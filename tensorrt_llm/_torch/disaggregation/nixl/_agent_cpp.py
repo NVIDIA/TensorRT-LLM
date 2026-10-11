@@ -43,6 +43,14 @@ class BindingsNixlTransferStatus(TransferStatus):
         """Check if transfer is completed (releases GIL)."""
         return self._cpp_status.is_completed()
 
+    def is_quiesced(self) -> bool:
+        """Poll physical completion independently of the logical outcome."""
+        return self._cpp_status.is_quiesced()
+
+    def request_cancel(self) -> bool:
+        """Ask the backend to drain; callers must still poll is_quiesced()."""
+        return self._cpp_status.request_cancel()
+
     @nvtx_range("BindingsNixlTransferStatus.wait")
     def wait(self, timeout_ms=None) -> bool:
         """Wait for transfer to complete (releases GIL)."""

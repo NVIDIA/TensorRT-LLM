@@ -94,8 +94,10 @@ namespace
 class BounceTransferStatus final : public TransferStatus
 {
 public:
-    explicit BounceTransferStatus(std::shared_future<bounce::BounceResult> fut)
+    explicit BounceTransferStatus(
+        std::shared_future<bounce::BounceResult> fut, std::shared_ptr<bounce::BounceRequestState> physical)
         : mFut(std::move(fut))
+        , mPhysical(std::move(physical))
     {
     }
 
@@ -126,6 +128,17 @@ public:
         return TransferState::kIN_PROGRESS;
     }
 
+    [[nodiscard]] bool isQuiesced() const override
+    {
+        return mPhysical->quiesced.load(std::memory_order_acquire);
+    }
+
+    [[nodiscard]] bool requestCancel() override
+    {
+        mPhysical->cancelRequested.store(true, std::memory_order_release);
+        return true;
+    }
+
     /// Failure cause recorded by the bounce transport (empty while in flight / on success).
     [[nodiscard]] std::string getLastStatusStr() const override
     {
@@ -139,6 +152,7 @@ public:
 
 private:
     std::shared_future<bounce::BounceResult> mFut;
+    std::shared_ptr<bounce::BounceRequestState> mPhysical;
 };
 } // namespace
 
@@ -743,6 +757,11 @@ std::string NixlTransferStatus::getLastStatusStr() const
     return queryStatus() == NIXL_SUCCESS;
 }
 
+bool NixlTransferStatus::isQuiesced() const
+{
+    return mQuiesced.load(std::memory_order_acquire) || queryStatus() == NIXL_SUCCESS;
+}
+
 nixl_status_t NixlTransferStatus::queryStatus() const
 {
     auto const query = [this]()
@@ -760,6 +779,10 @@ nixl_status_t NixlTransferStatus::queryStatus() const
             return NIXL_ERR_INVALID_PARAM;
         }
         auto const status = agent->getXferStatus(mHandle);
+        if (status == NIXL_SUCCESS)
+        {
+            mQuiesced.store(true, std::memory_order_release);
+        }
         mLastStatus.store(static_cast<int>(status), std::memory_order_relaxed);
         return status;
     };
@@ -1048,8 +1071,10 @@ void NixlTransferAgent::invalidateRemoteAgent(std::string const& name)
         // Programmatic check: getBounceSubmitCount() / bounce_submit_count on the Python binding.
         TLLM_LOG_DEBUG("NixlTransferAgent(%s): bounce path engaged for write to %s (%zu descs)", mName.c_str(),
             request.getRemoteName().c_str(), request.getSrcDescs().getDescs().size());
-        auto fut = mBounce->transport->submit(request.getSrcDescs(), request.getDstDescs(), request.getRemoteName());
-        return std::make_unique<BounceTransferStatus>(std::move(fut));
+        auto physical = std::make_shared<bounce::BounceRequestState>();
+        auto fut = mBounce->transport->submit(
+            request.getSrcDescs(), request.getDstDescs(), request.getRemoteName(), physical);
+        return std::make_unique<BounceTransferStatus>(std::move(fut), std::move(physical));
     }
 #endif
 

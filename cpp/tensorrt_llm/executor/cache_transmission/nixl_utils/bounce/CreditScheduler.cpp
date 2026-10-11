@@ -163,6 +163,10 @@ void CreditScheduler::issueGrant(
 std::vector<Grant> CreditScheduler::schedule()
 {
     std::vector<Grant> grants;
+    if (mGrantAdmissionClosed)
+    {
+        return grants;
+    }
     // Re-sweep as long as the previous sweep granted something; stop when a whole sweep makes no
     // progress or the ring is empty.
     while (!mRing.empty())
@@ -348,6 +352,71 @@ void CreditScheduler::dropFlow(std::string const& flow, std::unordered_set<std::
     }
     mFlows.erase(it);
     dropFromRing(flow);
+}
+
+std::vector<Grant> CreditScheduler::quarantineFlow(
+    std::string const& flow, std::unordered_set<std::uint64_t> const& busy, std::vector<std::uint64_t>& deferredOut)
+{
+    std::lock_guard<std::mutex> lk(mMu);
+    auto it = mFlows.find(flow);
+    if (it == mFlows.end())
+    {
+        return {};
+    }
+    for (auto const offset : it->second.held)
+    {
+        if (busy.count(offset) != 0)
+        {
+            deferredOut.push_back(offset);
+            mOrphans.insert(offset);
+        }
+        else
+        {
+            mUnproven[flow].insert(offset);
+        }
+    }
+    mFlows.erase(it);
+    dropFromRing(flow);
+    return schedule();
+}
+
+std::vector<Grant> CreditScheduler::releaseQuarantinedFlow(std::string const& flow)
+{
+    std::lock_guard<std::mutex> lk(mMu);
+    auto it = mUnproven.find(flow);
+    if (it != mUnproven.end())
+    {
+        for (auto const offset : it->second)
+        {
+            mArena.free(offset);
+        }
+        mUnproven.erase(it);
+    }
+    return schedule();
+}
+
+std::vector<std::string> CreditScheduler::flowKeys() const
+{
+    std::lock_guard<std::mutex> lk(mMu);
+    std::vector<std::string> keys;
+    for (auto const& [key, state] : mFlows)
+    {
+        keys.push_back(key);
+    }
+    return keys;
+}
+
+void CreditScheduler::closeGrantAdmission()
+{
+    std::lock_guard<std::mutex> lk(mMu);
+    mGrantAdmissionClosed = true;
+}
+
+bool CreditScheduler::hasUnprovenRemoteWrites() const
+{
+    std::lock_guard<std::mutex> lk(mMu);
+    return !mUnproven.empty()
+        || std::any_of(mFlows.begin(), mFlows.end(), [](auto const& entry) { return !entry.second.held.empty(); });
 }
 
 std::vector<Grant> CreditScheduler::reclaimByPrefix(std::string const& prefix,

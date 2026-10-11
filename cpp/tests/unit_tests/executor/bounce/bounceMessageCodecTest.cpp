@@ -279,3 +279,30 @@ TEST(BounceMessageCodec, HandshakeTruncatedRejected)
     EXPECT_FALSE(b::decodeHandshake(blob.substr(0, blob.size() - 4), out)); // endpoint cut short
     EXPECT_FALSE(b::decodeHandshake(blob.substr(0, 10), out));              // fixed part cut short
 }
+
+TEST(BounceMessageCodec, DrainRoundTripAndAcknowledgment)
+{
+    auto const blob = b::encodeDrain(42, "tcp://127.0.0.1:12345");
+    b::BounceMsgHeader header{};
+    ASSERT_TRUE(b::decodeHeader(blob, header));
+    EXPECT_EQ(static_cast<b::BounceMsgType>(header.msgType), b::BounceMsgType::kDRAIN);
+    EXPECT_EQ(header.requestId, 42u);
+    std::vector<std::uint32_t> chunks;
+    std::string endpoint;
+    ASSERT_TRUE(b::decodeWant(blob, header, chunks, endpoint));
+    EXPECT_TRUE(chunks.empty());
+    EXPECT_EQ(endpoint, "tcp://127.0.0.1:12345");
+    ASSERT_TRUE(b::decodeHeader(b::encodeDrainAck(42), header));
+    EXPECT_EQ(static_cast<b::BounceMsgType>(header.msgType), b::BounceMsgType::kDRAIN_ACK);
+    EXPECT_EQ(header.requestId, 42u);
+    EXPECT_EQ(header.payloadBytes, 0u);
+}
+
+TEST(BounceMessageCodec, PreviousWireVersionCannotAttestDrain)
+{
+    auto blob = b::encodeDrainAck(42);
+    auto const oldVersion = static_cast<std::uint16_t>(b::kBounceVersion - 1);
+    std::memcpy(blob.data() + offsetof(b::BounceMsgHeader, version), &oldVersion, sizeof(oldVersion));
+    b::BounceMsgHeader header{};
+    EXPECT_FALSE(b::decodeHeader(blob, header));
+}

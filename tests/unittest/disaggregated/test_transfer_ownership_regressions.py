@@ -31,6 +31,11 @@ from tensorrt_llm import DisaggregatedParams
 from tensorrt_llm._torch.disaggregation.base import CacheExtent, CacheKind, Chunk, TokenRange
 from tensorrt_llm._torch.disaggregation.base.transfer import SessionStatus, WaitResult
 from tensorrt_llm._torch.disaggregation.native.bounce.core import TransferContext
+from tensorrt_llm._torch.disaggregation.native.rank_info import (
+    NATIVE_OWNERSHIP_PROTOCOL_VERSION,
+    RankInfo,
+    validate_ownership_peer,
+)
 from tensorrt_llm._torch.disaggregation.native.transfer import (
     AgentResult,
     KVRecvTask,
@@ -43,6 +48,31 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheM
 from tensorrt_llm._torch.pyexecutor.resource_manager import CacheTypeCpp
 from tensorrt_llm.bindings import DataType, LlmRequestState
 from tensorrt_llm.disaggregated_params import DisaggScheduleStyle
+
+pytestmark = pytest.mark.cpu_only
+
+
+class _PhysicalStatusProbe:
+    """Keep logical failure fixed while independently advancing physical proof."""
+
+    def __init__(self) -> None:
+        self.quiesced = False
+        self.cancel_count = 0
+
+    def wait(self, timeout_ms: int | None = None) -> bool:
+        return False
+
+    def is_completed(self) -> bool:
+        return False
+
+    def is_quiesced(self) -> bool:
+        return self.quiesced
+
+    def request_cancel(self) -> None:
+        self.cancel_count += 1
+
+    def last_status_str(self) -> str:
+        return "failed while scatter is active"
 
 
 def _sole_piece(block_ids_per_layer_groups=None, *, tokens=0, is_last=True) -> Chunk:
@@ -170,6 +200,11 @@ class _PartialFanInBounce(_BounceProbe):
             dst_ptrs=dst_ptrs,
             sizes=sizes,
         )
+        self._advance()
+
+    def record_failure(self, rid_slice: tuple[int, int], peer_rank: int) -> None:
+        assert self.context is not None and self.context.rid_slice == rid_slice
+        self.context.record_writer_result(peer_rank, succeeded=False)
         self._advance()
 
 
@@ -749,8 +784,8 @@ def test_partial_bounced_publication_waits_for_queued_writer_success(
         assert bounce.release_count == 0
         assert not session.resources_drained()
 
-        # Only writer 0's REQUEST_DATA was successfully queued. The destination
-        # remains owned until that writer reports terminal physical evidence.
+        # Writer 1's send may have escaped before raising, so both writers stay
+        # owned until each supplies physical evidence.
         session.process_kv_agent_result(
             peer_rank=0,
             receiver_slice_id=0,
@@ -764,6 +799,10 @@ def test_partial_bounced_publication_waits_for_queued_writer_success(
     assert session.status == SessionStatus.ERROR
     assert not session.resources_drained()
     session.process_aux_agent_result(0, AgentResult.FAILED)
+    assert not session.resources_drained()
+    session.process_kv_agent_result(1, 0, True, AgentResult.FAILED)
+    assert not session.resources_drained()
+    session.process_aux_agent_result(1, AgentResult.FAILED)
     assert session.resources_drained()
     assert bounce.context is None
     assert bounce.scatter_count == 0
@@ -1460,6 +1499,7 @@ def test_pre_cancelled_sender_does_not_publish_from_transceiver() -> None:
     )
     transceiver = object.__new__(KvCacheTransceiverV2)
     transceiver._fp4_mla_bridge_enabled = True
+    transceiver._enforce_physical_ownership = True
     transceiver._enable_pipelined_transfer = False
     transceiver._ever_had_send_session = False
     transceiver._ctx_need_tp_sync = False
@@ -1542,6 +1582,7 @@ def test_bridge_rejection_releases_only_without_physical_owner(
     )
     transceiver = SimpleNamespace(
         _fp4_mla_bridge_enabled=bridge_enabled,
+        _enforce_physical_ownership=bridge_enabled,
         has_retired_send_session=lambda _req: False,
         respond_and_send_async=lambda req: setattr(
             req, "state", LlmRequestState.DISAGG_TRANS_ERROR
@@ -1649,6 +1690,10 @@ def test_late_request_data_to_terminal_sender_settles_aux(
     sender = _make_owned_sender()
     sender._save_peer_req_info = Mock()
     sender._send_failed_result_to_receiver = Mock()
+    sender._registrar = SimpleNamespace(
+        self_rank_info=_ownership_rank_info(1),
+        get_peer_rank_info=Mock(return_value=_ownership_rank_info(1)),
+    )
     session = SimpleNamespace(
         lock=threading.Lock(),
         _closed=False,
@@ -1872,7 +1917,9 @@ def test_legacy_aux_dispatch_remains_fail_fast() -> None:
 @pytest.mark.parametrize(
     "meta_type", [transfer_mod.WriteMetaType.KV, transfer_mod.WriteMetaType.AUX]
 )
-@pytest.mark.parametrize("failure_mode", ["false", "submit_exception", "wait_exception"])
+@pytest.mark.parametrize(
+    "failure_mode", ["false", "submit_exception", "wait_exception", "null_status"]
+)
 def test_ambiguous_sender_result_retains_source_and_reports_in_doubt(
     monkeypatch: pytest.MonkeyPatch,
     meta_type: transfer_mod.WriteMetaType,
@@ -1893,10 +1940,14 @@ def test_ambiguous_sender_result_retains_source_and_reports_in_doubt(
     def submit(_request):
         if failure_mode == "submit_exception":
             raise RuntimeError("submit failed")
+        if failure_mode == "null_status":
+            return None
         return status
 
     if failure_mode == "submit_exception":
         detail = "submit failed"
+    elif failure_mode == "null_status":
+        detail = "backend submission returned no physical operation handle"
     sender._agent = SimpleNamespace(
         name="nixl",
         submit_transfer_requests=submit,
@@ -1959,12 +2010,14 @@ def test_ambiguous_sender_result_retains_source_and_reports_in_doubt(
     dealer.send.assert_called_once()
     assert task.status == transfer_mod.TaskStatus.ERROR
     assert not task.resources_drained
-    expected_status = None if failure_mode == "submit_exception" else status
+    expected_status = None if failure_mode in ("submit_exception", "null_status") else status
     operation = task._physical_operations[peer_rank]
     assert operation.state is transfer_mod._PhysicalOperationState.IN_DOUBT
     assert operation.request is request
     assert operation.status is expected_status
-    assert sender._ownership_poisoned is not None
+    assert (sender._ownership_poisoned is not None) == (
+        failure_mode in ("submit_exception", "null_status")
+    )
 
 
 @pytest.mark.cpu_only
@@ -2004,12 +2057,13 @@ def test_receiver_in_doubt_retains_destination_and_closes_admission(
     assert session.status == SessionStatus.ERROR
     assert not session.resources_drained()
     assert session.close() is False
-    with pytest.raises(RuntimeError, match="admission is quarantined"):
-        RxSession(
-            request_id=rid + 1,
-            params=DisaggregatedParams(disagg_request_id=rid + 1),
-            receiver=receiver,
-        )
+    assert receiver._ownership_poisoned is None
+    unrelated = RxSession(
+        request_id=rid + 1,
+        params=DisaggregatedParams(disagg_request_id=rid + 1),
+        receiver=receiver,
+    )
+    assert unrelated.close()
 
     # This test intentionally models evidence that never settles.
     session._closed = True
@@ -2068,6 +2122,7 @@ def test_sender_registration_does_not_wait_for_active_transfer(
 ) -> None:
     sender = _make_owned_sender()
     sender._device_id, sender._registrar, sender._agent = 0, Mock(), Mock()
+    sender._registrar.self_rank_info = _ownership_rank_info(0)
     task = transfer_mod.SendTaskBase(DisaggregatedParams(disagg_request_id=1))
     assert task.begin_physical_operation(7)
     sender._sessions[1] = SimpleNamespace(kv_tasks=[task])
@@ -2250,7 +2305,7 @@ def test_sender_retires_only_after_backend_done() -> None:
     done = transfer_mod.SendTaskBase(DisaggregatedParams(disagg_request_id=92))
     done_request = Mock()
 
-    def wait() -> bool:
+    def wait(timeout_ms: int | None = None) -> bool:
         operation = done._physical_operations[7]
         assert operation.state is transfer_mod._PhysicalOperationState.SUBMITTED
         assert operation.request is done_request
@@ -2453,6 +2508,7 @@ def test_fp4_mla_bridge_roots_send_and_receive_requests_before_admission() -> No
     )
     sender = object.__new__(KvCacheTransceiverV2)
     sender._fp4_mla_bridge_enabled = True
+    sender._enforce_physical_ownership = True
     sender._enable_pipelined_transfer = False
     sender._send_reqs = {}
 
@@ -2485,6 +2541,7 @@ def test_fp4_mla_bridge_roots_send_and_receive_requests_before_admission() -> No
     )
     receiver = object.__new__(KvCacheTransceiverV2)
     receiver._fp4_mla_bridge_enabled = True
+    receiver._enforce_physical_ownership = True
     receiver._recv_sessions = {}
     receiver._recv_reqs = {}
     receiver._kv_size_rank_factor = 1
@@ -2512,6 +2569,7 @@ def test_fp4_mla_bridge_roots_send_and_receive_requests_before_admission() -> No
 def test_fp4_mla_bridge_rejects_requests_outside_qualified_protocol() -> None:
     transceiver = object.__new__(KvCacheTransceiverV2)
     transceiver._fp4_mla_bridge_enabled = True
+    transceiver._enforce_physical_ownership = True
     valid = SimpleNamespace(
         schedule_style=DisaggScheduleStyle.GENERATION_FIRST,
         disagg_request_id=1,
@@ -2556,3 +2614,604 @@ def test_fp4_mla_bridge_rejects_requests_outside_qualified_protocol() -> None:
     )
     transceiver.request_and_receive_async(req)
     assert req.state == LlmRequestState.DISAGG_TRANS_ERROR
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("proof", [None, False, 1, "done", RuntimeError("query failed")])
+def test_logical_terminal_status_without_physical_proof_retains_roots(proof: object) -> None:
+    task = transfer_mod.SendTaskBase(DisaggregatedParams(disagg_request_id=300))
+    request = object()
+    status = SimpleNamespace(is_completed=Mock(return_value=True))
+    if proof is not None:
+        status.is_quiesced = (
+            Mock(side_effect=proof) if isinstance(proof, RuntimeError) else Mock(return_value=proof)
+        )
+    assert task.begin_physical_operation(0)
+    task.begin_backend_submission(0, request)
+    task.record_backend_submission(0, status)
+    task.mark_physical_operation_in_doubt(0)
+    task.fail(RuntimeError("immutable failure"))
+
+    assert not task.poll_in_doubt_physical_operation(0)
+    assert not task.resources_drained
+    assert task._physical_operations[0].request is request
+    assert task._physical_operations[0].status is status
+    status.is_completed.assert_not_called()
+
+
+@pytest.mark.cpu_only
+def test_failed_bounce_can_drain_without_success_or_poisoning_next_request() -> None:
+    sender = _make_owned_sender()
+    status = _PhysicalStatusProbe()
+    sender._agent = SimpleNamespace(submit_transfer_requests=lambda _request: status)
+    failed = transfer_mod.SendTaskBase(DisaggregatedParams(disagg_request_id=301))
+    request = object()
+    assert failed.begin_physical_operation(0)
+
+    delivered, detail = sender._submit_transfer(failed, 0, request)
+    failed.fail(RuntimeError(detail))
+    assert not delivered
+    assert sender._ownership_poisoned is None
+    assert status.cancel_count > 0
+    assert not failed.poll_in_doubt_physical_operation(0)
+    assert not failed.resources_drained
+
+    status.quiesced = True
+    assert not status.is_completed()
+    assert failed.poll_in_doubt_physical_operation(0)
+    assert failed.resources_drained
+    assert failed.status is transfer_mod.TaskStatus.ERROR
+    assert failed._physical_operations[0].request is None
+    assert failed._physical_operations[0].status is None
+    assert not failed.poll_in_doubt_physical_operation(0)
+
+    independent = transfer_mod.SendTaskBase(DisaggregatedParams(disagg_request_id=302))
+    sender._agent = SimpleNamespace(
+        submit_transfer_requests=lambda _request: SimpleNamespace(wait=lambda timeout_ms=None: True)
+    )
+    assert independent.begin_physical_operation(0)
+    assert sender._submit_transfer(independent, 0, object()) == (True, None)
+    assert independent.resources_drained
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("late_registration", [False, True])
+def test_cancellation_reaches_retained_or_late_status_without_ownership_lock(
+    late_registration: bool,
+) -> None:
+    task = transfer_mod.SendTaskBase(DisaggregatedParams(disagg_request_id=303))
+    status = _PhysicalStatusProbe()
+    calls = []
+
+    def cancel() -> None:
+        assert task._physical_lock.acquire(blocking=False), "backend called under ownership lock"
+        task._physical_lock.release()
+        calls.append(True)
+
+    status.request_cancel = cancel
+    assert task.begin_physical_operation(0)
+    task.begin_backend_submission(0, object())
+    if late_registration:
+        task.request_physical_cancel()
+        assert calls == []
+        task.record_backend_submission(0, status)
+    else:
+        task.record_backend_submission(0, status)
+        task.request_physical_cancel()
+    assert calls == [True]
+    assert not task.resources_drained
+    assert task.begin_physical_operation(1)
+    with pytest.raises(transfer_mod._TransferNotSubmittedError):
+        task.begin_backend_submission(1, object())
+    assert task._physical_operations[1].state is transfer_mod._PhysicalOperationState.NOT_SUBMITTED
+
+
+@pytest.mark.cpu_only
+def test_two_writer_failure_cannot_reuse_kv_or_aux_until_every_physical_owner_drains() -> None:
+    receiver = _ReceiverProbe()
+    session = RxSession(
+        request_id=304,
+        params=DisaggregatedParams(
+            disagg_request_id=304,
+            schedule_style=DisaggScheduleStyle.GENERATION_FIRST,
+        ),
+        receiver=receiver,
+    )
+    task = session.prepare_receive(_sole_piece())
+    assert task is not None
+    task.expected_transfers = 2
+    assert session.try_begin_transfer(task.slice_id, set(), writer_cohort={0, 1})
+    allocation = _OneSlotAllocator(304)
+    session.process_kv_agent_result(0, 0, True, AgentResult.IN_DOUBT)
+    session.process_kv_agent_result(1, 0, True, AgentResult.IN_DOUBT)
+    session.process_aux_agent_result(0, AgentResult.IN_DOUBT)
+    session.process_aux_agent_result(1, AgentResult.FAILED)
+    assert session.status is SessionStatus.ERROR
+    allocation.apply_reuse_decision(session.close())
+    assert not allocation.is_reusable
+
+    session.process_kv_agent_result(0, 0, True, AgentResult.FAILED_QUIESCED)
+    allocation.apply_reuse_decision(session.close())
+    assert not allocation.is_reusable
+    assert not task.resources_drained
+    session.process_kv_agent_result(1, 0, True, AgentResult.FAILED_QUIESCED)
+    assert task.resources_drained
+    allocation.apply_reuse_decision(session.close())
+    assert not allocation.is_reusable
+    assert session._aux_physical_owner is not None
+    assert not session._aux_physical_owner.resources_drained
+
+    session.process_aux_agent_result(0, AgentResult.FAILED_QUIESCED)
+    assert session.resources_drained()
+    allocation.apply_reuse_decision(session.close())
+    assert allocation.is_reusable
+    assert allocation.release_count == 1
+    assert receiver.clear_count == 1
+
+
+def _ownership_rank_info(version: int, name: str = "peer") -> RankInfo:
+    return RankInfo(
+        instance_name=name,
+        instance_rank=0,
+        tp_size=1,
+        tp_rank=0,
+        pp_size=1,
+        pp_rank=0,
+        layer_num_per_pp=[1],
+        sender_endpoints=["tcp://sender"],
+        self_endpoint="tcp://self",
+        transfer_engine_info=b"opaque-agent-descriptor",
+        ownership_protocol_version=version,
+    )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("local,peer", [(0, 1), (1, 0), (1, 2), (2, 2)])
+def test_ownership_capability_mismatch_is_rejected(local: int, peer: int) -> None:
+    with pytest.raises(ValueError, match="ownership protocol mismatch"):
+        validate_ownership_peer(_ownership_rank_info(local), _ownership_rank_info(peer))
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("version", [0, NATIVE_OWNERSHIP_PROTOCOL_VERSION])
+def test_rank_info_ownership_roundtrip_preserves_legacy_schema(version: int) -> None:
+    import msgpack
+
+    info = _ownership_rank_info(version)
+    encoded = info.to_bytes()
+    assert ("ownership_protocol_version" in msgpack.unpackb(encoded)) == (version != 0)
+    restored = RankInfo.from_bytes(encoded)
+    assert restored == info
+    validate_ownership_peer(info, restored)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("local,peer", [(0, 1), (1, 0)])
+def test_sender_rejects_capability_mismatch_before_registering_remote_agent(
+    monkeypatch: pytest.MonkeyPatch, local: int, peer: int
+) -> None:
+    sender = _make_owned_sender()
+    sender._device_id = 0
+    sender._registrar = SimpleNamespace(self_rank_info=_ownership_rank_info(local), register=Mock())
+    sender._agent = SimpleNamespace(load_remote_agent=Mock())
+    monkeypatch.setattr(transfer_mod.torch.cuda, "set_device", Mock())
+    monkeypatch.setattr(transfer_mod.cudart, "cudaSetDevice", Mock())
+    monkeypatch.setattr(transfer_mod, "CUASSERT", Mock())
+
+    with pytest.raises(ValueError, match="ownership protocol mismatch"):
+        sender._register_peer_rank(
+            b"sender", [b"REGISTER_RANK_INFO", _ownership_rank_info(peer).to_bytes()]
+        )
+    sender._registrar.register.assert_not_called()
+    sender._agent.load_remote_agent.assert_not_called()
+    assert not sender._loaded_remote_agents
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("local,peer", [(0, 1), (1, 0)])
+def test_cached_peer_cannot_bypass_receive_ownership_preflight(local: int, peer: int) -> None:
+    receiver = _make_owned_receiver()
+    receiver._incompatible_peers = {}
+    receiver._extract_info_endpoint = Mock(return_value="tcp://cached")
+    receiver._should_register_peer = Mock(return_value=False)
+    receiver._sender_ep_instance_map = {"tcp://cached": _ownership_rank_info(peer)}
+    receiver._registrar = SimpleNamespace(self_rank_info=_ownership_rank_info(local))
+    receiver._get_or_connect_dealer = Mock()
+    with pytest.raises(
+        (ValueError, transfer_mod.PeerIncompatibleError), match="ownership protocol mismatch"
+    ):
+        receiver._get_sender_info(DisaggregatedParams(disagg_request_id=305))
+    receiver._get_or_connect_dealer.assert_not_called()
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("local,peer", [(0, 1), (1, 0)])
+def test_receive_capability_preflight_precedes_address_publication(
+    monkeypatch: pytest.MonkeyPatch, local: int, peer: int
+) -> None:
+    receiver = _make_owned_receiver()
+    receiver._incompatible_peers = {}
+    receiver._extract_info_endpoint = Mock(return_value="tcp://new-peer")
+    receiver._should_register_peer = Mock(return_value=True)
+    receiver._sender_ep_instance_map = {}
+    receiver._registrar = SimpleNamespace(self_rank_info=_ownership_rank_info(local))
+    receiver._get_or_connect_dealer = Mock()
+    messenger = Mock(receive=Mock(return_value=[_ownership_rank_info(peer).to_bytes()]))
+    monkeypatch.setattr(transfer_mod, "ZMQMessenger", Mock(return_value=messenger))
+    with pytest.raises(transfer_mod.PeerIncompatibleError, match="ownership protocol mismatch"):
+        receiver._get_sender_info(DisaggregatedParams(disagg_request_id=306))
+    messenger.send.assert_called_once_with([MessageType.REQUEST_INSTANCE_INFO])
+    messenger.stop.assert_called_once()
+    receiver._get_or_connect_dealer.assert_not_called()
+    assert not receiver._sender_ep_instance_map
+
+
+@pytest.mark.cpu_only
+def test_unregistered_request_data_cannot_create_pending_physical_owner() -> None:
+    sender = _make_owned_sender()
+    sender._registrar = SimpleNamespace(
+        self_rank_info=_ownership_rank_info(1),
+        get_peer_rank_info=Mock(side_effect=KeyError("unregistered peer")),
+    )
+    sender._save_peer_req_info = Mock()
+    sender._get_session = Mock()
+    info = transfer_mod.RecvReqInfo(
+        sender_req_id=18,
+        instance_name="unregistered",
+        instance_rank=2,
+        block_ids_per_layer_groups=[],
+        unique_rid=307,
+    )
+    with pytest.raises(KeyError, match="unregistered peer"):
+        sender._respond_with_kv(b"receiver", [MessageType.REQUEST_DATA, info.to_bytes()])
+    sender._save_peer_req_info.assert_not_called()
+    sender._get_session.assert_not_called()
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("pure_python", [False, True])
+@pytest.mark.parametrize(
+    "methods", [(), ("is_quiesced",), ("request_cancel",), ("is_quiesced", "request_cancel")]
+)
+def test_native_quiescence_requires_both_native_methods(
+    monkeypatch: pytest.MonkeyPatch, pure_python: bool, methods: tuple[str, ...]
+) -> None:
+    import tensorrt_llm._torch.disaggregation.base.agent as agent_mod
+
+    binding_status = SimpleNamespace(**{name: Mock() for name in methods})
+    monkeypatch.setattr(agent_mod, "_cpp_binding", SimpleNamespace(TransferStatus=binding_status))
+    monkeypatch.setattr(agent_mod, "_use_pure_python_transfer_agent", pure_python)
+    assert agent_mod.supports_native_quiescence() == (not pure_python and len(methods) == 2)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "violation",
+    [None, "retry", "pp", "cp", "pipeline", "sync", "layerwise", "pure_python", "timeout"],
+)
+def test_agent_bounce_ownership_profile_is_checked_before_publication(
+    monkeypatch: pytest.MonkeyPatch, violation: str | None
+) -> None:
+    monkeypatch.setenv("TRTLLM_DISAGG_NO_RETRY", "1")
+    monkeypatch.delenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP", raising=False)
+    monkeypatch.delenv("TRTLLM_DISAGG_LAYERWISE", raising=False)
+    monkeypatch.setattr(
+        transceiver_mod, "use_pure_python_transfer_agent", lambda: violation == "pure_python"
+    )
+    mapping = SimpleNamespace(
+        tp_size=4, pp_size=2 if violation == "pp" else 1, cp_size=2 if violation == "cp" else 1
+    )
+    config = SimpleNamespace(
+        agent_bounce_buffer_enable=True,
+        kv_cache_bounce_size_mb=64,
+        kv_transfer_timeout_ms=0 if violation == "timeout" else 1000,
+        enable_pipelined_transfer=violation == "pipeline",
+    )
+    if violation == "retry":
+        monkeypatch.delenv("TRTLLM_DISAGG_NO_RETRY")
+    if violation == "sync":
+        monkeypatch.setenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP", "1")
+    if violation == "layerwise":
+        monkeypatch.setenv("TRTLLM_DISAGG_LAYERWISE", "1")
+    if violation is None:
+        assert transceiver_mod._validate_agent_bounce_ownership_profile(mapping, config)
+    else:
+        with pytest.raises(ValueError, match=r"C\+\+ bounce physical ownership requires"):
+            transceiver_mod._validate_agent_bounce_ownership_profile(mapping, config)
+    config.agent_bounce_buffer_enable = False
+    assert not transceiver_mod._validate_agent_bounce_ownership_profile(mapping, config)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("auxiliary", [False, True])
+def test_failed_quiesced_report_retries_in_order_and_retires_once(auxiliary: bool) -> None:
+    sender = _make_owned_sender()
+    sender._bounce = Mock()
+    params = DisaggregatedParams(disagg_request_id=308)
+    task = (
+        transfer_mod.AuxSendTask(params, slot=0)
+        if auxiliary
+        else transfer_mod.KVSendTask(_sole_piece(), params, slice_id=0)
+    )
+    status = _PhysicalStatusProbe()
+    assert task.begin_physical_operation(0)
+    task.begin_backend_submission(0, object())
+    task.record_backend_submission(0, status)
+    task.mark_physical_operation_in_doubt(0)
+    task.fail(RuntimeError("failed"))
+    meta = transfer_mod.WriteMeta(
+        task=task,
+        expected_transfers=1,
+        peer_name="gen0",
+        peer_rank=0,
+        peer_endpoint="receiver",
+        unique_rid=308,
+        src_ptrs=np.array([0x1000], dtype=np.int64),
+        dst_ptrs=np.array([0x2000], dtype=np.int64),
+        sizes=np.array([0x100], dtype=np.int64),
+        slice_id=0,
+        receiver_slice_id=0,
+        is_last_slice=True,
+        meta_type=transfer_mod.WriteMetaType.AUX if auxiliary else transfer_mod.WriteMetaType.KV,
+    )
+    initial = (
+        transfer_mod._make_aux_result_msg(0, 308, AgentResult.IN_DOUBT)
+        if auxiliary
+        else transfer_mod._make_kv_result_msg(0, 308, 0, True, AgentResult.IN_DOUBT)
+    )
+    dealer = Mock()
+    dealer.send.side_effect = [
+        RuntimeError("initial send escaped"),
+        None,
+        RuntimeError("settlement send escaped"),
+        None,
+    ]
+    sender._get_result_dealer = Mock(return_value=dealer)
+    sender._retain_in_doubt_transfer(meta, initial, send_slot_id=4)
+    assert not task.resources_drained
+    status.quiesced = True
+    sender._poll_in_doubt_transfers(0)
+    assert task.resources_drained
+    assert sender._pending_settlements[0]
+    sender._bounce.release_send.assert_called_once_with(4)
+    sender._poll_in_doubt_transfers(0)
+    sender._poll_in_doubt_transfers(0)
+    messages = [call.args[0] for call in dealer.send.call_args_list]
+    assert messages[0] == messages[1] == initial
+    assert messages[2] == messages[3]
+    if auxiliary:
+        assert messages[3][-1] == AgentResult.FAILED_QUIESCED.value.encode("ascii")
+        assert task._transfer_count == 1
+    else:
+        result_code = transfer_mod._KV_RESULT_PREFIX.unpack(messages[3][1])[4]
+        assert transfer_mod._AGENT_RESULT_BY_CODE[result_code] is AgentResult.FAILED_QUIESCED
+        assert task.transferred_count == 1
+    assert not sender._pending_settlements[0]
+    assert task.status is transfer_mod.TaskStatus.ERROR
+    sender._bounce.release_send.assert_called_once_with(4)
+
+
+@pytest.mark.parametrize("direction", ["send", "receive"])
+@pytest.mark.parametrize("physically_drained", [False, True])
+def test_executor_free_cannot_bypass_unquiesced_session(
+    direction: str, physically_drained: bool
+) -> None:
+    from tensorrt_llm._torch.disaggregation.native.retirement import RetirementWatchdog
+    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+
+    request = SimpleNamespace(
+        py_request_id=309,
+        request_id=309,
+        py_disaggregated_params=DisaggregatedParams(disagg_request_id=309),
+    )
+    watchdog = RetirementWatchdog(Mock())
+    session = SimpleNamespace(
+        _enforce_physical_ownership=True,
+        cancel_local=Mock(),
+        resources_drained=Mock(return_value=physically_drained),
+        close=Mock(return_value=False),
+    )
+    transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver._enforce_physical_ownership = True
+    transceiver._send_sessions = {309: session} if direction == "send" else {}
+    transceiver._recv_sessions = {309: session} if direction == "receive" else {}
+    transceiver._transfer_worker = SimpleNamespace(_retirement_watchdog=watchdog)
+    transceiver._fail_unproven_transfer = Mock()
+    executor = SimpleNamespace(
+        kv_cache_transceiver=transceiver,
+        resource_manager=Mock(),
+        _prefetched_request_ids={309},
+        disagg=Mock(),
+    )
+
+    with pytest.raises(RuntimeError, match="executor resource release refused"):
+        PyExecutor._free_request_resources(executor, request)
+    executor.resource_manager.free_resources.assert_not_called()
+    executor.disagg.forget_request.assert_not_called()
+    assert executor._prefetched_request_ids == {309}
+    assert watchdog.fatal is not None
+    assert watchdog.fatal.direction == direction
+    session.cancel_local.assert_called_once()
+    assert session.close.called == physically_drained
+    transceiver._fail_unproven_transfer.assert_called_once_with(watchdog.fatal)
+
+
+def test_executor_free_fences_and_closes_drained_sessions_before_reuse() -> None:
+    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+
+    order = []
+    request = SimpleNamespace(
+        py_request_id=310,
+        request_id=310,
+        py_disaggregated_params=DisaggregatedParams(disagg_request_id=310),
+    )
+    session = SimpleNamespace(
+        _enforce_physical_ownership=True,
+        cancel_local=lambda: order.append("cancel"),
+        resources_drained=lambda: True,
+        close=lambda: order.append("close") or True,
+    )
+    transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver._enforce_physical_ownership = True
+    transceiver._send_sessions, transceiver._recv_sessions = {}, {310: session}
+    transceiver._send_reqs, transceiver._recv_reqs = {}, {310: request}
+    executor = SimpleNamespace(
+        kv_cache_transceiver=transceiver,
+        resource_manager=SimpleNamespace(free_resources=lambda _request: order.append("free")),
+        _prefetched_request_ids={310},
+        disagg=SimpleNamespace(forget_request=lambda _rid: order.append("forget")),
+    )
+    PyExecutor._free_request_resources(executor, request)
+    assert order == ["cancel", "close", "free", "forget"]
+    assert not executor._prefetched_request_ids
+    assert not transceiver._recv_sessions
+    assert not transceiver._recv_reqs
+
+
+def test_old_binding_is_rejected_before_creating_or_publishing_transfer_agent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import tensorrt_llm._torch.disaggregation.base.agent as agent_mod
+
+    worker = object.__new__(transfer_mod.TransferWorker)
+    worker._config = SimpleNamespace(enforce_physical_ownership=True)
+    create_agent = Mock()
+    set_device = Mock()
+    monkeypatch.setattr(agent_mod, "_use_pure_python_transfer_agent", False)
+    monkeypatch.setattr(agent_mod, "_cpp_binding", SimpleNamespace(TransferStatus=object))
+    monkeypatch.setattr(transfer_mod, "_create_nixl_agent", create_agent)
+    monkeypatch.setattr(transfer_mod.torch.cuda, "set_device", set_device)
+    with pytest.raises(ValueError, match="quiescence-capable bindings"):
+        worker._setup_transfer_engine()
+    create_agent.assert_not_called()
+    set_device.assert_not_called()
+    assert not hasattr(worker, "_agent")
+
+
+def test_generic_bounce_send_admission_exception_stays_rooted_until_drain() -> None:
+    rid = 311
+    request = SimpleNamespace(
+        py_request_id=rid,
+        request_id=rid,
+        py_disaggregated_params=DisaggregatedParams(
+            disagg_request_id=rid, schedule_style=DisaggScheduleStyle.GENERATION_FIRST
+        ),
+        state=LlmRequestState.CONTEXT_INIT,
+        set_kv_cache_transfer_start=Mock(),
+    )
+    transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver._fp4_mla_bridge_enabled = False
+    transceiver._enforce_physical_ownership = True
+    transceiver._enable_pipelined_transfer = False
+    transceiver._send_reqs = {}
+    transceiver._ctx_need_tp_sync = transceiver._ctx_need_pp_sync = False
+    transceiver._transfer_worker = SimpleNamespace(sweep_stale_req_infos=Mock())
+    transceiver._ctx_consensus = lambda rids: rids
+    transceiver._ctx_consensus_outcome = lambda _rids, cancelled, failed, completed, drained: (
+        cancelled,
+        failed,
+        completed,
+        drained,
+    )
+    drained = [False]
+    session = SimpleNamespace(
+        _enforce_physical_ownership=True,
+        status=SessionStatus.READY,
+        disagg_request_id=rid,
+        kv_tasks=[],
+        is_completed=lambda: False,
+        has_failed=lambda: session.status is SessionStatus.ERROR,
+        has_transferring_tasks=lambda: not drained[0],
+        resources_drained=lambda: drained[0],
+        wait_complete=lambda blocking=True: WaitResult.FAILED,
+        close=Mock(return_value=True),
+    )
+
+    def send(_chunk: Chunk) -> None:
+        assert transceiver._send_reqs[rid] is request
+        raise RuntimeError("backend admission may have escaped")
+
+    def fail(_reason: str) -> None:
+        session.status = SessionStatus.ERROR
+
+    session.send = send
+    session.set_exception = Mock(side_effect=fail)
+    transceiver._send_sessions = {rid: session}
+    transceiver._get_or_create_send_session = Mock(return_value=session)
+    transceiver._create_cache_extent = Mock(return_value=CacheExtent(name=rid, local=_sole_piece()))
+    transceiver._finalize_send = Mock()
+    transceiver.respond_and_send_async(request)
+    session.set_exception.assert_called_once_with(
+        "transfer admission failed: backend admission may have escaped"
+    )
+    assert request.state is LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
+    assert transceiver.check_context_transfer_status(None) == ([], [])
+    assert transceiver._send_reqs[rid] is request
+    assert transceiver._send_sessions[rid] is session
+    session.close.assert_not_called()
+    drained[0] = True
+    assert transceiver.check_context_transfer_status(None) == ([], [rid])
+    assert not transceiver._send_reqs and not transceiver._send_sessions
+    assert request.py_kv_send_session_retired is True
+    session.close.assert_called_once()
+    transceiver._finalize_send.assert_not_called()
+
+
+def test_generic_bounce_receive_admission_exception_stays_rooted_until_drain() -> None:
+    rid = 312
+    request = SimpleNamespace(
+        py_request_id=rid,
+        request_id=rid,
+        py_disaggregated_params=DisaggregatedParams(
+            disagg_request_id=rid, schedule_style=DisaggScheduleStyle.GENERATION_FIRST
+        ),
+        state=LlmRequestState.GENERATION_IN_PROGRESS,
+        set_kv_cache_transfer_start=Mock(),
+    )
+    transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver._fp4_mla_bridge_enabled = False
+    transceiver._enforce_physical_ownership = True
+    transceiver._recv_reqs, transceiver._recv_sessions = {}, {}
+    transceiver._kv_size_rank_factor = 1
+    transceiver._gen_need_sync = False
+    transceiver._gen_allgather = Mock(side_effect=AssertionError("single rank must not gather"))
+    transceiver._mapping = SimpleNamespace(pp_size=1, world_size=1, enable_attention_dp=False)
+    transceiver._dist = SimpleNamespace(rank=0)
+    drained = [False]
+    session = SimpleNamespace(
+        _enforce_physical_ownership=True,
+        status=SessionStatus.READY,
+        _kv_tasks=[],
+        is_completed=lambda: False,
+        has_failed=lambda: session.status is SessionStatus.ERROR,
+        resources_drained=lambda: drained[0],
+        wait_complete=lambda blocking=True: WaitResult.FAILED,
+        close=Mock(return_value=True),
+    )
+    admission_error = RuntimeError("destination publication may have escaped")
+
+    def receive(_chunk: Chunk, expected_write_bytes=None) -> None:
+        assert transceiver._recv_reqs[rid] is request
+        raise admission_error
+
+    def fail(_error: Exception) -> None:
+        session.status = SessionStatus.ERROR
+
+    session.receive = receive
+    session.fail_admission = Mock(side_effect=fail)
+    transceiver._transfer_worker = SimpleNamespace(create_rx_session=Mock(return_value=session))
+    transceiver._create_cache_extent = Mock(return_value=CacheExtent(name=rid, local=_sole_piece()))
+    transceiver._chunk_num_bytes = Mock(return_value=0)
+    transceiver.request_and_receive_async(request)
+    session.fail_admission.assert_called_with(admission_error)
+    assert all(call.args == (admission_error,) for call in session.fail_admission.call_args_list)
+    assert request.state is LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
+    assert transceiver.check_gen_transfer_status(None) == ([], [], [])
+    assert transceiver._recv_reqs[rid] is request
+    assert transceiver._recv_sessions[rid] is session
+    session.close.assert_not_called()
+    drained[0] = True
+    assert transceiver.check_gen_transfer_status(None) == ([], [rid], [])
+    assert not transceiver._recv_reqs and not transceiver._recv_sessions
+    assert request.state is LlmRequestState.DISAGG_TRANS_ERROR
+    session.close.assert_called_once()

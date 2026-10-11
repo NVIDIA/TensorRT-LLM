@@ -195,9 +195,9 @@ def test_blocked_backend_cannot_delay_fatal_deadline(blocked_call: str) -> None:
     task.bind_logical_outcomes(transfer_mod._LogicalOutcomes(retirement))
     assert task.begin_physical_operation(7)
     request = object()
-    status = Mock(wait=Mock(return_value=True), is_completed=Mock(return_value=True))
+    status = Mock(wait=Mock(return_value=True), is_quiesced=Mock(return_value=True))
 
-    def block() -> object:
+    def block(timeout_ms: int | None = None) -> object:
         """Block only the external backend boundary, never production state logic."""
         entered.set()
         assert release.wait(5)
@@ -214,7 +214,7 @@ def test_blocked_backend_cannot_delay_fatal_deadline(blocked_call: str) -> None:
         task.begin_backend_submission(7, request)
         task.record_backend_submission(7, status)
         task.mark_physical_operation_in_doubt(7)
-        status.is_completed.side_effect = block
+        status.is_quiesced.side_effect = block
         work = partial(task.poll_in_doubt_physical_operation, 7)
     else:
         if blocked_call == "submit":
@@ -351,6 +351,10 @@ def _receiver(watchdog: RetirementWatchdog) -> transfer_mod.Receiver:
     receiver._ownership_admission_lock = threading.Lock()
     receiver._ownership_poisoned = None
     receiver._bounce = Mock()
+    receiver._registrar = SimpleNamespace(
+        self_rank_info=SimpleNamespace(instance_name="gen", instance_rank=0)
+    )
+    receiver._get_or_connect_dealer = Mock()
     return receiver
 
 

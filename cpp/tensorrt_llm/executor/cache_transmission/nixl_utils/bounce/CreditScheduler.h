@@ -93,40 +93,43 @@ public:
     /// A region finished scattering on the receiver -> free it and re-schedule. Idempotent.
     [[nodiscard]] std::vector<Grant> onScatterDone(std::string const& flow, std::uint64_t offset);
 
-    /// Reclaim every flow whose id starts with `prefix` (drop all flows of a gone peer). DEFERS
-    /// freeing any held region whose offset is in `busy` (a scatter is still reading it): those are
-    /// appended to `deferredOut` instead of freed, and the caller MUST later call freeOrphanRegion()
-    /// for each once its scatter completes. `quarantineFor` > 0 marks a RECEIVER-initiated reclaim
-    /// (peer loss / lease expiry): unlike a sender cancel there is no sender-side drain guaranteeing
-    /// the RDMA writes into the granted regions have ended, and a one-sided write cannot be aborted
-    /// — so every non-busy held region is QUARANTINED for that duration (kept out of the arena;
-    /// reapQuarantine() frees it once the deadline passes) instead of freed immediately.
+    /// Reclaim every flow whose id starts with `prefix`. Regions in `busy` remain owned as
+    /// orphans until the caller proves scatter completion and calls freeOrphanRegion(). This
+    /// low-level API requires independent evidence that remote writes have stopped. A positive
+    /// `quarantineFor` delays reuse but cannot establish that evidence; the v3 transport uses
+    /// quarantineFlow() for every flow whose remote writes remain unproven.
     [[nodiscard]] std::vector<Grant> reclaimByPrefix(std::string const& prefix,
         std::unordered_set<std::uint64_t> const& busy, std::vector<std::uint64_t>& deferredOut,
         std::chrono::milliseconds quarantineFor = std::chrono::milliseconds{0});
 
+    /// Fence a flow without assuming remote RDMA stopped. Its non-scattering allocations
+    /// remain held until releaseQuarantinedFlow receives explicit sender drain evidence.
+    [[nodiscard]] std::vector<Grant> quarantineFlow(std::string const& flow,
+        std::unordered_set<std::uint64_t> const& busy, std::vector<std::uint64_t>& deferredOut);
+    [[nodiscard]] std::vector<Grant> releaseQuarantinedFlow(std::string const& flow);
+    [[nodiscard]] std::vector<std::string> flowKeys() const;
+    [[nodiscard]] bool hasUnprovenRemoteWrites() const;
+    void closeGrantAdmission();
+
     /// Free a region deferred by reclaimByPrefix (its in-flight scatter has finished) + re-schedule.
     [[nodiscard]] std::vector<Grant> freeOrphanRegion(std::uint64_t offset);
 
-    /// Cancel ONE flow (explicit abort / empty WANT): free its held regions and drop it. Any held
-    /// region in `busy` (a scatter is still reading it) is deferred to `deferredOut` instead of freed
-    /// (caller later calls freeOrphanRegion). Frees the granted-but-unwritten regions a failed sender
-    /// would otherwise leak until peer loss. The immediate-free default is safe ONLY when the SENDER
-    /// initiated the reclaim (its cancel is sent after draining in-flight writes); receiver-initiated
-    /// reclaims pass `quarantineFor` > 0 (same semantics as reclaimByPrefix).
+    /// Reclaim one flow with the same ownership requirements as reclaimByPrefix(). The v3
+    /// transport calls this only after DRAIN proves remote writes stopped, and retains every busy
+    /// scatter in `deferredOut` until completion. An empty WANT alone cannot justify this call.
     [[nodiscard]] std::vector<Grant> reclaimFlow(std::string const& flow, std::unordered_set<std::uint64_t> const& busy,
         std::vector<std::uint64_t>& deferredOut,
         std::chrono::milliseconds quarantineFor = std::chrono::milliseconds{0});
 
     /// Flows HOLDING at least one region with no progress (no WANT refresh, no grant issued, no
     /// scatter completed) for longer than `idleLimit`. A dead sender emits neither DATA nor a cancel
-    /// — unobservable through the protocol alone — so the receiver reclaims these via
-    /// reclaimFlow(quarantineFor > 0). Pending-only flows tie up no memory and are never reported:
+    /// — unobservable through the protocol alone — so the receiver fences these via
+    /// quarantineFlow(). Pending-only flows tie up no memory and are never reported:
     /// they may legitimately queue behind a full arena for a long time.
     [[nodiscard]] std::vector<std::string> staleFlows(std::chrono::milliseconds idleLimit) const;
 
-    /// Free every quarantined region whose deadline has passed (no write posted before its flow's
-    /// lease expired can plausibly still be in flight) + re-schedule. Returns the resulting grants.
+    /// Release legacy timed-quarantine regions and re-schedule. This cannot release permanent
+    /// flow quarantine and cannot establish remote-write completion evidence.
     [[nodiscard]] std::vector<Grant> reapQuarantine();
 
     /// Time-driven re-evaluation of the drain time-box: schedule() only runs on scheduler events, so
@@ -240,6 +243,7 @@ private:
     // except acquireLocal() from submit() app threads (eager gather staging).
     mutable std::mutex mMu;
 
+    bool mGrantAdmissionClosed{false};
     BuddyAllocator mArena;                             // the single shared region allocator (byte offsets)
     std::uint64_t mBaseAddr{};                         // device addr of offset 0
     std::uint32_t mMaxInflightChunksPerRequest{};      // per-request in-flight allocation cap
@@ -254,26 +258,27 @@ private:
     std::size_t mEagerBudgetBytes{0};
     std::unordered_set<std::uint64_t>
         mOrphans; // regions deferred by flow/peer reclamation (busy scatter), awaiting freeOrphanRegion
-    // Regions reclaimed by a RECEIVER-initiated teardown while possibly still being RDMA-written by
-    // the peer (granted, DATA never arrived), mapped to their reuse deadline. They stay allocated in
-    // the arena (so schedule() can never re-grant them) until reapQuarantine() passes the deadline.
+    // Legacy timed quarantine for direct scheduler callers with independent completion evidence.
+    // The v3 transport uses mUnproven instead: elapsed time cannot retire unknown remote writes.
     std::unordered_map<std::uint64_t, std::chrono::steady_clock::time_point> mQuarantined;
+    std::unordered_map<std::string, std::unordered_set<std::uint64_t>> mUnproven;
+
     std::function<std::chrono::steady_clock::time_point()> mClock; // injectable for tests
     // Receiver-only anti-starvation barrier. Every successful remote grant advances mGrantSequence.
     // A flow whose head allocation keeps failing while enough other grants pass it becomes mDrainFlow;
     // schedule() then pauses NEW remote grants until that one head fits. Local acquireLocal() remains
     // untouched, avoiding a cross-direction circular wait in the shared-arena case. The drain is
     // time-boxed by mDrainTimeout (see setDrainTimeout): a silent peer holding regions must not stall
-    // every other peer until its lease + quarantine expire, so an overlong drain is abandoned and the
+    // every other peer while its regions remain pinned, so an overlong drain is abandoned and the
     // normal round-robin sweep resumes. The expiry is checked inside schedule() (on scheduler
     // events) and by pollDrain() (from the periodic timeout sweep, whose granularity is 50 ms..1 s, so
     // expiry may be observed up to one sweep late) — it therefore also fires when no event arrives.
     // Abandoning restarts the head's bypass count, so it may re-latch once the threshold is crossed
     // again: under sustained traffic a permanently blocked head alternates between letting
     // ~threshold grants through and blocking for up to mDrainTimeout. The time-box bounds each stall;
-    // it does not remove the episode — aggregate throughput over a lease + quarantine window stays
-    // low (~threshold grants per mDrainTimeout) until the silent peer's regions are lease-reclaimed
-    // and reaped, or the blocked head's own sender cancels at requestTimeoutMs (a pending-only head
+    // it does not remove the episode — throughput remains low (~threshold grants per mDrainTimeout)
+    // until the silent peer's regions acquire physical drain evidence, or the blocked head's own
+    // sender cancels at requestTimeoutMs (a pending-only head
     // holds no regions and is never lease-reclaimed itself).
     static constexpr std::uint64_t kMinimumBypassGrants{8};
     static constexpr std::uint64_t kBypassRounds{2};

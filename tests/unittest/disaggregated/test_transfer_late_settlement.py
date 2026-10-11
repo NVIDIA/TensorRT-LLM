@@ -77,9 +77,9 @@ def test_late_settlement_requires_positive_retained_status(query: object) -> Non
     status = None if query is None else Mock()
     if status is not None:
         if isinstance(query, Exception):
-            status.is_completed.side_effect = query
+            status.is_quiesced.side_effect = query
         else:
-            status.is_completed.return_value = query
+            status.is_quiesced.return_value = query
     task = _in_doubt_task(status)
     operation = task._physical_operations[7]
     request = operation.request
@@ -101,7 +101,7 @@ def test_late_settlement_rejects_replaced_status() -> None:
         task._physical_operations[7].status = replacement
         return True
 
-    status.is_completed.side_effect = replace
+    status.is_quiesced.side_effect = replace
     assert not task.poll_in_doubt_physical_operation(7)
     assert not task.resources_drained
     assert task._physical_operations[7].status is replacement
@@ -116,7 +116,7 @@ def test_concurrent_late_done_retires_once_without_changing_failure() -> None:
         barrier.wait()
         return True
 
-    status.is_completed.side_effect = done
+    status.is_quiesced.side_effect = done
     task = _in_doubt_task(status)
     original_error = RuntimeError("original failure")
     task.fail(original_error)
@@ -142,7 +142,7 @@ def test_concurrent_late_done_retires_once_without_changing_failure() -> None:
 
 @pytest.mark.cpu_only
 def test_late_done_does_not_retire_active_sibling() -> None:
-    task = _in_doubt_task(Mock(is_completed=Mock(return_value=True)))
+    task = _in_doubt_task(Mock(is_quiesced=Mock(return_value=True)))
     assert task.begin_physical_operation(8)
     assert task.poll_in_doubt_physical_operation(7)
     assert not task.resources_drained
@@ -240,7 +240,7 @@ def test_sender_late_done_reports_physical_failure_only(
     sender._sessions[401] = session
     if not auxiliary:
         task.expected_transfers = 1
-    status = Mock(wait=Mock(return_value=False), is_completed=Mock(return_value=False))
+    status = Mock(wait=Mock(return_value=False), is_quiesced=Mock(return_value=False))
     status.last_status_str.return_value = "ERROR"
     sender._agent = SimpleNamespace(name="nixl", submit_transfer_requests=lambda request: status)
     request = SimpleNamespace(op="WRITE", remote_name="gen")
@@ -274,7 +274,7 @@ def test_sender_late_done_reports_physical_failure_only(
     assert not task.resources_drained
     sender._poll_in_doubt_transfers(0)
     assert dealer.send.call_count == 1
-    status.is_completed.return_value = True
+    status.is_quiesced.return_value = True
     sender._poll_in_doubt_transfers(0)
     sender._poll_in_doubt_transfers(0)
 
@@ -283,7 +283,7 @@ def test_sender_late_done_reports_physical_failure_only(
     assert task._exception is original_error
     if handle is not None:
         assert isinstance(handle.poll(), Failed)
-    assert sender._ownership_poisoned is not None
+    assert sender._ownership_poisoned is None
     assert not sender._pending_settlements[0]
     assert dealer.send.call_count == 2
     messages = [call.args[0] for call in dealer.send.call_args_list]
@@ -303,7 +303,9 @@ def test_sender_late_done_reports_physical_failure_only(
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("auxiliary", [False, True])
-def test_receiver_late_settlement_retains_logical_failure_and_quarantine(auxiliary: bool) -> None:
+def test_receiver_late_settlement_retains_logical_failure_without_poisoning_worker(
+    auxiliary: bool,
+) -> None:
     receiver = object.__new__(transfer_mod.Receiver)
     receiver._enforce_physical_ownership = True
     receiver._sessions_lock, receiver._sessions = threading.Lock(), {}
@@ -340,7 +342,7 @@ def test_receiver_late_settlement_retains_logical_failure_and_quarantine(auxilia
     assert session.resources_drained()
     assert session.status is SessionStatus.ERROR
     assert session.exception is error
-    assert receiver._ownership_poisoned is not None
+    assert receiver._ownership_poisoned is None
     receiver._bounce.record_failure.assert_called_once_with((401, 0), 7)
     assert session.close()
 
@@ -349,7 +351,7 @@ def test_receiver_late_settlement_retains_logical_failure_and_quarantine(auxilia
 def test_settlement_retries_in_order_without_releasing_twice() -> None:
     sender = _sender()
     task = transfer_mod.KVSendTask(_chunk(), _params(), slice_id=0)
-    status = Mock(is_completed=Mock(return_value=True))
+    status = Mock(is_quiesced=Mock(return_value=True))
     assert task.begin_physical_operation(7)
     task.begin_backend_submission(7, object())
     task.record_backend_submission(7, status)
@@ -372,7 +374,7 @@ def test_settlement_retries_in_order_without_releasing_twice() -> None:
     dealer.send.side_effect = [RuntimeError("initial send"), None, RuntimeError("late send"), None]
     sender._get_result_dealer = Mock(return_value=dealer)
     sender._retain_in_doubt_transfer(meta, initial, send_slot_id=12)
-    status.is_completed.assert_not_called()
+    status.is_quiesced.assert_not_called()
     sender._poll_in_doubt_transfers(0)
     assert task.resources_drained
     assert sender._pending_settlements[0]
@@ -382,7 +384,7 @@ def test_settlement_retries_in_order_without_releasing_twice() -> None:
     sender._poll_in_doubt_transfers(0)
     assert not sender._pending_settlements[0]
     sender._bounce.release_send.assert_called_once_with(12)
-    status.is_completed.assert_called_once()
+    status.is_quiesced.assert_called_once()
     assert task.transferred_count == 1
     codes = [
         transfer_mod._KV_RESULT_PREFIX.unpack(call.args[0][1])[4]
@@ -400,7 +402,7 @@ def test_committed_session_outcome_survives_late_settlement(
     direction: str, terminal_kind: str, poll_early: bool
 ) -> None:
     """Integration seam with the event-time logical-outcome commit change."""
-    status = Mock(is_completed=Mock(return_value=True))
+    status = Mock(is_quiesced=Mock(return_value=True))
     if direction == "send":
         sender = Mock()
         sender._enforce_physical_ownership = True
@@ -474,7 +476,7 @@ def test_worker_polls_retained_status_when_queue_is_idle(
     sender = _sender()
     sender._thread_local = threading.local()
     task = transfer_mod.KVSendTask(_chunk(), _params(), slice_id=0)
-    status = Mock(is_completed=Mock(side_effect=[False, True]))
+    status = Mock(is_quiesced=Mock(side_effect=[False, True]))
     assert task.begin_physical_operation(7)
     task.begin_backend_submission(7, object())
     task.record_backend_submission(7, status)
@@ -519,6 +521,6 @@ def test_worker_polls_retained_status_when_queue_is_idle(
     assert task.resources_drained
     assert not sender._pending_settlements[0]
     assert dealer.send.call_count == (4 if initial_send_fails else 2)
-    assert status.is_completed.call_count == 2
+    assert status.is_quiesced.call_count == 2
     assert task.status is transfer_mod.TaskStatus.ERROR
     sender._shutdown = True

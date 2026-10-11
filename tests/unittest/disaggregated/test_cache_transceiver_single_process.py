@@ -82,6 +82,7 @@ from tensorrt_llm.bindings import ModelConfig as ModelConfigCpp
 from tensorrt_llm.bindings.internal.batch_manager import CacheType as CacheTypeCpp
 from tensorrt_llm.bindings.internal.batch_manager import ReqIdsSet
 from tensorrt_llm.bindings.internal.testing import simulate_prefill_completion_only_use_for_testing
+from tensorrt_llm.disaggregated_params import DisaggScheduleStyle
 from tensorrt_llm.llmapi.llm_args import BlockReuseConfig, CacheTransceiverConfig, KvCacheConfig
 
 AttentionTypeCpp = tensorrt_llm.bindings.internal.batch_manager.AttentionType
@@ -1299,6 +1300,8 @@ def run_transfer_test(
         if expect_cpp_bounce
         else None,
     )
+    if expect_cpp_bounce:
+        config.kv_transfer_timeout_ms = 30_000
     ctx_tcs = create_instance_transceivers(
         ctx_tp, ctx_pp, ctx_enable_dp, ctx_managers, config, is_mla
     )
@@ -1341,7 +1344,14 @@ def run_transfer_test(
                 is_streaming=False,
                 llm_request_type=LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY,
             )
-            ctx_request.py_disaggregated_params = DisaggregatedParams(disagg_request_id=unique_rid)
+            schedule_style = (
+                DisaggScheduleStyle.GENERATION_FIRST
+                if expect_cpp_bounce
+                else DisaggScheduleStyle.CONTEXT_FIRST
+            )
+            ctx_request.py_disaggregated_params = DisaggregatedParams(
+                disagg_request_id=unique_rid, schedule_style=schedule_style
+            )
 
             gen_request = LlmRequest(
                 request_id=gen_rid,
@@ -1358,6 +1368,7 @@ def run_transfer_test(
                 ctx_dp_rank=ctx_dp_rank,
                 ctx_info_endpoint=ctx_info_endpoint,
                 disagg_request_id=unique_rid,
+                schedule_style=schedule_style,
             )
             if gen_scratch_tokens > 0:
                 # Mark the request as MTP so its draft length matches the
@@ -1420,6 +1431,19 @@ def run_transfer_test(
                 if kv is not None:
                     gen_kv_caches[rank].append(kv)
                 gen_tcs[rank].request_and_receive_async(req)
+
+        # Generation-first seals the AUX peer snapshot only after the scheduler
+        # observes every REQUEST_DATA. Model that admission boundary here too.
+        if expect_cpp_bounce:
+            ready_deadline = time.monotonic() + 10
+            for rank in range(ctx_world):
+                for _, req in ctx_handle_map[rank]:
+                    rid = get_unique_rid(req)
+                    while not ctx_tcs[rank]._transfer_worker.has_all_peer_req_infos_for_send(rid):
+                        assert time.monotonic() < ready_deadline, (
+                            "generation-first peer publication did not complete"
+                        )
+                        time.sleep(0.01)
 
         # 6. ctx send after
         for rank in range(ctx_world):
@@ -1990,10 +2014,10 @@ def test_cache_transceiver_v1_masked_dsa_indexer_across_asymmetric_pp() -> None:
         pytest.param(1, 1, 1, 1, False, True, False, id="v2_mha"),
         pytest.param(2, 1, 2, 1, True, True, False, id="v2_mla_tp2"),
         pytest.param(1, 1, 1, 1, True, False, True, id="v1_dsa_indexer"),
-        pytest.param(2, 1, 1, 2, False, True, False, id="v2_ctx_tp2_gen_pp2"),
     ],
 )
 def test_python_nixl_cache_transceiver_uses_cpp_bounce(
+    monkeypatch: pytest.MonkeyPatch,
     ctx_tp: int,
     ctx_pp: int,
     gen_tp: int,
@@ -2014,6 +2038,21 @@ def test_python_nixl_cache_transceiver_uses_cpp_bounce(
     from tensorrt_llm.tensorrt_llm_transfer_agent_binding import TransferStatus
 
     assert hasattr(TransferStatus, "get_last_status_str")
+    assert hasattr(TransferStatus, "is_quiesced")
+    assert hasattr(TransferStatus, "request_cancel")
+    monkeypatch.setenv("TRTLLM_DISAGG_NO_RETRY", "1")
+    # ThreadSafeDistributed models several logical ranks inside one process.
+    # Keep the real ownership/watchdog path while isolating its MPI kill route.
+    fatal_events = []
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.disaggregation.transceiver._retirement_executor_comm",
+        lambda _mapping: None,
+    )
+    monkeypatch.setattr(
+        KvCacheTransceiverV2,
+        "_fail_unproven_transfer",
+        lambda _self, event: fatal_events.append(event),
+    )
 
     run_transfer_test(
         ctx_tp=ctx_tp,
@@ -2028,6 +2067,26 @@ def test_python_nixl_cache_transceiver_uses_cpp_bounce(
         enable_indexer_k_cache=enable_indexer_k_cache,
         expect_cpp_bounce=True,
     )
+    assert not fatal_events
+
+
+@pytest.mark.cpu_only
+def test_cpp_bounce_rejects_pipeline_parallelism_before_agent_creation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tensorrt_llm._torch.disaggregation.transceiver import (
+        _validate_agent_bounce_ownership_profile,
+    )
+
+    monkeypatch.setenv("TRTLLM_DISAGG_NO_RETRY", "1")
+    config = CacheTransceiverConfig(
+        backend="NIXL",
+        transceiver_runtime="PYTHON",
+        kv_cache_bounce_size_mb=64,
+        agent_bounce_buffer_enable=True,
+    )
+    with pytest.raises(ValueError, match="PP1/CP1"):
+        _validate_agent_bounce_ownership_profile(Mapping(world_size=2, pp_size=2), config)
 
 
 # ---------------------------------------------------------------------------

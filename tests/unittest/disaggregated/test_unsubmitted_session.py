@@ -58,8 +58,13 @@ def _sender(*, ownership: bool = True) -> transfer_mod.Sender:
     sender._ownership_poison_lock = threading.Lock()
     sender._agent = Mock()
     sender._registrar = Mock()
+    sender._registrar.self_rank_info = SimpleNamespace(ownership_protocol_version=1)
     sender._registrar.get_peer_rank_info.return_value = SimpleNamespace(
-        instance_name="gen", instance_rank=0, dp_rank=0, self_endpoint="tcp://gen:1234"
+        instance_name="gen",
+        instance_rank=0,
+        dp_rank=0,
+        self_endpoint="tcp://gen:1234",
+        ownership_protocol_version=1,
     )
     sender._registrar.get_peer_overlap.return_value = SimpleNamespace(ranks=[0])
     return sender
@@ -182,7 +187,7 @@ def test_worker_orders_session_ack_after_piece_reports(
         session.kv_tasks.append(task)
         assert task.begin_physical_operation(0)
         task.begin_backend_submission(0, object())
-        task.record_backend_submission(0, Mock(is_completed=Mock(return_value=True)))
+        task.record_backend_submission(0, Mock(is_quiesced=Mock(return_value=True)))
         task.mark_physical_operation_in_doubt(0)
         empty = np.empty(0, dtype=np.int64)
         meta = transfer_mod.WriteMeta(task, 1, "gen", 0, "tcp://gen:1234", 401, empty, empty, empty)
@@ -309,7 +314,7 @@ def test_cancel_does_not_acknowledge_while_a_physical_write_is_unproven() -> Non
     assert task.begin_physical_operation(0)
     request = object()
     task.begin_backend_submission(0, request)
-    status = Mock(is_completed=Mock(return_value=False))
+    status = Mock(is_quiesced=Mock(return_value=False))
     task.record_backend_submission(0, status)
     task.mark_physical_operation_in_doubt(0)
 
@@ -325,7 +330,7 @@ def test_cancel_does_not_acknowledge_while_a_physical_write_is_unproven() -> Non
     assert sender._get_session(401) is session
     assert task._physical_operations[0].request is request
 
-    status.is_completed.return_value = True
+    status.is_quiesced.return_value = True
     assert task.poll_in_doubt_physical_operation(0)
     _assert_session_ack(sender)
     assert session.close()
@@ -351,7 +356,7 @@ def test_session_ack_waits_for_admitted_and_submitting_pieces(piece: str, state:
     if state == "admitted":
         task.retire_unsubmitted_physical_operation(0)
     else:
-        task.record_backend_submission(0, Mock(is_completed=Mock(return_value=True)))
+        task.record_backend_submission(0, Mock(is_quiesced=Mock(return_value=True)))
         assert task.retire_backend_done_physical_operation(0)
     _assert_session_ack(sender)
     assert session.close()

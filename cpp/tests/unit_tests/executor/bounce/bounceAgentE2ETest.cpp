@@ -136,6 +136,52 @@ std::unique_ptr<kvc::NixlTransferAgent> tryMakeAgent(kvc::BaseAgentConfig cfg, s
         return nullptr;
     }
 }
+
+class FailedPhysicalStatus final : public kvc::TransferStatus
+{
+public:
+    explicit FailedPhysicalStatus(std::shared_ptr<std::atomic<bool>> stopped)
+        : mStopped(std::move(stopped))
+    {
+    }
+
+    bool isCompleted() const override
+    {
+        return false;
+    }
+
+    kvc::TransferState wait(int64_t) const override
+    {
+        return kvc::TransferState::kFAILURE;
+    }
+
+    bool isQuiesced() const override
+    {
+        return mStopped->load(std::memory_order_acquire);
+    }
+
+private:
+    std::shared_ptr<std::atomic<bool>> mStopped;
+};
+
+class FailedPhysicalAgent final : public kvc::NixlTransferAgent
+{
+public:
+    FailedPhysicalAgent(kvc::BaseAgentConfig const& config, std::shared_ptr<std::atomic<bool>> stopped)
+        : kvc::NixlTransferAgent(config)
+        , mStopped(std::move(stopped))
+    {
+    }
+
+    std::unique_ptr<kvc::TransferStatus> postXferRequest(kvc::TransferOp, kvc::TransferDescs const&,
+        kvc::TransferDescs const&, std::string const&, std::optional<kvc::SyncMessage> const&) override
+    {
+        return std::make_unique<FailedPhysicalStatus>(mStopped);
+    }
+
+private:
+    std::shared_ptr<std::atomic<bool>> mStopped;
+};
 } // namespace
 
 // BaseAgentConfig::agentBufferSizeMb (derived from CacheTransceiverConfig's
@@ -194,6 +240,9 @@ TEST(BounceAgentE2E, SubmitTransferRequestsUsesBounce)
     EXPECT_EQ(waitTerminal(status, 30), kvc::TransferState::kSUCCESS)
         << "bounce transfer via submitTransferRequests did not succeed";
     EXPECT_TRUE(verifyXferBufs(bufs));
+    EXPECT_TRUE(status->isQuiesced());
+    (void) status->release();
+    EXPECT_TRUE(status->isQuiesced());
 
     a->shutdown();
     b->shutdown();
@@ -248,7 +297,9 @@ TEST(BounceAgentE2E, EffectiveChunkCapFallsBackToStandardNixl)
     auto const bucket = static_cast<std::size_t>(kvc::bounce::BounceRejectReason::kDescriptorShape);
     EXPECT_EQ(a->getBounceRejectCounts()[bucket], 1u);
     EXPECT_TRUE(verifyXferBufs(bufs));
+    EXPECT_TRUE(status->isQuiesced());
     EXPECT_TRUE(status->release());
+    EXPECT_TRUE(status->isQuiesced());
     status.reset();
 
     a->deregisterMemory(req.getSrcDescs());
@@ -422,4 +473,41 @@ TEST(BounceAgentE2E, MultiAgentManySendersToOneReceiver)
     {
         freeXferBufs(x);
     }
+}
+
+TEST(BounceAgentE2E, FailedBounceStatusSeparatesFailureFromPhysicalCompletion)
+{
+    if (!hasCuda())
+    {
+        GTEST_SKIP() << "no CUDA device";
+    }
+    std::string skipMessage;
+    auto receiver = tryMakeAgent(makeBounceConfig("proofAgentReceiver"), skipMessage);
+    if (!receiver)
+    {
+        GTEST_SKIP() << "NIXL unavailable: " << skipMessage;
+    }
+    auto stopped = std::make_shared<std::atomic<bool>>(false);
+    auto sender = std::make_unique<FailedPhysicalAgent>(makeBounceConfig("proofAgentSender"), stopped);
+    sender->loadRemoteAgent("proofAgentReceiver", receiver->getLocalAgentDesc());
+    auto buffers = makeXferBufs(8, 256, 19);
+    auto status = sender->submitTransferRequests(makeReq(buffers, "proofAgentReceiver"));
+    ASSERT_NE(status, nullptr);
+    ASSERT_EQ(waitTerminal(status, 10), kvc::TransferState::kFAILURE);
+    EXPECT_FALSE(status->isCompleted());
+    EXPECT_FALSE(status->isQuiesced());
+    EXPECT_TRUE(status->requestCancel());
+    EXPECT_FALSE(status->isQuiesced());
+    stopped->store(true, std::memory_order_release);
+    auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!status->isQuiesced() && std::chrono::steady_clock::now() < deadline)
+    {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    EXPECT_TRUE(status->isQuiesced());
+    EXPECT_FALSE(status->isCompleted());
+    EXPECT_EQ(status->wait(0), kvc::TransferState::kFAILURE);
+    sender->shutdown();
+    receiver->shutdown();
+    freeXferBufs(buffers);
 }

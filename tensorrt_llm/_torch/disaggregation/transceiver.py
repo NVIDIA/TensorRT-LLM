@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import math
 import os
 import threading
 import time
@@ -105,8 +106,8 @@ def _fail_unproven_kv_transfer(
 ) -> None:
     """Terminate the executor world without running ordinary resource cleanup.
 
-    Called by the independent retirement watchdog after fatal expiry is sticky
-    and transfer admission is closed. The existing MPI/launcher crash path
+    Called after the watchdog or final executor release guard latches fatal
+    containment and closes transfer admission. The MPI/launcher crash path
     makes the endpoint unhealthy; request failure is not memory-release proof.
     The communicator identifies the executor, not an isolated failure domain:
     Open MPI aborts the entire job, including other executors in split worlds.
@@ -230,6 +231,31 @@ def _validate_fp4_mla_bridge_profile(
     return True
 
 
+def _validate_agent_bounce_ownership_profile(
+    mapping: Mapping, config: CacheTransceiverConfig
+) -> bool:
+    """Qualify the lifecycle assumptions required by native bounce draining."""
+    if not config.agent_bounce_buffer_enable or config.kv_cache_bounce_size_mb <= 0:
+        return False
+    requirements = {
+        "C++ NIXL binding": not use_pure_python_transfer_agent(),
+        "finite positive kv_transfer_timeout_ms": (
+            config.kv_transfer_timeout_ms is not None
+            and math.isfinite(config.kv_transfer_timeout_ms)
+            and config.kv_transfer_timeout_ms > 0
+        ),
+        "TRTLLM_DISAGG_NO_RETRY=1": os.getenv("TRTLLM_DISAGG_NO_RETRY", "0") == "1",
+        "PP1/CP1": mapping.pp_size == 1 and mapping.cp_size == 1,
+        "non-pipelined transfer": not config.enable_pipelined_transfer,
+        "async transfer": os.getenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP") != "1",
+        "non-layerwise transfer": os.getenv("TRTLLM_DISAGG_LAYERWISE") != "1",
+    }
+    missing = [name for name, supported in requirements.items() if not supported]
+    if missing:
+        raise ValueError("C++ bounce physical ownership requires " + ", ".join(missing))
+    return True
+
+
 class KvCacheTransceiverV2(KvCacheTransceiver):
     @property
     def consumes_transfer_buffer(self) -> bool:
@@ -261,10 +287,16 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             else None
         )
         self._check_compatible()
-        enforce_physical_ownership = _validate_fp4_mla_bridge_profile(
+        self._fp4_mla_bridge_enabled = _validate_fp4_mla_bridge_profile(
             mapping, kv_cache_manager, cache_transceiver_config
         )
-        self._fp4_mla_bridge_enabled = enforce_physical_ownership
+        self._agent_bounce_ownership_enabled = _validate_agent_bounce_ownership_profile(
+            mapping, cache_transceiver_config
+        )
+        enforce_physical_ownership = (
+            self._fp4_mla_bridge_enabled or self._agent_bounce_ownership_enabled
+        )
+        self._enforce_physical_ownership = enforce_physical_ownership
         self._retirement_mpi_comm = (
             _retirement_executor_comm(mapping) if enforce_physical_ownership else None
         )
@@ -321,10 +353,10 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         )
         if enforce_physical_ownership:
             logger.info(
-                "FP4 MLA KV ownership bridge ENABLED: "
+                "KV physical ownership ENABLED: "
                 f"rank={rank}/{mapping.world_size}, backend=NIXL, runtime=PYTHON, "
-                "request_schedule_required=GENERATION_FIRST, attention_dp=True, pp=1, cp=1, "
-                "retry=False, async=True, layerwise=False, bounce_mb=0, "
+                "request_schedule_required=GENERATION_FIRST, pp=1, cp=1, "
+                "retry=False, async=True, layerwise=False, "
                 "unproven_retirement=fail_stop, termination_scope=mpi_job_or_launcher, "
                 f"kv_transfer_timeout_ms={self.kv_transfer_timeout_ms}"
             )
@@ -625,7 +657,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         return params is not None and params.schedule_style == DisaggScheduleStyle.GENERATION_FIRST
 
     def _validate_bridge_req(self, req: LlmRequest, synchronous: bool = False) -> bool:
-        if not getattr(self, "_fp4_mla_bridge_enabled", False):
+        if not getattr(self, "_enforce_physical_ownership", False):
             return True
         params = req.py_disaggregated_params
         rid = None if params is None else params.disagg_request_id
@@ -637,7 +669,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             or rid < 0
         ):
             logger.error(
-                "FP4 MLA lifecycle bridge requires async generation-first requests "
+                "KV physical ownership requires async generation-first requests "
                 "with a non-negative integer disagg_request_id"
             )
             req.state = LlmRequestState.DISAGG_TRANS_ERROR
@@ -989,6 +1021,34 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         """Whether req's send session was torn down before its last slice."""
         return req.py_kv_send_session_retired and get_unique_rid(req) not in self._send_sessions
 
+    def require_request_quiescence(self, req: LlmRequest) -> None:
+        """Protect KV release even when an unrelated executor error bypasses polling."""
+        if not getattr(self, "_enforce_physical_ownership", False):
+            return
+        rid = get_unique_rid(req)
+        for direction, sessions in (
+            ("send", self._send_sessions),
+            ("receive", self._recv_sessions),
+        ):
+            session = sessions.get(rid)
+            if session is None:
+                continue
+            # Close future admission before checking physical claims. This path
+            # is an executor teardown, not the normal asynchronous cancellation.
+            session.cancel_local()
+            if self._ownership_blocks_retirement(session) or session.close() is False:
+                watchdog = self._transfer_worker._retirement_watchdog
+                assert watchdog is not None
+                event = watchdog.reject_unproven_retirement(req.py_request_id, direction)
+                self._fail_unproven_transfer(event)
+                # A test/faulty callback must never authorize the caller's free.
+                raise RuntimeError("executor resource release refused: KV is not quiescent")
+            if direction == "send":
+                self._retire_send_session(rid, req, session_already_closed=True)
+            else:
+                self._recv_sessions.pop(rid, None)
+                self._recv_reqs.pop(rid, None)
+
     def _build_prefill_extent(
         self,
         req: LlmRequest,
@@ -1057,7 +1117,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         session = self._get_or_create_send_session(req)
         if session is None:
             return
-        bridge_enabled = getattr(self, "_fp4_mla_bridge_enabled", False)
+        bridge_enabled = getattr(self, "_enforce_physical_ownership", False)
         if bridge_enabled:
             # Root the request before backend admission so its source pages
             # outlive every ownership-enabled NIXL operation.
@@ -1091,6 +1151,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         except Exception as error:
             if bridge_enabled:
                 cast(Any, session).set_exception(f"transfer admission failed: {error}")
+                return
             raise
 
     @nvtx_range("KvCacheTransceiverV2.request_and_receive_sync")
@@ -1200,12 +1261,15 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             # The handle that comes back is the contract's answer about this piece. What retires
             # the request is the sweep over the session tables, as it was before.
             fetches.fetch(extent, expected_write_bytes=chunk_bytes)
-        except Exception:
+        except Exception as error:
             # No session means no publication and nothing the sweep could ever pair the request
             # with, so the registration made here is undone here and the request goes terminal.
             if self._legacy_session(fetches) is None:
                 del self._recv_reqs[rid]
                 req.state = LlmRequestState.DISAGG_TRANS_ERROR
+            elif getattr(self, "_enforce_physical_ownership", False):
+                self._legacy_session(fetches).fail_admission(error)
+                return
             raise
         finally:
             # The session exists even when publication failed, and the legacy sweep owns it.
@@ -1295,7 +1359,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         # DP ranks (entries that will never have a TxSession created for them).
         self._transfer_worker.sweep_stale_req_infos()
 
-        if getattr(self, "_fp4_mla_bridge_enabled", False):
+        if getattr(self, "_enforce_physical_ownership", False):
             # CtxTransferStatus has no cancellation channel. In the qualified
             # no-retry bridge, a globally quiesced cancellation is a terminal
             # send failure that the executor must consume to release its

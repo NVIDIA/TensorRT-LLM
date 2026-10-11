@@ -69,7 +69,11 @@ from tensorrt_llm._torch.disaggregation.native.mixers.ssm.peer import (
 )
 from tensorrt_llm._torch.disaggregation.native.peer import PeerOverlap, PeerRegistrar
 from tensorrt_llm._torch.disaggregation.native.perf_logger import PerfTimer, perf_log_manager
-from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
+from tensorrt_llm._torch.disaggregation.native.rank_info import (
+    NATIVE_OWNERSHIP_PROTOCOL_VERSION,
+    RankInfo,
+    validate_ownership_peer,
+)
 from tensorrt_llm._torch.disaggregation.native.retirement import (
     QuiescenceFatalEvent,
     RetirementDeadline,
@@ -406,7 +410,7 @@ class _ReceiveOperationOwner:
             self._settle_if_drained_locked()
 
     def abort_publication(self, published_writers: set[int]) -> None:
-        """Close a failed fan-out around the writers whose sends succeeded."""
+        """Close a failed fan-out around every writer whose send was attempted."""
         with self._lock:
             published = frozenset(published_writers)
             if self._writer_cohort is not None and not published.issubset(self._writer_cohort):
@@ -689,6 +693,7 @@ class SendTaskBase(_LogicalTask):
         self._perf_timer = PerfTimer() if perf_log_manager.enabled else None
         self._physical_lock = threading.Lock()
         self._physical_operations: dict[int, _PhysicalOperation] = {}
+        self._cancel_requested = False
 
     def bind_logical_outcomes(self, outcomes: _LogicalOutcomes) -> None:
         """Bind session outcome and deadline before exposing the task to workers.
@@ -752,6 +757,9 @@ class SendTaskBase(_LogicalTask):
             operation = self._require_physical_operation_locked(
                 peer_rank, (_PhysicalOperationState.ADMITTED,)
             )
+            if self._cancel_requested:
+                operation.state = _PhysicalOperationState.NOT_SUBMITTED
+                raise _TransferNotSubmittedError("source operation was cancelled before submission")
             if self._retirement is not None and not self._retirement.expose(operation):
                 operation.state = _PhysicalOperationState.NOT_SUBMITTED
                 raise _TransferNotSubmittedError("source retirement admission is closed")
@@ -765,6 +773,35 @@ class SendTaskBase(_LogicalTask):
             )
             operation.status = status
             operation.state = _PhysicalOperationState.SUBMITTED
+            cancel_requested = self._cancel_requested
+        # Submission may return after cancellation took its status snapshot.
+        if cancel_requested:
+            self._request_status_cancel(status)
+
+    @staticmethod
+    def _request_status_cancel(status: object) -> None:
+        """Invoke the backend outside every ownership/session lock."""
+        cancel = getattr(status, "request_cancel", None)
+        if cancel is None:
+            return
+        try:
+            cancel()
+        except Exception as error:
+            # Cancellation is best effort. Retained ownership and the watchdog
+            # still prevent reuse if the backend cannot provide completion.
+            logger.warning(f"Unable to request physical transfer drain: {error}")
+
+    def request_physical_cancel(self) -> None:
+        """Fence new operations and asynchronously drain retained status handles."""
+        with self._physical_lock:
+            self._cancel_requested = True
+            statuses = [
+                operation.status
+                for operation in self._physical_operations.values()
+                if operation.status is not None
+            ]
+        for status in statuses:
+            self._request_status_cancel(status)
 
     def mark_physical_operation_in_doubt(self, peer_rank: int) -> None:
         with self._physical_lock:
@@ -811,7 +848,7 @@ class SendTaskBase(_LogicalTask):
             return True
 
     def poll_in_doubt_physical_operation(self, peer_rank: int) -> bool:
-        """Retire once, only after a fresh DONE query on the retained status.
+        """Retire once, only after fresh physical proof from the retained status.
 
         Polling does not change the task's logical outcome. Keep strong local
         roots across the query, and reject a result if its operation changed.
@@ -824,7 +861,8 @@ class SendTaskBase(_LogicalTask):
         if status is None:
             return False
         try:
-            completed = status.is_completed()
+            proof = getattr(status, "is_quiesced", None)
+            completed = proof() if proof is not None else False
         except Exception:
             # A backend query failure is not evidence that its accessors stopped.
             return False
@@ -1175,6 +1213,8 @@ class Sender(SenderBase):
             # SUBMITTING already retains the request. Neither backend admission
             # nor completion may hold the lock needed by deadline containment.
             status = self._agent.submit_transfer_requests(request)
+            if status is None:
+                raise RuntimeError("backend submission returned no physical operation handle")
             task.record_backend_submission(peer_rank, status)
         except Exception as error:
             with self._ownership_poison_lock:
@@ -1182,21 +1222,24 @@ class Sender(SenderBase):
                 task.mark_physical_operation_in_doubt(peer_rank)
             return False, str(error)
         try:
-            if not status.wait():
-                # A non-success query is a logical transfer failure, but the
-                # current binding does not expose a backend-defined proof that
-                # the request handle has released every memory accessor. Treat
-                # it as physically unresolved until that contract is available.
+            # A native wait must not hide the Python request timeout. Once this
+            # slice expires, request C++ drain while the watchdog retains KV.
+            timeout_ms = (
+                max(1, int(task._retirement.timeout_s * 1000))
+                if task._retirement is not None
+                else None
+            )
+            if not status.wait(timeout_ms=timeout_ms):
+                # Failure is immutable, but the retained handle can later prove
+                # physical completion. Quarantine this operation, not unrelated
+                # sessions whose memory is independently owned.
                 detail = getattr(status, "last_status_str", lambda: "<no detail>")()
-                error = RuntimeError(f"NIXL transfer outcome is ambiguous: {detail}")
-                with self._ownership_poison_lock:
-                    self._ownership_poisoned = error
-                    task.mark_physical_operation_in_doubt(peer_rank)
+                task.mark_physical_operation_in_doubt(peer_rank)
+                task._request_status_cancel(status)
                 return False, detail
         except Exception as error:
-            with self._ownership_poison_lock:
-                self._ownership_poisoned = error
-                task.mark_physical_operation_in_doubt(peer_rank)
+            task.mark_physical_operation_in_doubt(peer_rank)
+            task._request_status_cancel(status)
             return False, str(error)
         if not task.retire_backend_done_physical_operation(peer_rank):
             return False, "quiescence deadline expired before backend completion"
@@ -1965,6 +2008,7 @@ class Sender(SenderBase):
         torch.cuda.set_device(self._device_id)
         CUASSERT(cudart.cudaSetDevice(self._device_id))
         ri: RankInfo = RankInfo.from_bytes(message[1])
+        validate_ownership_peer(self._registrar.self_rank_info, ri)
         agent_name = ri.instance_name + str(ri.instance_rank)
         logger.debug(f"Loading remote transfer agent descriptor for peer '{agent_name}'")
         # NIXL serializes descriptor load against submit internally. This lock
@@ -2060,6 +2104,10 @@ class Sender(SenderBase):
         # _sessions_lock prevents a race between session lookup and req_info save.
         # session.lock atomically saves peer info and snapshots tasks against send().
         info: RecvReqInfo = RecvReqInfo.from_bytes(message[1])
+        # Validate before saving a request or dispatching even an existing task.
+        # An unregistered/rejected peer must never enter the pending-info cache.
+        peer_info = self._registrar.get_peer_rank_info(info.instance_name, info.instance_rank)
+        validate_ownership_peer(self._registrar.self_rank_info, peer_info)
         with self._sessions_lock:
             session = self._get_session(info.unique_rid)
             fenced = (
@@ -2615,6 +2663,10 @@ class TxSession(TxSessionBase):
             req_infos = list((self._sender._get_req_info(self.disagg_request_id) or {}).values())
             if report_unsubmitted_aux:
                 aux_failures = self._claim_unsubmitted_aux_failures_locked(req_infos)
+            tasks = self.kv_tasks + ([self.aux_task] if self.aux_task is not None else [])
+        if self._enforce_physical_ownership:
+            for task in tasks:
+                task.request_physical_cancel()
         self._report_unsubmitted_aux_failures(aux_failures)
         return True
 
@@ -2755,6 +2807,10 @@ class TxSession(TxSessionBase):
                 self.aux_task.fail(self._exception)
             req_infos = list((self._sender._get_req_info(self.disagg_request_id) or {}).values())
             aux_failures = self._claim_unsubmitted_aux_failures_locked(req_infos)
+            tasks = self.kv_tasks + ([self.aux_task] if self.aux_task is not None else [])
+        if self._enforce_physical_ownership:
+            for task in tasks:
+                task.request_physical_cancel()
         self._report_unsubmitted_aux_failures(aux_failures)
 
     @property
@@ -3317,11 +3373,9 @@ class Receiver(ReceiverBase):
                 if task._perf_timer is not None:
                     task._perf_timer.record_task_start(rank)
                 published_writers.add(rank)
-                try:
-                    self._request_sender_data(peer_infos.sender_endpoints[rank], payload)
-                except Exception:
-                    published_writers.discard(rank)
-                    raise
+                # A send may escape before raising. The attempted writer keeps
+                # its destination claim until settlement or session fencing.
+                self._request_sender_data(peer_infos.sender_endpoints[rank], payload)
 
         # Gen-first ADP publishes the destination to every eligible DP group,
         # but the qualified immutable-request, no-retry/no-reroute profile
@@ -3387,6 +3441,7 @@ class Receiver(ReceiverBase):
             # (handled in dispatch_task) so only requests targeting this peer
             # fail, and cached so later requests fail fast.
             try:
+                validate_ownership_peer(self._registrar.self_rank_info, sender_info)
                 MambaPolicy.validate_peer_compatible(
                     self._registrar.self_rank_info,
                     sender_info,
@@ -3417,7 +3472,9 @@ class Receiver(ReceiverBase):
             return sender_info
 
         else:
-            return self._sender_ep_instance_map[info_endpoint]
+            sender_info = self._sender_ep_instance_map[info_endpoint]
+            validate_ownership_peer(self._registrar.self_rank_info, sender_info)
+            return sender_info
 
     def send_cancel_to_senders(self, unique_rid: int, sender_endpoints: set[str]) -> set[str]:
         """Notify senders and return the endpoints whose cancel message was sent."""
@@ -3666,11 +3723,15 @@ class RxSession(RxSessionBase):
 
     def _record_ownership_evidence_error(self, error: Exception) -> None:
         """Record a fatal ownership-evidence error and close receiver admission."""
+        self._record_unproven_transfer(error)
+        self._poison_receiver_ownership(error)
+
+    def _record_unproven_transfer(self, error: Exception) -> None:
+        """Fail this session while retaining owners until their drain completes."""
         self._logical_outcomes.fail(error)
         self._exception = error
         if self._terminal_status is None:
             self._terminal_status = SessionStatus.ERROR
-        self._poison_receiver_ownership(error)
 
     @property
     def status(self) -> SessionStatus:
@@ -3759,10 +3820,8 @@ class RxSession(RxSessionBase):
                     ):
                         raise RuntimeError("publication did not queue the complete writer cohort")
                 except Exception:
-                    # ZMQ delivers multipart messages atomically. A successful
-                    # send transfers responsibility to that writer; a failed
-                    # send does not. Retain only the successfully queued prefix
-                    # and wait for each of those writers to settle.
+                    # Retain every attempted publication, including a send
+                    # which may have escaped before raising.
                     self._receiver._bounce.abort_publication(
                         (self.disagg_request_id, task.slice_id),
                         published_writers,
@@ -3927,7 +3986,7 @@ class RxSession(RxSessionBase):
                     f"slice={receiver_slice_id} peer_rank={peer_rank}"
                 )
                 task.fail(error)
-                self._record_ownership_evidence_error(error)
+                self._record_unproven_transfer(error)
                 return
             if status == AgentResult.FAILED_QUIESCED:
                 if not self._enforce_physical_ownership:
@@ -4086,7 +4145,7 @@ class RxSession(RxSessionBase):
                     f"{self.request_id} peer_rank={peer_rank}"
                 )
                 self._aux_status = TaskStatus.ERROR
-                self._record_ownership_evidence_error(error)
+                self._record_unproven_transfer(error)
                 return
             if status == AgentResult.FAILED_QUIESCED:
                 if self._aux_physical_owner is None:
@@ -4516,6 +4575,10 @@ class TransferWorker:
     def __init__(self, config: TransferWorkerConfig):
         self._config = config
         self._retirement_watchdog = None
+        if config.agent_buffer_size_mb > 0 and (
+            not config.enforce_physical_ownership or config.quiescence_fatal_callback is None
+        ):
+            raise ValueError("C++ bounce requires physical ownership and qualified fail-stop")
         if config.quiescence_fatal_callback is not None:
             if not config.enforce_physical_ownership:
                 raise ValueError("deadline retirement requires physical ownership")
@@ -4534,6 +4597,9 @@ class TransferWorker:
             kvm,
             config.device_id,
             self._aux_buffer.meta if self._aux_buffer is not None else None,
+        )
+        self._rank_info.ownership_protocol_version = (
+            NATIVE_OWNERSHIP_PROTOCOL_VERSION if config.enforce_physical_ownership else 0
         )
         self._setup_peer_infrastructure(kvm)
         self._setup_transfer_engine()
@@ -4555,6 +4621,23 @@ class TransferWorker:
         watchdog = getattr(self, "_retirement_watchdog", None)
         if watchdog is not None:
             watchdog.request_shutdown()
+
+            # Arm containment before any native cancel. Do not wait for a
+            # receiver's publication lock to send peer notifications here:
+            # shutdown must reach its ownership preflight even if publication
+            # is blocked. Ordinary cancellation still notifies all writers.
+            # Both directions keep their roots until the ordinary retirement
+            # checks observe proof; cancellation itself never releases memory.
+            for endpoint in (getattr(self, "_sender", None), getattr(self, "_receiver", None)):
+                if endpoint is None:
+                    continue
+                with endpoint._sessions_lock:
+                    sessions = list(endpoint._sessions.values())
+                for session in sessions:
+                    if isinstance(session, weakref.ReferenceType):
+                        session = session()
+                    if session is not None:
+                        session.cancel_local()
 
     def populate_instance_and_rank_info(self, endpoints: list[str], layer_num_per_pp: list[int]):
         assert self._rank_info is not None
@@ -4601,6 +4684,11 @@ class TransferWorker:
         self._peer_registrar = PeerRegistrar(self._rank_info, self._kv_extractor)
 
     def _setup_transfer_engine(self):
+        if self._config.enforce_physical_ownership:
+            from tensorrt_llm._torch.disaggregation.base.agent import supports_native_quiescence
+
+            if not supports_native_quiescence():
+                raise ValueError("physical ownership requires C++ quiescence-capable bindings")
         torch.cuda.set_device(self._config.device_id)
         CUASSERT(cudart.cudaSetDevice(self._config.device_id))
         mapping = self._config.kv_cache_manager.mapping

@@ -25,6 +25,19 @@ from tensorrt_llm._torch.disaggregation.resource.page import KVCachePageTable
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._utils import get_size_in_bytes
 
+NATIVE_OWNERSHIP_PROTOCOL_VERSION = 1
+
+
+def validate_ownership_peer(local: "RankInfo", peer: "RankInfo") -> None:
+    """Reject incompatible retirement semantics before publishing any request."""
+    local_version = getattr(local, "ownership_protocol_version", 0)
+    peer_version = getattr(peer, "ownership_protocol_version", 0)
+    if local_version != peer_version or local_version not in (0, NATIVE_OWNERSHIP_PROTOCOL_VERSION):
+        raise ValueError(
+            "native KV ownership protocol mismatch: both endpoints must enable "
+            f"the same physical retirement protocol (local={local_version}, peer={peer_version})"
+        )
+
 
 @dataclass
 class RankInfo:
@@ -48,6 +61,7 @@ class RankInfo:
     attention: Optional[AttentionInfo] = None
     aux_meta: Optional[AuxBufferMeta] = None
     page_table: Optional[KVCachePageTable] = None
+    ownership_protocol_version: int = 0
 
     @property
     def tp_size_per_dp_group(self) -> int:
@@ -57,6 +71,9 @@ class RankInfo:
 
     def to_bytes(self) -> bytes:
         data = asdict(self)
+        # Preserve the legacy schema when neither endpoint opts into ownership.
+        if self.ownership_protocol_version == 0:
+            data.pop("ownership_protocol_version")
         data["attention"] = self.attention.to_dict() if self.attention is not None else None
         data["aux_meta"] = self.aux_meta.to_dict() if self.aux_meta is not None else None
         data["page_table"] = self.page_table.to_dict() if self.page_table is not None else None

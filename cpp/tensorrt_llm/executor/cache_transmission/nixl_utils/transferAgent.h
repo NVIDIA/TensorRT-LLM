@@ -80,6 +80,7 @@ public:
     NixlTransferStatus& operator=(NixlTransferStatus&&) = delete;
 
     [[nodiscard]] bool isCompleted() const override;
+    [[nodiscard]] bool isQuiesced() const override;
 
     [[nodiscard]] TransferState wait(int64_t timeout_ms = -1) const override;
 
@@ -95,6 +96,7 @@ private:
     std::weak_ptr<nixlAgent> mWeakAgent;
     nixlXferReqH* mHandle{};
     mutable std::atomic<int> mLastStatus{0};
+    mutable std::atomic<bool> mQuiesced{false};
     bool const mSynchronizeHandleAccess;
     mutable std::mutex mHandleMutex;
 };

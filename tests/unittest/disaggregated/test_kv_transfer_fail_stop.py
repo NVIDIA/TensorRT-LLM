@@ -329,7 +329,7 @@ def test_peer_loss_fails_closed_only_for_unsettled_exposure(exposure: str) -> No
 
 
 def test_failed_sender_write_retains_roots_until_fatal_deadline() -> None:
-    """A persistent backend error closes sender admission, not physical ownership."""
+    """A persistent backend error retains ownership until bounded containment."""
     now = [10.0]
     contain = Mock()
     watchdog = RetirementWatchdog(contain, clock=lambda: now[0])
@@ -338,7 +338,7 @@ def test_failed_sender_write_retains_roots_until_fatal_deadline() -> None:
     task.bind_logical_outcomes(transfer_mod._LogicalOutcomes(owner))
     assert task.begin_physical_operation(7)
     request = object()
-    status = Mock(wait=Mock(return_value=False), is_completed=Mock(return_value=False))
+    status = Mock(wait=Mock(return_value=False), is_quiesced=Mock(return_value=False))
     status.last_status_str.return_value = "ERROR"
     sender = object.__new__(transfer_mod.Sender)
     sender._shutdown = True  # No worker threads or transport were created by this fixture.
@@ -355,13 +355,12 @@ def test_failed_sender_write_retains_roots_until_fatal_deadline() -> None:
     assert operation.status is status
     assert not task.resources_drained
 
-    # Sender poisoning rejects a different request even before grace expires.
+    # A retained proof-capable handle does not poison independent requests.
     later = transfer_mod.SendTaskBase(DisaggregatedParams(disagg_request_id=13))
     assert later.begin_physical_operation(8)
-    with pytest.raises(transfer_mod._TransferNotSubmittedError, match="before backend submission"):
-        sender._submit_transfer(later, 8, object())
-    sender._agent.submit_transfer_requests.assert_called_once_with(request)
-    assert later._physical_operations[8].state is transfer_mod._PhysicalOperationState.NOT_SUBMITTED
+    sender._agent.submit_transfer_requests.return_value = Mock(wait=Mock(return_value=True))
+    assert sender._submit_transfer(later, 8, object()) == (True, None)
+    assert sender._ownership_poisoned is None
     assert later.resources_drained
 
     now[0] = 10.5
