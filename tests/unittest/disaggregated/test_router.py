@@ -97,11 +97,13 @@ def test_native_block_key_hasher_matches_python_v1_with_lora(
                                                   (2**64 + 5, 5)])
 def test_block_hashes_wrap_out_of_range_lora_id(servers, hash_algo,
                                                 lora_task_id, wrapped) -> None:
-    """Every algo reduces the LoRA id modulo 2**64 instead of raising.
+    """The router wraps the LoRA id modulo 2**64 instead of raising.
 
-    The worker's LoRA id is a uint64 on both the V1 ``BlockKey`` and the V2
-    ``ReuseScope``, so an id outside [0, 2**64) must hash as its wrapped value
-    rather than make the native binding reject the request.
+    The router reads ``lora_int_id`` from the client request before any worker
+    sees it. The worker holds it as a uint64 ``LlmRequest.lora_task_id`` and
+    rejects an id outside [0, 2**64) itself, so this only keeps the router's
+    native bindings from raising mid-routing; for in-range ids the wrap is the
+    identity and the router's hashes match the worker's.
     """
     router = KvCacheAwareRouter(server_role=None,
                                 servers=servers,

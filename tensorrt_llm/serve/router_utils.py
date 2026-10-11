@@ -51,7 +51,7 @@ _UINT64_MASK = (1 << 64) - 1
 
 
 def _to_uint64(value: Optional[int]) -> Optional[int]:
-    """Reduce an id modulo 2**64, as the native uint64 LoRA id fields hold it."""
+    """Reduce an id modulo 2**64 so the native uint64 LoRA id fields accept it."""
     return None if value is None else value & _UINT64_MASK
 
 
