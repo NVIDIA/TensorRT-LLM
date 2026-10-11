@@ -134,11 +134,7 @@ def route(
     sm_version: int = 100,
     det: bool = False,
 ) -> dict[str, object]:
-    """Mirror of the CUDA gvr_topk_launch dispatch. Pure. See module doc.
-
-    Deviations from the CUDA reference (self-sampling only): the 4K < n <= 8K
-    register rungs, QC = QUADC for every register plan, NB bins for the
-    not-wide register plans up to n4 <= 2048."""
+    """Select a kernel and launch resources from the shape and device properties."""
     if b < 1:
         raise RuntimeError(f"route requires b >= 1, got {b}")
     if num_sms < 1:
@@ -151,10 +147,6 @@ def route(
     # ======================= register-resident block ========================
     n4 = n >> 2
     CMP = n if n < 2560 else 2560
-    # QC = QUADC for every register plan: the O(mc^2) rank loop is taken only
-    # for mc <= QC, so a wider gate lets one row whose first-k bracket misses
-    # the k-th value stall the whole one-wave launch. Rows with mc <= QUADC
-    # take the same branch under either gate.
     QC = 160
     CURE = not (n < 2 * k and b > num_sms)
     if not wide and k == 2048 and sm_version in (100, 103) and 512 < n4 <= 1024:
@@ -162,10 +154,6 @@ def route(
     DEGE = (n <= 3 * k) or (n <= 4 * k + 64)
     if DEGE and CMP < n:
         CMP = n
-    # NB bins for the not-wide register plans up to n4 <= 2048 (incl. the
-    # (512, 4, 2) rung below) so IMGOFF == NBH holds at every reg site.
-    # Five float4s fit the smaller-K resident plan's 64-register budget.
-    # Retain streaming when the sixth fragment would add spill traffic.
     long_register = (
         not wide
         and sm_version in (100, 103)
@@ -244,7 +232,6 @@ def route(
             return _reg(256, 3, 4, NB)
         return _reg(512, 2, 4, NB)
 
-    # Up to six resident float4s fit the large-batch mid-K register budget.
     if k == 1024 and b in (512, 1024) and 1024 < n4 <= 1536 and sm_version in (100, 103):
         return _reg(256, (n4 + 255) // 256, 4, NB)
 
@@ -252,10 +239,6 @@ def route(
     if k == 1024 and b in (512, 1024) and 1536 < n4 <= 2048 and sm_version in (100, 103):
         return _reg(256, (n4 + 255) // 256, 4, NB)
 
-    # Use four 512-thread CTAs per SM for the shorter resident rows; each
-    # thread holds at most four float4s. Taller rows use 256 threads and up
-    # to ten float4s when the grid can amortize the cursor scan. The smaller
-    # grid band uses two 512-thread CTAs and at most six float4s.
     if k == 512 and sm_version in (100, 103):
         if b > 6 * num_sms and 1024 < n4 <= 2560:
             if n4 <= 2048:
@@ -305,33 +288,23 @@ def route(
     if n4 <= 2048:
         if wide:
             if k == 2048 and sm_version in (100, 103) and n4 <= 1536:
-                # Three float4 slots cover this row with half as many threads.
                 return _reg(512, 3, 1, 2 * NB)
             return _reg(1024, 2, 1, 2 * NB)
-        # On SM103 with 148 SMs, the existing register plan remains faster
-        # across the measured b=512..1024, k=2048 range. Keep the exception
-        # architecture- and shape-exact: smaller K and nearby lower batches
-        # have different winners, while SM100 retains its original streaming
-        # route byte-for-byte.
         sm103_large_batch_k2048 = (
             sm_version in (100, 103) and num_sms == 148 and 512 <= b <= 1024 and k == 2048
         )
         if b <= 2 * num_sms or sm103_large_batch_k2048:
             if n4 <= 1536:
                 if sm_version in (100, 103) and k == 2048 and n4 <= 1280 and b > 2 * num_sms:
-                    # Four small CTAs fit one wave; a sparse final float4 slot
-                    # also limits spill traffic when the taller grid needs two.
                     sparse_final_slot = n4 <= 4 * 256 + 128
                     if b <= 4 * num_sms or (b > 6 * num_sms and sparse_final_slot):
                         return _reg(256, 5, 4, NB)
-                    # Keep enough rows in the final wave to amortize a smaller CTA.
                     if b > 5 * num_sms:
                         return _reg(256, 5, 3, NB)
                 return _reg(512, 3, 2, NB)
             return _reg(512, 4, 2, NB)
 
     if n4 <= 4096 and wide:
-        # Keep only the float4 slots needed by the launch envelope.
         vpt = 3 if n4 <= 3072 else 4
         return _reg(1024, vpt, 1, 2 * NB)
 
@@ -341,7 +314,6 @@ def route(
     if wide and k == 2048 and sm_version in (100, 103) and n4 <= 8192:
         streaming_splits = min(148 // b, (n4 + 1023) // 1024) if b <= 32 else 1
         if streaming_splits <= 4 or (b <= 16 and n == 32768):
-            # Retain parallel streaming except for the validated full-capacity resident row.
             return _reg(1024, (n4 + 1023) // 1024, 1, 2 * NB)
 
     # ====================== streaming / collect path ========================
@@ -1041,8 +1013,6 @@ def _varlen_launcher(
         return lc
     plan = route_streaming(num_rows, n_route, npad, k, force_main=True)
     tpl = tuple(plan["tpl"])  # (BLK, U, MINB, SNB, KPT, SPLIT, TSHG)
-    # Four float4s per thread reduce work on the partial eight-float4 tile.
-    # Keep the larger tile for long rows and for grids without enough rows.
     if k == 512 and num_rows > 2 * num_sms and sm_version in (100, 103):
         n4 = n_route >> 2
         if 2048 < n4 <= 3072 or (num_rows <= 6 * num_sms and 1536 < n4 <= 2048):
