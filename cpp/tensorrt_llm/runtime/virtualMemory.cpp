@@ -343,25 +343,10 @@ void CudaVirtualMemoryAllocator::allocate(Pointer* ptr, std::size_t n, int devic
     std::size_t const alignedSize = mConfig->aligned(n, device);
     TLLM_CU_CHECK(cuMemAddressReserve(&address, alignedSize, 0, {}, 0));
 
-    try
-    {
-        map(address, alignedSize, n,
-            CUmemAllocationProp{CU_MEM_ALLOCATION_TYPE_PINNED, CU_MEM_HANDLE_TYPE_NONE,
-                CUmemLocation{CU_MEM_LOCATION_TYPE_DEVICE, {device}}},
-            checkVirtualMemoryCudaResult);
-    }
-    catch (...)
-    {
-        TLLM_CU_CHECK_FREE_RESOURCE(cuMemAddressFree(address, alignedSize));
-        throw;
-    }
+    map(address, alignedSize, n,
+        CUmemAllocationProp{CU_MEM_ALLOCATION_TYPE_PINNED, CU_MEM_HANDLE_TYPE_NONE,
+            CUmemLocation{CU_MEM_LOCATION_TYPE_DEVICE, {device}}});
     *ptr = deviceptr_cast(address);
-}
-
-void CudaVirtualMemoryAllocator::map(
-    CUdeviceptr address, std::size_t size, CUmemAllocationProp const& prop, VirtualMemoryCudaErrorCheck check) const
-{
-    map(address, size, size, prop, check);
 }
 
 void CudaVirtualMemoryAllocator::map(CUdeviceptr address, std::size_t alignedSize, std::size_t n,

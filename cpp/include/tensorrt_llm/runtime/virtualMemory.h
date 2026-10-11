@@ -267,15 +267,7 @@ struct UnicastConfigurator : CUDAVirtualMemoryChunk::Configurator
     void setup(CUmemGenericAllocationHandle handle) override
     {
         mCheck(cuMemMap(mAddress, mSize, 0, handle, 0));
-        try
-        {
-            mCheck(cuMemSetAccess(mAddress, mSize, &mDesc, 1));
-        }
-        catch (...)
-        {
-            TLLM_CU_CHECK_FREE_RESOURCE(cuMemUnmap(mAddress, mSize));
-            throw;
-        }
+        mCheck(cuMemSetAccess(mAddress, mSize, &mDesc, 1));
     }
 
     void teardown(CUmemGenericAllocationHandle, bool) override
@@ -577,14 +569,13 @@ public:
 
     // Register physical memory at a caller-owned virtual address. The caller
     // retains the reservation across release/materialize and must unmap before
-    // freeing it. Size and address must satisfy the allocation granularity.
-    void map(CUdeviceptr address, std::size_t size, CUmemAllocationProp const& prop,
+    // freeing it. Allocation size and address must satisfy the allocation
+    // granularity; contentSize is the number of bytes to preserve or clear.
+    void map(CUdeviceptr address, std::size_t allocationSize, std::size_t contentSize, CUmemAllocationProp const& prop,
         VirtualMemoryCudaErrorCheck check = checkVirtualMemoryCudaResult) const;
     void unmap(CUdeviceptr address) const;
 
 private:
-    void map(CUdeviceptr address, std::size_t allocationSize, std::size_t contentSize, CUmemAllocationProp const& prop,
-        VirtualMemoryCudaErrorCheck check) const;
     std::shared_ptr<Configuration> mConfig;
 };
 

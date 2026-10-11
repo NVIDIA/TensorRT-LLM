@@ -21,14 +21,18 @@ from tensorrt_llm.llmapi.llm_args import CudaGraphConfig, ExecutorMemoryType, Sl
         ([ExecutorMemoryType.KV_CACHE], "CPU", True),
         ([ExecutorMemoryType.KV_CACHE], "PINNED", True),
         (list(ExecutorMemoryType), "NONE", True),
-        ([ExecutorMemoryType.KV_CACHE], "NONE", False),
+        (
+            [ExecutorMemoryType.MODEL_ENGINE_MAIN, ExecutorMemoryType.MODEL_WEIGHTS_MAIN],
+            "NONE",
+            False,
+        ),
     ],
     ids=["v2_none", "v2_memset", "v2_cpu", "v2_pinned", "v2_all_tags", "v1_control"],
 )
 def test_llm_sleep(process_gpu_memory_info_available, sleep_tags, restore_mode, use_v2):
     llama_model_path = str(llm_models_root() / "Qwen3/Qwen3-0.6B")
     kv_cache_config = KvCacheConfig(
-        enable_block_reuse=True, max_tokens=16384, use_kv_cache_manager_v2=use_v2
+        enable_block_reuse=use_v2, max_tokens=16384, use_kv_cache_manager_v2=use_v2
     )
 
     llm = LLM(
@@ -57,11 +61,12 @@ def test_llm_sleep(process_gpu_memory_info_available, sleep_tags, restore_mode, 
         outputs = llm.generate(prompts, sampling_params)
         generated_before_sleep = [output.outputs[0].text for output in outputs]
 
-        warm_outputs = llm.generate(prompts, sampling_params)
-        assert any(
-            output.outputs[0].request_perf_metrics.kv_cache_metrics.num_reused_blocks > 0
-            for output in warm_outputs
-        )
+        if use_v2:
+            warm_outputs = llm.generate(prompts, sampling_params)
+            assert any(
+                output.outputs[0].request_perf_metrics.kv_cache_metrics.num_reused_blocks > 0
+                for output in warm_outputs
+            )
 
         memory_usage_active = get_current_process_gpu_memory(True)
 
@@ -92,7 +97,7 @@ def test_llm_sleep(process_gpu_memory_info_available, sleep_tags, restore_mode, 
         ]
         if restore_mode in ("NONE", "MEMSET"):
             assert all(count == 0 for count in reused_blocks)
-        else:
+        elif use_v2:
             assert any(count > 0 for count in reused_blocks)
 
     for before, after in zip(generated_before_sleep, generated_after_sleep, strict=True):

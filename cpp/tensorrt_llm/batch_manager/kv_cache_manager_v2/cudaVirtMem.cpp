@@ -159,21 +159,13 @@ void VirtMem::push()
     PooledPhysMemAllocator::PooledPhysMem handle;
     if (mSleepAllocator)
     {
-        mSleepAllocator.map(offset, physSize, mPhysMemAllocator.allocationProp(), cuCheck);
+        mSleepAllocator.map(offset, physSize, physSize, mPhysMemAllocator.allocationProp(), cuCheck);
     }
     else
     {
         handle = mPhysMemAllocator.acquire();
         cuCheck(cuMemMap(offset, physSize, 0, handle->handle(), 0));
-        try
-        {
-            cuCheck(cuMemSetAccess(offset, physSize, &mAccessDesc, 1));
-        }
-        catch (...)
-        {
-            cuCheck(cuMemUnmap(offset, physSize));
-            throw;
-        }
+        cuCheck(cuMemSetAccess(offset, physSize, &mAccessDesc, 1));
     }
     mPhysHandles.push_back(std::move(handle));
 }

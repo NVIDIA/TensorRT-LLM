@@ -2079,7 +2079,9 @@ class PyExecutor:
         """
         from tensorrt_llm._torch.virtual_memory import RestoreMode
 
-        if self._is_kv_manager_v2 and not self._sleeping_memory_tags:
+        if not self._is_kv_manager_v2:
+            return
+        if not self._sleeping_memory_tags:
             # Release shared speculative slots before any tag is unmapped.
             # Suspended caches still prevent V2 from clearing its reuse tree.
             released_resources = set()
@@ -2113,6 +2115,8 @@ class PyExecutor:
 
     def finish_wakeup(self, tags: list[ExecutorMemoryType]) -> None:
         """Resume maintenance only after every released tag is restored."""
+        if not self._is_kv_manager_v2:
+            return
         if not self._sleeping_memory_tags.difference(tags):
             for manager in self._sleeping_kv_managers:
                 manager.finish_wakeup()
