@@ -289,7 +289,7 @@ void invokeNoAuxTc(InputT* scores, BiasT* bias, OutputT* topk_values, IdxT* topk
 
     if (is_single_group || is_multi_group)
     {
-        // No tokens: there is nothing to write, and a grid of zero blocks is an invalid launch.
+
         if (num_tokens == 0)
         {
             return;

@@ -41,10 +41,6 @@ l0_a10:
   - unittest/_torch/executor/kv_cache/test_kv_cache_v2_capacity_only.py
   - unittest/_torch/executor/test_kv_cache_layout.py
   - unittest/_torch/executor/test_kv_connector_v2_prefix_real_manager.py
-  - unittest/_torch/executor/test_mooncake_store_cli.py
-  - unittest/_torch/executor/test_mooncake_store_common.py
-  - unittest/_torch/executor/test_mooncake_store_donor.py
-  - unittest/_torch/executor/test_mooncake_store_master.py
   - unittest/_torch/executor/test_error_classification.py
   - unittest/_torch/executor/test_resource_manager.py
   - unittest/_torch/executor/test_seq_slot_sizing.py
@@ -233,6 +229,8 @@ l0_a10:
   - llmapi/test_llm_api_connector.py::test_connector_cancel_drains_real_prefix_load[alone-False]
   - llmapi/test_llm_api_connector.py::test_connector_cancel_drains_real_prefix_load[traffic-True]
   - llmapi/test_llm_api_connector.py::test_connector_cancel_drains_real_prefix_load[traffic-False]
+  - llmapi/test_llm_api_connector.py::test_connector_cancel_holds_pages_until_the_save_reads_them[True]
+  - llmapi/test_llm_api_connector.py::test_connector_cancel_holds_pages_until_the_save_reads_them[False]
   - llmapi/test_llm_api_connector.py::test_connector_prefix_is_asked_once_and_shrinks_the_forward_pass[kv_cache_manager_v2]
   - llmapi/test_llm_api_connector.py::test_connector_prefix_under_chunked_prefill[kv_cache_manager_v2-offer_inside_chunk]
   - llmapi/test_llm_api_connector.py::test_connector_prefix_under_chunked_prefill[kv_cache_manager_v2-offer_past_chunk]
@@ -244,6 +242,8 @@ l0_a10:
   - llmapi/test_llm_api_connector.py::test_connector_vswa_out_of_window_blocks_reach_the_connector
   - llmapi/test_llm_api_connector.py::test_connector_transfers_only_in_window_blocks_to_the_sliding_group[gemma3_interleaved]
   - llmapi/test_llm_api_connector.py::test_connector_transfers_only_in_window_blocks_to_the_sliding_group[qwen3_forced_windows]
+  - llmapi/test_llm_api_connector_mooncake.py::test_mooncake_e2e_cross_engine_prefix_reuse
+  - llmapi/test_llm_api_connector_mooncake.py::test_mooncake_e2e_chunked_prefill_survives_a_small_cache
   # third-party policy checks CPU-only
   - thirdparty/test_cmake_third_party.py::test_cmake_listfiles
   - thirdparty/test_git_modules.py::test_gitmodules

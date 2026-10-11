@@ -243,6 +243,9 @@ def test_zero_rows() -> None:
     assert data.shape == (0, 3072) and data.dtype == torch.float8_e4m3fn
     assert sf.shape == (0,) and sf.dtype == torch.uint8
 
+    # Empty inputs must leave subsequent CUDA work usable.
+    assert torch.ones(1, device="cuda").item() == 1
+
 
 def test_input_not_mutated() -> None:
     torch.manual_seed(6)
