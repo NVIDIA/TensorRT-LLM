@@ -15,6 +15,7 @@
 # limitations under the License.
 
 import argparse
+import copy
 import glob
 import json
 import math
@@ -74,6 +75,56 @@ def save_worker_config(worker_config, output_path):
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     with open(output_path, 'w') as f:
         yaml.dump(worker_config, f, default_flow_style=False)
+
+
+#: Manifest the single mooncake_master in disaggr_torch.slurm publishes.
+MOONCAKE_POOL_FILE_NAME = 'pool.json'
+
+
+def mooncake_pool_config(worker_config):
+    """The mooncake_store block of worker_config, or None if unused."""
+    connector_config = worker_config.get('kv_connector_config') or {}
+    if connector_config.get('connector') != 'mooncake-store':
+        return None
+    return connector_config.setdefault('mooncake_store', {})
+
+
+def resolve_mooncake_pool(worker_config, pool_file):
+    """Point a mooncake-store worker config at the pool this job will start.
+
+    The path depends on the log directory, which config.yaml cannot know, so
+    it is filled in here rather than asked of the user. An explicit value is
+    left alone, for a pool run outside this script.
+
+    Returns:
+        Whether worker_config uses the connector at all.
+    """
+    pool_config = mooncake_pool_config(worker_config)
+    if pool_config is None:
+        return False
+    pool_config.setdefault('pool', f"file://{pool_file}")
+    return True
+
+
+def save_mooncake_worker_config(worker_config, log_dir, role, instance_id):
+    """Per-server copy of worker_config naming its own run directory.
+
+    The Mooncake client config a server renders into run_dir names that
+    server's role and its node's RDMA devices, so servers cannot share one.
+
+    Returns:
+        The path written, or None if worker_config does not use the connector.
+    """
+    if mooncake_pool_config(worker_config) is None:
+        return None
+    per_server = copy.deepcopy(worker_config)
+    mooncake_pool_config(per_server).setdefault(
+        'run_dir',
+        os.path.join(log_dir, f"mooncake_{role.lower()}_{instance_id}"))
+    config_path = os.path.join(log_dir,
+                               f"{role.lower()}_config_{instance_id}.yaml")
+    save_worker_config(per_server, config_path)
+    return config_path
 
 
 def calculate_nodes(world_size, num_servers, gpus_per_node):
@@ -582,6 +633,11 @@ def submit_job(config, log_dir, dry_run):
     # Setup config file paths and save worker configs
     ctx_config_path = os.path.join(log_dir, 'ctx_config.yaml')
     gen_config_path = os.path.join(log_dir, 'gen_config.yaml')
+    mooncake_pool_file = os.path.join(log_dir, MOONCAKE_POOL_FILE_NAME)
+    ctx_uses_mooncake = resolve_mooncake_pool(worker_config['ctx'],
+                                              mooncake_pool_file)
+    gen_uses_mooncake = resolve_mooncake_pool(worker_config['gen'],
+                                              mooncake_pool_file)
     save_worker_config(worker_config['ctx'], ctx_config_path)
     save_worker_config(worker_config['gen'], gen_config_path)
 
@@ -620,12 +676,14 @@ def submit_job(config, log_dir, dry_run):
         "GEN": {
             "world_size": gen_world_size,
             "profile_range": profiling_config['gen_profile_range'],
-            "config_path": gen_config_path
+            "config_path": gen_config_path,
+            "worker_key": "gen"
         },
         "CTX": {
             "world_size": ctx_world_size,
             "profile_range": profiling_config['ctx_profile_range'],
-            "config_path": ctx_config_path
+            "config_path": ctx_config_path,
+            "worker_key": "ctx"
         }
     }
 
@@ -673,6 +731,12 @@ def submit_job(config, log_dir, dry_run):
                 gpu_ids = sorted(list(allocation["nodes"].values())[0])
                 cuda_devices = ','.join(map(str, gpu_ids))
 
+            config_path = save_mooncake_worker_config(
+                worker_config[server_cfg['worker_key']], log_dir, server_type,
+                server_id)
+            if config_path is None:
+                config_path = server_cfg['config_path']
+
             concurrency_list = benchmark_config['concurrency_list']
             concurrency = (concurrency_list.split(',')[0] if isinstance(
                 concurrency_list, str) else concurrency_list)
@@ -716,7 +780,7 @@ def submit_job(config, log_dir, dry_run):
                 str(slurm_config['numa_bind']).lower(),
                 log_dir,
                 str(profiling_config['nsys_on']).lower(),
-                server_cfg['config_path'],
+                config_path,
                 cuda_devices,
                 f"&> {log_dir}/3_output_{server_type}_{server_id}.log &",
             ]
@@ -892,6 +956,11 @@ def submit_job(config, log_dir, dry_run):
         '--build-wheel', str(env_config['build_wheel']).lower(),
         '--cuda-architectures', env_config['cuda_architectures'],
         '--trtllm-wheel-path', env_config['trtllm_wheel_path'],
+
+        # Empty unless a worker uses the mooncake-store connector, in which
+        # case the job starts one mooncake_master to publish this manifest.
+        '--mooncake-pool-file',
+        mooncake_pool_file if ctx_uses_mooncake or gen_uses_mooncake else '',
     ]
     # yapf: enable
 

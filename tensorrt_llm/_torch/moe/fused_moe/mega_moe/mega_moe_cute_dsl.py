@@ -594,9 +594,11 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
             )
         self.apply_router_weight_on_input = apply_router_weight_on_input
 
-        # Preserve V4's pre-quantization routing weights; other models apply them after FC2.
-        self.apply_topk_in_fc1 = "DeepseekV4ForCausalLM" in (
-            getattr(model_config.pretrained_config, "architectures", None) or ()
+        # DeepSeek V4 and V4.1 apply routing weights before FC2 input quantization.
+        architectures = getattr(model_config.pretrained_config, "architectures", None) or ()
+        self.apply_topk_in_fc1 = any(
+            architecture in ("DeepseekV4ForCausalLM", "DeepseekV41ForCausalLM")
+            for architecture in architectures
         )
         self._topk_idx_dtype = torch.int32 if get_sm_version() == 107 else torch.int64
 
