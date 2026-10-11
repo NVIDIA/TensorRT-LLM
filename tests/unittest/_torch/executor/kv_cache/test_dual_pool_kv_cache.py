@@ -173,6 +173,7 @@ def _make_creator(
     llm_args.max_input_len = None
 
     creator = KvCacheCreator.__new__(KvCacheCreator)
+    creator._is_disagg = False
     creator._model_engine = model_engine
     creator._draft_model_engine = None
     creator._mapping = mapping if mapping is not None else Mapping()
