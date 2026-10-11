@@ -105,9 +105,10 @@ def compute_disagg_acceptance_length(serve_url: str) -> float:
     polled directly. Only generation workers are asked: the drafter runs
     during decode, so context workers report no speculative iterations.
 
-    Requires ``enable_iter_perf_stats`` on the generation workers, plus
-    ``iter_stats_max_iterations: -1`` so the server's stats buffer (default
-    1000 iterations) does not silently drop the earlier part of a long run.
+    Requires ``enable_iter_perf_stats`` and ``max_stats_len: -1`` on the
+    generation workers so the engine's stats buffer does not silently drop the
+    earlier part of a long run. When the server metrics collector is enabled,
+    ``iter_stats_max_iterations: -1`` must also be set for its snapshot buffer.
     """
     info = requests.get(f"{serve_url}/cluster_info", timeout=10)
     info.raise_for_status()
@@ -826,6 +827,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             "disable_overlap_scheduler": False,
             "enable_iter_perf_stats": True,
             "iter_stats_max_iterations": -1,
+            "max_stats_len": -1,
         }
         cache_transceiver_config = {
             "backend": "NIXL",
@@ -834,10 +836,9 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         }
         ctx_server_config["cache_transceiver_config"] = cache_transceiver_config
         gen_server_config["cache_transceiver_config"] = cache_transceiver_config
-        gen_server_config["speculative_config"] = {
-            "decoding_type": "MTP",
-            "max_draft_len": 2
-        }
+        speculative_config = {"decoding_type": "MTP", "max_draft_len": 2}
+        ctx_server_config["speculative_config"] = speculative_config
+        gen_server_config["speculative_config"] = speculative_config
         disaggregated_server_config = {
             "hostname": "localhost",
             "backend": "pytorch",
