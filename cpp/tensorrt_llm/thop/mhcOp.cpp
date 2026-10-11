@@ -28,9 +28,38 @@ namespace
 void mhcBigFuseOp(torch::Tensor y_acc, torch::Tensor r_acc, torch::Tensor residual, torch::Tensor hc_scale,
     torch::Tensor hc_base, torch::Tensor post_mix, torch::Tensor comb_mix, torch::Tensor layer_input, int64_t M,
     int64_t K, int64_t hidden_size, double rms_eps, double hc_pre_eps, double hc_sinkhorn_eps,
-    double hc_post_mult_value, int64_t sinkhorn_repeat, int64_t num_splits, int64_t block_size)
+    double hc_post_mult_value, int64_t sinkhorn_repeat, int64_t num_splits, int64_t block_size,
+    c10::optional<torch::Tensor> norm_weight, double norm_eps, c10::optional<torch::Tensor> pre_mix_ext,
+    c10::optional<torch::Tensor> pre_mix_out)
 {
     auto stream = at::cuda::getCurrentCUDAStream();
+
+    // Optional fused next-layer RMSNorm on layer_input and the lagged (V4.1) pre-mix: collapse with
+    // pre_mix_ext and write this boundary's own pre-mix to pre_mix_out.
+    __nv_bfloat16 const* norm_weight_ptr = nullptr;
+    if (norm_weight.has_value() && norm_weight->defined())
+    {
+        TORCH_CHECK(norm_weight->dtype() == torch::kBFloat16 && norm_weight->is_contiguous()
+                && norm_weight->numel() == hidden_size,
+            "mhc_big_fuse: norm_weight must be a contiguous bf16 [hidden_size] tensor");
+        norm_weight_ptr = reinterpret_cast<__nv_bfloat16 const*>(norm_weight->data_ptr<at::BFloat16>());
+    }
+    float const* pre_ext_ptr = nullptr;
+    float* pre_out_ptr = nullptr;
+    if (pre_mix_ext.has_value() && pre_mix_ext->defined())
+    {
+        TORCH_CHECK(
+            pre_mix_ext->dtype() == torch::kFloat32 && pre_mix_ext->is_contiguous() && pre_mix_ext->numel() == M * 4,
+            "mhc_big_fuse: pre_mix_ext must be a contiguous fp32 [M, 4] tensor");
+        pre_ext_ptr = pre_mix_ext->data_ptr<float>();
+    }
+    if (pre_mix_out.has_value() && pre_mix_out->defined())
+    {
+        TORCH_CHECK(
+            pre_mix_out->dtype() == torch::kFloat32 && pre_mix_out->is_contiguous() && pre_mix_out->numel() == M * 4,
+            "mhc_big_fuse: pre_mix_out must be a contiguous fp32 [M, 4] tensor");
+        pre_out_ptr = pre_mix_out->data_ptr<float>();
+    }
 
     tk::mhcBigFuseLaunch(y_acc.data_ptr<float>(), r_acc.data_ptr<float>(),
         reinterpret_cast<__nv_bfloat16 const*>(residual.data_ptr<at::BFloat16>()), hc_scale.data_ptr<float>(),
@@ -38,7 +67,8 @@ void mhcBigFuseOp(torch::Tensor y_acc, torch::Tensor r_acc, torch::Tensor residu
         reinterpret_cast<__nv_bfloat16*>(layer_input.data_ptr<at::BFloat16>()), static_cast<int>(M),
         static_cast<int>(K), static_cast<int>(hidden_size), static_cast<float>(rms_eps), static_cast<float>(hc_pre_eps),
         static_cast<float>(hc_sinkhorn_eps), static_cast<float>(hc_post_mult_value), static_cast<int>(sinkhorn_repeat),
-        static_cast<int>(num_splits), static_cast<int>(block_size), /*norm_weight=*/nullptr, /*norm_eps=*/0.f, stream);
+        static_cast<int>(num_splits), static_cast<int>(block_size), norm_weight_ptr, static_cast<float>(norm_eps),
+        stream, pre_ext_ptr, pre_out_ptr);
 }
 
 void mhcGemmSqrsumFmaOp(torch::Tensor x, torch::Tensor w, torch::Tensor y, torch::Tensor r, int64_t M, int64_t N,
@@ -90,9 +120,32 @@ void mhcFusedHcOp(torch::Tensor x_prev, torch::Tensor residual_prev, torch::Tens
     torch::Tensor y_acc_workspace, torch::Tensor r_acc_workspace, torch::Tensor done_counter_workspace, int64_t M,
     int64_t hidden_size, int64_t hc_mult, double rms_eps, double hc_pre_eps, double hc_sinkhorn_eps,
     double hc_post_mult_value, int64_t sinkhorn_repeat, int64_t backend, int64_t tile_n, int64_t num_k_splits,
-    int64_t bigfuse_block_size, int64_t tile_m, c10::optional<torch::Tensor> norm_weight, double norm_eps)
+    int64_t bigfuse_block_size, int64_t tile_m, c10::optional<torch::Tensor> norm_weight, double norm_eps,
+    c10::optional<torch::Tensor> pre_mix_ext, c10::optional<torch::Tensor> pre_mix_out)
 {
     auto stream = at::cuda::getCurrentCUDAStream();
+
+    // Lagged (DeepSeek-V4.1) pre-mix: collapse with pre_mix_ext (computed one boundary earlier) and hand
+    // this boundary's own pre-mix back through pre_mix_out. All four backends carry it as a template
+    // variant of their epilogue (bigfuse for the half paths, the Phase 4 tail for the all-in-one paths).
+    float const* pre_ext_ptr = nullptr;
+    float* pre_out_ptr = nullptr;
+    if (pre_mix_ext.has_value() && pre_mix_ext->defined())
+    {
+        TORCH_CHECK(pre_mix_ext->dtype() == torch::kFloat32 && pre_mix_ext->is_contiguous()
+                && pre_mix_ext->numel() == M * hc_mult,
+            "mhc_fused_hc: pre_mix_ext must be a contiguous fp32 [M, hc_mult] tensor");
+        pre_ext_ptr = pre_mix_ext->data_ptr<float>();
+    }
+    if (pre_mix_out.has_value() && pre_mix_out->defined())
+    {
+        TORCH_CHECK(pre_mix_out->dtype() == torch::kFloat32 && pre_mix_out->is_contiguous()
+                && pre_mix_out->numel() == M * hc_mult,
+            "mhc_fused_hc: pre_mix_out must be a contiguous fp32 [M, hc_mult] tensor");
+        pre_out_ptr = pre_mix_out->data_ptr<float>();
+    }
+    TORCH_CHECK((pre_ext_ptr == nullptr) == (pre_out_ptr == nullptr),
+        "mhc_fused_hc: pre_mix_ext and pre_mix_out must be given together (V4.1) or both omitted (V4)");
 
     // Fused next-layer RMSNorm on layer_input_cur. All four backends (Path B/D
     // for MMA and Path E/F for FMA) support it now: Path B/E fuse the norm into
@@ -127,7 +180,8 @@ void mhcFusedHcOp(torch::Tensor x_prev, torch::Tensor residual_prev, torch::Tens
             static_cast<int>(hc_mult), static_cast<int>(tile_n), static_cast<int>(num_k_splits),
             static_cast<int>(tile_m), static_cast<float>(rms_eps), static_cast<float>(hc_pre_eps),
             static_cast<float>(hc_sinkhorn_eps), static_cast<float>(hc_post_mult_value),
-            static_cast<int>(sinkhorn_repeat), norm_weight_ptr, static_cast<float>(norm_eps), stream);
+            static_cast<int>(sinkhorn_repeat), norm_weight_ptr, static_cast<float>(norm_eps), stream, pre_ext_ptr,
+            pre_out_ptr);
         return;
     }
     if (backend == 2)
@@ -142,7 +196,8 @@ void mhcFusedHcOp(torch::Tensor x_prev, torch::Tensor residual_prev, torch::Tens
             done_counter_workspace.data_ptr<int>(), static_cast<int>(M), static_cast<int>(hidden_size),
             static_cast<int>(hc_mult), static_cast<int>(num_k_splits), static_cast<float>(rms_eps),
             static_cast<float>(hc_pre_eps), static_cast<float>(hc_sinkhorn_eps), static_cast<float>(hc_post_mult_value),
-            static_cast<int>(sinkhorn_repeat), norm_weight_ptr, static_cast<float>(norm_eps), stream);
+            static_cast<int>(sinkhorn_repeat), norm_weight_ptr, static_cast<float>(norm_eps), stream, pre_ext_ptr,
+            pre_out_ptr);
         return;
     }
     if (backend == 1)
@@ -157,7 +212,8 @@ void mhcFusedHcOp(torch::Tensor x_prev, torch::Tensor residual_prev, torch::Tens
             static_cast<int>(hidden_size), static_cast<int>(hc_mult), static_cast<int>(tile_n),
             static_cast<int>(num_k_splits), static_cast<int>(bigfuse_block_size), static_cast<float>(rms_eps),
             static_cast<float>(hc_pre_eps), static_cast<float>(hc_sinkhorn_eps), static_cast<float>(hc_post_mult_value),
-            static_cast<int>(sinkhorn_repeat), norm_weight_ptr, static_cast<float>(norm_eps), stream);
+            static_cast<int>(sinkhorn_repeat), norm_weight_ptr, static_cast<float>(norm_eps), stream, pre_ext_ptr,
+            pre_out_ptr);
         return;
     }
 
@@ -170,7 +226,7 @@ void mhcFusedHcOp(torch::Tensor x_prev, torch::Tensor residual_prev, torch::Tens
         static_cast<int>(hidden_size), static_cast<int>(hc_mult), static_cast<int>(num_k_splits),
         static_cast<int>(bigfuse_block_size), static_cast<float>(rms_eps), static_cast<float>(hc_pre_eps),
         static_cast<float>(hc_sinkhorn_eps), static_cast<float>(hc_post_mult_value), static_cast<int>(sinkhorn_repeat),
-        norm_weight_ptr, static_cast<float>(norm_eps), stream);
+        norm_weight_ptr, static_cast<float>(norm_eps), stream, pre_ext_ptr, pre_out_ptr);
 }
 
 } // anonymous namespace
@@ -185,7 +241,8 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "int M, int K, int hidden_size, "
         "float rms_eps, float hc_pre_eps, float hc_sinkhorn_eps, "
         "float hc_post_mult_value, int sinkhorn_repeat, int num_splits, "
-        "int block_size=0) -> ()");
+        "int block_size=0, Tensor? norm_weight=None, float norm_eps=0.0, "
+        "Tensor? pre_mix_ext=None, Tensor(d!)? pre_mix_out=None) -> ()");
 
     m.def(
         "mhc_gemm_sqrsum_fma("
@@ -221,7 +278,8 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "float rms_eps, float hc_pre_eps, float hc_sinkhorn_eps, "
         "float hc_post_mult_value, int sinkhorn_repeat, "
         "int backend=0, int tile_n=0, int num_k_splits=0, int bigfuse_block_size=0, "
-        "int tile_m=1, Tensor? norm_weight=None, float norm_eps=0.0) -> ()");
+        "int tile_m=1, Tensor? norm_weight=None, float norm_eps=0.0, "
+        "Tensor? pre_mix_ext=None, Tensor(h!)? pre_mix_out=None) -> ()");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)

@@ -1751,6 +1751,8 @@ class Sender(SenderBase):
         # Send ownership is per pool: replicated pools elect one fan-in
         # owner, sharded pools keep head-duplication routing.
         for (self_lg, self_pi), (peer_lg, peer_pi) in pool_mapping.items():
+            if (self_lg, self_pi) in task._chunk.excluded_pool_views:
+                continue
             if not self._registrar.should_send_pool(targets, peer_ri, self_lg, self_pi):
                 continue
 
@@ -3378,7 +3380,7 @@ class Receiver(ReceiverBase):
             finally:
                 messenger.stop()
 
-            # Recurrent-state (Mamba/KDA) layout gate on the receiver side.
+            # Peer compatibility gates on the receiver side.
             # The sender-side check (PeerRegistrar.register) runs in the
             # sender's listener thread, where exceptions are only logged, so
             # reject here — before REGISTER_RANK_INFO is even sent, so no
@@ -3387,6 +3389,7 @@ class Receiver(ReceiverBase):
             # (handled in dispatch_task) so only requests targeting this peer
             # fail, and cached so later requests fail fast.
             try:
+                self._registrar.validate_bounded_replay_compatible(sender_info)
                 MambaPolicy.validate_peer_compatible(
                     self._registrar.self_rank_info,
                     sender_info,
