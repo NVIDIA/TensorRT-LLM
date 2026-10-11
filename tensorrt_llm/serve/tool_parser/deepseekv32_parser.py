@@ -67,6 +67,7 @@ class DeepSeekV32Parser(BaseToolParser):
 
     # Invoke header up to the function name, which is arbitrary text.
     _INVOKE_HEADER_PREFIX = '<｜DSML｜invoke name="'  # nosec B105
+    _INVOKE_BEGIN_TEMPLATE = '<｜DSML｜invoke name="{name}">'  # nosec B105
 
     def __init__(self):
         super().__init__()
@@ -146,7 +147,7 @@ class DeepSeekV32Parser(BaseToolParser):
             function_calls_content = function_calls_match.group(1)
 
             # Find all invoke blocks
-            invoke_pattern = r'<｜DSML｜invoke\s+name="([^"]+)"\s*>(.*?)</｜DSML｜invoke>'
+            invoke_pattern = self.invoke_begin_regex + r"(.*?)" + re.escape(self.invoke_end_token)
             invoke_matches = re.findall(invoke_pattern, function_calls_content, re.DOTALL)
 
             for func_name, invoke_content in invoke_matches:
@@ -211,7 +212,12 @@ class DeepSeekV32Parser(BaseToolParser):
             while True:
                 # Try to match an invoke block (may be partial)
                 invoke_match = re.search(
-                    pattern=r'<｜DSML｜invoke\s+name="([^"]+)"\s*>(.*?)(</｜DSML｜invoke>|$)',
+                    pattern=(
+                        self.invoke_begin_regex
+                        + r"(.*?)("
+                        + re.escape(self.invoke_end_token)
+                        + r"|$)"
+                    ),
                     string=current_text,
                     flags=re.DOTALL,
                 )
@@ -310,7 +316,7 @@ class DeepSeekV32Parser(BaseToolParser):
 
     def structure_info(self) -> _GetInfoFunc:
         return lambda name: StructureInfo(
-            begin=f'<｜DSML｜invoke name="{name}">',
-            end="</｜DSML｜invoke>",
-            trigger=f'<｜DSML｜invoke name="{name}">',
+            begin=self._INVOKE_BEGIN_TEMPLATE.format(name=name),
+            end=self.invoke_end_token,
+            trigger=self._INVOKE_BEGIN_TEMPLATE.format(name=name),
         )
