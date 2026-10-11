@@ -209,10 +209,8 @@ def _create_kv_cache_manager(
         mapping=Mapping(world_size=1, tp_size=1, rank=0),
         dtype=str_dtype_to_binding(torch_dtype_to_str(scenario.kvcache_dtype)),
     )
-    # Size the random physical pool from V2, including its reserved pages.
     for layer_idx in range(scenario.num_layers):
-        buffer = manager.get_buffers(layer_idx, kv_layout="HND")
-        buffer.copy_(torch.randn(buffer.shape, device=buffer.device, dtype=scenario.dtype))
+        manager.get_buffers(layer_idx, kv_layout="HND").zero_()
     return manager
 
 
@@ -233,6 +231,16 @@ def create_generation_inputs(scenario: MhaGenerationScenario) -> MhaGenerationIn
         dtype=scenario.dtype,
     )
     v_new = torch.randn_like(k_new)
+    kv_cache = torch.randn(
+        scenario.num_layers,
+        scenario.kv_pool_num_pages,
+        2,
+        scenario.num_kv_heads,
+        scenario.page_size,
+        scenario.head_dim,
+        device=device,
+        dtype=scenario.dtype,
+    ).to(scenario.kvcache_dtype)
 
     with ExitStack() as cleanup:
         kv_cache_manager = _create_kv_cache_manager(scenario)
@@ -240,6 +248,17 @@ def create_generation_inputs(scenario: MhaGenerationScenario) -> MhaGenerationIn
         request_ids = list(range(scenario.batch_size))
         token_nums = [past_kv_len + scenario.query_len for past_kv_len in scenario.past_kv_lens]
         kv_cache_manager.add_dummy_requests(request_ids, token_nums)
+        # Keep seeded request histories independent of physical page allocation.
+        for layer_idx in range(scenario.num_layers):
+            buffer = kv_cache_manager.get_buffers(layer_idx, kv_layout="HND")
+            page_tables = kv_cache_manager.get_batch_cache_indices(request_ids, layer_idx=layer_idx)
+            logical_page = 0
+            for pages, token_num in zip(page_tables, token_nums, strict=True):
+                num_pages = math.ceil(token_num / scenario.page_size)
+                assert len(pages) >= num_pages
+                for page in pages[:num_pages]:
+                    buffer[page].copy_(kv_cache[layer_idx, logical_page])
+                    logical_page += 1
         metadata = TrtllmAttentionMetadata(
             num_contexts=0,
             kv_cache_params=KVCacheParams(

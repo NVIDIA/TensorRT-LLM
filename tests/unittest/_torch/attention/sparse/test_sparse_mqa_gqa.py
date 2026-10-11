@@ -1095,9 +1095,7 @@ def _quant_config(s: SparseMqaGqaScenario) -> Optional[QuantConfig]:
     return None
 
 
-def _create_kv_cache_manager(
-    s: SparseMqaGqaScenario, *, random_history: bool = False
-) -> KVCacheManagerV2:
+def _create_kv_cache_manager(s: SparseMqaGqaScenario) -> KVCacheManagerV2:
     """Create kv cache manager for testing."""
     kv_cache_config = KvCacheConfig(max_tokens=s.kv_pool_num_pages * s.page_size)
     mapping = Mapping(world_size=1, tp_size=1, rank=0)
@@ -1115,13 +1113,8 @@ def _create_kv_cache_manager(
         dtype=str_dtype_to_binding(torch_dtype_to_str(s.kvcache_dtype)),
     )
 
-    # Size the physical pool from V2, including its reserved pages.
     for i in range(s.num_layers):
-        buffer = manager.get_buffers(i, kv_layout="HND")
-        if random_history:
-            buffer.copy_(torch.randn(buffer.shape, device=buffer.device, dtype=s.dtype))
-        else:
-            buffer.zero_()
+        manager.get_buffers(i, kv_layout="HND").zero_()
 
     return manager
 
@@ -1514,7 +1507,7 @@ def _create_context_inputs(s: ContextScenario) -> _ContextInputs:
     k = torch.randn(s.nnz_q, s.num_kv_heads * s.head_dim, device=device, dtype=s.dtype)
     v = torch.randn(s.nnz_q, s.num_kv_heads * s.head_dim, device=device, dtype=s.dtype)
 
-    kv_cache_manager = _create_kv_cache_manager(s, random_history=False)
+    kv_cache_manager = _create_kv_cache_manager(s)
 
     request_ids = list(range(s.batch_size))
     kv_cache_manager.add_dummy_requests(request_ids, list(s.seq_lens))
@@ -1566,10 +1559,31 @@ def _create_generation_inputs(s: GenerationScenario) -> _GenerationInputs:
         available_kv_lens, s.num_kv_heads, num_sparse_topk, device
     )
 
-    kv_cache_manager = _create_kv_cache_manager(s, random_history=True)
+    kv_cache = torch.randn(
+        s.num_layers,
+        s.kv_pool_num_pages,
+        2,
+        s.num_kv_heads,
+        s.page_size,
+        s.head_dim,
+        device=device,
+        dtype=s.dtype,
+    ).to(s.kvcache_dtype)
+    kv_cache_manager = _create_kv_cache_manager(s)
 
     request_ids = list(range(s.batch_size))
     kv_cache_manager.add_dummy_requests(request_ids, token_nums)
+    # Keep seeded request histories independent of physical page allocation.
+    for layer_idx in range(s.num_layers):
+        buffer = kv_cache_manager.get_buffers(layer_idx, kv_layout="HND")
+        page_tables = kv_cache_manager.get_batch_cache_indices(request_ids, layer_idx=layer_idx)
+        logical_page = 0
+        for pages, token_num in zip(page_tables, token_nums, strict=True):
+            num_pages = math.ceil(token_num / s.page_size)
+            assert len(pages) >= num_pages
+            for page in pages[:num_pages]:
+                buffer[page].copy_(kv_cache[layer_idx, logical_page])
+                logical_page += 1
 
     metadata = _SparseMqaGqaMetadata(
         num_contexts=0,

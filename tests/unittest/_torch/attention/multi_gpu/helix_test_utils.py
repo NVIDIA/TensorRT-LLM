@@ -181,6 +181,7 @@ def setup_kv_and_metadata(
         KvCacheConfig(
             max_tokens=max_tokens * cache_token_scale,
             enable_block_reuse=False,
+            host_cache_size=0,
         ),
         cache_type,
         num_layers=scenario.num_layers,
