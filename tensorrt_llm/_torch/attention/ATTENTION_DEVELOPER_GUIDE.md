@@ -233,6 +233,14 @@ routes, and optional token-validity bits mask ragged KV tails. Plans contain
 only static format, proxy, geometry, and capacity choices; every run receives
 the live routes, summaries, validity bits, page tables, and sequence lengths.
 
+The contiguous block-sparse path also consumes the SageAttention recipe in
+`AttentionForwardArgs`. Prediction sees the original BF16 Q/K/V. The adapter
+then quantizes Q/K/V with FlashInfer's Sage quantizer, quantizes the summaries
+with one scale per K mean and the original V channel scales, and passes all
+scales to PrimTS. The recipe and quantized dtypes are part of the plan key.
+Sage requires BF16 input, because the quantizer's FP16 reciprocal scale can
+overflow on zero or tiny Q/K blocks. Paged block-sparse attention rejects Sage.
+
 `PrimsTSBlockSparseFmha` keeps its planned wrappers in the attention metadata
 (`TrtllmAttentionMetadata.fmha_plan_caches`), like the FlashInfer wrappers and
 the MSA plans. Every layer that runs with one metadata object plans each static
