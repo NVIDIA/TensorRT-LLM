@@ -551,6 +551,9 @@ class PrimsTSBlockSparseFmha(PrimsTSFmha):
             out=forward_args.output.view_as(query),
         )
 
+    # Planning records an external CUDA event that Dynamo cannot construct, so
+    # compiled callers run the PrimTS call eagerly between graph segments.
+    @torch.compiler.disable
     def forward(
         self,
         q: torch.Tensor,
