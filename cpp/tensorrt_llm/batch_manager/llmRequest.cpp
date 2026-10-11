@@ -243,13 +243,8 @@ bool LlmRequest::checkTokenIdRange(SizeType32 vocabSize)
 }
 
 void LlmRequest::validate(SizeType32 maxInputLen, SizeType32 maxSequenceLen, SizeType32 maxDraftLen,
-    SizeType32 vocabSizePadded, std::optional<SizeType32> maxEncoderInputLen, bool enableKVCacheReuse)
+    std::optional<SizeType32> maxEncoderInputLen, bool enableKVCacheReuse)
 {
-    if (mEndId.has_value())
-    {
-        TLLM_CHECK_WITH_INFO(*mEndId >= -1 && *mEndId < vocabSizePadded,
-            "EndId (%d) is not within acceptable range [-1, %d).", *mEndId, vocabSizePadded);
-    }
     if (getEncoderInputFeatures()
         && getEncoderInputFeatures()->getShape().nbDims < 4) // skip encoder shape validation for image inputs
     {

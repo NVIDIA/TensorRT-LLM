@@ -22,8 +22,8 @@ from tensorrt_llm._torch.pyexecutor.engine.runners.encoder import (
     EncoderRunnerConfig,
 )
 from tensorrt_llm._torch.pyexecutor.engine.runners.encoder_decoder import (
-    EncoderDecoderRunner,
-    EncoderDecoderRunnerConfig,
+    EncoderStage,
+    EncoderStageConfig,
 )
 from tensorrt_llm._torch.pyexecutor.engine.runners.interface import PackedInputs
 from tensorrt_llm.llmapi.llm_args import EncodeCudaGraphConfig, EncodeExtraInputSpec
@@ -50,7 +50,7 @@ def _encoder_config(
             def encoder_graph_spec(self) -> tuple[tuple[int, ...], torch.dtype, int]:
                 return feature_spec
 
-    config_type = EncoderDecoderRunnerConfig if encoder_decoder else EncoderRunnerConfig
+    config_type = EncoderStageConfig if encoder_decoder else EncoderRunnerConfig
     kwargs = dict(
         model=_Model(),
         mapping=SimpleNamespace(tp_size=tp_size),
@@ -175,7 +175,7 @@ def test_encoder_decoder_attention_metadata_omits_decoder_cache_indirection() ->
         block_ids_per_seq=object(),
         kv_block_ids_per_seq=object(),
     )
-    runner = object.__new__(EncoderDecoderRunner)
+    runner = object.__new__(EncoderStage)
     runner._model = SimpleNamespace(model_config=object())
     runner._config = SimpleNamespace(
         max_batch_size=4,

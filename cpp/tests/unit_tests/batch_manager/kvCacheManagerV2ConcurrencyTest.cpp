@@ -25,6 +25,7 @@
 #include "tensorrt_llm/batch_manager/kv_cache_manager_v2/blockRadixTree.h"
 #include "tensorrt_llm/batch_manager/kv_cache_manager_v2/kvCache.h"
 #include "tensorrt_llm/batch_manager/kv_cache_manager_v2/kvCacheManager.h"
+#include "tensorrt_llm/batch_manager/kv_cache_manager_v2/utils/funcGuard.h"
 
 #include <cuda_runtime_api.h>
 #include <gtest/gtest.h>
@@ -110,6 +111,42 @@ TEST(KvCacheManagerV2ConcurrencyTest, LevelStatsAreConservedAcrossConcurrentDrai
     EXPECT_TRUE(manager->getAndResetIterationCachedTokensByLevel().empty());
     EXPECT_TRUE(manager->getAndResetIterationReusedBlocksByLevel().empty());
     EXPECT_EQ(manager->getAndResetIterationDiskPrefetchBlocks(), 0);
+}
+
+TEST(KvCacheManagerV2ConcurrencyTest, PageStorageSnapshotWaitsForSharedApiReaders)
+{
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    cudaStream_t stream{};
+    ASSERT_EQ(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), cudaSuccess);
+    auto destroyStream = FuncGuard([&]() { EXPECT_EQ(cudaStreamDestroy(stream), cudaSuccess); });
+    auto config = makeTieredConfig();
+    std::get<AttentionLayerConfig>(config.layers.front()).buffers.front().isSparse = true;
+    auto manager = std::make_shared<KvCacheManager>(std::move(config));
+    auto cache = manager->createKvCache();
+    auto closeCache = FuncGuard([&]() { cache->close(); });
+    ASSERT_TRUE(cache->resume(reinterpret_cast<CUstream>(stream)));
+    ASSERT_TRUE(cache->resize(4, 4));
+    ASSERT_TRUE(cache->enterDecode());
+
+    std::promise<void> started;
+    auto startedFuture = started.get_future();
+    std::future<PageStorageSnapshot> snapshotFuture;
+    {
+        auto const apiLock = manager->lockShared();
+        snapshotFuture = std::async(std::launch::async,
+            [&]
+            {
+                started.set_value();
+                return cache->getPageStorageSnapshot(LifeCycleId{0});
+            });
+        EXPECT_EQ(startedFuture.wait_for(std::chrono::seconds{5}), std::future_status::ready);
+        // Inspecting a locked host page changes non-atomic holder refcounts, so even a
+        // shared API reader must exclude the snapshot until it releases its lock.
+        EXPECT_EQ(snapshotFuture.wait_for(std::chrono::milliseconds{100}), std::future_status::timeout);
+    }
+    auto const snapshot = snapshotFuture.get();
+    EXPECT_EQ(snapshot.eligibleHistoryBlocks(), 1);
+    EXPECT_EQ(snapshot.cacheLevels(), (std::vector<std::optional<CacheLevel>>{kSparseHistoryLevel}));
 }
 
 // Creates `count` roots and proposes all of them for erasure, leaving that many pending entries and

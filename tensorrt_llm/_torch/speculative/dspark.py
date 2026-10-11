@@ -20,7 +20,7 @@
 # ``DSv4DSparkDraftModel.forward`` rather than via mask-token cross-attention.
 
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, List, Optional
 
 import torch
@@ -53,6 +53,59 @@ def _dspark_position_ceiling(max_ctx: int, block_size: int, max_draft_len: int) 
     return int(max_ctx) + int(max_draft_len) + int(block_size) + 3
 
 
+def _publish_policy_window_output(
+    outputs: dict[str, torch.Tensor | bool],
+    verify_lens: Optional[torch.Tensor],
+    *,
+    num_contexts: int,
+    num_generations: int,
+    output_verify_lens: Optional[torch.Tensor],
+) -> None:
+    """Publish executed token windows in full output-row order.
+
+    ``verify_lens`` is generation-ordered, including graph-padding generations.
+    ``output_verify_lens`` is persistent int32 device storage sized at warmup.
+    Context rows have one anchor and no verified drafts. The sampler removes
+    skipped context rows and snapshots the remaining view through its D2H path.
+    """
+    batch_size = num_contexts + num_generations
+    if num_contexts < 0 or num_generations < 0:
+        raise ValueError("verification output row counts must be nonnegative")
+    for name in ("new_tokens", "new_tokens_lens", "next_draft_tokens", "next_new_tokens"):
+        if outputs[name].shape[0] != batch_size:
+            raise ValueError("verification output row counts must match every worker output")
+
+    if verify_lens is None:
+        outputs.pop("verify_lens", None)
+        outputs.pop("verify_lens_in_output_order", None)
+        outputs.pop("host_policy_windows_snapshot", None)
+        outputs["native_uniform_verify"] = True
+        return
+    if (
+        verify_lens.dim() != 1
+        or verify_lens.shape[0] != num_generations
+        or verify_lens.dtype != torch.int32
+        or verify_lens.device != outputs["new_tokens_lens"].device
+    ):
+        raise ValueError("verify_lens must contain exactly one int32 window per generation row")
+    if (
+        output_verify_lens is None
+        or output_verify_lens.dim() != 1
+        or output_verify_lens.shape[0] < batch_size
+        or output_verify_lens.dtype != torch.int32
+        or output_verify_lens.device != verify_lens.device
+    ):
+        raise ValueError("executed-window output storage must cover the full batch on device")
+
+    output_view = output_verify_lens[:batch_size]
+    output_view[:num_contexts].fill_(1)
+    output_view[num_contexts:].copy_(verify_lens)
+    outputs.pop("native_uniform_verify", None)
+    outputs.pop("host_policy_windows_snapshot", None)
+    outputs["verify_lens"] = output_view
+    outputs["verify_lens_in_output_order"] = True
+
+
 @dataclass
 class DSparkSpecMetadata(SpecMetadata):
     """Metadata for DSpark speculative decoding.
@@ -70,6 +123,16 @@ class DSparkSpecMetadata(SpecMetadata):
     """
 
     batch_indices_cuda: Optional[torch.Tensor] = None
+
+    # The engine sets this only for the duration of a target forward. Its
+    # return_context_logits flag also serves sparse speculative gather and is
+    # not itself evidence that every context row is needed. None means the
+    # caller has not supplied that distinction; pruning must stay conservative.
+    _requires_all_context_logits: bool | None = field(default=None, init=False, repr=False)
+
+    # Valid suffix rows per context in the original target batch. None keeps
+    # the ordinary full-capture contract; zero means this chunk has no capture.
+    context_capture_lens: tuple[int, ...] | None = field(default=None, init=False, repr=False)
 
     # Hidden state capture fields
     layers_to_capture: Optional[List[int]] = None
@@ -117,6 +180,7 @@ class DSparkSpecMetadata(SpecMetadata):
             self._layer_to_idx = {}
 
     def prepare(self):
+        self.context_capture_lens = None
         assert self.request_ids is not None
         num_seqs = len(self.request_ids)
         batch_indices = torch.arange(
@@ -184,7 +248,12 @@ class DSparkSpecMetadata(SpecMetadata):
         return layer_id in self._capture_layer_set
 
     def maybe_capture_hidden_states(
-        self, layer_id: int, hidden_states: torch.Tensor, residual: Optional[torch.Tensor] = None
+        self,
+        layer_id: int,
+        hidden_states: torch.Tensor,
+        residual: Optional[torch.Tensor] = None,
+        *,
+        row_indices: Optional[torch.Tensor] = None,
     ) -> None:
         """Capture hidden states from a target model layer into the buffer.
 
@@ -193,7 +262,10 @@ class DSparkSpecMetadata(SpecMetadata):
         streams* (reference ``h.mean(dim=2)`` with ``h`` shaped
         ``[*, hc_mult, hidden]``). We reduce here so the V4 decoder layer's
         existing capture call is unchanged. A ``[num_tokens, hidden]`` input
-        (already reduced / non-mHC) is stored as-is.
+        (already reduced / non-mHC) is stored as-is. During CED replay,
+        ``row_indices`` maps compacted query rows back into the original target
+        batch. The draft worker seeds its rolling window using those original
+        offsets, including when context and generation requests are mixed.
         """
         if self.captured_hidden_states is None:
             return
@@ -205,9 +277,15 @@ class DSparkSpecMetadata(SpecMetadata):
             if to_save.shape[-1] != self.hidden_size:
                 hc_mult = to_save.shape[-1] // self.hidden_size
                 to_save = to_save.reshape(num_tokens, hc_mult, self.hidden_size).mean(dim=1)
-            self.captured_hidden_states[
-                :num_tokens, i * self.hidden_size : (i + 1) * self.hidden_size
-            ].copy_(to_save, non_blocking=True)
+            destination = self.captured_hidden_states[
+                :, i * self.hidden_size : (i + 1) * self.hidden_size
+            ]
+            if row_indices is None:
+                destination[:num_tokens].copy_(to_save, non_blocking=True)
+            else:
+                if row_indices.ndim != 1 or row_indices.shape[0] != num_tokens:
+                    raise ValueError("DSpark capture row_indices must map every replay query row")
+                destination.index_copy_(0, row_indices, to_save)
 
     def get_hidden_states(self, num_tokens: int) -> Optional[torch.Tensor]:
         """Get captured hidden states (all layers concatenated)."""
@@ -267,6 +345,7 @@ class DSv4DSparkWorker(SpecWorkerBase):
         # Per-slot rolling captured-context KV windows, built lazily on the
         # first forward (fixed-size for slot-indexed reads/writes).
         self._win_inited = False
+        self._output_verify_lens: Optional[torch.Tensor] = None
         self._attention_warmup_attempted = False
         self._kv_windows: Optional[torch.Tensor] = None  # [max_batch, num_stages, win, hd]
         self._ctx_len: Optional[torch.Tensor] = None  # [max_batch] abs decode position
@@ -354,6 +433,7 @@ class DSv4DSparkWorker(SpecWorkerBase):
 
         if not self._win_inited:
             max_batch = spec_metadata.max_num_requests
+            self._output_verify_lens = torch.empty(max_batch, dtype=torch.int32, device="cuda")
             num_stages = draft_model.num_stages
             self._win = int(draft_model._attn_params["window_size"])
             head_dim = int(draft_model._attn_params["head_dim"])
@@ -466,10 +546,16 @@ class DSv4DSparkWorker(SpecWorkerBase):
         continuation chunks append to the same request slot.
         """
         captured = spec_metadata.get_hidden_states(total_target_tokens)
+        capture_lens = getattr(spec_metadata, "context_capture_lens", None)
+        if capture_lens is not None and len(capture_lens) != attn_metadata.num_contexts:
+            raise ValueError("DSpark capture lengths must match the context requests")
         flat_position_ids = position_ids.reshape(-1)
         context_offset = 0
         for i in range(attn_metadata.num_contexts):
             chunk_len = int(attn_metadata._seq_lens[i])
+            capture_len = chunk_len if capture_lens is None else capture_lens[i]
+            if not 0 <= capture_len <= chunk_len:
+                raise ValueError("DSpark capture length must be a suffix of its context chunk")
             chunk_positions = flat_position_ids[context_offset : context_offset + chunk_len].long()
             if chunk_len == 0:
                 context_offset += chunk_len
@@ -481,11 +567,11 @@ class DSv4DSparkWorker(SpecWorkerBase):
             self._ctx_len[slot] = chunk_positions[-1] + 1
             self._position_initialized[slot] = True
 
-            if captured is not None:
+            if captured is not None and capture_len:
                 self._valid_len[slot] = torch.clamp(
-                    self._valid_len[slot] + chunk_len, max=self._win
+                    self._valid_len[slot] + capture_len, max=self._win
                 )
-                keep = min(self._win, chunk_len)
+                keep = min(self._win, capture_len)
                 hidden = captured[context_offset + chunk_len - keep : context_offset + chunk_len]
                 # A prompt token at absolute position p is stored in frame p+1,
                 # matching the generation path's start_pos convention.
@@ -557,7 +643,11 @@ class DSv4DSparkWorker(SpecWorkerBase):
             return None
         captured = spec_metadata.get_hidden_states(total_target_tokens)
         if captured is None:
-            return None
+            raise RuntimeError(
+                "DSpark generation requires captured target hidden states; "
+                "check target_layer_ids and the target model's capture hooks. "
+                "Refusing to substitute zero draft tokens for a missing capture buffer."
+            )
 
         # gen-only graph batches have num_ctx_tokens == 0; mixed eager batches put
         # the gen tokens after the context tokens.
@@ -819,13 +909,21 @@ class DSv4DSparkWorker(SpecWorkerBase):
             self._position_initialized.copy_(saved_position_initialized)
             self._kv_windows.copy_(saved_windows)
 
-        return {
+        outputs = {
             "logits": raw_logits,
             "new_tokens": accepted_tokens,
             "new_tokens_lens": num_accepted_tokens,
             "next_draft_tokens": next_draft_tokens,
             "next_new_tokens": next_new_tokens,
         }
+        _publish_policy_window_output(
+            outputs,
+            spec_metadata.verify_lens,
+            num_contexts=num_contexts,
+            num_generations=num_gens,
+            output_verify_lens=self._output_verify_lens,
+        )
+        return outputs
 
 
 class DSparkWorker(DFlashWorker):

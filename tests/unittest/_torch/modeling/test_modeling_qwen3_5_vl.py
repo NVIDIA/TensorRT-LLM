@@ -56,7 +56,7 @@ from tensorrt_llm.quantization.mode import QuantAlgo
 #     Qwen3NextAttention, which hardcodes output gating.
 
 
-def _write_qwen35_dense_vl_config(tmp_path: Path) -> Path:
+def _write_qwen35_dense_vl_config(tmp_path: Path, **extra_config) -> Path:
     config = {
         "architectures": ["Qwen3_5ForConditionalGeneration"],
         "image_token_id": 248056,
@@ -114,6 +114,7 @@ def _write_qwen35_dense_vl_config(tmp_path: Path) -> Path:
         },
         "vision_end_token_id": 248054,
         "vision_start_token_id": 248053,
+        **extra_config,
     }
     (tmp_path / "config.json").write_text(json.dumps(config), encoding="utf-8")
     return tmp_path
@@ -173,11 +174,17 @@ def test_qwen35_dense_vl_resolves_mamba_ssm_cache_dtype(
     assert opt_in_config.quant_config.mamba_ssm_cache_dtype is torch.float32
 
 
-def test_qwen35_dense_vl_resolves_model_and_mapper(tmp_path: Path) -> None:
-    config = load_pretrained_config(str(_write_qwen35_dense_vl_config(tmp_path)))
+# Qwen3.6/3.8-27B checkpoints (and fine-tunes such as Qwen-Image-Bench) publish
+# `language_model_only: false`; they must still load through the generic wrapper.
+@pytest.mark.parametrize("extra_config", [{}, {"language_model_only": False}])
+def test_qwen35_dense_vl_resolves_model_and_mapper(tmp_path: Path, extra_config: dict) -> None:
+    config = load_pretrained_config(str(_write_qwen35_dense_vl_config(tmp_path, **extra_config)))
     model_config = ModelConfig(pretrained_config=config)
 
-    assert AutoModelForCausalLM._resolve_class(model_config) is Qwen3_5VLModel
+    assert config.architectures == ["Qwen3_5ForConditionalGeneration"]
+    model_cls = AutoModelForCausalLM._resolve_class(model_config)
+    assert model_cls is Qwen3_5VLModel
+    assert model_cls.supports_encoder_cache
     assert isinstance(
         AutoCheckpointMapper.get("HF", "Qwen3_5ForConditionalGeneration"),
         Qwen3_5MoeHfWeightMapper,

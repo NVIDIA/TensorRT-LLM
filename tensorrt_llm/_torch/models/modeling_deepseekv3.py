@@ -61,8 +61,9 @@ from ..distributed import (AllReduce, AllReduceFusionOp, AllReduceParams,
 from ..model_config import ModelConfig
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
-from ..moe.fused_moe import (DeepSeekV3MoeRoutingMethod, MoEWeightLoadingMode,
-                             create_moe, is_moe_weight_owner)
+from ..moe.fused_moe import (DEFAULT_MOE_ACTIVATION, DeepSeekV3MoeRoutingMethod,
+                             MoEWeightLoadingMode, SwigluActivation, create_moe,
+                             is_moe_weight_owner)
 
 # isort: off
 from ..moe.fused_moe.routing import Deepseekv3RoutingImpl
@@ -968,7 +969,8 @@ class Deepseekv3MoE(nn.Module):
                  dtype: Optional[torch.dtype] = None,
                  model_config: ModelConfig = ModelConfig(),
                  override_quant_config: Optional[QuantConfig] = None,
-                 layer_idx: Optional[int] = None):
+                 layer_idx: Optional[int] = None,
+                 swiglu_limit_scalar: Optional[float] = None):
         from ..distributed import AllReduce
 
         super().__init__()
@@ -1001,6 +1003,9 @@ class Deepseekv3MoE(nn.Module):
                 model_config, layer_idx)
         else:
             expert_quant_config = override_quant_config
+        moe_activation = DEFAULT_MOE_ACTIVATION
+        if swiglu_limit_scalar is not None:
+            moe_activation = SwigluActivation(clamp=swiglu_limit_scalar)
         self.experts = create_moe(
             num_experts=num_experts,
             routing_method=self.gate.routing_method,
@@ -1017,6 +1022,7 @@ class Deepseekv3MoE(nn.Module):
             # examples/quantization/quantize_mixed_precision_moe.py
             weight_loading_mode=self._expert_weight_loading_mode(
                 expert_quant_config),
+            activation=moe_activation,
         )
 
         self.mapping = model_config.mapping
@@ -1047,6 +1053,7 @@ class Deepseekv3MoE(nn.Module):
             overridden_tp_size=self.shared_tp_size,
             reduce_output=False,
             use_cute_dsl_blockscaling_mm=self.use_cute_dsl_blockscaling_mm,
+            swiglu_limit=swiglu_limit_scalar,
         )
         self.shared_experts_use_fp4 = (
             shared_quant_config is not None

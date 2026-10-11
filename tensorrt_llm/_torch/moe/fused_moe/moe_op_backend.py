@@ -337,6 +337,12 @@ class TRTLLMOpBackend(MoEOpBackend):
         tune_max_num_tokens=8192,
         use_dp=False,
     ):
+        # The native runners take the block scales as one flat linear-layout
+        # tensor (``fp4BlockScaleMoe.cpp`` checks ``dim() == 1``); the
+        # framework hands them over token-major 2-D as ``quantize_input``
+        # produced them. Flattening is this provider's ABI detail.
+        if hidden_states_scale is not None:
+            hidden_states_scale = hidden_states_scale.flatten()
         hidden_size = gemm1_weights.shape[-1] * 2
         if gated_act_type == int(ActType_TrtllmGen.SiTu):
             # Fused SiTu FC1 cubins exist for two input formats: NVFP4
@@ -626,14 +632,17 @@ class FlashinferOpBackend(MoEOpBackend):
         is_sf_8x4_layout: bool = False,
         enable_pdl: Optional[bool] = None,
     ):
+        # Keyword binding: the provider inserts new options (e.g.
+        # ``is_global_scale_inversed``) ahead of ``enable_pdl`` in the
+        # positional signature, so positional calls misbind across releases.
         return self._fp4_quantize(
             input,
-            global_scale,
-            sf_vec_size,
-            sf_use_ue8m0,
-            is_sf_swizzled_layout,
-            is_sf_8x4_layout,
-            enable_pdl,
+            global_scale=global_scale,
+            sf_vec_size=sf_vec_size,
+            sf_use_ue8m0=sf_use_ue8m0,
+            is_sf_swizzled_layout=is_sf_swizzled_layout,
+            is_sf_8x4_layout=is_sf_8x4_layout,
+            enable_pdl=enable_pdl,
         )
 
     def mxfp8_quantize(
@@ -777,6 +786,9 @@ class FlashinferOpBackend(MoEOpBackend):
         tune_max_num_tokens=8192,
         use_dp=False,
     ):
+        # The framework hands the scales over token-major 2-D as
+        # ``quantize_input`` produced them, which is exactly what the
+        # FlashInfer API asserts (``shape[0] == num_tokens``). No reshape.
         if router_logits is not None:
             outputs = self._fused_moe.trtllm_fp4_block_scale_moe(
                 router_logits,

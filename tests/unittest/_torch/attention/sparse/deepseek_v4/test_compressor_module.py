@@ -130,6 +130,7 @@ class DummyAttentionMetadata:
         self.max_ctx_compressed_tokens = max_ctx_compressed_tokens
         self.compressed_mask_cuda = compressed_mask_cuda
         self.num_gen_tokens_per_seq = 0  # Set by caller
+        self.gen_new_tokens_per_seq = None
         self.kv_lens_cuda_runtime = None  # Set by caller
         self.cached_token_lens_cuda = None  # Set by caller
 

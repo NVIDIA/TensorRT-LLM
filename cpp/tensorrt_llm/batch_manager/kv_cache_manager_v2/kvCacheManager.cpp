@@ -300,6 +300,13 @@ int KvCacheManager::getPageIndexScale(LayerId layerId, DataRole role) const
     return mStorage->mSlotToPageIndices.at(attr.lifeCycleId).at(attr.poolIndex);
 }
 
+bool KvCacheManager::isSparse(LayerId layerId, DataRole role) const
+{
+    auto const& attr = mStorage->getBufferAttr(layerId, role);
+    auto const* attn = std::get_if<AttnLifeCycle>(&mLifeCycles[attr.lifeCycleId]);
+    return attn && attn->isSparse;
+}
+
 PageIndexConverter KvCacheManager::getPageIndexConverter(LayerId layerId, DataRole role) const
 {
     auto const& attr = mStorage->getBufferAttr(layerId, role);

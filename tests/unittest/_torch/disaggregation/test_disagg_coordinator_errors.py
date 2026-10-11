@@ -393,6 +393,7 @@ def _executor_with_real_error_path(monkeypatch) -> tuple:
     executor.waiting_queue = Mock(spec=["remove_by_ids"])
     executor.perf_manager = Mock()
     executor.model_engine = SimpleNamespace(route_capture=None)
+    executor.draft_model_engine = None
     executor.iter_counter = 0
     executor.disable_overlap_scheduler = True
     executor.stream_interval = 1
