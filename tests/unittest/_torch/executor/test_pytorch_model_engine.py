@@ -2659,6 +2659,47 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         self.assertEqual(attn_metadata.num_contexts, 0)
         kv_cache_manager.shutdown()
 
+    def test_item_scheduled_chunk_embedding_is_not_retained(self) -> None:
+        """The per-forward item-scheduler payload must not replace the
+        request's own multimodal data, or each chunked prefill would keep its
+        last chunk's joined embedding rows until prefill completes."""
+        model_engine, kv_cache_manager = create_model_engine_and_kvcache()
+        model_engine.model.config.vocab_size = 100
+        attn_metadata = AttentionMetadata(max_num_requests=4,
+                                          max_num_tokens=32,
+                                          kv_cache_manager=kv_cache_manager)
+        attn_metadata.is_cuda_graph = False
+
+        context = _create_request_with_tokens([11, 22, 33, 44], 1)
+        context.context_chunk_size = 2
+        context.py_seq_slot = 0
+        context.py_mm_encoder_state = object()
+        multimodal_data = {"multimodal_embedding_lengths": [2]}
+        context.py_multimodal_data = multimodal_data
+        model_engine._mm_item_scheduler = Mock()
+        model_engine._runner._mm_item_scheduler = model_engine._mm_item_scheduler
+        model_engine._mm_item_scheduler.build_multimodal_data_for_llm.return_value = {
+            "multimodal_embedding": torch.ones((2, 1), dtype=torch.float16),
+            "multimodal_embedding_is_chunk": True,
+        }
+        scheduled_requests = ScheduledRequests()
+        scheduled_requests.context_requests_chunking = [context]
+
+        model_engine._runner._prepare_tp_inputs(
+            scheduled_requests=scheduled_requests,
+            kv_cache_manager=kv_cache_manager,
+            attn_metadata=attn_metadata,
+            enable_spec_decode=False,
+            runtime_draft_len=0,
+            is_dummy=False,
+        )
+
+        model_engine._mm_item_scheduler.build_multimodal_data_for_llm.assert_called_once(
+        )
+        self.assertIs(context.py_multimodal_data, multimodal_data)
+        self.assertNotIn("multimodal_embedding", multimodal_data)
+        kv_cache_manager.shutdown()
+
     def test_kv_cache_manager_with_execution_stream(self) -> None:
         """Test that KVCacheManager uses the provided execution_stream.
         """

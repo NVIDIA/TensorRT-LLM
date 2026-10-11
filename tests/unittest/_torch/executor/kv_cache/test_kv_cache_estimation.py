@@ -31,6 +31,7 @@ from tensorrt_llm._torch.pyexecutor._util import (
 )
 from tensorrt_llm._torch.pyexecutor.config_utils import get_layer_attention_window
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._torch.speculative.interface import SpeculativeDecodingMode
 from tensorrt_llm.inputs.multimodal import MultimodalParams
@@ -206,8 +207,9 @@ class _TextModel:
         )
 
 
-class _MultimodalModel(MultimodalModelMixin):
+class _MultimodalModel(MultimodalModelMixin, torch.nn.Module):
     def __init__(self, encoder_cache_max_bytes):
+        super().__init__()
         self.model_config = ModelConfig(
             multimodal_config=MultimodalConfig(encoder_cache_max_bytes=encoder_cache_max_bytes)
         )
@@ -221,6 +223,10 @@ class _EncoderCacheMultimodalModel(_MultimodalModel):
 class _ModelEngine:
     model: _TextModel | _MultimodalModel
     mm_encoder_output_budget_bytes: int | None = None
+    _mm_item_scheduler: object | None = None
+    mm_encoder_item_scheduling_enabled: bool = False
+    bytes_per_mm_encoder_embedding: int = 8
+    mm_encoder_cache = PyTorchModelEngine.mm_encoder_cache
 
 
 def _make_reserve_creator(
@@ -228,6 +234,7 @@ def _make_reserve_creator(
     *,
     mm_encoder_output_budget_bytes: int | None = None,
     disable_mm_encoder: bool = False,
+    max_num_tokens: int = 1,
 ) -> KvCacheCreator:
     llm_args = TorchLlmArgs(
         model="dummy",
@@ -238,9 +245,20 @@ def _make_reserve_creator(
     # Match ModelLoader: the model receives the effective, normalized config
     # from TorchLlmArgs rather than retaining the caller's input object.
     model.model_config.multimodal_config = llm_args.multimodal_config
+    if isinstance(model, MultimodalModelMixin):
+        cache_bytes = mm_encoder_output_budget_bytes or 0
+        if model.encoder_cache_active:
+            cache_bytes = max(
+                cache_bytes,
+                model.model_config.multimodal_config.encoder_cache_max_bytes,
+            )
+        model._initialize_multimodal_encoder_cache(cache_bytes)
+    item_scheduling = mm_encoder_output_budget_bytes is not None
     model_engine = _ModelEngine(
         model=model,
         mm_encoder_output_budget_bytes=mm_encoder_output_budget_bytes,
+        _mm_item_scheduler=object() if item_scheduling else None,
+        mm_encoder_item_scheduling_enabled=item_scheduling,
     )
     return KvCacheCreator(
         model_engine=model_engine,
@@ -248,7 +266,7 @@ def _make_reserve_creator(
         mapping=Mapping(),
         net_max_seq_len=1,
         kv_connector_manager=None,
-        max_num_tokens=1,
+        max_num_tokens=max_num_tokens,
         max_beam_width=1,
         tokens_per_block=1,
         max_seq_len=1,
@@ -520,6 +538,9 @@ def test_kv_cache_estimation_reserves_multimodal_encoder_cache(
     creator = _make_reserve_creator(model_cls(encoder_cache_max_bytes))
 
     assert creator._get_multimodal_encoder_memory_reserve() == expected_reserve
+    # Inline encoding keeps its batch output beside the cache's copies, so the
+    # profiled batch output cannot stand in for cache-owned bytes.
+    assert creator._get_multimodal_encoder_memory_reserve(64) == expected_reserve
 
 
 def test_kv_cache_estimation_skips_multimodal_reserve_when_encoder_disabled():
@@ -534,12 +555,33 @@ def test_kv_cache_estimation_skips_multimodal_reserve_when_encoder_disabled():
     assert creator._get_multimodal_encoder_memory_reserve() == 0
 
 
-def test_reserve_adds_only_unprofiled_output_capacity():
+@pytest.mark.parametrize(
+    ("cache_bytes", "profiled_bytes", "max_num_tokens", "expected"),
+    [
+        (512, 400, 4, 112 + 64),
+        (512, 600, 4, 64),  # A profiled store never cancels unprofiled joins.
+        (64, 0, 16, 64 + 256),  # Shared entries can be copied by many requests.
+    ],
+)
+def test_reserve_adds_unprofiled_store_and_chunk_copies(
+    cache_bytes, profiled_bytes, max_num_tokens, expected
+):
     creator = _make_reserve_creator(
         _MultimodalModel(0),
-        mm_encoder_output_budget_bytes=512,
+        mm_encoder_output_budget_bytes=cache_bytes,
+        max_num_tokens=max_num_tokens,
     )
-    assert creator._get_multimodal_encoder_memory_reserve(profiled_output_bytes=400) == 112
+    assert creator._get_multimodal_encoder_memory_reserve(profiled_bytes) == expected
+    # Whole-model torch.compile wraps the model after its cache is created.
+    creator._model_engine.model = torch.compile(creator._model_engine.model)
+    assert creator._get_multimodal_encoder_memory_reserve(profiled_bytes) == expected
+
+
+def test_downstream_pp_rank_without_encoder_store_reserves_no_memory() -> None:
+    creator = object.__new__(KvCacheCreator)
+    creator._model_engine = SimpleNamespace(mm_encoder_cache=None)
+
+    assert creator._get_multimodal_encoder_memory_reserve() == 0
 
 
 # ---------------------------------------------------------------------------
@@ -1174,6 +1216,7 @@ def test_estimation_temporarily_uses_inferred_pool_sizing(
     # A bare Mock would auto-create the attribute; real engines set it to
     # None unless the model opted into MM item scheduling.
     model_engine.mm_encoder_output_budget_bytes = None
+    model_engine.mm_encoder_cache = None
     llm_args = Mock(cache_transceiver_config=None, enable_chunked_prefill=chunked_prefill)
 
     with patch.object(

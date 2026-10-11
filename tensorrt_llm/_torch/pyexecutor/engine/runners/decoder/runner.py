@@ -97,6 +97,7 @@ from tensorrt_llm.sampling_params import SamplingParams
 from ...lora import LoraParamBuilder, make_cuda_graph_lora_manager
 from ...metadata import build_attention_metadata
 from ...model_call import ModelCaller
+from ...multimodal import MultimodalItemScheduler
 from ..common import (
     apply_position_id_offset,
     get_all_rank_num_tokens,
@@ -263,6 +264,7 @@ class DecoderRunner(ScheduledModelRunner):
         iter_states: dict[str, Any],
         metrics: dict[str, float],
         kv_cache_manager_key: ResourceManagerType,
+        mm_item_scheduler: MultimodalItemScheduler | None = None,
     ) -> None:
         self.model = model
         self.input_processor = input_processor
@@ -277,6 +279,7 @@ class DecoderRunner(ScheduledModelRunner):
         self.iter_states = iter_states
         self._metrics = metrics
         self.kv_cache_manager_key = kv_cache_manager_key
+        self._mm_item_scheduler = mm_item_scheduler
 
         self._config = config
 
@@ -3153,6 +3156,16 @@ class DecoderRunner(ScheduledModelRunner):
     def _new_extra_inputs(self) -> "ExtraInputsCollector":
         return _NO_EXTRA_INPUTS
 
+    def _build_multimodal_data_for_llm(
+        self,
+        request: LlmRequest,
+        runtime: MultimodalRuntimeData | None = None,
+    ) -> dict[str, Any] | None:
+        """Attach cached item outputs when item scheduling owns the request."""
+        if self._mm_item_scheduler is None:
+            return request.py_multimodal_data
+        return self._mm_item_scheduler.build_multimodal_data_for_llm(request, runtime)
+
     def _prepare_tp_inputs(
         self,
         scheduled_requests: ScheduledRequests,
@@ -3316,7 +3329,7 @@ class DecoderRunner(ScheduledModelRunner):
                 multimodal_input=_build_request_multimodal_input(
                     request, self._config.mm_encoder_cache_enabled
                 ),
-                multimodal_data=request.py_multimodal_data,
+                multimodal_data=self._build_multimodal_data_for_llm(request, py_multimodal_runtime),
                 multimodal_runtime=py_multimodal_runtime,
                 mm_item_order=getattr(request, "py_mm_item_order", None),
                 input_ids_start_offset=context_start_idx,
@@ -3370,8 +3383,12 @@ class DecoderRunner(ScheduledModelRunner):
                         mrope_delta_write_seq_slots.append(request.py_seq_slot)
                         request.py_mrope_delta_cache_slot = request.py_seq_slot
 
-                # re-assign the multimodal_data to the request after to_device for generation requests
-                request.py_multimodal_data = multimodal_params.multimodal_data
+                # Item scheduling builds a per-forward copy holding this chunk's joined rows.
+                # Keep it off the request so chunked prefill does not retain those rows between
+                # chunks outside the encoder-cache memory budget. Legacy requests keep their
+                # device payload for generation.
+                if request.py_mm_encoder_state is None:
+                    request.py_multimodal_data = multimodal_params.multimodal_data
                 multimodal_params_list.append(multimodal_params)
 
                 # Re-register mrope tensors for context-only requests (EPD disaggregated serving).
