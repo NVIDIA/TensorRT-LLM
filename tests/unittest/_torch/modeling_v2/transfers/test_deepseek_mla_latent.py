@@ -12,13 +12,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""The dep4 DeepSeek-R1 target plans its own KV transfer; prove it equals the default plan."""
+"""The DeepSeek MLA-latent planner must produce the default planner's bytes for the pairs it covers."""
 
 import numpy as np
 import pytest
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.deepseek_v3.r1_0528_nvfp4__sm_103__dep4.transfer import (  # noqa: E501
-    DeepseekR1Dep4TransferPlanner,
+from tensorrt_llm._torch._experimental.modeling_v2.transfers.deepseek_mla_latent import (
+    DeepseekMlaLatentTransferPlanner,
 )
 from tensorrt_llm._torch.disaggregation.base import TokenRange
 from tensorrt_llm._torch.disaggregation.base.planner import PeerIncompatibleError, TransferPlan
@@ -42,6 +42,7 @@ NUM_LAYERS = 6
 LAYER_BYTES = 512  # one latent-K region per layer per block
 SLOT_BYTES = NUM_LAYERS * LAYER_BYTES
 TPB = 16
+DEP4 = "deepseek_v3/r1_0528_nvfp4__sm_103__dep4"
 
 
 def _mla_page_table(base: int, *, num_layers: int = NUM_LAYERS, extra_pool: bool = False):
@@ -68,8 +69,12 @@ def _mla_page_table(base: int, *, num_layers: int = NUM_LAYERS, extra_pool: bool
     )
 
 
-def _dep4_rank_info(name: str, dp_rank: int, page_table, *, dp_size: int = 4, pp_size: int = 1):
+def _dep4_rank_info(
+    name: str, dp_rank: int, page_table, *, dp_size: int = 4, pp_size: int = 1, target: str = DEP4
+):
     return RankInfo(
+        planner_id=DeepseekMlaLatentTransferPlanner.planner_id,
+        planner_blob=target.encode(),
         instance_name=name,
         instance_rank=dp_rank,
         tp_size=dp_size,
@@ -100,7 +105,7 @@ def _pair(dp_rank: int = 2):
     peer_ri = _dep4_rank_info("gen", dp_rank, peer_pt)
     ext = KVRegionExtractorV1(self_pt)
     return (
-        DeepseekR1Dep4TransferPlanner(self_ri, ext),
+        DeepseekMlaLatentTransferPlanner(self_ri, ext, self_target=DEP4),
         DefaultTransferPlanner(self_ri, ext),
         self_ri,
         peer_ri,
@@ -159,12 +164,17 @@ def test_targets_is_the_matching_dp_rank_only():
     assert ours.uniform_writers is True
 
 
-def test_check_peer_accepts_the_dep4_twin_and_refuses_everything_else():
+def test_check_peer_accepts_a_covered_pair_and_refuses_everything_else():
     target, _, self_ri, peer_ri = _pair()
-    target.check_peer(self_ri, peer_ri)  # the supported pair
-    with pytest.raises(PeerIncompatibleError, match="dp_size"):
+    target.check_peer(self_ri, peer_ri)  # (dep4, dep4) is in the matrix
+    with pytest.raises(PeerIncompatibleError, match="pair"):
         target.check_peer(
-            self_ri, _dep4_rank_info("gen", 0, _mla_page_table(0x9000_0000), dp_size=2)
+            self_ri,
+            _dep4_rank_info("gen", 2, _mla_page_table(0x9000_0000), target="deepseek_v3/other"),
+        )
+    with pytest.raises(PeerIncompatibleError, match="pair"):
+        target.check_peer(
+            self_ri, _dep4_rank_info("gen", 2, _mla_page_table(0x9000_0000), target="")
         )
     with pytest.raises(PeerIncompatibleError, match="pool"):
         target.check_peer(
@@ -176,14 +186,7 @@ def test_check_peer_accepts_the_dep4_twin_and_refuses_everything_else():
         )
 
 
-def test_target_class_builds_this_planner():
-    from tensorrt_llm._torch._experimental.modeling_v2.models.deepseek_v3.r1_0528_nvfp4__sm_103__dep4 import (  # noqa: E501
-        modeling,
-    )
-
-    cls = modeling.ModelingV2DeepseekR10528Nvfp4Sm103Dep4
-    self_pt = _mla_page_table(0x1000_0000)
-    ri = _dep4_rank_info("ctx", 0, self_pt)
-    planner = cls.build_transfer_planner(object(), None, ri, KVRegionExtractorV1(self_pt))
-    assert isinstance(planner, DeepseekR1Dep4TransferPlanner)
-    assert planner.planner_id == "deepseek_r1_0528_nvfp4_sm103_dep4"
+def test_describe_publishes_own_target_id():
+    target, _, _, _ = _pair()
+    assert target.describe() == DEP4.encode()
+    assert target.planner_id == "modeling_v2.deepseek_mla_latent"

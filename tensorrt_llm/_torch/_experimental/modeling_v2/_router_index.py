@@ -101,6 +101,23 @@ class NoTarget(Exception):
     """
 
 
+def target_id_of(model_cls: type) -> Optional[str]:
+    """``<family>/<directory>`` for a class defined in a modeling_v2 target, else None.
+
+    The directory name is a target's identity (``<checkpoint>__<sm>__<parallel>``);
+    the family prefix keeps two families' checkpoints from colliding. Cheap on
+    purpose: ``AutoModelForCausalLM`` asks this for every model it builds.
+    """
+    module = getattr(model_cls, "__module__", None) or ""
+    prefix = f"{_PACKAGE}.models."
+    if not module.startswith(prefix):
+        return None
+    parts = module[len(prefix) :].split(".")
+    if len(parts) != 3:  # family.directory.modeling
+        return None
+    return f"{parts[0]}/{parts[1]}"
+
+
 def routing_module(arch: str):
     """Import and return the routing module for ``arch``, or None."""
     name = MODELING_V2_ROUTERS.get(arch)

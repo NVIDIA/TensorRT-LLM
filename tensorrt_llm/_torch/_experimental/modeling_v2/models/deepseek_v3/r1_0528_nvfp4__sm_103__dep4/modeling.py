@@ -50,7 +50,6 @@ from .ops.moe.fp4_block_scale_moe_runner import fp4_block_scale_moe_runner  # no
 from .ops.moe.fused_moe import fused_moe
 from .ops.moe.noaux_tc_op import noaux_tc_op
 from .ops.quantization.fp4_quantize import fp4_quantize
-from .transfer import DeepseekR1Dep4TransferPlanner
 
 _CACHED_CTX_FIELDS = (
     "enable_context_mla_with_cached_kv",
@@ -1787,10 +1786,6 @@ class ModelingV2DeepseekR10528Nvfp4Sm103Dep4(
         if self.spec_config is not None:
             self.draft_model = DraftModel(self.model, self.lm_head, self.logits_processor)
             self.spec_worker = get_spec_worker(self.spec_config, model_config, model_config.mapping)
-
-    def build_transfer_planner(self, kv_cache_manager, self_rank_info, self_extractor):
-        """This target's own disaggregated KV plan: dep4 context to dep4 generation."""
-        return DeepseekR1Dep4TransferPlanner(self_rank_info, self_extractor)
 
     def forward(
         self,

@@ -12,22 +12,26 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Disaggregated KV transfer plan for the dep4 DeepSeek-R1 target.
+"""Disaggregated KV transfer plan for DeepSeek targets that keep MLA latent KV in one pool.
 
-Under attention-DP dep4 every context rank has exactly one generation twin, the
-rank with the same dp_rank. MLA keeps one latent-K region per layer in one
-physical pool, so a block's bytes are one contiguous slot. The plan is then
+Under attention-DP every context rank has a generation twin with the same
+dp_rank. MLA keeps one latent-K region per layer in one physical pool, so a
+block's bytes for all local layers are one contiguous slot. The plan is then
 plain arithmetic: pair block ordinals both sides hold, address the slots, and
 copy. Blocks that are consecutive on both sides move as one fragment.
 
-This planner accepts exactly one peer shape -- the same target on four ranks --
-and refuses anything else; the generic default planner stays untouched for the
-models that need pool matching, head re-sharding or recurrent state.
+Which deployments may talk to each other is the ``COVERS`` matrix below: pairs
+of (context target, generation target) ids. A target never names this planner;
+``modeling_v2.transfers`` finds the planner from the target id, and ``describe``
+publishes that id so the peer's planner can look the pair up too. Anything not
+in the matrix is refused at registration; the generic default planner stays
+untouched for the models that need pool matching, head re-sharding or
+recurrent state.
 """
 
 from __future__ import annotations
 
-from typing import AbstractSet, List, Optional, Tuple
+from typing import AbstractSet, FrozenSet, List, Optional, Tuple
 
 import numpy as np
 
@@ -48,7 +52,7 @@ from tensorrt_llm._torch.disaggregation.resource.page import (
 )
 from tensorrt_llm._torch.disaggregation.resource.utils import get_physical_pool
 
-_DP_SIZE = 4
+_R1_DEP4 = "deepseek_v3/r1_0528_nvfp4__sm_103__dep4"
 
 
 def _sole_pool(page_table: Optional[KVCachePageTable], side: str) -> PhysicalPool:
@@ -70,28 +74,39 @@ def _sole_pool(page_table: Optional[KVCachePageTable], side: str) -> PhysicalPoo
     return get_physical_pool(page_table, 0, lg.pool_views[0].pool_idx)
 
 
-class DeepseekR1Dep4TransferPlanner(TransferPlanner):
-    planner_id = "deepseek_r1_0528_nvfp4_sm103_dep4"
+class DeepseekMlaLatentTransferPlanner(TransferPlanner):
+    planner_id = "modeling_v2.deepseek_mla_latent"
 
-    def __init__(self, self_rank_info: RankInfo, self_extractor: KVRegionExtractorV1):
+    #: (context target, generation target) pairs this planner knows how to move
+    #: bytes between. The same pair is listed once; the planner serves both
+    #: roles, so a pair is read from the sender's side or the receiver's side.
+    COVERS: FrozenSet[Tuple[str, str]] = frozenset({(_R1_DEP4, _R1_DEP4)})
+
+    def __init__(
+        self, self_rank_info: RankInfo, self_extractor: KVRegionExtractorV1, *, self_target: str
+    ):
         self._ri = self_rank_info
+        self._target = self_target
         self._page_table = self_extractor.page_table
         self._pool = _sole_pool(self._page_table, "this rank")
+
+    def describe(self) -> bytes:
+        return self._target.encode()
+
+    def _pair(self, peer_ri: RankInfo) -> Tuple[str, str]:
+        """The (self, peer) target pair, or a refusal if the matrix lacks it."""
+        peer_target = peer_ri.planner_blob.decode()
+        if (self._target, peer_target) in self.COVERS or (peer_target, self._target) in self.COVERS:
+            return self._target, peer_target
+        raise PeerIncompatibleError(
+            f"no transfer plan for the pair ({self._target!r}, {peer_target!r}); "
+            f"covered pairs: {sorted(self.COVERS)}"
+        )
 
     # ---- TransferPlanner protocol -------------------------------------------------
 
     def check_peer(self, self_ri: RankInfo, peer_ri: RankInfo) -> None:
-        for ri, side in ((self_ri, "this rank"), (peer_ri, "peer")):
-            if ri.dp_size != _DP_SIZE or ri.tp_size != _DP_SIZE:
-                raise PeerIncompatibleError(
-                    f"{side}: dp_size={ri.dp_size} tp_size={ri.tp_size}; this target runs dep{_DP_SIZE} only"
-                )
-            if ri.pp_size != 1 or ri.cp_size != 1:
-                raise PeerIncompatibleError(
-                    f"{side}: pp_size={ri.pp_size} cp_size={ri.cp_size}; this target runs pp=1 cp=1 only"
-                )
-            if ri.attention is None or not ri.attention.enable_attention_dp:
-                raise PeerIncompatibleError(f"{side}: attention DP is off")
+        self._pair(peer_ri)
         peer_pool = _sole_pool(peer_ri.page_table, "peer")
         self_layers = len(self._page_table.layer_groups[0].local_layers)
         peer_layers = len(peer_ri.page_table.layer_groups[0].local_layers)
@@ -111,8 +126,9 @@ class DeepseekR1Dep4TransferPlanner(TransferPlanner):
             )
 
     def targets(self, self_ri: RankInfo, peer_ri: RankInfo, peer_dp_rank: int) -> PeerTargets:
-        # pp = cp = 1 and tp == dp, so the peer's flat rank is its dp_rank, and
-        # one writer per destination means the fan-in split is trivially uniform.
+        # Every covered pair is attention-DP with pp = cp = 1 and tp == dp, so
+        # the peer's flat rank is its dp_rank, and one writer per destination
+        # means the fan-in split is trivially uniform.
         return PeerTargets(ranks=[peer_dp_rank], uniform_writers=True)
 
     def plan(

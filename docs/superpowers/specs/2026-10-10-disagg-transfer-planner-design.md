@@ -154,12 +154,31 @@ class PretrainedModel/DecoderModelForCausalLM:
         return DefaultTransferPlanner(kv_cache_manager)
 ```
 
-A modeling_v2 target overrides `build_transfer_planner` in its `modeling.py`,
-beside `REQUIRED_TRTLLM_OPS`, and keeps its planner in its own target
-directory. Reason for the model over the cache manager: a plan is a function
+The default is the method above. A modeling_v2 target does **not** override
+it: a planner is the owner of a compatibility set, the (context target,
+generation target) pairs it can move bytes between, and a target is one
+member of such a set. Letting the member name the set would cap every set at
+one member. So the binding runs the other way:
+
+- A planner class declares `COVERS`, a frozenset of `(ctx_target_id,
+  gen_target_id)` pairs. Target ids are `<family>/<directory>`, the
+  directory being the target's identity (`<checkpoint>__<sm>__<parallel>`).
+- `modeling_v2/transfers/` holds every planner and the one lookup,
+  `planner_for_target(target_id)`: zero planners -> default plan, two ->
+  configuration error.
+- `AutoModelForCausalLM.from_config` asks that lookup for the target it just
+  built and installs the covering planner's factory as the instance's
+  `build_transfer_planner`. The framework reads the hook and nothing else;
+  neither the target nor the disaggregation code names a planner.
+- `describe()` publishes the rank's own target id; the peer's planner reads
+  it from `planner_blob` and refuses any pair its matrix lacks. Equal
+  `planner_id` on both sides therefore means "we belong to the same
+  compatibility set", not "we are the same target".
+
+Reason for the model over the cache manager still holds: a plan is a function
 of the parallel topology *and* the cache layout, and the target is the one
 object that already owns both. The cache manager builds the page table and
-knows nothing about which peer topologies the target supports.
+knows nothing about which peer topologies are supported.
 
 Plumbing: `create_kv_cache_transceiver` (`pyexecutor/_util.py:4232`) gains a
 `planner` argument built from `model_engine.model`;

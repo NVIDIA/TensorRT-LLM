@@ -77,3 +77,25 @@ transceiver logs), GSM8K within tolerance of 94.24, no `PeerIncompatibleError`.
   1319 requests in 6.5 min. Launcher findings (loopback-only HTTP discovery, `--server_role`
   crash in static mode, `UCX_TLS=^ib` requirement) are recorded in the dev scripts and memory,
   not in the repo. Logs: `/scratch/fsw/portfolios/coreai/projects/coreai_comparch_trtllm/users/fredw/mv2-disagg/twonode/logs/run_20261010T182505Z`.
+
+## Redesign of the binding (after review)
+
+The target-overrides-`build_transfer_planner` binding was rejected in review: one planner
+must be able to serve several targets, including pairs such as ctx dep4 -> gen dep8 and
+targets from different cores. Implemented instead:
+
+- Planner moved to `modeling_v2/transfers/deepseek_mla_latent.py` as
+  `DeepseekMlaLatentTransferPlanner`, `planner_id = "modeling_v2.deepseek_mla_latent"`, with a
+  `COVERS` matrix of `(ctx target id, gen target id)` pairs; today only
+  `(deepseek_v3/r1_0528_nvfp4__sm_103__dep4, same)`. `describe()` publishes the own target id and
+  `check_peer` refuses any pair outside the matrix; the dp/tp/pp/cp checks are gone because the
+  target id already pins the topology, the layout checks (one pool, layer count,
+  `tokens_per_block`, `slot_bytes`) stay because the arithmetic depends on them.
+- `modeling_v2/transfers/__init__.py`: `PLANNERS`, `planner_for_target`, `bind_transfer_planner`;
+  `target_id_of` lives in `_router_index` so `AutoModelForCausalLM` can ask it cheaply.
+- `AutoModelForCausalLM.from_config` binds after construction; the target's `modeling.py` is back
+  to zero transfer-related lines.
+- Tests: `tests/unittest/_torch/modeling_v2/transfers/` (binding direction, lookup, duplicate
+  coverage, bind; planner parity/merge/targets/pair refusal/describe). 74 tests green with the
+  claims, routing and disaggregation planner suites. The two-node GSM8K gate was run before the
+  redesign; the plan arithmetic is unchanged and the parity test still pins it.
