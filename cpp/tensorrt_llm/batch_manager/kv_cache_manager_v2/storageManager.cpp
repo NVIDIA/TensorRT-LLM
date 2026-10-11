@@ -230,10 +230,10 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
     std::unique_ptr<IKvCacheColdPageCodec> coldPageCodec, std::optional<SwaScratchReuseConfig> swaScratchReuse,
     std::optional<BatchDesc> const& typicalBatch, std::vector<BatchDesc> const& constraints,
     std::optional<std::vector<float>> const& initialPoolRatio, std::shared_ptr<EventSink> eventSink,
-    float maxUtilForResume, Priority secondaryOffloadMinPriority)
+    float maxUtilForResume, Priority coldTierOffloadMinPriority)
     : mLifeCycles(lifeCycles)
     , mEventSink(std::move(eventSink))
-    , mSecondaryOffloadMinPriority(secondaryOffloadMinPriority)
+    , mColdTierOffloadMinPriority(coldTierOffloadMinPriority)
     , mHotPoolGroupMapping(config.lifeCycleGrouping())
     , mSwaScratchReuse(std::move(swaScratchReuse))
     , mColdPageCodec(coldPageCodec ? std::move(coldPageCodec) : createDefaultKvCacheColdPageCodec())
@@ -963,7 +963,7 @@ void StorageManager::_prepareFreeSlots(TypedVec<CacheLevel, TypedVec<PoolGroupIn
                 for (auto iter = pages.rbegin(); iter != pages.rend(); ++iter)
                 {
                     auto const& page = *iter;
-                    if (!page->scheduledForEviction())
+                    if (page->hasValidSlot() && !page->scheduledForEviction() && isEvictable(*page))
                         mLevels.at(page->cacheLevel).controller.scheduleForEviction(*page, /*evictFirst=*/true);
                 }
             }
@@ -974,7 +974,7 @@ void StorageManager::_prepareFreeSlots(TypedVec<CacheLevel, TypedVec<PoolGroupIn
         {
             auto const& page = *iter;
             if (page->cacheLevel == kHotLevel && page->status() == PageStatus::DROPPABLE
-                && page->priority() < mSecondaryOffloadMinPriority)
+                && page->priority() < mColdTierOffloadMinPriority)
             {
                 belowOffloadThreshold.at(page->lifeCycle).push_back(std::move(*iter));
                 iter = pages.erase(iter);

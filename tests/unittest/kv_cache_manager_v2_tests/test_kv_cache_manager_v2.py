@@ -628,10 +628,10 @@ class TestRetention(TestKVCacheManagerV2):
             self.engine.execute([Step(copy, [], list(range(3)))], self.stream.handle)
         self.stream.synchronize()
 
-    @parameterized.expand([(29, 30), (30, 30), (49, 50), (50, 50)])
+    @parameterized.expand([(29, 30), (30, 30), (49, 50), (50, 50), (0, -1), (100, 101)])
     def test_released_offload_threshold_and_duration(self, priority, threshold):
         self.cfg = create_config(4, 2 << 20, 2 << 20, 0, 1, None, 0, 65536)
-        self.cfg.secondary_offload_min_priority = threshold
+        self.cfg.cold_tier_offload_min_priority = threshold
         self.engine = FakeEngine(self.cfg)
         self.manager = KVCacheManager(self.cfg)
         tokens = [1, 2, 3, 4]

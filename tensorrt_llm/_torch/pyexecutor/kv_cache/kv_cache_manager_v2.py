@@ -3100,10 +3100,10 @@ class KVCacheManagerV2(BaseResourceManager):
                 ratio_tolerance=rebalance_cfg.ratio_tolerance,
                 moving_average_decay=rebalance_cfg.moving_average_decay,
             ),
-            secondary_offload_min_priority=(
+            cold_tier_offload_min_priority=(
                 30
-                if kv_cache_config.secondary_offload_min_priority is None
-                else kv_cache_config.secondary_offload_min_priority
+                if kv_cache_config.cold_tier_offload_min_priority is None
+                else kv_cache_config.cold_tier_offload_min_priority
             ),
         )
 
