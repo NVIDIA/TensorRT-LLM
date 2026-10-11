@@ -2126,8 +2126,8 @@ def test_indexer_k_cache_scatter_custom_op():
     max_seq_len = 512
 
     # Use different layers for CUDA vs Python to test non-contiguous handling
-    layer_idx_cuda = 1  # CUDA kernel writes to layer 0
-    layer_idx_python = 2  # Python reference writes to layer 1
+    layer_idx_cuda = 1
+    layer_idx_python = 2
 
     # Create cache manager with multiple layers
     cache_manager, sparse_attn_config = create_dsa_cache_manager(
@@ -2182,17 +2182,34 @@ def test_indexer_k_cache_scatter_custom_op():
     flat_indices_scale = metadata.slot_mapping_scale[:num_tokens]
 
     # ========== Use Different Layers for CUDA vs Python ==========
-    # Simple approach: use layer 0 for CUDA, layer 1 for Python
     # Both get the same input data, but write to different layers
     # Then we extract and compare the outputs from each layer
 
-    # Get k_cache for CUDA path (layer 0)
+    # Get k_cache for CUDA path
     k_cache_cuda = cache_manager.get_indexer_k_cache_buffers(layer_idx_cuda)
     k_cache_cuda.zero_()
 
-    # Get k_cache for Python path (layer 1)
+    # Get k_cache for Python path
     k_cache_python = cache_manager.get_indexer_k_cache_buffers(layer_idx_python)
     k_cache_python.zero_()
+
+    # Use each layer's physical slots so the scatter still exercises strided
+    # storage. Metadata addresses the manager's contiguous shared-page views.
+    page_scale = cache_manager.indexer_k_cache_page_scale
+    k_cache_cuda = k_cache_cuda[::page_scale]
+    k_cache_python = k_cache_python[::page_scale]
+    assert k_cache_cuda.shape == k_cache_python.shape
+    assert not k_cache_cuda.is_contiguous()
+    assert not k_cache_python.is_contiguous()
+    page_bytes = block_size * (head_dim + scale_size)
+
+    def physical_slot_indices(indices):
+        pages = indices // page_bytes
+        assert torch.all(pages % page_scale == 0)
+        return (pages // page_scale) * page_bytes + indices % page_bytes
+
+    flat_indices_fp8 = physical_slot_indices(flat_indices_fp8)
+    flat_indices_scale = physical_slot_indices(flat_indices_scale)
 
     # Print cache properties
     print("\n=== Cache Properties ===")
@@ -2213,8 +2230,8 @@ def test_indexer_k_cache_scatter_custom_op():
         k_fp8,
         k_scale,
         k_cache_cuda,
-        metadata.slot_mapping_fp8,
-        metadata.slot_mapping_scale,
+        flat_indices_fp8,
+        flat_indices_scale,
         num_tokens,
     )
     torch.cuda.synchronize()
@@ -2273,8 +2290,8 @@ def test_indexer_k_cache_scatter_custom_op():
         for idx in diff_indices:
             flat_idx = idx.item()
             print(
-                f"  Byte {flat_idx}: CUDA={k_cache_cuda.view(-1)[flat_idx].item()}, "
-                f"Python={k_cache_python.view(-1)[flat_idx].item()}"
+                f"  Byte {flat_idx}: CUDA={k_cache_cuda.reshape(-1)[flat_idx].item()}, "
+                f"Python={k_cache_python.reshape(-1)[flat_idx].item()}"
             )
 
         # Fail the test

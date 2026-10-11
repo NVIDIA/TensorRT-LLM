@@ -812,6 +812,9 @@ class _MultiLayerPagedAttnEnv:
         for idx in range(num_layers):
             view = self.mgr.get_buffers(idx, kv_layout="HND")
             assert view is not None
+            page_scale = self.mgr.get_layer_page_index_scale(idx)
+            assert page_scale == num_layers * 2
+            view = view[:: page_scale // 2]
             view.zero_()
             self.layer_views.append(view)
         # Auto-resized in place by the op on first call.

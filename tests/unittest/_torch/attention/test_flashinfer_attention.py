@@ -675,7 +675,7 @@ class TestFlashInferAttention(unittest.TestCase):
         )
         kv_cache_manager.add_dummy_requests(request_ids, token_nums)
 
-        for i in range(kv_cache_manager.num_layers):
+        for i in kv_cache_manager.layer_offsets:
             buf = kv_cache_manager.get_buffers(i)
             if buf is not None:
                 torch.nn.init.normal_(buf)
