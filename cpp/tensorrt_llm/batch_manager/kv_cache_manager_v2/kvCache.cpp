@@ -311,11 +311,18 @@ void KvCache::_selectOptionalGroups(std::vector<LifeCycleId> const& groups)
     }
     for (auto lc : groups)
     {
+        bool const newlySelected = std::find(mSelectedOptionalGroups.begin(), mSelectedOptionalGroups.end(), lc)
+            == mSelectedOptionalGroups.end();
         auto const stale = _getStaleRange(mHistoryLength, mManager->lifeCycles()[lc]);
         for (auto const& [ordinal, holder] : mOptionalCandidates[lc])
         {
             if (!stale.contains(ordinal))
             {
+                if (newlySelected)
+                {
+                    auto const retention = getRetention(ordinal);
+                    holder->page->claimRetention(retention.retentionPriority, retention.durationMs);
+                }
                 mBlocks[ordinal].pages[kDefaultBeamIndex][lc] = holder;
             }
         }

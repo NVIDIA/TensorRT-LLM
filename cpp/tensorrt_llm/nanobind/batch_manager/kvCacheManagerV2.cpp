@@ -1749,7 +1749,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 std::optional<std::vector<float>> initialPoolRatio,
                 std::optional<kv::SwaScratchReuseConfig> swaScratchReuse, bool commitMinSnapshot, bool enableStats,
                 bool textOnly, bool enablePartialCommit, kv::PoolRebalanceConfig poolRebalance,
-                kv::Priority secondaryOffloadMinPriority)
+                kv::Priority coldTierOffloadMinPriority)
             {
                 new (cfg) kv::KVCacheManagerConfig();
                 cfg->tokensPerBlock = tokensPerBlock;
@@ -1774,7 +1774,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 cfg->textOnly = textOnly;
                 cfg->enablePartialCommit = enablePartialCommit;
                 cfg->poolRebalance = std::move(poolRebalance);
-                cfg->secondaryOffloadMinPriority = secondaryOffloadMinPriority;
+                cfg->coldTierOffloadMinPriority = coldTierOffloadMinPriority;
                 // Mirror Python's __post_init__: validate at construction. Config-integrity
                 // failures raise AssertionError (translated below).
                 cfg->validate();
@@ -1786,7 +1786,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             nb::arg("swa_scratch_reuse").none() = std::nullopt, nb::arg("commit_min_snapshot") = false,
             nb::arg("enable_stats") = true, nb::arg("text_only") = false, nb::arg("enable_partial_commit") = true,
             nb::arg("pool_rebalance") = kv::PoolRebalanceConfig{},
-            nb::arg("secondary_offload_min_priority") = 30)
+            nb::arg("cold_tier_offload_min_priority") = 30)
         .def_rw("tokens_per_block", &kv::KVCacheManagerConfig::tokensPerBlock)
         .def_rw("cache_tiers", &kv::KVCacheManagerConfig::cacheTiers)
         .def_rw("layers", &kv::KVCacheManagerConfig::layers)
@@ -1794,7 +1794,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def_rw("enable_partial_reuse", &kv::KVCacheManagerConfig::enablePartialReuse)
         .def_rw("reuse_match_backoff", &kv::KVCacheManagerConfig::reuseMatchBackoff)
         .def_rw("enable_partial_commit", &kv::KVCacheManagerConfig::enablePartialCommit)
-        .def_rw("secondary_offload_min_priority", &kv::KVCacheManagerConfig::secondaryOffloadMinPriority)
+        .def_rw("cold_tier_offload_min_priority", &kv::KVCacheManagerConfig::coldTierOffloadMinPriority)
         .def_rw("typical_step", &kv::KVCacheManagerConfig::typicalStep)
         .def_rw("constraints", &kv::KVCacheManagerConfig::constraints)
         .def_rw("initial_pool_ratio", &kv::KVCacheManagerConfig::initialPoolRatio,

@@ -330,7 +330,7 @@ class KVCacheManagerConfig:
     text_only: bool = False
     enable_partial_commit: bool = True
     pool_rebalance: PoolRebalanceConfig = ...
-    secondary_offload_min_priority: int = 30
+    cold_tier_offload_min_priority: int = 30
     @property
     def enable_swa_scratch_reuse(self) -> bool: ...
 

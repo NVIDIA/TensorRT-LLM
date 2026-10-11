@@ -2426,7 +2426,7 @@ def _build_v2_hybrid_with_mamba_layer(
     mamba_ssm_cache_dtype=torch.float16,
     kda_replay_num_spec=None,
     enable_kv_pool_rebalance=False,
-    secondary_offload_min_priority=None,
+    cold_tier_offload_min_priority=None,
     host_cache_size=None,
 ):
     """Construct a real MambaHybridCacheManagerV2."""
@@ -2456,7 +2456,7 @@ def _build_v2_hybrid_with_mamba_layer(
         ),
         dtype=kv_cache_dtype,
         enable_kv_pool_rebalance=enable_kv_pool_rebalance,
-        secondary_offload_min_priority=secondary_offload_min_priority,
+        cold_tier_offload_min_priority=cold_tier_offload_min_priority,
         host_cache_size=host_cache_size,
     )
     return MambaHybridCacheManagerV2(
@@ -2955,7 +2955,7 @@ def test_v2_hybrid_retains_configured_number_of_conversation_turns():
         block_reuse_policy="per_conversation",
         max_num_turns=2,
         additional_snapshot_offsets_from_end=[0],
-        secondary_offload_min_priority=50,
+        cold_tier_offload_min_priority=50,
         host_cache_size=0,
     )
     request_a = _make_v2_conversation_request(
@@ -2989,7 +2989,7 @@ def test_v2_hybrid_retains_configured_number_of_conversation_turns():
         attention_group = mgr.impl.get_layer_group_id(1)
         priorities = cache_a.get_page_priorities(attention_group)
         assert priorities and set(priorities) == {80}
-        assert mgr.impl.init_config.secondary_offload_min_priority == 50
+        assert mgr.impl.init_config.cold_tier_offload_min_priority == 50
         assert not mgr.can_evict
         assert mgr.prefetch_for_context_tokens([request_a]) is True
         request_a_state_index = mgr.get_state_indices([request_a.py_request_id], [False])[0]

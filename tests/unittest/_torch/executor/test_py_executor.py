@@ -370,6 +370,7 @@ def test_context_model_capacity_profile_uses_real_dummy_requests(
     )
     executor, _ = _make_remote_tail_executor_and_request()
     executor.is_warmup = is_warmup
+    executor._is_kv_manager_v2 = False
     if not has_transceiver:
         executor.kv_cache_transceiver = None
     executor.max_beam_width = 1

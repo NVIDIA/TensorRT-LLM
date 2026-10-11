@@ -81,11 +81,17 @@ snapshot can reach this state before its originating request finishes. Prefetch
 preserves the existing expiry. Expired pages return to priority 35; pages still
 referenced by a request cannot be permanently evicted.
 
-On GPU eviction, unreferenced pages below `secondary_offload_min_priority`
+On GPU eviction, unreferenced pages below `KvCacheConfig.cold_tier_offload_min_priority`
 (default 30) are discarded. Pages at or above it can be offloaded. Offloading
 such a page preserves its priority and clears its duration, as in V1; a later
 claim can supply a new duration. Referenced pages may move between tiers but
 are never discarded by this threshold.
+
+`secondary_offload_min_priority` is deprecated. Existing configurations using it
+are accepted with a warning and mapped to `cold_tier_offload_min_priority` for
+both managers. Setting both fields to different values is an error. Serialized
+configurations use the new name. The threshold is manager-wide, not part of
+the per-request `KvCacheRetentionConfig`.
 
 V2 supports the default `transfer_mode=DRAM`. Its host and disk offload tiers are
 configured at manager creation. The per-request `GDS` and `POSIX_DEBUG_FALLBACK`

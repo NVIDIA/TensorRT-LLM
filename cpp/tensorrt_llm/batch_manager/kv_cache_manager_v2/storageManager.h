@@ -130,7 +130,7 @@ public:
         std::optional<BatchDesc> const& typicalBatch = std::nullopt, std::vector<BatchDesc> const& constraints = {},
         std::optional<std::vector<float>> const& initialPoolRatio = std::nullopt,
         std::shared_ptr<EventSink> eventSink = nullptr, float maxUtilForResume = 1.0f,
-        Priority secondaryOffloadMinPriority = 30);
+        Priority coldTierOffloadMinPriority = 30);
     ~StorageManager();
 
     StorageManager(StorageManager const&) = delete;
@@ -426,7 +426,7 @@ private:
 
     LifeCycleRegistry const& mLifeCycles;
     std::shared_ptr<EventSink> mEventSink;
-    Priority mSecondaryOffloadMinPriority;
+    Priority mColdTierOffloadMinPriority;
     LifeCyclePoolGroupMapping mHotPoolGroupMapping;
     LifeCyclePoolGroupMapping mColdPoolGroupMapping;
     // Codec batching representative for each lifecycle.
