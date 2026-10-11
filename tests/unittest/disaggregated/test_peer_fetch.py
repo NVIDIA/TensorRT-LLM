@@ -17,16 +17,15 @@ import numpy as np
 import pytest
 
 from tensorrt_llm import DisaggregatedParams
-from tensorrt_llm._torch.disaggregation.base import (
+from tensorrt_llm._torch.disaggregation.base import CacheKind, TokenRange
+from tensorrt_llm._torch.disaggregation.base.transfer import get_unique_rid
+from tensorrt_llm._torch.disaggregation.native.extent import (
     CacheExtent,
-    CacheKind,
     Cancelled,
     Chunk,
     Delivered,
     Failed,
-    TokenRange,
 )
-from tensorrt_llm._torch.disaggregation.base.transfer import get_unique_rid
 from tensorrt_llm._torch.disaggregation.native.fetch import PeerFetch
 from tensorrt_llm._torch.disaggregation.native.transfer import (
     KVRecvTask,
@@ -125,13 +124,13 @@ def _request(rid: int = 42):
     )
 
 
-def _extent(end=8, groups=None, name=42):
-    blocks = groups if groups is not None else [np.array([1, 2], dtype=np.int64)]
+def _extent(end=8, slot_tables=None, request_id=42):
+    slot_ids = slot_tables if slot_tables is not None else [np.array([1, 2], dtype=np.int64)]
     return CacheExtent(
-        name=name,
+        request_id=request_id,
         local=Chunk(
-            block_ids_per_layer_groups=blocks,
-            kind_per_layer_group=[CacheKind.PAGED] * len(blocks),
+            pool_slot_ids_per_layer_group=slot_ids,
+            kind_per_layer_group=[CacheKind.PAGED] * len(slot_ids),
             token_range=TokenRange(start=0, end=end),
             is_last=True,
         ),
@@ -310,7 +309,7 @@ def _transceiver_over(worker):
     transceiver._validate_bridge_req = lambda req, synchronous=False: True
     # Named after the request, the way the real builder does it: the adapter refuses an extent
     # built for anyone else.
-    transceiver._create_cache_extent = lambda req: _extent(name=get_unique_rid(req))
+    transceiver._create_cache_extent = lambda req: _extent(request_id=get_unique_rid(req))
     transceiver._chunk_num_bytes = lambda chunk: 0
     return transceiver
 
@@ -381,7 +380,7 @@ def test_an_extent_for_another_request_is_refused():
     """
     worker = _StubWorker()
     extent = _extent()
-    extent.name = 99
+    extent.request_id = 99
 
     with pytest.raises(ValueError, match="bound to 42"):
         PeerFetch(worker, _request(42)).fetch(extent)

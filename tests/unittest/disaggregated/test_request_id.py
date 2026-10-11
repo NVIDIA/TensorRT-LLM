@@ -21,6 +21,8 @@ fallback in the native KV transceiver (nvbugs/6482576).
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import msgpack
+import numpy as np
 import pytest
 
 pytestmark = pytest.mark.cpu_only
@@ -86,7 +88,7 @@ def _make_recv_task(ctx_request_id, disagg_request_id, unique_rid=123):
     return SimpleNamespace(
         _params=SimpleNamespace(ctx_request_id=ctx_request_id, disagg_request_id=disagg_request_id),
         _unique_rid=unique_rid,
-        _chunk=SimpleNamespace(block_ids_per_layer_groups=[]),
+        _chunk=SimpleNamespace(pool_slot_ids_per_layer_group=[]),
         _aux_slot=None,
         slice_id=0,
     )
@@ -121,3 +123,19 @@ def test_build_recv_req_info_both_ids_none_raises():
     tfr = pytest.importorskip("tensorrt_llm._torch.disaggregation.native.transfer")
     with pytest.raises(ValueError):
         _build_recv_req_info(tfr, _make_recv_task(ctx_request_id=None, disagg_request_id=None))
+
+
+def test_local_pool_slot_tables_keep_the_receiver_wire_encoding():
+    """The local Chunk vocabulary maps to the peer's established message field."""
+    tfr = pytest.importorskip("tensorrt_llm._torch.disaggregation.native.transfer")
+    task = _make_recv_task(ctx_request_id=7, disagg_request_id=99)
+    slot_tables = [np.array([9, -1, 2], dtype=np.int64), np.array([5], dtype=np.int64)]
+    task._chunk.pool_slot_ids_per_layer_group = slot_tables
+    info = _build_recv_req_info(tfr, task)
+    assert info.block_ids_per_layer_groups is slot_tables
+
+    wire = msgpack.unpackb(info.to_bytes(), raw=False)
+    assert wire["block_ids_per_layer_groups"] == [table.tobytes() for table in slot_tables]
+    assert "pool_slot_ids_per_layer_group" not in wire
+    restored = tfr.RecvReqInfo.from_bytes(info.to_bytes())
+    assert [table.tolist() for table in restored.block_ids_per_layer_groups] == [[9, -1, 2], [5]]

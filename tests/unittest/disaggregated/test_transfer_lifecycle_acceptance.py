@@ -26,9 +26,10 @@ from unittest.mock import Mock, call
 import pytest
 
 import tensorrt_llm._torch.disaggregation.transceiver as transceiver_mod
-from tensorrt_llm._torch.disaggregation.base import Cancelled, Chunk, TokenRange
+from tensorrt_llm._torch.disaggregation.base import TokenRange
 from tensorrt_llm._torch.disaggregation.base.transfer import SessionStatus
 from tensorrt_llm._torch.disaggregation.native.bounce.impl import NoBounceTransport
+from tensorrt_llm._torch.disaggregation.native.extent import Cancelled, Chunk
 from tensorrt_llm._torch.disaggregation.native.handle import TaskHandle
 from tensorrt_llm._torch.disaggregation.native.transfer import AgentResult, KVRecvTask, RxSession
 from tensorrt_llm._torch.disaggregation.orchestration import coordinator as coordinator_mod
@@ -150,7 +151,7 @@ class _ReceiveCase:
         )
         self.session.receive(
             Chunk(
-                block_ids_per_layer_groups=[],
+                pool_slot_ids_per_layer_group=[],
                 kind_per_layer_group=[],
                 token_range=TokenRange(start=0, end=1),
                 is_last=True,

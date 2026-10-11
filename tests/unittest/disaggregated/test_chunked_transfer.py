@@ -25,8 +25,9 @@ import numpy as np
 import pytest
 
 from tensorrt_llm import DisaggregatedParams
-from tensorrt_llm._torch.disaggregation.base import CacheExtent, CacheKind, Chunk, TokenRange
+from tensorrt_llm._torch.disaggregation.base import CacheKind, TokenRange
 from tensorrt_llm._torch.disaggregation.base.transfer import SessionStatus, WaitResult
+from tensorrt_llm._torch.disaggregation.native.extent import CacheExtent, Chunk
 from tensorrt_llm._torch.disaggregation.native.transfer import (
     AgentResult,
     KVSendTask,
@@ -81,7 +82,7 @@ def _make_tx_session(num_slices: int, rid: int = 42, prompt_len: int = 8, **kwar
     )
     for i in range(num_slices):
         s = Chunk(
-            block_ids_per_layer_groups=[[i]],
+            pool_slot_ids_per_layer_group=[[i]],
             kind_per_layer_group=[CacheKind.PAGED],
             token_range=TokenRange(start=0, end=prompt_len),
             is_last=(i == num_slices - 1),
@@ -101,7 +102,7 @@ def _make_rx_session(num_slices: int, rid: int = 42, prompt_len: int = 8) -> RxS
     )
     for i in range(num_slices):
         s = Chunk(
-            block_ids_per_layer_groups=[[i]],
+            pool_slot_ids_per_layer_group=[[i]],
             kind_per_layer_group=[CacheKind.PAGED],
             token_range=TokenRange(start=0, end=prompt_len),
             is_last=(i == num_slices - 1),
@@ -196,7 +197,7 @@ def _make_projection_task(slice_id: int = 1) -> KVSendTask:
     # that only holds ordinals 5..7.
     return KVSendTask(
         Chunk(
-            block_ids_per_layer_groups=[
+            pool_slot_ids_per_layer_group=[
                 _positional(8, o4=[4, 5, 6, 7]),
                 _positional(8, o5=[10, 11, 12]),
             ],
@@ -252,7 +253,7 @@ def test_final_swa_slice_keeps_the_receivers_complete_active_window():
     )
     task = KVSendTask(
         Chunk(
-            block_ids_per_layer_groups=[
+            pool_slot_ids_per_layer_group=[
                 _positional(8, o2=np.arange(2, 8)),
                 _positional(8),
             ],
@@ -285,7 +286,7 @@ def _projection_task_for(start_block: int, end_block: int) -> KVSendTask:
     """A send task whose positional source table holds exactly the chunk's ordinals."""
     return KVSendTask(
         Chunk(
-            block_ids_per_layer_groups=[
+            pool_slot_ids_per_layer_group=[
                 _positional(8, **{f"o{start_block}": np.arange(start_block, end_block)}),
                 _positional(8, o5=[10, 11, 12]),
             ],
@@ -381,7 +382,7 @@ def test_tx_session_intermediate_slice_cannot_complete_session():
     )
     session.send(
         Chunk(
-            block_ids_per_layer_groups=[[0]],
+            pool_slot_ids_per_layer_group=[[0]],
             kind_per_layer_group=[CacheKind.PAGED],
             token_range=TokenRange(start=0, end=8),
             is_last=False,
@@ -459,7 +460,7 @@ def _make_respond_transceiver(session, chunk, *, pipelined=True):
     session.send = MagicMock(side_effect=lambda _chunk: session.kv_tasks.append(MagicMock()))
     # Both builders hand back an extent. The pipelined one answers None for a piece worth
     # deferring, which is what a caller passing chunk=None is asking for.
-    extent = None if chunk is None else CacheExtent(name=42, local=chunk)
+    extent = None if chunk is None else CacheExtent(request_id=42, local=chunk)
     transceiver._enable_pipelined_transfer = pipelined
     transceiver._get_or_create_send_session = MagicMock(return_value=session)
     transceiver._build_prefill_extent = MagicMock(return_value=extent)
@@ -787,7 +788,7 @@ def test_pipelined_last_chunk_sends_and_finalizes():
     session = MagicMock()
 
     last_slice = Chunk(
-        block_ids_per_layer_groups=[np.array([0, 1], dtype=np.int64)],
+        pool_slot_ids_per_layer_group=[np.array([0, 1], dtype=np.int64)],
         kind_per_layer_group=[CacheKind.PAGED],
         token_range=TokenRange(start=0, end=8),
         is_last=True,
@@ -819,7 +820,7 @@ def test_non_pipelined_transfer_builds_whole_slice():
 
     session = MagicMock()
     whole_slice = Chunk(
-        block_ids_per_layer_groups=[np.array([0, 1], dtype=np.int64)],
+        pool_slot_ids_per_layer_group=[np.array([0, 1], dtype=np.int64)],
         kind_per_layer_group=[CacheKind.PAGED],
         token_range=TokenRange(start=0, end=8),
         is_last=True,
@@ -849,7 +850,7 @@ def test_pipelined_non_last_chunk_does_not_finalize():
     session = MagicMock()
 
     mid_slice = Chunk(
-        block_ids_per_layer_groups=[np.array([0, 1], dtype=np.int64)],
+        pool_slot_ids_per_layer_group=[np.array([0, 1], dtype=np.int64)],
         kind_per_layer_group=[CacheKind.PAGED],
         token_range=TokenRange(start=0, end=4),
         is_last=False,
@@ -979,7 +980,7 @@ def test_pipelined_multiple_chunks_use_real_builder_and_tx_session():
         TokenRange(start=2 * tokens_per_block, end=4 * tokens_per_block),
     ]
     # Positional tables: each chunk blanks the ordinals outside its range.
-    assert [task._chunk.block_ids_per_layer_groups[0].tolist() for task in session.kv_tasks] == [
+    assert [task._chunk.pool_slot_ids_per_layer_group[0].tolist() for task in session.kv_tasks] == [
         [0, 1, -1, -1],
         [-1, -1, 2, 3],
     ]
@@ -1035,7 +1036,7 @@ def _build_prefill_chunk_tokens_for(
         source_block_ids = np.full(_REUSE_TOTAL_BLOCKS, -1, dtype=np.int64)
         source_block_ids[:resident_blocks] = np.arange(resident_blocks)
     whole = Chunk(
-        block_ids_per_layer_groups=[np.asarray(source_block_ids, dtype=np.int64)],
+        pool_slot_ids_per_layer_group=[np.asarray(source_block_ids, dtype=np.int64)],
         kind_per_layer_group=[CacheKind.PAGED],
         token_range=TokenRange(start=0, end=resident_blocks * _REUSE_TPB),
         is_last=True,
@@ -1088,7 +1089,7 @@ def test_build_prefill_chunk_rounds_unaligned_non_final_end_down():
 
     assert chunk.is_last is False
     assert chunk.token_range == _reuse_token_range(0, 1)
-    assert np.array_equal(chunk.block_ids_per_layer_groups[0], _positional(8, o0=[0]))
+    assert np.array_equal(chunk.pool_slot_ids_per_layer_group[0], _positional(8, o0=[0]))
 
 
 def test_unaligned_chunk_boundaries_tile_block_space_exactly():
@@ -1152,7 +1153,7 @@ def test_swa_blocks_are_deferred_until_the_complete_final_window():
     assert first_slice is None
     assert final_slice.is_last is True
     assert np.array_equal(
-        final_slice.block_ids_per_layer_groups[0],
+        final_slice.pool_slot_ids_per_layer_group[0],
         _positional(8, o4=np.arange(4, _REUSE_TOTAL_BLOCKS)),
     )
 
@@ -1181,7 +1182,7 @@ def test_window_covering_the_whole_prompt_streams_like_full_attention(window_tok
 
     assert chunk is not None
     assert chunk.is_last is False
-    assert np.array_equal(chunk.block_ids_per_layer_groups[0], _positional(8, o0=np.arange(4)))
+    assert np.array_equal(chunk.pool_slot_ids_per_layer_group[0], _positional(8, o0=np.arange(4)))
 
 
 def test_unaligned_reuse_prefix_still_extends_first_chunk_to_block_zero():
@@ -1193,7 +1194,7 @@ def test_unaligned_reuse_prefix_still_extends_first_chunk_to_block_zero():
     )
 
     assert chunk.token_range == _reuse_token_range(0, 3)
-    assert np.array_equal(chunk.block_ids_per_layer_groups[0], _positional(8, o0=np.arange(3)))
+    assert np.array_equal(chunk.pool_slot_ids_per_layer_group[0], _positional(8, o0=np.arange(3)))
 
 
 def test_first_chunk_covers_ctx_prefix_reuse():
@@ -1205,7 +1206,7 @@ def test_first_chunk_covers_ctx_prefix_reuse():
     )
 
     assert chunk.token_range == _reuse_token_range(0, 6)
-    assert np.array_equal(chunk.block_ids_per_layer_groups[0], _positional(8, o0=np.arange(6)))
+    assert np.array_equal(chunk.pool_slot_ids_per_layer_group[0], _positional(8, o0=np.arange(6)))
     assert chunk.is_last is False
 
 
@@ -1234,7 +1235,7 @@ def test_only_the_first_chunk_extends_to_block_zero(
     expected[expected_start_block:chunk_end_block] = np.arange(
         expected_start_block, chunk_end_block
     )
-    assert np.array_equal(chunk.block_ids_per_layer_groups[0], expected)
+    assert np.array_equal(chunk.pool_slot_ids_per_layer_group[0], expected)
 
 
 def test_single_chunk_with_reuse_degenerates_to_monolithic_slice():
@@ -1254,7 +1255,7 @@ def test_single_chunk_with_reuse_degenerates_to_monolithic_slice():
     assert chunk.is_last is True
     assert chunk.token_range == _reuse_token_range(0, _REUSE_TOTAL_BLOCKS)
     assert np.array_equal(
-        chunk.block_ids_per_layer_groups[0],
+        chunk.pool_slot_ids_per_layer_group[0],
         np.arange(_REUSE_TOTAL_BLOCKS, dtype=np.int64),
     )
 

@@ -18,10 +18,10 @@ from __future__ import annotations
 
 from typing import Optional
 
-from tensorrt_llm._torch.disaggregation.base import Attempt, CacheExtent, Cancelled, Outcome
 from tensorrt_llm._torch.disaggregation.base.transfer import get_unique_rid
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 
+from .extent import Attempt, CacheExtent, Cancelled, Outcome
 from .handle import NothingPublished, TaskHandle
 from .transfer import RxSession, SessionStatus, TransferWorker
 
@@ -29,17 +29,19 @@ from .transfer import RxSession, SessionStatus, TransferWorker
 def refuse_extent_for_another_request(extent: CacheExtent, request: LlmRequest) -> None:
     """Refuse an extent built for a different request than this adapter is bound to.
 
-    Both sides ignore ``name`` otherwise -- they move ``extent.local`` for the request they hold --
+    Both sides ignore ``request_id`` otherwise -- they move ``extent.local`` for the request they hold --
     so passing the wrong extent would transfer the bound request's blocks under the other one's
-    name, and nothing would say so.
+    request id, and nothing would say so.
 
     Compared against the same derivation the builder used, not against the session's id: the
     session is keyed by the name the peer resolves, which is a different value whenever a request
     carries a context id but no disaggregated one.
     """
-    mine = get_unique_rid(request)
-    if extent.name != mine:
-        raise ValueError(f"extent names request {extent.name}, but this adapter is bound to {mine}")
+    request_id = get_unique_rid(request)
+    if extent.request_id != request_id:
+        raise ValueError(
+            f"extent names request {extent.request_id}, but this adapter is bound to {request_id}"
+        )
 
 
 class CancelledBeforePublication:

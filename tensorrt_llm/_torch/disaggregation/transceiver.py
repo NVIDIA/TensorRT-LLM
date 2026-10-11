@@ -25,7 +25,7 @@ import torch
 
 import tensorrt_llm.bindings
 from tensorrt_llm import logger
-from tensorrt_llm._torch.disaggregation.base import CacheExtent, CacheKind, Chunk, TokenRange
+from tensorrt_llm._torch.disaggregation.base import CacheKind, TokenRange
 from tensorrt_llm._torch.disaggregation.base.agent import use_pure_python_transfer_agent
 from tensorrt_llm._torch.disaggregation.base.transfer import (
     RxSessionBase,
@@ -42,6 +42,7 @@ from tensorrt_llm._torch.disaggregation.kv_cache_transceiver import (
 from tensorrt_llm._torch.disaggregation.native.bounce import (
     config_from_size as bounce_config_from_size,
 )
+from tensorrt_llm._torch.disaggregation.native.extent import CacheExtent, Chunk
 from tensorrt_llm._torch.disaggregation.native.fetch import PeerFetch
 from tensorrt_llm._torch.disaggregation.native.perf_logger import perf_log_manager
 from tensorrt_llm._torch.disaggregation.native.publish import PeerPublish
@@ -513,11 +514,10 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         return self._describe_local(req)
 
     def _create_cache_extent(self, req: LlmRequest) -> CacheExtent:
-        """This request's whole prompt as the sole piece of a transfer, under the name it is
-        registered by."""
+        """This request's whole prompt as the sole piece of a transfer, with its local request id."""
         rid = get_unique_rid(req)
         assert rid is not None
-        return CacheExtent(name=rid, local=self._describe_local(req))
+        return CacheExtent(request_id=rid, local=self._describe_local(req))
 
     def _describe_local(self, req: LlmRequest) -> Chunk:
         """The blocks this rank holds, one list per layer group.
@@ -548,29 +548,31 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             excluded_pool_views = exclude(self._page_table, remote_tail_split)
 
         is_gen_only = req.is_generation_only_request
-        cached_per_lg = (
+        cached_tokens_per_layer_group = (
             adapter.get_cached_token_count_per_layer_group(req, layer_groups)
             if is_gen_only
             else [0] * len(layer_groups)
         )
 
         empty = np.array([], dtype=np.int64)
-        groups = []
-        kinds = [lg.kind for lg in layer_groups]
-        for idx, lg in enumerate(layer_groups):
-            if lg.kind == CacheKind.STATE:
+        slot_tables = []
+        kinds = [layer_group.kind for layer_group in layer_groups]
+        for layer_group_index, layer_group in enumerate(layer_groups):
+            if layer_group.kind == CacheKind.STATE:
                 slot = self._get_mamba_slot_for_request(req)
-                group = np.array([slot], dtype=np.int64) if slot is not None else empty
+                slot_ids = np.array([slot], dtype=np.int64) if slot is not None else empty
             else:
                 # Block lists carry beam 0 only (beam-search attention reads
                 # prompt positions through beam 0's block table), so the
                 # positional path applies to every beam width.
-                ordinals = adapter.get_block_ordinals(req, idx, lg)
-                group = self._positional_window(ordinals, prompt_blocks, cached_per_lg[idx] // tpb)
-            groups.append(group)
+                slot_ids = adapter.get_block_ordinals(req, layer_group_index, layer_group)
+                slot_ids = self._pool_slot_table_for_prompt(
+                    slot_ids, prompt_blocks, cached_tokens_per_layer_group[layer_group_index] // tpb
+                )
+            slot_tables.append(slot_ids)
 
         return Chunk(
-            block_ids_per_layer_groups=groups,
+            pool_slot_ids_per_layer_group=slot_tables,
             kind_per_layer_group=kinds,
             token_range=TokenRange(start=0, end=transfer_len),
             is_last=True,
@@ -578,8 +580,8 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         )
 
     @staticmethod
-    def _positional_window(
-        ordinals: np.ndarray, prompt_blocks: int, cached_blocks: int
+    def _pool_slot_table_for_prompt(
+        pool_slot_ids: np.ndarray, prompt_blocks: int, cached_blocks: int
     ) -> np.ndarray:
         """Fit a manager block table into the prompt's ordinal range.
 
@@ -587,11 +589,11 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         (incremental ctx allocation), truncates the speculative / first-token
         tail, and masks the receiver's cached prefix.
         """
-        window = np.full(prompt_blocks, -1, dtype=np.int64)
-        n = min(int(ordinals.size), prompt_blocks)
-        window[:n] = ordinals[:n]
-        window[: min(cached_blocks, prompt_blocks)] = -1
-        return window
+        slot_table = np.full(prompt_blocks, -1, dtype=np.int64)
+        copied_slots = min(int(pool_slot_ids.size), prompt_blocks)
+        slot_table[:copied_slots] = pool_slot_ids[:copied_slots]
+        slot_table[: min(cached_blocks, prompt_blocks)] = -1
+        return slot_table
 
     def _chunk_num_bytes(self, chunk: Chunk) -> int:
         """Local-rank KV bytes covered by a chunk: per view, the valid block count times the view's
@@ -610,15 +612,15 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         if pt is None:
             return 0
         total = 0
-        for lg_id, block_ids in enumerate(chunk.block_ids_per_layer_groups):
-            if block_ids is None or block_ids.size == 0:
+        for layer_group_index, slot_ids in enumerate(chunk.pool_slot_ids_per_layer_group):
+            if slot_ids is None or slot_ids.size == 0:
                 continue
-            n = int((block_ids >= 0).sum())
-            if n == 0:
+            valid_slot_count = int((slot_ids >= 0).sum())
+            if valid_slot_count == 0:
                 continue
-            lg = pt.layer_groups[lg_id]
-            for pool_idx, pv in enumerate(lg.pool_views):
-                if (lg_id, pool_idx) in chunk.excluded_pool_views:
+            lg = pt.layer_groups[layer_group_index]
+            for pool_index, pv in enumerate(lg.pool_views):
+                if (layer_group_index, pool_index) in chunk.excluded_pool_views:
                     continue
                 # The view's byte regions within one slot (all of its layers).
                 view_bytes = get_pool_view_slot_bytes(pv)
@@ -628,7 +630,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                     total += view_bytes
                 else:
                     # Attention: n blocks, each covering the view's regions.
-                    total += n * view_bytes
+                    total += valid_slot_count * view_bytes
         return total
 
     @staticmethod
@@ -1026,29 +1028,29 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             return None
 
         whole = self._describe_local(req)
-        all_block_ids = whole.block_ids_per_layer_groups
-        chunk_block_ids = []
+        whole_slot_tables = whole.pool_slot_ids_per_layer_group
+        chunk_slot_tables = []
         assert self._page_table is not None
-        for lg, block_ids in zip(self._page_table.layer_groups, all_block_ids):
+        for lg, slot_ids in zip(self._page_table.layer_groups, whole_slot_tables):
             window_size = getattr(lg, "sliding_window_size", None)
             if window_size is not None and window_size < req.prompt_len:
                 # SWA pages can leave the active window between chunks. Defer
                 # the group and send its complete final active window at once.
-                chunk_block_ids.append(block_ids if is_last_chunk else np.full_like(block_ids, -1))
+                chunk_slot_tables.append(slot_ids if is_last_chunk else np.full_like(slot_ids, -1))
             else:
                 # Positional: keep the chunk's ordinals, blank everything else.
-                chunk = np.full_like(block_ids, -1)
-                chunk[chunk_start:chunk_end] = block_ids[chunk_start:chunk_end]
-                chunk_block_ids.append(chunk)
-        if not is_last_chunk and not any((ids >= 0).any() for ids in chunk_block_ids):
+                slot_table = np.full_like(slot_ids, -1)
+                slot_table[chunk_start:chunk_end] = slot_ids[chunk_start:chunk_end]
+                chunk_slot_tables.append(slot_table)
+        if not is_last_chunk and not any((ids >= 0).any() for ids in chunk_slot_tables):
             return None
         # The block window is rounded up; the span this piece delivers is not. Every reader below
         # rounds back to blocks, and a recurrent-state group reads the end as an exact checkpoint.
         chunk_end_token = min(chunk_end * tpb, req.prompt_len) if is_last_chunk else chunk_end * tpb
         return CacheExtent(
-            name=rid,
+            request_id=rid,
             local=Chunk(
-                block_ids_per_layer_groups=chunk_block_ids,
+                pool_slot_ids_per_layer_group=chunk_slot_tables,
                 kind_per_layer_group=whole.kind_per_layer_group,
                 token_range=TokenRange(start=chunk_start * tpb, end=chunk_end_token),
                 is_last=is_last_chunk,
