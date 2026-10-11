@@ -109,6 +109,30 @@ class RenderResources:
         )
 
     @classmethod
+    def from_parts(
+        cls,
+        *,
+        tokenizer: Any,
+        model_type: Optional[str],
+        hf_config: Any,
+        processor: Any = None,
+        default_chat_template: Optional[str] = None,
+    ) -> "RenderResources":
+        """Resources for a caller that holds the pieces itself (the KV-cache governor, Responses).
+
+        The serving extension is derived from ``model_type`` here, so every such caller
+        gets the extension that goes with its model type.
+        """
+        return cls(
+            tokenizer=tokenizer,
+            model_type=model_type,
+            processor=processor,
+            hf_config=hf_config,
+            default_chat_template=default_chat_template,
+            extension=get_serving_extension(model_type),
+        )
+
+    @classmethod
     def from_tokenizer(
         cls,
         tokenizer: Any,

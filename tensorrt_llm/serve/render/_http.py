@@ -32,7 +32,7 @@ def build_render_app(
     """Build the FastAPI app of a CPU-only renderer.
 
     Only the render routes, ``/health`` and ``/server_info`` are mounted: there is
-    no executor here, so no inference routes and no ``/generate``.
+    no executor here, so no inference routes.
     """
     app = FastAPI(title="TensorRT-LLM renderer")
     serving = ServingRender(lambda: resources)

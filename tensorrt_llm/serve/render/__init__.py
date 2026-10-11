@@ -20,7 +20,7 @@ standalone renderer. The package builds without an executor, model weights or a
 GPU. See :mod:`.chat` for the pipeline and :mod:`.resources` for loading.
 """
 
-from .api_router import attach_render_routes, render_endpoints_enabled
+from .api_router import attach_render_routes, mount_render_endpoints, render_endpoints_enabled
 from .chat import (
     PreparedChat,
     arender_chat,
@@ -31,7 +31,6 @@ from .chat import (
     tokenize_rendered,
 )
 from .fingerprint import compute_fingerprint, fingerprints_match
-from .generate import attach_generate_route, mount_render_endpoints
 from .prompt_types import (
     GENERATE_REQUEST_SCHEMA_VERSION,
     GenerateRequest,
@@ -53,7 +52,6 @@ __all__ = [
     "ServingRender",
     "UnsupportedRenderError",
     "arender_chat",
-    "attach_generate_route",
     "attach_render_routes",
     "compute_fingerprint",
     "fingerprints_match",

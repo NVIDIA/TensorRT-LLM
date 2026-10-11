@@ -54,19 +54,18 @@ class RenderedPrompt:
     # (see ``untrusted_reason``); a consumer then renders the prompt itself.
     tokens_trusted: bool = True
     untrusted_reason: Optional[str] = None
-    # Multimodal payload, filled only when the caller asked to load media.
-    mm_data: Optional[Dict[str, Any]] = None
-    mm_embeddings: Optional[Dict[str, Any]] = None
-    # Decisions derived from the rendered prompt (see :class:`PreparedContext`).
+    # Decisions derived from the rendered prompt (see :class:`PreparedContext`); a caller
+    # that would forward the ids checks them first.
     context: Dict[str, Any] = field(default_factory=dict)
 
 
 class PreparedContext(BaseModel):
     """Decisions the chat route derives from the rendered prompt.
 
-    A worker handed token ids never sees the rendered text, so it cannot make these
-    decisions again; they are computed once where the prompt is rendered and carried
-    with the ids.
+    A request that carries only ``prompt_token_ids`` (what the router forwards on
+    write-back) skips rendering, so the worker cannot make these decisions from the
+    text. A caller that would forward ids therefore checks :meth:`is_trivial` and,
+    when the prompt carries a decision, leaves the rendering to the worker.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -77,8 +76,8 @@ class PreparedContext(BaseModel):
     # Reasoning mode read off the rendered prompt (a template that prefills ``<think>`` or
     # ``</think>``), per reasoning parser that takes its mode from there. It is recorded for
     # every such parser, not only the one the renderer was configured with: the renderer's
-    # parser setting is not part of the compatibility check, so the worker picks the entry
-    # for its own parser. A parser absent from the mapping resolved nothing (``None``).
+    # parser setting is not part of the compatibility check. A parser absent from the
+    # mapping resolved nothing.
     resolved_thinking: Dict[str, bool] = Field(default_factory=dict)
 
     def is_trivial(self) -> bool:
@@ -87,20 +86,18 @@ class PreparedContext(BaseModel):
 
 
 class GenerateRequest(BaseModel):
-    """Prepared request: the prompt tokens plus the original request to execute.
+    """What a render route returns: the prompt token ids plus what a consumer needs to use them.
 
-    Returned by the render routes and consumed by ``POST /generate``.
+    ``token_ids`` are the tokens the worker's own chat route would render for the original
+    request, valid when ``fingerprint`` equals the worker's (``GET /server_info``). A
+    routing consumer (the Dynamo EPP) reads ``token_ids`` and forwards the original request
+    unchanged.
 
-    **Contract: prompt replay.** What is guaranteed is prompt preparation: when the
-    ``fingerprint`` matches the worker's, ``token_ids`` are the tokens the worker's own
-    chat route would have rendered, and ``context`` carries the decisions derived from
-    the rendered prompt. Everything else stays worker-owned: the ``request`` field is
-    the original request body (chat-completions, or completions with the prompt replaced
-    by ``token_ids``) and is validated and executed by the worker's normal route, so
-    sampling defaults, guided decoding, tool and reasoning parsing, streaming, usage and
-    errors are the worker's. A caller that needs identical generation behavior must also
-    ensure the worker's execution configuration (generation defaults, parsers) is the one
-    it expects; the rendering fingerprint does not cover it.
+    To have a worker execute the ids without rendering, use its existing token-in routes
+    rather than a dedicated endpoint: ``POST /v1/completions`` with ``token_ids`` as the
+    prompt, or ``POST /v1/chat/completions`` with the original body plus ``prompt_token_ids``
+    (the mechanism the router's write-back already uses). Only ids with ``tokens_trusted``
+    and a matching ``fingerprint`` should be executed that way.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -111,10 +108,9 @@ class GenerateRequest(BaseModel):
     # Rendering-configuration fingerprint of the renderer that produced the ids.
     fingerprint: Dict[str, Any]
     token_ids: List[int]
-    # False when the ids must not be executed as is; the consumer re-renders.
+    # False when the ids must not be executed as is (a named tool_choice: the worker adds a
+    # forced tool-call prefix); the consumer lets the worker render.
     tokens_trusted: bool = True
     untrusted_reason: Optional[str] = None
-    # Decisions derived from the rendered prompt, preserved for the executing worker.
-    context: PreparedContext = Field(default_factory=PreparedContext)
     # The original request body.
     request: Dict[str, Any] = Field(default_factory=dict)
