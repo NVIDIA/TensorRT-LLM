@@ -28,7 +28,7 @@ A recipe is the tuple `(qk_dtype, v_dtype, (q_block_size, k_block_size, v_block_
 |---|---|---|---|---|
 | `TRTLLM` | `int8` | `fp8` | `(2, 16, 1)` | SageAttention (INT8 QK) for Hopper |
 | `TRTLLM` | `int8` | `fp8` | `(1, 1, 1)`, `(1, 4, 1)`, `(1, 16, 1)` | SageAttention (INT8 QK) for Blackwell |
-| `TRTLLM` | `fp8` | `fp8` | `(1, 1, 1)`, `(1, 4, 1)` | SageAttention (FP8 QK) for Blackwell |
+| `TRTLLM` | `fp8` | `fp8` | `(1, 1, 1)`, `(1, 4, 1)`, `(1, 16, 1)` | SageAttention (FP8 QK) for Blackwell |
 | `TRTLLM` | `bf16` | `fp8` | `(0, 0, 0)` | PrimTS QK16PV8 for Blackwell (`TLLM_FMHA_LIBS=+prims_ts`) |
 | `TRTLLM` | `fp8` | `fp8` | `(0, 0, 0)` | PrimTS FP8 for Blackwell (`TLLM_FMHA_LIBS=+prims_ts`) |
 | `CUDNN` | `fp8` | `fp8` | `(0, 0, 0)` | cuDNN FP8 |

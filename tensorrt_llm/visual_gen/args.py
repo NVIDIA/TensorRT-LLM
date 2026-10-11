@@ -152,10 +152,12 @@ class AttentionConfig(StrictBaseModel):
                 ("int8", "fp8", (1, 16, 1)),
                 ("fp8", "fp8", (1, 1, 1)),
                 ("fp8", "fp8", (1, 4, 1)),
+                ("fp8", "fp8", (1, 16, 1)),
             },
             103: {
                 ("fp8", "fp8", (1, 1, 1)),
                 ("fp8", "fp8", (1, 4, 1)),
+                ("fp8", "fp8", (1, 16, 1)),
             },
         }
         # PrimTS serves the per-tensor FP8 recipes on Blackwell (TLLM_FMHA_LIBS=+prims_ts).
