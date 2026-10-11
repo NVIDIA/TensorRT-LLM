@@ -51,7 +51,7 @@ def _allocate_request(manager: KVCacheManagerV2, request: LlmRequest) -> None:
     cache = manager._create_kv_cache(request.py_request_id, None, None)
     assert cache is not None
     assert cache.resume(torch.cuda.current_stream().cuda_stream)
-    assert cache.resize(request.prompt_len)
+    assert cache.resize(request.prompt_len, history_length=request.prompt_len)
 
 
 def _request_block_data(manager: KVCacheManagerV2, request: LlmRequest) -> torch.Tensor:

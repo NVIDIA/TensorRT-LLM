@@ -60,7 +60,7 @@ def _allocate_request(manager: KVCacheManagerV2, request: LlmRequest) -> None:
     cache = manager._create_kv_cache(request.py_request_id, None, None)
     assert cache is not None
     assert cache.resume(torch.cuda.current_stream().cuda_stream)
-    assert cache.resize(request.prompt_len)
+    assert cache.resize(request.prompt_len, history_length=request.prompt_len)
 
 
 def _request_block_data(manager: KVCacheManagerV2, request: LlmRequest) -> torch.Tensor:
@@ -385,7 +385,7 @@ def worker_fn(
 
             # Get block ids and send
             block_ids = np.asarray(
-                kv_cache_manager.get_batch_cache_indices([ctx_request.py_request_id])[0],
+                kv_cache_manager.get_page_indices_by_layer_group(ctx_request)[0],
                 dtype=np.int64,
             )
             send_kv_slice = Chunk(
@@ -430,7 +430,7 @@ def worker_fn(
 
             # Get block ids and receive
             block_ids = np.asarray(
-                kv_cache_manager.get_batch_cache_indices([gen_request.py_request_id])[0],
+                kv_cache_manager.get_page_indices_by_layer_group(gen_request)[0],
                 dtype=np.int64,
             )
             recv_kv_slice = Chunk(
