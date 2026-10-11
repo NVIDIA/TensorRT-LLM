@@ -247,4 +247,6 @@ class TestCpuOnlyStartup:
 
         expected = render_chat(chat_request(), resources(make_tokenizer())).token_ids
         assert prepared["token_ids"] == expected
-        assert info["render_fingerprint"]["digest"] == prepared["fingerprint"]["digest"]
+        assert info["render_fingerprint"]["digest"]
+        # The identity lives on /server_info only, not on each render response.
+        assert "fingerprint" not in prepared

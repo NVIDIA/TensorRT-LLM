@@ -215,6 +215,24 @@ def fingerprints_match(local: Optional[Dict[str, Any]], remote: Optional[Dict[st
     return digest is not None and digest == remote.get("digest")
 
 
+def fingerprint_summary(fingerprint: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """The part of a fingerprint :func:`fingerprints_match` reads, small enough to publish.
+
+    A coordinator sends this per worker to the frontends, which never fetch ``/server_info``
+    themselves. A summary matches exactly like the full fingerprint it came from.
+    """
+    if not fingerprint:
+        return None
+    compared = fingerprint.get("compared") or {}
+    return {
+        "digest": fingerprint.get("digest"),
+        "compared": {
+            "use_harmony": bool(compared.get("use_harmony")),
+            "tokenizer": {"complete": bool((compared.get("tokenizer") or {}).get("complete"))},
+        },
+    }
+
+
 def _identity_complete(fingerprint: Dict[str, Any]) -> bool:
     compared = fingerprint.get("compared") or {}
     if compared.get("use_harmony"):

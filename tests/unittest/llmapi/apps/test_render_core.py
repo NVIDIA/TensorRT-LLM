@@ -609,9 +609,7 @@ class TestResourcesFromServer:
 
 class TestGenerateRequest:
     def test_round_trips_and_carries_the_schema_version(self) -> None:
-        body = GenerateRequest(
-            fingerprint={"digest": "abc"}, token_ids=[1, 2, 3], request={"model": "m"}
-        )
+        body = GenerateRequest(token_ids=[1, 2, 3], request={"model": "m"})
         again = GenerateRequest.model_validate_json(body.model_dump_json())
 
         assert again == body
@@ -620,7 +618,11 @@ class TestGenerateRequest:
 
     def test_unknown_fields_are_rejected(self) -> None:
         with pytest.raises(ValidationError):
-            GenerateRequest(fingerprint={}, token_ids=[1], surprise=True)
+            GenerateRequest(token_ids=[1], surprise=True)
+
+    def test_a_per_response_fingerprint_is_no_longer_part_of_the_schema(self) -> None:
+        with pytest.raises(ValidationError):
+            GenerateRequest(fingerprint={"digest": "abc"}, token_ids=[1])
 
 
 class TestLegacySwitch:

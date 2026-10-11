@@ -90,7 +90,7 @@ class TestStandaloneApp:
         assert prepared.token_ids == expected
         assert prepared.kind == "chat"
         assert prepared.tokens_trusted is True
-        assert prepared.fingerprint == resources(tokenizer).fingerprint()
+        assert "fingerprint" not in response.json()
         assert prepared.request == CHAT_BODY
         # Top-level token_ids, so a client that reads only that field works.
         assert response.json()["token_ids"] == expected
@@ -188,7 +188,11 @@ class TestStandaloneApp:
         without = plain.post("/v1/chat/completions/render", json=CHAT_BODY).json()
 
         assert with_template["token_ids"] != without["token_ids"]
-        assert with_template["fingerprint"]["digest"] != without["fingerprint"]["digest"]
+        # The difference is visible in the identity published on /server_info.
+        assert (
+            templated.get("/server_info").json()["render_fingerprint"]["digest"]
+            != plain.get("/server_info").json()["render_fingerprint"]["digest"]
+        )
 
 
 class TestCompletionsRender:

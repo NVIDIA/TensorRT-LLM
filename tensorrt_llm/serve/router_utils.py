@@ -335,16 +335,26 @@ class BlockHashMixin:
         version) counts as a mismatch. Hashing the vocabulary is slow, so the
         router's own fingerprint is computed once per model.
         """
-        servers = getattr(self, "_server_info", None) or {}
-        if not servers:
+        published = self.__dict__.get("_published_render_fingerprints")
+        if published is not None:
+            # A coordinator frontend: it never fetches /server_info, so it judges the
+            # servers it was told about by the fingerprints the coordinator published.
+            # A server the coordinator has not reported yet counts as a mismatch.
+            remote = [published.get(server) for server in getattr(self, "_servers", None) or []]
+        else:
+            servers = getattr(self, "_server_info", None) or {}
+            remote = [info.get("render_fingerprint") for info in servers.values()]
+        if not remote:
             return False
         cache = self.__dict__.setdefault("_render_fingerprint_cache", {})
         local = cache.get(model)
         if local is None:
             local = cache[model] = self._render_resources(model).fingerprint()
-        return all(
-            fingerprints_match(local, info.get("render_fingerprint")) for info in servers.values()
-        )
+        return all(fingerprints_match(local, fingerprint) for fingerprint in remote)
+
+    def set_published_render_fingerprints(self, fingerprints: dict[str, Optional[dict]]) -> None:
+        """Worker fingerprints (summaries) a disagg coordinator published, by server."""
+        self._published_render_fingerprints = dict(fingerprints)
 
     def _tokenize_chat(self, request: ChatCompletionRequest) -> list[int]:
         """Render a chat request with the shared core and decide on write-back."""
