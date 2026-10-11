@@ -22,10 +22,11 @@
 #     copy of the selected YAML with enable_attention_dp: false. Every rank
 #     then serves the same global batch instead of its own, so in the default
 #     mode max_batch_size is raised 32 -> 128 to recover eval concurrency
-#     (the spec-dec modes keep their own batch limits). Note: with
-#     attention-DP off the MoE router gate defaults to its bf16 fast path,
-#     which can flip borderline expert picks; export KIMI_K3_ROUTER_BF16=0
-#     for apples-to-apples accuracy comparison against DEP16 references.
+#     (the spec-dec modes keep their own batch limits). Note: the MoE router
+#     gate defaults to its bf16 path, whose different summation order can
+#     flip borderline expert picks; export KIMI_K3_ROUTER_BF16=0 for
+#     apples-to-apples accuracy comparison against references measured with
+#     the fp32 upcast path.
 #
 # --task mmmu evaluates the multimodal path (KimiK3ForConditionalGeneration
 # with the vision tower; point --model at a K3 VL checkpoint). It passes
