@@ -216,7 +216,7 @@ def test_v2_receive_uses_each_resumed_group(encoder_hit):
         256 if encoder_hit else 0,
         0,
     ]
-    received = transceiver._create_chunk(req).block_ids_per_layer_groups
+    received = transceiver._create_chunk(req).pool_slot_ids_per_layer_group
     for actual, expected in zip(
         received, [[-1, -1, 12], [-1, -1, 22] if encoder_hit else [-1, 21, 22], [-1, 31, 32]]
     ):
@@ -251,7 +251,7 @@ class TestCreateKvSliceBlockSpan:
 
         kv_slice = transceiver._create_chunk(req)
 
-        assert kv_slice.block_ids_per_layer_groups[0].size == (prompt_len + tpb - 1) // tpb
+        assert kv_slice.pool_slot_ids_per_layer_group[0].size == (prompt_len + tpb - 1) // tpb
 
     def test_extra_tokens_do_not_cross_block_boundary(self):
         prompt_len = 16
@@ -264,7 +264,7 @@ class TestCreateKvSliceBlockSpan:
 
         kv_slice = transceiver._create_chunk(req)
 
-        assert kv_slice.block_ids_per_layer_groups[0].size == prompt_len // tpb
+        assert kv_slice.pool_slot_ids_per_layer_group[0].size == prompt_len // tpb
 
     def test_defaults_to_prompt_len_when_no_extra(self):
         prompt_len = 17
@@ -275,7 +275,7 @@ class TestCreateKvSliceBlockSpan:
 
         kv_slice = transceiver._create_chunk(req)
 
-        assert kv_slice.block_ids_per_layer_groups[0].size == (prompt_len + tpb - 1) // tpb
+        assert kv_slice.pool_slot_ids_per_layer_group[0].size == (prompt_len + tpb - 1) // tpb
 
     def test_incremental_allocation_is_padded_with_holes(self):
         # Ctx during chunked prefill has allocated only 2 of 4 prompt blocks.
@@ -285,7 +285,7 @@ class TestCreateKvSliceBlockSpan:
 
         kv_slice = transceiver._create_chunk(req)
 
-        np.testing.assert_array_equal(kv_slice.block_ids_per_layer_groups[0], [100, 101, -1, -1])
+        np.testing.assert_array_equal(kv_slice.pool_slot_ids_per_layer_group[0], [100, 101, -1, -1])
 
     def test_swa_holes_and_first_token_overhang(self):
         # prompt_len=32, window=16 -> the adapter reports [-1, -1, 102, 103, 104]:
@@ -301,7 +301,7 @@ class TestCreateKvSliceBlockSpan:
 
         kv_slice = transceiver._create_chunk(req)
 
-        np.testing.assert_array_equal(kv_slice.block_ids_per_layer_groups[0], [-1, -1, 102, 103])
+        np.testing.assert_array_equal(kv_slice.pool_slot_ids_per_layer_group[0], [-1, -1, 102, 103])
 
     def test_receiver_cached_prefix_is_masked(self):
         # MTP gen request: num_extra=2 adds a speculative tail block, window=16
@@ -319,7 +319,7 @@ class TestCreateKvSliceBlockSpan:
 
         kv_slice = transceiver._create_chunk(req)
 
-        np.testing.assert_array_equal(kv_slice.block_ids_per_layer_groups[0], [-1, -1, 102, 103])
+        np.testing.assert_array_equal(kv_slice.pool_slot_ids_per_layer_group[0], [-1, -1, 102, 103])
 
     def test_receiver_reuse_hit_reaching_into_window(self):
         # window=32 -> 2 holes; the receiver holds 32 cached tokens (4 blocks),
@@ -336,7 +336,7 @@ class TestCreateKvSliceBlockSpan:
         kv_slice = transceiver._create_chunk(req)
 
         np.testing.assert_array_equal(
-            kv_slice.block_ids_per_layer_groups[0], [-1, -1, -1, -1, 104, 105]
+            kv_slice.pool_slot_ids_per_layer_group[0], [-1, -1, -1, -1, 104, 105]
         )
 
     def test_ctx_side_ignores_cached_tokens(self):
@@ -352,7 +352,9 @@ class TestCreateKvSliceBlockSpan:
 
         kv_slice = transceiver._create_chunk(req)
 
-        np.testing.assert_array_equal(kv_slice.block_ids_per_layer_groups[0], [100, 101, 102, 103])
+        np.testing.assert_array_equal(
+            kv_slice.pool_slot_ids_per_layer_group[0], [100, 101, 102, 103]
+        )
 
     @pytest.mark.parametrize("prompt_len", (1150, 1151))
     def test_dspark_disagg_boundary_keeps_only_initialized_swa(self, prompt_len):
@@ -374,7 +376,7 @@ class TestCreateKvSliceBlockSpan:
         kv_slice = transceiver._create_chunk(req)
 
         expected = np.concatenate([np.full(stale_end, -1, dtype=np.int64), block_ids[:-1]])
-        np.testing.assert_array_equal(kv_slice.block_ids_per_layer_groups[0], expected)
+        np.testing.assert_array_equal(kv_slice.pool_slot_ids_per_layer_group[0], expected)
 
 
 class TestKvSliceProperty:
@@ -433,7 +435,7 @@ class TestKvSliceProperty:
             )
 
             kv_slice = transceiver._create_chunk(req)
-            got = kv_slice.block_ids_per_layer_groups[0]
+            got = kv_slice.pool_slot_ids_per_layer_group[0]
             expected = self._reference(prompt_len, tpb, window, cached_tokens, is_gen, window_slots)
             ctx = (
                 f"prompt_len={prompt_len} tpb={tpb} window={window} stale={stale} "
@@ -469,7 +471,7 @@ class TestKvSliceProperty:
             req.py_csa2_remote_tail_mode = mode
             req.py_csa2_remote_tail_start = remote_tail_start
             req.py_draft_tokens = []
-            slices.append(transceiver._create_chunk(req).block_ids_per_layer_groups[0])
+            slices.append(transceiver._create_chunk(req).pool_slot_ids_per_layer_group[0])
 
         # CTX owns only the computed prefix. GEN also reserves the replay tail,
         # whose uninitialized page must not replace the prefix's receive target.
@@ -502,7 +504,7 @@ class TestKvSliceProperty:
 
         kv_slice = transceiver._create_chunk(req)
 
-        assert kv_slice.block_ids_per_layer_groups[0].size == 0
+        assert kv_slice.pool_slot_ids_per_layer_group[0].size == 0
 
 
 # ---------------------------------------------------------------------------
@@ -817,4 +819,4 @@ class TestV1AdapterHostOffloadSlots:
 
         chunk = transceiver._create_chunk(self._req())
 
-        np.testing.assert_array_equal(chunk.block_ids_per_layer_groups[0], [0, 1, 2])
+        np.testing.assert_array_equal(chunk.pool_slot_ids_per_layer_group[0], [0, 1, 2])

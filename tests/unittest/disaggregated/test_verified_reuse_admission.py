@@ -36,8 +36,9 @@ import pytest
 import tensorrt_llm._torch.disaggregation.native.bounce as bounce_mod
 import tensorrt_llm._torch.disaggregation.native.transfer as transfer_mod
 from tensorrt_llm import DisaggregatedParams
-from tensorrt_llm._torch.disaggregation.base import CacheKind, Chunk, TokenRange
+from tensorrt_llm._torch.disaggregation.base import CacheKind, TokenRange
 from tensorrt_llm._torch.disaggregation.base.transfer import SessionStatus
+from tensorrt_llm._torch.disaggregation.native.extent import Chunk
 from tensorrt_llm._torch.disaggregation.native.mixers.attention.peer import (
     IntactMapper,
     ReplicatedMapper,
@@ -76,7 +77,7 @@ def _make_params(rid: int = 42) -> DisaggregatedParams:
 
 def _make_chunk(prompt_len: int = 8) -> Chunk:
     return Chunk(
-        block_ids_per_layer_groups=[np.array([0], dtype=np.int64)],
+        pool_slot_ids_per_layer_group=[np.array([0], dtype=np.int64)],
         kind_per_layer_group=[CacheKind.PAGED],
         token_range=TokenRange(start=0, end=prompt_len),
         is_last=True,
@@ -409,7 +410,7 @@ _UNIT = 64  # bytes of one K, V, or index-K buffer per (layer, block)
 
 def _make_block_chunk(num_blocks: int) -> Chunk:
     return Chunk(
-        block_ids_per_layer_groups=[np.arange(num_blocks, dtype=np.int64)],
+        pool_slot_ids_per_layer_group=[np.arange(num_blocks, dtype=np.int64)],
         kind_per_layer_group=[CacheKind.PAGED],
         token_range=TokenRange(start=0, end=num_blocks * 16),
         is_last=True,
@@ -516,7 +517,7 @@ def _summed_sender_bytes(page_table: KVCachePageTable, chunk: Chunk) -> int:
     """
     extractor = KVRegionExtractorV1(page_table)
     total = 0
-    for lg_idx, block_ids in enumerate(chunk.block_ids_per_layer_groups):
+    for lg_idx, block_ids in enumerate(chunk.pool_slot_ids_per_layer_group):
         layer_group = page_table.layer_groups[lg_idx]
         for view_idx, pool_view in enumerate(layer_group.pool_views):
             if (lg_idx, view_idx) in chunk.excluded_pool_views:
@@ -576,7 +577,7 @@ class TestExpectedWriteBytesMatchSenderBytes:
     def test_invalid_blocks_are_not_expected(self):
         page_table = _coalesced_page_table()
         chunk = Chunk(
-            block_ids_per_layer_groups=[np.array([-1, 0, 1, -1], dtype=np.int64)],
+            pool_slot_ids_per_layer_group=[np.array([-1, 0, 1, -1], dtype=np.int64)],
             kind_per_layer_group=[CacheKind.PAGED],
             token_range=TokenRange(start=0, end=64),
             is_last=True,
