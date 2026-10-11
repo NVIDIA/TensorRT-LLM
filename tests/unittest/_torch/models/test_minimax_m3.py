@@ -2691,3 +2691,100 @@ def test_minimax_m3_swiglu_oai_fused_matches_reference(dtype):
     plain_ref = torch.nn.functional.silu(gate_c) * up_c
     plain = swiglu(gate_up, swiglu_limit=limit)
     torch.testing.assert_close(plain.float(), plain_ref.float(), atol=atol, rtol=1e-2)
+
+
+def _dense_sdpa_decode_reference(q, k_ctx, v_ctx, seq_lens, num_kv_heads, head_dim):
+    """Per-request GQA decode via explicit ``repeat_interleave`` (pre-#18872 math).
+
+    ``q`` is ``[batch, num_heads * head_dim]``; ``k_ctx`` / ``v_ctx`` are
+    ``[batch, max_len, num_kv_heads, head_dim]`` holding each request's full
+    context, valid for positions ``< seq_lens[b]``.
+    """
+    batch = q.shape[0]
+    num_heads = q.shape[1] // head_dim
+    group = num_heads // num_kv_heads
+    out = torch.empty_like(q, dtype=torch.float32)
+    for b in range(batch):
+        n = int(seq_lens[b])
+        q_b = q[b].view(num_heads, 1, head_dim).float()  # [H, 1, d]
+        k_b = k_ctx[b, :n].float().repeat_interleave(group, dim=1).transpose(0, 1)  # [H, n, d]
+        v_b = v_ctx[b, :n].float().repeat_interleave(group, dim=1).transpose(0, 1)
+        o_b = torch.nn.functional.scaled_dot_product_attention(q_b, k_b, v_b)  # [H, 1, d]
+        out[b] = o_b.reshape(-1)
+    return out
+
+
+@pytest.mark.skipif(not _has_cuda(), reason="dense SDPA decode runs on the CUDA KV pool")
+@pytest.mark.parametrize("num_kv_heads", [1, 2, 4])
+@pytest.mark.parametrize("group", [1, 4])
+def test_minimax_m3_sdpa_dense_decode_matches_repeat_interleave_reference(num_kv_heads, group):
+    """The decode branch of ``_sdpa_dense_attention_core`` matches plain GQA math.
+
+    Covers ``group > 1``, ``num_kv_heads > 1`` and a batch with mixed
+    ``seq_lens`` (shorter rows padded out to ``max_k``), so a head-order or
+    mask-broadcast mistake in the GQA-into-query-axis fold shows up here even
+    though it would not move throughput (NVBug 6877539).
+    """
+    torch.manual_seed(0)
+    device, dtype = torch.device("cuda"), torch.bfloat16
+    head_dim, tokens_per_block = 64, 4
+    num_heads = num_kv_heads * group
+    seq_lens = torch.tensor([5, 1, 11, 8], dtype=torch.int32)  # mixed; max 11 -> 3 blocks
+    batch, max_len = int(seq_lens.numel()), int(seq_lens.max())
+    blocks_per_req = -(-max_len // tokens_per_block)
+
+    # Requests own scattered, non-contiguous pages so a gather or slot mix-up
+    # cannot pass by accident.
+    num_pages = batch * blocks_per_req + 3
+    pages = torch.randperm(num_pages)[: batch * blocks_per_req].view(batch, blocks_per_req)
+    pos = torch.arange(blocks_per_req * tokens_per_block)
+    req_to_token = (
+        pages[:, pos // tokens_per_block] * tokens_per_block + pos % tokens_per_block
+    ).to(device=device, dtype=torch.int32)
+
+    k_ctx = torch.randn(batch, max_len, num_kv_heads, head_dim, device=device, dtype=dtype)
+    v_ctx = torch.randn_like(k_ctx)
+    # Pool layout [num_pages, kv_factor, tokens_per_block, num_kv_heads, head_dim].
+    # Fill every unused slot with garbage: the seq_lens mask must hide it.
+    kv_pool = (
+        torch.randn(
+            num_pages, 2, tokens_per_block, num_kv_heads, head_dim, device=device, dtype=dtype
+        )
+        * 50
+    )
+    for b in range(batch):
+        n = int(seq_lens[b])
+        slots = req_to_token[b, : n - 1].long()  # context before this decode step
+        page, within = slots // tokens_per_block, slots % tokens_per_block
+        kv_pool[page, 0, within] = k_ctx[b, : n - 1]
+        kv_pool[page, 1, within] = v_ctx[b, : n - 1]
+    # The new token's K/V arrives through ``k`` / ``v`` and is written by the method.
+    out_cache_loc = torch.stack(
+        [req_to_token[b, int(seq_lens[b]) - 1] for b in range(batch)]
+    ).long()
+    k_new = k_ctx[torch.arange(batch), seq_lens.long() - 1].reshape(batch, -1)
+    v_new = v_ctx[torch.arange(batch), seq_lens.long() - 1].reshape(batch, -1)
+    q = torch.randn(batch, num_heads * head_dim, device=device, dtype=dtype)
+
+    layer = SimpleNamespace(
+        layer_idx=0, num_heads=num_heads, num_key_value_heads=num_kv_heads, head_dim=head_dim
+    )
+    m3_meta = SimpleNamespace(
+        slot_ids=torch.arange(batch, device=device, dtype=torch.int32),
+        req_to_token=req_to_token,
+        seq_lens=seq_lens.to(device),
+        max_seqlen_k=max_len,
+        is_prefill=False,
+    )
+    attn_metadata = SimpleNamespace(
+        kv_cache_manager=SimpleNamespace(get_buffers=lambda layer_idx: kv_pool),
+        minimax_m3={"metadata": m3_meta, "out_cache_loc": out_cache_loc},
+        is_cuda_graph=False,
+        max_seq_len=max_len,
+    )
+    output = torch.empty(batch, num_heads * head_dim, device=device, dtype=dtype)
+
+    MiniMaxM3Attention._sdpa_dense_attention_core(layer, q, k_new, v_new, attn_metadata, output)
+
+    ref = _dense_sdpa_decode_reference(q, k_ctx, v_ctx, seq_lens, num_kv_heads, head_dim)
+    torch.testing.assert_close(output.float(), ref, atol=2e-2, rtol=2e-2)
