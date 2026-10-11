@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import json
 import os
 import subprocess  # nosec B404
 import sys
@@ -70,6 +71,53 @@ def test_mpi_pool_session_forwards_current_rendezvous(monkeypatch):
             ]
         finally:
             session.shutdown()
+
+
+_STALE_SPAWN_ENV = "TLLM_TEST_STALE_SPAWN_ENV"
+_STALE_SPAWN_SCRIPT = f"""
+import json
+import os
+import sys
+from pathlib import Path
+
+from tensorrt_llm.llmapi.mpi_session import MpiPoolSession
+
+
+def spawn_and_read():
+    session = MpiPoolSession(n_workers=1)
+    try:
+        return session.submit_sync(os.getenv, {_STALE_SPAWN_ENV!r})[0]
+    finally:
+        session.shutdown()
+
+
+os.environ[{_STALE_SPAWN_ENV!r}] = "1"
+while_set = spawn_and_read()
+del os.environ[{_STALE_SPAWN_ENV!r}]
+Path(sys.argv[1]).write_text(json.dumps([while_set, spawn_and_read()]))
+"""
+
+
+@pytest.mark.cpu_only
+@pytest.mark.skipif(not ENABLE_MULTI_DEVICE, reason="multi-device required")
+def test_mpi_pool_session_does_not_resurrect_unset_forwarded_env(
+        tmp_path: Path) -> None:
+    # A singleton's MPI runtime is forked at the process's first spawn and
+    # launches every later worker with that environment, so a fresh process
+    # is needed to make the first spawn happen while the variable is set.
+    env, _ = split_mpi_env()
+    env.pop(_STALE_SPAWN_ENV, None)
+    worker_env = tmp_path / "worker_env.json"
+    result = subprocess.run(  # nosec B603
+        [sys.executable, "-c", _STALE_SPAWN_SCRIPT,
+         str(worker_env)],
+        capture_output=True,
+        env=env,
+        text=True,
+        timeout=300,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert json.loads(worker_env.read_text()) == ["1", None]
 
 
 def flashinfer_environment_probe():
