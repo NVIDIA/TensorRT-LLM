@@ -52,6 +52,7 @@ def _load_cpp_module():
 
 _cpp = _load_cpp_module()
 
+TransferPage = _cpp.TransferPage
 AggregatedPageDesc = _cpp.AggregatedPageDesc
 AttentionLayerConfig = _cpp.AttentionLayerConfig
 AttnLifeCycle = _cpp.AttnLifeCycle
@@ -204,6 +205,7 @@ def typed_range(*args: int) -> range:
 
 
 __all__ = [
+    "TransferPage",
     "AggregatedPageDesc",
     "AttentionLayerConfig",
     "BAD_PAGE_INDEX",

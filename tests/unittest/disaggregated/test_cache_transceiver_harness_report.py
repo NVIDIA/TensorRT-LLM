@@ -17,14 +17,18 @@
 CPU-only — no GPU, MPI, or tensorrt_llm dependency.
 """
 
+import copy
 import csv
 import json
 import os
+import sys
 
 import pytest
+import yaml
 
 __extra_import_path__ = ["~/examples/disaggregated/slurm/cache_transceiver_test"]
 
+import submit as submit_module
 from report import (
     RID_COMBINATION_STRIDE,
     RID_REQLEN_STRIDE,
@@ -42,6 +46,7 @@ from report import (
     emit_launch_vars,
     emit_ucx_env,
 )
+from submit import main as submit_main
 
 
 @pytest.fixture
@@ -166,6 +171,31 @@ class TestEmitHelpers:
         emit_ucx_env(sample_cfg, 1)
         out = capfd.readouterr().out
         assert "tcp_only" in out
+
+
+class TestSubmissionInterface:
+    def test_default_config_runs_without_config_flag(
+        self, sample_cfg, tmp_path, monkeypatch, capsys
+    ):
+        cfg = copy.deepcopy(sample_cfg)
+        cfg["environment"]["work_dir"] = str(tmp_path / "out")
+        (tmp_path / "config.yaml").write_text(yaml.safe_dump(cfg))
+        monkeypatch.setattr(submit_module, "SCRIPT_DIR", str(tmp_path))
+        monkeypatch.setattr(sys, "argv", ["submit.py", "--dry-run"])
+        submit_main()
+        assert "(dry-run: not submitting)" in capsys.readouterr().out
+
+    def test_default_two_node_dry_run(self, sample_cfg, tmp_path, monkeypatch, capsys):
+        cfg = copy.deepcopy(sample_cfg)
+        cfg["environment"]["work_dir"] = str(tmp_path / "out")
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(yaml.safe_dump(cfg))
+        monkeypatch.setattr(sys, "argv", ["submit.py", "-c", str(config_path), "--dry-run"])
+        submit_main()
+        output = capsys.readouterr().out
+        assert "--nodes=2" in output
+        assert "--ntasks-per-node=2" in output
+        assert "--gres=gpu:4" not in output
 
 
 # ---------------------------------------------------------------------------

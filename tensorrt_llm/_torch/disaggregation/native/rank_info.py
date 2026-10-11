@@ -60,6 +60,15 @@ class RankInfo:
         data["attention"] = self.attention.to_dict() if self.attention is not None else None
         data["aux_meta"] = self.aux_meta.to_dict() if self.aux_meta is not None else None
         data["page_table"] = self.page_table.to_dict() if self.page_table is not None else None
+        if self.page_table is not None and any(
+            pool.memory_type == "DRAM"
+            for group in self.page_table.pool_groups
+            for pool in group.pools
+        ):
+            # Older receivers construct RankInfo from every wire key. This
+            # required extension makes them reject host pools instead of silently
+            # discarding memory_type and treating host addresses as VRAM.
+            data["kv_memory_protocol"] = 1
         return msgpack.packb(data)
 
     @classmethod
@@ -117,10 +126,19 @@ class RankInfo:
     @classmethod
     def from_bytes(cls, data: bytes) -> "RankInfo":
         unpacked = msgpack.unpackb(data, strict_map_key=False)
+        memory_protocol = unpacked.pop("kv_memory_protocol", 0)
+        if memory_protocol not in (0, 1):
+            raise ValueError(f"Unsupported KV memory protocol: {memory_protocol}")
         if unpacked.get("attention") is not None:
             unpacked["attention"] = AttentionInfo.from_dict(unpacked["attention"])
         if unpacked.get("page_table") is not None:
             unpacked["page_table"] = KVCachePageTable.from_dict(unpacked["page_table"])
+            if memory_protocol == 0 and any(
+                pool.memory_type == "DRAM"
+                for group in unpacked["page_table"].pool_groups
+                for pool in group.pools
+            ):
+                raise ValueError("Host KV pools require the host-aware memory protocol")
         if unpacked.get("aux_meta") is not None:
             unpacked["aux_meta"] = AuxBufferMeta.from_dict(unpacked["aux_meta"])
         return cls(**unpacked)

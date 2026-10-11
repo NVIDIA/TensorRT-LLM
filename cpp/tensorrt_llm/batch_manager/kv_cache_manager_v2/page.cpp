@@ -353,6 +353,8 @@ void UniqPageLock::notifyFinish(CachedCudaEvent event)
 void UniqPageLock::prepareSparseOffload(KvCache const& requestingCache)
 {
     Page const& p = *page();
+    if (p.externalAccessPins != 0)
+        throw OutOfPagesError("Cannot migrate a externally pinned sparse page");
     auto const* attn = std::get_if<AttnLifeCycle>(&p.manager->getLifeCycle(p.lifeCycle));
     if (!attn || !attn->isSparse || !p.hasValidSlot()
         || (p.cacheLevel != kHotLevel && p.cacheLevel != kSparseHistoryLevel)
@@ -385,6 +387,8 @@ void UniqPageLock::prepareSparseOffload(KvCache const& requestingCache)
 void UniqPageLock::prepareSparsePromotion()
 {
     Page const& p = *page();
+    if (p.externalAccessPins != 0)
+        throw OutOfPagesError("Cannot migrate a externally pinned sparse page");
     if (!p.hasValidSlot() || p.cacheLevel != kSparseHistoryLevel || p.queryLockLevel() != kSparseHistoryLevel
         || mOwners.empty())
     {

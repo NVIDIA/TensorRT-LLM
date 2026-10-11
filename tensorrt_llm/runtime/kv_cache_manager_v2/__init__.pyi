@@ -515,7 +515,53 @@ class PageStorageSnapshot:
     def wait_ready(self, cuda_stream: CudaStream) -> None:
         """Queue copy-completion waits without blocking the CPU or uploading metadata."""
 
+class TransferPage:
+    @property
+    def layer_group_id(self) -> int: ...
+    @property
+    def ordinal(self) -> int: ...
+    @property
+    def cache_level(self) -> int: ...
+    @property
+    def slot_id(self) -> int: ...
+    @property
+    def pool_group(self) -> int: ...
+    @property
+    def pool_index(self) -> int: ...
+    @property
+    def address(self) -> int: ...
+    @property
+    def bytes(self) -> int: ...
+    @property
+    def pool_base_address(self) -> int: ...
+    @property
+    def pool_bytes(self) -> int: ...
+    @property
+    def valid_tokens(self) -> int: ...
+
 class _KVCache:
+    def begin_external_read(self, layer_group_ids: list[LayerGroupId], tokens: int) -> int:
+        """Pin active attention history; return a monotonically increasing request-local access ID."""
+    def reserve_external_receive(
+        self, layer_group_id: LayerGroupId, ordinal: int, cache_level: CacheLevel
+    ) -> int:
+        """Own a detached slot for a suspended private page; host requires full sparse history."""
+    def get_external_access_pages(self, access_id: int) -> list[TransferPage]: ...
+    def external_access_ready(self, access_id: int) -> bool: ...
+    def wait_external_access_ready(self, access_id: int) -> None: ...
+    def expose_external_access(self, access_id: int) -> None:
+        """Require completed CUDA writes before publication; retain the cache until physical settlement."""
+    def end_external_access(self, access_id: int) -> None:
+        """Require proof that physical access ended. Reject stale IDs; cancellation alone is insufficient.
+
+        Abandoned exposed claims retain their cache. close() releases unexposed claims,
+        but defers reclamation for exposed ones. Discarding an exposed receive invalidates
+        its request, which must then be closed.
+        """
+    def finalize_external_receive(
+        self, access_id: int, valid_tokens: int, cuda_stream: CudaStream
+    ) -> None:
+        """Install verified coverage without reuse commit. Keep the pin until end_external_access()."""
     Status: ClassVar[Type[_Status]]
     id: Any
     def __init__(

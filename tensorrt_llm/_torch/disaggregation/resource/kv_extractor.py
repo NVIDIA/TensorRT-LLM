@@ -166,6 +166,11 @@ class KVRegionExtractorV1(RegionExtractorBase):
         block_stride = pool.slot_stride_bytes
         assert block_stride is not None
 
+        if pool.memory_type == "DRAM" and (
+            np.any(region_ids < 0) or np.any(region_ids >= pool.num_slots)
+        ):
+            raise ValueError("Host KV transfer requires valid slots for every requested page")
+
         # KV cache: filter out invalid block_ids (BAD_PAGE_INDEX = -1)
         valid = region_ids >= 0
         ptrs = base_ptr + block_stride * region_ids[valid]

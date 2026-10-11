@@ -206,6 +206,24 @@ Eviction controller
   Every `KvCache` must be closed before manager shutdown so this deferred cleanup
   runs while `StorageManager` is still alive.
 
+### External transport access
+
+`KvCache` owns external-access claims keyed by monotonically increasing,
+request-local IDs. Claims retain concrete pages, physical pins, readiness events,
+and detached receive slots. Ordinary inference page locks keep their CUDA and
+page-index semantics; physical pins independently block relocation and eviction.
+
+Exposure requires completed CUDA readiness and installs a deliberate request
+self-reference so unresolved transport access cannot destroy the cache or its
+manager. Physical settlement releases the claim and breaks that reference after
+the last exposed claim. Request closure reclaims unpublished claims but defers
+reclamation for exposed ones. Logical cancellation is not settlement. Receive
+finalization installs verified coverage without reuse commit and keeps the pin
+until settlement; aborting an exposed receive invalidates its request.
+
+All claim mutation and non-atomic page-reference destruction require the manager's
+exclusive API lock. Bound methods release the GIL before blocking on that lock.
+
 ## Correctness invariants
 
 - Block keys are SHA-256 digests over the reuse scope and the token sequence.
