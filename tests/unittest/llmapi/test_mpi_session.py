@@ -107,6 +107,11 @@ def test_mpi_pool_session_does_not_resurrect_unset_forwarded_env(
     # is needed to make the first spawn happen while the variable is set.
     env, _ = split_mpi_env()
     env.pop(_STALE_SPAWN_ENV, None)
+    # Keep PMIX_HOSTNAME, which split_mpi_env() drops with the other PMIX_*
+    # variables: it only overrides the hostname PMIx uses, and CI sets it on
+    # pods whose names are too long for a singleton's MPI_Comm_spawn.
+    if "PMIX_HOSTNAME" in os.environ:
+        env["PMIX_HOSTNAME"] = os.environ["PMIX_HOSTNAME"]
     worker_env = tmp_path / "worker_env.json"
     result = subprocess.run(  # nosec B603
         [sys.executable, "-c", _STALE_SPAWN_SCRIPT,
