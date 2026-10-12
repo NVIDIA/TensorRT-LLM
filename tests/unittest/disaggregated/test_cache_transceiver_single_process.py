@@ -1204,6 +1204,23 @@ def _verify_indexer_k_all_requests(
 # ---------------------------------------------------------------------------
 # Main test orchestrator
 # ---------------------------------------------------------------------------
+def _send_prefill_in_pieces(transceiver, req: LlmRequest, piece_tokens: int) -> int:
+    """Send the prompt's KV in pieces of piece_tokens and return the number of pieces sent.
+
+    One context chunk per piece, as the executor does with enable_pipelined_transfer.
+    """
+    # A non-final piece without a complete block is not sent, which would break the count.
+    assert piece_tokens % TOKENS_PER_BLOCK == 0
+    pieces = 0
+    for start in range(0, req.prompt_len, piece_tokens):
+        end = min(start + piece_tokens, req.prompt_len)
+        req.py_last_context_chunk = (start, end)
+        req.context_current_position = end
+        transceiver.respond_and_send_async(req)
+        pieces += 1
+    return pieces
+
+
 def run_transfer_test(
     ctx_tp: int,
     ctx_pp: int,
@@ -1221,8 +1238,12 @@ def run_transfer_test(
     expect_cpp_bounce: bool = False,
     gen_scratch_tokens: int = 0,
     gen_cp: int = 1,
+    pipelined_piece_tokens: Optional[int] = None,
 ) -> None:
     """Run a full KV transfer test using KvCacheTransceiverV2.
+
+    pipelined_piece_tokens enables enable_pipelined_transfer: the context sends each prompt in
+    pieces of that many tokens instead of whole.
 
     gen_scratch_tokens > 0 sizes the generation cache to
     prompt_len + gen_scratch_tokens (history still prompt_len), materialising an
@@ -1296,6 +1317,7 @@ def run_transfer_test(
         }
         if expect_cpp_bounce
         else None,
+        enable_pipelined_transfer=pipelined_piece_tokens is not None,
     )
     ctx_tcs = create_instance_transceivers(
         ctx_tp, ctx_pp, ctx_enable_dp, ctx_managers, config, is_mla
@@ -1420,12 +1442,18 @@ def run_transfer_test(
                 gen_tcs[rank].request_and_receive_async(req)
 
         # 6. ctx send after
+        pieces_sent = 0
         for rank in range(ctx_world):
             for req_idx, req in ctx_handle_map[rank]:
                 kv = _add_sequence(ctx_managers[rank], req.py_request_id, req.prompt_len, use_v2)
                 if kv is not None:
                     ctx_kv_caches[rank].append(kv)
-                ctx_tcs[rank].respond_and_send_async(req)
+                if pipelined_piece_tokens is None:
+                    ctx_tcs[rank].respond_and_send_async(req)
+                else:
+                    pieces_sent += _send_prefill_in_pieces(
+                        ctx_tcs[rank], req, pipelined_piece_tokens
+                    )
 
         # 7. Wait for completion (threaded, dist calls inside)
         run_concurrent(
@@ -1491,6 +1519,14 @@ def run_transfer_test(
             )
             total_bounce_submits = sum(agent.bounce_submit_count for agent in agents)
             assert total_bounce_submits > 0, "no transfer was routed through the bounce fast path"
+            if pipelined_piece_tokens is not None:
+                # Exact for one context rank writing one generation rank: each piece is one
+                # transfer request, and every one of them must take the bounce.
+                ctx_agents = [tc._transfer_worker._agent for tc in ctx_tcs]
+                assert all(agent.bounce_reject_count == 0 for agent in ctx_agents), [
+                    agent.bounce_reject_counts for agent in ctx_agents
+                ]
+                assert sum(agent.bounce_submit_count for agent in ctx_agents) == pieces_sent
 
     finally:
         # Teardown must run on the failure path too, in this order:
@@ -1978,12 +2014,14 @@ def test_cache_transceiver_v1_masked_dsa_indexer_across_asymmetric_pp() -> None:
         "is_mla",
         "use_v2",
         "enable_indexer_k_cache",
+        "pipelined_piece_tokens",
     ),
     [
-        pytest.param(1, 1, 1, 1, False, True, False, id="v2_mha"),
-        pytest.param(2, 1, 2, 1, True, True, False, id="v2_mla_tp2"),
-        pytest.param(1, 1, 1, 1, True, False, True, id="v1_dsa_indexer"),
-        pytest.param(2, 1, 1, 2, False, True, False, id="v2_ctx_tp2_gen_pp2"),
+        pytest.param(1, 1, 1, 1, False, True, False, None, id="v2_mha"),
+        pytest.param(2, 1, 2, 1, True, True, False, None, id="v2_mla_tp2"),
+        pytest.param(1, 1, 1, 1, True, False, True, None, id="v1_dsa_indexer"),
+        pytest.param(2, 1, 1, 2, False, True, False, None, id="v2_ctx_tp2_gen_pp2"),
+        pytest.param(1, 1, 1, 1, False, True, False, 2 * TOKENS_PER_BLOCK, id="v2_mha_pipelined"),
     ],
 )
 def test_python_nixl_cache_transceiver_uses_cpp_bounce(
@@ -1994,6 +2032,7 @@ def test_python_nixl_cache_transceiver_uses_cpp_bounce(
     is_mla: bool,
     use_v2: bool,
     enable_indexer_k_cache: bool,
+    pipelined_piece_tokens: Optional[int],
 ) -> None:
     """Exercise C++ bounce v2 through representative Python NIXL transceiver paths.
 
@@ -2019,6 +2058,7 @@ def test_python_nixl_cache_transceiver_uses_cpp_bounce(
         request_lengths=[30, 60],
         enable_indexer_k_cache=enable_indexer_k_cache,
         expect_cpp_bounce=True,
+        pipelined_piece_tokens=pipelined_piece_tokens,
     )
 
 
