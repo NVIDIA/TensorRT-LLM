@@ -31,9 +31,10 @@
 import copy
 import math
 import os
-from typing import TYPE_CHECKING, Dict, List, Literal, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional
 
 if TYPE_CHECKING:
+    from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
     from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 
 import torch
@@ -149,12 +150,44 @@ def weight_dequant(x: torch.Tensor, s: torch.Tensor, block_size: int = 128) -> t
     return y
 
 
+def _deepseek_v4_layer_compress_ratio(
+    config: PretrainedConfig,
+    model_config: ModelConfig,
+    layer_idx: Optional[int],
+) -> int:
+    """This layer's KV compression ratio, or 0 when the config declares none.
+
+    The sparse-attention config wins over the pretrained config, and layers past
+    the end of the list clamp to the last entry (matching the reference, which
+    indexes MTP layers off the tail).
+    """
+    compress_ratios = None
+    if model_config.sparse_attention_config is not None:
+        compress_ratios = getattr(model_config.sparse_attention_config, "compress_ratios", None)
+    if not compress_ratios:
+        compress_ratios = getattr(config, "compress_ratios", None)
+
+    if compress_ratios and layer_idx is not None:
+        return compress_ratios[min(layer_idx, len(compress_ratios) - 1)]
+    return 0
+
+
 def _deepseek_v4_pos_embd_params(
     config: PretrainedConfig,
     model_config: ModelConfig,
     layer_idx: Optional[int],
     predicted_tokens_per_seq: int = 1,
+    *,
+    long_range: Optional[bool] = None,
 ) -> PositionalEmbeddingParams:
+    """RoPE parameters for one layer.
+
+    ``long_range`` selects between the YaRN + ``compress_rope_theta`` branch and
+    the base-RoPE branch. Leave it ``None`` for the V4 rule (``ratio > 1``);
+    DeepSeek-V4.1 passes ``ratio != 0`` because its ratio-1 layers are indexed
+    long-range layers that merely skip KV pooling (see
+    ``_deepseek_v41_pos_embd_params``).
+    """
     # Match the spec/overlap headroom that py_executor_creator applies
     # to model_engine_max_seq_len before sizing the KV cache. The overlap
     # branch is included unconditionally because disable_overlap_scheduler
@@ -169,17 +202,11 @@ def _deepseek_v4_pos_embd_params(
     if runtime_max_seq_len is not None:
         rope_params.max_seq_len = runtime_max_seq_len
 
-    compress_ratios = None
-    if model_config.sparse_attention_config is not None:
-        compress_ratios = getattr(model_config.sparse_attention_config, "compress_ratios", None)
-    if not compress_ratios:
-        compress_ratios = getattr(config, "compress_ratios", None)
+    compress_ratio = _deepseek_v4_layer_compress_ratio(config, model_config, layer_idx)
+    if long_range is None:
+        long_range = compress_ratio > 1
 
-    compress_ratio = 0
-    if compress_ratios and layer_idx is not None:
-        compress_ratio = compress_ratios[min(layer_idx, len(compress_ratios) - 1)]
-
-    if compress_ratio > 1:
+    if long_range:
         rope_params.theta = getattr(config, "compress_rope_theta", rope_params.theta)
         rope_params.scale_type = RotaryScalingType.yarn
         # DeepSeek-V4 reference applies YaRN frequency interpolation but does
@@ -264,6 +291,13 @@ def _rename_deepseek_v4_ffn_subkey(rest: str, routed_moe_scale_name: str) -> str
     """Rename a DeepSeek-V4 FFN checkpoint subkey."""
     if rest == "gate.bias":
         return "gate.e_score_correction_bias"
+    if rest == "gate.bias_vl":
+        # V4.1 ships a second router bias used in place of `gate.bias` for image
+        # tokens (`inference/model.py:816`). Present for every MoE layer in the
+        # checkpoint whether or not the vision tower is enabled, so it is renamed
+        # -- and loaded -- unconditionally; `DeepseekV4Gate` decides whether the
+        # parameter exists.
+        return "gate.e_score_correction_bias_vl"
     if rest.startswith("experts.") and rest.endswith(".scale"):
         return f"{rest[: -len('.scale')]}.{routed_moe_scale_name}"
     rest = rest.replace(".scale", ".weight_scale_inv")
@@ -545,8 +579,18 @@ def _remap_deepseek_v4_checkpoint_keys(
     # compressor kernels expect (kv_score = [kv | gate]).
     for bucket, parts in compressor_split.items():
         if "wkv" not in parts or "wgate" not in parts:
-            # Partial — emit what we have so the loader fails loudly with a
-            # specific missing key rather than a silent shape mismatch.
+            # Emit the halves under their own names. For DeepSeek-V4.1 this is
+            # the *expected* path, not a degraded one: a ratio-1 owner (layer 20
+            # in the release) compresses with a plain `norm(wkv(x))` and has no
+            # gate at all, so `DeepseekV41Compressor` registers a bare `wkv`
+            # Linear and deletes `wkv_gate`. Emitting `<bucket>.wkv.weight` is
+            # what that module asks for. Measured against the released
+            # checkpoint: 4 kv sources, 4 `wkv`, 3 `wgate`.
+            #
+            # For any other shape of partial -- a pooling owner missing its gate,
+            # say -- this still emits what exists, so the loader reports the
+            # specific absent key rather than a silent shape mismatch on a
+            # concatenation that never happened.
             for name, tensor in parts.items():
                 out[f"{bucket}.{name}.weight"] = tensor
             continue
@@ -556,6 +600,11 @@ def _remap_deepseek_v4_checkpoint_keys(
 
 
 class DeepseekV4WeightLoader:
+    # Subclass hook: rewrites raw checkpoint keys to the model's parameter names.
+    # V4.1 renames a different set of modules and has to dequantize its block-32
+    # fp8 dense weights first, so it overrides this (see ``modeling_deepseekv41``).
+    remap_checkpoint_keys = staticmethod(_remap_deepseek_v4_checkpoint_keys)
+
     def __init__(self, model, is_draft_model: bool = False):
         self.model = model
         self.config = model.config
@@ -578,7 +627,7 @@ class DeepseekV4WeightLoader:
         # presence of any top-level "layers." key; HF-style checkpoints use
         # "model.layers." and skip this branch.
         if any(k == "embed.weight" or k.startswith("layers.") for k in weights):
-            remapped_weights = _remap_deepseek_v4_checkpoint_keys(
+            remapped_weights = self.remap_checkpoint_keys(
                 weights,
                 num_hidden_layers=self.config.num_hidden_layers,
                 kv_lora_rank=self.config.kv_lora_rank,
@@ -1193,15 +1242,30 @@ class DeepseekV4WeightLoader:
                 elif isinstance(module, (mHC, HCHead)) and load_flat_hc_weights(module, names):
                     continue
                 elif names[-1] in ("engram",):
-                    # Engram is a container module with no direct parameters;
-                    # its leaf sub-modules (multi_head_embedding, kv_proj,
-                    # short_conv) and direct parameters (key_norm_weight,
-                    # query_norm_weight) are loaded via the generic path.
+                    # Engram's leaf sub-modules (multi_head_embedding, kv_proj,
+                    # short_conv) are visited by this loop in their own right, so
+                    # the generic branch below must not run for the container --
+                    # it would look for their weights under the container's own
+                    # prefix and KeyError. But Engram *does* own two direct
+                    # parameters (key_norm_weight / query_norm_weight), and those
+                    # have no other owner to load them, so copy them here.
+                    # V4-Flash ships no engram tensors at all, so this loop body
+                    # is inert for V4 and only fires for V4.1.
+                    module_weights = filter_weights(name, weights)
+                    for pname, param in module._parameters.items():
+                        if param is not None and pname in module_weights:
+                            param.data.copy_(module_weights[pname][:])
                     continue
                 else:
                     module_weights = filter_weights(name, weights)
                     if hasattr(module, "load_weights"):
-                        module.load_weights(weights=[module_weights])
+                        try:
+                            module.load_weights(weights=[module_weights])
+                        except (AssertionError, KeyError) as error:
+                            raise RuntimeError(
+                                f"Failed loading {name} ({type(module).__name__}); "
+                                f"checkpoint fields: {list(module_weights)}"
+                            ) from error
                     else:
                         for n, p in module.named_parameters():
                             p.data.copy_(module_weights[n][:])
@@ -1280,7 +1344,7 @@ class DeepseekV4LogitsProcessor(nn.Module):
     def __init__(
         self,
         model_config: ModelConfig[PretrainedConfig],
-        hc_head: HCHead,
+        hc_head: Optional[HCHead],
         norm: RMSNorm,
     ):
         super().__init__()
@@ -1291,6 +1355,10 @@ class DeepseekV4LogitsProcessor(nn.Module):
         # Keep HCHead and final norm owned by DeepseekV4Model. This processor only
         # borrows them, so checkpoint loading and PP weight removal still happen
         # through the model's normal module tree.
+        #
+        # ``hc_head=None`` means the model already collapsed the mHC stream and
+        # hands us plain ``[N, hidden]`` hidden states (V4.1, whose checkpoint
+        # ships no hc_head weights).
         object.__setattr__(self, "_hc_head", hc_head)
         object.__setattr__(self, "_norm", norm)
 
@@ -1310,8 +1378,9 @@ class DeepseekV4LogitsProcessor(nn.Module):
             else:
                 hidden_states = hidden_states[-1]
 
-        hidden_states = hidden_states.reshape(-1, self.hc_mult, self.hidden_dim)
-        hidden_states = self._hc_head(hidden_states)
+        if self._hc_head is not None:
+            hidden_states = hidden_states.reshape(-1, self.hc_mult, self.hidden_dim)
+            hidden_states = self._hc_head(hidden_states)
         hidden_states = self._norm(hidden_states)
         return lm_head(hidden_states).float()
 
@@ -1369,6 +1438,22 @@ class DeepseekV4Linear(Linear):
 
 
 class DeepseekV4Attention(MLA):
+    # Per-layer RoPE selection, overridable by subclasses whose ratio -> RoPE
+    # mapping differs (DeepSeek-V4.1). Looked up on the type, so calling it
+    # through ``self`` before ``super().__init__()`` is safe.
+    _pos_embd_params = staticmethod(_deepseek_v4_pos_embd_params)
+
+    # V4 renormalizes the query per head after ``wq_b``, with no learned gain:
+    #
+    #     q = self.wq_b(q).unflatten(-1, (n_local_heads, head_dim))
+    #     q *= torch.rsqrt(q.square().mean(-1, keepdim=True) + self.eps)
+    #
+    # (reference ``DeepSeek-V4-Flash/inference/model.py``). V4.1 dropped that
+    # line, so the flag is a class attribute rather than a config lookup -- it is
+    # an architecture fact, not a tunable, and a subclass that forgets to state
+    # it inherits V4's behaviour, which is the safe default for V4 itself.
+    q_b_norm_enabled = True
+
     def __init__(
         self,
         model_config: ModelConfig[PretrainedConfig],
@@ -1399,7 +1484,7 @@ class DeepseekV4Attention(MLA):
             predicted_tokens_per_seq=predicted_tokens_per_seq,
             max_position_embeddings=config.max_position_embeddings,
             bias=False,
-            pos_embd_params=_deepseek_v4_pos_embd_params(
+            pos_embd_params=self._pos_embd_params(
                 config, model_config, layer_idx, predicted_tokens_per_seq
             ),
             layer_idx=layer_idx,
@@ -1428,6 +1513,7 @@ class DeepseekV4Gate(nn.Module):
         fuse_routing_kernel: bool = True,
         apply_routing: bool = False,
         moe_backend: str = "CUTLASS",
+        has_vl_bias: bool = False,
     ):
         super().__init__()
         self.weight = nn.Parameter(
@@ -1459,6 +1545,13 @@ class DeepseekV4Gate(nn.Module):
                 torch.empty(num_experts, dtype=bias_dtype), requires_grad=False
             )
 
+        # Image selection uses a separate bias and a per-forward mask.
+        self.e_score_correction_bias_vl = None
+        if has_vl_bias and not self.is_hashed:
+            self.e_score_correction_bias_vl = nn.Parameter(
+                torch.empty(num_experts, dtype=bias_dtype), requires_grad=False
+            )
+
         assert not apply_routing, "DeepseekV4Gate routing is called inside MoE"
 
         def fetch_e_score_correction_bias():
@@ -1476,9 +1569,18 @@ class DeepseekV4Gate(nn.Module):
             callable_e_score_correction_bias=fetch_e_score_correction_bias,
             callable_tid2eid=lambda: self.tid2eid,
             is_hashed=self.is_hashed,
+            callable_e_score_correction_bias_vl=(
+                (lambda: self.e_score_correction_bias_vl)
+                if self.e_score_correction_bias_vl is not None
+                else None
+            ),
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if hidden_states.shape[0] == 0:
+            # An empty attention-DP peer still joins expert communication, but
+            # the router's cuBLAS fallback does not accept an empty GEMM.
+            return hidden_states.new_empty((0, self.weight.shape[0]), dtype=torch.float32)
         return torch.ops.trtllm.dsv3_router_gemm_op(
             hidden_states, self.weight.t(), bias=None, out_dtype=torch.float32
         )
@@ -1494,6 +1596,12 @@ class DeepseekV4Gate(nn.Module):
             self.e_score_correction_bias.copy_(
                 weights[0]["e_score_correction_bias"][:].to(self.e_score_correction_bias.dtype)
             )
+            if self.e_score_correction_bias_vl is not None:
+                self.e_score_correction_bias_vl.copy_(
+                    weights[0]["e_score_correction_bias_vl"][:].to(
+                        self.e_score_correction_bias_vl.dtype
+                    )
+                )
 
     @property
     def routing_method(self) -> DeepSeekV4MoeRoutingMethod:
@@ -1543,6 +1651,7 @@ class DeepseekV4MoE(nn.Module):
             fuse_routing_kernel=True,
             apply_routing=False,
             moe_backend=model_config.moe_backend,
+            has_vl_bias=bool(getattr(config, "use_vision_bias", False)),
         )
         experts_quant_config = self._get_experts_quant_config(model_config, layer_idx)
         if override_quant_config is not None and experts_quant_config is model_config.quant_config:
@@ -1666,7 +1775,13 @@ class DeepseekV4MoE(nn.Module):
         )
 
     def compute_routed_output(
-        self, hidden_states, hidden_states_fp4, input_ids, all_rank_num_tokens, do_finalize
+        self,
+        hidden_states,
+        hidden_states_fp4,
+        input_ids,
+        all_rank_num_tokens,
+        do_finalize,
+        image_mask: Optional[torch.Tensor] = None,
     ):
         # max-throughput
         use_dp_padding = False
@@ -1682,6 +1797,10 @@ class DeepseekV4MoE(nn.Module):
                 (0, max(all_rank_num_tokens) - input_ids.shape[0]),
                 value=self.model_config.pretrained_config.pad_token_id,
             )
+            if image_mask is not None:
+                image_mask = torch.nn.functional.pad(
+                    image_mask, (0, max(all_rank_num_tokens) - image_mask.shape[0]), value=False
+                )
 
         router_logits = self.gate(hidden_states)
 
@@ -1699,6 +1818,7 @@ class DeepseekV4MoE(nn.Module):
             output_dtype=hidden_states.dtype,
             all_rank_num_tokens=all_rank_num_tokens,
             use_dp_padding=use_dp_padding,
+            routing_aux=image_mask,
         )
 
         return routed_output
@@ -1711,11 +1831,15 @@ class DeepseekV4MoE(nn.Module):
         all_rank_num_tokens: Optional[list[int]] = None,
         final_all_reduce_params: Optional[AllReduceParams] = None,
         do_finalize: Optional[bool] = True,
+        image_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if not do_finalize:
             assert not self.use_dp
 
         def _compute_shared_output():
+            if hidden_states.shape[0] == 0:
+                # Shared experts have no collectives and need no empty GEMMs.
+                return torch.empty_like(hidden_states)
             shared_output = self.shared_experts(
                 hidden_states_fp4 if hidden_states_fp4 is not None else hidden_states
             )
@@ -1725,7 +1849,12 @@ class DeepseekV4MoE(nn.Module):
 
         def _compute_routed_output():
             routed_output = self.compute_routed_output(
-                hidden_states, hidden_states_fp4, input_ids, all_rank_num_tokens, do_finalize
+                hidden_states,
+                hidden_states_fp4,
+                input_ids,
+                all_rank_num_tokens,
+                do_finalize,
+                image_mask=image_mask,
             )
             return routed_output
 
@@ -1760,6 +1889,39 @@ class DeepseekV4MoE(nn.Module):
 
 
 class DeepseekV4DecoderLayer(DecoderLayer):
+    # Subclass hook: the attention implementation this layer instantiates.
+    attention_cls = DeepseekV4Attention
+
+    def _make_engram(self, layer_idx: int, engram_config, vocab_sizes_flat, stream) -> Engram:
+        """Build this layer's Engram module.
+
+        A hook because V4.1's Engram differs in construction, not just in
+        ``forward``: it has no depthwise convolution and its n-gram table is
+        row-sharded, so it needs the mapping (see ``modeling_deepseekv41``).
+        """
+        return Engram(
+            layer_id=layer_idx,
+            config=engram_config,
+            vocab_sizes_flat=vocab_sizes_flat,
+            stream=stream,
+        )
+
+    def _make_mhc(self) -> mHC:
+        """Build one mHC mixer for this layer.
+
+        V4 pins the numerics it was tuned with -- ``post_mult_value=2.0`` and the
+        module-default ``norm_eps``/``eps``. Subclasses whose checkpoint declares
+        different mHC constants override this (see ``modeling_deepseekv41``).
+        """
+        config = self.config
+        return mHC(
+            config.hc_mult,
+            config.hidden_size,
+            config.hc_sinkhorn_iters,
+            dtype=torch.float32,
+            post_mult_value=2.0,
+        )
+
     def __init__(
         self,
         model_config: ModelConfig[PretrainedConfig],
@@ -1786,18 +1948,12 @@ class DeepseekV4DecoderLayer(DecoderLayer):
         self.mlp_tp_size = mapping.tp_size
         self.is_p2p_supported = can_access_peer(mapping)
 
-        self.hc_attn = mHC(
-            config.hc_mult,
-            config.hidden_size,
-            config.hc_sinkhorn_iters,
-            dtype=torch.float32,
-            post_mult_value=2.0,
-        )
+        self.hc_attn = self._make_mhc()
 
         if attention_layer_idx is None:
             attention_layer_idx = layer_idx
 
-        self.self_attn = DeepseekV4Attention(
+        self.self_attn = self.attention_cls(
             model_config,
             layer_idx=attention_layer_idx,
             aux_stream_dict=aux_stream_dict,
@@ -1808,13 +1964,7 @@ class DeepseekV4DecoderLayer(DecoderLayer):
         self.enable_fusion = os.environ.get("TRTLLM_DEEPSEEK_EAGER_FUSION_DISABLED", "0") == "0"
         self.enable_fusion &= not self.enable_attention_dp
 
-        self.hc_ffn = mHC(
-            config.hc_mult,
-            config.hidden_size,
-            config.hc_sinkhorn_iters,
-            dtype=torch.float32,
-            post_mult_value=2.0,
-        )
+        self.hc_ffn = self._make_mhc()
 
         # FIXME: incompatible with mixed quantization mode
         quant_config = self._get_decoder_layer_quant_config(model_config, layer_idx)
@@ -1896,11 +2046,12 @@ class DeepseekV4DecoderLayer(DecoderLayer):
         _engram_config = getattr(config, "engram_config", None)
         _engram_vocab_sizes_by_layer = getattr(config, "engram_vocab_sizes_by_layer", {})
         if _engram_config is not None and layer_idx in _engram_vocab_sizes_by_layer:
-            self.engram = Engram(
-                layer_id=layer_idx,
-                config=_engram_config,
-                vocab_sizes_flat=_engram_vocab_sizes_by_layer[layer_idx],
-                stream=aux_stream_dict[AuxStreamType.EngramPrecompute],
+            engram_stream = aux_stream_dict[AuxStreamType.EngramPrecompute]
+            self.engram = self._make_engram(
+                layer_idx,
+                _engram_config,
+                _engram_vocab_sizes_by_layer[layer_idx],
+                engram_stream,
             )
 
     def _get_decoder_layer_quant_config(
@@ -2132,7 +2283,13 @@ class DeepseekV4DecoderLayer(DecoderLayer):
         attn_metadata: DeepseekV4TrtllmAttentionMetadata,
         spec_metadata: Optional[SpecMetadata] = None,
         input_ids: Optional[torch.IntTensor] = None,
+        *,
+        hidden_states_normalized: bool = False,
+        image_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if hidden_states_normalized and self.fusion_config.PRE_MOE_FUSION:
+            raise ValueError("Pre-normalized MoE input cannot use pre-MoE allreduce fusion")
+
         def _run_MoE(hidden_states, hidden_states_fp4, do_finalize, input_ids):
             return self.mlp(
                 hidden_states,
@@ -2145,6 +2302,7 @@ class DeepseekV4DecoderLayer(DecoderLayer):
                 ),
                 do_finalize=do_finalize,
                 input_ids=input_ids,
+                image_mask=image_mask,
             )
 
         if self.fusion_config.PRE_MOE_FUSION:
@@ -2160,7 +2318,7 @@ class DeepseekV4DecoderLayer(DecoderLayer):
                     trigger_completion_at_end=False,
                 ),
             )
-        else:
+        elif not hidden_states_normalized:
             # No fusion: just normalize.
             hidden_states = self.post_attention_layernorm(hidden_states)
 
@@ -2368,6 +2526,11 @@ class DeepseekV4MTP(DeepseekV4DecoderLayer):
 
 
 class DeepseekV4Model(DecoderModel):
+    # Subclass hooks. ``uses_hc_head`` is False for checkpoints that ship no
+    # ``hc_head`` weights and collapse the mHC stream some other way (V4.1).
+    decoder_layer_cls = DeepseekV4DecoderLayer
+    uses_hc_head = True
+
     def __init__(
         self, model_config: ModelConfig[PretrainedConfig], mapping_with_cp: Optional[Mapping] = None
     ):
@@ -2398,7 +2561,7 @@ class DeepseekV4Model(DecoderModel):
             dtype=config.torch_dtype,
         )
 
-        self.hc_head = HCHead(config.hc_mult, config.hidden_size)
+        self.hc_head = HCHead(config.hc_mult, config.hidden_size) if self.uses_hc_head else None
 
         # Engram hash provider (optional, for n-gram context augmentation)
         # Must be created before layers so vocab sizes can be stored on config.
@@ -2438,7 +2601,7 @@ class DeepseekV4Model(DecoderModel):
 
         self.layers = nn.ModuleList(
             [
-                DeepseekV4DecoderLayer(
+                self.decoder_layer_cls(
                     model_config,
                     layer_idx,
                     self.aux_stream_dict,
@@ -2452,7 +2615,8 @@ class DeepseekV4Model(DecoderModel):
         )
 
     def __pp_init__(self):
-        self.epilogue.append(self.hc_head)
+        if self.hc_head is not None:
+            self.epilogue.append(self.hc_head)
         super().__pp_init__()
 
     def forward(
@@ -2462,6 +2626,8 @@ class DeepseekV4Model(DecoderModel):
         position_ids: Optional[torch.IntTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         spec_metadata: Optional[SpecMetadata] = None,
+        orig_input_ids: Optional[torch.IntTensor] = None,
+        image_mask: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
         if (input_ids is None) ^ (inputs_embeds is not None):
@@ -2471,6 +2637,25 @@ class DeepseekV4Model(DecoderModel):
 
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
+
+        # Engram and token-dependent routing still need IDs after embedding fusion.
+        if input_ids is None:
+            input_ids = orig_input_ids
+            if input_ids is not None and (
+                input_ids.ndim != 1 or input_ids.shape[0] != inputs_embeds.shape[0]
+            ):
+                raise ValueError(
+                    "orig_input_ids must be a 1D tensor with one token ID per input embedding"
+                )
+        if self.use_engram and input_ids is None:
+            raise ValueError("Engram requires original token IDs when inputs_embeds are provided")
+        if image_mask is not None and (
+            image_mask.dtype != torch.bool
+            or image_mask.ndim != 1
+            or image_mask.shape[0] != inputs_embeds.shape[0]
+            or image_mask.device != inputs_embeds.device
+        ):
+            raise ValueError("image_mask must be a Boolean vector aligned with input embeddings")
 
         # -----------------------------------------------------------------
         # Engram pre-computation (overlapped with main-stream layer forward)
@@ -2487,9 +2672,11 @@ class DeepseekV4Model(DecoderModel):
         engram_embeddings_cache: Optional[Dict] = None
         engram_events: Dict[int, torch.cuda.Event] = {}
         if self.use_engram and self.engram_hash_provider is not None and input_ids is not None:
-            hash_cache = self.engram_hash_provider.compute_hashes(
-                input_ids.view(-1),
-                seq_lens=attn_metadata.seq_lens_cuda,
+            hash_cache = self._compute_engram_hashes(
+                input_ids,
+                position_ids,
+                attn_metadata,
+                **({"token_mask": ~image_mask} if image_mask is not None else {}),
             )
             engram_embeddings_cache = {}
             for layer_id in self.engram_layer_ids:
@@ -2497,8 +2684,8 @@ class DeepseekV4Model(DecoderModel):
                 if engram_mod is not None:
                     # precompute() dispatches onto the engram stream internally and
                     # records sync_event; the main stream will wait on it before use.
-                    engram_embeddings_cache[layer_id] = engram_mod.precompute(
-                        hash_cache[layer_id], dtype=inputs_embeds.dtype
+                    engram_embeddings_cache[layer_id] = self._precompute_engram(
+                        layer_id, hash_cache[layer_id], inputs_embeds.dtype, attn_metadata
                     )
                     engram_events[layer_id] = engram_mod.sync_event
 
@@ -2523,16 +2710,51 @@ class DeepseekV4Model(DecoderModel):
         # in unfused mode the state is "resolved" (residual already
         # post-mapped). After the last layer, a deferred state is closed with
         # a standalone hc_post; a resolved state feeds hc_head directly.
-        hc_state = hidden_states
+        hc_state = self._init_hc_state(hidden_states)
 
+        replay_at, replay_plan = self._plan_bounded_replay(
+            attn_metadata,
+            # Conservative default: a caller that does not say assumes it wants
+            # every row's hidden state, which rules bounded replay out.
+            bool(kwargs.get("all_token_states_required", True)),
+            requests=kwargs.get("context_requests"),
+        )
+        remote_tail_at = self._remote_tail_boundary(attn_metadata)
+
+        engram_kv_cache: dict[int, torch.Tensor] = {}
         for idx, decoder_layer in enumerate(self.layers[: self.num_hidden_layers]):
+            if idx == remote_tail_at:
+                boundary_output, hc_state = self._enter_remote_tail_boundary(
+                    attn_metadata, hc_state
+                )
+                if boundary_output is not None:
+                    return boundary_output
+            if idx == replay_at:
+                position_ids, input_ids, hc_state = self._enter_bounded_replay(
+                    replay_plan, attn_metadata, position_ids, input_ids, hc_state
+                )
+                if image_mask is not None and replay_plan.replays_local_tokens:
+                    image_mask = image_mask.index_select(0, replay_plan.rows)
+
+            if engram_embeddings_cache is not None and spec_metadata is None:
+                projected = self._precompute_engram_kv(idx, engram_embeddings_cache)
+                if projected is not None:
+                    layer_id, kv = projected
+                    engram_kv_cache[layer_id] = kv
+
             engram_embeddings = None
             if engram_embeddings_cache is not None and idx in engram_embeddings_cache:
                 # Sync: ensure the engram stream has finished precompute for this layer
-                # before the main stream reads the result.
-                engram_events[idx].wait(torch.cuda.current_stream())
+                # before the main stream reads the result. There is no event when
+                # the module was built without a side stream -- the precompute
+                # already ran on this stream, in order.
+                if engram_events[idx] is not None:
+                    engram_events[idx].wait(torch.cuda.current_stream())
                 engram_embeddings = engram_embeddings_cache[idx]
 
+            engram_kwargs = {}
+            if idx in engram_kv_cache:
+                engram_kwargs["precomputed_engram_kv"] = engram_kv_cache.pop(idx)
             hc_state = decoder_layer(
                 position_ids=position_ids,
                 hc_state=hc_state,
@@ -2540,15 +2762,140 @@ class DeepseekV4Model(DecoderModel):
                 spec_metadata=spec_metadata,
                 input_ids=input_ids,
                 engram_embeddings=engram_embeddings,
+                **({"image_mask": image_mask} if image_mask is not None else {}),
+                **engram_kwargs,
             )
 
-        hidden_states = hc_state.residual.flatten(1)
-
+        hidden_states = self._finalize_hc_state(hc_state)
+        if replay_plan is not None:
+            hidden_states = self._exit_bounded_replay(replay_plan, attn_metadata, hidden_states)
         return hidden_states
+
+    def _compute_engram_hashes(
+        self,
+        input_ids: torch.Tensor,
+        position_ids: Optional[torch.Tensor],
+        attn_metadata: DeepseekV4TrtllmAttentionMetadata,
+        *,
+        token_mask: Optional[torch.Tensor] = None,
+    ) -> Dict[int, torch.Tensor]:
+        """Hash local tokens while preserving each request's n-gram history."""
+        return self.engram_hash_provider.compute_hashes(
+            input_ids.view(-1),
+            seq_lens=attn_metadata.seq_lens_cuda,
+            position_ids=position_ids,
+            request_ids=attn_metadata.request_ids,
+            seq_lens_host=attn_metadata.seq_lens,
+            max_seq_len=getattr(attn_metadata.kv_cache_manager, "max_seq_len", None),
+            **({"token_mask": token_mask} if token_mask is not None else {}),
+        )
+
+    def _precompute_engram(
+        self,
+        layer_id: int,
+        hash_indices: torch.Tensor,
+        dtype: torch.dtype,
+        attn_metadata: DeepseekV4TrtllmAttentionMetadata,
+    ) -> torch.Tensor:
+        """Launch a lookup; sharded variants may first redistribute hash rows."""
+        return self.layers[layer_id].engram.precompute(hash_indices, dtype=dtype)
+
+    def _precompute_engram_kv(
+        self, layer_idx: int, embeddings: dict[int, torch.Tensor]
+    ) -> tuple[int, torch.Tensor] | None:
+        """Optionally launch a later layer's Engram projection before this layer."""
+        return None
+
+    # ------------------------------------------------------------------
+    # Bounded-replay boundary hooks
+    # ------------------------------------------------------------------
+    # DeepSeek-V4.1 §3.2.2 re-runs the decoder half of the stack over only the
+    # last ``n_win`` tokens of each prompt. The hooks below are where that
+    # second pass begins and ends; V4 itself never takes one, so its cost here is
+    # one integer compare per layer.
+    #
+    # They live on the base class rather than in a V4.1 ``forward`` override for
+    # the same reason as the mHC hooks below: overriding ``forward`` would copy
+    # ~90 lines of engram precompute, PP branching and loop that are identical
+    # between the two generations and would then drift apart.
+
+    def _plan_bounded_replay(self, attn_metadata, all_token_states_required: bool, requests=None):
+        """``(split, plan)`` if this batch replays a suffix of the stack, else ``(None, None)``.
+
+        V4 always answers ``(None, None)``: every one of its layers owns a
+        compressor, so no suffix of the stack can be re-run over a short window --
+        a truncated pass would publish truncated compressed KV, which is the one
+        thing the scheme may not do. V4.1 concentrates all compression in its
+        encoder half, which is what makes the suffix replayable at all.
+        """
+        return None, None
+
+    def _remote_tail_boundary(self, attn_metadata) -> Optional[int]:
+        """Layer at which a disaggregated remote-tail handoff occurs."""
+        return None
+
+    def _enter_remote_tail_boundary(
+        self, attn_metadata, hc_state: HCState
+    ) -> tuple[torch.Tensor | None, HCState]:
+        """Return source output states, or ``None`` and the state for decoder replay."""
+        raise NotImplementedError
+
+    def _enter_bounded_replay(self, plan, attn_metadata, position_ids, input_ids, hc_state):
+        """Re-index the per-token state the replayed layers will read.
+
+        Never called on V4, because :meth:`_plan_bounded_replay` never returns a
+        split. Returns the three per-token carriers narrowed to the replayed rows.
+        """
+        raise NotImplementedError
+
+    def _exit_bounded_replay(self, plan, attn_metadata, hidden_states):
+        """Restore encoder-pass shape and metadata after a successful replayed suffix.
+
+        Never called on V4. Returns ``hidden_states`` back at the encoder pass's
+        row count and restores the matching metadata for downstream consumers.
+        """
+        raise NotImplementedError
+
+    # ------------------------------------------------------------------
+    # mHC stream boundary hooks
+    # ------------------------------------------------------------------
+    # The two ends of the residual loop are the only places V4 and V4.1 differ
+    # in this method; everything between them (engram precompute + per-layer
+    # event waits, the PP-rank branch, the layer loop) is identical. Factoring
+    # them out keeps V4.1 from having to copy ~90 lines that would then drift.
+
+    def _init_hc_state(self, hidden_states: torch.Tensor):
+        """Seed the inter-layer mHC state from the ``[N, mult, hidden]`` stream.
+
+        V4 hands layer 0 the raw tensor: its ``is_first_layer`` branch in
+        ``_entry_boundary`` bootstraps the stream with a plain ``pre_mapping``,
+        and there is no lagged coefficient to carry in. Overridden by V4.1,
+        which must supply an identity ``pre_mix`` because *every* one of its
+        sublayers collapses with a ``pre`` computed by its predecessor.
+        """
+        return hidden_states
+
+    def _finalize_hc_state(self, hc_state) -> torch.Tensor:
+        """Close the mHC stream into the tensor the logits processor expects.
+
+        V4 hands the un-collapsed stream downstream flattened to
+        ``[N, mult * hidden]`` because its ``hc_head`` does the collapse (fused
+        with the final norm). V4.1 ships no ``hc_head`` -- see ``uses_hc_head``
+        -- so it overrides this to collapse with the last layer's trailing
+        ``pre`` and return plain ``[N, hidden]``, which is the other input shape
+        ``DeepseekV4LogitsProcessor`` accepts.
+        """
+        return hc_state.residual.flatten(1)
 
 
 @register_auto_model("DeepseekV4ForCausalLM")
 class DeepseekV4ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV4Model, PretrainedConfig]):
+    # Subclass hooks, so a variant can swap the model / logits path without
+    # duplicating the CP-remap, quant-normalization and MTP wiring in __init__.
+    model_cls = DeepseekV4Model
+    logits_processor_cls = DeepseekV4LogitsProcessor
+    weight_loader_cls = DeepseekV4WeightLoader
+
     @classmethod
     def get_model_defaults(cls, llm_args: "TorchLlmArgs") -> dict:
         kv_cache_defaults = {
@@ -2613,10 +2960,10 @@ class DeepseekV4ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV4Model, Pretrai
             model_config._frozen = True
 
         super().__init__(
-            model=DeepseekV4Model(model_config, mapping_with_cp=self.mapping_with_cp),
+            model=self.model_cls(model_config, mapping_with_cp=self.mapping_with_cp),
             model_config=model_config,
         )
-        self.logits_processor = DeepseekV4LogitsProcessor(
+        self.logits_processor = self.logits_processor_cls(
             model_config, self.model.hc_head, self.model.norm
         )
 
@@ -2665,6 +3012,66 @@ class DeepseekV4ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV4Model, Pretrai
             model_config.mapping = self.mapping_with_cp
             model_config._frozen = True
 
+    def prepare_disagg_generation_request(self, request: "LlmRequest") -> None:
+        """Restore the token lookback that is not part of the transferred KV pools."""
+        provider = self.model.engram_hash_provider
+        if provider is None or not self.model.use_engram:
+            return
+        end = request.prompt_len
+        start = max(0, end - provider.config.max_ngram_size + 1)
+        provider.queue_history_seed(
+            request.py_request_id, start, request.get_tokens_range(0, start, end)
+        )
+
+    def release_request_state(self, request_id: int) -> None:
+        """Release model-local Engram state, including an unconsumed disagg seed."""
+        provider = self.model.engram_hash_provider
+        if provider is not None:
+            provider.release_request_state(request_id)
+
+    def register_cuda_graph_pre_replay_hooks(self, runner) -> None:
+        """Refresh the Engram n-gram hashes at every replay boundary.
+
+        ``DeepseekV4Model.forward`` computes the hashes and ``precompute()`` reads them, so
+        the captured graph holds the *addresses* of those buffers while the only code that
+        writes them lives inside the forward. A replay runs no Python, so without this hook
+        every graphed decode step injects, at the Engram layers, embeddings looked up from
+        whichever tokens the last eager forward happened to see. Measured on 8 ranks: a run
+        of 15 consecutive replays over 15 distinct inputs yields one distinct hash value,
+        and it flips an argmax on a shared trajectory.
+
+        Registered unconditionally but a no-op unless Engram is on, so a model without it
+        pays one ``getattr`` per replay.
+        """
+        provider = getattr(self.model, "engram_hash_provider", None)
+        if provider is None or not getattr(self.model, "use_engram", False):
+            return
+
+        def _refresh(
+            key, num_tokens: int, static_tensors: Dict[str, Any], current_inputs: Dict[str, Any]
+        ) -> None:
+            input_ids = current_inputs.get("input_ids")
+            if input_ids is None:
+                return
+            real_num_tokens = input_ids.shape[0]
+            attn_metadata = current_inputs.get("attn_metadata")
+            if attn_metadata is None:
+                return
+            position_ids = static_tensors.get("position_ids")
+            provider.refresh_captured_hashes(
+                static_tensors["input_ids"][:real_num_tokens],
+                seq_lens=attn_metadata.seq_lens_cuda,
+                position_ids=(
+                    None if position_ids is None else position_ids[..., :real_num_tokens]
+                ),
+                request_ids=attn_metadata.request_ids,
+                seq_lens_host=attn_metadata.seq_lens,
+                max_seq_len=getattr(attn_metadata.kv_cache_manager, "max_seq_len", None),
+                padded_num_tokens=num_tokens,
+            )
+
+        runner.register_pre_replay_hook(_refresh)
+
     def forward(
         self,
         attn_metadata: DeepseekV4TrtllmAttentionMetadata,
@@ -2686,12 +3093,15 @@ class DeepseekV4ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV4Model, Pretrai
         )
 
     def load_weights(self, weights: Dict):
-        weight_loader = DeepseekV4WeightLoader(self)
+        weight_loader = self.weight_loader_cls(self)
         weight_loader.load_weights(weights)
 
+    def _post_load_decoder_layers(self) -> nn.ModuleList:
+        return self.model.layers[: self.config.num_hidden_layers]
+
     def post_load_weights(self):
-        layers = self.model.layers[: self.config.num_hidden_layers]
-        last_idx = self.config.num_hidden_layers - 1
+        layers = self._post_load_decoder_layers()
+        last_idx = len(layers) - 1
         for idx, layer in enumerate(layers):
             if idx == last_idx:
                 # The V4 logits path is HCHead -> model.norm -> lm_head, so
