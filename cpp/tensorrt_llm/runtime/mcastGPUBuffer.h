@@ -62,7 +62,7 @@ public:
     McastGPUBuffer(size_t bufSize, uint32_t groupSize, uint32_t groupRank, uint32_t deviceIdx, bool mnNvlink,
         int64_t mpiCommFortranHandle)
         : mMcastDeviceMemory(std::make_shared<McastDeviceMemory>(
-              bufSize, groupSize, groupRank, deviceIdx, mnNvlink, mpiCommFortranHandle))
+            bufSize, groupSize, groupRank, deviceIdx, mnNvlink, mpiCommFortranHandle))
         , mBufSize(mMcastDeviceMemory->getBufferSize())
         , mLocalDevice(at::Device(at::DeviceType::CUDA, deviceIdx))
     {
@@ -79,7 +79,7 @@ public:
     McastGPUBuffer(size_t bufSize, uint32_t groupSize, uint32_t groupRank, uint32_t deviceIdx, bool mnNvlink,
         std::shared_ptr<McastGroupComm> groupComm)
         : mMcastDeviceMemory(std::make_shared<McastDeviceMemory>(
-              bufSize, groupSize, groupRank, deviceIdx, mnNvlink, std::move(groupComm)))
+            bufSize, groupSize, groupRank, deviceIdx, mnNvlink, std::move(groupComm)))
         , mBufSize(mMcastDeviceMemory->getBufferSize())
         , mLocalDevice(at::Device(at::DeviceType::CUDA, deviceIdx))
     {
@@ -435,7 +435,7 @@ inline PreflightResult runLocalPreflight(
 
 //! Runtime-qualified MNNVL workspace used by the PyTorch all-reduce integration.
 //!
-//! Mapping policy stays in Python. This object validates the actual MPI placement and CUDA runtime,
+//! Mapping policy stays in Python. This object validates the actual group placement and CUDA runtime,
 //! coordinates preflight availability across the group, and owns the multicast allocation. Allocation itself
 //! deliberately retains McastDeviceMemory's existing failure behavior.
 class MnnvlWorkspace
@@ -452,6 +452,12 @@ public:
         TLLM_CHECK_WITH_INFO(groupComm != nullptr, "[MNNVL] Group communicator must not be null");
         uint32_t const groupSize = groupComm->getSize();
         uint32_t const groupRank = groupComm->getRank();
+        int32_t const localTransport = static_cast<int32_t>(transport);
+        std::vector<int32_t> transports(groupSize);
+        groupComm->allgather(&localTransport, transports.data(), sizeof(localTransport));
+        TLLM_CHECK_WITH_INFO(std::all_of(transports.begin(), transports.end(),
+                                 [localTransport](int32_t value) { return value == localTransport; }),
+            "[MNNVL] All ranks must select the same workspace transport");
         CUuuid localDeviceUuid{};
         std::array<char, 256> localHostName{};
         auto const localPreflight
@@ -519,6 +525,7 @@ public:
     //! \brief Internal, experimental hook that detaches fabric handles after engine-wide quiescence.
     void checkpointPrepare()
     {
+        TORCH_CHECK(mBuffer != nullptr, "MNNVL workspace is unavailable: ", mReason);
         mBuffer->checkpointPrepare();
     }
 
@@ -527,6 +534,7 @@ public:
     //! native resource retains its own duplicate after a successful restore.
     [[nodiscard]] bool checkpointRestore(int64_t mpiCommFortranHandle)
     {
+        TORCH_CHECK(mBuffer != nullptr, "MNNVL workspace is unavailable: ", mReason);
         return mBuffer->checkpointRestore(mpiCommFortranHandle);
     }
 
@@ -534,18 +542,20 @@ public:
     //! communicator.
     [[nodiscard]] bool checkpointRestore(std::shared_ptr<McastGroupComm> groupComm)
     {
+        TORCH_CHECK(mBuffer != nullptr, "MNNVL workspace is unavailable: ", mReason);
         return mBuffer->checkpointRestore(std::move(groupComm));
     }
 
     //! \brief Complete the collective restore only after the owner has reset its local protocol state.
     void checkpointRestoreComplete(bool localProtocolResetSucceeded)
     {
+        TORCH_CHECK(mBuffer != nullptr, "MNNVL workspace is unavailable: ", mReason);
         mBuffer->checkpointRestoreComplete(localProtocolResetSucceeded);
     }
 
     [[nodiscard]] bool isMapped() const
     {
-        return mBuffer->isMapped();
+        return mBuffer != nullptr && mBuffer->isMapped();
     }
 
     //! Return the allocator's total usable workspace size in bytes.

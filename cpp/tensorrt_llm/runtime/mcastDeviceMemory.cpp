@@ -152,7 +152,7 @@ void runCollectivePhase(McastGroupComm& comm, char const* phase, Action action, 
 McastDeviceMemory::McastDeviceMemory(
     size_t bufSize, uint32_t groupSize, uint32_t groupRank, int deviceIdx, bool mnNvlink, int64_t mpiCommFortranHandle)
     : McastDeviceMemory(
-          bufSize, groupSize, groupRank, deviceIdx, mnNvlink, std::make_shared<MpiMcastGroupComm>(mpiCommFortranHandle))
+        bufSize, groupSize, groupRank, deviceIdx, mnNvlink, std::make_shared<MpiMcastGroupComm>(mpiCommFortranHandle))
 {
 }
 
@@ -187,6 +187,8 @@ McastDeviceMemory::McastDeviceMemory(size_t bufSize, uint32_t groupSize, uint32_
         "[McastDeviceMemory] group communicator rank (%u) does not match the requested group rank (%u).",
         mGroupComm->getRank(), mGroupRank);
 
+    TLLM_CHECK_WITH_INFO(mGroupSize > 0, "[McastDeviceMemory] Group size must be positive.");
+
     // Retained so checkpointRestore() can confirm a replacement backend covers the same processes.
     mGroupWorldRanks = mGroupComm->getWorldRanks();
 
@@ -195,7 +197,9 @@ McastDeviceMemory::McastDeviceMemory(size_t bufSize, uint32_t groupSize, uint32_
         {
             TLLM_CHECK_WITH_INFO(
                 mGroupRank < mGroupSize, "[McastDeviceMemory] group rank is out of range for the group size.");
-            TLLM_CHECK_WITH_INFO(mBufSize > 0, "[McastDeviceMemory] Buffer size must be positive.");
+            TLLM_CHECK_WITH_INFO(
+                mBufSize > 0 && mBufSize <= std::numeric_limits<size_t>::max() - kSIGNAL_PAD_SIZE - 15UL,
+                "[McastDeviceMemory] Buffer size is outside the supported range.");
             TLLM_CUDA_CHECK(cudaSetDevice(mDeviceIdx));
             int multicastSupported{0};
             TLLM_CU_CHECK(
@@ -252,7 +256,8 @@ McastDeviceMemory::McastDeviceMemory(size_t bufSize, uint32_t groupSize, uint32_
                 mUcPtrsDev = nullptr;
             }
             if (mUcBasePtr != 0
-                && cleanupNoThrow("unicast virtual address reservation", [this]()
+                && cleanupNoThrow("unicast virtual address reservation",
+                    [this]()
                     { TLLM_CU_CHECK_FREE_RESOURCE(cuMemAddressFree(mUcBasePtr, mAllocationSize * mGroupSize)); }))
             {
                 mUcBasePtr = 0;
@@ -376,17 +381,16 @@ void McastDeviceMemory::createAndMapMnMcastMem(size_t bufSize)
     prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
     prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
     prop.location.id = mDeviceIdx;
-    int gpuDirectRdmaSupported{0};
-    TLLM_CU_CHECK(cuDeviceGetAttribute(
-        &gpuDirectRdmaSupported, CU_DEVICE_ATTRIBUTE_GPU_DIRECT_RDMA_WITH_CUDA_VMM_SUPPORTED, mDeviceIdx));
-    prop.allocFlags.gpuDirectRDMACapable = gpuDirectRdmaSupported != 0;
-
     size_t allocGranularity{0}, mcGranularity{0};
     size_t allocationSize{0};
     CUmulticastObjectProp mcProp{};
     runCollectivePhase(*mGroupComm, "allocation-layout validation",
         [&]()
         {
+            int gpuDirectRdmaSupported{0};
+            TLLM_CU_CHECK(cuDeviceGetAttribute(
+                &gpuDirectRdmaSupported, CU_DEVICE_ATTRIBUTE_GPU_DIRECT_RDMA_WITH_CUDA_VMM_SUPPORTED, mDeviceIdx));
+            prop.allocFlags.gpuDirectRDMACapable = gpuDirectRdmaSupported != 0;
             TLLM_CU_CHECK(cuMemGetAllocationGranularity(&allocGranularity, &prop, CU_MEM_ALLOC_GRANULARITY_MINIMUM));
             allocationSize = roundUp(roundUp(bufSize, 16UL) + kSIGNAL_PAD_SIZE, allocGranularity);
             mcProp = {.numDevices = mGroupSize, .size = allocationSize, .handleTypes = handleType};
@@ -403,10 +407,11 @@ void McastDeviceMemory::createAndMapMnMcastMem(size_t bufSize)
     uint64_t const localLayout[3] = {allocationSize, allocGranularity, mcGranularity};
     std::vector<uint64_t> layouts(mGroupSize * 3);
     mGroupComm->allgather(localLayout, layouts.data(), sizeof(localLayout));
-    TLLM_CHECK_WITH_INFO(
-        std::all_of(layouts.begin(), layouts.end(),
-            [&localLayout, index = size_t{0}](uint64_t value) mutable { return value == localLayout[index++ % 3]; }),
-        "[McastDeviceMemory] Ranks computed inconsistent aligned allocation properties.");
+    for (size_t index = 0; index < layouts.size(); ++index)
+    {
+        TLLM_CHECK_WITH_INFO(layouts[index] == localLayout[index % 3],
+            "[McastDeviceMemory] Ranks computed inconsistent aligned allocation properties.");
+    }
     TLLM_CHECK_WITH_INFO(allocationSize <= std::numeric_limits<size_t>::max() / mGroupSize,
         "[McastDeviceMemory] Unicast reservation size overflow.");
     mAllocationSize = allocationSize;
