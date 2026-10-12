@@ -2531,8 +2531,8 @@ class KVRecvTask(_LogicalTask):
     def fail(self, exc: Exception) -> None:
         """Mark the task ERROR.
 
-        Callers hold RxSession.lock, except dispatch_task's PeerIncompatibleError path, which
-        runs before publication.
+        Callers hold the owning RxSession.lock, unless that session is already closed and
+        unregistered (then no other thread can reach the task).
         """
         self._logical_outcomes.fail(exc)
         self._exception = exc
@@ -2542,8 +2542,9 @@ class KVRecvTask(_LogicalTask):
     def complete(self) -> None:
         """Mark the task TRANSFERRED unless it already failed.
 
-        Callers hold RxSession.lock, so this check-then-set is atomic against fail(). Status is
-        set before _event, so a thread woken by _event reads the status that complete() set.
+        Callers hold the owning RxSession.lock, which makes this check-then-set atomic against
+        fail(). Status is set before _event, so a thread woken by _event reads the status that
+        complete() set.
         """
         if self.status == TaskStatus.ERROR:
             return
@@ -2841,13 +2842,17 @@ class Receiver(ReceiverBase):
                 "dispatch_task: context peer incompatible, failing request "
                 f"unique_rid={task._unique_rid}: {e}"
             )
-            if self._enforce_physical_ownership:
-                session = self._get_session(task._unique_rid)
-                if session is None:
+            session = self._get_session(task._unique_rid)
+            if session is None:
+                # Closed and unregistered: no listener or executor path can reach this task any more.
+                if self._enforce_physical_ownership:
                     task.cancel_unpublished()
-                else:
-                    session.cancel_unpublished_task(task)
-            task.fail(e)
+                task.fail(e)
+                return
+            if self._enforce_physical_ownership:
+                session.cancel_unpublished_task(task)
+            with session.lock:
+                task.fail(e)
             return
 
         if sender_dp_rank is not None:
