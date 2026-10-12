@@ -649,7 +649,11 @@ def _load_video_by_cv2(
         video_buf = BytesIO(bytes(video))
         vidcap = cv2.VideoCapture(video_buf, cv2_backend, [])
     else:
-        vidcap = cv2.VideoCapture(video)
+        vidcap = (
+            cv2.VideoCapture(video, cv2_backend)
+            if cv2_backend is not None
+            else cv2.VideoCapture(video)
+        )
 
     try:
         if not vidcap.isOpened():
@@ -728,9 +732,10 @@ def _load_video_by_cv2(
         stacked_rgb = stacked_rgb[: len(valid_indices)]
 
         if format == "pt":
-            stacked_f32 = stacked_rgb.astype(np.float32)
-            stacked_f32 *= 1.0 / 255.0
-            tensor_nchw = torch.from_numpy(stacked_f32).permute(0, 3, 1, 2).contiguous()
+            src_nchw = torch.from_numpy(stacked_rgb).permute(0, 3, 1, 2)
+            tensor_nchw = torch.empty(src_nchw.shape, dtype=torch.float32, device="cpu")
+            tensor_nchw.copy_(src_nchw)
+            tensor_nchw.mul_(1.0 / 255.0)
             if device != "cpu":
                 tensor_nchw = tensor_nchw.to(device)
             loaded_frames = list(torch.unbind(tensor_nchw, dim=0))
@@ -1078,7 +1083,54 @@ class VideoMediaIO(BaseMediaIO[VideoData]):
         return self.load_bytes(base64.b64decode(data))
 
     def load_file(self, url: str) -> VideoData:
-        return self.load_bytes(Path(_normalize_file_uri(url)).read_bytes())
+        path = Path(_normalize_file_uri(url))
+        # Preserve custom byte loaders and the existing audio/decoder fallback paths.
+        if type(self) is not VideoMediaIO or "load_bytes" in vars(self) or self._extract_audio:
+            return self.load_bytes(path.read_bytes())
+        # Keep the selected backend, sample order, and raw-content hash of the byte path,
+        # without retaining a full copy of the file. The source must stay unchanged while
+        # loading: the metadata check catches ordinary writes/replacements, not an
+        # immutable snapshot of concurrent modifications.
+        with path.open("rb") as video_file:
+            # Open first, as read_bytes did, so source errors still precede decoder errors.
+            cv2_backend = _select_cv2_stream_buffered_backend()
+            cv2 = _get_cv2()
+            if cv2_backend != cv2.CAP_FFMPEG or not cv2.videoio_registry.isBackendBuiltIn(
+                cv2_backend
+            ):
+                source_bytes = video_file.read()
+            else:
+                before = os.fstat(video_file.fileno())
+                raw_bytes_hasher = blake3()
+                while chunk := video_file.read(1 << 20):
+                    raw_bytes_hasher.update(chunk)
+                video_data = _load_video_by_cv2(
+                    str(path),
+                    self._num_frames,
+                    self._fps,
+                    self._format,
+                    self._device,
+                    extract_audio=False,
+                    cv2_backend=cv2_backend,
+                    raw_bytes_hash=raw_bytes_hasher.hexdigest(),
+                )
+                after = path.stat()
+                if (
+                    before.st_dev,
+                    before.st_ino,
+                    before.st_size,
+                    before.st_mtime_ns,
+                    before.st_ctime_ns,
+                ) != (
+                    after.st_dev,
+                    after.st_ino,
+                    after.st_size,
+                    after.st_mtime_ns,
+                    after.st_ctime_ns,
+                ):
+                    raise ValueError(f"Video file {url!r} changed while it was being loaded.")
+                return video_data
+        return self.load_bytes(source_bytes)
 
 
 MEDIA_IO_REGISTRY: Mapping[MediaModality, Type[BaseMediaIO]] = MappingProxyType(
