@@ -61,6 +61,7 @@ struct Slot
     Slot(Slot&& other) noexcept
         : readyEvent(std::move(other.readyEvent))
         , mSlotId(std::exchange(other.mSlotId, std::nullopt))
+        , mLocalityDomainId(std::exchange(other.mLocalityDomainId, std::nullopt))
     {
     }
 
@@ -70,6 +71,7 @@ struct Slot
         {
             readyEvent = std::move(other.readyEvent);
             mSlotId = std::exchange(other.mSlotId, std::nullopt);
+            mLocalityDomainId = std::exchange(other.mLocalityDomainId, std::nullopt);
         }
         return *this;
     }
@@ -93,9 +95,21 @@ struct Slot
         mSlotId = id;
     }
 
+    // Locality domain whose physical memory backs this slot; nullopt for non-localized storage.
+    [[nodiscard]] std::optional<int> localityDomainId() const noexcept
+    {
+        return mLocalityDomainId;
+    }
+
+    void setLocalityDomainId(std::optional<int> id) noexcept
+    {
+        mLocalityDomainId = id;
+    }
+
     void resetSlot() noexcept
     {
         mSlotId.reset();
+        mLocalityDomainId.reset();
     }
 
     bool queryReady()
@@ -121,12 +135,15 @@ struct Slot
         Slot previous;
         auto replacementId = std::exchange(replacement.mSlotId, std::nullopt);
         previous.mSlotId = std::exchange(mSlotId, replacementId);
+        auto replacementDomain = std::exchange(replacement.mLocalityDomainId, std::nullopt);
+        previous.mLocalityDomainId = std::exchange(mLocalityDomainId, replacementDomain);
         previous.readyEvent = std::exchange(readyEvent, std::move(replacement.readyEvent));
         return previous;
     }
 
 private:
     std::optional<SlotId> mSlotId;
+    std::optional<int> mLocalityDomainId;
 };
 
 // ---------------------------------------------------------------------------

@@ -188,6 +188,7 @@ public:
     // ---- Query / info ------------------------------------------------------
 
     int tokensPerBlock() const noexcept;
+    int numLocalityDomains() const noexcept;
     bool enablePartialMatch() const noexcept;
 
     // Partial commit is independent of partial matching so beam search can

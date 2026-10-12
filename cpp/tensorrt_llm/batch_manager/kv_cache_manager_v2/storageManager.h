@@ -226,6 +226,12 @@ public:
         return mSlotDescLists.at(level).size();
     }
 
+    // 1 unless the GPU tier is localized.
+    int numLocalityDomains() const noexcept
+    {
+        return mNumLocalityDomains;
+    }
+
     PoolGroupIndex numPoolGroups() const
     {
         return numPoolGroups(kHotLevel);
@@ -456,6 +462,7 @@ private:
     TypedVec<PoolGroupIndex, SlotCount> mMinSlots;
     // All GPU cache levels borrow this allocator. It must outlive mLevels.
     std::unique_ptr<PooledPhysMemAllocator> mGpuPhysMemAllocator;
+    int mNumLocalityDomains{1};
     TypedVec<CacheLevel, CacheLevelManager> mLevels;
 
     static constexpr size_t kDefaultPageStagingBytes = 64u << 20u;

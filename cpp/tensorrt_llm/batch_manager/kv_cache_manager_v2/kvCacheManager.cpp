@@ -191,6 +191,12 @@ std::shared_ptr<KvCache> KvCacheManager::createKvCache(ReuseScope reuseScope, To
 {
     KVCM2_API_GUARD();
     auto const apiLock = lockExclusive();
+    if (reuseScope.localityDomainId.has_value())
+    {
+        int const localityDomainId = *reuseScope.localityDomainId;
+        TLLM_CHECK_WITH_INFO(localityDomainId >= 0 && localityDomainId < numLocalityDomains(),
+            "locality_domain_id %d out of range for %d locality domain(s)", localityDomainId, numLocalityDomains());
+    }
     if (!priorityCb)
     {
         priorityCb = [](BlockOrdinal, LifeCycleId) { return kPriorityDefault; };
@@ -413,6 +419,11 @@ TypedVec<PoolGroupIndex, PoolGroupDesc> KvCacheManager::poolGroupDescs() const
 int KvCacheManager::tokensPerBlock() const noexcept
 {
     return mRadixTree->tokensPerBlock();
+}
+
+int KvCacheManager::numLocalityDomains() const noexcept
+{
+    return mStorage->numLocalityDomains();
 }
 
 bool KvCacheManager::enablePartialMatch() const noexcept

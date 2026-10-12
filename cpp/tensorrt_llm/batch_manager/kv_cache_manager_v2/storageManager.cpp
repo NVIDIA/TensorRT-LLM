@@ -22,6 +22,7 @@
 #include "kv_cache_manager_v2/copyEngine.h"
 #include "kv_cache_manager_v2/exceptions.h"
 #include "kv_cache_manager_v2/kvCache.h"
+#include "kv_cache_manager_v2/localityDomain.h"
 #include "kv_cache_manager_v2/page.h"
 #include "kv_cache_manager_v2/stagingBuffer.h"
 #include "kv_cache_manager_v2/utils/hostMem.h"
@@ -281,10 +282,13 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
         slotSizeLists.push_back(sd.slotSizeList());
     }
 
-    size_t const gpuQuota = cacheTierQuota(config.cacheTiers[kHotLevel]);
+    auto const& gpuTierConfig = std::get<GpuCacheTierConfig>(config.cacheTiers[kHotLevel]);
+    size_t const gpuQuota = gpuTierConfig.quota;
     mGpuPhysMemAllocator = std::make_unique<PooledPhysMemAllocator>(
         CacheLevelManager::cacheTierGranularity(CacheTier::GPU_MEM, gpuQuota));
     size_t const gpuGranularity = mGpuPhysMemAllocator->physMemSize();
+    mNumLocalityDomains
+        = resolveNumLocalityDomains(gpuTierConfig.enableLocalityDomains, mGpuPhysMemAllocator->deviceId());
 
     // Constraints are hot-level feasibility floors. They are scaled by
     // 1/maxUtilForResume because KvCache::resume rejects a pool group above that
