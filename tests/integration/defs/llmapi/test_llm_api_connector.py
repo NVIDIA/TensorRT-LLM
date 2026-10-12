@@ -67,7 +67,7 @@ CONNECTOR_V1_ONLY_KV_CACHE_MANAGER_METHODS = (
     # `PyExecutor._maybe_init_kv_connector_manager`.
     "get_unique_primary_pool",
     # `KvCacheConnectorSchedulerOutputRequest.update_and_build_data` and
-    # `PyExecutor.kv_connector_request_finished`.
+    # `PyExecutor._start_connector_async_save`.
     "get_cache_indices",
     # `update_and_build_data`, for `RequestData.block_hashes`.
     "commit_and_get_block_hashes",
@@ -117,6 +117,7 @@ def model_with_connector(use_kv_cache_manager_v2):
         mock_worker = MagicMock()
         mock_scheduler.request_finished.return_value = False
         mock_worker.get_finished.return_value = [], []
+        mock_worker.capacity_only = False
 
         importlib_mock.import_module.return_value.KvConnectorScheduler.return_value = mock_scheduler
         importlib_mock.import_module.return_value.KvConnectorWorker.return_value = mock_worker
@@ -298,7 +299,7 @@ def test_v2_connector_contract_does_not_reuse_the_v1_methods():
 
     # The other half of the contract: what V2 offers instead. Every connector
     # path on V2 goes through this one accessor - `update_and_build_data`,
-    # `kv_connector_request_finished` and `_run_kv_connector_hooks` each call it
+    # `_start_connector_async_save` and `_run_kv_connector_hooks` each call it
     # and derive the flat list from `[0]` when there is a single layer group.
     assert hasattr(KVCacheManagerV2, "get_page_indices_by_layer_group"), (
         "KVCacheManagerV2.get_page_indices_by_layer_group is the V2 "
@@ -349,8 +350,10 @@ def test_connector_runs_on_kv_cache_manager_v2(enforce_single_worker,
                 "tensorrt_llm._torch.pyexecutor.py_executor_creator.importlib"
         ) as importlib_mock:
             connector_module = importlib_mock.import_module.return_value
+            mock_worker = MagicMock()
+            mock_worker.capacity_only = False
             connector_module.KvConnectorScheduler.return_value = MagicMock()
-            connector_module.KvConnectorWorker.return_value = MagicMock()
+            connector_module.KvConnectorWorker.return_value = mock_worker
 
             try:
                 llm = LLM(
@@ -1999,6 +2002,183 @@ def test_connector_cancel_drains_real_prefix_load(controlled_prefix_connector,
     finally:
         control.allow_copy.set()
         warm.shutdown()
+
+
+# Sizes for the cancelled-save test below, in a 6-page pool (192 / 32). The
+# cancelled request holds 3 of them, so the traffic that follows cannot run
+# without touching the held pages unless the hold is real.
+CANCELLED_SAVE_TOKENS_PER_BLOCK = 32
+CANCELLED_SAVE_KV_TOKENS = 192
+CANCELLED_SAVE_PROMPT_TOKENS = 96
+# Generation long enough that the run exceeds the pool on its own. A failed
+# abort then stalls for lack of pages rather than finishing quietly and
+# handing this test the ordinary end-of-request save in place of the
+# cancellation it means to exercise.
+CANCELLED_SAVE_MAX_TOKENS = 128
+# Forward passes with the request in `cached_requests` before it is aborted.
+# One is enough to put KV in its pages; two keeps the abort clear of the
+# prefill pass itself.
+CANCELLED_SAVE_DECODE_PASSES = 2
+
+
+@pytest.fixture
+def controlled_save_connector(enforce_single_worker, monkeypatch, tmp_path):
+    """Hold one request's connector save open until the test releases it."""
+    examples_dir = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "..", "..", "..", "..",
+                     "examples", "llm-api"))
+    monkeypatch.syspath_prepend(examples_dir)
+    monkeypatch.setenv("CONNECTOR_CACHE_FOLDER", str(tmp_path))
+    import llm_kv_cache_connector as persistent
+
+    control = SimpleNamespace(decoding=Event(),
+                              handed_over=Event(),
+                              allow_save=Event(),
+                              transmitted=Event(),
+                              freed=Event(),
+                              request_id=None,
+                              slots=None,
+                              at_handover=None,
+                              at_transmission=None,
+                              decode_passes=0)
+
+    class SavingLeader(persistent.PersistentKvCacheConnectorLeader):
+
+        def build_connector_meta(self, scheduler_output):
+            if scheduler_output.cached_requests:
+                control.decode_passes += 1
+                if control.decode_passes >= CANCELLED_SAVE_DECODE_PASSES:
+                    control.decoding.set()
+            return super().build_connector_meta(scheduler_output)
+
+        def request_finished(self, request, cache_block_ids):
+            # Only the first request saves asynchronously. The traffic that
+            # follows has to be free to finish and reclaim its own pages,
+            # which is what puts the held ones under pressure.
+            if control.request_id is not None:
+                return False
+            control.request_id = request.request_id
+            control.slots = [
+                slot for slot in cache_block_ids if slot != BAD_PAGE_INDEX
+            ]
+            assert control.slots, "The cancelled request held no readable pages"
+            return True
+
+    class SavingWorker(persistent.PersistentKvCacheConnectorWorker):
+
+        def _read_source(self):
+            return [self.kv_cache_tensor[slot].cpu() for slot in control.slots]
+
+        def get_finished(self, finished_gen_req_ids, started_loading_req_ids):
+            if control.request_id in finished_gen_req_ids:
+                # The source as the transfer first sees it. Whatever the test
+                # does between here and the read below has to leave it alone.
+                control.at_handover = self._read_source()
+                control.handed_over.set()
+            if (not control.handed_over.is_set()
+                    or not control.allow_save.is_set()
+                    or control.transmitted.is_set()):
+                return [], []
+            control.at_transmission = self._read_source()
+            control.transmitted.set()
+            return [control.request_id], []
+
+    original_free = KVCacheManagerV2.free_resources
+
+    def record_free(manager, request):
+        target = request.request_id == control.request_id
+        if target:
+            assert control.transmitted.is_set(), (
+                "Source pages were freed before the save read them")
+        result = original_free(manager, request)
+        if target:
+            control.freed.set()
+        return result
+
+    monkeypatch.setattr(persistent, "SavingLeader", SavingLeader, raising=False)
+    monkeypatch.setattr(persistent, "SavingWorker", SavingWorker, raising=False)
+    monkeypatch.setattr(KVCacheManagerV2, "free_resources", record_free)
+    yield persistent, control
+    control.allow_save.set()
+
+
+@pytest.mark.threadleak(enabled=False)
+@pytest.mark.parametrize("use_overlap_scheduler", [True, False])
+def test_connector_cancel_holds_pages_until_the_save_reads_them(
+        controlled_save_connector, use_overlap_scheduler):
+    """Cancellation retains a request's pages until its save has read them.
+
+    The response pass frees a request's pages as soon as it reads as
+    finished, so cancelling mid-flight has to offer the connector the same
+    save handshake a finished request gets. Without it the next allocation
+    overwrites bytes the transfer is still reading - and the pool here is
+    small enough that the traffic below wants exactly those pages.
+    """
+    import torch
+
+    persistent, control = controlled_save_connector
+    model = LLM(model=f"{llm_models_root()}/Qwen3/Qwen3-0.6B",
+                backend="pytorch",
+                cuda_graph_config=None,
+                disable_overlap_scheduler=not use_overlap_scheduler,
+                max_seq_len=256,
+                max_num_tokens=128,
+                max_batch_size=2,
+                enable_chunked_prefill=False,
+                kv_cache_config=KvCacheConfig(
+                    max_tokens=CANCELLED_SAVE_KV_TOKENS,
+                    tokens_per_block=CANCELLED_SAVE_TOKENS_PER_BLOCK,
+                    use_kv_cache_manager_v2=True),
+                kv_connector_config=KvCacheConnectorConfig(
+                    connector_module=persistent.__name__,
+                    connector_scheduler_class="SavingLeader",
+                    connector_worker_class="SavingWorker"))
+    try:
+        cancelled = model.generate_async(
+            [100] * CANCELLED_SAVE_PROMPT_TOKENS,
+            SamplingParams(max_tokens=CANCELLED_SAVE_MAX_TOKENS,
+                           ignore_eos=True))
+        assert control.decoding.wait(60), "Request never reached generation"
+        cancelled.abort()
+
+        assert control.handed_over.wait(
+            60), "Cancellation never offered the connector a save"
+        assert not control.freed.is_set()
+
+        # Cache pressure, with the held pages making up half the pool. These
+        # finish, so the allocator really is handing out and reclaiming pages
+        # while the save sits outstanding.
+        for first_token in (200, 300):
+            other = model.generate_async([first_token] * 32,
+                                         SamplingParams(max_tokens=2,
+                                                        ignore_eos=True))
+            assert len(other.result(timeout=60).outputs[0].token_ids) == 2
+        assert not control.freed.is_set()
+
+        control.allow_save.set()
+        assert control.transmitted.wait(60), "The held save never completed"
+        assert control.freed.wait(
+            60), "The completed save never released its pages"
+
+        # What the transfer read is what it was promised, byte for byte.
+        assert len(control.at_transmission) == len(control.at_handover)
+        for promised, read in zip(control.at_handover, control.at_transmission):
+            assert torch.equal(promised, read)
+
+        # The save was held on behalf of a cancellation, not of an ordinary
+        # end-of-request save that happened to arrive first.
+        assert cancelled.result(
+            timeout=60).outputs[0].finish_reason == "cancelled"
+
+        # The pages really did come back: this needs more than the pool had
+        # left while the save held them.
+        after = model.generate_async([400] * 128,
+                                     SamplingParams(max_tokens=2,
+                                                    ignore_eos=True))
+        assert len(after.result(timeout=60).outputs[0].token_ids) == 2
+    finally:
+        control.allow_save.set()
+        model.shutdown()
 
 
 # The VSWA end-to-end sizes. The window is deliberately larger than the whole

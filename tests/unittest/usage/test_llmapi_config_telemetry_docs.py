@@ -368,6 +368,28 @@ def test_kv_cache_compression_discriminator_captures_both_algorithms() -> None:
         assert metadata["capture_succeeded"] is True
 
 
+@pytest.mark.parametrize("residual_dim", (0, 64))
+def test_cold_page_rope_residual_dim_captures_only_supported_values(residual_dim) -> None:
+    from tensorrt_llm.llmapi.llm_args import ColdPageQuantizationCompressionConfig, TorchLlmArgs
+    from tensorrt_llm.usage.llmapi_config import (
+        build_capture_manifest,
+        collect_llm_api_config_payloads,
+    )
+
+    field_path = "kv_cache_compression_config.nvfp4_residual_dim"
+    entry = next(item for item in build_capture_manifest(TorchLlmArgs) if item.path == field_path)
+    assert entry.capture_types == ("literal",)
+    args = TorchLlmArgs(
+        model="/model",
+        kv_cache_compression_config=ColdPageQuantizationCompressionConfig(
+            nvfp4_residual_dim=residual_dim,
+        ),
+    )
+    config_json, metadata_json = collect_llm_api_config_payloads(args)
+    assert json.loads(config_json)[field_path] == residual_dim
+    assert json.loads(metadata_json)["capture_succeeded"] is True
+
+
 def _small_models():
     from enum import Enum
 

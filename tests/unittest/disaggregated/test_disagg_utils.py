@@ -133,6 +133,18 @@ def test_extract_disagg_cfg(sample_yaml_config):
     assert config.disagg_coordinator_url == "http://coordinator:7999"
 
 
+def test_bounded_replay_on_generation_reaches_both_workers():
+    config = extract_disagg_cfg(**get_yaml_config(),
+                                bounded_replay_on_generation=True)
+
+    assert config.bounded_replay_on_generation is True
+    assert {
+        server.other_args["bounded_replay_on_generation"]
+        for server in config.server_configs
+    } == {True}
+    assert config.conditional_disagg_config is None
+
+
 def test_extract_disagg_metrics_controls():
     yaml_config = get_yaml_config()
     yaml_config["context_servers"]["return_perf_metrics"] = False

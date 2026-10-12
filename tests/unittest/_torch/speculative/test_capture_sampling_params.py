@@ -108,7 +108,10 @@ def _request(temperature=None, top_k=None, top_p=None, min_p=None, slot=0):
 
 def _fake_meta():
     return types.SimpleNamespace(
-        runtime_draft_len=1, dummy_slot_row=0, group_all_greedy_sample=None
+        runtime_draft_len=1,
+        is_ragged_verify=False,
+        dummy_slot_row=0,
+        group_all_greedy_sample=None,
     )
 
 
@@ -196,6 +199,7 @@ def _populate_meta(mode, draft_len=1):
     """
     meta = types.SimpleNamespace(
         runtime_draft_len=draft_len,
+        is_ragged_verify=False,
         dummy_slot_row=0,
         group_all_greedy_sample=None,
         max_num_requests=4,

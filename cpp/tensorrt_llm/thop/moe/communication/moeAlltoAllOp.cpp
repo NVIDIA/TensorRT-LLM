@@ -299,7 +299,15 @@ torch::Tensor moeA2AInitializeOp(torch::Tensor const& workspace, int64_t epRank,
 // CFT Handle-Based Counted Writes Initialization
 // ============================================================================
 
-// Static CftLeManager — lives for the process lifetime (like workspace).
+// Static CftLeManager — one per process, bound to a single workspace.
+//
+// The manager owns a logical endpoint bound to the workspace's MNNVL
+// allocation, so it must be destroyed before that allocation is freed and its
+// virtual address is recycled; otherwise a later binding could resolve to an
+// endpoint left over from a dead allocation. The Python NVLinkOneSided
+// teardown calls moe_a2a_cft_release while the workspace is still alive.
+// MoeAlltoAll otherwise retains its shared workspaces for the process
+// lifetime, so the manager normally survives until static destruction.
 static std::unique_ptr<tensorrt_llm::kernels::moe_comm::CftLeManager> g_cft_manager;
 
 // Initialize CFT Logical Endpoints by binding the LE to the MNNVL workspace.
@@ -394,6 +402,45 @@ void moeA2ACftInitializeOp(torch::Tensor const& workspace, int64_t workspaceMemH
     {
         moeA2ABarrier();
     }
+}
+
+// Release the CFT logical endpoint before its backing workspace is freed.
+//
+// Idempotent, and a no-op unless the manager is actually bound to this
+// workspace's rank region: the caller passes the workspace it is tearing down,
+// and a manager bound to some other allocation must outlive that teardown.
+// Destroying the manager here — rather than at static destruction — keeps the
+// endpoint from outliving the virtual address it is bound to.
+void moeA2ACftReleaseOp(torch::Tensor const& workspace, int64_t epRank)
+{
+    CHECK_TH_CUDA(workspace);
+    CHECK_TYPE(workspace, torch::kUInt8);
+    TORCH_CHECK(workspace.dim() == 2, "workspace must be a 2D tensor of shape [epSize, sizePerRank]");
+    TORCH_CHECK(epRank >= 0 && epRank < workspace.size(0), "epRank must be in the range [0, epSize)");
+
+    if (!g_cft_manager)
+    {
+        return;
+    }
+
+    // An uninitialized manager holds no endpoint (initialization threw part
+    // way through); drop it unconditionally so a retry starts clean.
+    if (!g_cft_manager->isInitialized())
+    {
+        g_cft_manager.reset();
+        return;
+    }
+
+    CUdeviceptr workspaceRankPtr
+        = reinterpret_cast<CUdeviceptr>(workspace.data_ptr<uint8_t>() + epRank * workspace.stride(0));
+    if (g_cft_manager->getLocalBackingPtr() != workspaceRankPtr)
+    {
+        return;
+    }
+
+    // ~CftLeManager runs destroy(): unbind, destroy the local and imported
+    // endpoints, and release the reserved LE id block.
+    g_cft_manager.reset();
 }
 
 // MoE All-to-All Dispatch Operation
@@ -1062,6 +1109,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, module)
     module.def(
         "moe_a2a_cft_initialize(Tensor(a!) workspace, int workspace_mem_handle, "
         "int workspace_size_per_rank, int ep_rank, int ep_size) -> ()");
+    module.def("moe_a2a_cft_release(Tensor(a!) workspace, int ep_rank) -> ()");
     module.def(
         "moe_a2a_initialize(Tensor(a!) workspace, int ep_rank, int ep_size, int max_num_tokens_per_rank, "
         "int? eplb_stats_num_experts=None, bool can_use_cft_counted_writes=False) -> Tensor");
@@ -1088,4 +1136,5 @@ TORCH_LIBRARY_IMPL(trtllm, CUDA, module)
     module.impl(
         "moe_a2a_get_combine_payload_tensor", &tensorrt_llm::torch_ext::moe_comm::moeA2AGetCombinePayloadTensorOp);
     module.impl("moe_a2a_cft_initialize", &tensorrt_llm::torch_ext::moe_comm::moeA2ACftInitializeOp);
+    module.impl("moe_a2a_cft_release", &tensorrt_llm::torch_ext::moe_comm::moeA2ACftReleaseOp);
 }

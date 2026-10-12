@@ -44,6 +44,7 @@
 # This file is copied and modified from cutlass https://github.com/NVIDIA/cutlass/blob/main/python/CuTeDSL/cutlass/cute/core.py
 
 import ctypes
+import math
 import os
 from typing import Union
 
@@ -99,6 +100,11 @@ class _Pointer(Pointer):
         assert int(self._pointer) % self._assumed_align == 0, (
             f"pointer must be {self._assumed_align} bytes aligned"
         )
+
+    def __add__(self, offset: int) -> Pointer:  # type: ignore[override]
+        offset_bytes = offset * self._dtype.width // 8
+        assumed_align = math.gcd(offset_bytes, self._assumed_align)
+        return _Pointer(self._pointer + offset_bytes, self._dtype, self._addr_space, assumed_align)
 
     def size_in_bytes(self) -> int:
         return ctypes.sizeof(ctypes.c_void_p(int(self._pointer)))
