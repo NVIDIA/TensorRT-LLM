@@ -11,9 +11,11 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.pyexecutor import py_executor as py_executor_module
-from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import DecoderRunner
-from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import runner as runner_module
-from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.warmup import WarmupAgreement
+from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import warmup as warmup_module
+from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.warmup import (
+    DecoderWarmup,
+    WarmupAgreement,
+)
 from tensorrt_llm._torch.pyexecutor.warmup_timer import _WarmupTimer
 
 pytestmark = pytest.mark.cpu_only
@@ -72,9 +74,9 @@ def _agreement(
     return WarmupAgreement(dist, mapping)
 
 
-def _engine(*, world_size: int = 1, dwdp_size: int = 0) -> DecoderRunner:
+def _engine(*, world_size: int = 1, dwdp_size: int = 0) -> DecoderWarmup:
     """Build an engine carrying only what the warmup phases read."""
-    engine = object.__new__(DecoderRunner)
+    engine = object.__new__(DecoderWarmup)
     engine._agreement = _agreement(world_size=world_size, dwdp_size=dwdp_size)
     engine.dist = engine._agreement.dist
     engine.mapping = engine._agreement.mapping
@@ -394,7 +396,7 @@ def test_tp_agreement_lets_a_symmetric_world_run() -> None:
     assert agreement.should_run_warmup_batch(object(), 128, "general") is True
 
 
-def _general_warmup_engine(*, world_size: int, dwdp_size: int) -> DecoderRunner:
+def _general_warmup_engine(*, world_size: int, dwdp_size: int) -> DecoderWarmup:
     engine = _engine(world_size=world_size, dwdp_size=dwdp_size)
     engine._warmup_timer = _WarmupTimer(rank=engine.dist.rank)
     batch = object()
@@ -435,7 +437,7 @@ def test_general_warmup_oom_policy(world_size: int, dwdp_size: int, is_fatal: bo
 _KV_ALLOC_ERROR = "Can't allocate new blocks for window size 8"
 
 
-def _mamba_engine(*, world_size: int = 1, dwdp_size: int = 0) -> tuple[DecoderRunner, object]:
+def _mamba_engine(*, world_size: int = 1, dwdp_size: int = 0) -> tuple[DecoderWarmup, object]:
     engine = _engine(world_size=world_size, dwdp_size=dwdp_size)
     engine.kv_cache_manager_key = "kv"
     engine._config = SimpleNamespace(
@@ -461,15 +463,15 @@ def _mamba_engine(*, world_size: int = 1, dwdp_size: int = 0) -> tuple[DecoderRu
     return engine, resource_manager
 
 
-def _run_mamba_warmup(engine: DecoderRunner, resource_manager: object) -> None:
+def _run_mamba_warmup(engine: DecoderWarmup, resource_manager: object) -> None:
     with (
-        mock.patch.object(runner_module, "MambaHybridCacheManager", _StandInMambaCacheManager),
+        mock.patch.object(warmup_module, "MambaHybridCacheManager", _StandInMambaCacheManager),
         mock.patch.object(
-            runner_module.Mamba2Metadata,
+            warmup_module.Mamba2Metadata,
             "force_initial_states_for_warmup",
             side_effect=contextlib.nullcontext,
         ),
-        mock.patch.object(runner_module, "clear_memory_buffers"),
+        mock.patch.object(warmup_module, "clear_memory_buffers"),
     ):
         engine._run_mamba_hybrid_warmup(resource_manager)
 

@@ -506,8 +506,6 @@ class CrossAttentionInputs(ExtraInputsCollector):
 class EncoderDecoderRunner(DecoderRunner):
     """Run an encoder-decoder model: the encoder stage, then the decoder."""
 
-    # Synthetic context batches carry no encoder output.
-    _context_warmups_supported = False
     _dummy_request_tokens = ENC_DEC_CUDA_GRAPH_DUMMY_TOKEN_NUM
 
     def __init__(
@@ -842,9 +840,6 @@ class EncoderDecoderRunner(DecoderRunner):
 
     def _new_extra_inputs(self) -> CrossAttentionInputs:
         return CrossAttentionInputs(self)
-
-    def _freeze_eager_workspace_floor(self) -> None:
-        """Leave eager workspace reclamation off; it does not track cross-attention state."""
 
     def _capture_mixed_encoder_decoder_cuda_graphs(self, resource_manager: ResourceManager) -> None:
         """Warm and capture reachable mixed encoder-decoder graph shapes.

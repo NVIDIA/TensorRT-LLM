@@ -37,6 +37,8 @@ from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.metadata import \
     DecoderMetadata
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner import \
     _make_single_token_context_graph_batch
+from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.warmup import \
+    DecoderWarmup
 from tensorrt_llm._torch.pyexecutor.engine.runners.interface import \
     PreparedInputs
 from tensorrt_llm._torch.pyexecutor.engine.runners.pooling import PoolingRunner
@@ -356,7 +358,7 @@ def _make_forward_only_engine(
     decoder._get_draft_kv_cache_manager = Mock(return_value=None)
     engine._runner = decoder
     decoder._lora = SimpleNamespace(cuda_graph_manager=None)
-    decoder._trtllm_gen_jit_warmup = False
+    decoder._warmup = SimpleNamespace(trtllm_gen_jit_warmup=False)
 
     semantic_attn_metadata = Mock()
     graph_attn_metadata = Mock()
@@ -1807,7 +1809,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         from tensorrt_llm._torch.attention.backends.sparse.dsa import \
             DSAtrtllmAttentionMetadata
 
-        engine = object.__new__(DecoderRunner)
+        engine = object.__new__(DecoderWarmup)
         engine._config = SimpleNamespace(
             attention_backend=SimpleNamespace(
                 Metadata=DSAtrtllmAttentionMetadata),
@@ -1844,7 +1846,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         from tensorrt_llm._torch.attention.backends.trtllm import \
             TrtllmAttentionMetadata
 
-        engine = object.__new__(DecoderRunner)
+        engine = object.__new__(DecoderWarmup)
         engine._config = SimpleNamespace(attention_backend=SimpleNamespace(
             Metadata=TrtllmAttentionMetadata))
         engine._metadata = DecoderMetadata(engine._config,
