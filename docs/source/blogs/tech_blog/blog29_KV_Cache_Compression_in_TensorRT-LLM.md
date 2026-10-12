@@ -91,19 +91,19 @@ Our goals for the framework are two. A user turns a compression method on with *
 
 ### Design Philosophy
 
-Compression can live inside the model or the attention kernel, and TensorRT LLM already does that. The new opportunity is **compression at the right moment**: a small compression step, run when the KV is already there and nothing is reading it, benefits the whole serving system. Three principles follow:
+TensorRT LLM already compresses KV inside the model and the attention kernel. The new opportunity is **compression at the right moment**: a small step run when nothing is reading the KV, and the whole serving system benefits. Three principles:
 
-- **Untouched attention.** Attention always reads the normal GPU representation. A compressed page is restored before anything reads it.
-- **Seamless insertion.** A method changes only the contents of KV pages. The scheduler, the executor loop and the model are unchanged, and the cache manager keeps allocating, moving and reusing pages.
-- **General to models.** A method works on KV pages, not on a model's attention kernel, so the same method and the same insertion points serve every model.
+- **Untouched attention**: attention always reads the normal GPU representation.
+- **Seamless insertion**: a method changes only the contents of KV pages; the scheduler, executor loop, model and cache manager are unchanged.
+- **General to models**: a method works on KV pages, so one method serves every model.
 
-For seamless and precise insertion, we define **five stages in the life of a KV cache** where compression can run. Each is a moment when nothing is reading the cache, shown in Figure 3:
+To insert precisely, we define five stages in the life of a KV cache (Figure 3):
 
-1. **Prefill chunks.** Between two chunks of a long prompt. The KV of the chunks already computed can be compressed before the next chunk arrives.
-2. **After prefill.** The prompt's KV is complete and generation has not started. The whole prompt can be compressed once.
-3. **Decode steps.** Between two generation steps. The tokens generated so far can be scored and the least useful evicted. TriAttention runs here.
-4. **Tool calls.** The request pauses while a tool runs and its KV waits, often for seconds. The waiting KV can be compressed or moved.
-5. **After the request.** The KV is kept for the next turn or for a shared prefix, and moves to host or disk memory when the GPU is full. Pages can be stored in a smaller form while they are cold. NVFP4 cold-page compression runs here.
+1. **Prefill chunks**: between two chunks of a long prompt.
+2. **After prefill**: the prompt's KV is complete and generation has not started.
+3. **Decode steps**: between two generation steps. TriAttention runs here.
+4. **Tool calls**: the request pauses and its KV waits for the tool.
+5. **After the request**: the KV is kept for reuse and may move to host or disk memory. NVFP4 cold-page compression runs here.
 
 <div align="center">
 <figure>
