@@ -80,7 +80,8 @@ def _input_preparer() -> DecoderInputPreparer:
                                 None,
                                 use_beam_search=False,
                                 fast_path=lambda *args, **kwargs: None,
-                                new_extra_inputs=None)
+                                new_extra_inputs=None,
+                                steady_gen_cache_supported=True)
 
 
 class TestCachedKvTokenLogging(unittest.TestCase):
@@ -3104,7 +3105,7 @@ class TestDecodeGraphMetadataPreparation(unittest.TestCase):
                 elif case == "beam":
                     engine._runner._config.max_beam_width = 2
                 elif case == "encoder_decoder":
-                    engine._runner._new_extra_inputs = Mock()
+                    engine._runner._deferred_decode_outputs_supported = False
                 elif case == "context_parallel":
                     engine.mapping.cp_size = 2
                 elif case == "draft_key":

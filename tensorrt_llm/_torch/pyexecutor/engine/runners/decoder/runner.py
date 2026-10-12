@@ -73,13 +73,17 @@ from .warmup import DecoderWarmup, WarmupAgreement
 class DecoderRunner(ScheduledModelRunner):
     """Run scheduled decoder generation with its own buffers, graphs and metadata."""
 
+    # Optional execution paths that a subclass can turn off.
+    _context_warmups_supported = True
+    _context_graph_promotion_supported = True
+    _steady_gen_cache_supported = True
+    _eager_workspace_reclaim_supported = True
+    _deferred_decode_outputs_supported = True
     # Prompt tokens of the filler CUDA graph dummy requests, also the floor of
     # the longest one; None keeps the cache manager's default.
     _dummy_request_tokens: int | None = None
     # Collects per-sequence model inputs beyond the decoder's own; None when the
-    # model takes none. Steady-generation reuse, context-row promotion, the
-    # synthetic context warmups and eager workspace reclamation do not carry
-    # such inputs, so all of them stay off while it is set.
+    # model takes none.
     _new_extra_inputs: Callable[[], ExtraInputsCollector] | None = None
 
     def __init__(
@@ -157,6 +161,7 @@ class DecoderRunner(ScheduledModelRunner):
             use_beam_search=self.use_beam_search,
             fast_path=self._prepare_inputs_fast_path,
             new_extra_inputs=self._new_extra_inputs,
+            steady_gen_cache_supported=self._steady_gen_cache_supported,
             mm_item_scheduler=mm_item_scheduler,
         )
         cuda_graph_runner = self._initialize_cuda_graph_runner()
@@ -178,7 +183,7 @@ class DecoderRunner(ScheduledModelRunner):
             forward_warmup=self._forward_warmup,
             prepare_capture_batch=self._prepare_capture_batch,
             capture_additional_graphs=self._capture_additional_cuda_graphs,
-            context_promotion_supported=self._new_extra_inputs is None,
+            context_promotion_supported=self._context_graph_promotion_supported,
         )
         self._warmup = DecoderWarmup(
             self._config,
@@ -197,8 +202,8 @@ class DecoderRunner(ScheduledModelRunner):
             self._inputs,
             forward_warmup=self._forward_warmup,
             get_draft_kv_cache_manager=self._get_draft_kv_cache_manager,
-            context_warmups_supported=self._new_extra_inputs is None,
-            eager_workspace_reclaimable=self._new_extra_inputs is None,
+            context_warmups_supported=self._context_warmups_supported,
+            eager_workspace_reclaimable=self._eager_workspace_reclaim_supported,
         )
 
     @property
@@ -849,7 +854,7 @@ class DecoderRunner(ScheduledModelRunner):
             and not promoted_context_request_ids
             and not enable_spec_decode
             and not self.use_beam_search
-            and self._new_extra_inputs is None
+            and self._deferred_decode_outputs_supported
             and self.mapping.cp_size == 1
         ):
             return defer()

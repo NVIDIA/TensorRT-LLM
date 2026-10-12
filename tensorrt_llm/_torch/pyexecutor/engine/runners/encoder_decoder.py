@@ -1257,6 +1257,12 @@ def _get_max_encoder_output_len(
 class EncoderDecoderRunner(DecoderRunner):
     """Run an encoder-decoder model: the encoder stage, then the decoder."""
 
+    # Cross-attention state is per sequence and none of these paths carries it.
+    _context_warmups_supported = False
+    _context_graph_promotion_supported = False
+    _steady_gen_cache_supported = False
+    _eager_workspace_reclaim_supported = False
+    _deferred_decode_outputs_supported = False
     _dummy_request_tokens = ENC_DEC_CUDA_GRAPH_DUMMY_TOKEN_NUM
 
     def __init__(

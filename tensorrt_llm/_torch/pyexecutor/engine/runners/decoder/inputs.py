@@ -284,6 +284,7 @@ class DecoderInputPreparer:
         use_beam_search: bool,
         fast_path: Callable[..., PreparedInputs | None],
         new_extra_inputs: Callable[[], ExtraInputsCollector] | None,
+        steady_gen_cache_supported: bool,
         mm_item_scheduler: MultimodalItemScheduler | None = None,
     ) -> None:
         self._buffers = buffers
@@ -298,6 +299,7 @@ class DecoderInputPreparer:
         self.use_beam_search = use_beam_search
         self._prepare_inputs_fast_path = fast_path
         self._new_extra_inputs = new_extra_inputs
+        self._steady_gen_cache_supported = steady_gen_cache_supported
         self.guided_decoder: CapturableGuidedDecoder | None = None
         self._prepare_inputs_event: torch.cuda.Event | None = None
         # Steady-state generation-only prepare cache (non-speculative overlap
@@ -2190,7 +2192,7 @@ class DecoderInputPreparer:
             and not host.mrope_delta_read_seq_slots
             and not self.use_beam_search
             and self._config.max_beam_width == 1
-            and self._new_extra_inputs is None
+            and self._steady_gen_cache_supported
             and not host.has_cp_helix
             and host.num_ctx_requests == 0
             and not host.extend_requests
