@@ -1956,7 +1956,13 @@ class ModelLoader:
 
         config = checkpoint_loader.load_config(**load_config_kwargs)
 
-        config.modeling_v2_target = modeling_v2_resolve(config, self.llm_args)
+        # Decided here, after `load_config_and_apply_defaults` resolved the
+        # built-in class and applied its model defaults to `llm_args`: a
+        # modeling_v2 target reads the arguments as the engine will run with
+        # them and never overrides those defaults.
+        config = replace(config,
+                         modeling_v2_target=modeling_v2_resolve(
+                             config, self.llm_args))
 
         if uses_mtp_head_checkpoint(self.spec_config):
             # `load_config_and_apply_defaults` already ran this, but against a
