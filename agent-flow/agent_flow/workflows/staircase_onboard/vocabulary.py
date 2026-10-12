@@ -30,10 +30,11 @@ source tells you what that callable is and whether it can be one atomic
 entry.
 
 A ``GAP`` row says *where* its implementation comes from, via the sourcing
-ladder (``TIER_*``): an engine op, an in-tree callable, native torch this
-run composes, or a Triton kernel this run writes. The rungs are ordered by
-cost, and a row that claims a writing tier owes an account of why the
-cheaper ones were rejected.
+ladder (``TIER_*``): an engine op, an in-tree callable, a kernel library the
+engine already depends on (FlashInfer) called directly, native torch this run
+composes, or a Triton kernel this run writes. The rungs are ordered by cost,
+and a row that claims a writing tier owes an account of why the cheaper ones
+were rejected.
 
 Only when **every** rung is exhausted is the verdict a **vocabulary
 ceiling**, and that claim now has to carry its evidence per rung. The
@@ -78,9 +79,21 @@ _VALID_MODES = (MODE_ONBOARD, MODE_VERIFY)
 # to say what it tried at every rung.
 TIER_TRTLLM_OP = 1  # torch.ops.trtllm.* -- an op the engine already exports
 TIER_INTREE_CALLABLE = 2  # tensorrt_llm/_torch/modules/** -- the kernel plane
-TIER_NATIVE_TORCH = 3  # composed from torch ops, written by this run
-TIER_TRITON = 4  # a Triton kernel, written by this run
-_VALID_TIERS = (TIER_TRTLLM_OP, TIER_INTREE_CALLABLE, TIER_NATIVE_TORCH, TIER_TRITON)
+TIER_KERNEL_LIBRARY = 3  # flashinfer.* -- a pinned kernel library, called directly
+TIER_NATIVE_TORCH = 4  # composed from torch ops, written by this run
+TIER_TRITON = 5  # a Triton kernel, written by this run
+_VALID_TIERS = (
+    TIER_TRTLLM_OP,
+    TIER_INTREE_CALLABLE,
+    TIER_KERNEL_LIBRARY,
+    TIER_NATIVE_TORCH,
+    TIER_TRITON,
+)
+
+#: The packages the kernel-library rung may call: kernel libraries the engine
+#: already pins in ``requirements.txt``. The rung reuses a kernel the engine
+#: ships with; it is not a way to add a dependency.
+KERNEL_LIBRARIES: tuple[str, ...] = ("flashinfer",)
 
 #: What each rung means to the agent that has to build it.
 TIER_DESCRIPTION: dict[int, str] = {
@@ -88,6 +101,11 @@ TIER_DESCRIPTION: dict[int, str] = {
     TIER_INTREE_CALLABLE: (
         "a callable already in this repository under tensorrt_llm/_torch/modules/**; "
         "the kernel plane is reused, not rewritten"
+    ),
+    TIER_KERNEL_LIBRARY: (
+        "a kernel from a library the engine already pins (FlashInfer), called through "
+        "its public Python API because no trtllm op wraps it; the kernel is reused, "
+        "not rewritten. The survey lists the installed library's API"
     ),
     TIER_NATIVE_TORCH: (
         "no engine implementation exists, so compose one from torch ops. Correct "
@@ -102,7 +120,7 @@ TIER_DESCRIPTION: dict[int, str] = {
 
 #: A tier above this is work this run *writes* rather than *wraps*, so it
 #: costs an implementation as well as an entry and its test.
-HIGHEST_REUSING_TIER = TIER_INTREE_CALLABLE
+HIGHEST_REUSING_TIER = TIER_KERNEL_LIBRARY
 
 VERDICT_ASSEMBLABLE = "assemblable"
 VERDICT_AFTER_ADDITIONS = "assemblable_after_additions"
@@ -178,7 +196,7 @@ class QueueItem:
     def writes_implementation(self) -> bool:
         """True when this dispatch must *write* the kernel, not wrap one.
 
-        Tiers 1-2 wrap something that exists; 3-4 do not. The difference is
+        Tiers 1-3 wrap something that exists; 4-5 do not. The difference is
         not cosmetic: a writing dispatch owes an implementation as well as a
         contract and a test, is far more likely to need more than one turn,
         and should not be batched against a wrapping dispatch as though the
@@ -270,16 +288,27 @@ def _parse_steps(raw: Any, errors: list[str]) -> tuple[dict[str, Any], ...]:
                 )
             elif tier not in _VALID_TIERS:
                 errors.append(f"steps[{index}].tier is {tier!r}; expected one of {_VALID_TIERS}")
-            # Tiers 1-2 *wrap* something that already exists, so the row has
-            # to name it. Tiers 3-4 *write* it, so there is nothing to name
+            # Tiers 1-3 *wrap* something that already exists, so the row has
+            # to name it. Tiers 4-5 *write* it, so there is nothing to name
             # yet -- but then the row owes an explanation of why the cheaper
             # rungs were rejected, or the ladder becomes a way to skip to
             # writing a kernel without looking for one first.
-            if tier in (TIER_TRTLLM_OP, TIER_INTREE_CALLABLE):
-                if not str(row.get("candidate", "")).strip():
+            candidate = str(row.get("candidate", "")).strip()
+            if tier in (TIER_TRTLLM_OP, TIER_INTREE_CALLABLE, TIER_KERNEL_LIBRARY):
+                if not candidate:
                     errors.append(
                         f"steps[{index}] is GAP at tier {tier} but names no `candidate`; "
-                        f"tiers 1-2 wrap something that already exists, so it must be named"
+                        f"tiers 1-3 wrap something that already exists, so it must be named"
+                    )
+                elif (
+                    tier == TIER_KERNEL_LIBRARY and candidate.split(".")[0] not in KERNEL_LIBRARIES
+                ):
+                    errors.append(
+                        f"steps[{index}] is GAP at tier {tier} with candidate {candidate!r}, "
+                        f"which is not in a kernel library the engine pins "
+                        f"({', '.join(KERNEL_LIBRARIES)}). Name the library callable "
+                        f"(`flashinfer.<module>.<name>`); a trtllm op is tier 1 and an "
+                        f"in-tree callable tier 2"
                     )
             elif tier in (TIER_NATIVE_TORCH, TIER_TRITON):
                 if not str(row.get("tried", "")).strip():
@@ -441,17 +470,19 @@ def parse_vocabulary(
             errors.append(
                 "`ceiling` must carry an `exhausted` mapping with one entry per tier "
                 f"{_VALID_TIERS}, saying what was searched and why that rung failed. "
-                "A ceiling that has not considered tiers 3-4 is a report that nobody "
-                "wrote the kernel yet, which is not the same thing."
+                f"A ceiling that has not considered tier {TIER_KERNEL_LIBRARY} (FlashInfer's "
+                f"API) and tiers {TIER_NATIVE_TORCH}-{TIER_TRITON} is a report that nobody "
+                "looked outside the engine or wrote the kernel yet, which is not the same thing."
             )
         else:
             missing = [t for t in _VALID_TIERS if not str(exhausted.get(t, "")).strip()]
             if missing:
                 errors.append(
                     f"`ceiling.exhausted` says nothing about tier(s) {missing}. "
-                    f"Tiers 3-4 are this run writing the implementation itself; "
-                    f"declaring a ceiling without ruling them out claims more than "
-                    f"was established."
+                    f"Tier {TIER_KERNEL_LIBRARY} is FlashInfer's public API, which the "
+                    f"op inventory cannot see; tiers {TIER_NATIVE_TORCH}-{TIER_TRITON} are "
+                    f"this run writing the implementation itself. Declaring a ceiling "
+                    f"without ruling them out claims more than was established."
                 )
 
     if verdict == VERDICT_CEILING:

@@ -37,10 +37,15 @@ file of the entry" means both.
 1. **Locate the callable.** `.claude/skills/staircase-kernel-feasibility/references/trtllm-ops.md` (the generated inventory,
    with schemas) or, under the run's launch prefix and declared interpreter,
    `agent_flow/workflows/staircase_onboard/tools/list_trtllm_ops.py -f <substr>`.
-   Every listed op is callable as `torch.ops.trtllm.<name>`. Then read the
-   implementation and its Python call path until you can answer: what does one
-   call compute, what state or metadata must exist first, which dtypes and
-   arches does it route.
+   Every listed op is callable as `torch.ops.trtllm.<name>`. A tier-3
+   dispatch names a FlashInfer callable instead (`flashinfer.<module>.<name>`,
+   listed in the workspace's `surface.md`); read its signature and docstring
+   under the run's declared interpreter (`python -c "import inspect,
+   flashinfer.<module> as m; print(inspect.signature(m.<name>)); print(m.<name>.__doc__)"`)
+   and its source in the installed package. Then read the implementation and
+   its Python call path until you can answer: what does one call compute, what
+   state or metadata must exist first, which dtypes, arches and `backend=`
+   choices does it route.
 2. **Fix the boundary, the category and the home.** One entry = one op
    invocation at the Python level; fusion is legal only *inside* that call.
    Categories: `gemm attention moe norm activation quantization comm ssm`,

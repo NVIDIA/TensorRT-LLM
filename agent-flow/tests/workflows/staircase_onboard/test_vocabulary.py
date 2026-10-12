@@ -129,6 +129,46 @@ def test_a_wrapping_dispatch_is_not_marked_as_writing():
     assert parsed.queue[0].writes_implementation is False
 
 
+def _library_doc(candidate):
+    return _doc(
+        verdict=vocab.VERDICT_AFTER_ADDITIONS,
+        steps=[
+            {
+                "step": "gemma_rmsnorm",
+                "state": vocab.STATE_GAP,
+                "tier": vocab.TIER_KERNEL_LIBRARY,
+                "candidate": candidate,
+            }
+        ],
+        queue=[
+            {
+                "n": 1,
+                "mode": vocab.MODE_ONBOARD,
+                "target": "norm/flashinfer_gemma_rmsnorm",
+                "tier": vocab.TIER_KERNEL_LIBRARY,
+            }
+        ],
+    )
+
+
+def test_a_flashinfer_callable_is_a_wrapping_rung_below_native_torch():
+    """A kernel the engine already ships is reused before anyone writes one."""
+    parsed = vocab.parse_vocabulary(_library_doc("flashinfer.norm.gemma_rmsnorm"))
+    item = parsed.queue[0]
+    assert item.writes_implementation is False
+    assert "FlashInfer" in item.tier_brief
+    assert vocab.TIER_INTREE_CALLABLE < vocab.TIER_KERNEL_LIBRARY < vocab.TIER_NATIVE_TORCH
+
+
+@pytest.mark.parametrize(
+    "candidate", ["torch.ops.trtllm.flashinfer_rmsnorm", "some_pip_package.rmsnorm"]
+)
+def test_the_kernel_library_rung_names_a_pinned_library_callable(candidate):
+    """Tier 3 reuses a library the engine pins; it is not a door to a new dependency."""
+    with pytest.raises(vocab.VocabularyError, match="not in a kernel library the engine pins"):
+        vocab.parse_vocabulary(_library_doc(candidate))
+
+
 def test_the_tier_survives_a_round_trip_through_run_state():
     """A resume must not silently demote a writing dispatch to a wrapping one."""
     item = vocab.QueueItem(n=1, mode=vocab.MODE_ONBOARD, target="x", tier=vocab.TIER_TRITON)
@@ -195,8 +235,9 @@ def test_ceiling_with_evidence_parses():
                 "exhausted": {
                     1: "no torch.ops.trtllm candidate",
                     2: "nothing under modules/** computes it",
-                    3: "not expressible in torch ops without a scan",
-                    4: "a Triton kernel needs a spec nobody has",
+                    3: "no flashinfer callable computes it (surface.md, FlashInfer API)",
+                    4: "not expressible in torch ops without a scan",
+                    5: "a Triton kernel needs a spec nobody has",
                 },
             },
         )
@@ -215,7 +256,21 @@ def test_a_ceiling_that_ignores_the_writing_tiers_is_rejected():
             "exhausted": {1: "no trtllm op", 2: "nothing in modules/**"},
         },
     )
-    with pytest.raises(vocab.VocabularyError, match=r"tier\(s\) \[3, 4\]"):
+    with pytest.raises(vocab.VocabularyError, match=r"tier\(s\) \[3, 4, 5\]"):
+        vocab.parse_vocabulary(doc)
+
+
+def test_a_ceiling_must_say_it_searched_flashinfer():
+    """FlashInfer's API is invisible to the op inventory, so a ceiling must name it."""
+    doc = _doc(
+        verdict=vocab.VERDICT_CEILING,
+        ceiling={
+            "step": "exotic_norm",
+            "searched": ["inventory"],
+            "exhausted": {1: "no op", 2: "no callable", 4: "needs a scan", 5: "no spec"},
+        },
+    )
+    with pytest.raises(vocab.VocabularyError, match=r"tier\(s\) \[3\]\. Tier 3 is FlashInfer"):
         vocab.parse_vocabulary(doc)
 
 

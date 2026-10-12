@@ -6,8 +6,10 @@
 # already exist, where did it come from, and what does certifying it require.
 # The first is answered dynamically --- `survey.py` enumerates
 # `torch.ops.trtllm.*` on the real host, because an op's PRESENCE depends on
-# the build (FlashInfer ops register only behind `IS_FLASHINFER_AVAILABLE`).
-# This file answers the other two.
+# the build (FlashInfer ops register only behind `IS_FLASHINFER_AVAILABLE`),
+# and it reads the installed FlashInfer package's public API, because most of
+# FlashInfer's kernels have no trtllm op at all. This file answers the other
+# two.
 #
 # Provenance is not trivia. It decides what an entry's certification has to
 # state: a CuTe DSL kernel is architecture-gated and JIT-compiled, a vendored
@@ -36,6 +38,9 @@
 #     summary:     what this source is, in a sentence or two
 #     registers:   the file(s) where its ops enter `torch.ops.trtllm`
 #     implementation: where the kernel body lives, when that differs
+#     package:     the pip distribution its kernels ship in, for a source that
+#                  is a dependency rather than tree code; pinned in
+#                  `requirements.txt` (one of registers/implementation/package)
 #     claims_files_containing: markers; a `custom_ops/*.py` file no
 #                  `registers` path names, but which contains all of them,
 #                  belongs to this source
@@ -147,6 +152,30 @@ flashinfer:
     code path instead. The tree's own audit rejects version pins for exactly
     this reason.
 
+flashinfer_api:
+  summary: >-
+    FlashInfer's public Python API called directly from a catalog entry, for
+    a kernel no trtllm op wraps. The same library as `flashinfer`, and most
+    of it: the tree wraps a handful of FlashInfer kernels as trtllm ops, and
+    the op inventory cannot see the rest. The survey reads the installed
+    package's API and says which callables the engine already references.
+  package: flashinfer-python
+  tier: 3
+  availability: >-
+    A hard dependency of the wheel, so the package is present wherever the
+    engine is; whether it imports is still an environment property
+    (`IS_FLASHINFER_AVAILABLE`). Many kernels are architecture-gated or JIT
+    compiled on first call into a per-rank workspace, and several take a
+    `backend=` argument that selects a different kernel per architecture.
+  certifying: >-
+    Name the callable by its full path (`flashinfer.<module>.<name>`) in the
+    entry's docstring and the index `impl`, and the backend when the call
+    takes one --- `auto` resolves per architecture, so certify the backend
+    that ran. JIT compilation happens on the first call, so a cell's first
+    measurement includes it; never time the first call. Prefer the trtllm op
+    when one wraps the same kernel: it carries the engine's PDL and workspace
+    handling. Do not pin a FlashInfer version in the entry.
+
 triton_custom_op:
   summary: >-
     Triton kernels written in this tree and registered through
@@ -202,7 +231,7 @@ torch_composed:
     of a stable name and a fake/meta implementation. No custom kernel.
   registers:
     - tensorrt_llm/_torch/custom_ops/torch_custom_ops.py
-  tier: 3
+  tier: 4
   availability: >-
     Always present; nothing gates them.
   certifying: >-

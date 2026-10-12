@@ -20,7 +20,12 @@ Sourcing preference, in order:
 
 1. **Ops exposed by tensorrt_llm as `torch.ops.trtllm.*`** — the default
    catalog entry shape. Almost all constituents resolve here.
-2. **Any other Python-callable atomic surface**, as an approved policy
+2. **FlashInfer's public API** (`flashinfer.<module>.<name>`), when no
+   trtllm op wraps the kernel — the sourcing ladder's tier 3. FlashInfer is a
+   pinned dependency of the engine, so this needs no exception; the surface
+   survey lists the installed API and which callables the engine already
+   calls.
+3. **Any other Python-callable atomic surface**, as an approved policy
    exception, when no torch-op boundary exists. This was required exactly
    once: 1.3.0rc21 registered **no** `torch.ops.trtllm.attention`
    (verified exhaustively against all 252 registered `trtllm::` schemas —
@@ -34,7 +39,7 @@ Sourcing preference, in order:
    `attention/thop_attention`. The trade-off is recorded in its entry:
    it is invisible to torch.compile and is a private API with no stability
    promise.
-3. **torch-native glue** (`split`, `concat`, `reshape`, `expand`, `copy_`,
+4. **torch-native glue** (`split`, `concat`, `reshape`, `expand`, `copy_`,
    `empty`), called directly by the target: native torch calls are not
    catalog entries.
 

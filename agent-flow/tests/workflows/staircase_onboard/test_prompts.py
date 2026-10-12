@@ -266,3 +266,13 @@ def test_every_role_is_told_how_to_write_down_what_it_read():
     ):
         assert "Describe the behaviour and name the symbol — never the line" in role
         assert "quoted diagnostic" in role
+
+
+def test_the_planner_and_its_reviewer_search_flashinfer_before_writing_a_kernel():
+    """FlashInfer kernels no trtllm op wraps are tier 3, not tier 4-5 and not a ceiling."""
+    drafter, reviewer = DEFAULT_PROMPTS.plan_drafter, DEFAULT_PROMPTS.plan_reviewer
+    assert "check the catalog, the op inventory and\nFlashInfer's API" in drafter
+    assert "tier 3 whose `candidate` is\n`flashinfer.<module>.<name>`" in drafter
+    assert "tier: 1 | 2 | 3 | 4 | 5" in drafter
+    assert "the survey's FlashInfer API" in reviewer
+    assert "A writing row that never looked at FlashInfer is a REJECT" in reviewer

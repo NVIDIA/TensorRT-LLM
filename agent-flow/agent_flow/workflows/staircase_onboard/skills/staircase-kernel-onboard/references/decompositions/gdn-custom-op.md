@@ -214,16 +214,16 @@ an adapter whose body is Python-level composition:
 g2 = torch.exp(g.squeeze(0))                                  # log-space -> linear alpha
 q3, k3 = l2norm_fwd(q3), l2norm_fwd(k3)                       # only if use_qk_l2norm_in_kernel
 gathered = gather_cast_vk_to_fp32_vk(state, indices, dtype)   # triton: indexed gather (+cast)
-out, st  = flashinfer.chunk_gated_delta_rule(...)             # EXTERNAL package
+out, st  = flashinfer.chunk_gated_delta_rule(...)             # FlashInfer, tier 3
 cast_scatter_fp32_vk_to_vk(st, state, indices)                # triton: indexed scatter (+cast)
 ```
 
 Its atomic interior is `flashinfer.chunk_gated_delta_rule` — neither a
 `torch.ops.trtllm` op (probed absent, §3) nor a torch callable, but a function
-of an **external pip package**. That is outside all three sourcing tiers in
-`../decomposition.md`. **This needs an owner's ruling before a child is
-dispatched**, and it is the single blocking decision in this decomposition.
-What is reachable, stated plainly:
+of **FlashInfer**, a pinned dependency of the engine. That is the sourcing
+ladder's tier 3 (`../decomposition.md`, "FlashInfer's public API"): the child
+is an `ssm` entry whose `raw_call` calls `flashinfer.chunk_gated_delta_rule`
+directly, and it needs no ruling. What is reachable, stated plainly:
 
 - `flashinfer.chunk_gated_delta_rule` — one call, explicit state, no registry.
   Shaped like a legal entry; sourced from outside tensorrt_llm entirely.
@@ -407,7 +407,7 @@ One entry each, no dependencies between them. Categories proposed, not settled;
 | 2 | `torch.ops.trtllm.causal_conv1d_update` | 1 | decode conv step + conv-state update |
 | 3 | `fuse_elementwise_ops.fused_gdn_post_conv` | 2 | needs tier-2 authorization |
 | 4 | `fused_sigmoid_gating_recurrent.fused_sigmoid_gating_delta_rule_update` | 2 | decode core; must name which branch the receipt certifies (§4.2) |
-| 5 | **prefill delta-rule core** | — | **blocked on the §4.4 sourcing ruling** |
+| 5 | `flashinfer.chunk_gated_delta_rule` | 3 | prefill delta-rule core (§4.4) |
 | 6 | `recurrent_state_cache.reset_recurrent_state_rows` | 2 | |
 | 7 | `fuse_elementwise_ops.extract_transpose_prefill_slice` | 2 | placement question, §4.3 |
 | 8 | `causal_conv1d_triton.causal_conv1d_update` | 2 | MTP only |

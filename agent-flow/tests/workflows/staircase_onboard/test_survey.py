@@ -357,6 +357,59 @@ def test_the_workspace_file_is_unabridged(tmp_path):
     assert "op_199" not in format_surface(read_checkpoint_surface(_dense()), inventory)
 
 
+def _flashinfer_inventory(**overrides):
+    payload = _inventory_payload(
+        flashinfer_api=[
+            "flashinfer.norm.rmsnorm",
+            "flashinfer.norm.gemma_rmsnorm",
+            "flashinfer.gemm.mm_fp4",
+            "flashinfer.fused_moe.trtllm_fp4_block_scale_moe",
+        ],
+        flashinfer_refs={"rmsnorm": ["tensorrt_llm/_torch/custom_ops/flashinfer_custom_ops.py"]},
+        versions={"torch": "2.12", "flashinfer": "0.6.18"},
+    )
+    payload.update(overrides)
+    return parse_inventory(MARKER + json.dumps(payload), arch="sm_103")
+
+
+def test_flashinfer_kernels_no_op_wraps_are_offered_as_the_library_rung():
+    """The op inventory sees only trtllm ops; FlashInfer's own API is most of the library.
+
+    Before this, a FlashInfer kernel no trtllm op wrapped was invisible to the
+    plan, which then wrote the kernel (tier 4-5) or declared a ceiling.
+    """
+    inventory = _flashinfer_inventory()
+    assert inventory.flashinfer_unreferenced == (
+        "flashinfer.norm.gemma_rmsnorm",
+        "flashinfer.gemm.mm_fp4",
+        "flashinfer.fused_moe.trtllm_fp4_block_scale_moe",
+    )
+    block = format_surface(read_checkpoint_surface(_dense()), inventory)
+    assert "FlashInfer 0.6.18: 4 public callables, 3 referenced nowhere in the engine" in block
+    assert "tier 3" in block and "before any ceiling" in block
+    assert "- `flashinfer.gemm`: `mm_fp4`" in block
+    assert "- `flashinfer.norm`: `gemma_rmsnorm`" in block
+    assert "`rmsnorm`" not in block  # the engine already wraps it as a trtllm op
+
+
+def test_the_workspace_file_names_where_the_engine_uses_each_flashinfer_callable(tmp_path):
+    inventory = _flashinfer_inventory()
+    path = write_surface_file(tmp_path / "surface.md", read_checkpoint_surface(_dense()), inventory)
+    text = path.read_text()
+    assert (
+        "- `flashinfer.norm.rmsnorm` — referenced in "
+        "`tensorrt_llm/_torch/custom_ops/flashinfer_custom_ops.py`"
+    ) in text
+    assert "- `flashinfer.gemm.mm_fp4` — referenced nowhere in the engine" in text
+
+
+def test_an_unread_flashinfer_api_is_unmeasured_not_empty():
+    inventory = _flashinfer_inventory(flashinfer_api=[], versions={"flashinfer": "not installed"})
+    block = format_surface(read_checkpoint_surface(_dense()), inventory)
+    assert "FlashInfer's API was not read** (not installed)" in block
+    assert "unmeasured, not empty" in block
+
+
 def test_an_empty_surface_still_renders():
     block = format_surface(CheckpointSurface(architecture="", model_type=""), Inventory())
     assert "Surface survey" in block
@@ -663,6 +716,107 @@ def test_the_probe_declares_the_marker_the_parser_looks_for():
     from agent_flow.workflows.staircase_onboard.survey import MARKER, PROBE_SOURCE
 
     assert MARKER in PROBE_SOURCE
+
+
+# ------------------------------------------------- FlashInfer, read off disk
+
+#: A stand-in FlashInfer install: a re-exporting package, a plain module with
+#: its own helper import, a package-style submodule, and infrastructure.
+_FAKE_FLASHINFER = {
+    "__init__.py": (
+        "from .norm import rmsnorm as rmsnorm\n"
+        "from .autotuner import autotune as autotune\n"
+        "from . import gemm as gemm\n"
+        "try:\n"
+        "    from .quantization.fp4_quantization import fp4_quantize as fp4_quantize\n"
+        "except ImportError:\n"
+        "    pass\n"
+    ),
+    "norm.py": (
+        "from .utils import register_custom_op\n\n"
+        "def rmsnorm(x, w, eps):\n    return x\n\n"
+        "def gemma_rmsnorm(x, w, eps):\n    return x\n\n"
+        "def _private(x):\n    return x\n"
+    ),
+    "gemm/__init__.py": "from .core import mm_fp4 as mm_fp4\n",
+    "gemm/core.py": "def mm_fp4(a, b):\n    return a\n\ndef _tile():\n    return 1\n",
+    "quantization/__init__.py": "",
+    "quantization/fp4_quantization.py": "def fp4_quantize(x):\n    return x\n",
+    "autotuner.py": "def autotune():\n    pass\n",
+    "utils.py": "def register_custom_op(f):\n    return f\n",
+}
+
+
+def _run_probe_with_flashinfer(tmp_path, repo):
+    import subprocess
+    import sys
+
+    from agent_flow.workflows.staircase_onboard.survey import PROBE_SOURCE
+
+    site = tmp_path / "site"
+    for rel, body in _FAKE_FLASHINFER.items():
+        path = site / "flashinfer" / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(body, encoding="utf-8")
+    prefix = f"import sys\nsys.path.insert(0, {str(site)!r})\n"
+    proc = subprocess.run(
+        [sys.executable, "-c", prefix + PROBE_SOURCE, str(repo), "sm_103"],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    return parse_inventory(proc.stdout + proc.stderr, arch="sm_103")
+
+
+def test_the_probe_reads_flashinfers_public_api_without_importing_it(tmp_path):
+    """No torch, no GPU: the package's files say what it offers."""
+    repo = _fake_repo(tmp_path, [("norm/x.py", "torch.ops.trtllm.x", _INLINE_PASS)])
+    inventory = _run_probe_with_flashinfer(tmp_path, repo)
+
+    assert inventory.flashinfer_api == (
+        "flashinfer.gemm.mm_fp4",
+        "flashinfer.norm.gemma_rmsnorm",
+        "flashinfer.norm.rmsnorm",
+        "flashinfer.quantization.fp4_quantization.fp4_quantize",
+    )
+    # Infrastructure, private names and a module's own helper imports are not API.
+    assert not any(
+        "autotune" in p or "_private" in p or "_tile" in p for p in inventory.flashinfer_api
+    )
+    assert "flashinfer.norm.register_custom_op" not in inventory.flashinfer_api
+
+
+def test_the_probe_records_which_flashinfer_callables_the_engine_already_calls(tmp_path):
+    repo = _fake_repo(tmp_path, [("norm/x.py", "torch.ops.trtllm.x", _INLINE_PASS)])
+    custom_ops = repo / "tensorrt_llm/_torch/custom_ops"
+    custom_ops.mkdir(parents=True)
+    (custom_ops / "flashinfer_custom_ops.py").write_text(
+        "import flashinfer\n\ndef op(x, w):\n    return flashinfer.norm.rmsnorm(x, w, 1e-6)\n",
+        encoding="utf-8",
+    )
+    (repo / "tensorrt_llm/_torch/modules/gemm.py").write_text(
+        "from flashinfer.gemm import mm_fp4\n", encoding="utf-8"
+    )
+    inventory = _run_probe_with_flashinfer(tmp_path, repo)
+
+    assert inventory.flashinfer_refs["rmsnorm"] == (
+        "tensorrt_llm/_torch/custom_ops/flashinfer_custom_ops.py",
+    )
+    assert inventory.flashinfer_refs["mm_fp4"] == ("tensorrt_llm/_torch/modules/gemm.py",)
+    assert inventory.flashinfer_unreferenced == (
+        "flashinfer.norm.gemma_rmsnorm",
+        "flashinfer.quantization.fp4_quantization.fp4_quantize",
+    )
+
+
+def test_an_entry_calling_flashinfer_directly_reports_that_callable_as_its_impl(tmp_path):
+    repo = _fake_repo(
+        tmp_path,
+        [],
+        model_ops=[("fam/tgt", "norm/gemma.py", "flashinfer.norm.gemma_rmsnorm", _INLINE_PASS)],
+    )
+    inventory = _run_probe(repo)
+    assert inventory.catalog[0].impl == "flashinfer.norm.gemma_rmsnorm"
 
 
 # ------------------------------------------------- how the op plane is enumerated

@@ -53,7 +53,12 @@ INDEX_PATH = Path(__file__).parent / "runtime_index.yaml"
 KERNEL_SOURCES_PATH = Path(__file__).parent / "kernel_sources.yaml"
 
 KERNEL_SOURCE_REQUIRED: tuple[str, ...] = ("summary", "tier", "availability", "certifying")
-KERNEL_SOURCE_OPTIONAL: tuple[str, ...] = ("registers", "implementation", "claims_files_containing")
+KERNEL_SOURCE_OPTIONAL: tuple[str, ...] = (
+    "registers",
+    "implementation",
+    "claims_files_containing",
+    "package",
+)
 
 #: Areas every run needs regardless of what the checkpoint declares. A target
 #: always sits somewhere in the parallel topology and is always captured or
@@ -220,6 +225,9 @@ class KernelSource:
     #: source whose files carry no naming convention, so a tree that adds one
     #: does not need this registry edited to classify it.
     claims_files_containing: tuple[str, ...] = ()
+    #: The pip distribution the kernels ship in, for a source that is a
+    #: dependency rather than tree code; it is pinned in ``requirements.txt``.
+    package: str = ""
 
     @property
     def pointers(self) -> tuple[str, ...]:
@@ -241,6 +249,8 @@ class KernelSource:
         if self.claims_files_containing:
             markers = " and ".join(f"`{m}`" for m in self.claims_files_containing)
             lines.append(f"- **also any `custom_ops/*.py` containing**: {markers}")
+        if self.package:
+            lines.append(f"- **package**: `{self.package}`, pinned in `requirements.txt`")
         lines.append(f"- **availability**: {' '.join(self.availability.split())}")
         lines.append(f"- **certifying one**: {' '.join(self.certifying.split())}")
         return "\n".join(lines)
@@ -264,8 +274,10 @@ def load_kernel_sources(path: str | Path = KERNEL_SOURCES_PATH) -> dict[str, Ker
         for required in KERNEL_SOURCE_REQUIRED:
             if entry.get(required) in (None, "", []):
                 errors.append(f"{name}: missing required field '{required}'")
-        if not entry.get("registers") and not entry.get("implementation"):
-            errors.append(f"{name}: needs at least one of 'registers' or 'implementation'")
+        if not any(entry.get(key) for key in ("registers", "implementation", "package")):
+            errors.append(
+                f"{name}: needs at least one of 'registers', 'implementation' or 'package'"
+            )
         markers = entry.get("claims_files_containing", [])
         if not isinstance(markers, list) or not all(isinstance(m, str) and m for m in markers):
             errors.append(f"{name}: 'claims_files_containing' must be a list of non-empty strings")
@@ -279,6 +291,7 @@ def load_kernel_sources(path: str | Path = KERNEL_SOURCES_PATH) -> dict[str, Ker
             registers=tuple(str(p) for p in entry.get("registers", ())),
             implementation=tuple(str(p) for p in entry.get("implementation", ())),
             claims_files_containing=tuple(markers),
+            package=str(entry.get("package", "") or ""),
         )
     if errors:
         raise RuntimeIndexError(f"{path} is malformed:\n  - " + "\n  - ".join(errors))
@@ -331,6 +344,10 @@ def format_kernel_sources(sources: "Mapping[str, KernelSource]") -> str:
         "Both registration planes land in the same `torch.ops.trtllm` namespace, "
         "so the namespace alone tells you nothing about provenance. An op found "
         "in no `custom_ops/*.py` file is almost certainly registered from C++.",
+        "",
+        "Not every kernel the engine ships is a `torch.ops.trtllm` op: FlashInfer's "
+        "public API (`flashinfer_api` below) holds kernels no trtllm op wraps, and "
+        "the survey lists them separately.",
         "",
     ]
     lines.extend(source.render() + "\n" for source in sources.values())

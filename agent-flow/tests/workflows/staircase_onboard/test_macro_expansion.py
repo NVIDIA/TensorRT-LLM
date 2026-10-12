@@ -219,8 +219,22 @@ def test_a_writing_dispatch_is_told_it_is_writing(tmp_path):
     prompt = workflow._smith_prompt(
         QueueItem(n=1, mode="onboard", target="exotic_norm", tier=TIER_TRITON)
     )
-    assert "tier 4" in prompt
+    assert f"tier {TIER_TRITON}" in prompt
     assert "you are writing it, not wrapping one" in prompt
+
+
+def test_a_flashinfer_dispatch_is_told_to_call_the_library_directly(tmp_path):
+    """Tier 3 wraps a kernel the engine ships, through FlashInfer's own API."""
+    from agent_flow.workflows.staircase_onboard.vocabulary import TIER_KERNEL_LIBRARY
+
+    workflow = _workflow(tmp_path, features=[])
+    workflow.task_data.update({"trtllm_repo_path": "/repo", "arch": "sm_103"})
+    prompt = workflow._smith_prompt(
+        QueueItem(n=1, mode="onboard", target="norm/gemma_rmsnorm", tier=TIER_KERNEL_LIBRARY)
+    )
+    assert f"tier {TIER_KERNEL_LIBRARY}" in prompt and "FlashInfer" in prompt
+    assert "`raw_call` calls the FlashInfer callable directly" in prompt
+    assert "you are writing it" not in prompt
 
 
 def test_a_wrapping_dispatch_is_not_told_to_write(tmp_path):

@@ -9,7 +9,7 @@ the starting point differs.
 
 One entry = one op invocation at the Python level.
 
-- The wrapper body makes exactly one kernel-launching call into trtllm. Fusion is legal only inside that call: a fused kernel invoked once (silu-and-mul, allreduce+residual+rmsnorm) is one compliant entry.
+- The wrapper body makes exactly one kernel-launching call into trtllm — or, at sourcing tier 3, into FlashInfer's public API. Fusion is legal only inside that call: a fused kernel invoked once (silu-and-mul, allreduce+residual+rmsnorm) is one compliant entry.
 - Python-level composition is forbidden. A wrapper that chains split → norm → matmul, or bundles qkv-proj + RoPE + SDPA + o-proj into one function, is not an entry — it hides exactly the bugs the catalog exists to expose.
 - If inspection shows the requested op cannot be wrapped as one such call — its body is Python-level composition — it is a macro. Onboard nothing (no entry files, no index change); produce a decomposition report at `references/decompositions/<op>.md` instead, following the checklist in `references/decomposition.md`, "Writing a decomposition report for a new macro". Never onboard two entries in one run. <!-- PORT: verify — report location; see the marker in this skill's SKILL.md, "The macro path". -->
 
@@ -88,8 +88,8 @@ class <Name>(OpWrapper):
         ...
 ```
 
-- **`raw_call`: exactly one trtllm op invocation, and it reads nothing off
-  `self`.** Glue that launches no kernel is acceptable; tensor math is not. A
+- **`raw_call`: exactly one op invocation — a `torch.ops.trtllm.*` op, or at
+  tier 3 one FlashInfer public callable — and it reads nothing off `self`.** Glue that launches no kernel is acceptable; tensor math is not. A
   gate in `tests/unittest/_torch/modeling_v2/test_modeling_v2_claims.py`
   fails on any `self.` read inside it: the binding layer (`bind_const`,
   `bind_layered`) merges bound values in `__call__` before `raw_call` runs, so
@@ -114,10 +114,21 @@ class <Name>(OpWrapper):
   accumulation order a wider band accounts for, and what was measured.
   `assert_within_ulp` in `_op.py` is the gate for a reference that differs
   only in accumulation order.
-- The default vocabulary is `torch.ops.trtllm.*`. Wrapping any other Python
-  callable (a pybind binding, say) is allowed only when the run's request
-  explicitly authorizes it; record the import path in the class docstring and
-  the index `impl` field.
+- The default vocabulary is `torch.ops.trtllm.*`. **FlashInfer's public API
+  is the second**, and needs no authorization: `flashinfer-python` is pinned in
+  the engine's `requirements.txt`, and most of its kernels have no trtllm op.
+  Call it as `flashinfer.<module>.<name>(...)` with a module-scope
+  `import flashinfer` (the catalog package imports nothing, so only a target
+  that uses the entry pays for it), name that full path in the class docstring
+  and the index `impl` field, and pass `backend=` explicitly when the callable
+  takes one: `auto` resolves per architecture, so the cells certify the backend
+  that ran, and the `note` says which. FlashInfer JIT-compiles many kernels on
+  the first call; the test's first call includes it. When a trtllm op wraps the
+  same kernel, wrap the op instead — it carries the engine's PDL and workspace
+  handling.
+- Wrapping any other Python callable (a pybind binding, say) is allowed only
+  when the run's request explicitly authorizes it; record the import path in
+  the class docstring and the index `impl` field.
 - If the device's architecture is not yet an `Arch` member, add it to
   `catalog/_op.py` in a commit of its own containing only that line — every
   entry's `ARCHS` is checked against that enum — and say so in your report.

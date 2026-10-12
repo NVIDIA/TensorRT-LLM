@@ -129,6 +129,7 @@ from .task_schema import (
 )
 from .vocabulary import (
     MODE_VERIFY,
+    TIER_KERNEL_LIBRARY,
     UNIT_CORE,
     QueueItem,
     VocabularyError,
@@ -1050,7 +1051,9 @@ class StaircaseOnboardWorkflow:
             f"{len(surface.unrecognized)} unrecognized key(s); "
             + (
                 f"{len(inventory.spendable)}/{len(inventory.catalog)} entries certified on "
-                f"{inventory.arch}, {len(inventory.unwrapped_ops)} unwrapped op(s)"
+                f"{inventory.arch}, {len(inventory.unwrapped_ops)} unwrapped op(s), "
+                f"{len(inventory.flashinfer_unreferenced)} FlashInfer callable(s) the engine "
+                f"does not call"
                 if inventory.ok
                 else f"inventory probe failed: {inventory.error.splitlines()[0]}"
             )
@@ -3299,16 +3302,23 @@ class StaircaseOnboardWorkflow:
         # Directly under the dispatch line, because it changes what the turn
         # is for: finish what the last attempt started, not begin again.
         retry = f"\n{note}\n" if note else ""
-        # Tiers 1-2 wrap something that exists; 3-4 mean this dispatch writes
+        # Tiers 1-3 wrap something that exists; 4-5 mean this dispatch writes
         # the implementation. Saying which changes what the turn is for.
-        tier = f"Sourcing: **{item.tier_brief}**.\n" + (
-            "This entry has no implementation yet — you are writing it, not "
-            "wrapping one. Correct-and-slow is acceptable; the tuning phase "
-            "replaces it. Say in the contract what you rejected at the cheaper "
-            "rungs.\n"
-            if item.writes_implementation
-            else ""
-        )
+        tier = f"Sourcing: **{item.tier_brief}**.\n"
+        if item.writes_implementation:
+            tier += (
+                "This entry has no implementation yet — you are writing it, not "
+                "wrapping one. Correct-and-slow is acceptable; the tuning phase "
+                "replaces it. Say in the contract what you rejected at the cheaper "
+                "rungs.\n"
+            )
+        elif item.tier == TIER_KERNEL_LIBRARY:
+            tier += (
+                "`raw_call` calls the FlashInfer callable directly — no trtllm op "
+                "wraps it. The FlashInfer API the survey found is in `surface.md` in "
+                "the workspace; certify it as the kernel source `flashinfer_api` "
+                "below says.\n"
+            )
         # Device assignment, because the launch protocol hands EVERY role the
         # same line -- `CUDA_VISIBLE_DEVICES=0  # you own device(s) 0..0` --
         # and then warns that concurrent scripts on one device contend. At the

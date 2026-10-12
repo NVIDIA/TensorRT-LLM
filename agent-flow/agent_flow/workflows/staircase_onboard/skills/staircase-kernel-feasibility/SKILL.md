@@ -64,10 +64,22 @@ and its test move, and the cells are driven again here.
 
 ### 3. Ceiling check
 
-For every GAP row, look for a candidate in `references/trtllm-ops.md`. **No
-candidate is the vocabulary ceiling** —
+For every GAP row, look for a candidate in `references/trtllm-ops.md`, then in
+the FlashInfer API the surface survey lists (`surface.md`, section "FlashInfer
+API"). **No candidate in either is the vocabulary ceiling** —
 
-**except that the inventory cannot see pybind bindings, and one of the most
+**except that neither list is the whole engine.** FlashInfer is a pinned
+dependency of the engine, and the tree wraps only a handful of its kernels as
+trtllm ops; the rest — fp4 GEMMs, fused MoE runners, sampling, rope variants,
+paged-KV helpers — have no `torch.ops.trtllm` name, so the op inventory
+cannot see them. A step one of them computes is a **GAP at tier 3**: the entry's
+`raw_call` calls `flashinfer.<module>.<name>` directly, and the row names that
+path as its `candidate`. It is a wrapper and its cells, not an implementation,
+so it comes before native torch (tier 4) and Triton (tier 5). Prefer a trtllm op
+when one wraps the same kernel; the survey says which callables the engine
+already references, and where.
+
+**And the inventory cannot see pybind bindings either, and one of the most
 capable entries in the catalog is one.** `references/trtllm-ops.md` is generated
 from the torch schema registry, so it lists `torch.ops.*` only.
 `attention/thop_attention` wraps `tensorrt_llm.bindings.internal.thop.attention`,
@@ -95,11 +107,12 @@ only when all three hold —
 
 1. it is **exactly one torch callable**, not a computation assembled from
    several;
-2. **no trtllm op serves it**, established by a search closed over the inventory
+2. **no trtllm op and no FlashInfer callable serves it**, established by a
+   search closed over the inventory, the survey's FlashInfer API
    *and* the pybind surface the inventory cannot show;
 3. upstream owns its correctness, which is what lets it carry no cells.
 
-A computation composed from several torch calls is tier 3 — an entry this run
+A computation composed from several torch calls is tier 4 — an entry this run
 writes, with cells — and reaching for plain torch while a trtllm op exists is
 still wrong: the catalog prefers the engine's kernels.
 
@@ -121,7 +134,10 @@ steps:                                  # every computation step, both chapters
     state: OK | CERT | GAP
     entry: catalog/<category>/<name>.py                     # OK and CERT rows
     contract_line: "<the cell why, note line or is_valid assertion that decides coverage>"
-    candidate: torch.ops.trtllm.<name>                      # GAP rows
+    tier: 1 | 2 | 3 | 4 | 5                                 # GAP rows: the sourcing rung
+    candidate: torch.ops.trtllm.<name>                      # GAP rows at tiers 1-3: tier 1 an op,
+                                                            # 2 an in-tree callable, 3 flashinfer.<module>.<name>
+    tried: "<what tiers 1-3 offered and why it was rejected>"  # GAP rows at tiers 4-5
 
 queue:                                  # one dispatch per entry, in dependency order
   - {n: 1, mode: onboard, target: <category>/<name>, depends_on: []}      # shared catalog
@@ -147,7 +163,8 @@ error rather than one per round-trip:
 | `verdict` is exactly one of `assemblable` / `assemblable_after_additions` / `ceiling` | it is the headline, and the orchestrator branches on it |
 | every `steps` row names a non-empty `step` and a `state` of `OK` / `CERT` / `GAP` | a row with no state is not a mapping |
 | an `OK` or `CERT` row names an `entry` **and** quotes a `contract_line` — the cell `why`, `note` line or `is_valid` assertion that decides it | the quoted line is the evidence for the judgement; without it nobody can audit the row without redoing the reading |
-| a `GAP` row names a `candidate` | a GAP with no candidate anywhere *is* the ceiling — say so in `ceiling` rather than leaving the row bare |
+| a `GAP` row names its `tier`; at tiers 1-3 a `candidate`, at tier 3 one in FlashInfer; at tiers 4-5 what it `tried` | a GAP with no candidate anywhere *is* the ceiling — say so in `ceiling` rather than leaving the row bare; a writing tier owes the search that rejected the reusing ones |
+| a `ceiling` carries `exhausted`, one entry per tier 1-5 | "no trtllm op" is a fact about tier 1; tier 3 is FlashInfer's API, which the op inventory cannot see |
 | `queue[].n` is an integer and unique across the queue | it is the dispatch's identity and what `depends_on` points at |
 | `queue[].mode` is `onboard` or `verify` | it selects the skill smith loads |
 | `queue[].target` names exactly one catalog entry | one dispatch, one entry |

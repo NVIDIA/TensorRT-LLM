@@ -98,7 +98,11 @@ while the assembler discovers the gap mid-run. Walk the segment separately:
 what the topology partitions, what must be reduced or gathered to put it back
 together, and whether entries for that exist.
 
-**Before writing "ceiling", check the catalog as well as the op inventory.**
+**Before writing "ceiling", check the catalog, the op inventory and
+FlashInfer's API.** The tree wraps only a handful of FlashInfer kernels as
+trtllm ops; the surface survey lists the rest of the installed library, and a
+step one of them computes is a `GAP` at tier 3 whose `candidate` is
+`flashinfer.<module>.<name>` — a wrapper and its cells, not a kernel to write.
 The generated inventory lists `torch.ops.*` only, so an op served by a pybind
 binding comes back correctly empty and is wrongly read as a ceiling —
 `attention/thop_attention` is exactly that, and this has cost a feature once:
@@ -116,7 +120,7 @@ never carry a ceiling and never a `GAP` on its own, and a plan drafted over
 one says out loud that it was drafted without a measurement.
 
 A computation kernel that genuinely has no server anywhere — no catalog entry,
-no op, no binding — **is** the ceiling. Say so, with the evidence and what you
+no op, no FlashInfer callable, no binding — **is** the ceiling. Say so, with the evidence and what you
 searched, and the run stops. Do not compose the op out of smaller pieces: math
 assembled from several native torch calls is always a vocabulary gap, never a
 substitute for an entry.
@@ -185,7 +189,9 @@ steps:
             entry: catalog/<category>/<name>.py     # OK and CERT rows; this target's own
                                             # op: ops/<category>/<name>.py
         contract_line: "<the cell (why + spec) or note sentence that decides coverage>"
-    candidate: torch.ops.trtllm.<name>      # GAP rows
+    tier: 1 | 2 | 3 | 4 | 5                 # GAP rows: the sourcing rung
+    candidate: torch.ops.trtllm.<name>      # GAP rows at tiers 1-3 (tier 3: flashinfer.<module>.<name>)
+    tried: "<why tiers 1-3 do not serve it>"  # GAP rows at tiers 4-5
     call_sites:                             # where the target calls the entry
             - {{site: "<Target.method, which step>", row_multiple: 1}}
       - {{site: "<...>", row_multiple: 6, gathered: true, row_width: 512}}
@@ -204,7 +210,9 @@ Rules the schema enforces, so get them right the first time:
 - an `OK`/`CERT` row quotes the `contract_line` that decides it — that line is
   the evidence, and without it nobody can audit the judgement without redoing
   the reading
-- a `GAP` row names a `candidate`, or the verdict is `ceiling`
+- a `GAP` row names its `tier` and, at tiers 1-3, a `candidate` (tier 3: a
+  `flashinfer.` callable); at tiers 4-5 it says what it `tried`. Otherwise the
+  verdict is `ceiling`, and its `exhausted` mapping has one entry per tier 1-5
 - a `verify` dispatch names the `surface` — the value and the contract line
   that excludes it are what smith is dispatched with, so vagueness here costs
   a whole run
@@ -257,7 +265,8 @@ what you wrote in **both** files and the counts by state, and a `decision`:
 | Impulse | Reality |
 |---|---|
 | "This row is unclear, dispatch smith and let them figure it out" | Read the contract again. Judging coverage is reading a contract, and that is your job, not smith's. |
-| "No op in the inventory, so it's a ceiling" | The inventory cannot see pybind bindings. Check the catalog too. A wrong ceiling costs a feature; a wrong verify costs one dispatch. |
+| "No op in the inventory, so it's a ceiling" | The inventory cannot see FlashInfer's API or pybind bindings. Check the survey's FlashInfer list and the catalog too. A wrong ceiling costs a feature; a wrong verify costs one dispatch. |
+| "FlashInfer has it but no trtllm op wraps it, so I'll write a Triton kernel" | That is tier 3: the entry calls `flashinfer.<module>.<name>` directly. Writing a kernel the engine already ships is tier 5 for no reason. |
 | "I can compose this op from a few torch calls" | An op's math assembled from torch calls is always a vocabulary gap. Native torch is glue: layout, movement, allocation, lookup. |
 | "Prefill and decode run the same steps, so one mapping covers both" | Each target binds and calls its own entries. Mark each step's phase; a step only prefill runs is never decode's to certify, and a decode-only call site is the captured one. |
 | "The anchor is probably around X" | Anchors come from a written source or from the user. Never invented. |

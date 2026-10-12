@@ -38,8 +38,9 @@ pre-merge, so its cells are re-proved on every commit.
 | shared entry exists, a cell covers this checkpoint's values, `ARCHS` names this run's arch | **OK** | still goes to chapter 1 — `staircase-kernel-verify` confirms it cheaply, no GPU |
 | shared entry exists, some value falls outside every cell | **CERT** | `staircase-kernel-verify`, with the value and the cell or `note` line that excludes it |
 | another target keeps the op in its own `ops/` | **GAP** (promotion) | `staircase-kernel-onboard`, target `<category>/<name>`, naming the existing entry in `note` — it and its test move to the shared catalog and the cells are driven again |
-| no entry, but `references/trtllm-ops.md` has a candidate callable | **GAP** | `staircase-kernel-onboard`, with the candidate and the step it serves; target `ops/<category>/<name>` when only this target calls it |
-| no entry and no candidate | **ceiling** | nothing — the run ends here. **First rule out a pybind binding**: the inventory is generated from the torch schema registry and lists `torch.ops.*` only, so a step served by a binding (`thop_attention` is one) searches empty and reads as a ceiling. Check the catalog's existing entries and their *uncertified* surfaces before concluding |
+| no entry, but `references/trtllm-ops.md` has a candidate callable | **GAP** (tier 1) | `staircase-kernel-onboard`, with the candidate and the step it serves; target `ops/<category>/<name>` when only this target calls it |
+| no entry and no trtllm op, but a FlashInfer public callable computes the step (`surface.md`, "FlashInfer API") | **GAP** (tier 3) | `staircase-kernel-onboard`, candidate `flashinfer.<module>.<name>`: the entry's `raw_call` calls it directly. FlashInfer is a pinned dependency; most of its kernels have no trtllm op, so the op inventory cannot see them |
+| no entry and no candidate | **ceiling** | nothing — the run ends here. **First rule out FlashInfer's API and a pybind binding**: the inventory is generated from the torch schema registry and lists `torch.ops.*` only, so a step served by a binding (`thop_attention` is one) searches empty and reads as a ceiling. Check the catalog's existing entries and their *uncertified* surfaces before concluding |
 
 One more case that dispatches nobody: **a step plain torch serves**. Native
 torch calls are not entries — tensor layout, movement, allocation, lookup
@@ -47,12 +48,13 @@ torch calls are not entries — tensor layout, movement, allocation, lookup
 target calls torch directly; assembler writes those itself. It is glue by
 default: a computation the HF reference expresses as a named module is never
 *composed* from torch calls in the target, and a missing kernel there is a GAP
-(tier 3 or 4: an entry this run writes) or a ceiling.
+(tier 4 or 5: an entry this run writes) or a ceiling.
 
 **The one exception**, narrow by design: a computation may be a direct torch
-call when it is **exactly one torch callable**, **no trtllm op serves it**
-(searched closed over the inventory *and* the pybind surface the inventory
-cannot show), and upstream owns its correctness. Such a step is neither GAP nor
+call when it is **exactly one torch callable**, **no trtllm op and no FlashInfer
+callable serves it** (searched closed over the inventory, the survey's FlashInfer
+API *and* the pybind surface the inventory cannot show), and upstream owns its
+correctness. Such a step is neither GAP nor
 ceiling, and not a `steps` row — list it in the plan as a direct torch call,
 with the search that closed it.
 

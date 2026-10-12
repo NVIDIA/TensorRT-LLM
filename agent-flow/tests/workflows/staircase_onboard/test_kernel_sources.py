@@ -23,6 +23,11 @@ from agent_flow.workflows.staircase_onboard.runtime import (
     load_kernel_sources,
     source_for_stem,
 )
+from agent_flow.workflows.staircase_onboard.vocabulary import (
+    _VALID_TIERS,
+    KERNEL_LIBRARIES,
+    TIER_KERNEL_LIBRARY,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
 CUSTOM_OPS = REPO_ROOT / "tensorrt_llm/_torch/custom_ops"
@@ -44,10 +49,10 @@ def sources():
 def test_every_source_declares_what_certifying_one_requires(sources):
     """Provenance decides the shape of a receipt; that is the point of the file."""
     for source in sources.values():
-        assert source.tier in (1, 2, 3, 4), f"{source.name}: tier={source.tier}"
+        assert source.tier in _VALID_TIERS, f"{source.name}: tier={source.tier}"
         assert len(source.availability.split()) >= 5, f"{source.name}: availability too thin"
         assert len(source.certifying.split()) >= 5, f"{source.name}: certifying too thin"
-        assert source.pointers, f"{source.name}: points nowhere"
+        assert source.pointers or source.package, f"{source.name}: points nowhere"
 
 
 @in_checkout
@@ -194,6 +199,51 @@ def test_flashinfer_is_marked_as_the_conditional_one(sources):
     availability = sources["flashinfer"].availability
     assert "IS_FLASHINFER_AVAILABLE" in availability
     assert "version" in sources["flashinfer"].certifying  # no version pins
+
+
+def test_flashinfer_has_a_direct_api_source_on_the_library_rung(sources):
+    """FlashInfer kernels no trtllm op wraps are a source of their own.
+
+    Without it the only FlashInfer source was the trtllm-wrapped one, so a
+    smith had no provenance to name for `flashinfer.<module>.<name>` and the
+    library's unwrapped kernels read as nothing the engine supplies.
+    """
+    source = sources["flashinfer_api"]
+    assert source.tier == TIER_KERNEL_LIBRARY
+    assert source.package == "flashinfer-python"
+    assert "backend" in source.certifying and "version" in source.certifying
+    assert "`flashinfer-python`, pinned in `requirements.txt`" in source.render()
+    assert {s.package.split("-")[0] for s in sources.values() if s.package} <= set(KERNEL_LIBRARIES)
+
+
+@in_checkout
+def test_every_package_source_is_pinned_by_the_engine(sources):
+    """The library rung reuses what the engine ships; it never adds a dependency."""
+    requirements = (REPO_ROOT / "requirements.txt").read_text(encoding="utf-8")
+    pinned = {
+        re.split(r"[=<>~!\[; ]", line.strip(), maxsplit=1)[0].lower()
+        for line in requirements.splitlines()
+        if line.strip() and not line.lstrip().startswith(("#", "-"))
+    }
+    unpinned = [s.name for s in sources.values() if s.package and s.package.lower() not in pinned]
+    assert not unpinned, f"package sources the engine does not depend on: {unpinned}"
+
+
+def test_schema_accepts_a_package_in_place_of_tree_paths(tmp_path):
+    good = tmp_path / "k.yaml"
+    good.write_text(
+        "lib:\n  summary: s\n  tier: 3\n  availability: a b c d e\n  certifying: a b c d e\n"
+        "  package: some-lib\n",
+        encoding="utf-8",
+    )
+    assert load_kernel_sources(good)["lib"].package == "some-lib"
+    bad = tmp_path / "bad.yaml"
+    bad.write_text(
+        "lib:\n  summary: s\n  tier: 3\n  availability: a b c d e\n  certifying: a b c d e\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(RuntimeIndexError, match="'registers', 'implementation' or 'package'"):
+        load_kernel_sources(bad)
 
 
 def test_vendored_triton_is_outside_the_op_plane(sources):

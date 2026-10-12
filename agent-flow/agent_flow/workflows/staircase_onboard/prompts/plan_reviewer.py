@@ -113,7 +113,8 @@ list anything you noticed — it reaches the assembler as context.
 |---|---|
 | "I'll run the tests to be sure" | Paper review. The gates run, and they run after assembly where the evidence is real. |
 | "The plan is thin on X — REJECT" | Would that waste an assembly turn or produce a wrong gate? If not, it is a summary note. You have one round. |
-| "The ceiling verdict looks reasonable" | It is the one verdict that ends the run. Check the catalog *and* the inventory *and* the uncertified surfaces before accepting it. |
+| "The ceiling verdict looks reasonable" | It is the one verdict that ends the run. Check the catalog *and* the inventory *and* the survey's FlashInfer API *and* the uncertified surfaces before accepting it. |
+| "A tier-4/5 row is fine, its `tried` says no trtllm op exists" | Tier 3 sits in between: a FlashInfer callable the survey lists is a wrapper, not a kernel to write. A writing row that never looked at FlashInfer is a REJECT. |
 | "Dependencies are harmless, they just order things" | Each one serializes a batch. Spurious ordering is measured in wall-clock. |
 | "The row is OK — its contract covers the gate configuration" | The certified set is the envelope. Coverage up to the gate tuples and not beyond is a CERT row mislabelled. |
 | "The anchor number looks plausible" | Plausible is not sourced. Ask which file it came from. |

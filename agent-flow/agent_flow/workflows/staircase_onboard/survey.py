@@ -764,6 +764,11 @@ class Inventory:
     op_sources: dict[str, str] = field(default_factory=dict)
     versions: dict[str, str] = field(default_factory=dict)
     error: str = ""
+    #: FlashInfer's public callables, ``flashinfer.<module>.<name>``, read off
+    #: the installed package's files. Empty when it is not installed.
+    flashinfer_api: tuple[str, ...] = ()
+    #: callable name -> the engine files that reference it.
+    flashinfer_refs: dict[str, tuple[str, ...]] = field(default_factory=dict)
 
     @property
     def ok(self) -> bool:
@@ -816,6 +821,20 @@ class Inventory:
         """
         wrapped = {e.impl.rsplit(".", 1)[-1] for e in self.catalog if e.impl}
         return tuple(op for op in self.trtllm_ops if op not in wrapped)
+
+    @property
+    def flashinfer_unreferenced(self) -> tuple[str, ...]:
+        """FlashInfer callables the engine references nowhere.
+
+        This is the tier-3 rung made concrete: no trtllm op, catalog entry or
+        module calls them, so the op inventory cannot see them, and a demand
+        one of them answers costs a wrapper and its cells, not a kernel.
+        """
+        return tuple(
+            path
+            for path in self.flashinfer_api
+            if path.rsplit(".", 1)[-1] not in self.flashinfer_refs
+        )
 
 
 #: Runs on the host, inside the run's own interpreter. Kept as a string
@@ -970,10 +989,15 @@ def entry_certification(py_path):
                     ):
                         cells += 1
     # The op `raw_call` makes, not the first op the file mentions: an entry's
-    # docstring and reference routinely name its neighbours.
-    match = re.search(r"torch\.ops\.trtllm\.([A-Za-z0-9_]+)", call) or re.search(
-        r"torch\.ops\.trtllm\.([A-Za-z0-9_]+)", text
-    )
+    # docstring and reference routinely name its neighbours. A tier-3 entry
+    # calls a FlashInfer callable instead of a trtllm op.
+    match = re.search(r"torch\.ops\.trtllm\.([A-Za-z0-9_]+)", call)
+    if match:
+        return sorted(archs), cells, "torch.ops.trtllm." + match.group(1)
+    library = re.search(r"\b(flashinfer(?:\.[A-Za-z_][A-Za-z0-9_]*)+)\s*\(", call)
+    if library:
+        return sorted(archs), cells, library.group(1)
+    match = re.search(r"torch\.ops\.trtllm\.([A-Za-z0-9_]+)", text)
     return sorted(archs), cells, ("torch.ops.trtllm." + match.group(1)) if match else ""
 
 catalog = repo / "tensorrt_llm/_torch/_experimental/modeling_v2/catalog"
@@ -1051,6 +1075,138 @@ for py in sorted(modules_dir.rglob("*.py")):
             out["modules"].append("%s.%s" % (rel, node.name))
 out["modules"] = sorted(set(out["modules"]))
 
+# FlashInfer's public API. The engine wraps a handful of FlashInfer kernels as
+# trtllm ops; the op plane above sees those and nothing else, so the rest of
+# the library -- most of it -- read as kernels the engine does not have. Read
+# the installed package's files rather than importing it: no torch, no GPU,
+# and no import-time side effects in a probe that must stay read-only.
+FLASHINFER_INFRA = {
+    "aot", "api_logging", "artifacts", "autotuner", "collect_env", "compilation_context",
+    "cuda_utils", "data", "fi_trace", "jit", "profiler", "tactics_blocklist",
+    "tactics_blocklist_gen", "testing", "tllm_enums", "tllm_utils", "trace", "trace_apply",
+    "tuning_configs", "utils", "version",
+}
+
+def _module_level(body):
+    # Statements at module level, including those under a guard (`try`,
+    # `if`, `with`): FlashInfer re-exports several optional kernels that way.
+    for stmt in body:
+        yield stmt
+        for attr in ("body", "orelse", "finalbody"):
+            if not isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                yield from _module_level(getattr(stmt, attr, None) or [])
+        for handler in getattr(stmt, "handlers", None) or []:
+            yield from _module_level(handler.body)
+
+def _public_names(path, reexports):
+    # (where, exposed, defined) for what a module defines and, for a package
+    # __init__, re-exports; `where` is the relative module a re-export comes
+    # from, "" for a def. A plain module's own imports are its helpers, not
+    # its API, so only a package's re-exports count.
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+    except (OSError, SyntaxError, UnicodeDecodeError):
+        return []
+    names, explicit = [], None
+    for stmt in _module_level(tree.body):
+        if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names.append(("", stmt.name, stmt.name))
+        elif reexports and isinstance(stmt, ast.ImportFrom) and stmt.level >= 1 and stmt.module:
+            names.extend(
+                (stmt.module, alias.asname or alias.name, alias.name) for alias in stmt.names
+            )
+        elif isinstance(stmt, ast.Assign) and any(
+            isinstance(t, ast.Name) and t.id == "__all__" for t in stmt.targets
+        ):
+            try:
+                explicit = set(ast.literal_eval(stmt.value))
+            except ValueError:
+                pass
+    return [
+        row for row in names
+        if not row[1].startswith("_") and (explicit is None or row[1] in explicit)
+    ]
+
+try:
+    import importlib.util
+    fi_spec = importlib.util.find_spec("flashinfer")
+except (ImportError, ValueError):
+    fi_spec = None
+if fi_spec is None or not fi_spec.submodule_search_locations:
+    out["versions"]["flashinfer"] = "not installed"
+else:
+    try:
+        from importlib import metadata
+        out["versions"]["flashinfer"] = metadata.version("flashinfer-python")
+    except Exception:
+        out["versions"]["flashinfer"] = "installed, version unknown"
+    pkg = Path(list(fi_spec.submodule_search_locations)[0])
+    submodules = sorted(
+        p.stem if p.suffix == ".py" else p.name
+        for p in pkg.iterdir()
+        if (p.suffix == ".py" or (p / "__init__.py").is_file())
+        and not p.name.startswith("_")
+        and (p.stem if p.suffix == ".py" else p.name) not in FLASHINFER_INFRA
+    )
+    api = {}
+
+    def _add(group, name, path):
+        key = (group, name)
+        if key not in api or len(path) < len(api[key]):
+            api[key] = path
+
+    # What the package itself re-exports, then what each submodule offers.
+    for where, name, defined in _public_names(pkg / "__init__.py", True):
+        group = where.split(".")[0]
+        if where and group in submodules and name not in submodules:
+            _add(group, name, "flashinfer.%s.%s" % (where, defined))
+    for sub in submodules:
+        init = pkg / sub / "__init__.py"
+        is_pkg = init.is_file()
+        for _where, name, _defined in _public_names(init if is_pkg else pkg / (sub + ".py"), is_pkg):
+            _add(sub, name, "flashinfer.%s.%s" % (sub, name))
+    out["flashinfer_api"] = sorted(api.values())
+
+# Which FlashInfer callables the engine already references, and where: a
+# name referenced by a `custom_ops` file is probably a trtllm op already, and
+# one referenced only by a module is reachable through the kernel plane.
+fi_refs = {}
+torch_tree = repo / "tensorrt_llm/_torch"
+for py in sorted(torch_tree.rglob("*.py")) if torch_tree.is_dir() else ():
+    try:
+        text = py.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        continue
+    if "flashinfer" not in text:
+        continue
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        continue
+    names, roots = set(), {"flashinfer"}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name.split(".")[0] == "flashinfer":
+                    roots.add(alias.asname or "flashinfer")
+        elif isinstance(node, ast.ImportFrom) and node.level == 0 and (
+            (node.module or "").split(".")[0] == "flashinfer"
+        ):
+            for alias in node.names:
+                names.add(alias.name)
+                roots.add(alias.asname or alias.name)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Attribute):
+            base = node.value
+            while isinstance(base, ast.Attribute):
+                base = base.value
+            if isinstance(base, ast.Name) and base.id in roots:
+                names.add(node.attr)
+    rel = py.relative_to(repo).as_posix()
+    for name in names:
+        fi_refs.setdefault(name, []).append(rel)
+out["flashinfer_refs"] = {name: sorted(files) for name, files in sorted(fi_refs.items())}
+
 print("__SURVEY_JSON__" + json.dumps(out))
 """
 
@@ -1106,6 +1262,10 @@ def parse_inventory(stdout: str, *, arch: str = "") -> Inventory:
         op_sources={str(k): str(v) for k, v in (data.get("op_sources") or {}).items()},
         versions={str(k): str(v) for k, v in (data.get("versions") or {}).items()},
         error=str(data.get("error", "")),
+        flashinfer_api=tuple(str(p) for p in data.get("flashinfer_api", ())),
+        flashinfer_refs={
+            str(k): tuple(str(f) for f in v) for k, v in (data.get("flashinfer_refs") or {}).items()
+        },
     )
 
 
@@ -1133,7 +1293,9 @@ def run_inventory_probe(
     # A payload that landed is kept whatever the exit code says. The probe
     # catches its own import failures and still prints what it read off
     # disk, and the catalog half is most of the value.
-    landed = bool(inventory.catalog or inventory.trtllm_ops or inventory.modules)
+    landed = bool(
+        inventory.catalog or inventory.trtllm_ops or inventory.modules or inventory.flashinfer_api
+    )
     if not landed and not getattr(result, "ok", True):
         return Inventory(
             arch=arch,
@@ -1212,7 +1374,7 @@ def format_surface(surface: CheckpointSurface, inventory: Inventory, *, limit: i
             f"unwrapped — treat both as unknown and say so in the plan's open items."
         )
         lines.append("")
-    if not inventory.catalog and not inventory.trtllm_ops:
+    if not inventory.catalog and not inventory.trtllm_ops and not inventory.flashinfer_api:
         lines.append(
             "Nothing landed at all. Plan on the assumption that you do not know what "
             "exists, and name that as an open item."
@@ -1309,7 +1471,45 @@ def format_surface(surface: CheckpointSurface, inventory: Inventory, *, limit: i
         f"The kernel plane (`_torch/modules/**`) holds {len(inventory.modules)} public "
         f"callables — the tier-2 rung. `surface.md` lists them."
     )
+    lines.append("")
+    lines.extend(_flashinfer_lines(inventory, limit))
     return "\n".join(lines) + "\n"
+
+
+def _flashinfer_lines(inventory: Inventory, limit: int) -> list[str]:
+    """The tier-3 rung: FlashInfer kernels no trtllm op wraps, grouped by module."""
+    version = inventory.versions.get("flashinfer", "")
+    if not inventory.flashinfer_api:
+        return [
+            f"**FlashInfer's API was not read** ({version or 'the probe did not report it'}). "
+            f"Tier 3 is unmeasured, not empty: say so in the plan's open items, and do not "
+            f"claim tier 4 or 5 or a ceiling without searching the installed package yourself."
+        ]
+    unreferenced = inventory.flashinfer_unreferenced
+    lines = [
+        f"**FlashInfer {version}: {len(inventory.flashinfer_api)} public callables, "
+        f"{len(unreferenced)} referenced nowhere in the engine.** The op inventory cannot "
+        f"see these: no trtllm op wraps them. A demand one of them answers is tier 3 — an "
+        f"entry whose `raw_call` calls `flashinfer.<module>.<name>` directly, which costs a "
+        f"wrapper and its cells, not an implementation. Search them before you claim tier "
+        f"4 or 5, and before any ceiling:",
+        "",
+    ]
+    groups: dict[str, list[str]] = {}
+    for path in unreferenced:
+        group = path.split(".")[1] if path.count(".") >= 2 else ""
+        groups.setdefault(group, []).append(path.rsplit(".", 1)[-1])
+    per_group = max(1, limit // 5)
+    for group, names in sorted(groups.items()):
+        shown = ", ".join(f"`{name}`" for name in names[:per_group])
+        more = f", … {len(names) - per_group} more" if len(names) > per_group else ""
+        lines.append(f"- `flashinfer.{group}`: {shown}{more}")
+    lines += [
+        "",
+        "`surface.md` lists every callable with its full path and the engine files that "
+        "already reference it.",
+    ]
+    return lines
 
 
 def write_surface_file(path: str | Path, surface: CheckpointSurface, inventory: Inventory) -> Path:
@@ -1317,6 +1517,17 @@ def write_surface_file(path: str | Path, surface: CheckpointSurface, inventory: 
     out = Path(path)
     body = [format_surface(surface, inventory, limit=10_000), "", "## Kernel plane", ""]
     body.extend(f"- `{m}`" for m in inventory.modules)
+    body.extend(["", "## FlashInfer API", ""])
+    for path in inventory.flashinfer_api:
+        refs = inventory.flashinfer_refs.get(path.rsplit(".", 1)[-1], ())
+        where = (
+            "referenced in " + ", ".join(f"`{ref}`" for ref in refs)
+            if refs
+            else "referenced nowhere in the engine"
+        )
+        body.append(f"- `{path}` — {where}")
+    if not inventory.flashinfer_api:
+        body.append(f"- not read: {inventory.versions.get('flashinfer', 'not reported')}")
     body.extend(["", "## Versions", ""])
     body.extend(f"- {k}: {v}" for k, v in sorted(inventory.versions.items()))
     out.write_text("\n".join(body) + "\n", encoding="utf-8")
