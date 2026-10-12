@@ -82,9 +82,9 @@ the local functions and methods that consume the changed binding:
   `staticmethod` decorators, literal defaults, and annotations validated as safe name loads or
   supported builtin / `typing` / `collections.abc` forms; plain, unshadowed `torch.Tensor` and
   `torch.dtype` annotation loads are also supported;
-- added parameters with safe annotations and literal defaults when provided, preserving the existing
-  parameters' declarations, relative order, and defaults, along with positional-only parameters,
-  variadic parameters, decorators, and the type comment;
+- added parameters on undecorated functions or methods with safe annotations and literal defaults
+  when provided, preserving the existing parameters' declarations, relative order, and defaults,
+  along with positional-only parameters, variadic parameters, and the type comment;
 - a safe return annotation added to an undecorated function or method, with the same restrictions on
   any simultaneous parameter additions;
 - a literal module binding deletion, retaining consumers from both the pre- and post-image; unsupported
@@ -96,6 +96,12 @@ repository import/reference graph. A binding referenced from another file declin
 externally referenced no-data consumer whose local callers would otherwise be used as its bound.
 Every no-data caller reached during recursion is checked too; an external reference there declines
 the coverage decision instead of treating local callers or file rows as a complete bound.
+
+The analysis also declines if either image contains an attribute whose name matches a changed module
+binding, because the attribute receiver may alias the module and its consumers are not bounded by
+direct name loads. Signature additions on decorated functions or methods decline even when the
+decorator expression is unchanged: decorators can inspect signatures and register schemas during
+import, with consumers that never execute the Python function.
 
 The analysis also declines if the binding is consumed by import-executed code. Otherwise its consumers
 are resolved exactly like changed function bodies. If a consumer is new or absent from the DB, Tier 2

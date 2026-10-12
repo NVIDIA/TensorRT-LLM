@@ -773,6 +773,48 @@ def test_literal_assignment_resolves_consumers_and_callers_without_name_policy()
     assert analysis.callers == {"helper": {"caller"}}
 
 
+@pytest.mark.parametrize("delete_binding", (False, True))
+@pytest.mark.parametrize(
+    "consumer",
+    (
+        "def helper():\n    return C.VALUE\n",
+        "class Kernel:\n    def kern(self):\n        return C.VALUE\n",
+        "OBSERVED = C.VALUE\n",
+        "def helper():\n    alias = C\n    return alias.VALUE\n",
+        "def helper():\n    def nested():\n        return C.VALUE\n    return nested\n",
+    ),
+)
+def test_module_alias_binding_consumer_remains_fail_closed(
+    consumer: str, delete_binding: bool
+) -> None:
+    prefix = "import sys\nC = sys.modules[__name__]\n"
+    suffix = "UNCHANGED = 0\n" + consumer
+    before = prefix + "VALUE = 1\n" + suffix
+    source = prefix + ("" if delete_binding else "VALUE = 2\n") + suffix
+    diff = "".join(difflib.unified_diff(before.splitlines(True), source.splitlines(True)))
+
+    assert _analyze(source, diff).limitation == "unresolved module attribute consumer"
+
+
+def test_pre_image_module_alias_consumer_remains_fail_closed() -> None:
+    prefix = "import sys\nC = sys.modules[__name__]\n"
+    before = prefix + "VALUE = 1\ndef helper():\n    return C.VALUE\n"
+    source = prefix + "VALUE = 2\ndef helper():\n    return 0\n"
+    diff = "".join(difflib.unified_diff(before.splitlines(True), source.splitlines(True)))
+
+    assert _analyze(source, diff).limitation == "unresolved module attribute consumer"
+
+
+def test_repository_gvr_module_alias_constant_change_remains_fail_closed() -> None:
+    path = "tensorrt_llm/_torch/cute_dsl_kernels/blackwell/top_k/gvr_topk_decode_self_sampling.py"
+    before = (REPO_ROOT / path).read_text()
+    source = before.replace("SENT_LO = -3.0e38", "SENT_LO = -2.0e38", 1)
+    assert source != before
+    diff = "".join(difflib.unified_diff(before.splitlines(True), source.splitlines(True)))
+
+    assert _analyze(source, diff).limitation == "unresolved module attribute consumer"
+
+
 @pytest.mark.parametrize(
     ("source", "reason"),
     (
@@ -1298,6 +1340,47 @@ def test_inserted_safe_parameter_preserves_existing_arguments(before: str, after
     analysis = _analyze(source, diff)
     assert not analysis.limitation
     assert analysis.binding_consumers == {"helper"}
+
+
+@pytest.mark.parametrize("declaration", ("def", "async def"))
+@pytest.mark.parametrize("parameter", ("option: int = 0", "*, option: int = 0"))
+@pytest.mark.parametrize(
+    "decorator", ("register", 'fast_custom_op("trtllm::helper")', "property", "staticmethod")
+)
+def test_decorated_parameter_addition_remains_fail_closed(
+    decorator: str, parameter: str, declaration: str
+) -> None:
+    before = f"@{decorator}\n{declaration} helper(value: int):\n    return value\n"
+    source = f"@{decorator}\n{declaration} helper(value: int, {parameter}):\n    return value\n"
+    diff = "".join(difflib.unified_diff(before.splitlines(True), source.splitlines(True)))
+
+    assert _analyze(source, diff).limitation == "class/signature import change"
+
+
+def test_custom_decorated_method_parameter_addition_remains_fail_closed() -> None:
+    prefix = "class Example:\n    @register\n"
+    before = prefix + "    def helper(self, value: int):\n        return value\n"
+    source = (
+        prefix + "    def helper(self, value: int, *, option: int = 0):\n        return value\n"
+    )
+    diff = "".join(difflib.unified_diff(before.splitlines(True), source.splitlines(True)))
+
+    assert _analyze(source, diff).limitation == "class/signature import change"
+
+
+def test_repository_nvfp4_decorated_parameter_addition_remains_fail_closed() -> None:
+    before = (REPO_ROOT / "tensorrt_llm/_torch/custom_ops/torch_custom_ops.py").read_text()
+    function = next(
+        node
+        for node in ast.parse(before).body
+        if isinstance(node, ast.FunctionDef) and node.name == "nvfp4_gemm"
+    )
+    lines = before.splitlines(True)
+    lines.insert(function.args.args[-1].end_lineno, "    option: int = 0,\n")
+    source = "".join(lines)
+    diff = "".join(difflib.unified_diff(before.splitlines(True), source.splitlines(True)))
+
+    assert _analyze(source, diff).limitation == "class/signature import change"
 
 
 @pytest.mark.parametrize(
@@ -2267,6 +2350,47 @@ class _FakeDB:
 
     def untrusted_tests(self, *_args) -> set[str]:
         return set()
+
+
+@pytest.mark.parametrize(
+    ("before", "source", "reason"),
+    (
+        (
+            "import sys\nC = sys.modules[__name__]\nVALUE = 1\n"
+            "def helper():\n    return VALUE\n"
+            "class Kernel:\n    def kern(self):\n        return C.VALUE\n",
+            "import sys\nC = sys.modules[__name__]\nVALUE = 2\n"
+            "def helper():\n    return VALUE\n"
+            "class Kernel:\n    def kern(self):\n        return C.VALUE\n",
+            "unresolved module attribute consumer",
+        ),
+        (
+            '@fast_custom_op("trtllm::helper")\ndef helper(value: int):\n    return value\n',
+            '@fast_custom_op("trtllm::helper")\n'
+            "def helper(value: int, option: int = 0):\n    return value\n",
+            "class/signature import change",
+        ),
+    ),
+)
+def test_selector_declines_unbounded_alias_and_decorator_effects_with_consumer_rows(
+    before: str, source: str, reason: str
+) -> None:
+    path = "tensorrt_llm/example.py"
+    db = _FakeDB()
+    db.rows["helper"] = {"A10-PyTorch-1/test_caller"}
+    selector = CoverageSelector(
+        db,
+        REPO_ROOT,
+        read_source=lambda _path: source,
+        external_references=lambda _path, _names: set(),
+    )
+    diff = "".join(difflib.unified_diff(before.splitlines(True), source.splitlines(True)))
+
+    result = selector.decide([path], {path: diff})
+
+    assert not result.ok
+    assert reason in result.reason
+    assert not result.skippable
 
 
 class _ImportReplacementDB(_FakeDB):

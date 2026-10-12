@@ -634,12 +634,9 @@ def _safe_signature_addition(
         or node.type_comment != old_node.type_comment
     ):
         return False
-    if return_annotation_added and node.decorator_list:
-        # A decorator can consume annotation metadata while the module loads.
-        return False
-    if len(node.decorator_list) != len(old_node.decorator_list) or any(
-        not _same_ast(new, old) for new, old in zip(node.decorator_list, old_node.decorator_list)
-    ):
+    # Even an unchanged decorator can inspect the signature and register a
+    # schema at import time without its consumers executing this function.
+    if node.decorator_list or old_node.decorator_list:
         return False
 
     arguments = node.args
@@ -1409,6 +1406,16 @@ def analyze_python_changes(
         )
     if import_loads:
         return PythonChangeFacts(set(), set(), {}, "import-time binding consumer")
+
+    # Attribute receivers may alias this module. Name loads alone cannot bound
+    # their consumers, including aliases created or passed through other scopes.
+    if binding_names and any(
+        isinstance(node, ast.Attribute) and node.attr in binding_names
+        for parsed_tree in (tree, old_tree)
+        if parsed_tree is not None
+        for node in ast.walk(parsed_tree)
+    ):
+        return PythonChangeFacts(set(), set(), {}, "unresolved module attribute consumer")
 
     module_functions = {
         node.name for node in tree.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
