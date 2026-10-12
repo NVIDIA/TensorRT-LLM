@@ -71,7 +71,7 @@ ARTIFACTORY_DOCKER_HOST = "artifactory.nvidia.com"
 ARTIFACTORY_CREDENTIALS_ID = "trtllm-artifactory-credentials"
 
 // DLFW torch image
-DLFW_IMAGE = "urm.nvidia.com/docker/nvidia/pytorch:26.08-py3"
+DLFW_IMAGE = "urm.nvidia.com/docker/nvidia/pytorch:26.09-py3"
 
 MODEL_EXPRESS_VERSION = "0.5.1"
 MODEL_EXPRESS_SERVER_IMAGE = "urm.nvidia.com/docker/nvidia/ai-dynamo/modelexpress-server:${MODEL_EXPRESS_VERSION}"
@@ -4198,7 +4198,7 @@ def launchTestListCheck(pipeline)
             trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install -r ${llmSrc}/requirements-dev.txt")
             // --validate --parity: after --l0/--qa generate the collectable lists, assert every
             // statically-verified parametrize ID is actually collectable (validate<->collection parity).
-            sh "NVIDIA_TRITON_SERVER_VERSION=26.08 LLM_ROOT=${llmSrc} LLM_BACKEND_ROOT=${llmSrc}/triton_backend python3 ${llmSrc}/scripts/check_test_list.py --l0 --qa --waive --validate --parity"
+            sh "NVIDIA_TRITON_SERVER_VERSION=26.09 LLM_ROOT=${llmSrc} LLM_BACKEND_ROOT=${llmSrc}/triton_backend python3 ${llmSrc}/scripts/check_test_list.py --l0 --qa --waive --validate --parity"
         } catch (InterruptedException e) {
             throw e
         } catch (Exception e) {
@@ -5167,21 +5167,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
             trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmSrc} && pip3 install -r requirements-grpc-smg.txt")
             if (stageName.contains("-Ray-")) {
                 trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install ray[default]==2.55.1")
-                // TODO(dlfw-26.08): reinstate causal-conv1d and mamba-ssm once
-                // upstream publishes wheels built against this base image's torch.
-                // They used to be installed here, from
-                //   causal-conv1d v1.6.2  causal_conv1d-1.6.1+cu13torch26.04cxx11abiTRUE
-                //   mamba v2.3.0          mamba_ssm-2.3.0+cu13torch26.01cxx11abiTRUE
-                // but the newest builds upstream offers target torch 26.07 and 26.04,
-                // so on DLFW 26.08 the extension loads with an undefined c10 symbol,
-                // materialize_cow_storage(StorageImpl&). A broken install is worse
-                // than none: transformers gates its causal_conv1d import on a
-                // package-metadata probe, which a broken install still passes, so
-                // modeling_qwen3_5_moe raises at import and every test collected from
-                // a module that imports it dies as a collection error. Absent, the
-                // gate says no and the model falls back to its Python path -- slower,
-                // and it OOMs on Nemotron-H, which is why
-                // test_llm_update_weights_nemotron_h is waived under nvbugs/6729495.
+                trtllm_utils.llmExecStepWithRetry(pipeline, script: "bash ${llmSrc}/jenkins/scripts/install_mamba.sh")
             }
             if (!skipInstallWheel) {
                 trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmPath} && pip3 install --force-reinstall --no-deps TensorRT-LLM/tensorrt_llm-*.whl")

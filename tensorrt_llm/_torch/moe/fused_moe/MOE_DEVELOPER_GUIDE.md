@@ -118,7 +118,8 @@ comprehensive early-validation layer for every incompatible feature.
 ```text
 [EPLB start_wait_gpu] → routing → [EPLB done_wait_gpu + update_statistic + route]
   → [comm.prepare_dispatch (NVLink2-sided)] → quantize/dispatch (adaptive order)
-  → backend.run_moe → [EPLB start_set_cpu] → comm.combine → [EPLB done_set_cpu]
+  → backend.run_moe → [EPLB start_set_cpu] → [unfinalized_combine_fn]
+  → comm.combine → [EPLB done_set_cpu]
 
 Adaptive quantize/dispatch order (gated by comm.supports_post_quant_dispatch()):
   Post-quant flow: quantize_input() → comm.dispatch()   (send quantized data)
@@ -126,6 +127,8 @@ Adaptive quantize/dispatch order (gated by comm.supports_post_quant_dispatch()):
 ```
 
 EPLB hooks fire only at the first/last chunk of the first/last `repeat_idx`. Multi-stream chunk overlap is enabled when `not enable_alltoall and aux_stream is not None`.
+
+`unfinalized_combine_fn` is a constructor argument (`create_moe(..., unfinalized_combine_fn=...)`) for a model that needs a per-`(token, expert)` transform applied to each expert output *before* the top-k sum. Once registered it runs on **every** `do_finalize=False` forward, with or without a comm strategy, so the forward's return type (dense tensor vs. unfinalized triple) depends only on static config. Under a comm strategy the scheduler runs it on the dispatched rows and the combine reduces already-finalized partials — equal to finalizing after the combine, because each term depends on one row alone and non-local slots contribute exact zeros. That reordering is only sound for a combine that is an unweighted row sum over a dense per-token tensor; `DeepEPLowLatency.combine` is not one (it consumes expert-major rows and applies the routing weights itself), which is what `Communication.supports_finalize_before_combine()` declares. `ConfigurableMoE.validate_backend` rejects at construction: a backend without `supports_unfinalized_output()`, a comm without `supports_finalize_before_combine()`, and `apply_router_weight_on_input`. With no hook registered, `do_finalize=False` plus a comm strategy stays a named runtime refusal instead of a crash inside the comm layer.
 
 ### Fused-comm execution flow (MegaMoE-style)
 

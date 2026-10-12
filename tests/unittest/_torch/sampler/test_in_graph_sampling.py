@@ -68,8 +68,8 @@ class _Request:
     py_no_repeat_ngram_size: Any = None
     py_is_draft: bool = False
     py_logits_post_processors: Any = None
-    guided_decoding_params: Any = None
-    _py_embedding_bias_1d: Any = None
+    py_guided_decoding_params: Any = None
+    py_embedding_bias: Any = None
 
     def get_beam_width_by_iter(self, for_next_iteration: bool = False) -> int:
         return self.sampling_config.beam_width
@@ -100,6 +100,7 @@ class _Sampler(TorchSampler):
         self._fast_temperatures = None
         self._fast_top_ks = None
         self._fast_top_ps = None
+        self._fast_min_ps = None
         self._fast_seeds = None
         self._fast_offsets = None
         self._fast_num_rows = 0
@@ -114,15 +115,13 @@ class TestTierSelection:
     def test_plain_temperature_top_k_top_p_is_fast(self, sampler):
         assert sampler.get_sample_type([make_request()]) is SampleType.FAST
 
-    @pytest.mark.parametrize(
-        "sampling",
-        [
-            pytest.param(dict(temperature=0.0), id="greedy"),
-            pytest.param(dict(temperature=0.8, min_p=0.05), id="min_p"),
-        ],
-    )
-    def test_sampling_params_outside_the_tier_are_full(self, sampler, sampling):
-        assert sampler.get_sample_type([make_request(sampling)]) is SampleType.FULL
+    def test_min_p_is_fast(self, sampler):
+        request = make_request(dict(temperature=0.8, min_p=0.05))
+        assert sampler.get_sample_type([request]) is SampleType.FAST
+
+    def test_greedy_is_full(self, sampler):
+        request = make_request(dict(temperature=0.0))
+        assert sampler.get_sample_type([request]) is SampleType.FULL
 
     @pytest.mark.parametrize(
         "attrs",
@@ -131,9 +130,9 @@ class TestTierSelection:
             pytest.param(dict(py_min_length=50), id="min_length"),
             pytest.param(dict(py_bad_words=[[7]]), id="bad_words"),
             pytest.param(dict(py_no_repeat_ngram_size=3), id="no_repeat_ngram"),
-            pytest.param(dict(_py_embedding_bias_1d=object()), id="embedding_bias"),
+            pytest.param(dict(py_embedding_bias=object()), id="embedding_bias"),
             # Consume the logits after the forward returns.
-            pytest.param(dict(guided_decoding_params=object()), id="guided_decoding"),
+            pytest.param(dict(py_guided_decoding_params=object()), id="guided_decoding"),
             pytest.param(dict(py_logits_post_processors=[object()]), id="logits_processor"),
             # Shares this sampler but registers no hooks.
             pytest.param(dict(py_is_draft=True), id="draft"),
@@ -199,6 +198,20 @@ class TestStaging:
         assert sampler._in_graph_rows == 2
         assert sampler._in_graph_live_rows == 2
         assert sampler._in_graph_dest_indices[:2].tolist() == [3, 5]
+
+    def test_stages_per_row_filters(self, sampler):
+        batch = self._batch(
+            make_request(py_request_id=1, py_seq_slot=3),
+            make_request(
+                dict(temperature=0.7, top_p=0.8, min_p=0.05), py_request_id=2, py_seq_slot=5
+            ),
+        )
+        sampler.stage_in_graph_sampling(batch, SampleType.FAST)
+
+        assert sampler._fast_temperatures[:2].tolist() == pytest.approx([0.8, 0.7])
+        assert sampler._fast_top_ks[:2].tolist() == [50, 0]
+        assert sampler._fast_top_ps[:2].tolist() == pytest.approx([0.9, 0.8])
+        assert sampler._fast_min_ps[:2].tolist() == pytest.approx([0.0, 0.05])
 
     def test_full_stages_nothing(self, sampler):
         batch = self._batch(make_request(py_request_id=1, py_seq_slot=0))
@@ -268,7 +281,7 @@ class TestStaging:
         # batch simply did not schedule. Advancing its Philox offset would make
         # that request's stream depend on concurrent load, which is exactly what
         # _SeedManager exists to prevent.
-        live = make_request(py_request_id=1, py_seq_slot=0)
+        live = make_request(sampling={**FAST_PARAMS, "seed": 7}, py_request_id=1, py_seq_slot=0)
         dummy = make_request(py_request_id=99, py_seq_slot=None, is_dummy=True)
         before = sampler._seed_manager._offsets.clone()
 

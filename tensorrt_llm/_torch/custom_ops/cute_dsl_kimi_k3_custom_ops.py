@@ -31,10 +31,13 @@ The ``trtllm::kda_prefill`` operator updates selected recurrent-state pool rows
 in place. Intermediate matrices remain private runner workspace.
 """
 
+import os
 import weakref
-from typing import Optional
+from typing import Any, Hashable, Optional, TypeVar
 
 import torch
+
+from tensorrt_llm.logger import logger
 
 from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
@@ -301,44 +304,90 @@ _akk_inv_cache = {}
 _k4p_cache = {}
 _k4p_tm_ws = {}
 
+# ========== Shape-keyed scratch caches ==========
+# The scratch caches below are keyed by the packed prefill token count. In the
+# executor that is attn_metadata.num_ctx_tokens, which the scheduler does not
+# quantize, so almost every prefill iteration brings a new key. Every such
+# cache must therefore be LRU-bounded through _lru_put / _lru_touch.
+
+
+_V = TypeVar("_V")
+
+
+def _lru_put(cache: dict, key: Hashable, value: _V, max_entries: int) -> _V:
+    """Insert ``value`` under ``key``, first evicting least-recently-used entries."""
+    while len(cache) >= max_entries:
+        cache.pop(next(iter(cache)))
+    cache[key] = value
+    return value
+
+
+def _lru_touch(cache: dict, key: Hashable) -> Any:
+    """Mark ``key`` most recently used and return its value."""
+    cache[key] = cache.pop(key)
+    return cache[key]
+
+
+_DEFAULT_SCRATCH_CACHE_ENTRIES = 2
+
+
+def _scratch_cache_max_entries() -> int:
+    """Entry cap of the shape-keyed scratch caches: TLLM_KDA_BUF_CACHE_ENTRIES, default 2.
+
+    A non-integer value falls back to the default with a warning instead of
+    failing the import of this module.
+    """
+    raw = os.environ.get("TLLM_KDA_BUF_CACHE_ENTRIES")
+    if raw is None:
+        return _DEFAULT_SCRATCH_CACHE_ENTRIES
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        logger.warning(
+            f"Ignoring invalid TLLM_KDA_BUF_CACHE_ENTRIES={raw!r}; "
+            f"using the default of {_DEFAULT_SCRATCH_CACHE_ENTRIES}."
+        )
+        return _DEFAULT_SCRATCH_CACHE_ENTRIES
+
+
 # Buffer cache: avoid re-allocating ~67us of intermediate tensors per call.
 # Also caches cute.Tensor wrappers (saves ~7us each call from from_dlpack).
-# LRU-bounded: entries are keyed by (B, T, ...) shapes, and the runtime
-# executor calls with a different token count per prefill batch — an
-# unbounded dict would pin ~T*150KB of scratch per distinct shape forever.
+#
+# One entry owns ~1.25 KiB per token per KDA head, i.e. ~1 GiB at H=96 and
+# T=8192. This scratch is allocated after the KV-cache pool has been sized, so
+# every resident entry is memory the KV-cache accounting never saw: keep the
+# cap small. A small cap costs almost nothing, because the reuse that matters
+# is within one forward: all KDA layers of an iteration share one T, so even a
+# single entry hits on every layer but the first. Cross-iteration hits are
+# incidental, since T usually changes from one iteration to the next.
+# Override with TLLM_KDA_BUF_CACHE_ENTRIES (minimum 1).
 _buf_cache = {}
-_BUF_CACHE_MAX_ENTRIES = 8
+_BUF_CACHE_MAX_ENTRIES = _scratch_cache_max_entries()
 
 # Padded-input scratch cache for the eqlen partial-chunk path. Keyed by
 # (B, T_padded, H, K, dtype_qkv, dtype_g, dtype_beta, device, real_T).
 # real_T is part of the key so the g sentinel tail [real_T:T_padded] = -1e3
-# is set once and reused across calls with the same shape. LRU-bounded like
-# _buf_cache: real_T varies per prefill batch, so an unbounded dict would pin
-# scratch for every distinct token count forever.
+# is set once and reused across calls with the same shape.
 _padded_input_cache = {}
-_PAD_CACHE_MAX_ENTRIES = 8
+_PADDED_INPUT_CACHE_MAX_ENTRIES = _BUF_CACHE_MAX_ENTRIES
 
 # Sentinel-padded g scratch for varlen single-seq Phase 2.1 path. Keyed by
 # (B, T_padded, H, K, dtype, device, real_T). The tail [real_T:T_padded] is
 # pre-set to -1e3 once at cache init; subsequent calls only overwrite the
-# valid prefix [0, real_T).
+# valid prefix [0, real_T). real_T is the request's true prompt length, so
+# the key space is as wide as the prompt-length distribution.
 _g_sentinel_cache = {}
+_G_SENTINEL_CACHE_MAX_ENTRIES = _BUF_CACHE_MAX_ENTRIES
 
 
 def _get_g_sentinel_buffer(B, T_padded, H, K, dtype_g, device, real_T):
     key = (B, T_padded, H, K, dtype_g, device.index if device.index is not None else 0, real_T)
-    e = _g_sentinel_cache.get(key)
-    if e is None:
-        e = torch.zeros(B, T_padded, H, K, dtype=dtype_g, device=device)
-        if real_T < T_padded:
-            e[:, real_T:] = -1000.0
-        while len(_g_sentinel_cache) >= _PAD_CACHE_MAX_ENTRIES:
-            _g_sentinel_cache.pop(next(iter(_g_sentinel_cache)))
-        _g_sentinel_cache[key] = e
-    else:
-        # LRU refresh so hot shapes survive eviction.
-        _g_sentinel_cache[key] = _g_sentinel_cache.pop(key)
-    return e
+    if key in _g_sentinel_cache:
+        return _lru_touch(_g_sentinel_cache, key)
+    e = torch.zeros(B, T_padded, H, K, dtype=dtype_g, device=device)
+    if real_T < T_padded:
+        e[:, real_T:] = -1000.0
+    return _lru_put(_g_sentinel_cache, key, e, _G_SENTINEL_CACHE_MAX_ENTRIES)
 
 
 def _get_padded_input_buffers(B, T_padded, H, K, dtype_qkv, dtype_g, dtype_beta, device, real_T):
@@ -353,25 +402,19 @@ def _get_padded_input_buffers(B, T_padded, H, K, dtype_qkv, dtype_g, dtype_beta,
         device.index if device.index is not None else 0,
         real_T,
     )
-    e = _padded_input_cache.get(key)
-    if e is None:
-        q_pad = torch.zeros(B, T_padded, H, K, dtype=dtype_qkv, device=device)
-        k_pad = torch.zeros(B, T_padded, H, K, dtype=dtype_qkv, device=device)
-        v_pad = torch.zeros(B, T_padded, H, K, dtype=dtype_qkv, device=device)
-        beta_pad = torch.zeros(B, T_padded, H, dtype=dtype_beta, device=device)
-        # g: zero in [0, real_T), sentinel -1e3 in [real_T, T_padded). Caller's
-        # data overwrites the prefix each call; the sentinel tail never moves.
-        g_pad = torch.zeros(B, T_padded, H, K, dtype=dtype_g, device=device)
-        if real_T < T_padded:
-            g_pad[:, real_T:] = -1000.0
-        e = (q_pad, k_pad, v_pad, g_pad, beta_pad)
-        while len(_padded_input_cache) >= _PAD_CACHE_MAX_ENTRIES:
-            _padded_input_cache.pop(next(iter(_padded_input_cache)))
-        _padded_input_cache[key] = e
-    else:
-        # LRU refresh so hot shapes survive eviction.
-        _padded_input_cache[key] = _padded_input_cache.pop(key)
-    return e
+    if key in _padded_input_cache:
+        return _lru_touch(_padded_input_cache, key)
+    q_pad = torch.zeros(B, T_padded, H, K, dtype=dtype_qkv, device=device)
+    k_pad = torch.zeros(B, T_padded, H, K, dtype=dtype_qkv, device=device)
+    v_pad = torch.zeros(B, T_padded, H, K, dtype=dtype_qkv, device=device)
+    beta_pad = torch.zeros(B, T_padded, H, dtype=dtype_beta, device=device)
+    # g: zero in [0, real_T), sentinel -1e3 in [real_T, T_padded). Caller's
+    # data overwrites the prefix each call; the sentinel tail never moves.
+    g_pad = torch.zeros(B, T_padded, H, K, dtype=dtype_g, device=device)
+    if real_T < T_padded:
+        g_pad[:, real_T:] = -1000.0
+    e = (q_pad, k_pad, v_pad, g_pad, beta_pad)
+    return _lru_put(_padded_input_cache, key, e, _PADDED_INPUT_CACHE_MAX_ENTRIES)
 
 
 def _get_buffers(dev, dtype_k, B, T, H, K_dim, V_dim, NT, N_seqs, BT, varlen=False):
@@ -470,25 +513,25 @@ def _get_buffers(dev, dtype_k, B, T, H, K_dim, V_dim, NT, N_seqs, BT, varlen=Fal
             _akk_inv_fn=None,
         )
 
-        while len(_buf_cache) >= _BUF_CACHE_MAX_ENTRIES:
-            _buf_cache.pop(next(iter(_buf_cache)))
-        _buf_cache[key] = (
-            k_scaled,
-            kg,
-            q_scaled,
-            beta_activated,
-            gk_last_exp,
-            A_qk,
-            A_kk,
-            O_flat,
-            cu_eqlen,
-            co_eqlen,
-            cute_wrappers,
+        return _lru_put(
+            _buf_cache,
+            key,
+            (
+                k_scaled,
+                kg,
+                q_scaled,
+                beta_activated,
+                gk_last_exp,
+                A_qk,
+                A_kk,
+                O_flat,
+                cu_eqlen,
+                co_eqlen,
+                cute_wrappers,
+            ),
+            _BUF_CACHE_MAX_ENTRIES,
         )
-    else:
-        # LRU refresh so hot shapes survive eviction.
-        _buf_cache[key] = _buf_cache.pop(key)
-    return _buf_cache[key]
+    return _lru_touch(_buf_cache, key)
 
 
 def _launch_k4_persistent(

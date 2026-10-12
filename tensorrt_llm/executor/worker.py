@@ -422,6 +422,11 @@ def worker_main(
     # Optionally disable GC (default: not disabled)
     if os.getenv("TRTLLM_WORKER_DISABLE_GC", "0") == "1":
         gc.disable()
+        # With automatic GC off, dynamo's post-compile gc.collect(1) walks every
+        # object allocated since the previous compile (seconds per recompile).
+        if "TORCH_DYNAMO_RUN_GC_AFTER_COMPILE" not in os.environ:
+            import torch._dynamo.config
+            torch._dynamo.config.run_gc_after_compile = False
 
     with worker:
         try:

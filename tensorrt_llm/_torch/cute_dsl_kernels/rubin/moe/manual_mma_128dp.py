@@ -73,7 +73,12 @@ def build_static_idesc_base(
     OR's them in from the SF TMEM addresses.  n_dim is static (non-swapAB) and
     folded in here.
     """
-    assert umma_m in (64, 128, 256), f"Unsupported UMMA_M={umma_m}"
+    # 64 is not encodable here. ``m_dim = umma_m >> 4`` placed at bit 24 only
+    # coincides with the real m_dim field (bits [27,29), holding M >> 7) for
+    # 128 -> bit 27 and 256 -> bit 28. For 64 it yields 4 << 24, i.e. bit 26,
+    # which is _BIT_SFA_LAYOUT: the descriptor would silently select
+    # SFA_128dp_Unique and discard the caller's sfa_layout argument.
+    assert umma_m in (128, 256), f"Unsupported UMMA_M={umma_m}"
     assert umma_k in _K_SIZE_FIELD, f"Unsupported UMMA_K={umma_k}"
     assert 0 <= sfa_layout < 2
 
@@ -108,8 +113,15 @@ def compute_idesc(
     idesc = Int32(static_base)
     sfa_top = Int32(sfa_tmem_addr_i32) & Int32(0xC0000000)
     sfb_top = Int32(sfb_tmem_addr_i32) & Int32(0xC0000000)
-    idesc = idesc | (sfa_top >> Int32(30 - _BIT_A_SF_ID))
-    idesc = idesc | (sfb_top >> Int32(30 - _BIT_B_SF_ID))
+    # Mask after shifting. ``Int32`` is signed, so ``>>`` is an arithmetic
+    # shift: a TMEM address with bit 31 set sign-extends and would leave stray
+    # high bits set. Bit 31 is _BIT_K_SIZE_LO, so for umma_k=128 (k_size 2)
+    # that flips k_size to 3 and the instruction runs the wrong K. Matches
+    # ``compute_idesc`` in
+    # cutedsl_megamoe/kernel_src/rubin/inference/mega/dynamic_mainloop.py,
+    # which masks both fields; this copy had dropped it.
+    idesc = idesc | ((sfa_top >> Int32(30 - _BIT_A_SF_ID)) & Int32(0x3 << _BIT_A_SF_ID))
+    idesc = idesc | ((sfb_top >> Int32(30 - _BIT_B_SF_ID)) & Int32(0x3 << _BIT_B_SF_ID))
     return idesc
 
 

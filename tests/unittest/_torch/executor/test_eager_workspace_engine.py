@@ -15,10 +15,10 @@ import torch
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream
 from tensorrt_llm._torch.pyexecutor.engine.model_call import ModelCaller
-from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
+from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import DecoderRunner
 from tensorrt_llm._torch.pyexecutor.workspace import EagerWorkspaceReclaimer, WorkspaceShrinkPolicy
 
-_ENGINE_MODULE = "tensorrt_llm._torch.pyexecutor.model_engine"
+_RUNNER_MODULE = "tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner"
 pytestmark = pytest.mark.cpu_only
 
 
@@ -168,13 +168,14 @@ class TestEagerWorkspaceReclaimer(unittest.TestCase):
 
 class TestEagerWorkspaceEngine(unittest.TestCase):
     def setUp(self) -> None:
-        self.engine = object.__new__(PyTorchModelEngine)
+        self.engine = object.__new__(DecoderRunner)
         self.engine._eager_workspace_reclaimer = None
-        self.engine.is_spec_decode = False
+        self.engine._config = SimpleNamespace(
+            is_spec_decode=False, torch_compile_prefill_only=False
+        )
         self.engine.mapping = SimpleNamespace(cp_size=1)
         self.engine.sparse_attention_config = None
         self.engine._torch_compile_backend = None
-        self.engine._torch_compile_prefill_only = False
         self.engine.breakable_cuda_graph_runner = None
         self.engine._is_warmup = False
         self.metadata = object.__new__(TrtllmAttentionMetadata)
@@ -184,15 +185,12 @@ class TestEagerWorkspaceEngine(unittest.TestCase):
             model_config=SimpleNamespace(extra_attrs={}), forward=Mock(return_value=42)
         )
         self.engine._model_caller = ModelCaller(self.engine.model)
-        reclaimer_patch = patch(f"{_ENGINE_MODULE}.EagerWorkspaceReclaimer", autospec=True)
+        reclaimer_patch = patch(f"{_RUNNER_MODULE}.EagerWorkspaceReclaimer", autospec=True)
         self.reclaimer_class = reclaimer_patch.start()
         self.addCleanup(reclaimer_patch.stop)
 
-    def freeze(self, *, is_encoder_decoder: bool = False) -> None:
-        with patch.object(
-            self.engine, "_is_encoder_decoder_model", return_value=is_encoder_decoder
-        ):
-            self.engine._freeze_eager_workspace_floor()
+    def freeze(self) -> None:
+        self.engine._freeze_eager_workspace_floor()
 
     def call(self, *, is_dummy: bool = False) -> int:
         with (
@@ -230,16 +228,17 @@ class TestEagerWorkspaceEngine(unittest.TestCase):
         scope.return_value.__exit__.assert_called_once_with(None, None, None)
 
     def test_ineligible_modes_and_workspaces_do_not_create_reclaimer(self) -> None:
-        self.freeze(is_encoder_decoder=True)
+        with patch.object(self.engine, "_eager_workspace_reclaim_supported", False):
+            self.freeze()
         self.assertIsNone(self.engine._eager_workspace_reclaimer)
         self.reclaimer_class.assert_not_called()
-        for name, value in [
-            ("is_spec_decode", True),
-            ("_torch_compile_backend", object()),
-            ("breakable_cuda_graph_runner", object()),
-            ("sparse_attention_config", object()),
+        for target, name, value in [
+            (self.engine._config, "is_spec_decode", True),
+            (self.engine, "_torch_compile_backend", object()),
+            (self.engine, "breakable_cuda_graph_runner", object()),
+            (self.engine, "sparse_attention_config", object()),
         ]:
-            with self.subTest(mode=name), patch.object(self.engine, name, value):
+            with self.subTest(mode=name), patch.object(target, name, value):
                 self.freeze()
                 self.assertIsNone(self.engine._eager_workspace_reclaimer)
         with patch.object(self.engine.mapping, "cp_size", 2):
