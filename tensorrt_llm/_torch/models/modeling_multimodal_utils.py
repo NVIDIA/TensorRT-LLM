@@ -238,7 +238,10 @@ def _normalize_encoder_embeddings(
     return encoder_embeddings
 
 
-def _join_embeddings(embeddings: List[torch.Tensor]) -> torch.Tensor:
+def _join_embeddings(embeddings: List[torch.Tensor],
+                     *,
+                     start: int = 0,
+                     end: Optional[int] = None) -> torch.Tensor:
     """Join per-item/per-request embeddings along dim 0 without a needless copy.
 
     ``torch.cat`` always allocates, so calling it on a one-element list
@@ -248,8 +251,25 @@ def _join_embeddings(embeddings: List[torch.Tensor]) -> torch.Tensor:
     full extra allocation live at the prefill peak. Multimodal embeddings are
     read-only downstream -- they are sliced and scattered into the input
     embedding buffer, never written in place -- so returning the sole tensor
-    is equivalent to concatenating it.
+    is equivalent to concatenating it. If a row range is given, slice each
+    segment first so rows outside the current prefill chunk are never copied.
     """
+    if start != 0 or end is not None:
+        slices = []
+        offset = 0
+        for embedding in embeddings:
+            segment_end = offset + embedding.shape[0]
+            slice_end = segment_end if end is None else min(end, segment_end)
+            if max(start, offset) < slice_end:
+                slices.append(embedding[max(start - offset, 0):slice_end -
+                                        offset])
+            offset = segment_end
+            if end is not None and offset >= end:
+                break
+        if not slices:
+            return embeddings[0][:0]
+        embeddings = slices
+
     return embeddings[0] if len(embeddings) == 1 else torch.cat(embeddings,
                                                                 dim=0)
 
@@ -337,22 +357,8 @@ def get_multimodal_embeddings(
         _store_chunked_prefill_embeddings(uncached_multimodal_params,
                                           encoder_embeddings)
 
-    # Step 4: Gather all embeddings for the batch
-    for param in multimodal_params:
-        # concatenate if embeds is a list of tensors
-        embeds = param.multimodal_data.get("multimodal_embedding")
-        if isinstance(embeds, list):
-            param.multimodal_data["multimodal_embedding"] = _join_embeddings(
-                embeds)
-
-    valid_params = [
-        param for param in multimodal_params
-        if param.multimodal_data.get("multimodal_embedding", None) is not None
-    ]
-    all_embeddings = _join_embeddings([
-        param.multimodal_data["multimodal_embedding"] for param in valid_params
-    ])
-    return [all_embeddings]
+    # Step 4: Gather after the stream wait and any encoder/cache writes.
+    return get_attached_multimodal_embeddings(multimodal_params)
 
 
 def get_attached_multimodal_embeddings(
@@ -360,19 +366,37 @@ def get_attached_multimodal_embeddings(
     """Gather embeddings already stored on MultimodalParams.
 
     Use this on E/P prefill workers and cached-only paths. The encoder already ran somewhere else.
-    This only makes the tensor list that `find_input_mm_embeds` slices.
+    Normally `find_input_mm_embeds` selects active rows afterwards. If item
+    scheduling attached current-chunk embeddings, select the same chunk from
+    any full-request embeddings before joining the batch. This keeps mixed
+    batches in one row layout without copying unrelated future chunks.
 
     Side-stream-prefetched requests must use `get_multimodal_embeddings`, which waits on
     `encoder_event` and registers attached tensors with the consuming stream before gathering them.
     """
+    current_chunk_only = any(
+        param.multimodal_data.get("multimodal_embedding_is_chunk", False)
+        for param in multimodal_params)
     attached_embeddings = []
     for param in multimodal_params:
         embeds = param.multimodal_data.get("multimodal_embedding")
         # No attached embedding for this request.
         if embeds is None:
             continue
-        # Some paths stash chunks. Slicer expects one tensor.
-        if isinstance(embeds, list):
+        runtime = param.multimodal_runtime
+        if (current_chunk_only and runtime is not None
+                and not param.multimodal_data.get(
+                    "multimodal_embedding_is_chunk", False)):
+            # Keep the full attached payload intact for later chunks/cache
+            # writes; only this forward's gathered tensor is chunk-local.
+            start = runtime.num_cached_mm_tokens
+            end = start + runtime.num_mm_tokens_in_chunk
+            if isinstance(embeds, list):
+                embeds = _join_embeddings(embeds, start=start, end=end)
+            else:
+                embeds = embeds[start:end]
+        elif isinstance(embeds, list):
+            # Legacy paths can attach a list of full-request output pieces.
             embeds = _join_embeddings(embeds)
             param.multimodal_data["multimodal_embedding"] = embeds
         if not isinstance(embeds, torch.Tensor):
@@ -450,6 +474,8 @@ def find_input_mm_embeds(
         )
 
     if total_mm_tokens == sum(mm_embed.shape[0] for mm_embed in mm_embeds):
+        # Item-scheduled batches were already sliced by the producer/gather
+        # path. Do not apply the cached-prefix offset a second time.
         return mm_embeds
 
     current_pos = 0

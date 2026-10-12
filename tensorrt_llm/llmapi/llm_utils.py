@@ -357,9 +357,11 @@ class CachedModelLoader:
 
     def __init__(self,
                  llm_args: LlmArgs,
-                 mpi_session: Optional[MpiSession] = None):
+                 mpi_session: Optional[MpiSession] = None,
+                 is_attached_frontend: bool = False):
         self.llm_args = llm_args
         self.mpi_session = mpi_session
+        self._is_attached_frontend = is_attached_frontend
         self._hf_model_dir: Optional[Path] = None
 
     def _submit_to_all_workers(
@@ -381,11 +383,16 @@ class CachedModelLoader:
         Also updates the model_obj.model_dir with the local model dir.
         """
         if model_obj.is_hub_model:
-            model_dirs = self._submit_to_all_workers(
-                CachedModelLoader._node_download_hf_model,
-                model=model_obj.model_name,
-                revision=revision)
-            model_dir = next((d for d in model_dirs if d is not None), None)
+            if self._is_attached_frontend:
+                # Attached frontends have no MPI session; resolve the cached
+                # snapshot locally, independent of their CUDA device index.
+                model_dir = download_hf_model(model_obj.model_name, revision)
+            else:
+                model_dirs = self._submit_to_all_workers(
+                    CachedModelLoader._node_download_hf_model,
+                    model=model_obj.model_name,
+                    revision=revision)
+                model_dir = next((d for d in model_dirs if d is not None), None)
             model_obj.model_dir = model_dir
             return model_dir
         return model_obj.model_dir

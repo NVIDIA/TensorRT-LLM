@@ -7,6 +7,11 @@ cleanup_on_failure() {
 
 mkdir -p $jobWorkspace
 mkdir -p "$testOutputDir"
+
+# Remove stale worker addresses and benchmark status from a previous run or requeue.
+rm -rf "${testOutputDir:?}"/hostnames-*
+rm -f "${testOutputDir:?}"/benchmark_status.*.txt
+
 chmod +x $runScript
 chmod +x $installScript
 
@@ -119,13 +124,24 @@ sleep 5  # Wait for pyxis container namespace initialization to avoid race condi
 echo "Starting benchmark..."
 export DISAGG_SERVING_TYPE="BENCHMARK"
 export pytestCommand="$pytestCommandBenchmark"
+# Heartbeat: keep the job log growing so CI's no-output watchdog doesn't cancel long runs.
+(
+    set +xeE +o pipefail
+    trap - ERR
+    while sleep 600; do
+        echo "[heartbeat $(date '+%F %T')] $(tail -c 200 "$testOutputDir"/trtllm-benchmark.*.log 2>/dev/null | tr '\r' '\n' | tail -n 1)"
+    done
+) &
+heartbeatPid=$!
 if ! srun "${srunArgs[@]}" --kill-on-bad-exit=1 --overlap \
     -N 1 \
     --ntasks=1 \
     --ntasks-per-node=1 \
     $runScript; then
+    kill $heartbeatPid 2>/dev/null || true
     cleanup_on_failure "Benchmark failed. See slurm-${SLURM_JOB_ID}.out"
 fi
+kill $heartbeatPid 2>/dev/null || true
 
 echo "Disagg server and benchmark completed successfully"
 echo "Total runtime: $SECONDS seconds"
