@@ -163,6 +163,9 @@ def _fail_unittests(reason: str, output_xml: str, output_dir: str,
 
 
 def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
+    if case == "unittest/_torch/executor":
+        raise AssertionError("Forced executor failure for rerun reporting validation")
+
     import pandas as pd
     import pynvml
     try:
