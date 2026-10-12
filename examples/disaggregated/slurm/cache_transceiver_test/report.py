@@ -89,6 +89,8 @@ def build_cases(cfg):
             # The V2 cache manager only supports the Python cache transceiver.
             if ver == "V2" and combination["runtime"] == "CPP":
                 continue
+            if ver == "V1" and combination["runtime"] == "PYTHON":
+                continue
             cases.append(
                 {
                     "backend": combination["backend"],

@@ -80,8 +80,8 @@ from tensorrt_llm._torch.disaggregation.nixl.agent import NixlTransferAgent
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
 from tensorrt_llm._torch.disaggregation.resource.page import CacheKind, KVCachePageTable, MapperKind
 from tensorrt_llm._torch.disaggregation.resource.utils import get_unique_pool_memory_descs
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
-from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._utils import CUASSERT, nvtx_range
 from tensorrt_llm.disaggregated_params import DisaggregatedParams, DisaggScheduleStyle
 
@@ -4476,7 +4476,7 @@ def _create_nixl_agent(
 
 
 def _make_aux_buffer(
-    kvm: KVCacheManager, max_slots: int, max_draft_len: Optional[int] = None
+    kvm: KVCacheManagerV2, max_slots: int, max_draft_len: Optional[int] = None
 ) -> Optional[AuxBuffer]:
     if max_slots <= 0:
         return None
@@ -4492,7 +4492,7 @@ def _make_aux_buffer(
 
 @dataclass
 class TransferWorkerConfig:
-    kv_cache_manager: KVCacheManager
+    kv_cache_manager: KVCacheManagerV2
     device_id: int
     instance_name: str
     max_concurrent_sessions: int = 0
@@ -4598,7 +4598,7 @@ class TransferWorker:
         """Forward to Sender to evict orphaned RecvReqInfo from ADP broadcast."""
         self._sender.sweep_stale_req_infos()
 
-    def _setup_peer_infrastructure(self, kvm: KVCacheManager):
+    def _setup_peer_infrastructure(self, kvm: KVCacheManagerV2):
         self._rank_info_server = RankInfoServer(self._rank_info) if kvm.mapping.rank == 0 else None
         self._kv_extractor = KVRegionExtractorV1(kvm)
         self._peer_registrar = PeerRegistrar(self._rank_info, self._kv_extractor)
