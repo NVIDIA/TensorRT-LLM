@@ -1001,6 +1001,7 @@ class TestWarmupCleanup(unittest.TestCase):
             forward_warmup=None,
             prepare_capture_batch=None,
             capture_additional_graphs=None,
+            context_promotion_supported=True,
         )
         resource_manager = ResourceManager({})
         events = []

@@ -28,15 +28,13 @@ from tensorrt_llm._torch.pyexecutor.engine.model_call import ModelCaller
 from tensorrt_llm._torch.pyexecutor.engine.multimodal import \
     setup_mm_encoder_attn_metadata
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import DecoderRunner
-from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.graphs import \
-    DecoderCudaGraphs
+from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.graphs import (
+    DecoderCudaGraphs, _make_single_token_context_graph_batch)
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.inputs import (
     DecoderInputBuffers, DecoderInputPreparer,
     _get_context_prompt_lookahead_token)
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.metadata import \
     DecoderMetadata
-from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner import \
-    _make_single_token_context_graph_batch
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.warmup import \
     DecoderWarmup
 from tensorrt_llm._torch.pyexecutor.engine.runners.interface import \
@@ -400,9 +398,16 @@ def _make_forward_only_engine(
     runner.needs_capture.return_value = False
     runner.is_warmup_only = False
     runner.replay.return_value = outputs
-    decoder._graphs = SimpleNamespace(cuda_graph_runner=runner,
-                                      breakable_cuda_graph_runner=None,
-                                      force_lora_graph_for_capture=None)
+    graphs = object.__new__(DecoderCudaGraphs)
+    graphs.cuda_graph_runner = runner
+    graphs.breakable_cuda_graph_runner = None
+    graphs._force_lora_graph_for_capture = None
+    graphs._config = decoder._config
+    graphs.mapping = decoder.mapping
+    graphs.model = decoder.model
+    graphs._lora = decoder._lora
+    graphs._context_promotion_supported = True
+    decoder._graphs = graphs
 
     resource_manager = Mock()
     peft_cache_manager = Mock(data_type=torch.bfloat16)
@@ -761,46 +766,46 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
 
     def test_multimodal_decode_compatibility_uses_final_prompt_token(
             self) -> None:
-        engine = object.__new__(DecoderRunner)
-        engine.model = SimpleNamespace(
+        graphs = object.__new__(DecoderCudaGraphs)
+        graphs.model = SimpleNamespace(
             config=SimpleNamespace(vocab_size=100),
             mm_token_ids=torch.tensor([99], dtype=torch.int32),
         )
-        engine._config = SimpleNamespace(use_mrope=False)
+        graphs._config = SimpleNamespace(use_mrope=False)
         request = _create_request_with_tokens([11, 99, 22], 1)
 
         request.context_current_position = 2
         self.assertTrue(
-            engine._is_final_multimodal_context_decode_compatible(request))
+            graphs._is_final_multimodal_context_decode_compatible(request))
 
         request.context_current_position = 1
         self.assertFalse(
-            engine._is_final_multimodal_context_decode_compatible(request))
+            graphs._is_final_multimodal_context_decode_compatible(request))
 
-        engine.model.mm_token_ids = None
+        graphs.model.mm_token_ids = None
         request = _create_request_with_tokens([11, 100], 2)
         request.context_current_position = 1
         self.assertFalse(
-            engine._is_final_multimodal_context_decode_compatible(request))
+            graphs._is_final_multimodal_context_decode_compatible(request))
 
-        engine.model.mm_token_ids = torch.tensor([99], dtype=torch.int32)
-        engine.model.model_config = SimpleNamespace(
+        graphs.model.mm_token_ids = torch.tensor([99], dtype=torch.int32)
+        graphs.model.model_config = SimpleNamespace(
             pretrained_config=SimpleNamespace(rope_scaling={"type": "mrope"}))
-        engine._config.use_mrope = True
+        graphs._config.use_mrope = True
         request = _create_request_with_tokens([11, 22], 3)
         request.context_current_position = 1
         request.py_multimodal_data = {"mrope_config": {}}
         self.assertTrue(
-            engine._is_final_multimodal_context_decode_compatible(request))
+            graphs._is_final_multimodal_context_decode_compatible(request))
 
         request.py_multimodal_data["multimodal_embedding"] = object()
         self.assertFalse(
-            engine._is_final_multimodal_context_decode_compatible(request))
+            graphs._is_final_multimodal_context_decode_compatible(request))
 
         request.py_multimodal_data["mrope_config"][
             "mrope_position_deltas"] = object()
         self.assertTrue(
-            engine._is_final_multimodal_context_decode_compatible(request))
+            graphs._is_final_multimodal_context_decode_compatible(request))
 
     def test_sparse_sequence_mode_uses_promoted_context_cursor(self) -> None:
         sparse_config = Mock(spec=SeqLenAwareSparseAttentionConfig)
@@ -1009,25 +1014,25 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
         )
 
     def test_lora_graph_variant_selection(self) -> None:
-        engine = object.__new__(DecoderRunner)
-        engine._lora = SimpleNamespace(cuda_graph_manager=object())
-        engine._graphs = SimpleNamespace(force_lora_graph_for_capture=None)
-        engine._config = SimpleNamespace(cuda_graph_specialize_lora=True)
+        graphs = object.__new__(DecoderCudaGraphs)
+        graphs._lora = SimpleNamespace(cuda_graph_manager=object())
+        graphs._force_lora_graph_for_capture = None
+        graphs._config = SimpleNamespace(cuda_graph_specialize_lora=True)
         request = _make_request_stub(7)
         batch = ScheduledRequests()
         batch.generation_requests = [request]
 
-        self.assertFalse(engine._use_lora_cuda_graph(batch))
+        self.assertFalse(graphs.use_lora_cuda_graph(batch))
 
         request.lora_task_id = 42
-        self.assertTrue(engine._use_lora_cuda_graph(batch))
+        self.assertTrue(graphs.use_lora_cuda_graph(batch))
 
         request.lora_task_id = None
-        engine._config.cuda_graph_specialize_lora = False
-        self.assertTrue(engine._use_lora_cuda_graph(batch))
+        graphs._config.cuda_graph_specialize_lora = False
+        self.assertTrue(graphs.use_lora_cuda_graph(batch))
 
-        engine._graphs.force_lora_graph_for_capture = False
-        self.assertFalse(engine._use_lora_cuda_graph(batch))
+        graphs._force_lora_graph_for_capture = False
+        self.assertFalse(graphs.use_lora_cuda_graph(batch))
 
     def test_graph_lookup_forwards_promoted_context_ids(self) -> None:
         runner = Mock()
@@ -1085,7 +1090,7 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
         with patch(
                 "tensorrt_llm._torch.pyexecutor.model_engine.torch.cuda.Event"
         ), patch(
-                "tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner._make_single_token_context_graph_batch"
+                "tensorrt_llm._torch.pyexecutor.engine.runners.decoder.graphs._make_single_token_context_graph_batch"
         ) as promote:
             actual_outputs = engine.forward(batch, resource_manager)
             self.assertEqual(actual_outputs, outputs)
@@ -1304,7 +1309,8 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
     def test_generation_lora_request_selects_lora_graph(self) -> None:
         key = (1, 0, False, False, True, True)
         engine, runner, resource_manager, _, _ = _make_forward_only_engine(key)
-        engine._runner._lora = SimpleNamespace(cuda_graph_manager=object())
+        engine._runner._lora = engine._runner._graphs._lora = SimpleNamespace(
+            cuda_graph_manager=object())
         engine._runner._config.cuda_graph_specialize_lora = True
         generation = _make_request_stub(2)
         generation.lora_task_id = 42
@@ -1350,7 +1356,7 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
                 elif case == "beam":
                     engine._runner._config.max_beam_width = 2
                 elif case == "extra_inputs":
-                    engine._runner._new_extra_inputs = Mock()
+                    engine._runner._graphs._context_promotion_supported = False
                 elif case == "ple_recurrent_state":
                     engine.model.has_ple = True
                 elif case == "nested_ple_recurrent_state":
@@ -2024,6 +2030,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
             forward_warmup=None,
             prepare_capture_batch=None,
             capture_additional_graphs=None,
+            context_promotion_supported=True,
         )
 
         engine.wait_for_input_copy()

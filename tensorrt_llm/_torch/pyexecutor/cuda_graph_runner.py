@@ -1294,7 +1294,7 @@ class CUDAGraphRunner:
         """Finds the smallest graph batch size >= batch_size that also matches the given draft_len.
 
         The dynamic draft length mapping exists exactly when the dynamic draft
-        length feature is active (see _compute_dynamic_draft_len_mapping);
+        length feature is active (see compute_dynamic_draft_len_mapping);
         without it, this ignores draft_len and reduces to plain batch-size
         rounding.
         """

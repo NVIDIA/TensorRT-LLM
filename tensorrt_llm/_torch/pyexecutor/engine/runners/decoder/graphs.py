@@ -4,6 +4,7 @@
 """Decoder CUDA graph capture and replay state."""
 
 import contextlib
+import functools
 import os
 from collections.abc import Callable
 from contextlib import contextmanager
@@ -11,15 +12,34 @@ from typing import Any
 
 import torch
 
+from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
 from tensorrt_llm._torch.autotuner import AutoTuner, autotune
 from tensorrt_llm._torch.compilation.piecewise_optimizer import PiecewiseRunner
 from tensorrt_llm._torch.compilation.utils import capture_piecewise_cuda_graph
 from tensorrt_llm._torch.models.modeling_utils import timing_metric
+from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import (
+    MoeLoadBalancer,
+    MoeLoadBalancerIterContext,
+)
 from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph_runner import BreakableCUDAGraphRunner
-from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDAGraphRunner
-from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager, ResourceManagerType
+from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDAGraphRunner, KeyType
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, get_draft_token_length
+from tensorrt_llm._torch.pyexecutor.resource_manager import (
+    KVCacheManager,
+    ResourceManager,
+    ResourceManagerType,
+)
 from tensorrt_llm._torch.pyexecutor.sampler.sampler_common import SampleType
+from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
+from tensorrt_llm._torch.pyexecutor.scheduler.scheduler import RemoteTailPhase
+from tensorrt_llm._torch.speculative import (
+    prepare_attn_metadata_for_draft_replay,
+    restore_attn_metadata_after_draft_replay,
+)
 from tensorrt_llm._torch.speculative.utils import get_static_draft_len
+from tensorrt_llm._torch.utils import get_per_request_prefill_cuda_graph_flag
+from tensorrt_llm.inputs.multimodal import _has_mm_payload_keys
 from tensorrt_llm.llmapi.llm_args import (
     BaseSparseAttentionConfig,
     PrefillCudaGraphBackend,
@@ -29,10 +49,102 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
 from ...lora import LoraParamBuilder
+from ..common import get_top_level_model, prepare_multimodal_indices
 from .config import DecoderRunnerConfig
 from .dummy_requests import DummyRequestFactory
 from .metadata import DecoderMetadata
 from .warmup import WarmupAgreement
+
+
+def _make_single_token_context_graph_batch(
+    scheduled_requests: ScheduledRequests,
+    is_multimodal_decode_compatible: Callable[[LlmRequest], bool] | None = None,
+) -> tuple[ScheduledRequests, frozenset[int]]:
+    """Build a decode-shaped graph candidate for final one-token contexts.
+
+    Multimodal rows remain fail-closed unless the engine proves that their one
+    remaining prompt token is representable by the existing decode provider.
+    """
+    if scheduled_requests.num_context_requests == 0:
+        return scheduled_requests, frozenset()
+
+    context_requests = scheduled_requests.context_requests_last_chunk
+    if scheduled_requests.encoder_requests or scheduled_requests.context_requests_chunking:
+        return scheduled_requests, frozenset()
+
+    for request in context_requests:
+        if (
+            request.context_chunk_size != 1
+            or request.context_remaining_length != 1
+            or request.context_current_position + 1 != request.py_prompt_len
+            or request.py_beam_width != 1
+            or get_draft_token_length(request) > 0
+            or request.py_is_first_draft
+            or request.is_context_only_request
+            or request.is_generation_only_request
+            or request.py_disaggregated_params is not None
+            or request.py_mm_encoder_event is not None
+            or (
+                request.py_multimodal_data is not None
+                and (
+                    is_multimodal_decode_compatible is None
+                    or not is_multimodal_decode_compatible(request)
+                )
+            )
+        ):
+            return scheduled_requests, frozenset()
+
+    for request in scheduled_requests.generation_requests:
+        if (
+            request.py_beam_width != 1
+            or get_draft_token_length(request) > 0
+            or request.py_is_first_draft
+            or request.py_disaggregated_params is not None
+        ):
+            return scheduled_requests, frozenset()
+
+    graph_batch = ScheduledRequests()
+    graph_batch.generation_requests = list(context_requests) + list(
+        scheduled_requests.generation_requests
+    )
+    graph_batch.paused_requests = list(scheduled_requests.paused_requests)
+    promoted_context_request_ids = frozenset(request.py_request_id for request in context_requests)
+    return graph_batch, promoted_context_request_ids
+
+
+def compute_dynamic_draft_len_mapping(config: DecoderRunnerConfig) -> dict[int, int] | None:
+    """Compute graph_bs → draft_len mapping for dynamic draft length feature.
+
+    Example: draft_len_schedule = {4:4, 8:2, 32:1}, cuda_graph_batch_sizes = [1,2,3,4,5,6,7,8,16,24,32,64]
+    - Batch sizes 1-4:   use draft_len=4 (up to key 4)
+    - Batch sizes 5-8:   use draft_len=2 (up to key 8)
+    - Batch sizes 9-32:  use draft_len=1 (up to key 32)
+    - Batch sizes 33+:   use draft_len=0 (implicit, speculation disabled)
+
+    Returns: {1:4, 2:4, 3:4, 4:4, 5:2, 6:2, 7:2, 8:2, 16:1, 24:1, 32:1, 64:0}
+    """
+    # Dynamic draft length for CUDA graphs is only supported for one-model path
+    if (
+        not config.spec_config
+        or not config.spec_config.draft_len_schedule
+        or not config.spec_config.spec_dec_mode.support_dynamic_draft_len()
+    ):
+        return None
+
+    schedule = config.spec_config.draft_len_schedule
+    schedule_keys = list(schedule.keys())
+
+    mapping = {}
+    key_idx = 0
+    for graph_bs in config.cuda_graph_batch_sizes:
+        while key_idx < len(schedule_keys) and schedule_keys[key_idx] < graph_bs:
+            key_idx += 1
+        if key_idx < len(schedule_keys):
+            draft_len = schedule[schedule_keys[key_idx]]
+        else:
+            draft_len = 0
+        mapping[graph_bs] = draft_len
+    return mapping
 
 
 class DecoderCudaGraphs:
@@ -58,6 +170,7 @@ class DecoderCudaGraphs:
         forward_warmup: Callable[..., Any],
         prepare_capture_batch: Callable[..., Any],
         capture_additional_graphs: Callable[[ResourceManager], None],
+        context_promotion_supported: bool,
     ) -> None:
         self.cuda_graph_runner = cuda_graph_runner
         self.breakable_cuda_graph_runner = breakable_cuda_graph_runner
@@ -76,6 +189,8 @@ class DecoderCudaGraphs:
         self._forward_warmup = forward_warmup
         self._prepare_capture_batch = prepare_capture_batch
         self._capture_additional_cuda_graphs = capture_additional_graphs
+        # Promoted context rows carry no per-sequence extra model inputs.
+        self._context_promotion_supported = context_promotion_supported
         self._force_lora_graph_for_capture: bool | None = None
 
     @property
@@ -115,6 +230,171 @@ class DecoderCudaGraphs:
                 autotuner.cache_pp_recv()
                 autotuner.cache_pp_send()
                 autotuner.clean_pp_flag()
+
+    def use_lora_cuda_graph(self, scheduled_requests: ScheduledRequests) -> bool:
+        """
+        Determines whether a non-LoRA or LoRA CUDA graph should be used, if
+        both are available (cuda_graph_specialize_lora==True).
+        """
+        if self._lora.cuda_graph_manager is None:
+            return False
+        # Needed during graph capture to enforce a given mode
+        if self.force_lora_graph_for_capture is not None:
+            return self.force_lora_graph_for_capture
+        if not self._config.cuda_graph_specialize_lora:
+            return True
+        return any(
+            request.lora_task_id is not None for request in scheduled_requests.generation_requests
+        )
+
+    def promote_final_contexts(
+        self,
+        scheduled_requests: ScheduledRequests,
+        kv_cache_manager: KVCacheManager | KVCacheManagerV2,
+        *,
+        enable_spec_decode: bool,
+        runtime_draft_len: int,
+        ced_enabled: bool,
+    ) -> tuple[ScheduledRequests, frozenset[int]]:
+        """Return the graph batch, with final one-token contexts run as decode rows."""
+        # Non-linear tree decoding expands runtime_draft_len to the total
+        # tree width after graph selection. Only linear-tree zero-draft
+        # iterations can therefore safely reuse a zero-draft graph.
+        can_promote_spec_decode = not enable_spec_decode or (
+            runtime_draft_len == 0
+            and self._config.spec_config is not None
+            and self._config.spec_config.is_linear_tree
+        )
+        # TODO: Generalize these conservative gates as actual-draft, beam, and
+        # context-parallel providers for decoder-only LLMs gain support for
+        # promoted final-context rows. Each relaxation must preserve whole-batch
+        # fallback on graph miss and prove parity with the provider's native
+        # q_len=1 path. Encoder-decoder and non-LLM engines remain out of scope.
+        if not (
+            scheduled_requests.num_context_requests > 0
+            and scheduled_requests.attention_dp_phase is not RemoteTailPhase.CONTEXT
+            # A physically pruned context cache cannot become a decode
+            # batch, including single-token synthetic prefill warmup rows.
+            and getattr(kv_cache_manager, "context_swa_layer_limit", None) is None
+            and self.cuda_graph_runner.enabled
+            and can_promote_spec_decode
+            and not ced_enabled
+            and self._config.max_beam_width == 1
+            and self._context_promotion_supported
+            # PLE owns recurrent n-gram and convolution state. Promoting a
+            # fresh final-context row would skip its cache-slot reset.
+            and not self._model_uses_ple_recurrent_state
+            and self.mapping.cp_size == 1
+        ):
+            return scheduled_requests, frozenset()
+        return _make_single_token_context_graph_batch(
+            scheduled_requests, self._is_final_multimodal_context_decode_compatible
+        )
+
+    def _is_final_multimodal_context_decode_compatible(self, request: LlmRequest) -> bool:
+        """Return whether the final prompt token uses the decode input path.
+
+        KV reuse has already materialized every preceding prompt token. A
+        multimodal final-context row therefore needs its prepared embedding
+        only when the one remaining token is itself an MM placeholder. Text
+        tokens can use the existing decode provider; MRoPE deltas are seeded
+        into the per-sequence cache before graph lookup. An MRoPE request with
+        real MM payload remains eager until its delta is available.
+        """
+        final_prompt_token = request.get_tokens(0)[request.context_current_position]
+        _, mm_token_indices = prepare_multimodal_indices([final_prompt_token], model=self.model)
+        if mm_token_indices.numel() != 0:
+            return False
+
+        multimodal_data = request.py_multimodal_data
+        if not self._config.use_mrope or not _has_mm_payload_keys(multimodal_data):
+            return True
+        return CUDAGraphRunner._get_mrope_position_delta(request) is not None
+
+    @functools.cached_property
+    def _model_uses_ple_recurrent_state(self) -> bool:
+        """Detect PLE on text-only and multimodal model wrappers.
+
+        The answer is fixed once the model is loaded, and the CUDA-graph gate
+        below consults it on every forward that has context requests.
+        """
+        top_level_model = get_top_level_model(self.model)
+        if getattr(top_level_model, "has_ple", False):
+            return True
+        llm = getattr(top_level_model, "llm", None)
+        text_model = getattr(llm, "model", llm)
+        return bool(getattr(text_model, "has_ple", False))
+
+    def run(
+        self,
+        key: KeyType | None,
+        inputs: dict[str, Any],
+        run_model: Callable[[dict[str, Any]], Any],
+        postprocess_inputs: Callable[[dict[str, Any]], None],
+        *,
+        attn_metadata: AttentionMetadata,
+        draft_kv_cache_manager: KVCacheManager | KVCacheManagerV2 | None,
+        moe_load_balancer: MoeLoadBalancer | None,
+        enable_spec_decode: bool,
+        gather_context_logits: bool,
+        position_id_offsets: torch.Tensor | None,
+    ) -> Any:
+        """Run the model by replaying the graph for ``key``, capturing it first if needed.
+
+        Without a key, run through a breakable prefill graph when one covers
+        the tokens, otherwise eagerly.
+        """
+        breakable_runner = self.breakable_cuda_graph_runner
+        if key is None:
+            num_tokens = inputs["input_ids"].shape[0]
+            can_run_breakable_graph = (
+                breakable_runner is not None
+                and get_per_request_prefill_cuda_graph_flag()
+                and not gather_context_logits
+                and breakable_runner.has_graph(num_tokens)
+            )
+            if can_run_breakable_graph and not breakable_runner.is_warming_up:
+                outputs = breakable_runner.execute(num_tokens, lambda: run_model(inputs))
+            else:
+                # real eager or BCG warmup or PCG
+                outputs = run_model(inputs)
+        else:
+            needs_capture = self.cuda_graph_runner.needs_capture(key)
+            if needs_capture:
+                capture_outputs = self.cuda_graph_runner.capture(
+                    key,
+                    run_model,
+                    inputs,
+                    enable_spec_decode=enable_spec_decode,
+                    postprocess_fn=postprocess_inputs,
+                )
+
+            if self.cuda_graph_runner.is_warmup_only:
+                outputs = capture_outputs
+            elif needs_capture:
+                # Refresh attention metadata for the current batch's
+                # draft cache before replaying the captured graph.
+                saved_draft = prepare_attn_metadata_for_draft_replay(
+                    attn_metadata, draft_kv_cache_manager
+                )
+                try:
+                    outputs = self.cuda_graph_runner.replay(
+                        key, inputs, position_id_offsets=position_id_offsets
+                    )
+                finally:
+                    restore_attn_metadata_after_draft_replay(attn_metadata, saved_draft)
+            else:
+                saved_draft = prepare_attn_metadata_for_draft_replay(
+                    attn_metadata, draft_kv_cache_manager
+                )
+                try:
+                    with MoeLoadBalancerIterContext(moe_load_balancer):
+                        outputs = self.cuda_graph_runner.replay(
+                            key, inputs, position_id_offsets=position_id_offsets
+                        )
+                finally:
+                    restore_attn_metadata_after_draft_replay(attn_metadata, saved_draft)
+        return outputs
 
     def _get_graphs_to_capture(self, cuda_graph_batch_sizes: list[int]) -> list[tuple[int, int]]:
         """Determine which (batch_size, draft_len) graphs to capture.
