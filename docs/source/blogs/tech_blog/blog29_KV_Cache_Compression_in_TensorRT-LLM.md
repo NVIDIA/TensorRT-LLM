@@ -281,7 +281,7 @@ The gain is not tied to one setup. Figure 12 details the four configurations wit
 
 The frontier gains above come mostly from a higher hit rate, but the benefit does not stop when the hit rate saturates. There are **two cases**.
 
-**The hit rate rises.** When the host tier cannot hold the working set, a smaller cold page means more prefixes are still there when the next turn arrives. In the configurations of Figure 12 the hit rate rises by **5 to 34 points**. The effect is clearest in a GPU-limited deployment (Figure 13): Qwen3.5-397B-A17B on ten GB300s at concurrency 192 reads only 57% of prefixes uncompressed. As the disk tier grows from 0 to 1,024 GiB, NVFP4 hits more, completes more and answers sooner at every size, peaking at **64% more requests completed and 48% sooner** at 512 GiB.
+**The hit rate rises.** When the host tier cannot hold the working set, a smaller cold page means more prefixes are still there when the next turn arrives. In the configurations of Figure 12 the hit rate rises by **5 to 34 points**. The effect is clearest in a GPU-limited deployment (Figure 13), where the uncompressed tier reads barely half of the prefixes: at every disk-tier size NVFP4 hits more, completes more and answers sooner, peaking at **64% more requests completed and 48% lower TTFT**.
 
 <div align="center">
 <figure>
@@ -290,7 +290,7 @@ The frontier gains above come mostly from a higher hit rate, but the benefit doe
 </div>
 <p align="center"><sub><em>Figure 13: Qwen3.5-397B-A17B · ten GB300s · concurrency 192 · growing disk tier. NVFP4 completes more requests, hits more, and answers sooner at every disk size.</em></sub></p>
 
-**The hit rate is saturated, and the hits move from disk to host.** Even when the hit rate cannot rise further, cold pages still pay: a hit served from disk costs far more than one served from host memory, and a hit rate alone does not tell them apart. TensorRT LLM now counts every hit by the tier that served it. Figure 14 shows two cases on one GB300 node with the GPU cache capped: the hit rate barely changes, but the share of hits served from disk falls from **31% to 19%** for GLM-5.2 and from **14% to 0%** for Qwen3.5-397B-A17B, tail TTFT roughly halves, and 40% to 50% more requests complete in the same window. The same host memory holds more pages, so **less disk is used and the prefixes come back faster**.
+**The hit rate is saturated, and the hits move from disk to host.** Even when the hit rate cannot rise further, cold pages still pay: a hit served from disk costs far more than one served from host memory, and a hit rate alone does not tell them apart. TensorRT LLM now counts every hit by the tier that served it. Figure 14 shows two cases on one GB300 node with the GPU cache capped: the hit rate barely changes, but the share of hits served from disk falls from **31% to 19%** for GLM-5.2 and from **14% to 0%** for Qwen3.5-397B-A17B, **tail TTFT roughly halves**, and **40% to 50% more requests complete** in the same window. The same host memory holds more pages, so **less disk is used and the prefixes come back faster**.
 
 <div align="center">
 <figure>
