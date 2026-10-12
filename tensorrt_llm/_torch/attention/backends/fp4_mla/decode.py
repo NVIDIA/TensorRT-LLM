@@ -936,8 +936,8 @@ def run_fp4_mla_attention_decode(
             )
         if not _cutedsl_backend_available():
             raise RuntimeError(
-                "FP4 MLA cutedsl attention backend requires the Rubin CTM and "
-                "CuTeDSL runtime packages."
+                "FP4 MLA cutedsl attention backend requires the nvidia-cutlass-dsl "
+                "and cuda-python packages."
             )
         if not 0 < num_heads <= 128 or kv_lora_rank != 512:
             raise ValueError(

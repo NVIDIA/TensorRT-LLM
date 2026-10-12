@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """FP4 MLA storage constants, backend selection, and kernel tuning policy."""
 
+import functools
 import importlib.util
 import os
 from typing import Any, Literal, Optional
@@ -138,16 +139,26 @@ def _fp4_mla_attention_backend() -> str:
     backend = os.getenv(FP4_MLA_ATTENTION_BACKEND_ENV)
     if backend:
         return backend.lower()
-    return _FP4_MLA_CUTEDSL_BACKEND if get_sm_version() == 107 else "triton"
+    if get_sm_version() == 107 and _cutedsl_backend_available():
+        return _FP4_MLA_CUTEDSL_BACKEND
+    return "triton"
 
 
+# Modules the FP4 MLA CuTe DSL kernels import.
+_CUTEDSL_REQUIRED_MODULES = (
+    "cutlass.cute",
+    "cutlass.experimental",
+    "cuda.bindings.driver",
+)
+
+
+@functools.cache
 def _cutedsl_backend_available() -> bool:
     try:
         return all(
-            importlib.util.find_spec(module) is not None
-            for module in ("ctm", "cutlass", "cuda.bindings.driver")
+            importlib.util.find_spec(module) is not None for module in _CUTEDSL_REQUIRED_MODULES
         )
-    except ModuleNotFoundError:
+    except ImportError:
         return False
 
 
