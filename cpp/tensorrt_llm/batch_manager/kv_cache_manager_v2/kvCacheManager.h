@@ -270,6 +270,11 @@ public:
     void commitReusedBlocksByLevel(ReusedBlocksByLevelByLifeCycle const& byLifeCycle);
     ReusedBlocksByLevelByLifeCycle getAndResetIterationReusedBlocksByLevel();
 
+    // The KV-connector-loaded share of the reused blocks, committed alongside the scalar iteration
+    // stats that already include it.
+    void commitConnectorReusedBlocks(ConnectorReusedBlocksByLifeCycle const& byLifeCycle);
+    ConnectorReusedBlocksByLifeCycle getAndResetIterationConnectorReusedBlocks();
+
     // Count one ACTIVE->SUSPENDED transition for the current iteration window.
     void recordRequestSuspended();
     // Count one preemption recovery for the current iteration window. Only a
@@ -457,6 +462,7 @@ private:
     IterationStatsByLifeCycle mIterationStatsByLifeCycle;
     SsmSnapshotIterationStatsByLifeCycle mSsmSnapshotIterationStatsByLifeCycle;
     ReusedBlocksByLevelByLifeCycle mIterReusedBlocksByLevel;
+    ConnectorReusedBlocksByLifeCycle mIterConnectorReusedBlocks;
     PeakBlockStatsByCacheLevel mIterationPeakNumBlocksByCacheLevel;
     std::unordered_set<RequestIdType> mDirtyStatsKvCacheIds;
     std::unordered_set<RequestIdType> mStatsExcludedKvCacheIds;

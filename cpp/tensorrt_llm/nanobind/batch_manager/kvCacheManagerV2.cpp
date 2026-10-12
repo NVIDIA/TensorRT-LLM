@@ -1932,6 +1932,11 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def("close", &kv::KvCache::close, nb::call_guard<nb::gil_scoped_release>())
         .def("commit_pending_stats", &kv::KvCache::commitPendingStats, nb::call_guard<nb::gil_scoped_release>())
         .def("discard_pending_stats", &kv::KvCache::discardPendingStats, nb::call_guard<nb::gil_scoped_release>())
+        .def(
+            "record_connector_reuse",
+            [](kv::KvCache& self, int blockBegin, int blockEnd)
+            { self.recordConnectorReuse(kv::BlockOrdinal{blockBegin}, kv::BlockOrdinal{blockEnd}); },
+            nb::arg("block_begin"), nb::arg("block_end"), nb::call_guard<nb::gil_scoped_release>())
         .def("drop_cached_token_attribution", &kv::KvCache::dropCachedTokenAttribution,
             nb::call_guard<nb::gil_scoped_release>())
         .def("drop_partial_block_cached_token_attribution", &kv::KvCache::dropPartialBlockCachedTokenAttribution,
@@ -2738,6 +2743,21 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 for (auto const& [lifeCycle, byLevel] : stats)
                 {
                     result[nb::cast(lifeCycle.value())] = nb::cast(byLevel);
+                }
+                return result;
+            })
+        .def("get_and_reset_iteration_connector_reused_blocks",
+            [](kv::KvCacheManager& self)
+            {
+                auto stats = [&]
+                {
+                    nb::gil_scoped_release release;
+                    return self.getAndResetIterationConnectorReusedBlocks();
+                }();
+                nb::dict result;
+                for (auto const& [lifeCycle, numBlocks] : stats)
+                {
+                    result[nb::cast(lifeCycle.value())] = nb::cast(numBlocks);
                 }
                 return result;
             })

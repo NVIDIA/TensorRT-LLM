@@ -2437,6 +2437,7 @@ def test_iteration_stats_reports_physical_pool_groups_without_window_metadata() 
         get_and_reset_iteration_disk_prefetch_blocks=lambda: 7,
         get_and_reset_iteration_cached_tokens_by_level=lambda: [5, 2, 1],
         get_and_reset_iteration_reused_blocks_by_level=lambda: {},
+        get_and_reset_iteration_connector_reused_blocks=lambda: {},
     )
     manager._stats_life_cycle_metadata = lambda: {3: (1, None, "ssm")}
     manager._storage_pool_groups_by_window = lambda: {}
