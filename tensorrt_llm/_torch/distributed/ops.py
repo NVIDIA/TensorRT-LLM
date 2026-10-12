@@ -25,6 +25,7 @@ from torch import nn
 from tensorrt_llm._mnnvl_utils import HelixCpMnnvlMemory, MnnvlMemory
 from tensorrt_llm._torch.distributed.allreduce_helper import \
     CustomAllReduceHelper
+from tensorrt_llm._torch.distributed.process_group_ops import process_group_name
 from tensorrt_llm._torch.distributed.symm_mem_allreduce import \
     SymmetricMemoryAllReduce
 from tensorrt_llm._torch.utils import get_model_extra_attrs
@@ -44,6 +45,15 @@ from tensorrt_llm.mapping import Mapping
 # equivalent to a C++ static-bool cached env var.
 _NCCL_SYMMETRIC_ZERO_COPY: bool = (os.environ.get(
     "TLLM_NCCL_SYMMETRIC_ZERO_COPY", "1") == "1")
+
+# Route the plain NCCL all-reduce (MPI disabled, no fusion) through the c10d
+# functional collective instead of ``trtllm::allreduce_pg_by_name``.  Both
+# run ``ProcessGroup.allreduce(SUM)`` on a copy of the input, so eager
+# outputs are bitwise identical; under torch.compile Inductor re-inplaces
+# the functional op onto the dead producer output, which removes the copy
+# the C++ ProcessGroup path always pays.  Internal default only: a benchmark
+# may flip it process-wide, a caller per instance via ``AllReduce(...)``.
+_USE_FUNCTIONAL_NCCL_ALLREDUCE: bool = True
 
 _MNNVL_ONE_SHOT_THRESHOLD_BYTES = 64 * 1024 * 8 * 2
 
@@ -407,7 +417,7 @@ def _allgather(
     input: Union[torch.Tensor, List[torch.Tensor]],
     group: List[int],
     rank: int,
-    group_boxed: Optional[object] = None,
+    group_name: Optional[str] = None,
     dim: int = -1,
     sizes: Optional[List[int]] = None,
 ) -> Union[torch.Tensor, List[torch.Tensor]]:
@@ -418,7 +428,8 @@ def _allgather(
         input (Union[Tensor, List[Tensor]]): The input tensor or tensor list.
         group (List[int]): The list of ranks to participate in the all-gather.
         rank (int): The rank of the current process.
-        group_boxed (object): The boxed ProcessGroup object for the list of ranks, if available.
+        group_name (str): The c10d name of the ProcessGroup for 'group'. Required when MPI is disabled;
+            the op resolves the group by name internally so the call stays torch.compile-traceable.
         dim (int): Gather along given dimension. By default -1.
         sizes(Optional[List[int]]): An optional list indicating 'input.shape[dim]' in all ranks. By default None.
     Returns:
@@ -439,7 +450,7 @@ def _allgather(
     # Inputs are reshaped in this way to pass necessary shape information to the allgather op
     if isinstance(input, torch.Tensor):
         if mpi_disabled():
-            torch_op = torch.ops.trtllm.allgather_pg
+            torch_op = torch.ops.trtllm.allgather_pg_by_name
         else:
             torch_op = torch.ops.trtllm.allgather
 
@@ -448,7 +459,7 @@ def _allgather(
     else:
         input, valid = filter_valid_input(input)
         if mpi_disabled():
-            torch_op = torch.ops.trtllm.allgather_list_pg
+            torch_op = torch.ops.trtllm.allgather_list_pg_by_name
         else:
             torch_op = torch.ops.trtllm.allgather_list
 
@@ -459,7 +470,7 @@ def _allgather(
         ]
 
     if mpi_disabled():
-        output = torch_op(input, sizes, group, group_boxed)
+        output = torch_op(input, sizes, group, group_name)
     else:
         output = torch_op(input, sizes, group)
 
@@ -517,9 +528,10 @@ def allgather(
     Returns:
         The gathered tensor or tensor list.
     '''
-    group_boxed = mapping.tp_group_pg.boxed() if mpi_disabled() else None
-    return _allgather(input, mapping.tp_group, mapping.tp_rank, group_boxed,
-                      dim, sizes)
+    group_name = process_group_name(
+        mapping.tp_group_pg) if mpi_disabled() else None
+    return _allgather(input, mapping.tp_group, mapping.tp_rank, group_name, dim,
+                      sizes)
 
 
 def cp_allgather(
@@ -541,9 +553,10 @@ def cp_allgather(
     Returns:
         The gathered tensor or tensor list.
     '''
-    group_boxed = mapping.cp_group_pg.boxed() if mpi_disabled() else None
-    return _allgather(input, mapping.cp_group, mapping.cp_rank, group_boxed,
-                      dim, sizes)
+    group_name = process_group_name(
+        mapping.cp_group_pg) if mpi_disabled() else None
+    return _allgather(input, mapping.cp_group, mapping.cp_rank, group_name, dim,
+                      sizes)
 
 
 def alltoall_helix(
@@ -703,7 +716,7 @@ def reducescatter(
 
     if isinstance(input, torch.Tensor):
         if mpi_disabled():
-            torch_op = torch.ops.trtllm.reducescatter_pg
+            torch_op = torch.ops.trtllm.reducescatter_pg_by_name
         else:
             torch_op = torch.ops.trtllm.reducescatter
         output_info = get_output_info(input, dim)
@@ -711,7 +724,7 @@ def reducescatter(
     else:
         input, valid = filter_valid_input(input)
         if mpi_disabled():
-            torch_op = torch.ops.trtllm.reducescatter_list_pg
+            torch_op = torch.ops.trtllm.reducescatter_list_pg_by_name
         else:
             torch_op = torch.ops.trtllm.reducescatter_list
         output_info = [get_output_info(val, dim) for val in input]
@@ -722,7 +735,7 @@ def reducescatter(
 
     if mpi_disabled():
         output = torch_op(input, sizes, mapping.tp_group,
-                          mapping.tp_group_pg.boxed())
+                          process_group_name(mapping.tp_group_pg))
     else:
         output = torch_op(input, sizes, mapping.tp_group)
 
@@ -975,7 +988,8 @@ class AllReduce(nn.Module):
     def __init__(self,
                  mapping: Mapping,
                  strategy: AllReduceStrategy = AllReduceStrategy.AUTO,
-                 dtype: Optional[torch.dtype] = None):
+                 dtype: Optional[torch.dtype] = None,
+                 use_functional_nccl: Optional[bool] = None):
         super().__init__()
         """
         AllReduce is a module that performs an all-reduce operation on a tensor.
@@ -1013,6 +1027,12 @@ class AllReduce(nn.Module):
             Note: NCCL, UB, and LOWPRECISION strategies only support consequent kernel calls
         instead of fused operations.
 
+            use_functional_nccl (Optional[bool]):
+                With MPI disabled and ``strategy=NCCL``, run un-fused all-reduces
+                through ``torch.ops._c10d_functional`` instead of the C++
+                ProcessGroup op.  ``None`` takes the module default
+                ``_USE_FUNCTIONAL_NCCL_ALLREDUCE``.  Ignored when MPI is enabled.
+
         Note:
             For the reference implementation for each pattern, please refer to the following unit test:
             https://github.com/NVIDIA/TensorRT-LLM/blob/main/tests/unittest/_torch/multi_gpu/test_allreduce.py
@@ -1027,7 +1047,31 @@ class AllReduce(nn.Module):
         self.symm_mem_allreduce = None
         self._disable_mpi = mpi_disabled()
 
-        self.all_reduce_op = torch.ops.trtllm.allreduce_pg if self._disable_mpi else torch.ops.trtllm.allreduce
+        self.all_reduce_op = torch.ops.trtllm.allreduce_pg_by_name if self._disable_mpi else torch.ops.trtllm.allreduce
+
+        # With MPI disabled the C++ op needs the TP ProcessGroup.  Resolve its
+        # c10d name and our global rank once here instead of calling
+        # ``ProcessGroup.boxed()`` in forward(): a boxed ProcessGroup cannot be
+        # traced by torch.compile (no fake class), so every call was a graph
+        # break and ``fullgraph=True`` was impossible.  The name is a plain str
+        # that ``trtllm::allreduce_pg_by_name`` resolves back to the group.
+        self._tp_group_name: Optional[str] = None
+        self._global_rank: Optional[int] = None
+        if (self._disable_mpi and self.mapping.tp_size > 1
+                and torch.distributed.is_initialized()):
+            self._tp_group_name = process_group_name(self.mapping.tp_group_pg)
+            self._global_rank = torch.distributed.get_rank()
+
+        # Static half of the functional-collective route (see forward()).
+        # Only the MPI-disabled ProcessGroup path qualifies: with MPI enabled
+        # the NCCL strategy may be handed a pre-allocated NCCL-window output
+        # (uses_nccl_symmetric_memory_window), which this route cannot honour.
+        if use_functional_nccl is None:
+            use_functional_nccl = _USE_FUNCTIONAL_NCCL_ALLREDUCE
+        self._use_functional_nccl: bool = (self._disable_mpi
+                                           and bool(use_functional_nccl)
+                                           and self.strategy
+                                           == AllReduceStrategy.NCCL)
 
         # Propagate model-level prealloc config to AllReduceRunner once per
         # process.  extra_attrs is only active during model __init__, so we
@@ -1206,13 +1250,29 @@ class AllReduce(nn.Module):
 
         additional_args = {}
         if self._disable_mpi:
-            # Get ProcessGroup from mapping
-            pg = self.mapping.tp_group_pg
-            assert pg is not None, "TP ProcessGroup not initialised"
-            additional_args = {
-                "rank": torch.distributed.get_rank(),
-                "pg": pg.boxed(),
-            }
+            group_name = self._tp_group_name
+            rank = self._global_rank
+            if group_name is None:
+                # Not resolvable at construction (process group was not yet
+                # initialised); resolve now.  Both accesses trace under
+                # torch.compile, so this branch does not break the graph.
+                pg = self.mapping.tp_group_pg
+                assert pg is not None, "TP ProcessGroup not initialised"
+                group_name = process_group_name(pg)
+                rank = torch.distributed.get_rank()
+            if (self._use_functional_nccl
+                    and all_reduce_params.fusion_op == AllReduceFusionOp.NONE
+                    and all_reduce_params.residual is None
+                    and all_reduce_params.norm_weight is None
+                    and all_reduce_params.bias is None
+                    and all_reduce_params.scale is None):
+                # Bitwise the C++ ProcessGroup path and re-inplaceable under
+                # torch.compile (see _USE_FUNCTIONAL_NCCL_ALLREDUCE); returned
+                # unwrapped like that path's single fusion-NONE output.
+                output = torch.ops._c10d_functional.all_reduce(
+                    input, "sum", group_name)
+                return torch.ops._c10d_functional.wait_tensor(output)
+            additional_args = {"rank": rank, "group_name": group_name}
 
         # In case that AutoTuner brings potential perf regression
         # TODO: Remove this if no perf regression is observed.

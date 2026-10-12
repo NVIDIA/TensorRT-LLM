@@ -1,5 +1,5 @@
 from functools import wraps
-from typing import TYPE_CHECKING, List
+from typing import TYPE_CHECKING, Dict, List, Optional
 
 import torch
 import torch.distributed as dist
@@ -44,32 +44,33 @@ class SingleProcessGroup:
 class DeviceMeshTopologyImpl(_MappingBaseForTypeCheck):
     device_mesh = None
     tp_mesh = None
+    # Mesh-dim name -> ProcessGroup, filled by build_mesh() and validated
+    # against the mesh it was built from (tests reset ``device_mesh``).  The
+    # ``*_group_pg`` properties are then plain dict reads, which torch.compile
+    # folds to constants instead of breaking the graph on a DeviceMesh slice.
+    _group_cache: Dict[str, ProcessGroup] = {}
+    _group_cache_mesh = None
 
     # Access Torch ProcessGroup
     @property
-    @require_device_mesh
     def tp_group_pg(self) -> ProcessGroup:
-        return self._get_mesh_dim_by_name('tp').get_group()
+        return self._get_group_by_name('tp')
 
     @property
-    @require_device_mesh
     def pp_group_pg(self) -> ProcessGroup:
-        return self._get_mesh_dim_by_name('pp').get_group()
+        return self._get_group_by_name('pp')
 
     @property
-    @require_device_mesh
     def cp_group_pg(self) -> ProcessGroup:
-        return self._get_mesh_dim_by_name('cp').get_group()
+        return self._get_group_by_name('cp')
 
     @property
-    @require_device_mesh
     def moe_tp_group_pg(self) -> ProcessGroup:
-        return self._get_mesh_dim_by_name('moe_tp').get_group()
+        return self._get_group_by_name('moe_tp')
 
     @property
-    @require_device_mesh
     def moe_ep_group_pg(self) -> ProcessGroup:
-        return self._get_mesh_dim_by_name('moe_ep').get_group()
+        return self._get_group_by_name('moe_ep')
 
     # Access rank
     @property
@@ -144,9 +145,45 @@ class DeviceMeshTopologyImpl(_MappingBaseForTypeCheck):
                                           "moe_ep"]._flatten(mesh_dim_name="tp")
         logger.debug(f"DeviceMeshTopology.device_mesh: {cls.device_mesh}")
         logger.debug(f"DeviceMeshTopology.tp_mesh: {cls.tp_mesh}")
+        cls._populate_group_cache()
+
+    @classmethod
+    def _populate_group_cache(cls) -> None:
+        """(Re)build the mesh-dim name -> ProcessGroup cache from the class mesh.
+
+        ``DeviceMesh`` already created one ProcessGroup per dimension at
+        ``init_device_mesh`` time, so this only looks them up (no collective).
+        """
+        impl = DeviceMeshTopologyImpl
+        impl._group_cache = {}
+        impl._group_cache_mesh = impl.device_mesh
+        if impl.device_mesh is None:
+            return
+        for name in impl.device_mesh.mesh_dim_names or ():
+            impl._group_cache[name] = impl.device_mesh[name].get_group()
+        if impl.tp_mesh is not None:
+            # MoE layout: 'tp' is the flattened (moe_tp, moe_ep) mesh.
+            impl._group_cache['tp'] = impl.tp_mesh.get_group()
+
+    @classmethod
+    def _cached_group(cls, name: str) -> Optional[ProcessGroup]:
+        impl = DeviceMeshTopologyImpl
+        if impl._group_cache_mesh is not impl.device_mesh:
+            impl._populate_group_cache()
+        return impl._group_cache.get(name)
 
     @require_device_mesh
-    @torch.compiler.disable
+    def _get_group_by_name(self, name: str) -> ProcessGroup:
+        cls = DeviceMeshTopologyImpl
+        if cls.device_mesh is None and self.world_size == 1:
+            return SingleProcessGroup.get_group()
+        pg = cls._cached_group(name)
+        if pg is None:
+            pg = self._get_mesh_dim_by_name(name).get_group()
+            cls._group_cache[name] = pg
+        return pg
+
+    @require_device_mesh
     def _get_mesh_dim_by_name(self, name: str) -> dist.DeviceMesh:
         cls = DeviceMeshTopologyImpl
 
