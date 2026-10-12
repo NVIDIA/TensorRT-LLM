@@ -134,7 +134,7 @@ In the current implementation, **storage-bound** compression is the first cross-
 
 ### Configuration and Setup of KV Cache Compression
 
-**The idea.** Turning compression on takes one configuration block, and everything else follows from it: which modules to engage and whether the rest of the setup allows it. The block, `kv_cache_compression_config`, holds:
+Turning compression on takes one configuration block, and everything else follows from it: which modules to engage and whether the rest of the setup allows it. The block, `kv_cache_compression_config`, holds:
 
 - **`algorithm`**: which method to run. One method can be active per LLM instance.
 - **Method options**: the method's own parameters, e.g. for TriAttention the token `budget`, the eviction period, the `eviction_mode` and the calibration file.
@@ -145,7 +145,7 @@ Before anything is built, a factory reads the block and wires things up: which m
 
 ### KV Cache Compression in the Executor Iteration Loop
 
-**The idea.** Reaching the stages inside a request (stages 1 to 3 in Figure 3) costs the runtime nothing new: the compression manager rides on callbacks the executor already makes. The executor calls every resource manager before the forward pass, after it, and when a request ends. The compression manager registers last, so it runs after the KV cache manager has updated its state, and maps these callbacks onto five hook functions, one per moment: request start, end of prefill, before and after each decode step, and request finish (Figure 5). Every hook does nothing by default. A method overrides the hook of the stage it wants, and its code runs there.
+Reaching the stages inside a request (stages 1 to 3 in Figure 3) costs the runtime nothing new: the compression manager rides on callbacks the executor already makes. The executor calls every resource manager before the forward pass, after it, and when a request ends. The compression manager registers last, so it runs after the KV cache manager has updated its state, and maps these callbacks onto five hook functions, one per moment: request start, end of prefill, before and after each decode step, and request finish (Figure 5). Every hook does nothing by default. A method overrides the hook of the stage it wants, and its code runs there.
 
 <div align="center">
 <figure>
@@ -158,7 +158,7 @@ Two rules for methods on this path: the policy that picks tokens stays separate 
 
 ### KV Cache Compression in Cross-Request KV Management
 
-**The idea.** Once a request pauses or ends, its KV belongs to the cache manager, so that is where compression plugs in: at the points where pages move. During a tool call (stage 4 in Figure 3) and after the request (stage 5), V2 decides which pages stay on the GPU, move to host or disk memory, are reused by a later request or transferred to another worker; it does no compression itself. Every reused page is a prefill that never runs, and compression lets the tiers hold more of them. Today the framework covers the first and busiest of these movements, offload and onboard, with the **storage-bound** mechanism.
+Once a request pauses or ends, its KV belongs to the cache manager, so that is where compression plugs in: at the points where pages move. During a tool call (stage 4 in Figure 3) and after the request (stage 5), V2 decides which pages stay on the GPU, move to host or disk memory, are reused by a later request or transferred to another worker; it does no compression itself. Every reused page is a prefill that never runs, and compression lets the tiers hold more of them. Today the framework covers the first and busiest of these movements, offload and onboard, with the **storage-bound** mechanism.
 
 **Compression is more than the algorithm.** A page that crosses a storage boundary is already being read, moved and written by the cache manager's own copy kernels, so a compression method should not add a pass of its own on top. The storage-bound path is built around that: quantization is fused into the offload copy and dequantization into the onboard copy, so compression rides the transfer's bandwidth instead of competing with it.
 
@@ -176,7 +176,7 @@ In this section, we walk through the two KV cache compression methods currently 
 
 #### Introduction
 
-**The idea.** Pages that leave the GPU are the cheapest place to compress: they are being copied anyway, nothing reads them while they are cold, and only the pages pushed out by memory pressure are touched. Cold-page compression stores attention KV pages as NVFP4 while they sit in host or disk memory and keeps the model's normal data type, FP16, BF16 or FP8, on the GPU. The attention kernels never see the compressed form. To try it, see the [NVFP4 cold-page example](https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/kv_cache_compression/nvfp4_cold_page.md).
+Pages that leave the GPU are the cheapest place to compress: they are being copied anyway, nothing reads them while they are cold, and only the pages pushed out by memory pressure are touched. Cold-page compression stores attention KV pages as NVFP4 while they sit in host or disk memory and keeps the model's normal data type, FP16, BF16 or FP8, on the GPU. The attention kernels never see the compressed form. To try it, see the [NVFP4 cold-page example](https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/kv_cache_compression/nvfp4_cold_page.md).
 
 NVFP4 is NVIDIA's 4-bit floating-point format: 4-bit values (E2M1) with one 8-bit (E4M3) scale per 16 values, 4.5 bits per value on average, the same format TensorRT LLM uses for weights and for the active KV cache. Applying it to cold pages buys four things:
 
@@ -219,7 +219,7 @@ The implementation lives in `tensorrt_llm/_torch/kv_cache_compression/quantizati
 
 #### Introduction
 
-**The idea.** In a long generation most of the KV cache is generated tokens, and most of them will not matter to the queries still to come. [TriAttention](https://arxiv.org/abs/2604.04921) (ICML 2026) predicts which ones matter from per-head query statistics collected once offline, and every few tokens evicts the rest and compacts the cache, so decoding reads a shorter cache and more sequences fit on the GPU. The prompt is never touched; only generated tokens are evicted. Figure 8 shows one round. For details, see the paper and the [TriAttention example](https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/kv_cache_compression/triattention.md).
+In a long generation most of the KV cache is generated tokens, and most of them will not matter to the queries still to come. [TriAttention](https://arxiv.org/abs/2604.04921) (ICML 2026) predicts which ones matter from per-head query statistics collected once offline, and every few tokens evicts the rest and compacts the cache, so decoding reads a shorter cache and more sequences fit on the GPU. The prompt is never touched; only generated tokens are evicted. Figure 8 shows one round. For details, see the paper and the [TriAttention example](https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/kv_cache_compression/triattention.md).
 
 <div align="center">
 <figure>
