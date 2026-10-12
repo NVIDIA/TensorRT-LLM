@@ -419,6 +419,204 @@ def test_checkpoint_routes_vision_and_optional_mtp_separately():
             audit_glm5_next_checkpoint(keys, config, num_mtp_layers=invalid)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_nvfp4_loader_preserves_calibrated_scales():
+    from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
+    from tensorrt_llm._utils import get_sm_version
+    from tensorrt_llm.models.modeling_utils import QuantConfig
+    from tensorrt_llm.quantization.mode import QuantAlgo
+
+    if get_sm_version() not in (100, 103):
+        pytest.skip("NVFP4 comparison requires SM100/103")
+    config = ModelConfig(quant_config=QuantConfig(quant_algo=QuantAlgo.NVFP4, group_size=16))
+    with torch.device("cuda"):
+        actual = GatedMLP(
+            hidden_size=128,
+            intermediate_size=256,
+            bias=False,
+            dtype=torch.bfloat16,
+            config=config,
+            swiglu_limit=7.0,
+        )
+        reference = GatedMLP(
+            hidden_size=128,
+            intermediate_size=256,
+            bias=False,
+            dtype=torch.bfloat16,
+            config=config,
+            swiglu_limit=7.0,
+        )
+    generator = torch.Generator().manual_seed(19136)
+    groups = {}
+    for name, rows, cols in (
+        ("gate_proj", 256, 128),
+        ("up_proj", 256, 128),
+        ("down_proj", 128, 256),
+    ):
+        groups[name] = {
+            "weight": torch.randint(
+                0, 256, (rows, cols // 2), dtype=torch.uint8, generator=generator
+            ),
+            "weight_scale": torch.ones(rows, cols // 16, dtype=torch.float8_e4m3fn),
+            "input_scale": torch.tensor(0.01),
+            "weight_scale_2": torch.tensor(0.02),
+        }
+    reference.gate_up_proj.load_weights([groups["gate_proj"], groups["up_proj"]])
+    reference.down_proj.load_weights([groups["down_proj"]])
+    weights = {
+        f"{name}.{label}": tensor
+        for name, group in groups.items()
+        for label, tensor in group.items()
+    }
+    actual.to_empty(device="cuda")
+    Glm5NextForCausalLM._fill_module(
+        None, actual, "dense", "", [(key, key) for key in weights], weights, torch.device("cuda")
+    )
+    for name in ("gate_up_proj", "down_proj"):
+        loaded, expected = getattr(actual, name), getattr(reference, name)
+        for scale in ("input_scale", "weight_scale_2", "alpha"):
+            torch.testing.assert_close(getattr(loaded, scale), getattr(expected, scale))
+            assert torch.all(getattr(loaded, scale) > 0)
+    x = torch.randn(8, 128, generator=generator, dtype=torch.bfloat16).cuda()
+    torch.testing.assert_close(actual(x), reference(x), atol=0, rtol=0)
+
+
+@pytest.mark.cpu_only
+def test_checkpoint_lazy_scalar_materialization(tmp_path) -> None:
+    from safetensors import safe_open
+    from safetensors.torch import save_file
+
+    expected = {
+        "weight": torch.arange(6, dtype=torch.float32).reshape(2, 3),
+        "input_scale": torch.tensor(0.01),
+    }
+    path = tmp_path / "scalar.safetensors"
+    save_file(expected, path)
+    module = torch.nn.Module()
+    for name, tensor in expected.items():
+        module.register_parameter(
+            name, torch.nn.Parameter(torch.empty_like(tensor), requires_grad=False)
+        )
+    with safe_open(path, framework="pt") as checkpoint:
+        weights = {key: checkpoint.get_slice(key) for key in checkpoint.keys()}
+        Glm5NextForCausalLM._fill_module(
+            None,
+            module,
+            "scalar",
+            "",
+            [(key, key) for key in weights],
+            weights,
+            torch.device("cpu"),
+        )
+    for name, tensor in expected.items():
+        torch.testing.assert_close(getattr(module, name), tensor, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_nvfp4_moe_loader_restores_activation_constants() -> None:
+    from tensorrt_llm._torch.models.modeling_glm5_next import Glm5NextMoE
+    from tensorrt_llm._utils import get_sm_version
+    from tensorrt_llm.models.modeling_utils import QuantConfig
+    from tensorrt_llm.quantization.mode import QuantAlgo
+
+    if get_sm_version() not in (100, 103):
+        pytest.skip("NVFP4 comparison requires SM100/103")
+    text = PretrainedConfig(
+        hidden_size=128,
+        moe_intermediate_size=256,
+        n_routed_experts=4,
+        n_shared_experts=1,
+        num_experts_per_tok=2,
+        n_group=1,
+        topk_group=1,
+        routed_scaling_factor=1.0,
+        norm_topk_prob=True,
+        swiglu_limit=10.0,
+    )
+    config = ModelConfig(
+        pretrained_config=text,
+        moe_backend="CUTLASS",
+        quant_config=QuantConfig(quant_algo=QuantAlgo.NVFP4, group_size=16),
+    )
+    generator = torch.Generator().manual_seed(19136)
+    prefix = "model.layers.0."
+    weights = {
+        prefix + "mlp.gate.weight": torch.randn(4, 128, generator=generator) * 0.1,
+        prefix + "mlp.gate.e_score_correction_bias": torch.zeros(4),
+    }
+    for part in ["mlp.shared_experts", *[f"mlp.experts.{i}" for i in range(4)]]:
+        for name, rows, cols in (
+            ("gate_proj", 256, 128),
+            ("up_proj", 256, 128),
+            ("down_proj", 128, 256),
+        ):
+            base = prefix + part + "." + name + "."
+            weights[base + "weight"] = torch.randint(
+                0, 256, (rows, cols // 2), dtype=torch.uint8, generator=generator
+            )
+            weights[base + "weight_scale"] = torch.ones(rows, cols // 16, dtype=torch.float8_e4m3fn)
+            weights[base + "input_scale"] = torch.tensor(0.01)
+            weights[base + "weight_scale_2"] = torch.tensor(0.02)
+    x = (torch.randn(8, 128, generator=generator) * 10).to(device="cuda", dtype=torch.bfloat16)
+    outputs = []
+    for materialize in (False, True):
+        with torch.device("cuda"):
+            owner = torch.nn.Module()
+            owner.mlp = Glm5NextMoE(text, config, 0)
+        if materialize:
+            owner.to_empty(device="cuda")
+            owner.mlp.experts.backend.act_clamp.zero_()
+        Glm5NextForCausalLM._fill_module(
+            None, owner, 0, prefix, [(key, key) for key in weights], weights, torch.device("cuda")
+        )
+        torch.testing.assert_close(
+            owner.mlp.experts.backend.act_clamp,
+            torch.full((4,), 10.0, device="cuda"),
+            rtol=0,
+            atol=0,
+        )
+        outputs.append(owner.mlp(x))
+    torch.testing.assert_close(outputs[0], outputs[1], rtol=0, atol=0)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("missing", ["weight_scale", "weight_scale_2", "input_scale"])
+def test_nvfp4_loader_rejects_missing_scales(monkeypatch, missing: str) -> None:
+    from tensorrt_llm._torch.modules import linear
+    from tensorrt_llm.models.modeling_utils import QuantConfig
+    from tensorrt_llm.quantization.mode import QuantAlgo
+
+    monkeypatch.setattr(linear, "get_sm_version", lambda: 100)
+    projection = linear.Linear(
+        128,
+        128,
+        bias=False,
+        dtype=torch.bfloat16,
+        quant_config=QuantConfig(quant_algo=QuantAlgo.NVFP4, group_size=16),
+        skip_create_weights_in_init=True,
+        reduce_output=False,
+    )
+    weights = {
+        "weight": torch.zeros(128, 64, dtype=torch.uint8),
+        "weight_scale": torch.ones(128, 8, dtype=torch.float8_e4m3fn),
+        "weight_scale_2": torch.tensor(0.02),
+        "input_scale": torch.tensor(0.01),
+    }
+    del weights[missing]
+    with patch.object(projection, "load_weights") as load:
+        with pytest.raises(ValueError, match=f"NVFP4 projection .*missing.*{missing}"):
+            Glm5NextForCausalLM._fill_module(
+                None,
+                projection,
+                "projection",
+                "",
+                [(key, key) for key in weights],
+                weights,
+                torch.device("cpu"),
+            )
+        load.assert_not_called()
+
+
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("route", ["valid", "py_mamba", "manager_preference", "v1", "cpp", "ucx"])
 def test_cache_manager_routing_guards(route, monkeypatch):

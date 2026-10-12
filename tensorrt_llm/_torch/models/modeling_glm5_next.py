@@ -34,6 +34,7 @@ from transformers import PretrainedConfig
 from ...logger import logger
 from ...mapping import Mapping
 from ...models.modeling_utils import QuantConfig
+from ...quantization.mode import QuantAlgo
 from ..attention.backends.interface import (
     AttentionForwardArgs,
     AttentionInputType,
@@ -406,6 +407,25 @@ class Glm5NextForCausalLM(SpecDecOneEngineForCausalLM):
                 "glm5_next MTP with attention DP and a tensor-parallel LM head is not supported"
             )
         text_config = unwrap_glm5_next_text_config(model_config.pretrained_config)
+        if model_config.quant_config is not None:
+            model_config = copy.copy(model_config)
+            model_config.quant_config = copy.deepcopy(model_config.quant_config)
+            quant = model_config.quant_config
+            # Text-runtime module names omit the checkpoint's language_model level.
+            if quant.exclude_modules is not None:
+                quant.exclude_modules = [
+                    name.replace("model.language_model.", "model.", 1)
+                    for name in quant.exclude_modules
+                ]
+            if quant.quant_algo == QuantAlgo.NVFP4:
+                # The NVFP4 checkpoint's appended MTP layer remains BF16.
+                quant.exclude_modules = list(quant.exclude_modules or []) + [
+                    f"model.layers.{i}.*"
+                    for i in range(
+                        text_config.num_hidden_layers,
+                        text_config.num_hidden_layers + text_config.num_nextn_predict_layers,
+                    )
+                ]
         # tie_word_embeddings is false on this checkpoint, so lm_head is a real
         # weight rather than a view of the embedding; it is asserted, not assumed.
         if bool(getattr(text_config, "tie_word_embeddings", False)):
@@ -545,7 +565,7 @@ class Glm5NextForCausalLM(SpecDecOneEngineForCausalLM):
             )
         if not self.quantized:
             raise ValueError(
-                "glm5_next whole-model loading requires the block-FP8 build "
+                "glm5_next whole-model loading requires a block-FP8 or NVFP4 build "
                 "(quantized=True). Dequantizing all 288 experts of 42 routed "
                 "layers to bf16 would double the resident model to ~656 GB and "
                 "exceed the supported loading footprint."
@@ -650,18 +670,18 @@ class Glm5NextForCausalLM(SpecDecOneEngineForCausalLM):
         proj_to_w = {"gate_proj": "w1", "up_proj": "w3", "down_proj": "w2"}
 
         def materialize(t: Any) -> torch.Tensor:
-            # Lazy safetensors slice: indexing materializes only this tensor.
-            return t if torch.is_tensor(t) else t[:]
+            # Ellipsis supports both scalar calibration scales and matrix weights.
+            return t if torch.is_tensor(t) else t[...]
 
         for key, dest in sorted(entries):
             local = dest.removeprefix(prefix)
             lazy = weights[key]
 
-            moe = _FUSED_MOE_RE.match(dest.removesuffix("_scale_inv").removesuffix(".weight"))
+            moe = _FUSED_MOE_RE.match(dest)
             if moe is not None:
                 expert_id = int(moe.group("expert"))
                 if expert_id in local_expert_ids:  # other EP ranks' bytes are never read
-                    suffix = ".weight_scale_inv" if dest.endswith("_scale_inv") else ".weight"
+                    suffix = "." + moe.group("tensor")
                     moe_weights[f"{expert_id}.{proj_to_w[moe.group('proj')]}{suffix}"] = (
                         materialize(lazy)
                     )
@@ -705,15 +725,53 @@ class Glm5NextForCausalLM(SpecDecOneEngineForCausalLM):
         def mark_linear(mod_path: str, labels: Iterable[str] = ()) -> None:
             # ``labels`` are extra tensors the Linear's load_weights consumed
             # (e.g. the router gate's e_score_correction_bias).
-            for param_name in ("weight", "weight_scale", "bias", *labels):
+            linear = named_modules[mod_path]
+            param_names = ["weight", "weight_scale", "bias", *labels]
+            if (
+                linear.quant_config is not None
+                and linear.quant_config.quant_algo == QuantAlgo.NVFP4
+            ):
+                # The shared loader derives alpha and input_scale. These extra
+                # fields need initialization after the owner's to_empty().
+                with torch.no_grad():
+                    linear.inv_input_scale.copy_(linear.input_scale / 6.0)
+                    linear.kv_scales.fill_(1)
+                    linear.inv_kv_scales.fill_(1)
+                param_names += [
+                    "input_scale",
+                    "inv_input_scale",
+                    "weight_scale_2",
+                    "alpha",
+                    "kv_scales",
+                    "inv_kv_scales",
+                ]
+            for param_name in param_names:
                 # mod_path is "" when the owner *is* the Linear (the LMHead).
                 name = f"{mod_path}.{param_name}" if mod_path else param_name
                 if name in params:
                     filled.add(name)
 
+        def load_linear(
+            mod_path: str, groups: list[dict[str, torch.Tensor]], labels: Iterable[str] = ()
+        ) -> None:
+            linear = named_modules[mod_path]
+            if (
+                linear.quant_config is not None
+                and linear.quant_config.quant_algo == QuantAlgo.NVFP4
+            ):
+                required = {"weight", "weight_scale", "weight_scale_2", "input_scale"}
+                for part, group in enumerate(groups):
+                    missing = required - group.keys()
+                    if missing:
+                        raise ValueError(
+                            f"glm5_next owner {owner!r}: NVFP4 projection {mod_path!r} "
+                            f"part {part} is missing checkpoint tensors {sorted(missing)}"
+                        )
+            linear.load_weights(groups)
+            mark_linear(mod_path, labels)
+
         for mod_path, group in linear_groups.items():
-            named_modules[mod_path].load_weights([group])
-            mark_linear(mod_path, group)
+            load_linear(mod_path, [group], group)
         for fused_path, parts in fused_groups.items():
             dest_mod = named_modules[fused_path]
             groups = [parts[i] for i in sorted(parts)]
@@ -722,7 +780,7 @@ class Glm5NextForCausalLM(SpecDecOneEngineForCausalLM):
             ) and dest_mod.weights_loading_config.weight_mode.name == ("FUSED_GATE_UP_LINEAR"):
                 # GatedMLP: the Linear shards each half over this rank's
                 # intermediate range and stacks them [gate; up] itself.
-                dest_mod.load_weights(groups)
+                load_linear(fused_path, groups)
             else:
                 # Replicated fusions: one row-concatenated tensor (and block
                 # scales), the order being the module's declared source order.
@@ -731,16 +789,27 @@ class Glm5NextForCausalLM(SpecDecOneEngineForCausalLM):
                     merged["weight_scale_inv"] = torch.cat(
                         [g["weight_scale_inv"] for g in groups], dim=0
                     )
-                dest_mod.load_weights([merged])
-            mark_linear(fused_path)
+                load_linear(fused_path, [merged])
 
         if experts is not None:
-            expected = 6 * len(local_expert_ids)
+            quant_algo = (
+                experts.quant_config.quant_algo if experts.quant_config is not None else None
+            )
+            tensors_per_expert = {
+                QuantAlgo.FP8_BLOCK_SCALES: 6,
+                QuantAlgo.NVFP4: 12,
+            }.get(quant_algo, 3)
+            expected = tensors_per_expert * len(local_expert_ids)
             if len(moe_weights) != expected:
                 raise ValueError(
                     f"glm5_next owner {owner!r}: fused MoE collected {len(moe_weights)} expert "
                     f"tensors, expected {expected} (local experts {len(local_expert_ids)})"
                 )
+            from ..moe.fused_moe.activation import install_activation_params
+
+            # Recreate non-checkpoint constants after to_empty, before quantization
+            # transforms them into the backend's scale convention.
+            install_activation_params(getattr(experts, "backend", experts), device=device)
             experts.load_weights([moe_weights])
             if hasattr(experts, "post_load_weights"):
                 experts.post_load_weights()
@@ -749,7 +818,9 @@ class Glm5NextForCausalLM(SpecDecOneEngineForCausalLM):
         # FP8_BLOCK_SCALES' static activation scales: this checkpoint is
         # activation_scheme='dynamic', so they are never read; zero them rather
         # than leave to_empty garbage behind.
-        unused = {n for n in params if n.endswith(("input_scale", "inv_input_scale"))}
+        unused = {
+            n for n in params if n not in filled and n.endswith(("input_scale", "inv_input_scale"))
+        }
         with torch.no_grad():
             for name in unused:
                 params[name].zero_()
@@ -1496,16 +1567,17 @@ class Glm5NextMoE(nn.Module):
         # fetched per call so it follows the parameter through
         # to_empty/materialization onto its final device).
         routing = self.gate.routing_method
-        # The experts are uniformly block-FP8 on the published checkpoint;
-        # the exclusion patterns concern *other* modules (applied by name by
-        # the base class), so the layer-scoped config the fused backend sees
-        # carries only the algorithm and block size. A bf16 build (no quant
-        # config) gets bf16 experts.
+        # Routed experts use the checkpoint's quantization; excluded layers
+        # (including the NVFP4 checkpoint's BF16 MTP layer) stay unquantized.
         quant = model_config.get_quant_config()
         experts_quant = (
             QuantConfig(quant_algo=quant.quant_algo, group_size=quant.group_size)
-            if quant is not None and quant.quant_algo is not None
-            else None
+            if quant is not None
+            and quant.quant_algo is not None
+            and not quant.is_module_excluded_from_quantization(
+                f"model.layers.{layer_idx}.mlp.experts"
+            )
+            else QuantConfig()
         )
         self.experts = create_moe(
             routing_method=routing,
@@ -2079,5 +2151,6 @@ class Glm5NextMTP(nn.Module):
 #: than placed by name.
 _FUSED_MOE_RE = re.compile(
     r"^(?P<layer>model\.layers\.\d+\.mlp)\.experts\.(?P<expert>\d+)"
-    r"\.(?P<proj>gate_proj|up_proj|down_proj)$"
+    r"\.(?P<proj>gate_proj|up_proj|down_proj)"
+    r"\.(?P<tensor>weight|weight_scale_inv|weight_scale|weight_scale_2|input_scale)$"
 )
