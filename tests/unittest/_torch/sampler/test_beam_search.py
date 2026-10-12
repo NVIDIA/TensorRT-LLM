@@ -2016,7 +2016,7 @@ def test_vbws_rejects_decreasing_beam_width_array(beam_width_array: list[int],
     # Exercise the real beam admission checks with unrelated cache, transport,
     # token-range, sampler, and budget validation disabled in the executor stub.
     executor = types.SimpleNamespace(
-        _is_kv_manager_v2=False,
+        _is_kv_manager_v2=True,
         max_beam_width=request.py_beam_width,
         kv_cache_manager=None,
         kv_cache_transceiver=None,

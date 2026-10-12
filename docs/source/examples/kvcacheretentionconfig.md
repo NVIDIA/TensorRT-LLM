@@ -69,11 +69,6 @@ This example uses a single ```kv_cache_retention_config``` object for all the pr
 
 ## KV Cache Manager V2
 
-KV cache manager V2 accepts the same `KvCacheRetentionConfig`, so the examples
-above work unchanged. For `transfer_mode`, V2 supports only the default `DRAM` and rejects
-requests that set `GDS` or `POSIX_DEBUG_FALLBACK`. V2's host and disk offload
-tiers are configured manager-wide when the manager is created and are
-independent of these per-request transfer modes.
+KV cache manager V2 accepts the same `KvCacheRetentionConfig`, so the examples above work unchanged. For `transfer_mode`, V2 supports only the default `DRAM` and rejects requests that set `GDS` or `POSIX_DEBUG_FALLBACK`. V2's host and disk offload tiers are configured manager-wide when the manager is created and are independent of these per-request transfer modes.
 
-The priority threshold that decides which evicted blocks are offloaded is also
-manager-wide; see [Enable Offloading to Host Memory](../features/kvcache.md#enable-offloading-to-host-memory).
+The priority threshold that decides which evicted blocks are offloaded is also manager-wide; see [Enable Offloading to Host Memory](../features/kvcache.md#enable-offloading-to-host-memory).
