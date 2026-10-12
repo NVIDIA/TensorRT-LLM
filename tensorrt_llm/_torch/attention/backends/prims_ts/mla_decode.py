@@ -23,6 +23,9 @@ from typing import Any, Literal, Optional, cast
 import torch
 
 from flashinfer.api_logging import flashinfer_api as flashinfer_experimental_api
+from flashinfer.trace.templates.attention import (
+    prims_ts_decode_mla_one_shot_trace_dispatch,
+)
 
 from .decode import (
     _WorkspaceSection,
@@ -1678,7 +1681,7 @@ class BatchMLADecodePagedTSWrapper:
         )
 
 
-@flashinfer_experimental_api
+@flashinfer_experimental_api(trace=prims_ts_decode_mla_one_shot_trace_dispatch)
 def batch_mla_decode_with_paged_kv_cache(
     query: torch.Tensor,
     kv_cache: torch.Tensor,
