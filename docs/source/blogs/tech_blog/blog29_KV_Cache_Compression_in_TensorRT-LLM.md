@@ -74,8 +74,8 @@ The two tables below summarize the current coverage.
 | Memory Tier | NVFP4 Cold-Page Compression | TriAttention |
 | :--- | :--- | :--- |
 | **GPU (active KV)** | Unchanged (FP16 / BF16 / FP8) | Generated tokens evicted periodically; prompt kept |
-| **Host memory** | NVFP4 (4-bit values with FP8 block scales) | Not affected |
-| **Disk** | Same NVFP4 data as host memory, copied as is | Not affected |
+| **Host memory** | NVFP4 | Not affected |
+| **Disk** | NVFP4 | Not affected |
 
 <p align="center"><sub><em>Table 2. What each method does to the KV cache in each memory tier.</em></sub></p>
 
