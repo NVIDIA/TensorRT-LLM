@@ -1159,7 +1159,6 @@ def test_pipeline_accepts_pure_ulysses(monkeypatch: pytest.MonkeyPatch, world_si
         ("ring_size", 2),
         ("attn2d_row_size", 2),
         ("attn2d_col_size", 2),
-        ("tp_size", 2),
         ("missing_mapping", True),
     ],
 )
@@ -1168,14 +1167,11 @@ def test_pipeline_rejects_unsupported_ulysses_topology(field: str, value: int) -
     if field == "missing_mapping":
         config.visual_gen_mapping = None
         config.mapping.world_size = 8
-    elif field == "tp_size":
-        config.mapping.tp_size = value
-        config.visual_gen_mapping.world_size *= value
     else:
         setattr(config.visual_gen_mapping, field, value)
         if field != "ulysses_size":
             config.visual_gen_mapping.world_size *= value
-    with pytest.raises(NotImplementedError, match="pure Ulysses"):
+    with pytest.raises(NotImplementedError, match="tensor parallelism and Ulysses"):
         MiniMaxH3Pipeline(config)
 
 
@@ -1292,3 +1288,21 @@ def test_pipeline_accepts_fa4_ulysses(monkeypatch: pytest.MonkeyPatch) -> None:
     config = _ulysses_pipeline_config(2)
     config.attention.backend = "FA4"
     MiniMaxH3Pipeline(config)
+
+
+@pytest.mark.parametrize("tp_size,ulysses_size", [(2, 1), (4, 1), (2, 2)])
+def test_pipeline_accepts_tp(
+    monkeypatch: pytest.MonkeyPatch, tp_size: int, ulysses_size: int
+) -> None:
+    initialized = []
+
+    def initialize(self, config):
+        torch.nn.Module.__init__(self)
+        initialized.append(config)
+
+    monkeypatch.setattr(h3_pipeline.BasePipeline, "__init__", initialize)
+    config = _ulysses_pipeline_config(tp_size * ulysses_size)
+    config.mapping.tp_size = tp_size
+    config.visual_gen_mapping.ulysses_size = ulysses_size
+    MiniMaxH3Pipeline(config)
+    assert initialized == [config]
