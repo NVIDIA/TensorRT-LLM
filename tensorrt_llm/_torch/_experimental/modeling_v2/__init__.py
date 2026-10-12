@@ -17,8 +17,9 @@ Entry is a single environment variable::
 ``off`` (unset, the default) is byte-for-byte today's behaviour: the resolver returns
 immediately and nothing in this package is imported. ``auto`` uses a target
 when one matches and falls back to the built-in implementation when none
-does. ``require`` raises instead of falling back -- see ``_router_index`` for
-why that mode is not optional.
+does, unless the checkpoint's targets bring their own input processor, which
+the built-in model must not run behind. ``require`` raises instead of falling
+back -- see ``_router_index`` for why that mode is not optional.
 
 This package sits *beside* ``_torch/models/`` rather than inside it, which is
 load-bearing twice over: ``is_builtin_zoo_module`` matches on the zoo's
@@ -36,6 +37,7 @@ from ._router_index import (
     ModelingV2Context,
     ModelingV2Mode,
     assert_backend_can_route,
+    modeling_v2_input_processor,
     modeling_v2_resolve,
     step_contract_enabled,
 )
@@ -48,6 +50,7 @@ __all__ = [
     "ModelingV2Mode",
     "MODELING_V2_VALIDATE_ENV",
     "assert_backend_can_route",
+    "modeling_v2_input_processor",
     "modeling_v2_resolve",
     "step_contract_enabled",
 ]

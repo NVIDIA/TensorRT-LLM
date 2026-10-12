@@ -43,7 +43,9 @@ _PACKAGE = "tensorrt_llm._torch._experimental.modeling_v2"
 
 #: The switch. An environment variable rather than an LLM-API field, so that
 #: nothing outside this package has to carry the concept: the only upstream
-#: change modeling_v2 needs is the ``_resolve_class`` hook itself.
+#: changes modeling_v2 needs are the ``_resolve_class`` hook itself and, for a
+#: target family that reads its own multimodal inputs, the input-processor
+#: hook in ``create_input_processor``.
 #:
 #: Assigning to ``os.environ`` from a script does not set it. Worker ranks
 #: receive the environment as it stood when MPI initialized, and long-lived
@@ -85,6 +87,7 @@ def step_contract_enabled() -> bool:
 MODELING_V2_ROUTERS = {
     "GptOssForCausalLM": "models.gpt_oss.routing",
     "DeepseekV3ForCausalLM": "models.deepseek_v3.routing",
+    "DeepseekV41ForConditionalGeneration": "models.deepseek_v41.routing",
 }
 
 #: Backends whose model construction reaches ``modeling_v2_resolve``. The
@@ -278,6 +281,11 @@ def modeling_v2_resolve(config: "ModelConfig") -> Optional[str]:
     exists to prevent is silent: asking for a target that does not exist,
     getting the in-tree implementation, and reading the resulting curve as
     modeling_v2's.
+
+    ``auto`` raises too when the checkpoint's targets bring their own input
+    processor (see ``modeling_v2_input_processor``): that processor was chosen
+    on the checkpoint alone, and falling back would pair it with a built-in
+    model that expects another placeholder layout.
     """
     mode = ModelingV2Mode.from_env()
     if mode is ModelingV2Mode.OFF:
@@ -297,6 +305,11 @@ def modeling_v2_resolve(config: "ModelConfig") -> Optional[str]:
     if target is None:
         if mode is ModelingV2Mode.REQUIRE:
             raise ValueError(explain_no_match(arch, routing, trace))
+        if _input_processor_module(routing, pretrained_config) is not None:
+            # Replay the tree with a trace, only to say which criterion missed.
+            trace = Trace()
+            routing.route(ctx, trace)
+            raise ValueError(explain_no_auto_fallback(arch, routing, trace))
         return None
 
     # The synthetic name is only a registry key: importing the target module
@@ -304,6 +317,87 @@ def modeling_v2_resolve(config: "ModelConfig") -> Optional[str]:
     # static index does not, and must not, carry modeling_v2 names.
     import_module(f"{_PACKAGE}.{routing.TARGET_MODULES[target]}")
     return target
+
+
+def modeling_v2_input_processor(pretrained_config: Any) -> Optional[type]:
+    """The input processor a modeling_v2 target family brings for this checkpoint, or None.
+
+    ``create_input_processor`` takes the processor registered on the class under
+    ``architectures[0]``, and the multimodal placeholder registry is keyed by
+    ``model_type``; neither goes through ``modeling_v2_resolve``. A routing
+    module whose targets read their own multimodal inputs defines
+    ``input_processor(pretrained_config)``, naming a module (relative to this
+    package) that carries ``INPUT_PROCESSOR``, ``MODEL_TYPE`` and
+    ``PLACEHOLDER_METADATA``. This registers that placeholder metadata for
+    ``MODEL_TYPE`` and returns the processor class. None -- modeling_v2 off, no
+    routing module, or none of its targets brings a processor for this
+    checkpoint -- leaves the choice to the built-in registry.
+
+    The choice is the checkpoint's alone, because the input processor is built
+    where the GPU and the parallel mapping are not known. So a configuration
+    no target matches raises when the model is built, under ``auto`` as under
+    ``require`` (``modeling_v2_resolve``): the built-in model never runs behind
+    this processor.
+    """
+    if ModelingV2Mode.from_env() is ModelingV2Mode.OFF:
+        return None
+    architectures = getattr(pretrained_config, "architectures", None)
+    if not architectures:
+        return None
+    name = _input_processor_module(routing_module(architectures[0]), pretrained_config)
+    if name is None:
+        return None
+
+    # Function-local: the inputs registry imports torch and the model zoo,
+    # and nothing on the resolve path should.
+    from tensorrt_llm.inputs.registry import MULTIMODAL_PLACEHOLDER_REGISTRY
+
+    module = import_module(f"{_PACKAGE}.{name}")
+    # Registered from outside the built-in zoo, so it holds the slot even if
+    # the zoo's own module for this model type is imported afterwards.
+    MULTIMODAL_PLACEHOLDER_REGISTRY.set_placeholder_metadata(
+        module.MODEL_TYPE, module.PLACEHOLDER_METADATA, registrant_module=module.__name__
+    )
+    module.INPUT_PROCESSOR._registered_model_type = module.MODEL_TYPE
+    return module.INPUT_PROCESSOR
+
+
+def _input_processor_module(routing, pretrained_config: Any) -> Optional[str]:
+    """The input-processor module the routing module names for this checkpoint, or None."""
+    pick = getattr(routing, "input_processor", None)
+    return None if pick is None else pick(pretrained_config)
+
+
+def _trace_lines(routing, trace: Trace) -> List[str]:
+    """Where the routing module's decision tree stopped, one line per criterion."""
+    lines = [
+        f"The decision tree in "
+        f"{routing.__name__.rpartition('.')[0].replace('.', '/')}/routing.py "
+        f"got as far as:"
+    ]
+    for label, value, outcome in trace.steps:
+        mark = "no match" if outcome is None else f"-> {outcome}"
+        lines.append(f"  {label:<10} {value!r:<48} {mark}")
+    if not trace.steps:
+        lines.append("  (the tree rejected the configuration before its first recorded criterion)")
+    return lines
+
+
+def explain_no_auto_fallback(arch: str, routing, trace: Trace) -> str:
+    """Why ``auto`` refuses the built-in fallback for this checkpoint, and the ways out."""
+    lines = [
+        f"{MODELING_V2_ENV}=auto, but no modeling_v2 target matches this "
+        f"{arch!r} configuration, and its targets bring their own input "
+        f"processor and multimodal placeholder placement, which the built-in "
+        f"implementation does not expect. Falling back would lay out image "
+        f"prompts for a model that reads them differently, so this raises "
+        f"instead. Set {MODELING_V2_ENV}=off to run the built-in "
+        f"implementation with its own input processor, or run on an SM and "
+        f"with a parallel member that a target supports "
+        f"(`python -m {_PACKAGE}.explain` lists the criteria).",
+    ]
+    lines.extend(_trace_lines(routing, trace))
+    return "\n".join(lines)
 
 
 def explain_no_match(arch: str, routing, trace: Trace) -> str:
@@ -315,15 +409,8 @@ def explain_no_match(arch: str, routing, trace: Trace) -> str:
             f"architecture {arch!r}; routed architectures: "
             f"{known}"
         )
-    lines = [
-        f"{MODELING_V2_ENV}=require, but no target matched architecture "
-        f"{arch!r}. The decision tree in "
-        f"{routing.__name__.rpartition('.')[0].replace('.', '/')}/routing.py "
-        f"got as far as:"
-    ]
-    for label, value, outcome in trace.steps:
-        mark = "no match" if outcome is None else f"-> {outcome}"
-        lines.append(f"  {label:<10} {value!r:<48} {mark}")
-    if not trace.steps:
-        lines.append("  (the tree rejected the configuration before its first recorded criterion)")
+    lines = _trace_lines(routing, trace)
+    lines[0] = (
+        f"{MODELING_V2_ENV}=require, but no target matched architecture {arch!r}. " + lines[0]
+    )
     return "\n".join(lines)

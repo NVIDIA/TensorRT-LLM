@@ -20,7 +20,7 @@ export TRTLLM_MODELING_V2=require        # off | auto | require
 | `TRTLLM_MODELING_V2` | Behaviour |
 |---|---|
 | unset or `off` (default) | The resolver returns immediately. Nothing in this package is imported and behaviour is byte-for-byte what it is today. |
-| `auto` | Uses a target when one matches this exact configuration; falls back to the built-in implementation when none does. |
+| `auto` | Uses a target when one matches this exact configuration; falls back to the built-in implementation when none does. A family whose targets bring their own input processor (DeepSeek-V4.1) raises instead of falling back, because the processor is chosen per checkpoint and the built-in model expects another one. |
 | `require` | Raises instead of falling back, naming the criterion that did not match. |
 
 **Use `require` for anything you will attribute to modeling_v2.** Under `auto`,
@@ -36,8 +36,10 @@ its workers resolve the built-in is the silent split this package exists to
 prevent.
 
 An environment variable rather than an LLM-API field is a deliberate trade: it
-keeps the entire concept inside this package, so the only change modeling_v2
-needs anywhere else is the `_resolve_class` hook. The cost is that the switch
+keeps the entire concept inside this package, so the only changes modeling_v2
+needs anywhere else are the `_resolve_class` hook and, for a target family that
+reads its own multimodal inputs, one call in `create_input_processor`
+(`modeling_v2_input_processor`). The cost is that the switch
 does not appear in a run's recorded `llm.args` and cannot be set through
 `--extra_llm_api_options`.
 

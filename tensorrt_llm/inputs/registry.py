@@ -1195,13 +1195,20 @@ def create_input_processor(
             f"checkpoint_format={checkpoint_format}; skipping HF config load.")
 
     if config is not None:
-        try:
-            model_cls, _ = get_model_architecture(config)
-            input_processor_cls = INPUT_PROCESSOR_REGISTRY._input_processors_cls_by_model_type \
-                .get(model_cls)
-        except RuntimeError:  # unregistered model
-            logger.info("Unregistered model, using DefaultInputProcessor")
-            input_processor_cls = None
+        # A modeling_v2 target family (TRTLLM_MODELING_V2) that reads its own
+        # multimodal inputs brings its processor; otherwise the class registered
+        # under the checkpoint's architecture decides.
+        from tensorrt_llm._torch._experimental.modeling_v2 import \
+            modeling_v2_input_processor
+        input_processor_cls = modeling_v2_input_processor(config)
+        if input_processor_cls is None:
+            try:
+                model_cls, _ = get_model_architecture(config)
+                input_processor_cls = INPUT_PROCESSOR_REGISTRY._input_processors_cls_by_model_type \
+                    .get(model_cls)
+            except RuntimeError:  # unregistered model
+                logger.info("Unregistered model, using DefaultInputProcessor")
+                input_processor_cls = None
         if input_processor_cls is not None:
             if (issubclass(input_processor_cls, BaseMultimodalInputProcessor)
                     and input_processor_cls.supports_tokenization_cache):

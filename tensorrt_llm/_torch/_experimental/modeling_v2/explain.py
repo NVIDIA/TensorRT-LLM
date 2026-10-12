@@ -58,6 +58,9 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Optional[list] = None) -> int:
     args = build_parser().parse_args(argv)
 
+    # Registers the in-tree custom configs (e.g. deepseek_v41) with
+    # transformers, as the engine does before it reads a checkpoint.
+    import tensorrt_llm._torch.configs  # noqa: F401
     from tensorrt_llm._torch.model_config import ModelConfig
 
     world_size = args.tp * args.pp

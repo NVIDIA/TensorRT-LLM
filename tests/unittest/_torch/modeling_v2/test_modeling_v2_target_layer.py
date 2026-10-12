@@ -85,22 +85,26 @@ def test_a_target_keeps_the_core_by_reference():
     assert target.forward(None) == "second"
 
 
-def test_decode_step_args_state_the_zero_rather_than_reading_it():
-    """The one place the two gpt_oss targets actually differ.
+@pytest.mark.parametrize(
+    "target",
+    [
+        "gpt_oss/gpt_oss_120b__sm_103__tp1",
+        "deepseek_v41/deepseek_v4_1_flash_nvfp4__sm_103__unified",
+    ],
+)
+def test_decode_step_args_state_the_zero_rather_than_reading_it(target):
+    """The decode target states both context counts as literal zeros.
 
     Decode's routing already guarantees no context rows, so it says so instead
     of reading the field back. That is what makes the source gate in
-    test_modeling_v2_claims.py meaningful on this target rather than vacuous.
+    test_modeling_v2_claims.py meaningful on these targets rather than vacuous.
     """
     import ast
     from pathlib import Path
 
     import tensorrt_llm._torch._experimental.modeling_v2 as _mv2
 
-    source = (
-        Path(_mv2.__file__).resolve().parent
-        / "models/gpt_oss/gpt_oss_120b__sm_103__tp1/modeling.py"
-    ).read_text()
+    source = (Path(_mv2.__file__).resolve().parent / "models" / target / "modeling.py").read_text()
     decode = next(
         n
         for n in ast.walk(ast.parse(source))
