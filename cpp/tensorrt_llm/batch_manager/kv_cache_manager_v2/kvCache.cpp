@@ -191,7 +191,13 @@ std::vector<Priority> KvCache::getPagePriorities(LayerGroupId layerGroupId, Beam
     KVCM2_REJECT_IF_POISONED();
     auto const apiLock = mManager->lockShared();
     if (beamIndex < BeamIndex{0} || beamIndex >= mBeamWidth)
+    {
         throw std::out_of_range("Beam index is outside the request's beam width");
+    }
+    if (layerGroupId.value() < 0 || LifeCycleId{layerGroupId.value()} >= mManager->storage().numLifeCycles())
+    {
+        throw std::out_of_range("Layer group is outside the configured life cycles");
+    }
     std::vector<Priority> result;
     result.reserve(mBlocks.stdSize());
     bool const isSsm

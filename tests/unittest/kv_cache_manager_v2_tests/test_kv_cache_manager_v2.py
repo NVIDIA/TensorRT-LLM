@@ -495,6 +495,16 @@ class TestRetention(TestKVCacheManagerV2):
             [KvCacheRetentionConfig.TokenRangeRetentionConfig(0, None, priority, duration)]
         )
 
+    def test_page_priorities_reject_invalid_layer_groups(self) -> None:
+        self._prepare_retention()
+        for num_tokens in (0, 4):
+            cache = self._cache(list(range(num_tokens)))
+            for layer_group in (-1, 1):
+                with self.subTest(num_tokens=num_tokens, layer_group=layer_group):
+                    with self.assertRaises(IndexError):
+                        cache.get_page_priorities(layer_group)
+            self.assertEqual(cache.get_page_priorities(0), [35] * (num_tokens // 4))
+
     @parameterized.expand([(4, False), (4, True), (5, False), (5, True)])
     def test_beam_priorities_share_prompt_and_keep_private_tail(
         self, prompt_length: int, commit: bool
