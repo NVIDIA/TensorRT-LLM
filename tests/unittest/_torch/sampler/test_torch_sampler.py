@@ -66,10 +66,11 @@ from tensorrt_llm._torch.pyexecutor.sampler.sampler_common import (
     _get_max_beam_width,
 )
 from tensorrt_llm._torch.pyexecutor.sampler.sampler_strategy import (
+    FUSED_GROUP_KEY,
     GREEDY,
     BeamSearch,
-    FlashInferGroupedStrategySampler,
     Greedy,
+    GroupedStrategySampler,
     MinP,
     RequestSeeds,
     Strategy,
@@ -1713,6 +1714,21 @@ def test_top_p_no_crossing_row_keeps_full_vocab(device: str):
     torch.testing.assert_close(probs[1], torch.softmax(no_crossing, -1))
 
 
+def test_stochastic_strategies_share_one_group():
+    """Every stochastic strategy kind lands in the fused group, so a batch mixing
+    them is sampled in a single call."""
+    strategies: list[Strategy] = [
+        ("temperature", 0.8),
+        ("top_k", 50, 0.8),
+        ("top_p", 0.9, 0.8),
+        ("top_k_top_p", 50, 0.9, 0.8),
+        ("min_p", 0, 1.0, 0.05, 0.8),
+    ]
+    keys = {GroupedStrategySampler.strategy_grouping_key(s) for s in strategies}
+    assert keys == {FUSED_GROUP_KEY}
+    assert GroupedStrategySampler.strategy_grouping_key(GREEDY) != FUSED_GROUP_KEY
+
+
 class TestBatchedSampling:
     """Validate batched/mixed sampling.
 
@@ -2399,40 +2415,37 @@ class TestBatchedSampling:
 
         Used by test_samples.
         """
-        # FlashInfer sampling batches requests of the same kind (e.g. top-p)
-        # together even if they have different parameter values (e.g. probability thresholds).
-        # This variable tracks which request types have been encountered.
-        flashinfer_keys_seen: set[Any] = set()
+        # Grouped sampling batches every stochastic request into one fused group,
+        # whatever its strategy kind (e.g. top-k next to top-p) and parameter values.
+        # This variable tracks which group keys have been encountered.
+        group_keys_seen: set[Any] = set()
 
-        assert sampler._grouped_sampler_cls == FlashInferGroupedStrategySampler
+        assert sampler._grouped_sampler_cls == GroupedStrategySampler
         sample_grouped_strategies_orig = sampler._grouped_sampler_cls.sample_grouped_strategies
 
         def _sample_grouped_strategies(
-            group_key: FlashInferGroupedStrategySampler.STRATEGY_KEY_TYPE,
+            group_key: GroupedStrategySampler.STRATEGY_KEY_TYPE,
             strategies: list[Strategy],
             logits: torch.Tensor,
             *,
             group_logit_indices: Optional[torch.Tensor] = None,
-            generator: Optional[torch.Generator] = None,
             return_probs: bool,
             group_metadata: StrategyMetadata | None = None,
             seeds: Optional[RequestSeeds] = None,
         ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor] | float]:
-            assert generator is sampler.get_generator(logits.device)
             if isinstance(group_key, tuple):
                 assert isinstance(group_key[0], str)
             else:
                 assert isinstance(group_key, str)
-            nonlocal flashinfer_keys_seen
-            assert (group_key, return_probs) not in flashinfer_keys_seen
-            flashinfer_keys_seen.add((group_key, return_probs))
+            nonlocal group_keys_seen
+            assert (group_key, return_probs) not in group_keys_seen
+            group_keys_seen.add((group_key, return_probs))
             result: tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor] | float] = (
                 sample_grouped_strategies_orig(
                     group_key,
                     strategies,
                     logits,
                     group_logit_indices=group_logit_indices,
-                    generator=generator,
                     return_probs=return_probs,
                     group_metadata=group_metadata,
                     seeds=seeds,
@@ -2443,8 +2456,8 @@ class TestBatchedSampling:
         # _grouped_sampler_cls is a class; point the instance at a subclass
         # that overrides the callable, rather than mutating the shared class.
         instrumented_cls = type(
-            "InstrumentedFlashInferGroupedStrategySampler",
-            (FlashInferGroupedStrategySampler,),
+            "InstrumentedGroupedStrategySampler",
+            (GroupedStrategySampler,),
             {"sample_grouped_strategies": staticmethod(_sample_grouped_strategies)},
         )
         patch_ctx.setattr(sampler, "_grouped_sampler_cls", instrumented_cls)
@@ -2457,8 +2470,8 @@ class TestBatchedSampling:
             num_context_logits_prefix_sum: list[int],
             resource_manager=None,
         ):
-            nonlocal flashinfer_keys_seen
-            flashinfer_keys_seen.clear()
+            nonlocal group_keys_seen
+            group_keys_seen.clear()
             res = sample_async_orig(
                 scheduled_requests,
                 model_outputs,
@@ -2466,13 +2479,13 @@ class TestBatchedSampling:
                 resource_manager,
             )
 
-            # Fast greedy path bypasses flashinfer sampling, so flashinfer_keys_seen
+            # Fast greedy path bypasses grouped sampling, so group_keys_seen
             # will be empty when all requests are greedy
             all_greedy = all(
                 _request_strategy(req, vocab_size=2**31) == GREEDY
                 for req in scheduled_requests.all_requests()
             )
-            assert flashinfer_keys_seen or all_greedy
+            assert group_keys_seen or all_greedy
             return res
 
         patch_ctx.setattr(sampler, "sample_async", _sample_async)
@@ -3264,6 +3277,26 @@ class TestRequestSeed:
         # Negative control: distinct seeds on identical logits draw distinct streams.
         assert not torch.equal(batched[:, 0], batched[:, 2])
 
+    def test_seed_is_independent_of_strategy_mix(self, monkeypatch: pytest.MonkeyPatch):
+        """Requests of other strategy kinds share the seeded request's group, so
+        they must not perturb its stream either."""
+        logits = self._logits(1).expand(4, -1).contiguous()
+        seeded = self._sampling_params(1234)
+
+        alone = self._run([seeded], logits=logits[:1], monkeypatch=monkeypatch)
+        mixed = self._run(
+            [
+                SamplingParams(temperature=0.9, top_p=0.8),
+                seeded,
+                SamplingParams(temperature=1.1, min_p=0.05, seed=7),
+                SamplingParams(temperature=0.7),
+            ],
+            logits=logits,
+            monkeypatch=monkeypatch,
+        )
+
+        torch.testing.assert_close(alone[:, 0], mixed[:, 1])
+
     def test_seeded_row_position_does_not_matter(self, monkeypatch: pytest.MonkeyPatch):
         logits = self._logits(1).expand(3, -1).contiguous()
         seeded = self._sampling_params(1234)
@@ -3508,11 +3541,8 @@ class TestTopPDecay:
     )
     def test_decay_metadata_dispatch(self, params):
         strategy = resolve_sampling_strategy(self._params(**params), vocab_size=self.VOCAB_SIZE)
-        group_key = FlashInferGroupedStrategySampler.strategy_grouping_key(strategy)
-        assert (
-            FlashInferGroupedStrategySampler.get_metadata_type_for_group(group_key)
-            is TopPDecayMetadata
-        )
+        group_key = GroupedStrategySampler.strategy_grouping_key(strategy)
+        assert GroupedStrategySampler.get_metadata_type_for_group(group_key) is TopPDecayMetadata
 
     # Companion to the dispatch test: the metadata must not just be handed over
     # but actually override the per-row top-p. Logits are chosen so the static
@@ -3541,8 +3571,8 @@ class TestTopPDecay:
                 runtime_top_p=torch.tensor([decayed_top_p], dtype=torch.float32, device="cuda"),
                 is_decay_slot=torch.tensor([is_decay_slot], dtype=torch.bool, device="cuda"),
             )
-            tokens, _, _ = FlashInferGroupedStrategySampler.sample_grouped_strategies(
-                FlashInferGroupedStrategySampler.strategy_grouping_key(strategy),
+            tokens, _, _ = GroupedStrategySampler.sample_grouped_strategies(
+                GroupedStrategySampler.strategy_grouping_key(strategy),
                 [cast(Strategy, strategy)] * num_rows,
                 logits,
                 return_probs=return_probs,

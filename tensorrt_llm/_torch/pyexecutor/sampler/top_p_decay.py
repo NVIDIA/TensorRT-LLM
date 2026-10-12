@@ -35,14 +35,14 @@ __all__ = ["TopPDecayHandler", "TopPDecayStore"]
 
 @dataclass(kw_only=True)
 class TopPDecayMetadata(StrategyMetadata):
-    """Per-group runtime top-p override for Top-P Decay (attached to the
-    top-p-carrying groups -- top_p, top_k_top_p and min_p -- via the
-    ``StrategyMetadata`` mechanism).
+    """Per-group runtime top-p override for Top-P Decay (attached to the fused
+    group, which carries a per-row top-p, via the ``StrategyMetadata``
+    mechanism).
 
     ``slots`` maps each per-step group row to its sequence slot; the decayed
     per-row top-p is gathered on-device from the per-slot ``runtime_top_p``
     store, gated by ``is_decay_slot`` (non-decay rows keep their static top-p).
-    Consumed by the TopP*/TopKTopP*/MinP* strategy impls in ``sample()``. See
+    Consumed by ``_StrategyImpls.FusedImpl``. See
     ``top_p_decay.TopPDecayStore`` for the feature-level semantics.
     """
 
@@ -301,7 +301,7 @@ class TopPDecayHandler:
         seq_slots: torch.Tensor,
         seq_slots_cuda: torch.Tensor,
     ) -> Optional[TopPDecayMetadata]:
-        """Build the Top-P Decay metadata for a top_p / top_k_top_p / min_p group.
+        """Build the Top-P Decay metadata for the fused group.
 
         Lifecycle step 2, see :class:`TopPDecayStore`. Returns None when no request
         currently uses decay. The metadata's ``slots`` tensor is aligned to the

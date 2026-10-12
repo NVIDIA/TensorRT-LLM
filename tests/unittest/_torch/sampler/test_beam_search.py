@@ -2047,17 +2047,17 @@ def test_beam_strategy_grouping_key_tolerates_trailing_fields():
     grouping layer. Pin that trailing fields are ignored.
     """
     from tensorrt_llm._torch.pyexecutor.sampler.sampler_strategy import \
-        FlashInferGroupedStrategySampler
+        GroupedStrategySampler
 
     strategy = _beam_strategy(early_stopping=BeamSearchEarlyStop.TRUE)
-    key = FlashInferGroupedStrategySampler.strategy_grouping_key(strategy)
+    key = GroupedStrategySampler.strategy_grouping_key(strategy)
     assert key == ("beam_search", strategy.beam_width_in,
                    strategy.beam_width_out, BeamSearchEarlyStop.TRUE)
 
     # row_stride is not part of the key: requests differing only in it still
     # group together.
     other = strategy._replace(row_stride=strategy.row_stride + 1)
-    assert FlashInferGroupedStrategySampler.strategy_grouping_key(other) == key
+    assert GroupedStrategySampler.strategy_grouping_key(other) == key
 
 
 def test_vbws_uniform_array_matches_fixed_width():
@@ -2445,7 +2445,8 @@ class TestBeamSearchStepFromStrategies:
         expected_cls = _StrategyImpls.CBABeamSearchStep
         strategies = [_beam_strategy(early_stopping=early_stopping)]
         impl = expected_cls.from_strategies(strategies,
-                                            cuda_device=torch.device("cuda"))
+                                            cuda_device=torch.device("cuda"),
+                                            return_probs=False)
         assert type(impl) is expected_cls
         assert impl._beam_width_in == 2
         assert impl._beam_width_out == 2
@@ -2463,7 +2464,7 @@ class TestBeamSearchStepFromStrategies:
                            diversity_rate=0.5)
         ]
         impl = _StrategyImpls.CBABeamSearchStep.from_strategies(
-            strategies, cuda_device=torch.device("cuda"))
+            strategies, cuda_device=torch.device("cuda"), return_probs=False)
         assert impl._length_penalty is not None
         assert impl._diversity_rate is not None
         torch.testing.assert_close(impl._length_penalty,

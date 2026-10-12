@@ -97,13 +97,7 @@ class _Sampler(TorchSampler):
         self._in_graph_live_rows = 0
         self._in_graph_request_ids = []
         self._current_sample_type = SampleType.FULL
-        self._fast_temperatures = None
-        self._fast_top_ks = None
-        self._fast_top_ps = None
-        self._fast_min_ps = None
-        self._fast_seeds = None
-        self._fast_offsets = None
-        self._fast_num_rows = 0
+        self._fast_params = None
 
 
 @pytest.fixture
@@ -208,10 +202,11 @@ class TestStaging:
         )
         sampler.stage_in_graph_sampling(batch, SampleType.FAST)
 
-        assert sampler._fast_temperatures[:2].tolist() == pytest.approx([0.8, 0.7])
-        assert sampler._fast_top_ks[:2].tolist() == [50, 0]
-        assert sampler._fast_top_ps[:2].tolist() == pytest.approx([0.9, 0.8])
-        assert sampler._fast_min_ps[:2].tolist() == pytest.approx([0.0, 0.05])
+        params = sampler._fast_params
+        assert params.temperature[:2].tolist() == pytest.approx([0.8, 0.7])
+        assert params.top_k[:2].tolist() == [50, 0]
+        assert params.top_p[:2].tolist() == pytest.approx([0.9, 0.8])
+        assert params.min_p[:2].tolist() == pytest.approx([0.0, 0.05])
 
     def test_full_stages_nothing(self, sampler):
         batch = self._batch(make_request(py_request_id=1, py_seq_slot=0))

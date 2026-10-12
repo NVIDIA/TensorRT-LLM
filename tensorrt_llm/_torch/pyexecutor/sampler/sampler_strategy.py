@@ -33,7 +33,6 @@ from collections.abc import Callable, Hashable, Iterable
 from dataclasses import dataclass
 from typing import (
     Any,
-    ClassVar,
     Final,
     Generic,
     Literal,
@@ -211,10 +210,13 @@ def resolve_sampling_strategy(params: UtilsSamplingParams, *, vocab_size: int) -
     return ("temperature", temperature)
 
 
-# Strategy group keys sampled by the fused kernel (everything but greedy and beam search).
-FUSED_STRATEGY_KEYS: Final[frozenset[str]] = frozenset(
+# Strategy tags sampled by the fused kernel (everything but greedy and beam search).
+FUSED_STRATEGY_TAGS: Final[frozenset[str]] = frozenset(
     {"temperature", "top_k", "top_p", "top_k_top_p", "min_p"}
 )
+# The one group key all of FUSED_STRATEGY_TAGS share: the fused kernel takes every
+# filter per row, so a batch mixing them samples in a single call.
+FUSED_GROUP_KEY: Final = "fused"
 
 
 def fused_row_params(strategy: Strategy) -> tuple[float, int, float, float]:
@@ -241,6 +243,20 @@ def fused_row_params(strategy: Strategy) -> tuple[float, int, float, float]:
                 cast(float, min_p),
             )
     raise AssertionError(f"strategy {strategy[0]!r} is not a stochastic strategy")
+
+
+def fused_params_host(strategies: Iterable[Strategy]) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per-row fused-kernel params of ``strategies``, as host tensors.
+
+    Returns ``(temperature, top_p, min_p)`` stacked as float32 ``[3, num_rows]`` and
+    top_k as int32 ``[num_rows]``, so a caller moves them to the device in two copies.
+    """
+    temperatures, top_ks, top_ps, min_ps = zip(*(fused_row_params(s) for s in strategies))
+    pin = prefer_pinned()
+    return (
+        torch.tensor([temperatures, top_ps, min_ps], dtype=torch.float32, pin_memory=pin),
+        torch.tensor(top_ks, dtype=torch.int32, pin_memory=pin),
+    )
 
 
 def sample(
@@ -334,17 +350,18 @@ GenericStrategyKeyType = TypeVar("GenericStrategyKeyType", bound=Hashable)
 
 class _StrategyImpls:
     class StrategyImpl(abc.ABC):
-        @classmethod
-        @abc.abstractmethod
-        def from_strategies(
-            cls, strategies: list[Any], cuda_device: torch.device
-        ) -> "_StrategyImpls.StrategyImpl":
-            pass
+        def __init__(self, *, computes_probs: bool):
+            self._computes_probs = computes_probs
 
         @classmethod
         @abc.abstractmethod
-        def computes_probs(cls) -> bool:
+        def from_strategies(
+            cls, strategies: list[Any], cuda_device: torch.device, *, return_probs: bool
+        ) -> "_StrategyImpls.StrategyImpl":
             pass
+
+        def computes_probs(self) -> bool:
+            return self._computes_probs
 
         def get_temperature(self) -> torch.Tensor | None:
             return getattr(self, "_temperature", None)
@@ -355,7 +372,6 @@ class _StrategyImpls:
             logits: torch.Tensor,
             *,
             group_logit_indices: Optional[torch.Tensor] = None,
-            generator: Optional[torch.Generator] = None,
             group_metadata: Optional[StrategyMetadata] = None,
             seeds: Optional["RequestSeeds"] = None,
         ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
@@ -389,22 +405,9 @@ class _StrategyImpls:
                 logits = logits / temperature
             return logits
 
-        def _sample_greedy_with_probs(
-            self,
-            logits: torch.Tensor,
-            *,
-            group_logit_indices: Optional[torch.Tensor],
-        ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-            if group_logit_indices is not None:
-                logits = torch.index_select(logits, 0, group_logit_indices)
-            tokens = torch.argmax(logits, dim=-1)
-            probs = torch.zeros_like(logits)
-            probs.scatter_(1, tokens.unsqueeze(-1), 1.0)
-            return tokens, probs
-
     class TopPDecayMixin:
-        """Mixed into the fused impls (the owners of a per-row ``_top_p``
-        tensor) to consume ``TopPDecayMetadata``."""
+        """Mixed into ``FusedImpl`` (the owner of a per-row ``_top_p`` tensor) to
+        consume ``TopPDecayMetadata``."""
 
         _top_p: torch.Tensor
 
@@ -412,10 +415,11 @@ class _StrategyImpls:
             """Override the per-row static top-p with the decayed runtime top-p.
 
             Only decay-active rows (per the on-device ``is_decay_slot`` gate) are
-            overridden, so a group mixing top-p-decay and plain top-p requests
-            keeps each row's correct value. The overridden ``self._top_p`` tensor
-            then feeds the fused kernel, which uses it for both the sampled token
-            and the returned probs (so processed logprobs match). Fused via torch.compile (gather + gate + select).
+            overridden, so a group mixing top-p-decay requests with any other
+            stochastic ones keeps each row's correct value. The overridden
+            ``self._top_p`` tensor then feeds the fused kernel, which uses it for
+            both the sampled token and the returned probs (so processed logprobs
+            match). Fused via torch.compile (gather + gate + select).
             """
             if not isinstance(group_metadata, TopPDecayMetadata):
                 return
@@ -430,22 +434,13 @@ class _StrategyImpls:
                 slots=group_metadata.slots,
             )
 
-    class StrategyImplWithProbs(StrategyImpl):
-        @override
-        @classmethod
-        def computes_probs(cls) -> bool:
-            return True
-
-    class GreedyWithProbs(StrategyImplWithProbs):
-        def __init__(self) -> None:
-            self._temperature = None
-
+    class GreedyImpl(StrategyImpl):
         @override
         @classmethod
         def from_strategies(
-            cls, strategies: list[Any], cuda_device: torch.device
-        ) -> "_StrategyImpls.GreedyWithProbs":
-            return cls()
+            cls, strategies: list[Any], cuda_device: torch.device, *, return_probs: bool
+        ) -> "_StrategyImpls.GreedyImpl":
+            return cls(computes_probs=return_probs)
 
         @override
         def sample(
@@ -453,18 +448,24 @@ class _StrategyImpls:
             logits: torch.Tensor,
             *,
             group_logit_indices: Optional[torch.Tensor] = None,
-            generator: Optional[torch.Generator] = None,
             group_metadata: Optional[StrategyMetadata] = None,
             seeds: Optional["RequestSeeds"] = None,
         ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-            return self._sample_greedy_with_probs(logits, group_logit_indices=group_logit_indices)
+            if group_logit_indices is not None:
+                logits = torch.index_select(logits, 0, group_logit_indices)
+            tokens = torch.argmax(logits, dim=-1)
+            if not self._computes_probs:
+                return tokens, None
+            probs = torch.zeros_like(logits)
+            probs.scatter_(1, tokens.unsqueeze(-1), 1.0)
+            return tokens, probs
 
     class FusedImpl(TopPDecayMixin, StrategyImpl):
         """Every stochastic strategy, sampled by the fused kernel.
 
         Each row carries its own temperature / top_k / top_p / min_p, with the
         disabled filters at their neutral values (see ``fused_row_params``), so
-        one class serves every stochastic strategy group. Every row gets its own
+        one group can mix every stochastic strategy. Every row gets its own
         ``(seed, offset)``, so its draws do not depend on where it sits in the
         batch.
         """
@@ -475,153 +476,50 @@ class _StrategyImpls:
             top_k: torch.Tensor,
             top_p: torch.Tensor,
             min_p: torch.Tensor,
+            *,
+            computes_probs: bool,
         ):
+            super().__init__(computes_probs=computes_probs)
             self._temperature = temperature
             self._top_k = top_k
             self._top_p = top_p
             self._min_p = min_p
 
-        # Position of each kernel parameter in a strategy tuple, by strategy kind.
-        # A parameter the kind does not carry is disabled (see ``fused_row_params``).
-        _PARAM_INDEX: ClassVar[dict[str, dict[str, int]]] = {
-            "temperature": {"temperature": 1},
-            "top_k": {"top_k": 1, "temperature": 2},
-            "top_p": {"top_p": 1, "temperature": 2},
-            "top_k_top_p": {"top_k": 1, "top_p": 2, "temperature": 3},
-            "min_p": {"top_k": 1, "top_p": 2, "min_p": 3, "temperature": 4},
-        }
-
         @override
         @classmethod
         def from_strategies(
-            cls, strategies: list[Any], cuda_device: torch.device
+            cls, strategies: list[Any], cuda_device: torch.device, *, return_probs: bool
         ) -> "_StrategyImpls.FusedImpl":
-            # A group holds one strategy kind, so its parameters are read column by
-            # column: one host-to-device copy for the float columns the kind carries,
-            # one for top_k, and a device-side fill for each disabled filter.
-            index = cls._PARAM_INDEX[strategies[0][0]]
-            columns = list(zip(*strategies))
-            float_names = [name for name in ("temperature", "top_p", "min_p") if name in index]
-            floats = dict(
-                zip(
-                    float_names,
-                    cls._make_tensor(
-                        [columns[index[name]] for name in float_names], torch.float32, cuda_device
-                    ),
-                )
-            )
-            num_rows = len(strategies)
+            floats, top_ks = fused_params_host(strategies)
+            floats = floats.to(device=cuda_device, non_blocking=True)
             return cls(
-                floats["temperature"],
-                cls._make_tensor(list(columns[index["top_k"]]), torch.int32, cuda_device)
-                if "top_k" in index
-                else torch.zeros(num_rows, dtype=torch.int32, device=cuda_device),
-                floats["top_p"]
-                if "top_p" in index
-                else torch.ones(num_rows, dtype=torch.float32, device=cuda_device),
-                floats["min_p"]
-                if "min_p" in index
-                else torch.zeros(num_rows, dtype=torch.float32, device=cuda_device),
+                floats[0],
+                top_ks.to(device=cuda_device, non_blocking=True),
+                floats[1],
+                floats[2],
+                computes_probs=return_probs,
             )
 
-        def _prepare(
+        @override
+        def sample(
             self,
             logits: torch.Tensor,
-            group_logit_indices: Optional[torch.Tensor],
-            group_metadata: Optional[StrategyMetadata],
-            seeds: Optional["RequestSeeds"],
-        ) -> tuple[torch.Tensor, "RequestSeeds"]:
+            *,
+            group_logit_indices: Optional[torch.Tensor] = None,
+            group_metadata: Optional[StrategyMetadata] = None,
+            seeds: Optional["RequestSeeds"] = None,
+        ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
             assert seeds is not None, "the fused sampler needs per-row seeds"
             self._maybe_apply_top_p_decay(group_metadata)
             if group_logit_indices is not None:
                 logits = torch.index_select(logits, 0, group_logit_indices)
             self._assert_no_nans(logits)
-            return logits, seeds
-
-    class FusedWithProbs(FusedImpl):
-        @override
-        @classmethod
-        def computes_probs(cls) -> bool:
-            return True
-
-        @override
-        def sample(
-            self,
-            logits: torch.Tensor,
-            *,
-            group_logit_indices: Optional[torch.Tensor] = None,
-            generator: Optional[torch.Generator] = None,
-            group_metadata: Optional[StrategyMetadata] = None,
-            seeds: Optional["RequestSeeds"] = None,
-        ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-            logits, seeds = self._prepare(logits, group_logit_indices, group_metadata, seeds)
-            return fused_sample_from_logits_with_probs(
-                logits,
-                self._temperature,
-                self._top_k,
-                self._top_p,
-                self._min_p,
-                seed=seeds.seed,
-                offset=seeds.offset,
-            )
-
-    class StrategyImplSampleOnly(StrategyImpl):
-        @override
-        @classmethod
-        def computes_probs(cls) -> bool:
-            return False
-
-    class GreedySampleOnly(StrategyImplSampleOnly):
-        def __init__(self) -> None:
-            self._temperature = None
-
-        @override
-        @classmethod
-        def from_strategies(
-            cls, strategies: list[Any], cuda_device: torch.device
-        ) -> "_StrategyImpls.GreedySampleOnly":
-            return cls()
-
-        @override
-        def sample(
-            self,
-            logits: torch.Tensor,
-            *,
-            group_logit_indices: Optional[torch.Tensor] = None,
-            generator: Optional[torch.Generator] = None,
-            group_metadata: Optional[StrategyMetadata] = None,
-            seeds: Optional["RequestSeeds"] = None,
-        ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-            if group_logit_indices is not None:
-                logits = logits[group_logit_indices]
-            return torch.argmax(logits, dim=-1), None
-
-    class FusedSampleOnly(FusedImpl):
-        @override
-        @classmethod
-        def computes_probs(cls) -> bool:
-            return False
-
-        @override
-        def sample(
-            self,
-            logits: torch.Tensor,
-            *,
-            group_logit_indices: Optional[torch.Tensor] = None,
-            generator: Optional[torch.Generator] = None,
-            group_metadata: Optional[StrategyMetadata] = None,
-            seeds: Optional["RequestSeeds"] = None,
-        ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-            logits, seeds = self._prepare(logits, group_logit_indices, group_metadata, seeds)
-            return fused_sample_from_logits(
-                logits,
-                self._temperature,
-                self._top_k,
-                self._top_p,
-                self._min_p,
-                seed=seeds.seed,
-                offset=seeds.offset,
-            ), None
+            params = (logits, self._temperature, self._top_k, self._top_p, self._min_p)
+            if self._computes_probs:
+                return fused_sample_from_logits_with_probs(
+                    *params, seed=seeds.seed, offset=seeds.offset
+                )
+            return fused_sample_from_logits(*params, seed=seeds.seed, offset=seeds.offset), None
 
     class BeamSearchStep(StrategyImpl):
         """Base for the beam-search step strategies.
@@ -629,8 +527,7 @@ class _StrategyImpls:
         ``sample`` applies the shared temperature preprocessing and delegates to
         the ``_select_and_update`` hook, implemented per stopping mode by
         ``CBABeamSearchStep``, which every stopping mode uses -- the mode only
-        selects the done verdict computed inside it. With-probs is a constructor flag
-        (``computes_probs``), not a subclass.
+        selects the done verdict computed inside it.
         """
 
         @dataclass(frozen=True, kw_only=True)
@@ -655,24 +552,13 @@ class _StrategyImpls:
             *,
             computes_probs: bool = False,
         ):
+            super().__init__(computes_probs=computes_probs)
             self._beam_width_in = beam_width_in
             self._beam_width_out = beam_width_out
             self._row_stride = row_stride
             self._temperature = temperature
             self._length_penalty = length_penalty
             self._diversity_rate = diversity_rate
-            self._computes_probs = computes_probs
-
-        @override
-        def computes_probs(self) -> bool:  # type: ignore[override]
-            # Instance flag, not a per-subclass constant: beam search has no
-            # separate with-probs sampling path.
-            return self._computes_probs
-
-        def with_computes_probs(self, computes_probs: bool) -> "_StrategyImpls.BeamSearchStep":
-            """Set the return-probs flag after construction and return self."""
-            self._computes_probs = computes_probs
-            return self
 
         @staticmethod
         def _common_fields(
@@ -723,7 +609,7 @@ class _StrategyImpls:
         @override
         @classmethod
         def from_strategies(
-            cls, strategies: list[Any], cuda_device: torch.device
+            cls, strategies: list[Any], cuda_device: torch.device, *, return_probs: bool
         ) -> "_StrategyImpls.BeamSearchStep":
             fields = _StrategyImpls.BeamSearchStep._common_fields(strategies, cuda_device)
             return cls(
@@ -733,6 +619,7 @@ class _StrategyImpls:
                 fields.temperature,
                 fields.length_penalty,
                 fields.diversity_rate,
+                computes_probs=return_probs,
             )
 
         @override
@@ -741,7 +628,6 @@ class _StrategyImpls:
             logits: torch.Tensor,
             *,
             group_logit_indices: Optional[torch.Tensor] = None,
-            generator: Optional[torch.Generator] = None,
             group_metadata: Optional[StrategyMetadata] = None,
             seeds: Optional["RequestSeeds"] = None,
         ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
@@ -794,7 +680,7 @@ class _StrategyImpls:
         @override
         @classmethod
         def from_strategies(
-            cls, strategies: list[Any], cuda_device: torch.device
+            cls, strategies: list[Any], cuda_device: torch.device, *, return_probs: bool
         ) -> "_StrategyImpls.CBABeamSearchStep":
             fields = _StrategyImpls.BeamSearchStep._common_fields(strategies, cuda_device)
             narrowed_strats = cast(list[BeamSearch], strategies)
@@ -808,6 +694,7 @@ class _StrategyImpls:
                 fields.length_penalty,
                 fields.diversity_rate,
                 early_stopping,
+                computes_probs=return_probs,
             )
 
         @override
@@ -829,17 +716,11 @@ class _StrategyImpls:
 
 
 _STRATEGY_KEY_TYPE: TypeAlias = (
-    Literal["temperature"]
-    | Literal["top_k"]
-    | Literal["top_p"]
-    | Literal["top_k_top_p"]
-    | Literal["min_p"]
-    | Literal["greedy"]
-    | tuple[Literal["beam_search"], int, int, int]
+    Literal["fused"] | Literal["greedy"] | tuple[Literal["beam_search"], int, int, int]
 )
 
 
-class FlashInferGroupedStrategySampler:
+class GroupedStrategySampler:
     """Batched sampling, one call per strategy group; stochastic groups use the fused kernel."""
 
     STRATEGY_KEY_TYPE: TypeAlias = _STRATEGY_KEY_TYPE
@@ -853,9 +734,10 @@ class FlashInferGroupedStrategySampler:
                 | ("top_k_top_p", _, _, _)
                 | ("temperature", _)
                 | ("min_p", _, _, _, _)
-                | ("greedy", None)
             ):
-                return cast(_STRATEGY_KEY_TYPE, strategy[0])
+                return FUSED_GROUP_KEY
+            case ("greedy", None):
+                return "greedy"
             # Trailing wildcard: row_stride is appended after early_stopping.
             case (
                 "beam_search",
@@ -881,7 +763,7 @@ class FlashInferGroupedStrategySampler:
         match strategy_key:
             case ("beam_search", _, _, _):
                 return BeamSearchMetadata
-            case "top_p" | "top_k_top_p" | "min_p":
+            case "fused":
                 return TopPDecayMetadata
             case _:
                 return None
@@ -893,7 +775,6 @@ class FlashInferGroupedStrategySampler:
         logits: torch.Tensor,
         *,
         group_logit_indices: Optional[torch.Tensor] = None,
-        generator: Optional[torch.Generator] = None,
         return_probs: bool,
         group_metadata: StrategyMetadata | None = None,
         seeds: Optional[RequestSeeds] = None,
@@ -907,31 +788,18 @@ class FlashInferGroupedStrategySampler:
         """
         beam_width_in = 1
         strategy_impl_cls: Type[_StrategyImpls.StrategyImpl]
-        if return_probs:
-            match group_key:
-                case "top_k" | "top_p" | "top_k_top_p" | "temperature" | "min_p":
-                    strategy_impl_cls = _StrategyImpls.FusedWithProbs
-                case "greedy":
-                    strategy_impl_cls = _StrategyImpls.GreedyWithProbs
-                case ("beam_search", beam_width_in_key, _, _):
-                    beam_width_in = beam_width_in_key
-                    # Beam search encodes with-probs as a constructor flag, not
-                    # a subclass. Every stopping mode uses the CBA step; the
-                    # mode only changes the done verdict inside it.
-                    strategy_impl_cls = _StrategyImpls.CBABeamSearchStep
-                case _:
-                    raise NotImplementedError("Unsupported strategy key encountered")
-        else:
-            match group_key:
-                case "top_k" | "top_p" | "top_k_top_p" | "temperature" | "min_p":
-                    strategy_impl_cls = _StrategyImpls.FusedSampleOnly
-                case "greedy":
-                    strategy_impl_cls = _StrategyImpls.GreedySampleOnly
-                case ("beam_search", beam_width_in_key, _, _):
-                    beam_width_in = beam_width_in_key
-                    strategy_impl_cls = _StrategyImpls.CBABeamSearchStep
-                case _:
-                    raise NotImplementedError("Unsupported strategy key encountered")
+        match group_key:
+            case "fused":
+                strategy_impl_cls = _StrategyImpls.FusedImpl
+            case "greedy":
+                strategy_impl_cls = _StrategyImpls.GreedyImpl
+            case ("beam_search", beam_width_in_key, _, _):
+                beam_width_in = beam_width_in_key
+                # Every stopping mode uses the CBA step; the mode only changes
+                # the done verdict inside it.
+                strategy_impl_cls = _StrategyImpls.CBABeamSearchStep
+            case _:
+                raise NotImplementedError("Unsupported strategy key encountered")
         if group_logit_indices is None:
             # Beam-search rows are laid out at the static admission width
             # (row_stride), which exceeds beam_width_in on a widening
@@ -942,15 +810,12 @@ class FlashInferGroupedStrategySampler:
             assert logits.size(0) == rows_per_request * len(strategies)
         else:
             assert group_logit_indices.size(0) == beam_width_in * len(strategies)
-        strategy_impl = strategy_impl_cls.from_strategies(strategies, cuda_device=logits.device)
-        # Beam search carries with-probs as a flag rather than a subclass, so
-        # inject return_probs here (the other strategies encode it in the class).
-        if isinstance(strategy_impl, _StrategyImpls.BeamSearchStep):
-            strategy_impl.with_computes_probs(return_probs)
+        strategy_impl = strategy_impl_cls.from_strategies(
+            strategies, cuda_device=logits.device, return_probs=return_probs
+        )
         next_tokens, softmax = strategy_impl.sample(
             logits,
             group_logit_indices=group_logit_indices,
-            generator=generator,
             group_metadata=group_metadata,
             seeds=seeds,
         )

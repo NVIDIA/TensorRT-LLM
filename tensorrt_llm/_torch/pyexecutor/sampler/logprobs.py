@@ -446,7 +446,7 @@ class LogProbsHandler:
                 ).squeeze(-1)  # flattened (step, slot)
 
                 # sampled_rank_cuda contains the 0-based rank, it will be corrected to 1-based in handle_logprobs
-                # NB: Computation of sampled rank could be lowered into FlashInferGroupedStrategySampler, s.t., e.g.,
+                # NB: Computation of sampled rank could be lowered into GroupedStrategySampler, s.t., e.g.,
                 #     for greedy sampling, logits management and log_softmax could be completely skipped (sampled rank
                 #     computation is trivial in this case).
                 sampled_rank_cuda = Fusions.determine_sampled_rank(
