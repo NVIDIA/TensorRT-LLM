@@ -19,11 +19,12 @@ test_llm_api_pytorch.py: these gate a parallel implementation, and reading them
 next to the built-in model's tests would invite treating one as a variant of
 the other.
 
-Every test here runs under ``TRTLLM_MODELING_V2=require``, which the case puts
-in place itself -- see ``modeling_v2_env``. Under ``"auto"`` a configuration
-that missed a target's criteria would quietly fall back to the built-in
-implementation, pass, and report the built-in's numbers as the target's --
-which is the one failure this whole system exists to prevent.
+Every test here passes ``modeling_v2="require"`` to ``LLM``. Under ``"auto"`` a
+configuration that missed a target's criteria -- or fell outside its bounds --
+would quietly fall back to the built-in implementation, pass, and report the
+built-in's numbers as the target's, which is the one failure this whole
+system exists to prevent. The switch is an LLM API argument, so it reaches
+every rank the way the rest of the arguments do.
 """
 
 import pytest
@@ -33,7 +34,6 @@ from tensorrt_llm._utils import get_sm_version
 
 from ..conftest import llm_models_root
 from .accuracy_core import GSM8K, LlmapiAccuracyTestHarness
-from .modeling_v2_env import modeling_v2_llm_args
 
 # The targets assert their own SM at construction: certification is per GPU
 # architecture, and a receipt from another one says nothing here.
@@ -60,7 +60,7 @@ class TestModelingV2GptOss120bSm103Tp1(LlmapiAccuracyTestHarness):
     }
 
     @skip_not_sm103
-    def test_gsm8k(self, mocker, monkeypatch):
+    def test_gsm8k(self, mocker):
         # Both patches are the protocol the anchor was measured under, and both
         # are what TestGPTOSS applies to this same checkpoint. The stock 256
         # tokens truncate it mid-chain-of-thought, before it ever reaches an
@@ -71,6 +71,6 @@ class TestModelingV2GptOss120bSm103Tp1(LlmapiAccuracyTestHarness):
         mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN", 8192)
         mocker.patch.dict(GSM8K.EVALUATE_KWARGS, {"scores_filter": "exact_match,flexible-extract"})
 
-        with LLM(self.MODEL_PATH, **modeling_v2_llm_args("require", monkeypatch)) as llm:
+        with LLM(self.MODEL_PATH, modeling_v2="require") as llm:
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm, extra_evaluator_kwargs=self.extra_evaluator_kwargs)
