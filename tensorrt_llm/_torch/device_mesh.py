@@ -1,5 +1,20 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from functools import wraps
-from typing import TYPE_CHECKING, List
+from typing import TYPE_CHECKING, List, Union
 
 import torch
 import torch.distributed as dist
@@ -26,11 +41,19 @@ def require_device_mesh(func):
 
 
 class SingleProcessGroup:
+    """Stands in for the process group of a single-rank mapping: ``rank()`` is 0
+    and ``size()`` is 1. Not a torch ``ProcessGroup``: it has no ``boxed()`` and
+    torch collectives reject it, so it must only be read, never passed to a
+    collective."""
 
     @staticmethod
-    def get_group():
-        return dist.group.WORLD if dist.is_initialized(
-        ) else SingleProcessGroup()
+    def get_group() -> Union[ProcessGroup, "SingleProcessGroup"]:
+        """The world process group when the whole job is a single rank, so callers
+        can pass it to torch collectives. In a larger job there is no single-rank
+        process group to return, so the stand-in itself is returned."""
+        if dist.is_initialized() and dist.get_world_size() == 1:
+            return dist.group.WORLD
+        return SingleProcessGroup()
 
     @staticmethod
     def rank():
@@ -48,27 +71,27 @@ class DeviceMeshTopologyImpl(_MappingBaseForTypeCheck):
     # Access Torch ProcessGroup
     @property
     @require_device_mesh
-    def tp_group_pg(self) -> ProcessGroup:
+    def tp_group_pg(self) -> Union[ProcessGroup, SingleProcessGroup]:
         return self._get_mesh_dim_by_name('tp').get_group()
 
     @property
     @require_device_mesh
-    def pp_group_pg(self) -> ProcessGroup:
+    def pp_group_pg(self) -> Union[ProcessGroup, SingleProcessGroup]:
         return self._get_mesh_dim_by_name('pp').get_group()
 
     @property
     @require_device_mesh
-    def cp_group_pg(self) -> ProcessGroup:
+    def cp_group_pg(self) -> Union[ProcessGroup, SingleProcessGroup]:
         return self._get_mesh_dim_by_name('cp').get_group()
 
     @property
     @require_device_mesh
-    def moe_tp_group_pg(self) -> ProcessGroup:
+    def moe_tp_group_pg(self) -> Union[ProcessGroup, SingleProcessGroup]:
         return self._get_mesh_dim_by_name('moe_tp').get_group()
 
     @property
     @require_device_mesh
-    def moe_ep_group_pg(self) -> ProcessGroup:
+    def moe_ep_group_pg(self) -> Union[ProcessGroup, SingleProcessGroup]:
         return self._get_mesh_dim_by_name('moe_ep').get_group()
 
     # Access rank
@@ -147,10 +170,14 @@ class DeviceMeshTopologyImpl(_MappingBaseForTypeCheck):
 
     @require_device_mesh
     @torch.compiler.disable
-    def _get_mesh_dim_by_name(self, name: str) -> dist.DeviceMesh:
+    def _get_mesh_dim_by_name(
+            self, name: str) -> Union[dist.DeviceMesh, SingleProcessGroup]:
         cls = DeviceMeshTopologyImpl
 
-        if cls.device_mesh is None and self.world_size == 1:
+        if self.world_size == 1:
+            # A single-rank mapping reports rank 0 of a size-1 group for every
+            # dimension, whatever mesh the job built: the mesh belongs to the
+            # job, not to this mapping.
             return SingleProcessGroup()
 
         if name == 'tp':

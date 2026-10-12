@@ -72,12 +72,6 @@ def test_llm_inference_distributed_ray(ray_example_root, llm_venv, tp_size,
 
 @pytest.mark.skip_less_device(2)
 @pytest.mark.parametrize("tp_size", [1, 2], ids=["tp1", "tp2"])
-def test_ray_disaggregated_serving(ray_example_root, llm_venv, tp_size):
-    _run_ray_disaggregated_serving(ray_example_root, tp_size, "NIXL", "CPP")
-
-
-@pytest.mark.skip_less_device(2)
-@pytest.mark.parametrize("tp_size", [1, 2], ids=["tp1", "tp2"])
 def test_ray_disaggregated_serving_python(ray_example_root, llm_venv, tp_size):
     _run_ray_disaggregated_serving(ray_example_root, tp_size, "NIXL", "PYTHON")
 

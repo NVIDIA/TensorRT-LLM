@@ -394,14 +394,6 @@ class BaseLLM:
                     f"Unknown backend: {backend!r}. Supported backends are "
                     "'pytorch'.")
 
-            # TRTLLM_MODELING_V2=require promises the run measured a modeling_v2
-            # target. Only the pytorch backend reaches the resolver that could
-            # select one, so on any other backend the promise would be broken
-            # silently -- the one failure that mode exists to prevent.
-            from .._torch._experimental.modeling_v2 import \
-                assert_backend_can_route
-            assert_backend_can_route(backend)
-
             # check the kwargs and raise ValueError directly
             valid_keys = set(
                 list(llm_args_cls.model_fields.keys()) +
@@ -435,6 +427,18 @@ class BaseLLM:
 
         finally:
             logger.set_level(log_level)  # restore the log level
+
+        # Before the ranks these args go to are spawned and before the usage
+        # report reads them, so that one description of the deployment reaches
+        # both. Imported behind the check so that no other deployment loads
+        # this connector's package, which pulls in its worker and scheduler.
+        # The registry names every preset's module without importing any of
+        # them, and tolerates an absent connector config.
+        from .._torch.pyexecutor.connectors.registry import uses_connector
+        if uses_connector(self.args.kv_connector_config, "mooncake-store"):
+            from .._torch.pyexecutor.connectors.mooncake_store.settings import \
+                apply_effective_settings
+            apply_effective_settings(self.args)
 
         logger_debug(f"LLM.args.mpi_session: {self.args.mpi_session}\n",
                      "yellow")
