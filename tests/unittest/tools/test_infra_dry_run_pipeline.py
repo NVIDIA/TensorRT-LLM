@@ -131,7 +131,7 @@ class InfraDryRunPipelineTest(unittest.TestCase):
         )
 
     def test_slurm_upload_skips_a_missing_result_directory(self) -> None:
-        upload_results = _function_body(L0_TEST, "uploadResults", "runIsolatedTests")
+        upload_results = _function_body(L0_TEST, "uploadResults", "getInfraDryRunPytestTargets")
 
         self.assertIn("if (!fileExists(stageName))", upload_results)
         self.assertLess(
