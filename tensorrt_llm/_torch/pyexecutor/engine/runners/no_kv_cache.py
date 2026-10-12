@@ -21,10 +21,7 @@ from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import (
 )
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager, ResourceManagerType
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
-from tensorrt_llm._torch.utils import (
-    set_per_request_prefill_cuda_graph_flag,
-    with_model_extra_attrs,
-)
+from tensorrt_llm._torch.utils import with_model_extra_attrs
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 from tensorrt_llm.llmapi.llm_args import PrefillCudaGraphBackend
@@ -36,9 +33,10 @@ from ..metadata import build_attention_metadata
 from .common import (
     apply_position_id_offset,
     get_all_rank_num_tokens,
-    get_padding_params,
+    pad_input_tokens,
     prepare_multimodal_indices,
     ship_multimodal_indices,
+    token_model_inputs,
 )
 from .interface import PreparedInputs, RunnerConfig, ScheduledInputs, ScheduledModelRunner
 
@@ -209,30 +207,18 @@ class NoKVCacheRunner(ScheduledModelRunner):
             mapping=self._mapping,
             dist=self._dist,
         )
-        padded_num_tokens, can_run_prefill_cuda_graph, attn_all_rank_num_tokens = (
-            get_padding_params(
-                num_tokens,
-                attn_metadata.num_contexts,
-                attn_all_rank_num_tokens,
-                dist=self._dist,
-                enable_attention_dp=runner_config.enable_attention_dp,
-                prefill_cuda_graph_backend=runner_config.prefill_cuda_graph_backend,
-                prefill_cuda_graph_num_tokens=runner_config.prefill_cuda_graph_num_tokens,
-            )
+        virtual_num_tokens = pad_input_tokens(
+            attn_metadata,
+            num_tokens,
+            attn_metadata.num_contexts,
+            attn_all_rank_num_tokens,
+            input_ids=self._buffers.input_ids_cuda,
+            position_ids=self._buffers.position_ids_cuda,
+            dist=self._dist,
+            enable_attention_dp=runner_config.enable_attention_dp,
+            prefill_cuda_graph_backend=runner_config.prefill_cuda_graph_backend,
+            prefill_cuda_graph_num_tokens=runner_config.prefill_cuda_graph_num_tokens,
         )
-        set_per_request_prefill_cuda_graph_flag(can_run_prefill_cuda_graph)
-        attn_metadata.padded_num_tokens = (
-            padded_num_tokens if padded_num_tokens != num_tokens else None
-        )
-
-        if runner_config.enable_attention_dp:
-            attn_metadata.all_rank_num_tokens = attn_all_rank_num_tokens
-
-        virtual_num_tokens = num_tokens
-        if attn_metadata.padded_num_tokens is not None:
-            self._buffers.input_ids_cuda[num_tokens:padded_num_tokens].fill_(0)
-            self._buffers.position_ids_cuda[num_tokens:padded_num_tokens].fill_(0)
-            virtual_num_tokens = padded_num_tokens
 
         # This is for no-KV-cache attention, not for dummy attention.
         if attn_metadata.kv_cache_manager is None:
@@ -249,14 +235,14 @@ class NoKVCacheRunner(ScheduledModelRunner):
 
         lora_params = self._lora.build(scheduled_requests, attn_metadata)
 
-        inputs = {
-            "attn_metadata": attn_metadata,
-            "input_ids": self._buffers.input_ids_cuda[:virtual_num_tokens],
-            "position_ids": self._buffers.position_ids_cuda[:virtual_num_tokens].unsqueeze(0),
-            "inputs_embeds": None,
-            "multimodal_params": multimodal_params_list,
-            "resource_manager": resource_manager,
-        }
+        inputs = token_model_inputs(
+            attn_metadata,
+            resource_manager,
+            input_ids=self._buffers.input_ids_cuda,
+            position_ids=self._buffers.position_ids_cuda,
+            num_tokens=virtual_num_tokens,
+            multimodal_params=multimodal_params_list,
+        )
 
         if mm_token_indices_cpu is not None:
             # No extend/draft tokens in the no-KV-cache path, so num_tokens covers

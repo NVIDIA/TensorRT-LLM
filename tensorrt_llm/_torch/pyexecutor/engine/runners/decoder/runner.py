@@ -120,8 +120,7 @@ class DecoderRunner(ScheduledModelRunner):
         self._trtllm_gen_jit_warmup = False
         self._eager_workspace_reclaimer: EagerWorkspaceReclaimer | None = None
 
-        self._buffers = DecoderInputBuffers()
-        self._buffers.allocate(self._config, self.use_beam_search)
+        self._buffers = DecoderInputBuffers.for_config(self._config, self.use_beam_search)
         self._metadata = DecoderMetadata(self._config, mapping, model, self._buffers)
         self._dummy_requests = self._make_dummy_requests()
         self._init_decoder_state()

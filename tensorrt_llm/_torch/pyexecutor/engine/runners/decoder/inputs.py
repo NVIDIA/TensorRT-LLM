@@ -6,7 +6,7 @@
 import math
 import os
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from typing import Any
 
 import torch
@@ -45,16 +45,18 @@ from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig, PrefillCudaGraphBac
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import CpType, Mapping
 
+from ...input_buffers import InputBuffers
 from ...lora import LoraParamBuilder
 from ...multimodal import MultimodalItemScheduler
 from ..common import (
     apply_position_id_offset,
     get_all_rank_num_tokens,
-    get_padding_params,
     get_position_id_offset,
+    pad_input_tokens,
     prepare_multimodal_indices,
     resolve_mrope_position_deltas_cache,
     ship_multimodal_indices,
+    token_model_inputs,
 )
 from ..interface import PreparedInputs
 from .config import DecoderRunnerConfig
@@ -103,73 +105,75 @@ def _get_context_prompt_lookahead_token(request: LlmRequest, chunk_end: int) -> 
     return request.get_token(0, chunk_end)
 
 
-@dataclass(slots=True)
-class DecoderInputBuffers:
+@dataclass(frozen=True, kw_only=True)
+class DecoderInputBuffers(InputBuffers):
     """Persistent buffers read by decoder execution.
 
     CUDA graphs record these addresses, so they are allocated once and only
     ever sliced or written in place.
     """
 
-    draft_tokens_cuda: torch.Tensor | None = None
-    gather_ids_cuda: torch.Tensor | None = None
+    previous_batch_indices_cuda: torch.Tensor
+    # Host counter of the steady-state generation prepare cache.
+    steady_gen_positions_pinned: torch.Tensor
     num_accepted_draft_tokens_cuda: torch.Tensor | None = None
     previous_pos_indices_cuda: torch.Tensor | None = None
     previous_pos_id_offsets_cuda: torch.Tensor | None = None
     previous_kv_lens_offsets_cuda: torch.Tensor | None = None
-    previous_batch_indices_cuda: torch.Tensor | None = None
-    input_ids_cuda: torch.Tensor | None = None
-    position_ids_cuda: torch.Tensor | None = None
-    # Host counter of the steady-state generation prepare cache.
-    steady_gen_positions_pinned: torch.Tensor | None = None
     mrope_position_ids_cuda: torch.Tensor | None = None
-    cache_indirection_attention: torch.Tensor | None = None
 
-    def allocate(self, config: DecoderRunnerConfig, use_beam_search: bool) -> None:
-        if config.is_spec_decode:
-            max_num_draft_tokens = config.max_draft_loop_tokens * config.max_batch_size
-            self.draft_tokens_cuda = torch.empty(
-                (max_num_draft_tokens,), dtype=torch.int, device="cuda"
-            )
-            self.gather_ids_cuda = torch.empty(
-                (config.max_num_tokens,), dtype=torch.int, device="cuda"
-            )
-            self.num_accepted_draft_tokens_cuda = torch.empty(
-                (config.max_batch_size,), dtype=torch.int, device="cuda"
-            )
-            self.previous_pos_indices_cuda = torch.empty(
-                (config.max_num_tokens,), dtype=torch.int, device="cuda"
-            )
-            self.previous_pos_id_offsets_cuda = torch.zeros(
-                (config.max_num_tokens,), dtype=torch.int, device="cuda"
-            )
-            self.previous_kv_lens_offsets_cuda = torch.zeros(
-                (config.max_batch_size,), dtype=torch.int, device="cuda"
-            )
-        self.previous_batch_indices_cuda = torch.empty(
-            (config.max_num_tokens,), dtype=torch.int, device="cuda"
+    @classmethod
+    def for_config(
+        cls, config: DecoderRunnerConfig, use_beam_search: bool
+    ) -> "DecoderInputBuffers":
+        """Allocate the buffers ``config`` needs before warmup or graph capture."""
+        base = InputBuffers.allocate(
+            max_num_tokens=config.max_num_tokens,
+            max_batch_size=config.max_batch_size,
+            max_beam_width=config.max_beam_width,
+            max_seq_len=config.max_seq_len,
+            use_cache_indirection=use_beam_search,
+            max_num_draft_tokens=(
+                config.max_draft_loop_tokens * config.max_batch_size
+                if config.is_spec_decode
+                else None
+            ),
         )
-        self.input_ids_cuda = torch.empty((config.max_num_tokens,), dtype=torch.int, device="cuda")
-        self.position_ids_cuda = torch.empty(
-            (config.max_num_tokens,), dtype=torch.int, device="cuda"
+        spec = config.is_spec_decode
+        return cls(
+            **{f.name: getattr(base, f.name) for f in fields(InputBuffers)},
+            previous_batch_indices_cuda=torch.empty(
+                (config.max_num_tokens,), dtype=torch.int, device="cuda"
+            ),
+            steady_gen_positions_pinned=torch.empty(
+                (config.max_num_tokens,), dtype=torch.int, pin_memory=prefer_pinned()
+            ),
+            num_accepted_draft_tokens_cuda=(
+                torch.empty((config.max_batch_size,), dtype=torch.int, device="cuda")
+                if spec
+                else None
+            ),
+            previous_pos_indices_cuda=(
+                torch.empty((config.max_num_tokens,), dtype=torch.int, device="cuda")
+                if spec
+                else None
+            ),
+            previous_pos_id_offsets_cuda=(
+                torch.zeros((config.max_num_tokens,), dtype=torch.int, device="cuda")
+                if spec
+                else None
+            ),
+            previous_kv_lens_offsets_cuda=(
+                torch.zeros((config.max_batch_size,), dtype=torch.int, device="cuda")
+                if spec
+                else None
+            ),
+            mrope_position_ids_cuda=(
+                torch.empty((3, 1, config.max_num_tokens), dtype=torch.int, device="cuda")
+                if config.use_mrope
+                else None
+            ),
         )
-        self.steady_gen_positions_pinned = torch.empty(
-            (config.max_num_tokens,), dtype=torch.int, pin_memory=prefer_pinned()
-        )
-        if config.use_mrope:
-            self.mrope_position_ids_cuda = torch.empty(
-                (3, 1, config.max_num_tokens), dtype=torch.int, device="cuda"
-            )
-        if use_beam_search:
-            self.cache_indirection_attention = torch.zeros(
-                (
-                    config.max_batch_size,
-                    config.max_beam_width,
-                    config.max_seq_len,
-                ),
-                device="cuda",
-                dtype=torch.int32,
-            )
 
 
 class ExtraInputsCollector:
@@ -481,39 +485,22 @@ class DecoderInputPreparer:
                 mapping=self.mapping,
                 dist=self.dist,
             )
-        (padded_num_tokens, can_run_prefill_cuda_graph, attn_all_rank_num_tokens) = (
-            get_padding_params(
-                num_tokens,
-                num_contexts,
-                attn_all_rank_num_tokens,
-                dist=self.dist,
-                enable_attention_dp=self._config.enable_attention_dp,
-                prefill_cuda_graph_backend=(
-                    self._config.prefill_cuda_graph_backend
-                    if allow_prefill_cuda_graph
-                    else PrefillCudaGraphBackend.DISABLED
-                ),
-                prefill_cuda_graph_num_tokens=self._config.prefill_cuda_graph_num_tokens,
-            )
+        return pad_input_tokens(
+            attn_metadata,
+            num_tokens,
+            num_contexts,
+            attn_all_rank_num_tokens,
+            input_ids=self._buffers.input_ids_cuda,
+            position_ids=self._position_ids_buffer(),
+            dist=self.dist,
+            enable_attention_dp=self._config.enable_attention_dp,
+            prefill_cuda_graph_backend=(
+                self._config.prefill_cuda_graph_backend
+                if allow_prefill_cuda_graph
+                else PrefillCudaGraphBackend.DISABLED
+            ),
+            prefill_cuda_graph_num_tokens=self._config.prefill_cuda_graph_num_tokens,
         )
-        set_per_request_prefill_cuda_graph_flag(can_run_prefill_cuda_graph)
-        attn_metadata.padded_num_tokens = (
-            padded_num_tokens if padded_num_tokens != num_tokens else None
-        )
-
-        virtual_num_tokens = num_tokens
-        if attn_metadata.padded_num_tokens is not None:
-            self._buffers.input_ids_cuda[num_tokens:padded_num_tokens].fill_(0)
-            virtual_num_tokens = padded_num_tokens
-            if self._config.use_mrope:
-                # Zero-fill padding on dim 2 (token dim) of (3,1,N) buffer.
-                self._buffers.mrope_position_ids_cuda[:, :, num_tokens:padded_num_tokens].fill_(0)
-            else:
-                self._buffers.position_ids_cuda[num_tokens:padded_num_tokens].fill_(0)
-
-        if self._config.enable_attention_dp:
-            attn_metadata.all_rank_num_tokens = attn_all_rank_num_tokens
-        return virtual_num_tokens
 
     def model_inputs(
         self,
@@ -523,20 +510,20 @@ class DecoderInputPreparer:
         multimodal_params: list[MultimodalParams],
     ) -> dict[str, Any]:
         """Return the model inputs over the first ``num_tokens`` buffer rows."""
-        # MRoPE models always use the (3,1,N) layout, padded or not, to keep
-        # torch.compile guards stable.
+        return token_model_inputs(
+            attn_metadata,
+            resource_manager,
+            input_ids=self._buffers.input_ids_cuda,
+            position_ids=self._position_ids_buffer(),
+            num_tokens=num_tokens,
+            multimodal_params=multimodal_params,
+        )
+
+    def _position_ids_buffer(self) -> torch.Tensor:
+        # MRoPE models always use the (3,1,N) layout.
         if self._config.use_mrope:
-            position_ids = self._buffers.mrope_position_ids_cuda[:, :, :num_tokens]
-        else:
-            position_ids = self._buffers.position_ids_cuda[:num_tokens].unsqueeze(0)
-        return {
-            "attn_metadata": attn_metadata,
-            "input_ids": self._buffers.input_ids_cuda[:num_tokens],
-            "position_ids": position_ids,
-            "inputs_embeds": None,
-            "multimodal_params": multimodal_params,
-            "resource_manager": resource_manager,
-        }
+            return self._buffers.mrope_position_ids_cuda
+        return self._buffers.position_ids_cuda
 
     def _can_use_steady_gen_fast_prepare(
         self,
@@ -1728,8 +1715,8 @@ class DecoderInputPreparer:
             )
         if next_draft_tokens_device is not None:
             # Initialize these two values to zeros
-            self._buffers.previous_pos_id_offsets_cuda *= 0
-            self._buffers.previous_kv_lens_offsets_cuda *= 0
+            self._buffers.previous_pos_id_offsets_cuda.zero_()
+            self._buffers.previous_kv_lens_offsets_cuda.zero_()
             runtime_tokens_per_gen_step = self.get_runtime_tokens_per_gen_step(runtime_draft_len)
             runtime_draft_token_buffer_width = runtime_tokens_per_gen_step - 1
 
@@ -1819,8 +1806,8 @@ class DecoderInputPreparer:
             # so we need to set the previous_pos_id_offsets and previous_kv_lens_offsets to zeros
             # to skip the value changes in preprocess_inputs. Otherwise, there will be illegal memory access
             # when writing key/values to the KV cache.
-            self._buffers.previous_pos_id_offsets_cuda *= 0
-            self._buffers.previous_kv_lens_offsets_cuda *= 0
+            self._buffers.previous_pos_id_offsets_cuda.zero_()
+            self._buffers.previous_kv_lens_offsets_cuda.zero_()
 
         host.num_tokens = num_tokens
         host.total_num_tokens = total_num_tokens
@@ -1924,7 +1911,7 @@ class DecoderInputPreparer:
                 gen_request_seq_slots_tensor = torch.tensor(
                     gen_request_seq_slots, dtype=torch.long, pin_memory=prefer_pinned()
                 ).to(device="cuda", non_blocking=True)
-                self._buffers.cache_indirection_attention[:num_generation_requests].copy_(
+                self._buffers.cache_indirection[:num_generation_requests].copy_(
                     cache_indirection_buffer[gen_request_seq_slots_tensor]
                 )
             if cache_indirection_buffer is not None or is_dummy:

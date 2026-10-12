@@ -477,6 +477,14 @@ def create_model_engine_and_kvcache(
     return model_engine, kv_cache_manager
 
 
+def _resize_input_buffers(runner: DecoderRunner, max_num_tokens: int) -> None:
+    """Reallocate the runner's input buffers for ``max_num_tokens`` tokens."""
+    buffers = DecoderInputBuffers.for_config(
+        replace(runner._config, max_num_tokens=max_num_tokens),
+        runner.use_beam_search)
+    runner._buffers = runner._inputs._buffers = runner._metadata._buffers = buffers
+
+
 def _clone_tensors(values: dict) -> dict:
     return {
         name: value.clone() if isinstance(value, torch.Tensor) else value
@@ -1971,8 +1979,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
                     self.assertIsInstance(runner, DecoderRunner)
                     self.assertIsNotNone(engine.cuda_graph_runner)
                     self.assertEqual(
-                        tuple(
-                            runner._buffers.cache_indirection_attention.shape),
+                        tuple(runner._buffers.cache_indirection.shape),
                         (4, 2, engine.max_seq_len))
                 else:
                     self.assertIsInstance(runner, PoolingRunner)
@@ -2710,12 +2717,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         max_num_tokens = 512
         model_engine._runner._inputs._config = replace(
             model_engine._runner._inputs._config, max_num_tokens=max_num_tokens)
-        model_engine._runner._buffers.input_ids_cuda = torch.zeros(
-            max_num_tokens, dtype=torch.int32, device='cuda')
-        model_engine._runner._buffers.position_ids_cuda = torch.zeros(
-            max_num_tokens, dtype=torch.int32, device='cuda')
-        model_engine._runner._buffers.previous_batch_indices_cuda = torch.zeros(
-            max_num_tokens, dtype=torch.int32, device='cuda')
+        _resize_input_buffers(model_engine._runner, max_num_tokens)
 
         result = model_engine._runner._inputs.prepare_inputs(
             scheduled_requests=scheduled_requests,
@@ -2789,14 +2791,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
 
         model_engine._runner._config = replace(model_engine._runner._config,
                                                max_num_tokens=max_num_tokens)
-        model_engine._runner._buffers.input_ids_cuda = torch.zeros(
-            max_num_tokens, dtype=torch.int32, device='cuda')
-        model_engine._runner._buffers.position_ids_cuda = torch.zeros(
-            max_num_tokens, dtype=torch.int32, device='cuda')
-        model_engine._runner._buffers.mrope_position_ids_cuda = torch.zeros(
-            (3, 1, max_num_tokens), dtype=torch.int32, device='cuda')
-        model_engine._runner._buffers.previous_batch_indices_cuda = torch.zeros(
-            max_num_tokens, dtype=torch.int32, device='cuda')
+        _resize_input_buffers(model_engine._runner, max_num_tokens)
         return model_engine, kv_cache_manager, attn_metadata
 
     @skip_pre_blackwell_unittest

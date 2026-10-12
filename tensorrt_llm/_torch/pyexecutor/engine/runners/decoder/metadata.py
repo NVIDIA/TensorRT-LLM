@@ -85,7 +85,7 @@ class DecoderMetadata:
             attention_backend=self._config.attention_backend,
             attention_runtime_features=self._config.attention_runtime_features,
             mapping=self.mapping,
-            cache_indirection=self._buffers.cache_indirection_attention
+            cache_indirection=self._buffers.cache_indirection
             if self._config.attention_backend.Metadata is TrtllmAttentionMetadata
             else None,
             kv_cache_manager=kv_cache_manager,

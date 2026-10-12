@@ -14,6 +14,7 @@ from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
 from tensorrt_llm._torch.distributed import Distributed
 from tensorrt_llm._torch.models.modeling_multimodal_utils import filter_mm_token_from_input_ids
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
+from tensorrt_llm._torch.utils import set_per_request_prefill_cuda_graph_flag
 from tensorrt_llm._utils import maybe_pin_memory
 from tensorrt_llm.llmapi.llm_args import PrefillCudaGraphBackend
 from tensorrt_llm.logger import logger
@@ -123,6 +124,69 @@ def get_padding_params(
             return total_num_tokens, False, None
 
     return total_num_tokens, False, attn_all_rank_num_tokens
+
+
+def pad_input_tokens(
+    attn_metadata: AttentionMetadata,
+    num_tokens: int,
+    num_ctx_requests: int,
+    attn_all_rank_num_tokens: list[int] | None,
+    *,
+    input_ids: torch.Tensor,
+    position_ids: torch.Tensor,
+    dist: Distributed | None,
+    enable_attention_dp: bool,
+    prefill_cuda_graph_backend: PrefillCudaGraphBackend,
+    prefill_cuda_graph_num_tokens: list[int],
+) -> int:
+    """Pad the batch to the token count its prefill graph or attention-DP peers need.
+
+    Zeroes the padded rows of ``input_ids`` and ``position_ids``, whose last
+    dimension is the token one, and returns the token count the model runs on.
+    """
+    padded_num_tokens, can_run_prefill_cuda_graph, attn_all_rank_num_tokens = get_padding_params(
+        num_tokens,
+        num_ctx_requests,
+        attn_all_rank_num_tokens,
+        dist=dist,
+        enable_attention_dp=enable_attention_dp,
+        prefill_cuda_graph_backend=prefill_cuda_graph_backend,
+        prefill_cuda_graph_num_tokens=prefill_cuda_graph_num_tokens,
+    )
+    set_per_request_prefill_cuda_graph_flag(can_run_prefill_cuda_graph)
+    attn_metadata.padded_num_tokens = padded_num_tokens if padded_num_tokens != num_tokens else None
+    if enable_attention_dp:
+        attn_metadata.all_rank_num_tokens = attn_all_rank_num_tokens
+    if attn_metadata.padded_num_tokens is None:
+        return num_tokens
+    input_ids[num_tokens:padded_num_tokens].fill_(0)
+    position_ids[..., num_tokens:padded_num_tokens].fill_(0)
+    return padded_num_tokens
+
+
+def token_model_inputs(
+    attn_metadata: AttentionMetadata,
+    resource_manager: Any,
+    *,
+    input_ids: torch.Tensor,
+    position_ids: torch.Tensor,
+    num_tokens: int,
+    multimodal_params: list[Any],
+) -> dict[str, Any]:
+    """Return the model inputs over the first ``num_tokens`` rows of the token buffers.
+
+    A one-dimensional ``position_ids`` gains a batch dimension; the [3, 1, N]
+    MRoPE layout is kept as is, padded or not, to keep torch.compile guards stable.
+    """
+    positions = position_ids[..., :num_tokens]
+    return {
+        "attn_metadata": attn_metadata,
+        "input_ids": input_ids[:num_tokens],
+        "position_ids": positions.unsqueeze(0) if positions.dim() == 1 else positions,
+        "inputs_embeds": None,
+        "multimodal_params": multimodal_params,
+        "resource_manager": resource_manager,
+    }
 
 
 def prepare_multimodal_indices(
