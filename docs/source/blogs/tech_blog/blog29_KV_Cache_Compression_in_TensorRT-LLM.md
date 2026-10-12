@@ -310,7 +310,7 @@ A page is quantized only when it leaves the GPU, so the accuracy question is whe
 </div>
 <p align="center"><sub><em>Figure 15: NVFP4 round trips do not accumulate error. Left: distance to the original value after 1 to 4 round trips, for every FP8, FP16 and BF16 value; it is the quantization error and does not change with the number of round trips. Middle: distance to the previous round trip; from the second round trip on it is zero. Right: Qwen3-8B accuracy on AIME24 and AIME25 after 0, 1 and 2 round trips; the second round trip reproduces every output of the first.</em></sub></p>
 
-On a large model the end-to-end accuracy is **indistinguishable from the uncompressed baseline**. Figure 16 shows Qwen3.5-397B-A17B with and without NVFP4 cold pages: AIME25 stays at 90.0% when 28% of the reused pages are compressed and 90.2% when 61% are, and MATH-500 stays within 0.4 points.
+End to end, on a **large model, hard reasoning tasks, and with very different shares of pages offloaded**, accuracy is **indistinguishable from the uncompressed baseline**. Figure 16 shows Qwen3.5-397B-A17B with and without NVFP4 cold pages: AIME25 stays at 90.0% when 28% of the reused pages are compressed and 90.2% when 61% are, and MATH-500 stays within 0.4 points whether 9% or 23% of the pages are compressed.
 
 <div align="center">
 <figure>
