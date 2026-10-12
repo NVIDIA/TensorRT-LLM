@@ -3286,6 +3286,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         # With a host drafter: requests of a prepared batch whose acceptance
         # update_resources has not recorded yet.
         self._kda_replay_acceptance_pending: set[int] = set()
+        self._kda_replay_unseeded: set[int] = set()
 
         state_index_capacity = (self.max_batch_size +
                                 self._num_reserved_dummy_slots)
@@ -4532,7 +4533,10 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                     f"Request {request_id} is being suspended before "
                     "update_resources recorded the acceptance of its last "
                     "verify, so its pending KDA drafts are unknown")
-            self._commit_kda_pending_drafts(slot)
+            if request_id in self._kda_replay_unseeded:
+                self._kda_replay_unseeded.remove(request_id)
+            else:
+                self._commit_kda_pending_drafts(slot)
             del self._request_id_to_state_index[request_id]
             self._kda_replay_suspended.add(request_id)
         super().suspend_request(req)
@@ -4636,6 +4640,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         self._branch_snapshot_points.pop(request.py_request_id, None)
         self._kda_replay_suspended.discard(request.py_request_id)
         self._kda_replay_acceptance_pending.discard(request.py_request_id)
+        self._kda_replay_unseeded.discard(request.py_request_id)
         super().free_resources(request, pin_on_release)
 
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
@@ -4647,6 +4652,11 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         num_contexts = len(scheduled_batch.context_requests)
         self._setup_state_indices(requests, num_contexts=num_contexts)
         self._reset_context_mamba_slots(num_contexts)
+        if self.use_kda_replay_update:
+            self._kda_replay_unseeded.update(
+                request.py_request_id
+                for request in scheduled_batch.context_requests
+                if request.is_disagg_generation_init_state)
         if self._record_kda_replay_in_update_resources:
             # Recorded by this batch's update_resources, or dropped by
             # revert_allocate_generation when the batch is not run.
@@ -4761,6 +4771,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             for request_id in request_ids
             if request_id in self._request_id_to_state_index
         ]
+        self._kda_replay_unseeded.difference_update(request_ids)
         if not slots:
             return
 
@@ -5116,4 +5127,5 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         self._kda_replay_suspended.clear()
         self._kda_replay_acceptance_pending.clear()
         self.kda_state_tok = None
+        self._kda_replay_unseeded.clear()
         super().shutdown()
