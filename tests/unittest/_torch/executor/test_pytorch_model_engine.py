@@ -519,6 +519,51 @@ def test_cleanup_releases_runner_model_before_release_gc() -> None:
     release_gc.assert_called_once_with()
 
 
+class GraphOwnerTeardownTestCase(unittest.TestCase):
+
+    def test_cuda_graph_runner_destructor_does_not_release_window_owner(
+            self) -> None:
+        runner = Mock()
+
+        CUDAGraphRunner.__del__(runner)
+
+        runner.clear.assert_called_once_with(release_nccl_window_owners=False)
+
+    def test_engine_graph_ownership_is_split(self) -> None:
+        clear_blocks_graph = Mock()
+        model = Mock()
+        model.modules.return_value = [
+            SimpleNamespace(clear_blocks_cuda_graph=clear_blocks_graph)
+        ]
+        backend = Mock()
+        cuda_runner = Mock()
+        breakable_runner = Mock()
+        decoder_runner = object.__new__(DecoderRunner)
+        decoder_runner.cuda_graph_runner = cuda_runner
+        decoder_runner.breakable_cuda_graph_runner = breakable_runner
+        engine = SimpleNamespace(
+            model=model,
+            _torch_compile_backend=backend,
+            _runner=decoder_runner,
+        )
+
+        PyTorchModelEngine._release_cuda_graphs(
+            engine, release_nccl_window_owners=False)
+
+        clear_blocks_graph.assert_not_called()
+        backend.clear_piecewise_cuda_graphs.assert_called_once_with(
+            release_nccl_window_owners=False)
+        for runner in (cuda_runner, breakable_runner):
+            runner.clear.assert_called_once_with(
+                release_nccl_window_owners=False)
+
+        PyTorchModelEngine._release_model_owned_cuda_graphs(
+            engine, release_nccl_window_owners=False)
+
+        clear_blocks_graph.assert_called_once_with(
+            release_nccl_window_owners=False)
+
+
 class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
 
     def test_generation_only_is_identity(self) -> None:
@@ -1661,7 +1706,8 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         engine._init_cuda_graph_lora_manager(Mock())
 
         runner.wait_for_input_copy.assert_called_once_with()
-        runner.release_graphs.assert_called_once_with()
+        runner.release_graphs.assert_called_once_with(
+            release_nccl_window_owners=True)
         runner.init_cuda_graph_lora_manager.assert_not_called()
 
     def test_decoder_engine_shared_entries_use_decoder_state(self) -> None:
@@ -1677,8 +1723,10 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         engine._release_cuda_graphs()
 
         decoder._prepare_inputs_event.synchronize.assert_called_once_with()
-        decoder.cuda_graph_runner.clear.assert_called_once_with()
-        decoder.breakable_cuda_graph_runner.clear.assert_called_once_with()
+        decoder.cuda_graph_runner.clear.assert_called_once_with(
+            release_nccl_window_owners=True)
+        decoder.breakable_cuda_graph_runner.clear.assert_called_once_with(
+            release_nccl_window_owners=True)
 
     def test_prepare_tp_inputs_fast_path_returns_call_draft_length(
             self) -> None:

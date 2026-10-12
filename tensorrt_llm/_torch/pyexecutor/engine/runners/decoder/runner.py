@@ -31,6 +31,7 @@ from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import (
     MoeLoadBalancer,
     MoeLoadBalancerIterContext,
 )
+from tensorrt_llm._torch.nccl_window_tensor_scope import discard_nccl_window_tensor_outputs
 from tensorrt_llm._torch.peft.lora.config import LoraConfig
 from tensorrt_llm._torch.peft.lora.manager import LoraModelConfig
 from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph_runner import BreakableCUDAGraphRunner
@@ -211,6 +212,30 @@ def _make_single_token_context_graph_batch(
     graph_batch.paused_requests = list(scheduled_requests.paused_requests)
     promoted_context_request_ids = frozenset(request.py_request_id for request in context_requests)
     return graph_batch, promoted_context_request_ids
+
+
+def _discarded_warmup_scope(runner: Any, inputs: Any = None):
+    # Warmup inputs may be host-only. The persistent CUDA input buffer
+    # ensures the native scope opens before forward creates window tensors.
+    return discard_nccl_window_tensor_outputs((getattr(runner, "input_ids_cuda", None), inputs))
+
+
+def _run_discarded_warmup_forward(
+    runner: Any,
+    batch: ScheduledRequests,
+    resource_manager: ResourceManager,
+    *,
+    enable_spec_decode: bool,
+    runtime_draft_len: int,
+) -> None:
+    """Run an eager warmup through its last consumer and release its outputs."""
+    with _discarded_warmup_scope(runner, batch):
+        runner._forward_warmup(
+            batch,
+            resource_manager,
+            enable_spec_decode=enable_spec_decode,
+            runtime_draft_len=runtime_draft_len,
+        )
 
 
 # Arbitrary non-greedy params used to force the advanced-sampling CUDA graph
@@ -399,8 +424,8 @@ class DecoderRunner(ScheduledModelRunner):
         with self._warmup_timer:
             self._warmup_scheduled(resource_manager, kv_cache_manager)
 
-    def release_graphs(self) -> None:
-        self._release_decoder_graphs()
+    def release_graphs(self, *, release_nccl_window_owners: bool = True) -> None:
+        self._release_decoder_graphs(release_nccl_window_owners=release_nccl_window_owners)
 
     def wait_for_input_copy(self) -> None:
         self._wait_for_decoder_input_copy()
@@ -1357,7 +1382,8 @@ class DecoderRunner(ScheduledModelRunner):
                         record=False,
                         log_start=False,
                     ):
-                        self._forward_warmup(
+                        _run_discarded_warmup_forward(
+                            self,
                             batch,
                             resource_manager,
                             enable_spec_decode=self._config.is_spec_decode,
@@ -1473,7 +1499,8 @@ class DecoderRunner(ScheduledModelRunner):
                     log_start=True,
                 ):
                     with trtllm_gen_fmha_jit_warmup():
-                        self._forward_warmup(
+                        _run_discarded_warmup_forward(
+                            self,
                             batch,
                             resource_manager,
                             enable_spec_decode=self._config.is_spec_decode,
@@ -1629,7 +1656,8 @@ class DecoderRunner(ScheduledModelRunner):
                             record=False,
                             log_start=True,
                         ):
-                            self._forward_warmup(
+                            _run_discarded_warmup_forward(
+                                self,
                                 batch,
                                 resource_manager,
                                 enable_spec_decode=self._config.is_spec_decode,
@@ -1856,7 +1884,8 @@ class DecoderRunner(ScheduledModelRunner):
                         with self._release_batch_context(warmup_request, resource_manager) as batch:
                             if not self._should_run_warmup_batch(batch, num_tokens_i, shape):
                                 continue
-                            self._forward_warmup(
+                            _run_discarded_warmup_forward(
+                                self,
                                 batch,
                                 resource_manager,
                                 enable_spec_decode=self._config.is_spec_decode,
@@ -2151,12 +2180,21 @@ class DecoderRunner(ScheduledModelRunner):
                                 enable_spec_decode=enable_spec_decode,
                                 runtime_draft_len=draft_len,
                             )
-                            self._forward_warmup(
-                                batch,
-                                resource_manager,
-                                enable_spec_decode=enable_spec_decode,
-                                runtime_draft_len=draft_len,
-                            )
+                            if self.cuda_graph_runner.is_warmup_only:
+                                _run_discarded_warmup_forward(
+                                    self,
+                                    batch,
+                                    resource_manager,
+                                    enable_spec_decode=enable_spec_decode,
+                                    runtime_draft_len=draft_len,
+                                )
+                            else:
+                                self._forward_warmup(
+                                    batch,
+                                    resource_manager,
+                                    enable_spec_decode=enable_spec_decode,
+                                    runtime_draft_len=draft_len,
+                                )
                             torch.cuda.synchronize()
             finally:
                 self._force_lora_graph_for_capture = None
@@ -2280,6 +2318,7 @@ class DecoderRunner(ScheduledModelRunner):
                                     enable_spec_decode=enable_spec_decode,
                                     runtime_draft_len=runtime_draft_len,
                                 ),
+                                self.input_ids_cuda,
                             )
                         finally:
                             self._metrics["ctx_cuda_graph_warmup_seconds"] += runner.metrics.get(
@@ -2291,7 +2330,8 @@ class DecoderRunner(ScheduledModelRunner):
                     else:
                         with timing_metric("ctx_cuda_graph_warmup_seconds", self._metrics):
                             for _ in range(PiecewiseRunner.WARMUP_STEPS):
-                                self._forward_warmup(
+                                _run_discarded_warmup_forward(
+                                    self,
                                     batch,
                                     resource_manager,
                                     enable_spec_decode=enable_spec_decode,
@@ -2299,7 +2339,8 @@ class DecoderRunner(ScheduledModelRunner):
                                 )
                             torch.cuda.synchronize()
                         with timing_metric("ctx_cuda_graph_capture_seconds", self._metrics):
-                            self._forward_warmup(
+                            _run_discarded_warmup_forward(
+                                self,
                                 batch,
                                 resource_manager,
                                 enable_spec_decode=enable_spec_decode,
@@ -2331,10 +2372,12 @@ class DecoderRunner(ScheduledModelRunner):
                                     enable_spec_decode=enable_spec_decode,
                                     runtime_draft_len=runtime_draft_len,
                                 ),
+                                self.input_ids_cuda,
                                 steps=1,
                             )
                     else:
-                        self._forward_warmup(
+                        _run_discarded_warmup_forward(
+                            self,
                             batch,
                             resource_manager,
                             enable_spec_decode=enable_spec_decode,
@@ -2782,14 +2825,16 @@ class DecoderRunner(ScheduledModelRunner):
         )
         return self.spec_metadata
 
-    def _release_decoder_graphs(self) -> None:
+    def _release_decoder_graphs(self, *, release_nccl_window_owners: bool = True) -> None:
         if hasattr(self, "cuda_graph_runner") and self.cuda_graph_runner is not None:
-            self.cuda_graph_runner.clear()
+            self.cuda_graph_runner.clear(release_nccl_window_owners=release_nccl_window_owners)
         if (
             hasattr(self, "breakable_cuda_graph_runner")
             and self.breakable_cuda_graph_runner is not None
         ):
-            self.breakable_cuda_graph_runner.clear()
+            self.breakable_cuda_graph_runner.clear(
+                release_nccl_window_owners=release_nccl_window_owners
+            )
 
     def _should_use_full_generation_page_table(
         self, spec_config: DecodingBaseConfig | None, attn_metadata: AttentionMetadata
