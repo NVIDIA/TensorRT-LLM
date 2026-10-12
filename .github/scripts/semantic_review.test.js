@@ -613,18 +613,23 @@ test('tidy without a semantic review request or trusted event is a no-op', async
   assert.equal(await tidy({number: undefined, context: {repo, payload: {issue: {number: 1}}}}), undefined);
 });
 
-test('privileged jobs run trusted code and serialize request switches with publication', () => {
+test('disabled semantic workflow cannot request or process bot replies and retains trusted job isolation', () => {
   const workflow = readFileSync(join(__dirname, '../workflows/semantic-review.yml'), 'utf8');
   assert.doesNotMatch(workflow, /pull_request_target:|pull_request:/);
-  assert.match(workflow, /cron: '23 \*\/2 \* \* \*'/);
+  assert.doesNotMatch(workflow, /^  (schedule|issue_comment|pull_request|pull_request_target):/m);
+  assert.match(workflow, /^  workflow_dispatch:/m);
+  const discoverJob = workflow.split('  discover:')[1].split('  request:')[0];
+  const requestJob = workflow.split('  request:')[1].split('  publish:')[0];
+  assert.match(discoverJob, /if: \$\{\{ false \}\}/);
+  assert.match(requestJob, /needs: discover/);
   assert.match(workflow, /group: semantic-review-pr-\$\{\{ matrix.number \}\}/);
   assert.match(workflow, /group: semantic-review-pr-\$\{\{ github.event.issue.number \}\}/);
   assert.equal(workflow.match(/      cancel-in-progress: false\n      queue: max/g).length, 3);
   assert.equal(workflow.match(/ref: \$\{\{ github.event.repository.default_branch \}\}/g).length, 4);
-  assert.match(workflow, /types: \[created, edited, deleted\]/);
   assert.equal(workflow.match(/secrets\./g).length, 1);
   const publishJob = workflow.split('  publish:')[1].split('  tidy:')[0];
   const tidyJob = workflow.split('  tidy:')[1];
+  assert.match(publishJob, /if: \$\{\{ false \}\}/);
   assert.doesNotMatch(publishJob, /SEMANTIC_COMMAND_TOKEN|issues: write|pull-requests: write/);
   assert.doesNotMatch(tidyJob, /SEMANTIC_COMMAND_TOKEN|statuses: write|checks: write/);
   assert.match(tidyJob, /needs: publish/);

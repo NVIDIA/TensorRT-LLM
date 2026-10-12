@@ -896,9 +896,9 @@ def test_receive_reserves_kv_and_aux_atomically_against_cancellation(
 
     thread = threading.Thread(target=cancel)
 
-    def seal(expected: int, cohort: set[int]) -> None:
+    def seal(expected: int, cohort: set[int], *, published_writers: set[int] | None = None) -> None:
         """Pause at a real metadata boundary while cancellation competes."""
-        original_seal(expected, cohort)
+        original_seal(expected, cohort, published_writers=published_writers)
         thread.start()
         assert attempted.wait(1)
         assert interleaved == [False]

@@ -17,7 +17,7 @@ import math
 from contextlib import nullcontext
 from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import Callable, ContextManager, Optional, Tuple, TypeVar
+from typing import Any, Callable, ContextManager, Optional, Tuple, TypeVar
 
 import torch
 import torch.nn as nn
@@ -31,6 +31,11 @@ from tensorrt_llm._torch.modules.linear import Linear, WeightMode
 from tensorrt_llm._torch.modules.mlp import MLP
 from tensorrt_llm._torch.utils import relu2
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
+from tensorrt_llm._torch.visual_gen.models.cosmos3.step_precision import (
+    StepPrecisionController,
+    install_step_precision,
+    parse_diffusion_step_policy,
+)
 from tensorrt_llm._torch.visual_gen.models.modeling import BaseDiffusionModel
 from tensorrt_llm._torch.visual_gen.modules.attention import Attention, QKVMode
 from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeightLoader
@@ -59,6 +64,53 @@ def apply_pretrained_config_compat_defaults(
         if getattr(pretrained_config, key, None) is None:
             setattr(pretrained_config, key, value)
     return pretrained_config
+
+
+def uses_static_fp8(model_config: DiffusionModelConfig) -> bool:
+    """Whether this run consumes a statically quantized (calibrated) FP8 checkpoint.
+
+    Such checkpoints store a separate calibrated scale per projection. Fusing
+    q/k/v or gate/up into one Linear forces a single scale on the group and
+    re-quantizes the other members onto it, discarding their calibration, so
+    those groups are kept as separate projections here instead.
+
+    Dynamic quantization derives scales at load or per call, so it has no
+    calibration to preserve and keeps the fused topology.
+    """
+    quant_config = model_config.quant_config
+    if quant_config is None or getattr(quant_config, "layer_quant_mode", None) is None:
+        return False
+    return (
+        quant_config.layer_quant_mode.has_fp8_qdq()
+        and not model_config.force_dynamic_quantization
+        and not model_config.dynamic_weight_quant
+    )
+
+
+def _resolve_cosmos3_cross_attention_backend(
+    backend: str,
+    visual_gen_mapping: Optional[Any],
+) -> str:
+    """Select a backend that preserves padded cross-attention semantics."""
+    if backend == "TRTLLM":
+        return "VANILLA"
+    if backend != "CUTEDSL" or visual_gen_mapping is None:
+        return backend
+
+    attn2d_size = visual_gen_mapping.attn2d_row_size * visual_gen_mapping.attn2d_col_size
+    if attn2d_size > 1:
+        raise ValueError(
+            "Cosmos3 cross-attention with Attention2D cannot use the CUTEDSL "
+            "backend because request prompt lengths may differ. Use attention "
+            "backend FA4."
+        )
+    if visual_gen_mapping.ulysses_size > 1:
+        raise ValueError(
+            "Cosmos3 cross-attention with Ulysses cannot use the CUTEDSL backend "
+            "because request prompt lengths may differ. Use attention backend "
+            "VANILLA or FA4."
+        )
+    return backend
 
 
 def _noop_offload_context(_tower_name: str) -> ContextManager:
@@ -641,32 +693,42 @@ class Cosmos3CrossAttention(Attention):
         module_name: Optional[str] = None,
     ):
         original_backend = model_config.attention.backend
-        if model_config.attention.backend == "TRTLLM":
-            # TRTLLM backend is not supported for Cosmos3CrossAttention
-            model_config.attention.backend = "VANILLA"
+        resolved_backend = _resolve_cosmos3_cross_attention_backend(
+            original_backend,
+            model_config.visual_gen_mapping,
+        )
+        if resolved_backend != original_backend:
+            model_config.attention.backend = resolved_backend
             # Warn once per (module class, requested, resolved) triple so the
             # fallback is visible without per-module-instance log spam.
             logger.warning_once(
-                f"{type(self).__name__}: requested attention backend {original_backend} is not "
-                f"supported for Cosmos3 cross-attention; falling back to VANILLA.",
-                key=(type(self).__name__, original_backend, "VANILLA"),
+                f"{type(self).__name__}: requested attention backend {original_backend} "
+                f"is not supported for Cosmos3 cross-attention; "
+                f"falling back to {resolved_backend}.",
+                key=(type(self).__name__, original_backend, resolved_backend),
             )
 
-        super().__init__(
-            hidden_size=hidden_size,
-            num_attention_heads=num_attention_heads,
-            num_key_value_heads=num_key_value_heads,
-            head_dim=head_dim,
-            qkv_mode=QKVMode.FUSE_QKV,
-            qk_norm=False,
-            qk_norm_mode="per_head",
-            bias=False,
-            config=model_config,
-            layer_idx=layer_idx,
-            module_name=module_name,
-            enable_sequence_parallel=True,
-        )
-        model_config.attention.backend = original_backend
+        static_fp8 = uses_static_fp8(model_config)
+
+        try:
+            super().__init__(
+                hidden_size=hidden_size,
+                num_attention_heads=num_attention_heads,
+                num_key_value_heads=num_key_value_heads,
+                head_dim=head_dim,
+                qkv_mode=QKVMode.SEPARATE_QKV if static_fp8 else QKVMode.FUSE_QKV,
+                qk_norm=False,
+                qk_norm_mode="per_head",
+                bias=False,
+                config=model_config,
+                layer_idx=layer_idx,
+                module_name=module_name,
+                enable_sequence_parallel=True,
+            )
+        finally:
+            model_config.attention.backend = original_backend
+        vgm = model_config.visual_gen_mapping
+        self._sequence_parallel = vgm is not None and vgm.seq_size > 1
 
         # Same flavor note as Cosmos3CausalAttention: attention Q/K norms are
         # fp32-weight-multiply in both recipes.
@@ -678,6 +740,69 @@ class Cosmos3CrossAttention(Attention):
         """Per-head RMSNorm on 4D tensors [B, S, H, D]."""
         return self.norm_q(q), self.norm_k(k)
 
+    def _forward_with_text_prefixes(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        k_und: torch.Tensor,
+        v_und: torch.Tensor,
+        real_text_lens: list[int],
+        timestep: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """Run the unsharded batch with each sample's exact text prefix."""
+        if len(real_text_lens) != q.shape[0]:
+            raise ValueError(
+                f"Expected {q.shape[0]} Cosmos3 text lengths, got {len(real_text_lens)}."
+            )
+        text_lens = [int(length) for length in real_text_lens]
+        if any(not 0 <= length <= k_und.shape[1] for length in text_lens):
+            raise ValueError(
+                f"Cosmos3 text lengths must be in [0, {k_und.shape[1]}], got {text_lens}."
+            )
+
+        if all(length == text_lens[0] for length in text_lens):
+            text_len = text_lens[0]
+            return self._attn_impl(
+                q,
+                torch.cat([k_und[:, :text_len], k], dim=1),
+                torch.cat([v_und[:, :text_len], v], dim=1),
+                attention_mask=PredefinedAttentionMask.FULL,
+                timestep=timestep,
+            )
+
+        outputs = []
+        for batch_idx, text_len in enumerate(text_lens):
+            timestep_batch = (
+                timestep[batch_idx : batch_idx + 1]
+                if torch.is_tensor(timestep)
+                and timestep.ndim > 0
+                and timestep.shape[0] == q.shape[0]
+                else timestep
+            )
+            outputs.append(
+                self._attn_impl(
+                    q[batch_idx : batch_idx + 1],
+                    torch.cat(
+                        [
+                            k_und[batch_idx : batch_idx + 1, :text_len],
+                            k[batch_idx : batch_idx + 1],
+                        ],
+                        dim=1,
+                    ),
+                    torch.cat(
+                        [
+                            v_und[batch_idx : batch_idx + 1, :text_len],
+                            v[batch_idx : batch_idx + 1],
+                        ],
+                        dim=1,
+                    ),
+                    attention_mask=PredefinedAttentionMask.FULL,
+                    timestep=timestep_batch,
+                )
+            )
+        return torch.cat(outputs, dim=0)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -686,7 +811,8 @@ class Cosmos3CrossAttention(Attention):
         freqs_cos: torch.Tensor,
         freqs_sin: torch.Tensor,
         timestep=None,
-        real_text_lens: Optional[list[int]] = None,
+        real_text_lens: Optional[torch.Tensor | list[int]] = None,
+        global_generated_seq_len: Optional[int] = None,
     ) -> torch.Tensor:
         """
         Args:
@@ -710,22 +836,33 @@ class Cosmos3CrossAttention(Attention):
         q, k = self.apply_qk_norm(q, k)
         q, k = qwen3_apply_rotary_pos_emb(q, k, freqs_cos, freqs_sin)
 
-        if real_text_lens is not None and batch_size > 1:
-            outs = []
-            for b in range(batch_size):
-                Lb = int(real_text_lens[b])
-                k_all_b = torch.cat([k_und[b : b + 1, :Lb], k[b : b + 1]], dim=1)
-                v_all_b = torch.cat([v_und[b : b + 1, :Lb], v[b : b + 1]], dim=1)
-                outs.append(
-                    self._attn_impl(
-                        q[b : b + 1],
-                        k_all_b,
-                        v_all_b,
-                        attention_mask=PredefinedAttentionMask.FULL,
-                        timestep=timestep,
-                    )
+        if self._sequence_parallel:
+            if global_generated_seq_len is None:
+                raise ValueError(
+                    "Sequence-parallel Cosmos3 cross-attention requires the generated "
+                    "sequence length."
                 )
-            out = torch.cat(outs, dim=0)
+            out = self._attn_impl(
+                q,
+                k,
+                v,
+                attention_mask=PredefinedAttentionMask.FULL,
+                timestep=timestep,
+                replicated_k=k_und,
+                replicated_v=v_und,
+                replicated_k_lengths=real_text_lens,
+                global_generated_seq_len=global_generated_seq_len,
+            )
+        elif real_text_lens is not None and batch_size > 1:
+            out = self._forward_with_text_prefixes(
+                q,
+                k,
+                v,
+                k_und,
+                v_und,
+                real_text_lens,
+                timestep,
+            )
         else:
             k_all = torch.cat([k_und, k], dim=1).contiguous()
             v_all = torch.cat([v_und, v], dim=1).contiguous()
@@ -755,6 +892,7 @@ def _build_cosmos3_mlp(
             config=model_config,
             layer_idx=layer_idx,
             reduce_output=model_config.mapping.tp_size > 1,
+            split_gate_up=uses_static_fp8(model_config),
         )
     return MLP(
         hidden_size=hidden_size,
@@ -877,7 +1015,8 @@ class Cosmos3GenDecoderLayer(nn.Module):
         v_und: torch.Tensor,
         freqs: Tuple[torch.Tensor, torch.Tensor],
         timestep=None,
-        real_text_lens: Optional[list[int]] = None,
+        real_text_lens: Optional[torch.Tensor | list[int]] = None,
+        global_generated_seq_len: Optional[int] = None,
     ) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
@@ -891,6 +1030,7 @@ class Cosmos3GenDecoderLayer(nn.Module):
             freqs_sin=sin,
             timestep=timestep,
             real_text_lens=real_text_lens,
+            global_generated_seq_len=global_generated_seq_len,
         )
         hidden_states = residual + hidden_states
 
@@ -1076,6 +1216,8 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
         )
         pretrained_config = apply_pretrained_config_compat_defaults(model_config.pretrained_config)
         self.recipe = resolve_arch_recipe(pretrained_config)
+        # Installed in post_load_weights when the checkpoint is static FP8.
+        self.step_precision_controller: Optional[StepPrecisionController] = None
         self.audio_gen = getattr(pretrained_config, "sound_gen", False)
         self.action_gen = getattr(pretrained_config, "action_gen", False)
         # Config-fact alias kept for callers that predate action support.
@@ -1163,6 +1305,27 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
                 "Ring parallelism is not supported for Cosmos3 cross-attention."
             )
 
+        if uses_static_fp8(model_config):
+            # Static FP8 puts cross-attention on SEPARATE_QKV, which the parallel
+            # wrappers treat differently from a fused QKV: Attention2D silently
+            # falls back off Ulysses rather than failing. Reject the untested
+            # combinations outright instead of degrading quietly.
+            # cp_size unifies ring and Attention2D; ring is already rejected above.
+            unsupported = {
+                "tp_size": tp_size,
+                "ulysses_size": ulysses_size,
+                "cfg_size": vgm.cfg_size if vgm else 1,
+                "cp_size": vgm.cp_size if vgm else 1,
+                "parallel_vae_size": vgm.parallel_vae_size if vgm else 1,
+            }
+            engaged = {k: v for k, v in unsupported.items() if v > 1}
+            if engaged:
+                raise NotImplementedError(
+                    "Static FP8 Cosmos3 is supported on one GPU only (each of "
+                    f"{sorted(unsupported)} must be 1); got {engaged}. Use the "
+                    "BF16 checkpoint for multi-GPU."
+                )
+
         self.language_model = Cosmos3LanguageModel(model_config, self.recipe)
 
         self.vae2llm = nn.Linear(self.patch_latent_dim, self.hidden_size)
@@ -1190,6 +1353,9 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
         )
 
         self.cached_kv = None
+        self.cached_real_text_lens = None
+        self.cached_real_text_lens_host = None
+        self.cached_text_lengths_uniform = None
         self.cached_freqs_gen = None
         self.cached_freqs_gen_combined = None
         self.domain_ids_validated = False
@@ -1444,15 +1610,16 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
         return tokens
 
     def register_cuda_graph_extra_key_fns(self, runner) -> None:
-        """Make the position-determining scalars part of the graph key.
+        """Make the scalars that change the computation part of the graph key.
 
-        The base key is tensor shapes only, but the rotary tables are built
-        from Python scalars that leave every shape unchanged: the frame rate,
-        the action clock, and the offset of the first action step. Two requests
-        differing only in these produce different positions at identical
-        shapes, so without them one captured graph would be replayed for both.
+        The base key is tensor shapes only, but some inputs to the computation
+        leave every shape unchanged. The rotary tables are built from Python
+        scalars: the frame rate, the action clock, and the offset of the first
+        action step. The step precision swaps each governed Linear's
+        quantization method between FP8 and 16-bit. Without these in the key,
+        one captured graph would be replayed for all of them.
         Each returns ``None`` when absent, which drops that part of the key --
-        a video-only request keys exactly as it did before.
+        a video-only request without a step policy keys on tensor shapes alone.
         """
         super().register_cuda_graph_extra_key_fns(runner)
 
@@ -1476,8 +1643,18 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
             "action_start_frame_offset", _int_key("action_start_frame_offset")
         )
 
+        def _step_precision_key(*args, **kwargs):
+            # Read at call time: the controller is installed after the runner.
+            controller = self.step_precision_controller
+            return None if controller is None else controller.high_precision
+
+        runner.register_extra_key_fn("step_precision_a16", _step_precision_key)
+
     def reset_cache(self):
         self.cached_kv = None
+        self.cached_real_text_lens = None
+        self.cached_real_text_lens_host = None
+        self.cached_text_lengths_uniform = None
         self.cached_freqs_gen = None
         self.cached_freqs_gen_combined = None
         self.domain_ids_validated = False
@@ -1561,8 +1738,6 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
             )
         T, H, W = video_shape
         Hp, Wp, _, _ = self._pad_to_patch_size(H, W)
-        max_real_len = text_mask.sum(dim=1).max().item()
-        real_text_lens = text_mask.sum(dim=1).tolist()
 
         hidden_gen = self.vae2llm(self.patchify(hidden_states, T, H, W))
 
@@ -1592,8 +1767,19 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
             hidden_gen = hidden_gen + time_embed.unsqueeze(1)
 
         if self.cached_kv is None:
+            self.cached_real_text_lens = text_mask.sum(dim=1).to(device="cpu", dtype=torch.int32)
+            real_text_lens_host = [int(length) for length in self.cached_real_text_lens.tolist()]
+            self.cached_real_text_lens_host = real_text_lens_host
+            self.cached_text_lengths_uniform = bool(real_text_lens_host) and all(
+                length == real_text_lens_host[0] for length in real_text_lens_host
+            )
+            max_real_len = int(self.cached_real_text_lens.max().item())
+            # Trim the tower inputs as views so its per-layer K/V outputs have
+            # the required length without copying every cached K/V tensor.
+            text_ids_for_cache = text_ids[:, :max_real_len]
+            text_mask_for_cache = text_mask[:, :max_real_len]
             freqs_und, freqs_gen = self._compute_rope_freqs(
-                text_mask,
+                text_mask_for_cache,
                 T,
                 Hp,
                 Wp,
@@ -1604,32 +1790,31 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
                 share_vision_temporal_positions=transfer_share_vision_temporal_positions,
             )
             with offload_context("reasoner"):
-                cached_kv_full = self.language_model(
-                    text_ids,
-                    text_mask,
+                self.cached_kv = self.language_model(
+                    text_ids_for_cache,
+                    text_mask_for_cache,
                     freqs_und,
                     timestep=timestep,
                 )
             self.cached_freqs_gen = freqs_gen
 
-            if self.sharder.is_active:
-                # Round max_real_len up to next multiple of sharder.size.
-                # At most size-1 extra positions, negligible softmax dilution.
-                val = (self.sharder.size - max_real_len % self.sharder.size) % self.sharder.size
-                S_text_shard_total = int(max_real_len) + val
-
-                self.cached_kv = []
-                for k, v in cached_kv_full:
-                    k = k[:, :S_text_shard_total].clone()
-                    v = v[:, :S_text_shard_total].clone()
-                    if val > 0:
-                        k[:, int(max_real_len) :] = 0
-                        v[:, int(max_real_len) :] = 0
-                    self.cached_kv.append(
-                        (self.sharder.shard(k, dim=1), self.sharder.shard(v, dim=1))
-                    )
-            else:
-                self.cached_kv = cached_kv_full
+        if self.cached_real_text_lens is None:
+            raise RuntimeError("Cosmos3 text lengths are missing from the K/V cache.")
+        if self.cached_real_text_lens_host is None:
+            raise RuntimeError("Cosmos3 host text lengths are missing from the K/V cache.")
+        if self.cached_text_lengths_uniform is None:
+            raise RuntimeError("Cosmos3 text-length uniformity is missing from the K/V cache.")
+        real_text_lens = self.cached_real_text_lens
+        # The text cache is already trimmed to this shared length, so both
+        # unsharded and sequence-parallel paths can stay fully compiled.
+        if self.cached_text_lengths_uniform:
+            layer_text_lens = None
+        elif self.sharder.is_active:
+            layer_text_lens = real_text_lens
+        else:
+            # Keep the unsharded per-sample loop traceable under fullgraph=True,
+            # matching the pre-fix behavior without per-step device syncs.
+            layer_text_lens = self.cached_real_text_lens_host
 
         # --- Extra modality token injection (mutually exclusive: action, audio or control) ---
         T_vid_tokens = hidden_gen.shape[1]  # T * Hp * Wp
@@ -1756,15 +1941,13 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
             for i, layer in enumerate(self.gen_layers):
                 k_und, v_und = self.cached_kv[i]
                 if not self.sharder.is_active:
-                    k_und = k_und[:, :max_real_len]
-                    v_und = v_und[:, :max_real_len]
                     hidden_gen = layer(
                         hidden_gen,
                         k_und,
                         v_und,
                         freqs_gen,
                         timestep=timestep,
-                        real_text_lens=real_text_lens,
+                        real_text_lens=layer_text_lens,
                     )
                 else:
                     hidden_gen = layer(
@@ -1773,6 +1956,8 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
                         v_und,
                         freqs_gen,
                         timestep=timestep,
+                        real_text_lens=layer_text_lens,
+                        global_generated_seq_len=S_gen,
                     )
 
         hidden_gen = self.sharder.gather(hidden_gen, dim=1, unpad_to=S_gen)
@@ -2056,3 +2241,78 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
         for _, module in self.named_modules():
             if isinstance(module, Linear) or isinstance(module, Qwen3VLTextRMSNorm):
                 module.post_load_weights()
+
+        # Second pass: GatedMLP and Attention validate invariants across their
+        # own projections, so they must run after those projections finalize.
+        # named_modules() yields parents before children, so folding this into
+        # the loop above would check the scales too early.
+        for _, module in self.named_modules():
+            if isinstance(module, (GatedMLP, Attention)):
+                module.post_load_weights()
+
+        self._maybe_install_step_precision()
+
+    def _maybe_install_step_precision(self) -> None:
+        """Honor the checkpoint's ``diffusion_step_policy``, if it declares one.
+
+        Runs last: the wrapper only ever needs to dispatch ``apply``, and the
+        projections must already be finalized. The policy is the checkpoint's
+        to state -- it ships only with the builds whose calibration needs it --
+        so there is no default to apply when it is absent, and no knob here to
+        turn it on for a checkpoint that did not ask.
+
+        Only static FP8 qualifies: under dynamic quantization the scale is
+        derived per call, so there is no calibration mismatch to avoid.
+        """
+        policy = parse_diffusion_step_policy(
+            getattr(self.model_config.pretrained_config, "quantization_config", None)
+        )
+        if policy is None:
+            return
+        if not uses_static_fp8(self.model_config):
+            logger.warning(
+                "Checkpoint declares a diffusion_step_policy but this run is not static "
+                "per-tensor FP8, so the policy does not apply and is ignored."
+            )
+            return
+
+        self.step_precision_controller = StepPrecisionController(
+            first_steps=policy.first_steps,
+            last_steps=policy.last_steps,
+        )
+        # The generation tower follows the step windows. The reasoner's
+        # precision is stated outright: it runs once per request, on whichever
+        # transformer call builds its KV cache, so deriving it from a step index
+        # would match the policy only by coincidence.
+        wrapped = install_step_precision([self.gen_layers], self.step_precision_controller)
+        if policy.reasoner_high_precision:
+            wrapped += install_step_precision(
+                [self.language_model.layers], self.step_precision_controller, always_high=True
+            )
+        if wrapped == 0:
+            logger.warning(
+                "Checkpoint declares a diffusion_step_policy, but no static-FP8 linears "
+                "were found to wrap; every step will run fully quantized."
+            )
+            self.step_precision_controller = None
+            return
+        logger.info(
+            f"Cosmos3 diffusion_step_policy: {wrapped} FP8 linears wrapped; first "
+            f"{policy.first_steps} and last {policy.last_steps} denoising steps run with "
+            f"BF16 activations, reasoner "
+            f"{'always BF16' if policy.reasoner_high_precision else 'native'}."
+        )
+
+    def set_denoising_step(self, step_index: int, num_steps: int) -> None:
+        """Select this step's activation precision, before any transformer call.
+
+        Called once per denoising step so a step's conditional and
+        unconditional CFG branches cannot disagree.
+        """
+        if self.step_precision_controller is not None:
+            self.step_precision_controller.set_step(step_index, num_steps)
+
+    def reset_denoising_step(self) -> None:
+        """Drop per-request precision state so it cannot leak into the next request."""
+        if self.step_precision_controller is not None:
+            self.step_precision_controller.reset()

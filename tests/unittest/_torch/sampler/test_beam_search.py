@@ -472,12 +472,13 @@ def test_beam_search_disagg_first_token_is_end_id(
     prompts = [[1, 2, 3]]
 
     def _context_first_gen_tokens(llm, params: SamplingParams) -> list[int]:
+        # Let the executor assign a fresh ID: the previous context response
+        # can arrive while its KV transfer still owns the request's cache.
         outputs = llm.generate(
             deepcopy(prompts),
             sampling_params=deepcopy(params),
             disaggregated_params=[
-                DisaggregatedParams(request_type="context_only",
-                                    disagg_request_id=201)
+                DisaggregatedParams(request_type="context_only")
             ],
             use_tqdm=False,
         )
@@ -514,6 +515,50 @@ def test_beam_search_disagg_first_token_is_end_id(
             assert end_id_tokens == baseline_tokens
     finally:
         ctx_llm.shutdown()
+
+
+@pytest.mark.threadleak(enabled=False)
+def test_beam_search_v2_preserves_outputs_with_reuse() -> None:
+    """Cold and reused V2 caches produce the same beams as V1 with mixed prompt lengths."""
+    model_root = llm_models_root()
+    if model_root is None:
+        pytest.skip("LLM_MODELS_ROOT is required for model-output parity")
+    prompts = [[1, 2, 3, 4] * 8, [5, 6, 7, 8] * 8 + [9, 10, 11]]
+    sampling = SamplingParams(max_tokens=8,
+                              n=2,
+                              best_of=2,
+                              use_beam_search=True,
+                              ignore_eos=True)
+    expected = None
+    for use_v2 in (False, True):
+        with LLM(
+                model=model_root / "llama-models-v2/TinyLlama-1.1B-Chat-v1.0",
+                max_seq_len=64,
+                max_batch_size=2,
+                max_beam_width=2,
+                disable_overlap_scheduler=False,
+                cuda_graph_config=CudaGraphConfig(batch_sizes=[1, 2, 4],
+                                                  enable_padding=True),
+                kv_cache_config=KvCacheConfig(max_tokens=4096,
+                                              tokens_per_block=32,
+                                              enable_block_reuse=True,
+                                              use_kv_cache_manager_v2=use_v2),
+        ) as llm:
+            for repeat in range(2 if use_v2 else 1):
+                results = llm.generate(prompts, sampling, use_tqdm=False)
+                actual = [[list(beam.token_ids) for beam in result.outputs]
+                          for result in results]
+                assert len(actual) == len(prompts)
+                assert all(
+                    len(beams) == 2 and all(
+                        len(tokens) == 8 for tokens in beams)
+                    for beams in actual)
+                if expected is None:
+                    expected = actual
+                else:
+                    assert actual == expected
+                if repeat:
+                    assert all(result.cached_tokens > 0 for result in results)
 
 
 @pytest.mark.parametrize("beam_width", [10])
@@ -1969,25 +2014,20 @@ def test_vbws_rejects_decreasing_beam_width_array(beam_width_array: list[int],
     # and py_beam_width is the array maximum either way.
     assert request.py_beam_width == max(beam_width_array)
 
-    # Drive the real admission check rather than a local re-implementation:
-    # _validate_request only reads self.max_beam_width, so a stub carrying it
-    # is enough to reach the beam_width_array branch without standing up an
-    # executor. A test that mirrored the predicate would keep passing if the
-    # production check were deleted.
-    # Everything _validate_request touches besides the beam checks runs after
-    # them and needs a live engine/sampler/KV cache manager, so stub those out;
-    # the beam width and beam_width_array branches are reached with the real
-    # code.
+    # Exercise the real beam admission checks with unrelated cache, transport,
+    # token-range, sampler, and budget validation disabled in the executor stub.
     executor = types.SimpleNamespace(
         max_beam_width=request.py_beam_width,
+        kv_cache_manager=None,
         kv_cache_transceiver=None,
+        _configure_csa2_remote_tail=lambda _request: None,
         _validate_token_id_range=lambda _request: None,
         sampler=types.SimpleNamespace(validate_request=lambda _request: None),
         _validate_request_budget=lambda _request: None,
     )
     validate = functools.partial(
         PyExecutor._validate_request,
-        executor,  # type: ignore[arg-type]  # stub: only max_beam_width is read
+        executor,  # type: ignore[arg-type]  # minimal executor stub
     )
 
     if accepted:
@@ -2464,8 +2504,7 @@ class TestParameterValidation:
     def model_kwargs() -> dict[str, Any]:
         root = llm_models_root()
         assert root is not None
-        return dict(model=root / "llama-models-v2" /
-                    "TinyLlama-1.1B-Chat-v1.0", )
+        return dict(model=root / "Qwen3" / "Qwen3-0.6B", )
 
     # NB: Class-level fixture overrides do not work without this
     @pytest.fixture(scope="module")

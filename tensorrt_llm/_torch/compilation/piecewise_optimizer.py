@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import dataclasses
 from typing import Callable, List, Optional, Sequence, Union
 from unittest.mock import patch
@@ -144,6 +147,8 @@ class Entry:
 
 class PiecewiseRunner(object):
 
+    WARMUP_STEPS = 3
+
     def __init__(
         self,
         graph: GraphModule,
@@ -223,7 +228,7 @@ class PiecewiseRunner(object):
             if not get_capture_piecewise_cuda_graph_flag():
                 return entry.callable(*args)
 
-            if entry.warmup_count < 3:
+            if entry.warmup_count < self.WARMUP_STEPS:
                 entry.warmup_count += 1
                 return entry.callable(*args)
 
