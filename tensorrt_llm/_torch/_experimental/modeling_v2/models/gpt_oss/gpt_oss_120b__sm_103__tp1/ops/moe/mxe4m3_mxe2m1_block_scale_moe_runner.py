@@ -26,7 +26,7 @@ ACT_TYPE_SWIGLU = 0
 #: sigmoid(alpha * gate)` after `gate.clamp(max=limit)`, `up.clamp(+-limit)`.
 #: gpt-oss carries these two in its HF reference rather than its checkpoint --
 #: every expert on every layer uses the same alpha and beta -- which is why
-#: `bind_glu` below builds them from a count rather than taking them as
+#: `glu_vectors` below builds them from a count rather than taking them as
 #: arguments: there is nothing a caller could supply that varies.
 GLU_ALPHA = 1.702
 GLU_BETA = 1.0
@@ -124,6 +124,27 @@ def dequantize_mxfp4(codes: torch.Tensor, exponents: torch.Tensor) -> torch.Tens
     return table[codes.long()] * scale
 
 
+def glu_vectors(
+    num_experts: int, clamp_limit: float, device: torch.device
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """gpt-oss's clamped-GLU epilogue vectors: `(gemm1_alpha, gemm1_beta,
+    gemm1_clamp_limit)`, one fp32 value per local expert.
+
+    `gemm1_alpha` and `gemm1_beta` are this op's own fixture: a fixed pair the
+    checkpoint never carries, built here from `GLU_ALPHA`/`GLU_BETA` rather
+    than taken as tensors a caller assembled. `clamp_limit` does come from the
+    checkpoint -- gpt-oss's `swiglu_limit` -- but every local expert shares the
+    one value, and broadcasting it into the per-expert vector `__call__` wants
+    is this op's business, not a caller's. A target builds the three once and
+    passes them on every call.
+    """
+    return (
+        torch.full((num_experts,), GLU_ALPHA, dtype=torch.float32, device=device),
+        torch.full((num_experts,), GLU_BETA, dtype=torch.float32, device=device),
+        torch.full((num_experts,), float(clamp_limit), dtype=torch.float32, device=device),
+    )
+
+
 class Mxe4m3Mxe2m1BlockScaleMoeRunner(OpWrapper):
     """One MXFP4-weight MoE layer over MXFP8 (e4m3 + UE8M0) activations, with
     gpt-oss's clamped gated activation.
@@ -200,27 +221,7 @@ class Mxe4m3Mxe2m1BlockScaleMoeRunner(OpWrapper):
     once through the trtllm preprocessing ops -- and compares them first.
     """
 
-    def bind_glu(self, num_experts: int, clamp_limit: float, device: torch.device) -> None:
-        """Bind gpt-oss's clamped-GLU epilogue vectors, via `bind_const`.
-
-        `gemm1_alpha` and `gemm1_beta` are this op's own fixture: a fixed pair
-        the checkpoint never carries, so the op manufactures the per-expert
-        vectors itself from `GLU_ALPHA`/`GLU_BETA` rather than taking them as
-        tensors a caller built. `clamp_limit` does come from the checkpoint --
-        gpt-oss's `swiglu_limit` -- but is still a scalar here: every local
-        expert shares the one value, and broadcasting it into the per-expert
-        `gemm1_clamp_limit` vector `raw_call` wants is this op's business, not
-        a caller's.
-        """
-        self.bind_const(
-            gemm1_alpha=torch.full((num_experts,), GLU_ALPHA, dtype=torch.float32, device=device),
-            gemm1_beta=torch.full((num_experts,), GLU_BETA, dtype=torch.float32, device=device),
-            gemm1_clamp_limit=torch.full(
-                (num_experts,), float(clamp_limit), dtype=torch.float32, device=device
-            ),
-        )
-
-    def raw_call(
+    def __call__(
         self,
         routing_logits: Optional[torch.Tensor],
         routing_bias: Optional[torch.Tensor],
@@ -304,7 +305,7 @@ class Mxe4m3Mxe2m1BlockScaleMoeRunner(OpWrapper):
     ) -> torch.Tensor:
         """The layer, in plain torch over dequantized weights, fp32 throughout.
 
-        The documented exception to mirroring: `raw_call` takes the *prepared*
+        The documented exception to mirroring: `__call__` takes the *prepared*
         operands -- packed e2m1 codes, shuffled and padded rows, swizzled
         scales -- and a reference given those would be re-deriving the layout
         rather than the computation. So this takes the per-expert

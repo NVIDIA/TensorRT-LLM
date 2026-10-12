@@ -55,7 +55,7 @@ class Allgather(OpWrapper):
     own named checks.
     """
 
-    def raw_call(
+    def __call__(
         self,
         input: torch.Tensor,
         sizes: Optional[List[int]],
@@ -79,7 +79,7 @@ class Allgather(OpWrapper):
     ) -> torch.Tensor:
         """The concatenation the collective is supposed to make.
 
-        The documented exception to mirroring `raw_call`: a collective's output
+        The documented exception to mirroring `__call__`: a collective's output
         is not a function of what the calling rank holds, so a reference given
         only `input` could not state anything at all. It takes the group's
         inputs in ascending rank order instead. The matrix builds that list on

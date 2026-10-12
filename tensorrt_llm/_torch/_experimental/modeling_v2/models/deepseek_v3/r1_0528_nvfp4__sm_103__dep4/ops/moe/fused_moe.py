@@ -80,7 +80,7 @@ class FusedMoe(OpWrapper):
     tuner\'s behaviour, and `misc/test_autotuner.py` owns it.
     """
 
-    def raw_call(
+    def __call__(
         self,
         input: torch.Tensor,
         token_selected_experts: torch.Tensor,
@@ -241,7 +241,7 @@ class FusedMoe(OpWrapper):
         """What the op computes, in plain torch, fp32 through both GEMMs.
 
         Takes the arguments that change the result rather than mirroring
-        `raw_call`. The other ~40 are inert on the certified path -- a
+        `__call__`. The other ~40 are inert on the certified path -- a
         reference that accepted them would have to ignore them, which reads
         as coverage it does not have.
 

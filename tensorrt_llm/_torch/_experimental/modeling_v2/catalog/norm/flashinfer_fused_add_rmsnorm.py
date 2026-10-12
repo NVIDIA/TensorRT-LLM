@@ -61,7 +61,7 @@ class FlashinferFusedAddRmsnorm(OpWrapper):
     is not certified by this entry.
     """
 
-    def raw_call(
+    def __call__(
         self, x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, eps: float
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Writes `x` and `residual` in place and returns both, in that order
@@ -76,7 +76,7 @@ class FlashinferFusedAddRmsnorm(OpWrapper):
         """The two values the op writes, as (x_out, residual_out).
 
         Returns rather than mutates so a cell can drive both sides from the
-        same inputs; the kernel's in-place write is what `raw_call` does.
+        same inputs; the kernel's in-place write is what `__call__` does.
         """
         h = x.float() + residual.float()
         normed = h * torch.rsqrt(h.pow(2).mean(dim=-1, keepdim=True) + eps)

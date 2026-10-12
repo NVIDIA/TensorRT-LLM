@@ -84,7 +84,7 @@ class Nvfp4Gemm(OpWrapper):
     day -- that is deliberate, since a target gets the same choice.
     """
 
-    def raw_call(
+    def __call__(
         self,
         act_fp4: torch.Tensor,
         weight: torch.Tensor,

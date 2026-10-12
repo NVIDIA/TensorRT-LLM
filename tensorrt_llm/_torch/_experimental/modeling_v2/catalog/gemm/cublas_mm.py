@@ -52,7 +52,7 @@ class CublasMm(OpWrapper):
     a cell axis and neither is certified here.
     """
 
-    def raw_call(
+    def __call__(
         self,
         mat_a: torch.Tensor,
         mat_b: torch.Tensor,

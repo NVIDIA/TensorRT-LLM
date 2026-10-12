@@ -4,28 +4,28 @@
 
 Flat single-entry forward assembled from catalog entries only, running the
 MXFP4 sparse MoE W4A8 on a single GPU (tp1). Weights are target-owned and
-declared in the sibling weights.py. Each target is self-contained: it binds
-every op it calls against the real weights in its own `__init__` and shares
-no code with the other target.
+declared in the sibling weights.py. Each target is self-contained: it holds
+the per-layer weight views it reads, passes every argument to every op at the
+call site, and shares no code with the other target.
 """
 
 import math
+from typing import NamedTuple
 
 import torch
 from torch import nn
 from transformers import PretrainedConfig
 
 from tensorrt_llm._torch._experimental.modeling_v2._target import Phase, Target, phase_of
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import advance_step_generation
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.thop_attention import (
-    ThopAttention,
+    thop_attention,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.cublas_mm import CublasMm
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.cublas_mm import cublas_mm
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.flashinfer_fused_add_rmsnorm import (  # noqa: E501
-    FlashinferFusedAddRmsnorm,
+    flashinfer_fused_add_rmsnorm,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.flashinfer_rmsnorm import (
-    FlashinferRmsnorm,
+    flashinfer_rmsnorm,
 )
 from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
@@ -33,11 +33,14 @@ from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_utils import DecoderModel, DecoderModelForCausalLM
 
 from . import weights as _weights
-from .ops.attention.fused_qk_norm_rope import FusedQkNormRope
+from .ops.attention.fused_qk_norm_rope import fused_qk_norm_rope
 from .ops.moe.mxe4m3_mxe2m1_block_scale_moe_runner import (  # noqa: E501
-    Mxe4m3Mxe2m1BlockScaleMoeRunner,
+    ACT_TYPE_SWIGLU,
+    ROUTING_METHOD_RENORMALIZE,
+    glu_vectors,
+    mxe4m3_mxe2m1_block_scale_moe_runner,
 )
-from .ops.quantization.mxfp8_quantize import Mxfp8Quantize
+from .ops.quantization.mxfp8_quantize import mxfp8_quantize
 
 _CALL_CONSTANTS = dict(
     output_sf=None,
@@ -95,6 +98,55 @@ _CALL_CONSTANTS = dict(
 )
 
 _FC1_K_ALIGN = _weights.FC1_K_ALIGN
+
+# The MoE runner reads the activation scales as a linear buffer. The swizzled 128x4 order has
+# the same byte count whenever num_tokens % 128 == 0, which every decode CUDA-graph batch is, so
+# a wrong value here is accepted silently as a wrong answer.
+_SF_LINEAR = False
+
+
+class _Layer(NamedTuple):
+    """One decoder layer's weights, as the views the ops read: `.t()` for the GEMM operands,
+    and the *next* layer's input norm (the final norm on the last layer) as `norm_next`."""
+
+    qkv: torch.Tensor
+    qkv_bias: torch.Tensor
+    sinks: torch.Tensor
+    o: torch.Tensor
+    o_bias: torch.Tensor
+    norm2: torch.Tensor
+    router: torch.Tensor
+    router_bias: torch.Tensor
+    fc1_w: torch.Tensor
+    fc1_s: torch.Tensor
+    fc1_b: torch.Tensor
+    fc2_w: torch.Tensor
+    fc2_s: torch.Tensor
+    fc2_b: torch.Tensor
+    norm_next: torch.Tensor
+
+
+def _layer_views(w, num_layers: int) -> list[_Layer]:
+    return [
+        _Layer(
+            qkv=w[f"l{i}_qkv"].t(),
+            qkv_bias=w[f"l{i}_qkv_bias"],
+            sinks=w[f"l{i}_sinks"],
+            o=w[f"l{i}_o"].t(),
+            o_bias=w[f"l{i}_o_bias"],
+            norm2=w[f"l{i}_norm2"],
+            router=w[f"l{i}_router"].t(),
+            router_bias=w[f"l{i}_router_bias"],
+            fc1_w=w[f"l{i}_fc1_w"],
+            fc1_s=w[f"l{i}_fc1_s"],
+            fc1_b=w[f"l{i}_fc1_b"],
+            fc2_w=w[f"l{i}_fc2_w"],
+            fc2_s=w[f"l{i}_fc2_s"],
+            fc2_b=w[f"l{i}_fc2_b"],
+            norm_next=w[f"l{i + 1}_norm1"] if i + 1 < num_layers else w["final_norm"],
+        )
+        for i in range(num_layers)
+    ]
 
 
 class GptOssTp1ModelingV2(DecoderModel):
@@ -178,7 +230,6 @@ class GptOssTp1ModelingV2(DecoderModel):
         **kwargs,
     ) -> torch.Tensor:
         """Route the step, and nothing else."""
-        advance_step_generation()
         return self._select_target(attn_metadata).forward(attn_metadata, *args, **kwargs)
 
 
@@ -194,106 +245,26 @@ class PrefillTarget(Target):
         yarn_high: float,
         yarn_attn_factor: float,
     ) -> None:
-        """Bind every op this target calls, once, against the real weights."""
+        """Take the views and constants this target's forward reads, once, off the real weights."""
         super().__init__(core)
         cfg = core.model_config.pretrained_config
         w = core.w
         device = w["final_norm"].device
         dtype = w["final_norm"].dtype
-        n = cfg.num_hidden_layers
 
-        self._norm0 = FlashinferRmsnorm()
-        self._norm0.bind_const(weight=w["l0_norm1"], eps=cfg.rms_norm_eps)
+        self._yarn_factor = yarn_factor
+        self._yarn_low = yarn_low
+        self._yarn_high = yarn_high
+        self._yarn_attn_factor = yarn_attn_factor
 
-        self._qkv = CublasMm()
-        for i in range(n):
-            self._qkv.bind_layered(i, mat_b=w[f"l{i}_qkv"].t(), bias=w[f"l{i}_qkv_bias"])
-
+        self._norm0 = w["l0_norm1"]
+        self._layers = _layer_views(w, cfg.num_hidden_layers)
         # fused_qk_norm_rope requires valid q/k norm weight tensors even when is_qk_norm=False, where
         # the values are unused.
-        no_qk_norm = torch.zeros(cfg.head_dim, dtype=dtype, device=device)
-        self._qk_rope = FusedQkNormRope()
-        self._qk_rope.bind_const(
-            num_heads_q=cfg.num_attention_heads,
-            num_heads_k=cfg.num_key_value_heads,
-            num_heads_v=cfg.num_key_value_heads,
-            head_dim=cfg.head_dim,
-            rotary_dim=cfg.head_dim,
-            eps=cfg.rms_norm_eps,
-            q_weight=no_qk_norm,
-            k_weight=no_qk_norm,
-            base=core.theta,
-            is_neox=True,
-            factor=yarn_factor,
-            low=yarn_low,
-            high=yarn_high,
-            attention_factor=yarn_attn_factor,
-            is_qk_norm=False,
+        self._no_qk_norm = torch.zeros(cfg.head_dim, dtype=dtype, device=device)
+        self._glu_alpha, self._glu_beta, self._glu_limit = glu_vectors(
+            cfg.num_local_experts, cfg.swiglu_limit, device
         )
-
-        self._attn = ThopAttention()
-        for i in range(n):
-            self._attn.bind_layered(i, attention_sinks=w[f"l{i}_sinks"], local_layer_idx=i)
-        self._attn.bind_const(
-            num_heads=cfg.num_attention_heads,
-            num_kv_heads=cfg.num_key_value_heads,
-            head_size=cfg.head_dim,
-            **_CALL_CONSTANTS,
-        )
-
-        self._o_proj = CublasMm()
-        for i in range(n):
-            self._o_proj.bind_layered(i, mat_b=w[f"l{i}_o"].t(), bias=w[f"l{i}_o_bias"])
-
-        self._norm2 = FlashinferFusedAddRmsnorm()
-        for i in range(n):
-            self._norm2.bind_layered(i, weight=w[f"l{i}_norm2"])
-        self._norm2.bind_const(eps=cfg.rms_norm_eps)
-
-        self._router = CublasMm()
-        for i in range(n):
-            self._router.bind_layered(i, mat_b=w[f"l{i}_router"].t(), bias=w[f"l{i}_router_bias"])
-
-        self._quant = Mxfp8Quantize()
-        # The swizzled 128x4 order has the same byte count whenever num_tokens % 128 == 0, which every
-        # decode CUDA-graph batch is, so a wrong value here is accepted silently as a wrong answer.
-        self._quant.bind_const(swizzled_layout=False, alignment=_FC1_K_ALIGN)
-
-        self._moe = Mxe4m3Mxe2m1BlockScaleMoeRunner()
-        for i in range(n):
-            self._moe.bind_layered(
-                i,
-                gemm1_weights=w[f"l{i}_fc1_w"],
-                gemm1_weights_scale=w[f"l{i}_fc1_s"],
-                gemm1_bias=w[f"l{i}_fc1_b"],
-                gemm2_weights=w[f"l{i}_fc2_w"],
-                gemm2_weights_scale=w[f"l{i}_fc2_s"],
-                gemm2_bias=w[f"l{i}_fc2_b"],
-            )
-        self._moe.bind_glu(cfg.num_local_experts, cfg.swiglu_limit, device)
-        self._moe.bind_const(
-            # The MoE op silently ignores routing_bias on this routing method; the bias rides the
-            # router GEMM epilogue instead.
-            routing_bias=None,
-            num_experts=cfg.num_local_experts,
-            top_k=cfg.num_experts_per_tok,
-            n_group=None,
-            topk_group=None,
-            intermediate_size=core.inter_pad,
-            valid_hidden_size=cfg.hidden_size,
-            valid_intermediate_size=cfg.intermediate_size,
-            local_expert_offset=0,
-            local_num_experts=cfg.num_local_experts,
-            routed_scaling_factor=None,
-            routing_method_type=1,
-            act_type=0,
-        )
-
-        self._norm_next = FlashinferFusedAddRmsnorm()
-        for i in range(n):
-            next_w = w[f"l{i + 1}_norm1"] if i + 1 < n else w["final_norm"]
-            self._norm_next.bind_layered(i, weight=next_w)
-        self._norm_next.bind_const(eps=cfg.rms_norm_eps)
 
     def step_args(self, md: TrtllmAttentionMetadata) -> dict:
         """Project the prepared metadata onto thop_attention's explicit batch state, once per forward."""
@@ -349,15 +320,17 @@ class PrefillTarget(Target):
     ) -> torch.Tensor:
         core = self.core
         cfg = core.model_config.pretrained_config
+        eps = cfg.rms_norm_eps
+        heads_q = cfg.num_attention_heads
+        heads_kv = cfg.num_key_value_heads
+        head_dim = cfg.head_dim
 
         self._check_step_contract(attn_metadata)
-        self._attn.bind_const(**self.step_args(attn_metadata))
-
+        step = self.step_args(attn_metadata)
+        # Full-attention layers take the no-window value; sliding layers take the checkpoint's
+        # window. Both are host-derived per-capture constants.
         full_window = attn_metadata.max_seq_len
-        for i, sliding in enumerate(core.sliding):
-            self._attn.bind_layered(
-                i, attention_window_size=core.window if sliding else full_window
-            )
+        no_qk_norm = self._no_qk_norm
 
         pos = torch.reshape(position_ids, [-1])
 
@@ -367,27 +340,77 @@ class PrefillTarget(Target):
             h = inputs_embeds
         num_tokens = h.shape[0]
         dt = h.dtype
-        attn_out = torch.empty(
-            [num_tokens, cfg.num_attention_heads * cfg.head_dim], dtype=dt, device=h.device
-        )
+        attn_out = torch.empty([num_tokens, heads_q * head_dim], dtype=dt, device=h.device)
 
-        x = self._norm0(h)
+        x = flashinfer_rmsnorm(h, self._norm0, eps)
         residual = h
-        for i in range(cfg.num_hidden_layers):
-            qkv = self._qkv(x, layer=i)
-            qkv = self._qk_rope(qkv, position_ids=pos)
-            attn_out = self._attn(q=qkv, output=attn_out, layer=i)
-            o = self._o_proj(attn_out, layer=i)
-            o, residual = self._norm2(o, residual, layer=i)
-            router_logits = self._router(o, layer=i)
-            hidden_fp8, hidden_sf = self._quant(o)
-            moe = self._moe(
+        for i, L in enumerate(self._layers):
+            qkv = cublas_mm(x, L.qkv, L.qkv_bias)
+            qkv = fused_qk_norm_rope(
+                qkv,
+                num_heads_q=heads_q,
+                num_heads_k=heads_kv,
+                num_heads_v=heads_kv,
+                head_dim=head_dim,
+                rotary_dim=head_dim,
+                eps=eps,
+                q_weight=no_qk_norm,
+                k_weight=no_qk_norm,
+                base=core.theta,
+                is_neox=True,
+                position_ids=pos,
+                factor=self._yarn_factor,
+                low=self._yarn_low,
+                high=self._yarn_high,
+                attention_factor=self._yarn_attn_factor,
+                is_qk_norm=False,
+            )
+            attn_out = thop_attention(
+                q=qkv,
+                output=attn_out,
+                local_layer_idx=i,
+                num_heads=heads_q,
+                num_kv_heads=heads_kv,
+                head_size=head_dim,
+                attention_sinks=L.sinks,
+                attention_window_size=core.window if core.sliding[i] else full_window,
+                **step,
+                **_CALL_CONSTANTS,
+            )
+            o = cublas_mm(attn_out, L.o, L.o_bias)
+            o, residual = flashinfer_fused_add_rmsnorm(o, residual, L.norm2, eps)
+            # The router bias rides the GEMM epilogue: the MoE op silently ignores routing_bias
+            # on this routing method.
+            router_logits = cublas_mm(o, L.router, L.router_bias)
+            hidden_fp8, hidden_sf = mxfp8_quantize(o, _SF_LINEAR, _FC1_K_ALIGN)
+            moe = mxe4m3_mxe2m1_block_scale_moe_runner(
                 routing_logits=router_logits,
+                routing_bias=None,
                 hidden_states=hidden_fp8,
                 hidden_states_scale=hidden_sf,
-                layer=i,
+                gemm1_weights=L.fc1_w,
+                gemm1_weights_scale=L.fc1_s,
+                gemm1_bias=L.fc1_b,
+                gemm1_alpha=self._glu_alpha,
+                gemm1_beta=self._glu_beta,
+                gemm1_clamp_limit=self._glu_limit,
+                gemm2_weights=L.fc2_w,
+                gemm2_weights_scale=L.fc2_s,
+                gemm2_bias=L.fc2_b,
+                num_experts=cfg.num_local_experts,
+                top_k=cfg.num_experts_per_tok,
+                n_group=None,
+                topk_group=None,
+                intermediate_size=core.inter_pad,
+                valid_hidden_size=cfg.hidden_size,
+                valid_intermediate_size=cfg.intermediate_size,
+                local_expert_offset=0,
+                local_num_experts=cfg.num_local_experts,
+                routed_scaling_factor=None,
+                routing_method_type=ROUTING_METHOD_RENORMALIZE,
+                act_type=ACT_TYPE_SWIGLU,
             )
-            moe, residual = self._norm_next(moe, residual, layer=i)
+            moe, residual = flashinfer_fused_add_rmsnorm(moe, residual, L.norm_next, eps)
             x = moe
         return x
 
@@ -404,106 +427,26 @@ class DecodeTarget(Target):
         yarn_high: float,
         yarn_attn_factor: float,
     ) -> None:
-        """Bind every op this target calls, once, against the real weights."""
+        """Take the views and constants this target's forward reads, once, off the real weights."""
         super().__init__(core)
         cfg = core.model_config.pretrained_config
         w = core.w
         device = w["final_norm"].device
         dtype = w["final_norm"].dtype
-        n = cfg.num_hidden_layers
 
-        self._norm0 = FlashinferRmsnorm()
-        self._norm0.bind_const(weight=w["l0_norm1"], eps=cfg.rms_norm_eps)
+        self._yarn_factor = yarn_factor
+        self._yarn_low = yarn_low
+        self._yarn_high = yarn_high
+        self._yarn_attn_factor = yarn_attn_factor
 
-        self._qkv = CublasMm()
-        for i in range(n):
-            self._qkv.bind_layered(i, mat_b=w[f"l{i}_qkv"].t(), bias=w[f"l{i}_qkv_bias"])
-
+        self._norm0 = w["l0_norm1"]
+        self._layers = _layer_views(w, cfg.num_hidden_layers)
         # fused_qk_norm_rope requires valid q/k norm weight tensors even when is_qk_norm=False, where
         # the values are unused.
-        no_qk_norm = torch.zeros(cfg.head_dim, dtype=dtype, device=device)
-        self._qk_rope = FusedQkNormRope()
-        self._qk_rope.bind_const(
-            num_heads_q=cfg.num_attention_heads,
-            num_heads_k=cfg.num_key_value_heads,
-            num_heads_v=cfg.num_key_value_heads,
-            head_dim=cfg.head_dim,
-            rotary_dim=cfg.head_dim,
-            eps=cfg.rms_norm_eps,
-            q_weight=no_qk_norm,
-            k_weight=no_qk_norm,
-            base=core.theta,
-            is_neox=True,
-            factor=yarn_factor,
-            low=yarn_low,
-            high=yarn_high,
-            attention_factor=yarn_attn_factor,
-            is_qk_norm=False,
+        self._no_qk_norm = torch.zeros(cfg.head_dim, dtype=dtype, device=device)
+        self._glu_alpha, self._glu_beta, self._glu_limit = glu_vectors(
+            cfg.num_local_experts, cfg.swiglu_limit, device
         )
-
-        self._attn = ThopAttention()
-        for i in range(n):
-            self._attn.bind_layered(i, attention_sinks=w[f"l{i}_sinks"], local_layer_idx=i)
-        self._attn.bind_const(
-            num_heads=cfg.num_attention_heads,
-            num_kv_heads=cfg.num_key_value_heads,
-            head_size=cfg.head_dim,
-            **_CALL_CONSTANTS,
-        )
-
-        self._o_proj = CublasMm()
-        for i in range(n):
-            self._o_proj.bind_layered(i, mat_b=w[f"l{i}_o"].t(), bias=w[f"l{i}_o_bias"])
-
-        self._norm2 = FlashinferFusedAddRmsnorm()
-        for i in range(n):
-            self._norm2.bind_layered(i, weight=w[f"l{i}_norm2"])
-        self._norm2.bind_const(eps=cfg.rms_norm_eps)
-
-        self._router = CublasMm()
-        for i in range(n):
-            self._router.bind_layered(i, mat_b=w[f"l{i}_router"].t(), bias=w[f"l{i}_router_bias"])
-
-        self._quant = Mxfp8Quantize()
-        # The swizzled 128x4 order has the same byte count whenever num_tokens % 128 == 0, which every
-        # decode CUDA-graph batch is, so a wrong value here is accepted silently as a wrong answer.
-        self._quant.bind_const(swizzled_layout=False, alignment=_FC1_K_ALIGN)
-
-        self._moe = Mxe4m3Mxe2m1BlockScaleMoeRunner()
-        for i in range(n):
-            self._moe.bind_layered(
-                i,
-                gemm1_weights=w[f"l{i}_fc1_w"],
-                gemm1_weights_scale=w[f"l{i}_fc1_s"],
-                gemm1_bias=w[f"l{i}_fc1_b"],
-                gemm2_weights=w[f"l{i}_fc2_w"],
-                gemm2_weights_scale=w[f"l{i}_fc2_s"],
-                gemm2_bias=w[f"l{i}_fc2_b"],
-            )
-        self._moe.bind_glu(cfg.num_local_experts, cfg.swiglu_limit, device)
-        self._moe.bind_const(
-            # The MoE op silently ignores routing_bias on this routing method; the bias rides the
-            # router GEMM epilogue instead.
-            routing_bias=None,
-            num_experts=cfg.num_local_experts,
-            top_k=cfg.num_experts_per_tok,
-            n_group=None,
-            topk_group=None,
-            intermediate_size=core.inter_pad,
-            valid_hidden_size=cfg.hidden_size,
-            valid_intermediate_size=cfg.intermediate_size,
-            local_expert_offset=0,
-            local_num_experts=cfg.num_local_experts,
-            routed_scaling_factor=None,
-            routing_method_type=1,
-            act_type=0,
-        )
-
-        self._norm_next = FlashinferFusedAddRmsnorm()
-        for i in range(n):
-            next_w = w[f"l{i + 1}_norm1"] if i + 1 < n else w["final_norm"]
-            self._norm_next.bind_layered(i, weight=next_w)
-        self._norm_next.bind_const(eps=cfg.rms_norm_eps)
 
     def step_args(self, md: TrtllmAttentionMetadata) -> dict:
         """Project the prepared metadata onto thop_attention's explicit batch state, once per forward."""
@@ -559,15 +502,17 @@ class DecodeTarget(Target):
     ) -> torch.Tensor:
         core = self.core
         cfg = core.model_config.pretrained_config
+        eps = cfg.rms_norm_eps
+        heads_q = cfg.num_attention_heads
+        heads_kv = cfg.num_key_value_heads
+        head_dim = cfg.head_dim
 
         self._check_step_contract(attn_metadata)
-        self._attn.bind_const(**self.step_args(attn_metadata))
-
+        step = self.step_args(attn_metadata)
+        # Full-attention layers take the no-window value; sliding layers take the checkpoint's
+        # window. Both are host-derived per-capture constants.
         full_window = attn_metadata.max_seq_len
-        for i, sliding in enumerate(core.sliding):
-            self._attn.bind_layered(
-                i, attention_window_size=core.window if sliding else full_window
-            )
+        no_qk_norm = self._no_qk_norm
 
         pos = torch.reshape(position_ids, [-1])
 
@@ -577,27 +522,77 @@ class DecodeTarget(Target):
             h = inputs_embeds
         num_tokens = h.shape[0]
         dt = h.dtype
-        attn_out = torch.empty(
-            [num_tokens, cfg.num_attention_heads * cfg.head_dim], dtype=dt, device=h.device
-        )
+        attn_out = torch.empty([num_tokens, heads_q * head_dim], dtype=dt, device=h.device)
 
-        x = self._norm0(h)
+        x = flashinfer_rmsnorm(h, self._norm0, eps)
         residual = h
-        for i in range(cfg.num_hidden_layers):
-            qkv = self._qkv(x, layer=i)
-            qkv = self._qk_rope(qkv, position_ids=pos)
-            attn_out = self._attn(q=qkv, output=attn_out, layer=i)
-            o = self._o_proj(attn_out, layer=i)
-            o, residual = self._norm2(o, residual, layer=i)
-            router_logits = self._router(o, layer=i)
-            hidden_fp8, hidden_sf = self._quant(o)
-            moe = self._moe(
+        for i, L in enumerate(self._layers):
+            qkv = cublas_mm(x, L.qkv, L.qkv_bias)
+            qkv = fused_qk_norm_rope(
+                qkv,
+                num_heads_q=heads_q,
+                num_heads_k=heads_kv,
+                num_heads_v=heads_kv,
+                head_dim=head_dim,
+                rotary_dim=head_dim,
+                eps=eps,
+                q_weight=no_qk_norm,
+                k_weight=no_qk_norm,
+                base=core.theta,
+                is_neox=True,
+                position_ids=pos,
+                factor=self._yarn_factor,
+                low=self._yarn_low,
+                high=self._yarn_high,
+                attention_factor=self._yarn_attn_factor,
+                is_qk_norm=False,
+            )
+            attn_out = thop_attention(
+                q=qkv,
+                output=attn_out,
+                local_layer_idx=i,
+                num_heads=heads_q,
+                num_kv_heads=heads_kv,
+                head_size=head_dim,
+                attention_sinks=L.sinks,
+                attention_window_size=core.window if core.sliding[i] else full_window,
+                **step,
+                **_CALL_CONSTANTS,
+            )
+            o = cublas_mm(attn_out, L.o, L.o_bias)
+            o, residual = flashinfer_fused_add_rmsnorm(o, residual, L.norm2, eps)
+            # The router bias rides the GEMM epilogue: the MoE op silently ignores routing_bias
+            # on this routing method.
+            router_logits = cublas_mm(o, L.router, L.router_bias)
+            hidden_fp8, hidden_sf = mxfp8_quantize(o, _SF_LINEAR, _FC1_K_ALIGN)
+            moe = mxe4m3_mxe2m1_block_scale_moe_runner(
                 routing_logits=router_logits,
+                routing_bias=None,
                 hidden_states=hidden_fp8,
                 hidden_states_scale=hidden_sf,
-                layer=i,
+                gemm1_weights=L.fc1_w,
+                gemm1_weights_scale=L.fc1_s,
+                gemm1_bias=L.fc1_b,
+                gemm1_alpha=self._glu_alpha,
+                gemm1_beta=self._glu_beta,
+                gemm1_clamp_limit=self._glu_limit,
+                gemm2_weights=L.fc2_w,
+                gemm2_weights_scale=L.fc2_s,
+                gemm2_bias=L.fc2_b,
+                num_experts=cfg.num_local_experts,
+                top_k=cfg.num_experts_per_tok,
+                n_group=None,
+                topk_group=None,
+                intermediate_size=core.inter_pad,
+                valid_hidden_size=cfg.hidden_size,
+                valid_intermediate_size=cfg.intermediate_size,
+                local_expert_offset=0,
+                local_num_experts=cfg.num_local_experts,
+                routed_scaling_factor=None,
+                routing_method_type=ROUTING_METHOD_RENORMALIZE,
+                act_type=ACT_TYPE_SWIGLU,
             )
-            moe, residual = self._norm_next(moe, residual, layer=i)
+            moe, residual = flashinfer_fused_add_rmsnorm(moe, residual, L.norm_next, eps)
             x = moe
         return x
 

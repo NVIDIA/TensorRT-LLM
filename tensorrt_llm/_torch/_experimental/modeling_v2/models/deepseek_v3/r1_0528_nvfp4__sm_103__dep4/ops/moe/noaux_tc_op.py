@@ -53,7 +53,7 @@ class NoauxTcOp(OpWrapper):
     `reference` reproduces with a stable descending sort.
     """
 
-    def raw_call(
+    def __call__(
         self,
         router_logits: torch.Tensor,
         bias: torch.Tensor,

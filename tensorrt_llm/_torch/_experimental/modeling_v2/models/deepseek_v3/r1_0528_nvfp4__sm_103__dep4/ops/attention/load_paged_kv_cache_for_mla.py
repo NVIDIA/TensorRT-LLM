@@ -90,7 +90,7 @@ class LoadPagedKvCacheForMla(OpWrapper):
     target runs the fp8 pool, so it is not a cell.
     """
 
-    def raw_call(
+    def __call__(
         self,
         out_dtype: torch.dtype,
         num_contexts: int,
@@ -136,7 +136,7 @@ class LoadPagedKvCacheForMla(OpWrapper):
     ) -> torch.Tensor:
         """`float(e4m3 byte) * scale`, in fp32, rounded once to `out_dtype`.
 
-        The second documented exception to mirroring `raw_call`, after the
+        The second documented exception to mirroring `__call__`, after the
         collectives: this op's output is a function of what the paged cache
         holds, and its arguments only say where to look. `stored` is the rows
         the gather was pointed at; the test reads them out of the pool, which is

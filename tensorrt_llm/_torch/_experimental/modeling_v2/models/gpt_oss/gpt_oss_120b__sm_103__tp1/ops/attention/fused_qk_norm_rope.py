@@ -70,7 +70,7 @@ class FusedQkNormRope(OpWrapper):
     the path works because the argument exists.
     """
 
-    def raw_call(
+    def __call__(
         self,
         qkv: torch.Tensor,
         num_heads_q: int,
@@ -149,7 +149,7 @@ class FusedQkNormRope(OpWrapper):
         """The buffer the op writes back, fp32 throughout.
 
         Returns rather than mutates so a cell can drive both sides from the
-        same input; the in-place write is what `raw_call` does.
+        same input; the in-place write is what `__call__` does.
         """
         num_heads = num_heads_q + num_heads_k + num_heads_v
         x = qkv.float().view(-1, num_heads, head_dim).clone()
@@ -243,7 +243,7 @@ class FusedQkNormRope(OpWrapper):
         **unused_kwargs: object,
     ) -> None:
         # `eps`, `q_weight`, `k_weight`, `base` and `is_neox` are named though
-        # nothing here reads them: they mirror `raw_call`, and gpt-oss passes
+        # nothing here reads them: they mirror `__call__`, and gpt-oss passes
         # them by keyword.
         #
         # The op reads the head counts as scalars and addresses qkv from

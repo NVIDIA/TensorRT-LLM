@@ -33,6 +33,7 @@ CUDA nor torch.distributed state of its own), and the
 ranks reach the catalog by absolute import, so neither needs a package.
 """
 
+import functools
 import os
 import random
 import signal
@@ -71,6 +72,7 @@ SITES_PER_DECODE_GRAPH = 29
 # Bound inside the rank body, never in the launcher: importing the entry
 # pulls in tensorrt_llm, which calls MPI_Init at import, and an
 allgather: Any = None
+entry: Any = None
 RANK = 0
 WORLD = 1
 GROUP: List[int] = [0]
@@ -358,7 +360,7 @@ def check_certified_cells() -> None:
         rows, trailing, dtype = spec["rows"], spec["trailing"], spec["dtype"]
         seed = 9000 + 13 * i
         x = _payload(RANK, rows, seed, dtype, trailing)
-        with validating(allgather):
+        with validating(entry.allgather):
             out = allgather(x, spec["sizes"], GROUP)
         assert out.shape == (rows * WORLD, *trailing), (cell.why, out.shape)
         _assert_bitwise(out, _gather_ref([rows] * WORLD, seed, dtype, trailing), cell.why)
@@ -800,7 +802,7 @@ def check_wrapper_guards_a_non_contiguous_input() -> None:
     assert not view.is_contiguous()
 
     try:
-        with validating(allgather):
+        with validating(entry.allgather):
             allgather(view, None, GROUP)
     except AssertionError:
         pass
@@ -816,7 +818,7 @@ def check_wrapper_guards_a_sizes_list_of_the_wrong_length() -> None:
     rows, seed = 4, 93000
     for sizes in ([rows] * (WORLD - 1), [rows] * (WORLD + 1)):
         try:
-            with validating(allgather):
+            with validating(entry.allgather):
                 allgather(_payload(RANK, rows, seed), sizes, GROUP)
         except AssertionError:
             pass
@@ -832,7 +834,7 @@ def check_wrapper_guards_a_zero_dim_input() -> None:
     `AllgatherOp::run_list` and kills every rank in the job.
     """
     try:
-        with validating(allgather):
+        with validating(entry.allgather):
             allgather(torch.tensor(1.0, device="cuda"), None, GROUP)
     except AssertionError:
         pass
@@ -929,7 +931,7 @@ CHECKS = (
 def _run_one_rank() -> int:
     """Body of one spawned rank: run every test; a failing rank exits nonzero
     and the launcher kills its siblings."""
-    global RANK, WORLD, GROUP, HOST_GROUP, SUBGROUPS, PG_BOXED, allgather, validating
+    global RANK, WORLD, GROUP, HOST_GROUP, SUBGROUPS, PG_BOXED, allgather, validating, entry
     os.environ.setdefault("TLLM_DISABLE_MPI", "1")
     rank = int(os.environ["RANK"])
     world = int(os.environ["WORLD_SIZE"])
@@ -940,13 +942,13 @@ def _run_one_rank() -> int:
 
     from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm import allgather as entry
 
-    allgather = entry.allgather
-    # One binding instead of a per-call argument: every check's call site keeps
+    # One partial instead of a per-call argument: every check's call site keeps
     # the certified shape, and the wrapper hands the boxed group to the _pg
     # symbol -- the same routing the product's non-MPI mode does in
-    # _torch/distributed/ops.py.
+    # _torch/distributed/ops.py. The guard is armed on the entry itself, which
+    # the partial reaches.
     PG_BOXED = dist.distributed_c10d._get_default_group().boxed()
-    allgather.bind_const(process_group=PG_BOXED)
+    allgather = functools.partial(entry.allgather, process_group=PG_BOXED)
 
     # This file is run as a spawned worker process, not collected by pytest,
     # so the repo's `__extra_import_path__` mechanism is not in play and the

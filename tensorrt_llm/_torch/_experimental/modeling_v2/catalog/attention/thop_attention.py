@@ -118,7 +118,7 @@ class ThopAttention(OpWrapper):
     thing.
     """
 
-    def raw_call(
+    def __call__(
         self,
         q: torch.Tensor,
         k: Optional[torch.Tensor],
@@ -381,7 +381,7 @@ class ThopAttention(OpWrapper):
     ) -> torch.Tensor:
         """Masked softmax attention over explicit per-sequence K/V, in fp32.
 
-        The paged-cache exception to mirroring `raw_call`, and the largest one:
+        The paged-cache exception to mirroring `__call__`, and the largest one:
         this op's output is a function of what the pool holds, and its 115
         arguments mostly say where to look. `k` and `v` are the gathered
         histories the call should have attended over; the test reads them out of
@@ -535,7 +535,7 @@ class ThopAttention(OpWrapper):
     ) -> None:
         """Keyword-only, because every call site passes keywords.
 
-        The one entry that does not mirror `raw_call`. This op takes 115
+        The one entry that does not mirror `__call__`. This op takes 115
         arguments; naming all of them here would restate the signature without
         adding a claim, and `reference` cannot mirror it either -- it is the
         paged-cache exception and takes gathered K/V -- so there is no shared

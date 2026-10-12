@@ -10,7 +10,7 @@ single test going red.
 
 This is the executable form of that contract:
 
-    raw_call    the op call a target makes
+    __call__    the op call a target makes
     reference   what the op is supposed to compute, in plain torch
     is_valid    the inputs the op takes and answers wrongly
     compare     how close the two have to be, and why
@@ -19,7 +19,7 @@ This is the executable form of that contract:
     note        what is left, and nothing that could have been one of the above
 
 `reference` and `CELLS` are the part that cannot go stale: the entry's test
-drives every cell through both `raw_call` and `reference` and gates them with
+drives every cell through both `__call__` and `reference` and gates them with
 `compare`, so a claim that stops holding stops the build.
 
 `CELLS` is also the answer to "can my model use this op?". A target author
@@ -120,18 +120,6 @@ def assert_within_ulp(
     assert rel_rms <= rms_ulp * ulp, f"relative RMS {rel_rms:.3e} exceeds {rms_ulp} ulp"
 
 
-#: Bumped once per engine step by the target that owns the entries. Only read
-#: when validation is on: outside it, nothing compares generations and the
-#: counter costs one integer increment a forward.
-_STEP_GENERATION = 0
-
-
-def advance_step_generation() -> None:
-    """Called once per forward, before any `bind_const` or `bind_layered`."""
-    global _STEP_GENERATION
-    _STEP_GENERATION += 1
-
-
 class Arch(str, enum.Enum):
     """A GPU architecture an entry can be certified on.
 
@@ -164,145 +152,39 @@ class Cell:
 class OpWrapper(ABC):
     """Base for a catalog entry.
 
-    An entry does not care *when* a value becomes known -- that was the old
-    design's axis (construction vs. per-step), and it was the caller's
-    business, not the interface's. What the entry actually needs to know is
-    whether a value varies by layer. Two binding methods state exactly that:
+    An entry is a callable and nothing more: `__call__` takes every argument
+    explicitly, reads nothing off `self`, and dispatches to the kernel. A
+    target that calls one passes the weights, the per-step batch state and the
+    configuration scalars at the call site, every time, so the call site shows
+    exactly what the kernel receives.
 
-        bind_const(**values)            a value, the same for every layer
-        bind_layered(layer_id, **values)  one layer's values, read back by `layer=`
+    What that keeps true: what an entry computes is a pure function of its
+    arguments, so `CELLS` covers the entry's whole input space, and `reference`
+    and `is_valid` mirror `__call__` directly. A gate in the claims suite
+    enforces that `__call__` reads no attribute of `self`.
 
-    Both are callable from anywhere a target chooses -- construction, the
-    first forward, every forward -- and the caller decides which. Both may be
-    called more than once; a later call updates only the keys it names and
-    leaves every other binding alone. `bind_layered` takes one layer at a
-    time rather than a whole table so that a caller whose layers are not
-    uniform -- some dense, some not -- can bind only the layers that have a
-    given operand, instead of padding the gaps itself. `__call__` merges
-    `_const`, then the row `_layered` holds for `layer=` (so a layered value
-    wins over a flat const for the same argument), then the call's own
-    kwargs last of all, and hands the result to `raw_call`.
-
-    This is what gives gpt_oss's `attention_window_size` a home: per-layer,
-    but not knowable at construction (it derives from `attn_metadata`'s
-    resolved `max_seq_len`, which the KV cache manager does not produce until
-    after weights load). It is rebound with `bind_layered` every forward
-    rather than once at construction.
-
-    The cost of collapsing the time axis: a reader at a call site can no
-    longer tell a volatile per-forward binding from a permanent one by the
-    method name alone -- both read `bind_const`. Make that obvious in
-    context instead, e.g. a comment naming what gets rebound each step --
-    see gpt_oss's attention binding for the pattern.
-
-    `raw_call` is the certified surface, and it takes everything explicitly --
-    it must not read any bound state off `self`. That is what keeps `CELLS`
-    covering the entry's whole input space regardless of what a target chose to
-    bind, and it is why `reference` and `is_valid` mirror `raw_call` rather
-    than `__call__`. A gate in the claims suite enforces it.
-
-    Instances are stateful: binding is state, and an op that manufactures its
-    own fixture holds a device tensor. Each target owns its own instances --
-    there is no module-level singleton to contend over, which is what makes
-    per-target binding safe. Two models genuinely disagree about values like
-    `num_heads`; a shared instance could only hold one of them.
+    Instances carry no state, so one module-level instance per entry is the
+    normal way to reach it; a target may also construct its own.
     """
 
     ARCHS: frozenset[Arch] = frozenset()
     CELLS: tuple[Cell, ...] = ()
     note: str = ""
 
-    def __init__(self) -> None:
-        """Set up empty binding state.
-
-        No binding arguments: a target binds explicitly, from wherever a
-        value becomes knowable, with `bind_const` or `bind_layered` -- there
-        is no longer a stage reserved for construction.
-        """
-        self._const: dict[str, Any] = {}
-        #: name -> {layer_id: value}, filled one layer at a time by
-        #: `bind_layered`.
-        self._layered: dict[str, dict[int, Any]] = {}
-        # Per key: the step generation in effect when that key was last
-        # bound. Read only by the validation harness -- see `bind_const`.
-        self._generation: dict[str, int] = {}
-
-    def bind_const(self, **values: Any) -> None:
-        """Bind values that are the same for every layer.
-
-        Updates rather than replaces: a later call adds or overwrites only
-        the keys it names, leaving every other binding -- including ones
-        made at construction -- in place. A target rebinding its per-step
-        projections once a forward is not required to also restate its
-        construction-time constants on every call.
-
-        Also stamps each bound key with the step generation in effect right
-        now. A key bound before the first `advance_step_generation()` call
-        -- a construction-time constant -- carries generation 0 forever,
-        because nothing ever rebinds it. A key bound while a forward is
-        underway carries that forward's generation, and gets left behind the
-        moment the next forward advances the counter without rebinding it.
-        That drift is exactly the bug `_validating.validating` watches for:
-        the base class cannot tell a construction-time constant from a
-        volatile per-forward value by name anymore, but it can tell whether
-        a given key's last bind has fallen behind the current forward.
-        """
-        self._const.update(values)
-        for key in values:
-            self._generation[key] = _STEP_GENERATION
-
-    def bind_layered(self, layer_id: int, **values: Any) -> None:
-        """Bind one layer's values, read back by `layer=` at the call.
-
-        One layer per call rather than a whole table: a caller binds
-        exactly the layers that have a given operand, which is what a model
-        whose layers are not uniform -- some dense, some not -- needs, and a
-        whole-table signature could not express without the caller padding
-        the gaps itself. The call site is unchanged either way -- still
-        `op(..., layer=i)`.
-
-        Same update-not-replace and generation bookkeeping as `bind_const`,
-        for the same reason: a layered value is not inherently a
-        construction-time thing -- gpt_oss's `attention_window_size` is
-        rebound this way on every forward rather than once at construction,
-        and does so one layer at a time just like a construction-time table
-        would.
-        """
-        for name, value in values.items():
-            self._layered.setdefault(name, {})[layer_id] = value
-            self._generation[name] = _STEP_GENERATION
-
-    def __call__(self, *args: Any, layer: int | None = None, **kwargs: Any) -> Any:
-        """Merge const, the layer row, and the call's own kwargs, in that order.
-
-        Later stages win: the layer row overrides a flat const for the same
-        argument, and a call-time kwarg overrides both -- a target can still
-        pass a per-call override through the same call a layered value is
-        bound on. An unbound entry has empty `_const` and `_layered`, so a
-        call that never passes `layer=` is a plain passthrough -- which is
-        what keeps deepseek's call sites byte-for-byte the same call they
-        always were.
-        """
-        merged = dict(self._const)
-        if layer is not None:
-            merged.update({name: rows[layer] for name, rows in self._layered.items()})
-        merged.update(kwargs)
-        return self.raw_call(*args, **merged)
-
     @abstractmethod
-    def raw_call(self, *args: Any, **kwargs: Any) -> Any:
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
         """Make the op call, taking every argument explicitly. The hot path.
 
-        Must not read bound state off `self` -- see the class docstring. The
-        test tree interposes validation by patching this method on the
-        subclass, which is why it has to live there.
+        Must not read state off `self` -- see the class docstring. The test
+        tree interposes validation by patching this method on the subclass,
+        which is why it has to live there.
         """
 
     @abstractmethod
     def reference(self, *args: Any, **kwargs: Any) -> Any:
         """What the op is supposed to compute, in plain torch.
 
-        Mirrors `raw_call`'s signature, parameter for parameter and name for
+        Mirrors `__call__`'s signature, parameter for parameter and name for
         name, so the two can be driven from one cell's argument list. An
         argument this computation does not need keeps its name anyway: dropping
         it would hide that the op takes it, and renaming it would break every
@@ -328,7 +210,7 @@ class OpWrapper(ABC):
         rejects loudly does not belong here: restating it only swaps its error
         for a worse one.
 
-        Mirrors `raw_call`'s signature, like `reference`, because `validating`
+        Mirrors `__call__`'s signature, like `reference`, because `validating`
         forwards the call's arguments verbatim -- an override that accepts only
         the arguments it inspects raises TypeError on every call site that
         passes the others. Parameters keep the op's own names for the same

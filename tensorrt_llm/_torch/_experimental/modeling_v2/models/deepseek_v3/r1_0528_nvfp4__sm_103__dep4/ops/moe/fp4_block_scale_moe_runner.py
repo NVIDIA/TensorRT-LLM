@@ -151,7 +151,7 @@ class Fp4BlockScaleMoeRunner(OpWrapper):
     trtllm preprocessing ops, and compares them before either reaches the op.
     """
 
-    def raw_call(
+    def __call__(
         self,
         routing_logits: Optional[torch.Tensor],
         routing_bias: Optional[torch.Tensor],
@@ -235,7 +235,7 @@ class Fp4BlockScaleMoeRunner(OpWrapper):
     ) -> torch.Tensor:
         """The layer, in plain torch over dequantized weights, fp32 throughout.
 
-        The documented exception to mirroring: `raw_call` takes the *prepared*
+        The documented exception to mirroring: `__call__` takes the *prepared*
         operands -- packed e2m1 codes, shuffled rows, swizzled scales -- and a
         reference given those would be re-deriving the layout rather than the
         computation. So this takes the per-expert `(codes, scales)` pairs the

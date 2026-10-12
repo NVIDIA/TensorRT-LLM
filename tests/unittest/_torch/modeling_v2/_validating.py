@@ -8,9 +8,9 @@ nothing to gain from it: everything ``is_valid`` checks is a property of how a
 target calls the op, fixed when the target was written, and a guard of ours
 firing in production is our bug taking down a working deployment.
 
-So the wrapper's ``raw_call`` goes straight to the kernel, and this interposes
+So the wrapper's ``__call__`` goes straight to the kernel, and this interposes
 ``is_valid`` for the duration of a test. Patching is on the subclass rather
-than the instance: ``raw_call`` is looked up on the type, and every entry has
+than the instance: ``__call__`` is looked up on the type, and every entry has
 its own class, so one entry's guard never reaches another's.
 """
 
@@ -36,37 +36,19 @@ def validating(*wrappers: OpWrapper) -> Iterator[None]:
     for w in wrappers:
         cls = type(w)
         assert isinstance(w, OpWrapper), f"{w!r} is not a catalog entry"
-        original = cls.raw_call
+        original = cls.__call__
         saved.append((cls, original))
 
         def guarded(self, *args, _original=original, **kwargs):
-            from tensorrt_llm._torch._experimental.modeling_v2.catalog import _op
-
-            # A key's generation stays 0 forever if it is only ever bound
-            # before the first forward -- a construction-time constant can
-            # never be flagged. A key bound mid-forward is flagged the
-            # moment a later forward advances the counter without rebinding
-            # it: its stamp is then behind the engine's current generation.
-            stale = sorted(
-                key
-                for key, gen in self._generation.items()
-                if gen >= 1 and gen < _op._STEP_GENERATION
-            )
-            assert not stale, (
-                f"{type(self).__name__} bound {stale} during a forward and did "
-                f"not rebind {'it' if len(stale) == 1 else 'them'} this one: "
-                "this call is using the previous step's metadata -- wrong "
-                "output, no error, outside validation"
-            )
             self.is_valid(*args, **kwargs)
             return _original(self, *args, **kwargs)
 
-        cls.raw_call = guarded
+        cls.__call__ = guarded
     try:
         yield
     finally:
         for cls, original in reversed(saved):
-            cls.raw_call = original
+            cls.__call__ = original
 
 
 @pytest.fixture
@@ -102,7 +84,7 @@ def certifying():
         for w in wrappers:
             assert isinstance(w, OpWrapper), f"{w!r} is not a catalog entry"
             cls = type(w)
-            for name in ("raw_call", "reference", "compare"):
+            for name in ("__call__", "reference", "compare"):
                 original = getattr(cls, name)
                 # Whether the subclass owns it decides how to put it back:
                 # `compare` and `is_valid` have base defaults, and restoring an
@@ -113,7 +95,7 @@ def certifying():
 
                 def counted(self, *args, _o=original, _n=name, **kwargs):
                     seen[_n] = seen.get(_n, 0) + 1
-                    if _n == "raw_call":
+                    if _n == "__call__":
                         self.is_valid(*args, **kwargs)
                     return _o(self, *args, **kwargs)
 
@@ -129,7 +111,7 @@ def certifying():
 
     if not armed:
         return
-    missing = [n for n in ("raw_call", "reference", "compare") if not seen.get(n)]
+    missing = [n for n in ("__call__", "reference", "compare") if not seen.get(n)]
     assert not missing, (
         f"the entry was armed but {', '.join(missing)} never ran: a cell driven "
         f"without the entry's own reference and gate certifies nothing it claims"

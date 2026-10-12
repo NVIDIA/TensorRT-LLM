@@ -39,6 +39,7 @@ CUDA nor torch.distributed state of its own), and the
 ranks reach the catalog by absolute import, so neither needs a package.
 """
 
+import functools
 import os
 import random
 import signal
@@ -88,6 +89,7 @@ BF16_U = 2.0**-8
 # Bound inside the rank body, never in the launcher: importing the entry
 # pulls in tensorrt_llm, which calls MPI_Init at import, and an
 reducescatter: Any = None
+entry: Any = None
 PG_BOXED: Any = None
 SUBGROUPS: Dict[Tuple[int, ...], Any] = {}
 RANK = 0
@@ -430,7 +432,7 @@ def check_certified_cells() -> None:
         seed = 9000 + 13 * i
         sizes = [rows] * WORLD
         x = _input(RANK, sizes, seed, dtype, trailing)
-        with validating(reducescatter):
+        with validating(entry.reducescatter):
             out = reducescatter(x, spec["sizes"], GROUP)
         assert out.shape == (rows, *trailing), (cell.why, out.shape)
         _assert_bitwise(out, _ref(sizes, RANK, seed, dtype, trailing), cell.why)
@@ -1154,7 +1156,7 @@ def check_wrapper_guards_a_float8_input() -> None:
         torch.float8_e4m3fn
     )
     try:
-        with validating(reducescatter):
+        with validating(entry.reducescatter):
             reducescatter(x, None, GROUP)
     except AssertionError:
         pass
@@ -1183,7 +1185,7 @@ def check_the_guard_refuses_every_dtype_it_cannot_sum() -> None:
     for dtype in (torch.bool, torch.float64):
         x = torch.ones(4 * WORLD, 8, dtype=torch.float32, device="cuda").to(dtype)
         try:
-            with validating(reducescatter):
+            with validating(entry.reducescatter):
                 reducescatter(x, None, GROUP)
         except AssertionError as exc:
             assert "not summable" in str(exc), str(exc)
@@ -1210,7 +1212,7 @@ def check_wrapper_guards_a_non_contiguous_input() -> None:
     assert not view.is_contiguous()
 
     try:
-        with validating(reducescatter):
+        with validating(entry.reducescatter):
             reducescatter(view, None, GROUP)
     except AssertionError:
         pass
@@ -1226,7 +1228,7 @@ def check_wrapper_guards_a_zero_dim_input() -> None:
     `ReducescatterOp::run_list` and kills every rank in the job.
     """
     try:
-        with validating(reducescatter):
+        with validating(entry.reducescatter):
             reducescatter(torch.tensor(1.0, device="cuda"), None, GROUP)
     except AssertionError:
         pass
@@ -1252,7 +1254,7 @@ def check_wrapper_guards_a_sizes_list_of_the_wrong_length() -> None:
     long_list = [rows] * (WORLD + 1)
     for bad in ([rows] * (WORLD - 1), long_list):
         try:
-            with validating(reducescatter):
+            with validating(entry.reducescatter):
                 reducescatter(_input(RANK, sizes, seed), bad, GROUP)
         except AssertionError:
             pass
@@ -1273,7 +1275,7 @@ def check_wrapper_guards_a_split_that_does_not_cover_the_input() -> None:
     short_split = [2] * WORLD
     for x_, sizes_ in ((x, None), (y, short_split), (y, [6] * WORLD)):
         try:
-            with validating(reducescatter):
+            with validating(entry.reducescatter):
                 reducescatter(x_, sizes_, GROUP)
         except AssertionError:
             pass
@@ -1335,7 +1337,7 @@ CHECKS = (
 def _run_one_rank() -> int:
     """Body of one spawned rank: run every test; a failing rank exits nonzero
     and the launcher kills its siblings."""
-    global RANK, WORLD, GROUP, PG_BOXED, SUBGROUPS, reducescatter, validating
+    global RANK, WORLD, GROUP, PG_BOXED, SUBGROUPS, reducescatter, validating, entry
     os.environ.setdefault("TLLM_DISABLE_MPI", "1")
     rank = int(os.environ["RANK"])
     world = int(os.environ["WORLD_SIZE"])
@@ -1346,13 +1348,13 @@ def _run_one_rank() -> int:
 
     from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm import reducescatter as entry
 
-    reducescatter = entry.reducescatter
     PG_BOXED = dist.distributed_c10d._get_default_group().boxed()
-    # One binding instead of a per-call argument: every check's call site keeps
+    # One partial instead of a per-call argument: every check's call site keeps
     # the certified shape, and the wrapper hands the boxed group to the _pg
     # symbol -- the same routing the product's non-MPI mode does in
-    # _torch/distributed/ops.py.
-    reducescatter.bind_const(process_group=PG_BOXED)
+    # _torch/distributed/ops.py. The guard is armed on the entry itself, which
+    # the partial reaches.
+    reducescatter = functools.partial(entry.reducescatter, process_group=PG_BOXED)
 
     # Run as a spawned worker process, not collected by pytest, so the repo's
     # `__extra_import_path__` mechanism is not in play. The mutation is confined

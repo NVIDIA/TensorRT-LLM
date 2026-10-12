@@ -118,7 +118,7 @@ class MlaRopeGeneration(OpWrapper):
     multi-layer pools.
     """
 
-    def raw_call(
+    def __call__(
         self,
         fused_q: torch.Tensor,
         q_pe: torch.Tensor,
@@ -390,7 +390,7 @@ class MlaRopeGeneration(OpWrapper):
     ) -> None:
         """The four inputs this op takes and answers wrongly.
 
-        The signature mirrors `raw_call` position for position because
+        The signature mirrors `__call__` position for position because
         `validating` forwards a call's arguments verbatim and every caller here
         passes them positionally: a narrower signature would collect
         `residual_dim` and `quant_mode` into a catch-all and check nothing,
