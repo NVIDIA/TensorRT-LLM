@@ -1,24 +1,20 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""FP4 MLA CuTe DSL backend selection and optional scheduling hints."""
+"""FP4 MLA CuTe DSL backend selection and kernel DSL API usage."""
 
-import importlib
+import ast
+import inspect
 
-import cutlass.cute as cute
 import pytest
 
 import tensorrt_llm._torch.attention.backends.fp4_mla.config as fp4_mla_config
-import tensorrt_llm._torch.attention.backends.fp4_mla.cute_dsl_utils as cute_dsl_utils
+import tensorrt_llm._torch.attention.backends.fp4_mla.fp4_mla_cutedsl_mufu16 as mufu16
+import tensorrt_llm._torch.attention.backends.fp4_mla.fp4_mla_cutedsl_mufu16_fused_v_transpose as mufu16_fused_v_transpose  # noqa: E501
 
 pytestmark = pytest.mark.cpu_only
 
-_HINTS = ("cfence", "warp_switch")
-
-
-@pytest.fixture
-def reload_cute_dsl_utils():
-    yield lambda: importlib.reload(cute_dsl_utils)
-    importlib.reload(cute_dsl_utils)
+# Scheduling-hint APIs absent from the public nvidia-cutlass-dsl release.
+_NON_PUBLIC_SCHEDULE_HINTS = ("cfence", "warp_switch")
 
 
 @pytest.fixture
@@ -28,30 +24,17 @@ def fresh_availability():
     fp4_mla_config._cutedsl_backend_available.cache_clear()
 
 
-@pytest.mark.parametrize("hint", _HINTS)
-def test_missing_schedule_hint_is_a_no_op(monkeypatch, reload_cute_dsl_utils, hint):
-    monkeypatch.delattr(cute.nvgpu, hint, raising=False)
+@pytest.mark.parametrize("kernel_module", [mufu16, mufu16_fused_v_transpose])
+def test_kernels_do_not_use_non_public_schedule_hints(kernel_module):
+    tree = ast.parse(inspect.getsource(kernel_module))
+    hint_uses = [
+        node.attr if isinstance(node, ast.Attribute) else node.id
+        for node in ast.walk(tree)
+        if (isinstance(node, ast.Attribute) and node.attr in _NON_PUBLIC_SCHEDULE_HINTS)
+        or (isinstance(node, ast.Name) and node.id in _NON_PUBLIC_SCHEDULE_HINTS)
+    ]
 
-    utils = reload_cute_dsl_utils()
-
-    assert getattr(utils, hint) is utils._skip_schedule_hint
-    assert getattr(utils, hint)() is None
-
-
-@pytest.mark.parametrize("hint", _HINTS)
-def test_available_schedule_hint_is_the_dsl_function(monkeypatch, reload_cute_dsl_utils, hint):
-    calls = []
-
-    def dsl_hint():
-        calls.append(hint)
-
-    monkeypatch.setattr(cute.nvgpu, hint, dsl_hint, raising=False)
-
-    utils = reload_cute_dsl_utils()
-    getattr(utils, hint)()
-
-    assert getattr(utils, hint) is dsl_hint
-    assert calls == [hint]
+    assert hint_uses == []
 
 
 def test_cutedsl_availability_needs_only_the_kernel_imports(monkeypatch, fresh_availability):
