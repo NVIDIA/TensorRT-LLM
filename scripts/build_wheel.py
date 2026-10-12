@@ -536,8 +536,15 @@ def generate_python_stubs_linux(venv_python: Path, deep_ep: bool,
         link_dir = None
 
     try:
+        # Use the installed module name without running package initialization.
+        # The package path points at the current wheel staging directory.
         build_run(
-            f"\"{venv_python}\" -m nanobind.stubgen -m bindings -r -O . "
+            f"\"{venv_python}\" -c 'import sys, types; "
+            'package = types.ModuleType("tensorrt_llm"); '
+            'package.__path__ = ["."]; '
+            'sys.modules["tensorrt_llm"] = package; '
+            "from nanobind.stubgen import main; main()' "
+            "-m tensorrt_llm.bindings -r -O . "
             f"-p \"{nanobind_stubgen_patterns}\" -q",
             env=env_stub_gen)
         # Pre-import torch so deep_gemm_cpp_tllm's FP4 scalar-type registration
