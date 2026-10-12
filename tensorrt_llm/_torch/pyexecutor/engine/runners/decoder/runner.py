@@ -11,6 +11,7 @@ import math
 import os
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
+from itertools import accumulate
 from typing import Any
 
 import torch
@@ -122,6 +123,26 @@ from .speculative import (
     set_spec_metadata_all_rank_num_tokens,
     update_spec_metadata,
 )
+
+
+def _locality_domain_forkjoin_enabled(kv_cache_manager) -> bool:
+    """Whether to drive two-stream attention for *kv_cache_manager*.
+
+    True iff the manager is :class:`KVCacheManagerV2` with
+    ``num_locality_domains > 1`` and ``fork_join_attn`` set.
+    """
+    if not isinstance(kv_cache_manager, KVCacheManagerV2):
+        return False
+    if kv_cache_manager.num_locality_domains <= 1:
+        return False
+    return kv_cache_manager.fork_join_attn
+
+
+def sort_generation_requests_by_locality_domain(requests: list[LlmRequest]) -> list[LlmRequest]:
+    """Group by locality domain, keeping CUDA graph padding dummies at the tail
+    so ``pad_batch``'s ``generation_requests[:-padding_size]`` trims only them.
+    """
+    return sorted(requests, key=lambda r: (r.is_cuda_graph_dummy, r.py_locality_domain_id))
 
 
 def _get_context_prompt_lookahead_token(request: LlmRequest, chunk_end: int) -> int:
@@ -2652,41 +2673,65 @@ class DecoderRunner(ScheduledModelRunner):
         runtime_tokens_per_gen_step = self.get_runtime_tokens_per_gen_step(draft_len)
         runtime_draft_token_buffer_width = runtime_tokens_per_gen_step - 1
 
-        # Add (batch_size - 1) dummy requests with the minimal sequence length.
-        num_fillers = batch_size - 1
-        requests = kv_cache_manager.add_dummy_requests(
-            list(range(num_fillers)),
-            token_nums=(
-                None
-                if self._dummy_request_tokens is None
-                else [self._dummy_request_tokens] * num_fillers
-            ),
-            is_gen=True,
-            max_num_draft_tokens=runtime_draft_token_buffer_width,
-            kv_reserve_draft_tokens=self._config.max_draft_loop_tokens,
-            use_mrope=self._config.use_mrope,
-            max_beam_width=self._config.max_beam_width,
-            draft_kv_cache_manager=draft_kv_cache_manager,
-            capture_sampling_params=capture_sampling_params,
-            **self._dummy_request_kwargs(resource_manager, num_fillers),
-        )
-        if requests is None:
-            return None
+        num_long_requests = 1
+        short_dummy_request_kwargs = {}
+        long_dummy_request_kwargs = {}
+        if (
+            isinstance(kv_cache_manager, KVCacheManagerV2)
+            and kv_cache_manager.num_locality_domains > 1
+        ):
+            num_locality_domains = kv_cache_manager.num_locality_domains
+            num_long_requests = min(num_locality_domains, batch_size)
+            # Give each active locality domain one longest request so CUDA graph
+            # capture grows every per-domain attention workspace to the
+            # long-sequence bound. Short requests start from domain 0 to keep the
+            # request split balanced after the generation-only dispatcher sort.
+            short_dummy_request_kwargs["locality_domain_ids"] = [
+                request_idx % num_locality_domains
+                for request_idx in range(batch_size - num_long_requests)
+            ]
+            long_dummy_request_kwargs["locality_domain_ids"] = list(range(num_long_requests))
 
-        max_seq_len_request = self._add_longest_dummy_request(
+        # Add the short dummy requests with the minimal sequence length.
+        num_fillers = batch_size - num_long_requests
+        requests = []
+        if num_fillers > 0:
+            requests = kv_cache_manager.add_dummy_requests(
+                list(range(num_fillers)),
+                token_nums=(
+                    None
+                    if self._dummy_request_tokens is None
+                    else [self._dummy_request_tokens] * num_fillers
+                ),
+                is_gen=True,
+                max_num_draft_tokens=runtime_draft_token_buffer_width,
+                kv_reserve_draft_tokens=self._config.max_draft_loop_tokens,
+                use_mrope=self._config.use_mrope,
+                max_beam_width=self._config.max_beam_width,
+                draft_kv_cache_manager=draft_kv_cache_manager,
+                capture_sampling_params=capture_sampling_params,
+                **self._dummy_request_kwargs(resource_manager, num_fillers),
+                **short_dummy_request_kwargs,
+            )
+            if requests is None:
+                return None
+
+        max_seq_len_requests = self._add_longest_dummy_requests(
             resource_manager,
             requests,
             batch_size,
             max_seq_len,
             runtime_draft_token_buffer_width,
             capture_sampling_params,
+            num_long_requests=num_long_requests,
+            dummy_request_kwargs=long_dummy_request_kwargs,
         )
-        if max_seq_len_request is None:
+        if max_seq_len_requests is None:
             return None
 
-        # Insert the longest request first to simulate padding for the CUDA
-        # graph.
-        requests.insert(0, max_seq_len_request)
+        # Put the longest requests first to simulate padding for the CUDA graph;
+        # with locality domains this also seeds each domain group.
+        requests = max_seq_len_requests + requests
         result.generation_requests = requests
         return self._finish_cuda_graph_warmup_request(
             result, resource_manager, batch_size, draft_len
@@ -2702,6 +2747,28 @@ class DecoderRunner(ScheduledModelRunner):
         capture_sampling_params: SamplingParams | None,
     ) -> LlmRequest | None:
         """Add the dummy request with the longest sequence; free ``requests`` if it does not fit."""
+        longest = self._add_longest_dummy_requests(
+            resource_manager,
+            requests,
+            batch_size,
+            max_seq_len,
+            runtime_draft_token_buffer_width,
+            capture_sampling_params,
+        )
+        return None if longest is None else longest[0]
+
+    def _add_longest_dummy_requests(
+        self,
+        resource_manager: ResourceManager,
+        requests: list[LlmRequest],
+        batch_size: int,
+        max_seq_len: int | None,
+        runtime_draft_token_buffer_width: int,
+        capture_sampling_params: SamplingParams | None,
+        num_long_requests: int = 1,
+        dummy_request_kwargs: dict[str, Any] | None = None,
+    ) -> list[LlmRequest] | None:
+        """Add the longest dummy requests; free ``requests`` if they do not fit."""
         kv_cache_manager = resource_manager.get_resource_manager(self.kv_cache_manager_key)
         draft_kv_cache_manager = self._get_draft_kv_cache_manager(resource_manager)
 
@@ -2711,7 +2778,8 @@ class DecoderRunner(ScheduledModelRunner):
                 if draft_kv_cache_manager is not None:
                     draft_kv_cache_manager.free_resources(r)
 
-        # Add one dummy request with the maximum possible sequence length.
+        # Add the dummy requests with the maximum possible sequence length.
+        available_tokens_batch_size = math.ceil(batch_size / num_long_requests)
         max_seq_len = min(
             self._config.max_seq_len if max_seq_len is None else max_seq_len,
             kv_cache_manager.max_seq_len,
@@ -2721,13 +2789,15 @@ class DecoderRunner(ScheduledModelRunner):
         # for the actual KV reservation per request.
         _kv_draft = self._config.max_draft_loop_tokens
         available_tokens = kv_cache_manager.get_num_available_tokens(
-            token_num_upper_bound=max_seq_len, batch_size=batch_size, max_num_draft_tokens=_kv_draft
+            token_num_upper_bound=max_seq_len,
+            batch_size=available_tokens_batch_size,
+            max_num_draft_tokens=_kv_draft,
         )
 
         # Also consider draft KV cache capacity when it exists
         if draft_kv_cache_manager is not None:
             draft_available_tokens = draft_kv_cache_manager.get_num_available_tokens(
-                batch_size=batch_size,
+                batch_size=available_tokens_batch_size,
                 token_num_upper_bound=max_seq_len,
                 max_num_draft_tokens=_kv_draft,
             )
@@ -2746,9 +2816,9 @@ class DecoderRunner(ScheduledModelRunner):
 
         token_num = int(token_num)  # Ensure int for range() in add_dummy_requests
 
-        max_seq_len_request = kv_cache_manager.add_dummy_requests(
-            request_ids=[batch_size - 1],
-            token_nums=[token_num],
+        max_seq_len_requests = kv_cache_manager.add_dummy_requests(
+            request_ids=list(range(batch_size - num_long_requests, batch_size)),
+            token_nums=[token_num] * num_long_requests,
             is_gen=True,
             max_num_draft_tokens=runtime_draft_token_buffer_width,
             kv_reserve_draft_tokens=self._config.max_draft_loop_tokens,
@@ -2756,13 +2826,14 @@ class DecoderRunner(ScheduledModelRunner):
             max_beam_width=self._config.max_beam_width,
             draft_kv_cache_manager=draft_kv_cache_manager,
             capture_sampling_params=capture_sampling_params,
-            **self._dummy_request_kwargs(resource_manager, 1),
+            **self._dummy_request_kwargs(resource_manager, num_long_requests),
+            **(dummy_request_kwargs or {}),
         )
 
-        if max_seq_len_request is None:
+        if max_seq_len_requests is None:
             free_warmup_requests()
             return None
-        return max_seq_len_request[0]
+        return max_seq_len_requests
 
     def _finish_cuda_graph_warmup_request(
         self,
@@ -3442,7 +3513,23 @@ class DecoderRunner(ScheduledModelRunner):
         if spec_metadata is not None and spec_metadata.context_prompt_lookahead_tokens is not None:
             context_prompt_lookahead = []
 
-        for request in scheduled_requests.context_requests:
+        # Reorder context requests so tokens are contiguous per locality domain --
+        # the fork-join attention kernel requires per-domain contiguous input
+        # slices.
+        _locality_domain_reorder = _locality_domain_forkjoin_enabled(kv_cache_manager)
+        # Under chunked prefill, fork-join ctx attention falls back to the
+        # single-kernel path, so per-domain contiguity is not needed; keep the
+        # scheduler order there.
+        _locality_domain_reorder_ctx = (
+            _locality_domain_reorder and not self._config.attention_runtime_features.chunked_prefill
+        )
+
+        _ctx_requests = scheduled_requests.context_requests
+        if _locality_domain_reorder_ctx:
+            _ctx_requests = sorted(_ctx_requests, key=lambda r: r.py_locality_domain_id)
+            scheduled_requests.reset_context_requests(_ctx_requests)
+
+        for request in _ctx_requests:
             request_ids.append(request.py_request_id)
             draft_lens.append(0)
             begin_compute = request.context_current_position
@@ -3606,6 +3693,32 @@ class DecoderRunner(ScheduledModelRunner):
         # Collect generation request IDs during categorization to avoid
         # a separate iteration over scheduled_requests.generation_requests later.
         all_gen_request_ids = []
+        # Sort ALL generation requests by locality domain before categorizing so
+        # extend/first_draft/generation lists are each domain-contiguous, which
+        # fork-join attention requires under speculative decoding. Reordering in
+        # place means the sampler and spec-decode see the same order as the model
+        # input, so no logit un-permutation is needed.
+        _all_gen_reqs = list(scheduled_requests.generation_requests)
+        _gen_dispatch_locality_domain: dict[int, int] = {}
+        if _locality_domain_reorder and _all_gen_reqs:
+            _all_gen_reqs = sort_generation_requests_by_locality_domain(_all_gen_reqs)
+            scheduled_requests.generation_requests = _all_gen_reqs
+            if scheduled_requests.num_context_requests == 0:
+                # Split by position, not by placement: CUDA graph capture bakes the
+                # per-domain request counts in as launch scalars, so the split must
+                # depend only on the padded batch size. Placement-derived splits vary
+                # with batch composition -- capturing (half-2, half+2) and replaying
+                # (half+1, half-1) crashes. The assert keeps this to two domains: with
+                # four the expression still runs but silently stops balancing.
+                num_locality_domains_local = kv_cache_manager.num_locality_domains
+                assert num_locality_domains_local == 2, (
+                    "balanced generation locality domain dispatch currently supports "
+                    f"num_locality_domains == 2; got {num_locality_domains_local}"
+                )
+                half = (len(_all_gen_reqs) + 1) // 2
+                for idx, req in enumerate(_all_gen_reqs):
+                    _gen_dispatch_locality_domain[req.py_request_id] = 0 if idx < half else 1
+
         for request in scheduled_requests.generation_requests:
             is_promoted_context = request.py_request_id in promoted_context_request_ids
             if is_promoted_context:
@@ -4305,6 +4418,47 @@ class DecoderRunner(ScheduledModelRunner):
             ),
         )
         attn_metadata.kv_cache_manager = kv_cache_manager
+        # Locality domain split points for fork-join attention. The single
+        # attn_metadata.kv_cache_manager is shared across domains -- V2 encodes
+        # per-domain addressing via global block indices, so no per-domain
+        # manager list is needed.
+        if _locality_domain_reorder:
+            attn_metadata.locality_domain_enabled = True
+            num_locality_domains = kv_cache_manager.num_locality_domains
+
+            # Requests are already ordered by domain from the loops above.
+            per_locality_domain_ctx_reqs = [0] * num_locality_domains
+            per_locality_domain_ctx_tokens = [0] * num_locality_domains
+            per_locality_domain_gen_reqs = [0] * num_locality_domains
+            per_locality_domain_gen_tokens = [0] * num_locality_domains
+
+            for i, request in enumerate(_ctx_requests):
+                u = request.py_locality_domain_id
+                per_locality_domain_ctx_reqs[u] += 1
+                per_locality_domain_ctx_tokens[u] += sequence_lengths[i]
+
+            gen_sequence_lengths = sequence_lengths[num_ctx_requests:]
+            for i, request in enumerate(_all_gen_reqs):
+                u = _gen_dispatch_locality_domain.get(
+                    request.py_request_id, request.py_locality_domain_id
+                )
+                per_locality_domain_gen_reqs[u] += 1
+                per_locality_domain_gen_tokens[u] += gen_sequence_lengths[i]
+
+            attn_metadata.locality_domain_ctx_req_splits = [0] + list(
+                accumulate(per_locality_domain_ctx_reqs)
+            )
+            attn_metadata.locality_domain_gen_req_splits = [0] + list(
+                accumulate(per_locality_domain_gen_reqs)
+            )
+            attn_metadata.locality_domain_ctx_token_splits = [0] + list(
+                accumulate(per_locality_domain_ctx_tokens)
+            )
+            attn_metadata.locality_domain_gen_token_splits = [0] + list(
+                accumulate(per_locality_domain_gen_tokens)
+            )
+            attn_metadata.locality_domain_num_ctx_tokens = per_locality_domain_ctx_tokens
+            attn_metadata.locality_domain_num_gen_tokens = per_locality_domain_gen_tokens
 
         if hasattr(self.model.model_config.pretrained_config, "chunk_size"):
             attn_metadata.mamba_chunk_size = self.model.model_config.pretrained_config.chunk_size
