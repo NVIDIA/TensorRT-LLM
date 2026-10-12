@@ -2934,8 +2934,6 @@ class TestKimiK25(LlmapiAccuracyTestHarness):
                 assert not all(tid == 0 for tid in token_ids)
 
 
-
-
 class TestQwen3_4B(LlmapiAccuracyTestHarness):
     MODEL_NAME = "Qwen3/Qwen3-4B"
 

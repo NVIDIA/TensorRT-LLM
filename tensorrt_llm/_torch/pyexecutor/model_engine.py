@@ -820,6 +820,7 @@ class PyTorchModelEngine(ModelEngine):
             moe_load_balancer=self.moe_load_balancer,
             sparse_attention_config=self.sparse_attention_config,
             torch_compile_backend=self._torch_compile_backend,
+            torch_compile_bypass=self._maybe_bypass_torch_compile,
             get_runtime_tokens_per_gen_step=self.
             get_runtime_tokens_per_gen_step,
             warmup_timer=self._warmup_timer,
@@ -1087,6 +1088,20 @@ class PyTorchModelEngine(ModelEngine):
             "scheduled warmup requires a resource manager")
         assert isinstance(self._runner, ScheduledModelRunner)
         self._runner.warmup(resource_manager)
+
+    @contextmanager
+    def _maybe_bypass_torch_compile(
+            self,
+            bypass: bool = False,
+            can_run_graph: bool = True) -> Iterator[None]:
+        """Force eager execution for auxiliary work and ordinary CUDA graphs."""
+        if (not self._compile_only_piecewise_graphs
+                or self._prefill_compiled_model is None
+                or not (bypass or can_run_graph)):
+            yield
+            return
+        with self._prefill_compiled_model.bypass():
+            yield
 
     ### Helper methods promoted from the original warmup method ###
 

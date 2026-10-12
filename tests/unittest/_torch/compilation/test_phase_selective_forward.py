@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import contextlib
 from unittest.mock import Mock, patch
 
 import pytest
@@ -9,6 +10,7 @@ from utils.llm_data import llm_models_root
 from utils.util import skip_pre_hopper
 
 from tensorrt_llm import LLM, SamplingParams
+from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import DecoderRunner
 from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine, _PrefillCompiledModel
 from tensorrt_llm.llmapi import CudaGraphConfig, PrefillCudaGraphBackend, TorchCompileConfig
 
@@ -21,6 +23,17 @@ def _create_prefill_compiled_model() -> tuple[_PrefillCompiledModel, Mock, Mock]
     eager_model.forward = eager_forward
     compiled_model.forward = compiled_forward
     return (_PrefillCompiledModel(eager_model, compiled_model), eager_forward, compiled_forward)
+
+
+def _create_compile_restricted_runner(
+    model: _PrefillCompiledModel, enabled: bool = True
+) -> DecoderRunner:
+    engine = object.__new__(PyTorchModelEngine)
+    engine._compile_only_piecewise_graphs = enabled
+    engine._prefill_compiled_model = model
+    runner = object.__new__(DecoderRunner)
+    runner._torch_compile_bypass = engine._maybe_bypass_torch_compile
+    return runner
 
 
 def test_prefill_compiled_model_uses_compiled_when_eligible() -> None:
@@ -59,21 +72,19 @@ def test_prefill_compiled_model_bypass_is_restored() -> None:
         pytest.param(False, False, "eager", id="generation-graph-miss"),
     ],
 )
-def test_model_engine_selects_torch_compile_forward(
+def test_decoder_runner_selects_torch_compile_forward(
     can_run_graph: bool,
     prefill_graph_eligible: bool,
     expected: str,
 ) -> None:
-    engine = object.__new__(PyTorchModelEngine)
     model, eager_forward, compiled_forward = _create_prefill_compiled_model()
-    engine._compile_only_piecewise_graphs = True
-    engine._prefill_compiled_model = model
+    runner = _create_compile_restricted_runner(model)
 
     with patch(
         "tensorrt_llm._torch.pyexecutor.model_engine.get_per_request_prefill_cuda_graph_flag",
         return_value=prefill_graph_eligible,
     ) as get_prefill_graph_flag:
-        with engine._maybe_bypass_torch_compile(can_run_graph=can_run_graph):
+        with runner._maybe_bypass_torch_compile(can_run_graph=can_run_graph):
             actual = model()
 
     assert actual == expected
@@ -87,17 +98,15 @@ def test_model_engine_selects_torch_compile_forward(
         get_prefill_graph_flag.assert_called_once_with()
 
 
-def test_model_engine_explicit_bypass_skips_graph_eligibility() -> None:
-    engine = object.__new__(PyTorchModelEngine)
+def test_decoder_runner_explicit_bypass_skips_graph_eligibility() -> None:
     model, eager_forward, compiled_forward = _create_prefill_compiled_model()
-    engine._compile_only_piecewise_graphs = True
-    engine._prefill_compiled_model = model
+    runner = _create_compile_restricted_runner(model)
 
     with patch(
         "tensorrt_llm._torch.pyexecutor.model_engine.get_per_request_prefill_cuda_graph_flag",
         return_value=True,
     ) as get_prefill_graph_flag:
-        with engine._maybe_bypass_torch_compile(bypass=True, can_run_graph=False):
+        with runner._maybe_bypass_torch_compile(bypass=True, can_run_graph=False):
             actual = model()
 
     assert actual == "eager"
@@ -106,22 +115,120 @@ def test_model_engine_explicit_bypass_skips_graph_eligibility() -> None:
     get_prefill_graph_flag.assert_not_called()
 
 
-def test_model_engine_bypass_requires_compile_only_option() -> None:
-    engine = object.__new__(PyTorchModelEngine)
+def test_decoder_runner_bypass_requires_compile_only_option() -> None:
     model, eager_forward, compiled_forward = _create_prefill_compiled_model()
-    engine._compile_only_piecewise_graphs = False
-    engine._prefill_compiled_model = model
+    runner = _create_compile_restricted_runner(model, enabled=False)
 
     with patch(
         "tensorrt_llm._torch.pyexecutor.model_engine.get_per_request_prefill_cuda_graph_flag",
         return_value=True,
     ):
-        with engine._maybe_bypass_torch_compile(bypass=True):
+        with runner._maybe_bypass_torch_compile(bypass=True):
             actual = model()
 
     assert actual == "compiled"
     compiled_forward.assert_called_once_with()
     eager_forward.assert_not_called()
+
+
+def test_decoder_runner_without_compile_bypass_service() -> None:
+    runner = object.__new__(DecoderRunner)
+    runner._torch_compile_bypass = None
+    with runner._maybe_bypass_torch_compile(bypass=True):
+        pass
+
+
+def test_decoder_runner_nested_bypass_restores_after_exception() -> None:
+    model, _, _ = _create_prefill_compiled_model()
+    runner = _create_compile_restricted_runner(model)
+    with runner._maybe_bypass_torch_compile(bypass=True):
+        with pytest.raises(RuntimeError, match="forward failed"):
+            with runner._maybe_bypass_torch_compile(bypass=True):
+                raise RuntimeError("forward failed")
+        assert model._bypass_active
+    assert not model._bypass_active
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("enabled", [False, True])
+def test_decoder_runner_warmup_bypasses_only_auxiliary_phases(monkeypatch, enabled: bool) -> None:
+    """Exercise the relocated warmup orchestration with eager/compiled routing."""
+    from types import SimpleNamespace
+
+    from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import runner as runner_module
+    from tensorrt_llm._torch.pyexecutor.warmup_timer import _WarmupTimer
+
+    model, _, _ = _create_prefill_compiled_model()
+    runner = _create_compile_restricted_runner(model, enabled=enabled)
+    runner.model = SimpleNamespace(config=SimpleNamespace(vocab_size=128))
+    runner.mapping = SimpleNamespace(cp_size=1, has_cp_helix=lambda: False)
+    runner.guided_decoder = None
+    runner._metrics = {}
+    runner._warmup_timer = _WarmupTimer(rank=0)
+    runner.cuda_graph_runner = SimpleNamespace(
+        allow_capture=contextlib.nullcontext, preallocate_padding_dummies=Mock()
+    )
+    runner._agree_warmup_flag = lambda value: value
+    runner._agree_warmup_shapes = lambda shapes: shapes
+    runner._get_full_general_warmup_requests = Mock(return_value=[(4, 0)])
+    runner._get_max_shape_warmup_requests = Mock(return_value=[(8, 0)])
+    runner.no_cuda_graph = contextlib.nullcontext
+    observed = []
+
+    def observe(phase):
+        def forward(*args):
+            observed.append((phase, model.use_compiled_forward()))
+
+        return forward
+
+    for method in (
+        "_prewarm_engram_kernels",
+        "_prewarm_csa2_sparse_indexer",
+        "_prewarm_cute_dsl_indexer_q",
+        "_ensure_dsa_attn_metadata_for_warmup",
+        "_warmup_dg_paged_mqa_logits_metadata",
+        "_warmup_cute_dsl_radix_topk",
+        "_freeze_eager_workspace_floor",
+    ):
+        monkeypatch.setattr(runner, method, Mock())
+    for method in (
+        "_run_attention_warmup",
+        "_run_autotuner_warmup",
+        "_run_mamba_hybrid_warmup",
+        "_general_warmup",
+        "_run_cuda_graph_warmup",
+    ):
+        monkeypatch.setattr(runner, method, observe(method))
+    monkeypatch.setattr(runner_module, "warmup_sampling_module", Mock())
+    monkeypatch.setattr(runner_module, "log_mem_snapshot", Mock())
+    monkeypatch.setattr(runner_module.AutoTuner, "get", Mock())
+    monkeypatch.setattr(
+        runner_module, "moe_a2a_steady_state_budget_for_capture", contextlib.nullcontext
+    )
+    monkeypatch.setattr(torch.cuda, "empty_cache", Mock())
+    monkeypatch.setattr(runner_module, "gc", SimpleNamespace(collect=Mock()))
+    with (
+        patch("tensorrt_llm._torch.bolt_profiling.maybe_bolt_clear_counters", Mock()),
+        patch(
+            "tensorrt_llm._torch.custom_ops.torch_custom_ops.MoERunner.clear_all_workspaces", Mock()
+        ),
+        patch(
+            "tensorrt_llm._torch.pyexecutor.model_engine.get_per_request_prefill_cuda_graph_flag",
+            return_value=True,
+        ),
+    ):
+        runner._warmup_scheduled(Mock(), SimpleNamespace(context_swa_layer_limit=None))
+
+    assert observed == [
+        ("_run_attention_warmup", not enabled),
+        ("_general_warmup", True),
+        ("_run_autotuner_warmup", not enabled),
+        ("_run_mamba_hybrid_warmup", not enabled),
+        ("_run_cuda_graph_warmup", True),
+        ("_run_cuda_graph_warmup", True),
+        ("_general_warmup", not enabled),
+    ]
+    assert not model._bypass_active
 
 
 @skip_pre_hopper

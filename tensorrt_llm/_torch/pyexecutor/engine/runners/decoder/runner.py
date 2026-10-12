@@ -268,6 +268,8 @@ class DecoderRunner(ScheduledModelRunner):
         metrics: dict[str, float],
         kv_cache_manager_key: ResourceManagerType,
         mm_item_scheduler: MultimodalItemScheduler | None = None,
+        torch_compile_bypass: Callable[[bool, bool], contextlib.AbstractContextManager[None]]
+        | None = None,
     ) -> None:
         self.model = model
         self.input_processor = input_processor
@@ -277,6 +279,7 @@ class DecoderRunner(ScheduledModelRunner):
         self.moe_load_balancer = moe_load_balancer
         self.sparse_attention_config = sparse_attention_config
         self._torch_compile_backend = torch_compile_backend
+        self._torch_compile_bypass = torch_compile_bypass
         self.get_runtime_tokens_per_gen_step = get_runtime_tokens_per_gen_step
         self._warmup_timer = warmup_timer
         self.iter_states = iter_states
@@ -723,8 +726,11 @@ class DecoderRunner(ScheduledModelRunner):
             self._prewarm_cute_dsl_indexer_q()
         log_mem_snapshot("warmup/after_cute_dsl_indexer_q")
         if self._context_warmups_supported:
-            with self._warmup_timer.phase(
-                "attention_jit", metrics=self._metrics, metric_name="attention_warmup_seconds"
+            with (
+                self._warmup_timer.phase(
+                    "attention_jit", metrics=self._metrics, metric_name="attention_warmup_seconds"
+                ),
+                self._maybe_bypass_torch_compile(bypass=True),
             ):
                 self._run_attention_warmup(resource_manager, can_run_general_warmup)
 
@@ -752,8 +758,11 @@ class DecoderRunner(ScheduledModelRunner):
         # Helix CP is decode-only and runs into issues with the
         # autotuner warmup's context requests.
         if self._context_warmups_supported and not self.mapping.has_cp_helix():
-            with self._warmup_timer.phase(
-                "autotuner", metrics=self._metrics, metric_name="autotuner_warmup_seconds"
+            with (
+                self._warmup_timer.phase(
+                    "autotuner", metrics=self._metrics, metric_name="autotuner_warmup_seconds"
+                ),
+                self._maybe_bypass_torch_compile(bypass=True),
             ):
                 self._run_autotuner_warmup(resource_manager)
             log_mem_snapshot("warmup/after_autotuner")
@@ -762,8 +771,11 @@ class DecoderRunner(ScheduledModelRunner):
             # since MambaHybridCacheManager skips _general_warmup and the
             # default autotuner shape is single-seq / no-initstates. Safe
             # no-op for non-Mamba models.
-            with self._warmup_timer.phase(
-                "mamba_hybrid", metrics=self._metrics, metric_name="mamba_hybrid_warmup_seconds"
+            with (
+                self._warmup_timer.phase(
+                    "mamba_hybrid", metrics=self._metrics, metric_name="mamba_hybrid_warmup_seconds"
+                ),
+                self._maybe_bypass_torch_compile(bypass=True),
             ):
                 self._run_mamba_hybrid_warmup(resource_manager)
             log_mem_snapshot("warmup/after_mamba_hybrid")
@@ -815,10 +827,13 @@ class DecoderRunner(ScheduledModelRunner):
         if can_run_general_warmup:
             # Pre-populate the memory pool with max-shape allocations to reduce
             # fragmentation at runtime.
-            with self._warmup_timer.phase(
-                "memory_pool_prepop",
-                metrics=self._metrics,
-                metric_name="memory_pool_prepopulation_seconds",
+            with (
+                self._warmup_timer.phase(
+                    "memory_pool_prepop",
+                    metrics=self._metrics,
+                    metric_name="memory_pool_prepopulation_seconds",
+                ),
+                self._maybe_bypass_torch_compile(bypass=True),
             ):
                 warmup_requests_configs = self._get_max_shape_warmup_requests(resource_manager)
                 self._general_warmup(resource_manager, warmup_requests_configs)
@@ -4750,7 +4765,10 @@ class DecoderRunner(ScheduledModelRunner):
             with with_shared_pool(self.cuda_graph_runner.get_graph_pool()):
 
                 def forward_step():
-                    with MoeLoadBalancerIterContext(moe_load_balancer):
+                    with (
+                        self._maybe_bypass_torch_compile(can_run_graph=can_run_graph),
+                        MoeLoadBalancerIterContext(moe_load_balancer),
+                    ):
                         return self._forward_step(
                             inputs,
                             enable_spec_decode=enable_spec_decode,
@@ -4788,7 +4806,10 @@ class DecoderRunner(ScheduledModelRunner):
                     if needs_capture:
 
                         def capture_forward_fn(inputs: dict[str, Any]):
-                            with MoeLoadBalancerIterContext(moe_load_balancer):
+                            with (
+                                self._maybe_bypass_torch_compile(can_run_graph=can_run_graph),
+                                MoeLoadBalancerIterContext(moe_load_balancer),
+                            ):
                                 return self._forward_step(
                                     inputs,
                                     enable_spec_decode=enable_spec_decode,
@@ -4848,6 +4869,14 @@ class DecoderRunner(ScheduledModelRunner):
                 return outputs
             outputs = self._restore_attention_dp_semantic_outputs(semantic_requests, outputs)
             return {**outputs, "runtime_draft_len": runtime_draft_len}
+
+    def _maybe_bypass_torch_compile(
+        self, bypass: bool = False, can_run_graph: bool = True
+    ) -> contextlib.AbstractContextManager[None]:
+        """Enter the engine's optional eager-forward scope."""
+        if self._torch_compile_bypass is None:
+            return contextlib.nullcontext()
+        return self._torch_compile_bypass(bypass, can_run_graph)
 
     def model_forward(self, *, is_dummy: bool, **kwargs):
         assert self._model_caller is not None
