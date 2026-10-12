@@ -26,6 +26,7 @@ from .config import DecoderRunnerConfig
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
+    from tensorrt_llm._torch.distributed import Distributed
     from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager
     from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
     from tensorrt_llm._torch.speculative.spec_tree_manager import SpecTreeManager
@@ -178,6 +179,36 @@ def update_spec_metadata(
         spec_tree_manager=spec_tree_manager,
         num_contexts=scheduled_requests.num_context_requests,
     )
+
+
+def sync_group_all_greedy_sample(
+    spec_metadata: SpecMetadata, mapping: Mapping, dist: Distributed | None
+) -> None:
+    """All-gather the per-rank greedy flags and store the group AND.
+
+    Why the sampling-path choice must be group-uniform under
+    ADP + LM-head TP is documented on the anchor,
+    ``SpecMetadata.group_all_greedy_sample``. Local contract: called once
+    per iteration, right after ``update_is_all_greedy_sample`` and BEFORE
+    the CUDA graph key is built. The gate is pure config (identical on
+    every rank), so ranks also agree on whether the exchange happens; the
+    gather spans the whole TP group, a superset of any LM-head-TP
+    subgroup. A dedicated host all-gather rather than a piggyback on the
+    ``all_rank_num_tokens`` exchange, which runs in ``prepare_inputs`` --
+    after the graph key, too late for the key to see the synced value.
+    """
+    # enable_lm_head_tp_in_adp implies enable_attention_dp (asserted in
+    # Mapping.__init__), so ADP needs no separate check here.
+    if not (mapping.enable_lm_head_tp_in_adp and spec_metadata.use_rejection_sampling):
+        return
+    local_flag = bool(spec_metadata.is_all_greedy_sample)
+    all_flags = dist.tp_allgather_int64([local_flag])[:, 0]
+    spec_metadata.group_all_greedy_sample = bool(all_flags.all())
+    # Also overwrite the live flag directly: this iteration's scan already
+    # ran (update_is_all_greedy_sample just returned) and the CUDA graph
+    # key reads the flag next -- the stored override only takes effect on
+    # the NEXT rescan (populate), which is after key selection.
+    spec_metadata.is_all_greedy_sample = spec_metadata.group_all_greedy_sample
 
 
 def set_spec_metadata_all_rank_num_tokens(

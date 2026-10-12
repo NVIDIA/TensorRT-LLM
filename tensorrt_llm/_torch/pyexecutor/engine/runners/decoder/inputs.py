@@ -299,6 +299,7 @@ class DecoderInputPreparer:
         self._prepare_inputs_fast_path = fast_path
         self._new_extra_inputs = new_extra_inputs
         self.guided_decoder: CapturableGuidedDecoder | None = None
+        self._prepare_inputs_event: torch.cuda.Event | None = None
         # Steady-state generation-only prepare cache (non-speculative overlap
         # decode). Holds the per-request lists that are invariant while the
         # scheduled generation batch keeps the same composition, plus a pinned
@@ -2138,6 +2139,23 @@ class DecoderInputPreparer:
                     (host.generation_requests, host.beam_width),
                 ),
             )
+
+    def record_promoted_iter_states(self, scheduled_requests: ScheduledRequests) -> None:
+        """Count promoted final-context rows as the context requests they were scheduled as."""
+        self.iter_states["num_ctx_requests"] = scheduled_requests.num_context_requests
+        self.iter_states["num_ctx_tokens"] = sum(
+            request.context_chunk_size for request in scheduled_requests.context_requests
+        )
+        self.iter_states["num_generation_tokens"] = scheduled_requests.num_generation_requests
+
+    def record_input_copy(self) -> None:
+        """Mark the end of this pass's host-to-device input copies."""
+        self._prepare_inputs_event = torch.cuda.Event()
+        self._prepare_inputs_event.record()
+
+    def wait_for_input_copy(self) -> None:
+        if self._prepare_inputs_event is not None:
+            self._prepare_inputs_event.synchronize()
 
     def _record_steady_gen_cache(
         self,

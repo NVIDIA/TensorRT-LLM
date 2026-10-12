@@ -577,7 +577,7 @@ class SpecMetadata:
     # value). Under ADP + LM-head TP with rejection sampling, the greedy-vs-
     # advanced choice gates group collectives, so all ranks must take the same
     # path even though their batches (and thus local flags) differ. Set by
-    # ``_sync_group_all_greedy_sample`` before the CUDA graph key is built and
+    # ``sync_group_all_greedy_sample`` before the CUDA graph key is built and
     # re-applied by ``_scan_one_model_sampling`` on every rescan. AND is safe:
     # a greedy rank pulled onto the advanced path still samples greedily via
     # its sentinel params.

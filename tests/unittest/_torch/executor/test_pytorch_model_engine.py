@@ -349,6 +349,7 @@ def _make_forward_only_engine(
         cp_size=1,
         enable_lm_head_tp_in_adp=False,
     )
+    decoder.dist = None
     engine.runtime_draft_len = 0
     decoder.get_runtime_tokens_per_gen_step = Mock(return_value=1)
     engine.iter_states = decoder.iter_states = {}
@@ -381,7 +382,9 @@ def _make_forward_only_engine(
     }
     decoder._inputs = SimpleNamespace(
         guided_decoder=None,
-        prepare_inputs=Mock(return_value=PreparedInputs(prepared_inputs)))
+        prepare_inputs=Mock(return_value=PreparedInputs(prepared_inputs)),
+        record_promoted_iter_states=Mock(),
+        record_input_copy=Mock())
     outputs = {"logits": object()}
     decoder._forward_step = Mock(return_value=outputs)
     decoder._execute_logit_post_processors = Mock()
@@ -2001,7 +2004,8 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         decoder = object.__new__(DecoderRunner)
         engine._runner = decoder
         engine._torch_compile_backend = None
-        decoder._prepare_inputs_event = Mock()
+        decoder._inputs = object.__new__(DecoderInputPreparer)
+        decoder._inputs._prepare_inputs_event = Mock()
         decoder._graphs = DecoderCudaGraphs(
             Mock(),
             Mock(),
@@ -2025,7 +2029,8 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         engine.wait_for_input_copy()
         engine._release_cuda_graphs()
 
-        decoder._prepare_inputs_event.synchronize.assert_called_once_with()
+        decoder._inputs._prepare_inputs_event.synchronize.assert_called_once_with(
+        )
         decoder.cuda_graph_runner.clear.assert_called_once_with()
         decoder.breakable_cuda_graph_runner.clear.assert_called_once_with()
 

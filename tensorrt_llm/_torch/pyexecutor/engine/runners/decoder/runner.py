@@ -72,7 +72,12 @@ from .inputs import (
     ExtraInputsCollector,
     resolve_runtime_draft_len,
 )
-from .metadata import DecoderMetadata, get_spec_managers, update_spec_metadata
+from .metadata import (
+    DecoderMetadata,
+    get_spec_managers,
+    sync_group_all_greedy_sample,
+    update_spec_metadata,
+)
 from .warmup import DecoderWarmup, WarmupAgreement
 
 
@@ -316,7 +321,7 @@ class DecoderRunner(ScheduledModelRunner):
         self._graphs.release()
 
     def wait_for_input_copy(self) -> None:
-        self._wait_for_decoder_input_copy()
+        self._inputs.wait_for_input_copy()
 
     def register_sample_type_resolver(
         self, resolver: Callable | None, stage: Callable | None = None
@@ -359,7 +364,6 @@ class DecoderRunner(ScheduledModelRunner):
             attn_backend=self._config.attention_backend,
             cuda_graph_manager=None,
         )
-        self._prepare_inputs_event: torch.cuda.Event | None = None
         # Let the first CUDA graph capture create its private pool. Piecewise
         # CUDA graphs use a separate pool owned by their runners, so sharing a
         # pre-created pool handle with the outer graph runner is unnecessary.
@@ -514,33 +518,6 @@ class DecoderRunner(ScheduledModelRunner):
         self, requests: list[LlmRequest], resource_manager: ResourceManager
     ) -> None:
         """Free what ``_add_dummy_request_resources`` allocated."""
-
-    def _sync_group_all_greedy_sample(self, spec_metadata) -> None:
-        """All-gather the per-rank greedy flags and store the group AND.
-
-        Why the sampling-path choice must be group-uniform under
-        ADP + LM-head TP is documented on the anchor,
-        ``SpecMetadata.group_all_greedy_sample``. Local contract: called once
-        per iteration, right after ``update_is_all_greedy_sample`` and BEFORE
-        the CUDA graph key is built. The gate is pure config (identical on
-        every rank), so ranks also agree on whether the exchange happens; the
-        gather spans the whole TP group, a superset of any LM-head-TP
-        subgroup. A dedicated host all-gather rather than a piggyback on the
-        ``all_rank_num_tokens`` exchange, which runs in ``_prepare_inputs`` --
-        after the graph key, too late for the key to see the synced value.
-        """
-        # enable_lm_head_tp_in_adp implies enable_attention_dp (asserted in
-        # Mapping.__init__), so ADP needs no separate check here.
-        if not (self.mapping.enable_lm_head_tp_in_adp and spec_metadata.use_rejection_sampling):
-            return
-        local_flag = bool(spec_metadata.is_all_greedy_sample)
-        all_flags = self.dist.tp_allgather_int64([local_flag])[:, 0]
-        spec_metadata.group_all_greedy_sample = bool(all_flags.all())
-        # Also overwrite the live flag directly: this iteration's scan already
-        # ran (update_is_all_greedy_sample just returned) and the CUDA graph
-        # key reads the flag next -- the stored override only takes effect on
-        # the NEXT rescan (populate), which is after key selection.
-        spec_metadata.is_all_greedy_sample = spec_metadata.group_all_greedy_sample
 
     def _is_final_multimodal_context_decode_compatible(self, request: LlmRequest) -> bool:
         """Return whether the final prompt token uses the decode input path.
@@ -706,7 +683,7 @@ class DecoderRunner(ScheduledModelRunner):
             # unpopulated (greedy) buffers, hanging the run (e.g. MTP nextn>=2).
             if spec_metadata is not None:
                 spec_metadata.update_is_all_greedy_sample(padded_graph_requests.all_requests())
-                self._sync_group_all_greedy_sample(spec_metadata)
+                sync_group_all_greedy_sample(spec_metadata, self.mapping, self.dist)
 
             peft_cache_data_type = None
             if self._lora.cuda_graph_manager is not None:
@@ -804,15 +781,8 @@ class DecoderRunner(ScheduledModelRunner):
                 self._config.spec_config if enable_spec_decode else None, runtime_draft_len
             )
             if execution_promoted_context_ids:
-                self.iter_states["num_ctx_requests"] = scheduled_requests.num_context_requests
-                self.iter_states["num_ctx_tokens"] = sum(
-                    request.context_chunk_size for request in scheduled_requests.context_requests
-                )
-                self.iter_states["num_generation_tokens"] = (
-                    scheduled_requests.num_generation_requests
-                )
-            self._prepare_inputs_event = torch.cuda.Event()
-            self._prepare_inputs_event.record()
+                self._inputs.record_promoted_iter_states(scheduled_requests)
+            self._inputs.record_input_copy()
 
             breakable_runner = self.breakable_cuda_graph_runner
 
@@ -1076,10 +1046,6 @@ class DecoderRunner(ScheduledModelRunner):
                         logits_row_offset,
                     )
                 logits_row_offset += row_stride
-
-    def _wait_for_decoder_input_copy(self) -> None:
-        if self._prepare_inputs_event is not None:
-            self._prepare_inputs_event.synchronize()
 
     def _cuda_graph_metadata_prepare_scope(
         self,
