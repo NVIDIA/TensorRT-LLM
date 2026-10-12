@@ -108,7 +108,9 @@ def _non_hybrid_kv_cache_manager_cls(config, kv_cache_config: KvCacheConfig):
 
 
 def kv_cache_manager_v2_incompatible_features(
-        max_beam_width: Optional[int]) -> List[str]:
+        max_beam_width: Optional[int],
+        *,
+        enable_sleep: bool = False) -> List[str]:
     """Runtime features a V2 manager cannot serve.
 
     ``KvCacheCreator._validate_or_fallback_kv_cache_manager_v2`` demotes a plain
@@ -124,11 +126,14 @@ def kv_cache_manager_v2_incompatible_features(
     """
     # The C++ backend supports beam search. Model-specific restrictions are
     # validated by KvCacheCreator before constructing the manager.
-    return []
+    # V2's native allocations are not tracked by release_with_tag.
+    return ["SleepConfig"] if enable_sleep else []
 
 
 def resolved_kv_cache_manager_is_v2(kv_cache_config: KvCacheConfig,
-                                    max_beam_width: Optional[int]) -> bool:
+                                    max_beam_width: Optional[int],
+                                    *,
+                                    enable_sleep: bool = False) -> bool:
     """Whether the executor will actually hold a V2 manager.
 
     ``use_kv_cache_manager_v2`` is a request, not the outcome: model loading has
@@ -137,7 +142,8 @@ def resolved_kv_cache_manager_is_v2(kv_cache_config: KvCacheConfig,
     a pool from the request would leave V2 geometry on a V1 executor.
     """
     return (kv_cache_config.use_kv_cache_manager_v2 is True
-            and not kv_cache_manager_v2_incompatible_features(max_beam_width))
+            and not kv_cache_manager_v2_incompatible_features(
+                max_beam_width, enable_sleep=enable_sleep))
 
 
 def _resolve_disagg_transceiver_route(
@@ -435,9 +441,20 @@ class CacheCost:
     """Affine KV cache budget: ``bytes = slope * tokens + intercept``.
 
     The legacy proportional case is just ``intercept = 0``.
+
+    ``bytes_per_request`` is an optional estimate of the slope-funded
+    per-request spend (``get_cache_bytes_per_request``): the worst-case bytes
+    one request pins beyond what the intercept already reserves. It refines
+    how the target/draft budget split weighs the two managers.
+    ``quota_per_request`` is the optional allocator quota one request makes
+    the manager insist on (``get_cache_quota_per_request``), which floors and
+    caps the draft share. Neither is part of the affine cost model, so
+    arithmetic (``__add__``) drops them.
     """
     slope: int
     intercept: int = 0
+    bytes_per_request: Optional[int] = None
+    quota_per_request: Optional[int] = None
 
     @classmethod
     def from_raw(cls, raw) -> "CacheCost":
@@ -456,10 +473,14 @@ class CacheCost:
                          intercept=self.intercept + other.intercept)
 
     def __str__(self) -> str:
-        if self.intercept == 0:
-            return f"{self.slope} bytes/token"
-        else:
-            return f"{self.slope} bytes/token + {self.intercept} bytes fixed cost"
+        text = f"{self.slope} bytes/token"
+        if self.intercept != 0:
+            text += f" + {self.intercept} bytes fixed cost"
+        if self.bytes_per_request is not None:
+            text += f", {self.bytes_per_request} bytes/request"
+        if self.quota_per_request is not None:
+            text += f", {self.quota_per_request} quota bytes/request"
+        return text
 
     def tokens_for_budget(self, budget: int) -> int:
         """Memory budget -> max tokens. Clamps a negative result to 0."""
@@ -500,6 +521,15 @@ def get_attention_workspace_is_chunked_prefill_bounded(model_config) -> bool:
     return get_attention_backend(
         model_config.attn_backend).runtime_workspace_is_chunked_prefill_bounded(
             model_config)
+
+
+def get_attention_workspace_fixed_bytes(model_config, mapping,
+                                        **capacities) -> int:
+    """Capacity-sized reserve declared by the model's selected backend."""
+    from ..attention.backends.utils import get_attention_backend
+    return get_attention_backend(
+        model_config.attn_backend).runtime_workspace_fixed_bytes(
+            model_config, mapping, **capacities)
 
 
 def get_mla_context_workspace_kv_len_cap(
@@ -918,7 +948,8 @@ class KvCacheCreator:
                        and quant_config is not None
                        and quant_config.quant_mode.has_fp4_kv_cache())
             incompat = kv_cache_manager_v2_incompatible_features(
-                self._max_beam_width)
+                self._max_beam_width,
+                enable_sleep=self._llm_args.sleep_config is not None)
             # Sparse attention: ModelEngine only forwards cache_indirection when
             # the metadata type is exactly TrtllmAttentionMetadata, and every
             # sparse backend uses a subclass, so beams would read beam 0's
@@ -959,10 +990,22 @@ class KvCacheCreator:
                         "features to run FP4 MLA.")
                 if is_hybrid_linear(config):
                     raise NotImplementedError(
-                        "Hybrid Mamba cache managers do not support "
-                        f"{incompat_str}; CppMambaHybridCacheManager does not "
-                        "provide a compatible fallback. Use max_beam_width=1 "
-                        "to run hybrid linear models.")
+                        "Hybrid Mamba KVCacheManagerV2 does not support "
+                        f"{incompat_str}; automatic fallback is unavailable "
+                        "for hybrid linear models. Disable the "
+                        "incompatible features to run hybrid linear models.")
+                if kv_cache_config is None:
+                    kv_cache_config = self._kv_cache_config
+                if kv_cache_config.block_reuse_config.policy != "all_reusable":
+                    raise NotImplementedError(
+                        "Non-default block_reuse_config.policy requires "
+                        "KVCacheManagerV2, which is not supported with "
+                        f"{incompat_str}.")
+                if kv_cache_config.block_reuse_config.swa_endpoint_rewind_tokens > 0:
+                    raise NotImplementedError(
+                        "block_reuse_config.swa_endpoint_rewind_tokens requires "
+                        "KVCacheManagerV2, which is not supported with "
+                        f"{incompat_str}.")
                 # Plain V2 (explicitly enabled or selected by a model preference):
                 # V2 was a preference, not a structural requirement, so we can
                 # safely fall back to V1.
@@ -983,6 +1026,7 @@ class KvCacheCreator:
                                 *,
                                 is_draft: bool = False,
                                 mapping=None,
+                                include_request_cost: bool = False,
                                 **extra_kwargs) -> CacheCost:
         kv_cache_config = (kv_cache_config if kv_cache_config is not None else
                            self._kv_cache_config)
@@ -996,7 +1040,7 @@ class KvCacheCreator:
                 # pools. The draft manager never derives (see there).
                 kv_cache_config = kv_cache_config.model_copy(
                     update={"max_attention_window": derived_windows})
-        return CacheCost.from_raw(
+        cost = CacheCost.from_raw(
             manager_cls.get_cache_size_per_token(
                 model_config,
                 mapping if mapping is not None else self._mapping,
@@ -1008,6 +1052,73 @@ class KvCacheCreator:
                 spec_config=self._speculative_config,
                 is_draft=is_draft,
                 **extra_kwargs))
+        if include_request_cost:
+            if cost.bytes_per_request is None:
+                bytes_per_request = self._per_manager_request_estimate(
+                    manager_cls,
+                    "get_cache_bytes_per_request",
+                    model_config,
+                    kv_cache_config,
+                    mapping=mapping,
+                    is_draft=is_draft,
+                    # Zero is a valid weight: a manager whose entire retention
+                    # is intercept-funded spends nothing per request from the
+                    # slope budget.
+                    allow_zero=True,
+                    **extra_kwargs)
+                if bytes_per_request is not None:
+                    cost = dataclasses.replace(
+                        cost, bytes_per_request=bytes_per_request)
+            if cost.quota_per_request is None:
+                quota_per_request = self._per_manager_request_estimate(
+                    manager_cls,
+                    "get_cache_quota_per_request",
+                    model_config,
+                    kv_cache_config,
+                    mapping=mapping,
+                    is_draft=is_draft,
+                    **extra_kwargs)
+                if quota_per_request is not None:
+                    cost = dataclasses.replace(
+                        cost, quota_per_request=quota_per_request)
+        return cost
+
+    def _per_manager_request_estimate(self,
+                                      manager_cls,
+                                      method_name: str,
+                                      model_config,
+                                      kv_cache_config: KvCacheConfig,
+                                      *,
+                                      mapping=None,
+                                      is_draft: bool = False,
+                                      allow_zero: bool = False,
+                                      **extra_kwargs) -> Optional[int]:
+        """Per-request byte estimate from a manager classmethod, or None.
+
+        None when the manager class does not model per-request spend (only
+        ``KVCacheManagerV2`` and subclasses do) or declines (see the manager
+        method's docstring for when).
+        """
+        estimate_method = getattr(manager_cls, method_name, None)
+        if estimate_method is None:
+            return None
+        estimate = estimate_method(
+            model_config,
+            mapping if mapping is not None else self._mapping,
+            tokens_per_block=self._tokens_per_block,
+            max_seq_len=self._max_seq_len,
+            max_batch_size=self._max_batch_size,
+            max_num_tokens=self._max_num_tokens,
+            kv_cache_config=kv_cache_config,
+            spec_config=self._speculative_config,
+            is_draft=is_draft,
+            **extra_kwargs)
+        # Mocked manager classes in tests return non-int sentinels; treat
+        # anything but a usable int as "no estimate".
+        if isinstance(estimate, int) and (estimate > 0 or
+                                          (allow_zero and estimate == 0)):
+            return estimate
+        return None
 
     def _get_one_model_draft_layer_mask(self) -> List[bool]:
         """Return the same draft-only mask used by runtime construction."""
@@ -1051,6 +1162,7 @@ class KvCacheCreator:
         kv_cache_config: KvCacheConfig,
         *,
         use_separate_draft_kv_cache: bool,
+        include_request_cost: bool = False,
     ) -> Optional[CacheCost]:
         """Return the draft manager's standalone cache cost, if it has one.
 
@@ -1067,18 +1179,24 @@ class KvCacheCreator:
             helix_cp_scale = self._mapping.cp_size
 
         def scaled(cost: CacheCost) -> CacheCost:
-            return CacheCost(slope=cost.slope * helix_cp_scale,
-                             intercept=cost.intercept)
+            # Rescale only the slope: every other cost component (e.g. the
+            # fixed intercept) is per-request rank-local bytes and stays
+            # unscaled. dataclasses.replace keeps any component the rescale
+            # does not touch, where rebuilding the CacheCost from named
+            # fields would silently drop it.
+            return dataclasses.replace(cost, slope=cost.slope * helix_cp_scale)
 
         if self._draft_model_engine is not None:
             draft_model_config = self._draft_model_engine.model.model_config
             draft_kv_cache_manager_cls = self._get_model_kv_cache_manager_cls(
                 self._draft_model_engine, kv_cache_config)
             return scaled(
-                self._per_manager_cache_cost(draft_kv_cache_manager_cls,
-                                             draft_model_config,
-                                             kv_cache_config,
-                                             mapping=draft_mapping))
+                self._per_manager_cache_cost(
+                    draft_kv_cache_manager_cls,
+                    draft_model_config,
+                    kv_cache_config,
+                    mapping=draft_mapping,
+                    include_request_cost=include_request_cost))
         if use_separate_draft_kv_cache:
             # One-model draft with separate KV cache layout.
             # Pass num_layers explicitly since the HF config may report a
@@ -1105,11 +1223,13 @@ class KvCacheCreator:
             if self._speculative_config.spec_dec_mode.is_external_drafter():
                 # External drafter: layers start from 0, normal PP distribution
                 return scaled(
-                    self._per_manager_cache_cost(draft_kv_cache_manager_cls,
-                                                 effective_draft_config,
-                                                 draft_kv_cache_config,
-                                                 mapping=draft_mapping,
-                                                 is_draft=True))
+                    self._per_manager_cache_cost(
+                        draft_kv_cache_manager_cls,
+                        effective_draft_config,
+                        draft_kv_cache_config,
+                        mapping=draft_mapping,
+                        is_draft=True,
+                        include_request_cost=include_request_cost))
             elif self._mapping.is_last_pp_rank():
                 # EAGLE3/MTP: draft layers only on last PP rank
                 return scaled(
@@ -1119,7 +1239,8 @@ class KvCacheCreator:
                         draft_kv_cache_config,
                         mapping=draft_mapping,
                         num_layers=self._get_num_draft_layers(),
-                        is_draft=True))
+                        is_draft=True,
+                        include_request_cost=include_request_cost))
         return None
 
     def _cal_max_memory(self, peak_memory, total_gpu_memory, fraction,
@@ -1291,7 +1412,7 @@ class KvCacheCreator:
         return [MultimodalParams(multimodal_data=mm_data)]
 
     def _encode_dummy_inputs(self) -> Optional[torch.Tensor]:
-        """Run the full-budget MM encoder and retain request-owned output storage."""
+        """Run the full-budget MM encoder and retain equivalent store output."""
         if not self._dummy_encoder_inputs:
             return None
 
@@ -1311,7 +1432,7 @@ class KvCacheCreator:
                     )
                 output = self._model_engine.model.encode_multimodal_inputs(
                     encoder_inputs)
-                # Runtime item state owns detached copies rather than views of
+                # The runtime store owns detached copies rather than views of
                 # an encoder batch. Reproduce that allocation boundary here.
                 return output.detach().clone()
         finally:
@@ -1320,20 +1441,26 @@ class KvCacheCreator:
     def _get_multimodal_encoder_memory_reserve(self,
                                                profiled_output_bytes: int = 0
                                                ) -> int:
-        """Return output and cache capacity absent from the measured peak."""
-        output_budget = getattr(self._model_engine,
-                                "mm_encoder_output_budget_bytes", None)
-        unprofiled_output_bytes = max(0, (output_budget or 0) -
-                                      profiled_output_bytes)
-
-        model = self._model_engine.model
-        cache_bytes = 0
-        if (isinstance(model, MultimodalModelMixin)
-                and model.encoder_cache_active
-                and model.model_config.multimodal_config is not None):
-            cache_bytes = (
-                model.model_config.multimodal_config.encoder_cache_max_bytes)
-        return unprofiled_output_bytes + cache_bytes
+        """Reserve the unprofiled encoder store and chunk-assembly copies."""
+        encoder_cache = self._model_engine.mm_encoder_cache
+        if encoder_cache is None:
+            return 0
+        reserve = encoder_cache.max_bytes
+        if self._model_engine.mm_encoder_item_scheduling_enabled:
+            # Item outputs live only in the store, so the retained profiling
+            # output already occupies part of it. Inline encoding keeps its
+            # batch output beside the store's copies; the retained output
+            # stands in for that batch, so the whole store stays unprofiled.
+            reserve = max(0, reserve - profiled_output_bytes)
+            # The text-only dummy does not assemble cached MM rows for LLM
+            # prefill. Per-request joins and their batch-wide join can coexist.
+            # Both contain only current-chunk rows, bounded by the LLM token
+            # budget even when many requests reuse the same cached item.
+            chunk_output_bytes = (
+                self._max_num_tokens *
+                self._model_engine.bytes_per_mm_encoder_embedding)
+            reserve += 2 * chunk_output_bytes
+        return reserve
 
     def _get_token_num_for_estimation(self) -> int:
         """Compute KV cache capacity required for estimate_max_kv_cache_tokens to succeed."""
@@ -1442,6 +1569,12 @@ class KvCacheCreator:
                 self._skip_est = True
         model_config = self._model_engine.model.model_config
         if model_config.attn_backend == "VANILLA":
+            # Make build_managers call configure_kv_cache_capacity() for
+            # the V2 memory quota. Non-HELIX CP has no sizing path there;
+            # HELIX is handled above.
+            if (self._is_kv_cache_manager_v2
+                    and 'cp_type' not in self._mapping.cp_config):
+                self._skip_est = True
             estimating_kv_cache = False
             logger.info(
                 "KV cache size estimation is not supported for Vanilla attention backend, disable it."
@@ -1557,7 +1690,7 @@ class KvCacheCreator:
 
         if py_executor is not None and not self._skip_est:
             # Run the MM encoder at its independent token budget, then keep the
-            # resulting request-owned embeddings resident while the text-only
+            # equivalent runtime-owned embeddings resident while the text-only
             # LLM dummy fills max_num_tokens.
             encoder_profile_output = self._encode_dummy_inputs()
             if encoder_profile_output is not None:
@@ -1643,6 +1776,22 @@ class KvCacheCreator:
             logger.info(
                 f"Reserving {mem_gb:.2f} GiB for multimodal encoder memory "
                 "not materialized by the profiling run.")
+
+        fixed_workspace_reserve = get_attention_workspace_fixed_bytes(
+            self._model_engine.model.model_config,
+            self._mapping,
+            max_batch_size=self._max_batch_size,
+            max_num_tokens=self._max_num_tokens,
+            max_seq_len=self._max_seq_len,
+            enable_cuda_graph=self._llm_args.cuda_graph_config is not None,
+        )
+        # A decode arena can first appear after the peak prefill step. Reserve
+        # its full capacity for coexistence with the profiled transient peak.
+        peak_memory += fixed_workspace_reserve
+        if fixed_workspace_reserve:
+            logger.info(
+                f"Reserving {fixed_workspace_reserve / GB:.2f} GiB for capacity-sized "
+                "attention workspace across serving steps.")
 
         # calculate max memory from peak memory and free gpu memory fraction
         kv_cache_max_memory = self._cal_max_memory(peak_memory,
@@ -2109,8 +2258,16 @@ class KvCacheCreator:
     def _get_target_and_draft_cache_costs(
         self,
         kv_cache_config: Optional[KvCacheConfig] = None,
+        *,
+        include_request_cost: bool = False,
     ) -> Optional[tuple[CacheCost, CacheCost]]:
-        """Per-manager KV cache costs for target and draft layers."""
+        """Per-manager KV cache costs for target and draft layers.
+
+        ``include_request_cost`` additionally attaches the optional per-request
+        estimates (``CacheCost.bytes_per_request`` and
+        ``CacheCost.quota_per_request``) to each cost. Only the GPU budget
+        split uses them; default callers keep the plain affine costs.
+        """
         target_kv_cache_config = (kv_cache_config if kv_cache_config is not None
                                   else self._kv_cache_config)
         use_separate_draft_kv_cache = (
@@ -2119,12 +2276,14 @@ class KvCacheCreator:
             self._kv_cache_manager_cls,
             self._model_engine.model.model_config,
             target_kv_cache_config,
-            use_separate_draft_kv_cache=use_separate_draft_kv_cache)
+            use_separate_draft_kv_cache=use_separate_draft_kv_cache,
+            include_request_cost=include_request_cost)
         # Estimate the draft component directly so its independently modelled
         # affine intercept is preserved exactly.
         draft_kv = self._get_draft_cache_cost(
             target_kv_cache_config,
             use_separate_draft_kv_cache=use_separate_draft_kv_cache,
+            include_request_cost=include_request_cost,
         )
         if draft_kv is None:
             return None
@@ -2140,7 +2299,32 @@ class KvCacheCreator:
         target_kv: CacheCost,
         draft_kv: CacheCost,
     ) -> Optional[tuple[int, int]]:
-        """Split *total_budget* into (target_budget, draft_budget) byte shares."""
+        """Split *total_budget* into (target_budget, draft_budget) byte shares.
+
+        Both managers' affine intercepts are reserved first; the remaining
+        (slope) budget is weighed by slope-funded per-request spend
+        (``CacheCost.bytes_per_request``, which excludes the retention the
+        intercept already pays) when both managers report it, and by per-token
+        cost otherwise. The per-token weighting hands both pools the same token
+        capacity, which under-budgets the draft pool whenever the target bounds
+        retention with windows the intercept does not carry while every draft
+        mirror is reserved at the request's full context length: the draft pool
+        then caps concurrency while the target pool sits mostly idle. Weighting
+        by the uncovered per-request spend sizes both pools for the same
+        worst-case request count instead.
+
+        Under per-request weighting the draft share is additionally capped at
+        ``max_batch_size`` full-length mirrors — the pool can never hold more
+        than the scheduler admits, so any excess share stays with the target —
+        using the per-mirror allocator quota (``CacheCost.quota_per_request``:
+        resume-utilization headroom and allocation granularity included) when
+        the manager reports it. That quota also floors the draft share: the
+        allocator raises any smaller quota at construction regardless of the
+        split, so assigning less would silently overcommit the target's share.
+        A floor that does not fit in the budget remaining after both
+        intercepts makes the split infeasible (``None``), like an unfundable
+        fixed cost; flooring anyway would push the target below its intercept.
+        """
         intercept_total = target_kv.intercept + draft_kv.intercept
         slope_budget = total_budget - intercept_total
         slope_total = target_kv.slope + draft_kv.slope
@@ -2156,11 +2340,87 @@ class KvCacheCreator:
                 f"the fixed cache cost {intercept_total}; cannot split "
                 f"between target and draft with a per-token cache cost.")
             return None
-        draft_slope_share = (slope_budget * draft_kv.slope //
-                             slope_total if slope_total > 0 else 0)
+        per_request_weighted = (target_kv.bytes_per_request is not None
+                                and draft_kv.bytes_per_request is not None
+                                and target_kv.bytes_per_request +
+                                draft_kv.bytes_per_request > 0)
+        if per_request_weighted:
+            target_weight = target_kv.bytes_per_request
+            draft_weight = draft_kv.bytes_per_request
+        else:
+            target_weight = target_kv.slope
+            draft_weight = draft_kv.slope
+        weight_total = target_weight + draft_weight
+        draft_slope_share = (slope_budget * draft_weight //
+                             weight_total if weight_total > 0 else 0)
+        if per_request_weighted and self._max_batch_size > 0:
+            # Cap in allocator-quota units when known: the usable-bytes
+            # estimate under-reserves by the resume-utilization headroom and
+            # the allocation granularity the runtime rounds each pool to.
+            draft_bytes_per_mirror = (draft_kv.quota_per_request
+                                      if draft_kv.quota_per_request is not None
+                                      else draft_kv.bytes_per_request)
+            max_useful_draft_bytes = (self._max_batch_size *
+                                      draft_bytes_per_mirror)
+            draft_slope_share = min(draft_slope_share, max_useful_draft_bytes)
+        if draft_kv.quota_per_request is not None:
+            if draft_kv.quota_per_request > slope_budget:
+                # The allocator will raise the draft quota to this one-request
+                # floor at construction regardless of the split, so a budget
+                # that cannot fund it alongside both intercepts is infeasible,
+                # exactly like an unfundable fixed cost. Flooring anyway would
+                # silently push the target below its intercept.
+                logger.warning(
+                    f"KV cache budget {total_budget} cannot fund the draft "
+                    f"manager's minimum allocator quota "
+                    f"({draft_kv.quota_per_request} bytes for one max-length "
+                    f"request) beyond the fixed cache cost {intercept_total}; "
+                    f"cannot split between target and draft.")
+                return None
+            # The allocator raises any smaller quota to this one-request floor
+            # at construction regardless of the split, so assigning less would
+            # silently overcommit the target's share.
+            draft_slope_share = max(draft_slope_share,
+                                    draft_kv.quota_per_request)
         draft_budget = draft_kv.intercept + draft_slope_share
         target_budget = total_budget - draft_budget
         return target_budget, draft_budget
+
+    def _bound_unsplit_v2_draft_by_tokens(
+        self,
+        total_budget: int,
+        target_kv_cache_config: KvCacheConfig,
+        draft_kv_cache_config: Optional[KvCacheConfig],
+    ) -> Optional[KvCacheConfig]:
+        """Backstop for a one-model V2 draft whose GPU budget cannot be split.
+
+        When the per-manager costs are unavailable the split returns the
+        configs unchanged, so the draft would read the target's whole
+        max_gpu_total_bytes and claim the budget a second time. Bound the draft
+        alone by the token capacity of that budget instead: its V2 quota
+        becomes min(max_gpu_total_bytes, max_tokens * draft bytes/token), as V1
+        does with a shared max_tokens. The target config is never touched, so a
+        successful split (which already sizes both managers) is unaffected.
+        """
+        if (not self._is_kv_cache_manager_v2
+                or self._draft_model_engine is not None
+                or not self._should_create_separate_draft_kv_cache()
+                or target_kv_cache_config.max_tokens is not None):
+            return draft_kv_cache_config
+        max_tokens = self._get_kv_size_per_token(
+            target_kv_cache_config).tokens_for_budget(total_budget)
+        # When every attention layer is windowed the per-token slope is 0 and
+        # tokens_for_budget returns 0. V2 treats an unset max_tokens as
+        # unbounded, so leave it unset rather than impose a cap of zero.
+        if max_tokens <= 0:
+            return draft_kv_cache_config
+        bounded = (draft_kv_cache_config if draft_kv_cache_config is not None
+                   else target_kv_cache_config).model_copy()
+        bounded.max_tokens = max_tokens
+        logger.info(
+            f"Cannot split KV cache max_gpu_total_bytes between target and "
+            f"draft; bounding the draft to max_tokens={max_tokens}.")
+        return bounded
 
     def _split_kv_cache_budget_for_draft(
         self,
@@ -2202,8 +2462,11 @@ class KvCacheCreator:
             return target_kv_cache_config, draft_kv_cache_config
 
         cache_costs = self._get_target_and_draft_cache_costs(
-            target_kv_cache_config)
+            target_kv_cache_config, include_request_cost=True)
         if cache_costs is None:
+            if budget_attr == "max_gpu_total_bytes":
+                draft_kv_cache_config = self._bound_unsplit_v2_draft_by_tokens(
+                    total_budget, target_kv_cache_config, draft_kv_cache_config)
             return target_kv_cache_config, draft_kv_cache_config
         target_kv, draft_kv = cache_costs
 
@@ -2211,7 +2474,10 @@ class KvCacheCreator:
         # state; it does not consume host offload memory. When splitting a
         # non-GPU budget (e.g. host_cache_size), drop the intercept so the split
         # stays proportional to the per-token (slope) cost instead of being
-        # spuriously starved by a GPU-only fixed cost.
+        # spuriously starved by a GPU-only fixed cost. The per-request
+        # estimates are dropped with it: only the GPU pool caps live
+        # concurrency and only its allocator enforces quota floors, so offload
+        # tiers keep the per-token proportional split.
         if budget_attr != "max_gpu_total_bytes":
             target_kv = CacheCost(slope=target_kv.slope)
             draft_kv = CacheCost(slope=draft_kv.slope)
@@ -3108,13 +3374,23 @@ def _create_kv_cache_manager(
             **kda_extra_kwargs,
             **manager_extra_kwargs,
         )
-    elif is_mla(config):
+    elif (getattr(sparse_attention_config, "algorithm", None) == "csa2"
+          or is_mla(config)):
+        if getattr(sparse_attention_config, "algorithm", None) == "csa2":
+            manager_extra_kwargs["context_swa_layer_limit"] = (
+                _model_config.extra_attrs.get("csa2_context_swa_layer_limit"))
+            manager_extra_kwargs["bounded_replay_on_generation"] = (
+                _model_config.extra_attrs.get("bounded_replay_on_generation",
+                                              False))
         kv_cache_manager = kv_cache_manager_cls(
             kv_cache_config,
             tensorrt_llm.bindings.internal.batch_manager.CacheType.SELFKONLY,
             num_layers=num_hidden_layers,
             num_kv_heads=1,
-            head_dim=config.kv_lora_rank + config.qk_rope_head_dim,
+            head_dim=(getattr(config, "head_dim", 512)
+                      if sparse_attention_config is not None
+                      and sparse_attention_config.algorithm == "csa2" else
+                      config.kv_lora_rank + config.qk_rope_head_dim),
             tokens_per_block=tokens_per_block,
             max_seq_len=max_seq_len,
             max_batch_size=max_batch_size,
@@ -3988,7 +4264,8 @@ def create_py_executor_instance(
                 reorder_policy_config.policy_args.agent_inflight_seq_num)
         scheduler = SimpleScheduler(capacity_scheduler, mb_scheduler)
 
-    if getattr(model_engine, "mm_encoder_item_scheduling_enabled", False):
+    if (getattr(model_engine, "mm_encoder_item_scheduling_enabled", False)
+            and model_engine.mapping.is_first_pp_rank()):
         # Wrap the LLM scheduler with atomic MM item budgeting. ModelEngine
         # already validated model-capability-dependent feature combinations.
         multimodal_config = llm_args.multimodal_config
@@ -4001,13 +4278,19 @@ def create_py_executor_instance(
             logger.info("Eager multimodal encoder scheduling is enabled for "
                         "capacity-rejected active requests.")
             scheduler_cls = MultimodalEagerEncoderScheduler
+        encoder_cache = model_engine.mm_encoder_cache
+        if encoder_cache is None:
+            raise RuntimeError(
+                "MM encoder item scheduling requires its unified output cache")
         scheduler = scheduler_cls(
             scheduler,
             max_batch_size=model_engine.encoder_batch_size,
             max_num_tokens=model_engine.encoder_max_num_tokens,
-            output_budget_bytes=model_engine.mm_encoder_output_budget_bytes,
+            encoder_cache=encoder_cache,
+            get_item_cache_keys=model_engine.get_mm_encoder_item_cache_keys,
             bytes_per_encoder_embedding=(
                 model_engine.bytes_per_mm_encoder_embedding),
+            retain_cache_entries=model_engine.model.encoder_cache_active,
         )
 
     config = model_engine.model.model_config.pretrained_config
@@ -4137,8 +4420,14 @@ def instantiate_sampler(
         return get_spec_decoder(sampler_args, engine.spec_config)
 
     if mm_encoder_only:
-        # NOTE: handle model outputs specially for mm encoder executor/engine
-        return EarlyStopWithMMResult()
+        # NOTE: handle model outputs specially for mm encoder executor/engine.
+        # Only export results on ranks whose responses reach the frontend
+        # (see PyExecutor._enqueue_responses): rank 0, plus the attention-DP
+        # ranks gathered into it. A CUDA IPC handle exported on any other rank
+        # is never opened, so PyTorch would never release its allocation.
+        returns_responses = mapping.rank == 0 or (mapping.enable_attention_dp
+                                                  and 0 in mapping.tp_group)
+        return EarlyStopWithMMResult(return_mm_results=returns_responses)
     if not engine.model.model_config.is_generation:
         # NOTE: choose sampler based on model type
         return EarlyStopSampler()

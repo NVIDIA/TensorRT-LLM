@@ -17,6 +17,7 @@ while [[ $# -gt 0 ]]; do
         --build-wheel) build_wheel="$2"; shift 2 ;;
         --cuda-architectures) cuda_architectures="$2"; shift 2 ;;
         --trtllm-wheel-path) trtllm_wheel_path="$2"; shift 2 ;;
+        --mooncake-pool-file) mooncake_pool_file="$2"; shift 2 ;;
         *)
             echo "Unknown argument: $1"
             exit 1
@@ -39,6 +40,7 @@ echo "  container_image: ${container_image}"
 echo "  build_wheel: ${build_wheel}"
 echo "  cuda_architectures: ${cuda_architectures}"
 echo "  trtllm_wheel_path: ${trtllm_wheel_path}"
+echo "  mooncake_pool_file: ${mooncake_pool_file}"
 
 # Set TRTLLM_DISAGG_BENCHMARK_GEN_ONLY=1 for gen_only_no_context mode
 if [ "${benchmark_mode}" = "gen_only_no_context" ]; then
@@ -101,7 +103,7 @@ elif [ -d "${trtllm_repo}" ]; then
 
     if [ "${build_wheel}" = "true" ]; then
         echo "Building TensorRT-LLM wheel on one node..."
-        build_command="python3 ./scripts/build_wheel.py --trt_root /usr/local/tensorrt --use_ccache --clean"
+        build_command="python3 ./scripts/build_wheel.py --use_ccache --clean"
         if [ -n "${cuda_architectures:-}" ]; then
             build_command="${build_command} --cuda_architectures \"${cuda_architectures}\""
         fi
@@ -154,6 +156,33 @@ client_cmds_base_file=${full_logdir}/client_cmds_base.sh
 client_cmds_file=${full_logdir}/client_cmds.sh
 replace_placeholder "${client_cmds_base_file}" "${all_nodes_str}" "${client_cmds_file}"
 
+# One Mooncake master per job, up before any server opens a store handle.
+if [ -n "${mooncake_pool_file}" ]; then
+    # A stale manifest would send every worker to a master that is gone.
+    rm -f "${mooncake_pool_file}"
+
+    echo "Starting the Mooncake master..."
+    srun --container-name=${container_name} \
+        --container-mounts=${container_mount} --no-container-mount-home \
+        --overlap -N 1 -n 1 \
+        trtllm-serve mooncake_master --run_dir "${full_logdir}" \
+        &> ${full_logdir}/2_mooncake_master.log &
+    mooncake_master_pid=$!
+
+    # A pool that never came up reads as a workload with no reuse, so fail closed.
+    echo "Waiting for the pool manifest at ${mooncake_pool_file}..."
+    for _ in $(seq 1 900); do
+        [ -s "${mooncake_pool_file}" ] && break
+        kill -0 ${mooncake_master_pid} 2>/dev/null \
+            || cleanup_on_failure "The Mooncake master exited before publishing ${mooncake_pool_file}. Check ${full_logdir}/2_mooncake_master.log and ${full_logdir}/mooncake_master.log"
+        sleep 1
+    done
+    [ -s "${mooncake_pool_file}" ] \
+        || cleanup_on_failure "No Mooncake pool manifest at ${mooncake_pool_file}, so no worker could join the pool. Check ${full_logdir}/2_mooncake_master.log and ${full_logdir}/mooncake_master.log"
+    echo "Mooncake pool manifest published:"
+    cat "${mooncake_pool_file}"
+fi
+
 # Per-worker hostfile / gpu_map files for srun --distribution=arbitrary.
 # submit.py emits *_base.txt with <nodeN_placeholder>; rewrite them here.
 for base_file in "${full_logdir}"/hostfile_*_base.txt "${full_logdir}"/gpu_map_*_base.txt; do
@@ -185,6 +214,19 @@ while read -r cmd <&3; do
         cleanup_on_failure "Command failed: ${cmd}."
     fi
 done 3< "${client_cmds_file}"
+
+# Signalled before the scancel below so it withdraws the manifest it published.
+if [ -n "${mooncake_pool_file}" ]; then
+    echo "Stopping the Mooncake master..."
+    kill ${mooncake_master_pid} 2>/dev/null || true
+    for _ in $(seq 1 30); do
+        kill -0 ${mooncake_master_pid} 2>/dev/null || break
+        sleep 1
+    done
+    kill -0 ${mooncake_master_pid} 2>/dev/null \
+        && echo "The Mooncake master did not stop on its own; scancel will take it." \
+        || echo "Mooncake master stopped."
+fi
 
 echo "Job completed successfully, total runtime: $SECONDS seconds"
 

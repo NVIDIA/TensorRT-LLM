@@ -49,7 +49,8 @@ constexpr int kHistCopies = 16;
 //! How many survivors the shared gather buffer holds (8 KB). Past this the descent falls
 //! back to re-reading the row, so the cap is a performance knob, never a correctness one.
 constexpr int kCandCap = 2048;
-//! Guards 1/T for a zero temperature. Matches decodingCommon.cu's EPSILON for float.
+//! Stands in for a zero temperature in 1/T. A positive temperature is used as given, however
+//! small, so that it scales the logits exactly as dividing by it would.
 constexpr float kTempEpsilon = 1e-6f;
 //! Rejection rounds a tokens-only row may spend before it settles for the argmax. Each
 //! round drops the rejected candidate and everything at or below its weight, so the
@@ -128,11 +129,32 @@ struct RowParams
     bool needMinP;
 };
 
+//! Philox subsequences from here up hold per-row streams. A shared seed/offset makes the row
+//! index the subsequence, which never reaches them.
+constexpr uint64_t kPerRowSubsequenceBase = 1ull << 63;
+
+//! Seeds one row's Philox stream (see FusedSamplingParams::perRowRng).
+__device__ inline void initRowRng(FusedSamplingParams const& p, int row, curandStatePhilox4_32_10_t* state)
+{
+    int const rngIdx = p.perRowRng ? row : 0;
+    uint64_t const seed = p.seed != nullptr ? p.seed[rngIdx] : 0ull;
+    uint64_t const offset = p.offset != nullptr ? p.offset[rngIdx] : 0ull;
+    if (p.perRowRng)
+    {
+        curand_init(seed, kPerRowSubsequenceBase | offset, 0ull, state);
+    }
+    else
+    {
+        curand_init(seed, static_cast<uint64_t>(row), offset, state);
+    }
+}
+
 __device__ inline RowParams loadRowParams(FusedSamplingParams const& p, int row)
 {
     RowParams r;
     float const temperature = p.temperatures != nullptr ? p.temperatures[row] : 1.0f;
-    r.tempInv = 1.0f / (temperature + kTempEpsilon);
+    // In-tree callers pass T > 0: a zero temperature is sampled greedily before it gets here.
+    r.tempInv = temperature > 0.0f ? 1.0f / temperature : 1.0f / kTempEpsilon;
 
     // min_p is a fraction of the row maximum, so a value above 1 keeps nothing: keptMass
     // would be 0 and the renormalized row would come back all-inf instead of raising.
@@ -772,10 +794,7 @@ __device__ void fusedSamplingBody(FusedSamplingParams const& params, FusedSampli
 
             if (tid == 0)
             {
-                int const rngIdx = params.perRowRng ? row : 0;
-                uint64_t const seed = params.seed != nullptr ? params.seed[rngIdx] : 0ull;
-                uint64_t const offset = params.offset != nullptr ? params.offset[rngIdx] : 0ull;
-                curand_init(seed, static_cast<uint64_t>(row), offset, &sRejectRng);
+                initRowRng(params, row, &sRejectRng);
                 // -1 admits every weight: w is an exp, so it is never negative.
                 sPivot = -1.0f;
                 sToken = -1;
@@ -1092,13 +1111,8 @@ __device__ void fusedSamplingBody(FusedSamplingParams const& params, FusedSampli
     {
         if (tid == 0)
         {
-            int const rngIdx = params.perRowRng ? row : 0;
-            uint64_t const seed = params.seed != nullptr ? params.seed[rngIdx] : 0ull;
-            uint64_t const offset = params.offset != nullptr ? params.offset[rngIdx] : 0ull;
             curandStatePhilox4_32_10_t state;
-            // The row index is the subsequence, so rows draw independent streams from a
-            // shared seed -- and a seeded request stays reproducible via its own offset.
-            curand_init(seed, static_cast<uint64_t>(row), offset, &state);
+            initRowRng(params, row, &state);
             sTarget = curand_uniform(&state) * keptMass;
             sToken = -1;
         }

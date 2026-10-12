@@ -22,6 +22,7 @@ from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph_runner import (
     BreakableCUDAGraphRunner,
     BreakableCUDAGraphRunnerState,
 )
+from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import DecoderRunner
 from tensorrt_llm._torch.pyexecutor.engine.runners.interface import ScheduledInputs
 from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
@@ -265,14 +266,14 @@ def test_runner_warmup_capture_execute_and_shared_output(through_model_engine):
             assert is_dummy
             return model_forward()
 
+        decoder_runner = object.__new__(DecoderRunner)
+        decoder_runner._forward_decoder = decoder_forward
+        decoder_runner.model = SimpleNamespace(extra_attrs={})
         engine = object.__new__(PyTorchModelEngine)
-        engine.model = SimpleNamespace(extra_attrs={})
-        engine._runner = None
-        engine._fallback_to_engine = True
+        engine._runner = decoder_runner
         engine._is_warmup = True
         engine.enable_spec_decode = False
         engine.runtime_draft_len = 0
-        engine._forward_decoder = decoder_forward
 
     def engine_forward():
         if through_model_engine:

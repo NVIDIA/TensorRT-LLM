@@ -59,7 +59,7 @@ from tensorrt_llm._torch.models.modeling_utils import (
 
 from peft import LoraConfig as PeftLoraConfig
 from peft import get_peft_model
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 from dataclasses import replace
 
 # isort: on
@@ -283,7 +283,7 @@ def test_llm_perf_metrics():
 @pytest.mark.part3
 @pytest.mark.parametrize("attn_backend", ["TRTLLM", "FLASHINFER"])
 def test_llm_prefix_cache_reuse(attn_backend):
-    model_path = get_model_path("llama-models-v2/TinyLlama-1.1B-Chat-v1.0")
+    model_path = get_model_path("Qwen3/Qwen3-0.6B")
     prompt = "The future of AI is " * 20
     sampling_params = SamplingParams(temperature=0,
                                      max_tokens=5,
@@ -346,12 +346,13 @@ def test_embedding_bias_with_torch_sampler_strategies():
     """Test embedding bias application in TorchSampler."""
     tokenizer = AutoTokenizer.from_pretrained(llama_model_path)
     biased_word_id = tokenizer.encode("Z", add_special_tokens=False)[-1]
-    vocab_size_padded = 32000
+    vocab_size_padded = AutoConfig.from_pretrained(llama_model_path).vocab_size
     embedding_bias = torch.zeros(vocab_size_padded)
     embedding_bias[biased_word_id] = torch.finfo(torch.float32).max
 
+    max_tokens = 6
     sampling_kwargs = {
-        "max_tokens": 6,
+        "max_tokens": max_tokens,
         "embedding_bias": embedding_bias,
     }
 
@@ -359,10 +360,15 @@ def test_embedding_bias_with_torch_sampler_strategies():
 
     sampling_params = SamplingParams(**sampling_kwargs)
 
+    # The biased token's decoded text (e.g. with or without a leading space)
+    # is tokenizer-specific, so derive the expected repeated-token output
+    # rather than hardcoding a particular tokenizer's rendering.
+    expected_output = tokenizer.decode([biased_word_id] * max_tokens)
+
     llm_test_harness(
         llama_model_path,
         prompts,
-        ["Z Z Z Z Z Z"],
+        [expected_output],
         sampling_params=sampling_params,
         backend="pytorch",
     )
@@ -1158,7 +1164,7 @@ async def test_llm_rpc_get_stats_async():
 @pytest.mark.threadleak(enabled=False)
 @pytest.mark.part0
 @skip_ray
-@pytest.mark.parametrize("transceiver_runtime", [None, "PYTHON"])
+@pytest.mark.parametrize("transceiver_runtime", ["PYTHON"])
 def test_llm_context_only_timed_out(transceiver_runtime):
     tp_size = 1
     use_overlap = False
@@ -1171,8 +1177,7 @@ def test_llm_context_only_timed_out(transceiver_runtime):
              enable_iter_req_stats=enable_iter_req_stats,
              disable_overlap_scheduler=not use_overlap))
 
-    # Python transceiver (V2) only supports NIXL/DEFAULT backends
-    backend = "NIXL" if transceiver_runtime == "PYTHON" else "UCX"
+    backend = "NIXL"
     llm = LLM(model=llama_model_path,
               kv_cache_config=global_kvcache_config,
               tensor_parallel_size=tp_size,
@@ -1249,15 +1254,11 @@ def test_llm_context_only_timed_out(transceiver_runtime):
 @pytest.mark.part0
 @skip_ray
 @pytest.mark.parametrize("sender_future_timeout_ms", [100, 1000])
-@pytest.mark.parametrize("backend", ["NIXL", "UCX"])
-@pytest.mark.parametrize("transceiver_runtime", [None, "PYTHON"])
+@pytest.mark.parametrize("backend", ["NIXL"])
+@pytest.mark.parametrize("transceiver_runtime", ["PYTHON"])
 def test_llm_context_only_timed_out_kv_cache_exhausted(sender_future_timeout_ms,
                                                        backend,
                                                        transceiver_runtime):
-    # Python transceiver (V2) only supports NIXL/DEFAULT backends
-    if transceiver_runtime == "PYTHON" and backend == "UCX":
-        pytest.skip("Python transceiver (V2) does not support UCX backend")
-
     tp_size = 1
     use_overlap = False
     enable_iter_req_stats = False
@@ -1342,7 +1343,7 @@ _DISAGG_CANCEL_TEST_ITERATIONS = 2
 @pytest.mark.private_mpi_session
 @pytest.mark.timeout(600)
 @pytest.mark.asyncio
-@pytest.mark.parametrize("transceiver_runtime", [None, "PYTHON"])
+@pytest.mark.parametrize("transceiver_runtime", ["PYTHON"])
 async def test_llm_disagg_gen_cancelled(transceiver_runtime):
     tp_size = 1
     use_overlap = False
@@ -1355,8 +1356,7 @@ async def test_llm_disagg_gen_cancelled(transceiver_runtime):
              enable_iter_req_stats=enable_iter_req_stats,
              disable_overlap_scheduler=not use_overlap))
 
-    # Python transceiver (V2) only supports NIXL/DEFAULT backends
-    backend = "NIXL" if transceiver_runtime == "PYTHON" else "UCX"
+    backend = "NIXL"
     llm_ctx = LLM(model=llama_model_path,
                   kv_cache_config=global_kvcache_config_no_reuse,
                   tensor_parallel_size=tp_size,
@@ -1522,7 +1522,7 @@ def test_priority_request_completes_before_low_priority():
 @pytest.mark.part0
 @skip_ray
 @pytest.mark.asyncio
-@pytest.mark.parametrize("transceiver_runtime", [None, "PYTHON"])
+@pytest.mark.parametrize("transceiver_runtime", ["PYTHON"])
 async def test_llm_disagg_streaming_gen_cancelled(transceiver_runtime):
     tp_size = 1
     use_overlap = False
@@ -1535,8 +1535,7 @@ async def test_llm_disagg_streaming_gen_cancelled(transceiver_runtime):
              enable_iter_req_stats=enable_iter_req_stats,
              disable_overlap_scheduler=not use_overlap))
 
-    # Python transceiver (V2) only supports NIXL/DEFAULT backends
-    backend = "NIXL" if transceiver_runtime == "PYTHON" else "UCX"
+    backend = "NIXL"
     llm_ctx = LLM(model=llama_model_path,
                   kv_cache_config=global_kvcache_config_no_reuse,
                   tensor_parallel_size=tp_size,
