@@ -1750,7 +1750,7 @@ def test_generation_dummy_uses_available_capacity(draft_len: int) -> None:
     )
     try:
         requests = DummyRequestFactory(
-            SimpleNamespace(
+            config=SimpleNamespace(
                 spec_config=spec_config,
                 max_draft_len=draft_len,
                 max_draft_loop_tokens=draft_len,
@@ -1758,14 +1758,11 @@ def test_generation_dummy_uses_available_capacity(draft_len: int) -> None:
                 max_beam_width=1,
                 use_mrope=False,
             ),
-            ResourceManagerType.KV_CACHE_MANAGER,
-            lambda length: length + 1,
-            None,
-            request_kwargs=lambda resource_manager, num_requests: {},
-            position_limit=lambda: None,
-            add_resources=lambda requests, resource_manager: True,
-            free_resources=lambda requests, resource_manager: None,
-            get_draft_kv_cache_manager=lambda _: None,
+            kv_cache_manager_key=ResourceManagerType.KV_CACHE_MANAGER,
+            model=SimpleNamespace(
+                model_config=SimpleNamespace(pretrained_config=SimpleNamespace())
+            ),
+            get_runtime_tokens_per_gen_step=lambda length: length + 1,
             release_request_state=None,
         )
         resources = ResourceManager({ResourceManagerType.KV_CACHE_MANAGER: manager})

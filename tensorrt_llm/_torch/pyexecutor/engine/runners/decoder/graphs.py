@@ -8,7 +8,7 @@ import functools
 import os
 from collections.abc import Callable
 from contextlib import contextmanager
-from typing import Any
+from typing import Any, Protocol
 
 import torch
 
@@ -50,10 +50,10 @@ from tensorrt_llm.mapping import Mapping
 
 from ...lora import LoraParamBuilder
 from ..common import get_top_level_model, prepare_multimodal_indices
+from .agreement import WarmupAgreement
 from .config import DecoderRunnerConfig
 from .dummy_requests import DummyRequestFactory
 from .metadata import DecoderMetadata
-from .warmup import WarmupAgreement
 
 
 def _make_single_token_context_graph_batch(
@@ -147,11 +147,30 @@ def compute_dynamic_draft_len_mapping(config: DecoderRunnerConfig) -> dict[int, 
     return mapping
 
 
+class ForwardWarmup(Protocol):
+    """Run one dummy scheduled pass through the runner's forward."""
+
+    def __call__(
+        self,
+        batch: ScheduledRequests,
+        resource_manager: ResourceManager,
+        *,
+        enable_spec_decode: bool,
+        runtime_draft_len: int,
+    ) -> Any: ...
+
+
 class DecoderCudaGraphs:
-    """Owns the decoder's CUDA graph runners and captures their graphs."""
+    """Owns the decoder's CUDA graph runners and captures their graphs.
+
+    A model family that prepares capture batches differently, or captures
+    shapes beyond the generation ones, overrides ``_prepare_capture_batch``
+    and ``_capture_additional_cuda_graphs``.
+    """
 
     def __init__(
         self,
+        *,
         cuda_graph_runner: CUDAGraphRunner | None,
         breakable_cuda_graph_runner: BreakableCUDAGraphRunner | None,
         config: DecoderRunnerConfig,
@@ -166,10 +185,7 @@ class DecoderCudaGraphs:
         get_runtime_tokens_per_gen_step: Callable[[int], int],
         dynamic_draft_len_mapping: dict[int, int] | None,
         lora: LoraParamBuilder,
-        *,
-        forward_warmup: Callable[..., Any],
-        prepare_capture_batch: Callable[..., Any],
-        capture_additional_graphs: Callable[[ResourceManager], None],
+        forward_warmup: ForwardWarmup,
         context_promotion_supported: bool,
     ) -> None:
         self.cuda_graph_runner = cuda_graph_runner
@@ -187,8 +203,6 @@ class DecoderCudaGraphs:
         self._dynamic_draft_len_mapping = dynamic_draft_len_mapping
         self._lora = lora
         self._forward_warmup = forward_warmup
-        self._prepare_capture_batch = prepare_capture_batch
-        self._capture_additional_cuda_graphs = capture_additional_graphs
         # Promoted context rows carry no per-sequence extra model inputs.
         self._context_promotion_supported = context_promotion_supported
         self._force_lora_graph_for_capture: bool | None = None
@@ -197,8 +211,18 @@ class DecoderCudaGraphs:
     def force_lora_graph_for_capture(self) -> bool | None:
         return self._force_lora_graph_for_capture
 
-    def set_lora(self, lora: LoraParamBuilder) -> None:
-        self._lora = lora
+    def _prepare_capture_batch(
+        self,
+        batch: ScheduledRequests,
+        resource_manager: ResourceManager,
+        *,
+        enable_spec_decode: bool,
+        runtime_draft_len: int,
+    ) -> None:
+        """Prepare a dummy batch's request state before its graph is captured."""
+
+    def _capture_additional_cuda_graphs(self, resource_manager: ResourceManager) -> None:
+        """Capture graphs beyond the generation-only shapes; none by default."""
 
     @contextlib.contextmanager
     def no_cuda_graph(self):

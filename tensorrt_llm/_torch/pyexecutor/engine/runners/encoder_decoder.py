@@ -5,7 +5,6 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
 from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from typing import Any
@@ -22,10 +21,8 @@ from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import MoeLoadBalancer
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import (
     ENC_DEC_CUDA_GRAPH_DUMMY_TOKEN_NUM,
-    CUDAGraphRunner,
     CUDAGraphRunnerConfig,
 )
-from tensorrt_llm._torch.pyexecutor.guided_decoder import CapturableGuidedDecoder
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
@@ -34,6 +31,7 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import (
     ResourceManagerType,
 )
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
+from tensorrt_llm._torch.speculative import get_draft_kv_cache_manager
 from tensorrt_llm._utils import nvtx_range, prefer_pinned
 from tensorrt_llm.bindings.internal import batch_manager as batch_manager_bindings
 from tensorrt_llm.inputs.registry import BaseMultimodalInputProcessor, InputProcessor
@@ -42,12 +40,12 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
 from ..cuda_graph import resolve_cuda_graph_batch_sizes
+from ..multimodal import MultimodalItemScheduler
 from .common import apply_position_id_offset, get_position_id_offset, get_top_level_model
 from .decoder import DecoderRunner, DecoderRunnerConfig, ExtraInputsCollector
 from .decoder.dummy_requests import DummyRequestFactory
 from .decoder.graphs import DecoderCudaGraphs
-from .decoder.inputs import DecoderInputBuffers, DecoderInputPreparer
-from .decoder.metadata import DecoderMetadata
+from .decoder.inputs import DecoderInputPreparer
 from .encoder import EncoderConfigMixin, EncoderMixin, EncoderPreparedInputs
 from .interface import PreparedInputs, RunnerConfig, ScheduledInputs
 
@@ -504,29 +502,17 @@ class CrossAttentionInputs(ExtraInputsCollector):
         )
 
 
-class EncoderDecoderInputPreparer:
-    """Prepares cross-attention inputs, and whole simple batches on the native fast path."""
+class EncoderDecoderInputPreparer(DecoderInputPreparer):
+    """Adds cross-attention inputs, and prepares whole simple batches on the native fast path."""
 
     def __init__(
         self,
-        config: EncoderDecoderRunnerConfig,
-        mapping: Mapping,
-        model: nn.Module,
-        sparse_attention_config: BaseSparseAttentionConfig | None,
-        inputs: DecoderInputPreparer,
-        buffers: DecoderInputBuffers,
-        iter_states: dict[str, Any],
         *,
-        uses_lora: Callable[[], bool],
+        sparse_attention_config: BaseSparseAttentionConfig | None,
+        **decoder_inputs: Any,
     ) -> None:
-        self._config = config
-        self.mapping = mapping
-        self.model = model
+        super().__init__(**decoder_inputs)
         self.sparse_attention_config = sparse_attention_config
-        self._inputs = inputs
-        self._buffers = buffers
-        self.iter_states = iter_states
-        self._uses_lora = uses_lora
         self._host_buffer_pool: list[dict[str, Any]] = []
         self._fast_path_static_eligible: bool | None = None
         self._position_id_offset: int | None = None
@@ -537,11 +523,10 @@ class EncoderDecoderInputPreparer:
         self._cross_attn_stable_cached_tokens: list[int] | None = None
         self._cross_attn_stable_request_ids: list[int] | None = None
 
-    @property
-    def guided_decoder(self) -> CapturableGuidedDecoder | None:
-        return self._inputs.guided_decoder
+    def _new_extra_inputs(self) -> CrossAttentionInputs:
+        return CrossAttentionInputs(self)
 
-    def prepare_fast_path(
+    def _prepare_inputs_fast_path(
         self,
         scheduled_requests: ScheduledRequests,
         kv_cache_manager: KVCacheManager | KVCacheManagerV2,
@@ -730,7 +715,7 @@ class EncoderDecoderInputPreparer:
         if (
             not static_eligible
             or enable_spec_decode
-            or self._uses_lora()
+            or self._lora.model_config is not None
             or new_tokens_device is None
             or next_draft_tokens_device is not None
             or self.guided_decoder is not None
@@ -914,18 +899,18 @@ class EncoderDecoderInputPreparer:
             max_encoder_kv_len=max_encoder_kv_len,
         )
 
-        virtual_num_tokens = self._inputs.pad_tokens(
+        virtual_num_tokens = self.pad_tokens(
             attn_metadata, total_num_tokens, scheduled_requests.num_context_requests
         )
-        inputs = self._inputs.model_inputs(attn_metadata, resource_manager, virtual_num_tokens, [])
+        inputs = self.model_inputs(attn_metadata, resource_manager, virtual_num_tokens, [])
         inputs.update(cross_attention_inputs)
 
         self.iter_states["num_ctx_requests"] = scheduled_requests.num_context_requests
         self.iter_states["num_ctx_tokens"] = num_context_tokens
         self.iter_states["num_generation_tokens"] = num_generation_requests
         self.iter_states["cached_kv_tokens"] = cached_kv_tokens
-        if self._inputs.log_cached_kv_tokens_per_req:
-            self._inputs.record_cached_kv_tokens_per_req(
+        if self.log_cached_kv_tokens_per_req:
+            self.record_cached_kv_tokens_per_req(
                 buffers["cached_token_lengths"][:num_sequences].tolist(),
                 (
                     (scheduled_requests.context_requests, 1),
@@ -939,7 +924,7 @@ class EncoderDecoderInputPreparer:
         return PreparedInputs(inputs)
 
 
-class EncoderDecoderCudaGraphs:
+class EncoderDecoderCudaGraphs(DecoderCudaGraphs):
     """Prepares and captures the encoder-decoder CUDA graphs.
 
     Fills the cross-KV cache of dummy generation requests before their graphs
@@ -949,38 +934,18 @@ class EncoderDecoderCudaGraphs:
 
     def __init__(
         self,
-        config: EncoderDecoderRunnerConfig,
-        model: nn.Module,
-        input_processor: InputProcessor | BaseMultimodalInputProcessor,
-        kv_cache_manager_key: ResourceManagerType,
-        encoder_graph_shapes: frozenset[tuple[int, int]],
-        metadata: DecoderMetadata,
-        dummy_requests: DummyRequestFactory,
-        graphs: DecoderCudaGraphs,
-        inputs: DecoderInputPreparer,
         *,
-        forward_warmup: Callable[..., Any],
-        get_draft_kv_cache_manager: Callable[
-            [ResourceManager], KVCacheManager | KVCacheManagerV2 | None
-        ],
+        input_processor: InputProcessor | BaseMultimodalInputProcessor,
+        encoder_graph_shapes: frozenset[tuple[int, int]],
+        inputs: DecoderInputPreparer,
+        **decoder_graphs: Any,
     ) -> None:
-        self._config = config
-        self.model = model
+        super().__init__(**decoder_graphs)
         self.input_processor = input_processor
-        self.kv_cache_manager_key = kv_cache_manager_key
         self._encoder_graph_shapes = encoder_graph_shapes
-        self._metadata = metadata
-        self._dummy_requests = dummy_requests
-        self._graphs = graphs
         self._inputs = inputs
-        self._forward_warmup = forward_warmup
-        self._get_draft_kv_cache_manager = get_draft_kv_cache_manager
 
-    @property
-    def cuda_graph_runner(self) -> CUDAGraphRunner | None:
-        return self._graphs.cuda_graph_runner
-
-    def prepare_capture_batch(
+    def _prepare_capture_batch(
         self,
         batch: ScheduledRequests,
         resource_manager: ResourceManager,
@@ -1026,9 +991,11 @@ class EncoderDecoderCudaGraphs:
         projection_batch = ScheduledRequests()
         projection_batch.reset_context_requests(batch.generation_requests)
         kv_cache_manager = resource_manager.get_resource_manager(self.kv_cache_manager_key)
-        draft_kv_cache_manager = self._get_draft_kv_cache_manager(resource_manager)
+        draft_kv_cache_manager = get_draft_kv_cache_manager(
+            self._config.spec_config, resource_manager
+        )
         attn_metadata = self._metadata.setup_attention(kv_cache_manager, draft_kv_cache_manager)
-        with self._graphs.no_cuda_graph():
+        with self.no_cuda_graph():
             projection_inputs = self._inputs.prepare_inputs(
                 projection_batch,
                 kv_cache_manager,
@@ -1062,7 +1029,7 @@ class EncoderDecoderCudaGraphs:
             request._cached_tokens = cached_tokens
             request._cached_tokens_set = cached_tokens_set
 
-    def capture_mixed_graphs(self, resource_manager: ResourceManager) -> None:
+    def _capture_additional_cuda_graphs(self, resource_manager: ResourceManager) -> None:
         """Warm and capture reachable mixed encoder-decoder graph shapes.
 
         The first global CUDA-graph pass warms every shape so shared attention
@@ -1239,6 +1206,74 @@ class EncoderDecoderCudaGraphs:
         return int(hidden_size)
 
 
+class EncoderDecoderDummyRequests(DummyRequestFactory):
+    """Builds dummy requests that also hold cross-KV cache blocks."""
+
+    _dummy_request_tokens = ENC_DEC_CUDA_GRAPH_DUMMY_TOKEN_NUM
+
+    def _dummy_request_kwargs(
+        self, resource_manager: ResourceManager, num_requests: int
+    ) -> dict[str, Any]:
+        return {
+            "encoder_output_lens": [_get_max_encoder_output_len(self._config, resource_manager)]
+            * num_requests
+        }
+
+    def _dummy_position_limit(self) -> int | None:
+        # For enc-dec models the engine max_seq_len covers the encoder
+        # sequence, which may exceed the decoder's position table (e.g.
+        # Whisper: 1500 encoder positions vs max_target_positions=448).
+        max_position_embeddings = super()._dummy_position_limit()
+        model_config = self.model.model_config.pretrained_config
+        decoder_position_limit = getattr(model_config, "max_target_positions", None)
+        if decoder_position_limit is None:
+            return max_position_embeddings
+        return (
+            decoder_position_limit
+            if max_position_embeddings is None
+            else min(max_position_embeddings, decoder_position_limit)
+        )
+
+    def _add_dummy_request_resources(
+        self, requests: list[LlmRequest], resource_manager: ResourceManager
+    ) -> bool:
+        if not requests:
+            return True
+        cross_kv_cache_manager = resource_manager.get_resource_manager(
+            ResourceManagerType.CROSS_KV_CACHE_MANAGER
+        )
+        if cross_kv_cache_manager is None:
+            raise RuntimeError(
+                "Encoder-decoder CUDA graph warmup requires "
+                "ResourceManagerType.CROSS_KV_CACHE_MANAGER."
+            )
+
+        max_encoder_output_len = _get_max_encoder_output_len(self._config, resource_manager)
+        for request in requests:
+            request.py_encoder_output = None
+            request.py_skip_cross_kv_projection = True
+
+        encoder_output_lens = [max_encoder_output_len] * len(requests)
+        cross_dummy_requests = cross_kv_cache_manager.add_dummy_requests(
+            request_ids=[request.py_request_id for request in requests],
+            token_nums=encoder_output_lens,
+            is_gen=True,
+            max_beam_width=1,
+            encoder_output_lens=encoder_output_lens,
+        )
+        return cross_dummy_requests is not None
+
+    def _free_dummy_request_resources(
+        self, requests: list[LlmRequest], resource_manager: ResourceManager
+    ) -> None:
+        cross_kv_cache_manager = resource_manager.get_resource_manager(
+            ResourceManagerType.CROSS_KV_CACHE_MANAGER
+        )
+        if cross_kv_cache_manager is not None:
+            for req in requests:
+                cross_kv_cache_manager.free_resources(req)
+
+
 def _get_max_encoder_output_len(
     config: DecoderRunnerConfig, resource_manager: ResourceManager
 ) -> int:
@@ -1263,7 +1298,6 @@ class EncoderDecoderRunner(DecoderRunner):
     _steady_gen_cache_supported = False
     _eager_workspace_reclaim_supported = False
     _deferred_decode_outputs_supported = False
-    _dummy_request_tokens = ENC_DEC_CUDA_GRAPH_DUMMY_TOKEN_NUM
 
     def __init__(
         self,
@@ -1293,29 +1327,6 @@ class EncoderDecoderRunner(DecoderRunner):
             dist=dist,
             moe_load_balancer=moe_load_balancer,
             **decoder_services,
-        )
-        self._encoder_decoder_inputs = EncoderDecoderInputPreparer(
-            self._config,
-            mapping,
-            model,
-            self.sparse_attention_config,
-            self._inputs,
-            self._buffers,
-            self.iter_states,
-            uses_lora=lambda: self.lora_model_config is not None,
-        )
-        self._encoder_decoder_graphs = EncoderDecoderCudaGraphs(
-            self._config,
-            model,
-            self.input_processor,
-            self.kv_cache_manager_key,
-            self._encoder_graph_shapes,
-            self._metadata,
-            self._dummy_requests,
-            self._graphs,
-            self._inputs,
-            forward_warmup=self._forward_warmup,
-            get_draft_kv_cache_manager=self._get_draft_kv_cache_manager,
         )
 
     def forward_encoder(
@@ -1357,113 +1368,21 @@ class EncoderDecoderRunner(DecoderRunner):
             ),
         )
 
-    def _capture_additional_cuda_graphs(self, resource_manager: ResourceManager) -> None:
-        self._encoder_decoder_graphs.capture_mixed_graphs(resource_manager)
+    def _make_dummy_requests(self) -> EncoderDecoderDummyRequests:
+        return EncoderDecoderDummyRequests(**self._dummy_requests_kwargs())
 
-    def _prepare_capture_batch(
-        self,
-        batch: ScheduledRequests,
-        resource_manager: ResourceManager,
-        *,
-        enable_spec_decode: bool,
-        runtime_draft_len: int,
-    ) -> None:
-        self._encoder_decoder_graphs.prepare_capture_batch(
-            batch,
-            resource_manager,
-            enable_spec_decode=enable_spec_decode,
-            runtime_draft_len=runtime_draft_len,
+    def _make_input_preparer(
+        self, mm_item_scheduler: MultimodalItemScheduler | None
+    ) -> EncoderDecoderInputPreparer:
+        return EncoderDecoderInputPreparer(
+            **self._input_preparer_kwargs(mm_item_scheduler),
+            sparse_attention_config=self.sparse_attention_config,
         )
 
-    def _free_dummy_request_resources(
-        self, requests: list[LlmRequest], resource_manager: ResourceManager
-    ) -> None:
-        cross_kv_cache_manager = resource_manager.get_resource_manager(
-            ResourceManagerType.CROSS_KV_CACHE_MANAGER
+    def _make_cuda_graphs(self) -> EncoderDecoderCudaGraphs:
+        return EncoderDecoderCudaGraphs(
+            **self._cuda_graphs_kwargs(),
+            input_processor=self.input_processor,
+            encoder_graph_shapes=self._encoder_graph_shapes,
+            inputs=self._inputs,
         )
-        if cross_kv_cache_manager is not None:
-            for req in requests:
-                cross_kv_cache_manager.free_resources(req)
-
-    def _dummy_request_kwargs(
-        self, resource_manager: ResourceManager, num_requests: int
-    ) -> dict[str, Any]:
-        return {
-            "encoder_output_lens": [_get_max_encoder_output_len(self._config, resource_manager)]
-            * num_requests
-        }
-
-    def _dummy_position_limit(self) -> int | None:
-        # For enc-dec models the engine max_seq_len covers the encoder
-        # sequence, which may exceed the decoder's position table (e.g.
-        # Whisper: 1500 encoder positions vs max_target_positions=448).
-        max_position_embeddings = super()._dummy_position_limit()
-        model_config = self.model.model_config.pretrained_config
-        decoder_position_limit = getattr(model_config, "max_target_positions", None)
-        if decoder_position_limit is None:
-            return max_position_embeddings
-        return (
-            decoder_position_limit
-            if max_position_embeddings is None
-            else min(max_position_embeddings, decoder_position_limit)
-        )
-
-    def _add_dummy_request_resources(
-        self, requests: list[LlmRequest], resource_manager: ResourceManager
-    ) -> bool:
-        return self._add_cross_dummy_requests(requests, resource_manager)
-
-    def _prepare_inputs_fast_path(
-        self,
-        scheduled_requests: ScheduledRequests,
-        kv_cache_manager: KVCacheManager | KVCacheManagerV2,
-        attn_metadata: AttentionMetadata,
-        new_tokens_device: torch.Tensor | None,
-        next_draft_tokens_device: torch.Tensor | None,
-        resource_manager: ResourceManager | None,
-        *,
-        promoted_context_request_ids: frozenset[int],
-        enable_spec_decode: bool,
-    ) -> PreparedInputs | None:
-        return self._encoder_decoder_inputs.prepare_fast_path(
-            scheduled_requests,
-            kv_cache_manager,
-            attn_metadata,
-            new_tokens_device,
-            next_draft_tokens_device,
-            resource_manager,
-            promoted_context_request_ids=promoted_context_request_ids,
-            enable_spec_decode=enable_spec_decode,
-        )
-
-    def _new_extra_inputs(self) -> CrossAttentionInputs:
-        return CrossAttentionInputs(self._encoder_decoder_inputs)
-
-    def _add_cross_dummy_requests(
-        self, requests: list[LlmRequest], resource_manager: ResourceManager
-    ) -> bool:
-        if not requests:
-            return True
-        cross_kv_cache_manager = resource_manager.get_resource_manager(
-            ResourceManagerType.CROSS_KV_CACHE_MANAGER
-        )
-        if cross_kv_cache_manager is None:
-            raise RuntimeError(
-                "Encoder-decoder CUDA graph warmup requires "
-                "ResourceManagerType.CROSS_KV_CACHE_MANAGER."
-            )
-
-        max_encoder_output_len = _get_max_encoder_output_len(self._config, resource_manager)
-        for request in requests:
-            request.py_encoder_output = None
-            request.py_skip_cross_kv_projection = True
-
-        encoder_output_lens = [max_encoder_output_len] * len(requests)
-        cross_dummy_requests = cross_kv_cache_manager.add_dummy_requests(
-            request_ids=[request.py_request_id for request in requests],
-            token_nums=encoder_output_lens,
-            is_gen=True,
-            max_beam_width=1,
-            encoder_output_lens=encoder_output_lens,
-        )
-        return cross_dummy_requests is not None

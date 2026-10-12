@@ -8,7 +8,8 @@ import math
 from collections.abc import Callable, Iterator, Sequence
 from typing import Any
 
-from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+import torch
+
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
     KVCacheManager,
@@ -16,7 +17,7 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import (
     ResourceManagerType,
 )
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
-from tensorrt_llm._torch.speculative import get_num_extra_kv_tokens
+from tensorrt_llm._torch.speculative import get_draft_kv_cache_manager, get_num_extra_kv_tokens
 from tensorrt_llm._torch.speculative.utils import get_static_draft_len, resolve_draft_len
 from tensorrt_llm.logger import logger
 from tensorrt_llm.sampling_params import SamplingParams
@@ -31,34 +32,52 @@ NON_GREEDY_CAPTURE_SAMPLING_PARAMS = SamplingParams(
 
 
 class DummyRequestFactory:
-    """Builds the dummy batches that warmup and CUDA graph capture run."""
+    """Builds the dummy batches that warmup and CUDA graph capture run.
+
+    A model family whose dummy requests need more than the KV caches
+    overrides the ``_dummy_*`` methods.
+    """
+
+    # Prompt tokens of the filler CUDA graph dummy requests, also the floor of
+    # the longest one; None keeps the cache manager's default.
+    _dummy_request_tokens: int | None = None
 
     def __init__(
         self,
+        *,
         config: DecoderRunnerConfig,
         kv_cache_manager_key: ResourceManagerType,
+        model: torch.nn.Module,
         get_runtime_tokens_per_gen_step: Callable[[int], int],
-        dummy_request_tokens: int | None,
-        *,
-        request_kwargs: Callable[[ResourceManager, int], dict[str, Any]],
-        position_limit: Callable[[], int | None],
-        add_resources: Callable[[list[LlmRequest], ResourceManager], bool],
-        free_resources: Callable[[list[LlmRequest], ResourceManager], None],
-        get_draft_kv_cache_manager: Callable[
-            [ResourceManager], KVCacheManager | KVCacheManagerV2 | None
-        ],
         release_request_state: Callable[[int], None] | None,
     ) -> None:
         self._config = config
         self.kv_cache_manager_key = kv_cache_manager_key
+        self.model = model
         self.get_runtime_tokens_per_gen_step = get_runtime_tokens_per_gen_step
-        self._dummy_request_tokens = dummy_request_tokens
-        self._dummy_request_kwargs = request_kwargs
-        self._dummy_position_limit = position_limit
-        self._add_dummy_request_resources = add_resources
-        self._free_dummy_request_resources = free_resources
-        self._get_draft_kv_cache_manager = get_draft_kv_cache_manager
         self._release_request_state = release_request_state
+
+    def _dummy_request_kwargs(
+        self, resource_manager: ResourceManager, num_requests: int
+    ) -> dict[str, Any]:
+        """Extra ``add_dummy_requests`` arguments for ``num_requests`` dummy requests."""
+        return {}
+
+    def _dummy_position_limit(self) -> int | None:
+        """Return the largest position a dummy request may reach."""
+        model_config = self.model.model_config.pretrained_config
+        return getattr(model_config, "max_position_embeddings", None)
+
+    def _add_dummy_request_resources(
+        self, requests: list[LlmRequest], resource_manager: ResourceManager
+    ) -> bool:
+        """Allocate resources dummy requests need beyond the KV caches."""
+        return True
+
+    def _free_dummy_request_resources(
+        self, requests: list[LlmRequest], resource_manager: ResourceManager
+    ) -> None:
+        """Free what ``_add_dummy_request_resources`` allocated."""
 
     @staticmethod
     def _apply_chunk_alignment(
@@ -99,7 +118,9 @@ class DummyRequestFactory:
         safe over-estimate.
         """
         kv_cache_manager = resource_manager.get_resource_manager(self.kv_cache_manager_key)
-        draft_kv_cache_manager = self._get_draft_kv_cache_manager(resource_manager)
+        draft_kv_cache_manager = get_draft_kv_cache_manager(
+            self._config.spec_config, resource_manager
+        )
 
         spec_resource_manager = resource_manager.get_resource_manager(
             ResourceManagerType.SPEC_RESOURCE_MANAGER
@@ -279,7 +300,9 @@ class DummyRequestFactory:
         kv_cache_manager = resource_manager.get_resource_manager(self.kv_cache_manager_key)
         if getattr(kv_cache_manager, "context_swa_layer_limit", None) is not None:
             return None
-        draft_kv_cache_manager = self._get_draft_kv_cache_manager(resource_manager)
+        draft_kv_cache_manager = get_draft_kv_cache_manager(
+            self._config.spec_config, resource_manager
+        )
 
         available_blocks = kv_cache_manager.get_num_free_blocks() // self._config.max_beam_width
         if available_blocks < batch_size:
@@ -378,7 +401,9 @@ class DummyRequestFactory:
     ) -> LlmRequest | None:
         """Add the dummy request with the longest sequence; free ``requests`` if it does not fit."""
         kv_cache_manager = resource_manager.get_resource_manager(self.kv_cache_manager_key)
-        draft_kv_cache_manager = self._get_draft_kv_cache_manager(resource_manager)
+        draft_kv_cache_manager = get_draft_kv_cache_manager(
+            self._config.spec_config, resource_manager
+        )
 
         def free_warmup_requests() -> None:
             for r in requests:
@@ -480,7 +505,9 @@ class DummyRequestFactory:
         kv_cache_manager = resource_manager.get_resource_manager(self.kv_cache_manager_key)
         if kv_cache_manager is None:
             return
-        draft_kv_cache_manager = self._get_draft_kv_cache_manager(resource_manager)
+        draft_kv_cache_manager = get_draft_kv_cache_manager(
+            self._config.spec_config, resource_manager
+        )
         spec_resource_manager = resource_manager.get_resource_manager(
             ResourceManagerType.SPEC_RESOURCE_MANAGER
         )

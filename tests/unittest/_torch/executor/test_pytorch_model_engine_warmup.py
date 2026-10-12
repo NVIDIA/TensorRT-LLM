@@ -982,8 +982,8 @@ class TestWarmupCleanup(unittest.TestCase):
     def test_cuda_graph_metrics_exclude_piecewise_stages(self) -> None:
         """Verify generation graph timing excludes prefill and includes LoRA warmup cleanup."""
         graphs = DecoderCudaGraphs(
-            SimpleNamespace(enabled=True, is_warmup_only=False),
-            None,
+            cuda_graph_runner=SimpleNamespace(enabled=True, is_warmup_only=False),
+            breakable_cuda_graph_runner=None,
             config=SimpleNamespace(
                 enable_autotuner=True, prefill_cuda_graph_backend=PrefillCudaGraphBackend.PIECEWISE
             ),
@@ -999,8 +999,6 @@ class TestWarmupCleanup(unittest.TestCase):
             dynamic_draft_len_mapping=None,
             lora=SimpleNamespace(cuda_graph_manager=object()),
             forward_warmup=None,
-            prepare_capture_batch=None,
-            capture_additional_graphs=None,
             context_promotion_supported=True,
         )
         resource_manager = ResourceManager({})

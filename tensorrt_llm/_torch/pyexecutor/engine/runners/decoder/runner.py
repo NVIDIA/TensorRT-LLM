@@ -29,13 +29,7 @@ from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import (
     KeyType,
 )
 from tensorrt_llm._torch.pyexecutor.guided_decoder import CapturableGuidedDecoder
-from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
-from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
-from tensorrt_llm._torch.pyexecutor.resource_manager import (
-    KVCacheManager,
-    ResourceManager,
-    ResourceManagerType,
-)
+from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager, ResourceManagerType
 from tensorrt_llm._torch.pyexecutor.sampler.sampler_common import SampleType
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._torch.pyexecutor.warmup_timer import _WarmupTimer
@@ -51,23 +45,19 @@ from ...lora import LoraParamBuilder, make_cuda_graph_lora_manager
 from ...model_call import ModelCaller
 from ...multimodal import MultimodalItemScheduler
 from ..common import make_scheduled_inputs
-from ..interface import PreparedInputs, ScheduledInputs, ScheduledModelRunner
+from ..interface import ScheduledInputs, ScheduledModelRunner
+from .agreement import WarmupAgreement
 from .config import DecoderRunnerConfig
 from .dummy_requests import DummyRequestFactory
 from .graphs import DecoderCudaGraphs, compute_dynamic_draft_len_mapping
-from .inputs import (
-    DecoderInputBuffers,
-    DecoderInputPreparer,
-    ExtraInputsCollector,
-    resolve_runtime_draft_len,
-)
+from .inputs import DecoderInputBuffers, DecoderInputPreparer, resolve_runtime_draft_len
 from .metadata import (
     DecoderMetadata,
     get_spec_managers,
     sync_group_all_greedy_sample,
     update_spec_metadata,
 )
-from .warmup import DecoderWarmup, WarmupAgreement
+from .warmup import DecoderWarmup
 
 
 class DecoderRunner(ScheduledModelRunner):
@@ -79,12 +69,6 @@ class DecoderRunner(ScheduledModelRunner):
     _steady_gen_cache_supported = True
     _eager_workspace_reclaim_supported = True
     _deferred_decode_outputs_supported = True
-    # Prompt tokens of the filler CUDA graph dummy requests, also the floor of
-    # the longest one; None keeps the cache manager's default.
-    _dummy_request_tokens: int | None = None
-    # Collects per-sequence model inputs beyond the decoder's own; None when the
-    # model takes none.
-    _new_extra_inputs: Callable[[], ExtraInputsCollector] | None = None
 
     def __init__(
         self,
@@ -122,7 +106,6 @@ class DecoderRunner(ScheduledModelRunner):
 
         self._config = config
 
-        self.lora_model_config: LoraModelConfig | None = None
         self.forward_pass_callable = None
         # Optional in-graph sampling hook, registered by PyExecutor. Called at
         # the tail of _forward_step -- i.e. right after the LM head, and inside
@@ -136,74 +119,91 @@ class DecoderRunner(ScheduledModelRunner):
         self._buffers = DecoderInputBuffers()
         self._buffers.allocate(self._config, self.use_beam_search)
         self._metadata = DecoderMetadata(self._config, mapping, model, self._buffers)
-        self._dummy_requests = DummyRequestFactory(
-            self._config,
-            kv_cache_manager_key,
-            get_runtime_tokens_per_gen_step,
-            self._dummy_request_tokens,
-            request_kwargs=self._dummy_request_kwargs,
-            position_limit=self._dummy_position_limit,
-            add_resources=self._add_dummy_request_resources,
-            free_resources=self._free_dummy_request_resources,
-            get_draft_kv_cache_manager=self._get_draft_kv_cache_manager,
-            release_request_state=getattr(model, "release_request_state", None),
-        )
+        self._dummy_requests = self._make_dummy_requests()
         self._init_decoder_state()
-        self._inputs = DecoderInputPreparer(
-            self._buffers,
-            self._config,
-            mapping,
-            dist,
-            model,
-            get_runtime_tokens_per_gen_step,
-            iter_states,
-            self._lora,
+        self._inputs = self._make_input_preparer(mm_item_scheduler)
+        self._graphs = self._make_cuda_graphs()
+        self._warmup = DecoderWarmup(
+            config=self._config,
+            mapping=mapping,
+            dist=dist,
+            model=model,
+            sparse_attention_config=sparse_attention_config,
+            torch_compile_backend=torch_compile_backend,
+            kv_cache_manager_key=kv_cache_manager_key,
+            warmup_timer=warmup_timer,
+            metrics=metrics,
+            agreement=self._agreement,
+            metadata=self._metadata,
+            dummy_requests=self._dummy_requests,
+            graphs=self._graphs,
+            inputs=self._inputs,
+            forward_warmup=self._forward_warmup,
+            context_warmups_supported=self._context_warmups_supported,
+            eager_workspace_reclaimable=self._eager_workspace_reclaim_supported,
+        )
+
+    def _make_dummy_requests(self) -> DummyRequestFactory:
+        """Build the factory of warmup and capture dummy requests."""
+        return DummyRequestFactory(**self._dummy_requests_kwargs())
+
+    def _make_input_preparer(
+        self, mm_item_scheduler: MultimodalItemScheduler | None
+    ) -> DecoderInputPreparer:
+        """Build the input preparer over this runner's buffers."""
+        return DecoderInputPreparer(**self._input_preparer_kwargs(mm_item_scheduler))
+
+    def _make_cuda_graphs(self) -> DecoderCudaGraphs:
+        """Build the CUDA graph component; call after the input preparer."""
+        return DecoderCudaGraphs(**self._cuda_graphs_kwargs())
+
+    def _dummy_requests_kwargs(self) -> dict[str, Any]:
+        return dict(
+            config=self._config,
+            kv_cache_manager_key=self.kv_cache_manager_key,
+            model=self.model,
+            get_runtime_tokens_per_gen_step=self.get_runtime_tokens_per_gen_step,
+            release_request_state=getattr(self.model, "release_request_state", None),
+        )
+
+    def _input_preparer_kwargs(
+        self, mm_item_scheduler: MultimodalItemScheduler | None
+    ) -> dict[str, Any]:
+        return dict(
+            buffers=self._buffers,
+            config=self._config,
+            mapping=self.mapping,
+            dist=self.dist,
+            model=self.model,
+            get_runtime_tokens_per_gen_step=self.get_runtime_tokens_per_gen_step,
+            iter_states=self.iter_states,
+            lora=self._lora,
             use_beam_search=self.use_beam_search,
-            fast_path=self._prepare_inputs_fast_path,
-            new_extra_inputs=self._new_extra_inputs,
             steady_gen_cache_supported=self._steady_gen_cache_supported,
             mm_item_scheduler=mm_item_scheduler,
         )
+
+    def _cuda_graphs_kwargs(self) -> dict[str, Any]:
         cuda_graph_runner = self._initialize_cuda_graph_runner()
-        self._graphs = DecoderCudaGraphs(
-            cuda_graph_runner,
-            self._initialize_breakable_cuda_graph_runner(cuda_graph_runner),
-            self._config,
-            mapping,
-            model,
-            sparse_attention_config,
-            metrics,
-            kv_cache_manager_key,
-            self._dummy_requests,
-            self._agreement,
-            self._metadata,
-            get_runtime_tokens_per_gen_step,
-            self._dynamic_draft_len_mapping,
-            self._lora,
+        return dict(
+            cuda_graph_runner=cuda_graph_runner,
+            breakable_cuda_graph_runner=self._initialize_breakable_cuda_graph_runner(
+                cuda_graph_runner
+            ),
+            config=self._config,
+            mapping=self.mapping,
+            model=self.model,
+            sparse_attention_config=self.sparse_attention_config,
+            metrics=self._metrics,
+            kv_cache_manager_key=self.kv_cache_manager_key,
+            dummy_requests=self._dummy_requests,
+            agreement=self._agreement,
+            metadata=self._metadata,
+            get_runtime_tokens_per_gen_step=self.get_runtime_tokens_per_gen_step,
+            dynamic_draft_len_mapping=self._dynamic_draft_len_mapping,
+            lora=self._lora,
             forward_warmup=self._forward_warmup,
-            prepare_capture_batch=self._prepare_capture_batch,
-            capture_additional_graphs=self._capture_additional_cuda_graphs,
             context_promotion_supported=self._context_graph_promotion_supported,
-        )
-        self._warmup = DecoderWarmup(
-            self._config,
-            mapping,
-            dist,
-            model,
-            sparse_attention_config,
-            torch_compile_backend,
-            kv_cache_manager_key,
-            warmup_timer,
-            metrics,
-            self._agreement,
-            self._metadata,
-            self._dummy_requests,
-            self._graphs,
-            self._inputs,
-            forward_warmup=self._forward_warmup,
-            get_draft_kv_cache_manager=self._get_draft_kv_cache_manager,
-            context_warmups_supported=self._context_warmups_supported,
-            eager_workspace_reclaimable=self._eager_workspace_reclaim_supported,
         )
 
     @property
@@ -287,14 +287,16 @@ class DecoderRunner(ScheduledModelRunner):
                 self._config.max_num_tokens,
             )
         # Resource creation runs again after capacity estimation, once the old
-        # executor has released its graphs. Replace the complete preparation state.
-        self._lora = LoraParamBuilder(
-            spec_config=self._config.spec_config,
-            attn_backend=self._config.attention_backend,
-            cuda_graph_manager=cuda_graph_manager,
-        )
-        self._graphs.set_lora(self._lora)
-        self._inputs.set_lora(self._lora)
+        # executor has released its graphs, and replaces the graph manager.
+        self._lora.cuda_graph_manager = cuda_graph_manager
+
+    @property
+    def lora_model_config(self) -> LoraModelConfig | None:
+        return self._lora.model_config
+
+    @lora_model_config.setter
+    def lora_model_config(self, lora_model_config: LoraModelConfig | None) -> None:
+        self._lora.model_config = lora_model_config
 
     def _init_decoder_state(self) -> None:
         """Initialize the mutable state read only by engine decoder execution."""
@@ -364,65 +366,6 @@ class DecoderRunner(ScheduledModelRunner):
     def use_beam_search(self):
         return self._config.max_beam_width > 1
 
-    def _get_draft_kv_cache_manager(
-        self, resource_manager: ResourceManager
-    ) -> KVCacheManager | KVCacheManagerV2 | None:
-        """
-        Returns the draft KV cache manager only in one-model speculative decoding
-        mode where the target model manages a separate draft KV cache.
-        """
-        return get_draft_kv_cache_manager(self._config.spec_config, resource_manager)
-
-    def _capture_additional_cuda_graphs(self, resource_manager: ResourceManager) -> None:
-        """Capture graphs beyond the generation-only shapes; none by default."""
-
-    def _prepare_capture_batch(
-        self,
-        batch: ScheduledRequests,
-        resource_manager: ResourceManager,
-        *,
-        enable_spec_decode: bool,
-        runtime_draft_len: int,
-    ) -> None:
-        """Prepare a dummy batch's request state before its graph is captured."""
-
-    def _dummy_request_kwargs(
-        self, resource_manager: ResourceManager, num_requests: int
-    ) -> dict[str, Any]:
-        """Extra ``add_dummy_requests`` arguments for ``num_requests`` dummy requests."""
-        return {}
-
-    def _dummy_position_limit(self) -> int | None:
-        """Return the largest position a dummy request may reach."""
-        model_config = self.model.model_config.pretrained_config
-        return getattr(model_config, "max_position_embeddings", None)
-
-    def _add_dummy_request_resources(
-        self, requests: list[LlmRequest], resource_manager: ResourceManager
-    ) -> bool:
-        """Allocate resources dummy requests need beyond the KV caches."""
-        return True
-
-    def _free_dummy_request_resources(
-        self, requests: list[LlmRequest], resource_manager: ResourceManager
-    ) -> None:
-        """Free what ``_add_dummy_request_resources`` allocated."""
-
-    def _prepare_inputs_fast_path(
-        self,
-        scheduled_requests: ScheduledRequests,
-        kv_cache_manager: KVCacheManager | KVCacheManagerV2,
-        attn_metadata: AttentionMetadata,
-        new_tokens_device: torch.Tensor | None,
-        next_draft_tokens_device: torch.Tensor | None,
-        resource_manager: ResourceManager | None,
-        *,
-        promoted_context_request_ids: frozenset[int],
-        enable_spec_decode: bool,
-    ) -> PreparedInputs | None:
-        """Return the prepared inputs when a specialized path prepares the batch."""
-        return None
-
     def _forward_warmup(
         self,
         batch: ScheduledRequests,
@@ -458,7 +401,9 @@ class DecoderRunner(ScheduledModelRunner):
         assert kv_cache_manager is not None, "the legacy runner requires a KV cache manager"
         semantic_requests = scheduled_requests
         scheduled_requests = self._get_attention_dp_execution_batch(scheduled_requests)
-        draft_kv_cache_manager = self._get_draft_kv_cache_manager(resource_manager)
+        draft_kv_cache_manager = get_draft_kv_cache_manager(
+            self._config.spec_config, resource_manager
+        )
 
         attn_metadata = self._metadata.setup_attention(kv_cache_manager, draft_kv_cache_manager)
         if isinstance(attn_metadata, TrtllmAttentionMetadata):

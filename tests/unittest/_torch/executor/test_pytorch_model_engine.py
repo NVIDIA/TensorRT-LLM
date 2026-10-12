@@ -69,18 +69,20 @@ from tensorrt_llm.llmapi import (CudaGraphConfig, SADecodingConfig,
                                  SamplingParams)
 from tensorrt_llm.mapping import CpType, Mapping
 
+# One-engine checks see a two-model mode, so no draft KV cache is looked up.
+_TWO_MODEL_SPEC_MODE = SimpleNamespace(use_one_engine=lambda: False)
+
 
 def _input_preparer() -> DecoderInputPreparer:
-    return DecoderInputPreparer(None,
-                                None,
-                                None,
-                                None,
-                                None,
-                                None, {},
-                                None,
+    return DecoderInputPreparer(buffers=None,
+                                config=None,
+                                mapping=None,
+                                dist=None,
+                                model=None,
+                                get_runtime_tokens_per_gen_step=None,
+                                iter_states={},
+                                lora=None,
                                 use_beam_search=False,
-                                fast_path=lambda *args, **kwargs: None,
-                                new_extra_inputs=None,
                                 steady_gen_cache_supported=True)
 
 
@@ -355,7 +357,6 @@ def _make_forward_only_engine(
     decoder.forward_pass_callable = None
     decoder._stage_in_graph_sampling = None
     decoder.moe_load_balancer = None
-    decoder._get_draft_kv_cache_manager = Mock(return_value=None)
     engine._runner = decoder
     decoder._lora = SimpleNamespace(cuda_graph_manager=None)
     decoder._warmup = SimpleNamespace(trtllm_gen_jit_warmup=False)
@@ -1109,6 +1110,7 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
             _make_forward_only_engine(key)
         engine.enable_spec_decode = True
         engine._runner._config.spec_config = SimpleNamespace(
+            spec_dec_mode=_TWO_MODEL_SPEC_MODE,
             is_linear_tree=True,
             get_runtime_tokens_per_gen_step=Mock(return_value=1))
         graph_attn_metadata = runner.maybe_get_cuda_graph.return_value[0]
@@ -1155,6 +1157,7 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
             _make_forward_only_engine(None)
         engine.enable_spec_decode = True
         engine._runner._config.spec_config = SimpleNamespace(
+            spec_dec_mode=_TWO_MODEL_SPEC_MODE,
             is_linear_tree=True,
             get_runtime_tokens_per_gen_step=Mock(return_value=1))
         context = _make_request_stub(1)
@@ -1184,6 +1187,7 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
             _make_forward_only_engine(None)
         engine.enable_spec_decode = True
         engine._runner._config.spec_config = SimpleNamespace(
+            spec_dec_mode=_TWO_MODEL_SPEC_MODE,
             is_linear_tree=False,
             tokens_per_gen_step=8,
             get_runtime_tokens_per_gen_step=Mock(return_value=1))
@@ -1352,6 +1356,7 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
                     engine.enable_spec_decode = True
                     engine.runtime_draft_len = 1
                     engine._runner._config.spec_config = SimpleNamespace(
+                        spec_dec_mode=_TWO_MODEL_SPEC_MODE,
                         is_linear_tree=True,
                         get_runtime_tokens_per_gen_step=Mock(return_value=1))
                 elif case == "beam":
@@ -1396,6 +1401,7 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
         # A non-linear tree widens the length to its total draft tokens after
         # graph selection.
         engine._runner._config.spec_config = SimpleNamespace(
+            spec_dec_mode=_TWO_MODEL_SPEC_MODE,
             is_linear_tree=False,
             tokens_per_gen_step=8,
             get_runtime_tokens_per_gen_step=Mock(return_value=1))
@@ -1825,13 +1831,13 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
                 Metadata=DSAtrtllmAttentionMetadata),
             original_max_draft_len=2,
             cuda_graph_batch_sizes=[8],
+            spec_config=None,
         )
         engine._metadata = DecoderMetadata(engine._config,
                                            mapping=None,
                                            model=None,
                                            buffers=None)
         engine.kv_cache_manager_key = "kv"
-        engine._get_draft_kv_cache_manager = Mock(return_value=None)
         metadata = Mock(spec=DSAtrtllmAttentionMetadata)
 
         def build(kv_cache_manager, draft_kv_cache_manager):
@@ -2014,8 +2020,8 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         decoder._inputs = object.__new__(DecoderInputPreparer)
         decoder._inputs._prepare_inputs_event = Mock()
         decoder._graphs = DecoderCudaGraphs(
-            Mock(),
-            Mock(),
+            cuda_graph_runner=Mock(),
+            breakable_cuda_graph_runner=Mock(),
             config=None,
             mapping=None,
             model=None,
@@ -2029,8 +2035,6 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
             dynamic_draft_len_mapping=None,
             lora=None,
             forward_warmup=None,
-            prepare_capture_batch=None,
-            capture_additional_graphs=None,
             context_promotion_supported=True,
         )
 

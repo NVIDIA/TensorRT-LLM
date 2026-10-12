@@ -268,10 +268,15 @@ class HostInputs:
 
 
 class DecoderInputPreparer:
-    """Prepares decoder model inputs into the persistent input buffers."""
+    """Prepares decoder model inputs into the persistent input buffers.
+
+    A model family with its own per-sequence inputs or a specialized whole-batch
+    path overrides ``_new_extra_inputs`` and ``_prepare_inputs_fast_path``.
+    """
 
     def __init__(
         self,
+        *,
         buffers: DecoderInputBuffers,
         config: DecoderRunnerConfig,
         mapping: Mapping,
@@ -280,10 +285,7 @@ class DecoderInputPreparer:
         get_runtime_tokens_per_gen_step: Callable[[int], int],
         iter_states: dict[str, Any],
         lora: LoraParamBuilder,
-        *,
         use_beam_search: bool,
-        fast_path: Callable[..., PreparedInputs | None],
-        new_extra_inputs: Callable[[], ExtraInputsCollector] | None,
         steady_gen_cache_supported: bool,
         mm_item_scheduler: MultimodalItemScheduler | None = None,
     ) -> None:
@@ -297,8 +299,6 @@ class DecoderInputPreparer:
         self.iter_states = iter_states
         self._lora = lora
         self.use_beam_search = use_beam_search
-        self._prepare_inputs_fast_path = fast_path
-        self._new_extra_inputs = new_extra_inputs
         self._steady_gen_cache_supported = steady_gen_cache_supported
         self.guided_decoder: CapturableGuidedDecoder | None = None
         self._prepare_inputs_event: torch.cuda.Event | None = None
@@ -315,8 +315,24 @@ class DecoderInputPreparer:
             os.getenv("TLLM_LOG_CACHED_KV_TOKENS_PER_REQ", "0") == "1"
         )
 
-    def set_lora(self, lora: LoraParamBuilder) -> None:
-        self._lora = lora
+    def _new_extra_inputs(self) -> ExtraInputsCollector:
+        """Return the collector of this pass's model inputs beyond the decoder's own."""
+        return _NO_EXTRA_INPUTS
+
+    def _prepare_inputs_fast_path(
+        self,
+        scheduled_requests: ScheduledRequests,
+        kv_cache_manager: KVCacheManager | KVCacheManagerV2,
+        attn_metadata: AttentionMetadata,
+        new_tokens_device: torch.Tensor | None,
+        next_draft_tokens_device: torch.Tensor | None,
+        resource_manager: ResourceManager | None,
+        *,
+        promoted_context_request_ids: frozenset[int],
+        enable_spec_decode: bool,
+    ) -> PreparedInputs | None:
+        """Return the prepared inputs when a specialized path prepares the batch."""
+        return None
 
     def pad_batch_seed_mrope_delta_cache(self, padded_requests: ScheduledRequests) -> None:
         if not self._config.use_mrope or padded_requests.num_generation_requests == 0:
@@ -749,9 +765,7 @@ class DecoderInputPreparer:
             mrope_dummy_seq_slot=get_mrope_dummy_seq_slot(
                 self._config.max_num_tokens, self.mapping.pp_size
             ),
-            extra_inputs=(
-                _NO_EXTRA_INPUTS if self._new_extra_inputs is None else self._new_extra_inputs()
-            ),
+            extra_inputs=self._new_extra_inputs(),
             context_prompt_lookahead=(
                 []
                 if spec_metadata is not None
