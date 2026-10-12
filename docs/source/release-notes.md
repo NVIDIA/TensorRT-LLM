@@ -8,9 +8,13 @@ All published functionality in the Release Notes has been fully tested and verif
 
 ### Key Features and Enhancements
 
+- Disaggregated serving supports the Responses API: `trtllm-serve disaggregated` serves `/v1/responses` with context-first and generation-first scheduling, and `/v1/models`. `previous_response_id` is rejected and `store` is ignored there, since no response history is kept. See [Disaggregated Serving](features/disagg-serving.md#responses-api).
+
 ### Infrastructure Changes
 
 ### API Changes
+
+- `/v1/responses`: a response cut short by `max_output_tokens` now reports `incomplete_details.reason` `max_output_tokens`, and when streamed it ends with `response.incomplete` instead of `response.completed`, as in the OpenAI API.
 
 ### Fixed Issues
 
@@ -18,13 +22,7 @@ All published functionality in the Release Notes has been fully tested and verif
 
 ## TensorRT-LLM Release 1.3
 
-### Key Features and Enhancements
-
-- Disaggregated serving supports the Responses API: `trtllm-serve disaggregated` serves `/v1/responses` with context-first and generation-first scheduling, and `/v1/models`. `previous_response_id` is rejected and `store` is ignored there, since no response history is kept. See [Disaggregated Serving](features/disagg-serving.md#responses-api).
-
 ### API Changes
-
-- `/v1/responses`: a response cut short by `max_output_tokens` now reports `incomplete_details.reason` `max_output_tokens`, and when streamed it ends with `response.incomplete` instead of `response.completed`, as in the OpenAI API.
 
 - NVFP4 cold-page compression remains opt-in and disabled by default. When enabled for DeepSeek-V4, NoPE uses NVFP4 and RoPE now defaults to 2FP4 (`nvfp4_residual_dim=64`). Set `skip_rope_quantization=True` to keep RoPE at its original precision, as before, or `nvfp4_residual_dim=0` to use single NVFP4. The active GPU KV-cache dtype is unchanged. See the [NVFP4 cold-page compression example](source:examples/kv_cache_compression/nvfp4_cold_page.md#deepseek-v4).
 
