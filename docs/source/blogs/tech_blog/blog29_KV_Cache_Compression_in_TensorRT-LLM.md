@@ -145,7 +145,7 @@ Before anything is built, a factory reads the block and wires things up: which m
 
 ### KV Cache Compression in the Executor Iteration Loop
 
-**The idea.** The stages inside a request (stages 1 to 3 in Figure 3) are reached by riding on callbacks the executor already makes; a method only overrides the hooks it needs. The executor calls every resource manager three times per iteration: before the forward pass, after it, and when a request ends. The compression manager registers last, so it runs after the KV cache manager has updated its state, and turns the three callbacks into five hooks (Figure 5). All of them do nothing by default.
+**The idea.** The stages inside a request (stages 1 to 3 in Figure 3) are reached by riding on callbacks the executor already makes. The executor calls every resource manager before the forward pass, after it, and when a request ends. The compression manager registers last, so it runs after the KV cache manager has updated its state, and maps these callbacks onto five hook functions, one per moment: request start, end of prefill, before and after each decode step, and request finish (Figure 5). Every hook does nothing by default. A method overrides the hook of the stage it wants, and its code runs there.
 
 <div align="center">
 <figure>
