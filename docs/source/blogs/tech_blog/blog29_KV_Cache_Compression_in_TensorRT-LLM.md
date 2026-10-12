@@ -49,19 +49,10 @@ The general idea is simple: **shrink the KV cache at every safe point of the ser
 </div>
 <p align="center"><sub><em>Figure 2: The TensorRT LLM stack. KV cache compression sits in the compression layer next to quantization and sparse attention. It changes what is stored in the KV cache and touches neither the kernels below nor the serving layers above.</em></sub></p>
 
-Those boundaries are the five stages in the life of a KV cache shown in Figure 3: prefill chunks (1), after prefill (2), decode steps (3), tool calls (4), and after the request ends (5). At each of them nothing is reading the cache, so compression can run safely. Methods reach them through **two integration paths**. Iteration-driven methods run between model iterations, from the executor loop, and change the retained KV state. Storage-bound methods run when the cache manager moves a page between the GPU and host or disk memory, and change how the page is stored while it is cold. A method uses one path or both. In both the **cache manager keeps ownership of every page** and the method only changes its contents.
+To demonstrate the framework's generality, we have built two methods on it that act at different points in the life of a KV cache:
 
-<div align="center">
-<figure>
-  <img src="../media/tech_blog29_kv_lifetime_stages.svg" width="900">
-</figure>
-</div>
-<p align="center"><sub><em>Figure 3: Five stages in the life of a KV cache where compression can run. TriAttention acts at the decode stage (stage 3) and cold-page compression at the after-request stage (stage 5). The dashed stages are in scope and have no method yet.</em></sub></p>
-
-Two methods ship today, one on each path:
-
-*   **NVFP4 cold-page compression** (storage-bound, stage 5): stores attention KV pages as NVFP4 while they sit in host or disk memory. A page is encoded on the way out and decoded on the way back, so the GPU cache and the attention kernels keep the model's normal KV data type.
-*   **TriAttention** (iteration-driven, stage 3): runs between decode steps. It scores the generated tokens with an importance measure calibrated offline per attention head and keeps only a fixed budget of them. The prompt is never touched.
+*   **NVFP4 cold-page compression**: stores attention KV pages as NVFP4 while they sit in host or disk memory. A page is encoded on the way out and decoded on the way back, so the GPU cache and the attention kernels keep the model's normal KV data type.
+*   **TriAttention**: runs between decode steps. It scores the generated tokens with an importance measure calibrated offline per attention head and keeps only a fixed budget of them. The prompt is never touched.
 
 The two tables below summarize the current coverage.
 
@@ -69,10 +60,10 @@ The two tables below summarize the current coverage.
 
 | Method | When It Runs | What It Changes | Supported Attention Types |
 | :--- | :--- | :--- | :--- |
-| **NVFP4 cold-page compression** | After-request stage (stage 5): when a page moves between the GPU and host or disk memory | How attention KV is stored while off the GPU | multi-head, multi-query and grouped-query attention (MHA / MQA / GQA); multi-head latent attention (MLA); hybrid models (attention KV only) |
-| **TriAttention** | Decode stage (stage 3): periodically between decode steps | Which KV tokens are kept | MHA / MQA / GQA |
+| **NVFP4 cold-page compression** | When a page moves between the GPU and host or disk memory | How attention KV is stored while off the GPU | multi-head, multi-query and grouped-query attention (MHA / MQA / GQA); multi-head latent attention (MLA); hybrid models (attention KV only) |
+| **TriAttention** | Periodically between decode steps | Which KV tokens are kept | MHA / MQA / GQA |
 
-<p align="center"><sub><em>Table 1. The two methods built on the framework: the stage each one runs at, what it changes, and the attention types it supports.</em></sub></p>
+<p align="center"><sub><em>Table 1. The two methods built on the framework: when each one runs, what it changes, and the attention types it supports.</em></sub></p>
 
 </div>
 
@@ -104,7 +95,16 @@ Three principles follow from this.
 
 - **Attention stays untouched.** Sparse attention changes how the attention kernel reads the cache. KV cache compression never does. Attention always reads the normal GPU representation, and a compressed page is restored before anything reads it.
 - **Insertion is seamless.** A method plugs into the runtime without changes to the scheduler, the executor loop, or the model. It only changes the contents of KV pages. The cache manager keeps control of memory: it allocates pages, moves them between tiers, and reuses them.
-- **Insertion points are well defined.** They follow the life of a request and of the server, the five stages of Figure 3: after each prefill chunk, right after prefill, between decode steps, around a tool call, and after the request. We call these points hooks, but the idea is simply a place in the runtime where a compression algorithm can be inserted and run to completion.
+- **Insertion points are well defined.** They follow the life of a request and of the server. We call these points hooks, but the idea is simply a place in the runtime where a compression algorithm can be inserted and run to completion.
+
+These insertion points are the five stages in the life of a KV cache shown in Figure 3: prefill chunks (1), after prefill (2), decode steps (3), tool calls (4), and after the request ends (5). At each of them nothing is reading the cache, so compression can run safely. Methods reach them through **two integration paths**. Iteration-driven methods run between model iterations, from the executor loop, and change the retained KV state. Storage-bound methods run when the cache manager moves a page between the GPU and host or disk memory, and change how the page is stored while it is cold. A method uses one path or both. In both the **cache manager keeps ownership of every page** and the method only changes its contents.
+
+<div align="center">
+<figure>
+  <img src="../media/tech_blog29_kv_lifetime_stages.svg" width="900">
+</figure>
+</div>
+<p align="center"><sub><em>Figure 3: Five stages in the life of a KV cache where compression can run. TriAttention acts at the decode stage (stage 3) and cold-page compression at the after-request stage (stage 5). The dashed stages are in scope and have no method yet.</em></sub></p>
 
 A compression method is selected with one configuration block, `kv_cache_compression_config`. It is kept separate from the KV cache configuration, which sets capacity, memory tiers, block reuse, and the active KV data type. It is also separate from the sparse attention configuration, which controls how attention computes. One method can be active per LLM instance. A method must handle every cache layout it is given, or pass the parts it does not understand through unchanged.
 
