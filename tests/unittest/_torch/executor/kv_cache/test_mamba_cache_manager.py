@@ -4615,3 +4615,127 @@ def test_v2_stack_state_views_rejects_non_affine_layout():
     assert stack([pool[0], pool[1], pool[3]]) is None
     assert stack([pool[0], torch.zeros(5, 8)]) is None
     assert stack([]) is None
+
+
+def _kda_v2_replay_manager(device, num_slots=8, num_layers=2, num_spec=2, section_dim=2, window=3):
+    """A V2 manager holding only the KDA replay state its slot writes touch."""
+    mgr = object.__new__(MambaHybridCacheManagerV2)
+    mgr._use_kda_replay_update = True
+    mgr._use_replay_state_update = False
+    mgr.mamba_ssm_rand_seed = None
+    mgr.local_num_mamba_layers = num_layers
+    mgr.prev_num_accepted_tokens = torch.arange(1, num_slots + 1, dtype=torch.int32, device=device)
+    mgr.cuda_state_indices = torch.zeros(num_slots, dtype=torch.int32, device=device)
+    mgr.conv_state_shape = [3 * section_dim, window]
+    mgr.conv_section_dims = [section_dim] * 3
+    mgr.all_conv_states = [
+        torch.randn(num_slots, 3 * section_dim, window, device=device) for _ in range(num_layers)
+    ]
+    # Same layout as the real dim-contiguous replay conv caches: [layer, slot, dim, window + spec].
+    mgr.kda_conv_q, mgr.kda_conv_k, mgr.kda_conv_v = (
+        torch.randn(
+            num_layers,
+            num_slots,
+            window + num_spec,
+            section_dim,
+            device=device,
+            dtype=torch.bfloat16,
+        ).transpose(-1, -2)
+        for _ in range(3)
+    )
+    mgr.kda_qkg_cache, mgr.kda_v_cache, mgr.kda_beta_cache = (
+        torch.randn(num_layers, num_slots, num_spec, section_dim, device=device) for _ in range(3)
+    )
+    return mgr
+
+
+_KDA_DEVICES = ["cpu", pytest.param("cuda", marks=skip_no_cuda)]
+
+
+@pytest.mark.parametrize("device", _KDA_DEVICES)
+def test_v2_kda_replay_slot_resets(device):
+    mgr = _kda_v2_replay_manager(device)
+    mgr.cuda_state_indices[:2] = torch.tensor([5, 1], dtype=torch.int32)
+
+    mgr._reset_context_mamba_slots(2)
+    mgr._reset_kda_replay_slots([3])
+    mgr._reset_kda_replay_slots([])
+    mgr._reset_kda_replay_slots(torch.tensor([6]))
+
+    assert mgr.prev_num_accepted_tokens.tolist() == [1, 0, 3, 0, 5, 0, 0, 8]
+
+
+@pytest.mark.parametrize("device", _KDA_DEVICES)
+def test_v2_kda_seed_replay_caches_for_disagg_gen(device):
+    mgr = _kda_v2_replay_manager(device)
+    mgr._request_id_to_state_index = {10: 4, 11: 2, 12: 4}
+    before = {
+        name: getattr(mgr, name).clone()
+        for name in (
+            "prev_num_accepted_tokens",
+            "kda_conv_q",
+            "kda_conv_k",
+            "kda_conv_v",
+            "kda_qkg_cache",
+            "kda_v_cache",
+            "kda_beta_cache",
+        )
+    }
+
+    mgr.seed_kda_replay_caches_for_disagg_gen([10, 11, 12, 99])
+
+    seeded, untouched = [2, 4], [0, 1, 3, 5, 6, 7]
+    window = mgr.conv_state_shape[1]
+    for name, before_value in before.items():
+        after = getattr(mgr, name)
+        dim = 0 if name == "prev_num_accepted_tokens" else 1
+        torch.testing.assert_close(
+            after.index_select(dim, torch.tensor(untouched, device=device)),
+            before_value.index_select(dim, torch.tensor(untouched, device=device)),
+        )
+    assert mgr.prev_num_accepted_tokens[seeded].tolist() == [0, 0]
+    for cache in (mgr.kda_qkg_cache, mgr.kda_v_cache, mgr.kda_beta_cache):
+        assert not cache[:, seeded].any()
+    for section, replay in enumerate((mgr.kda_conv_q, mgr.kda_conv_k, mgr.kda_conv_v)):
+        lo, hi = 2 * section, 2 * section + 2
+        for layer, conv_state in enumerate(mgr.all_conv_states):
+            torch.testing.assert_close(
+                replay[layer, seeded, :, :window],
+                conv_state[seeded, lo:hi, :].to(replay.dtype),
+            )
+            assert not replay[layer, seeded, :, window:].any()
+
+
+@pytest.mark.parametrize("device", _KDA_DEVICES)
+def test_v2_kda_relocate_replay_slots(device):
+    mgr = _kda_v2_replay_manager(device)
+    source = {name: getattr(mgr, name)[:, 1].clone() for name in ("kda_conv_q", "kda_qkg_cache")}
+
+    mgr._relocate_kda_replay_slots([1, 3, -1], [6, 3, 7])
+
+    assert mgr.prev_num_accepted_tokens.tolist() == [1, 2, 3, 4, 5, 6, 2, 8]
+    for name, value in source.items():
+        torch.testing.assert_close(getattr(mgr, name)[:, 6], value)
+
+
+@skip_no_cuda
+def test_v2_kda_replay_slot_writes_do_not_synchronize():
+    """These run on every disagg GEN admission: a host sync there stalls the executor
+    thread until the in-flight decode step drains."""
+    mgr = _kda_v2_replay_manager("cuda")
+    mgr.cuda_state_indices[:2] = torch.tensor([5, 1], dtype=torch.int32)
+    mgr._request_id_to_state_index = {10: 4, 11: 2}
+    torch.cuda.synchronize()
+
+    previous_mode = torch.cuda.get_sync_debug_mode()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        mgr._reset_context_mamba_slots(2)
+        mgr._reset_kda_replay_slots([3])
+        mgr._relocate_kda_replay_slots([1], [6])
+        mgr.seed_kda_replay_caches_for_disagg_gen([10, 11])
+    finally:
+        torch.cuda.set_sync_debug_mode(previous_mode)
+
+    # Reset slots 5, 1 and 3; slot 6 takes slot 1's (reset) count; seeding resets 4 and 2.
+    assert mgr.prev_num_accepted_tokens.tolist() == [1, 0, 0, 0, 0, 0, 0, 8]

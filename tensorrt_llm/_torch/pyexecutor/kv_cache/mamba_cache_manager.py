@@ -4262,13 +4262,35 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         for buffer in self._ple_conv_states.values():
             yield -1, buffer
 
+    def _upload_kda_slots(self, slots: List[int]) -> torch.Tensor:
+        """Copy host slot ids to the device without a host synchronization.
+
+        Each call stages through a fresh pinned buffer, which the caching host
+        allocator keeps alive until the non-blocking copy has run, so no later
+        host write can race the copy. Building the index with
+        ``torch.tensor(..., device=...)`` instead is a pageable HtoD copy that
+        blocks until the in-flight forward drains; on the disagg GEN admission
+        path that costs about one decode step per call.
+        """
+        assert self.prev_num_accepted_tokens is not None
+        return torch.tensor(slots, dtype=torch.long,
+                            pin_memory=prefer_pinned()).to(
+                                self.prev_num_accepted_tokens.device,
+                                non_blocking=True)
+
     def _reset_context_mamba_slots(self, num_contexts: int) -> None:
         super()._reset_context_mamba_slots(num_contexts)
         if num_contexts == 0 or not self.use_kda_replay_update:
             return
         assert self.prev_num_accepted_tokens is not None
+        # index_fill_ keeps this async (``t[idx] = 0`` uploads the scalar
+        # through pageable memory and synchronizes). It relies on
+        # _setup_state_indices staging cuda_state_indices through a fresh
+        # pinned buffer: with a persistent staging buffer, the next batch's
+        # _setup_state_indices in the same iteration could overwrite it before
+        # this copy runs, and the reset would hit the wrong slots.
         context_slots = self.cuda_state_indices[:num_contexts].long()
-        self.prev_num_accepted_tokens[context_slots] = 0
+        self.prev_num_accepted_tokens.index_fill_(0, context_slots, 0)
 
     def _reset_kda_replay_slots(
         self,
@@ -4277,11 +4299,16 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         """Reset pending KDA drafts for newly initialized logical slots."""
         assert self.use_kda_replay_update
         assert self.prev_num_accepted_tokens is not None
-        slots = torch.as_tensor(slots,
-                                dtype=torch.long,
-                                device=self.prev_num_accepted_tokens.device)
+        if isinstance(slots, torch.Tensor):
+            slots = slots.to(device=self.prev_num_accepted_tokens.device,
+                             dtype=torch.long,
+                             non_blocking=True)
+        elif slots:
+            slots = self._upload_kda_slots(slots)
+        else:
+            return
         if slots.numel() > 0:
-            self.prev_num_accepted_tokens[slots] = 0
+            self.prev_num_accepted_tokens.index_fill_(0, slots, 0)
 
     def _relocate_kda_replay_slots(self, old_slots: List[int],
                                    new_slots: List[int]) -> None:
@@ -4293,13 +4320,8 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         if not moves:
             return
 
-        device = self.prev_num_accepted_tokens.device
-        source_slots = torch.tensor([old for old, _ in moves],
-                                    dtype=torch.long,
-                                    device=device)
-        destination_slots = torch.tensor([new for _, new in moves],
-                                         dtype=torch.long,
-                                         device=device)
+        source_slots = self._upload_kda_slots([old for old, _ in moves])
+        destination_slots = self._upload_kda_slots([new for _, new in moves])
         replay_buffers = (
             self.kda_conv_q,
             self.kda_conv_k,
@@ -4461,10 +4483,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             return
 
         assert self.prev_num_accepted_tokens is not None
-        device = self.prev_num_accepted_tokens.device
-        state_indices = torch.tensor(sorted(set(slots)),
-                                     dtype=torch.long,
-                                     device=device)
+        state_indices = self._upload_kda_slots(sorted(set(slots)))
         committed_window = self.conv_state_shape[1]
         section_offsets = [0]
         for section_dim in self.conv_section_dims:
@@ -4487,7 +4506,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                               self.kda_beta_cache):
             assert replay_buffer is not None
             replay_buffer.index_fill_(1, state_indices, 0)
-        self.prev_num_accepted_tokens[state_indices] = 0
+        self.prev_num_accepted_tokens.index_fill_(0, state_indices, 0)
 
     def mamba_layer_cache(
         self, layer_idx: int
