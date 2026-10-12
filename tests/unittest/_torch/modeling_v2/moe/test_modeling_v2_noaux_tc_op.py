@@ -361,6 +361,9 @@ def test_degenerate_shapes() -> None:
     assert weights.shape == (0, 6) and ids.shape == (0, 6)
     assert weights.dtype == torch.bfloat16 and ids.dtype == torch.int32
 
+    # Empty inputs must leave subsequent CUDA work usable.
+    assert torch.ones(1, device="cuda").item() == 1
+
 
 def test_input_not_mutated_and_deterministic() -> None:
     torch.manual_seed(12)

@@ -183,8 +183,24 @@ def test_mpi_sleep_wakeup_kv_cache_only_tp2(process_gpu_memory_info_available):
         outputs_before = llm.generate(_PROMPTS, _SAMPLING_PARAMS)
         generated_before = [o.outputs[0].text for o in outputs_before]
 
+        mem_active = _per_device_gpu_memory()
         llm._collective_rpc("sleep", (sleep_tags,))
+        mem_sleep = _per_device_gpu_memory()
+        if process_gpu_memory_info_available:
+            active_devices = {dev for dev, size in mem_active.items() if size > 0}
+            assert len(active_devices) == 2
+            for dev in active_devices:
+                assert mem_sleep.get(dev, 0) < mem_active[dev], (
+                    f"GPU {dev} KV cache memory was not released by sleep()"
+                )
+
         llm._collective_rpc("wakeup", (sleep_tags,))
+        mem_wakeup = _per_device_gpu_memory()
+        if process_gpu_memory_info_available:
+            for dev in active_devices:
+                assert mem_wakeup.get(dev, 0) > mem_sleep.get(dev, 0), (
+                    f"GPU {dev} KV cache memory was not restored by wakeup()"
+                )
 
         outputs_after = llm.generate(_PROMPTS, _SAMPLING_PARAMS)
         generated_after = [o.outputs[0].text for o in outputs_after]

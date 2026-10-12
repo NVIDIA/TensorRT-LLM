@@ -519,6 +519,8 @@ def _summed_sender_bytes(page_table: KVCachePageTable, chunk: Chunk) -> int:
     for lg_idx, block_ids in enumerate(chunk.block_ids_per_layer_groups):
         layer_group = page_table.layer_groups[lg_idx]
         for view_idx, pool_view in enumerate(layer_group.pool_views):
+            if (lg_idx, view_idx) in chunk.excluded_pool_views:
+                continue
             # Offsets in physical slot order, as get_kv_map builds them.
             starts, bytes_per_layer = get_layer_byte_ranges(pool_view)
             offsets = np.array(sorted(starts.values()), dtype=np.int64)
@@ -543,14 +545,24 @@ class TestExpectedWriteBytesMatchSenderBytes:
     ignored-role regions no view transfers.
     """
 
-    def test_coalesced_pool_layout(self):
+    @pytest.mark.parametrize(
+        "excluded_pool_views,units_per_block",
+        [
+            pytest.param(set(), 9, id="all-views"),
+            pytest.param({(0, 0)}, 1, id="index-only"),
+            pytest.param({(0, 1)}, 8, id="kv-only"),
+            pytest.param({(0, 0), (0, 1)}, 0, id="no-views"),
+        ],
+    )
+    def test_coalesced_pool_layout(self, excluded_pool_views, units_per_block):
         page_table = _coalesced_page_table()
         chunk = _make_block_chunk(num_blocks=2)
+        chunk.excluded_pool_views = excluded_pool_views
         expected = _expected_write_bytes(page_table, chunk)
         assert expected == _summed_sender_bytes(page_table, chunk)
-        # 2 blocks x (8 K/V units + 1 index-K unit): the 9-unit physical
-        # slot is counted once, not once per view.
-        assert expected == 2 * 9 * _UNIT
+        # Both views share physical pool 0. Remote-tail exclusions name the
+        # view index, so each included region contributes exactly once.
+        assert expected == 2 * units_per_block * _UNIT
 
     def test_ignored_role_layout(self):
         page_table = _ignored_role_page_table()
