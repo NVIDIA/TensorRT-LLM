@@ -93,20 +93,17 @@ class DecoderWarmup:
         # Warmups that synthesize context batches.
         self._context_warmups_supported = context_warmups_supported
         self._eager_workspace_reclaimable = eager_workspace_reclaimable
-        # Read by decoder forward: the TRTLLM-Gen FMHA JIT warmup flag and the
-        # eager workspace reclaimer frozen at the end of warmup.
-        self.trtllm_gen_jit_warmup = False
-        self.eager_workspace_reclaimer: EagerWorkspaceReclaimer | None = None
 
     @property
     def guided_decoder(self) -> CapturableGuidedDecoder | None:
         return self._inputs.guided_decoder
 
-    def run(self, resource_manager: ResourceManager) -> None:
+    def run(self, resource_manager: ResourceManager) -> EagerWorkspaceReclaimer | None:
+        """Warm up and capture graphs; return the eager workspace reclaimer to serve with."""
         kv_cache_manager = resource_manager.get_resource_manager(self.kv_cache_manager_key)
         # Retain a partial summary when a phase raises.
         with self._warmup_timer:
-            self._warmup_scheduled(resource_manager, kv_cache_manager)
+            return self._warmup_scheduled(resource_manager, kv_cache_manager)
 
     def _get_max_shape_warmup_requests(
         self, resource_manager: ResourceManager
@@ -160,13 +157,14 @@ class DecoderWarmup:
         # Deduplicate the warmup_configs while keeping the order.
         return list(dict.fromkeys(warmup_configs))
 
-    def _warmup_scheduled(self, resource_manager: ResourceManager, kv_cache_manager) -> None:
+    def _warmup_scheduled(
+        self, resource_manager: ResourceManager, kv_cache_manager
+    ) -> EagerWorkspaceReclaimer | None:
         """Body of ``warmup`` for the scheduled (KV-cache-backed) path."""
         # Ahead of the legacy early returns below: only the advanced-sampling
         # CUDA graph capture pass exercises the non-greedy sampler, so with
         # cuda_graph_config=None flashinfer's sampling kernels would be
         # JIT-built mid-serving.
-        self.eager_workspace_reclaimer = None
         with self._warmup_timer.phase(
             "sampling_module_prewarm", metrics=self._metrics, metric_name="sampling_warmup_seconds"
         ):
@@ -319,13 +317,13 @@ class DecoderWarmup:
 
         maybe_bolt_clear_counters()
 
-        self._freeze_eager_workspace_floor()
+        return self._freeze_eager_workspace_floor()
 
-    def _freeze_eager_workspace_floor(self) -> None:
+    def _freeze_eager_workspace_floor(self) -> EagerWorkspaceReclaimer | None:
         if not self._eager_workspace_reclaimable:
-            return
+            return None
         if os.environ.get("TRTLLM_RECLAIM_WORKSPACE", "1") == "0":
-            return
+            return None
         metadata = self._metadata.attn_metadata
         if (
             self._config.is_spec_decode
@@ -338,7 +336,7 @@ class DecoderWarmup:
                 "Eager workspace reclamation is disabled for speculative, "
                 "CP, sparse, compiled, or breakable-graph models"
             )
-            return
+            return None
         if (
             type(metadata) is not TrtllmAttentionMetadata
             or not metadata.workspace_reclaimable
@@ -346,8 +344,8 @@ class DecoderWarmup:
             or metadata.workspace.untyped_storage().nbytes() == 0
         ):
             logger.info("Eager workspace reclamation requires warmup of pure fallback scratch")
-            return
-        self.eager_workspace_reclaimer = EagerWorkspaceReclaimer(metadata)
+            return None
+        return EagerWorkspaceReclaimer(metadata)
 
     def _warmup_dg_paged_mqa_logits_metadata(self) -> None:
         """Pre-compile DeepGEMM's `get_paged_mqa_logits_metadata` helper for
@@ -651,15 +649,6 @@ class DecoderWarmup:
         if not issubclass(self._config.attention_backend.Metadata, TrtllmAttentionMetadata):
             return
 
-        @contextlib.contextmanager
-        def trtllm_gen_fmha_jit_warmup():
-            previous = self.trtllm_gen_jit_warmup
-            self.trtllm_gen_jit_warmup = True
-            try:
-                yield
-            finally:
-                self.trtllm_gen_jit_warmup = previous
-
         logger.info("Running TRTLLM-Gen FMHA JIT warmup")
 
         warmup_requests_configs = []
@@ -716,13 +705,13 @@ class DecoderWarmup:
                     record=False,
                     log_start=True,
                 ):
-                    with trtllm_gen_fmha_jit_warmup():
-                        self._forward_warmup(
-                            batch,
-                            resource_manager,
-                            enable_spec_decode=self._config.is_spec_decode,
-                            runtime_draft_len=get_static_draft_len(self._config.spec_config),
-                        )
+                    self._forward_warmup(
+                        batch,
+                        resource_manager,
+                        enable_spec_decode=self._config.is_spec_decode,
+                        runtime_draft_len=get_static_draft_len(self._config.spec_config),
+                        trtllm_gen_jit_warmup=True,
+                    )
                     torch.cuda.synchronize()
 
     @staticmethod

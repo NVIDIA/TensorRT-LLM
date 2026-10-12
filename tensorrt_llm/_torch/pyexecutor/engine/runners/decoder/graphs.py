@@ -161,7 +161,10 @@ class GraphSelection(NamedTuple):
 
 
 class ForwardWarmup(Protocol):
-    """Run one dummy scheduled pass through the runner's forward."""
+    """Run one dummy scheduled pass through the runner's forward.
+
+    ``trtllm_gen_jit_warmup`` marks the pass as the TRTLLM-Gen FMHA JIT warmup.
+    """
 
     def __call__(
         self,
@@ -170,6 +173,7 @@ class ForwardWarmup(Protocol):
         *,
         enable_spec_decode: bool,
         runtime_draft_len: int,
+        trtllm_gen_jit_warmup: bool = False,
     ) -> Any: ...
 
 

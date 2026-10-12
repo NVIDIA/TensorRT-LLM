@@ -32,6 +32,7 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager, Res
 from tensorrt_llm._torch.pyexecutor.sampler.sampler_common import SampleType
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._torch.pyexecutor.warmup_timer import _WarmupTimer
+from tensorrt_llm._torch.pyexecutor.workspace import EagerWorkspaceReclaimer
 from tensorrt_llm._torch.speculative import SpecMetadata, get_draft_kv_cache_manager
 from tensorrt_llm._torch.speculative.dspark import DSparkSpecMetadata
 from tensorrt_llm._torch.utils import with_model_extra_attrs
@@ -114,6 +115,10 @@ class DecoderRunner(ScheduledModelRunner):
         self.sample_in_graph_callable = None
         # Stages (or clears) in-graph sampling state once the batch is settled.
         self._stage_in_graph_sampling = None
+        # Set by warmup: whether a forward is the TRTLLM-Gen FMHA JIT warmup,
+        # and the eager workspace reclaimer that serving forwards run under.
+        self._trtllm_gen_jit_warmup = False
+        self._eager_workspace_reclaimer: EagerWorkspaceReclaimer | None = None
 
         self._buffers = DecoderInputBuffers()
         self._buffers.allocate(self._config, self.use_beam_search)
@@ -253,7 +258,8 @@ class DecoderRunner(ScheduledModelRunner):
         return self._forward_decoder(inputs, resource_manager, is_dummy=is_dummy)
 
     def warmup(self, resource_manager: ResourceManager) -> None:
-        self._warmup.run(resource_manager)
+        self._eager_workspace_reclaimer = None
+        self._eager_workspace_reclaimer = self._warmup.run(resource_manager)
 
     def release_graphs(self) -> None:
         self._graphs.release()
@@ -372,7 +378,8 @@ class DecoderRunner(ScheduledModelRunner):
         *,
         enable_spec_decode: bool,
         runtime_draft_len: int,
-    ):
+        trtllm_gen_jit_warmup: bool = False,
+    ) -> Any:
         """Run a dummy scheduled pass with this call's speculation values."""
         inputs = make_scheduled_inputs(
             batch,
@@ -381,7 +388,12 @@ class DecoderRunner(ScheduledModelRunner):
             enable_spec_decode=enable_spec_decode,
             runtime_draft_len=runtime_draft_len,
         )
-        return self.forward(inputs, resource_manager=resource_manager, is_dummy=True)
+        previous = self._trtllm_gen_jit_warmup
+        self._trtllm_gen_jit_warmup = trtllm_gen_jit_warmup
+        try:
+            return self.forward(inputs, resource_manager=resource_manager, is_dummy=True)
+        finally:
+            self._trtllm_gen_jit_warmup = previous
 
     def _forward_decoder(
         self,
@@ -406,7 +418,7 @@ class DecoderRunner(ScheduledModelRunner):
 
         attn_metadata = self._metadata.setup_attention(kv_cache_manager, draft_kv_cache_manager)
         if isinstance(attn_metadata, TrtllmAttentionMetadata):
-            attn_metadata.trtllm_gen_jit_warmup = self._warmup.trtllm_gen_jit_warmup
+            attn_metadata.trtllm_gen_jit_warmup = self._trtllm_gen_jit_warmup
         if enable_spec_decode:
             spec_resource_manager, spec_tree_manager = get_spec_managers(resource_manager)
             spec_metadata = self._metadata.setup_speculative(spec_resource_manager)
@@ -600,7 +612,7 @@ class DecoderRunner(ScheduledModelRunner):
 
     def model_forward(self, *, is_dummy: bool, **kwargs):
         assert self._model_caller is not None
-        reclaimer = self._warmup.eager_workspace_reclaimer
+        reclaimer = self._eager_workspace_reclaimer
         metadata = kwargs["attn_metadata"]
         reclaim_scope = (
             reclaimer.forward(metadata)

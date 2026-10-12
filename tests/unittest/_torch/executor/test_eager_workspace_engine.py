@@ -170,7 +170,6 @@ class TestEagerWorkspaceReclaimer(unittest.TestCase):
 class TestEagerWorkspaceEngine(unittest.TestCase):
     def setUp(self) -> None:
         self.warmup = object.__new__(DecoderWarmup)
-        self.warmup.eager_workspace_reclaimer = None
         self.warmup._eager_workspace_reclaimable = True
         self.warmup._config = SimpleNamespace(is_spec_decode=False)
         self.warmup.mapping = SimpleNamespace(cp_size=1)
@@ -181,7 +180,10 @@ class TestEagerWorkspaceEngine(unittest.TestCase):
         self.metadata.workspace = torch.empty(4096, dtype=torch.int8)
         self.warmup._metadata = SimpleNamespace(attn_metadata=self.metadata)
         self.engine = object.__new__(DecoderRunner)
-        self.engine._warmup = self.warmup
+        self.engine._warmup = SimpleNamespace(
+            run=lambda _resource_manager: self.warmup._freeze_eager_workspace_floor()
+        )
+        self.engine._eager_workspace_reclaimer = None
         self.engine.model = SimpleNamespace(
             model_config=SimpleNamespace(extra_attrs={}), forward=Mock(return_value=42)
         )
@@ -191,7 +193,7 @@ class TestEagerWorkspaceEngine(unittest.TestCase):
         self.addCleanup(reclaimer_patch.stop)
 
     def freeze(self) -> None:
-        self.warmup._freeze_eager_workspace_floor()
+        self.engine.warmup(resource_manager=None)
 
     def call(self, *, is_dummy: bool = False) -> int:
         with (
@@ -209,12 +211,12 @@ class TestEagerWorkspaceEngine(unittest.TestCase):
     def test_forward_scope_and_warmup_bypass(self) -> None:
         with patch.dict(os.environ, {"TRTLLM_RECLAIM_WORKSPACE": "0"}):
             self.freeze()
-            self.assertIsNone(self.warmup.eager_workspace_reclaimer)
+            self.assertIsNone(self.engine._eager_workspace_reclaimer)
             self.reclaimer_class.assert_not_called()
         with patch.dict(os.environ, {"TRTLLM_RECLAIM_WORKSPACE": "1"}):
             self.freeze()
         self.reclaimer_class.assert_called_once_with(self.metadata)
-        self.assertIs(self.warmup.eager_workspace_reclaimer, self.reclaimer_class.return_value)
+        self.assertIs(self.engine._eager_workspace_reclaimer, self.reclaimer_class.return_value)
         scope = self.reclaimer_class.return_value.forward
         self.assertEqual(self.call(is_dummy=True), 42)
         scope.assert_not_called()
@@ -231,7 +233,7 @@ class TestEagerWorkspaceEngine(unittest.TestCase):
     def test_ineligible_modes_and_workspaces_do_not_create_reclaimer(self) -> None:
         with patch.object(self.warmup, "_eager_workspace_reclaimable", False):
             self.freeze()
-        self.assertIsNone(self.warmup.eager_workspace_reclaimer)
+        self.assertIsNone(self.engine._eager_workspace_reclaimer)
         self.reclaimer_class.assert_not_called()
         for target, name, value in [
             (self.warmup._config, "is_spec_decode", True),
@@ -241,17 +243,17 @@ class TestEagerWorkspaceEngine(unittest.TestCase):
         ]:
             with self.subTest(mode=name), patch.object(target, name, value):
                 self.freeze()
-                self.assertIsNone(self.warmup.eager_workspace_reclaimer)
+                self.assertIsNone(self.engine._eager_workspace_reclaimer)
         with patch.object(self.warmup.mapping, "cp_size", 2):
             self.freeze()
-            self.assertIsNone(self.warmup.eager_workspace_reclaimer)
+            self.assertIsNone(self.engine._eager_workspace_reclaimer)
         self.metadata.workspace_reclaimable = False
         self.freeze()
-        self.assertIsNone(self.warmup.eager_workspace_reclaimer)
+        self.assertIsNone(self.engine._eager_workspace_reclaimer)
         self.metadata.workspace_reclaimable = True
         self.metadata.workspace = torch.empty(0, dtype=torch.int8)
         self.freeze()
-        self.assertIsNone(self.warmup.eager_workspace_reclaimer)
+        self.assertIsNone(self.engine._eager_workspace_reclaimer)
 
 
 if __name__ == "__main__":

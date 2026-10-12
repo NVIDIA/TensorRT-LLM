@@ -295,7 +295,7 @@ def test_prefill_compile_scopes_whole_model_forward(
     model = SimpleNamespace(model_config=SimpleNamespace(extra_attrs={}), forward=forward)
     engine = SimpleNamespace(
         _model_caller=ModelCaller(model, prefill_compile_only=prefill_only),
-        _warmup=SimpleNamespace(eager_workspace_reclaimer=None),
+        _eager_workspace_reclaimer=None,
     )
     monkeypatch.setattr(model_call_module, "get_model_extra_attrs", lambda: {})
     monkeypatch.setattr(
@@ -368,7 +368,7 @@ def test_compiled_mxfp8_warmup_backend_selection(
             spec_config=None,
         ),
         _torch_compile_backend=None,
-        _warmup=SimpleNamespace(eager_workspace_reclaimer=None),
+        _eager_workspace_reclaimer=None,
         is_warmup=True,
         model=SimpleNamespace(
             modules=lambda: [
@@ -726,10 +726,15 @@ def test_warmup_phases_pass_configured_speculation_state(phase: str) -> None:
             )
             runner._graphs._capture_prefill_cuda_graphs(resource_manager)
 
+    jit_warmup = {"trtllm_gen_jit_warmup": True} if phase == "attention" else {}
     assert forward_warmup.call_count > 0
     assert (
         forward_warmup.call_args_list
-        == [call(batch, resource_manager, enable_spec_decode=True, runtime_draft_len=3)]
+        == [
+            call(
+                batch, resource_manager, enable_spec_decode=True, runtime_draft_len=3, **jit_warmup
+            )
+        ]
         * forward_warmup.call_count
     )
 
@@ -925,7 +930,7 @@ class TestWarmupCleanup(unittest.TestCase):
                     events.clear()
                     warmup_sampling.reset_mock()
                     warmup._config.enable_in_graph_sampling = enabled
-                    warmup.eager_workspace_reclaimer = object()
+                    runner._eager_workspace_reclaimer = object()
                     model_engine._warmup_impl(resource_manager)
                     self.assertEqual(
                         events,
@@ -935,7 +940,7 @@ class TestWarmupCleanup(unittest.TestCase):
                             ("exit", "sampling_warmup_seconds"),
                         ],
                     )
-                    self.assertIsNone(warmup.eager_workspace_reclaimer)
+                    self.assertIsNone(runner._eager_workspace_reclaimer)
                     warmup_sampling.assert_called_once_with()
 
         self.assertTrue(

@@ -359,7 +359,7 @@ def _make_forward_only_engine(
     decoder.moe_load_balancer = None
     engine._runner = decoder
     decoder._lora = SimpleNamespace(cuda_graph_manager=None)
-    decoder._warmup = SimpleNamespace(trtllm_gen_jit_warmup=False)
+    decoder._trtllm_gen_jit_warmup = False
 
     semantic_attn_metadata = Mock()
     graph_attn_metadata = Mock()
@@ -3174,6 +3174,31 @@ class TestDecodeGraphMetadataPreparation(unittest.TestCase):
                     runner.replay.assert_called_once()
                 if mode == "fallback":
                     engine._runner._forward_step.assert_called_once()
+
+    def test_jit_warmup_flag_marks_only_the_warmup_forward(self):
+        engine, _, resource_manager, _, _ = _make_forward_only_engine(None)
+        runner = engine._runner
+        metadata = self._metadata()
+        runner.attn_metadata = metadata
+        runner._metadata.setup_attention.return_value = metadata
+        prepared = runner._inputs.prepare_inputs.return_value
+        observed = []
+
+        def prepare(*args, **kwargs):
+            observed.append(metadata.trtllm_gen_jit_warmup)
+            return prepared
+
+        runner._inputs.prepare_inputs.side_effect = prepare
+        batch = ScheduledRequests()
+        batch.generation_requests = [_make_request_stub(1)]
+        for jit_warmup in (True, False):
+            runner._forward_warmup(batch,
+                                   resource_manager,
+                                   enable_spec_decode=False,
+                                   runtime_draft_len=0,
+                                   trtllm_gen_jit_warmup=jit_warmup)
+        self.assertEqual(observed, [True, False])
+        self.assertFalse(runner._trtllm_gen_jit_warmup)
 
 
 if __name__ == "__main__":
