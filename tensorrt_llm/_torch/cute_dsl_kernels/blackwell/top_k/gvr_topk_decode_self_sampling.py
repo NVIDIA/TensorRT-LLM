@@ -3190,7 +3190,8 @@ def run(logits, pre_idx, n: int, out, ws):
         import gvr_topk_decode_self_sampling_host as ct_dispatch
     b, npad = logits.shape
     k = pre_idx.shape[1]
-    r = ct_dispatch.route(b, int(n), npad, k)
+    num_sms, sm_version = ct_dispatch.device_route_profile(logits.get_device())
+    r = ct_dispatch.route(b, int(n), npad, k, num_sms, sm_version)
     assert r["kernel"] == "main", f"shape routes to {r['kernel']}, not gvr_main"
     assert ws.numel() * ws.element_size() >= WS_BYTES
     rt = r["rt"]
@@ -5874,7 +5875,8 @@ def run__clus(logits, pre_idx, n: int, out):
         import gvr_topk_decode_self_sampling_host as ct_dispatch
     b, npad = logits.shape
     k = pre_idx.shape[1]
-    r = ct_dispatch.route(b, int(n), npad, k)
+    num_sms, sm_version = ct_dispatch.device_route_profile(logits.get_device())
+    r = ct_dispatch.route(b, int(n), npad, k, num_sms, sm_version)
     assert r["kernel"] == "clus", f"shape routes to {r['kernel']}, not gvr_clus"
     rt = r["rt"]
     kobj = GvrClusKernel(*r["tpl"], scap=rt["SCAP"], cmp_=rt["CMP"])
