@@ -200,3 +200,26 @@ def test_record_roundtrip(tmp_path, monkeypatch):
     p3 = jp.JitPrefetcher(rank=0)
     assert p3._replay == []
     p3._record_fh.close()
+
+
+def test_deep_gemm_compile_counted_once_per_shape(monkeypatch):
+    """Only the first slow launch of an (m, n, k) counts as an executor
+    compile; repeats of the same shape are host stalls."""
+    from tensorrt_llm._torch import jit_prefetch as jp
+    from tensorrt_llm._torch import jit_prefetch_deep_gemm as jdg
+
+    monkeypatch.setenv("TLLM_JIT_STATS", "1")
+    monkeypatch.delenv("TLLM_JIT_PREFETCH", raising=False)
+    monkeypatch.delenv("TLLM_JIT_RECORD_DIR", raising=False)
+    monkeypatch.setattr(jdg, "done_observer", None)
+    monkeypatch.setattr(jdg, "launch_observer", None)
+    p = jp.JitPrefetcher(rank=0)
+    p.bind_executor_thread()
+    p.observe_deep_gemm()
+    slow = jdg.COMPILE_HOST_S + 0.1
+    for _ in range(3):
+        jdg.done_observer(128, 7168, 2048, slow)
+    jdg.done_observer(64, 7168, 2048, slow)
+    jdg.done_observer(32, 7168, 2048, 0.0)  # fast first launch: a cache hit
+    jdg.done_observer(32, 7168, 2048, slow)  # a stall, not a compile
+    assert p.stats.dg_executor_compiles == 2

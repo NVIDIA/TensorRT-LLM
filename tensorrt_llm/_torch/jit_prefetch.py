@@ -482,6 +482,12 @@ class JitPrefetcher:
                 text=True,
                 bufsize=1,
             )
+            # Lowest CPU priority, inherited by the compilers a helper forks:
+            # a helper only uses CPU time the executor and its threads leave.
+            try:
+                os.setpriority(os.PRIO_PROCESS, p.pid, 19)
+            except OSError:
+                pass
             self._procs.append(p)
             self._ready[p.pid] = threading.Event()
             threading.Thread(target=self._feed_loop, args=(p, q), daemon=True).start()
@@ -495,8 +501,19 @@ class JitPrefetcher:
         """
         from . import jit_prefetch_deep_gemm as jdg
 
+        # DeepGEMM keeps a kernel in memory once loaded, so only the first
+        # launch of an (m, n, k) can compile; a later slow launch of it is a
+        # host stall (e.g. the caching allocator releasing blocks near its
+        # memory limit), not a compile.
+        seen_shapes: set = set()
+
         def _done(m, n, k, dt):
-            if dt < jdg.COMPILE_HOST_S or threading.get_ident() != self._executor_thread:
+            shape = (m, n, k)
+            first = shape not in seen_shapes
+            seen_shapes.add(shape)
+            if not first or dt < jdg.COMPILE_HOST_S:
+                return
+            if threading.get_ident() != self._executor_thread:
                 return
             self.stats.dg_executor_compiles += 1
             self.stats.dg_executor_compile_s += dt
