@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""End-to-end tests for the beam-history speculative D2H opt-in.
+"""End-to-end and sampler tests for the beam-history speculative D2H opt-in.
 
 This file covers the code paths gated behind
 `TorchLlmArgs.enable_speculative_beam_history_d2h`:
@@ -40,11 +40,16 @@ import pytest
 import torch
 from pydantic import ValidationError
 from test_beam_search_util import DummyConfigLoader, DummyWeightLoader
+from torch._dynamo.testing import CompileCounterWithBackend
 
 from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm._torch.models.checkpoints import HfCheckpointLoader
-from tensorrt_llm._torch.pyexecutor.sampler import SampleStateTorch, TorchSampler
+from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState
+from tensorrt_llm._torch.pyexecutor.sampler import TorchSampler
+from tensorrt_llm._torch.pyexecutor.sampler import beam_search as beam_search_module
 from tensorrt_llm._torch.pyexecutor.sampler.beam_search import BeamSearchHandler
+from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
+from tensorrt_llm.bindings import SamplingConfig
 from tensorrt_llm.executor.result import GenerationResult
 from tensorrt_llm.llmapi import KvCacheConfig
 
@@ -152,24 +157,20 @@ def _run_with_env(
     stop_token_ids: list[int] | None,
     predictor_override: Any = None,
     sampler_force_async_worker: bool = False,
-    sampler_method_patches: dict[str, Any] | None = None,
 ) -> list[GenerationResult]:
     """Build a fresh LLM with the speculative flag configured, run beam search, tear down.
 
     Opt-in is via `TorchLlmArgs.enable_speculative_beam_history_d2h`.
     `predictor_override` patches
-    `BeamSearchHandler.predict_is_likely_finishing` and
-    `sampler_method_patches` patches arbitrary `TorchSampler` methods;
-    either forces `TLLM_WORKER_USE_SINGLE_PROCESS=1` so class-level patches
+    `BeamSearchHandler.predict_is_likely_finishing` and forces
+    `TLLM_WORKER_USE_SINGLE_PROCESS=1` so class-level patches
     reach the sampler. `sampler_force_async_worker` enables the
     AsyncWorkerMixin path.
     """
-    needs_single_process = predictor_override is not None or sampler_method_patches
-    if needs_single_process:
+    if predictor_override is not None:
         # Class-level patches do not cross process boundaries; force the
         # sampler to run in-process so the patch is observed.
         monkeypatch.setenv("TLLM_WORKER_USE_SINGLE_PROCESS", "1")
-    if predictor_override is not None:
         monkeypatch.setattr(BeamSearchHandler, "predict_is_likely_finishing", predictor_override)
 
     gc.collect(2)
@@ -182,14 +183,7 @@ def _run_with_env(
     try:
         with llm:
             sampling_params = _make_sampling_params(fixed_params, stop_token_ids)
-            if sampler_method_patches:
-                # Warmup before installing the hooks.
-                _generate(llm, input_prompts, sampling_params)
-            with monkeypatch.context() if sampler_method_patches else nullcontext() as p:
-                for name, replacement in (sampler_method_patches or {}).items():
-                    p.setattr(TorchSampler, name, replacement)
-                # Run with the hooks installed.
-                return _generate(llm, input_prompts, sampling_params)
+            return _generate(llm, input_prompts, sampling_params)
     finally:
         del llm
         gc.collect(2)
@@ -450,65 +444,133 @@ def _assert_no_cuda_sync_locally() -> Generator[None, None, None]:
         torch.cuda.set_sync_debug_mode(previous_mode)
 
 
+@pytest.mark.parametrize("batch_size", [1, 3])
 @pytest.mark.threadleak(enabled=False)
 def test_speculative_d2h_predictor_hit_is_sync_free(
+    batch_size: int,
     fixed_params: dict[str, Any],
     input_prompts: list[list[int]],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Speculative + always-hit path must not introduce host-device syncs
-    inside `sample_async` or inside `update_requests` after the sampler
-    event has been awaited.
+    """Check warmed sampler execution with deterministic context/decode batches.
 
-    Mirrors the sync check used by
-    `tests/unittest/_torch/sampler/test_beam_search.py::validate_outputs`,
-    but pins the predictor to always-hit so every step routes through
-    the side-stream copier and never reaches the `.cpu()` fallback.
+    An LLM.generate warmup does not guarantee the same scheduling as the checked
+    run. In particular, batch=1 specializes even with mark_dynamic and can cause
+    Inductor to recompile (and synchronize while folding constants) under the
+    no-sync guard. Replay the same schedule with fresh requests and sampler state
+    instead. Cover the first, intermediate and terminal steps for both singleton
+    and multi-request batches, and reject compilation during the checked replay.
     """
-    _always_hit, hit_state = _pinned_predictor(True)
+    beam_width = fixed_params["max_beam_width"]
+    max_tokens = fixed_params["max_tokens"]
+    prompts = input_prompts[:batch_size]
+    sampling_params = _make_sampling_params(fixed_params, stop_token_ids=None)
+    always_hit, hit_state = _pinned_predictor(True)
+    monkeypatch.setattr(BeamSearchHandler, "predict_is_likely_finishing", always_hit)
 
-    sample_async_orig = TorchSampler.sample_async
-    update_requests_orig = TorchSampler.update_requests
-    hook_state = {"sample_async_called": False, "update_requests_called": False}
+    # Use the production math and Inductor options, with a test-local backend
+    # counter so another test's compilation history cannot hide missing warmup.
+    compiler = CompileCounterWithBackend("inductor")
+    checking = False
 
-    def _sample_async_hook(self, *args, **kwargs):  # type: ignore[no-untyped-def]
-        hook_state["sample_async_called"] = True
-        with _assert_no_cuda_sync_locally():
-            return sample_async_orig(self, *args, **kwargs)
+    def compile_backend(graph: torch.fx.GraphModule, inputs: list[Any]) -> Any:
+        assert not checking, "CBA compilation during sync check: warmup did not cover this input"
+        return compiler(graph, inputs)
 
-    def _update_requests_hook(self, state: SampleStateTorch, *args, **kwargs):  # type: ignore[no-untyped-def]
-        hook_state["update_requests_called"] = True
-        # Sampler event awaits all device work (incl. side-stream copies)
-        # and is the one expected sync; do it outside the guard below.
-        sampler_event = state.sampler_event
-        if sampler_event:
-            sampler_event.synchronize()
-        with _assert_no_cuda_sync_locally():
+    monkeypatch.setattr(
+        beam_search_module,
+        "_cba_step_compiled_inner",
+        torch.compile(
+            beam_search_module._cba_step_math,
+            backend=compile_backend,
+            dynamic=None,
+            fullgraph=True,
+        ),
+    )
+
+    generator = torch.Generator(device="cuda").manual_seed(42)
+    logits = [
+        torch.randn(
+            (batch_size if step == 0 else batch_size * beam_width, 32),
+            device="cuda",
+            generator=generator,
+        )
+        for step in range(max_tokens)
+    ]
+
+    def run_steps() -> list[list[list[list[int]]]]:
+        # Reconstruct state instead of sampling twice into the same requests:
+        # sample_async mutates device stores and update_requests advances tokens.
+        sampler = TorchSampler(
+            TorchSampler.Args(
+                max_seq_len=32,
+                max_draft_len=0,
+                max_num_sequences=batch_size,
+                max_beam_width=beam_width,
+                max_total_draft_tokens=0,
+                disable_overlap_scheduler=True,
+                enable_speculative_beam_history_d2h=True,
+            )
+        )
+        requests = [
+            LlmRequest(
+                request_id=slot,
+                seq_slot=slot,
+                input_tokens=prompt,
+                max_new_tokens=max_tokens,
+                end_id=-1,
+                sampling_config=SamplingConfig(sampling_params._get_sampling_config()),
+                is_streaming=False,
+            )
+            for slot, prompt in enumerate(prompts)
+        ]
+        token_history = []
+        for step, step_logits in enumerate(logits):
+            scheduled = ScheduledRequests()
+            if step == 0:
+                scheduled.context_requests_last_chunk = requests
+            else:
+                scheduled.generation_requests = requests
+            prefix_sum = list(range(batch_size + 1)) if step == 0 else [0]
+            with _assert_no_cuda_sync_locally() if checking else nullcontext():
+                state = sampler.sample_async(
+                    scheduled,
+                    model_outputs={"logits": step_logits},
+                    num_context_logits_prefix_sum=prefix_sum,
+                )
+
+            event = state.sampler_event
+            assert event is not None
+            assert event.side_stream_event is not None, "Speculative D2H copies were not issued"
+            # This is the expected synchronization, including the side stream.
+            event.synchronize()
             state.sampler_event = None
             try:
-                return update_requests_orig(self, state, *args, **kwargs)
+                with _assert_no_cuda_sync_locally() if checking else nullcontext():
+                    sampler.update_requests(state)
             finally:
-                state.sampler_event = sampler_event
+                state.sampler_event = event
 
-    _ = _run_with_env(
-        fixed_params,
-        input_prompts,
-        monkeypatch,
-        speculative=True,
-        stop_token_ids=None,
-        predictor_override=_always_hit,
-        sampler_method_patches={
-            "sample_async": _sample_async_hook,
-            "update_requests": _update_requests_hook,
-        },
-    )
+            token_history.append(
+                [[list(req.get_tokens(beam)) for beam in range(beam_width)] for req in requests]
+            )
+            for req in requests:
+                assert req.is_finished == (step == max_tokens - 1)
+                if not req.is_finished:
+                    # Mirror the executor's transition after handling responses.
+                    req.state = LlmRequestState.GENERATION_IN_PROGRESS
+                    req.decoding_iter = req.py_decoding_iter
+        return token_history
 
-    assert hit_state["calls"] > 0, (
-        "predictor patch was never invoked; the speculative path did not run "
-        "(check that enable_speculative_beam_history_d2h is honored)"
-    )
-    assert hook_state["sample_async_called"], "sample_async hook was never invoked"
-    assert hook_state["update_requests_called"], "update_requests hook was never invoked"
+    expected = run_steps()
+    assert compiler.frame_count > 0, "CBA compilation was not exercised"
+    compile_count = compiler.frame_count
+    hit_state["calls"] = 0
+    checking = True
+    actual = run_steps()
+    assert compiler.frame_count == compile_count
+    assert hit_state["calls"] >= max_tokens, "Predictor was not called on every checked step"
+    assert actual == expected
 
 
 if __name__ == "__main__":

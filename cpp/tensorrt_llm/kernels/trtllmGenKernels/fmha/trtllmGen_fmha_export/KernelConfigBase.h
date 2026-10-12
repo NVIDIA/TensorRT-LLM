@@ -659,6 +659,8 @@ __host__ __device__ inline float getSoftmaxPScale(tg::Dtype dtypeBmm2,
   X(bool, mUseBlockSparseAttention, false, bool)                                                   \
   /* Whether to emit the DSv4 fused-epilogue scales as UE8M0 exponent bytes instead of FP32. */    \
   X(bool, mUsesDsv4Ue8m0ScaleO, false, bool)                                                       \
+  /* Whether to compute softmax row sums with P times an all-ones matrix using UTCMMA. */          \
+  X(bool, mUsesMmaForSoftmaxSum, false, bool)                                                      \
   /* Whether to use an ordered sequence between softmax0 and softmax1. */                          \
   X(bool, mUsesOrderedSequence, true, bool)                                                        \
   /* Whether to use CGA reduction (deprecated, kept for benchmarking). */                          \

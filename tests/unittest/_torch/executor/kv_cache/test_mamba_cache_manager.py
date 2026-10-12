@@ -150,6 +150,8 @@ def _hybrid_model_config():
     )
     return SimpleNamespace(
         pretrained_config=config,
+        mapping=Mapping(world_size=1, tp_size=1, pp_size=1),
+        spec_config=None,
         sparse_attention_config=None,
         get_num_mamba_layers=lambda: 1,
     )
@@ -297,6 +299,8 @@ def _kimi_model_config() -> SimpleNamespace:
     )
     return SimpleNamespace(
         pretrained_config=config,
+        mapping=Mapping(world_size=1, tp_size=1, pp_size=1),
+        spec_config=None,
         quant_config=None,
         sparse_attention_config=None,
         get_num_mamba_layers=lambda: 2,

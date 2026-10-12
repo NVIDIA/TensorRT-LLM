@@ -1788,30 +1788,31 @@ class MiniMaxM3Attention(Attention):
         else:
             # Decode: one query token per request at position seq_lens - 1.
             valid = kv_positions < seq_lens_dev.unsqueeze(-1)  # [batch, max_k]
-            q_b = q_view.view(batch, 1, self.num_heads, self.head_dim).transpose(
-                1, 2
-            )  # [batch, H, 1, d]
             mask_b = valid.unsqueeze(1).unsqueeze(1)  # [batch, 1, 1, k]
-            # Expand K/V one KV head at a time: all heads at once needs an
-            # O(batch * max_k * num_heads) temporary that overflows the CUDA-graph
-            # pool under attention DP.
-            out_b = q.new_empty(batch, self.num_heads, 1, self.head_dim)
+            # Fold the GQA group into SDPA's query-length axis: the ``group`` Q
+            # heads sharing KV head h become ``group`` query rows of one SDPA
+            # head that reads KV head h unexpanded. Exact for decode (every
+            # query row sits at seq_lens - 1, so one key mask serves them all),
+            # and it needs neither an O(batch * max_k * num_heads)
+            # repeat_interleave temporary in the CUDA-graph pool nor one SDPA
+            # launch per KV head.
+            num_kv_heads = max(self.num_key_value_heads, 1)
+            q_b = q_view.view(batch, num_kv_heads, group, self.head_dim)  # [batch, KV, group, d]
+            k_b = k_padded.transpose(1, 2)  # [batch, KV, k, d]
+            v_b = v_padded.transpose(1, 2)  # [batch, KV, k, d]
             with sdpa_kernel(_DENSE_SDPA_BACKENDS):
-                for h in range(max(self.num_key_value_heads, 1)):
-                    qh = slice(h * group, (h + 1) * group)
-                    k_h = k_padded[:, :, h : h + 1].repeat_interleave(group, dim=2)
-                    v_h = v_padded[:, :, h : h + 1].repeat_interleave(group, dim=2)
-                    out_b[:, qh] = torch.nn.functional.scaled_dot_product_attention(
-                        q_b[:, qh].to(q.dtype),
-                        k_h.transpose(1, 2).to(q.dtype),
-                        v_h.transpose(1, 2).to(q.dtype),
-                        attn_mask=mask_b,
-                        dropout_p=0.0,
-                        is_causal=False,
-                    )  # [batch, group, 1, d]
-            # Drop the singleton query axis; a transpose(1, 2).reshape would
-            # scramble (head, head_dim) when H != head_dim.
-            output.view(batch, self.num_heads, self.head_dim).copy_(out_b.squeeze(2))
+                out_b = torch.nn.functional.scaled_dot_product_attention(
+                    q_b.to(q.dtype),
+                    k_b.to(q.dtype),
+                    v_b.to(q.dtype),
+                    attn_mask=mask_b,
+                    dropout_p=0.0,
+                    is_causal=False,
+                )  # [batch, KV, group, d]
+            # Q head h * group + g is query row g of SDPA head h, so viewing the
+            # output as [batch, KV, group, d] keeps (head, head_dim) ordering; a
+            # transpose(1, 2).reshape would scramble it when H != head_dim.
+            output.view(batch, num_kv_heads, group, self.head_dim).copy_(out_b)
 
         return output
 

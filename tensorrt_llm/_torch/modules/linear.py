@@ -2958,23 +2958,27 @@ class W4A16_AWQ_LinearMethod(LinearMethodBase):
         elm_packing = 2 if module.tp_mode == TensorParallelMode.COLUMN else 1
         load_weights_vanilla_helper(module, weights, elm_packing=elm_packing)
 
-        # Use the same device as the weight tensor
-        # as we register pre_quant_scale after sharded model weights are moved to respective gpus
-        device = module.weight.device
-        pre_quant_scale = module.load_shard(
-            weights[0]["pre_quant_scale"],
-            # pre_quant_scale applies to activation as opposed to weight, so flip tp_mode the other way around
-            flip_tp=True,
-            device=device,
-        )
+        pre_quant_scale = weights[0].get("pre_quant_scale")
+        if pre_quant_scale is not None:
+            # Use the device of the loaded weight for the activation scale.
+            device = module.weight.device
+            pre_quant_scale = module.load_shard(
+                pre_quant_scale,
+                # Activation scales shard along the input dimension.
+                flip_tp=True,
+                device=device,
+            )
 
-        module.pre_quant_scale = Parameter(
-            torch.ones((module.in_features, ), dtype=pre_quant_scale.dtype),
-            requires_grad=False).to(device=device)
+            module.pre_quant_scale = Parameter(
+                torch.ones((module.in_features, ), dtype=pre_quant_scale.dtype),
+                requires_grad=False).to(device=device)
+
+            copy_weight(module.pre_quant_scale, pre_quant_scale)
+        else:
+            module.pre_quant_scale = None
 
         weight_scale = self.load_weight_scales(module, weights)[0]
 
-        copy_weight(module.pre_quant_scale, pre_quant_scale)
         copy_weight(module.weight_scale, weight_scale.T.contiguous())
 
     def load_weights_fused_qkv_linear(self, module: Linear,

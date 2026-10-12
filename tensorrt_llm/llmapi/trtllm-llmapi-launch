@@ -10,11 +10,27 @@ mpi_rank=${SLURM_PROCID:-${OMPI_COMM_WORLD_RANK:-${PMI_RANK:-${PMI_ID:-0}}}}
 
 flashinfer_workspace_lock_held=0
 flashinfer_temporary_workspace=
+owned_child_pids=()
+owned_payload_pgids=()
+owned_ready_files=()
+owned_guard_active=()
+guard_directory=
 
 log_stderr() { echo -e "\033[33m$@\033[0m" >&2; }
 log_stderr "mpi_rank: $mpi_rank"
 
-pid=$(ps -o pid= -p $$ | tr -d ' ')
+# Allow TLLM_MGMN_SHUTDOWN_GRACE_SECONDS plus cold stop-helper startup/import,
+# communication and cleanup overhead. Increase this budget when raising that grace.
+stop_timeout=${TLLM_LLMAPI_LAUNCH_STOP_TIMEOUT:-120}
+if [[ ! "$stop_timeout" =~ ^[1-9][0-9]*$ ]] || [ "${#stop_timeout}" -gt 6 ]; then
+    log_stderr "TLLM_LLMAPI_LAUNCH_STOP_TIMEOUT must be a positive integer of at most six digits"
+    exit 2
+fi
+term_grace_seconds=${TLLM_LLMAPI_LAUNCH_TERM_GRACE_SECONDS:-5}
+if [[ ! "$term_grace_seconds" =~ ^[1-9][0-9]*$ ]] || [ "${#term_grace_seconds}" -gt 6 ]; then
+    log_stderr "TLLM_LLMAPI_LAUNCH_TERM_GRACE_SECONDS must be a positive integer of at most six digits"
+    exit 2
+fi
 
 # Tell TRTLLM to spawn a additional process for the Proxy
 export TLLM_SPAWN_PROXY_PROCESS=1
@@ -31,8 +47,85 @@ function mpi_world_size {
     fi
 }
 
-function cleanup_flashinfer_temporary_workspace {
+# A completed guard holds its workload leader unreaped until we retire the
+# registration. This pins the process group identity through the last signal.
+function command_running {
+    local child_pid=$1
+    local index
+    for index in "${!owned_child_pids[@]}"; do
+        [ "${owned_child_pids[$index]}" = "$child_pid" ] || continue
+        [ "${owned_guard_active[$index]}" -eq 1 ] || return 1
+        if [ -f "${owned_ready_files[$index]}.done" ]; then
+            owned_guard_active[$index]=0
+            if ! : > "${owned_ready_files[$index]}.reap"; then
+                log_stderr "Failed to acknowledge process guard completion"
+                # The guard still pins the group until this acknowledgment.
+                kill -KILL -- "-${owned_payload_pgids[$index]}" 2>/dev/null || true
+                kill -KILL -- "-$child_pid" 2>/dev/null || true
+            fi
+            wait "$child_pid" 2>/dev/null || true
+            return 1
+        fi
+    done
+    kill -0 "$child_pid" 2>/dev/null
+}
+
+# Wait budgets count 100ms sleeps; polling work and scheduling delays add time.
+function cleanup_owned_children {
+    local index child_pid payload_pgid
+    local cleanup_polls_remaining=$((term_grace_seconds * 10))
+    local children_alive
+
+    for index in "${!owned_child_pids[@]}"; do
+        child_pid=${owned_child_pids[$index]}
+        command_running "$child_pid" || true
+        [ "${owned_guard_active[$index]}" -eq 1 ] || continue
+        # Signal the guard too, including a guard still registering its payload.
+        kill -TERM -- "-$child_pid" 2>/dev/null || true
+    done
+    while true; do
+        children_alive=0
+        for index in "${!owned_child_pids[@]}"; do
+            [ "${owned_guard_active[$index]}" -eq 1 ] || continue
+            if command_running "${owned_child_pids[$index]}"; then
+                children_alive=1
+            fi
+        done
+        [ "$children_alive" -eq 0 ] && break
+        [ "$cleanup_polls_remaining" -eq 0 ] && break
+        sleep 0.1
+        cleanup_polls_remaining=$((cleanup_polls_remaining - 1))
+    done
+    for index in "${!owned_child_pids[@]}"; do
+        child_pid=${owned_child_pids[$index]}
+        [ "${owned_guard_active[$index]}" -eq 1 ] || continue
+        payload_pgid=${owned_payload_pgids[$index]}
+        # A guard can publish readiness while EXIT cleanup is already running.
+        if [ -z "$payload_pgid" ] && [ -f "${owned_ready_files[$index]}" ]; then
+            read -r payload_pgid < "${owned_ready_files[$index]}"
+        fi
+        if [[ "$payload_pgid" =~ ^[1-9][0-9]*$ ]]; then
+            kill -KILL -- "-$payload_pgid" 2>/dev/null || true
+        fi
+        owned_guard_active[$index]=0
+        if ! : > "${owned_ready_files[$index]}.reap"; then
+            log_stderr "Failed to acknowledge process guard cleanup"
+            kill -KILL -- "-$child_pid" 2>/dev/null || true
+        fi
+        # Reap the guard after it has killed/reaped its workload. Never kill a
+        # guard ahead of its payload group, including during startup.
+        wait "$child_pid" 2>/dev/null || true
+    done
+}
+
+function cleanup_launcher {
     local exit_status=$?
+
+    trap - INT TERM
+    cleanup_owned_children
+    if [ -n "$guard_directory" ]; then
+        rm -rf -- "$guard_directory"
+    fi
 
     if [ -n "$flashinfer_temporary_workspace" ]; then
         if ! rm -rf -- "$flashinfer_temporary_workspace"; then
@@ -44,7 +137,7 @@ function cleanup_flashinfer_temporary_workspace {
     exit "$exit_status"
 }
 
-trap cleanup_flashinfer_temporary_workspace EXIT
+trap cleanup_launcher EXIT
 
 function use_unique_flashinfer_workspace {
     local temporary_root=${TMPDIR:-/tmp}
@@ -179,6 +272,9 @@ unset TLLM_SPAWN_PROXY_PROCESS_IPC_HMAC_KEY
 # The launcher owns the workspace lock. Long-lived child commands close its
 # descriptor so detached descendants cannot keep a stale slot locked.
 if [ -z "$mpi_rank" ] || [ "$mpi_rank" -eq 0 ]; then
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+
     if ! hmac_key=$(openssl rand -hex 32); then
         log_stderr "Failed to generate TLLM_SPAWN_PROXY_PROCESS_IPC_HMAC_KEY"
         exit 1
@@ -204,8 +300,15 @@ if [ -z "$mpi_rank" ] || [ "$mpi_rank" -eq 0 ]; then
         I_MPI_ HYDRA_ KMP_ MPICH_ MV2_ CRAY_
     )
 
-    (
-        # Remove MPI-related variables only in the subshell context
+    function exec_child_command {
+        if [ "$flashinfer_workspace_lock_held" -eq 1 ]; then
+            exec 200>&-
+        fi
+        exec "$@"
+    }
+
+    function exec_without_mpi_environment {
+        local var prefix
         for var in $(compgen -e); do
             for prefix in "${mpi_blacklist[@]}"; do
                 if [[ "$var" == "$prefix"* ]]; then
@@ -214,53 +317,151 @@ if [ -z "$mpi_rank" ] || [ "$mpi_rank" -eq 0 ]; then
                 fi
             done
         done
+        exec_child_command "$@"
+    }
 
-        # Turn off "exit on error" so the following lines always run
-        set +e
+    guard_path="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/_llmapi_process_guard.py"
+    guard_directory=$(mktemp -d "${TMPDIR:-/tmp}/trtllm-launch-guards.XXXXXXXX")
 
-        # Execute the task with cleaned environment
-        run_child_command "${task_with_command[@]}"
-        task_exit_code=$?
-        log_stderr "Rank${mpi_rank} Task exit code: $task_exit_code"
-
-        # Stop the MPI Comm server
-        run_child_command python3 -m tensorrt_llm.llmapi.mgmn_leader_node --action stop
-        mpi_exit_code=$?
-        log_stderr "Rank${mpi_rank} MPI Comm server exit code: $mpi_exit_code"
-
-        # Propagate task exit status
-        if [ $task_exit_code -ne 0 ]; then
-            exit $task_exit_code
-        else
-            exit $mpi_exit_code
+    function start_guarded_command {
+        local role=$1
+        shift
+        local ready_file="$guard_directory/$role"
+        local guard_pid payload_pgid guard_exit_code
+        local polls_remaining=$((stop_timeout * 10))
+        local index=${#owned_child_pids[@]}
+        local environment_function=exec_without_mpi_environment
+        [ "$role" = server ] && environment_function=exec_child_command
+        "$environment_function" python3 -S "$guard_path" \
+            --parent-pid "$$" --term-grace "$term_grace_seconds" \
+            --ready-file "$ready_file" --go-file "$ready_file.go" \
+            --role "$role" -- "$@" < /dev/null &
+        guard_pid=$!
+        owned_child_pids+=("$guard_pid")
+        owned_payload_pgids+=("")
+        owned_ready_files+=("$ready_file")
+        owned_guard_active+=(1)
+        while [ ! -f "$ready_file" ]; do
+            if ! kill -0 "$guard_pid" 2>/dev/null; then
+                wait "$guard_pid"
+                guard_exit_code=$?
+                owned_guard_active[$index]=0
+                log_stderr "Failed to register $role process guard (status $guard_exit_code)"
+                [ "$guard_exit_code" -eq 0 ] && guard_exit_code=1
+                return "$guard_exit_code"
+            fi
+            if [ "$polls_remaining" -eq 0 ]; then
+                log_stderr "$role process guard registration exceeded ${stop_timeout}s"
+                return 124
+            fi
+            sleep 0.1
+            polls_remaining=$((polls_remaining - 1))
+        done
+        read -r payload_pgid < "$ready_file"
+        if [[ ! "$payload_pgid" =~ ^[1-9][0-9]*$ ]]; then
+            log_stderr "Invalid $role process group registration"
+            return 1
         fi
-    ) &
+        owned_payload_pgids[$index]=$payload_pgid
+        log_stderr "Rank${mpi_rank} $role guard PID: $guard_pid; workload PGID: $payload_pgid"
+        if ! : > "$ready_file.go"; then
+            log_stderr "Failed to release $role process guard"
+            return 1
+        fi
+        started_guard_pid=$guard_pid
+    }
 
-    # Turn off "exit on error" so the following lines always run
+    # Guards stay direct children; each owns a separate workload process group.
+    set -m
     set +e
+    start_guarded_command server python3 -m tensorrt_llm.llmapi.mgmn_leader_node || exit $?
+    server_pid=$started_guard_pid
+    start_guarded_command task "${task_with_command[@]}" || exit $?
+    task_pid=$started_guard_pid
 
-    # Capture subshell PID
-    subshell_pid=$!
-    log_stderr "Rank${mpi_rank} Subshell PID: $subshell_pid"
+    while command_running "$task_pid"; do
+        if ! command_running "$server_pid"; then
+            wait "$server_pid"
+            server_exit_code=$?
+            log_stderr "MPI Comm server exited before the task (status $server_exit_code); waiting up to ${stop_timeout}s for task exit"
+            # Even a successful server exit is a failure while its task is alive.
+            [ "$server_exit_code" -eq 0 ] && server_exit_code=1
+            task_exit_polls_remaining=$((stop_timeout * 10))
+            while command_running "$task_pid"; do
+                if [ "$task_exit_polls_remaining" -eq 0 ]; then
+                    log_stderr "Task exit after MPI Comm server failure exceeded ${stop_timeout}s; terminating owned processes"
+                    # Cleanup-induced signal statuses must not replace the
+                    # original server failure when the task cannot finish.
+                    exit "$server_exit_code"
+                fi
+                sleep 0.1
+                task_exit_polls_remaining=$((task_exit_polls_remaining - 1))
+            done
+            wait "$task_pid"
+            task_exit_code=$?
+            log_stderr "Rank${mpi_rank} Task exit code: $task_exit_code"
+            # Let the task report its own failure, including errors received
+            # from the server, before falling back to the server's status.
+            [ "$task_exit_code" -ne 0 ] && exit "$task_exit_code"
+            exit "$server_exit_code"
+        fi
+        sleep 0.1
+    done
+    wait "$task_pid"
+    task_exit_code=$?
+    log_stderr "Rank${mpi_rank} Task exit code: $task_exit_code"
 
-    log_stderr "Rank${mpi_rank} run mgmn leader node with mpi_world_size: $(mpi_world_size) ..."
-    log_stderr "Rank0 host: $HOSTNAME"
-    run_child_command python3 -m tensorrt_llm.llmapi.mgmn_leader_node
-    mgmn_leader_node_exit_code=$?
-    log_stderr "Rank${mpi_rank} MGMN leader node exit code: $mgmn_leader_node_exit_code"
-
-    # Wait for subshell
-    wait $subshell_pid
-    # This is subshell's exit code
-    subshell_exit_code=$?
-    log_stderr "Rank${mpi_rank} Subshell exit code: $subshell_exit_code"
-
-    # Propagate subshell exit status
-    if [ $subshell_exit_code -ne 0 ]; then
-        exit $subshell_exit_code
-    else
-        exit $mgmn_leader_node_exit_code
+    # The wait covers the stop helper's imports, connection, send and queue
+    # cleanup as well as the MPI server. Neither child can block this supervisor.
+    shutdown_polls_remaining=$((stop_timeout * 10))
+    stop_pid=
+    if command_running "$server_pid"; then
+        if start_guarded_command stop python3 -m tensorrt_llm.llmapi.mgmn_leader_node --action stop; then
+            stop_pid=$started_guard_pid
+        else
+            stop_exit_code=$?
+            [ "$task_exit_code" -ne 0 ] && exit "$task_exit_code"
+            exit "$stop_exit_code"
+        fi
     fi
+
+    shutdown_timed_out=0
+    while true; do
+        if [ -n "$stop_pid" ] && ! command_running "$stop_pid"; then
+            wait "$stop_pid"
+            stop_exit_code=$?
+            stop_pid=
+            log_stderr "Rank${mpi_rank} stop helper exit code: $stop_exit_code"
+            # A failed helper cannot be relied on to stop the server.
+            if [ "$stop_exit_code" -ne 0 ]; then
+                [ "$task_exit_code" -ne 0 ] && exit "$task_exit_code"
+                exit "$stop_exit_code"
+            fi
+        fi
+        if ! command_running "$server_pid" && [ -z "$stop_pid" ]; then
+            break
+        fi
+        if [ "$shutdown_polls_remaining" -eq 0 ]; then
+            log_stderr "MPI Comm shutdown exceeded ${stop_timeout}s; terminating owned processes"
+            shutdown_timed_out=1
+            break
+        fi
+        sleep 0.1
+        shutdown_polls_remaining=$((shutdown_polls_remaining - 1))
+    done
+
+    if [ "$shutdown_timed_out" -ne 0 ]; then
+        [ "$task_exit_code" -ne 0 ] && exit "$task_exit_code"
+        exit 124
+    fi
+    wait "$server_pid"
+    server_exit_code=$?
+    log_stderr "Rank${mpi_rank} MPI Comm server exit code: $server_exit_code"
+
+    # Preserve the original task failure; otherwise surface teardown failures.
+    [ "$task_exit_code" -ne 0 ] && exit "$task_exit_code"
+    exit "$server_exit_code"
+
 else
     # Turn off "exit on error" so the following lines always run
     set +e

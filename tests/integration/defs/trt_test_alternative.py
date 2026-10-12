@@ -8,6 +8,7 @@ import signal
 import subprocess
 import sys
 import time
+import traceback
 import warnings
 from collections.abc import Generator
 from typing import List, Optional
@@ -286,8 +287,13 @@ def popen(*popenargs,
             yield p
             if start_new_session:
                 cleanup_process_tree(p, True, True)
-        except Exception as e:
-            cleanup_process_tree(p, start_new_session)
+        except BaseException as e:
+            try:
+                cleanup_process_tree(p, start_new_session)
+            except Exception as ee:
+                print(
+                    f"cleanup_process_tree failed while handling exception: {''.join(traceback.format_exception(ee))}"
+                )
             if isinstance(e, subprocess.TimeoutExpired):
                 print("Process timed out.")
                 stdout, stderr = p.communicate()
