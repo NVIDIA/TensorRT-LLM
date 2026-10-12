@@ -176,7 +176,6 @@ if [ "${useRunTests:-false}" = "true" ]; then
         --output-dir "$jobWorkspace"
         --working-dir "$llmSrcNode/tests/integration/defs"
         --fail-signatures "${failSignaturesList:-}"
-        --max-rerun-tests 5
     )
     if [ -n "${testDurationsPath:-}" ]; then
         runTestsArgs+=(--durations-path "$testDurationsPath")

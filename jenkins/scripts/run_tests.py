@@ -86,7 +86,7 @@ def format_duration(seconds):
 
 
 # ---------------------------------------------------------------------------
-# render_test_list: replaces Groovy processShardTestList()
+# Test list rendering: shard split and regular/isolated separation
 # ---------------------------------------------------------------------------
 def render_test_list(
     test_db_list, working_dir, splits, group, perf_mode, durations_path=None, pytest_targets=None
@@ -472,13 +472,12 @@ def build_isolated_command(base_cmd, test_list, xml_path, csv_path, stage_name):
         f"--csv={csv_path}",
         "--periodic-junit-xmlpath",
         xml_path,
-        "--cov-append",
     ]
     return rebuild_pytest_command(base_cmd, drop_patterns, append_args)
 
 
 # ---------------------------------------------------------------------------
-# Rerun logic: replaces Groovy rerunFailedTests()
+# Rerun logic
 # ---------------------------------------------------------------------------
 def check_and_rerun(
     result_xml,
@@ -644,7 +643,7 @@ def run_regular_tests(
 
 
 # ---------------------------------------------------------------------------
-# Isolated test execution: replaces Groovy runIsolatedTests()
+# Isolated test execution
 # ---------------------------------------------------------------------------
 def run_isolated_tests(
     pytest_cmd, isolate_list, working_dir, output_dir, stage_name, fail_signatures, max_rerun_tests
@@ -742,7 +741,7 @@ def run_isolated_tests(
 
 
 # ---------------------------------------------------------------------------
-# Result merging: replaces Groovy generateRerunReport()
+# Result merging
 # ---------------------------------------------------------------------------
 def merge_results(output_dir, stage_name, all_xml_files):
     """Merge all result XMLs and generate rerun report.
