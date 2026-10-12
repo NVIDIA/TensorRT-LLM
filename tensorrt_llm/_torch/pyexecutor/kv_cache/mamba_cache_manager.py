@@ -52,6 +52,7 @@ from tensorrt_llm.bindings.internal.batch_manager import (
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.math_utils import ceil_div
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (DEFAULT_BEAM_INDEX,
                                                       BatchDesc, BufferConfig,
                                                       DataRole,
@@ -335,7 +336,7 @@ class BaseMambaCacheManager(ABC):
         return getattr(self, "_use_kda_replay_update", False)
 
     @property
-    def keeps_kda_token_states(self) -> bool:
+    def keeps_kda_draft_records(self) -> bool:
         """Whether the KDA replay caches come with the records of every draft
         of the last verify round (``kda_state_tok``), from which a verify
         kernel replays the accepted drafts onto the slot's state."""
@@ -3065,7 +3066,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         conv_state_layout: Literal["x_b_c", "q_k_v"] = "x_b_c",
         kda_replay_num_spec: Optional[int] = None,
         qwen4_exp_ple_cache_params: Optional["Qwen4ExpPLECacheParams"] = None,
-        kda_token_states: bool = False,
+        kda_draft_records: bool = False,
         **kwargs,
     ) -> None:
         if conv_state_layout not in ("x_b_c", "q_k_v"):
@@ -3084,7 +3085,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         self._use_kda_replay_update = kda_replay_num_spec is not None
         # Only with the KDA replay caches: also keep the records of every
         # draft of the last verify round (kda_state_tok).
-        self._kda_token_states = kda_token_states and self._use_kda_replay_update
+        self._kda_draft_records = kda_draft_records and self._use_kda_replay_update
         if self._use_kda_replay_update:
             if use_replay_state_update:
                 raise ValueError(
@@ -3475,7 +3476,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         return getattr(self, "_use_gdn_cached_replay_all_layer_commit", False)
 
     @property
-    def keeps_kda_token_states(self) -> bool:
+    def keeps_kda_draft_records(self) -> bool:
         return getattr(self, "kda_state_tok", None) is not None
 
     def _setup_mtp_intermediate_states(self, spec_config,
@@ -3541,7 +3542,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         self.kda_conv_q = allocate_dim_contiguous_conv_cache()
         self.kda_conv_k = allocate_dim_contiguous_conv_cache()
         self.kda_conv_v = allocate_dim_contiguous_conv_cache()
-        if self._kda_token_states:
+        if self._kda_draft_records:
             # Beside the V2 pools. With the SSM pool at its live floor,
             # _build_cache_config took these bytes out of the GPU quota. The
             # verify replays the accepted drafts from these records, so the
@@ -3878,19 +3879,18 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         return (3, self._kda_replay_num_spec, self.ssm_state_shape[0],
                 self.ssm_state_shape[-1])
 
-    def _kda_token_state_bytes_per_slot(self) -> int:
+    def _kda_draft_record_bytes_per_slot(self) -> int:
         """Bytes of ``kda_state_tok`` per SSM slot: the fp32 records of every
         draft of every local Mamba layer, or 0 without them."""
-        if not getattr(self, "_kda_token_states", False):
+        if not getattr(self, "_kda_draft_records", False):
             return 0
         return (self.local_num_mamba_layers *
                 math.prod(self._kda_draft_records_shape()) *
                 torch.float32.itemsize)
 
-    def _mamba_state_bytes_per_slot(self) -> int:
+    def _managed_state_bytes_per_slot(self) -> int:
         base_bytes = (self.local_num_mamba_layers *
-                      (self.ssm_bytes + self.conv_bytes) +
-                      self._kda_token_state_bytes_per_slot())
+                      (self.ssm_bytes + self.conv_bytes))
         local_ple_layers = sum(layer_id in self.pp_layers
                                for layer_id in self._ple_layer_ids)
         if local_ple_layers == 0:
@@ -3900,6 +3900,10 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             self._ple_conv_state_dtype.itemsize +
             math.prod(self._ple_ngram_context_shape) * torch.int64.itemsize)
         return base_bytes + local_ple_layers * ple_bytes
+
+    def _mamba_state_bytes_per_slot(self) -> int:
+        return (self._managed_state_bytes_per_slot() +
+                self._kda_draft_record_bytes_per_slot())
 
     def _ple_buffer_configs(self) -> list[BufferConfig]:
         if not self._ple_layer_ids:
@@ -3988,11 +3992,11 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
 
     def _state_quota(self, state_slots: int) -> int:
         """Quota for ``state_slots`` recurrent-state slots, or for every slot
-        the live floor keeps (``_live_floor_token_state_slots``) when that is
+        the live floor keeps (``_live_floor_draft_record_slots``) when that is
         more: each holds its states and its drafts' records."""
         slots = max(
             state_slots,
-            self._live_floor_token_state_slots(
+            self._live_floor_draft_record_slots(
                 self.kv_cache_config.max_util_for_resume))
         return slots * self._mamba_state_bytes_per_slot()
 
@@ -4059,12 +4063,12 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         known before sizing, so ``_build_cache_config`` takes those records'
         bytes out of the GPU quota.
         """
-        return (getattr(self, "_kda_token_states", False)
+        return (getattr(self, "_kda_draft_records", False)
                 and self.local_num_mamba_layers > 0
                 and not kv_cache_config.enable_block_reuse
                 and self._attention_cache_bytes_per_token() > 0)
 
-    def _live_floor_token_state_slots(self, max_util_for_resume: float) -> int:
+    def _live_floor_draft_record_slots(self, max_util_for_resume: float) -> int:
         """SSM slots whose ``kda_state_tok`` entries come out of the GPU quota.
 
         With the SSM pool at its live floor and no ``pool_ratio``, that is
@@ -4093,7 +4097,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         bytes_per_token = (self._max_resident_sequences() *
                            self._attention_cache_bytes_per_token())
         # KVCacheDesc.capacity is a 32-bit int.
-        return min(-(-gpu_quota // bytes_per_token), 1 << 30)
+        return min(ceil_div(gpu_quota, bytes_per_token), 1 << 30)
 
     def _build_cache_config(
             self, config: KVCacheManagerConfigPy) -> KVCacheManagerConfigPy:
@@ -4110,7 +4114,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                 "are sized once from the SSM pool's slot count, and a KV pool "
                 "rebalance can grow that pool past them: set "
                 "kv_cache_config.enable_kv_pool_rebalance=False.")
-        if (getattr(self, "_kda_token_states", False)
+        if (getattr(self, "_kda_draft_records", False)
                 and self.local_num_mamba_layers > 0
                 and (config.initial_pool_ratio is not None
                      or not self._ssm_pool_at_live_floor(kv_cache_config))):
@@ -4118,37 +4122,39 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             # only at the live floor is that count known before sizing, so
             # that its bytes can come out of the quota.
             raise ValueError(
-                "Per-token KDA states (kda_token_states) need the SSM pool at "
+                "KDA draft records (kda_draft_records) need the SSM pool at "
                 "its live floor: kv_cache_config.enable_block_reuse off, "
                 "kv_cache_config.pool_ratio unset, and attention layers on "
                 "this rank.")
         cache_tiers = config.cache_tiers
-        gpu_quota = cache_tiers[0].quota
+        total_gpu_quota = cache_tiers[0].quota
         minimum_live_quota = self._minimum_live_gpu_quota()
-        if minimum_live_quota > gpu_quota:
+        if minimum_live_quota > total_gpu_quota:
             raise ValueError(
                 "The V2 Mamba GPU cache quota is too small for live recurrent "
-                f"states and attention pages: got {gpu_quota} bytes, need at "
-                f"least {minimum_live_quota} bytes.")
+                f"states and attention pages: got {total_gpu_quota} bytes, "
+                f"need at least {minimum_live_quota} bytes.")
+        pool_gpu_quota = total_gpu_quota
         ssm_pool_at_live_floor = (config.initial_pool_ratio is None and
                                   self._ssm_pool_at_live_floor(kv_cache_config))
         if ssm_pool_at_live_floor:
             # kda_state_tok is allocated beside the pools, one entry per SSM
             # slot: take those records' bytes out of the GPU quota before the
             # pools are sized.
-            token_state_slots = self._live_floor_token_state_slots(
+            draft_record_slots = self._live_floor_draft_record_slots(
                 config.max_util_for_resume)
-            token_state_quota = (token_state_slots *
-                                 self._kda_token_state_bytes_per_slot())
-            gpu_quota -= token_state_quota
+            draft_record_quota = (draft_record_slots *
+                                  self._kda_draft_record_bytes_per_slot())
+            pool_gpu_quota = total_gpu_quota - draft_record_quota
             cache_tiers = [
-                GpuCacheTierConfig(quota=gpu_quota), *cache_tiers[1:]
+                GpuCacheTierConfig(quota=pool_gpu_quota), *cache_tiers[1:]
             ]
             logger.info(
                 "KV cache manager v2: the KDA draft records of "
-                f"{token_state_slots} SSM slots take "
-                f"{token_state_quota / (1 << 30)}GiB of the device quota; the "
-                f"pools get {gpu_quota / (1 << 30)}GiB")
+                f"{draft_record_slots} SSM slots take "
+                f"{draft_record_quota / (1 << 30)}GiB of the "
+                f"{total_gpu_quota / (1 << 30)}GiB device quota; the pools "
+                f"get {pool_gpu_quota / (1 << 30)}GiB")
         # _build_base_config already constructed every attention layer,
         # including dtype-specific scale and subclass-provided side buffers.
         # Preserve those configs and replace only the local Mamba layers.
@@ -4186,7 +4192,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             if ssm_pool_at_live_floor:
                 typical_capacity = max(
                     typical_capacity,
-                    self._quota_filling_request_capacity(gpu_quota))
+                    self._quota_filling_request_capacity(pool_gpu_quota))
             request_descs = self._typical_request_descs(typical_capacity,
                                                         kv_cache_config)
             typical_step = BatchDesc(request_descs *

@@ -142,7 +142,7 @@ set's and leave every index in 0..2 (the op's own test also checks with guard ba
 buffers).
 
 **The pools.** Not part of the object: they belong to the cache manager. With the V2 hybrid manager built with the
-KDA replay caches and `kda_token_states`, layer `l`'s are `mamba_layer_cache(l).kda_conv_q` / `kda_conv_k` /
+KDA replay caches and `kda_draft_records`, layer `l`'s are `mamba_layer_cache(l).kda_conv_q` / `kda_conv_k` /
 `kda_conv_v` (`cs_*`), `get_ssm_states(l)` (`ssm`, its slots strided by the manager's per-slot coalescing) and
 `mamba_layer_cache(l).kda_state_tok`; `pending` is `prev_num_accepted_tokens`, one record shared by every layer and
 written by the sampler's acceptance between steps. A launch on layer `l` writes only layer `l`'s views, at its slot.

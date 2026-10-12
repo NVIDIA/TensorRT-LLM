@@ -51,7 +51,7 @@ def load_ops():
 def build_manager(num_layers: int, num_spec: int | None = None, max_batch_size: int = 8):
     """A real MambaHybridCacheManagerV2 with ``num_layers`` KDA layers (and one attention layer). With ``num_spec``:
     MTP-style speculation of ``num_spec`` drafts, the KDA replay caches and the drafts' records
-    (``kda_token_states``) that k3_kda_verify / k3_kda_attn read and write."""
+    (``kda_draft_records``) that k3_kda_verify / k3_kda_attn read and write."""
     from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
         MambaHybridCacheManagerV2,
     )
@@ -85,7 +85,7 @@ def build_manager(num_layers: int, num_spec: int | None = None, max_batch_size: 
         vocab_size=1024,
         conv_state_layout="q_k_v",
         kda_replay_num_spec=num_spec,
-        kda_token_states=num_spec is not None,
+        kda_draft_records=num_spec is not None,
     )
 
 
