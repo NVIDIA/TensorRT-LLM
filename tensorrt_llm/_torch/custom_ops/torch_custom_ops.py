@@ -2178,11 +2178,6 @@ class fp8SwapABGemmRunner(TunableRunner):
         tactic: int = -1,
     ) -> torch.Tensor:
         input, weight, weight_scale = inputs
-        observed = jit_prefetch_deep_gemm.launch_observer is not None
-        if observed:
-            t0 = jit_prefetch_deep_gemm.note_launch(input.size(0),
-                                                    weight.size(0),
-                                                    weight.size(1))
         a, a_sf = _fp8_quantize_1x128_ue8m0(input, self.quant_tactic)
         output = torch.empty(
             (input.size(0), weight.size(0)),
@@ -2190,6 +2185,13 @@ class fp8SwapABGemmRunner(TunableRunner):
             dtype=self.output_dtype,
         )
 
+        # Time only the DeepGEMM call: an allocator stall in the quantize or
+        # the output allocation above must not read as a compile.
+        observed = jit_prefetch_deep_gemm.launch_observer is not None
+        if observed:
+            t0 = jit_prefetch_deep_gemm.note_launch(input.size(0),
+                                                    weight.size(0),
+                                                    weight.size(1))
         deep_gemm.fp8_gemm_nt(
             (a, a_sf),
             (weight, weight_scale),

@@ -192,14 +192,27 @@ def build(spec: str, gpu_arch: str, out_dir: str) -> bool:
     """Compile ``spec`` and export it to ``<out_dir>/<key>.o``.
 
     Returns True if it compiled, False if the file already existed. The file
-    appears atomically (written under a temporary name, then renamed).
+    appears atomically (written under a temporary name, then renamed). The
+    ranks of a node share ``out_dir``; a per-variant lock makes one helper
+    compile while the others wait and then find the file.
     """
-    import cutlass.cute as cute
+    import fcntl
 
     key = spec_key(spec)
     final = os.path.join(out_dir, f"{key}.o")
     if os.path.exists(final):
         return False
+    with open(os.path.join(out_dir, f".{key}.lock"), "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if os.path.exists(final):
+            return False
+        _compile_export(spec, gpu_arch, out_dir, key, final)
+    return True
+
+
+def _compile_export(spec: str, gpu_arch: str, out_dir: str, key: str, final: str) -> None:
+    import cutlass.cute as cute
+
     s = json.loads(spec)
     host_fn, args = _BUILDERS[s["kernel"]](s)
     compiled = cute.compile(host_fn, *args, options=f"--gpu-arch {gpu_arch}")
@@ -210,7 +223,6 @@ def build(spec: str, gpu_arch: str, out_dir: str) -> bool:
         os.remove(os.path.join(out_dir, f"{tmp_name}.h"))
     except FileNotFoundError:
         pass
-    return True
 
 
 def load(spec: str, out_dir: str):

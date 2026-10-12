@@ -1540,6 +1540,7 @@ class PyTorchModelEngine(ModelEngine):
         # Helpers were started when the prefetcher was created; make sure
         # their start-up is paid here, inside warmup, not by a request.
         prefetcher.wait_ready()
+        prefetcher.start_background()
 
     def _plan_jit_prefetch(self, scheduled_requests: ScheduledRequests,
                            resource_manager: ResourceManager) -> None:

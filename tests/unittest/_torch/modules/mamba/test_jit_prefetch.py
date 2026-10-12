@@ -172,6 +172,20 @@ def test_enumeration_covers_real_launches(token_major, ctx_lens, any_cached):
     assert not missing, f"real launches the enumeration did not predict: {missing}"
 
 
+@pytest.fixture
+def restore_triton_hooks():
+    """A JitPrefetcher installs process-wide Triton hooks; restore them so a
+    prefetcher built by one test does not observe another test's compiles."""
+    from triton import knobs
+
+    saved = (knobs.runtime.jit_cache_hook, knobs.runtime.jit_post_compile_hook,
+             knobs.compilation.listener, knobs.autotuning.listener)  # fmt: skip
+    yield
+    (knobs.runtime.jit_cache_hook, knobs.runtime.jit_post_compile_hook,
+     knobs.compilation.listener, knobs.autotuning.listener) = saved  # fmt: skip
+
+
+@pytest.mark.usefixtures("restore_triton_hooks")
 def test_record_roundtrip(tmp_path, monkeypatch):
     """A record written by one prefetcher is read back for replay, and a
     record from another Triton version or GPU target is discarded."""
@@ -202,6 +216,51 @@ def test_record_roundtrip(tmp_path, monkeypatch):
     p3._record_fh.close()
 
 
+@pytest.mark.usefixtures("restore_triton_hooks")
+def test_executor_compiles_triton_variant_no_helper_started(monkeypatch):
+    """A variant still queued (no helper started it) is compiled on the
+    executor at once; only a variant a helper is compiling is waited for."""
+    import queue
+    import threading
+
+    from triton import knobs
+
+    from tensorrt_llm._torch import jit_prefetch as jp
+
+    monkeypatch.setenv("TLLM_JIT_STATS", "1")
+    monkeypatch.delenv("TLLM_JIT_PREFETCH", raising=False)
+    monkeypatch.delenv("TLLM_JIT_RECORD_DIR", raising=False)
+    p = jp.JitPrefetcher(rank=0)
+    p._queues["triton"] = queue.PriorityQueue()
+    assert p._submit("k-queued", '{"v": 1}', "f", jp._PRIO_ENUM)
+    assert p._submit("k-started", '{"v": 2}', "f", jp._PRIO_ENUM)
+    p._key_started.add("k-started")
+    fn = type("F", (), {"name": "f"})()
+    hook = knobs.runtime.jit_cache_hook
+    kw = dict(repr="", fn=fn, compile={}, is_manual_warmup=False, already_compiled=False)
+    hook(key="k-queued", **kw)
+    assert p.stats.wait_n == 0
+    threading.Timer(0.05, p._key_event["k-started"].set).start()
+    hook(key="k-started", **kw)
+    assert p.stats.wait_n == 1
+
+
+def test_cute_dsl_build_skips_a_variant_another_helper_built(tmp_path, monkeypatch):
+    """Ranks on a node share the CuTe DSL output dir: a variant already
+    exported (or exported while waiting for the lock) is not compiled."""
+    from tensorrt_llm._torch import jit_prefetch_cute_dsl as jcd
+
+    calls = []
+    monkeypatch.setattr(jcd, "_compile_export", lambda *a: calls.append(a))
+    spec = jcd.k123_spec(96, True, True, True, "int64", "int64", True, "float32")
+    (tmp_path / f"{jcd.spec_key(spec)}.o").write_bytes(b"")
+    assert jcd.build(spec, "sm_103a", str(tmp_path)) is False
+    other = jcd.k123_spec(96, True, True, False, "int64", "int64", True, "float32")
+    assert jcd.build(other, "sm_103a", str(tmp_path)) is True
+    assert len(calls) == 1
+
+
+@pytest.mark.usefixtures("restore_triton_hooks")
 def test_deep_gemm_compile_counted_once_per_shape(monkeypatch):
     """Only the first slow launch of an (m, n, k) counts as an executor
     compile; repeats of the same shape are host stalls."""

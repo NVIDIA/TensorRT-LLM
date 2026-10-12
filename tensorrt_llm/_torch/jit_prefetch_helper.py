@@ -99,6 +99,38 @@ def _resolve(finder: _StubFinder, full_name: str):
     return obj
 
 
+def _warm_compiler(triton, tl, GPUTarget, ASTSource) -> None:
+    """Compile a trivial kernel once, to a scratch cache, before reporting
+    ready. A helper's first ``triton.compile`` costs about 1.4 s more than
+    later ones (backend and LLVM initialization); paid here, it falls inside
+    warmup instead of delaying the first variant a batch needs.
+    """
+    import tempfile
+
+    @triton.jit
+    def _warm(x_ptr):
+        tl.store(x_ptr, tl.load(x_ptr) + 1)
+
+    target = os.environ.get("TLLM_JIT_PREFETCH_TARGET")
+    if not target:
+        return
+    backend, arch, warp_size = target.split(":")
+    from triton import knobs
+
+    prev = knobs.cache.dir
+    with tempfile.TemporaryDirectory() as tmp:
+        knobs.cache.dir = tmp
+        try:
+            triton.compile(
+                ASTSource(_warm, {"x_ptr": "*fp32"}, {}, {}),
+                target=GPUTarget(backend, int(arch), int(warp_size)),
+            )
+        except Exception:  # noqa: BLE001 - warming is best effort
+            pass
+        finally:
+            knobs.cache.dir = prev
+
+
 def main():
     pkg_root = sys.argv[1]
     finder = _StubFinder(pkg_root)
@@ -122,6 +154,7 @@ def main():
     from triton.runtime.cache import triton_key
 
     triton_key()
+    _warm_compiler(triton, tl, GPUTarget, ASTSource)
     out = sys.stdout
     out.write(json.dumps({"ready": True}) + "\n")
     out.flush()

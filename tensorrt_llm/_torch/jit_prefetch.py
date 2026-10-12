@@ -396,6 +396,10 @@ class JitPrefetcher:
         self._tag_event: Dict[int, threading.Event] = {}
         self._key_event: Dict[str, threading.Event] = {}
         self._key_spec: Dict[str, Tuple[str, str]] = {}
+        # Triton keys a helper has been sent: the executor waits only for
+        # those, and compiles a still-queued one itself.
+        self._tag_key: Dict[int, str] = {}
+        self._key_started: set = set()
         self._record_fh = None
         self._recorded: set = set()
         self._replay: List[Tuple[str, str, str]] = []
@@ -458,6 +462,15 @@ class JitPrefetcher:
         }
         env.update(TRITON_CACHE_DIR=cache_dir, CUDA_VISIBLE_DEVICES="", PYTHONNOUSERSITE="1")
         env.pop("PYTHONPATH", None)
+        try:
+            from triton.runtime.driver import driver
+
+            t = driver.active.get_current_target()
+            # The helper warms its compiler for this target before it reports
+            # ready (jit_prefetch_helper._warm_compiler).
+            env["TLLM_JIT_PREFETCH_TARGET"] = f"{t.backend}:{t.arch}:{t.warp_size}"
+        except Exception:  # noqa: BLE001 - warming is optional
+            pass
         n = max(1, int(os.environ.get(_WORKERS_ENV, str(_default_workers()))))
         self._procs = []
         self._req_q = queue.PriorityQueue()
@@ -638,6 +651,9 @@ class JitPrefetcher:
         # One request in flight per helper, so work spreads across helpers.
         while True:
             _prio, tag, spec = q.get()
+            key = self._tag_key.get(tag)
+            if key is not None:
+                self._key_started.add(key)
             self._busy.setdefault(proc.pid, threading.Event()).clear()
             try:
                 proc.stdin.write(json.dumps({"tag": tag, "spec": spec}) + "\n")
@@ -737,7 +753,11 @@ class JitPrefetcher:
             for k, v in os.environ.items()
             if not k.startswith(("OMPI_", "PMIX_", "PMI_", "SLURM_", "UCX_", "MPI_"))
         }
-        env.update(CUDA_VISIBLE_DEVICES="", PYTHONNOUSERSITE="1")
+        # CUTE_DSL_ARCH: without it CuTe DSL detects the arch by querying the
+        # driver, which serializes across the node's helpers (about 27 s
+        # each with no GPU visible); compiling for the given arch needs no
+        # driver call.
+        env.update(CUDA_VISIBLE_DEVICES="", PYTHONNOUSERSITE="1", CUTE_DSL_ARCH=jcd.gpu_arch())
         helper = os.path.join(
             os.path.dirname(os.path.abspath(__file__)), "jit_prefetch_cute_dsl_helper.py"
         )
@@ -808,16 +828,25 @@ class JitPrefetcher:
                 n += 1
         self._event(f"DeepGEMM enumeration: {n} requests queued")
 
+    def start_background(self) -> None:
+        """Queue every enumerable variant, once, on a background thread.
+
+        Called when the providers are registered (end of warmup), so the
+        helpers start on the background set while the rest of warmup runs.
+        """
+        if not self.prefetch or not self._providers or self._bg_started:
+            return
+        self._bg_started = True
+        threading.Thread(
+            target=self._enumerate_all, daemon=True, name="jit_prefetch_enumerate"
+        ).start()
+
     def plan(self, batch_ctx: Any) -> None:
         """Called once a batch is scheduled, before its inputs are prepared."""
         self.bind_executor_thread()
         if not self.prefetch or not self._providers:
             return
-        if not self._bg_started:
-            self._bg_started = True
-            threading.Thread(
-                target=self._enumerate_all, daemon=True, name="jit_prefetch_enumerate"
-            ).start()
+        self.start_background()
         t0 = time.perf_counter()
         for provider in self._providers:
             try:
@@ -887,6 +916,8 @@ class JitPrefetcher:
                 ev = threading.Event()
                 self._key_event[key] = ev
             self._tag_event[tag] = ev
+            if kind == "triton":
+                self._tag_key[tag] = key
             self._key_spec[key] = (spec, label, kind)
             self.stats.submitted += 1
             if priority == _PRIO_REPLAY:
@@ -1031,12 +1062,13 @@ class JitPrefetcher:
                 and os.environ.get("TLLM_JIT_PREFETCH_DEBUG_KEYS") == "1"
             ):
                 print(f"[JIT keys] UNPLANNED {fn.name} key={key}", flush=True)
+            if ev is not None and not ev.is_set() and key not in me._key_started:
+                # Not started by any helper yet: a Triton compile here takes
+                # about 0.1 s, less than a helper's first compile (its
+                # imports run then), so compile here and let the queued
+                # request become a disk-cache hit.
+                ev = None
             if ev is not None and not ev.is_set():
-                # Still queued behind other work: move it to the front so the
-                # executor waits for one compile, not for the queue to drain.
-                spec_label = me._key_spec.get(key)
-                if spec_label is not None:
-                    me._submit(key, spec_label[0], spec_label[1], _PRIO_URGENT, kind=spec_label[2])
                 t0 = time.perf_counter()
                 ev.wait(wait_timeout_s)
                 dt = time.perf_counter() - t0
@@ -1064,12 +1096,13 @@ class JitPrefetcher:
             # is exactly the set of variants this process launched, which is
             # what the next process should compile first (approach B).
             spec = compile.get("specialization_data") if isinstance(compile, dict) else None
-            if me._record_fh is not None and spec and spec not in me._recorded:
+            fh = me._record_fh
+            if fh is not None and not fh.closed and spec and spec not in me._recorded:
                 with me._lock:
                     if spec not in me._recorded:
                         me._recorded.add(spec)
-                        me._record_fh.write(json.dumps({"name": fn.name, "spec": spec}) + "\n")
-                        me._record_fh.flush()
+                        fh.write(json.dumps({"name": fn.name, "spec": spec}) + "\n")
+                        fh.flush()
                         stats.recorded += 1
             if prev_post_hook is not None:
                 return prev_post_hook(
@@ -1113,14 +1146,15 @@ class JitPrefetcher:
     def _record(self, kind: str, name: str, spec: str) -> None:
         """Append one non-Triton request to the record (Triton records itself
         from ``jit_post_compile_hook``)."""
-        if self._record_fh is None or spec in self._recorded:
+        fh = self._record_fh
+        if fh is None or fh.closed or spec in self._recorded:
             return
         with self._lock:
             if spec in self._recorded:
                 return
             self._recorded.add(spec)
-            self._record_fh.write(json.dumps({"kind": kind, "name": name, "spec": spec}) + "\n")
-            self._record_fh.flush()
+            fh.write(json.dumps({"kind": kind, "name": name, "spec": spec}) + "\n")
+            fh.flush()
             self.stats.recorded += 1
 
     def _open_record(self) -> None:
