@@ -21,11 +21,11 @@ log-probs) build on:
 
 * the per-request queries that read an ``LlmRequest``'s sampling config into
   :class:`UtilsSamplingParams`, plus the predicates over it
-  (``top_p_decay_active``, ``_request_sampling_params_cachable``);
+  (``top_p_decay_active``);
 * the shared step/beam index constants and beam-width accessors;
 * tensor helpers (``int_tensor``, ``add_token``);
 * plain data types passed *between* modules that no single feature owns --
-  :class:`RequestSeeds` (seed manager -> strategy impls) and
+  :class:`RequestSeeds` (seed manager -> sampler) and
   :class:`_BatchedSamplingResult` (sampler -> log-probs).
 
 That last group follows the package's dependency rule: a type shared across
@@ -33,7 +33,7 @@ features belongs here, so that a lower-layer module never has to import a
 higher-layer one to name it. A type owned by a single feature belongs with that
 feature instead -- the ``*Store`` classes all live in their own modules.
 
-Resolving a request's ``Strategy`` lives in ``sampler_strategy``.
+Resolving a request's sampling params lives in ``sampling_resolution``.
 """
 
 from dataclasses import dataclass, field
@@ -173,11 +173,9 @@ def _get_max_beam_width(request: LlmRequest) -> int:
 def request_random_seed(request: LlmRequest) -> Optional[int]:
     """The request's user-specified ``SamplingParams.seed``, if any.
 
-    Deliberately kept out of ``UtilsSamplingParams``: that struct backs the
-    sampling-strategy cache key, and a per-request seed there would make every
-    seeded request its own strategy group, defeating batched sampling. The seed
-    does not change *which* distribution is sampled, only the RNG stream, so it
-    is read separately and applied as per-row RNG state.
+    Deliberately kept out of ``UtilsSamplingParams``: the seed does not change
+    *which* distribution is sampled, only the RNG stream, so it is read
+    separately and applied as per-row RNG state.
 
     The C++ ``SamplingConfig.randomSeed`` is ``uint64``, so a user seed in
     ``[2**63, 2**64)`` (e.g. from ``random.getrandbits(64)``) does not fit the
@@ -227,10 +225,6 @@ def _request_get_sampling_params(request: LlmRequest) -> UtilsSamplingParams:
         beam_search_diversity_rate=beam_search_diversity_rate,
         early_stopping=early_stopping,
     )
-
-
-def _request_sampling_params_cachable(params: UtilsSamplingParams) -> bool:
-    return not params.use_beam_search
 
 
 @dataclass(kw_only=True)

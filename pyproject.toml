@@ -875,7 +875,7 @@ show_error_codes = true
 files = [
     "tensorrt_llm/_torch/pyexecutor/sampler/sampler.py",
     "tensorrt_llm/_torch/pyexecutor/sampler/sampler_common.py",
-    "tensorrt_llm/_torch/pyexecutor/sampler/sampler_strategy.py",
+    "tensorrt_llm/_torch/pyexecutor/sampler/sampling_resolution.py",
     "tensorrt_llm/_torch/pyexecutor/sampler/logprobs.py",
     "tensorrt_llm/_torch/pyexecutor/sampler/sampler_features.py",
     "tensorrt_llm/_torch/pyexecutor/sampler/seed_manager.py",
@@ -915,7 +915,7 @@ module = [
 disable_error_code = [
     "no-untyped-call",
     # TODO(TRTLLM-15310): strict mode's warn_redundant_casts flags several cast(...) calls
-    # in sampler_strategy.py (introduced by #16620). Whether a cast is "redundant" is
+    # in the sampler package (introduced by #16620). Whether a cast is "redundant" is
     # binding-dependent -- the full build check (compiled bindings + stubs) flags 2,
     # the bindings-less local/pre-commit check flags ~20 -- so removing casts is a
     # fragile WAR. Suppress redundant-cast for the sampler module until the casts are

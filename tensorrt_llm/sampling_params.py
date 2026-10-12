@@ -502,7 +502,7 @@ class SamplingParams:
         self._validate()
 
     # NB: The predicates below are static because downstream code (e.g.
-    #     sampler_strategy.resolve_sampling_strategy) only holds instances of
+    #     sampling_resolution.resolve_row_params) only holds instances of
     #     bindings.SamplingConfig (not SamplingParams). They are the single
     #     source of truth for the greedy / top-p-decay resolution shared by
     #     _greedy_decoding and the torch sampler.

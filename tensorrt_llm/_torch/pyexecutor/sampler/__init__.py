@@ -15,8 +15,9 @@
 """Sampler package.
 
 The upper-level orchestration (``Sampler`` / ``TorchSampler``)
-lives in ``sampler.py`` and depends on operation-level APIs in
-``sampler_strategy.py``. Implementation-specific kernel providers (FlashInfer,
+lives in ``sampler.py``; ``sampling_resolution.py`` maps a request's sampling
+params onto the fused sampling kernel, for it and for the one-model speculative
+path. Implementation-specific kernel providers (FlashInfer,
 vanilla/PyTorch, TRT-LLM ops) live under ``ops/`` and are selected
 internally, never exposed as interchangeable backends to callers.
 
@@ -29,8 +30,8 @@ Layout -- imports only ever point downward; there are no cycles::
                                   │
           ┌───────────┬───────────┼───────────┬───────────┐
           ▼           ▼           ▼           ▼           ▼
-      beam_search  sampler_    logprobs   penalties      ...
-                   strategy                            token_ban
+      beam_search  sampling_   logprobs   penalties      ...
+                   resolution                          token_ban
                                                        top_p_decay
                                                        finish_reasons
                                                        seed_manager
@@ -47,8 +48,7 @@ Layout -- imports only ever point downward; there are no cycles::
        ─────────── no intra-package imports ───────────
 
 Feature modules are shown flat, but some depend on others -- notably
-``two_model_spec_dec`` -> ``sampler_strategy`` -> ``beam_search`` ->
-``logprobs`` -> ``sampler_features``. Each feature owns its ``*Store``
+``beam_search`` -> ``logprobs`` -> ``sampler_features``. Each feature owns its ``*Store``
 (persistent per-slot device state) and ``*Handler`` (lifecycle); ``TorchSampler``
 holds one handler per feature and drives them. Types passed *between* modules
 that no single feature owns live in ``sampler_common.py``.
@@ -56,7 +56,7 @@ that no single feature owns live in ``sampler_common.py``.
 Public symbols from ``sampler.py`` are re-exported here so existing
 ``pyexecutor.sampler`` import paths keep working. The re-export is lazy
 (PEP 562 ``__getattr__``) so that importing lightweight submodules such as
-``pyexecutor.sampler.sampler_strategy`` does not eagerly pull in ``sampler.py``
+``pyexecutor.sampler.sampling_resolution`` does not eagerly pull in ``sampler.py``
 and its heavy dependency chain (which would create import cycles with
 ``speculative.interface``).
 """
@@ -65,7 +65,7 @@ import importlib
 
 # Submodules of this package — never forward these to sampler.py (that would
 # recurse, since accessing e.g. `.sampler` before it is bound re-enters here).
-_SUBMODULES = frozenset({"sampler", "sampler_common", "sampler_strategy", "ops"})
+_SUBMODULES = frozenset({"sampler", "sampler_common", "sampling_resolution", "ops"})
 
 
 def __getattr__(name: str):

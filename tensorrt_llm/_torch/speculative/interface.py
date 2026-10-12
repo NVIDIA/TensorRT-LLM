@@ -1210,7 +1210,8 @@ class SpecMetadata:
             LlmRequestState, get_request_tokens_per_gen_step)
         from tensorrt_llm._torch.pyexecutor.sampler.ops.vanilla import \
             GREEDY_TEMPERATURE_THRESHOLD
-        from tensorrt_llm.sampling_params import SamplingParams
+        from tensorrt_llm._torch.pyexecutor.sampler.sampling_resolution import (
+            SamplingMode, resolve_row_params)
 
         # Sentinel temperature for greedy / temperature-disabled rows. Must stay
         # strictly below GREEDY_TEMPERATURE_THRESHOLD so the sampling kernels
@@ -1220,8 +1221,6 @@ class SpecMetadata:
         DISABLE_TEMP_VAL = GREEDY_TEMPERATURE_THRESHOLD / 10
         # Very large values disable topk.
         DISABLE_TOPK_VAL = torch.iinfo(torch.int32).max
-        DISABLE_TOPP_VAL = 1.0
-        DISABLE_MINP_VAL = 0.0
 
         def _normalize_request_sampling_params(
             *,
@@ -1230,32 +1229,24 @@ class SpecMetadata:
             top_p: Optional[float],
             min_p: Optional[float],
         ) -> tuple[float, int, float, float, bool]:
-            """Convert request sampling params into normalized per-request scalars."""
-            # min_p participates in the greedy classification and must: a request whose
-            # ONLY knob is min_p is not greedy (params_imply_greedy_decoding treats
-            # 0 < min_p < 1 as an active sampling knob), and min_p == 1.0 is explicit
-            # greedy. Omitting it here would classify a min_p-only request as greedy, send
-            # it down the argmax fast path, and drop min_p silently -- and since this flag
-            # is part of the CUDA graph key, it would also pick the wrong graph variant.
-            is_greedy = SamplingParams.params_imply_greedy_decoding(
-                temperature=temperature,
-                top_k=top_k,
-                top_p=top_p,
-                min_p=min_p,
-                use_beam_search=False)
+            """Convert request sampling params into normalized per-request scalars.
 
-            use_top_k = not is_greedy and top_k is not None and top_k > 0
-
+            Interpreted as TorchSampler does (resolve_row_params); greedy rows
+            take the sentinels above, and a disabled top_k takes
+            DISABLE_TOPK_VAL rather than 0.
+            """
+            row = resolve_row_params(temperature=temperature,
+                                     top_k=top_k,
+                                     top_p=top_p,
+                                     min_p=min_p)
+            is_greedy = row.mode is SamplingMode.GREEDY
             # The sentinel is one-hot under softmax, so it must not reach a
-            # non-greedy row; those resolve 1.0, as resolve_sampling_strategy does.
-            normalized_temperature = (DISABLE_TEMP_VAL if is_greedy else
-                                      (temperature or 1.0))
-            normalized_top_k = DISABLE_TOPK_VAL if not use_top_k else top_k
-            normalized_top_p = (DISABLE_TOPP_VAL
-                                if is_greedy or top_p is None else top_p)
-            # Unlike top_p, min_p's neutral value is 0.0, not 1.0.
-            normalized_min_p = (DISABLE_MINP_VAL
-                                if is_greedy or min_p is None else min_p)
+            # non-greedy row.
+            normalized_temperature = (DISABLE_TEMP_VAL
+                                      if is_greedy else row.temperature)
+            normalized_top_k = row.top_k if row.top_k > 0 else DISABLE_TOPK_VAL
+            normalized_top_p = row.top_p
+            normalized_min_p = row.min_p
 
             return (
                 normalized_temperature,

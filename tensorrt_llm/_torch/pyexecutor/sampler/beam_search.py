@@ -44,8 +44,7 @@ from tensorrt_llm.executor.result import Logprob
 from ..llm_request import LlmRequest, LlmRequestState
 from .logprobs import LogProbsStore
 from .ops.flashinfer import radix_topk_op
-from .ops.vanilla import StrategyMetadata
-from .sampler_common import _get_beam_width_out, int_tensor
+from .sampler_common import _get_beam_width_out, _request_get_sampling_params, int_tensor
 from .sampler_features import _SideStreamCopier
 
 BEAM_SEARCH_PAD_TOKEN = -1
@@ -56,7 +55,7 @@ class BeamSearchEarlyStop(IntEnum):
     ``early_stopping`` (``True`` / ``False`` / ``"never"``).
 
     An ``IntEnum`` so it stays interchangeable with the raw integers coming from
-    ``sampling_config.early_stopping`` and used in the strategy grouping key.
+    ``sampling_config.early_stopping`` and used in ``BeamSearchParams.group_key``.
     Member names follow HF's ``early_stopping`` values (``True`` / ``False`` /
     ``"never"``) directly.
 
@@ -319,7 +318,7 @@ def _gather_beam_path(
 
 
 @dataclass(kw_only=True)
-class BeamSearchMetadata(StrategyMetadata):
+class BeamSearchMetadata:
     """Stateful tensors required by beam_search_sampling_batch_cba."""
 
     cache_indirection: torch.Tensor
@@ -1035,6 +1034,126 @@ def beam_search_sampling_batch_cba(
     return _pad_next_tokens(slot_tok, args.finished_beams.size(1)), softmax
 
 
+class BeamSearchParams(NamedTuple):
+    """A beam-search request's params for one step.
+
+    Not cached per slot like the other sampling params: the beam widths and
+    ``row_stride`` change between the context step and later steps.
+    """
+
+    beam_width_in: int
+    beam_width_out: int
+    # Logits rows the forward laid out per request: the static admission width,
+    # which exceeds beam_width_in while a variable beam width array widens.
+    row_stride: int
+    temperature: float
+    length_penalty: float
+    diversity_rate: float
+    early_stopping: BeamSearchEarlyStop
+
+    @classmethod
+    def from_request(cls, request: LlmRequest) -> "BeamSearchParams":
+        params = _request_get_sampling_params(request)
+        assert params.beam_width_in is not None and params.beam_width_out is not None, (
+            "beam_width_in and beam_width_out must be specified for beam search"
+        )
+        temperature = params.temperature or 1.0
+        assert temperature > 0, f"beam search needs temperature > 0, got {temperature}"
+        return cls(
+            beam_width_in=params.beam_width_in,
+            beam_width_out=params.beam_width_out,
+            row_stride=params.row_stride or params.beam_width_in,
+            temperature=temperature,
+            length_penalty=params.length_penalty or 0.0,
+            diversity_rate=params.beam_search_diversity_rate or 0.0,
+            early_stopping=BeamSearchEarlyStop.from_raw(params.early_stopping),
+        )
+
+    @property
+    def group_key(self) -> tuple[int, int, BeamSearchEarlyStop]:
+        """What requests sampled in one beam-search step must share."""
+        return self.beam_width_in, self.beam_width_out, self.early_stopping
+
+
+class BeamSearchStep:
+    """One candidate-beams-array step for a group of beam-search requests.
+
+    Every early_stopping mode runs here; the mode only selects the done verdict
+    computed inside :func:`beam_search_sampling_batch_cba`.
+    """
+
+    def __init__(
+        self,
+        beam_width_in: int,
+        beam_width_out: int,
+        row_stride: int,
+        temperature: torch.Tensor,
+        length_penalty: Optional[torch.Tensor],
+        diversity_rate: Optional[torch.Tensor],
+        early_stopping: BeamSearchEarlyStop,
+        *,
+        computes_probs: bool = False,
+    ):
+        self._beam_width_in = beam_width_in
+        self._beam_width_out = beam_width_out
+        self._row_stride = row_stride
+        self.temperature = temperature
+        self._length_penalty = length_penalty
+        self._diversity_rate = diversity_rate
+        self._early_stopping = early_stopping
+        self._computes_probs = computes_probs
+
+    @classmethod
+    def from_params(
+        cls, params: list[BeamSearchParams], device: torch.device, *, return_probs: bool
+    ) -> "BeamSearchStep":
+        (group_key,) = set(p.group_key for p in params)
+        beam_width_in, beam_width_out, early_stopping = group_key
+        # row_stride is not part of the group key. It is unique because
+        # admission pins every request to max_beam_width; unpacking fails loudly
+        # should narrower requests ever be admitted.
+        (row_stride,) = set(p.row_stride for p in params)
+
+        def _to_device(values: list[float]) -> torch.Tensor:
+            return torch.tensor(values, dtype=torch.float32, pin_memory=prefer_pinned()).to(
+                device=device, non_blocking=True
+            )
+
+        # Unset length_penalty / diversity_rate stay None so the op skips them.
+        length_penalties = [p.length_penalty for p in params]
+        diversity_rates = [p.diversity_rate for p in params]
+        return cls(
+            beam_width_in,
+            beam_width_out,
+            row_stride,
+            _to_device([p.temperature for p in params]),
+            _to_device(length_penalties) if any(length_penalties) else None,
+            _to_device(diversity_rates) if any(diversity_rates) else None,
+            early_stopping,
+            computes_probs=return_probs,
+        )
+
+    def sample(
+        self, logits: torch.Tensor, *, metadata: BeamSearchMetadata
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Sample the group's logits rows, ``row_stride`` per request."""
+        # Temperature is applied before the op slices the padding rows off, so
+        # it must cover every row the forward laid out.
+        temperature = self.temperature.repeat_interleave(self._row_stride).unsqueeze(-1)
+        return beam_search_sampling_batch_cba(
+            logits / temperature,
+            beam_width_in=self._beam_width_in,
+            beam_width_out=self._beam_width_out,
+            row_stride=self._row_stride,
+            beam_search_args=metadata,
+            temperature=None,
+            early_stopping=self._early_stopping,
+            length_penalty=self._length_penalty,
+            diversity_rate=self._diversity_rate,
+            return_probs=self._computes_probs,
+        )
+
+
 BeamHistoryBuilder: TypeAlias = Callable[[], BeamHistory | None]
 """Builder for BeamHistory.
 
@@ -1375,8 +1494,8 @@ class BeamSearchHandler:
         store = self._store
         assert store is not None
         assert seq_lens is not None, "seq_lens is required for beam search"
-        # Reuse the precomputed CUDA tensors when the strategy group
-        # covers the full batch (typical single-strategy case);
+        # Reuse the precomputed CUDA tensors when the group covers the full
+        # batch (the typical case);
         # otherwise fall back to a per-group H2D for the subset.
         if group_req_indices.size(0) == num_requests:
             group_seq_slots_cuda = seq_slots_cuda

@@ -32,6 +32,7 @@ from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner import (
 )
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
+from tensorrt_llm._torch.pyexecutor.sampler.ops.vanilla import GREEDY_TEMPERATURE_THRESHOLD
 from tensorrt_llm._torch.speculative.interface import SpecMetadata
 from tensorrt_llm.llmapi.llm_args import AdvancedSamplingMode, KvCacheConfig
 from tensorrt_llm.mapping import Mapping
@@ -189,6 +190,48 @@ class TestScanOneModelSamplingHonorsRealCaptureParams(unittest.TestCase):
         self.assertNotEqual(top_k, CAPTURE_TOP_K)
         self.assertEqual(top_p, 1.0)
         self.assertNotEqual(min_p, CAPTURE_MIN_P)
+
+
+class TestScanOneModelSamplingResolution(unittest.TestCase):
+    """The scan reads sampling params the way TorchSampler does
+    (``resolve_row_params``), with greedy rows and a disabled top_k on the
+    one-model sentinels."""
+
+    TOPK_DISABLED = torch.iinfo(torch.int32).max
+
+    def _scan_one(self, **params):
+        meta = _fake_meta()
+        (scanned,) = _scan(meta, [_request(**params)])
+        return scanned, meta.is_all_greedy_sample
+
+    def test_greedy_rows(self):
+        for params in (
+            {},
+            {"top_k": 1, "temperature": 0.7},
+            {"temperature": 0.0, "top_k": 40},
+            {"top_p": 0.0},
+            {"min_p": 1.0, "temperature": 0.7},
+        ):
+            with self.subTest(**params):
+                (temperature, top_k, top_p, min_p), all_greedy = self._scan_one(**params)
+                self.assertTrue(all_greedy)
+                self.assertLess(temperature, GREEDY_TEMPERATURE_THRESHOLD)
+                self.assertEqual((top_k, top_p, min_p), (self.TOPK_DISABLED, 1.0, 0.0))
+
+    def test_sampling_rows(self):
+        for params, expected in (
+            ({"temperature": 0.7}, (0.7, self.TOPK_DISABLED, 1.0, 0.0)),
+            ({"top_k": 40}, (1.0, 40, 1.0, 0.0)),
+            ({"top_k": 0, "top_p": 1.0}, (1.0, self.TOPK_DISABLED, 1.0, 0.0)),
+            ({"top_p": 0.9}, (1.0, self.TOPK_DISABLED, 0.9, 0.0)),
+            # A min_p-only request is not greedy.
+            ({"min_p": 0.1}, (1.0, self.TOPK_DISABLED, 1.0, 0.1)),
+            ({"temperature": 0.5, "top_k": 8, "top_p": 0.8, "min_p": 0.05}, (0.5, 8, 0.8, 0.05)),
+        ):
+            with self.subTest(**params):
+                scanned, all_greedy = self._scan_one(**params)
+                self.assertFalse(all_greedy)
+                self.assertEqual(scanned, expected)
 
 
 def _populate_meta(mode, draft_len=1):
