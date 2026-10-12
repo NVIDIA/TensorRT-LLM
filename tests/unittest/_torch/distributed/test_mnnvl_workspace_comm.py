@@ -351,3 +351,46 @@ def test_minimax_workspace_constructors_use_tp_process_group(
         synchronize.assert_called_once()
     no_mpi.assert_not_called()
     assert pg.requested_devices == [torch.device("cpu")] * pg.backend.allreduces
+
+
+@pytest.mark.parametrize("use_ray", [False, True])
+def test_qualified_workspace_receives_correct_communicator(monkeypatch, use_ray):
+    monkeypatch.setattr(ops, "mpi_disabled", lambda: use_ray)
+    monkeypatch.setattr(ops, "torch_pybind11_abi", lambda: "abi")
+    monkeypatch.setattr(ops.torch.cuda, "current_device", lambda: 0)
+    captured = {}
+
+    def construct(*args, **kwargs):
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return "workspace"
+
+    class Comm:
+        def py2f(self):
+            return 42
+
+    comm = Comm()
+    monkeypatch.setattr(ops, "MnnvlWorkspace", construct)
+    mapping = _FakeMapping(comm)
+    assert ops._make_mnnvl_workspace(comm, 4096, mapping, ops.MnnvlTransport.FABRIC) == "workspace"
+    if use_ray:
+        assert captured["args"] == (4096, ops.MnnvlTransport.FABRIC, 0)
+        assert captured["kwargs"] == {"process_group": comm, "pybind11_abi": "abi"}
+    else:
+        assert captured["args"] == (4096, ops.MnnvlTransport.FABRIC, mapping.local_rank, 42)
+        assert captured["kwargs"] == {}
+
+
+@pytest.mark.parametrize("use_ray", [False, True])
+def test_dispatch_plan_supports_both_orchestrators(monkeypatch, use_ray):
+    import torch
+
+    from tensorrt_llm.mapping import Mapping
+
+    monkeypatch.setattr(ops, "mpi_disabled", lambda: use_ray)
+    monkeypatch.delenv("TRTLLM_FORCE_MNNVL_AR_FABRIC", raising=False)
+    monkeypatch.delenv("TRTLLM_FORCE_MNNVL_AR", raising=False)
+    mapping = Mapping(world_size=2, tp_size=2, rank=0)
+    plan = ops._get_mnnvl_dispatch_plan(mapping, torch.bfloat16)
+    assert plan.is_supported
+    assert plan.transport == ops.MnnvlTransport.POSIX_FD
