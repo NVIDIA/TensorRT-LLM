@@ -30,6 +30,8 @@ from tensorrt_llm._torch._experimental.modeling_v2._router_index import (
 
 # The package, not this file: these paths address the tree under test, and this
 # test lives in tests/ while that tree lives in tensorrt_llm/.
+pytestmark = pytest.mark.cpu_only
+
 _ROOT = Path(_modeling_v2.__file__).resolve().parent
 _ARCHS = sorted(MODELING_V2_ROUTERS)
 

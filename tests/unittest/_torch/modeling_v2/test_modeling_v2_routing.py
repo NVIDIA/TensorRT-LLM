@@ -41,6 +41,8 @@ from tensorrt_llm._torch.models.modeling_utils import (
 from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig, NGramDecodingConfig, TorchLlmArgs
 from tensorrt_llm.mapping import Mapping
 
+pytestmark = pytest.mark.cpu_only
+
 _SM103 = (10, 3)
 _DUMMY_MODEL = "/tmp/dummy_model"
 _BUILTIN_GPT_OSS = "tensorrt_llm._torch.models.modeling_gpt_oss"
