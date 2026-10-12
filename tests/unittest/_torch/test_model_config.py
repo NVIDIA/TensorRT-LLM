@@ -15,6 +15,7 @@ from tensorrt_llm._torch.pyexecutor.model_loader import (
     validate_and_set_kv_cache_quant,
     validate_encoder_decoder_kv_cache_config,
 )
+from tensorrt_llm.llmapi.llm_args import MiniMaxM3SparseAttentionConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
@@ -189,18 +190,32 @@ def test_validate_and_set_kv_cache_quant_auto_keeps_quant_config_dict():
         assert layer_quant_config.kv_cache_quant_algo is None
 
 
+@pytest.mark.parametrize("implementation", [None, "triton", "msa"])
+@pytest.mark.parametrize("requested_dtype", ["nvfp4", "auto"])
 def test_validate_and_set_kv_cache_quant_sm107_downgrade_propagates_to_quant_config_dict(
     monkeypatch: pytest.MonkeyPatch,
+    implementation: str | None,
+    requested_dtype: str,
 ) -> None:
-    """The SM107 NVFP4->FP8 downgrade must update per-layer QuantConfigs too,
-    otherwise a mixed-precision checkpoint keeps NVFP4 in quant_config_dict
-    while the KV pool (sized from the global config) uses FP8."""
+    """The SM107 NVFP4->FP8 decision must reach per-layer QuantConfigs too,
+    otherwise a mixed-precision checkpoint and the KV pool (sized from the
+    global config) disagree. MiniMax-M3 MSA keeps NVFP4, which its hybrid
+    cache serves on SM107; every other configuration falls back to FP8."""
     _mock_sm107(monkeypatch)
     model_config = _make_mixed_precision_model_config()
-    validate_and_set_kv_cache_quant(model_config, "nvfp4")
-    assert model_config.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
+    if implementation is not None:
+        model_config.sparse_attention_config = MiniMaxM3SparseAttentionConfig(
+            implementation=implementation
+        )
+    if requested_dtype == "auto":
+        model_config.quant_config.kv_cache_quant_algo = QuantAlgo.NVFP4
+        for layer_quant_config in model_config.quant_config_dict.values():
+            layer_quant_config.kv_cache_quant_algo = QuantAlgo.NVFP4
+    validate_and_set_kv_cache_quant(model_config, requested_dtype)
+    expected = QuantAlgo.NVFP4 if implementation == "msa" else QuantAlgo.FP8
+    assert model_config.quant_config.kv_cache_quant_algo == expected
     for layer_quant_config in model_config.quant_config_dict.values():
-        assert layer_quant_config.kv_cache_quant_algo == QuantAlgo.FP8
+        assert layer_quant_config.kv_cache_quant_algo == expected
 
 
 def _write_safetensors_header(checkpoint_dir, tensor_dtype, tensor_shape):

@@ -1,0 +1,34 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# MiniMax-M3 context worker on Rubin (SM107) for disaggregated serving.
+# Pair with gen.yaml and keep kv_cache_config.dtype identical on both roles:
+# nvfp4 stores the sparse layers in NVFP4 and the dense and draft layers in FP8;
+# fp8 stores every layer in FP8. Set speculative_model to a local Eagle3 draft
+# checkpoint, and source runtime_env.sh in every worker for native MSA sparse
+# prefill.
+tensor_parallel_size: 2
+moe_expert_parallel_size: 1
+enable_attention_dp: false
+trust_remote_code: true
+max_seq_len: 1048576
+enable_chunked_prefill: true
+cuda_graph_config: null
+kv_cache_config:
+  dtype: nvfp4
+  tokens_per_block: 128
+  enable_block_reuse: true
+  free_gpu_memory_fraction: 0.9
+cache_transceiver_config:
+  backend: NIXL
+moe_config:
+  backend: TRTLLM
+sparse_attention_config:
+  algorithm: minimax_m3
+  implementation: msa
+  indexer_kv_dtype: fp8
+  fuse_qkv_index_projection: true
+speculative_config:
+  decoding_type: Eagle3
+  max_draft_len: 3
+  speculative_model: /path/to/minimax-m3-eagle3
