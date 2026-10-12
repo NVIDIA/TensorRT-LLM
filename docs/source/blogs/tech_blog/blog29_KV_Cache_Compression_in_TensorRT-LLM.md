@@ -114,7 +114,7 @@ To insert precisely, we define five stages in the life of a KV cache (Figure 3):
 
 These stages map to two integration paths in the runtime. **Iteration-driven** methods engage directly at the stages the executor loop passes through: a hook fires at each stage boundary, and the method transforms the retained KV state before the next step reads it. TriAttention is one.
 
-The fifth stage is different in kind. After a request ends, its KV is kept across requests and moves across storage levels, from the GPU to host and disk memory and back. For this part we define **storage-bound** methods: they run inside the cache manager's page migration, when a page crosses a storage boundary, and define how the page is stored while it is cold. NVFP4 cold-page compression is one. A method may use either path or both; in both the cache manager keeps ownership of every page and the method only changes their contents.
+Stages 4 and 5 are different in kind. While a tool runs, and after a request ends, the KV is held by the cache manager rather than by a running request: it is kept across requests, reused, and moved across storage levels from the GPU to host and disk memory and back. For these stages we define **cross-request KV management** methods: they run inside the cache manager, where KV is kept, moved and reused across requests. A method may use either path or both; in both the cache manager keeps ownership of every page and the method only changes their contents.
 
 ### Architecture Overview
 
@@ -131,9 +131,9 @@ The executor and the KV cache manager are existing components. The framework doe
   <img src="../media/tech_blog29_framework.svg" width="1000">
 </figure>
 </div>
-<p align="center"><sub><em>Figure 4: The KV cache compression framework and its execution order. The config builds the manager (1). The manager base inserts a hook into the executor and one into the KV cache manager (2). The concrete method inherits the base and runs inside those hooks (3), launching its own kernels (4). Highlighted boxes are the framework parts; white boxes are existing system components, with the stages each one hosts today and in the future.</em></sub></p>
+<p align="center"><sub><em>Figure 4: The KV cache compression framework and its execution order. The config builds the manager (1). The manager inserts a hook into the executor and one into the KV cache manager (2). The concrete method inherits the manager and runs inside those hooks (3), launching its own kernels (4). Highlighted boxes are the framework parts; white boxes are existing system components, with the stages each one hosts today and in the future.</em></sub></p>
 
-The executor loop hosts the stages inside a request (1 to 3); the cache manager hosts the stages beyond it (4 and 5). Today TriAttention implements the decode stage (3) and cold-page compression the offload part of the after-request stage (5). The rest of this section walks through the configuration, the two paths, and the stages still open.
+The executor loop hosts the stages inside a request (1 to 3); the cache manager hosts the stages beyond it (4 and 5), which need the cross-request mechanism. In the current implementation we use **storage-bound** compression as the first cross-request mechanism: it acts when a page moves to secondary storage, host or disk memory, and defines how the page is stored there. Today TriAttention implements the decode stage (3) and NVFP4 cold-page compression the offload part of the after-request stage (5). The rest of this section walks through the configuration, the two paths, and the stages still open.
 
 ### Configuration and Integration with the Cache Manager
 
