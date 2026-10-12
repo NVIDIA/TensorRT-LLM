@@ -115,7 +115,7 @@ These stages fall into two groups, and each group has its own integration path. 
 
 ### Architecture Overview
 
-The framework has three parts, shown in Figure 4:
+To keep compression simple and straightforward, the whole design breaks down into three parts, shown in Figure 4, without modifying any existing runtime component:
 
 - **Compression config**: one block that selects the method and carries its options; a factory builds the method from it before the model runs.
 - **Compression manager**: the class a method inherits. It already sits at every hook in the executor loop and in the cache manager's page migration; a method overrides the functions for the stages it needs and the compression flow is in place.
@@ -134,7 +134,7 @@ In the current implementation, **storage-bound** compression is the first cross-
 
 ### Configuration and Setup of KV Cache Compression
 
-**The idea.** One config block says which method to run and with what parameters. From it the framework works out which modules to engage and whether the rest of the setup allows it. The block, `kv_cache_compression_config`, holds:
+**The idea.** Turning compression on takes one configuration block, and everything else follows from it: which modules to engage and whether the rest of the setup allows it. The block, `kv_cache_compression_config`, holds:
 
 - **`algorithm`**: which method to run. One method can be active per LLM instance.
 - **Method options**: the method's own parameters, e.g. for TriAttention the token `budget`, the eviction period, the `eviction_mode` and the calibration file.
@@ -145,7 +145,7 @@ Before anything is built, a factory reads the block and wires things up: which m
 
 ### KV Cache Compression in the Executor Iteration Loop
 
-**The idea.** The stages inside a request (stages 1 to 3 in Figure 3) are reached by riding on callbacks the executor already makes. The executor calls every resource manager before the forward pass, after it, and when a request ends. The compression manager registers last, so it runs after the KV cache manager has updated its state, and maps these callbacks onto five hook functions, one per moment: request start, end of prefill, before and after each decode step, and request finish (Figure 5). Every hook does nothing by default. A method overrides the hook of the stage it wants, and its code runs there.
+**The idea.** Reaching the stages inside a request (stages 1 to 3 in Figure 3) costs the runtime nothing new: the compression manager rides on callbacks the executor already makes. The executor calls every resource manager before the forward pass, after it, and when a request ends. The compression manager registers last, so it runs after the KV cache manager has updated its state, and maps these callbacks onto five hook functions, one per moment: request start, end of prefill, before and after each decode step, and request finish (Figure 5). Every hook does nothing by default. A method overrides the hook of the stage it wants, and its code runs there.
 
 <div align="center">
 <figure>
@@ -158,7 +158,7 @@ Two rules for methods on this path: the policy that picks tokens stays separate 
 
 ### KV Cache Compression in Cross-Request KV Management
 
-**The idea.** Outside a request the cache manager owns the KV, so compression plugs into the cache manager where pages move. During a tool call (stage 4 in Figure 3) and after the request (stage 5), V2 decides which pages stay on the GPU, move to host or disk memory, are reused by a later request or transferred to another worker; it does no compression itself. Every reused page is a prefill that never runs, and compression lets the tiers hold more of them. Today the framework covers the first and busiest of these movements, offload and onboard, with the **storage-bound** mechanism.
+**The idea.** Once a request pauses or ends, its KV belongs to the cache manager, so that is where compression plugs in: at the points where pages move. During a tool call (stage 4 in Figure 3) and after the request (stage 5), V2 decides which pages stay on the GPU, move to host or disk memory, are reused by a later request or transferred to another worker; it does no compression itself. Every reused page is a prefill that never runs, and compression lets the tiers hold more of them. Today the framework covers the first and busiest of these movements, offload and onboard, with the **storage-bound** mechanism.
 
 **Compression is more than the algorithm.** A page that crosses a storage boundary is already being read, moved and written by the cache manager's own copy kernels, so a compression method should not add a pass of its own on top. The storage-bound path is built around that: quantization is fused into the offload copy and dequantization into the onboard copy, so compression rides the transfer's bandwidth instead of competing with it.
 
