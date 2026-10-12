@@ -516,6 +516,15 @@ def test_many_threads_read_shared_page_info_concurrently() -> None:
         for cache in readers:
             cache.close()
         assert manager.probe_reuse(None, tokens) == len(tokens)
+
+        # Clearing reuse state must release its pages, not just remove their token matches.
+        manager.clear_reusable_blocks()
+        assert manager.probe_reuse(None, tokens) == 0
+        pools = manager.get_storage_statistics()
+        assert pools
+        for pool in pools:
+            assert pool.free == pool.available == pool.total
+            assert pool.evictable == pool.unavailable == 0
     finally:
         for cache in readers:
             cache.close()
