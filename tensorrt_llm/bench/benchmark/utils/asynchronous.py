@@ -23,7 +23,7 @@ from typing import Dict, List, Optional, Set, Tuple
 
 import tqdm
 from transformers import PreTrainedTokenizer
-from zmq import LINGER, PUSH
+from zmq import IMMEDIATE, LINGER, PUSH
 from zmq.asyncio import Context
 
 from tensorrt_llm import LLM, SamplingParams
@@ -333,6 +333,9 @@ class LlmManager:
             context = Context(io_threads=1)
             socket = context.socket(PUSH)
             socket.setsockopt(LINGER, _ITERATION_LOG_LINGER_MS)
+            # Do not queue records until the writer has finished binding. This
+            # prevents a fast producer from losing its tail during shutdown.
+            socket.setsockopt(IMMEDIATE, 1)
             socket.connect(iteration_addr)
 
             # Wait until a request is seen before proceeding
