@@ -16,6 +16,7 @@ import math
 import os
 from typing import Optional
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -24,7 +25,7 @@ import triton.language as tl
 
 from tensorrt_llm._torch.distributed import AllReduce, allgather, reducescatter
 from tensorrt_llm._torch.modules.embedding import Embedding
-from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
+from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode, UnquantizedLinearMethod
 from tensorrt_llm._utils import CUASSERT, prefer_pinned
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
@@ -148,6 +149,60 @@ def _pad_token_rows(x: torch.Tensor, total_tokens: int) -> torch.Tensor:
     out = x.new_zeros((total_tokens, *x.shape[1:]))
     out[: x.shape[0]] = x
     return out
+
+
+@dataclasses.dataclass(frozen=True)
+class _PLEProjectionRunPlan:
+    """Per-forward representatives certified by the original CPU token layout."""
+
+    starts: torch.Tensor
+    inverse: torch.Tensor
+
+
+def _build_ple_projection_run_plan(
+    input_ids: torch.Tensor, seq_lens: list[int], ngram_size: int
+) -> Optional[_PLEProjectionRunPlan]:
+    """Certify repeated complete n-grams without reading recurrent history.
+
+    ``input_ids`` is the original sequence-packed CPU int32/int64 vector. Each
+    same-token run keeps its first ``ngram_size`` rows as representatives, so
+    unknown history at chunk/request boundaries cannot authorize reuse. Later
+    windows in that run are identical for every configured n-gram head.
+    """
+    if input_ids.device.type != "cpu" or input_ids.dtype not in (torch.int32, torch.int64):
+        raise ValueError("PLE projection planning requires original CPU integer token IDs")
+    if input_ids.ndim != 1 or ngram_size < 2:
+        raise ValueError("PLE projection planning requires flat IDs and ngram_size >= 2")
+    tokens = input_ids.numel()
+    if any(length < 0 for length in seq_lens) or sum(seq_lens) != tokens:
+        raise ValueError("PLE projection planning lengths do not match original token IDs")
+    if tokens < 8192:
+        return None
+
+    ids_cpu = input_ids.detach().numpy()
+    # This negative-only sample can miss reuse, but cannot authorize it. Long
+    # runs must still pass the complete, boundary-aware certificate below.
+    sample = np.linspace(16, tokens - 17, num=16, dtype=np.int64)
+    if not np.any(
+        (ids_cpu[sample - 16] == ids_cpu[sample]) & (ids_cpu[sample] == ids_cpu[sample + 16])
+    ):
+        return None
+    positions = np.arange(tokens, dtype=np.int64)
+    new_run = np.empty(tokens, dtype=np.bool_)
+    new_run[0] = True
+    new_run[1:] = ids_cpu[1:] != ids_cpu[:-1]
+    boundaries = np.cumsum(seq_lens, dtype=np.int64)
+    new_run[boundaries[boundaries < tokens]] = True
+    starts = np.maximum.accumulate(np.where(new_run, positions, 0))
+    representatives = positions - starts < ngram_size
+    # Require a large, strongly repetitive batch before allocating a full map.
+    if np.count_nonzero(representatives) * 4 > tokens:
+        return None
+    inverse = np.cumsum(representatives, dtype=np.int64) - 1
+    return _PLEProjectionRunPlan(
+        starts=torch.from_numpy(np.flatnonzero(representatives)),
+        inverse=torch.from_numpy(inverse),
+    )
 
 
 @dataclasses.dataclass
@@ -1034,11 +1089,76 @@ class Qwen4ExpPLE(nn.Module):
         self._graph_prefetch_buffers: dict[tuple[int, int], torch.Tensor] = {}
         self._eager_prefetch_buffer: Optional[torch.Tensor] = None
         self._prefetch_state: Optional[tuple[torch.Tensor, int, int, torch.Tensor]] = None
+        # Private experiment switch; no public configuration or persistent cache.
+        self._experimental_projection_reuse = False
 
     def _apply_ple_norm(self, norm: nn.Module, x: torch.Tensor) -> torch.Tensor:
         """Per-stream grouped norm over a ``[..., hc_count, hidden]`` tensor."""
         y = norm(x.flatten(-2, -1))
         return y.unflatten(-1, (self.hc_count, self.hidden_size))
+
+    def _can_reuse_projection(self, metadata: PLEMetadata, embeddings: torch.Tensor) -> bool:
+        """Limit the private experiment to large, eager, dense inference prefill."""
+        if not self._experimental_projection_reuse:
+            return False
+        if (
+            metadata.is_decode
+            or metadata.num_contexts == 0
+            or metadata.processed_tokens < 8192
+            or metadata.is_cuda_graph
+            or metadata.use_spec_decoding
+            or torch.compiler.is_compiling()
+            or torch.is_grad_enabled()
+            or self.ple_embedding.use_attention_dp_sharding
+        ):
+            return False
+        if embeddings.is_cuda and torch.cuda.is_current_stream_capturing():
+            return False
+        if embeddings.dtype not in (torch.float32, torch.bfloat16):
+            return False
+        for projection in (self.key_proj, self.value_proj):
+            if (
+                type(projection) is not Linear
+                or type(projection.quant_method) is not UnquantizedLinearMethod
+                or projection.lora is not None
+                or projection.weight.dtype != embeddings.dtype
+                or projection.weight.device != embeddings.device
+                or projection.tp_mode is not None
+            ):
+                return False
+        return True
+
+    def _project_key_value(
+        self, embeddings: torch.Tensor, metadata: PLEMetadata
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Reuse certified equal contexts, restoring rows before query/state work.
+
+        The default-off experiment deliberately includes synchronous token D2H
+        and CPU planning. It does not alter lookup or TP collective participation,
+        and stores no plan or projections beyond this forward.
+        """
+        inverse = None
+        if self._can_reuse_projection(metadata, embeddings):
+            # Only logical tokens enter the certificate, never rectangular EOS
+            # padding. First rows of each run stay independent of prior history.
+            packed_tokens = metadata.padded_tokens[metadata.req_indices, metadata.token_offsets].to(
+                device="cpu"
+            )
+            lengths = metadata.lengths.tolist()
+            plan = _build_ple_projection_run_plan(packed_tokens, lengths, self.ngram_size)
+            if plan is not None:
+                starts = plan.starts.to(device=embeddings.device)
+                inverse = plan.inverse.to(device=embeddings.device)
+                embeddings = embeddings.index_select(0, starts)
+
+        key = self.key_proj(embeddings)
+        value = self.value_proj(embeddings)
+        key = key.reshape(embeddings.shape[0], self.hc_count, self.hidden_size)
+        key_normed = self._apply_ple_norm(self.norm_key, key)
+        if inverse is not None:
+            key_normed = key_normed.index_select(0, inverse)
+            value = value.index_select(0, inverse)
+        return key_normed, value
 
     def _prepare_ngram_lookup(
         self,
@@ -1394,12 +1514,9 @@ class Qwen4ExpPLE(nn.Module):
                 all_rank_num_tokens=m.all_rank_num_tokens,
             ).flatten(start_dim=-2)
 
-        key = self.key_proj(embeddings)
-        value = self.value_proj(embeddings)
+        key_normed, value = self._project_key_value(embeddings, m)
         token_count = hidden_states.shape[0]
-        key = key.reshape(token_count, self.hc_count, self.hidden_size)
         query = hidden_states.reshape(token_count, self.hc_count, self.hidden_size)
-        key_normed = self._apply_ple_norm(self.norm_key, key)
         query_normed = self._apply_ple_norm(self.norm_query, query)
         gate = (key_normed * query_normed).sum(dim=-1, keepdim=True)
         gate = gate / math.sqrt(self.hidden_size)
