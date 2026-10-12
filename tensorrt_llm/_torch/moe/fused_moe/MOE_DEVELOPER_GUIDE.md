@@ -793,12 +793,19 @@ The `XXFusedMoE` names remain supported as module-level aliases — `DeepGemmFus
 ### CUTLASS eager scratch reclamation
 
 The scheduled decoder engine supplies a `CutlassWorkspaceReclaimer` scope around
-one complete model forward, including warmup. `torch_custom_ops.fused_moe`
-registers each native runner/stream once per scope, after autotuning. The native
+one complete model forward, including warmup. The Python scope enters and exits
+a native `EagerMoeWorkspaceScope`; inference calls discover runners directly in
+C++, after autotuning, without per-layer Python registration or stream queries.
+The native scope retains each runner and groups calls by runner/device/stream.
+Cleanup restores each allocation stream, including after model or cleanup errors.
+Scopes are thread-local and reject overlapping or cross-thread use. If warmup
+finds no runners, subsequent serving forwards bypass native scopes; later warmup
+can still discover runners. The native
 `EagerMoeWorkspace` accumulates exact workspace requirements across layers and
 chunks and replaces excess backing after three successful forwards using at most half
-the retained capacity. The replacement retains the largest demand in that window.
-Maximum-shape warmup establishes eligibility, not a permanent capacity floor.
+the retained capacity. The replacement retains the larger of the window demand and the capacity
+established by successful warmup. This warmup floor is never reduced by serving
+forwards; at the floor, the shrink-window checks are bypassed.
 The engine also supplies its host token count. Known runners on the current
 stream begin before the model executes, reserving a previously observed demand
 before embedding/attention intermediates can split a released burst-sized block.
@@ -807,7 +814,8 @@ window, and a failed reservation does not reject a smaller actual allocation. Ro
 `getWorkspaceInfo` on the next call. A new runner/stream without warmup does not
 reclaim; capture, another engine owner or unscoped use disables reclamation for
 that workspace. Graph storage and LoRA-specific persistent scratch are excluded.
-`TRTLLM_RECLAIM_WORKSPACE=0` disables the engine scope. All cleanup runs on each
+`TRTLLM_RECLAIM_WORKSPACE=0`, set before engine initialization, disables both
+attention and CUTLASS MoE reclamation scopes. All cleanup runs on each
 allocation's original CUDA stream; no device synchronization or payload copy is
 needed for pure scratch. The replacement is allocated before releasing the old
 block so a small allocation does not split and pin the burst-sized segment;

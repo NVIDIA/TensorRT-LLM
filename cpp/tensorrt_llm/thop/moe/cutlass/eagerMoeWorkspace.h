@@ -77,18 +77,23 @@ public:
             resetWindow();
             return;
         }
-        if (mNumTokens > 0)
-        {
-            auto& required = mRequirements[mNumTokens];
-            required = std::max(required, mRequired);
-        }
         if (mWarmup)
         {
+            mFloor = std::max(mFloor, capacity());
             mWarmedUp = true;
             resetWindow();
             return;
         }
-        if (capacity() > mCapacityBefore || mRequired > capacity() / 2)
+        // Only build reservation history after demand exceeds the floor. Once
+        // history exists, retain small-shape observations too so their next
+        // forward does not reserve a larger shape's workspace unnecessarily.
+        if (mNumTokens > 0 && (mRequired > mFloor || !mRequirements.empty()))
+        {
+            auto& required = mRequirements[mNumTokens];
+            required = std::max(required, mRequired);
+        }
+        auto const currentCapacity = capacity();
+        if (currentCapacity <= mFloor || currentCapacity > mCapacityBefore || mRequired > currentCapacity / 2)
         {
             resetWindow();
             return;
@@ -98,11 +103,10 @@ public:
         {
             return;
         }
-        // Warmup exercises maximum shapes, not a minimum serving requirement.
-        // Pure scratch can shrink below that high-water mark. Requiring three
+        // Preserve the capacity established by successful warmup. Requiring three
         // forwards at no more than half capacity avoids reallocating for small
         // fluctuations; retain the largest actual demand in that window.
-        auto const target = mWindowMax;
+        auto const target = std::max(mFloor, mWindowMax);
         resetWindow();
         auto const options = mWorkspace.options();
         // Allocate the small replacement before releasing the large block.
@@ -141,7 +145,8 @@ public:
         if (capturing || !mWorkspace.defined() || capacity() < required)
         {
             mWorkspace = torch::Tensor{};
-            mWorkspace = torch::empty({required}, torch::dtype(torch::kInt8).device(torch::kCUDA));
+            auto const target = capturing ? required : std::max(mFloor, required);
+            mWorkspace = torch::empty({target}, torch::dtype(torch::kInt8).device(torch::kCUDA));
         }
         return mWorkspace;
     }
@@ -168,6 +173,7 @@ private:
     int64_t mOwner = 0;
     int64_t mNumTokens = 0;
     int64_t mCapacityBefore = 0;
+    int64_t mFloor = 0;
     int64_t mRequired = 0;
     int64_t mWindowMax = 0;
     int mRemaining = 3;

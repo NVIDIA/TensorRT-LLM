@@ -23,9 +23,10 @@ memory. Set `TRTLLM_RECLAIM_WORKSPACE=0` before starting the process to disable
 this behavior if it causes performance regression. This setting also controls eager CUTLASS MoE runner workspace reclamation.
 CUTLASS uses its native workspace sizing to accumulate the maximum demand across
 all layers and chunks in a model forward. After three successful forwards using at most half the retained capacity, it
-replaces the backing with the largest actual requirement in that window. Unlike
-the attention policy, maximum-shape warmup is not a permanent minimum for this
-pure scratch buffer; it can shrink after warmup even without a serving spike.
+replaces the backing with the larger of that window's maximum demand and the
+capacity established by successful warmup. Like attention, it never shrinks
+below this warmup floor. Runner/stream discovery happens in native inference
+calls; Python only opens and closes a scope at model-forward boundaries.
 Previously observed demand is reserved at the next model-forward entry so model
 intermediates do not consume and fragment the released burst-sized block first.
 This reduces active allocations; allocator-reserved and device memory can remain

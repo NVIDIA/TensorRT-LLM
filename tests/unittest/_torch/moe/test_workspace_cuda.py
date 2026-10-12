@@ -103,11 +103,13 @@ def test_cutlass_fifty_growth_reclaim_cycles(
             elif step < 3:
                 assert retained == peak, "Count complete forwards, not the three layer calls"
             else:
-                assert retained <= baseline, "Third underfilled forward must release excess backing"
+                assert retained == baseline, (
+                    "Third underfilled forward must return to the warmup floor"
+                )
                 assert retained < peak
 
 
-def test_cutlass_reclaims_maximum_shape_warmup(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_cutlass_preserves_maximum_shape_warmup(monkeypatch: pytest.MonkeyPatch) -> None:
     workload = CutlassWorkload()
     monkeypatch.setattr(ops.MoERunner, "runner_dict", {})
     references = {n: [x.cpu() for x in workload.forward(n, None)] for n in (16, 8, 4)}
@@ -115,16 +117,13 @@ def test_cutlass_reclaims_maximum_shape_warmup(monkeypatch: pytest.MonkeyPatch) 
     scope = CutlassWorkspaceReclaimer()
     workload.forward(1024, scope, warmup=True)
     peak = memory()["allocated"]
-    for step, n in enumerate((16, 8, 4)):
+    for n in (16, 8, 4) * 3:
         outputs = workload.forward(n, scope)
         for output, expected in zip(outputs, references[n]):
             torch.testing.assert_close(output.cpu(), expected, rtol=0, atol=0)
         del outputs, output
         retained = memory()["allocated"]
-        if step < 2:
-            assert retained == peak
-        else:
-            assert retained < peak, "Normal maximum-shape warmup must not pin eager scratch"
+        assert retained == peak, "Eager scratch must retain its warmup capacity floor"
 
 
 def test_cutlass_graph_replay_after_eager_calls(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -197,7 +196,7 @@ def memory_sequence(workload: CutlassWorkload, enabled: bool) -> dict[str, objec
         for label in ("short1", "short2"):
             assert phases[label]["allocated"] == peak
         if enabled:
-            assert phases["short3"]["allocated"] <= baseline
+            assert phases["short3"]["allocated"] == baseline
             assert phases["short3"]["allocated"] < peak
         else:
             assert phases["short3"]["allocated"] == peak

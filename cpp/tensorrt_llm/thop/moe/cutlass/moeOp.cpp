@@ -28,6 +28,7 @@
 
 #include "cutlass/gemm_coord.h"
 #include "eagerMoeWorkspace.h"
+#include "eagerMoeWorkspaceScope.h"
 
 #include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/dataType.h"
@@ -169,7 +170,7 @@ static ActivationParams makeActivationParams(ActivationType activation_type,
 #endif
 }
 
-class FusedMoeRunner : public torch::CustomClassHolder
+class FusedMoeRunner : public EagerMoeWorkspaceOwner
 {
 public:
     template <typename TypeAct, typename TypeWeight, bool NeedQuant = false>
@@ -380,7 +381,7 @@ public:
     FusedMoeRunner(FusedMoeRunner const&) = delete;
     void operator=(FusedMoeRunner const&) = delete;
 
-    bool beginWorkspaceForward(int64_t owner, bool warmup, int64_t numTokens)
+    bool beginWorkspaceForward(int64_t owner, bool warmup, int64_t numTokens) override
     {
         std::lock_guard<std::mutex> lock(mMutex);
         auto const stream = at::cuda::getCurrentCUDAStream();
@@ -388,7 +389,7 @@ public:
             owner, warmup, numTokens);
     }
 
-    void finishWorkspaceForward(bool completed)
+    void finishWorkspaceForward(bool completed) override
     {
         std::lock_guard<std::mutex> lock(mMutex);
         auto const stream = at::cuda::getCurrentCUDAStream();
@@ -446,6 +447,7 @@ public:
         torch::optional<torch::Tensor> const& token_to_slot = torch::nullopt,
         bool const swiglu_clamp_after_silu = false)
     {
+        EagerMoeWorkspaceScope::registerCurrent(this, input.get_device());
         std::lock_guard<std::mutex> lock(mMutex);
         // Free the profile workspace to save memory
         freeProfileWorkspace();
@@ -779,6 +781,7 @@ public:
         torch::optional<int64_t> const& num_valid_tokens, torch::optional<torch::Tensor> const& out_tensor,
         bool const swiglu_clamp_after_silu = false)
     {
+        EagerMoeWorkspaceScope::registerCurrent(this, input.get_device());
         std::lock_guard<std::mutex> lock(mMutex);
 
         // Free the profile workspace to save memory
@@ -2500,6 +2503,10 @@ TRTLLM_NAMESPACE_END
 
 TORCH_LIBRARY(trtllm, m)
 {
+    m.class_<tensorrt_llm::torch_ext::EagerMoeWorkspaceScope>("EagerMoeWorkspaceScope")
+        .def(torch::init<int64_t>())
+        .def("begin", &tensorrt_llm::torch_ext::EagerMoeWorkspaceScope::begin)
+        .def("finish", &tensorrt_llm::torch_ext::EagerMoeWorkspaceScope::finish);
     m.class_<tensorrt_llm::torch_ext::FusedMoeRunner>("FusedMoeRunner")
         .def(torch::init<c10::ScalarType, c10::ScalarType, c10::ScalarType, bool, bool, bool, bool, bool, bool>())
         .def("run_gemm_profile", &tensorrt_llm::torch_ext::FusedMoeRunner::runGemmProfile)

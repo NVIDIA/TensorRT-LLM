@@ -229,6 +229,31 @@ class TestEagerWorkspaceEngine(unittest.TestCase):
         scope.assert_called_once_with(self.metadata)
         scope.return_value.__exit__.assert_called_once_with(None, None, None)
 
+    def test_runner_warmup_restores_flag_on_success_and_failure(self) -> None:
+        self.engine.kv_cache_manager_key = object()
+        resource_manager = Mock()
+        for initial in (False, True):
+            for fail in (False, True):
+                with self.subTest(initial=initial, fail=fail):
+                    self.engine._is_warmup = initial
+                    self.engine._warmup_timer = ExitStack()
+
+                    def scheduled(*args: object) -> None:
+                        self.assertTrue(self.engine._is_warmup)
+                        if fail:
+                            raise RuntimeError("warmup failed")
+
+                    self.engine._warmup_scheduled = Mock(side_effect=scheduled)
+                    if fail:
+                        with self.assertRaisesRegex(RuntimeError, "warmup failed"):
+                            self.engine.warmup(resource_manager)
+                    else:
+                        self.engine.warmup(resource_manager)
+                    self.assertEqual(self.engine._is_warmup, initial)
+                    self.engine._warmup_scheduled.assert_called_once_with(
+                        resource_manager, resource_manager.get_resource_manager.return_value
+                    )
+
     def test_moe_scope_tracks_warmup_and_serving_but_not_profiling(self) -> None:
         reclaimer = Mock()
         reclaimer.forward.return_value = ExitStack()
@@ -255,6 +280,7 @@ class TestEagerWorkspaceEngine(unittest.TestCase):
             factory.assert_called_once()
             for target, name, value in [
                 (self.engine._config, "is_spec_decode", True),
+                (self.engine.mapping, "cp_size", 2),
                 (self.engine, "_eager_workspace_reclaim_supported", False),
                 (self.engine, "_torch_compile_backend", object()),
                 (self.engine, "breakable_cuda_graph_runner", object()),
@@ -263,6 +289,21 @@ class TestEagerWorkspaceEngine(unittest.TestCase):
                     self.engine._initialize_moe_workspace_reclaimer()
                     self.assertIsNone(self.engine._moe_workspace_reclaimer)
             factory.assert_called_once()
+
+    def test_escape_hatch_disables_both_workspace_scopes(self) -> None:
+        with (
+            patch.dict(os.environ, {"TRTLLM_RECLAIM_WORKSPACE": "0"}),
+            patch(f"{_RUNNER_MODULE}.CutlassWorkspaceReclaimer") as moe_factory,
+        ):
+            self.engine._initialize_moe_workspace_reclaimer()
+            self.freeze()
+            for warmup in (True, False):
+                self.engine._is_warmup = warmup
+                self.assertEqual(self.call(is_dummy=warmup), 42)
+            self.assertIsNone(self.engine._moe_workspace_reclaimer)
+            self.assertIsNone(self.engine._eager_workspace_reclaimer)
+            moe_factory.assert_not_called()
+            self.reclaimer_class.assert_not_called()
 
     def test_ineligible_modes_and_workspaces_do_not_create_reclaimer(self) -> None:
         with patch.object(self.engine, "_eager_workspace_reclaim_supported", False):
