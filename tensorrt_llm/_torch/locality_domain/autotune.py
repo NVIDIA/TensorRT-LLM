@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import replace
-from typing import Any
+from typing import Any, Optional
 
 import torch
 
@@ -40,6 +40,7 @@ class LocalityDomainConcurrentTunableRunner(TunableRunner):
         runtime: LocalityDomainRuntime,
         num_partitions: int,
         launch_fn: Callable[[int, list[torch.Tensor], object], None],
+        prologue_fn: Optional[Callable[[list[torch.Tensor], object], None]] = None,
     ) -> None:
         super().__init__()
         if num_partitions <= 0:
@@ -54,6 +55,10 @@ class LocalityDomainConcurrentTunableRunner(TunableRunner):
         self._runtime = runtime
         self._num_partitions = num_partitions
         self._launch_fn = launch_fn
+        # Runs on the caller's stream before the fork on every forward
+        # (profiling included): shared per-call preparation such as one reset
+        # launch for both partitions' workspaces.
+        self._prologue_fn = prologue_fn
 
     @property
     def op_runner(self) -> TunableRunner:
@@ -93,6 +98,8 @@ class LocalityDomainConcurrentTunableRunner(TunableRunner):
         tactic: Any = -1,
         **kwargs: Any,
     ) -> None:
+        if self._prologue_fn is not None:
+            self._prologue_fn(inputs, tactic)
         self._runtime.fork()
         try:
             for partition_id in range(self._num_partitions):
@@ -110,14 +117,19 @@ def tune_locality_domain_concurrent(
     launch_fn: Callable[[int, list[torch.Tensor], object], None],
     inputs: list[torch.Tensor],
     tuning_config: TuningConfig,
+    prologue_fn: Optional[Callable[[list[torch.Tensor], object], None]] = None,
     **choose_one_kwargs: Any,
 ) -> tuple[LocalityDomainConcurrentTunableRunner, Any]:
-    """Choose one tactic by profiling all locality domain partitions concurrently."""
+    """Choose one tactic by profiling all locality domain partitions concurrently.
+
+    ``prologue_fn`` runs before the fork on every forward, profiling included.
+    """
     runner = LocalityDomainConcurrentTunableRunner(
         op_runner,
         runtime,
         num_partitions,
         launch_fn,
+        prologue_fn,
     )
     # AutoTuner implements cold-L2 profiling by cloning every tensor into
     # ordinary CUDA allocations. That loses the VMM node locality of locality domain
