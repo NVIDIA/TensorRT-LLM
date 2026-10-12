@@ -4043,14 +4043,19 @@ def test_disaggregated_logprobs_serving(disaggregated_test_root,
                         **base
                     }
 
-                # 1) Streaming vs non-streaming consistency check
-                async with session.post(url,
-                                        json=make_payload(prompt, False),
-                                        timeout=timeout) as resp:
-                    assert resp.status == 200, \
-                        f"[{api_type}] non-streaming: {await resp.text()}"
-                    ns_tokens, ns_logprobs = extract_logprobs(
-                        await resp.json(), api_type)
+                # 1) Streaming vs non-streaming consistency check.
+                # Block reuse is on, and a cold prefill is not bit-identical
+                # to a reused prefix. Issue the non-streaming request twice
+                # and keep the second result so both sides of the comparison
+                # hit the reuse path.
+                for _ in range(2):
+                    async with session.post(url,
+                                            json=make_payload(prompt, False),
+                                            timeout=timeout) as resp:
+                        assert resp.status == 200, \
+                            f"[{api_type}] non-streaming: {await resp.text()}"
+                        ns_tokens, ns_logprobs = extract_logprobs(
+                            await resp.json(), api_type)
 
                 async with session.post(url,
                                         json=make_payload(prompt, True),
@@ -4065,13 +4070,10 @@ def test_disaggregated_logprobs_serving(disaggregated_test_root,
                 assert len(ns_logprobs) == len(st_logprobs), (
                     f"[{api_type}] logprobs length: "
                     f"{len(ns_logprobs)} vs {len(st_logprobs)}")
-                # Skip position 0: the first token logprob can diverge
-                # between streaming and non-streaming in disaggregated mode
-                # due to the context/generation handoff boundary.
                 comparable = 0
                 for i, (n, s) in enumerate(
                         zip(ns_logprobs, st_logprobs, strict=True)):
-                    if i == 0 or n is None or s is None:
+                    if n is None or s is None:
                         continue
                     comparable += 1
                     rtol, atol = (1e-3, 1e-4) if api_type == "chat" else (1e-4,
@@ -4079,7 +4081,7 @@ def test_disaggregated_logprobs_serving(disaggregated_test_root,
                     assert np.isclose(n, s, rtol=rtol, atol=atol), \
                         f"[{api_type}] logprob mismatch at {i}: {n} vs {s}"
                 assert comparable > 0, (
-                    f"[{api_type}] no comparable post-handoff logprobs found")
+                    f"[{api_type}] no comparable logprobs found")
 
                 # 2) Chat API with top_logprobs (requires gather_generation_logits)
                 if api_type == "chat":
