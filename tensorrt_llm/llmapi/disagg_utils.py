@@ -226,10 +226,13 @@ def get_ctx_gen_server_addrs(
     ctx_server_urls = []
     gen_server_urls = []
     for cfg in server_configs:
+        hostname = cfg.hostname
+        if hostname and ':' in hostname and not hostname.startswith('['):
+            hostname = f'[{hostname}]'
         if cfg.type == "ctx":
-            ctx_server_urls.append(f"{cfg.hostname}:{cfg.port}")
+            ctx_server_urls.append(f"{hostname}:{cfg.port}")
         else:
-            gen_server_urls.append(f"{cfg.hostname}:{cfg.port}")
+            gen_server_urls.append(f"{hostname}:{cfg.port}")
 
     return ctx_server_urls, gen_server_urls
 
@@ -407,7 +410,11 @@ def extract_ctx_gen_cfgs(type: Literal['ctx', 'gen'],
     ports = []
     if urls:
         for url in urls:
-            hostname, port_str = url.split(':')
+            hostname, port_str = url.rsplit(':', 1)
+            if hostname.startswith('[') and hostname.endswith(']'):
+                hostname = hostname[1:-1]
+            elif ':' in hostname:
+                raise ValueError('IPv6 server addresses must use brackets')
             port = int(port_str)
             hostnames.append(hostname)
             ports.append(port)

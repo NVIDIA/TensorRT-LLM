@@ -12,8 +12,9 @@ import yaml
 from tensorrt_llm.llmapi.disagg_utils import (
     MIN_GLOBAL_ID, CtxGenServerConfig, DisaggServerConfig,
     disagg_process_id_space, extract_ctx_gen_cfgs, extract_router_config,
-    extract_disagg_cfg, get_global_disagg_request_id, get_local_request_id,
-    get_server_configs_dict, parse_disagg_config_file, worker_local_process_id)
+    get_ctx_gen_server_addrs, extract_disagg_cfg, get_global_disagg_request_id,
+    get_local_request_id, get_server_configs_dict, parse_disagg_config_file,
+    worker_local_process_id)
 # isort: on
 
 pytestmark = pytest.mark.cpu_only
@@ -262,6 +263,46 @@ def test_extract_ctx_gen_cfgs():
     assert configs[0].hostname == "host1"
     assert configs[0].port == 8001
     assert configs[0].instance_num_ranks == 2
+
+
+@pytest.mark.parametrize("server_type", ["ctx", "gen"])
+@pytest.mark.parametrize("address,hostname", [
+    ("127.0.0.1:8000", "127.0.0.1"),
+    ("worker.example:8000", "worker.example"),
+    ("[::1]:8000", "::1"),
+    ("[2001:db8::10]:8000", "2001:db8::10"),
+    ("[fe80::1%eth0]:8000", "fe80::1%eth0"),
+])
+def test_ctx_gen_server_address_round_trip(server_type, address, hostname):
+    configs = extract_ctx_gen_cfgs(type=server_type, urls=[address])
+
+    assert configs[0].hostname == hostname
+    assert configs[0].port == 8000
+    context_addresses, generation_addresses = get_ctx_gen_server_addrs(configs)
+    addresses = context_addresses if server_type == "ctx" else generation_addresses
+    assert addresses == [address]
+
+
+def test_ctx_gen_server_address_formats_existing_ipv6_config():
+    configs = [
+        CtxGenServerConfig(type="ctx", hostname="::1", port=8000),
+        CtxGenServerConfig(type="gen", hostname="[::1]", port=8001),
+    ]
+
+    assert get_ctx_gen_server_addrs(configs) == (["[::1]:8000"], ["[::1]:8001"])
+
+
+@pytest.mark.parametrize("address", [
+    "::1:8000",
+    "http://worker:8000",
+    "[::1]",
+    "worker:not-a-port",
+    "[::1:8000",
+    "worker:8000:extra",
+])
+def test_ctx_gen_server_address_rejects_invalid_input(address):
+    with pytest.raises(ValueError):
+        extract_ctx_gen_cfgs(type="ctx", urls=[address])
 
 
 @pytest.mark.parametrize("sample_yaml_config", [""], indirect=True)
