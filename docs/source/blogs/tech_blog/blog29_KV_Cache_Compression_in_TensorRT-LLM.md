@@ -212,7 +212,7 @@ The implementation lives in `tensorrt_llm/_torch/kv_cache_compression/quantizati
 
 #### Introduction
 
-In a long generation most of the KV cache is generated tokens, and most of them will not matter to the queries still to come. [TriAttention](https://arxiv.org/abs/2604.04921) (ICML 2026) predicts which ones matter from per-head query statistics collected once offline, and every few tokens evicts the rest and compacts the cache, so decoding reads a shorter cache and more sequences fit on the GPU. The prompt is never touched; only generated tokens are evicted. Figure 8 shows one round. For details, see the paper and the [TriAttention example](https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/kv_cache_compression/triattention.md).
+In a long generation most of the KV cache is generated tokens, and most of them will not matter to the queries still to come. [TriAttention](https://arxiv.org/abs/2604.04921) (ICML 2026) predicts which ones matter from per-head query statistics collected once offline, and every few tokens evicts the rest and compacts the cache, so decoding reads a shorter cache and more sequences fit on the GPU. Figure 8 shows one round. For details, see the paper and the [TriAttention example](https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/kv_cache_compression/triattention.md).
 
 <div align="center">
 <figure>
