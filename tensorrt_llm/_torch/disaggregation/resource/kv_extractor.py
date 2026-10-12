@@ -461,7 +461,6 @@ def _build_page_table_v2(manager) -> KVCachePageTable:
                     pool_group_idx=storage_pg_to_list_idx[storage_pg_idx],
                     local_layers=local_layers,
                     pool_views=pool_views,
-                    slot_major_layout=True,
                 )
                 continue
 

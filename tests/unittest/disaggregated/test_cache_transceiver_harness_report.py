@@ -104,7 +104,7 @@ class TestBuildCases:
         labels = [c["label"] for c in cases]
         assert "UCX/CPP/V1" in labels
         assert "NIXL/CPP/V1" in labels
-        assert "NIXL/PYTHON/V1" in labels
+        assert "NIXL/PYTHON/V1" not in labels
         assert "NIXL/PYTHON/V2" in labels
         # V2 + CPP should be skipped
         assert "UCX/CPP/V2" not in labels
@@ -380,7 +380,7 @@ class TestParseProtoInfo:
                 "[CTT_CASE_BEGIN] ci=0 label=UCX/CPP/V1",
                 "cfg#0 ucp_put (cuda/cuda)",
                 "  | rendezvous | cuda_ipc/cuda |",
-                "[CTT_CASE_BEGIN] ci=1 label=NIXL/PYTHON/V1",
+                "[CTT_CASE_BEGIN] ci=1 label=NIXL/PYTHON/V2",
                 "cfg#0 ucp_put (cuda/cuda)",
                 "  | rendezvous | rc_mlx5/cuda |",
             ],
@@ -393,7 +393,7 @@ class TestParseProtoInfo:
         self._write_log(
             tmp_path / "rank0.log",
             [
-                "[CTT_CASE_BEGIN] ci=0 label=NIXL/PYTHON/V1",
+                "[CTT_CASE_BEGIN] ci=0 label=NIXL/PYTHON/V2",
                 "export UCX_TLS=all,self",
                 "cfg#0 tagged message (cuda/cuda)",
                 "  | eager short | self/memory |",
@@ -442,7 +442,7 @@ class TestRankBest:
     def test_picks_highest_bw(self):
         by_combination = [
             {
-                "combination": "NIXL/PYTHON/V1",
+                "combination": "NIXL/PYTHON/V2",
                 "sweeps": [
                     {
                         "sweep": "all",
@@ -497,7 +497,7 @@ class TestAggregate:
         sample_cfg["environment"]["work_dir"] = str(work)
         # Use only 1 sweep and 1 combination for simplicity
         sample_cfg["test_matrix"]["combinations"] = [{"backend": "NIXL", "runtime": "PYTHON"}]
-        sample_cfg["test_matrix"]["cache_manager_versions"] = ["V1"]
+        sample_cfg["test_matrix"]["cache_manager_versions"] = ["V2"]
         sample_cfg["ucx_env_sweep"] = [{"name": "default", "env": {"UCX_TLS": "all"}}]
         sample_cfg["test_matrix"]["request_lengths"] = [100, 1000]
         sample_cfg["test_matrix"]["warmup_requests"] = 1
@@ -553,7 +553,7 @@ class TestAggregate:
         assert "by_combination" in data
         assert data["req_len"] == 1000
         assert len(data["by_combination"]) == 1
-        assert data["by_combination"][0]["combination"] == "NIXL/PYTHON/V1"
+        assert data["by_combination"][0]["combination"] == "NIXL/PYTHON/V2"
 
         # Best file should also be written
         best_path = str(work / "results.best.json")
@@ -563,7 +563,7 @@ class TestAggregate:
         work = self._setup_work_dir(tmp_path, sample_cfg)
         with open(work / "logs" / "sweep0_gen_rank0.log", "w") as f:
             f.write(
-                "[CTT_CASE_BEGIN] ci=0 label=NIXL/PYTHON/V1\n"
+                "[CTT_CASE_BEGIN] ci=0 label=NIXL/PYTHON/V2\n"
                 "export UCX_TLS=all,self\n"
                 "cfg#0 tagged message (cuda/cuda)\n"
                 "  | eager short | self/memory |\n"

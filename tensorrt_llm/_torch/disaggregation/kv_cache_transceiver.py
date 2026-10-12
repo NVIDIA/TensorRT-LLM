@@ -115,7 +115,7 @@ def mapping_to_world_config(mapping: Mapping) -> WorldConfig:
 def create_kv_cache_transceiver(
     mapping: Mapping,
     dist: Distributed,
-    kv_cache_manager: KVCacheManager,
+    kv_cache_manager: KVCacheManager | KVCacheManagerV2,
     attention_type: AttentionTypeCpp,
     cache_transceiver_config: CacheTransceiverConfig,
     mamba_cache_manager: Optional[BaseMambaCacheManager] = None
@@ -190,7 +190,9 @@ def create_kv_cache_transceiver(
                 "Please use transceiver_runtime='CPP' with "
                 "kv_cache_config.use_kv_cache_manager_v2=False for MPI, UCX, "
                 "or MOONCAKE backends, with a model that supports V1.")
-        if not isinstance(kv_cache_manager, KVCacheManagerV2):
+        if (not isinstance(kv_cache_manager, KVCacheManagerV2) or
+            (mamba_cache_manager is not None and
+             not isinstance(mamba_cache_manager, MambaHybridCacheManagerV2))):
             raise ValueError(
                 "KvCacheTransceiverV2 does not support KV cache manager V1. "
                 "Set use_kv_cache_manager_v2=True to use "
@@ -199,7 +201,7 @@ def create_kv_cache_transceiver(
         from tensorrt_llm._torch.disaggregation.transceiver import \
             KvCacheTransceiverV2
         logger.info("Using KvCacheTransceiverV2")
-        # MixedMambaHybridCacheManager contains both the KV and Mamba pools.
+        # MambaHybridCacheManagerV2 contains both the KV and Mamba pools.
         return KvCacheTransceiverV2(mapping, dist, kv_cache_manager,
                                     cache_transceiver_config)
 
