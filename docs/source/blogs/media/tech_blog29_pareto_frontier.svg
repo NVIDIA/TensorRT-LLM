@@ -1,7 +1,7 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 640" width="1000" height="640">
 <defs><marker id="ah" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto" markerUnits="userSpaceOnUse"><path d="M0,0.5 L7,4 L0,7.5" fill="none" stroke="#4f5d75" stroke-width="1"/></marker></defs>
 <rect width="1000" height="640" fill="#f5f5f5"/>
-<text x="500.0" y="30.0" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="middle">GLM-5.2 · 8 to 48 GB300</text>
+<text x="500.0" y="30.0" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="middle">GLM-5.2 · Pareto frontier</text>
 <circle cx="75" cy="51" r="4.5" fill="#76B900"/>
 <text x="86.0" y="55.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" fill="#4f5d75" text-anchor="start">NVFP4 host cache · Pareto frontier</text>
 <circle cx="325" cy="51" r="4.5" fill="#ffffff" stroke="#2d3142"/>

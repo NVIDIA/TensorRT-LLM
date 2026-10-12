@@ -244,7 +244,7 @@ This section consolidates performance and accuracy results for the KV cache comp
 
 ### NVFP4 Cold-Page Compression
 
-Unless otherwise specified, the experiments below use GB300 GPUs, the PyTorch backend, the paged KV cache manager, and block reuse enabled. Before any result was accepted we confirmed that pages were actually compressed during the measured window, using the offload and onboard byte counters on the `/metrics` endpoint and an Nsight Systems trace.
+Unless otherwise specified, the experiments below use GB300 GPUs, the paged KV cache manager, and block reuse enabled. Before any result was accepted we confirmed that pages were actually compressed during the measured window, using the offload and onboard byte counters on the `/metrics` endpoint and an Nsight Systems trace.
 
 #### Performance
 
@@ -257,60 +257,43 @@ The compression ratio follows from the format. Packed NVFP4 data plus one 8-bit 
 </div>
 <p align="center"><sub><em>Figure 10: Measured size of one attention KV page off the GPU, uncompressed and as an NVFP4 cold page. FP8 pages shrink by 43.75%, BF16 pages by 71.9%; the GLM-5.2 MLA page shrinks a little less because its index buffer stays lossless.</em></sub></p>
 
-The serving effect of a smaller cold page is more capacity in the host and disk tiers, and therefore a higher prefix-cache hit rate when the working set does not fit. We show it in three settings, from a well-provisioned published configuration to a deliberately GPU-limited one.
+The serving effect of a smaller cold page is more capacity in the host and disk tiers, and therefore a higher prefix-cache hit rate when the working set does not fit. We show it along the GLM-5.2 Pareto frontier, in a GPU-limited deployment, and by where the reused pages are served from.
 
-**A published configuration.** Figure 11 shows GLM-5.2 at a published InferenceX configuration on 32 GB300s. The uncompressed host tier already reads 96.2% of the prefixes, close to the 97.2% the trace allows, so throughput is neutral. NVFP4 buys latency: P90 interactivity (output tokens per second per user) rises and the P90 time to first token (TTFT) falls.
-
-<div align="center">
-<figure>
-  <img src="../media/tech_blog29_glm_point.svg" width="1000">
-</figure>
-</div>
-<p align="center"><sub><em>Figure 11: GLM-5.2 · published InferenceX configuration · 32 GB300s · AgentX replay. Throughput is unchanged; P90 interactivity and TTFT improve.</em></sub></p>
-
-**Beyond the published frontier.** When the host tier is under pressure, NVFP4 raises the hit rate, and the serving metrics follow. Figure 12 shows one point from our search: GLM-5.2 at concurrency 288 on 24 GB300s, where the uncompressed tier reads only 90.2% of prefixes. NVFP4 raises that to 95.5%, lifts throughput per GPU by 39.7%, triples P90 interactivity, and cuts TTFT from 38.7 to 6.9 seconds, which puts this configuration on the Pareto frontier.
-
-<div align="center">
-<figure>
-  <img src="../media/tech_blog29_glm_search_point.svg" width="1000">
-</figure>
-</div>
-<p align="center"><sub><em>Figure 12: GLM-5.2 · 24 GB300s · concurrency 288 · AgentX replay. NVFP4 lifts the cache-read hit rate from 90.2% to 95.5% and improves every serving metric.</em></sub></p>
-
-**The largest gains.** Figure 13 shows the four configurations from our search where NVFP4 cold pages changed the result most. In each one the uncompressed host tier reads far fewer prefixes than the trace allows, so requests recompute long prompts and queue behind them. NVFP4 raises the hit rate by 5 to 34 points, and throughput per GPU and P90 interactivity follow: GLM-5.2 at concurrency 128 on 8 GB300s triples its throughput, and Qwen3.5-397B-A17B at concurrency 1536 on 40 GB300s gains 44%.
-
-<div align="center">
-<figure>
-  <img src="../media/tech_blog29_pareto_pairs.svg" width="1000">
-</figure>
-</div>
-<p align="center"><sub><em>Figure 13: The four serving configurations with the largest NVFP4 gains · AgentX replay. Each panel is one configuration run with the uncompressed host cache and with the NVFP4 host cache, two or three repeats per setting; bars are throughput per GPU and P90 interactivity, with the cache-read hit rate and P90 TTFT below.</em></sub></p>
-Figure 14 shows the effect along the GLM-5.2 Pareto frontier. Each green point is an NVFP4 configuration that no other NVFP4 configuration beats on both axes; the hollow point joined to it is the same configuration without compression. The gain is largest where the uncompressed tier misses most and fades to nothing where it already reads most prefixes.
+NVFP4 cold pages extend the Pareto frontier. Figure 11 takes the ten highest-throughput points of the GLM-5.2 frontier with NVFP4 and shows, for each, the same configuration with an uncompressed host cache. The gain is largest where the uncompressed tier misses most, up to 84% more throughput per GPU and 4x the P90 interactivity, and fades to nothing where it already reads most prefixes; averaged over the ten points it is +21% throughput and +92% interactivity.
 
 <div align="center">
 <figure>
   <img src="../media/tech_blog29_pareto_frontier.svg" width="1000">
 </figure>
 </div>
-<p align="center"><sub><em>Figure 14: GLM-5.2 · 8 to 48 GB300 · the ten highest-throughput points of the NVFP4 Pareto frontier. Top: each green numbered point is an NVFP4 configuration, the hollow point is the same configuration with an uncompressed host cache, and the arrow shows the change. Bottom: the gain of each numbered configuration in tok/s/GPU (green) and in P90 interactivity (blue). Two repeats per setting; AgentX replay.</em></sub></p>
+<p align="center"><sub><em>Figure 11: GLM-5.2 Pareto frontier · the ten highest-throughput NVFP4 points and the uncompressed run of each. Top: each green numbered point is an NVFP4 configuration, the hollow point is the same configuration with an uncompressed host cache, and the arrow shows the change. Bottom: the gain of each numbered configuration in tok/s/GPU (green) and in P90 interactivity (blue). Two repeats per setting; AgentX replay.</em></sub></p>
 
-**A GPU-limited deployment.** The third setting is a resource-constrained configuration: Qwen3.5-397B-A17B served on ten GB300s (prefill on 2 GPUs, generation on 8 GPUs) at concurrency 192. With the host tier alone the uncompressed setting reads only 57% of prefixes. Figure 15 grows the disk tier from 0 to 1,024 GiB. NVFP4 hits more, completes more, and answers sooner at every disk size. The gain peaks at 512 GiB: 64% more requests completed and 48% sooner.
+Figure 12 details the four configurations with the largest gains, including Qwen3.5-397B-A17B.
+
+<div align="center">
+<figure>
+  <img src="../media/tech_blog29_pareto_pairs.svg" width="1000">
+</figure>
+</div>
+<p align="center"><sub><em>Figure 12: The four serving configurations with the largest NVFP4 gains · AgentX replay. Each panel is one configuration run with the uncompressed host cache and with the NVFP4 host cache, two or three repeats per setting; bars are throughput per GPU and P90 interactivity, with the cache-read hit rate and P90 TTFT below.</em></sub></p>
+
+**A GPU-limited deployment.** A resource-constrained configuration: Qwen3.5-397B-A17B served on ten GB300s (prefill on 2 GPUs, generation on 8 GPUs) at concurrency 192. With the host tier alone the uncompressed setting reads only 57% of prefixes. Figure 13 grows the disk tier from 0 to 1,024 GiB. NVFP4 hits more, completes more, and answers sooner at every disk size. The gain peaks at 512 GiB: 64% more requests completed and 48% sooner.
 
 <div align="center">
 <figure>
   <img src="../media/tech_blog29_disk_sweep.svg" width="1000">
 </figure>
 </div>
-<p align="center"><sub><em>Figure 15: Qwen3.5-397B-A17B · ten GB300s · concurrency 192 · growing disk tier. NVFP4 completes more requests, hits more, and answers sooner at every disk size.</em></sub></p>
+<p align="center"><sub><em>Figure 13: Qwen3.5-397B-A17B · ten GB300s · concurrency 192 · growing disk tier. NVFP4 completes more requests, hits more, and answers sooner at every disk size.</em></sub></p>
 
-**Where the hits come from.** A hit rate alone does not say which tier served the prefix. TensorRT LLM now counts every full-block hit by the tier it came from. Figure 16 uses these counters on one GB300 node (4 GPUs, TP4/EP4) with a 512 GiB disk tier and the GPU cache capped so that the working set spills out of it. Both settings reach a similar hit rate in each case. What changes is where the hits are served from. For GLM-5.2 at concurrency 48 with 24 GiB of host cache per GPU, the share of hits served from disk falls from 31% to 19%, p90 TTFT drops from 40 s to 23 s, and 1,581 requests complete in the 30-minute window instead of 1,133. For Qwen3.5-397B-A17B at concurrency 128 with 16 GiB of host cache per GPU, no hit is served from disk at all, p90 TTFT drops from 34 s to 21 s, and 4,621 requests complete instead of 3,070. The same host memory holds more pages, so the prefixes that used to come back from disk now come back from host memory.
+**Where the hits come from.** A hit rate alone does not say which tier served the prefix. TensorRT LLM now counts every full-block hit by the tier it came from. Figure 14 uses these counters on one GB300 node (4 GPUs, TP4/EP4) with a 512 GiB disk tier and the GPU cache capped so that the working set spills out of it. Both settings reach a similar hit rate in each case. What changes is where the hits are served from. For GLM-5.2 at concurrency 48 with 24 GiB of host cache per GPU, the share of hits served from disk falls from 31% to 19%, p90 TTFT drops from 40 s to 23 s, and 1,581 requests complete in the 30-minute window instead of 1,133. For Qwen3.5-397B-A17B at concurrency 128 with 16 GiB of host cache per GPU, no hit is served from disk at all, p90 TTFT drops from 34 s to 21 s, and 4,621 requests complete instead of 3,070. The same host memory holds more pages, so the prefixes that used to come back from disk now come back from host memory.
 
 <div align="center">
 <figure>
   <img src="../media/tech_blog29_tier_hits.svg" width="1000">
 </figure>
 </div>
-<p align="center"><sub><em>Figure 16: GLM-5.2 · 4 GB300 · concurrency 48 (left) and Qwen3.5-397B-A17B · 4 GB300 · concurrency 128 (right) · where reuse hits are served from. Each bar splits the full-block hits of a 30-minute AgentX replay by tier. The hit rate is similar in both settings of each pair; with NVFP4 cold pages fewer hits are served from disk, the tail TTFT falls, and more requests complete in the window. GPU cache capped at 50% (GLM-5.2) and 35% (Qwen3.5) of free GPU memory.</em></sub></p>
+<p align="center"><sub><em>Figure 14: GLM-5.2 · 4 GB300 · concurrency 48 (left) and Qwen3.5-397B-A17B · 4 GB300 · concurrency 128 (right) · where reuse hits are served from. Each bar splits the full-block hits of a 30-minute AgentX replay by tier. The hit rate is similar in both settings of each pair; with NVFP4 cold pages fewer hits are served from disk, the tail TTFT falls, and more requests complete in the window. GPU cache capped at 50% (GLM-5.2) and 35% (Qwen3.5) of free GPU memory.</em></sub></p>
 
 #### Accuracy
 
@@ -324,23 +307,23 @@ $$
 d_{\text{orig}}(r) = \frac{|x_r - x_0|}{m}, \qquad d_{\text{prev}}(r) = \frac{|x_r - x_{r-1}|}{m}.
 $$
 
-Figure 17 reports both over every finite FP8 code and every FP16 and BF16 value whose block scale is a normal E4M3 code. The distance to the original is the quantization error itself, a median below 1% of the block maximum and a worst case of 17%, and it is the same after every round trip. The distance to the previous round trip is zero for every value from the second round trip on. End to end, Qwen3-8B on AIME24 and AIME25 loses about 2 points after one round trip, within the noise of this setup, and the second round trip reproduces every output of the first.
+Figure 15 reports both over every finite FP8 code and every FP16 and BF16 value whose block scale is a normal E4M3 code. The distance to the original is the quantization error itself, a median below 1% of the block maximum and a worst case of 17%, and it is the same after every round trip. The distance to the previous round trip is zero for every value from the second round trip on. End to end, Qwen3-8B on AIME24 and AIME25 loses about 2 points after one round trip, within the noise of this setup, and the second round trip reproduces every output of the first.
 
 <div align="center">
 <figure>
   <img src="../media/tech_blog29_nvfp4_roundtrip.svg" width="1000">
 </figure>
 </div>
-<p align="center"><sub><em>Figure 17: NVFP4 round trips do not accumulate error. Left: distance to the original value after 1 to 4 round trips, as a percentage of the block maximum on a log scale, for every finite FP8 code and every FP16 and BF16 value with a normal block scale; the dot is the median, the bar reaches the 90th percentile, the tick is the maximum. The distribution is the quantization error, and it does not change with the number of round trips. Middle: distance to the previous round trip on the same scale; from the second round trip on it is exactly zero for every value, drawn on the baseline. The one exception is the exhaustive FP8 layout that lays all 254 codes out in order, where 18 of 1,024 values move once more at the second round trip and never again. Right: Qwen3-8B accuracy on AIME24 and AIME25 (30 questions, 8 seeds) after 0, 1 and 2 round trips; the second round trip reproduces all 480 outputs of the first. Distances come from a scalar reference model of the codec that reproduces the change counts of the production kernels exactly.</em></sub></p>
+<p align="center"><sub><em>Figure 15: NVFP4 round trips do not accumulate error. Left: distance to the original value after 1 to 4 round trips, as a percentage of the block maximum on a log scale, for every finite FP8 code and every FP16 and BF16 value with a normal block scale; the dot is the median, the bar reaches the 90th percentile, the tick is the maximum. The distribution is the quantization error, and it does not change with the number of round trips. Middle: distance to the previous round trip on the same scale; from the second round trip on it is exactly zero for every value, drawn on the baseline. The one exception is the exhaustive FP8 layout that lays all 254 codes out in order, where 18 of 1,024 values move once more at the second round trip and never again. Right: Qwen3-8B accuracy on AIME24 and AIME25 (30 questions, 8 seeds) after 0, 1 and 2 round trips; the second round trip reproduces all 480 outputs of the first. Distances come from a scalar reference model of the codec that reproduces the change counts of the production kernels exactly.</em></sub></p>
 
-Figure 18 shows the end-to-end measurements on larger models. Each pair is the same model, hardware and configuration with and without NVFP4 cold pages. On Qwen3.5-397B-A17B, AIME25 is 90.00% with and without compression when 28% of the reused pages are compressed, and 90.21% when 61% are; MATH-500 is 98.6% against 99.0% and 98.8%. DeepSeek-V4-Flash on GPQA Diamond moves by 0.15 points, DeepSeek-V4-Pro on IFBench by 0.25 points. The largest difference is 0.40 points.
+Figure 16 shows the end-to-end measurements on larger models. Each pair is the same model, hardware and configuration with and without NVFP4 cold pages. On Qwen3.5-397B-A17B, AIME25 is 90.00% with and without compression when 28% of the reused pages are compressed, and 90.21% when 61% are; MATH-500 is 98.6% against 99.0% and 98.8%. DeepSeek-V4-Flash on GPQA Diamond moves by 0.15 points, DeepSeek-V4-Pro on IFBench by 0.25 points. The largest difference is 0.40 points.
 
 <div align="center">
 <figure>
   <img src="../media/tech_blog29_large_model_acc.svg" width="1000">
 </figure>
 </div>
-<p align="center"><sub><em>Figure 18: Accuracy with and without NVFP4 cold pages on large models. Qwen3.5-397B-A17B on AIME25 (16 seeds, error bar is the standard error) and MATH-500 (greedy, one run per bar); DeepSeek-V4-Flash on GPQA Diamond (1,980 generations); DeepSeek-V4-Pro on IFBench (4 seeds, error bar is the standard deviation, mean of the four IFBench scores). Labels under the Qwen bars give the share of reused pages that had been compressed before scoring.</em></sub></p>
+<p align="center"><sub><em>Figure 16: Accuracy with and without NVFP4 cold pages on large models. Qwen3.5-397B-A17B on AIME25 (16 seeds, error bar is the standard error) and MATH-500 (greedy, one run per bar); DeepSeek-V4-Flash on GPQA Diamond (1,980 generations); DeepSeek-V4-Pro on IFBench (4 seeds, error bar is the standard deviation, mean of the four IFBench scores). Labels under the Qwen bars give the share of reused pages that had been compressed before scoring.</em></sub></p>
 
 Together, these two facts mean that cold-page compression cannot drift with repeated offloading. Its accuracy cost is at most one NVFP4 rounding of the pages that actually leave the GPU, and it does not grow with the number of times a page is offloaded and brought back.
 
@@ -348,7 +331,7 @@ Together, these two facts mean that cold-page compression cannot drift with repe
 
 #### Performance
 
-TriAttention shrinks the decode KV cache of every running sequence, so it helps in two ways: decoding reads a shorter cache at the same batch size, and more sequences fit on the GPU. We measure both on Qwen3-8B on one B200 with 1,024 input and 16,384 output tokens per request, CUDA graphs and the overlap scheduler on, and three fresh-process runs per point on the same GPU. Figure 19 shows aggregate output throughput per GPU against batch size for the dense cache and for TriAttention with budgets of 4,096 and 2,048 tokens and an eviction period equal to the budget.
+TriAttention shrinks the decode KV cache of every running sequence, so it helps in two ways: decoding reads a shorter cache at the same batch size, and more sequences fit on the GPU. We measure both on Qwen3-8B on one B200 with 1,024 input and 16,384 output tokens per request, CUDA graphs and the overlap scheduler on, and three fresh-process runs per point on the same GPU. Figure 17 shows aggregate output throughput per GPU against batch size for the dense cache and for TriAttention with budgets of 4,096 and 2,048 tokens and an eviction period equal to the budget.
 
 At matched batch sizes the compacted cache decodes faster: at batch size 32, budget 4,096 gives 27% more output throughput than dense and budget 2,048 gives 60% more. Beyond that the dense cache runs out of memory at batch size 64, while TriAttention keeps scaling: budget 2,048 reaches 6,670 tok/s at batch size 64 and 8,198 tok/s at batch size 128, 2.7x the dense peak on the same GPU.
 
@@ -357,18 +340,18 @@ At matched batch sizes the compacted cache decodes faster: at batch size 32, bud
   <img src="../media/tech_blog29_triattention_perf.svg" width="1000">
 </figure>
 </div>
-<p align="center"><sub><em>Figure 19: TriAttention on Qwen3-8B, one B200, 1,024 input and 16,384 output tokens. Aggregate output throughput per GPU against batch size for the dense KV cache and for TriAttention with budgets of 4,096 and 2,048 tokens. The dense cache runs out of memory at batch size 64; TriAttention continues to batch size 128.</em></sub></p>
+<p align="center"><sub><em>Figure 17: TriAttention on Qwen3-8B, one B200, 1,024 input and 16,384 output tokens. Aggregate output throughput per GPU against batch size for the dense KV cache and for TriAttention with budgets of 4,096 and 2,048 tokens. The dense cache runs out of memory at batch size 64; TriAttention continues to batch size 128.</em></sub></p>
 
 #### Accuracy
 
-Eviction is lossy by design, and the budget sets the trade. Figure 20 shows AIME25 accuracy against the decode KV budget for Qwen3-8B and GPT-OSS-120B in `union` mode, with the dense result as the dashed line. Each point is 30 problems with 4 samples, so single points carry about 4 to 5 points of noise. With aggressive budgets of 1,000 or 2,000 tokens for outputs that run to 32,000 tokens, accuracy drops sharply. At 4,096 tokens, the budget used for the throughput results above, the drop is about 5 points on both models while the decode KV shrinks 7.9 times on Qwen3-8B. From 8,192 tokens on, accuracy is within noise of dense on both models while the decode KV still shrinks 2 to 4 times. The friendly region is therefore wide, and the budget can be chosen per deployment to trade a known amount of accuracy for capacity.
+Eviction is lossy by design, and the budget sets the trade. Figure 18 shows AIME25 accuracy against the decode KV budget for Qwen3-8B and GPT-OSS-120B in `union` mode, with the dense result as the dashed line. Each point is 30 problems with 4 samples, so single points carry about 4 to 5 points of noise. With aggressive budgets of 1,000 or 2,000 tokens for outputs that run to 32,000 tokens, accuracy drops sharply. At 4,096 tokens, the budget used for the throughput results above, the drop is about 5 points on both models while the decode KV shrinks 7.9 times on Qwen3-8B. From 8,192 tokens on, accuracy is within noise of dense on both models while the decode KV still shrinks 2 to 4 times. The friendly region is therefore wide, and the budget can be chosen per deployment to trade a known amount of accuracy for capacity.
 
 <div align="center">
 <figure>
   <img src="../media/tech_blog29_triattention_acc.svg" width="1000">
 </figure>
 </div>
-<p align="center"><sub><em>Figure 20: AIME25 accuracy against the decode KV budget for TriAttention in union mode with the eviction period equal to the budget, on Qwen3-8B (left) and GPT-OSS-120B (right). The dashed line is the dense cache. The label under each bar is the decode-KV compression relative to dense at that budget.</em></sub></p>
+<p align="center"><sub><em>Figure 18: AIME25 accuracy against the decode KV budget for TriAttention in union mode with the eviction period equal to the budget, on Qwen3-8B (left) and GPT-OSS-120B (right). The dashed line is the dense cache. The label under each bar is the decode-KV compression relative to dense at that budget.</em></sub></p>
 
 For configuration, the calibration workflow, and validated modes, please refer to the [TriAttention example](https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/kv_cache_compression/triattention.md).
 
