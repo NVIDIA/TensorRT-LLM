@@ -19,6 +19,7 @@ import threading
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import msgpack
 import numpy as np
 import pytest
 
@@ -70,8 +71,8 @@ def _cancel(*, routing: bool = False) -> list[bytes]:
     return message + [b"gen", b"0"] if routing else message
 
 
-def _request_data() -> list[bytes]:
-    info = transfer_mod.RecvReqInfo(
+def _request_info() -> transfer_mod.RecvReqInfo:
+    return transfer_mod.RecvReqInfo(
         sender_req_id=401,
         instance_name="gen",
         instance_rank=0,
@@ -80,7 +81,17 @@ def _request_data() -> list[bytes]:
         aux_slot=3,
         slice_id=0,
     )
-    return [transfer_mod.MessageType.REQUEST_DATA, info.to_bytes()]
+
+
+def _request_data() -> list[bytes]:
+    return [transfer_mod.MessageType.REQUEST_DATA, _request_info().to_bytes()]
+
+
+def _legacy_request_info_bytes(bounce_dst_base) -> bytes:
+    """REQUEST_DATA payload of a generation server from before the Python bounce was removed."""
+    fields = msgpack.unpackb(_request_info().to_bytes(), raw=False)
+    fields["bounce_dst_base"] = bounce_dst_base
+    return msgpack.packb(fields)
 
 
 def _assert_session_ack(sender: transfer_mod.Sender) -> None:
@@ -556,3 +567,52 @@ def test_nonblocking_gen_progress_notifies_unsettled_senders_once(terminal: str)
     assert session.resources_drained()
     assert session.close()
     watchdog.stop()
+
+
+def test_legacy_request_without_a_bounce_region_decodes() -> None:
+    info = transfer_mod.RecvReqInfo.from_bytes(_legacy_request_info_bytes(None))
+    expected = _request_info()
+    assert (info.unique_rid, info.instance_name, info.instance_rank) == (401, "gen", 0)
+    assert (info.aux_slot, info.slice_id) == (expected.aux_slot, expected.slice_id)
+
+
+def test_legacy_request_with_a_bounce_region_names_the_version_mismatch() -> None:
+    with pytest.raises(
+        transfer_mod.LegacyBounceRequestError, match="older TensorRT-LLM release"
+    ) as error:
+        transfer_mod.RecvReqInfo.from_bytes(_legacy_request_info_bytes(0x7F0000000000))
+    assert error.value.req_info.unique_rid == 401
+
+
+@pytest.mark.parametrize("ownership", [False, True])
+def test_request_data_from_a_bouncing_legacy_generation_server_fails_it_at_once(
+    ownership: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sender = _sender(ownership=ownership)
+    sender._get_or_connect_dealer = Mock()
+    # error_once deduplicates against the process-wide key set; start from an empty one.
+    monkeypatch.setattr(transfer_mod.logger, "_appeared_keys", set())
+    log = Mock()
+    monkeypatch.setattr(transfer_mod.logger, "log", log)
+    legacy_request = [
+        transfer_mod.MessageType.REQUEST_DATA,
+        _legacy_request_info_bytes(0x7F0000000000),
+    ]
+
+    for _ in range(2):
+        sender._respond_with_kv(b"gen", legacy_request)
+
+    failed = transfer_mod._make_kv_result_msg(7, 401, 0, True, transfer_mod.AgentResult.FAILED)
+    if ownership:
+        sent = [sender._send_task_queues[0].get_nowait() for _ in range(2)]
+        assert sent == [("tcp://gen:1234", failed)] * 2
+        sender._get_or_connect_dealer.assert_not_called()
+    else:
+        dealer = sender._get_or_connect_dealer.return_value
+        assert [call.args for call in dealer.send.call_args_list] == [(failed,)] * 2
+    assert sender._get_req_info(401) is None
+    errors = [
+        call.args[1] for call in log.call_args_list if call.args[0] == transfer_mod.logger.ERROR
+    ]
+    assert len(errors) == 1
+    assert errors[0].startswith("Failing every request from generation server gen rank 0")

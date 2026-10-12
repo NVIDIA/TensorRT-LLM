@@ -101,6 +101,25 @@ class _TransferNotSubmittedError(RuntimeError):
     """The sender rejected an operation before the backend could access memory."""
 
 
+# Sent by generation servers from before the Python KV bounce buffer was removed: None, or the base
+# of a bounce region the server reserved for this request and expects the KV in.
+_LEGACY_BOUNCE_DST_BASE_KEY = "bounce_dst_base"
+
+
+class LegacyBounceRequestError(ValueError):
+    """REQUEST_DATA from an older generation server that reserved a Python KV bounce region for the request."""
+
+    def __init__(self, req_info: RecvReqInfo):
+        super().__init__(
+            f"Failing request {req_info.unique_rid}: generation server {req_info.instance_name} "
+            f"rank {req_info.instance_rank} runs an older TensorRT-LLM release that expects the KV "
+            "cache in its Python bounce buffer, and this context server no longer writes there. "
+            "Run both servers on the same release, or set kv_cache_bounce_size_mb=0 on that "
+            "generation server."
+        )
+        self.req_info = req_info
+
+
 @dataclass
 class RecvReqInfo:
     sender_req_id: int
@@ -138,7 +157,11 @@ class RecvReqInfo:
         d["block_ids_per_layer_groups"] = [
             np.frombuffer(b, dtype=np.int64).copy() for b in d["block_ids_per_layer_groups"]
         ]
-        return cls(**d)
+        legacy_bounce_dst_base = d.pop(_LEGACY_BOUNCE_DST_BASE_KEY, None)
+        info = cls(**d)
+        if legacy_bounce_dst_base is not None:
+            raise LegacyBounceRequestError(info)
+        return info
 
 
 @dataclass
@@ -2003,7 +2026,22 @@ class Sender(SenderBase):
     def _respond_with_kv(self, _send_id: bytes, message: list[bytes]):
         # _sessions_lock prevents a race between session lookup and req_info save.
         # session.lock atomically saves peer info and snapshots tasks against send().
-        info: RecvReqInfo = RecvReqInfo.from_bytes(message[1])
+        try:
+            info: RecvReqInfo = RecvReqInfo.from_bytes(message[1])
+        except LegacyBounceRequestError as error:
+            # Answer instead of dropping, or the generation server waits out kv_transfer_timeout_ms.
+            info = error.req_info
+            logger.error_once(
+                f"Failing every request from generation server {info.instance_name} rank "
+                f"{info.instance_rank}: it runs an older TensorRT-LLM release that expects the KV "
+                "cache in its Python bounce buffer, and this context server no longer writes there. "
+                "Run both servers on the same release, or set kv_cache_bounce_size_mb=0 on that "
+                "generation server. Each rejected request is logged at DEBUG.",
+                key=("legacy_bounce_request", info.instance_name, info.instance_rank),
+            )
+            logger.debug(str(error))
+            self._send_failed_result_to_receiver(info)
+            return
         with self._sessions_lock:
             session = self._get_session(info.unique_rid)
             fenced = (
