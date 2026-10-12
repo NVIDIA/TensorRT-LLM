@@ -93,17 +93,17 @@ Our goals for the framework are two. A user turns a compression method on with *
 
 TensorRT LLM already compresses KV inside the model and the attention kernel. The new opportunity is **compression at the right moment**: a small step run when nothing is reading the KV, and the whole serving system benefits. Three principles:
 
-- **Untouched attention**: attention always reads the normal GPU representation.
-- **Seamless insertion**: a method changes only the contents of KV pages; the scheduler, executor loop, model and cache manager are unchanged.
-- **General to models**: a method works on KV pages, so one method serves every model.
+- **Untouched attention**: attention reads the GPU KV as before.
+- **Seamless insertion**: only page contents change.
+- **General to models**: works on KV pages, not on kernels.
 
 To insert precisely, we define five stages in the life of a KV cache (Figure 3):
 
-1. **Prefill chunks**: between two chunks of a long prompt.
-2. **After prefill**: the prompt's KV is complete and generation has not started.
-3. **Decode steps**: between two generation steps. TriAttention runs here.
-4. **Tool calls**: the request pauses and its KV waits for the tool.
-5. **After the request**: the KV is kept for reuse and may move to host or disk memory. NVFP4 cold-page compression runs here.
+1. **Prefill chunks**: between prompt chunks.
+2. **After prefill**: before the first decode step.
+3. **Decode steps**: between generation steps (TriAttention).
+4. **Tool calls**: while the request waits for a tool.
+5. **After the request**: KV kept for reuse on GPU, host or disk (NVFP4 cold pages).
 
 <div align="center">
 <figure>
