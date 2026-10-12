@@ -116,8 +116,6 @@ These stages map to two integration paths in the runtime. **Iteration-driven** m
 
 The fifth stage is different in kind. After a request ends, its KV is kept across requests and moves across storage levels, from the GPU to host and disk memory and back. For this part we define **storage-bound** methods: they run inside the cache manager's page migration, when a page crosses a storage boundary, and define how the page is stored while it is cold. NVFP4 cold-page compression is one. A method may use either path or both; in both the cache manager keeps ownership of every page and the method only changes their contents.
 
-A method is selected via `kv_cache_compression_config`, separate from the KV cache config and the sparse attention config. One method can be active per LLM instance.
-
 ### Architecture Overview
 
 The framework has three well-defined parts that together form KV cache compression in TensorRT LLM.
@@ -141,7 +139,7 @@ Some of these stages have a method today and some do not. The decode stage (stag
 
 ### Configuration and Integration with the Cache Manager
 
-Configuration is deliberately small. One block, `kv_cache_compression_config`, collects only the settings that belong to compression: which method to run and that method's own options. A factory validates the block, rejects unsupported combinations before anything is built, and hands the settings to the compression manager, which handles everything from there. Cold-page compression is turned on with `algorithm: quantization_for_cold_page` and `quant: nvfp4`. TriAttention is turned on with `algorithm: triattention` plus its budget and calibration options. The same fields work in the Python API, in `trtllm-serve` YAML, and in `trtllm-bench`. The full option table is in the [KV Cache Compression feature documentation](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/features/kv-cache-compression.md).
+A method is selected via `kv_cache_compression_config`, separate from the KV cache config and the sparse attention config, and one method can be active per LLM instance. The block collects only the settings that belong to compression: which method to run and that method's own options. A factory validates the block, rejects unsupported combinations before anything is built, and hands the settings to the compression manager, which handles everything from there. Cold-page compression is turned on with `algorithm: quantization_for_cold_page` and `quant: nvfp4`. TriAttention is turned on with `algorithm: triattention` plus its budget and calibration options. The same fields work in the Python API, in `trtllm-serve` YAML, and in `trtllm-bench`. The full option table is in the [KV Cache Compression feature documentation](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/features/kv-cache-compression.md).
 
 The cache manager and the attention backend are outside the framework. The compression manager is designed to adapt to any cache manager and any attention backend. It changes only the contents of KV pages, and it never owns pages, tiers, or the kernels that read them.
 
