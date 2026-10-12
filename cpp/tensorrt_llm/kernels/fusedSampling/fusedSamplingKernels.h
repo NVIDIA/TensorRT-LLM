@@ -16,13 +16,21 @@
  */
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
+
 #include <cstdint>
 #include <cuda_runtime.h>
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
+
+//! Philox subsequences from here up hold per-row streams: a row with its own seed/offset draws
+//! from subsequence kPerRowSubsequenceBase | offset. A shared seed/offset makes the row index
+//! the subsequence, which never reaches them. The speculative acceptance kernels follow the
+//! same convention.
+constexpr uint64_t kPerRowSubsequenceBase = 1ULL << 63;
 
 //! \brief Inputs and outputs of the fused sampler.
 //!
@@ -82,4 +90,5 @@ template <typename T>
 void invokeFusedSampling(FusedSamplingParams const& params, cudaStream_t stream);
 
 } // namespace kernels
-} // namespace tensorrt_llm
+
+TRTLLM_NAMESPACE_END

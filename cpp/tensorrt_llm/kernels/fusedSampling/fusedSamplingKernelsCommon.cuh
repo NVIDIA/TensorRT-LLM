@@ -25,8 +25,8 @@
 #include <cuda_fp16.h>
 #include <curand_kernel.h>
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -128,10 +128,6 @@ struct RowParams
     bool needTopP;
     bool needMinP;
 };
-
-//! Philox subsequences from here up hold per-row streams. A shared seed/offset makes the row
-//! index the subsequence, which never reaches them.
-constexpr uint64_t kPerRowSubsequenceBase = 1ull << 63;
 
 //! Seeds one row's Philox stream (see FusedSamplingParams::perRowRng).
 __device__ inline void initRowRng(FusedSamplingParams const& p, int row, curandStatePhilox4_32_10_t* state)
@@ -1180,4 +1176,5 @@ __device__ void fusedSamplingBody(FusedSamplingParams const& params, FusedSampli
 
 } // namespace fusedSampling
 } // namespace kernels
-} // namespace tensorrt_llm
+
+TRTLLM_NAMESPACE_END

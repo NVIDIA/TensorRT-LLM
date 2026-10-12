@@ -865,8 +865,8 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
 
         Context tokens are sampled directly (they bypass the rejection kernel).
         Gen tokens are handled entirely by the rejection kernel, which samples
-        from the target distribution internally — so only the raw logits (not
-        pre-sampled token IDs) are passed to the kernel.
+        from the target distribution internally — so it is given the filtered
+        target probs, not pre-sampled token IDs.
         """
         if num_gens > self._max_batch_size:
             raise RuntimeError(

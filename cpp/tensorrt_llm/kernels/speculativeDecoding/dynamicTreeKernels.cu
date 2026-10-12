@@ -28,6 +28,7 @@
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/reduceKernelUtils.cuh"
 #include "tensorrt_llm/common/vec_dtypes.cuh"
+#include "tensorrt_llm/kernels/fusedSampling/fusedSamplingKernels.h"
 #include <algorithm>
 #include <cfloat>
 #include <cstdint>
@@ -498,10 +499,6 @@ struct MaxInt32Op
 // Maximum siblings we track per level for the correction step.
 // Matches the maximum supported K branching factor (dynamic_tree_max_topK).
 constexpr int32_t kMaxTriedPerLevel = 32;
-
-//! First Philox subsequence of the per-request streams, as in FusedSamplingParams::perRowRng: a
-//! request's offset selects its subsequence above this base.
-constexpr uint64_t kPerRowSubsequenceBase = 1ull << 63;
 
 //! \param acceptIndex         output [batchSize, numSpecStep] int64 — tree positions of accepted tokens.
 //! \param acceptTokenNum      output [batchSize] int64 — # accepted draft tokens (excl. root).

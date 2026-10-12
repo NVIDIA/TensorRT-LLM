@@ -640,8 +640,8 @@ class SpecMetadata:
     # step counter -- keeps a seeded request reproducible regardless of which
     # batch it lands in.
     #
-    # The fused kernel honors these per row. The flashinfer ops behind the
-    # non-fused advanced sampling modes, and the acceptance kernel, read only
+    # The fused kernel and the acceptance kernels honor these per row. The
+    # flashinfer ops behind the non-fused advanced sampling modes read only
     # element 0.
     request_seeds: Optional[torch.Tensor] = None
     request_offsets: Optional[torch.Tensor] = None

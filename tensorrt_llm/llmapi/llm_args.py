@@ -7022,9 +7022,9 @@ class TorchLlmArgs(BaseLlmArgs):
                             f"this configuration: {'; '.join(reasons)}.")
                     self.speculative_config.use_rejection_sampling = False
                 elif self.speculative_config.use_rejection_sampling:
-                    # Advanced sampling modes other than FULL sample through
-                    # FlashInfer on every rejection path; fail fast if it is
-                    # missing.
+                    # The one-model spec workers require FlashInfer, which the
+                    # advanced sampling modes other than FULL sample through;
+                    # fail fast if it is missing.
                     from tensorrt_llm._torch.flashinfer_utils import \
                         IS_FLASHINFER_AVAILABLE
                     if not IS_FLASHINFER_AVAILABLE:

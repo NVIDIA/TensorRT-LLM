@@ -17,6 +17,7 @@
 
 #include "chainSpeculativeSamplingKernels.h"
 #include "tensorrt_llm/common/cudaUtils.h"
+#include "tensorrt_llm/kernels/fusedSampling/fusedSamplingKernels.h"
 
 #include <cub/cub.cuh>
 #include <curand_kernel.h>
@@ -32,10 +33,6 @@ namespace
 {
 
 constexpr int32_t kBlockSize = 1024;
-
-//! First Philox subsequence of the per-request streams, as in FusedSamplingParams::perRowRng: a
-//! request's offset selects its subsequence above this base.
-constexpr uint64_t kPerRowSubsequenceBase = 1ull << 63;
 
 struct Float2SumOp
 {
