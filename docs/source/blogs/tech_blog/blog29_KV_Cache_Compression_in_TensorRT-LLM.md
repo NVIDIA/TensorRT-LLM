@@ -122,7 +122,7 @@ The framework has three parts, shown in Figure 4:
 
 - **Compression config**: one block that selects the method and carries its options; a factory builds the method from it before the model runs.
 - **Compression manager**: the class a method inherits. It already sits at every hook in the executor loop and in the cache manager's page migration; a method overrides the functions for the stages it needs and the compression flow is in place.
-- **Method-specific kernels**: each method brings its own compress and decompress kernels, which can be fused with neighboring work such as the copy that moves a page off the GPU.
+- **Method-specific kernels**: a method could bring its own kernels, new algorithms as well as fusions with existing parts of the runtime.
 
 The executor and the KV cache manager are existing components. The framework does not replace them; it meets them at the hooks and leaves scheduling and memory ownership where they are.
 
