@@ -4421,6 +4421,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 self.kv_connector_manager.accept_prefix_load(
                     req, reservation.start, reservation.end, by_group
                 )
+                self._record_connector_reuse(kv_cache, reservation.start, reservation.end)
                 req.py_served_prefix_end = reservation.end
             self.kv_connector_manager.update_state_after_alloc(req, flat, by_group)
             req.py_connector_allocation_reported = True
@@ -4484,7 +4485,21 @@ class KVCacheManagerV2(BaseResourceManager):
                 num_tokens,
             )
         self.kv_connector_manager.commit_new_matched_tokens(req, position - local_end, load_async)
+        self._record_connector_reuse(kv_cache, local_end, position)
         return position > local_end
+
+    def _record_connector_reuse(self, kv_cache, start: int, end: int) -> None:
+        """Book the blocks a connector fills in ``[start, end)`` as reused.
+
+        The scheduling pass allocated them as misses and this batch's stats are
+        not committed yet. A block the forward pass still writes part of stays
+        a miss.
+        """
+        tokens_per_block = self.tokens_per_block
+        block_begin = (start + tokens_per_block - 1) // tokens_per_block
+        block_end = end // tokens_per_block
+        if block_begin < block_end:
+            kv_cache.record_connector_reuse(block_begin, block_end)
 
     def _reserve_connector_prefix(
         self, req: LlmRequest, kv_cache, local_end: int, offered_end: int
@@ -5182,6 +5197,7 @@ class KVCacheManagerV2(BaseResourceManager):
         secondary_peak_stats_by_level,
         reuse_delta,
         reused_blocks_by_level=None,
+        connector_reused_blocks: int = 0,
     ) -> KVCacheV2LifeCycleIterationStats:
         pool_group_id, window_size, kind = life_cycle_metadata[life_cycle_id]
         assert kind == "attention"
@@ -5206,6 +5222,7 @@ class KVCacheManagerV2(BaseResourceManager):
             partial_reused_blocks_by_level=(
                 list(reused_blocks_by_level.partial) if reused_blocks_by_level is not None else []
             ),
+            connector_reused_blocks=connector_reused_blocks,
         )
 
     @staticmethod
@@ -5296,6 +5313,7 @@ class KVCacheManagerV2(BaseResourceManager):
         disk_prefetch_blocks = self.impl.get_and_reset_iteration_disk_prefetch_blocks()
         cached_tokens_by_level = self.impl.get_and_reset_iteration_cached_tokens_by_level()
         reused_blocks_by_level = self.impl.get_and_reset_iteration_reused_blocks_by_level()
+        connector_reused_blocks = self.impl.get_and_reset_iteration_connector_reused_blocks()
 
         life_cycle_metadata = self._stats_life_cycle_metadata()
         pool_groups_by_window = self._storage_pool_groups_by_window()
@@ -5368,6 +5386,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 secondary_peak_stats_by_level,
                 reuse_delta,
                 reused_blocks_by_level.get(life_cycle_id),
+                connector_reused_blocks.get(life_cycle_id, 0),
             )
             for life_cycle_id, reuse_delta in sorted(reuse_deltas_by_life_cycle.items())
         }

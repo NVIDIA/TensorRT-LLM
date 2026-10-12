@@ -83,6 +83,10 @@ class KVCacheV2LifeCycleIterationStats:
     # cycle recorded no reuse this iteration.
     full_reused_blocks_by_level: list[int] = field(default_factory=list)
     partial_reused_blocks_by_level: list[int] = field(default_factory=list)
+    # The share of `stats.iter_full_reused_blocks` a KV connector loaded from an external store
+    # rather than matching on device. Those blocks sit on no cache level, so they are the part of
+    # the full reuse count that `full_reused_blocks_by_level` does not cover.
+    connector_reused_blocks: int = 0
 
 
 @dataclass(slots=True)
@@ -283,5 +287,6 @@ def append_kv_cache_iteration_stats(stats_dict: dict, kv_iter_stats) -> None:
                 serialized["iterPartialReusedBlocksByLevel"] = list(
                     stats.partial_reused_blocks_by_level
                 )
+            serialized["iterConnectorReusedBlocks"] = stats.connector_reused_blocks
         stats_by_life_cycle[str(life_cycle_id)] = serialized
     stats_dict["kvCacheIterationStatsByLifecycle"] = stats_by_life_cycle

@@ -1070,6 +1070,7 @@ KVCacheStatsDelta KvCache::commitPendingStats()
         mManager->commitStats(mPendingStats.globalStats(), mPendingStats.iterationStatsByLifeCycle());
         mManager->commitSsmSnapshotIterationStats(mPendingStats.ssmSnapshotIterationStatsByLifeCycle());
         mManager->commitReusedBlocksByLevel(mPendingStats.reusedBlocksByLevelByLifeCycle());
+        mManager->commitConnectorReusedBlocks(mPendingStats.connectorReusedBlocksByLifeCycle());
         mManager->commitCachedTokensByLevel(mPendingStats.cachedTokensByLevel());
     }
     KVCacheStatsDelta const requestStats
@@ -1085,6 +1086,15 @@ void KvCache::discardPendingStats()
     auto const apiLock = mManager->lockExclusive();
     mPendingStats.clear();
     mManager->clearStatsDirty(id);
+}
+
+void KvCache::recordConnectorReuse(BlockOrdinal blockBegin, BlockOrdinal blockEnd)
+{
+    KVCM2_REJECT_IF_POISONED();
+    if (mPendingStats.recordConnectorReuse(blockBegin, blockEnd))
+    {
+        _refreshStatsDirtyState();
+    }
 }
 
 bool KvCache::_shouldRecordStats() const

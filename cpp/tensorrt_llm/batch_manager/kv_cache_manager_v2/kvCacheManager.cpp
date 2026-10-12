@@ -601,6 +601,26 @@ ReusedBlocksByLevelByLifeCycle KvCacheManager::getAndResetIterationReusedBlocksB
     return byLifeCycle;
 }
 
+void KvCacheManager::commitConnectorReusedBlocks(ConnectorReusedBlocksByLifeCycle const& byLifeCycle)
+{
+    for (auto const& [lifeCycle, numBlocks] : byLifeCycle)
+    {
+        TLLM_CHECK_DEBUG(numBlocks >= 0);
+        if (numBlocks != 0)
+        {
+            mIterConnectorReusedBlocks[lifeCycle] += numBlocks;
+        }
+    }
+}
+
+ConnectorReusedBlocksByLifeCycle KvCacheManager::getAndResetIterationConnectorReusedBlocks()
+{
+    auto const apiLock = lockExclusive();
+    ConnectorReusedBlocksByLifeCycle byLifeCycle;
+    byLifeCycle.swap(mIterConnectorReusedBlocks);
+    return byLifeCycle;
+}
+
 void KvCacheManager::recordRequestSuspended()
 {
     auto const apiLock = lockExclusive();
