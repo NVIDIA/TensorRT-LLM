@@ -20,26 +20,25 @@ and runs anywhere: this one imports the targets, so it needs a real build.
 from __future__ import annotations
 
 import importlib
+from pathlib import Path
 
 import pytest
 import torch
 
+import tensorrt_llm._torch._experimental.modeling_v2 as _modeling_v2
 import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtllm.*
-from tensorrt_llm._torch._experimental.modeling_v2._router_index import (
-    MODELING_V2_ROUTERS,
-    routing_module,
-)
 
-_PACKAGE = "tensorrt_llm._torch._experimental.modeling_v2"
-_ARCHS = sorted(MODELING_V2_ROUTERS)
+_ROOT = Path(_modeling_v2.__file__).resolve().parent
 
 
 def _target_modules():
-    """(target name, imported modeling module) for every routed target."""
-    for arch in _ARCHS:
-        routing = routing_module(arch)
-        for name, dotted in routing.TARGET_MODULES.items():
-            yield name, importlib.import_module(f"{_PACKAGE}.{dotted}")
+    """(target directory name, imported modeling module) for every target on disk."""
+    for modeling in sorted((_ROOT / "models").glob("*/*/modeling.py")):
+        target_dir = modeling.parent
+        dotted = (
+            f"{_modeling_v2.__name__}.models.{target_dir.parent.name}.{target_dir.name}.modeling"
+        )
+        yield target_dir.name, importlib.import_module(dotted)
 
 
 def _target_ids():
