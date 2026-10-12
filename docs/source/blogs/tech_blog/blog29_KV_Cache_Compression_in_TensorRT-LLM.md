@@ -145,7 +145,7 @@ Before anything is built, a factory reads the block and wires things up: which m
 
 ### KV Cache Compression in the Executor Iteration Loop
 
-**The idea.** The stages inside a request (stages 1 to 3 in Figure 3) are reached by riding on callbacks the executor already makes; a method only overrides the hooks it needs. The executor calls every resource manager three times per iteration: before the forward pass, after it, and when a request ends. The compression manager registers last, so it runs after the KV cache manager has updated its state, and turns the three callbacks into five hooks (Figure 5, Table 3). All of them do nothing by default.
+**The idea.** The stages inside a request (stages 1 to 3 in Figure 3) are reached by riding on callbacks the executor already makes; a method only overrides the hooks it needs. The executor calls every resource manager three times per iteration: before the forward pass, after it, and when a request ends. The compression manager registers last, so it runs after the KV cache manager has updated its state, and turns the three callbacks into five hooks (Figure 5). All of them do nothing by default.
 
 <div align="center">
 <figure>
@@ -153,20 +153,6 @@ Before anything is built, a factory reads the block and wires things up: which m
 </figure>
 </div>
 <p align="center"><sub><em>Figure 5: How the hooks reach the executor iteration loop. Every BaseResourceManager receives three callbacks per iteration: before the forward pass, after it, and when a request ends. KVCacheCompressionManager inherits BaseResourceManager and turns the three callbacks into the five hooks. A method overrides the hooks it needs.</em></sub></p>
-
-<div align="center">
-
-| Hook | When it fires | Stage it serves |
-| :--- | :--- | :--- |
-| `on_request_init` | Before a request's first prefill chunk | Prefill-chunk stage (stage 1), set-up before the first chunk |
-| `on_context_step_end` | After a request's last prefill chunk | After-prefill stage (stage 2) |
-| `on_generation_step_begin` | Before each decode step | Decode stage (stage 3) |
-| `on_generation_step_end` | After each decode step, once the cache has been updated | Decode stage (stage 3) (used by **TriAttention**) |
-| `on_request_finish` | When a request completes or is aborted | Tool-call and after-request stages (stages 4 and 5), when a request pauses or ends |
-
-<p align="center"><sub><em>Table 3. The five hooks in the executor iteration loop, when each one fires, and the stage it serves.</em></sub></p>
-
-</div>
 
 Two rules for methods on this path: the policy that picks tokens stays separate from the shared compaction kernel, and GPU work finishes before a page is shrunk or freed. TriAttention uses `on_generation_step_end`; the other hooks are in place for new methods.
 
