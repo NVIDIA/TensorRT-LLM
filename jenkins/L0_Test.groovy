@@ -495,96 +495,6 @@ def uploadResults(def pipeline, SlurmCluster cluster, String clusterName, String
     }
 }
 
-def runIsolatedTests(pipeline, preprocessedLists, testCmdLine, llmSrc, stageName, postTag="") {
-    // Run the isolated tests one by one to avoid any potential conflicts
-    def isolateTestList = preprocessedLists.isolate
-    def isolateTestLines = readFile(file: isolateTestList).readLines()
-    def rerunFailed = false
-    def hasUnrerunFailure = false
-
-    for (int i = 0; i < isolateTestLines.size(); i++) {
-        def isolateTestName = isolateTestLines[i].trim()
-        // Create a temporary file for this single isolated test
-        def singleTestFile = "${isolateTestList}_isolated_${i}.txt"
-        sh "echo '${isolateTestName}' > ${singleTestFile}"
-        sh "cat ${singleTestFile}"
-
-        def isolateTestCmdLine = testCmdLine.findAll { cmd ->
-            !cmd.contains("--test-list=") &&
-            !cmd.contains("--test-prefix=") &&
-            !cmd.contains("--csv=") &&
-            !cmd.contains("--periodic-junit-xmlpath")
-        }
-        isolateTestCmdLine += ["--test-list=${singleTestFile}"]
-        isolateTestCmdLine += ["--test-prefix=${stageName}"]
-        isolateTestCmdLine += ["--csv=${WORKSPACE}/${stageName}/report_isolated_${i}.csv"]
-        isolateTestCmdLine += ["--periodic-junit-xmlpath ${WORKSPACE}/${stageName}/results_isolated_${i}.xml"]
-
-        try {
-            sh """
-                cd ${llmSrc}/tests/integration/defs && \
-                ${isolateTestCmdLine.join(" ")}
-            """
-        } catch (InterruptedException e) {
-            throw e
-        } catch (Exception e) {
-            def isRerunFailed = rerunFailedTests(
-                stageName, llmSrc, isolateTestCmdLine, "results_isolated_${i}.xml", "isolated_${i}", postTag)
-            if (isRerunFailed) {
-                catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
-                    error "Isolated test ${i} (${isolateTestName}) failed after rerun attempt"
-                }
-                // Mark that at least one isolated test failed, but continue processing other tests
-                rerunFailed = true
-            } else {
-                // Strip trailing " TIMEOUT (N)" / "TIMEOUT(N)" / " ISOLATION" turtle
-                // directives the same way generate_duration.py's _TURTLE_DIRECTIVE_RE does.
-                def bareTestName = isolateTestName.replaceAll(/(?:\s+(?:TIMEOUT\s*\(\d+\)|ISOLATION))+\s*$/, '').trim()
-                def unfinishedTestFile = "${WORKSPACE}/${stageName}/unfinished_test.txt"
-                // conftest.py prefixes nodeids with --test-prefix=${stageName}; match in
-                // Groovy, not a shell grep, so a quote in a parametrized id can't break it.
-                def isTestUnfinished = fileExists(unfinishedTestFile) &&
-                    readFile(unfinishedTestFile).readLines().collect { it.trim() }.contains("${stageName}/${bareTestName}".toString())
-                if (isTestUnfinished) {
-                    // Record this crash as a JUnit <testcase> like the regular-test
-                    // path does. hasUnrerunFailure stays untouched here: it drives
-                    // the duration/no-signature message below, which doesn't apply.
-                    generateTimeoutTestResultXml(pipeline, stageName)
-                    catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
-                        error "Isolated test ${i} (${isolateTestName}) terminated unexpectedly, please check the test report."
-                    }
-                } else if (fileHasContent("${WORKSPACE}/${stageName}/rerun/isolated_${i}/rerun_0.txt")) {
-                    // Same duration/no-signature gap as the regular-test path: this
-                    // finished but failed, and was never actually rerun, so
-                    // results_isolated_${i}.xml still carries the original
-                    // <failure> with nothing here to flag it.
-                    catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
-                        error "Isolated test ${i} (${isolateTestName}) failed and was not eligible for rerun (duration > 10 min, no matching failure signature)"
-                    }
-                    hasUnrerunFailure = true
-                }
-            }
-        } finally {
-            // Clean up the temporary test file
-            sh "rm -f ${singleTestFile}"
-        }
-    }
-
-    // After processing all isolated tests, set stage failure if any test failed
-    if (rerunFailed) {
-        catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
-            error "One or more isolated tests failed after rerun attempts"
-        }
-    }
-    if (hasUnrerunFailure) {
-        catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
-            error "One or more isolated tests failed and were not eligible for rerun, please check the test report."
-        }
-    }
-
-    return [rerunFailed: rerunFailed, hasUnrerunFailure: hasUnrerunFailure]
-}
-
 def getInfraDryRunPytestTargets(testListPath) {
     if (!isInfraDryRun()) {
         return []
@@ -601,205 +511,6 @@ def getInfraDryRunPytestTargets(testListPath) {
         error "Unexpected pytest targets in infrastructure dry-run list ${testListPath}: ${targets}"
     }
     return targets
-}
-
-def processShardTestList(llmSrc, testDBList, splitId, splits, perfMode=false, durationsPath="") {
-    // Preprocess testDBList to extract ISOLATION markers
-    echo "Preprocessing testDBList to extract ISOLATION markers..."
-
-    def originalTestLines = readFile(file: testDBList).readLines()
-
-    def cleanedTestLines = []
-    def isolationTestLines = []
-
-    originalTestLines.each { originalLine ->
-        def trimmedLine = originalLine.trim()
-        if (trimmedLine && trimmedLine.contains('ISOLATION')) {
-            // Remove ISOLATION marker and nearby comma from the line
-            def cleanedLine = trimmedLine
-
-            // Handle different comma patterns around ISOLATION
-            if (trimmedLine.contains('ISOLATION,')) {
-                // Case: "ISOLATION,OTHER_MARKER" -> remove "ISOLATION,"
-                cleanedLine = cleanedLine.replace('ISOLATION,', '').trim()
-            } else if (trimmedLine.contains(',ISOLATION')) {
-                // Case: "OTHER_MARKER,ISOLATION" -> remove ",ISOLATION"
-                cleanedLine = cleanedLine.replace(',ISOLATION', '').trim()
-            } else {
-                // Case: standalone "ISOLATION" -> remove " ISOLATION"
-                cleanedLine = cleanedLine.replace(' ISOLATION', '').trim()
-            }
-
-            // Add the cleaned line to isolationTestLines if original line had ISOLATION
-            isolationTestLines.add(cleanedLine)
-            cleanedTestLines.add(cleanedLine)
-
-        } else if (trimmedLine) {
-            // Line doesn't contain ISOLATION, add as-is
-            cleanedTestLines.add(originalLine.trim())
-        }
-    }
-
-    // Create cleaned testDBList file (without ISOLATION markers)
-    def cleanedTestDBList = testDBList.replaceAll('\\.txt$', '_cleaned.txt')
-    if (cleanedTestLines.size() > 0) {
-        def cleanedContent = cleanedTestLines.join('\n')
-        sh "echo '${cleanedContent.replace("'", "'\\''")}' > ${cleanedTestDBList}"
-        echo "Created cleaned testDBList: ${cleanedTestDBList} with ${cleanedTestLines.size()} lines (ISOLATION markers removed)"
-    } else {
-        sh "touch ${cleanedTestDBList}"
-        echo "No tests found, created empty cleaned testDBList: ${cleanedTestDBList}"
-    }
-
-    sh "cat ${cleanedTestDBList}"
-    echo "Original testDBList contains ${isolationTestLines.size()} tests that had ISOLATION markers"
-
-    def shardTestList = []
-
-    if (perfMode) {
-        // In perfMode, skip pytest collection as it may cause errors with automatically generated testcases
-        // Instead, use all tests from the original testDBList
-        echo "Performance mode enabled - skipping pytest collection, using all tests from testDBList"
-    } else {
-        def testListCmd = [
-            "LLM_ROOT=${llmSrc}",
-            "LLM_BACKEND_ROOT=${llmSrc}/triton_backend",
-            "pytest",
-            "--collect-only",
-            "--splitting-algorithm least_duration",
-            "--test-list=${cleanedTestDBList}",
-            "--quiet",
-            "--splits ${splits}",
-            "--group ${splitId}",
-        ]
-        if (durationsPath) {
-            testListCmd += ["--durations-path ${durationsPath}"]
-        }
-        testListCmd += getInfraDryRunPytestTargets(cleanedTestDBList)
-
-        try {
-            // First execute the pytest command and check if it succeeds
-            def pytestOutput = sh(
-                script: "cd ${llmSrc}/tests/integration/defs && ${testListCmd.join(' ')}",
-                returnStdout: true
-            ).trim()
-
-            // Debug: Show the raw pytest output
-            echo "<<<START_PYTEST_OUTPUT>>>"
-            echo "${pytestOutput}"
-            echo "<<<END_PYTEST_OUTPUT>>>"
-
-            // Filter the output to get only test lines with '::' that occur after "Running X items in this shard"
-            def lines = pytestOutput.split('\n')
-            def foundRunningLine = false
-            def lineIndex = 0
-            shardTestList = lines.findAll { line ->
-                lineIndex++
-
-                if (line.matches(/.*Running \d+ items in this shard.*/) || line.matches(/.*\[pytest-split\] Running group.*/)) {
-                    foundRunningLine = true
-                    return false  // Don't include the "Running" line itself
-                }
-                // Stop collecting when we hit the warnings/errors summary separator
-                if (foundRunningLine && line.contains('======================')) {
-                    foundRunningLine = false  // Stop collecting
-                    return false
-                }
-
-                def hasDoubleColon = line.contains('::')
-                def shouldInclude = foundRunningLine && hasDoubleColon
-                return shouldInclude
-            }
-            echo "Filtering complete. shardTestList size: ${shardTestList.size()}"
-        } catch (Exception e) {
-            echo "Error: Failed to execute pytest command for test collection: ${e.getMessage()}"
-            error "Test collection failed for shard ${splitId}/${splits}. Cannot proceed without valid test list."
-        }
-    }
-
-    if (shardTestList || perfMode) {
-        // Split the shard test list into regular and isolate tests
-        def shardRegularTests = []
-        def shardIsolateTests = []
-
-        if (perfMode) {
-            // In perfMode, put all tests in regular and skip isolation
-            echo "Performance mode enabled - all tests will run as regular tests (no isolation)"
-            shardRegularTests = cleanedTestLines.findAll { it.trim() }
-        } else {
-            // Process each test from shardTestList
-            shardTestList.each { test ->
-                def trimmedTest = test.trim()
-                if (trimmedTest) {
-                    // Process test_unittests.py::test_unittests_v2[xxxx] pattern
-                    if (trimmedTest.startsWith('test_unittests.py::test_unittests_v2[') && trimmedTest.endsWith(']')) {
-                        // Extract content between [ and ]
-                        def startIndex = trimmedTest.indexOf('[') + 1
-                        def endIndex = trimmedTest.lastIndexOf(']')
-                        trimmedTest = trimmedTest.substring(startIndex, endIndex)
-                    }
-
-                    // Check if this test is in the isolation list
-                    def isolationTestLine = isolationTestLines.find { it.contains(trimmedTest) }
-                    if (isolationTestLine) {
-                        // This test needs isolation
-                        shardIsolateTests.add(isolationTestLine)
-                    } else {
-                        // This test is a regular test - find the actual line from cleanedTestLines
-                        def cleanedTestLine = cleanedTestLines.find { it.contains(trimmedTest) }
-                        shardRegularTests.add(cleanedTestLine)
-                    }
-                }
-            }
-        }
-
-        // Define file paths for regular and isolate tests
-        def regularTestList = testDBList.replaceAll('\\.txt$', '_regular.txt')
-        def isolateTestList = testDBList.replaceAll('\\.txt$', '_isolate.txt')
-
-        // Create shard-specific test files
-        if (shardRegularTests.size() > 0) {
-            def shardRegularContent = shardRegularTests.join('\n')
-            sh "echo '${shardRegularContent.replace("'", "'\\''")}' > ${regularTestList}"
-            echo "Created ${regularTestList} with ${shardRegularTests.size()} regular tests for this shard"
-        } else {
-            sh "touch ${regularTestList}"
-            echo "No regular tests in this shard, created empty file: ${regularTestList}"
-        }
-        sh "cat ${regularTestList}"
-
-        if (shardIsolateTests.size() > 0) {
-            def shardIsolateContent = shardIsolateTests.join('\n')
-            sh "echo '${shardIsolateContent.replace("'", "'\\''")}' > ${isolateTestList}"
-            echo "Created ${isolateTestList} with ${shardIsolateTests.size()} isolate tests for this shard"
-        } else {
-            sh "touch ${isolateTestList}"
-            echo "No isolate tests in this shard, created empty file: ${isolateTestList}"
-        }
-        sh "cat ${isolateTestList}"
-
-        // Return preprocessed lists object for compatibility
-        return [
-            regular: regularTestList,
-            isolate: isolateTestList,
-            regularCount: shardRegularTests.size(),
-            isolateCount: shardIsolateTests.size()
-        ]
-    } else {
-        echo "No tests found in current shard or failed to list tests"
-        // Create empty files and preprocessed lists object
-        def regularTestList = testDBList.replaceAll('\\.txt$', '_regular.txt')
-        def isolateTestList = testDBList.replaceAll('\\.txt$', '_isolate.txt')
-        sh "touch ${regularTestList}"
-        sh "touch ${isolateTestList}"
-
-        return [
-            regular: regularTestList,
-            isolate: isolateTestList,
-            regularCount: 0,
-            isolateCount: 0
-        ]
-    }
 }
 
 // SLURM job IDs are digit-only. Not String.isNumber(): that is a
@@ -1737,7 +1448,10 @@ def getPytestBaseCommandLine(
         testCmdLine += ["--run-ray"]
     }
     def unittestMarkExpr = (stageName.startsWith("CPU-")) ? "cpu_only" : "not cpu_only"
-    testCmdLine += ["--unittest-markexpr='${unittestMarkExpr}'"]
+    testCmdLine += ["--unittest-markexpr=\"${unittestMarkExpr}\""]
+    if (ENABLE_UPLOAD_TEST_RESULTS) {
+        testCmdLine += ["-o console_output_style=progress-even-when-capture-no"]
+    }
     if (extraArgs) {
         testCmdLine += extraArgs
     }
@@ -2043,25 +1757,24 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 )
 
                 // Generate Pytest command
+                // NOTE: the launcher (trtllm-llmapi-launch) is NOT included in
+                // pytestCommand.  For multi-node, slurm_run.sh wraps run_tests.py
+                // itself with the launcher so that MPI worker nodes stay alive
+                // across all pytest invocations (regular, isolated, rerun).
                 String pytestUtil = ""
                 if (nodeCount > 1) {
                     pytestUtil = "$llmSrcNode/tensorrt_llm/llmapi/trtllm-llmapi-launch"
                 }
                 def uploadPath = "${env.JOB_NAME}/${env.BUILD_NUMBER}"
 
-                def clusterDurationsArgsNode = []
+                def clusterDurationsPathNode = ""
                 if (useClusterDurations) {
                     def clusterKey = partition.clusterName.replaceAll('[^a-zA-Z0-9]', '_')
-                    def clusterDurationsPathNode = "${llmSrcNode}/tests/integration/defs/.test_durations_${clusterKey}"
-                    clusterDurationsArgsNode = ["--durations-path ${clusterDurationsPathNode}"]
+                    clusterDurationsPathNode = "${llmSrcNode}/tests/integration/defs/.test_durations_${clusterKey}"
                 }
-                def extraArgs = [
-                    "--test-list=$testListPathNode",
-                    "--splitting-algorithm least_duration",
-                    "--splits $splits",
-                    "--group $splitId",
-                    *clusterDurationsArgsNode,
-                ]
+                // test-list/splits/group/durations are now handled by run_tests.py;
+                // only pass S3 upload args as part of the pytest base command.
+                def extraArgs = []
                 if (ENABLE_UPLOAD_TEST_RESULTS && !testFilter[(DETAILED_LOG)]) {
                     extraArgs += [
                         "--capture=fd",
@@ -2076,11 +1789,13 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     perfMode,
                     jobWorkspace,
                     "$jobWorkspace/.coveragerc",
-                    pytestUtil,
-                    extraArgs,
+                    "",  // pytestUtil excluded — launcher wraps run_tests.py instead
+                    extraArgs,  // test-list/splits/group handled by run_tests.py
                 )
-                pytestCommandParts += getInfraDryRunPytestTargets(testListPathLocal)
                 def pytestCommand = pytestCommandParts.join(" ")
+                // Passed separately so run_tests.py also narrows its --collect-only step.
+                def pytestTargets = getInfraDryRunPytestTargets(testListPathLocal).join(" ")
+                def failSignaturesList = trtllm_utils.getFailSignaturesList().join(",")
 
                 // Generate Job Launch Script
                 def container = LLM_DOCKER_IMAGE
@@ -2236,6 +1951,13 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     "export ${varName}=\"${escapedValue}\""
                 }.join('\n')
 
+                // Escape pytestCommand for embedding inside bash double-quoted export.
+                // --unittest-markexpr="not cpu_only" contains inner double quotes that
+                // would prematurely close the outer "..." and cause an export error.
+                def safePytestCmd = pytestCommand
+                    .replace('\\', '\\\\')
+                    .replace('"', '\\"')
+
                 def scriptLaunchPrefix = """#!/bin/bash
                     #SBATCH ${exemptionComment}
                     #SBATCH --output=${slurmJobLogPath}
@@ -2258,8 +1980,15 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     export perfMode=$perfMode
                     ${infraDryRun ? "export infraDryRun=true" : ""}
                     export resourcePathNode=$resourcePathNode
-                    export pytestCommand="$pytestCommand"
+                    export pytestCommand="$safePytestCmd"
                     export coverageConfigFile="$coverageConfigFile"
+                    export testListPathNode="$testListPathNode"
+                    export testSplits="$splits"
+                    export testGroup="$splitId"
+                    export failSignaturesList="$failSignaturesList"
+                    export pytestUtil="$pytestUtil"
+                    export pytestTargets="$pytestTargets"
+                    export testDurationsPath="$clusterDurationsPathNode"
                     # Keep xtrace off around the token exports so they are not echoed into the Slurm job log.
                     set +x
                     export HF_TOKEN=$HF_TOKEN
@@ -2658,6 +2387,8 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 def sshStatCmd = Utils.sshUserCmd(remote, "\"srun --overlap ${srunAccountArg}--quiet --jobid='${slurmJobId}' --ntasks=1 stat -c %Y '${remoteWorkspaceTrk}/results.xml' || echo 0\"")
                 def scpXmlCmd = scpFromRemoteCmd(remote, "${remoteWorkspaceTrk}/results*.xml", "${stageName}/")
                 def scpUnfinishedCmd = scpFromRemoteCmd(remote, "${remoteWorkspaceTrk}/unfinished_test.txt", "${stageName}/")
+                // run_tests.py's merged rerun report; results*.xml above does not match it.
+                def scpRerunReportCmd = scpFromRemoteCmd(remote, "${remoteWorkspaceTrk}/rerun_results.xml", "${stageName}/")
                 def sshRefreshCacheCmd = Utils.sshUserCmd(remote, "\"ls '${remoteWorkspaceTrk}/' > /dev/null 2>&1; ls -la '${remoteWorkspaceTrk}/results.xml' > /dev/null 2>&1 || true\"")
                 def sshListPerfCmd = Utils.sshUserCmd(remote, "\"find '${remoteWorkspaceTrk}' -maxdepth 1 -type d \\( -name 'aggr*' -o -name 'disagg*' \\) -print 2>/dev/null || true\"")
                 def scpPerfTemplate = scpFromRemoteCmd(remote, "PERF_FOLDER_PLACEHOLDER", "${stageName}/")
@@ -2702,6 +2433,10 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
 
                         # ---- immediate final snapshot ----
                         mkdir -p '${WORKSPACE}/${stageName}'
+                        # run_tests.py merges results_isolated_*.xml into results.xml and
+                        # deletes them; drop copies a checkpoint scp may have pulled so
+                        # junit does not count them twice. Unmerged ones are re-fetched below.
+                        rm -f '${WORKSPACE}/${stageName}'/results_isolated_*.xml
                         ${sshRefreshCacheCmd}
                         for _attempt in 1 2 3; do
                             ${scpXmlCmd} && break
@@ -2714,6 +2449,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                             [ \$_attempt -lt 3 ] && sleep 10
                         done
                         [ "\$_unfinished_ok" -eq 0 ] && echo "[PROGRESS-UPLOAD] ${stageName}: scp unfinished not available, skipping"
+                        ${scpRerunReportCmd} || echo "[PROGRESS-UPLOAD] ${stageName}: no rerun report to fetch"
                         SCP_PERF_TMPL='${scpPerfTemplate}'
                         while IFS= read -r perf_folder; do
                             [ -z "\$perf_folder" ] && continue
@@ -4565,270 +4301,6 @@ def getSSHConnectionPorts(portConfigFile, stageName)
     return [userPort, monitorPort]
 }
 
-// generate_rerun_tests_list opens rerun_0/1/2.txt eagerly but removes any that
-// end up empty, so this also guards against a future change to that cleanup.
-def fileHasContent(path) {
-    return fileExists(path) && readFile(path).trim()
-}
-
-// Return true means the test rerun also fails. Return false otherwise.
-def rerunFailedTests(stageName, llmSrc, testCmdLine, resultFileName="results.xml", testType="regular", postTag="") {
-    if (!fileExists("${WORKSPACE}/${stageName}/${resultFileName}")) {
-        // No results were ever flushed (e.g. the process was killed before any
-        // test finished reporting). test_rerun.py treats a missing xml as "no
-        // tests ran" and falls back to unfinished_test.txt / the original test
-        // list to classify each test, so keep going instead of assuming a
-        // rerun already failed.
-        echo "There is no ${resultFileName} file; falling back to unfinished/not-run classification for ${testType}"
-    }
-
-    // Create rerun directory structure to avoid conflicts
-    def rerunDir = "${WORKSPACE}/${stageName}/rerun/${testType}"
-    sh "mkdir -p ${rerunDir}"
-
-    // Generate rerun test lists
-    def failSignaturesList = trtllm_utils.getFailSignaturesList().join(",")
-    def testListCmd = testCmdLine.find { it.contains("--test-list=") }
-    def testListArg = testListCmd ? "--test-list=${testListCmd.split('=', 2)[1]}" : ""
-    def unfinishedTestFile = "${WORKSPACE}/${stageName}/unfinished_test.txt"
-    def unfinishedTestArg = fileExists(unfinishedTestFile) ? "--unfinished-test-file=${unfinishedTestFile}" : ""
-    sh """
-        python3 ${llmSrc}/jenkins/scripts/test_rerun.py \
-        generate_rerun_tests_list \
-        --output-dir=${rerunDir}/ \
-        --input-file=${WORKSPACE}/${stageName}/${resultFileName} \
-        --fail-signatures='${failSignaturesList}' \
-        ${testListArg} \
-        ${unfinishedTestArg}
-    """
-
-    // If the stage has more than 5 failed tests, skip the rerun step
-    def validLineCount = 0
-    for (times in [1, 2]) {
-        def currentRerunTestList = "${rerunDir}/rerun_${times}.txt"
-        if (fileExists(currentRerunTestList)) {
-            count = sh(
-                script: "grep -v '^[[:space:]]*\$' ${currentRerunTestList} | wc -l",
-                returnStdout: true
-            ).trim().toInteger()
-            echo "Found ${count} ${testType} tests to rerun ${times} time(s)"
-            validLineCount += count
-        }
-    }
-
-    // Rerun tests
-    def isRerunFailed = false
-    for (times in [1, 2]) {
-        def currentRerunTestList = "${rerunDir}/rerun_${times}.txt"
-        if (!fileExists(currentRerunTestList)) {
-            echo "No failed ${testType} tests need to be rerun ${times} time(s)"
-            continue
-        }
-        sh "cat ${currentRerunTestList}"
-        def xmlFile = "${rerunDir}/rerun_results_${times}.xml"
-        // change the testCmdLine for rerun
-        def noNeedLine = ["--splitting-algorithm", "--splits", "--group", "--cov"]
-        def needToChangeLine = ["--test-list", "--csv", "--periodic-junit-xmlpath"]
-        def newTestCmdLine = testCmdLine.findAll { cmd ->
-            !noNeedLine.any { line -> cmd.contains(line) } && !needToChangeLine.any { line -> cmd.contains(line) }
-        }
-        newTestCmdLine += [
-            "--test-list=${currentRerunTestList}",
-            "--csv=${rerunDir}/rerun_report_${times}.csv",
-            "--periodic-junit-xmlpath ${xmlFile}",
-            "--reruns ${times - 1}"
-        ]
-        def rerunProgressTar = "results-${stageName}${postTag}-progress.tar.gz"
-        def rerunProgressUrl = "https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/test-results/${rerunProgressTar}"
-        def rerunDoneFile = "${WORKSPACE}/.rerun${times}-done-${stageName}"
-        sh "rm -f ${rerunDoneFile}"
-        try {
-            withCredentials([usernamePassword(
-                    credentialsId: 'urm-artifactory-creds',
-                    usernameVariable: 'ART_USER',
-                    passwordVariable: 'ART_PASS')]) {
-                sh """
-                    set +e
-                    export STAGE_NAME='${stageName}'
-                    export PROGRESS_TAR='${rerunProgressTar}'
-                    export PROGRESS_URL='${rerunProgressUrl}'
-                    export POST_TAG='${postTag}'
-                    # ---- background watcher for rerun${times} ----
-                    PROGRESS_DONE_FILE='${rerunDoneFile}' \\
-                    PROGRESS_INTERVAL=${PROGRESS_UPLOAD_INTERVAL_SEC} \\
-                    LABEL_PREFIX='rerun${times} checkpoint' \\
-                    XML_PATH='${xmlFile}' \\
-                    bash '${llmSrc}/jenkins/scripts/progress_upload_watcher.sh' &
-                    WATCHER_PID=\$!
-
-                    # ---- foreground rerun ----
-                    cd ${llmSrc}/tests/integration/defs && \\
-                    ${newTestCmdLine.join(" ")}
-                    rc=\$?
-
-                    touch '${rerunDoneFile}'
-                    wait \$WATCHER_PID 2>/dev/null || true
-
-                    # ---- immediate final snapshot of rerun${times} ----
-                    LABEL='rerun${times} final snapshot' FINAL_SNAPSHOT=1 \\
-                    bash '${llmSrc}/jenkins/scripts/progress_upload_snapshot.sh' || true
-
-                    exit \$rc
-                """
-            }
-        } catch(InterruptedException e) {
-            throw e
-        } catch (Exception e) {
-            if (!fileExists(xmlFile)) {
-                echo "The ${testType} tests crashed when rerun attempt."
-                throw e
-            }
-            echo "The ${testType} tests still failed after rerun attempt."
-            isRerunFailed = true
-        }
-    }
-
-    echo "isRerunFailed for ${testType}: ${isRerunFailed}"
-    return isRerunFailed
-}
-
-def generateRerunReport(stageName, llmSrc) {
-    echo "Generating comprehensive rerun report for stage: ${stageName}"
-
-    def rerunBaseDir = "${WORKSPACE}/${stageName}/rerun"
-    def regularRerunDir = "${rerunBaseDir}/regular"
-
-    // Check if regular rerun directory has rerun_results_*.xml files
-    def hasRegularReruns = sh(script: "[ -d '${regularRerunDir}' ] && find '${regularRerunDir}' -name 'rerun_results_*.xml' | head -1 | grep -q . && echo 'true' || echo 'false'", returnStdout: true).trim() == 'true'
-
-    // Check if any isolated rerun directories have rerun_results_*.xml files
-    def hasIsolatedReruns = sh(script: "find ${rerunBaseDir} -type d -name 'isolated_*' -exec find {} -name 'rerun_results_*.xml' \\; 2>/dev/null | head -1 | grep -q . && echo 'true' || echo 'false'", returnStdout: true).trim() == 'true'
-
-    // Find isolated tests that have actual rerun results and build mapping
-    def isolatedTestsWithReruns = []
-    if (hasIsolatedReruns) {
-        def isolatedDirsOutput = sh(script: "find ${rerunBaseDir} -type d -name 'isolated_*' 2>/dev/null || true", returnStdout: true).trim()
-        if (isolatedDirsOutput) {
-            def isolatedDirs = isolatedDirsOutput.split('\n').findAll { it.trim() }
-            isolatedDirs.each { isolatedDir ->
-                // Extract the isolated number from directory name (e.g., isolated_0 -> 0)
-                def isolatedNum = isolatedDir.split('/').last().replace('isolated_', '')
-
-                // Check if this isolated directory has any rerun results
-                def hasRerunResults = sh(script: "find '${isolatedDir}' -name 'rerun_results_*.xml' | head -1 | grep -q . && echo 'true' || echo 'false'", returnStdout: true).trim() == 'true'
-
-                if (hasRerunResults) {
-                    isolatedTestsWithReruns.add([
-                        dir: isolatedDir,
-                        num: isolatedNum,
-                        originalResult: "${WORKSPACE}/${stageName}/results_isolated_${isolatedNum}.xml"
-                    ])
-                }
-            }
-        }
-    }
-
-    // Collect rerun result files and corresponding original result files
-    def rerunResultFiles = []
-
-    echo "Found regular reruns: ${hasRegularReruns}"
-    echo "Found isolated tests with reruns: ${isolatedTestsWithReruns.collect { "isolated_${it.num}" }}"
-
-    if (!hasRegularReruns && !hasIsolatedReruns) {
-        echo "No rerun results found, skipping rerun report generation"
-        return
-    }
-
-    // Specify the stage name correctly for all result xml files.
-    sh "cd ${WORKSPACE}/${stageName} && find . -name '*.xml' -exec sed -i 's/testsuite name=\"pytest\"/testsuite name=\"${stageName}\"/g' {} + || true"
-
-    // Collect all original and rerun result files
-    def allInputFiles = []
-
-    // ---- Regular test results ----
-    // Add original results
-    if (fileExists("${WORKSPACE}/${stageName}/results.xml")) {
-        allInputFiles.add("${WORKSPACE}/${stageName}/results.xml")
-        // Add to rerunResultFiles only if it has reruns
-        if (hasRegularReruns) {
-            rerunResultFiles.add("${WORKSPACE}/${stageName}/results.xml")
-        }
-    }
-    // Add regular rerun results
-    if (hasRegularReruns) {
-        for (times in [1, 2]) {
-            def rerunFile = "${regularRerunDir}/rerun_results_${times}.xml"
-            if (fileExists(rerunFile)) {
-                allInputFiles.add(rerunFile)
-                rerunResultFiles.add(rerunFile)
-            }
-        }
-    }
-
-    // ---- Isolated test results ----
-    // Add ALL isolated test results to allInputFiles
-    def isolatedResults = sh(script: "find ${WORKSPACE}/${stageName} -name 'results_isolated_*.xml' 2>/dev/null || true", returnStdout: true).trim()
-    if (isolatedResults) {
-        isolatedResults.split('\n').each { file ->
-            if (file.trim()) {
-                allInputFiles.add(file.trim())
-            }
-        }
-    }
-    // Add isolated rerun results
-    isolatedTestsWithReruns.each { isolatedTest ->
-        if (fileExists(isolatedTest.originalResult)) {
-            rerunResultFiles.add(isolatedTest.originalResult)
-            echo "Added isolated result with reruns to rerunResultFiles: ${isolatedTest.originalResult}"
-        }
-        for (times in [1, 2]) {
-            def rerunFile = "${isolatedTest.dir}/rerun_results_${times}.xml"
-            if (fileExists(rerunFile)) {
-                allInputFiles.add(rerunFile)
-                rerunResultFiles.add(rerunFile)
-            }
-        }
-    }
-
-    if (allInputFiles.isEmpty()) {
-        echo "No valid input files found for rerun report generation"
-        return
-    }
-
-    echo "Generating rerun report with input files: ${rerunResultFiles.join(',')}"
-
-    // Generate comprehensive rerun report
-    sh """
-        python3 ${llmSrc}/jenkins/scripts/test_rerun.py \
-        generate_rerun_report \
-        --output-file=${WORKSPACE}/${stageName}/rerun_results.xml \
-        --input-files=${rerunResultFiles.join(",")}
-    """
-
-    // Update original results xml file with all rerun results for junit
-    sh """
-        python3 ${llmSrc}/jenkins/scripts/test_rerun.py \
-        merge_junit_xmls \
-        --output-file=${WORKSPACE}/${stageName}/results.xml \
-        --input-files=${allInputFiles.join(",")} \
-        --deduplicate
-    """
-
-    // Upload rerun report
-    if (fileExists("${WORKSPACE}/${stageName}/rerun_results.html")) {
-        trtllm_utils.uploadArtifacts(
-            "${WORKSPACE}/${stageName}/rerun_results.html",
-            "${UPLOAD_PATH}/rerun_reports/${stageName}_rerun_results.html"
-        )
-        echo "Test rerun report: https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/rerun_reports/${stageName}_rerun_results.html"
-    }
-
-    // Remove isolation results since they are merged into results.xml
-    sh "rm -rf ${WORKSPACE}/${stageName}/results_isolated_*.xml || true"
-
-    echo "Rerun report generation completed for stage: ${stageName}"
-}
-
 def mergeWaivesTxt(pipeline, llmSrc, stageName) {
     def waivesTxt = "https://urm.nvidia.com/artifactory/${ARTIFACT_PATH}/waive_list/waives.txt"
     try {
@@ -5255,10 +4727,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
 
     stage ("[${stageName}] Run Pytest")
     {
-        def noRegularTests = false
-        def noIsolateTests = false
-        def rerunFailed = false
-        def hasUnrerunFailure = false
+        def runTestsExitCode = 0
         def infraDryRun = isInfraDryRun()
         if (infraDryRun) {
             testList = INFRA_DRY_RUN_TEST_CONTEXT
@@ -5271,15 +4740,13 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         // partition.clusterName (e.g. "oci-hsg", "dlcluster").  This lets each cluster
         // build its own timing baseline so sharding is not skewed by timings collected
         // on different hardware.  Falls back to the shared .test_durations when unset.
-        def clusterDurationsArgs = []
-        def clusterDurationsPath = ""
         String clusterNameForDurations = null
+        def clusterDurationsPath = ""
         if (useClusterDurations) {
             def partition = SlurmConfig.resolvePlatform(platform)
             def clusterKey = partition.clusterName.replaceAll('[^a-zA-Z0-9]', '_')
             clusterNameForDurations = clusterKey
             clusterDurationsPath = "${llmSrc}/tests/integration/defs/.test_durations_${clusterKey}"
-            clusterDurationsArgs = ["--durations-path ${clusterDurationsPath}"]
         }
 
         def testDBList = renderTestDB(pipeline, testList, llmSrc, stageName, null, clusterNameForDurations)
@@ -5298,9 +4765,6 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                 reusePassedTestResults(llmSrc, stageName, waivesFilePath, postTag)
             }
         }
-
-        // Process shard test list and create separate files for regular and isolate tests
-        def preprocessedLists = processShardTestList(llmSrc, testDBList, splitId, splits, perfMode, clusterDurationsPath)
 
         // Test Coverage
         def TRTLLM_WHL_PATH = sh(returnStdout: true, script: "pip3 show tensorrt_llm | grep Location | cut -d ' ' -f 2").replaceAll("\\s","")
@@ -5330,10 +4794,9 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         def containerPortNum = GlobalState.PORT_SECTION_SIZE
         def uploadPath = UPLOAD_PATH.replaceFirst("sw-tensorrt-generic/llm-artifacts/LLM/", "")
 
-        // Some clusters do not allow dmesg -C so we add || true
-        // Temporarily disable to reduce the log size
-        // sh 'if [ "$(id -u)" -eq 0 ]; then dmesg -C || true; fi'
-        def extraArgs = [*clusterDurationsArgs]
+        // clusterDurationsArgs removed — --durations-path is now passed directly to run_tests.py.
+        // Only S3 upload args remain in extraArgs for the pytest base command.
+        def extraArgs = []
         if (ENABLE_UPLOAD_TEST_RESULTS && !testFilter[(DETAILED_LOG)]) {
             extraArgs += [
                 "--capture=fd",
@@ -5349,16 +4812,13 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
             "${WORKSPACE}/${stageName}",
             coverageConfigFile,
             "",  // pytestUtil
-            extraArgs,  // extraArgs
+            extraArgs,  // S3 upload args; test-list/durations handled by run_tests.py
             containerPortStart,
             containerPortNum
         )
 
-        // Only add --test-list if there are regular tests to run
-        if (preprocessedLists.regularCount > 0) {
-            pytestCommand += ["--test-list=${preprocessedLists.regular}"]
-            pytestCommand += getInfraDryRunPytestTargets(preprocessedLists.regular)
-        }
+        // Passed separately so run_tests.py also narrows its --collect-only step.
+        def pytestTargetArgs = getInfraDryRunPytestTargets(testDBList).collect { "--pytest-target ${it}" }.join(" ")
 
         def containerPIP_LLM_LIB_PATH = sh(script: "pip3 show tensorrt_llm | grep \"Location\" | awk -F\":\" '{ gsub(/ /, \"\", \$2); print \$2\"/tensorrt_llm/libs\"}'", returnStdout: true).replaceAll("\\s","")
         def containerLD_LIBRARY_PATH = sh(script: "echo \${LD_LIBRARY_PATH}", returnStdout: true).replaceAll("\\s","")
@@ -5378,132 +4838,84 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                 string(credentialsId: 'llm_evaltool_repo_url', variable: 'EVALTOOL_REPO_URL')
             ]) {
                 sh "env | sort"
-                try {
-                    // Sentinel that the watcher polls to know pytest has exited
-                    // (success or failure). Lives outside ${stageName}/ so the
-                    // `rm -rf ${stageName}/` at pytest startup doesn't wipe it.
-                    def pytestDoneFile = "${WORKSPACE}/.pytest-done-${stageName}"
-                    def progressTar = "results-${stageName}${postTag}-progress.tar.gz"
-                    def progressUrl = "https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/test-results/${progressTar}"
-                    sh "rm -f ${pytestDoneFile}"
-                    try {
-                        if (preprocessedLists.regularCount > 0) {
-                            // Run pytest in the foreground while a shell subshell
-                            // watcher periodically tars + uploads results.xml. The
-                            // watcher is a background subshell of the same `sh`
-                            // step (not a Groovy parallel branch) so Blue Ocean
-                            // renders the stage as a single box rather than a
-                            // nested parallel split.
-                            withCredentials([usernamePassword(
-                                    credentialsId: 'urm-artifactory-creds',
-                                    usernameVariable: 'ART_USER',
-                                    passwordVariable: 'ART_PASS')]) {
-                                sh """
-                                    set +e
-                                    export STAGE_NAME='${stageName}'
-                                    export PROGRESS_TAR='${progressTar}'
-                                    export PROGRESS_URL='${progressUrl}'
-                                    export TIMEOUT_XML_SCRIPT='${llmSrc}/jenkins/scripts/generate_timeout_xml.py'
-                                    export POST_TAG='${postTag}'
-                                    # ---- background watcher ----
-                                    PROGRESS_DONE_FILE='${pytestDoneFile}' \\
-                                    PROGRESS_INTERVAL=${PROGRESS_UPLOAD_INTERVAL_SEC} \\
-                                    LABEL_PREFIX='checkpoint' \\
-                                    XML_PATH='${WORKSPACE}/${stageName}/results.xml' \\
-                                    bash '${llmSrc}/jenkins/scripts/progress_upload_watcher.sh' &
-                                    WATCHER_PID=\$!
 
-                                    # ---- foreground pytest ----
-                                    rm -rf '${stageName}/'
-                                    cd '${llmSrc}/tests/integration/defs'
-                                    ${pytestCommand.join(" ")}
-                                    rc=\$?
+                // Build fail signatures list for rerun eligibility
+                def failSignaturesList = trtllm_utils.getFailSignaturesList().join(",")
 
-                                    touch '${pytestDoneFile}'
-                                    wait \$WATCHER_PID 2>/dev/null || true
+                // Sentinel that the watcher polls to know run_tests.py has exited
+                // (success or failure). Lives outside ${stageName}/ so the
+                // `rm -rf ${stageName}/` before the run doesn't wipe it.
+                def pytestDoneFile = "${WORKSPACE}/.pytest-done-${stageName}"
+                def progressTar = "results-${stageName}${postTag}-progress.tar.gz"
+                def progressUrl = "https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/test-results/${progressTar}"
+                sh "rm -f ${pytestDoneFile}"
 
-                                    # ---- immediate final snapshot of run 1 ----
-                                    if [ -f '${WORKSPACE}/${stageName}/results.xml' ]; then
-                                        LABEL='run1 final snapshot' FINAL_SNAPSHOT=1 \\
-                                        bash '${llmSrc}/jenkins/scripts/progress_upload_snapshot.sh' || true
-                                    fi
+                // Use unified run_tests.py for render + regular + isolated + rerun + merge,
+                // while a background watcher periodically tars + uploads the stage dir.
+                // No XML_PATH: run_tests.py writes regular, isolated and rerun XMLs to
+                // different files, so the watcher uploads on every interval and relies
+                // on the snapshot's content hash to skip unchanged dirs.
+                withCredentials([usernamePassword(
+                        credentialsId: 'urm-artifactory-creds',
+                        usernameVariable: 'ART_USER',
+                        passwordVariable: 'ART_PASS')]) {
+                    runTestsExitCode = sh(returnStatus: true, script: """
+                        set +e
+                        export STAGE_NAME='${stageName}'
+                        export PROGRESS_TAR='${progressTar}'
+                        export PROGRESS_URL='${progressUrl}'
+                        export TIMEOUT_XML_SCRIPT='${llmSrc}/jenkins/scripts/generate_timeout_xml.py'
+                        export POST_TAG='${postTag}'
+                        # ---- background watcher ----
+                        PROGRESS_DONE_FILE='${pytestDoneFile}' \\
+                        PROGRESS_INTERVAL=${PROGRESS_UPLOAD_INTERVAL_SEC} \\
+                        LABEL_PREFIX='checkpoint' \\
+                        bash '${llmSrc}/jenkins/scripts/progress_upload_watcher.sh' &
+                        WATCHER_PID=\$!
 
-                                    exit \$rc
-                                """
-                            }
-                        } else {
-                            echo "No regular tests to run for stage ${stageName}"
-                            noRegularTests = true
-                            sh "mkdir -p ${stageName}"
-                            // Create an empty results.xml file for consistency
-                            sh """
-                                echo '<?xml version="1.0" encoding="UTF-8"?>' > ${stageName}/results.xml
-                                echo '<testsuites>' >> ${stageName}/results.xml
-                                echo '<testsuite name="${stageName}" errors="0" failures="0" skipped="0" tests="0" time="0.0">' >> ${stageName}/results.xml
-                                echo '</testsuite>' >> ${stageName}/results.xml
-                                echo '</testsuites>' >> ${stageName}/results.xml
-                            """
-                            sh "touch ${pytestDoneFile}"
-                        }
-                    } catch (InterruptedException e) {
-                        throw e
-                    } catch (Exception e) {
-                        def isRerunFailed = rerunFailedTests(
-                            stageName, llmSrc, pytestCommand, "results.xml", "regular", postTag)
-                        // Unconditional: a test can crash again during the rerun itself
-                        // (isRerunFailed=true), and unfinished_test.txt is the only
-                        // record of that crash. junit()'s "results*.xml" glob picks up
-                        // results-timeout.xml directly, so this is what surfaces it.
-                        def hadUnfinishedTests = generateTimeoutTestResultXml(pipeline, stageName)
-                        if (isRerunFailed) {
-                            catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
-                                error "Regular tests failed after rerun attempt"
-                            }
-                            rerunFailed = true
-                        } else if (hadUnfinishedTests) {
-                            // Rerun passed but the first run had a timeout: mark this
-                            // stage FAILURE so "[${stageName}] Run Pytest" turns red,
-                            // not just the enclosing parent stage.
-                            catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
-                                error "Some tests terminated unexpectedly, please check the test report."
-                            }
-                        } else if (fileHasContent("${WORKSPACE}/${stageName}/rerun/regular/rerun_0.txt")) {
-                            // Failures that finished (not a timeout) but were never
-                            // rerun because duration > 10 min and no known failure
-                            // signature matched: results.xml still carries their
-                            // original <failure>, but neither branch above fires for
-                            // them, so without this the stage silently reports green.
-                            catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
-                                error "Some tests failed and were not eligible for rerun (duration > 10 min, no matching failure signature), please check the test report."
-                            }
-                            hasUnrerunFailure = true
-                        }
+                        # ---- foreground run_tests.py ----
+                        rm -rf '${stageName}/'
+                        cd '${llmSrc}/tests/integration/defs'
+                        python3 ${llmSrc}/jenkins/scripts/run_tests.py \\
+                            --render \\
+                            --test-db-list ${testDBList} \\
+                            --splits ${splits} \\
+                            --group ${splitId} \\
+                            ${perfMode ? '--perf-mode' : ''} \\
+                            --pytest-base-cmd '${pytestCommand.join(" ")}' \\
+                            ${pytestTargetArgs} \\
+                            --stage-name ${stageName} \\
+                            --output-dir ${WORKSPACE}/${stageName} \\
+                            --working-dir ${llmSrc}/tests/integration/defs \\
+                            --fail-signatures '${failSignaturesList}' \\
+                            --max-rerun-tests 5 \\
+                            ${clusterDurationsPath ? "--durations-path ${clusterDurationsPath}" : ''}
+                        rc=\$?
+
+                        touch '${pytestDoneFile}'
+                        wait \$WATCHER_PID 2>/dev/null || true
+
+                        # ---- immediate final snapshot ----
+                        if [ -f '${WORKSPACE}/${stageName}/results.xml' ]; then
+                            LABEL='final snapshot' FINAL_SNAPSHOT=1 \\
+                            bash '${llmSrc}/jenkins/scripts/progress_upload_snapshot.sh' || true
+                        fi
+
+                        exit \$rc
+                    """)
+                }
+                if (runTestsExitCode != 0) {
+                    // Turn "[${stageName}] Run Pytest" red now; the terminal error is
+                    // raised after perfMode below so perf artifacts are still generated.
+                    catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+                        error "run_tests.py failed with exit code ${runTestsExitCode}, please check the test report."
                     }
-
-                    // Run the isolated tests if exists
-                    if (preprocessedLists.isolateCount > 0) {
-                        stage ("[${stageName}] Run Pytest (Isolated)") {
-                            echo "There are ${preprocessedLists.isolateCount} isolated tests to run"
-                            def isolatedResult = runIsolatedTests(
-                                pipeline, preprocessedLists, pytestCommand, llmSrc, stageName, postTag)
-                            rerunFailed = isolatedResult.rerunFailed || rerunFailed
-                            hasUnrerunFailure = isolatedResult.hasUnrerunFailure || hasUnrerunFailure
-                        }
-                    } else {
-                        echo "No isolated tests to run for stage ${stageName}"
-                        noIsolateTests = true
-                    }
-
-                    if (noRegularTests && noIsolateTests) {
-                        error "No tests were executed for stage ${stageName}, please check the test list and test-db rendering result."
-                    }
-                } finally {
-                    if (ENABLE_UPLOAD_TEST_RESULTS && !testFilter[(DETAILED_LOG)]) {
-                        sh """
-                            python3 ${llmSrc}/tests/test_common/s3_output.py \
-                                --drain-spool "${WORKSPACE}/${stageName}" || true
-                        """
-                    }
+                }
+                if (ENABLE_UPLOAD_TEST_RESULTS && !testFilter[(DETAILED_LOG)]) {
+                    sh """
+                        python3 ${llmSrc}/tests/test_common/s3_output.py \
+                            --drain-spool "${WORKSPACE}/${stageName}" || true
+                    """
                 }
             }
 
@@ -5517,11 +4929,13 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
             }
         }
 
-        // Generate comprehensive rerun report if any reruns occurred
-        stage ("Generate Report") {
-            timeout(time: 15, unit: 'MINUTES'){
-                generateRerunReport(stageName, llmSrc)
-            }
+        // Upload rerun report if generated by run_tests.py
+        if (fileExists("${WORKSPACE}/${stageName}/rerun_results.html")) {
+            trtllm_utils.uploadArtifacts(
+                "${WORKSPACE}/${stageName}/rerun_results.html",
+                "${UPLOAD_PATH}/rerun_reports/${stageName}_rerun_results.html"
+            )
+            echo "Test rerun report: https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/rerun_reports/${stageName}_rerun_results.html"
         }
 
         // catchError just lets "Create Perf Report" still run; the real
@@ -5564,16 +4978,14 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         // Checked after perfMode so perf artifacts are generated first.
         // Unguarded error() on purpose -- catchError here would swallow the
         // throw that cacheErrorAndUploadResult relies on to fail the build.
-        if (rerunFailed) {
-            error "Some tests still failed after rerun attempts, please check the test report."
-        }
-
         if (fileExists("${stageName}/results-timeout.xml") || generateTimeoutTestResultXml(pipeline, stageName)) {
             error "Some tests terminated unexpectedly, please check the test report."
         }
 
-        if (hasUnrerunFailure) {
-            error "Some tests failed and were not eligible for rerun (duration > 10 min, no matching failure signature), please check the test report."
+        // run_tests.py exits non-zero for failures still failing after rerun and
+        // for failures not eligible for rerun (duration > 10 min, no signature).
+        if (runTestsExitCode != 0) {
+            error "Some tests failed (run_tests.py exit code ${runTestsExitCode}), please check the test report."
         }
 
         if (perfRegressionExitCode != null) {
