@@ -46,7 +46,6 @@ from ...model_call import ModelCaller
 from ...multimodal import MultimodalItemScheduler
 from ..common import make_scheduled_inputs
 from ..interface import ScheduledInputs, ScheduledModelRunner
-from .agreement import WarmupAgreement
 from .config import DecoderRunnerConfig
 from .dummy_requests import DummyRequestFactory
 from .graphs import DecoderCudaGraphs, compute_dynamic_draft_len_mapping
@@ -57,7 +56,7 @@ from .metadata import (
     sync_group_all_greedy_sample,
     update_spec_metadata,
 )
-from .warmup import DecoderWarmup
+from .warmup import DecoderWarmup, WarmupAgreement
 
 
 class DecoderRunner(ScheduledModelRunner):

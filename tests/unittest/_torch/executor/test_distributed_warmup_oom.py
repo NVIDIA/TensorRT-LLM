@@ -12,8 +12,10 @@ import torch
 
 from tensorrt_llm._torch.pyexecutor import py_executor as py_executor_module
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import warmup as warmup_module
-from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.agreement import WarmupAgreement
-from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.warmup import DecoderWarmup
+from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.warmup import (
+    DecoderWarmup,
+    WarmupAgreement,
+)
 from tensorrt_llm._torch.pyexecutor.warmup_timer import _WarmupTimer
 
 pytestmark = pytest.mark.cpu_only

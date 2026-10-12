@@ -54,10 +54,10 @@ from tensorrt_llm.mapping import Mapping
 
 from ...lora import LoraParamBuilder
 from ..common import get_top_level_model, prepare_multimodal_indices
-from .agreement import WarmupAgreement
 from .config import DecoderRunnerConfig
 from .dummy_requests import DummyRequestFactory
 from .metadata import DecoderMetadata
+from .warmup import WarmupAgreement
 
 
 def _make_single_token_context_graph_batch(
