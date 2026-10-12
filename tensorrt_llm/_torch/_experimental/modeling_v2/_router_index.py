@@ -20,25 +20,28 @@ Two levels, on purpose:
   that already exist in every checkpoint's config.json, so adding a new
   checkpoint, GPU arch or parallel topology never touches it -- only a new
   architecture family does.
-* The routing module owns the rest of the decision as one forward-reading
-  tree, in two stages. ``route`` reads the configuration's *identity* --
-  checkpoint shape, GPU architecture, parallel topology -- and names a target.
-  ``within_bounds`` then reads the *deployment* -- the LLM API arguments as
-  the engine will run with them, model defaults included -- and says whether
-  that target was certified for it.
-  Reading that single file tells you where any configuration lands.
+* The routing module's ``route`` owns the rest of the decision as one
+  forward-reading tree over the facts that fix which code runs: the
+  checkpoint's config, the parallel mapping, the GPU's compute capability and
+  the speculative-decoding config. It returns a target name, or raises
+  :class:`NoTarget` with the reason in words. Reading that one file tells you
+  where any configuration lands.
+
+Tuning knobs -- ``max_batch_size``, ``max_num_tokens``, CUDA graph settings --
+are deliberately not routing inputs. They do not change which code runs, so a
+target claims a configuration regardless of them; ``require`` promises that the
+target ran, not that a particular knob setting was measured.
 
 Routing modules are imported lazily: resolving a GptOss config never imports
 the DeepSeek tree, and a target's modeling code is imported only once its
-routing module has claimed the config and accepted the deployment.
+routing module has named it.
 """
 
 from __future__ import annotations
 
 import enum
-from dataclasses import dataclass
 from importlib import import_module
-from typing import TYPE_CHECKING, Any, List, Optional, Tuple
+from typing import TYPE_CHECKING, Optional, Tuple
 
 from tensorrt_llm.logger import logger
 
@@ -67,103 +70,13 @@ class ModelingV2Mode(str, enum.Enum):
         return cls(llm_args.modeling_v2)
 
 
-@dataclass(frozen=True)
-class ModelingV2Context:
-    """Everything the identity stage of a routing decision may depend on.
+class NoTarget(Exception):
+    """Raised by a routing module's ``route`` when no target fits.
 
-    The admission rule is one line: a quantity may live here only if it is
-    already known when the model class is resolved *and* does not change for
-    the rest of the engine's life. Config shape, SM version, the parallel
-    mapping, the quant and speculative configs and the disagg flag all
-    qualify. Batch composition, ``num_contexts``, "is this step pure decode"
-    do not -- they move every forward, and a target selected from them would
-    be selected once and then be wrong.
-
-    That is a necessary condition, not a sufficient one. ``max_num_tokens``
-    and ``cuda_graph_config.max_batch_size`` are per-instance constants too,
-    but they are tuning knobs: they are LLM API arguments, not identity. Only
-    an instance constant that changes the *structure of the forward* earns a
-    target of its own. Knobs belong to the second stage: a target's
-    ``within_bounds`` reads the LLM API arguments directly and says whether
-    the deployment is one it was certified for.
-
-    ``is_disagg`` is declared but **not yet plumbed**: nothing sets it on
-    ``ModelConfig``, so it reads False in every deployment, disaggregated or
-    not. It is here so the field exists the day it is, and a claim test
-    forbids any routing module from reading it until then -- a branch on a
-    value that is always False would take the wrong side silently, which is
-    the failure this package's ``require`` mode exists to prevent. The useful
-    disagg dimension is the instance's ``ServerRole``, and that stops at the
-    server layer today; wiring it into ``LlmArgs`` is a prerequisite, not
-    part of this work.
+    The message says, in words, which fact ruled the targets out. Under
+    ``auto`` the resolver logs it and falls back to the built-in implementation;
+    under ``require`` it becomes the error the user sees.
     """
-
-    pretrained_config: Any
-    mapping: Any
-    sm: Tuple[int, int]
-    quant_config: Any
-    spec_config: Any
-    is_disagg: bool
-
-    @classmethod
-    def from_model_config(cls, config: "ModelConfig") -> "ModelingV2Context":
-        """Build the context the identity stage routes on, for the device
-        this process will run on."""
-        import torch
-
-        assert torch.cuda.is_available(), (
-            "modeling_v2 routes on the SM version of the device it will run on; "
-            "no CUDA device is visible"
-        )
-        sm = torch.cuda.get_device_capability()
-        return cls(
-            pretrained_config=config.pretrained_config,
-            mapping=config.mapping,
-            sm=sm,
-            quant_config=config.quant_config,
-            spec_config=config.spec_config,
-            is_disagg=getattr(config, "is_disagg", False),
-        )
-
-
-class Trace:
-    """Records the criteria a routing tree evaluated, for ``require``'s error.
-
-    Routing modules call ``check``/``resolve`` instead of a bare ``if`` so the
-    error can quote the criterion that did not hold. ``NULL_TRACE`` makes both
-    a no-op and is the default, so ``auto`` pays nothing.
-    """
-
-    __slots__ = ("steps",)
-
-    def __init__(self) -> None:
-        self.steps: List[Tuple[str, Any, Any]] = []
-
-    def check(self, label: str, value: Any, ok: bool) -> bool:
-        """Record a pass/fail criterion and return it unchanged."""
-        self.steps.append((label, value, ok or None))
-        return ok
-
-    def resolve(self, label: str, value: Any, outcome: Any) -> Any:
-        """Record a criterion that names something, and return that name."""
-        self.steps.append((label, value, outcome))
-        return outcome
-
-
-class _NullTrace(Trace):
-    __slots__ = ()
-
-    def __init__(self) -> None:  # no list to append to
-        pass
-
-    def check(self, label: str, value: Any, ok: bool) -> bool:
-        return ok
-
-    def resolve(self, label: str, value: Any, outcome: Any) -> Any:
-        return outcome
-
-
-NULL_TRACE = _NullTrace()
 
 
 def routing_module(arch: str):
@@ -174,14 +87,23 @@ def routing_module(arch: str):
     return import_module(f"{_PACKAGE}.{name}")
 
 
+def _device_compute_capability() -> Tuple[int, int]:
+    import torch
+
+    assert torch.cuda.is_available(), (
+        "modeling_v2 routes on the compute capability of the device it will run on; "
+        "no CUDA device is visible"
+    )
+    return torch.cuda.get_device_capability()
+
+
 def modeling_v2_resolve(config: "ModelConfig", llm_args: "TorchLlmArgs") -> Optional[str]:
     """Decide which modeling_v2 target, if any, this deployment builds.
 
     Returns the target's class name, or None for the built-in implementation:
     when ``llm_args.modeling_v2`` is ``off``, when no routing module claims the
-    architecture, when the identity tree names no target, or when that
-    target's ``within_bounds`` rejects the deployment. In ``require`` every one
-    of those but ``off`` raises instead.
+    architecture, or when the routing module's ``route`` raises ``NoTarget``.
+    In ``require`` every one of those but ``off`` raises ``ValueError`` instead.
     """
     mode = ModelingV2Mode.of(llm_args)
     if mode is ModelingV2Mode.OFF:
@@ -190,23 +112,24 @@ def modeling_v2_resolve(config: "ModelConfig", llm_args: "TorchLlmArgs") -> Opti
     pretrained_config = config.pretrained_config
     if not getattr(pretrained_config, "architectures", None):
         return None
-
-    ctx = ModelingV2Context.from_model_config(config)
     arch = pretrained_config.architectures[0]
-    trace = Trace() if mode is ModelingV2Mode.REQUIRE else NULL_TRACE
 
-    routing = routing_module(arch)
-    target = None if routing is None else routing.route(ctx, trace)
-    accepted = target is not None and routing.within_bounds(target, llm_args, ctx, trace)
-
-    if not accepted:
-        if mode is ModelingV2Mode.REQUIRE:
-            raise ValueError(no_match_message(arch, routing, trace, target))
-        if target is not None:
-            logger.info(
-                f"modeling_v2: {target} claims {arch} but this deployment is outside "
-                f"its bounds; using the built-in implementation"
+    try:
+        routing = routing_module(arch)
+        if routing is None:
+            known = ", ".join(sorted(MODELING_V2_ROUTERS)) or "(none)"
+            raise NoTarget(
+                f"no routing module for this architecture; routed architectures: {known}"
             )
+        target = routing.route(
+            pretrained_config, config.mapping, _device_compute_capability(), config.spec_config
+        )
+    except NoTarget as why:
+        if mode is ModelingV2Mode.REQUIRE:
+            raise ValueError(f"modeling_v2='require', but no target fits {arch!r}: {why}") from None
+        logger.info(
+            f"modeling_v2: no target fits {arch!r} ({why}); using the built-in implementation"
+        )
         return None
 
     # The synthetic name is only a registry key: importing the target module
@@ -214,28 +137,3 @@ def modeling_v2_resolve(config: "ModelConfig", llm_args: "TorchLlmArgs") -> Opti
     # static index does not, and must not, carry modeling_v2 names.
     import_module(f"{_PACKAGE}.{routing.TARGET_MODULES[target]}")
     return target
-
-
-def no_match_message(arch: str, routing, trace: Trace, target: Optional[str] = None) -> str:
-    """Say which criterion the configuration failed, not just that it did."""
-    asked = "modeling_v2='require'"
-    if routing is None:
-        known = ", ".join(sorted(MODELING_V2_ROUTERS)) or "(none)"
-        return f"{asked}, but no target exists for architecture {arch!r}; routed architectures: {known}"
-    where = routing.__name__.rpartition(".")[0].replace(".", "/") + "/routing.py"
-    if target is None:
-        lines = [
-            f"{asked}, but no target matched architecture {arch!r}. "
-            f"The decision tree in {where} got as far as:"
-        ]
-    else:
-        lines = [
-            f"{asked}, but {target} claims architecture {arch!r} and this deployment "
-            f"is outside its bounds. The decision tree in {where} got as far as:"
-        ]
-    for label, value, outcome in trace.steps:
-        mark = "no match" if outcome is None else f"-> {outcome}"
-        lines.append(f"  {label:<10} {value!r:<48} {mark}")
-    if not trace.steps:
-        lines.append("  (the tree rejected the configuration before its first recorded criterion)")
-    return "\n".join(lines)

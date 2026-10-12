@@ -16,10 +16,9 @@ Entry is a single LLM API argument::
 
 ``off`` (the default) is byte-for-byte today's behaviour: the resolver returns
 immediately and nothing in this package is imported. ``auto`` uses a target
-when one claims the configuration and the deployment is within that target's
-bounds, and falls back to the built-in implementation otherwise. ``require``
-raises instead of falling back -- see ``_router_index`` for why that mode is
-not optional.
+when one claims the configuration and falls back to the built-in
+implementation otherwise. ``require`` raises instead of falling back -- see
+``_router_index`` for why that mode is not optional.
 
 This package sits *beside* ``_torch/models/`` rather than inside it, which is
 load-bearing twice over: ``is_builtin_zoo_module`` matches on the zoo's
@@ -29,16 +28,11 @@ the zoo directory would not see these modules, so putting the synthetic names
 in the built-in static index would fail its staleness assertion.
 """
 
-from ._router_index import (
-    MODELING_V2_ROUTERS,
-    ModelingV2Context,
-    ModelingV2Mode,
-    modeling_v2_resolve,
-)
+from ._router_index import MODELING_V2_ROUTERS, ModelingV2Mode, NoTarget, modeling_v2_resolve
 
 __all__ = [
     "MODELING_V2_ROUTERS",
-    "ModelingV2Context",
     "ModelingV2Mode",
+    "NoTarget",
     "modeling_v2_resolve",
 ]

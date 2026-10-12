@@ -55,16 +55,15 @@ def test_no_routing_module_is_orphaned():
 
 
 @pytest.mark.parametrize("arch", _ARCHS)
-def test_targets_table_and_target_modules_agree(arch):
-    """Every name the tree can return must have a module that registers it."""
+def test_route_can_return_every_declared_target(arch):
+    """Every name TARGET_MODULES declares must appear in ``route``'s source as
+    the literal it returns; a declared target the tree never names is dead."""
     routing = routing_module(arch)
-    produced = set(routing._TARGETS.values())
-    declared = set(routing.TARGET_MODULES)
-    assert produced == declared, (
-        f"{arch}: _TARGETS yields {sorted(produced - declared)} with no "
-        f"TARGET_MODULES entry; TARGET_MODULES declares "
-        f"{sorted(declared - produced)} the tree cannot return"
-    )
+    source = _module_path(MODELING_V2_ROUTERS[arch]).read_text()
+    for name in routing.TARGET_MODULES:
+        assert source.count(f'"{name}"') >= 2, (
+            f"{arch}: route() never returns {name!r}, only TARGET_MODULES names it"
+        )
 
 
 @pytest.mark.parametrize("arch", _ARCHS)
@@ -87,17 +86,9 @@ def test_each_target_module_registers_its_own_name(arch):
 
 @pytest.mark.parametrize("arch", _ARCHS)
 def test_target_identity_matches_its_path(arch):
-    """Identity is the directory name: <checkpoint>__<gpu arch>__<parallel>.
-
-    The class name encodes the same triple, and the routing module's ``_SM``
-    has to be the arch segment those targets actually live under -- a target
-    moved to a new SM without its routing constant following is the one drift
-    that would still route, and route wrong.
-    """
+    """Identity is the directory name: <checkpoint>__<gpu arch>__<parallel>,
+    and the class name encodes the same triple."""
     routing = routing_module(arch)
-    major, minor = routing._SM
-    expected_segment = f"sm_{major}{minor}"
-
     for name, dotted in routing.TARGET_MODULES.items():
         parts = dotted.split(".")
         assert parts[-1] == "modeling", dotted
@@ -105,58 +96,14 @@ def test_target_identity_matches_its_path(arch):
         assert len(segments) == 3, (
             f"{arch}: {parts[-2]!r} is not a <checkpoint>__<sm>__<parallel> directory name"
         )
-        checkpoint, sm_segment, parallel = segments
-
-        assert sm_segment == expected_segment, (
-            f"{arch}: {name} lives under {sm_segment} but its routing module "
-            f"only ever matches {expected_segment}"
-        )
 
         def camel(segment: str) -> str:
             return "".join(w.capitalize() for w in segment.split("_"))
 
-        for segment in (checkpoint, sm_segment, parallel):
+        for segment in segments:
             assert camel(segment).lower() in name.lower(), (
                 f"{arch}: {name} does not carry path segment {segment!r}"
             )
-
-        assert (checkpoint, parallel) in routing._TARGETS, (
-            f"{arch}: no _TARGETS entry keyed ({checkpoint!r}, {parallel!r})"
-        )
-        assert routing._TARGETS[(checkpoint, parallel)] == name
-
-
-@pytest.mark.parametrize("arch", _ARCHS)
-def test_checkpoint_fingerprints_are_distinct(arch):
-    """Two checkpoints sharing a fingerprint would route to one target."""
-    routing = routing_module(arch)
-    names = list(routing._CHECKPOINTS.values())
-    assert len(names) == len(set(names)), f"{arch}: duplicate checkpoint names in _CHECKPOINTS"
-    assert set(names) == {c for c, _ in routing._TARGETS}, (
-        f"{arch}: _CHECKPOINTS and _TARGETS name different checkpoints"
-    )
-
-
-# Context fields a routing tree may not branch on yet, and what has to happen
-# before it can. A tree would otherwise decide silently on a value that is not
-# the deployment's -- the failure ``require`` exists to prevent. Delete a row
-# once its prerequisite is met.
-_UNREADABLE_CONTEXT_FIELDS = {
-    "is_disagg": (
-        "no caller sets it, so it reads False in every deployment, "
-        "disaggregated or not; plumb it onto ModelConfig first"
-    ),
-}
-
-
-@pytest.mark.parametrize("arch", _ARCHS)
-@pytest.mark.parametrize("field", sorted(_UNREADABLE_CONTEXT_FIELDS))
-def test_no_routing_module_reads_an_unplumbed_dimension(arch, field):
-    """A routing tree may only read what the engine actually fills."""
-    source = _module_path(MODELING_V2_ROUTERS[arch]).read_text()
-    assert field not in source, (
-        f"{arch}: routing reads ctx.{field}, but {_UNREADABLE_CONTEXT_FIELDS[field]}"
-    )
 
 
 def test_every_target_ships_both_products():

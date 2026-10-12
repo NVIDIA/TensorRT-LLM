@@ -2,84 +2,71 @@
 # SPDX-License-Identifier: Apache-2.0
 """Where a DeepseekV3ForCausalLM config lands. Read this file and you know.
 
-One forward-reading decision tree per architecture family: the criteria are
-evaluated in the order a reader would ask them, and every branch that does not
-end in a target returns None (in ``auto`` the engine then uses the built-in
-DeepseekV3 implementation; in ``require`` it raises, quoting the trace below).
+``route`` is one forward-reading decision: the facts that fix which code runs,
+compared against the deployments the targets below were written for. When none
+fits it raises ``NoTarget`` stating those facts. In ``auto`` the engine then
+uses the built-in DeepseekV3 implementation; in ``require`` it raises that
+error.
 """
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Optional
+from typing import Any, Optional, Tuple
 
-from ..._router_index import NULL_TRACE, ModelingV2Context, Trace
+from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig
 
-if TYPE_CHECKING:
-    from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
+from ..._router_index import NoTarget
 
-# The one GPU architecture these targets are written for. sm is part of a
-# target's identity, not a knob: a different SM is a different target.
-_SM = (10, 3)
-
-# Config-shape fingerprint -> checkpoint identity; see the note in the sibling
-# gpt_oss routing module for what shape-sniffing does and does not pin.
-#
-# (num_hidden_layers, hidden_size, n_routed_experts, q_lora_rank). q_lora_rank
-# is in the fingerprint because it changes the attention weight layout -- a
-# checkpoint that matched the first three and not this one would be a
-# different assembly, not a variant.
-_CHECKPOINTS = {
-    (61, 7168, 256, 1536): "r1_0528_nvfp4",
-    # (30, 2560, 72, 0): "v3_lite_nvfp4",   <- second batch
-}
-
-_TARGETS = {
-    ("r1_0528_nvfp4", "dep4"): "ModelingV2DeepseekR10528Nvfp4Sm103Dep4",
-}
-
-# Synthetic architecture name -> the module whose import registers it.
+# Target class name -> the module whose import registers it.
 TARGET_MODULES = {
     "ModelingV2DeepseekR10528Nvfp4Sm103Dep4": "models.deepseek_v3.r1_0528_nvfp4__sm_103__dep4.modeling",
 }
 
 
-def _parallel(m) -> Optional[str]:
-    """Name the parallel topology, or None if no target implements it.
-
-    This is a weight-layout question, which is why it selects a target rather
-    than a runtime branch: dep4 replicates attention across ranks and shards
-    only the experts, while tep4 (not in this batch) shards the attention
-    heads. The two load different weights into different shapes.
-    """
-    if m.world_size == 4 and m.moe_ep_size == 4 and m.moe_tp_size == 1 and m.enable_attention_dp:
-        return "dep4"
-    return None
-
-
-def route(ctx: ModelingV2Context, trace: Trace = NULL_TRACE) -> Optional[str]:
-    c, m = ctx.pretrained_config, ctx.mapping
-
-    if not trace.check("sm", ctx.sm, ctx.sm == _SM):
-        return None
-
-    shape = (c.num_hidden_layers, c.hidden_size, c.n_routed_experts, c.q_lora_rank)
-    ckpt = trace.resolve("shape", shape, _CHECKPOINTS.get(shape))
-    if ckpt is None:
-        return None
-
-    parallel = trace.resolve(
-        "parallel",
-        f"ws={m.world_size} ep={m.moe_ep_size} "
-        f"moe_tp={m.moe_tp_size} attention_dp={m.enable_attention_dp}",
-        _parallel(m),
+def route(
+    pretrained_config: Any,
+    mapping: Any,
+    compute_capability: Tuple[int, int],
+    spec_config: Optional[Any],
+) -> str:
+    """Name the target for this deployment, or raise ``NoTarget`` saying why none fits."""
+    # The checkpoint is recognized by its config shape; see the gpt_oss routing
+    # module for what shape-sniffing does and does not pin. q_lora_rank is in
+    # the shape because it changes the attention weight layout: a checkpoint
+    # matching the first three but not this one is a different assembly.
+    shape = (
+        pretrained_config.num_hidden_layers,
+        pretrained_config.hidden_size,
+        pretrained_config.n_routed_experts,
+        pretrained_config.q_lora_rank,
     )
-    if parallel is None:
-        return None
 
-    return _TARGETS.get((ckpt, parallel))
+    # dep4: attention replicated across the 4 ranks (attention DP), only the
+    # experts sharded. This is a weight-layout question, which is why it
+    # selects a target rather than a runtime branch: tep4 (not in this batch)
+    # shards the attention heads and loads different weights into different
+    # shapes.
+    dep4 = (
+        mapping.world_size == 4
+        and mapping.moe_ep_size == 4
+        and mapping.moe_tp_size == 1
+        and mapping.enable_attention_dp
+    )
 
+    # The target carries the checkpoint's own MTP module (layer 61) and no
+    # other draft path.
+    mtp_or_none = spec_config is None or isinstance(spec_config, MTPDecodingConfig)
 
-def within_bounds(
-    target: str, args: "TorchLlmArgs", ctx: ModelingV2Context, trace: Trace = NULL_TRACE
-) -> bool:
-    return True
+    # DeepSeek-R1-0528-NVFP4 on 4 GB300s (sm103), dep4, MTP or no speculation.
+    if compute_capability == (10, 3) and shape == (61, 7168, 256, 1536) and dep4 and mtp_or_none:
+        return "ModelingV2DeepseekR10528Nvfp4Sm103Dep4"
+
+    raise NoTarget(
+        f"compute capability {compute_capability}, config shape {shape}, "
+        f"world_size={mapping.world_size} moe_ep={mapping.moe_ep_size} "
+        f"moe_tp={mapping.moe_tp_size} attention_dp={mapping.enable_attention_dp}, "
+        f"speculative decoding "
+        f"{type(spec_config).__name__ if spec_config is not None else 'off'}; "
+        "the one deepseek_v3 target is DeepSeek-R1-0528-NVFP4 on sm103, dep4 "
+        "(4 ranks, expert-parallel MoE, attention DP), with MTP or no speculative decoding"
+    )

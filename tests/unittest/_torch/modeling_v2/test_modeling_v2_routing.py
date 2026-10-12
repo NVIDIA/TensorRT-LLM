@@ -14,9 +14,10 @@ The things worth proving:
 * a matching configuration reaches a target class, and that class is
   *external* -- so it wins the registry slot rather than losing it to the
   built-in provider, which the lazy zoo may import afterwards.
-* ``require`` raises on a near-miss and says which criterion missed.
-* a target's ``within_bounds`` has the last word: outside it, ``auto`` falls
-  back to the built-in implementation and ``require`` raises.
+* ``require`` raises on a near-miss and says, in words, which criterion
+  missed; ``auto`` falls back to the built-in implementation instead.
+* speculative decoding is an identity criterion: a target that does not
+  implement the requested mode does not claim the deployment.
 * ``AutoModelForCausalLM._resolve_class`` reads the decision off the
   ``ModelConfig`` rather than deciding again.
 """
@@ -30,24 +31,21 @@ import torch
 from pydantic import ValidationError
 from transformers import PretrainedConfig
 
-from tensorrt_llm._torch._experimental.modeling_v2._router_index import (
-    NULL_TRACE,
-    modeling_v2_resolve,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.models.gpt_oss import routing as gpt_oss_routing
+from tensorrt_llm._torch._experimental.modeling_v2._router_index import modeling_v2_resolve
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_auto import AutoModelForCausalLM
 from tensorrt_llm._torch.models.modeling_utils import (
     _is_builtin_model_class,
     get_registered_model_class,
 )
-from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
+from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig, NGramDecodingConfig, TorchLlmArgs
 from tensorrt_llm.mapping import Mapping
 
 _SM103 = (10, 3)
 _DUMMY_MODEL = "/tmp/dummy_model"
 _BUILTIN_GPT_OSS = "tensorrt_llm._torch.models.modeling_gpt_oss"
 _GPT_OSS_TARGET = "ModelingV2GptOss120bSm103Tp1"
+_R1_TARGET = "ModelingV2DeepseekR10528Nvfp4Sm103Dep4"
 
 
 @pytest.fixture(autouse=True)
@@ -93,9 +91,15 @@ def _llm_args(mode="auto", **kwargs) -> TorchLlmArgs:
     return TorchLlmArgs(model=_DUMMY_MODEL, modeling_v2=mode, **kwargs)
 
 
-def _model_config(pretrained_config, **mapping_kwargs):
+def _model_config(pretrained_config, spec_config=None, **mapping_kwargs):
     mapping = Mapping(**mapping_kwargs) if mapping_kwargs else Mapping()
-    return ModelConfig(pretrained_config=pretrained_config, mapping=mapping)
+    return ModelConfig(
+        pretrained_config=pretrained_config, mapping=mapping, spec_config=spec_config
+    )
+
+
+# A speculative mode no target implements.
+_NGRAM = NGramDecodingConfig(max_draft_len=3, max_matching_ngram_size=2)
 
 
 _DEP4 = dict(world_size=4, tp_size=4, moe_ep_size=4, moe_tp_size=1, enable_attention_dp=True)
@@ -130,7 +134,7 @@ def test_gpt_oss_tp1_matches(mode):
 @pytest.mark.parametrize("mode", ["auto", "require"])
 def test_r1_dep4_matches(mode):
     config = _model_config(_r1_config(), **_DEP4)
-    assert modeling_v2_resolve(config, _llm_args(mode)) == "ModelingV2DeepseekR10528Nvfp4Sm103Dep4"
+    assert modeling_v2_resolve(config, _llm_args(mode)) == _R1_TARGET
 
 
 def test_resolving_registers_the_target_class():
@@ -165,9 +169,9 @@ def test_resolve_class_reads_the_decision_off_the_config():
     "config_kwargs, mapping_kwargs, missed",
     [
         # a GptOss checkpoint of another size
-        (dict(num_hidden_layers=24, num_local_experts=32), {}, "shape"),
+        (dict(num_hidden_layers=24, num_local_experts=32), {}, r"shape \(24, 2880, 32\)"),
         # the right checkpoint, a topology no target implements
-        (dict(), dict(world_size=2, tp_size=2), "parallel"),
+        (dict(), dict(world_size=2, tp_size=2), "2 ranks"),
     ],
 )
 def test_gpt_oss_near_misses_do_not_match(config_kwargs, mapping_kwargs, missed):
@@ -192,8 +196,8 @@ def test_require_names_the_criterion_that_missed(monkeypatch):
     with pytest.raises(ValueError) as excinfo:
         modeling_v2_resolve(config, _llm_args("require"))
     message = str(excinfo.value)
-    assert "sm" in message and "(10, 0)" in message
-    assert "no match" in message
+    assert "no target fits" in message and "GptOssForCausalLM" in message
+    assert "compute capability (10, 0)" in message
 
 
 def test_an_unrouted_architecture_is_not_an_error_under_auto():
@@ -220,33 +224,32 @@ def test_an_unknown_mode_is_rejected_when_the_arguments_are_built():
         _llm_args("yes")
 
 
-# --- within_bounds: the target's certified deployment envelope -----------------
+# --- speculative decoding is an identity criterion ------------------------------
 
 
-def _outside(label, value):
-    """A ``within_bounds`` that rejects on one named criterion."""
-
-    def within_bounds(target, args, ctx, trace=NULL_TRACE):
-        return trace.check(label, value, False)
-
-    return within_bounds
-
-
-def test_outside_its_bounds_a_target_falls_back_under_auto(monkeypatch):
-    monkeypatch.setattr(gpt_oss_routing, "within_bounds", _outside("max_batch_size", 2048))
-    config = _model_config(_gpt_oss_config())
+def test_gpt_oss_with_speculative_decoding_falls_back_under_auto():
+    """The tp1 target implements no speculative path, so claiming the
+    deployment would trade a fallback for a crash inside the target."""
+    config = _model_config(_gpt_oss_config(), spec_config=_NGRAM)
     assert modeling_v2_resolve(config, _llm_args("auto")) is None
 
 
-def test_outside_its_bounds_a_target_raises_under_require(monkeypatch):
-    """Falling back silently would break the promise ``require`` makes, the
-    same way a missed identity criterion would -- so the error names the
-    target that claimed the configuration and the bound it failed."""
-    monkeypatch.setattr(gpt_oss_routing, "within_bounds", _outside("max_batch_size", 2048))
-    config = _model_config(_gpt_oss_config())
+def test_gpt_oss_with_speculative_decoding_raises_under_require():
+    config = _model_config(_gpt_oss_config(), spec_config=_NGRAM)
     with pytest.raises(ValueError) as excinfo:
         modeling_v2_resolve(config, _llm_args("require"))
     message = str(excinfo.value)
-    assert _GPT_OSS_TARGET in message
-    assert "bounds" in message
-    assert "max_batch_size" in message and "2048" in message
+    assert "NGramDecodingConfig" in message
+
+
+def test_r1_dep4_with_mtp_matches():
+    config = _model_config(_r1_config(), spec_config=MTPDecodingConfig(max_draft_len=3), **_DEP4)
+    assert modeling_v2_resolve(config, _llm_args("require")) == _R1_TARGET
+
+
+def test_r1_dep4_with_another_speculative_mode_does_not_match():
+    """The dep4 target carries the checkpoint's MTP module and nothing else."""
+    config = _model_config(_r1_config(), spec_config=_NGRAM, **_DEP4)
+    assert modeling_v2_resolve(config, _llm_args("auto")) is None
+    with pytest.raises(ValueError, match="MTP"):
+        modeling_v2_resolve(config, _llm_args("require"))

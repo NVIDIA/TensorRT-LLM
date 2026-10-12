@@ -25,8 +25,8 @@ modeling_v2: require
 | `modeling_v2` | Behaviour |
 |---|---|
 | `off` (default) | The resolver returns immediately. Nothing beyond it is imported and behaviour is byte-for-byte what it is today. |
-| `auto` | Uses a target when one claims this exact configuration *and* the deployment is within that target's bounds; falls back to the built-in implementation otherwise. |
-| `require` | Raises instead of falling back, naming the criterion -- identity or bound -- that did not hold. |
+| `auto` | Uses a target when one claims this exact configuration; falls back to the built-in implementation otherwise, logging why. |
+| `require` | Raises instead of falling back, saying which criterion did not hold. |
 
 It is an LLM API argument rather than an environment variable so that it
 reaches every rank the way the rest of the arguments do; a variable set after
@@ -34,12 +34,14 @@ MPI initialized reached the driver and not the workers, and a driver building
 a target while its workers build the built-in is exactly the split `require`
 exists to catch.
 
-The decision has two stages, both in the family's `routing.py`. `route` reads
-the configuration's *identity* -- checkpoint shape, GPU architecture, parallel
-topology -- and names a target. `within_bounds` then reads the *deployment* --
-the LLM API arguments it was configured with, `max_batch_size`,
-`max_num_tokens`, speculative decoding, anything the target's gates did or did
-not exercise -- and says whether the target was certified for it. The model
+The decision is one function, `route`, in the family's `routing.py`. It reads
+the facts that fix which code runs -- the checkpoint's config shape, the
+parallel mapping, the GPU's compute capability and the speculative-decoding
+config -- and either names a target or raises `NoTarget` with the reason in
+words. Tuning knobs such as `max_batch_size`, `max_num_tokens` and CUDA graph
+settings are not routing inputs: they do not change which code runs, so a
+target claims a configuration regardless of them. `require` therefore promises
+that the target ran, not that a particular knob setting was measured. The model
 loader decides when it is about to build the model, after the built-in model's
 defaults have been applied to the arguments, and carries the answer on
 `ModelConfig.modeling_v2_target`.
@@ -64,8 +66,8 @@ LLM(model=..., modeling_v2=...)  ->  ModelLoader
                                         +-- modeling_v2_resolve(config, llm_args)
                                               |
                     _router_index.py          +-- architectures[0] -> routing module
-                    models/<x>/routing.py     +-- route(ctx): identity -> target name
-                                              +-- within_bounds(target, llm_args, ctx)
+                    models/<x>/routing.py     +-- route(config, mapping, compute_capability,
+                                              |         spec_config) -> target name, or NoTarget
                                         |
                                      config.modeling_v2_target = name
                                         |
