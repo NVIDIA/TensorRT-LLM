@@ -1838,6 +1838,11 @@ class DFlashForCausalLM(nn.Module):
                     cache_batch_idx=cache_batch_idx_i32,
                     causal=causal,
                     window_size=window_size,
+                    # FA2's default heuristic sizes splits from k_cache.size(1),
+                    # the max_seq_len-dense arena, not the live context, so long
+                    # contexts run on split 0 with a few CTAs. A fixed count is
+                    # CUDA-graph safe; splits past the live length exit early.
+                    num_splits=128,
                 )
                 if pack_gqa:
                     # Undo the packing: [B, group*blk, h_kv, d] -> [B, blk, h_q, d].
