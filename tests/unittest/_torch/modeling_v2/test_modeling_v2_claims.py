@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""The routing tables and the targets they name must not drift apart.
+"""The routing modules and the target directories they import must not drift apart.
 
 Everything here is read off disk as text -- no target module is imported, so
 this runs anywhere, including a CI machine with no GPU and no built
@@ -41,6 +41,19 @@ def _module_path(dotted: str) -> Path:
     return _ROOT / (dotted.replace(".", "/") + ".py")
 
 
+# ``route`` hands back the class itself, imported from the target directory
+# right where it is returned. That import line is the one place a family's
+# routing module names its targets, so it is what these tests read.
+_TARGET_IMPORT = re.compile(r"^\s*from \.(\w+)\.modeling import (\w+)$", re.MULTILINE)
+
+
+def _routed_targets(arch: str):
+    """(target directory, class name) for every target ``route`` can return."""
+    source = _module_path(MODELING_V2_ROUTERS[arch]).read_text()
+    family_dir = _module_path(MODELING_V2_ROUTERS[arch]).parent
+    return [(family_dir / target, name) for target, name in _TARGET_IMPORT.findall(source)]
+
+
 def test_every_routed_architecture_has_an_importable_routing_module():
     for arch in _ARCHS:
         assert routing_module(arch) is not None, arch
@@ -57,46 +70,27 @@ def test_no_routing_module_is_orphaned():
 
 
 @pytest.mark.parametrize("arch", _ARCHS)
-def test_route_can_return_every_declared_target(arch):
-    """Every name TARGET_MODULES declares must appear in ``route``'s source as
-    the literal it returns; a declared target the tree never names is dead."""
-    routing = routing_module(arch)
-    source = _module_path(MODELING_V2_ROUTERS[arch]).read_text()
-    for name in routing.TARGET_MODULES:
-        assert source.count(f'"{name}"') >= 2, (
-            f"{arch}: route() never returns {name!r}, only TARGET_MODULES names it"
-        )
-
-
-@pytest.mark.parametrize("arch", _ARCHS)
-def test_each_target_module_registers_its_own_name(arch):
-    """The synthetic name is only a registry key -- the module must fill it.
-
-    Nothing else can: the built-in static index does not carry modeling_v2
-    names, so a target whose decorator says something different resolves to
-    None and the engine reports an unknown architecture.
-    """
-    routing = routing_module(arch)
-    for name, dotted in routing.TARGET_MODULES.items():
-        path = _module_path(dotted)
-        assert path.is_file(), f"{arch}: {name} -> missing {path}"
-        source = path.read_text()
-        assert f'@register_auto_model("{name}")' in source, (
-            f"{arch}: {path.relative_to(_ROOT)} does not register {name!r}"
-        )
+def test_no_target_directory_is_orphaned(arch):
+    """A target directory ``route`` never imports from is dead code: nothing
+    else can reach it."""
+    family_dir = _module_path(MODELING_V2_ROUTERS[arch]).parent
+    on_disk = {p.parent for p in family_dir.glob("*/modeling.py")}
+    routed = {target_dir for target_dir, _ in _routed_targets(arch)}
+    assert on_disk == routed, (
+        f"{arch}: target directories route() never imports: "
+        f"{sorted(p.name for p in on_disk - routed)}; imports with no directory: "
+        f"{sorted(p.name for p in routed - on_disk)}"
+    )
 
 
 @pytest.mark.parametrize("arch", _ARCHS)
 def test_target_identity_matches_its_path(arch):
     """Identity is the directory name: <checkpoint>__<gpu arch>__<parallel>,
     and the class name encodes the same triple."""
-    routing = routing_module(arch)
-    for name, dotted in routing.TARGET_MODULES.items():
-        parts = dotted.split(".")
-        assert parts[-1] == "modeling", dotted
-        segments = parts[-2].split("__")
+    for target_dir, name in _routed_targets(arch):
+        segments = target_dir.name.split("__")
         assert len(segments) == 3, (
-            f"{arch}: {parts[-2]!r} is not a <checkpoint>__<sm>__<parallel> directory name"
+            f"{arch}: {target_dir.name!r} is not a <checkpoint>__<sm>__<parallel> directory name"
         )
 
         def camel(segment: str) -> str:
@@ -123,9 +117,7 @@ def test_every_target_ships_both_products():
     rather than by a reader.
     """
     for arch in _ARCHS:
-        routing = routing_module(arch)
-        for name, dotted in routing.TARGET_MODULES.items():
-            target_dir = _module_path(dotted).parent
+        for target_dir, name in _routed_targets(arch):
             for product in ("modeling.py", "weights.py"):
                 assert (target_dir / product).is_file(), f"{name}: missing {product}"
 
@@ -138,9 +130,7 @@ def test_targets_do_not_share_files():
     the abstraction this package exists to avoid.
     """
     for arch in _ARCHS:
-        routing = routing_module(arch)
-        for name, dotted in routing.TARGET_MODULES.items():
-            target_dir = _module_path(dotted).parent
+        for target_dir, name in _routed_targets(arch):
             for source_file in target_dir.glob("*.py"):
                 text = source_file.read_text()
                 for match in re.finditer(r"^from (\.+)([\w.]*) import", text, re.MULTILINE):

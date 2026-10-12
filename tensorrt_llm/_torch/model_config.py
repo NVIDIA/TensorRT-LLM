@@ -317,9 +317,9 @@ class ModelConfig(Generic[TConfig]):
     # Multimodal model configuration, e.g. vision encoder CUDA graph buckets.
     multimodal_config: MultimodalConfig | None = None
 
-    # Class name of the modeling_v2 target to build, or None for the built-in
+    # The modeling_v2 target class to build, or None for the built-in
     # implementation. Set by the model loader, read by `_resolve_class`.
-    modeling_v2_target: Optional[str] = None
+    modeling_v2_target: Optional[type] = None
 
     def __setattr__(self, key, value):
         """

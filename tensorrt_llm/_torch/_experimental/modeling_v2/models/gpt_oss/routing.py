@@ -14,19 +14,18 @@ from typing import Any, Optional, Tuple
 
 from ..._router_index import NoTarget
 
-# Target class name -> the module whose import registers it.
-TARGET_MODULES = {
-    "ModelingV2GptOss120bSm103Tp1": "models.gpt_oss.gpt_oss_120b__sm_103__tp1.modeling",
-}
-
 
 def route(
     pretrained_config: Any,
     mapping: Any,
     compute_capability: Tuple[int, int],
     spec_config: Optional[Any],
-) -> str:
-    """Name the target for this deployment, or raise ``NoTarget`` saying why none fits."""
+) -> type:
+    """Return the target class for this deployment, or raise ``NoTarget`` saying why none fits.
+
+    Each target is imported where it is returned, so declining costs no import
+    of modeling code.
+    """
     # The checkpoint is recognized by its config shape, the upstream idiom
     # (``is_mla``, ``is_nemotron_hybrid`` do the same). A fine-tune with the
     # same shape routes here too; the accuracy gate is what pins the identity.
@@ -47,7 +46,9 @@ def route(
         and mapping.world_size == 1
         and spec_config is None
     ):
-        return "ModelingV2GptOss120bSm103Tp1"
+        from .gpt_oss_120b__sm_103__tp1.modeling import ModelingV2GptOss120bSm103Tp1
+
+        return ModelingV2GptOss120bSm103Tp1
 
     raise NoTarget(
         f"compute capability {compute_capability}, config shape {shape}, "

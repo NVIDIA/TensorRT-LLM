@@ -37,8 +37,8 @@ exists to catch.
 The decision is one function, `route`, in the family's `routing.py`. It reads
 the facts that fix which code runs -- the checkpoint's config shape, the
 parallel mapping, the GPU's compute capability and the speculative-decoding
-config -- and either names a target or raises `NoTarget` with the reason in
-words. Tuning knobs such as `max_batch_size`, `max_num_tokens` and CUDA graph
+config -- and either returns a target class or raises `NoTarget` with the
+reason in words. Tuning knobs such as `max_batch_size`, `max_num_tokens` and CUDA graph
 settings are not routing inputs: they do not change which code runs, so a
 target claims a configuration regardless of them. `require` therefore promises
 that the target ran, not that a particular knob setting was measured. The model
@@ -67,20 +67,20 @@ LLM(model=..., modeling_v2=...)  ->  ModelLoader
                                               |
                     _router_index.py          +-- architectures[0] -> routing module
                     models/<x>/routing.py     +-- route(config, mapping, compute_capability,
-                                              |         spec_config) -> target name, or NoTarget
+                                              |         spec_config) -> target class, or NoTarget
                                         |
-                                     config.modeling_v2_target = name
+                                     config.modeling_v2_target = class
                                         |
                     AutoModelForCausalLM._resolve_class(config)
                                         |
-                                     get_registered_model_class(name)
+                                     returns that class; the registry is not consulted
 ```
 
-The synthetic name (`ModelingV2GptOss120bSm103Tp1`) is a registry key that no
-checkpoint declares. Upstream already does exactly this for `EAGLE3<Arch>`,
-which also exists only as a `_resolve_class` rewrite.
+`route` imports the target class on the branch that returns it, so a routing
+module that declines never loads modeling code, and the class a reader sees
+returned is the class that runs -- no name to look up elsewhere.
 
-### What may decide a target
+## What may decide a target
 
 A quantity may be a routing criterion only if it is known when
 `_resolve_class` runs **and** constant for the engine's life — and only if it
@@ -119,7 +119,7 @@ The third piece of a catalog entry, its GPU test, lives in the tests tree:
 
 ```
 tests/unittest/_torch/modeling_v2/
-  test_modeling_v2_claims.py     routing tables vs the targets they name (no GPU)
+  test_modeling_v2_claims.py     routing modules vs the target directories they import (no GPU)
   test_modeling_v2_routing.py    what modeling_v2_resolve does (no GPU)
   <category>/test_modeling_v2_<entry>.py
   comm/_<entry>_op_matrix.py   the two collectives' 4-rank rank bodies
@@ -147,15 +147,10 @@ carries the same triple; `test_modeling_v2_claims.py` asserts they agree.
 
 ### Why beside `_torch/models/`, not inside it
 
-Two upstream mechanisms, and together they are the worst combination —
-inheriting the built-in constraints without inheriting the built-in guards:
-
-* `is_builtin_zoo_module` matches on the zoo's package prefix. Inside it,
-  modeling_v2 registrations would count as built-in and only fill *empty*
-  registry slots. Outside it they are external and always win their slot.
-* `test_lazy_model_zoo.py`'s scan of the zoo directory is **non-recursive**,
-  so decorators in a subpackage are invisible to it — putting synthetic names
-  in the built-in static index would fail its staleness assertion.
+Targets are not registered in the model zoo: `route` returns the class and the
+loader builds it. Inside `_torch/models/` they would still be swept up by the
+zoo's own guards -- `test_lazy_model_zoo.py` scans that directory and expects
+every modeling module there to appear in the built-in static index.
 
 Conceptually `models/` means "one architecture, one class, shared across
 checkpoints", which is the opposite of what this package is for.

@@ -20,12 +20,10 @@ when one claims the configuration and falls back to the built-in
 implementation otherwise. ``require`` raises instead of falling back -- see
 ``_router_index`` for why that mode is not optional.
 
-This package sits *beside* ``_torch/models/`` rather than inside it, which is
-load-bearing twice over: ``is_builtin_zoo_module`` matches on the zoo's
-package prefix, so registrations from here count as external and always win
-their architecture slot; and ``test_lazy_model_zoo``'s non-recursive scan of
-the zoo directory would not see these modules, so putting the synthetic names
-in the built-in static index would fail its staleness assertion.
+This package sits *beside* ``_torch/models/`` rather than inside it. Targets
+are not registered in the model zoo at all: ``route`` returns the class and the
+loader builds it, so nothing here competes for an architecture slot and the
+zoo's static index never has to know these classes exist.
 """
 
 from ._router_index import MODELING_V2_ROUTERS, ModelingV2Mode, NoTarget, modeling_v2_resolve

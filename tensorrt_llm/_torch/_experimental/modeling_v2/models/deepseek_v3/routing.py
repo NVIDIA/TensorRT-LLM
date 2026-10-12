@@ -17,19 +17,18 @@ from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig
 
 from ..._router_index import NoTarget
 
-# Target class name -> the module whose import registers it.
-TARGET_MODULES = {
-    "ModelingV2DeepseekR10528Nvfp4Sm103Dep4": "models.deepseek_v3.r1_0528_nvfp4__sm_103__dep4.modeling",
-}
-
 
 def route(
     pretrained_config: Any,
     mapping: Any,
     compute_capability: Tuple[int, int],
     spec_config: Optional[Any],
-) -> str:
-    """Name the target for this deployment, or raise ``NoTarget`` saying why none fits."""
+) -> type:
+    """Return the target class for this deployment, or raise ``NoTarget`` saying why none fits.
+
+    Each target is imported where it is returned, so declining costs no import
+    of modeling code.
+    """
     # The checkpoint is recognized by its config shape; see the gpt_oss routing
     # module for what shape-sniffing does and does not pin. q_lora_rank is in
     # the shape because it changes the attention weight layout: a checkpoint
@@ -59,7 +58,9 @@ def route(
 
     # DeepSeek-R1-0528-NVFP4 on 4 GB300s (sm103), dep4, MTP or no speculation.
     if compute_capability == (10, 3) and shape == (61, 7168, 256, 1536) and dep4 and mtp_or_none:
-        return "ModelingV2DeepseekR10528Nvfp4Sm103Dep4"
+        from .r1_0528_nvfp4__sm_103__dep4.modeling import ModelingV2DeepseekR10528Nvfp4Sm103Dep4
+
+        return ModelingV2DeepseekR10528Nvfp4Sm103Dep4
 
     raise NoTarget(
         f"compute capability {compute_capability}, config shape {shape}, "

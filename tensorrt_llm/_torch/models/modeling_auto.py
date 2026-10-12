@@ -35,8 +35,6 @@ class AutoModelForCausalLM(Generic[TModel, TConfig]):
                                             "")  # Strip the appended EAGLE3
             model_arch = "EAGLE3" + model_arch
 
-        # ModelingV2 targets are keyed by a synthetic architecture name that no
-        # checkpoint declares -- the same shape as the Eagle3 rewrite above.
         # Set by the model loader when a modeling_v2 target claims this
         # deployment; None leaves the default path unchanged.
         #
@@ -49,7 +47,7 @@ class AutoModelForCausalLM(Generic[TModel, TConfig]):
         # checkpoint matches a target's shape fingerprint -- so this note is
         # the contract, not a description of observed behaviour.
         if config.modeling_v2_target is not None:
-            model_arch = config.modeling_v2_target
+            return config.modeling_v2_target
 
         return get_registered_model_class(model_arch)
 

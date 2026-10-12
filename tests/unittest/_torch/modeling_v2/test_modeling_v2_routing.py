@@ -11,9 +11,9 @@ The things worth proving:
 
 * ``off`` changes nothing. This is the whole safety argument for making the
   decision in the model loader at all.
-* a matching configuration reaches a target class, and that class is
-  *external* -- so it wins the registry slot rather than losing it to the
-  built-in provider, which the lazy zoo may import afterwards.
+* a matching configuration resolves to the target class itself, imported
+  from its own directory; no registry lookup stands between the decision and
+  the class.
 * ``require`` raises on a near-miss and says, in words, which criterion
   missed; ``auto`` falls back to the built-in implementation instead.
 * speculative decoding is an identity criterion: a target that does not
@@ -34,10 +34,6 @@ from transformers import PretrainedConfig
 from tensorrt_llm._torch._experimental.modeling_v2._router_index import modeling_v2_resolve
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_auto import AutoModelForCausalLM
-from tensorrt_llm._torch.models.modeling_utils import (
-    _is_builtin_model_class,
-    get_registered_model_class,
-)
 from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig, NGramDecodingConfig, TorchLlmArgs
 from tensorrt_llm.mapping import Mapping
 
@@ -46,8 +42,15 @@ pytestmark = pytest.mark.cpu_only
 _SM103 = (10, 3)
 _DUMMY_MODEL = "/tmp/dummy_model"
 _BUILTIN_GPT_OSS = "tensorrt_llm._torch.models.modeling_gpt_oss"
-_GPT_OSS_TARGET = "ModelingV2GptOss120bSm103Tp1"
-_R1_TARGET = "ModelingV2DeepseekR10528Nvfp4Sm103Dep4"
+_GPT_OSS_TARGET = "models.gpt_oss.gpt_oss_120b__sm_103__tp1.modeling.ModelingV2GptOss120bSm103Tp1"
+_R1_TARGET = (
+    "models.deepseek_v3.r1_0528_nvfp4__sm_103__dep4.modeling.ModelingV2DeepseekR10528Nvfp4Sm103Dep4"
+)
+
+
+def _qualified(target) -> str:
+    """``models.<family>.<dir>.modeling.<Class>`` for a resolved target class."""
+    return f"{target.__module__.split('.modeling_v2.')[1]}.{target.__name__}"
 
 
 @pytest.fixture(autouse=True)
@@ -130,41 +133,22 @@ def test_off_still_reaches_the_builtin_implementation():
 @pytest.mark.parametrize("mode", ["auto", "require"])
 def test_gpt_oss_tp1_matches(mode):
     config = _model_config(_gpt_oss_config())
-    assert modeling_v2_resolve(config, _llm_args(mode)) == _GPT_OSS_TARGET
+    assert _qualified(modeling_v2_resolve(config, _llm_args(mode))) == _GPT_OSS_TARGET
 
 
 @pytest.mark.parametrize("mode", ["auto", "require"])
 def test_r1_dep4_matches(mode):
     config = _model_config(_r1_config(), **_DEP4)
-    assert modeling_v2_resolve(config, _llm_args(mode)) == _R1_TARGET
-
-
-def test_resolving_registers_the_target_class():
-    """The synthetic name is a key; the import behind it is what fills it."""
-    config = _model_config(_gpt_oss_config())
-    name = modeling_v2_resolve(config, _llm_args())
-    cls = get_registered_model_class(name)
-    assert cls is not None, f"{name} resolved to no class"
-    assert cls.__name__ == name
-    assert cls.__module__.endswith("modeling_v2.models.gpt_oss.gpt_oss_120b__sm_103__tp1.modeling")
-
-
-def test_the_target_registration_counts_as_external():
-    """External registrations always win their slot; built-ins only fill
-    empty ones. Living beside the zoo rather than inside it is what buys
-    this, and a move into _torch/models/ would silently reverse it."""
-    config = _model_config(_gpt_oss_config())
-    cls = get_registered_model_class(modeling_v2_resolve(config, _llm_args()))
-    assert not _is_builtin_model_class(cls)
+    assert _qualified(modeling_v2_resolve(config, _llm_args(mode))) == _R1_TARGET
 
 
 def test_resolve_class_reads_the_decision_off_the_config():
-    """The loader decides and writes the result on the ModelConfig; the class
+    """The loader decides and writes the class on the ModelConfig; the class
     lookup only has to honour it."""
     config = _model_config(_gpt_oss_config())
     target = modeling_v2_resolve(config, _llm_args())
     decided = replace(config, modeling_v2_target=target)
-    assert AutoModelForCausalLM._resolve_class(decided).__name__ == target
+    assert AutoModelForCausalLM._resolve_class(decided) is target
 
 
 @pytest.mark.parametrize(
@@ -246,7 +230,7 @@ def test_gpt_oss_with_speculative_decoding_raises_under_require():
 
 def test_r1_dep4_with_mtp_matches():
     config = _model_config(_r1_config(), spec_config=MTPDecodingConfig(max_draft_len=3), **_DEP4)
-    assert modeling_v2_resolve(config, _llm_args("require")) == _R1_TARGET
+    assert _qualified(modeling_v2_resolve(config, _llm_args("require"))) == _R1_TARGET
 
 
 def test_r1_dep4_with_another_speculative_mode_does_not_match():

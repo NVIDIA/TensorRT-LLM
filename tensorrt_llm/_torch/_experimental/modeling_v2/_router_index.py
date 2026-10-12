@@ -2,17 +2,12 @@
 # SPDX-License-Identifier: Apache-2.0
 """Architecture name -> routing module, and the resolver that reads the table.
 
-ModelingV2 targets are keyed by a *synthetic* architecture name that no
-checkpoint declares. The checkpoint's own ``architectures[0]`` stays what it
-always was (``GptOssForCausalLM``, ``DeepseekV3ForCausalLM``), so it cannot
-also be the target selector; ``modeling_v2_resolve`` decides on the synthetic
-name, the model loader records it on ``ModelConfig.modeling_v2_target``, and
-``AutoModelForCausalLM._resolve_class`` then looks that up in the ordinary
-registry.
-
-The pattern is upstream's own: the Eagle3 rewrite in ``_resolve_class`` builds
-``EAGLE3<Arch>`` the same way -- a name no config.json declares, reached only
-through that rewrite.
+The checkpoint's own ``architectures[0]`` (``GptOssForCausalLM``,
+``DeepseekV3ForCausalLM``) selects a routing module, never a target: one
+architecture has many deployments and a target serves exactly one of them.
+``modeling_v2_resolve`` returns the target *class*, the model loader records it
+on ``ModelConfig.modeling_v2_target``, and ``AutoModelForCausalLM._resolve_class``
+builds that class instead of the registry's.
 
 Two levels, on purpose:
 
@@ -23,7 +18,7 @@ Two levels, on purpose:
 * The routing module's ``route`` owns the rest of the decision as one
   forward-reading tree over the facts that fix which code runs: the
   checkpoint's config, the parallel mapping, the GPU's compute capability and
-  the speculative-decoding config. It returns a target name, or raises
+  the speculative-decoding config. It returns the target class, or raises
   :class:`NoTarget` with the reason in words. Reading that one file tells you
   where any configuration lands.
 
@@ -33,8 +28,8 @@ target claims a configuration regardless of them; ``require`` promises that the
 target ran, not that a particular knob setting was measured.
 
 Routing modules are imported lazily: resolving a GptOss config never imports
-the DeepSeek tree, and a target's modeling code is imported only once its
-routing module has named it.
+the DeepSeek tree, and a target's modeling code is imported only on the
+``route`` branch that returns it.
 """
 
 from __future__ import annotations
@@ -97,10 +92,10 @@ def _device_compute_capability() -> Tuple[int, int]:
     return torch.cuda.get_device_capability()
 
 
-def modeling_v2_resolve(config: "ModelConfig", llm_args: "TorchLlmArgs") -> Optional[str]:
+def modeling_v2_resolve(config: "ModelConfig", llm_args: "TorchLlmArgs") -> Optional[type]:
     """Decide which modeling_v2 target, if any, this deployment builds.
 
-    Returns the target's class name, or None for the built-in implementation:
+    Returns the target class, or None for the built-in implementation:
     when ``llm_args.modeling_v2`` is ``off``, when no routing module claims the
     architecture, or when the routing module's ``route`` raises ``NoTarget``.
     In ``require`` every one of those but ``off`` raises ``ValueError`` instead.
@@ -121,7 +116,7 @@ def modeling_v2_resolve(config: "ModelConfig", llm_args: "TorchLlmArgs") -> Opti
             raise NoTarget(
                 f"no routing module for this architecture; routed architectures: {known}"
             )
-        target = routing.route(
+        return routing.route(
             pretrained_config, config.mapping, _device_compute_capability(), config.spec_config
         )
     except NoTarget as why:
@@ -131,9 +126,3 @@ def modeling_v2_resolve(config: "ModelConfig", llm_args: "TorchLlmArgs") -> Opti
             f"modeling_v2: no target fits {arch!r} ({why}); using the built-in implementation"
         )
         return None
-
-    # The synthetic name is only a registry key: importing the target module
-    # is what puts the class behind it. Nothing else would -- the built-in
-    # static index does not, and must not, carry modeling_v2 names.
-    import_module(f"{_PACKAGE}.{routing.TARGET_MODULES[target]}")
-    return target
