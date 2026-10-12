@@ -1572,6 +1572,7 @@ class Sender(SenderBase):
         if not self._admit_kv_write(session, task):
             self._refuse_kv_write(task, write_meta)
             return
+        holds_admission = not owned
         try:
             from .bounce import build_send_request, encode_result_tail
 
@@ -1594,6 +1595,10 @@ class Sender(SenderBase):
                     )
                     if owned:
                         task.retire_unsubmitted_physical_operation(write_meta.peer_rank)
+                    else:
+                        # Release before reporting: the worker DEALER send can block indefinitely.
+                        holds_admission = False
+                        task.finish_write()
                     task.fail(RuntimeError(f"build_send_request failed: {e}"))
                     self._report_kv_failed(write_meta)
                     return
@@ -1638,7 +1643,7 @@ class Sender(SenderBase):
             if timer:
                 timer.record_transfer_end(write_meta.peer_rank)
         finally:
-            if not owned:
+            if holds_admission:
                 task.finish_write()
 
         # Report every chunk so failures reach the receiver immediately.
@@ -1748,6 +1753,7 @@ class Sender(SenderBase):
         if not self._admit_aux_write(aux_task):
             self._refuse_aux_write(aux_task, write_meta)
             return
+        holds_admission = not owned
         try:
             agent_result = AgentResult.SUCCESS
             if write_meta.src_ptrs.size > 0:
@@ -1760,6 +1766,10 @@ class Sender(SenderBase):
                     )
                     if owned:
                         aux_task.retire_unsubmitted_physical_operation(write_meta.peer_rank)
+                    else:
+                        # Release before reporting: the worker DEALER send can block indefinitely.
+                        holds_admission = False
+                        aux_task.finish_write()
                     aux_task.fail(RuntimeError(f"build aux transfer request failed: {error}"))
                     # An admitted operation normally makes this worker the only
                     # eligible claimant. Keep the claim at the send boundary so
@@ -1792,7 +1802,7 @@ class Sender(SenderBase):
             elif owned:
                 aux_task.retire_unsubmitted_physical_operation(write_meta.peer_rank)
         finally:
-            if not owned:
+            if holds_admission:
                 aux_task.finish_write()
 
         # An admitted operation normally makes this worker the only eligible

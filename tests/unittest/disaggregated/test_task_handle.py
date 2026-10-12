@@ -918,6 +918,43 @@ def test_failed_session_keeps_its_source_until_another_peer_write_returns(
     assert not session.has_transferring_tasks()
 
 
+@pytest.mark.parametrize("write_kind", ["kv", "aux"])
+def test_unbuilt_write_releases_its_source_before_reporting_the_failure(
+    monkeypatch, write_kind: str
+) -> None:
+    """A FAILED report blocked on a full DEALER must not keep teardown from freeing the source."""
+    report_started, release_report = threading.Event(), threading.Event()
+
+    def blocked_send(_message) -> None:
+        report_started.set()
+        release_report.wait(timeout=10)
+
+    sender, session, kv_task = _deliverable_slice(monkeypatch, wait=lambda: True)
+    monkeypatch.setattr(
+        Sender, "_make_agent_request", MagicMock(side_effect=RuntimeError("bad descriptors"))
+    )
+    sender._get_or_connect_thread_dealer.return_value.send.side_effect = blocked_send
+    if write_kind == "kv":
+        deliver, task = sender._deliver_kv_to_agent, kv_task
+        write = _peer_write(task, peer_rank=1)
+    else:
+        deliver, task = sender._deliver_aux_to_agent, session.send_aux()
+        write = _peer_write(task, peer_rank=1, meta_type=WriteMetaType.AUX)
+    writer = threading.Thread(target=deliver, args=(write,), daemon=True)
+    writer.start()
+    try:
+        assert report_started.wait(timeout=10)
+        assert session.has_failed()
+        assert not session.has_transferring_tasks()
+    finally:
+        release_report.set()
+        writer.join(timeout=10)
+    assert not writer.is_alive()
+    sender._agent.submit_transfer_requests.assert_not_called()
+    # Released exactly once: a negative count would hide another peer's in-flight write.
+    assert task._admitted_writes_in_flight == 0
+
+
 @pytest.mark.parametrize("poll_before_completion", [False, True])
 def test_sender_sibling_failure_is_stable_across_late_completion(
     poll_before_completion: bool,
