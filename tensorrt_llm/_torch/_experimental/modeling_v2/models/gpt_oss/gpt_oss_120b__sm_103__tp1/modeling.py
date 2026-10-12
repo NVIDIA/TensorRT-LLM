@@ -16,7 +16,7 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
-from tensorrt_llm._torch._experimental.modeling_v2._target import Phase, Target, phase_of
+from tensorrt_llm._torch._experimental.modeling_v2._router_index import step_contract_enabled
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.thop_attention import (
     thop_attention,
 )
@@ -167,8 +167,8 @@ class GptOssTp1ModelingV2(DecoderModel):
         self.fc2_rows_pad = d.fc2_rows_pad
         self.w = _weights.MODEL_WEIGHTS.declare(d)
 
-        self._prefill: Target | None = None
-        self._decode: Target | None = None
+        self._prefill: "PrefillTarget | None" = None
+        self._decode: "DecodeTarget | None" = None
 
     def post_load_weights(self) -> None:
         """Construct the two targets, now that the weights are real.
@@ -219,9 +219,16 @@ class GptOssTp1ModelingV2(DecoderModel):
             yarn_attn_factor=yarn_attn_factor,
         )
 
-    def _select_target(self, attn_metadata) -> Target:
-        """Which target runs this step."""
-        return self._decode if phase_of(attn_metadata) is Phase.DECODE else self._prefill
+    def _select_target(self, attn_metadata) -> "PrefillTarget | DecodeTarget":
+        """Which target runs this step.
+
+        One host-side integer read and nothing else: a decode-only CUDA graph is a
+        per-capture constant environment, and a predicate that reached for a second field
+        would be reading one this call is not guaranteed to carry. A mixed batch -- context
+        and generation rows in one step -- goes to prefill, so prefill is the general case
+        and decode the specialization that may assume it has no context rows.
+        """
+        return self._decode if attn_metadata.num_contexts == 0 else self._prefill
 
     def forward(
         self,
@@ -233,7 +240,7 @@ class GptOssTp1ModelingV2(DecoderModel):
         return self._select_target(attn_metadata).forward(attn_metadata, *args, **kwargs)
 
 
-class PrefillTarget(Target):
+class PrefillTarget:
     """The general case: context rows, and possibly generation rows beside them."""
 
     def __init__(
@@ -246,7 +253,11 @@ class PrefillTarget(Target):
         yarn_attn_factor: float,
     ) -> None:
         """Take the views and constants this target's forward reads, once, off the real weights."""
-        super().__init__(core)
+        self.core = core
+        # Off unless TRTLLM_MODELING_V2_VALIDATE asks for it; read once here rather than per
+        # forward. Each target owns its own flag: the two `step_args` projections differ,
+        # so probing one does not prove the other's fields exist.
+        self._contract_pending = step_contract_enabled()
         cfg = core.model_config.pretrained_config
         w = core.w
         device = w["final_norm"].device
@@ -265,6 +276,21 @@ class PrefillTarget(Target):
         self._glu_alpha, self._glu_beta, self._glu_limit = glu_vectors(
             cfg.num_local_experts, cfg.swiglu_limit, device
         )
+
+    def _check_step_contract(self, md) -> None:
+        """Opt-in first-forward fail-fast, run when TRTLLM_MODELING_V2_VALIDATE asks for it:
+        the metadata fields this target consumes must exist (they are private trtllm
+        surface). Calling `step_args` is the check -- it reads every field this target
+        consumes, so a rename upstream surfaces here rather than mid-forward. Everything
+        checked is fixed at engine construction, so once per target instance is sound,
+        and it is off in a served engine."""
+        if not self._contract_pending:
+            return
+        try:
+            self.step_args(md)
+        except AttributeError as exc:
+            raise AssertionError(f"attention metadata surface drifted: {exc}") from exc
+        self._contract_pending = False
 
     def step_args(self, md: TrtllmAttentionMetadata) -> dict:
         """Project the prepared metadata onto thop_attention's explicit batch state, once per forward."""
@@ -415,7 +441,7 @@ class PrefillTarget(Target):
         return x
 
 
-class DecodeTarget(Target):
+class DecodeTarget:
     """The specialization: routed to only when there are no context rows."""
 
     def __init__(
@@ -428,7 +454,11 @@ class DecodeTarget(Target):
         yarn_attn_factor: float,
     ) -> None:
         """Take the views and constants this target's forward reads, once, off the real weights."""
-        super().__init__(core)
+        self.core = core
+        # Off unless TRTLLM_MODELING_V2_VALIDATE asks for it; read once here rather than per
+        # forward. Each target owns its own flag: the two `step_args` projections differ,
+        # so probing one does not prove the other's fields exist.
+        self._contract_pending = step_contract_enabled()
         cfg = core.model_config.pretrained_config
         w = core.w
         device = w["final_norm"].device
@@ -447,6 +477,21 @@ class DecodeTarget(Target):
         self._glu_alpha, self._glu_beta, self._glu_limit = glu_vectors(
             cfg.num_local_experts, cfg.swiglu_limit, device
         )
+
+    def _check_step_contract(self, md) -> None:
+        """Opt-in first-forward fail-fast, run when TRTLLM_MODELING_V2_VALIDATE asks for it:
+        the metadata fields this target consumes must exist (they are private trtllm
+        surface). Calling `step_args` is the check -- it reads every field this target
+        consumes, so a rename upstream surfaces here rather than mid-forward. Everything
+        checked is fixed at engine construction, so once per target instance is sound,
+        and it is off in a served engine."""
+        if not self._contract_pending:
+            return
+        try:
+            self.step_args(md)
+        except AttributeError as exc:
+            raise AssertionError(f"attention metadata surface drifted: {exc}") from exc
+        self._contract_pending = False
 
     def step_args(self, md: TrtllmAttentionMetadata) -> dict:
         """Project the prepared metadata onto thop_attention's explicit batch state, once per forward."""

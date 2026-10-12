@@ -16,7 +16,7 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
-from tensorrt_llm._torch._experimental.modeling_v2._target import Phase, Target, phase_of
+from tensorrt_llm._torch._experimental.modeling_v2._router_index import step_contract_enabled
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.activation.flashinfer_silu_and_mul import (  # noqa: E501
     flashinfer_silu_and_mul,
 )
@@ -311,9 +311,16 @@ class DeepseekV3Dep4ModelingV2(DecoderModel):
         self._prefill = PrefillTarget(self)
         self._decode = DecodeTarget(self)
 
-    def _select_target(self, attn_metadata) -> Target:
-        """Which target runs this step."""
-        return self._decode if phase_of(attn_metadata) is Phase.DECODE else self._prefill
+    def _select_target(self, attn_metadata) -> "PrefillTarget | DecodeTarget":
+        """Which target runs this step.
+
+        One host-side integer read and nothing else: a decode-only CUDA graph is a
+        per-capture constant environment, and a predicate that reached for a second field
+        would be reading one this call is not guaranteed to carry. A mixed batch -- context
+        and generation rows in one step -- goes to prefill, so prefill is the general case
+        and decode the specialization that may assume it has no context rows.
+        """
+        return self._decode if attn_metadata.num_contexts == 0 else self._prefill
 
     def forward(
         self,
@@ -517,15 +524,34 @@ def _layer_views(core: "DeepseekV3Dep4ModelingV2") -> list[_Layer]:
     return layers
 
 
-class PrefillTarget(Target):
+class PrefillTarget:
     """The general case: context rows, and possibly generation rows beside them."""
 
     def __init__(self, core: "DeepseekV3Dep4ModelingV2") -> None:
         """Take the per-layer weight views this target's forward reads, once, off the real
         weights. The MTP operands are read off `core._mtp` at the call instead."""
-        super().__init__(core)
+        self.core = core
+        # Off unless TRTLLM_MODELING_V2_VALIDATE asks for it; read once here rather than per
+        # forward. Each target owns its own flag: the two `step_args` projections differ,
+        # so probing one does not prove the other's fields exist.
+        self._contract_pending = step_contract_enabled()
         self._norm0 = core.w["l0_norm1"]
         self._layers = _layer_views(core)
+
+    def _check_step_contract(self, md) -> None:
+        """Opt-in first-forward fail-fast, run when TRTLLM_MODELING_V2_VALIDATE asks for it:
+        the metadata fields this target consumes must exist (they are private trtllm
+        surface). Calling `step_args` is the check -- it reads every field this target
+        consumes, so a rename upstream surfaces here rather than mid-forward. Everything
+        checked is fixed at engine construction, so once per target instance is sound,
+        and it is off in a served engine."""
+        if not self._contract_pending:
+            return
+        try:
+            self.step_args(md)
+        except AttributeError as exc:
+            raise AssertionError(f"attention metadata surface drifted: {exc}") from exc
+        self._contract_pending = False
 
     def step_args(self, md: TrtllmAttentionMetadata) -> dict:
         """The batch state both MLA calls of one step share."""
@@ -1181,7 +1207,7 @@ class PrefillTarget(Target):
         return torch.add(residual, torch.add(routed, shared))
 
 
-class DecodeTarget(Target):
+class DecodeTarget:
     """The specialization: routed to only when there are no context rows.
 
     Calls four fewer ops than the prefill target -- the context attention flavor, the
@@ -1192,9 +1218,28 @@ class DecodeTarget(Target):
     def __init__(self, core: "DeepseekV3Dep4ModelingV2") -> None:
         """Take the per-layer weight views this target's forward reads, once, off the real
         weights. The MTP operands are read off `core._mtp` at the call instead."""
-        super().__init__(core)
+        self.core = core
+        # Off unless TRTLLM_MODELING_V2_VALIDATE asks for it; read once here rather than per
+        # forward. Each target owns its own flag: the two `step_args` projections differ,
+        # so probing one does not prove the other's fields exist.
+        self._contract_pending = step_contract_enabled()
         self._norm0 = core.w["l0_norm1"]
         self._layers = _layer_views(core)
+
+    def _check_step_contract(self, md) -> None:
+        """Opt-in first-forward fail-fast, run when TRTLLM_MODELING_V2_VALIDATE asks for it:
+        the metadata fields this target consumes must exist (they are private trtllm
+        surface). Calling `step_args` is the check -- it reads every field this target
+        consumes, so a rename upstream surfaces here rather than mid-forward. Everything
+        checked is fixed at engine construction, so once per target instance is sound,
+        and it is off in a served engine."""
+        if not self._contract_pending:
+            return
+        try:
+            self.step_args(md)
+        except AttributeError as exc:
+            raise AssertionError(f"attention metadata surface drifted: {exc}") from exc
+        self._contract_pending = False
 
     def step_args(self, md: TrtllmAttentionMetadata) -> dict:
         """The batch state both MLA calls of one step share.
