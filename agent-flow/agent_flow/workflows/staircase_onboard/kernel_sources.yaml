@@ -1,0 +1,233 @@
+# Where kernels come from, and what that costs to certify.
+#
+# THE PROBLEM THIS SOLVES
+#
+# A smith asked to supply a computation needs three answers: does a kernel
+# already exist, where did it come from, and what does certifying it require.
+# The first is answered dynamically --- `survey.py` enumerates
+# `torch.ops.trtllm.*` on the real host, because an op's PRESENCE depends on
+# the build (FlashInfer ops register only behind `IS_FLASHINFER_AVAILABLE`).
+# This file answers the other two.
+#
+# Provenance is not trivia. It decides the shape of the receipt: a CuTe DSL
+# kernel is architecture-gated and JIT-compiled, a vendored Triton kernel is
+# compiled on first call and has no arch gate, a C++ kernel is in the wheel
+# and either present or not. Certifying them means different things.
+#
+# TWO REGISTRATION PLANES, and you have to know which one you are in:
+#
+#   Python  `tensorrt_llm/_torch/custom_ops/*.py`   ~181 ops
+#           One file per source. The file name IS the provenance, which is
+#           what makes attribution mechanical --- grep the op name there.
+#   C++     `cpp/tensorrt_llm/thop/*.cpp`            ~95 ops
+#           Registered via `def("...")` at load. Nothing in the Python tree
+#           mentions them, so an op found in neither custom_ops file is
+#           almost certainly here.
+#
+# Both land in the same `torch.ops.trtllm` namespace, so the namespace alone
+# tells you nothing about provenance. That is the whole reason for this file.
+#
+# SCHEMA (enforced by tests/workflows/staircase_onboard/test_kernel_sources.py)
+#
+#   <source>:
+#     summary:     what this source is, in a sentence or two
+#     registers:   the file(s) where its ops enter `torch.ops.trtllm`
+#     implementation: where the kernel body lives, when that differs
+#     tier:        which sourcing tier (see vocabulary.py) it satisfies
+#     availability: what decides whether its ops exist in a given build
+#     certifying:  what a receipt for one of these must say, beyond passing
+#
+# Paths are resolved against the checkout by a test. No line numbers, no
+# signatures --- same rule as the runtime map.
+
+# `fast_custom_op.py` is deliberately absent as a source: it is a low-overhead
+# replacement for `@torch.library.custom_op`, not a place kernels come from.
+# An op attributed to it has some other real provenance --- read the file that
+# uses the decorator, not the decorator.
+
+cpp_thop:
+  summary: >-
+    Hand-written CUDA and C++ kernels compiled into the wheel and bound
+    through the `thop` layer. The largest source and the default assumption
+    when an op's provenance is not otherwise obvious.
+  registers:
+    - tensorrt_llm/_torch/custom_ops/cpp_custom_ops.py
+    - cpp/tensorrt_llm/thop
+  implementation:
+    - cpp/tensorrt_llm/kernels
+  tier: 1
+  availability: >-
+    In the wheel or not. Present on every build that compiled the
+    corresponding architecture; a missing one means the build excluded it,
+    not that the environment is misconfigured.
+  certifying: >-
+    Name the architecture. These are compiled per `--cuda_architectures`, so
+    a receipt is only meaningful with the arch stated, and a pass elsewhere
+    says nothing here.
+
+trtllm_gen:
+  summary: >-
+    Generated kernels --- the trtllm-gen family, including the FMHA and
+    block-scale MoE runners. Generated rather than written, so the tactic and
+    kernel selection happen at run time from a precompiled set.
+  registers:
+    - tensorrt_llm/_torch/custom_ops/trtllm_gen_custom_ops.py
+  implementation:
+    - cpp/tensorrt_llm/kernels/trtllmGenKernels
+  tier: 1
+  availability: >-
+    In the wheel, but the *selection* is dynamic: a generation FMHA kernel
+    takes the NVRTC path unless the KV dtype is E2m1, which is a run-time
+    branch and a known source of a JIT failure that looks like a build fault.
+  certifying: >-
+    Name which kernel of the family was selected, and the KV dtype. Two
+    architectures can compute bit-different results from one entry --- the
+    catalog already records a case where each refutes the other's recipe.
+
+cute_dsl:
+  summary: >-
+    Kernels written in CuTe DSL, NVIDIA's Python-embedded tile DSL. Compiled
+    at first use for the architecture in hand, so they are both source in the
+    tree and JIT artifacts at run time.
+  registers:
+    - tensorrt_llm/_torch/custom_ops/cute_dsl_custom_ops.py
+    - tensorrt_llm/_torch/custom_ops/cute_dsl_kimi_k3_custom_ops.py
+    - tensorrt_llm/_torch/custom_ops/cute_dsl_kimi_k3_kda_mtp_ops.py
+  implementation:
+    - tensorrt_llm/_torch/cute_dsl_kernels
+  tier: 1
+  availability: >-
+    Architecture-gated, and the gate is per-kernel --- the implementation
+    tree is organised by architecture (`blackwell`, `rubin`). An unavailable
+    kernel usually degrades to another path rather than raising, sometimes
+    behind a broad except.
+  certifying: >-
+    State the architecture and confirm the CuTe path actually ran. A silent
+    fallback to a reference implementation produces a passing test that
+    certifies the wrong kernel.
+
+cuda_tile:
+  summary: >-
+    Kernels for the CUDA Tile / TileIR backend. A small source today --- norm
+    and fused residual-add norm --- but a distinct compilation path.
+  registers:
+    - tensorrt_llm/_torch/custom_ops/cuda_tile_custom_ops.py
+  implementation:
+    - tensorrt_llm/_torch/cuda_tile_kernels
+  tier: 1
+  availability: >-
+    Requires the Tile toolchain; absent builds simply do not register the op.
+  certifying: >-
+    Confirm the tile path ran rather than the equivalent non-tile op, since
+    both exist for the same computation.
+
+flashinfer:
+  summary: >-
+    Kernels from the external FlashInfer library, wrapped as trtllm ops. The
+    only source here that is a third-party dependency rather than tree code,
+    and the only one whose ops can be absent from an otherwise complete build.
+  registers:
+    - tensorrt_llm/_torch/custom_ops/flashinfer_custom_ops.py
+  tier: 1
+  availability: >-
+    Conditional. The ops register only behind `IS_FLASHINFER_AVAILABLE`, so
+    presence is an environment property, not a build one. FlashInfer also
+    JIT-compiles into a workspace that is locked per rank --- see
+    `trtllm-llmapi-launch` for the isolation and `FLASHINFER_CUBIN_DIR` for
+    the shared cubin cache.
+  certifying: >-
+    Do not pin a FlashInfer version in the contract; name the kernel or the
+    code path instead. The tree's own audit rejects version pins for exactly
+    this reason.
+
+triton_custom_op:
+  summary: >-
+    Triton kernels written in this tree and registered through
+    `torch.library.custom_op`, so the kernel and its op live in the same
+    file under `custom_ops/`. Distinct from `vendored_triton`, which is
+    Triton the op plane cannot see: these ARE ops, and an inventory finds
+    them.
+  registers:
+    - tensorrt_llm/_torch/custom_ops/nvfp4_sfc_finalize.py
+    - tensorrt_llm/_torch/custom_ops/nvfp4_fake_quantize.py
+    - tensorrt_llm/_torch/custom_ops/mxfp8_fake_quantize.py
+    - tensorrt_llm/_torch/custom_ops/mxfp8_dequantize.py
+    - tensorrt_llm/_torch/custom_ops/mxfp8_to_e4m3.py
+    - tensorrt_llm/_torch/custom_ops/nvfp4_kv_to_bf16.py
+    - tensorrt_llm/_torch/custom_ops/nvfp4_kv_to_e4m3.py
+    - tensorrt_llm/_torch/custom_ops/e4m3_quantize_pow2_dynamic.py
+  tier: 2
+  availability: >-
+    Never gated --- Triton is a hard dependency of the wheel, and each module
+    imports it at module scope rather than behind a try. But an op exists
+    only once its module is imported: `nvfp4_sfc_finalize` is imported by the
+    `custom_ops` package, the others by the catalog wrapper that calls them,
+    so an inventory that imports only the package does not list them.
+  certifying: >-
+    Read the autotune. A Triton op's numerics are fixed but its launch
+    configuration is chosen at runtime, so a receipt that names only the op
+    describes a kernel that may not be the one the next run picks. Record
+    the resolved config alongside the result.
+
+vendored_triton:
+  summary: >-
+    Triton kernels vendored into the tree and called directly as Python, not
+    through `torch.ops`. The linear-attention and SSM families live here.
+    Because they are ordinary callables, they are invisible to an op
+    inventory --- the kernel plane, not the op plane.
+  implementation:
+    - tensorrt_llm/_torch/modules/fla
+    - tensorrt_llm/_torch/modules/mamba
+  tier: 2
+  availability: >-
+    Always importable, but which one runs can be chosen once per process by
+    environment and architecture --- the GDN prefill backend resolves through
+    a cached lookup on first call.
+  certifying: >-
+    Name the branch. Two backends for one computation are different kernels
+    in different gate spaces; the in-tree parity test compares them with a
+    tolerance, not bit-equality, so a receipt that does not say which one ran
+    certifies an implementation nobody can identify later.
+
+torch_composed:
+  summary: >-
+    Ops composed from ordinary torch operations and registered for the sake
+    of a stable name and a fake/meta implementation. No custom kernel.
+  registers:
+    - tensorrt_llm/_torch/custom_ops/torch_custom_ops.py
+  tier: 3
+  availability: >-
+    Always present; nothing gates them.
+  certifying: >-
+    Cheap. Upstream owns the correctness of the underlying torch ops, which
+    is why the catalog's `torch/` mirrors carry no contract and no receipt.
+
+userbuffers:
+  summary: >-
+    Communication kernels using userbuffers for fused collective paths. A
+    parallelism-only source; a single-rank target never reaches it.
+  registers:
+    - tensorrt_llm/_torch/custom_ops/userbuffers_custom_ops.py
+  tier: 1
+  availability: >-
+    Multi-rank only, and topology dependent: the buffers are established
+    across a communicator, so a single-rank build never registers a use for
+    them even when the ops are present.
+  certifying: >-
+    Certify at the world size the target declares. A collective receipt taken
+    at a different rank count describes a different communicator.
+
+dspark:
+  summary: >-
+    Fused DSpark attention and norm+RoPE kernels for the DSV4 family, built
+    on tcgen05 MMA. Model-family specific rather than general-purpose.
+  registers:
+    - tensorrt_llm/_torch/custom_ops/dspark_attention_custom_op.py
+    - tensorrt_llm/_torch/custom_ops/dspark_rmsnorm_rope_custom_op.py
+  tier: 1
+  availability: >-
+    Architecture-gated on the tcgen05 MMA path; a build or device without it
+    does not register these.
+  certifying: >-
+    Name the architecture and the family. A family-specific fused kernel is
+    not a drop-in for the general path even when the shapes agree.

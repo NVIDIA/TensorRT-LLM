@@ -1,0 +1,564 @@
+# staircase-onboard task specification.
+#
+# Copy this file, fill it in, and run:
+#
+#   staircase-onboard --task task.yaml --workspace workspace/staircase-onboard
+#
+# Start with --dry-run: it runs preflight, resolves the launch environment
+# and stops before the first agent turn, which is the cheapest way to find
+# out whether this host can host this run.
+#
+# Every block here is CLOSED: a key this schema does not know is an error,
+# not a no-op, and the message suggests the nearest real key. That is not
+# pedantry — `feature:` instead of `features:` used to validate cleanly and
+# resolve to no features, so the run built core, gated it green, and
+# reported success for a feature set it never built.
+#
+# Commented-out fields below are optional. Uncomment what you need; the
+# defaults are stated next to each.
+
+# ---------------------------------------------------------------- identity
+# A target's identity is the (checkpoint, GPU arch, parallel config) triple.
+# All three end up in the run's slug, the branch name and the target's path.
+
+checkpoint_path: /path/to/Qwen3-30B-A3B
+
+# REQUIRED and never inferred. Catalog receipts are per-architecture, so the
+# wrong value gates this target against another machine's certification.
+# sm_100 = B200, sm_103 = GB300.
+arch: sm_103
+
+# tp<N> | tep<N> | dep<N> | unified. The trailing number is the world size
+# and therefore how many devices preflight claims. Omit for `unified` — one
+# modeling codebase over a family of parallel configurations, whose world
+# size comes from the member set instead.
+parallel: tp1
+
+# Which configurations a `unified` target is actually GATED at. Legal only
+# with `parallel: unified`, because a concrete segment already names one.
+#
+# The failure this prevents: `unified` is the default, and a unified target
+# used to be built once and gated once, at pure tensor parallelism. Expert
+# parallelism and attention data parallelism — the two branches a unified
+# codebase exists to carry, and for a 256-expert MoE the ones holding the
+# expert sharding and the all-to-all — were switched on by no gate, while the
+# target's Coverage section documented all three. An EP bug is invisible to a
+# TP-only gate by construction.
+#
+# Every member must declare the SAME world size: one allocation serves them
+# all, so a member that wants a different device count cannot be run at all.
+# `unified` is not a legal member — it is the family, not a configuration.
+#
+# Default when omitted, at the unified world size W (4 unless a member says
+# otherwise): [tpW, tepW, depW]. TEP and DEP are the baseline pair; TP is the
+# degenerate path, and it is not free — it is the only member that folds every
+# branch off, so no other member covers the code it runs.
+#
+# COST. Each member pays boot + accuracy per unit, and accuracy is roughly an
+# hour. Three members over four units is twelve accuracy gates, which
+# preflight prints before the run starts. Naming one member is how a run buys
+# a cheaper answer honestly, rather than getting a cheap answer labelled as an
+# expensive one.
+#
+# members: [tp4, tep4, dep4]
+#
+# Per-unit, layered over `default`, same shape as `runtime:` — for when one
+# unit is worth less gate budget than the rest:
+# members:
+#   default: [tp4, tep4, dep4]
+#   multimodal: [tep4]
+
+# Feature increments, built one at a time *after* core is green. A concise
+# target is the default, not an option. Known values: mtp, eagle3, dflash,
+# dspark, eplb, dwdp, multimodal, host_offload, disagg, kv_quant,
+# decoder_replay, encoder_replay.
+#
+# Several are output-identical BY CONSTRUCTION and therefore carry a third
+# gate, because boot and accuracy pass whether or not the feature is doing
+# anything: the speculators (mtp/eagle3/dflash/dspark) get the acceptance
+# gate, host_offload a residency witness, disagg an equivalence witness,
+# kv_quant a bytes-per-token witness. decoder_replay and encoder_replay are NOT
+# output-identical -- they truncate sliding-window state on purpose -- but a
+# unit that implements nothing still passes accuracy, so they carry a work
+# witness. All of those but the speculators need `accuracy.witness` below; for
+# kv_quant and the two replay features it is required here, at spec time.
+#
+# `dspark` is not a spelling of `mtp`. A checkpoint whose `mtp.*` stages are a
+# DSpark block drafter (DeepSeek-V4.1: `dspark_*` keys in its config) asks for
+# `dspark` even when the request says "MTP"; `mtp` over those weights builds
+# three chained heads the checkpoint never trained. The two are refused
+# together.
+features: []
+
+trtllm_repo_path: /path/to/TensorRT-LLM
+
+# Overrides for the identity the workflow derives. The family comes from the
+# checkpoint's own `architectures[0]` and is almost never worth setting; the
+# checkpoint segment is a GUESS made from the directory name and is the one
+# component worth setting by hand. Both are Python package directory names,
+# so lowercase-with-underscores.
+# target:
+#   family: qwen3_5
+#   checkpoint_segment: qwen3_5_27b_nvfp4
+
+# `full` (default) | `text_only`. A multimodal checkpoint whose vision tower
+# is out of scope still has to load, route and gate as a language model;
+# saying so here is what keeps an assembler from treating the absent vision
+# path as a defect.
+# scope: text_only
+
+# Paths the agents may not read. Each must EXIST — an embargo naming a path
+# that is not there reads as protection while protecting nothing. Use this to
+# verify the pipeline derives a target rather than transliterating one that
+# already exists.
+#
+# Two spellings, split on where the path points:
+#   - repo-relative, resolved under `trtllm_repo_path` — the engine's own
+#     implementation of this checkpoint, when it ships one;
+#   - ABSOLUTE, when it resolves outside the repo — a sibling vLLM or SGLang
+#     checkout that implements this checkpoint. Those are the trees most
+#     likely to be copied from on a new architecture, because the run
+#     deliberately starts one of them as its accuracy oracle, and they are one
+#     `Read` away from every agent. An absolute path INSIDE the repo is
+#     rejected; spell that one repo-relative.
+#
+# A directory entry embargoes the tree beneath it, so a checkout is named once
+# rather than enumerated file by file and left to go stale.
+#
+# Running either kind is expected — the in-repo one under
+# `TRTLLM_MODELING_V2=off`, the out-of-repo one as a black-box server. Only
+# reading is forbidden.
+# source_embargo:
+#   - tensorrt_llm/_torch/models/modeling_qwen3_5.py
+#   - /path/to/vllm
+
+# ----------------------------------------------------------------- runtime
+# What must be true of every gate command. These are declared rather than
+# left to the engine's defaults because the gates have to exercise them, and
+# because two are spelled as negations on the command line — translating
+# "block reuse on" into "emit no flag" is done once here, in Python, so no
+# agent ever types it.
+#
+# runtime:
+#   cuda_graph: false          # default false
+#   chunked_prefill: false     # default false
+#   overlap_scheduler: true    # default true  (--disable_overlap_scheduler)
+#   kv_cache_reuse: true       # default true  (--disable_kv_cache_reuse)
+#
+# PER UNIT when the units disagree, layered over `default`:
+#
+#   runtime:
+#     default:
+#       kv_cache_reuse: true
+#       extra_flags: [--max_seq_len=8192]
+#     multimodal:
+#       kv_cache_reuse: false    # the vision path requires it off
+#
+# This block and not `llm_api_options`, which is already per-unit, because
+# `quickstart_advanced.py` takes no `--extra_llm_api_options` — so the BOOT
+# gate, the one that runs first and most often, cannot read that file at all
+# and this is its only channel. Set both when a unit needs a switch changed:
+# the boot gate reads this, the accuracy gate reads the YAML, and two gates
+# measuring different engines is worse than either being wrong.
+#
+#   # Anything else the gate command needs, verbatim. `max_seq_len` belongs
+#   # here for most checkpoints: without it the engine inherits the
+#   # checkpoint's `max_position_embeddings` — 262144 is common — and the
+#   # run dies with `Impossible to fit in any sequence in kvCache`, which
+#   # reads as a model defect and is not one.
+#   extra_flags:
+#     - --max_seq_len=8192
+#     - --max_batch_size=8
+#     - --kv_cache_fraction=0.6
+
+# ------------------------------------------------------------- environment
+# How GPU work is launched. Resolved ONCE into a literal command prefix that
+# every agent prompt carries verbatim; no agent ever builds a launcher line.
+
+environment:
+  # local | slurm | slurm_broker | session_spool
+  #
+  # Prefer `session_spool` wherever it is available, and not for
+  # convenience: every other kind puts a scheduler between a command and its
+  # result — a container image import (26 GB, 4-8 minutes) and a queue wait
+  # PER COMMAND. A spool acquires one allocation once, and work is a file,
+  # so anything that can write a file can run GPU work.
+  #
+  # `slurm_broker` is for a cluster whose Slurm CLI cannot reach the
+  # controller from here and where an MCP broker is the only path. It has
+  # one consequence worth knowing before you pick it: the orchestrator is
+  # not an MCP client, so gate *execution* moves to an agent while gate
+  # *adjudication* stays in Python.
+  kind: local
+
+  # The interpreter every Python command runs under. Point this at the
+  # editable TensorRT-LLM install you want measured — resolving it here is
+  # what keeps a run from silently gating against a different build.
+  python: /path/to/TensorRT-LLM/.venv-3.12/bin/python
+
+  env:
+    # Mandatory for anything you will attribute to modeling_v2. Under
+    # `auto`, a configuration that misses a target's routing criteria
+    # silently gets the built-in implementation, and a number measured that
+    # way reads as modeling_v2's. `require` raises instead.
+    TRTLLM_MODELING_V2: require
+    # Engine builds, NVRTC scratch and harness output all default to TMPDIR.
+    # On a shared host another tenant can fill /tmp to zero mid-run, so
+    # preflight rejects a TMPDIR that points there.
+    TMPDIR: /path/to/scratch/tmp
+    CLAUDE_CODE_TMPDIR: /path/to/scratch/tmp
+
+  # A checkpoint the STOCK modeling path already supports, used only as a
+  # stand-in by the substrate gate — the preflight step that proves this host
+  # can generate a token at all before any agent exists.
+  #
+  # That gate runs on the run's OWN checkpoint, which is right for two of the
+  # three failures it catches (a kvCache sizing fault and an NVRTC one depend
+  # on this checkpoint's geometry and this run's flags). But a genuinely new
+  # architecture has no stock path by definition, so the gate can never pass
+  # for exactly the runs this workflow exists for: it fails with an
+  # architecture-not-supported error that reads as a target defect.
+  #
+  # When that specific failure happens — and no other; a real kvCache fault is
+  # still a hard stop — the gate re-runs against this checkpoint under the same
+  # environment and the same `runtime` block. `MPI_ERR_SPAWN` and the NVRTC
+  # PATH fault are still proven, because neither depends on the checkpoint. The
+  # kvCache one is NOT, and preflight's notes say so verbatim: a sizing fault
+  # will then surface at the first boot gate instead of here.
+  #
+  # Prefer this over `--skip-substrate-gate`, which gives up all three.
+  # substrate_checkpoint: /path/to/Qwen3-30B-A3B
+
+  # --- kind: slurm / slurm_broker only ------------------------------------
+  # partition: batch
+  # account: your-account
+  # container_image: /path/to/image.sqsh
+  # mounts:
+  #   - /lustre:/lustre
+  # time_limit: "04:00:00"
+  #
+  # GPUs per NODE. With `parallel: tep8` and 4 GPUs per node the workflow
+  # derives 2 nodes, 8 tasks, 4 tasks per node — one task per rank, which is
+  # the thing that decides whether the launch works at all. See below.
+  # gpus_per_node: 4
+  #
+  # Pyxis skips the container import when a container of this name already
+  # exists on the node. A 26 GB image costs 4-8 minutes per job to import,
+  # so this is the difference between paying that once and paying it every
+  # time a gate runs.
+  # container_name: trtllm-staircase
+  #
+  # `auto` (default) picks the MPI plugin from the task count: `none` at one
+  # task, `pmix` above it. Set it only when this cluster reports a versioned
+  # variant — ask it: `srun --mpi=list`.
+  # mpi: pmix_v5
+  #
+  # PREFER A LOCAL SQUASHFS over a registry reference. pyxis takes either, and
+  # the difference is the single biggest lever on how parallel a run can be: a
+  # registry reference is fetched and unpacked PER ALLOCATION, measured at 5-7
+  # minutes for a 26 GB image and at 25-35 minutes on a loaded cluster, three
+  # times in a row. A file on shared storage mounts in seconds.
+  #
+  # That cost is the reason a run ends up on one shared session, and a shared
+  # session has ONE FAILURE DOMAIN — a leaked server or a stray process-group
+  # kill takes down every other job with it.
+  #
+  #   enroot import -o /lustre/<you>/images/trtllm.sqsh \
+  #       docker://artifactory.example.com#ns/trtllm:tag
+  #
+  # then point container_image at that path. Preflight warns if you do not.
+
+  # --- per-workload substrate ----------------------------------------------
+  # The right substrate depends on HOW LONG THE JOB RUNS, and a run does not
+  # have to pick once.
+  #
+  # A `session_spool` imports its container image ONCE and then costs nothing
+  # per job. That is the correct trade for a smith's entry test, which runs for
+  # a minute; one onboarding ran 443 such jobs, and paying the import on each
+  # would have cost roughly 37 hours.
+  #
+  # It is the wrong trade for a gate. A boot or accuracy gate runs 10-15
+  # minutes, so the import is 30-50% overhead rather than 3000%, and what you
+  # want in exchange is the thing a shared session cannot give: ISOLATION. A
+  # spool has one failure domain. Across the two runs this was written for, a
+  # gate that leaked a 173 GB server, a teardown whose process-group kill
+  # caught the watcher, an agent's `pkill -9` that did the same, and two
+  # engines colliding over PMIx (`status = -61` cancels the whole step) each
+  # took down every other job AND the orchestrator.
+  #
+  # So: short work on the spool, gates in their own Slurm jobs. Only `gate` is
+  # recognised today; an unknown name is REJECTED rather than ignored, because
+  # an override that never applies is invisible — the run just uses the base
+  # environment and nothing says why.
+  #
+  # Keys are the environment keys above. `env` merges key-by-key with the base;
+  # everything else replaces, so a gate that only needs a different substrate
+  # does not have to restate mounts and accounts that would then drift.
+  #
+  # workloads:
+  #   gate:
+  #     kind: slurm
+  #     time_limit: "01:00:00"
+
+  # --- how multi-rank actually launches ------------------------------------
+  # Worth knowing, because the failure is loud and the cause is not.
+  #
+  # At world size > 1 the workflow emits one task per rank and wraps the
+  # command in `trtllm-llmapi-launch`, so the ranks EXIST before the engine
+  # starts. Without that, srun launches a single task, the MPI world size is
+  # 1, and the LLM API concludes it must create the other ranks itself —
+  # `need_spawn_mpi_workers` in `llmapi/mpi_session.py` is exactly
+  # `get_mpi_world_size() == 1 and model_world_size > 1`. Under pyxis that
+  # dynamic spawn is forbidden and the run dies with `MPI_ERR_SPAWN`.
+  #
+  # At world size 1 the opposite applies: no wrapper, and the MPI environment
+  # is cleared before exec, because mpi4py auto-initializes MPI whenever PMI
+  # variables are present and inside a PMIx step they always are.
+  #
+  # Both rules are TensorRT-LLM's own, carried from
+  # `.claude/skills/trtllm-test-script-builder/`. Nothing here is this
+  # workflow's invention, and no agent ever assembles this line.
+
+  # --- kind: session_spool only -------------------------------------------
+  # The directory a long-lived compute session watches. Work is a file:
+  # write `<spool>/pending/<name>.sh`, wait for `<spool>/done/<name>.rc`,
+  # read `<spool>/logs/<name>.log`.
+  # spool: /path/to/scratch/spool
+
+# ---------------------------------------------------------------- accuracy
+# The release criterion. One-sided: measured >= reference - tolerance.
+#
+# The anchor comes from a written source — TensorRT-LLM's own accuracy
+# references — and is NEVER invented. If this checkpoint has no entry yet,
+# the plan phase must add one from a source it cites, before assembly.
+#
+# Preflight resolves the row EVERY unit will look up — through the accuracy
+# gate's own lookup, so it fails exactly where the gate would — and stops the
+# run if one is missing. That is deliberate: a unit whose anchor is absent
+# otherwise assembles, boots on every member and dies at its accuracy gate
+# hours later, on this. The unit most likely to be the missing one is the
+# increment that names a different benchmark and a different file.
+
+accuracy:
+  # The benchmark AND its protocol. A reasoning model scored as 5-shot
+  # completion lands near the floor whatever its ability, so a mismatch here
+  # reads as an assembly defect.
+  benchmark: gsm8k
+  reference_yaml: tests/integration/defs/accuracy/references/gsm8k.yaml
+
+  # In benchmark points. Same-protocol session variance measured at 0.1-0.3
+  # points, so the default 5.0 is wide relative to the noise by design: the
+  # gate catches an assembly defect, it does not resolve a fine difference.
+  tolerance: 5.0
+
+  # Which row of reference_yaml this checkpoint is anchored to. Defaults to
+  # a value derived from the checkpoint directory name, which is right for a
+  # stock checkpoint and wrong for a quantized derivative that should anchor
+  # to its parent.
+  # model_key: openai/gpt-oss-120b
+
+  # `model_key` picks the model; `discriminators` picks the ROW. The
+  # references hold a LIST per model, tagged with `quant_algo` /
+  # `kv_cache_quant_algo` / `spec_dec_algo`, and the match is EXACT — no
+  # more, no less. Omitting this therefore asks for the untagged row, which
+  # for a quantized checkpoint is the bf16 number, and for a model that has
+  # no untagged row is an error raised at the end of an assembly.
+  #
+  # Per unit for the same reason `llm_api_options` is: `core` and `mtp` are
+  # different rows of the same list and different questions.
+  # discriminators:
+  #   core: {quant_algo: MIXED_PRECISION}
+  #   mtp:  {quant_algo: MIXED_PRECISION, spec_dec_algo: MTP}
+
+  # The two-leg WITNESS gates, for the features that are output-identical by
+  # construction. `host_offload` and `disagg` each pass boot AND accuracy
+  # whether or not the feature is doing anything — the same blindness the
+  # acceptance gate exists for, with a different observable — so a unit with
+  # no witness can be declared green for a feature nobody built.
+  #
+  # Supplies the one thing the orchestrator cannot derive: the environment
+  # for the SECOND leg -- which turns the offload off, and turns disagg on, so
+  # the key is not named for a direction. `expected_mib` is the delta predicted
+  # from the CHECKPOINT's own shapes, passed in rather than derived, because
+  # a witness that computes its own expectation from the run it is judging
+  # can only ever agree with itself.
+  #
+  # witness:
+  #   host_offload:
+  #     contrast_env: {QWEN_PLE_OFFLOAD: "0"}   # the leg WITHOUT the offload
+  #     expected_mib: 48800          # 20 M rows x 2560 dims, fp8
+  #   disagg:
+  #     contrast_env: {TRTLLM_DISAGG: "1"}       # the leg WITH disagg
+  #     # REQUIRED: leg B's own launcher (context + generation engine + proxy +
+  #     # client). Run as ONE process on every device of the claim, handed leg
+  #     # A's workload as STAIRCASE_WITNESS_* variables (see witness.py).
+  #     contrast_command: /path/to/disagg_leg_b.py
+  #     prompt_tokens: [131, 2050, 2051, 4097]   # extra prompts, BOTH legs
+  #     timeout: 2700                            # seconds per leg
+  #     max_batch_size: 1                        # one schedule on BOTH legs
+  #     # The environment of BOTH legs (`contrast_env` is leg B's alone).
+  #     legs_env:
+  #       TRTLLM_DSV41_ENCODER_SWA_BOUNDED_REPLAY: "0"
+  #       TRTLLM_DSV41_DECODER_SWA_BOUNDED_REPLAY: "0"
+  #
+  # `legs_env` (disagg only): the two legs must differ in exactly ONE thing,
+  # the hop. Leg B is a different launcher, and a code path its engines refuse
+  # or guard off under disaggregation (above: both bounded replays) stays ON in
+  # the aggregated leg unless pinned here -- then the legs differ in that path
+  # too, and token identity no longer holds by construction. Leg A's process
+  # gets these variables; the contrast command gets them in its environment
+  # and, as JSON, in STAIRCASE_WITNESS_LEGS_ENV, and must apply them to every
+  # engine it starts. The pinned path is witnessed by its own block. A variable
+  # may not appear in both `legs_env` and `contrast_env`. The host_offload and
+  # kv_quant witnesses run one aggregated command on both legs, so nothing but
+  # `contrast_env` differs between them and they do not take the key.
+  #
+  # Any witness block may set `timeout` (seconds per leg; default 1800).
+  #
+  # A witness that compares TOKENS (`host_offload`, `kv_quant`, `disagg`) may
+  # set `max_batch_size`: both legs run at it, in place of the runtime block's
+  # `--max_batch_size`, and a `contrast_command` gets it as
+  # STAIRCASE_WITNESS_MAX_BATCH_SIZE for every engine it starts. Set it to 1
+  # when the comparison must be exact: a row's bits depend on the rows beside
+  # it, and batched admission follows arrival timing, so two batched legs can
+  # pack rows differently and flip a near-tie neither feature caused. Unset,
+  # the legs run at the runtime block's limit, as before.
+  #
+  # `kv_quant`: the target prints `MODELING_V2_WITNESS kv_bytes_per_token=<int>`
+  # once per rank under TRTLLM_MODELING_V2_WITNESS=1, and it must match the
+  # figure DECLARED here from the checkpoint's formats. `exact: true` (default)
+  # also demands token-identical output against bf16 storage; `exact: false`
+  # names a lossy attention path (an FP8-query kernel) and drops that leg.
+  #
+  #   kv_quant:
+  #     contrast_env: {TRTLLM_DSV41_KV_STORAGE: bf16}   # the leg WITH bf16 storage
+  #     expected_bytes_per_token: 890    # 3 x (288 + 68) / 2 + (288 + 68)
+  #     exact: true
+  #     bytes_tolerance: 0.02            # default; row padding, not a layout
+  #     max_batch_size: 1                # both legs one request at a time
+  #
+  # The bounded-replay features: the target prints one
+  # `MODELING_V2_WITNESS forwarded_tokens=<int> decoder_tokens=<int> ...` line
+  # per context request, and the witness judges it against a window and a
+  # workload declared HERE -- sized before the run, never from it. Each size
+  # must exceed the window (or replay on and off do the same work) and stay
+  # under 16384, since the prompt travels as one argv string.
+  #
+  #   decoder_replay:
+  #     contrast_env: {TRTLLM_DSV41_DECODER_SWA_BOUNDED_REPLAY: "0"}  # replay OFF
+  #     window: 128
+  #     prompt_tokens: 4096
+  #   encoder_replay:
+  #     contrast_env: {TRTLLM_DSV41_ENCODER_SWA_BOUNDED_REPLAY: "0"}  # replay OFF
+  #     window: 128
+  #     prefix_tokens: 4096
+  #     reuse_alignment: 2     # the compress ratio; an odd boundary splits a pair
+
+  # The ABSOLUTE `acceptance_length` floor a speculator unit falls back to
+  # when the `=off` leg cannot exist. The acceptance gate normally compares
+  # the target against the same checkpoint under BUILT-IN modeling — and a
+  # genuinely new architecture has none, so `=off` cannot load it at all.
+  # That is the same shape as the substrate gate's problem: the check is
+  # unavailable exactly when onboarding is doing its job.
+  #
+  # Skipping the gate is not an option. It is the ONLY gate that can see a
+  # miscomputed draft path, because rejection sampling makes a wrong draft
+  # produce correct text more slowly — boot passes, accuracy passes, and only
+  # speed moves. So declare a floor instead, and the run records the weaker
+  # claim verbatim: the draft path accepts at a real rate, NOT that it
+  # matches stock.
+  #
+  # Pick it from the ceiling, not from what the target happens to score. At
+  # `num_nextn_predict_layers: N` the ceiling is `N + 1`, for DSpark at
+  # `block_size: B` it is `B + 1`, and 1.0 means every draft was rejected —
+  # which the gate already fails on separately.
+  #
+  # The same block declares the gate's WORKLOAD. Without one it measures the
+  # boot prompts, and those are only a workload when their answers are long:
+  # a 2-token answer ends in EOS before any draft is verified, so the rate
+  # reads 1.00 for every drafter, working or broken, and no floor above 1 can
+  # pass. Declare prompts whose greedy answers run to `max_tokens`: a
+  # derivation, a code listing, a story. They are passed as-is, with no chat
+  # template applied, so write them the way the boot prompts are written.
+  # A workload that reaches fewer than `min_draft_iterations` generation
+  # iterations in total fails as "workload too short to measure acceptance"
+  # rather than as a low number. All four keys also work inside one unit's
+  # entry, for that unit only.
+  #
+  # acceptance:
+  #   prompts:
+  #     - "Explain, step by step, how a heat pump moves heat indoors."
+  #   # prompts_file: prompts.json  # instead of `prompts`: a YAML/JSON list,
+  #   #                             # or a boot.yaml-shaped file (`prompts:`)
+  #   max_tokens: 256
+  #   min_draft_iterations: 32
+  #   mtp:
+  #     min_absolute: 1.5
+  #   dspark:
+  #     min_absolute: 1.2
+
+  # `trtllm-eval`'s own flags, not LLM-API settings, so they cannot live in
+  # llm_api_options. Without `max_seq_len` the eval inherits the checkpoint's
+  # `max_position_embeddings` and the run dies in kvCache allocation.
+  # max_seq_len: 8192
+  # max_batch_size: 32
+
+  # MMLU only. trtllm-eval fetches that one dataset itself from a URL that
+  # now 404s; it writes the error page to data.tar and dies inside
+  # tarfile.open, so the failure reads as a corrupt archive rather than a
+  # dead link. Every other benchmark comes through lm-eval and is unaffected.
+  # dataset_path: /path/to/datasets/mmlu
+
+  # The LLM-API YAML the accuracy gate runs under — a path, or a mapping
+  # from assembly unit to a path when the units need different settings.
+  #
+  # Per-unit is not an optimization. The `mtp` unit's gate must carry a
+  # `speculative_config`, and without it the run re-measures the BASE path
+  # and reports the number as the speculator's. Measured.
+  #
+  # It is also where the boot and acceptance gates learn the draft DEPTH
+  # (`speculative_config.max_draft_len`, or `block_size` for DSpark), since the
+  # quickstart they drive cannot read this file. For DSpark that is not a
+  # knob: the depth must equal the drafter's trained block size, or the engine
+  # rejects the config before it starts.
+  #
+  # WRITE THESE RELATIVE. A path that is not absolute is resolved against THIS
+  # FILE'S OWN DIRECTORY, because that is where these YAMLs are written — so
+  # `scripts/core_llm_api.yaml` means the same thing on every machine, and an
+  # absolute spelling means it on exactly one. One run produced a 220-line
+  # task.yaml with six absolute paths in it, and its most reusable artifact was
+  # unusable anywhere else. An absolute path is still honoured untouched, so a
+  # site that wants one keeps it.
+  # llm_api_options:
+  #   core: scripts/core_llm_api.yaml
+  #   mtp: scripts/mtp_llm_api.yaml
+  #   dspark: scripts/dspark_llm_api.yaml  # decoding_type: DSpark, max_draft_len: 5
+
+  # Options of the benchmark subcommand itself — the PROTOCOL, which cannot
+  # live in llm_api_options. A protocol mismatch between the anchor and the
+  # gate is indistinguishable from a real regression: measured 63.50 against
+  # a 95.53 anchor once, a 27-point phantom, because the anchor was scored
+  # with a chat template and the gate was not.
+  # benchmark_args:
+  #   - --apply_chat_template
+
+# ------------------------------------------------- catalog remediation budget
+# When the delivery auditor returns UNCOVERED — runtime values sitting outside
+# their entries' certified columns — the orchestrator certifies them itself,
+# in a BOUNDED cycle: group the findings by (entry, arch, axis), dispatch one
+# verify smith per surface, re-audit, repeat.
+#
+# Bounded is the operative word. The cycle stops on its own if the unresolved
+# set stops shrinking, if a surface that was already certified comes back, or
+# if any of these budgets is spent — each with a named verdict, so a run that
+# cannot converge hands over instead of spending the night proving it.
+#
+# The defaults below are the policy and are deliberately small: remediation
+# runs catalog GPU tests, not accuracy gates, but it is still GPU time, and a
+# cycle that needs a third round usually had a first round that was measuring
+# the wrong thing. There is no spelling for "unlimited".
+# catalog_remediation:
+#   max_rounds: 2              # audit -> verify -> re-audit, at most twice
+#   max_attempts_per_item: 1   # a second attempt at identical work is not progress
+#   max_new_items: 16          # surfaces one round may add to the queue
+#   max_parallel_verifiers: 4  # concurrent verify smiths

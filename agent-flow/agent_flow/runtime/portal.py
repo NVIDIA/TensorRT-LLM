@@ -1,3 +1,13 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Run async work on a dedicated background loop, from synchronous callers.
+
+Was ``agent_flow/runtime.py``; moved here when the runtime package grew
+turns and commands beside it. ``from agent_flow.runtime import
+PortalRunner`` still resolves, so nothing importing it had to change.
+"""
+
 from __future__ import annotations
 
 import asyncio
@@ -7,7 +17,7 @@ from threading import Event, Lock, Thread
 
 import anyio
 
-from .types import AgentRequest
+from ..types import AgentRequest
 
 
 class PortalRunner:
