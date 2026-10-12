@@ -7,7 +7,7 @@
 
 The exemplar target shows the pattern; every model-specific value must be
 re-derived from the new checkpoint's `config.json` and the catalog
-contracts, never copied. The known variation axes:
+entries' cells, never copied. The known variation axes:
 
 **attention structure** — GQA/MHA vs **MLA**, the axis that reshapes the
 most: MLA replaces per-head K/V with one compressed latent, needs two

@@ -96,6 +96,13 @@ MODE_OFF = "off"
 #: those dumps against the catalog contracts.
 RUNTIME_VALUE_DUMP_ENV = "TRTLLM_MODELING_V2_VALUE_DUMP"
 
+#: Turns on each target's first-forward step-contract check
+#: (``Target._check_step_contract``, which calls the target's ``step_args``):
+#: a renamed metadata field then fails the gate loudly instead of computing a
+#: wrong answer. Off in a served engine; every gate and witness run sets it, as
+#: the in-tree modeling_v2 accuracy tests do.
+STEP_CONTRACT_ENV = "TRTLLM_MODELING_V2_VALIDATE"
+
 #: What a gate records when it could not ask git anything — no repository, no
 #: ``git`` on the host, no commits yet. Never an exception: a gate adjudicates
 #: a model, and failing one because a VCS query failed would attribute a
@@ -1232,7 +1239,12 @@ def _with_mode(environment: RunEnvironment, mode: str) -> RunEnvironment:
 
     return replace(
         environment,
-        env={**environment.env, MODELING_V2_ENV: mode, RUNTIME_VALUE_DUMP_ENV: "1"},
+        env={
+            **environment.env,
+            MODELING_V2_ENV: mode,
+            RUNTIME_VALUE_DUMP_ENV: "1",
+            STEP_CONTRACT_ENV: "1",
+        },
     )
 
 
@@ -2655,6 +2667,7 @@ __all__ = [
     "MODE_OFF",
     "MODE_REQUIRE",
     "RUNTIME_VALUE_DUMP_ENV",
+    "STEP_CONTRACT_ENV",
     "ShellResult",
     "ShellRunner",
     "TreeState",

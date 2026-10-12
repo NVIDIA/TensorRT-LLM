@@ -14,16 +14,17 @@ parallelize, resume, and audit; a prose queue is none of those.
 Each computation step lands in one of three states:
 
 ===========  ==========================================================
-``OK``       an entry exists and its certified column covers this
-             checkpoint's values — nothing to do
+``OK``       an entry exists and its ``CELLS`` cover this checkpoint's
+             values on an arch in its ``ARCHS`` — nothing to do
 ``CERT``     an entry exists, but this surface is not covered — dispatch
              smith with ``kernel-verify``
 ``GAP``      no entry at all — dispatch smith with ``kernel-onboard``
 ===========  ==========================================================
 
 **The judging happens in the plan phase, not inside smith.** Deciding
-whether a value falls inside an entry's certified column is *reading a
-contract*, and contracts are written to be sufficient on their own. What
+whether a value falls inside an entry's cells is *reading the entry* -- an
+``OpWrapper`` class whose cells, ``ARCHS`` and ``note`` are written to be
+sufficient on their own. What
 needs smith is a step with no entry, because only reading the engine's
 source tells you what that callable is and whether it can be one atomic
 entry.
@@ -100,7 +101,7 @@ TIER_DESCRIPTION: dict[int, str] = {
 }
 
 #: A tier above this is work this run *writes* rather than *wraps*, so it
-#: costs an implementation as well as a contract and a test.
+#: costs an implementation as well as an entry and its test.
 HIGHEST_REUSING_TIER = TIER_INTREE_CALLABLE
 
 VERDICT_ASSEMBLABLE = "assemblable"
@@ -128,6 +129,8 @@ class QueueItem:
 
     n: int
     mode: str
+    #: ``<category>/<name>`` for the shared catalog, ``ops/<category>/<name>``
+    #: for an entry only this run's target calls, kept in its own ``ops/``.
     target: str
     depends_on: tuple[int, ...] = ()
     surface: str | None = None

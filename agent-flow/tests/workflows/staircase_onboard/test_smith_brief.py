@@ -119,7 +119,7 @@ def test_without_declared_call_sites_the_brief_assumes_decode_and_verify(tmp_pat
     brief = smith_brief.render_smith_brief(_item("norm/rmsnorm"), steps=STEPS, plan=plan)
     assert "ASSUMED" in brief
     assert "| decode step | G |" in brief and "| speculative verify step | 6·G |" in brief
-    assert "read them from the contract" in brief
+    assert "read them from the entry's raw_call" in brief
 
 
 def test_malformed_call_sites_are_named(tmp_path):
@@ -150,6 +150,12 @@ def test_entry_keys_match_every_spelling():
         assert smith_brief.entry_key(spelled) == "attention/compressor"
     assert len(smith_brief.steps_for(STEPS, "compressor")) == 1
     assert smith_brief.steps_for(STEPS, "other/compressor") == []
+    # A target's own entry keeps its ops/ prefix: it is not the shared entry.
+    for spelled in (
+        "ops/moe/router.py",
+        "tensorrt_llm/_torch/_experimental/modeling_v2/models/fam/ckpt__sm_103__tp1/ops/moe/router",
+    ):
+        assert smith_brief.entry_key(spelled) == "ops/moe/router"
 
 
 def test_the_brief_carries_the_queue_row(tmp_path):
@@ -203,6 +209,8 @@ def test_every_smith_prompt_carries_the_brief(tmp_path, task_file, monkeypatch):
     assert "## Smith brief: dispatch 1, verify `flashinfer_rmsnorm`" in smith
     assert "### Envelope (DERIVED from the gate tuples (legacy))" in smith
     assert "Integer-width boundary probes (mandatory)" in smith
+    # An `ops/<category>/<name>` dispatch lives in this target's own ops/.
+    assert "\nTarget: tensorrt_llm/_torch/_experimental/modeling_v2/models/" in smith
 
 
 def test_the_verify_skill_and_the_prompts_carry_the_probes():

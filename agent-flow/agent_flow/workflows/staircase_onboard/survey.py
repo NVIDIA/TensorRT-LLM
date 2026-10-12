@@ -19,8 +19,9 @@ agent exists. It has two halves and they are deliberately not joined:
   heads, quantization. Pure Python, no GPU, no imports of the engine.
 - :func:`run_inventory_probe` runs on the real host and reports what the
   build *supplies* — which ops are registered, which catalog entries exist,
-  which of those carry a receipt for this architecture, and which entries
-  name an ``impl`` that no longer resolves.
+  which of those are certified on this architecture (their ``ARCHS``), which
+  entries name an ``impl`` that no longer resolves, and which ops other
+  targets keep in their own ``ops/`` (promotable, not spendable).
 
 **The join between them is judgement and stays in prose.** Deciding that
 "this model wants SwiGLU" is answered by ``activation/flashinfer_silu_and_mul``
@@ -692,20 +693,35 @@ def read_checkpoint_surface(config: Mapping[str, Any]) -> CheckpointSurface:
 # half two: what the build supplies
 # --------------------------------------------------------------------------
 
+#: An entry's ``ARCHS`` names this architecture: its cells were driven here.
 RECEIPT_PASSED = "passed"
+#: Kept for callers that still branch on it; an ``OpWrapper`` entry has no
+#: failed state -- a measured failure is a value outside its ``CELLS``, guarded
+#: by ``is_valid`` and written in its ``note``.
 RECEIPT_FAILED = "failed"
+#: This architecture is not in ``ARCHS`` (or the entry declares none): unknown.
 RECEIPT_ABSENT = "absent"
 
 
 @dataclass(frozen=True)
 class CatalogEntry:
-    """One catalog entry as the host actually holds it."""
+    """One catalog entry as the host actually holds it.
+
+    ``scope`` is empty for the shared catalog and ``<family>/<target>`` for an
+    op that target keeps in its own ``ops/``. Another target cannot import the
+    latter -- targets share the catalog and nothing else -- so it is
+    *promotable* vocabulary: certified once already, and a move to the shared
+    catalog (with its test) away from spendable.
+    """
 
     path: str
     impl: str = ""
     summary: str = ""
     receipt: str = RECEIPT_ABSENT
     impl_resolves: bool = True
+    scope: str = ""
+    #: How many ``Cell`` s the entry certifies; 0 when it states none.
+    cells: int = 0
 
     @property
     def name(self) -> str:
@@ -718,22 +734,20 @@ class CatalogEntry:
 
     @property
     def certifiable(self) -> bool:
-        """Whether a receipt is a thing this entry can even have.
+        """Every shared entry is an ``OpWrapper`` with cells to certify.
 
-        ``torch/`` entries are thin mirrors of torch callables; upstream owns
-        their correctness, so the catalog gives them no contract, no test and
-        no architecture certification. For those, absence is *by design* and
-        not the three-state "unknown" — listing them as "a receipt run is
-        what is missing" points at work that does not exist.
+        There are no exempt categories: native torch calls are not entries,
+        a target calls torch directly. A target's own ``ops/`` entry is
+        certified too, but for that target; see :attr:`scope`.
         """
-        return self.category != "torch"
+        return not self.scope
 
     @property
     def spendable(self) -> bool:
-        """Usable without a smith dispatch: certified here and still wired."""
-        if not self.impl_resolves:
+        """Usable without a smith dispatch: shared, certified here, and still wired."""
+        if not self.impl_resolves or self.scope:
             return False
-        return self.receipt == RECEIPT_PASSED or not self.certifiable
+        return self.receipt == RECEIPT_PASSED
 
 
 @dataclass(frozen=True)
@@ -771,6 +785,17 @@ class Inventory:
         return tuple(
             e for e in self.catalog if e.certifiable and e.impl_resolves and not e.spendable
         )
+
+    @property
+    def promotable(self) -> tuple[CatalogEntry, ...]:
+        """Ops another target keeps in its own ``ops/``.
+
+        Not spendable as they stand -- a target may import the catalog and
+        nothing else of another target's -- but certified once already, so a
+        demand one of them answers costs a move into the shared catalog (the
+        entry and its test, re-run here), not an onboard.
+        """
+        return tuple(e for e in self.catalog if e.scope)
 
     @property
     def rotted(self) -> tuple[CatalogEntry, ...]:
@@ -869,7 +894,9 @@ def resolves(dotted, entry_path=None):
         # spend these" and the plan phase had to argue the survey down.
         if entry_path:
             import importlib
-            module = CATALOG_PKG + "." + entry_path[:-3].replace("/", ".")
+            module = entry_path
+            if "/" in module:
+                module = CATALOG_PKG + "." + module[:-3].replace("/", ".")
             try:
                 importlib.import_module(module)
             except Exception:
@@ -897,89 +924,57 @@ def resolves(dotted, entry_path=None):
         return True
     return False
 
-def frontmatter(md_path):
+def entry_certification(py_path):
+    # An entry is an OpWrapper subclass whose class attributes are its
+    # contract: `ARCHS = frozenset({Arch.SM_103})` names the architectures
+    # its `CELLS` were driven on. Read from the AST rather than by importing,
+    # so an entry whose op does not import here still reports what it claims.
+    # Returns (archs, cells, impl).
     try:
-        text = md_path.read_text(encoding="utf-8")
-    except OSError:
-        return ""
-    if not text.startswith("---") or text.count("---") < 2:
-        return ""
-    return text.split("---", 2)[1]
-
-def receipt_state(md_path, arch):
-    # Three-state, keyed by arch: passed / failed / absent. Absent means
-    # UNKNOWN, and conflating it with either other state is the whole reason
-    # this is three-state.
-    #
-    # Two frontmatter shapes are in use -- `sm_103: {status: passed, tests: 9}`
-    # and the block form with `status:` on its own indented line -- and an
-    # earlier hand-rolled reader got both wrong in the same direction: it
-    # reported the inline FAILED entry as passed, and the block FAILED entry
-    # as absent. yaml is used when importable, which in the run's own
-    # interpreter it always is; the fallback below reads `status:` rather
-    # than guessing from the presence of a value.
-    head = frontmatter(md_path)
-    if not head:
-        return "absent"
-    try:
-        import yaml
-        receipts = (yaml.safe_load(head) or {}).get("receipts") or {}
-        record = receipts.get(arch)
-        if record is None:
-            return "absent"
-        if isinstance(record, dict):
-            status = str(record.get("status", "")).lower()
-        else:
-            status = str(record).lower()
-        if status.startswith(("pass", "true", "ok")):
-            return "passed"
-        if status.startswith(("fail", "false")):
-            return "failed"
-        return "absent"
-    except ImportError:
-        pass
-    except Exception:
-        return "absent"
-
-    inside, base_indent, status = False, None, ""
-    for line in head.splitlines():
-        stripped = line.strip()
-        if not stripped:
+        text = py_path.read_text(encoding="utf-8")
+        tree = ast.parse(text)
+    except (OSError, SyntaxError):
+        return [], 0, ""
+    archs, cells, call = set(), 0, ""
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ClassDef):
             continue
-        indent = len(line) - len(line.lstrip())
-        if stripped.startswith("receipts:"):
-            inside, base_indent = True, indent
+        if not any(
+            (isinstance(b, ast.Name) and b.id == "OpWrapper")
+            or (isinstance(b, ast.Attribute) and b.attr == "OpWrapper")
+            for b in node.bases
+        ):
             continue
-        if not inside:
-            continue
-        if indent <= base_indent:
-            break
-        if stripped.startswith(arch + ":"):
-            rest = stripped.split(":", 1)[1].strip()
-            if rest:
-                # inline flow mapping, or a bare scalar
-                marker = "status:"
-                status = (
-                    rest.split(marker, 1)[1].strip(" {}'\"").split(",")[0].strip()
-                    if marker in rest
-                    else rest.strip("{}'\"")
-                )
+        for stmt in node.body:
+            if isinstance(stmt, ast.FunctionDef) and stmt.name == "raw_call":
+                call = ast.get_source_segment(text, stmt) or ""
+                continue
+            if isinstance(stmt, ast.Assign):
+                names = [t.id for t in stmt.targets if isinstance(t, ast.Name)]
+            elif isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name):
+                names = [stmt.target.id]
             else:
-                # block form: the first `status:` under this arch key
-                status = "__block__"
-            continue
-        if status == "__block__":
-            if stripped.startswith("status:"):
-                status = stripped.split(":", 1)[1].strip().strip("'\"")
-            elif indent <= base_indent + 2:
-                status = ""  # left the arch block without ever seeing a status
-                break
-    status = status.lower()
-    if status.startswith(("pass", "true", "ok")):
-        return "passed"
-    if status.startswith(("fail", "false")):
-        return "failed"
-    return "absent"
+                continue
+            if stmt.value is None:
+                continue
+            for sub in ast.walk(stmt.value):
+                if "ARCHS" in names:
+                    if isinstance(sub, ast.Attribute) and sub.attr.startswith("SM_"):
+                        archs.add(sub.attr.lower())
+                    elif isinstance(sub, ast.Constant) and str(sub.value).startswith("sm_"):
+                        archs.add(str(sub.value))
+                if "CELLS" in names and isinstance(sub, ast.Call):
+                    func = sub.func
+                    if (isinstance(func, ast.Name) and func.id == "Cell") or (
+                        isinstance(func, ast.Attribute) and func.attr == "Cell"
+                    ):
+                        cells += 1
+    # The op `raw_call` makes, not the first op the file mentions: an entry's
+    # docstring and reference routinely name its neighbours.
+    match = re.search(r"torch\.ops\.trtllm\.([A-Za-z0-9_]+)", call) or re.search(
+        r"torch\.ops\.trtllm\.([A-Za-z0-9_]+)", text
+    )
+    return sorted(archs), cells, ("torch.ops.trtllm." + match.group(1)) if match else ""
 
 catalog = repo / "tensorrt_llm/_torch/_experimental/modeling_v2/catalog"
 index = catalog / "index.yaml"
@@ -1001,14 +996,34 @@ if index.is_file():
             entry["summary"] = line.split(":", 1)[1].strip().strip("'\"")[:160]
     if entry:
         out["catalog"].append(entry)
+# A target's own ops: certified for that target, promotable for another.
+models = repo / "tensorrt_llm/_torch/_experimental/modeling_v2/models"
+for py in sorted(models.glob("*/*/ops/*/*.py")) if models.is_dir() else ():
+    if py.name == "__init__.py":
+        continue
+    target_dir = py.parents[2]
+    out["catalog"].append({
+        "path": "%s/%s" % (py.parent.name, py.name),
+        "impl": entry_certification(py)[2],
+        "summary": "",
+        "scope": "%s/%s" % (target_dir.parent.name, target_dir.name),
+    })
 for entry in out["catalog"]:
-    md = catalog / entry["path"].replace(".py", ".md")
-    entry["receipt"] = receipt_state(md, arch)
+    if entry.get("scope"):
+        py = models / entry["scope"] / "ops" / entry["path"]
+        module = "tensorrt_llm._torch._experimental.modeling_v2.models.%s.ops.%s" % (
+            entry["scope"].replace("/", "."), entry["path"][:-3].replace("/", "."))
+    else:
+        py = catalog / entry["path"]
+        module = entry["path"]
+    archs, cells, _ = entry_certification(py)
+    entry["cells"] = cells
+    entry["receipt"] = "passed" if arch in archs and cells else "absent"
     # Only claim an entry is unwired when the op inventory was actually
     # taken. Without that guard an engine that failed to import reports the
     # whole catalog as rotted, which is the most alarming possible way to
     # say "I could not measure this".
-    entry["impl_resolves"] = True if out["error"] else bool(resolves(entry["impl"], entry.get("path")))
+    entry["impl_resolves"] = True if out["error"] else bool(resolves(entry["impl"], module))
 
 # Provenance. Every op enters `torch.ops.trtllm` through one of two planes,
 # and the Python plane names its source in the file name. An op matched by
@@ -1045,7 +1060,7 @@ def probe_command(environment: RunEnvironment, *, repo: str | Path, arch: str) -
 
     Launched as **one** process whatever the run's world size. This is
     read-only introspection — it imports the build, walks ``torch.ops.trtllm``
-    and parses catalog frontmatter off disk — so nothing in it wants a rank
+    and reads the catalog entries' certification off disk — so nothing in it wants a rank
     per device, and taking the engine's launch rules instead cost this
     workflow a whole survey once: at world size 4 the probe went out as
     ``mpirun -n 4 ... trtllm-llmapi-launch``, the run's own ``PATH`` did not
@@ -1078,6 +1093,8 @@ def parse_inventory(stdout: str, *, arch: str = "") -> Inventory:
             summary=str(e.get("summary", "")),
             receipt=str(e.get("receipt", RECEIPT_ABSENT)),
             impl_resolves=bool(e.get("impl_resolves", True)),
+            scope=str(e.get("scope", "") or ""),
+            cells=int(e.get("cells", 0) or 0),
         )
         for e in data.get("catalog", ())
     )
@@ -1203,10 +1220,11 @@ def format_surface(surface: CheckpointSurface, inventory: Inventory, *, limit: i
         return "\n".join(lines) + "\n"
 
     spendable = inventory.spendable
+    shared = [e for e in inventory.catalog if not e.scope]
     lines.append(
-        f"{len(spendable)} of {len(inventory.catalog)} catalog entries are spendable on "
-        f"`{inventory.arch}` — certified here and still wired, or a `torch/` mirror that "
-        f"needs no certification. {len(inventory.trtllm_ops)} ops are registered in this "
+        f"{len(spendable)} of {len(shared)} shared catalog entries are spendable on "
+        f"`{inventory.arch}` — their `ARCHS` name it, so their `CELLS` were driven here, "
+        f"and they are still wired. {len(inventory.trtllm_ops)} ops are registered in this "
         f"build."
     )
     lines.append("")
@@ -1235,13 +1253,26 @@ def format_surface(surface: CheckpointSurface, inventory: Inventory, *, limit: i
         lines.append("")
     if unrun:
         lines.append(
-            "**Present but un-run on this arch** — the wrapper exists and the receipt is "
-            "absent, which reads as *unknown*. A receipt run is what is missing, and that "
-            "is much cheaper than an onboard:"
+            "**Present but un-run on this arch** — the entry exists and its `ARCHS` does "
+            "not name this architecture, which reads as *unknown*. Driving its cells here "
+            "is what is missing, and that is much cheaper than an onboard:"
         )
         lines.append("")
         for entry in unrun[:limit]:
             lines.append(f"- `{entry.category}/{entry.name}`")
+        lines.append("")
+    promotable = inventory.promotable
+    if promotable:
+        lines.append(
+            "**Kept by another target in its own `ops/`** — certified for that target, "
+            "importable by no other. A demand one of these answers costs a promotion into "
+            "the shared catalog (the entry and its test move, the cells are re-driven "
+            "here), not an onboard:"
+        )
+        lines.append("")
+        for entry in promotable[:limit]:
+            impl = f" → `{entry.impl}`" if entry.impl else ""
+            lines.append(f"- `{entry.scope}/ops/{entry.category}/{entry.name}`{impl}")
         lines.append("")
     if inventory.rotted:
         lines.append(

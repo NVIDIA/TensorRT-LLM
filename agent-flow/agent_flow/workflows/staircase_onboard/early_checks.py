@@ -35,7 +35,7 @@ from .delivery import (
     ACCURACY_TESTS_DIR,
     CATALOG_DIR,
     CATALOG_TESTS_DIR,
-    MIRROR_CATEGORY,
+    MODEL_OPS_DIRNAME,
     TEST_DB_DIR,
 )
 
@@ -135,7 +135,12 @@ class EarlyReport:
 
 
 def vocabulary_entries(vocabulary_path: Path | str, catalog_root: Path) -> list[tuple[str, str]]:
-    """``(category, name)`` for every entry the plan names, resolved against the catalog."""
+    """``(category, name)`` for every shared entry the plan names, resolved against the catalog.
+
+    A target's own entries (``ops/<category>/<name>``) are left out: their tests
+    sit under the target's path in the tests tree, which delivery checks once
+    the target exists.
+    """
     path = Path(vocabulary_path)
     if not path.is_file():
         return []
@@ -155,6 +160,8 @@ def vocabulary_entries(vocabulary_path: Path | str, catalog_root: Path) -> list[
     entries: set[tuple[str, str]] = set()
     for raw in named:
         text = raw.strip().removesuffix(".py")
+        if text.startswith(f"{MODEL_OPS_DIRNAME}/") or f"/{MODEL_OPS_DIRNAME}/" in text:
+            continue
         if "catalog/" in text:
             text = text.split("catalog/", 1)[1]
         if "/" in text:
@@ -173,8 +180,6 @@ def check_test_naming(repo_root: Path, entries: Iterable[tuple[str, str]]) -> li
     findings: list[EarlyFinding] = []
     tests_root = repo_root / CATALOG_TESTS_DIR
     for category, name in entries:
-        if category == MIRROR_CATEGORY:
-            continue
         expected = tests_root / category / f"test_modeling_v2_{name}.py"
         if expected.is_file():
             continue

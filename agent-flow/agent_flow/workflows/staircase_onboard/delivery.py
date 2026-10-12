@@ -14,7 +14,8 @@ In tree a finished onboarding touches **six** trees, three of them outside
 the package the CI selector claims. Every one has a way of being silently
 half-done, so every one gets a check:
 
-1. the catalog entries the target imports
+1. the catalog entries the target imports -- shared ones under ``catalog/``,
+   and the ones only this target calls under its own ``ops/``
 2. their GPU tests, in the tests tree
 3. the target itself
 4. the routing entry that makes it reachable
@@ -54,14 +55,27 @@ ACCURACY_REFERENCES_DIR = "tests/integration/defs/accuracy/references"
 ACCURACY_TESTS_DIR = "tests/integration/defs/accuracy"
 TEST_DB_DIR = "tests/integration/test_lists/test-db"
 
-# ``catalog/torch/`` holds thin mirrors of torch callables. Upstream owns
-# their correctness, so by design they carry no contract, no test and no
-# receipts — absence there is not a gap.
-MIRROR_CATEGORY = "torch"
+#: A target's own entries -- ops only it calls -- sit in this directory of the
+#: target, one ``<category>/<name>.py`` each, and their tests mirror that path
+#: under ``CATALOG_TESTS_DIR/models/<family>/<target>/``.
+MODEL_OPS_DIRNAME = "ops"
+
+# What a target is made of since the target layer: the core dispatches each
+# step to one of these two, chosen by ``_target.phase_of``.
+TARGET_CLASSES = ("PrefillTarget", "DecodeTarget")
+# The fields ``phase_of`` routes on; a decode target states them, never reads them.
+PHASE_FIELDS = ("num_contexts", "num_ctx_tokens")
+# Module-level names of a manifest written beside the weight table by hand.
+HAND_MANIFEST_NAMES = ("MANIFEST", "_manifest")
 
 _CATALOG_IMPORT = re.compile(
     r"tensorrt_llm\._torch\._experimental\.modeling_v2\.catalog\.([a-z_]+)\.([a-z0-9_]+)"
 )
+_MODEL_OPS_IMPORT = re.compile(
+    r"tensorrt_llm\._torch\._experimental\.modeling_v2\.models\.[a-z0-9_]+\."
+    r"([a-z0-9_]+)\.ops\.([a-z_]+)\.([a-z0-9_]+)"
+)
+_RELATIVE_OPS_IMPORT = re.compile(r"^ops\.([a-z_]+)\.([a-z0-9_]+)")
 
 
 @dataclass(frozen=True)
@@ -119,21 +133,149 @@ def imported_catalog_entries(modeling_py: Path) -> list[tuple[str, str]]:
     return sorted(set(found))
 
 
-def declared_required_ops(modeling_py: Path) -> list[str]:
-    """Read ``REQUIRED_TRTLLM_OPS`` statically."""
+def imported_model_ops(modeling_py: Path) -> list[tuple[str, str, str]]:
+    """Return ``(target_dir, category, name)`` for every ``ops/`` entry a target imports.
+
+    A target reaches its own ``ops/`` relatively (``from .ops.moe.x import X``)
+    or by absolute path; either way ``target_dir`` is the directory the entry
+    lives in, so an import of *another* target's op is visible as one --
+    targets share the catalog and nothing else.
+    """
     tree = ast.parse(modeling_py.read_text(encoding="utf-8"))
+    own = modeling_py.parent.name
+    found: set[tuple[str, str, str]] = set()
     for node in ast.walk(tree):
-        if not isinstance(node, ast.Assign):
-            continue
-        for target in node.targets:
-            if isinstance(target, ast.Name) and target.id == "REQUIRED_TRTLLM_OPS":
-                try:
-                    value = ast.literal_eval(node.value)
-                except ValueError:
-                    return []
-                if isinstance(value, (list, tuple)):
-                    return [str(v) for v in value]
-    return []
+        modules: list[str] = []
+        if isinstance(node, ast.ImportFrom) and node.module:
+            if node.level == 1:
+                match = _RELATIVE_OPS_IMPORT.match(node.module)
+                if match:
+                    found.add((own, match.group(1), match.group(2)))
+                continue
+            modules = [node.module]
+        elif isinstance(node, ast.Import):
+            modules = [alias.name for alias in node.names]
+        for module in modules:
+            match = _MODEL_OPS_IMPORT.search(module)
+            if match:
+                found.add((match.group(1), match.group(2), match.group(3)))
+    return sorted(found)
+
+
+@dataclass(frozen=True)
+class EntryContract:
+    """What an entry's source states about itself, read without importing it.
+
+    An entry is an ``OpWrapper`` subclass: ``raw_call`` is the op call,
+    ``reference`` what it should compute, ``CELLS`` the inputs it is certified
+    over and ``ARCHS`` the architectures those cells were driven on. There is
+    no separate contract file -- the class is the contract, and its test is
+    what keeps it true.
+    """
+
+    classes: tuple[str, ...] = ()
+    archs: tuple[str, ...] = ()
+    cells: int = 0
+    problems: tuple[str, ...] = ()
+
+    @property
+    def certified(self) -> bool:
+        return bool(self.classes) and not self.problems
+
+
+def _is_opwrapper_base(base: ast.expr) -> bool:
+    return (isinstance(base, ast.Name) and base.id == "OpWrapper") or (
+        isinstance(base, ast.Attribute) and base.attr == "OpWrapper"
+    )
+
+
+def _class_assignment(cls: ast.ClassDef, name: str) -> ast.expr | None:
+    for node in cls.body:
+        if isinstance(node, ast.Assign) and any(
+            isinstance(t, ast.Name) and t.id == name for t in node.targets
+        ):
+            return node.value
+        if (
+            isinstance(node, ast.AnnAssign)
+            and isinstance(node.target, ast.Name)
+            and node.target.id == name
+        ):
+            return node.value
+    return None
+
+
+def _arch_names(value: ast.expr | None) -> list[str]:
+    """``frozenset({Arch.SM_103})`` -> ``["sm_103"]``; anything else -> ``[]``."""
+    archs = []
+    for node in ast.walk(value) if value is not None else ():
+        if isinstance(node, ast.Attribute) and node.attr.startswith("SM_"):
+            archs.append(node.attr.lower())
+        elif isinstance(node, ast.Constant) and isinstance(node.value, str):
+            if node.value.startswith("sm_"):
+                archs.append(node.value)
+    return sorted(set(archs))
+
+
+def _cell_count(value: ast.expr | None) -> int:
+    if value is None:
+        return 0
+    return sum(
+        1
+        for node in ast.walk(value)
+        if isinstance(node, ast.Call)
+        and (
+            (isinstance(node.func, ast.Name) and node.func.id == "Cell")
+            or (isinstance(node.func, ast.Attribute) and node.func.attr == "Cell")
+        )
+    )
+
+
+def entry_contract(path: Path) -> EntryContract:
+    """Read an entry's executable contract statically. See :class:`EntryContract`."""
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+    except (OSError, SyntaxError) as exc:
+        return EntryContract(problems=(f"unreadable: {type(exc).__name__}: {exc}",))
+    classes = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ClassDef) and any(_is_opwrapper_base(b) for b in node.bases)
+    ]
+    if not classes:
+        return EntryContract(
+            problems=(
+                "no OpWrapper subclass: an entry is its executable contract "
+                "(raw_call, reference, CELLS, ARCHS), not a bare function",
+            )
+        )
+    problems: list[str] = []
+    archs: set[str] = set()
+    cells = 0
+    for cls in classes:
+        methods = {n.name for n in cls.body if isinstance(n, ast.FunctionDef)}
+        for required in ("raw_call", "reference"):
+            if required not in methods:
+                problems.append(f"{cls.name} defines no {required}")
+        cls_cells = _cell_count(_class_assignment(cls, "CELLS"))
+        cls_archs = _arch_names(_class_assignment(cls, "ARCHS"))
+        if not cls_cells:
+            problems.append(f"{cls.name} declares no CELLS: nothing is certified")
+        if not cls_archs:
+            problems.append(
+                f"{cls.name} declares no ARCHS: its cells were driven on no architecture"
+            )
+        cells += cls_cells
+        archs.update(cls_archs)
+    return EntryContract(
+        classes=tuple(c.name for c in classes),
+        archs=tuple(sorted(archs)),
+        cells=cells,
+        problems=tuple(problems),
+    )
+
+
+def _contract_detail(contract: EntryContract) -> str:
+    return f"{'/'.join(contract.classes)}: {contract.cells} cell(s) on {', '.join(contract.archs)}"
 
 
 def catalog_index_paths(repo_root: Path) -> set[str]:
@@ -149,33 +291,106 @@ def catalog_index_paths(repo_root: Path) -> set[str]:
     }
 
 
+def _entry_problems(wrapper: Path) -> tuple[list[str], EntryContract | None]:
+    if not wrapper.is_file():
+        return [f"entry missing: {wrapper}"], None
+    contract = entry_contract(wrapper)
+    return list(contract.problems), contract
+
+
 def check_catalog_entries(repo_root: Path, entries: Iterable[tuple[str, str]]) -> list[Check]:
-    """Every imported entry exists, is indexed, and (unless a mirror) is contracted."""
+    """Every imported shared entry exists, states a certified contract, and is indexed.
+
+    Every entry is an ``OpWrapper``; there are no exempt categories. Native
+    torch calls are not entries -- a target calls torch directly -- so an
+    import of anything under ``catalog/`` is an import of a trtllm op that
+    must carry its cells.
+    """
     checks: list[Check] = []
     indexed = catalog_index_paths(repo_root)
     for category, name in entries:
         rel = f"{category}/{name}.py"
-        wrapper = repo_root / CATALOG_DIR / rel
-        contract = wrapper.with_suffix(".md")
-        problems: list[str] = []
-        if not wrapper.is_file():
-            problems.append(f"wrapper missing: {wrapper}")
-        if category != MIRROR_CATEGORY and not contract.is_file():
-            problems.append(f"contract missing: {contract}")
+        problems, contract = _entry_problems(repo_root / CATALOG_DIR / rel)
         if rel not in indexed:
             problems.append(f"not listed in catalog/index.yaml (looked for {rel!r})")
         checks.append(
             Check(
                 name=f"catalog:{rel}",
                 passed=not problems,
-                detail="; ".join(problems) or "wrapper, contract and index entry present",
+                detail="; ".join(problems)
+                or f"{_contract_detail(contract)}; listed in catalog/index.yaml",
             )
         )
     return checks
 
 
+def model_ops_tests_dir(target_rel: str) -> str:
+    """``.../modeling_v2/models/<family>/<target>`` -> its tests' directory."""
+    tail = target_rel.rstrip("/").split(f"{MODELING_V2_PACKAGE}/", 1)[-1]
+    return f"{CATALOG_TESTS_DIR}/{tail}"
+
+
+def check_model_ops(
+    repo_root: Path, target_rel: str, ops: Iterable[tuple[str, str, str]]
+) -> list[Check]:
+    """Every ``ops/`` entry the target imports is its own, and states a certified contract.
+
+    Not indexed: ``catalog/index.yaml`` lists the shared vocabulary only. An
+    op another target needs is promoted to the shared catalog, with its test;
+    importing it out of a sibling's ``ops/`` couples two targets that are
+    certified independently.
+    """
+    own = Path(target_rel.rstrip("/")).name
+    checks: list[Check] = []
+    for target_dir, category, name in ops:
+        rel = f"{MODEL_OPS_DIRNAME}/{category}/{name}.py"
+        if target_dir != own:
+            checks.append(
+                Check(
+                    name=f"ops:{rel}",
+                    passed=False,
+                    detail=f"imported from another target's ops/ ({target_dir}); targets share "
+                    f"the catalog and nothing else -- promote the entry to "
+                    f"{CATALOG_DIR}/{category}/{name}.py",
+                )
+            )
+            continue
+        problems, contract = _entry_problems(repo_root / target_rel / rel)
+        checks.append(
+            Check(
+                name=f"ops:{rel}",
+                passed=not problems,
+                detail="; ".join(problems) or _contract_detail(contract),
+            )
+        )
+    return checks
+
+
+def _test_check(repo_root: Path, tests_dir: str, label: str, category: str, name: str) -> Check:
+    candidates = [
+        f"{tests_dir}/{category}/test_modeling_v2_{name}{suffix}.py"
+        for suffix in ("", "_op_matrix")
+    ]
+    found = next((rel for rel in candidates if (repo_root / rel).is_file()), None)
+    if found is None:
+        return Check(name=label, passed=False, detail=f"missing: {candidates[0]}")
+    test = repo_root / found
+    # A multi-rank entry's collected file only launches its rank body, which
+    # sits beside it as `_<name>_op_matrix.py`; the cells are driven there.
+    sources = [test, test.parent / f"_{name}_op_matrix.py"]
+    drives = any(p.is_file() and ".CELLS" in p.read_text(encoding="utf-8") for p in sources)
+    return Check(
+        name=label,
+        passed=drives,
+        detail=str(test)
+        if drives
+        else f"{test} never reads the entry's .CELLS: parametrize it off them, or the "
+        f"cells it claims were never driven",
+    )
+
+
 def check_catalog_tests(repo_root: Path, entries: Iterable[tuple[str, str]]) -> list[Check]:
-    """Every non-mirror entry has its GPU test, under the name CI matches.
+    """Every shared entry has its GPU test, under the name CI matches, driving its cells.
 
     The name is not a preference: every file in the subtree is called
     ``test_modeling_v2_*`` precisely so it cannot collide with upstream's
@@ -185,28 +400,176 @@ def check_catalog_tests(repo_root: Path, entries: Iterable[tuple[str, str]]) -> 
     A multi-rank entry's test is an op matrix over world sizes and is named
     ``test_modeling_v2_<name>_op_matrix.py``, as the in-tree ``comm`` tests
     are; either name satisfies the check.
+
+    The test has to read the entry's ``CELLS``: a cell list nothing executes
+    reads as coverage. Upstream's claims test checks that for the shared
+    catalog; this checks it for every entry a delivery adds, ``ops/`` included.
     """
-    checks: list[Check] = []
-    for category, name in entries:
-        if category == MIRROR_CATEGORY:
+    return [
+        _test_check(repo_root, CATALOG_TESTS_DIR, f"test:{category}/{name}", category, name)
+        for category, name in entries
+    ]
+
+
+def check_model_op_tests(
+    repo_root: Path, target_rel: str, ops: Iterable[tuple[str, str, str]]
+) -> list[Check]:
+    """Every own ``ops/`` entry has its GPU test under the target's mirror of the tests tree.
+
+    ``ops/<category>/<name>.py`` is tested at
+    ``tests/unittest/_torch/modeling_v2/models/<family>/<target>/<category>/
+    test_modeling_v2_<name>.py`` -- same naming rule as a shared entry.
+    """
+    own = Path(target_rel.rstrip("/")).name
+    tests_dir = model_ops_tests_dir(target_rel)
+    return [
+        _test_check(repo_root, tests_dir, f"test:ops/{category}/{name}", category, name)
+        for target_dir, category, name in ops
+        if target_dir == own
+    ]
+
+
+def _class_nodes(tree: ast.AST) -> dict[str, ast.ClassDef]:
+    return {node.name: node for node in ast.walk(tree) if isinstance(node, ast.ClassDef)}
+
+
+def _base_names(node: ast.ClassDef) -> set[str]:
+    names = set()
+    for base in node.bases:
+        if isinstance(base, ast.Subscript):
+            base = base.value
+        if isinstance(base, ast.Name):
+            names.add(base.id)
+        elif isinstance(base, ast.Attribute):
+            names.add(base.attr)
+    return names
+
+
+def _check_phase_targets(tree: ast.AST) -> list[Check]:
+    """Both targets exist, each answers for its step, and decode never reads the phase back.
+
+    The core dispatches each step to ``PrefillTarget`` or ``DecodeTarget`` on
+    ``phase_of(attn_metadata)``; a core with one of them routes half its steps
+    into an AttributeError. Decode is routed to only when ``num_contexts == 0``,
+    so a read of ``num_contexts`` / ``num_ctx_tokens`` inside it is a branch on
+    a per-capture constant -- frozen at whatever the capturing batch carried.
+    ``test_modeling_v2_claims.py`` gates the same two facts in CI.
+    """
+    classes = _class_nodes(tree)
+    problems: list[str] = []
+    for name in TARGET_CLASSES:
+        node = classes.get(name)
+        if node is None:
+            problems.append(f"no {name}")
             continue
-        candidates = [
-            f"{CATALOG_TESTS_DIR}/{category}/test_modeling_v2_{name}{suffix}.py"
-            for suffix in ("", "_op_matrix")
-        ]
-        found = next((rel for rel in candidates if (repo_root / rel).is_file()), None)
+        if "Target" not in _base_names(node):
+            problems.append(f"{name} does not derive from Target")
+        methods = {
+            item.name
+            for item in node.body
+            if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
+        }
+        missing = [m for m in ("step_args", "forward") if m not in methods]
+        if missing:
+            problems.append(f"{name} defines no {', '.join(missing)}")
+    checks = [
+        Check(
+            name="target:prefill-decode",
+            passed=not problems,
+            detail="; ".join(problems)
+            or "PrefillTarget and DecodeTarget derive from Target and define step_args and forward",
+        )
+    ]
+    decode = classes.get("DecodeTarget")
+    if decode is not None:
+        reads = sorted(
+            {
+                f"line {inner.lineno} .{inner.attr}"
+                for inner in ast.walk(decode)
+                if isinstance(inner, ast.Attribute) and inner.attr in PHASE_FIELDS
+            }
+        )
         checks.append(
             Check(
-                name=f"test:{category}/{name}",
-                passed=found is not None,
-                detail=str(repo_root / found) if found else f"missing: {candidates[0]}",
+                name="target:decode-reads-no-phase",
+                passed=not reads,
+                detail=(
+                    "DecodeTarget states the context counts instead of reading them"
+                    if not reads
+                    else "DecodeTarget reads the phase it was routed on ("
+                    + ", ".join(reads)
+                    + "); state num_contexts/num_ctx_tokens as 0 in its step_args"
+                ),
             )
         )
     return checks
 
 
+def _check_weight_table(weights_py: Path) -> Check:
+    """``weights.py`` states each weight once, as a ``ModelWeights`` table.
+
+    ``ModelWeights`` generates the manifest from ``WEIGHTS``, so a hand-written
+    manifest beside the table is a second copy of every checkpoint key -- the
+    drift the table exists to stop.
+    """
+    tree = ast.parse(weights_py.read_text(encoding="utf-8"))
+    tables = [
+        node
+        for node in _class_nodes(tree).values()
+        if "ModelWeights" in _base_names(node)
+        and any(
+            (isinstance(item, ast.Assign) and any(_is_name(t, "WEIGHTS") for t in item.targets))
+            or (isinstance(item, ast.AnnAssign) and _is_name(item.target, "WEIGHTS"))
+            for item in node.body
+        )
+    ]
+    hand_manifest = sorted(
+        {
+            target.id
+            for node in tree.body
+            for target in (
+                node.targets
+                if isinstance(node, ast.Assign)
+                else [node.target]
+                if isinstance(node, ast.AnnAssign)
+                else []
+            )
+            if isinstance(target, ast.Name) and target.id in HAND_MANIFEST_NAMES
+        }
+        | {
+            node.name
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name in HAND_MANIFEST_NAMES
+        }
+    )
+    problems = []
+    if not tables:
+        problems.append("no ModelWeights subclass with a WEIGHTS table")
+    if hand_manifest:
+        problems.append(
+            f"hand-written {', '.join(hand_manifest)} beside the table; "
+            "ModelWeights.manifest() generates it from WEIGHTS"
+        )
+    return Check(
+        name="target:weight-table",
+        passed=not problems,
+        detail="; ".join(problems) or f"{tables[0].name}(ModelWeights) declares WEIGHTS",
+    )
+
+
+def _is_name(node: ast.AST, name: str) -> bool:
+    return isinstance(node, ast.Name) and node.id == name
+
+
 def check_target(repo_root: Path, target_rel: str) -> list[Check]:
-    """The target's two products exist and it declares the surface it touches."""
+    """The target's two products exist and have the shape the framework expects.
+
+    A core that dispatches to a prefill and a decode target, and a weight
+    table the manifest is generated from. The target's own ``ops/`` are
+    checked with the catalog entries. Engine-surface drift is not declared
+    here: each target's ``step_args`` is the probe its opt-in step-contract
+    check calls, and a renamed op fails at its call.
+    """
     target = repo_root / target_rel
     checks = []
     for product in ("modeling.py", "weights.py"):
@@ -220,19 +583,10 @@ def check_target(repo_root: Path, target_rel: str) -> list[Check]:
         )
     modeling = target / "modeling.py"
     if modeling.is_file():
-        declared = declared_required_ops(modeling)
-        checks.append(
-            Check(
-                name="target:REQUIRED_TRTLLM_OPS",
-                passed=bool(declared),
-                detail=(
-                    f"declares {len(declared)} op(s): {', '.join(declared)}"
-                    if declared
-                    else "declares no REQUIRED_TRTLLM_OPS — nothing would catch a "
-                    "renamed op until the forward hit it"
-                ),
-            )
-        )
+        checks.extend(_check_phase_targets(ast.parse(modeling.read_text(encoding="utf-8"))))
+    weights = target / "weights.py"
+    if weights.is_file():
+        checks.append(_check_weight_table(weights))
     return checks
 
 
@@ -498,8 +852,10 @@ def verify_delivery(
 
     modeling = root / target_rel / "modeling.py"
     entries: list[tuple[str, str]] = list(extra_entries)
+    model_ops: list[tuple[str, str, str]] = []
     if modeling.is_file():
         entries = sorted(set(entries) | set(imported_catalog_entries(modeling)))
+        model_ops = imported_model_ops(modeling)
     else:
         checks.append(
             Check(
@@ -512,6 +868,8 @@ def verify_delivery(
     checks.extend(check_target(root, target_rel))
     checks.extend(check_catalog_entries(root, entries))
     checks.extend(check_catalog_tests(root, entries))
+    checks.extend(check_model_ops(root, target_rel, model_ops))
+    checks.extend(check_model_op_tests(root, target_rel, model_ops))
     checks.extend(check_routing(root, family, target_rel))
     checks.extend(check_accuracy_reference(root, reference_yaml, model_key))
     checks.extend(check_test_registration(root, accuracy_test))
@@ -540,20 +898,25 @@ __all__ = [
     "CATALOG_TESTS_DIR",
     "Check",
     "DeliveryReport",
-    "MIRROR_CATEGORY",
+    "EntryContract",
     "MODELING_V2_PACKAGE",
+    "MODEL_OPS_DIRNAME",
     "TEST_DB_DIR",
     "catalog_index_paths",
     "check_accuracy_reference",
     "check_catalog_entries",
     "check_catalog_tests",
     "check_commit_hygiene",
+    "check_model_op_tests",
+    "check_model_ops",
     "check_routing",
     "check_target",
     "check_test_registration",
     "check_tree_committed",
-    "declared_required_ops",
+    "entry_contract",
     "imported_catalog_entries",
+    "imported_model_ops",
+    "model_ops_tests_dir",
     "summarize_for_auditor",
     "verify_delivery",
     "write_premerge_pack",

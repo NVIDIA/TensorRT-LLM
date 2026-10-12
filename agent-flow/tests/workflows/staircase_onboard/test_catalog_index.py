@@ -59,11 +59,10 @@ def _catalog(repo: Path) -> Path:
 
 
 def _entry(repo: Path, category: str, name: str, summary: str) -> list[str]:
-    """What a smith writes: the wrapper, the contract, and its own fragment."""
+    """What a smith writes: the entry (its contract is the wrapper's class), and its fragment."""
     catalog = _catalog(repo)
     (catalog / category).mkdir(parents=True, exist_ok=True)
     (catalog / category / f"{name}.py").write_text("def f(): ...\n", encoding="utf-8")
-    (catalog / category / f"{name}.md").write_text("# contract\n", encoding="utf-8")
     fragment = catalog / ci.fragment_rel(f"{category}/{name}.py")
     fragment.parent.mkdir(parents=True, exist_ok=True)
     fragment.write_text(
@@ -78,7 +77,6 @@ def _entry(repo: Path, category: str, name: str, summary: str) -> list[str]:
     )
     return [
         f"{CATALOG_DIR}/{category}/{name}.py",
-        f"{CATALOG_DIR}/{category}/{name}.md",
         f"{CATALOG_DIR}/{ci.fragment_rel(f'{category}/{name}.py')}",
     ]
 
@@ -116,6 +114,45 @@ def test_the_real_catalog_migrates_without_losing_a_row_or_a_comment(tmp_path):
     # Byte-identical apart from the notice that says the file is generated.
     assert regenerated.replace(ci.GENERATED_NOTICE, "") == original
     assert ci.problems(ci.snapshot_worktree(copy)) == []
+
+
+_STACKED_DIVIDERS = """\
+# header
+
+entries:
+  # ─── norm ──────────────────────────────────────────────────────
+  - path: norm/flashinfer_rmsnorm.py
+    impl: torch.ops.trtllm.flashinfer_rmsnorm
+    summary: "rmsnorm"
+
+  # ─── moe ───────────────────────────────────────────────────────
+  # ─── quantization ──────────────────────────────────────────────
+  # ─── gemm ──────────────────────────────────────────────────────
+  - path: gemm/cublas_mm.py
+    impl: torch.ops.trtllm.cublas_mm
+    summary: "matmul"
+"""
+
+
+def test_dividers_of_categories_with_no_entry_survive_migration(tmp_path):
+    """Upstream's index keeps a divider for a category it has no entry in yet.
+
+    Those dividers stack directly above the next category's, and they stay
+    there: a migration that dropped them would not be byte-identical, and an
+    entry landing in that category later goes under its own divider.
+    """
+    root = _build_repo(tmp_path)
+    catalog = _catalog(root)
+    (catalog / "index.yaml").write_text(_STACKED_DIVIDERS, encoding="utf-8")
+    ci.migrate(catalog)
+    regenerated = (catalog / "index.yaml").read_text(encoding="utf-8")
+    assert regenerated.replace(ci.GENERATED_NOTICE, "") == _STACKED_DIVIDERS
+    assert ci.problems(ci.snapshot_worktree(catalog)) == []
+
+    _entry(root, "moe", "fused_moe", "a moe entry")
+    text = ci.render(ci.snapshot_worktree(catalog))
+    moe_divider = text.index("# ─── moe ")
+    assert moe_divider < text.index("path: moe/fused_moe.py") < text.index("# ─── quantization ")
 
 
 def test_migration_is_idempotent(tmp_path):
@@ -229,7 +266,7 @@ def test_a_fragment_whose_entry_is_not_committed_is_left_out(repo, commit):
     _first_smith(repo, commit)
     ci.sync(repo, commit=commit)
     paths = _entry(repo, "norm", "half_landed", "fragment committed, wrapper not")
-    ok, _ = commit("feat(catalog): fragment only", [paths[2]])
+    ok, _ = commit("feat(catalog): fragment only", [paths[-1]])
     assert ok
     ci.sync(repo, commit=commit)
     assert "norm/half_landed.py" not in _index_paths(_head_index(repo))

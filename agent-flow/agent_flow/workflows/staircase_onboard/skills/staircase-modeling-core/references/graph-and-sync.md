@@ -22,7 +22,7 @@ read the same copy.
 ## What a replayed forward may contain
 
 Decode replay executes captured kernels only. Classify every value the
-step consumes — the step-args builder is the single audit point:
+step consumes — each target's `step_args` is the single audit point:
 
 | Class | Meaning | Replay behavior |
 |---|---|---|

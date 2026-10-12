@@ -41,15 +41,26 @@ category is where the candidates are.
 ### 2. Vocabulary mapping
 
 Map every step onto
-`tensorrt_llm/_torch/_experimental/modeling_v2/catalog/index.yaml` and the
-entries' contracts. Each row lands in one of three states — the judging rules
-are in `references/mapping-and-triage.md`:
+`tensorrt_llm/_torch/_experimental/modeling_v2/catalog/index.yaml` (the shared
+vocabulary) and the entries themselves: an entry is an `OpWrapper` class whose
+`CELLS`, `ARCHS` and `note` are what it certifies
+(`tensorrt_llm/_torch/_experimental/modeling_v2/catalog/_op.py`). The surface
+survey also lists ops other targets keep in their own `ops/` — certified for
+them, importable by no other target. Each row lands in one of three states —
+the judging rules are in `references/mapping-and-triage.md`:
 
 | state | meaning |
 |---|---|
-| **OK** | an entry exists and its certified column covers this checkpoint's values |
-| **CERT** | an entry exists; this surface is not covered |
-| **GAP** | no entry |
+| **OK** | a shared entry exists, a cell covers this checkpoint's values, and `ARCHS` names this arch |
+| **CERT** | a shared entry exists; this surface is not covered |
+| **GAP** | no shared entry — including an op another target keeps in its `ops/`, which is a *promotion* |
+
+**Decide each new entry's home** in the queue `target`: `<category>/<name>` for
+the shared catalog, `ops/<category>/<name>` for this target's own `ops/`. An op
+only this target calls goes in its `ops/`; an op another target already calls
+(a promotion), or one of general use, goes in the shared catalog. A promotion
+row is `mode: onboard` with the existing entry named in its `note`: the entry
+and its test move, and the cells are driven again here.
 
 ### 3. Ceiling check
 
@@ -75,28 +86,22 @@ first costs a dispatch, the second costs a feature — this checkpoint cannot be
 today, and you can say so here, before dispatching anyone. Record the step,
 what it computes, and why nothing upstream provides it.
 
-The mirror surface is glue — layout, movement, allocation, lookup — and a
-missing **computation** kernel (norm, rope, activation, linear, attention,
-quantization) is a ceiling rather than something to build there. **One narrow
-exception**, and it is narrow on purpose: a computation may become a mirror when
-all three hold —
+**Native torch is not an entry.** A step that plain torch serves — layout,
+movement, allocation, lookup, or one torch callable computing exactly what the
+step needs — is no vocabulary row at all: the target calls torch directly, and
+the plan lists it as such. For a **computation** (norm, rope, activation,
+linear, attention, quantization) that answer is narrow on purpose, and holds
+only when all three hold —
 
 1. it is **exactly one torch callable**, not a computation assembled from
-   several mirrors;
+   several;
 2. **no trtllm op serves it**, established by a search closed over the inventory
    *and* the pybind surface the inventory cannot show;
-3. upstream owns its correctness, which is what lets a mirror be contract-free.
+3. upstream owns its correctness, which is what lets it carry no cells.
 
-Composing a computation out of several mirrors is still a ceiling, and reaching
-for a mirror while a trtllm op exists is still wrong — the catalog prefers the
-engine's kernels and a mirror is the last resort, not the convenient one.
-Precedent: `catalog/torch/gelu_tanh.py`, added after the candidate set for
-non-gated `gelu_tanh` at bf16 was searched closed.
-<!-- PORT: verify — `catalog/torch/gelu_tanh.py` is not in the in-tree catalog
-     (`torch/` holds add, concat, copy_, embedding, empty, expand, pad,
-     reshape, split, transpose, view_dtype). The precedent is kept because the
-     rule it illustrates stands on its own; confirm whether the entry was
-     dropped in the move or is still to be ported. -->
+A computation composed from several torch calls is tier 3 — an entry this run
+writes, with cells — and reaching for plain torch while a trtllm op exists is
+still wrong: the catalog prefers the engine's kernels.
 
 ### 4. Write `vocabulary.yaml`
 
@@ -115,15 +120,16 @@ steps:                                  # every computation step, both chapters
     values: {<axis>: <this checkpoint's value>, ...}
     state: OK | CERT | GAP
     entry: catalog/<category>/<name>.py                     # OK and CERT rows
-    contract_line: "<the contract sentence that decides coverage>"
+    contract_line: "<the cell why, note line or is_valid assertion that decides coverage>"
     candidate: torch.ops.trtllm.<name>                      # GAP rows
 
 queue:                                  # one dispatch per entry, in dependency order
-  - {n: 1, mode: onboard, target: <entry name>, depends_on: []}
-  - {n: 2, mode: verify,  target: <entry name>, depends_on: [1],
-     surface: "<the value the certified column excludes>"}
-  - {n: 3, mode: onboard, target: <entry name>, depends_on: [],
+  - {n: 1, mode: onboard, target: <category>/<name>, depends_on: []}      # shared catalog
+  - {n: 2, mode: verify,  target: <category>/<name>, depends_on: [1],
+     surface: "<the value no cell covers>"}
+  - {n: 3, mode: onboard, target: <category>/<name>, depends_on: [],
      unit: <feature>}                   # optional; core when absent
+  - {n: 4, mode: onboard, target: ops/<category>/<name>, depends_on: []}  # this target only
 
 ceiling: null                           # or {step: ..., searched: [...], why: ...}
 ```
@@ -140,7 +146,7 @@ error rather than one per round-trip:
 |---|---|
 | `verdict` is exactly one of `assemblable` / `assemblable_after_additions` / `ceiling` | it is the headline, and the orchestrator branches on it |
 | every `steps` row names a non-empty `step` and a `state` of `OK` / `CERT` / `GAP` | a row with no state is not a mapping |
-| an `OK` or `CERT` row names an `entry` **and** quotes a `contract_line` | the quoted line is the evidence for the judgement; without it nobody can audit the row without redoing the reading |
+| an `OK` or `CERT` row names an `entry` **and** quotes a `contract_line` — the cell `why`, `note` line or `is_valid` assertion that decides it | the quoted line is the evidence for the judgement; without it nobody can audit the row without redoing the reading |
 | a `GAP` row names a `candidate` | a GAP with no candidate anywhere *is* the ceiling — say so in `ceiling` rather than leaving the row bare |
 | `queue[].n` is an integer and unique across the queue | it is the dispatch's identity and what `depends_on` points at |
 | `queue[].mode` is `onboard` or `verify` | it selects the skill smith loads |
@@ -184,24 +190,18 @@ before core started.
 
 ## Why the judging stays here
 
-Reading a contract's certified column is what contracts are *for*. The entry
-spec puts it plainly: "Whoever calls this op reads the contract and nothing
-else — no trtllm source", and "Nothing outside this entry reads trtllm source.
-The contract must stand alone." A contract only smith can interpret would be a
-failed contract.
-<!-- PORT: verify — the first sentence is verbatim in
-     `.claude/skills/staircase-kernel-onboard/references/entry-spec.md`; the
-     second was attributed to staircase's `smith.md` agent definition and is
-     not verbatim in the ported prompt
-     (`agent_flow/workflows/staircase_onboard/prompts/smith.py`), which carries
-     the same doctrine as a red-flag row. Re-attribute or re-quote. -->
+Reading an entry's cells is what they are *for*. `catalog/_op.py` puts it
+plainly: a target author reads the cell list and its reasons, not a document —
+and what they read is what CI proved on the last commit. Whoever calls the op
+reads the class and nothing else, no trtllm source; an entry only smith could
+interpret would be a failed entry.
 
 What genuinely needs smith is a row with **no entry**: only reading source
 tells you what that callable is, whether it can be one entry, and what it
 needs beforehand.
 
 So: **judge here, dispatch to act.** Never dispatch because a row is unclear —
-read the contract again.
+read the entry again.
 
 ## Report
 
@@ -210,5 +210,5 @@ Whether run inside an onboarding or standalone, say:
 - the verdict: assemblable / assemblable after N additions / ceiling
 - the counts by state, and the queue length
 - for a ceiling: the exact step, and what was searched
-- for CERT rows: the value and the contract line that excludes it — this is
+- for CERT rows: the value and the cell or `note` line that excludes it — this is
   what smith is dispatched with, so vagueness here costs a whole run

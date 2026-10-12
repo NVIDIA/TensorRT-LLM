@@ -19,7 +19,7 @@ Two halves, and most readers need only the first.
 
 | file | read it when |
 |---|---|
-| `runtime-interface.md` | always, before writing — registration, shell/model split, weight lifecycle, manifest convention, forward duties, fail-fast ladder, serving-time costs |
+| `runtime-interface.md` | always, before writing — registration, the shell / core / two-target split, binding the entries, weight lifecycle, the weight table, forward duties, fail-fast ladder, serving-time costs |
 | `graph-and-sync.md` | **always, before touching a forward** — what a replayed forward may contain, and which patterns stall the host |
 | `routing-identity.md` | placing a new target, or asking whether some quantity may select one |
 | `step-args.md` | building the attention call's arguments |
@@ -36,43 +36,87 @@ one is the difference between an afternoon and a week.
 ## Invariants
 
 These hold for every edit to a target's modeling code, by anyone, forever.
+`runtime-interface.md` §1, §3, §3a and §5 show each one in code; the two
+in-tree targets (`gpt_oss/gpt_oss_120b__sm_103__tp1`,
+`deepseek_v3/r1_0528_nvfp4__sm_103__dep4`) are the exemplars.
 
-1. **Closed vocabulary.** Inside `forward` and the private methods it reaches,
-   every call that creates or transforms a tensor is a catalog entry. Only
-   tensor-metadata reads and Python control flow live outside. Scope is the
-   whole trick — a whole-file scan false-positives on the rope table's
-   `arange`/`cos`/`sin` and on load-time `.t()`/`.to()`, which run at init.
-2. **The static op declaration lists exactly what the forward calls.**
-   `REQUIRED_TRTLLM_OPS` names every `torch.ops.trtllm.*` symbol the forward
-   reaches, and
-   `tests/unittest/_torch/modeling_v2/test_modeling_v2_target_contract.py`
-   asserts that this build registers each one (plus the pybind entry point the
-   attention op is reached through). The list must *equal* the actual call
-   set — a stale entry is as wrong as a missing one. With no version pin, that
-   declaration is the only thing standing between a drifted engine and a wrong
-   answer: it turns the drift into a loud failure instead.
-3. **Every axis the assembly depends on carries an assert**, read from
-   `pretrained_config`. An assert is how a reused pattern refuses a
-   checkpoint it does not fit.
-4. **Parameters are declared flat**, `torch.empty` only, HF `[out, in]`
-   storage. Derivations happen in the post-load path, never at declaration.
-5. **The manifest asserts coverage in both directions**: every declared
-   parameter is filled, and every checkpoint key is consumed — with one
-   explicit escape, the **known-not-loaded key set**, for weights this target
-   deliberately does not implement (an unimplemented feature's module, an
-   off-window expert range). Anything in that set is named in `weights.py`
-   beside the predicted-leftover assert, with the reason, and reported in the
-   run journal. Without the escape the assert fires on a correct target; with
-   it used loosely, a real miss hides.
+1. **Closed vocabulary.** Inside each target's `forward` and the private
+   methods it reaches, every trtllm op — anything that is not native torch —
+   is called through an entry: a shared `catalog/` entry, or a target-owned
+   op under `<target>/ops/<category>/` when only this target calls it.
+   Native torch calls (`torch.empty`, `torch.reshape`, `torch.add`,
+   `nn.functional.embedding`, ...) are made directly; there are no torch
+   mirrors. Composing an op's math out of torch calls where an engine op
+   serves it is still a vocabulary gap. Scope is the whole trick — a
+   whole-file scan false-positives on the rope table's `arange`/`cos`/`sin`
+   and on load-time `.t()`/`.to()`, which run at init.
+2. **The engine surface is checked by running it, never declared twice.**
+   Each target's `step_args(md)` is the one projection of the attention
+   metadata it consumes, and `Target._check_step_contract` calls it on the
+   first forward under `TRTLLM_MODELING_V2_VALIDATE=1`. A renamed custom op
+   fails at its call. Do not add `REQUIRED_TRTLLM_OPS`, a `_STEP_FIELDS`
+   tuple, or any hand-kept list of names beside the code that reads them —
+   it is only something to forget to update.
+3. **Routing decides identity; the target carries no configuration
+   asserts.** Every axis the assembly depends on is either a routing
+   criterion in `models/<family>/routing.py` (it changes the structure of the
+   forward: config-shape fingerprint, SM, parallel topology) or read from
+   `pretrained_config` where it is bound. A configuration no target
+   implements is refused by routing — `require` raises naming the criterion.
+   When a reused pattern would not fit some checkpoint of the same
+   fingerprint, the fix is a sharper criterion, not an assert in the target.
+   A guard is still owed only where routing cannot see the fact — a runtime
+   combination a feature cannot serve (its skill names them), or a field the
+   runtime reads from somewhere other than the config the target read. Those
+   fail loudly at construction and say why; re-validating what the
+   fingerprint already pins does not.
+4. **Weights are declared once, in the weight table.** `weights.py`
+   subclasses `ModelWeights` with one `W` row per weight role (shape, source,
+   dtype, transform, layers) and a `dims(core)` that is the only place a
+   derived width or padded size is computed; `MODEL_WEIGHTS` is its instance.
+   The core declares `self.w = MODEL_WEIGHTS.declare(dims)` — a flat
+   `nn.ParameterDict`, `torch.empty` only, HF `[out, in]` storage — and the
+   shell's `load_weights` calls `MODEL_WEIGHTS.load`. Never write a manifest
+   by hand: `manifest()` unrolls the table. Load-time layout changes are a
+   row's `transform`; state derived from loaded weights is built in
+   `post_load_weights`, never at declaration.
+5. **Load coverage holds in both directions**: every declared parameter is
+   filled, and every checkpoint key is consumed — with one explicit escape,
+   `expected_unconsumed(core, weights)`, the **known-not-loaded key set**,
+   for weights this target deliberately does not implement (an unimplemented
+   feature's module, an off-window expert range). Each member is named there
+   with its reason and reported in the run journal. Without the escape the
+   assert fires on a correct target; with it used loosely, a real miss hides.
 6. **Graph safety and sync-freedom**, per `references/graph-and-sync.md`.
    These are writing rules, not tuning rules: a forward that violates them is
    wrong the first time it is captured.
-7. **The forward is flat and serves any batch composition.** One code path,
-   branching only on metadata and per-capture constants.
-8. **Fail loudly on what the target does not implement.** The fail-fast ladder
-   is the difference between an unsupported input and a wrong answer.
-9. **Self-containment.** No shared helpers across targets. Duplication between
-   targets is the architecture, not a smell.
+7. **The core dispatches; a prefill and a decode target run the step.** The
+   core's `forward` calls `advance_step_generation()` once and hands the step
+   to `self._select_target(md)`: `DecodeTarget` when `phase_of(md)` is
+   `Phase.DECODE` (`num_contexts == 0`), `PrefillTarget` otherwise — a mixed
+   batch is prefill's. Both are built in the core's `post_load_weights`,
+   hold the core by reference, and derive from `Target` directly with their
+   own `__init__`, `step_args` and `forward` — no shared body, base or mixin
+   between them. `DecodeTarget` states `num_contexts=0, num_ctx_tokens=0`
+   and never reads either back. Each forward is flat: one code path,
+   branching only on metadata and per-capture constants. A draft step reads
+   the phase per draft step, never cached.
+8. **Bind once; call with data.** Each target instantiates its own entries
+   and binds them in its `__init__` against the real weights —
+   `bind_const(...)` for values every layer shares, `bind_layered(i, ...)`
+   per layer, only on the layers that have the operand. What is known only
+   per step (the `step_args` projection, windows from `md.max_seq_len`) is
+   rebound once at the top of `forward`, and per-step scratch is allocated
+   there too — never inside the layer loop. Call sites pass the data tensors
+   and `layer=i`, and every call states its outputs:
+   `out = op(in, out=buf, layer=i)`.
+9. **Self-containment.** A target directory imports the catalog, the
+   framework (`_target`, `_weights`, `catalog._op`), engine surface, and its
+   own siblings (`.weights`, `.ops.<category>.<name>`) — nothing of another
+   target's. An op only this target calls lives in its `ops/` with its GPU
+   test at the mirrored path under
+   `tests/unittest/_torch/modeling_v2/models/<family>/<target>/<category>/`.
+   Duplication between targets is the architecture, not a smell.
 10. **Every fixed size answers to an engine limit.** A module- or class-level
     integer that bounds something (rows, tokens, batch, slots, pages) or sizes
     a buffer, and every buffer sized by a literal of 1024 or more, is either
@@ -96,12 +140,13 @@ These hold for every edit to a target's modeling code, by anyone, forever.
 
 ## Products
 
-A target directory holds **two files**:
+A target directory holds **two files**, plus target-owned ops when it has any:
 
 | product | |
 |---|---|
-| `modeling.py` | the `REQUIRED_TRTLLM_OPS` declaration · geometry with asserts · the flat `ParameterDict` · the step-args builder with its per-entry CUDA-graph classification · the forward · the runtime-value dump (below) · loud asserts for the unimplemented · the `@register_auto_model(<synthetic name>)` shell |
-| `weights.py` | the MANIFEST data table and load loop with bidirectional coverage asserts, and the predicted non-load sets with their reasons; post-load derivations live in modeling's `post_load_weights` |
+| `modeling.py` | the core `<Family><Par>ModelingV2(DecoderModel)`: derived geometry, `self.w = MODEL_WEIGHTS.declare(...)`, `post_load_weights` building both targets, any unconditional first-step derivation, the dispatching `forward` · `PrefillTarget` and `DecodeTarget`, each with its bindings in `__init__`, its `step_args`, its `forward` · the runtime-value dump (below) · the `@register_auto_model(<synthetic name>)` shell `ModelingV2<Ckpt><Sm><Par>(DecoderModelForCausalLM[core, PretrainedConfig])`, whose `load_weights` calls `MODEL_WEIGHTS.load` and whose `post_load_weights` calls `super()` then `self.model.post_load_weights()` |
+| `weights.py` | the weight table: a `ModelWeights` subclass with its `W` rows, `dims`, load-time transforms and `expected_unconsumed` with each reason; `MODEL_WEIGHTS = <Subclass>()` |
+| `ops/<category>/<name>.py` | optional: `OpWrapper` subclasses only this target calls — the same executable contract as a catalog entry (`raw_call`, `reference`, `is_valid`, `compare`, `CELLS`, `ARCHS`) — each with its GPU test in the tests tree |
 
 Four products the standalone layout had are gone. Each one's *responsibility*
 moved rather than disappearing, and knowing where is how you avoid recreating
@@ -137,9 +182,13 @@ module name; an ordinary dotted module satisfies that without any help.
 
 ## The runtime-value dump
 
-`forward` records the **metadata** of every catalog call it makes — shapes,
-dtypes, the constants passed — into a set, and the boot gate's output carries
-it out of the run.
+Each target's `forward` records the **metadata** of every entry call it
+makes — shapes, dtypes, the constants passed — into a set, and the boot
+gate's output carries it out of the run. With bound entries the call site
+holds only the data tensors, so record two things: the call's own arguments
+at the call, and the per-step bindings (the `step_args` projection, any
+per-step `bind_layered`) when they are bound. Construction-time bindings are
+read from the source.
 
 This exists because of a class of value that nothing else surfaces: the
 shapes the engine **varies at runtime**. Decode batch sizes, page sizes,
@@ -151,7 +200,7 @@ was inside.
 Four rules make it safe and sufficient:
 
 - **metadata only.** Never a tensor value: `.item()`/`.cpu()` are forbidden in
-  a forward, and metadata is exactly what a certified column is written in
+  a forward, and metadata is exactly what an entry's `CELLS` are written in
 - **no allocation in the hot path.** A set of tuples, appended to; nothing
   that grows per token
 - **capture is enough.** CUDA graph capture *executes* Python — that is why
@@ -162,10 +211,10 @@ Four rules make it safe and sufficient:
   `TRTLLM_MODELING_V2_VALUE_DUMP=1` (read once, at import). Every gate and
   witness run sets it; a served engine must not print the dump at each exit
 
-Comparing the dump against the contracts is a *reading* job, not an automated
-one: a certified column is prose. The target's duty ends at exposing the
-values; assembler judges them, and smith is dispatched only for what is
-genuinely uncovered.
+Comparing the dump against each entry's `CELLS` is a *reading* job, not an
+automated one: a cell's `spec` is entry-specific and its `why` is prose. The
+target's duty ends at exposing the values; assembler judges them, and smith
+is dispatched only for what is genuinely uncovered.
 
 ## From-scratch flow
 
@@ -173,17 +222,20 @@ genuinely uncovered.
    workspace's `vocabulary.yaml` — it already carries this checkpoint's value
    on every axis, established in Phase B. Read the checkpoint's safetensors key
    list and the HF reference for the compute graph, and decide each step's
-   mapping onto catalog entries. An unmappable step is a vocabulary gap: report
-   it before creating files.
+   mapping onto catalog entries (or a target-owned op, when only this target
+   will call it), and which steps differ between prefill and decode. An
+   unmappable step is a vocabulary gap: report it before creating files.
 2. **Place the target and its routing.** Create
    `tensorrt_llm/_torch/_experimental/modeling_v2/models/<family>/<ckpt>__<arch>__<parallel>/`,
    and add the target to that family's `routing.py`: the config-shape
    fingerprint, the parallel segment, the synthetic class name and its
    `TARGET_MODULES` entry. A family nothing routes yet also needs one row in
    `_router_index.py`. `references/routing-identity.md` is what may decide any
-   of this.
-3. **Write `modeling.py` + `weights.py`**, and draft the boot gate's keyword
-   cases. Keywords stay provisional.
+   of this — including every axis the derivation table says the exemplar's
+   fingerprint does not pin.
+3. **Write `weights.py` (the table) and `modeling.py` (core, both targets,
+   shell)**, plus any target-owned op with its test, and draft the boot
+   gate's keyword cases. Keywords stay provisional.
 4. **Inner loop — edit → import dry-run → boot gate, until the gate passes.**
    The dry-run imports the target module and asserts the class registers under
    the synthetic name, and that `explain.py` routes this configuration to it.
@@ -191,8 +243,8 @@ genuinely uncovered.
    repo's `pre-commit`; during iteration spend the turns on the model, not on
    whitespace. **The first engine run doubles as keyword verification** —
    freeze the cases only after observing the continuations.
-5. **Check the dump** against the contracts. Anything outside a certified
-   column: dispatch `Agent(smith)` with `kernel-verify`, resume on the receipt.
+5. **Check the dump** against each entry's `CELLS`. Anything outside them:
+   dispatch `Agent(smith)` with `kernel-verify`, resume on the receipt.
 6. **Accuracy gate.** A shortfall is a debug signal, not a verdict: the
    reference entry pins both the anchor and the protocol, so a miss usually
    means a real defect and you hold the derivation table to find it. Two
@@ -213,8 +265,10 @@ Same file, same invariants, plus:
 - the feature's own skill says where it attaches and what it owes
 - **the base path stays exactly as it was.** If the feature is off, the forward
   must be what the recorded gate measured — bit for bit
-- the weights the feature turns on come *out* of the known-not-loaded key set,
-  and `weights.py`'s predicted non-load set says so
+- the weights the feature turns on come *out* of the known-not-loaded key set
+  (`expected_unconsumed`) and *into* the table as `W` rows
+- a feature that changes one phase edits that target only; one that touches
+  both edits both bodies — they share none
 - the run journal records what the feature needs to run at all: its activation
   config and any boot requirement you discovered while gating it, as the gate
   ran with them. Neither is a tuning knob, and tuner may not change them
@@ -231,11 +285,12 @@ Same file, same invariants, plus:
   original, so the record of which bytes you measured is what pins the claim
 - **derivation table**: each axis and what this model required. Flag every axis
   where this target differs from the exemplar you read
-- **vocabulary audit**: the forward's call list, each mapped to its
-  `tensorrt_llm/_torch/_experimental/modeling_v2/catalog/index.yaml` path.
-  Scope it to `forward` plus the private methods it reaches
+- **vocabulary audit**: each target's call list, each trtllm op mapped to its
+  `tensorrt_llm/_torch/_experimental/modeling_v2/catalog/index.yaml` path or
+  its `<target>/ops/<category>/<name>.py`. Scope it to each target's `forward`
+  plus the private methods it reaches
 - **dump review**: which values the engine produced at runtime, and where each
-  sits against its contract
+  sits against its entry's `CELLS`
 - **gate outcomes**: boot-gate cases and verdicts; accuracy measured versus
   reference and threshold — verbatim numbers, or the precise blocker
 - **symptoms**: knowledge gaps (the exact question your sources could not

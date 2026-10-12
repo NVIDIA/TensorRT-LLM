@@ -323,4 +323,5 @@ def test_the_entry_spec_separates_pool_geometry_from_batch_geometry():
     # and the reason, not just the rule -- a rule with no failure attached is
     # the first thing a hurried reader skips
     assert "pool_slots == batch_size" in spec
-    assert "certified column" in spec
+    # and where the slot count is recorded: a cell axis, not a free one
+    assert "Make the slot count a `spec` axis" in spec

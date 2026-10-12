@@ -43,30 +43,40 @@ ModelingV2 is in the TensorRT-LLM tree, not in a separate repo:
 
 | what | path |
 |---|---|
-| kernel catalog | `tensorrt_llm/_torch/_experimental/modeling_v2/catalog/<category>/<name>.{md,py}` |
+| kernel catalog (shared) | `tensorrt_llm/_torch/_experimental/modeling_v2/catalog/<category>/<name>.py` |
 | catalog index | `tensorrt_llm/_torch/_experimental/modeling_v2/catalog/index.yaml` |
 | catalog GPU tests | `tests/unittest/_torch/modeling_v2/<category>/test_modeling_v2_<name>.py` |
+| a target's own ops | `tensorrt_llm/_torch/_experimental/modeling_v2/models/<family>/<ckpt>__<arch>__<parallel>/ops/<category>/<name>.py` |
+| their GPU tests | `tests/unittest/_torch/modeling_v2/models/<family>/<ckpt>__<arch>__<parallel>/<category>/test_modeling_v2_<name>.py` |
 | targets | `tensorrt_llm/_torch/_experimental/modeling_v2/models/<family>/<ckpt>__<arch>__<parallel>/{modeling,weights}.py` |
+| target-owned ops | `.../models/<family>/<ckpt>__<arch>__<parallel>/ops/<category>/<name>.py`, tested at `tests/unittest/_torch/modeling_v2/models/<family>/<ckpt>__<arch>__<parallel>/<category>/test_modeling_v2_<name>.py` |
+| target framework | `tensorrt_llm/_torch/_experimental/modeling_v2/{_target,_weights}.py` (`Phase`/`Target`, `W`/`ModelWeights`) |
 | routing | `tensorrt_llm/_torch/_experimental/modeling_v2/models/<family>/routing.py` |
 | accuracy anchors | `tests/integration/defs/accuracy/references/<benchmark>.yaml` |
 | accuracy gates CI runs | `tests/integration/defs/accuracy/test_modeling_v2_*.py` |
 
 Two consequences worth holding onto:
 
-- **A catalog entry spans two trees.** The contract and wrapper live in the
-  package; the GPU test lives in the tests tree, because that is where this
-  repo's CI collects from and an in-package test is on no list. A receipt is
-  valid only if it post-dates the last write to *every* file of its entry, so
-  that check now has to look in both places.
+- **A catalog entry is one `OpWrapper` class, and it spans two trees.** The
+  class is the contract (`raw_call`, `reference`, `is_valid`, `compare`,
+  `CELLS`, `ARCHS`, `note`; see `catalog/_op.py`) — there is no `.md`. Its
+  GPU test lives in the tests tree, because that is where this repo's CI
+  collects from, and drives every cell. An op only one target calls lives in
+  that target's `ops/`; the shared catalog holds the rest, and a target
+  imports the catalog and its own `ops/`, nothing of another target's. A
+  certification is valid only if the run behind it post-dates the last write
+  to *every* file of its entry, so that check looks in both trees.
 - **Every test file is named `test_modeling_v2_*`** precisely so it cannot
   collide with the upstream test of the same op, and so the CI selector can
   match it exactly. Do not invent a different name.
 
 There is **no version pin** in tree. A target moves with the trunk, so the
 pinned-version assert is gone and receipts are keyed by GPU architecture and
-nothing else. What replaced it is `REQUIRED_TRTLLM_OPS` on each target, which
-`tests/unittest/_torch/modeling_v2/test_modeling_v2_target_contract.py`
-asserts — that turns a drifting engine from a wrong answer into a loud failure.
+nothing else. Nor is there a hand-kept list of the engine surface a target
+touches (`REQUIRED_TRTLLM_OPS` is gone): each target's `step_args` is the
+probe its opt-in step-contract check (`TRTLLM_MODELING_V2_VALIDATE=1`) calls on
+the first forward, and a renamed op fails at its call — that is what turns a
+drifting engine from a wrong answer into a loud failure.
 """
 
 # The single most expensive mistake available in this package.

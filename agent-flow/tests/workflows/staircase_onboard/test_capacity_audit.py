@@ -192,6 +192,22 @@ def test_unparsable_files_and_bounds_are_reported(tmp_path):
     assert any("literal mapping" in e for e in result.errors)
 
 
+def test_the_targets_own_ops_are_left_to_their_cells(tmp_path):
+    """``<target>/ops/`` entries are certified per cell, like catalog entries."""
+    target = _target(tmp_path, "import torch\n")
+    op_dir = target / audit.TARGET_OPS_DIR / "moe"
+    op_dir.mkdir(parents=True)
+    (op_dir / "runner.py").write_text(_TOPK.format(binding=""), encoding="utf-8")
+    nested = target / "attention" / "ops.py"
+    nested.parent.mkdir()
+    nested.write_text(_TOPK.format(binding=""), encoding="utf-8")
+
+    files = [p.relative_to(target).as_posix() for p in audit.target_files(target)]
+    assert files == ["attention/ops.py", "topk.py"]
+    result = audit.audit_target(target, DECLARED)
+    assert [f.file for f in result.findings if f.name == "_TOPK_MAX_ROWS"] == ["attention/ops.py"]
+
+
 # ----------------------------------------------------------------- workflow
 
 

@@ -12,7 +12,6 @@ nobody has a word for.
 from __future__ import annotations
 
 import json
-from pathlib import Path
 
 import pytest
 
@@ -371,31 +370,53 @@ def test_receipt_absent_is_the_default_not_a_pass():
 # ------------------------------------------------- the probe, actually run
 
 
-def _fake_repo(tmp_path, entries, indent=""):
-    """A repo tree with a catalog index and contracts, and nothing else.
+def _entry_source(impl, archs, cells=2):
+    """An entry in #19977's form: the OpWrapper class is the contract."""
+    arch_set = ", ".join(f"Arch.{a}" for a in archs)
+    cell_list = "".join(f"Cell(why='c{i}', spec={{}}), " for i in range(cells))
+    return (
+        "from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper\n\n\n"
+        "class Entry(OpWrapper):\n"
+        '    """Mentions torch.ops.trtllm.neighbour in prose, which is not the op."""\n\n'
+        f"    ARCHS = frozenset({{{arch_set}}})\n"
+        f"    CELLS = ({cell_list})\n\n"
+        "    def raw_call(self, x):\n"
+        f"        return {impl}(x)\n\n"
+        "    def reference(self, x):\n"
+        "        return x\n"
+    )
+
+
+def _fake_repo(tmp_path, entries, indent="", model_ops=()):
+    """A repo tree with a catalog index and its entries, and nothing else.
 
     ``indent`` nests the list under ``entries:`` the way the in-tree index
-    does; the default keeps it at column 0.
+    does; the default keeps it at column 0. ``model_ops`` are
+    ``(family/target, category/name.py, impl, archs)`` kept in a target's ``ops/``.
     """
     catalog = tmp_path / "tensorrt_llm/_torch/_experimental/modeling_v2/catalog"
     catalog.mkdir(parents=True)
     lines = ["entries:"]
-    for path, impl, frontmatter in entries:
+    for path, impl, archs in entries:
         lines += [f"{indent}- path: {path}", f"{indent}  impl: {impl}", f"{indent}  summary: s"]
-        md = catalog / path.replace(".py", ".md")
-        md.parent.mkdir(parents=True, exist_ok=True)
-        md.write_text(f"---\n{frontmatter}---\n\n# {Path(path).stem}\n", encoding="utf-8")
+        py = catalog / path
+        py.parent.mkdir(parents=True, exist_ok=True)
+        py.write_text(_entry_source(impl, archs), encoding="utf-8")
     (catalog / "index.yaml").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    models = tmp_path / "tensorrt_llm/_torch/_experimental/modeling_v2/models"
+    for scope, path, impl, archs in model_ops:
+        py = models / scope / "ops" / path
+        py.parent.mkdir(parents=True, exist_ok=True)
+        py.write_text(_entry_source(impl, archs), encoding="utf-8")
+        (py.parent / "__init__.py").write_text("", encoding="utf-8")
     modules = tmp_path / "tensorrt_llm/_torch/modules"
     modules.mkdir(parents=True)
     (modules / "rms_norm.py").write_text("class RMSNorm:\n    pass\n\ndef _hidden():\n    pass\n")
     return tmp_path
 
 
-#: Makes `import yaml` raise, so the probe's hand-rolled fallback parser is
-#: the thing under test. Without this the fallback is dead code in CI — the
-#: interpreter that runs these tests has yaml, and so does every real run's —
-#: and dead code is exactly where a parser bug hides.
+#: Makes `import yaml` raise: the probe reads the index and the entries without
+#: it, and this keeps that true.
 _BLOCK_YAML = (
     "import sys\n"
     "class _NoYaml:\n"
@@ -423,33 +444,58 @@ def _run_probe(repo, arch="sm_103", *, block_yaml=False):
     return parse_inventory(proc.stdout + proc.stderr, arch=arch)
 
 
-#: The two shapes actually present in the tree, and the two the old
-#: hand-rolled reader got wrong in the same direction — inline FAILED read as
-#: passed, block FAILED read as absent. Both are the dangerous direction:
-#: they make a known-broken entry look spendable or merely un-run.
-_INLINE_PASS = "receipts:\n  sm_103: {status: passed, tests: 9}\n"
-_INLINE_FAIL = "receipts:\n  sm_103: {status: failed, tests: 57}\n"
-_BLOCK_FAIL = "receipts:\n  sm_103:\n    status: failed\n    tests: 57\n    note: >-\n      long\n"
-_BLOCK_PASS = "receipts:\n  sm_103:\n    status: passed\n    tests: 12\n"
-_OTHER_ARCH = "receipts:\n  sm_100: {status: passed, tests: 9}\n"
+#: An entry's certification is its ``ARCHS``: the architectures its cells were
+#: driven on. There is no contract file and no frontmatter left to read.
+_INLINE_PASS = ("SM_103",)
+_OTHER_ARCH = ("SM_100",)
 
 
 @pytest.mark.parametrize(
-    "frontmatter,expected",
+    "archs,expected",
     [
         (_INLINE_PASS, RECEIPT_PASSED),
-        (_INLINE_FAIL, "failed"),
-        (_BLOCK_FAIL, "failed"),
-        (_BLOCK_PASS, RECEIPT_PASSED),
+        (("SM_100", "SM_103"), RECEIPT_PASSED),
         (_OTHER_ARCH, RECEIPT_ABSENT),
-        ("", RECEIPT_ABSENT),
+        ((), RECEIPT_ABSENT),
     ],
+    ids=["this-arch", "two-archs", "other-arch", "none"],
 )
-@pytest.mark.parametrize("block_yaml", [False, True], ids=["yaml", "fallback"])
-def test_the_probe_reads_both_frontmatter_shapes(tmp_path, frontmatter, expected, block_yaml):
-    repo = _fake_repo(tmp_path, [("norm/x.py", "torch.ops.trtllm.x", frontmatter)])
+@pytest.mark.parametrize("block_yaml", [False, True], ids=["yaml", "no-yaml"])
+def test_the_probe_reads_the_entrys_archs(tmp_path, archs, expected, block_yaml):
+    repo = _fake_repo(tmp_path, [("norm/x.py", "torch.ops.trtllm.x", archs)])
     inventory = _run_probe(repo, block_yaml=block_yaml)
     assert inventory.catalog[0].receipt == expected
+    assert inventory.catalog[0].cells == 2
+
+
+def test_an_entry_with_no_cells_certifies_nothing_on_any_arch(tmp_path):
+    repo = _fake_repo(tmp_path, [("norm/x.py", "torch.ops.trtllm.x", _INLINE_PASS)])
+    py = repo / "tensorrt_llm/_torch/_experimental/modeling_v2/catalog/norm/x.py"
+    py.write_text(_entry_source("torch.ops.trtllm.x", _INLINE_PASS, cells=0), encoding="utf-8")
+    assert _run_probe(repo).catalog[0].receipt == RECEIPT_ABSENT
+
+
+def test_another_targets_ops_are_promotable_not_spendable(tmp_path):
+    """Targets share the catalog and nothing else of each other's."""
+    repo = _fake_repo(
+        tmp_path,
+        [("norm/x.py", "torch.ops.trtllm.x", _INLINE_PASS)],
+        model_ops=[
+            ("fam/ckpt__sm_103__tp1", "moe/router.py", "torch.ops.trtllm.router", _INLINE_PASS)
+        ],
+    )
+    inventory = _run_probe(repo)
+    (op,) = inventory.promotable
+    assert (op.scope, op.path, op.impl) == (
+        "fam/ckpt__sm_103__tp1",
+        "moe/router.py",
+        "torch.ops.trtllm.router",
+    )
+    assert op.receipt == RECEIPT_PASSED
+    assert op not in inventory.spendable and op not in inventory.uncertified
+    assert "router" not in inventory.unwrapped_ops
+    block = format_surface(read_checkpoint_surface(_dense()), inventory)
+    assert "`fam/ckpt__sm_103__tp1/ops/moe/router`" in block
 
 
 @pytest.mark.parametrize("indent", ["", "  "], ids=["column0", "indented"])
@@ -503,36 +549,38 @@ def test_an_engine_that_will_not_import_does_not_condemn_the_whole_catalog(tmp_p
     assert inventory.catalog[0].receipt == RECEIPT_PASSED
 
 
-# ------------------------------------------------- torch mirrors carry none
+# ------------------------------------------------- no category is exempt
 
 
-def test_a_torch_mirror_is_spendable_without_a_receipt():
-    """Absence is by design there, not the three-state unknown."""
+def test_no_category_is_spendable_without_certification():
+    """#19977 dropped the torch mirrors: every entry is an OpWrapper with cells."""
     entry = CatalogEntry(path="torch/add.py", impl="torch.add")
-    assert not entry.certifiable
-    assert entry.spendable
+    assert entry.certifiable
+    assert not entry.spendable
 
 
-def test_a_torch_mirror_is_not_listed_as_needing_a_receipt_run():
+def test_an_uncertified_entry_is_listed_as_needing_a_run():
     payload = _inventory_payload(
         catalog=[
-            {
-                "path": "torch/add.py",
-                "impl": "torch.add",
-                "receipt": "absent",
-                "impl_resolves": True,
-            },
             {
                 "path": "norm/y.py",
                 "impl": "torch.ops.trtllm.y",
                 "receipt": "absent",
                 "impl_resolves": True,
             },
+            {
+                "path": "moe/z.py",
+                "impl": "torch.ops.trtllm.z",
+                "receipt": "passed",
+                "impl_resolves": True,
+                "scope": "fam/ckpt__sm_103__tp1",
+            },
         ]
     )
     inventory = parse_inventory(MARKER + json.dumps(payload), arch="sm_103")
     assert [e.name for e in inventory.uncertified] == ["y"]
-    assert "add" in [e.name for e in inventory.spendable]
+    assert [e.name for e in inventory.promotable] == ["z"]
+    assert inventory.spendable == ()
 
 
 def test_a_failed_receipt_is_listed_loudly_rather_than_as_unrun():

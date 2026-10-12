@@ -31,11 +31,12 @@ Sourcing preference, in order:
    and the MLA attention core is otherwise reachable only inside the macro.
    The pybind binding `tensorrt_llm.bindings.internal.thop.attention` is
    Python-callable, single-call, fully explicit-state, and was onboarded as
-   `attention/thop_attention`. The trade-off is recorded in its contract:
+   `attention/thop_attention`. The trade-off is recorded in its entry:
    it is invisible to torch.compile and is a private API with no stability
    promise.
 3. **torch-native glue** (`split`, `concat`, `reshape`, `expand`, `copy_`,
-   `empty`) as hand-added thin mirrors under `catalog/torch/`.
+   `empty`), called directly by the target: native torch calls are not
+   catalog entries.
 
 ### Writing a decomposition report for a new macro
 
@@ -53,12 +54,14 @@ entry. The report must:
   (`torch.ops.trtllm.attention`) across several runs before an onboarding
   attempt exposed it.
 - **Label every constituent with one of three states**: existing entry
-  (cite the catalog path) / not onboarded (op symbol plus proposed
-  category — the sourcing tiers above decide the shape) / gap (no
+  (cite the catalog path, or the `ops/` path of the target that keeps it) /
+  not onboarded (op symbol plus proposed category and home — the shared
+  catalog, or this target's `ops/` when only it calls the op; the sourcing
+  tiers above decide the shape) / gap (no
   Python-callable atomic surface exists; say what is reachable instead).
 - **Map the mainline path step by step** (the shape of §4) and list
   variant branches with their extra ops separately (the shape of §6).
-- **Claim nothing that only certification can establish.** Receipts,
-  numerical behavior, and caller-facing hard constraints (this document's
+- **Claim nothing that only certification can establish.** Cells and
+  `ARCHS`, numerical behavior, and caller-facing hard constraints (this document's
   §4.5 and §5) exist only after the constituents are onboarded and tested
   on GPU; a pre-onboarding report marks them as unknown.

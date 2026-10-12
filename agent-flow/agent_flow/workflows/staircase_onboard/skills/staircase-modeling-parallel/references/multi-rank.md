@@ -121,12 +121,15 @@ segment names the intent, `mapping` is what the engine actually built.
 Established by the first multi-rank target (`tep4`, world size 4). These
 are the four things this section used to list as unobserved.
 
-**`lm_head` is topology-aware, and that is a manifest obligation §4/§5 do
+**`lm_head` is topology-aware, and that is a load obligation §4/§5 do
 not mention.** At `tp_size = 4` `DecoderModelForCausalLM` builds an
-`LMHead` of `[vocab/tp, hidden]` — vocab-parallel — so the manifest must
-feed *this rank's contiguous block of vocabulary rows*, and the logits
-gather stays upstream's. Consequence: `vocab % tp_size == 0` belongs in
-the construction asserts, because nothing else checks it.
+`LMHead` of `[vocab/tp, hidden]` — vocab-parallel — so the load must
+feed *this rank's contiguous block of vocabulary rows* (override
+`ModelWeights.load`, whose base feeds `lm_head.weight` whole), and the
+logits gather stays upstream's. Consequence: `vocab % tp_size == 0` is an
+identity fact for routing, which carries no such criterion today — put it
+in the family's `routing.py`, because the target carries no configuration
+asserts and nothing else checks it.
 
 **Where the collectives belong: after every row/column-sharded producer,
 and nowhere else.** For a TP attention + EP MoE layer that is two per
@@ -222,9 +225,9 @@ the communicator, and at equal byte counts an ordering divergence is
 **silent** — every rank wrong in 98-99% of elements, bitwise reproducibly,
 no hang. Padding guarantees equal byte counts, so a `depN` forward must
 issue an identical call sequence on every rank and must not wait for a hang
-to detect that it did not. Certified in
-`tensorrt_llm/_torch/_experimental/modeling_v2/catalog/comm/allgather.md` and
-`.../catalog/comm/reducescatter.md`, whose 4-rank rank bodies and launcher
+to detect that it did not. Certified by the entries
+`tensorrt_llm/_torch/_experimental/modeling_v2/catalog/comm/allgather.py` and
+`.../catalog/comm/reducescatter.py`, whose 4-rank rank bodies and launcher
 live in `tests/unittest/_torch/modeling_v2/comm/`.
 
 **The runtime is not a second party on that communicator.** Traced live:

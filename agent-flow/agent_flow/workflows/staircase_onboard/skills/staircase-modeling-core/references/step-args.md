@@ -2,10 +2,11 @@
 
 How a target's modeling code fills
 `catalog/attention/thop_attention`'s
-arguments when running under the TensorRT-LLM engine. The entry contract
-(`tensorrt_llm/_torch/_experimental/modeling_v2/catalog/attention/thop_attention.md`)
-defines what the op computes and
-what each argument must contain; this reference defines **where each value
+arguments when running under the TensorRT-LLM engine. The entry's executable
+contract
+(`tensorrt_llm/_torch/_experimental/modeling_v2/catalog/attention/thop_attention.py`:
+`raw_call`, `reference`, `is_valid`, `CELLS`) defines what the op computes and
+which inputs it is certified over; this reference defines **where each value
 comes from at runtime**. Together they are sufficient — no TensorRT-LLM
 source reading is needed to integrate the op.
 
@@ -18,30 +19,44 @@ and re-run the gates.
 
 ## The three-source split
 
-Every argument of one attention call belongs to exactly one source:
+Every argument of one attention call belongs to exactly one source, and each
+source has its own binding site:
 
 ```python
-thop_attention(
-    q=qkv,
-    output=attn_out,  # 1. per-layer: data tensors
-    local_layer_idx=i,  #    + the layer index
-    num_heads=Hq,
-    num_kv_heads=Hkv,
-    head_size=D,  # target geometry
-    **step,  # 2. per-step: engine batch state,
-    #    built once per forward, shared
-    #    by every layer
-    **CALL_CONSTANTS,  # 3. per-target constants: the call
-    #    shape, fixed at import time
+# PrefillTarget.__init__ / DecodeTarget.__init__ -- once, against real weights
+self._attn = ThopAttention()
+for i in range(n):
+    self._attn.bind_layered(i, local_layer_idx=i)  # + per-layer operands (sinks, ...)
+self._attn.bind_const(
+    num_heads=Hq, num_kv_heads=Hkv, head_size=D,  # target geometry
+    **_CALL_CONSTANTS,                             # 3. per-target constants
 )
+
+# forward -- once per step, before the layer loop
+self._attn.bind_const(**self.step_args(attn_metadata))  # 2. per-step batch state
+attn_out = torch.empty([num_tokens, Hq * D], ...)       # one buffer, every layer
+
+# the layer loop -- data only
+attn_out = self._attn(q=qkv, output=attn_out, layer=i)  # 1. per-layer data tensors
 ```
 
-Build `step` once per forward from the engine-prepared metadata and reuse
-it across layers — the values describe the batch, not the layer. Per
-layer, `q` is that layer's packed-QKV activation (the fused projection's
-output) and `output` is a caller-allocated `[num_tokens, Hq*D]` buffer:
-the contract guarantees rows `[:num_tokens]` are overwritten in place, so
-one buffer allocated per forward serves every layer.
+`step_args(md)` is a method of each target, not a shared helper: it projects
+the engine-prepared metadata onto the op's batch-state arguments, and the two
+targets' projections differ. `PrefillTarget` reads `num_contexts` and
+`num_ctx_tokens` off the metadata because it holds the mixed batch;
+`DecodeTarget` states them as `0` because routing guarantees it — and nothing
+else in `DecodeTarget` reads either field (the claims suite gates it, and so
+does delivery). The values describe the batch, not the layer, so the
+projection is rebound once per forward and never inside the loop. Per layer,
+`q` is that layer's packed-QKV activation and `output` a caller-allocated
+`[num_tokens, Hq*D]` buffer: rows `[:num_tokens]` are overwritten in place,
+so one buffer allocated per forward serves every layer, and the call still
+states it — `attn_out = self._attn(..., output=attn_out, ...)`.
+
+`step_args` is also the probe: `Target._check_step_contract` calls it on the
+first forward under `TRTLLM_MODELING_V2_VALIDATE=1`, so every field it reads
+is checked to exist. Read a metadata field anywhere else in the forward and
+it is unchecked.
 
 ## Per-step arguments (engine metadata)
 
@@ -71,9 +86,9 @@ always see `num_contexts == 0`); **cfg** = engine-construction constant.
 | `max_num_requests` | `max_num_requests` | cfg | |
 | `max_context_length` | `max_context_length` | cfg | |
 | `max_seq_len` | `max_seq_len` | cfg | |
-| `attention_window_size` | `max_seq_len` | cfg | no sliding window: window = full length |
-| `num_contexts` | `num_contexts` | host | |
-| `num_ctx_tokens` | `num_ctx_tokens` | host | |
+| `attention_window_size` | `max_seq_len` | cfg | no sliding window: window = full length. Per-layer windows are `bind_layered` at the top of `forward` (known only once the KV manager exists) |
+| `num_contexts` | `num_contexts` | host | `DecodeTarget`: the literal `0` |
+| `num_ctx_tokens` | `num_ctx_tokens` | host | `DecodeTarget`: the literal `0` |
 | `trtllm_gen_jit_warmup` | `trtllm_gen_jit_warmup` | host | engine warmup flag, pass through |
 | `use_paged_context_fmha` | `use_paged_context_fmha` | cfg | cached-context path selector (block reuse / chunked prefill) |
 | `beam_width` | `effective_beam_width` | cfg | |
@@ -106,24 +121,26 @@ Everything the in-tree path reads from the attention module or its
 forward args is, for one target, a compile-time constant: it encodes
 *which kind of attention call this target makes*. For a bf16 packed-QKV
 causal GQA target with RoPE applied outside the op (the
-`fused_qk_norm_rope` pairing), the constants are exactly the certified
-"Standard" column of the entry contract:
+`fused_qk_norm_rope` pairing), the constants are exactly the standard cell
+of the entry's `CELLS`, bound once with `bind_const`:
 
 - `is_fused_qkv=True`, `k=None`, `v=None`, `update_kv_cache=True`,
   `predicted_tokens_per_seq=1`, `attention_input_type=0` (one call serves
   pure-prefill / pure-decode / mixed batches), `mask_type=1` (causal),
   `is_mla_enable=False`, `quant_mode=0`, `q_scaling=1.0`.
 - In-kernel RoPE disabled: `position_embedding_type=0` and every `rope_*`
-  argument at the contract's inert placeholder. **The placeholders are not
+  argument at the entry's inert placeholder. **The placeholders are not
   the model's rope config** (`rope_base=10000.0` even when the model's
   theta is 1e6) — rotation happens outside, the values are dead.
 - All quantization scales, MLA arguments, mRoPE / cross / relative-bias /
-  sparse / helix arguments at their contract-listed inert values.
+  sparse / helix arguments at their inert values.
 
-MLA targets take their per-phase constants from the contract's MLA
-columns the same way (separate context/generation call shapes,
-`attention_input_type` 1/2); the per-step table above applies unchanged —
-both configurations consume the same prepared metadata.
+MLA targets take their per-phase constants from the entry's MLA cells the
+same way (separate context/generation call shapes, `attention_input_type`
+1/2), and each phase's instance lives on the target that runs it:
+`PrefillTarget` holds the context instance and the generation one (a mixed
+batch splits its rows), `DecodeTarget` only the generation one. The per-step
+table above applies unchanged — both consume the same prepared metadata.
 
 Two forward-looking notes: `helix_*` are metadata-sourced in-tree but are
 None whenever helix CP is off — a non-CP target may hold them as
@@ -132,29 +149,30 @@ constants. Quantized-KV targets turn `kv_scale_orig_quant` /
 in `post_load_weights` (checkpoint-calibrated; leaving them `None` under
 fp8 KV does **not** fault — measured, it is read as a silent `1.0`, so a
 miscalibrated target is a wrong-number bug rather than a crash) — see the
-contract's not-certified annotations for what a certification extension
-must cover first.
+entry's `CELLS` and `note` for what a certification extension must cover
+first.
 
 ## Fail-fast discipline
 
 The metadata attribute names above are private trtllm surface with no
 stability promise. A target consuming them must:
 
-1. Keep a `_STEP_FIELDS` tuple in modeling code, exactly equal to the set
-   of metadata attributes read, and `hasattr`-check every name on the
-   first forward (everything is fixed at engine construction — once per
-   model instance is sound). Version drift then fails with a named list
-   instead of a deep AttributeError. **Exception: MLA's cached-KV fields
-   are conditional.** `enable_context_mla_with_cached_kv`,
+1. Read them in `step_args` and nowhere else on the hot path, so the opt-in
+   step-contract check — which calls `step_args` — covers every one. There is
+   no `_STEP_FIELDS` tuple to keep in sync: the projection is the
+   declaration. **Exception: MLA's cached-KV fields are conditional.**
+   `enable_context_mla_with_cached_kv`,
    `ctx_cached_token_indptr`, `ctx_kv_indptr`,
    `ctx_uncached_token_indptr`, `max_ctx_seq_len`, `max_ctx_kv_len` and
    `num_ctx_cached_tokens` exist only when block reuse is on — with
-   `enable_block_reuse: false` they are absent, not False. Asserting them
-   turns a legal config into a hard failure; select the context flavor by
-   their presence instead.
-2. Assert `isinstance(attn_metadata, TrtllmAttentionMetadata)` — this
-   table is meaningless for other backends' metadata.
-3. Assert `position_ids.dtype == torch.int32` and flatten with
+   `enable_block_reuse: false` they are absent, not False. Reading them
+   unconditionally turns a legal config into a hard failure; select the
+   context flavor once by their presence (on the core, unconditionally) and
+   bind them only on that flavor.
+2. Expect `TrtllmAttentionMetadata` — this table is meaningless for other
+   backends' metadata. Routing is what keeps another backend out
+   (`assert_backend_can_route`), not an assert in the target.
+3. Expect `position_ids` int32 and flatten with
    `reshape(position_ids, [-1])` before ops that consume positions (the
    engine passes an int32 `[1, T]` view of a persistent buffer).
 
@@ -168,11 +186,10 @@ stability promise. A target consuming them must:
    contiguous`. Take row 0 for a text-only path, or pass the `[3, T]` view the
    op documents for mRoPE. A text-only target built from a multimodal
    checkpoint hits this even though nothing about its workload is multimodal.
-4. Declare every `torch.ops.trtllm.*` symbol the forward calls in the
-   target's `REQUIRED_TRTLLM_OPS`, which
+4. Declare nothing else. `REQUIRED_TRTLLM_OPS` is gone: a renamed custom op
+   fails at its call, which names the place, and
    `tests/unittest/_torch/modeling_v2/test_modeling_v2_target_contract.py`
-   asserts this build registers. There is no version to pin against — the
-   target moves with the trunk — so that declaration plus the first-forward
-   `_STEP_FIELDS` check are the whole fuse. A receipt, likewise, is keyed by
-   GPU architecture and is valid only against the files of its own entry;
+   checks only the pybind attention entry point. There is no version to pin
+   against — the target moves with the trunk. A receipt, likewise, is keyed
+   by GPU architecture and is valid only against the files of its own entry;
    absent means unknown.

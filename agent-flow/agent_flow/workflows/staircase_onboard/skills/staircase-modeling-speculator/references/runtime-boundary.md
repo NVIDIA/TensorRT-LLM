@@ -122,7 +122,7 @@ closed-vocabulary audit both rest on.
 ### The shell's shape, and the four things it has to get right
 
 ```python
-class ModelingV2<Checkpoint><Arch><Par>(DecoderModelForCausalLM[ModelingV2Core, ...]):
+class ModelingV2<Checkpoint><Arch><Par>(DecoderModelForCausalLM[<Family><Par>ModelingV2, ...]):
     def __init__(self, model_config):
         ...                                    # unchanged
         self.spec_config = getattr(model_config, "spec_config", None)
@@ -252,13 +252,13 @@ raises `seq_len should be same for all generation requests`. And setting
 `predicted_tokens_per_seq` is harmless but does nothing on this path, so a target
 that sets it and sees a taller block has not learned that the two are connected.
 
-*Verified on sm_100. There is no version pin to re-check against: a target
-declares the private engine surface it touches as `REQUIRED_TRTLLM_OPS` and
-`tests/unittest/_torch/modeling_v2/test_modeling_v2_target_contract.py` asserts
-every name in it exists, which turns a drifting engine into a loud failure
-rather than a wrong answer. Re-check this particular behaviour by sweeping the
-argument against a fixed row count and comparing output bitwise; the catalog
-entry's contract is the authority for what the resulting block attends to.*
+*Verified on sm_100. There is no version pin to re-check against: each
+target's `step_args` is the probe its opt-in step-contract check calls, so a
+renamed metadata field fails loudly on the first forward under
+`TRTLLM_MODELING_V2_VALIDATE=1`, and a renamed op fails at its call. Re-check
+this particular behaviour by sweeping the argument against a fixed row count
+and comparing output bitwise; the attention entry's `reference` and `CELLS`
+are the authority for what the resulting block attends to.*
 
 **Those extra query tokens stay on the generation call.** A one-engine mode
 returns False from the runtime's `extend_ctx` predicate — "1-model has
@@ -268,7 +268,8 @@ speculation does it. The batch keeps its `[context | generation]` split and
 the generation call simply gets a taller query block. What that block is
 allowed to attend to — each draft position seeing the cache plus the earlier
 positions of its own block, and no later one — is a **kernel** fact, so the
-catalog contract for the attention entry is its authority, not this file.
+attention entry's executable contract (`reference`, `CELLS`) is its
+authority, not this file.
 Do not assume it from `mask_type` alone.
 
 **The spec-dec mask machinery is forced off at sm_100 and stays inert.**
@@ -285,8 +286,8 @@ self.is_spec_decoding_enabled = is_spec_decoding_enabled and (
 so it is True on sm_100; a linear-tree MTP has `is_spec_dec_dynamic_tree`
 False; the conjunction is **False**. `is_spec_decoding_enabled`,
 `use_spec_decoding` and `is_spec_dec_tree` are all False and every
-`spec_decoding_*` tensor is None — the same inert values the MLA columns of
-`tensorrt_llm/_torch/_experimental/modeling_v2/catalog/attention/thop_attention.md`
+`spec_decoding_*` tensor is None — the same inert values the MLA cells of
+`tensorrt_llm/_torch/_experimental/modeling_v2/catalog/attention/thop_attention.py`
 already certify. **On a pre-Blackwell arch this is not true** and the mask
 surface would need certifying first.
 
@@ -312,7 +313,15 @@ step the worker mutates `attn_metadata` in place:
 **So the layer must read its phase from `attn_metadata` on every call.** It
 is invoked N times inside one forward, and a value computed on the first
 call is wrong on the rest. This is not the trunk's situation — the trunk
-builds step-args once per forward because there is only one step in it.
+routes and projects `step_args` once per forward because there is only one
+step in it. The layer therefore routes per call: its `forward` is
+`core._select_target(md).mtp_forward(...)`, and each target carries its own
+`mtp_forward` with the draft ops bound in its own `__init__` (on the
+deepseek exemplar, decode's binds 23 of prefill's 27 — the context attention
+instance, the kv_b projection and the two paged-KV helpers serve a path its
+routing guarantees never runs). One engine step's draft calls can cross from
+prefill to decode, and each call asks again. The layer runs inside the
+engine forward, so it never calls `advance_step_generation()` itself.
 
 The read is cheap and sync-free. `on_update()` recomputes `_num_ctx_tokens`,
 `_num_generations` and `_num_tokens` from `_seq_lens`, which is a **pinned
@@ -335,7 +344,9 @@ request's first accepted (golden) token written at its last position —
 `_prepare_context_input_ids`, shared by both MTP flavours. Its hidden states
 are the trunk's, in full, at full prompt length. So step 0 runs a real
 context-phase attention for those rows and the layer needs both phases,
-exactly like the trunk.
+exactly like the trunk — step 0 of a batch holding a context request runs
+`PrefillTarget.mtp_forward`, and steps 1+ (`num_contexts` rewritten to 0) run
+`DecodeTarget.mtp_forward`.
 
 ### Attention DP: the padding basis changes source, and reading the wrong one is silent
 
@@ -360,8 +371,8 @@ contributes exactly one token.
 
 **Pad from `md.all_rank_num_tokens` inside the MTP layer and the collectives
 mispair silently.**
-`tensorrt_llm/_torch/_experimental/modeling_v2/catalog/comm/allgather.md` and
-`.../catalog/comm/reducescatter.md` both certify that calls pair by *position*
+`tensorrt_llm/_torch/_experimental/modeling_v2/catalog/comm/allgather.py` and
+`.../catalog/comm/reducescatter.py` both certify that calls pair by *position*
 on the communicator and that at equal byte counts a divergence produces no
 hang — every rank wrong in 98–99% of elements, bitwise reproducibly. The
 defence is structural: give the layer's padding helper a signature that

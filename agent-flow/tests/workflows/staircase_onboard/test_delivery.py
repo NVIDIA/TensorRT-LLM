@@ -29,13 +29,81 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.flashinfer_rmsno
     flashinfer_rmsnorm,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.cublas_mm import cublas_mm
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.torch.embedding import embedding
-
-REQUIRED_TRTLLM_OPS = (
-    "flashinfer_rmsnorm",
-    "cublas_mm",
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.activation.silu_and_mul import (
+    SiluAndMul,
 )
+
+from .ops.moe.router import Router
+
+
+class SyntheticCore(DecoderModel):
+    def forward(self, attn_metadata, *args, **kwargs):
+        return self._select_target(attn_metadata).forward(attn_metadata, *args, **kwargs)
+
+
+class PrefillTarget(Target):
+    def step_args(self, md):
+        return dict(num_contexts=md.num_contexts, num_ctx_tokens=md.num_ctx_tokens)
+
+    def forward(self, attn_metadata, *args, **kwargs): ...
+
+
+class DecodeTarget(Target):
+    def step_args(self, md):
+        return dict(num_contexts=0, num_ctx_tokens=0)
+
+    def forward(self, attn_metadata, *args, **kwargs): ...
 '''
+
+_WEIGHTS = '''\
+"""A synthetic weight table."""
+
+
+class SyntheticWeights(ModelWeights):
+    WEIGHTS: tuple = ()
+
+
+MODEL_WEIGHTS = SyntheticWeights()
+'''
+
+
+#: An entry in #19977's form: an OpWrapper whose class is its contract.
+_ENTRY = """\
+from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+
+
+class Entry(OpWrapper):
+    ARCHS = frozenset({Arch.SM_103})
+    CELLS = (Cell(why="decode", spec=dict(rows=1)), Cell(why="prefill", spec=dict(rows=2048)))
+
+    def raw_call(self, x):
+        return x
+
+    def reference(self, x):
+        return x
+"""
+
+_ENTRY_TEST = """\
+import pytest
+
+
+@pytest.mark.parametrize("cell", op.CELLS)
+def test_certified_cells(cell): ...
+"""
+
+#: (category, name) of every shared entry `_MODELING` imports.
+_SHARED_ENTRIES = (
+    ("norm", "flashinfer_rmsnorm"),
+    ("gemm", "cublas_mm"),
+    ("activation", "silu_and_mul"),
+)
+
+
+def _write_entry(wrapper: Path, test: Path, *, entry: str = _ENTRY) -> None:
+    wrapper.parent.mkdir(parents=True, exist_ok=True)
+    wrapper.write_text(entry, encoding="utf-8")
+    test.parent.mkdir(parents=True, exist_ok=True)
+    test.write_text(_ENTRY_TEST, encoding="utf-8")
 
 
 def _build_repo(tmp_path: Path, *, modeling: str = _MODELING) -> Path:
@@ -43,33 +111,22 @@ def _build_repo(tmp_path: Path, *, modeling: str = _MODELING) -> Path:
     target = root / TARGET_REL
     target.mkdir(parents=True)
     (target / "modeling.py").write_text(modeling, encoding="utf-8")
-    (target / "weights.py").write_text("MANIFEST = ()\n", encoding="utf-8")
+    (target / "weights.py").write_text(_WEIGHTS, encoding="utf-8")
 
     catalog = root / delivery.CATALOG_DIR
-    for category, name, contracted in (
-        ("norm", "flashinfer_rmsnorm", True),
-        ("gemm", "cublas_mm", True),
-        ("torch", "embedding", False),
-    ):
-        (catalog / category).mkdir(parents=True, exist_ok=True)
-        (catalog / category / f"{name}.py").write_text("def f(): ...\n", encoding="utf-8")
-        if contracted:
-            (catalog / category / f"{name}.md").write_text("# contract\n", encoding="utf-8")
-        tests = root / delivery.CATALOG_TESTS_DIR / category
-        tests.mkdir(parents=True, exist_ok=True)
-        if contracted:
-            (tests / f"test_modeling_v2_{name}.py").write_text(
-                "def test(): ...\n", encoding="utf-8"
-            )
+    for category, name in _SHARED_ENTRIES:
+        _write_entry(
+            catalog / category / f"{name}.py",
+            root / delivery.CATALOG_TESTS_DIR / category / f"test_modeling_v2_{name}.py",
+        )
+    # The one op only this target calls: in its own ops/, tested under its path.
+    _write_entry(
+        target / delivery.MODEL_OPS_DIRNAME / "moe" / "router.py",
+        root / delivery.model_ops_tests_dir(TARGET_REL) / "moe" / "test_modeling_v2_router.py",
+    )
     (catalog / "index.yaml").write_text(
         yaml.safe_dump(
-            {
-                "entries": [
-                    {"path": "norm/flashinfer_rmsnorm.py"},
-                    {"path": "gemm/cublas_mm.py"},
-                    {"path": "torch/embedding.py"},
-                ]
-            }
+            {"entries": [{"path": f"{category}/{name}.py"} for category, name in _SHARED_ENTRIES]}
         ),
         encoding="utf-8",
     )
@@ -119,25 +176,77 @@ def test_imports_are_read_from_the_ast_not_by_importing(tmp_path):
     root = _build_repo(tmp_path)
     entries = delivery.imported_catalog_entries(root / TARGET_REL / "modeling.py")
     assert entries == [
+        ("activation", "silu_and_mul"),
         ("gemm", "cublas_mm"),
         ("norm", "flashinfer_rmsnorm"),
-        ("torch", "embedding"),
+    ]
+    assert delivery.imported_model_ops(root / TARGET_REL / "modeling.py") == [
+        ("gpt_oss_120b__sm_103__tp1", "moe", "router")
     ]
 
 
-def test_required_ops_are_read_statically(tmp_path):
+def _replace_modeling(root: Path, old: str, new: str) -> None:
+    modeling = root / TARGET_REL / "modeling.py"
+    text = modeling.read_text(encoding="utf-8")
+    assert old in text
+    modeling.write_text(text.replace(old, new), encoding="utf-8")
+
+
+def test_a_core_without_its_decode_target_is_flagged(tmp_path):
+    """The core dispatches every step to one of two targets; one alone is half a model."""
     root = _build_repo(tmp_path)
-    assert delivery.declared_required_ops(root / TARGET_REL / "modeling.py") == [
-        "flashinfer_rmsnorm",
-        "cublas_mm",
-    ]
+    _replace_modeling(root, "class DecodeTarget(Target):", "class Decode(Target):")
+    failure = next(c for c in _verify(root).failures if c.name == "target:prefill-decode")
+    assert "no DecodeTarget" in failure.detail
 
 
-def test_a_target_declaring_no_ops_is_flagged(tmp_path):
-    root = _build_repo(tmp_path, modeling="X = 1\n")
+def test_a_target_that_skips_step_args_is_flagged(tmp_path):
+    """`step_args` is the probe the step-contract check calls; a target owes one."""
+    root = _build_repo(tmp_path)
+    _replace_modeling(
+        root,
+        "    def step_args(self, md):\n        return dict(num_contexts=0",
+        "    def other(self, md):\n        return dict(num_contexts=0",
+    )
+    failure = next(c for c in _verify(root).failures if c.name == "target:prefill-decode")
+    assert "DecodeTarget defines no step_args" in failure.detail
+
+
+def test_a_decode_target_reading_the_phase_back_is_flagged(tmp_path):
+    """Decode runs only when num_contexts == 0; reading it is a branch frozen at capture."""
+    root = _build_repo(tmp_path)
+    _replace_modeling(root, "dict(num_contexts=0,", "dict(num_contexts=md.num_contexts,")
+    failure = next(c for c in _verify(root).failures if c.name == "target:decode-reads-no-phase")
+    assert ".num_contexts" in failure.detail
+    # Prefill holds the mixed batch and reads both counts; that is the design,
+    # so only the one read inside DecodeTarget is named.
+    assert failure.detail.count(".num_contexts") == 1
+    assert ".num_ctx_tokens" not in failure.detail
+
+
+def test_a_weights_file_without_a_table_is_flagged(tmp_path):
+    root = _build_repo(tmp_path)
+    (root / TARGET_REL / "weights.py").write_text("MODEL_WEIGHTS = object()\n", encoding="utf-8")
+    failure = next(c for c in _verify(root).failures if c.name == "target:weight-table")
+    assert "no ModelWeights subclass" in failure.detail
+
+
+def test_a_hand_written_manifest_beside_the_table_is_flagged(tmp_path):
+    """The table generates the manifest; a second copy of every key is the drift it stops."""
+    root = _build_repo(tmp_path)
+    weights = root / TARGET_REL / "weights.py"
+    weights.write_text(_WEIGHTS + "\n\ndef _manifest(core):\n    return {}\n", encoding="utf-8")
+    failure = next(c for c in _verify(root).failures if c.name == "target:weight-table")
+    assert "_manifest" in failure.detail
+
+
+def test_the_target_check_no_longer_asks_for_a_required_ops_list(tmp_path):
+    """The step contract replaced REQUIRED_TRTLLM_OPS; a target without one is complete."""
+    root = _build_repo(tmp_path)
+    assert "REQUIRED_TRTLLM_OPS" not in (root / TARGET_REL / "modeling.py").read_text()
     report = _verify(root)
-    failure = next(c for c in report.failures if c.name == "target:REQUIRED_TRTLLM_OPS")
-    assert "renamed op" in failure.detail
+    assert report.passed, report.render()
+    assert not any("REQUIRED_TRTLLM_OPS" in c.name for c in report.checks)
 
 
 def test_a_missing_catalog_test_fails(tmp_path):
@@ -148,12 +257,71 @@ def test_a_missing_catalog_test_fails(tmp_path):
     assert any(c.name == "test:norm/flashinfer_rmsnorm" for c in report.failures)
 
 
-def test_mirrors_need_no_contract_or_test(tmp_path):
-    """`catalog/torch/` mirrors carry no contract, test or receipts by design."""
+def test_an_entry_is_its_executable_contract(tmp_path):
+    """No `.md` contract and no exempt category: the OpWrapper class is the contract."""
+    contract = delivery.entry_contract(
+        _build_repo(tmp_path) / delivery.CATALOG_DIR / "norm" / "flashinfer_rmsnorm.py"
+    )
+    assert contract.certified
+    assert contract.classes == ("Entry",)
+    assert contract.archs == ("sm_103",)
+    assert contract.cells == 2
+
+
+@pytest.mark.parametrize(
+    ("entry", "expected"),
+    [
+        ("def flashinfer_rmsnorm(x): ...\n", "no OpWrapper subclass"),
+        (_ENTRY.replace("    ARCHS = frozenset({Arch.SM_103})\n", ""), "declares no ARCHS"),
+        (_ENTRY.replace("CELLS = (", "UNUSED = ("), "declares no CELLS"),
+        (_ENTRY.replace("def reference", "def ref"), "defines no reference"),
+    ],
+    ids=["bare-function", "no-archs", "no-cells", "no-reference"],
+)
+def test_an_entry_that_certifies_nothing_fails(tmp_path, entry, expected):
+    root = _build_repo(tmp_path)
+    (root / delivery.CATALOG_DIR / "norm" / "flashinfer_rmsnorm.py").write_text(
+        entry, encoding="utf-8"
+    )
+    failure = next(
+        c for c in _verify(root).failures if c.name == "catalog:norm/flashinfer_rmsnorm.py"
+    )
+    assert expected in failure.detail
+
+
+def test_a_test_that_never_drives_the_cells_fails(tmp_path):
+    root = _build_repo(tmp_path)
+    test = root / delivery.CATALOG_TESTS_DIR / "gemm" / "test_modeling_v2_cublas_mm.py"
+    test.write_text("def test(): ...\n", encoding="utf-8")
+    failure = next(c for c in _verify(root).failures if c.name == "test:gemm/cublas_mm")
+    assert ".CELLS" in failure.detail
+
+
+def test_a_model_op_is_checked_at_the_target_paths(tmp_path):
+    """An op only this target calls lives in its `ops/`, tested under its path."""
     root = _build_repo(tmp_path)
     report = _verify(root)
-    assert report.passed
-    assert not any(c.name == "test:torch/embedding" for c in report.checks)
+    names = {c.name for c in report.checks}
+    assert {"ops:ops/moe/router.py", "test:ops/moe/router"} <= names
+    test = root / delivery.model_ops_tests_dir(TARGET_REL) / "moe" / "test_modeling_v2_router.py"
+    test.unlink()
+    failure = next(c for c in _verify(root).failures if c.name == "test:ops/moe/router")
+    assert "models/gpt_oss/gpt_oss_120b__sm_103__tp1/moe/test_modeling_v2_router.py" in (
+        failure.detail
+    )
+    (root / TARGET_REL / "ops" / "moe" / "router.py").unlink()
+    assert any(c.name == "ops:ops/moe/router.py" for c in _verify(root).failures)
+
+
+def test_another_targets_op_is_refused(tmp_path):
+    """Targets share the catalog and nothing else: a sibling's op gets promoted."""
+    foreign = (
+        "from tensorrt_llm._torch._experimental.modeling_v2.models.deepseek_v3."
+        "r1_0528_nvfp4__sm_103__dep4.ops.moe.fused_moe import FusedMoe\n"
+    )
+    root = _build_repo(tmp_path, modeling=_MODELING + foreign)
+    failure = next(c for c in _verify(root).failures if c.name == "ops:ops/moe/fused_moe.py")
+    assert "promote the entry" in failure.detail
 
 
 def test_an_unindexed_entry_fails(tmp_path):
@@ -313,9 +481,11 @@ def test_the_real_merged_target_passes_every_check(target_rel, family, model_key
 
 
 def test_a_multi_rank_entry_is_satisfied_by_its_op_matrix_test(tmp_path):
+    """The collected file launches the ranks; the rank body beside it drives the cells."""
     tests = tmp_path / delivery.CATALOG_TESTS_DIR / "comm"
     tests.mkdir(parents=True)
     (tests / "test_modeling_v2_allgather_op_matrix.py").write_text("", encoding="utf-8")
+    (tests / "_allgather_op_matrix.py").write_text("for cell in op.CELLS: ...\n", encoding="utf-8")
     [check] = delivery.check_catalog_tests(tmp_path, [("comm", "allgather")])
     assert check.passed, check.detail
     [missing] = delivery.check_catalog_tests(tmp_path, [("comm", "reducescatter")])

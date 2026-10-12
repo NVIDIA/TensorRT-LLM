@@ -131,9 +131,24 @@ def test_the_anchor_is_never_invented_reaches_the_planner():
     )
 
 
-def test_receipts_are_three_state_in_the_smith_prompt():
-    assert "absent — unknown" in DEFAULT_PROMPTS.smith
+def test_certification_is_three_state_in_the_smith_prompt():
+    assert "**unknown** — a value outside every cell, or an arch not in `ARCHS`" in (
+        DEFAULT_PROMPTS.smith
+    )
     assert "Tolerance inflation manufactures green" in DEFAULT_PROMPTS.smith
+
+
+def test_the_smith_prompt_teaches_the_19977_entry_form():
+    """An entry is an OpWrapper class with an executable contract, in one of two homes."""
+    smith = DEFAULT_PROMPTS.smith
+    for member in ("`raw_call`", "`reference`", "`is_valid`", "`compare`", "`CELLS`", "`ARCHS`"):
+        assert member in smith
+    assert "there is no `.md` beside it" in smith
+    assert "/ops/<category>/<name>.py" in smith
+    assert "models/<family>/<ckpt>__<arch>__<parallel>/<category>/test_modeling_v2_<name>.py" in (
+        smith
+    )
+    assert "catalog/torch/" not in smith.replace("there is no `catalog/torch/`", "")
 
 
 def test_the_runtime_dump_incident_reaches_the_roles_that_can_catch_it():

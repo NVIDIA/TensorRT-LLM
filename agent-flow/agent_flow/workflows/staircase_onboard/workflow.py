@@ -3334,10 +3334,14 @@ class StaircaseOnboardWorkflow:
         # matters most for this role: the corrections file exists because a
         # plan review landed after the smith queue had been built.
         context = self._context_block()
+        # An `ops/<category>/<name>` target lives in this target's own `ops/`.
+        target_rel = str(getattr(self._preflight, "target_rel", "") or "")
         return (
             f"Workspace: {self.workspace}\n"
             f"Repository: {self.task_data['trtllm_repo_path']}\n"
-            f"Architecture: {self.task_data['arch']}\n\n"
+            f"Architecture: {self.task_data['arch']}\n"
+            + (f"Target: {target_rel}\n" if target_rel else "")
+            + "\n"
             f"Dispatch {item.n}: **{item.mode}** the catalog entry `{item.target}`.\n"
             f"{retry}"
             f"{assignment}"

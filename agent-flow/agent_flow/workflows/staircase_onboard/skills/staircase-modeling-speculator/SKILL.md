@@ -48,9 +48,12 @@ and the runtime's part (the drafting loop, rejection sampling) already exists
 and needs nothing registered.
 
 Concretely, per `references/runtime-boundary.md`: the shell gains the binding
-the runtime looks for, the target's core model (`ModelingV2Core`) gains the
-draft module, and the no-feature path must stay **bit-identical** — when the
-feature is off, the forward is exactly what the recorded gate measured.
+the runtime looks for, the core gains the draft container, **each of the two
+targets gains its own `mtp_forward`** with the draft ops bound in its own
+`__init__`, and the draft layer's `forward` is one routing line —
+`core._select_target(md).mtp_forward(...)`, read per call. The no-feature
+path must stay **bit-identical** — when the feature is off, both targets'
+`forward` are exactly what the recorded gate measured.
 
 Do not inherit the upstream speculative-decoding base class. It reaches the
 draft model through a module-level function with no override point, which

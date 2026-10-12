@@ -9,10 +9,13 @@
 # the build (FlashInfer ops register only behind `IS_FLASHINFER_AVAILABLE`).
 # This file answers the other two.
 #
-# Provenance is not trivia. It decides the shape of the receipt: a CuTe DSL
-# kernel is architecture-gated and JIT-compiled, a vendored Triton kernel is
-# compiled on first call and has no arch gate, a C++ kernel is in the wheel
-# and either present or not. Certifying them means different things.
+# Provenance is not trivia. It decides what an entry's certification has to
+# state: a CuTe DSL kernel is architecture-gated and JIT-compiled, a vendored
+# Triton kernel is compiled on first call and has no arch gate, a C++ kernel
+# is in the wheel and either present or not. Certifying them means different
+# things. An entry certifies through its `ARCHS` and `CELLS` (catalog/_op.py);
+# what `certifying` asks for below goes into a cell's `spec` when it is an
+# axis the test drives, and into the entry's `note` when it is not.
 #
 # TWO REGISTRATION PLANES, and you have to know which one you are in:
 #
@@ -38,7 +41,8 @@
 #                  belongs to this source
 #     tier:        which sourcing tier (see vocabulary.py) it satisfies
 #     availability: what decides whether its ops exist in a given build
-#     certifying:  what a receipt for one of these must say, beyond passing
+#     certifying:  what an entry wrapping one of these must state, beyond its
+#                  cells passing
 #
 # Paths are resolved against the checkout by a test. No line numbers, no
 # signatures --- same rule as the runtime map.
@@ -65,8 +69,8 @@ cpp_thop:
     not that the environment is misconfigured.
   certifying: >-
     Name the architecture. These are compiled per `--cuda_architectures`, so
-    a receipt is only meaningful with the arch stated, and a pass elsewhere
-    says nothing here.
+    an entry's `ARCHS` is only meaningful for the device its cells were
+    driven on, and a pass elsewhere says nothing here.
 
 trtllm_gen:
   summary: >-
@@ -139,7 +143,7 @@ flashinfer:
     `trtllm-llmapi-launch` for the isolation and `FLASHINFER_CUBIN_DIR` for
     the shared cubin cache.
   certifying: >-
-    Do not pin a FlashInfer version in the contract; name the kernel or the
+    Do not pin a FlashInfer version in the entry; name the kernel or the
     code path instead. The tree's own audit rejects version pins for exactly
     this reason.
 
@@ -168,7 +172,7 @@ triton_custom_op:
     imports only the package does not list its ops.
   certifying: >-
     Read the autotune. A Triton op's numerics are fixed but its launch
-    configuration is chosen at runtime, so a receipt that names only the op
+    configuration is chosen at runtime, so an entry that names only the op
     describes a kernel that may not be the one the next run picks. Record
     the resolved config alongside the result.
 
@@ -189,7 +193,7 @@ vendored_triton:
   certifying: >-
     Name the branch. Two backends for one computation are different kernels
     in different gate spaces; the in-tree parity test compares them with a
-    tolerance, not bit-equality, so a receipt that does not say which one ran
+    tolerance, not bit-equality, so an entry that does not say which one ran
     certifies an implementation nobody can identify later.
 
 torch_composed:
@@ -202,8 +206,10 @@ torch_composed:
   availability: >-
     Always present; nothing gates them.
   certifying: >-
-    Cheap. Upstream owns the correctness of the underlying torch ops, which
-    is why the catalog's `torch/` mirrors carry no contract and no receipt.
+    Cheap, but not exempt. Upstream owns the correctness of the underlying
+    torch ops, and a target calls plain torch directly rather than through an
+    entry; a registered op of this source is still a trtllm op, so the entry
+    wrapping it carries cells like any other.
 
 userbuffers:
   summary: >-
@@ -217,8 +223,8 @@ userbuffers:
     across a communicator, so a single-rank build never registers a use for
     them even when the ops are present.
   certifying: >-
-    Certify at the world size the target declares. A collective receipt taken
-    at a different rank count describes a different communicator.
+    Certify at the world size the target declares, and make it a cell axis.
+    Cells driven at a different rank count describe a different communicator.
 
 dspark:
   summary: >-

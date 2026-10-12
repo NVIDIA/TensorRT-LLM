@@ -249,6 +249,17 @@ def test_every_gate_asks_the_target_for_its_runtime_value_dump():
         assert f"{gates.RUNTIME_VALUE_DUMP_ENV}=1" in command
 
 
+def test_every_gate_turns_on_the_targets_step_contract_check():
+    """Each target's `step_args` probe runs only under the switch; a gate must set it."""
+    run = recorder(ShellResult(returncode=0, stdout="ok"))
+    gates.run_boot_gate(_env(), task_data=_TASK, runner=run)
+    gates.run_accuracy_gate(_env(), task_data=_TASK, reference=90.0, runner=run)
+    assert run.seen  # type: ignore[attr-defined]
+    for command in run.seen:  # type: ignore[attr-defined]
+        assert f"{gates.STEP_CONTRACT_ENV}=1" in command
+    assert gates.STEP_CONTRACT_ENV == "TRTLLM_MODELING_V2_VALIDATE"
+
+
 def test_boot_gate_always_forces_require_mode():
     """Under `auto` the built-in implementation answers and the gate lies."""
     run = recorder(ShellResult(returncode=0, stdout=_PARIS))

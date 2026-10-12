@@ -4,7 +4,7 @@
 """Every fixed size in a target must answer to an engine limit.
 
 A catalog entry is certified over the serving envelope, kernel by kernel. A
-target can still set a ceiling none of those receipts sees: a module-level
+target can still set a ceiling none of those entries' cells sees: a module-level
 ``_TOPK_MAX_ROWS = 8192`` that sizes an offsets buffer at construction makes
 every engine with ``max_num_tokens`` above 8192 die in warm-up, while every
 kernel it feeds is certified to 16384. No gate launched above 8192, so no gate
@@ -527,12 +527,20 @@ def _is_capacity_name(name: str) -> bool:
     return any(word in CAPACITY_WORDS for word in words)
 
 
+#: A target's own ops live here, one entry per kernel; like catalog entries they
+#: are certified through their cells, so the audit leaves them to that.
+TARGET_OPS_DIR = "ops"
+
+
 def target_files(target_dir: Path) -> list[Path]:
-    """Every Python file of a target, tests and caches excluded."""
+    """Every Python file of a target; tests, caches and ``ops/`` excluded."""
+    root = Path(target_dir)
     return sorted(
         path
-        for path in Path(target_dir).rglob("*.py")
-        if "__pycache__" not in path.parts and not path.name.startswith("test_")
+        for path in root.rglob("*.py")
+        if "__pycache__" not in path.parts
+        and not path.name.startswith("test_")
+        and path.relative_to(root).parts[0] != TARGET_OPS_DIR
     )
 
 
@@ -748,6 +756,7 @@ __all__ = [
     "CAPACITY_WORDS",
     "ENGINE_ARGS",
     "LITERAL_THRESHOLD",
+    "TARGET_OPS_DIR",
     "Allocation",
     "Binding",
     "CapacityAudit",

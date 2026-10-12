@@ -2,7 +2,7 @@
 
 Every verify and every onboard records, for each index-typed argument of the
 entry, where 32-bit (and fp32) arithmetic stops being exact -- as a hard limit
-in the contract, independent of the serving envelope.
+in the entry, independent of the serving envelope.
 
 ## Which arguments
 
@@ -46,20 +46,30 @@ When a boundary genuinely cannot be reached on this machine, record it as
 `unprobed` with the reason and the largest value that was probed: the hard
 limit is then that value, not the boundary.
 
-## The contract table
-
-```markdown
 ## Hard limits
 
-| argument | arithmetic | boundary | probed at | result | receipt |
-|---|---|---|---|---|---|
-| `out` offset | `row * 512` in int32 | 2^31 / 512 = 4194304 rows | 4194305 rows | failed: rows >= 2^22 written out of place | sm_103 |
-| `num_tokens` | element count, int64 | 2^31 elements | 2^31 + 1 | passed | sm_103 |
-| `topk_idx` | through fp32 in the reduction | 2^24 | 16777217 | passed (int32 path, never fp32) | sm_103 |
+Each probe lands in the entry itself, in one of two places:
+
+- **the op crosses the boundary silently** (writes out of place, wraps, rounds
+  an index): an `is_valid` guard that refuses the argument at the boundary,
+  plus a guard test that first shows the wrong answer unguarded and then
+  `pytest.raises` under `validating(op)`. That is exactly the class of input
+  `is_valid` exists for: accepted, and answered wrongly;
+- **the op raises, passes, or the boundary was not reached**: a row in the
+  `note`, under a `Hard limits` heading.
+
+```text
+Hard limits (sm_103)
+  out offset   row * 512 in int32       2^31 / 512 = 4194304 rows  probed at 4194305 rows
+               failed: rows >= 2^22 written out of place -- is_valid refuses them
+  num_tokens   element count, int64     2^31 elements              probed at 2^31 + 1   passed
+  topk_idx     through fp32 in the      2^24                       probed at 16777217   passed
+               reduction                                           (int32 path, never fp32)
 ```
 
-A `failed` row is a hard limit every target must stay below, and a value of the
-serving envelope above it is a blocker for the target, not for the entry. An
-`unprobed` row limits the entry to what was probed. Rewrite the table only from
-a run you watched, and re-read it whenever a change removes a memory cap that
-kept the reachable rows small.
+Name the architecture the probes ran on; a boundary probed on one arch says
+nothing about another. A `failed` row is a hard limit every target must stay
+below, and a value of the serving envelope above it is a blocker for the
+target, not for the entry. An `unprobed` row limits the entry to what was
+probed. Rewrite the rows only from a run you watched, and re-read them
+whenever a change removes a memory cap that kept the reachable rows small.

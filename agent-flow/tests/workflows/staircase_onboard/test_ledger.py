@@ -213,7 +213,7 @@ def test_dependencies_are_the_target_its_family_and_its_imported_catalog_entries
     assert f"{family.relative_to(root).as_posix()}/shared_rope.py" in paths
     assert f"{CATALOG_DIR}/norm/flashinfer_rmsnorm.py" in paths
     assert f"{CATALOG_DIR}/gemm/cublas_mm.py" in paths
-    assert f"{CATALOG_DIR}/torch/embedding.py" in paths
+    assert f"{CATALOG_DIR}/activation/silu_and_mul.py" in paths
     # a contract is a certification, not code the engine runs
     assert not [p for p in paths if p.endswith(".md")]
     assert not [p for p in paths if "__pycache__" in p]

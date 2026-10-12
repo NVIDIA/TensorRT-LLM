@@ -76,7 +76,6 @@ def _repo(tmp_path: Path, *, accuracy: bool = True) -> Path:
     for category, name, test_name in (
         ("comm", "allreduce", "test_allreduce_op_matrix.py"),
         ("norm", "rmsnorm", "test_modeling_v2_rmsnorm.py"),
-        ("torch", "embedding", None),
     ):
         (catalog / category).mkdir(parents=True, exist_ok=True)
         (catalog / category / f"{name}.py").write_text("def f(): ...\n", encoding="utf-8")
@@ -100,7 +99,7 @@ def _vocabulary(tmp_path: Path) -> Path:
                 "steps": [
                     {"step": "tp all-reduce", "entry": "catalog/comm/allreduce.py"},
                     {"step": "norm", "entry": "catalog/norm/rmsnorm.py"},
-                    {"step": "embed", "entry": "catalog/torch/embedding.py"},
+                    {"step": "route", "entry": "ops/moe/router.py"},
                     {
                         "step": "gemm",
                         "entry": "catalog/gemm/mm_mxfp8.py",
@@ -129,8 +128,9 @@ def test_test_names_ci_does_not_match_are_found_before_delivery(tmp_path):
     warned = {f.name: f.detail for f in report.warnings}
     assert "test_allreduce_op_matrix.py" in warned["test-name:comm/allreduce"]
     assert "has no test" in warned["test-name:gemm/mm_mxfp8"]
-    # Correctly named, a mirror, and an entry smith has not written yet: no warning.
-    assert not {"test-name:norm/rmsnorm", "test-name:torch/embedding"} & set(warned)
+    # Correctly named, the target's own op (delivery checks it at the target's
+    # path), and an entry smith has not written yet: no warning.
+    assert not {"test-name:norm/rmsnorm", "test-name:moe/router"} & set(warned)
     assert not any("draft_sample" in name for name in warned)
     assert "vocabulary:call_sites" in warned
 

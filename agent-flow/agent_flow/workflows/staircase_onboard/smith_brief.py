@@ -80,8 +80,15 @@ class CallSite:
 
 
 def entry_key(path: str) -> str:
-    """``catalog/attention/x.py`` / ``attention/x`` / ``.../catalog/attention/x`` -> ``attention/x``."""
+    """``catalog/attention/x.py`` / ``attention/x`` / ``.../catalog/attention/x`` -> ``attention/x``.
+
+    A target's own entry keeps its ``ops/`` prefix, so it never matches a
+    shared entry of the same name: ``.../models/<family>/<target>/ops/moe/x.py``
+    and ``ops/moe/x`` -> ``ops/moe/x``.
+    """
     text = str(path).strip().removesuffix(".py").strip("/")
+    if "/ops/" in text:
+        return "ops/" + text.split("/ops/", 1)[1]
     if "catalog/" in text:
         text = text.split("catalog/", 1)[1]
     return text
@@ -202,7 +209,8 @@ def integer_width_probes(widths: Iterable[int], *, reachable_rows: int | None) -
     if not widths:
         lines.append(
             "rows x row width: 2^31 / <row width> rows, for every row width this entry "
-            "addresses (the call sites declare none -- read them from the contract)"
+            "addresses (the call sites declare none -- read them from the entry's raw_call "
+            "signature and its cells' specs)"
         )
     return lines
 
@@ -309,8 +317,10 @@ def render_smith_brief(
         "",
         "### Integer-width boundary probes (mandatory)",
         "",
-        "Probe every index-typed argument at these boundaries and record each outcome in "
-        "the contract's `## Hard limits` table, whether or not today's envelope reaches it:",
+        "Probe every index-typed argument at these boundaries, whether or not today's "
+        "envelope reaches them, and record each outcome in the entry: a boundary the op "
+        "crosses silently wrong becomes an `is_valid` guard with a test proving it refuses; "
+        "one it raises at, or passes, goes in the entry's `note` under `Hard limits`:",
         "",
         *(f"- {line}" for line in integer_width_probes(widths, reachable_rows=reachable)),
     ]

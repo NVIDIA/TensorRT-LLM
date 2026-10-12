@@ -151,9 +151,11 @@ Two details of that path are protocol, not modelling, and they move the score:
 ## What the target adds
 
 **A second module tree.** The vision tower plus the projector that maps its
-output into the language model's hidden size. Built in `__init__` beside the
-language model, under the same flat-declaration rule: `torch.empty`, HF
-storage layout, one assert per axis the assembly depends on.
+output into the language model's hidden size. Declared beside the language
+model under the same weight-table rule: `W` rows in the same `ModelWeights`
+subclass (`layers=None` or a `layers` callable over the tower's own blocks,
+with its own key prefix), `torch.empty`, HF storage layout, every axis read
+from the config or pinned by routing.
 
 **A second weight family.** Usually a different layout convention from the
 language model's, and commonly **unquantized** while the language model is

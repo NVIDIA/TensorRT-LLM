@@ -22,35 +22,56 @@ has inverted the economics of the whole run.
 
 ## What to check, in order of what actually catches defects
 
-1. **The vocabulary audit.** Every call in `forward` and the private methods
-   it reaches that creates or transforms a tensor must be a catalog entry.
+1. **The vocabulary audit.** Every trtllm op in each target's `forward` and
+   the private methods it reaches must be called through an entry — a
+   `catalog/` entry, or one of the target's own `ops/<category>/` with its
+   test at the mirrored path. Native torch calls are allowed directly; an
+   op's math composed out of them where an engine op serves it is not.
    Scope is the whole trick: the rope table's `arange`/`cos`/`sin` and
    load-time `.t()`/`.to()` run at init and are outside the rule, so a
    whole-file scan false-positives on them. Check the assembler scoped it
    correctly, and spot-check two or three calls against `catalog/index.yaml`
-   yourself rather than trusting the list.
-2. **`REQUIRED_TRTLLM_OPS` equals the forward's call set** — not a superset,
-   not a subset. A stale name is as wrong as a missing one.
-3. **The runtime-value dump against the contracts.** Any value the engine
-   varied at runtime that sits outside its entry's certified column must be
+   or the `ops/` file yourself rather than trusting the list.
+2. **The target layer is intact.** The core's `forward` advances the step
+   generation once and routes through `_select_target` / `phase_of`; both
+   `PrefillTarget` and `DecodeTarget` exist, derive from `Target` directly,
+   are built in `post_load_weights`, and share no body (no intermediate base,
+   no mixin). `DecodeTarget` states `num_contexts=0, num_ctx_tokens=0` in its
+   `step_args` and reads neither anywhere — a read there is a branch frozen at
+   capture. Every metadata field a target consumes is read in its
+   `step_args`, which is the step-contract probe. A reintroduced
+   `REQUIRED_TRTLLM_OPS` / `_STEP_FIELDS` list, or a configuration assert
+   re-validating what routing pins, is a finding.
+3. **Binding discipline.** Entries are bound in each target's `__init__`
+   (`bind_const`, `bind_layered(i, ...)` only on the layers that have the
+   operand); per-step state and per-step scratch are bound or allocated once
+   at the top of `forward`, never inside the layer loop; call sites pass data
+   and `layer=i` and state their outputs (`out = op(in, out=buf, layer=i)`);
+   no bound instance is shared between targets.
+4. **The runtime-value dump against each entry's `CELLS`.** Any value the
+   engine varied at runtime that sits outside its entry's certified cells must be
    certified before delivery -- see "Rejecting" for how to report it. This is
    the check that has been missed before: a target merged with 34 of the 35
    batch sizes its engine captured sitting outside the contract, because
    every *constant* it passed was inside.
-4. **Graph safety and sync-freedom in the forward.** No `.item()`, no
+5. **Graph safety and sync-freedom in the forward.** No `.item()`, no
    `.cpu()`, no data-dependent host branching. These are writing rules — a
    forward that violates them is wrong the first time it is captured, and the
    boot gate may well not show it.
-5. **The manifest's bidirectional coverage**, and that every key in the
-   known-not-loaded set is named with a reason.
-6. **The topology.** Every gate is topology-blind: a `tep4` target served at
+6. **The weight table.** Every weight is one `W` row of the `ModelWeights`
+   subclass, widths derived in `dims()` only, no hand-written manifest beside
+   the table; load coverage is bidirectional, and every key in
+   `expected_unconsumed` is named with a reason.
+7. **The topology.** Every gate is topology-blind: a `tep4` target served at
    tp2 boots and scores and looks self-consistent while the directory name
    lies. Read the assembly's parallel handling against the segment the target
    path declares.
-7. **For a feature increment: the base path is unchanged.** With the feature
-   off, the forward must be what the recorded gate measured, bit for bit.
-8. **Capacity constants against the serving envelope.** Your prompt carries
-   the orchestrator's static audit of every fixed size in the target. A FAIL
+8. **For a feature increment: the base path is unchanged.** With the feature
+   off, both targets' forwards must be what the recorded gate measured, bit
+   for bit.
+9. **Capacity constants against the serving envelope.** Your prompt carries
+   the orchestrator's static audit of every fixed size in the target (its
+   `ops/` excepted: those are certified per cell, like catalog entries). A FAIL
    row is a blocker. An ok row is a CLAIM: read the code and confirm the
    constant really caps the axis it is bound to (a row ceiling bound to
    `max_batch_size` is wrong), and that a `fixed:` reason is true. No gate
@@ -65,15 +86,17 @@ has inverted the economics of the whole run.
   and it is not part of onboarding at all.
 - **Do not review formatting.** The run lints once, at delivery, on purpose.
 - **Do not ask for refactors.** Self-containment is the architecture;
-  duplication between targets is not a smell, and "this could be shared" is
-  the opposite of the design.
+  duplication between targets — and between a core's prefill and decode
+  bodies — is not a smell, and "this could be shared" is the opposite of the
+  design.
 
 ## Rejecting
 
 REJECT for a defect the gates cannot see and a reader can: an unmapped call, a
-stale op list, a sync in the forward, a topology that does not match the
-segment, a feature that changed the base path, a capacity constant below the
-envelope.
+decode target that reads the phase back, per-step binding inside the layer
+loop, a hand-written manifest, a sync in the forward, a topology that does not
+match the segment, a feature that changed the base path, a capacity constant
+below the envelope.
 
 **A runtime value outside an entry's certified column, on a target that is
 otherwise correct, is a certification gap, not a REJECT.** List it in
@@ -81,8 +104,8 @@ otherwise correct, is a certification gap, not a REJECT.** List it in
 surface -- and APPROVE. The orchestrator dispatches the verify smiths itself
 and the unit moves on; a REJECT for it re-opens the assembler for hours over
 work that is not the assembler's. Judge "outside" against the serving
-envelope in your prompt: a value inside the envelope that the contract's
-certified column covers by the envelope standard is not a gap at all.
+envelope in your prompt: a value inside the envelope that the entry's
+`CELLS` cover by the envelope standard is not a gap at all.
 
 APPROVE when the diff is consistent with the gate evidence and the invariants
 hold. A gate that passed plus a clean audit is sufficient — you are not
@@ -109,7 +132,9 @@ line for every item, and say which invariant each one violates.
 |---|---|
 | "Let me re-run the accuracy gate to be sure" | It ran. The number is in your prompt. Re-running it costs an hour and produces the same number plus 0.1-0.3 points of session noise. |
 | "The forward duplicates what another target does" | Self-containment is the architecture. Duplication between targets is the design, not a smell. |
-| "The whole file should be scanned for non-catalog calls" | That false-positives on init-time code and buries the real finding. Scope it to `forward` plus what it reaches. |
+| "The whole file should be scanned for non-catalog calls" | That false-positives on init-time code and buries the real finding. Scope it to each target's `forward` plus what it reaches. |
+| "PrefillTarget and DecodeTarget are nearly identical — ask for a shared base" | They share no body by design. Check only that decode never reads the phase back. |
+| "The target dropped its config asserts — REJECT, nothing refuses a wrong checkpoint" | Routing refuses it. Re-validating what the fingerprint pins is the anti-pattern; an axis the fingerprint misses is a routing finding. |
 | "The constants are all certified, so we're clean" | The values that escape are the ones the engine varies at runtime. Read the dump. |
 | "Both gates passed, so the topology is what the path says" | Every gate is topology-blind. Only reading the assembly against the segment catches it. |
 | "The constant is bound, so it is fine" | A binding is a claim the audit takes at its word. Check it names the axis the constant actually caps. |

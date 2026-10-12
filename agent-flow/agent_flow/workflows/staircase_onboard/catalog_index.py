@@ -316,13 +316,21 @@ def render(snapshot: Snapshot) -> str:
     by_category: dict[str, list[Mapping[str, Any]]] = {}
     for row in renderable_rows(snapshot):
         by_category.setdefault(str(row["path"]).split("/", 1)[0], []).append(row)
-    order = [c for c in header.category_order if c in by_category] + sorted(
-        c for c in by_category if c not in header.category_order
-    )
+    # A header category with no rows keeps its divider when it has one of its
+    # own: the hand-written index carries dividers for categories it has no
+    # entry in yet, stacked directly above the next category's divider.
+    order = [
+        c for c in header.category_order if c in by_category or c in header.category_dividers
+    ] + sorted(c for c in by_category if c not in header.category_order)
     out = [header.preamble.rstrip("\n") + "\n\n" if header.preamble else "", GENERATED_NOTICE]
     out.append("entries:\n")
-    blocks = []
+    blocks: list[str] = []
+    separators: list[str] = []
     for category in order:
+        if category not in by_category:
+            blocks.append(header.category_dividers[category])
+            separators.append("\n")
+            continue
         rows = sorted(
             by_category[category],
             key=lambda r: (
@@ -337,7 +345,9 @@ def render(snapshot: Snapshot) -> str:
                 lines.append("")
             lines.extend(_render_row(row))
         blocks.append("\n".join(lines))
-    out.append("\n\n".join(blocks) + ("\n" if blocks else ""))
+        separators.append("\n\n")
+    body = "".join(block + sep for block, sep in zip(blocks[:-1], separators[:-1]))
+    out.append(body + blocks[-1] + "\n" if blocks else "")
     return "".join(out)
 
 
@@ -360,8 +370,21 @@ def split_index(text: str) -> tuple[Header, list[dict[str, Any]]]:
     order: list[str] = []
     dividers: dict[str, str] = {}
     pending_divider: str | None = None
+
+    def standalone(divider: str) -> None:
+        # A divider followed by another divider, or by nothing, heads a
+        # category with no entry yet; it is keyed by the first word of its title.
+        match = _DIVIDER_LINE.match(divider)
+        title = match.group("title") if match else ""
+        key = re.sub(r"[^a-z0-9_]", "", (title.split() or [""])[0].lower())
+        if key and key not in order:
+            order.append(key)
+            dividers[key] = divider
+
     for line in lines[start + 1 :]:
         if _DIVIDER_LINE.match(line):
+            if pending_divider is not None:
+                standalone(pending_divider)
             pending_divider = line.rstrip("\n")
             continue
         match = re.match(r"^\s*-\s*path:\s*(\S+)", line)
@@ -372,6 +395,8 @@ def split_index(text: str) -> tuple[Header, list[dict[str, Any]]]:
                 if pending_divider is not None:
                     dividers[category] = pending_divider
             pending_divider = None
+    if pending_divider is not None:
+        standalone(pending_divider)
     for row in rows:
         category = str(row["path"]).split("/", 1)[0]
         if category not in order:

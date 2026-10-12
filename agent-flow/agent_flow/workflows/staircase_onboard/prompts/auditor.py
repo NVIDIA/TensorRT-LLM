@@ -14,8 +14,9 @@ memory of how this target was built — deliberately, so that nothing you
 conclude is inherited from the agents whose claims you are checking.
 
 Most of delivery is mechanical and already done: the orchestrator has verified
-in Python that the files exist, that `index.yaml` is in sync, that
-`REQUIRED_TRTLLM_OPS` resolves, that the target routes, that the accuracy
+in Python that the files exist, that `index.yaml` is in sync, that the
+target has its prefill and decode targets and its weight table, that every
+target-owned op has its test, that the target routes, that the accuracy
 anchor is present, and that the tests are registered. Those results are in
 your prompt.
 
@@ -23,18 +24,21 @@ your prompt.
 
 ## The check: the runtime-value dump against the certified columns
 
-The target's forward recorded the metadata of every catalog call it made —
-shapes, dtypes, the constants passed — at runtime. Each catalog entry's
-contract states, in prose, what its receipt certifies. Deciding whether a
-dumped value falls inside a certified column is **reading a contract**, and a
-certified column is a sentence, not a table. That is why a human-language
-reader does it and a script does not.
+The target's two forwards recorded the metadata of every entry call they
+made — shapes, dtypes, the constants passed, and the per-step bindings — at
+runtime. Each entry states what it is certified over in its `.py`: `CELLS`
+(each with a `spec` the entry's test interprets and a `why`), `ARCHS`, and a
+`note` for what is left. A "certified column" below means the cells on an
+architecture the entry lists. Deciding whether a dumped value falls inside
+them is **reading an entry**: a cell's `spec` is entry-specific and its `why`
+is prose. That is why a human-language reader does it and a script does not.
 
 For every distinct value in the dump:
 
-1. find the entry it was passed to, in `catalog/index.yaml`
-2. read that entry's contract — specifically the certified column and the
-   receipt for **this GPU architecture**
+1. find the entry it was passed to — in `catalog/index.yaml`, or in the
+   target's own `ops/<category>/` for an op only this target calls
+2. read that entry's `CELLS` and `ARCHS` (and `note`) — specifically the cells
+   certified on **this GPU architecture**
 3. decide: inside, or outside
 
 **The values that escape are the ones the engine varies at runtime** — decode
@@ -48,10 +52,12 @@ exists to prevent, and it is the one that has actually happened.
 is reached with several row multiples: `G` at a decode step, `(1 + draft)·G` at
 a verify step, a fraction of that on a compressed path, times the gather width
 after an attention-DP all-gather. Derive each site's multiple from the call
-chain and check `multiple x every captured G` against the certified column;
+chain and check `multiple x every captured G` against the certified cells;
 `certification.md` lists the captured batch sizes and the envelope. A site on
 a path that is never captured (context rows only) is eager: check it against
-the eager rows up to the envelope's token budget, not against capture. Name
+the eager rows up to the envelope's token budget, not against capture. A
+call site names its target too — `PrefillTarget` and `DecodeTarget` call the
+same entry from different bodies, and only decode's rows are captured. Name
 the call site and its multiple in `contract_line` when you report one.
 
 Two things that are **not** coverage:
@@ -104,9 +110,10 @@ Three things decide whether this round costs a whole extra cycle:
 - **the value list has to be complete for that axis.** A list that omits a
   value you saw sends the next round back for it, and "the next round finds
   one more" is exactly the loop this structure exists to end.
-- **`contract_line` verbatim.** It is the difference between a dispatch that
-  certifies the surface and one that spends its turn re-deriving what was
-  wrong.
+- **`contract_line` verbatim** — the closest cell's `why` and `spec`, or the
+  `note` sentence that decides it. It is the difference between a dispatch
+  that certifies the surface and one that spends its turn re-deriving what
+  was wrong.
 
 A row missing `entry`, `arch` or `axis` cannot be dispatched and is dropped.
 

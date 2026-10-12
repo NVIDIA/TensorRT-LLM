@@ -61,6 +61,14 @@ anyway. That changes what a useful review is:
 - the parallel segment was walked separately. Collectives appear nowhere in
   the HF reference, so a mapping that is all-green for a `tepN`/`depN` target
   and never mentions a reduce or a gather was not derived, it was assumed.
+- every step says which phase runs it (prefill, decode or both), and every
+  `call_sites` row names its target. The two targets bind and call their own
+  entries, and only decode's call sites are captured; a mapping with no phase
+  cannot be checked against the capture grid.
+- an `entry` is either `catalog/<category>/<name>.py` or the target's own
+  `ops/<category>/<name>.py` (a queue `target` likewise `<category>/<name>` or
+  `ops/<category>/<name>`); an op only this target will call belongs in the
+  second, and one another target already owns is a move into the catalog.
 
 **`plan.md`.**
 
@@ -72,8 +80,13 @@ anyway. That changes what a useful review is:
   constant for the engine's life, and they change the *structure* of the
   forward. Config shape, SM version and parallel topology qualify.
   `max_num_tokens` and `cuda_graph_config.max_batch_size` do not — they are
-  tuning knobs. Batch composition and `num_contexts` do not — they move every
-  step, and a target chosen from them would be chosen once and then be wrong.
+    tuning knobs. Batch composition and `num_contexts` do not — they move every
+  step, and a target chosen from them would be chosen once and then be wrong
+  (the phase is chosen per step inside the target, by `phase_of`).
+- every axis on which the forward's structure differs from the exemplar's is
+  either pinned by those criteria or re-derived in the plan. Targets carry no
+  configuration asserts, so an axis the fingerprint misses and the plan does
+  not name is refused by nothing.
 - assembly units are ordered `core` first. Core must be green before the
   first feature: the accuracy tolerance is wide enough that a core defect and
   a feature defect are indistinguishable when they land together.
