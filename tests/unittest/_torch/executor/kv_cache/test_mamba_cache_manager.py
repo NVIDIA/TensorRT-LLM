@@ -1456,6 +1456,7 @@ def test_non_mtp_pytorch_prepare_and_get_state_indices_flow():
 def test_v2_hybrid_prepare_expect_snapshot_points():
     mgr = object.__new__(MambaHybridCacheManagerV2)
     mgr.enable_block_reuse = True
+    mgr.tokens_per_block = 32  # interior offsets align down to the block grid
     mgr.kv_cache_config = KvCacheConfig(
         enable_block_reuse=True,
         mamba_state_config=MambaStateConfig(
@@ -1472,16 +1473,19 @@ def test_v2_hybrid_prepare_expect_snapshot_points():
 
     mgr.prepare_expect_snapshot_points(requests)
 
+    # offset 22 -> 128 / 106 -> 96 / 10 -> 0 (dropped): interior points are
+    # forced chunk boundaries and must sit on the block grid.
     assert [request.expect_snapshot_points for request in requests] == [
         [64, 128, 150],
-        [64, 106, 128],
-        [10, 32],
+        [64, 96, 128],
+        [32],
     ]
 
 
 def test_v2_hybrid_prepare_expect_snapshot_points_without_periodic_snapshots():
     mgr = object.__new__(MambaHybridCacheManagerV2)
     mgr.enable_block_reuse = True
+    mgr.tokens_per_block = 32
     mgr.kv_cache_config = KvCacheConfig(
         enable_block_reuse=True,
         mamba_state_config=MambaStateConfig(
@@ -1494,7 +1498,8 @@ def test_v2_hybrid_prepare_expect_snapshot_points_without_periodic_snapshots():
 
     mgr.prepare_expect_snapshot_points([request])
 
-    assert request.expect_snapshot_points == [128, 137, 150]
+    # offset 13 -> 137 aligns down onto the configured 128 point
+    assert request.expect_snapshot_points == [128, 150]
 
 
 def test_mamba_snapshot_rule_count_deduplicates_and_filters_unreachable_points():
@@ -3210,7 +3215,11 @@ def test_branch_snapshot_adds_prompt_end_without_configured_placement():
 
 
 def test_branch_snapshot_preserves_configured_nonzero_end_offset():
-    """Do not replace a same-block recurrent checkpoint before prompt end."""
+    """Do not replace a same-block recurrent checkpoint before prompt end.
+
+    The configured offset 2 (254) aligns down to the 192 block boundary and
+    the branch point (divergence 192) lands on the same block: one point,
+    and the branch code must not add prompt_len next to it."""
     mgr = _branch_snapshot_manager(
         tokens_per_block=64,
         additional_snapshot_offsets_from_end=[2],
@@ -3219,13 +3228,13 @@ def test_branch_snapshot_preserves_configured_nonzero_end_offset():
     kv_cache = _fake_reuse_match(divergence=192)
 
     mgr.prepare_expect_snapshot_points([request])
-    assert request.expect_snapshot_points == [254]
+    assert request.expect_snapshot_points == [192]
 
     mgr._record_branch_snapshot_point(request, kv_cache, num_lookup_tokens=255)
-    assert request.expect_snapshot_points == [192, 254]
+    assert request.expect_snapshot_points == [192]
 
     mgr.prepare_expect_snapshot_points([request])
-    assert request.expect_snapshot_points == [192, 254]
+    assert request.expect_snapshot_points == [192]
 
 
 def test_branch_snapshot_points_stay_sorted_and_deduplicated():
@@ -4793,3 +4802,29 @@ def test_cpp_hybrid_prepare_expect_snapshot_points_skips_prepared_generation_req
     mgr.kv_cache_config = KvCacheConfig(enable_block_reuse=False)
     mgr.prepare_expect_snapshot_points([ctx, gen_done])
     assert ctx.expect_snapshot_points == [] and gen_done.expect_snapshot_points == [1, 2, 3]
+
+
+def test_v2_interior_snapshot_offsets_from_end_align_to_block_grid():
+    """Interior snapshot offsets become forced chunk boundaries, which must be block-aligned."""
+    mgr = object.__new__(MambaHybridCacheManagerV2)
+    mgr.tokens_per_block = 32
+    mgr.enable_block_reuse = True
+    mgr.kv_cache_config = KvCacheConfig(
+        enable_block_reuse=True,
+        mamba_state_config=MambaStateConfig(
+            periodic_snapshot_interval=16384,
+            additional_snapshot_offsets_from_start=[],
+            additional_snapshot_offsets_from_end=[0, 32],
+        ),
+    )
+    req = SimpleNamespace(
+        prompt_len=1000, expect_snapshot_points=None, py_snapshot_points_ready=False
+    )
+
+    mgr.prepare_expect_snapshot_points([req])
+
+    assert (
+        1000 in req.expect_snapshot_points
+    )  # offset 0 = prompt end (last chunk, no alignment needed)
+    assert 968 not in req.expect_snapshot_points  # raw prompt_len - 32 is not block-aligned
+    assert 960 in req.expect_snapshot_points  # aligned down to the 32-token grid

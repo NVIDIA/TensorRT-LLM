@@ -2281,6 +2281,30 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def("shutdown", &kv::KvCacheManager::shutdown, nb::call_guard<nb::gil_scoped_release>())
         .def(
             "clear_reusable_blocks", &kv::KvCacheManager::clearReusableBlocks, nb::call_guard<nb::gil_scoped_release>())
+        // Batched per-iteration entry points. Argument conversion (list -> vector) runs with the GIL
+        // held; the C++ work runs under a single gil_scoped_release, so a 32-request step costs one
+        // GIL hand-off instead of 32.
+        .def(
+            "resize_many",
+            [](kv::KvCacheManager& self, std::vector<kv::KvCache*> const& caches,
+                std::vector<std::optional<int>> const& capacities,
+                std::vector<std::optional<int>> const& historyLengths)
+            {
+                nb::gil_scoped_release release;
+                return self.resizeMany(caches, capacities, historyLengths);
+            },
+            nb::arg("caches"), nb::arg("capacities"), nb::arg("history_lengths"))
+        .def(
+            "get_ssm_block_base_indices",
+            [](kv::KvCacheManager const& self, std::vector<kv::KvCache const*> const& caches, int layerGroupId,
+                nb::ndarray<int32_t, nb::ndim<1>, nb::c_contig, nb::device::cpu> out)
+            {
+                TLLM_CHECK_WITH_INFO(out.shape(0) >= caches.size(),
+                    "get_ssm_block_base_indices(): out has %zu slots for %zu caches", out.shape(0), caches.size());
+                nb::gil_scoped_release release;
+                self.getSsmBlockBaseIndices(caches, kv::LayerGroupId{layerGroupId}, kv::BeamIndex{0}, out.data());
+            },
+            nb::arg("caches"), nb::arg("layer_group_id"), nb::arg("out"))
         .def(
             "create_kv_cache",
             [](std::shared_ptr<kv::KvCacheManager> self, nb::object reuseScopeObj, nb::object inputTokens,

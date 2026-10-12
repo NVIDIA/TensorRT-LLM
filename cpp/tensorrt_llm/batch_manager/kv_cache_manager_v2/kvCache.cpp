@@ -1770,7 +1770,9 @@ void KvCache::commit(TokenSpan tokens, bool isEnd)
     }
 
     // Update history before mutating the committed-token state so an invalid growth leaves commit() retryable.
-    if (mCommitState != CommitState::VIRTUAL_STOP && mHistoryLength < numCommitted)
+    // Committed tokens are history under VIRTUAL_STOP as well: only the tree publication is suppressed, and the
+    // num_committed_tokens <= history_length invariant that suspend() / close() check still has to hold.
+    if (mHistoryLength < numCommitted)
         setHistoryLength(numCommitted);
 
     // Append tokens to committed list.
@@ -1818,6 +1820,17 @@ void KvCache::commit(TokenSpan tokens, bool isEnd)
 
     if (isEnd && mCommitState != CommitState::USER_STOP)
         stopCommitting();
+}
+
+void KvCache::markReuseStateStale()
+{
+    if (mCommitState != CommitState::ALLOWED)
+        return;
+    mCommitState = CommitState::VIRTUAL_STOP;
+    // Same bookkeeping as the commit path's own VIRTUAL_STOP transition (_commitBlock): with commit_min_snapshot off,
+    // the out-of-window SWA pages of uncommitted blocks were held only for the commit that would publish them. No
+    // commit follows, so release them now. Unlike stopCommitting() this takes no partial-block snapshot.
+    _onStopCommitting();
 }
 
 void KvCache::stopCommitting()

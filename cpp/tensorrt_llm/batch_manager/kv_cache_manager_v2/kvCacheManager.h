@@ -323,6 +323,18 @@ public:
     void registerKvCache(KvCache* kvc);
     void unregisterKvCache(KvCache* kvc);
 
+    //! Batched KvCache::resize(): one API lock and one Python GIL hand-off per iteration instead
+    //! of one per active request (the executor's update_resources / scheduler loops call resize()
+    //! once per generation request per step). Per-cache semantics are exactly KvCache::resize();
+    //! entry i of the result is that cache's return value. Sizes must match.
+    std::vector<bool> resizeMany(std::vector<KvCache*> const& caches, std::vector<std::optional<int>> const& capacities,
+        std::vector<std::optional<int>> const& historyLengths);
+
+    //! Batched KvCache::getSsmBlockBaseIndex() for ACTIVE caches; writes caches.size() values to out.
+    //! Lock-free like the scalar version (an ACTIVE cache holds its SSM page locked).
+    void getSsmBlockBaseIndices(
+        std::vector<KvCache const*> const& caches, LayerGroupId lgId, BeamIndex beamIdx, int* out) const;
+
     // Moving-average updates from closed KvCaches.
     void updateAvgReusedLength(double v)
     {

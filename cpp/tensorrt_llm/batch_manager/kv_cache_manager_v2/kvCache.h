@@ -209,6 +209,15 @@ public:
     // Returns true on success, false when the resize ran out of pages and was rolled back.
     bool resize(std::optional<int> capacity, std::optional<int> historyLength = std::nullopt);
 
+    // Called by KvCacheManager::clearReusableBlocks() for caches still open across a
+    // reset of the reuse tree (weight refit with requests in flight): stop committing so
+    // the cache never re-registers its pre-reset tree blocks as reusable. Only
+    // ALLOWED changes (to VIRTUAL_STOP, the state the commit path already uses when it
+    // cannot commit), and leaving ALLOWED releases the out-of-window SWA pages that were
+    // held only for a commit, as every other exit from ALLOWED does. Caller holds the
+    // manager API lock.
+    void markReuseStateStale();
+
     // Convenience: set only capacity or history length.
     void setCapacity(int capacity);
     void setHistoryLength(int historyLength);

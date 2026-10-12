@@ -1702,6 +1702,13 @@ class MambaHybridCacheManager(BaseResourceManager, BaseMambaCacheManager):
                         snapshot_points.add(offset)
                 for offset in state_config.additional_snapshot_offsets_from_end:
                     point = request.prompt_len - offset
+                    if offset > 0:
+                        # An interior snapshot point is also a forced context-chunk
+                        # boundary, and the executor requires every non-final chunk
+                        # to end on a block boundary: align the point down to the
+                        # block grid (a duplicate prompt reuses it just the same).
+                        point = (point //
+                                 self.tokens_per_block) * self.tokens_per_block
                     if point > 0:
                         snapshot_points.add(point)
             request.py_recurrent_fold_point = None
@@ -1840,7 +1847,6 @@ class MixedMambaHybridCacheManager(KVCacheManager, MambaCacheManager,
     speculative decoding and disaggregated serving.
     Does not support block reuse / prefix caching for mamba states.
     """
-
 
     def __init__(
         self,
@@ -2939,9 +2945,8 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         self._setup_state_indices()
         # A folded save-last chunk decodes from its terminal slot S2, which is
         # not its primary slot: give S2 the fresh-context reset/seed too.
-        self._reset_context_mamba_slots(
-            len(scheduled_batch.context_requests),
-            extra_slots=self._fold_terminal_slots)
+        self._reset_context_mamba_slots(len(scheduled_batch.context_requests),
+                                        extra_slots=self._fold_terminal_slots)
 
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
         super().prepare_resources(scheduled_batch)
@@ -2968,9 +2973,8 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         if self.local_num_mamba_layers == 0:
             return
         self._setup_state_indices()
-        self._reset_context_mamba_slots(
-            len(scheduled_batch.context_requests),
-            extra_slots=self._fold_terminal_slots)
+        self._reset_context_mamba_slots(len(scheduled_batch.context_requests),
+                                        extra_slots=self._fold_terminal_slots)
 
     @nvtx_range("hybrid_flush_state_transfers")
     def flush_state_transfers(self) -> None:
@@ -4825,7 +4829,38 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             f"State-index batch size {n} exceeds max_batch_size "
             f"{self._host_state_indices.shape[0]}")
         self._host_state_indices.zero_()
-        if n > 0:
+        get_many = (getattr(getattr(self, "impl", None),
+                            "get_ssm_block_base_indices", None)
+                    if os.environ.get("TLLM_KV_V2_BATCHED_CALLS", "1") != "0"
+                    else None)
+        if n > 0 and get_many is not None:
+            # Native core: one nanobind call fills the pinned host buffer in
+            # place (no per-request GIL hand-off, no per-element tensor
+            # __setitem__ of ~3-5 us each).
+            caches = []
+            for req in requests:
+                kv_cache = self.kv_cache_map.get(req.py_request_id)
+                if kv_cache is None:
+                    raise RuntimeError(
+                        f"Missing V2 KV cache for request {req.py_request_id}")
+                caches.append(kv_cache)
+            host_view = self._host_state_indices[:n].numpy()
+            try:
+                get_many(caches, self.ssm_layer_group_id, host_view)
+            except TypeError:
+                # Not native KV cache objects (test doubles / Python core):
+                # scalar path.
+                for i, kv_cache in enumerate(caches):
+                    host_view[i] = kv_cache.get_ssm_block_base_index(
+                        self.ssm_layer_group_id)
+            bad = int((host_view < 0).sum())
+            if bad:
+                for req, base_index in zip(requests, host_view.tolist()):
+                    if base_index < 0:
+                        raise RuntimeError(
+                            f"Invalid SSM state block index {base_index} for "
+                            f"request {req.py_request_id}")
+        elif n > 0:
             for i, req in enumerate(requests):
                 kv_cache = self.kv_cache_map.get(req.py_request_id)
                 if kv_cache is None:
