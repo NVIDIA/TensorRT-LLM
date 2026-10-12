@@ -194,6 +194,21 @@ TEST(KvCacheManagerV2HostMemTest, AllocationSupportsGpuRoundTrip)
     EXPECT_EQ(cudaFree(devicePtr), cudaSuccess);
 }
 
+//! Small pinned buffers, such as batch metadata staging, request arbitrary byte
+//! counts through the single-size constructor.
+TEST(KvCacheManagerV2HostMemTest, SingleSizeConstructorRoundsUpToAlignment)
+{
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    for (size_t const requested : {size_t{8}, HostMem::kAlignment + 12})
+    {
+        HostMem memory(requested);
+        size_t const expected = (requested + HostMem::kAlignment - 1) / HostMem::kAlignment * HostMem::kAlignment;
+        EXPECT_EQ(memory.size(), expected);
+        EXPECT_EQ(memory.address() % HostMem::kAlignment, 0);
+        std::memset(reinterpret_cast<void*>(memory.address()), 0xA5, memory.size());
+    }
+}
+
 //! Growing the host tier must not drop what it already holds, and must not move
 //! it: the pool contains live KV pages and hands out pointers derived from the
 //! base address.

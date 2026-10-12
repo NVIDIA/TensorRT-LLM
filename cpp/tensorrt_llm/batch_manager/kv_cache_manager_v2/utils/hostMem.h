@@ -19,6 +19,7 @@
 
 #include "kv_cache_manager_v2/common.h"
 #include "kv_cache_manager_v2/utils/hostMemBacking.h"
+#include "kv_cache_manager_v2/utils/math.h"
 
 #include <atomic>
 #include <cstddef>
@@ -46,8 +47,8 @@ public:
     //! Required alignment of every size passed to HostMem, and of the base
     //! address it returns. Set by the coarsest backing: cuMemCreate rejects a
     //! host allocation whose size is not a multiple of its granularity, which is
-    //! 2 MiB. Sizes are not rounded up on the caller's behalf -- a request that
-    //! is not a multiple of this is a bug and is rejected.
+    //! 2 MiB. Only the single-size constructor rounds up on the caller's behalf;
+    //! elsewhere a size that is not a multiple of this is a bug and is rejected.
     static constexpr size_t kAlignment = kHostMemAlignment;
 
     //! Bytes committed per watermark advance. Large enough that the commit cost
@@ -83,8 +84,12 @@ public:
     //! Reserves exactly as much as it commits, for an allocation that never
     //! resizes. Takes no waitForFill: a caller that cannot resize has no reason
     //! to observe a partially filled range.
+    //!
+    //! `size` may be any byte count: it is rounded up to kAlignment, and size()
+    //! reports the rounded value.
     explicit HostMem(size_t size)
-        : HostMem(size, size, HostMemBackingOptions{}, /*waitForFill=*/true)
+        : HostMem(roundUp(size, kAlignment), roundUp(size, kAlignment), HostMemBackingOptions{},
+            /*waitForFill=*/true)
     {
     }
 
