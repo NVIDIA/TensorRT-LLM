@@ -623,13 +623,10 @@ class KvCacheConnectorSchedulerOutputRequest:
         priorities = None
         if req.kv_cache_retention_config is not None:
             if is_v2:
-                priorities = (
-                    kv_cache_manager.kv_cache_map[req.py_request_id].get_page_priorities(0)[
-                        len(self.block_ids) - len(new_block_ids) : len(self.block_ids)
-                    ]
-                    if len(new_block_ids_by_layer_group) == 1
-                    else []
-                )
+                kv_cache = kv_cache_manager.kv_cache_map[req.py_request_id]
+                priorities = kv_cache.get_page_priorities(0)[
+                    len(self.block_ids) - len(new_block_ids) : len(self.block_ids)
+                ]
             else:
                 priorities = [
                     kv_cache_manager.get_priority_by_block_id(block_id)

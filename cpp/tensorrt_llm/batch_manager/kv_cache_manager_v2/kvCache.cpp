@@ -198,9 +198,9 @@ std::vector<Priority> KvCache::getPagePriorities(LayerGroupId layerGroupId, Beam
         = std::holds_alternative<SsmLifeCycle>(mManager->storage().getLifeCycle(LifeCycleId{layerGroupId.value()}));
     for (auto const& block : mBlocks)
     {
-        auto const* page = beamIndex < block.pages.size()
-            ? blockPageGetPage(block.pages[beamIndex].at(layerGroupId)).get()
-            : nullptr;
+        // Shared prompt blocks keep only beam 0; writable tails have a row per beam.
+        auto const pageBeamIndex = block.pages.size() == BeamIndex{1} ? kDefaultBeamIndex : beamIndex;
+        auto const* page = blockPageGetPage(block.pages[pageBeamIndex].at(layerGroupId)).get();
         if (isSsm && block.treeBlock)
             page = block.treeBlock->getPage(LifeCycleId{layerGroupId.value()});
         // Preserve ordinals, including absent pages, just like getAggregatedPageIndices(validOnly=false).

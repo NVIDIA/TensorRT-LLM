@@ -64,6 +64,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     BAD_PAGE_INDEX,
     CACHE_LEVEL1,
     DEFAULT_BEAM_INDEX,
+    DEFAULT_COLD_TIER_OFFLOAD_MIN_PRIORITY,
     GPU_LEVEL,
     AttentionLayerConfig,
     AttnLifeCycle,
@@ -3050,7 +3051,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 moving_average_decay=rebalance_cfg.moving_average_decay,
             ),
             cold_tier_offload_min_priority=(
-                30
+                DEFAULT_COLD_TIER_OFFLOAD_MIN_PRIORITY
                 if kv_cache_config.cold_tier_offload_min_priority is None
                 else kv_cache_config.cold_tier_offload_min_priority
             ),

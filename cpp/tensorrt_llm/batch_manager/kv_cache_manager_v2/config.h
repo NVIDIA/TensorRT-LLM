@@ -451,7 +451,7 @@ struct KVCacheManagerConfig
     bool enablePartialCommit = true;
 
     // Unreferenced GPU pages below this priority are dropped instead of offloaded.
-    Priority coldTierOffloadMinPriority = 30;
+    Priority coldTierOffloadMinPriority = kDefaultColdTierOffloadMinPriority;
 
     bool enableSwaScratchReuse() const noexcept
     {

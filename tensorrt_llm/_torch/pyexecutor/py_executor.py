@@ -1301,10 +1301,12 @@ class PyExecutor:
                     self._reject_connector_prefix_without_block_reuse(
                         self.kv_cache_manager)
                 layout = build_kv_cache_layout_v2(self.kv_cache_manager)
-                self.kv_connector_manager.reject_flat_only_scheduler(
-                    len(layout.groups))
-                window = (layout.groups[0].window_size
-                          if len(layout.groups) == 1 else None)
+                if len(layout.groups) != 1:
+                    raise NotImplementedError(
+                        "KV Cache Connector requires a single layer group. "
+                        "Retention priorities for multiple layer groups "
+                        "are not supported.")
+                window = layout.groups[0].window_size
                 self.kv_connector_manager.warn_flat_scheduler_under_swa(window)
                 self.kv_connector_manager.worker.register_kv_cache_layout(
                     layout)
