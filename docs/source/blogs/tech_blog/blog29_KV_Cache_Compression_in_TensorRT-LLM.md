@@ -91,13 +91,13 @@ Our goals for the framework are two. A user turns a compression method on with *
 
 ### Design Philosophy
 
-Compression does not need to live inside the model or the attention kernel. It only needs to run **at the right moment, on the KV that is already there**: the runtime pauses at a well-defined point, hands the cache to the method, and continues when the method returns. This draws the line to sparse attention. A method that must be co-designed with the attention kernel, or that needs a tensor from the running forward pass such as the current query, belongs to the [sparse attention framework](blog17_Sparse_Attention_in_TensorRT-LLM.md); everything that decides from the stored KV alone belongs here. Three principles follow:
+Compression can live inside the model or the attention kernel, and TensorRT LLM already does that. The new opportunity is **compression at the right moment**: a small compression step, run when the KV is already there and nothing is reading it, benefits the whole serving system. Three principles follow:
 
-- **Attention stays untouched.** Attention always reads the normal GPU representation. A compressed page is restored before anything reads it.
-- **Insertion is seamless.** A method changes only the contents of KV pages. The scheduler, the executor loop and the model are unchanged, and the cache manager keeps allocating, moving and reusing pages.
-- **Insertion points are well defined.** They follow the life of a KV cache, and we call them hooks: places in the runtime where a method is inserted and runs to completion.
+- **Untouched attention.** Attention always reads the normal GPU representation. A compressed page is restored before anything reads it.
+- **Seamless insertion.** A method changes only the contents of KV pages. The scheduler, the executor loop and the model are unchanged, and the cache manager keeps allocating, moving and reusing pages.
+- **General to models.** A method works on KV pages, not on a model's attention kernel, so the same method and the same insertion points serve every model.
 
-These insertion points are the five stages in the life of a KV cache shown in Figure 3: prefill chunks (1), after prefill (2), decode steps (3), tool calls (4), and after the request ends (5). At each of them nothing is reading the cache, so compression can run safely. Methods reach them through **two integration paths**. Iteration-driven methods run between model iterations, from the executor loop, and change the retained KV state. Storage-bound methods run when the cache manager moves a page between the GPU and host or disk memory, and change how the page is stored while it is cold. A method uses one path or both. In both the **cache manager keeps ownership of every page** and the method only changes its contents.
+The insertion points are the five stages in the life of a KV cache shown in Figure 3: prefill chunks (1), after prefill (2), decode steps (3), tool calls (4), and after the request ends (5). At each of them nothing is reading the cache, so compression can run safely. Methods reach them through **two integration paths**. Iteration-driven methods run between model iterations, from the executor loop, and change the retained KV state. Storage-bound methods run when the cache manager moves a page between the GPU and host or disk memory, and change how the page is stored while it is cold. A method uses one path or both. In both the **cache manager keeps ownership of every page** and the method only changes its contents.
 
 <div align="center">
 <figure>
