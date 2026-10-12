@@ -206,7 +206,7 @@ def pre_comm_embedding_ops(
             vocab_end_index,
         )
     else:
-        # flashinfer's rejection kernel (chain_speculative_sampling) pads non-accepted
+        # The rejection kernel (trtllm::chain_speculative_sampling) pads non-accepted
         # tokens with -1. When the full vocab is local (non-TP or ROW TP), mask
         # out-of-range ids (e.g. -1) over [0, weight.shape[0]) to avoid an OOB
         # embedding lookup.

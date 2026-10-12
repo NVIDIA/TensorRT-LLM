@@ -946,6 +946,20 @@ def _register_fake():
     ) -> torch.Tensor:
         return logits.new_empty(logits.shape, dtype=torch.float32)
 
+    @torch.library.register_fake("trtllm::chain_speculative_sampling")
+    def _(
+        draft_probs: torch.Tensor,
+        draft_token_ids: torch.Tensor,
+        target_probs: torch.Tensor,
+        seed: torch.Tensor,
+        offset: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        batch_size, num_draft = draft_token_ids.shape
+        return (
+            draft_token_ids.new_empty((batch_size, num_draft + 1)),
+            draft_token_ids.new_empty((batch_size, )),
+        )
+
     @torch.library.register_fake(
         "trtllm::mtp_sampling_and_accepted_draft_tokens_op")
     def _(logits: torch.Tensor, draft_tokens: torch.Tensor,

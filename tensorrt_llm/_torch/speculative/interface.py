@@ -53,39 +53,26 @@ def rejection_sampling_one_model(
     draft_probs: torch.Tensor,
     draft_token_ids: torch.Tensor,
     target_probs: torch.Tensor,
-    deterministic: bool = True,
-    seed: Optional[int] = None,
-    offset: Optional[int] = None,
+    seed: torch.Tensor,
+    offset: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    # chain_speculative_sampling requires flashinfer>=0.6.4. This entry point can
-    # be reached independently of SpecWorkerBase.__init__ (e.g. via
-    # _can_use_rejection_sampling), so re-check here to fail with a clear message
-    # instead of a cryptic flashinfer error.
-    if not IS_FLASHINFER_AVAILABLE or Version(
-            flashinfer.__version__) < Version("0.6.4"):
-        raise RuntimeError(
-            "Rejection sampling for one-model speculative decoding requires flashinfer>=0.6.4"
-        )
-    batch_size = draft_token_ids.shape[0]
-    device = draft_token_ids.device
-    output_accepted_token_num = torch.zeros(batch_size,
-                                            dtype=torch.int32,
-                                            device=device)
-    output_emitted_draft_token_num = torch.zeros(batch_size,
-                                                 dtype=torch.int32,
-                                                 device=device)
-    accepted_tokens, _, output_emitted_draft_token_num = flashinfer.sampling.chain_speculative_sampling(
-        draft_probs,
-        draft_token_ids,
-        target_probs,
-        maybe_output_accepted_token_num=output_accepted_token_num,
-        maybe_output_emitted_draft_token_num=output_emitted_draft_token_num,
-        deterministic=deterministic,
-        generator=None,
-        seed=seed,
-        offset=offset,
-    )
-    return accepted_tokens, output_emitted_draft_token_num + 1
+    """Verify each request's linear draft against the target distribution.
+
+    Args:
+        draft_probs: ``[batch, D, vocab]`` float32 proposal distributions.
+        draft_token_ids: ``[batch, D]`` int32 draft tokens.
+        target_probs: ``[batch, D + 1, vocab]`` float32 target distributions.
+        seed, offset: ``[batch]`` int64 Philox state, one per request; the
+            offset names the request's own subsequence.
+    Returns:
+        ``accepted_tokens [batch, D + 1]`` (the accepted draft tokens, the
+        corrected or bonus token, then ``-1``) and the number of tokens each
+        request emits, ``[batch]``.
+    """
+    return torch.ops.trtllm.chain_speculative_sampling(draft_probs,
+                                                       draft_token_ids,
+                                                       target_probs, seed,
+                                                       offset)
 
 
 # Environment variable name for forcing the number of accepted tokens in speculative decoding
@@ -461,9 +448,9 @@ DEFAULT_SAMPLING_SEED = 42
 _UNSEEDED_RNG_WINDOW_KEY = "unseeded"
 
 # Philox offsets between consecutive slots of an offset window. The fused
-# kernel needs only distinct offsets, but the flashinfer ops and the acceptance
-# kernels read a single offset and draw several values per row from it, so each
-# slot leaves them room before the next one starts.
+# kernel and the acceptance kernels need only distinct offsets, but the
+# flashinfer ops read a single offset and draw several values per row from it,
+# so each slot leaves them room before the next one starts.
 _RNG_SLOT_SPAN = 32
 
 
@@ -2346,10 +2333,8 @@ class SpecWorkerBase(nn.Module, ABC):
         """Zero the logits rows belonging to CUDA-graph padding requests.
 
         A padding request decodes from an uninitialized KV/hidden state, so its
-        logits can be non-finite and its probs degenerate. flashinfer's
-        ``chain_speculative_sampling`` then rejects at a position whose
-        ``relu(target - draft)`` residual has no mass, reads an uninitialized
-        shared-memory slot and emits an out-of-range token id. Zeroed logits are legal.
+        logits can be non-finite and its probs NaN, which no acceptance kernel
+        can sample from. Zeroed logits are legal.
 
         Padding requests are the ones ``populate_sampling_params_for_one_model``
         routed to ``dummy_slot_row`` (``py_seq_slot is None``), so this needs no
@@ -2714,7 +2699,6 @@ class SpecWorkerBase(nn.Module, ABC):
                 draft_probs=full_draft_probs,
                 draft_token_ids=full_draft_tokens,
                 target_probs=target_probs,
-                deterministic=True,
                 seed=seed,
                 offset=offset,
             )
