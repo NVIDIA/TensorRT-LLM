@@ -199,6 +199,7 @@ class IterationWriter:
                                           _ITERATION_WRITER_IDLE_TIMEOUT_SEC)
         except KeyboardInterrupt:
             logger.info("Keyboard interrupt, exiting iteration logging...")
+            raise
         finally:
             # Finalize the logging process by closing the socket and terminating
             # the context

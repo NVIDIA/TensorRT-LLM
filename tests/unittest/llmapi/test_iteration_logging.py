@@ -209,6 +209,25 @@ def test_iteration_writer_drains_after_transient_post_stop_gap(tmp_path: Path) -
     warning.assert_not_called()
 
 
+def test_iteration_writer_propagates_keyboard_interrupt(tmp_path: Path) -> None:
+    """An interrupted writer reports failure after releasing ZMQ resources."""
+    socket = MagicMock()
+    socket.poll.side_effect = KeyboardInterrupt
+    context = MagicMock()
+    context.socket.return_value = socket
+
+    with patch.object(processes, "Context", return_value=context):
+        with pytest.raises(KeyboardInterrupt):
+            processes.IterationWriter.run(
+                "ipc://unused",
+                tmp_path / "iterations.log",
+                multiprocessing.Event(),
+            )
+
+    socket.close.assert_called_once()
+    context.term.assert_called_once()
+
+
 @pytest.mark.parametrize("enabled", [True, False])
 def test_latency_command_forwards_iteration_log(enabled: bool, tmp_path: Path) -> None:
     """Latency configuration enables iteration statistics only when requested."""
