@@ -1398,7 +1398,7 @@ def test_pre_cancelled_sender_settles_saved_generation_first_request(monkeypatch
     session._claim_unsubmitted_aux_failure.assert_not_called()
     make_result.assert_not_called()
     marker = sender._send_task_queues[0].get_nowait()
-    assert marker == transfer_mod._SessionQuiescence(rid, 2, "receiver")
+    assert marker == transfer_mod._SessionQuiescence(rid, 2, "receiver", peer_rid=rid)
     assert sender._send_session_quiesced(marker)
     dealer.send.assert_called_once_with([MessageType.SESSION_QUIESCED, b"5", b"97"])
     assert not sender._pending_session_quiescence

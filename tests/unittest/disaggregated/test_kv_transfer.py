@@ -2342,8 +2342,9 @@ def test_transfer_worker_pipelined_unaligned_chunk_boundaries(
 def test_transfer_with_distinct_gen_disagg_id(use_v2):
     """A generation retry carries a fresh disagg_request_id but the same ctx_request_id.
 
-    The receiver keys its session by the ctx id, so the sender resolves it and
-    the transfer completes even though the two ids differ.
+    The receiver keys its session by its own disagg id and names the sender's by
+    the ctx id, so the sender resolves its TxSession and answers under the
+    receiver's key; the transfer completes even though the two ids differ.
     """
     setup = create_transfer_worker_setup(
         ctx_tp=1,
@@ -2494,11 +2495,12 @@ def _assert_kv_landed_only_in(setup, info, served, untouched, use_v2):
 
 @pytest.mark.timeout(120)
 @pytest.mark.parametrize("use_v2", [False, True], ids=["v1", "v2"])
-def test_gen_retry_refused_while_first_attempt_active(use_v2):
-    """A retry arriving while the first attempt holds the key fails admission locally.
+def test_gen_retry_while_first_attempt_active_is_refused_by_sender(use_v2):
+    """A retry arriving while the first attempt is live registers under its own key.
 
-    The holder keeps its Receiver entry and the transfer; the retry never asks
-    the sender, settles as FAILED, and its close does not evict the holder.
+    The two attempts never share a Receiver entry. The sender sees a second
+    request for the same piece from the same rank, refuses it with FAILED and
+    serves only the first attempt; the retry's close evicts nothing but itself.
     """
     setup = create_transfer_worker_setup(
         ctx_tp=1,
@@ -2524,22 +2526,21 @@ def test_gen_retry_refused_while_first_attempt_active(use_v2):
         rx_a = gen_tw.create_rx_session(gen_a)
         rx_a.receive(_full_chunk(gen_a_block_ids, gen_a.prompt_len))
         rx_b = gen_tw.create_rx_session(gen_b)
-        key = rx_a.disagg_request_id
-        assert rx_b.disagg_request_id == key
-        assert receiver._get_session(key) is rx_a
-        assert rx_b.status == SessionStatus.ERROR
+        key_a, key_b = rx_a.disagg_request_id, rx_b.disagg_request_id
+        assert key_b != key_a
+        assert rx_a.sender_request_id == rx_b.sender_request_id == tx.disagg_request_id
+        assert receiver._get_session(key_a) is rx_a
+        assert receiver._get_session(key_b) is rx_b
 
         rx_b.receive(_full_chunk(gen_b_block_ids, gen_b.prompt_len))
         assert rx_b.wait_complete(blocking=True) == WaitResult.FAILED
-        # The refused attempt never reached the sender: only the holder asked.
-        # The holder's REQUEST_DATA travels over the wire, so wait for it.
+        assert rx_b.status == SessionStatus.ERROR
+        # The sender kept only the first attempt's request for this rank; the
+        # repeat was refused before it was saved.
         sender = ctx_tw._sender
-        _wait_until(
-            lambda: sender._get_first_req_info(tx.disagg_request_id) is not None,
-            what="the holder's REQUEST_DATA to reach the sender",
-        )
         first = sender._get_first_req_info(tx.disagg_request_id)
         assert first is not None and first.instance_rank == gen_tw._rank_info.instance_rank
+        assert first.unique_rid == key_a
         assert len(sender._get_req_info(tx.disagg_request_id)) == 1
 
         tx.send(_full_chunk(ctx_block_ids, ctx_request.prompt_len))
@@ -2552,9 +2553,10 @@ def test_gen_retry_refused_while_first_attempt_active(use_v2):
         )
 
         rx_b.close()
-        assert receiver._get_session(key) is rx_a
+        assert receiver._get_session(key_b) is None
+        assert receiver._get_session(key_a) is rx_a
         rx_a.close()
-        assert receiver._get_session(key) is None
+        assert receiver._get_session(key_a) is None
 
         tx.close()
         _close_retry_attempt_kv(setup, info)
@@ -2597,12 +2599,14 @@ def test_gen_retry_after_first_attempt_retired_is_refused_by_sender():
         rx_a.receive(_full_chunk(gen_a_block_ids, gen_a.prompt_len))
         assert tx.wait_complete() == WaitResult.COMPLETED
         assert rx_a.wait_complete(blocking=True) == WaitResult.COMPLETED
-        key = rx_a.disagg_request_id
+        key_a = rx_a.disagg_request_id
         rx_a.close()
-        assert receiver._get_session(key) is None
+        assert receiver._get_session(key_a) is None
 
         rx_b = gen_tw.create_rx_session(gen_b)
-        assert receiver._get_session(key) is rx_b
+        key_b = rx_b.disagg_request_id
+        assert key_b != key_a
+        assert receiver._get_session(key_b) is rx_b
         rx_b.receive(_full_chunk(gen_b_block_ids, gen_b.prompt_len))
         assert rx_b.wait_complete(blocking=True) == WaitResult.FAILED
         assert rx_b.status == SessionStatus.ERROR
@@ -2649,7 +2653,7 @@ def test_gen_retry_after_first_attempt_cancelled_fails_fast():
         tx = ctx_tw.create_tx_session(ctx_request)
         rx_a = gen_tw.create_rx_session(gen_a)
         rx_a.receive(_full_chunk(gen_a_block_ids, gen_a.prompt_len))
-        key = rx_a.disagg_request_id
+        key_a = rx_a.disagg_request_id
         assert rx_a.cancel()
         _wait_until(
             lambda: tx.status == SessionStatus.CANCELLED,
@@ -2657,15 +2661,97 @@ def test_gen_retry_after_first_attempt_cancelled_fails_fast():
         )
         assert tx.cancelled_by_peer is True
         rx_a.close()
-        assert receiver._get_session(key) is None
+        assert receiver._get_session(key_a) is None
 
         rx_b = gen_tw.create_rx_session(gen_b)
-        assert receiver._get_session(key) is rx_b
+        key_b = rx_b.disagg_request_id
+        assert key_b != key_a
+        assert receiver._get_session(key_b) is rx_b
         rx_b.receive(_full_chunk(gen_b_block_ids, gen_b.prompt_len))
         assert rx_b.wait_complete(blocking=True) == WaitResult.FAILED
-        # Either the sender's FAILED answer or the sender's own CANCEL fan-out
-        # (still in flight when the retry registered) ends the retry.
-        assert rx_b.status in (SessionStatus.ERROR, SessionStatus.CANCELLED)
+        # The sender's CANCEL fan-out names the first attempt's key, so only its
+        # FAILED answer to the repeat request can end the retry.
+        assert rx_b.status == SessionStatus.ERROR
+
+        rx_b.close()
+        tx.close()
+        _close_retry_attempt_kv(setup, info)
+    finally:
+        ctx_tw.shutdown()
+        gen_tw.shutdown()
+
+
+@pytest.mark.timeout(60)
+def test_gen_retry_ignores_stale_success_of_timed_out_first_attempt():
+    """A SUCCESS still in flight for a timed-out attempt cannot complete its retry.
+
+    The first attempt times out and closes while the sender's SUCCESS for it is
+    on the wire. The retry registers under its own key, so the stale result finds
+    no session and is dropped; the retry ends with the sender's FAILED and its KV
+    pages stay untouched.
+    """
+    setup = create_transfer_worker_setup(
+        ctx_tp=1,
+        ctx_pp=1,
+        ctx_enable_dp=False,
+        gen_tp=1,
+        gen_pp=1,
+        gen_enable_dp=False,
+        use_v2=False,
+    )
+    ctx_tw = setup["ctx_transfer_workers"][0]
+    gen_tw = setup["gen_transfer_workers"][0]
+    request_len = setup["request_len"]
+    try:
+        info = _setup_retry_attempts(setup, 40, [41, 42], request_len)
+        ctx_request = info["ctx_request"]
+        gen_a, gen_b = info["gen_requests"]
+        ctx_block_ids = info["ctx_block_ids"][0]
+        gen_a_block_ids, gen_b_block_ids = (ids[0] for ids in info["gen_block_ids"])
+        receiver = gen_tw._receiver
+
+        # Hold every KV result on the receiver so the first attempt's SUCCESS is
+        # still "in flight" when it times out, closes and the retry registers.
+        held = []
+        passthrough = [False]
+        deliver = receiver._process_kv_agent_result
+
+        def gated(send_id, message):
+            if passthrough[0]:
+                return deliver(send_id, message)
+            held.append((send_id, message))
+
+        receiver._process_kv_agent_result = gated
+
+        tx = ctx_tw.create_tx_session(ctx_request)
+        tx.send(_full_chunk(ctx_block_ids, ctx_request.prompt_len))
+        rx_a = gen_tw.create_rx_session(gen_a)
+        rx_a._timeout_s = 1.0
+        rx_a.receive(_full_chunk(gen_a_block_ids, gen_a.prompt_len))
+        assert tx.wait_complete() == WaitResult.COMPLETED
+        _wait_until(lambda: held, what="the sender's SUCCESS to reach the receiver")
+        assert rx_a.wait_complete(blocking=True) == WaitResult.FAILED
+        key_a = rx_a.disagg_request_id
+        rx_a.close()
+        assert receiver._get_session(key_a) is None
+
+        rx_b = gen_tw.create_rx_session(gen_b)
+        key_b = rx_b.disagg_request_id
+        assert key_b != key_a
+        rx_b.receive(_full_chunk(gen_b_block_ids, gen_b.prompt_len))
+
+        # Let the stale SUCCESS land now, after the retry is registered.
+        passthrough[0] = True
+        for args in held:
+            deliver(*args)
+        assert receiver._get_session(key_b) is rx_b
+
+        assert rx_b.wait_complete(blocking=True) == WaitResult.FAILED
+        assert rx_b.status == SessionStatus.ERROR
+        assert tx.status == SessionStatus.TRANSFERRED
+        _assert_kv_landed_only_in(
+            setup, info, (gen_a, gen_a_block_ids), (gen_b, gen_b_block_ids), False
+        )
 
         rx_b.close()
         tx.close()
