@@ -813,8 +813,9 @@ class FP8QDQLinearMethod(UnquantizedLinearMethod):
                 weight_scale=module.weight_scale,
                 output_dtype=module.dtype or input.dtype,
             )
-        elif module.enable_cuda_core and qinput.shape[0] <= 8:
-            # use cuda core for small m dimension
+        elif (module.enable_cuda_core and qinput.shape[0] <= 8
+              and module.weight.shape[0] <= 2 * 65535):
+            # Two output columns per block must fit within grid.y's limit.
             output = torch.ops.trtllm.cuda_scaled_mm(
                 qinput,
                 module.weight.t(),

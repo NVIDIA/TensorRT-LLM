@@ -1,4 +1,8 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import os
+from unittest import mock
 
 import pytest
 import torch
@@ -7,7 +11,7 @@ from utils.util import skip_pre_hopper
 
 from tensorrt_llm._torch.autotuner import AutoTuner
 from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_RUBIN_AVAILABLE
-from tensorrt_llm._torch.modules.linear import Linear
+from tensorrt_llm._torch.modules import linear
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
@@ -32,11 +36,11 @@ def test_fp8_linear(dtype, use_cute_dsl, monkeypatch):
     monkeypatch.setenv("USE_CUTE_DSL_FP8_PER_TENSOR_MM",
                        "1" if use_cute_dsl else "0")
     qc = QuantConfig(quant_algo=QuantAlgo.FP8)
-    l0 = Linear(in_features=HIDDEN_SIZE,
-                out_features=OUTPUT_SIZE,
-                bias=False,
-                dtype=dtype,
-                quant_config=qc)
+    l0 = linear.Linear(in_features=HIDDEN_SIZE,
+                       out_features=OUTPUT_SIZE,
+                       bias=False,
+                       dtype=dtype,
+                       quant_config=qc)
     assert l0.weight.dtype == torch.float8_e4m3fn
     l0.load_weights([{
         'weight': w_fp8,
@@ -81,6 +85,60 @@ def test_fp8_linear(dtype, use_cute_dsl, monkeypatch):
     # compare
     torch.cuda.synchronize()
     torch.testing.assert_close(output, ref_output)
+
+
+@skip_pre_hopper
+@pytest.mark.parametrize("m", [1, 8])
+def test_fp8_linear_large_output_falls_back_to_cublas(m, monkeypatch):
+    torch.manual_seed(0)
+    k, n = 4096, 131072
+    dtype = torch.bfloat16
+    x = torch.randn((m, k), device="cuda", dtype=dtype)
+    x_fp8, x_scale = torch.ops.tensorrt_llm.quantize_e4m3_per_tensor(x)
+    x_fp8 = x_fp8.view(torch.float8_e4m3fn)
+    x_scale = x_scale.float().squeeze()
+    w_fp8 = torch.randint(-4, 5, (n, k), device="cuda",
+                          dtype=torch.int8).to(torch.float8_e4m3fn)
+    w_scale = torch.tensor(0.25, device="cuda", dtype=torch.float32)
+    layer = linear.Linear(in_features=k,
+                          out_features=n,
+                          bias=False,
+                          dtype=dtype,
+                          quant_config=QuantConfig(quant_algo=QuantAlgo.FP8))
+    layer.load_weights([{
+        "weight": w_fp8,
+        "weight_scale": w_scale,
+        "input_scale": x_scale,
+    }])
+    layer.cuda()
+    # Exercise the Spark dispatch condition on other FP8-capable GPUs too.
+    layer.enable_cuda_core = True
+    monkeypatch.setattr(linear, "_fp8_per_tensor_uses_cute_dsl_sm107",
+                        lambda: False)
+    with (
+            mock.patch.object(torch.ops.trtllm,
+                              "cuda_scaled_mm",
+                              side_effect=AssertionError(
+                                  "Output width exceeds the CUDA grid limit")),
+            mock.patch.object(torch.ops.trtllm,
+                              "cublas_scaled_mm",
+                              wraps=torch.ops.trtllm.cublas_scaled_mm) as
+            cublas_mm,
+            torch.inference_mode(),
+    ):
+        output = layer(x)
+
+    cublas_mm.assert_called_once()
+    monkeypatch.setenv("CUBLASLT_WORKSPACE_SIZE", str(32 * 1024))
+    ref = torch._scaled_mm(x_fp8,
+                           w_fp8.t(),
+                           scale_a=x_scale,
+                           scale_b=w_scale,
+                           out_dtype=dtype,
+                           use_fast_accum=True)
+    torch.cuda.synchronize()
+    assert output.dtype == dtype
+    torch.testing.assert_close(output, ref, atol=1e-2, rtol=1e-2)
 
 
 @pytest.mark.skipif(
