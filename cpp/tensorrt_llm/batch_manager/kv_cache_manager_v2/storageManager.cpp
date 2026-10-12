@@ -1912,6 +1912,12 @@ void StorageManager::adjustCacheLevel(CacheLevel level, std::optional<size_t> ne
     size_t quota = newQuota.has_value()
         ? roundUp(newQuota.value(), static_cast<size_t>(lvlStorage.poolSizeGranularity()))
         : lvlStorage.totalQuota();
+    // Slot counts and the feasibility floor are per domain; the quota covers the whole level.
+    int const numDomains = lvlStorage.numLocalityDomains();
+    if (numDomains > 1)
+    {
+        quota = roundDown(quota / static_cast<size_t>(numDomains), lvlStorage.poolSizeGranularity());
+    }
     auto const minSlots
         = level == kHotLevel ? mMinSlots : TypedVec<PoolGroupIndex, SlotCount>(numPoolGroups(level), SlotCount{1});
     size_t minQuota = minQuotaForLevel(lvlStorage.slotSizeLists(), lvlStorage.poolSizeGranularity(), minSlots);
@@ -1923,14 +1929,6 @@ void StorageManager::adjustCacheLevel(CacheLevel level, std::optional<size_t> ne
     auto newNumSlots = lvlStorage.computeSlotCountList(ratioList, minSlots, quota);
 
     TLLM_CHECK_DEBUG(isLastLevel(level) || persistentPages == nullptr);
-
-    // Slot counts are per domain; the quota and ratio math above covers the whole level.
-    int const numDomains = lvlStorage.numLocalityDomains();
-    if (numDomains > 1)
-    {
-        for (auto& count : newNumSlots)
-            count = std::max(SlotCount{1}, count / numDomains);
-    }
 
     // Shrink first.
     for (PoolGroupIndex pgIdx{0}; pgIdx < newNumSlots.size(); ++pgIdx)
@@ -2273,6 +2271,12 @@ TypedVec<PoolGroupIndex, SlotCount> StorageManager::computeSlotCountForLevel(Cac
     size_t quota = cacheTierQuota(tierConfig);
     size_t granularity = tier == CacheTier::GPU_MEM ? mGpuPhysMemAllocator->physMemSize()
                                                     : CacheLevelManager::cacheTierGranularity(tier, quota);
+    if (tier == CacheTier::GPU_MEM && mNumLocalityDomains > 1)
+    {
+        // Each domain rounds its own backing up to the granularity, so the slot count is sized
+        // per domain from an equal share of the quota rather than split after sizing.
+        quota = roundDown(quota / static_cast<size_t>(mNumLocalityDomains), granularity);
+    }
     quota = std::max(minQuotaForLevel(slotSizeLists, granularity, minSlots), roundUp(quota, granularity));
     return CacheLevelStorage::ratioToSlotCountList(quota, slotSizeLists, ratio, granularity, minSlots);
 }

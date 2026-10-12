@@ -191,11 +191,18 @@ std::shared_ptr<KvCache> KvCacheManager::createKvCache(ReuseScope reuseScope, To
 {
     KVCM2_API_GUARD();
     auto const apiLock = lockExclusive();
-    if (reuseScope.localityDomainId.has_value())
+    if (numLocalityDomains() > 1)
     {
+        TLLM_CHECK_WITH_INFO(reuseScope.localityDomainId.has_value(),
+            "locality_domain_id is required when the KV cache manager has %d locality domains", numLocalityDomains());
         int const localityDomainId = *reuseScope.localityDomainId;
         TLLM_CHECK_WITH_INFO(localityDomainId >= 0 && localityDomainId < numLocalityDomains(),
             "locality_domain_id %d out of range for %d locality domain(s)", localityDomainId, numLocalityDomains());
+    }
+    else
+    {
+        TLLM_CHECK_WITH_INFO(
+            !reuseScope.localityDomainId.has_value(), "locality_domain_id is set but locality domains are off");
     }
     if (!priorityCb)
     {

@@ -934,16 +934,13 @@ GpuCacheLevelStorage::GpuCacheLevelStorage(TypedVec<PoolGroupIndex, SlotDesc> co
 {
     TLLM_CHECK_WITH_INFO(slotCountList.size() == slotDescList.size(),
         "GpuCacheLevelStorage: slotCountList and slotDescList must have the same length");
+    // slotCountList is per domain: StorageManager sizes it from an equal share of the quota.
     int const numLocalityDomains = mPhysMemAllocator.numLocalityDomains();
     for (PoolGroupIndex pgIdx{0}; pgIdx < slotDescList.size(); ++pgIdx)
     {
-        // The level's slot budget is split evenly across domains.
-        SlotCount const perDomain = numLocalityDomains == 1
-            ? slotCountList[pgIdx]
-            : std::max(SlotCount{1}, slotCountList[pgIdx] / numLocalityDomains);
-        mPoolGroups.push_back(
-            std::make_unique<GpuPoolGroup>(std::vector<SlotCount>(static_cast<size_t>(numLocalityDomains), perDomain),
-                slotDescList[pgIdx].slotSizeList(), mPhysMemAllocator));
+        mPoolGroups.push_back(std::make_unique<GpuPoolGroup>(
+            std::vector<SlotCount>(static_cast<size_t>(numLocalityDomains), slotCountList[pgIdx]),
+            slotDescList[pgIdx].slotSizeList(), mPhysMemAllocator));
     }
 }
 

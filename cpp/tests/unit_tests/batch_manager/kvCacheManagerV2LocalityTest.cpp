@@ -94,11 +94,13 @@ TEST(KvCacheManagerV2LocalityTest, MappedAllocatorsIssueDisjointGlobalIdsAndStam
     EXPECT_EQ(ids.size(), 8U);
     EXPECT_EQ(alloc0.numFreeSlots(), 0);
 
-    // A slot issued by the other domain is foreign to this allocator.
+    // A handle carrying the other domain's id is foreign to this allocator; the real slot stays
+    // with alloc1 and is released below.
     {
-        Slot stolen;
-        stolen.setSlot(slots1[0]);
-        EXPECT_THROW(alloc0.release(std::move(stolen)), LogicError);
+        Slot foreign;
+        foreign.setSlotId(slots1[0].slotId());
+        foreign.setLocalityDomainId(1);
+        EXPECT_THROW(alloc0.release(std::move(foreign)), LogicError);
     }
     for (auto& slot : slots0)
     {
@@ -106,18 +108,20 @@ TEST(KvCacheManagerV2LocalityTest, MappedAllocatorsIssueDisjointGlobalIdsAndStam
         moved.setSlot(slot);
         alloc0.release(std::move(moved));
     }
-    for (size_t i = 1; i < slots1.size(); ++i)
+    for (auto& slot : slots1)
     {
         Slot moved;
-        moved.setSlot(slots1[i]);
+        moved.setSlot(slot);
         alloc1.release(std::move(moved));
     }
     EXPECT_EQ(alloc0.numFreeSlots(), 4);
-    EXPECT_EQ(alloc1.numFreeSlots(), 3);
+    EXPECT_EQ(alloc1.numFreeSlots(), 4);
     alloc0.synchronize();
     alloc1.synchronize();
     alloc0.prepareForShrink(SlotCount{0});
     EXPECT_TRUE(alloc0.finishShrink());
+    alloc1.prepareForShrink(SlotCount{0});
+    EXPECT_TRUE(alloc1.finishShrink());
 }
 
 TEST(KvCacheManagerV2LocalityTest, MappedAllocatorShrinksByLocalIndex)
@@ -261,6 +265,9 @@ TEST_F(KvCacheManagerV2MockLocalityTest, FreeSlotsAreTrackedPerDomain)
     EXPECT_EQ(manager->getPerLocalityDomainFreeSlots(), before);
 
     EXPECT_THROW(manager->createKvCache(scopeFor(2)), tensorrt_llm::common::TllmException);
+    EXPECT_THROW(manager->createKvCache(scopeFor(std::nullopt)), tensorrt_llm::common::TllmException);
+    auto plain = std::make_shared<KvCacheManager>(makeLocalizedConfig(false));
+    EXPECT_THROW(plain->createKvCache(scopeFor(0)), tensorrt_llm::common::TllmException);
 }
 
 TEST_F(KvCacheManagerV2MockLocalityTest, PageIndexUpperBoundCoversBothDomains)
