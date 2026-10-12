@@ -39,30 +39,16 @@ does not control all GPU memory management.
 
 #### CUTLASS reclamation validation
 
-`pytest tests/unittest/_torch/moe/test_workspace_cuda.py` runs FP16/BF16
-output parity across 50 growth/reclamation cycles and CUDA graph replay checks.
-It requires native libraries built from the same source revision.
-For manual operator measurements, run each allocator in a fresh process:
+`pytest tests/unittest/_torch/moe/test_workspace_cuda.py` checks BF16 output
+parity through growth, reclamation and regrowth, plus CUDA graph replay. It
+requires native libraries built from the same source revision. Run with each
+allocator separately using `PYTORCH_CUDA_ALLOC_CONF=backend:native` or
+`PYTORCH_CUDA_ALLOC_CONF=backend:cudaMallocAsync`.
 
-```bash
-PYTORCH_CUDA_ALLOC_CONF=backend:native python tests/unittest/_torch/moe/test_workspace_cuda.py --benchmark --output /tmp/moe-native.json
-PYTORCH_CUDA_ALLOC_CONF=backend:cudaMallocAsync python tests/unittest/_torch/moe/test_workspace_cuda.py --benchmark --output /tmp/moe-async.json
-```
-
-The benchmark alternates enabled/disabled order across five fresh runner pairs,
-with no reclamation and low/medium/high-frequency workloads. It compares output
-tensors outside timing. For memory comparisons, run `--memory-only --enabled 0`
-and `--memory-only --enabled 1` in separate fresh processes (with distinct
-`--output` files), holding the allocator fixed and reversing arm order on a
-second pair. This avoids contamination by earlier arms' allocator pools.
-Memory sequences include native-sized workspace growth, three underfilled
-forwards, a synthetic later allocation, and regrowth. JSON records allocated/reserved peaks, boundary device usage,
-and 5 ms NVML samples; startup/warmup are excluded from those memory peaks.
-Compare enabled/disabled arms within the same allocator. These are operator
-measurements, not model throughput, OOM capacity, or representative serving
-traffic. Sampled device peaks can miss transients. Full-model validation must
-also keep attention reclamation fixed to isolate the MoE change, since the
-shared environment variable controls both.
+For performance measurements, compare enabled/disabled arms within the same
+allocator. Keep attention reclamation fixed when isolating the MoE change,
+since the shared environment variable controls both. Operator measurements do
+not establish model throughput or lower reserved/device memory peaks.
 
 ### Profiling Features
 

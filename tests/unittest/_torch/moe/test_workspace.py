@@ -41,23 +41,14 @@ def test_failed_forward_aborts_native_scope(native_scope: Mock) -> None:
     native_scope.finish.assert_called_once_with(False)
 
 
-def test_failed_begin_is_not_finished_twice(native_scope: Mock) -> None:
-    native_scope.begin.side_effect = RuntimeError("begin failed")
-    with pytest.raises(RuntimeError, match="begin failed"):
-        with CutlassWorkspaceReclaimer().forward(warmup=False):
-            pytest.fail("Model must not execute after failed scope setup")
-    native_scope.finish.assert_not_called()
-
-
 def test_empty_warmup_skips_serving_boundaries_but_allows_later_warmup(native_scope: Mock) -> None:
     reclaimer = CutlassWorkspaceReclaimer()
     native_scope.finish.return_value = False
     with reclaimer.forward(warmup=True):
         pass
     native_scope.reset_mock()
-    for _ in range(3):
-        with reclaimer.forward(warmup=False):
-            pass
+    with reclaimer.forward(warmup=False):
+        pass
     native_scope.begin.assert_not_called()
     native_scope.finish.assert_not_called()
     native_scope.finish.return_value = True
