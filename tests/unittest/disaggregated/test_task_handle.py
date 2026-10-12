@@ -43,6 +43,7 @@ from tensorrt_llm._torch.disaggregation.native.transfer import (
     KVRecvTask,
     KVSendTask,
     MessageType,
+    PeerIncompatibleError,
     Receiver,
     RxSession,
     Sender,
@@ -642,6 +643,58 @@ def test_a_fetch_the_cancel_beat_reports_the_peers_cancel_rather_than_a_failure(
     assert outcome.by_peer is True
     # No peer was told where to write, so there is no report to wait for.
     assert _owes_a_report(outcome) is False
+
+
+def _receiver_with_an_incompatible_context_peer(owns_transfers: bool) -> Receiver:
+    """A receiver that dispatches for real, against a context peer whose layout it rejects."""
+    receiver = _wired_receiver(owns_transfers)
+    del receiver.dispatch_task
+    receiver._registrar = SimpleNamespace(
+        self_rank_info=SimpleNamespace(instance_name="gen", instance_rank=0)
+    )
+    receiver._get_sender_info = MagicMock(
+        side_effect=PeerIncompatibleError("synthetic layout mismatch")
+    )
+    return receiver
+
+
+@pytest.mark.parametrize("owns_transfers", [False, True])
+def test_an_incompatible_peer_fails_the_task_under_the_session_lock(
+    owns_transfers: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """KVRecvTask.fail() relies on its session's lock, also on the path that never publishes."""
+    receiver = _receiver_with_an_incompatible_context_peer(owns_transfers)
+    session = _receiving_over(receiver, 21)
+    lock_held_on_fail = []
+    fail = KVRecvTask.fail
+
+    def fail_recording_the_lock(task: KVRecvTask, exc: Exception) -> None:
+        lock_held_on_fail.append(session.lock.locked())
+        fail(task, exc)
+
+    monkeypatch.setattr(KVRecvTask, "fail", fail_recording_the_lock)
+
+    session.receive(_sole_piece())
+
+    assert lock_held_on_fail == [True]
+    assert session.has_failed()
+    if owns_transfers:
+        # No writer was published, so the owner closed without waiting for one.
+        assert session._kv_tasks[0].resources_drained
+
+
+@pytest.mark.parametrize("owns_transfers", [False, True])
+def test_an_incompatible_peer_fails_the_task_of_an_unregistered_session(
+    owns_transfers: bool,
+) -> None:
+    """Once the session is unregistered nothing else can reach the task, so no lock is needed."""
+    receiver = _receiver_with_an_incompatible_context_peer(owns_transfers)
+    session = _receiving_over(receiver, 22)
+    receiver._sessions.pop(22)
+
+    session.receive(_sole_piece())
+
+    assert session._kv_tasks[0].status is TaskStatus.ERROR
 
 
 def test_a_send_session_reads_a_parked_cancel_as_the_peers_too():
