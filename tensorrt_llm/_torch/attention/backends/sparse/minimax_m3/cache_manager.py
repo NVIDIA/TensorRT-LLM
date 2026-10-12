@@ -1046,6 +1046,12 @@ class MiniMaxM3DraftKVCacheView:
         self.host_kv_cache_block_offsets = manager.host_kv_cache_block_offsets[
             source_pool : source_pool + 1
         ]
+        self._page_table_materializer = _BasePageTableMaterializer(
+            self.host_kv_cache_block_offsets,
+            manager._stream,
+            self.index_scales,
+            self.kv_offset,
+        )
 
     def _check_layer(self, local_layer_idx: int) -> None:
         if local_layer_idx != self._local_layer_idx:
@@ -1088,6 +1094,9 @@ class MiniMaxM3DraftKVCacheView:
         manager = self._manager
         copy_idx = manager.index_mapper.get_copy_index(request_ids, num_contexts, beam_width)
         assert copy_idx.shape[0] == num_seqs
+        if self._page_table_materializer.uses_device_expansion:
+            self._page_table_materializer.copy_block_offsets_to(dst_tensor, copy_idx)
+            return
         copy_batch_block_offsets_to_device(
             self.host_kv_cache_block_offsets,
             dst_tensor,

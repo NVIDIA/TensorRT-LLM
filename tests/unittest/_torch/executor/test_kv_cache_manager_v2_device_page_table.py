@@ -579,6 +579,44 @@ def test_materializer_matches_the_native_kernel(monkeypatch, scales):
 
 
 @requires_cuda
+@pytest.mark.parametrize("num_blocks", [4, _MAX_BLOCKS_PER_SEQ])
+def test_materializer_broadcasts_more_rows_than_source_capacity(monkeypatch, scales, num_blocks):
+    """Repeated source rows must fill every beam, including temporary narrow staging."""
+    monkeypatch.setenv(_DEVICE_PAGE_TABLE_ENV, "1")
+    index_scales, kv_offset = scales
+    host_table = _make_host_table()
+    copy_idx = torch.tensor([3, 3, 3, 3, 1, 1, 1, 1], dtype=torch.int32)
+    materializer = _BasePageTableMaterializer(
+        host_table,
+        torch.cuda.current_stream(),
+        index_scales,
+        kv_offset,
+        output_row_capacity=copy_idx.numel(),
+    )
+    output = torch.full(
+        (_NUM_POOLS, copy_idx.numel() + 1, 2, num_blocks),
+        _UNTOUCHED,
+        dtype=torch.int32,
+        device="cuda",
+    )
+    materializer.copy_block_offsets_to(output, copy_idx)
+    torch.cuda.synchronize()
+    expected = _reference_offsets(host_table, copy_idx, index_scales, kv_offset)
+    torch.testing.assert_close(output[:, :-1].cpu(), expected[..., :num_blocks])
+    assert torch.all(output[:, -1] == _UNTOUCHED)
+
+
+@requires_cuda
+def test_materializer_rejects_batch_exceeding_output_capacity(monkeypatch, scales):
+    monkeypatch.setenv(_DEVICE_PAGE_TABLE_ENV, "1")
+    materializer = _make_materializer(_make_host_table(), *scales)
+    copy_idx = torch.zeros(_CAPACITY + 1, dtype=torch.int32)
+    output = torch.empty((_NUM_POOLS, _CAPACITY + 1, 2, 4), dtype=torch.int32, device="cuda")
+    with pytest.raises(AssertionError, match="output row capacity"):
+        materializer.copy_block_offsets_to(output, copy_idx)
+
+
+@requires_cuda
 def test_materializer_rereads_the_table_every_step(monkeypatch, scales):
     """Each step must re-gather; rows are edited in place and slots are reused."""
     monkeypatch.setenv(_DEVICE_PAGE_TABLE_ENV, "1")
@@ -695,6 +733,56 @@ def _build_manager(
         dtype=DataType.HALF,
         enable_stats=False,
     )
+
+
+@requires_native_page_table_kernel
+def test_cross_attention_beams_match_native_materialization(monkeypatch):
+    """The manager must reserve output capacity for replicated cross-attention beams."""
+    from tensorrt_llm.bindings.internal.batch_manager.kv_cache_manager_v2_utils import (
+        copy_batch_block_offsets_to_device,
+    )
+
+    monkeypatch.setenv(_DEVICE_PAGE_TABLE_ENV, "1")
+    manager = KVCacheManagerV2(
+        KvCacheConfig(enable_block_reuse=False, max_gpu_total_bytes=16 << 20),
+        CacheType.CROSS,
+        num_layers=1,
+        num_kv_heads=2,
+        head_dim=64,
+        tokens_per_block=4,
+        max_seq_len=32,
+        max_batch_size=1,
+        max_beam_width=1,
+        max_copy_beam_width=4,
+        mapping=Mapping(world_size=1, rank=0, tp_size=1, pp_size=1),
+        dtype=DataType.HALF,
+        enable_stats=False,
+    )
+    try:
+        manager.index_mapper.add_new_sequence(11)
+        manager.host_kv_cache_block_offsets[:, :, 0].fill_(2)
+        assert manager.host_kv_cache_block_offsets.shape[1] < 4
+        shape = (manager.num_pools, 5, 2, manager.max_blocks_per_seq)
+        native = torch.full(shape, _UNTOUCHED, dtype=torch.int32, device="cuda")
+        copy_idx = manager.index_mapper.get_copy_index([11], 0, 4, True)
+        assert copy_idx.numel() == 4 and torch.all(copy_idx == copy_idx[0])
+        copy_batch_block_offsets_to_device(
+            manager.host_kv_cache_block_offsets,
+            native,
+            copy_idx,
+            manager.index_scales,
+            manager.kv_offset,
+            manager._stream.cuda_stream,
+        )
+        manager._stream.synchronize()
+        uploaded = torch.full_like(native, _UNTOUCHED)
+        manager.copy_batch_block_offsets(uploaded, [11], 4, 0, 4)
+        manager._stream.synchronize()
+        torch.testing.assert_close(uploaded, native)
+        assert torch.all(uploaded[:, :4] != _UNTOUCHED)
+        assert torch.all(uploaded[:, 4:] == _UNTOUCHED)
+    finally:
+        manager.shutdown()
 
 
 @requires_native_page_table_kernel

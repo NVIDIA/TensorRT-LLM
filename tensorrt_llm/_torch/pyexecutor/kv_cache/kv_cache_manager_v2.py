@@ -1302,6 +1302,7 @@ class _BasePageTableMaterializer:
         index_scales: Optional[torch.Tensor] = None,
         kv_offset: Optional[torch.Tensor] = None,
         allocate_device_source: bool = True,
+        output_row_capacity: Optional[int] = None,
     ) -> None:
         assert host_block_offsets.ndim == 4 and host_block_offsets.shape[2] == 2
         self._host_block_offsets = host_block_offsets
@@ -1330,8 +1331,12 @@ class _BasePageTableMaterializer:
             kv_offset.to(device=self._device) if self._use_device_expansion else None
         )
         if self._use_device_expansion:
+            # Cross-attention broadcasts source beam zero to multiple output beams.
+            output_row_capacity = (
+                self._row_capacity if output_row_capacity is None else output_row_capacity
+            )
             self._identity_copy_idx_device = torch.arange(
-                self._row_capacity,
+                output_row_capacity,
                 dtype=torch.int32,
                 device=self._device,
             )
@@ -1339,7 +1344,11 @@ class _BasePageTableMaterializer:
             # expansion kernel reads exactly that plane and materializes both
             # K and V in its destination.
             self._device_base_page_rows = (
-                torch.empty_like(host_block_offsets, device=self._device)
+                torch.empty(
+                    (self._num_pools, output_row_capacity, 2, self._max_blocks_per_seq),
+                    dtype=host_block_offsets.dtype,
+                    device=self._device,
+                )
                 if allocate_device_source
                 else None
             )
@@ -1453,6 +1462,10 @@ class _BasePageTableMaterializer:
         if num_seqs == 0:
             return
         assert num_blocks % 4 == 0, "blocks per sequence must be a multiple of 4"
+        assert self._identity_copy_idx_device is not None
+        assert num_seqs <= self._identity_copy_idx_device.numel(), (
+            "Batch rows exceed the materializer's output row capacity"
+        )
         assert self._index_scales is not None and self._kv_offset is not None
         stream = self._stream if stream is None else stream
 
@@ -1471,7 +1484,6 @@ class _BasePageTableMaterializer:
                 num_seqs,
                 stream.cuda_stream,
             )
-        assert self._identity_copy_idx_device is not None
         copy_idx = self._identity_copy_idx_device[:num_seqs]
         index_scales, kv_offset = self._get_device_conversion_metadata()
 
@@ -2783,6 +2795,7 @@ class KVCacheManagerV2(BaseResourceManager):
             self.index_scales,
             self.kv_offset,
             allocate_device_source=not self._use_per_layer_page_tables,
+            output_row_capacity=index_mapper_capacity * self.max_copy_beam_width,
         )
         if not self._page_table_materializer.uses_device_expansion:
             # get_copy_index always slices the mapper's persistent copy-index
