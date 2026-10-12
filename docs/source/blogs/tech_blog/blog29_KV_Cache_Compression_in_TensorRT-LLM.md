@@ -95,7 +95,7 @@ Beyond the forward pass, a serving system offers **extra opportunities to compre
 
 - **Untouched attention**: attention reads the GPU KV as before.
 - **Seamless insertion**: no exposed overhead; the compression kernels hide inside existing steps and nothing else in the runtime changes.
-- **General to models**: works on KV pages, not on kernels.
+- **General to models**: works on KV pages, not on model-specific operators.
 
 To insert precisely, we define five stages in the life of a KV cache (Figure 3):
 
