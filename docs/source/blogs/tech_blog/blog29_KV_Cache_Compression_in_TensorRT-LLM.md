@@ -58,14 +58,16 @@ The two tables below summarize the current coverage.
 
 <div align="center">
 
-| Method | When It Runs | What It Changes | Supported Attention Types |
+| Method | When It Runs | What It Changes | Supported Attention Types[^attn-types] |
 | :--- | :--- | :--- | :--- |
-| **NVFP4 cold-page compression** | When a page moves between the GPU and host or disk memory | How attention KV is stored while off the GPU | multi-head, multi-query and grouped-query attention (MHA / MQA / GQA); multi-head latent attention (MLA); hybrid models (attention KV only) |
+| **NVFP4 cold-page compression** | When a page moves between the GPU and host or disk memory | How attention KV is stored while off the GPU | MHA / MQA / GQA / MLA / hybrid |
 | **TriAttention** | Periodically between decode steps | Which KV tokens are kept | MHA / MQA / GQA |
 
 <p align="center"><sub><em>Table 1. The two methods built on the framework: when each one runs, what it changes, and the attention types it supports.</em></sub></p>
 
 </div>
+
+[^attn-types]: MHA: multi-head attention. MQA: multi-query attention. GQA: grouped-query attention. MLA: multi-head latent attention. For hybrid models, only the KV of the attention layers is compressed.
 
 <div align="center">
 
