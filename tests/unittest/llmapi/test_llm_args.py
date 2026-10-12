@@ -860,6 +860,16 @@ class TestKvCacheManagerV2AutoResolution:
         def get_preferred_kv_cache_manager_version(cls, pretrained_config=None):
             return "V1"
 
+    class _RequireV2:
+
+        @classmethod
+        def get_preferred_kv_cache_manager_version(cls, pretrained_config=None):
+            return "V2"
+
+        @classmethod
+        def requires_kv_cache_manager_v2(cls, pretrained_config=None):
+            return True
+
     @pytest.mark.parametrize(
         "kind,dtype,checkpoint_dtype,backend,setting,expected",
         [
@@ -977,6 +987,54 @@ class TestKvCacheManagerV2AutoResolution:
         _resolve_kv_cache_manager_v2_auto(llm_args, self._PreferV2)
 
         assert llm_args.kv_cache_config.use_kv_cache_manager_v2 is True
+
+    @pytest.mark.parametrize(
+        "cache_transceiver_config",
+        [
+            pytest.param(None, id="aggregated"),
+            pytest.param(CacheTransceiverConfig(backend="NIXL",
+                                                transceiver_runtime="PYTHON"),
+                         id="disagg-nixl-python"),
+        ],
+    )
+    def test_required_v2_resolves_on_supported_routes(self,
+                                                      cache_transceiver_config):
+        llm_args = TorchLlmArgs(
+            model="/tmp/dummy_model",
+            cache_transceiver_config=cache_transceiver_config)
+
+        assert _resolve_kv_cache_manager_v2_auto(llm_args,
+                                                 self._RequireV2) is True
+        assert llm_args.kv_cache_config.use_kv_cache_manager_v2 is True
+
+    @pytest.mark.parametrize(("backend", "runtime"), [
+        pytest.param("NIXL", "CPP", id="nixl-cpp"),
+        pytest.param("UCX", "PYTHON", id="ucx-python"),
+    ])
+    def test_required_v2_refuses_incompatible_disagg(self, backend, runtime):
+        """A required V2 is refused on the demotion arm, never demoted."""
+        llm_args = TorchLlmArgs(
+            model="/tmp/dummy_model",
+            cache_transceiver_config=CacheTransceiverConfig(
+                backend=backend, transceiver_runtime=runtime),
+        )
+
+        with pytest.raises(ValueError) as excinfo:
+            _resolve_kv_cache_manager_v2_auto(llm_args, self._RequireV2)
+
+        message = str(excinfo.value)
+        assert self._RequireV2.__name__ in message
+        assert "requires KV cache manager v2" in message
+        assert "backend='NIXL'" in message
+        assert "transceiver_runtime='PYTHON'" in message
+
+    def test_required_v2_rejects_explicit_v1(self):
+        llm_args = TorchLlmArgs(
+            model="/tmp/dummy_model",
+            kv_cache_config=KvCacheConfig(use_kv_cache_manager_v2=False))
+
+        with pytest.raises(ValueError, match="use_kv_cache_manager_v2=False"):
+            _resolve_kv_cache_manager_v2_auto(llm_args, self._RequireV2)
 
     @pytest.mark.parametrize(("user_setting", "model_cls"), [
         pytest.param(False, _PreferV2, id="explicit-v1"),
