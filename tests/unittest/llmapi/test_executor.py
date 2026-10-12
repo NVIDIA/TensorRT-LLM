@@ -20,6 +20,7 @@ from tensorrt_llm.executor import (DetokenizedGenerationResultBase,
 from tensorrt_llm.executor.ipc import FusedIpcQueue, ZeroMqQueue
 from tensorrt_llm.llmapi.tokenizer import TransformersTokenizer
 from tensorrt_llm.llmapi.utils import AsyncQueue
+from tensorrt_llm.metrics import MetricNames
 from tensorrt_llm.sampling_params import SamplingParams
 
 # isort: off
@@ -279,6 +280,35 @@ def test_handle_response_postproc_nonstreaming_propagates_metadata():
     assert result._done
     assert result._outputs[0].finish_reason == "stop"
     assert len(result._outputs[0].token_ids) == 5
+
+
+def test_handle_response_postproc_adds_prompt_tokens():
+    """With num_postprocess_workers > 0 the worker's record has no prompt, so
+    the main-thread result fills PROMPT_TOKENS in alongside the worker's
+    cached-token count. Without it trtllm_prompt_tokens_total stays empty and
+    the Prometheus prefix hit rate has no denominator."""
+    sampling_params = SamplingParams(max_tokens=10)
+    result = GenerationResultBase(id=1, sampling_params=sampling_params)
+    result.prompt_token_ids = list(range(300))
+
+    result._handle_response(
+        PostprocWorker.Output(client_id=1,
+                              res="mock_sse_data",
+                              is_final=False,
+                              metrics={MetricNames.TTFT: 0.5}))
+    assert MetricNames.PROMPT_TOKENS not in result.metrics_dict
+
+    result._handle_response(
+        PostprocWorker.Output(client_id=1,
+                              res="mock_sse_data",
+                              is_final=True,
+                              metrics={
+                                  MetricNames.PROMPT_CACHE_CACHED_TOKENS: 256
+                              },
+                              finish_reason="length",
+                              num_generated_tokens=1))
+    assert result.metrics_dict[MetricNames.PROMPT_TOKENS] == 300
+    assert result.metrics_dict[MetricNames.PROMPT_CACHE_CACHED_TOKENS] == 256
 
 
 def _ZeroMqQueue_sync_sync_task(addr: str):

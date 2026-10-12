@@ -483,6 +483,16 @@ class GenerationResultBase:
 
             if response.metrics:
                 self.metrics_dict.update(response.metrics)
+                # The postprocess worker's record carries no prompt, so it cannot
+                # count prompt tokens. It reports cached tokens only for a
+                # request's finished first candidate, which is where
+                # `record_stats` counts the prompt too.
+                prompt_token_ids = getattr(self, "prompt_token_ids", None)
+                if (MetricNames.PROMPT_CACHE_CACHED_TOKENS in response.metrics
+                        and MetricNames.PROMPT_TOKENS not in self.metrics_dict
+                        and prompt_token_ids):
+                    self.metrics_dict[MetricNames.PROMPT_TOKENS] = len(
+                        prompt_token_ids)
 
             if self._done:
                 req_perf_metrics_dict = _build_perf_metrics_dict(
