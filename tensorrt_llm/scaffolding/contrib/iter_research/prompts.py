@@ -1,3 +1,17 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 # ruff: noqa: E501
 
 from tensorrt_llm.scaffolding import system_prompt
@@ -153,17 +167,16 @@ Do not include <tool_call> tags, JSON tool-call text, function-call markdown, or
 - Then choose: <answer>...</answer> in text if sufficient info, OR exactly one native tool call in the structured tool_calls field if more action is needed
 - Never output both an answer and a native tool call in the same response
 - Never write <tool_call> tags or tool-call JSON in the text body
-
-## Input
-- Current Date: {date_to_use}
-- Question: {question}
-- Available Tools Summary (the actual callable tool schemas are provided separately through the native tools field)
-{tools}
 """,
     name="iter_research.instruction_system_prompt",
 )
 
-INSTRUCTION_INPUT_PROMPT = """- Last Status Report and Deep Analysis:
+INSTRUCTION_INPUT_PROMPT = """## Input
+- Current Date: {date_to_use}
+- Question: {question}
+- Available Tools Summary (the actual callable tool schemas are provided separately through the native tools field)
+{tools}
+- Last Status Report and Deep Analysis:
 <report>
 {report}
 </report>
@@ -243,15 +256,14 @@ You MUST output this section enclosed with <answer></answer> tags!
 - Start with <report>...</report> section
 - Then <answer>...</answer> section
 - you MUST give a final response
-
-## Input
-- Current Date: {date_to_use}
-- Question: {question}
 """,
     name="iter_research.last_instruction_system_prompt",
 )
 
-LAST_INSTRUCTION_INPUT_PROMPT = """- Last Status Report and Deep Analysis:
+LAST_INSTRUCTION_INPUT_PROMPT = """## Input
+- Current Date: {date_to_use}
+- Question: {question}
+- Last Status Report and Deep Analysis:
 <report>
 {report}
 </report>

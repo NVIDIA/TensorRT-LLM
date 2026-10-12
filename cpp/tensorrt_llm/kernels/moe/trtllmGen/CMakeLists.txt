@@ -21,12 +21,14 @@ set(ROUTING_CUSTOM_SRC_CU
     ${CMAKE_CURRENT_SOURCE_DIR}/routing/RoutingCustomBlock.cu
     ${CMAKE_CURRENT_SOURCE_DIR}/routing/RoutingCustomCluster.cu
     ${CMAKE_CURRENT_SOURCE_DIR}/routing/RoutingCustomClusterLarge.cu
-    ${CMAKE_CURRENT_SOURCE_DIR}/routing/RoutingCustomEntry.cu)
+    ${CMAKE_CURRENT_SOURCE_DIR}/routing/RoutingCustomEntry.cu
+    ${CMAKE_CURRENT_SOURCE_DIR}/routing/RoutingCustomSmallToken.cu)
 
 list(REMOVE_ITEM SRC_CU ${ROUTING_CUSTOM_SRC_CU})
 
 # Build routing as multiple translation units without NVCC's internal parallel
-# split pipeline.
+# split pipeline: one TU per heavy kernel family (block group, small cluster,
+# large cluster, small-token, entry) so ptxas runs them in parallel.
 add_library(trtllm_gen_fp8_block_scale_moe_routing OBJECT
             ${ROUTING_CUSTOM_SRC_CU})
 set_property(TARGET trtllm_gen_fp8_block_scale_moe_routing

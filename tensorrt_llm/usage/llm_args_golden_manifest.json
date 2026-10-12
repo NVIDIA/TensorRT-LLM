@@ -222,6 +222,15 @@
       "path": "cuda_graph_config.enable_padding"
     },
     {
+      "allowed_values": [
+        "num_tokens",
+        "batch_size"
+      ],
+      "capture_policy": "list[tuple[int|literal]]",
+      "kind": "categorical",
+      "path": "cuda_graph_config.extra_model_inputs.shape"
+    },
+    {
       "capture_policy": "int",
       "kind": "value",
       "path": "cuda_graph_config.max_batch_size"
@@ -359,6 +368,11 @@
     {
       "capture_policy": "bool",
       "kind": "value",
+      "path": "enable_locality_domains"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
       "path": "enable_lora"
     },
     {
@@ -410,6 +424,15 @@
       "capture_policy": "bool",
       "kind": "value",
       "path": "encoder_cuda_graph_config.enable_padding"
+    },
+    {
+      "allowed_values": [
+        "num_tokens",
+        "batch_size"
+      ],
+      "capture_policy": "list[tuple[int|literal]]",
+      "kind": "categorical",
+      "path": "encoder_cuda_graph_config.extra_model_inputs.shape"
     },
     {
       "capture_policy": "int",
@@ -503,6 +526,11 @@
       "path": "guided_decoding_backend"
     },
     {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "iter_perf_stats_interval"
+    },
+    {
       "capture_policy": "int|none",
       "kind": "value",
       "path": "iter_stats_max_iterations"
@@ -543,11 +571,25 @@
     },
     {
       "allowed_values": [
+        0,
+        64
+      ],
+      "capture_policy": "literal",
+      "kind": "categorical",
+      "path": "kv_cache_compression_config.nvfp4_residual_dim"
+    },
+    {
+      "allowed_values": [
         "nvfp4"
       ],
       "capture_policy": "literal",
       "kind": "categorical",
       "path": "kv_cache_compression_config.quant"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "kv_cache_compression_config.skip_rope_quantization"
     },
     {
       "capture_policy": "int",
@@ -573,6 +615,11 @@
       "capture_policy": "literal",
       "kind": "categorical",
       "path": "kv_cache_config.block_reuse_config.policy"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "kv_cache_config.block_reuse_config.swa_endpoint_rewind_tokens"
     },
     {
       "capture_policy": "bool",
@@ -781,11 +828,28 @@
       "allowed_values": [
         "lmcache",
         "lmcache-mp",
-        "kvbm"
+        "kvbm",
+        "mooncake-store"
       ],
       "capture_policy": "allowlist|none",
       "kind": "categorical",
       "path": "kv_connector_config.connector"
+    },
+    {
+      "allowed_values": [
+        "both",
+        "producer",
+        "consumer",
+        "capacity"
+      ],
+      "capture_policy": "literal",
+      "kind": "categorical",
+      "path": "kv_connector_config.mooncake_store.role"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "kv_connector_config.mooncake_store.segment_size"
     },
     {
       "capture_policy": "list[int]|none",
@@ -1070,6 +1134,11 @@
       "path": "peft_cache_config.optimal_adapter_size"
     },
     {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "per_request_spec_decode_stats"
+    },
+    {
       "capture_policy": "int",
       "kind": "value",
       "path": "perf_metrics_max_requests"
@@ -1167,7 +1236,8 @@
         "nano-v3",
         "gemma4",
         "kimi_k2",
-        "kimi_k25"
+        "kimi_k25",
+        "k-exaone"
       ],
       "capture_policy": "allowlist|none",
       "kind": "categorical",
@@ -1267,6 +1337,7 @@
     },
     {
       "allowed_values": [
+        "csa2",
         "dsa",
         "deepseek_v4",
         "minimax_m3",
@@ -1287,6 +1358,11 @@
       "capture_policy": "bool",
       "kind": "value",
       "path": "sparse_attention_config.enable_heuristic_topk"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "sparse_attention_config.enable_kv_cache_offload"
     },
     {
       "capture_policy": "bool",
@@ -1473,6 +1549,11 @@
       "path": "sparse_attention_config.use_cute_dsl_topk"
     },
     {
+      "capture_policy": "bool|none",
+      "kind": "value",
+      "path": "sparse_attention_config.use_fp8_staging"
+    },
+    {
       "capture_policy": "bool",
       "kind": "value",
       "path": "sparse_attention_config.use_gvr_emission"
@@ -1539,6 +1620,11 @@
       "capture_policy": "int|none",
       "kind": "value",
       "path": "speculative_config.block_size"
+    },
+    {
+      "capture_policy": "int|none",
+      "kind": "value",
+      "path": "speculative_config.context_recompute_tail"
     },
     {
       "allowed_values": [

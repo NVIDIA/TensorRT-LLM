@@ -70,7 +70,7 @@ std::tuple<at::Tensor, at::Tensor> fp8_quantize_1x128(at::Tensor const& self, bo
     mGemmRunner.fp8CS1x128(
         act_buffer, act_scale_buffer, reinterpret_cast<__nv_bfloat16 const*>(self.data_ptr()), n, m, stream, use_ue8m0);
 
-    // Post-process the scale tensor for sm100 gemm/moe kernel
+    // Post-process the scale tensor for the sm100-family gemm/moe kernels
     if (tensorrt_llm::common::isSM100Family())
     {
         auto const num_n_blocks = (n + 127) / 128;
@@ -144,7 +144,7 @@ std::tuple<at::Tensor, at::Tensor> fp8_batched_quantize_1x128_permute102(at::Ten
     return {valueE4M3.slice(0, 0, b * m * n).view({b, m, n}), scaleFP8SF};
 }
 
-// Fused 1x128 FP8 quantize + UE8M0 packing (SM100 only).
+// Fused 1x128 FP8 quantize + UE8M0 packing (SM100 family only: SM100/SM103/SM107).
 //
 // By default, returns K32-addressable scale slots in the standard R128c4
 // layout: [ceil(M/128), ceil(K/128), 32, 4, 4]. Quantization remains K128,
@@ -159,7 +159,7 @@ std::tuple<at::Tensor, at::Tensor> fp8_quantize_1x128_packed_ue8m0(at::Tensor co
     TORCH_CHECK(self.scalar_type() == at::ScalarType::BFloat16, "Input matrix dtype must be BF16.");
     TORCH_CHECK(self.dim() == 2, "input must be a matrix");
     TORCH_CHECK(tensorrt_llm::common::isSM100Family(),
-        "fp8_quantize_1x128_packed_ue8m0 currently only supports SM100 (Blackwell).");
+        "fp8_quantize_1x128_packed_ue8m0 currently only supports SM100-family GPUs (SM100/SM103/SM107).");
 
     auto const m = self.sizes()[0];
     auto const n = self.sizes()[1];
@@ -240,7 +240,7 @@ std::tuple<at::Tensor, at::Tensor> fp8_quantize_1x128_cutedsl_ue8m0(at::Tensor c
     TORCH_CHECK(self.scalar_type() == at::ScalarType::BFloat16, "Input matrix dtype must be BF16.");
     TORCH_CHECK(self.dim() == 2, "input must be a matrix");
     TORCH_CHECK(tensorrt_llm::common::isSM100Family(),
-        "fp8_quantize_1x128_cutedsl_ue8m0 currently only supports SM100 (Blackwell).");
+        "fp8_quantize_1x128_cutedsl_ue8m0 currently only supports SM100-family GPUs (SM100/SM103/SM107).");
 
     auto const m = self.sizes()[0];
     auto const k = self.sizes()[1];

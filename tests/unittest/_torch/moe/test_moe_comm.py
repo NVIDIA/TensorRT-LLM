@@ -1822,7 +1822,7 @@ def _simulate_nvfp4_round_trip(tensor: torch.Tensor, group_size: int = 16) -> to
     N, H = x.shape
     assert H % group_size == 0
 
-    # E2M1 lookup tables (same as torch_quant.py)
+    # E2M1 lookup tables.
     e2m1_bounds = torch.tensor([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0], device=x.device)
     e2m1_pos_vals = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], device=x.device)
 
@@ -2182,6 +2182,22 @@ def _make_boundary_test_params():
         for comm_type in ALL_COMM_TYPES:
             aligned_top_k = 8 if comm_type == COMM_NVLINK_TWO_SIDED_FLASHINFER else 2
             boundary_cases = []
+            if comm_type == COMM_NVLINK_ONE_SIDED:
+                # DSpark routes to three experts; include an idle ADP peer.
+                boundary_cases.append(
+                    (
+                        2,
+                        CommTestConfig(
+                            comm_type=comm_type,
+                            ep_size=2,
+                            num_experts=FIXED_NUM_EXPERTS,
+                            top_k=3,
+                            hidden_size=DEFAULT_HIDDEN_SIZE,
+                            all_num_tokens=[17, 0],
+                        ),
+                        f"{comm_type}_topk3",
+                    )
+                )
             if comm_type != COMM_NVLINK_TWO_SIDED_FLASHINFER:
                 boundary_cases.append(
                     (

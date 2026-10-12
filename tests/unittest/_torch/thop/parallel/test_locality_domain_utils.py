@@ -68,6 +68,17 @@ def check_locality_domain_support():
         pytest.skip("LOCALITY_DOMAIN localization is not supported on this system")
 
 
+@pytest.fixture(scope="module")
+def check_locality_domain_enabled(check_locality_domain_support):
+    """Skip unless locality_domain_device() actually switches the current domain.
+
+    Driver support alone is not enough: the feature is only enabled on SM107, and
+    elsewhere locality_domain_device() is a no-op.
+    """
+    if not is_locality_domain_enabled():
+        pytest.skip("LOCALITY_DOMAIN localization is not enabled on this system")
+
+
 class TestLocalityDomainSupport:
     """Tests for LOCALITY_DOMAIN support detection."""
 
@@ -106,7 +117,6 @@ class TestLocalityDomainSupport:
 class TestLocalityDomainComputeTopology:
     """Pure mocked tests for compute topology and grid sizing."""
 
-    @pytest.mark.skip(reason="requires _get_full_device_max_active_clusters (cute_dsl_custom_ops)")
     @pytest.mark.skipif(not IS_CUTLASS_DSL_AVAILABLE, reason="cutlass-dsl is not available")
     def test_cluster_occupancy_cache_keeps_topology_scaling_dynamic(self, monkeypatch):
         from tensorrt_llm._torch.custom_ops import cute_dsl_custom_ops
@@ -144,7 +154,6 @@ class TestLocalityDomainComputeTopology:
         finally:
             occupancy_cache.cache_clear()
 
-    @pytest.mark.skip(reason="requires _get_full_device_max_active_clusters (cute_dsl_custom_ops)")
     @pytest.mark.skipif(not IS_CUTLASS_DSL_AVAILABLE, reason="cutlass-dsl is not available")
     def test_cluster_occupancy_cache_is_scoped_by_device_and_cluster(self, monkeypatch):
         from tensorrt_llm._torch.custom_ops import cute_dsl_custom_ops
@@ -349,7 +358,6 @@ class TestLocalityDomainLinearRouting:
         "fusion_op",
         [AllReduceFusionOp.NONE, AllReduceFusionOp.RESIDUAL_RMS_NORM],
     )
-    @pytest.mark.skip(reason="requires the Linear/model_config wire-up (call-site PR)")
     def test_shards_bypass_full_weight_paths(self, fusion_op):
         input_tensor = torch.ones(2, 4)
         local_output = torch.full((2, 3), 2.0)
@@ -666,7 +674,7 @@ def _pool_allocated_bytes(pool):
 class TestLocalityDomainNestedMemPool:
     """Nested optional_locality_domain_mem_pool scopes across locality domains."""
 
-    def test_nested_same_domain_does_not_reenter(self, check_locality_domain_support):
+    def test_nested_same_domain_does_not_reenter(self, check_locality_domain_enabled):
         """Re-entering the same pool is skipped; use_mem_pool would reject it."""
         manager = locality_domain_utils.get_locality_domain_resource_manager()
         device_id = torch.cuda.current_device()
@@ -684,7 +692,7 @@ class TestLocalityDomainNestedMemPool:
 
         assert getattr(manager.in_mem_pool_context, "active_pool_key", None) is None
 
-    def test_nested_other_domain_restores_outer_key(self, check_locality_domain_support):
+    def test_nested_other_domain_restores_outer_key(self, check_locality_domain_enabled):
         """A nested scope for a different domain enters it and unwinds to the outer one."""
         manager = locality_domain_utils.get_locality_domain_resource_manager()
         device_id = torch.cuda.current_device()
@@ -704,7 +712,7 @@ class TestLocalityDomainNestedMemPool:
 
         assert getattr(manager.in_mem_pool_context, "active_pool_key", None) is None
 
-    def test_nested_other_domain_allocates_from_inner_pool(self, check_locality_domain_support):
+    def test_nested_other_domain_allocates_from_inner_pool(self, check_locality_domain_enabled):
         """A nested domain's tensor comes from its own pool, not the enclosing one."""
         try:
             pool0 = get_locality_domain_mempool(0)
@@ -728,7 +736,7 @@ class TestLocalityDomainNestedMemPool:
         assert after0 == before0, "nested domain 1 allocation leaked into domain 0's pool"
         del inner
 
-    def test_exception_restores_previous_key(self, check_locality_domain_support):
+    def test_exception_restores_previous_key(self, check_locality_domain_enabled):
         """An exception inside a nested scope must still unwind the key."""
         manager = locality_domain_utils.get_locality_domain_resource_manager()
         device_id = torch.cuda.current_device()

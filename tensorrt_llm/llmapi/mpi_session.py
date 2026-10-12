@@ -550,7 +550,8 @@ class MpiPoolSession(MpiSession):
             key: value
             for key, value in os.environ.items()
             if key.startswith("TRTLLM") or key.startswith("TLLM") or key in (
-                "FLASHINFER_WORKSPACE_BASE", "FLASHINFER_CUBIN_DIR")
+                "FLASHINFER_WORKSPACE_BASE", "FLASHINFER_CUBIN_DIR",
+                "MASTER_ADDR", "MASTER_PORT")
         }
         workspace_managed = env.get(_FLASHINFER_WORKSPACE_MANAGED_ENV) == "1"
         env.update(self._env_overrides)
@@ -699,6 +700,8 @@ class RemoteTask(NamedTuple):
     args: Tuple[Any, ...]
     kwargs: Dict[str, Any]
     sync: bool = False  # if True, the result will be sent back to the client
+    # Submitting client's sys.path, applied on every rank by task_wrapper.
+    sys_path: Tuple[str, ...] = ()
 
 
 class RemoteWorkerDeath(NamedTuple):
@@ -780,7 +783,8 @@ class RemoteMpiCommSessionClient(MpiSession):
         logger_debug(
             f"RemoteMpiCommSessionClient [rank{global_mpi_rank()}] sending task {task} to {self.addr}\n",
             "yellow")
-        self.queue.put(RemoteTask(task, args, kwargs, sync=sync))
+        self.queue.put(
+            RemoteTask(task, args, kwargs, sync=sync, sys_path=tuple(sys.path)))
         return []
 
     SYNC_IDLE_INTERVAL = 8
@@ -891,7 +895,17 @@ class RemoteMpiCommSessionServer():
                     n_workers=n_workers)
 
     @staticmethod
-    def task_wrapper(task: Callable[..., T], *args, **kwargs) -> T:
+    def task_wrapper(client_sys_path: Tuple[str, ...], task: Callable[..., T],
+                     /, *args, **kwargs) -> T:
+        # Adopt the client's sys.path before the task runs, so objects it later
+        # unpickles -- per-request payloads such as a caller-defined logits
+        # processor -- can resolve their classes on this rank. Appending keeps
+        # this process's own environment ahead of the client's; relative entries
+        # are dropped because they would resolve against this process's working
+        # directory rather than the client's.
+        for path in client_sys_path:
+            if os.path.isabs(path) and path not in sys.path:
+                sys.path.append(path)
         logger_debug(
             f"MpiCommSession rank{mpi_rank()} with world_size {mpi_world_size()}\n",
             "green")
@@ -960,14 +974,15 @@ class RemoteMpiCommSessionServer():
                     f"RemoteMpiCommSessionServer [rank{global_mpi_rank()}] received shutdown signal\n",
                     "green")
                 self.session.shutdown_abort()
+                self._close_global_comm_executor()
                 break
             else:
                 logger_debug(
                     f"RemoteMpiCommSessionServer [rank{global_mpi_rank()}] received task [{message.task}] from {self.addr}\n",
                     "green")
                 futures = self.session.submit(
-                    RemoteMpiCommSessionServer.task_wrapper, message.task,
-                    *message.args, **message.kwargs)
+                    RemoteMpiCommSessionServer.task_wrapper, message.sys_path,
+                    message.task, *message.args, **message.kwargs)
                 self.num_results = self.session.n_workers
                 assert len(futures) == self.num_results == mpi_world_size()
                 # Store futures to wait for them before the next task
@@ -981,6 +996,65 @@ class RemoteMpiCommSessionServer():
                         # client-side session has no futures to watch); see
                         # RemoteWorkerDeath.
                         future.add_done_callback(self.mpi_async_error_callback)
+
+    @staticmethod
+    def _close_global_comm_executor(
+            grace: float = 60.0,
+            abort: Optional[Callable[[], None]] = None) -> None:
+        """Release the shared COMM_WORLD ``MPICommExecutor`` so peers exit.
+
+        The server's shutdown is the END of the MPI world's life, and it is
+        the only place that can close the global executor:
+        ``MpiCommSession.shutdown()`` deliberately leaves the shared pool
+        running (multiple LLM instances reuse it), and the client-side
+        session's shutdown is a no-op for the same reason. Without this
+        close, the non-leader ranks stay blocked in ``MPICommExecutor``'s
+        task loop after the client is gone, and the job ends only when
+        something hard-kills it.
+
+        ``__exit__`` joins the worker ranks, which can block forever if one
+        is wedged (e.g. stranded in a collective by an asymmetric crash), so
+        the join runs under a grace period with an ``Abort`` escalation --
+        the same shape as ``MpiSession.shutdown_abort``.
+        """
+        executor = MPINodeState._global_comm_executor
+        if executor is None:
+            return
+        MPINodeState._global_comm_executor = None
+        MPINodeState._global_mpi_pool = None
+        if abort is None:
+            abort = lambda: mpi4py.MPI.COMM_WORLD.Abort(1)  # noqa: E731
+
+        closed = threading.Event()
+        close_failed = threading.Event()
+
+        def _close():
+            try:
+                executor.__exit__(None, None, None)
+            except Exception as e:  # noqa: BLE001 - teardown must not raise
+                logger.error(f"global MPICommExecutor close failed: {e!r}")
+                close_failed.set()
+            finally:
+                closed.set()
+
+        closer = threading.Thread(target=_close,
+                                  name="MpiCommExecutorCloser",
+                                  daemon=True)
+        closer.start()
+        if not closed.wait(grace):
+            logger.critical(
+                f"global MPICommExecutor did not close within {grace}s; "
+                "calling MPI_Abort to free stuck ranks...")
+            abort()
+        elif close_failed.is_set():
+            # A raised __exit__ means the executor did not cleanly release, so
+            # peers can stay blocked in the task loop; the global refs are
+            # already cleared, so nothing else will close them. Escalate the
+            # same way a timeout does.
+            logger.critical(
+                "global MPICommExecutor close raised; calling MPI_Abort to "
+                "free stuck ranks...")
+            abort()
 
     def mpi_async_error_callback(self, future):
         """Forward a worker exception to the client for async tasks.

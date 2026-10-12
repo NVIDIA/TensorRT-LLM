@@ -65,6 +65,11 @@ def sanity_check():
             '`scripts/build_wheel.py` first (CMake FetchContent stages it under '
             '3rdparty/fmha_sm100), or use TRTLLM_USE_PRECOMPILED to extract it '
             'from a published wheel.')
+    if not (tensorrt_llm_path / "grpc" / "openengine" / "_generated" /
+            "openengine_pb2.py").is_file():
+        raise ImportError(
+            'The checked-in private OpenEngine bindings are missing. Please check the package integrity.'
+        )
 
 
 def get_version():
@@ -147,14 +152,10 @@ required_deps, extra_URLs = parse_requirements(
 devel_deps, _ = parse_requirements(
     Path("requirements-dev-windows.txt"
          if on_windows else "requirements-dev.txt"))
-openengine_deps, _ = parse_requirements(Path("requirements-openengine.txt"))
 mx_deps = ["modelexpress>=0.5.1,<0.6.0"]
-# Gateway protocol adapters are opt-in extras: the default installation must
-# not carry any gateway protobuf package. Each gateway owns a dedicated
-# requirements-<gateway>.txt as the single source of truth for its pins; CI
-# stages that exercise a gateway install that file explicitly, and the file
-# may carry gateway-specific options (such as an --extra-index-url) without
-# affecting the default dependency graph.
+# OpenEngine's private schema bindings ship in this wheel and use the base
+# grpcio dependency; its empty extra remains an install-compatible feature
+# marker. SMG still consumes its external generated package.
 grpc_smg_deps, _ = parse_requirements(Path("requirements-grpc-smg.txt"))
 constraints_file = Path("constraints.txt")
 if constraints_file.exists():
@@ -195,24 +196,16 @@ else:
         'flash_mla/LICENSE',
         'flash_mla/*.py',
         'flash_mla_cpp_tllm.*.so',
-        'runtime/kv_cache_manager_v2/*.so',
-        'runtime/kv_cache_manager_v2/**/*.so',
-        'runtime/kv_cache_manager_v2/*.pyi',
-        'runtime/kv_cache_manager_v2/**/*.pyi',
-        'runtime/kv_cache_manager_v2/rawref/*.py',
-        'runtime/kv_cache_manager_v2/rawref/*.pyi',
-        'runtime/*__mypyc*.so',
     ]
 
 package_data += [
     'bindings/*.pyi',
     'bindings/**/*.pyi',
     'evaluate/lm_eval_tasks/**/*',
-    "_torch/auto_deploy/config/*.yaml",
-    # Include CUDA source for fused MoE align extension so runtime JIT can find it in wheels
-    '_torch/auto_deploy/custom_ops/fused_moe/moe_align_kernel.cu',
-    '_torch/auto_deploy/custom_ops/fused_moe/triton_fused_moe_configs/*',
     'usage/schemas/*.json',
+    'grpc/openengine/_generated/*.pyi',
+    'grpc/openengine/proto/manifest.json',
+    'grpc/openengine/proto/openengine/v1/*.proto',
 ]
 
 
@@ -241,13 +234,17 @@ def download_precompiled(workspace: str, version: str) -> str:
 def should_skip_precompiled_package_data(filename: str) -> bool:
     """Return True for source-owned package data kept from local checkout.
 
-    Precompiled wheels own native bits. Source owns telemetry schema JSON.
-    Skip those wheel files so Python-only schema edits layer over old wheels.
+    Precompiled wheels own native bits. Source owns telemetry schemas and the
+    OpenEngine contract. Skip those wheel files so Python-only edits layer over
+    old wheels and tracked bindings from the current checkout remain authoritative.
     """
     filename = filename.replace("\\", "/")
-    source_owned_package_data_prefixes = ("tensorrt_llm/usage/schemas/", )
-    return filename.endswith(".json") and filename.startswith(
-        source_owned_package_data_prefixes)
+    if filename.startswith("tensorrt_llm/usage/schemas/"):
+        return filename.endswith(".json")
+    return filename.startswith((
+        "tensorrt_llm/grpc/openengine/_generated/",
+        "tensorrt_llm/grpc/openengine/proto/",
+    ))
 
 
 def warn_on_build_skew(precompiled_location: str) -> None:
@@ -568,15 +565,11 @@ def extract_from_precompiled(precompiled_location: str, package_data: list[str],
             # (deep_gemm, deep_ep, flash_mla Python files are generated during build)
             if file.filename.endswith(".py"):
                 allowed_dirs = (
-                    "tensorrt_llm/deep_gemm/", "tensorrt_llm/deep_ep/",
+                    "tensorrt_llm/deep_gemm/",
+                    "tensorrt_llm/deep_ep/",
                     "tensorrt_llm/flash_mla/",
-                    "tensorrt_llm/runtime/kv_cache_manager_v2/rawref/__init__.py"
                 )
                 if not any(file.filename.startswith(d) for d in allowed_dirs):
-                    # Exclude all .py files in kv_cache_manager_v2 except rawref/__init__.py
-                    if file.filename.startswith("tensorrt_llm/runtime/kv_cache_manager_v2/") and \
-                       not file.filename.endswith("rawref/__init__.py"):
-                        continue
                     continue
 
             for filename_pattern in package_data:
@@ -610,37 +603,8 @@ sanity_check()
 with open("README.md", "r", encoding="utf-8") as fh:
     long_description = fh.read()
 
-    # We use find_packages with a custom exclude filter to handle the mypyc compiled modules.
-    # We want to exclude the .py source files for modules that are compiled to .so.
-    # We exclude the kv_cache_manager_v2 package entirely from the source list,
-    # but explicitly add back the rawref subpackage (which is not compiled by mypyc).
-    # The .so and .pyi files for kv_cache_manager_v2 are added via package_data.
-enable_mypyc = os.getenv("TRTLLM_ENABLE_MYPYC", "0") == "1"
-if enable_mypyc:
-    packages = find_packages(exclude=[
-        "tensorrt_llm.runtime.kv_cache_manager_v2",
-        "tensorrt_llm.runtime.kv_cache_manager_v2.*",
-    ]) + ["tensorrt_llm.runtime.kv_cache_manager_v2.rawref"]
-    exclude_package_data = {
-        "tensorrt_llm": [
-            "runtime/kv_cache_manager_v2/*.py",
-            "runtime/kv_cache_manager_v2/**/*.py"
-        ],
-        "tensorrt_llm.runtime.kv_cache_manager_v2": ["*.py", "**/*.py"],
-    }
-else:
-    packages = find_packages()
-    exclude_package_data = {}
-
-    # Remove mypyc shared objects from package_data to avoid packaging stale files
-    package_data = [
-        p for p in package_data if p not in [
-            'runtime/kv_cache_manager_v2/*.so',
-            'runtime/kv_cache_manager_v2/**/*.so', 'runtime/*__mypyc*.so'
-        ]
-    ]
-    # Ensure rawref is included
-    package_data.append('runtime/kv_cache_manager_v2/rawref/*.so')
+packages = find_packages()
+exclude_package_data = {}
 
 # Add vendored triton_kernels as an explicit top-level package.
 # This is vendored from the Triton project and kept at repo root so its
@@ -747,7 +711,7 @@ setup(
     scripts=['tensorrt_llm/llmapi/trtllm-llmapi-launch'],
     extras_require={
         "devel": devel_deps + grpc_smg_deps,
-        "openengine": openengine_deps,
+        "openengine": [],
         "mx": mx_deps,
         "grpc-smg": grpc_smg_deps,
     },

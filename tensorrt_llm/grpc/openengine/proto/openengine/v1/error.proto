@@ -1,0 +1,31 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+// Terminal errors for accepted streaming requests.
+
+syntax = "proto3";
+
+package openengine.v1;
+
+// Accepted failures emit one terminal EngineError and close with OK.
+// Validation and transport failures use non-OK gRPC status instead.
+message EngineError {
+  ErrorCode code = 1;
+  string message = 2;
+  bool retryable = 3; // Retry may succeed without changing the request.
+}
+
+enum ErrorCode {
+  ERROR_CODE_UNSPECIFIED = 0;
+  ERROR_CODE_INVALID_ARGUMENT = 1;
+  ERROR_CODE_UNSUPPORTED_FEATURE = 2;
+  ERROR_CODE_ROLE_MISMATCH = 3;
+  ERROR_CODE_MODEL_NOT_FOUND = 4;
+  ERROR_CODE_OVERLOADED = 5;
+  ERROR_CODE_REQUEST_NOT_FOUND = 6;
+  ERROR_CODE_DUPLICATE_REQUEST = 7;
+  ERROR_CODE_KV_SESSION_NOT_FOUND = 8;
+  ERROR_CODE_KV_TRANSFER_FAILED = 9;
+  ERROR_CODE_CANCELLED = 10;
+  ERROR_CODE_INTERNAL = 11;
+}

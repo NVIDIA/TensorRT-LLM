@@ -95,7 +95,7 @@ async def create_coder_resources(args):
         client, args.model, getattr(args, "kv_cache_hint_agent", False)
     )
 
-    mcp_url = getattr(args, "mcp_url", "http://0.0.0.0:8083/sse")
+    mcp_url = getattr(args, "mcp_url", "http://127.0.0.1:8083/mcp")
     max_conns = getattr(args, "coder_max_connections", 200)
     mcp_worker = ApiaryMCPWorker(mcp_url, max_connections=max_conns)
 

@@ -41,7 +41,7 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Tupl
 
 import torch
 
-from tensorrt_llm._utils import mpi_allgather, mpi_broadcast, mpi_rank
+from tensorrt_llm._utils import mpi_allgather, mpi_broadcast, mpi_comm, mpi_rank, mpi_world_size
 from tensorrt_llm.bindings import LlmRequestState
 from tensorrt_llm.bindings.internal.batch_manager import (
     KvCacheConnectorManager as KvCacheConnectorManagerCpp,
@@ -52,6 +52,7 @@ from tensorrt_llm.logger import logger
 
 from ..llm_request import get_draft_token_length
 from ..scheduler import ScheduledRequests
+from .prefix_load_completion import PrefixLoadCompletionTracker
 
 if TYPE_CHECKING:
     from ..resource_manager import KVCacheManager
@@ -112,6 +113,26 @@ class SchedulerOutput:
     # Requests being scheduled, that have already shown up in `new_requests`.
     cached_requests: List[RequestData] = field(default_factory=list)
 
+    # Confirmed transfers, including loads whose requests are parked outside
+    # the compute batch. A reservation ID identifies one destination allocation.
+    prefix_loads: List["PrefixLoad"] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class PrefixReservation:
+    reservation_id: int
+    request_id: int
+    start: int
+    end: int
+    is_async: bool
+
+
+@dataclass(frozen=True)
+class PrefixLoad(PrefixReservation):
+    block_ids_by_layer_group: List[List[int]]
+    tokens: List[int]
+    cache_salt: Optional[str]
+
 
 def _flat_form_unavailable(flat: str, grouped: str) -> Callable:
     """A stand-in for ``flat`` that names the form this connector implements."""
@@ -166,6 +187,21 @@ class KvCacheConnectorWorker(ABC):
             KvCacheConnectorWorker,
             {"register_kv_caches": "register_kv_cache_layout"},
         )
+
+    @property
+    def capacity_only(self) -> bool:
+        """Whether this worker contributes resources but transfers no KV.
+
+        Several executor guards exist to protect the page addresses a
+        connector registers: the capacity scheduler is restricted, cache tiers
+        below GPU are refused, and per-layer hooks are installed. A worker that
+        registers nothing needs none of them, so overriding this leaves its
+        engine alone. It still participates in construction and shutdown.
+
+        Must answer the same on every rank. The ranks are gathered at startup
+        and a deployment whose ranks disagree is rejected there.
+        """
+        return False
 
     def bind_connector_meta(self, metadata: object):
         self._metadata = metadata
@@ -292,6 +328,23 @@ class KvCacheConnectorWorker(ABC):
         longer than others to complete the operations.
         """
 
+    def get_finished_prefix_loads(self) -> List[int]:
+        """Return reservation IDs whose confirmed writes have finished locally.
+
+        Implement together with the scheduler's reservation methods. Report
+        both synchronous and asynchronous loads, using the IDs received through
+        ``SchedulerOutput.prefix_loads``. Do not wait for other workers. The
+        runtime retains allocations until an ordered retirement decision arrives.
+        """
+        return []
+
+    def shutdown(self) -> None:
+        """Release whatever this worker holds, once the executor is done with it.
+
+        Called once, after the executor's worker thread has joined, so no
+        transfer can start afterwards. Implementations must be idempotent.
+        """
+
 
 class KvCacheConnectorScheduler(ABC):
     def __init__(self, llm_args: TorchLlmArgs):
@@ -338,6 +391,29 @@ class KvCacheConnectorScheduler(ABC):
             Whether the tokens will be loaded asynchronously.
         """
 
+    def reserve_prefix(
+        self, request: LlmRequest, num_computed_tokens: int, reservation_id: int
+    ) -> Tuple[int, bool]:
+        """Protect an additional prefix without starting a transfer.
+
+        The returned count defines ``[num_computed_tokens, start + count)``.
+        Keep that content immutable and available until its exact range is
+        released. Loads start only from confirmed ``prefix_loads`` metadata;
+        the runtime may release all or part of this promise before admission.
+        """
+        raise NotImplementedError
+
+    def release_prefix_reservation(
+        self, request: LlmRequest, reservation_id: int, start: int, end: int
+    ) -> None:
+        """Release protection for a half-open range of a reservation.
+
+        The range is either unused or complete on every worker. This callback
+        never aborts transmission, and overlapping reservations retain their
+        own protection until each is released.
+        """
+        raise NotImplementedError
+
     @abstractmethod
     def request_finished(self, request: LlmRequest, cache_block_ids: List[int]) -> bool:
         """
@@ -382,6 +458,19 @@ class KvCacheConnectorScheduler(ABC):
                 "indices cannot share one list."
             )
         return self.request_finished(request, cache_block_ids_by_layer_group[0])
+
+    def request_reset(self, request: LlmRequest) -> None:
+        """
+        Called when a request's allocation is released for it to run again.
+
+        Rollback and failed admission take this path, where request_finished
+        ends a request instead. Another request may own the released pages
+        before this one is readmitted, so state the connector recorded in page
+        indices has to be dropped or rebuilt here. Defaults to a no-op.
+
+        Args:
+            request: The request whose allocation was released.
+        """
 
     @abstractmethod
     def update_state_after_alloc(self, request: LlmRequest, block_ids: List[int]):
@@ -658,6 +747,11 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
 
         self.worker = worker
         self.scheduler = scheduler
+        #: Whether the attached connector moves KV at all; see
+        #: `KvCacheConnectorWorker.capacity_only`. Compared against True
+        #: because this disables most of the per-request path, which is too
+        #: much to infer from a merely truthy value.
+        self.capacity_only = worker.capacity_only is True
 
         # Requests that haven't yet been passed into get_finished.
         self.new_async_requests = AsyncRequests(dict(), dict())
@@ -673,6 +767,20 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
 
         self._scheduler_output = None
         self.scheduler_output_manager = KvCacheConnectorSchedulerOutputManager()
+        self.prefix_reservations_enabled = False
+        self._prefix_capability = None
+        self._next_prefix_reservation_id = 1
+        self._prefix_reservations: Dict[int, PrefixReservation] = {}
+        self._prefix_requests: Dict[int, LlmRequest] = {}
+        self._prefix_loads: Dict[int, PrefixLoad] = {}
+        self._prefix_load_requests: Dict[int, LlmRequest] = {}
+        self._bound_scheduler_output: Optional[SchedulerOutput] = None
+        self._bound_prefix_load_ids: Set[int] = set()
+        self._dispatched_prefix_load_ids: Set[int] = set()
+        self._local_finished_prefix_load_ids: Set[int] = set()
+        self._prefix_completion_tracker: PrefixLoadCompletionTracker | None = None
+        self._deferred_load_terminations: Dict[int, LlmRequest] = {}
+        self._finished_load_terminations: List[LlmRequest] = []
 
     def _run_on_leader(self, f: Callable[[], Any]) -> Any:
         """
@@ -685,10 +793,249 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
             res = None
         return mpi_broadcast(res, root=0)
 
+    def configure_prefix_reservations(self, enabled: bool) -> None:
+        """Enable reservations when both connector roles implement the protocol.
+
+        A capacity-only role has no prefix to reserve, and leaving the protocol
+        off is what keeps ``reserve_prefix`` -- a leader broadcast per context
+        request -- and the per-iteration completion poll out of its path. The
+        capability probe below still runs on every rank: it is collective, and
+        a role that reads it differently would strand the others. The probe
+        carries capacity_only, which must agree for the same reason.
+        """
+        if self._prefix_capability is None:
+            scheduler_methods = self._run_on_leader(
+                lambda: [
+                    getattr(type(self.scheduler), name, None) is not None
+                    and getattr(type(self.scheduler), name)
+                    is not getattr(KvCacheConnectorScheduler, name)
+                    for name in ("reserve_prefix", "release_prefix_reservation")
+                ]
+            )
+            worker_method = getattr(type(self.worker), "get_finished_prefix_loads", None)
+            probe = mpi_allgather(
+                (
+                    worker_method is not None
+                    and worker_method is not KvCacheConnectorWorker.get_finished_prefix_loads,
+                    self.capacity_only,
+                )
+            )
+            worker_capabilities = [reports_prefix_loads for reports_prefix_loads, _ in probe]
+            capacity_only_ranks = [
+                rank for rank, (_, capacity_only) in enumerate(probe) if capacity_only
+            ]
+            if capacity_only_ranks and len(capacity_only_ranks) != len(probe):
+                raise ValueError(
+                    "KV connector capacity_only must be the same on every rank, but "
+                    f"only rank(s) {capacity_only_ranks} of {len(probe)} report it. "
+                    "It gates collectives the other ranks still enter, such as the "
+                    "get_finished allgather, so a split hangs rather than fails. "
+                    "Give every rank of this server the same connector role."
+                )
+            capabilities = scheduler_methods + worker_capabilities
+            if any(capabilities) and not all(capabilities):
+                raise ValueError(
+                    "KV connector prefix reservations require reserve_prefix and "
+                    "release_prefix_reservation on the scheduler and "
+                    "get_finished_prefix_loads on every worker."
+                )
+            self._prefix_capability = all(capabilities)
+        self.prefix_reservations_enabled = (
+            enabled and self._prefix_capability and not self.capacity_only
+        )
+        if self.prefix_reservations_enabled and self._prefix_completion_tracker is None:
+            comm = mpi_comm().Dup() if mpi_world_size() > 1 else None
+            self._prefix_completion_tracker = PrefixLoadCompletionTracker(comm)
+
+    def reserve_prefix(self, request: LlmRequest, local_end: int) -> Optional[PrefixReservation]:
+        """Query once per pending attempt and protect the promised source range."""
+        if not self.prefix_reservations_enabled:
+            return None
+        if local_end < 0:
+            raise ValueError("A prefix reservation cannot start before the prompt")
+        existing = self.get_prefix_reservation(request)
+        if existing is not None:
+            return existing
+        if self.has_pending_load(request):
+            raise RuntimeError("Cannot reserve a prefix while a load owns this allocation")
+        reservation_id = self._next_prefix_reservation_id
+        self._next_prefix_reservation_id += 1
+        count, is_async = self._run_on_leader(
+            lambda: self.scheduler.reserve_prefix(request, local_end, reservation_id)
+        )
+        if not isinstance(count, int) or isinstance(count, bool) or count < 0:
+            raise ValueError("A prefix reservation must return a nonnegative token count")
+        if not isinstance(is_async, bool):
+            raise ValueError("A prefix reservation must return a boolean asynchronous mode")
+        if count == 0:
+            if is_async:
+                raise ValueError("An empty prefix reservation cannot load asynchronously")
+            return None
+        reservation = PrefixReservation(
+            reservation_id, request.request_id, local_end, local_end + count, is_async
+        )
+        self._prefix_reservations[request.request_id] = reservation
+        self._prefix_requests[request.request_id] = request
+        logger.debug(
+            f"KV connector reserved {reservation_id} for request {request.request_id}: "
+            f"[{reservation.start}, {reservation.end}), async={is_async}"
+        )
+        return reservation
+
+    def get_prefix_reservation(self, request: LlmRequest) -> Optional[PrefixReservation]:
+        return self._prefix_reservations.get(request.request_id)
+
+    def _release_prefix_range(
+        self, request: LlmRequest, reservation: PrefixReservation, start: int, end: int
+    ) -> None:
+        if start < end and self.scheduler is not None:
+            self.scheduler.release_prefix_reservation(
+                request, reservation.reservation_id, start, end
+            )
+
+    def trim_prefix_reservation(
+        self, request: LlmRequest, start: int, end: int
+    ) -> Optional[PrefixReservation]:
+        """Keep only the requested subrange and release both discarded ends."""
+        reservation = self.get_prefix_reservation(request)
+        if reservation is None:
+            return None
+        if not reservation.start <= start <= end <= reservation.end:
+            raise ValueError("The accepted prefix must be inside its reservation")
+        self._release_prefix_range(request, reservation, reservation.start, start)
+        self._release_prefix_range(request, reservation, end, reservation.end)
+        if start == end:
+            self._prefix_reservations.pop(request.request_id)
+            self._prefix_requests.pop(request.request_id)
+            return None
+        trimmed = PrefixReservation(
+            reservation.reservation_id, reservation.request_id, start, end, reservation.is_async
+        )
+        self._prefix_reservations[request.request_id] = trimmed
+        return trimmed
+
+    def release_prefix_reservation(self, request: LlmRequest) -> None:
+        """Release an unaccepted promise without affecting a confirmed transfer."""
+        reservation = self._prefix_reservations.get(request.request_id)
+        if reservation is not None:
+            self._release_prefix_range(request, reservation, reservation.start, reservation.end)
+            self._prefix_reservations.pop(request.request_id)
+            self._prefix_requests.pop(request.request_id)
+
+    def pending_prefix_requests(self) -> List[LlmRequest]:
+        return list(self._prefix_requests.values())
+
+    def accept_prefix_load(
+        self,
+        request: LlmRequest,
+        start: int,
+        end: int,
+        block_ids_by_layer_group: List[List[int]],
+    ) -> None:
+        """Confirm a transfer against an allocation that survives until completion."""
+        reservation = self.trim_prefix_reservation(request, start, end)
+        if reservation is None:
+            return
+        load = PrefixLoad(
+            reservation.reservation_id,
+            reservation.request_id,
+            reservation.start,
+            reservation.end,
+            reservation.is_async,
+            [list(indices) for indices in block_ids_by_layer_group],
+            list(request.get_tokens(0)),
+            request.cache_salt,
+        )
+        self._prefix_loads[load.reservation_id] = load
+        self._prefix_load_requests[request.request_id] = request
+        self._prefix_completion_tracker.track(load.reservation_id)
+        logger.debug(
+            f"KV connector accepted load {load.reservation_id} for request {request.request_id}: "
+            f"[{start}, {end})"
+        )
+        self._prefix_reservations.pop(request.request_id)
+        self._prefix_requests.pop(request.request_id)
+        if not load.is_async:
+            self.commit_new_matched_tokens(request, end - start, False)
+        else:
+            request.py_num_connector_matched_tokens = end - start
+
+    def mark_prefix_loads_dispatched(self) -> None:
+        """Retain destination ownership before the worker can enqueue a write."""
+        self._dispatched_prefix_load_ids.update(self._bound_prefix_load_ids)
+        self._bound_prefix_load_ids.clear()
+        self._bound_scheduler_output = None
+
+    def has_pending_load(self, request: LlmRequest) -> bool:
+        request_id = request.request_id
+        return (
+            request_id in self._prefix_load_requests
+            or request_id in self.new_async_requests.loading
+            or request_id in self.pending_async_requests.loading
+            or request_id in self.local_finished_async_requests.loading
+        )
+
+    def has_pending_loads(self) -> bool:
+        return bool(
+            self._prefix_load_requests
+            or self._finished_load_terminations
+            or self.new_async_requests.loading
+            or self.pending_async_requests.loading
+            or self.local_finished_async_requests.loading
+        )
+
+    def release_unstarted_prefix_loads(self, request: LlmRequest) -> None:
+        """Abandon accepted work only while no worker has been authorized to write."""
+        for reservation_id, load in list(self._prefix_loads.items()):
+            if (
+                load.request_id != request.request_id
+                or reservation_id in self._dispatched_prefix_load_ids
+            ):
+                continue
+            self._release_prefix_range(request, load, load.start, load.end)
+            del self._prefix_loads[reservation_id]
+            self._prefix_completion_tracker.forget(reservation_id)
+            self._prefix_load_requests.pop(request.request_id)
+            self._bound_prefix_load_ids.discard(reservation_id)
+            self.scheduler_output_manager.external_loads.pop(request.request_id, None)
+            for output in (self._scheduler_output, self._bound_scheduler_output):
+                if output is None:
+                    continue
+                output.prefix_loads = [
+                    item for item in output.prefix_loads if item.reservation_id != reservation_id
+                ]
+                output.new_requests = [
+                    item for item in output.new_requests if item.request_id != request.request_id
+                ]
+                output.cached_requests = [
+                    item for item in output.cached_requests if item.request_id != request.request_id
+                ]
+            if self._bound_scheduler_output is not None:
+                metadata = self._run_on_leader(
+                    lambda: self.scheduler.build_connector_meta(self._bound_scheduler_output)
+                )
+                self.worker.bind_connector_meta(metadata)
+
+    def defer_load_termination(self, request: LlmRequest) -> bool:
+        """Remember termination while a load still owns the request's pages."""
+        if not self.has_pending_load(request):
+            return False
+        if request.request_id not in self._deferred_load_terminations:
+            logger.debug(
+                f"KV connector draining load before terminating request {request.request_id}"
+            )
+        self._deferred_load_terminations[request.request_id] = request
+        return True
+
+    def take_finished_load_terminations(self) -> List[LlmRequest]:
+        finished = self._finished_load_terminations
+        self._finished_load_terminations = []
+        return finished
+
     def query_num_new_matched_tokens(
         self, request: LlmRequest, num_computed_tokens: int
     ) -> Tuple[int, bool]:
-        """Ask the connector how much of the prompt it can serve. No side effects.
+        """Query the legacy connector without committing runtime load bookkeeping.
 
         The connector ABC promises one query per allocation, so a caller must
         reach this at most once per request per allocation whatever it does with
@@ -703,6 +1050,12 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         ``KVCacheManagerV2`` holds the Python subclass where it is a method, so
         no single spelling of the check reads correctly in both.
         """
+        if self.capacity_only:
+            # No page of this cache is registered, so nothing can be loaded
+            # into it, and the query would cost the leader broadcast below on
+            # every request.
+            return 0, False
+
         num_tokens, load_kv_async = self._run_on_leader(
             lambda: self.scheduler.get_num_new_matched_tokens(request, num_computed_tokens)
         )
@@ -737,6 +1090,12 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         ``cancel_load``, and a parked request carries no honoured count into
         ``build_connector_meta``.
         """
+        if self.capacity_only:
+            # Only `build_scheduler_output` consumes `external_loads`, and this
+            # role skips it, so an entry recorded here would be carried until
+            # the allocation dies.
+            return
+
         # TODO(jthomson04): This part is a bit ugly.
         # When the connector indicates that a request will be loaded
         # asynchronously, we need to suspend its execution. This is
@@ -764,6 +1123,14 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         ``LlmRequest`` rather than the ``_torch`` subclass, so only what
         ``nanobind/batch_manager/bindings.cpp`` binds is readable below.
         """
+        if self.capacity_only:
+            # Checked ahead of the generation-only refusal, which every request
+            # on the disaggregated generation server this role is for would
+            # trip. The refusal is about a connector having no story for prompt
+            # KV that came from the context worker; one that serves nothing has
+            # nothing to refuse.
+            return 0
+
         if request.is_generation_only_request:
             raise RuntimeError("Connector API is not supported for generation-only requests!")
 
@@ -847,15 +1214,16 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         )
 
     def reset_request_state(self, request: LlmRequest) -> None:
-        """Tell the connector bookkeeping that this request's allocation died.
-
-        Only a cache that can destructively pause and replay a live request
-        needs this; under ``GUARANTEED_NO_EVICT`` an allocation dies only when
-        the request finishes. ``KVCacheV2Scheduler`` coerces the policy to
-        ``MAX_UTILIZATION`` whatever was configured, so everything keyed to the
-        old allocation has to go with it.
-        """
+        """Retire bookkeeping only after the allocation's writes have completed."""
+        if self.has_pending_load(request):
+            raise RuntimeError("Cannot reset connector state while a load owns the allocation")
+        self.release_prefix_reservation(request)
         self.scheduler_output_manager.reset_request(request.request_id)
+        self.finished_async_loading_requests.pop(request.request_id, None)
+        self._deferred_load_terminations.pop(request.request_id, None)
+        # The connector's own per-request state is keyed to the allocation too.
+        if self.scheduler is not None:
+            self.scheduler.request_reset(request)
 
     def should_add_sequence(self, request: LlmRequest) -> bool:
         req_id = request.request_id
@@ -864,14 +1232,36 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
     def build_scheduler_output(
         self, scheduled_batch: ScheduledRequests, kv_cache_manager: "KVCacheManager"
     ):
-        self._scheduler_output = self.scheduler_output_manager.build_scheduler_output(
-            scheduled_batch, self.new_async_requests, kv_cache_manager
+        if self.capacity_only:
+            # The output would describe no loads and no saves, and both KV
+            # cache managers build one per iteration from `prepare_resources`,
+            # which on a generation server is inter-token latency.
+            # `handle_metadata` returns early when none was built.
+            return
+        async_requests = AsyncRequests(
+            {},
+            {
+                **self.new_async_requests.loading,
+                **{
+                    load.request_id: self._prefix_load_requests[load.request_id]
+                    for load in self._prefix_loads.values()
+                    if load.is_async
+                },
+            },
         )
+        self._scheduler_output = self.scheduler_output_manager.build_scheduler_output(
+            scheduled_batch, async_requests, kv_cache_manager
+        )
+        self._scheduler_output.prefix_loads = [
+            load
+            for reservation_id, load in self._prefix_loads.items()
+            if reservation_id not in self._dispatched_prefix_load_ids
+        ]
 
     def take_scheduled_requests_pending_load(self, scheduled_requests: ScheduledRequests):
         """
         Remove context requests from our list of scheduled requests that are being loaded asynchronously.
-        This is done to prevent the runtime from attempting to load the KV cache for these requests.
+        Their destination pages remain owned while computation waits for completion.
 
         Args:
             scheduled_requests: The scheduled requests.
@@ -879,18 +1269,29 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         Returns:
             The scheduled requests with the context requests that are being loaded asynchronously removed.
         """
+        if self.capacity_only:
+            # Nothing is offered asynchronously, so both lists below would be
+            # rebuilt unchanged once per iteration.
+            return
 
+        prefix_loading_ids = {
+            load.request_id for load in self._prefix_loads.values() if load.is_async
+        }
         for key in ["context_requests_chunking", "context_requests_last_chunk"]:
             allowed_context_requests = []
             for req in getattr(scheduled_requests, key):
                 # If this request is being loaded asynchronously, in
                 # addition to removing it from the list of scheduled
                 # requests, we also need to update its state.
-                if req.request_id in self.new_async_requests.loading.keys():
+                prefix_loading = req.request_id in prefix_loading_ids
+                if req.request_id in self.new_async_requests.loading or prefix_loading:
                     req.state = LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
 
                     # Replace the request with the canonical request.
-                    self.new_async_requests.loading[req.request_id] = req
+                    if prefix_loading:
+                        self._prefix_load_requests[req.request_id] = req
+                    else:
+                        self.new_async_requests.loading[req.request_id] = req
                 else:
                     allowed_context_requests.append(req)
             setattr(scheduled_requests, key, allowed_context_requests)
@@ -903,6 +1304,10 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
             lambda: self.scheduler.build_connector_meta(self._scheduler_output)
         )
 
+        self._bound_prefix_load_ids.update(
+            load.reservation_id for load in self._scheduler_output.prefix_loads
+        )
+        self._bound_scheduler_output = self._scheduler_output
         self._scheduler_output = None
 
         self.worker.bind_connector_meta(metadata)
@@ -931,6 +1336,10 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         if req.request_id in self.finished_async_loading_requests:
             del self.finished_async_loading_requests[req.request_id]
 
+        if self.capacity_only:
+            # Nothing is registered for a save to read.
+            return False
+
         # A caller with no per-group view of the cache leaves this unset, and the
         # flat list is the whole description. Every per-group caller passes one
         # list per layer group, empty lists included, so a request whose cache
@@ -955,6 +1364,25 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
 
         return saving_async
 
+    def has_outstanding_save(self, request_id: int) -> bool:
+        """Whether a save this manager accepted for `request_id` is still open.
+
+        True from the `request_finished` that accepted the save until the
+        `get_finished` in which every rank reports it complete. A request must
+        be offered at most once over that span: `AsyncTransferManager` counts
+        transfer claims, so a second accepted offer would leave two claims
+        against the single completion that arrives and the request would never
+        terminate.
+        """
+        return any(
+            request_id in requests.saving
+            for requests in (
+                self.new_async_requests,
+                self.pending_async_requests,
+                self.local_finished_async_requests,
+            )
+        )
+
     def get_finished(self) -> List[LlmRequest]:
         """
         Process requests that have finished loading and saving.
@@ -962,6 +1390,12 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         Returns:
             The requests that have newly finished saving.
         """
+        if self.capacity_only:
+            # Every list below is empty, and the ranks agree on them through an
+            # allgather that runs once per iteration -- inter-token latency on
+            # the generation server this role is for.
+            return []
+
         started_loading_req_ids = list(self.new_async_requests.loading_ids)
         finished_gen_req_ids = list(self.new_async_requests.saving_ids)
 
@@ -977,7 +1411,8 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
 
         # Remove the requests from our pending list that have finished locally.
         new_local_finished_async_requests = self.pending_async_requests.extract_by_id(
-            finished_saving, finished_loading
+            set(finished_saving) & self.pending_async_requests.saving_ids,
+            set(finished_loading) & self.pending_async_requests.loading_ids,
         )
 
         # Add these requests to our list of locally finished requests.
@@ -999,13 +1434,59 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         )
 
         # For requests that have finished loading, move them back to the context state.
-        for id, req in all_finished.loading.items():
-            req.state = LlmRequestState.CONTEXT_INIT
-            self.finished_async_loading_requests[id] = req
+        for req in all_finished.loading.values():
+            self._finish_load(req, is_async=True)
+
+        if self.prefix_reservations_enabled:
+            finished = (
+                set(self.worker.get_finished_prefix_loads())
+                & self._dispatched_prefix_load_ids - self._local_finished_prefix_load_ids
+            )
+            self._local_finished_prefix_load_ids.update(finished)
+            self._prefix_completion_tracker.report(finished)
+            self._prefix_completion_tracker.poll()
 
         # Return the requests that have finished saving.
         # The execution loop will call _terminate_request on these requests.
         return list(all_finished.saving.values())
+
+    def take_finished_prefix_loads(self) -> list[int]:
+        """Return leader completion decisions for the next request broadcast."""
+        if not self.prefix_reservations_enabled or self.scheduler is None:
+            return []
+        return self._prefix_completion_tracker.take_completed()
+
+    def finish_prefix_loads(self, reservation_ids: list[int]) -> None:
+        """Apply ordered completion decisions before scheduling on every worker."""
+        for reservation_id in reservation_ids:
+            load = self._prefix_loads.get(reservation_id)
+            if load is None:
+                continue
+            if reservation_id not in self._local_finished_prefix_load_ids:
+                raise RuntimeError(f"Prefix load {reservation_id} has not finished locally")
+            request = self._prefix_load_requests[load.request_id]
+            self._release_prefix_range(request, load, load.start, load.end)
+            del self._prefix_loads[reservation_id]
+            del self._prefix_load_requests[load.request_id]
+            self._dispatched_prefix_load_ids.remove(reservation_id)
+            self._local_finished_prefix_load_ids.remove(reservation_id)
+            self._prefix_completion_tracker.forget(reservation_id)
+            self._finish_load(request, is_async=load.is_async)
+
+    def shutdown(self) -> None:
+        try:
+            self.worker.shutdown()
+        finally:
+            if self._prefix_completion_tracker is not None:
+                self._prefix_completion_tracker.close()
+
+    def _finish_load(self, request: LlmRequest, is_async: bool) -> None:
+        if request.request_id in self._deferred_load_terminations:
+            request = self._deferred_load_terminations.pop(request.request_id)
+            self._finished_load_terminations.append(request)
+        elif is_async:
+            request.state = LlmRequestState.CONTEXT_INIT
+            self.finished_async_loading_requests[request.request_id] = request
 
     def update_state_after_alloc(
         self,
@@ -1013,7 +1494,7 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         block_ids: List[int],
         block_ids_by_layer_group: Optional[List[List[int]]] = None,
     ):
-        if self.scheduler is None:
+        if self.scheduler is None or self.capacity_only:
             return
         # A cache that reports per layer group is reported that way, whatever
         # the group count -- including one empty list per group for a request
@@ -1027,6 +1508,10 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
             self.scheduler.update_state_after_alloc(req, block_ids)
 
     def set_scheduler_output(self, scheduler_output: SchedulerOutput):
+        if self._scheduler_output is not None:
+            loads = {load.reservation_id: load for load in self._scheduler_output.prefix_loads}
+            loads.update({load.reservation_id: load for load in scheduler_output.prefix_loads})
+            scheduler_output.prefix_loads = list(loads.values())
         self._scheduler_output = scheduler_output
 
     def layer_pre_hook(self, module, *args):

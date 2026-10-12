@@ -28,7 +28,7 @@ namespace kernels::kimiK3AttnRes
 
 //! Parameters for the fused Kimi K3 attention-residual forward kernel
 //! (warp-specialised online softmax + residual selection + RMSNorm,
-//! Blackwell sm_100/sm_103 only).
+//! sm_100 family only: sm_100/sm_103/sm_107).
 //!
 //! Contract (checked at the Torch-op bridge): B == 1, N in [1, 12],
 //! T in [1, 16384], H a multiple of 1024 in [4096, 8192]; all residual

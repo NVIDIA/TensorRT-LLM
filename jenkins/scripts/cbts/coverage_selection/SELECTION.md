@@ -17,7 +17,9 @@ Tier 2  coverage   residual is all core Python and all present in the DB → sco
         full fallback                                                     scope=null
 ```
 
-Tier 2 only ever looks at the **residual**: the files no Tier 1 rule claimed.
+Tier 2 only ever looks at the **residual**: the files no Tier 1 rule claimed. The Git
+compatibility gate uses that same residual. Conflicts in files already claimed by Tier 1, such as
+`waives.txt`, do not disable Tier 2.
 
 ## 2. The qualname concepts
 
@@ -157,20 +159,44 @@ stages finish, it uploads `cbts_pystart_report_x86_64.tar.gz` and
 ### 8.1 Resolution
 
 ```
+run Tier 1                                      → Tier-2 residual paths
 GitHub compare main...<PR head>                 → PR base commit
-Jenkins REST lastBuild                          → newest build number N
-for b in N .. N-49:                              (_MAX_PROBE)
-   ranged GET both architecture tarballs        → skip b unless both exist
-   GET build_info.txt, parse `commit=`           → sha; skip when absent
-   compare <sha>...<PR base>                     → retain ancestors and exact matches
-   retain distance to the PR base
-rank by (distance ascending, build descending)
+GET Artifactory pin at <PR number>/<PR head>:
+   200                                           → reuse its coverage build
+   404                                           → resolve the newest build below
+   other / malformed                             → decline Tier 2
+when no pin:
+   Jenkins REST lastBuild                        → newest build number N
+   for b in N .. N-49:                            (_MAX_PROBE)
+      ranged GET both architecture tarballs      → skip b unless both exist
+      GET build_info.txt, parse `commit=`         → sha; skip when absent
+      first complete pair with a known sha        → latest coverage DB
+   Python writes the build/commit pin locally
+   Jenkins uploads that file                      → stable for this PR head
+compare <sha>...<PR base>                        → record topology and absolute distance
+fetch PR head locally; fetch base and selected DB from the normal CI Git mirror
+create a squashed PR commit with `commit-tree`, parented at the PR base
+cherry-pick it onto the DB revision
+   no unmerged residual path                       → continue
+   residual conflict / unavailable revision       → decline Tier 2
 ```
 
-Requiring the pair prevents the selector from narrowing only one CPU architecture. Ranking is by
-**revision, not build number**: a post-merge build can be a re-run of an older commit, so the
-highest build number is not necessarily the closest safe revision. Build number only breaks ties.
-An exact PR-base match is allowed and wins with distance zero.
+The pin lives under
+`LLM/main/cbts/coverage-db-pins/v1/<PR number>/<PR head>/cbts_db_pin.json`. A new PR head has no
+pin and therefore receives the freshest complete pair available at its first CBTS run. Repeated
+`/bot run` commands for the same head reuse that build even after newer post-merge DBs appear.
+`artifact.py --resolve-pin` owns pin lookup, schema validation, build selection, local pin
+creation, and fail-closed reasons. Groovy only supplies PR identity and uses Jenkins'
+authenticated artifact uploader when Python reports `pin_upload_required`. Lookup, validation,
+and first-write upload fail closed; CBTS never silently substitutes a newer build when a pin
+cannot be read or written. Preparation also verifies that the pinned build's `build_info.txt`
+still names the commit recorded in the pin, so an overwritten or corrupted build cannot silently
+change a repeated run.
+
+Requiring the architecture pair prevents the selector from narrowing only one CPU architecture.
+For an unpinned head, builds are probed newest first and the first complete pair with commit
+metadata is the only DB considered. The selector does not substitute an older DB merely because
+it is closer to the PR base or because the selected DB conflicts with the PR diff.
 
 ### 8.2 Measuring the lag (reporting)
 
@@ -182,10 +208,13 @@ Since every candidate revision is a commit that already merged to `main`, it can
 *behind* the tip: `behind_by` stays 0 and the lag is non-negative. A non-zero `behind_by` would
 mean the revision is no longer on `main` at all (history rewritten).
 
-There is no local-git path. The CI checkout is `depth: 1, noTags: true` with a single-SHA refspec
-(`trtllm_utils.checkoutSpec`), so no candidate revision is ever in the object store; a git
-measurement would also answer against whatever ref it was given, and a merely stale ref returns a
-*smaller* number rather than an error.
+There is no local-git path for measuring lag. The CI checkout is `depth: 1, noTags: true` with a
+single-SHA refspec (`trtllm_utils.checkoutSpec`), so the coverage revision is not available there.
+The conflict check creates a temporary repository and fetches the checked-out PR head locally.
+The base and DB revisions come from the authoritative public
+`https://github.com/NVIDIA/TensorRT-LLM.git` repository. This avoids depending on the replication
+delay or commit availability of the internal checkout mirror. The temporary repository never
+changes the CI checkout or its index.
 
 The compare API answers unless the revision has not reached the public mirror yet (404) or the
 token is missing (403 — the 60/h anonymous quota is shared across NVIDIA's egress IP and is
@@ -193,38 +222,42 @@ routinely already spent). An unmeasurable candidate-to-base relation is rejected
 candidate's main-tip lag may remain `null`.
 
 The token comes from the `github-cred-trtllm-ci` credential — the one `getGithubMRChangedFile`
-already uses — bound around the `--print-selection` call in `_cbtsCoverageAudit` and read from
+already uses — bound around the artifact selection call in `_cbtsCoverageAudit` and read from
 `GITHUB_API_TOKEN`.
 
-This number reports overall freshness. It is **not** what the gate decides on.
+This number reports overall freshness. It does not select the DB.
 
-### 8.2b Measuring the drift (gating)
+### 8.2b Measuring the drift (reporting)
 
-The PR base is `merge_base_commit.sha` from `main...<PR head>`. Each candidate is compared as
-`<db sha>...<PR base>` and is eligible only when GitHub reports `ahead` (the PR base is ahead of the
-DB) or `identical`. `behind`, `diverged`, and unknown relations are rejected before download, so a
-coverage DB is never newer than the PR base.
+The PR base is `merge_base_commit.sha` from `main...<PR head>`. The selected DB is compared as
+`<db sha>...<PR base>`, and drift is `ahead_by + behind_by`: an absolute distance retained for
+telemetry. `ahead`, `behind`, and `identical` describe valid positions on main; diverged and
+unknown relations decline Tier 2 because the selector cannot establish a shared main history.
 
-For eligible candidates, drift is their plain ancestor distance to the PR base. The closest one
-wins, and `--coverage-max-drift` applies a second fail-closed bound: beyond 30 commits Tier 2
-declines and the PR runs in full.
+`commit-tree` represents the complete base-to-head PR change as one commit, and `cherry-pick`
+tests that commit against the selected DB without serializing through patch format. When the
+cherry-pick reports conflicts, only unmerged paths in the Tier-2 residual count; conflicts in
+Tier-1-owned files are ignored. This check is independent of whether the DB is older than, equal
+to, or newer than the PR base. A residual conflict or an unmeasurable check declines before the
+large DB artifacts are downloaded. If it passes, Tier 2 uses the original forge PR payload.
 
 
 ### 8.3 What happens with the result
 
-`--prepare DIR` does the whole fetch in one call: resolve the PR base, select a complete pair,
-stream both tarballs down, unpack their identically named SQLite files separately, and union them
-with `compact_db.merge_databases`. It writes the selection JSON beside the merged SQLite as
-`cbts_coverage_db.json` and prints `{path, meta}`. Groovy is left with the two things only it can do
-— bind the credential and run `coverage_audit.py` over the result — and any failure anywhere is
-caught and non-fatal: no prepared DB is returned, Tier 2 never runs, and the PR gets a full run.
+After Tier 1 computes the residual, `--resolve-pin FILE` returns a reuse/create/decline plan.
+Groovy uploads `FILE` only for a create plan, before any large download. `--prepare DIR --build
+BUILD --paths-json PATH` then resolves the PR base, validates the pinned pair's residual
+compatibility, streams both tarballs down, unpacks their identically named SQLite files
+separately, and unions them with `compact_db.merge_databases`.
+It writes the selection JSON
+beside the merged SQLite as `cbts_coverage_db.json` and prints `{path, meta}`. Groovy binds the
+credentials, logs the successful compatibility check, and runs `coverage_audit.py` over the result.
+On a residual conflict it returns `{path: null, meta}` so the decline remains observable without
+downloading the DB. Any failure is non-fatal: Tier 2 never runs and the PR gets a full run.
 
-Those two paths reach `main.py` as `--coverage-db` and `--coverage-db-meta`, so a new selection
-field needs no Groovy change. `main.py` records all of it and **gates on the drift**: past
-`--coverage-max-drift` (default 30) the tier declines and the PR runs in full, on the grounds that
-a DB that far from the PR's base no longer describes who touches what in the code under test. A
-drift that could not be measured — including a meta file that is missing or unreadable — is
-treated the same way.
+The metadata path always reaches `main.py`; the DB path is added only when compatibility is clean.
+`main.py` records the drift but does not gate on its size. The residual compatibility check is the
+authority for whether a DB collected before or after the PR base can safely be used.
 
 All of it lands in the decision and in OpenSearch:
 
@@ -232,11 +265,15 @@ All of it lands in the decision and in OpenSearch:
 |---|---|---|
 | `coverage_db_build` | `l_coverage_db_build` | 0 when no DB was consulted |
 | `coverage_db_commit` | `s_coverage_db_commit` | |
-| `coverage_db_lag` | `l_coverage_db_lag` | ranking / overall freshness; `null` / `-1` when unmeasurable |
+| `coverage_db_lag` | `l_coverage_db_lag` | overall freshness only; `null` / `-1` when unmeasurable |
 | `coverage_db_base_commit` | `s_coverage_db_base_commit` | the PR's merge base |
-| `coverage_db_drift` | `l_coverage_db_drift` | **the gated number**; `null` / `-1` when unmeasurable |
-| `coverage_db_drift_status` | `s_coverage_db_drift_status` | `ahead` / `identical` for every selected DB |
-| `coverage_freshness` | `s_coverage_freshness` | `ok` / `stale` / `unknown`, empty when no DB |
+| `coverage_db_drift` | `l_coverage_db_drift` | distance from the PR base; `null` / `-1` when unmeasurable |
+| `coverage_db_drift_status` | `s_coverage_db_drift_status` | `ahead` / `behind` / `identical` for every selected DB |
+| `coverage_freshness` | `s_coverage_freshness` | drift measurement status: `ok` / `unknown`, empty when no DB |
+| `coverage_compatibility` | `s_coverage_compatibility` | `clean` / `conflict` / `unknown` / `not_attempted` |
+| `coverage_decline_reason` | `s_coverage_decline_reason` | human-readable Tier-2 decline detail |
+| `coverage_decline_category` | `s_coverage_decline_category` | aggregation-safe decline category |
+| count of `coverage_residual_files` | `l_coverage_residual_files` | Tier-2 opportunity size |
 
 so the decline rate is queryable per verdict rather than only readable in `s_reason`.
 
@@ -257,6 +294,10 @@ so the decline rate is queryable per verdict rather than only readable in `s_rea
   "coverage_db_base_commit": "9f0da65d...",
   "coverage_db_drift": 7,
   "coverage_db_drift_status": "ahead",
+  "coverage_residual_files": ["tensorrt_llm/example.py"],
+  "coverage_compatibility": "clean",
+  "coverage_decline_reason": "",
+  "coverage_decline_category": "",
   "coverage_no_diff_files": 0,
   "reasons": [{"source": "coverage", "impacted": 118, "untrusted": 104, ...}]
 }

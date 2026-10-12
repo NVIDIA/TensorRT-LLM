@@ -4,11 +4,15 @@ import argparse
 import sys
 from pathlib import Path
 
-from .prompts import build_perf_analyze_prompts
+from agent_flow.agent_runtime import resolve_agent_config
+from agent_flow.prompts import dump_prompt_bundle
+
+from .prompts import PROMPTS_DIRNAME, build_perf_analyze_prompts
 from .sol_methodology import resolve_sol_methodology
 from .state import STATE_FILENAME
 from .task_schema import (
     TaskSchemaError,
+    casebook_enabled,
     has_slurm_environment,
     load_and_validate_task_yaml,
     sol_enabled,
@@ -43,8 +47,10 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=Path("workspace/perf-analyze"),
         help="Workspace directory for shared state files (task.yaml, "
         "benchmark_results.md, sol_projection.md, profile_findings.md, "
-        "performance_report.md/.html, progress.yaml) and run artifacts "
-        "(serve.log, result JSON, *.nsys-rep, *.ncu-rep).",
+        "performance_report.md/.html, progress.yaml, prompts/) and run "
+        "artifacts (serve.log, result JSON, *.nsys-rep, *.ncu-rep). Each "
+        "launch snapshots every role's composed system prompt to "
+        "prompts/<role>.md.",
     )
     parser.add_argument(
         "--clean",
@@ -61,15 +67,19 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> None:
     args = _parse_args(argv)
+    task_path = args.task
+    if not args.clean and (args.workspace / STATE_FILENAME).is_file():
+        task_path = args.workspace / "task.yaml"
     try:
-        task_data = load_and_validate_task_yaml(args.task)
+        task_data = load_and_validate_task_yaml(task_path)
     except TaskSchemaError as exc:
         print(f"error: {exc}", file=sys.stderr)
         sys.exit(2)
     # Resolve the projector's methodology skill once, before the run, so
     # it is told to load a skill this session actually has. Skipped (free)
     # when the stage is off.
-    methodology = resolve_sol_methodology(sol_enabled(task_data))
+    projector_backend = resolve_agent_config(task_data, "projector").backend
+    methodology = resolve_sol_methodology(sol_enabled(task_data), backend_kind=projector_backend)
     note = methodology.console_note()
     if note:
         print(note, file=sys.stderr)
@@ -79,6 +89,7 @@ def main(argv: list[str] | None = None) -> None:
         sol_methodology=methodology.name,
         remote_execution=task_data,
         campaign_name=args.workspace.resolve().name,
+        include_casebook=casebook_enabled(task_data),
     )
     with PerfAnalyzeWorkflow(
         workspace=args.workspace,
@@ -86,6 +97,8 @@ def main(argv: list[str] | None = None) -> None:
         prompts=prompts,
         sol_methodology=methodology,
     ) as workflow:
+        prompt_dir = args.workspace / PROMPTS_DIRNAME
+        dump_prompt_bundle(prompts, prompt_dir)
         workflow.run(args.task)
 
 

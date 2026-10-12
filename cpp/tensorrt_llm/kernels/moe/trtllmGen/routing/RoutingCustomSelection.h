@@ -43,4 +43,18 @@ namespace moe::dev::routing::routingCustom
 bool prefersCoopBlockKernel(RoutingPreprocessType preprocessType, RoutingPostprocessType postprocessType,
     int32_t numTokens, int32_t dispatchedMaxExperts, int32_t minNumExpertsForCoopOverride = -1);
 
+//! Largest tier at which the small-token kernel is preferred for a single token under a per-expert
+//! preprocess (sigmoid, sigmoid + bias); above it that cell keeps the cooperative kernel (the measured
+//! crossover, see prefersSmallTokenKernel() and CoopBlockKernelSingleTokenMinNumExperts in
+//! RoutingCustomPolicy.cuh). Host-visible here so the selection test can pin it.
+static constexpr int SmallTokenKernelSingleTokenPerExpertMaxNumExperts = 256;
+
+//! Whether the small-token kernel (routingIndicesSmallTokenKernel) serves this shape. Evaluated before
+//! prefersCoopBlockKernel() in run(); TLLM_ROUTING_SMALL_TOKEN_FASTPATH=0 disables it (read by the caller).
+//!
+//! \param numTokens number of routing tokens in this launch (<= 8 and <= the tier's warp count).
+//! \param dispatchedMaxExperts compile-time tier from queryDispatchedMaxExperts() (<= 512).
+bool prefersSmallTokenKernel(RoutingPreprocessType preprocessType, RoutingPostprocessType postprocessType,
+    int32_t numTokens, int32_t dispatchedMaxExperts);
+
 } // namespace moe::dev::routing::routingCustom

@@ -382,6 +382,7 @@ void run(Data const& data, void* stream);
 // Production code should always go through run().
 void launchBlockKernel(Data const& data, uint32_t numThreadsHist, void* stream);
 void launchCoopBlockKernel(Data const& data, uint32_t numThreadsHist, void* stream);
+void launchSmallTokenBlockKernel(Data const& data, uint32_t numThreadsHist, void* stream);
 
 } // namespace routingCustom
 

@@ -19,7 +19,7 @@ from typing import Dict
 import pytest
 from prometheus_client import REGISTRY
 
-from tensorrt_llm.metrics.collector import MetricsCollector
+from tensorrt_llm.metrics.collector import MAX_SPEC_DECODE_POSITION_LABELS, MetricsCollector
 from tensorrt_llm.metrics.enums import MetricNames, RequestEventTiming
 from tensorrt_llm.metrics.perf_utils import process_req_perf_metrics
 
@@ -1170,6 +1170,29 @@ class TestPerPositionSpecDecodeMetrics:
     def test_absent_arrays_no_error(self, collector):
         metrics = {MetricsCollector.labelname_finish_reason: "end_id"}
         collector.log_request_metrics_dict(metrics)  # must not raise
+
+    def test_label_cardinality_is_capped(self, collector):
+        """Deep drafting must not create unbounded token_position series.
+
+        The per-request arrays grow with max_draft_len so per-request acceptance
+        is not truncated, but each position is one Prometheus time series per
+        model, so the metrics side caps them independently.
+        """
+        deep = MAX_SPEC_DECODE_POSITION_LABELS + 5
+        metrics = {
+            MetricsCollector.labelname_finish_reason: "end_id",
+            MetricNames.SPEC_DEC_DRAFTED_PER_POS: [1] * deep,
+            MetricNames.SPEC_DEC_ACCEPTED_PER_POS: [1] * deep,
+        }
+        collector.log_request_metrics_dict(metrics)
+        existing_pos = {
+            sample.labels.get("token_position")
+            for metric in REGISTRY.collect()
+            if metric.name == collector.counter_tokens_drafted_per_position._name
+            for sample in metric.samples
+            if sample.name.endswith("_total")
+        }
+        assert existing_pos == {str(p) for p in range(MAX_SPEC_DECODE_POSITION_LABELS)}
 
     def test_no_observation_without_finish_reason(self, collector):
         """No per-position counter updates when finish_reason is missing."""

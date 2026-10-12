@@ -15,8 +15,11 @@
  */
 #pragma once
 
+#include "tensorrt_llm/runtime/mcastGroupComm.h"
+
 #include <cuda.h>
 #include <cuda_runtime.h>
+#include <memory>
 #include <set>
 #include <vector>
 
@@ -61,7 +64,19 @@ bool ipcNvlsSupported();
 //! NCCL_NVLS when this returns false. The (heavy) result is cached.
 bool ipcNvlsFabricUsable();
 
+//! \brief Allocate NVLS multicast memory shared by \p ranks, exchanging the memory handles over
+//! the MPI session communicator. The process must therefore be part of an MPI job.
+//!
+//! Kept as a distinct overload rather than a defaulted argument on the one below: a default
+//! argument lives at the call site, not in the symbol, so folding the two would drop this mangled
+//! name and break prebuilt archives that link against it.
 IpcNvlsHandle* ipcNvlsAllocate(size_t size, std::set<int> ranks);
+
+//! \brief Allocate NVLS multicast memory shared by \p ranks.
+//! \param groupComm Host collective covering exactly \p ranks, used to exchange the memory
+//! handles. Non-MPI orchestrators (Ray) pass a ProcessGroup-backed collective here. Passing null
+//! is equivalent to the overload above.
+IpcNvlsHandle* ipcNvlsAllocate(size_t size, std::set<int> ranks, std::shared_ptr<McastGroupComm> groupComm);
 
 void ipcNvlsFree(IpcNvlsHandle* handle);
 

@@ -413,7 +413,7 @@ class Runner:
     ) -> None:
         super().__init__()
 
-        checkpoint_loader = _construct_checkpoint_loader("pytorch", None, "HF")
+        checkpoint_loader = _construct_checkpoint_loader(None, "HF")
         # Please refer to `tensorrt_llm/_torch/pyexecutor/model_loader.py` for effective args
         llm_args = TorchLlmArgs(
             model=pretrained_model_name_or_path,
@@ -902,8 +902,7 @@ class Runner:
 
         # Please refer to `tensorrt_llm/_torch/pyexecutor/_util.py` for `kv_cache_manager`
         config = model_config.pretrained_config
-        # max_seq_len + 1 because the is_gen path in add_dummy_requests resizes each
-        # request to capacity + 1; without the extra token the last block rounds down.
+        # Reserve one token of headroom before rounding to a block boundary.
         # kv_pool_headroom oversizes max_tokens when the manager splits it across
         # several pools. DeepSeek-V4 needs 3; the default 1 keeps every other model
         # on its previous allocation.

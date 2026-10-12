@@ -84,8 +84,6 @@ the gap.
   HF/vLLM semantics copied into helpers.
 - The diff touches C++/CUDA/header files but validation used a stale wheel,
   or touched CMake without a clean rebuild.
-- The diff touches `auto_deploy/` or `tests/.../auto_deploy/` (out of
-  scope for modeling bring-up).
 - Accuracy gates are configured in `task.yaml` but were not run, or the
   enabled run skipped the LLM API smoke / accuracy canary preceding the
   full benchmark.

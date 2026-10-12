@@ -88,7 +88,7 @@ Valid keys are the input names listed in the [Inputs](#inputs) section. Unrecogn
 | `benchmark_config_yaml` | Path to an existing benchmark config YAML file (perf-sanity fallback) | No (benchmark) | `examples/disaggregated/slurm/benchmark/config.yaml` |
 | `perf_config_yaml` | Path to a pre-built perf-sanity config YAML. Used with pre-built perf-sanity `test_cmd` to pass node/GPU sizing to `trtllm-case-executor`. | No (perf-sanity) | `/work/deepseek_v3_disagg.yaml` |
 | `bench_subcommand` | `trtllm-bench` subcommand: `throughput` or `latency` | No (default: `throughput`) | `latency` |
-| `backend` | Backend for `trtllm-bench`: `pytorch`, `tensorrt`, or `_autodeploy` | No (default: `pytorch`) | `pytorch` |
+| `backend` | Backend for `trtllm-bench`: `pytorch` | No (default: `pytorch`) | `pytorch` |
 | `num_requests` | Synthetic dataset size when `dataset_path` is not provided | No (default: `100`) | `512` |
 | `input_mean` / `output_mean` | Mean input / output token lengths for synthetic dataset | No (defaults: `128` / `128`) | `1024` / `1024` |
 | `concurrency` | `--concurrency` flag for `trtllm-bench` | No | `32` |

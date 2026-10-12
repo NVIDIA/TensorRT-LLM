@@ -28,6 +28,7 @@ import torch
 import zmq
 import zmq.asyncio
 
+from tensorrt_llm._startup import _StartupTimer
 from tensorrt_llm.logger import logger
 
 from .._utils import customized_gc_thresholds, mpi_rank, nvtx_range_debug
@@ -101,6 +102,9 @@ def _check_collective_rpc_guard(
 class GenerationExecutorProxy(GenerationExecutor):
     READY_SIGNAL = b"READY"
     WORKER_PROCESS_IDENTITIES_SIGNAL = b"WORKER_PROCESS_IDENTITIES"
+    # Total wait for the worker futures in an orderly shutdown. Generous
+    # enough for the teardown of a large engine.
+    _WORKER_SHUTDOWN_TIMEOUT_S = 180.0
 
     def __init__(
         self,
@@ -112,6 +116,8 @@ class GenerationExecutorProxy(GenerationExecutor):
         postproc_worker_config: Optional[PostprocWorkerConfig] = None,
         is_llm_executor: Optional[bool] = None,
     ) -> None:
+        proxy_start = time.perf_counter()
+        logger.info(f"[startup][pid={os.getpid()}] executor_proxy: start")
         postproc_worker_config = postproc_worker_config or PostprocWorkerConfig(
         )
         super().__init__(
@@ -128,20 +134,22 @@ class GenerationExecutorProxy(GenerationExecutor):
         mpi_process_pre_spawned: bool = get_spawn_proxy_process_env()
         self._owns_mpi_session = mpi_session is None
 
-        if mpi_session is None:
-            if mpi_process_pre_spawned:
-                logger_debug('create comm session ...\n', "yellow")
-                self.mpi_session = create_mpi_comm_session(model_world_size)
+        with _StartupTimer("mpi_session_setup"):
+            if mpi_session is None:
+                if mpi_process_pre_spawned:
+                    logger_debug('create comm session ...\n', "yellow")
+                    self.mpi_session = create_mpi_comm_session(model_world_size)
+                else:
+                    logger_debug('create pool session ...\n', "yellow")
+                    self.mpi_session = MpiPoolSession(
+                        n_workers=model_world_size)
             else:
-                logger_debug('create pool session ...\n', "yellow")
-                self.mpi_session = MpiPoolSession(n_workers=model_world_size)
-        else:
-            # submit() launches one worker task per pool worker, so an
-            # external session must match the model's world size exactly;
-            # fail loudly instead of starting the wrong number of executors.
-            validate_session_world_size(mpi_session, model_world_size)
-            logger_debug('using external mpi session ...\n', "yellow")
-            self.mpi_session = mpi_session
+                # submit() launches one worker task per pool worker, so an
+                # external session must match the model's world size exactly;
+                # fail loudly instead of starting the wrong number of executors.
+                validate_session_world_size(mpi_session, model_world_size)
+                logger_debug('using external mpi session ...\n', "yellow")
+                self.mpi_session = mpi_session
 
         if isinstance(self.mpi_session,
                       (MpiCommSession, RemoteMpiCommSessionClient)):
@@ -164,7 +172,7 @@ class GenerationExecutorProxy(GenerationExecutor):
         _llm_args = worker_kwargs.get("llm_args", None)
         self.garbage_collection_gen0_threshold = _llm_args.garbage_collection_gen0_threshold if _llm_args is not None else None
         _backend = None if _llm_args is None else _llm_args.backend
-        self._is_pytorch_backend = _backend in ["pytorch", "_autodeploy"]
+        self._is_pytorch_backend = _backend == "pytorch"
         self._enable_resource_governor = bool(
             getattr(_llm_args, "enable_resource_governor", False))
 
@@ -203,7 +211,14 @@ class GenerationExecutorProxy(GenerationExecutor):
         self.dispatch_result_thread: Optional[ManagedThread] = None
         self.rpc_client: Optional[RPCClient] = None
         self._worker_process_monitor = WorkerProcessMonitor()
+        logger.info(
+            f"[startup][pid={os.getpid()}] executor_proxy/pre_worker_setup: "
+            f"done in {time.perf_counter() - proxy_start:.3f}s (includes mpi_session_setup)"
+        )
         self._start_executor_workers(worker_kwargs)
+        logger.info(
+            f"[startup][pid={os.getpid()}] executor_proxy/workers_ready: "
+            f"elapsed={time.perf_counter() - proxy_start:.3f}s")
 
         # Create RPC client after workers are started (worker starts RPC server)
         self.rpc_client = RPCClient(self.rpc_addr, hmac_key=self.hmac_key)
@@ -899,25 +914,32 @@ class GenerationExecutorProxy(GenerationExecutor):
             self.WORKER_PROCESS_IDENTITIES_SIGNAL
             if self._can_monitor_worker_processes() else None)
 
-        self.mpi_futures = self.mpi_session.submit(
-            worker_main,
-            **mpi_worker_kwargs,
-            worker_cls=self.worker_cls,
-            tracer_init_kwargs=tracer_init_kwargs,
-            _torch_external_model_modules=export_external_model_modules(),
-            ready_signal=GenerationExecutorProxy.READY_SIGNAL,
-            worker_process_identities_signal=worker_process_identities_signal,
-        )
+        with _StartupTimer("worker_submit_to_ready") as startup_timer:
+            with startup_timer.phase("worker_submit"):
+                self.mpi_futures = self.mpi_session.submit(
+                    worker_main,
+                    **mpi_worker_kwargs,
+                    worker_cls=self.worker_cls,
+                    tracer_init_kwargs=tracer_init_kwargs,
+                    _torch_external_model_modules=export_external_model_modules(
+                    ),
+                    ready_signal=GenerationExecutorProxy.READY_SIGNAL,
+                    worker_process_identities_signal=
+                    worker_process_identities_signal,
+                )
 
-        self.workers_started = True
+            self.workers_started = True
 
-        status = self._wait_for_executor_workers_ready()
+            with startup_timer.phase("worker_initialization_wait"):
+                status = self._wait_for_executor_workers_ready()
 
-        ready_signal, error_trace = status[:2]
-        if ready_signal != GenerationExecutorProxy.READY_SIGNAL:
-            logger.error(f"Executor worker initialization error: {error_trace}")
-            self._fail_initialization(
-                RuntimeError("Executor worker returned error"), ready_signal)
+            ready_signal, error_trace = status[:2]
+            if ready_signal != GenerationExecutorProxy.READY_SIGNAL:
+                logger.error(
+                    f"Executor worker initialization error: {error_trace}")
+                self._fail_initialization(
+                    RuntimeError("Executor worker returned error"),
+                    ready_signal)
 
         # Register the fast-death callback only after the world reported
         # ready: on an already-completed future, add_done_callback() runs the
@@ -1064,6 +1086,28 @@ class GenerationExecutorProxy(GenerationExecutor):
         # instead of blocking on each, and skip the ones still pending.
         if self._engine_dead:
             concurrent.futures.wait(self.mpi_futures, timeout=5.0)
+        else:
+            # A worker that dies *after* delivering its results (e.g. a segfault
+            # in its own teardown) queues no error, so _engine_dead is still
+            # False. Bound the wait with one deadline shared by all futures so
+            # that cannot wedge shutdown; pre_shutdown has already asked the
+            # workers to quit.
+            _, pending = concurrent.futures.wait(
+                self.mpi_futures, timeout=self._WORKER_SHUTDOWN_TIMEOUT_S)
+            if pending:
+                stuck = [
+                    i for i, f in enumerate(self.mpi_futures) if f in pending
+                ]
+                logger.warning(
+                    f"MPI worker future(s) {stuck} did not complete within "
+                    f"{self._WORKER_SHUTDOWN_TIMEOUT_S}s of shutdown; treating "
+                    "the worker world as dead")
+                # Route the rest of teardown through the dead-engine path:
+                # skip the stuck futures, bound the dispatcher join and
+                # abandon (rather than join) the session.
+                self._mark_engine_dead(
+                    TimeoutError(
+                        f"MPI worker future(s) {stuck} timed out on shutdown"))
 
         for f in self.mpi_futures:
             if self._engine_dead and not f.done():

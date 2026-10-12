@@ -44,12 +44,15 @@ from tensorrt_llm.bench.utils.data import (DatasetFormatError,
                                            create_dataset_from_stream,
                                            initialize_tokenizer,
                                            update_metadata_for_multimodal)
+from tensorrt_llm.commands._telemetry import TelemetryCommand
 from tensorrt_llm.llmapi import CapacitySchedulerPolicy
 from tensorrt_llm.logger import logger
 from tensorrt_llm.sampling_params import SamplingParams
 
 
-@click.command(name="throughput")
+@click.command(name="throughput",
+               cls=TelemetryCommand,
+               telemetry_llm_startup=True)
 @optgroup.group("Engine run configuration.",
                 help="Runtime settings for executing a TensorRT LLM model.")
 @optgroup.option(
@@ -352,12 +355,6 @@ def throughput_command(
             logger.error(
                 f"Failed to import custom module from {custom_module_dir}: {e}")
             raise e
-
-    # Eagerly import auto_deploy to ensure custom model configs
-    # are registered with transformers.AutoConfig before
-    # options.model_type triggers AutoConfig.from_pretrained().
-    if options.backend == "_autodeploy":
-        import tensorrt_llm._torch.auto_deploy  # noqa: F401
 
     # Runtime kwargs and option tracking.
     kwargs = {}

@@ -20,7 +20,7 @@ Example usage:
     # Start CoderMCP server first:
     # python examples/scaffolding/mcp/coder/coder_mcp.py --port 8083
 
-    mcp_worker = ApiaryMCPWorker("http://localhost:8083/sse")
+    mcp_worker = ApiaryMCPWorker("http://localhost:8083/mcp")
 
     # Create the Coder agent
     coder = create_coder_scaffolding_llm(

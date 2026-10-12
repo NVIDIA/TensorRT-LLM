@@ -1,5 +1,6 @@
 from typing import Generic, Optional, Type
 
+from .._experimental.modeling_v2 import modeling_v2_resolve
 from ..model_config import ModelConfig
 from ..utils import model_extra_attrs
 from .modeling_utils import (DecoderModelForCausalLM, TConfig, TModel,
@@ -32,6 +33,23 @@ class AutoModelForCausalLM(Generic[TModel, TConfig]):
             model_arch = model_arch.replace("Eagle3",
                                             "")  # Strip the appended EAGLE3
             model_arch = "EAGLE3" + model_arch
+
+        # ModelingV2 targets are keyed by a synthetic architecture name that no
+        # checkpoint declares -- the same shape as the Eagle3 rewrite above.
+        # Returns None unless `modeling_v2` is on and a target claims this
+        # exact (checkpoint, GPU arch, parallel topology), so the default path
+        # is byte-for-byte unchanged.
+        #
+        # Precedence, since this runs last and would override the rewrite
+        # above: modeling_v2 wins. It reads the *un-rewritten*
+        # architectures[0], so it decides on the checkpoint rather than on what
+        # that rewrite made of it, and a target that claims a configuration
+        # carries that configuration's draft path itself. Not reachable today
+        # -- Eagle3 needs draft_vocab_size, and no draft checkpoint matches a
+        # target's shape fingerprint -- so this note is the contract, not a
+        # description of observed behaviour.
+        if (modeling_v2_arch := modeling_v2_resolve(config)) is not None:
+            model_arch = modeling_v2_arch
 
         return get_registered_model_class(model_arch)
 

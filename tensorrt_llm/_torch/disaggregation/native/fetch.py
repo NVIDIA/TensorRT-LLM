@@ -76,7 +76,16 @@ class PeerFetch:
         """
         return self._session
 
-    def fetch(self, extent: CacheExtent, *, src: Optional[str] = None) -> Attempt:
+    def fetch(
+        self,
+        extent: CacheExtent,
+        *,
+        src: Optional[str] = None,
+        expected_write_bytes: Optional[int] = None,
+    ) -> Attempt:
+        """``expected_write_bytes`` is the local byte total the remote writers must cover for
+        this piece; the session tracks attested written bytes against it so reuse admission can
+        be restricted to verifiably written ranges (see ``RxSession.kv_write_verified``)."""
         if src is not None:
             # This backend asks whoever the request names; accepting `src` and not using it would
             # read from a different peer than the caller asked for, and nothing would report it.
@@ -91,7 +100,7 @@ class PeerFetch:
         # this call started.
         mine = len(session._kv_tasks)
         try:
-            session.receive(extent.local)
+            session.receive(extent.local, expected_write_bytes=expected_write_bytes)
         except Exception as error:
             # Publication reaches peers one at a time, so a failure can leave some already holding
             # the destination; the session goes terminal so the sweep can retire it. The error is

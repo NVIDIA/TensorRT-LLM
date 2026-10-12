@@ -12,18 +12,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""How a native transfer's state reads as a contract outcome.
+"""Observe a native task's committed logical result and current report progress.
 
-Both directions land here: a send session and a receive session expose the same three things a
-handle needs -- the session's own verdict, its exception, and per-task status. What differs is what
-``reports_pending`` is owed by: on the receive side the writers' reports, on the send side word
-about this side's own writes. Neither answers whether anyone is still touching the memory; that is a
-separate question nothing here asks.
-
-TODO: Which ending a piece reports depends on when it is first polled. A piece whose session has
-gone terminal while the piece itself is still writing latches the session's verdict, yet the piece
-may finish afterwards -- so an early poll says failed and a late one says delivered. Nothing polls
-these yet; it has to be settled before the surface is frozen.
+Task/session transitions commit the result, not polling. Reports and physical
+quiescence remain separate questions; an outcome never authorizes memory reuse.
 """
 
 from __future__ import annotations
@@ -32,56 +24,29 @@ from typing import Optional
 
 from tensorrt_llm._torch.disaggregation.base import Cancelled, Delivered, Failed, Outcome
 
-from .transfer import SessionStatus, TaskStatus
+from .transfer import KVRecvTask, KVSendTask, RxSession, SessionStatus, TaskStatus, TxSession
 
 
 class TaskHandle:
-    """One piece of one request, seen through the session carrying it.
+    """One piece's decision, including when the first observer arrives late."""
 
-    Pieces of the same request share that session, so this piece's own state is read first and the
-    session's verdict only answers for a piece that has not ended on its own.
-    """
-
-    def __init__(self, session, task, token_end: int):
+    def __init__(
+        self, session: RxSession | TxSession, task: KVRecvTask | KVSendTask, token_end: int
+    ) -> None:
         self._session = session
         self._task = task
         self._token_end = token_end
-        self._ended: Optional[Outcome] = None
 
     def poll(self) -> Optional[Outcome]:
-        if self._ended is not None:
-            # Which ending this was cannot change; only whether a writer still owes word can.
-            return self._rebuild(self._ended)
-        # This piece's own ending wins: bytes that landed landed, whatever became of its siblings,
-        # and "cancelled" means stopped short of delivering.
-        if self._task.status is TaskStatus.TRANSFERRED:
-            outcome = Delivered(token_end=self._token_end)
-        elif self._task.status is TaskStatus.ERROR:
-            if self._ended_by_cancel():
-                outcome = Cancelled(by_peer=self._session.cancelled_by_peer, reports_pending=True)
-            else:
-                outcome = Failed(reason=self._why_failed(), reports_pending=True)
-        elif self._session.status is SessionStatus.CANCELLED:
-            outcome = Cancelled(by_peer=self._session.cancelled_by_peer, reports_pending=True)
-        elif self._session.status is SessionStatus.ERROR:
-            outcome = Failed(reason=self._why_failed(), reports_pending=True)
-        else:
+        result = self._task.logical_outcome
+        if result is None:
             return None
-        self._ended = outcome
-        return self._rebuild(outcome)
-
-    def _rebuild(self, ended: Outcome) -> Outcome:
-        """The latched ending, with today's answer to whether a report is still owed.
-
-        A session is shared by several pieces, so a sibling's failure moves the session's own
-        verdict after this piece has already ended; the ending latched here does not move with it.
-        """
-        if isinstance(ended, Delivered):
-            return ended
+        if result.status is SessionStatus.TRANSFERRED:
+            return Delivered(token_end=self._token_end)
         owed = self._owed_a_report()
-        if isinstance(ended, Cancelled):
-            return Cancelled(by_peer=ended.by_peer, reports_pending=owed)
-        return Failed(reason=ended.reason, reports_pending=owed)
+        if result.status is SessionStatus.CANCELLED:
+            return Cancelled(by_peer=result.by_peer, reports_pending=owed)
+        return Failed(reason=result.reason, reports_pending=owed)
 
     def _owed_a_report(self) -> bool:
         """Whether anyone still owes word about this piece.
@@ -97,20 +62,6 @@ class TaskHandle:
             # A task that counts nothing leaves its own state as the only evidence there is.
             return self._task.status is TaskStatus.TRANSFERRING
         return outstanding
-
-    def _ended_by_cancel(self) -> bool:
-        """Whether this piece's error is the cancellation itself.
-
-        A cancel ends the pieces that had not started by failing them, which is the same task state
-        a real transfer error leaves; only the recorded cause tells the two apart, and it is the
-        very object the cancel installed rather than one that merely reads like it.
-        """
-        cancelled = getattr(self._session, "_cancel_exception", None)
-        return cancelled is not None and self._task._exception is cancelled
-
-    def _why_failed(self) -> str:
-        error = self._task._exception or self._session.exception
-        return str(error) if error is not None else "transfer failed without a recorded cause"
 
 
 class NothingPublished:

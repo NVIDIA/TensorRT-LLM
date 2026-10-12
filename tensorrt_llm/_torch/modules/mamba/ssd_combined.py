@@ -161,7 +161,7 @@ def _mamba_chunk_scan_flashinfer_fwd(
     # The SSDCombined kernel was compiled with B/C compact stride
     # `b.strides[0] = N*G` (N=dstate=const), so the runtime check requires
     # the seqlen stride divisible by N. Upstream split-then-view producers
-    # (e.g. AutoDeploy's projected_states split) leave seqlen-stride equal
+    # (e.g. a projected_states split) leave seqlen-stride equal
     # to the full projection width, which need not be a multiple of N.
     # Materialize contiguous copies when necessary.
     if not B.is_contiguous():

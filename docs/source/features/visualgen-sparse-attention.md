@@ -6,56 +6,23 @@ This feature is in **beta** stage. APIs, supported models, and optimization opti
 
 - [Overview](#overview)
   - [Algorithms](#algorithms)
-  - [Sol-Attn](#sol-attn)
 - [Skip Softmax Attention](#skip-softmax-attention)
+- [SOL Attention](#sol-attention)
 - [Video Sparse Attention (VSA)](#video-sparse-attention-vsa)
 
 ## Overview
 
 Visual generation models naturally operate on long image or video token sequences. Each denoising step is closer to a full-context prefill pass than to autoregressive decoding, and attention can dominate runtime for high-resolution image generation or long video generation.
 
-Sparse attention in VisualGen is configured through `VisualGenArgs.attention_config.sparse_attention_config`. The user-facing config stays in VisualGen args or model config. Checkpoint calibration metadata remains internal and is lowered into per-attention-backend `SparseParams` when each attention module is constructed.
+Sparse attention in VisualGen is configured through `VisualGenArgs.attention_config.sparse_attention_config`. The user-facing config stays in VisualGen args or model config, while `attention_config.backend` selects the kernel family. Algorithms produce their block-sparse routes through the core `block_sparse_attn_predict` hook: a backend either predicts inside that hook from the flattened Q/K/V, or predicts before the core forward and hands the complete `BlockSparseForwardInputs` through `AttentionForwardArgs.sparse_backend_args`, which the default hook passes through. The VisualGen TRTLLM wrapper owns the timestep schedule those backends consult: it prepares the denoising timestep once per eager call and answers whether a layer runs sparse for it (dense layers and dense timestep phases do not). `SparseRuntimeParams` is the single lowered runtime carrier passed as `AttentionForwardArgs.sparse_runtime_params`; its optional `block_sparse_inputs` field nests the algorithm-neutral routes for the general block-sparse FMHA. `None` means prediction has not run, while an empty `SparseRuntimeParams()` records that prediction ran without a sparse payload.
 
 ### Algorithms
 
 | `algorithm` | Config class | Status |
 |---|---|---|
 | `skip_softmax` | `SkipSoftmaxAttentionConfig` | Supported |
-| `vsa` | `VideoSparseAttentionConfig` | Supported (CUTEDSL) |
-| `sol_attn` | `SolAttentionConfig` | Supported (CUTEDSL, sm100/sm103) |
-
-### Sol-Attn
-
-Sol-Attn ([arXiv:2607.24027](https://arxiv.org/abs/2607.24027)) folds dynamic block
-routing, sparse computation, and an approximation-correction term into one
-online-softmax pass. It runs on the **CUTEDSL** backend only, on datacenter
-Blackwell -- sm100 (B200/GB200) and sm103 (B300/GB300) -- and requires
-`head_dim=128`, bfloat16, and MHA
-(`num_kv_heads == num_heads`).
-
-```yaml
-attention_config:
-  backend: CUTEDSL
-  sparse_attention_config:
-    algorithm: sol_attn
-    tau: 2.0                        # routing threshold; higher routes more blocks sparse
-    thresh_type: diag               # or "exact"
-    disabled_until_timestep: 0.9090 # dense while normalized timestep >= cutoff
-    dense_layers: [0]               # optional: layer indices forced dense
-```
-
-`disabled_until_timestep` has the same meaning as it does for Skip Softmax:
-attention runs dense while the normalized denoising timestep is at or above the
-cutoff, protecting the high-noise prefix, and switches to the sparse kernel
-below it. Use `None` rather than `0.0` to disable the prefix.
-
-On an input the kernel is known not to serve — an unsupported architecture, a
-`head_dim` other than 128, a non-bfloat16 dtype — Sol-Attn runs dense
-attention instead (the configured backend's dense kernel where available,
-torch SDPA otherwise), logs the specific reason once, and counts the fallback.
-Set `TRTLLM_SOL_ATTN_STRICT=1` to raise instead, which is useful when
-benchmarking to confirm the kernel actually ran. Errors raised by the kernel
-itself are not caught.
+| `vsa` | `VideoSparseAttentionConfig` | Supported (`CUTEDSL`, `TRTLLM`) |
+| `sol_attn` | `SolAttentionConfig` | Supported (`TRTLLM`, `CUTEDSL`) |
 
 ## Skip Softmax Attention
 
@@ -127,7 +94,7 @@ User configuration is supplied through Python or YAML and controls how the check
 
 `threshold_scale_factor` and `target_sparsity` are alternatives: if both are present, `threshold_scale_factor` takes precedence and the calibration formula is not used. User-provided `target_sparsity` and `disabled_until_timestep` override checkpoint defaults. Checkpoint `ignore` patterns always disable Skip Softmax Attention for matching layers.
 
-Skip Softmax Attention works with both the **TRTLLM** and **CUTEDSL** attention backends in VisualGen. Set `attention_config.backend` to either when enabling it. On CUTEDSL, Skip Softmax Attention can also be combined with `quant_attention_config`'s block-scaled Q/K recipes (MXFP8, NVFP4); VSA and Sol-Attn are currently the two supported sparse-attention algorithms, both available only through the CuTeDSL attention backend; quantized attention is not yet supported or enabled with either mode.
+Skip Softmax Attention works with both the **TRTLLM** and **CUTEDSL** attention backends in VisualGen. Set `attention_config.backend` to either when enabling it. On CUTEDSL, Skip Softmax Attention can also be combined with `quant_attention_config`'s block-scaled Q/K recipes (MXFP8, NVFP4); VSA and SOL cannot be combined with quantized attention on any backend.
 
 #### Mapping `disabled_until_timestep` to Actual Denoising Steps
 
@@ -251,6 +218,145 @@ attention_config:
 
 Graphs are captured lazily. The first denoising step seen for a given tensor shape and sparse-attention phase captures a graph; later steps with the same shape and phase replay that graph. When denoising crosses the cutoff, the phase key changes, so VisualGen captures a second graph for the enabled phase instead of replaying the graph from the disabled phase.
 
+## SOL Attention
+
+SOL ([arXiv:2607.24027](https://arxiv.org/abs/2607.24027)) routes attention
+blocks dynamically: blocks whose scores stand out are computed exactly, the
+rest are approximated from compact K/V proxies and folded back into the online
+softmax. VisualGen serves it on two backends behind one `SolAttentionConfig`:
+
+- **TRTLLM** runs SOL in two stages. A TRT-LLM-owned predictor first produces
+  an exact block bitmask and K/V proxy summaries from Q/K/V; the shared
+  `PrimsTSBlockSparseFmha` library then executes that route from the shared
+  `SparseRuntimeParams`. `SOLTrtllmAttention` is only the VisualGen bridge: it
+  overrides the core `block_sparse_attn_predict` hook, so prediction runs
+  inside the core forward from the flattened Q/K/V, the batch layout in the
+  attention metadata and the `timestep` in the forward arguments; dense layers
+  and dense timestep phases return no routes. The VisualGen wrapper compacts
+  fused projection split views once and shares those tensors between
+  prediction and the block-sparse FMHA. Cross-attention, context parallelism,
+  attention quantization and unsupported tensor envelopes raise an error
+  instead of silently falling back to dense attention.
+- **CUTEDSL** runs the fused kernel vendored from the reference implementation
+  (`SOLCuTeDSLAttention`), which folds routing, sparse computation and the
+  approximation correction into one online-softmax pass. It runs on datacenter
+  Blackwell, sm100 (B200/GB200) and sm103 (B300/GB300), and requires
+  `head_dim=128`, bfloat16 and MHA (`num_kv_heads == num_heads`). On an input
+  the kernel is known not to serve, such as an unsupported architecture, a
+  `head_dim` other than 128 or a non-bfloat16 dtype, it runs dense attention
+  instead (the CuTe DSL FMHA where available, torch SDPA otherwise), logs the
+  reason once and counts the fallback; set `TRTLLM_SOL_ATTN_STRICT=1` to raise
+  instead, which is useful when benchmarking to confirm the kernel actually
+  ran. Errors raised by the kernel itself are not caught. Cross-attention and
+  masked calls are delegated to dense attention per call.
+
+Configure SOL with `SolAttentionConfig` and either backend:
+
+```python
+from tensorrt_llm.visual_gen import AttentionConfig, SolAttentionConfig
+
+attention_config = AttentionConfig(
+    backend="TRTLLM",  # or "CUTEDSL"
+    sparse_attention_config=SolAttentionConfig(
+        tau=1.0,
+        disabled_until_timestep=0.6,
+        dense_layers=[0, 2, 3, 4],
+    ),
+)
+```
+
+The equivalent YAML is:
+
+```yaml
+attention_config:
+  backend: TRTLLM                 # or CUTEDSL
+  sparse_attention_config:
+    algorithm: sol_attn
+    tau: 1.0                      # routing threshold; higher tau routes more blocks sparse
+    disabled_until_timestep: 0.6  # dense while the normalized timestep >= cutoff
+    dense_layers: [0, 2, 3, 4]    # optional: layer indices forced dense
+    thresh_type: diag             # block threshold policy: "diag" or "exact"
+```
+
+- `tau` is the routing threshold in standard deviations above the mean block
+  score; higher values route more blocks sparse.
+- `disabled_until_timestep` has the same meaning as it does for Skip Softmax
+  Attention: attention runs dense while the normalized denoising timestep is at
+  or above the cutoff, protecting the high-noise prefix, and switches to SOL
+  below it. Use `None` rather than `0.0` to disable the prefix.
+- `dense_layers` lists zero-based layer indices that always use dense
+  attention.
+- `thresh_type` selects how the routing threshold models the key blocks:
+  `diag` treats every key channel independently, `exact` uses the full key
+  covariance. Both backends implement both policies from the same per-block
+  statistics.
+
+The TRTLLM envelope is full-mask BF16 self-attention on SM100 or SM103 with 4-D
+BSHD Q/K/V tensors, equal Q/K/V shapes and head dimension 128. The predictor is
+one graph-visible operator that allocates its route and summary tensors per
+call, so it composes with CUDA Graph capture and with torch.compile, including
+`fullgraph`, without keeping any state between calls.
+
+When a cutoff is configured, VisualGen includes the dense-or-sparse phase in
+the CUDA Graph key. The TRTLLM attention metadata reduces the timestep to a host
+value during graph warmup, keeps it in the component attention state and reuses
+it during capture for every timestep-scheduled algorithm (Skip Softmax Attention
+and SOL), while the SOL predictor's outputs are allocated inside the captured
+graph and replayed with it; the CuTeDSL backends read the
+phase the CUDA Graph runner resolved for the graph key instead of the device
+tensor. Per-token timesteps, such as Wan I2V where the conditioning frame stays
+at timestep zero, reduce to their largest live value, so the schedule stays
+dense until every token is below the cutoff. A dense capture therefore cannot
+be reused for the sparse phase.
+
 ## Video Sparse Attention (VSA)
 
-TODO
+VSA reduces the cost of self-attention in video diffusion models by attending only to the most relevant spatial-temporal blocks. It uses a two-branch design: a lightweight coarse branch mean-pools tokens into (4, 4, 4) cubes and computes cube-level attention scores to select the top-K most relevant cubes per query, then a fine branch runs the selected backend's block-sparse kernel over those cubes only. The two outputs are blended with learned gates, which is why VSA needs a fine-tuned checkpoint. Select either `CUTEDSL` for the CuTe DSL fine-stage kernel or `TRTLLM` for PrimTS block-sparse attention.
+
+Requirements:
+
+- A VSA-fine-tuned checkpoint such as [`FastVideo/Wan2.1-VSA-T2V-14B-720P-Diffusers`](https://huggingface.co/FastVideo/Wan2.1-VSA-T2V-14B-720P-Diffusers). Standard Wan checkpoints do not carry the learned VSA gates.
+- The `CUTEDSL` or `TRTLLM` attention backend. `CUTEDSL` uses the CuTe DSL fine-stage kernel; `TRTLLM` lowers the selected cubes through the generic PrimTS block-sparse FMHA contract.
+- A supported CUDA device and tensor shape for the selected block-sparse kernel. When that kernel is unavailable or the input is outside its envelope, the fine branch runs the compact Q/K/V through that backend's dense path (SDPA for `CUTEDSL`, TRTLLM attention for `TRTLLM`) and the VSA post-processing still applies.
+- VSA cannot be combined with `quant_attention_config`.
+- VSA is not compatible with Ring attention or Attention2D (it does not produce per-split LSE). Ulysses is supported.
+
+Configure VSA with `VideoSparseAttentionConfig` and either backend:
+
+```python
+from tensorrt_llm import VisualGenArgs
+from tensorrt_llm.visual_gen.args import AttentionConfig, VideoSparseAttentionConfig
+
+args = VisualGenArgs(
+    model="FastVideo/Wan2.1-VSA-T2V-14B-720P-Diffusers",
+    attention_config=AttentionConfig(
+        backend="TRTLLM",  # or "CUTEDSL"
+        sparse_attention_config=VideoSparseAttentionConfig(vsa_sparsity=0.9),
+    ),
+)
+```
+
+The equivalent YAML, for `--visual_gen_args` or `trtllm-serve`:
+
+```yaml
+attention_config:
+  backend: TRTLLM                 # or CUTEDSL
+  sparse_attention_config:
+    algorithm: vsa
+    vsa_sparsity: 0.90            # fraction of K/V cubes skipped by the fine branch
+```
+
+`vsa_sparsity` controls the fraction of K/V cubes the fine branch skips (0.0 keeps every cube and reproduces dense attention, 0.9 skips 90% of them). Higher sparsity gives more speedup at the cost of some quality.
+
+VSA retains shape-dependent metadata and route tensors so CUDA Graph replay can reuse stable addresses. A pipeline instance keeps one set of these tensors per distinct shape profile for as long as the CUDA Graphs that reference them, so their footprint grows with the number of served resolution/frame profiles exactly like the graphs do.
+
+Both VSA backends use the same VisualGen-owned predictor implementation, one
+instance per attention layer, and identical post-processing. The `TRTLLM` path runs the coarse stage before the core
+forward, hands the predicted `BlockSparseForwardInputs` (including the
+tile-padding validity bits only the VSA predictor knows) through
+`sparse_backend_args`, lets the default core prediction hook pass them to the
+general block-sparse FMHA, and then blends the fine and coarse outputs. Its
+compact dense fallback passes no sparse inputs, so the core runs dense attention
+and VSA post-processing still runs. `CUTEDSL` retains only its backend-specific
+fine-attention execution. The core FMHA registry owns the reusable block-sparse
+implementation rather than a VSA-specific lifecycle.

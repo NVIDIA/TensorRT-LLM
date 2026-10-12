@@ -76,7 +76,7 @@ tk::FusedSamplingParams buildParams(torch::Tensor const& logits, torch::Tensor c
         TORCH_CHECK(s.numel() == 1 || s.numel() >= numRows, "seed/offset must hold 1 or numRows entries");
         params.seed = reinterpret_cast<uint64_t const*>(s.const_data_ptr<int64_t>());
         params.offset = reinterpret_cast<uint64_t const*>(o.const_data_ptr<int64_t>());
-        params.perRowRng = s.numel() > 1;
+        params.perRowRng = s.numel() >= numRows;
     }
     return params;
 }

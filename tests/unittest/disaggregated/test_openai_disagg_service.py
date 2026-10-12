@@ -13,13 +13,23 @@
 # limitations under the License.
 
 import asyncio
+from contextlib import AsyncExitStack
 from types import SimpleNamespace
 from unittest import mock
 from unittest.mock import AsyncMock
 
+import aiohttp
+import msgspec
 import pytest
 import torch
+from aiohttp import web
+from aiohttp.test_utils import TestServer
+from starlette.requests import Request
 
+from tensorrt_llm._torch.pyexecutor.scheduler.adp_router import (
+    ConversationAwareADPRouter,
+    RankState,
+)
 from tensorrt_llm.disaggregated_params import DisaggregatedParams as LlmDisaggregatedParams
 from tensorrt_llm.executor.result import Logprob
 from tensorrt_llm.llmapi.disagg_utils import (
@@ -53,6 +63,7 @@ from tensorrt_llm.serve.openai_protocol import (
     _serialize_first_gen_log_probs,
     _serialize_first_gen_logits,
 )
+from tensorrt_llm.serve.openai_server import OpenAIServer
 from tensorrt_llm.serve.postprocess_handlers import (
     ChatPostprocArgs,
     CompletionPostprocArgs,
@@ -105,6 +116,72 @@ async def test_conditional_disagg_uses_selected_server_match_length():
 
     assert server == "gen:8000"
     assert need_context is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("remote_tail", "num_tokens", "expected_need_context"),
+    [
+        (False, 32, True),
+        (True, 32, False),
+        (True, 33, True),
+    ],
+)
+async def test_conditional_disagg_remote_tail_allows_cold_local_prefill(
+    remote_tail, num_tokens, expected_need_context
+):
+    service = _make_service("context_first")
+    service._config.bounded_replay_on_generation = remote_tail
+    service._config.conditional_disagg_config = ConditionalDisaggConfig(max_local_prefill_length=32)
+    router = KvCacheAwareRouter(server_role=ServerRole.GENERATION, servers=[])
+    router.get_next_server = AsyncMock(
+        return_value=(
+            "gen:8000",
+            {
+                "match_length": 0,
+                "num_tokens": num_tokens,
+            },
+        )
+    )
+    service._gen_router = router
+    request = CompletionRequest(model="model", prompt=[1] * num_tokens)
+
+    server, need_context = await service._check_conditional_disagg(request, 123)
+
+    assert server == "gen:8000"
+    assert need_context is expected_need_context
+
+
+@pytest.mark.asyncio
+async def test_remote_tail_cold_local_prefill_skips_context_worker(monkeypatch):
+    monkeypatch.setenv("TRTLLM_V41_DECODER_BOUNDED_REPLAY", "1")
+    monkeypatch.delenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY", raising=False)
+    service = _make_service("context_first")
+    service._config.bounded_replay_on_generation = True
+    service._config.conditional_disagg_config = ConditionalDisaggConfig(max_local_prefill_length=32)
+    router = KvCacheAwareRouter(server_role=ServerRole.GENERATION, servers=[])
+    router.get_next_server = AsyncMock(
+        return_value=(
+            "gen:8000",
+            {
+                "match_length": 0,
+                "num_tokens": 32,
+            },
+        )
+    )
+    service._gen_router = router
+    service._ctx_client = AsyncMock()
+    service._gen_client = AsyncMock()
+    service._gen_client.send_request = AsyncMock(
+        return_value=_make_completion_response("ok", finish_reason="stop")
+    )
+    request = CompletionRequest(model="model", prompt=[1] * 32)
+
+    await service._send_disagg_request_ctx_first(request)
+
+    service._ctx_client.send_request.assert_not_awaited()
+    gen_request = service._gen_client.send_request.call_args.args[0]
+    assert gen_request.disaggregated_params is None
 
 
 @pytest.mark.asyncio
@@ -203,6 +280,15 @@ def _make_chat_response(
             )
         ],
     )
+
+
+def test_remote_tail_marker_requires_generation_after_context_stop():
+    service = _make_service("context_first")
+    response = _make_completion_response("", finish_reason="stop")
+    response.choices[0].disaggregated_params.first_gen_tokens = [17]
+    response.choices[0].disaggregated_params.remote_tail_start = 64
+
+    assert service._need_gen(response)
 
 
 async def _mock_streaming_response(chunks):
@@ -391,6 +477,174 @@ async def test_subagent_body_id_and_affinity_at_router_dispatch(
         "context": ("body-child", "parent"),
         "generation": ("body-child", "parent" if scope == "both" else "body-child"),
     }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("schedule_style", ["context_first", "generation_first"])
+@pytest.mark.parametrize("scope", ["context", "both"])
+@pytest.mark.parametrize("handler_name", ["openai_chat", "chat_harmony"])
+@pytest.mark.parametrize("affinity_enabled", [False, True])
+@pytest.mark.parametrize("configured_role", [False, True])
+async def test_subagent_affinity_http_worker_adp_placement(
+    monkeypatch: pytest.MonkeyPatch,
+    schedule_style: str,
+    scope: str,
+    handler_name: str,
+    affinity_enabled: bool,
+    configured_role: bool,
+) -> None:
+    """Exercise transport and worker ingestion with real two-rank routing.
+
+    Only model execution/tokenization and response postprocessing are stubbed;
+    the service, HTTP client, worker chat handler and ADP router execute normally.
+    Rank states are deterministic CPU fixtures, not a GPU execution test.
+    """
+    monkeypatch.delenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY", raising=False)
+    monkeypatch.setattr("tensorrt_llm.serve.openai_client.ClientMetricsCollector", mock.Mock())
+
+    async def no_media():
+        return None, None
+
+    monkeypatch.setattr(
+        "tensorrt_llm.serve.openai_server.parse_chat_messages_coroutines",
+        lambda *args, **kwargs: ([], no_media(), {}, []),
+    )
+    service = _make_service(schedule_style)
+    service._subagent_affinity_scope = scope
+    service._coordinator.get_disagg_request_id = AsyncMock(side_effect=range(42, 46))
+    auth_key = "secret" if affinity_enabled else None
+    observed: dict[ServerRole, list[tuple[str, str | None, int]]] = {
+        ServerRole.CONTEXT: [],
+        ServerRole.GENERATION: [],
+    }
+
+    def make_worker(role: ServerRole) -> web.Application:
+        router = ConversationAwareADPRouter(
+            SimpleNamespace(tp_rank=0, tp_size=2, has_cp_helix=False)
+        )
+        states = [
+            RankState(rank=rank, num_active_requests=0, num_active_tokens=0) for rank in range(2)
+        ]
+
+        def generate(**kwargs):
+            conversation = kwargs["conversation_params"]
+            scheduling = kwargs["scheduling_params"]
+            item = SimpleNamespace(
+                request=SimpleNamespace(
+                    py_conversation_params=conversation,
+                    py_scheduling_params=scheduling,
+                )
+            )
+            assignments, _ = router.route_requests(states, [item], max_num_active_requests=32)
+            rank = next(rank for rank, items in assignments.items() if items)
+            observed[role].append(
+                (conversation.conversation_id, scheduling.subagent_affinity_id, rank)
+            )
+            return SimpleNamespace(prompt_token_ids=[1, 2, 3])
+
+        server = object.__new__(OpenAIServer)
+        server.server_role = role if configured_role else None
+        server._internal_disagg_auth_key = auth_key
+        server.allow_request_chat_template = False
+        server.generator = SimpleNamespace(
+            args=SimpleNamespace(
+                num_postprocess_workers=0,
+                gather_generation_logits=False,
+                reasoning_parser=None,
+                backend="pytorch",
+                cache_transceiver_config={"backend": "UCX"},
+            ),
+            generate_async=generate,
+        )
+        server.model_config = SimpleNamespace(model_type="llama", vocab_size=1000)
+        server.tokenizer = SimpleNamespace(tokenizer=SimpleNamespace(vocab_size=1000))
+        server.multimodal_server_config = None
+        server.tool_parser = None
+        server.tool_call_id_type = "random"
+        server.chat_template = None
+        server.harmony_adapter = mock.Mock()
+        server.harmony_adapter.get_stop_tokens.return_value = [999]
+        server.await_disconnected = AsyncMock()
+
+        async def postprocess(promise, postproc_params, raw_request, disaggregated_params):
+            return _make_chat_response(
+                "length" if role == ServerRole.CONTEXT else "stop",
+                disagg_request_id=disaggregated_params.disagg_request_id,
+            )
+
+        server._create_chat_response = postprocess
+
+        async def handle(http_request: web.Request) -> web.Response:
+            body = msgspec.msgpack.decode(await http_request.read())
+            assert "subagent_affinity_id" not in body["conversation_params"]
+            request = ChatCompletionRequest.model_validate(body)
+            assert (
+                request.disaggregated_params.schedule_style
+                == DisaggScheduleStyle[schedule_style.upper()]
+            )
+            raw_request = Request({"type": "http", "headers": http_request.raw_headers})
+            response = await getattr(server, handler_name)(request, raw_request)
+            return web.Response(
+                body=response.body, status=response.status_code, content_type="application/json"
+            )
+
+        app = web.Application()
+        app.router.add_post("/v1/chat/completions", handle)
+        return app
+
+    async with AsyncExitStack() as stack:
+        session = await stack.enter_async_context(aiohttp.ClientSession())
+        for role, instance_router, client_attr in (
+            (ServerRole.CONTEXT, service._ctx_router, "_ctx_client"),
+            (ServerRole.GENERATION, service._gen_router, "_gen_client"),
+        ):
+            worker = await stack.enter_async_context(TestServer(make_worker(role)))
+            # Completion clients add the HTTP scheme to router host:port addresses.
+            instance_router.get_next_server.return_value = (
+                f"{worker.host}:{worker.port}",
+                {"server_info": {}},
+            )
+            setattr(
+                service,
+                client_attr,
+                OpenAIHttpClient(
+                    instance_router,
+                    role,
+                    timeout_secs=5,
+                    session=session,
+                    internal_disagg_auth_key=auth_key,
+                ),
+            )
+        for conversation_id in ("parent", "child-a", "child-b", "child-a"):
+            request = ChatCompletionRequest(
+                model="test-model",
+                messages=[{"role": "user", "content": "hello"}],
+                prompt_token_ids=[1, 2, 3],
+                conversation_params=ConversationParams(conversation_id=conversation_id),
+            )
+            headers = {"x-session-id": "conflicting-header-id"}
+            if conversation_id != "parent":
+                headers["x-parent-id"] = "parent"
+            OpenAIDisaggServer._extract_conversation_id(
+                request,
+                SimpleNamespace(headers=headers),
+                "x-parent-id" if affinity_enabled else None,
+            )
+            await service._send_disagg_request(request)
+
+    parent_placement = [("parent", None, 0)]
+    child_placements = [
+        ("child-a", "parent", 0),
+        ("child-b", "parent", 0),
+        ("child-a", "parent", 0),
+    ]
+    independent_placements = [("child-a", None, 1), ("child-b", None, 0), ("child-a", None, 1)]
+    assert observed[ServerRole.CONTEXT] == parent_placement + (
+        child_placements if affinity_enabled else independent_placements
+    )
+    assert observed[ServerRole.GENERATION] == parent_placement + (
+        child_placements if affinity_enabled and scope == "both" else independent_placements
+    )
 
 
 @pytest.mark.asyncio
@@ -1005,3 +1259,111 @@ class TestFirstGenLogitsSerializeRoundtrip:
     def test_deserialize_missing_key_raises(self):
         with pytest.raises(ValueError, match="missing required key"):
             _deserialize_first_gen_logits([{"data": "abc", "shape": [1]}])
+
+
+@pytest.fixture
+def generation_first_stream_service():
+    service = _make_service("generation_first")
+    service._ctx_client = AsyncMock()
+    service._gen_client = AsyncMock()
+    service._coordinator.get_disagg_request_id = AsyncMock(return_value=42)
+    service._check_gen_only_disagg = AsyncMock(return_value=False)
+    service._ctx_router.get_next_server = AsyncMock(return_value=("ctx:9000", {"server_info": {}}))
+    return service
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error_type", [RuntimeError, asyncio.CancelledError])
+async def test_gen_first_context_failure_closes_unstarted_stream(
+    generation_first_stream_service, error_type
+):
+    service = generation_first_stream_service
+    gen_response = AsyncMock()
+    gen_response.__aiter__.side_effect = AssertionError("GEN consumer must not start")
+    service._gen_client.send_request.return_value = gen_response
+    service._ctx_client.send_request.side_effect = error_type("CTX interrupted")
+    request = CompletionRequest(model="test-model", prompt="hello", stream=True)
+
+    with pytest.raises(error_type):
+        await service._send_disagg_request(request)
+
+    gen_response.__aiter__.assert_not_called()
+    gen_response.aclose.assert_awaited_once_with()
+    # The HTTP clients own their router accounting; the service only closes GEN.
+    service._ctx_router.finish_request.assert_not_called()
+    service._gen_router.finish_request.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_gen_first_close_before_read_stops_unstarted_consumer(
+    generation_first_stream_service,
+):
+    service = generation_first_stream_service
+    gen_response = AsyncMock()
+    gen_response.__aiter__.side_effect = AssertionError("GEN consumer must not start")
+    service._gen_client.send_request.return_value = gen_response
+    request = CompletionRequest(model="test-model", prompt="hello", stream=True)
+
+    response = await service._send_disagg_request(request)
+    await response.aclose()
+    await response.aclose()
+
+    gen_response.__aiter__.assert_not_called()
+    gen_response.aclose.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+async def test_gen_first_cancellation_closes_running_stream(generation_first_stream_service):
+    service = generation_first_stream_service
+    gen_started = asyncio.Event()
+    gen_closed = asyncio.Event()
+    ctx_started = asyncio.Event()
+    blocked = asyncio.Event()
+
+    async def gen_chunks():
+        try:
+            gen_started.set()
+            await blocked.wait()
+            yield b"data: [DONE]\n\n"
+        finally:
+            gen_closed.set()
+
+    async def ctx_response(*args, **kwargs):
+        ctx_started.set()
+        await blocked.wait()
+
+    service._gen_client.send_request.return_value = gen_chunks()
+    service._ctx_client.send_request.side_effect = ctx_response
+    request = CompletionRequest(model="test-model", prompt="hello", stream=True)
+    pending = asyncio.create_task(service._send_disagg_request(request))
+    try:
+        await asyncio.wait_for(gen_started.wait(), timeout=1)
+        await asyncio.wait_for(ctx_started.wait(), timeout=1)
+    finally:
+        pending.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await pending
+
+    assert gen_closed.is_set()
+
+
+@pytest.mark.asyncio
+async def test_gen_first_close_after_chunk_closes_running_stream(generation_first_stream_service):
+    service = generation_first_stream_service
+    gen_closed = asyncio.Event()
+    blocked = asyncio.Event()
+
+    async def gen_chunks():
+        try:
+            yield b'data: "first"\n\n'
+            await blocked.wait()
+        finally:
+            gen_closed.set()
+
+    service._gen_client.send_request.return_value = gen_chunks()
+    request = CompletionRequest(model="test-model", prompt="hello", stream=True)
+    response = await service._send_disagg_request(request)
+    assert await asyncio.wait_for(response.__anext__(), timeout=1) == b'data: "first"\n\n'
+    await response.aclose()
+
+    assert gen_closed.is_set()

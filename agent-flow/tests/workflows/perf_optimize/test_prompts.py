@@ -1443,3 +1443,11 @@ def test_analyzer_categorizes_imbalance_by_the_work_not_the_collective():
     assert "often not fixable in-campaign" in prompt
     # Bounded by the measured share, not the raw spread.
     assert "bound `expected_gain_pct` by `pct_of_iter`, never by the whole spread" in prompt
+
+
+def test_casebook_control_adds_an_explicit_override():
+    bundle = build_perf_optimize_prompts(include_casebook=False)
+    for role in ("benchmarker", "analyzer", "optimizer"):
+        assert "This run intentionally disables `perf-optimization-casebook`" in getattr(
+            bundle, role
+        )
