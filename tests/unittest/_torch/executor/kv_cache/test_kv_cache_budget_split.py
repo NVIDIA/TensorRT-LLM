@@ -1265,3 +1265,627 @@ class TestMambaEffectiveTpSize:
         assert params.get_states_bytes_per_layer(
             replicated
         ) == 16 * params.get_states_bytes_per_layer(helix)
+
+
+def _v2_model_config(num_layers=24, layer_types=None, sliding_window=None):
+    """Minimal model config the V2 static estimators accept."""
+    pretrained = SimpleNamespace(
+        num_hidden_layers=num_layers,
+        hidden_size=2880,
+        num_attention_heads=64,
+        num_key_value_heads=8,
+        head_dim=64,
+    )
+    if layer_types is not None:
+        pretrained.layer_types = layer_types
+    if sliding_window is not None:
+        pretrained.sliding_window = sliding_window
+    return SimpleNamespace(
+        is_encoder_decoder=False,
+        quant_config=None,
+        pretrained_config=pretrained,
+        get_num_attention_layers=lambda: num_layers,
+    )
+
+
+def _v2_mapping(num_layers=24):
+    mapping = Mock(enable_attention_dp=False, tp_size=2)
+    mapping.pp_layers.return_value = list(range(num_layers))
+    mapping.is_last_pp_rank.return_value = True
+    return mapping
+
+
+class TestCacheBytesPerRequest:
+    """KVCacheManagerV2.get_cache_bytes_per_request estimates per-request spend."""
+
+    # kv_factor(2) * head_dim(64) * kv heads(8) / tp(2) * 2 bytes (no quant)
+    LAYER_BYTES = 1024
+    TPB = 64
+    MSL = 65536
+
+    @staticmethod
+    def _window_tokens(window, headroom, tpb=64):
+        return (math.ceil((window + headroom - 2) / tpb) + 1) * tpb
+
+    @staticmethod
+    def _full_tokens(msl, headroom, tpb=64):
+        return math.ceil((msl + headroom) / tpb) * tpb
+
+    def _call(self, model_config, **kwargs):
+        args = dict(
+            tokens_per_block=self.TPB,
+            kv_cache_config=KvCacheConfig(enable_block_reuse=False),
+            max_seq_len=self.MSL,
+            spec_config=None,
+        )
+        args.update(kwargs)
+        return KVCacheManagerV2.get_cache_bytes_per_request(model_config, _v2_mapping(), **args)
+
+    def test_explicit_windows_are_intercept_covered(self):
+        """Configured windows are charged as fixed per-request retention in
+        the affine intercept (``get_cache_size_per_token``), which the budget
+        split reserves up front. The slope-funded estimate must not count
+        that retention again: only the growing full-attention layers remain."""
+        from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
+            BASE_GENERATION_TOKEN_COUNT,
+        )
+
+        bytes_per_request = self._call(
+            _v2_model_config(),
+            kv_cache_config=KvCacheConfig(
+                enable_block_reuse=False, max_attention_window=[128, self.MSL]
+            ),
+        )
+        headroom = BASE_GENERATION_TOKEN_COUNT
+        expected = 12 * self.LAYER_BYTES * self._full_tokens(self.MSL, headroom)
+        assert bytes_per_request == expected
+
+    def test_fully_window_covered_target_reports_zero(self):
+        """Every layer windowed and intercept-covered: the target spends
+        nothing per request from the slope budget. Zero is a valid weight,
+        not a decline."""
+        bytes_per_request = self._call(
+            _v2_model_config(),
+            kv_cache_config=KvCacheConfig(enable_block_reuse=False, max_attention_window=[128]),
+        )
+        assert bytes_per_request == 0
+
+    def test_windows_derive_from_layer_types_like_runtime_creation(self):
+        """No config windows, but the model schedule bounds runtime retention."""
+        from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
+            BASE_GENERATION_TOKEN_COUNT,
+        )
+
+        bytes_per_request = self._call(
+            _v2_model_config(
+                layer_types=["sliding_attention", "full_attention"] * 12,
+                sliding_window=512,
+            )
+        )
+        headroom = BASE_GENERATION_TOKEN_COUNT
+        expected = 12 * self.LAYER_BYTES * self._window_tokens(512, headroom) + (
+            12 * self.LAYER_BYTES * self._full_tokens(self.MSL, headroom)
+        )
+        assert bytes_per_request == expected
+
+    def test_draft_mirrors_are_budgeted_full_length(self):
+        """The drafter's own windows must not bound the estimate: every draft
+        mirror is reserved at the request's full context length."""
+        from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
+            BASE_GENERATION_TOKEN_COUNT,
+        )
+
+        bytes_per_request = self._call(
+            _v2_model_config(
+                layer_types=["sliding_attention", "full_attention"] * 12,
+                sliding_window=512,
+            ),
+            is_draft=True,
+        )
+        headroom = BASE_GENERATION_TOKEN_COUNT
+        expected = 24 * self.LAYER_BYTES * self._full_tokens(self.MSL, headroom)
+        assert bytes_per_request == expected
+
+    def test_draft_subtracts_intercept_covered_window_retention(self):
+        """A draft with configured windows still mirrors full-length, but its
+        affine intercept already reserves the windowed retention; only the
+        growth beyond the window is slope-funded."""
+        from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
+            BASE_GENERATION_TOKEN_COUNT,
+        )
+
+        bytes_per_request = self._call(
+            _v2_model_config(),
+            kv_cache_config=KvCacheConfig(
+                enable_block_reuse=False, max_attention_window=[128, self.MSL]
+            ),
+            is_draft=True,
+        )
+        headroom = BASE_GENERATION_TOKEN_COUNT
+        full = self._full_tokens(self.MSL, headroom)
+        expected = 12 * self.LAYER_BYTES * (full - self._window_tokens(128, headroom)) + (
+            12 * self.LAYER_BYTES * full
+        )
+        assert bytes_per_request == expected
+
+    def test_uniform_full_attention_declines(self):
+        """Per-request spend proportional to the slope reports None so the
+        split keeps its per-token weighting."""
+        assert self._call(_v2_model_config()) is None
+
+    def test_unknown_max_seq_len_declines(self):
+        assert (
+            self._call(
+                _v2_model_config(
+                    layer_types=["sliding_attention", "full_attention"] * 12,
+                    sliding_window=512,
+                ),
+                max_seq_len=None,
+            )
+            is None
+        )
+
+    def test_hybrid_attention_layer_subset_declines(self):
+        """Hybrid recurrent/attention models (e.g. a MambaHybridCacheManagerV2
+        target) decline before touching the pp partition: the static component
+        helper has no hybrid layer mask, so its attention-only layer count
+        cannot be distributed over the full-model partition."""
+        model_config = _v2_model_config(
+            layer_types=["sliding_attention", "full_attention"] * 12,
+            sliding_window=512,
+        )
+        # 12 attention layers among 24 hidden layers.
+        model_config.get_num_attention_layers = lambda: 12
+        mapping = _v2_mapping()
+        # An explicit pp_partition posture: distributing a layer count that
+        # does not sum to the partition raises. The decline must come first.
+        mapping.pp_layers.side_effect = ValueError
+        assert (
+            KVCacheManagerV2.get_cache_bytes_per_request(
+                model_config,
+                mapping,
+                tokens_per_block=self.TPB,
+                kv_cache_config=KvCacheConfig(enable_block_reuse=False),
+                max_seq_len=self.MSL,
+                spec_config=None,
+            )
+            is None
+        )
+
+
+class TestCacheQuotaPerRequest:
+    """get_cache_quota_per_request mirrors the allocator's one-request floor."""
+
+    TPB = 64
+    MSL = 65536
+
+    def _call(self, model_config, **kwargs):
+        args = dict(
+            num_layers=1,
+            tokens_per_block=self.TPB,
+            kv_cache_config=KvCacheConfig(enable_block_reuse=False, avg_seq_len=8192),
+            max_seq_len=self.MSL,
+            spec_config=None,
+            is_draft=True,
+        )
+        args.update(kwargs)
+        return KVCacheManagerV2.get_cache_quota_per_request(model_config, _v2_mapping(), **args)
+
+    def test_floor_includes_resume_headroom_and_granularity(self):
+        """One 1024 B/token draft mirror at 65536 tokens pins 64.0625 MiB of
+        usable pages, but the allocator scales the slot floor by
+        1 / float32(0.95) (1025 -> 1079 blocks, 67.4375 MiB) and rounds the
+        pool up to the 2 MiB allocation granularity: it insists on 68 MiB."""
+        assert self._call(_v2_model_config(num_layers=1)) == 68 * (1 << 20)
+
+    def test_declines_without_runtime_constraints(self):
+        """No avg_seq_len (or an explicit pool_ratio) means the runtime builds
+        no capacity constraints, so there is no allocator floor to reserve."""
+        assert (
+            self._call(
+                _v2_model_config(num_layers=1),
+                kv_cache_config=KvCacheConfig(enable_block_reuse=False),
+            )
+            is None
+        )
+        assert (
+            self._call(
+                _v2_model_config(num_layers=1),
+                kv_cache_config=KvCacheConfig(
+                    enable_block_reuse=False, avg_seq_len=8192, pool_ratio=[1.0]
+                ),
+            )
+            is None
+        )
+
+    def test_unknown_max_seq_len_declines(self):
+        assert self._call(_v2_model_config(num_layers=1), max_seq_len=None) is None
+
+
+class TestPerRequestWeightedSplit:
+    """The GPU budget split weighs managers by per-request spend when known."""
+
+    def _creator(self, total, *, target, draft, max_batch_size=1 << 20):
+        c = _make_creator(
+            max_gpu_total_bytes=total,
+            total_kv_per_token=target.slope + draft.slope,
+            target_kv_per_token=target.slope,
+        )
+        c._max_batch_size = max_batch_size
+        c._kv_cache_manager_cls.get_cache_size_per_token = Mock(
+            return_value=(target.slope, target.intercept)
+        )
+        c._kv_cache_manager_cls.get_cache_bytes_per_request = Mock(
+            return_value=target.bytes_per_request
+        )
+        c._kv_cache_manager_cls.get_cache_quota_per_request = Mock(
+            return_value=target.quota_per_request
+        )
+        c._get_draft_cache_cost = Mock(return_value=draft)
+        return c
+
+    def test_per_request_weighting_overrides_slope_split(self):
+        c = self._creator(
+            1_000,
+            target=CacheCost(slope=80, bytes_per_request=400),
+            draft=CacheCost(slope=20, bytes_per_request=600),
+        )
+
+        target_config, draft_config = c._split_kv_cache_budget_for_draft("max_gpu_total_bytes")
+
+        # Slope weighting would give the draft 200; per-request spend says the
+        # draft pool empties three times as fast per request.
+        assert draft_config.max_gpu_total_bytes == 600
+        assert target_config.max_gpu_total_bytes == 400
+
+    def test_draft_share_capped_at_max_batch_size_mirrors(self):
+        c = self._creator(
+            1_000,
+            target=CacheCost(slope=80, bytes_per_request=400),
+            draft=CacheCost(slope=20, bytes_per_request=300),
+            max_batch_size=1,
+        )
+
+        target_config, draft_config = c._split_kv_cache_budget_for_draft("max_gpu_total_bytes")
+
+        # Weighted share would be 1000 * 300 // 700 = 428, but the pool can
+        # never hold more than max_batch_size full-length mirrors.
+        assert draft_config.max_gpu_total_bytes == 300
+        assert target_config.max_gpu_total_bytes == 700
+
+    def test_cap_uses_allocator_quota_per_mirror(self):
+        """At batch size 1 a 64.0625 MiB usable mirror estimate must be capped
+        at the 68 MiB quota the allocator enforces for one request (slot floor
+        scaled by 1/0.95, pool rounded to the 2 MiB granularity). Capping at
+        the usable bytes hands the 3.9 MiB difference to the target, and the
+        allocator then raises the draft pool past the split's assignment."""
+        mirror_bytes = 67_174_400  # 64.0625 MiB of usable mirror pages
+        mirror_quota = 71_303_168  # 68 MiB allocator floor for one mirror
+        c = self._creator(
+            10 * GB,
+            target=CacheCost(slope=80, bytes_per_request=10 * GB),
+            draft=CacheCost(
+                slope=20, bytes_per_request=mirror_bytes, quota_per_request=mirror_quota
+            ),
+            max_batch_size=1,
+        )
+
+        target_config, draft_config = c._split_kv_cache_budget_for_draft("max_gpu_total_bytes")
+
+        assert draft_config.max_gpu_total_bytes == mirror_quota
+        assert target_config.max_gpu_total_bytes == 10 * GB - mirror_quota
+
+    def test_draft_share_floored_at_allocator_minimum(self):
+        """A weighted share below the one-request allocator floor is raised to
+        it: the allocator takes that much at construction regardless of the
+        split, so a smaller assignment silently overcommits the target."""
+        c = self._creator(
+            1_000,
+            target=CacheCost(slope=80, bytes_per_request=900),
+            draft=CacheCost(slope=20, bytes_per_request=100, quota_per_request=300),
+        )
+
+        target_config, draft_config = c._split_kv_cache_budget_for_draft("max_gpu_total_bytes")
+
+        # Weighted share would be 1000 * 100 // 1000 = 100.
+        assert draft_config.max_gpu_total_bytes == 300
+        assert target_config.max_gpu_total_bytes == 700
+
+    def test_floor_exceeding_slope_budget_is_infeasible(self):
+        """The floor must never push the target below its intercept. If even
+        one mirror's allocator quota does not fit after both intercepts, the
+        allocator will overrun the budget regardless of the split, so the GPU
+        split fails fast exactly like an unfundable fixed cost."""
+        c = self._creator(
+            1_000,
+            target=CacheCost(slope=80, intercept=400, bytes_per_request=900),
+            draft=CacheCost(slope=20, bytes_per_request=100, quota_per_request=700),
+        )
+
+        # The slope budget is 1000 - 400 = 600, below the 700-byte one-mirror
+        # quota. Flooring anyway would hand the draft 700 and the target 300,
+        # below its 400-byte intercept.
+        with pytest.raises(ValueError, match="insufficient"):
+            c._split_kv_cache_budget_for_draft("max_gpu_total_bytes")
+
+    def test_fully_covered_target_weight_hands_slope_budget_to_draft(self):
+        """A target whose entire retention is intercept-funded reports a zero
+        slope-funded weight: the draft takes the remainder, still capped at
+        max_batch_size mirrors."""
+        c = self._creator(
+            1_000,
+            target=CacheCost(slope=80, bytes_per_request=0),
+            draft=CacheCost(slope=20, bytes_per_request=100),
+            max_batch_size=3,
+        )
+
+        target_config, draft_config = c._split_kv_cache_budget_for_draft("max_gpu_total_bytes")
+
+        assert draft_config.max_gpu_total_bytes == 300
+        assert target_config.max_gpu_total_bytes == 700
+
+    def test_missing_request_cost_falls_back_to_slope_weighting(self):
+        c = self._creator(
+            10 * GB,
+            target=CacheCost(slope=80),
+            draft=CacheCost(slope=20, bytes_per_request=600),
+        )
+        c._kv_cache_manager_cls.get_cache_bytes_per_request = Mock(return_value=None)
+
+        target_config, draft_config = c._split_kv_cache_budget_for_draft("max_gpu_total_bytes")
+
+        assert target_config.max_gpu_total_bytes == 8 * GB
+        assert draft_config.max_gpu_total_bytes == 2 * GB
+
+    def test_offload_budget_keeps_slope_weighting(self):
+        """Only the GPU pool caps live concurrency; offload tiers keep the
+        per-token proportional split."""
+        c = self._creator(
+            0,
+            target=CacheCost(slope=80, bytes_per_request=400),
+            draft=CacheCost(slope=20, bytes_per_request=600),
+        )
+        c._kv_cache_config.max_gpu_total_bytes = 0
+        c._kv_cache_config.host_cache_size = 1_000
+
+        target_config, draft_config = c._split_kv_cache_budget_for_draft("host_cache_size")
+
+        assert target_config.host_cache_size == 800
+        assert draft_config.host_cache_size == 200
+
+    def test_vswa_target_with_full_length_draft_mirrors_end_to_end(self, mocker):
+        """A windowed target + full-length draft mirrors through the full split.
+
+        The creator derives the layer_types windows into the config, so the
+        affine costing charges the sliding layers' retention as fixed
+        per-request cost in the intercept, which the split reserves up front.
+        The per-request weights therefore count only slope-funded growth
+        (slope times the block-rounded full sequence for both managers), and
+        the split admits the same worst-case request count in both pools.
+        """
+        recorded = {}
+
+        class RecordingV2(KVCacheManagerV2):
+            @classmethod
+            def get_cache_size_per_token(cls, model_config, mapping, *args, **kwargs):
+                key = "draft_token" if kwargs.get("is_draft") else "target_token"
+                recorded[key] = KVCacheManagerV2.get_cache_size_per_token(
+                    model_config, mapping, *args, **kwargs
+                )
+                return recorded[key]
+
+            @classmethod
+            def get_cache_bytes_per_request(cls, model_config, mapping, *args, **kwargs):
+                key = "draft_req" if kwargs.get("is_draft") else "target_req"
+                recorded[key] = KVCacheManagerV2.get_cache_bytes_per_request(
+                    model_config, mapping, *args, **kwargs
+                )
+                return recorded[key]
+
+        max_seq_len = 65536
+        total_budget = 40 * GB
+        c = _make_creator(max_gpu_total_bytes=total_budget)
+        del c._get_draft_cache_cost
+        c._kv_cache_config.enable_block_reuse = False
+        # No max_attention_window override: like the measured posture, the
+        # windows exist only in the model's layer_types schedule. Both the
+        # affine costing (via _derive_v2_layer_type_attention_windows) and the
+        # per-request estimate derive them from there.
+        c._kv_cache_manager_cls = RecordingV2
+        c._max_seq_len = max_seq_len
+        c._max_batch_size = 256
+        c._max_num_tokens = 8192
+        c._max_beam_width = 1
+        c._mapping = _v2_mapping()
+        c._mapping.has_cp_helix.return_value = False
+        c._speculative_config = SimpleNamespace(
+            spec_dec_mode=SpeculativeDecodingMode.EAGLE3_ONE_MODEL,
+            max_draft_len=3,
+            max_total_draft_tokens=3,
+            tokens_per_gen_step=4,
+            use_dynamic_tree=False,
+            _use_shared_kv_cache=False,
+        )
+        c._model_engine.model.model_config = SimpleNamespace(
+            is_encoder_decoder=False,
+            quant_config=None,
+            pretrained_config=SimpleNamespace(
+                num_hidden_layers=24,
+                hidden_size=2880,
+                num_attention_heads=64,
+                num_key_value_heads=8,
+                head_dim=64,
+                layer_types=["sliding_attention", "full_attention"] * 12,
+                sliding_window=2048,
+            ),
+            get_num_attention_layers=lambda: 24,
+        )
+        c._draft_model_engine = None
+        c._get_effective_draft_config = Mock(
+            return_value=SimpleNamespace(
+                quant_config=None,
+                sparse_attention_config=None,
+                pretrained_config=SimpleNamespace(
+                    num_hidden_layers=1,
+                    hidden_size=2880,
+                    num_attention_heads=64,
+                    num_key_value_heads=4,
+                    head_dim=64,
+                ),
+            )
+        )
+        c._get_num_draft_layers = Mock(return_value=1)
+        # The draft manager class is resolved from the draft config via
+        # get_kv_cache_manager_cls; route it through the recorder too.
+        mocker.patch(
+            "tensorrt_llm._torch.pyexecutor._util.get_kv_cache_manager_cls",
+            autospec=True,
+            return_value=RecordingV2,
+        )
+
+        target_config, draft_config = c._split_kv_cache_budget_for_draft("max_gpu_total_bytes")
+
+        assert draft_config is not None
+        assert target_config.max_gpu_total_bytes + draft_config.max_gpu_total_bytes == total_budget
+
+        target_req = recorded["target_req"]
+        draft_req = recorded["draft_req"]
+        assert target_req is not None and draft_req is not None
+        target_slope, target_intercept = recorded["target_token"]
+        draft_slope, draft_intercept = recorded["draft_token"]
+        slope_budget = total_budget - target_intercept - draft_intercept
+        expected_draft_share = min(
+            slope_budget * draft_req // (target_req + draft_req),
+            c._max_batch_size * draft_req,
+        )
+        assert draft_config.max_gpu_total_bytes == draft_intercept + expected_draft_share
+
+        # The sliding layers' retention lives in target_intercept (reserved up
+        # front), not in the weights: both per-request weights are exactly the
+        # slope-funded growth, slope times the shared block-rounded full
+        # sequence. Counting the intercept-funded retention again in
+        # target_req would shrink the draft share below equal admission (the
+        # double-count this test pins down).
+        full_tokens = draft_req // draft_slope
+        assert draft_req == draft_slope * full_tokens
+        assert target_req == target_slope * full_tokens
+        target_requests = (target_config.max_gpu_total_bytes - target_intercept) // target_req
+        draft_requests = (draft_config.max_gpu_total_bytes - draft_intercept) // draft_req
+        assert abs(target_requests - draft_requests) <= 1
+
+    def test_static_vswa_target_split_equalizes_admitted_requests(self, mocker):
+        """23 sliding (8K window) + 1 full target layer, statically configured
+        windows, one-layer full-length draft mirrors.
+
+        The target intercept reserves the sliding retention for max_batch_size
+        requests before the remainder is weighted. With both slope-funded
+        per-request costs at one full-length layer (64.0625 MiB), the draft's
+        fair share of a ~3.98 GiB remainder is half: 1.99 GiB, 31 full-length
+        mirrors, matching the 31 requests the target's half admits. Counting
+        the already-reserved sliding retention again in the target weight
+        would hand the draft only ~0.81 GiB (12 mirrors) while the matching
+        surplus idles in the target pool.
+        """
+        recorded = {}
+
+        class RecordingV2(KVCacheManagerV2):
+            @classmethod
+            def get_cache_size_per_token(cls, model_config, mapping, *args, **kwargs):
+                key = "draft_token" if kwargs.get("is_draft") else "target_token"
+                recorded[key] = KVCacheManagerV2.get_cache_size_per_token(
+                    model_config, mapping, *args, **kwargs
+                )
+                return recorded[key]
+
+            @classmethod
+            def get_cache_bytes_per_request(cls, model_config, mapping, *args, **kwargs):
+                key = "draft_req" if kwargs.get("is_draft") else "target_req"
+                recorded[key] = KVCacheManagerV2.get_cache_bytes_per_request(
+                    model_config, mapping, *args, **kwargs
+                )
+                return recorded[key]
+
+        max_seq_len = 65536
+        mirror_bytes = 67_174_400  # 1025 blocks * 64 tokens * 1024 B/token
+        slope_budget = 4_273_000_000
+        c = _make_creator(max_gpu_total_bytes=0)
+        del c._get_draft_cache_cost
+        c._kv_cache_config.enable_block_reuse = False
+        c._kv_cache_config.max_attention_window = [8192] * 23 + [max_seq_len]
+        c._kv_cache_manager_cls = RecordingV2
+        c._max_seq_len = max_seq_len
+        c._max_batch_size = 64
+        c._max_num_tokens = 8192
+        c._max_beam_width = 1
+        c._mapping = _v2_mapping()
+        c._mapping.has_cp_helix.return_value = False
+        c._speculative_config = SimpleNamespace(
+            spec_dec_mode=SpeculativeDecodingMode.EAGLE3_ONE_MODEL,
+            max_draft_len=3,
+            max_total_draft_tokens=3,
+            tokens_per_gen_step=4,
+            use_dynamic_tree=False,
+            _use_shared_kv_cache=False,
+        )
+        target_model_config = SimpleNamespace(
+            is_encoder_decoder=False,
+            quant_config=None,
+            pretrained_config=SimpleNamespace(
+                num_hidden_layers=24,
+                hidden_size=2880,
+                num_attention_heads=64,
+                num_key_value_heads=8,
+                head_dim=64,
+            ),
+            get_num_attention_layers=lambda: 24,
+        )
+        c._model_engine.model.model_config = target_model_config
+        c._draft_model_engine = None
+        c._get_effective_draft_config = Mock(
+            return_value=SimpleNamespace(
+                quant_config=None,
+                sparse_attention_config=None,
+                pretrained_config=SimpleNamespace(
+                    num_hidden_layers=1,
+                    hidden_size=2880,
+                    num_attention_heads=64,
+                    num_key_value_heads=8,
+                    head_dim=64,
+                ),
+            )
+        )
+        c._get_num_draft_layers = Mock(return_value=1)
+        mocker.patch(
+            "tensorrt_llm._torch.pyexecutor._util.get_kv_cache_manager_cls",
+            autospec=True,
+            return_value=RecordingV2,
+        )
+        # Size the budget so exactly slope_budget remains after the reserved
+        # intercepts (the draft is a plain full-attention layer: intercept 0).
+        _, target_intercept = KVCacheManagerV2.get_cache_size_per_token(
+            target_model_config,
+            _v2_mapping(),
+            tokens_per_block=64,
+            max_seq_len=max_seq_len,
+            max_batch_size=c._max_batch_size,
+            max_num_tokens=c._max_num_tokens,
+            kv_cache_config=c._kv_cache_config,
+            spec_config=c._speculative_config,
+        )
+        total_budget = target_intercept + slope_budget
+        c._kv_cache_config.max_gpu_total_bytes = total_budget
+
+        target_config, draft_config = c._split_kv_cache_budget_for_draft("max_gpu_total_bytes")
+
+        assert target_config.max_gpu_total_bytes + draft_config.max_gpu_total_bytes == total_budget
+        _, draft_intercept = recorded["draft_token"]
+        assert draft_intercept == 0
+        # Both slope-funded per-request costs are one full-length 1024 B/token
+        # layer: the target's 23 sliding windows are intercept-covered.
+        assert recorded["draft_req"] == mirror_bytes
+        assert recorded["target_req"] == mirror_bytes
+        assert draft_config.max_gpu_total_bytes == slope_budget // 2
+        draft_requests = draft_config.max_gpu_total_bytes // mirror_bytes
+        target_requests = (target_config.max_gpu_total_bytes - target_intercept) // mirror_bytes
+        assert draft_requests == 31
+        assert target_requests == 31

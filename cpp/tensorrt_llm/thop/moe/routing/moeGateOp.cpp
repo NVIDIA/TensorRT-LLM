@@ -35,7 +35,8 @@ void gate_forward(th::Tensor scores_in, // [batch_size, nExperts] - pre-computed
     th::Tensor tid2eid,                 // empty tensor if non-hash mode
     th::Tensor out_weights,             // [batch_size, topK] - pre-allocated
     th::Tensor out_indices,             // [batch_size, topK] - pre-allocated
-    int64_t topk, double route_scale, bool is_hash)
+    int64_t topk, double route_scale, bool is_hash, std::optional<th::Tensor> image_mask,
+    std::optional<th::Tensor> vision_bias)
 {
     TORCH_CHECK(topk == kTOPK, "topk must be ", kTOPK);
     auto const n_experts = scores_in.size(1);
@@ -50,13 +51,28 @@ void gate_forward(th::Tensor scores_in, // [batch_size, nExperts] - pre-computed
         "All tensors must be on the same device");
 
     auto const batch_size = scores_in.size(0);
+    TORCH_CHECK(image_mask.has_value() == vision_bias.has_value(),
+        "image_mask and vision_bias must either both be provided or both be omitted");
+    if (image_mask.has_value())
+    {
+        TORCH_CHECK(!is_hash, "image routing is not supported in hash mode");
+        TORCH_CHECK(image_mask->is_cuda() && vision_bias->is_cuda(), "image_mask and vision_bias must be CUDA tensors");
+        TORCH_CHECK(
+            image_mask->get_device() == scores_in.get_device() && vision_bias->get_device() == scores_in.get_device(),
+            "image_mask and vision_bias must be on the same device as scores_in");
+        TORCH_CHECK(image_mask->scalar_type() == torch::kBool, "image_mask must be bool");
+        TORCH_CHECK(vision_bias->scalar_type() == torch::kFloat32, "vision_bias must be float32");
+        TORCH_CHECK(image_mask->numel() == batch_size, "image_mask must contain one value per token");
+        TORCH_CHECK(vision_bias->numel() == n_experts, "vision_bias must contain one value per expert");
+    }
     auto stream = at::cuda::getCurrentCUDAStream(scores_in.get_device());
 
     // Call the kernel implementation from kernels namespace
     kernels::gate_forward(scores_in.data_ptr<float>(), is_hash ? nullptr : bias.data_ptr<float>(),
         is_hash ? input_ids.data_ptr<int>() : nullptr, is_hash ? tid2eid.data_ptr<int>() : nullptr,
         out_weights.data_ptr<float>(), out_indices.data_ptr<int>(), batch_size, static_cast<int>(n_experts),
-        static_cast<float>(route_scale), is_hash, stream);
+        static_cast<float>(route_scale), is_hash, image_mask.has_value() ? image_mask->data_ptr<bool>() : nullptr,
+        vision_bias.has_value() ? vision_bias->data_ptr<float>() : nullptr, stream);
 }
 
 } // namespace torch_ext
@@ -67,7 +83,8 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def(
         "gate_forward(Tensor scores_in, Tensor bias, Tensor input_ids, Tensor tid2eid, Tensor(a!) out_weights, "
-        "Tensor(b!) out_indices, int topk, float route_scale, bool is_hash) -> ()");
+        "Tensor(b!) out_indices, int topk, float route_scale, bool is_hash, Tensor? image_mask=None, "
+        "Tensor? vision_bias=None) -> ()");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)

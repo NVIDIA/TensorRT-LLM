@@ -79,6 +79,10 @@ MODEL_PATH_DICT = {
     "deepseek_v4_pro_dspark": "DeepSeek-V4-Pro-DSpark",
     # NVFP4 routed experts (MIXED_PRECISION); the -DSpark entry above is FP8.
     "deepseek_v4_pro_nvfp4_dspark": "DeepSeek-V4-Pro-nvfp4-DSpark",
+    # DeepSeek V4.1 Flash (CSA2 sparse attention, MXFP4 routed experts). The
+    # DSpark draft stages are embedded in this checkpoint, so it is also the
+    # `speculative_model` of the DSpark perf-sanity cases.
+    "deepseek_v41_flash": "DeepSeek-V4.1-Flash",
     # GLM-5 FP8 (MoE)
     "glm_5_fp8": "GLM-5-FP8",
     # GLM-5.2 NVFP4 (MoE, MLA + DSA on the DeepSeek-V3.2 code path)

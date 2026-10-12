@@ -593,7 +593,7 @@ def _assert_decoder_cuda_graphs_captured(llm: LLM) -> None:
     """
     model_engine = llm._executor.engine.model_engine
     assert isinstance(model_engine._runner, EncoderDecoderRunner)
-    assert not model_engine._runner._encoder_cuda_graph_runner.enabled
+    assert not model_engine._runner._encoder_stage._encoder_cuda_graph_runner.enabled
     assert model_engine.cuda_graph_runner.enabled
     assert model_engine.cuda_graph_runner.graphs
 
@@ -913,7 +913,7 @@ def test_t5_pytorch_continuous_admission_replays_encoder_and_mixed_cuda_graphs(
     ) as llm:
         model_engine = llm._executor.engine.model_engine
         assert isinstance(model_engine._runner, EncoderDecoderRunner)
-        encoder_runner = model_engine._runner._encoder_cuda_graph_runner
+        encoder_runner = model_engine._runner._encoder_stage._encoder_cuda_graph_runner
         decoder_runner = model_engine.cuda_graph_runner
 
         assert encoder_runner.enabled

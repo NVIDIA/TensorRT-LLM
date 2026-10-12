@@ -161,6 +161,16 @@ class DeepEPLowLatency(Communication):
             return (self.hidden_size // 2) in self.SUPPORTED_HIDDEN_SIZES
         return False
 
+    def supports_finalize_before_combine(self) -> bool:
+        """``combine`` here is not an unweighted row sum over a per-token tensor.
+
+        It consumes expert-major rows (``[local_experts, ep_size * max_tokens,
+        hidden]``) and applies the routing weights itself, and the post-dispatch
+        ``token_final_scales`` are unit placeholders. A finalize that already
+        applied the real weights per token cannot feed it.
+        """
+        return False
+
     def supports_low_precision_combine(self) -> bool:
         """
         DeepEP Low Latency supports low-precision combine for: fp8_qdq, nvfp4, w4afp8

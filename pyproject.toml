@@ -45,6 +45,7 @@ exclude = [
     "triton_kernels/**",
     "tensorrt_llm/_torch/cute_dsl_kernels/rubin/moe/manual_mma_128dp.py",
     "tensorrt_llm/_torch/cute_dsl_kernels/rubin/moe/rubin_contiguous_grouped_blockscaled_gemm_fused_fc12.py",
+    "tensorrt_llm/grpc/openengine/_generated/**",
 ]
 
 
@@ -899,6 +900,12 @@ mypy_path = ".:tests/unittest:tests/unittest/_torch/sampler"
 [[tool.mypy.overrides]]
 module = ["tensorrt_llm.bindings.*"]
 ignore_errors = true
+
+# Generated pybind11 stub; DeepGEMM returns a bare py::dict from
+# get_bf16_mega_gate_config, which stubgen renders without type parameters.
+[[tool.mypy.overrides]]
+module = ["tensorrt_llm.deep_gemm_cpp_tllm", "deep_gemm_cpp_tllm"]
+disallow_any_generics = false
 
 [[tool.mypy.overrides]]
 module = [

@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import json
 import math
 import re
 import tempfile
@@ -31,6 +32,7 @@ from tensorrt_llm._torch.models.checkpoints.hf.checkpoint_loader import \
     HfCheckpointLoader
 from tensorrt_llm._torch.models.modeling_gemma3 import Gemma3ForCausalLM
 from tensorrt_llm._torch.models.modeling_llama import LlamaForCausalLM
+from tensorrt_llm._torch.models.modeling_qwen3 import Qwen3ForCausalLM
 from tensorrt_llm._torch.peft.lora.config import LoraConfig
 from tensorrt_llm._torch.virtual_memory import RestoreMode
 from tensorrt_llm.commands.serve import get_llm_args, is_non_default_or_required
@@ -562,6 +564,62 @@ def test_dspark_target_layer_ids_resolved_from_checkpoint(tmp_path):
 
     # Order is preserved (projection columns are order-dependent).
     assert args.speculative_config.target_layer_ids == [3, 1, 2]
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "spelling", ["prefixed", "plain", "dspark_config", "dflash_config"])
+def test_dspark_nested_language_config(tmp_path: Path, spelling: str) -> None:
+    values = {
+        "target_layer_ids": [0, 20, 39],
+        "mask_token_id": 0,
+        "block_size": 5,
+        "markov_rank": 256,
+    }
+    if spelling == "prefixed":
+        config = {f"dspark_{key}": value for key, value in values.items()}
+        config["dspark_noise_token_id"] = config.pop("dspark_mask_token_id")
+    elif spelling == "plain":
+        config = values
+    else:
+        config = {spelling: values}
+    (tmp_path / "config.json").write_text(json.dumps({"text_config": config}),
+                                          encoding="utf-8")
+
+    args = TorchLlmArgs(
+        model="/tmp/dummy_model",
+        skip_tokenizer_init=True,
+        speculative_config=DSparkDecodingConfig(max_draft_len=5,
+                                                speculative_model=tmp_path),
+    )
+    spec = args.speculative_config
+    assert spec.target_layer_ids == [0, 20, 39]
+    assert spec.mask_token_id == 0
+    assert spec.block_size == 5
+    assert spec.markov_rank == 256
+
+
+@pytest.mark.cpu_only
+def test_dspark_language_scope_precedes_legacy_fallback(tmp_path: Path) -> None:
+    config = {
+        "dspark_target_layer_ids": [1, 2, 3],
+        "dspark_markov_rank": 256,
+        "text_config": {
+            "dspark_target_layer_ids": [0, 20, 39],
+            "dspark_noise_token_id": 0,
+        },
+    }
+    (tmp_path / "config.json").write_text(json.dumps(config), encoding="utf-8")
+
+    args = TorchLlmArgs(
+        model="/tmp/dummy_model",
+        skip_tokenizer_init=True,
+        speculative_config=DSparkDecodingConfig(max_draft_len=5,
+                                                speculative_model=tmp_path),
+    )
+    assert args.speculative_config.target_layer_ids == [0, 20, 39]
+    assert args.speculative_config.mask_token_id == 0
+    assert args.speculative_config.markov_rank == 256
 
 
 @pytest.mark.cpu_only
@@ -3366,6 +3424,33 @@ class TestServeDefaults:
         assert llm_args.get("max_batch_size") == 128
         assert llm_args.get("tensor_parallel_size") == 4
 
+    def test_serve_enable_locality_domain_flag(self):
+        llm_args, _ = get_llm_args(model=llama_model_path, backend="pytorch")
+        assert llm_args.get("enable_locality_domains", False) is False
+
+        llm_args, _ = get_llm_args(model=llama_model_path,
+                                   backend="pytorch",
+                                   enable_locality_domains=True)
+
+        assert llm_args["enable_locality_domains"] is True
+
+    @pytest.mark.cpu_only
+    @pytest.mark.parametrize("enabled", [False, True])
+    @pytest.mark.parametrize("load_format", ["AUTO", "GMS"])
+    def test_locality_domains_config_validation(
+            self, enabled: bool, load_format: Literal["AUTO", "GMS"]) -> None:
+        assert "enable_locality_domains" not in BaseLlmArgs.model_fields
+        kwargs = dict(model=llama_model_path,
+                      enable_locality_domains=enabled,
+                      load_format=load_format)
+        if enabled and load_format == "GMS":
+            with pytest.raises(ValidationError,
+                               match="GMS.*enable_locality_domains"):
+                TorchLlmArgs(**kwargs)
+        else:
+            args = TorchLlmArgs(**kwargs)
+            assert args.enable_locality_domains is enabled
+
     def test_serve_video_pruning_rate_maps_to_multimodal_config(self):
         llm_args, _ = get_llm_args(
             model=llama_model_path,
@@ -3546,8 +3631,11 @@ class TestServeDefaults:
         with (
                 patch("tensorrt_llm.commands.serve.get_is_diffusion_only_model",
                       return_value=False),
-                pytest.raises(click.UsageError,
-                              match="num_serve_frontends must be 1"),
+                pytest.raises(
+                    click.UsageError,
+                    match=
+                    "Multiple gRPC frontends require --grpc-protocol openengine"
+                ),
         ):
             serve_main(
                 args=[
@@ -3555,6 +3643,24 @@ class TestServeDefaults:
                 ],
                 standalone_mode=False,
             )
+
+    def test_serve_set_grpc_openengine_uses_multiple_frontends(self) -> None:
+        with (
+                patch("tensorrt_llm.commands.serve.get_is_diffusion_only_model",
+                      return_value=False),
+                patch("tensorrt_llm.grpc.openengine.server.launch_server") as
+                mock_launch_server,
+        ):
+            serve_main(
+                args=[
+                    "dummy/model", "--grpc", "--grpc-protocol", "openengine",
+                    "--gpus_per_node", "1", "--set", "num_serve_frontends=2"
+                ],
+                standalone_mode=False,
+            )
+
+        mock_launch_server.assert_called_once()
+        assert mock_launch_server.call_args.args[2]["num_serve_frontends"] == 2
 
     def test_serve_set_does_not_capture_misspelled_options(self) -> None:
         with pytest.raises(click.NoSuchOption):
@@ -3591,16 +3697,16 @@ class TestServeDefaults:
 
 class TestPyTorchBackendModelDefaults:
 
-    def get_tinyllama_path(self):
+    def get_qwen_path(self):
         # Use local model path if available, otherwise use HuggingFace ID
         model_root = llm_models_root()
         if model_root:
-            local_path = model_root / "llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
+            local_path = model_root / "Qwen3/Qwen3-0.6B"
             if local_path.exists():
                 return str(local_path)
 
         # Fallback to HuggingFace model ID
-        return "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+        return "Qwen/Qwen3-0.6B"
 
     @pytest.fixture(autouse=True)
     def setup(self, monkeypatch, tmp_path):
@@ -3619,17 +3725,17 @@ class TestPyTorchBackendModelDefaults:
                 }
             }
 
-        self.original_get_model_defaults = getattr(LlamaForCausalLM,
+        self.original_get_model_defaults = getattr(Qwen3ForCausalLM,
                                                    'get_model_defaults', None)
-        setattr(LlamaForCausalLM, 'get_model_defaults',
+        setattr(Qwen3ForCausalLM, 'get_model_defaults',
                 classmethod(mock_get_model_defaults))
 
         yield
 
         if self.original_get_model_defaults is None:
-            delattr(LlamaForCausalLM, 'get_model_defaults')
+            delattr(Qwen3ForCausalLM, 'get_model_defaults')
         else:
-            setattr(LlamaForCausalLM, 'get_model_defaults',
+            setattr(Qwen3ForCausalLM, 'get_model_defaults',
                     self.original_get_model_defaults)
 
     @pytest.mark.part0
@@ -3637,7 +3743,7 @@ class TestPyTorchBackendModelDefaults:
         self.get_model_defaults_called = False
 
         with TorchLLM(
-                model=self.get_tinyllama_path(),
+                model=self.get_qwen_path(),
                 backend='pytorch',
                 skip_tokenizer_init=True,
                 env_overrides={"TLLM_WORKER_USE_SINGLE_PROCESS": "1"},
@@ -3654,7 +3760,7 @@ class TestPyTorchBackendModelDefaults:
         self.get_model_defaults_called = False
 
         with TorchLLM(
-                model=self.get_tinyllama_path(),
+                model=self.get_qwen_path(),
                 backend='pytorch',
                 enable_chunked_prefill=False,
                 max_batch_size=42,
@@ -3676,7 +3782,7 @@ class TestPyTorchBackendModelDefaults:
         self.get_model_defaults_called = False
 
         with TorchLLM(
-                model=self.get_tinyllama_path(),
+                model=self.get_qwen_path(),
                 backend='pytorch',
                 max_batch_size=42,
                 skip_tokenizer_init=True,
@@ -3701,7 +3807,7 @@ class TestPyTorchBackendModelDefaults:
         self.get_model_defaults_called = False
 
         with TorchLLM(
-                model=self.get_tinyllama_path(),
+                model=self.get_qwen_path(),
                 backend='pytorch',
                 kv_cache_config=KvCacheConfig(),
                 skip_tokenizer_init=True,
@@ -4056,6 +4162,8 @@ def test_kv_cache_compression_config_dispatches_by_algorithm():
     assert cold_config.model_dump() == {
         "algorithm": "quantization_for_cold_page",
         "quant": "nvfp4",
+        "skip_rope_quantization": False,
+        "nvfp4_residual_dim": 64,
         "scale_checkpoint_path": None,
     }
     assert not cold_config.changes_physical_kv_length
@@ -4071,6 +4179,35 @@ def test_kv_cache_compression_config_dispatches_by_algorithm():
         },
     ).kv_cache_compression_config
     assert cold_config_with_scales.scale_checkpoint_path == "/tmp/nvfp4-kv-scales"
+
+    for options, expected in [
+        ({
+            "skip_rope_quantization": True
+        }, (True, 64)),
+        ({
+            "nvfp4_residual_dim": 0
+        }, (False, 0)),
+    ]:
+        config = TorchLlmArgs(
+            model="/tmp/dummy_model",
+            kv_cache_compression_config={
+                "algorithm": "quantization_for_cold_page",
+                **options
+            },
+        ).kv_cache_compression_config
+        assert (config.skip_rope_quantization,
+                config.nvfp4_residual_dim) == expected
+        assert ColdPageQuantizationCompressionConfig.model_validate_json(
+            config.model_dump_json()) == config
+    for option in ("skip_rope_quantization", "nvfp4_residual_dim"):
+        with pytest.raises(ValidationError):
+            TorchLlmArgs(
+                model="/tmp/dummy_model",
+                kv_cache_compression_config={
+                    "algorithm": "quantization_for_cold_page",
+                    option: "maybe"
+                },
+            )
 
     with pytest.raises(ValidationError):
         TorchLlmArgs(

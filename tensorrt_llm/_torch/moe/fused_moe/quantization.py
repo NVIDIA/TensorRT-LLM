@@ -3574,30 +3574,20 @@ class NVFP4MarlinFusedMoEMethod(NVFP4CutlassFusedMoEMethod):
 
 
 class W4A16NVFP4CutlassFusedMoEMethod(NVFP4CutlassFusedMoEMethod):
-    """W4A16 dequant-on-the-fly variant of NVFP4 MoE for SM<100.
-
-    Loads an unmodified NVFP4 MoE ckpt; only load-time change is un-swizzling
-    per-block scales once so the per-forward dequant skips that step.
-    ``CutlassFusedMoE.run_moe`` dispatches here and uses an active-mask Triton
-    kernel (``dequant_active_experts_to_hp``) to dequant only routed experts
-    into a static [E_total, N, K] workspace, then runs the bf16 ``fused_moe``.
-    """
+    """Dequantize active NVFP4 experts into a BF16/FP16 workspace for CUTLASS."""
 
     quantizes_nvfp4_activations = False
 
-    def process_weights_after_loading(self, module: torch.nn.Module):
-        super().process_weights_after_loading(module)
+    def _interleave_w3_w1_weight_scale(
+            self, dst_w3_w1_weight_scale: torch.Tensor) -> None:
+        # Dequantization reads linear scales, including host copies migrated
+        # into resident slots by online EPLB.
+        pass
 
-        # Scale buffer: int32-packed FP8, viewed as uint8 has shape
-        # [E, pad_up(N, 128), pad_up(K/sf_vec, 4)] -- the 3D layout
-        # block_scale_interleave_reverse accepts.
-        def _unswizzle_inplace(scale_param: torch.nn.Parameter):
-            sf_view = scale_param.data.view(float4_sf_dtype)
-            linear = torch.ops.trtllm.block_scale_interleave_reverse(sf_view)
-            scale_param.data.view(float4_sf_dtype).copy_(linear)
-
-        _unswizzle_inplace(module.w3_w1_weight_scale)
-        _unswizzle_inplace(module.w2_weight_scale)
+    def _interleave_w2_weight_scale(self,
+                                    dst_w2_weight_scale: torch.Tensor) -> None:
+        # FC2 uses the same linear layout for resident and host copies.
+        pass
 
     def dequant_active_experts_to_hp(
         self,
