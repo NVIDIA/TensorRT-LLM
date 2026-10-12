@@ -119,6 +119,20 @@ def test_helper_cubin_is_what_the_real_op_loads(tmp_path, m, n, k):
     assert _entries(cache) == built, "real op compiled a different variant"
 
 
+def test_provider_finds_kimi_fp8_weight_read_linears():
+    """Kimi K3's attention and shared-expert FP8 projections are not
+    ``Linear`` modules but run the same swap-AB GEMM."""
+    from tensorrt_llm._torch.models.modeling_kimi_linear import _Fp8BlockScaleWeightReadLinear
+
+    n, k = 512, 256
+    w = torch.zeros(n, k, device="cuda").to(torch.float8_e4m3fn)
+    ws = torch.ones(n // 128, k // 128, device="cuda")
+    model = torch.nn.ModuleList([_Fp8BlockScaleWeightReadLinear(w, ws, n)])
+    p = jdg.FP8LinearDeepGemmProvider(model, max_num_tokens=64)
+    assert p.shapes == [(n, k)]
+    assert p.plan_tokens(17) == [jdg.spec_for(17, n, k)]
+
+
 def test_provider_enumeration_windows():
     p = jdg.FP8LinearDeepGemmProvider(torch.nn.Module(), max_num_tokens=100)
     p.shapes = [(128, 512)]

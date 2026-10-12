@@ -1477,8 +1477,18 @@ class PyTorchModelEngine(ModelEngine):
             return
         from .. import jit_prefetch_deep_gemm as jdg
         if jdg.supported():
-            dg_provider = jdg.FP8LinearDeepGemmProvider(
-                self.model, max_num_tokens=self.max_num_tokens)
+            # MLA with a cached prefix runs kv_b_proj over up to chunk_size x
+            # chunked_prefill_buffer_batch_size cached tokens per loop, more
+            # than max_num_tokens rows.
+            rf = self.attn_runtime_features
+            max_m = self.max_num_tokens
+            if rf.chunked_prefill and rf.cache_reuse:
+                max_m = max(
+                    max_m,
+                    int(rf.chunk_size or 0) *
+                    int(rf.chunked_prefill_buffer_batch_size or 1))
+            dg_provider = jdg.FP8LinearDeepGemmProvider(self.model,
+                                                        max_num_tokens=max_m)
             dg_moe = jdg.DeepGemmMoEProvider(self.model)
             from ..attention.backends.sparse.dsa import indexer as dsa_indexer
             has_dsa = (bool(dsa_indexer.DG_INDEXER_VARIANTS)

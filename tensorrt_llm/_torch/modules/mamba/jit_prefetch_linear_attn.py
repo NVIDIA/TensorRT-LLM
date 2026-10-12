@@ -181,7 +181,7 @@ class LinearAttnProvider:
             if isinstance(s, _GdnShape):
                 calls.extend(self._plan_gdn(s, sum(ctx_lens), gen_tokens))
             else:
-                calls.extend(self._plan_kda(s, sum(ctx_lens) + gen_tokens))
+                calls.extend(self._plan_kda(s, sum(ctx_lens), gen_tokens))
         return calls
 
     def enumerate_batches(self) -> Iterator[Any]:
@@ -277,11 +277,18 @@ class LinearAttnProvider:
             self._gated_norm(t, s.v_heads, s.v_dim, z, s.fp8_norm, "silu")
         return list(rec)
 
-    def _plan_kda(self, s: _KdaShape, t: int) -> List[KernelCall]:
+    def _plan_kda(self, s: _KdaShape, p: int, d: int) -> List[KernelCall]:
+        from .fuse_elementwise_ops import extract_transpose_prefill_slice
+
         meta = torch.device("meta")
-        g_out = torch.empty(t, s.heads * s.head_dim, dtype=s.dtype, device=meta).view(
-            t, s.heads, s.head_dim
-        )
+        t = p + d
+        proj = s.heads * s.head_dim
+        g_out = torch.empty(t, proj, dtype=s.dtype, device=meta).view(t, s.heads, s.head_dim)
         with shadow_launches() as rec, _device_index_for_meta(self.device_index):
+            if p > 0:
+                # forward_prefill repacks the [q | k | v] columns of the fused
+                # [T, 4 * proj] qkvg projection output for the convolution.
+                qkvg = torch.empty(p, 4 * proj, dtype=s.dtype, device=meta)
+                extract_transpose_prefill_slice(qkvg, p, 0, 3 * proj)
             self._gated_norm(t, s.heads, s.head_dim, g_out, False, "sigmoid")
         return list(rec)

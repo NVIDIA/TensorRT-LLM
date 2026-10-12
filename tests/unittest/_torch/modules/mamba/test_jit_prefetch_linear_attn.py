@@ -107,13 +107,21 @@ def _real_gdn(s, p, d):
 
 
 def _real_kda(s, t):
+    from tensorrt_llm._torch.modules.mamba.fuse_elementwise_ops import (
+        extract_transpose_prefill_slice,
+    )
     from tensorrt_llm._torch.modules.mamba.layernorm_gated import rms_norm_gated_token_major
 
     dev = torch.device("cuda")
-    g = torch.randn(t, s.heads * s.head_dim, dtype=s.dtype, device=dev).view(t, s.heads, s.head_dim)
+    proj = s.heads * s.head_dim
+    # KimiKDALinearAttention._project_packed_conv_input with the fused FP8
+    # qkvg projection: [T, 4 * proj], the [q | k | v] columns repacked.
+    qkvg = torch.randn(t, 4 * proj, dtype=s.dtype, device=dev)
+    g = torch.randn(t, proj, dtype=s.dtype, device=dev).view(t, s.heads, s.head_dim)
     x = torch.randn(t * s.heads, s.head_dim, dtype=s.dtype, device=dev)
     w = torch.randn(s.head_dim, dtype=s.dtype, device=dev)
     with jp.shadow_launches() as rec:
+        extract_transpose_prefill_slice(qkvg, t, 0, 3 * proj)
         rms_norm_gated_token_major._init_fn(x, g, w, 1e-6, gate_activation="sigmoid")
     return list(rec)
 
@@ -143,7 +151,11 @@ def test_kda_planned_keys_cover_real_launches(t):
     batch = type("B", (), {"ctx_chunk_lens": [t], "gen_tokens": 0})()
     planned = _keys(p(batch))
     real = _keys(_real_kda(s, t))
-    assert real and real <= planned, f"unplanned: {sorted(real - planned)}"
+    assert {name for name, _ in real} == {
+        "_extract_transpose_prefill_kernel",
+        "_rms_norm_gated_fwd_multirow_kernel",
+    }, real
+    assert real <= planned, f"unplanned: {sorted(real - planned)}"
 
 
 def test_enumeration_covers_pdl_threshold():

@@ -262,13 +262,24 @@ class FP8LinearDeepGemmProvider:
     def __init__(self, model, max_num_tokens: int):
         from .modules.linear import FP8BlockScalesLinearMethod, Linear
 
+        # Kimi K3's FP8 weight-read projections (attention, shared experts)
+        # call the same trtllm::fp8_swap_ab_gemm with BF16 output.
+        try:
+            from .models.modeling_kimi_linear import _Fp8BlockScaleWeightReadLinear
+        except ImportError:
+            _Fp8BlockScaleWeightReadLinear = ()
+
         shapes = set()
         for mod in model.modules():
-            if not isinstance(mod, Linear):
+            if _Fp8BlockScaleWeightReadLinear and isinstance(
+                mod, _Fp8BlockScaleWeightReadLinear
+            ):
+                pass
+            elif not isinstance(mod, Linear):
                 continue
-            if not isinstance(getattr(mod, "quant_method", None), FP8BlockScalesLinearMethod):
+            elif not isinstance(getattr(mod, "quant_method", None), FP8BlockScalesLinearMethod):
                 continue
-            if getattr(mod, "use_cute_dsl_blockscaling_mm", False) or getattr(
+            elif getattr(mod, "use_cute_dsl_blockscaling_mm", False) or getattr(
                 mod, "disable_deep_gemm", False
             ):
                 continue
