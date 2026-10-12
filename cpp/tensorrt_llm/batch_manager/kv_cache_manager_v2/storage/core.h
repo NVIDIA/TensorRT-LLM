@@ -270,7 +270,8 @@ private:
 class HostSlotPool : public SlotPoolBase
 {
 public:
-    HostSlotPool(size_t slotSize, SlotCount numSlots);
+    //! maxNumSlots > 0 reserves address space for that many slots so resizes pin only the changed range.
+    HostSlotPool(size_t slotSize, SlotCount numSlots, SlotCount maxNumSlots = 0);
 
     SlotCount numSlots() const noexcept override;
     void destroy() override;
@@ -401,7 +402,7 @@ public:
 class HostPoolGroup : public PoolGroupBase
 {
 public:
-    HostPoolGroup(SlotCount numSlots, TypedVec<PoolIndex, size_t> const& slotSizeList);
+    HostPoolGroup(SlotCount numSlots, TypedVec<PoolIndex, size_t> const& slotSizeList, SlotCount maxNumSlots = 0);
 
     [[nodiscard]] HostMem const* hostMem(PoolIndex poolIndex) const;
 };

@@ -354,9 +354,9 @@ Address GpuSlotPool::slotAddress(SlotId slot) const
 // HostSlotPool
 // ---------------------------------------------------------------------------
 
-HostSlotPool::HostSlotPool(size_t slotSize, SlotCount numSlots)
+HostSlotPool::HostSlotPool(size_t slotSize, SlotCount numSlots, SlotCount maxNumSlots)
     : SlotPoolBase(slotSize)
-    , mHostMem(alignedSize(numSlots))
+    , mHostMem(alignedSize(numSlots), slotSize, maxNumSlots > 0 ? alignedSize(maxNumSlots) : 0)
 {
 }
 
@@ -583,12 +583,12 @@ GpuPoolGroup::GpuPoolGroup(
 // HostPoolGroup
 // ---------------------------------------------------------------------------
 
-HostPoolGroup::HostPoolGroup(SlotCount numSlots, TypedVec<PoolIndex, size_t> const& slotSizeList)
+HostPoolGroup::HostPoolGroup(SlotCount numSlots, TypedVec<PoolIndex, size_t> const& slotSizeList, SlotCount maxNumSlots)
     : PoolGroupBase(numSlots)
 {
     for (size_t sz : slotSizeList)
     {
-        mPools.push_back(std::make_unique<HostSlotPool>(sz, numSlots));
+        mPools.push_back(std::make_unique<HostSlotPool>(sz, numSlots, maxNumSlots));
     }
 }
 
@@ -661,10 +661,25 @@ HostCacheLevelStorage::HostCacheLevelStorage(
 {
     TLLM_CHECK_WITH_INFO(slotCountList.size() == slotDescList.size(),
         "HostCacheLevelStorage: slotCountList and slotDescList must have the same length");
+    // adjust() redistributes a fixed quota between pool groups, so a group can at most take all of it. Reserve
+    // address space for that, letting each pool resize in place. Total reservation is numPoolGroups x quota of
+    // address space, none of it committed until used.
+    size_t quota = 0;
     for (PoolGroupIndex pgIdx{0}; pgIdx < slotDescList.size(); ++pgIdx)
     {
-        mPoolGroups.push_back(
-            std::make_unique<HostPoolGroup>(slotCountList[pgIdx], slotDescList[pgIdx].slotSizeList()));
+        for (size_t sz : slotDescList[pgIdx].slotSizeList())
+        {
+            quota += roundUp(slotCountToSizeT(slotCountList[pgIdx]) * sz, HostMem::kAlignment);
+        }
+    }
+    for (PoolGroupIndex pgIdx{0}; pgIdx < slotDescList.size(); ++pgIdx)
+    {
+        auto const& sizes = slotDescList[pgIdx].slotSizeList();
+        size_t const groupSlotBytes = std::accumulate(sizes.begin(), sizes.end(), size_t{0});
+        SlotCount const maxNumSlots = groupSlotBytes == 0
+            ? SlotCount{0}
+            : std::max(slotCountList[pgIdx], slotCountValueFromSize(quota / groupSlotBytes + 1));
+        mPoolGroups.push_back(std::make_unique<HostPoolGroup>(slotCountList[pgIdx], sizes, maxNumSlots));
     }
 }
 
