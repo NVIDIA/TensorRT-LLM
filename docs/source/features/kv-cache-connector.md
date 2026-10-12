@@ -83,10 +83,7 @@ These methods run on the leader process and drive the connector's behavior.
 
 ##### Running under VSWA
 
-Multi-layer-group configurations currently fail during connector initialization because retention
-priorities are represented by a single list. This applies to both KV cache managers, even when the
-connector implements the grouped APIs below. Single-window SWA remains allowed. The grouped
-interfaces and example describe the addressing needed for future VSWA connector support.
+Multi-layer-group configurations currently fail during connector initialization because retention priorities are represented by a single list. This applies to both KV cache managers, even when the connector implements the grouped APIs below. Single-window SWA remains allowed. The grouped interfaces and example describe the addressing needed for future VSWA connector support.
 
 Under variable sliding-window attention the KV cache allocates one pool per attention window size, and a page index only means something inside its own layer group. A single tensor and a single flat block list cannot describe that, so three methods have to be implemented together:
 
@@ -98,8 +95,7 @@ Under variable sliding-window attention the KV cache allocates one pool per atte
 
 Implementing the per-layer-group form of a pair is enough — the flat method it replaces does not also have to be defined.
 
-The current single-group restriction is checked during executor bring-up, before worker registration
-or request admission. Implementing all three methods does not bypass that restriction.
+The current single-group restriction is checked during executor bring-up, before worker registration or request admission. Implementing all three methods does not bypass that restriction.
 
 `examples/llm-api/llm_kv_cache_connector_vswa.py` is a worked connector for this case. A VSWA connector has to do five things:
 
