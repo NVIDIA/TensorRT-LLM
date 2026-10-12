@@ -99,6 +99,7 @@ EOF
 Notes:
 
 * The configuration uses `free_gpu_memory_fraction: 0.25` to leave runtime headroom. Each KDA layer also keeps a per-request recurrent state outside the paged KV pool, so reduce this value if the deployment runs out of memory.
+* For small-batch decode (for example TEP8 at low concurrency), export `TRTLLM_LOW_M_GEMM_BACKEND=auto` on the server. The BF16 projections (shared expert, latent MoE down/up, KDA gate) then race the low-M CuTe-DSL GEMMs against cuBLAS instead of running cuBLAS split-K plus a separate reduce kernel. The first launch autotunes and JIT-compiles these kernels, which adds startup time unless the autotuner cache is persisted.
 * This YAML is specifically the DEP16 high-throughput configuration. For the TEP16 low-latency and TEP8 8-GPU configurations, use `examples/kimi_k3/perf_sweep/perf_sweep.sbatch`; changing only `enable_attention_dp` does not reproduce those recipes.
 
 ### Launch the TensorRT LLM Server

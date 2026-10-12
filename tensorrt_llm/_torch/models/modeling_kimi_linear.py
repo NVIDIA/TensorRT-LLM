@@ -116,6 +116,7 @@ from ..modules.kimi_kda import KimiKDALinearAttention
 from ..modules.kimi_kda.kimi_k3_mamba_metadata import KimiK3MambaMetadata
 from ..modules.linear import Linear as TrtllmLinear
 from ..modules.linear import TensorParallelMode, load_weight_shard
+from ..modules.low_m_gemm import _should_apply_low_m_gemm, apply_low_m_gemm
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
 from ..modules.situ import SituAndMul
@@ -1276,6 +1277,10 @@ class KimiK3MoERuntime(nn.Module):
     def _routed_projection(hidden_states: torch.Tensor, projection: nn.Module) -> torch.Tensor:
         if _K3_DISABLE_MIN_LATENCY_LATENT_PROJ or not isinstance(projection, nn.Linear):
             return projection(hidden_states)
+        if _should_apply_low_m_gemm(hidden_states):
+            out = apply_low_m_gemm(projection, hidden_states, projection.weight, None)
+            if out is not None:
+                return out
         return torch.ops.trtllm.dsv3_fused_a_gemm_op(
             hidden_states, projection.weight.t(), None, None
         )
@@ -1485,11 +1490,11 @@ class KimiK3MoERuntime(nn.Module):
         moe_all_reduce = self.routed_experts.all_reduce if self._reduce_routed_output else None
 
         def _routed_output():
-            # Latent down/up projections via the min-latency fused GEMM op:
-            # at <=16 tokens (decode graphs) it runs a single pipelined
-            # bf16 kernel per projection instead of cuBLAS's split-K GEMV +
-            # splitKreduce pair (~17+3.6us -> ~8us for 7168->3584 at M=1);
-            # for larger token counts the op falls back to cuBLAS internally.
+            # Latent down/up projections: dsv3_fused_a_gemm_op has no
+            # pipelined kernel for K3's 7168 <-> 3584 shapes and runs cuBLAS,
+            # which at decode M picks split-K + a separate splitKreduce for
+            # the down-projection. With TRTLLM_LOW_M_GEMM_BACKEND=auto the
+            # low-M dispatcher races its CuTe-DSL kernels against cuBLAS here.
             # TLLM_K3_DISABLE_MIN_LATENCY_LATENT_PROJ=1 restores nn.Linear
             # (A/B escape hatch). When the FP8 weight-read conversion has
             # replaced the projection module, call it directly: its weight is

@@ -93,6 +93,13 @@ def test_attach_reaches_the_router_gate(monkeypatch) -> None:
     assert root.gate._low_m_gemm_name == "gate"
 
 
+def test_kimi_kda_gate_gemm_opts_in() -> None:
+    """The KDA fused [f_a | (g_a) | b] gate GEMM reads a plain weight tensor."""
+    from tensorrt_llm._torch.modules.kimi_kda.kimi_kda_mixer import KimiKDALinearAttention
+
+    assert getattr(KimiKDALinearAttention, LOW_M_GEMM_OPT_IN_ATTR, False)
+
+
 # ---------------------------------------------------------------------------
 # linear.py fast pre-filter
 # ---------------------------------------------------------------------------
