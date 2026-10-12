@@ -16,6 +16,7 @@
  */
 
 #include "kv_cache_manager_v2/localityDomain.h"
+#include "kv_cache_manager_v2/exceptions.h"
 
 #include "tensorrt_llm/runtime/locality_domain/localityDomainResourceConfig.h"
 #include "tensorrt_llm/runtime/locality_domain/locality_domain_utils.h"
@@ -46,7 +47,7 @@ LocalizationMode localizationMode()
     throw std::invalid_argument("TRT_LLM_MOCK_LOCALIZATION_SUPPORT must be '0' or '1' when set");
 }
 
-int resolveNumLocalityDomains(bool enableLocalityDomains, int deviceId)
+int resolveNumLocalityDomains(bool enableLocalityDomains)
 {
     if (!enableLocalityDomains)
     {
@@ -57,8 +58,11 @@ int resolveNumLocalityDomains(bool enableLocalityDomains, int deviceId)
     case LocalizationMode::OFF: return 1;
     case LocalizationMode::MOCK: return locality_domain::detail::kLocalityDomainCount;
     case LocalizationMode::AUTO:
-        return locality_domain::deviceSupportsLocalization(deviceId) ? locality_domain::detail::kLocalityDomainCount
-                                                                     : 1;
+    {
+        CUdevice device{};
+        cuCheck(cuCtxGetDevice(&device));
+        return locality_domain::deviceSupportsLocalization(device) ? locality_domain::detail::kLocalityDomainCount : 1;
+    }
     }
     return 1;
 }

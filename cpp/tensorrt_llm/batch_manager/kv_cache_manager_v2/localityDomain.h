@@ -31,7 +31,7 @@ enum class LocalizationMode
 // "1" reports the device's domain count while backing every domain with ordinary device memory.
 LocalizationMode localizationMode();
 
-// 1 when locality domains are disabled or the device has none, otherwise the domain count.
-int resolveNumLocalityDomains(bool enableLocalityDomains, int deviceId);
+// 1 when locality domains are disabled or the current device has none, otherwise the domain count.
+int resolveNumLocalityDomains(bool enableLocalityDomains);
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

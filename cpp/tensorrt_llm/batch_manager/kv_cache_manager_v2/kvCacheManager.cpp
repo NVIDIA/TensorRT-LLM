@@ -295,7 +295,7 @@ size_t KvCacheManager::getPageIndexUpperBound(LayerId layerId, DataRole role) co
     auto const& attr = mStorage->getBufferAttr(layerId, role);
     LifeCycleId lc = attr.lifeCycleId;
     PoolGroupIndex pg = mStorage->getPoolGroupIndex(lc);
-    SlotCount const numSlots = mStorage->numSlots(pg, kHotLevel);
+    SlotCount const numSlots = mStorage->slotIndexUpperBound(pg, kHotLevel);
     auto slotSizes = mStorage->slotSize(pg);
     size_t slotSize = slotSizes.at(attr.poolIndex);
     return (exactDiv(slotSize, attr.size) * slotCountToSizeT(numSlots) - exactDiv(attr.offset, attr.size))

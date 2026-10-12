@@ -324,7 +324,10 @@ public:
     float getOverallUtilization(CacheLevel level = kHotLevel) const;
 
     // Pool-group slot count (number of pages).
+    // Slots of locality domain 0 (the whole group when not localized).
     SlotCount numSlots(PoolGroupIndex pgIdx, CacheLevel level = kHotLevel) const;
+    // One past the highest usable slot id across all locality domains.
+    SlotCount slotIndexUpperBound(PoolGroupIndex pgIdx, CacheLevel level = kHotLevel) const;
 
     // Layer-to-lifecycle mapping (for KvCacheManager queries).
     std::unordered_map<LayerId, LifeCycleId> const& layerToLifeCycleIds() const noexcept

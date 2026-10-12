@@ -1574,6 +1574,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
     nb::class_<kv::PoolDesc>(m, "PoolDesc")
         .def_prop_ro("pool_index", [](kv::PoolDesc const& self) { return self.poolIndex.value(); })
         .def_ro("base_address", &kv::PoolDesc::baseAddress)
+        .def_ro("mapped_ranges", &kv::PoolDesc::mappedRanges)
         .def_ro("slot_bytes", &kv::PoolDesc::slotBytes);
 
     nb::class_<kv::PoolGroupDesc>(m, "PoolGroupDesc")

@@ -693,6 +693,7 @@ class PoolDesc:
     pool_index: PoolIndex
     base_address: MemAddress
     slot_bytes: int
+    mapped_ranges: list[tuple[int, int]]
 
 class BufferId(NamedTuple):
     layer_id: LayerId

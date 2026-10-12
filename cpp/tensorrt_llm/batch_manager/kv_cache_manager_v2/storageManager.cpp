@@ -284,11 +284,10 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
 
     auto const& gpuTierConfig = std::get<GpuCacheTierConfig>(config.cacheTiers[kHotLevel]);
     size_t const gpuQuota = gpuTierConfig.quota;
+    mNumLocalityDomains = resolveNumLocalityDomains(gpuTierConfig.enableLocalityDomains);
     mGpuPhysMemAllocator = std::make_unique<PooledPhysMemAllocator>(
-        CacheLevelManager::cacheTierGranularity(CacheTier::GPU_MEM, gpuQuota));
+        CacheLevelManager::cacheTierGranularity(CacheTier::GPU_MEM, gpuQuota), mNumLocalityDomains);
     size_t const gpuGranularity = mGpuPhysMemAllocator->physMemSize();
-    mNumLocalityDomains
-        = resolveNumLocalityDomains(gpuTierConfig.enableLocalityDomains, mGpuPhysMemAllocator->deviceId());
 
     // Constraints are hot-level feasibility floors. They are scaled by
     // 1/maxUtilForResume because KvCache::resume rejects a pool group above that
@@ -1629,6 +1628,7 @@ MemAddress StorageManager::getMemPoolBaseAddress(PoolGroupIndex pgIdx, PoolIndex
 TypedVec<PoolGroupIndex, PoolGroupDesc> StorageManager::poolGroupDescs() const
 {
     auto const& descList = slotDescList(kHotLevel);
+    auto const& gpuStorage = static_cast<GpuCacheLevelStorage const&>(*mLevels[kHotLevel].storage);
     TypedVec<PoolGroupIndex, PoolGroupDesc> result;
     result.reserve(descList.size());
     for (PoolGroupIndex pgIdx{0}; pgIdx < descList.size(); ++pgIdx)
@@ -1638,9 +1638,12 @@ TypedVec<PoolGroupIndex, PoolGroupDesc> StorageManager::poolGroupDescs() const
         pools.reserve(slotSizeList.size());
         for (PoolIndex poolIdx{0}; poolIdx < slotSizeList.size(); ++poolIdx)
         {
-            pools.push_back(PoolDesc{poolIdx, getMemPoolBaseAddress(pgIdx, poolIdx), slotSizeList.at(poolIdx)});
+            pools.push_back(PoolDesc{poolIdx, getMemPoolBaseAddress(pgIdx, poolIdx), slotSizeList.at(poolIdx),
+                gpuStorage.mappedRanges(pgIdx, poolIdx)});
         }
-        result.push_back(PoolGroupDesc{pgIdx, numSlots(pgIdx, kHotLevel), descList.at(pgIdx), std::move(pools)});
+        // Localized groups have unmapped holes between domains, so the slot count is the index bound.
+        result.push_back(
+            PoolGroupDesc{pgIdx, gpuStorage.slotIndexUpperBound(pgIdx), descList.at(pgIdx), std::move(pools)});
     }
     return result;
 }
@@ -1658,11 +1661,21 @@ SlotCount StorageManager::numSlots(PoolGroupIndex pgIdx, CacheLevel level) const
     return mLevels.at(level).storage->numSlots(pgIdx);
 }
 
+SlotCount StorageManager::slotIndexUpperBound(PoolGroupIndex pgIdx, CacheLevel level) const
+{
+    return mLevels.at(level).storage->slotIndexUpperBound(pgIdx);
+}
+
 StorageStatistics StorageManager::getStatistics(CacheLevel level, PoolGroupIndex pgIdx) const
 {
     auto const& lvl = mLevels.at(level);
-    SlotCount freeSlots = lvl.storage->numFreeSlots(pgIdx);
-    SlotCount totalSlots = lvl.storage->numSlots(pgIdx);
+    SlotCount freeSlots = 0;
+    SlotCount totalSlots = 0;
+    for (int localityDomainId = 0; localityDomainId < lvl.storage->numLocalityDomains(); ++localityDomainId)
+    {
+        freeSlots += lvl.storage->numFreeSlots(pgIdx, localityDomainId);
+        totalSlots += lvl.storage->numSlots(pgIdx, localityDomainId);
+    }
     SlotCount evictable = lvl.controller.numEvictablePages(pgIdx);
     auto sizes = lvl.storage->slotSize(pgIdx);
     return StorageStatistics{sizes, totalSlots, freeSlots, evictable};
