@@ -91,7 +91,7 @@ Our goals for the framework are two. A user turns a compression method on with *
 
 ### Design Philosophy
 
-TensorRT LLM already compresses KV inside the model and the attention kernel. The new opportunity is **compression at the right moment**: a small step run when nothing is reading the KV, and the whole serving system benefits. Three principles:
+Beyond the forward pass, a serving system offers **extra opportunities to compress the KV cache**: moments where the KV already exists, nothing is reading it, and a dedicated algorithm can run at exactly that time. Using them well means three things:
 
 - **Untouched attention**: attention reads the GPU KV as before.
 - **Seamless insertion**: only page contents change.
