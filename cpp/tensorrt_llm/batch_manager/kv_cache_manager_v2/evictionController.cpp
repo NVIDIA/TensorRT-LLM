@@ -169,7 +169,7 @@ void PerLevelEvictionController::scheduleForEviction(Page& page, bool evictFirst
 }
 
 TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> PerLevelEvictionController::evict(
-    TypedVec<PoolGroupIndex, SlotCount> const& minNumPages)
+    TypedVec<PoolGroupIndex, SlotCount> const& minNumPages, std::optional<int> localityDomainId)
 {
     TLLM_CHECK_DEBUG(minNumPages.size() == numPoolGroups());
 
@@ -185,15 +185,39 @@ TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> PerLevelEvictionControlle
             {
                 throw LogicError("PerLevelEvictionController::evict: page count must be non-negative");
             }
-            SlotCount const available = policy.size() + slotCountValueFromSize(ret[pgIdx].size());
-            if (available < count)
+            if (!localityDomainId.has_value())
             {
-                throw OutOfPagesError("Not enough pages to evict in group " + std::to_string(pgIdx.value()));
+                SlotCount const available = policy.size() + slotCountValueFromSize(ret[pgIdx].size());
+                if (available < count)
+                {
+                    throw OutOfPagesError("Not enough pages to evict in group " + std::to_string(pgIdx.value()));
+                }
             }
             while (slotCountValueFromSize(ret[pgIdx].size()) < count)
             {
-                auto page = policy.pop();
-                page->nodeRef = std::nullopt;
+                SharedPtr<Page> page;
+                if (!localityDomainId.has_value())
+                {
+                    page = policy.pop();
+                    page->nodeRef = std::nullopt;
+                }
+                else
+                {
+                    auto gen = policy.pageGenerator();
+                    while (auto const* candidate = gen())
+                    {
+                        if ((*candidate)->localityDomainId() == localityDomainId)
+                        {
+                            page = *candidate;
+                            break;
+                        }
+                    }
+                    if (!page)
+                    {
+                        throw OutOfPagesError("Not enough pages to evict in group " + std::to_string(pgIdx.value()));
+                    }
+                    remove(page->nodeRef.value());
+                }
                 ret[pgIdx].push_back(page);
                 // @TODO: evict dependencies (like Python _evict_dependencies)
             }
@@ -235,9 +259,23 @@ void PerLevelEvictionController::remove(NodeRef node)
     page->nodeRef = std::nullopt;
 }
 
-SlotCount PerLevelEvictionController::numEvictablePages(PoolGroupIndex pgIdx) const
+SlotCount PerLevelEvictionController::numEvictablePages(PoolGroupIndex pgIdx, std::optional<int> localityDomainId) const
 {
-    return mPolicies.at(pgIdx).size();
+    auto const& policy = mPolicies.at(pgIdx);
+    if (!localityDomainId.has_value())
+    {
+        return policy.size();
+    }
+    SlotCount count = 0;
+    auto gen = policy.pageGenerator();
+    while (auto const* page = gen())
+    {
+        if ((*page)->localityDomainId() == localityDomainId)
+        {
+            ++count;
+        }
+    }
+    return count;
 }
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

@@ -216,6 +216,12 @@ public:
         return mLocalityDomainId;
     }
 
+    // Local index of a slot this allocator issued; nullopt for a foreign slot id.
+    [[nodiscard]] std::optional<SlotCount> localIndexOf(SlotId slot) const noexcept
+    {
+        return localIndex(slot);
+    }
+
     // SlotId is signed, so a bare `slot < numSlots()` admits negatives. Both ends are checked
     // here so no caller has to remember the lower one.
     [[nodiscard]] bool isValidSlotId(SlotId slot) const noexcept
@@ -606,6 +612,11 @@ public:
     SlotCount slotIndexUpperBound(PoolGroupIndex pgIdx) const
     {
         return mPoolGroups.at(pgIdx)->slotIndexUpperBound();
+    }
+
+    std::vector<std::pair<SlotCount, SlotCount>> slotRanges(PoolGroupIndex pgIdx) const
+    {
+        return mPoolGroups.at(pgIdx)->slotRanges();
     }
 
     TypedVec<PoolIndex, size_t> slotSize(PoolGroupIndex pgIdx) const

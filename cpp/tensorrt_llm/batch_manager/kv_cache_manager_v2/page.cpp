@@ -626,12 +626,13 @@ std::vector<SharedPageLock> batchedLockPages(KvCache& kvCache, std::vector<Batch
         for (auto const& page : pages)
             if (page->cacheLevel != level)
                 ++requirements[storeMgr->getPoolGroupIndex(level, page->lifeCycle)];
-        storeMgr->prepareFreeSlots(level, requirements, migrationRecorder, dropRecorder);
+        storeMgr->prepareFreeSlots(level, requirements, migrationRecorder, dropRecorder, kvCache.localityDomainId());
         if (level == kHotLevel && !lockedHostPages.empty())
         {
-            storeMgr->promoteSparsePages(kvCache.cudaStream(), lockedHostPages, migrationRecorder, dropRecorder);
+            storeMgr->promoteSparsePages(
+                kvCache.cudaStream(), lockedHostPages, migrationRecorder, dropRecorder, kvCache.localityDomainId());
         }
-        storeMgr->batchedMigrate(level, pages, migrationRecorder);
+        storeMgr->batchedMigrate(level, pages, migrationRecorder, kvCache.localityDomainId());
     }
 
     // Wait for all ready events on KvCache's stream (deduplicated).

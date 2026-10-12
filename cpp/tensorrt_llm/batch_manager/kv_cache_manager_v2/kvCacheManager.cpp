@@ -426,6 +426,30 @@ int KvCacheManager::numLocalityDomains() const noexcept
     return mStorage->numLocalityDomains();
 }
 
+std::vector<SlotCount> KvCacheManager::getPerLocalityDomainFreeSlots() const
+{
+    auto const apiLock = lockShared();
+    return mStorage->getPerLocalityDomainFreeSlots();
+}
+
+std::vector<std::pair<MemAddress, size_t>> KvCacheManager::getMappedBufferViews(LayerId layerId, DataRole role) const
+{
+    auto const apiLock = lockShared();
+    auto const& attr = mStorage->getBufferAttr(layerId, role);
+    PoolGroupIndex const pg = mStorage->getPoolGroupIndex(attr.lifeCycleId);
+    size_t const slotSize = mStorage->slotSize(pg).at(attr.poolIndex);
+    MemAddress const base = mStorage->getMemPoolBaseAddress(pg, attr.poolIndex) + attr.offset;
+    std::vector<std::pair<MemAddress, size_t>> views;
+    for (auto const& [begin, end] : mStorage->slotRanges(pg))
+    {
+        size_t const numPages
+            = (exactDiv(slotSize, attr.size) * slotCountToSizeT(end - begin) - exactDiv(attr.offset, attr.size))
+            * static_cast<size_t>(attr.expansion);
+        views.emplace_back(MemAddress(base + slotSize * slotCountToSizeT(begin)), numPages);
+    }
+    return views;
+}
+
 bool KvCacheManager::enablePartialMatch() const noexcept
 {
     return mConfig.enablePartialReuse;

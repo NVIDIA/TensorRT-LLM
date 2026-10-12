@@ -13,7 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import hashlib
-import inspect
 import math
 import os
 import sys
@@ -245,39 +244,6 @@ def _fill_kv_pages(buffer: torch.Tensor, pages: Sequence[int], value: float) -> 
     except NotImplementedError:
         return False
     return True
-
-
-def _make_gpu_cache_tier_config(
-    quota: int, enable_locality_domains: bool = False
-) -> GpuCacheTierConfig:
-    """Construct GpuCacheTierConfig across Python and C++ backends."""
-    if not enable_locality_domains:
-        # Keep the default path identical to a plain quota construction: passing the
-        # keyword to a backend that lacks it would fall back to a positional call and
-        # yield a different tier-config type for every non-localized run.
-        return GpuCacheTierConfig(quota=int(quota))
-    try:
-        return GpuCacheTierConfig(quota=int(quota), enable_locality_domains=True)
-    except TypeError as exc:
-        # The C++ binding only accepts quota; locality domains are Python-only.
-        raise NotImplementedError(
-            "Locality domains require the Python KVCacheManagerV2 backend; "
-            "set TLLM_KV_CACHE_MANAGER_V2_BACKEND=python"
-        ) from exc
-
-
-def _make_reuse_scope(
-    lora_id: int | None,
-    salt: int | None,
-    locality_domain_id: int | None = None,
-) -> ReuseScope:
-    """Construct ReuseScope across bindings with and without locality domains."""
-    try:
-        return ReuseScope(lora_id=lora_id, salt=salt, locality_domain_id=locality_domain_id)
-    except TypeError:
-        if locality_domain_id is not None:
-            raise
-        return ReuseScope(lora_id=lora_id, salt=salt)
 
 
 class Role:
@@ -1660,7 +1626,7 @@ class KVCacheManagerV2(BaseResourceManager):
         logger.info(f"KV cache manager v2 device quota set to {quota / (1 << 30)}GiB")
 
         cache_tiers: List[CacheTierConfig] = [
-            _make_gpu_cache_tier_config(int(quota), enable_locality_domains)
+            GpuCacheTierConfig(quota=int(quota), enable_locality_domains=enable_locality_domains)
         ]
         # A capacity-only connector registers nothing for migration to
         # invalidate, so it keeps the tier the scheduler spills to. The
@@ -3458,9 +3424,9 @@ class KVCacheManagerV2(BaseResourceManager):
     @property
     def num_locality_domains(self) -> int:
         """Number of locality domains. Returns 1 for non-localized configurations."""
-        value = getattr(self.impl, "num_locality_domains", 1)
-        # A Mock impl answers every attribute, so getattr's default never fires; read
-        # anything that is not an int as non-localized rather than comparing it below.
+        value = self.impl.num_locality_domains
+        # A Mock impl answers every attribute; read anything that is not an int as
+        # non-localized rather than comparing it below.
         return value if isinstance(value, int) else 1
 
     def pick_locality_domain(self, request_id: int) -> int | None:
@@ -3489,11 +3455,7 @@ class KVCacheManagerV2(BaseResourceManager):
 
     def get_per_locality_domain_free_slots(self) -> list[int]:
         """Free slot count per locality domain, summed across all pool groups."""
-        getter = getattr(self.impl, "get_per_locality_domain_free_slots", None)
-        if getter is not None:
-            return getter()
-        peak_stats = self.impl.get_and_reset_iteration_peak_block_stats(GPU_LEVEL)
-        return [sum(pg.available for pg in peak_stats)]
+        return list(self.impl.get_per_locality_domain_free_slots())
 
     def _request_locality_domain_id(self, req: LlmRequest) -> int | None:
         """Return the request-owned locality domain id after validating the invariant."""
@@ -6090,13 +6052,6 @@ class KVCacheManagerV2(BaseResourceManager):
             return [self.get_buffers(layer_idx, kv_layout=kv_layout).flatten(0, 1)]
 
         layer_offset = self.layer_offsets[layer_idx]
-        storage = self.impl._storage
-        lc_id = storage._layer_to_life_cycle_ids[LayerId(layer_offset)]
-        attr = storage.get_buffer_attr(LayerId(layer_offset), Role.KEY)
-        pg_idx = storage.get_pool_group_index(lc_id)
-        gpu_storage = storage._levels[GPU_LEVEL].storage
-        pool_group = gpu_storage._pool_groups[pg_idx]
-        slot_size = pool_group.slot_size[attr.pool_index]
         element_per_container = 1
         dtype = self.dtype
         if dtype == DataType.NVFP4:
@@ -6104,14 +6059,12 @@ class KVCacheManagerV2(BaseResourceManager):
             dtype = torch.int8
 
         views: list[torch.Tensor] = []
-        for locality_domain_id in range(self.num_locality_domains):
-            local_page_upper_bound = (
-                exact_div(slot_size, attr.size) * pool_group.num_slots(locality_domain_id)
-                - exact_div(attr.offset, attr.size)
-            ) * attr.expansion
+        for address, num_pages in self.impl.get_mapped_buffer_views(
+            LayerId(layer_offset), Role.KEY
+        ):
             if kv_layout == "NHD":
                 shape = [
-                    local_page_upper_bound // self.kv_factor,
+                    num_pages // self.kv_factor,
                     self.kv_factor,
                     self.tokens_per_block,
                     self.num_kv_heads_per_layer[layer_offset],
@@ -6119,18 +6072,14 @@ class KVCacheManagerV2(BaseResourceManager):
                 ]
             else:
                 shape = [
-                    local_page_upper_bound // self.kv_factor,
+                    num_pages // self.kv_factor,
                     self.kv_factor,
                     self.num_kv_heads_per_layer[layer_offset],
                     self.tokens_per_block,
                     self.head_dim_per_layer[layer_offset] // element_per_container,
                 ]
-            addr_key = (
-                int(gpu_storage.slot_address(pg_idx, attr.pool_index, 0, locality_domain_id))
-                + attr.offset
-            )
             views.append(
-                convert_to_torch_tensor(TensorWrapper(addr_key, dtype, shape)).flatten(0, 1)
+                convert_to_torch_tensor(TensorWrapper(int(address), dtype, shape)).flatten(0, 1)
             )
         return views
 
@@ -6834,14 +6783,8 @@ class KVCacheManagerV2(BaseResourceManager):
             priority_kwargs["custom_priority_callback"] = _swa_endpoint_priority(
                 expected_prompt_length, self.tokens_per_block, self._swa_endpoint_rewind
             )
-        try:
-            create_params = inspect.signature(self.impl.create_kv_cache).parameters
-        except (TypeError, ValueError):
-            create_params = {}
-        if "locality_domain_id" in create_params:
-            priority_kwargs["locality_domain_id"] = locality_domain_id
         kv_cache = self.impl.create_kv_cache(
-            _make_reuse_scope(lora_task_id, salt_int, locality_domain_id),
+            ReuseScope(lora_id=lora_task_id, salt=salt_int, locality_domain_id=locality_domain_id),
             input_tokens,
             id=request_id,
             enable_request_stats=enable_request_stats,

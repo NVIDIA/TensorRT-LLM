@@ -165,16 +165,18 @@ public:
 
     void scheduleForEviction(Page& page, bool evictFirst = false);
 
-    // Evict at least minNumPages[pgIdx] pages per pool group.
+    // Evict at least minNumPages[pgIdx] pages per pool group. With localityDomainId, only pages
+    // whose slot lives in that domain are taken, in eviction order.
     // Returns evicted pages per pool group.
     // On failure, re-queues any already-evicted pages and throws OutOfPagesError.
     TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> evict(
-        TypedVec<PoolGroupIndex, SlotCount> const& minNumPages);
+        TypedVec<PoolGroupIndex, SlotCount> const& minNumPages, std::optional<int> localityDomainId = std::nullopt);
 
     // Remove a page from the queue by its NodeRef.
     void remove(NodeRef node);
 
-    [[nodiscard]] SlotCount numEvictablePages(PoolGroupIndex pgIdx) const;
+    [[nodiscard]] SlotCount numEvictablePages(
+        PoolGroupIndex pgIdx, std::optional<int> localityDomainId = std::nullopt) const;
 
     [[nodiscard]] PoolGroupIndex numPoolGroups() const noexcept
     {
