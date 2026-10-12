@@ -104,7 +104,7 @@ fi
 # The install lock in slurm_install.sh lives under $resourcePathNode (/tmp), so it
 # is node-local: its wait loop only fences $SLURM_LOCALID peers on the same node,
 # and a node can never observe another node's lock. Nothing else stops one node
-# from reaching run_tests.py below while another is still installing, and
+# from reaching `eval $pytestCommand` below while another is still installing, and
 # the per-rank work above skews the ranks further (non-zero ranks cover the
 # coverage-config write with a blind `sleep 30`, and slurm_setup_runtime_env shells
 # out to pip3). Pytest's first action is `import tensorrt_llm`, whose module-scope
@@ -162,48 +162,61 @@ pytest_exit_code=0
 perf_check_exit_code=0
 perf_report_exit_code=0
 
-# Use unified run_tests.py for test execution, rerun, and result merging
-runTestsScript="$llmSrcNode/jenkins/scripts/run_tests.py"
-
-# Build the run_tests.py arguments array for proper quoting
-runTestsArgs=(
-    python3 "$runTestsScript"
-    --render
-    --test-db-list "$testListPathNode"
-    --splits "${testSplits:-1}"
-    --group "${testGroup:-1}"
-    --pytest-base-cmd "$pytestCommand"
-    --stage-name "$stageName"
-    --output-dir "$jobWorkspace"
-    --working-dir "$llmSrcNode/tests/integration/defs"
-    --fail-signatures "${failSignaturesList:-}"
-    --max-rerun-tests 5
-)
-if [ -n "${testDurationsPath:-}" ]; then
-    runTestsArgs+=(--durations-path "$testDurationsPath")
-fi
-if [ "$perfMode" = "true" ]; then
-    runTestsArgs+=(--perf-mode)
-fi
-for target in ${pytestTargets:-}; do
-    runTestsArgs+=(--pytest-target "$target")
-done
-
-# For multi-node runs, wrap run_tests.py with the MPI launcher so that
-# worker nodes stay alive across all pytest invocations (regular, isolated,
-# rerun).  The launcher ensures rank 0 executes run_tests.py while workers
-# run mgmn_worker_node for the entire duration.
-if [ -n "${pytestUtil:-}" ] && [ "${SLURM_JOB_NUM_NODES:-1}" -gt 1 ]; then
-    echo "Multi-node mode: wrapping run_tests.py with $pytestUtil"
-    "$pytestUtil" "${runTestsArgs[@]}"
-else
+if [ "${useRunTests:-false}" = "true" ]; then
+    # Single-node stages: run_tests.py renders the shard and runs regular,
+    # isolated and rerun pytest sessions, then merges the results.
+    runTestsArgs=(
+        python3 "$llmSrcNode/jenkins/scripts/run_tests.py"
+        --render
+        --test-db-list "$testListPathNode"
+        --splits "${testSplits:-1}"
+        --group "${testGroup:-1}"
+        --pytest-base-cmd "$pytestCommand"
+        --stage-name "$stageName"
+        --output-dir "$jobWorkspace"
+        --working-dir "$llmSrcNode/tests/integration/defs"
+        --fail-signatures "${failSignaturesList:-}"
+        --max-rerun-tests 5
+    )
+    if [ -n "${testDurationsPath:-}" ]; then
+        runTestsArgs+=(--durations-path "$testDurationsPath")
+    fi
+    if [ "$perfMode" = "true" ]; then
+        runTestsArgs+=(--perf-mode)
+    fi
+    for target in ${pytestTargets:-}; do
+        runTestsArgs+=(--pytest-target "$target")
+    done
     "${runTestsArgs[@]}"
+else
+    # Multi-node and perf-sanity launches: pytestCommand carries the test list,
+    # shard and trtllm-llmapi-launch, so every rank runs it as a single session.
+    eval $pytestCommand
 fi
 pytest_exit_code=$?
-echo "Rank${SLURM_PROCID} run_tests.py finished execution with exit code $pytest_exit_code"
+echo "Rank${SLURM_PROCID} Pytest finished execution with exit code $pytest_exit_code"
 if [ "${SLURM_PROCID:-0}" -eq 0 ]; then
     python3 "$llmSrcNode/tests/test_common/s3_output.py" \
         --drain-spool "$jobWorkspace" || true
+fi
+
+# DEBUG: Diagnose intermittent "unrecognized arguments" failure (Exit Code 4)
+# Remove this after the issue is resolved
+if [ $pytest_exit_code -eq 4 ]; then
+    echo "DEBUG: Pytest failed with usage error (exit code 4)"
+    echo "DEBUG: Directory state at $(pwd):"
+    ls -l
+    echo "DEBUG: Directory state at $llmSrcNode/tests/integration/defs:"
+    ls -l $llmSrcNode/tests/integration/defs
+
+    echo "DEBUG: conftest.py content:"
+    md5sum $llmSrcNode/tests/integration/defs/conftest.py
+
+    echo "DEBUG: pytest.ini content:"
+    md5sum $llmSrcNode/tests/integration/defs/pytest.ini
+
+    echo "DEBUG: Check importability of conftest.py"
+    python3 -c "import sys; sys.path.insert(0, '.'); import conftest; print('DEBUG: conftest imported successfully')"
 fi
 
 if [ $SLURM_PROCID -eq 0 ] && [ "$perfMode" = "true" ]; then

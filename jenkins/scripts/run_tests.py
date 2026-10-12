@@ -27,6 +27,7 @@ import shlex
 import subprocess
 import sys
 import time
+import traceback
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
@@ -41,6 +42,22 @@ sys.stdout.reconfigure(line_buffering=True)
 
 BANNER_WIDTH = 80
 COLLECT_TIMEOUT_SECONDS = 600
+
+# Exit codes. Callers treat EXIT_TESTS_FAILED as a deterministic test failure
+# (no infra retry); EXIT_SETUP_FAILED and EXIT_INTERNAL_ERROR mean the run did
+# not complete.
+EXIT_TESTS_FAILED = 1
+EXIT_SETUP_FAILED = 2
+EXIT_INTERNAL_ERROR = 3
+# Failures that were never rerun: unfinished (crashed/timed out) tests, or tests
+# over 10 min with no matching failure signature.
+EXIT_TESTS_NOT_RERUN = 4
+
+# Leading NAME=value shell assignments, kept verbatim when rebuilding a command
+# so values such as ${PYTHONPATH:-} still expand and stay assignments.
+_ENV_ASSIGNMENT_RE = re.compile(
+    r"""\s*[A-Za-z_][A-Za-z0-9_]*=(?:"[^"]*"|'[^']*'|[^\s"'])*(?=\s|$)"""
+)
 
 
 def print_banner(title, char="="):
@@ -166,7 +183,7 @@ def render_test_list(
                 print(f"partial stdout:\n{partial_stdout}")
             if partial_stderr:
                 print(f"partial stderr:\n{partial_stderr}")
-            sys.exit(1)
+            sys.exit(EXIT_SETUP_FAILED)
 
         output = result.stdout.strip()
         print("<<<START_PYTEST_OUTPUT>>>")
@@ -179,7 +196,7 @@ def render_test_list(
         if result.returncode != 0:
             print(f"Error: pytest --collect-only failed with exit code {result.returncode}")
             print(f"stderr: {result.stderr}")
-            sys.exit(1)
+            sys.exit(EXIT_SETUP_FAILED)
 
         # Parse output: collect test IDs after "Running N items in this shard" line
         found_running_line = False
@@ -377,6 +394,14 @@ def rebuild_pytest_command(base_cmd, drop_patterns, append_args):
         shell_prefix = " && ".join(and_parts[:-1]) + " && "
         cmd_part = and_parts[-1]
 
+    # Keep leading env assignments verbatim: shlex.join would quote a value like
+    # PYTHONPATH=/x:${PYTHONPATH:-}, and bash then runs it as a command name.
+    env_end = 0
+    while match := _ENV_ASSIGNMENT_RE.match(cmd_part, env_end):
+        env_end = match.end()
+    shell_prefix += cmd_part[:env_end].strip() + " " if env_end else ""
+    cmd_part = cmd_part[env_end:]
+
     parts = []
     tokens = shlex.split(cmd_part)
     skip_next = False
@@ -426,7 +451,7 @@ def build_rerun_command(base_cmd, test_list, xml_path, csv_path, reruns):
     return rebuild_pytest_command(base_cmd, drop_patterns, append_args)
 
 
-def build_isolated_command(base_cmd, test_list, xml_path, csv_path):
+def build_isolated_command(base_cmd, test_list, xml_path, csv_path, stage_name):
     """Build an isolated test command by replacing test-list/output/prefix args.
 
     Args:
@@ -434,6 +459,8 @@ def build_isolated_command(base_cmd, test_list, xml_path, csv_path):
         test_list: Path to the single-test list file.
         xml_path: Path for the isolated results XML.
         csv_path: Path for the isolated results CSV.
+        stage_name: Stage name passed as --test-prefix, so isolated results and
+            unfinished_test.txt entries carry the same "<stage>/" prefix as regular runs.
 
     Returns:
         Modified pytest command string.
@@ -441,6 +468,7 @@ def build_isolated_command(base_cmd, test_list, xml_path, csv_path):
     drop_patterns = ["--test-list", "--test-prefix", "--csv", "--periodic-junit-xmlpath"]
     append_args = [
         f"--test-list={test_list}",
+        f"--test-prefix={stage_name}",
         f"--csv={csv_path}",
         "--periodic-junit-xmlpath",
         xml_path,
@@ -477,8 +505,7 @@ def check_and_rerun(
 
     Returns:
         Tuple of (is_rerun_failed: bool, rerun_xml_files: list of paths to rerun result XMLs).
-        is_rerun_failed is also True when some failures were not eligible for
-        rerun (unfinished, or duration > 10 min with no matching signature).
+        Failures not eligible for rerun do not set is_rerun_failed; see has_unrerun_failures().
     """
     if not os.path.exists(result_xml):
         # No results were ever flushed (e.g. killed before any test finished);
@@ -517,15 +544,13 @@ def check_and_rerun(
         return True, []
 
     # Step 3: Execute reruns
-    # Tests in rerun_0.txt are never rerun, so their original failure stands.
-    is_rerun_failed = False
-    rerun_0_file = os.path.join(rerun_dir, "rerun_0.txt")
-    if os.path.exists(rerun_0_file):
+    # Tests in rerun_0.txt are never rerun; main() reports them via has_unrerun_failures().
+    if os.path.exists(os.path.join(rerun_dir, "rerun_0.txt")):
         print(
             f"Some {rerun_tag} tests failed and were not eligible for rerun (terminated "
             "unexpectedly, or duration > 10 min with no matching failure signature)."
         )
-        is_rerun_failed = True
+    is_rerun_failed = False
     rerun_xml_files = []
 
     for times in [1, 2]:
@@ -554,6 +579,11 @@ def check_and_rerun(
             is_rerun_failed = True
 
     return is_rerun_failed, rerun_xml_files
+
+
+def has_unrerun_failures(output_dir):
+    """Return True if any rerun/<tag>/rerun_0.txt lists failures that were never rerun."""
+    return any(Path(output_dir, "rerun").glob("*/rerun_0.txt"))
 
 
 # ---------------------------------------------------------------------------
@@ -655,7 +685,9 @@ def run_isolated_tests(
         xml_path = os.path.join(output_dir, f"results_isolated_{i}.xml")
         csv_path = os.path.join(output_dir, f"report_isolated_{i}.csv")
 
-        isolated_cmd = build_isolated_command(pytest_cmd, single_test_file, xml_path, csv_path)
+        isolated_cmd = build_isolated_command(
+            pytest_cmd, single_test_file, xml_path, csv_path, stage_name
+        )
         rc, elapsed, pytest_tail = run_pytest(isolated_cmd, working_dir, tail_lines=200)
         all_xml_files.append(xml_path)
 
@@ -900,7 +932,7 @@ def main():
     if args.render:
         if not args.test_db_list:
             print("Error: --test-db-list is required when using --render")
-            sys.exit(1)
+            sys.exit(EXIT_SETUP_FAILED)
         regular_list, isolate_list, regular_count, isolate_count = render_test_list(
             args.test_db_list,
             working_dir,
@@ -930,7 +962,7 @@ def main():
             sys.exit(0)
         else:
             print("Error: --pytest-base-cmd is required for test execution")
-            sys.exit(1)
+            sys.exit(EXIT_SETUP_FAILED)
 
     pytest_base_cmd = args.pytest_base_cmd
     if args.pytest_target:
@@ -984,7 +1016,7 @@ def main():
     # Step 4: Check that at least some tests were executed
     if regular_count == 0 and isolate_count == 0:
         print(f"Error: No tests were executed for stage {stage_name}")
-        sys.exit(1)
+        sys.exit(EXIT_SETUP_FAILED)
 
     # Step 5: Merge all results
     print_banner("RESULT MERGING", char="-")
@@ -1000,7 +1032,15 @@ def main():
     if rerun_failed:
         print("  Result          : FAILED")
         print("\nSome tests still failed after rerun attempts, please check the test report.")
-        sys.exit(1)
+        sys.exit(EXIT_TESTS_FAILED)
+
+    if has_unrerun_failures(output_dir):
+        print("  Result          : FAILED")
+        print(
+            "\nSome tests failed and were not eligible for rerun (terminated unexpectedly, or "
+            "duration > 10 min with no matching failure signature), please check the test report."
+        )
+        sys.exit(EXIT_TESTS_NOT_RERUN)
 
     print("  Result          : PASSED")
     print("\nAll tests passed.")
@@ -1008,4 +1048,10 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception:
+        # Python's default exit code for an uncaught exception is 1, which
+        # callers would read as EXIT_TESTS_FAILED.
+        traceback.print_exc()
+        sys.exit(EXIT_INTERNAL_ERROR)

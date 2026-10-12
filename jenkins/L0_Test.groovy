@@ -104,6 +104,12 @@ def LINUX_AARCH64_CONFIG = "linux_aarch64"
 @Field
 def INFRA_DRY_RUN_TEST_CONTEXT = "infra_dry_run"
 
+// Keep in sync with the EXIT_* codes in jenkins/scripts/run_tests.py.
+@Field
+def RUN_TESTS_EXIT_TESTS_FAILED = 1
+@Field
+def RUN_TESTS_EXIT_TESTS_NOT_RERUN = 4
+
 @Field
 def BUILD_CONFIGS = [
   // Vanilla TARNAME is used for packaging in runLLMPackage
@@ -1448,7 +1454,7 @@ def getPytestBaseCommandLine(
         testCmdLine += ["--run-ray"]
     }
     def unittestMarkExpr = (stageName.startsWith("CPU-")) ? "cpu_only" : "not cpu_only"
-    testCmdLine += ["--unittest-markexpr=\"${unittestMarkExpr}\""]
+    testCmdLine += ["--unittest-markexpr='${unittestMarkExpr}'"]
     if (ENABLE_UPLOAD_TEST_RESULTS) {
         testCmdLine += ["-o console_output_style=progress-even-when-capture-no"]
     }
@@ -1756,11 +1762,11 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     coverageConfigFile
                 )
 
-                // Generate Pytest command
-                // NOTE: the launcher (trtllm-llmapi-launch) is NOT included in
-                // pytestCommand.  For multi-node, slurm_run.sh wraps run_tests.py
-                // itself with the launcher so that MPI worker nodes stay alive
-                // across all pytest invocations (regular, isolated, rerun).
+                // Single-node stages run through run_tests.py (isolation, rerun, merge).
+                // Multi-node and perf-sanity launches eval pytestCommand directly:
+                // trtllm-llmapi-launch must wrap a single pytest process on every rank,
+                // and perf/submit.py derives its per-role commands from pytestCommand.
+                def useRunTests = nodeCount <= 1 && !disaggMultiNodeMode && !aggMultiNodeMode
                 String pytestUtil = ""
                 if (nodeCount > 1) {
                     pytestUtil = "$llmSrcNode/tensorrt_llm/llmapi/trtllm-llmapi-launch"
@@ -1772,9 +1778,18 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     def clusterKey = partition.clusterName.replaceAll('[^a-zA-Z0-9]', '_')
                     clusterDurationsPathNode = "${llmSrcNode}/tests/integration/defs/.test_durations_${clusterKey}"
                 }
-                // test-list/splits/group/durations are now handled by run_tests.py;
-                // only pass S3 upload args as part of the pytest base command.
                 def extraArgs = []
+                if (!useRunTests) {
+                    extraArgs += [
+                        "--test-list=$testListPathNode",
+                        "--splitting-algorithm least_duration",
+                        "--splits $splits",
+                        "--group $splitId",
+                    ]
+                    if (clusterDurationsPathNode) {
+                        extraArgs += ["--durations-path ${clusterDurationsPathNode}"]
+                    }
+                }
                 if (ENABLE_UPLOAD_TEST_RESULTS && !testFilter[(DETAILED_LOG)]) {
                     extraArgs += [
                         "--capture=fd",
@@ -1789,12 +1804,16 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     perfMode,
                     jobWorkspace,
                     "$jobWorkspace/.coveragerc",
-                    "",  // pytestUtil excluded — launcher wraps run_tests.py instead
-                    extraArgs,  // test-list/splits/group handled by run_tests.py
+                    pytestUtil,
+                    extraArgs,
                 )
+                def infraDryRunTargets = getInfraDryRunPytestTargets(testListPathLocal)
+                // run_tests.py takes the targets separately so its --collect-only step is narrowed too.
+                def pytestTargets = useRunTests ? infraDryRunTargets.join(" ") : ""
+                if (!useRunTests) {
+                    pytestCommandParts += infraDryRunTargets
+                }
                 def pytestCommand = pytestCommandParts.join(" ")
-                // Passed separately so run_tests.py also narrows its --collect-only step.
-                def pytestTargets = getInfraDryRunPytestTargets(testListPathLocal).join(" ")
                 def failSignaturesList = trtllm_utils.getFailSignaturesList().join(",")
 
                 // Generate Job Launch Script
@@ -1951,13 +1970,6 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     "export ${varName}=\"${escapedValue}\""
                 }.join('\n')
 
-                // Escape pytestCommand for embedding inside bash double-quoted export.
-                // --unittest-markexpr="not cpu_only" contains inner double quotes that
-                // would prematurely close the outer "..." and cause an export error.
-                def safePytestCmd = pytestCommand
-                    .replace('\\', '\\\\')
-                    .replace('"', '\\"')
-
                 def scriptLaunchPrefix = """#!/bin/bash
                     #SBATCH ${exemptionComment}
                     #SBATCH --output=${slurmJobLogPath}
@@ -1980,13 +1992,13 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     export perfMode=$perfMode
                     ${infraDryRun ? "export infraDryRun=true" : ""}
                     export resourcePathNode=$resourcePathNode
-                    export pytestCommand="$safePytestCmd"
+                    export pytestCommand="$pytestCommand"
                     export coverageConfigFile="$coverageConfigFile"
+                    export useRunTests=$useRunTests
                     export testListPathNode="$testListPathNode"
                     export testSplits="$splits"
                     export testGroup="$splitId"
                     export failSignaturesList="$failSignaturesList"
-                    export pytestUtil="$pytestUtil"
                     export pytestTargets="$pytestTargets"
                     export testDurationsPath="$clusterDurationsPathNode"
                     # Keep xtrace off around the token exports so they are not echoed into the Slurm job log.
@@ -4817,6 +4829,8 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
             containerPortNum
         )
 
+        // Single-quote for the shell; the command itself carries single-quoted args.
+        def pytestBaseCmdArg = "'" + pytestCommand.join(" ").replace("'", "'\\''") + "'"
         // Passed separately so run_tests.py also narrows its --collect-only step.
         def pytestTargetArgs = getInfraDryRunPytestTargets(testDBList).collect { "--pytest-target ${it}" }.join(" ")
 
@@ -4882,7 +4896,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                             --splits ${splits} \\
                             --group ${splitId} \\
                             ${perfMode ? '--perf-mode' : ''} \\
-                            --pytest-base-cmd '${pytestCommand.join(" ")}' \\
+                            --pytest-base-cmd ${pytestBaseCmdArg} \\
                             ${pytestTargetArgs} \\
                             --stage-name ${stageName} \\
                             --output-dir ${WORKSPACE}/${stageName} \\
@@ -4908,7 +4922,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                     // Turn "[${stageName}] Run Pytest" red now; the terminal error is
                     // raised after perfMode below so perf artifacts are still generated.
                     catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
-                        error "run_tests.py failed with exit code ${runTestsExitCode}, please check the test report."
+                        error "run_tests.py exited with code ${runTestsExitCode}, please check the test report."
                     }
                 }
                 if (ENABLE_UPLOAD_TEST_RESULTS && !testFilter[(DETAILED_LOG)]) {
@@ -4978,14 +4992,24 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         // Checked after perfMode so perf artifacts are generated first.
         // Unguarded error() on purpose -- catchError here would swallow the
         // throw that cacheErrorAndUploadResult relies on to fail the build.
+        // classifySlurmFailure keys off "still failed after rerun attempts" to treat
+        // the failure as deterministic and skip the infra retry, so keep that wording
+        // for test failures only, and check it before the timeout path.
+        if (runTestsExitCode == RUN_TESTS_EXIT_TESTS_FAILED) {
+            error "Some tests still failed after rerun attempts, please check the test report."
+        }
+
         if (fileExists("${stageName}/results-timeout.xml") || generateTimeoutTestResultXml(pipeline, stageName)) {
             error "Some tests terminated unexpectedly, please check the test report."
         }
 
-        // run_tests.py exits non-zero for failures still failing after rerun and
-        // for failures not eligible for rerun (duration > 10 min, no signature).
+        if (runTestsExitCode == RUN_TESTS_EXIT_TESTS_NOT_RERUN) {
+            error "Some tests failed and were not eligible for rerun (duration > 10 min, no matching failure signature), please check the test report."
+        }
+
+        // Render/collection and internal errors stay retryable.
         if (runTestsExitCode != 0) {
-            error "Some tests failed (run_tests.py exit code ${runTestsExitCode}), please check the test report."
+            error "run_tests.py failed before the tests completed (exit code ${runTestsExitCode}), please check the stage log."
         }
 
         if (perfRegressionExitCode != null) {
