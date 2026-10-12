@@ -1780,6 +1780,8 @@ def _create_mock_metadata(
             self.max_num_sequences = batch_size
             self.max_draft_tokens = max_draft_tokens
             self.num_sparse_topk = index_topk
+            self._radix_rows_per_sequence = 1 + self.max_draft_tokens
+            self._create_radix_aux_buffers(capture_graph=False)
             self.enable_indexer_skip = enable_indexer_skip
             self.indexer_head_dim = indexer_head_dim
             self.indexer_quant_block_size = 128
