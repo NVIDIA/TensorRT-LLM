@@ -4,8 +4,8 @@ import socket
 import time
 
 import openai
-import psutil
 import pytest
+from test_common import cluster_env
 from test_common.http_utils import (wait_for_endpoint_down,
                                     wait_for_endpoint_ready)
 
@@ -74,34 +74,15 @@ def env():
         if not ('PMI_' in k or 'OMPI_' in k or 'PMIX_' in k or 'SLURM_' in k)
         and k not in ["UCX_TLS", "UCX_NET_DEVICES"]  # avoid UCX failure on oci
     }
+    cluster_env.apply_ucx_env(e,
+                              cluster_name=os.environ.get("SLURM_CLUSTER_NAME"))
     # Some GB300 machines have NICs that misbehave with UCX's default transport
     # auto-selection, so UCX_TLS must be set explicitly there. Identify GB300 via
     # sm_103 (Blackwell Ultra) + aarch64 (Grace) -- this excludes HGX B300
     # (also sm_103 but x86_64) and avoids depending on the GPU device name string.
     if get_sm_version() == 103 and platform.machine().lower() == "aarch64":
         e["UCX_TLS"] = "cuda_copy,cuda_ipc,sm,self,tcp"
-        # With tcp enabled, UCX opens every NIC unless UCX_NET_DEVICES limits
-        # it. GB300 rail NICs carry only IPv6 addresses inside a VRF, which a
-        # plain socket cannot bind, so UCX worker creation fails on them. Pin
-        # UCX to the NIC this node uses to reach the other node.
-        e["UCX_NET_DEVICES"] = _ipv4_nic_to(get_the_other_host(0))
     return e
-
-
-def _ipv4_nic_to(host):
-    """Return the NIC carrying this node's IPv4 route to host."""
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-            s.connect((host, 1))
-            local_ip = s.getsockname()[0]
-    except OSError as err:
-        pytest.fail(f"No IPv4 route to {host} for UCX tcp: {err}")
-    for nic, addrs in psutil.net_if_addrs().items():
-        if any(a.family == socket.AF_INET and a.address == local_ip
-               for a in addrs):
-            return nic
-    pytest.fail(f"No NIC owns local IPv4 {local_ip} used to reach {host}; "
-                "cannot restrict UCX_NET_DEVICES")
 
 
 @pytest.fixture(scope="module")
