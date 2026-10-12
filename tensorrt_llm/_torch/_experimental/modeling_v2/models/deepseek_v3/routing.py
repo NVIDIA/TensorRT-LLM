@@ -52,12 +52,21 @@ def route(
         and mapping.enable_attention_dp
     )
 
-    # The target carries the checkpoint's own MTP module (layer 61) and no
-    # other draft path.
-    mtp_or_none = spec_config is None or isinstance(spec_config, MTPDecodingConfig)
+    # The target carries the checkpoint's own MTP module (layer 61) driven by
+    # the one-model MTP-Eagle loop, and no other draft path. ``use_mtp_vanilla``
+    # selects the multi-model MTP loop instead, so it does not route here.
+    mtp_eagle_or_none = spec_config is None or (
+        isinstance(spec_config, MTPDecodingConfig)
+        and spec_config.spec_dec_mode.is_mtp_eagle_one_model()
+    )
 
-    # DeepSeek-R1-0528-NVFP4 on 4 GB300s (sm103), dep4, MTP or no speculation.
-    if compute_capability == (10, 3) and shape == (61, 7168, 256, 1536) and dep4 and mtp_or_none:
+    # DeepSeek-R1-0528-NVFP4 on 4 GB300s (sm103), dep4, MTP-Eagle or no speculation.
+    if (
+        compute_capability == (10, 3)
+        and shape == (61, 7168, 256, 1536)
+        and dep4
+        and mtp_eagle_or_none
+    ):
         from .r1_0528_nvfp4__sm_103__dep4.modeling import ModelingV2DeepseekR10528Nvfp4Sm103Dep4
 
         return ModelingV2DeepseekR10528Nvfp4Sm103Dep4
@@ -67,7 +76,8 @@ def route(
         f"world_size={mapping.world_size} moe_ep={mapping.moe_ep_size} "
         f"moe_tp={mapping.moe_tp_size} attention_dp={mapping.enable_attention_dp}, "
         f"speculative decoding "
-        f"{type(spec_config).__name__ if spec_config is not None else 'off'}; "
+        f"{spec_config.spec_dec_mode.name if spec_config is not None else 'off'}; "
         "the one deepseek_v3 target is DeepSeek-R1-0528-NVFP4 on sm103, dep4 "
-        "(4 ranks, expert-parallel MoE, attention DP), with MTP or no speculative decoding"
+        "(4 ranks, expert-parallel MoE, attention DP), with one-model MTP-Eagle or no "
+        "speculative decoding"
     )

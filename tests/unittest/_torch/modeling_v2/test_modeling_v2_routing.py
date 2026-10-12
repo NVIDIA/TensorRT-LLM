@@ -237,5 +237,16 @@ def test_r1_dep4_with_another_speculative_mode_does_not_match():
     """The dep4 target carries the checkpoint's MTP module and nothing else."""
     config = _model_config(_r1_config(), spec_config=_NGRAM, **_DEP4)
     assert modeling_v2_resolve(config, _llm_args("auto")) is None
+
+
+def test_r1_dep4_with_vanilla_mtp_does_not_match():
+    """``use_mtp_vanilla`` resolves to the multi-model MTP loop; the target
+    asserts the one-model MTP-Eagle loop at construction, so route must say
+    no before that assert can."""
+    vanilla = MTPDecodingConfig(max_draft_len=3, use_mtp_vanilla=True)
+    config = _model_config(_r1_config(), spec_config=vanilla, **_DEP4)
+    assert modeling_v2_resolve(config, _llm_args("auto")) is None
+    with pytest.raises(ValueError, match="MTP"):
+        modeling_v2_resolve(config, _llm_args("require"))
     with pytest.raises(ValueError, match="MTP"):
         modeling_v2_resolve(config, _llm_args("require"))
