@@ -98,55 +98,28 @@ struct DMA
     using Cbw_k = typename Kernel_traits::Circular_buffer_k_writer;
     using Cbw_v = typename Kernel_traits::Circular_buffer_v_writer;
 
-    enum
-    {
-        STEP_Q = Kernel_traits::STEP_Q
-    };
+    static constexpr int STEP_Q = Kernel_traits::STEP_Q;
 
-    enum
-    {
-        STEP_KV = Kernel_traits::STEP_KV
-    };
+    static constexpr int STEP_KV = Kernel_traits::STEP_KV;
 
-    enum
-    {
-        D = Kernel_traits::D
-    };
+    static constexpr int D = Kernel_traits::D;
 
-    enum
-    {
-        DV = Kernel_traits::DV
-    };
+    static constexpr int DV = Kernel_traits::DV;
 
-    enum
-    {
-        ELEMENT_BYTES = Kernel_traits::ELEMENT_BYTES
-    };
+    static constexpr int ELEMENT_BYTES = Kernel_traits::ELEMENT_BYTES;
 
     using Cta_tile_p = typename Kernel_traits::Cta_tile_p;
 
-    enum
-    {
-        CAUSAL_MASK = Kernel_traits::CAUSAL_MASK
-    };
+    static constexpr int CAUSAL_MASK = Kernel_traits::CAUSAL_MASK;
 
     // Per-granular-chunk transaction byte counts (one chunk == one granular
     // smem buffer). These MUST equal the smem buffer sizes so the TMA fills
     // exactly one buffer (no over/underrun).
-    enum
-    {
-        TX_BYTES_Q = Kernel_traits::BYTES_PER_BUFFER_Q
-    };
+    static constexpr int TX_BYTES_Q = Kernel_traits::BYTES_PER_BUFFER_Q;
 
-    enum
-    {
-        TX_BYTES_K = Kernel_traits::BYTES_PER_BUFFER_K
-    };
+    static constexpr int TX_BYTES_K = Kernel_traits::BYTES_PER_BUFFER_K;
 
-    enum
-    {
-        TX_BYTES_V = Kernel_traits::BYTES_PER_BUFFER_V
-    };
+    static constexpr int TX_BYTES_V = Kernel_traits::BYTES_PER_BUFFER_V;
 
     explicit inline __device__ DMA(uint32_t elect_one)
         : elect_one_(elect_one)

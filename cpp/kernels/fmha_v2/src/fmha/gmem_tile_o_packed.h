@@ -47,16 +47,10 @@ struct Hmma_gmem_tile_o
     using Mma_tile = typename Traits::template Mma_tile<Cta_tile>;
 
     // The size of each element.
-    enum
-    {
-        BYTES_PER_ELEMENT = BYTES_PER_ELEMENT_
-    };
+    static constexpr int BYTES_PER_ELEMENT = BYTES_PER_ELEMENT_;
 
     // The size of a row in bytes.
-    enum
-    {
-        BYTES_PER_ROW = Cta_tile::N * BYTES_PER_ELEMENT
-    };
+    static constexpr int BYTES_PER_ROW = Cta_tile::N * BYTES_PER_ELEMENT;
 
     // The valid size of a row in bytes.
     // Note: cross-attention kernels rely on head dim from runtime instead of from compile-time.
@@ -64,46 +58,25 @@ struct Hmma_gmem_tile_o
     // enum { VALID_BYTES_PER_ROW = Cta_tile::VALID_N * BYTES_PER_ELEMENT };
 
     // The size of each STG.
-    enum
-    {
-        BYTES_PER_STG = BYTES_PER_STG_
-    };
+    static constexpr int BYTES_PER_STG = BYTES_PER_STG_;
 
     // The number of threads to store a "row" of the matrix.
-    enum
-    {
-        THREADS_PER_ROW = BYTES_PER_ROW / BYTES_PER_STG
-    };
+    static constexpr int THREADS_PER_ROW = BYTES_PER_ROW / BYTES_PER_STG;
 
     // The number of "rows" stored per STG.
-    enum
-    {
-        ROWS_PER_STG = Cta_tile::THREADS_PER_CTA / THREADS_PER_ROW
-    };
+    static constexpr int ROWS_PER_STG = Cta_tile::THREADS_PER_CTA / THREADS_PER_ROW;
 
     // The number of "rows" stored per iteration of the loop. The output of 1 MMA.
-    enum
-    {
-        ROWS = Cta_tile::M
-    };
+    static constexpr int ROWS = Cta_tile::M;
 
     // We want at least one output per thread (if possible).
-    enum
-    {
-        ROWS_PER_LOOP_ = ROWS <= 64 ? ROWS : (int) Min<ROWS, ROWS_PER_STG>::VALUE
-    };
+    static constexpr int ROWS_PER_LOOP_ = ROWS <= 64 ? ROWS : (int) Min<ROWS, ROWS_PER_STG>::VALUE;
 
     // We also want to have "complete" MMAs.
-    enum
-    {
-        ROWS_PER_LOOP = Max<ROWS_PER_LOOP_, Mma_tile::M_PER_MMA_PER_CTA>::VALUE
-    };
+    static constexpr int ROWS_PER_LOOP = Max<ROWS_PER_LOOP_, Mma_tile::M_PER_MMA_PER_CTA>::VALUE;
 
     // The number of outer loop for the stores.
-    enum
-    {
-        LOOPS = fmha::Div_up<ROWS, ROWS_PER_LOOP>::VALUE
-    };
+    static constexpr int LOOPS = fmha::Div_up<ROWS, ROWS_PER_LOOP>::VALUE;
 
     // DEBUG.
     static_assert(ROWS % ROWS_PER_LOOP == 0, "");
@@ -113,22 +86,13 @@ struct Hmma_gmem_tile_o
     static_assert(ROWS_PER_LOOP >= (int) Mma_tile::M_PER_MMA_PER_CTA, "");
 
     // Do we have to guard against partial writes/reads.
-    enum
-    {
-        HAS_INCOMPLETE_STG = Cta_tile::M % ROWS_PER_STG != 0
-    };
+    static constexpr int HAS_INCOMPLETE_STG = Cta_tile::M % ROWS_PER_STG != 0;
 
     // The number of STGs needed to store a chunk of the Q matrix.
-    enum
-    {
-        STGS_PER_LOOP = fmha::Div_up<ROWS_PER_LOOP, ROWS_PER_STG>::VALUE
-    };
+    static constexpr int STGS_PER_LOOP = fmha::Div_up<ROWS_PER_LOOP, ROWS_PER_STG>::VALUE;
 
     // The number of STGs needed to store a chunk of the Q matrix in total.
-    enum
-    {
-        STGS = STGS_PER_LOOP * LOOPS
-    };
+    static constexpr int STGS = STGS_PER_LOOP * LOOPS;
 
     // Ctor.
     template <typename Params, typename Block_info>
@@ -371,25 +335,13 @@ struct Gmem_tile_o<fmha::Ampere_hmma_fp32_traits, Cta_tile, CTAS_PER_HEAD>
 
     // END OF DEBUG.
 
-    enum
-    {
-        STGS_PER_LOOP = Base::STGS_PER_LOOP
-    };
+    static constexpr int STGS_PER_LOOP = Base::STGS_PER_LOOP;
 
-    enum
-    {
-        ROWS_PER_STG = Base::ROWS_PER_STG
-    };
+    static constexpr int ROWS_PER_STG = Base::ROWS_PER_STG;
 
-    enum
-    {
-        STGS = Base::STGS
-    };
+    static constexpr int STGS = Base::STGS;
 
-    enum
-    {
-        HAS_INCOMPLETE_STG = Base::HAS_INCOMPLETE_STG
-    };
+    static constexpr int HAS_INCOMPLETE_STG = Base::HAS_INCOMPLETE_STG;
 
     // Ctor.
     template <typename Params, typename Block_info>
@@ -461,25 +413,13 @@ struct Gmem_tile_o<fmha::Ampere_hmma_bf16_traits, Cta_tile, CTAS_PER_HEAD>
 
     // END OF DEBUG.
 
-    enum
-    {
-        STGS_PER_LOOP = Base::STGS_PER_LOOP
-    };
+    static constexpr int STGS_PER_LOOP = Base::STGS_PER_LOOP;
 
-    enum
-    {
-        ROWS_PER_STG = Base::ROWS_PER_STG
-    };
+    static constexpr int ROWS_PER_STG = Base::ROWS_PER_STG;
 
-    enum
-    {
-        STGS = Base::STGS
-    };
+    static constexpr int STGS = Base::STGS;
 
-    enum
-    {
-        HAS_INCOMPLETE_STG = Base::HAS_INCOMPLETE_STG
-    };
+    static constexpr int HAS_INCOMPLETE_STG = Base::HAS_INCOMPLETE_STG;
 
     // Ctor.
     template <typename Params, typename Block_info>
@@ -811,67 +751,37 @@ struct Gmem_tile_o_8bit
     using Mma_tile = typename Traits::template Mma_tile<Cta_tile>;
 
     // The size of each element.
-    enum
-    {
-        BYTES_PER_ELEMENT = 1
-    };
+    static constexpr int BYTES_PER_ELEMENT = 1;
 
     // The size of a row in bytes.
-    enum
-    {
-        BYTES_PER_ROW = Cta_tile::N * BYTES_PER_ELEMENT
-    };
+    static constexpr int BYTES_PER_ROW = Cta_tile::N * BYTES_PER_ELEMENT;
 
     // The valid size of a row in bytes.
-    enum
-    {
-        VALID_BYTES_PER_ROW = Cta_tile::VALID_N * BYTES_PER_ELEMENT
-    };
+    static constexpr int VALID_BYTES_PER_ROW = Cta_tile::VALID_N * BYTES_PER_ELEMENT;
 
     // The size of each STG (16B --> 8bit elements).
-    enum
-    {
-        BYTES_PER_STG = fmha::Div_up<16, sizeof(typename Traits::Accumulator_type)>::VALUE
-    };
+    static constexpr int BYTES_PER_STG = fmha::Div_up<16, sizeof(typename Traits::Accumulator_type)>::VALUE;
 
     // The STG packed data type
     using Stg_packed_type = typename Uint_from_size_in_bytes<BYTES_PER_STG>::Type;
 
     // The number of threads to store a "row" of the matrix.
-    enum
-    {
-        THREADS_PER_ROW = BYTES_PER_ROW / BYTES_PER_STG
-    };
+    static constexpr int THREADS_PER_ROW = BYTES_PER_ROW / BYTES_PER_STG;
 
     // The number of "rows" stored per STG.
-    enum
-    {
-        ROWS_PER_STG = Cta_tile::THREADS_PER_CTA / THREADS_PER_ROW
-    };
+    static constexpr int ROWS_PER_STG = Cta_tile::THREADS_PER_CTA / THREADS_PER_ROW;
 
     // The number of "rows" stored per iteration of the loop. The output of 1 MMA.
-    enum
-    {
-        ROWS = Cta_tile::M
-    };
+    static constexpr int ROWS = Cta_tile::M;
 
     // We want at least one output per thread (if possible).
-    enum
-    {
-        ROWS_PER_LOOP_ = ROWS <= 64 ? ROWS : (int) Min<ROWS, ROWS_PER_STG>::VALUE
-    };
+    static constexpr int ROWS_PER_LOOP_ = ROWS <= 64 ? ROWS : (int) Min<ROWS, ROWS_PER_STG>::VALUE;
 
     // We also want to have "complete" MMAs.
-    enum
-    {
-        ROWS_PER_LOOP = Max<ROWS_PER_LOOP_, Mma_tile::M_PER_MMA_PER_CTA>::VALUE
-    };
+    static constexpr int ROWS_PER_LOOP = Max<ROWS_PER_LOOP_, Mma_tile::M_PER_MMA_PER_CTA>::VALUE;
 
     // The number of outer loop for the stores.
-    enum
-    {
-        LOOPS = fmha::Div_up<ROWS, ROWS_PER_LOOP>::VALUE
-    };
+    static constexpr int LOOPS = fmha::Div_up<ROWS, ROWS_PER_LOOP>::VALUE;
 
     // DEBUG.
     static_assert(ROWS % ROWS_PER_LOOP == 0, "");
@@ -880,57 +790,39 @@ struct Gmem_tile_o_8bit
     static_assert(ROWS_PER_LOOP >= (int) Mma_tile::M_PER_MMA_PER_CTA, "");
 
     // Do we have to guard against partial writes/reads.
-    enum
-    {
-        HAS_INCOMPLETE_STG = Cta_tile::M % ROWS_PER_STG != 0
-    };
+    static constexpr int HAS_INCOMPLETE_STG = Cta_tile::M % ROWS_PER_STG != 0;
 
     // The number of STGs needed to store a chunk of the Q matrix.
-    enum
-    {
-        STGS_PER_LOOP = fmha::Div_up<ROWS_PER_LOOP, ROWS_PER_STG>::VALUE
-    };
+    static constexpr int STGS_PER_LOOP = fmha::Div_up<ROWS_PER_LOOP, ROWS_PER_STG>::VALUE;
 
     // The number of STGs needed to store a chunk of the Q matrix in total.
-    enum
-    {
-        STGS = STGS_PER_LOOP * LOOPS
-    };
+    static constexpr int STGS = STGS_PER_LOOP * LOOPS;
 
 #if 0
     // The number of "rows" stored per iteration of the loop. The output of 1 MMA.
-    enum { ROWS = Cta_tile::M };
+    static constexpr int ROWS = Cta_tile::M;
     // The number of "rows" stored per iteration of the loop. The output of 1 MMA.
-    enum { ROWS_PER_LOOP = Mma_tile::M_PER_MMA_PER_CTA };
+    static constexpr int ROWS_PER_LOOP = Mma_tile::M_PER_MMA_PER_CTA;
     // The number of outer loop for the stores.
-    enum { LOOPS = ROWS / ROWS_PER_LOOP };
+    static constexpr int LOOPS = ROWS / ROWS_PER_LOOP;
 
     // Make sure the math is correct.
     static_assert(LOOPS == (int)Mma_tile::MMAS_M, "");
 
     // The number of "rows" stored per STG -- for it to be the number of rows per MMA instruction.
-    enum { ROWS_PER_STG = Cta_tile::THREADS_PER_CTA / THREADS_PER_ROW };
+    static constexpr int ROWS_PER_STG = Cta_tile::THREADS_PER_CTA / THREADS_PER_ROW;
     // The number of STGs needed to store a chunk of the Q matrix.
-    enum { STGS_PER_LOOP = fmha::Div_up<ROWS_PER_LOOP, ROWS_PER_STG>::VALUE };
+    static constexpr int STGS_PER_LOOP = fmha::Div_up<ROWS_PER_LOOP, ROWS_PER_STG>::VALUE;
 #endif
 
     // Are all threads active?
-    enum
-    {
-        ALL_THREADS_ACTIVE = ROWS_PER_STG <= ROWS_PER_LOOP
-    };
+    static constexpr int ALL_THREADS_ACTIVE = ROWS_PER_STG <= ROWS_PER_LOOP;
 
     // The number of active threads.
-    enum
-    {
-        ACTIVE_THREADS_ = Cta_tile::THREADS_PER_CTA * ROWS_PER_LOOP / ROWS_PER_STG
-    };
+    static constexpr int ACTIVE_THREADS_ = Cta_tile::THREADS_PER_CTA * ROWS_PER_LOOP / ROWS_PER_STG;
 
     // The number of active threads.
-    enum
-    {
-        ACTIVE_THREADS = ALL_THREADS_ACTIVE ? Cta_tile::THREADS_PER_CTA : ACTIVE_THREADS_
-    };
+    static constexpr int ACTIVE_THREADS = ALL_THREADS_ACTIVE ? Cta_tile::THREADS_PER_CTA : ACTIVE_THREADS_;
 
     // Ctor.
     template <typename Params, typename Block_info>
@@ -1248,69 +1140,39 @@ struct Gmem_tile_o_16bit
     using Mma_tile = typename Traits::template Mma_tile<Cta_tile>;
 
     // The size of each element.
-    enum
-    {
-        BYTES_PER_ELEMENT = 2
-    };
+    static constexpr int BYTES_PER_ELEMENT = 2;
 
     // The size of a row in bytes.
-    enum
-    {
-        BYTES_PER_ROW = Cta_tile::N * BYTES_PER_ELEMENT
-    };
+    static constexpr int BYTES_PER_ROW = Cta_tile::N * BYTES_PER_ELEMENT;
 
     // The valid size of a row in bytes.
     // Note: cross-attention kernels rely on head dim from runtime instead of from compile-time.
     // This approach deviates from self-attention kernels. To explore a unified approach.
-    enum
-    {
-        VALID_BYTES_PER_ROW = Cta_tile::VALID_N * BYTES_PER_ELEMENT
-    };
+    static constexpr int VALID_BYTES_PER_ROW = Cta_tile::VALID_N * BYTES_PER_ELEMENT;
 
     // The size of each STG.
-    enum
-    {
-        BYTES_PER_STG = 8
-    };
+    static constexpr int BYTES_PER_STG = 8;
 
     // The STG packed data type
     using Stg_packed_type = typename Uint_from_size_in_bytes<BYTES_PER_STG>::Type;
 
     // The number of threads to store a "row" of the matrix.
-    enum
-    {
-        THREADS_PER_ROW = BYTES_PER_ROW / BYTES_PER_STG
-    };
+    static constexpr int THREADS_PER_ROW = BYTES_PER_ROW / BYTES_PER_STG;
 
     // The number of "rows" stored per STG.
-    enum
-    {
-        ROWS_PER_STG = Cta_tile::THREADS_PER_CTA / THREADS_PER_ROW
-    };
+    static constexpr int ROWS_PER_STG = Cta_tile::THREADS_PER_CTA / THREADS_PER_ROW;
 
     // The number of "rows" stored per iteration of the loop. The output of 1 MMA.
-    enum
-    {
-        ROWS = Cta_tile::M
-    };
+    static constexpr int ROWS = Cta_tile::M;
 
     // We want at least one output per thread (if possible).
-    enum
-    {
-        ROWS_PER_LOOP_ = ROWS <= 64 ? ROWS : (int) Min<ROWS, ROWS_PER_STG>::VALUE
-    };
+    static constexpr int ROWS_PER_LOOP_ = ROWS <= 64 ? ROWS : (int) Min<ROWS, ROWS_PER_STG>::VALUE;
 
     // We also want to have "complete" MMAs.
-    enum
-    {
-        ROWS_PER_LOOP = Max<ROWS_PER_LOOP_, Mma_tile::M_PER_MMA_PER_CTA>::VALUE
-    };
+    static constexpr int ROWS_PER_LOOP = Max<ROWS_PER_LOOP_, Mma_tile::M_PER_MMA_PER_CTA>::VALUE;
 
     // The number of outer loop for the stores.
-    enum
-    {
-        LOOPS = fmha::Div_up<ROWS, ROWS_PER_LOOP>::VALUE
-    };
+    static constexpr int LOOPS = fmha::Div_up<ROWS, ROWS_PER_LOOP>::VALUE;
 
     // DEBUG.
     static_assert(ROWS % ROWS_PER_LOOP == 0, "");
@@ -1320,40 +1182,22 @@ struct Gmem_tile_o_16bit
     static_assert(ROWS_PER_LOOP >= (int) Mma_tile::M_PER_MMA_PER_CTA, "");
 
     // Do we have to guard against partial writes/reads.
-    enum
-    {
-        HAS_INCOMPLETE_STG = Cta_tile::M % ROWS_PER_STG != 0
-    };
+    static constexpr int HAS_INCOMPLETE_STG = Cta_tile::M % ROWS_PER_STG != 0;
 
     // The number of STGs needed to store a chunk of the Q matrix.
-    enum
-    {
-        STGS_PER_LOOP = fmha::Div_up<ROWS_PER_LOOP, ROWS_PER_STG>::VALUE
-    };
+    static constexpr int STGS_PER_LOOP = fmha::Div_up<ROWS_PER_LOOP, ROWS_PER_STG>::VALUE;
 
     // The number of STGs needed to store a chunk of the Q matrix in total.
-    enum
-    {
-        STGS = STGS_PER_LOOP * LOOPS
-    };
+    static constexpr int STGS = STGS_PER_LOOP * LOOPS;
 
     // Are all threads active?
-    enum
-    {
-        ALL_THREADS_ACTIVE = ROWS_PER_STG <= ROWS_PER_LOOP
-    };
+    static constexpr int ALL_THREADS_ACTIVE = ROWS_PER_STG <= ROWS_PER_LOOP;
 
     // The number of active threads.
-    enum
-    {
-        ACTIVE_THREADS_ = Cta_tile::THREADS_PER_CTA * ROWS_PER_LOOP / ROWS_PER_STG
-    };
+    static constexpr int ACTIVE_THREADS_ = Cta_tile::THREADS_PER_CTA * ROWS_PER_LOOP / ROWS_PER_STG;
 
     // The number of active threads.
-    enum
-    {
-        ACTIVE_THREADS = ALL_THREADS_ACTIVE ? Cta_tile::THREADS_PER_CTA : ACTIVE_THREADS_
-    };
+    static constexpr int ACTIVE_THREADS = ALL_THREADS_ACTIVE ? Cta_tile::THREADS_PER_CTA : ACTIVE_THREADS_;
 
     // Ctor.
     template <typename Params, typename Block_info>
@@ -1501,15 +1345,9 @@ struct Imma_gmem_tile_o_interleaved
     // The mma tile.
     using Mma_tile = typename Traits::template Mma_tile<Cta_tile>;
 
-    enum
-    {
-        VEC = 32
-    };
+    static constexpr int VEC = 32;
 
-    enum
-    {
-        NUM_SLICES = Cta_tile::N / VEC
-    };
+    static constexpr int NUM_SLICES = Cta_tile::N / VEC;
 
     // DEBUG.
     static_assert(NUM_SLICES == 1 || NUM_SLICES == 2, "");
@@ -1517,28 +1355,16 @@ struct Imma_gmem_tile_o_interleaved
     // END OF DEBUG.
 
     // The size of each element.
-    enum
-    {
-        BYTES_PER_ELEMENT = 1
-    };
+    static constexpr int BYTES_PER_ELEMENT = 1;
 
     // The size of a row in bytes.
-    enum
-    {
-        BYTES_PER_ROW = VEC * BYTES_PER_ELEMENT
-    };
+    static constexpr int BYTES_PER_ROW = VEC * BYTES_PER_ELEMENT;
 
     // The size of each STG.
-    enum
-    {
-        BYTES_PER_STG = 4
-    };
+    static constexpr int BYTES_PER_STG = 4;
 
     // The number of threads to store a "row" of the matrix. We force it to 8
-    enum
-    {
-        THREADS_PER_ROW = BYTES_PER_ROW / BYTES_PER_STG
-    };
+    static constexpr int THREADS_PER_ROW = BYTES_PER_ROW / BYTES_PER_STG;
 
     // DEBUG.
     static_assert(THREADS_PER_ROW == 8 && BYTES_PER_STG == 4, "");
@@ -1546,27 +1372,15 @@ struct Imma_gmem_tile_o_interleaved
     // END OF DEBUG.
 
     // the "logical" number of rows. think of rows per slice
-    enum
-    {
-        ROWS = Cta_tile::M
-    };
+    static constexpr int ROWS = Cta_tile::M;
 
     // "physical" rows
-    enum
-    {
-        TOTAL_ROWS = ROWS * NUM_SLICES
-    };
+    static constexpr int TOTAL_ROWS = ROWS * NUM_SLICES;
 
     // The number of "rows" stored per iteration of the loop. The output of 1 MMA.
-    enum
-    {
-        ROWS_PER_LOOP_PER_SLICE = Mma_tile::M_PER_MMA_PER_CTA
-    };
+    static constexpr int ROWS_PER_LOOP_PER_SLICE = Mma_tile::M_PER_MMA_PER_CTA;
 
-    enum
-    {
-        ROWS_PER_LOOP = Mma_tile::M_PER_MMA_PER_CTA * NUM_SLICES
-    };
+    static constexpr int ROWS_PER_LOOP = Mma_tile::M_PER_MMA_PER_CTA * NUM_SLICES;
 
     // DEBUG.
     static_assert(ROWS_PER_LOOP == 16 * Cta_tile::WARPS_M * NUM_SLICES, "");
@@ -1574,30 +1388,18 @@ struct Imma_gmem_tile_o_interleaved
     // END OF DEBUG.
 
     // The number of outer loop for the stores.
-    enum
-    {
-        LOOPS = TOTAL_ROWS / ROWS_PER_LOOP
-    };
+    static constexpr int LOOPS = TOTAL_ROWS / ROWS_PER_LOOP;
 
     // Make sure the math is correct.
     static_assert(LOOPS == (int) Mma_tile::MMAS_M, "");
 
     // The number of "rows" stored per STG -- for it to be the number of rows per MMA instruction.
-    enum
-    {
-        ROWS_PER_STG = Cta_tile::THREADS_PER_CTA / THREADS_PER_ROW
-    };
+    static constexpr int ROWS_PER_STG = Cta_tile::THREADS_PER_CTA / THREADS_PER_ROW;
 
     // The number of STGs needed to store a chunk of the Q matrix.
-    enum
-    {
-        STGS_PER_LOOP = fmha::Div_up<ROWS_PER_LOOP, ROWS_PER_STG>::VALUE
-    };
+    static constexpr int STGS_PER_LOOP = fmha::Div_up<ROWS_PER_LOOP, ROWS_PER_STG>::VALUE;
 
-    enum
-    {
-        STGS_PER_SLICE = STGS_PER_LOOP / NUM_SLICES
-    };
+    static constexpr int STGS_PER_SLICE = STGS_PER_LOOP / NUM_SLICES;
 
     // DEBUG.
     static_assert(

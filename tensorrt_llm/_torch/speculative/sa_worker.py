@@ -197,6 +197,8 @@ class SAWorker(SpecWorkerBase):
             accepted_tokens, num_accepted_tokens, spec_metadata, batch_size, num_contexts
         )
 
+        self._rollback_guided_decoder_after_verify(num_accepted_tokens)
+
         # Step 5: Prepare next_new_tokens for overlap scheduler
         next_new_tokens = self._prepare_next_new_tokens(
             accepted_tokens,

@@ -80,7 +80,14 @@ def discover_pipeline_components(checkpoint_path: Path) -> Dict[str, Path]:
 
 
 def create_attention_metadata_state() -> Dict[str, Any]:
-    """Create model-scoped state shared by visual-gen attention layers."""
+    """Create state shared by attention layers in one model component.
+
+    The state outlives individual forwards and CUDA Graph captures. It owns the
+    shape-keyed TRTLLM metadata cache, whose metadata objects also carry the FMHA
+    plan caches, so one static block-sparse profile is planned once per component
+    and shape instead of once per layer. Each model component receives a distinct
+    state and must not execute concurrent forwards.
+    """
     return {"metadata_cache": {}}
 
 
@@ -129,6 +136,7 @@ class DiffusionModelConfig(_VisualGenConfigBase):
     cuda_graph: CudaGraphConfig = PydanticField(default_factory=CudaGraphConfig)
     cpu_offload_config: CpuOffloadConfig = PydanticField(default_factory=CpuOffloadConfig)
     attention: AttentionConfig = PydanticField(default_factory=AttentionConfig)
+    # Per-component metadata cache shared by VisualGen TRTLLM attention layers.
     attention_metadata_state: Optional[Dict[str, Any]] = None
     parallel: ParallelConfig = PydanticField(default_factory=ParallelConfig)
     cache: Optional[CacheConfig] = None
@@ -202,6 +210,7 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
     cuda_graph: CudaGraphConfig = PydanticField(default_factory=CudaGraphConfig)
     cpu_offload_config: CpuOffloadConfig = PydanticField(default_factory=CpuOffloadConfig)
     attention: AttentionConfig = PydanticField(default_factory=AttentionConfig)
+    # Seed state copied into each model component before attention metadata is created.
     attention_metadata_state: Optional[Dict[str, Any]] = None
     parallel: ParallelConfig = PydanticField(default_factory=ParallelConfig)
     cache: Optional[CacheConfig] = None
@@ -591,21 +600,25 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
         checkpoint_path = Path(checkpoint_dir)
         extra_attrs: Dict[str, Any] = {}
 
-        # LTX-2 stage-2 paths (spatial_upsampler_path, distilled_lora_path)
-        # are surfaced to the LTX2 pipeline consumer via extra_attrs. The
-        # resolved pipeline_config kwarg comes from PipelineLoader after
-        # registry validation; when from_pretrained is called directly
-        # (mostly in unit tests), fall back to the raw VisualGenArgs dict.
+        # Preserve all registry-resolved model options, including False and None.
+        # Direct callers may supply the raw dictionary without a PipelineLoader.
         resolved_pipeline_config = kwargs.pop("pipeline_config", None)
         if resolved_pipeline_config is None:
             resolved_pipeline_config = dict(args.pipeline_config) if args else {}
-        for key in ("spatial_upsampler_path", "distilled_lora_path"):
-            value = resolved_pipeline_config.get(key)
-            if value:
-                extra_attrs[key] = value
+        extra_attrs.update(resolved_pipeline_config)
+
+        h3_workflow = resolved_pipeline_config.get("workflow")
+        if h3_workflow is not None:
+            if h3_workflow not in ("fl2va", "ref2va"):
+                raise ValueError("MiniMax-H3 workflow must be 'fl2va' or 'ref2va'.")
+            extra_attrs["workflow"] = h3_workflow
 
         # Discover pipeline components (diffusers layout)
         components = discover_pipeline_components(checkpoint_path)
+        if h3_workflow == "ref2va":
+            if "transformer_ref" not in components:
+                raise ValueError("MiniMax-H3 ref2va requires the transformer_ref checkpoint.")
+            components[PipelineComponent.TRANSFORMER] = components.pop("transformer_ref")
         component_config_dicts: Dict[str, Dict[str, Any]] = {}
 
         if components:

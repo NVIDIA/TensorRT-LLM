@@ -13,11 +13,29 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import threading
+from concurrent.futures import ThreadPoolExecutor
+
 import pytest
 import torch
 
 from tensorrt_llm._torch.distributed import ops as ops_module
-from tensorrt_llm._torch.distributed.ops import MNNVLAllReduce
+from tensorrt_llm._torch.distributed.ops import (
+    MNNVLAllReduce,
+    get_or_scale_allreduce_mnnvl_workspace,
+)
+from tensorrt_llm.mapping import Mapping
+
+
+@pytest.fixture(autouse=True)
+def mpi_mode(monkeypatch):
+    """Pin the checkpoint hooks to their MPI branch.
+
+    These tests assert MPI ownership semantics -- the workspace duplicates the communicator it is
+    handed and frees its own copy. The hooks pick that branch on mpi_disabled(), which reads the
+    environment, so pin it rather than inherit whatever the runner happens to export.
+    """
+    monkeypatch.setattr(ops_module, "mpi_disabled", lambda: False)
 
 
 class _FakeComm:
@@ -53,12 +71,15 @@ class _FailingDupComm(_FakeComm):
 
 
 class _FakeMcastBuffer:
-    def __init__(self) -> None:
+    def __init__(self, *args: object, **kwargs: object) -> None:
         self.mapped = True
         self.restore_pending = False
         self.prepare_count = 0
         self.restore_count = 0
         self.complete_count = 0
+
+    def get_uc_buffer(self, *args: object, **kwargs: object) -> torch.Tensor:
+        return torch.zeros(1, dtype=torch.float32)
 
     def is_mapped(self) -> bool:
         return self.mapped
@@ -85,6 +106,87 @@ class _FakeMcastBuffer:
         self.mapped = True
 
 
+class _FakeWorld:
+    def __init__(self) -> None:
+        self.comm = _FakeComm()
+        self.split_count = 0
+
+    def Split(self, color: int, key: int) -> _FakeComm:
+        self.split_count += 1
+        return self.comm
+
+
+def _patch_workspace_dependencies(monkeypatch: pytest.MonkeyPatch) -> _FakeWorld:
+    world = _FakeWorld()
+    cpu_device = torch.device("cpu")
+    monkeypatch.setattr(MNNVLAllReduce, "allreduce_mnnvl_workspaces", {})
+    monkeypatch.setattr(MNNVLAllReduce, "allreduce_mnnvl_pending_comms", {})
+    monkeypatch.setattr(MNNVLAllReduce, "_allreduce_mnnvl_workspace_locks", {})
+    monkeypatch.setattr(ops_module, "mpi_comm", lambda: world)
+    monkeypatch.setattr(ops_module.torch, "device", lambda *args, **kwargs: cpu_device)
+    monkeypatch.setattr(ops_module, "_initialize_allreduce_mnnvl_protocol", lambda workspace: None)
+    return world
+
+
+def test_workspace_retry_reuses_pending_communicator(monkeypatch: pytest.MonkeyPatch) -> None:
+    mapping = Mapping(world_size=1, tp_size=1, rank=0)
+    world = _patch_workspace_dependencies(monkeypatch)
+    construction_count = 0
+
+    def fail_once(*args: object, **kwargs: object) -> _FakeMcastBuffer:
+        nonlocal construction_count
+        construction_count += 1
+        if construction_count == 1:
+            raise RuntimeError("injected workspace construction failure")
+        return _FakeMcastBuffer()
+
+    monkeypatch.setattr(ops_module, "McastGPUBuffer", fail_once)
+
+    with pytest.raises(RuntimeError, match="workspace construction failed"):
+        get_or_scale_allreduce_mnnvl_workspace(mapping, torch.float32)
+
+    assert world.split_count == 1
+    assert MNNVLAllReduce.allreduce_mnnvl_pending_comms[mapping] is world.comm
+
+    workspace = get_or_scale_allreduce_mnnvl_workspace(mapping, torch.float32)
+
+    assert construction_count == 2
+    assert world.split_count == 1
+    assert MNNVLAllReduce.allreduce_mnnvl_pending_comms == {}
+    assert workspace["mpi_comm"] is world.comm
+
+
+def test_concurrent_workspace_construction_is_serialized(monkeypatch: pytest.MonkeyPatch) -> None:
+    mapping = Mapping(world_size=1, tp_size=1, rank=0)
+    world = _patch_workspace_dependencies(monkeypatch)
+    construction_barrier = threading.Barrier(2)
+    construction_count = 0
+    construction_count_lock = threading.Lock()
+
+    def construct(*args: object, **kwargs: object) -> _FakeMcastBuffer:
+        nonlocal construction_count
+        with construction_count_lock:
+            construction_count += 1
+        try:
+            construction_barrier.wait(timeout=0.2)
+        except threading.BrokenBarrierError:
+            pass
+        return _FakeMcastBuffer()
+
+    monkeypatch.setattr(ops_module, "McastGPUBuffer", construct)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [
+            executor.submit(get_or_scale_allreduce_mnnvl_workspace, mapping, torch.float32)
+            for _ in range(2)
+        ]
+        workspaces = [future.result() for future in futures]
+
+    assert construction_count == 1
+    assert world.split_count == 1
+    assert workspaces[0] is workspaces[1]
+
+
 def test_checkpoint_restore_resets_inference_protocol_state(monkeypatch) -> None:
     mapping = object()
     stale_comm = _FakeComm()
@@ -99,7 +201,7 @@ def test_checkpoint_restore_resets_inference_protocol_state(monkeypatch) -> None
         "uc_buffer": uc_buffer,
         "buffer_flags": buffer_flags,
         "buffer_size_bytes": 1024,
-        "mpi_comm": stale_comm,
+        "comm": stale_comm,
     }
     allreduce = object.__new__(MNNVLAllReduce)
     torch.nn.Module.__init__(allreduce)
@@ -115,7 +217,7 @@ def test_checkpoint_restore_resets_inference_protocol_state(monkeypatch) -> None
     allreduce.checkpoint_restore(comm)
     allreduce.checkpoint_restore(redundant_comm)
 
-    assert workspace["mpi_comm"] is comm.duplicates[0]
+    assert workspace["comm"] is comm.duplicates[0]
     assert stale_comm.allreduce_count == 0
     assert stale_comm.free_count == 1
     assert handle.prepare_count == 1
@@ -144,7 +246,7 @@ def test_checkpoint_restore_protocol_failure_is_terminal(monkeypatch) -> None:
         "uc_buffer": torch.ones(8, dtype=torch.float32),
         "buffer_flags": torch.ones(9, dtype=torch.uint32),
         "buffer_size_bytes": 1024,
-        "mpi_comm": _FakeComm(),
+        "comm": _FakeComm(),
     }
     allreduce = object.__new__(MNNVLAllReduce)
     torch.nn.Module.__init__(allreduce)
@@ -165,7 +267,7 @@ def test_checkpoint_restore_protocol_failure_is_terminal(monkeypatch) -> None:
     assert not handle.is_mapped()
     assert not handle.restore_pending
     assert handle.complete_count == 1
-    assert workspace["mpi_comm"] is None
+    assert workspace["comm"] is None
     assert comm.duplicates[0].free_count == 1
 
 
@@ -177,7 +279,7 @@ def test_checkpoint_restore_communicator_duplication_failure_is_terminal(monkeyp
         "uc_buffer": torch.ones(8, dtype=torch.float32),
         "buffer_flags": torch.ones(9, dtype=torch.uint32),
         "buffer_size_bytes": 1024,
-        "mpi_comm": _FakeComm(),
+        "comm": _FakeComm(),
     }
     allreduce = object.__new__(MNNVLAllReduce)
     torch.nn.Module.__init__(allreduce)
@@ -191,4 +293,4 @@ def test_checkpoint_restore_communicator_duplication_failure_is_terminal(monkeyp
     assert not handle.is_mapped()
     assert not handle.restore_pending
     assert handle.complete_count == 1
-    assert workspace["mpi_comm"] is None
+    assert workspace["comm"] is None

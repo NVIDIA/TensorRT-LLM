@@ -73,26 +73,14 @@ inline __device__ void device_4xN_hopper(Params const& params)
     using Compute_tile_o = typename Kernel_traits::Compute_tile_o;
 
     // Do we use LDGSTS for Q, K or V?
-    enum
-    {
-        USE_LDGSTS_Q = Kernel_traits::USE_LDGSTS_Q
-    };
+    static constexpr int USE_LDGSTS_Q = Kernel_traits::USE_LDGSTS_Q;
 
-    enum
-    {
-        USE_LDGSTS_K = Kernel_traits::USE_LDGSTS_K
-    };
+    static constexpr int USE_LDGSTS_K = Kernel_traits::USE_LDGSTS_K;
 
-    enum
-    {
-        USE_LDGSTS_V = Kernel_traits::USE_LDGSTS_V
-    };
+    static constexpr int USE_LDGSTS_V = Kernel_traits::USE_LDGSTS_V;
 
     // Do we use LDGSTS for any of the 3 input matrices.
-    enum
-    {
-        USE_LDGSTS = USE_LDGSTS_Q || USE_LDGSTS_K || USE_LDGSTS_V
-    };
+    static constexpr int USE_LDGSTS = USE_LDGSTS_Q || USE_LDGSTS_K || USE_LDGSTS_V;
 
     // If either K or V uses LDGSTS, they cannot share a buffer.
     static_assert(!(USE_LDGSTS_K || USE_LDGSTS_V) || !Kernel_traits::SHARE_SMEM_FOR_K_AND_V, "");
@@ -189,10 +177,7 @@ inline __device__ void device_4xN_hopper(Params const& params)
 
     // Store/load P to/from memory (for debugging).
 #if defined(STORE_P)
-    enum
-    {
-        BITS_PER_ELT_P = sizeof(typename Traits_p::Accumulator_type) * 8
-    };
+    static constexpr int BITS_PER_ELT_P = sizeof(typename Traits_p::Accumulator_type) * 8;
 
     using Gmem_tile_p = fmha::Gmem_tile_ps_hopper<Traits_p, Cta_tile_p, BITS_PER_ELT_P>;
     Gmem_tile_p gmem_p(params.p_ptr, params.p_stride_in_bytes, params.scale_bmm1, tidx);
@@ -200,10 +185,7 @@ inline __device__ void device_4xN_hopper(Params const& params)
 
     // Store S to memory (for debugging). NOTE: We use A_type as C_type is int32 for IMMA???
 #if defined(STORE_S)
-    enum
-    {
-        BITS_PER_ELT_S = sizeof(typename Traits_p::A_type) * 8
-    };
+    static constexpr int BITS_PER_ELT_S = sizeof(typename Traits_p::A_type) * 8;
 
     using Gmem_tile_s = fmha::Gmem_tile_ps_hopper<Traits_p, Cta_tile_p, BITS_PER_ELT_S>;
     Gmem_tile_s gmem_s(params.s_ptr, params.s_stride_in_bytes, params.scale_softmax, tidx);

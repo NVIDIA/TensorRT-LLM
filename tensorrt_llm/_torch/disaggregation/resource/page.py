@@ -21,6 +21,8 @@ from typing import FrozenSet, List, Optional, Tuple
 
 import numpy as np
 
+from tensorrt_llm._torch.disaggregation.base import CacheKind
+
 BUFFER_ENTRY_DTYPE = np.dtype(
     [
         ("local_layer_id", np.uint32),
@@ -271,25 +273,14 @@ class PoolView:
         )
 
 
-class CacheKind(IntEnum):
-    """How region IDs in block_ids_per_layer_groups are interpreted.
-
-    PAGED: multiple block IDs per request (attention KV cache).
-           Extraction: per-block base pointers. Alignment: window/beam/SWA.
-    STATE: single slot ID per request (recurrent state, e.g. mamba).
-           Extraction: per-layer pointers within one slot. No block alignment.
-    """
-
-    PAGED = 0
-    STATE = 1
-
-
 @dataclass
 class LayerGroup:
     """Base class for one life cycle / layer-group.
 
     Shared structure:
-      - kind: how this group's region IDs are interpreted (PAGED vs STATE)
+      - kind: how this group's region IDs are interpreted. PAGED extracts per-block base pointers
+        and aligns on window/beam/SWA; STATE extracts per-layer pointers within one slot and has no
+        block alignment.
       - pool_group_idx: index into KVCachePageTable.pool_groups
       - local_layers: local ↔ global layer ID mapping
       - pool_views: logical views into pool_groups[pool_group_idx].pools

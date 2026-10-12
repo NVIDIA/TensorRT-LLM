@@ -1,0 +1,20 @@
+version: 0.0.1
+l0_gb300_multi_nodes_perf_sanity_gen1_node8_gpu32:
+- condition:
+    ranges:
+      # 0 ctx workers
+      # 1 gen worker with 8 nodes and 32 GPUs
+      system_gpu_count:
+        gte: 32
+        lte: 32
+    wildcards:
+      gpu:
+      - '*gb300*'
+    terms:
+      stage: post_merge
+      backend: pytorch
+  tests:
+  # deepseek-v4-pro-fp4 8k1k con180
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-gen_only_no_context-gb300_deepseek-v4-pro-fp4_8k1k_con180_ctx3_dep4_gen1_dep32_eplb384_mtp3_ccb-NIXL] TIMEOUT (120)
+  # glm-5-fp4 8k1k con512
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-gen_only_no_context-gb300_glm-5-fp4_8k1k_con512_ctx1_dep2_gen1_dep32_eplb0_mtp3_ccb-NIXL] TIMEOUT (90)

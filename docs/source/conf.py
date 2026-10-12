@@ -73,7 +73,6 @@ extensions = [
     'sphinxcontrib.autodoc_pydantic',
     'sphinx_togglebutton',
     'sphinxcontrib.mermaid',
-    'trtllm_auto_deploy',
     'llmapi_config_telemetry',
     'trtllm_config_selector',
 ]
@@ -152,11 +151,11 @@ copybutton_line_continuation_character = "\\"
 # -- Options for HTML output -------------------------------------------------
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#options-for-html-output
 
+# JSON files are downloadable data assets, not documentation source files.
 source_suffix = {
     '.rst': 'restructuredtext',
     '.txt': 'markdown',
     '.md': 'markdown',
-    '.json': 'json',
 }
 
 html_theme = 'nvidia_sphinx_theme'

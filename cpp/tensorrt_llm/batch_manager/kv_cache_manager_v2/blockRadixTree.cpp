@@ -325,6 +325,22 @@ Block::Block(BlockKey k, std::vector<TokenIdExt> toks, NodeBase* prevNode)
     // exists to avoid). knownNoDigest=false lets makeKey's update() scan for digests
     // itself — correct regardless of content, so no separate scan is needed here.
     TLLM_CHECK_DEBUG(k == Block::makeKey(prevNode->key, tokens.data(), tokens.size(), /*knownNoDigest=*/false));
+
+    if (eventSink != nullptr && eventSink->needsTokenDigestContext())
+    {
+        if (prevNode->type() == Type::kBLOCK)
+        {
+            mLastTokenDigest = static_cast<Block const*>(prevNode)->getLastTokenDigest();
+        }
+        for (auto iter = tokens.rbegin(); iter != tokens.rend(); ++iter)
+        {
+            if (iter->isDigest())
+            {
+                mLastTokenDigest = std::make_shared<Digest const>(iter->digest());
+                break;
+            }
+        }
+    }
 }
 
 // Delegates to the tree, mirroring Python's RootBlock.num_life_cycles. Defined
@@ -466,7 +482,8 @@ std::vector<SharedPtr<Block>> Block::clearStaleBlocksAfterPageUnlink(
 
     // If this is a full-attention block or a sink block: evict subtree.
     // Mirrors Python: pages = remove_subtree(self)
-    if (alc && (!alc->windowSize.has_value() || block.ordinal() < BlockOrdinal{alc->numSinkBlocks}))
+    if (alc && alc->requiresPrefixCoverage()
+        && (!alc->windowSize.has_value() || block.ordinal() < BlockOrdinal{alc->numSinkBlocks}))
     {
         pruneStart = block.prev;
         detachedBlocks.push_back(removeSubtree(block));
@@ -871,6 +888,10 @@ std::vector<BlockRadixTree::MatchResult> BlockRadixTree::pruneMatch(
         bool shortened = false;
         for (auto [lcId, attn] : attnLcs)
         {
+            if (!attn->requiresPrefixCoverage())
+            {
+                continue;
+            }
             auto const staleRange = attn->getStaleRange(numTok, mTokensPerBlock);
             int const staleBeg = staleRange.beg.value();
             int const staleEnd = staleRange.end.value();

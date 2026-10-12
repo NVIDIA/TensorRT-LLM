@@ -29,13 +29,13 @@ from typing import (
     cast,
 )
 
-import flashinfer.sampling
 import numpy as np
 import pytest
 import torch
 from scipy.stats import power_divergence
 from utils.util import UutProvider, assert_no_cuda_sync, force_ampere, run_test_with_warmup
 
+import tensorrt_llm._torch.pyexecutor.sampler.sampler_strategy as sampler_strategy_module
 from tensorrt_llm._torch.pyexecutor.llm_request import (
     LlmRequest,
     LlmRequestState,
@@ -51,7 +51,15 @@ from tensorrt_llm._torch.pyexecutor.sampler import (
     _SeedManager,
 )
 from tensorrt_llm._torch.pyexecutor.sampler.finish_reasons import FinishReasonsHandler
-from tensorrt_llm._torch.pyexecutor.sampler.ops.vanilla import min_p_renorm_probs
+from tensorrt_llm._torch.pyexecutor.sampler.ops.custom import (
+    UNSEEDED_OFFSET_BASE,
+    fused_compute_probs_from_logits,
+    fused_sample_from_logits_with_probs,
+)
+from tensorrt_llm._torch.pyexecutor.sampler.ops.vanilla import (
+    min_p_renorm_probs,
+    top_k_top_p_sampling_batch,
+)
 from tensorrt_llm._torch.pyexecutor.sampler.sampler_common import (
     SampleType,
     UtilsSamplingParams,
@@ -157,7 +165,7 @@ class TestStrategySelection:
         def get_beam_width_by_iter(
             self, for_next_iteration: bool = False
         ) -> int:  # Torch sampler accesses this, but it does not affect this test
-            return cast(int, self.sampling_config.beam_width)
+            return self.sampling_config.beam_width
 
     def _check_params(self, params: SamplingParams):
         # cf. description of 'top_p' in doc-string of SamplingParams and
@@ -563,7 +571,7 @@ def test_select_generated_logits(
             def get_beam_width_by_iter(
                 self, for_next_iteration: bool = False
             ) -> int:  # Torch sampler accesses this, but it does not affect this test
-                return cast(int, self.sampling_config.beam_width)
+                return self.sampling_config.beam_width
 
         class GenRequestMock:
             def __init__(self, draft_len: int):
@@ -575,7 +583,7 @@ def test_select_generated_logits(
             def get_beam_width_by_iter(
                 self, for_next_iteration: bool = False
             ) -> int:  # Torch sampler accesses this, but it does not affect this test
-                return cast(int, self.sampling_config.beam_width)
+                return self.sampling_config.beam_width
 
         def _build_scheduled_requests() -> ScheduledRequests:
             scheduled_requests = ScheduledRequests()
@@ -981,6 +989,51 @@ class TestFinishReasons:
         assert requests[1].get_tokens(0)[-1] == 7
         assert requests[2].get_tokens(0) == [2, 0]
 
+    # 13 and 17 are the two stop words; 99 is neither, and pins that the check
+    # stays selective rather than finishing on any token.
+    @pytest.mark.parametrize("new_token, expect_finished", [(13, True), (17, True), (99, False)])
+    def test_single_step_greedy_honors_every_single_token_stop_word(
+        self, new_token: int, expect_finished: bool
+    ) -> None:
+        """Each single-token stop word must stop generation, not just the first.
+
+        The harmony / GPT-OSS serving path passes two of them (``<|return|>``
+        and ``<|call|>``); matching only ``py_stop_words_list[0]`` let a tool
+        call run on past ``<|call|>`` into fabricated content (nvbugs/6751484).
+        """
+        sampler = object.__new__(TorchSampler)
+        sampler.max_seq_len = 20
+        sampler._track_pending_steps = False
+        request = LlmRequest(
+            request_id=0,
+            seq_slot=0,
+            input_tokens=[2, 0],
+            # Ample budget, so LENGTH cannot fire and mask a missed stop word.
+            max_new_tokens=10,
+            end_id=2,
+            stop_words_list=[[13], [17]],
+            sampling_config=SamplingConfig(),
+            is_streaming=False,
+        )
+        state = SampleStateTorch(
+            requests=[request],
+            device=None,
+            host=SampleStateTensorsHostTorch(
+                new_tokens=torch.tensor([new_token], dtype=torch.int32),
+                finish_reasons=None,
+                first_finish_reasons=None,
+                single_step_greedy=True,
+            ),
+        )
+
+        sampler.update_requests(state)
+
+        assert request.is_finished == expect_finished
+        if expect_finished:
+            # Pins STOP_WORDS as the reason: the budget above rules out LENGTH,
+            # and none of the parametrized tokens is ``end_id``, ruling out END_ID.
+            assert not request.is_finished_due_to_length
+
     class RequestCase:
         MAX_NEW_TOKENS = 10
         MAX_NUM_SEQUENCES = 128
@@ -1019,7 +1072,7 @@ class TestFinishReasons:
 
         def __repr__(self):
             return f"RequestCase({self.prompt=}, {self.new_tokens=}, {self.finish_reasons=}, \
-            {self.request.max_new_tokens=}, {self.request.end_id=}, {self.request.py_stop_words_list=})"
+            {self.request.max_new_tokens=}, {self.request.py_end_id=}, {self.request.py_stop_words_list=})"
 
         @classmethod
         def build(
@@ -1612,6 +1665,54 @@ def test_min_p_sample_top_k_disabled_sentinel():
     assert kept.gather(1, tokens.unsqueeze(-1)).all()
 
 
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_top_p_no_crossing_row_keeps_full_vocab(device: str):
+    """A row whose cumulative probability never reaches top_p keeps its full
+    distribution instead of scattering an out-of-range index.
+
+    fp32 accumulation can leave every cumulative probability of a row below a
+    top_p very close to 1, so the first-True search finds no entry and yields
+    vocab_size. Such a row must retain every token, renormalized.
+    """
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    torch.manual_seed(0)
+    candidates = torch.randn(8, 32000, device=device)
+    sorted_candidates, _ = torch.sort(candidates, descending=True, dim=-1)
+    finals = torch.cumsum(torch.softmax(sorted_candidates, dim=-1), dim=-1)[:, -1]
+    # Put top_p just above the lowest reachable cumulative sum so the no-crossing
+    # branch is hit by construction: fp32 accumulation order differs between CPU
+    # and CUDA and between GPU architectures, so a fixed threshold would only
+    # reach this branch by coincidence.
+    no_crossing_row = int(finals.argmin())
+    top_p = float(
+        torch.nextafter(
+            finals[no_crossing_row],
+            torch.ones((), device=device),
+        )
+    )
+    assert top_p < 1.0
+    no_crossing = candidates[no_crossing_row]
+    peaked = torch.zeros(32000, device=device)
+    peaked[0] = 30.0
+    logits = torch.stack([peaked, no_crossing])
+
+    # Must not raise: without the clamp the search yields vocab_size, giving an
+    # out-of-bounds scatter, which is a device-side assert on CUDA.
+    tokens, probs = top_k_top_p_sampling_batch(logits, temperature=1.0, top_p=top_p)
+
+    assert tokens.shape == (2,)
+    # Crossing row: only the top token survives nucleus filtering.
+    assert int((probs[0] > 0).sum()) == 1
+    assert int(probs[0].argmax()) == 0
+    # No-crossing row: nothing removed, renormalized. Strict positivity proves no
+    # tail was zeroed, since softmax of finite logits is strictly positive while
+    # the failure mode writes exact 0.0.
+    assert bool((probs[1] > 0).all())
+    torch.testing.assert_close(probs[1].sum(), torch.ones((), device=device))
+    torch.testing.assert_close(probs[1], torch.softmax(no_crossing, -1))
+
+
 class TestBatchedSampling:
     """Validate batched/mixed sampling.
 
@@ -2020,7 +2121,7 @@ class TestBatchedSampling:
                 params_label,
                 False,
                 vocab_size,
-                id=f"FlashInfer-{params_label}",
+                id=f"Fused-{params_label}",
             )
             # https://stackoverflow.com/a/75421799, does not work with nested loops
             for ((sampling_params_list, params_label), vocab_size) in product(
@@ -2293,7 +2394,7 @@ class TestBatchedSampling:
     ):
         """Setup interception of sample_async and request grouping.
 
-        Validates that at every invocation of sample_async, the FlashInfer
+        Validates that at every invocation of sample_async, the grouped
         sampling backend is called at most once for any given sampling strategy.
 
         Used by test_samples.
@@ -2410,253 +2511,97 @@ class TestBatchedSampling:
         """
         mock_sampling_log: list[TestBatchedSampling._MockSamplingLogEntry] = []
 
-        def _mock_flashinfer_top_k_top_p(
+        def _log_fused_rows(
             logits: torch.Tensor,
-            *,
-            top_k: torch.Tensor,
-            top_p: torch.Tensor,
-            filter_apply_order: str,
-            deterministic: bool,
-            check_nan: bool,
-            generator: torch.Generator,
-            seed: Optional[Union[int, torch.Tensor]] = None,
-            offset: Optional[Union[int, torch.Tensor]] = None,
+            temperatures: torch.Tensor,
+            top_ks: torch.Tensor,
+            top_ps: torch.Tensor,
+            min_ps: torch.Tensor,
+            seed: Optional[torch.Tensor],
+            offset: Optional[torch.Tensor],
         ) -> torch.Tensor:
-            assert filter_apply_order == "top_k_first"
-            assert deterministic
-            assert not check_nan, "check_nan syncs"
-            assert generator is sampler.get_generator(logits.device)
+            # TorchSampler must hand every row its own RNG state, independent of
+            # the row's position in the batch.
+            assert seed is not None and offset is not None
+            assert seed.numel() == offset.numel() == logits.size(0)
             nonlocal mock_sampling_log
+            # Log the kernel's own tempered, unfiltered distribution, so that it
+            # compares exactly against the filtered probs the kernel returns.
+            probs = fused_compute_probs_from_logits(
+                logits,
+                temperatures,
+                torch.zeros_like(top_ks),
+                torch.ones_like(top_ps),
+                torch.zeros_like(min_ps),
+            )
             new_entries = [
                 TestBatchedSampling._MockSamplingLogEntry(
-                    probs=torch.softmax(logits[row_idx], dim=-1),
+                    probs=probs[row_idx],
                     sampling_params=TestBatchedSampling._TorchUtilsSamplingParams(
-                        top_k=top_k[row_idx],
-                        top_p=top_p[row_idx],
+                        top_k=top_ks[row_idx],
+                        top_p=top_ps[row_idx],
+                        min_p=min_ps[row_idx],
                         temperature=None,
                     ),
                 )
                 for row_idx in range(logits.size(0))
             ]
             mock_tokens = torch.arange(
-                len(mock_sampling_log), len(mock_sampling_log) + len(new_entries)
+                len(mock_sampling_log),
+                len(mock_sampling_log) + len(new_entries),
+                dtype=torch.int32,
+                device=logits.device,
             )
             mock_sampling_log += new_entries
             return mock_tokens
 
-        patch_ctx.setattr(
-            flashinfer.sampling,
-            "top_k_top_p_sampling_from_logits",
-            _mock_flashinfer_top_k_top_p,
-        )
-
-        def _mock_flashinfer_top_k_top_p_from_probs(
-            probs: torch.Tensor,
-            *,
-            top_k: torch.Tensor,
-            top_p: torch.Tensor,
-            filter_apply_order: str,
-            deterministic: bool,
-            check_nan: bool,
-            generator: torch.Generator,
-            seed: Optional[Union[int, torch.Tensor]] = None,
-            offset: Optional[Union[int, torch.Tensor]] = None,
-        ) -> torch.Tensor:
-            # The min_p strategy terminates its renorm chain here, so the probs
-            # recorded below already have min_p applied; min_p itself never
-            # reaches a flashinfer kernel and thus cannot be captured as a param.
-            # Patching this is not optional: unpatched, the real flashinfer
-            # implementation delegates to the *patched* top_p_sampling_from_probs
-            # with kwargs its mock does not accept.
-            assert filter_apply_order == "top_k_first"
-            assert deterministic
-            assert not check_nan, "check_nan syncs"
-            assert generator is sampler.get_generator(probs.device)
-            nonlocal mock_sampling_log
-            new_entries = [
-                TestBatchedSampling._MockSamplingLogEntry(
-                    probs=probs[row_idx],
-                    sampling_params=TestBatchedSampling._TorchUtilsSamplingParams(
-                        top_k=top_k[row_idx],
-                        top_p=top_p[row_idx],
-                        temperature=None,
-                    ),
-                )
-                for row_idx in range(probs.size(0))
-            ]
-            mock_tokens = torch.arange(
-                len(mock_sampling_log), len(mock_sampling_log) + len(new_entries)
-            )
-            mock_sampling_log += new_entries
-            return mock_tokens
-
-        patch_ctx.setattr(
-            flashinfer.sampling,
-            "top_k_top_p_sampling_from_probs",
-            _mock_flashinfer_top_k_top_p_from_probs,
-        )
-
-        def _mock_flashinfer_from_logits(
+        def _mock_fused_sample_from_logits(
             logits: torch.Tensor,
+            temperatures: torch.Tensor,
+            top_ks: torch.Tensor,
+            top_ps: torch.Tensor,
+            min_ps: torch.Tensor,
             *,
-            deterministic: bool,
-            check_nan: bool,
-            generator: torch.Generator,
+            seed: Optional[torch.Tensor] = None,
+            offset: Optional[torch.Tensor] = None,
         ) -> torch.Tensor:
-            assert deterministic
-            assert not check_nan, "check_nan syncs"
-            assert generator is sampler.get_generator(logits.device)
-            nonlocal mock_sampling_log
-            new_entries = [
-                TestBatchedSampling._MockSamplingLogEntry(
-                    probs=torch.softmax(logits[row_idx], dim=-1),
-                    sampling_params=TestBatchedSampling._TorchUtilsSamplingParams(
-                        top_k=None,
-                        top_p=None,
-                        temperature=None,
-                    ),
-                )
-                for row_idx in range(logits.size(0))
-            ]
-            mock_tokens = torch.arange(
-                len(mock_sampling_log), len(mock_sampling_log) + len(new_entries)
-            )
-            mock_sampling_log += new_entries
-            return mock_tokens
+            return _log_fused_rows(logits, temperatures, top_ks, top_ps, min_ps, seed, offset)
 
-        patch_ctx.setattr(flashinfer.sampling, "sampling_from_logits", _mock_flashinfer_from_logits)
+        patch_ctx.setattr(
+            sampler_strategy_module, "fused_sample_from_logits", _mock_fused_sample_from_logits
+        )
 
-        def _mock_flashinfer_top_k(
-            probs: torch.Tensor,
+        def _mock_fused_sample_from_logits_with_probs(
+            logits: torch.Tensor,
+            temperatures: torch.Tensor,
+            top_ks: torch.Tensor,
+            top_ps: torch.Tensor,
+            min_ps: torch.Tensor,
             *,
-            top_k: torch.Tensor,
-            deterministic: bool,
-            check_nan: bool,
-            generator: torch.Generator,
-            seed: Optional[Union[int, torch.Tensor]] = None,
-            offset: Optional[Union[int, torch.Tensor]] = None,
-        ) -> torch.Tensor:
-            assert deterministic
-            assert not check_nan, "check_nan syncs"
-            assert generator is sampler.get_generator(probs.device)
-            nonlocal mock_sampling_log
-            new_entries = [
-                TestBatchedSampling._MockSamplingLogEntry(
-                    probs=probs[row_idx],
-                    sampling_params=TestBatchedSampling._TorchUtilsSamplingParams(
-                        top_k=top_k[row_idx],
-                        top_p=None,
-                        temperature=None,
-                    ),
-                )
-                for row_idx in range(probs.size(0))
-            ]
-            mock_tokens = torch.arange(
-                len(mock_sampling_log), len(mock_sampling_log) + len(new_entries)
+            seed: Optional[torch.Tensor] = None,
+            offset: Optional[torch.Tensor] = None,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            # The probs feed py_target_probs and logprobs, so they come from the
+            # real kernel; only the tokens are replaced by log indices.
+            _, probs = fused_sample_from_logits_with_probs(
+                logits,
+                temperatures,
+                top_ks,
+                top_ps,
+                min_ps,
+                seed=seed,
+                offset=offset,
             )
-            mock_sampling_log += new_entries
-            return mock_tokens
-
-        patch_ctx.setattr(flashinfer.sampling, "top_k_sampling_from_probs", _mock_flashinfer_top_k)
-
-        def _mock_flashinfer_top_p(
-            probs: torch.Tensor,
-            *,
-            top_p: torch.Tensor,
-            deterministic: bool,
-            check_nan: bool,
-            generator: torch.Generator,
-            seed: Optional[Union[int, torch.Tensor]] = None,
-            offset: Optional[Union[int, torch.Tensor]] = None,
-        ) -> torch.Tensor:
-            assert deterministic
-            assert not check_nan, "check_nan syncs"
-            assert generator is sampler.get_generator(probs.device)
-            nonlocal mock_sampling_log
-            new_entries = [
-                TestBatchedSampling._MockSamplingLogEntry(
-                    probs=probs[row_idx],
-                    sampling_params=TestBatchedSampling._TorchUtilsSamplingParams(
-                        top_k=None,
-                        top_p=top_p[row_idx],
-                        temperature=None,
-                    ),
-                )
-                for row_idx in range(probs.size(0))
-            ]
-            mock_tokens = torch.arange(
-                len(mock_sampling_log), len(mock_sampling_log) + len(new_entries)
+            mock_tokens = _log_fused_rows(
+                logits, temperatures, top_ks, top_ps, min_ps, seed, offset
             )
-            mock_sampling_log += new_entries
-            return mock_tokens
+            return mock_tokens, probs
 
-        patch_ctx.setattr(flashinfer.sampling, "top_p_sampling_from_probs", _mock_flashinfer_top_p)
-
-        def _mock_flashinfer_min_p(
-            probs: torch.Tensor,
-            min_p: torch.Tensor,
-            *,
-            deterministic: bool,
-            check_nan: bool,
-            generator: torch.Generator,
-            seed: Optional[Union[int, torch.Tensor]] = None,
-            offset: Optional[Union[int, torch.Tensor]] = None,
-        ) -> torch.Tensor:
-            assert deterministic
-            assert not check_nan, "check_nan syncs"
-            assert generator is sampler.get_generator(probs.device)
-            nonlocal mock_sampling_log
-            new_entries = [
-                TestBatchedSampling._MockSamplingLogEntry(
-                    probs=probs[row_idx],
-                    sampling_params=TestBatchedSampling._TorchUtilsSamplingParams(
-                        top_k=None,
-                        top_p=None,
-                        temperature=None,
-                        min_p=min_p[row_idx],
-                    ),
-                )
-                for row_idx in range(probs.size(0))
-            ]
-            mock_tokens = torch.arange(
-                len(mock_sampling_log), len(mock_sampling_log) + len(new_entries)
-            )
-            mock_sampling_log += new_entries
-            return mock_tokens
-
-        patch_ctx.setattr(flashinfer.sampling, "min_p_sampling_from_probs", _mock_flashinfer_min_p)
-
-        def _mock_flashinfer_from_probs(
-            probs: torch.Tensor,
-            *,
-            deterministic: bool,
-            check_nan: bool,
-            generator: torch.Generator,
-            seed: Optional[Union[int, torch.Tensor]] = None,
-            offset: Optional[Union[int, torch.Tensor]] = None,
-        ) -> torch.Tensor:
-            assert deterministic
-            assert not check_nan, "check_nan syncs"
-            assert generator is sampler.get_generator(probs.device)
-            nonlocal mock_sampling_log
-            new_entries = [
-                TestBatchedSampling._MockSamplingLogEntry(
-                    probs=probs[row_idx],
-                    sampling_params=TestBatchedSampling._TorchUtilsSamplingParams(
-                        top_k=None,
-                        top_p=None,
-                        temperature=None,
-                    ),
-                )
-                for row_idx in range(probs.size(0))
-            ]
-            mock_tokens = torch.arange(
-                len(mock_sampling_log), len(mock_sampling_log) + len(new_entries)
-            )
-            mock_sampling_log += new_entries
-            return mock_tokens
-
-        patch_ctx.setattr(flashinfer.sampling, "sampling_from_probs", _mock_flashinfer_from_probs)
+        patch_ctx.setattr(
+            sampler_strategy_module,
+            "fused_sample_from_logits_with_probs",
+            _mock_fused_sample_from_logits_with_probs,
+        )
 
         def _mock_torch_multinomial(
             probs: torch.Tensor,
@@ -2699,20 +2644,20 @@ class TestBatchedSampling:
 
         Used by test_samples.
         """
-        # Tests rely on UUT handling temperature outside the sampling routines
+        # The mocks log the tempered distribution, so no temperature remains here
         assert log_entry.sampling_params.temperature is None
 
         req_has_top_p = (
             log_entry.sampling_params.top_p is not None
-            and log_entry.sampling_params.top_p.item() != 1
+            and log_entry.sampling_params.top_p.item() < 1
         )
         req_has_top_k = (
             log_entry.sampling_params.top_k is not None
-            and log_entry.sampling_params.top_k.item() != vocab_size
+            and 0 < log_entry.sampling_params.top_k.item() < vocab_size
         )
         req_has_min_p = (
             log_entry.sampling_params.min_p is not None
-            and log_entry.sampling_params.min_p.item() != 0
+            and log_entry.sampling_params.min_p.item() > 0
         )
         if req_has_top_k:
             assert req_params.top_k is not None
@@ -2843,7 +2788,7 @@ class TestBatchedSampling:
                 ),  # bypass_sampling
                 vocab_size,
                 id=(
-                    f"FlashInfer"
+                    f"Fused"
                     f"-draft_len={0 if allow_zero_draft_len else 1}..{max_draft_len}"
                     f"-{params_label}"
                 ),
@@ -3298,14 +3243,16 @@ class TestRequestSeed:
 
     def test_seed_is_independent_of_batch_composition(self, monkeypatch: pytest.MonkeyPatch):
         """The core guarantee: batching must not perturb a seeded stream."""
-        logits = self._logits(3)
+        logits = self._logits(1).expand(3, -1).contiguous()
         seeded = self._sampling_params(1234)
 
         alone = self._run([seeded], logits=logits[:1], monkeypatch=monkeypatch)
+        alone_other = self._run(
+            [self._sampling_params(999)], logits=logits[2:], monkeypatch=monkeypatch
+        )
 
-        # Same seeded request, now in slot 0 of a batch whose other members
-        # draw from the same strategy group and would advance a shared
-        # generator's state.
+        # The same seeded requests in a batch whose other members draw from the
+        # same strategy group, one of them away from row 0.
         batched = self._run(
             [seeded, self._sampling_params(None), self._sampling_params(999)],
             logits=logits,
@@ -3313,21 +3260,49 @@ class TestRequestSeed:
         )
 
         torch.testing.assert_close(alone[:, 0], batched[:, 0])
+        torch.testing.assert_close(alone_other[:, 0], batched[:, 2])
+        # Negative control: distinct seeds on identical logits draw distinct streams.
+        assert not torch.equal(batched[:, 0], batched[:, 2])
 
-        # Negative control, disabled until FlashInfer honors per-row seeds.
-        #
-        # The assertion above passes even if the seed path is entirely inert,
-        # because slot 0 is the one row whose seed is read either way. This
-        # check would catch that -- but flashinfer-python 0.6.15 reads only
-        # seed[0]/offset[0] for the whole call and distinguishes rows by
-        # blockIdx.x, so rows 1..N sample from row 0's seed and this assertion
-        # fails for reasons outside this code. Re-enable once the pinned
-        # FlashInfer supports per-row seeds -- tracked upstream in
-        # https://github.com/flashinfer-ai/flashinfer/pull/2345 (note it lands
-        # the feature as generator=(seed_arr, offset_arr), so the sampler call
-        # sites change with it).
-        #
-        # assert not torch.equal(batched[:, 0], batched[:, 2])
+    def test_seeded_row_position_does_not_matter(self, monkeypatch: pytest.MonkeyPatch):
+        logits = self._logits(1).expand(3, -1).contiguous()
+        seeded = self._sampling_params(1234)
+
+        first = self._run(
+            [seeded, self._sampling_params(None), self._sampling_params(999)],
+            logits=logits,
+            monkeypatch=monkeypatch,
+        )
+        last = self._run(
+            [self._sampling_params(None), self._sampling_params(999), seeded],
+            logits=logits,
+            monkeypatch=monkeypatch,
+        )
+
+        torch.testing.assert_close(first[:, 0], last[:, 2])
+
+    def test_unseeded_requests_do_not_replay_on_a_reused_slot(self):
+        manager = _SeedManager(max_num_sequences=1, global_seed=42)
+        device = torch.device("cpu")
+
+        def unseeded(request_id: int) -> LlmRequest:
+            return cast(
+                LlmRequest,
+                SimpleNamespace(
+                    py_seq_slot=0,
+                    py_request_id=request_id,
+                    py_is_draft=False,
+                    sampling_config=SamplingConfig(SamplingParams()._get_sampling_config()),
+                ),
+            )
+
+        manager.observe([unseeded(1)])
+        first = manager.take_row_seeds([0], device=device)
+        manager.observe([unseeded(2)])
+        second = manager.take_row_seeds([0], device=device)
+
+        assert first.seed.tolist() == second.seed.tolist() == [42]
+        assert first.offset.item() != second.offset.item()
 
     def test_draft_batch_does_not_disturb_target_seed_state(self):
         """Draft slots come from a different SeqSlotManager over the same range.
@@ -3337,6 +3312,7 @@ class TestRequestSeed:
         and make it replay part of its stream.
         """
         manager = _SeedManager(max_num_sequences=4, global_seed=42)
+        device = torch.device("cpu")
 
         target = cast(
             LlmRequest,
@@ -3344,12 +3320,11 @@ class TestRequestSeed:
                 py_seq_slot=0,
                 py_request_id=100,
                 py_is_draft=False,
-                sampling_config=SamplingConfig(SamplingParams()._get_sampling_config()),
+                sampling_config=SamplingConfig(SamplingParams(seed=1234)._get_sampling_config()),
             ),
         )
         manager.observe([target])
-        manager.advance([0, 0, 0])
-        assert manager.any_seeded is False  # target carries no user seed
+        assert manager.take_row_seeds([0], device=device).seed.tolist() == [1234]
         offset_before = manager._offsets[0].item()
 
         # A draft request lands on slot 0, owned by `target` above.
@@ -3363,7 +3338,8 @@ class TestRequestSeed:
             ),
         )
         manager.observe([draft])
-        assert manager.any_seeded is False  # draft never uses the per-row path
+        # Draft rows draw from the global seed, not the target's stream.
+        assert manager.take_row_seeds([0], device=device).seed.tolist() == [42]
         assert manager._offsets[0].item() == offset_before
         assert manager._slot_owner[0] == 100  # still the target request
 
@@ -3371,52 +3347,96 @@ class TestRequestSeed:
         manager.observe([target])
         assert manager._offsets[0].item() == offset_before
 
+    def test_draft_batch_advances_unseeded_offsets(self):
+        manager = _SeedManager(max_num_sequences=4, global_seed=42)
+        device = torch.device("cpu")
+
+        def request(request_id: int, is_draft: bool) -> LlmRequest:
+            return cast(
+                LlmRequest,
+                SimpleNamespace(
+                    py_seq_slot=0,
+                    py_request_id=request_id,
+                    py_is_draft=is_draft,
+                    sampling_config=SamplingConfig(SamplingParams()._get_sampling_config()),
+                ),
+            )
+
+        target = request(100, is_draft=False)
+        manager.observe([target])
+        before = manager.take_row_seeds([0], device=device)
+        manager.observe([request(200, is_draft=True)])
+        during = manager.take_row_seeds([0], device=device)
+        manager.observe([target])
+        after = manager.take_row_seeds([0], device=device)
+
+        assert before.seed.tolist() == during.seed.tolist() == after.seed.tolist() == [42]
+        assert before.offset.item() < during.offset.item() < after.offset.item()
+
     def test_multi_row_offsets_do_not_overlap(self):
         """Speculative decoding draws several rows per request per step.
 
-        Those rows must be assigned distinct stretches of the request's stream,
+        Those rows must be assigned distinct offsets of the request's stream,
         and the next step must resume past all of them -- otherwise a request
         would replay the same random numbers across steps.
-
-        This asserts the offsets ``_SeedManager`` produces, not what the kernel
-        does with them: the pinned flashinfer reads only ``offset[0]``, so the
-        per-row values are not yet honored downstream.
         """
         manager = _SeedManager(max_num_sequences=4, global_seed=42)
         manager._seeds[0] = 1234
         manager._seeds[1] = 999
-        manager._any_seeded = True
+        manager._slot_seeded[0] = manager._slot_seeded[1] = True
 
         rows = [0, 0, 0, 1]  # slot 0 draws 3 tokens this step, slot 1 draws 1
         device = torch.device("cpu")
 
-        first = manager.make_row_seeds(rows, device=device)
+        first = manager.take_row_seeds(rows, device=device)
         assert first.seed.tolist() == [1234, 1234, 1234, 999]
+        second = manager.take_row_seeds(rows, device=device)
 
-        manager.advance(rows)
-        second = manager.make_row_seeds(rows, device=device)
-
-        # Each row reserves a stretch of the stream; the invariant is that no
-        # two stretches overlap, within a step or across steps. Asserted as a
-        # property rather than against OFFSET_STRIDE, so that a stride too small
-        # for the kernel's per-row consumption fails here instead of silently
-        # rescaling the expected values.
-        #
-        # flashinfer 0.6.15 reserves 32 offset units per row for the top-k/top-p
-        # rejection samplers, so a stride below that would replay random values.
-        # Only within a slot: distinct slots carry distinct seeds, so they are
-        # independent streams and may legitimately share offsets.
-        assert _SeedManager.OFFSET_STRIDE >= 32
-        per_slot: dict[int, set[int]] = {}
+        # Distinct slots carry distinct seeds, so they are independent streams
+        # and may share offsets; within a slot no offset may repeat.
+        per_slot: dict[int, list[int]] = {}
         for offsets in (first.offset.tolist(), second.offset.tolist()):
             for slot, off in zip(rows, offsets):
-                stretch = range(off, off + _SeedManager.OFFSET_STRIDE)
-                used = per_slot.setdefault(slot, set())
-                assert used.isdisjoint(stretch), (
-                    f"slot {slot} reuses offsets {off}..{off + _SeedManager.OFFSET_STRIDE - 1}; "
-                    "the stream is replayed"
-                )
-                used.update(stretch)
+                per_slot.setdefault(slot, []).append(off)
+        assert per_slot == {0: [0, 1, 2, 3, 4, 5], 1: [0, 1]}
+
+    def test_unseeded_rows_take_distinct_offsets(self):
+        manager = _SeedManager(max_num_sequences=4, global_seed=42)
+        device = torch.device("cpu")
+
+        first = manager.take_row_seeds([0, 1, 2], device=device)
+        second = manager.take_row_seeds([2, 3], device=device)
+
+        assert first.seed.tolist() + second.seed.tolist() == [42] * 5
+        assert first.offset.tolist() + second.offset.tolist() == [
+            UNSEEDED_OFFSET_BASE + i for i in range(5)
+        ]
+
+    def test_unseeded_offsets_continue_across_mixed_batches(self):
+        manager = _SeedManager(max_num_sequences=4, global_seed=42)
+        manager._seeds[0] = 1234
+        manager._slot_seeded[0] = True
+        device = torch.device("cpu")
+
+        before = manager.take_row_seeds([1], device=device)
+        mixed = manager.take_row_seeds([0, 1], device=device)
+        after = manager.take_row_seeds([1], device=device)
+
+        assert mixed.seed.tolist() == [1234, 42]
+        unseeded = before.offset.tolist() + mixed.offset.tolist()[1:] + after.offset.tolist()
+        assert unseeded == [UNSEEDED_OFFSET_BASE + i for i in range(3)]
+
+    def test_user_seed_equal_to_global_seed_does_not_share_unseeded_streams(self):
+        manager = _SeedManager(max_num_sequences=4, global_seed=42)
+        manager._seeds[0] = 42
+        manager._slot_seeded[0] = True
+        device = torch.device("cpu")
+
+        for _ in range(4):
+            seeds = manager.take_row_seeds([0, 1], device=device)
+            assert seeds.seed.tolist() == [42, 42]
+            seeded_offset, unseeded_offset = seeds.offset.tolist()
+            assert seeded_offset < UNSEEDED_OFFSET_BASE <= unseeded_offset
 
 
 class TestTopPDecay:
@@ -3525,9 +3545,12 @@ class TestTopPDecay:
                 FlashInferGroupedStrategySampler.strategy_grouping_key(strategy),
                 [cast(Strategy, strategy)] * num_rows,
                 logits,
-                generator=torch.Generator(device="cuda").manual_seed(0),
                 return_probs=return_probs,
                 group_metadata=metadata,
+                seeds=RequestSeeds(
+                    seed=torch.zeros(num_rows, dtype=torch.int64, device="cuda"),
+                    offset=torch.arange(num_rows, dtype=torch.int64, device="cuda") * 32,
+                ),
             )
             return set(tokens.flatten().tolist())
 

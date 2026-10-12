@@ -301,7 +301,9 @@ class CuteDslMlaFmha(PhasedFmha):
         seq_len_q = q.shape[0] // meta.num_generations
         batch_size = meta.num_generations
         if meta.helix_position_offsets is not None:
-            if seq_len_q != 1:
+            if seq_len_q != 1 and not meta._helix_spec_tokens_valid:
+                # Multi-token decode under helix needs the per-token bound /
+                # write-slot buffers of the speculative verify-group path.
                 return False, "CuTe DSL MLA FMHA only supports single-token decode with Helix."
             softmax_stats = fwd.softmax_stats_tensor
             if softmax_stats is None:
@@ -320,15 +322,30 @@ class CuteDslMlaFmha(PhasedFmha):
 
         from tensorrt_llm._torch.autotuner import AutoTuner
 
-        # Perf gate (NOT a correctness limit).
-        favorable, reason = self._is_perf_favorable(
-            attn.num_heads,
-            None if AutoTuner.get().is_tuning_mode else batch_size,
-            seq_len_q,
-            self._get_kernel_dtype(attn, q),
+        # A multi-token verify group at H=96 has nowhere else to go: TRTLLM-Gen
+        # rejects 64 < num_heads_q < 128 outright, so falling through the perf
+        # gate does not reach a faster kernel, it reaches an executor-init
+        # failure. That makes this a correctness carve-out rather than a perf
+        # tradeoff, so it is decided here instead of being folded into
+        # _PERF_MIN_BATCH_FP8, which stays a pure measured-win table.
+        # Deliberately narrow: single-token H=96 is already a measured table
+        # entry and still goes through the gate, and non-helix multi-token
+        # H=96 keeps falling back exactly as it does today. Helix with
+        # seq_len_q > 1 implies _helix_spec_tokens_valid -- the helix block
+        # above returns False otherwise.
+        helix_h96_verify_group = (
+            attn.num_heads == 96 and seq_len_q > 1 and meta.helix_position_offsets is not None
         )
-        if not favorable:
-            return False, reason
+        if not helix_h96_verify_group:
+            # Perf gate (NOT a correctness limit).
+            favorable, reason = self._is_perf_favorable(
+                attn.num_heads,
+                None if AutoTuner.get().is_tuning_mode else batch_size,
+                seq_len_q,
+                self._get_kernel_dtype(attn, q),
+            )
+            if not favorable:
+                return False, reason
         if meta.kv_cache_manager is None:
             return False, "KV cache manager is required."
         if fwd.output is None:
@@ -505,26 +522,33 @@ class CuteDslMlaFmha(PhasedFmha):
             # Max batch size for the AutoTuner to profile.
             int(meta.max_num_requests),
             params.fwd.softmax_stats_tensor,
+            # Per-token rank-local bounds, filled by
+            # recompute_helix_spec_buffers. None everywhere else.
+            (
+                meta.helix_kv_bounds[:num_tokens]
+                if (meta.helix_position_offsets is not None and meta._helix_spec_tokens_valid)
+                else None
+            ),
         )
 
     def run_mla_generation(
         self,
         params: FmhaParams,
     ) -> None:
-        if params.qkv_input is None:
-            raise RuntimeError("CuTe DSL MLA generation requires qkv_input.")
-        if params.context_buf is None:
-            raise RuntimeError("CuTe DSL MLA generation requires context_buf.")
+        if params.query_input is None:
+            raise RuntimeError("CuTe DSL MLA generation requires query_input.")
+        if params.output is None:
+            raise RuntimeError("CuTe DSL MLA generation requires output.")
         if params.sequence_lengths is None:
             raise RuntimeError("CuTe DSL MLA generation requires sequence lengths.")
 
-        kernel_dtype = self._get_kernel_dtype(params.attn, params.qkv_input)
+        kernel_dtype = self._get_kernel_dtype(params.attn, params.query_input)
         if kernel_dtype is None:
             raise RuntimeError("CuTe DSL MLA generation was selected for an unsupported dtype.")
 
         self._run_mla_decode(
-            params.qkv_input,
-            params.context_buf,
+            params.query_input,
+            params.output,
             params,
             kernel_dtype,
         )

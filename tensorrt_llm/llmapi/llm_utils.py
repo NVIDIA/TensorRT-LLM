@@ -3,11 +3,8 @@
 
 import json
 import os
-import tempfile
-import weakref
-from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Union
 
 import transformers
 
@@ -25,11 +22,12 @@ from ..quantization.modelopt_config import (is_modelopt_quant_config,
                                             warn_if_inline_diverges)
 # yapf: disable
 from .llm_args import (CalibConfig, CudaGraphConfig, DecodeCudaGraphConfig,
-                       DraftTargetDecodingConfig, Eagle3DecodingConfig,
-                       EagleDecodingConfig, EncodeCudaGraphConfig,
-                       KvCacheConfig, KVEventsConfig, LlmArgs,
-                       MTPDecodingConfig, NGramDecodingConfig, SchedulerConfig,
-                       TorchLlmArgs, UserProvidedDecodingConfig, _ModelWrapper,
+                       DFlashDecodingConfig, DraftTargetDecodingConfig,
+                       Eagle3DecodingConfig, EagleDecodingConfig,
+                       EncodeCudaGraphConfig, KvCacheConfig, KVEventsConfig,
+                       LlmArgs, MTPDecodingConfig, NGramDecodingConfig,
+                       SchedulerConfig, TorchLlmArgs,
+                       UserProvidedDecodingConfig, _ModelWrapper,
                        _ParallelConfig, update_llm_args_with_extra_dict,
                        update_llm_args_with_extra_options)
 # yapf: enable
@@ -45,13 +43,8 @@ class ModelLoader:
     It accepts model name or a local model dir, and will download the model if necessary.
     """
 
-    def __init__(self,
-                 llm_args: LlmArgs,
-                 workspace: Optional[str | tempfile.TemporaryDirectory] = None,
-                 llm_build_stats: Optional["LlmBuildStats"] = None):
+    def __init__(self, llm_args: LlmArgs):
         self.llm_args = llm_args
-        self._workspace = workspace or tempfile.TemporaryDirectory()
-        self.llm_build_stats = llm_build_stats or LlmBuildStats()
 
         self.model_obj = _ModelWrapper(self.llm_args.model)
         self.speculative_model_obj = _ModelWrapper(
@@ -362,27 +355,14 @@ class CachedModelLoader:
     """The CachedModelLoader is used to build the model in both single or multi-gpu, with optional caching.
     """
 
-    def __init__(
-        self,
-        llm_args: LlmArgs,
-        llm_build_stats: weakref.ReferenceType["LlmBuildStats"],
-        mpi_session: Optional[MpiSession] = None,
-        workspace: Optional[str] = None,
-    ):
+    def __init__(self,
+                 llm_args: LlmArgs,
+                 mpi_session: Optional[MpiSession] = None,
+                 is_attached_frontend: bool = False):
         self.llm_args = llm_args
         self.mpi_session = mpi_session
-        self._workspace = workspace or tempfile.TemporaryDirectory()
-        self.llm_build_stats = llm_build_stats
-
-        # This is used for build cache. To compute the cache key, a local HF model is required, it could be download
-        # from HF model hub, so this helps to hold the path.
+        self._is_attached_frontend = is_attached_frontend
         self._hf_model_dir: Optional[Path] = None
-
-    @property
-    def workspace(self) -> Path:
-        return Path(self._workspace.name) if isinstance(
-            self._workspace, tempfile.TemporaryDirectory) else Path(
-                self._workspace)
 
     def _submit_to_all_workers(
         self,
@@ -403,16 +383,21 @@ class CachedModelLoader:
         Also updates the model_obj.model_dir with the local model dir.
         """
         if model_obj.is_hub_model:
-            model_dirs = self._submit_to_all_workers(
-                CachedModelLoader._node_download_hf_model,
-                model=model_obj.model_name,
-                revision=revision)
-            model_dir = next((d for d in model_dirs if d is not None), None)
+            if self._is_attached_frontend:
+                # Attached frontends have no MPI session; resolve the cached
+                # snapshot locally, independent of their CUDA device index.
+                model_dir = download_hf_model(model_obj.model_name, revision)
+            else:
+                model_dirs = self._submit_to_all_workers(
+                    CachedModelLoader._node_download_hf_model,
+                    model=model_obj.model_name,
+                    revision=revision)
+                model_dir = next((d for d in model_dirs if d is not None), None)
             model_obj.model_dir = model_dir
             return model_dir
         return model_obj.model_dir
 
-    def __call__(self) -> Tuple[Path, Union[Path, None]]:
+    def __call__(self) -> Optional[Path]:
 
         # Download speculative model from HuggingFace if needed (all backends)
         if (self.llm_args.speculative_config is not None and
@@ -432,15 +417,20 @@ class CachedModelLoader:
                     None)
                 if resolve_from_checkpoint is not None:
                     resolve_from_checkpoint()
-
-        # AutoDeploy doesn't use ModelLoader
-        if self.llm_args.backend == "_autodeploy":
-            return None, ""
+                # The DFlash buffer-fit check reads the drafter geometry from
+                # the same config.json, so for a hub repo id the validation
+                # pass only covered the token budget. Re-run it now that the
+                # checkpoint is local; a local path was fully checked at
+                # validation time and is not re-run.
+                if (isinstance(self.llm_args, TorchLlmArgs)
+                        and isinstance(self.llm_args.speculative_config,
+                                       DFlashDecodingConfig)):
+                    self.llm_args._validate_dflash_ctx_budget()
 
         self._hf_model_dir = None
         self.model_loader = ModelLoader(self.llm_args)
 
-        if self.llm_args.backend not in ["pytorch", "_autodeploy"]:
+        if self.llm_args.backend != "pytorch":
             raise ValueError(
                 f'backend {self.llm_args.backend} is not supported.')
 
@@ -455,7 +445,7 @@ class CachedModelLoader:
         # TODO: Unify the logics with those in tensorrt_llm/_torch/model_config.py
         self.model_loader._update_from_hf_quant_config()
 
-        return None, self._hf_model_dir
+        return self._hf_model_dir
 
     @print_traceback_on_error
     @staticmethod
@@ -469,27 +459,8 @@ class CachedModelLoader:
             return None
 
 
-@dataclass
-class LlmBuildStats:
-    """LlmBuildStats is the statistics for the LLM model building."""
-    # Whether the cache is hit for the engine
-    cache_hitted: bool = False
-    cache_info: Optional[str] = None
-
-    model_from_hf_hub: bool = False
-
-    local_model_dir: Optional[Path] = None
-
-    # The path to the trt-llm engine
-    engine_dir: Optional[Path] = None
-
-    # The build steps information, including the step name and the latency in seconds.
-    build_steps_info: List[Tuple[str, float]] = field(default_factory=list)
-
-
 __all__ = [
     'LlmArgs',
-    'LlmBuildStats',
     'ModelLoader',
     '_ParallelConfig',
     '_ModelWrapper',
@@ -593,18 +564,11 @@ def _resolve_kv_cache_manager_v2_auto(llm_args: 'TorchLlmArgs',
                                       pretrained_config: Any = None) -> bool:
     """Resolve the KV cache manager auto setting from the model preference.
 
-    A model preference for V2 is demoted to V1 for routes V2 cannot serve; an
-    explicit user value otherwise wins. The compatibility arms are:
-
-    - Disaggregated serving: hybrid Mamba V2 requires the Python transceiver
-      with NIXL, so any other route falls back to V1. The transceiver runtime
-      auto setting must be resolved first.
-    - Two-model speculative decoding: the draft model runs in a separate engine
-      with its own KV cache manager. ``build_managers`` hands that manager the
-      target's ``kv_cache_config`` unsplit, and V2 capacity is governed solely
-      by ``max_gpu_total_bytes``, so both managers size their pools from the
-      full budget. The model preference falls back to V1, and an explicit
-      ``True`` is rejected rather than deferred to that allocation.
+    A model preference for V2 is demoted to V1 for routes V2 cannot serve; a
+    boolean value otherwise wins, including the default ``True``.
+    Disaggregated serving with V2 requires the Python transceiver with NIXL,
+    so ``auto`` falls back to V1 for any other route. The transceiver runtime
+    auto setting must be resolved first.
 
     The fallback only reaches models whose manager class is selected by
     ``use_kv_cache_manager_v2``. Models routed to a V2 manager unconditionally
@@ -640,6 +604,12 @@ def _resolve_kv_cache_manager_v2_auto(llm_args: 'TorchLlmArgs',
                 "falling back to V1.", runtime, effective_backend)
             use_v2 = False
 
+    if (not use_v2 and llm_args.kv_cache_config.block_reuse_config.
+            swa_endpoint_rewind_tokens > 0):
+        raise ValueError(
+            "block_reuse_config.swa_endpoint_rewind_tokens requires KV cache "
+            "manager v2, but use_kv_cache_manager_v2='auto' resolved to V1. "
+            "Set kv_cache_config.use_kv_cache_manager_v2=True explicitly.")
     llm_args.kv_cache_config.use_kv_cache_manager_v2 = use_v2
     return use_v2
 

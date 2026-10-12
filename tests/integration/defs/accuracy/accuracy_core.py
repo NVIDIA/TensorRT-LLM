@@ -17,7 +17,7 @@ import math
 import os
 import re
 from dataclasses import dataclass, field
-from typing import List, Optional, Union
+from typing import List, Optional
 
 import pytest
 import scipy
@@ -26,9 +26,9 @@ import yaml
 
 import tensorrt_llm.evaluate
 from tensorrt_llm import LLM as PyTorchLLM
-from tensorrt_llm._torch.auto_deploy import LLM as AutoDeployLLM
 from tensorrt_llm.evaluate.audio_asr import AudioASREvaluator
-from tensorrt_llm.llmapi import GuidedDecodingParams, SamplingParams
+from tensorrt_llm.llmapi import (GuidedDecodingParams, SamplingParams,
+                                 SchedulingParams)
 from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.sampling_params import LogitsProcessor
@@ -62,7 +62,7 @@ class ForceTokenLogitsProcessor(LogitsProcessor):
         logits[..., self._forced_token_id] = 0
 
 
-def assert_guided_decoding_regex(llm: PyTorchLLM | AutoDeployLLM) -> None:
+def assert_guided_decoding_regex(llm: PyTorchLLM) -> None:
     """Verify that an initialized model applies a regex grammar end to end."""
     pattern = r"[0-9]{2}"
     prompt_token_ids = llm.tokenizer.encode(
@@ -263,6 +263,45 @@ def assert_acceptance_length_for_llm(test_key: str, llm) -> None:
     assert_acceptance_length(test_key, acceptance_length)
 
 
+def assert_kv_cache_reuse_for_llm(
+    llm: PyTorchLLM,
+    prompt_token_ids: list[int],
+    *,
+    output_length: int = 8,
+    scheduling_params: list[SchedulingParams] | None = None,
+) -> None:
+    """Assert that a repeated prompt hits the KV cache without changing output."""
+    sampling_params = SamplingParams(
+        max_tokens=output_length,
+        temperature=0,
+        end_id=-1,
+        return_perf_metrics=True,
+    )
+
+    cold_output = llm.generate(
+        [prompt_token_ids],
+        sampling_params=sampling_params,
+        scheduling_params=scheduling_params,
+        use_tqdm=False,
+    )[0].outputs[0]
+    warm_output = llm.generate(
+        [prompt_token_ids],
+        sampling_params=sampling_params,
+        scheduling_params=scheduling_params,
+        use_tqdm=False,
+    )[0].outputs[0]
+
+    cold_metrics = cold_output.request_perf_metrics
+    warm_metrics = warm_output.request_perf_metrics
+    assert cold_metrics is not None
+    assert warm_metrics is not None
+    assert cold_metrics.kv_cache_metrics.num_reused_blocks == 0
+    assert warm_metrics.kv_cache_metrics.num_reused_blocks > 0
+    assert len(cold_output.token_ids) == output_length
+    assert len(warm_output.token_ids) == output_length
+    assert warm_output.token_ids == cold_output.token_ids
+
+
 class AccuracyTask:
     REFERENCE_DIR = f"{os.path.dirname(__file__)}/references"
 
@@ -332,7 +371,7 @@ class AccuracyTask:
             threshold=entry.get("threshold"))
 
     def evaluate(self,
-                 llm: Union[PyTorchLLM, AutoDeployLLM],
+                 llm: PyTorchLLM,
                  extra_acc_spec: Optional[str] = None,
                  extra_evaluator_kwargs: Optional[dict] = None,
                  sampling_params: Optional[SamplingParams] = None,

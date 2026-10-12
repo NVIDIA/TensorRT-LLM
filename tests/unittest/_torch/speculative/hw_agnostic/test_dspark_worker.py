@@ -140,6 +140,7 @@ def test_worker_lazy_init_window_buffers():
     assert worker._batch_to_slot is not None
     assert worker._batch_to_slot.shape == (8,)
     assert worker._batch_to_slot.device.type == "cuda"
+    assert worker._batch_to_slot.tolist() == [worker._scratch_slot] * 8
     # idempotent
     buf_id = id(worker._kv_windows)
     worker._lazy_init(dm, meta)
@@ -247,6 +248,69 @@ def test_seed_context_windows_preserves_state_across_prefill_chunks():
         [4, 5],
     ]
     assert torch.all(worker._kv_windows[slot] == 2.0)
+
+
+@pytest.mark.parametrize(
+    "chunks",
+    [
+        [(0, 4800), (4800, 150), (4950, 50)],
+        [(3872, 1078), (4950, 50)],
+        [(3872, 178)],
+        [(4000, 1000)],
+        [(4000, 1), (4001, 127)],
+    ],
+)
+@pytest.mark.parametrize("window", [64, 128, 256])
+@pytest.mark.parametrize("final_window", [False, True])
+def test_seed_context_windows_reads_only_each_chunk_tail(chunks, window, final_window):
+    """Never consume dropped captures, including an entirely skipped chunk."""
+    worker = _make_worker()
+    draft = _fake_draft_model()
+    draft._attn_params = dict(draft._attn_params, window_size=window)
+    written = []
+
+    def write(hidden, positions, windows):
+        assert torch.isfinite(hidden).all()
+        torch.testing.assert_close(hidden[:, 0].float(), positions.float() - 1)
+        written.append(positions.tolist())
+
+    draft.write_context_windows = write
+    meta = types.SimpleNamespace(max_num_requests=2, request_ids=[100, 101])
+    worker._lazy_init(draft, meta)
+    expected = []
+    total_kept = 0
+    prompt_end = chunks[-1][0] + chunks[-1][1]
+    for start, length in chunks:
+        # Dropped Decoder rows remain invalid. A second, short context and
+        # generation rows verify that offsets stay in the original batch.
+        captured = torch.full((length + 3 + 6, HIDDEN * NCAP), float("nan"), device="cuda")
+        positions = torch.arange(start, start + length, device="cuda")
+        kept = min(length, max(128, window))
+        if final_window:
+            kept = len(
+                set(range(start, start + length))
+                & set(range(max(0, prompt_end - max(128, window)), prompt_end))
+            )
+            meta.context_capture_lens = (kept, 3)
+        if kept:
+            captured[length - kept : length] = positions[-kept:, None]
+        total_kept += kept if final_window else length
+        captured[length : length + 3] = positions.new_tensor([0, 1, 2])[:, None]
+        captured[-6:] = -99
+        meta.get_hidden_states = lambda count: captured[:count]
+        attn = types.SimpleNamespace(num_contexts=2, _seq_lens=[length, 3, 6])
+        packed_positions = torch.cat(
+            (positions, positions.new_tensor([0, 1, 2, 50, 51, 52, 53, 54, 55]))
+        )
+        worker._seed_context_windows(draft, meta, attn, packed_positions, len(captured))
+        end = start + length
+        if kept:
+            expected.append(list(range(end - min(window, kept) + 1, end + 1)))
+        expected.append([1, 2, 3])
+    assert written == expected
+    slot = worker._req_to_slot[100]
+    assert int(worker._valid_len[slot]) == min(window, total_kept)
+    assert int(worker._ctx_len[slot]) == chunks[-1][0] + chunks[-1][1]
 
 
 def test_prepare_builds_batch_to_slot_on_batched_path():
@@ -384,6 +448,54 @@ def test_prepare_keeps_dummy_generation_requests_on_scratch_row():
     assert list(worker._free_slots) == [1, 2, 3]
 
 
+def test_prepare_keeps_small_real_request_slots_across_steps():
+    """Small real IDs are not mistaken for CUDA-graph warmup dummies."""
+    worker = _make_worker()
+    meta = _make_metadata(max_num_requests=4)
+    worker._lazy_init(_fake_draft_model(), meta)
+    meta._dspark_worker = worker
+    meta.request_ids = [1, 2]
+    meta.num_generations = 2
+    meta.prepare()
+
+    slots = worker._batch_to_slot[:2]
+    worker._ctx_len[slots] = torch.tensor([7, 8], device="cuda")
+    worker._valid_len[slots] = torch.tensor([1, 2], device="cuda")
+    worker._position_initialized[slots] = True
+
+    meta.prepare()
+    assert worker._ctx_len[slots].tolist() == [7, 8]
+    assert worker._valid_len[slots].tolist() == [1, 2]
+    assert worker._position_initialized[slots].tolist() == [True, True]
+
+
+def test_prepare_keeps_cuda_graph_slots_across_replays():
+    """Graph metadata must not reset rolling state before each replay."""
+    worker = _make_worker()
+    meta = _make_metadata(max_num_requests=4)
+    worker._lazy_init(_fake_draft_model(), meta)
+    meta._dspark_worker = worker
+    # Not 0: that is ATTENTION_DP_DUMMY_REQUEST_ID, which prepare() routes to
+    # the scratch row by design, so it would never take a persistent slot.
+    meta.request_ids = [11, 12, 13]
+    meta.num_generations = 3
+    meta.is_cuda_graph = True
+    meta.prepare()
+
+    slots = worker._batch_to_slot[:3]
+    assert len(set(slots.tolist())) == 3
+    assert all(slot != worker._scratch_slot for slot in slots.tolist())
+    worker._ctx_len[slots] = torch.tensor([7, 8, 9], device="cuda")
+    worker._valid_len[slots] = torch.tensor([1, 2, 3], device="cuda")
+    worker._position_initialized[slots] = True
+
+    meta.prepare()
+    slots = worker._batch_to_slot[:3]
+    assert worker._ctx_len[slots].tolist() == [7, 8, 9]
+    assert worker._valid_len[slots].tolist() == [1, 2, 3]
+    assert worker._position_initialized[slots].tolist() == [True, True, True]
+
+
 class _RecordingDraftModel:
     num_stages = 1
     block_size = 5
@@ -438,6 +550,34 @@ def test_generation_state_cuda_graph_bootstrap_and_replay():
     graph.replay()
     assert worker._ctx_len[slots].tolist() == [4019, 92]
     assert worker._valid_len[slots].tolist() == [3, 5]
+
+
+def test_generation_state_resets_scratch_row_on_every_cuda_graph_replay():
+    """Graph replays must not advance the shared dummy slot indefinitely."""
+    worker = _make_worker()
+    worker._lazy_init(_fake_draft_model(window_size=8), _make_metadata(max_num_requests=2))
+    scratch = worker._scratch_slot
+    slots = torch.tensor([scratch], device="cuda", dtype=torch.long)
+    num_accepted = torch.tensor([1], device="cuda", dtype=torch.long)
+    input_positions = torch.tensor([4016], device="cuda", dtype=torch.long)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        worker._advance_generation_state(slots, num_accepted, input_positions)
+
+    graph.replay()
+    assert worker._ctx_len[scratch].item() == 4017
+    assert worker._valid_len[scratch].item() == 1
+
+    graph.replay()
+    assert worker._ctx_len[scratch].item() == 4017
+    assert worker._valid_len[scratch].item() == 1
+
+    num_accepted.fill_(2)
+    graph.replay()
+    # The new replay bootstraps from 4016, rather than adding to 4017.
+    assert worker._ctx_len[scratch].item() == 4018
+    assert worker._valid_len[scratch].item() == 2
 
 
 def test_disagg_position_bootstrap_uses_actual_positions_and_target_width():
@@ -824,3 +964,144 @@ def test_dspark_worker_policies_come_from_the_drafter():
     # No Markov head -> the backbone logits pass through untouched.
     logits = torch.randn(2, 3, 8, device="cuda")
     assert worker._refine_block_logits(legacy, logits, {}, None) is logits
+
+
+def test_lazy_init_publishes_the_runtime_position_ceiling():
+    """The RoPE table must be sized from the engine's bound, not model_config's."""
+    worker = _make_worker()
+    dm = _fake_draft_model()
+    dm.dspark_model = types.SimpleNamespace()
+    attn_metadata = types.SimpleNamespace(max_seq_len=4096)
+
+    worker._lazy_init(dm, _make_metadata(max_num_requests=2), attn_metadata)
+
+    # start_pos is a frame index (position + 1); a full verification then accepts
+    # K+1 tokens and DSpark indexes K block positions from that start. Length is
+    # max index + 1.
+    expected = 4096 + 1 + 5 + 1 + 5 + 1
+    assert dm._runtime_position_ceiling == expected
+    assert dm.dspark_model._runtime_position_ceiling == expected
+
+
+def test_position_ceiling_covers_the_config_cap_and_grows_after_kv_estimation():
+    """Publishing once, from one bound, undersizes the table for the rest of the run.
+
+    KV-cache estimation drives drafter forwards against a probe manager whose
+    max_seq_len is below the real one, and _create_cuda_graph_warmup_request puts
+    its dummy request at max_seq_len - 1 -- within one block of the table's end.
+    """
+    worker = _make_worker()
+    dm = _fake_draft_model()
+    dm.dspark_model = types.SimpleNamespace(_freqs_cap=9000)
+    meta = _make_metadata(max_num_requests=2)
+
+    # The probe manager's bound is below the config cap: cover both, not one.
+    # _freqs_cap 9000 encodes max_seq_len 9000 - block_size - 2.
+    worker._lazy_init(dm, meta, types.SimpleNamespace(max_seq_len=512))
+    assert dm.dspark_model._runtime_position_ceiling == (9000 - 5 - 2) + 1 + 5 + 1 + 5 + 1
+
+    # The real manager arrives after _win_inited is already set.
+    worker._lazy_init(dm, meta, types.SimpleNamespace(max_seq_len=16384))
+    assert dm.dspark_model._runtime_position_ceiling == 16384 + 1 + 5 + 1 + 5 + 1
+
+
+def test_position_bound_holds_across_cuda_graph_replays():
+    """The bound has to be an in-graph tensor op, not a host-side guard.
+
+    Warmup reaches this through ``cuda_graph_runner.replay``, which runs no Python,
+    so a captured graph keeps advancing a slot that no completion ever frees. Left
+    unbounded it ran 53 entries past the RoPE table [measured job 3097207]; the cap
+    itself sits at what a full-length real request reaches, so serving is untouched.
+    """
+    worker = _make_worker()
+    dm = _fake_draft_model(window_size=8)
+    worker._lazy_init(dm, _make_metadata(max_num_requests=2), types.SimpleNamespace(max_seq_len=64))
+    cap = worker._position_cap
+    assert cap == 64 + 1 + 5 + 1  # max_ctx + frame + K + bonus
+    assert cap == (64 + 5 + 5 + 3) - 1 - 5  # == table length - 1 - block_size
+
+    slots = torch.tensor([0], device="cuda", dtype=torch.long)
+    num_accepted = torch.tensor([6], device="cuda", dtype=torch.long)
+    input_positions = torch.tensor([cap - 3], device="cuda", dtype=torch.long)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        worker._advance_generation_state(slots, num_accepted, input_positions)
+
+    worker._ctx_len[slots] = 0
+    worker._position_initialized[slots] = False
+    for _ in range(5):
+        graph.replay()
+        assert worker._ctx_len[0].item() <= cap
+    assert worker._ctx_len[0].item() == cap
+
+
+def test_freqs_table_prefers_the_runtime_ceiling_over_the_config_cap(mocker):
+    """The cache key has to carry the cap, not just the device.
+
+    Moving where the cap comes from without moving the key would let any table
+    built before the worker publishes the ceiling serve every later call -- the
+    undersized table, silently, for the life of the process.
+    """
+    from tensorrt_llm._torch.models.modeling_dspark import DSv4DSparkDraftModel
+
+    spy = mocker.patch(
+        "tensorrt_llm._torch.models.modeling_dspark.precompute_dspark_freqs_cis",
+        return_value=torch.zeros(1),
+    )
+    model = types.SimpleNamespace(
+        _freqs_cap=1000,
+        _runtime_position_ceiling=5000,
+        _attn_params={"rope_head_dim": 64},
+        _rope_theta=10000.0,
+        _freqs_table_cache={},
+    )
+    device = torch.device("cpu")
+
+    DSv4DSparkDraftModel._dspark_freqs_table(model, device)
+    assert spy.call_args.args[1] == 5000
+
+    # The cache key carries the cap, so a table built for one bound can never be
+    # served for the other.
+    del model._runtime_position_ceiling
+    DSv4DSparkDraftModel._dspark_freqs_table(model, device)
+    assert spy.call_args.args[1] == 1000
+    assert len(model._freqs_table_cache) == 2
+
+
+def test_prepare_resets_the_scratch_row_every_iteration():
+    """The throwaway row must not carry an absolute position between forwards.
+
+    It has no prefill to seed it and no completion to free it, so without this
+    reset ``_advance_generation_state``'s unconditional advance leaves its
+    position climbing across CUDA-graph shapes and iterations until it indexes
+    past the RoPE table.
+    """
+    from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDA_GRAPH_DUMMY_REQUEST_ID
+
+    worker = _make_worker()
+    meta = _make_metadata(max_num_requests=4)
+    worker._lazy_init(_fake_draft_model(), meta)
+    meta._dspark_worker = worker
+    scratch = worker._scratch_slot
+
+    # State a previous padding / ADP-idle forward left behind.
+    worker._ctx_len[scratch] = 4096
+    worker._valid_len[scratch] = 8
+    worker._position_initialized[scratch] = True
+
+    live = worker._assign_slot(100, reset=True)
+    worker._ctx_len[live] = 17
+    worker._valid_len[live] = 5
+    worker._position_initialized[live] = True
+
+    meta.request_ids = [100, CUDA_GRAPH_DUMMY_REQUEST_ID]
+    meta.prepare()
+
+    assert int(worker._ctx_len[scratch]) == 0
+    assert int(worker._valid_len[scratch]) == 0
+    assert not bool(worker._position_initialized[scratch])
+    # A live request's own state is bounded by its lifetime and must survive.
+    assert int(worker._ctx_len[live]) == 17
+    assert int(worker._valid_len[live]) == 5
+    assert bool(worker._position_initialized[live])

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -72,7 +72,14 @@ public:
     static at::Device device(void const* ptr)
     {
         ::cudaPointerAttributes attr{};
-        TLLM_CUDA_CHECK(cudaPointerGetAttributes(&attr, ptr));
+        auto const status = cudaPointerGetAttributes(&attr, ptr);
+        if (status == cudaErrorNoDevice || status == cudaErrorInsufficientDriver)
+        {
+            // Without an available CUDA device or driver, ptr cannot refer to CUDA memory.
+            static_cast<void>(cudaGetLastError());
+            return at::Device{at::kCPU};
+        }
+        TLLM_CUDA_CHECK(status);
         auto const memoryType = attr.type;
         return (memoryType == ::cudaMemoryTypeDevice || memoryType == ::cudaMemoryTypeManaged)
             ? at::Device{at::kCUDA, static_cast<at::DeviceIndex>(attr.device)}

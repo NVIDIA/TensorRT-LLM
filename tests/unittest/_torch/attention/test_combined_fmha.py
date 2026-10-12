@@ -45,7 +45,17 @@ def test_combined_fmha_delegates_phases_and_prepares_max_workspace() -> None:
         workspace_size=4,
     )
     combined_fmha = CombinedFmha(attn)
-    combined_fmha.set_fmha_impls(context_fmha, generation_fmha)
+    assert not combined_fmha.supports_workspace_reclamation
+    for context_support, generation_support, expected in (
+        (False, False, False),
+        (True, False, False),
+        (True, True, True),
+        (False, True, False),
+    ):
+        context_fmha.supports_workspace_reclamation = context_support
+        generation_fmha.supports_workspace_reclamation = generation_support
+        combined_fmha.set_fmha_impls(context_fmha, generation_fmha)
+        assert combined_fmha.supports_workspace_reclamation is expected
     metadata = SimpleNamespace(
         kv_cache_block_offsets=object(),
         effective_workspace=torch.empty(0, dtype=torch.uint8),

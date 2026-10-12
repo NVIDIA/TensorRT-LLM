@@ -19,15 +19,18 @@
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/opUtils.h"
+#include "tensorrt_llm/runtime/cudaStream.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 
 #include <gtest/gtest.h>
 #include <mutex>
 #include <nccl.h>
 #include <thread>
+#include <tuple>
 #include <vector>
 
 #if ENABLE_MULTI_DEVICE && BUILD_PYT
+#include <c10/cuda/CUDAGuard.h>
 #include <torch/extension.h>
 #endif
 
@@ -317,6 +320,39 @@ TEST_F(NCCLWindowAllocatorTest, BasicAllocation)
 
     // Release the buffer
     allocator.releaseBuffer(*mComm, buffer.ptr);
+}
+
+TEST_F(NCCLWindowAllocatorTest, ExplicitStreamAllocationAndCapture)
+{
+    auto& allocator = nccl_util::NCCLWindowAllocator::getInstance();
+    auto const testComm = createSplitComm(*mComm, 0, mRank);
+    tr::CudaStream const stream;
+    size_t constexpr kBufferSize = 4 * 1024;
+
+    auto const buffer = allocator.requestBuffer(*testComm, kBufferSize, stream.get());
+    ASSERT_TRUE(buffer.isValid());
+    allocator.releaseBuffer(*testComm, buffer.ptr);
+
+    TLLM_CUDA_CHECK(cudaStreamBeginCapture(stream.get(), cudaStreamCaptureModeThreadLocal));
+    nccl_util::NCCLWindowBuffer reusedBuffer;
+    nccl_util::NCCLWindowBuffer newBuffer;
+    EXPECT_NO_THROW(reusedBuffer = allocator.requestBuffer(*testComm, kBufferSize, stream.get()));
+    EXPECT_NO_THROW(newBuffer = allocator.requestBuffer(*testComm, kBufferSize * 2, stream.get()));
+    cudaGraph_t graph = nullptr;
+    EXPECT_EQ(cudaStreamEndCapture(stream.get(), &graph), cudaSuccess);
+    if (graph)
+    {
+        TLLM_CUDA_CHECK(cudaGraphDestroy(graph));
+    }
+
+    EXPECT_TRUE(reusedBuffer.isValid());
+    EXPECT_EQ(reusedBuffer.ptr, buffer.ptr);
+    EXPECT_FALSE(newBuffer.isValid());
+    EXPECT_EQ(allocator.getBufferCount(*testComm), 1);
+    allocator.releaseBuffer(*testComm, reusedBuffer.ptr);
+
+    nccl_util::ScopedNCCLWindowBuffer const scopedBuffer(testComm, kBufferSize * 2, stream.get());
+    EXPECT_TRUE(scopedBuffer.getBuffer().isValid());
 }
 
 TEST_F(NCCLWindowAllocatorTest, BufferReuse)
@@ -734,6 +770,28 @@ TEST_F(CreateNCCLWindowTensorTest, BasicTensorCreation)
     // Tensor should be in use
     auto& allocator = nccl_util::NCCLWindowAllocator::getInstance();
     EXPECT_EQ(allocator.getBufferInUseCount(*mComm), 1);
+}
+
+TEST_F(CreateNCCLWindowTensorTest, CurrentStreamCapture)
+{
+    auto const testComm = createSplitComm(*mComm, 0, mRank);
+    auto const stream = at::cuda::getStreamFromPool();
+    c10::cuda::CUDAStreamGuard const streamGuard(stream);
+
+    TLLM_CUDA_CHECK(cudaStreamBeginCapture(stream.stream(), cudaStreamCaptureModeThreadLocal));
+    torch::Tensor tensor;
+    nccl_util::NCCLWindowBuffer buffer;
+    EXPECT_NO_THROW(std::tie(tensor, buffer) = nccl_util::createNCCLWindowTensor(testComm, {4, 8}, torch::kFloat32));
+    cudaGraph_t graph = nullptr;
+    EXPECT_EQ(cudaStreamEndCapture(stream.stream(), &graph), cudaSuccess);
+    if (graph)
+    {
+        TLLM_CUDA_CHECK(cudaGraphDestroy(graph));
+    }
+
+    EXPECT_FALSE(tensor.defined());
+    EXPECT_FALSE(buffer.isValid());
+    EXPECT_EQ(nccl_util::NCCLWindowAllocator::getInstance().getBufferCount(*testComm), 0);
 }
 
 TEST_F(CreateNCCLWindowTensorTest, DifferentDtypes)

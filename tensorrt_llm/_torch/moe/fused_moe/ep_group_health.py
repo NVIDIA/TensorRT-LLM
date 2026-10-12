@@ -34,9 +34,9 @@ from typing import NamedTuple
 
 # Default number of uint64 words for EPGroupHealth.get_mask_words().
 # Matches the active_rank_mask ABI of the NVLink AlltoAll kernels
-# (uint64_t[2]). Two words cover 128 ranks, sufficient for NVL72 with
-# headroom.
-EP_MASK_NUM_WORDS: int = 2
+# (uint64_t[4]). Four words cover 256 ranks, sufficient for NVL576 EP256
+# with headroom.
+EP_MASK_NUM_WORDS: int = 4
 
 
 class EPGroupHealthSnapshot(NamedTuple):
@@ -201,8 +201,8 @@ class EPGroupHealth:
 
         Suitable for passing to CUDA kernels that accept ``uint64_t[num_words]``.
         Word ``0`` covers ranks ``0..63``, word ``1`` covers ranks ``64..127``,
-        etc. The default of two words covers the NVL72 case (72 ranks) with
-        headroom for future expansion.
+        etc. The default of four words covers up to 256 ranks (NVL576 EP256),
+        matching the kernel ABI.
 
         Args:
             num_words: Number of 64-bit words to produce. Must be large enough

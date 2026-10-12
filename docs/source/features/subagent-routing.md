@@ -14,6 +14,7 @@ configuration. Merge the router settings into the corresponding server sections:
 ```yaml
 conversation_affinity_header_for_subagents: X-Dynamo-Parent-Session-ID
 subagent_affinity_scope: context
+internal_request_auth_key: <shared-secret>
 
 context_servers:
   router:
@@ -24,6 +25,18 @@ The feature is opt-in: leaving `conversation_affinity_header_for_subagents` unse
 preserves ordinary conversation routing. Choose a dedicated parent-session header
 supplied by your agent gateway, separate from the headers identifying each agent's
 own conversation.
+
+Set the same `internal_request_auth_key` on the edge and its context/generation
+workers. A combined disaggregated launch propagates this key to its workers;
+independently launched workers need it in their own configuration. Forwarding
+sub-agent affinity requires this key, even while KV-transfer authentication still
+permits a missing key with a transitional warning. The edge rejects an affinity
+configuration without an internal key at startup.
+
+Workers may omit `--server_role`: when no role is configured, affinity
+validation infers context or generation from `disaggregated_params.request_type`.
+The inferred role selects the signature to verify; a valid signature is still
+required. An explicitly configured role takes precedence.
 
 On the context workers, enable conversation affinity in your existing attention-DP
 configuration:
@@ -89,7 +102,8 @@ configured header can request affinity to another session's instance and ADP ran
 
 Deployments accepting untrusted requests should place a gateway before
 `trtllm-serve`. The gateway should prune client-supplied copies of the configured
-parent-session header and the internal `x-trtllm-subagent-affinity-id` header,
+parent-session header and the internal `x-trtllm-subagent-affinity-id` and
+`x-trtllm-subagent-affinity-auth` headers,
 then set the parent-session header only for authorized sub-agent requests.
 Keep worker endpoints behind this trusted boundary as well. Each agent's own
 session ID should continue to identify its independent conversation.
@@ -98,9 +112,19 @@ session ID should continue to identify its independent conversation.
 
 The disagg edge reads the configured parent header into an internal routing key.
 The conversation router uses that key to select the parent's instance, and the HTTP
-client forwards it as `x-trtllm-subagent-affinity-id`. The worker places the key in
-`SchedulingParams.subagent_affinity_id` for the conversation-aware ADP router.
+client forwards it as `x-trtllm-subagent-affinity-id` with a separate HMAC signature
+in `x-trtllm-subagent-affinity-auth`. Context/generation workers validate the
+signature before placing the key in `SchedulingParams.subagent_affinity_id` for
+the conversation-aware ADP router. The signature binds the hint to the worker
+role, model, child's conversation ID, request type, and disaggregated request ID.
+Ordinary aggregated requests with neither a configured worker role nor a
+context/generation request type ignore the affinity header and retain ordinary
+conversation routing. Worker requests carrying unsigned or invalid affinity are
+rejected, including requests sent to workers without an explicit role.
 
 The child's conversation ID continues to identify its own history throughout this
 path. The internal affinity field is excluded from the serialized request body;
 older workers can ignore the new header during a rolling deployment.
+Upgrade edges before workers: upgraded workers reject affinity headers from
+older edges that do not sign them. The existing KV-transfer authentication
+signature remains unchanged.

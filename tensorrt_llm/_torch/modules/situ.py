@@ -12,6 +12,10 @@ import triton.language as tl  # type: ignore[import]
 import triton.language.extra.libdevice as tldevice  # type: ignore[import]
 from torch import nn
 
+from tensorrt_llm._utils import get_sm_version
+
+from ..flashinfer_utils import get_env_enable_pdl
+
 
 class SituAndMul(nn.Module):
     """SiTU activation with gate/up multiplicative gating.
@@ -59,6 +63,7 @@ def situ_and_mul_kernel(
     linear_beta,
     BLOCK_SIZE: tl.constexpr,
     HAS_LINEAR_BETA: tl.constexpr,
+    LAUNCH_WITH_PDL: tl.constexpr,
 ) -> None:
     """Fused :class:`SituAndMul` on a packed ``[gate | up]`` row layout."""
     i = tl.program_id(axis=0).to(tl.int64)
@@ -66,6 +71,9 @@ def situ_and_mul_kernel(
 
     o_row_ptr = o_ptr + o_stride * i
     x_row_ptr = x_ptr + x_stride * i
+
+    if LAUNCH_WITH_PDL:
+        tl.extra.cuda.gdc_wait()
 
     offsets = j * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offsets < d
@@ -79,6 +87,9 @@ def situ_and_mul_kernel(
     result = situ_a * up
 
     tl.store(o_row_ptr + offsets, result, mask=mask)
+
+    if LAUNCH_WITH_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 @torch.library.custom_op("trtllm::situ_and_mul", mutates_args=())
@@ -95,6 +106,7 @@ def situ_and_mul(x: torch.Tensor, beta: float, linear_beta: Optional[float] = No
     def grid(meta: Mapping[str, int]) -> tuple[int, int]:
         return (b, triton.cdiv(d, meta["BLOCK_SIZE"]))
 
+    launch_with_pdl = get_env_enable_pdl() and get_sm_version() >= 90
     situ_and_mul_kernel[grid](
         o_ptr=output,
         o_stride=output.stride(0),
@@ -105,6 +117,8 @@ def situ_and_mul(x: torch.Tensor, beta: float, linear_beta: Optional[float] = No
         linear_beta=float(linear_beta) if linear_beta is not None else 1.0,
         BLOCK_SIZE=1024,
         HAS_LINEAR_BETA=linear_beta is not None,
+        LAUNCH_WITH_PDL=launch_with_pdl,
+        launch_pdl=launch_with_pdl,
     )
     return output
 

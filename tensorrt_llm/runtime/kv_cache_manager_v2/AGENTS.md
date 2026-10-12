@@ -4,9 +4,24 @@ This file provides guidance to coding agents when working with code in this dire
 
 ## What This Is
 
-KVCacheManagerV2 is the KV cache management subsystem for TensorRT-LLM. It manages GPU/host/disk memory for key-value caches used during LLM inference, handling page allocation, eviction, multi-tier caching, radix-tree-based prefix sharing, and disaggregated serving.
+The Python surface of KVCacheManagerV2, the KV cache management subsystem for TensorRT-LLM.
+It manages GPU/host/disk memory for key-value caches used during LLM inference, handling page
+allocation, eviction, multi-tier caching, radix-tree-based prefix sharing, and disaggregated
+serving.
 
-This is a **pure Python implementation** designed to be compilable with **mypyc** for production performance. There is also a `rawref` C extension for mutable object references.
+**The implementation is C++**, in `cpp/tensorrt_llm/batch_manager/kv_cache_manager_v2/`, exposed
+through nanobind as `tensorrt_llm.bindings.internal.batch_manager.kv_cache_manager_v2`. Read
+`cpp/tensorrt_llm/batch_manager/kv_cache_manager_v2/AGENTS.md` for the architecture, the
+concurrency contract, and the C++ test suite.
+
+This directory contains only:
+
+- `__init__.py` — re-exports the nanobind surface, plus the plain-Python aliases, constants and
+  two `__dataclass_fields__` grafts the bindings do not carry. Adding a type to the bindings
+  means adding a rebind here and an entry in `__all__`.
+- `_introspection.py` — white-box hooks for tests and accuracy harnesses. Every function
+  forwards to the bindings' native `_introspection` submodule; the indirection exists so callers
+  import a stable Python path and get plain Python containers back.
 
 ## Commands
 
@@ -34,90 +49,37 @@ PYTHONPATH="$REPO_ROOT/" \
     python "$REPO_ROOT/tests/unittest/kv_cache_manager_v2_tests/test_kv_cache_manager_v2.py" -v
 ```
 
-### Building Extensions
+### Rebuilding after a C++ change
 
 ```bash
-# Build rawref C extension
-cd rawref && python setup.py build_ext --inplace
-
-# Build mypyc-compiled version (run from runtime/ parent dir)
-cd .. && python kv_cache_manager_v2/setup_mypyc.py build_ext --inplace
-
-# Or use the Makefile (builds both)
-make all
+cd cpp/build
+cmake --build . --target bindings -j$(nproc)
+cp tensorrt_llm/libtensorrt_llm.so ../../tensorrt_llm/libs/
+cp tensorrt_llm/thop/libth_common.so ../../tensorrt_llm/libs/
+cp tensorrt_llm/nanobind/bindings.cpython-*.so ../../tensorrt_llm/
 ```
 
 ### Debug Mode
 
-Set `TLLM_DEBUG_MODE=1` to enable debug assertions (`NDEBUG=False`). Default is release mode (`NDEBUG=True`).
-
-## Architecture
-
-### Dual Import Trick
-
-The test file uses `find_spec("kv_cache_manager_v2")` to detect whether the package is importable as a top-level module (fast mode via `PYTHONPATH=.../runtime/`) or must be imported via the full path `tensorrt_llm.runtime.kv_cache_manager_v2` (production mode). This allows the same test file to work in both contexts.
-
-### Core Layers (bottom-up)
-
-1. **`_common.py`** — Fundamental types: `TokenId`, `TokenIdExt`, `CacheLevel`, `CacheTier`, `PageStatus`, `CudaStream`, `BeamIndex`, `BlockOrdinal`. All use `NewType` for type safety.
-
-2. **`rawref/`** — C extension providing `ref[T]`, a substitute for `weakref.ref` which is not compatible with mypyc. Uses raw object IDs instead of Python's weak reference machinery. Used throughout for parent/back-references that must not prevent GC. Objects must define `__rawref__ = NULL` class attribute and call `invalidate()` in `__del__`.
-
-3. **`_storage/`** — Low-level memory pool management. `_config.py` defines buffer/pool configurations. `_core.py` provides `CacheLevelStorage` with slot-based allocation across `PoolGroup`s and `Pool`s.
-
-4. **`_storage_manager.py`** — Coordinates storage across cache tiers (GPU → Host → Disk). Manages the `PerLevelEvictionController` and `batched_copy` for cross-tier data movement.
-
-5. **`_page.py`** — Page abstraction: `CommittedPage` (finalized, prefix-shareable), `UncommittedPage` (being filled), `BlockPage` (within a radix tree block). Includes `_SharedPageLock` and `batched_lock_to_gpu` for multi-level page locking.
-
-6. **`_life_cycle_registry.py`** — Maps `LayerGroupId`→`LifeCycleId`. Each layer group has either `AttnLifeCycle` (with optional sliding window + sink tokens) or `SsmLifeCycle`. Controls which blocks are "stale" and eligible for eviction.
-
-7. **`_block_radix_tree.py`** — Radix tree for prefix sharing across sequences. Blocks store pages and token IDs. Supports multi-modal tokens via `gen_multimodal_cache_key_tokens`.
-
-8. **`_eviction_controller/`** — Decides which pages to evict when memory is low, per cache level.
-
-9. **`_copy_engine.py`** — `CopyTask` and `batched_copy` for efficient GPU↔Host↔Disk data transfers.
-
-10. **`_core/_kv_cache.py`** (`_KVCache`) — Per-sequence cache state. Manages the block chain, commit/uncommit lifecycle, beam search forks, page locking, and cross-level migration. This is the most complex module.
-
-11. **`_core/_kv_cache_manager.py`** (`KVCacheManager`) — Top-level manager. Owns all `_KVCache` instances, handles batched operations (`prepareStep`, `acceptStep`, `cleanStep`), quota management, and disaggregated serving coordination.
-
-### Key Type Aliases
-
-- `LayerGroupId` = public alias of `LifeCycleId` (same value, different semantic)
-- `PoolGroupIndex` ≠ `LayerGroupId` — pool group index is the storage-level index
-- `PageIndex` = index into a pool's slot array
-- `BlockOrdinal` = position of a block in a sequence's block chain
-
-### Page Lifecycle
-
-`UncommittedPage` → (commit) → `CommittedPage` → (evict to host) → `CommittedPage` at lower level → (recall to GPU) → `CommittedPage` at GPU level
-
-Pages inside radix tree blocks are `BlockPage` wrappers that delegate to the underlying `CommittedPage`/`UncommittedPage`.
-
-## Concurrency
-
-**This pure-Python backend is not thread-safe.** There is no lock around the
-manager API; the only `threading.Lock` in the package guards copy-engine state
-in `_copy_engine.py`. The GIL makes individual bytecode operations atomic but
-gives no atomicity across a multi-step operation like `resize()`, which walks
-the radix tree, evicts, and migrates pages.
-
-The **C++ backend is** thread-safe, via a manager-wide reader-writer lock. The
-two backends are selected by `TLLM_KV_CACHE_MANAGER_V2_BACKEND` and are
-otherwise interchangeable, so this is an easy asymmetry to trip over: code that
-drives `resize()` from a background thread works against the C++ backend and
-races against this one.
-
-See `cpp/tensorrt_llm/batch_manager/kv_cache_manager_v2/AGENTS.md`
-("Concurrency model") for the guarantee, its scope, and the supported
-helper-thread handoff pattern. If this backend ever needs the same property, it
-needs its own design -- the C++ lock is not reachable from here.
+Set `TLLM_DEBUG_MODE=1` to enable debug assertions (`NDEBUG=False`). Default is release mode
+(`NDEBUG=True`).
 
 ## Gotchas
 
-- **`rawref` must be built first** — the package imports `rawref` at the top level. Run `make rawref` before anything else.
-- **mypyc compilation is from the `runtime/` directory** — `setup_mypyc.py` expects `kv_cache_manager_v2/` prefixes in module paths.
-- **`_exceptions.py` excluded from mypyc** — mypyc can't compile classes inheriting from builtin `Exception`.
-- **`NDEBUG` controls assertions** — many hot-path assertions are gated behind `if not NDEBUG:`. Don't remove these guards.
-- **`stopCommitting()` must NOT call `commit()`** — it would double-append tokens to the block.
-- **Cross-stream sync on `cuda_stream` setter** — changing the CUDA stream records an event on the old stream and waits on the new one. This is intentional, and it is how a cache built on one thread is adopted by another without a blocking host-side sync (C++ backend; see its AGENTS.md).
+- **Dual import trick.** `_load_cpp_module()` reaches the bindings two ways: through
+  `tensorrt_llm.bindings...` when `tensorrt_llm` is already imported, otherwise by walking up
+  from `find_spec("kv_cache_manager_v2")` to the `tensorrt_llm` root and importing
+  `bindings.internal.batch_manager.kv_cache_manager_v2` directly. The second path is what makes
+  fast mode work; the test files mirror the same branch. Keep both in sync.
+- **`__dataclass_fields__` grafts.** `BatchDesc` and `KVCacheManagerConfig` are nanobind classes
+  that callers pass to `dataclasses.replace()`. `replace()` is keyed on `__dataclass_fields__`,
+  so `__init__.py` attaches a field spec to each. A new constructor field on either binding must
+  be added to the matching `_*FieldSpec` or `replace()` silently drops it.
+- **Block-key hashing is a cross-language contract.** `root_block_key` and `block_key` must stay
+  byte-identical to the C++ `RootBlock::makeKey` / `Block::makeKey` they wrap, because
+  `tensorrt_llm/serve/router_utils.py` computes routing hashes with them and compares against
+  hashes the engine produced. `TestBlockKeyHashing` in the unit tests guards the format.
+- **Streaming KV events have no implementation.** `kv_cache_config.kv_events_config` is rejected
+  by `validate_streaming_support`; the supported route is the buffered path via
+  `kv_cache_config.event_buffer_max_size`. A native event sink is what would re-enable it — a
+  Python sink cannot work, because the C++ radix tree calls its sink natively.

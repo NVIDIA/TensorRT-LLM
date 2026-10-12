@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import asyncio
 import dataclasses
 import json
@@ -70,6 +73,16 @@ class LogProbsResult(NamedTuple):
     generation: Optional[TokenLogprobs | SimpleTokenLogprobs] = None
 
 
+class _SpecDecCounters(NamedTuple):
+    """Speculative-decoding counters reported by the request behind one sequence.
+
+    Field names match the executor response so a formatter can read either.
+    """
+    per_pos_drafted: Optional[List[int]] = None
+    per_pos_accepted: Optional[List[int]] = None
+    spec_dec_totals: Optional[tuple[int, int]] = None
+
+
 class ResponseWrapper:
     """1. Wrapper of runtime response with optional outputs computed post runtime.
     2. A workaround to pass around RequestPerfMetrics.
@@ -125,6 +138,7 @@ class CompletionOutput:
         token_ids_diff (List[int]): Newly generated token ids.
         logprobs_diff (TokenLogprobs | SimpleTokenLogprobs): Logprobs of newly generated tokens.
         text_diff (str): Newly generated tokens.
+        routed_experts (Optional[torch.Tensor]): Per-token pre-EPLB logical top-k MoE expert ids (Router Replay / R3), or None when not requested.
     """
     index: int
     text: str = ""
@@ -153,6 +167,10 @@ class CompletionOutput:
                                                 repr=False)
     # the result of result_handler passed to postprocess workers
     _postprocess_result: Any = None
+    # this sequence's own spec-decode counters; see _handle_sequence
+    _spec_dec_counters: Optional[_SpecDecCounters] = field(default=None,
+                                                           init=False,
+                                                           repr=False)
 
     def __getstate__(self) -> dict:
         # _incremental_states holds a tokenizers.DecodeStream (a Rust object,
@@ -177,6 +195,25 @@ class CompletionOutput:
     @property
     def length(self) -> int:
         return len(self.token_ids)
+
+    @property
+    def routed_experts(self) -> Optional[torch.Tensor]:
+        """Per-token pre-EPLB logical top-k MoE expert ids (Router Replay / R3).
+
+        Shape ``[seq_len - 1, num_moe_layers, top_k]`` when requested via
+        ``SamplingParams.return_routed_experts`` (with the engine-level
+        ``enable_return_routed_experts``); ``None`` otherwise. Surfaced from
+        ``additional_generation_outputs["routed_experts"]``.
+        """
+        outs = self.additional_generation_outputs
+        if not outs or "routed_experts" not in outs:
+            return None
+        val = outs["routed_experts"]
+        if isinstance(val, (list, tuple)):
+            if not val:
+                return None
+            return val[0] if len(val) == 1 else torch.cat(list(val), dim=0)
+        return val
 
     @property
     def text_diff(self) -> str:
@@ -344,6 +381,15 @@ class GenerationResultBase:
         output.disaggregated_params = self.disaggregated_params
         output._last_token_ids_len = len(output.token_ids)
         output._last_logprobs_len = len(output.logprobs)
+        # With n > 1 each candidate is its own child request with its own
+        # counters, while the request-level copies on self are overwritten by
+        # every candidate's response. Capture this sequence's here so a choice
+        # never reports whichever candidate happened to respond last.
+        output._spec_dec_counters = _SpecDecCounters(
+            per_pos_drafted=getattr(response_tensors, 'per_pos_drafted', None),
+            per_pos_accepted=getattr(response_tensors, 'per_pos_accepted',
+                                     None),
+            spec_dec_totals=getattr(response_tensors, 'spec_dec_totals', None))
         decoder_output_prefix = ()
         if (self.sampling_params.exclude_input_from_output
                 or getattr(self, "_streaming", False)):
@@ -541,6 +587,10 @@ class GenerationResultBase:
 
         if isinstance(response, PostprocWorker.Output):
             self._done = response.is_final
+            self.decoding_iter = response.decoding_iter
+            self.avg_decoded_tokens_per_iter = (
+                response.avg_decoded_tokens_per_iter)
+            self.cached_tokens = response.cached_tokens
             if isinstance(response.res, CompletionOutput):
                 # in streaming mode
                 self._outputs[0] = response.res
@@ -616,18 +666,23 @@ class GenerationResultBase:
                 )
             if context_phase_params is not None:
                 existing_disagg_params = self.disaggregated_params
+                remote_tail_start = getattr(response_result,
+                                            "remote_tail_start", None)
                 # Use `replace` to preserve things like `mrope_position_ids_handle` and
                 # `mrope_position_deltas_handle`. However, explicitly set
                 # `multimodal_embedding_handles=None` since they should no longer be needed.
                 self._disaggregated_params = dataclasses.replace(
                     existing_disagg_params or DisaggregatedParams(),
                     request_type="context_only",
-                    first_gen_tokens=context_phase_params.first_gen_tokens,
+                    first_gen_tokens=[] if remote_tail_start is not None else
+                    context_phase_params.first_gen_tokens,
                     ctx_request_id=context_phase_params.req_id,
                     opaque_state=context_phase_params.opaque_state,
-                    draft_tokens=context_phase_params.draft_tokens,
+                    draft_tokens=[] if remote_tail_start is not None else
+                    context_phase_params.draft_tokens,
                     ctx_dp_rank=context_phase_params.ctx_dp_rank,
                     ctx_info_endpoint=context_phase_params.disagg_info_endpoint,
+                    remote_tail_start=remote_tail_start,
                     multimodal_embedding_handles=None,
                 )
 
@@ -647,7 +702,8 @@ class GenerationResultBase:
             # logprobs and generation logits so the generation_only side
             # can prepend them.
             if (context_phase_params is not None
-                    and self._disaggregated_params is not None):
+                    and self._disaggregated_params is not None
+                    and self._disaggregated_params.remote_tail_start is None):
                 first_gen_lp = getattr(response_result, "first_gen_log_probs",
                                        None)
                 if first_gen_lp is None:
@@ -1059,11 +1115,21 @@ class GenerationResult(GenerationResultBase):
         self._executor: Optional[weakref.ReferenceType[
             "GenerationExecutor"]] = weakref.ref(executor) if executor else None
 
-        # Pipelined multimodal hashes from request to result
-        mm_hashes = getattr(
-            getattr(getattr(generation_request, "multimodal_params", None),
-                    "multimodal_input", None), "multimodal_hashes", None)
-        self._multimodal_hashes = mm_hashes
+        mm_input = getattr(
+            getattr(generation_request, "multimodal_params", None),
+            "multimodal_input", None)
+        self._multimodal_hashes = getattr(mm_input, "multimodal_hashes", None)
+        mm_positions = getattr(mm_input, "multimodal_positions", None)
+        mm_lengths = getattr(mm_input, "multimodal_lengths", None)
+        if (self._disaggregated_params is not None
+                and self._disaggregated_params.request_type == "context_only"
+                and mm_positions is not None):
+            # Seed before postprocessing workers receive the request metadata.
+            self._disaggregated_params = dataclasses.replace(
+                self._disaggregated_params,
+                multimodal_positions=list(mm_positions),
+                multimodal_lengths=list(mm_lengths),
+            )
 
     @property
     def request_id(self) -> int:

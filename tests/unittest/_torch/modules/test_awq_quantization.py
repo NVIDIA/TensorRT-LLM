@@ -135,7 +135,8 @@ def test_fused_moe_trtllm_gen_input_scaling(has_scale):
         routing_method=routing_method,
         reduce_results=False,
         model_config=model_config,
-    ).cuda()
+    )
+    moe = moe.cuda()
 
     # Set fc31_act_scale directly (simulating AWQ pre_quant_scale)
     if has_scale:

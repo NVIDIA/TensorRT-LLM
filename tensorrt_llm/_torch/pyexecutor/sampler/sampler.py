@@ -30,7 +30,6 @@ from abc import ABC, abstractmethod
 from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import (
-    TYPE_CHECKING,
     Any,
     Callable,
     Dict,
@@ -56,12 +55,12 @@ from tensorrt_llm.sampling_params import SamplingParams
 
 from ...utils import torch_multi_arange
 from ..llm_request import LlmRequest, LlmRequestState, get_draft_token_length
-from ..resource_manager import ResourceManager, ResourceManagerType
+from ..resource_manager import ResourceManager
 from ..scheduler import ScheduledRequests
 from .beam_search import BeamHistoryBuilder, BeamSearchHandler, finalize_beam, prepare_beam_search
 from .finish_reasons import FinishReasonsHandler
 from .logprobs import LogProbsHandler, LogProbsState, LogProbsStateList, LogProbsStore
-from .ops.flashinfer import sample_from_logits_op
+from .ops.custom import fused_sample_from_logits
 from .penalties import PenaltyHandler, has_occurrence_penalty
 from .sampler_common import (
     DEFAULT_BEAM_IDX,
@@ -84,9 +83,11 @@ from .sampler_features import (
     apply_embedding_bias,
     check_stop_words_length,
     fast_greedy_sample_kernel,
+    meet_stop_token_criteria,
     scatter_new_tokens,
 )
 from .sampler_strategy import (
+    FUSED_STRATEGY_KEYS,
     GREEDY,
     BeamHistory,
     BeamSearchMetadata,
@@ -102,6 +103,7 @@ from .sampler_strategy import (
     TopPDecayMetadata,
     _CachingRequestGrouper,
     _request_strategy,
+    fused_row_params,
 )
 from .seed_manager import _SeedManager
 from .token_ban import OverlappedTokenBanHandler, SynchronousTokenBanHandler, TokenBanHandler
@@ -116,15 +118,6 @@ if sys.version_info[:2] >= (3, 12):
     from typing import override
 else:
     from typing_extensions import override
-
-if TYPE_CHECKING:
-    # Type-only: importing the speculative package at module level would
-    # re-create the import cycle sampler.sampler -> speculative ->
-    # (draft_target/mtp) -> pyexecutor.sampler that this package's lazy
-    # __init__ exists to avoid. The cycle only resolves when speculative is
-    # imported first; a process whose first touch is sampler.sampler (e.g. a
-    # test module, with the top-level package now lazy) would break.
-    from tensorrt_llm._torch.speculative.spec_tree_manager import SpecTreeManager
 
 T = TypeVar("T")
 
@@ -154,28 +147,14 @@ class SampleState(Generic[GenericSampleStateTensorsHost, GenericSampleStateTenso
 GenericSampleState = TypeVar("GenericSampleState", bound=SampleState)  # type: ignore
 
 
-def _fast_strategy_params(strategy: Strategy) -> tuple[float, int, float]:
-    """Flatten a fast-tier strategy into per-row ``(temperature, top_k, top_p)``.
-
-    Disabled filters use the neutral values ``sample_from_logits_op`` expects:
-    top_k 0 means "keep all" (not vocab_size, which can overflow the int32
-    buffer) and top_p 1.0 keeps the whole nucleus.
-    """
-    match strategy:
-        case ("temperature", temperature):
-            return cast(float, temperature), 0, 1.0
-        case ("top_k", top_k, temperature):
-            return cast(float, temperature), cast(int, top_k), 1.0
-        case ("top_p", top_p, temperature):
-            return cast(float, temperature), 0, cast(float, top_p)
-        case ("top_k_top_p", top_k, top_p, temperature):
-            return cast(float, temperature), cast(int, top_k), cast(float, top_p)
-        case ("greedy", None):
-            # Only padding dummies reach this: they carry no sampling params of
-            # their own, and the graph samples their rows only to discard them.
-            # Neutral filters keep them out of the way of the live rows.
-            return 1.0, 0, 1.0
-    raise AssertionError(f"strategy {strategy[0]!r} is not a fast-tier strategy")
+def _fast_strategy_params(strategy: Strategy) -> tuple[float, int, float, float]:
+    """Flatten a fast-tier strategy into per-row ``(temperature, top_k, top_p, min_p)``."""
+    if strategy == GREEDY:
+        # Only padding dummies reach this: they carry no sampling params of
+        # their own, and the graph samples their rows only to discard them.
+        # Neutral filters keep them out of the way of the live rows.
+        return 1.0, 0, 1.0, 0.0
+    return fused_row_params(strategy)
 
 
 class Sampler(ABC, Generic[GenericSampleState]):
@@ -309,6 +288,9 @@ class MultimodalResult:
 
     def __post_init__(self) -> None:
         num_embeddings = len(self.mm_embeddings)
+        metadata = (self.extra_data or {}).get("mm_embedding_metadata")
+        if metadata is not None and len(metadata) != num_embeddings:
+            raise ValueError("mm_embedding_metadata batch size does not match mm_embeddings")
         num_lengths = len(self.mm_embedding_lengths)
         if num_lengths != num_embeddings:
             raise ValueError(
@@ -366,9 +348,19 @@ class SampleStateWithMMResult(SampleState[SampleStateTensors, SampleStateTensors
 class EarlyStopWithMMResult(Sampler[SampleStateWithMMResult]):
     """
     Use for skipping decoding step for non generation model, and return the batch_output (such as mm_embeddings)
+
+    Args:
+        return_mm_results: Whether to attach the multimodal outputs to the
+            requests' results. Disable it on ranks whose responses never reach
+            the frontend: the results are exported as CUDA IPC handles, and
+            PyTorch keeps an exported allocation alive until a consumer opens
+            and releases its handle.
     """
 
     SampleState: TypeAlias = SampleStateWithMMResult
+
+    def __init__(self, return_mm_results: bool = True) -> None:
+        self.return_mm_results = return_mm_results
 
     @override
     def sample_async(
@@ -403,6 +395,9 @@ class EarlyStopWithMMResult(Sampler[SampleStateWithMMResult]):
             # NOTE: This is a hack: set finish reason manually and set the beam 0
             request.set_finished_reason(FinishReason.LENGTH, 0)
 
+        if not self.return_mm_results:
+            return
+
         request_indices = state.data.mm_embedding_request_indices
         for result_index, (request_index, mm_embedding) in enumerate(
             zip(request_indices, mm_embeddings, strict=True)
@@ -410,7 +405,13 @@ class EarlyStopWithMMResult(Sampler[SampleStateWithMMResult]):
             request = requests[request_index]
             mm_embedding_lengths = state.data.mm_embedding_lengths[result_index]
 
-            request.py_result.append_mm_embeddings(mm_embedding, mm_embedding_lengths)
+            embedding_metadata = extra_data.get("mm_embedding_metadata")
+            if embedding_metadata is None:
+                request.py_result.append_mm_embeddings(mm_embedding, mm_embedding_lengths)
+            else:
+                request.py_result.append_mm_embeddings(
+                    mm_embedding, mm_embedding_lengths, embedding_metadata[result_index]
+                )
 
             # Store mrope data if available
             if mrope_position_ids is not None and mrope_position_deltas is not None:
@@ -608,7 +609,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 "in requirements.txt."
             )
         self._grouped_sampler_cls = FlashInferGroupedStrategySampler
-        # Per-slot Top-P Decay runtime state (FlashInfer path). Allocated for all
+        # Per-slot Top-P Decay runtime state. Allocated for all
         # sampler instances; only decay-admitted slots are ever read.
         self._top_p_decay = TopPDecayHandler(self.max_num_sequences)
 
@@ -639,14 +640,14 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         self._fast_temperatures: torch.Tensor | None = None
         self._fast_top_ks: torch.Tensor | None = None
         self._fast_top_ps: torch.Tensor | None = None
+        self._fast_min_ps: torch.Tensor | None = None
         self._fast_seeds: torch.Tensor | None = None
         self._fast_offsets: torch.Tensor | None = None
         # Number of leading rows of the fast-tier buffers the staged batch fills.
         self._fast_num_rows: int = 0
 
-        # AutoDeploy build creates the sampler in inference mode,
-        # which would disallow in-place mutating of new_tokens.
-        # So, we temporarily exit inference mode.
+        # The sampler can be created in inference mode, which disallows
+        # in-place mutation of new_tokens. Temporarily exit inference mode.
         with torch.inference_mode(False):
             self.store = self._create_store()
             self._request_grouper: _CachingRequestGrouper[Any] = _CachingRequestGrouper(
@@ -692,7 +693,8 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
 
         # Force number of accepted tokens for speculative decoding testing.
         # Imported here (not at module level) to keep sampler.sampler off the
-        # speculative import cycle; see the TYPE_CHECKING note above.
+        # import cycle sampler.sampler -> speculative -> (draft_target/mtp) ->
+        # pyexecutor.sampler that this package's lazy __init__ exists to avoid.
         from ...speculative.interface import get_force_num_accepted_tokens
 
         self._force_num_accepted_tokens = get_force_num_accepted_tokens()
@@ -764,32 +766,18 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         assert self._generator.device == device
         return self._generator
 
-    def get_spec_tree_manager(
-        self, resource_manager: Optional[ResourceManager]
-    ) -> Optional["SpecTreeManager"]:
-        if resource_manager is None:
-            return None
-        spec_resource_manager = resource_manager.get_resource_manager(
-            ResourceManagerType.SPEC_RESOURCE_MANAGER
-        )
-        if spec_resource_manager is None or not hasattr(spec_resource_manager, "spec_tree_manager"):
-            return None
-        return spec_resource_manager.spec_tree_manager  # type: ignore
-
     @property
     def _use_beam_search(self) -> bool:
         return self.max_beam_width > 1
 
-    # Strategy tags the fast tier can sample, i.e. those expressible as
-    # per-row (temperature, top_k, top_p) for sample_from_logits_op. "greedy"
+    # Strategy tags the fast tier can sample: every one the fused kernel takes
+    # per row as (temperature, top_k, top_p, min_p). "greedy"
     # is absent on purpose: greedy batches stay on the eager path. Capturing
     # argmax saves about as much launch overhead as staging for it costs (on
     # Qwen2-0.5B the two cancelled out), the eager stable-greedy path already
     # handles them, and expressing greedy rows as top_k=1 would drag them onto
     # the seeded sampling path for no gain.
-    _FAST_STRATEGY_TAGS: Final[frozenset[str]] = frozenset(
-        {"temperature", "top_k", "top_p", "top_k_top_p"}
-    )
+    _FAST_STRATEGY_TAGS: Final[frozenset[str]] = FUSED_STRATEGY_KEYS
 
     @staticmethod
     def _request_rewrites_logits(request: LlmRequest) -> bool:
@@ -799,7 +787,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         in-graph, so a request using one cannot be sampled there at all.
         """
         return (
-            request._py_embedding_bias_1d is not None
+            request.py_embedding_bias is not None
             or bool(getattr(request, "py_bad_words", None))
             or bool(getattr(request, "py_no_repeat_ngram_size", None))
             or has_occurrence_penalty(request)
@@ -822,10 +810,10 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         return bool(request.py_min_length) or check_stop_words_length(request)
 
     def _can_use_fast_path(self, requests: list[LlmRequest]) -> bool:
-        """Whether every request is plain temperature / top_k / top_p sampling.
+        """Whether every request is plain temperature / top_k / top_p / min_p sampling.
 
         Rejects anything the fast-tier kernel cannot express per row: beam search
-        and min_p (different strategy tags), top-p decay (its top_p is per-step
+        (a different strategy tag), top-p decay (its top_p is per-step
         state, not a fixed per-row value), and the feature handlers that rewrite
         logits or need extra outputs -- penalties, token bans, embedding bias,
         logprobs and speculation, none of which the fast path runs.
@@ -865,7 +853,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         state staged for its target.
         """
         return (
-            request.guided_decoding_params is not None
+            request.py_guided_decoding_params is not None
             or bool(getattr(request, "py_logits_post_processors", None))
             or bool(getattr(request, "py_is_draft", False))
         )
@@ -1008,8 +996,8 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
 
         Never reallocated for a batch that already fits, since a captured graph
         holds these addresses. Initial values are neutral (temperature 1,
-        top_k 0 = keep all, top_p 1), so rows past the staged batch filter
-        nothing even if a replay reads them.
+        top_k 0 = keep all, top_p 1, min_p 0), so rows past the staged batch
+        filter nothing even if a replay reads them.
         """
         if self._fast_temperatures is not None and (self._fast_temperatures.numel() >= num_rows):
             return
@@ -1018,6 +1006,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         self._fast_temperatures = torch.ones(capacity, dtype=torch.float32, device=device)
         self._fast_top_ks = torch.zeros(capacity, dtype=torch.int32, device=device)
         self._fast_top_ps = torch.ones(capacity, dtype=torch.float32, device=device)
+        self._fast_min_ps = torch.zeros(capacity, dtype=torch.float32, device=device)
         self._fast_seeds = torch.zeros(capacity, dtype=torch.int64, device=device)
         self._fast_offsets = torch.zeros(capacity, dtype=torch.int64, device=device)
 
@@ -1042,12 +1031,14 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         temperatures_buf = self._fast_temperatures
         top_ks_buf = self._fast_top_ks
         top_ps_buf = self._fast_top_ps
+        min_ps_buf = self._fast_min_ps
         seeds_buf = self._fast_seeds
         offsets_buf = self._fast_offsets
         assert (
             temperatures_buf is not None
             and top_ks_buf is not None
             and top_ps_buf is not None
+            and min_ps_buf is not None
             and seeds_buf is not None
             and offsets_buf is not None
         ), "_ensure_fast_buffers must have allocated every fast-tier buffer"
@@ -1055,18 +1046,20 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         # The real vocab size is only known from the logits at sample time, so
         # resolve with the same 2**31 probe the greedy check uses: it only makes
         # resolve_sampling_strategy keep a top_k it would otherwise drop as
-        # redundant, and sample_from_logits_op sanitizes top_k against the
-        # actual vocab size anyway.
+        # redundant, and the fused kernel treats a top_k at or above the actual
+        # vocab size as disabled anyway.
         vocab_size = 2**31
         temperatures: list[float] = []
         top_ks: list[int] = []
         top_ps: list[float] = []
+        min_ps: list[float] = []
         for request, num_request_rows in zip(requests, rows_per_request, strict=True):
             strategy = _request_strategy(request, vocab_size=vocab_size)
-            temperature, top_k, top_p = _fast_strategy_params(strategy)
+            temperature, top_k, top_p, min_p = _fast_strategy_params(strategy)
             temperatures.extend([temperature] * num_request_rows)
             top_ks.extend([top_k] * num_request_rows)
             top_ps.extend([top_p] * num_request_rows)
+            min_ps.extend([min_p] * num_request_rows)
 
         pin = prefer_pinned()
         temperatures_buf[:num_rows].copy_(
@@ -1078,6 +1071,9 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         top_ps_buf[:num_rows].copy_(
             torch.tensor(top_ps, dtype=torch.float32, pin_memory=pin), non_blocking=True
         )
+        min_ps_buf[:num_rows].copy_(
+            torch.tensor(min_ps, dtype=torch.float32, pin_memory=pin), non_blocking=True
+        )
 
         # Philox (seed, offset) per row, from the sampler's own seed manager so
         # a request's stream stays tied to how far it has decoded.
@@ -1085,18 +1081,15 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         # _SeedManager is indexed by sequence slot and has no entry for the
         # scratch row, so ask it only about the live rows. The padded rows keep
         # whatever the buffers already hold; their tokens are discarded.
-        live_slots_per_row = slots_per_row[:live_rows]
-        row_seeds = self._seed_manager.make_row_seeds(live_slots_per_row, device=seeds_buf.device)
-        seeds_buf[:live_rows].copy_(row_seeds.seed, non_blocking=True)
-        offsets_buf[:live_rows].copy_(row_seeds.offset, non_blocking=True)
         # Only the live rows consume RNG stream. Padding rows borrow a slot that
         # may belong to an active request this batch simply did not schedule;
         # advancing it would move that request's Philox offset by an amount that
         # depends on concurrent load, breaking the guarantee _SeedManager exists
         # for -- that a seeded request's stream depends only on its own draws.
-        # The padded rows still read the borrowed slot's current offset, since
-        # their tokens are discarded.
-        self._seed_manager.advance(live_slots_per_row)
+        live_slots_per_row = slots_per_row[:live_rows]
+        row_seeds = self._seed_manager.take_row_seeds(live_slots_per_row, device=seeds_buf.device)
+        seeds_buf[:live_rows].copy_(row_seeds.seed, non_blocking=True)
+        offsets_buf[:live_rows].copy_(row_seeds.offset, non_blocking=True)
 
         self._fast_num_rows = num_rows
 
@@ -1153,30 +1146,34 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
     ) -> None:
         """Sample the fast tier from the staged per-row params.
 
-        Uses the same op as the one-model speculation path, built for exactly
-        this: per-row temperature / top_k / top_p with explicit Philox
-        (seed, offset) and no host synchronization, so it is capture-safe.
+        Uses the fused kernel the one-model speculation path uses: per-row
+        temperature / top_k / top_p with explicit Philox (seed, offset) and no
+        host synchronization, so it is capture-safe. The row index is kept out
+        of the RNG so a row's draws depend only on its own (seed, offset).
         """
         temperatures_buf = self._fast_temperatures
         top_ks_buf = self._fast_top_ks
         top_ps_buf = self._fast_top_ps
+        min_ps_buf = self._fast_min_ps
         seeds_buf = self._fast_seeds
         offsets_buf = self._fast_offsets
         assert (
             temperatures_buf is not None
             and top_ks_buf is not None
             and top_ps_buf is not None
+            and min_ps_buf is not None
             and seeds_buf is not None
             and offsets_buf is not None
         ), "fast-tier sampling params were not staged; call stage_fast_sampling_params"
         # Rows staged for this batch, padding included; the buffers are wider.
         num_rows = dest_indices.shape[0]
         logits_cuda = logits_cuda[:num_rows]
-        next_tokens = sample_from_logits_op(
+        next_tokens = fused_sample_from_logits(
             logits_cuda,
             temperatures_buf[:num_rows],
             top_ks_buf[:num_rows],
             top_ps_buf[:num_rows],
+            min_ps_buf[:num_rows],
             seed=seeds_buf[:num_rows],
             offset=offsets_buf[:num_rows],
         )
@@ -1533,15 +1530,11 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
 
         finalized_token_updates: list[tuple[int, list[int]]] = []
         # Fast-path (batched pybind): when the batch is greedy with no beam
-        # search, no logprobs, no draft tokens, no stop-words, and no
-        # speculative tree, collapse per-request pybind chatter into one
-        # batched add_new_tokens_to_requests call. Single-pass eligibility
-        # check with early-break; falls through when any invariant breaks.
-        if (
-            self._batch_fastpath_eligible
-            and logprobs_state_list is None
-            and self.get_spec_tree_manager(resource_manager) is None
-        ):
+        # search, no logprobs, no draft tokens and no stop-words, collapse
+        # per-request pybind chatter into one batched
+        # add_new_tokens_to_requests call. Single-pass eligibility check with
+        # early-break; falls through when any invariant breaks.
+        if self._batch_fastpath_eligible and logprobs_state_list is None:
             alive_reqs: list[LlmRequest] = []
             tokens_flat: list[int] = []
             fastpath_ok = True
@@ -1654,7 +1647,6 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                     new_tokens_tensor=new_tokens,
                     new_tokens_list=new_tokens_list,
                     finish_reasons=finish_reasons,
-                    resource_manager=resource_manager,
                 )
                 if (actual_draft_len := get_draft_token_length(req)) > 0:
                     req.py_num_accepted_draft_tokens = num_accepted
@@ -1739,7 +1731,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 or request.max_beam_num_tokens >= self.max_seq_len
             ):
                 request.finish_by(FinishReason.LENGTH, DEFAULT_BEAM_IDX)
-            elif request.py_stop_words_list and new_token in request.py_stop_words_list[0]:
+            elif meet_stop_token_criteria(request, new_token, DEFAULT_BEAM_IDX):
                 request.finish_by(FinishReason.STOP_WORDS, DEFAULT_BEAM_IDX)
             request.py_num_accepted_draft_tokens = 0
             request.py_rewind_len = 0
@@ -1995,10 +1987,9 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 for _ in range(steps)
             ]
 
-            # Per-request seeds only when some live request actually asked for
-            # one; otherwise the shared generator keeps the previous behavior.
+            # Every row of a fused-kernel group gets its own Philox (seed, offset).
             group_seeds: Optional[RequestSeeds] = None
-            if self._seed_manager.any_seeded:
+            if strategy_key in FUSED_STRATEGY_KEYS:
                 group_slots_per_step = [
                     slot
                     for slot, steps in zip(
@@ -2006,10 +1997,9 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                     )
                     for _ in range(steps)
                 ]
-                group_seeds = self._seed_manager.make_row_seeds(
+                group_seeds = self._seed_manager.take_row_seeds(
                     group_slots_per_step, device=cuda_device
                 )
-                self._seed_manager.advance(group_slots_per_step)
 
             group_next_tokens_cuda, group_softmax_cuda, group_temperature_cuda = (
                 self._grouped_sampler_cls.sample_grouped_strategies(

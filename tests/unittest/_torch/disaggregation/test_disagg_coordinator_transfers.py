@@ -14,6 +14,7 @@ from unittest.mock import Mock
 import pytest
 from coordinator_harness import CoordinatorHarness as _Harness
 from coordinator_harness import TransferRequest as _Request
+from fake_dist import FakeDistGroup
 
 from tensorrt_llm._torch.disaggregation.orchestration import coordinator as coordinator_module
 from tensorrt_llm.bindings import LlmRequestState
@@ -505,6 +506,244 @@ def test_generation_error_consensus_fails_only_when_some_rank_needs_it(inflight_
     assert h.effects.failed == [
         ("Error in kv cache transfer for generation requests", [error_req], False)
     ]
+
+
+# -- settling cancellations and hangs ----------------------------------------
+#
+# The cases above stop where the coordinator asks for something (a cancel, a
+# retry) or keeps waiting. These follow each scenario through to its end: the
+# transceiver finally reports, the executor cleans up, and nothing is
+# released, failed or cancelled a second time.
+
+_GEN_ERROR = "Error in kv cache transfer for generation requests"
+_CTX_ERROR = "Error in kv cache transfer for context requests"
+
+
+def _keep_session_on_cancel(h: _Harness, *, refuse_first: int = 0) -> list:
+    """Model in-flight cancellation: ``cancel_request`` is accepted after
+    ``refuse_first`` refusals, but the session stays owned by the transceiver
+    until a later status poll reports it. Tests script that report with
+    ``cancel_recv_remotely`` / ``finish_send``. Returns the attempt log."""
+    attempts = []
+
+    def cancel(request):
+        attempts.append(request.py_request_id)
+        return len(attempts) > refuse_first
+
+    h.transceiver.cancel_request = cancel
+    return attempts
+
+
+def _executor_cleans_up(h: _Harness, req: _Request) -> None:
+    """What the executor's error path does after ``fail_requests``: the request
+    leaves active_requests and the coordinator drops its bookkeeping."""
+    h.active.remove(req)
+    h.coordinator.forget_request(req.py_request_id)
+
+
+def test_refused_cancellation_is_settled_once_after_the_retry_is_accepted(
+    inflight_cancel, clock
+) -> None:
+    """A refusal leaves the receive owned and untouched; the accepted retry is
+    not repeated; the request fails exactly once when the transceiver reports
+    the cancelled session, and nothing happens to it after that."""
+    h = _Harness(kv_transfer_timeout_ms=1000, supports_inflight_cancellation=True)
+    req = _receiving(h, 1, started_at=clock["t"])
+    clock["t"] += 2.0
+    attempts = _keep_session_on_cancel(h, refuse_first=1)
+
+    h.coordinator.poll_gen_transfers()  # refused
+    assert attempts == [1]
+    assert req.state == LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
+    assert not h.transceiver.check_gen_transfer_complete()
+    assert h.effects.history == []
+
+    h.coordinator.poll_gen_transfers()  # accepted; the session is still owned
+    h.coordinator.poll_gen_transfers()  # nothing left to ask for
+    assert attempts == [1, 1]
+    assert not h.transceiver.check_gen_transfer_complete()
+    assert h.effects.history == []
+
+    h.transceiver.cancel_recv_remotely(req)
+    h.coordinator.poll_gen_transfers()
+    assert req.state == LlmRequestState.DISAGG_TRANS_ERROR
+    assert h.transceiver.check_gen_transfer_complete()
+    assert h.effects.failed == [(_GEN_ERROR, [req], False)]
+
+    _executor_cleans_up(h, req)
+    h.coordinator.poll_gen_transfers()
+    assert attempts == [1, 1]
+    assert h.effects.history == [("fail", _GEN_ERROR)]
+
+
+@pytest.mark.parametrize("outcome", ["error", "complete"])
+def test_timed_out_send_is_settled_once_when_the_transceiver_finally_reports(
+    inflight_cancel, clock, outcome
+) -> None:
+    """After the in-flight cancel the send stays owned until the transceiver
+    reports. A late failure releases the blocks once and fails the request
+    once; a completion that beat the cancel releases once and terminates
+    normally, with no error."""
+    h = _Harness(kv_transfer_timeout_ms=1000, supports_inflight_cancellation=True)
+    req = _Request(1)
+    h.active.append(req)
+    h.send(req)
+    clock["t"] += 2.0
+    h.coordinator.check_transfer_timeouts()
+    attempts = _keep_session_on_cancel(h)
+    h.coordinator.reap_context_sends(0)  # cancels once, ownership kept
+    assert attempts == [1]
+    assert h.in_transfer(req)
+    h.kv_cache_manager.unpin_blocks_by_id.assert_not_called()
+
+    h.transceiver.finish_send(req, outcome=outcome)
+    h.coordinator.reap_context_sends(0)
+
+    assert not h.in_transfer(req)
+    h.kv_cache_manager.unpin_blocks_by_id.assert_called_once_with(1)
+    assert attempts == [1]
+    if outcome == "error":
+        assert req.state == LlmRequestState.DISAGG_TRANS_ERROR
+        assert h.effects.history == [("fail", _CTX_ERROR)]
+        assert h.effects.failed == [(_CTX_ERROR, [req], False)]
+        _executor_cleans_up(h, req)
+    else:
+        assert req.state == LlmRequestState.DISAGG_CONTEXT_COMPLETE
+        assert h.effects.history == [("terminate", req)]
+        assert h.active == []
+
+    h.coordinator.reap_context_sends(0)
+    assert attempts == [1]
+    assert len(h.effects.history) == 1
+
+
+def test_mirrored_timeout_cancels_and_fails_each_replica_once_across_ranks(
+    inflight_cancel, clock
+) -> None:
+    """Under TP the peer's timeout is mirrored: both ranks cancel their replica
+    once, keep polling in lockstep while the transceiver still owns it, fail
+    it once when the cancelled session is reported, and stay quiet once the
+    executor cleaned up. Both ranks enter the same collectives throughout."""
+    group = FakeDistGroup(world_size=2, tp_size=2)
+    ranks = [
+        _Harness(
+            kv_transfer_timeout_ms=1000, supports_inflight_cancellation=True, dist=group.rank(rank)
+        )
+        for rank in range(2)
+    ]
+    expired = _receiving(ranks[0], 1, started_at=clock["t"])
+    fresh = _receiving(ranks[1], 1, started_at=clock["t"] + 1.5)
+    attempts = [_keep_session_on_cancel(h) for h in ranks]
+    clock["t"] += 2.0
+
+    def poll(rank):
+        ranks[rank].coordinator.poll_gen_transfers()
+
+    group.run(poll)  # rank 0 expired; rank 1 mirrors the decision
+    group.run(poll)  # nothing to repeat
+    assert attempts == [[1], [1]]
+    assert expired.py_kv_transfer_timed_out and fresh.py_kv_transfer_timed_out
+    assert [h.effects.history for h in ranks] == [[], []]
+
+    for h, req in zip(ranks, (expired, fresh)):
+        h.transceiver.cancel_recv_remotely(req)
+    group.run(poll)
+    assert [h.effects.failed for h in ranks] == [
+        [(_GEN_ERROR, [expired], False)],
+        [(_GEN_ERROR, [fresh], False)],
+    ]
+
+    for h, req in zip(ranks, (expired, fresh)):
+        _executor_cleans_up(h, req)
+    group.run(poll)
+    assert attempts == [[1], [1]]
+    assert [len(h.effects.history) for h in ranks] == [1, 1]
+    collectives = [[name for name, _ in h.dist.calls] for h in ranks]
+    assert collectives[0] == collectives[1]
+    assert collectives[0].count("tp_allgather") == 1  # the id union, once
+
+
+@pytest.mark.parametrize("direction", ["context_send", "generation_receive"])
+def test_a_hanging_transfer_keeps_its_resources_until_the_transceiver_settles(
+    direction,
+) -> None:
+    """A transfer that reports nothing for many polls is left exactly as it
+    is: still owned, blocks still pinned, no error, no termination. Holding on
+    is the correct outcome of a hang, not releasing. Once the transceiver
+    settles it, the request is released exactly once."""
+    h = _Harness()
+    if direction == "context_send":
+        req = _Request(1)
+        h.active.append(req)
+        h.send(req)
+        pending_state = LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
+
+        def poll():
+            h.coordinator.reap_context_sends(0)
+
+        def settle():
+            h.transceiver.finish_send(req)
+    else:
+        req = _receiving(h, 1, started_at=None)
+        pending_state = LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
+        poll = h.coordinator.poll_gen_transfers
+
+        def settle():
+            h.transceiver.finish_recv(req)
+
+    for _ in range(3):
+        poll()
+
+    assert req.state == pending_state
+    assert h.active == [req]
+    assert h.effects.history == []
+    h.kv_cache_manager.unpin_blocks_by_id.assert_not_called()
+    assert "cancel_request:1" not in h.transceiver.call_log
+    if direction == "context_send":
+        assert h.in_transfer(req)
+    else:
+        assert not h.transceiver.check_gen_transfer_complete()
+
+    settle()
+    poll()
+
+    if direction == "context_send":
+        assert not h.in_transfer(req)
+        h.kv_cache_manager.unpin_blocks_by_id.assert_called_once_with(1)
+        assert h.effects.history == [("terminate", req)]
+        assert h.active == []
+    else:
+        assert req.state == LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
+        assert h.transceiver.check_gen_transfer_complete()
+        assert h.effects.history == []
+
+
+def test_consecutive_sends_release_every_pinned_block_exactly_once() -> None:
+    """Context requests hold their blocks only while a send is in flight. With
+    several sends settling out of order across polls, one of them failing,
+    every block is unpinned exactly once and nothing stays in transfer, so the
+    capacity a context worker lent to transfers comes back in full."""
+    h = _Harness()
+    first, second, third, fourth = requests = [_Request(rid) for rid in (1, 2, 3, 4)]
+    h.active.extend(requests)
+    h.send(*requests)
+    assert sorted(h.transfers.requests_in_transfer()) == [1, 2, 3, 4]
+
+    h.transceiver.finish_send(third)
+    h.coordinator.reap_context_sends(0)
+    h.transceiver.finish_send(first, outcome="error")
+    h.transceiver.finish_send(fourth)
+    h.coordinator.reap_context_sends(0)
+    _executor_cleans_up(h, first)
+    h.transceiver.finish_send(second)
+    h.coordinator.reap_context_sends(0)
+
+    assert h.transfers.requests_in_transfer() == {}
+    unpinned = sorted(call.args[0] for call in h.kv_cache_manager.unpin_blocks_by_id.call_args_list)
+    assert unpinned == [1, 2, 3, 4]
+    assert h.effects.terminated == [third, fourth, second]
+    assert h.effects.failed == [(_CTX_ERROR, [first], False)]
+    assert h.active == []
 
 
 # -- pacing ------------------------------------------------------------------

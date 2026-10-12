@@ -254,7 +254,7 @@ def test_watchdog_coordinator_reuses_committed_mask_when_generation_is_unchanged
     combine_mask = coordinator.active_rank_mask_for_combine(dispatch_snapshot, None)
 
     assert combine_mask is dispatch_snapshot.active_rank_mask
-    assert combine_mask.tolist() == [0b1111, 0]
+    assert combine_mask.tolist() == [0b1111, 0, 0, 0]
 
 
 def test_watchdog_coordinator_fails_closed_on_committed_generation_change() -> None:
@@ -280,7 +280,7 @@ def test_watchdog_coordinator_fails_closed_on_committed_generation_change() -> N
         coordinator.active_rank_mask_for_combine(dispatch_snapshot, None)
 
 
-def test_watchdog_coordinator_converts_atomic_snapshot_to_two_mask_words() -> None:
+def test_watchdog_coordinator_converts_atomic_snapshot_to_mask_words() -> None:
     health = EPGroupHealth(72)
     health.mark_failed(70)
     coordinator = AlltoAllWatchdogCoordinator(
@@ -296,7 +296,7 @@ def test_watchdog_coordinator_converts_atomic_snapshot_to_two_mask_words() -> No
 
     assert dispatch_snapshot.committed_generation == 1
     assert dispatch_snapshot.active_rank_mask is not None
-    assert dispatch_snapshot.active_rank_mask.tolist() == [(1 << 64) - 1, 0xBF]
+    assert dispatch_snapshot.active_rank_mask.tolist() == [(1 << 64) - 1, 0xBF, 0, 0]
 
 
 def test_watchdog_coordinator_explicit_mask_is_not_bound_to_health_generation() -> None:
@@ -309,7 +309,7 @@ def test_watchdog_coordinator_explicit_mask_is_not_bound_to_health_generation() 
         ep_rank=0,
         health=health,
     )
-    explicit_mask = torch.tensor([0b1101, 0], dtype=torch.uint64)
+    explicit_mask = torch.tensor([0b1101, 0, 0, 0], dtype=torch.uint64)
     dispatch_snapshot = coordinator.capture_active_rank_mask(explicit_mask)
     assert dispatch_snapshot.committed_generation is None
 

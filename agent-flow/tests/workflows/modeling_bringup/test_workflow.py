@@ -818,6 +818,7 @@ def _print_baseline_context_table(
         print(f"skipped: {'; '.join(unavailable)}")
 
 
+@pytest.mark.live_backend
 @pytest.mark.parametrize(
     "include_slurm_environment",
     [False, True],

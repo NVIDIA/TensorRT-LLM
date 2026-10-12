@@ -31,7 +31,7 @@ HF_ID_TO_LLM_MODELS_SUBDIR = {
     "meta-llama/Llama-3.1-8B": "llama-3.1-model/Meta-Llama-3.1-8B",
     "nvidia/Llama-3.1-8B-Instruct-FP8": "Llama-3.1-8B-Instruct-FP8",
     "nvidia/Llama-3.1-8B-Instruct-NVFP4": "Llama-3.1-8B-Instruct-NVFP4",
-    "TinyLlama/TinyLlama-1.1B-Chat-v1.0": "llama-models-v2/TinyLlama-1.1B-Chat-v1.0",
+    "Qwen/Qwen3-0.6B": "Qwen3/Qwen3-0.6B",
     "mistralai/Mistral-Small-3.1-24B-Instruct-2503": "Mistral-Small-3.1-24B-Instruct-2503",
     "Qwen/Qwen3-30B-A3B": "Qwen3/Qwen3-30B-A3B",
     "deepseek-ai/DeepSeek-V3": "DeepSeek-V3",
@@ -52,7 +52,6 @@ HF_ID_TO_LLM_MODELS_SUBDIR = {
     "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16": "NVIDIA-Nemotron-3-Super-120B-A12B-BF16",
     "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-FP8": "NVIDIA-Nemotron-3-Super-120B-A12B-FP8",
     "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4": "NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4",
-    # AutoDeploy accuracy tests - overlapping with model registry
     "google/gemma-3n-E2B-it": "gemma/gemma-3n-E2B-it",
     "google/gemma-4-E2B-it": "gemma/gemma-4-E2B-it",
     "nvidia/Qwen3.5-397B-A17B-NVFP4": "Qwen3.5-397B-A17B-NVFP4",

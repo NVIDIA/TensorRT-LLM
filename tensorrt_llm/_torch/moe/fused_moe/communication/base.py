@@ -123,6 +123,28 @@ class Communication(ABC):
         """
         return True
 
+    def supports_finalize_before_combine(self) -> bool:
+        """Whether ``combine`` is an unweighted row sum over a dense per-token tensor.
+
+        A model-owned finalize that runs before the combine
+        (``ConfigurableMoE.unfinalized_combine_fn``) is only correct when the
+        combine itself reduces the already-finalized partials without applying
+        the routing weights again. A strategy whose combine consumes a
+        different row layout or applies the weights itself answers ``False``,
+        and the incompatibility is rejected at construction.
+        """
+        return True
+
+    def uses_internal_dispatch_quantization(self) -> bool:
+        """Return whether dispatch itself quantizes BF16 activations.
+
+        Strategies returning ``True`` receive unquantized activations and
+        return the quantized payload plus its scales. The external-comm
+        scheduler must therefore not invoke ``backend.quantize_input`` on
+        either side of dispatch.
+        """
+        return False
+
     def prepare_dispatch(
         self,
         token_selected_slots: torch.Tensor,  # [local_num_tokens, top_k]

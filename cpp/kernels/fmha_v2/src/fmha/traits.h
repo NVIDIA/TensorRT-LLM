@@ -34,37 +34,31 @@ struct Traits_tile_size;
 template <int STEP, int S, int D, int DV, int K_PER_MMA>
 struct Traits_tile_size</* GRANULAR = */ false, STEP, S, D, DV, K_PER_MMA>
 {
-    enum
-    {
-        CTA_P_TILE_M = STEP,
-        CTA_P_TILE_N = S,
-        CTA_P_TILE_K = D,
-        CTA_O_TILE_M = CTA_P_TILE_M,
-        CTA_O_TILE_N = DV,
-        CTA_O_TILE_K = S
-    };
+    static constexpr int CTA_P_TILE_M = STEP;
+    static constexpr int CTA_P_TILE_N = S;
+    static constexpr int CTA_P_TILE_K = D;
+    static constexpr int CTA_O_TILE_M = CTA_P_TILE_M;
+    static constexpr int CTA_O_TILE_N = DV;
+    static constexpr int CTA_O_TILE_K = S;
 };
 
 template <int STEP, int S, int D, int DV, int K_PER_MMA>
 struct Traits_tile_size</* GRANULAR = */ true, STEP, S, D, DV, K_PER_MMA>
 {
-    enum
-    {
-        CTA_P_TILE_M = STEP,
-        CTA_P_TILE_N = S,
-        // D =16: CTA_P_TILE_K=16
-        // D =32: CTA_P_TILE_K=32
-        // D>=64: CTA_P_TILE_K=64
-        CTA_P_TILE_K = D < 32 ? 16 : (D < 64 ? 32 : 64),
-        CTA_O_TILE_M = CTA_P_TILE_M,
-        // D =512: CTA_TILE_N=256
-        // D<=256: CTA_TILE_N=D
-        CTA_O_TILE_N = DV > 256 ? 256 : DV,
-        // D =512: CTA_O_TILE_K=16
-        // D =256: CTA_O_TILE_K=32
-        // D<=128: CTA_O_TILE_K=64
-        CTA_O_TILE_K = std::max(K_PER_MMA, DV > 256 ? 16 : (DV > 128 ? 32 : 64))
-    };
+    static constexpr int CTA_P_TILE_M = STEP;
+    static constexpr int CTA_P_TILE_N = S;
+    // D =16: CTA_P_TILE_K=16
+    // D =32: CTA_P_TILE_K=32
+    // D>=64: CTA_P_TILE_K=64
+    static constexpr int CTA_P_TILE_K = D < 32 ? 16 : (D < 64 ? 32 : 64);
+    static constexpr int CTA_O_TILE_M = CTA_P_TILE_M;
+    // D =512: CTA_TILE_N=256
+    // D<=256: CTA_TILE_N=D
+    static constexpr int CTA_O_TILE_N = DV > 256 ? 256 : DV;
+    // D =512: CTA_O_TILE_K=16
+    // D =256: CTA_O_TILE_K=32
+    // D<=128: CTA_O_TILE_K=64
+    static constexpr int CTA_O_TILE_K = std::max(K_PER_MMA, DV > 256 ? 16 : (DV > 128 ? 32 : 64));
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -91,40 +85,25 @@ template <
 struct Cta_tile_
 {
 
-    enum
-    {
-        M = M_,
-        N = N_,
-        K = K_,
-        VALID_N = VALID_N_,
-        VALID_K = VALID_K_
-    };
+    static constexpr int M = M_;
+    static constexpr int N = N_;
+    static constexpr int K = K_;
+    static constexpr int VALID_N = VALID_N_;
+    static constexpr int VALID_K = VALID_K_;
 
     // The number of warps.
-    enum
-    {
-        WARPS_M = WARPS_M_,
-        WARPS_N = WARPS_N_,
-        WARPS_K = WARPS_K_
-    };
+    static constexpr int WARPS_M = WARPS_M_;
+    static constexpr int WARPS_N = WARPS_N_;
+    static constexpr int WARPS_K = WARPS_K_;
 
     // The number of warps per CTA.
-    enum
-    {
-        WARPS_PER_CTA = WARPS_M * WARPS_N * WARPS_K
-    };
+    static constexpr int WARPS_PER_CTA = WARPS_M * WARPS_N * WARPS_K;
 
     // The number of threads per warp.
-    enum
-    {
-        THREADS_PER_WARP = Gpu_arch::THREADS_PER_WARP
-    };
+    static constexpr int THREADS_PER_WARP = Gpu_arch::THREADS_PER_WARP;
 
     // The number of threads per CTA.
-    enum
-    {
-        THREADS_PER_CTA = WARPS_PER_CTA * THREADS_PER_WARP
-    };
+    static constexpr int THREADS_PER_CTA = WARPS_PER_CTA * THREADS_PER_WARP;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -163,10 +142,7 @@ struct Traits
     using Cta_tile_extd = Cta_tile_<Gpu_arch, M, N, K, VALID_N, VALID_K, WARPS_M, WARPS_N, WARPS_K>;
 
     // The number of bits per element of A.
-    enum
-    {
-        BITS_PER_ELEMENT_A = sizeof(A_type) * 8
-    };
+    static constexpr int BITS_PER_ELEMENT_A = sizeof(A_type) * 8;
 
     // An offset in bytes for A.
     static inline __host__ __device__ int64_t offset_in_bytes_a(int64_t offset)
@@ -175,10 +151,7 @@ struct Traits
     }
 
     // The number of bits per element of B.
-    enum
-    {
-        BITS_PER_ELEMENT_B = sizeof(B_type) * 8
-    };
+    static constexpr int BITS_PER_ELEMENT_B = sizeof(B_type) * 8;
 
     // An offset in bytes for B.
     static inline __host__ __device__ int64_t offset_in_bytes_b(int64_t offset)
@@ -187,10 +160,7 @@ struct Traits
     }
 
     // The number of bits per element of C.
-    enum
-    {
-        BITS_PER_ELEMENT_C = sizeof(C_type) * 8
-    };
+    static constexpr int BITS_PER_ELEMENT_C = sizeof(C_type) * 8;
 
     // An offset in bytes for C.
     static inline __host__ __device__ int64_t offset_in_bytes_c(int64_t offset)
@@ -205,34 +175,19 @@ struct Gpu_arch_base
 {
 
     // By default, architectures have 32 threads per warp.
-    enum
-    {
-        THREADS_PER_WARP = 32
-    };
+    static constexpr int THREADS_PER_WARP = 32;
 
     // By default, architectures do not support LDGSTS.
-    enum
-    {
-        HAS_LDGSTS = 0
-    };
+    static constexpr int HAS_LDGSTS = 0;
 
     // By default, architecture do not support super HMMA
-    enum
-    {
-        HAS_SUPER_HMMA = 0
-    };
+    static constexpr int HAS_SUPER_HMMA = 0;
 
     // By default, architecture do not support TMA
-    enum
-    {
-        HAS_TMA = 0
-    };
+    static constexpr int HAS_TMA = 0;
 
     // By default, architecture do not support GMMA
-    enum
-    {
-        HAS_GMMA = 0
-    };
+    static constexpr int HAS_GMMA = 0;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -255,51 +210,33 @@ struct Volta_mma_tile
 {
 
     // The number of elements computed with a single warp-MMA.
-    enum
-    {
-        M_PER_MMA = 16,
-        N_PER_MMA = N_PER_MMA_,
-        K_PER_MMA = K_PER_MMA_
-    };
+    static constexpr int M_PER_MMA = 16;
+    static constexpr int N_PER_MMA = N_PER_MMA_;
+    static constexpr int K_PER_MMA = K_PER_MMA_;
 
     // The number of elements computed with a single CTA-MMA.
-    enum
-    {
-        M_PER_MMA_PER_CTA = M_PER_MMA * Cta_tile::WARPS_M,
-        N_PER_MMA_PER_CTA = N_PER_MMA * Cta_tile::WARPS_N,
-        K_PER_MMA_PER_CTA = K_PER_MMA * Cta_tile::WARPS_K
-    };
+    static constexpr int M_PER_MMA_PER_CTA = M_PER_MMA * Cta_tile::WARPS_M;
+    static constexpr int N_PER_MMA_PER_CTA = N_PER_MMA * Cta_tile::WARPS_N;
+    static constexpr int K_PER_MMA_PER_CTA = K_PER_MMA * Cta_tile::WARPS_K;
 
     // The number of MMAs needed to compute the GEMM.
-    enum
-    {
-        MMAS_M = (Cta_tile::M + M_PER_MMA_PER_CTA - 1) / M_PER_MMA_PER_CTA,
-        MMAS_N = (Cta_tile::N + N_PER_MMA_PER_CTA - 1) / N_PER_MMA_PER_CTA,
-        MMAS_K = (Cta_tile::K + K_PER_MMA_PER_CTA - 1) / K_PER_MMA_PER_CTA
-    };
+    static constexpr int MMAS_M = (Cta_tile::M + M_PER_MMA_PER_CTA - 1) / M_PER_MMA_PER_CTA;
+    static constexpr int MMAS_N = (Cta_tile::N + N_PER_MMA_PER_CTA - 1) / N_PER_MMA_PER_CTA;
+    static constexpr int MMAS_K = (Cta_tile::K + K_PER_MMA_PER_CTA - 1) / K_PER_MMA_PER_CTA;
 
     // The number of valid MMAs (for Head Size)
-    enum
-    {
-        // tile o
-        VALID_MMAS_N = Div_up<Cta_tile::VALID_N, N_PER_MMA_PER_CTA>::VALUE,
-        // tile p
-        VALID_MMAS_K = Div_up<Cta_tile::VALID_K, K_PER_MMA_PER_CTA>::VALUE,
-    };
+    // tile o
+    static constexpr int VALID_MMAS_N = Div_up<Cta_tile::VALID_N, N_PER_MMA_PER_CTA>::VALUE;
+    // tile p
+    static constexpr int VALID_MMAS_K = Div_up<Cta_tile::VALID_K, K_PER_MMA_PER_CTA>::VALUE;
 
     // The number of elements computed per warp.
-    enum
-    {
-        M_PER_WARP = MMAS_M * M_PER_MMA,
-        N_PER_WARP = MMAS_N * N_PER_MMA,
-        K_PER_WARP = MMAS_K * K_PER_MMA,
-    };
+    static constexpr int M_PER_WARP = MMAS_M * M_PER_MMA;
+    static constexpr int N_PER_WARP = MMAS_N * N_PER_MMA;
+    static constexpr int K_PER_WARP = MMAS_K * K_PER_MMA;
 
     // Do we enable the fast path for LDS.
-    enum
-    {
-        ENABLE_LDS_FAST_PATH = 0
-    };
+    static constexpr int ENABLE_LDS_FAST_PATH = 0;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -308,10 +245,7 @@ struct Volta_hmma_fp16_traits : public Traits<Volta, uint16_t, uint16_t, uint16_
 {
 
     // The K_PER_MMA for Volta_hmma_fp16_traits is 8.
-    enum
-    {
-        K_PER_MMA = 8
-    };
+    static constexpr int K_PER_MMA = 8;
 
     // The MMA tile.
     template <typename Cta_tile>
@@ -324,10 +258,7 @@ struct Volta_hmma_fp16_16x16x16_traits : public Traits<Volta, uint16_t, uint16_t
 {
 
     // The K_PER_MMA for Volta_hmma_fp16_16x16x16_traits is 16.
-    enum
-    {
-        K_PER_MMA = 16
-    };
+    static constexpr int K_PER_MMA = 16;
 
     // The MMA tile.
     template <typename Cta_tile>
@@ -340,10 +271,7 @@ struct Volta_imma_int8_int32_traits : public Traits<Volta, int8_t, int8_t, int8_
 {
 
     // The K_PER_MMA for Volta_imma_int8_int32_traits is 16.
-    enum
-    {
-        K_PER_MMA = 16
-    };
+    static constexpr int K_PER_MMA = 16;
 
     // The MMA tile.
     template <typename Cta_tile>
@@ -363,52 +291,34 @@ struct Turing_mma_tile
 {
 
     // The number of elements computed with a single warp-MMA.
-    enum
-    {
-        M_PER_MMA = 16,
-        N_PER_MMA = 16,
-        K_PER_MMA = K_PER_MMA_
-    };
+    static constexpr int M_PER_MMA = 16;
+    static constexpr int N_PER_MMA = 16;
+    static constexpr int K_PER_MMA = K_PER_MMA_;
 
     // The number of elements computed with a single CTA-MMA.
-    enum
-    {
-        M_PER_MMA_PER_CTA = M_PER_MMA * Cta_tile::WARPS_M,
-        N_PER_MMA_PER_CTA = N_PER_MMA * Cta_tile::WARPS_N,
-        K_PER_MMA_PER_CTA = K_PER_MMA * Cta_tile::WARPS_K
-    };
+    static constexpr int M_PER_MMA_PER_CTA = M_PER_MMA * Cta_tile::WARPS_M;
+    static constexpr int N_PER_MMA_PER_CTA = N_PER_MMA * Cta_tile::WARPS_N;
+    static constexpr int K_PER_MMA_PER_CTA = K_PER_MMA * Cta_tile::WARPS_K;
 
     // The number of MMAs needed to compute the GEMM.
-    enum
-    {
-        MMAS_M = Div_up<Cta_tile::M, M_PER_MMA_PER_CTA>::VALUE,
-        MMAS_N = Div_up<Cta_tile::N, N_PER_MMA_PER_CTA>::VALUE,
-        MMAS_K = Div_up<Cta_tile::K, K_PER_MMA_PER_CTA>::VALUE,
-    };
+    static constexpr int MMAS_M = Div_up<Cta_tile::M, M_PER_MMA_PER_CTA>::VALUE;
+    static constexpr int MMAS_N = Div_up<Cta_tile::N, N_PER_MMA_PER_CTA>::VALUE;
+    static constexpr int MMAS_K = Div_up<Cta_tile::K, K_PER_MMA_PER_CTA>::VALUE;
 
     // The number of valid MMAs (for Head Size)
-    enum
-    {
-        // tile o
-        VALID_MMAS_N = Div_up<Cta_tile::VALID_N, N_PER_MMA_PER_CTA>::VALUE,
-        // tile p
-        VALID_MMAS_K = Div_up<Cta_tile::VALID_K, K_PER_MMA_PER_CTA>::VALUE,
-    };
+    // tile o
+    static constexpr int VALID_MMAS_N = Div_up<Cta_tile::VALID_N, N_PER_MMA_PER_CTA>::VALUE;
+    // tile p
+    static constexpr int VALID_MMAS_K = Div_up<Cta_tile::VALID_K, K_PER_MMA_PER_CTA>::VALUE;
 
     // The number of elements computed per warp.
-    enum
-    {
-        M_PER_WARP = MMAS_M * M_PER_MMA,
-        N_PER_WARP = MMAS_N * N_PER_MMA,
-        K_PER_WARP = MMAS_K * K_PER_MMA,
-    };
+    static constexpr int M_PER_WARP = MMAS_M * M_PER_MMA;
+    static constexpr int N_PER_WARP = MMAS_N * N_PER_MMA;
+    static constexpr int K_PER_WARP = MMAS_K * K_PER_MMA;
 
     // The distribution of threads in the output tile.
-    enum
-    {
-        THREADS_PER_MMA_M = 8,
-        THREADS_PER_MMA_N = 4,
-    };
+    static constexpr int THREADS_PER_MMA_M = 8;
+    static constexpr int THREADS_PER_MMA_N = 4;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -424,10 +334,7 @@ struct Turing_hmma_fp16_traits : public Traits<Turing, uint16_t, uint16_t, uint1
 {
 
     // The K_PER_MMA for Turing_hmma_fp16_traits is 8.
-    enum
-    {
-        K_PER_MMA = 8
-    };
+    static constexpr int K_PER_MMA = 8;
 
     // The MMA tile.
     template <typename Cta_tile>
@@ -440,10 +347,7 @@ struct Turing_hmma_fp32_traits : public Traits<Turing, uint16_t, uint16_t, uint1
 {
 
     // The K_PER_MMA for Turing_hmma_fp32_traits is 8.
-    enum
-    {
-        K_PER_MMA = 8
-    };
+    static constexpr int K_PER_MMA = 8;
 
     // The MMA tile.
     template <typename Cta_tile>
@@ -463,10 +367,7 @@ struct Turing_imma_int8_int32_traits : public Traits<Turing, int8_t, int8_t, int
 {
 
     // The K_PER_MMA for Turing_imma_int8_int32_traits is 16.
-    enum
-    {
-        K_PER_MMA = 16
-    };
+    static constexpr int K_PER_MMA = 16;
 
     // The MMA tile.
     template <typename Cta_tile>
@@ -478,10 +379,7 @@ struct Turing_imma_int8_int32_traits : public Traits<Turing, int8_t, int8_t, int
 struct Ampere : public Gpu_arch_base
 {
     // It has LDGSTS.
-    enum
-    {
-        HAS_LDGSTS = 1
-    };
+    static constexpr int HAS_LDGSTS = 1;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -497,10 +395,7 @@ struct Ampere_hmma_fp16_traits : public Traits<Ampere, uint16_t, uint16_t, uint1
 {
 
     // The K_PER_MMA for Ampere_hmma_fp16_traits is 16.
-    enum
-    {
-        K_PER_MMA = 16
-    };
+    static constexpr int K_PER_MMA = 16;
 
     // The MMA tile.
     template <typename Cta_tile>
@@ -513,10 +408,7 @@ struct Ampere_hmma_fp32_traits : public Traits<Ampere, uint16_t, uint16_t, uint1
 {
 
     // The K_PER_MMA for Ampere_hmma_fp32_traits is 16.
-    enum
-    {
-        K_PER_MMA = 16
-    };
+    static constexpr int K_PER_MMA = 16;
 
     // The MMA tile.
     template <typename Cta_tile>
@@ -530,10 +422,7 @@ struct Ampere_hmma_bf16_bf16_traits : public Traits<Ampere, bf16_t, bf16_t, bf16
 {
 
     // The K_PER_MMA for Ampere_hmma_bf16_bf16_traits is 16.
-    enum
-    {
-        K_PER_MMA = 16
-    };
+    static constexpr int K_PER_MMA = 16;
 
     // The MMA tile.
     template <typename Cta_tile>
@@ -546,10 +435,7 @@ struct Ampere_hmma_bf16_traits : public Traits<Ampere, bf16_t, bf16_t, bf16_t, f
 {
 
     // The K_PER_MMA for Ampere_hmma_bf16_traits is 16.
-    enum
-    {
-        K_PER_MMA = 16
-    };
+    static constexpr int K_PER_MMA = 16;
 
     // The MMA tile.
     template <typename Cta_tile>
@@ -569,10 +455,7 @@ struct Ampere_imma_int8_int32_traits : public Traits<Ampere, int8_t, int8_t, int
 {
 
     // The K_PER_MMA for Ampere_imma_int8_int32_traits is 32.
-    enum
-    {
-        K_PER_MMA = 32
-    };
+    static constexpr int K_PER_MMA = 32;
 
     // The MMA tile.
     template <typename Cta_tile>
@@ -584,10 +467,7 @@ struct Ampere_imma_int8_int32_traits : public Traits<Ampere, int8_t, int8_t, int
 struct Ada : public Gpu_arch_base
 {
     // It has LDGSTS.
-    enum
-    {
-        HAS_LDGSTS = 1
-    };
+    static constexpr int HAS_LDGSTS = 1;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -620,10 +500,7 @@ struct Ada_qmma_e4m3_fp16_traits : public Traits<Ada, e4m3_t, e4m3_t, e4m3_t, ui
 {
 
     // The K_PER_MMA for Ada_qmma_e4m3_fp16_traits is 32.
-    enum
-    {
-        K_PER_MMA = 32
-    };
+    static constexpr int K_PER_MMA = 32;
 
     // The MMA tile.
     template <typename Cta_tile>
@@ -636,10 +513,7 @@ struct Ada_qmma_e4m3_fp32_traits : public Traits<Ada, e4m3_t, e4m3_t, e4m3_t, fl
 {
 
     // The K_PER_MMA for Ada_qmma_e4m3_fp32_traits is 32.
-    enum
-    {
-        K_PER_MMA = 32
-    };
+    static constexpr int K_PER_MMA = 32;
 
     // The MMA tile.
     template <typename Cta_tile>
@@ -654,28 +528,16 @@ struct Ada_qmma_e4m3_fp32_traits : public Traits<Ada, e4m3_t, e4m3_t, e4m3_t, fl
 struct Hopper : public Gpu_arch_base
 {
     // It has LDGSTS.
-    enum
-    {
-        HAS_LDGSTS = 1
-    };
+    static constexpr int HAS_LDGSTS = 1;
 
     // It has TMA.
-    enum
-    {
-        HAS_TMA = 1
-    };
+    static constexpr int HAS_TMA = 1;
 
     // It has GMMA
-    enum
-    {
-        HAS_GMMA = 1
-    };
+    static constexpr int HAS_GMMA = 1;
 
     // for Hopper there are 4 warps per warpgroup.
-    enum
-    {
-        WARPS_PER_WARP_GROUP = 4
-    };
+    static constexpr int WARPS_PER_WARP_GROUP = 4;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -687,20 +549,11 @@ struct Hopper_cga_tile
 {
 
     // The size of the CGA in terms of CTA
-    enum
-    {
-        CLUSTER_HEIGHT = HEIGHT_
-    };
+    static constexpr int CLUSTER_HEIGHT = HEIGHT_;
 
-    enum
-    {
-        CLUSTER_WIDTH = WIDTH_
-    };
+    static constexpr int CLUSTER_WIDTH = WIDTH_;
 
-    enum
-    {
-        CLUSTER_DEPTH = DEPTH_
-    };
+    static constexpr int CLUSTER_DEPTH = DEPTH_;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -720,83 +573,47 @@ struct Hopper_cta_tile
 
     // The size of the CTA tile.
     // TODO: support D (not power of 2)
-    enum
-    {
-        M = M_,
-        N = N_,
-        K = K_,
-        VALID_N = VALID_N_,
-        VALID_K = VALID_K_
-    };
+    static constexpr int M = M_;
+    static constexpr int N = N_;
+    static constexpr int K = K_;
+    static constexpr int VALID_N = VALID_N_;
+    static constexpr int VALID_K = VALID_K_;
 
     // The number of warp groups.
-    enum
-    {
-        WARP_GROUP_M = WARP_GROUP_M_,
-        WARP_GROUP_N = WARP_GROUP_N_,
-        WARP_GROUP_K = WARP_GROUP_K_
-    };
+    static constexpr int WARP_GROUP_M = WARP_GROUP_M_;
+    static constexpr int WARP_GROUP_N = WARP_GROUP_N_;
+    static constexpr int WARP_GROUP_K = WARP_GROUP_K_;
 
     // The number of warps in a warp group.
-    enum
-    {
-        WARPS_M_PER_GROUP = 4,
-        WARPS_N_PER_GROUP = 1,
-        WARPS_K_PER_GROUP = 1,
-    };
+    static constexpr int WARPS_M_PER_GROUP = 4;
+    static constexpr int WARPS_N_PER_GROUP = 1;
+    static constexpr int WARPS_K_PER_GROUP = 1;
 
     // The number of warps in a cta.
-    enum
-    {
-        WARPS_M = WARPS_M_PER_GROUP * WARP_GROUP_M_,
-        WARPS_N = WARPS_N_PER_GROUP * WARP_GROUP_N_,
-        WARPS_K = WARPS_K_PER_GROUP * WARP_GROUP_K_
-    };
+    static constexpr int WARPS_M = WARPS_M_PER_GROUP * WARP_GROUP_M_;
+    static constexpr int WARPS_N = WARPS_N_PER_GROUP * WARP_GROUP_N_;
+    static constexpr int WARPS_K = WARPS_K_PER_GROUP * WARP_GROUP_K_;
 
     // The number of warps per CTA.
-    enum
-    {
-        WARPS_PER_CTA = WARP_GROUP_M * WARP_GROUP_N * WARP_GROUP_K * Gpu_arch::WARPS_PER_WARP_GROUP
-    };
+    static constexpr int WARPS_PER_CTA = WARP_GROUP_M * WARP_GROUP_N * WARP_GROUP_K * Gpu_arch::WARPS_PER_WARP_GROUP;
 
     // The number of warps per warpgroup.
-    enum
-    {
-        WARPS_PER_WARP_GROUP = Gpu_arch::WARPS_PER_WARP_GROUP
-    };
+    static constexpr int WARPS_PER_WARP_GROUP = Gpu_arch::WARPS_PER_WARP_GROUP;
 
     // The number of threads per warp.
-    enum
-    {
-        THREADS_PER_WARP = Gpu_arch::THREADS_PER_WARP
-    };
+    static constexpr int THREADS_PER_WARP = Gpu_arch::THREADS_PER_WARP;
 
     // the number of threads per warpgroup.
-    enum
-    {
-        THREADS_PER_WARP_GROUP = THREADS_PER_WARP * WARPS_PER_WARP_GROUP
-    };
+    static constexpr int THREADS_PER_WARP_GROUP = THREADS_PER_WARP * WARPS_PER_WARP_GROUP;
 
     // The number of threads per CTA.
-    enum
-    {
-        THREADS_PER_CTA = WARPS_PER_CTA * THREADS_PER_WARP
-    };
+    static constexpr int THREADS_PER_CTA = WARPS_PER_CTA * THREADS_PER_WARP;
 
-    enum
-    {
-        GROUPS_M = 1
-    };
+    static constexpr int GROUPS_M = 1;
 
-    enum
-    {
-        GROUPS_N = 1
-    };
+    static constexpr int GROUPS_N = 1;
 
-    enum
-    {
-        GROUPS_K = 1
-    };
+    static constexpr int GROUPS_K = 1;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -806,85 +623,55 @@ struct Hopper_gmma_tile
 {
 
     // The number of elements computed with a single warp group mma.
-    enum
-    {
-        M_PER_MMA = GMMA_M,
-        N_PER_MMA = GMMA_N,
-        K_PER_MMA = GMMA_K
-    };
+    static constexpr int M_PER_MMA = GMMA_M;
+    static constexpr int N_PER_MMA = GMMA_N;
+    static constexpr int K_PER_MMA = GMMA_K;
 
     // The number of warp groups.
-    enum
-    {
-        NUM_WARP_GROUPS = Cta_tile::WARP_GROUP_M * Cta_tile::WARP_GROUP_N * Cta_tile::WARP_GROUP_K
-    };
+    static constexpr int NUM_WARP_GROUPS = Cta_tile::WARP_GROUP_M * Cta_tile::WARP_GROUP_N * Cta_tile::WARP_GROUP_K;
 
     // The number of elements computed with a single CTA-MMA.
-    enum
-    {
-        M_PER_MMA_PER_CTA = M_PER_MMA * Cta_tile::WARP_GROUP_M,
-        N_PER_MMA_PER_CTA = N_PER_MMA * Cta_tile::WARP_GROUP_N,
-        K_PER_MMA_PER_CTA = K_PER_MMA * Cta_tile::WARP_GROUP_K
-    };
+    static constexpr int M_PER_MMA_PER_CTA = M_PER_MMA * Cta_tile::WARP_GROUP_M;
+    static constexpr int N_PER_MMA_PER_CTA = N_PER_MMA * Cta_tile::WARP_GROUP_N;
+    static constexpr int K_PER_MMA_PER_CTA = K_PER_MMA * Cta_tile::WARP_GROUP_K;
 
     // The number of MMAs needed to compute the GEMM.
-    enum
-    {
-        MMAS_M = (Cta_tile::M + M_PER_MMA_PER_CTA - 1) / M_PER_MMA_PER_CTA,
-        MMAS_N = (Cta_tile::N + N_PER_MMA_PER_CTA - 1) / N_PER_MMA_PER_CTA,
-        MMAS_K = (Cta_tile::K + K_PER_MMA_PER_CTA - 1) / K_PER_MMA_PER_CTA,
-    };
+    static constexpr int MMAS_M = (Cta_tile::M + M_PER_MMA_PER_CTA - 1) / M_PER_MMA_PER_CTA;
+    static constexpr int MMAS_N = (Cta_tile::N + N_PER_MMA_PER_CTA - 1) / N_PER_MMA_PER_CTA;
+    static constexpr int MMAS_K = (Cta_tile::K + K_PER_MMA_PER_CTA - 1) / K_PER_MMA_PER_CTA;
 
     // The number of valid MMAs (for Head Size)
-    enum
-    {
-        // tile o
-        VALID_MMAS_N = Div_up<Cta_tile::VALID_N, N_PER_MMA_PER_CTA>::VALUE,
-        // tile p
-        VALID_MMAS_K = Div_up<Cta_tile::VALID_K, K_PER_MMA_PER_CTA>::VALUE,
-    };
+    // tile o
+    static constexpr int VALID_MMAS_N = Div_up<Cta_tile::VALID_N, N_PER_MMA_PER_CTA>::VALUE;
+    // tile p
+    static constexpr int VALID_MMAS_K = Div_up<Cta_tile::VALID_K, K_PER_MMA_PER_CTA>::VALUE;
 
     // The number of elements computed per warp group.
-    enum
-    {
-        M_PER_WARP_GROUP = MMAS_M * M_PER_MMA,
-        N_PER_WARP_GROUP = MMAS_N * N_PER_MMA,
-        K_PER_WARP_GROUP = MMAS_K * K_PER_MMA,
-    };
+    static constexpr int M_PER_WARP_GROUP = MMAS_M * M_PER_MMA;
+    static constexpr int N_PER_WARP_GROUP = MMAS_N * N_PER_MMA;
+    static constexpr int K_PER_WARP_GROUP = MMAS_K * K_PER_MMA;
 
     // the size of GMMA group, which is GMMA_M x GMMA_N x Kblock.
-    enum
-    {
-        M_PER_GMMA_GROUP = GMMA_M,
-        N_PER_GMMA_GROUP = GMMA_N,
-        K_PER_GMMA_GROUP = Cta_tile::K,
-    };
+    static constexpr int M_PER_GMMA_GROUP = GMMA_M;
+    static constexpr int N_PER_GMMA_GROUP = GMMA_N;
+    static constexpr int K_PER_GMMA_GROUP = Cta_tile::K;
 
     // The distribution of threads in the output tile.
     // TODO
-    enum
-    {
-        THREADS_PER_MMA_M = 8,
-        THREADS_PER_MMA_N = 4,
-    };
+    static constexpr int THREADS_PER_MMA_M = 8;
+    static constexpr int THREADS_PER_MMA_N = 4;
 
     // The number of core matrices per GMMA.
-    enum
-    {
-        CORES_M_PER_GROUP = 8 * Cta_tile::WARPS_M_PER_GROUP,
-        CORES_N_PER_GROUP = 8 * Cta_tile::WARPS_N_PER_GROUP,
-        CORES_M = GMMA_M / CORES_M_PER_GROUP,
-        CORES_N = GMMA_N / CORES_N_PER_GROUP,
-    };
+    static constexpr int CORES_M_PER_GROUP = 8 * Cta_tile::WARPS_M_PER_GROUP;
+    static constexpr int CORES_N_PER_GROUP = 8 * Cta_tile::WARPS_N_PER_GROUP;
+    static constexpr int CORES_M = GMMA_M / CORES_M_PER_GROUP;
+    static constexpr int CORES_N = GMMA_N / CORES_N_PER_GROUP;
 
     // The number of logical rows/cols per thread.
-    enum
-    {
-        // A thread owns 1 row per core matrix.
-        ROWS_PER_THREAD = CORES_M,
-        // A thread owns 2 col per core matrix.
-        COLS_PER_THREAD = CORES_N * 2,
-    };
+    // A thread owns 1 row per core matrix.
+    static constexpr int ROWS_PER_THREAD = CORES_M;
+    // A thread owns 2 col per core matrix.
+    static constexpr int COLS_PER_THREAD = CORES_N * 2;
 
     static_assert(ROWS_PER_THREAD == 2);
     static_assert(COLS_PER_THREAD == GMMA_N / 4);
@@ -915,12 +702,9 @@ template <int GMMA_M_, // GMMA instruction shape in M dim
 struct Hopper_hgmma_fp16_traits : public Traits<Hopper, uint16_t, uint16_t, uint16_t, uint16_t, uint16_t>
 {
     // The GMMA shape.
-    enum
-    {
-        GMMA_M = GMMA_M_,
-        GMMA_N = GMMA_N_,
-        GMMA_K = 16
-    };
+    static constexpr int GMMA_M = GMMA_M_;
+    static constexpr int GMMA_N = GMMA_N_;
+    static constexpr int GMMA_K = 16;
 
     // is A operand in RF for GMMA?
     static constexpr bool GMMA_A_RF = GMMA_A_RF_;
@@ -968,12 +752,9 @@ template <int GMMA_M_, // GMMA instruction shape in M dim
 struct Hopper_hgmma_fp32_traits : public Traits<Hopper, uint16_t, uint16_t, uint16_t, float, uint16_t>
 {
     // The GMMA shape.
-    enum
-    {
-        GMMA_M = GMMA_M_,
-        GMMA_N = GMMA_N_,
-        GMMA_K = 16
-    };
+    static constexpr int GMMA_M = GMMA_M_;
+    static constexpr int GMMA_N = GMMA_N_;
+    static constexpr int GMMA_K = 16;
 
     // is A operand in RF for GMMA?
     static constexpr bool GMMA_A_RF = GMMA_A_RF_;
@@ -1021,12 +802,9 @@ template <int GMMA_M_, // GMMA instruction shape in M dim
 struct Hopper_hgmma_bf16_traits : public Traits<Hopper, bf16_t, bf16_t, bf16_t, float, bf16_t>
 {
     // The GMMA shape.
-    enum
-    {
-        GMMA_M = GMMA_M_,
-        GMMA_N = GMMA_N_,
-        GMMA_K = 16
-    };
+    static constexpr int GMMA_M = GMMA_M_;
+    static constexpr int GMMA_N = GMMA_N_;
+    static constexpr int GMMA_K = 16;
 
     // is A operand in RF for GMMA?
     static constexpr bool GMMA_A_RF = GMMA_A_RF_;
@@ -1079,20 +857,11 @@ struct Hopper_igmma_int8_int32_traits : public Traits<Hopper, int8_t, int8_t, in
     using Base = Traits<Hopper, int8_t, int8_t, int8_t, int32_t, float>;
 
     // The GMMA shape
-    enum
-    {
-        GMMA_M = GMMA_M_
-    };
+    static constexpr int GMMA_M = GMMA_M_;
 
-    enum
-    {
-        GMMA_N = GMMA_N_
-    };
+    static constexpr int GMMA_N = GMMA_N_;
 
-    enum
-    {
-        GMMA_K = 32
-    };
+    static constexpr int GMMA_K = 32;
 
     // is A operand in RF for GMMA?
     static constexpr bool GMMA_A_RF = GMMA_A_RF_;
@@ -1146,20 +915,11 @@ struct Hopper_qgmma_fp8_fp32_traits : public Traits<Hopper, Input_type_A_, Input
     using Output_type = Output_type_;
 
     // The GMMA shape
-    enum
-    {
-        GMMA_M = GMMA_M_
-    };
+    static constexpr int GMMA_M = GMMA_M_;
 
-    enum
-    {
-        GMMA_N = GMMA_N_
-    };
+    static constexpr int GMMA_N = GMMA_N_;
 
-    enum
-    {
-        GMMA_K = 32
-    };
+    static constexpr int GMMA_K = 32;
 
     // is A operand in RF for GMMA?
     static constexpr bool GMMA_A_RF = GMMA_A_RF_;

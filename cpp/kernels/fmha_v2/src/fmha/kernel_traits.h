@@ -159,92 +159,44 @@ struct Kernel_traits_
     using Traits_e = typename Traits_o_adapter<Traits_p, BMM2_FP16_EPILOGUE>::Traits;
 
     // The padded D dimension
-    enum
-    {
-        VALID_D = VALID_D_
-    };
+    static constexpr int VALID_D = VALID_D_;
 
-    enum
-    {
-        D = Next_power_of_two<VALID_D>::VALUE
-    };
+    static constexpr int D = Next_power_of_two<VALID_D>::VALUE;
 
-    enum
-    {
-        VALID_DV = VALID_DV_ > 0 ? VALID_DV_ : VALID_D
-    };
+    static constexpr int VALID_DV = VALID_DV_ > 0 ? VALID_DV_ : VALID_D;
 
-    enum
-    {
-        DV = Next_power_of_two<VALID_DV>::VALUE
-    };
+    static constexpr int DV = Next_power_of_two<VALID_DV>::VALUE;
 
-    enum
-    {
-        SAGE_ATTENTION = SAGE_BLOCK_SIZE_Q_ > 0 || SAGE_BLOCK_SIZE_K_ > 0 || SAGE_BLOCK_SIZE_V_ > 0
-    };
+    static constexpr int SAGE_ATTENTION = SAGE_BLOCK_SIZE_Q_ > 0 || SAGE_BLOCK_SIZE_K_ > 0 || SAGE_BLOCK_SIZE_V_ > 0;
 
-    enum
-    {
-        SAGE_BLOCK_SIZE_Q = SAGE_BLOCK_SIZE_Q_
-    };
+    static constexpr int SAGE_BLOCK_SIZE_Q = SAGE_BLOCK_SIZE_Q_;
 
-    enum
-    {
-        SAGE_BLOCK_SIZE_K = SAGE_BLOCK_SIZE_K_
-    };
+    static constexpr int SAGE_BLOCK_SIZE_K = SAGE_BLOCK_SIZE_K_;
 
-    enum
-    {
-        SAGE_BLOCK_SIZE_V = SAGE_BLOCK_SIZE_V_
-    };
+    static constexpr int SAGE_BLOCK_SIZE_V = SAGE_BLOCK_SIZE_V_;
 
     // Are we enabling skip softmax attention feature?
     static constexpr bool ENABLE_SKIP_SOFTMAX = ENABLE_SKIP_SOFTMAX_;
 
     // TODO: expose these tiling params to the interface
-    enum
-    {
-        USE_GRANULAR_TILING = (FLAGS & 0x1000) != 0u
-    }; // TODO ANT: check FLAGS
+    static constexpr int USE_GRANULAR_TILING = (FLAGS & 0x1000) != 0u; // TODO ANT: check FLAGS
 
     using Traits_tile_size = Traits_tile_size<(bool) USE_GRANULAR_TILING, STEP, S, D, DV, Traits_o::K_PER_MMA>;
 
-    enum
-    {
-        CTA_P_TILE_M = Traits_tile_size::CTA_P_TILE_M
-    };
+    static constexpr int CTA_P_TILE_M = Traits_tile_size::CTA_P_TILE_M;
 
-    enum
-    {
-        CTA_P_TILE_N = Traits_tile_size::CTA_P_TILE_N
-    };
+    static constexpr int CTA_P_TILE_N = Traits_tile_size::CTA_P_TILE_N;
 
-    enum
-    {
-        CTA_P_TILE_K = Traits_tile_size::CTA_P_TILE_K
-    };
+    static constexpr int CTA_P_TILE_K = Traits_tile_size::CTA_P_TILE_K;
 
-    enum
-    {
-        CTA_O_TILE_M = Traits_tile_size::CTA_O_TILE_M
-    };
+    static constexpr int CTA_O_TILE_M = Traits_tile_size::CTA_O_TILE_M;
 
-    enum
-    {
-        CTA_O_TILE_N = Traits_tile_size::CTA_O_TILE_N
-    };
+    static constexpr int CTA_O_TILE_N = Traits_tile_size::CTA_O_TILE_N;
 
-    enum
-    {
-        CTA_O_TILE_K = Traits_tile_size::CTA_O_TILE_K
-    };
+    static constexpr int CTA_O_TILE_K = Traits_tile_size::CTA_O_TILE_K;
 
     // Do we need to reload Q due to splitting the D ?
-    enum
-    {
-        RELOAD_Q = static_cast<int>(CTA_P_TILE_K) != static_cast<int>(D)
-    };
+    static constexpr int RELOAD_Q = static_cast<int>(CTA_P_TILE_K) != static_cast<int>(D);
 
     // The CTA description for the 1st GEMM.
     using Cta_tile_p = typename Traits_p::template Cta_tile_extd<CTA_P_TILE_M, CTA_P_TILE_N, CTA_P_TILE_K, S, VALID_D,
@@ -261,152 +213,81 @@ struct Kernel_traits_
     // Compute the total BMM2_MMAS_K (might not the same as Mma_tile_o::MMAS_K if the granular tiling is used).
     static_assert(S % CTA_O_TILE_K == 0, "");
 
-    enum
-    {
-        TOTAL_BMM2_MMAS_K = Mma_tile_o::MMAS_K * (S / CTA_O_TILE_K)
-    };
+    static constexpr int TOTAL_BMM2_MMAS_K = Mma_tile_o::MMAS_K * (S / CTA_O_TILE_K);
 
     // Constraints on the K dimension.
     static_assert(Mma_tile_p::K_PER_MMA <= static_cast<int>(D));
     static_assert(Mma_tile_o::K_PER_MMA <= S);
 
     // The version.
-    enum
-    {
-        VERSION = VERSION_
-    };
+    static constexpr int VERSION = VERSION_;
 
     // The mask version: padding (2), causal (3), sliding_window_causal (4), bidirectional_sliding_window (5),
     // custom_mask (6).
-    enum
-    {
-        MASK_VERSION = MASK_VERSION_
-    };
+    static constexpr int MASK_VERSION = MASK_VERSION_;
 
     // Whether use causal mask or not.
-    enum
-    {
-        CAUSAL_MASK = MASK_VERSION_ == 3 || MASK_VERSION_ == 4
-    };
+    static constexpr int CAUSAL_MASK = MASK_VERSION_ == 3 || MASK_VERSION_ == 4;
 
     // Whether use the sliding window attention or not.
-    enum
-    {
-        SLIDING_WINDOW_ATTENTION = MASK_VERSION_ == 4
-    };
+    static constexpr int SLIDING_WINDOW_ATTENTION = MASK_VERSION_ == 4;
 
     // Whether use the bidirectional sliding window attention or not.
-    enum
-    {
-        BIDIRECTIONAL_SLIDING_WINDOW_ATTENTION = MASK_VERSION_ == 5
-    };
+    static constexpr int BIDIRECTIONAL_SLIDING_WINDOW_ATTENTION = MASK_VERSION_ == 5;
 
     // Whether use the custom mask or not.
-    enum
-    {
-        CUSTOM_MASK = MASK_VERSION_ == 6
-    };
+    static constexpr int CUSTOM_MASK = MASK_VERSION_ == 6;
 
     // Do we use LDGSTS for Q, K or V.
-    enum
-    {
-        USE_LDGSTS_Q = (FLAGS & 0x1u) != 0u
-    };
+    static constexpr int USE_LDGSTS_Q = (FLAGS & 0x1u) != 0u;
 
-    enum
-    {
-        USE_LDGSTS_K = (FLAGS & 0x2u) != 0u
-    };
+    static constexpr int USE_LDGSTS_K = (FLAGS & 0x2u) != 0u;
 
-    enum
-    {
-        USE_LDGSTS_V = (FLAGS & 0x4u) != 0u
-    };
+    static constexpr int USE_LDGSTS_V = (FLAGS & 0x4u) != 0u;
 
     // Do we use one buffer for K and V.
-    enum
-    {
-        SHARE_SMEM_FOR_K_AND_V = (FLAGS & 0x8u) != 0u
-    };
+    static constexpr int SHARE_SMEM_FOR_K_AND_V = (FLAGS & 0x8u) != 0u;
 
     // Do we use the scale max trick.
-    enum
-    {
-        USE_SCALE_MAX = (FLAGS & 0x10u) != 0u
-    };
+    static constexpr int USE_SCALE_MAX = (FLAGS & 0x10u) != 0u;
 
     // Are heads in QKV interleaved, i.e. total x h x 3 x d or total x 3 x h x d.
-    enum
-    {
-        HEADS_INTERLEAVED = (FLAGS & 0x20u) == 0u
-    };
+    static constexpr int HEADS_INTERLEAVED = (FLAGS & 0x20u) == 0u;
 
     // Keep full K matrix in registers.
-    enum
-    {
-        K_IN_REGS = (FLAGS & 0x40) == 0u
-    };
+    static constexpr int K_IN_REGS = (FLAGS & 0x40) == 0u;
 
     // Do we use only 2 fragments or full fragments for frag_q/k (only used by flash attention)
-    enum
-    {
-        LIMIT_QK_FRAGMENTS = ((FLAGS & 0x80u) != 0u && !SHARE_SMEM_FOR_K_AND_V)
-    };
+    static constexpr int LIMIT_QK_FRAGMENTS = ((FLAGS & 0x80u) != 0u && !SHARE_SMEM_FOR_K_AND_V);
 
     // Do we use only 2 fragments or full fragments for frag_v (only used by flash attention)
-    enum
-    {
-        LIMIT_V_FRAGMENTS = ((FLAGS & 0x100u) != 0u && !SHARE_SMEM_FOR_K_AND_V)
-    };
+    static constexpr int LIMIT_V_FRAGMENTS = ((FLAGS & 0x100u) != 0u && !SHARE_SMEM_FOR_K_AND_V);
 
     // Limiting QK fragments implies SMEM_K has to reside in SMEM
     static_assert(!(LIMIT_QK_FRAGMENTS && SHARE_SMEM_FOR_K_AND_V), "");
 
     // Indicates that kernel does not loop over Q tensor, usually kernel name has _nl suffix
-    enum
-    {
-        NO_LOOP = (FLAGS & 0x200u) != 0u
-    };
+    static constexpr int NO_LOOP = (FLAGS & 0x200u) != 0u;
 
     // Are sequences in one batch interleaved. i.e. s x b x ..., or b x s x ...
-    enum
-    {
-        SEQUENCES_INTERLEAVED = (FLAGS & 0x400) != 0u
-    };
+    static constexpr int SEQUENCES_INTERLEAVED = (FLAGS & 0x400) != 0u;
 
     // Use BMM1 softcapping scale or not.
-    enum
-    {
-        ENABLE_BMM1_SOFTCAPPING_SCALE = (FLAGS & 0x800) != 0u
-    };
+    static constexpr int ENABLE_BMM1_SOFTCAPPING_SCALE = (FLAGS & 0x800) != 0u;
 
     // Use MTP (multi-token prediction for MLA kernels) or not.
-    enum
-    {
-        IS_MTP = (FLAGS & 0x2000) != 0u
-    };
+    static constexpr int IS_MTP = (FLAGS & 0x2000) != 0u;
 
     // The number of CTAs per head for Cta_tile_p; equivalent to BMM1 split-K
-    enum
-    {
-        CTAS_PER_HEAD = CTAS_PER_HEAD_
-    };
+    static constexpr int CTAS_PER_HEAD = CTAS_PER_HEAD_;
 
     // The number of shared memory buffers to build a software pipeline for Q, K and V.
-    enum
-    {
-        BUFFERS_PER_TILE_SMEM_Q = (USE_GRANULAR_TILING && D > 64) || (USE_LDGSTS_Q && !NO_LOOP) ? 2 : 1
-    };
+    static constexpr int BUFFERS_PER_TILE_SMEM_Q
+        = (USE_GRANULAR_TILING && D > 64) || (USE_LDGSTS_Q && !NO_LOOP) ? 2 : 1;
 
-    enum
-    {
-        BUFFERS_PER_TILE_SMEM_K = USE_GRANULAR_TILING ? 2 : 1
-    };
+    static constexpr int BUFFERS_PER_TILE_SMEM_K = USE_GRANULAR_TILING ? 2 : 1;
 
-    enum
-    {
-        BUFFERS_PER_TILE_SMEM_V = USE_GRANULAR_TILING ? 2 : 1
-    };
+    static constexpr int BUFFERS_PER_TILE_SMEM_V = USE_GRANULAR_TILING ? 2 : 1;
 
     // The global memory tile to load Q.
     using Gmem_tile_q = Gmem_tile_q_<Traits_p, Cta_tile_p, Traits_p::BITS_PER_ELEMENT_A, CTA_P_TILE_M, CTA_P_TILE_K,
@@ -447,49 +328,29 @@ struct Kernel_traits_
     static_assert((int) Gmem_tile_o::THREADS_PER_ROW == (int) Smem_tile_o::THREADS_PER_ROW, "");
 
     // The number of threads.
-    enum
-    {
-        THREADS = Cta_tile_p::THREADS_PER_CTA
-    };
+    static constexpr int THREADS = Cta_tile_p::THREADS_PER_CTA;
 
     // Make sure the number of threads matches both CTAs.
     static_assert((int) THREADS == (int) Cta_tile_o::THREADS_PER_CTA, "");
 
     // The amount of shared memory needed to load Q and K.
-    enum
-    {
-        BYTES_PER_SMEM_QK = Smem_tile_q::BYTES_PER_TILE + Smem_tile_k::BYTES_PER_TILE
-    };
+    static constexpr int BYTES_PER_SMEM_QK = Smem_tile_q::BYTES_PER_TILE + Smem_tile_k::BYTES_PER_TILE;
 
     // The extra amount of shared memory needed to load V.
-    enum
-    {
-        BYTES_PER_SMEM_V = SHARE_SMEM_FOR_K_AND_V ? 0u : Smem_tile_v::BYTES_PER_TILE
-    };
+    static constexpr int BYTES_PER_SMEM_V = SHARE_SMEM_FOR_K_AND_V ? 0u : Smem_tile_v::BYTES_PER_TILE;
 
     // The amount of shared memory needed for Q, K and V..
-    enum
-    {
-        BYTES_PER_SMEM_QKV = BYTES_PER_SMEM_QK + BYTES_PER_SMEM_V
-    };
+    static constexpr int BYTES_PER_SMEM_QKV = BYTES_PER_SMEM_QK + BYTES_PER_SMEM_V;
 
     // The amount of shared memory needed to load/store O.
-    enum
-    {
-        BYTES_PER_SMEM_O = Smem_tile_o::BYTES_PER_TILE
-    };
+    static constexpr int BYTES_PER_SMEM_O = Smem_tile_o::BYTES_PER_TILE;
 
     // The amount of shared memory needed to load Q and store O.
-    enum
-    {
-        BYTES_PER_SMEM_QO = NO_LOOP ? Smem_tile_o::BYTES_PER_TILE : Smem_tile_q::BYTES_PER_TILE + BYTES_PER_SMEM_O
-    };
+    static constexpr int BYTES_PER_SMEM_QO
+        = NO_LOOP ? Smem_tile_o::BYTES_PER_TILE : Smem_tile_q::BYTES_PER_TILE + BYTES_PER_SMEM_O;
 
     // The amount of shared memory needed for Q, K, V and O.
-    enum
-    {
-        BYTES_PER_SMEM = fmha::Max<BYTES_PER_SMEM_QKV, BYTES_PER_SMEM_QO>::VALUE
-    };
+    static constexpr int BYTES_PER_SMEM = fmha::Max<BYTES_PER_SMEM_QKV, BYTES_PER_SMEM_QO>::VALUE;
 
     // Make sure we have enough shared memory.
     static_assert((NO_LOOP ? Smem_tile_o::BYTES_PER_TILE : Smem_tile_q::BYTES_PER_TILE + Smem_tile_o::BYTES_PER_TILE)
@@ -549,86 +410,44 @@ struct Kernel_traits_fmhca_
     static_assert(Mma_tile_o::K_PER_MMA <= S_KV, "");
 
     // The version.
-    enum
-    {
-        VERSION = VERSION_
-    };
+    static constexpr int VERSION = VERSION_;
 
     // The mask version
-    enum
-    {
-        MASK_VERSION = VERSION_
-    };
+    static constexpr int MASK_VERSION = VERSION_;
 
     // Whether use causal mask or not.
-    enum
-    {
-        CAUSAL_MASK = MASK_VERSION == 3 || MASK_VERSION == 4
-    };
+    static constexpr int CAUSAL_MASK = MASK_VERSION == 3 || MASK_VERSION == 4;
 
     // Whether use the sliding window attention or not.
-    enum
-    {
-        SLIDING_WINDOW_ATTENTION = MASK_VERSION == 4
-    };
+    static constexpr int SLIDING_WINDOW_ATTENTION = MASK_VERSION == 4;
 
     // Whether use the bidirectional sliding window attention or not.
-    enum
-    {
-        BIDIRECTIONAL_SLIDING_WINDOW_ATTENTION = MASK_VERSION == 5
-    };
+    static constexpr int BIDIRECTIONAL_SLIDING_WINDOW_ATTENTION = MASK_VERSION == 5;
 
     // Do we use LDGSTS for Q, K or V.
-    enum
-    {
-        USE_LDGSTS_Q = (FLAGS & 0x1u) != 0u
-    };
+    static constexpr int USE_LDGSTS_Q = (FLAGS & 0x1u) != 0u;
 
-    enum
-    {
-        USE_LDGSTS_K = (FLAGS & 0x2u) != 0u
-    };
+    static constexpr int USE_LDGSTS_K = (FLAGS & 0x2u) != 0u;
 
-    enum
-    {
-        USE_LDGSTS_V = (FLAGS & 0x4u) != 0u
-    };
+    static constexpr int USE_LDGSTS_V = (FLAGS & 0x4u) != 0u;
 
     // Do we use one buffer for K and V.
-    enum
-    {
-        SHARE_SMEM_FOR_K_AND_V = (FLAGS & 0x8u) != 0u
-    };
+    static constexpr int SHARE_SMEM_FOR_K_AND_V = (FLAGS & 0x8u) != 0u;
 
     // Do we use the scale max trick.
-    enum
-    {
-        USE_SCALE_MAX = (FLAGS & 0x10u) != 0u
-    };
+    static constexpr int USE_SCALE_MAX = (FLAGS & 0x10u) != 0u;
 
     // Are heads in QKV interleaved, i.e. total x h x 3 x d or total x 3 x h x d.
-    enum
-    {
-        HEADS_INTERLEAVED = (FLAGS & 0x20u) == 0u
-    };
+    static constexpr int HEADS_INTERLEAVED = (FLAGS & 0x20u) == 0u;
 
     // Keep full K matrix in registers.
-    enum
-    {
-        K_IN_REGS = (FLAGS & 0x40) == 0u
-    };
+    static constexpr int K_IN_REGS = (FLAGS & 0x40) == 0u;
 
     // Use BMM1 softcapping scale or not.
-    enum
-    {
-        ENABLE_BMM1_SOFTCAPPING_SCALE = 0
-    };
+    static constexpr int ENABLE_BMM1_SOFTCAPPING_SCALE = 0;
 
     // The number of CTAs per head for Cta_tile_p; equivalent to BMM1 split-K
-    enum
-    {
-        CTAS_PER_HEAD = CTAS_PER_HEAD_
-    };
+    static constexpr int CTAS_PER_HEAD = CTAS_PER_HEAD_;
 
     // The global memory tile to load Q.
     using Gmem_tile_q
@@ -667,43 +486,25 @@ struct Kernel_traits_fmhca_
     static_assert((int) Gmem_tile_o::THREADS_PER_ROW == (int) Smem_tile_o::THREADS_PER_ROW, "");
 
     // The number of threads.
-    enum
-    {
-        THREADS = Cta_tile_p::THREADS_PER_CTA
-    };
+    static constexpr int THREADS = Cta_tile_p::THREADS_PER_CTA;
 
     // Make sure the number of threads matches both CTAs.
     static_assert((int) THREADS == (int) Cta_tile_o::THREADS_PER_CTA, "");
 
     // The amount of shared memory needed to load Q and K.
-    enum
-    {
-        BYTES_PER_SMEM_QK = Smem_tile_q::BYTES_PER_TILE + Smem_tile_k::BYTES_PER_TILE
-    };
+    static constexpr int BYTES_PER_SMEM_QK = Smem_tile_q::BYTES_PER_TILE + Smem_tile_k::BYTES_PER_TILE;
 
     // The extra amount of shared memory needed to load V.
-    enum
-    {
-        BYTES_PER_SMEM_V = SHARE_SMEM_FOR_K_AND_V ? 0u : Smem_tile_v::BYTES_PER_TILE
-    };
+    static constexpr int BYTES_PER_SMEM_V = SHARE_SMEM_FOR_K_AND_V ? 0u : Smem_tile_v::BYTES_PER_TILE;
 
     // The amount of shared memory needed for Q, K and V..
-    enum
-    {
-        BYTES_PER_SMEM_QKV = BYTES_PER_SMEM_QK + BYTES_PER_SMEM_V
-    };
+    static constexpr int BYTES_PER_SMEM_QKV = BYTES_PER_SMEM_QK + BYTES_PER_SMEM_V;
 
     // The amount of shared memory needed to load Q and store O.
-    enum
-    {
-        BYTES_PER_SMEM_QO = Smem_tile_q::BYTES_PER_TILE + Smem_tile_o::BYTES_PER_TILE
-    };
+    static constexpr int BYTES_PER_SMEM_QO = Smem_tile_q::BYTES_PER_TILE + Smem_tile_o::BYTES_PER_TILE;
 
     // The amount of shared memory needed for Q, K, V and O.
-    enum
-    {
-        BYTES_PER_SMEM = fmha::Max<BYTES_PER_SMEM_QKV, BYTES_PER_SMEM_QO>::VALUE
-    };
+    static constexpr int BYTES_PER_SMEM = fmha::Max<BYTES_PER_SMEM_QKV, BYTES_PER_SMEM_QO>::VALUE;
 
     // Make sure we have enough shared memory.
     static_assert(Smem_tile_q::BYTES_PER_TILE + Smem_tile_o::BYTES_PER_TILE <= BYTES_PER_SMEM, "");
@@ -739,10 +540,7 @@ struct Kernel_traits_interleaved_v2_
     using Traits_o = Traits;
 
     // The padded D dimension
-    enum
-    {
-        D = Next_power_of_two<VALID_D>::VALUE
-    };
+    static constexpr int D = Next_power_of_two<VALID_D>::VALUE;
 
     // The CTA description for the 1st GEMM.
     using Cta_tile_p = typename Traits::template Cta_tile_extd<STEP, S, D, S, VALID_D, WARPS_M, WARPS_N, 1>;
@@ -750,67 +548,34 @@ struct Kernel_traits_interleaved_v2_
     using Cta_tile_o = typename Traits::template Cta_tile_extd<STEP, D, S, VALID_D, S, WARPS_M, 1, WARPS_N>;
 
     // The version.
-    enum
-    {
-        VERSION = 2
-    };
+    static constexpr int VERSION = 2;
 
-    enum
-    {
-        MASK_VERSION = MASK_VERSION_
-    };
+    static constexpr int MASK_VERSION = MASK_VERSION_;
 
     // Whether use causal mask or not.
-    enum
-    {
-        CAUSAL_MASK = MASK_VERSION_ == 3 || MASK_VERSION_ == 4
-    };
+    static constexpr int CAUSAL_MASK = MASK_VERSION_ == 3 || MASK_VERSION_ == 4;
 
     // Whether use the sliding window attention or not.
-    enum
-    {
-        SLIDING_WINDOW_ATTENTION = MASK_VERSION_ == 4
-    };
+    static constexpr int SLIDING_WINDOW_ATTENTION = MASK_VERSION_ == 4;
 
     // Whether use the bidirectional sliding window attention or not.
-    enum
-    {
-        BIDIRECTIONAL_SLIDING_WINDOW_ATTENTION = MASK_VERSION_ == 5
-    };
+    static constexpr int BIDIRECTIONAL_SLIDING_WINDOW_ATTENTION = MASK_VERSION_ == 5;
 
     // The number of CTAs per head for Cta_tile_p; equivalent to BMM1 split-K
-    enum
-    {
-        CTAS_PER_HEAD = CTAS_PER_HEAD_
-    };
+    static constexpr int CTAS_PER_HEAD = CTAS_PER_HEAD_;
 
     // Do we use LDGSTS for Q, K or V.
-    enum
-    {
-        USE_LDGSTS_Q = (FLAGS & 0x1u) != 0u
-    };
+    static constexpr int USE_LDGSTS_Q = (FLAGS & 0x1u) != 0u;
 
-    enum
-    {
-        USE_LDGSTS_K = (FLAGS & 0x2u) != 0u
-    };
+    static constexpr int USE_LDGSTS_K = (FLAGS & 0x2u) != 0u;
 
-    enum
-    {
-        USE_LDGSTS_V = (FLAGS & 0x4u) != 0u
-    };
+    static constexpr int USE_LDGSTS_V = (FLAGS & 0x4u) != 0u;
 
     // Do we use one buffer for K and V.
-    enum
-    {
-        SHARE_SMEM_FOR_K_AND_V = (FLAGS & 0x8u) != 0u
-    };
+    static constexpr int SHARE_SMEM_FOR_K_AND_V = (FLAGS & 0x8u) != 0u;
 
     // Do we use the scale max trick.
-    enum
-    {
-        USE_SCALE_MAX = (FLAGS & 16) != 0u
-    };
+    static constexpr int USE_SCALE_MAX = (FLAGS & 16) != 0u;
 
     // The global memory tile to load Q.
     using Gmem_tile_q
@@ -840,43 +605,25 @@ struct Kernel_traits_interleaved_v2_
     static_assert((int) Gmem_tile_o::THREADS_PER_ROW == (int) Smem_tile_o::THREADS_PER_ROW, "");
 
     // The number of threads.
-    enum
-    {
-        THREADS = Cta_tile_p::THREADS_PER_CTA
-    };
+    static constexpr int THREADS = Cta_tile_p::THREADS_PER_CTA;
 
     // Make sure the number of threads matches both CTAs.
     static_assert((int) THREADS == (int) Cta_tile_o::THREADS_PER_CTA, "");
 
     // The amount of shared memory needed to load Q and K.
-    enum
-    {
-        BYTES_PER_SMEM_QK = Smem_tile_q::BYTES_PER_TILE + Smem_tile_k::BYTES_PER_TILE
-    };
+    static constexpr int BYTES_PER_SMEM_QK = Smem_tile_q::BYTES_PER_TILE + Smem_tile_k::BYTES_PER_TILE;
 
     // The extra amount of shared memory needed to load V.
-    enum
-    {
-        BYTES_PER_SMEM_V = SHARE_SMEM_FOR_K_AND_V ? 0u : Smem_tile_v::BYTES_PER_TILE
-    };
+    static constexpr int BYTES_PER_SMEM_V = SHARE_SMEM_FOR_K_AND_V ? 0u : Smem_tile_v::BYTES_PER_TILE;
 
     // The amount of shared memory needed for Q, K and V..
-    enum
-    {
-        BYTES_PER_SMEM_QKV = BYTES_PER_SMEM_QK + BYTES_PER_SMEM_V
-    };
+    static constexpr int BYTES_PER_SMEM_QKV = BYTES_PER_SMEM_QK + BYTES_PER_SMEM_V;
 
     // The amount of shared memory needed to load Q and store O.
-    enum
-    {
-        BYTES_PER_SMEM_QO = Smem_tile_q::BYTES_PER_TILE + Smem_tile_o::BYTES_PER_TILE
-    };
+    static constexpr int BYTES_PER_SMEM_QO = Smem_tile_q::BYTES_PER_TILE + Smem_tile_o::BYTES_PER_TILE;
 
     // The amount of shared memory needed for Q, K, V and O.
-    enum
-    {
-        BYTES_PER_SMEM = fmha::Max<BYTES_PER_SMEM_QKV, BYTES_PER_SMEM_QO>::VALUE
-    };
+    static constexpr int BYTES_PER_SMEM = fmha::Max<BYTES_PER_SMEM_QKV, BYTES_PER_SMEM_QO>::VALUE;
 
     // Make sure we have enough shared memory.
     static_assert(Smem_tile_q::BYTES_PER_TILE + Smem_tile_o::BYTES_PER_TILE <= BYTES_PER_SMEM, "");

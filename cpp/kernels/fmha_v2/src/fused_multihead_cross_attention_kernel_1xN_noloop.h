@@ -65,26 +65,14 @@ inline __device__ void device_mhca_1xN_nl(Params const& params)
     using Smem_tile_o = typename Kernel_traits::Smem_tile_o;
 
     // Do we use LDGSTS for Q, K or V?
-    enum
-    {
-        USE_LDGSTS_Q = Kernel_traits::USE_LDGSTS_Q
-    };
+    static constexpr int USE_LDGSTS_Q = Kernel_traits::USE_LDGSTS_Q;
 
-    enum
-    {
-        USE_LDGSTS_K = Kernel_traits::USE_LDGSTS_K
-    };
+    static constexpr int USE_LDGSTS_K = Kernel_traits::USE_LDGSTS_K;
 
-    enum
-    {
-        USE_LDGSTS_V = Kernel_traits::USE_LDGSTS_V
-    };
+    static constexpr int USE_LDGSTS_V = Kernel_traits::USE_LDGSTS_V;
 
     // Do we use LDGSTS for any of the 3 input matrices.
-    enum
-    {
-        USE_LDGSTS = USE_LDGSTS_Q || USE_LDGSTS_K || USE_LDGSTS_V
-    };
+    static constexpr int USE_LDGSTS = USE_LDGSTS_Q || USE_LDGSTS_K || USE_LDGSTS_V;
 
     // If either K or V uses LDGSTS, they cannot share a buffer.
     static_assert(!(USE_LDGSTS_K || USE_LDGSTS_V) || !Kernel_traits::SHARE_SMEM_FOR_K_AND_V, "");
@@ -146,10 +134,7 @@ inline __device__ void device_mhca_1xN_nl(Params const& params)
 
     // Store/load P to/from memory (for debugging).
 #if defined(STORE_P)
-    enum
-    {
-        BITS_PER_ELT_P = sizeof(typename Traits_p::Accumulator_type) * 8
-    };
+    static constexpr int BITS_PER_ELT_P = sizeof(typename Traits_p::Accumulator_type) * 8;
 
     using Gmem_tile_p = fmha::Gmem_tile_ps<Traits_p, Cta_tile_p, BITS_PER_ELT_P>;
     char* p_ptr = reinterpret_cast<char*>(params.p_ptr);
@@ -159,10 +144,7 @@ inline __device__ void device_mhca_1xN_nl(Params const& params)
 
     // Store S to memory (for debugging). NOTE: We use A_type as C_type is int32 for IMMA???
 #if defined(STORE_S)
-    enum
-    {
-        BITS_PER_ELT_S = sizeof(typename Traits_p::A_type) * 8
-    };
+    static constexpr int BITS_PER_ELT_S = sizeof(typename Traits_p::A_type) * 8;
 
     using Gmem_tile_s = fmha::Gmem_tile_ps<Traits_p, Cta_tile_p, BITS_PER_ELT_S>;
     char* s_ptr = reinterpret_cast<char*>(params.s_ptr);
@@ -235,10 +217,7 @@ inline __device__ void device_mhca_1xN_nl(Params const& params)
     Softmax softmax(params, &smem_[Smem_tile_q::BYTES_PER_TILE], bidb, tidx);
 
     // The number of threads per row.
-    enum
-    {
-        THREADS_PER_ROW = 32
-    };
+    static constexpr int THREADS_PER_ROW = 32;
 
     // Declare the accumulators for the 1st gemm.
     fmha::Fragment_accumulator<Traits_p> acc_p[Mma_tile_p::MMAS_M][Mma_tile_p::MMAS_N];

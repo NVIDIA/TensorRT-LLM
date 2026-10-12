@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -44,6 +44,7 @@
 # This file is copied and modified from cutlass https://github.com/NVIDIA/cutlass/blob/main/python/CuTeDSL/cutlass/cute/core.py
 
 import ctypes
+import math
 import os
 from typing import Union
 
@@ -99,6 +100,11 @@ class _Pointer(Pointer):
         assert int(self._pointer) % self._assumed_align == 0, (
             f"pointer must be {self._assumed_align} bytes aligned"
         )
+
+    def __add__(self, offset: int) -> Pointer:  # type: ignore[override]
+        offset_bytes = offset * self._dtype.width // 8
+        assumed_align = math.gcd(offset_bytes, self._assumed_align)
+        return _Pointer(self._pointer + offset_bytes, self._dtype, self._addr_space, assumed_align)
 
     def size_in_bytes(self) -> int:
         return ctypes.sizeof(ctypes.c_void_p(int(self._pointer)))
@@ -298,6 +304,10 @@ def atomic_add_func(rOut_epi_packed, scatter_out_offset, loc=None, ip=None):
             has_side_effects=True,
             loc=loc,
             ip=ip,
+        )
+    else:
+        raise TypeError(
+            f"atomic_add_func only supports Float32 and BFloat16, got {rOut_epi_packed.dtype}"
         )
 
 

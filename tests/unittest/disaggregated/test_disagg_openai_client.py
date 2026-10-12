@@ -12,20 +12,30 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
 import json
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import aiohttp
+import msgspec
 import pytest
 
 from tensorrt_llm._utils import AdjustedSteadyClock
+from tensorrt_llm.disaggregated_params import DisaggScheduleStyle
 from tensorrt_llm.llmapi.disagg_utils import ServerRole
-from tensorrt_llm.serve.disagg_auth import INTERNAL_DISAGG_AUTH_HEADER
+from tensorrt_llm.serve.conversation_id import SUBAGENT_AFFINITY_HEADER
+from tensorrt_llm.serve.disagg_auth import (
+    INTERNAL_DISAGG_AUTH_HEADER,
+    SUBAGENT_AFFINITY_AUTH_HEADER,
+    validate_internal_disagg_request,
+    validate_subagent_affinity,
+)
 from tensorrt_llm.serve.openai_client import OpenAIHttpClient
 from tensorrt_llm.serve.openai_protocol import (
     CompletionRequest,
     CompletionResponse,
     CompletionResponseChoice,
+    ConversationParams,
     DisaggregatedParams,
     UsageInfo,
 )
@@ -776,7 +786,7 @@ class TestDisaggIdRegenOnRetry:
         r.__aexit__ = AsyncMock()
         return r
 
-    def _make_client(self, session, **kwargs):
+    def _make_client(self, session, role=ServerRole.CONTEXT, **kwargs):
         from prometheus_client.registry import REGISTRY
 
         REGISTRY._names_to_collectors = {}
@@ -788,7 +798,7 @@ class TestDisaggIdRegenOnRetry:
         router.finish_request = AsyncMock()
         return OpenAIHttpClient(
             router=router,
-            role=ServerRole.CONTEXT,
+            role=role,
             timeout_secs=10,
             max_retries=2,
             retry_interval_sec=0,
@@ -848,6 +858,121 @@ class TestDisaggIdRegenOnRetry:
 
         assert req.disaggregated_params.disagg_request_id == 42
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("role", [ServerRole.CONTEXT, ServerRole.GENERATION])
+    @pytest.mark.parametrize("regenerate_id", [False, True])
+    async def test_retry_affinity_signature_matches_wire_request(
+        self, role: ServerRole, regenerate_id: bool
+    ) -> None:
+        session = AsyncMock(spec=aiohttp.ClientSession)
+        client = self._make_client(
+            session,
+            role=role,
+            internal_disagg_auth_key="secret",
+            disagg_id_generator=AsyncMock(return_value=1000) if regenerate_id else None,
+        )
+        session.post.side_effect = [
+            aiohttp.ClientError("transient"),
+            self._mock_http_ok(self._ok_response()),
+        ]
+        request = CompletionRequest(
+            model="m",
+            prompt="hi",
+            stream=False,
+            conversation_params=ConversationParams(
+                conversation_id="child", subagent_affinity_id="parent"
+            ),
+            disaggregated_params=DisaggregatedParams(
+                request_type="context_only" if role == ServerRole.CONTEXT else "generation_only",
+                disagg_request_id=42,
+                encoded_opaque_state="b3BhcXVl" if role == ServerRole.GENERATION else None,
+            ),
+        )
+
+        await client.send_request(request)
+        expected_ids = [42, 1000 if regenerate_id else 42]
+
+        # Serialized attempts retain their own IDs when a context retry
+        # regenerates the request ID.
+        assert session.post.call_count == len(expected_ids)
+        bodies = [
+            msgspec.msgpack.decode(call.kwargs["data"]) for call in session.post.call_args_list
+        ]
+        headers = [dict(call.kwargs["headers"]) for call in session.post.call_args_list]
+        assert [
+            body["disaggregated_params"]["disagg_request_id"] for body in bodies
+        ] == expected_ids
+        wire_requests = [CompletionRequest.model_validate(body) for body in bodies]
+        for body, wire_request, attempt_headers in zip(bodies, wire_requests, headers):
+            assert "subagent_affinity_id" not in body["conversation_params"]
+            assert attempt_headers[SUBAGENT_AFFINITY_HEADER] == "parent"
+            assert (
+                validate_subagent_affinity("secret", wire_request, role, attempt_headers)
+                == "parent"
+            )
+            if role == ServerRole.GENERATION:
+                validate_internal_disagg_request("secret", wire_request, attempt_headers)
+        if role == ServerRole.GENERATION:
+            assert (
+                headers[0][INTERNAL_DISAGG_AUTH_HEADER] == headers[1][INTERNAL_DISAGG_AUTH_HEADER]
+            )
+        if regenerate_id:
+            assert (
+                headers[0][SUBAGENT_AFFINITY_AUTH_HEADER]
+                != headers[1][SUBAGENT_AFFINITY_AUTH_HEADER]
+            )
+            for index in (0, 1):
+                with pytest.raises(ValueError, match="Invalid internal subagent"):
+                    validate_subagent_affinity(
+                        "secret", wire_requests[index], role, headers[1 - index]
+                    )
+        else:
+            assert (
+                headers[0][SUBAGENT_AFFINITY_AUTH_HEADER]
+                == headers[1][SUBAGENT_AFFINITY_AUTH_HEADER]
+            )
+
+    @pytest.mark.asyncio
+    async def test_retry_keeps_original_reservation_id_without_explicit_req_id(self):
+        """Renew/finish must keep using the id the request was routed with.
+
+        Without an explicit req_id the coordinator router keys a context
+        reservation by disagg_request_id, which the retry path re-issues. If the
+        client let that leak into renew/finish, the coordinator would look up a
+        reservation it never created and the original one would linger until it
+        expired.
+        """
+        session = AsyncMock(spec=aiohttp.ClientSession)
+        ids = iter(range(1000, 2000))
+
+        async def next_id():
+            return next(ids)
+
+        client = self._make_client(session, disagg_id_generator=next_id)
+        session.post.side_effect = [
+            aiohttp.ClientError("transient"),
+            self._mock_http_ok(self._ok_response()),
+        ]
+        req = CompletionRequest(
+            model="m",
+            prompt="hi",
+            stream=False,
+            disaggregated_params=DisaggregatedParams(
+                request_type="context_only", disagg_request_id=42
+            ),
+        )
+
+        with patch("asyncio.sleep", new_callable=AsyncMock):
+            await client.send_request(req)
+
+        assert req.disaggregated_params.disagg_request_id != 42
+        assert client._router.renew_request.await_count == 2
+        assert all(
+            call.kwargs["req_id"] == 42 for call in client._router.renew_request.await_args_list
+        )
+        assert client._router.finish_request.await_count == 1
+        assert client._router.finish_request.await_args.kwargs["req_id"] == 42
+
 
 class TestSelectiveTransientTcpRetry:
     """Selective retry budget for transient TCP race symptoms.
@@ -904,6 +1029,25 @@ class TestSelectiveTransientTcpRetry:
             disaggregated_params=DisaggregatedParams(
                 request_type="context_only", disagg_request_id=1
             ),
+        )
+
+    @pytest.mark.asyncio
+    async def test_retry_renews_coordinator_reservation(self):
+        session = AsyncMock(spec=aiohttp.ClientSession)
+        client = self._make_client(session)
+        session.post.side_effect = [
+            aiohttp.ClientError("transient"),
+            self._mock_http_ok(self._ok_response()),
+        ]
+        request = self._make_request()
+
+        with patch("asyncio.sleep", new_callable=AsyncMock):
+            await client.send_request(request, req_id=71)
+
+        assert client._router.renew_request.await_count == 2
+        assert all(
+            call.args == (request,) and call.kwargs == {"req_id": 71}
+            for call in client._router.renew_request.await_args_list
         )
 
     @pytest.mark.asyncio
@@ -1003,3 +1147,415 @@ class TestSelectiveTransientTcpRetry:
 
         # 1 original + 5 retries
         assert session.post.call_count == 6
+
+
+class TestRequestCleanup:
+    @pytest.fixture
+    def client(self, openai_client):
+        openai_client._max_retries = 1
+        openai_client._retry_interval_sec = 0
+        openai_client._metrics_collector = MagicMock()
+        return openai_client
+
+    @staticmethod
+    def _response(chunks):
+        response = AsyncMock()
+        response.status = 200
+        response.headers = {"Content-Type": "text/event-stream"}
+        response.content.iter_any = chunks
+        response.__aenter__.return_value = response
+        response.__aexit__.return_value = False
+        return response
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("stream", [False, True])
+    async def test_preheader_failure_finishes_once(
+        self, client, completion_request, mock_session, mock_router, stream
+    ):
+        completion_request.stream = stream
+        mock_session.post.side_effect = aiohttp.ClientOSError(104, "Connection reset by peer")
+
+        with pytest.raises(aiohttp.ClientOSError):
+            response = await client.send_request(completion_request, req_id=42)
+            if stream:
+                _ = [chunk async for chunk in response]
+
+        assert mock_session.post.call_count == 2
+        mock_router.finish_request.assert_awaited_once_with(
+            completion_request, mock_session, success=False, req_id=42
+        )
+        client._metrics_collector.error_requests.inc.assert_called_once_with()
+        client._metrics_collector.completed_requests.inc.assert_called_once_with()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("failure_stage", ["headers", "body"])
+    async def test_retry_keeps_reservation_until_success(
+        self, client, streaming_completion_request, mock_session, mock_router, failure_stage
+    ):
+        async def failed_chunks():
+            raise aiohttp.ClientOSError(104, "Connection reset by peer")
+            yield  # pragma: no cover
+
+        async def successful_chunks():
+            yield b"data: [DONE]\n\n"
+
+        failed_response = self._response(failed_chunks)
+        successful_response = self._response(successful_chunks)
+        attempts = 0
+
+        def post(*args, **kwargs):
+            nonlocal attempts
+            attempts += 1
+            mock_router.finish_request.assert_not_called()
+            if attempts == 1:
+                if failure_stage == "headers":
+                    raise aiohttp.ClientOSError(104, "Connection reset by peer")
+                return failed_response
+            return successful_response
+
+        mock_session.post.side_effect = post
+        response = await client.send_request(streaming_completion_request, req_id=42)
+        assert [chunk async for chunk in response] == [b"data: [DONE]\n\n"]
+
+        assert attempts == 2
+        mock_router.finish_request.assert_awaited_once_with(
+            streaming_completion_request, mock_session, success=True, req_id=42
+        )
+        client._metrics_collector.error_requests.inc.assert_not_called()
+        client._metrics_collector.completed_requests.inc.assert_called_once_with()
+        client._metrics_collector.retry_requests.inc.assert_called_once_with()
+        successful_response.__aexit__.assert_awaited_once()
+        if failure_stage == "body":
+            failed_response.__aexit__.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("error_type", [aiohttp.ClientOSError, RuntimeError])
+    async def test_failure_after_first_chunk_finishes_once_without_retry(
+        self, client, streaming_completion_request, mock_session, mock_router, error_type
+    ):
+        async def chunks():
+            yield b'data: "first"\n\n'
+            raise error_type("stream failed")
+
+        http_response = self._response(chunks)
+        mock_session.post.return_value = http_response
+        response = await client.send_request(streaming_completion_request, req_id=42)
+        assert await response.__anext__() == b'data: "first"\n\n'
+        with pytest.raises(error_type):
+            await response.__anext__()
+        await response.aclose()
+
+        mock_session.post.assert_called_once()
+        http_response.__aexit__.assert_awaited_once()
+        mock_router.finish_request.assert_awaited_once_with(
+            streaming_completion_request, mock_session, success=False, req_id=42
+        )
+        client._metrics_collector.error_requests.inc.assert_called_once_with()
+        client._metrics_collector.completed_requests.inc.assert_called_once_with()
+        client._metrics_collector.retry_requests.inc.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("read_first", [False, True])
+    async def test_explicit_close_finishes_once(
+        self, client, streaming_completion_request, mock_session, mock_router, read_first
+    ):
+        async def chunks():
+            yield b'data: "first"\n\n'
+            yield b"data: [DONE]\n\n"
+
+        http_response = self._response(chunks)
+        mock_session.post.return_value = http_response
+        response = await client.send_request(streaming_completion_request, req_id=42)
+        mock_session.post.assert_not_called()
+        if read_first:
+            assert await response.__anext__() == b'data: "first"\n\n'
+        await response.aclose()
+        await response.aclose()
+
+        assert mock_session.post.call_count == int(read_first)
+        assert http_response.__aexit__.await_count == int(read_first)
+        mock_router.finish_request.assert_awaited_once_with(
+            streaming_completion_request, mock_session, success=False, req_id=42
+        )
+        client._metrics_collector.error_requests.inc.assert_called_once_with()
+        client._metrics_collector.completed_requests.inc.assert_called_once_with()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("cancel_stage", ["headers", "body"])
+    async def test_cancellation_finishes_once(
+        self, client, streaming_completion_request, mock_session, mock_router, cancel_stage
+    ):
+        entered = asyncio.Event()
+        blocked = asyncio.Event()
+
+        async def wait_for_cancel():
+            entered.set()
+            await blocked.wait()
+
+        async def chunks():
+            await wait_for_cancel()
+            yield b"data: [DONE]\n\n"
+
+        http_response = self._response(chunks)
+        if cancel_stage == "headers":
+            http_response.__aenter__.side_effect = wait_for_cancel
+        mock_session.post.return_value = http_response
+        response = await client.send_request(streaming_completion_request, req_id=42)
+        pending = asyncio.create_task(response.__anext__())
+        try:
+            await asyncio.wait_for(entered.wait(), timeout=1)
+        finally:
+            pending.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await pending
+        await response.aclose()
+
+        mock_session.post.assert_called_once()
+        assert http_response.__aexit__.await_count == int(cancel_stage == "body")
+        mock_router.finish_request.assert_awaited_once_with(
+            streaming_completion_request, mock_session, success=False, req_id=42
+        )
+        client._metrics_collector.error_requests.inc.assert_called_once_with()
+        client._metrics_collector.completed_requests.inc.assert_called_once_with()
+
+    @pytest.mark.asyncio
+    async def test_successful_stream_finishes_once(
+        self, client, streaming_completion_request, mock_session, mock_router
+    ):
+        async def chunks():
+            yield b"data: [DONE]\n\n"
+
+        http_response = self._response(chunks)
+        mock_session.post.return_value = http_response
+        response = await client.send_request(streaming_completion_request, req_id=42)
+        assert [chunk async for chunk in response] == [b"data: [DONE]\n\n"]
+        await response.aclose()
+
+        mock_router.finish_request.assert_awaited_once_with(
+            streaming_completion_request, mock_session, success=True, req_id=42
+        )
+        client._metrics_collector.error_requests.inc.assert_not_called()
+        client._metrics_collector.completed_requests.inc.assert_called_once_with()
+        http_response.__aexit__.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("cancel_stage", ["headers", "body", "exit"])
+    async def test_non_stream_cancellation_finishes_once(
+        self, client, completion_request, mock_session, mock_router, cancel_stage
+    ):
+        entered = asyncio.Event()
+        blocked = asyncio.Event()
+
+        async def wait_for_cancel(*args):
+            entered.set()
+            await blocked.wait()
+
+        http_response = AsyncMock()
+        http_response.status = 200
+        http_response.headers = {"Content-Type": "application/json"}
+        http_response.json.return_value = TestOpenAIHttpClient().dummy_response().model_dump()
+        http_response.__aenter__.return_value = http_response
+        http_response.__aexit__.return_value = False
+        waiting_method = {
+            "headers": http_response.__aenter__,
+            "body": http_response.json,
+            "exit": http_response.__aexit__,
+        }[cancel_stage]
+        waiting_method.side_effect = wait_for_cancel
+        mock_session.post.return_value = http_response
+        pending = asyncio.create_task(client.send_request(completion_request, req_id=42))
+        try:
+            await asyncio.wait_for(entered.wait(), timeout=1)
+        finally:
+            pending.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await pending
+
+        mock_session.post.assert_called_once()
+        assert http_response.__aexit__.await_count == int(cancel_stage != "headers")
+        mock_router.finish_request.assert_awaited_once_with(
+            completion_request, mock_session, success=False, req_id=42
+        )
+        client._metrics_collector.error_requests.inc.assert_called_once_with()
+        client._metrics_collector.completed_requests.inc.assert_called_once_with()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("error_type", [aiohttp.ClientOSError, RuntimeError])
+    async def test_non_stream_context_exit_error_finishes_once(
+        self, client, completion_request, mock_session, mock_router, error_type
+    ):
+        client._max_retries = 0
+        http_response = AsyncMock()
+        http_response.status = 200
+        http_response.headers = {"Content-Type": "application/json"}
+        http_response.json.return_value = TestOpenAIHttpClient().dummy_response().model_dump()
+        http_response.__aenter__.return_value = http_response
+        http_response.__aexit__.side_effect = error_type("closing HTTP response failed")
+        mock_session.post.return_value = http_response
+
+        with pytest.raises(error_type):
+            await client.send_request(completion_request, req_id=42)
+
+        mock_session.post.assert_called_once()
+        http_response.__aexit__.assert_awaited_once()
+        mock_router.finish_request.assert_awaited_once_with(
+            completion_request, mock_session, success=False, req_id=42
+        )
+        client._metrics_collector.error_requests.inc.assert_called_once_with()
+        client._metrics_collector.completed_requests.inc.assert_called_once_with()
+
+    @pytest.mark.asyncio
+    async def test_non_stream_hook_error_closes_http_response(
+        self, client, completion_request, mock_session, mock_router
+    ):
+        http_response = AsyncMock()
+        http_response.status = 200
+        http_response.headers = {"Content-Type": "application/json"}
+        http_response.json.return_value = TestOpenAIHttpClient().dummy_response().model_dump()
+        http_response.__aenter__.return_value = http_response
+        http_response.__aexit__.return_value = False
+        mock_session.post.return_value = http_response
+        hooks = MagicMock(spec=ResponseHooks)
+        hooks.on_ctx_resp.side_effect = RuntimeError("response hook failed")
+
+        with pytest.raises(RuntimeError, match="response hook failed"):
+            await client.send_request(completion_request, hooks=hooks, req_id=42)
+
+        http_response.__aexit__.assert_awaited_once()
+        mock_router.finish_request.assert_awaited_once_with(
+            completion_request, mock_session, success=False, req_id=42
+        )
+        client._metrics_collector.error_requests.inc.assert_called_once_with()
+        client._metrics_collector.completed_requests.inc.assert_called_once_with()
+
+
+class TestRemoteTailHandoffRetry:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("stream", [False, True])
+    @pytest.mark.parametrize(
+        "role,request_type,schedule_style,remote_tail_start,bounded_replay",
+        [
+            (ServerRole.GENERATION, "generation_only", None, 0, False),
+            (ServerRole.GENERATION, "generation_only", DisaggScheduleStyle.CONTEXT_FIRST, 8, False),
+            (
+                ServerRole.GENERATION,
+                "generation_only",
+                DisaggScheduleStyle.GENERATION_FIRST,
+                None,
+                True,
+            ),
+            (ServerRole.CONTEXT, "context_only", DisaggScheduleStyle.GENERATION_FIRST, None, True),
+            (ServerRole.CONTEXT, "context_only", 1, None, True),
+        ],
+    )
+    @pytest.mark.parametrize(
+        "error_type", [aiohttp.ClientOSError, aiohttp.ServerDisconnectedError, ConnectionResetError]
+    )
+    async def test_remote_tail_handoff_does_not_retry_or_change_id(
+        self,
+        openai_client,
+        mock_session,
+        mock_router,
+        stream,
+        role,
+        request_type,
+        schedule_style,
+        remote_tail_start,
+        bounded_replay,
+        error_type,
+    ):
+        openai_client._role = role
+        openai_client._bounded_replay_on_generation = bounded_replay
+        openai_client._metrics_collector = MagicMock()
+        openai_client._disagg_id_generator = AsyncMock(return_value=999)
+        mock_session.post.side_effect = error_type("connection failed")
+        request = CompletionRequest(
+            model="m",
+            prompt="hi",
+            stream=stream,
+            disaggregated_params=DisaggregatedParams(
+                request_type=request_type,
+                disagg_request_id=123,
+                schedule_style=schedule_style,
+                remote_tail_start=remote_tail_start,
+            ),
+        )
+        hooks = MagicMock(spec=ResponseHooks)
+        with pytest.raises(error_type):
+            response = await openai_client.send_request(request, hooks=hooks, req_id=42)
+            if stream:
+                _ = [chunk async for chunk in response]
+
+        mock_session.post.assert_called_once()
+        openai_client._disagg_id_generator.assert_not_awaited()
+        assert request.disaggregated_params.disagg_request_id == 123
+        hooks.on_disagg_request_id.assert_not_called()
+        openai_client._metrics_collector.retry_requests.inc.assert_not_called()
+        openai_client._metrics_collector.error_requests.inc.assert_called_once_with()
+        openai_client._metrics_collector.completed_requests.inc.assert_called_once_with()
+        mock_router.finish_request.assert_awaited_once_with(
+            request, mock_session, success=False, req_id=42
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "role,request_type,schedule_style,bounded_replay",
+        [
+            (ServerRole.GENERATION, None, None, True),
+            (ServerRole.GENERATION, "generation_only", None, False),
+            (ServerRole.GENERATION, "generation_only", DisaggScheduleStyle.CONTEXT_FIRST, False),
+            (ServerRole.GENERATION, "generation_only", DisaggScheduleStyle.GENERATION_FIRST, False),
+            (ServerRole.CONTEXT, "context_only", DisaggScheduleStyle.GENERATION_FIRST, False),
+            (ServerRole.CONTEXT, "context_only", DisaggScheduleStyle.CONTEXT_FIRST, True),
+        ],
+    )
+    @pytest.mark.parametrize("error_type", [aiohttp.ClientError, aiohttp.ServerDisconnectedError])
+    async def test_other_requests_retain_retry(
+        self,
+        openai_client,
+        completion_request,
+        mock_session,
+        mock_router,
+        role,
+        request_type,
+        schedule_style,
+        bounded_replay,
+        error_type,
+    ):
+        openai_client._role = role
+        openai_client._bounded_replay_on_generation = bounded_replay
+        openai_client._retry_interval_sec = 0
+        # Transient TCP failures retain their budget even without normal retries.
+        openai_client._max_retries = 0 if error_type is aiohttp.ServerDisconnectedError else 2
+        openai_client._disagg_id_generator = AsyncMock(return_value=999)
+        completion_request.disaggregated_params = (
+            DisaggregatedParams(
+                request_type=request_type, disagg_request_id=123, schedule_style=schedule_style
+            )
+            if request_type is not None
+            else None
+        )
+        response_body = TestOpenAIHttpClient().dummy_response()
+        http_response = AsyncMock()
+        http_response.status = 200
+        http_response.headers = {"Content-Type": "application/json"}
+        http_response.json.return_value = response_body.model_dump()
+        http_response.__aenter__.return_value = http_response
+        http_response.__aexit__.return_value = False
+        mock_session.post.side_effect = [error_type("connection failed"), http_response]
+        hooks = MagicMock(spec=ResponseHooks)
+
+        response = await openai_client.send_request(completion_request, hooks=hooks, req_id=42)
+
+        assert response == response_body
+        assert mock_session.post.call_count == 2
+        if request_type is not None:
+            assert completion_request.disaggregated_params.disagg_request_id == 999
+            openai_client._disagg_id_generator.assert_awaited_once_with()
+            hooks.on_disagg_request_id.assert_called_once_with(999)
+        else:
+            openai_client._disagg_id_generator.assert_not_awaited()
+            hooks.on_disagg_request_id.assert_not_called()
+        mock_router.finish_request.assert_awaited_once_with(
+            completion_request, mock_session, success=True, req_id=42
+        )

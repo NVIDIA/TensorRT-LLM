@@ -1,0 +1,21 @@
+kv_cache_config:
+  dtype: fp8
+  enable_block_reuse: false
+  mamba_state_config:
+     periodic_snapshot_interval: 8192
+  free_gpu_memory_fraction: 0.8
+  mamba_ssm_cache_dtype: float16
+  mamba_ssm_stochastic_rounding: true
+  mamba_ssm_philox_rounds: 5
+cuda_graph_config:
+    enable_padding: true
+    max_batch_size: 16
+speculative_config:
+  decoding_type: MTP
+  max_draft_len: 3
+  allow_advanced_sampling: true
+enable_chunked_prefill: true
+num_postprocess_workers: 4
+print_iter_log: true
+stream_interval: 10
+disable_overlap_scheduler: false

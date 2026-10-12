@@ -389,7 +389,8 @@ __launch_bounds__(256) __global__ void fused_pmap_gemm_fma_ksplit(__nv_bfloat16 
 // Caller MUST zero y_acc[M, FULL_N], r_acc[M], done_counter[ceil(M / TM)]
 // before launch.  FULL_N must equal HC_MULT * (2 + HC_MULT) = 24.
 // ===================================================================
-template <int TN, int KS, int TM = 1, int FULL_N = 24, int BF16_VEC_OVERRIDE = 0, bool kFuseNorm = false>
+template <int TN, int KS, int TM = 1, int FULL_N = 24, int BF16_VEC_OVERRIDE = 0, bool kFuseNorm = false,
+    bool kLaggedPre = false>
 __launch_bounds__(256) __global__ void fused_pmap_gemm_fma_allinone(__nv_bfloat16 const* __restrict__ residual_in,
     __nv_bfloat16 const* __restrict__ x_in, float const* __restrict__ post_mix_prev,
     float const* __restrict__ comb_mix_prev, float const* __restrict__ W_T, float const* __restrict__ hc_scale,
@@ -399,7 +400,9 @@ __launch_bounds__(256) __global__ void fused_pmap_gemm_fma_allinone(__nv_bfloat1
     float hc_pre_eps, float hc_sinkhorn_eps, float hc_post_mult_value, int sinkhorn_repeat,
     // When kFuseNorm: apply next-layer RMSNorm on layer_input inline:
     //   layer_input[t,h] = bf16(li * rsqrt(mean(li²)+norm_eps) * norm_weight[h]).
-    __nv_bfloat16 const* __restrict__ norm_weight = nullptr, float norm_eps = 0.f)
+    __nv_bfloat16 const* __restrict__ norm_weight = nullptr, float norm_eps = 0.f,
+    // kLaggedPre (V4.1), see mhcBigFuseKernel: collapse with pre_mix_ext, write the own gate to pre_mix_out.
+    float const* __restrict__ pre_mix_ext = nullptr, float* __restrict__ pre_mix_out = nullptr)
 {
     constexpr int HC_MULT = 4;
     constexpr int HC_MULT2 = HC_MULT * HC_MULT;
@@ -798,9 +801,9 @@ __launch_bounds__(256) __global__ void fused_pmap_gemm_fma_allinone(__nv_bfloat1
 
     // Phase 4: inline bigFuse for the TM tokens in this batch.
     // Layout: FULL_N = HC_MULT*(2+HC_MULT) = 24
-    //   y_local[0..HC_MULT)               → s_pre_mix (sigmoid gate)
-    //   y_local[HC_MULT..2*HC_MULT)       → post_mix_out (sigmoid*hc_post_mult)
-    //   y_local[2*HC_MULT..FULL_N)        → comb_mix_out (Sinkhorn)
+    //   y_acc[0..HC_MULT)               → s_pre_mix (sigmoid gate)
+    //   y_acc[HC_MULT..2*HC_MULT)       → post_mix_out (sigmoid*hc_post_mult)
+    //   y_acc[2*HC_MULT..FULL_N)        → comb_mix_out (Sinkhorn)
     __shared__ float s_pre_mix[TM][HC_MULT];
 
 #pragma unroll
@@ -812,30 +815,28 @@ __launch_bounds__(256) __global__ void fused_pmap_gemm_fma_allinone(__nv_bfloat1
             continue;
         }
         int const tok = base_tok + t;
-        float cm_vals[HC_MULT];
 
         if (warp_id == 0 && lane < HC_MULT)
         {
+            float cm_vals[HC_MULT];
             float const r_val = r_acc[tok];
-            float y_local[HC_MULT3];
             float const* y_row = y_acc + static_cast<long long>(tok) * FULL_N;
-#pragma unroll
-            for (int c = 0; c < HC_MULT3; c++)
-                y_local[c] = y_row[c];
 
             float const rstd = rsqrtf(r_val / static_cast<float>(K) + rms_eps);
             float const s0 = hc_scale[0], s1 = hc_scale[1], s2 = hc_scale[2];
 
-            float v = y_local[lane] * rstd * s0 + hc_base[lane];
+            float v = y_row[lane] * rstd * s0 + hc_base[lane];
             s_pre_mix[t][lane] = 1.0f / (1.0f + expf(-v)) + hc_pre_eps;
+            if constexpr (kLaggedPre)
+                pre_mix_out[tok * HC_MULT + lane] = s_pre_mix[t][lane];
 
-            v = y_local[HC_MULT + lane] * rstd * s1 + hc_base[HC_MULT + lane];
+            v = y_row[HC_MULT + lane] * rstd * s1 + hc_base[HC_MULT + lane];
             post_mix_out[tok * HC_MULT + lane] = 1.0f / (1.0f + expf(-v)) * hc_post_mult_value;
 
 #pragma unroll
             for (int k = 0; k < HC_MULT; k++)
                 cm_vals[k]
-                    = y_local[2 * HC_MULT + lane * HC_MULT + k] * rstd * s2 + hc_base[2 * HC_MULT + lane * HC_MULT + k];
+                    = y_row[2 * HC_MULT + lane * HC_MULT + k] * rstd * s2 + hc_base[2 * HC_MULT + lane * HC_MULT + k];
 
             constexpr unsigned LANE_MASK = (1u << HC_MULT) - 1;
             float const rowMax = fmaxf(fmaxf(cm_vals[0], cm_vals[1]), fmaxf(cm_vals[2], cm_vals[3]));
@@ -877,28 +878,32 @@ __launch_bounds__(256) __global__ void fused_pmap_gemm_fma_allinone(__nv_bfloat1
         }
         __syncthreads();
 
-        // layer_input: warp>0 threads process hidden in parallel.
+        // layer_input: all eight warps process hidden in parallel.
         //
         // When kFuseNorm is true, accumulate per-thread sum_sq while writing
         // un-normalized layer_input bf16; after a __syncthreads, all threads
         // run pass 2: re-LDG from L2 (hot from pass 1's STGs), multiply by
         // rsqrt * norm_weight, STG normalized bf16. Saves one HBM read+write
         // pair vs the separate flashinfer.rmsnorm kernel.
-        constexpr int kFmaBigFuseWarps = BLOCK_SIZE / WARP_SIZE - 1;
+        constexpr int kFmaBigFuseWarps = BLOCK_SIZE / WARP_SIZE;
         __shared__ float s_sumsq_li[kFmaBigFuseWarps];
         __shared__ float s_rsqrt_li;
         constexpr int BF16_VEC_LI = 8;
         __nv_bfloat16* obase = layer_input_out + static_cast<long long>(tok) * hidden_size;
-        if (warp_id > 0)
         {
             float pm[HC_MULT];
 #pragma unroll
             for (int j = 0; j < HC_MULT; j++)
-                pm[j] = s_pre_mix[t][j];
+            {
+                if constexpr (kLaggedPre)
+                    pm[j] = pre_mix_ext[tok * HC_MULT + j];
+                else
+                    pm[j] = s_pre_mix[t][j];
+            }
 
             __nv_bfloat16 const* rbase = residual_out + static_cast<long long>(tok) * HC_MULT * hidden_size;
-            int const p2_tid = tid - WARP_SIZE;
-            constexpr int p2_threads = BLOCK_SIZE - WARP_SIZE;
+            int const p2_tid = tid;
+            constexpr int p2_threads = BLOCK_SIZE;
             float sum_sq_local = 0.f;
 
             for (int h = p2_tid * BF16_VEC_LI; h < hidden_size; h += p2_threads * BF16_VEC_LI)
@@ -942,7 +947,7 @@ __launch_bounds__(256) __global__ void fused_pmap_gemm_fma_allinone(__nv_bfloat1
                 sum_sq_local += __shfl_xor_sync(0xffffffff, sum_sq_local, 2);
                 sum_sq_local += __shfl_xor_sync(0xffffffff, sum_sq_local, 1);
                 if ((tid & 31) == 0)
-                    s_sumsq_li[warp_id - 1] = sum_sq_local;
+                    s_sumsq_li[warp_id] = sum_sq_local;
             }
         }
         if constexpr (kFuseNorm)
@@ -957,10 +962,9 @@ __launch_bounds__(256) __global__ void fused_pmap_gemm_fma_allinone(__nv_bfloat1
                 s_rsqrt_li = rsqrtf(total / static_cast<float>(hidden_size) + norm_eps);
             }
             __syncthreads();
-            if (warp_id > 0)
             {
-                int const p2_tid = tid - WARP_SIZE;
-                constexpr int p2_threads = BLOCK_SIZE - WARP_SIZE;
+                int const p2_tid = tid;
+                constexpr int p2_threads = BLOCK_SIZE;
                 float const rsqrt_val = s_rsqrt_li;
                 for (int h = p2_tid * BF16_VEC_LI; h < hidden_size; h += p2_threads * BF16_VEC_LI)
                 {

@@ -32,6 +32,11 @@ using tensorrt_llm::common::float22bf162;
 using tensorrt_llm::common::hsub2;
 #endif
 
+#ifdef ENABLE_FP8
+using tensorrt_llm::common::fp8x2_to_float2;
+using tensorrt_llm::common::fp8x4_to_float4;
+#endif
+
 TRTLLM_NAMESPACE_BEGIN
 
 namespace kernels
@@ -1207,8 +1212,8 @@ inline __device__ float4 fma(float4 a, fp8_4_t b, float4 fc)
     };
 
     fp8_4 = b;
-    float2 fb0 = float2(fp8_2[0]);
-    float2 fb1 = float2(fp8_2[1]);
+    float2 fb0 = fp8x2_to_float2(fp8_2[0]);
+    float2 fb1 = fp8x2_to_float2(fp8_2[1]);
 
     fd.x = fma(a.x, fb0.x, fc.x);
     fd.y = fma(a.y, fb0.y, fc.y);
@@ -1230,8 +1235,8 @@ inline __device__ float4 fma(float a, fp8_4_t b, float4 fc)
     };
 
     fp8_4 = b;
-    float2 fb0 = float2(fp8_2[0]);
-    float2 fb1 = float2(fp8_2[1]);
+    float2 fb0 = fp8x2_to_float2(fp8_2[0]);
+    float2 fb1 = fp8x2_to_float2(fp8_2[1]);
 
     fd.x = fma(a, fb0.x, fc.x);
     fd.y = fma(a, fb0.y, fc.y);
@@ -1264,10 +1269,10 @@ inline __device__ Float8_ fma(uint4 a, fp8_8_t b, Float8_ fc)
 
     fp8_8 = b;
 
-    fd.x = fma(a.x, float2(fp8_2[0]), fc.x);
-    fd.y = fma(a.y, float2(fp8_2[1]), fc.y);
-    fd.z = fma(a.z, float2(fp8_2[2]), fc.z);
-    fd.w = fma(a.w, float2(fp8_2[3]), fc.w);
+    fd.x = fma(a.x, fp8x2_to_float2(fp8_2[0]), fc.x);
+    fd.y = fma(a.y, fp8x2_to_float2(fp8_2[1]), fc.y);
+    fd.z = fma(a.z, fp8x2_to_float2(fp8_2[2]), fc.z);
+    fd.w = fma(a.w, fp8x2_to_float2(fp8_2[3]), fc.w);
 
     return fd;
 }
@@ -1286,10 +1291,10 @@ inline __device__ Float8_ fma(Float8_ fa, fp8_8_t b, Float8_ fc)
 
     fp8_8 = b;
 
-    fd.x = fma(fa.x, float2(fp8_2[0]), fc.x);
-    fd.y = fma(fa.y, float2(fp8_2[1]), fc.y);
-    fd.z = fma(fa.z, float2(fp8_2[2]), fc.z);
-    fd.w = fma(fa.w, float2(fp8_2[3]), fc.w);
+    fd.x = fma(fa.x, fp8x2_to_float2(fp8_2[0]), fc.x);
+    fd.y = fma(fa.y, fp8x2_to_float2(fp8_2[1]), fc.y);
+    fd.z = fma(fa.z, fp8x2_to_float2(fp8_2[2]), fc.z);
+    fd.w = fma(fa.w, fp8x2_to_float2(fp8_2[3]), fc.w);
 
     return fd;
 }
@@ -1308,10 +1313,10 @@ inline __device__ Float8_ fma(float a, fp8_8_t b, Float8_ fc)
 
     fp8_8 = b;
 
-    fd.x = fma(a, float2(fp8_2[0]), fc.x);
-    fd.y = fma(a, float2(fp8_2[1]), fc.y);
-    fd.z = fma(a, float2(fp8_2[2]), fc.z);
-    fd.w = fma(a, float2(fp8_2[3]), fc.w);
+    fd.x = fma(a, fp8x2_to_float2(fp8_2[0]), fc.x);
+    fd.y = fma(a, fp8x2_to_float2(fp8_2[1]), fc.y);
+    fd.z = fma(a, fp8x2_to_float2(fp8_2[2]), fc.z);
+    fd.w = fma(a, fp8x2_to_float2(fp8_2[3]), fc.w);
 
     return fd;
 }
@@ -1337,10 +1342,10 @@ inline __device__ Float8_ fma(bf16_8_t a, fp8_8_t b, Float8_ fc)
 
     fp8_8 = b;
 
-    fd.x = fma(a.x, float2(fp8_2[0]), fc.x);
-    fd.y = fma(a.y, float2(fp8_2[1]), fc.y);
-    fd.z = fma(a.z, float2(fp8_2[2]), fc.z);
-    fd.w = fma(a.w, float2(fp8_2[3]), fc.w);
+    fd.x = fma(a.x, fp8x2_to_float2(fp8_2[0]), fc.x);
+    fd.y = fma(a.y, fp8x2_to_float2(fp8_2[1]), fc.y);
+    fd.z = fma(a.z, fp8x2_to_float2(fp8_2[2]), fc.z);
+    fd.w = fma(a.w, fp8x2_to_float2(fp8_2[3]), fc.w);
 
     return fd;
 }
@@ -2137,10 +2142,10 @@ inline __device__ Float8_ mul(uint4 a, fp8_8_t b)
 
     fp8_8 = b;
 
-    fc.x = mul<float2, uint32_t, float2>(a.x, float2(fp8_2[0]));
-    fc.y = mul<float2, uint32_t, float2>(a.y, float2(fp8_2[1]));
-    fc.z = mul<float2, uint32_t, float2>(a.z, float2(fp8_2[2]));
-    fc.w = mul<float2, uint32_t, float2>(a.w, float2(fp8_2[3]));
+    fc.x = mul<float2, uint32_t, float2>(a.x, fp8x2_to_float2(fp8_2[0]));
+    fc.y = mul<float2, uint32_t, float2>(a.y, fp8x2_to_float2(fp8_2[1]));
+    fc.z = mul<float2, uint32_t, float2>(a.z, fp8x2_to_float2(fp8_2[2]));
+    fc.w = mul<float2, uint32_t, float2>(a.w, fp8x2_to_float2(fp8_2[3]));
 
     return fc;
 }
@@ -2160,10 +2165,10 @@ inline __device__ Float8_ mul(Float8_ fa, fp8_8_t b)
 
     fp8_8 = b;
 
-    fc.x = mul<float2, float2, float2>(fa.x, float2(fp8_2[0]));
-    fc.y = mul<float2, float2, float2>(fa.y, float2(fp8_2[1]));
-    fc.z = mul<float2, float2, float2>(fa.z, float2(fp8_2[2]));
-    fc.w = mul<float2, float2, float2>(fa.w, float2(fp8_2[3]));
+    fc.x = mul<float2, float2, float2>(fa.x, fp8x2_to_float2(fp8_2[0]));
+    fc.y = mul<float2, float2, float2>(fa.y, fp8x2_to_float2(fp8_2[1]));
+    fc.z = mul<float2, float2, float2>(fa.z, fp8x2_to_float2(fp8_2[2]));
+    fc.w = mul<float2, float2, float2>(fa.w, fp8x2_to_float2(fp8_2[3]));
 
     return fc;
 }
@@ -2184,8 +2189,8 @@ inline __device__ Float4_ mul(float fa, fp8_4_t b)
     fp8_4 = b;
     float2 fa2 = make_float2(fa, fa);
 
-    fc.x = mul<float2, float2, float2>(fa2, float2(fp8_2[0]));
-    fc.y = mul<float2, float2, float2>(fa2, float2(fp8_2[1]));
+    fc.x = mul<float2, float2, float2>(fa2, fp8x2_to_float2(fp8_2[0]));
+    fc.y = mul<float2, float2, float2>(fa2, fp8x2_to_float2(fp8_2[1]));
 
     return fc;
 }
@@ -2215,10 +2220,10 @@ inline __device__ Float8_ mul(float fa, fp8_8_t b)
     fp8_8 = b;
     float2 fa2 = make_float2(fa, fa);
 
-    fc.x = mul<float2, float2, float2>(fa2, float2(fp8_2[0]));
-    fc.y = mul<float2, float2, float2>(fa2, float2(fp8_2[1]));
-    fc.z = mul<float2, float2, float2>(fa2, float2(fp8_2[2]));
-    fc.w = mul<float2, float2, float2>(fa2, float2(fp8_2[3]));
+    fc.x = mul<float2, float2, float2>(fa2, fp8x2_to_float2(fp8_2[0]));
+    fc.y = mul<float2, float2, float2>(fa2, fp8x2_to_float2(fp8_2[1]));
+    fc.z = mul<float2, float2, float2>(fa2, fp8x2_to_float2(fp8_2[2]));
+    fc.w = mul<float2, float2, float2>(fa2, fp8x2_to_float2(fp8_2[3]));
 
     return fc;
 }
@@ -2238,10 +2243,10 @@ inline __device__ Float8_ mul(bf16_8_t a, fp8_8_t b)
 
     fp8_8 = b;
 
-    fc.x = mul<float2, __nv_bfloat162, float2>(a.x, float2(fp8_2[0]));
-    fc.y = mul<float2, __nv_bfloat162, float2>(a.y, float2(fp8_2[1]));
-    fc.z = mul<float2, __nv_bfloat162, float2>(a.z, float2(fp8_2[2]));
-    fc.w = mul<float2, __nv_bfloat162, float2>(a.w, float2(fp8_2[3]));
+    fc.x = mul<float2, __nv_bfloat162, float2>(a.x, fp8x2_to_float2(fp8_2[0]));
+    fc.y = mul<float2, __nv_bfloat162, float2>(a.y, fp8x2_to_float2(fp8_2[1]));
+    fc.z = mul<float2, __nv_bfloat162, float2>(a.z, fp8x2_to_float2(fp8_2[2]));
+    fc.w = mul<float2, __nv_bfloat162, float2>(a.w, fp8x2_to_float2(fp8_2[3]));
     return fc;
 }
 
@@ -2260,8 +2265,8 @@ inline __device__ float4 mul(float4 fa, fp8_4_t b)
 
     fp8_4 = b;
 
-    float2 fb0 = float2(fp8_2[0]);
-    float2 fb1 = float2(fp8_2[1]);
+    float2 fb0 = fp8x2_to_float2(fp8_2[0]);
+    float2 fb1 = fp8x2_to_float2(fp8_2[1]);
 
     fc.x = fa.x * fb0.x;
     fc.y = fa.y * fb0.y;
@@ -3441,24 +3446,24 @@ inline __device__ void convert_from_fp8(float* v, const __nv_fp8_e4m3 u)
 
 inline __device__ void convert_from_fp8(float2* v, const fp8_2_t u)
 {
-    v[0] = float2(u);
+    v[0] = fp8x2_to_float2(u);
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 inline __device__ void convert_from_fp8(float4* v, const fp8_4_t u)
 {
-    v[0] = float4(u);
+    v[0] = fp8x4_to_float4(u);
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 inline __device__ void convert_from_fp8(Float8_* v, const fp8_8_t u)
 {
-    v[0].x = float2(u.x);
-    v[0].y = float2(u.y);
-    v[0].z = float2(u.z);
-    v[0].w = float2(u.w);
+    v[0].x = fp8x2_to_float2(u.x);
+    v[0].y = fp8x2_to_float2(u.y);
+    v[0].z = fp8x2_to_float2(u.z);
+    v[0].w = fp8x2_to_float2(u.w);
 }
 #endif // ENALBE_FP8
 

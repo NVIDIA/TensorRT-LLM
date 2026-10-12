@@ -9,6 +9,7 @@ from tensorrt_llm._torch.configs.kimi_linear import KimiLinearConfig
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models import modeling_kimi_linear
 from tensorrt_llm._torch.utils import AuxStreamType
+from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
 pytestmark = pytest.mark.cpu_only
 
@@ -54,3 +55,33 @@ def test_kimi_linear_model_builds_shared_aux_stream_registry(
     assert aux_stream_dict[AuxStreamType.MoeOutputMemset] is streams[3]
     assert len(layer_aux_stream_dicts) == config.num_hidden_layers
     assert all(stream_dict is aux_stream_dict for stream_dict in layer_aux_stream_dicts)
+
+
+def test_kimi_k3_routed_expert_exclusion_outranks_the_checkpoint_entry() -> None:
+    """An excluded layer drops the checkpoint's per-layer format, and only it.
+
+    Both layers carry the same per-layer NVFP4 entry, so the two resolutions
+    differ only by the exclusion. Without the exclusion winning, layer 3 keeps
+    NVFP4 and loads quantized weights the checkpoint left in bf16 -- wrong
+    numerics rather than a failure. ``kv_cache_quant_algo`` is not part of what
+    an expert exclusion turns off, so it has to survive.
+    """
+    per_layer = QuantConfig(quant_algo=QuantAlgo.NVFP4, group_size=16)
+    model_config = ModelConfig(
+        quant_config=QuantConfig(
+            quant_algo=QuantAlgo.NVFP4,
+            kv_cache_quant_algo=QuantAlgo.FP8,
+            exclude_modules=["model.layers.3.mlp.experts"],
+        ),
+        quant_config_dict={
+            "model.layers.3.mlp.experts": per_layer,
+            "model.layers.4.mlp.experts": per_layer,
+        },
+    )
+    resolve = modeling_kimi_linear.KimiK3MoERuntime._resolve_routed_quant_config
+
+    excluded = resolve(model_config, 3)
+    assert excluded.quant_algo is None
+    assert excluded.kv_cache_quant_algo == QuantAlgo.FP8
+
+    assert resolve(model_config, 4) is per_layer

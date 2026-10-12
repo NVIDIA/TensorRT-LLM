@@ -29,8 +29,9 @@ Two implementations for the coordinator/worker deployment:
   coordinator's ``/select`` / ``/finish`` handlers.
 * :class:`CoordinatorClient` -- runs in each forked worker. Stateful routers
   (conversation, centralized) are wrapped in a :class:`CoordinatorDelegatingRouter`
-  that posts the routing key to ``/select`` (finish -> ``/finish``); stateless
-  routers (round_robin, load_balancing) place locally in the worker. Readiness /
+  that posts the routing key to ``/select`` (finish -> ``/finish``). The
+  round-robin router places locally; load-balancing, conversation, and
+  KV-cache-aware routers delegate to preserve global routing state. Readiness /
   cluster_info proxy the coordinator over HTTP.
 """
 
@@ -77,6 +78,7 @@ __all__ = [
 
 COORDINATOR_RESERVATION_TIMEOUT_ENV = "TRTLLM_DISAGG_COORDINATOR_RESERVATION_TIMEOUT"
 COORDINATOR_RESERVATION_TIMEOUT_DEFAULT_S = 180.0
+COORDINATOR_RESERVATION_LOCK_STRIPES = 256
 COORDINATOR_STATE_SYNC_INTERVAL_S = 3.0
 
 
@@ -134,6 +136,7 @@ class DisaggCoordinatorService(DisaggCoordinator):
         server_start_timeout_secs: int = 180,
         health_check_interval_secs: int = 3,
         reservation_timeout_secs: Optional[float] = None,
+        request_timeout_secs: Optional[float] = None,
     ):
         self._config = config
         self._client_factory = client_factory
@@ -167,12 +170,19 @@ class DisaggCoordinatorService(DisaggCoordinator):
         )
         self._server_start_timeout_secs = server_start_timeout_secs
         self._health_check_interval_secs = health_check_interval_secs
-        self._reservation_timeout_secs = (
+        configured_reservation_timeout = (
             coordinator_reservation_timeout()
             if reservation_timeout_secs is None
             else reservation_timeout_secs
         )
+        self._reservation_timeout_secs = max(
+            configured_reservation_timeout,
+            request_timeout_secs or 0,
+        )
         self._reservation_tasks: dict[tuple[str, int], asyncio.Task] = {}
+        self._reservation_locks = [
+            asyncio.Lock() for _ in range(COORDINATOR_RESERVATION_LOCK_STRIPES)
+        ]
 
         self._ctx_client: Optional[OpenAIClient] = None
         self._gen_client: Optional[OpenAIClient] = None
@@ -214,18 +224,20 @@ class DisaggCoordinatorService(DisaggCoordinator):
         self, role: str, routing_key, req_id, exclude_server: Optional[str]
     ) -> Tuple[str, dict, Optional[str]]:
         _t0 = time.monotonic()
-        router = self._router_for_role(role)
-        reservation_key = (self._normalize_role(role), req_id)
-        previous = self._reservation_tasks.pop(reservation_key, None)
-        if previous is not None:
-            previous.cancel()
-            await router.finish_request_by_id(req_id, False)
-        server, info, request_id = await router.get_next_server_by_key(
-            routing_key, req_id=req_id, exclude_server=exclude_server
-        )
-        self._reservation_tasks[reservation_key] = asyncio.create_task(
-            self._expire_reservation(reservation_key, router)
-        )
+        normalized_role = self._normalize_role(role)
+        router = self._router_for_role(normalized_role)
+        reservation_key = (normalized_role, req_id)
+        async with self._reservation_lock(reservation_key):
+            previous = self._reservation_tasks.pop(reservation_key, None)
+            if previous is not None:
+                previous.cancel()
+                await router.finish_request_by_id(req_id, False)
+            server, info, request_id = await router.get_next_server_by_key(
+                routing_key, req_id=req_id, exclude_server=exclude_server
+            )
+            self._reservation_tasks[reservation_key] = asyncio.create_task(
+                self._expire_reservation(reservation_key, router)
+            )
         self._api_lat(f"select[{role}]").record(time.monotonic() - _t0)
         return server, self._compact_route_info(info), request_id
 
@@ -242,23 +254,47 @@ class DisaggCoordinatorService(DisaggCoordinator):
 
     async def finish(self, role: str, req_id, success: bool = True) -> None:
         _t0 = time.monotonic()
-        reservation = self._reservation_tasks.pop((self._normalize_role(role), req_id), None)
-        if reservation is not None:
-            reservation.cancel()
-        await self._router_for_role(role).finish_request_by_id(req_id, success)
+        normalized_role = self._normalize_role(role)
+        reservation_key = (normalized_role, req_id)
+        async with self._reservation_lock(reservation_key):
+            reservation = self._reservation_tasks.pop(reservation_key, None)
+            if reservation is not None:
+                reservation.cancel()
+            await self._router_for_role(normalized_role).finish_request_by_id(req_id, success)
         self._api_lat(f"finish[{role}]").record(time.monotonic() - _t0)
+
+    async def renew(self, role: str, req_id) -> None:
+        """Extend an active reservation while a worker retries its backend request."""
+        normalized_role = self._normalize_role(role)
+        reservation_key = (normalized_role, req_id)
+        async with self._reservation_lock(reservation_key):
+            reservation = self._reservation_tasks.get(reservation_key)
+            if reservation is None:
+                raise ValueError(
+                    f"No active coordinator reservation for role={normalized_role}, req_id={req_id}"
+                )
+            reservation.cancel()
+            self._reservation_tasks[reservation_key] = asyncio.create_task(
+                self._expire_reservation(reservation_key, self._router_for_role(normalized_role))
+            )
 
     async def _expire_reservation(self, key: tuple[str, int], router: Router) -> None:
         try:
             await asyncio.sleep(self._reservation_timeout_secs)
+        except asyncio.CancelledError:
+            raise
+        async with self._reservation_lock(key):
+            if self._reservation_tasks.get(key) is not asyncio.current_task():
+                return
+            self._reservation_tasks.pop(key, None)
             logger.warning(
                 f"Releasing stale coordinator reservation for role={key[0]}, "
                 f"req_id={key[1]} after {self._reservation_timeout_secs}s"
             )
             await router.finish_request_by_id(key[1], False)
-        finally:
-            if self._reservation_tasks.get(key) is asyncio.current_task():
-                self._reservation_tasks.pop(key, None)
+
+    def _reservation_lock(self, key: tuple[str, int]) -> asyncio.Lock:
+        return self._reservation_locks[hash(key) % len(self._reservation_locks)]
 
     @staticmethod
     def _normalize_role(role: str) -> str:
@@ -452,15 +488,16 @@ def make_coordinator_session(remote_url: str) -> aiohttp.ClientSession:
 
 
 class CoordinatorClient(DisaggCoordinator):
-    """Worker-side coordinator: delegate stateful routing to the coordinator.
+    """Worker-side coordinator: delegate global routing to the coordinator.
 
-    A *stateful* router (conversation, centralized -- it exposes
+    A router that needs globally shared state (load_balancing, conversation,
+    centralized -- it exposes
     ``get_next_server_by_key``) is wrapped in a :class:`CoordinatorDelegatingRouter`
     so the worker computes the small routing key locally and the coordinator makes
-    the placement (placement -> ``/select``, finish -> ``/finish``). A *stateless*
-    router (round_robin, load_balancing) is used as-is and places locally in the
-    worker -- no coordinator round-trip. A background ``/cluster_info`` poll keeps
-    readiness and stateless-router server lists synchronized with the coordinator.
+    the placement (placement -> ``/select``, finish -> ``/finish``). The
+    round-robin router is used as-is and places locally in the worker. A background
+    ``/cluster_info`` poll keeps readiness and local-router server lists synchronized
+    with the coordinator.
 
     Args:
         remote_url: Coordinator base URL (e.g. ``http://host:PORT``).
@@ -515,9 +552,9 @@ class CoordinatorClient(DisaggCoordinator):
         self._gen_router = self._maybe_delegate(gen_router, "generation")
 
     def _maybe_delegate(self, local_router: Router, role: str) -> Router:
-        # Stateful routers expose get_next_server_by_key -> delegate placement to
-        # the coordinator; stateless ones place locally (used unchanged). Pass the
-        # RAW url so the delegating router picks the UDS connector when applicable.
+        # Routers that expose get_next_server_by_key delegate placement to the
+        # coordinator. Round-robin remains local. Pass the RAW url so the
+        # delegating router picks the UDS connector when applicable.
         if hasattr(local_router, "get_next_server_by_key"):
             return CoordinatorDelegatingRouter(
                 self._remote_url_raw, local_router, role, self._request_timeout_s
@@ -608,7 +645,7 @@ class CoordinatorClient(DisaggCoordinator):
     async def _apply_cluster_info(self, info: Dict[str, Any]) -> None:
         self._is_ready = info.get("is_ready", False)
         self._sync_delegating_router_configs(info)
-        await self._sync_stateless_routers(info)
+        await self._sync_router_server_lists(info)
 
     def _sync_delegating_router_configs(self, info: Dict[str, Any]) -> None:
         configs = info.get("routing_key_configs", {})
@@ -618,7 +655,7 @@ class CoordinatorClient(DisaggCoordinator):
             if config is not None and isinstance(local, KvCacheAwareRouter):
                 local.set_routing_key_config(config)
 
-    async def _sync_stateless_routers(self, info: Dict[str, Any]) -> None:
+    async def _sync_router_server_lists(self, info: Dict[str, Any]) -> None:
         server_lists = info.get("server_lists")
         if server_lists is None:
             return
@@ -628,6 +665,7 @@ class CoordinatorClient(DisaggCoordinator):
         )
         for router, servers in router_servers:
             if isinstance(router, CoordinatorDelegatingRouter):
+                await router.sync_servers(servers)
                 continue
             desired = set(servers)
             for server in desired - set(router.servers):

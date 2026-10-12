@@ -21,10 +21,13 @@ AUTOTUNER_MARKER = "[Autotuner]"
 AUTOTUNER_BENIGN_TEXTS = [
     "out of memory",
 ]
+ENDPOINT_RETRY_MARKER = "is not ready, with exception:"
 
 
 def is_benign_line(line: str) -> bool:
     """True for lines expected during a HEALTHY run despite an error keyword."""
+    if ENDPOINT_RETRY_MARKER in line:
+        return True
     return AUTOTUNER_MARKER in line and any(text in line for text in AUTOTUNER_BENIGN_TEXTS)
 
 

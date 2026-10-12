@@ -23,6 +23,7 @@ Everything here exercises the pure-Python weight-loading logic on small
 synthetic tensors, so it runs on CPU.
 """
 
+import pytest
 import torch
 
 from tensorrt_llm._torch.moe.fused_moe import quantization
@@ -30,6 +31,10 @@ from tensorrt_llm._torch.moe.fused_moe.quantization import (
     NVFP4FusedMoEMethod,
     NVFP4TRTLLMGenFusedMoEBaseMethod,
 )
+
+# The marker is what makes the file reachable: the CPU stage collects only
+# files that carry it.
+pytestmark = pytest.mark.cpu_only
 
 
 class _StubNVFP4Method(NVFP4FusedMoEMethod):

@@ -13,8 +13,11 @@ Run:
     pytest tests/unittest/_torch/visual_gen/test_wan_vsa_pipeline.py -v -s
 """
 
+import contextlib
 import gc
 import os
+from types import SimpleNamespace
+from typing import Iterator
 
 os.environ["TLLM_DISABLE_MPI"] = "1"
 
@@ -108,6 +111,30 @@ def _cosine_similarity(a: torch.Tensor, b: torch.Tensor) -> float:
     return F.cosine_similarity(a_flat.unsqueeze(0), b_flat.unsqueeze(0)).clamp(-1.0, 1.0).item()
 
 
+@contextlib.contextmanager
+def _count_cute_fine_stage_launches() -> Iterator[SimpleNamespace]:
+    """Count CuTe VSA fine-stage launches without retaining their arguments.
+
+    A recording mock would keep every layer's Q/K/V alive for the whole
+    denoising loop, so a plain counting wrapper is used instead.
+    """
+    from unittest.mock import patch
+
+    from tensorrt_llm._torch.visual_gen.attention_backend.sparse.vsa.backend import (
+        VSACuTeDSLAttention,
+    )
+
+    launches = SimpleNamespace(count=0)
+    original = VSACuTeDSLAttention._execute_sparse_fine
+
+    def counted(self, inputs):
+        launches.count += 1
+        return original(self, inputs)
+
+    with patch.object(VSACuTeDSLAttention, "_execute_sparse_fine", counted):
+        yield launches
+
+
 def _assert_vsa_matches_dense(
     checkpoint_subdir: str,
     height: int,
@@ -120,7 +147,7 @@ def _assert_vsa_matches_dense(
     """Compare CuTe-DSL VSA against SDPA-fallback VSA (same gated formulation, different fine kernel)."""
     from unittest.mock import patch
 
-    from tensorrt_llm._torch.visual_gen.attention_backend.cute_dsl import vsa as _vsa_module
+    from tensorrt_llm._torch.visual_gen.attention_backend.sparse.vsa import backend as _vsa_module
 
     common_kwargs = dict(
         prompt=PROMPT,
@@ -135,15 +162,24 @@ def _assert_vsa_matches_dense(
 
     # --- CuTe-DSL path ---
     vsa_pipe = _load_vsa_pipeline(checkpoint_subdir, vsa_sparsity=vsa_sparsity)
-    vsa_video = _capture_trtllm_video(vsa_pipe, **common_kwargs)
+    with _count_cute_fine_stage_launches() as cute_fine_stage:
+        vsa_video = _capture_trtllm_video(vsa_pipe, **common_kwargs)
+    assert cute_fine_stage.count > 0, f"{model_label}: the CuTe-DSL fine stage never ran"
     del vsa_pipe
     gc.collect()
     torch.cuda.empty_cache()
 
     # --- SDPA fallback reference (same VSA formulation, fine attn via SDPA) ---
     sdpa_pipe = _load_vsa_pipeline(checkpoint_subdir, vsa_sparsity=vsa_sparsity)
-    with patch.object(_vsa_module, "is_cute_supported", return_value=False):
+    with (
+        patch.object(_vsa_module, "is_cute_supported", return_value=False),
+        _count_cute_fine_stage_launches() as sdpa_fine_stage,
+    ):
         sdpa_video = _capture_trtllm_video(sdpa_pipe, **common_kwargs)
+    # The fine stage has exactly two implementations, so no CuTe launch means SDPA ran.
+    assert sdpa_fine_stage.count == 0, (
+        f"{model_label}: the SDPA reference still ran the CuTe-DSL fine stage"
+    )
     del sdpa_pipe
     gc.collect()
     torch.cuda.empty_cache()

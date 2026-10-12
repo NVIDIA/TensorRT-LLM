@@ -24,14 +24,16 @@ install_boost() {
 }
 
 set_bash_env() {
-  if [ ! -f ${BASH_ENV} ];then
-    touch ${BASH_ENV}
+  # The wrapper installed at `ENV` sources this original file with xtrace disabled.
+  local original_sh_env="${TRTLLM_ORIGINAL_SH_ENV:-${ENV}}"
+  if [ ! -f "${BASH_ENV}" ]; then
+    touch "${BASH_ENV}"
   fi
   # In the existing base images, as long as `ENV` is set, it will be enabled by `BASH_ENV`.
-  if [ ! -f ${ENV} ];then
-    touch ${ENV}
-    (echo "test -f ${ENV} && source ${ENV}" && cat ${BASH_ENV}) > /tmp/shinit_f
-    mv /tmp/shinit_f ${BASH_ENV}
+  if [ ! -f "${original_sh_env}" ]; then
+    touch "${original_sh_env}"
+    (echo "test -f \"${ENV}\" && source \"${ENV}\"" && cat "${BASH_ENV}") > /tmp/shinit_f
+    mv /tmp/shinit_f "${BASH_ENV}"
   fi
 }
 
@@ -114,17 +116,6 @@ init_ubuntu() {
   # the apt packages leaves pip3 functional.
 
   echo 'export LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH' >> "${ENV}"
-
-  # PRRTE cannot derive its install dirs on its own: the HPC-X Open MPI 5 in the
-  # NGC PyTorch base image is relocated away from the prefix it was built with,
-  # so prte_info resolves to /build-result/hpcx-*, a build-machine path absent
-  # from the container, and `prte --version` cannot find its help files. Open
-  # MPI itself is fine -- the base image already exports OPAL_PREFIX and puts
-  # /usr/local/mpi/bin on PATH. Only the DLFW base images carry /opt/hpcx.
-  if [ -d /opt/hpcx/ompi5 ]; then
-    echo 'export PRTE_PREFIX=/opt/hpcx/ompi5' >> "${ENV}"
-  fi
-
   # Remove previous TRT installation
   if [[ $(apt list --installed | grep libnvinfer) ]]; then
     apt-get remove --purge -y libnvinfer*
@@ -195,7 +186,7 @@ install_gcctoolset_rockylinux() {
     rdma-core-devel \
     zeromq-devel \
     -y
-  echo "source scl_source enable gcc-toolset-11" >> "${ENV}"
+  echo ". scl_source enable gcc-toolset-11" >> "${ENV}"
   echo 'export PATH=/usr/lib64/openmpi/bin:$PATH' >> "${ENV}"
 }
 

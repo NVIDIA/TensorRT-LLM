@@ -14,10 +14,76 @@
 # limitations under the License.
 """Shared sparse attention parameter types."""
 
+import os
 from dataclasses import dataclass
-from typing import Literal, Optional
+from typing import Literal, Optional, Protocol, runtime_checkable
 
 import torch
+
+_INDEXER_MQA_LOGITS_DEFAULT_ELEM_BUDGET = 1 << 31
+_INDEXER_MQA_LOGITS_BYTES_PER_ELEMENT = 4
+
+
+def get_indexer_mqa_logits_elem_budget() -> int:
+    """Return the per-call Indexer MQA-logits cap used by the runtime."""
+    return int(
+        os.environ.get(
+            "TLLM_INDEXER_MQA_LOGITS_ELEM_BUDGET", _INDEXER_MQA_LOGITS_DEFAULT_ELEM_BUDGET
+        )
+    )
+
+
+def get_indexer_mqa_logits_workspace_bytes(
+    max_num_tokens: Optional[int] = None, max_seq_len: Optional[int] = None
+) -> int:
+    """Return the reachable maximum bytes for one FP32 MQA-logits tile."""
+    elem_budget = get_indexer_mqa_logits_elem_budget()
+    if max_num_tokens is not None and max_seq_len is not None:
+        elem_budget = min(elem_budget, max_num_tokens * max_seq_len)
+    return elem_budget * _INDEXER_MQA_LOGITS_BYTES_PER_ELEMENT
+
+
+@runtime_checkable
+class MTPIndexShareMetadata(Protocol):
+    """Draft-loop state a sparse backend exposes so MTP can share one selection.
+
+    The three calls are used together for one draft loop, so a backend that
+    implements only some of them cannot serve the reuse at all.
+    """
+
+    def set_in_mtp_draft_loop(self, active: bool) -> None:
+        """Mark whether a draft loop is running."""
+
+    def set_mtp_num_accepted(self, num_accepted: Optional[torch.Tensor]) -> None:
+        """Supply the per-request accepted counts used to pick the capture row."""
+
+    def set_skip_topk(self, skip: bool) -> None:
+        """Ask the indexer to reuse its captured selection instead of scoring."""
+
+
+def use_self_sampling_gvr(
+    *,
+    enable_heuristic_topk: bool,
+    use_self_sampling_topk: bool,
+    index_topk: int | None,
+    compress_ratio: int,
+    is_cute_dsl_available: bool,
+    sm_version: int,
+) -> bool:
+    """Return whether the two-level dispatch picks the self-sampling engine.
+
+    Shared by the indexer (per-layer TopK construction) and the attention
+    metadata (prior-state allocation and warmup) so both sides of the
+    dispatch agree.
+    """
+    return (
+        enable_heuristic_topk
+        and use_self_sampling_topk
+        and is_cute_dsl_available
+        and sm_version in (100, 103)
+        and index_topk in (512, 1024, 2048)
+        and compress_ratio in (1, 4)
+    )
 
 
 class SparseParams:

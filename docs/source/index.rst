@@ -86,14 +86,13 @@ Welcome to TensorRT LLM's Documentation!
    features/speculative-decoding.md
    features/checkpoint-loading.md
    features/model-express.md
-   features/auto_deploy/auto-deploy.md
-   features/auto_deploy/transforms.rst
    features/ray-orchestrator.md
    features/torch_compile_and_piecewise_cuda_graph.md
    features/helix.md
    features/kv-cache-connector.md
    features/sparse-attention.md
    features/visual-generation.md
+   features/prefix-tokenization-cache.md
 
 
 .. toctree::

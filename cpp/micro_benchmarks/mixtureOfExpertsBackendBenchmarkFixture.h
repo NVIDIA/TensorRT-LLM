@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 1993-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 1993-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -21,7 +21,7 @@
 #include <nlohmann/json.hpp>
 
 #ifdef USING_OSS_CUTLASS_MOE_GEMM
-#include "tensorrt_llm/kernels/cutlass_kernels/include/moe_kernels.h"
+#include "tensorrt_llm/kernels/moe/cutlass/include/moe_kernels.h"
 #else
 #include "moe_kernels.h"
 #endif

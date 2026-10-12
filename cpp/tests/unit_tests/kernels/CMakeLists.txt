@@ -26,7 +26,7 @@ macro(remove_compile_definition TARGET_NAME DEFINITION)
   endif()
 endmacro()
 
-add_gtest(mixtureOfExpertsTest mixtureOfExpertsTest.cu)
+add_gtest(mixtureOfExpertsTest moe/mixtureOfExpertsTest.cu)
 
 # If we are using oss cutlass, build an explicit internal test
 if(USING_OSS_CUTLASS_MOE_GEMM)
@@ -37,7 +37,7 @@ if(USING_OSS_CUTLASS_MOE_GEMM)
   # with the internal cutlass kernels sources; the prebuilt tarball provides the
   # library and a reduced header set only.
   if(INTERNAL_CUTLASS_KERNELS_PATH)
-    add_gtest(mixtureOfExpertsInternalTest mixtureOfExpertsTest.cu)
+    add_gtest(mixtureOfExpertsInternalTest moe/mixtureOfExpertsTest.cu)
     remove_compile_definition(mixtureOfExpertsInternalTest
                               USING_OSS_CUTLASS_MOE_GEMM)
   endif()
@@ -54,7 +54,7 @@ add_gtest(cudaCoreGemmKernelTest cudaCoreGemm/cudaCoreGemmKernelTest.cpp)
 
 add_gtest(mlaChunkedPrefillTest mlaChunkedPrefillTest.cu)
 
-add_gtest(fusedMoeCommKernelTest fusedMoeCommKernelTest.cpp)
+add_gtest(fusedMoeCommKernelTest moe/fusedMoeCommKernelTest.cpp)
 
 add_gtest(
   gemmSwigluRunnerTest
@@ -86,20 +86,20 @@ foreach(target_name gemmSwigluRunnerTest;gemmSwigluKernelTestSm90Fp8)
 endforeach()
 
 set(ROUTING_KERNEL_TEST_SRC
-    routing/routingTest.cpp routing/routingLlama4Test.cpp
-    routing/routingCustomTest.cpp routing/routingDeepSeekTest.cpp)
+    moe/routing/routingTest.cpp moe/routing/routingLlama4Test.cpp
+    moe/routing/routingCustomTest.cpp moe/routing/routingDeepSeekTest.cpp)
 add_gtest(routingKernelsTest "${ROUTING_KERNEL_TEST_SRC}")
 target_link_libraries(routingKernelsTest PRIVATE Python3::Python)
 
-add_gtest(blockScaleMoeActivationTest blockScaleMoeActivationTest.cu)
-add_gtest(blockScaleMoeFinalizeTest blockScaleMoeFinalizeTest.cu)
+add_gtest(blockScaleMoeActivationTest moe/blockScaleMoeActivationTest.cu)
+add_gtest(blockScaleMoeFinalizeTest moe/blockScaleMoeFinalizeTest.cu)
 
-add_gtest(moeLoadBalanceKernelTest moeLoadBalanceKernelTest.cpp)
+add_gtest(moeLoadBalanceKernelTest moe/moeLoadBalanceKernelTest.cpp)
 
 if(USING_OSS_CUTLASS_MOE_GEMM)
-  add_gtest(moeLoraPointerExpandTest moeLoraPointerExpandTest.cu)
-  add_gtest(moeLoraProblemBuilderTest moeLoraProblemBuilderTest.cu)
-  add_gtest(moeLoraSlotExpandTest moeLoraSlotExpandTest.cu)
+  add_gtest(moeLoraPointerExpandTest moe/moeLoraPointerExpandTest.cu)
+  add_gtest(moeLoraProblemBuilderTest moe/moeLoraProblemBuilderTest.cu)
+  add_gtest(moeLoraSlotExpandTest moe/moeLoraSlotExpandTest.cu)
 endif()
 
 add_gtest(sparseKvCacheTest sparseKvCacheTest.cu)

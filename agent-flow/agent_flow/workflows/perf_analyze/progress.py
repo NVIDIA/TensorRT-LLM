@@ -57,11 +57,11 @@ from pathlib import Path
 from typing import Any
 
 import yaml
-from claude_agent_sdk import tool
 from rich.syntax import Syntax
 
 from agent_flow.console import print_layer_panel
 from agent_flow.logger import get_logger
+from agent_flow.tools import tool
 
 ANALYSIS_STAGE = "analysis"
 _AGENTS = ("benchmarker", "projector", "analyzer", "reporter")

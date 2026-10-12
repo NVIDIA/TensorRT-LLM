@@ -321,7 +321,7 @@ class GatherBenchmark:
                 q_pe=self.q_pe[:batch_size],
                 block_ids_per_seq=None,
                 attention_sinks=None,
-                is_fused_qkv=True,
+                is_fused_qkv=False,
                 update_kv_cache=True,
                 predicted_tokens_per_seq=1,
                 local_layer_idx=0,

@@ -16,6 +16,7 @@ include(FetchContent)
 
 set(SRCS
     utils/mpiUtils.cpp
+    mcastGroupComm.cpp
     utils/numpyUtils.cpp
     utils/runtimeUtils.cpp
     utils/debugUtils.cu
@@ -29,7 +30,6 @@ set(SRCS
     iTensor.cpp
     ipcUtils.cpp
     ipcSocket.cpp
-    ipcNvlsMemory.cu
     mcastDeviceMemory.cpp
     memoryCounters.cpp
     moeLoadBalancer/gdrwrap.cpp
@@ -63,6 +63,7 @@ add_library(runtime_src OBJECT ${SRCS})
 set_property(TARGET runtime_src PROPERTY POSITION_INDEPENDENT_CODE ON)
 set_property(TARGET runtime_src PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 add_cuda_architectures(runtime_src 89)
+target_link_libraries(runtime_src PUBLIC ipc_nvls_memory_src)
 
 target_include_directories(runtime_src PRIVATE ${MPI_C_INCLUDE_DIRS})
 
@@ -71,28 +72,7 @@ if(ENABLE_MULTI_DEVICE)
 endif()
 
 if(NOT WIN32)
-  find_package(libnuma QUIET CONFIG)
-
-  if(NOT libnuma_FOUND)
-    message(
-      STATUS "libnuma not found via Conan, falling back to system libnuma")
-    find_path(NUMA_INCLUDE_DIR numa.h)
-    find_library(NUMA_LIBRARY numa)
-
-    if(NUMA_INCLUDE_DIR AND NUMA_LIBRARY)
-      add_library(libnuma::libnuma UNKNOWN IMPORTED)
-      set_target_properties(
-        libnuma::libnuma
-        PROPERTIES IMPORTED_LOCATION "${NUMA_LIBRARY}"
-                   INTERFACE_INCLUDE_DIRECTORIES "${NUMA_INCLUDE_DIR}")
-    else()
-      message(FATAL_ERROR "NUMA library not found, please install libnuma-dev")
-    endif()
-  else()
-    message(STATUS "libnuma found.")
-  endif()
-  target_link_libraries(runtime_src PUBLIC libnuma::libnuma)
-  target_link_options(runtime_src PUBLIC ${CONAN_LIBNUMA_LINK_OPTIONS})
+  target_link_libraries(runtime_src PUBLIC NUMA::NUMA)
 endif()
 
 # Add utils subdirectory for pg_utils module

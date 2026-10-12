@@ -423,12 +423,12 @@ std::vector<CutlassGemmConfig> get_candidate_configs_sm100_dynamic_cluster_shape
     if ((config & CutlassGemmConfig::MXFP8_MXFP8) != 0)
     {
         // MXFP8xMXFP8 always instantiates the Mxf8f6f4 block-scaled tensor-op
-        // with cutlass::arch::Sm100, even on SM103 (the SM103 dispatch case in
+        // with cutlass::arch::Sm100, even on SM103/SM107 (the SM103 dispatch case in
         // dispatchMoeGemmSelectTileShapeTmaWarpSpecialized only handles FP4xFP4;
         // MXFP8 falls through to the sm_version>=100 && <120 branch which
         // instantiates Arch=Sm100). Therefore the TMA-only constraint enforced
         // by getDispatchFunctionForSM100 (Arch::kMinComputeCapability==103 is
-        // false for Sm100) applies on both SM100 and SM103, so we filter out
+        // false for Sm100) applies on SM100, SM103 and SM107, so we filter out
         // non-TMA epilogue candidates unconditionally here.
         if (schedule != EpilogueScheduleType::TMA)
             return {};

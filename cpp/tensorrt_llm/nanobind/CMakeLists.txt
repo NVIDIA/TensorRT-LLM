@@ -11,7 +11,6 @@ set(SRCS
     batch_manager/kvCacheManager.cpp
     batch_manager/kvCacheManagerV2Utils.cpp
     batch_manager/kvCacheManagerV2.cpp
-    batch_manager/llmRequest.cpp
     common/tllmExceptions.cpp
     executor/bindings.cpp
     executor/executorConfig.cpp
@@ -26,7 +25,6 @@ set(SRCS
     userbuffers/bindings.cpp
     thop/bindings.cpp
     visual_gen/coordinatorWatchdog.cpp
-    ../runtime/ipcNvlsMemory.cu
     bindings.cpp)
 
 include_directories(${PROJECT_SOURCE_DIR}/include)

@@ -42,7 +42,6 @@ class KdaInputs:
     output_norm_weight: torch.Tensor
     state_storage: torch.Tensor
     state_indices: torch.Tensor | None
-    cu_seqlens: torch.Tensor
 
 
 def _state_view(
@@ -198,7 +197,6 @@ def _make_inputs(
         ),
         state_storage=state_storage,
         state_indices=state_indices,
-        cu_seqlens=torch.arange(batch_size + 1, device="cuda", dtype=torch.int32),
     )
 
 
@@ -326,26 +324,24 @@ def _assert_parity(
 @pytest.mark.parametrize("batch_size", [1, 17, 32])
 @pytest.mark.parametrize("num_heads", [2, 3, 4, 6, 12, 96])
 @pytest.mark.parametrize(
-    (
-        "use_state_indices,"
-        "update_conv_cache,state_slot_gap,apply_output_norm,apply_beta_sigmoid,gate_lower_bound"
-    ),
+    ("use_state_indices", "state_slot_gap", "update_conv_cache"),
     [
-        pytest.param(True, False, None, True, True, -5.0, id="indexed"),
-        pytest.param(False, False, None, False, False, None, id="batch-local-softplus-decay"),
-        pytest.param(True, True, 73728, True, True, -5.0, id="indexed-conv-strided"),
+        pytest.param(False, None, False, id="batch-local"),
+        pytest.param(True, None, True, id="indexed"),
+        pytest.param(True, 73728, False, id="indexed-strided-state"),
+        pytest.param(True, 73728, True, id="indexed-conv-strided"),
     ],
 )
 def test_kda_decode_matches_fla(
     batch_size: int,
     num_heads: int,
     use_state_indices: bool,
-    update_conv_cache: bool,
     state_slot_gap: int | None,
-    apply_output_norm: bool,
-    apply_beta_sigmoid: bool,
-    gate_lower_bound: float | None,
+    update_conv_cache: bool,
 ) -> None:
+    apply_output_norm = True
+    apply_beta_sigmoid = True
+    gate_lower_bound = -5.0
     head_dim = HEAD_DIM
     inputs = _make_inputs(
         batch_size=batch_size,
@@ -447,7 +443,6 @@ def test_kda_decode_matches_fla(
         inputs.output_norm_gate,
         inputs.output_norm_weight,
         inputs.state_indices,
-        inputs.cu_seqlens,
         actual_state,
         apply_output_norm,
         update_conv_cache,

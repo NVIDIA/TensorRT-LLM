@@ -2,7 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """V2 hybrid cache manager for QSA sparse attention."""
 
-from typing import TYPE_CHECKING, Dict, Optional
+from functools import cached_property
+from typing import TYPE_CHECKING, Dict, List, Optional
 
 import torch
 
@@ -11,8 +12,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import Role
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManagerV2
 from tensorrt_llm._utils import TensorWrapper, binding_to_torch_dtype, convert_to_torch_tensor
 from tensorrt_llm.bindings.internal.batch_manager import CacheType as CacheTypeCpp
-from tensorrt_llm.runtime.kv_cache_manager_v2 import BufferConfig, PageIndexMode
-from tensorrt_llm.runtime.kv_cache_manager_v2._config import DataRole
+from tensorrt_llm.runtime.kv_cache_manager_v2 import BufferConfig, DataRole, PageIndexMode
 
 from .constants import (
     QSA_INDEX_K_CACHE_DTYPE,
@@ -88,6 +88,23 @@ class QSAMambaHybridCacheManagerV2(MambaHybridCacheManagerV2):
             QSA_INDEX_POSITION: MapperKind.REPLICATED,
         }
 
+    @cached_property
+    def qsa_local_sparse_layer_ids(self) -> List[int]:
+        """Sparse layers this rank owns, in model order."""
+        return [
+            layer_id for layer_id in self.qsa_sparse_layer_ids if layer_id in self.layer_offsets
+        ]
+
+    @cached_property
+    def qsa_shared_topk_slots(self) -> Dict[int, int]:
+        """Row each sparse layer captures into in the shared MTP Top-K buffers.
+
+        Every sparse layer runs its own indexer projection over its own index
+        cache, so a captured selection is only valid for the layer that
+        produced it.
+        """
+        return {layer_id: slot for slot, layer_id in enumerate(self.qsa_local_sparse_layer_ids)}
+
     def _extra_buffers_per_layer(
         self,
         *,
@@ -97,9 +114,7 @@ class QSAMambaHybridCacheManagerV2(MambaHybridCacheManagerV2):
         index_size = (
             self.qsa_index_kv_heads * self.qsa_index_dim * _INDEX_K_ELEMENT_BYTES * tokens_per_block
         )
-        local_sparse_layers = [
-            layer_id for layer_id in self.qsa_sparse_layer_ids if layer_id in self.layer_offsets
-        ]
+        local_sparse_layers = self.qsa_local_sparse_layer_ids
         # Coordinates are request-wide, so all local indexers use one view.
         # Register the position role once; duplicating it on every sparse layer
         # wastes one three-axis int32 page per layer without adding state.

@@ -25,6 +25,10 @@ class FakeExecutorEffects(ExecutorEffects):
         self.failed: List[Tuple[str, List[LlmRequest], bool]] = []
         # Messages of collective-aligned fatal failures.
         self.fatal: List[str] = []
+        # Batches of gen-init requests whose executor resources were prepared.
+        self.prepared: List[List[LlmRequest]] = []
+        # Batches of deferred gen-init requests whose V2 KV growth was reverted.
+        self.reverted: List[List[LlmRequest]] = []
         # Interleaved history of every effect, for relative-order assertions.
         self.history: List[Tuple[str, object]] = []
         # Optional exception raised from fail_requests, to model a fatal error.
@@ -54,6 +58,14 @@ class FakeExecutorEffects(ExecutorEffects):
     def fail_fatal(self, error_msg: str) -> None:
         self.fatal.append(error_msg)
         self.history.append(("fatal", error_msg))
+
+    def prepare_gen_resources(self, requests: List[LlmRequest]) -> None:
+        self.prepared.append(list(requests))
+        self.history.append(("prepare", list(requests)))
+
+    def revert_ctx_alloc(self, requests: List[LlmRequest]) -> None:
+        self.reverted.append(list(requests))
+        self.history.append(("revert", list(requests)))
 
 
 class FakeRequestRegistry(ActiveRequestRegistry):

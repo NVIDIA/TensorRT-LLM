@@ -150,6 +150,29 @@ def test_autotuner_marker_does_not_hide_real_errors(tmp_path):
     assert "Error line 2" in str(e.value)
 
 
+def test_check_error_skips_the_waits_own_retry_messages(tmp_path):
+    """The readiness wait must not fail on its own progress output."""
+    log = _server_log(
+        tmp_path,
+        "endpoint http://h:8000/health is not ready, with exception: "
+        "ConnectionRefusedError(111, 'Connection refused')\n"
+        "loading weights\n",
+    )
+    assert check_error(log) == []
+
+
+def test_the_retry_marker_does_not_hide_a_real_connection_failure(tmp_path):
+    """Only the poller's own phrasing is benign, not the keyword on its own."""
+    log = _server_log(
+        tmp_path,
+        "endpoint http://h:8000/health is not ready, with exception: "
+        "ConnectionRefusedError(111, 'Connection refused')\n"
+        "ConnectionRefusedError: [Errno 111] connect to kv cache peer failed\n",
+    )
+    hits = check_error(log)
+    assert [idx for idx, _ in hits] == [2]
+
+
 def test_report_error_always_appends_tail_even_on_keyword_hit(tmp_path):
     """The first keyword hit may be noise; the fatal error can sit at EOF."""
     lines = ["ValueError: early benign-looking hit\n"]

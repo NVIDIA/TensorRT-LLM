@@ -928,8 +928,17 @@ class BasicAVTransformerBlock(nn.Module):
         text_kv_video: tuple[torch.Tensor, torch.Tensor] | None = None,
         text_kv_audio: tuple[torch.Tensor, torch.Tensor] | None = None,
         step_index=None,
+        timestep: torch.Tensor | None = None,
     ) -> tuple[TransformerArgs | None, TransformerArgs | None]:
         """Forward with optional perturbation masking for STG.
+
+        ``timestep`` is the normalized scheduler time in ``[0, 1]`` (larger =
+        noisier) that the attention backends consume for timestep-dependent
+        decisions such as the sparse-attention dense prefix. It is deliberately
+        *not* ``video.timesteps`` / ``audio.timesteps``: those are the AdaLN
+        modulation outputs -- learned activations -- and were previously passed
+        to attention as if they were the scheduler time, so any
+        ``disabled_until_timestep`` cutoff was compared against noise.
 
         Args:
             perturbations: Optional ``BatchedPerturbationConfig`` that masks
@@ -991,9 +1000,7 @@ class BasicAVTransformerBlock(nn.Module):
                     self._fuse_adaln,
                     fp4_input_scale=get_nvfp4_self_attn_input_scale(self.attn1),
                 )
-                v_attn_raw = self.attn1(
-                    norm_vx, pe=video.positional_embeddings, timestep=video.timesteps
-                )
+                v_attn_raw = self.attn1(norm_vx, pe=video.positional_embeddings, timestep=timestep)
                 if has_perturbations and perturbations.any_in_batch(
                     PerturbationType.SKIP_VIDEO_SELF_ATTN, self.idx
                 ):
@@ -1018,7 +1025,7 @@ class BasicAVTransformerBlock(nn.Module):
                 attn2_q_input,
                 context=video.context,
                 pre_projected_kv=text_kv_video,
-                timestep=video.timesteps,
+                timestep=timestep,
             )
 
         # --- Audio self-attention + text cross-attention ---
@@ -1049,7 +1056,7 @@ class BasicAVTransformerBlock(nn.Module):
                     norm_ax,
                     pe=audio.positional_embeddings,
                     key_padding_mask=audio.audio_padding_mask,
-                    timestep=audio.timesteps,
+                    timestep=timestep,
                 )
                 if has_perturbations and perturbations.any_in_batch(
                     PerturbationType.SKIP_AUDIO_SELF_ATTN, self.idx
@@ -1074,7 +1081,7 @@ class BasicAVTransformerBlock(nn.Module):
                 audio_attn2_q_input,
                 context=audio.context,
                 pre_projected_kv=text_kv_audio,
-                timestep=audio.timesteps,
+                timestep=timestep,
             )
 
         # --- Bidirectional audio ↔ video cross-attention ---
@@ -1233,7 +1240,7 @@ class BasicAVTransformerBlock(nn.Module):
                     pre_projected_kv=(k_a2v, v_a2v),
                     pe=video.cross_positional_embeddings,
                     key_padding_mask=audio.audio_padding_mask,
-                    timestep=video.timesteps,
+                    timestep=timestep,
                 )
                 if has_perturbations and perturbations.any_in_batch(
                     PerturbationType.SKIP_A2V_CROSS_ATTN, self.idx
@@ -1267,7 +1274,7 @@ class BasicAVTransformerBlock(nn.Module):
                             freqs=a_cross_pe,
                             kv_input=vx_scaled_v2a,
                             kv_freqs=video.cross_positional_embeddings,
-                            timestep=audio.timesteps,
+                            timestep=timestep,
                         )
                     else:
                         k_v2a, v_v2a = self.video_to_audio_attn.project_kv(
@@ -1286,7 +1293,7 @@ class BasicAVTransformerBlock(nn.Module):
                             ax_v2a_local,
                             pre_projected_kv=(k_v2a, v_v2a),
                             pe=a_cross_pe,
-                            timestep=audio.timesteps,
+                            timestep=timestep,
                         )
                     v2a_attn_raw = self._sp_all_gather(out_local, dim=1)
                 elif self._async_ulysses and self.video_to_audio_attn.is_ulysses:
@@ -1299,7 +1306,7 @@ class BasicAVTransformerBlock(nn.Module):
                         freqs=audio.cross_positional_embeddings,
                         kv_input=vx_scaled_v2a,
                         kv_freqs=video.cross_positional_embeddings,
-                        timestep=audio.timesteps,
+                        timestep=timestep,
                     )
                 else:
                     # v2a sync: with a Ulysses wrapper, K/V (video) stay seq-sharded
@@ -1320,7 +1327,7 @@ class BasicAVTransformerBlock(nn.Module):
                         ax_scaled_v2a,
                         pre_projected_kv=(k_v2a, v_v2a),
                         pe=audio.cross_positional_embeddings,
-                        timestep=audio.timesteps,
+                        timestep=timestep,
                     )
                 if has_perturbations and perturbations.any_in_batch(
                     PerturbationType.SKIP_V2A_CROSS_ATTN, self.idx
@@ -2235,9 +2242,10 @@ class LTXModel(BaseDiffusionModel):
             text_cache: Pre-computed step-invariant outputs from ``prepare_text_cache()``.
                 Always required — callers must invoke ``prepare_text_cache()`` first.
             timestep: Normalized denoising-time coordinate in ``[0, 1]``.
-                May be ``None`` for LTX-2 paths that rely only on per-modality
-                timestep values and do not need timestep-based CUDA graph
-                partitioning.
+                Threaded to every attention call; sparse-attention dense
+                prefixes (``disabled_until_timestep``) and the CUDA-graph phase
+                key both read it, so pipelines must pass the scheduler sigma
+                here. May be ``None`` only when neither is configured.
                 LTX-2 also carries per-modality timestep values in
                 ``video.timesteps`` / ``audio.timesteps`` for the reference
                 time-embedding path.
@@ -2333,6 +2341,7 @@ class LTXModel(BaseDiffusionModel):
                     ax,
                     perturbations=perturbations,
                     step_index=step_index,
+                    timestep=timestep,
                 )
                 if video_args is not None and vx is not None:
                     video_args = replace(video_args, x=vx)
@@ -2347,6 +2356,7 @@ class LTXModel(BaseDiffusionModel):
                     text_kv_video=v_kv[i] if v_kv else None,
                     text_kv_audio=a_kv[i] if a_kv else None,
                     step_index=step_index,
+                    timestep=timestep,
                 )
 
         # Gather sequences back to full length for output processing.

@@ -289,3 +289,34 @@ class TestRequireToolCallStopHook:
             "decision": "block",
             "reason": "please log progress!",
         }
+
+
+class TestSharedRequiredToolPolicy:
+    def test_all_policy_and_legacy_any_helper_remain_distinct(self, tmp_path):
+        from agent_flow.hooks import RequiredToolPolicy
+        from agent_flow.types import ToolCallEvent
+
+        required = ("append_progress", "update_status")
+        transcript = _write_transcript(
+            tmp_path / "turn.jsonl",
+            [
+                _user("work"),
+                _assistant_tool_use("mcp__agent-tools__append_progress"),
+            ],
+        )
+        assert called_required_tool_this_turn(transcript, required)
+        policy = RequiredToolPolicy(required)
+        policy.record(ToolCallEvent("mcp__agent-tools__append_progress", {}))
+        assert policy.missing == ("update_status",)
+        policy.record(ToolCallEvent("update_status", {}))
+        assert policy.missing == ()
+
+    def test_qualified_requirement_does_not_match_another_server(self):
+        from agent_flow.hooks import RequiredToolPolicy
+        from agent_flow.types import ToolCallEvent
+
+        policy = RequiredToolPolicy(("mcp__trusted__append_progress",))
+        policy.record(ToolCallEvent("mcp__other__append_progress", {}))
+        assert policy.missing == ("mcp__trusted__append_progress",)
+        policy.record(ToolCallEvent("mcp__trusted__append_progress", {}))
+        assert policy.missing == ()

@@ -39,7 +39,6 @@
 #include "tensorrt_llm/nanobind/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/nanobind/batch_manager/kvCacheManagerV2.h"
 #include "tensorrt_llm/nanobind/batch_manager/kvCacheManagerV2Utils.h"
-#include "tensorrt_llm/nanobind/batch_manager/llmRequest.h"
 #include "tensorrt_llm/nanobind/common/tllmExceptions.h"
 #include "tensorrt_llm/nanobind/executor/bindings.h"
 #include "tensorrt_llm/nanobind/kvCacheCompression/bindings.h"
@@ -448,7 +447,11 @@ NB_MODULE(TRTLLM_NB_MODULE, m)
         .def("get_ipc_ptrs",
             [](tr::IpcNvlsHandle& self) { return reinterpret_cast<uintptr_t>(self.ipc_uc_ptrs.data()); });
 
-    m.def("ipc_nvls_allocate", &tr::ipcNvlsAllocate, nb::rv_policy::reference);
+    // Adding the McastGroupComm overload made this an unresolved overload set. Bind the MPI one so
+    // the exported signature stays unchanged; the other takes a shared_ptr<McastGroupComm>, which
+    // has no Python-facing counterpart.
+    m.def(
+        "ipc_nvls_allocate", nb::overload_cast<size_t, std::set<int>>(&tr::ipcNvlsAllocate), nb::rv_policy::reference);
     m.def("ipc_nvls_free", &tr::ipcNvlsFree);
     m.def("ipc_nvls_supported", &tr::ipcNvlsSupported);
 

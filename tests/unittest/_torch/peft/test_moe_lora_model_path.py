@@ -149,8 +149,8 @@ def test_step3p7_moe_forward_passes_lora_params_to_routed_experts() -> None:
         need_fp32_gate=False,
         gate=MagicMock(return_value=torch.randn(num_tokens, 2)),
         experts=experts,
-        _use_python_clamp=False,
-        _moe_lora_enabled=True,
+        _use_python_experts=False,
+        _requires_python_clamp_weights=lambda: False,
         routed_scaling_factor=1.0,
     )
 
@@ -450,30 +450,37 @@ def test_step3p7_clamped_mlp_applies_gate_up_and_down_lora(gate_value: float) ->
 
 def test_step3p7_moe_lora_uses_clamp_capable_expert_path() -> None:
     """Step3p7 must not bypass routed-expert LoRA through its Python path."""
-    hidden_states = torch.randn(4, 8)
-    experts = MagicMock(return_value=torch.randn_like(hidden_states))
-    python_clamped_forward = MagicMock(return_value=torch.randn_like(hidden_states))
-    fake_self = SimpleNamespace(
-        hidden_size=hidden_states.shape[-1],
+    text_config = SimpleNamespace(
+        hidden_size=8,
+        moe_num_experts=2,
+        moe_top_k=2,
+        moe_intermediate_size=16,
+        moe_router_scaling_factor=1.0,
         need_fp32_gate=False,
-        gate=MagicMock(return_value=torch.randn(4, 2)),
-        experts=experts,
-        _use_python_clamp=True,
-        _clamp_weights_loaded=True,
-        _moe_lora_enabled=True,
-        _python_clamped_moe_forward=python_clamped_forward,
-        routed_scaling_factor=1.0,
+        torch_dtype=torch.float32,
+    )
+    model_config = SimpleNamespace(
+        pretrained_config=text_config,
+        mapping=SimpleNamespace(enable_attention_dp=True, tp_size=1),
+        lora_config=object(),
     )
 
-    Step3p7MoE.forward(
-        fake_self,
-        hidden_states,
-        SimpleNamespace(all_rank_num_tokens=[4]),
-        lora_params=_LORA_PARAMS_SENTINEL,
-    )
+    with (
+        patch.object(step3p7_module, "Linear", return_value=MagicMock()),
+        patch.object(
+            step3p7_module,
+            "_select_python_expert_path",
+            return_value=(1.0, True, "clamp"),
+        ),
+        patch.object(step3p7_module, "has_moe_lora_targets", return_value=True),
+        patch.object(step3p7_module, "create_moe", return_value=MagicMock()) as create_moe,
+        patch.object(Step3p7MoE, "_allocate_clamp_buffers") as allocate_clamp_buffers,
+    ):
+        moe = Step3p7MoE(model_config, layer_idx=0, aux_stream_dict={})
 
-    python_clamped_forward.assert_not_called()
-    assert experts.call_args.kwargs.get("lora_params") is _LORA_PARAMS_SENTINEL
+    assert moe._use_python_experts is False
+    assert create_moe.call_args.kwargs["activation"].clamp_after_silu is True
+    allocate_clamp_buffers.assert_not_called()
 
 
 def test_step3p7_attention_applies_lora_to_qkv_and_output() -> None:

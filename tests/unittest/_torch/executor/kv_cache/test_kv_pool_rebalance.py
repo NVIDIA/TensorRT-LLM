@@ -220,9 +220,11 @@ class TestCanPauseForRebalance:
         exe = _make_executor(is_shutdown=True)
         assert PyExecutor._can_pause_for_rebalance(exe) is False
 
-    def test_beam_width_gt_one_returns_false(self):
+    def test_beam_width_gt_one_is_allowed(self):
+        # suspend/resume already walk every beam and adjust() does not touch beam
+        # width; the tuner's target ratio is what had to become beam-aware.
         exe = _make_executor(max_beam_width=2)
-        assert PyExecutor._can_pause_for_rebalance(exe) is False
+        assert PyExecutor._can_pause_for_rebalance(exe) is True
 
     def test_drafter_present_returns_false(self):
         exe = _make_executor(drafter=MagicMock())
@@ -932,7 +934,6 @@ def _make_pp_loop_executor(monkeypatch, *, num_micro_batches=2, agreement=(True,
     exe._rebalance_kv_pools_now = MagicMock()
 
     # Per-iteration no-ops.
-    exe._handle_disagg_cache_errors_synced = MagicMock()
     exe._handle_control_request = MagicMock()
     exe._pad_attention_dp_dummy_request = MagicMock()
     exe._revert_gen_alloc = MagicMock()

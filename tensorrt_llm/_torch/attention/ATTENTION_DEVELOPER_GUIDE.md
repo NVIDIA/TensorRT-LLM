@@ -142,13 +142,14 @@ statically checkable without runtime signature inspection.
 
 Ordinary sparse variants use `attention_output_hidden_size` and the shared
 output allocation. DeepSeek-V4's fused epilogue instead uses the optional
-output-preparation hook to create one token-major O-LoRA output tensor. Its
-context- and generation-phase helpers allocate the private FP8 attention and
-scale buffers, then write the O-LoRA result into the corresponding token range.
-The shared MLA custom-op contract exposes exactly one mutable output tensor;
-`_create_outputs()` keeps that tensor in a single-entry list through forward
-and output projection. Phase-specific scratch buffers remain inside the
-DeepSeek-V4 algorithm module and do not widen the generic hook facade.
+output-preparation hook to create one token-major O-LoRA-sized output tensor.
+Its context- and generation-phase helpers allocate the private FP8 attention
+and scale buffers, run both O-LoRA projections, and write the final hidden
+states into the leading columns of that tensor. The shared MLA custom-op
+contract exposes exactly one mutable output tensor; `_create_outputs()` keeps
+that tensor in a single-entry list through forward and output projection.
+Phase-specific scratch buffers remain inside the DeepSeek-V4 algorithm module
+and do not widen the generic hook facade.
 
 Sparse prediction inputs stay out of shared MLA APIs. Algorithm modules wrap
 their module-to-backend inputs in a `SparseBackendForwardArgs` subclass and
@@ -214,6 +215,15 @@ that file for the current config/backend combinations. Consult the
 for the supported attention shapes; do not infer support from algorithm
 registration alone.
 
+| Algorithm | Sparse backend | Metadata | Cache manager |
+|---|---|---|---|
+| `csa2` | `CSA2TrtllmAttention`, with hardware-selected Flash helpers | `CSA2TrtllmMetadata` | `CSA2CacheManager` (V2) |
+
+CSA2 implements DeepSeek-V4.1 compressed sparse MLA. Its module adapter owns
+compression and shared KV/index sources; per-phase query tiles feed selected
+rows to attention. See the [CSA2 implementation guide](backends/sparse/csa2/README.md)
+for SM90, SM100-family and SM120/121 routing, persistent cache formats, and replay.
+
 Block-sparse FMHA is a kernel-library contract rather than a sparse algorithm.
 Algorithms lower their live routing state to an algorithm-neutral
 `BlockSparseForwardInputs`, nested at
@@ -223,11 +233,15 @@ routes, and optional token-validity bits mask ragged KV tails. Plans contain
 only static format, proxy, geometry, and capacity choices; every run receives
 the live routes, summaries, validity bits, page tables, and sequence lengths.
 
-`PrimsTSBlockSparseFmha` owns its wrapper-plan cache by default. Integrations
-whose attention layers execute serially may explicitly bind a model-scoped
-cache to reuse graph-stable route workspaces across compatible layers. The
-cache must not be shared by concurrent forwards; each independent model
-component must own separate state.
+`PrimsTSBlockSparseFmha` keeps its planned wrappers in the attention metadata
+(`TrtllmAttentionMetadata.fmha_plan_caches`), like the FlashInfer wrappers and
+the MSA plans. Every layer that runs with one metadata object plans each static
+profile once and reuses its graph-stable route workspace, so the sharing
+granularity is the metadata: one per batch in the LLM path, where each
+CUDA-graph batch size gets its own copy, and one per component and sequence
+shape in VisualGen, whose layers share a shape-keyed metadata cache. Layers
+that share a metadata object execute serially, so they never run a planned
+wrapper concurrently.
 
 `TrtllmAttention.block_sparse_attn_predict(q, k, v, metadata, forward_args)`
 is the backend hook that produces this payload; `prepare_sparse_runtime_params`
@@ -257,11 +271,15 @@ The core contract is:
   - `support_fused_rope()`
   - `support_fused_qkv()`
   - `support_mla()`
+  - `support_fp4_kv_cache()`
 - `runtime_workspace_bytes_per_token(model_config, mapping)` — the memory-accounting
   contract (default `0`); see below
 - `runtime_workspace_is_chunked_prefill_bounded(model_config)` — whether
   chunked prefill limits that workspace to the current KV chunk (default
   `True`)
+- `runtime_workspace_fixed_bytes(model_config, mapping, **capacities)` — retained
+  workspace sized by serving capacity rather than admitted attended-KV length
+  (default `0`)
 
 `**kwargs` is only a temporary compatibility path. It is merged into
 `AttentionForwardArgs`, rejects unknown fields, and must not be mixed with
@@ -286,6 +304,18 @@ from `max_num_tokens` (`TrtllmAttention.runtime_workspace_bytes_per_token`).
 NVFP4 sparse MLA reads the complete attended prefix even with chunked prefill,
 so it also returns `False` from
 `runtime_workspace_is_chunked_prefill_bounded`.
+
+CSA2 also gathers the complete compressed prefix during index prefill and
+declares a conservative gather rate even with chunked prefill. Its native
+index descriptor/radix arena follows maximum batch, draft width and sequence
+length, so it declares a separate fixed reserve for an eager arena and, when
+enabled, a shared CUDA graph arena. The estimator conservatively reserves the
+full arena capacity alongside the profiled peak: a decode arena may first be
+allocated after peak prefill, so its final retained bytes cannot safely be
+subtracted from that earlier peak.
+The attended-KV admission cap applies to the prefix gather, independently of
+the fixed graph arena. Projection, native/provider scratch and transient logits
+still require representative peak-memory profiling.
 
 ### 2.4 Capability reference
 
@@ -328,6 +358,42 @@ state).
 `TrtllmAttention` path. Its fields are algorithm-specific, not a generic
 sparse-attention ABI; `VanillaAttention` uses its own per-request contract.
 
+#### 3.1.1 Ragged verification rows
+
+DSA and DeepSeek-V4 keep request-major metadata for preparation, the indexer,
+KV ownership and overlap correction. Python `num_seqs` remains the request
+count. For ragged generation only, `presented_token_major()` temporarily
+presents one attention row per query token to the MLA RoPE/KV-append call and
+to FMHA selection plus dispatch. The native ops derive their sequence count
+from those runtime views; each generation row has query length one.
+
+The presentation swaps `kv_lens_cuda_runtime`, `kv_lens_runtime`,
+`prompt_lens_cpu_runtime`, `prompt_lens_cuda_runtime`,
+`host_request_types_runtime` and `kv_cache_block_offsets`. It also supplies
+the static row-capacity ceiling as `max_num_requests` for workspace sizing.
+All views and that capacity are restored on exit, including exceptional exit;
+`seq_lens` and request identities are not replaced.
+
+Preparation initializes both the indexer's per-row causal KV extents and the
+attention row extents on device, so prepare-to-forward callers can consume
+them immediately. `on_update_kv_lens()` refreshes those same buffers in place
+after device-side overlap correction. Device-selected windows must install
+their request map and KV corrections before that refresh/replay. Context
+attention rows start at zero; generation attention rows start at
+`num_contexts`, while generation tokens start at `num_ctx_tokens`.
+
+The module-level MLA prefix hook matches that presentation too. Ragged
+generation uses fixed-address, opt-in prefix buffers over generation rows
+(one query token per row), excluding the context prefix. KV prefixes scan
+the presented causal device extents, without extra reserved KV tokens.
+Prepare/update invalidation rebuilds them after overlap correction; uniform
+and context prefix preparation keep their existing paths.
+
+Uniform indexer scheduling uses the runtime query width, not the persistent
+draft-cap allocation width. Ragged generation is not supported with FlashMLA:
+its tile schedule uses a request-major scalar query width, so the backend
+rejects that combination before scheduling or dispatch.
+
 ### 3.2 KV-cache and decode-time semantics
 
 The main question is not just "does the backend read K and V?" but:
@@ -343,6 +409,21 @@ The main question is not just "does the backend read K and V?" but:
 A backend may support the score computation you want, but still be the wrong
 fit because it assumes a different KV-cache layout or a different decode-time
 update pattern.
+
+CSA2 uses model-native cache ownership and the following policies when block
+reuse is enabled (Encoder SWA is `PRIVATE` when reuse is disabled):
+
+| Storage | Ownership and format | Reuse policy |
+|---|---|---|
+| GLOBAL main/index | KV-source layers; 288-byte main and 68-byte index records sharing physical pages | `REQUIRED` |
+| Encoder SWA | Per layer; 528-byte E4M3 rows | `REQUIRED`, or `OPTIONAL` with Encoder replay |
+| Decoder SWA | Per layer; same row format | `PRIVATE` for eligible bounded replay; ordinary lifecycle for full prefill |
+| Ratio-two compressor state | Source owners; FP32 partial-group values/scores | Managed with the owner's page lifecycle |
+
+`CSA2TrtllmMetadata.prepare()` publishes owner tables, compression inputs,
+visibility and SWA read/write slots. Live accepted-length updates refresh
+captured buffers in place. Graph clones share reserved index arenas and query
+tiles; eager shape eviction must preserve every graph-owned allocation.
 
 #### 3.2.1 Common paged-KV model
 
@@ -398,8 +479,8 @@ independently with `is_supported(..., phase=...)`; a phased library accepts only
 phases backed by its corresponding `run_*()` entry point.
 
 `Fmha` owns both entry points. Libraries declare shared capabilities through
-class attributes, such as `supports_skip_correction` and
-`supports_block_sparse_inputs`, and override only
+class attributes, such as `supports_skip_correction`, `supports_block_sparse_inputs`,
+and `supports_fp4_mla`, and override only
 `_is_available()` and `_is_supported()` for implementation-specific checks.
 `is_available()` rejects unsupported static capabilities before calling
 `_is_available()`. `is_supported()` provides the same boundary for shared
@@ -413,6 +494,18 @@ remain invariant for its lifetime. Request-varying capability requirements
 must be represented in `FmhaManager._make_cache_key`, because a cache hit
 reuses the selected library without rechecking support.
 
+For a configuration a library would serve *incorrectly* rather than not at
+all -- a failure inside the library's own kernels that selection cannot see
+or route around -- `_is_supported` raises an actionable error instead of
+returning False. A False would let selection fall through to the generic
+no-library error (or, for a library that is not last in the registry, hand
+the request to a library that masks the broken configuration), while the
+raise names the cause and the remedy at dispatch. `Fp4MlaFmha` raises this
+way for FP4 MLA configurations only it can serve, and `FallbackFmha` raises
+to refuse paged-context FMHA on (SM, head_dim) combinations whose fused
+context kernel is proven absent, where the C++ op would silently fall back
+to unfused MHA and corrupt the cached prefix.
+
 The FMHA package is split by role:
 
 - `fmha/interface.py` defines the `Fmha` runtime contract.
@@ -420,8 +513,15 @@ The FMHA package is split by role:
   selection caching.
 - `fmha/phased.py` defines `PhasedFmha`, shared phase splitting, and the
   context/generation and MHA/MLA entry points.
+  Each phase's `FmhaParams` carries packed QKV in `qkv_input` or separate Q
+  in `query_input`, with the other field set to `None`. Separate K/V remain
+  in `key_input`/`value_input`, and `output` holds the phase's output view.
+  MLA uses `query_input` with `is_fused_qkv=False`.
 - `fmha/combined.py` composes different context and generation implementations
   for non-MLA mixed batches.
+- `fmha/fp4_mla.py` implements FP4 MLA using FP8 context attention with FP4
+  cache updates and FP4 no-dequant decode. It uses KV Cache Manager V2;
+  batch state, cache storage, and kernels live in `fp4_mla/`.
 - `fmha/triton_custom_mask.py` implements the Triton custom-mask context phase.
   Custom-mask data applies to context requests; for mixed batches,
   `TrtllmAttention` can pair it with a later causal-generation provider through
@@ -475,6 +575,74 @@ prefill, disaggregated transfer, CUDA Graph, and speculative-decoding contracts.
 See `attention/backends/sparse/` and the
 [Sparse Attention Development Guide](../../../docs/source/developer-guide/sparse-attention-development-guide.md)
 for details.
+
+#### 3.2.5 Paged-context FMHA requires a fused kernel
+
+`TrtllmAttentionMetadata` enables `use_paged_context_fmha` whenever chunked
+prefill, KV block reuse or speculative draft tokens are configured. Those
+features all require the context phase to attend to KV that is already in the
+cache, and only the fused context FMHA kernel can do that.
+
+`AttentionOp::initialize()` ends with
+`mEnableContextFMHA = mIsGenerationMLA || mFmhaDispatcher->isSupported()`, so a
+configuration with no compiled kernel silently clears the flag and the context
+phase runs the unfused path instead. That path builds K and V from the current
+chunk alone: the cached prefix is dropped from attention and then overwritten
+by the chunk's write-back, which turns a missing kernel into a plausible wrong
+answer rather than an error.
+
+`get_attention_op` in `thop/attentionOp.cpp` therefore refuses a non-MLA,
+non-cross paged-context configuration whose initialization produced no context
+FMHA kernel. The check runs after `initialize()`, because only the initialized
+op reflects the exact Q/KV/output precision, mask type and page size, and
+outside `initialize()` itself, which is `noexcept`.
+
+The refusal has three distinct causes, each with its own message, and the
+distinction matters when triaging:
+
+- Relative position embedding (T5-style self attention). `initialize()` clears
+  `mEnableContextFMHA` for it before the kernel table is consulted, so no
+  build carries a fused kernel for it. This is an unsupported feature
+  combination: disable chunked prefill, KV block reuse and speculative
+  decoding for the model. The message says so and does not point at the
+  build's architecture list, because no architecture list can supply the
+  kernel.
+- The kernel set genuinely has no kernel for that combination (precision,
+  head size, page size, mask).
+- The build's `--cuda_architectures` does not name the SM of the device it is
+  running on. `cuda_configuration.cmake` stamps `-DEXCLUDE_SM_<arch>` for every
+  architecture the list omits, and that macro compiles the matching block of
+  the trtllm-gen cubin table out, so such a build carries no kernels for that
+  SM at all. Check the architecture list first.
+
+The last two share one message ("requires a fused context FMHA kernel, and this
+build has none").
+
+Cross attention is exempt from the op-construction check. Its unfused path
+builds K and V from the encoder output (`params.cross_kv`) rather than from a
+cached prefix, so it is correct whenever the encoder output is supplied, which
+is the case on the first decoder context step and on every generation step.
+The exception is the later chunks of a chunked decoder prefill: the executor
+marks the encoder output consumed after the first chunk, the cross layer then
+passes no K/V, and the op must read the cross KV cache instead. Only the fused
+kernel can do that, so the context-stage enqueue in `thop/attentionOp.cpp`
+checks per call that a cross-attention op called without `cross_kv` has
+`mEnableContextFMHA`.
+
+`thop.fused_context_fmha_kernel_exists(head_size, kv_cache_dtype,
+tokens_per_block, output_dtype)` reports whether this build contains a fused
+context FMHA kernel for an ordinary dense causal paged-context configuration
+with equal Q/KV head counts. Q is probed at the KV precision, except for an
+NVFP4 KV cache, which `AttentionOp` reads with an FP8 Q kernel
+(`hasFp4KvCache()` requires `mFP8ContextFMHA`); only the trtllm-gen kernel
+set carries E2M1-KV context kernels, and the probe reports absent for NVFP4
+KV wherever `FmhaDispatcher` would select FMHA-v2 instead (outside the SM100
+family, or head size 72) rather than trip that runner's Q/KV precision
+assertion. It is a diagnostic aid: the output dtype is an explicit
+argument because the runtime chooses it independently of the KV cache dtype,
+and the probe fixes the mask, layout and head ratio, so its answer does not by
+itself describe the configuration a given model will run. The op-level refusal
+above is the authoritative check.
 
 ## 4. Evaluating New Attention
 

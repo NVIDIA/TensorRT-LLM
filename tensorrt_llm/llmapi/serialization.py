@@ -102,8 +102,6 @@ BASE_EXAMPLE_CLASSES = {
         "KvCacheConfig", "SchedulerConfig", "LoadFormat", "DynamicBatchConfig"
     ],
     "tensorrt_llm.llmapi.mpi_session": ["RemoteTask"],
-    "tensorrt_llm.llmapi.llm_utils":
-    ["CachedModelLoader._node_build_task", "LlmBuildStats"],
     "tensorrt_llm.llmapi.tokenizer": ["TransformersTokenizer"],
     "tensorrt_llm._torch.peft.lora.config": ["LoraConfig"],
     "tensorrt_llm.mapping": ["Mapping"],

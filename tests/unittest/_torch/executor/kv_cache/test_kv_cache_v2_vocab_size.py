@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""vocab_size has to reach KVCacheManagerV2 whatever config the model ships.
+"""vocab_size must reach KVCacheManagerV2 when multimodal keys are needed.
 
 V2 mints the synthetic ids of a multimodal block-reuse cache key above
 ``vocab_size``. ``_create_kv_cache_manager`` resolves it once and every branch
-forwards that one value, so what is left to guard is narrow: the two branches
-that rebuild the kwargs dict rather than spread it, the lookup order inside
-``resolve_vocab_size``, and the error raised when nothing resolves.
+forwards that one value. Text-only engines leave it unset to avoid multimodal
+event digest scans. Cover the hybrid branches that rebuild the kwargs dict,
+the lookup order inside ``resolve_vocab_size``, and unresolved vocabulary sizes.
 """
 
 from types import SimpleNamespace
@@ -82,7 +82,9 @@ def _dense_config():
     )
 
 
-def _capture_manager_kwargs(pretrained_config, base_cls):
+def _capture_manager_kwargs(
+    pretrained_config, base_cls, *, is_multimodal=None, disable_mm_encoder=False
+):
     """Route a config through _create_kv_cache_manager, capture the ctor kwargs."""
     captured: dict[str, object] = {}
 
@@ -90,8 +92,22 @@ def _capture_manager_kwargs(pretrained_config, base_cls):
         def __init__(self, *args: object, **kwargs: object) -> None:
             captured["kwargs"] = kwargs
 
+    model_config = SimpleNamespace(
+        pretrained_config=pretrained_config,
+        quant_config=None,
+        sparse_attention_config=None,
+        disable_mm_encoder=disable_mm_encoder,
+    )
+    model_engine = (
+        SimpleNamespace(
+            model=SimpleNamespace(model_config=model_config),
+            is_multimodal=is_multimodal,
+        )
+        if is_multimodal is not None
+        else None
+    )
     _create_kv_cache_manager(
-        model_engine=None,
+        model_engine=model_engine,
         kv_cache_manager_cls=RecordingManager,
         mapping=Mapping(world_size=1, tp_size=1, pp_size=1),
         kv_cache_config=KvCacheConfig(enable_block_reuse=True, use_kv_cache_manager_v2=True),
@@ -103,17 +119,23 @@ def _capture_manager_kwargs(pretrained_config, base_cls):
         max_num_tokens=256,
         max_beam_width=1,
         kv_connector_manager=None,
-        model_config=SimpleNamespace(
-            pretrained_config=pretrained_config,
-            quant_config=None,
-            sparse_attention_config=None,
-        ),
+        model_config=model_config,
         dtype=torch.bfloat16,
         is_draft=False,
     )
     return captured["kwargs"]
 
 
+@pytest.mark.parametrize(
+    "is_multimodal, disable_mm_encoder, expected_vocab_size",
+    [
+        pytest.param(False, False, None, id="text_only"),
+        pytest.param(True, False, _VOCAB_SIZE, id="multimodal"),
+        # Some models ignore disable_mm_encoder and still accept MM inputs.
+        pytest.param(True, True, _VOCAB_SIZE, id="encoder_disable_noop"),
+        pytest.param(None, False, _VOCAB_SIZE, id="config_only"),
+    ],
+)
 @pytest.mark.parametrize(
     "config_factory, base_cls",
     [
@@ -125,9 +147,16 @@ def _capture_manager_kwargs(pretrained_config, base_cls):
         pytest.param(_dense_config, KVCacheManagerV2, id="dense"),
     ],
 )
-def test_branch_forwards_vocab_size_to_the_manager(config_factory, base_cls):
-    kwargs = _capture_manager_kwargs(config_factory(), base_cls)
-    assert kwargs["vocab_size"] == _VOCAB_SIZE
+def test_branch_only_enables_multimodal_keys_when_needed(
+    config_factory, base_cls, is_multimodal, disable_mm_encoder, expected_vocab_size
+):
+    kwargs = _capture_manager_kwargs(
+        config_factory(),
+        base_cls,
+        is_multimodal=is_multimodal,
+        disable_mm_encoder=disable_mm_encoder,
+    )
+    assert kwargs["vocab_size"] == expected_vocab_size
 
 
 def test_util_resolves_vocab_size_instead_of_reading_the_attribute():
@@ -140,7 +169,10 @@ def test_util_resolves_vocab_size_instead_of_reading_the_attribute():
     assert kwargs["vocab_size"] == _VOCAB_SIZE
 
 
-def test_unresolvable_vocab_size_warns_when_block_reuse_is_on(monkeypatch: pytest.MonkeyPatch):
+@pytest.mark.parametrize("is_multimodal", [False, True, None])
+def test_unresolvable_vocab_size_only_warns_when_multimodal_keys_are_needed(
+    monkeypatch: pytest.MonkeyPatch, is_multimodal
+):
     """Startup says so once; the request that needs the value raises."""
     warnings: list[str] = []
     monkeypatch.setattr(
@@ -150,9 +182,9 @@ def test_unresolvable_vocab_size_warns_when_block_reuse_is_on(monkeypatch: pytes
     config = _dense_config()
     config.vocab_size = None
 
-    kwargs = _capture_manager_kwargs(config, KVCacheManagerV2)
+    kwargs = _capture_manager_kwargs(config, KVCacheManagerV2, is_multimodal=is_multimodal)
     assert kwargs["vocab_size"] is None
-    assert any("vocab_size" in message for message in warnings)
+    assert any("vocab_size" in message for message in warnings) == (is_multimodal is not False)
 
 
 def test_resolve_vocab_size_reads_a_text_config_attribute():

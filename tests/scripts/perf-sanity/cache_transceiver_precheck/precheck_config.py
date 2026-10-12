@@ -350,7 +350,9 @@ def resolve_plan(cfg, benchmark_mode="e2e"):
     benchmark = cfg.get("benchmark", {}) or {}
 
     yaml_mode = str(benchmark.get("mode", ""))
-    if benchmark_mode == "gen_only" and "gen_only_no_context" in yaml_mode:
+    if benchmark_mode == "gen_only_no_context" or (
+        benchmark_mode == "gen_only" and "gen_only_no_context" in yaml_mode
+    ):
         # No ctx workers at launch -> no KV transfer in the real test either.
         return {"skip": True, "skip_reason": "gen_only_no_context mode has no KV transfer"}
 
@@ -447,7 +449,7 @@ def resolve_plan(cfg, benchmark_mode="e2e"):
         # True/False from the yaml wins; absent means "auto", which the
         # driver resolves against the model class's manager preference at
         # runtime, exactly like serving (_resolve_kv_cache_manager_v2_auto).
-        plan[f"{role}_use_kv_cache_manager_v2"] = kv_cfg.get("use_kv_cache_manager_v2", "auto")
+        plan[f"{role}_use_kv_cache_manager_v2"] = kv_cfg.get("use_kv_cache_manager_v2", True)
     plan["fingerprint"] = plan_fingerprint(plan)
     return plan
 

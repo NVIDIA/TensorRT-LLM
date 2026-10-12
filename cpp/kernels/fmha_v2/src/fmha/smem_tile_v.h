@@ -62,10 +62,7 @@ struct Smem_tile_v<Volta_hmma_fp16_16x16x16_traits, Cta_tile, BUFFERS_PER_TILE>
     using Fragment = fmha::Fragment_b<Traits, fmha::Row>;
 
     // The size of a single LDS in bytes.
-    enum
-    {
-        BYTES_PER_LDS = 16
-    };
+    static constexpr int BYTES_PER_LDS = 16;
 
     // Ctor.
     inline __device__ Smem_tile_v(void* smem, int tidx)
@@ -73,42 +70,21 @@ struct Smem_tile_v<Volta_hmma_fp16_16x16x16_traits, Cta_tile, BUFFERS_PER_TILE>
     {
 
         // Warps.
-        enum
-        {
-            WARPS_M = Cta_tile::WARPS_M
-        };
+        static constexpr int WARPS_M = Cta_tile::WARPS_M;
 
-        enum
-        {
-            WARPS_N = Cta_tile::WARPS_N
-        };
+        static constexpr int WARPS_N = Cta_tile::WARPS_N;
 
-        enum
-        {
-            WARPS_K = Cta_tile::WARPS_K
-        };
+        static constexpr int WARPS_K = Cta_tile::WARPS_K;
 
         // Determine the config.
-        enum
-        {
-            WARPS_2x1x2 = WARPS_M == 2 && WARPS_N == 1 && WARPS_K == 2
-        };
+        static constexpr int WARPS_2x1x2 = WARPS_M == 2 && WARPS_N == 1 && WARPS_K == 2;
 
-        enum
-        {
-            WARPS_1x1x8 = WARPS_M == 1 && WARPS_N == 1 && WARPS_K == 8
-        };
+        static constexpr int WARPS_1x1x8 = WARPS_M == 1 && WARPS_N == 1 && WARPS_K == 8;
 
-        enum
-        {
-            WARPS_1x1x4 = WARPS_M == 1 && WARPS_N == 1 && WARPS_K == 4
-        };
+        static constexpr int WARPS_1x1x4 = WARPS_M == 1 && WARPS_N == 1 && WARPS_K == 4;
 
         // Flash Attention uses WARPS_4x1x1
-        enum
-        {
-            WARPS_4x1x1 = WARPS_M == 4 && WARPS_N == 1 && WARPS_K == 1
-        };
+        static constexpr int WARPS_4x1x1 = WARPS_M == 4 && WARPS_N == 1 && WARPS_K == 1;
 
         // The row/col read by the thread.
         int read_row, read_col;
@@ -239,10 +215,7 @@ struct Smem_tile_v_turing_hmma
     using Fragment = fmha::Fragment_b<Traits, fmha::Col>;
 
     // The size of a single LDS in bytes.
-    enum
-    {
-        BYTES_PER_LDS = 16
-    };
+    static constexpr int BYTES_PER_LDS = 16;
 
     // Ctor.
     inline __device__ Smem_tile_v_turing_hmma(void* smem, int tidx)
@@ -250,42 +223,21 @@ struct Smem_tile_v_turing_hmma
     {
 
         // Warps.
-        enum
-        {
-            WARPS_M = Cta_tile::WARPS_M
-        };
+        static constexpr int WARPS_M = Cta_tile::WARPS_M;
 
-        enum
-        {
-            WARPS_N = Cta_tile::WARPS_N
-        };
+        static constexpr int WARPS_N = Cta_tile::WARPS_N;
 
-        enum
-        {
-            WARPS_K = Cta_tile::WARPS_K
-        };
+        static constexpr int WARPS_K = Cta_tile::WARPS_K;
 
         // Determine the config.
-        enum
-        {
-            WARPS_2x1x2 = WARPS_M == 2 && WARPS_N == 1 && WARPS_K == 2
-        };
+        static constexpr int WARPS_2x1x2 = WARPS_M == 2 && WARPS_N == 1 && WARPS_K == 2;
 
-        enum
-        {
-            WARPS_1x1x8 = WARPS_M == 1 && WARPS_N == 1 && WARPS_K == 8
-        };
+        static constexpr int WARPS_1x1x8 = WARPS_M == 1 && WARPS_N == 1 && WARPS_K == 8;
 
-        enum
-        {
-            WARPS_1x1x4 = WARPS_M == 1 && WARPS_N == 1 && WARPS_K == 4
-        };
+        static constexpr int WARPS_1x1x4 = WARPS_M == 1 && WARPS_N == 1 && WARPS_K == 4;
 
         // Flash Attention uses WARPS_4x1x1
-        enum
-        {
-            WARPS_4x1x1 = WARPS_M == 4 && WARPS_N == 1 && WARPS_K == 1
-        };
+        static constexpr int WARPS_4x1x1 = WARPS_M == 4 && WARPS_N == 1 && WARPS_K == 1;
 
         // The row/col read by the thread.
         int read_row, read_col;
@@ -373,10 +325,7 @@ struct Smem_tile_v_turing_hmma
         for (int ni = 0; ni < Mma_tile::MMAS_N; ++ni)
         {
             // The amount of row packing.
-            enum
-            {
-                ROW_PACKING = Base::BYTES_PER_ROW / Base::BYTES_PER_ROW_BEFORE_PACKING
-            };
+            static constexpr int ROW_PACKING = Base::BYTES_PER_ROW / Base::BYTES_PER_ROW_BEFORE_PACKING;
 
             // Skip N paddings
             if (ni < Mma_tile::VALID_MMAS_N)
@@ -490,10 +439,7 @@ struct Smem_tile_v<Volta_imma_int8_int32_traits, Cta_tile, BUFFERS_PER_TILE>
     using Fragment = fmha::Fragment_b<Traits, fmha::Col>;
 
     // The size of a single LDS in bytes.
-    enum
-    {
-        BYTES_PER_LDS = 16
-    };
+    static constexpr int BYTES_PER_LDS = 16;
 
     // Ctor.
     inline __device__ Smem_tile_v(void* smem, int tidx)
@@ -504,36 +450,18 @@ struct Smem_tile_v<Volta_imma_int8_int32_traits, Cta_tile, BUFFERS_PER_TILE>
         int read_row, read_col;
 
         // Warps.
-        enum
-        {
-            WARPS_M = Cta_tile::WARPS_M
-        };
+        static constexpr int WARPS_M = Cta_tile::WARPS_M;
 
-        enum
-        {
-            WARPS_N = Cta_tile::WARPS_N
-        };
+        static constexpr int WARPS_N = Cta_tile::WARPS_N;
 
-        enum
-        {
-            WARPS_K = Cta_tile::WARPS_K
-        };
+        static constexpr int WARPS_K = Cta_tile::WARPS_K;
 
         // Determine the config.
-        enum
-        {
-            WARPS_2x1x2 = WARPS_M == 2 && WARPS_N == 1 && WARPS_K == 2
-        };
+        static constexpr int WARPS_2x1x2 = WARPS_M == 2 && WARPS_N == 1 && WARPS_K == 2;
 
-        enum
-        {
-            WARPS_1x1x8 = WARPS_M == 1 && WARPS_N == 1 && WARPS_K == 8
-        };
+        static constexpr int WARPS_1x1x8 = WARPS_M == 1 && WARPS_N == 1 && WARPS_K == 8;
 
-        enum
-        {
-            WARPS_1x1x4 = WARPS_M == 1 && WARPS_N == 1 && WARPS_K == 4
-        };
+        static constexpr int WARPS_1x1x4 = WARPS_M == 1 && WARPS_N == 1 && WARPS_K == 4;
 
         // SEQLEN == 128 and N == 16.
         if (WARPS_2x1x2 && Cta_tile::N == 16)
@@ -597,10 +525,7 @@ struct Smem_tile_v<Volta_imma_int8_int32_traits, Cta_tile, BUFFERS_PER_TILE>
         {
 
             // The amount of row packing.
-            enum
-            {
-                ROW_PACKING = Base::BYTES_PER_ROW / Base::BYTES_PER_ROW_BEFORE_PACKING
-            };
+            static constexpr int ROW_PACKING = Base::BYTES_PER_ROW / Base::BYTES_PER_ROW_BEFORE_PACKING;
 
             // Skip N paddings
             if (ni < Mma_tile::VALID_MMAS_N)
@@ -711,10 +636,7 @@ struct Smem_tile_v<Turing_imma_int8_int32_traits, Cta_tile, BUFFERS_PER_TILE>
     using Fragment = fmha::Fragment_b<Traits, fmha::Col>;
 
     // The size of a single LDS in bytes.
-    enum
-    {
-        BYTES_PER_LDS = 16
-    };
+    static constexpr int BYTES_PER_LDS = 16;
 
     // Ctor.
     inline __device__ Smem_tile_v(void* smem, int tidx)
@@ -722,36 +644,18 @@ struct Smem_tile_v<Turing_imma_int8_int32_traits, Cta_tile, BUFFERS_PER_TILE>
     {
 
         // Warps.
-        enum
-        {
-            WARPS_M = Cta_tile::WARPS_M
-        };
+        static constexpr int WARPS_M = Cta_tile::WARPS_M;
 
-        enum
-        {
-            WARPS_N = Cta_tile::WARPS_N
-        };
+        static constexpr int WARPS_N = Cta_tile::WARPS_N;
 
-        enum
-        {
-            WARPS_K = Cta_tile::WARPS_K
-        };
+        static constexpr int WARPS_K = Cta_tile::WARPS_K;
 
         // Determine the config.
-        enum
-        {
-            WARPS_2x1x2 = WARPS_M == 2 && WARPS_N == 1 && WARPS_K == 2
-        };
+        static constexpr int WARPS_2x1x2 = WARPS_M == 2 && WARPS_N == 1 && WARPS_K == 2;
 
-        enum
-        {
-            WARPS_1x1x8 = WARPS_M == 1 && WARPS_N == 1 && WARPS_K == 8
-        };
+        static constexpr int WARPS_1x1x8 = WARPS_M == 1 && WARPS_N == 1 && WARPS_K == 8;
 
-        enum
-        {
-            WARPS_1x1x4 = WARPS_M == 1 && WARPS_N == 1 && WARPS_K == 4
-        };
+        static constexpr int WARPS_1x1x4 = WARPS_M == 1 && WARPS_N == 1 && WARPS_K == 4;
 
         // The row/col read by the thread.
         int read_row, read_col;
@@ -818,10 +722,7 @@ struct Smem_tile_v<Turing_imma_int8_int32_traits, Cta_tile, BUFFERS_PER_TILE>
         for (int ni = 0; ni < Mma_tile::MMAS_N; ++ni)
         {
             // The amount of row packing.
-            enum
-            {
-                ROW_PACKING = Base::BYTES_PER_ROW / Base::BYTES_PER_ROW_BEFORE_PACKING
-            };
+            static constexpr int ROW_PACKING = Base::BYTES_PER_ROW / Base::BYTES_PER_ROW_BEFORE_PACKING;
 
             // Skip N paddings
             if (ni < Mma_tile::VALID_MMAS_N)
@@ -889,10 +790,7 @@ struct Smem_tile_v_ampere_hmma
     using Fragment = fmha::Fragment_b<Traits, fmha::Col>;
 
     // The size of a single LDS in bytes.
-    enum
-    {
-        BYTES_PER_LDS = 16
-    };
+    static constexpr int BYTES_PER_LDS = 16;
 
     // Ctor.
     inline __device__ Smem_tile_v_ampere_hmma(void* smem, int tidx)
@@ -900,42 +798,21 @@ struct Smem_tile_v_ampere_hmma
     {
 
         // Warps.
-        enum
-        {
-            WARPS_M = Cta_tile::WARPS_M
-        };
+        static constexpr int WARPS_M = Cta_tile::WARPS_M;
 
-        enum
-        {
-            WARPS_N = Cta_tile::WARPS_N
-        };
+        static constexpr int WARPS_N = Cta_tile::WARPS_N;
 
-        enum
-        {
-            WARPS_K = Cta_tile::WARPS_K
-        };
+        static constexpr int WARPS_K = Cta_tile::WARPS_K;
 
         // Determine the config.
-        enum
-        {
-            WARPS_2x1x2 = WARPS_M == 2 && WARPS_N == 1 && WARPS_K == 2
-        };
+        static constexpr int WARPS_2x1x2 = WARPS_M == 2 && WARPS_N == 1 && WARPS_K == 2;
 
-        enum
-        {
-            WARPS_1x1x8 = WARPS_M == 1 && WARPS_N == 1 && WARPS_K == 8
-        };
+        static constexpr int WARPS_1x1x8 = WARPS_M == 1 && WARPS_N == 1 && WARPS_K == 8;
 
-        enum
-        {
-            WARPS_1x1x4 = WARPS_M == 1 && WARPS_N == 1 && WARPS_K == 4
-        };
+        static constexpr int WARPS_1x1x4 = WARPS_M == 1 && WARPS_N == 1 && WARPS_K == 4;
 
         // Flash Attention uses WARPS_4x1x1
-        enum
-        {
-            WARPS_4x1x1 = WARPS_M == 4 && WARPS_N == 1 && WARPS_K == 1
-        };
+        static constexpr int WARPS_4x1x1 = WARPS_M == 4 && WARPS_N == 1 && WARPS_K == 1;
 
         // The row/col read by the thread.
         int read_row, read_col;
@@ -1023,10 +900,7 @@ struct Smem_tile_v_ampere_hmma
         for (int ni = 0; ni < Mma_tile::MMAS_N; ++ni)
         {
             // The amount of row packing.
-            enum
-            {
-                ROW_PACKING = Base::BYTES_PER_ROW / Base::BYTES_PER_ROW_BEFORE_PACKING
-            };
+            static constexpr int ROW_PACKING = Base::BYTES_PER_ROW / Base::BYTES_PER_ROW_BEFORE_PACKING;
 
             // Jump by 16 * #warps row. Account for the packing.
             int row = ki * 16 * Cta_tile::WARPS_K / ROW_PACKING;
@@ -1136,10 +1010,7 @@ struct Smem_tile_v_ampere_8bit_mma
     using Fragment = fmha::Fragment_b<Traits, fmha::Col>;
 
     // The size of a single LDS in bytes.
-    enum
-    {
-        BYTES_PER_LDS = 16
-    };
+    static constexpr int BYTES_PER_LDS = 16;
 
     // Ctor.
     inline __device__ Smem_tile_v_ampere_8bit_mma(void* smem, int tidx)
@@ -1147,41 +1018,20 @@ struct Smem_tile_v_ampere_8bit_mma
     {
 
         // Warps.
-        enum
-        {
-            WARPS_M = Cta_tile::WARPS_M
-        };
+        static constexpr int WARPS_M = Cta_tile::WARPS_M;
 
-        enum
-        {
-            WARPS_N = Cta_tile::WARPS_N
-        };
+        static constexpr int WARPS_N = Cta_tile::WARPS_N;
 
-        enum
-        {
-            WARPS_K = Cta_tile::WARPS_K
-        };
+        static constexpr int WARPS_K = Cta_tile::WARPS_K;
 
         // Determine the config.
-        enum
-        {
-            WARPS_2x1x2 = WARPS_M == 2 && WARPS_N == 1 && WARPS_K == 2
-        };
+        static constexpr int WARPS_2x1x2 = WARPS_M == 2 && WARPS_N == 1 && WARPS_K == 2;
 
-        enum
-        {
-            WARPS_1x1x8 = WARPS_M == 1 && WARPS_N == 1 && WARPS_K == 8
-        };
+        static constexpr int WARPS_1x1x8 = WARPS_M == 1 && WARPS_N == 1 && WARPS_K == 8;
 
-        enum
-        {
-            WARPS_1x1x4 = WARPS_M == 1 && WARPS_N == 1 && WARPS_K == 4
-        };
+        static constexpr int WARPS_1x1x4 = WARPS_M == 1 && WARPS_N == 1 && WARPS_K == 4;
 
-        enum
-        {
-            WARPS_4x1x1 = WARPS_M == 4 && WARPS_N == 1 && WARPS_K == 1
-        };
+        static constexpr int WARPS_4x1x1 = WARPS_M == 4 && WARPS_N == 1 && WARPS_K == 1;
 
         // The row/col read by the thread.
         int read_row, read_col;
@@ -1261,10 +1111,7 @@ struct Smem_tile_v_ampere_8bit_mma
         for (int ni = 0; ni < Mma_tile::MMAS_N; ++ni)
         {
             // The amount of row packing.
-            enum
-            {
-                ROW_PACKING = Base::BYTES_PER_ROW / Base::BYTES_PER_ROW_BEFORE_PACKING
-            };
+            static constexpr int ROW_PACKING = Base::BYTES_PER_ROW / Base::BYTES_PER_ROW_BEFORE_PACKING;
 
             // // Make sure we do not end up with weird values :)
             // static_assert(Cta_tile::WARPS_K % ROW_PACKING == 0, "");

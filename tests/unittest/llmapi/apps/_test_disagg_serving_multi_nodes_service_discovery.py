@@ -57,7 +57,7 @@ def env():
 
 @pytest.fixture
 def model_name():
-    return "llama-3.1-model/Llama-3.1-8B-Instruct"
+    return "Qwen3.5-4B"
 
 
 @pytest.fixture
@@ -107,10 +107,14 @@ def worker(model_name: str, disagg_cluster_config: dict):
         "disagg_cluster": disagg_cluster_config,
         "cache_transceiver_config": {"backend": "DEFAULT"},
         "kv_cache_config": {
-            "free_gpu_memory_fraction": 0.5,
+            "free_gpu_memory_fraction": 0.8,
             "enable_block_reuse": False,
         },
         "disable_overlap_scheduler": True,
+        # Qwen3.5 reserves recurrent state for max_batch_size * pp_size
+        # sequences up front; the defaults do not fit on 80 GB GPUs.
+        "max_batch_size": 128,
+        "max_seq_len": 8192,
     }
     # start workers on 0.0.0.0:<free_port>, then the workers should be able to
     # report their correct hostname:port to the disagg server
