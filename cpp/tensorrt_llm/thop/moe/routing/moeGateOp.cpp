@@ -26,8 +26,6 @@ TRTLLM_NAMESPACE_BEGIN
 namespace torch_ext
 {
 
-static constexpr int kTOPK = 6;
-
 // PyTorch wrapper function that calls the kernel implementation
 void gate_forward(th::Tensor scores_in, // [batch_size, nExperts] - pre-computed from linear(x, weight)
     th::Tensor bias,                    // empty tensor if hash mode
@@ -38,9 +36,9 @@ void gate_forward(th::Tensor scores_in, // [batch_size, nExperts] - pre-computed
     int64_t topk, double route_scale, bool is_hash, std::optional<th::Tensor> image_mask,
     std::optional<th::Tensor> vision_bias)
 {
-    TORCH_CHECK(topk == kTOPK, "topk must be ", kTOPK);
     auto const n_experts = scores_in.size(1);
-    TORCH_CHECK(n_experts == 256 || n_experts == 384, "n_experts must be 256 or 384");
+    TORCH_CHECK((n_experts == 256 && topk == 6) || (n_experts == 384 && topk == 6) || (n_experts == 128 && topk == 3),
+        "(n_experts, topk) must be one of (256, 6), (384, 6), (128, 3); got (", n_experts, ", ", topk, ")");
     TORCH_CHECK(scores_in.scalar_type() == torch::kFloat32, "scores_in must be float32");
     TORCH_CHECK(out_weights.scalar_type() == torch::kFloat32, "out_weights must be float32");
     TORCH_CHECK(out_indices.scalar_type() == torch::kInt32, "out_indices must be int32");
@@ -71,7 +69,8 @@ void gate_forward(th::Tensor scores_in, // [batch_size, nExperts] - pre-computed
     kernels::gate_forward(scores_in.data_ptr<float>(), is_hash ? nullptr : bias.data_ptr<float>(),
         is_hash ? input_ids.data_ptr<int>() : nullptr, is_hash ? tid2eid.data_ptr<int>() : nullptr,
         out_weights.data_ptr<float>(), out_indices.data_ptr<int>(), batch_size, static_cast<int>(n_experts),
-        static_cast<float>(route_scale), is_hash, image_mask.has_value() ? image_mask->data_ptr<bool>() : nullptr,
+        static_cast<int>(topk), static_cast<float>(route_scale), is_hash,
+        image_mask.has_value() ? image_mask->data_ptr<bool>() : nullptr,
         vision_bias.has_value() ? vision_bias->data_ptr<float>() : nullptr, stream);
 }
 

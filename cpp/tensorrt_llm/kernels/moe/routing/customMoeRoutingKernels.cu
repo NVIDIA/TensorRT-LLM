@@ -310,8 +310,6 @@ INSTANTIATE_RENORM_MOE_ROUTING(half, __nv_bfloat16, int32_t, true);
 INSTANTIATE_RENORM_MOE_ROUTING(__nv_bfloat16, __nv_bfloat16, int32_t, true);
 #endif
 
-static constexpr int kTOPK = 6;
-
 // CUDA kernel for gate forward
 // Input: pre-computed scores from linear(x, weight) done outside kernel
 // Template parameters:
@@ -425,7 +423,7 @@ __global__ void gate_forward_kernel(
 
 // C++ wrapper function (output tensors passed as parameters)
 // All tensors are float32
-template <int nExperts, bool hash>
+template <int nExperts, int topK, bool hash>
 void launch_gate_forward_kernel(float* scores_in, float* bias, int* input_ids, int* tid2eid, float* out_weights,
     int* out_indices, int batch_size, float route_scale, bool const* image_mask, float const* vision_bias,
     cudaStream_t stream)
@@ -434,8 +432,25 @@ void launch_gate_forward_kernel(float* scores_in, float* bias, int* input_ids, i
     constexpr int threads_per_block = warps_per_block * WARP_SIZE;
     int const blocks = (batch_size + warps_per_block - 1) / warps_per_block;
 
-    gate_forward_kernel<nExperts, kTOPK, hash><<<blocks, threads_per_block, 0, stream>>>(scores_in, bias, input_ids,
+    gate_forward_kernel<nExperts, topK, hash><<<blocks, threads_per_block, 0, stream>>>(scores_in, bias, input_ids,
         tid2eid, out_weights, out_indices, batch_size, route_scale, image_mask, vision_bias);
+}
+
+template <int nExperts, int topK>
+void dispatch_gate_forward_kernel(float* scores_in, float* bias, int* input_ids, int* tid2eid, float* out_weights,
+    int* out_indices, int batch_size, float route_scale, bool is_hash, bool const* image_mask, float const* vision_bias,
+    cudaStream_t stream)
+{
+    if (is_hash)
+    {
+        launch_gate_forward_kernel<nExperts, topK, true>(scores_in, nullptr, input_ids, tid2eid, out_weights,
+            out_indices, batch_size, route_scale, nullptr, nullptr, stream);
+    }
+    else
+    {
+        launch_gate_forward_kernel<nExperts, topK, false>(scores_in, bias, nullptr, nullptr, out_weights, out_indices,
+            batch_size, route_scale, image_mask, vision_bias, stream);
+    }
 }
 
 void gate_forward(void* scores_in, // [batch_size, nExperts] - pre-computed from linear(x, weight)
@@ -444,8 +459,8 @@ void gate_forward(void* scores_in, // [batch_size, nExperts] - pre-computed from
     void* tid2eid,                 // nullptr if non-hash mode
     void* out_weights,             // [batch_size, topK] - pre-allocated
     void* out_indices,             // [batch_size, topK] - pre-allocated
-    int batch_size, int n_experts, float route_scale, bool is_hash, bool const* image_mask, float const* vision_bias,
-    cudaStream_t stream)
+    int batch_size, int n_experts, int topk, float route_scale, bool is_hash, bool const* image_mask,
+    float const* vision_bias, cudaStream_t stream)
 {
     auto* scores = static_cast<float*>(scores_in);
     auto* bias_ptr = static_cast<float*>(bias);
@@ -454,33 +469,27 @@ void gate_forward(void* scores_in, // [batch_size, nExperts] - pre-computed from
     auto* weights = static_cast<float*>(out_weights);
     auto* indices = static_cast<int*>(out_indices);
 
-    switch (n_experts)
+    // Supported (n_experts, topk) pairs: 256/6 and 384/6 (DeepSeek-V4 / V4.1 routed MoE), 128/3 (DeepSeek-V4.1 DSpark
+    // draft MoE).
+    if (n_experts == 256 && topk == 6)
     {
-    case 256:
-        if (is_hash)
-        {
-            launch_gate_forward_kernel<256, true>(scores, nullptr, input_ids_ptr, tid2eid_ptr, weights, indices,
-                batch_size, route_scale, nullptr, nullptr, stream);
-        }
-        else
-        {
-            launch_gate_forward_kernel<256, false>(scores, bias_ptr, nullptr, nullptr, weights, indices, batch_size,
-                route_scale, image_mask, vision_bias, stream);
-        }
-        break;
-    case 384:
-        if (is_hash)
-        {
-            launch_gate_forward_kernel<384, true>(scores, nullptr, input_ids_ptr, tid2eid_ptr, weights, indices,
-                batch_size, route_scale, nullptr, nullptr, stream);
-        }
-        else
-        {
-            launch_gate_forward_kernel<384, false>(scores, bias_ptr, nullptr, nullptr, weights, indices, batch_size,
-                route_scale, image_mask, vision_bias, stream);
-        }
-        break;
-    default: TLLM_CHECK_WITH_INFO(false, "gate_forward only supports n_experts 256 or 384");
+        dispatch_gate_forward_kernel<256, 6>(scores, bias_ptr, input_ids_ptr, tid2eid_ptr, weights, indices, batch_size,
+            route_scale, is_hash, image_mask, vision_bias, stream);
+    }
+    else if (n_experts == 384 && topk == 6)
+    {
+        dispatch_gate_forward_kernel<384, 6>(scores, bias_ptr, input_ids_ptr, tid2eid_ptr, weights, indices, batch_size,
+            route_scale, is_hash, image_mask, vision_bias, stream);
+    }
+    else if (n_experts == 128 && topk == 3)
+    {
+        dispatch_gate_forward_kernel<128, 3>(scores, bias_ptr, input_ids_ptr, tid2eid_ptr, weights, indices, batch_size,
+            route_scale, is_hash, image_mask, vision_bias, stream);
+    }
+    else
+    {
+        TLLM_CHECK_WITH_INFO(false,
+            "gate_forward supports (n_experts, topk) in {(256, 6), (384, 6), (128, 3)}, got (%d, %d)", n_experts, topk);
     }
     sync_check_cuda_error(stream);
 }
