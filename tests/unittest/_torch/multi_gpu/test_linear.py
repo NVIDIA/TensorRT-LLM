@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import pickle
 import sys
 import traceback
@@ -13,6 +16,8 @@ import tensorrt_llm
 import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 from tensorrt_llm._torch.autotuner import autotune
 from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
+from tensorrt_llm._torch.nccl_window_tensor_scope import \
+    nccl_window_tensor_scope
 from tensorrt_llm.functional import AllReduceFusionOp, AllReduceParams
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.math_utils import pad_up
@@ -40,9 +45,11 @@ def run_single_rank(tensor_parallel_size, single_rank_forward_func, input,
                     weights, hidden_size, dtype):
     rank = tensorrt_llm.mpi_rank()
     torch.cuda.set_device(rank)
+    input = input.cuda()
     try:
-        single_rank_forward_func(input, hidden_size, dtype,
-                                 tensor_parallel_size, rank, weights)
+        with nccl_window_tensor_scope(input):
+            single_rank_forward_func(input, hidden_size, dtype,
+                                     tensor_parallel_size, rank, weights)
     except Exception:
         traceback.print_exc()
         raise
@@ -385,8 +392,10 @@ def fp4_row_linear_allreduce(tp_size, local_rank, seq_len, output_size,
     l0.cuda()
     # TODO: parameters['weight']' size mismatch at index 0
     # l0 = torch.compile(l0)
-    with torch.inference_mode(), autotune():
-        output = l0.forward((x_fp4, x_sf_block))
+    with torch.inference_mode(), autotune(), nccl_window_tensor_scope(
+        (x_fp4, x_sf_block)):
+        # Accuracy checks consume a snapshot after the window lease is released.
+        output = l0.forward((x_fp4, x_sf_block)).clone()
 
     torch.cuda.synchronize()
     check_accuracy(output, output_ref, atol=0.05, rtol=0.05, percent=0.99)

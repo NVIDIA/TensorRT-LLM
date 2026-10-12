@@ -64,6 +64,9 @@ from ..moe.fused_moe.moe_comm_timeout_guard import (moe_comm_serving_timeouts,
                                                     set_moe_comm_warmup)
 from ..moe.fused_moe.moe_load_balancer import (MoeLoadBalancer,
                                                MoeLoadBalancerIterContext)
+from ..nccl_window_tensor_scope import (discard_nccl_window_tensor_outputs,
+                                        install_eager_nccl_window_tensor_scopes,
+                                        nccl_window_tensor_scope)
 from ..peft.lora.cuda_graph_lora_manager import CudaGraphLoraManager
 from ..route_capture import ROUTE_CAPTURE_ATTR, RouteCapture
 from ..speculative import (SpecMetadata, get_draft_kv_cache_manager,
@@ -336,6 +339,22 @@ def _configure_deep_gemm_pdl() -> None:
 
     deep_gemm.set_pdl(os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1")
     _DEEP_GEMM_PDL_CONFIGURED = True
+
+
+def _discarded_warmup_scope(engine: Any, inputs: Any = None):
+    # Warmup inputs may be host-only. The persistent CUDA input buffer
+    # ensures the native scope opens before forward creates window tensors.
+    return discard_nccl_window_tensor_outputs((getattr(engine, "input_ids_cuda",
+                                                       None), inputs))
+
+
+def _run_discarded_warmup_forward(engine: Any, batch: ScheduledRequests,
+                                  resource_manager: ResourceManager) -> None:
+    """Run an eager warmup through its last consumer and release its outputs."""
+    with _discarded_warmup_scope(engine, batch):
+        engine.forward(batch,
+                       new_tensors_device=None,
+                       resource_manager=resource_manager)
 
 
 class PyTorchModelEngine(ModelEngine):
@@ -658,6 +677,7 @@ class PyTorchModelEngine(ModelEngine):
             use_ub_for_nccl = (
                 self.llm_args.allreduce_strategy == "NCCL_SYMMETRIC"
                 and self._init_userbuffers(self.model.config.hidden_size))
+            self._nccl_window_tensor_scope_hooks = []
             if self._torch_compile_enabled:
                 set_torch_compiling(True)
                 use_ub = not use_ub_for_nccl and (
@@ -704,6 +724,8 @@ class PyTorchModelEngine(ModelEngine):
                 torch._dynamo.config.cache_size_limit = 16
             else:
                 set_torch_compiling(False)
+                self._nccl_window_tensor_scope_hooks = (
+                    install_eager_nccl_window_tensor_scopes(self.model))
         except Exception as e:
             import traceback
             traceback.print_exception(Exception, e, e.__traceback__)
@@ -2034,9 +2056,8 @@ class PyTorchModelEngine(ModelEngine):
                             f"num_gen_tokens={num_gen_tokens}",
                             record=False,
                             log_start=False):
-                        self.forward(batch,
-                                     new_tensors_device=None,
-                                     resource_manager=resource_manager)
+                        _run_discarded_warmup_forward(self, batch,
+                                                      resource_manager)
                         torch.cuda.synchronize()
             except torch.OutOfMemoryError:
                 if self._is_distributed_forward():
@@ -2151,9 +2172,8 @@ class PyTorchModelEngine(ModelEngine):
                         record=False,
                         log_start=True):
                     with trtllm_gen_fmha_jit_warmup():
-                        self.forward(batch,
-                                     new_tensors_device=None,
-                                     resource_manager=resource_manager)
+                        _run_discarded_warmup_forward(self, batch,
+                                                      resource_manager)
                     torch.cuda.synchronize()
 
     @staticmethod
@@ -2302,9 +2322,8 @@ class PyTorchModelEngine(ModelEngine):
                                 f"num_gen_requests={num_gen_requests}",
                                 record=False,
                                 log_start=True):
-                            self.forward(batch,
-                                         new_tensors_device=None,
-                                         resource_manager=resource_manager)
+                            _run_discarded_warmup_forward(
+                                self, batch, resource_manager)
                             ran_forward = True
                             torch.cuda.synchronize()
 
@@ -2503,9 +2522,8 @@ class PyTorchModelEngine(ModelEngine):
                                     Eagle3ResourceManager):
                                 spec_resource_manager.is_first_draft = True
 
-                            self.forward(batch,
-                                         new_tensors_device=None,
-                                         resource_manager=resource_manager)
+                            _run_discarded_warmup_forward(
+                                self, batch, resource_manager)
 
                             if autotuner_enabled:
                                 AutoTuner.get().cache_pp_recv()
@@ -2838,9 +2856,13 @@ class PyTorchModelEngine(ModelEngine):
                                 batch, draft_len > 0, resource_manager)
                             if self._is_encoder_decoder_model():
                                 prepare_cross_batch(batch, resource_manager)
-                            self.forward(batch,
-                                         new_tensors_device=None,
-                                         resource_manager=resource_manager)
+                            if self.cuda_graph_runner.is_warmup_only:
+                                _run_discarded_warmup_forward(
+                                    self, batch, resource_manager)
+                            else:
+                                self.forward(batch,
+                                             new_tensors_device=None,
+                                             resource_manager=resource_manager)
                             torch.cuda.synchronize()
             finally:
                 self._force_lora_graph_for_capture = None
@@ -3050,9 +3072,13 @@ class PyTorchModelEngine(ModelEngine):
                     try:
                         self.enable_spec_decode = False
                         self.runtime_draft_len = 0
-                        self.forward(batch,
-                                     new_tensors_device=None,
-                                     resource_manager=resource_manager)
+                        if runner.is_warmup_only:
+                            _run_discarded_warmup_forward(
+                                self, batch, resource_manager)
+                        else:
+                            self.forward(batch,
+                                         new_tensors_device=None,
+                                         resource_manager=resource_manager)
                         torch.cuda.synchronize()
                     finally:
                         self.enable_spec_decode = saved_enable_spec_decode
@@ -3092,13 +3118,13 @@ class PyTorchModelEngine(ModelEngine):
                             num_tokens, lambda: self.forward(
                                 batch,
                                 new_tensors_device=None,
-                                resource_manager=resource_manager))
+                                resource_manager=resource_manager),
+                            self.input_ids_cuda)
                     else:
                         # Run a few times to ensure torch.compile capture.
                         for _ in range(4):
-                            self.forward(batch,
-                                         new_tensors_device=None,
-                                         resource_manager=resource_manager)
+                            _run_discarded_warmup_forward(
+                                self, batch, resource_manager)
 
         # The logits allocations grow with the number of requests and are not
         # part of the captured model body. Warm up the largest request count so
@@ -3123,11 +3149,10 @@ class PyTorchModelEngine(ModelEngine):
                                                  new_tensors_device=None,
                                                  resource_manager=
                                                  resource_manager),
+                            self.input_ids_cuda,
                             steps=1)
                 else:
-                    self.forward(batch,
-                                 new_tensors_device=None,
-                                 resource_manager=resource_manager)
+                    _run_discarded_warmup_forward(self, batch, resource_manager)
                 torch.cuda.synchronize()
 
     ### Helper methods promoted from the original warmup method ###
@@ -3573,11 +3598,13 @@ class PyTorchModelEngine(ModelEngine):
                 raise RuntimeError(
                     "Encoder-decoder CUDA graph warmup requires every decoder "
                     "layer to expose a cross_attn module.")
-            cross_attn(hidden_states=hidden_states,
-                       encoder_hidden_states=encoder_hidden_states,
-                       attn_metadata=attn_metadata,
-                       cross_attn_metadata=cross_attn_metadata,
-                       skip_cross_kv_projection=False)
+            with discard_nccl_window_tensor_outputs(
+                (hidden_states, encoder_hidden_states)):
+                cross_attn(hidden_states=hidden_states,
+                           encoder_hidden_states=encoder_hidden_states,
+                           attn_metadata=attn_metadata,
+                           cross_attn_metadata=cross_attn_metadata,
+                           skip_cross_kv_projection=False)
 
     def _get_enc_dec_hidden_size(self) -> int:
         config = self.model.model_config.pretrained_config
@@ -3695,7 +3722,7 @@ class PyTorchModelEngine(ModelEngine):
 
         1. The optional ``ModelLoader`` (which in turn releases any
            GMS client; see :meth:`ModelLoader.cleanup`).
-        2. CUDA Graph captures (via :meth:`_release_cuda_graphs`).
+        2. Executor-owned CUDA Graphs (via :meth:`_release_cuda_graphs`).
         3. The runner, MM item scheduler, and model module reference, which
            hold references to the model.
         4. Input processors.
@@ -3710,8 +3737,8 @@ class PyTorchModelEngine(ModelEngine):
             deliberately does *not* call this: it is also invoked mid-init by
             ``configure_kv_cache_capacity``, which reads ``model`` right
             afterwards, so clearing ``model`` here would break it. That path
-            calls :meth:`_release_cuda_graphs` and then drops its reference
-            instead.
+            uses an explicit temporary-executor shutdown and then drops its
+            reference instead.
         """
         if self._cleanup_done:
             return
@@ -3727,7 +3754,8 @@ class PyTorchModelEngine(ModelEngine):
 
         # Release runner-owned graphs before dropping the runner. Keep the
         # handle available if graph release fails and cleanup is retried.
-        self._release_cuda_graphs()
+        # Destruction timing is not rank-symmetric; only explicit shutdown releases owners.
+        self._release_cuda_graphs(release_nccl_window_owners=False)
 
         # The runner and scheduler keep their own references to the model, so
         # clearing the engine's attribute alone would leave the weights
@@ -3850,17 +3878,39 @@ class PyTorchModelEngine(ModelEngine):
         self._init_max_seq_len()
         self._init_max_num_tokens()
 
-    def _release_cuda_graphs(self):
+    def _release_model_owned_cuda_graphs(
+        self,
+        *,
+        release_nccl_window_owners: bool = True,
+    ):
+        model = getattr(self, "model", None)
+        if model is not None:
+            for module in model.modules():
+                clear_blocks_graph = getattr(module, "clear_blocks_cuda_graph",
+                                             None)
+                if clear_blocks_graph is not None:
+                    clear_blocks_graph(
+                        release_nccl_window_owners=release_nccl_window_owners)
+
+    def _release_cuda_graphs(
+        self,
+        *,
+        release_nccl_window_owners: bool = True,
+    ):
         if self._runner is not None:
-            self._runner.cleanup()
+            self._runner.cleanup(
+                release_nccl_window_owners=release_nccl_window_owners)
         if self._torch_compile_backend is not None:
-            self._torch_compile_backend.clear_piecewise_cuda_graphs()
+            self._torch_compile_backend.clear_piecewise_cuda_graphs(
+                release_nccl_window_owners=release_nccl_window_owners)
         if hasattr(self,
                    'cuda_graph_runner') and self.cuda_graph_runner is not None:
-            self.cuda_graph_runner.clear()
+            self.cuda_graph_runner.clear(
+                release_nccl_window_owners=release_nccl_window_owners)
         if (hasattr(self, 'breakable_cuda_graph_runner')
                 and self.breakable_cuda_graph_runner is not None):
-            self.breakable_cuda_graph_runner.clear()
+            self.breakable_cuda_graph_runner.clear(
+                release_nccl_window_owners=release_nccl_window_owners)
 
     def get_max_num_sequences(self) -> int:
         """
@@ -6524,10 +6574,14 @@ class PyTorchModelEngine(ModelEngine):
             torch_compiling(get_per_request_prefill_cuda_graph_flag())
             if self._torch_compile_prefill_only else contextlib.nullcontext())
         with reclaim_scope, compile_scope:
-            if is_trace_enabled("TLLM_TRACE_MODEL_FORWARD"):
-                return trace_func(self.model.forward)(**kwargs)
-            else:
-                return self.model.forward(**kwargs)
+            # This boundary stays outside torch.compile, so one lease scope covers
+            # eager, compiled, and CUDA-graph model execution.
+            with nccl_window_tensor_scope(kwargs) as scope:
+                if is_trace_enabled("TLLM_TRACE_MODEL_FORWARD"):
+                    outputs = trace_func(self.model.forward)(**kwargs)
+                else:
+                    outputs = self.model.forward(**kwargs)
+                return scope.escape(outputs)
 
     @nvtx_range("_forward_step")
     def _forward_step(self,

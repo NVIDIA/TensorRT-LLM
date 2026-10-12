@@ -20,6 +20,7 @@ layout against an unfused reference built from the HF checkpoint's split
 """
 
 import os
+import pickle
 import sys
 from types import SimpleNamespace
 
@@ -27,13 +28,16 @@ import cloudpickle
 import pytest
 import torch
 from _torch.moe.kimi_k3_ref_moe.kimi_k3_mlp_test_utils import KimiK3MLP
+from mpi4py import MPI
 from torch import nn
 
 from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
 from tensorrt_llm._torch.modules.situ import SituAndMul
+from tensorrt_llm._torch.nccl_window_tensor_scope import nccl_window_tensor_scope
 from tensorrt_llm._torch.utils import AuxStreamType
 
 cloudpickle.register_pickle_by_value(sys.modules[__name__])
+MPI.pickle.__init__(cloudpickle.dumps, cloudpickle.loads, pickle.HIGHEST_PROTOCOL)
 
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA device")
 
@@ -516,11 +520,16 @@ def _run_kimi_k3_moe_multi_rank_worker(attention_dp):
             )
             expected = _kimi_k3_moe_reference(hidden_states, weights, config)
             all_rank_num_tokens = [hidden_states.shape[0]] * world_size if attention_dp else None
-            with torch.inference_mode(), with_multi_stream(True):
+            with (
+                torch.inference_mode(),
+                with_multi_stream(True),
+                nccl_window_tensor_scope(hidden_states),
+            ):
+                # Keep accuracy checks independent of the window lease lifetime.
                 actual = runtime(
                     hidden_states,
                     all_rank_num_tokens=all_rank_num_tokens,
-                )
+                ).clone()
             torch.testing.assert_close(actual, expected, rtol=8e-2, atol=8e-2)
     finally:
         if runtime is not None:
