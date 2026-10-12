@@ -159,7 +159,9 @@ def _find_last_user_index(messages: list[dict[str, Any]]) -> int:
 def _merge_tool_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     merged: list[dict[str, Any]] = []
     for message in messages:
-        message = copy.deepcopy(message)
+        # A message parsed by the OpenAI server carries its pending media loads (coroutines,
+        # which cannot be deep-copied) under "media"; the renderer never reads them.
+        message = copy.deepcopy({key: value for key, value in message.items() if key != "media"})
         role = message.get("role")
 
         if role == "tool":
