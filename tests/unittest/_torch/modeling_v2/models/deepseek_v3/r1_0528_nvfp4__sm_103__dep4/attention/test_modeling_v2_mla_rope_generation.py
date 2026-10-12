@@ -42,6 +42,7 @@ evidence that one exists.
 import contextlib
 import inspect
 import math
+import zlib
 from typing import List, NamedTuple, Optional
 
 import pytest
@@ -1301,7 +1302,7 @@ def test_certified_cells(cell) -> None:
     """
     spec = cell.spec
     p = spec["predicted_tokens_per_seq"]
-    torch.manual_seed(abs(hash(cell.why)) % 2**31)
+    torch.manual_seed(zlib.crc32(cell.why.encode()) % 2**31)
 
     env = _MlaEnv(
         max_batch_size=4,

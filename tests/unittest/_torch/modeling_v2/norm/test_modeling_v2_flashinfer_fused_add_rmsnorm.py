@@ -8,6 +8,8 @@ cell cannot carry -- turning a spec into real tensors -- plus the inputs the
 guard exists to refuse, which are claims about inputs no cell describes.
 """
 
+import zlib
+
 import pytest
 import torch
 
@@ -37,7 +39,7 @@ def test_certified_cells(cell) -> None:
     Driven inside `validating`, so each cell also proves the guard admits the
     inputs a shipped target actually passes.
     """
-    x, residual, weight, eps = _build(cell.spec, seed=abs(hash(cell.why)) % 2**31)
+    x, residual, weight, eps = _build(cell.spec, seed=zlib.crc32(cell.why.encode()) % 2**31)
     ref_x, ref_residual = op.reference(x, residual, weight, eps)
     with validating(op):
         out_x, out_residual = op(x, residual, weight, eps)

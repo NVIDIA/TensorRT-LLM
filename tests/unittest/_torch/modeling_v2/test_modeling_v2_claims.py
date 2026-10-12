@@ -158,18 +158,15 @@ def test_every_entry_with_cells_has_a_test_that_drives_them():
     name both the entry and `.CELLS`. That is weaker than proving the cells were
     driven, and it is what a check that runs anywhere can say.
     """
-    catalog = _ROOT / "catalog"
     tests = list(Path(__file__).resolve().parent.rglob("*.py"))
     sources = {t: t.read_text() for t in tests}
 
     undriven = []
-    for entry in sorted(catalog.glob("*/*.py")):
-        if entry.name == "__init__.py":
-            continue
+    for entry in sorted(_entry_files()):
         if "Cell(" not in entry.read_text():
             continue
         if not any(entry.stem in src and ".CELLS" in src for src in sources.values()):
-            undriven.append(f"{entry.parent.name}/{entry.stem}")
+            undriven.append(str(entry.relative_to(_ROOT)))
 
     assert not undriven, (
         f"{len(undriven)} entry(ies) declare cells that no test drives: "
@@ -184,23 +181,11 @@ def test_every_entry_with_cells_has_a_test_that_drives_them():
 _PHASE_FIELDS = ("num_contexts", "num_ctx_tokens")
 
 
-# Cores not yet on the target layer. An entry is deleted when that core is
-# migrated, so finishing the migration is a visible diff rather than a gate
-# that quietly stopped covering anything.
-_NOT_YET_ON_THE_TARGET_LAYER = frozenset({"r1_0528_nvfp4__sm_103__dep4"})
-
-
 def _core_modules() -> list[Path]:
-    """Every target module the routing tables can reach and this layer covers."""
-    modules = []
-    for arch in _ARCHS:
-        routing = routing_module(arch)
-        for dotted in routing.TARGET_MODULES.values():
-            path = _module_path(dotted)
-            if path.parent.name in _NOT_YET_ON_THE_TARGET_LAYER:
-                continue
-            modules.append(path)
-    return modules
+    """Every target module ``route`` can reach."""
+    return [
+        target_dir / "modeling.py" for arch in _ARCHS for target_dir, _ in _routed_targets(arch)
+    ]
 
 
 def test_a_decode_target_never_reads_the_phase_back():
@@ -289,12 +274,17 @@ def test_every_core_ships_both_targets():
 # state, and CELLS stops covering what the target actually runs.
 
 
+def _entry_files() -> list[Path]:
+    """Every entry module: the shared catalog and each target's own ``ops/``."""
+    shared = (_ROOT / "catalog").glob("*/*.py")
+    owned = (_ROOT / "models").glob("*/*/ops/*/*.py")
+    return sorted(p for p in (*shared, *owned) if p.name != "__init__.py")
+
+
 def _catalog_entries() -> list[tuple[Path, ast.ClassDef]]:
-    """Every OpWrapper subclass in the catalog, as (path, class node)."""
+    """Every OpWrapper subclass, shared or owned, as (path, class node)."""
     found = []
-    for path in sorted((_ROOT / "catalog").glob("*/*.py")):
-        if path.name == "__init__.py":
-            continue
+    for path in _entry_files():
         for node in ast.walk(ast.parse(path.read_text())):
             if isinstance(node, ast.ClassDef) and any(
                 isinstance(b, ast.Name) and b.id == "OpWrapper" for b in node.bases

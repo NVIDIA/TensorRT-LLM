@@ -6,6 +6,8 @@ The entry owns what is certified. This file turns a cell's spec into tensors
 and drives the inputs the guard exists to refuse.
 """
 
+import zlib
+
 import pytest
 import torch
 
@@ -26,7 +28,7 @@ def _build(spec, seed):
 
 @pytest.mark.parametrize("cell", op.CELLS, ids=[c.why[:40] for c in op.CELLS])
 def test_certified_cells(cell) -> None:
-    x = _build(cell.spec, seed=abs(hash(cell.why)) % 2**31)
+    x = _build(cell.spec, seed=zlib.crc32(cell.why.encode()) % 2**31)
     with validating(op):
         out = op(x)
     assert out.shape == (*x.shape[:-1], x.shape[-1] // 2)

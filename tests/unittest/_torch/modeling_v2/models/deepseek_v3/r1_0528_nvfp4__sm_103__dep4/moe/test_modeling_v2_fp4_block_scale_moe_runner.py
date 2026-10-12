@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """GPU test for the fp4_block_scale_moe_runner catalog entry."""
 
+import zlib
+
 import pytest
 import torch
 
@@ -1912,7 +1914,7 @@ def test_certified_cells(cell):
     args, ref = _dsr1()
     off, n = spec["local_expert_offset"], spec["local_num_experts"]
     num_experts, hidden, top_k = spec["num_experts"], spec["hidden"], spec["top_k"]
-    gen = torch.Generator(device=DEV).manual_seed(abs(hash(cell.why)) % 2**31)
+    gen = torch.Generator(device=DEV).manual_seed(zlib.crc32(cell.why.encode()) % 2**31)
     g1 = 137.0
 
     data, sf, x = _rand_activation(spec["tokens"], hidden, g1, gen)

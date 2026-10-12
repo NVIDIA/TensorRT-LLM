@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """GPU test for the bmm_out catalog entry."""
 
+import zlib
+
 import pytest
 import torch
 
@@ -60,7 +62,7 @@ def _build(spec, seed):
 
 @pytest.mark.parametrize("cell", op.CELLS, ids=[c.why[:44] for c in op.CELLS])
 def test_certified_cells(cell) -> None:
-    a, w, out, parent = _build(cell.spec, seed=abs(hash(cell.why)) % 2**31)
+    a, w, out, parent = _build(cell.spec, seed=zlib.crc32(cell.why.encode()) % 2**31)
     parent_ptr = parent.data_ptr()
     with validating(op):
         # Identity, not equality: the op must have written this very buffer and

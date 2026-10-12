@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """GPU test for the fp4_quantize catalog entry (NVFP4: sf_vec_size=16, e4m3 scales)."""
 
+import zlib
+
 import pytest
 import torch
 
@@ -46,7 +48,7 @@ def test_certified_cells(cell) -> None:
     count inside it is asserted small, so the window cannot quietly grow into a
     licence for the kernel to be wrong.
     """
-    x, gs, vec, swizzled = _build(cell.spec, seed=abs(hash(cell.why)) % 2**31)
+    x, gs, vec, swizzled = _build(cell.spec, seed=zlib.crc32(cell.why.encode()) % 2**31)
     with validating(op):
         packed, sf = op(x, gs, vec, False, swizzled)
     ref_packed, ref_sf = op.reference(x, gs, vec, False, swizzled)

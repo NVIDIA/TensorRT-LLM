@@ -3,6 +3,7 @@
 """GPU test for the mxe4m3_mxe2m1_block_scale_moe_runner catalog entry."""
 
 import math
+import zlib
 
 import pytest
 import torch
@@ -1641,7 +1642,7 @@ def test_certified_cells(cell):
     args, ref = _gpt_oss()
     off, n = spec["local_expert_offset"], spec["local_num_experts"]
     num_experts, hidden, top_k = spec["num_experts"], spec["hidden"], spec["top_k"]
-    gen = torch.Generator(device=DEV).manual_seed(abs(hash(cell.why)) % 2**31)
+    gen = torch.Generator(device=DEV).manual_seed(zlib.crc32(cell.why.encode()) % 2**31)
 
     data, sf, xv = _rand_mxfp8(spec["tokens"], hidden, ref["h1_pad"], gen)
     alpha, beta, limit = _swiglu_params(n)

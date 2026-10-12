@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """GPU test for the nvfp4_gemm catalog entry."""
 
+import zlib
+
 import pytest
 import torch
 
@@ -51,7 +53,7 @@ def _operand(rows, k, seed):
 @pytest.mark.parametrize("cell", op.CELLS, ids=[c.why[:44] for c in op.CELLS])
 def test_certified_cells(cell) -> None:
     spec = cell.spec
-    seed = abs(hash(cell.why)) % 2**31
+    seed = zlib.crc32(cell.why.encode()) % 2**31
     act, act_sf, act_gs = _operand(spec["m"], spec["k"], seed)
     weight, weight_sf, weight_gs = _operand(spec["n"], spec["k"], seed + 1)
     # alpha folds both global scales back out of the product.

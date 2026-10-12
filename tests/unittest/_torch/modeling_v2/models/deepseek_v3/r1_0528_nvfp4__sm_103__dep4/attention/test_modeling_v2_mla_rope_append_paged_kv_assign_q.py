@@ -32,6 +32,7 @@ Two surfaces:
    generation sequences must be ignored.
 """
 
+import zlib
 from typing import List, NamedTuple, Optional, Sequence, Union
 
 import pytest
@@ -554,7 +555,7 @@ def test_certified_cells(cell) -> None:
     no claim at all -- it reads as coverage.
     """
     spec = cell.spec
-    torch.manual_seed(abs(hash(cell.why)) % 2**31)
+    torch.manual_seed(zlib.crc32(cell.why.encode()) % 2**31)
     env = _MlaCtxEnv(
         max_batch_size=8,
         tokens_per_block=spec["tokens_per_block"],

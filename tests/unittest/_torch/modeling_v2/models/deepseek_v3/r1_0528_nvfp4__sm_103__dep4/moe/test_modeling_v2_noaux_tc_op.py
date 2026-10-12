@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """GPU test for the noaux_tc_op catalog entry."""
 
+import zlib
+
 import pytest
 import torch
 
@@ -26,7 +28,7 @@ def _build(spec, seed):
 
 @pytest.mark.parametrize("cell", op.CELLS, ids=[c.why[:44] for c in op.CELLS])
 def test_certified_cells(cell) -> None:
-    args = _build(cell.spec, seed=abs(hash(cell.why)) % 2**31)
+    args = _build(cell.spec, seed=zlib.crc32(cell.why.encode()) % 2**31)
     with validating(op):
         weights, ids = op(*args)
     ref_weights, ref_ids = op.reference(*args)

@@ -167,6 +167,7 @@ exercised:
 """
 
 import math
+import zlib
 from typing import Dict, List, NamedTuple, Optional, Tuple
 
 import pytest
@@ -5318,7 +5319,7 @@ def _cell_standard(cell) -> None:
     failure from a kernel that moved.
     """
     spec = cell.spec
-    torch.manual_seed(abs(hash(cell.why)) % 2**31)
+    torch.manual_seed(zlib.crc32(cell.why.encode()) % 2**31)
     window = spec["window"]
     env = (
         _sink_env(attention_window_size=window, num_blocks=96, max_blocks_per_seq=16)
@@ -5326,7 +5327,7 @@ def _cell_standard(cell) -> None:
         else _sink_env()
     )
     n_tokens = 200 if window else 48
-    sink = _sinks(-2.0, 4.0, seed=abs(hash(cell.why)) % 1000)
+    sink = _sinks(-2.0, 4.0, seed=zlib.crc32(cell.why.encode()) % 1000)
     env.add_request(0, n_tokens)
     qkv = env.random_qkv(n_tokens)
     out = _paged_ctx_call(env, qkv, [n_tokens], 1, [0], attention_sinks=sink)
@@ -5377,7 +5378,7 @@ def _cell_mla_context(cell) -> None:
     env = _fp8_r1_env()
     cached_lens, new_lens = [96, 31, 0], [32, 9, 25]
     kv_lens = [c + n for c, n in zip(cached_lens, new_lens)]
-    torch.manual_seed(abs(hash(cell.why)) % 2**31)
+    torch.manual_seed(zlib.crc32(cell.why.encode()) % 2**31)
     for rid, total in enumerate(kv_lens):
         env.add_request(rid, new_lens[rid])
         env.reserve_cache_pages(rid, total)

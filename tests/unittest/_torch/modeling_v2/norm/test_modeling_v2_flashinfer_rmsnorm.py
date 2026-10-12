@@ -8,6 +8,8 @@ cell cannot carry -- turning a spec into real tensors -- plus the inputs the
 guard exists to refuse.
 """
 
+import zlib
+
 import pytest
 import torch
 
@@ -32,7 +34,7 @@ def _build(spec, seed):
 @pytest.mark.parametrize("cell", op.CELLS, ids=[c.why[:44] for c in op.CELLS])
 def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — pytest resolves the fixture by this name
     certifying(op)
-    x, weight, eps = _build(cell.spec, seed=abs(hash(cell.why)) % 2**31)
+    x, weight, eps = _build(cell.spec, seed=zlib.crc32(cell.why.encode()) % 2**31)
     out = op(x, weight, eps)
     assert out.shape == x.shape and out.dtype == x.dtype
     assert out.data_ptr() != x.data_ptr(), "the op must return a new tensor"

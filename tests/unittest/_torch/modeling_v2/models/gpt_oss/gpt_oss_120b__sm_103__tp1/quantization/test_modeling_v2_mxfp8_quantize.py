@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """GPU test for the mxfp8_quantize catalog entry."""
 
+import zlib
+
 import pytest
 import torch
 
@@ -36,7 +38,7 @@ def _build(spec, seed):
 
 @pytest.mark.parametrize("cell", op.CELLS, ids=[c.why[:44] for c in op.CELLS])
 def test_certified_cells(cell) -> None:
-    x = _build(cell.spec, seed=abs(hash(cell.why)) % 2**31)
+    x = _build(cell.spec, seed=zlib.crc32(cell.why.encode()) % 2**31)
     swizzled, alignment = cell.spec["swizzled"], cell.spec["alignment"]
     with validating(op):
         data, scales = op(x, swizzled, alignment)
