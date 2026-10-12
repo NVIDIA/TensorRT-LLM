@@ -1182,7 +1182,7 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
             // it (which masks the failure whenever the retry happens to pass). Key
             // off the propagated rerun-failure error: it is raised only when reruns
             // genuinely failed and takes precedence over the timeout path. Do not key
-            // off failed_results.xml -- generateRerunReport writes it from the first
+            // off failed_results.xml -- run_tests.py writes it from the first
             // run whenever any rerun occurred, even when the rerun passed or the job
             // timed out, so it would wrongly suppress a legitimate infra retry. Defer
             // so the base classifier treats it as a UserFailure (no retry); a monitor-
@@ -1763,10 +1763,11 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 )
 
                 // Single-node stages run through run_tests.py (isolation, rerun, merge).
-                // Multi-node and perf-sanity launches eval pytestCommand directly:
+                // Multi-node and PerfSanity stages eval pytestCommand as one pytest session:
                 // trtllm-llmapi-launch must wrap a single pytest process on every rank,
-                // and perf/submit.py derives its per-role commands from pytestCommand.
-                def useRunTests = nodeCount <= 1 && !disaggMultiNodeMode && !aggMultiNodeMode
+                // perf/submit.py derives its per-role commands from pytestCommand, and
+                // perf results must not be rerun.
+                def useRunTests = nodeCount <= 1 && !stageName.contains("PerfSanity")
                 String pytestUtil = ""
                 if (nodeCount > 1) {
                     pytestUtil = "$llmSrcNode/tensorrt_llm/llmapi/trtllm-llmapi-launch"
@@ -4806,8 +4807,6 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         def containerPortNum = GlobalState.PORT_SECTION_SIZE
         def uploadPath = UPLOAD_PATH.replaceFirst("sw-tensorrt-generic/llm-artifacts/LLM/", "")
 
-        // clusterDurationsArgs removed — --durations-path is now passed directly to run_tests.py.
-        // Only S3 upload args remain in extraArgs for the pytest base command.
         def extraArgs = []
         if (ENABLE_UPLOAD_TEST_RESULTS && !testFilter[(DETAILED_LOG)]) {
             extraArgs += [
@@ -4902,7 +4901,6 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                             --output-dir ${WORKSPACE}/${stageName} \\
                             --working-dir ${llmSrc}/tests/integration/defs \\
                             --fail-signatures '${failSignaturesList}' \\
-                            --max-rerun-tests 5 \\
                             ${clusterDurationsPath ? "--durations-path ${clusterDurationsPath}" : ''}
                         rc=\$?
 
