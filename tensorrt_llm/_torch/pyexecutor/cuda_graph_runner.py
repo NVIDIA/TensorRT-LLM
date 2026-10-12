@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import bisect
 import contextlib
 import os
@@ -181,6 +184,13 @@ class CUDAGraphRunner:
         # graph runner does not need to know about the sampler.
         self._sample_type_resolver: Optional[Callable[
             [ScheduledRequests, Optional[SampleType]], SampleType]] = None
+        # Called just before each replay, after the static input buffers are
+        # filled. For state a model computes inside its own forward and a graph
+        # therefore captures the address of: a replay runs no Python, so nothing
+        # else refreshes it. Registered by the engine on the model's behalf.
+        self._pre_replay_hooks: List[Callable[
+            [KeyType, int, Dict[str, Any], Dict[str, Any]], None]] = []
+        self._pre_replay_position_ids: Optional[torch.Tensor] = None
 
         self.graphs: Dict[KeyType, torch.cuda.CUDAGraph] = {}
         self.graph_outputs: Dict[KeyType,
@@ -215,6 +225,7 @@ class CUDAGraphRunner:
             max_total_tokens = self.config.max_num_tokens
         max_total_tokens = min(max_total_tokens, self.config.max_num_tokens)
 
+        self._pre_replay_position_ids = None
         self.shared_static_tensors = {
             "input_ids":
             torch.ones((max_total_tokens, ), device="cuda", dtype=torch.int32),
@@ -433,6 +444,21 @@ class CUDAGraphRunner:
     ) -> None:
         """Register how a runtime batch maps to its sampling tier."""
         self._sample_type_resolver = resolver
+
+    def register_pre_replay_hook(
+        self, hook: Callable[[KeyType, int, Dict[str, Any], Dict[str, Any]],
+                             None]
+    ) -> None:
+        """Register a callback to run immediately before every graph replay.
+
+        The hook receives ``(key, num_tokens, static_tensors, current_inputs)``. It runs
+        after the static input buffers have been filled and outside any capture region, so
+        it may issue device work on the current stream but must not allocate storage the
+        graph reads -- writes have to be in place, into the buffers capture recorded.
+        Position IDs include any speculative overlap correction, in separate storage
+        so the captured preprocessing still applies that correction exactly once.
+        """
+        self._pre_replay_hooks.append(hook)
 
     def _resolve_sample_type(
         self,
@@ -760,9 +786,18 @@ class CUDAGraphRunner:
         self.memory_pool = graph.pool()
         return graph_output
 
-    def replay(self, key: KeyType,
-               current_inputs: Dict[str, Any]) -> Optional[torch.Tensor]:
-        """Replays a previously captured graph."""
+    def replay(
+        self,
+        key: KeyType,
+        current_inputs: Dict[str, Any],
+        *,
+        position_id_offsets: Optional[torch.Tensor] = None,
+    ) -> Optional[torch.Tensor]:
+        """Replay a graph, applying optional per-generation-token offsets to hooks.
+
+        ``position_id_offsets`` is a one-dimensional device tensor containing the
+        position corrections applied inside the captured speculative preprocessing.
+        """
         key = KeyType(*key)
         stored_meta = self.graph_metadata[key]
         assert current_inputs["attn_metadata"] is stored_meta["attn_metadata"]
@@ -851,6 +886,24 @@ class CUDAGraphRunner:
             static_encoder_hidden_states[:actual_num_encoder_tokens].copy_(
                 encoder_hidden_states)
             static_encoder_hidden_states[actual_num_encoder_tokens:].zero_()
+
+        if self._pre_replay_hooks:
+            hook_tensors = static_tensors
+            if position_id_offsets is not None:
+                assert current_inputs["attn_metadata"].num_ctx_tokens == 0, (
+                    "Pre-replay position offsets require a generation-only batch"
+                )
+                # Captured preprocessing owns the in-place position update.
+                if self._pre_replay_position_ids is None:
+                    self._pre_replay_position_ids = torch.empty_like(
+                        static_tensors["position_ids"])
+                hook_positions = self._pre_replay_position_ids[..., :seqlen]
+                torch.add(static_tensors["position_ids"][..., :seqlen],
+                          position_id_offsets[:seqlen],
+                          out=hook_positions)
+                hook_tensors = dict(static_tensors, position_ids=hook_positions)
+            for hook in self._pre_replay_hooks:
+                hook(key, seqlen, hook_tensors, current_inputs)
 
         self.graphs[key].replay()
         output_ref = self.graph_outputs[key]
@@ -1284,6 +1337,7 @@ class CUDAGraphRunner:
         self.graphs.clear()
         self.graph_outputs.clear()
         self.graph_metadata.clear()
+        self._pre_replay_position_ids = None
         self.padding_dummy_requests = {}
         del self.memory_pool
         self.memory_pool = None

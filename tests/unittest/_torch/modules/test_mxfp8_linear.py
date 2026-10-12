@@ -293,6 +293,7 @@ def test_mxfp8_auto_keeps_eager_native_and_captures_flashinfer(monkeypatch):
     module = SimpleNamespace(
         weight=torch.empty((3, 4), dtype=torch.float8_e4m3fn),
         weight_scale=torch.empty(512, dtype=torch.uint8),
+        _mxfp8_alpha=torch.ones(1, dtype=torch.float32),
         dtype=torch.bfloat16,
     )
     activation = torch.randn((2, 4), dtype=torch.bfloat16)
@@ -344,6 +345,7 @@ def test_mxfp8_compile_skips_context_dispatch(
     module = SimpleNamespace(
         weight=torch.empty((3, 4), dtype=torch.float8_e4m3fn),
         weight_scale=torch.empty(512, dtype=torch.uint8),
+        _mxfp8_alpha=torch.ones(1, dtype=torch.float32),
         dtype=torch.bfloat16,
     )
     result = method.apply(module, torch.empty((2, 4), dtype=torch.bfloat16), bias=None)
@@ -366,6 +368,7 @@ def test_mxfp8_auto_fallback_does_not_rearm_native_autotuning(monkeypatch):
     module = SimpleNamespace(
         weight=torch.empty((3, 4), dtype=torch.float8_e4m3fn),
         weight_scale=torch.empty(512, dtype=torch.uint8),
+        _mxfp8_alpha=torch.ones(1, dtype=torch.float32),
         dtype=torch.bfloat16,
     )
     activation = torch.randn((2, 4), dtype=torch.bfloat16)
@@ -449,6 +452,7 @@ def test_mxfp8_native_autotuner_dispatch(monkeypatch):
     module = SimpleNamespace(
         weight=torch.empty((3, 4), dtype=torch.float8_e4m3fn),
         weight_scale=torch.empty(512, dtype=torch.uint8),
+        _mxfp8_alpha=torch.ones(1, dtype=torch.float32),
         dtype=torch.bfloat16,
     )
     activation = torch.randn((2, 4), dtype=torch.bfloat16)

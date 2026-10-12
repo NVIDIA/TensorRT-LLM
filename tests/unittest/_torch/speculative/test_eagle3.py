@@ -503,15 +503,7 @@ def test_kv_lens_runtime_with_eagle3_one_model():
         prompt_lens[i] - seq_lens_q[i] for i in range(num_seqs)
     ]
 
-    # Create a mock KV cache manager
-    mock_kv_cache_manager = MagicMock()
-    mock_kv_cache_manager.tokens_per_block = 32
-    mock_kv_cache_manager.num_pools = 1
-    mock_kv_cache_manager.num_attention_op_pools = mock_kv_cache_manager.num_pools
-    mock_kv_cache_manager.max_blocks_per_seq = 16
-    mock_kv_cache_manager.max_batch_size = num_seqs
-    mock_kv_cache_manager.max_seq_len = 512  # Large enough to hold our test sequences
-    mock_kv_cache_manager.copy_batch_block_offsets = MagicMock()
+    mock_kv_cache_manager = _make_mock_kv_cache_manager(num_seqs)
 
     attn_metadata = TrtllmAttentionMetadata(
         max_num_requests=num_seqs,
@@ -556,6 +548,9 @@ def _make_mock_kv_cache_manager(num_seqs: int) -> MagicMock:
     mock_kv_cache_manager.max_batch_size = num_seqs
     mock_kv_cache_manager.max_seq_len = 512
     mock_kv_cache_manager.copy_batch_block_offsets = MagicMock()
+    # MagicMock fabricates every attribute; metadata detects an FP4 MLA cache
+    # layout from this hook, so a plain (non-FP4) manager must not expose it.
+    mock_kv_cache_manager.get_fp4_mla_page_table_spec = None
     return mock_kv_cache_manager
 
 
