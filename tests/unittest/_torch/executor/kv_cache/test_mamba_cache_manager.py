@@ -386,21 +386,21 @@ def test_kimi_explicit_v2_manager_enables_kda_replay(
 
     assert kwargs["kda_replay_num_spec"] == spec_config.tokens_per_gen_step - 1
     assert kwargs["conv_state_layout"] == "q_k_v"
-    assert "kda_token_states" not in kwargs
+    assert "kda_draft_records" not in kwargs
 
 
 @pytest.mark.parametrize("backbone_asks", [True, False])
-def test_kimi_explicit_v2_manager_kda_token_states_follow_the_model(
+def test_kimi_explicit_v2_manager_kda_draft_records_follow_the_model(
     monkeypatch: pytest.MonkeyPatch,
     backbone_asks: bool,
 ) -> None:
     """The factory asks the V2 manager for per-token KDA verify states only when
-    the model's backbone sets ``kda_token_states``."""
+    the model's backbone sets ``kda_draft_records``."""
     monkeypatch.setattr(
         "tensorrt_llm._torch.modules.kimi_kda._kda_kernels.is_kda_mtp_verify_available",
         lambda: True,
     )
-    backbone = SimpleNamespace(kda_token_states=True) if backbone_asks else SimpleNamespace()
+    backbone = SimpleNamespace(kda_draft_records=True) if backbone_asks else SimpleNamespace()
     model_engine = SimpleNamespace(
         model=SimpleNamespace(model=backbone),
         _max_cuda_graph_batch_size=4,
@@ -412,7 +412,7 @@ def test_kimi_explicit_v2_manager_kda_token_states_follow_the_model(
     )
 
     assert kwargs["kda_replay_num_spec"] == 3
-    assert kwargs.get("kda_token_states", False) is backbone_asks
+    assert kwargs.get("kda_draft_records", False) is backbone_asks
 
 
 def test_kimi_explicit_v2_manager_uses_qkv_convolution_layout(
@@ -2388,7 +2388,7 @@ def _build_v2_hybrid_with_mamba_layer(
     mamba_ssm_cache_dtype=torch.float16,
     kda_replay_num_spec=None,
     enable_kv_pool_rebalance=False,
-    kda_token_states=False,
+    kda_draft_records=False,
 ):
     """Construct a real MambaHybridCacheManagerV2."""
     mamba_mask = [True] * num_mamba_layers + [False] * num_attention_layers
@@ -2444,7 +2444,7 @@ def _build_v2_hybrid_with_mamba_layer(
         dtype=dtype,
         conv_state_layout=conv_state_layout,
         kda_replay_num_spec=kda_replay_num_spec,
-        kda_token_states=kda_token_states,
+        kda_draft_records=kda_draft_records,
     )
 
 
@@ -3668,7 +3668,7 @@ def test_v2_kda_replay_allocates_logical_slot_caches():
         assert layer_cache.intermediate_ssm is None
         assert layer_cache.intermediate_conv_window is None
         assert layer_cache.kda_state_tok is None
-        assert not mgr.keeps_kda_token_states
+        assert not mgr.keeps_kda_draft_records
         assert layer_cache.has_kda_replay_caches
     finally:
         mgr.shutdown()
@@ -3676,8 +3676,8 @@ def test_v2_kda_replay_allocates_logical_slot_caches():
 
 @skip_no_cuda
 @pytest.mark.parametrize("kda_replay_num_spec", [2, None])
-def test_v2_kda_token_states_replace_the_replay_caches(kda_replay_num_spec):
-    """On the KDA replay path, ``kda_token_states`` allocates the fp32 records of every draft of each slot (vn,
+def test_v2_kda_draft_records_replace_the_replay_caches(kda_replay_num_spec):
+    """On the KDA replay path, ``kda_draft_records`` allocates the fp32 records of every draft of each slot (vn,
     beta * k, decay), per layer, in place of the per-draft replay caches; the conv caches and the replay path stay.
     Without the replay path it allocates nothing."""
     mgr = _build_v2_hybrid_with_mamba_layer(
@@ -3690,14 +3690,14 @@ def test_v2_kda_token_states_replace_the_replay_caches(kda_replay_num_spec):
         mamba_n_groups=6,
         mamba_ssm_cache_dtype=torch.float32,
         kda_replay_num_spec=kda_replay_num_spec,
-        kda_token_states=True,
+        kda_draft_records=True,
     )
     try:
         if kda_replay_num_spec is None:
             assert getattr(mgr, "kda_state_tok", None) is None
-            assert not mgr.keeps_kda_token_states
+            assert not mgr.keeps_kda_draft_records
             return
-        assert mgr.keeps_kda_token_states
+        assert mgr.keeps_kda_draft_records
         assert mgr.kda_qkg_cache is None
         assert mgr.kda_v_cache is None
         assert mgr.kda_beta_cache is None
@@ -3781,7 +3781,7 @@ def test_v2_kda_replay_refuses_kv_pool_rebalance(kda_replay):
         )
 
 
-def _v2_kda_token_state_manager(kda_token_states, enable_block_reuse):
+def _v2_kda_draft_record_manager(kda_draft_records, enable_block_reuse):
     """A V2 hybrid manager stub for _build_cache_config: one KDA layer with the replay caches and one attention
     layer."""
     mgr = object.__new__(MambaHybridCacheManagerV2)
@@ -3811,7 +3811,7 @@ def _v2_kda_token_state_manager(kda_token_states, enable_block_reuse):
     # Layer 1's 256-byte pages of 32 tokens (_base_attention_layer_configs; layer 0 becomes the SSM layer).
     mgr._attention_cache_bytes_per_token = lambda: 8
     mgr._use_kda_replay_update = True
-    mgr._kda_token_states = kda_token_states
+    mgr._kda_draft_records = kda_draft_records
     # The drafts' records count in each slot's state bytes (_mamba_state_bytes_per_slot): per draft, vn, beta * k
     # and the decay, fp32 [H, K] each (24 KiB here).
     mgr._kda_replay_num_spec = 2
@@ -3825,16 +3825,16 @@ def _v2_kda_token_state_manager(kda_token_states, enable_block_reuse):
 
 
 @pytest.mark.parametrize(
-    ("kda_token_states", "enable_block_reuse", "at_floor"),
+    ("kda_draft_records", "enable_block_reuse", "at_floor"),
     [(True, False, True), (False, False, False), (False, True, False)],
 )
-def test_v2_kda_token_states_keep_ssm_pool_at_live_floor(
-    kda_token_states, enable_block_reuse, at_floor
+def test_v2_kda_draft_records_keep_ssm_pool_at_live_floor(
+    kda_draft_records, enable_block_reuse, at_floor
 ):
     """The KDA drafts' records take memory per SSM slot beside the V2 pools. Without block reuse the SSM pool keeps
     only its live floor, the records' bytes come out of the quota, and attention gets the rest; without them (replay
     caches only, with or without block reuse) the typical step's ratio sizes the pool."""
-    mgr = _v2_kda_token_state_manager(kda_token_states, enable_block_reuse)
+    mgr = _v2_kda_draft_record_manager(kda_draft_records, enable_block_reuse)
     base_config = KVCacheManagerConfig(
         tokens_per_block=32,
         cache_tiers=[GpuCacheTierConfig(quota=128 << 20)],
@@ -3873,12 +3873,12 @@ def test_v2_kda_token_states_keep_ssm_pool_at_live_floor(
 
 
 @pytest.mark.parametrize("off_the_floor", ["block_reuse", "pool_ratio", "no_attention"])
-def test_v2_kda_token_states_refuse_a_pool_off_the_live_floor(off_the_floor):
+def test_v2_kda_draft_records_refuse_a_pool_off_the_live_floor(off_the_floor):
     """kda_state_tok is allocated for every slot the SSM pool keeps, so with block reuse, a pool_ratio, or no
     attention layers on the rank (the SSM pool sized by its ratio, its slot count unknown before sizing) the build
     refuses the per-token states instead of allocating them outside the quota."""
-    mgr = _v2_kda_token_state_manager(
-        kda_token_states=True, enable_block_reuse=off_the_floor == "block_reuse"
+    mgr = _v2_kda_draft_record_manager(
+        kda_draft_records=True, enable_block_reuse=off_the_floor == "block_reuse"
     )
     pool_ratio = None
     if off_the_floor == "pool_ratio":
@@ -3896,11 +3896,11 @@ def test_v2_kda_token_states_refuse_a_pool_off_the_live_floor(off_the_floor):
         )
 
 
-def test_v2_kda_token_states_reserve_quota_before_sizing():
+def test_v2_kda_draft_records_reserve_quota_before_sizing():
     """At the live floor the drafts' records of every slot the SSM pool keeps come out of the GPU quota before the
     pools are sized, and the minimum quota and the quota for max_tokens count them all."""
-    mgr = _v2_kda_token_state_manager(kda_token_states=True, enable_block_reuse=False)
-    plain = _v2_kda_token_state_manager(kda_token_states=False, enable_block_reuse=False)
+    mgr = _v2_kda_draft_record_manager(kda_draft_records=True, enable_block_reuse=False)
+    plain = _v2_kda_draft_record_manager(kda_draft_records=False, enable_block_reuse=False)
     assert mgr._max_resident_sequences() + mgr._num_reserved_dummy_slots == 3
     # The pool keeps ceil(3 / max_util_for_resume) = 4 slots, each with the records of 2 drafts (3 x 8 x 256 fp32
     # each). The quotas count the 4 slots' records and the 4th slot's states, which the quotas without the records
@@ -3931,11 +3931,11 @@ def test_v2_kda_token_states_reserve_quota_before_sizing():
     assert build(128 << 20).cache_tiers[0].quota == (128 << 20) - reserved
 
 
-def test_v2_kda_token_states_reserve_the_slots_the_runtime_keeps():
+def test_v2_kda_draft_records_reserve_the_slots_the_runtime_keeps():
     """The quota checks and the build count the same slots when floor / max_util_for_resume is a whole number in
     exact arithmetic: the runtime holds the ratio as a C++ float, so 19 / 0.95 keeps 21 slots, not 20."""
-    mgr = _v2_kda_token_state_manager(kda_token_states=True, enable_block_reuse=False)
-    plain = _v2_kda_token_state_manager(kda_token_states=False, enable_block_reuse=False)
+    mgr = _v2_kda_draft_record_manager(kda_draft_records=True, enable_block_reuse=False)
+    plain = _v2_kda_draft_record_manager(kda_draft_records=False, enable_block_reuse=False)
     for m in (mgr, plain):
         m.max_batch_size = 18
         m.kv_cache_config = KvCacheConfig(
@@ -4535,7 +4535,7 @@ def test_v2_kda_replay_relocates_live_slot_history():
 
 
 @skip_no_cuda
-def test_v2_kda_token_states_relocate_with_their_slot():
+def test_v2_kda_draft_records_relocate_with_their_slot():
     """Without the per-draft replay caches, a slot's conv caches, drafts' records and draft count move with it."""
     mgr = _build_v2_hybrid_with_mamba_layer(
         spec_config=MTPDecodingConfig(max_draft_len=2),
@@ -4543,7 +4543,7 @@ def test_v2_kda_token_states_relocate_with_their_slot():
         mamba_n_groups=4,
         mamba_ssm_cache_dtype=torch.float32,
         kda_replay_num_spec=2,
-        kda_token_states=True,
+        kda_draft_records=True,
     )
     try:
         assert mgr.kda_qkg_cache is None
@@ -4574,7 +4574,7 @@ def test_v2_kda_token_states_relocate_with_their_slot():
 
 
 @skip_no_cuda
-def test_v2_kda_token_states_count_in_the_per_slot_budget():
+def test_v2_kda_draft_records_count_in_the_per_slot_budget():
     """The capacity math sees the drafts' records: per draft and layer, a slot costs vn, beta * k and the decay, fp32
     [H, K] each."""
     kwargs = dict(
@@ -4592,10 +4592,12 @@ def test_v2_kda_token_states_count_in_the_per_slot_budget():
         plain_bytes = plain._mamba_state_bytes_per_slot()
     finally:
         plain.shutdown()
-    with_states = _build_v2_hybrid_with_mamba_layer(kda_token_states=True, **kwargs)
+    with_states = _build_v2_hybrid_with_mamba_layer(kda_draft_records=True, **kwargs)
     try:
         num_heads, _, head_dim = with_states.ssm_state_shape
         per_token = 2 * 2 * 3 * num_heads * head_dim * 4
+        assert with_states._managed_state_bytes_per_slot() == plain_bytes
+        assert with_states._kda_draft_record_bytes_per_slot() == per_token
         assert with_states._mamba_state_bytes_per_slot() == plain_bytes + per_token
     finally:
         with_states.shutdown()
@@ -4753,7 +4755,7 @@ def test_v2_kda_replay_seeds_disaggregated_generation_slots():
     assert mgr.prev_num_accepted_tokens[2] == 5
 
 
-def test_v2_kda_token_states_seed_disaggregated_generation_slots():
+def test_v2_kda_draft_records_seed_disaggregated_generation_slots():
     """Without the per-draft replay caches, seeding a transferred request's slot sets its conv caches and clears its
     draft count; its drafts' records stay as they are, since with no pending drafts none of them is read."""
     mgr = object.__new__(MambaHybridCacheManagerV2)
