@@ -7,7 +7,7 @@ from __future__ import annotations
 import os
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from typing import TYPE_CHECKING, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
@@ -54,6 +54,18 @@ ModelConfig = tensorrt_llm.bindings.ModelConfig
 # (each query row's logits/top-k are independent). Override via env if needed.
 _INDEXER_MQA_LOGITS_ELEM_BUDGET = int(
     os.environ.get("TLLM_INDEXER_MQA_LOGITS_ELEM_BUDGET", 1 << 31)
+)
+
+# Cap on the [sum(q) x sum(kv)] logits of context requests packed into one
+# indexer prefill chunk (in elements; 1 << 26 is 256 MiB of fp32). A packed
+# chunk gathers the KV of every request in it and scores every query against
+# all of it, so its logits grow with the product of the packed totals while
+# each query row only needs its own request's window. Prefix-reuse hits make
+# this explode: each brings few new tokens but its whole cached context. A
+# request whose own logits exceed the cap still gets a chunk to itself, where
+# _INDEXER_MQA_LOGITS_ELEM_BUDGET tiles it. Override via env if needed.
+_INDEXER_PACKED_LOGITS_ELEM_BUDGET = int(
+    os.environ.get("TLLM_INDEXER_PACKED_LOGITS_ELEM_BUDGET", 1 << 26)
 )
 
 if TYPE_CHECKING:
@@ -380,6 +392,39 @@ def split_prefill_chunks(
             current_req += 1
 
     return chunk_groups
+
+
+def group_prefill_requests_by_logits_budget(
+    q_lens: Sequence[int],
+    kv_lens: Sequence[int],
+    elem_budget: int,
+) -> List[List[int]]:
+    """Group consecutive context requests into indexer prefill chunks.
+
+    A request joins the current group only while the group's packed logits,
+    ``sum(q_lens) * sum(kv_lens)``, stay within ``elem_budget``. A request that
+    exceeds the budget on its own forms a single-request group.
+
+    Args:
+        q_lens: New (query) tokens per request.
+        kv_lens: Compressed KV tokens per request, cached plus new.
+        elem_budget: Maximum packed logits elements for a multi-request group.
+
+    Returns:
+        Groups of request indices, in order, covering every request once.
+    """
+    assert len(q_lens) == len(kv_lens)
+    groups: List[List[int]] = []
+    group_q = group_kv = 0
+    for req_idx, (q_len, kv_len) in enumerate(zip(q_lens, kv_lens)):
+        if groups and (group_q + q_len) * (group_kv + kv_len) <= elem_budget:
+            groups[-1].append(req_idx)
+            group_q += q_len
+            group_kv += kv_len
+        else:
+            groups.append([req_idx])
+            group_q, group_kv = q_len, kv_len
+    return groups
 
 
 # Shrink the indexer prefill chunk size for very long requests to bound the
@@ -1158,20 +1203,33 @@ class Indexer(nn.Module):
         num_contexts = indexer_params.num_contexts
         seq_lens = indexer_params.seq_lens
 
-        # When MLA chunked prefill is active, it already handles chunking
-        # Indexer should just process the current MLA chunk as a single chunk
+        # When MLA chunked prefill is active, it already bounds the new tokens per
+        # request, so requests are never split here. They are only grouped so that
+        # a chunk's packed logits stay bounded: with cached KV, a request's KV can
+        # be far longer than its new tokens.
         has_mla_chunked_prefill = (
             metadata.enable_context_mla_with_cached_kv and metadata.runtime_features.chunked_prefill
         )
         if has_mla_chunked_prefill:
-            chunk_specs = [
-                (i, 0, seq_lens[i].item(), seq_lens[:i].sum().item() if i > 0 else 0)
+            compress_ratio = _effective_compress_ratio_divisor(
+                _select_indexer_compress_ratio(metadata.compress_ratios)
+            )
+            q_lens = seq_lens[:num_contexts].tolist()
+            cached_indptr = metadata.host_ctx_cached_token_indptr[: num_contexts + 1].tolist()
+            kv_lens = [
+                (cached_indptr[i + 1] - cached_indptr[i] + q_lens[i]) // compress_ratio
                 for i in range(num_contexts)
             ]
+            q_starts = [0]
+            for q_len in q_lens[:-1]:
+                q_starts.append(q_starts[-1] + q_len)
             metadata.indexer_prefill_chunks = [
                 Indexer.prepare_one_prefill_chunk(
                     metadata,
-                    chunk_specs,
+                    [(i, 0, q_lens[i], q_starts[i]) for i in group],
+                )
+                for group in group_prefill_requests_by_logits_budget(
+                    q_lens, kv_lens, _INDEXER_PACKED_LOGITS_ELEM_BUDGET
                 )
             ]
         else:

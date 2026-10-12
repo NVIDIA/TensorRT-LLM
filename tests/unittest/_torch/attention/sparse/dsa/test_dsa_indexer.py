@@ -48,10 +48,12 @@ from tensorrt_llm._torch.attention.backends.sparse.dsa import (
     _effective_compress_ratio_divisor,
     _select_indexer_compress_ratio,
     compute_cu_seqlen_kv_bounds_with_cache,
+    group_prefill_requests_by_logits_budget,
     split_prefill_chunks,
     transform_local_topk_and_prepare_pool_view,
 )
 from tensorrt_llm._torch.attention.backends.sparse.dsa import backend as dsa_backend
+from tensorrt_llm._torch.attention.backends.sparse.dsa import indexer as dsa_indexer
 from tensorrt_llm._torch.attention.backends.sparse.dsa.cache_manager import (
     _resolve_fp8_ds_mla_head_dim,
 )
@@ -3440,6 +3442,33 @@ def test_split_prefill_chunks(max_chunk_size, seq_lens, start_idx, expected_spec
     print("✅ test_split_prefill_chunks passed")
 
 
+@pytest.mark.parametrize(
+    "q_lens,kv_lens,elem_budget,expected_groups",
+    [
+        # Short prompts with no cached KV stay packed.
+        ([100, 200, 300], [25, 50, 75], 1 << 26, [[0, 1, 2]]),
+        # Prefix-reuse hits: few new tokens, long compressed context each.
+        # Two fit (1000 x 32000), three do not (1500 x 48000).
+        ([500, 500, 500, 500], [16000] * 4, 1 << 26, [[0, 1], [2, 3]]),
+        # A request over budget by itself gets its own group, and does not
+        # absorb the small request that follows it.
+        ([8192, 16], [262144, 4], 1 << 26, [[0], [1]]),
+        # A zero budget isolates every request.
+        ([1, 1, 1], [1, 1, 1], 0, [[0], [1], [2]]),
+        ([], [], 1 << 26, []),
+    ],
+    ids=["short_packed", "reuse_hits_split", "oversized_alone", "zero_budget", "empty"],
+)
+@pytest.mark.cpu_only
+def test_group_prefill_requests_by_logits_budget(q_lens, kv_lens, elem_budget, expected_groups):
+    groups = group_prefill_requests_by_logits_budget(q_lens, kv_lens, elem_budget)
+    assert groups == expected_groups
+    for group in groups:
+        if len(group) > 1:
+            packed = sum(q_lens[i] for i in group) * sum(kv_lens[i] for i in group)
+            assert packed <= elem_budget
+
+
 @pytest.mark.skipif(not has_deep_gemm(), reason="DeepGEMM not available")
 @skip_pre_hopper
 @pytest.mark.parametrize("compress_ratio", [1, 4])
@@ -4572,6 +4601,120 @@ def test_indexer_topk_multi_request_with_different_cache(enable_indexer_skip):
         assert avg_similarity >= 0.95, (
             f"Custom vs indexer skip differ: avg similarity {avg_similarity:.4f} < 0.95"
         )
+
+
+@skip_pre_hopper
+def test_indexer_mla_prefill_groups_requests_by_logits_budget(monkeypatch):
+    """Grouping reuse-hit requests into separate chunks must not change top-k.
+
+    Under MLA chunked prefill every context request used to be packed into one
+    indexer chunk whose logits are [sum(new tokens) x sum(cached + new KV)].
+    With prefix reuse each request brings few new tokens but a long cached
+    context, so that product grows with the square of the request count. The
+    budget splits such batches; each query row still scores only its own
+    request's window, so the selected indices must match the packed run.
+    """
+    torch.manual_seed(0)
+    heads, head_dim = 64, 128
+    block_size = 64
+    index_topk = 2048
+    max_model_len = 10240
+
+    seq_lens = [237, 300, 256, 199]
+    cached_tokens = [3584, 3072, 0, 4096]
+    batch_size = len(seq_lens)
+    total_kv_lens = [s + c for s, c in zip(seq_lens, cached_tokens)]
+    total_tokens = sum(seq_lens)
+
+    cache_manager, sparse_attn_config = create_dsa_cache_manager(
+        batch_size=batch_size,
+        head_dim=head_dim,
+        tokens_per_block=block_size,
+        max_seq_len=max_model_len,
+        num_layers=1,
+        index_topk=index_topk,
+    )
+    indexer = create_indexer(sparse_attn_config, layer_idx=0)
+    request_ids = list(range(batch_size))
+    cache_manager.add_dummy_requests(
+        request_ids, total_kv_lens, is_gen=False, prepare_resource=True
+    )
+
+    # Write distinct K for every position first, so the cached prefixes hold
+    # real values rather than ties that either chunking may break differently.
+    k_full = torch.randn((sum(total_kv_lens), head_dim), device="cuda", dtype=torch.bfloat16)
+    k_full_fp8, k_full_scale = fp8_utils.fp8_quantize_1x128_sf_transpose(k_full)
+    fill_metadata = _create_mock_metadata(
+        request_ids,
+        batch_size,
+        batch_size,
+        0,
+        torch.tensor(total_kv_lens, dtype=torch.int32),
+        torch.tensor(total_kv_lens, dtype=torch.int32),
+        [0] * batch_size,
+        cache_manager,
+        sum(total_kv_lens),
+        sum(total_kv_lens),
+        indexer_max_chunk_size=32768,
+        indexer_head_dim=head_dim,
+    )
+    Indexer.prepare(fill_metadata)
+    indexer._update_k_cache(k_full_fp8, k_full_scale, fill_metadata)
+
+    # The new tokens are the tail of each request's sequence.
+    kv_starts = [sum(total_kv_lens[:i]) for i in range(batch_size)]
+    new_rows = torch.cat(
+        [
+            torch.arange(start + cached, start + cached + new)
+            for start, cached, new in zip(kv_starts, cached_tokens, seq_lens)
+        ]
+    ).cuda()
+    k = k_full[new_rows]
+    q = torch.randn((total_tokens, heads, head_dim), device="cuda", dtype=torch.bfloat16)
+    weights = torch.randn((total_tokens, heads), device="cuda", dtype=torch.float32)
+    hidden_states = torch.randn((total_tokens, 4096), device="cuda", dtype=torch.bfloat16)
+    q_fp8 = q.to(torch.float8_e4m3fn)
+    k_fp8, k_scale = fp8_utils.fp8_quantize_1x128_sf_transpose(k)
+
+    def run(elem_budget):
+        monkeypatch.setattr(dsa_indexer, "_INDEXER_PACKED_LOGITS_ELEM_BUDGET", elem_budget)
+        metadata = _create_mock_metadata(
+            request_ids,
+            batch_size,
+            batch_size,
+            0,
+            torch.tensor(seq_lens, dtype=torch.int32),
+            torch.tensor(total_kv_lens, dtype=torch.int32),
+            cached_tokens,
+            cache_manager,
+            total_tokens,
+            total_tokens,
+            indexer_max_chunk_size=32768,
+            enable_context_mla_with_cached_kv=True,
+            indexer_head_dim=head_dim,
+        )
+        Indexer.prepare(metadata)
+        indexer._update_k_cache(k_fp8, k_scale, metadata)
+        topk = indexer.sparse_attn_indexer(
+            metadata, hidden_states, q_fp8, k_fp8, k_scale, weights
+        ).clone()
+        return metadata.indexer_prefill_chunks, topk
+
+    packed_chunks, topk_packed = run(1 << 62)
+    split_chunks, topk_split = run(0)
+
+    assert len(packed_chunks) == 1
+    assert len(split_chunks) == batch_size
+    q_start = kv_start = 0
+    for chunk, q_len, kv_len in zip(split_chunks, seq_lens, total_kv_lens):
+        assert (chunk.token_start, chunk.token_end) == (q_start, q_start + q_len)
+        assert (chunk.k_token_start, chunk.k_token_end) == (kv_start, kv_start + kv_len)
+        q_start += q_len
+        kv_start += kv_len
+
+    # Top-k order within a row is unspecified; the selected sets must be equal.
+    _, _, min_similarity = validate_topk_indices(topk_split, topk_packed, total_tokens)
+    assert min_similarity == 1.0, f"split vs packed select different indices: {min_similarity}"
 
 
 @pytest.mark.cpu_only
