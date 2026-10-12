@@ -67,34 +67,13 @@ if __name__ == '__main__':
 
 This example uses a single ```kv_cache_retention_config``` object for all the prompts. You can also provide a list that must have the same length as the list of prompts.
 
-KV cache manager V2 applies this configuration to native pages, including reused
-prefix pages. A token range selects blocks whose first token falls within the
-range. The final partial prompt block uses the prompt policy; subsequent blocks
-use the decode policy.
+## KV Cache Manager V2
 
-When requests share a page, the latest claim with an explicit priority sets its
-priority. Releasing an older request does not restore that request's priority.
-A claim without an explicit priority preserves the existing priority, but replaces
-the duration, including clearing it when no duration is supplied. The duration
-starts when a page has no request references. An independently published
-snapshot can reach this state before its originating request finishes. Prefetch
-preserves the existing expiry. Expired pages return to priority 35; pages still
-referenced by a request cannot be permanently evicted.
+KV cache manager V2 accepts the same `KvCacheRetentionConfig`, so the examples
+above work unchanged. For `transfer_mode`, V2 supports only the default `DRAM` and rejects
+requests that set `GDS` or `POSIX_DEBUG_FALLBACK`. V2's host and disk offload
+tiers are configured manager-wide when the manager is created and are
+independent of these per-request transfer modes.
 
-On GPU eviction, unreferenced pages below `KvCacheConfig.cold_tier_offload_min_priority`
-(default 30) are discarded. Pages at or above it can be offloaded. Offloading
-such a page preserves its priority and clears its duration, as in V1; a later
-claim can supply a new duration. Referenced pages may move between tiers but
-are never discarded by this threshold.
-
-`secondary_offload_min_priority` is deprecated. Existing configurations using it
-are accepted with a warning and mapped to `cold_tier_offload_min_priority` for
-both managers. Setting both fields to different values is an error. Serialized
-configurations use the new name. The threshold is manager-wide, not part of
-the per-request `KvCacheRetentionConfig`.
-
-V2 supports the default `transfer_mode=DRAM`. Its host and disk offload tiers are
-configured at manager creation. The per-request `GDS` and `POSIX_DEBUG_FALLBACK`
-transfer modes, whose `directory` selects V1 block files, are rejected by V2.
-They are not aliases for V2's manager-wide disk tier. With `DRAM`, `directory`
-does not select storage.
+The priority threshold that decides which evicted blocks are offloaded is also
+manager-wide; see [Enable Offloading to Host Memory](../features/kvcache.md#enable-offloading-to-host-memory).

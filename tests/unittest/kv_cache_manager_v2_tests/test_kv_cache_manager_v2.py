@@ -37,6 +37,7 @@ if not TYPE_CHECKING and find_spec("kv_cache_manager_v2") is not None:
     from kv_cache_manager_v2 import (
         BAD_PAGE_INDEX,
         DEFAULT_BEAM_INDEX,
+        DEFAULT_COLD_TIER_OFFLOAD_MIN_PRIORITY,
         GPU_LEVEL,
         AttentionLayerConfig,
         Batch,
@@ -95,6 +96,7 @@ else:
     from tensorrt_llm.runtime.kv_cache_manager_v2 import (
         BAD_PAGE_INDEX,
         DEFAULT_BEAM_INDEX,
+        DEFAULT_COLD_TIER_OFFLOAD_MIN_PRIORITY,
         GPU_LEVEL,
         AttentionLayerConfig,
         Batch,
@@ -419,22 +421,53 @@ class TestKVCacheManagerV2(unittest.TestCase):
 class TestRetention(TestKVCacheManagerV2):
     def setUp(self) -> None:
         super().setUp()
-        self.caches = []
+        self.caches: list[_KVCache] = []
         self.stream = CachedCudaStream()
 
     def tearDown(self) -> None:
+        self._close_caches()
+        super().tearDown()
+
+    def _close_caches(self) -> None:
         for cache in reversed(self.caches):
             cache.close()
         self.caches.clear()
-        super().tearDown()
 
-    def _cache(self, tokens, config=None, prompt_length=None):
+    def _prepare_retention(
+        self,
+        *,
+        host_quota: int = 0,
+        window_size: SlidingWindowSize = None,
+        enable_partial_commit: bool = True,
+        offload_threshold: int = DEFAULT_COLD_TIER_OFFLOAD_MIN_PRIORITY,
+    ) -> None:
+        self.cfg = create_config(4, 2 << 20, host_quota, 0, 1, window_size, 0, 65536)
+        self.cfg.enable_partial_commit = enable_partial_commit
+        self.cfg.cold_tier_offload_min_priority = offload_threshold
+        self.engine = FakeEngine(self.cfg)
+        self.manager = KVCacheManager(self.cfg)
+
+    def _new_cache(
+        self,
+        tokens: list[TokenIdExt],
+        config: KvCacheRetentionConfig | None = None,
+        prompt_length: int | None = None,
+    ) -> _KVCache:
         cache = self.manager.create_kv_cache(
             input_tokens=tokens,
             expected_prompt_length=len(tokens) if prompt_length is None else prompt_length,
             kv_cache_retention_config=config,
         )
         self.caches.append(cache)
+        return cache
+
+    def _cache(
+        self,
+        tokens: list[TokenIdExt],
+        config: KvCacheRetentionConfig | None = None,
+        prompt_length: int | None = None,
+    ) -> _KVCache:
+        cache = self._new_cache(tokens, config, prompt_length)
         self.assertTrue(cache.resume(self.stream.handle))
         self.assertTrue(cache.resize(len(tokens)))
         remaining = tokens[cache.num_committed_tokens :]
@@ -446,24 +479,113 @@ class TestRetention(TestKVCacheManagerV2):
             cache.commit(remaining)
         return cache
 
+    def _apply_memory_pressure(self) -> _KVCache:
+        free = self.manager.get_storage_statistics(GPU_LEVEL)[0].free
+        pressure = self._cache([])
+        self.assertTrue(pressure.resize((free + 1) * self.cfg.tokens_per_block))
+        return pressure
+
     @staticmethod
-    def _config(priority, duration=None):
+    def _config(
+        priority: int | None, duration: timedelta | None = None
+    ) -> KvCacheRetentionConfig | None:
         if priority is None:
             return None
         return KvCacheRetentionConfig(
             [KvCacheRetentionConfig.TokenRangeRetentionConfig(0, None, priority, duration)]
         )
 
+    @parameterized.expand([(4, False), (4, True), (5, False), (5, True)])
+    def test_beam_priorities_share_prompt_and_keep_private_tail(
+        self, prompt_length: int, commit: bool
+    ) -> None:
+        self._prepare_retention(enable_partial_commit=False)
+        config = KvCacheRetentionConfig(
+            [KvCacheRetentionConfig.TokenRangeRetentionConfig(0, None, 80)],
+            decode_retention_priority=10,
+        )
+        tokens = list(range(prompt_length))
+        cache = self._new_cache(tokens, config)
+        self.assertTrue(cache.resume(self.stream.handle))
+        self.assertTrue(cache.resize(12))
+        self.engine.execute([Step(cache, tokens, [])], self.stream.handle)
+        if commit:
+            cache.commit(tokens)
+        cache.stop_committing()
+        cache.beam_width = 3
+
+        prompt_blocks = div_up(prompt_length, 4)
+        shared_blocks = prompt_length // 4
+        for capacity in (12, 16):
+            self.assertTrue(cache.resize(capacity))
+            indices = [cache.get_aggregated_page_indices(0, beam) for beam in range(3)]
+            for beam in range(3):
+                self.assertEqual(
+                    cache.get_page_priorities(0, beam),
+                    [80] * prompt_blocks + [10] * (capacity // 4 - prompt_blocks),
+                )
+                if beam:
+                    self.assertEqual(
+                        indices[beam][:shared_blocks], [BAD_PAGE_INDEX] * shared_blocks
+                    )
+            # The partial prompt tail and both preallocated and newly allocated decode pages
+            # are writable independently by every beam.
+            for ordinal in range(shared_blocks, capacity // 4):
+                pages = {row[ordinal] for row in indices}
+                self.assertNotIn(BAD_PAGE_INDEX, pages)
+                self.assertEqual(len(pages), 3)
+        for invalid_beam in (-1, 3):
+            with self.assertRaises(IndexError):
+                cache.get_page_priorities(0, invalid_beam)
+        self.stream.synchronize()
+
+    def test_beam_priorities_read_each_private_page(self) -> None:
+        self._prepare_retention(enable_partial_commit=False)
+        priority = 60
+        tokens = list(range(5))
+        cache = self.manager.create_kv_cache(
+            input_tokens=tokens,
+            expected_prompt_length=len(tokens),
+            custom_priority_callback=lambda ordinal, lifecycle: priority,
+        )
+        self.caches.append(cache)
+        self.assertTrue(cache.resume(self.stream.handle))
+        self.assertTrue(cache.resize(12))
+        self.engine.execute([Step(cache, tokens, [])], self.stream.handle)
+        cache.stop_committing()
+        # Give each new beam's private pages a distinct allocation-time priority.
+        for beam_width, priority in ((2, 80), (3, 90)):
+            cache.beam_width = beam_width
+        self.assertEqual(cache.get_page_priorities(0, 0), [60, 60, 60])
+        self.assertEqual(cache.get_page_priorities(0, 1), [60, 80, 80])
+        self.assertEqual(cache.get_page_priorities(0, 2), [60, 90, 90])
+        self.stream.synchronize()
+
+    def test_offload_default_and_dataclass_replace(self) -> None:
+        config = create_config(4, 2 << 20, 0, 0, 1, None, 0, 65536)
+        self.assertEqual(
+            config.cold_tier_offload_min_priority, DEFAULT_COLD_TIER_OFFLOAD_MIN_PRIORITY
+        )
+        self.assertEqual(
+            replace(config).cold_tier_offload_min_priority, DEFAULT_COLD_TIER_OFFLOAD_MIN_PRIORITY
+        )
+        for threshold in (0, 80):
+            self.assertEqual(
+                replace(
+                    config, cold_tier_offload_min_priority=threshold
+                ).cold_tier_offload_min_priority,
+                threshold,
+            )
+
     @parameterized.expand(
         [(80, 10, False), (80, 10, True), (10, 80, False), (10, 80, True), (80, None, False)]
     )
-    def test_shared_claim_order_controls_eviction(self, first, second, close_newer_first):
-        self.prepare(2 << 20, 0, 0, 1, None, 0, tokens_per_block=4, kv_buf_size=65536)
+    def test_shared_claim_order_controls_eviction(
+        self, first: int, second: int | None, close_newer_first: bool
+    ) -> None:
+        self._prepare_retention()
         prompt = [1, 2, 3, 4]
-        late = self.manager.create_kv_cache(
-            input_tokens=prompt, kv_cache_retention_config=self._config(100)
-        )
-        self.caches.append(late)
+        late = self._new_cache(prompt, self._config(100))
         self.assertTrue(late.resume(self.stream.handle))
         self.assertTrue(late.resize(len(prompt)))
         self.engine.execute([Step(late, prompt, [])], self.stream.handle)
@@ -482,25 +604,21 @@ class TestRetention(TestKVCacheManagerV2):
         competitor = self._cache([5, 6, 7, 8], self._config(50))
         competitor.close()
         # Referenced pages cannot be permanently evicted, irrespective of priority.
-        free = self.manager.get_storage_statistics()[0].free
-        pin = self._cache([])
-        self.assertTrue(pin.resize((free + 1) * 4))
+        pin = self._apply_memory_pressure()
         self.assertEqual(self.manager.probe_reuse(input_tokens=prompt), 4)
         self.assertEqual(self.manager.probe_reuse(input_tokens=[5, 6, 7, 8]), 0)
         pin.close()
         requests[1].close()
         competitor = self._cache([5, 6, 7, 8], self._config(50))
         competitor.close()
-        free = self.manager.get_storage_statistics()[0].free
-        pressure = self._cache([])
-        self.assertTrue(pressure.resize((free + 1) * 4))
+        self._apply_memory_pressure()
         self.assertEqual(self.manager.probe_reuse(input_tokens=prompt), 4 if priority > 50 else 0)
         self.assertEqual(
             self.manager.probe_reuse(input_tokens=[5, 6, 7, 8]), 0 if priority > 50 else 4
         )
 
-    def test_prompt_decode_duration_and_unconfigured_claim(self):
-        self.prepare(2 << 20, 0, 0, 1, None, 0, tokens_per_block=4, kv_buf_size=65536)
+    def test_prompt_and_decode_priorities_expire_after_last_release(self) -> None:
+        self._prepare_retention()
         duration = timedelta(milliseconds=20)
         config = KvCacheRetentionConfig(
             [KvCacheRetentionConfig.TokenRangeRetentionConfig(1, None, 80, duration)],
@@ -515,12 +633,6 @@ class TestRetention(TestKVCacheManagerV2):
         first.commit(tokens[5:])
         second = self._cache(tokens, config, prompt_length=5)
         self.assertEqual(first.get_page_priorities(0), [35, 80, 10])
-        with self.assertRaises(IndexError):
-            first.get_page_priorities(0, -1)
-        with self.assertRaises(IndexError):
-            self.manager.prefetch_reuse(ReuseScope(), tokens, CacheLevel(-1))
-        with self.assertRaises(IndexError):
-            self.manager.prefetch_reuse(ReuseScope(), tokens, CacheLevel(1))
         first.close()
         time.sleep(0.04)
         self.manager.refresh_retention()
@@ -531,7 +643,10 @@ class TestRetention(TestKVCacheManagerV2):
         self.manager.refresh_retention()
         reclaimed = self._cache(tokens)
         self.assertEqual(reclaimed.get_page_priorities(0), [35, 35, 35])
-        reclaimed.close()
+
+    def test_unconfigured_claim_preserves_priority_and_clears_expiry(self) -> None:
+        self._prepare_retention()
+        tokens = list(range(12))
         long_duration = timedelta(seconds=1)
         config = KvCacheRetentionConfig(
             [KvCacheRetentionConfig.TokenRangeRetentionConfig(1, None, 80, long_duration)],
@@ -546,34 +661,35 @@ class TestRetention(TestKVCacheManagerV2):
         self.manager.refresh_retention()
         self.assertEqual(self._cache(tokens).get_page_priorities(0), [35, 80, 10])
 
-        for shared in (False, True):
-            with self.subTest(shared_swa_page=shared):
-                for cache in self.caches:
-                    cache.close()
-                self.caches.clear()
-                self.manager.shutdown()
-                self.prepare(2 << 20, 0, 0, 1, 4, 0, tokens_per_block=4, kv_buf_size=65536)
-                config = self._config(80, duration)
-                source = self._cache(tokens[:4], config)
-                sharer = self._cache(tokens[:4], config) if shared else None
-                self.assertTrue(source.resize(8))
-                self.engine.execute([Step(source, tokens[4:8], tokens[:4])], self.stream.handle)
-                source.commit(tokens[4:8])
-                source.close()
-                if sharer is not None:
-                    sharer.close()
-                time.sleep(0.04)
-                self.manager.refresh_retention()
-                self.assertEqual(self._cache(tokens[:4]).get_page_priorities(0), [80])
+    @parameterized.expand([(False,), (True,)])
+    def test_sliding_window_release_preserves_priority_without_expiry(self, shared: bool) -> None:
+        self._prepare_retention(window_size=4)
+        tokens = list(range(8))
+        config = self._config(80, timedelta(milliseconds=20))
+        source = self._cache(tokens[:4], config)
+        sharer = self._cache(tokens[:4], config) if shared else None
+        self.assertTrue(source.resize(8))
+        self.engine.execute([Step(source, tokens[4:], tokens[:4])], self.stream.handle)
+        source.commit(tokens[4:])
+        source.close()
+        if sharer is not None:
+            sharer.close()
+        time.sleep(0.04)
+        self.manager.refresh_retention()
+        self.assertEqual(self._cache(tokens[:4]).get_page_priorities(0), [80])
 
-    def test_offload_reload_and_error_cleanup(self):
-        self.prepare(2 << 20, 2 << 20, 0, 1, None, 0, tokens_per_block=4, kv_buf_size=65536)
+    def test_prefetch_rejects_invalid_cache_levels(self) -> None:
+        self._prepare_retention()
+        for level in (-1, 1):
+            with self.subTest(level=level), self.assertRaises(IndexError):
+                self.manager.prefetch_reuse(ReuseScope(), [1, 2, 3, 4], CacheLevel(level))
+
+    def test_offload_reload_preserves_priority_and_partial_reuse(self) -> None:
+        self._prepare_retention(host_quota=2 << 20)
         tokens = [1, 2, 3, 4]
         cached = self._cache(tokens, self._config(80))
         cached.suspend()
-        free = self.manager.get_storage_statistics()[0].free
-        pressure = self._cache([])
-        self.assertTrue(pressure.resize((free + 1) * 4))
+        pressure = self._apply_memory_pressure()
         self.assertEqual(_introspection.active_page_stats(cached)[0], [0, 1])
         pressure.close()
         self.assertTrue(cached.resume(self.stream.handle))
@@ -589,6 +705,17 @@ class TestRetention(TestKVCacheManagerV2):
             self.assertNotEqual(
                 partial.get_aggregated_page_indices(0), cached.get_aggregated_page_indices(0)
             )
+        self._close_caches()
+        self.manager.clear_reusable_blocks()
+        for level in (GPU_LEVEL, CacheLevel(1)):
+            for stats in self.manager.get_storage_statistics(level):
+                self.assertEqual(stats.free, stats.total)
+                self.assertEqual(stats.evictable, 0)
+
+    def test_failed_resize_preserves_capacity_priority_and_data(self) -> None:
+        self._prepare_retention(host_quota=2 << 20)
+        tokens = [1, 2, 3, 4]
+        cached = self._cache(tokens, self._config(80))
         capacity = cached.capacity
         total = self.manager.get_storage_statistics()[0].total
         self.assertFalse(cached.resize((total + 1) * 4))
@@ -596,32 +723,26 @@ class TestRetention(TestKVCacheManagerV2):
         self.assertEqual(cached.get_page_priorities(0), [80])
         self.engine.execute([Step(cached, [], tokens)], self.stream.handle)
         self.stream.synchronize()
-        cached.close()
+
+    def test_unsupported_transfer_modes_do_not_claim_reusable_pages(self) -> None:
+        self._prepare_retention(host_quota=2 << 20)
+        tokens = [1, 2, 3, 4]
+        self._cache(tokens, self._config(80)).close()
         # Unsupported file-transfer semantics fail before claiming any reusable pages.
         for mode in (KvCacheTransferMode.GDS, KvCacheTransferMode.POSIX_DEBUG_FALLBACK):
             config = KvCacheRetentionConfig([], transfer_mode=mode, directory="/tmp")
-            with self.assertRaisesRegex(ValueError, "per-request GDS/POSIX"):
+            with (
+                self.subTest(mode=mode),
+                self.assertRaisesRegex(ValueError, "per-request GDS/POSIX"),
+            ):
                 self.manager.create_kv_cache(input_tokens=tokens, kv_cache_retention_config=config)
         self.assertEqual(self._cache(tokens).get_page_priorities(0), [80])
-        for cache in self.caches:
-            cache.close()
-        self.manager.clear_reusable_blocks()
-        for level in (GPU_LEVEL, CacheLevel(1)):
-            for stats in self.manager.get_storage_statistics(level):
-                self.assertEqual(stats.free, stats.total)
-                self.assertEqual(stats.evictable, 0)
 
+    def test_deferred_partial_copies_use_latest_claim_priority(self) -> None:
+        self._prepare_retention(host_quota=2 << 20)
         donor = self._cache(list(range(8)), self._config(80))
         donor.close()
-        pending = []
-        for priority in (10, 90):
-            copy = self.manager.create_kv_cache(
-                input_tokens=list(range(3)),
-                expected_prompt_length=3,
-                kv_cache_retention_config=self._config(priority),
-            )
-            self.caches.append(copy)
-            pending.append(copy)
+        pending = [self._new_cache(list(range(3)), self._config(priority)) for priority in (10, 90)]
         for copy in pending:
             self.assertTrue(copy.resume(self.stream.handle))
             self.assertEqual(copy.get_page_priorities(0), [90])
@@ -629,27 +750,32 @@ class TestRetention(TestKVCacheManagerV2):
         self.stream.synchronize()
 
     @parameterized.expand([(29, 30), (30, 30), (49, 50), (50, 50), (0, -1), (100, 101)])
-    def test_released_offload_threshold_and_duration(self, priority, threshold):
-        self.cfg = create_config(4, 2 << 20, 2 << 20, 0, 1, None, 0, 65536)
-        self.cfg.cold_tier_offload_min_priority = threshold
-        self.engine = FakeEngine(self.cfg)
-        self.manager = KVCacheManager(self.cfg)
+    def test_released_offload_threshold(self, priority: int, threshold: int) -> None:
+        self._prepare_retention(host_quota=2 << 20, offload_threshold=threshold)
         tokens = [1, 2, 3, 4]
         cached = self._cache(tokens, self._config(priority, timedelta(seconds=2)))
         cached.close()
-        free = self.manager.get_storage_statistics()[0].free
-        pressure = self._cache([])
-        self.assertTrue(pressure.resize((free + 1) * 4))
+        pressure = self._apply_memory_pressure()
         retained = priority >= threshold
         self.assertEqual(self.manager.probe_reuse(input_tokens=tokens), 4 if retained else 0)
         self.assertEqual(
             self.manager.get_storage_statistics(CacheLevel(1))[0].evictable, 1 if retained else 0
         )
         pressure.close()
+        self.assertEqual(self._cache(tokens).get_page_priorities(0), [priority if retained else 35])
+
+    def test_eviction_offload_preserves_priority_and_clears_expiry(self) -> None:
+        self._prepare_retention(host_quota=2 << 20, offload_threshold=50)
+        tokens = [1, 2, 3, 4]
+        self._cache(tokens, self._config(80, timedelta(seconds=2))).close()
+        pressure = self._apply_memory_pressure()
+        self.assertEqual(self.manager.probe_reuse(input_tokens=tokens), 4)
+        self.assertEqual(self.manager.get_storage_statistics(CacheLevel(1))[0].evictable, 1)
+        pressure.close()
         time.sleep(2.05)
         self.manager.refresh_retention()
         # GPU eviction-driven offload clears the old duration, retaining the priority.
-        self.assertEqual(self._cache(tokens).get_page_priorities(0), [priority if retained else 35])
+        self.assertEqual(self._cache(tokens).get_page_priorities(0), [80])
 
 
 class TestStorageStatistics(TestKVCacheManagerV2):

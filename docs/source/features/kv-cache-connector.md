@@ -76,12 +76,17 @@ These methods run on the leader process and drive the connector's behavior.
 
     | Set | Models it covers |
     |---|---|
-    | per-layer-group | every model, VSWA included |
+    | per-layer-group | single-layer-group models; multi-group configurations are currently rejected |
     | flat | non-VSWA, non-hybrid only |
 
-    A set is complete when both of its methods are defined. Mixing the two — one method from each — is rejected during executor bring-up, naming the method that is missing. An existing flat connector needs no change on the models it already covers: with a single layer group the base per-layer-group implementation folds back to the flat call. Hybrid / linear-attention models are not enabled for the connector yet; the per-layer-group set is the shape their cache will need. See [Running under VSWA](#running-under-vswa).
+    A set is complete when both of its methods are defined. An existing flat connector needs no change on the models it already covers: with a single layer group the base per-layer-group implementation folds back to the flat call. Hybrid / linear-attention models are not enabled for the connector yet; the per-layer-group set is the shape their cache will need. See [Running under VSWA](#running-under-vswa).
 
 ##### Running under VSWA
+
+Multi-layer-group configurations currently fail during connector initialization because retention
+priorities are represented by a single list. This applies to both KV cache managers, even when the
+connector implements the grouped APIs below. Single-window SWA remains allowed. The grouped
+interfaces and example describe the addressing needed for future VSWA connector support.
 
 Under variable sliding-window attention the KV cache allocates one pool per attention window size, and a page index only means something inside its own layer group. A single tensor and a single flat block list cannot describe that, so three methods have to be implemented together:
 
@@ -93,7 +98,8 @@ Under variable sliding-window attention the KV cache allocates one pool per atte
 
 Implementing the per-layer-group form of a pair is enough — the flat method it replaces does not also have to be defined.
 
-All three are checked during executor bring-up, before any request is admitted. `register_kv_cache_layout` refuses there, naming the group and region counts it could not describe, and the two scheduler methods are checked alongside it. Nothing is deferred to the first request, so a partial implementation costs a start-up failure rather than one after the model is loaded.
+The current single-group restriction is checked during executor bring-up, before worker registration
+or request admission. Implementing all three methods does not bypass that restriction.
 
 `examples/llm-api/llm_kv_cache_connector_vswa.py` is a worked connector for this case. A VSWA connector has to do five things:
 

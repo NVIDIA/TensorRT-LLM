@@ -37,6 +37,7 @@ from tensorrt_llm.bindings.executor import KvCacheRetentionConfig
 # From _common.py
 NDEBUG: Final[int]
 DEFAULT_BEAM_INDEX: Final[BeamIndex]
+DEFAULT_COLD_TIER_OFFLOAD_MIN_PRIORITY: Final[int]
 BAD_PAGE_INDEX: Final[int]
 GPU_LEVEL: Final[CacheLevel]
 CACHE_LEVEL1: Final[CacheLevel]
@@ -304,7 +305,7 @@ class KVCacheManagerConfig:
     text_only: bool = False
     enable_partial_commit: bool = True
     pool_rebalance: PoolRebalanceConfig = ...
-    cold_tier_offload_min_priority: int = 30
+    cold_tier_offload_min_priority: int = DEFAULT_COLD_TIER_OFFLOAD_MIN_PRIORITY
     @property
     def enable_swa_scratch_reuse(self) -> bool: ...
 

@@ -824,6 +824,8 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
 
     // Export the C++ debug mode as an immutable Python bool snapshot.
     m.attr("NDEBUG") = nb::bool_(!kv::gDebug);
+    m.attr("DEFAULT_COLD_TIER_OFFLOAD_MIN_PRIORITY")
+        = nb::int_(tensorrt_llm::batch_manager::kDefaultColdTierOffloadMinPriority);
 
     // ---- Exceptions --------------------------------------------------------
     static nb::object sOutOfMemoryError = nb::exception<kv::OutOfMemoryError>(m, "OutOfMemoryError");
@@ -1777,7 +1779,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             nb::arg("swa_scratch_reuse").none() = std::nullopt, nb::arg("commit_min_snapshot") = false,
             nb::arg("enable_stats") = true, nb::arg("text_only") = false, nb::arg("enable_partial_commit") = true,
             nb::arg("pool_rebalance") = kv::PoolRebalanceConfig{},
-            nb::arg("cold_tier_offload_min_priority") = 30)
+            nb::arg("cold_tier_offload_min_priority") = tensorrt_llm::batch_manager::kDefaultColdTierOffloadMinPriority)
         .def_rw("tokens_per_block", &kv::KVCacheManagerConfig::tokensPerBlock)
         .def_rw("cache_tiers", &kv::KVCacheManagerConfig::cacheTiers)
         .def_rw("layers", &kv::KVCacheManagerConfig::layers)

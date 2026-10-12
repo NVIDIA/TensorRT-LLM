@@ -722,6 +722,13 @@ SWA_WINDOW = 64
 SWA_MAX_SEQ_LEN = 512
 SWA_NUM_INPUT_TOKENS = 256
 
+MULTI_GROUP_CONNECTOR_UNSUPPORTED = pytest.mark.xfail(
+    raises=NotImplementedError,
+    strict=True,
+    reason=
+    "Connector initialization rejects multiple layer groups until grouped retention priorities are supported",
+)
+
 
 @pytest.mark.threadleak(enabled=False)
 @pytest.mark.parametrize("use_kv_cache_manager_v2", [True],
@@ -1029,7 +1036,10 @@ def test_connector_sliding_window_prefix_is_backed_by_real_pages(
 
 
 @pytest.mark.threadleak(enabled=False)
-@pytest.mark.parametrize("use_kv_cache_manager_v2", [False, True],
+@pytest.mark.parametrize("use_kv_cache_manager_v2", [
+    False,
+    pytest.param(True, marks=MULTI_GROUP_CONNECTOR_UNSUPPORTED),
+],
                          ids=["kv_cache_manager_v1", "kv_cache_manager_v2"],
                          indirect=True)
 def test_connector_vswa_reports_page_indices_per_layer_group(
@@ -1505,6 +1515,14 @@ def test_connector_max_utilization_is_rejected_on_v1_only(
             "beam",
             "beam",
             id="beam_search",
+        ),
+        pytest.param(
+            dict(kv_cache_config=KvCacheConfig(
+                free_gpu_memory_fraction=0.1,
+                max_attention_window=[SWA_WINDOW, SWA_MAX_SEQ_LEN])),
+            "VSWA",
+            "single layer group",
+            id="multiple_layer_groups",
         ),
         pytest.param(
             dict(enable_attention_dp=True),
@@ -2129,6 +2147,7 @@ VSWA_E2E_MAX_SEQ_LEN = 512
 
 
 @pytest.mark.threadleak(enabled=False)
+@MULTI_GROUP_CONNECTOR_UNSUPPORTED
 def test_connector_multi_pool_e2e_persistent_cache(enforce_single_worker,
                                                    monkeypatch):
     """The multi-pool data path, end to end, with a connector that moves real bytes.
@@ -2330,6 +2349,7 @@ GEMMA3_MAX_SEQ_LEN = 2048
 
 
 @pytest.mark.threadleak(enabled=False)
+@MULTI_GROUP_CONNECTOR_UNSUPPORTED
 def test_connector_vswa_e2e_gemma3(enforce_single_worker, monkeypatch):
     """A KV connector on a model whose architecture is variable-window.
 
@@ -2635,6 +2655,7 @@ GEMMA3_ENGAGED_GEN_TOKENS = 64
 
 
 @pytest.mark.threadleak(enabled=False)
+@MULTI_GROUP_CONNECTOR_UNSUPPORTED
 def test_connector_vswa_out_of_window_blocks_reach_the_connector(
         enforce_single_worker, monkeypatch):
     """The sliding window passing blocks, delivered per layer group.
@@ -2866,6 +2887,7 @@ SELECTIVE_WINDOW = 64
                          get_sm_version() not in (100, 103),
                          reason="gpt-oss-20b is MXFP4 and needs SM100/SM103")),
     ])
+@MULTI_GROUP_CONNECTOR_UNSUPPORTED
 def test_connector_transfers_only_in_window_blocks_to_the_sliding_group(
         enforce_single_worker, monkeypatch, model_rel, assert_round_trip):
     """The connector transfers each layer group only what that group can read.
