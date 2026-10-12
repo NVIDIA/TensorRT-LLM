@@ -546,12 +546,22 @@ class TestDefaultADPRouter:
             kv_total_blocks=10,
             kv_load_timestamp_ns=123,
         )
-        state = RankState(rank=0, iter_stats=payload)
+        state = RankState(
+            rank=0,
+            iter_stats=payload,
+            num_context_requests=2,
+            num_generation_requests=3,
+        )
 
-        assert len(state.serialize()) == 13
+        disabled = state.serialize()
+        assert len(disabled) == 15
+        assert RankState.deserialize(disabled).num_context_requests == 2
         enabled = state.serialize(include_kv_cache_load=True)
-        assert len(enabled) == 16
-        assert RankState.deserialize(enabled).iter_stats.kv_used_blocks == 4
+        assert len(enabled) == 18
+        restored = RankState.deserialize(enabled)
+        assert restored.iter_stats.kv_used_blocks == 4
+        assert restored.num_context_requests == 2
+        assert restored.num_generation_requests == 3
 
 
 def test_schedule_attention_dp_requests_scheduled_requests(
