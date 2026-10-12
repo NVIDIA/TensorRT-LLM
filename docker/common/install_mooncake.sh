@@ -30,7 +30,7 @@ apt-get install -y --no-install-recommends \
 
 mkdir -p /third-party-source
 
-git clone --depth 1 https://github.com/alibaba/yalantinglibs.git
+git clone --depth 1 -b 0.5.5 https://github.com/alibaba/yalantinglibs.git
 tar -czf /third-party-source/yalantinglibs.tar.gz yalantinglibs
 cd yalantinglibs
 mkdir build && cd build
