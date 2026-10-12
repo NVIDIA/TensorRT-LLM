@@ -268,7 +268,7 @@ Put together, compression and the cold-page mechanism **move the serving frontie
 </div>
 <p align="center"><sub><em>Figure 11: GLM-5.2 Pareto frontier · the ten highest-throughput NVFP4 points and the uncompressed run of each. Top: each green numbered point is an NVFP4 configuration, the hollow point is the same configuration with an uncompressed host cache, and the arrow shows the change. Bottom: the gain of each numbered configuration in tok/s/GPU (green) and in P90 interactivity (blue). Two repeats per setting; AgentX replay.</em></sub></p>
 
-Figure 12 details the four configurations with the largest gains, including Qwen3.5-397B-A17B.
+The gain is not tied to one setup. Figure 12 details the four configurations with the largest gains, across two models (GLM-5.2 and Qwen3.5-397B-A17B), from 8 to 40 GPUs, and from concurrency 128 to 1536: in every one **both the hit rate and the TTFT improve**. The improvement comes from two sources, not one: the smaller cold page lets the tiers **hold more prefixes, so the hit rate rises**, and it also means **fewer bytes to move, so offloading and onboarding themselves get faster**.
 
 <div align="center">
 <figure>
@@ -277,9 +277,9 @@ Figure 12 details the four configurations with the largest gains, including Qwen
 </div>
 <p align="center"><sub><em>Figure 12: The four serving configurations with the largest NVFP4 gains · AgentX replay. Each panel is one configuration run with the uncompressed host cache and with the NVFP4 host cache, two or three repeats per setting; bars are throughput per GPU and P90 interactivity, with the cache-read hit rate and P90 TTFT below.</em></sub></p>
 
-#### Hit Rate
+#### Where the Gain Comes From
 
-Besides the frontier, the hit rate shows directly where cold-page compression pays off, in **two cases**.
+The frontier gains above come mostly from a higher hit rate, but the benefit does not stop when the hit rate saturates. There are **two cases**.
 
 **The hit rate rises.** When the host tier cannot hold the working set, a smaller cold page means more prefixes are still there when the next turn arrives. In the configurations of Figure 12 the hit rate rises by **5 to 34 points**. The effect is clearest in a GPU-limited deployment (Figure 13): Qwen3.5-397B-A17B on ten GB300s at concurrency 192 reads only 57% of prefixes uncompressed. As the disk tier grows from 0 to 1,024 GiB, NVFP4 hits more, completes more and answers sooner at every size, peaking at **64% more requests completed and 48% sooner** at 512 GiB.
 
@@ -290,7 +290,7 @@ Besides the frontier, the hit rate shows directly where cold-page compression pa
 </div>
 <p align="center"><sub><em>Figure 13: Qwen3.5-397B-A17B · ten GB300s · concurrency 192 · growing disk tier. NVFP4 completes more requests, hits more, and answers sooner at every disk size.</em></sub></p>
 
-**The hit rate is saturated, and the hits move from disk to host.** A hit served from disk costs far more than one served from host memory, and a hit rate alone does not tell them apart. TensorRT LLM now counts every hit by the tier that served it. Figure 14 shows two cases on one GB300 node with the GPU cache capped: the hit rate barely changes, but the share of hits served from disk falls from **31% to 19%** for GLM-5.2 and from **14% to 0%** for Qwen3.5-397B-A17B, tail TTFT roughly halves, and 40% to 50% more requests complete in the same window. The same host memory holds more pages, so prefixes that used to come back from disk now come back from host memory.
+**The hit rate is saturated, and the hits move from disk to host.** Even when the hit rate cannot rise further, cold pages still pay: a hit served from disk costs far more than one served from host memory, and a hit rate alone does not tell them apart. TensorRT LLM now counts every hit by the tier that served it. Figure 14 shows two cases on one GB300 node with the GPU cache capped: the hit rate barely changes, but the share of hits served from disk falls from **31% to 19%** for GLM-5.2 and from **14% to 0%** for Qwen3.5-397B-A17B, tail TTFT roughly halves, and 40% to 50% more requests complete in the same window. The same host memory holds more pages, so **less disk is used and the prefixes come back faster**.
 
 <div align="center">
 <figure>
