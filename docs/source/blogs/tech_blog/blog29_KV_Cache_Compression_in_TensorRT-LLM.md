@@ -99,11 +99,11 @@ Beyond the forward pass, a serving system offers **extra opportunities to compre
 
 To insert precisely, we define five stages in the life of a KV cache (Figure 3):
 
-1. **Prefill chunks**: between prompt chunks.
-2. **After prefill**: before the first decode step.
-3. **Decode steps**: between generation steps (TriAttention).
-4. **Tool calls**: while the request waits for a tool.
-5. **After the request**: KV kept for reuse on GPU, host or disk (NVFP4 cold pages).
+1. **Prefill-chunk stage**: after each prefill chunk.
+2. **After-prefill stage**: right after prefill, before the first decode step.
+3. **Decode stage**: between decode steps (TriAttention).
+4. **Tool-call stage**: around a tool call, while the request waits.
+5. **After-request stage**: after the request, KV kept for reuse on GPU, host or disk (cold-page compression).
 
 <div align="center">
 <figure>
@@ -114,7 +114,7 @@ To insert precisely, we define five stages in the life of a KV cache (Figure 3):
 
 These stages map to two integration paths in the runtime. **Iteration-driven** methods engage directly at the stages the executor loop passes through: a hook fires at each stage boundary, and the method transforms the retained KV state before the next step reads it. TriAttention is one.
 
-Stages 4 and 5 are different in kind. While a tool runs, and after a request ends, the KV is held by the cache manager rather than by a running request: it is kept across requests, reused, and moved across storage levels from the GPU to host and disk memory and back. For these stages we define **cross-request KV management** methods: they run inside the cache manager, where KV is kept, moved and reused across requests. A method may use either path or both; in both the cache manager keeps ownership of every page and the method only changes their contents.
+The tool-call and after-request stages (stages 4 and 5) are different in kind. While a tool runs, and after a request ends, the KV is held by the cache manager rather than by a running request: it is kept across requests, reused, and moved across storage levels from the GPU to host and disk memory and back. For these stages we define **cross-request KV management** methods: they run inside the cache manager, where KV is kept, moved and reused across requests. A method may use either path or both; in both the cache manager keeps ownership of every page and the method only changes their contents.
 
 ### Architecture Overview
 
