@@ -400,7 +400,9 @@ class GptOssWeights:
         fill(model.lm_head.weight, "lm_head.weight", None, None)
 
         torch.cuda.synchronize()
-        leftover = set(weights.keys()) - consumed - self.expected_unconsumed(core, weights)
+        # Every key in this checkpoint is one the table names; nothing is meant
+        # to be left untouched.
+        leftover = set(weights.keys()) - consumed
         assert not leftover, f"unconsumed checkpoint keys: {sorted(leftover)[:8]}"
 
 

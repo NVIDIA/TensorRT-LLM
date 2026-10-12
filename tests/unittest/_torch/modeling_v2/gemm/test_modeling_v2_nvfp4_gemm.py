@@ -6,7 +6,7 @@ import pytest
 import torch
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.nvfp4_gemm import nvfp4_gemm as op
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.quantization.fp4_quantize import (
+from tensorrt_llm._torch._experimental.modeling_v2.models.deepseek_v3.r1_0528_nvfp4__sm_103__dep4.ops.quantization.fp4_quantize import (  # noqa: E501
     fp4_quantize,
 )
 

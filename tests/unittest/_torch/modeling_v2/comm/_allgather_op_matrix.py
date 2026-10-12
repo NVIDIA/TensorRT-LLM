@@ -145,7 +145,7 @@ def _gather_ref(
     # Delegates to the entry: what the concatenation is supposed to be is the
     # entry's claim, and building it here again would be a second place to fix
     # if it were ever wrong.
-    return allgather.reference(
+    return entry.allgather.reference(
         [_payload(r, sizes[i], seed, dtype, trailing) for i, r in enumerate(ranks)]
     )
 
@@ -158,7 +158,7 @@ def _assert_bitwise(out: torch.Tensor, ref: torch.Tensor, where: str) -> None:
     """
     # The gate itself is the entry's `compare`; `where` only labels the failure.
     try:
-        allgather.compare(out, ref)
+        entry.allgather.compare(out, ref)
     except AssertionError as exc:
         raise AssertionError(f"{where}: {exc}") from exc
 
@@ -355,7 +355,7 @@ def check_certified_cells() -> None:
     certified over, the gather is the concatenation, and the guard admits the
     input a shipped target passes.
     """
-    for i, cell in enumerate(allgather.CELLS):
+    for i, cell in enumerate(entry.allgather.CELLS):
         spec = cell.spec
         rows, trailing, dtype = spec["rows"], spec["trailing"], spec["dtype"]
         seed = 9000 + 13 * i
@@ -945,8 +945,9 @@ def _run_one_rank() -> int:
     # One partial instead of a per-call argument: every check's call site keeps
     # the certified shape, and the wrapper hands the boxed group to the _pg
     # symbol -- the same routing the product's non-MPI mode does in
-    # _torch/distributed/ops.py. The guard is armed on the entry itself, which
-    # the partial reaches.
+    # _torch/distributed/ops.py. The partial is only the call surface: the
+    # guard is armed on the entry itself, and `reference`, `compare` and
+    # `CELLS` are read off `entry.allgather` directly.
     PG_BOXED = dist.distributed_c10d._get_default_group().boxed()
     allgather = functools.partial(entry.allgather, process_group=PG_BOXED)
 

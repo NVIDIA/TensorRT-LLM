@@ -164,7 +164,7 @@ def _ref(
     ranks = list(range(WORLD)) if ranks is None else list(ranks)
     # Delegates to the entry: what the sum is supposed to be is the entry's
     # claim, and computing it here as well would be a second place to fix.
-    return reducescatter.reference(
+    return entry.reducescatter.reference(
         [_block(r, pos, sizes[pos], seed, dtype, trailing, amp) for r in ranks]
     )
 
@@ -179,7 +179,7 @@ def _assert_bitwise(out: torch.Tensor, ref: torch.Tensor, where: str) -> None:
     """
     # The gate itself is the entry's `compare`; `where` only labels the failure.
     try:
-        reducescatter.compare(out, ref)
+        entry.reducescatter.compare(out, ref)
     except AssertionError as exc:
         raise AssertionError(f"{where}: {exc}") from exc
 
@@ -426,7 +426,7 @@ def check_certified_cells() -> None:
     every configuration the entry claims, the slice is the sum, bitwise, and the
     guard admits the input a shipped target passes.
     """
-    for i, cell in enumerate(reducescatter.CELLS):
+    for i, cell in enumerate(entry.reducescatter.CELLS):
         spec = cell.spec
         rows, trailing, dtype = spec["rows_per_rank"], spec["trailing"], spec["dtype"]
         seed = 9000 + 13 * i
@@ -1352,8 +1352,9 @@ def _run_one_rank() -> int:
     # One partial instead of a per-call argument: every check's call site keeps
     # the certified shape, and the wrapper hands the boxed group to the _pg
     # symbol -- the same routing the product's non-MPI mode does in
-    # _torch/distributed/ops.py. The guard is armed on the entry itself, which
-    # the partial reaches.
+    # _torch/distributed/ops.py. The partial is only the call surface: the
+    # guard is armed on the entry itself, and `reference`, `compare` and
+    # `CELLS` are read off `entry.reducescatter` directly.
     reducescatter = functools.partial(entry.reducescatter, process_group=PG_BOXED)
 
     # Run as a spawned worker process, not collected by pytest, so the repo's
