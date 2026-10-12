@@ -180,7 +180,7 @@ In this section, we walk through the two KV cache compression methods currently 
 
 #### Introduction
 
-Pages that leave the GPU are the cheapest place to compress: they are being copied anyway, nothing reads them while they are cold, and only the pages pushed out by memory pressure are touched. Cold-page compression stores attention KV pages as NVFP4 while they sit in host or disk memory and keeps the model's normal data type, FP16, BF16 or FP8, on the GPU. The attention kernels never see the compressed form. To try it, see the [NVFP4 cold-page example](https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/kv_cache_compression/nvfp4_cold_page.md).
+Pages that leave the GPU are the cheapest place to compress: they are being copied anyway, nothing reads them while they are cold, and only the pages pushed out by memory pressure are touched. Compression therefore happens only under pressure and never on the whole cache, which makes it **far friendlier to accuracy** than compressing every page on every step. Cold-page compression stores attention KV pages as NVFP4 while they sit in host or disk memory and keeps the model's normal data type, FP16, BF16 or FP8, on the GPU. The attention kernels never see the compressed form. To try it, see the [NVFP4 cold-page example](https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/kv_cache_compression/nvfp4_cold_page.md).
 
 NVFP4 is NVIDIA's 4-bit floating-point format: 4-bit values (E2M1) with one 8-bit (E4M3) scale per 16 values, 4.5 bits per value on average, the same format TensorRT LLM uses for weights and for the active KV cache. Applying it to cold pages buys four things:
 
