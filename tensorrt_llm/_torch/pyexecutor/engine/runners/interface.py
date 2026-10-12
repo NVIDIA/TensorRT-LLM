@@ -24,10 +24,14 @@ if TYPE_CHECKING:
 
 @dataclass(frozen=True)
 class PreparedInputs:
-    """Wrap, rather than replace, the keyword arguments passed to a model."""
+    """Wrap, rather than replace, the keyword arguments passed to a model.
+
+    ``runtime_draft_len`` is the draft length the prepared step runs with.
+    """
 
     kwargs: dict[str, Any]
     gather_ids: torch.Tensor | None = None
+    runtime_draft_len: int = 0
 
 
 @dataclass(frozen=True)

@@ -50,7 +50,7 @@ from .agreement import WarmupAgreement
 from .config import DecoderRunnerConfig
 from .dummy_requests import DummyRequestFactory
 from .graphs import DecoderCudaGraphs, compute_dynamic_draft_len_mapping
-from .inputs import DecoderInputBuffers, DecoderInputPreparer, resolve_runtime_draft_len
+from .inputs import DecoderInputBuffers, DecoderInputPreparer
 from .metadata import (
     DecoderMetadata,
     get_spec_managers,
@@ -121,7 +121,9 @@ class DecoderRunner(ScheduledModelRunner):
         self._eager_workspace_reclaimer: EagerWorkspaceReclaimer | None = None
 
         self._buffers = DecoderInputBuffers.for_config(self._config, self.use_beam_search)
-        self._metadata = DecoderMetadata(self._config, mapping, model, self._buffers)
+        self._metadata = DecoderMetadata(
+            config=self._config, mapping=mapping, model=model, buffers=self._buffers
+        )
         self._dummy_requests = self._make_dummy_requests()
         self._init_decoder_state()
         self._inputs = self._make_input_preparer(mm_item_scheduler)
@@ -367,7 +369,7 @@ class DecoderRunner(ScheduledModelRunner):
         return BreakableCUDAGraphRunner(decoder_model.model)
 
     @property
-    def use_beam_search(self):
+    def use_beam_search(self) -> bool:
         return self._config.max_beam_width > 1
 
     def _forward_warmup(
@@ -551,9 +553,7 @@ class DecoderRunner(ScheduledModelRunner):
                     gather_context_logits=gather_context_logits,
                 )
             inputs = prepared.kwargs
-            runtime_draft_len = resolve_runtime_draft_len(
-                self._config.spec_config if enable_spec_decode else None, runtime_draft_len
-            )
+            runtime_draft_len = prepared.runtime_draft_len
             if execution_promoted_context_ids:
                 self._inputs.record_promoted_iter_states(scheduled_requests)
             self._inputs.record_input_copy()
@@ -609,7 +609,7 @@ class DecoderRunner(ScheduledModelRunner):
             outputs = self._restore_attention_dp_semantic_outputs(semantic_requests, outputs)
             return {**outputs, "runtime_draft_len": runtime_draft_len}
 
-    def model_forward(self, *, is_dummy: bool, **kwargs):
+    def model_forward(self, *, is_dummy: bool, **kwargs: Any) -> Any:
         assert self._model_caller is not None
         reclaimer = self._eager_workspace_reclaimer
         metadata = kwargs["attn_metadata"]
@@ -694,7 +694,7 @@ class DecoderRunner(ScheduledModelRunner):
     @staticmethod
     def _apply_logits_processors(
         request, logits_processors, logits_tensor, beam_width, token_ids, logits_row_offset
-    ):
+    ) -> None:
         logits_rows = logits_tensor[logits_row_offset : logits_row_offset + beam_width]
         # Reshape to align w/ the shape used in the TRT backend,
         # so the same logit processors can be used across both backends.
@@ -713,7 +713,9 @@ class DecoderRunner(ScheduledModelRunner):
         # back would be a self-assignment, which torch rejects for the
         # non-contiguous slices a TP-padded vocab produces.
 
-    def _execute_logit_post_processors(self, scheduled_requests: ScheduledRequests, outputs: dict):
+    def _execute_logit_post_processors(
+        self, scheduled_requests: ScheduledRequests, outputs: dict
+    ) -> None:
         """Apply logit post processors (in-place modify outputs Tensors) if any."""
 
         if not (self.mapping.is_last_pp_rank()):
@@ -771,12 +773,12 @@ class DecoderRunner(ScheduledModelRunner):
     def _cuda_graph_metadata_prepare_scope(
         self,
         attn_metadata: AttentionMetadata,
-        key,
+        key: KeyType | None,
         scheduled_requests: ScheduledRequests,
         promoted_context_request_ids: frozenset[int],
         *,
         enable_spec_decode: bool,
-    ):
+    ) -> contextlib.AbstractContextManager[Any]:
         """Allow derived outputs only when this forward owns a decode graph.
 
         Both capture/warmup and replay execute _preprocess_inputs before model

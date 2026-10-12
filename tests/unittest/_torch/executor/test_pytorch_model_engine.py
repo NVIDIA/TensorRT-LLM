@@ -400,16 +400,24 @@ def _make_forward_only_engine(
     runner.needs_capture.return_value = False
     runner.is_warmup_only = False
     runner.replay.return_value = outputs
-    graphs = object.__new__(DecoderCudaGraphs)
-    graphs.cuda_graph_runner = runner
-    graphs.breakable_cuda_graph_runner = None
-    graphs._force_lora_graph_for_capture = None
-    graphs._config = decoder._config
-    graphs.mapping = decoder.mapping
-    graphs.model = decoder.model
-    graphs._lora = decoder._lora
-    graphs._context_promotion_supported = True
-    decoder._graphs = graphs
+    decoder._graphs = DecoderCudaGraphs(
+        cuda_graph_runner=runner,
+        breakable_cuda_graph_runner=None,
+        config=decoder._config,
+        mapping=decoder.mapping,
+        model=decoder.model,
+        sparse_attention_config=None,
+        metrics={},
+        kv_cache_manager_key=decoder.kv_cache_manager_key,
+        dummy_requests=None,
+        agreement=None,
+        metadata=decoder._metadata,
+        get_runtime_tokens_per_gen_step=decoder.get_runtime_tokens_per_gen_step,
+        dynamic_draft_len_mapping=None,
+        lora=decoder._lora,
+        forward_warmup=decoder._forward_warmup,
+        context_promotion_supported=True,
+    )
 
     resource_manager = Mock()
     peft_cache_manager = Mock(data_type=torch.bfloat16)
@@ -1406,13 +1414,16 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
             _make_forward_only_engine(None)
         engine.enable_spec_decode = True
         engine.runtime_draft_len = 2
-        # A non-linear tree widens the length to its total draft tokens after
-        # graph selection.
         engine._runner._config.spec_config = SimpleNamespace(
             spec_dec_mode=_TWO_MODEL_SPEC_MODE,
             is_linear_tree=False,
             tokens_per_gen_step=8,
             get_runtime_tokens_per_gen_step=Mock(return_value=1))
+        # A non-linear tree widens the length to its total draft tokens during
+        # preparation, after graph selection.
+        prepared = engine._runner._inputs.prepare_inputs.return_value
+        engine._runner._inputs.prepare_inputs.return_value = replace(
+            prepared, runtime_draft_len=7)
         batch = ScheduledRequests()
         batch.generation_requests = [_make_request_stub(2)]
 
@@ -1841,7 +1852,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
             cuda_graph_batch_sizes=[8],
             spec_config=None,
         )
-        engine._metadata = DecoderMetadata(engine._config,
+        engine._metadata = DecoderMetadata(config=engine._config,
                                            mapping=None,
                                            model=None,
                                            buffers=None)
@@ -1873,7 +1884,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         engine = object.__new__(DecoderWarmup)
         engine._config = SimpleNamespace(attention_backend=SimpleNamespace(
             Metadata=TrtllmAttentionMetadata))
-        engine._metadata = DecoderMetadata(engine._config,
+        engine._metadata = DecoderMetadata(config=engine._config,
                                            mapping=None,
                                            model=None,
                                            buffers=None)
@@ -2072,11 +2083,31 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
             runtime_draft_len=3,
             is_dummy=True)
 
-        self.assertIs(result, fast_inputs)
+        self.assertIs(result.kwargs, fast_inputs.kwargs)
+        self.assertEqual(result.runtime_draft_len, 3)
         inputs.guided_decoder.add_batch.assert_called_once_with(
             batch, new_tokens=new_tokens, runtime_draft_len=3)
         inputs._can_use_steady_gen_fast_prepare.assert_called_once_with(
             batch, new_tokens, None, None, True)
+
+    def test_prepare_inputs_reports_tree_draft_length(self) -> None:
+        inputs = _input_preparer()
+        inputs._config = SimpleNamespace(spec_config=SimpleNamespace(
+            is_linear_tree=False, tokens_per_gen_step=8))
+        inputs._can_use_steady_gen_fast_prepare = Mock(return_value=True)
+        inputs._apply_steady_gen_fast_prepare = Mock(
+            return_value=PreparedInputs({}))
+
+        for enable_spec_decode, expected in ((True, 7), (False, 2)):
+            with self.subTest(enable_spec_decode=enable_spec_decode):
+                result = inputs.prepare_inputs(
+                    ScheduledRequests(),
+                    Mock(),
+                    Mock(),
+                    enable_spec_decode=enable_spec_decode,
+                    runtime_draft_len=2,
+                    is_dummy=True)
+                self.assertEqual(result.runtime_draft_len, expected)
 
     def test_steady_gen_fast_prepare_skips_dummy_passes(self) -> None:
         inputs = _input_preparer()

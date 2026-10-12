@@ -44,6 +44,7 @@ class DecoderMetadata:
 
     def __init__(
         self,
+        *,
         config: DecoderRunnerConfig,
         mapping: Mapping,
         model: torch.nn.Module,
@@ -69,7 +70,7 @@ class DecoderMetadata:
         self,
         kv_cache_manager: KVCacheManager | KVCacheManagerV2,
         draft_kv_cache_manager: KVCacheManager | KVCacheManagerV2 | None = None,
-    ):
+    ) -> AttentionMetadata:
         if self.attn_metadata is not None:
             # This assertion can be relaxed if needed: just create a new metadata
             # object if it changes.
@@ -99,7 +100,9 @@ class DecoderMetadata:
 
         return self.attn_metadata
 
-    def setup_speculative(self, spec_resource_manager: BaseResourceManager | None):
+    def setup_speculative(
+        self, spec_resource_manager: BaseResourceManager | None
+    ) -> SpecMetadata | None:
         if self.spec_metadata is not None:
             return self.spec_metadata
         self.spec_metadata = create_spec_metadata(

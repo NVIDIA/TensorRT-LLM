@@ -6,7 +6,7 @@
 import math
 import os
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, field, fields, replace
 from typing import Any
 
 import torch
@@ -194,23 +194,13 @@ class ExtraInputsCollector:
 _NO_EXTRA_INPUTS = ExtraInputsCollector()
 
 
-@dataclass(slots=True)
-class HostInputs:
-    """Host-side inputs of one full prepare pass, built up stage by stage.
+@dataclass(frozen=True, slots=True)
+class HostLists:
+    """Per-sequence and per-request lists of one full prepare pass.
 
-    Stages bind the fields they use to locals, since the per-request loops are
-    hot, and write back only the names they rebind.
+    Stages fill them in place; the dataclass is frozen so none can be rebound
+    away from the pass.
     """
-
-    use_mrope: bool
-    # Extra model-side cache slot reserved for CUDA graph / warmup dummy
-    # requests, whose outputs are discarded, and for generation requests
-    # that carry no MRoPE metadata at all. The cache is zero-initialized and
-    # the write path only ever targets real ``py_seq_slot``s, so this slot
-    # permanently reads back a zero delta.
-    mrope_dummy_seq_slot: int
-    extra_inputs: ExtraInputsCollector
-    context_prompt_lookahead: list[int] | None
 
     # if new_tensors_device exist, input_ids will only contain new context tokens
     input_ids: list[int] = field(default_factory=list)  # per sequence
@@ -237,11 +227,6 @@ class HostInputs:
     previous_batch_indices: list[int] = field(default_factory=list)
     previous_pos_indices: list[int] = field(default_factory=list)
 
-    num_ctx_requests: int = 0
-    num_ctx_tokens: int = 0
-    text_token_indices_ctx: Any = None
-    mm_token_indices: Any = None
-
     extend_requests: list[LlmRequest] = field(default_factory=list)
     extend_dummy_requests: list[LlmRequest] = field(default_factory=list)
     generation_requests: list[LlmRequest] = field(default_factory=list)
@@ -250,10 +235,36 @@ class HostInputs:
     # a separate iteration over scheduled_requests.generation_requests later.
     all_gen_request_ids: list[int] = field(default_factory=list)
 
-    has_cp_helix: bool = False
     helix_is_inactive_rank: list[bool] = field(default_factory=list)
     helix_position_offsets: list[int] = field(default_factory=list)
     helix_owned_new_tokens: list[int] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class HostInputs:
+    """Host-side inputs of one full prepare pass, built up stage by stage.
+
+    Stages bind the fields they use to locals, since the per-request loops are
+    hot, and write back only the scalars they rebind.
+    """
+
+    use_mrope: bool
+    # Extra model-side cache slot reserved for CUDA graph / warmup dummy
+    # requests, whose outputs are discarded, and for generation requests
+    # that carry no MRoPE metadata at all. The cache is zero-initialized and
+    # the write path only ever targets real ``py_seq_slot``s, so this slot
+    # permanently reads back a zero delta.
+    mrope_dummy_seq_slot: int
+    extra_inputs: ExtraInputsCollector
+    context_prompt_lookahead: list[int] | None
+    lists: HostLists = field(default_factory=HostLists)
+
+    num_ctx_requests: int = 0
+    num_ctx_tokens: int = 0
+    text_token_indices_ctx: Any = None
+    mm_token_indices: Any = None
+
+    has_cp_helix: bool = False
     helix_local_len_host: Callable[[int], int] | None = None
     helix_pack_extend: Callable[[LlmRequest, int], int] | None = None
 
@@ -720,6 +731,9 @@ class DecoderInputPreparer:
                 runtime_draft_len=runtime_draft_len,
             )
 
+        spec_config = self._config.spec_config if enable_spec_decode else None
+        runtime_draft_len = resolve_runtime_draft_len(spec_config, runtime_draft_len)
+
         fast_inputs = self._prepare_inputs_fast_path(
             scheduled_requests,
             kv_cache_manager,
@@ -731,17 +745,20 @@ class DecoderInputPreparer:
             enable_spec_decode=enable_spec_decode,
         )
         if fast_inputs is not None:
-            return self._attach_context_requests(fast_inputs, scheduled_requests, kv_cache_manager)
+            return self._finish_prepared(
+                fast_inputs, scheduled_requests, kv_cache_manager, runtime_draft_len
+            )
 
         if not promoted_context_request_ids and self._can_use_steady_gen_fast_prepare(
             scheduled_requests, new_tokens_device, next_draft_tokens_device, spec_metadata, is_dummy
         ):
-            return self._attach_context_requests(
+            return self._finish_prepared(
                 self._apply_steady_gen_fast_prepare(
                     kv_cache_manager, attn_metadata, new_tensors_device, resource_manager
                 ),
                 scheduled_requests,
                 kv_cache_manager,
+                runtime_draft_len,
             )
         # Any full pass invalidates the steady-state cache; it is re-recorded
         # at the end of this pass when the batch qualifies.
@@ -770,13 +787,10 @@ class DecoderInputPreparer:
         )
         self._prepare_helix_state(host, kv_cache_manager)
 
-        spec_config = self._config.spec_config if enable_spec_decode else None
         if not self._config.disable_overlap_scheduler and spec_config is not None:
             assert spec_config.spec_dec_mode.support_overlap_scheduler(), (
                 f"{spec_config.decoding_type} does not support overlap scheduler"
             )
-
-        runtime_draft_len = resolve_runtime_draft_len(spec_config, runtime_draft_len)
 
         runtime_tokens_per_gen_step = self.get_runtime_tokens_per_gen_step(runtime_draft_len)
         self._pack_extend_requests(
@@ -801,8 +815,8 @@ class DecoderInputPreparer:
         self._copy_position_ids_to_device(host)
 
         if enable_spec_decode:
-            self._buffers.gather_ids_cuda[: len(host.gather_ids)].copy_(
-                torch.tensor(host.gather_ids, dtype=torch.int, pin_memory=prefer_pinned()),
+            self._buffers.gather_ids_cuda[: len(host.lists.gather_ids)].copy_(
+                torch.tensor(host.lists.gather_ids, dtype=torch.int, pin_memory=prefer_pinned()),
                 non_blocking=True,
             )
 
@@ -856,19 +870,26 @@ class DecoderInputPreparer:
             )
 
         gather_ids_device = (
-            self._buffers.gather_ids_cuda[: len(host.gather_ids)] if enable_spec_decode else None
+            self._buffers.gather_ids_cuda[: len(host.lists.gather_ids)]
+            if enable_spec_decode
+            else None
         )
-        return self._attach_context_requests(
-            PreparedInputs(inputs, gather_ids_device), scheduled_requests, kv_cache_manager
+        return self._finish_prepared(
+            PreparedInputs(inputs, gather_ids_device),
+            scheduled_requests,
+            kv_cache_manager,
+            runtime_draft_len,
         )
 
-    def _attach_context_requests(
+    def _finish_prepared(
         self,
         prepared: PreparedInputs,
         scheduled_requests: ScheduledRequests,
         kv_cache_manager: KVCacheManager | KVCacheManagerV2,
+        runtime_draft_len: int,
     ) -> PreparedInputs:
-        """Pass the context requests to models that select rows or replay encoder tokens."""
+        """Record the step's draft length, and pass the context requests to models
+        that select rows or replay encoder tokens."""
         from tensorrt_llm._torch.pyexecutor.ced_replay import (
             encoder_replay_tokens,
             uses_private_decoder_cache,
@@ -883,7 +904,7 @@ class DecoderInputPreparer:
             or any(encoder_replay_tokens(req) for req in scheduled_requests.context_requests)
         ):
             prepared.kwargs["context_requests"] = scheduled_requests.context_requests
-        return prepared
+        return replace(prepared, runtime_draft_len=runtime_draft_len)
 
     def _register_suffix_automaton_requests(
         self, scheduled_requests: ScheduledRequests, resource_manager: ResourceManager | None
@@ -915,16 +936,16 @@ class DecoderInputPreparer:
         self, host: HostInputs, scheduled_requests: ScheduledRequests
     ) -> None:
         """Pack the current chunk of every context request."""
-        input_ids = host.input_ids
-        sequence_lengths = host.sequence_lengths
-        prompt_lengths = host.prompt_lengths
-        request_ids = host.request_ids
-        gather_ids = host.gather_ids
-        position_ids = host.position_ids
-        num_cached_tokens_per_seq = host.num_cached_tokens_per_seq
-        draft_lens = host.draft_lens
-        num_accepted_draft_tokens = host.num_accepted_draft_tokens
-        multimodal_params_list = host.multimodal_params_list
+        input_ids = host.lists.input_ids
+        sequence_lengths = host.lists.sequence_lengths
+        prompt_lengths = host.lists.prompt_lengths
+        request_ids = host.lists.request_ids
+        gather_ids = host.lists.gather_ids
+        position_ids = host.lists.position_ids
+        num_cached_tokens_per_seq = host.lists.num_cached_tokens_per_seq
+        draft_lens = host.lists.draft_lens
+        num_accepted_draft_tokens = host.lists.num_accepted_draft_tokens
+        multimodal_params_list = host.lists.multimodal_params_list
         extra_inputs = host.extra_inputs
         context_prompt_lookahead = host.context_prompt_lookahead
 
@@ -1009,10 +1030,10 @@ class DecoderInputPreparer:
     ) -> None:
         """Attach a context request's multimodal inputs and MRoPE positions."""
         _use_mrope = host.use_mrope
-        position_ids = host.position_ids
-        mrope_position_ids = host.mrope_position_ids
-        mrope_delta_write_seq_slots = host.mrope_delta_write_seq_slots
-        multimodal_params_list = host.multimodal_params_list
+        position_ids = host.lists.position_ids
+        mrope_position_ids = host.lists.mrope_position_ids
+        mrope_delta_write_seq_slots = host.lists.mrope_delta_write_seq_slots
+        multimodal_params_list = host.lists.multimodal_params_list
 
         # Embed mask is required only for partial iterations (chunked
         # prefill or KV-cache reuse); full-prefill degrades gracefully.
@@ -1125,11 +1146,11 @@ class DecoderInputPreparer:
         enable_spec_decode: bool,
     ) -> None:
         """Sort generation requests into the extend, first-draft and generation groups."""
-        extend_requests = host.extend_requests
-        extend_dummy_requests = host.extend_dummy_requests
-        generation_requests = host.generation_requests
-        first_draft_requests = host.first_draft_requests
-        all_gen_request_ids = host.all_gen_request_ids
+        extend_requests = host.lists.extend_requests
+        extend_dummy_requests = host.lists.extend_dummy_requests
+        generation_requests = host.lists.generation_requests
+        first_draft_requests = host.lists.first_draft_requests
+        all_gen_request_ids = host.lists.all_gen_request_ids
 
         # Requests with draft tokens are treated like extend requests. Dummy extend requests should be
         # at the end of extend_requests.
@@ -1174,9 +1195,9 @@ class DecoderInputPreparer:
         # round-robin ledger (page b -> rank b % cp); the host-side
         # provisional packing values come from the one shared definition in
         # _torch.utils.helix_local_len.
-        helix_is_inactive_rank = host.helix_is_inactive_rank
-        helix_position_offsets = host.helix_position_offsets
-        position_ids = host.position_ids
+        helix_is_inactive_rank = host.lists.helix_is_inactive_rank
+        helix_position_offsets = host.lists.helix_position_offsets
+        position_ids = host.lists.position_ids
         _has_cp_helix = self.mapping.has_cp_helix()
         if _has_cp_helix and kv_cache_manager is not None:
             _helix_phys = kv_cache_manager.tokens_per_block
@@ -1214,21 +1235,21 @@ class DecoderInputPreparer:
         enable_spec_decode: bool,
     ) -> None:
         """Pack requests that verify draft tokens or take a promoted context row."""
-        extend_requests = host.extend_requests
-        padding_gen_slots = host.padding_gen_slots
-        request_ids = host.request_ids
-        input_ids = host.input_ids
-        draft_tokens = host.draft_tokens
-        draft_lens = host.draft_lens
-        prompt_lengths = host.prompt_lengths
-        sequence_lengths = host.sequence_lengths
-        num_accepted_draft_tokens = host.num_accepted_draft_tokens
-        gather_ids = host.gather_ids
-        position_ids = host.position_ids
-        num_cached_tokens_per_seq = host.num_cached_tokens_per_seq
-        previous_batch_indices = host.previous_batch_indices
-        previous_pos_indices = host.previous_pos_indices
-        helix_owned_new_tokens = host.helix_owned_new_tokens
+        extend_requests = host.lists.extend_requests
+        padding_gen_slots = host.lists.padding_gen_slots
+        request_ids = host.lists.request_ids
+        input_ids = host.lists.input_ids
+        draft_tokens = host.lists.draft_tokens
+        draft_lens = host.lists.draft_lens
+        prompt_lengths = host.lists.prompt_lengths
+        sequence_lengths = host.lists.sequence_lengths
+        num_accepted_draft_tokens = host.lists.num_accepted_draft_tokens
+        gather_ids = host.lists.gather_ids
+        position_ids = host.lists.position_ids
+        num_cached_tokens_per_seq = host.lists.num_cached_tokens_per_seq
+        previous_batch_indices = host.lists.previous_batch_indices
+        previous_pos_indices = host.lists.previous_pos_indices
+        helix_owned_new_tokens = host.lists.helix_owned_new_tokens
         extra_inputs = host.extra_inputs
         _has_cp_helix = host.has_cp_helix
         _helix_local_len_host = host.helix_local_len_host
@@ -1364,16 +1385,16 @@ class DecoderInputPreparer:
 
     def _pack_first_draft_requests(self, host: HostInputs) -> None:
         """Pack the first draft-model step of each request."""
-        first_draft_requests = host.first_draft_requests
-        request_ids = host.request_ids
-        draft_lens = host.draft_lens
-        position_ids = host.position_ids
-        input_ids = host.input_ids
-        gather_ids = host.gather_ids
-        num_accepted_draft_tokens = host.num_accepted_draft_tokens
-        sequence_lengths = host.sequence_lengths
-        prompt_lengths = host.prompt_lengths
-        num_cached_tokens_per_seq = host.num_cached_tokens_per_seq
+        first_draft_requests = host.lists.first_draft_requests
+        request_ids = host.lists.request_ids
+        draft_lens = host.lists.draft_lens
+        position_ids = host.lists.position_ids
+        input_ids = host.lists.input_ids
+        gather_ids = host.lists.gather_ids
+        num_accepted_draft_tokens = host.lists.num_accepted_draft_tokens
+        sequence_lengths = host.lists.sequence_lengths
+        prompt_lengths = host.lists.prompt_lengths
+        num_cached_tokens_per_seq = host.lists.num_cached_tokens_per_seq
         extra_inputs = host.extra_inputs
 
         for request in first_draft_requests:
@@ -1412,26 +1433,26 @@ class DecoderInputPreparer:
         new_tokens_device: torch.Tensor | None,
     ) -> None:
         """Pack one token per beam for every plain generation request."""
-        generation_requests = host.generation_requests
-        draft_lens = host.draft_lens
-        sequence_lengths = host.sequence_lengths
-        num_accepted_draft_tokens = host.num_accepted_draft_tokens
-        request_ids = host.request_ids
-        input_ids = host.input_ids
-        previous_batch_indices = host.previous_batch_indices
-        helix_is_inactive_rank = host.helix_is_inactive_rank
-        helix_position_offsets = host.helix_position_offsets
-        helix_owned_new_tokens = host.helix_owned_new_tokens
-        position_ids = host.position_ids
-        num_cached_tokens_per_seq = host.num_cached_tokens_per_seq
-        prompt_lengths = host.prompt_lengths
-        gather_ids = host.gather_ids
-        mrope_position_ids = host.mrope_position_ids
-        mrope_delta_write_seq_slots = host.mrope_delta_write_seq_slots
-        mrope_delta_read_seq_slots = host.mrope_delta_read_seq_slots
-        multimodal_params_list = host.multimodal_params_list
+        generation_requests = host.lists.generation_requests
+        draft_lens = host.lists.draft_lens
+        sequence_lengths = host.lists.sequence_lengths
+        num_accepted_draft_tokens = host.lists.num_accepted_draft_tokens
+        request_ids = host.lists.request_ids
+        input_ids = host.lists.input_ids
+        previous_batch_indices = host.lists.previous_batch_indices
+        helix_is_inactive_rank = host.lists.helix_is_inactive_rank
+        helix_position_offsets = host.lists.helix_position_offsets
+        helix_owned_new_tokens = host.lists.helix_owned_new_tokens
+        position_ids = host.lists.position_ids
+        num_cached_tokens_per_seq = host.lists.num_cached_tokens_per_seq
+        prompt_lengths = host.lists.prompt_lengths
+        gather_ids = host.lists.gather_ids
+        mrope_position_ids = host.lists.mrope_position_ids
+        mrope_delta_write_seq_slots = host.lists.mrope_delta_write_seq_slots
+        mrope_delta_read_seq_slots = host.lists.mrope_delta_read_seq_slots
+        multimodal_params_list = host.lists.multimodal_params_list
         extra_inputs = host.extra_inputs
-        gen_request_seq_slots = host.gen_request_seq_slots
+        gen_request_seq_slots = host.lists.gen_request_seq_slots
         _use_mrope = host.use_mrope
         _has_cp_helix = host.has_cp_helix
         mrope_dummy_seq_slot = host.mrope_dummy_seq_slot
@@ -1666,19 +1687,19 @@ class DecoderInputPreparer:
         next_draft_tokens_device: torch.Tensor | None,
         runtime_draft_len: int,
     ) -> None:
-        input_ids = host.input_ids
-        draft_tokens = host.draft_tokens
-        num_accepted_draft_tokens = host.num_accepted_draft_tokens
-        position_ids = host.position_ids
-        draft_lens = host.draft_lens
-        previous_batch_indices = host.previous_batch_indices
-        previous_pos_indices = host.previous_pos_indices
-        extend_requests = host.extend_requests
-        extend_dummy_requests = host.extend_dummy_requests
+        input_ids = host.lists.input_ids
+        draft_tokens = host.lists.draft_tokens
+        num_accepted_draft_tokens = host.lists.num_accepted_draft_tokens
+        position_ids = host.lists.position_ids
+        draft_lens = host.lists.draft_lens
+        previous_batch_indices = host.lists.previous_batch_indices
+        previous_pos_indices = host.lists.previous_pos_indices
+        extend_requests = host.lists.extend_requests
+        extend_dummy_requests = host.lists.extend_dummy_requests
 
         previous_batch_len = len(previous_batch_indices)
 
-        def previous_seq_slots_device():
+        def previous_seq_slots_device() -> torch.Tensor:
             previous_batch_indices_host = torch.tensor(
                 previous_batch_indices, dtype=torch.int, pin_memory=prefer_pinned()
             )
@@ -1815,7 +1836,7 @@ class DecoderInputPreparer:
 
     def _copy_position_ids_to_device(self, host: HostInputs) -> None:
         total_num_tokens = host.total_num_tokens
-        position_ids = apply_position_id_offset(host.position_ids, model=self.model)
+        position_ids = apply_position_id_offset(host.lists.position_ids, model=self.model)
         host_position_ids = torch.tensor(position_ids, dtype=torch.int, pin_memory=prefer_pinned())
         # Use the (3,1,N) MRoPE layout whenever the model declares MRoPE, even
         # for text-only batches: keeping position_ids rank-consistent between
@@ -1835,7 +1856,7 @@ class DecoderInputPreparer:
                 non_blocking=True,
             )
             # Overwrite multimodal spans with per-axis MRoPE positions.
-            for start_idx, end_idx, segment in host.mrope_position_ids:
+            for start_idx, end_idx, segment in host.lists.mrope_position_ids:
                 if segment.ndim != 3:
                     raise RuntimeError(
                         f"Expected 3D mrope_position_ids, got shape {tuple(segment.shape)}"
@@ -1874,9 +1895,9 @@ class DecoderInputPreparer:
         enable_spec_decode: bool,
         is_dummy: bool,
     ) -> None:
-        num_cached_tokens_per_seq = host.num_cached_tokens_per_seq
-        gen_request_seq_slots = host.gen_request_seq_slots
-        extend_requests = host.extend_requests
+        num_cached_tokens_per_seq = host.lists.num_cached_tokens_per_seq
+        gen_request_seq_slots = host.lists.gen_request_seq_slots
+        extend_requests = host.lists.extend_requests
 
         if self.mapping.has_cp_helix():
             # A non-None owned-count list is what arms
@@ -1886,18 +1907,20 @@ class DecoderInputPreparer:
             # hand-off here, at the single choke point, so no packing loop can
             # arm the spec path for ordinary helix generation and send its
             # consumers to uninitialized buffers.
-            helix_spec_active = bool(enable_spec_decode and host.helix_owned_new_tokens)
+            helix_spec_active = bool(enable_spec_decode and host.lists.helix_owned_new_tokens)
             attn_metadata.update_helix_param(
-                helix_position_offsets=host.helix_position_offsets,
-                helix_is_inactive_rank=host.helix_is_inactive_rank,
-                helix_owned_new_tokens=(host.helix_owned_new_tokens if helix_spec_active else None),
+                helix_position_offsets=host.lists.helix_position_offsets,
+                helix_is_inactive_rank=host.lists.helix_is_inactive_rank,
+                helix_owned_new_tokens=(
+                    host.lists.helix_owned_new_tokens if helix_spec_active else None
+                ),
             )
 
         if not attn_metadata.is_cuda_graph:
             # Assumes seq lens do not change between CUDA graph invocations. This applies
             # to draft sequences too. This means that all draft sequences must be padded.
             attn_metadata.seq_lens = torch.tensor(
-                host.sequence_lengths,
+                host.lists.sequence_lengths,
                 dtype=torch.int,
                 pin_memory=prefer_pinned(),
             )
@@ -1919,8 +1942,8 @@ class DecoderInputPreparer:
         else:
             attn_metadata.beam_width = 1
 
-        attn_metadata.request_ids = host.request_ids
-        attn_metadata.prompt_lens = host.prompt_lengths
+        attn_metadata.request_ids = host.lists.request_ids
+        attn_metadata.prompt_lens = host.lists.prompt_lengths
         attn_metadata.num_contexts = scheduled_requests.num_context_requests
         remote_tail_modes = {
             getattr(request, "py_csa2_remote_tail_mode", None)
@@ -2003,7 +2026,7 @@ class DecoderInputPreparer:
             # count prepare() uses.
             spec_metadata.num_tokens = total_num_tokens
             spec_metadata.num_generations = scheduled_requests.num_generation_requests
-            spec_metadata.seq_lens = host.sequence_lengths
+            spec_metadata.seq_lens = host.lists.sequence_lengths
 
         # Resolve row selection before the existing attention/spec count
         # exchange. Prefill graph padding is selected collectively below and
@@ -2059,22 +2082,29 @@ class DecoderInputPreparer:
         runtime_draft_len: int,
     ) -> dict[str, Any]:
         inputs = self.model_inputs(
-            attn_metadata, resource_manager, host.virtual_num_tokens, host.multimodal_params_list
+            attn_metadata,
+            resource_manager,
+            host.virtual_num_tokens,
+            host.lists.multimodal_params_list,
         )
         inputs.update(extra_model_inputs)
 
         if self._config.use_mrope:
-            if host.mrope_delta_write_seq_slots:
+            if host.lists.mrope_delta_write_seq_slots:
                 delta_write_seq_slots = torch.tensor(
-                    host.mrope_delta_write_seq_slots, dtype=torch.long, pin_memory=prefer_pinned()
+                    host.lists.mrope_delta_write_seq_slots,
+                    dtype=torch.long,
+                    pin_memory=prefer_pinned(),
                 )
                 inputs["mrope_delta_write_seq_slots"] = delta_write_seq_slots.to(
                     device="cuda", non_blocking=True
                 )
 
-            if host.mrope_delta_read_seq_slots:
+            if host.lists.mrope_delta_read_seq_slots:
                 delta_read_seq_slots = torch.tensor(
-                    host.mrope_delta_read_seq_slots, dtype=torch.long, pin_memory=prefer_pinned()
+                    host.lists.mrope_delta_read_seq_slots,
+                    dtype=torch.long,
+                    pin_memory=prefer_pinned(),
                 )
                 inputs["mrope_delta_read_seq_slots"] = delta_read_seq_slots.to(
                     device="cuda", non_blocking=True
@@ -2084,15 +2114,15 @@ class DecoderInputPreparer:
             inputs["lora_params"] = lora_params
 
         if spec_metadata is not None:
-            total_draft_lens = sum(host.draft_lens)
+            total_draft_lens = sum(host.lists.draft_lens)
             spec_metadata.draft_tokens = self._buffers.draft_tokens_cuda[:total_draft_lens]
-            spec_metadata.request_ids = host.request_ids
-            spec_metadata.gather_ids = self._buffers.gather_ids_cuda[: len(host.gather_ids)]
+            spec_metadata.request_ids = host.lists.request_ids
+            spec_metadata.gather_ids = self._buffers.gather_ids_cuda[: len(host.lists.gather_ids)]
             # num_generations / num_tokens / seq_lens are set above, before the
             # attention-DP allgather that must agree with prepare().
             spec_metadata.host_position_ids = host.host_position_ids
             spec_metadata.num_accepted_draft_tokens = self._buffers.num_accepted_draft_tokens_cuda[
-                : len(host.num_accepted_draft_tokens)
+                : len(host.lists.num_accepted_draft_tokens)
             ]
             if host.context_prompt_lookahead is not None:
                 spec_metadata.populate_context_prompt_lookahead(host.context_prompt_lookahead)
@@ -2103,7 +2133,7 @@ class DecoderInputPreparer:
             # requests that produced no draft tokens this step, so the (possibly
             # captured) rejection kernel reads a legal placeholder distribution.
             spec_metadata.write_padding_onehot_draft_probs(
-                host.padding_gen_slots, runtime_draft_len
+                host.lists.padding_gen_slots, runtime_draft_len
             )
             inputs["spec_metadata"] = spec_metadata
 
@@ -2122,24 +2152,24 @@ class DecoderInputPreparer:
 
     def _record_iter_states(self, host: HostInputs, scheduled_requests: ScheduledRequests) -> None:
         num_generation_tokens = (
-            len(host.generation_requests)
-            + len(host.extend_requests)
-            + sum(host.draft_lens)
-            + len(host.first_draft_requests)
+            len(host.lists.generation_requests)
+            + len(host.lists.extend_requests)
+            + sum(host.lists.draft_lens)
+            + len(host.lists.first_draft_requests)
         )
         self.iter_states["num_ctx_requests"] = host.num_ctx_requests
         self.iter_states["num_ctx_tokens"] = host.num_ctx_tokens
         self.iter_states["num_generation_tokens"] = num_generation_tokens
         # Count the already-cached prefix for the sequences scheduled this iteration.
-        self.iter_states["cached_kv_tokens"] = sum(host.num_cached_tokens_per_seq)
+        self.iter_states["cached_kv_tokens"] = sum(host.lists.num_cached_tokens_per_seq)
         if self.log_cached_kv_tokens_per_req:
             self.record_cached_kv_tokens_per_req(
-                host.num_cached_tokens_per_seq,
+                host.lists.num_cached_tokens_per_seq,
                 (
                     (scheduled_requests.context_requests, 1),
-                    (host.extend_requests, 1),
-                    (host.first_draft_requests, 1),
-                    (host.generation_requests, host.beam_width),
+                    (host.lists.extend_requests, 1),
+                    (host.lists.first_draft_requests, 1),
+                    (host.lists.generation_requests, host.beam_width),
                 ),
             )
 
@@ -2188,21 +2218,21 @@ class DecoderInputPreparer:
             and new_tokens_device is not None
             and self.guided_decoder is None
             and not self._config.enable_attention_dp
-            and not host.mrope_position_ids
-            and not host.mrope_delta_write_seq_slots
-            and not host.mrope_delta_read_seq_slots
+            and not host.lists.mrope_position_ids
+            and not host.lists.mrope_delta_write_seq_slots
+            and not host.lists.mrope_delta_read_seq_slots
             and not self.use_beam_search
             and self._config.max_beam_width == 1
             and self._steady_gen_cache_supported
             and not host.has_cp_helix
             and host.num_ctx_requests == 0
-            and not host.extend_requests
-            and not host.first_draft_requests
+            and not host.lists.extend_requests
+            and not host.lists.first_draft_requests
             and host.n_gen > 0
             and host.previous_batch_len == host.n_gen
             and host.num_tokens == 0
             and not host.has_any_multimodal_request
-            and not host.multimodal_params_list
+            and not host.lists.multimodal_params_list
             and not lora_params
             and attn_metadata.padded_num_tokens is None
             and get_position_id_offset(self.model) == 0
@@ -2213,8 +2243,8 @@ class DecoderInputPreparer:
             )
             self._steady_gen_cache = {
                 "num_requests": host.n_gen,
-                "request_ids": host.all_gen_request_ids,
-                "prompt_lens": host.prompt_lengths,
+                "request_ids": host.lists.all_gen_request_ids,
+                "prompt_lens": host.lists.prompt_lengths,
                 "seq_lens_ones": maybe_pin_memory(torch.ones(host.n_gen, dtype=torch.int)),
                 "use_mrope": host.use_mrope,
             }
@@ -2233,7 +2263,7 @@ class DecoderInputPreparer:
 
     def preprocess_inputs(
         self, inputs: dict[str, Any], *, enable_spec_decode: bool, runtime_draft_len: int
-    ):
+    ) -> dict[str, Any]:
         """
         Make some changes to the device inputs and avoid blocking the async data transfer
         """
@@ -2324,7 +2354,7 @@ class DecoderInputPreparer:
 
     def postprocess_inputs(
         self, inputs: dict[str, Any], *, enable_spec_decode: bool, runtime_draft_len: int
-    ):
+    ) -> None:
         """
         Postprocess to make sure model forward doesn't change the inputs.
         It is only used in cuda graph capture, because other cases will prepare

@@ -558,7 +558,7 @@ class DecoderWarmup:
 
     def _general_warmup(
         self, resource_manager: ResourceManager, warmup_requests_configs: list[tuple[int, int]]
-    ):
+    ) -> None:
         """
         Runs forward passes for each config in warmup_requests_configs.
 
@@ -715,7 +715,7 @@ class DecoderWarmup:
                     torch.cuda.synchronize()
 
     @staticmethod
-    def _release_megamoe_profiling_scratch():
+    def _release_megamoe_profiling_scratch() -> None:
         # MegaMoE tuning resources are shared across layers, so only the engine
         # can release them after its full autotune warmup and before graph
         # capture. Later eviction could invalidate a captured workspace pointer.

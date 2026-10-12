@@ -6,7 +6,7 @@
 import contextlib
 import functools
 import os
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from typing import Any, NamedTuple, Protocol
 
@@ -345,7 +345,7 @@ class DecoderCudaGraphs:
         """Capture graphs beyond the generation-only shapes; none by default."""
 
     @contextlib.contextmanager
-    def no_cuda_graph(self):
+    def no_cuda_graph(self) -> Iterator[None]:
         if self.cuda_graph_runner is None:
             yield
             return
@@ -357,7 +357,7 @@ class DecoderCudaGraphs:
             self.cuda_graph_runner.enabled = _run_cuda_graphs
 
     @contextmanager
-    def maybe_autotune_lora(self):
+    def maybe_autotune_lora(self) -> Iterator[None]:
         """Enable autotuning while warming up CUDA-graph LoRA kernels."""
         if not (self._config.enable_autotuner and self._lora.cuda_graph_manager is not None):
             yield
@@ -627,7 +627,7 @@ class DecoderCudaGraphs:
             draft_lengths.append(0)
         return [(bs, draft_len) for bs in cuda_graph_batch_sizes for draft_len in draft_lengths]
 
-    def run_cuda_graph_warmup(self, resource_manager: ResourceManager):
+    def run_cuda_graph_warmup(self, resource_manager: ResourceManager) -> None:
         """Warm up or capture CUDA graphs for the configured graph shapes."""
         is_warmup_only = self.cuda_graph_runner.is_warmup_only
         metric_name = (
@@ -683,7 +683,7 @@ class DecoderCudaGraphs:
         if not is_warmup_only:
             self._capture_prefill_cuda_graphs(resource_manager)
 
-    def _capture_generation_cuda_graphs(self, resource_manager: ResourceManager):
+    def _capture_generation_cuda_graphs(self, resource_manager: ResourceManager) -> None:
         """Warm up or capture pure-generation CUDA graph shapes."""
         if not self.cuda_graph_runner.enabled:
             return
@@ -869,7 +869,7 @@ class DecoderCudaGraphs:
         if self._metadata.spec_metadata is not None:
             self._metadata.spec_metadata.is_all_greedy_sample = True
 
-    def _capture_prefill_cuda_graphs(self, resource_manager: ResourceManager):
+    def _capture_prefill_cuda_graphs(self, resource_manager: ResourceManager) -> None:
         """Warm up and capture prefill CUDA graphs, timing each phase separately.
 
         After capture, run prefill batches with many requests to warm up

@@ -432,6 +432,24 @@ def test_longest_dummy_request_failure_frees_filler_requests() -> None:
     assert draft_kv_cache_manager.free_resources.call_args_list == [call(r) for r in fillers]
 
 
+def test_cuda_graph_warmup_request_frees_rows_without_cross_kv_space() -> None:
+    resource_manager, kv_cache_manager = _dummy_request_resources()
+    cross_kv_cache_manager = resource_manager.get_resource_manager(
+        ResourceManagerType.CROSS_KV_CACHE_MANAGER
+    )
+    cross_kv_cache_manager.add_dummy_requests.return_value = None
+    rows = [SimpleNamespace(py_request_id=0), SimpleNamespace(py_request_id=1)]
+    batch = ScheduledRequests()
+    batch.generation_requests = rows
+
+    requests = _dummy_requests(EncoderDecoderDummyRequests)
+    assert requests.finish_cuda_graph_warmup_request(batch, resource_manager, 2, 0) is None
+
+    assert cross_kv_cache_manager.add_dummy_requests.call_args.kwargs["request_ids"] == [0, 1]
+    assert kv_cache_manager.free_resources.call_args_list == [call(row) for row in rows]
+    cross_kv_cache_manager.free_resources.assert_not_called()
+
+
 def test_mixed_warmup_request_orders_context_generation_and_longest_rows() -> None:
     resource_manager, kv_cache_manager = _dummy_request_resources()
     kv_cache_manager.get_num_free_blocks.return_value = 8
