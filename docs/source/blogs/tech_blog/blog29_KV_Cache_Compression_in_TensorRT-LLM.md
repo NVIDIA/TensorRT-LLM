@@ -137,11 +137,20 @@ The executor loop hosts the stages inside a request (stages 1 to 3 in Figure 3);
 
 ### Configuration and Integration with the Cache Manager
 
-A method is selected via `kv_cache_compression_config`, separate from the KV cache config and the sparse attention config, and one method can be active per LLM instance. The block collects only the settings that belong to compression: which method to run and that method's own options. A factory validates the block, rejects unsupported combinations before anything is built, and hands the settings to the compression manager, which handles everything from there. Cold-page compression is turned on with `algorithm: quantization_for_cold_page` and `quant: nvfp4`. TriAttention is turned on with `algorithm: triattention` plus its budget and calibration options. The same fields work in the Python API, in `trtllm-serve` YAML, and in `trtllm-bench`. The full option table is in the [KV Cache Compression feature documentation](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/features/kv-cache-compression.md).
+TensorRT LLM has many modules a compression method may need to engage or change: the executor loop, the KV cache manager and its storage tiers, block reuse, speculative decoding. Which ones, and how, depends on the method. The configuration is where this is decided. One block, `kv_cache_compression_config`, holds:
 
-The cache manager and the attention backend are outside the framework. The compression manager is designed to adapt to any cache manager and any attention backend. It changes only the contents of KV pages, and it never owns pages, tiers, or the kernels that read them.
+- **`algorithm`**: which method to run, `quantization_for_cold_page` or `triattention`. One method can be active per LLM instance.
+- **Method options**: for cold-page compression the cold format (`quant: nvfp4`); for TriAttention the token `budget`, the eviction period, the `eviction_mode` and the calibration file.
 
-The framework touches three existing parts of TensorRT LLM. The executor iteration loop hosts the in-request hooks. The KV cache manager, today KVCacheManagerV2 (V2 from here on), owns the pages, the host and disk tiers, and the migration of pages between them; the compression manager binds to it after it is built, and the cold-page codec plugs into its page migration path, so V2 keeps ownership of pools, mappings, and migration while the codec decides how a page is stored off the GPU. The attention backend is not touched at all. For the interfaces involved, see the [KV cache compression development guide](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/developer-guide/kv-cache-compression-development.md).
+The same block works in the Python API, in `trtllm-serve` YAML and in `trtllm-bench`; the full option table is in the [KV Cache Compression feature documentation](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/features/kv-cache-compression.md).
+
+From this block a factory decides what the method needs and checks that the rest of the configuration allows it, before anything is built:
+
+- **Modules to engage**: cold-page compression plugs a codec into the page migration of the KV cache manager (KVCacheManagerV2, V2 from here on); TriAttention registers in the executor loop.
+- **Compatibility**: a method declares whether block reuse stays valid and which speculative decoding modes it supports. Both methods keep block reuse; TriAttention supports speculative decoding only in `union` mode, and both methods only with one-model MTP or EAGLE3.
+- **Platform**: both methods need Blackwell-class GPUs and the C++ V2 backend.
+
+An unsupported combination is rejected with a clear message. Otherwise the factory builds the compression manager, which binds to V2 after V2 is built. V2 keeps the pages, the tiers and the migration between them, and the attention backend is not touched. For the interfaces involved, see the [KV cache compression development guide](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/developer-guide/kv-cache-compression-development.md).
 
 ### KV Cache Compression in the Executor Iteration Loop
 
