@@ -36,15 +36,19 @@ rather than contended, and no amount of waiting will free it.
 
 from __future__ import annotations
 
+import ast
 import json
 import shlex
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
+import yaml
+
 from agent_flow.runtime import CommandSpec, LocalCommandExecutor
 
 from .delivery import MODELING_V2_PACKAGE
+from .envelope import CertificationPlan, derive_certification
 from .environment import RunEnvironment, resolve_environment
 from .task_schema import (
     assembly_units,
@@ -180,10 +184,28 @@ class PreflightResult:
     target_rel: str = ""
     checkpoint_config: dict[str, Any] = field(default_factory=dict)
     notes: list[str] = field(default_factory=list)
+    #: What the run certifies: the serving envelope, the gate tuples inside
+    #: it, the envelope probes and the feature-matrix cells. See `envelope.py`.
+    certification: CertificationPlan | None = None
 
 
 class PreflightError(RuntimeError):
     """A precondition failed. The run ends here, before the branch exists."""
+
+
+class SpecInconsistencyError(PreflightError):
+    """The spec cannot run as written; the host is not at fault.
+
+    Raised where preflight finds the spec's own blocks disagreeing -- a gate
+    launched outside the declared serving envelope -- or asking the tree for
+    something it does not have, so the operator is pointed at the spec or the
+    tree rather than at the infrastructure troubleshooting guide every other
+    preflight failure belongs in.
+    """
+
+
+class UnsupportedSpeculationError(SpecInconsistencyError):
+    """A gate would ask a launch path for a speculation algorithm it has no branch for."""
 
 
 #: The one process-wide local executor for probes. Stateless.
@@ -472,6 +494,184 @@ def check_accuracy_anchors(
         notes.append(
             f"accuracy anchor [{unit}]: {benchmark or 'eval'} {model_key} "
             f"{dict(wanted) if wanted else '{}'} = {score:g} ({declared})"
+        )
+    return notes
+
+
+#: The launcher the boot, acceptance, witness and envelope-probe gates run
+#: (see ``gates.run_boot_gate``), and the module whose ``SpeculativeConfig``
+#: decides what ``trtllm-eval`` and the LLM API accept, both repo-relative.
+QUICKSTART_REL = "examples/llm-api/quickstart_advanced.py"
+LLM_ARGS_REL = "tensorrt_llm/llmapi/llm_args.py"
+
+#: The variable ``quickstart_advanced.py`` dispatches its algorithms on.
+_QUICKSTART_ALGO_NAME = "spec_decode_algo"
+_SPECULATIVE_UNION = "SpeculativeConfig"
+
+
+def quickstart_spec_algorithms(path: Path | str) -> set[str] | None:
+    """The ``--spec_decode_algo`` values the quickstart script has a branch for.
+
+    Read from the script's own ``spec_decode_algo == "<ALGO>"`` comparisons,
+    upper-cased the way the script upper-cases its argument. None when the
+    file is absent or does not parse, which means "cannot tell", not "none".
+    """
+    try:
+        tree = ast.parse(Path(path).read_text(encoding="utf-8"))
+    except (OSError, SyntaxError):
+        return None
+    found: set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Compare):
+            continue
+        operands = [node.left, *node.comparators]
+        if not any(isinstance(o, ast.Name) and o.id == _QUICKSTART_ALGO_NAME for o in operands):
+            continue
+        for operand in operands:
+            constants = (
+                operand.elts if isinstance(operand, (ast.Tuple, ast.List, ast.Set)) else [operand]
+            )
+            for constant in constants:
+                if isinstance(constant, ast.Constant) and isinstance(constant.value, str):
+                    found.add(constant.value.upper())
+    return found
+
+
+def llm_api_decoding_types(path: Path | str) -> set[str] | None:
+    """The ``speculative_config.decoding_type`` values the LLM API accepts.
+
+    The ``decoding_type`` literals of the classes in ``SpeculativeConfig``'s
+    union; every decoding config's literal when the union cannot be found.
+    None when the file is absent or does not parse.
+    """
+    try:
+        tree = ast.parse(Path(path).read_text(encoding="utf-8"))
+    except (OSError, SyntaxError):
+        return None
+    literals: dict[str, str] = {}
+    members: set[str] = set()
+    for node in tree.body:
+        if isinstance(node, ast.ClassDef):
+            for item in node.body:
+                if (
+                    isinstance(item, ast.AnnAssign)
+                    and isinstance(item.target, ast.Name)
+                    and item.target.id == "decoding_type"
+                    and isinstance(item.annotation, ast.Subscript)
+                ):
+                    value = item.annotation.slice
+                    if isinstance(value, ast.Constant) and isinstance(value.value, str):
+                        literals[node.name] = value.value
+        target = None
+        if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            target, value = node.target.id, node.value
+        elif isinstance(node, ast.Assign) and len(node.targets) == 1:
+            first = node.targets[0]
+            target, value = (first.id if isinstance(first, ast.Name) else None), node.value
+        if target == _SPECULATIVE_UNION and value is not None:
+            members = {n.id for n in ast.walk(value) if isinstance(n, ast.Name)}
+    if members:
+        return {literal for name, literal in literals.items() if name in members}
+    return set(literals.values())
+
+
+def check_speculation_support(task_data: Mapping[str, Any]) -> list[str]:
+    """Every speculation algorithm the gates will emit has a branch in the launcher.
+
+    Two launch paths, each asked differently:
+
+    - the quickstart gates (boot, acceptance, witness, envelope probe) pass
+      ``--spec_decode_algo=<ALGO>`` from ``gates.speculation_flags``. A value
+      the script has no branch for falls through to ``spec_config = None``:
+      the gate runs the unit WITHOUT speculation, its acceptance statistic is
+      missing or 1.0, and the failure reads as a broken draft path;
+    - the accuracy gate's ``trtllm-eval`` reads the unit's options YAML, whose
+      ``speculative_config.decoding_type`` must be one the LLM API's
+      ``SpeculativeConfig`` union accepts.
+
+    Raises :class:`UnsupportedSpeculationError` naming the algorithm, the
+    unit, the file and the branch it lacks. Returns notes, including one for a
+    launcher this preflight could not read.
+    """
+    from .envelope import features_through
+    from .gates import resolve_llm_api_options, speculation_flags
+
+    repo = Path(str(task_data.get("trtllm_repo_path") or "."))
+    accuracy = task_data.get("accuracy") or {}
+    emitted: dict[str, list[str]] = {}
+    asked: dict[str, list[tuple[str, str]]] = {}
+    for unit in assembly_units(task_data):
+        for flag in speculation_flags(features_through(task_data, unit)):
+            if flag.startswith("--spec_decode_algo="):
+                emitted.setdefault(flag.split("=", 1)[1].upper(), []).append(unit)
+        options = resolve_llm_api_options(accuracy, unit) if isinstance(accuracy, dict) else None
+        if options and Path(options).is_file():
+            try:
+                loaded = yaml.safe_load(Path(options).read_text(encoding="utf-8")) or {}
+            except yaml.YAMLError:
+                continue
+            config = loaded.get("speculative_config") if isinstance(loaded, dict) else None
+            decoding = config.get("decoding_type") if isinstance(config, dict) else None
+            if decoding:
+                asked.setdefault(str(decoding), []).append((unit, str(options)))
+    if not emitted and not asked:
+        return []
+
+    notes: list[str] = []
+    errors: list[str] = []
+    verified: set[str] = set()
+    if emitted:
+        quickstart = repo / QUICKSTART_REL
+        supported = quickstart_spec_algorithms(quickstart)
+        if supported is None:
+            notes.append(
+                f"speculation: cannot read {quickstart}, so whether it handles "
+                f"{', '.join(sorted(emitted))} is unchecked; the boot gate will say"
+            )
+        else:
+            for algo, units in sorted(emitted.items()):
+                if algo in supported:
+                    verified.add(algo)
+                    continue
+                errors.append(
+                    f"unit(s) {', '.join(units)} make the boot/acceptance/witness/probe gates "
+                    f"pass `--spec_decode_algo={algo}`, but {quickstart} has no "
+                    f"`{_QUICKSTART_ALGO_NAME} == '{algo}'` branch (it handles "
+                    f"{', '.join(sorted(supported)) or 'none'}); the value falls through to "
+                    f"`spec_config = None` and every quickstart gate would run the unit "
+                    f"without speculation. Add the {algo} branch to {QUICKSTART_REL} on this "
+                    f"tree before the run"
+                )
+    if asked:
+        llm_args = repo / LLM_ARGS_REL
+        accepted = llm_api_decoding_types(llm_args)
+        if accepted is None:
+            notes.append(
+                f"speculation: cannot read {llm_args}, so the decoding types "
+                f"{', '.join(sorted(asked))} are unchecked"
+            )
+        else:
+            lowered = {a.lower() for a in accepted}
+            for decoding, uses in sorted(asked.items()):
+                if decoding.lower() in lowered:
+                    verified.add(decoding)
+                    continue
+                where = "; ".join(f"{unit} ({options})" for unit, options in uses)
+                errors.append(
+                    f"the accuracy gate's options ask trtllm-eval for "
+                    f"`speculative_config.decoding_type: {decoding}` ({where}), but "
+                    f"`{_SPECULATIVE_UNION}` in {llm_args} accepts only "
+                    f"{', '.join(sorted(accepted)) or 'none'}. Add the {decoding} config to "
+                    f"that union in {LLM_ARGS_REL}, or fix the options file"
+                )
+    if errors:
+        raise UnsupportedSpeculationError(
+            "a speculation algorithm the gates will ask for has no branch on this tree:\n  - "
+            + "\n  - ".join(errors)
+        )
+    if verified:
+        notes.append(
+            f"speculation: {', '.join(sorted(verified))} supported by the gates' launch paths"
         )
     return notes
 
@@ -831,11 +1031,16 @@ def run_preflight(
     *,
     runner: CommandRunner = _default_runner,
     skip_device_claim: bool = False,
+    unit_kinds: Callable[[str], Any] | None = None,
 ) -> PreflightResult:
     """Assert every precondition in order and resolve the run's identity.
 
     ``skip_device_claim`` exists for the CPU-only tests and for a
     ``--dry-run`` on a machine with no GPUs; it is never set by a real run.
+
+    ``unit_kinds`` answers which gate kinds (boot, accuracy, witness,
+    acceptance) the orchestrator runs for a unit; without it they are read
+    from what the spec declares. See :func:`~.envelope.derive_certification`.
     """
     notes: list[str] = []
 
@@ -890,6 +1095,29 @@ def run_preflight(
     # the unit list is decided here.
     notes.extend(check_accuracy_anchors(task_data, units))
 
+    # The certified set, derived before anything touches the host: it is file
+    # reading, and a gate that launches outside the declared envelope -- or a
+    # gated member the envelope does not claim -- is a spec inconsistency the
+    # run must not start with. Everything it derives (probes, external matrix
+    # cells) is printed here so the bill is readable on a dry run.
+    certification = derive_certification(
+        task_data,
+        world_size=world_size,
+        gpus_per_node=_int_or_none((task_data.get("environment") or {}).get("gpus_per_node")),
+        checkpoint_config=checkpoint_config,
+        unit_kinds=unit_kinds,
+    )
+    if certification.errors:
+        raise SpecInconsistencyError(
+            "the serving envelope and the gates disagree:\n  - "
+            + "\n  - ".join(certification.errors)
+        )
+    notes.extend(certification.notes())
+    # File reading too, and a spec that asks a launcher for a speculation
+    # algorithm it cannot build would otherwise surface at the first boot
+    # gate as a unit that "drafts nothing".
+    notes.extend(check_speculation_support(task_data))
+
     env_block = dict(task_data.get("environment") or {})
     declared_env = {str(k): str(v) for k, v in (env_block.get("env") or {}).items()}
     check_tmpdir(declared_env)
@@ -934,7 +1162,15 @@ def run_preflight(
         target_rel=target_rel,
         checkpoint_config=checkpoint_config,
         notes=notes,
+        certification=certification,
     )
+
+
+def _int_or_none(value: Any) -> int | None:
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
 
 
 def resolve_target_identity(
@@ -1000,6 +1236,11 @@ __all__ = [
     "UNIX_SOCKET_PATH_MAX",
     "PreflightError",
     "PreflightResult",
+    "SpecInconsistencyError",
+    "UnsupportedSpeculationError",
+    "check_speculation_support",
+    "llm_api_decoding_types",
+    "quickstart_spec_algorithms",
     "UNSUPPORTED_ARCHITECTURE_MARKERS",
     "check_accuracy_anchors",
     "check_checkpoint",

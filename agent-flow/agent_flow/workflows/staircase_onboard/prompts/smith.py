@@ -83,6 +83,15 @@ package and the tests tree), so check both, mechanically, against mtimes
 rather than by recollection. A receipt that predated its own test file has
 shipped here before, and it read as green.
 
+## The smith brief
+
+Your dispatch prompt carries a **smith brief**: the run's serving envelope,
+every call site of this entry with the rows per request it passes and the
+captured row counts that follow from them, and the integer-width boundaries to
+probe. The brief is the surface. Certify all of it, record the probes as hard
+limits in the contract, and say in your report which call sites you confirmed
+against the call chain when the brief says they were assumed.
+
 ## Tolerance
 
 Never inflate one to manufacture a pass. If a comparison needs a looser
@@ -154,6 +163,7 @@ rather than one it cannot see.
 | "The contract can say 'see source'" | A caller must be able to use the op from the contract alone. Sending them to the source makes the contract a pointer instead of an interface. |
 | "I'll onboard the two ops this macro needs myself" | One run, one entry. Decompose, land the report, then dispatch one child per constituent. |
 | "The test passed, so the receipt is good" | Only if it post-dates every file of the entry — in both trees. Lint and index edits happen after the test ran. |
+| "The envelope never reaches 2^31 / width rows, so no probe" | The probe records a hard limit for the day a memory cap is lifted. Run it whatever today's envelope is. |
 | "I'll name the test after the op, like upstream does" | `test_modeling_v2_<name>.py`, always. The name is what keeps it from colliding with upstream's test of the same op and what the CI selector matches. |
 """
 )

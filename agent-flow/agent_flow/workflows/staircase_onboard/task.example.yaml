@@ -171,6 +171,70 @@ trtllm_repo_path: /path/to/TensorRT-LLM
 #     - --max_batch_size=8
 #     - --kv_cache_fraction=0.6
 
+# --------------------------------------------------------- serving envelope
+# What the target is CLAIMED to serve. Every certification -- catalog
+# receipts, capacity constants in the target, integer-width limits of the
+# kernels -- is judged against this box, never against the tuples the gates
+# happen to launch.
+#
+# The failure this prevents: when the certified set is "whatever the gates
+# ran", a run whose gates all used max_num_tokens 8192 and max_seq_len 16384
+# certifies nothing above them, and every defect that lives above them -- a
+# fixed-size buffer sized 8192 in the target, a recompute path that crashes
+# past 16K, a 32-bit offset that overflows at 2^25 rows -- passes every gate
+# and ships.
+#
+# From this block the run derives (preflight prints all of it, and writes it
+# to <workspace>/certification.md):
+#   - a check that every gate tuple lies INSIDE the envelope, and that every
+#     gated member is one the envelope claims;
+#   - one ENVELOPE PROBE per unit: the boot gate at the ceiling (these limits,
+#     this capture list), at the unit's cheapest member;
+#   - a boot-at-the-ceiling evidence requirement for every member no unit
+#     gates (multi-node, PP): delivery needs
+#     <workspace>/evidence/<cell>.yaml {verdict: pass, tree: ..., log: ...}.
+#
+# Omitted: the envelope is DERIVED from the gate tuples (the legacy reading)
+# and every rendering says so. To migrate a spec, print a block derived from
+# its gates and then widen it:
+#   python -m agent_flow.workflows.staircase_onboard.envelope migrate task.yaml
+#
+# serving_envelope:
+#   max_batch_size: 256           # requests per step
+#   max_num_tokens: 16384         # tokens per step, per rank
+#   max_seq_len: 131072           # per-request length
+#   max_draft_len: 3              # optional: speculative tokens per request per step
+#   cuda_graph:                   # false = eager only
+#     padding: true               # the engine's padding policy ...
+#     max_batch_size: 256         # ... generated up to here (default: max_batch_size)
+#     # batch_sizes: [1, 2, 4, 8, 16, 32, 64, 128, 256]   # or an explicit list
+#   # Every configuration claimed, including ones this allocation cannot run:
+#   # <tp|tep|dep><N>[pp<M>], e.g. tep8 (two 4-GPU nodes) or tep4pp2.
+#   members: [tp4, tep4, dep4, dep8]
+#   gpus_per_node: 4              # optional: default environment.gpus_per_node
+#   # Optional: a generated prompt of at least this many words every probe also
+#   # sends, so the probe prefills a long request. Keep it under max_num_tokens
+#   # unless the runtime block turns chunked_prefill on.
+#   probe_prompt_tokens: 12000
+#
+# The feature combinations that must have ENGINE evidence beyond what the
+# units' own gates produce. Each cell expands over its members and evidence
+# kinds, and is classified as gated (an existing gate covers it), probe (the
+# run launches a boot at that point) or external (evidence file owed at
+# delivery, as above).
+#
+# feature_matrix:
+#   - name: mtp-long-context
+#     features: [mtp]               # [] = core
+#     members: [tep4]               # default: every envelope member
+#     evidence: [boot]              # boot | accuracy | witness | acceptance
+#     at: {max_seq_len: 131072}     # gate (default) | ceiling | a point
+#     prompt_tokens: 12000
+#   - name: multi-node-accuracy
+#     features: [mtp]
+#     members: [dep8]
+#     evidence: accuracy
+
 # ------------------------------------------------------------- environment
 # How GPU work is launched. Resolved ONCE into a literal command prefix that
 # every agent prompt carries verbatim; no agent ever builds a launcher line.

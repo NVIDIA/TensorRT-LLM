@@ -32,10 +32,11 @@ has inverted the economics of the whole run.
 2. **`REQUIRED_TRTLLM_OPS` equals the forward's call set** — not a superset,
    not a subset. A stale name is as wrong as a missing one.
 3. **The runtime-value dump against the contracts.** Any value the engine
-   varied at runtime that sits outside its entry's certified column is a
-   blocker, not a note. This is the check that has been missed before: a
-   target merged with 34 of the 35 batch sizes its engine captured sitting
-   outside the contract, because every *constant* it passed was inside.
+   varied at runtime that sits outside its entry's certified column must be
+   certified before delivery -- see "Rejecting" for how to report it. This is
+   the check that has been missed before: a target merged with 34 of the 35
+   batch sizes its engine captured sitting outside the contract, because
+   every *constant* it passed was inside.
 4. **Graph safety and sync-freedom in the forward.** No `.item()`, no
    `.cpu()`, no data-dependent host branching. These are writing rules — a
    forward that violates them is wrong the first time it is captured, and the
@@ -48,6 +49,13 @@ has inverted the economics of the whole run.
    path declares.
 7. **For a feature increment: the base path is unchanged.** With the feature
    off, the forward must be what the recorded gate measured, bit for bit.
+8. **Capacity constants against the serving envelope.** Your prompt carries
+   the orchestrator's static audit of every fixed size in the target. A FAIL
+   row is a blocker. An ok row is a CLAIM: read the code and confirm the
+   constant really caps the axis it is bound to (a row ceiling bound to
+   `max_batch_size` is wrong), and that a `fixed:` reason is true. No gate
+   launches at the envelope's ceiling except the envelope probe, so this
+   reading is where a too-small buffer is caught.
 
 ## What not to do
 
@@ -63,8 +71,18 @@ has inverted the economics of the whole run.
 ## Rejecting
 
 REJECT for a defect the gates cannot see and a reader can: an unmapped call, a
-stale op list, an uncovered runtime value, a sync in the forward, a topology
-that does not match the segment, a feature that changed the base path.
+stale op list, a sync in the forward, a topology that does not match the
+segment, a feature that changed the base path, a capacity constant below the
+envelope.
+
+**A runtime value outside an entry's certified column, on a target that is
+otherwise correct, is a certification gap, not a REJECT.** List it in
+`certification_gap` -- `{{entry, values, axis, reason}}`, one row per entry
+surface -- and APPROVE. The orchestrator dispatches the verify smiths itself
+and the unit moves on; a REJECT for it re-opens the assembler for hours over
+work that is not the assembler's. Judge "outside" against the serving
+envelope in your prompt: a value inside the envelope that the contract's
+certified column covers by the envelope standard is not a gap at all.
 
 APPROVE when the diff is consistent with the gate evidence and the invariants
 hold. A gate that passed plus a clean audit is sufficient — you are not
@@ -94,7 +112,9 @@ line for every item, and say which invariant each one violates.
 | "The whole file should be scanned for non-catalog calls" | That false-positives on init-time code and buries the real finding. Scope it to `forward` plus what it reaches. |
 | "The constants are all certified, so we're clean" | The values that escape are the ones the engine varies at runtime. Read the dump. |
 | "Both gates passed, so the topology is what the path says" | Every gate is topology-blind. Only reading the assembly against the segment catches it. |
+| "The constant is bound, so it is fine" | A binding is a claim the audit takes at its word. Check it names the axis the constant actually caps. |
 | "It would read better formatted" | One lint pass, at delivery. Not yours. |
+| "REJECT — this value is not certified" | If the code is right, it is a `certification_gap` row with an APPROVE. Verifies run without the assembler. |
 | "REJECT — I'd have written this differently" | Name the invariant it violates, or APPROVE. |
 """
 )

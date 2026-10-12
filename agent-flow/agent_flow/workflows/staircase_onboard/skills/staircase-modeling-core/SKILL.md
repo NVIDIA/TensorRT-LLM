@@ -73,6 +73,26 @@ These hold for every edit to a target's modeling code, by anyone, forever.
    is the difference between an unsupported input and a wrong answer.
 9. **Self-containment.** No shared helpers across targets. Duplication between
    targets is the architecture, not a smell.
+10. **Every fixed size answers to an engine limit.** A module- or class-level
+    integer that bounds something (rows, tokens, batch, slots, pages) or sizes
+    a buffer, and every buffer sized by a literal of 1024 or more, is either
+    derived from an engine argument at construction
+    (`model_config.max_num_tokens`, `max_batch_size`, `max_seq_len`) or
+    declared on its own line:
+
+    ```python
+    _TOPK_MAX_ROWS = 16384  # capacity: max_num_tokens
+    _GATHER_ROWS = 65536  # capacity: max_num_tokens * world_size
+    _WINDOW = 128  # capacity: fixed: the checkpoint's sliding window
+    ```
+
+    (or in a module-level `CAPACITY_BOUNDS = {"NAME": "<binding>"}`). The
+    orchestrator audits every one statically against the serving envelope at
+    review and at delivery: unbound, or bound and below the envelope, fails.
+    The case that made this an invariant: a `_TOPK_MAX_ROWS = 8192` offsets
+    buffer killed every engine above `max_num_tokens` 8192 in warm-up while
+    every kernel it fed was certified to 16384, and no gate launched above
+    8192 to see it.
 
 ## Products
 

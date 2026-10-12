@@ -46,6 +46,8 @@ from rich.syntax import Syntax
 from agent_flow.console import print_layer_panel
 from agent_flow.logger import get_logger
 
+from .remediation import CERTIFICATION_GAP_KEY, normalize_certification_gap_records
+
 PLAN_STAGE = "plan_stage"
 BUILD_STAGE = "build_stage"
 DELIVER_STAGE = "deliver_stage"
@@ -72,7 +74,13 @@ AUDITOR_DECISIONS = ("CLEAN", "UNCOVERED")
 
 # Staircase's triage table, as an enum. Each maps to a different
 # orchestrator action, which is the whole reason it is not free text.
-BLOCKED_REASONS = ("vocabulary_gap", "knowledge_gap", "accuracy_shortfall", "environment")
+BLOCKED_REASONS = (
+    "vocabulary_gap",
+    "knowledge_gap",
+    "accuracy_shortfall",
+    "environment",
+    "certification_gap",
+)
 
 
 def _empty() -> dict[str, list[dict[str, Any]]]:
@@ -317,14 +325,19 @@ EXTRA_KEYS_BY_AGENT: dict[str, tuple[str, ...]] = {
     # extending it. Measured on the first real onboarding, on its largest
     # item.
     "smith": ("entry", "receipt", "constituents"),
-    "assembler": ("blocked_reason", "missing_entry"),
+    "assembler": ("blocked_reason", "missing_entry", CERTIFICATION_GAP_KEY),
+    # `certification_gap`: "this entry is correct and must be certified at
+    # these values". The orchestrator fans each row out to a verify smith
+    # itself (remediation.py), so a certification-only finding no longer
+    # re-opens the assembler or waits on a human to relay it.
+    "reviewer": (CERTIFICATION_GAP_KEY,),
     # `uncovered` is to the auditor what `constituents` is to a MACRO: the
     # difference between a verdict the orchestrator can act on and one a
     # human has to read. Prose cannot be deduplicated, grouped by entry
     # surface, or compared across rounds -- so an UNCOVERED whose findings
     # live only in `summary` ends the run, which is exactly what it used to
     # do. See remediation.py.
-    "auditor": ("uncovered",),
+    "auditor": ("uncovered", CERTIFICATION_GAP_KEY),
 }
 
 #: Keys an uncovered row may carry. `entry`, `arch` and `axis` are required:
@@ -540,10 +553,48 @@ def collect_decision_file(
             rows = parse_uncovered_records(value)
             if rows:
                 entry[key] = rows
+        elif key == CERTIFICATION_GAP_KEY:
+            gaps = normalize_certification_gap_records(value)
+            if gaps:
+                entry[key] = gaps
         elif str(value).strip():
             entry[key] = str(value).strip()
     ctx.append(agent, entry)
     return decision
+
+
+def _certification_gap_property(who: str) -> dict[str, Any]:
+    """The ``certification_gap`` tool property, worded for one role."""
+    return {
+        "type": "array",
+        "description": (
+            f"{who} One row per catalog entry that is CORRECT but not certified at "
+            "values the target reaches inside the serving envelope. The orchestrator "
+            "dispatches a verify smith per row itself -- no human relays it -- so a "
+            "certification-only finding never needs a REJECT or a BLOCKED."
+        ),
+        "items": {
+            "type": "object",
+            "properties": {
+                "entry": {"type": "string", "description": "Catalog entry, e.g. `moe/runner`."},
+                "values": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "The values to certify (row counts, sizes, ...).",
+                },
+                "axis": {
+                    "type": "string",
+                    "description": "The certification axis; default `envelope`.",
+                },
+                "arch": {"type": "string", "description": "Default: this run's architecture."},
+                "reason": {
+                    "type": "string",
+                    "description": "Why the target needs it: the call site, the contract line.",
+                },
+            },
+            "required": ["entry", "values"],
+        },
+    }
 
 
 def build_progress_tools(ctx: ProgressContext) -> dict[str, list[Any]]:
@@ -633,7 +684,10 @@ def build_progress_tools(ctx: ProgressContext) -> dict[str, list[Any]]:
                     "shortfall that survived your self-heal — the run ends with the "
                     "audit trail, because the gate is the release criterion and it is "
                     "not yours to relax. `environment`: the launch prefix or the host "
-                    "cannot do what the task needs."
+                    "cannot do what the task needs. `certification_gap`: you cannot "
+                    "go on until entries are certified at values the target needs — "
+                    "list them in `certification_gap`; the orchestrator verifies them "
+                    "and resumes you."
                 ),
             },
             "missing_entry": {
@@ -643,8 +697,12 @@ def build_progress_tools(ctx: ProgressContext) -> dict[str, list[Any]]:
                     "op if you found one. This becomes smith's dispatch brief."
                 ),
             },
+            CERTIFICATION_GAP_KEY: _certification_gap_property(
+                "Optional with UNIT_READY (the verifies run while the unit is gated), "
+                "required with BLOCKED/certification_gap."
+            ),
         },
-        extra_keys=("blocked_reason", "missing_entry"),
+        extra_keys=("blocked_reason", "missing_entry", CERTIFICATION_GAP_KEY),
     )
     reviewer = _decision_tool(
         ctx,
@@ -657,9 +715,17 @@ def build_progress_tools(ctx: ProgressContext) -> dict[str, list[Any]]:
         decision_help=(
             "APPROVE if the diff is consistent with the gate evidence and the "
             "invariants hold. REJECT for a defect the gates cannot see and a reader "
-            "can — an unmapped call, a stale op list, an uncovered runtime value, a "
-            "sync in the forward, a topology that does not match the segment."
+            "can — an unmapped call, a stale op list, a sync in the forward, a "
+            "topology that does not match the segment. A value outside an entry's "
+            "certified column on a CORRECT target is not a REJECT: APPROVE and list "
+            "it in `certification_gap`."
         ),
+        extra_properties={
+            CERTIFICATION_GAP_KEY: _certification_gap_property(
+                "Certification-only findings, with APPROVE or REJECT."
+            )
+        },
+        extra_keys=(CERTIFICATION_GAP_KEY,),
     )
     auditor = _decision_tool(
         ctx,
@@ -725,9 +791,12 @@ def build_progress_tools(ctx: ProgressContext) -> dict[str, list[Any]]:
                     },
                     "required": ["entry", "arch", "axis", "values"],
                 },
-            }
+            },
+            CERTIFICATION_GAP_KEY: _certification_gap_property(
+                "Optional, and dispatched exactly like `uncovered`."
+            ),
         },
-        extra_keys=("uncovered",),
+        extra_keys=("uncovered", CERTIFICATION_GAP_KEY),
     )
 
     return {

@@ -52,10 +52,11 @@ from agent_flow.console import print_message, print_rule
 from agent_flow.logger import get_logger
 from agent_flow.runtime import CommandExecutor, TurnExecutor, TurnRequest
 
+from . import envelope as envelope_mod
 from . import gates as gates_mod
 from . import remediation
 from .committer import install_committer
-from .delivery import summarize_for_auditor, verify_delivery
+from .delivery import DeliveryReport, summarize_for_auditor, verify_delivery
 from .environment import (
     RunEnvironment,
     image_import_warning,
@@ -67,6 +68,7 @@ from .journal import Journal
 from .preflight import (
     MAX_TMPDIR_LEN,
     PreflightError,
+    SpecInconsistencyError,
     format_preflight_report,
     run_preflight,
     substrate_gate,
@@ -216,6 +218,12 @@ WITNESS_GATED_UNITS: dict[str, str] = {
     "encoder_replay": "replay",
     "kv_quant": "kv_quant",
 }
+
+# The BLOCKED reasons a resume handles instead of re-dispatching: the two the
+# orchestrator can act on by itself, dispatching smiths -- an onboard for a
+# vocabulary gap, verifies for a certification gap. Any other reason already
+# ended the run once, and handling it again just ends it again.
+RESUMABLE_BLOCKED_REASONS: tuple[str, ...] = ("vocabulary_gap", "certification_gap")
 
 # Shown on every infrastructure failure, and pointed at the file rather than
 # summarized, because the summary is the part that goes stale. A run stops
@@ -442,6 +450,9 @@ class StaircaseOnboardWorkflow:
         )
         self._runtime_block: str = ""
         self._kernel_sources_block: str = ""
+        #: The certification standard every planning and certifying role
+        #: carries; written with `certification.md` at preflight.
+        self._certification_block: str = ""
 
     # ------------------------------------------------------------- lifecycle
 
@@ -617,6 +628,7 @@ class StaircaseOnboardWorkflow:
             if state.stage == STAGE_PLAN:
                 if not self._run_plan_phase(state, log):
                     return
+                self._run_early_checks("end of the plan phase", log)
                 state.stage = STAGE_SMITH
                 self._checkpoint(state)
 
@@ -657,12 +669,16 @@ class StaircaseOnboardWorkflow:
         if self._command_runner is not None:
             kwargs["runner"] = self._command_runner
         try:
-            result = run_preflight(self.task_data, **kwargs)
+            result = run_preflight(self.task_data, unit_kinds=self._unit_gate_kinds, **kwargs)
         except PreflightError as exc:
+            # A spec that contradicts itself is fixed in the spec; the
+            # infrastructure guide would send the operator the wrong way.
+            hint = "" if isinstance(exc, SpecInconsistencyError) else TROUBLESHOOTING_HINT
             print_message(f"[bold red]✘ preflight: {exc}[/bold red]", log)
-            print_message(TROUBLESHOOTING_HINT, log)
+            if hint:
+                print_message(hint, log)
             self.journal.open(slug="(preflight failed)")
-            self.journal.section("preflight failed", f"{exc}\n\n{TROUBLESHOOTING_HINT}")
+            self.journal.section("preflight failed", f"{exc}\n\n{hint}".rstrip())
             return False
 
         state.slug = result.slug
@@ -747,6 +763,7 @@ class StaircaseOnboardWorkflow:
                 return False
 
         self._take_survey(result, log)
+        self._write_certification(result)
 
         # Prompts can only be built now: every role's prompt carries the
         # resolved launch prefix, which did not exist until the device claim
@@ -1006,6 +1023,76 @@ class StaircaseOnboardWorkflow:
         print_message(f"[bold {colour}]{mark} survey[/bold {colour}] {headline}", log)
         if surface.unrecognized:
             print_message(f"  unrecognized structural keys: {', '.join(surface.unrecognized)}", log)
+
+    def _unit_gate_kinds(self, unit: str) -> set[str]:
+        """The gate kinds `_assemble_one_unit` runs for `unit`; see `envelope.py`."""
+        kinds = {envelope_mod.EVIDENCE_BOOT, envelope_mod.EVIDENCE_ACCURACY}
+        if unit in WITNESS_GATED_UNITS:
+            kinds.add(envelope_mod.EVIDENCE_WITNESS)
+        if unit in ACCEPTANCE_GATED_UNITS:
+            kinds.add(envelope_mod.EVIDENCE_ACCEPTANCE)
+        return kinds
+
+    def _write_certification(self, result) -> None:
+        """Write `certification.md` and the block the certifying roles carry."""
+        plan = getattr(result, "certification", None)
+        if plan is None:
+            return
+        path = self.workspace / "certification.md"
+        path.write_text(plan.render(), encoding="utf-8")
+        self._certification_block = plan.prompt_block(path)
+        self.journal.section("certification plan", f"`{path}`\n\n" + "\n".join(plan.notes()))
+
+    def _run_early_checks(self, stage: str, log) -> None:
+        """Run the delivery checks that need no finished target, as warnings only."""
+        from .early_checks import run_early_checks
+
+        if self._preflight is None:
+            return
+        environment = self.task_data.get("environment") or {}
+        report = run_early_checks(
+            repo_root=self.task_data["trtllm_repo_path"],
+            family=self._preflight.family,
+            stage=stage,
+            vocabulary_path=self.vocabulary_path,
+            env=environment.get("env") or {},
+            capacity=self._capacity_audit(),
+            certification=getattr(self._preflight, "certification", None),
+            workspace=self.workspace,
+        )
+        path = self.workspace / "early_checks.md"
+        path.write_text(report.render(), encoding="utf-8")
+        warnings = report.warnings
+        self.journal.section(
+            f"early delivery checks ({stage})",
+            f"{len(warnings)} warning(s); required CI assets and details in `{path}`\n\n"
+            + "\n".join(f"- {w.render()}" for w in warnings),
+        )
+        for warning in warnings:
+            print_message(f"[bold yellow]⚠ {escape_markup(warning.render())}[/bold yellow]", log)
+
+    def _run_envelope_probes(self, unit: str, log) -> bool:
+        """Boot `unit` at every envelope point its certification plan derived."""
+        plan = getattr(self._preflight, "certification", None)
+        for probe in plan.probes_for(unit) if plan is not None else ():
+            result = self.gate_log.record(
+                envelope_mod.run_envelope_probe(
+                    self._gate_env(),
+                    task_data=self.task_data,
+                    probe=probe,
+                    spec=gates_mod.BootSpec.load(self.boot_spec_path),
+                    runner=self._shell_runner,
+                    features=self._features_through(unit),
+                )
+            )
+            self.journal.event("gate", result.summary())
+            if not result.passed:
+                print_message(
+                    f"[bold yellow]↻ {escape_markup(result.summary())}[/bold yellow]", log
+                )
+                return False
+            print_message(f"[bold green]✔ {escape_markup(result.summary())}[/bold green]", log)
+        return True
 
     def _run_plan_phase(self, state: WorkflowState, log) -> bool:
         """Drafter <-> reviewer, capped, and never blocking the build."""
@@ -1509,6 +1596,7 @@ class StaircaseOnboardWorkflow:
             state.units_done.append(unit)
             state.unit_index += 1
             state.unit_turns = 0
+            self._run_early_checks(f"after the {unit} unit", log)
             # A unit is the assembler's unit of work, so its context ends
             # with it. The next unit starts clean, which is also what makes
             # "core is green before the first feature" mean something.
@@ -1700,7 +1788,7 @@ class StaircaseOnboardWorkflow:
                 # the blocking condition is meant to be revisited. So the
                 # other reasons fall through to a fresh assembler turn, which
                 # is free to reach the same conclusion and say so.
-                elif prior == "BLOCKED" and prior_reason == "vocabulary_gap":
+                elif prior == "BLOCKED" and prior_reason in RESUMABLE_BLOCKED_REASONS:
                     print_message(
                         "[bold cyan]→ resuming onto a BLOCKED assembler decision from a "
                         "previous process; handling it rather than re-dispatching"
@@ -1739,6 +1827,8 @@ class StaircaseOnboardWorkflow:
                 if decision == "UNIT_READY":
                     state.unit_marker[unit] = self._target_marker()
                     self._checkpoint(state)
+                    if not self._fan_out_certification_gaps(state, "assembler", unit, log):
+                        continue
 
             # The configurations this unit is gated over, resolved once. A
             # `unified` segment is ONE codebase over a FAMILY of parallel
@@ -1776,12 +1866,21 @@ class StaircaseOnboardWorkflow:
             )
             if not boots:
                 continue
+            # The envelope's ceiling, before review: warm-up at the real token
+            # budget and capture at every claimed batch are what a fixed-size
+            # buffer fails, and no gate tuple reaches them.
+            if not self._run_envelope_probes(unit, log):
+                continue
 
             if self.reviewer_mode != "off":
                 # The last member's evidence: the reviewer reads one dump and
                 # the summary line names which member produced it, so the
                 # freshest is the one whose log is still meaningful to quote.
                 self._dispatch("reviewer", what=unit, prompt=self._reviewer_prompt(unit, boots[-1]))
+                # Certification-only findings go to verify smiths, not back to
+                # the assembler: the target is correct, the catalog is short.
+                if not self._fan_out_certification_gaps(state, "reviewer", unit, log):
+                    continue
                 if latest_decision(self.progress_path, "reviewer", REVIEWER_DECISIONS) == "REJECT":
                     print_message("[bold yellow]↻ reviewer REJECT[/bold yellow]", log)
                     continue
@@ -2102,7 +2201,9 @@ class StaircaseOnboardWorkflow:
                 print_message("[bold green]✔ audit CLEAN[/bold green]", log)
                 return True
 
-            rows, dropped = remediation.parse_uncovered_rows(entry.get("uncovered"))
+            rows, dropped = remediation.parse_audit_rows(
+                entry, default_arch=str(self.task_data.get("arch", ""))
+            )
             if dropped:
                 # Never silent: a dropped row is a finding nothing will act
                 # on, and the run would otherwise converge on an incomplete
@@ -2222,10 +2323,14 @@ class StaircaseOnboardWorkflow:
 
         # One smith per surface, carrying the whole surface. The dispatch
         # numbers start well above the build queue's so a decision file from
-        # remediation is never mistaken for one the smith phase wrote.
+        # remediation is never mistaken for one the smith phase wrote, and are
+        # the item's position in the queue, which only grows: a later round or
+        # a certification-gap fan-out never reuses another surface's number,
+        # and so never reads another surface's decision.
+        position = {queued.group_key: index for index, queued in enumerate(cycle.queue)}
         dispatches = {
             item.identity: QueueItem(
-                n=9000 + index,
+                n=9000 + position.get(item.group_key, index),
                 mode=MODE_VERIFY,
                 target=item.entry,
                 surface=item.brief(),
@@ -2260,6 +2365,58 @@ class StaircaseOnboardWorkflow:
         updated, failed = remediation.apply_outcomes(cycle.queue, outcomes)
         cycle.queue = list(updated)
         return failed
+
+    def _fan_out_certification_gaps(self, state: WorkflowState, role: str, unit: str, log) -> bool:
+        """Verify every `certification_gap` row `role`'s latest decision carries.
+
+        True when there was nothing to verify or every verify landed; False
+        when one failed or cannot be retried, which sends the unit back to the
+        assembler with a correction naming the surfaces. The rows join the
+        remediation queue, so the delivery audit never re-dispatches them.
+        """
+        entry = latest_entry(self.progress_path, role) or {}
+        rows, dropped = remediation.parse_certification_gaps(
+            entry.get(remediation.CERTIFICATION_GAP_KEY),
+            default_arch=str(self.task_data.get("arch", "")),
+        )
+        if dropped:
+            print_message(
+                f"[bold yellow]! {dropped} certification_gap row(s) from the {role} named no "
+                f"entry and cannot be dispatched[/bold yellow]",
+                log,
+            )
+        if not rows:
+            return True
+        budget = self._remediation_budget()
+        cycle = remediation.RemediationState.from_dict(state.remediation)
+        incoming = remediation.canonicalize(
+            rows, target_commit=self._target_commit(), capture_id=f"{role}:{unit}"
+        )
+        merge = remediation.merge_into_queue(cycle.queue, incoming, budget=budget)
+        decision = remediation.decide_gap_dispatch(merge, budget=budget, incoming=incoming)
+        cycle.queue = list(merge.queue)
+        state.remediation = cycle.as_dict()
+        self._checkpoint(state)
+        self.journal.section(f"certification gap ({role}, {unit})", decision.detail)
+        print_message(
+            f"[bold cyan]→ certification gap from the {role}: {decision.detail}[/bold cyan]", log
+        )
+        failed: tuple = ()
+        if decision.action == "dispatch":
+            failed = self._dispatch_verifiers(cycle, decision, log)
+            state.remediation = cycle.as_dict()
+            self._checkpoint(state)
+        if decision.action != "stop" and not failed:
+            return True
+        names = ", ".join(f"{i.entry}[{i.axis}]" for i in failed) or decision.detail
+        self._record_correction(
+            f"certification gap, {role} on {unit}",
+            f"These surfaces did not certify: {names}. The entry fails there or could not be "
+            f"verified, so the target must not reach those values with it: use another entry, "
+            f"bound the call, or narrow the serving envelope (a plan change).",
+        )
+        print_message(f"[bold red]✘ certification gap not closed: {names}[/bold red]", log)
+        return False
 
     def _target_marker(self) -> str:
         """A cheap identity for the work under the target path, or ``""``.
@@ -2339,7 +2496,7 @@ class StaircaseOnboardWorkflow:
 
     def _delivery_report(self, state: WorkflowState):
         """The mechanical half of delivery. Cheap, and safe to repeat."""
-        return verify_delivery(
+        report = verify_delivery(
             repo_root=self.task_data["trtllm_repo_path"],
             target_rel=self._preflight.target_rel,
             family=self._preflight.family,
@@ -2351,6 +2508,16 @@ class StaircaseOnboardWorkflow:
             model_key=self._model_key(),
             accuracy_test=f"test_modeling_v2_{self._preflight.family}.py",
         )
+        return DeliveryReport(checks=(*report.checks, *self._certification_checks()))
+
+    def _certification_checks(self) -> list:
+        """Delivery checks owed to the envelope: matrix evidence and capacity constants."""
+        plan = getattr(self._preflight, "certification", None)
+        if plan is None:
+            return []
+        audit = self._capacity_audit()
+        capacity = audit.checks() if audit is not None else []
+        return [*envelope_mod.check_external_evidence(plan, self.workspace), *capacity]
 
     # ------------------------------------------------------------------ helpers
 
@@ -2809,6 +2976,21 @@ class StaircaseOnboardWorkflow:
         """
         entry = latest_entry(self.progress_path, "assembler") or {}
         reason = str(entry.get("blocked_reason", "")).strip()
+        if reason == "certification_gap":
+            units = assembly_units(self.task_data)
+            unit = units[state.unit_index] if state.unit_index < len(units) else UNIT_CORE
+            if not entry.get(remediation.CERTIFICATION_GAP_KEY):
+                print_message(
+                    "[bold red]✘ assembler blocked on a certification gap without listing "
+                    "`certification_gap`, so there is nothing to verify.[/bold red]",
+                    log,
+                )
+                self._close_run(state, log, verdict="certification-gap-unnamed")
+                return False
+            if self._fan_out_certification_gaps(state, "assembler", unit, log):
+                return True
+            self._close_run(state, log, verdict=remediation.STOP_VERIFICATION_FAILED)
+            return False
         if reason == "vocabulary_gap":
             missing = str(entry.get("missing_entry", "")).strip()
             if not missing:
@@ -2983,6 +3165,7 @@ class StaircaseOnboardWorkflow:
             f"architecture, the parallel segment, the features and the accuracy anchor.\n\n"
             f"{self._surface_block}\n"
             f"{self._runtime_block}\n"
+            f"{self._certification_block}\n"
             f"Write `{self.plan_path}` and `{self.vocabulary_path}` as your system "
             f"prompt specifies. The orchestrator parses `vocabulary.yaml` and will "
             f"refuse a malformed one, so follow the schema exactly.\n\n"
@@ -3061,12 +3244,24 @@ class StaircaseOnboardWorkflow:
             f"Load the `{item.skill}` skill before anything else.\n"
             f"{surface}"
             f"{tier}\n"
+            f"{self._smith_brief(item)}\n"
             f"{self._kernel_sources_block}\n"
             f"Read `{self.vocabulary_path}` for the computation step this entry serves "
             f"and the values this checkpoint passes it.\n\n"
             f"One run, one entry. Commit by explicit file path. "
             + self._report_instruction("smith")
             + (f"\n\n{context}\n" if context else "")
+        )
+
+    def _smith_brief(self, item: QueueItem) -> str:
+        """The entry's call sites, captured rows and integer-width probes; see `smith_brief.py`."""
+        from .smith_brief import load_queue_row, load_steps, render_smith_brief
+
+        return render_smith_brief(
+            item,
+            steps=load_steps(self.vocabulary_path),
+            plan=getattr(self._preflight, "certification", None),
+            queue_row=load_queue_row(self.vocabulary_path, item.n),
         )
 
     def _assembler_prompt(self, unit: str, turn: int) -> str:
@@ -3116,8 +3311,23 @@ class StaircaseOnboardWorkflow:
             "table, vocabulary audit and dump review are what you check against the "
             "diff.\n\n"
             "Read the diff and decide. Do not re-run the gates.\n\n"
+            + self._capacity_block()
             + self._report_instruction("reviewer")
         )
+
+    def _capacity_audit(self):
+        """The static capacity audit of the target, or None before preflight."""
+        from .capacity_audit import audit_target
+
+        plan = getattr(self._preflight, "certification", None)
+        rel = str(getattr(self._preflight, "target_rel", "") or "")
+        if plan is None or not rel:
+            return None
+        return audit_target(Path(self.task_data["trtllm_repo_path"]) / rel, plan.envelope)
+
+    def _capacity_block(self) -> str:
+        audit = self._capacity_audit()
+        return f"{self._certification_block}\n{audit.render()}\n" if audit is not None else ""
 
     #: The line every modeling_v2 target's `_emit_runtime_values` writes before
     #: its dump. Named here because the auditor has to find dumps this process
@@ -3173,6 +3383,7 @@ class StaircaseOnboardWorkflow:
             f"{summarize_for_auditor(report, self._auditor_dump())}\n"
             f"## Gates\n\n```\n{self.gate_log.render() or '(none in this process — see above)'}"
             f"\n```\n\n"
+            f"{self._certification_block}\n"
             f"Do the one check that is left: every value in the runtime-value dump "
             f"against its catalog entry's certified column, on this architecture.\n\n"
             + self._report_instruction("auditor")

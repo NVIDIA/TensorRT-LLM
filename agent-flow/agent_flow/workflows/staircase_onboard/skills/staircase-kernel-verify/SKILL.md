@@ -74,6 +74,53 @@ every existing caller is affected.
 constraint on every target that would have passed that value, and finding it
 here is far cheaper than finding it in an accuracy gate.
 
+## The surface is the envelope, at every call site's row multiple
+
+Your dispatch prompt carries a **smith brief**: the run's serving envelope and,
+for each place the target calls this entry, the rows per request it passes
+(`G`, `3·G`, `6·G`, ...; times the gather width after an attention-DP
+all-gather; `eager-only` for a site that is never captured). Certify what the
+brief lists, not what one dump showed:
+
+- every captured row count it lists, replay on new data bitwise equal to eager;
+- every eager row count up to the envelope's token budget, by the envelope
+  standard (a run at the maximum plus prefix-bitwise for grid-sized rows;
+  every bucket's edges for a kernel that picks by size);
+- pools at the largest size the GPU allocates at the envelope's settings, with
+  rows addressed at the far end.
+
+The certified column you write says the envelope and the call-site multiples
+it covers, so the auditor reads one sentence instead of re-deriving rows. A
+brief that says its call sites were ASSUMED is a prompt to check them against
+the call chain and say in your report which you found.
+
+## Integer-width boundary probes (mandatory)
+
+Every verify probes each **index-typed** argument -- offsets, indices,
+positions, page and slot tables, row counts -- at the integer-width
+boundaries, and records the outcome in the contract as a **hard limit**,
+**whether or not today's envelope reaches it**:
+
+- **2^31 elements**: an int32 element count or offset wraps;
+- **2^31 / row width rows**, for every row width the entry addresses: a row
+  index multiplied by the width in 32 bits wraps there (2^31 / 512 = 2^22
+  rows), and the kernel writes out of place without raising;
+- **2^24 + 1** for any index that passes through fp32: above 2^24 an fp32
+  integer is no longer exact.
+
+The brief lists the row counts for this entry's widths and marks any that fall
+inside the envelope. How to probe without the full allocation, and the table
+format, are in `references/integer-width-probes.md`.
+
+The reason this is mandatory rather than envelope-driven: a contract certified
+"up to the envelope of the day" stops being true the day another change
+removes the memory cap that kept the envelope small. One kernel computed its
+output offset in 32 bits and silently wrote rows at and above 2^25 out of
+place; its contract was correct for the envelope it was certified at, and a
+prefill-tiling fix that lifted a memory cap moved the reachable rows past it.
+A hard limit in the contract is what makes that change visible: **any change
+that removes a memory cap re-reads the hard limits of every entry it feeds.**
+
 ## When the surface neighbours a known intermittent defect
 
 `entry-spec.md` states the rule and the case that produced it: prove the
@@ -86,5 +133,6 @@ where a blind harness returns a confident, meaningless green.
 - entry path, the surface requested, and the verdict: already covered / newly
   certified / failed
 - the receipt as it now reads, and what the new coverage pinned
+- the hard limits the integer-width probes established
 - **what remains uncertified** on this entry — the next caller reads this
 - every claim matched against disk before sending

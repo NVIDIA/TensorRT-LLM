@@ -44,6 +44,16 @@ target, so reading the forward does not reveal them. A target once merged with
 because every *constant* it passed was inside. That is the failure this turn
 exists to prevent, and it is the one that has actually happened.
 
+**Captured rows come per call site.** An entry reached from several call sites
+is reached with several row multiples: `G` at a decode step, `(1 + draft)·G` at
+a verify step, a fraction of that on a compressed path, times the gather width
+after an attention-DP all-gather. Derive each site's multiple from the call
+chain and check `multiple x every captured G` against the certified column;
+`certification.md` lists the captured batch sizes and the envelope. A site on
+a path that is never captured (context rows only) is eager: check it against
+the eager rows up to the envelope's token budget, not against capture. Name
+the call site and its multiple in `contract_line` when you report one.
+
 Two things that are **not** coverage:
 
 - a receipt for a different architecture. Receipts are keyed by GPU arch and
@@ -99,6 +109,10 @@ Three things decide whether this round costs a whole extra cycle:
   wrong.
 
 A row missing `entry`, `arch` or `axis` cannot be dispatched and is dropped.
+
+`certification_gap` (`{{entry, values, axis, reason}}`, arch and axis
+defaulted) is accepted too and dispatched exactly like `uncovered`; use
+`uncovered` when you have the contract line, which is the better brief.
 
 ## What is not yours
 

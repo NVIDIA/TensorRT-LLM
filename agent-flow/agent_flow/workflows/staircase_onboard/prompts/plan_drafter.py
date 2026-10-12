@@ -116,6 +116,24 @@ searched, and the run stops. Do not compose the op out of smaller pieces: math
 assembled from several `catalog/torch/` mirrors is always a vocabulary gap,
 never a mirror to add.
 
+## Judge coverage against the serving envelope
+
+Your dispatch prompt carries the run's **serving envelope** and the full plan is
+in `certification.md`: the token budget per step, the batch limit, the sequence
+length, the CUDA-graph capture batches and every member the target is claimed to
+serve. A contract decides a row against **that box**, not against the
+configuration some gate will happen to launch. A row whose certified column
+covers the gate tuples and stops below the envelope is `CERT`, not `OK` — the
+values above the gate tuples are exactly the ones a deployment reaches and no
+gate does. When the envelope was DERIVED (the spec declares none), say in
+`plan.md`'s open risks that nothing above the gate tuples is certified.
+
+`plan.md` carries a short **envelope** section: the envelope as you read it,
+the members a single allocation cannot run (their evidence is owed from
+outside), and any limit the checkpoint or the runtime cannot honour — a limit
+that cannot be served is a plan change to raise now, not a finding for the
+last gate.
+
 ## The accuracy anchor
 
 The plan names the benchmark **and its protocol**. A reasoning model scored as
@@ -158,6 +176,10 @@ steps:
     entry: catalog/<category>/<name>.py     # OK and CERT rows
     contract_line: "<the contract sentence that decides coverage>"
     candidate: torch.ops.trtllm.<name>      # GAP rows
+    call_sites:                             # where the target calls the entry
+      - {{site: "<module.method, which step>", row_multiple: 1}}
+      - {{site: "<...>", row_multiple: 6, gathered: true, row_width: 512}}
+      - {{site: "<...>", eager_only: true}}
 queue:
   - {{n: 1, mode: onboard, target: <entry name>, depends_on: []}}
   - {{n: 2, mode: verify,  target: <entry name>, depends_on: [],
@@ -178,6 +200,16 @@ Rules the schema enforces, so get them right the first time:
   a whole run
 - **the two chapters do not overlap.** An entry smith onboards is tested at
   this checkpoint's values by construction, so it never also needs verifying
+- `call_sites` lists every place the target will call the entry, with the
+  rows per request it passes at a captured step: 1 for a decode step,
+  `1 + draft` at a speculative verify step, a fraction of that on a
+  compressed path, the drafter's own width for a drafter call. `gathered:
+  true` marks a call after an attention-DP all-gather (it sees every rank's
+  rows); `eager_only: true` a call on a path that is never captured (context
+  rows only); `row_width` the width the entry's offsets are computed over.
+  Each smith brief multiplies these by every captured batch size, so a site
+  missing here is a row count no smith certifies and the delivery auditor
+  finds at the end of the run
 - `depends_on` is for real ordering only (a verify row whose test state must
   be built by an onboard row first). Everything without a dependency runs
   **concurrently**, so a spurious dependency directly costs wall-clock
@@ -221,6 +253,7 @@ what you wrote in **both** files and the counts by state, and a `decision`:
 | "I'll mark everything depends_on the previous item to be safe" | Every spurious dependency serializes a batch that would have run concurrently. Order only what genuinely must be ordered. |
 | "The row's `note` says it is dspark-only" | Nothing reads notes. Put it in `unit:`, or one failed dispatch the speculator alone needed stops the run before core has started. Measured: six such rows in a 33-dispatch queue, each able to close the run. |
 | "The reviewer will catch it, ship the draft" | The reviewer gets one round. What it does not catch, the gates catch — expensively. |
+| "The contract covers what the gates run, so the row is OK" | The certified set is the serving envelope. A column that stops at the gate tuples is CERT: the values above them are the ones a deployment reaches and no gate does. |
 | "The parallel segment doesn't change the math, so the mapping is the same" | Collectives appear nowhere in the HF reference. Walk the segment separately or the assembler finds the gap mid-run. |
 """
 )

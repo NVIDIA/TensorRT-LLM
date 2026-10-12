@@ -425,11 +425,16 @@ def test_a_resume_only_auto_handles_a_vocabulary_gap():
     """
     import inspect
 
-    from agent_flow.workflows.staircase_onboard.workflow import StaircaseOnboardWorkflow
+    from agent_flow.workflows.staircase_onboard.workflow import (
+        RESUMABLE_BLOCKED_REASONS,
+        StaircaseOnboardWorkflow,
+    )
 
     source = inspect.getsource(StaircaseOnboardWorkflow._assemble_one_unit)
     head = source[: source.index("self._dispatch(")]
-    assert 'prior_reason == "vocabulary_gap"' in head
+    assert "prior_reason in RESUMABLE_BLOCKED_REASONS" in head
+    # The two reasons the orchestrator can act on itself, and no others.
+    assert RESUMABLE_BLOCKED_REASONS == ("vocabulary_gap", "certification_gap")
 
 
 # ------------------------------------------- the auditor's runtime-value dump

@@ -208,6 +208,116 @@ def parse_uncovered_rows(raw: Any) -> tuple[tuple[UncoveredRow, ...], int]:
     return tuple(rows), dropped
 
 
+# --------------------------------------------------------- certification gaps
+
+#: The typed decision field an assembler, a reviewer or an auditor uses to say
+#: "this entry is correct, but it must be certified at these values". Before
+#: it existed the only typed outcomes were a target REJECT (which re-opens the
+#: assembler for hours over what is a catalog item) or a run-ending BLOCKED,
+#: and every verify was relayed by a human. The orchestrator now fans each
+#: gap out to verify smiths itself, through the same queue the audit uses.
+CERTIFICATION_GAP_KEY = "certification_gap"
+
+#: Roles whose decision may carry a gap.
+CERTIFICATION_GAP_ROLES: tuple[str, ...] = ("assembler", "reviewer", "auditor")
+
+#: The axis a gap row gets when it names none: "the serving envelope", which is
+#: what an entry is certified over.
+DEFAULT_GAP_AXIS = "envelope"
+
+#: Keys a gap row may carry. Only `entry` is required: the arch defaults to the
+#: run's, and the axis to the envelope.
+CERTIFICATION_GAP_FIELDS: tuple[str, ...] = (
+    "entry",
+    "values",
+    "value",
+    "axis",
+    "arch",
+    "reason",
+    "contract_line",
+)
+
+
+def normalize_certification_gap_records(raw: Any) -> list[dict[str, Any]]:
+    """Normalize a decision's gap list for persistence, dropping rows with no entry.
+
+    Kept as plain dicts: this is the persistence boundary, and
+    :func:`parse_certification_gaps` turns them into typed rows.
+    """
+    if not isinstance(raw, list):
+        return []
+    rows: list[dict[str, Any]] = []
+    for row in raw:
+        if not isinstance(row, Mapping):
+            continue
+        entry = str(row.get("entry", "")).strip()
+        if not entry:
+            continue
+        record: dict[str, Any] = {"entry": entry}
+        values = row.get("values")
+        if values is None:
+            values = row.get("value")
+        if isinstance(values, (str, int, float)):
+            values = [values]
+        if isinstance(values, Sequence) and not isinstance(values, (str, bytes)):
+            record["values"] = [str(v).strip() for v in values if str(v).strip()]
+        for key in ("axis", "arch", "reason", "contract_line"):
+            text = str(row.get(key, "") or "").strip()
+            if text:
+                record[key] = text
+        rows.append(record)
+    return rows
+
+
+def parse_certification_gaps(
+    raw: Any, *, default_arch: str
+) -> tuple[tuple[UncoveredRow, ...], int]:
+    """Turn a decision's ``certification_gap`` list into dispatchable rows.
+
+    Returns the rows and how many were dropped (no entry), so the caller can
+    say so. The reason travels as the contract line: it is what the verify
+    smith reads to know why the surface is needed.
+    """
+    if not isinstance(raw, Sequence) or isinstance(raw, (str, bytes)):
+        return (), 0
+    rows: list[UncoveredRow] = []
+    dropped = 0
+    for candidate in raw:
+        if not isinstance(candidate, Mapping) or not str(candidate.get("entry", "")).strip():
+            dropped += 1
+            continue
+        reason = str(candidate.get("reason", "") or candidate.get("contract_line", "")).strip()
+        row = UncoveredRow.parse(
+            {
+                "entry": candidate.get("entry"),
+                "arch": str(candidate.get("arch", "") or default_arch),
+                "axis": str(candidate.get("axis", "") or DEFAULT_GAP_AXIS),
+                "values": candidate.get("values", candidate.get("value")),
+                "contract_line": reason,
+            }
+        )
+        if row is None:
+            dropped += 1
+        else:
+            rows.append(row)
+    return tuple(rows), dropped
+
+
+def parse_audit_rows(
+    entry: Mapping[str, Any], *, default_arch: str
+) -> tuple[tuple[UncoveredRow, ...], int]:
+    """An auditor's ``uncovered`` rows and its ``certification_gap`` rows, together.
+
+    The two say the same thing -- a surface outside its certified column --
+    and are dispatched by the same cycle.
+    """
+    uncovered, dropped = parse_uncovered_rows(entry.get("uncovered"))
+    gaps, gap_dropped = parse_certification_gaps(
+        entry.get(CERTIFICATION_GAP_KEY), default_arch=default_arch
+    )
+    return (*uncovered, *gaps), dropped + gap_dropped
+
+
 # ---------------------------------------------------------------------- items
 
 
@@ -578,6 +688,61 @@ def decide_round(
     )
 
 
+def decide_gap_dispatch(
+    merge: MergeOutcome,
+    *,
+    budget: RemediationBudget,
+    incoming: Sequence[RemediationItem],
+) -> RoundDecision:
+    """What to do with the certification gaps one decision reported.
+
+    Not :func:`decide_round`: a gap arrives mid-assembly, not from an audit
+    round, so it spends no round budget and there is no previous signature to
+    converge against. The rules that remain:
+
+    - a surface already certified is not re-dispatched -- the reporter misread
+      a contract, and the detail says so -- and does not stop anything;
+    - a surface whose verify already failed, or that is over the item budget,
+      cannot be dispatched again: ``stop``, because the unit needs a surface
+      the catalog cannot give it and that is a plan change;
+    - everything new or widened is dispatched, capped at
+      ``max_parallel_verifiers`` concurrent smiths.
+    """
+    wanted = {item.group_key for item in incoming}
+    dispatch = tuple(
+        item for item in merge.queue if item.group_key in wanted and item.status in OPEN_STATES
+    )
+    notes: list[str] = []
+    if merge.regressions:
+        names = ", ".join(f"{i.entry}[{i.axis}]" for i in merge.regressions[:4])
+        notes.append(
+            f"{len(merge.regressions)} already certified by an earlier verify, not re-dispatched "
+            f"({names}): re-read the contract"
+        )
+    if merge.duplicates:
+        notes.append(f"{len(merge.duplicates)} already queued")
+    if merge.exhausted:
+        names = ", ".join(f"{i.entry}[{i.axis}]" for i in merge.exhausted[:4])
+        return RoundDecision(
+            action="stop",
+            verdict=STOP_VERIFICATION_FAILED,
+            detail=(
+                f"{len(merge.exhausted)} gap(s) cannot be verified again -- a previous verify "
+                f"failed or the item budget is spent: {names}"
+                + (f"; {'; '.join(notes)}" if notes else "")
+            ),
+        )
+    if not dispatch:
+        return RoundDecision(action="clean", detail="; ".join(notes) or "nothing to verify")
+    notes.insert(0, f"{len(dispatch)} verify dispatch(es)")
+    return RoundDecision(
+        action="dispatch",
+        dispatch=dispatch,
+        workers=max(1, min(budget.max_parallel_verifiers, len(dispatch))),
+        detail="; ".join(notes),
+    )
+
+
 # ------------------------------------------------------------------- outcomes
 
 #: Smith decisions that certify a surface, and the queue state each maps to.
@@ -660,6 +825,10 @@ class RemediationState:
 
 
 __all__ = [
+    "CERTIFICATION_GAP_FIELDS",
+    "CERTIFICATION_GAP_KEY",
+    "CERTIFICATION_GAP_ROLES",
+    "DEFAULT_GAP_AXIS",
     "OPEN_STATES",
     "QUEUE_BLOCKED",
     "QUEUE_CERTIFIED",
@@ -680,8 +849,12 @@ __all__ = [
     "UncoveredRow",
     "apply_outcomes",
     "canonicalize",
+    "decide_gap_dispatch",
     "decide_round",
     "merge_into_queue",
+    "normalize_certification_gap_records",
+    "parse_audit_rows",
+    "parse_certification_gaps",
     "parse_uncovered_rows",
     "unresolved_signature",
 ]

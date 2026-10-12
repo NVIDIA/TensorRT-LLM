@@ -279,6 +279,16 @@ SOURCE_EMBARGO_FIELD = "source_embargo"
 # only states one when this target is known to need a wider one.
 REMEDIATION_FIELD = "catalog_remediation"
 
+# ------------------------------------------------ envelope / matrix / certification
+# What the target is certified FOR, declared before the run: the serving
+# envelope (engine limits, capture policy, every member claimed) and the
+# feature combinations that must have engine evidence. Both are optional so an
+# existing spec still validates -- its certified set is then the hull of its
+# gate tuples, which every rendering states. The validators, the derivation and
+# the migration command live in `envelope.py`.
+SERVING_ENVELOPE_FIELD = "serving_envelope"
+FEATURE_MATRIX_FIELD = "feature_matrix"
+
 # Runtime switches the gates must exercise, and which therefore have to be
 # declared rather than left to whatever the engine defaults to.
 #
@@ -318,6 +328,8 @@ TOP_LEVEL_KEYS: tuple[str, ...] = (
     SCOPE_FIELD,
     SOURCE_EMBARGO_FIELD,
     REMEDIATION_FIELD,
+    SERVING_ENVELOPE_FIELD,
+    FEATURE_MATRIX_FIELD,
 )
 
 REMEDIATION_KEYS: tuple[str, ...] = (
@@ -1445,6 +1457,17 @@ def _require_declared_witnesses(data: Mapping[str, Any], errors: list[str]) -> N
         )
 
 
+def _validate_certification(data: Mapping[str, Any], errors: list[str]) -> None:
+    """Validate ``serving_envelope`` and ``feature_matrix``; see `envelope.py`.
+
+    Imported here rather than at module scope: `envelope` consumes this
+    schema's constants and helpers, so a top-level import would be circular.
+    """
+    from .envelope import validate_certification_blocks
+
+    validate_certification_blocks(data, errors)
+
+
 def _resolve_spec_relative_paths(data: dict[str, Any], spec_dir: Path) -> None:
     """Make paths the user writes NEXT TO the spec portable, in place.
 
@@ -1664,6 +1687,8 @@ def load_and_validate_task_yaml(path: str | Path) -> dict[str, Any]:
             errors.append(str(exc))
         _require_declared_witnesses(data, errors)
 
+    _validate_certification(data, errors)
+
     if errors:
         bullet = "\n  - "
         raise TaskSchemaError(
@@ -1712,6 +1737,8 @@ __all__ = [
     "REPLAY_WITNESS_REQUIRED",
     "EQUIVALENCE_WITNESS_FEATURES",
     "EQUIVALENCE_WITNESS_KEYS",
+    "FEATURE_MATRIX_FIELD",
+    "SERVING_ENVELOPE_FIELD",
     "WITNESS_BATCH_SIZE_KEY",
     "WITNESS_KEYS",
     "WITNESS_LEGS_ENV_KEY",

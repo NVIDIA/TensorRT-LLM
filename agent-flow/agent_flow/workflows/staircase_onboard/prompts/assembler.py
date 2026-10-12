@@ -85,6 +85,12 @@ work is acceptable at all:
    is the difference between an unsupported input and a wrong answer.
 9. **Self-containment.** No shared helpers across targets. Duplication between
    targets is the architecture, not a smell.
+10. **Every fixed size answers to an engine limit.** A constant that bounds
+    rows, tokens, batch or slots, or that sizes a buffer, is derived from an
+    engine argument at construction or declared `# capacity: <axis>` /
+    `# capacity: fixed: <why>` on its line. The orchestrator audits each one
+    against the serving envelope; unbound, or below the envelope, fails review
+    and delivery.
 
 ## The runtime-value dump
 
@@ -158,6 +164,14 @@ gets smith dispatched and you resume; a `knowledge_gap` or an
 `accuracy_shortfall` ends the run with the audit trail, because guessing at
 the first or relaxing the second is exactly what must not happen quietly.
 
+**A correct call outside its entry's certified column is a
+`certification_gap`, not a judgement call and not a reason to stop.** List
+each one -- `{{entry, values, axis, reason}}`, the reason naming the call site
+-- in `certification_gap`. With `UNIT_READY` the orchestrator dispatches the
+verify smiths and gates the unit; with `BLOCKED` and `blocked_reason:
+certification_gap` (only when you genuinely cannot go on without the answer)
+it verifies first and resumes you. Either way nobody has to relay it.
+
 ## Your report
 
 The skill specifies it in full. At minimum: the target path; the **derivation
@@ -188,7 +202,9 @@ disprove it.
 | "A shared helper for future targets would be cleaner" | Self-containment is the architecture. Everything lives in the target dir. |
 | "Skip the boot gate, the accuracy gate is the real one" | The ladder exists to make iteration cheap. Boot first, always. |
 | "The fused kernel is missing; I can compose it from torch mirrors" | Composing math from mirrors is always a vocabulary gap. A *single* torch callable may be a mirror, but only once a closed search shows no engine op serves it. |
+| "This value is outside the contract, so I'll block on it" | It is a `certification_gap` row. The orchestrator verifies it while the unit is gated; BLOCKED is for when you cannot write the unit without the answer. |
 | "I'm not sure this value is certified — flag it for verify" | Read the contract. It is written to be sufficient alone. Flag it only once you have established it is not covered. |
+| "8192 rows is plenty for this buffer" | Plenty for the gates is not the envelope. Size it from `max_num_tokens` or declare `# capacity: max_num_tokens` and let the audit prove it. |
 | "Let me reformat before I report" | One lint pass, at delivery. Reformatting every turn is how a run spends its budget on whitespace. |
 | "Three failed fixes, but the fourth idea is good" | Stop and report. Three hypothesis-backed fixes without movement means the hypothesis space is wrong, and the next person needs the audit trail more than the fourth attempt. |
 """

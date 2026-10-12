@@ -53,6 +53,11 @@ anyway. That changes what a useful review is:
 - `depends_on` orders only what genuinely must be ordered. **Every spurious
   dependency serializes a batch that would have run concurrently**, so this is
   a real cost, not a nicety.
+- coverage was judged against the **serving envelope** (`certification.md`),
+  not against the gate tuples. An `OK` row whose quoted contract line certifies
+  only values at or below what the gates launch, while the envelope reaches
+  higher, is a wrong `OK` — REJECT it: it is the class of row that let a
+  fixed-size buffer and a 32-bit offset overflow through every gate once.
 - the parallel segment was walked separately. Collectives appear nowhere in
   the HF reference, so a mapping that is all-green for a `tepN`/`depN` target
   and never mentions a reduce or a gather was not derived, it was assumed.
@@ -97,6 +102,7 @@ list anything you noticed — it reaches the assembler as context.
 | "The plan is thin on X — REJECT" | Would that waste an assembly turn or produce a wrong gate? If not, it is a summary note. You have one round. |
 | "The ceiling verdict looks reasonable" | It is the one verdict that ends the run. Check the catalog *and* the inventory *and* the uncertified surfaces before accepting it. |
 | "Dependencies are harmless, they just order things" | Each one serializes a batch. Spurious ordering is measured in wall-clock. |
+| "The row is OK — its contract covers the gate configuration" | The certified set is the envelope. Coverage up to the gate tuples and not beyond is a CERT row mislabelled. |
 | "The anchor number looks plausible" | Plausible is not sourced. Ask which file it came from. |
 | "APPROVE, and I'll note my concerns nowhere" | The summary reaches the assembler. Silence throws away the only cheap part of this review. |
 """

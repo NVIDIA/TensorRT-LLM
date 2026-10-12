@@ -58,6 +58,12 @@ violating none of these must get a correct result.
 
 ## Notes
 Arch quirks observed in source or during testing.
+
+## Hard limits
+The integer-width boundary of every index-typed argument (2^31 elements,
+2^31 / row width rows, 2^24 + 1 through fp32), probed and recorded whether
+or not today's envelope reaches it. Table format and probing recipe:
+staircase-kernel-verify `references/integer-width-probes.md`.
 ```
 
 ### `<name>.py` — wrapper
