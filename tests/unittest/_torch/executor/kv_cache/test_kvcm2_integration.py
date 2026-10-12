@@ -1764,7 +1764,9 @@ def test_generation_dummy_uses_available_capacity(draft_len: int) -> None:
             request_kwargs=lambda resource_manager, num_requests: {},
             position_limit=lambda: None,
             add_resources=lambda requests, resource_manager: True,
+            free_resources=lambda requests, resource_manager: None,
             get_draft_kv_cache_manager=lambda _: None,
+            release_request_state=None,
         )
         resources = ResourceManager({ResourceManagerType.KV_CACHE_MANAGER: manager})
         batch = requests.create_cuda_graph_warmup_request(

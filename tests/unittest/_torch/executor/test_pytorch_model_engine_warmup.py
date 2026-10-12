@@ -388,9 +388,9 @@ def test_compiled_mxfp8_warmup_backend_selection(
         _dummy_requests=SimpleNamespace(
             create_warmup_request=lambda resources, num_tokens, num_gen_requests: Mock(
                 num_gen_requests=num_gen_requests
-            )
+            ),
+            release_batch_context=lambda batch, resources: contextlib.nullcontext(batch),
         ),
-        _release_batch_context=lambda batch, resources: contextlib.nullcontext(batch),
         _agreement=SimpleNamespace(should_run_warmup_batch=Mock(return_value=True)),
         _release_megamoe_profiling_scratch=Mock(),
         _forward_warmup=Mock(),
@@ -617,7 +617,7 @@ def test_warmup_builders_resynchronize_stale_draft_buffers(
             resource_manager, batch_size, draft_len, max_seq_len=16
         )
 
-    with runner._release_batch_context(warmup_request, resource_manager) as batch:
+    with runner._dummy_requests.release_batch_context(warmup_request, resource_manager) as batch:
         assert batch is not None
         assert len(batch.generation_requests) == batch_size
         expected_buffer_width = config.get_runtime_tokens_per_gen_step(expected_draft_len) - 1
@@ -644,8 +644,8 @@ def test_generation_capture_passes_local_speculation_state(fails: bool) -> None:
             runner._dummy_requests, "create_cuda_graph_warmup_request", side_effect=create_request
         ),
         patch.object(
-            runner._graphs,
-            "_release_batch_context",
+            runner._dummy_requests,
+            "release_batch_context",
             side_effect=lambda request, resources: contextlib.nullcontext(request),
         ),
         patch.object(runner._graphs, "_forward_warmup", forward_warmup),
@@ -683,14 +683,14 @@ def test_warmup_phases_pass_configured_speculation_state(phase: str) -> None:
         stack.enter_context(
             patch.object(runner._dummy_requests, "create_warmup_request", Mock(return_value=batch))
         )
-        for owner in (runner._warmup, runner._graphs):
-            stack.enter_context(
-                patch.object(
-                    owner,
-                    "_release_batch_context",
-                    side_effect=lambda request, resources: contextlib.nullcontext(request),
-                )
+        stack.enter_context(
+            patch.object(
+                runner._dummy_requests,
+                "release_batch_context",
+                side_effect=lambda request, resources: contextlib.nullcontext(request),
             )
+        )
+        for owner in (runner._warmup, runner._graphs):
             stack.enter_context(patch.object(owner, "_forward_warmup", forward_warmup))
         if phase == "general":
             runner._warmup._general_warmup_impl(resource_manager, [(4, 0)])
@@ -1001,7 +1001,6 @@ class TestWarmupCleanup(unittest.TestCase):
             forward_warmup=None,
             prepare_capture_batch=None,
             capture_additional_graphs=None,
-            release_batch_context=None,
         )
         resource_manager = ResourceManager({})
         events = []
@@ -1285,14 +1284,16 @@ class TestWarmupCleanup(unittest.TestCase):
                 dist=object(),
                 guided_decoder=None,
                 _graphs=SimpleNamespace(no_cuda_graph=lambda: contextlib.nullcontext()),
-                _dummy_requests=SimpleNamespace(create_warmup_request=Mock(return_value=object())),
-                _release_batch_context=Mock(
-                    side_effect=[
-                        contextlib.nullcontext(object()),
-                        contextlib.nullcontext(object()),
-                        contextlib.nullcontext(object()),
-                        contextlib.nullcontext(object()),
-                    ]
+                _dummy_requests=SimpleNamespace(
+                    create_warmup_request=Mock(return_value=object()),
+                    release_batch_context=Mock(
+                        side_effect=[
+                            contextlib.nullcontext(object()),
+                            contextlib.nullcontext(object()),
+                            contextlib.nullcontext(object()),
+                            contextlib.nullcontext(object()),
+                        ]
+                    ),
                 ),
                 _agreement=SimpleNamespace(should_run_warmup_batch=Mock(return_value=True)),
                 _release_megamoe_profiling_scratch=Mock(),
@@ -1407,14 +1408,16 @@ class TestWarmupCleanup(unittest.TestCase):
                 dist=object(),
                 guided_decoder=None,
                 _graphs=SimpleNamespace(no_cuda_graph=lambda: contextlib.nullcontext()),
-                _dummy_requests=SimpleNamespace(create_warmup_request=Mock(return_value=object())),
-                _release_batch_context=Mock(
-                    side_effect=[
-                        contextlib.nullcontext(None),
-                        contextlib.nullcontext(None),
-                        contextlib.nullcontext(None),
-                        contextlib.nullcontext(None),
-                    ]
+                _dummy_requests=SimpleNamespace(
+                    create_warmup_request=Mock(return_value=object()),
+                    release_batch_context=Mock(
+                        side_effect=[
+                            contextlib.nullcontext(None),
+                            contextlib.nullcontext(None),
+                            contextlib.nullcontext(None),
+                            contextlib.nullcontext(None),
+                        ]
+                    ),
                 ),
                 _agreement=SimpleNamespace(should_run_warmup_batch=Mock(return_value=False)),
                 _release_megamoe_profiling_scratch=Mock(),
@@ -1514,8 +1517,10 @@ class TestWarmupCleanup(unittest.TestCase):
                 dist=dist,
                 guided_decoder=None,
                 _graphs=SimpleNamespace(no_cuda_graph=lambda: contextlib.nullcontext()),
-                _dummy_requests=SimpleNamespace(create_warmup_request=Mock(return_value=object())),
-                _release_batch_context=Mock(return_value=contextlib.nullcontext(object())),
+                _dummy_requests=SimpleNamespace(
+                    create_warmup_request=Mock(return_value=object()),
+                    release_batch_context=Mock(return_value=contextlib.nullcontext(object())),
+                ),
                 _agreement=SimpleNamespace(should_run_warmup_batch=Mock(return_value=True)),
                 _release_megamoe_profiling_scratch=Mock(),
                 _forward_warmup=Mock(),

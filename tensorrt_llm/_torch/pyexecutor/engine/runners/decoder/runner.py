@@ -202,7 +202,9 @@ class DecoderRunner(ScheduledModelRunner):
             request_kwargs=self._dummy_request_kwargs,
             position_limit=self._dummy_position_limit,
             add_resources=self._add_dummy_request_resources,
+            free_resources=self._free_dummy_request_resources,
             get_draft_kv_cache_manager=self._get_draft_kv_cache_manager,
+            release_request_state=getattr(model, "release_request_state", None),
         )
         self._init_decoder_state()
         self._inputs = DecoderInputPreparer(
@@ -238,7 +240,6 @@ class DecoderRunner(ScheduledModelRunner):
             forward_warmup=self._forward_warmup,
             prepare_capture_batch=self._prepare_capture_batch,
             capture_additional_graphs=self._capture_additional_cuda_graphs,
-            release_batch_context=self._release_batch_context,
         )
         self._warmup = DecoderWarmup(
             self._config,
@@ -256,7 +257,6 @@ class DecoderRunner(ScheduledModelRunner):
             self._graphs,
             self._inputs,
             forward_warmup=self._forward_warmup,
-            release_batch_context=self._release_batch_context,
             get_draft_kv_cache_manager=self._get_draft_kv_cache_manager,
             context_warmups_supported=self._new_extra_inputs is None,
             eager_workspace_reclaimable=self._new_extra_inputs is None,
@@ -493,30 +493,6 @@ class DecoderRunner(ScheduledModelRunner):
     ) -> None:
         """Prepare a dummy batch's request state before its graph is captured."""
 
-    @contextlib.contextmanager
-    def _release_batch_context(
-        self, batch: ScheduledRequests | None, resource_manager: ResourceManager
-    ):
-        """A context manager to automatically free resources of a dummy batch."""
-        kv_cache_manager = resource_manager.get_resource_manager(self.kv_cache_manager_key)
-        draft_kv_cache_manager = self._get_draft_kv_cache_manager(resource_manager)
-        spec_resource_manager = resource_manager.get_resource_manager(
-            ResourceManagerType.SPEC_RESOURCE_MANAGER
-        )
-        try:
-            yield batch
-        finally:
-            if batch is not None and kv_cache_manager is not None:
-                release_request_state = getattr(self.model, "release_request_state", None)
-                for req in batch.all_requests():
-                    kv_cache_manager.free_resources(req)
-                    if draft_kv_cache_manager is not None:
-                        draft_kv_cache_manager.free_resources(req)
-                    if spec_resource_manager is not None:
-                        spec_resource_manager.free_resources(req)
-                    if release_request_state is not None:
-                        release_request_state(req.py_request_id)
-
     def _dummy_request_kwargs(
         self, resource_manager: ResourceManager, num_requests: int
     ) -> dict[str, Any]:
@@ -533,6 +509,11 @@ class DecoderRunner(ScheduledModelRunner):
     ) -> bool:
         """Allocate resources dummy requests need beyond the KV caches."""
         return True
+
+    def _free_dummy_request_resources(
+        self, requests: list[LlmRequest], resource_manager: ResourceManager
+    ) -> None:
+        """Free what ``_add_dummy_request_resources`` allocated."""
 
     def _sync_group_all_greedy_sample(self, spec_metadata) -> None:
         """All-gather the per-rank greedy flags and store the group AND.

@@ -3,12 +3,13 @@
 
 """Dummy requests for decoder warmup and CUDA graph capture."""
 
+import contextlib
 import math
-from collections.abc import Callable
+from collections.abc import Callable, Iterator, Sequence
 from typing import Any
 
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
-from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
+from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
     KVCacheManager,
     ResourceManager,
@@ -42,9 +43,11 @@ class DummyRequestFactory:
         request_kwargs: Callable[[ResourceManager, int], dict[str, Any]],
         position_limit: Callable[[], int | None],
         add_resources: Callable[[list[LlmRequest], ResourceManager], bool],
+        free_resources: Callable[[list[LlmRequest], ResourceManager], None],
         get_draft_kv_cache_manager: Callable[
             [ResourceManager], KVCacheManager | KVCacheManagerV2 | None
         ],
+        release_request_state: Callable[[int], None] | None,
     ) -> None:
         self._config = config
         self.kv_cache_manager_key = kv_cache_manager_key
@@ -53,7 +56,9 @@ class DummyRequestFactory:
         self._dummy_request_kwargs = request_kwargs
         self._dummy_position_limit = position_limit
         self._add_dummy_request_resources = add_resources
+        self._free_dummy_request_resources = free_resources
         self._get_draft_kv_cache_manager = get_draft_kv_cache_manager
+        self._release_request_state = release_request_state
 
     @staticmethod
     def _apply_chunk_alignment(
@@ -261,8 +266,15 @@ class DummyRequestFactory:
         draft_len: int,
         max_seq_len: int = None,
         force_non_greedy: bool = False,
+        context_token_nums: Sequence[int] = (),
+        context_request_kwargs: dict[str, Any] | None = None,
     ) -> ScheduledRequests | None:
-        """Creates a dummy ScheduledRequests tailored for CUDA graph capture."""
+        """Creates a dummy ScheduledRequests tailored for CUDA graph capture.
+
+        With ``context_token_nums``, the first rows are context requests of
+        those lengths, created with ``context_request_kwargs``; the rest are
+        generation requests.
+        """
         capture_sampling_params = NON_GREEDY_CAPTURE_SAMPLING_PARAMS if force_non_greedy else None
         kv_cache_manager = resource_manager.get_resource_manager(self.kv_cache_manager_key)
         if getattr(kv_cache_manager, "context_swa_layer_limit", None) is not None:
@@ -276,11 +288,33 @@ class DummyRequestFactory:
         result = ScheduledRequests()
         runtime_tokens_per_gen_step = self.get_runtime_tokens_per_gen_step(draft_len)
         runtime_draft_token_buffer_width = runtime_tokens_per_gen_step - 1
+        num_contexts = len(context_token_nums)
+        if num_contexts >= batch_size:
+            return None
 
-        # Add (batch_size - 1) dummy requests with the minimal sequence length.
-        num_fillers = batch_size - 1
+        context_requests = []
+        if num_contexts:
+            # Mixed capture must create its context rows as real context
+            # requests; converting generation dummies afterward leaves their
+            # native prompt/context bookkeeping at one token.
+            context_requests = kv_cache_manager.add_dummy_requests(
+                list(range(num_contexts)),
+                token_nums=list(context_token_nums),
+                is_gen=False,
+                max_num_draft_tokens=runtime_draft_token_buffer_width,
+                kv_reserve_draft_tokens=self._config.max_draft_loop_tokens,
+                use_mrope=self._config.use_mrope,
+                max_beam_width=self._config.max_beam_width,
+                draft_kv_cache_manager=draft_kv_cache_manager,
+                **(context_request_kwargs or {}),
+            )
+            if context_requests is None:
+                return None
+
+        # Fill all rows but the longest with minimal-length generation requests.
+        num_fillers = batch_size - 1 - num_contexts
         requests = kv_cache_manager.add_dummy_requests(
-            list(range(num_fillers)),
+            list(range(num_contexts, batch_size - 1)),
             token_nums=(
                 None
                 if self._dummy_request_tokens is None
@@ -296,7 +330,12 @@ class DummyRequestFactory:
             **self._dummy_request_kwargs(resource_manager, num_fillers),
         )
         if requests is None:
+            for request in context_requests:
+                kv_cache_manager.free_resources(request)
+                if draft_kv_cache_manager is not None:
+                    draft_kv_cache_manager.free_resources(request)
             return None
+        requests = context_requests + requests
 
         max_seq_len_request = self.add_longest_dummy_request(
             resource_manager,
@@ -309,10 +348,21 @@ class DummyRequestFactory:
         if max_seq_len_request is None:
             return None
 
-        # Insert the longest request first to simulate padding for the CUDA
-        # graph.
-        requests.insert(0, max_seq_len_request)
-        result.generation_requests = requests
+        if num_contexts:
+            requests.append(max_seq_len_request)
+            for request, token_num in zip(requests, context_token_nums):
+                request.state = LlmRequestState.CONTEXT_INIT
+                request.context_current_position = 0
+                request.context_chunk_size = token_num
+                request.cached_tokens = 0
+                request.py_batch_idx = None
+            result.context_requests_last_chunk = requests[:num_contexts]
+            result.generation_requests = requests[num_contexts:]
+        else:
+            # Insert the longest request first to simulate padding for the CUDA
+            # graph.
+            requests.insert(0, max_seq_len_request)
+            result.generation_requests = requests
         return self.finish_cuda_graph_warmup_request(
             result, resource_manager, batch_size, draft_len
         )
@@ -402,6 +452,7 @@ class DummyRequestFactory:
         if spec_resource_manager is not None:
             spec_resource_manager.add_dummy_requests(request_ids=list(range(batch_size)))
         if not self._add_dummy_request_resources(result.all_requests(), resource_manager):
+            self._free_requests(result.all_requests(), resource_manager)
             return None
         resolve_draft_len(
             self._config.spec_config,
@@ -411,3 +462,33 @@ class DummyRequestFactory:
             draft_len=draft_len,
         )
         return result
+
+    @contextlib.contextmanager
+    def release_batch_context(
+        self, batch: ScheduledRequests | None, resource_manager: ResourceManager
+    ) -> Iterator[ScheduledRequests | None]:
+        """A context manager to automatically free resources of a dummy batch."""
+        try:
+            yield batch
+        finally:
+            if batch is not None:
+                requests = batch.all_requests()
+                self._free_dummy_request_resources(requests, resource_manager)
+                self._free_requests(requests, resource_manager)
+
+    def _free_requests(self, requests: list[LlmRequest], resource_manager: ResourceManager) -> None:
+        kv_cache_manager = resource_manager.get_resource_manager(self.kv_cache_manager_key)
+        if kv_cache_manager is None:
+            return
+        draft_kv_cache_manager = self._get_draft_kv_cache_manager(resource_manager)
+        spec_resource_manager = resource_manager.get_resource_manager(
+            ResourceManagerType.SPEC_RESOURCE_MANAGER
+        )
+        for req in requests:
+            kv_cache_manager.free_resources(req)
+            if draft_kv_cache_manager is not None:
+                draft_kv_cache_manager.free_resources(req)
+            if spec_resource_manager is not None:
+                spec_resource_manager.free_resources(req)
+            if self._release_request_state is not None:
+                self._release_request_state(req.py_request_id)

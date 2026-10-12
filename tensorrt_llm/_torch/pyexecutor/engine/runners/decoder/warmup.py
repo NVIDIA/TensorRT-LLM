@@ -9,7 +9,6 @@ import contextlib
 import gc
 import os
 from collections.abc import Callable
-from contextlib import AbstractContextManager
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -249,10 +248,6 @@ class DecoderWarmup:
         inputs: DecoderInputPreparer,
         *,
         forward_warmup: Callable[..., Any],
-        release_batch_context: Callable[
-            [ScheduledRequests | None, ResourceManager],
-            AbstractContextManager[ScheduledRequests | None],
-        ],
         get_draft_kv_cache_manager: Callable[
             [ResourceManager], KVCacheManager | KVCacheManagerV2 | None
         ],
@@ -274,7 +269,6 @@ class DecoderWarmup:
         self._graphs = graphs
         self._inputs = inputs
         self._forward_warmup = forward_warmup
-        self._release_batch_context = release_batch_context
         self._get_draft_kv_cache_manager = get_draft_kv_cache_manager
         # Warmups that synthesize context batches.
         self._context_warmups_supported = context_warmups_supported
@@ -785,7 +779,7 @@ class DecoderWarmup:
             if self.mapping.has_cp_helix() and num_tokens != num_gen_tokens:
                 continue
             try:
-                with self._release_batch_context(
+                with self._dummy_requests.release_batch_context(
                     self._dummy_requests.create_warmup_request(
                         resource_manager, num_tokens, num_gen_tokens
                     ),
@@ -903,7 +897,9 @@ class DecoderWarmup:
 
             with (
                 self._graphs.no_cuda_graph(),
-                self._release_batch_context(warmup_request, resource_manager) as batch,
+                self._dummy_requests.release_batch_context(
+                    warmup_request, resource_manager
+                ) as batch,
             ):
                 if not self._agreement.should_run_warmup_batch(
                     batch,
@@ -1063,7 +1059,9 @@ class DecoderWarmup:
                     warmup_request = self._dummy_requests.create_warmup_request(
                         resource_manager, num_tokens, num_gen_requests
                     )
-                    with self._release_batch_context(warmup_request, resource_manager) as batch:
+                    with self._dummy_requests.release_batch_context(
+                        warmup_request, resource_manager
+                    ) as batch:
                         if not self._agreement.should_run_warmup_batch(
                             batch,
                             num_tokens,
@@ -1301,7 +1299,9 @@ class DecoderWarmup:
                         continue
 
                     try:
-                        with self._release_batch_context(warmup_request, resource_manager) as batch:
+                        with self._dummy_requests.release_batch_context(
+                            warmup_request, resource_manager
+                        ) as batch:
                             if not self._agreement.should_run_warmup_batch(
                                 batch, num_tokens_i, shape
                             ):

@@ -400,8 +400,10 @@ def _general_warmup_engine(*, world_size: int, dwdp_size: int) -> DecoderWarmup:
     engine = _engine(world_size=world_size, dwdp_size=dwdp_size)
     engine._warmup_timer = _WarmupTimer(rank=engine.dist.rank)
     batch = object()
-    engine._dummy_requests = SimpleNamespace(create_warmup_request=mock.Mock(return_value=batch))
-    engine._release_batch_context = lambda *_a, **_kw: _released_batch(batch)
+    engine._dummy_requests = SimpleNamespace(
+        create_warmup_request=mock.Mock(return_value=batch),
+        release_batch_context=lambda *_a, **_kw: _released_batch(batch),
+    )
     return engine
 
 
@@ -454,7 +456,9 @@ def _mamba_engine(*, world_size: int = 1, dwdp_size: int = 0) -> tuple[DecoderWa
     # default, i.e. no alignment rewrite.
     engine.model = SimpleNamespace()
     batch = object()
-    engine._release_batch_context = lambda *_a, **_kw: _released_batch(batch)
+    engine._dummy_requests = SimpleNamespace(
+        release_batch_context=lambda *_a, **_kw: _released_batch(batch)
+    )
 
     cache_manager = _StandInMambaCacheManager()
     resource_manager = SimpleNamespace(
@@ -486,7 +490,7 @@ def _run_mamba_warmup(engine: DecoderWarmup, resource_manager: object) -> None:
 )
 def test_mamba_preforward_error_policy_when_alone(error: Exception, recoverable: bool) -> None:
     engine, resource_manager = _mamba_engine()
-    engine._dummy_requests = SimpleNamespace(create_warmup_request=mock.Mock(side_effect=error))
+    engine._dummy_requests.create_warmup_request = mock.Mock(side_effect=error)
     engine._forward_warmup = mock.Mock()
 
     with _no_cuda_side_effects():
@@ -504,7 +508,7 @@ def test_mamba_preforward_error_policy_when_alone(error: Exception, recoverable:
 
 def test_mamba_midforward_runtime_error_recovers_when_alone() -> None:
     engine, resource_manager = _mamba_engine()
-    engine._dummy_requests = SimpleNamespace(create_warmup_request=mock.Mock(return_value=object()))
+    engine._dummy_requests.create_warmup_request = mock.Mock(return_value=object())
     engine._forward_warmup = mock.Mock(side_effect=RuntimeError("mid-forward failure"))
 
     with _no_cuda_side_effects():
@@ -521,12 +525,10 @@ def test_mamba_error_is_fatal_when_distributed(phase: str) -> None:
     engine, resource_manager = _mamba_engine(world_size=2)
     error = RuntimeError(_KV_ALLOC_ERROR)
     if phase == "pre-forward":
-        engine._dummy_requests = SimpleNamespace(create_warmup_request=mock.Mock(side_effect=error))
+        engine._dummy_requests.create_warmup_request = mock.Mock(side_effect=error)
         engine._forward_warmup = mock.Mock()
     else:
-        engine._dummy_requests = SimpleNamespace(
-            create_warmup_request=mock.Mock(return_value=object())
-        )
+        engine._dummy_requests.create_warmup_request = mock.Mock(return_value=object())
         engine._forward_warmup = mock.Mock(side_effect=error)
 
     with _no_cuda_side_effects():

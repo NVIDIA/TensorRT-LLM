@@ -2020,7 +2020,6 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
             forward_warmup=None,
             prepare_capture_batch=None,
             capture_additional_graphs=None,
-            release_batch_context=None,
         )
 
         engine.wait_for_input_copy()

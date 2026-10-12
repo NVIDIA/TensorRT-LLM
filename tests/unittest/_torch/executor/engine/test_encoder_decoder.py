@@ -199,6 +199,11 @@ def test_encoder_decoder_runner_builds_stage_before_decoder() -> None:
         _inputs=object(),
         _buffers=object(),
         iter_states={},
+        input_processor=input_processor,
+        kv_cache_manager_key=ResourceManagerType.KV_CACHE_MANAGER,
+        _metadata=object(),
+        _dummy_requests=object(),
+        _graphs=object(),
     )
 
     def decoder_init(self, *args, **kwargs) -> None:
@@ -208,10 +213,12 @@ def test_encoder_decoder_runner_builds_stage_before_decoder() -> None:
     with (
         patch.object(encoder_decoder_module, "EncoderStage") as stage_type,
         patch.object(encoder_decoder_module, "EncoderDecoderInputPreparer") as preparer_type,
+        patch.object(encoder_decoder_module, "EncoderDecoderCudaGraphs") as graphs_type,
         patch.object(DecoderRunner, "__init__", decoder_init),
     ):
         order.attach_mock(stage_type, "stage")
         order.attach_mock(preparer_type, "inputs")
+        order.attach_mock(graphs_type, "graphs")
         stage_type.return_value._encoder_graph_shapes = shapes
         runner = EncoderDecoderRunner(
             model,
@@ -245,8 +252,22 @@ def test_encoder_decoder_runner_builds_stage_before_decoder() -> None:
             decoder_state.iter_states,
             uses_lora=ANY,
         ),
+        call.graphs(
+            config,
+            model,
+            input_processor,
+            ResourceManagerType.KV_CACHE_MANAGER,
+            shapes,
+            decoder_state._metadata,
+            decoder_state._dummy_requests,
+            decoder_state._graphs,
+            decoder_state._inputs,
+            forward_warmup=runner._forward_warmup,
+            get_draft_kv_cache_manager=runner._get_draft_kv_cache_manager,
+        ),
     ]
     assert runner._encoder_decoder_inputs is preparer_type.return_value
+    assert runner._encoder_decoder_graphs is graphs_type.return_value
 
 
 def test_encoder_decoder_runner_releases_stage_before_decoder_graphs() -> None:
@@ -302,31 +323,29 @@ def test_encoder_decoder_graph_runner_config_gates_mixed_graphs(
 
 @pytest.mark.parametrize("fails", [False, True], ids=["success", "failure"])
 def test_encoder_decoder_release_context_frees_cross_kv(fails: bool) -> None:
-    runner = object.__new__(EncoderDecoderRunner)
+    runner = _dummy_request_runner(EncoderDecoderRunner, SimpleNamespace())
     requests = [object(), object()]
     batch = ScheduledRequests()
     batch.generation_requests = requests
-    cross_kv_cache_manager = Mock()
+    managers = Mock()
     resource_manager = Mock()
-    resource_manager.get_resource_manager.side_effect = lambda key: (
-        cross_kv_cache_manager if key == ResourceManagerType.CROSS_KV_CACHE_MANAGER else None
-    )
+    resource_manager.get_resource_manager.side_effect = {
+        ResourceManagerType.CROSS_KV_CACHE_MANAGER: managers.cross,
+        ResourceManagerType.KV_CACHE_MANAGER: managers.kv,
+    }.get
 
     with (
-        patch.object(
-            DecoderRunner, "_release_batch_context", return_value=nullcontext(batch)
-        ) as release_decoder,
         pytest.raises(RuntimeError) if fails else nullcontext(),
-        runner._release_batch_context(batch, resource_manager) as released,
+        _dummy_requests(runner).release_batch_context(batch, resource_manager) as released,
     ):
         assert released is batch
-        cross_kv_cache_manager.free_resources.assert_not_called()
+        assert managers.mock_calls == []
         if fails:
             raise RuntimeError("capture failure")
 
-    release_decoder.assert_called_once_with(batch, resource_manager)
-    assert cross_kv_cache_manager.free_resources.call_args_list == [
-        call(request) for request in requests
+    assert managers.mock_calls == [
+        *(call.cross.free_resources(request) for request in requests),
+        *(call.kv.free_resources(request) for request in requests),
     ]
 
 
@@ -358,12 +377,14 @@ def _dummy_requests(runner: DecoderRunner) -> DummyRequestFactory:
         request_kwargs=runner._dummy_request_kwargs,
         position_limit=runner._dummy_position_limit,
         add_resources=runner._add_dummy_request_resources,
+        free_resources=runner._free_dummy_request_resources,
         get_draft_kv_cache_manager=runner._get_draft_kv_cache_manager,
+        release_request_state=None,
     )
 
 
 def _dummy_request_resources() -> tuple[Mock, Mock]:
-    kv_cache_manager = Mock(max_seq_len=64)
+    kv_cache_manager = Mock(max_seq_len=64, context_swa_layer_limit=None)
     kv_cache_manager.get_num_available_tokens.return_value = 40
     managers = {
         ResourceManagerType.KV_CACHE_MANAGER: kv_cache_manager,
@@ -427,7 +448,6 @@ def test_longest_dummy_request_failure_frees_filler_requests() -> None:
 
 def test_mixed_warmup_request_orders_context_generation_and_longest_rows() -> None:
     runner = _dummy_request_runner(EncoderDecoderRunner, SimpleNamespace())
-    runner.get_runtime_tokens_per_gen_step = lambda draft_len: draft_len + 1
     resource_manager, kv_cache_manager = _dummy_request_resources()
     kv_cache_manager.get_num_free_blocks.return_value = 8
     contexts = [SimpleNamespace(), SimpleNamespace()]
@@ -441,11 +461,16 @@ def test_mixed_warmup_request_orders_context_generation_and_longest_rows() -> No
         return longest
 
     finish = Mock(side_effect=lambda result, *_: result)
-    runner._dummy_requests = SimpleNamespace(
-        add_longest_dummy_request=Mock(side_effect=add_longest),
-        finish_cuda_graph_warmup_request=finish,
+    requests = _dummy_requests(runner)
+    requests.add_longest_dummy_request = Mock(side_effect=add_longest)
+    requests.finish_cuda_graph_warmup_request = finish
+    batch = requests.create_cuda_graph_warmup_request(
+        resource_manager,
+        4,
+        0,
+        context_token_nums=[3, 3],
+        context_request_kwargs={"encoder_output_lens": [5, 7]},
     )
-    batch = runner._create_mixed_cuda_graph_warmup_request(resource_manager, 4, 0, [5, 7], 3)
 
     assert longest_inputs == [contexts + generations]
     assert batch.context_requests_last_chunk == contexts

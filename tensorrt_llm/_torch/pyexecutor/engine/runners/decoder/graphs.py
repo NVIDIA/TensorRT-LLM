@@ -58,7 +58,6 @@ class DecoderCudaGraphs:
         forward_warmup: Callable[..., Any],
         prepare_capture_batch: Callable[..., Any],
         capture_additional_graphs: Callable[[ResourceManager], None],
-        release_batch_context: Callable[..., Any],
     ) -> None:
         self.cuda_graph_runner = cuda_graph_runner
         self.breakable_cuda_graph_runner = breakable_cuda_graph_runner
@@ -77,7 +76,6 @@ class DecoderCudaGraphs:
         self._forward_warmup = forward_warmup
         self._prepare_capture_batch = prepare_capture_batch
         self._capture_additional_cuda_graphs = capture_additional_graphs
-        self._release_batch_context = release_batch_context
         self._force_lora_graph_for_capture: bool | None = None
 
     @property
@@ -302,7 +300,9 @@ class DecoderCudaGraphs:
                             max_seq_len,
                             force_non_greedy=force_non_greedy,
                         )
-                        with self._release_batch_context(warmup_request, resource_manager) as batch:
+                        with self._dummy_requests.release_batch_context(
+                            warmup_request, resource_manager
+                        ) as batch:
                             if batch is None:
                                 # No KV cache space for this batch size. During KV
                                 # cache estimation this makes the profiling peak
@@ -443,7 +443,9 @@ class DecoderCudaGraphs:
                 warmup_request = self._dummy_requests.create_warmup_request(
                     resource_manager, num_tokens, 0
                 )
-                with self._release_batch_context(warmup_request, resource_manager) as batch:
+                with self._dummy_requests.release_batch_context(
+                    warmup_request, resource_manager
+                ) as batch:
                     self._agreement.assert_all_tp_ranks_have_warmup_batch(batch, num_tokens)
                     if batch is None:
                         continue
@@ -495,7 +497,9 @@ class DecoderCudaGraphs:
                 warmup_request = self._dummy_requests.create_warmup_request(
                     resource_manager, num_tokens, 0, least_requests=False
                 )
-                with self._release_batch_context(warmup_request, resource_manager) as batch:
+                with self._dummy_requests.release_batch_context(
+                    warmup_request, resource_manager
+                ) as batch:
                     self._agreement.assert_all_tp_ranks_have_warmup_batch(batch, num_tokens)
                     if batch is None:
                         continue
