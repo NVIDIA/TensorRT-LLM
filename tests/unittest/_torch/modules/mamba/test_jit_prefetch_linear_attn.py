@@ -180,6 +180,44 @@ def test_chunk_index_kernel_planned(ctx_lens):
     assert real and real <= planned, f"unplanned: {sorted(real - planned)}"
 
 
+def test_provider_finds_real_gdn_and_kda_layers():
+    """Built from a model's modules (not __new__), as model_engine builds it."""
+    from transformers import Qwen3NextConfig
+
+    from tensorrt_llm._torch.model_config import ModelConfig
+    from tensorrt_llm._torch.modules.kimi_kda.kimi_kda_mixer import KimiKDALinearAttention
+    from tensorrt_llm._torch.modules.mamba.gdn_mixer import Qwen3NextGatedDeltaNet
+
+    gdn_cfg = Qwen3NextConfig(
+        hidden_size=256,
+        linear_num_value_heads=8,
+        linear_num_key_heads=4,
+        linear_key_head_dim=64,
+        linear_value_head_dim=64,
+        linear_conv_kernel_dim=4,
+        torch_dtype=torch.bfloat16,
+    )
+    gdn = Qwen3NextGatedDeltaNet(ModelConfig(pretrained_config=gdn_cfg), None, layer_idx=0)
+    kda_cfg = type(
+        "Cfg",
+        (),
+        dict(hidden_size=256, rms_norm_eps=1e-6,
+             linear_attn_config=dict(num_heads=4, head_dim=128, short_conv_kernel_size=4,
+                                     use_full_rank_gate=True, gate_lower_bound=-5.0)),
+    )()  # fmt: skip
+    kda = KimiKDALinearAttention(kda_cfg, layer_idx=1)
+    model = torch.nn.ModuleList([gdn, kda])
+
+    p = la.LinearAttnProvider(model, max_num_tokens=256, chunk_size=64)
+    assert sorted(type(s).__name__ for s in p.shapes) == ["_GdnShape", "_KdaShape"]
+    gdn_shape = next(s for s in p.shapes if isinstance(s, la._GdnShape))
+    assert (gdn_shape.k_heads, gdn_shape.v_heads, gdn_shape.k_dim, gdn_shape.v_dim) == (4, 8, 64, 64)
+    kda_shape = next(s for s in p.shapes if isinstance(s, la._KdaShape))
+    assert (kda_shape.heads, kda_shape.head_dim) == (4, 128)
+    batch = type("B", (), {"ctx_chunk_lens": [100], "gen_tokens": 0})()
+    assert p(batch), "no launches planned for a prefill batch"
+
+
 def test_enumeration_covers_chunk_index_classes():
     p = _provider([_kda()])
     planned = set()

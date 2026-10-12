@@ -102,7 +102,7 @@ class LinearAttnProvider:
     """
 
     def __init__(self, model, max_num_tokens: int = 0, chunk_size: int = 0):
-        from .gdn_mixer import GatedDeltaNet
+        from .gdn_mixer import Qwen3NextGatedDeltaNet
 
         try:
             from ..kimi_kda.kimi_kda_mixer import KimiKDALinearAttention
@@ -110,7 +110,7 @@ class LinearAttnProvider:
             KimiKDALinearAttention = ()
         shapes = {}
         for m in model.modules():
-            if isinstance(m, GatedDeltaNet):
+            if isinstance(m, Qwen3NextGatedDeltaNet):
                 s = _GdnShape(m)
             elif KimiKDALinearAttention and isinstance(m, KimiKDALinearAttention):
                 s = _KdaShape(m)
