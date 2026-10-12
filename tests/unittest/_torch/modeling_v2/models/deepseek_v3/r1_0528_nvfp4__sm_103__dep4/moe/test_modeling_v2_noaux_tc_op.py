@@ -35,7 +35,7 @@ def test_certified_cells(cell) -> None:
     # not, and a near-miss here is a different set of experts, not a rounding.
     assert torch.equal(ids, ref_ids), "selected experts differ from the reference"
     assert ids.dtype is torch.int32
-    op.compare(weights, ref_weights)
+    torch.testing.assert_close(weights, ref_weights)
 
 
 def test_the_sigmoid_is_the_tanh_form() -> None:
@@ -53,7 +53,7 @@ def test_the_sigmoid_is_the_tanh_form() -> None:
     bias = torch.zeros(experts, dtype=torch.float32, device="cuda")
     weights, _ = op(logits, bias, 1, 1, 2, 1.0)
     ref_weights, _ = op.reference(logits, bias, 1, 1, 2, 1.0)
-    op.compare(weights, ref_weights)
+    torch.testing.assert_close(weights, ref_weights)
 
 
 def _ok():

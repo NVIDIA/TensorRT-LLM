@@ -156,9 +156,13 @@ def _assert_bitwise(out: torch.Tensor, ref: torch.Tensor, where: str) -> None:
     Tightened from the default dtype-aware tolerances rather than loosened —
     a gather computes nothing, so any difference at all is a wrong gather.
     """
-    # The gate itself is the entry's `compare`; `where` only labels the failure.
     try:
-        entry.allgather.compare(out, ref)
+        assert out.dtype == ref.dtype, (out.dtype, ref.dtype)
+        assert out.shape == ref.shape, (out.shape, ref.shape)
+        if out.dtype is torch.float8_e4m3fn:
+            # assert_close has no e4m3 band; a byte view is the exact gate anyway.
+            out, ref = (out.view(torch.uint8), ref.view(torch.uint8))
+        torch.testing.assert_close(out, ref, rtol=0, atol=0)
     except AssertionError as exc:
         raise AssertionError(f"{where}: {exc}") from exc
 
@@ -946,7 +950,7 @@ def _run_one_rank() -> int:
     # the certified shape, and the wrapper hands the boxed group to the _pg
     # symbol -- the same routing the product's non-MPI mode does in
     # _torch/distributed/ops.py. The partial is only the call surface: the
-    # guard is armed on the entry itself, and `reference`, `compare` and
+    # guard is armed on the entry itself, and `reference` and
     # `CELLS` are read off `entry.allgather` directly.
     PG_BOXED = dist.distributed_c10d._get_default_group().boxed()
     allgather = functools.partial(entry.allgather, process_group=PG_BOXED)

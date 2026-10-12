@@ -10,9 +10,27 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.gpt_oss.gpt_oss_120b__
 )
 
 __extra_import_path__ = ["../../../.."]
-from _validating import validating  # noqa: E402 — needs the path declared above
+from _validating import assert_within_ulp, validating  # noqa: E402 — needs the path declared above
 
 assert torch.cuda.is_available(), "fused_qk_norm_rope requires a CUDA device"
+
+
+def _compare(out: torch.Tensor, ref: torch.Tensor) -> None:
+    """A rotation is a two-term combination, and two terms can cancel.
+
+    `x1 * cos - x2 * sin` goes to zero wherever the two products nearly
+    match, and there torch's per-element rtol is meaningless: at 2048 tokens
+    roughly 2e-4 of the outputs land close enough that a 7.3e-4 absolute
+    difference reads as a relative difference of 23. The decode and 37-token
+    cells pass under torch's default band only because they are too small to
+    sample one.
+
+    So: 2 ulp element-wise against the row scale, 1 of relative RMS -- tight,
+    because one rotation is the shortest chain in this catalog. Measured
+    worst case across these cells is 7.3e-4 absolute at a row scale of ~4,
+    about 0.05 ulp.
+    """
+    assert_within_ulp(out, ref, element_ulp=2.0, rms_ulp=1.0)
 
 
 def _build(spec, seed):
@@ -41,7 +59,7 @@ def test_certified_cells(cell) -> None:
     with validating(op):
         out = op(qkv, **kwargs)
         assert out is qkv, "the op writes in place"
-    op.compare(qkv, ref)
+    _compare(qkv, ref)
 
 
 def test_the_v_heads_are_left_alone() -> None:

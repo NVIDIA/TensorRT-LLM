@@ -15,6 +15,20 @@ from _validating import validating  # noqa: E402 — needs the path declared abo
 assert torch.cuda.is_available(), "mxfp8_quantize requires a CUDA device"
 
 
+def _compare(out: torch.Tensor, ref: torch.Tensor) -> None:
+    """Bit-exact.
+
+    Both sides compute the same power-of-two scale and the same e4m3
+    rounding, so any difference is a defect rather than accumulated error.
+    fp8 and uint8 both compare as bytes.
+    """
+    assert out.dtype == ref.dtype, (out.dtype, ref.dtype)
+    assert out.shape == ref.shape, (out.shape, ref.shape)
+    assert torch.equal(out.view(torch.uint8), ref.view(torch.uint8)), (
+        "quantization is deterministic; a mismatch is a defect, not drift"
+    )
+
+
 def _build(spec, seed):
     g = torch.Generator(device="cuda").manual_seed(seed)
     return torch.randn(spec["shape"], generator=g, device="cuda").to(spec["dtype"])
@@ -27,8 +41,8 @@ def test_certified_cells(cell) -> None:
     with validating(op):
         data, scales = op(x, swizzled, alignment)
     ref_data, ref_scales = op.reference(x, swizzled, alignment)
-    op.compare(data, ref_data)
-    op.compare(scales, ref_scales)
+    _compare(data, ref_data)
+    _compare(scales, ref_scales)
 
 
 def test_the_quantization_round_trips_within_the_block_bound() -> None:

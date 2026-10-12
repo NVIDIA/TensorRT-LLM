@@ -8,7 +8,7 @@ import torch
 
 import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtllm.*
 
-from .._op import ULP, Arch, Cell, OpWrapper, assert_within_ulp, true_fp32_matmul
+from .._op import Arch, Cell, OpWrapper, true_fp32_matmul
 
 
 class CublasMm(OpWrapper):
@@ -104,27 +104,6 @@ class CublasMm(OpWrapper):
             assert bias.shape == (mat_b.shape[1],) and bias.is_contiguous(), (
                 "bias must be a contiguous [N] tensor"
             )
-
-    def compare(self, out: torch.Tensor, ref: torch.Tensor) -> None:
-        """One GEMM's worth of accumulation-order difference.
-
-        Kernel and reference consume bit-identical operands and differ only in
-        the order cuBLAS and torch sum over K. Over random operands a few
-        outputs land near zero, where that reordering shows up as a relative
-        difference of 10 on an absolute difference of 1.5e-4 -- which is what
-        torch's default band rejects, and what no bf16 result could represent
-        anyway: one ulp at these rows' scale is about 6e-1.
-
-        So: 4 ulp element-wise against the row scale, 2 ulp of relative RMS.
-        Measured worst case across this entry's cells is 1.5e-4 absolute, or
-        roughly 3e-4 ulp -- four orders of margin, and a band that a genuinely
-        wrong product would miss by orders rather than squeak past.
-        """
-        # Scored in bf16 ulp even when the output is fp32: every cell's
-        # operands are bf16, so the fp32 out_dtype the router asks for is a
-        # wider container for a bf16-limited product, not a more precise one.
-        # Against fp32's own ulp the same 2.4e-6 difference reads as 5x over.
-        assert_within_ulp(out, ref, element_ulp=4.0, rms_ulp=2.0, ulp=ULP[torch.bfloat16])
 
 
 cublas_mm = CublasMm()

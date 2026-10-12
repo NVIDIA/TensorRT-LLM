@@ -5,7 +5,7 @@ with a gated activation between them + routing-weighted combine, in one call.
 
 Everything a target author needs is below and all of it is checked: what the
 op computes (`reference`), what it refuses (`is_valid`), how close the two
-must be and why (`compare`), and the range CI drives (`CELLS`).
+must be and why (the test's `_compare`), and the range CI drives (`CELLS`).
 """
 
 from __future__ import annotations
@@ -273,40 +273,6 @@ class FusedMoe(OpWrapper):
             )
             out.index_add_(0, tok, y * weight.unsqueeze(1))
         return out.to(input.dtype)
-
-    #: Relative distance between neighbouring representable values
-    #: (1 + 2^-m for m stored mantissa bits): bf16 has 7, fp16 has 10.
-    _ULP = {torch.bfloat16: 2.0**-8, torch.float16: 2.0**-11}
-
-    def compare(self, out: torch.Tensor, ref: torch.Tensor) -> None:
-        """Wider than the base default, with the derivation rather than a number.
-
-        Kernel and reference consume bit-identical operands and differ only in
-        GEMM accumulation order and in which side of a rounding boundary each
-        intermediate lands -- one flipped intermediate moves an output element
-        by about one ulp of that row\'s scale. torch\'s default cannot express
-        that: its bf16 `atol=1e-5` sits three orders of magnitude below one
-        output ulp of a two-GEMM chain, and per-element `rtol` is meaningless
-        where cancellation drives `|ref|` to zero.
-
-        So: 8 ulp of the row\'s largest magnitude element-wise, 4 ulp of
-        relative RMS in aggregate. Measured worst case across everything this
-        entry drives is 3.98 / 1.43 ulp once the whole tactic space is walked
-        -- 2.0x and 2.8x margin. Both gates were sized against deliberately
-        wrong computations, which land two orders of magnitude out.
-        """
-        assert out.dtype == ref.dtype, (out.dtype, ref.dtype)
-        assert out.shape == ref.shape, (out.shape, ref.shape)
-        ulp = self._ULP[ref.dtype]
-        row_scale = ref.float().abs().amax(dim=1, keepdim=True).clamp_min(1e-9)
-        torch.testing.assert_close(
-            out.float() / row_scale, ref.float() / row_scale, rtol=0.0, atol=8 * ulp
-        )
-        rel_rms = (
-            (out.float() - ref.float()).pow(2).mean().sqrt()
-            / ref.float().pow(2).mean().sqrt().clamp_min(1e-9)
-        ).item()
-        assert rel_rms <= 4 * ulp, f"relative RMS {rel_rms:.3e} > {4 * ulp:.3e}"
 
 
 fused_moe = FusedMoe()

@@ -17,7 +17,7 @@ import torch
 
 from tensorrt_llm.bindings.internal import thop
 
-from .._op import ULP, Arch, Cell, OpWrapper, assert_within_ulp
+from .._op import Arch, Cell, OpWrapper
 
 #: attention_input_type. 0 is the standard append-and-attend path; 1 and 2 are
 #: MLA's context and generation phases.
@@ -509,21 +509,6 @@ class ThopAttention(OpWrapper):
             low = 0 if window is None else max(0, high - window)
             keep[i, low:high] = True
         return keep
-
-    def compare(self, out: torch.Tensor, ref: torch.Tensor) -> None:
-        """A softmax chain, so the band is the longest in this catalog.
-
-        Attention accumulates twice -- once over the KV range inside the
-        softmax, once over the same range in the value product -- and the
-        kernel splits both differently from a single fp32 pass. 8 ulp
-        element-wise against the row scale and 4 of relative RMS, the same band
-        a two-GEMM MoE chain gets, and for the same reason.
-
-        Scored in bf16 ulp whatever the output dtype: on the fp8 paths the
-        operands are e4m3 and the accumulation is bf16-limited, so fp32's ulp
-        would measure the container.
-        """
-        assert_within_ulp(out, ref, element_ulp=8.0, rms_ulp=4.0, ulp=ULP[torch.bfloat16])
 
     def is_valid(
         self,

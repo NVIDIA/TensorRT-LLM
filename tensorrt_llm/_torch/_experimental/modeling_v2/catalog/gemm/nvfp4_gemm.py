@@ -8,7 +8,7 @@ import torch
 
 import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtllm.*
 
-from .._op import ULP, Arch, Cell, OpWrapper, assert_within_ulp
+from .._op import Arch, Cell, OpWrapper
 
 _VEC = 16
 
@@ -155,19 +155,6 @@ class Nvfp4Gemm(OpWrapper):
         scale = swizzled_sf.reshape(-1)[index].reshape(rows, cols)
         scale = scale.view(torch.float8_e4m3fn).float()
         return value * scale.repeat_interleave(_VEC, dim=-1)
-
-    def compare(self, out: torch.Tensor, ref: torch.Tensor) -> None:
-        """Two fp4 operands accumulated over K, so the band is the operands'.
-
-        The values are exact on both sides -- e2m1 codes and e4m3 scales decode
-        to the same numbers -- and the only difference is the order K is summed
-        in. Over a K of 7168 a few outputs cancel toward zero, where torch's
-        per-element rtol is meaningless. Scored in bf16 ulp because that is what
-        the output is asked to hold; 8 ulp element-wise and 4 of relative RMS,
-        the same band a two-GEMM chain gets, because the fp4 operands make each
-        product coarser than a bf16 one.
-        """
-        assert_within_ulp(out, ref, element_ulp=8.0, rms_ulp=4.0, ulp=ULP[torch.bfloat16])
 
     def is_valid(
         self,

@@ -3,7 +3,7 @@
 """GPU test for the fused_moe catalog entry.
 
 The entry owns the contract: `fused_moe.CELLS` is what is certified,
-`reference` is what it is certified against, and `compare` is the band. This
+`reference` is what it is certified against, and `_compare` below is the band. This
 file owns what a cell cannot carry -- building 5.6 GB of weights once and
 reusing them, and the hazards, which are claims about inputs no cell
 describes.
@@ -18,7 +18,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.deepseek_v3.r1_0528_nv
 from tensorrt_llm._torch.autotuner import AutoTuner, autotune
 
 __extra_import_path__ = ["../../../.."]
-from _validating import validating  # noqa: E402 — needs the path declared above
+from _validating import ULP, validating  # noqa: E402 — needs the path declared above
 
 assert torch.cuda.is_available(), "fused_moe requires a CUDA device"
 
@@ -26,6 +26,37 @@ DEV = "cuda"
 # The reference GEMMs must be true fp32; TF32 would leave the reference with
 # 10 mantissa bits, coarser than the bf16 output it is meant to bound.
 torch.backends.cuda.matmul.allow_tf32 = False
+
+
+def _compare(out: torch.Tensor, ref: torch.Tensor) -> None:
+    """Wider than torch's default band, with the derivation rather than a number.
+
+    Kernel and reference consume bit-identical operands and differ only in
+    GEMM accumulation order and in which side of a rounding boundary each
+    intermediate lands -- one flipped intermediate moves an output element
+    by about one ulp of that row's scale. torch's default cannot express
+    that: its bf16 `atol=1e-5` sits three orders of magnitude below one
+    output ulp of a two-GEMM chain, and per-element `rtol` is meaningless
+    where cancellation drives `|ref|` to zero.
+
+    So: 8 ulp of the row's largest magnitude element-wise, 4 ulp of
+    relative RMS in aggregate. Measured worst case across everything this
+    entry drives is 3.98 / 1.43 ulp once the whole tactic space is walked
+    -- 2.0x and 2.8x margin. Both gates were sized against deliberately
+    wrong computations, which land two orders of magnitude out.
+    """
+    assert out.dtype == ref.dtype, (out.dtype, ref.dtype)
+    assert out.shape == ref.shape, (out.shape, ref.shape)
+    ulp = ULP[ref.dtype]
+    row_scale = ref.float().abs().amax(dim=1, keepdim=True).clamp_min(1e-9)
+    torch.testing.assert_close(
+        out.float() / row_scale, ref.float() / row_scale, rtol=0.0, atol=8 * ulp
+    )
+    rel_rms = (
+        (out.float() - ref.float()).pow(2).mean().sqrt()
+        / ref.float().pow(2).mean().sqrt().clamp_min(1e-9)
+    ).item()
+    assert rel_rms <= 4 * ulp, f"relative RMS {rel_rms:.3e} > {4 * ulp:.3e}"
 
 
 def _make(num_tokens, hidden, inter, num_experts, top_k, seed=0, dtype=torch.bfloat16):
@@ -127,7 +158,7 @@ def test_certified_cells(cell, _r1_weights) -> None:
             ep_size=spec["ep_size"],
             ep_rank=spec["ep_rank"],
         )[0]
-    fused_moe.compare(
+    _compare(
         out,
         fused_moe.reference(
             x,
@@ -159,7 +190,7 @@ def test_out_of_range_expert_ids_are_dropped() -> None:
         kept[:, 0] = True
         kept[:, 2:] = True
         dropped_scales = scales * kept
-        fused_moe.compare(
+        _compare(
             y, fused_moe.reference(x, bad, dropped_scales, w31, None, w2, None, torch.bfloat16, [])
         )
 
@@ -173,9 +204,7 @@ def test_repeated_expert_ids() -> None:
     dup = ids.clone()
     dup[:, 1] = dup[:, 0]
     y = fused_moe(x, dup, scales, w31, None, w2, None, torch.bfloat16, [])[0]
-    fused_moe.compare(
-        y, fused_moe.reference(x, dup, scales, w31, None, w2, None, torch.bfloat16, [])
-    )
+    _compare(y, fused_moe.reference(x, dup, scales, w31, None, w2, None, torch.bfloat16, []))
 
 
 def test_inputs_untouched_and_deterministic() -> None:
@@ -202,9 +231,7 @@ def test_wrapper_rejects_output_dtype_mismatch() -> None:
         raise AssertionError(f"wrapper accepted output_dtype={bad} for a bf16 input")
     # positive control: the matching dtype still works
     y = fused_moe(x, ids, scales, w31, None, w2, None, torch.bfloat16, [])[0]
-    fused_moe.compare(
-        y, fused_moe.reference(x, ids, scales, w31, None, w2, None, torch.bfloat16, [])
-    )
+    _compare(y, fused_moe.reference(x, ids, scales, w31, None, w2, None, torch.bfloat16, []))
 
 
 def test_op_rejects_unsupported_domains() -> None:
@@ -429,7 +456,7 @@ def test_op_rejects_unsupported_domains() -> None:
 def _rejects(y: torch.Tensor, ref: torch.Tensor, tag: str) -> None:
     """Assert the gates reject `ref` as a description of `y`."""
     try:
-        fused_moe.compare(y, ref)
+        _compare(y, ref)
     except AssertionError:
         return
     raise AssertionError(f"tolerance accepted a wrong reference: {tag}")
@@ -442,9 +469,7 @@ def test_r1_mtp_expert_relabeling_is_bitwise() -> None:
     w31, w2 = _make_r1_weights(R1_E_LOCAL, seed=2222)
     x, ids, scales = _make_r1_routing(512, R1_E_LOCAL, seed=31337)
     y = fused_moe(x, ids, scales, w31, None, w2, None, torch.bfloat16, [])[0]
-    fused_moe.compare(
-        y, fused_moe.reference(x, ids, scales, w31, None, w2, None, torch.bfloat16, [])
-    )
+    _compare(y, fused_moe.reference(x, ids, scales, w31, None, w2, None, torch.bfloat16, []))
     g = torch.Generator(device=DEV).manual_seed(4)
     perm = torch.randperm(R1_E_LOCAL, device=DEV, generator=g)
     inv = torch.empty_like(perm)
@@ -489,7 +514,7 @@ def test_r1_mtp_autotuned_tactics() -> None:
             cold,
             fused_moe.reference(x, ids, scales, w31, None, w2, None, torch.bfloat16, []),
         )
-        fused_moe.compare(cold, cases[t][4])
+        _compare(cold, cases[t][4])
     try:
         x, ids, scales = cases[8192][:3]
         with autotune():
@@ -500,7 +525,7 @@ def test_r1_mtp_autotuned_tactics() -> None:
         moved = 0
         for t, (x, ids, scales, cold, ref) in cases.items():
             hot = fused_moe(x, ids, scales, w31, None, w2, None, torch.bfloat16, [])[0]
-            fused_moe.compare(hot, ref)
+            _compare(hot, ref)
             moved += int(not torch.equal(hot, cold))
         # the control this whole test rests on: if tuning had not changed a
         # single bit, a clean pass here would mean nothing
@@ -520,7 +545,7 @@ def _sweep_tactics(combos, args, ref, count_distinct: bool) -> int:
     for cfg in combos:
         with AutoTuner.get().replay(cfg):
             y = fused_moe(*args)[0]
-        fused_moe.compare(y, ref)
+        _compare(y, ref)
         if count_distinct:
             distinct.add(y.view(torch.int16).cpu().numpy().tobytes())
         del y

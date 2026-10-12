@@ -11,9 +11,27 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.deepseek_v3.r1_0528_nv
 )
 
 __extra_import_path__ = [".."]
-from _validating import validating  # noqa: E402 — needs the path declared above
+from _validating import (  # noqa: E402 — needs the path declared above
+    ULP,
+    assert_within_ulp,
+    validating,
+)
 
 assert torch.cuda.is_available(), "nvfp4_gemm requires a CUDA device"
+
+
+def _compare(out: torch.Tensor, ref: torch.Tensor) -> None:
+    """Two fp4 operands accumulated over K, so the band is the operands'.
+
+    The values are exact on both sides -- e2m1 codes and e4m3 scales decode
+    to the same numbers -- and the only difference is the order K is summed
+    in. Over a K of 7168 a few outputs cancel toward zero, where torch's
+    per-element rtol is meaningless. Scored in bf16 ulp because that is what
+    the output is asked to hold; 8 ulp element-wise and 4 of relative RMS,
+    the same band a two-GEMM chain gets, because the fp4 operands make each
+    product coarser than a bf16 one.
+    """
+    assert_within_ulp(out, ref, element_ulp=8.0, rms_ulp=4.0, ulp=ULP[torch.bfloat16])
 
 
 def _operand(rows, k, seed):
@@ -42,7 +60,7 @@ def test_certified_cells(cell) -> None:
     with validating(op):
         out = op(act, weight, act_sf, weight_sf, alpha, torch.bfloat16)
     assert out.shape == (spec["m"], spec["n"])
-    op.compare(out, op.reference(act, weight, act_sf, weight_sf, alpha, torch.bfloat16))
+    _compare(out, op.reference(act, weight, act_sf, weight_sf, alpha, torch.bfloat16))
 
 
 def _ok():

@@ -36,7 +36,7 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — pytest res
     out = op(x, weight, eps)
     assert out.shape == x.shape and out.dtype == x.dtype
     assert out.data_ptr() != x.data_ptr(), "the op must return a new tensor"
-    op.compare(out, op.reference(x, weight, eps))
+    torch.testing.assert_close(out, op.reference(x, weight, eps))
 
 
 def test_guard_refuses_fp8_before_the_kernel_answers() -> None:

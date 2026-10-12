@@ -14,15 +14,6 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell
 #: quant_mode bit for an fp8 KV cache.
 QM_FP8_KV_CACHE = 128
 
-#: Half an e4m3 ulp. e4m3 carries 3 explicit mantissa bits, so a
-#: round-to-nearest lands within 2**-3 relative.
-E4M3_ULP_RTOL = 2.0**-3
-
-#: How much of the appended output may miss bit-exactness before the gate calls
-#: it drift rather than rounding. See `compare` for why this is not zero and why
-#: it has never been approached.
-E4M3_MAX_INEXACT_FRACTION = 1e-3
-
 
 class MlaRopeAppendPagedKvAssignQ(OpWrapper):
     """RoPE each new context token's `q_pe` (in `q`) and `k_pe` (in
@@ -158,31 +149,6 @@ class MlaRopeAppendPagedKvAssignQ(OpWrapper):
         if kv_scale_orig_quant is not None:
             out = out * kv_scale_orig_quant[0]
         return out.to(store_dtype)
-
-    def compare(self, out: torch.Tensor, ref: torch.Tensor) -> None:
-        """Half an e4m3 ulp, *and* a floor on how much may miss bit-exactness.
-
-        The rotation is where kernel and reference can disagree: both evaluate
-        `x*cos -+ y*sin`, and they may do it in different orders. e4m3's coarse
-        rounding absorbs that completely in practice -- every appended byte
-        measured on this architecture, across every scale and every cell, came
-        back bit-exact, so neither half of this gate has ever been approached.
-
-        Both halves are kept anyway, and both are measured rather than assumed:
-        the test runs four deliberately wrong mirrors of the same bytes and
-        asserts each blows the half it is able to blow. A tolerance alone would
-        pass a mirror that is uniformly a little wrong; a bit-exact demand alone
-        would fail the first time a reordering did survive the rounding.
-        """
-        assert out.shape == ref.shape, (out.shape, ref.shape)
-        torch.testing.assert_close(out.float(), ref.float(), rtol=E4M3_ULP_RTOL, atol=0.0)
-        inexact = int(
-            (out.reshape(-1).view(torch.uint8) != ref.reshape(-1).view(torch.uint8)).sum()
-        )
-        allowed = max(1, int(E4M3_MAX_INEXACT_FRACTION * out.numel()))
-        assert inexact <= allowed, (
-            f"not bit-exact enough: {inexact}/{out.numel()} bytes differ (allowed {allowed})"
-        )
 
     def is_valid(
         self,

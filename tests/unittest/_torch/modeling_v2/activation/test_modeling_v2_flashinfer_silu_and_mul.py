@@ -31,7 +31,7 @@ def test_certified_cells(cell) -> None:
         out = op(x)
     assert out.shape == (*x.shape[:-1], x.shape[-1] // 2)
     assert out.data_ptr() != x.data_ptr(), "the op must return a new tensor"
-    op.compare(out, op.reference(x))
+    torch.testing.assert_close(out, op.reference(x))
 
 
 @pytest.mark.parametrize(

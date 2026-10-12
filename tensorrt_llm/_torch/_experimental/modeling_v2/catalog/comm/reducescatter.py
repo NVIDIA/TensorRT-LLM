@@ -100,7 +100,7 @@ class Reducescatter(OpWrapper):
         Accumulated in fp32 (int64 for integer dtypes) and rounded once. The op
         sums in the input dtype in whatever order NCCL picks; on a cell's payload
         that costs nothing, because every partial sum there is exact in the input
-        dtype either way -- which is what lets `compare` be bitwise.
+        dtype either way -- which is what lets the matrix gate it bitwise.
         """
         first = contributions_to_this_slice[0]
         acc_dtype = torch.float32 if first.dtype.is_floating_point else torch.int64
@@ -108,24 +108,6 @@ class Reducescatter(OpWrapper):
         for block in contributions_to_this_slice:
             acc += block.to(acc_dtype)
         return acc.to(first.dtype)
-
-    def compare(self, out: torch.Tensor, ref: torch.Tensor) -> None:
-        """A gate of exactly zero, which the cells earn rather than assume.
-
-        This op computes, so NCCL's summation order and the reference's rank
-        order could in general differ by rounding. They do not here, because a
-        cell's payload is drawn from a value set -- multiples of 1/8, bounded --
-        on which every partial sum is exactly representable in the input dtype.
-        That makes the strong gate available, and taking it is the point: any
-        difference at all is then a wrong reduction or a wrong slice, never
-        rounding, and a band would have hidden both.
-
-        A cell built from unrestricted random values would need a band instead.
-        None is; see the matrix's payload builder.
-        """
-        assert out.dtype == ref.dtype, (out.dtype, ref.dtype)
-        assert out.shape == ref.shape, (out.shape, ref.shape)
-        torch.testing.assert_close(out, ref, rtol=0, atol=0)
 
     def is_valid(
         self,

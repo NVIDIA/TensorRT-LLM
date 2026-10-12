@@ -13,14 +13,15 @@ This is the executable form of that contract:
     __call__    the op call a target makes
     reference   what the op is supposed to compute, in plain torch
     is_valid    the inputs the op takes and answers wrongly
-    compare     how close the two have to be, and why
     CELLS       the input configurations this entry is certified over
     ARCHS       the architectures those cells were driven on
     note        what is left, and nothing that could have been one of the above
 
 `reference` and `CELLS` are the part that cannot go stale: the entry's test
-drives every cell through both `__call__` and `reference` and gates them with
-`compare`, so a claim that stops holding stops the build.
+drives every cell through both `__call__` and `reference` and gates one
+against the other within a band the test states and derives, so a claim that
+stops holding stops the build. How close the two have to be is the test's
+business, not the entry's: nothing on the way to the kernel needs it.
 
 `CELLS` is also the answer to "can my model use this op?". A target author
 reads the cell list and its reasons, not a document -- and what they read is
@@ -76,48 +77,6 @@ def true_fp32_matmul():
         torch.backends.cuda.matmul.allow_tf32 = prev_allow
         if prev_prec is not None:
             torch.backends.cuda.matmul.fp32_precision = prev_prec
-
-
-#: One unit in the last place of each accumulating dtype's mantissa.
-ULP = {torch.bfloat16: 2.0**-8, torch.float16: 2.0**-11, torch.float32: 2.0**-23}
-
-
-def assert_within_ulp(
-    out: torch.Tensor,
-    ref: torch.Tensor,
-    element_ulp: float,
-    rms_ulp: float,
-    ulp: float | None = None,
-) -> None:
-    """Gate a kernel against a reference that differs only in accumulation order.
-
-    torch's default band cannot express this comparison. Its per-element `rtol`
-    is meaningless wherever cancellation drives `|ref|` toward zero -- a long
-    dot product over random operands puts a handful of outputs there, and a
-    1e-4 absolute difference then reads as a relative difference of 10. And its
-    bf16 `atol` of 1e-5 sits orders of magnitude below one ulp of the output's
-    own scale, so it rejects differences no bf16 result could represent.
-
-    So both gates are in units of the output's scale rather than its value:
-    `element_ulp` against each row's largest magnitude, `rms_ulp` against the
-    relative RMS in aggregate. A caller must say what it measured -- a
-    tolerance without a derivation is one that gets widened again next time.
-    """
-    assert out.dtype == ref.dtype, (out.dtype, ref.dtype)
-    assert out.shape == ref.shape, (out.shape, ref.shape)
-    ulp = ULP[ref.dtype] if ulp is None else ulp
-    flat_out, flat_ref = (
-        out.float().reshape(-1, out.shape[-1]),
-        ref.float().reshape(-1, ref.shape[-1]),
-    )
-    row_scale = flat_ref.abs().amax(dim=1, keepdim=True).clamp_min(1e-9)
-    torch.testing.assert_close(
-        flat_out / row_scale, flat_ref / row_scale, rtol=0.0, atol=element_ulp * ulp
-    )
-    rel_rms = (
-        (flat_out - flat_ref).pow(2).mean().sqrt() / flat_ref.pow(2).mean().sqrt().clamp_min(1e-9)
-    ).item()
-    assert rel_rms <= rms_ulp * ulp, f"relative RMS {rel_rms:.3e} exceeds {rms_ulp} ulp"
 
 
 class Arch(str, enum.Enum):
@@ -197,7 +156,7 @@ class OpWrapper(ABC):
         the group's inputs in rank order and say so in their own docstring.
 
         Accumulate in fp32 and round once at the end: the reference has to be
-        the more accurate side, or `compare`'s band measures the reference
+        the more accurate side, or the test's band measures the reference
         rather than the op.
         """
 
@@ -217,16 +176,3 @@ class OpWrapper(ABC):
         reason `reference`'s do.
         """
         return None
-
-    def compare(self, out: torch.Tensor, ref: torch.Tensor) -> None:
-        """Gate `out` against `reference`.
-
-        The default is torch's dtype-aware band, which is right for an op that
-        rounds once. An op that accumulates through several GEMMs will exceed it
-        for reasons that are not defects, and must widen the band *and say what
-        it measured* -- a tolerance without a derivation is a tolerance that
-        will be widened again next time it fails.
-        """
-        assert out.dtype == ref.dtype, (out.dtype, ref.dtype)
-        assert out.shape == ref.shape, (out.shape, ref.shape)
-        torch.testing.assert_close(out, ref)

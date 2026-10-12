@@ -273,44 +273,6 @@ class Fp4BlockScaleMoeRunner(OpWrapper):
             out.index_add_(0, tok, y * topk_weights[tok, slot].float().unsqueeze(1))
         return out
 
-    def compare(self, out: torch.Tensor, ref: torch.Tensor) -> None:
-        """16 ulp per element against the row's own scale, 2 ulp relative RMS.
-
-        Kernel and reference consume bit-identical NVFP4 weights and activations
-        and model the same FC1-output requantization, so they differ only in
-        accumulation order and in whether a marginal FC1 value rounds to the
-        same e2m1 code. An e2m1 code is a coarse step -- two mantissa bits -- so
-        one flipped intermediate moves the output row by a visible fraction, and
-        torch's default band cannot express that: its bf16 `atol` of 1e-5 sits
-        three orders of magnitude below one output ulp of a two-GEMM chain, and
-        per-element `rtol` is meaningless where cancellation drives `|ref|` to
-        zero.
-
-        Both numbers are measured, not chosen. Worst over every configuration
-        the entry's test covers: 9.97 ulp element-wise and 0.88 ulp RMS; the R1
-        geometry lands at 9.62 / 0.74 for a 64-wide window and 4.68 / 0.70 for
-        the 256-expert stack. Only the RMS gate is scale-free -- the element
-        figure is a max over `T*H` elements, so its tail grows with `T` at
-        constant accuracy and reaches 16.33 at the top of the certified token
-        column. Size a caller's tolerance off the RMS number.
-
-        Both were sized against deliberately wrong computations: a gate/up swap
-        (263-278 ulp), a scalar-role swap (177/48), a missing scale swizzle
-        (408/357), a missing row shuffle (508/432), and a reference skipping the
-        FC1 requantization (43/28 element, 23/23 RMS). The smallest RMS distance
-        any of them reaches is 39.8.
-        """
-        assert out.dtype == ref.dtype == torch.bfloat16, (out.dtype, ref.dtype)
-        assert out.shape == ref.shape, (out.shape, ref.shape)
-        ulp = 2.0**-8
-        row = ref.float().abs().amax(dim=1, keepdim=True).clamp_min(1e-9)
-        torch.testing.assert_close(out.float() / row, ref.float() / row, rtol=0.0, atol=16 * ulp)
-        rel_rms = (
-            (out.float() - ref.float()).pow(2).mean().sqrt()
-            / ref.float().pow(2).mean().sqrt().clamp_min(1e-9)
-        ).item() / ulp
-        assert rel_rms <= 2.0, f"relative RMS {rel_rms:.2f} ulp > 2 ulp"
-
     def is_valid(
         self,
         routing_logits: Optional[torch.Tensor],

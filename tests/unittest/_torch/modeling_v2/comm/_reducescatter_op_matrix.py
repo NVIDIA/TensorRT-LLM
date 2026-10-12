@@ -177,9 +177,10 @@ def _assert_bitwise(out: torch.Tensor, ref: torch.Tensor, where: str) -> None:
     intermediate representable, so any difference at all is a wrong reduction
     or a wrong slice, not rounding.
     """
-    # The gate itself is the entry's `compare`; `where` only labels the failure.
     try:
-        entry.reducescatter.compare(out, ref)
+        assert out.dtype == ref.dtype, (out.dtype, ref.dtype)
+        assert out.shape == ref.shape, (out.shape, ref.shape)
+        torch.testing.assert_close(out, ref, rtol=0, atol=0)
     except AssertionError as exc:
         raise AssertionError(f"{where}: {exc}") from exc
 
@@ -1353,7 +1354,7 @@ def _run_one_rank() -> int:
     # the certified shape, and the wrapper hands the boxed group to the _pg
     # symbol -- the same routing the product's non-MPI mode does in
     # _torch/distributed/ops.py. The partial is only the call surface: the
-    # guard is armed on the entry itself, and `reference`, `compare` and
+    # guard is armed on the entry itself, and `reference` and
     # `CELLS` are read off `entry.reducescatter` directly.
     reducescatter = functools.partial(entry.reducescatter, process_group=PG_BOXED)
 

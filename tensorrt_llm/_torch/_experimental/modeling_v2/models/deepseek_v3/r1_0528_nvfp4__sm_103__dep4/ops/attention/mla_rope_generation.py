@@ -15,14 +15,6 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell
 #: quant_mode bit for an fp8 KV cache.
 QM_FP8_KV_CACHE = 128
 
-#: Half an e4m3 ulp. e4m3 carries 3 explicit mantissa bits, so a
-#: round-to-nearest lands within 2**-3 relative.
-E4M3_ULP_RTOL = 2.0**-3
-
-#: How much of a quantized output may miss bit-exactness before the gate calls
-#: it drift rather than rounding. See `compare`.
-E4M3_MAX_INEXACT_FRACTION = 1e-3
-
 #: DeepSeek-R1's YaRN attention temperature, carried as `q_scaling = 1/mscale^2`
 #: with `mscale = 0.1 * ln(40) + 1`. The target passes this, which is why a
 #: `q_scaling != 1` cell exists: it lands in `mla_bmm1_scale` and nowhere else.
@@ -313,29 +305,6 @@ class MlaRopeGeneration(OpWrapper):
         return (
             torch.tensor(cu_q, dtype=torch.int32),
             torch.tensor(cu_kv, dtype=torch.int32),
-        )
-
-    def compare(self, out: torch.Tensor, ref: torch.Tensor) -> None:
-        """Half an e4m3 ulp, *and* a floor on how much may miss bit-exactness.
-
-        The rotation is where kernel and reference can disagree: both evaluate
-        `x*cos -+ y*sin` and may do it in different orders. e4m3's coarse
-        rounding absorbs that in practice -- every quantized element measured on
-        this architecture, at every scale and every cell, came back bit-exact,
-        so neither half of this gate has been approached.
-
-        Both halves are kept because they fail differently: a tolerance alone
-        passes a mirror that is uniformly a little wrong, and a bit-exact demand
-        alone fails the first time a reordering does survive the rounding.
-        """
-        assert out.shape == ref.shape, (out.shape, ref.shape)
-        torch.testing.assert_close(out.float(), ref.float(), rtol=E4M3_ULP_RTOL, atol=0.0)
-        inexact = int(
-            (out.reshape(-1).view(torch.uint8) != ref.reshape(-1).view(torch.uint8)).sum()
-        )
-        allowed = max(1, int(E4M3_MAX_INEXACT_FRACTION * out.numel()))
-        assert inexact <= allowed, (
-            f"not bit-exact enough: {inexact}/{out.numel()} bytes differ (allowed {allowed})"
         )
 
     def is_valid(

@@ -42,8 +42,8 @@ def test_certified_cells(cell) -> None:
     with validating(op):
         out_x, out_residual = op(x, residual, weight, eps)
         assert out_x is x and out_residual is residual, "the op writes in place"
-    op.compare(residual, ref_residual)
-    op.compare(x, ref_x)
+    torch.testing.assert_close(residual, ref_residual)
+    torch.testing.assert_close(x, ref_x)
 
 
 def _one(**over):

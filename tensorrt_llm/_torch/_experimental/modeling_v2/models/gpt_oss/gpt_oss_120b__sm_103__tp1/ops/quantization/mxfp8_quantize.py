@@ -125,19 +125,6 @@ class Mxfp8Quantize(OpWrapper):
         out[index.reshape(-1)] = byte.reshape(-1)
         return out
 
-    def compare(self, out: torch.Tensor, ref: torch.Tensor) -> None:
-        """Bit-exact.
-
-        Both sides compute the same power-of-two scale and the same e4m3
-        rounding, so any difference is a defect rather than accumulated error.
-        fp8 and uint8 both compare as bytes.
-        """
-        assert out.dtype == ref.dtype, (out.dtype, ref.dtype)
-        assert out.shape == ref.shape, (out.shape, ref.shape)
-        assert torch.equal(out.view(torch.uint8), ref.view(torch.uint8)), (
-            "quantization is deterministic; a mismatch is a defect, not drift"
-        )
-
     def is_valid(
         self,
         input: torch.Tensor,

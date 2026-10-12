@@ -11,7 +11,6 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import (
     Arch,
     Cell,
     OpWrapper,
-    assert_within_ulp,
     true_fp32_matmul,
 )
 
@@ -85,23 +84,6 @@ class BmmOut(OpWrapper):
         # Mixed input dtypes are type-promoted instead of rejected, changing the
         # required out dtype; the catalog exposes only the single-dtype form.
         assert a.dtype == b.dtype == out.dtype, "a, b, out must share one dtype"
-
-    def compare(self, out: torch.Tensor, ref: torch.Tensor) -> None:
-        """One GEMM's worth of accumulation-order difference.
-
-        Kernel and reference consume bit-identical operands and differ only in
-        the order cuBLAS and torch sum over K. Over random operands a few
-        outputs land near zero, where that reordering shows up as a relative
-        difference of 10 on an absolute difference of 1.5e-4 -- which is what
-        torch's default band rejects, and what no bf16 result could represent
-        anyway: one ulp at these rows' scale is about 6e-1.
-
-        So: 4 ulp element-wise against the row scale, 2 ulp of relative RMS.
-        Measured worst case across this entry's cells is 1.5e-4 absolute, or
-        roughly 3e-4 ulp -- four orders of margin, and a band that a genuinely
-        wrong product would miss by orders rather than squeak past.
-        """
-        assert_within_ulp(out, ref, element_ulp=4.0, rms_ulp=2.0)
 
 
 bmm_out = BmmOut()

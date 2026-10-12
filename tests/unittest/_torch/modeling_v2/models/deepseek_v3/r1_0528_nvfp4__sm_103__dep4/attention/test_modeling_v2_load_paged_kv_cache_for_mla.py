@@ -76,6 +76,18 @@ _TRTLLM_TO_TORCH_DTYPE = {
 }
 
 
+def _compare(out: torch.Tensor, ref: torch.Tensor) -> None:
+    """A gate of exactly zero: one multiply and one rounding, on both sides.
+
+    The op dequantizes in fp32 and rounds once; so does `reference`. There
+    is no accumulation to disagree about, so any difference is a wrong
+    gather, a wrong scale, or a wrong row -- never drift.
+    """
+    assert out.dtype == ref.dtype, (out.dtype, ref.dtype)
+    assert out.shape == ref.shape, (out.shape, ref.shape)
+    torch.testing.assert_close(out, ref, rtol=0.0, atol=0.0)
+
+
 class _MlaCacheEnv:
     """Real op state: MLA (kv_factor=1) paged KV cache manager.
 
@@ -308,8 +320,8 @@ def _assert_fp8_exact(
 ) -> None:
     """Both halves bitwise equal to the fp32-multiply mirror."""
     mirror = _dequant_mirror(stored, read_scale, out_dtype)
-    op.compare(compressed_kv, mirror[:, :KV_LORA_RANK])
-    op.compare(k_pe, mirror[:, KV_LORA_RANK:])
+    _compare(compressed_kv, mirror[:, :KV_LORA_RANK])
+    _compare(k_pe, mirror[:, KV_LORA_RANK:])
 
 
 def _raises(fn) -> str:

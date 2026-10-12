@@ -7,12 +7,7 @@ from __future__ import annotations
 import torch
 
 import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtllm.*
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import (
-    Arch,
-    Cell,
-    OpWrapper,
-    assert_within_ulp,
-)
+from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 
 
 class FusedQkNormRope(OpWrapper):
@@ -207,23 +202,6 @@ class FusedQkNormRope(OpWrapper):
         ramp = ((j - low) / (high - low)).clamp(0.0, 1.0)
         extrapolation = 1.0 - ramp
         return inv_interpolation * (1.0 - extrapolation) + inv_extrapolation * extrapolation
-
-    def compare(self, out: torch.Tensor, ref: torch.Tensor) -> None:
-        """A rotation is a two-term combination, and two terms can cancel.
-
-        `x1 * cos - x2 * sin` goes to zero wherever the two products nearly
-        match, and there torch's per-element rtol is meaningless: at 2048 tokens
-        roughly 2e-4 of the outputs land close enough that a 7.3e-4 absolute
-        difference reads as a relative difference of 23. The decode and 37-token
-        cells pass under torch's default band only because they are too small to
-        sample one.
-
-        So: 2 ulp element-wise against the row scale, 1 of relative RMS -- tight,
-        because one rotation is the shortest chain in this catalog. Measured
-        worst case across these cells is 7.3e-4 absolute at a row scale of ~4,
-        about 0.05 ulp.
-        """
-        assert_within_ulp(out, ref, element_ulp=2.0, rms_ulp=1.0)
 
     def is_valid(
         self,

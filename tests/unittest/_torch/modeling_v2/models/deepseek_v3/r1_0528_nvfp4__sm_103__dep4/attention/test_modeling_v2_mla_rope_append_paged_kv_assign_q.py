@@ -83,7 +83,12 @@ QUANT_MODE_INT8_KV_CACHE = 64  # QuantMode.INT8_KV_CACHE — rejected, see below
 # ever been approached. That both halves still discriminate is measured, not
 # assumed — test_fp8_kv_explicit_unit_scale runs four wrong mirrors of the same
 # bytes and asserts each blows the gate it is able to blow.
-E4M3_ULP_RTOL = 2**-3  # the entry's own gate carries the derivation
+# Half an e4m3 ulp: e4m3 carries 3 explicit mantissa bits, so a round-to-nearest
+# lands within 2**-3 relative.
+E4M3_ULP_RTOL = 2**-3
+# How much of the appended output may miss bit-exactness before the gate calls it
+# drift rather than rounding. See `_compare` for why this is not zero and why it
+# has never been approached.
 E4M3_MAX_INEXACT_FRACTION = 1e-3
 
 # The roped q must come back as an ordinary bf16 rotation, NOT quantized: this
@@ -99,6 +104,30 @@ _TRTLLM_TO_TORCH_DTYPE = {
     DataType.BF16: torch.bfloat16,
     DataType.HALF: torch.float16,
 }
+
+
+def _compare(out: torch.Tensor, ref: torch.Tensor) -> None:
+    """Half an e4m3 ulp, *and* a floor on how much may miss bit-exactness.
+
+    The rotation is where kernel and reference can disagree: both evaluate
+    `x*cos -+ y*sin`, and they may do it in different orders. e4m3's coarse
+    rounding absorbs that completely in practice -- every appended byte
+    measured on this architecture, across every scale and every cell, came
+    back bit-exact, so neither half of this gate has ever been approached.
+
+    Both halves are kept anyway, and both are measured rather than assumed:
+    the test runs four deliberately wrong mirrors of the same bytes and
+    asserts each blows the half it is able to blow. A tolerance alone would
+    pass a mirror that is uniformly a little wrong; a bit-exact demand alone
+    would fail the first time a reordering did survive the rounding.
+    """
+    assert out.shape == ref.shape, (out.shape, ref.shape)
+    torch.testing.assert_close(out.float(), ref.float(), rtol=E4M3_ULP_RTOL, atol=0.0)
+    inexact = int((out.reshape(-1).view(torch.uint8) != ref.reshape(-1).view(torch.uint8)).sum())
+    allowed = max(1, int(E4M3_MAX_INEXACT_FRACTION * out.numel()))
+    assert inexact <= allowed, (
+        f"not bit-exact enough: {inexact}/{out.numel()} bytes differ (allowed {allowed})"
+    )
 
 
 class _MlaCtxEnv:
@@ -284,7 +313,7 @@ def _assert_e4m3_roped(got: torch.Tensor, want: torch.Tensor, what: str) -> None
     """Delegates to the entry: the gate and its derivation are the entry's
     claim. `what` only labels the failure."""
     try:
-        op.compare(got, want)
+        _compare(got, want)
     except AssertionError as exc:
         raise AssertionError(f"{what}: {exc}") from exc
 

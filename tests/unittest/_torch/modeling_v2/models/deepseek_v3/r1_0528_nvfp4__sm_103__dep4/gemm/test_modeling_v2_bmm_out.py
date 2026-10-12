@@ -10,9 +10,27 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.deepseek_v3.r1_0528_nv
 )
 
 __extra_import_path__ = ["../../../.."]
-from _validating import validating  # noqa: E402 — needs the path declared above
+from _validating import assert_within_ulp, validating  # noqa: E402 — needs the path declared above
 
 assert torch.cuda.is_available(), "bmm_out requires a CUDA device"
+
+
+def _compare(out: torch.Tensor, ref: torch.Tensor) -> None:
+    """One GEMM's worth of accumulation-order difference.
+
+    Kernel and reference consume bit-identical operands and differ only in
+    the order cuBLAS and torch sum over K. Over random operands a few
+    outputs land near zero, where that reordering shows up as a relative
+    difference of 10 on an absolute difference of 1.5e-4 -- which is what
+    torch's default band rejects, and what no bf16 result could represent
+    anyway: one ulp at these rows' scale is about 6e-1.
+
+    So: 4 ulp element-wise against the row scale, 2 ulp of relative RMS.
+    Measured worst case across this entry's cells is 1.5e-4 absolute, or
+    roughly 3e-4 ulp -- four orders of margin, and a band that a genuinely
+    wrong product would miss by orders rather than squeak past.
+    """
+    assert_within_ulp(out, ref, element_ulp=4.0, rms_ulp=2.0)
 
 
 def _build(spec, seed):
@@ -51,7 +69,7 @@ def test_certified_cells(cell) -> None:
     # The product has to be in the caller's buffer, not in a replacement the op
     # allocated: that is the whole reason this op exists over torch.bmm.
     assert parent.data_ptr() == parent_ptr
-    op.compare(out, op.reference(a, w, out))
+    _compare(out, op.reference(a, w, out))
 
 
 def _ok(dtype=torch.bfloat16):

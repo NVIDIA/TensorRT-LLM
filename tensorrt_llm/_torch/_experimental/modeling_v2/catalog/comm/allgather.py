@@ -88,20 +88,6 @@ class Allgather(OpWrapper):
         """
         return torch.cat(list(per_rank_inputs), dim=0)
 
-    def compare(self, out: torch.Tensor, ref: torch.Tensor) -> None:
-        """A gate of exactly zero: the op moves bytes and computes nothing.
-
-        Tightened from the base default rather than loosened. Any difference at
-        all is a wrong gather.
-        """
-        assert out.dtype == ref.dtype, (out.dtype, ref.dtype)
-        assert out.shape == ref.shape, (out.shape, ref.shape)
-        if out.dtype is torch.float8_e4m3fn:
-            # torch.testing cannot compare float8; for a pure data move the byte
-            # pattern is the honest gate anyway.
-            out, ref = out.view(torch.uint8), ref.view(torch.uint8)
-        torch.testing.assert_close(out, ref, rtol=0, atol=0)
-
     def is_valid(
         self,
         input: torch.Tensor,

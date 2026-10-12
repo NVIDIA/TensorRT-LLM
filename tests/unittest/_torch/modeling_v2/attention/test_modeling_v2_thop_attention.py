@@ -187,7 +187,11 @@ from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 
 __extra_import_path__ = [".."]
-from _validating import validating  # noqa: E402 — needs the path declared above
+from _validating import (  # noqa: E402 — needs the path declared above
+    ULP,
+    assert_within_ulp,
+    validating,
+)
 
 assert torch.cuda.is_available(), "thop_attention requires a CUDA device"
 
@@ -256,6 +260,22 @@ FP8_DECODE_RTOL = 2**-4
 # so no claim here rests on it.
 FP8_MLA_ATOL = 2**-3
 FP8_MLA_RTOL = 2**-4
+
+
+def _compare(out: torch.Tensor, ref: torch.Tensor) -> None:
+    """A softmax chain, so the band is the longest in this catalog.
+
+    Attention accumulates twice -- once over the KV range inside the
+    softmax, once over the same range in the value product -- and the
+    kernel splits both differently from a single fp32 pass. 8 ulp
+    element-wise against the row scale and 4 of relative RMS, the same band
+    a two-GEMM MoE chain gets, and for the same reason.
+
+    Scored in bf16 ulp whatever the output dtype: on the fp8 paths the
+    operands are e4m3 and the accumulation is bf16-limited, so fp32's ulp
+    would measure the container.
+    """
+    assert_within_ulp(out, ref, element_ulp=8.0, rms_ulp=4.0, ulp=ULP[torch.bfloat16])
 
 
 class _PagedAttnEnv:
@@ -5338,7 +5358,7 @@ def _cell_standard(cell) -> None:
         atol=2e-2,
         msg=lambda m: f"op.reference disagrees with _sink_reference\n{m}",
     )
-    op.compare(out, ref)
+    _compare(out, ref)
 
 
 def _cell_mla_context(cell) -> None:
@@ -5387,7 +5407,7 @@ def _cell_mla_context(cell) -> None:
         atol=FP8_MLA_ATOL,
         msg=lambda m: f"op.reference disagrees with _fp8_no_append_reference\n{m}",
     )
-    op.compare(out, ref)
+    _compare(out, ref)
 
 
 @pytest.mark.parametrize("cell", op.CELLS, ids=[c.why[:44] for c in op.CELLS])
