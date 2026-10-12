@@ -937,6 +937,37 @@ def test_fp4_mla_manager_v2_registers_native_cache_and_hp_roles(monkeypatch) -> 
         manager.shutdown()
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_fp4_mla_manager_v2_copies_per_pool_block_offsets(monkeypatch) -> None:
+    monkeypatch.setenv(FP4_MLA_ATTENTION_BACKEND_ENV, "triton")
+    seq_lens = [FP4_MLA_TOKENS_PER_BLOCK + 1, 3]
+    manager = _create_fp4_mla_v2_manager(max_tokens=1024, max_seq_len=512, max_batch_size=2)
+    try:
+        manager.add_dummy_requests(list(range(len(seq_lens))), seq_lens)
+        assert manager._use_per_layer_page_tables is False
+        page_spec = manager.get_fp4_mla_page_table_spec(0)
+        assert page_spec.cache_page_index_scale == 1
+        dst = torch.full(
+            (manager.num_attention_op_pools, len(seq_lens), 2, manager.max_blocks_per_seq),
+            -1,
+            dtype=torch.int32,
+            device="cuda",
+        )
+
+        manager.copy_batch_block_offsets(dst, list(range(len(seq_lens))), 1, 0, len(seq_lens))
+        torch.cuda.synchronize()
+
+        block_ids = manager.get_batch_cache_indices(list(range(len(seq_lens))), layer_idx=0)
+        for seq_idx, seq_len in enumerate(seq_lens):
+            num_blocks = -(-seq_len // FP4_MLA_TOKENS_PER_BLOCK)
+            assert (
+                dst[page_spec.cache_pool_id, seq_idx, 0, :num_blocks].tolist()
+                == block_ids[seq_idx][:num_blocks]
+            )
+    finally:
+        manager.shutdown()
+
+
 def _dequant_fp4_swizzled(
     fp4_tensor: torch.Tensor,
     sf_tensor: torch.Tensor,
