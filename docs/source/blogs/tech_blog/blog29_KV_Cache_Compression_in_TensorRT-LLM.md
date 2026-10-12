@@ -301,7 +301,7 @@ The frontier gains above come mostly from a higher hit rate, but the benefit doe
 
 #### Accuracy
 
-A page is quantized only when it leaves the GPU, so the accuracy question is whether repeated **quantize-dequantize (QDQ) round trips** accumulate error as a page is offloaded and brought back again and again. They do not. Figure 15 measures every representable FP8, FP16 and BF16 value through up to four round trips: the distance to the original value is the one-time quantization error and stays the same after every trip, and the distance to the previous trip is zero from the second trip on. End to end, Qwen3-8B on AIME24 and AIME25 reproduces every output of the first round trip on the second.
+A page is quantized only when it leaves the GPU, so the accuracy question is whether repeated **quantize-dequantize (QDQ) round trips** accumulate error as a page is offloaded and brought back again and again. **They do not.** Figure 15 measures every representable FP8, FP16 and BF16 value through up to four round trips: the distance to the original value is the one-time quantization error and stays the same after every trip, and the distance to the previous trip is zero from the second trip on. End to end, Qwen3-8B on AIME24 and AIME25 reproduces every output of the first round trip on the second.
 
 <div align="center">
 <figure>
