@@ -821,7 +821,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_device(8)
     @skip_pre_hopper
-    def test_gen_only_spec_dec(self):
+    def test_symmetric(self):
         ctx_server_config = {"disable_overlap_scheduler": True}
         gen_server_config = {
             "disable_overlap_scheduler": False,
@@ -856,7 +856,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                                       tensor_parallel_size=4) as llm:
             run_accuracy_test(llm, self.MODEL_NAME, ["MMLU", "GSM8K"])
             assert_acceptance_length(
-                "disagg::TestDeepSeekV3Lite::test_gen_only_spec_dec",
+                "disagg::TestDeepSeekV3Lite::test_symmetric",
                 compute_disagg_acceptance_length(llm.serve_url))
 
     @skip_pre_blackwell
