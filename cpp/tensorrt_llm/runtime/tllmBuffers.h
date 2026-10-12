@@ -189,8 +189,8 @@ public:
     PinnedAllocator() noexcept = default;
 
     //! \brief Host page size that chunked allocations and their chunk boundaries are aligned to, as required by
-    //! ::cudaHostRegister.
-    static std::size_t constexpr kHostPageSize{4096};
+    //! ::cudaHostRegister. Queried at runtime because it is not 4 KiB everywhere (e.g. 64 KiB aarch64 kernels).
+    [[nodiscard]] static std::size_t hostPageSize();
 
     //! \brief Default value of getPinChunkSize().
     static std::size_t constexpr kDefaultPinChunkSize{std::size_t{1} << 30}; // 1 GiB
@@ -198,8 +198,9 @@ public:
     //! \brief Number of bytes page-locked per ::cudaHostRegister call, and the size up to which allocations keep
     //! using a single ::cudaHostAlloc.
     //!
-    //! Read once from TRTLLM_HOST_PIN_CHUNK_BYTES, defaulting to kDefaultPinChunkSize. Setting it to 0 disables
-    //! chunking and restores plain ::cudaHostAlloc for every allocation size.
+    //! Read once from TRTLLM_HOST_PIN_CHUNK_BYTES, defaulting to kDefaultPinChunkSize, and rounded up to a whole
+    //! number of host pages so that no page straddles two chunks. Setting it to 0 disables chunking and restores
+    //! plain ::cudaHostAlloc for every allocation size.
     [[nodiscard]] static std::size_t getPinChunkSize();
 
     //! \brief Allocates \p n bytes of host memory and page-locks it in \p chunkSize pieces.

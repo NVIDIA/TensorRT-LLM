@@ -21,6 +21,8 @@
 #include <cstdint>
 #include <new>
 
+#include <unistd.h>
+
 namespace tensorrt_llm::runtime
 {
 namespace
@@ -28,7 +30,8 @@ namespace
 //! \brief Rounds \p size up to a whole number of host pages, as required by ::cudaHostRegister.
 std::size_t pageAlignedSize(std::size_t size)
 {
-    return common::ceilDiv(size, PinnedAllocator::kHostPageSize) * PinnedAllocator::kHostPageSize;
+    auto const pageSize = PinnedAllocator::hostPageSize();
+    return common::ceilDiv(size, pageSize) * pageSize;
 }
 
 //! \brief Whether an allocation of \p n bytes is backed by host memory that is page-locked in chunks.
@@ -41,7 +44,11 @@ bool useChunkedPinning(std::size_t n)
 
 void hostRegisterChunked(void* ptr, std::size_t size, std::size_t chunkSize)
 {
-    TLLM_CHECK_WITH_INFO(chunkSize > 0, "Page-locking chunk size must be positive");
+    auto const pageSize = PinnedAllocator::hostPageSize();
+    TLLM_CHECK_WITH_INFO(chunkSize > 0 && chunkSize % pageSize == 0,
+        "Page-locking chunk size %zu must be a positive multiple of the host page size %zu", chunkSize, pageSize);
+    TLLM_CHECK_WITH_INFO(reinterpret_cast<std::uintptr_t>(ptr) % pageSize == 0,
+        "Chunk-pinned host memory must be aligned to the host page size %zu", pageSize);
     auto* const base = static_cast<std::uint8_t*>(ptr);
     std::size_t offset{0};
     try
@@ -74,10 +81,23 @@ void hostUnregisterChunked(void* ptr, std::size_t size, std::size_t chunkSize)
     }
 }
 
+std::size_t PinnedAllocator::hostPageSize()
+{
+    static std::size_t const pageSize = []
+    {
+        auto const size = ::sysconf(_SC_PAGESIZE);
+        return size > 0 ? static_cast<std::size_t>(size) : std::size_t{4096};
+    }();
+    return pageSize;
+}
+
 std::size_t PinnedAllocator::getPinChunkSize()
 {
-    static std::size_t const chunkSize
-        = common::getUInt64Env("TRTLLM_HOST_PIN_CHUNK_BYTES").value_or(kDefaultPinChunkSize);
+    static std::size_t const chunkSize = []
+    {
+        auto const requested = common::getUInt64Env("TRTLLM_HOST_PIN_CHUNK_BYTES").value_or(kDefaultPinChunkSize);
+        return pageAlignedSize(requested);
+    }();
     return chunkSize;
 }
 
@@ -86,7 +106,7 @@ PinnedAllocator::PointerType PinnedAllocator::allocateChunkPinned(std::size_t n,
     auto const lockedBytes = pageAlignedSize(n);
     TLLM_LOG_DEBUG("PinnedAllocator: page-locking %zu B in chunks of %zu B", lockedBytes, chunkSize);
 
-    auto* const base = std::aligned_alloc(kHostPageSize, lockedBytes);
+    auto* const base = std::aligned_alloc(hostPageSize(), lockedBytes);
     if (base == nullptr)
     {
         throw std::bad_alloc();

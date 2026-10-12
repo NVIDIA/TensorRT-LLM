@@ -126,9 +126,9 @@ TEST_F(TllmBuffersTest, HostRegisterChunked)
     // including a partial trailing one, is reported as host memory and the whole range is usable as the source of an
     // async copy across chunk boundaries.
     auto constexpr chunkSize = std::size_t{1} << 20; // 1 MB
-    auto constexpr size = 4 * chunkSize + PinnedAllocator::kHostPageSize;
+    auto const size = 4 * chunkSize + PinnedAllocator::hostPageSize();
 
-    auto* const host = static_cast<std::uint8_t*>(std::aligned_alloc(PinnedAllocator::kHostPageSize, size));
+    auto* const host = static_cast<std::uint8_t*>(std::aligned_alloc(PinnedAllocator::hostPageSize(), size));
     ASSERT_NE(host, nullptr);
     for (std::size_t i = 0; i < size; ++i)
     {
@@ -174,7 +174,7 @@ TEST_F(TllmBuffersTest, PinnedAllocatorChunkPinnedAllocation)
 
     auto* const ptr = PinnedAllocator::allocateChunkPinned(size, chunkSize);
     ASSERT_NE(ptr, nullptr);
-    EXPECT_EQ(reinterpret_cast<std::uintptr_t>(ptr) % PinnedAllocator::kHostPageSize, std::uintptr_t{0});
+    EXPECT_EQ(reinterpret_cast<std::uintptr_t>(ptr) % PinnedAllocator::hostPageSize(), std::uintptr_t{0});
 
     cudaPointerAttributes attributes{};
     TLLM_CUDA_CHECK(::cudaPointerGetAttributes(&attributes, static_cast<std::uint8_t*>(ptr) + size - 1));
