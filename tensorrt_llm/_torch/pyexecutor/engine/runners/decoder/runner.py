@@ -534,158 +534,6 @@ class DecoderRunner(ScheduledModelRunner):
         """Allocate resources dummy requests need beyond the KV caches."""
         return True
 
-    def _preprocess_inputs(
-        self, inputs: dict[str, Any], *, enable_spec_decode: bool, runtime_draft_len: int
-    ):
-        """
-        Make some changes to the device inputs and avoid blocking the async data transfer
-        """
-        attn_meta = inputs.get("attn_metadata")
-        # Invalidate per-forward-pass caches so they are recomputed (and captured) on every _forward_step.
-        if attn_meta is not None:
-            attn_meta.on_update_kv_lens()
-
-        if enable_spec_decode and not self._config.disable_overlap_scheduler:
-            # When enabling overlap scheduler, the kv cache for draft tokens will
-            # be prepared in advance by using the max_total_draft_tokens. But we need to use
-            # new_tokens_lens_device to get the real past kv lengths and the
-            # correct position ids. And to avoid blocking the async data transfer,
-            # we need to preprocess the inputs in forward to update the position_ids and
-            # kv cache length.
-            if inputs["attn_metadata"].kv_cache_manager is not None:
-                num_seqs = inputs["attn_metadata"].num_seqs
-                num_ctx_requests = inputs["attn_metadata"].num_contexts
-                num_gen_requests = inputs["attn_metadata"].num_generations
-                num_ctx_tokens = inputs["attn_metadata"].num_ctx_tokens
-                num_chunked_ctx_requests = inputs["attn_metadata"].num_chunked_ctx_requests
-                previous_batch_tokens = inputs["input_ids"].shape[0] - num_ctx_tokens
-                if inputs["position_ids"].ndim == 3:  # mrope: [3, 1, N]
-                    inputs["position_ids"][:, :, num_ctx_tokens:] += (
-                        self._buffers.previous_pos_id_offsets_cuda[:previous_batch_tokens]
-                    )
-                else:
-                    inputs["position_ids"][0, num_ctx_tokens:] += (
-                        self._buffers.previous_pos_id_offsets_cuda[:previous_batch_tokens]
-                    )
-
-                if hasattr(inputs["attn_metadata"], "kv_lens_cuda"):
-                    if (
-                        num_ctx_requests >= num_chunked_ctx_requests
-                        and num_chunked_ctx_requests > 0
-                    ):
-                        # The generation requests with draft_tokens are treated as chunked context
-                        # requests when extend_ctx returns True.
-                        inputs["attn_metadata"].kv_lens_cuda[
-                            num_ctx_requests - num_chunked_ctx_requests : num_ctx_requests
-                        ] += self._buffers.previous_kv_lens_offsets_cuda[:num_chunked_ctx_requests]
-                    else:
-                        inputs["attn_metadata"].kv_lens_cuda[num_ctx_requests:num_seqs] += (
-                            self._buffers.previous_kv_lens_offsets_cuda[:num_gen_requests]
-                        )
-                    inputs["attn_metadata"].on_update_kv_lens()
-                # TRTLLM uses `kv_lens_cuda` above; FlashInfer exposes this backend-specific
-                # correction without coupling the engine to its metadata type.
-                elif hasattr(inputs["attn_metadata"], "apply_spec_decode_kv_lens_offsets"):
-                    inputs["attn_metadata"].apply_spec_decode_kv_lens_offsets(
-                        self._buffers.previous_kv_lens_offsets_cuda,
-                        num_gen_requests,
-                        self.get_runtime_tokens_per_gen_step(runtime_draft_len),
-                        num_chunked_contexts=num_chunked_ctx_requests,
-                    )
-
-        if enable_spec_decode and self.mapping.has_cp_helix():
-            # Helix verify groups: the per-token device buffers (write slots,
-            # attention bounds, rank-local kv lens) must be derived on EVERY
-            # spec step, overlap or not -- the append/mask kernels consume
-            # them whenever _helix_spec_tokens_valid is armed. Under overlap
-            # the host packed provisional positions from a stale base, so
-            # first apply the same accepted-count correction position_ids
-            # got above; without overlap the host values are already exact.
-            md = inputs.get("attn_metadata")
-            if (
-                md is not None
-                and md.kv_cache_manager is not None
-                and getattr(md, "_helix_spec_tokens_valid", False)
-            ):
-                helix_gen_tokens = inputs["input_ids"].shape[0] - md.num_ctx_tokens
-                if not self._config.disable_overlap_scheduler:
-                    # The kv_lens override in the recompute supersedes the
-                    # generic previous_kv_lens_offsets adjustment above,
-                    # which is not ownership-aware.
-                    md.helix_position_offsets[:helix_gen_tokens] += (
-                        self._buffers.previous_pos_id_offsets_cuda[:helix_gen_tokens]
-                    )
-                md.recompute_helix_spec_buffers(
-                    helix_gen_tokens, self.get_runtime_tokens_per_gen_step(runtime_draft_len)
-                )
-                md.on_update_kv_lens()
-
-        if self.guided_decoder is not None:
-            self.guided_decoder.token_event.record()
-
-        return inputs
-
-    def _postprocess_inputs(
-        self, inputs: dict[str, Any], *, enable_spec_decode: bool, runtime_draft_len: int
-    ):
-        """
-        Postprocess to make sure model forward doesn't change the inputs.
-        It is only used in cuda graph capture, because other cases will prepare
-        new inputs before the model forward.
-        """
-        if enable_spec_decode and not self._config.disable_overlap_scheduler:
-            if inputs["attn_metadata"].kv_cache_manager is not None:
-                num_seqs = inputs["attn_metadata"].num_seqs
-                num_ctx_requests = inputs["attn_metadata"].num_contexts
-                num_gen_requests = inputs["attn_metadata"].num_generations
-                num_ctx_tokens = inputs["attn_metadata"].num_ctx_tokens
-                num_chunked_ctx_requests = inputs["attn_metadata"].num_chunked_ctx_requests
-                previous_batch_tokens = inputs["input_ids"].shape[0] - num_ctx_tokens
-                if inputs["position_ids"].ndim == 3:  # mrope: [3, 1, N]
-                    inputs["position_ids"][:, :, num_ctx_tokens:] -= (
-                        self._buffers.previous_pos_id_offsets_cuda[:previous_batch_tokens]
-                    )
-                else:
-                    inputs["position_ids"][0, num_ctx_tokens:] -= (
-                        self._buffers.previous_pos_id_offsets_cuda[:previous_batch_tokens]
-                    )
-
-                # Only TrtllmAttentionMetadata has kv_lens_cuda.
-                if isinstance(inputs["attn_metadata"], TrtllmAttentionMetadata):
-                    if (
-                        num_ctx_requests >= num_chunked_ctx_requests
-                        and num_chunked_ctx_requests > 0
-                    ):
-                        inputs["attn_metadata"].kv_lens_cuda[
-                            num_ctx_requests - num_chunked_ctx_requests : num_ctx_requests
-                        ] -= self._buffers.previous_kv_lens_offsets_cuda[:num_chunked_ctx_requests]
-                    else:
-                        inputs["attn_metadata"].kv_lens_cuda[num_ctx_requests:num_seqs] -= (
-                            self._buffers.previous_kv_lens_offsets_cuda[:num_gen_requests]
-                        )
-                # Restore the FlashInfer-specific logical KV lengths through the same optional hook
-                # used by `_preprocess_inputs`.
-                elif hasattr(inputs["attn_metadata"], "apply_spec_decode_kv_lens_offsets"):
-                    inputs["attn_metadata"].apply_spec_decode_kv_lens_offsets(
-                        self._buffers.previous_kv_lens_offsets_cuda,
-                        num_gen_requests,
-                        self.get_runtime_tokens_per_gen_step(runtime_draft_len),
-                        num_chunked_contexts=num_chunked_ctx_requests,
-                        restore=True,
-                    )
-
-                if self.mapping.has_cp_helix() and getattr(
-                    inputs["attn_metadata"], "_helix_spec_tokens_valid", False
-                ):
-                    # Mirror of the helix position correction in
-                    # _preprocess_inputs (capture symmetry, like position_ids
-                    # above). The recompute's OVERWRITES (slots/bounds/
-                    # kv_lens) need no reversal: every consumer buffer is
-                    # rewritten from host state at the next step's prepare.
-                    inputs["attn_metadata"].helix_position_offsets[:previous_batch_tokens] -= (
-                        self._buffers.previous_pos_id_offsets_cuda[:previous_batch_tokens]
-                    )
-
     def _sync_group_all_greedy_sample(self, spec_metadata) -> None:
         """All-gather the per-rank greedy flags and store the group AND.
 
@@ -1039,7 +887,7 @@ class DecoderRunner(ScheduledModelRunner):
                                 )
 
                         def capture_postprocess_fn(inputs: dict[str, Any]):
-                            self._postprocess_inputs(
+                            self._inputs.postprocess_inputs(
                                 inputs,
                                 enable_spec_decode=enable_spec_decode,
                                 runtime_draft_len=runtime_draft_len,
@@ -1114,7 +962,7 @@ class DecoderRunner(ScheduledModelRunner):
         gather_ids: torch.Tensor | None = None,
         gather_context_logits: bool = False,
     ) -> dict[str, Any]:
-        inputs = self._preprocess_inputs(
+        inputs = self._inputs.preprocess_inputs(
             inputs, enable_spec_decode=enable_spec_decode, runtime_draft_len=runtime_draft_len
         )
         if inputs.get("spec_metadata", None):

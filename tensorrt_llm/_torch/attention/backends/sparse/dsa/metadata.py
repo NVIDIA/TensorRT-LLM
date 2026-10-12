@@ -613,17 +613,17 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
 
     def on_update_kv_lens(self) -> None:
         # After changing the kv_lens/kv_lens_cuda, we may need to update other metadatas.
-        # Especially for the changes in the _preprocess_inputs() of model_engine.py.
+        # Especially for the changes in DecoderInputPreparer.preprocess_inputs().
         #
         # NOTE:
         # In overlap scheduler + speculative decoding, kv_lens_cuda can be corrected at runtime
-        # (inside _preprocess_inputs) to account for variable accepted tokens. The indexer
+        # (inside preprocess_inputs) to account for variable accepted tokens. The indexer
         # slot_mapping_* buffers also depend on these effective cached lengths. If we do not
         # refresh slot mappings here, indexer K-cache updates can be written with stale offsets.
 
         super().on_update_kv_lens()
 
-        # _preprocess_inputs() also uses this as a general hook to "invalidate per-forward-pass
+        # preprocess_inputs() also uses this as a general hook to "invalidate per-forward-pass
         # caches so they are recomputed (and captured) on every _forward_step". Invalidate the
         # pool_view cache here so it is recomputed on the next
         # transform_local_topk_and_prepare_pool_view() call.
