@@ -14,6 +14,7 @@ l0_rtx_pro_6000:
       backend: pytorch
   tests:
   # ------------- PyTorch tests ---------------
+  - cpp/test_unit_tests.py::test_fmha_head104_unit_tests[120]
   - unittest/_torch/modeling -k "modeling_out_of_tree"
   # NCCL-EP v0.2 owns LL shared-memory sizing; cover the factory regression on SM120.
   - unittest/_torch/moe/test_communication_factory.py
@@ -22,6 +23,7 @@ l0_rtx_pro_6000:
   - unittest/_torch/visual_gen/test_attention_flashinfer.py
   # - unittest/_torch/modeling -k "modeling_qwen3" # https://nvbugs/5234573
   - unittest/_torch/attention/test_attention_mla.py
+  - unittest/_torch/attention/test_pixtral_head104_attention.py
   # SM120 W4A16 / W4A8 mixed-dtype GEMM coverage (paired with FinegrainedMixedDtypeGemm
   # MAX_SUPPORTED_SM_VERSION_W4A* gates and cutlass_heuristic.cpp SM120 routing).
   - unittest/_torch/thop/parallel/test_w4a16_linear.py

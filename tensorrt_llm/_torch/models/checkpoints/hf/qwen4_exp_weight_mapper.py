@@ -76,7 +76,10 @@ import torch
 from torch import nn
 
 from tensorrt_llm._torch.models.checkpoints.hf.qwen2_moe_weight_mapper import Qwen2MoeHfWeightMapper
-from tensorrt_llm._torch.models.modeling_utils import register_mapper
+from tensorrt_llm._torch.models.modeling_utils import (
+    concatenate_weights_by_tp_rank,
+    register_mapper,
+)
 from tensorrt_llm._torch.modules.qwen4_exp.ple import Qwen4ExpPinnedHostEmbedding
 from tensorrt_llm._torch.moe.fused_moe.interface import MoEWeightLoadingMode
 from tensorrt_llm._torch.moe.fused_moe.weight_owner import is_moe_weight_owner
@@ -87,36 +90,6 @@ _LM_PREFIX = "model.language_model."
 # The vision tower is loaded by the composite wrapper.
 _SKIP_PREFIXES = ("model.visual.",)
 _PER_EXPERT_PROJECTION_PATTERN = re.compile(r"^\d+\.(?:gate_proj|up_proj|down_proj)\.")
-
-
-def _rank_block(components: list[torch.Tensor], tp_size: int) -> torch.Tensor:
-    """Concat `components` (each `[out_i, ...]`) into the per-rank column-
-    parallel row order a contiguous `TensorParallelMode.COLUMN` split recovers.
-
-    At `tp_size == 1` this is a plain `[c0 | c1 | ...]` concat. At
-    `tp_size > 1` each component is split across ranks and the rank-`r` slices
-    are grouped together (`[c0_r0 c1_r0 ... | c0_r1 c1_r1 ... | ...]`), so a
-    later contiguous per-rank row split hands each rank its own head slice of
-    every component.
-    """
-    if not components:
-        raise ValueError("rank blocking requires at least one projection")
-    if tp_size <= 0:
-        raise ValueError(f"tp_size must be positive, got {tp_size}")
-    trailing_shape = components[0].shape[1:]
-    for component in components:
-        if component.ndim == 0 or component.shape[1:] != trailing_shape:
-            raise ValueError("rank-blocked projections must have matching trailing dimensions")
-        if component.shape[0] % tp_size:
-            raise ValueError(
-                f"projection rows {component.shape[0]} are not divisible by tp_size={tp_size}"
-            )
-    if tp_size == 1:
-        return torch.cat(components, dim=0)
-    rows: list[torch.Tensor] = []
-    for rank in range(tp_size):
-        rows.extend(split(c, tp_size, rank) for c in components)
-    return torch.cat(rows, dim=0)
 
 
 def _normalize_moe_module_weights(
@@ -363,7 +336,7 @@ class Qwen4ExpHfWeightMapper(Qwen2MoeHfWeightMapper):
                         f"{key} convolution width is {w.shape[1]}, expected {conv_kernel}"
                     )
                 conv_q, conv_k, conv_v = torch.split(w, [key_dim, key_dim, value_dim], dim=0)
-                new_weights[key] = _rank_block([conv_q, conv_k, conv_v], tp_size)
+                new_weights[key] = concatenate_weights_by_tp_rank([conv_q, conv_k, conv_v], tp_size)
             else:
                 new_weights[key] = tensor
 
@@ -376,7 +349,7 @@ class Qwen4ExpHfWeightMapper(Qwen2MoeHfWeightMapper):
                 )
             # Split the pre-fused in_proj_qkv [Q|K|V] into its Q/K/V sub-tensors
             # BEFORE rank-blocking. Passing the concatenated [Q|K|V] as one
-            # component makes _rank_block cut it at contiguous (key+key+value)/tp
+            # component cuts it at contiguous (key+key+value)/tp
             # boundaries, which scrambles Q/K/V across ranks at tp>1 (rank r would
             # get [Q[..], K[..]] instead of [Q_r|K_r|V_r]) -> garbage GDN output.
             # Each of Q, K, V, and Z is sharded independently. Mirror the
@@ -402,8 +375,8 @@ class Qwen4ExpHfWeightMapper(Qwen2MoeHfWeightMapper):
                         f"{tuple(parts[projection].shape)}, expected {expected_ba_shape}"
                     )
             q_t, k_t, v_t = torch.split(qkv_t, [key_dim, key_dim, value_dim], dim=0)
-            qkvz = _rank_block([q_t, k_t, v_t, parts["z"][:]], tp_size)
-            ba = _rank_block([parts["b"][:], parts["a"][:]], tp_size)
+            qkvz = concatenate_weights_by_tp_rank([q_t, k_t, v_t, parts["z"][:]], tp_size)
+            ba = concatenate_weights_by_tp_rank([parts["b"][:], parts["a"][:]], tp_size)
             expected_qkvz_rows = 2 * key_dim + 2 * value_dim
             if qkvz.shape[0] != expected_qkvz_rows:
                 raise ValueError(

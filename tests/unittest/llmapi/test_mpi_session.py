@@ -5,13 +5,17 @@ import os
 import subprocess  # nosec B404
 import sys
 import threading
+import time
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from subprocess import PIPE, Popen
 from typing import Literal
 
 import pytest
+import zmq
 
 from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
+from tensorrt_llm.executor.ipc import ZeroMqQueue
 from tensorrt_llm.llmapi.mpi_session import (_DEFAULT_IDENTITY_TIMEOUT,
                                              MPINodeState, MpiPoolSession,
                                              RemoteMpiCommSessionClient,
@@ -128,6 +132,76 @@ def run_client(server_addr, values_to_process, hmac_key: bytes):
 
     except Exception as e:
         return f"Error in client: {str(e)}"
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "response",
+    [[1, 1], RuntimeError("remote task failed"),
+     SystemExit(7)],
+    ids=["results", "error", "system-exit"])
+def test_remote_mpi_submit_sync_response_after_empty_poll(
+        monkeypatch: pytest.MonkeyPatch,
+        response: list[int] | BaseException) -> None:
+    """A response following an empty poll must wake the waiting client."""
+    first_empty_poll = threading.Event()
+    release_server = threading.Event()
+    address: Future[tuple[str, bytes]] = Future()
+    empty_poll_at: list[float] = []
+    monkeypatch.setattr(RemoteMpiCommSessionClient, "_global_instance", None)
+
+    def send_response() -> None:
+        # Each socket is created, used, and closed on its owning thread.
+        server = ZeroMqQueue(is_server=True)
+        server.socket.setsockopt(zmq.SNDTIMEO, 2000)
+        server.socket.setsockopt(zmq.LINGER, 0)
+        try:
+            address.set_result(server.address)
+            request = server.get(timeout=10)
+            assert request.sync
+            assert request.args == (-1, )
+            assert first_empty_poll.wait(10)
+            server.put(response)
+            assert release_server.wait(10)
+        finally:
+            server.close()
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        peer = executor.submit(send_response)
+        client = None
+        try:
+            endpoint, key = address.result(timeout=10)
+            client = RemoteMpiCommSessionClient(endpoint, hmac_key=key)
+            client.queue.socket.setsockopt(zmq.SNDTIMEO, 2000)
+            client.queue.socket.setsockopt(zmq.LINGER, 0)
+            poll = client.poll
+
+            def observe_poll() -> object:
+                if empty_poll_at and time.monotonic() - empty_poll_at[0] > 10:
+                    raise TimeoutError("Client did not receive the response")
+                result = poll()
+                if not result and not first_empty_poll.is_set():
+                    empty_poll_at.append(time.monotonic())
+                    first_empty_poll.set()
+                return result
+
+            # Observe the real socket poll; do not alter its timeout or result.
+            monkeypatch.setattr(client, "poll", observe_poll)
+            actual = client.submit_sync(abs, -1)
+            elapsed = time.monotonic() - empty_poll_at[0]
+        finally:
+            release_server.set()
+            if client is not None:
+                client.queue.close()
+            peer.result(timeout=10)
+
+    assert first_empty_poll.is_set()
+    assert elapsed < 2, f"Client waited {elapsed:.3f}s after an empty poll"
+    if isinstance(response, BaseException):
+        assert type(actual) is type(response)
+        assert actual.args == response.args
+    else:
+        assert actual == response
 
 
 @pytest.mark.cpu_only
@@ -285,15 +359,28 @@ def _launcher_env(tmp_path: Path, home: str) -> dict:
     ``python3`` and ``openssl`` are stubbed so the launcher can hand out an IPC
     address and an HMAC key without importing tensorrt_llm; the stubbed
     ``python3 -S`` used for the workspace lock exits 0, so the persistent slot
-    is treated as acquired.
+    is treated as acquired. Process guard invocations execute the real Python
+    helper so launcher registration and cleanup retain their normal behavior.
     """
     stub_bin = tmp_path / "bin"
     stub_bin.mkdir(exist_ok=True)
     python_stub = stub_bin / "python3"
-    python_stub.write_text("#!/bin/sh\n"
-                           "if [ \"$1\" = \"-c\" ]; then\n"
-                           "    echo ipc:///tmp/trtllm-pmi-workspace-test\n"
-                           "fi\n")
+    stop_fifo = tmp_path / "launcher-stop"
+    os.mkfifo(stop_fifo)
+    python_stub.write_text(
+        "#!/bin/sh\n"
+        "if [ \"$1\" = \"-S\" ] && "
+        "[ \"${2##*/}\" = \"_llmapi_process_guard.py\" ]; then\n"
+        "    exec \"$LAUNCHER_TEST_PYTHON\" \"$@\"\n"
+        "elif [ \"$1\" = \"-c\" ]; then\n"
+        "    echo ipc:///tmp/trtllm-pmi-workspace-test\n"
+        "elif [ \"$1\" = \"-m\" ]; then\n"
+        "    if [ \"$4\" = \"stop\" ]; then\n"
+        "        echo stop > \"$LAUNCHER_TEST_STOP_FIFO\"\n"
+        "    else\n"
+        "        read message < \"$LAUNCHER_TEST_STOP_FIFO\"\n"
+        "    fi\n"
+        "fi\n")
     python_stub.chmod(0o755)
     openssl_stub = stub_bin / "openssl"
     openssl_stub.write_text("#!/bin/sh\nprintf '%064d\\n' 0\n")
@@ -303,6 +390,8 @@ def _launcher_env(tmp_path: Path, home: str) -> dict:
     for name in _LAUNCHER_ENV_SCRUB:
         env.pop(name, None)
     env["PMI_RANK"] = "0"
+    env["LAUNCHER_TEST_STOP_FIFO"] = str(stop_fifo)
+    env["LAUNCHER_TEST_PYTHON"] = sys.executable
     env["HOME"] = home
     env["PATH"] = f"{stub_bin}{os.pathsep}{env['PATH']}"
     return env
@@ -561,3 +650,123 @@ def test_prefetch_fallback_identity_timeout_matches_mpi_default():
     from test_common.session_prefetcher import _FALLBACK_IDENTITY_TIMEOUT
 
     assert _FALLBACK_IDENTITY_TIMEOUT == _DEFAULT_IDENTITY_TIMEOUT
+
+
+class _FakeCommExecutor:
+    """Stand-in for the entered MPICommExecutor context manager."""
+
+    def __init__(self, block: bool = False, fail: bool = False):
+        self.block = block
+        self.fail = fail
+        self.release = threading.Event()
+        self.exited = threading.Event()
+
+    def __exit__(self, exc_type, exc_value, tb):
+        if self.block:
+            # A wedged worker rank: the join does not return until the test
+            # releases it (so the closer thread does not leak past the test).
+            self.release.wait(30)
+        self.exited.set()
+        if self.fail:
+            raise RuntimeError("simulated executor close failure")
+
+
+def _wait_closer_thread_gone(timeout: float = 5.0) -> None:
+    import time as _time
+    deadline = _time.monotonic() + timeout
+    while _time.monotonic() < deadline:
+        if not any(t.name == "MpiCommExecutorCloser"
+                   for t in threading.enumerate()):
+            return
+        _time.sleep(0.02)
+    raise AssertionError("MpiCommExecutorCloser remained alive after "
+                         f"{timeout}s")
+
+
+@pytest.fixture
+def _global_executor_state():
+    """Snapshot/restore the module-global executor slots around a test."""
+    saved = (MPINodeState._global_comm_executor, MPINodeState._global_mpi_pool)
+    yield
+    (MPINodeState._global_comm_executor, MPINodeState._global_mpi_pool) = saved
+
+
+@pytest.mark.cpu_only
+def test_server_close_releases_the_global_comm_executor(_global_executor_state):
+    """The server's final shutdown must close the shared COMM_WORLD executor.
+
+    ``MpiCommSession.shutdown()`` deliberately leaves the shared pool running
+    (multiple LLM instances reuse it), so without this close the non-leader
+    ranks stay blocked in the executor's task loop after the client is gone
+    -- the teardown hang behind a serve that could only die by hard kill.
+    """
+    from tensorrt_llm.llmapi.mpi_session import RemoteMpiCommSessionServer
+
+    fake = _FakeCommExecutor()
+    MPINodeState._global_comm_executor = fake
+    MPINodeState._global_mpi_pool = object()
+    aborted = []
+
+    RemoteMpiCommSessionServer._close_global_comm_executor(
+        grace=5.0, abort=lambda: aborted.append(True))
+
+    assert fake.exited.is_set()
+    assert not aborted
+    _wait_closer_thread_gone()
+    assert MPINodeState._global_comm_executor is None
+    assert MPINodeState._global_mpi_pool is None
+
+
+@pytest.mark.cpu_only
+def test_server_close_escalates_to_abort_when_the_join_wedges(
+        _global_executor_state):
+    """A worker stranded in a collective must not block teardown forever."""
+    from tensorrt_llm.llmapi.mpi_session import RemoteMpiCommSessionServer
+
+    fake = _FakeCommExecutor(block=True)
+    MPINodeState._global_comm_executor = fake
+    aborted = []
+
+    RemoteMpiCommSessionServer._close_global_comm_executor(
+        grace=0.2, abort=lambda: aborted.append(True))
+
+    assert aborted == [True]
+    # Release the wedged join so the closer thread ends inside the test
+    # (pytest-threadleak checks for leaked threads per test).
+    fake.release.set()
+    fake.exited.wait(5)
+    _wait_closer_thread_gone()
+
+
+@pytest.mark.cpu_only
+def test_server_close_escalates_to_abort_when_exit_raises(
+        _global_executor_state):
+    """Escalate to abort when the executor's ``__exit__`` raises.
+
+    A raised ``__exit__`` means the executor did not cleanly release, so peers
+    can stay blocked; the global refs are already cleared, so nothing else will
+    close them -- escalate the same way a timeout does.
+    """
+    from tensorrt_llm.llmapi.mpi_session import RemoteMpiCommSessionServer
+
+    fake = _FakeCommExecutor(fail=True)
+    MPINodeState._global_comm_executor = fake
+    aborted = []
+
+    RemoteMpiCommSessionServer._close_global_comm_executor(
+        grace=5.0, abort=lambda: aborted.append(True))
+
+    assert fake.exited.is_set()
+    assert aborted == [True]
+    _wait_closer_thread_gone()
+    assert MPINodeState._global_comm_executor is None
+
+
+@pytest.mark.cpu_only
+def test_server_close_is_a_noop_without_a_global_executor(
+        _global_executor_state):
+    from tensorrt_llm.llmapi.mpi_session import RemoteMpiCommSessionServer
+
+    MPINodeState._global_comm_executor = None
+    # Must not touch MPI at all (no abort callable is even constructed).
+    RemoteMpiCommSessionServer._close_global_comm_executor(grace=0.1)

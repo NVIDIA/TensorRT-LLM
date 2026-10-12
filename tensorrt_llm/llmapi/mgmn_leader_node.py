@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 '''
 This script is used to start the MPICommSession in the rank0 and wait for the
 MPI Proxy process to connect and get the MPI task to run.
@@ -41,14 +43,21 @@ def stop_server_main():
                         is_server=False,
                         socket_type=zmq.PAIR)
 
+    # Only queue the stop message once a peer is connected, and bound both
+    # sending and context termination if that peer disappears during shutdown.
+    queue.socket.setsockopt(zmq.IMMEDIATE, 1)
+    queue.socket.setsockopt(zmq.SNDTIMEO, 5000)
+    queue.socket.setsockopt(zmq.LINGER, 1000)
     try:
         logger_debug(
             f"RemoteMpiCommSessionClient [rank{global_mpi_rank()}] send shutdown signal to server\n",
             "green")
         queue.put(None)  # ask RemoteMpiCommSessionServer to shutdown
-    except zmq.error.ZMQError as e:
-        logger_debug(f"Error during RemoteMpiCommSessionClient shutdown: {e}\n",
-                     "red")
+    except zmq.error.ZMQError as error:
+        raise click.ClickException(
+            f"Failed to send MPI Comm server shutdown: {error}") from error
+    finally:
+        queue.close()
 
 
 @click.command()

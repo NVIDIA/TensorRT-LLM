@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2020-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2020-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -2199,8 +2199,16 @@ def selected_mask_types(kspec):
             custom_mask = '0'
         # encoder models (head_size = 32 / 64 / 128) need packed_qkv input layout + padding mask.
         elif kspec.input_layout == InputLayout.PACKED_QKV:
-            # NOTE: 72/80 are added for vision transformer
-            if kspec.head_size not in [32, 64, 72, 80, 128]:
+            # NOTE: 72/80 are added for vision transformers. Pixtral's head size
+            # 104 uses warp specialization on SM90 and non-tiled kernels on SM120.
+            pixtral_padding = kspec.head_size == 104 and (
+                kspec.sm == 100 or
+                (kspec.sm in (90, 120) and kspec.dtype in
+                 ('fp16', 'bf16', 'fp16_fp32') and not kspec.enable_skip_softmax
+                 and kspec.warp_specialization == (kspec.sm == 90) and
+                 (kspec.sm != 120 or not kspec.tiled)))
+            if (kspec.head_size not in [32, 64, 72, 80, 128]
+                    and not pixtral_padding):
                 padding_mask = '0'
         # only cross attention (head_size = 32/64/128) needs contiguous_q_kv input layout + padding mask / custom_mask.
         elif kspec.input_layout == InputLayout.CONTIGUOUS_Q_KV:
@@ -6904,10 +6912,10 @@ def enumerate_kernels():
                   and kspec.cross_mha     == False
                   and kspec.flash_attention == True
                   and kspec.input_layout != InputLayout.SEPARATE_Q_K_V)
-                  # Gemma3 VL support.
+                  # Gemma3 VL and Pixtral VL support.
                   or  (kspec.sm           == 100
                   and kspec.dtype         in ['fp16', 'bf16', 'fp16_fp32', 'e4m3', 'e4m3_fp32']
-                  and kspec.head_size     == 72
+                  and kspec.head_size     in [72, 104]
                   and kspec.head_size_v   == 0
                   and kspec.sage_block_sizes is None
                   and kspec.version       == 2

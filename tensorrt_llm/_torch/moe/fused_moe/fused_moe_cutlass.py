@@ -176,10 +176,9 @@ class CutlassFusedMoE(MoEImplBase):
             "sm_constraint": ("in", {100, 103, 107, 120, 121}),
             "dtypes": {torch.float16, torch.bfloat16},
         },
-        # MXFP8 (W8A8 e4m3xe4m3 with UE8M0 1x32 block scales): SM in {100, 103}.
-        # M3.1 enables construction/load; the fused kernel is M3.2.
+        # MXFP8 uses SM100-family block-scaled kernels, including SM107.
         QuantAlgo.MXFP8: {
-            "sm_constraint": ("in", {100, 103}),
+            "sm_constraint": ("in", {100, 103, 107}),
             "dtypes": {torch.float16, torch.bfloat16},
         },
     }
