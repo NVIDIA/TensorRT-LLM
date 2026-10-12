@@ -997,10 +997,12 @@ class TestKvCacheManagerV2AutoResolution:
                          id="disagg-nixl-python"),
         ],
     )
-    def test_required_v2_resolves_on_supported_routes(self,
-                                                      cache_transceiver_config):
+    def test_required_v2_resolves_on_supported_routes(
+            self,
+            cache_transceiver_config: CacheTransceiverConfig | None) -> None:
         llm_args = TorchLlmArgs(
             model="/tmp/dummy_model",
+            kv_cache_config=KvCacheConfig(use_kv_cache_manager_v2="auto"),
             cache_transceiver_config=cache_transceiver_config)
 
         assert _resolve_kv_cache_manager_v2_auto(llm_args,
@@ -1011,10 +1013,12 @@ class TestKvCacheManagerV2AutoResolution:
         pytest.param("NIXL", "CPP", id="nixl-cpp"),
         pytest.param("UCX", "PYTHON", id="ucx-python"),
     ])
-    def test_required_v2_refuses_incompatible_disagg(self, backend, runtime):
+    def test_required_v2_refuses_incompatible_disagg(self, backend: str,
+                                                     runtime: str) -> None:
         """A required V2 is refused on the demotion arm, never demoted."""
         llm_args = TorchLlmArgs(
             model="/tmp/dummy_model",
+            kv_cache_config=KvCacheConfig(use_kv_cache_manager_v2="auto"),
             cache_transceiver_config=CacheTransceiverConfig(
                 backend=backend, transceiver_runtime=runtime),
         )
