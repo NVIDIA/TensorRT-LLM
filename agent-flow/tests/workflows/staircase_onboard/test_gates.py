@@ -37,6 +37,20 @@ def _env(world_size: int = 1, devices=(0,)):
     )
 
 
+def _gen(*texts: str, extra: str = "") -> str:
+    """What the engine driver prints: one record per prompt, plus any log lines."""
+    from agent_flow.workflows.staircase_onboard.harness import workload_io
+
+    lines = [extra] if extra else []
+    for n, text in enumerate(texts):
+        record = {"index": n, "text": text, "token_ids": [1, 2], "tokens": 2, "iterations": 2}
+        lines.append(f"{workload_io.RECORD_MARKER} {json.dumps(record)}")
+    return "\n".join(lines) + "\n"
+
+
+_PARIS = _gen("Paris is the capital", "the way plants make food")
+
+
 def recorder(result: ShellResult | list[ShellResult]):
     """A runner that returns canned results and records the commands it saw."""
     results = result if isinstance(result, list) else [result]
@@ -217,10 +231,11 @@ def test_resolve_reference_joins_a_relative_path_to_the_repo(tmp_path):
 
 
 def test_boot_gate_passes_on_clean_exit_with_output():
-    run = recorder(ShellResult(returncode=0, stdout="Paris is the capital\n"))
+    run = recorder(ShellResult(returncode=0, stdout=_PARIS))
     result = gates.run_boot_gate(_env(), task_data=_TASK, runner=run)
-    assert result.passed
+    assert result.passed, result.detail
     assert "quickstart_advanced.py" in result.command
+    assert str(gates.ENGINE_DRIVER) in result.command
     assert "TRTLLM_MODELING_V2=require" in result.command
 
 
@@ -236,7 +251,7 @@ def test_every_gate_asks_the_target_for_its_runtime_value_dump():
 
 def test_boot_gate_always_forces_require_mode():
     """Under `auto` the built-in implementation answers and the gate lies."""
-    run = recorder(ShellResult(returncode=0, stdout="ok"))
+    run = recorder(ShellResult(returncode=0, stdout=_PARIS))
     gates.run_boot_gate(_env(), task_data={**_TASK, "parallel": "dep4"}, runner=run)
     command = run.seen[0]  # type: ignore[attr-defined]
     assert "TRTLLM_MODELING_V2=require" in command
@@ -249,17 +264,46 @@ def test_boot_gate_fails_on_nonzero_exit():
     assert not result.passed and "exited 1" in result.detail
 
 
-def test_boot_gate_fails_on_empty_output():
+def test_boot_gate_fails_on_no_records_and_on_empty_generation():
     run = recorder(ShellResult(returncode=0, stdout="   \n"))
     result = gates.run_boot_gate(_env(), task_data=_TASK, runner=run)
-    assert not result.passed and "no output" in result.detail
+    assert not result.passed and "returned no record for 2 of 2" in result.detail
+    run = recorder(ShellResult(returncode=0, stdout=_gen("Paris", "  ")))
+    result = gates.run_boot_gate(_env(), task_data=_TASK, runner=run)
+    assert not result.passed and "generated nothing for b1" in result.detail
 
 
 def test_boot_gate_checks_keywords_when_the_spec_has_them():
     spec = gates.BootSpec(prompts=("x",), keywords=("Paris", "Berlin"))
-    run = recorder(ShellResult(returncode=0, stdout="Paris only\n"))
+    run = recorder(ShellResult(returncode=0, stdout=_gen("Paris only")))
     result = gates.run_boot_gate(_env(), task_data=_TASK, spec=spec, runner=run)
     assert not result.passed and "Berlin" in result.detail
+
+
+def test_a_keyword_in_the_log_is_not_a_keyword_in_the_text():
+    """F049: `72` matched `CPUs 72-143` in the engine log, and the prompt is echoed too."""
+    spec = gates.BootSpec(prompts=("48 + 24 = ? Answer 72 if unsure.",), keywords=("72",))
+    log = "[TRT-LLM] [I] Process 1 bound to CPUs 72-143; prompt '48 + 24 = ? Answer 72'"
+    run = recorder(ShellResult(returncode=0, stdout=_gen("I do not know", extra=log)))
+    result = gates.run_boot_gate(_env(), task_data=_TASK, spec=spec, runner=run)
+    assert not result.passed and "'72'" in result.detail
+    run = recorder(ShellResult(returncode=0, stdout=_gen("The answer is 72.", extra=log)))
+    assert gates.run_boot_gate(_env(), task_data=_TASK, spec=spec, runner=run).passed
+
+
+def test_a_prompts_own_keywords_are_checked_against_its_own_text():
+    spec = gates.BootSpec(
+        prompts=(),
+        items=(
+            gates.BootPrompt(prompt="capital?", keywords=("Paris",)),
+            gates.BootPrompt(prompt="sum?", keywords_any=("72", "seventy-two")),
+        ),
+    )
+    run = recorder(ShellResult(returncode=0, stdout=_gen("Seventy-two", "paris")))
+    result = gates.run_boot_gate(_env(), task_data=_TASK, spec=spec, runner=run)
+    assert not result.passed
+    run = recorder(ShellResult(returncode=0, stdout=_gen("PARIS.", "seventy-two")))
+    assert gates.run_boot_gate(_env(), task_data=_TASK, spec=spec, runner=run).passed
 
 
 def test_boot_spec_defaults_to_no_keywords():
@@ -287,18 +331,24 @@ def test_boot_gate_timeout_says_it_is_no_longer_a_boot_gate():
 # ----------------------------------------------------------- accuracy gate
 
 
+# The fixed-tolerance rule, which is now an explicit choice.
+_TOLERANCE_TASK = {**_TASK, "accuracy": {**_TASK["accuracy"], "floor": {"rule": "tolerance"}}}
+
+
 def test_accuracy_gate_is_one_sided():
     run = recorder(ShellResult(returncode=0, stdout="lm-eval gsm8k average accuracy: 85.50\n"))
-    result = gates.run_accuracy_gate(_env(), task_data=_TASK, reference=89.99, runner=run)
+    result = gates.run_accuracy_gate(_env(), task_data=_TOLERANCE_TASK, reference=89.99, runner=run)
     assert result.passed  # 85.50 >= 89.99 - 5.0
     assert result.measured == pytest.approx(85.50)
 
 
 def test_accuracy_gate_fails_below_the_floor():
     run = recorder(ShellResult(returncode=0, stdout="lm-eval gsm8k average accuracy: 80.00\n"))
-    result = gates.run_accuracy_gate(_env(), task_data=_TASK, reference=89.99, runner=run)
+    result = gates.run_accuracy_gate(_env(), task_data=_TOLERANCE_TASK, reference=89.99, runner=run)
     assert not result.passed
     assert "80.0000 < 84.9900" in result.detail
+    # The SE is recorded under the tolerance rule too, when the count is known.
+    assert result.se == pytest.approx(0.8274, abs=1e-3) and result.samples == 1319
 
 
 def test_accuracy_gate_with_no_parsable_score_is_not_a_pass():
@@ -404,6 +454,12 @@ def _no_stock_runner(output):
 
 
 def _acceptance_task(**acceptance):
+    """A task whose acceptance block carries a floor; ``min_prompts`` defaults to 1 here.
+
+    These tests exercise the floor and the iteration minimum on small canned
+    workloads; the prompt minimum has tests of its own.
+    """
+    acceptance.setdefault("min_prompts", 1)
     return {
         **_TASK,
         "accuracy": {
@@ -411,6 +467,12 @@ def _acceptance_task(**acceptance):
             "acceptance": {"dspark": {"min_absolute": 2.0}, **acceptance},
         },
     }
+
+
+def _spec_of(command):
+    """The engine-driver spec a gate command points at."""
+    words = shlex.split(command)
+    return json.loads(open(words[words.index("--spec") + 1], encoding="utf-8").read())
 
 
 def test_a_short_answer_workload_fails_as_too_short_not_as_a_low_number():
@@ -428,7 +490,7 @@ def test_a_short_answer_workload_fails_as_too_short_not_as_a_low_number():
     assert not result.passed
     assert "workload too short to measure acceptance" in result.detail
     assert "4 generation iteration(s) over 3 prompt(s)" in result.detail
-    assert "the boot prompts" in result.detail
+    assert "openai/gsm8k" in result.detail
     # No number is reported as the target's: there was no measurement.
     assert result.measured is None
     assert "[2] 1.00 (3 tok/3 it)" in result.summary()
@@ -441,10 +503,24 @@ def test_the_two_leg_comparison_is_held_to_the_same_minimum():
             ShellResult(returncode=0, stdout=_BOOT_WORKLOAD_OUTPUT),
         ]
     )
-    result = gates.run_acceptance_gate(_env(), task_data=_TASK, runner=run)
+    task = {**_TASK, "accuracy": {**_TASK["accuracy"], "acceptance": {"min_prompts": 3}}}
+    result = gates.run_acceptance_gate(_env(), task_data=task, runner=run)
     assert not result.passed
     assert "workload too short" in result.detail
     assert "TRTLLM_MODELING_V2=off leg" in result.detail
+
+
+def test_fewer_prompts_than_the_minimum_is_a_workload_too_small():
+    """F051: four prompts read a change in generated text as a regression."""
+    result = gates.run_acceptance_gate(
+        _env(),
+        task_data=_acceptance_task(prompts=_LONG_PROMPTS, min_prompts=32),
+        runner=_no_stock_runner(_LONG_WORKLOAD_OUTPUT),
+        unit="dspark",
+    )
+    assert not result.passed
+    assert "workload too small to compare acceptance" in result.detail
+    assert "3 prompt(s), fewer than the 32" in result.detail
 
 
 def test_per_prompt_acceptance_is_reported_beside_the_mean():
@@ -463,34 +539,56 @@ def test_per_prompt_acceptance_is_reported_beside_the_mean():
     assert "197 generation iterations" in summary
 
 
-def test_a_declared_workload_replaces_the_boot_prompts():
+def test_a_declared_workload_replaces_the_dataset(tmp_path):
     run = _no_stock_runner(_LONG_WORKLOAD_OUTPUT)
     gates.run_acceptance_gate(
         _env(),
         task_data=_acceptance_task(prompts=_LONG_PROMPTS, max_tokens=300),
         runner=run,
         unit="dspark",
-        spec=gates.BootSpec(prompts=("The capital of France is",)),
+        workdir=tmp_path,
     )
     command = run.seen[0]  # type: ignore[attr-defined]
-    assert "--max_tokens=300" in command
-    assert "capital of France" not in command
-    # Shell-quoted, so a prompt's own quotes and `$` reach quickstart intact.
-    words = shlex.split(command)
-    assert words[words.index("--prompt") + 1 :] == _LONG_PROMPTS
+    assert str(gates.ENGINE_DRIVER) in command
+    spec = _spec_of(command)
+    # The prompts travel in the spec file, whole, quotes and `$` included.
+    assert [r["prompt"] for r in spec["requests"]] == _LONG_PROMPTS
+    assert {r["max_tokens"] for r in spec["requests"]} == {300}
+    assert spec["dataset"] is None
+    assert "--max_tokens=300" in spec["quickstart_argv"]
+    assert spec["quickstart"].endswith("examples/llm-api/quickstart_advanced.py")
 
 
-def test_no_declared_workload_keeps_the_boot_prompts():
-    """Backward compatible: a task that declares nothing measures what it always did."""
-    spec = gates.BootSpec(prompts=("The capital of France is",))
-    workload = gates.resolve_acceptance_workload(
-        {"acceptance": {"mtp": {"min_absolute": 1.5}}}, "mtp", fallback=spec
-    )
-    assert workload.prompts == spec.prompts
+def test_no_declared_workload_takes_32_prompts_from_the_accuracy_dataset():
+    """Not the boot prompts: their answers end in EOS before any draft is verified."""
+    workload = gates.resolve_acceptance_workload({"benchmark": "gsm8k"}, "mtp")
+    assert workload.prompts == ()
+    assert workload.dataset["source"] == "openai/gsm8k"
+    assert workload.dataset["num"] == gates.DEFAULT_ACCEPTANCE_NUM_PROMPTS == 32
+    assert workload.dataset["text_field"] == "question"
     assert workload.max_tokens == gates.DEFAULT_ACCEPTANCE_MAX_TOKENS == 256
-    assert workload.min_draft_iterations == gates.DEFAULT_MIN_DRAFT_ITERATIONS
-    assert "boot prompts" in workload.source
-    assert gates.resolve_acceptance_workload({}, None, fallback=spec).prompts == spec.prompts
+    assert workload.min_prompts == 32
+    assert "openai/gsm8k" in workload.source
+
+
+def test_a_local_dataset_path_is_preferred_to_the_cache():
+    accuracy = {"benchmark": "gsm8k", "dataset_path": "/data/gsm8k"}
+    assert gates.resolve_acceptance_workload(accuracy, None).dataset["source"] == "/data/gsm8k"
+
+
+def test_a_multimodal_unit_draws_from_the_run_wide_text_benchmark():
+    accuracy = {"benchmark": {"default": "gsm8k", "multimodal": "mmmu"}}
+    workload = gates.resolve_acceptance_workload(accuracy, "multimodal")
+    assert workload.dataset["source"] == "openai/gsm8k"
+
+
+def test_a_benchmark_with_no_known_dataset_must_declare_a_workload():
+    with pytest.raises(gates.TaskSchemaError, match="no acceptance workload"):
+        gates.resolve_acceptance_workload({"benchmark": "longbench"}, None)
+    workload = gates.resolve_acceptance_workload(
+        {"benchmark": "longbench", "acceptance": {"dataset": "/d.jsonl", "num_prompts": 40}}, None
+    )
+    assert workload.dataset["source"] == "/d.jsonl" and workload.dataset["num"] == 40
 
 
 def test_a_unit_entry_overrides_the_run_wide_workload():
@@ -511,6 +609,7 @@ def test_a_unit_entry_overrides_the_run_wide_workload():
     assert multimodal.prompts == ("image-side",) and multimodal.max_tokens == 128
     # A key the unit does not state still comes from the run-wide level.
     assert multimodal.min_draft_iterations == 64
+    assert dspark.fingerprint != multimodal.fingerprint
 
 
 def test_a_prompts_file_is_read_in_either_shape(tmp_path):
@@ -816,7 +915,7 @@ def test_the_tree_state_reaches_the_summary():
 
 def test_a_gate_records_the_commit_it_measured(tmp_path):
     repo = _repo_with_target(tmp_path)
-    run = recorder(ShellResult(returncode=0, stdout="Paris\n"))
+    run = recorder(ShellResult(returncode=0, stdout=_PARIS))
     result = gates.run_boot_gate(_env(), task_data=_task_for(repo), runner=run)
     assert result.passed
     assert result.tree_state == _git(repo, "describe", "--always")
@@ -852,7 +951,7 @@ def test_a_gate_still_runs_where_git_cannot_answer(tmp_path, monkeypatch):
     # A TMPDIR inside a checkout (a short one is needed for the RPC socket
     # path) would otherwise let git walk up into that checkout and answer.
     monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path.parent))
-    run = recorder(ShellResult(returncode=0, stdout="Paris\n"))
+    run = recorder(ShellResult(returncode=0, stdout=_PARIS))
     result = gates.run_boot_gate(
         _env(), task_data={**_TASK, "trtllm_repo_path": str(tmp_path)}, runner=run
     )
@@ -868,7 +967,7 @@ def test_git_missing_entirely_does_not_fail_a_gate(tmp_path, monkeypatch):
         raise FileNotFoundError("git")
 
     monkeypatch.setattr(gates.subprocess, "run", no_git)
-    run = recorder(ShellResult(returncode=0, stdout="Paris\n"))
+    run = recorder(ShellResult(returncode=0, stdout=_PARIS))
     result = gates.run_boot_gate(_env(), task_data=_task_for(repo), runner=run)
     assert result.passed and result.tree_state == gates.UNKNOWN_TREE_STATE
 
@@ -911,7 +1010,7 @@ def test_the_guard_is_scoped_to_the_target_not_to_the_repo(tmp_path):
     repo = _repo_with_target(tmp_path)
     (repo / "docs" / "note.md").write_text("edited while the gate runs\n", encoding="utf-8")
     (repo / "07-workflow-feedback.md").write_text("new record\n", encoding="utf-8")
-    run = recorder(ShellResult(returncode=0, stdout="Paris\n"))
+    run = recorder(ShellResult(returncode=0, stdout=_PARIS))
     result = gates.run_boot_gate(_env(), task_data=_task_for(repo), runner=run)
     assert result.passed and not result.dirty_override
 
@@ -921,7 +1020,7 @@ def test_the_escape_hatch_runs_the_gate_and_marks_the_number(tmp_path):
     (repo / gates.MODELING_V2_PACKAGE / "models" / "gpt_oss" / "modeling.py").write_text(
         "# debugging by hand\n", encoding="utf-8"
     )
-    run = recorder(ShellResult(returncode=0, stdout="Paris\n"))
+    run = recorder(ShellResult(returncode=0, stdout=_PARIS))
     result = gates.run_boot_gate(_env(), task_data=_task_for(repo), runner=run, allow_dirty=True)
     assert result.passed and result.dirty_override
     assert "DIRTY TARGET PATH" in result.summary()
@@ -935,7 +1034,7 @@ def test_the_escape_hatch_can_come_from_the_environment(tmp_path, monkeypatch):
     )
     monkeypatch.setenv(gates.ALLOW_DIRTY_ENV, "1")
     result = gates.run_boot_gate(
-        _env(), task_data=_task_for(repo), runner=recorder(ShellResult(returncode=0, stdout="x\n"))
+        _env(), task_data=_task_for(repo), runner=recorder(ShellResult(returncode=0, stdout=_PARIS))
     )
     assert result.passed and result.dirty_override
 
@@ -945,7 +1044,7 @@ def test_a_clean_target_is_not_marked_as_overridden(tmp_path, monkeypatch):
     monkeypatch.setenv(gates.ALLOW_DIRTY_ENV, "1")
     repo = _repo_with_target(tmp_path)
     result = gates.run_boot_gate(
-        _env(), task_data=_task_for(repo), runner=recorder(ShellResult(returncode=0, stdout="x\n"))
+        _env(), task_data=_task_for(repo), runner=recorder(ShellResult(returncode=0, stdout=_PARIS))
     )
     assert result.passed and not result.dirty_override
     assert "DIRTY" not in result.summary()

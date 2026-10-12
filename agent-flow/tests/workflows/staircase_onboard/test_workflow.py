@@ -21,6 +21,7 @@ import yaml
 from agent_flow.workflows.staircase_onboard import progress as progress_mod
 from agent_flow.workflows.staircase_onboard import vocabulary as vocab
 from agent_flow.workflows.staircase_onboard.gates import ShellResult
+from agent_flow.workflows.staircase_onboard.harness import workload_io
 from agent_flow.workflows.staircase_onboard.preflight import CommandResult
 from agent_flow.workflows.staircase_onboard.state import (
     STAGE_ASSEMBLE,
@@ -178,6 +179,49 @@ def healthy_smi(count: int = 1):
     return runner
 
 
+def driver_records(accepted: int = 320, iterations: int = 100, prompts: int = 32) -> str:
+    """What the engine driver prints for ``prompts`` prompts accepting alike."""
+    lines = []
+    for n in range(prompts):
+        record = {
+            "index": n,
+            "id": f"d{n}",
+            "prompt_sha": f"p{n}",
+            "tokens": accepted,
+            "iterations": iterations,
+            "token_ids": list(range(accepted)),
+            "text": "Paris is the capital of France",
+        }
+        lines.append(f"{workload_io.RECORD_MARKER} {json.dumps(record)}")
+    return "\n".join(lines) + "\n"
+
+
+def other_driver_gate(command: str) -> bool:
+    """A driver gate other than boot, which a boot-counting fake passes through."""
+    return (
+        "engine_driver.py" in command and "/boot." not in command
+    ) or "serve_smoke.py" in command
+
+
+def serve_output(requests: int = 32, status: int = 200) -> str:
+    """What the serve smoke prints for an entry that answers every request."""
+    lines = []
+    for n in range(requests):
+        record = {"index": n, "id": f"d{n}", "status": status, "text": "#### 1", "correct": True}
+        lines.append(f"{workload_io.SERVE_MARKER} {json.dumps(record)}")
+    summary = {
+        "requests": requests,
+        "started": True,
+        "http_errors": 0 if status == 200 else requests,
+        "scored": requests,
+        "correct": requests,
+        "accuracy": 100.0,
+        "leftover_pids": [],
+    }
+    lines.append(f"{workload_io.SERVE_SUMMARY_MARKER} {json.dumps(summary)}")
+    return "\n".join(lines) + "\n"
+
+
 def passing_shell(score: float = 90.0, accepted: int = 320, iterations: int = 100, dirt: str = ""):
     def runner(command, env=None, timeout=0):
         probe = git_probe(command, dirt=dirt)
@@ -185,10 +229,15 @@ def passing_shell(score: float = 90.0, accepted: int = 320, iterations: int = 10
             return probe
         if "trtllm-eval" in command:
             return ShellResult(returncode=0, stdout=f"lm-eval gsm8k average accuracy: {score}\n")
-        # The acceptance gate runs the QUICKSTART command, because nothing in
-        # tree makes `trtllm-eval` report a speculative statistic. The fake
-        # has to print what the real script prints, or every speculator unit
-        # is unpassable for a reason that looks like a broken draft path.
+        # The gates that need per-request structure run the engine driver,
+        # which prints one record per prompt; the acceptance gate wants 32 of
+        # them. The fake has to print what the real driver prints, or every
+        # speculator unit is unpassable for a reason that looks like a broken
+        # draft path.
+        if "engine_driver.py" in command:
+            return ShellResult(returncode=0, stdout=driver_records(accepted, iterations))
+        if "serve_smoke.py" in command:
+            return ShellResult(returncode=0, stdout=serve_output())
         return ShellResult(
             returncode=0,
             stdout=(
@@ -424,10 +473,12 @@ def test_a_failing_boot_gate_loops_back_to_the_assembler(tmp_path, task_file, mo
             # be miscounted as a boot attempt. It is left failing on purpose:
             # a run whose survey does not land still has to complete.
             return ShellResult(returncode=1, stderr="no engine here")
+        if other_driver_gate(command):
+            return passing_shell()(command, env, timeout)
         attempts["boot"] += 1
         if attempts["boot"] == 1:
             return ShellResult(returncode=1, stderr="CUDA error")
-        return ShellResult(returncode=0, stdout="Paris\n")
+        return ShellResult(returncode=0, stdout=driver_records())
 
     workflow = _workflow(tmp_path, shell_runner=flaky)
     calls = _install(monkeypatch, workflow, Script(None))
@@ -598,10 +649,12 @@ def _member_counting_shell(fail_on_boot=None):
         if "trtllm-eval" in command:
             evals.append(command)
             return ShellResult(returncode=0, stdout="lm-eval gsm8k average accuracy: 90.0\n")
+        if other_driver_gate(command):
+            return passing_shell()(command, env, timeout)
         boots.append(command)
         if fail_on_boot is not None and len(boots) == fail_on_boot:
             return ShellResult(returncode=1, stderr="CUDA error")
-        return ShellResult(returncode=0, stdout="Paris\n")
+        return ShellResult(returncode=0, stdout=driver_records())
 
     runner.boots = boots  # type: ignore[attr-defined]
     runner.evals = evals  # type: ignore[attr-defined]
@@ -861,10 +914,12 @@ def test_the_turn_a_resume_gives_back_is_still_spendable(tmp_path, task_file, mo
             return probe
         if "trtllm-eval" in command or "__SURVEY_JSON__" in command:
             return passing_shell()(command, env, timeout)
+        if other_driver_gate(command):
+            return passing_shell()(command, env, timeout)
         attempts["boot"] += 1
         if attempts["boot"] == 1:
             return ShellResult(returncode=1, stderr="CUDA error")
-        return ShellResult(returncode=0, stdout="Paris\n")
+        return ShellResult(returncode=0, stdout=driver_records())
 
     second = _workflow(tmp_path, shell_runner=one_bad_boot, max_assembler_turns_per_unit=2)
     calls = _install(monkeypatch, second, Script(None))
@@ -1066,7 +1121,7 @@ def test_run_invokes_the_substrate_gate_before_any_agent(tmp_path, task_file, mo
     def shell(command, env=None, timeout=0):
         if "TRTLLM_MODELING_V2=off" in command and "quickstart" in command:
             order.append("substrate")
-        return ShellResult(returncode=0, stdout="Paris\n")
+        return ShellResult(returncode=0, stdout=driver_records())
 
     workflow = _workflow(tmp_path, shell_runner=shell, skip_substrate_gate=False)
 

@@ -406,7 +406,8 @@ def test_the_boot_gate_takes_a_unit_because_it_cannot_read_the_options_file():
 
     assert "unit" in inspect.signature(gates.run_boot_gate).parameters
     source = inspect.getsource(gates.run_boot_gate)
-    assert "resolve_runtime(task_data, unit)" in source
+    assert "unit=unit" in source[source.index("quickstart_words(") :][:400]
+    assert "resolve_runtime(task_data, unit)" in inspect.getsource(gates.quickstart_words)
 
     from agent_flow.workflows.staircase_onboard.workflow import StaircaseOnboardWorkflow
 
@@ -627,7 +628,11 @@ def test_every_feature_whose_standing_gates_are_blind_has_a_witness():
 
 
 def test_the_witness_dispatch_reaches_the_new_witnesses():
-    source = inspect.getsource(StaircaseOnboardWorkflow._run_witness)
+    """The unit loop and a standalone run share one dispatch: `witness.run_declared_witness`."""
+    from agent_flow.workflows.staircase_onboard import witness
+
+    assert "run_declared_witness" in inspect.getsource(StaircaseOnboardWorkflow._run_witness)
+    source = inspect.getsource(witness.run_declared_witness)
     assert "run_replay_witness" in source
     assert "run_kv_quant_witness" in source
     # The replay workload is declared, so it must travel from the block.
@@ -782,8 +787,8 @@ def test_a_replay_witness_is_not_handed_a_batch_limit():
     """It counts work, not tokens, and takes no such argument: passing one would raise."""
     from agent_flow.workflows.staircase_onboard import witness
 
-    source = inspect.getsource(StaircaseOnboardWorkflow._run_witness)
-    assert "schedule" not in _call_block(source, "run_replay_witness", lines=12)
+    source = inspect.getsource(witness.run_declared_witness)
+    assert "shaped" not in _call_block(source, "return run_replay_witness", lines=10)
     assert "max_batch_size" not in inspect.signature(witness.run_replay_witness).parameters
 
 

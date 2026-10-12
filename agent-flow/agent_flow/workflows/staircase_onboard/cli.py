@@ -255,11 +255,18 @@ def _premerge(argv: list[str]) -> int:
     return premerge_main(argv)
 
 
+def _gate(argv: list[str]) -> int:
+    from .gate_cli import main as gate_main
+
+    return gate_main(argv)
+
+
 #: ``staircase-onboard <subcommand> ...`` for the tools that are not a run.
 #: A run is still ``staircase-onboard --task ...``; a first argument named
 #: here dispatches instead, and everything after it is the subcommand's own.
 SUBCOMMANDS = {
     "premerge": _premerge,
+    "gate": _gate,
 }
 
 

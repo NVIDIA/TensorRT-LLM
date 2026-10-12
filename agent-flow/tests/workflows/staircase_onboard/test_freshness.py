@@ -385,7 +385,9 @@ def _delivered_run(tmp_path, task_file, monkeypatch, *, before_deliver=None, she
     base = shell or passing_shell()
 
     def counting(command, env=None, timeout=0):
-        if "trtllm-eval" in command or "quickstart" in command:
+        # Boot (the engine driver over a `boot.*` spec) and accuracy only; the
+        # scheduler-equivalence legs and the launch smoke are counted nowhere.
+        if "trtllm-eval" in command or "/boot." in command:
             calls.append(command)
         return base(command, env, timeout)
 

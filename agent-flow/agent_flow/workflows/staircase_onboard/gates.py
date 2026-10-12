@@ -17,7 +17,9 @@ Three gates, in ascending cost:
    catastrophes, not accuracy. Runs after every assembler turn.
 2. **accuracy** — the release criterion. ``trtllm-eval`` against the anchor
    in TensorRT-LLM's own accuracy references. One-sided:
-   ``measured >= reference - tolerance``. Runs at a unit boundary.
+   ``measured >= reference - k * SE``, the SE binomial over the benchmark's
+   sample count (``accuracy.floor``; a fixed ``tolerance`` is still
+   available as an explicit rule). Runs at a unit boundary.
 3. **acceptance** — required only when a feature is *distribution-preserving
    by construction*, speculative decoding above all. Rejection sampling
    holds the emitted distribution to the target model's, so a miscomputed
@@ -36,6 +38,7 @@ modeling_v2's — the single most expensive mistake available here.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -43,7 +46,7 @@ import shlex
 import subprocess
 import tempfile
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
@@ -56,9 +59,21 @@ from agent_flow.runtime import (
     SpoolCommandExecutor,
 )
 
+from . import stats
 from .delivery import MODELING_V2_PACKAGE
 from .environment import RunEnvironment
+from .gate_records import (
+    KIND_ACCEPTANCE,
+    KIND_FINDING,
+    RESULTS_FILENAME,
+    GateRecord,
+    GateRecords,
+    open_findings,
+)
+from .harness import workload_io
 from .task_schema import (
+    BOOT_KEYS,
+    BOOT_RENDERS,
     PARALLEL_UNIFIED,
     TaskSchemaError,
     derive_family,
@@ -105,6 +120,13 @@ _LM_EVAL_SCORE = re.compile(r"lm-eval\s+\S+\s+.*?accuracy:\s*([0-9]+(?:\.[0-9]+)
 # ``MMLU weighted average accuracy: 74.98 (14042)`` — the MMLU path has its
 # own reporting because it does not go through lm-eval.
 _MMLU_SCORE = re.compile(r"MMLU weighted average accuracy:\s*([0-9]+(?:\.[0-9]+)?)")
+# The sample count a run actually scored, where the eval prints one: the MMLU
+# line carries it in parentheses, and lm-eval's partial-score line (printed
+# under `TLLM_EVAL_PARTIAL_SCORES_EVERY`) ends at `<total>/<total>`.
+_MMLU_SAMPLES = re.compile(r"MMLU weighted average accuracy:\s*[0-9.]+\s*\((\d+)\)")
+_PARTIAL_TOTAL = re.compile(r"Partial scores after\s+(\d+)/(\d+)\s+responses")
+# `--num_samples=N` or `--num_samples N` among the benchmark arguments.
+_NUM_SAMPLES_ARG = re.compile(r"^--num_samples(?:=(\d+))?$")
 # ``Spec-dec stats: AL (decoded tokens/step, iteration-weighted) 3.351 (...)``
 _ACCEPTANCE_LENGTH = re.compile(r"Spec-dec stats:\s*AL\b[^)]*\)\s*([0-9]+(?:\.[0-9]+)?)")
 # trtllm-bench reports the same quantity under its own name.
@@ -383,6 +405,26 @@ class GateResult:
     #: cannot say that one prompt ended in EOS after two tokens while another
     #: accepted at the ceiling; this rides in the journal line so it can.
     breakdown: str = ""
+    #: The accuracy floor the measurement was held to, and the binomial
+    #: standard error and sample count it was derived from. Every accuracy
+    #: verdict carries the SE when the count is known, whichever rule set
+    #: the floor, so a reader can see how many SE a margin is.
+    floor: float | None = None
+    se: float | None = None
+    samples: int | None = None
+    #: How ``floor`` was derived, verbatim (see :meth:`.stats.Floor.describe`).
+    floor_rule: str = ""
+    #: Things the verdict wants a reader to see that do not change it -- a
+    #: floor not backed by a measurement, a comparison that had no baseline.
+    warnings: tuple[str, ...] = ()
+    #: Whether the summary line carries ``detail`` even on a pass: true for a
+    #: verdict that rests on more than its headline numbers.
+    explained: bool = False
+
+    @property
+    def threshold(self) -> float | None:
+        """The number ``measured`` was held to, where the gate states one (the ledger reads it)."""
+        return self.floor
 
     def summary(self) -> str:
         """One line for the journal, carrying the numbers verbatim.
@@ -403,12 +445,25 @@ class GateResult:
         if self.dirty_override:
             tree = f" [tree {self.tree_state}; DIRTY TARGET PATH measured by override]"
         breakdown = f" [{self.breakdown}]" if self.breakdown else ""
+        if self.warnings:
+            breakdown += "".join(f" [WARNING: {w}]" for w in self.warnings)
+        # The numbers lead; the reasoning follows whenever the verdict is a
+        # failure or rests on more than the numbers (a paired comparison, an
+        # HTTP status), so the journal line says why without the log.
+        why = f" -- {self.detail}" if self.detail and (self.explained or not self.passed) else ""
+        if self.measured is not None and self.floor is not None:
+            return (
+                f"[{verdict}] {label}: measured {self.measured:.4f} vs floor "
+                f"{self.floor:.4f} [{self.floor_rule}] (margin "
+                f"{self.measured - self.floor:+.4f}){why}{breakdown} in "
+                f"{self.duration_s:.0f}s{tree}"
+            )
         if self.measured is not None and self.reference is not None:
             margin = self.measured - (self.reference - (self.tolerance or 0.0))
             return (
                 f"[{verdict}] {label}: measured {self.measured:.4f} vs "
                 f"reference {self.reference:.4f} - tol {self.tolerance or 0.0:.2f} "
-                f"(margin {margin:+.4f}){breakdown} in {self.duration_s:.0f}s{tree}"
+                f"(margin {margin:+.4f}){why}{breakdown} in {self.duration_s:.0f}s{tree}"
             )
         return f"[{verdict}] {label}: {self.detail}{breakdown} ({self.duration_s:.0f}s){tree}"
 
@@ -429,6 +484,56 @@ def _verdict_factory(state: TreeState) -> Callable[..., GateResult]:
     return verdict
 
 
+#: The image a multimodal unit's boot sends when the task declares none: a
+#: photograph shipped in the repository's own test assets (a git-lfs file),
+#: resolved against the tree under test. Never downloaded.
+DEFAULT_BOOT_IMAGE = "tests/integration/test_input_files/merlion.png"
+#: What the default image prompt asks, and the words any correct description
+#: of that photograph (the Merlion fountain in Singapore) contains one of.
+DEFAULT_BOOT_IMAGE_PROMPT = "Describe this image in one sentence."
+DEFAULT_BOOT_IMAGE_KEYWORDS: tuple[str, ...] = (
+    "merlion",
+    "lion",
+    "statue",
+    "fountain",
+    "singapore",
+    "sculpture",
+    "water",
+)
+
+
+@dataclass(frozen=True)
+class BootPrompt:
+    """One boot prompt with checks of its own, images included."""
+
+    prompt: str
+    #: Every one must appear in THIS prompt's generated text (case-insensitive).
+    keywords: tuple[str, ...] = ()
+    #: At least one must appear in it (case-insensitive).
+    keywords_any: tuple[str, ...] = ()
+    images: tuple[str, ...] = ()
+    render: str = "loader"
+
+    @classmethod
+    def from_mapping(cls, data: Mapping[str, Any]) -> "BootPrompt":
+        """Read one entry of a boot ``prompts`` list written as a mapping."""
+        return cls(
+            prompt=str(data.get("prompt", "")),
+            keywords=tuple(str(k) for k in data.get("keywords") or ()),
+            keywords_any=tuple(str(k) for k in data.get("keywords_any") or ()),
+            images=tuple(str(i) for i in data.get("images") or ()),
+            render=str(data.get("render") or "loader"),
+        )
+
+    def missing(self, text: str) -> list[str]:
+        """What this prompt's checks did not find in ``text``."""
+        lowered = (text or "").lower()
+        absent = [k for k in self.keywords if k.lower() not in lowered]
+        if self.keywords_any and not any(k.lower() in lowered for k in self.keywords_any):
+            absent.append(f"any of {list(self.keywords_any)}")
+        return absent
+
+
 @dataclass(frozen=True)
 class BootSpec:
     """What the boot gate sends and what it insists on seeing back.
@@ -439,6 +544,12 @@ class BootSpec:
     not yet seen this model generate anything has no business asserting
     what it will say. Until then the gate asserts the weaker, still useful
     thing: the engine cold-starts and produces non-empty output.
+
+    ``prompts`` and ``keywords`` are the plain form: each keyword must appear
+    in SOME prompt's generated text. ``items`` are prompts with checks of
+    their own, and the only ones that carry images. Keywords are matched
+    against the generated texts only, never against the log: ``72`` matches
+    ``CPUs 72-143`` in an engine log line.
     """
 
     prompts: tuple[str, ...] = (
@@ -447,21 +558,120 @@ class BootSpec:
     )
     keywords: tuple[str, ...] = ()
     max_tokens: int = 32
+    items: tuple[BootPrompt, ...] = ()
+    #: Where the spec came from, named in a verdict.
+    source: str = "the default boot prompts"
+
+    @classmethod
+    def from_mapping(cls, data: Mapping[str, Any], source: str) -> "BootSpec":
+        """A spec from a boot block: ``prompts`` (strings or mappings), ``keywords``, ``max_tokens``."""
+        plain: list[str] = []
+        items: list[BootPrompt] = []
+        for entry in data.get("prompts") or ():
+            if isinstance(entry, Mapping):
+                items.append(BootPrompt.from_mapping(entry))
+            else:
+                plain.append(str(entry))
+        if data.get("prompts_file"):
+            plain.extend(load_prompts_file(data["prompts_file"]))
+        return cls(
+            prompts=tuple(plain) if (plain or items) else cls.prompts,
+            keywords=tuple(str(k) for k in data.get("keywords") or ()),
+            max_tokens=int(data.get("max_tokens") or cls.max_tokens),
+            items=tuple(items),
+            source=source,
+        )
 
     @classmethod
     def load(cls, path: str | Path) -> "BootSpec":
+        """A workspace ``boot.yaml``; the default spec when there is none."""
         source = Path(path)
         if not source.is_file():
             return cls()
         data = yaml.safe_load(source.read_text(encoding="utf-8")) or {}
         if not isinstance(data, dict):
             raise ValueError(f"{source} must hold a YAML mapping, got {type(data).__name__}")
-        prompts = tuple(str(p) for p in data.get("prompts") or cls.prompts)
-        return cls(
-            prompts=prompts or cls.prompts,
-            keywords=tuple(str(k) for k in data.get("keywords") or ()),
-            max_tokens=int(data.get("max_tokens", cls.max_tokens)),
+        return cls.from_mapping(data, str(source))
+
+    @property
+    def has_images(self) -> bool:
+        """Whether any prompt sends an image."""
+        return any(item.images for item in self.items)
+
+    def requests(self, repo_root: str | Path | None) -> list[dict[str, Any]]:
+        """Engine-driver requests: the plain prompts, then the items.
+
+        A relative image path is resolved against ``repo_root``, the tree
+        under test, so a repository test asset names the same file on every
+        checkout.
+        """
+
+        def image_path(name: str) -> str:
+            path = Path(name)
+            if path.is_absolute() or repo_root is None:
+                return str(path)
+            return str(Path(repo_root) / path)
+
+        requests = [
+            {"id": f"b{n}", "prompt": prompt, "max_tokens": self.max_tokens}
+            for n, prompt in enumerate(self.prompts)
+        ]
+        for n, item in enumerate(self.items):
+            request: dict[str, Any] = {
+                "id": f"i{n}",
+                "prompt": item.prompt,
+                "max_tokens": self.max_tokens,
+            }
+            if item.images:
+                request["images"] = [image_path(i) for i in item.images]
+                request["render"] = item.render
+            requests.append(request)
+        return requests
+
+
+def resolve_boot_spec(
+    task_data: Mapping[str, Any],
+    unit: str | None,
+    features: Sequence[str] | None = None,
+    fallback: str | Path | None = None,
+) -> BootSpec:
+    """The boot workload ``unit`` runs, declared in task.yaml.
+
+    ``accuracy.boot`` (run-wide keys, with a per-unit entry layered over
+    them) when task.yaml declares it, else the workspace ``boot.yaml`` at
+    ``fallback``, else the default. A unit whose target implements
+    ``multimodal`` (and whose scope is not ``text_only``) and whose spec sends
+    no image gets the default image prompt appended: a multimodal boot that
+    sends only text never exercises the vision path, and the first gate that
+    does is an hour-long benchmark.
+    """
+    accuracy = task_data.get("accuracy") or {}
+    block = accuracy.get("boot") if isinstance(accuracy, Mapping) else None
+    if isinstance(block, Mapping):
+        merged = {k: v for k, v in block.items() if k in BOOT_KEYS}
+        chosen = block.get(unit) if unit is not None else None
+        where = "accuracy.boot"
+        if isinstance(chosen, Mapping):
+            merged.update(chosen)
+            where = f"accuracy.boot.{unit}"
+        spec = BootSpec.from_mapping(merged, where)
+    elif fallback is not None:
+        spec = BootSpec.load(fallback)
+    else:
+        spec = BootSpec()
+    implemented = {str(f) for f in (features or ())}
+    if (
+        "multimodal" in implemented
+        and task_data.get("scope", "full") != "text_only"
+        and not spec.has_images
+    ):
+        image = BootPrompt(
+            prompt=DEFAULT_BOOT_IMAGE_PROMPT,
+            keywords_any=DEFAULT_BOOT_IMAGE_KEYWORDS,
+            images=(DEFAULT_BOOT_IMAGE,),
         )
+        spec = replace(spec, items=(*spec.items, image))
+    return spec
 
 
 def _default_shell_runner(
@@ -1026,6 +1236,183 @@ def _with_mode(environment: RunEnvironment, mode: str) -> RunEnvironment:
     )
 
 
+# ------------------------------------------------------------ the engine driver
+#
+# The gates that need per-request structure -- token ids, whole texts,
+# iterations, images -- run `harness/engine_driver.py` under the tree's own
+# interpreter. It builds the engine with the tree's own quickstart from the
+# same argv the quickstart gates use, so the configuration measured is
+# identical, and prints one `STAIRCASE_RECORD` JSON line per request. A gate
+# reads those lines and nothing else of the log.
+
+#: The driver script, run as a file under the measured tree's interpreter.
+ENGINE_DRIVER = Path(__file__).resolve().parent / "harness" / "engine_driver.py"
+
+#: The quickstart flag a declared batch limit replaces. The runtime block
+#: usually sets it through ``extra_flags``, so an override has to remove that
+#: spelling, not just append another one.
+BATCH_SIZE_FLAG = "--max_batch_size"
+
+
+def with_max_batch_size(flags: Sequence[str], max_batch_size: int | None) -> list[str]:
+    """``flags`` with every ``--max_batch_size`` spelling replaced by one ``=N``.
+
+    A token-comparing gate declares the batch limit its legs run at, and the
+    runtime block has usually set its own through ``extra_flags`` --
+    ``--max_batch_size=8``, ``--max_batch_size 8`` as one string, or the flag
+    and its value as two. All three are removed, so the argv states ONE limit.
+    ``None`` returns ``flags`` unchanged.
+    """
+    if max_batch_size is None:
+        return list(flags)
+    kept: list[str] = []
+    skip_value = False
+    for flag in flags:
+        if skip_value:
+            skip_value = False
+            continue
+        word = str(flag)
+        if word == BATCH_SIZE_FLAG:
+            skip_value = True
+            continue
+        if word.startswith((f"{BATCH_SIZE_FLAG}=", f"{BATCH_SIZE_FLAG} ")):
+            continue
+        kept.append(word)
+    return [*kept, f"{BATCH_SIZE_FLAG}={int(max_batch_size)}"]
+
+
+def quickstart_script(task_data: Mapping[str, Any]) -> Path:
+    """The measured tree's ``examples/llm-api/quickstart_advanced.py``."""
+    return (
+        Path(str(task_data["trtllm_repo_path"])) / "examples" / "llm-api" / "quickstart_advanced.py"
+    )
+
+
+def quickstart_words(
+    task_data: Mapping[str, Any],
+    environment: RunEnvironment,
+    *,
+    unit: str | None,
+    features: Any | None,
+    max_tokens: int,
+    member: str | None,
+    max_batch_size: int | None = None,
+    extra: Sequence[str] = (),
+    runtime_overrides: Mapping[str, Any] | None = None,
+) -> list[str]:
+    """The quickstart argv as a list of plain words, for the engine driver's spec.
+
+    The same flags the quickstart gates emit -- topology, the unit's runtime
+    block, the speculator at the unit's draft depth -- with each runtime
+    ``extra_flags`` entry split as the shell would split it.
+    ``runtime_overrides`` replaces switches of the unit's runtime block (a
+    leg that turns the overlap scheduler off, for one).
+    """
+    runtime = {**resolve_runtime(task_data, unit), **dict(runtime_overrides or {})}
+    flags = with_max_batch_size(
+        [
+            *runtime_flags(runtime),
+            *speculation_flags(
+                task_data.get("features") if features is None else features,
+                max_draft_len=resolve_max_draft_len(task_data.get("accuracy") or {}, unit),
+            ),
+            *extra,
+        ],
+        max_batch_size,
+    )
+    words = [
+        f"--model_dir={task_data['checkpoint_path']}",
+        f"--max_tokens={int(max_tokens)}",
+        *topology_flags(str(task_data["parallel"]), environment.world_size, member),
+    ]
+    for flag in flags:
+        words.extend(shlex.split(str(flag)))
+    return words
+
+
+def gate_workdir(
+    workdir: str | Path | None, name: str, task_data: Mapping[str, Any] | None = None
+) -> Path:
+    """Where a gate writes the files its job reads.
+
+    ``workdir`` when given: the orchestrator passes a directory on the shared
+    filesystem, because the job may run on another host (a spool session).
+    Otherwise a directory under the temp dir named for the gate and the task
+    (its tree and checkpoint), so two runs of one gate on one task write the
+    same files and their commands compare equal; a fresh one without a task.
+    """
+    if workdir is not None:
+        directory = Path(workdir)
+    elif task_data is not None:
+        key = f"{task_data.get('trtllm_repo_path')}|{task_data.get('checkpoint_path')}"
+        digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:12]
+        directory = Path(tempfile.gettempdir()) / f"staircase-{name}-{digest}"
+    else:
+        return Path(tempfile.mkdtemp(prefix=f"staircase-{name}-"))
+    directory.mkdir(parents=True, exist_ok=True)
+    return directory
+
+
+def write_driver_spec(
+    path: str | Path,
+    *,
+    task_data: Mapping[str, Any],
+    argv: Sequence[str],
+    requests: Sequence[Mapping[str, Any]] = (),
+    dataset: Mapping[str, Any] | None = None,
+    max_tokens: int = 64,
+    concurrency: int = 1,
+    ignore_eos: bool = False,
+    perf: Mapping[str, Any] | None = None,
+) -> Path:
+    """Write one engine-driver spec (see ``harness/engine_driver.py``)."""
+    spec = {
+        "quickstart": str(quickstart_script(task_data)),
+        "quickstart_argv": [str(a) for a in argv],
+        "requests": [dict(r) for r in requests],
+        "dataset": dict(dataset) if dataset else None,
+        "max_tokens": int(max_tokens),
+        "concurrency": int(concurrency),
+        "ignore_eos": bool(ignore_eos),
+        "perf": dict(perf) if perf else None,
+    }
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps(spec, indent=1, ensure_ascii=False), encoding="utf-8")
+    return target
+
+
+def engine_driver_command(
+    environment: RunEnvironment, spec_path: str | Path, quickstart: str | Path | None = None
+) -> str:
+    """The launch of the engine driver over ``spec_path``, as engine work.
+
+    The quickstart and its argv are spelled on the command line as well as in
+    the spec (the driver takes the command line's), so a command read from a
+    log says which tree it built from and with which flags. The prompts stay
+    in the spec: a long one would not fit an argv string.
+    """
+    argv: list[str] = []
+    try:
+        spec = json.loads(Path(spec_path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        spec = {}
+    if quickstart is None:
+        quickstart = spec.get("quickstart")
+    argv = [str(a) for a in spec.get("quickstart_argv") or ()]
+    named = f" --quickstart {shlex.quote(str(quickstart))}" if quickstart else ""
+    flags = f" -- {' '.join(shlex.quote(a) for a in argv)}" if argv else ""
+    return environment.python_command(
+        f"{shlex.quote(str(ENGINE_DRIVER))} --spec {shlex.quote(str(spec_path))}{named}{flags}"
+    )
+
+
+def parse_driver_records(output: str) -> list[dict[str, Any]]:
+    """Every ``STAIRCASE_RECORD`` the engine driver printed, in request order."""
+    records = workload_io.parse_marked(output, workload_io.RECORD_MARKER)
+    return sorted(records, key=lambda r: int(r.get("index", 0)))
+
+
 def parse_eval_score(stdout: str) -> float | None:
     """Extract the final accuracy from a ``trtllm-eval`` run's output.
 
@@ -1052,6 +1439,17 @@ class AcceptanceReading:
     #: output carried only a summary statistic, which says nothing about how
     #: much work it was estimated from.
     requests: tuple[tuple[int, int], ...] = ()
+    #: A digest of each request's prompt, parallel to ``requests``, where the
+    #: run printed one (the engine driver does). What pairs a prompt's rate
+    #: with the same prompt's rate in another leg or on another tree.
+    prompts: tuple[str, ...] = ()
+
+    def rates(self) -> dict[str, float]:
+        """Accepted tokens per iteration, per prompt, keyed by prompt digest."""
+        names = self.prompts if len(self.prompts) == len(self.requests) else ()
+        return {
+            (names[n] if names else str(n)): t / i for n, (t, i) in enumerate(self.requests) if i
+        }
 
     @property
     def draft_iterations(self) -> int | None:
@@ -1080,7 +1478,10 @@ class AcceptanceReading:
 
 
 def parse_acceptance(stdout: str) -> AcceptanceReading | None:
-    """Extract the acceptance measurement from an eval, bench or quickstart run.
+    """Extract the acceptance measurement from a driver, eval, bench or quickstart run.
+
+    The engine driver's records come first: one per prompt, with the prompt's
+    digest, so a rate can be paired with the same prompt's rate elsewhere.
 
     The quickstart form is **iteration-weighted across requests**: the
     quantity is tokens-per-iteration, so several requests combine as
@@ -1091,6 +1492,16 @@ def parse_acceptance(stdout: str) -> AcceptanceReading | None:
     :meth:`AcceptanceReading.breakdown`, because it is the number that shows
     a prompt that never drafted.
     """
+    records = parse_driver_records(stdout)
+    if records:
+        parts = tuple((int(r.get("tokens", 0)), int(r.get("iterations", 0))) for r in records)
+        iterations = sum(i for _, i in parts)
+        if iterations:
+            return AcceptanceReading(
+                value=sum(t for t, _ in parts) / iterations,
+                requests=parts,
+                prompts=tuple(str(r.get("prompt_sha", n)) for n, r in enumerate(records)),
+            )
     for pattern in (_ACCEPTANCE_LENGTH, _ACCEPTANCE_LENGTH_ALT):
         matches = pattern.findall(stdout)
         if matches:
@@ -1178,8 +1589,9 @@ def run_boot_gate(
     unit: str | None = None,
     member: str | None = None,
     allow_dirty: bool | None = None,
+    workdir: str | Path | None = None,
 ) -> GateResult:
-    """Cold-start the engine and check it generates.
+    """Cold-start the engine and check it generates, through the engine driver.
 
     ``member`` is the parallel configuration to serve at, and it is the only
     thing that makes a ``unified`` target's gate mean anything — see
@@ -1193,31 +1605,24 @@ def run_boot_gate(
 
     ``features`` is **the features the target under test actually
     implements**, which is not the same as the features the *run* will
-    finish with. Defaulting it to ``task_data["features"]`` — as this
-    function originally did with no way to override — means the ``core``
-    unit is gated with the speculator's flags before a speculator exists.
-
-    Measured: the core target refused `--spec_decode_algo=MTP` through its
-    own fail-fast assert, correctly, and the assembler escalated rather than
-    deleting the assert to make the gate pass. Deleting it would have been
-    the silent wrong — one-engine MTP is drafted by the model, so a base
-    model under that config emits no drafts and the run would have gated a
-    speculator that was not there.
-
-    Staircase's rule is that core is green *before* the first feature
+    finish with. Defaulting it to ``task_data["features"]`` means the
+    ``core`` unit is gated with the speculator's flags before a speculator
+    exists. Staircase's rule is that core is green *before* the first feature
     increment; the gate has to agree with it.
+
+    ``spec`` is the workload (see :func:`resolve_boot_spec`): text prompts,
+    and for a multimodal unit at least one prompt that sends an image. The
+    engine driver builds the engine exactly as ``quickstart_advanced.py``
+    does from the same flags and prints one record per prompt; keywords are
+    matched against those generated texts only, never against the log, so
+    ``72`` cannot pass on ``CPUs 72-143``.
 
     ``mode`` defaults to ``require`` and should stay there for any result
     that will be attributed to modeling_v2. It is a parameter for one
     reason: when a boot gate fails, the next question is always *"is this
     the target or is this the host?"*, and the cheapest answer is the same
     command under ``off`` — the stock implementation, same prompts, same
-    runtime flags, one variable. Without this the control has to be
-    reconstructed by hand, which is how a run ends up debugging a target
-    that was never at fault.
-
-    ``run_accuracy_gate`` already took a ``mode`` for the same reason; the
-    boot gate not having one was an inconsistency, not a decision.
+    runtime flags, one variable.
 
     ``allow_dirty`` is the escape hatch of :func:`inspect_tree`; see there
     for why a dirty target path stops this gate by default.
@@ -1233,83 +1638,146 @@ def run_boot_gate(
     _verdict = _verdict_factory(state)
     if state.blocked:
         return _verdict(name=gate_name, member=member, passed=False, detail=state.block_detail())
-    repo = Path(str(task_data["trtllm_repo_path"]))
-    script = repo / "examples" / "llm-api" / "quickstart_advanced.py"
-    prompts = " ".join(f'"{p}"' for p in spec.prompts)
-    argv = " ".join(
-        [
-            str(script),
-            f'--model_dir="{task_data["checkpoint_path"]}"',
-            f"--max_tokens={spec.max_tokens}",
-            *topology_flags(str(task_data["parallel"]), environment.world_size, member),
-            *runtime_flags(resolve_runtime(task_data, unit)),
-            *speculation_flags(
-                task_data.get("features") if features is None else features,
-                max_draft_len=resolve_max_draft_len(task_data.get("accuracy") or {}, unit),
-            ),
-            f"--prompt {prompts}",
-        ]
+    requests = spec.requests(task_data.get("trtllm_repo_path"))
+    argv = quickstart_words(
+        task_data,
+        environment,
+        unit=unit,
+        features=task_data.get("features") if features is None else features,
+        max_tokens=spec.max_tokens,
+        member=member,
     )
-    command = env.python_command(argv)
+    spec_path = write_driver_spec(
+        gate_workdir(workdir, "boot", task_data)
+        / f"boot.{unit or 'unit'}.{member or 'member'}.json",
+        task_data=task_data,
+        argv=argv,
+        requests=requests,
+        max_tokens=spec.max_tokens,
+    )
+    command = engine_driver_command(env, spec_path)
 
     started = time.monotonic()
     result = runner(command, None, timeout)
     elapsed = time.monotonic() - started
-    tail = "\n".join((result.stdout + result.stderr).splitlines()[-40:])
+    combined = result.stdout + result.stderr
+    tail = "\n".join(combined.splitlines()[-40:])
+    ran = dict(name=gate_name, member=member, command=command, duration_s=elapsed, stdout_tail=tail)
 
     if result.timed_out:
         return _verdict(
-            name=gate_name,
-            member=member,
             passed=False,
             detail=f"timed out after {timeout}s — a boot gate that takes this long is "
             f"not catching catastrophes any more",
-            command=command,
-            duration_s=elapsed,
-            stdout_tail=tail,
+            **ran,
         )
     if not result.ok:
-        return _verdict(
-            name=gate_name,
-            member=member,
-            passed=False,
-            detail=f"exited {result.returncode}",
-            command=command,
-            duration_s=elapsed,
-            stdout_tail=tail,
-        )
+        return _verdict(passed=False, detail=f"exited {result.returncode}", **ran)
 
-    missing = [k for k in spec.keywords if k not in result.stdout]
+    records = {int(r.get("index", -1)): r for r in parse_driver_records(combined)}
+    texts = [
+        str(records[n].get("text", "")) if n in records else None for n in range(len(requests))
+    ]
+    absent = [requests[n]["id"] for n, text in enumerate(texts) if text is None]
+    if absent:
+        return _verdict(
+            passed=False,
+            detail=f"the engine exited cleanly but returned no record for {len(absent)} of "
+            f"{len(requests)} prompt(s) ({', '.join(absent)})",
+            **ran,
+        )
+    empty = [requests[n]["id"] for n, text in enumerate(texts) if not (text or "").strip()]
+    if empty:
+        return _verdict(
+            passed=False,
+            detail=f"the engine exited cleanly but generated nothing for {', '.join(empty)}",
+            **ran,
+        )
+    generated = "\n".join(text or "" for text in texts).lower()
+    missing = [k for k in spec.keywords if k.lower() not in generated]
+    item_texts = texts[len(spec.prompts) :]
+    for item, text in zip(spec.items, item_texts):
+        for absent_keyword in item.missing(text or ""):
+            label = "the image prompt" if item.images else "a prompt"
+            missing.append(f"{absent_keyword} (in {label} {item.prompt[:40]!r})")
     if missing:
         return _verdict(
-            name=gate_name,
-            member=member,
             passed=False,
-            detail=f"generated output is missing {len(missing)} expected keyword(s): {missing}",
-            command=command,
-            duration_s=elapsed,
-            stdout_tail=tail,
+            detail=f"the generated texts are missing {len(missing)} expected keyword(s): "
+            f"{missing}. Keywords are matched against generated text only",
+            **ran,
         )
-    if not result.stdout.strip():
-        return _verdict(
-            name=gate_name,
-            member=member,
-            passed=False,
-            detail="the engine exited cleanly but produced no output at all",
-            command=command,
-            duration_s=elapsed,
-            stdout_tail=tail,
-        )
-    checked = f"{len(spec.keywords)} keyword(s)" if spec.keywords else "non-empty generation"
-    return _verdict(
-        name=gate_name,
-        member=member,
-        passed=True,
-        detail=f"engine cold-started and produced {checked}",
-        command=command,
-        duration_s=elapsed,
-        stdout_tail=tail,
+    images = sum(len(r.get("images") or ()) for r in requests)
+    checked = (
+        f"{len(spec.keywords) + sum(1 for i in spec.items if i.keywords or i.keywords_any)} "
+        f"keyword check(s) in the generated texts"
+        if spec.keywords or any(i.keywords or i.keywords_any for i in spec.items)
+        else "non-empty generation"
     )
+    sent = f", {images} image(s) sent" if images else ""
+    return _verdict(
+        passed=True,
+        detail=f"engine cold-started and produced {checked} for {len(requests)} prompt(s)"
+        f"{sent}; workload: {spec.source}",
+        **ran,
+    )
+
+
+def resolve_samples(
+    accuracy: Mapping[str, Any],
+    unit: str | None,
+    benchmark: str,
+    output: str = "",
+) -> tuple[int | None, str]:
+    """How many samples the accuracy score was (or will be) measured on, and from where.
+
+    Most specific first: the count the eval itself printed (what was actually
+    scored), then ``--num_samples`` among the unit's benchmark arguments, then
+    ``accuracy.samples`` (scalar or per unit), then
+    :data:`.stats.KNOWN_BENCHMARK_SAMPLES`. ``(None, reason)`` when none of
+    them answers; the statistical floor cannot be computed then, and the
+    schema refuses such a task before a run starts.
+    """
+    if output:
+        mmlu = _MMLU_SAMPLES.findall(output)
+        if mmlu:
+            return int(mmlu[-1]), "the eval's own output"
+        partial = _PARTIAL_TOTAL.findall(output)
+        if partial:
+            return int(partial[-1][1]), "the eval's own output"
+    args = [str(a) for a in resolve_per_unit(accuracy, "benchmark_args", unit) or ()]
+    for i, arg in enumerate(args):
+        matched = _NUM_SAMPLES_ARG.match(arg)
+        if not matched:
+            continue
+        value = matched.group(1) or (args[i + 1] if i + 1 < len(args) else None)
+        try:
+            return int(str(value)), "--num_samples in benchmark_args"
+        except (TypeError, ValueError):
+            break
+    declared = resolve_per_unit(accuracy, "samples", unit)
+    if declared is not None:
+        try:
+            return int(declared), "accuracy.samples"
+        except (TypeError, ValueError):
+            pass
+    known = stats.KNOWN_BENCHMARK_SAMPLES.get(benchmark)
+    if known is not None:
+        return known, f"the {benchmark} split size"
+    return None, f"no sample count for `{benchmark}`: declare `accuracy.samples`"
+
+
+def resolve_floor(
+    accuracy: Mapping[str, Any],
+    unit: str | None,
+    benchmark: str,
+    reference: float,
+    output: str = "",
+) -> tuple[stats.Floor | None, str]:
+    """The floor ``reference`` gets under ``accuracy.floor``, and where its count came from."""
+    policy = stats.resolve_floor_policy(accuracy)
+    samples, source = resolve_samples(accuracy, unit, benchmark, output)
+    return stats.floor_for(policy, reference, samples), source
 
 
 def run_accuracy_gate(
@@ -1330,6 +1798,13 @@ def run_accuracy_gate(
     ``unified`` target is the whole question: one codebase serving three
     configurations is three anchored numbers, not one repeated three times.
 
+    **The floor is statistical by default**: ``reference - k * SE``, where SE
+    is the binomial standard error of a score at the reference measured on
+    the benchmark's sample count (see :func:`resolve_samples`) and ``k`` is
+    ``accuracy.floor.k`` (default 2). A fixed ``reference - tolerance`` is
+    the explicit alternative, ``accuracy.floor.rule: tolerance``. Every
+    verdict records the SE, the count and the rule.
+
     This is the gate the tree-state guard was written for. It is the
     expensive one — a quarter of an hour per member — and it is the one whose
     output becomes the target's headline number, so it is also the one where
@@ -1342,14 +1817,23 @@ def run_accuracy_gate(
     env = _with_mode(environment, mode)
     state = inspect_tree(task_data, allow_dirty=allow_dirty)
     _verdict = _verdict_factory(state)
+    planned, _ = resolve_floor(accuracy, unit, benchmark, reference)
+
+    def floor_fields(floor: stats.Floor | None) -> dict[str, Any]:
+        if floor is None:
+            return {}
+        return {
+            "floor": floor.value,
+            "se": floor.se,
+            "samples": floor.samples,
+            "floor_rule": floor.describe(),
+        }
+
+    name = f"accuracy[{benchmark}]"
+    common = dict(name=name, member=member, reference=reference, tolerance=tolerance)
     if state.blocked:
         return _verdict(
-            name=f"accuracy[{benchmark}]",
-            member=member,
-            passed=False,
-            detail=state.block_detail(),
-            reference=reference,
-            tolerance=tolerance,
+            passed=False, detail=state.block_detail(), **common, **floor_fields(planned)
         )
 
     parts = eval_command(task_data, environment, benchmark, unit=unit, member=member)
@@ -1360,71 +1844,171 @@ def run_accuracy_gate(
     elapsed = time.monotonic() - started
     combined = result.stdout + result.stderr
     tail = "\n".join(combined.splitlines()[-40:])
+    ran = dict(command=command, duration_s=elapsed, stdout_tail=tail, **common)
 
     if result.timed_out:
         return _verdict(
-            name=f"accuracy[{benchmark}]",
-            member=member,
-            passed=False,
-            detail=f"timed out after {timeout}s",
-            command=command,
-            reference=reference,
-            tolerance=tolerance,
-            duration_s=elapsed,
-            stdout_tail=tail,
+            passed=False, detail=f"timed out after {timeout}s", **ran, **floor_fields(planned)
         )
     if not result.ok:
         return _verdict(
-            name=f"accuracy[{benchmark}]",
-            member=member,
             passed=False,
             detail=f"trtllm-eval exited {result.returncode}",
-            command=command,
-            reference=reference,
-            tolerance=tolerance,
-            duration_s=elapsed,
-            stdout_tail=tail,
+            **ran,
+            **floor_fields(planned),
         )
 
     measured = parse_eval_score(combined)
     if measured is None:
         return _verdict(
-            name=f"accuracy[{benchmark}]",
-            member=member,
             passed=False,
             detail="trtllm-eval exited 0 but printed no score this module recognizes; "
             "a gate with no number is not a pass",
-            command=command,
-            reference=reference,
-            tolerance=tolerance,
-            duration_s=elapsed,
-            stdout_tail=tail,
+            **ran,
+            **floor_fields(planned),
         )
 
-    floor = reference - tolerance
-    passed = measured >= floor
+    floor, source = resolve_floor(accuracy, unit, benchmark, reference, combined)
+    if floor is None:
+        return _verdict(
+            passed=False,
+            detail=f"measured {measured:.4f}, but the statistical floor needs the sample "
+            f"count and there is {source}. A floor that cannot be computed is not a pass",
+            measured=measured,
+            **ran,
+        )
+    passed = measured >= floor.value
     return _verdict(
-        name=f"accuracy[{benchmark}]",
-        member=member,
         passed=passed,
         detail=(
-            f"measured {measured:.4f} {'>=' if passed else '<'} {floor:.4f} "
-            f"(reference {reference:.4f} - tol {tolerance:.2f})"
+            f"measured {measured:.4f} {'>=' if passed else '<'} {floor.value:.4f} "
+            f"({floor.describe()}; count from {source})"
         ),
-        command=command,
         measured=measured,
-        reference=reference,
-        tolerance=tolerance,
-        duration_s=elapsed,
-        stdout_tail=tail,
+        **ran,
+        **floor_fields(floor),
     )
 
 
-def resolve_acceptance_floor(accuracy: Mapping[str, Any], unit: str | None) -> float | None:
-    """The absolute `acceptance_length` floor this unit declares, if any.
+def check_systematic_shift(
+    results: Sequence[GateResult],
+    accuracy: Mapping[str, Any],
+    unit: str | None,
+) -> stats.ShiftFinding | None:
+    """The cross-member check over one unit's accuracy verdicts.
 
-    Only consulted when the `=off` leg **cannot exist**. See
-    :func:`run_acceptance_gate`.
+    Every member passing its own floor is not the same as every member being
+    on the anchor: a defect in code the members share moves all of them the
+    same way, and each still clears ``reference - 2 SE``. When **every**
+    member sits more than one SE under the reference, that is a finding, and
+    delivery refuses it unless ``accuracy.floor.acknowledge.<unit>`` gives a
+    reason. Verdicts without a measurement or an SE are left out.
+    """
+    policy = stats.resolve_floor_policy(accuracy)
+    readings = {
+        str(r.member): (float(r.measured), float(r.reference), float(r.se))
+        for r in results
+        if r.measured is not None and r.reference is not None and r.se is not None
+    }
+    return stats.systematic_shift(
+        unit,
+        readings,
+        min_members=policy.shift_min_members,
+        acknowledged=policy.acknowledged,
+    )
+
+
+#: The key a systematic-shift finding is recorded under, per unit.
+SHIFT_FINDING = "systematic_shift"
+
+
+def records_for(workspace: str | Path) -> GateRecords:
+    """The results file of a run's workspace."""
+    return GateRecords(Path(workspace) / RESULTS_FILENAME)
+
+
+def note_systematic_shift(
+    records: GateRecords,
+    results: Sequence[GateResult],
+    accuracy: Mapping[str, Any],
+    unit: str | None,
+) -> stats.ShiftFinding | None:
+    """Run :func:`check_systematic_shift` and record its outcome either way.
+
+    A unit with no shift records a resolved entry, so a finding raised by an
+    earlier turn of the same unit stops blocking once a later turn is clean.
+    """
+    finding = check_systematic_shift(results, accuracy, unit)
+    tree = results[-1].tree_state if results else UNKNOWN_TREE_STATE
+    records.append(
+        GateRecord(
+            kind=KIND_FINDING,
+            key={"finding": SHIFT_FINDING, "unit": str(unit)},
+            tree=tree,
+            passed=finding is None or bool(finding.acknowledged),
+            values={
+                "detail": finding.describe() if finding else "no systematic shift",
+                "members": {
+                    str(r.member): {"measured": r.measured, "reference": r.reference, "se": r.se}
+                    for r in results
+                },
+            },
+        )
+    )
+    return finding
+
+
+def blocking_findings(records: GateRecords, accuracy: Mapping[str, Any]) -> list[GateRecord]:
+    """Findings that refuse delivery under the CURRENT ``accuracy.floor.acknowledge``."""
+    return open_findings(records, stats.resolve_floor_policy(accuracy).acknowledged)
+
+
+#: Prompts an acceptance workload must hold before its rates are compared. On
+#: four prompts a change that only moved the generated text moved the mean by
+#: +0.24 / -0.18 / -0.02 across three members; on 32 GSM8K prompts the same
+#: change measured -0.06 / +0.05 at paired t -1.4 / +0.8 -- no change. A task
+#: may lower it through ``accuracy.acceptance.min_prompts``, and the verdict
+#: then rests on fewer pairs, visibly.
+DEFAULT_ACCEPTANCE_MIN_PROMPTS = 32
+#: Prompts taken from the accuracy dataset when the task declares none.
+DEFAULT_ACCEPTANCE_NUM_PROMPTS = 32
+#: The minimum drop, in accepted tokens per iteration, a paired comparison
+#: must find before it calls a significant change a regression.
+DEFAULT_ACCEPTANCE_MIN_EFFECT = 0.1
+
+
+@dataclass(frozen=True)
+class AcceptanceFloor:
+    """An absolute acceptance floor, and the measurement it came from, if any."""
+
+    value: float
+    #: Where the reference drafter this floor derives from was measured;
+    #: ``None`` when the task declared a number with no measurement behind it.
+    source: str | None = None
+    #: The measured reference value the floor was derived from, when it was.
+    measured: float | None = None
+
+    def warning(self) -> str | None:
+        """What a verdict says when the floor is not tied to a measurement."""
+        if self.source or self.measured is not None:
+            return None
+        return (
+            f"the acceptance floor {self.value:.2f} is not tied to a measured reference: "
+            f"declare `floor_source` naming the reference-drafter measurement it was "
+            f"derived from, or `measured_reference` with the value itself. A floor chosen "
+            f"from the ceiling passed every wrong drafter of the run that had one"
+        )
+
+
+def resolve_acceptance_floor_spec(
+    accuracy: Mapping[str, Any], unit: str | None, *, min_ratio: float = 0.95
+) -> AcceptanceFloor | None:
+    """The absolute floor ``unit`` declares in ``accuracy.acceptance``, if any.
+
+    ``min_absolute`` is the floor itself. ``measured_reference`` is what a
+    reference drafter measured on this workload; with no ``min_absolute``
+    the floor is that times ``min_ratio``, the same ratio the stock
+    comparison uses. ``floor_source`` names where the measurement was taken.
     """
     block = accuracy.get("acceptance")
     if not isinstance(block, dict):
@@ -1433,43 +2017,125 @@ def resolve_acceptance_floor(accuracy: Mapping[str, Any], unit: str | None) -> f
     if chosen is None:
         chosen = block.get("default")
     if isinstance(chosen, dict):
-        chosen = chosen.get("min_absolute")
+        source = chosen.get("floor_source")
+        measured = chosen.get("measured_reference")
+        measured = float(measured) if isinstance(measured, (int, float)) else None
+        if chosen.get("min_absolute") is not None:
+            try:
+                return AcceptanceFloor(float(chosen["min_absolute"]), source, measured)
+            except (TypeError, ValueError):
+                return None
+        if measured is not None:
+            return AcceptanceFloor(measured * min_ratio, source, measured)
+        return None
     try:
-        return float(chosen)
+        return AcceptanceFloor(float(chosen))
     except (TypeError, ValueError):
         return None
 
 
+def resolve_acceptance_floor(accuracy: Mapping[str, Any], unit: str | None) -> float | None:
+    """The absolute `acceptance_length` floor this unit declares, if any.
+
+    Only consulted when the `=off` leg **cannot exist**. See
+    :func:`run_acceptance_gate` and :func:`resolve_acceptance_floor_spec`.
+    """
+    floor = resolve_acceptance_floor_spec(accuracy, unit)
+    return floor.value if floor is not None else None
+
+
 @dataclass(frozen=True)
 class AcceptanceWorkload:
-    """What the acceptance gate sends, and how much work it must get back."""
+    """What the acceptance gate sends, and how much of it it needs back."""
 
+    #: Declared prompts; empty when ``dataset`` supplies them.
     prompts: tuple[str, ...]
     max_tokens: int
     min_draft_iterations: int
     #: Where the prompts came from, named in a verdict that blames them.
     source: str
+    #: The engine driver's ``dataset`` block, when the prompts come from one.
+    dataset: Mapping[str, Any] | None = None
+    min_prompts: int = DEFAULT_ACCEPTANCE_MIN_PROMPTS
+
+    @property
+    def fingerprint(self) -> str:
+        """Names this workload, so two runs of it can be paired."""
+        payload = json.dumps(
+            {
+                "prompts": list(self.prompts),
+                "dataset": dict(self.dataset or {}),
+                "max_tokens": self.max_tokens,
+            },
+            sort_keys=True,
+        )
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+    def requests(self) -> list[dict[str, Any]]:
+        """The declared prompts as engine-driver requests."""
+        return [
+            {"id": f"p{n}", "prompt": prompt, "max_tokens": self.max_tokens}
+            for n, prompt in enumerate(self.prompts)
+        ]
+
+
+def acceptance_dataset(
+    accuracy: Mapping[str, Any], unit: str | None, setting: Callable[[str], Any]
+) -> tuple[dict[str, Any] | None, str]:
+    """The dataset an undeclared acceptance workload is drawn from, and its name.
+
+    ``accuracy.acceptance.dataset`` when declared; otherwise the accuracy
+    benchmark's own dataset -- ``accuracy.dataset_path`` when the run keeps
+    it locally, else the benchmark's Hugging Face id, read from the local
+    cache only (:data:`.harness.workload_io.KNOWN_DATASETS`). A multimodal
+    unit's benchmark has no text dataset, so the run-wide benchmark's is used.
+    """
+    known: dict[str, Any] = {}
+    for scope in (unit, "default"):
+        benchmark = resolve_per_unit(accuracy, "benchmark", scope)
+        if isinstance(benchmark, str) and benchmark in workload_io.KNOWN_DATASETS:
+            known = dict(workload_io.KNOWN_DATASETS[benchmark])
+            break
+    declared = setting("dataset")
+    if declared:
+        source, where = str(declared), "accuracy.acceptance.dataset"
+    elif accuracy.get("dataset_path") and known:
+        source, where = str(accuracy["dataset_path"]), "accuracy.dataset_path"
+    elif known:
+        source, where = str(known["source"]), "the accuracy benchmark's dataset"
+    else:
+        return None, ""
+    dataset = {
+        "source": source,
+        "num": int(setting("num_prompts") or DEFAULT_ACCEPTANCE_NUM_PROMPTS),
+        "text_field": setting("text_field") or known.get("text_field"),
+        "answer_field": known.get("answer_field"),
+        "split": setting("split") or known.get("split", "test"),
+        "config": setting("dataset_config") or (None if declared else known.get("config")),
+        "template": setting("prompt_template") or "{text}",
+    }
+    return dataset, f"{dataset['num']} prompts from {where} ({source})"
 
 
 def resolve_acceptance_workload(
     accuracy: Mapping[str, Any],
     unit: str | None,
     *,
-    fallback: BootSpec | None = None,
     max_tokens: int | None = None,
 ) -> AcceptanceWorkload:
-    """The acceptance workload ``unit`` declares, or the fallback when none does.
+    """The acceptance workload ``unit`` declares, or the accuracy dataset's prompts.
 
     Read from ``accuracy.acceptance``, most specific level first: the unit's
     own entry, then its ``default`` entry, then the block's top level (see
     ``task_schema.ACCEPTANCE_WORKLOAD_KEYS``). ``prompts`` and
     ``prompts_file`` are one setting, so the level that states either wins
-    for both. ``fallback`` (the boot spec) and ``max_tokens`` are what a task
-    that declares nothing measures, which is what every task measured before
-    the workload could be declared.
+    for both. With neither, the workload is the first ``num_prompts``
+    (default 32) natural-text questions of the accuracy dataset; see
+    :func:`acceptance_dataset`.
 
     Raises :class:`~.task_schema.TaskSchemaError` when a declared prompts
-    file cannot be read.
+    file cannot be read, or when nothing declares a workload and the
+    benchmark has no dataset to draw one from.
     """
     block = accuracy.get("acceptance")
     block = block if isinstance(block, dict) else {}
@@ -1487,8 +2153,9 @@ def resolve_acceptance_workload(
                 return entry[key]
         return None
 
-    prompts: tuple[str, ...] | None = None
+    prompts: tuple[str, ...] = ()
     source = ""
+    dataset: dict[str, Any] | None = None
     for where, entry in levels:
         if entry.get("prompts") is not None:
             prompts = tuple(str(p) for p in entry["prompts"])
@@ -1498,21 +2165,87 @@ def resolve_acceptance_workload(
             prompts = load_prompts_file(entry["prompts_file"])
             source = f"{where}.prompts_file ({entry['prompts_file']})"
             break
-    if prompts is None:
-        prompts = (fallback or BootSpec()).prompts
-        source = "the boot prompts (no `accuracy.acceptance.prompts` declared)"
+    if not prompts:
+        dataset, source = acceptance_dataset(accuracy, unit, setting)
+        if dataset is None:
+            raise TaskSchemaError(
+                "no acceptance workload: declare `accuracy.acceptance.prompts`, "
+                "`prompts_file` or `dataset` (a local path or a cached dataset id); the "
+                "benchmark has no dataset this gate knows how to draw prompts from"
+            )
     declared_tokens = setting("max_tokens")
-    declared_minimum = setting("min_draft_iterations")
     if declared_tokens is None:
         declared_tokens = max_tokens if max_tokens is not None else DEFAULT_ACCEPTANCE_MAX_TOKENS
-    if declared_minimum is None:
-        declared_minimum = DEFAULT_MIN_DRAFT_ITERATIONS
+    declared_minimum = setting("min_draft_iterations")
+    min_prompts = setting("min_prompts")
     return AcceptanceWorkload(
         prompts=prompts,
         max_tokens=int(declared_tokens),
-        min_draft_iterations=int(declared_minimum),
+        min_draft_iterations=int(
+            DEFAULT_MIN_DRAFT_ITERATIONS if declared_minimum is None else declared_minimum
+        ),
         source=source,
+        dataset=dataset,
+        min_prompts=int(DEFAULT_ACCEPTANCE_MIN_PROMPTS if min_prompts is None else min_prompts),
     )
+
+
+@dataclass(frozen=True)
+class RegressionPolicy:
+    """How a paired acceptance comparison is judged (``accuracy.acceptance.regression``)."""
+
+    test: str = stats.TEST_T
+    alpha: float = stats.DEFAULT_ALPHA
+    min_effect: float = DEFAULT_ACCEPTANCE_MIN_EFFECT
+
+    def compare(
+        self, baseline: Sequence[float], candidate: Sequence[float]
+    ) -> stats.PairedComparison:
+        """:func:`.stats.paired_test` under this policy."""
+        return stats.paired_test(
+            baseline, candidate, test=self.test, alpha=self.alpha, min_effect=self.min_effect
+        )
+
+
+def resolve_regression_policy(accuracy: Mapping[str, Any]) -> RegressionPolicy:
+    """Read ``accuracy.acceptance.regression``; every key optional."""
+    block = accuracy.get("acceptance")
+    block = (block if isinstance(block, dict) else {}).get("regression")
+    block = block if isinstance(block, dict) else {}
+    return RegressionPolicy(
+        test=str(block.get("test") or stats.TEST_T),
+        alpha=float(block.get("alpha", stats.DEFAULT_ALPHA)),
+        min_effect=float(block.get("min_effect", DEFAULT_ACCEPTANCE_MIN_EFFECT)),
+    )
+
+
+def tree_commit(repo_root: str | Path | None) -> str | None:
+    """The full commit ``HEAD`` names in ``repo_root``, or ``None`` if git cannot say."""
+    if not repo_root:
+        return None
+    answer = _git(repo_root, "rev-parse", "HEAD")
+    return answer.strip() if answer and answer.strip() else None
+
+
+def acceptance_key(
+    workload: AcceptanceWorkload,
+    *,
+    member: str | None,
+    speculation: Sequence[str],
+) -> dict[str, Any]:
+    """What makes two acceptance verdicts comparable across trees.
+
+    The member, the workload and the speculator flags -- not the unit: a
+    later unit that keeps speculation on is compared against the earlier
+    unit's verdict, which is how a regression a later feature introduces in
+    the draft path shows up.
+    """
+    return {
+        "gate": "acceptance",
+        "member": str(member),
+        "workload": workload.fingerprint,
+        "speculation": " ".join(speculation),
+    }
 
 
 def run_acceptance_gate(
@@ -1523,51 +2256,49 @@ def run_acceptance_gate(
     timeout: int = BOOT_TIMEOUT_S,
     min_ratio: float = 0.95,
     unit: str | None = None,
-    spec: BootSpec | None = None,
     features: Any | None = None,
     max_tokens: int | None = None,
     member: str | None = None,
     allow_dirty: bool | None = None,
+    workdir: str | Path | None = None,
+    records: GateRecords | None = None,
 ) -> GateResult:
-    """Compare ``acceptance_length`` against stock in-tree modeling.
+    """Measure per-prompt acceptance, and judge it against stock, a floor and the last tree.
 
-    The two runs differ in exactly one variable — ``TRTLLM_MODELING_V2``
-    ``off`` versus ``require`` — and must happen **in the same session**.
-    A cross-session delta carries session variance into the judgement, and
-    staircase measured a bit-identical forward at 94.7688 and 95.0720 a day
-    apart.
+    **The workload** is the task's to declare (``accuracy.acceptance.prompts``,
+    ``prompts_file`` or ``dataset``; see :func:`resolve_acceptance_workload`)
+    and is otherwise the first 32 questions of the accuracy dataset: natural
+    text whose answers run long. It goes to the engine driver (see
+    :data:`ENGINE_DRIVER`), which runs each prompt alone, streamed, and
+    prints its tokens and iterations; the rate of a prompt is its tokens per
+    iteration, and the gate's number is iteration-weighted over all of them.
 
-    ``member`` fixes the topology **both** legs run at, so the one variable
-    stays one: a draft path whose acceptance depends on the expert-parallel
-    slice is a thing this gate can only see when it is asked at that member.
+    **Size.** Fewer than ``min_prompts`` prompts (default 32) or fewer than
+    ``min_draft_iterations`` generation iterations fails as a workload too
+    small or too short to measure, not as a low number.
 
-    The tree-state guard matters here for a reason the other two gates do not
-    have: **both legs import the same working tree**, so an edit landing
-    between them moves the ratio without moving either leg's correctness, and
-    the gate reports it as a draft-path defect. See :func:`inspect_tree`.
+    **Three comparisons**, each only where it can be made:
 
-    **The workload is the task's to declare** (``accuracy.acceptance.prompts``
-    or ``prompts_file``, ``max_tokens``; see
-    :func:`resolve_acceptance_workload`). ``spec`` and ``max_tokens`` here are
-    only the fallback for a task that declares none. The boot prompts are
-    the wrong workload for a model whose answers to them are short:
-    DeepSeek-V4.1 answers them in 2-3 tokens and EOS, so every request is a
-    context step plus one generation step, the rate reads exactly 1.00 for
-    ANY drafter, and a declared floor above 1 can never pass while a broken
-    drafter cannot be told from a working one. On long-answer prompts the
-    same command measured 1.91 for a drafter with a broken ring index and
-    3.24 after the fix.
+    * against stock: the same command under ``TRTLLM_MODELING_V2=off``, in
+      the same session. It fails when the weighted ratio is under
+      ``min_ratio`` AND the per-prompt paired test finds the drop
+      significant. A new architecture has no stock path; then the declared
+      floor (see :func:`resolve_acceptance_floor_spec`) is used instead, and
+      the verdict warns when that floor is not tied to a measured reference.
+    * against 1.0: a target at or under it rejects every draft.
+    * against the previous verdict for the same member, workload and
+      speculator in ``records``: a paired test over the prompts both
+      measured (``accuracy.acceptance.regression``: t or Wilcoxon, alpha,
+      minimum effect). A significant drop at least the minimum effect large
+      fails. This replaces the fixed 0.1 delta that read noise on four
+      prompts as a regression.
 
-    **A workload too short to measure is a failure of its own**, reported as
-    one: fewer than ``min_draft_iterations`` generation iterations in total
-    (from quickstart's ``Accept rate: ... (tokens=T, iterations=I)`` lines)
-    fails with "workload too short to measure acceptance" instead of a low
-    number that reads as a drafter defect. A leg that prints only a summary
-    statistic carries no iteration count and is not held to it.
+    Every verdict with a reading carries the per-prompt rates. A passing
+    reading is appended to ``records`` and becomes the next tree's baseline.
 
-    Every verdict that has a reading carries the per-prompt rates and their
-    plain mean beside the iteration-weighted value it is judged on, in
-    :attr:`GateResult.breakdown`.
+    The two legs differ in exactly one variable and must run in the same
+    session; both import the same working tree, so the tree-state guard of
+    :func:`inspect_tree` stops a gate whose target path is being edited.
     """
     state = inspect_tree(task_data, allow_dirty=allow_dirty)
     _verdict = _verdict_factory(state)
@@ -1575,9 +2306,7 @@ def run_acceptance_gate(
         return _verdict(name="acceptance", member=member, passed=False, detail=state.block_detail())
     accuracy = task_data.get("accuracy") or {}
     try:
-        workload = resolve_acceptance_workload(
-            accuracy, unit, fallback=spec or BootSpec(), max_tokens=max_tokens
-        )
+        workload = resolve_acceptance_workload(accuracy, unit, max_tokens=max_tokens)
     except TaskSchemaError as exc:
         return _verdict(
             name="acceptance",
@@ -1585,71 +2314,52 @@ def run_acceptance_gate(
             passed=False,
             detail=f"the declared acceptance workload cannot be read: {exc}",
         )
-    # The QUICKSTART command, not the eval command, and not as an
-    # optimization. `trtllm-eval` emits no speculative statistic in this
-    # tree, so an acceptance gate built on it reads None from both legs and
-    # fails identically to a broken draft path. `quickstart_advanced.py`
-    # prints `Accept rate: N (tokens=T, iterations=I)` per request, which is
-    # the quantity this gate is about.
-    #
-    # It is also two orders of magnitude cheaper -- minutes against the nine
-    # a full gsm8k run costs, twice -- which matters because this gate runs
-    # both legs.
-    repo = Path(str(task_data["trtllm_repo_path"]))
-    script = repo / "examples" / "llm-api" / "quickstart_advanced.py"
-    # Shell-quoted: a declared workload is free text, and a code-listing
-    # prompt carries the quotes, `$` and backslashes a double-quoted word
-    # would expand or end on.
-    prompts = " ".join(shlex.quote(p) for p in workload.prompts)
-    argv = " ".join(
-        [
-            str(script),
-            f'--model_dir="{task_data["checkpoint_path"]}"',
-            # Longer than the boot gate's, deliberately. Acceptance length is
-            # a rate, and a 32-token continuation gives it a handful of
-            # iterations to be estimated from -- enough to see a draft path
-            # collapse to 1.0, not enough to resolve a 5% shortfall.
-            f"--max_tokens={workload.max_tokens}",
-            *topology_flags(str(task_data["parallel"]), environment.world_size, member),
-            *runtime_flags(resolve_runtime(task_data, unit)),
-            *speculation_flags(
-                task_data.get("features") if features is None else features,
-                max_draft_len=resolve_max_draft_len(accuracy, unit),
-            ),
-            f"--prompt {prompts}",
-        ]
+    features = task_data.get("features") if features is None else features
+    draft_len = resolve_max_draft_len(accuracy, unit)
+    speculation = speculation_flags(features, max_draft_len=draft_len)
+    argv = quickstart_words(
+        task_data,
+        environment,
+        unit=unit,
+        features=features,
+        max_tokens=workload.max_tokens,
+        member=member,
     )
+    directory = gate_workdir(workdir, "acceptance", task_data)
+    spec_path = write_driver_spec(
+        directory / f"acceptance.{unit or 'unit'}.{member or 'member'}.json",
+        task_data=task_data,
+        argv=argv,
+        requests=workload.requests(),
+        dataset=workload.dataset,
+        max_tokens=workload.max_tokens,
+    )
+    policy = resolve_regression_policy(accuracy)
+    floor_spec = resolve_acceptance_floor_spec(accuracy, unit, min_ratio=min_ratio)
 
     started = time.monotonic()
     readings: dict[str, AcceptanceReading | None] = {}
     commands: dict[str, str] = {}
     stock_unavailable = False
     for mode in (MODE_REQUIRE, MODE_OFF):
-        command = _with_mode(environment, mode).python_command(argv)
+        command = engine_driver_command(_with_mode(environment, mode), spec_path)
         commands[mode] = command
         result = runner(command, None, timeout)
         combined = result.stdout + result.stderr
         if not result.ok:
-            # **The stock leg can be impossible rather than broken.** This gate
-            # compares the target against the same checkpoint under built-in
-            # modeling -- and a genuinely new architecture HAS no built-in
-            # modeling, so `=off` cannot load it at all. That is the same shape
-            # as the substrate gate's problem (see
-            # `preflight.UNSUPPORTED_ARCHITECTURE_MARKERS`, reused here): the
-            # check is unavailable exactly when onboarding is doing its job.
-            #
-            # Failing the unit for it would be wrong, and silently skipping the
-            # gate would be worse -- it is the ONLY gate that can see a
-            # miscomputed draft path, because rejection sampling makes a wrong
-            # draft produce correct text more slowly. So the spec may declare an
-            # ABSOLUTE floor instead, and the weaker claim is recorded verbatim.
+            # **The stock leg can be impossible rather than broken.** A
+            # genuinely new architecture HAS no built-in modeling, so `=off`
+            # cannot load it at all -- the check is unavailable exactly when
+            # onboarding is doing its job (see
+            # `preflight.UNSUPPORTED_ARCHITECTURE_MARKERS`, reused here). The
+            # spec may then declare an absolute floor instead, and the weaker
+            # claim is recorded verbatim.
             from .preflight import reports_unsupported_architecture
 
-            floor = resolve_acceptance_floor(accuracy, unit)
             unavailable = mode == MODE_OFF and reports_unsupported_architecture(
                 f"exited {result.returncode}", "\n".join(combined.splitlines()[-200:])
             )
-            if unavailable and floor is not None:
+            if unavailable and floor_spec is not None:
                 readings[mode] = None
                 stock_unavailable = True
                 break
@@ -1663,7 +2373,8 @@ def run_acceptance_gate(
                     + (
                         " -- this checkpoint has no built-in implementation, so the "
                         "stock leg cannot run. Declare `accuracy.acceptance.<unit>."
-                        "min_absolute` to gate on an absolute floor instead."
+                        "min_absolute` (or `measured_reference`) to gate on an absolute "
+                        "floor instead."
                         if unavailable
                         else ""
                     )
@@ -1680,110 +2391,171 @@ def run_acceptance_gate(
     target = target_reading.value if target_reading is not None else None
     stock = stock_reading.value if stock_reading is not None else None
     breakdown = target_reading.breakdown() if target_reading is not None else ""
+    base = dict(name="acceptance", member=member, duration_s=elapsed)
 
-    def too_short(mode: str) -> GateResult | None:
-        """The verdict for a leg whose workload never exercised the drafter."""
+    def too_small(mode: str) -> GateResult | None:
+        """The verdict for a leg whose workload cannot carry a comparison."""
         reading = readings.get(mode)
-        counted = reading.draft_iterations if reading is not None else None
-        if reading is None or counted is None or counted >= workload.min_draft_iterations:
+        if reading is None or not reading.requests:
             return None
-        return _verdict(
-            name="acceptance",
-            member=member,
-            passed=False,
-            detail=(
+        counted = reading.draft_iterations or 0
+        if len(reading.requests) < workload.min_prompts:
+            why = (
+                f"workload too small to compare acceptance: the {MODELING_V2_ENV}={mode} leg "
+                f"measured {len(reading.requests)} prompt(s), fewer than the "
+                f"{workload.min_prompts} a paired comparison needs -- on four prompts a "
+                f"change that only moved the generated text read as a regression"
+            )
+        elif counted < workload.min_draft_iterations:
+            why = (
                 f"workload too short to measure acceptance: the {MODELING_V2_ENV}={mode} "
                 f"leg ran {counted} generation iteration(s) over {len(reading.requests)} "
                 f"prompt(s), fewer than the {workload.min_draft_iterations} this gate "
                 f"needs, so its rate ({reading.value:.2f}) says nothing about the draft "
-                f"path -- the answers end before drafts are verified. Workload: "
-                f"{workload.source}, max_tokens {workload.max_tokens}. Declare "
-                f"long-answer prompts in `accuracy.acceptance.prompts` (or "
-                f"`prompts_file`); this is a property of the workload, not of the target."
+                f"path -- the answers end before drafts are verified"
+            )
+        else:
+            return None
+        return _verdict(
+            passed=False,
+            detail=(
+                f"{why}. Workload: {workload.source}, max_tokens {workload.max_tokens}. "
+                f"This is a property of the workload, not of the target."
             ),
             command=commands[mode],
-            duration_s=elapsed,
             breakdown=reading.breakdown(),
+            **base,
         )
 
-    if stock_unavailable:
-        floor = resolve_acceptance_floor(accuracy, unit)
-        if target is None:
-            return _verdict(
-                name="acceptance",
-                member=member,
-                passed=False,
-                detail="could not read acceptance_length from the require leg",
-                command=commands[MODE_REQUIRE],
-                duration_s=elapsed,
-            )
-        short = too_short(MODE_REQUIRE)
-        if short is not None:
-            return short
+    if target is None:
         return _verdict(
-            name="acceptance",
-            member=member,
-            passed=target >= float(floor),
-            detail=(
-                f"acceptance_length {target:.4f} vs declared floor {float(floor):.4f}. "
-                f"The {MODELING_V2_ENV}=off leg could not run: this checkpoint has no "
-                f"built-in implementation, so there is no stock acceptance to compare "
-                f"against. THIS IS THE WEAKER CLAIM -- it shows the draft path accepts "
-                f"at a real rate, not that it matches stock."
-            ),
-            command=commands[MODE_REQUIRE],
-            measured=target,
-            reference=float(floor),
-            duration_s=elapsed,
-            breakdown=breakdown,
-        )
-    if target is None or stock is None:
-        return _verdict(
-            name="acceptance",
-            member=member,
             passed=False,
-            detail=f"could not read acceptance_length from both legs "
-            f"(require={target}, off={stock})",
+            detail=f"could not read acceptance from the require leg (off={stock})",
             command=commands[MODE_REQUIRE],
-            duration_s=elapsed,
+            **base,
         )
     for mode in (MODE_REQUIRE, MODE_OFF):
-        short = too_short(mode)
+        short = too_small(mode)
         if short is not None:
             return short
-    stock_breakdown = stock_reading.breakdown() if stock_reading is not None else ""
-    if breakdown and stock_breakdown:
-        breakdown = f"require: {breakdown}; off: {stock_breakdown}"
+
+    warnings: list[str] = []
+    notes: list[str] = []
     if target <= 1.0:
         return _verdict(
-            name="acceptance",
-            member=member,
             passed=False,
-            detail=f"acceptance_length {target:.4f} at or below 1.0 means every draft "
-            f"was rejected — the draft path is computing the wrong thing",
+            detail=f"acceptance_length {target:.4f} at or below 1.0 means every draft was "
+            f"rejected — the draft path is computing the wrong thing",
             command=commands[MODE_REQUIRE],
             measured=target,
-            reference=stock,
-            duration_s=elapsed,
+            reference=stock if stock is not None else (floor_spec.value if floor_spec else None),
             breakdown=breakdown,
+            **base,
         )
 
-    ratio = target / stock if stock else 0.0
-    passed = ratio >= min_ratio
+    reference: float | None
+    if stock_unavailable:
+        assert floor_spec is not None
+        reference = floor_spec.value
+        passed = target >= floor_spec.value
+        if floor_spec.warning():
+            warnings.append(floor_spec.warning())
+        derived = (
+            f" (= measured reference {floor_spec.measured:.2f} x {min_ratio:.2f})"
+            if floor_spec.measured is not None and floor_spec.source is None
+            else ""
+        )
+        notes.append(
+            f"acceptance_length {target:.4f} vs declared floor {floor_spec.value:.4f}{derived}"
+            + (f" (from {floor_spec.source})" if floor_spec.source else "")
+            + f". The {MODELING_V2_ENV}=off leg could not run: this checkpoint has no "
+            f"built-in implementation. THIS IS THE WEAKER CLAIM -- it shows the draft path "
+            f"accepts at a real rate, not that it matches stock"
+        )
+    else:
+        if stock is None:
+            return _verdict(
+                passed=False,
+                detail=f"could not read acceptance from both legs (require={target}, off={stock})",
+                command=commands[MODE_REQUIRE],
+                **base,
+            )
+        stock_breakdown = stock_reading.breakdown() if stock_reading is not None else ""
+        if breakdown and stock_breakdown:
+            breakdown = f"require: {breakdown}; off: {stock_breakdown}"
+        reference = stock
+        ratio = target / stock if stock else 0.0
+        paired = None
+        if target_reading.requests and stock_reading.requests:
+            own, theirs = target_reading.rates(), stock_reading.rates()
+            shared = [p for p in own if p in theirs]
+            if len(shared) >= 2:
+                paired = policy.compare([theirs[p] for p in shared], [own[p] for p in shared])
+        passed = ratio >= min_ratio or (paired is not None and not paired.significant)
+        notes.append(
+            f"acceptance_length {target:.4f} vs stock {stock:.4f} (ratio {ratio:.3f}, floor "
+            f"{min_ratio:.2f})"
+            + (f"; {paired.describe()}" if paired is not None else "")
+            + (
+                ". Clearly above 1.0 but below the reference means subtly wrong, not merely slower"
+                if not passed
+                else ""
+            )
+        )
+
+    key = acceptance_key(workload, member=member, speculation=speculation)
+    if records is not None and target_reading.requests:
+        baseline = records.latest(KIND_ACCEPTANCE, key, exclude_tree=state.description)
+        if baseline is None:
+            notes.append(
+                "no earlier verdict for this member and workload; this one is the baseline"
+            )
+        else:
+            before = {
+                str(k): float(v) for k, v in (baseline.values.get("per_prompt") or {}).items()
+            }
+            now = target_reading.rates()
+            shared = [p for p in now if p in before]
+            if len(shared) < 2:
+                warnings.append(
+                    f"the earlier verdict on tree {baseline.tree} shares {len(shared)} prompt(s) "
+                    f"with this one, so the two were not compared"
+                )
+            else:
+                compared = policy.compare([before[p] for p in shared], [now[p] for p in shared])
+                regressed = compared.regressed
+                notes.append(
+                    f"against tree {baseline.tree}: "
+                    + ("REGRESSED, " if regressed else "")
+                    + compared.describe()
+                )
+                passed = passed and not regressed
+        records.append(
+            GateRecord(
+                kind=KIND_ACCEPTANCE,
+                key=key,
+                tree=state.description,
+                commit=tree_commit(task_data.get("trtllm_repo_path")),
+                passed=passed,
+                values={
+                    "unit": unit,
+                    "weighted": target,
+                    "per_prompt": target_reading.rates(),
+                    "prompts": len(target_reading.requests),
+                },
+            )
+        )
+
     return _verdict(
-        name="acceptance",
-        member=member,
         passed=passed,
-        detail=(
-            f"acceptance_length {target:.4f} vs stock {stock:.4f} "
-            f"(ratio {ratio:.3f}, floor {min_ratio:.2f}). Clearly above 1.0 but below "
-            f"the reference means subtly wrong, not merely slower."
-        ),
+        detail="; ".join(notes),
         command=commands[MODE_REQUIRE],
         measured=target,
-        reference=stock,
-        duration_s=elapsed,
+        reference=reference,
         breakdown=breakdown,
+        warnings=tuple(warnings),
+        explained=True,
+        **base,
     )
 
 
@@ -1842,7 +2614,39 @@ __all__ = [
     "AcceptanceReading",
     "AcceptanceWorkload",
     "BOOT_TIMEOUT_S",
+    "AcceptanceFloor",
+    "BATCH_SIZE_FLAG",
+    "BOOT_RENDERS",
+    "BootPrompt",
     "BootSpec",
+    "DEFAULT_BOOT_IMAGE",
+    "DEFAULT_BOOT_IMAGE_KEYWORDS",
+    "DEFAULT_BOOT_IMAGE_PROMPT",
+    "resolve_boot_spec",
+    "DEFAULT_ACCEPTANCE_MIN_EFFECT",
+    "DEFAULT_ACCEPTANCE_MIN_PROMPTS",
+    "DEFAULT_ACCEPTANCE_NUM_PROMPTS",
+    "ENGINE_DRIVER",
+    "RegressionPolicy",
+    "SHIFT_FINDING",
+    "acceptance_dataset",
+    "acceptance_key",
+    "engine_driver_command",
+    "gate_workdir",
+    "parse_driver_records",
+    "quickstart_script",
+    "quickstart_words",
+    "resolve_acceptance_floor_spec",
+    "resolve_regression_policy",
+    "tree_commit",
+    "with_max_batch_size",
+    "write_driver_spec",
+    "blocking_findings",
+    "check_systematic_shift",
+    "note_systematic_shift",
+    "records_for",
+    "resolve_floor",
+    "resolve_samples",
     "DEFAULT_ACCEPTANCE_MAX_TOKENS",
     "DEFAULT_MIN_DRAFT_ITERATIONS",
     "GateLog",

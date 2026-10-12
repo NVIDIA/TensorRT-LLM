@@ -760,6 +760,9 @@ def _with_witness(tmp_path, features, witness):
     spec = _valid_spec(tmp_path)
     spec["features"] = features
     spec["accuracy"]["witness"] = witness
+    if "disagg" in features:
+        # The disagg unit's launch-path smoke needs its launcher declared too.
+        spec["accuracy"]["launch"] = {"disagg": {"command": "/onboard/launch_disagg.sh"}}
     return _write(tmp_path, spec)
 
 

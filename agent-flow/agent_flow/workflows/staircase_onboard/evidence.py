@@ -367,11 +367,14 @@ class RunEvidence:
                 gates_mod.run_boot_gate(
                     wf._gate_env(),
                     task_data=wf.task_data,
-                    spec=gates_mod.BootSpec.load(wf.boot_spec_path),
+                    spec=gates_mod.resolve_boot_spec(
+                        wf.task_data, unit, wf._features_through(unit), wf.boot_spec_path
+                    ),
                     runner=wf._shell_runner,
                     features=wf._features_through(unit),
                     unit=unit,
                     member=member,
+                    workdir=wf.workspace / "gates" / unit,
                 )
             )
         if entry.gate.startswith("accuracy"):
@@ -390,11 +393,41 @@ class RunEvidence:
                 gates_mod.run_acceptance_gate(
                     wf._gate_env(),
                     task_data=wf.task_data,
-                    spec=gates_mod.BootSpec.load(wf.boot_spec_path),
                     runner=wf._shell_runner,
                     unit=unit,
                     features=wf._features_through(unit),
                     member=member,
+                    workdir=wf.workspace / "gates" / unit,
+                    records=gates_mod.records_for(wf.workspace),
+                )
+            )
+        if entry.gate == "scheduler_equivalence":
+            from . import step_check
+
+            return lambda: wf.gate_log.record(
+                step_check.run_scheduler_equivalence(
+                    wf._gate_env(),
+                    task_data=wf.task_data,
+                    runner=wf._shell_runner,
+                    unit=unit,
+                    member=member,
+                    features=wf._features_through(unit),
+                    workdir=wf.workspace / "gates" / unit / "scheduler_equivalence",
+                )
+            )
+        if entry.gate == "launch":
+            from . import launch_gate
+
+            return lambda: wf.gate_log.record(
+                launch_gate.run_launch_gate(
+                    wf._gate_env(),
+                    task_data=wf.task_data,
+                    reference=launch_gate.smoke_reference(wf.task_data, unit, wf._model_key),
+                    runner=wf._shell_runner,
+                    unit=unit,
+                    member=member,
+                    features=wf._features_through(unit),
+                    workdir=wf.workspace / "gates" / unit / "launch",
                 )
             )
         if unit in WITNESS_GATED_UNITS:

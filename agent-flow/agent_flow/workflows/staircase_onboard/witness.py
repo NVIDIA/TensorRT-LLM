@@ -73,6 +73,7 @@ from typing import Any, Callable, Mapping, Sequence
 
 from .environment import RunEnvironment
 from .gates import (
+    BATCH_SIZE_FLAG,
     BOOT_TIMEOUT_S,
     MODE_REQUIRE,
     RUNTIME_VALUE_DUMP_ENV,
@@ -86,6 +87,7 @@ from .gates import (
     runtime_flags,
     speculation_flags,
     topology_flags,
+    with_max_batch_size,
 )
 from .task_schema import DEFAULT_BYTES_TOLERANCE
 
@@ -125,11 +127,6 @@ LEG_B_ARGV_ENV = "STAIRCASE_WITNESS_LEG_A_ARGV"
 LEG_B_TIMEOUT_ENV = "STAIRCASE_WITNESS_TIMEOUT_S"
 LEG_B_MAX_BATCH_SIZE_ENV = "STAIRCASE_WITNESS_MAX_BATCH_SIZE"
 LEG_B_LEGS_ENV_ENV = "STAIRCASE_WITNESS_LEGS_ENV"
-
-#: The quickstart flag a witness block's ``max_batch_size`` replaces. The
-#: runtime block usually sets it through ``extra_flags``, so an override has
-#: to remove that spelling, not just append another one.
-BATCH_SIZE_FLAG = "--max_batch_size"
 
 #: What `trtllm-llmapi-launch` exports to the process it wraps. A contrast
 #: command is a launcher that starts engines of its own, and an engine that
@@ -394,6 +391,84 @@ def compare_continuations(out_a: str, out_b: str) -> ContinuationComparison:
     return ContinuationComparison(PREFIX_OBSERVABLE, "character", prefix_a, prefix_b)
 
 
+#: Generated tokens a token-comparing witness's continuations must reach,
+#: when the block does not say. Identity over a 2-token answer rests on the
+#: kernels' certification, not on an end-to-end comparison.
+DEFAULT_MIN_GENERATED_TOKENS = 32
+#: The workload keys a token-comparing witness block may declare.
+WORKLOAD_KEYS: tuple[str, ...] = ("prompts", "prompts_file", "max_tokens", "min_generated_tokens")
+
+
+def too_short(comparison: ContinuationComparison, minimum: int | None) -> str | None:
+    """Why ``comparison`` is too short to judge, or ``None``.
+
+    Only token ids carry a length a witness can hold to a minimum; a leg
+    that printed text alone is judged as before.
+    """
+    if not minimum or comparison.unit != "token" or not comparison.a:
+        return None
+    lengths = [len(ids) for ids in (*comparison.a, *comparison.b)]
+    if min(lengths) >= minimum:
+        return None
+    return (
+        f"the continuations are too short to compare: the shortest generated "
+        f"{min(lengths)} token(s), under min_generated_tokens={minimum}, so identity "
+        f"would rest on the kernels' certification rather than on an end-to-end "
+        f"comparison. Declare a workload with long answers in the witness block "
+        f"(`prompts` / `prompts_file`, `max_tokens`)"
+    )
+
+
+@dataclass(frozen=True)
+class WitnessWorkload:
+    """What a token-comparing witness sends, resolved from its block."""
+
+    prompts: tuple[str, ...]
+    max_tokens: int
+    min_generated_tokens: int
+    source: str
+
+
+def resolve_witness_workload(
+    task_data: Mapping[str, Any],
+    block: Mapping[str, Any],
+    boot: BootSpec,
+    *,
+    default_max_tokens: int,
+) -> WitnessWorkload:
+    """The witness block's own workload, else the declared acceptance prompts, else the boot prompts.
+
+    Declared in task.yaml, never assembled from the run: ``prompts`` or
+    ``prompts_file``, ``max_tokens`` and ``min_generated_tokens`` on the
+    witness block. With none, the prompts the acceptance gate declares
+    (long answers by construction), else the boot prompts as before.
+    """
+    from .task_schema import load_prompts_file
+
+    if block.get("prompts"):
+        prompts, source = tuple(str(p) for p in block["prompts"]), "the witness block's prompts"
+    elif block.get("prompts_file"):
+        prompts = load_prompts_file(block["prompts_file"])
+        source = f"the witness block's prompts_file ({block['prompts_file']})"
+    else:
+        acceptance = (task_data.get("accuracy") or {}).get("acceptance")
+        acceptance = acceptance if isinstance(acceptance, Mapping) else {}
+        if acceptance.get("prompts"):
+            prompts = tuple(str(p) for p in acceptance["prompts"])
+            source = "accuracy.acceptance.prompts"
+        elif acceptance.get("prompts_file"):
+            prompts = load_prompts_file(acceptance["prompts_file"])
+            source = "accuracy.acceptance.prompts_file"
+        else:
+            prompts, source = boot.prompts, boot.source
+    return WitnessWorkload(
+        prompts=prompts,
+        max_tokens=int(block.get("max_tokens") or default_max_tokens),
+        min_generated_tokens=int(block.get("min_generated_tokens") or DEFAULT_MIN_GENERATED_TOKENS),
+        source=source,
+    )
+
+
 def parse_device_memory_mib(stdout: str) -> float | None:
     """The device-memory reading a witness workload printed, in MiB.
 
@@ -481,34 +556,6 @@ def witness_command(
             f"--prompt {quoted}",
         ]
     )
-
-
-def with_max_batch_size(flags: Sequence[str], max_batch_size: int | None) -> list[str]:
-    """``flags`` with every ``--max_batch_size`` spelling replaced by one ``=N``.
-
-    A token-comparing witness declares the batch limit its legs run at, and
-    the runtime block has usually set its own through ``extra_flags`` --
-    ``--max_batch_size=8``, ``--max_batch_size 8`` as one string, or the flag
-    and its value as two. All three are removed, so the argv states ONE limit
-    and leg B's reading of leg A's argv cannot pick up the stale one. ``None``
-    returns ``flags`` unchanged.
-    """
-    if max_batch_size is None:
-        return list(flags)
-    kept: list[str] = []
-    skip_value = False
-    for flag in flags:
-        if skip_value:
-            skip_value = False
-            continue
-        word = str(flag)
-        if word == BATCH_SIZE_FLAG:
-            skip_value = True
-            continue
-        if word.startswith((f"{BATCH_SIZE_FLAG}=", f"{BATCH_SIZE_FLAG} ")):
-            continue
-        kept.append(word)
-    return [*kept, f"{BATCH_SIZE_FLAG}={int(max_batch_size)}"]
 
 
 def _quickstart_argv(
@@ -638,6 +685,9 @@ def run_residency_witness(
     features: Any | None = None,
     member: str | None = None,
     max_batch_size: int | None = None,
+    prompts: Sequence[str] | None = None,
+    max_tokens: int = 64,
+    min_generated_tokens: int | None = None,
 ) -> GateResult:
     """Prove a host-offloaded tensor is actually not resident.
 
@@ -664,6 +714,8 @@ def run_residency_witness(
         features=features,
         member=member,
         max_batch_size=max_batch_size,
+        prompts=prompts,
+        max_tokens=max_tokens,
     )
     full_output = {WITNESS_OUTPUT_ENV: "1"}
     started = time.monotonic()
@@ -709,6 +761,16 @@ def run_residency_witness(
         )
 
     comparison = compare_continuations(on_out, off_out)
+    short = too_short(comparison, min_generated_tokens)
+    if short:
+        return GateResult(
+            name="residency",
+            member=member,
+            passed=False,
+            detail=short,
+            command=on_cmd,
+            duration_s=elapsed,
+        )
     if not comparison.identical:
         names = ("offloaded", "resident")
         return GateResult(
@@ -763,6 +825,8 @@ def run_equivalence_witness(
     workdir: str | Path | None = None,
     max_batch_size: int | None = None,
     legs_env: Mapping[str, str] | None = None,
+    prompts: Sequence[str] | None = None,
+    min_generated_tokens: int | None = None,
 ) -> GateResult:
     """Prove per-sequence state survives the prefill/decode hop.
 
@@ -828,7 +892,10 @@ def run_equivalence_witness(
     remembers to check.
     """
     spec = spec or BootSpec()
-    prompts = (*spec.prompts, *(filler_words(int(n)) for n in (prompt_tokens or ())))
+    prompts = (
+        *(spec.prompts if prompts is None else prompts),
+        *(filler_words(int(n)) for n in (prompt_tokens or ())),
+    )
     shape = dict(
         unit=unit,
         features=features,
@@ -923,6 +990,16 @@ def run_equivalence_witness(
             duration_s=elapsed,
         )
 
+    short = too_short(comparison, min_generated_tokens)
+    if short:
+        return GateResult(
+            name="equivalence",
+            member=member,
+            passed=False,
+            detail=short,
+            command=agg_cmd,
+            duration_s=elapsed,
+        )
     compared = f"compared as {comparison.observable}"
     if comparison.observable == PREFIX_OBSERVABLE:
         compared += (
@@ -1237,6 +1314,8 @@ def run_kv_quant_witness(
     max_tokens: int = 256,
     member: str | None = None,
     max_batch_size: int | None = None,
+    prompts: Sequence[str] | None = None,
+    min_generated_tokens: int | None = None,
 ) -> GateResult:
     """Prove KV is stored natively, and -- when declared exact -- that nothing moved.
 
@@ -1280,6 +1359,7 @@ def run_kv_quant_witness(
         max_tokens=max_tokens,
         member=member,
         max_batch_size=max_batch_size,
+        prompts=prompts,
     )
     env = _with_mode(environment, MODE_REQUIRE)
     counting = {WITNESS_COUNTER_ENV: "1", WITNESS_OUTPUT_ENV: "1"}
@@ -1364,6 +1444,16 @@ def run_kv_quant_witness(
             duration_s=elapsed,
         )
     comparison = compare_continuations(native_out, ref_out)
+    short = too_short(comparison, min_generated_tokens)
+    if short:
+        return GateResult(
+            name=name,
+            member=member,
+            passed=False,
+            detail=short,
+            command=native_cmd,
+            duration_s=elapsed,
+        )
     if not comparison.identical:
         names = ("native", "bf16")
         return GateResult(
@@ -1401,6 +1491,122 @@ def run_kv_quant_witness(
     )
 
 
+#: The witness each output-identical (or work-skipping) feature needs. The
+#: orchestrator's ``WITNESS_GATED_UNITS`` is this table.
+WITNESS_KINDS: dict[str, str] = {
+    "host_offload": "residency",
+    "disagg": "equivalence",
+    "decoder_replay": "replay",
+    "encoder_replay": "replay",
+    "kv_quant": "kv_quant",
+}
+
+
+def run_declared_witness(
+    environment: RunEnvironment,
+    *,
+    unit: str,
+    member: str | None,
+    task_data: Mapping[str, Any],
+    runner: ShellRunner = _default_shell_runner,
+    features: Any | None = None,
+    workdir: str | Path | None = None,
+    boot: BootSpec | None = None,
+    kind: str | None = None,
+) -> GateResult:
+    """Run the witness ``accuracy.witness.<unit>`` declares, exactly as the orchestrator does.
+
+    One entry point for the unit loop and for a standalone run of the same
+    witness (``staircase-onboard gate witness``): an assembler that reruns a
+    witness by hand reruns this, not a reconstruction of it. The block must
+    already be complete (see the orchestrator's ``_witness_block_gap``).
+    """
+    from .task_schema import DEFAULT_BYTES_TOLERANCE, WITNESS_BATCH_SIZE_KEY, WITNESS_LEGS_ENV_KEY
+
+    kind = kind or WITNESS_KINDS[unit]
+    witnesses = (task_data.get("accuracy") or {}).get("witness") or {}
+    block = dict(witnesses.get(unit) or {}) if isinstance(witnesses, Mapping) else {}
+    contrast_env = {str(k): str(v) for k, v in (block.get("contrast_env") or {}).items()}
+    common = dict(
+        task_data=task_data,
+        runner=runner,
+        unit=unit,
+        features=features,
+        member=member,
+        # Per leg. A disagg leg boots two engines in sequence, which the
+        # one-engine default was never sized for.
+        timeout=int(block.get("timeout") or BOOT_TIMEOUT_S),
+    )
+    if kind == "replay":
+        # The workload is generated from the declared sizes, not from the
+        # boot prompts: two short prompts never exceed the window, and a
+        # witness whose prompt fits inside the window passes for a target
+        # that bounds nothing.
+        return run_replay_witness(
+            environment,
+            feature=unit,
+            contrast_env=contrast_env,
+            window=int(block["window"]),
+            prompt_tokens=block.get("prompt_tokens"),
+            prefix_tokens=block.get("prefix_tokens"),
+            reuse_alignment=int(block.get("reuse_alignment", 1)),
+            **common,
+        )
+    # The token-comparing witnesses: both legs run at this batch limit (see
+    # `task_schema.WITNESS_BATCH_SIZE_KEY` for why 1 is the useful one) over
+    # the declared workload.
+    batch = block.get(WITNESS_BATCH_SIZE_KEY)
+    boot = boot or BootSpec()
+    default_tokens = 64 if kind == "residency" else 256
+    workload = resolve_witness_workload(task_data, block, boot, default_max_tokens=default_tokens)
+    shaped = dict(
+        max_batch_size=None if batch is None else int(batch),
+        spec=boot,
+        prompts=workload.prompts,
+        min_generated_tokens=workload.min_generated_tokens,
+    )
+    if kind == "residency":
+        return run_residency_witness(
+            environment,
+            expected_mib=resolve_expected_mib(block, member),
+            contrast_env=contrast_env,
+            max_tokens=workload.max_tokens,
+            **shaped,
+            **common,
+        )
+    if kind == "kv_quant":
+        return run_kv_quant_witness(
+            environment,
+            expected_bytes_per_token=int(block["expected_bytes_per_token"]),
+            exact=bool(block.get("exact", True)),
+            contrast_env=contrast_env,
+            bytes_tolerance=float(block.get("bytes_tolerance", DEFAULT_BYTES_TOLERANCE)),
+            max_tokens=workload.max_tokens,
+            **shaped,
+            **common,
+        )
+    return run_equivalence_witness(
+        environment,
+        contrast_env=contrast_env,
+        contrast_command=block.get("contrast_command"),
+        prompt_tokens=block.get("prompt_tokens"),
+        workdir=workdir,
+        legs_env={str(k): str(v) for k, v in (block.get(WITNESS_LEGS_ENV_KEY) or {}).items()},
+        max_tokens=workload.max_tokens,
+        **shaped,
+        **common,
+    )
+
+
+def resolve_expected_mib(block: Mapping[str, Any], member: str | None) -> float:
+    """The residency delta predicted for ``member``: a scalar, or a mapping with ``default``."""
+    expected = block.get("expected_mib", 0.0)
+    if isinstance(expected, Mapping):
+        chosen = expected.get(str(member))
+        expected = chosen if chosen is not None else expected.get("default", 0.0)
+    return float(expected)
+
+
 __all__ = [
     "DEVICE_MEMORY_MARKER",
     "KV_BYTES_FIELD",
@@ -1418,7 +1624,15 @@ __all__ = [
     "REPLAY_COUNTER_FIELDS",
     "WITNESS_COUNTER_ENV",
     "WITNESS_COUNTER_MARKER",
+    "WITNESS_KINDS",
     "WITNESS_OUTPUT_ENV",
+    "WORKLOAD_KEYS",
+    "resolve_expected_mib",
+    "run_declared_witness",
+    "DEFAULT_MIN_GENERATED_TOKENS",
+    "WitnessWorkload",
+    "resolve_witness_workload",
+    "too_short",
     "ContinuationComparison",
     "compare_continuations",
     "contrast_leg_command",

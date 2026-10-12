@@ -12,6 +12,8 @@ wrong depth, or not at all.
 from __future__ import annotations
 
 import ast
+import json
+import shlex
 import textwrap
 from pathlib import Path
 
@@ -92,7 +94,11 @@ def _task(tmp_path, floor):
             "llm_api_options": {
                 "dspark": _options(tmp_path, decoding_type="DSpark", max_draft_len=5)
             },
-            "acceptance": {"dspark": {"min_absolute": floor}},
+            "acceptance": {
+                "prompts": ["Explain step by step.", "Write a long story."],
+                "min_prompts": 1,
+                "dspark": {"min_absolute": floor},
+            },
         },
     }
 
@@ -136,8 +142,10 @@ def test_the_declared_floor_stands_in_for_the_missing_stock_leg(tmp_path):
     assert result.reference == pytest.approx(1.2)
     assert "WEAKER CLAIM" in result.detail
     seen = run.seen  # type: ignore[attr-defined]
-    assert "--spec_decode_algo=DSPARK" in seen[0]
-    assert "--spec_decode_max_draft_len=5" in seen[0]
+    words = shlex.split(seen[0])
+    argv = json.loads(Path(words[words.index("--spec") + 1]).read_text())["quickstart_argv"]
+    assert "--spec_decode_algo=DSPARK" in argv
+    assert "--spec_decode_max_draft_len=5" in argv
 
 
 def test_below_the_declared_floor_fails(tmp_path):

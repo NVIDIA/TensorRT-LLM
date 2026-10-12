@@ -36,6 +36,7 @@ import yaml
 
 from agent_flow.agent_runtime import AGENTS_FIELD, validate_agents
 
+from . import stats
 from .committer import COMMIT_POLICY_FIELD, validate_commit_policy_block
 from .embargo import PACKAGE_PREFIX, package_entry_problem, resolve_entry
 from .roles import ROLES, validate_role_defaults
@@ -146,12 +147,25 @@ WITNESS_BATCH_SIZE_KEY = "max_batch_size"
 # witness's prediction, `contrast_command` the equivalence witness's second
 # launcher. `timeout` is seconds PER LEG, where the one-engine boot budget does
 # not fit -- a disagg leg boots two engines in sequence.
+# The workload a token-comparing witness (residency, kv_quant, equivalence)
+# declares, as the acceptance gate does: `prompts` or `prompts_file`,
+# `max_tokens`, and `min_generated_tokens` (default 32) -- a witness whose
+# continuations are shorter fails as too short to compare instead of passing
+# on two-token answers. With none, the declared acceptance prompts, else the
+# boot prompts.
+WITNESS_WORKLOAD_KEYS: tuple[str, ...] = (
+    "prompts",
+    "prompts_file",
+    "max_tokens",
+    "min_generated_tokens",
+)
 WITNESS_KEYS: tuple[str, ...] = (
     "contrast_env",
     "expected_mib",
     "contrast_command",
     "timeout",
     WITNESS_BATCH_SIZE_KEY,
+    *WITNESS_WORKLOAD_KEYS,
 )
 
 # Features gated by the EQUIVALENCE witness (token identity across a hop).
@@ -187,6 +201,7 @@ EQUIVALENCE_WITNESS_KEYS: tuple[str, ...] = (
     "timeout",
     WITNESS_BATCH_SIZE_KEY,
     WITNESS_LEGS_ENV_KEY,
+    *WITNESS_WORKLOAD_KEYS,
 )
 
 # The bounded-replay witness parameters, per feature, each REQUIRED. Declared
@@ -243,6 +258,7 @@ KV_QUANT_WITNESS_KEYS: tuple[str, ...] = (
     "bytes_tolerance",
     "timeout",
     WITNESS_BATCH_SIZE_KEY,
+    *WITNESS_WORKLOAD_KEYS,
 )
 DEFAULT_BYTES_TOLERANCE = 0.02
 
@@ -252,10 +268,11 @@ DECLARED_WITNESS_FEATURES: tuple[str, ...] = (*REPLAY_WITNESS_REQUIRED, "kv_quan
 
 # The acceptance gate's WORKLOAD, declared in `accuracy.acceptance` beside the
 # per-unit floors: at the block's top level for every unit, or inside one
-# unit's entry for that unit alone. With none declared the gate measures the
-# boot prompts, which is only a measurement when their answers are long: a
-# 2-token answer ends in EOS before a drafter is asked anything, and the rate
-# reads 1.00 for every drafter, working or not.
+# unit's entry for that unit alone. With none declared, the gate takes the
+# first `num_prompts` (default 32) natural-text questions of the accuracy
+# benchmark's dataset -- a local path, or a Hugging Face id read from the local
+# cache only. Never the boot prompts: a 2-token answer ends in EOS before a
+# drafter is asked anything, and the rate reads 1.00 for every drafter.
 #
 #   prompts               a list of prompt strings, passed as-is (no chat
 #                         template is applied: write them the way the boot
@@ -263,18 +280,53 @@ DECLARED_WITNESS_FEATURES: tuple[str, ...] = (*REPLAY_WITNESS_REQUIRED, "kv_quan
 #   prompts_file          or a file holding them: a YAML/JSON list of strings,
 #                         or a mapping with `prompts:` (boot.yaml's shape).
 #                         Relative paths resolve against the spec's directory
+#   dataset               or a dataset: a local file or directory (JSON, JSON
+#                         lines, YAML, Parquet, Arrow) or a cached dataset id
+#   num_prompts           questions taken from the dataset (default 32)
+#   text_field            the dataset field holding the question (default: the
+#                         first of question/prompt/problem/input/text/...)
+#   prompt_template       how a question becomes a prompt, `{text}` naming it;
+#                         write the model's chat markers here if it needs them
+#   split, dataset_config which split and config of a dataset id
 #   max_tokens            tokens each prompt may generate (default 256)
 #   min_draft_iterations  generation iterations the whole workload must reach
 #                         before its rate is read (default 32); fewer fails as
 #                         "workload too short" rather than as a low number
+#   min_prompts           prompts the workload must hold (default 32); fewer
+#                         fails as "workload too small": four prompts read a
+#                         change in generated text as an acceptance regression
 ACCEPTANCE_WORKLOAD_KEYS: tuple[str, ...] = (
     "prompts",
     "prompts_file",
+    "dataset",
+    "num_prompts",
+    "text_field",
+    "prompt_template",
+    "split",
+    "dataset_config",
     "max_tokens",
     "min_draft_iterations",
+    "min_prompts",
 )
-# What one unit's entry in `accuracy.acceptance` may carry.
-ACCEPTANCE_UNIT_KEYS: tuple[str, ...] = ("min_absolute", *ACCEPTANCE_WORKLOAD_KEYS)
+# The paired comparison against the previous tree's verdict, at the block's top
+# level only: `test` (t or wilcoxon, default t), `alpha` (one-sided, default
+# 0.05), `min_effect` (accepted tokens per iteration, default 0.1). A drop must
+# be both significant and at least `min_effect` to fail.
+ACCEPTANCE_REGRESSION_KEYS: tuple[str, ...] = ("test", "alpha", "min_effect")
+ACCEPTANCE_BLOCK_KEYS: tuple[str, ...] = (*ACCEPTANCE_WORKLOAD_KEYS, "regression")
+# What one unit's entry in `accuracy.acceptance` may carry:
+#   min_absolute        the absolute floor used when the `=off` leg cannot run
+#   measured_reference  what a reference drafter measured on this workload; the
+#                       floor is this x 0.95 when `min_absolute` is not given
+#   floor_source        where that measurement was taken. A floor with neither
+#                       a measured reference nor a source is used, and every
+#                       verdict says it is not tied to a measurement
+ACCEPTANCE_UNIT_KEYS: tuple[str, ...] = (
+    "min_absolute",
+    "measured_reference",
+    "floor_source",
+    *ACCEPTANCE_WORKLOAD_KEYS,
+)
 
 TARGET_FIELD = "target"
 RUNTIME_FIELD = "runtime"
@@ -383,7 +435,146 @@ ACCURACY_KEYS: tuple[str, ...] = (
     "max_seq_len",
     "max_batch_size",
     "benchmark_args",
+    # How the accuracy floor is derived; see `FLOOR_KEYS`.
+    "floor",
+    # The scheduler-equivalence witness; see `SCHEDULER_EQUIVALENCE_KEYS`.
+    "scheduler_equivalence",
+    # The boot gate's workload, declared here; see `BOOT_KEYS`.
+    "boot",
+    # The launch-path smoke; see `LAUNCH_KEYS`.
+    "launch",
+    # The benchmark's sample count, scalar or per unit, for the standard
+    # error behind the statistical floor. Needed only for a benchmark whose
+    # count the gate does not know (`stats.KNOWN_BENCHMARK_SAMPLES`) and whose
+    # eval does not print one.
+    "samples",
 )
+
+# The boot gate's workload, `accuracy.boot`: run-wide keys, plus optional
+# per-unit entries (unit name -> the same keys) layered over them. With no
+# block the workspace `boot.yaml` is read as before.
+#
+#   prompts       strings, or mappings {prompt, keywords, keywords_any, images,
+#                 render}: a mapping's keywords are checked against THAT
+#                 prompt's generated text; `images` are files sent with it
+#                 (relative paths resolve against the spec's directory when the
+#                 file is there, else against the tree under test, where the
+#                 repository's test assets are); `render` is `loader` (the
+#                 tree's multimodal input loader applies the chat template) or
+#                 `raw` (the prompt is pre-rendered, placeholders included)
+#   prompts_file  a YAML/JSON list of plain prompts, or boot.yaml's shape
+#   keywords      each must appear in SOME generated text
+#   max_tokens    per prompt (default 32)
+#
+# Keywords are matched against the generated texts only, never the log. A unit
+# whose target implements `multimodal` and declares no image prompt sends the
+# repository's own `tests/integration/test_input_files/merlion.png`.
+BOOT_KEYS: tuple[str, ...] = ("prompts", "prompts_file", "keywords", "max_tokens")
+BOOT_PROMPT_KEYS: tuple[str, ...] = ("prompt", "keywords", "keywords_any", "images", "render")
+BOOT_RENDERS: tuple[str, ...] = ("loader", "raw")
+
+# The launch-path smoke, `accuracy.launch`: a small accuracy workload through
+# the unit's OWN deployment entry -- `trtllm-serve` by default, a declared
+# launcher for the disagg unit -- because the accuracy gate's in-process LLM
+# API never parses an HTTP request, renders a served chat template or loads
+# served media. Run-wide keys, plus per-unit entries layered over them.
+#
+#   enabled        default true
+#   units          units it runs in (default: every unit)
+#   members        all (default) or first
+#   num_samples    questions from the accuracy dataset (default 32)
+#   max_tokens     per request (default 512)
+#   endpoint       chat (default: /v1/chat/completions) or completions
+#   dataset / text_field / answer_field / prompt_template / split /
+#   dataset_config the workload, as for the acceptance gate
+#   scorer         gsm8k / contains / exact / none (default: the benchmark's)
+#   min_accuracy   the floor; default anchor - k * SE at the smoke's count
+#   command        a launcher for an entry trtllm-serve alone is not, REQUIRED
+#                  for the disagg unit: it starts the deployment, prints
+#                  STAIRCASE_ENDPOINT=<base url> once it serves, and stops
+#                  everything it started on SIGTERM
+#   timeout        seconds for the entry to become healthy
+LAUNCH_KEYS: tuple[str, ...] = (
+    "enabled",
+    "units",
+    "members",
+    "num_samples",
+    "max_tokens",
+    "endpoint",
+    "dataset",
+    "text_field",
+    "answer_field",
+    "prompt_template",
+    "split",
+    "dataset_config",
+    "scorer",
+    "min_accuracy",
+    "command",
+    "timeout",
+)
+LAUNCH_ENDPOINTS: tuple[str, ...] = ("chat", "completions")
+LAUNCH_SCORERS: tuple[str, ...] = ("gsm8k", "contains", "exact", "none")
+
+# The `accuracy.scheduler_equivalence` block: the witness that runs the same
+# prompts greedily at batch 1 with the overlap scheduler on and off (and with
+# speculation off) and requires token identity where the configuration is
+# output-preserving. Every key optional; see `step_check.py`.
+#
+#   enabled               default true
+#   units                 units it runs in (default: every unit)
+#   prompts / prompts_file / dataset / num_prompts / text_field /
+#   prompt_template       the workload, as for the acceptance gate; default the
+#                         first 8 questions of the accuracy dataset
+#   max_tokens            per prompt, default 128, at least 64
+#   ignore_eos            default true, so every prompt reaches max_tokens
+#   min_generated_tokens  default 64; a shorter continuation fails as too short
+#   legs                  contrast legs, a subset of [no_overlap, no_spec]
+#   spec_pair             how no_spec is judged: report (default), agreement
+#                         (first difference at or past `agreement_tokens`) or
+#                         exact
+#   agreement_tokens      default 16
+#   pin_autotuner         default true: one AutoTuner cache across the legs
+#   timeout               seconds per leg
+#   step_trace            {reference_command: ...}, the optional reference
+#                         adapter for the step-trace hook
+SCHEDULER_EQUIVALENCE_KEYS: tuple[str, ...] = (
+    "enabled",
+    "units",
+    "prompts",
+    "prompts_file",
+    "dataset",
+    "num_prompts",
+    "text_field",
+    "prompt_template",
+    "max_tokens",
+    "ignore_eos",
+    "min_generated_tokens",
+    "legs",
+    "spec_pair",
+    "agreement_tokens",
+    "pin_autotuner",
+    "timeout",
+    "step_trace",
+)
+SCHEDULER_EQUIVALENCE_LEGS: tuple[str, ...] = ("no_overlap", "no_spec")
+SCHEDULER_EQUIVALENCE_PAIRS: tuple[str, ...] = ("exact", "agreement", "report")
+
+# The `accuracy.floor` block.
+#
+#   rule               `statistical` (default): floor = anchor - k * SE, the SE
+#                      binomial at the anchor over the benchmark's sample count.
+#                      `tolerance`: floor = anchor - `accuracy.tolerance`, the
+#                      fixed width this workflow used before; an explicit choice
+#   k                  default 2.0. GSM8K's 1319 questions at 92 % give SE 0.74,
+#                      so the floor sits ~1.5 points under the anchor, where a
+#                      fixed 5.0 sat ~7 SE under it
+#   shift_min_members  default 2. When every member of a unit scores more than
+#                      1 SE under the anchor, that is a FINDING that blocks
+#                      delivery, even though each member passed its own floor --
+#                      but only for a unit gated over at least this many members
+#   acknowledge        unit -> reason. A finding on that unit is recorded with
+#                      the reason and no longer blocks delivery
+FLOOR_KEYS: tuple[str, ...] = ("rule", "k", "shift_min_members", "acknowledge")
 
 ENVIRONMENT_KEYS: tuple[str, ...] = (
     "kind",
@@ -418,10 +609,10 @@ ENVIRONMENT_KINDS: tuple[str, ...] = ("local", "slurm", "slurm_broker", "session
 ENVIRONMENT_REQUIRED_FIELDS: tuple[str, ...] = ("kind", "python")
 SLURM_REQUIRED_FIELDS: tuple[str, ...] = ("partition", "container_image")
 
-# Default accuracy tolerance, in benchmark points. Staircase measured
-# same-protocol session variance at 0.1-0.3 points against a 5.0-point
-# tolerance, so 5.0 is wide relative to the noise by design: the gate is
-# there to catch an assembly defect, not to resolve a fine difference.
+# Accuracy tolerance, in benchmark points, under `accuracy.floor.rule:
+# tolerance` only. The default rule is statistical (`FLOOR_KEYS`): 5.0 points
+# is about seven standard errors on GSM8K, wide enough that a defect moving
+# every member by half a point passed every gate of the run that had it.
 DEFAULT_ACCURACY_TOLERANCE = 5.0
 
 
@@ -999,6 +1190,10 @@ def _positive_int(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value >= 1
 
 
+def _number(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
 def _validate_contrast_env(entry: Mapping[str, Any], errors: list[str], where: str) -> None:
     contrast_env = entry.get("contrast_env")
     if not isinstance(contrast_env, dict) or not contrast_env:
@@ -1014,6 +1209,18 @@ def _validate_witness_timeout(entry: Mapping[str, Any], errors: list[str], where
     timeout = entry.get("timeout")
     if timeout is not None and not _positive_int(timeout):
         errors.append(f"'{where}.timeout' must be a whole number of seconds >= 1, got {timeout!r}")
+
+
+def _validate_witness_workload(entry: Mapping[str, Any], errors: list[str], where: str) -> None:
+    """Validate a token-comparing witness block's declared workload."""
+    _validate_acceptance_workload(
+        {k: v for k, v in entry.items() if k in ("prompts", "prompts_file", "max_tokens")},
+        errors,
+        where,
+    )
+    minimum = entry.get("min_generated_tokens")
+    if minimum is not None and not _positive_int(minimum):
+        errors.append(f"'{where}.min_generated_tokens' must be an integer >= 1")
 
 
 def _validate_witness_batch_size(entry: Mapping[str, Any], errors: list[str], where: str) -> None:
@@ -1083,6 +1290,7 @@ def _validate_equivalence_witness(entry: Mapping[str, Any], errors: list[str], w
                     )
     _validate_witness_timeout(entry, errors, where)
     _validate_witness_batch_size(entry, errors, where)
+    _validate_witness_workload(entry, errors, where)
 
 
 def _validate_replay_witness(
@@ -1167,6 +1375,7 @@ def _validate_kv_quant_witness(entry: dict[str, Any], errors: list[str], where: 
         errors.append(f"'{where}.bytes_tolerance' must be a fraction in [0, 1), got {tolerance!r}")
     _validate_witness_timeout(entry, errors, where)
     _validate_witness_batch_size(entry, errors, where)
+    _validate_witness_workload(entry, errors, where)
 
 
 def load_prompts_file(path: str | Path) -> tuple[str, ...]:
@@ -1222,12 +1431,47 @@ def _validate_acceptance_workload(entry: Mapping[str, Any], errors: list[str], w
                 load_prompts_file(prompts_file)
             except TaskSchemaError as exc:
                 errors.append(f"'{where}.prompts_file': {exc}")
-    for key in ("max_tokens", "min_draft_iterations"):
+    sources = [k for k in ("prompts", "prompts_file", "dataset") if entry.get(k) is not None]
+    if "dataset" in sources and len(sources) > 1:
+        errors.append(
+            f"'{where}' declares 'dataset' beside {sources[0]!r}; keep one, so the workload "
+            f"a verdict was measured on has a single source"
+        )
+    dataset = entry.get("dataset")
+    if dataset is not None and (not isinstance(dataset, str) or not dataset.strip()):
+        errors.append(
+            f"'{where}.dataset' must be a local path or a cached dataset id (no download)"
+        )
+    for key in ("text_field", "prompt_template", "split", "dataset_config"):
+        value = entry.get(key)
+        if value is not None and (not isinstance(value, str) or not value.strip()):
+            errors.append(f"'{where}.{key}' must be a non-empty string")
+    template = entry.get("prompt_template")
+    if isinstance(template, str) and "{text}" not in template:
+        errors.append(f"'{where}.prompt_template' must name the question as {{text}}")
+    for key in ("max_tokens", "min_draft_iterations", "num_prompts", "min_prompts"):
         value = entry.get(key)
         if value is not None and (
             not isinstance(value, int) or isinstance(value, bool) or value < 1
         ):
             errors.append(f"'{where}.{key}' must be an integer >= 1")
+
+
+def _validate_acceptance_regression(block: Any, errors: list[str], where: str) -> None:
+    """Validate ``accuracy.acceptance.regression``."""
+    if not isinstance(block, dict):
+        errors.append(f"'{where}' must be a mapping with keys {list(ACCEPTANCE_REGRESSION_KEYS)}")
+        return
+    reject_unknown_keys(block, ACCEPTANCE_REGRESSION_KEYS, errors, where=where)
+    test = block.get("test")
+    if test is not None and test not in stats.PAIRED_TESTS:
+        errors.append(f"'{where}.test' must be one of {stats.PAIRED_TESTS}, got {test!r}")
+    alpha = block.get("alpha")
+    if alpha is not None and (not _number(alpha) or not 0 < alpha < 1):
+        errors.append(f"'{where}.alpha' must be a probability in (0, 1), got {alpha!r}")
+    effect = block.get("min_effect")
+    if effect is not None and (not _number(effect) or effect < 0):
+        errors.append(f"'{where}.min_effect' must be a number >= 0, got {effect!r}")
 
 
 def _validate_acceptance(block: Any, errors: list[str]) -> None:
@@ -1245,8 +1489,10 @@ def _validate_acceptance(block: Any, errors: list[str]) -> None:
         )
         return
     _validate_acceptance_workload(block, errors, where)
+    if block.get("regression") is not None:
+        _validate_acceptance_regression(block["regression"], errors, f"{where}.regression")
     for unit, entry in block.items():
-        if unit in ACCEPTANCE_WORKLOAD_KEYS:
+        if unit in ACCEPTANCE_BLOCK_KEYS:
             continue
         unit_where = f"{where}.{unit}"
         if isinstance(entry, dict):
@@ -1254,6 +1500,14 @@ def _validate_acceptance(block: Any, errors: list[str]) -> None:
             _validate_acceptance_workload(entry, errors, unit_where)
             floor = entry.get("min_absolute")
             floor_where = f"{unit_where}.min_absolute"
+            measured = entry.get("measured_reference")
+            if measured is not None and (not _number(measured) or measured < 1.0):
+                errors.append(
+                    f"'{unit_where}.measured_reference' must be a number >= 1.0; got {measured!r}"
+                )
+            source = entry.get("floor_source")
+            if source is not None and (not isinstance(source, str) or not source.strip()):
+                errors.append(f"'{unit_where}.floor_source' must be a non-empty string")
         else:
             floor = entry
             floor_where = unit_where
@@ -1264,6 +1518,243 @@ def _validate_acceptance(block: Any, errors: list[str]) -> None:
         # everything.
         if not isinstance(floor, (int, float)) or isinstance(floor, bool) or floor < 1.0:
             errors.append(f"'{floor_where}' must be a number >= 1.0; got {floor!r}")
+
+
+def _validate_boot_level(level: Mapping[str, Any], errors: list[str], where: str) -> None:
+    """Validate one level of ``accuracy.boot``."""
+    prompts = level.get("prompts")
+    if prompts is not None:
+        if not isinstance(prompts, list) or not prompts:
+            errors.append(f"'{where}.prompts' must be a non-empty list")
+        else:
+            for n, entry in enumerate(prompts):
+                at = f"{where}.prompts[{n}]"
+                if isinstance(entry, str):
+                    if not entry.strip():
+                        errors.append(f"'{at}' must be a non-empty string")
+                    continue
+                if not isinstance(entry, dict):
+                    errors.append(f"'{at}' must be a string or a mapping")
+                    continue
+                reject_unknown_keys(entry, BOOT_PROMPT_KEYS, errors, where=at)
+                if not isinstance(entry.get("prompt"), str) or not entry["prompt"].strip():
+                    errors.append(f"'{at}.prompt' is required and must be a non-empty string")
+                for key in ("keywords", "keywords_any", "images"):
+                    value = entry.get(key)
+                    if value is not None and (
+                        not isinstance(value, list)
+                        or not all(isinstance(v, str) and v.strip() for v in value)
+                    ):
+                        errors.append(f"'{at}.{key}' must be a list of non-empty strings")
+                if entry.get("render") is not None and entry["render"] not in BOOT_RENDERS:
+                    errors.append(f"'{at}.render' must be one of {BOOT_RENDERS}")
+    prompts_file = level.get("prompts_file")
+    if prompts_file is not None:
+        if not isinstance(prompts_file, str) or not Path(prompts_file).is_file():
+            errors.append(f"'{where}.prompts_file' does not exist: {prompts_file}")
+    keywords = level.get("keywords")
+    if keywords is not None and (
+        not isinstance(keywords, list) or not all(isinstance(k, str) for k in keywords)
+    ):
+        errors.append(f"'{where}.keywords' must be a list of strings")
+    tokens = level.get("max_tokens")
+    if tokens is not None and not _positive_int(tokens):
+        errors.append(f"'{where}.max_tokens' must be an integer >= 1")
+
+
+def _validate_boot(block: Any, errors: list[str]) -> None:
+    """Validate ``accuracy.boot``: the run-wide keys, then each unit's entry."""
+    where = f"{ACCURACY_FIELD}.boot"
+    if not isinstance(block, dict):
+        errors.append(f"'{where}' must be a mapping")
+        return
+    _validate_boot_level(block, errors, where)
+    for unit, entry in block.items():
+        if unit in BOOT_KEYS:
+            continue
+        if not isinstance(entry, dict):
+            errors.append(
+                f"'{where}.{unit}' is neither a boot key ({list(BOOT_KEYS)}) nor a unit's "
+                f"mapping of them"
+            )
+            continue
+        reject_unknown_keys(entry, BOOT_KEYS, errors, where=f"{where}.{unit}")
+        _validate_boot_level(entry, errors, f"{where}.{unit}")
+
+
+def _validate_launch_level(level: Mapping[str, Any], errors: list[str], where: str) -> None:
+    """Validate one level of ``accuracy.launch``."""
+    for key in ("enabled",):
+        if level.get(key) is not None and not isinstance(level[key], bool):
+            errors.append(f"'{where}.{key}' must be true or false")
+    for key in ("num_samples", "max_tokens", "timeout"):
+        if level.get(key) is not None and not _positive_int(level[key]):
+            errors.append(f"'{where}.{key}' must be an integer >= 1")
+    if level.get("members") is not None and level["members"] not in ("all", "first"):
+        errors.append(f"'{where}.members' must be 'all' or 'first'")
+    if level.get("endpoint") is not None and level["endpoint"] not in LAUNCH_ENDPOINTS:
+        errors.append(f"'{where}.endpoint' must be one of {LAUNCH_ENDPOINTS}")
+    if level.get("scorer") is not None and level["scorer"] not in LAUNCH_SCORERS:
+        errors.append(f"'{where}.scorer' must be one of {LAUNCH_SCORERS}")
+    floor = level.get("min_accuracy")
+    if floor is not None and (not _number(floor) or not 0 <= floor <= 100):
+        errors.append(f"'{where}.min_accuracy' must be a percentage in [0, 100]")
+    for key in (
+        "dataset",
+        "text_field",
+        "answer_field",
+        "prompt_template",
+        "split",
+        "dataset_config",
+        "command",
+    ):
+        value = level.get(key)
+        if value is not None and (not isinstance(value, str) or not value.strip()):
+            errors.append(f"'{where}.{key}' must be a non-empty string")
+    units = level.get("units")
+    if units is not None and (
+        not isinstance(units, list) or not all(isinstance(u, str) for u in units)
+    ):
+        errors.append(f"'{where}.units' must be a list of unit names")
+
+
+def _validate_launch(block: Any, errors: list[str]) -> None:
+    """Validate ``accuracy.launch``: the run-wide keys, then each unit's entry."""
+    where = f"{ACCURACY_FIELD}.launch"
+    if not isinstance(block, dict):
+        errors.append(f"'{where}' must be a mapping")
+        return
+    _validate_launch_level(block, errors, where)
+    for unit, entry in block.items():
+        if unit in LAUNCH_KEYS:
+            continue
+        if not isinstance(entry, dict):
+            errors.append(
+                f"'{where}.{unit}' is neither a launch key ({list(LAUNCH_KEYS)}) nor a unit's "
+                f"mapping of them"
+            )
+            continue
+        reject_unknown_keys(entry, LAUNCH_KEYS, errors, where=f"{where}.{unit}")
+        _validate_launch_level(entry, errors, f"{where}.{unit}")
+
+
+def _validate_scheduler_equivalence(block: Any, errors: list[str]) -> None:
+    """Validate ``accuracy.scheduler_equivalence``."""
+    where = f"{ACCURACY_FIELD}.scheduler_equivalence"
+    if not isinstance(block, dict):
+        errors.append(f"'{where}' must be a mapping with keys {list(SCHEDULER_EQUIVALENCE_KEYS)}")
+        return
+    reject_unknown_keys(block, SCHEDULER_EQUIVALENCE_KEYS, errors, where=where)
+    _validate_acceptance_workload(
+        {k: v for k, v in block.items() if k in ACCEPTANCE_WORKLOAD_KEYS and k != "max_tokens"},
+        errors,
+        where,
+    )
+    for key in ("enabled", "ignore_eos", "pin_autotuner"):
+        if block.get(key) is not None and not isinstance(block[key], bool):
+            errors.append(f"'{where}.{key}' must be true or false")
+    units = block.get("units")
+    if units is not None and (
+        not isinstance(units, list) or not all(isinstance(u, str) and u for u in units)
+    ):
+        errors.append(f"'{where}.units' must be a list of unit names")
+    for key in ("min_generated_tokens", "agreement_tokens", "timeout"):
+        if block.get(key) is not None and not _positive_int(block[key]):
+            errors.append(f"'{where}.{key}' must be an integer >= 1")
+    tokens = block.get("max_tokens")
+    if tokens is not None and (not _positive_int(tokens) or tokens < 64):
+        errors.append(
+            f"'{where}.max_tokens' must be an integer >= 64: a defect in generation steps "
+            f"needs steps to show in"
+        )
+    legs = block.get("legs")
+    if legs is not None and (
+        not isinstance(legs, list) or not set(legs) <= set(SCHEDULER_EQUIVALENCE_LEGS)
+    ):
+        errors.append(
+            f"'{where}.legs' must be a list drawn from {list(SCHEDULER_EQUIVALENCE_LEGS)}"
+        )
+    pair = block.get("spec_pair")
+    if pair is not None and pair not in SCHEDULER_EQUIVALENCE_PAIRS:
+        errors.append(f"'{where}.spec_pair' must be one of {SCHEDULER_EQUIVALENCE_PAIRS}")
+    trace = block.get("step_trace")
+    if trace is not None:
+        if not isinstance(trace, dict):
+            errors.append(f"'{where}.step_trace' must be a mapping")
+        else:
+            reject_unknown_keys(trace, ("reference_command",), errors, where=f"{where}.step_trace")
+            command = trace.get("reference_command")
+            if command is not None and (not isinstance(command, str) or not command.strip()):
+                errors.append(f"'{where}.step_trace.reference_command' must be a non-empty string")
+
+
+def _validate_floor(block: Mapping[str, Any], errors: list[str]) -> None:
+    """Validate ``accuracy.floor`` and that its rule can be computed for every unit.
+
+    The statistical rule needs a sample count per benchmark. Asked here
+    rather than at the gate: a floor that cannot be computed is found at the
+    end of a unit's first accuracy run otherwise, which is the most expensive
+    place to learn that a number was never declared.
+    """
+    where = f"{ACCURACY_FIELD}.floor"
+    floor = block.get("floor")
+    if floor is not None:
+        if not isinstance(floor, dict):
+            errors.append(f"'{where}' must be a mapping with keys {list(FLOOR_KEYS)}")
+            floor = {}
+        reject_unknown_keys(floor, FLOOR_KEYS, errors, where=where)
+        rule = floor.get("rule")
+        if rule is not None and rule not in stats.FLOOR_RULES:
+            errors.append(f"'{where}.rule' must be one of {stats.FLOOR_RULES}, got {rule!r}")
+        k = floor.get("k")
+        if k is not None and (not _number(k) or k <= 0):
+            errors.append(f"'{where}.k' must be a number > 0, got {k!r}")
+        members = floor.get("shift_min_members")
+        if members is not None and not _positive_int(members):
+            errors.append(f"'{where}.shift_min_members' must be an integer >= 1, got {members!r}")
+        acknowledge = floor.get("acknowledge")
+        if acknowledge is not None and (
+            not isinstance(acknowledge, dict)
+            or not all(isinstance(v, str) and v.strip() for v in acknowledge.values())
+        ):
+            errors.append(
+                f"'{where}.acknowledge' must map a unit to the reason its systematic shift "
+                f"is accepted, as a non-empty string"
+            )
+    else:
+        floor = {}
+
+    samples = block.get("samples")
+    if samples is not None:
+        values = samples.values() if isinstance(samples, dict) else [samples]
+        if not all(_positive_int(v) for v in values):
+            errors.append(
+                f"'{ACCURACY_FIELD}.samples' must be an integer >= 1, or a mapping from unit "
+                f"to one; got {samples!r}"
+            )
+            return
+
+    if (floor.get("rule") or stats.FLOOR_STATISTICAL) != stats.FLOOR_STATISTICAL:
+        return
+    # Imported here: `gates` imports this module.
+    from .gates import resolve_samples
+
+    benchmarks = block.get("benchmark")
+    pairs = (
+        list(benchmarks.items())
+        if isinstance(benchmarks, dict)
+        else [(None, benchmarks or "gsm8k")]
+    )
+    for unit, benchmark in pairs:
+        if not isinstance(benchmark, str):
+            continue
+        count, source = resolve_samples(block, None if unit == "default" else unit, benchmark)
+        if count is None:
+            errors.append(
+                f"'{ACCURACY_FIELD}' uses the statistical floor, and there is {source} "
+                f"(unit {unit or 'every unit'}); the floor is anchor - k * SE and the SE "
+                f"needs it"
+            )
 
 
 def _validate_accuracy(block: Any, errors: list[str]) -> None:
@@ -1352,6 +1843,17 @@ def _validate_accuracy(block: Any, errors: list[str]) -> None:
     if block.get("acceptance") is not None:
         _validate_acceptance(block["acceptance"], errors)
 
+    _validate_floor(block, errors)
+
+    if block.get("scheduler_equivalence") is not None:
+        _validate_scheduler_equivalence(block["scheduler_equivalence"], errors)
+
+    if block.get("boot") is not None:
+        _validate_boot(block["boot"], errors)
+
+    if block.get("launch") is not None:
+        _validate_launch(block["launch"], errors)
+
     witness = block.get("witness")
     if witness is not None:
         if not isinstance(witness, dict):
@@ -1377,17 +1879,23 @@ def _validate_accuracy(block: Any, errors: list[str]) -> None:
                 reject_unknown_keys(entry, WITNESS_KEYS, errors, where=where)
                 _validate_witness_timeout(entry, errors, where)
                 _validate_witness_batch_size(entry, errors, where)
+                _validate_witness_workload(entry, errors, where)
                 command = entry.get("contrast_command")
                 if command is not None and (not isinstance(command, str) or not command.strip()):
                     errors.append(f"'{where}.contrast_command' must be a non-empty string")
                 _validate_contrast_env(entry, errors, where)
+                # A scalar, or per member with a `default`: the witness runs
+                # at every member, and the delta can differ between them.
                 predicted = entry.get("expected_mib")
+                values = predicted.values() if isinstance(predicted, dict) else [predicted]
                 if predicted is not None and (
-                    not isinstance(predicted, (int, float))
-                    or isinstance(predicted, bool)
-                    or predicted <= 0
+                    not all(_number(v) and v > 0 for v in values)
+                    or (isinstance(predicted, dict) and not predicted)
                 ):
-                    errors.append(f"'{where}.expected_mib' must be a positive number")
+                    errors.append(
+                        f"'{where}.expected_mib' must be a positive number, or a mapping from "
+                        f"member (and `default`) to one"
+                    )
 
     # A mapping of scalars (the whole run) or of unit -> mapping of scalars.
     # Validated rather than trusted because a discriminator the reference file
@@ -1445,6 +1953,32 @@ def _validate_accuracy(block: Any, errors: list[str]) -> None:
         errors.append(
             f"'{ACCURACY_FIELD}.benchmark_args' must be a list of strings, or a "
             f"mapping from assembly unit to one"
+        )
+
+
+def _require_launch_command(data: Mapping[str, Any], errors: list[str]) -> None:
+    """The disagg unit's deployment entry is a launcher the spec must declare.
+
+    Asked here because the launch-path smoke runs at the END of the unit: an
+    undeclared launcher found there costs the unit's whole gate sequence.
+    """
+    features = data.get(FEATURES_FIELD)
+    accuracy = data.get(ACCURACY_FIELD)
+    if not isinstance(features, list) or "disagg" not in features or not isinstance(accuracy, dict):
+        return
+    launch = accuracy.get("launch")
+    launch = launch if isinstance(launch, dict) else {}
+    own = launch.get("disagg") if isinstance(launch.get("disagg"), dict) else {}
+    enabled = own.get("enabled", launch.get("enabled", True))
+    units = own.get("units", launch.get("units"))
+    if not enabled or (units and "disagg" not in units):
+        return
+    if not (own.get("command") or launch.get("command")):
+        errors.append(
+            "feature 'disagg' needs 'accuracy.launch.disagg.command': the unit's launch-path "
+            "smoke goes through the disaggregated proxy, which trtllm-serve alone does not "
+            "start. Give a launcher that prints STAIRCASE_ENDPOINT=<base url> once it serves "
+            "(or set 'accuracy.launch.disagg.enabled: false' and say why in the plan)"
         )
 
 
@@ -1538,13 +2072,48 @@ def _resolve_spec_relative_paths(data: dict[str, Any], spec_dir: Path) -> None:
         for block in witness.values():
             if isinstance(block, dict) and block.get("boot_spec") is not None:
                 block["boot_spec"] = absolute(block["boot_spec"])
+            if isinstance(block, dict) and block.get("prompts_file") is not None:
+                block["prompts_file"] = absolute(block["prompts_file"])
 
     # The acceptance workload's prompt file, at the block level and per unit.
+    # A `dataset` may be a cached dataset id ("openai/gsm8k"), which reads like
+    # a relative path, so it is resolved only when the spec's directory holds it.
     acceptance = accuracy.get("acceptance")
     if isinstance(acceptance, dict):
         for level in (acceptance, *(v for v in acceptance.values() if isinstance(v, dict))):
             if level.get("prompts_file") is not None:
                 level["prompts_file"] = absolute(level["prompts_file"])
+            dataset = level.get("dataset")
+            if isinstance(dataset, str) and dataset.strip() and not Path(dataset).is_absolute():
+                if (spec_dir / dataset).exists():
+                    level["dataset"] = absolute(dataset)
+
+    # Boot prompt files, and boot images that sit beside the spec. An image
+    # that does not is left relative: the gate resolves it against the tree
+    # under test, where the repository's own test assets are.
+    boot = accuracy.get("boot")
+    if isinstance(boot, dict):
+        for level in (boot, *(v for v in boot.values() if isinstance(v, dict))):
+            if level.get("prompts_file") is not None:
+                level["prompts_file"] = absolute(level["prompts_file"])
+            for entry in level.get("prompts") or ():
+                if isinstance(entry, dict) and isinstance(entry.get("images"), list):
+                    entry["images"] = [
+                        absolute(i)
+                        if isinstance(i, str)
+                        and not Path(i).is_absolute()
+                        and (spec_dir / i).exists()
+                        else i
+                        for i in entry["images"]
+                    ]
+
+    equivalence = accuracy.get("scheduler_equivalence")
+    if isinstance(equivalence, dict):
+        if equivalence.get("prompts_file") is not None:
+            equivalence["prompts_file"] = absolute(equivalence["prompts_file"])
+        dataset = equivalence.get("dataset")
+        if isinstance(dataset, str) and dataset.strip() and (spec_dir / dataset).exists():
+            equivalence["dataset"] = absolute(dataset)
 
 
 def load_and_validate_task_yaml(path: str | Path) -> dict[str, Any]:
@@ -1709,6 +2278,7 @@ def load_and_validate_task_yaml(path: str | Path) -> dict[str, Any]:
         except TaskSchemaError as exc:
             errors.append(str(exc))
         _require_declared_witnesses(data, errors)
+        _require_launch_command(data, errors)
 
     _validate_certification(data, errors)
 

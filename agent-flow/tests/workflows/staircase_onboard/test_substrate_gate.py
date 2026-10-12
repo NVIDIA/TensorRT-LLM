@@ -20,6 +20,8 @@ from agent_flow.workflows.staircase_onboard.preflight import (
     substrate_gate,
 )
 
+from .test_workflow import driver_records
+
 _TASK = {
     "checkpoint_path": "/ckpt",
     "trtllm_repo_path": "/repo",
@@ -61,6 +63,10 @@ def _scripted(*results, sink=None):
     return run
 
 
+#: What the boot gate's engine driver prints for a host that generates: one
+#: structured record per prompt.
+_GENERATED = driver_records()
+
 #: What a stock path that has never heard of this architecture actually
 #: prints. Quoted from the raise sites named in
 #: `preflight.UNSUPPORTED_ARCHITECTURE_MARKERS`.
@@ -75,7 +81,7 @@ def test_a_host_that_generates_passes():
     substrate_gate(
         _TASK,
         _environment(),
-        shell_runner=_runner(ShellResult(returncode=0, stdout="Generated text: Paris")),
+        shell_runner=_runner(ShellResult(returncode=0, stdout=_GENERATED)),
         notes=notes,
     )
     assert any("substrate gate" in n for n in notes)
@@ -104,7 +110,7 @@ def test_it_runs_the_stock_path_not_the_target():
     substrate_gate(
         _TASK,
         _environment(),
-        shell_runner=_runner(ShellResult(returncode=0, stdout="ok"), sink),
+        shell_runner=_runner(ShellResult(returncode=0, stdout=_GENERATED), sink),
     )
     command = sink[0][0]
     assert "TRTLLM_MODELING_V2=off" in command
@@ -117,7 +123,7 @@ def test_it_carries_the_runs_own_runtime_block():
     substrate_gate(
         _TASK,
         _environment(),
-        shell_runner=_runner(ShellResult(returncode=0, stdout="ok"), sink),
+        shell_runner=_runner(ShellResult(returncode=0, stdout=_GENERATED), sink),
     )
     command = sink[0][0]
     assert "--use_cuda_graph" in command
@@ -131,7 +137,7 @@ def test_it_does_not_carry_any_feature_flags():
     substrate_gate(
         _TASK,
         _environment(),
-        shell_runner=_runner(ShellResult(returncode=0, stdout="ok"), sink),
+        shell_runner=_runner(ShellResult(returncode=0, stdout=_GENERATED), sink),
     )
     assert "--spec_decode_algo" not in sink[0][0]
 
@@ -193,15 +199,15 @@ def test_the_proxy_is_run_under_the_same_environment_and_runtime_block():
         _environment(),
         shell_runner=_scripted(
             ShellResult(returncode=1, stdout=_UNKNOWN_ARCH),
-            ShellResult(returncode=0, stdout="Generated text: Paris"),
+            ShellResult(returncode=0, stdout=_GENERATED),
             sink=sink,
         ),
         notes=notes,
     )
     assert len(sink) == 2
     first, second = sink[0][0], sink[1][0]
-    assert '--model_dir="/ckpt"' in first
-    assert '--model_dir="/proxy-ckpt"' in second
+    assert "--model_dir=/ckpt " in first
+    assert "--model_dir=/proxy-ckpt " in second
     # Same environment, same runtime block, same stock path — one variable.
     for command in (first, second):
         assert "TRTLLM_MODELING_V2=off" in command
@@ -222,7 +228,7 @@ def test_the_weaker_claim_is_recorded_verbatim():
         _environment(),
         shell_runner=_scripted(
             ShellResult(returncode=1, stdout=_UNKNOWN_ARCH),
-            ShellResult(returncode=0, stdout="Generated text: Paris"),
+            ShellResult(returncode=0, stdout=_GENERATED),
         ),
         notes=notes,
     )
@@ -244,7 +250,7 @@ def test_a_real_host_failure_is_never_answered_by_measuring_another_model():
     sink: list[tuple[str, int]] = []
     runner = _scripted(
         ShellResult(returncode=1, stdout="Impossible to fit in any sequence in kvCache"),
-        ShellResult(returncode=0, stdout="Generated text: Paris"),
+        ShellResult(returncode=0, stdout=_GENERATED),
         sink=sink,
     )
     with pytest.raises(PreflightError, match="cannot generate a token"):
@@ -272,7 +278,7 @@ def test_a_checkpoint_the_stock_path_knows_never_reaches_the_proxy():
     substrate_gate(
         _with_proxy(),
         _environment(),
-        shell_runner=_scripted(ShellResult(returncode=0, stdout="Paris"), sink=sink),
+        shell_runner=_scripted(ShellResult(returncode=0, stdout=_GENERATED), sink=sink),
         notes=notes,
     )
     assert len(sink) == 1

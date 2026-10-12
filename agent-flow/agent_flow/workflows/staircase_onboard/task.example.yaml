@@ -396,7 +396,8 @@ environment:
   # spool: /path/to/scratch/spool
 
 # ---------------------------------------------------------------- accuracy
-# The release criterion. One-sided: measured >= reference - tolerance.
+# The release criterion. One-sided: measured >= reference - k x SE, the SE
+# binomial over the benchmark's sample count (see `floor` below).
 #
 # The anchor comes from a written source — TensorRT-LLM's own accuracy
 # references — and is NEVER invented. If this checkpoint has no entry yet,
@@ -416,10 +417,32 @@ accuracy:
   benchmark: gsm8k
   reference_yaml: tests/integration/defs/accuracy/references/gsm8k.yaml
 
-  # In benchmark points. Same-protocol session variance measured at 0.1-0.3
-  # points, so the default 5.0 is wide relative to the noise by design: the
-  # gate catches an assembly defect, it does not resolve a fine difference.
+  # How the floor is derived. `statistical` (default): reference - k x SE,
+  # where SE = sqrt(p(1-p)/n) at the reference over the benchmark's sample
+  # count -- 0.73 points for GSM8K's 1319 questions at 92 %, so k = 2 puts the
+  # floor 1.5 points down. A fixed `tolerance` of 5.0 sat ~7 SE down, wide
+  # enough that a defect in every member passed every gate of the run that
+  # had it. `rule: tolerance` keeps the fixed width as an explicit choice.
+  #
+  # When EVERY member of a unit (at least `shift_min_members`, default 2)
+  # scores more than 1 SE under the reference, the unit still passes but the
+  # run records a FINDING, and delivery refuses it until it is explained:
+  # name the unit under `acknowledge` with the reason, and relaunch.
+  # floor:
+  #   rule: statistical
+  #   k: 2.0
+  #   shift_min_members: 2
+  #   acknowledge:
+  #     dspark: "every member -0.9..-1.1: drafter changes rounding, see 06-gates/..."
+
+  # In benchmark points; read only under `floor.rule: tolerance`.
   tolerance: 5.0
+
+  # The benchmark's sample count, for the SE. Needed only when the gate cannot
+  # know it: it reads the count the eval prints, then `--num_samples` in
+  # `benchmark_args`, then this, then the split sizes it ships for gsm8k,
+  # mmlu, mmmu and gpqa. A scalar, or a mapping from unit to a count.
+  # samples: {default: 1319, multimodal: 900}
 
   # Which row of reference_yaml this checkpoint is anchored to. Defaults to
   # a value derived from the checkpoint directory name, which is right for a
@@ -485,6 +508,13 @@ accuracy:
   #
   # Any witness block may set `timeout` (seconds per leg; default 1800).
   #
+  # A witness that compares TOKENS declares its workload the way the acceptance
+  # gate does: `prompts` or `prompts_file`, `max_tokens`, and
+  # `min_generated_tokens` (default 32). With none it uses the declared
+  # acceptance prompts, else the boot prompts -- and a witness whose
+  # continuations come back shorter than the minimum fails as too short to
+  # compare: identity over a 2-token answer says nothing end to end.
+  #
   # A witness that compares TOKENS (`host_offload`, `kv_quant`, `disagg`) may
   # set `max_batch_size`: both legs run at it, in place of the runtime block's
   # `--max_batch_size`, and a `contrast_command` gets it as
@@ -526,48 +556,120 @@ accuracy:
   #     prefix_tokens: 4096
   #     reuse_alignment: 2     # e.g. a KV compression ratio the boundary may not split
 
-  # The ABSOLUTE `acceptance_length` floor a speculator unit falls back to
-  # when the `=off` leg cannot exist. The acceptance gate normally compares
-  # the target against the same checkpoint under BUILT-IN modeling — and a
-  # genuinely new architecture has none, so `=off` cannot load it at all.
-  # That is the same shape as the substrate gate's problem: the check is
-  # unavailable exactly when onboarding is doing its job.
+  # The ACCEPTANCE gate runs in every unit whose target keeps speculation on
+  # (the unit that adds it and every unit after it). It measures accepted
+  # tokens per iteration PER PROMPT and judges them three ways:
+  #   - against the same checkpoint under BUILT-IN modeling (`=off`), same
+  #     session: fails when the ratio is under 0.95 AND a paired test over the
+  #     prompts finds the drop significant;
+  #   - against the previous tree's verdict for the same member and workload
+  #     (kept in <workspace>/gate_results.jsonl): a paired t-test (or Wilcoxon)
+  #     with a minimum effect -- a drop must be significant AND >= `min_effect`;
+  #   - against 1.0: every draft rejected.
   #
-  # Skipping the gate is not an option. It is the ONLY gate that can see a
-  # miscomputed draft path, because rejection sampling makes a wrong draft
-  # produce correct text more slowly — boot passes, accuracy passes, and only
-  # speed moves. So declare a floor instead, and the run records the weaker
-  # claim verbatim: the draft path accepts at a real rate, NOT that it
-  # matches stock.
+  # A genuinely new architecture has no built-in modeling, so `=off` cannot
+  # load it. Declare a floor for that case, and tie it to a MEASUREMENT: a
+  # reference drafter's acceptance on this workload (`measured_reference`; the
+  # floor is 0.95 x it) or a `min_absolute` with the `floor_source` it was
+  # derived from. A floor with neither still applies, and every verdict warns
+  # that it is not tied to a measured reference: one picked from the ceiling
+  # passed every wrong drafter of the run that had it. The run records the
+  # weaker claim verbatim either way: the draft path accepts at a real rate,
+  # NOT that it matches stock.
   #
-  # Pick it from the ceiling, not from what the target happens to score. At
-  # `num_nextn_predict_layers: N` the ceiling is `N + 1`, for DSpark at
-  # `block_size: B` it is `B + 1`, and 1.0 means every draft was rejected —
-  # which the gate already fails on separately.
-  #
-  # The same block declares the gate's WORKLOAD. Without one it measures the
-  # boot prompts, and those are only a workload when their answers are long:
-  # a 2-token answer ends in EOS before any draft is verified, so the rate
-  # reads 1.00 for every drafter, working or broken, and no floor above 1 can
-  # pass. Declare prompts whose greedy answers run to `max_tokens`: a
-  # derivation, a code listing, a story. They are passed as-is, with no chat
-  # template applied, so write them the way the boot prompts are written.
-  # A workload that reaches fewer than `min_draft_iterations` generation
-  # iterations in total fails as "workload too short to measure acceptance"
-  # rather than as a low number. All four keys also work inside one unit's
-  # entry, for that unit only.
+  # The WORKLOAD defaults to the first 32 questions of the accuracy dataset
+  # (natural text, long answers) -- `dataset_path` when the run keeps it
+  # locally, else the benchmark's dataset id read from the local cache. Nothing
+  # is downloaded. Fewer than `min_prompts` (32) prompts fails as "workload too
+  # small": four prompts read a change in generated text as a regression.
+  # Fewer than `min_draft_iterations` generation iterations fails as "workload
+  # too short". Prompts are passed as-is; `prompt_template` (with `{text}`)
+  # adds the model's chat markers to dataset questions. Every workload key
+  # also works inside one unit's entry, for that unit only.
   #
   # acceptance:
-  #   prompts:
-  #     - "Explain, step by step, how a heat pump moves heat indoors."
-  #   # prompts_file: prompts.json  # instead of `prompts`: a YAML/JSON list,
-  #   #                             # or a boot.yaml-shaped file (`prompts:`)
+  #   # dataset: /data/gsm8k         # or a cached id; default: the benchmark's
+  #   num_prompts: 32
+  #   prompt_template: "{text} Solve it step by step, then give the answer."
+  #   # prompts: [...]              # or declare the prompts outright
+  #   # prompts_file: prompts.json  # a YAML/JSON list, or boot.yaml's shape
   #   max_tokens: 256
   #   min_draft_iterations: 32
+  #   min_prompts: 32
+  #   regression: {test: t, alpha: 0.05, min_effect: 0.1}
   #   mtp:
   #     min_absolute: 1.5
+  #     floor_source: "03-plan/acceptance-spike.md: reference 2.31, wrong controls <= 1.4"
   #   dspark:
-  #     min_absolute: 1.2
+  #     measured_reference: 3.32    # floor 3.15
+
+  # The BOOT gate's workload, declared here (else the workspace boot.yaml). It
+  # runs through the engine driver, which prints one structured record per
+  # prompt, and every keyword is matched against the GENERATED TEXT only --
+  # never the log, where `72` once matched `CPUs 72-143`. A prompt may be a
+  # mapping with checks of its own and the images it sends; a unit whose target
+  # implements `multimodal` and declares no image prompt sends the repository's
+  # tests/integration/test_input_files/merlion.png (a git-lfs file: pulled
+  # in the tree under test). Per-unit entries layer over the run-wide keys.
+  #
+  # boot:
+  #   prompts:
+  #     - "The capital of France is"
+  #     - prompt: "Natalia sold 48 clips in April and half as many in May. How many in all?"
+  #       keywords: ["72"]
+  #   max_tokens: 32
+  #   multimodal:
+  #     prompts:
+  #       - prompt: "<|User|><image>What vegetable is this? One word.<|Assistant|>"
+  #         images: [examples/images/carrots.jpeg]   # beside this file, or in the tree
+  #         render: raw                              # pre-rendered; or `loader`
+  #         keywords_any: [carrot]
+
+  # The LAUNCH-PATH smoke, last in every unit at every member: the unit's own
+  # deployment entry answers `num_samples` (32) accuracy-dataset questions over
+  # HTTP, plus the boot image prompt when the target is multimodal. The
+  # accuracy gate drives the LLM API in process and never parses a served
+  # request, renders a served chat template or loads served media -- every
+  # image request to trtllm-serve returned HTTP 400 for a whole run while that
+  # unit's accuracy gate passed. Any non-200 fails; so does accuracy under
+  # `min_accuracy` (default: anchor - k x SE at 32 questions, a garbage floor).
+  # The entry is trtllm-serve with the unit's llm_api_options; the `disagg`
+  # unit MUST declare `command`, a launcher that starts its context server,
+  # generation server and proxy, prints STAIRCASE_ENDPOINT=<base url> once it
+  # serves, and stops all of it on SIGTERM.
+  #
+  # launch:
+  #   num_samples: 32
+  #   endpoint: chat                       # or completions
+  #   members: all                         # or first
+  #   # min_accuracy: 80
+  #   disagg:
+  #     command: /path/to/launch_disagg.sh
+
+  # The SCHEDULER-EQUIVALENCE witness, in every unit at every member unless
+  # narrowed here. The same prompts, greedy, one request at a time, at least 64
+  # generated tokens each: overlap scheduler ON vs OFF must produce identical
+  # tokens (the overlap path changes when the host prepares a step, never what
+  # it computes), and speculation ON vs OFF is reported (a verify step's GEMM
+  # shapes differ, so a near-tie may flip) unless declared `agreement`/`exact`.
+  # This is what catches a generation step reading stale state under overlap +
+  # speculation -- a defect every member carried through every other gate of
+  # the run that had it. A target MAY implement the optional step-trace hook
+  # (STAIRCASE_STEP_TRACE_DIR, see step_check.py) to name the first divergent
+  # step; `step_trace.reference_command` adds a reference-implementation replay.
+  #
+  # scheduler_equivalence:
+  #   units: [core, dspark, multimodal]   # default: every unit
+  #   num_prompts: 8                      # from the accuracy dataset, or
+  #   # prompts: [...]                    # declare them (prompts_file, dataset)
+  #   max_tokens: 128                     # >= 64
+  #   ignore_eos: true
+  #   legs: [no_overlap, no_spec]
+  #   spec_pair: report                   # or agreement / exact
+  #   agreement_tokens: 16
+  #   pin_autotuner: true                 # one AutoTuner cache across legs
+  #   timeout: 1800                       # seconds per leg
+  #   # step_trace: {reference_command: /path/to/reference_replay.py}
 
   # `trtllm-eval`'s own flags, not LLM-API settings, so they cannot live in
   # llm_api_options. Without `max_seq_len` the eval inherits the checkpoint's

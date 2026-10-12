@@ -52,9 +52,9 @@ from agent_flow.prompts import dump_prompt_bundle
 from agent_flow.runtime import CommandExecutor, TurnExecutor, TurnRequest
 
 from . import envelope as envelope_mod
+from . import gate_cli, launch_gate, remediation, step_check
 from . import gates as gates_mod
 from . import overlap as overlap_mod
-from . import remediation
 from .catalog_index import CatalogIndexHook
 from .committer import CommitPolicy, install_committer
 from .delivery import DeliveryReport, summarize_for_auditor, verify_delivery, write_premerge_pack
@@ -122,10 +122,7 @@ from .state import (
 )
 from .survey import format_surface, read_checkpoint_surface, run_inventory_probe, write_surface_file
 from .task_schema import (
-    DEFAULT_BYTES_TOLERANCE,
     REPLAY_WITNESS_REQUIRED,
-    WITNESS_BATCH_SIZE_KEY,
-    WITNESS_LEGS_ENV_KEY,
     assembly_units,
     load_and_validate_task_yaml,
     members_for,
@@ -176,17 +173,20 @@ ENTERPRISE_MCP_CONFIG = Path("/etc/claude-code/managed-mcp.json")
 # the 19 that has never been tried.
 DEFAULT_MAX_PARALLEL_SMITHS = 10
 
-# Units whose feature is distribution-preserving BY CONSTRUCTION, and which
-# therefore need the acceptance gate on top of boot and accuracy.
+# The speculative features. A unit is acceptance-gated when the features its
+# target implements -- its own and every earlier unit's -- include one of
+# these, so the gate runs in the unit that adds speculation AND in every unit
+# after it, which keeps speculation on.
 #
-# Speculative decoding is the whole membership. Rejection sampling holds the
-# emitted distribution to the target model's, so a draft path that computes
-# the wrong thing produces correct text more slowly: boot passes, accuracy
-# passes, and the only observable that moves is speed. `acceptance_length`
-# under `=require` versus `=off` is the detector.
+# Speculative decoding is distribution-preserving BY CONSTRUCTION. Rejection
+# sampling holds the emitted distribution to the target model's, so a draft
+# path that computes the wrong thing produces correct text more slowly: boot
+# passes, accuracy passes, and the only observable that moves is speed.
+# Per-prompt acceptance against `=off`, a measured floor and the previous
+# tree's verdict is the detector.
 #
-# `core` is deliberately absent: it has no draft path, so the comparison
-# would be 1.0 against 1.0 and would pass whatever core did.
+# `core` is never gated: it has no draft path, so the comparison would be
+# 1.0 against 1.0 and would pass whatever core did.
 ACCEPTANCE_GATED_UNITS: frozenset[str] = frozenset({"mtp", "eagle3", "dflash", "dspark"})
 
 # The other output-identical features, and the witness each needs. Same
@@ -1068,7 +1068,9 @@ class StaircaseOnboardWorkflow:
         kinds = {envelope_mod.EVIDENCE_BOOT, envelope_mod.EVIDENCE_ACCURACY}
         if unit in WITNESS_GATED_UNITS:
             kinds.add(envelope_mod.EVIDENCE_WITNESS)
-        if unit in ACCEPTANCE_GATED_UNITS:
+        # The same predicate `_assemble_one_unit` gates with: every unit whose
+        # target keeps speculation on, not only the unit that adds it.
+        if ACCEPTANCE_GATED_UNITS & set(self._features_through(unit)):
             kinds.add(envelope_mod.EVIDENCE_ACCEPTANCE)
         return kinds
 
@@ -1895,7 +1897,6 @@ class StaircaseOnboardWorkflow:
                 lambda member: gates_mod.run_boot_gate(
                     self._gate_env(),
                     task_data=self.task_data,
-                    spec=gates_mod.BootSpec.load(self.boot_spec_path),
                     runner=self._shell_runner,
                     # The features this target implements *now*, not the ones
                     # the run will finish with. `core` implements none, so
@@ -1904,6 +1905,12 @@ class StaircaseOnboardWorkflow:
                     features=self._features_through(unit),
                     unit=unit,
                     member=member,
+                    # `accuracy.boot`, else the workspace boot.yaml; a
+                    # multimodal target also sends an image.
+                    spec=gates_mod.resolve_boot_spec(
+                        self.task_data, unit, self._features_through(unit), self.boot_spec_path
+                    ),
+                    workdir=self.workspace / "gates" / unit,
                 ),
                 log,
             )
@@ -1928,7 +1935,7 @@ class StaircaseOnboardWorkflow:
                     print_message("[bold yellow]↻ reviewer REJECT[/bold yellow]", log)
                     continue
 
-            if not self._gate_over_members(
+            accuracy_results = self._gate_over_members(
                 members,
                 lambda member: gates_mod.run_accuracy_gate(
                     self._gate_env(),
@@ -1944,8 +1951,22 @@ class StaircaseOnboardWorkflow:
                 ),
                 log,
                 announce=True,
-            ):
+            )
+            if not accuracy_results:
                 continue
+            # Every member over its own floor can still be every member
+            # under the anchor; recorded either way, refused at delivery.
+            shift = gates_mod.note_systematic_shift(
+                gates_mod.records_for(self.workspace),
+                accuracy_results,
+                self.task_data.get("accuracy") or {},
+                unit,
+            )
+            if shift is not None:
+                self.journal.event("finding", shift.describe())
+                print_message(
+                    f"[bold yellow]⚠ {escape_markup(shift.describe())}[/bold yellow]", log
+                )
 
             # The third gate, and the only one that can see a miscomputed
             # draft path. Rejection sampling holds the emitted distribution
@@ -1953,41 +1974,62 @@ class StaircaseOnboardWorkflow:
             # only speed moves. Runs for distribution-preserving features
             # only; core has no draft path to compare.
             if unit in WITNESS_GATED_UNITS:
-                # **The first member only**, and deliberately. Boot and
-                # accuracy ask "does this configuration work", which is a
-                # different question at every member. A witness asks
-                # something else: it is a CONTRAST between two legs of the
-                # SAME configuration — a residency delta, or token identity
-                # across the disagg hop — and what it proves is a property of
-                # the modeling code rather than of the topology. The
-                # residency witness makes that concrete: its verdict is a
-                # device-memory delta against `expected_mib`, one number the
-                # spec derives from the checkpoint's own shapes, so running
-                # it at DEP (attention replicated) and at TEP (attention
-                # sharded) would compare two different deltas against an
-                # expectation computed for one of them. Each witness is also
-                # two full engine launches, so looping it would triple the
-                # most expensive gate shape in the set to re-ask a question
-                # that does not vary with the answer.
-                witness = self._run_witness(unit, members[0], log)
-                if witness is None:
-                    return False
-                # Escaped: a token witness's verdict quotes generated text,
-                # which may contain what rich reads as markup.
-                if not witness.passed:
+                # **Every member**, cheapest first, stopping at the first
+                # failure. A witness contrasts two legs of one configuration,
+                # but the code a leg runs differs by member: the Engram table
+                # is sharded by the TP group, attention DP replicates what TEP
+                # shards, and a stale-state defect showed on every member a
+                # first-member witness never ran at. A residency witness whose
+                # delta differs per member declares `expected_mib` per member.
+                witnessed = True
+                for member in members:
+                    witness = self._run_witness(unit, member, log)
+                    if witness is None:
+                        return False
+                    # Escaped: a token witness's verdict quotes generated
+                    # text, which may contain what rich reads as markup.
+                    if not witness.passed:
+                        print_message(
+                            f"[bold yellow]↻ {escape_markup(witness.summary())}[/bold yellow]", log
+                        )
+                        witnessed = False
+                        break
                     print_message(
-                        f"[bold yellow]↻ {escape_markup(witness.summary())}[/bold yellow]", log
+                        f"[bold green]✔ {escape_markup(witness.summary())}[/bold green]", log
                     )
+                if not witnessed:
                     continue
-                print_message(f"[bold green]✔ {escape_markup(witness.summary())}[/bold green]", log)
 
-            if unit in ACCEPTANCE_GATED_UNITS:
+            # Decode-time state the overlap scheduler or speculation reads
+            # stale shows as a token difference between legs that must agree:
+            # at batch 1, greedy, overlap on and off produce the same tokens.
+            if step_check.applies(self.task_data.get("accuracy") or {}, unit):
+                if not self._gate_over_members(
+                    members,
+                    lambda member: step_check.run_scheduler_equivalence(
+                        self._gate_env(),
+                        task_data=self.task_data,
+                        runner=self._shell_runner,
+                        unit=unit,
+                        member=member,
+                        features=self._features_through(unit),
+                        workdir=self.workspace / "gates" / unit / "scheduler_equivalence",
+                    ),
+                    log,
+                    announce=True,
+                ):
+                    continue
+
+            # Every unit whose target keeps speculation on, not only the unit
+            # that adds it: a later feature can break the draft path too, and
+            # the floors task.yaml declares for those units are otherwise dead
+            # configuration.
+            if ACCEPTANCE_GATED_UNITS & set(self._features_through(unit)):
                 if not self._gate_over_members(
                     members,
                     lambda member: gates_mod.run_acceptance_gate(
                         self._gate_env(),
                         task_data=self.task_data,
-                        spec=gates_mod.BootSpec.load(self.boot_spec_path),
                         runner=self._shell_runner,
                         unit=unit,
                         # The features the target implements NOW, same rule as
@@ -1996,6 +2038,36 @@ class StaircaseOnboardWorkflow:
                         # a different one.
                         features=self._features_through(unit),
                         member=member,
+                        workdir=self.workspace / "gates" / unit,
+                        records=gates_mod.records_for(self.workspace),
+                    ),
+                    log,
+                    announce=True,
+                ):
+                    continue
+
+            # Last: the unit's own deployment entry (trtllm-serve, or the
+            # declared launcher for disagg) answers a small accuracy smoke
+            # over HTTP, which the in-process LLM API of the accuracy gate
+            # never exercises.
+            if launch_gate.applies(self.task_data.get("accuracy") or {}, unit):
+                launch = launch_gate.resolve_launch_config(
+                    self.task_data.get("accuracy") or {}, unit
+                )
+                if not self._gate_over_members(
+                    launch_gate.select_members(launch, members),
+                    lambda member: launch_gate.run_launch_gate(
+                        self._gate_env(),
+                        task_data=self.task_data,
+                        reference=launch_gate.smoke_reference(
+                            self.task_data, unit, self._model_key
+                        ),
+                        runner=self._shell_runner,
+                        unit=unit,
+                        member=member,
+                        features=self._features_through(unit),
+                        workdir=self.workspace / "gates" / unit / "launch",
+                        config=launch,
                     ),
                     log,
                     announce=True,
@@ -2042,10 +2114,17 @@ class StaircaseOnboardWorkflow:
             results.append(result)
             self.journal.event("gate", result.summary())
             if not result.passed:
-                print_message(f"[bold yellow]↻ {result.summary()}[/bold yellow]", log)
+                print_message(
+                    f"[bold yellow]↻ {escape_markup(result.summary())}[/bold yellow]", log
+                )
+                if result.stdout_tail.strip():
+                    self.journal.section(
+                        f"gate `{result.name}` failed: evidence",
+                        f"```\n{result.stdout_tail.rstrip()}\n```",
+                    )
                 return []
             if announce:
-                print_message(f"[bold green]✔ {result.summary()}[/bold green]", log)
+                print_message(f"[bold green]✔ {escape_markup(result.summary())}[/bold green]", log)
         return results
 
     @staticmethod
@@ -2080,9 +2159,8 @@ class StaircaseOnboardWorkflow:
     def _run_witness(self, unit: str, member: str, log) -> "gates_mod.GateResult | None":
         """Run the witness gate `unit`'s feature needs. None means misconfigured.
 
-        `member` is the configuration both legs are served at — see the call
-        site for why a witness runs at one member rather than over all of
-        them.
+        `member` is the configuration both legs are served at; the unit
+        loop runs the witness at every member, cheapest first.
 
         The spec has to supply the one thing that cannot be derived: the
         environment that turns the feature OFF. A missing block is a hard
@@ -2109,72 +2187,19 @@ class StaircaseOnboardWorkflow:
             )
             return None
 
-        contrast_env = {str(k): str(v) for k, v in (block.get("contrast_env") or {}).items()}
-        common = dict(
+        # The same entry point a standalone run uses (`staircase-onboard gate
+        # witness`), over the workload the block declares.
+        result = witness_mod.run_declared_witness(
+            self._gate_env(),
+            kind=kind,
+            unit=unit,
+            member=member,
             task_data=self.task_data,
             runner=self._shell_runner,
-            unit=unit,
             features=self._features_through(unit),
-            member=member,
-            # Per leg. A disagg leg boots two engines in sequence, which the
-            # one-engine default was never sized for.
-            timeout=int(block.get("timeout") or gates_mod.BOOT_TIMEOUT_S),
+            workdir=self.workspace / "witness" / unit,
+            boot=gates_mod.resolve_boot_spec(self.task_data, unit, None, self.boot_spec_path),
         )
-        # The token-comparing witnesses only: the replay witnesses count work,
-        # and their schema refuses the key. Both legs run at this batch limit;
-        # see `task_schema.WITNESS_BATCH_SIZE_KEY` for why 1 is the useful one.
-        batch = block.get(WITNESS_BATCH_SIZE_KEY)
-        schedule = dict(max_batch_size=None if batch is None else int(batch))
-        boot_spec = gates_mod.BootSpec.load(self.boot_spec_path)
-        if kind == "residency":
-            result = witness_mod.run_residency_witness(
-                self._gate_env(),
-                expected_mib=float(block.get("expected_mib", 0.0)),
-                contrast_env=contrast_env,
-                spec=boot_spec,
-                **schedule,
-                **common,
-            )
-        elif kind == "replay":
-            # The workload is generated from the declared sizes, not from the
-            # boot prompts: two short prompts never exceed the window, and a
-            # witness whose prompt fits inside the window passes for a target
-            # that bounds nothing.
-            result = witness_mod.run_replay_witness(
-                self._gate_env(),
-                feature=unit,
-                contrast_env=contrast_env,
-                window=int(block["window"]),
-                prompt_tokens=block.get("prompt_tokens"),
-                prefix_tokens=block.get("prefix_tokens"),
-                reuse_alignment=int(block.get("reuse_alignment", 1)),
-                **common,
-            )
-        elif kind == "kv_quant":
-            result = witness_mod.run_kv_quant_witness(
-                self._gate_env(),
-                expected_bytes_per_token=int(block["expected_bytes_per_token"]),
-                exact=bool(block.get("exact", True)),
-                contrast_env=contrast_env,
-                bytes_tolerance=float(block.get("bytes_tolerance", DEFAULT_BYTES_TOLERANCE)),
-                spec=boot_spec,
-                **schedule,
-                **common,
-            )
-        else:
-            result = witness_mod.run_equivalence_witness(
-                self._gate_env(),
-                contrast_env=contrast_env,
-                contrast_command=block.get("contrast_command"),
-                spec=boot_spec,
-                prompt_tokens=block.get("prompt_tokens"),
-                workdir=self.workspace / "witness" / unit,
-                legs_env={
-                    str(k): str(v) for k, v in (block.get(WITNESS_LEGS_ENV_KEY) or {}).items()
-                },
-                **schedule,
-                **common,
-            )
         self.gate_log.record(result)
         self.journal.event("gate", result.summary())
         if not result.passed and result.stdout_tail.strip():
@@ -2193,6 +2218,16 @@ class StaircaseOnboardWorkflow:
     def _run_deliver_phase(self, state: WorkflowState, log) -> bool:
         print_rule("[bold magenta]deliver[/bold magenta]", log)
         self._progress_ctx.current_iteration = 1
+
+        findings = gates_mod.blocking_findings(
+            gates_mod.records_for(self.workspace), self.task_data.get("accuracy") or {}
+        )
+        if findings:
+            detail = "\n".join(f"- {f.values.get('detail', f.key)}" for f in findings)
+            self.journal.section("delivery blocked by gate findings", detail)
+            print_message(f"[bold red]✘ delivery blocked:\n{escape_markup(detail)}[/bold red]", log)
+            self._close_run(state, log, verdict="delivery-failed:findings")
+            return False
 
         self._catalog_index.sync(log)
         report = self.evidence.record_delivery_checks(
@@ -3356,7 +3391,10 @@ class StaircaseOnboardWorkflow:
             f"{self._gate_history_block()}"
             f"Write the unit. The orchestrator runs the boot gate as soon as you "
             f"finish, and the accuracy gate once the unit looks right — do not run "
-            f"them yourself, and do not reformat: the run lints once, at delivery.\n\n"
+            f"them yourself, and do not reformat: the run lints once, at delivery. "
+            f"To reproduce one gate or witness while debugging, run the workflow's own "
+            f"entry point, never a reconstruction of its command: "
+            f"`{gate_cli.invocation(self.task_path, self.workspace / 'gates', unit)}`.\n\n"
             + self._report_instruction("assembler")
         )
 

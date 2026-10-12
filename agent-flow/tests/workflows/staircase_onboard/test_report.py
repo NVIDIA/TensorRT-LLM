@@ -336,7 +336,7 @@ def test_a_run_writes_its_reports_from_the_ledger(tmp_path, task_file, monkeypat
     doc = json.loads((ws / PROGRESS_JSON).read_text())
     assert doc["meta"]["status"] == "DELIVERED"
     gates = {r["gate"].split("[")[0] for r in doc["gates"]["rows"] if r["unit"]}
-    assert gates == {"boot", "accuracy"}
+    assert gates == {"boot", "accuracy", "scheduler_equivalence", "launch"}
     assert any(r["gate"].startswith("delivery:") for r in doc["gates"]["rows"])
     assert doc["pipeline_stages"][-1]["status"] == "DELIVERED"
     assert (ws / PROGRESS_HTML).is_file()
