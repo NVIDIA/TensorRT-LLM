@@ -29,7 +29,7 @@ import urllib.request
 import pytest
 
 from tensorrt_llm.inputs.registry import DefaultInputProcessor
-from tensorrt_llm.serve.render import RenderResources, render_chat
+from tensorrt_llm.serve.render import RenderResources, fingerprints_match, render_chat
 from tensorrt_llm.serve.render.__main__ import build_parser
 
 from .render_helpers import chat_request, make_tokenizer, resources
@@ -103,6 +103,36 @@ class TestLoad:
             str(checkpoint), chat_template="X{% for m in messages %}{{ m.content }}{% endfor %}"
         )
         assert render_chat(chat_request(), loaded, tokenize=False).text.startswith("X")
+
+    def test_a_router_and_a_worker_that_load_the_same_checkpoint_have_one_fingerprint(
+        self, checkpoint
+    ) -> None:
+        # Both sides go through their real loading code, nothing is a stand-in: the router's
+        # own tokenizer loader, and the loader a worker (and this renderer) uses, including
+        # AutoProcessor, which returns the tokenizer for a text-only checkpoint. These differed
+        # in the template sources and in the tokenizer's init options before they were
+        # resolved/loaded the same way, so no router ever matched a real worker.
+        from tensorrt_llm.serve.router import KvCacheAwareRouter
+
+        router = KvCacheAwareRouter(
+            server_role=None,
+            servers=[],
+            use_tokens=False,
+            max_batch_size=32,
+            tokens_per_block=32,
+            use_harmony=False,
+            tokenizer_dir=str(checkpoint),
+            model_path=str(checkpoint),
+        )
+        worker = RenderResources.load(str(checkpoint))
+        # The shape that made a plain comparison of template sources disagree.
+        assert worker.processor is not None
+        assert worker.processor.chat_template == worker.tokenizer.tokenizer.chat_template
+
+        router_fingerprint = router._render_resources("tiny").fingerprint()
+
+        assert router_fingerprint["compared"]["model_type"] == "llama"
+        assert fingerprints_match(router_fingerprint, worker.fingerprint())
 
     def test_a_missing_checkpoint_is_a_clear_error(self, tmp_path) -> None:
         with pytest.raises(Exception):  # noqa: B017 - the exact type depends on the loader

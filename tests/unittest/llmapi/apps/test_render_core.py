@@ -370,12 +370,6 @@ class TestRenderConversation:
 
 
 class TestFingerprint:
-    def test_equal_resources_have_equal_fingerprints(self, tokenizer) -> None:
-        first = compute_fingerprint(resources(tokenizer))
-        second = compute_fingerprint(resources(tokenizer))
-        assert fingerprints_match(first, second)
-        assert first["digest"] == second["digest"]
-
     def test_a_different_server_template_changes_the_digest(self, tokenizer) -> None:
         plain = compute_fingerprint(resources(tokenizer))
         with_template = compute_fingerprint(
@@ -408,17 +402,17 @@ class TestFingerprint:
     def test_a_missing_fingerprint_never_matches(self, local, remote) -> None:
         assert not fingerprints_match(local, remote)
 
-    def test_a_router_without_a_processor_does_not_match_a_server_with_one(self, tokenizer) -> None:
-        server = resources(tokenizer, processor=SimpleNamespace(chat_template="PROCESSOR:{{ x }}"))
-        router = RenderResources.from_tokenizer(tokenizer, model_type="render-test-model")
-        assert not fingerprints_match(compute_fingerprint(router), compute_fingerprint(server))
-
     def _worker_resources(self, tokenizer, **overrides) -> RenderResources:
-        """Resources built the way a worker builds them, not copied from the router's."""
+        """Resources built the way a worker builds them, not copied from the router's.
+
+        A worker's ``processor`` is ``AutoProcessor.from_pretrained(...)``, which returns the
+        tokenizer itself for a text-only checkpoint; a stand-in with ``processor=None`` would
+        hide every difference that only exists in that real shape.
+        """
         server = SimpleNamespace(
             tokenizer=tokenizer,
             model_config=SimpleNamespace(model_type="render-test-model"),
-            processor=None,
+            processor=tokenizer,
             chat_template=None,
             allow_request_chat_template=False,
             generator=SimpleNamespace(
@@ -430,13 +424,84 @@ class TestFingerprint:
             setattr(server, name, value)
         return RenderResources.from_server(server)
 
-    def test_a_router_matches_an_independently_built_worker_for_plain_text(self, tokenizer) -> None:
-        # The router has only a tokenizer; the worker has the engine's DefaultInputProcessor.
-        # Both are the same plain-text tokenization.
-        router = RenderResources.from_tokenizer(tokenizer, model_type="render-test-model")
-        worker = self._worker_resources(tokenizer)
+    def _router_resources(self, tokenizer) -> RenderResources:
+        return RenderResources.from_tokenizer(tokenizer, model_type="render-test-model")
 
-        assert fingerprints_match(compute_fingerprint(router), compute_fingerprint(worker))
+    def test_a_worker_whose_processor_is_the_tokenizer_matches_a_router_without_one(
+        self, tokenizer
+    ) -> None:
+        # The real shape of every text-only worker: AutoProcessor falls back to the tokenizer,
+        # so the "processor" carries the tokenizer's own template. The router has no processor.
+        worker = self._worker_resources(tokenizer)
+        assert worker.processor is tokenizer
+        assert worker.input_processor is not None  # the engine's DefaultInputProcessor
+
+        assert fingerprints_match(
+            compute_fingerprint(self._router_resources(tokenizer)), compute_fingerprint(worker)
+        )
+
+    def test_a_processor_with_the_same_template_text_changes_nothing(self, tokenizer) -> None:
+        same_text = SimpleNamespace(chat_template=tokenizer.chat_template)
+        worker = self._worker_resources(tokenizer, processor=same_text)
+
+        assert fingerprints_match(
+            compute_fingerprint(self._router_resources(tokenizer)), compute_fingerprint(worker)
+        )
+
+    def test_a_processor_with_a_different_template_does_not_match_a_router_without_one(
+        self, tokenizer
+    ) -> None:
+        # A vision model's processor can carry its own template; the router cannot know it.
+        worker = self._worker_resources(
+            tokenizer, processor=SimpleNamespace(chat_template="PROCESSOR:{{ x }}")
+        )
+
+        assert not fingerprints_match(
+            compute_fingerprint(self._router_resources(tokenizer)), compute_fingerprint(worker)
+        )
+
+    def test_a_server_template_makes_the_processors_template_irrelevant(self, tokenizer) -> None:
+        # The server template wins when it is set, so a difference in a template that is never
+        # used must not change the identity.
+        first = resources(
+            tokenizer,
+            default_chat_template=SERVER_TEMPLATE,
+            processor=SimpleNamespace(chat_template="ONE"),
+        )
+        second = resources(
+            tokenizer,
+            default_chat_template=SERVER_TEMPLATE,
+            processor=SimpleNamespace(chat_template="TWO"),
+        )
+
+        assert fingerprints_match(compute_fingerprint(first), compute_fingerprint(second))
+
+    def test_the_tool_variant_of_a_template_is_part_of_the_identity(self) -> None:
+        plain = "{% for m in messages %}{{ m.content }}{% endfor %}"
+        same = make_tokenizer(chat_template={"default": plain, "tool_use": plain + "T"})
+        also_same = make_tokenizer(chat_template={"default": plain, "tool_use": plain + "T"})
+        other_tool_variant = make_tokenizer(
+            chat_template={"default": plain, "tool_use": plain + "U"}
+        )
+
+        assert fingerprints_match(
+            compute_fingerprint(resources(same)), compute_fingerprint(resources(also_same))
+        )
+        assert not fingerprints_match(
+            compute_fingerprint(resources(same)),
+            compute_fingerprint(resources(other_tool_variant)),
+        )
+
+    def test_a_tokenizer_without_a_template_has_no_template_identity(self) -> None:
+        class NativeTokenizer:
+            """Renders in Python (no Jinja template); its own identity covers it."""
+
+            def get_vocab(self):
+                return {"a": 0}
+
+        templates = compute_fingerprint(resources(NativeTokenizer()))["compared"]["templates"]
+
+        assert templates == {"without_tools": None, "with_tools": None}
 
     def test_a_worker_with_its_own_input_processor_does_not_match_a_router(self, tokenizer) -> None:
         class OwnInputProcessor:

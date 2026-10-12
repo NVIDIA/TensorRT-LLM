@@ -18,8 +18,9 @@ Two processes produce the same prompt token ids for the same request only if
 they render with the same chat template, tokenizer, model type, model-specific
 extension and input processor. The fingerprint is a digest over exactly those
 inputs, so a router or a worker can check that it may trust ids rendered
-elsewhere. Settings that do not change the ids (the tool parser, for example)
-are listed for information but excluded from the digest.
+elsewhere. The chat template is the one the renderer resolves, not every place
+one could come from. Settings that do not change the ids (the tool parser, for
+example) are listed for information but excluded from the digest.
 """
 
 from __future__ import annotations
@@ -31,7 +32,7 @@ from typing import TYPE_CHECKING, Any, Dict, Optional
 if TYPE_CHECKING:
     from .resources import RenderResources
 
-FINGERPRINT_VERSION = 2
+FINGERPRINT_VERSION = 3
 
 
 def _sha256(value: Any) -> Optional[str]:
@@ -151,14 +152,35 @@ def _harmony_identity() -> Dict[str, Any]:
     return {"encoding": "HARMONY_GPT_OSS", "package": "openai-harmony", "version": package}
 
 
-def _template_sources(res: "RenderResources") -> Dict[str, Optional[str]]:
-    """Digests of every place a chat template can come from."""
+def _resolved_templates(res: "RenderResources") -> Dict[str, Optional[str]]:
+    """Digests of the chat template the renderer resolves, for a request without tools and with.
+
+    The template is chosen by ``resolve_hf_chat_template`` (the server template, else the
+    processor's, else the tokenizer's, and the tokenizer's tool variant when tools are given),
+    so the fingerprint calls that function instead of listing where a template could come
+    from. Listing the sources made a worker whose ``AutoProcessor`` fell back to the
+    tokenizer (every text-only checkpoint) differ from a router that has no processor, though
+    both render with the same text.
+    """
+    from tensorrt_llm.inputs.utils import resolve_hf_chat_template
+
     inner = getattr(res.tokenizer, "tokenizer", res.tokenizer)
-    return {
-        "server": _sha256(res.default_chat_template),
-        "processor": _sha256(getattr(res.processor, "chat_template", None)),
-        "tokenizer": _sha256(getattr(inner, "chat_template", None)),
-    }
+    if not any(
+        getattr(source, "chat_template", None) is not None for source in (res.processor, inner)
+    ) and (res.default_chat_template is None):
+        # No Jinja template anywhere (a tokenizer-native renderer): the tokenizer's own
+        # identity covers it, and the resolver would only log a warning.
+        return {"without_tools": None, "with_tools": None}
+    resolved: Dict[str, Optional[str]] = {}
+    for shape, tools in (("without_tools", None), ("with_tools", [{}])):
+        try:
+            template = resolve_hf_chat_template(
+                inner, res.processor, res.default_chat_template, tools
+            )
+        except Exception:  # noqa: BLE001 - a template that cannot be resolved is "none"
+            template = None
+        resolved[shape] = _sha256(template)
+    return resolved
 
 
 def compute_fingerprint(res: "RenderResources") -> Dict[str, Any]:
@@ -188,7 +210,7 @@ def compute_fingerprint(res: "RenderResources") -> Dict[str, Any]:
             {
                 "custom_tokenizer": res.custom_tokenizer,
                 "input_processor": input_processor_kind,
-                "templates": _template_sources(res),
+                "templates": _resolved_templates(res),
                 "tokenizer": _tokenizer_digest(res.tokenizer),
             }
         )
