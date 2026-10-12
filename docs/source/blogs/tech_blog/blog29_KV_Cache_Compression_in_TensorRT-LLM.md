@@ -145,7 +145,11 @@ Before anything is built, a factory reads the block and wires things up: which m
 
 ### KV Cache Compression in the Executor Iteration Loop
 
-Reaching the stages inside a request (stages 1 to 3 in Figure 3) costs the runtime nothing new: the compression manager rides on callbacks the executor already makes. The executor calls every resource manager before the forward pass, after it, and when a request ends. The compression manager registers last, so it runs after the KV cache manager has updated its state, and maps these callbacks onto five hook functions, one per moment: request start, end of prefill, before and after each decode step, and request finish (Figure 5). Every hook does nothing by default. A method overrides the hook of the stage it wants, and its code runs there.
+The most important property of the framework is seamless insertion: compression reaches the whole lifecycle of a request inside TensorRT LLM without the runtime learning anything new. This section shows how.
+
+In the PyTorch executor every iteration follows the same cycle. The scheduler picks a batch of requests; each resource manager prepares its resources for that batch (`prepare_resources`); the model runs one forward pass; each manager updates its state (`update_resources`); and a finished request releases its resources (`free_resources`). The KV cache manager is one of these resource managers: it allocates pages before the forward and records the new tokens after it. These three callbacks are exactly the moments when nothing is reading the cache, which is why the five stages of Figure 3 become hooks here.
+
+`KVCacheCompressionManager` inherits `BaseResourceManager` and is registered after the KV cache manager, so it always sees an updated cache. In `prepare_resources` it fires `on_request_init` for a request's first prefill chunk (stage 1) and `on_generation_step_begin` (stage 3); in `update_resources` it fires `on_context_step_end` for the requests whose last prefill chunk just ran (stage 2) and `on_generation_step_end` (stage 3); in `free_resources` it fires `on_request_finish` (stages 4 and 5). Every hook does nothing by default, and a method overrides the hooks of the stages it wants (Figure 5). The manager owns no pages, so it never touches admission or memory accounting.
 
 <div align="center">
 <figure>
@@ -154,7 +158,7 @@ Reaching the stages inside a request (stages 1 to 3 in Figure 3) costs the runti
 </div>
 <p align="center"><sub><em>Figure 5: How the hooks reach the executor iteration loop. Every BaseResourceManager receives three callbacks per iteration: before the forward pass, after it, and when a request ends. KVCacheCompressionManager inherits BaseResourceManager and turns the three callbacks into the five hooks. A method overrides the hooks it needs.</em></sub></p>
 
-Two rules for methods on this path: the policy that picks tokens stays separate from the shared compaction kernel, and GPU work finishes before a page is shrunk or freed. TriAttention uses `on_generation_step_end`; the other hooks are in place for new methods.
+Inside a hook a method runs its own kernels on the cache, and two shared pieces keep it small. The manager hands each hook the scheduled batch with the per-request cache state it needs, and an algorithm-neutral compaction kernel packs the kept tokens in place and returns the freed pages to the cache manager, so a method only decides what to keep. Two rules follow: the keep policy stays separate from the compaction, and GPU work finishes before any page is shrunk or freed. TriAttention is the shipped example: it overrides `on_generation_step_end`, scores and selects tokens with its own kernels, and calls the shared compaction.
 
 ### KV Cache Compression in Cross-Request KV Management
 
