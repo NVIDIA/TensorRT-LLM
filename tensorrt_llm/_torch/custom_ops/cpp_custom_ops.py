@@ -377,7 +377,8 @@ def _register_fake():
           index_topk,
           compress_ratio=1,
           radix_aux_indices=None,
-          radix_aux_logits=None):
+          radix_aux_logits=None,
+          row_kv_lens=None):
         # In-place operation, no return value (void function)
         pass
 
@@ -516,6 +517,8 @@ def _register_fake():
         topk: int,
         route_scale: float,
         is_hash: bool,
+        image_mask: Optional[torch.Tensor] = None,
+        vision_bias: Optional[torch.Tensor] = None,
     ) -> None:
         # In-place operation, no return value.
         pass

@@ -1420,6 +1420,11 @@ class MixedMambaHybridCacheManager(KVCacheManager, MambaCacheManager, MambaHybri
     Does not support block reuse / prefix caching for mamba states.
     """
 
+    # Recurrent (conv/SSM) state summarizes the whole matched prefix, so the
+    # cache manager __init__ coerces a positive spec recompute tail to a full
+    # re-prefill (see _has_recurrent_state on the attention-only base classes).
+    _has_recurrent_state = True
+
     def __init__(
         self,
         # mamba cache parameters
@@ -1628,6 +1633,11 @@ class CppMambaHybridCacheManager(KVCacheManager, _LegacyMambaHybridCacheManager)
     manager preference override and legacy disaggregated routing.
 
     """
+
+    # Recurrent (conv/SSM) state summarizes the whole matched prefix, so the
+    # cache manager __init__ coerces a positive spec recompute tail to a full
+    # re-prefill (see _has_recurrent_state on the attention-only base classes).
+    _has_recurrent_state = True
 
     def __init__(
         self,

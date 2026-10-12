@@ -30,7 +30,7 @@ from tensorrt_llm.llmapi import KvCacheConfig as TRT_KvCacheConfig
 
 @pytest.fixture(scope="module")
 def model_path() -> Path:
-    return llm_models_root() / "llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
+    return llm_models_root() / "Qwen3/Qwen3-0.6B"
 
 
 @dataclass(frozen=True)

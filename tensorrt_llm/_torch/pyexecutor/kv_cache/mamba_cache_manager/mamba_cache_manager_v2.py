@@ -106,6 +106,11 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
 
     _supports_additional_snapshot_offsets = True
 
+    # Recurrent (conv/SSM) state summarizes the whole matched prefix, so the
+    # cache manager __init__ coerces a positive spec recompute tail to a full
+    # re-prefill (see _has_recurrent_state on the attention-only base classes).
+    _has_recurrent_state = True
+
     # Construction and cache configuration
 
     @override
