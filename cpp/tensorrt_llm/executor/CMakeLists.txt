@@ -19,13 +19,15 @@ set(TARGET_DIR ${CMAKE_CURRENT_SOURCE_DIR})
 
 # keep this list sorted alphabetically
 set(SRCS
-    cache_transmission/mpi_utils/connection.cpp
     cache_transmission/agent_utils/connection.cpp
-    cache_transmission/transferAgent.cpp
     cache_transmission/cacheSplitConcat.cu
+    cache_transmission/mpi_utils/connection.cpp
     cache_transmission/rnnCacheSplitConcat.cu
+    cache_transmission/transferAgent.cpp
+    cacheTransceiverConfig.cpp
     contextPhaseParams.cpp
     decodingConfig.cpp
+    dynamicBatchConfig.cpp
     executorKVCacheEventManager.cpp
     extendedRuntimePerfKnobConfig.cpp
     guidedDecodingConfig.cpp
@@ -34,24 +36,20 @@ set(SRCS
     kvCacheConfig.cpp
     kvCacheRetentionConfig.cpp
     loraConfig.cpp
+    mropeConfig.cpp
+    multimodalInput.cpp
     outputConfig.cpp
     peftCacheConfig.cpp
     promptTuningConfig.cpp
-    mropeConfig.cpp
-    multimodalInput.cpp
     request.cpp
     requestUtils.cpp
     requestWithId.cpp
     response.cpp
     samplingConfig.cpp
-    dynamicBatchConfig.cpp
     schedulerConfig.cpp
     serialization.cpp
     tensor.cpp
-    types.cpp
-    requestUtils.cpp
-    contextPhaseParams.cpp
-    cacheTransceiverConfig.cpp)
+    types.cpp)
 
 if(NOT WIN32)
   # additional warnings

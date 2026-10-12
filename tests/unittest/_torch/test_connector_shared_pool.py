@@ -51,6 +51,7 @@ def test_restore_from_another_owner(
 ) -> None:
     """Restore across owners, base/ADP examples and the integration backend."""
     monkeypatch.setenv("CONNECTOR_CACHE_FOLDER", str(tmp_path))
+    monkeypatch.setenv("TRTLLM_TEST_CONNECTOR_CACHE_FOLDER", str(tmp_path))
     producer = example.PersistentKvCacheConnectorLeader(_args())
     consumer = example.PersistentKvCacheConnectorLeader(_args())
     if base_role == "producer":
@@ -62,7 +63,7 @@ def test_restore_from_another_owner(
         monkeypatch.syspath_prepend(str(backend_dir))
         from connector_test_backend import RecordingConnectorScheduler
 
-        monkeypatch.delenv("CONNECTOR_TEST_ASYNC", raising=False)
+        monkeypatch.delenv("TRTLLM_TEST_CONNECTOR_ASYNC", raising=False)
         if base_role == "recording_producer":
             producer = RecordingConnectorScheduler(_args())
         else:

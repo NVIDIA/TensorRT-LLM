@@ -37,17 +37,23 @@ def _request(
     *,
     rewind: int = 0,
     accepted_draft_tokens: int = 0,
+    draft_tokens: list[int] | None = None,
+    verify_len: int | None = None,
     complete: bool = False,
 ) -> SimpleNamespace:
-    return SimpleNamespace(
+    request = SimpleNamespace(
         py_request_id=request_id,
         py_rewind_len=rewind,
         py_num_accepted_draft_tokens=accepted_draft_tokens,
+        py_draft_tokens=draft_tokens,
         max_beam_num_tokens=201,
         state=LlmRequestState.GENERATION_COMPLETE
         if complete
         else LlmRequestState.GENERATION_IN_PROGRESS,
     )
+    if verify_len is not None:
+        request.py_verify_len = verify_len
+    return request
 
 
 def _cache(*, capacity: int = 256, active: bool = True) -> MagicMock:
@@ -137,6 +143,37 @@ def test_dynamic_tree_reserved_capacity(is_draft: bool, expected_capacity: int) 
     manager.update_resources(SimpleNamespace(generation_requests=[request]))
 
     cache.resize.assert_called_once_with(expected_capacity, 200)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("verify_len", "rewind", "accepted", "expected_capacity"),
+    [(2, 1, 1, 252), (5, 2, 3, 254)],
+    ids=["reclaims-unverified-suffix", "full-window-keeps-uniform-accounting"],
+)
+def test_target_reclaims_only_ragged_unverified_capacity(
+    verify_len: int, rewind: int, accepted: int, expected_capacity: int
+) -> None:
+    manager = _manager(is_draft=False, kv_reserve_draft_tokens=5)
+    request = _request(
+        1,
+        rewind=rewind,
+        accepted_draft_tokens=accepted,
+        draft_tokens=[1] * 5,
+        verify_len=verify_len,
+    )
+    cache = _cache()
+    manager.kv_cache_map[request.py_request_id] = cache
+
+    # The reservation belongs to the completed step; live request fields may
+    # already describe the next overlap iteration.
+    manager._allocated_draft_lens[request.py_request_id] = 5
+    request.py_verify_len = 1
+    request.py_draft_tokens = [9]
+    manager.update_resources(SimpleNamespace(generation_requests=[request]))
+
+    cache.resize.assert_called_once_with(expected_capacity, 200)
+    assert request.py_request_id not in manager._allocated_draft_lens
 
 
 def test_capacity_only_completion_preserves_history() -> None:

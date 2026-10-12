@@ -25,9 +25,9 @@ from ..test_llm import get_model_path
 from .openai_server import RemoteOpenAIServer
 
 
-@pytest.fixture(scope="module", ids=["TinyLlama-1.1B-Chat"])
+@pytest.fixture(scope="module", ids=["Qwen3-0.6B"])
 def model_name():
-    return "llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
+    return "Qwen3/Qwen3-0.6B"
 
 
 @pytest.fixture(scope="module")

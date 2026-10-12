@@ -17,11 +17,25 @@
 #include "fmhaDispatcher.h"
 #include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
+#include "tensorrt_llm/common/envUtils.h"
 
 TRTLLM_NAMESPACE_BEGIN
 
 namespace kernels
 {
+
+namespace
+{
+// Persistent is the default for performance. TRTLLM_GEN_FMHA_CONTEXT_STATIC_TILE_SCHEDULER=1 selects the static
+// variant instead: the sm107 persistent context kernel can hang in a tcgen05 TMEM-dealloc guardrail trap
+// (observed with the MLA HQk192/HV128 SeparateQkv kernel on Kimi-K3 prefill). Kernel support check and launch
+// must agree on the scheduler, so both go through this helper.
+TileScheduler contextTileScheduler()
+{
+    return tensorrt_llm::common::getEnvUseStaticTileSchedulerForTrtllmGenContextFmha() ? TileScheduler::Static
+                                                                                       : TileScheduler::Persistent;
+}
+} // namespace
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -68,6 +82,14 @@ FmhaDispatcher::FmhaDispatcher(MHARunnerFixedParams fixedParams)
     }
     else
     {
+        // SageAttention sets different QK/V datatypes. Unlike trtllmGen, the fmha_v2 kernelMetaInfo
+        // carries one input datatype. Collapse pair to the composite type where it's registered.
+        if (mFixedParams.dataType == DATA_TYPE_INT8 && mFixedParams.dataTypeKv == DATA_TYPE_KV_INT8_E4M3)
+        {
+            mFixedParams.dataType = DATA_TYPE_KV_INT8_E4M3;
+            fixedParams.dataType = DATA_TYPE_KV_INT8_E4M3;
+        }
+
         TLLM_CHECK_WITH_INFO(mFixedParams.dataType == mFixedParams.dataTypeKv,
             "KV cache data type %s is not the same as input data type %s.",
             data_type_to_string(mFixedParams.dataTypeKv).c_str(), data_type_to_string(mFixedParams.dataType).c_str());
@@ -112,7 +134,7 @@ bool FmhaDispatcher::isSupported()
         tllmRunnerParams.mQkvLayout = qkvLayout;
         tllmRunnerParams.setAttentionMaskType(static_cast<std::int8_t>(mFixedParams.attentionMaskType));
         tllmRunnerParams.mKernelType = FmhaKernelType::Context;
-        tllmRunnerParams.mTileScheduler = TileScheduler::Persistent;
+        tllmRunnerParams.mTileScheduler = contextTileScheduler();
         tllmRunnerParams.mMultiCtasKvMode = false;
         tllmRunnerParams.mNumHeadsQ = mFixedParams.numQHeads;
         tllmRunnerParams.mNumHeadsKv = mFixedParams.numKvHeads;
@@ -153,6 +175,26 @@ bool FmhaDispatcher::isSupported()
     }
     else
     {
+        if (mFixedParams.sageBlockSizeQ > 0 || mFixedParams.sageBlockSizeK > 0 || mFixedParams.sageBlockSizeV > 0)
+        {
+            // This backend implements SageAttention on SM90 only, with one kernel, for block
+            // sizes (2, 16, 1) and separate Q/K/V.
+            int const sm = tensorrt_llm::common::getSMVersion();
+            if (sm != kSM_90)
+            {
+                TLLM_LOG_WARNING("fmha_v2 implements SageAttention on SM90 only, got sm_%d.", sm);
+                return false;
+            }
+            if (mFixedParams.sageBlockSizeQ != 2 || mFixedParams.sageBlockSizeK != 16
+                || mFixedParams.sageBlockSizeV != 1)
+            {
+                TLLM_LOG_WARNING(
+                    "SageAttention on SM90 supports exactly one block-size combination, (q, k, v) = (2, 16, 1), "
+                    "got (%d, %d, %d).",
+                    mFixedParams.sageBlockSizeQ, mFixedParams.sageBlockSizeK, mFixedParams.sageBlockSizeV);
+                return false;
+            }
+        }
         foundKernels = mFMHARunner->isFmhaSupported();
     }
     if (!foundKernels)
@@ -200,8 +242,8 @@ void FmhaDispatcher::run(MHARunnerParams runnerParams)
         tllmRunnerParams.mQkvLayout = qkvLayout;
         tllmRunnerParams.setAttentionMaskType(static_cast<std::int8_t>(mFixedParams.attentionMaskType));
         tllmRunnerParams.mKernelType = FmhaKernelType::Context;
-        // Always use persistent scheduler for better performance.
-        tllmRunnerParams.mTileScheduler = TileScheduler::Persistent;
+        // Persistent scheduler by default for better performance; see contextTileScheduler().
+        tllmRunnerParams.mTileScheduler = contextTileScheduler();
         tllmRunnerParams.mMultiCtasKvMode = false;
 
         tllmRunnerParams.qPtr = runnerParams.qPtr;

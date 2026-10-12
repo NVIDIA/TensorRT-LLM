@@ -133,6 +133,8 @@ class RankState:
     num_active_tokens: int = 0
     num_retiring_requests: int = 0
     iter_stats: RankIterStatsPayload = field(default_factory=RankIterStatsPayload)
+    num_context_requests: int = 0
+    num_generation_requests: int = 0
     num_connector_transfers: int = 0
     connector_poll_failed: bool = False
 
@@ -149,6 +151,8 @@ class RankState:
             self.num_active_tokens,
             self.num_retiring_requests,
             *self.iter_stats.serialize(),
+            self.num_context_requests,
+            self.num_generation_requests,
             self.num_connector_transfers,
             int(self.connector_poll_failed),
         ]
@@ -160,7 +164,7 @@ class RankState:
         rank_state_prefix_field_count = 4
         rank_state_fields = fields(cls)[:rank_state_prefix_field_count]
         stats_end = rank_state_prefix_field_count + len(fields(RankIterStatsPayload))
-        max_field_count = stats_end + 2
+        max_field_count = stats_end + 4
         if len(values) < 1:
             raise ValueError("RankState payload is missing required field rank")
         if len(values) > max_field_count:
@@ -183,9 +187,11 @@ class RankState:
             iter_stats=RankIterStatsPayload.deserialize(
                 values[rank_state_prefix_field_count:stats_end]
             ),
-            num_connector_transfers=values[stats_end] if len(values) > stats_end else 0,
-            connector_poll_failed=bool(values[stats_end + 1])
-            if len(values) > stats_end + 1
+            num_context_requests=values[stats_end] if len(values) > stats_end else 0,
+            num_generation_requests=values[stats_end + 1] if len(values) > stats_end + 1 else 0,
+            num_connector_transfers=values[stats_end + 2] if len(values) > stats_end + 2 else 0,
+            connector_poll_failed=bool(values[stats_end + 3])
+            if len(values) > stats_end + 3
             else False,
         )
 
@@ -297,6 +303,7 @@ class ADPRouter(ABC):
         active_requests: list[LlmRequest],
         new_requests: list[RequestQueueItem] | None = None,
         iter_stats_payload: RankIterStatsPayload | None = None,
+        forward_work: tuple[int, int] | None = None,
         num_connector_transfers: int = 0,
         connector_poll_failed: bool = False,
     ) -> list[RankState]:
@@ -309,6 +316,8 @@ class ADPRouter(ABC):
                 new-request info (e.g. KV-cache-aware routing).
             iter_stats_payload: Completed previous-iteration stats payload to
                 piggyback on this allgather, if one is pending.
+            forward_work: Context and generation work eligible before this
+                iteration polls transfers, used by conditional attention DP.
             num_connector_transfers: Owner-local transfers or completed loads
                 awaiting response delivery before their slots can be freed.
             connector_poll_failed: Whether the local completion poll failed;
@@ -323,6 +332,8 @@ class ADPRouter(ABC):
         local_state = self.create_rank_state(active_requests_for_overlap, new_requests or [])
         local_state.num_retiring_requests = num_retiring_requests
         local_state.copy_iter_stats_from(iter_stats_payload)
+        if forward_work is not None:
+            local_state.num_context_requests, local_state.num_generation_requests = forward_work
         local_state.num_connector_transfers = num_connector_transfers
         local_state.connector_poll_failed = connector_poll_failed
         responses = self.dist.tp_allgather(local_state.serialize())

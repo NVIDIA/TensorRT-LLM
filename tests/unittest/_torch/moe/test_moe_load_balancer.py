@@ -1,7 +1,12 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import os
 import unittest
+from collections.abc import Iterator
 from unittest.mock import MagicMock, patch
 
+import pytest
 import torch
 from mpi4py import MPI
 from transformers import PretrainedConfig
@@ -13,6 +18,7 @@ from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import (
     moe_load_balancer_add_single_layer)
 from tensorrt_llm.llmapi.llm_args import MoeLoadBalancerConfig
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
 
 class TestMoeLoadBalancer(unittest.TestCase):
@@ -77,29 +83,6 @@ class TestMoeLoadBalancer(unittest.TestCase):
                          mock_single_layer)
 
     @patch('tensorrt_llm.bindings.internal.runtime.MoeLoadBalancer')
-    def test_context_manager(self, mock_load_balancer_impl):
-        """Test MoeLoadBalancer as a context manager."""
-
-        torch.cuda.set_device(0)
-
-        # Setup
-        ep_rank = 0
-        ep_size = 4
-        layer_updates_per_iter = 2
-
-        # Exercise & Verify
-        # Before entering context
-        self.assertIsNone(get_moe_load_balancer())
-
-        with MoeLoadBalancer(ep_rank, ep_size,
-                             layer_updates_per_iter) as balancer:
-            # Inside context
-            self.assertEqual(get_moe_load_balancer(), balancer)
-
-        # After exiting context
-        self.assertIsNone(get_moe_load_balancer())
-
-    @patch('tensorrt_llm.bindings.internal.runtime.MoeLoadBalancer')
     def test_nested_context_managers(self, mock_load_balancer_impl):
         """Test nested MoeLoadBalancer context managers."""
 
@@ -110,7 +93,9 @@ class TestMoeLoadBalancer(unittest.TestCase):
         inner_balancer = MoeLoadBalancer(1, 4, 2)
 
         # Exercise & Verify
-        with outer_balancer:
+        self.assertIsNone(get_moe_load_balancer())
+        with outer_balancer as active_balancer:
+            self.assertIs(active_balancer, outer_balancer)
             self.assertEqual(get_moe_load_balancer(), outer_balancer)
 
             with inner_balancer:
@@ -466,6 +451,116 @@ class TestMoeLoadBalancer(unittest.TestCase):
         finally:
             # Clean up
             balancer.shutdown()
+
+
+@pytest.fixture
+def mock_runtime() -> Iterator[MagicMock]:
+    shared_comm = MagicMock()
+    shared_comm.Get_rank.return_value = 1
+    shared_comm.Get_size.return_value = 4
+    with (
+            patch("tensorrt_llm.bindings.internal.runtime.MoeLoadBalancer") as
+            runtime,
+            patch.object(
+                MoeLoadBalancer,
+                "_setup_mpi_comm",
+                lambda self: setattr(self, "shared_mpi_comm", shared_comm),
+            ),
+    ):
+        yield runtime
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("updates", [0, 2])
+def test_nemotron_vl_decoder_inherits_eplb_and_registers_moe(
+        updates: int, mock_runtime: MagicMock) -> None:
+    from tensorrt_llm._torch.models.modeling_nemotron_h_multimodal import \
+        NemotronHMultimodalModel
+    from tensorrt_llm._torch.moe.fused_moe import (RenormalizeMoeRoutingMethod,
+                                                   SimpleActivation)
+    from tensorrt_llm._torch.moe.fused_moe.configurable_moe import \
+        ConfigurableMoE
+    from tensorrt_llm._torch.moe.fused_moe.fused_moe_cutlass import \
+        CutlassFusedMoE
+    from tensorrt_llm._torch.utils import ActivationType
+
+    text_config = PretrainedConfig(architectures=["NemotronHForCausalLM"],
+                                   vocab_size=32)
+    model_config = ModelConfig(
+        pretrained_config=PretrainedConfig(
+            architectures=["NemotronH_Omni_Reasoning_V3"],
+            llm_config=text_config,
+            img_context_token_id=1,
+            video_context_token_id=2,
+            sound_config=None,
+        ),
+        mapping=Mapping(world_size=4,
+                        rank=1,
+                        tp_size=4,
+                        moe_ep_size=4,
+                        enable_attention_dp=True),
+        quant_config=QuantConfig(quant_algo=QuantAlgo.W4A16_NVFP4),
+        moe_backend="CUTLASS",
+        moe_load_balancer=MoeLoadBalancerConfig(num_slots=16,
+                                                layer_updates_per_iter=updates),
+        skip_create_weights_in_init=True,
+    )
+
+    def create_decoder(decoder_config: ModelConfig) -> torch.nn.Module:
+        assert decoder_config.pretrained_config.architectures == [
+            "NemotronHForCausalLM"
+        ]
+        assert decoder_config.moe_load_balancer is not model_config.moe_load_balancer
+        assert decoder_config.moe_load_balancer.num_local_slots == 4
+        assert decoder_config.moe_load_balancer.slot_start == 4
+        assert decoder_config.moe_load_balancer.slot_end == 8
+        assert get_moe_load_balancer() is balancer
+        decoder = torch.nn.Module()
+        decoder.config = decoder_config.pretrained_config
+        decoder.moe = ConfigurableMoE(
+            routing_method=RenormalizeMoeRoutingMethod(top_k=2),
+            num_experts=8,
+            hidden_size=128,
+            intermediate_size=128,
+            dtype=torch.bfloat16,
+            model_config=decoder_config,
+            moe_cls=CutlassFusedMoE,
+            activation=SimpleActivation(ActivationType.Relu2),
+            layer_idx=0,
+        )
+        return decoder
+
+    with (
+            patch("torch.cuda.Stream"),
+            patch("torch.cuda.Event"),
+            patch("tensorrt_llm._torch.distributed.AllReduce",
+                  return_value=torch.nn.Identity()),
+            patch.object(ConfigurableMoE,
+                         "_create_comm_strategy_auto",
+                         return_value=None),
+            patch(
+                "tensorrt_llm._torch.models.modeling_nemotron_h_multimodal."
+                "AutoModelForCausalLM.from_config",
+                side_effect=create_decoder,
+            ) as decoder_factory,
+            maybe_create_moe_load_balancer(model_config, model_config.mapping)
+            as balancer,
+    ):
+        try:
+            model = NemotronHMultimodalModel(model_config)
+            decoder_factory.assert_called_once()
+            mock_runtime.return_value.add_layer.assert_called_once_with(8, 2, 4)
+            assert len(balancer.single_layer_load_balancers) == 1
+            layer_balancer = balancer.single_layer_load_balancers[0]
+            assert model.llm.moe.layer_load_balancer is layer_balancer
+            assert model.llm.moe.backend.layer_load_balancer is layer_balancer
+            assert model.llm.moe.backend.expert_size_per_partition == 4
+            assert model.llm.moe.backend.initial_local_expert_ids == [
+                2, 3, 4, 5
+            ]
+        finally:
+            balancer.shutdown()
+    assert get_moe_load_balancer() is None
 
 
 if __name__ == '__main__':

@@ -26,8 +26,8 @@ from tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector import (
     SchedulerOutput,
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
-from tensorrt_llm.bindings import LlmRequestState
 from tensorrt_llm.llmapi.llm_args import KvCacheConnectorConfig
 
 if TYPE_CHECKING:
@@ -82,6 +82,7 @@ def _configure_recovery_controls(executor: "PyExecutor") -> None:
     executor.dist = MagicMock(tp_size=1, cp_size=1, pp_size=1)
     executor.enable_attention_dp = True
     executor.kv_connector_manager = None
+    executor._is_kv_manager_v2 = False
     executor._kv_connector_failed = False
     executor._kv_connector_has_pending = False
     executor.active_requests = []
@@ -1303,7 +1304,12 @@ def test_rank_state_preserves_transfer_snapshot_and_old_payloads() -> None:
 
     stats = RankIterStatsPayload(has_iter_stats=1, num_context_requests=3, num_gen_kv_tokens=123)
     state = RankState(
-        rank=1, iter_stats=stats, num_connector_transfers=2, connector_poll_failed=True
+        rank=1,
+        iter_stats=stats,
+        num_context_requests=5,
+        num_generation_requests=7,
+        num_connector_transfers=2,
+        connector_poll_failed=True,
     )
     assert RankState.deserialize(state.serialize()) == state
     old_state = RankState.deserialize(state.serialize()[:-2])
@@ -1559,3 +1565,40 @@ def test_prefix_load_recovery_lifetime(
             else:
                 assert batch.context_requests == [request]
                 executor.resource_manager.prepare_resources.assert_called_once_with(batch)
+
+
+@pytest.mark.parametrize("peer_has_work", [False, True])
+def test_phase_idle_connector_owner_joins_ready_peer(peer_has_work: bool) -> None:
+    """A phase-idle row can join compute, but an all-idle fleet cannot."""
+    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+
+    collective = _OwnerCollective()
+    executors = []
+    batches = []
+    for rank in range(2):
+        executor = object.__new__(PyExecutor)
+        _configure_recovery_controls(executor)
+        executor._enable_remote_tail_adp = True
+        executor.model_engine = SimpleNamespace(
+            cuda_graph_runner=SimpleNamespace(padding_dummy_requests={0: object()})
+        )
+        executor.kv_connector_manager = _manager(rank)
+        executor.dist.tp_size = 2
+        executor.dist.tp_allgather_int64.side_effect = partial(collective.gather_int64, rank)
+        batch = ScheduledRequests()
+        if rank == 0 and peer_has_work:
+            batch.context_requests_last_chunk = [_request(10)]
+        else:
+            batch.is_attention_dp_phase_idle = True
+        # The owner is restoring a request excluded from this iteration's phase.
+        # It must not wait for the restore before joining a ready peer's forward.
+        executor._kv_connector_prepare_batch = MagicMock(return_value=[_request(20 + rank)])
+        executors.append(executor)
+        batches.append(batch)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(e._kv_connector_start_batch, b) for e, b in zip(executors, batches)]
+        results = [future.result(timeout=10) for future in futures]
+    assert results == [(peer_has_work, peer_has_work), (peer_has_work, False)]
+    for executor in executors:
+        executor.dist.tp_allgather_int64.assert_called_once()

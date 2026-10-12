@@ -141,6 +141,12 @@ if(NOT INTERNAL_CUTLASS_KERNELS_PATH)
 endif()
 
 add_subdirectory(common)
+
+add_library(ipc_nvls_memory_src STATIC runtime/ipcNvlsMemory.cu)
+set_target_properties(
+  ipc_nvls_memory_src PROPERTIES POSITION_INDEPENDENT_CODE ON
+                                 CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+
 add_subdirectory(kernels)
 add_subdirectory(runtime)
 

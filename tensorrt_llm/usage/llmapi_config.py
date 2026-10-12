@@ -31,7 +31,7 @@ from pydantic import BaseModel
 from tensorrt_llm.usage.config import TelemetryField
 
 CAPTURE_VERSION = "2"
-FIELD_POLICY_VERSION = "3"
+FIELD_POLICY_VERSION = "4"
 API_CONTRACT_VERSION = "0.2.0"
 CAPTURE_SOURCE = "effective_validated_llm_args"
 
@@ -134,9 +134,9 @@ class _CapturePolicy:
 
 @dataclass(frozen=True)
 class _PolicyVariant:
-    """Policy for a field as declared by one reachable model arm."""
+    """Leaf policy and exact model/container route that authorizes its capture."""
 
-    owner: type[BaseModel]
+    route: tuple[type, ...]
     policy: _CapturePolicy
 
 
@@ -344,29 +344,36 @@ def _policy_kind(policy: _CapturePolicy) -> str:
     return "value"
 
 
-def _nested_models(annotation: Any) -> list[type]:
-    """Every BaseModel reachable in an annotation tree.
+def _nested_model_routes(annotation: Any) -> list[tuple[type, ...]]:
+    """Reachable models through unions/lists, excluding tuple, set and dict containers."""
+    out: list[tuple[type, ...]] = []
 
-    Covers Optional / Union / discriminated-union arms / list|tuple|set element
-    types. dict is NOT traversed (keys/values are not captured).
-    """
-    out: list[type] = []
-
-    def rec(ann: Any) -> None:
+    def rec(ann: Any, containers: tuple[type, ...]) -> None:
         ann = _unwrap_annotated(ann)
         if isinstance(ann, type) and issubclass(ann, BaseModel):
-            out.append(ann)
+            route = (*containers, ann)
+            if route not in out:
+                out.append(route)
             return
-        if _is_union(ann) or get_origin(ann) in {list, tuple, set}:
+        origin = get_origin(ann)
+        if _is_union(ann):
             for arg in get_args(ann):
-                rec(arg)
+                rec(arg, containers)
+        elif origin is list:
+            for arg in get_args(ann):
+                rec(arg, (*containers, origin))
 
-    rec(annotation)
-    deduped: list[type] = []
-    for m in out:
-        if m not in deduped:
-            deduped.append(m)
-    return deduped
+    rec(annotation, ())
+    return out
+
+
+def _projected_policy(variant: _PolicyVariant) -> _CapturePolicy:
+    """Describe the wire value, including containers enclosing the leaf owner."""
+    policy = variant.policy
+    for step in reversed(variant.route):
+        if step is list:
+            policy = _CapturePolicy("sequence", runtime_type=step, branches=(policy,))
+    return policy
 
 
 def build_capture_manifest(model_cls: type[BaseModel]) -> list[_ManifestEntry]:
@@ -375,16 +382,17 @@ def build_capture_manifest(model_cls: type[BaseModel]) -> list[_ManifestEntry]:
     The single source of truth. Type-safe annotations auto-enroll; str/Any
     allowlist escape hatches opt in; telemetry=False opts out. Recurses into
     statically reachable nested BaseModels with a cycle guard. Collapses
-    duplicate keys shared by nested model union arms while retaining an
-    owner-specific compiled policy for every arm. Display domains and capture
+    duplicate keys shared by nested model union arms while retaining a
+    route-specific compiled policy for every arm. Display domains and capture
     types are merged, but runtime sanitization selects only the active arm's
     policy. Conflicting kinds fail manifest construction.
     """
     rows: list[dict[str, Any]] = []
 
-    def walk(cls: type, prefix: str, stack: tuple) -> None:
-        if cls in stack:
+    def walk(cls: type, prefix: str, route: tuple[type, ...]) -> None:
+        if cls in route:
             return
+        route = (*route, cls)
         for fname, finfo in cls.model_fields.items():
             key = f"{prefix}.{fname}" if prefix else fname
             ann = finfo.annotation
@@ -396,17 +404,19 @@ def build_capture_manifest(model_cls: type[BaseModel]) -> list[_ManifestEntry]:
                 rows.append(
                     {
                         "key": key,
-                        "owner": cls,
+                        "route": route,
                         "policy": policy,
                         "kind": _policy_kind(policy),
                     }
                 )
-            for sub in _nested_models(ann):
-                walk(sub, key, (*stack, cls))
+            for sub_route in _nested_model_routes(ann):
+                walk(sub_route[-1], key, (*route, *sub_route[:-1]))
 
     walk(model_cls, "", ())
 
-    rows.sort(key=lambda r: (r["key"], r["owner"].__module__, r["owner"].__qualname__))
+    rows.sort(
+        key=lambda r: (r["key"], tuple((step.__module__, step.__qualname__) for step in r["route"]))
+    )
     grouped: dict[str, dict[str, Any]] = {}
     for r in rows:
         key = r["key"]
@@ -418,15 +428,9 @@ def build_capture_manifest(model_cls: type[BaseModel]) -> list[_ManifestEntry]:
                 f"across model arms: {grouped[key]['kind']} vs {r['kind']}"
             )
         variants: list[_PolicyVariant] = grouped[key]["variants"]
-        matching = [variant for variant in variants if variant.owner is r["owner"]]
-        if matching:
-            if any(_policy_key(variant.policy) != _policy_key(r["policy"]) for variant in matching):
-                raise ValueError(
-                    f"telemetry manifest: key '{key}' has conflicting policies "
-                    f"for model arm {r['owner'].__qualname__}"
-                )
-            continue
-        variants.append(_PolicyVariant(owner=r["owner"], policy=r["policy"]))
+        if any(variant.route == r["route"] for variant in variants):
+            raise ValueError(f"telemetry manifest: key '{key}' has a duplicate model route")
+        variants.append(_PolicyVariant(route=r["route"], policy=r["policy"]))
 
     entries = []
     for key, group in grouped.items():
@@ -434,8 +438,9 @@ def build_capture_manifest(model_cls: type[BaseModel]) -> list[_ManifestEntry]:
         allowed_values: list[Any] = []
         capture_types: set[str] = set()
         for variant in variants:
-            allowed_values.extend(_policy_allowed_values(variant.policy))
-            capture_types.update(_policy_capture_types(variant.policy))
+            policy = _projected_policy(variant)
+            allowed_values.extend(_policy_allowed_values(policy))
+            capture_types.update(_policy_capture_types(policy))
         entries.append(
             _ManifestEntry(
                 path=key,
@@ -565,34 +570,74 @@ def _schema_digest(model_cls: type[BaseModel]) -> str:
     return _digest({"class": model_cls.__name__, "fields": schema_fields})
 
 
-def _resolve_path(instance: BaseModel, path: str) -> tuple[bool, Any, BaseModel | None]:
-    """Resolve a dotted manifest path against a live instance.
+def _capture_path(
+    instance: BaseModel, entry: _ManifestEntry, state: _CaptureState
+) -> tuple[bool, bool, Any]:
+    """Return (present, safe, value) for a manifest path, projecting model lists.
 
-    Returns (present, value, leaf owner). Skips when a parent segment is
-    missing/None or is not a pydantic model (unset config, or a union arm that
-    is not active). The owner selects that arm's compiled capture policy.
+    Every model and container must match a compiled route. List projections
+    preserve positions: an absent, excluded or unsafe element omits the whole
+    field instead of shortening it or fabricating nulls. Empty lists are
+    captured as [], and nullable *leaf* values still follow their own policy.
+    Missing optional models skip the field without counting as unsafe values.
     """
-    segments = path.split(".")
-    obj: Any = instance
-    for seg in segments[:-1]:
-        if not _is_pydantic_model(obj):
-            return False, None, None
-        if seg not in obj.__class__.model_fields:
-            return False, None, None
-        obj = getattr(obj, seg, None)
-        if obj is None:
-            return False, None, None
-    leaf = segments[-1]
-    if not _is_pydantic_model(obj) or leaf not in obj.__class__.model_fields:
-        return False, None, None
-    return True, getattr(obj, leaf, None), obj
+    segments = entry.path.split(".")
+    field_state = _CaptureState()
 
+    def list_item_annotations(annotation: Any) -> tuple[Any, ...]:
+        annotation = _unwrap_annotated(annotation)
+        if _is_union(annotation):
+            return tuple(
+                item for branch in get_args(annotation) for item in list_item_annotations(branch)
+            )
+        return get_args(annotation) if get_origin(annotation) is list else ()
 
-def _policy_for_owner(entry: _ManifestEntry, owner: BaseModel) -> _CapturePolicy | None:
-    return next(
-        (variant.policy for variant in entry.variants if type(owner) is variant.owner),
-        None,
-    )
+    def visit(
+        value: Any,
+        variants: tuple[_PolicyVariant, ...],
+        route_index: int,
+        segment_index: int,
+        annotations: tuple[Any, ...],
+    ) -> tuple[bool, bool, Any]:
+        if value is None and any(_annotation_allows_none(ann) for ann in annotations):
+            return False, True, None
+        matching = tuple(
+            variant for variant in variants if variant.route[route_index] is type(value)
+        )
+        if not matching:
+            return False, False, None
+        if type(value) is list:
+            projected = []
+            complete = True
+            item_annotations = tuple(
+                item for ann in annotations for item in list_item_annotations(ann)
+            )
+            for item in value:
+                present, safe, captured = visit(
+                    item, matching, route_index + 1, segment_index, item_annotations
+                )
+                if not safe:
+                    return True, False, None
+                complete &= present
+                projected.append(captured)
+            if not complete:
+                return False, True, None
+            if len(projected) > MAX_SEQ_ITEMS:
+                projected = projected[:MAX_SEQ_ITEMS]
+                field_state.sequence_truncated = True
+            return True, True, projected
+
+        field_value = getattr(value, segments[segment_index], None)
+        if segment_index == len(segments) - 1:
+            safe, captured = _sanitize_policy(field_value, matching[0].policy, field_state)
+            return True, safe, captured
+        annotation = type(value).model_fields[segments[segment_index]].annotation
+        return visit(field_value, matching, route_index + 1, segment_index + 1, (annotation,))
+
+    present, safe, captured = visit(instance, entry.variants, 0, 0, (type(instance),))
+    if present and safe:
+        state.sequence_truncated |= field_state.sequence_truncated
+    return present, safe, captured
 
 
 def _truncate_to_budget(values: dict[str, Any]) -> tuple[dict[str, Any], str]:
@@ -647,13 +692,9 @@ def collect_llm_api_config_payloads(llm_args: Any) -> tuple[str, str]:
         entries = build_capture_manifest(cls)
         state = _CaptureState()
         for entry in entries:
-            present, value, owner = _resolve_path(llm_args, entry.path)
-            if not present or owner is None:
+            present, is_safe, sanitized = _capture_path(llm_args, entry, state)
+            if not present:
                 continue
-            policy = _policy_for_owner(entry, owner)
-            if policy is None:
-                continue
-            is_safe, sanitized = _sanitize_policy(value, policy, state)
             if is_safe:
                 state.values[entry.path] = sanitized
             else:
