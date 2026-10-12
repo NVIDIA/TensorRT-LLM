@@ -148,7 +148,7 @@ From this block a factory decides what the method needs and checks that the rest
 
 - **Modules to engage**: cold-page compression plugs a codec into the page migration of the KV cache manager (KVCacheManagerV2, V2 from here on); TriAttention registers in the executor loop.
 - **Compatibility**: a method declares whether block reuse stays valid and which speculative decoding modes it supports. Both methods keep block reuse; TriAttention supports speculative decoding only in `union` mode, and both methods only with one-model MTP or EAGLE3.
-- **Platform**: both methods need Blackwell-class GPUs and the C++ V2 backend.
+- **Platform**: both methods need Blackwell-class GPUs; cold-page compression also needs the C++ V2 backend.
 
 An unsupported combination is rejected with a clear message. Otherwise the factory builds the compression manager, which binds to V2 after V2 is built. V2 keeps the pages, the tiers and the migration between them, and the attention backend is not touched. For the interfaces involved, see the [KV cache compression development guide](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/developer-guide/kv-cache-compression-development.md).
 
