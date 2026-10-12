@@ -999,6 +999,20 @@ def _augment_tokens_with_contiguous_mm_metadata(
     return result
 
 
+def _effective_partial_reuse(requested: bool, supported: bool, manager_name: str) -> bool:
+    """Resolve ``enable_partial_reuse`` against a manager's support for it."""
+    if requested and not supported:
+        logger.warning(
+            f"{manager_name} does not support partial-block reuse; forcing "
+            f"enable_partial_reuse=False. Full-block reuse is unaffected. This "
+            f"manager has pools that are not addressed at tokens_per_block token "
+            f"granularity, so a prefix stopping mid-block would inherit boundary "
+            f"rows computed from tokens that prefix does not contain."
+        )
+        return False
+    return requested
+
+
 def _locate_accepted_draft_tokens(requests: List[LlmRequest]):
     num_accepted_draft_tokens = []
     accepted_draft_tokens_indices = []
@@ -1228,6 +1242,19 @@ class KVCacheManagerV2(BaseResourceManager):
     # Read by KvCacheCreator: a subclass that overrides the context
     # commit/history protocol opts out of generic reuse-match backoff.
     _supports_reuse_match_backoff = True
+    # A subclass whose pools are not all addressed at `tokens_per_block` token
+    # granularity opts out of *partial*-block reuse. Full-block reuse stays on.
+    #
+    # Partial reuse hands a sequence a prefix that stops mid-block. That is sound
+    # only if every pool of that layer maps token i to a fixed slot derivable from
+    # i alone. A pool holding one row per N tokens, or one row pooled *over* a
+    # window of tokens, does not: its boundary row is a function of tokens the
+    # matched prefix does not include, so the new sequence inherits a row that was
+    # computed from a longer sequence than its own. Nothing raises -- the row is
+    # well-formed, just not the row this sequence would have produced -- so the
+    # symptom is a small perturbation that flips an argmax a couple of steps into
+    # decode, which reads as ordinary sampling variation rather than as a bug.
+    _supports_partial_reuse = True
 
     def __init__(
         self,
@@ -1392,6 +1419,11 @@ class KVCacheManagerV2(BaseResourceManager):
         self.reuse_match_backoff = draft_prompt_lookahead(spec_config) or 0
         if not self._supports_reuse_match_backoff:
             self.reuse_match_backoff = 0
+        self.enable_partial_reuse = _effective_partial_reuse(
+            kv_cache_config.enable_partial_reuse,
+            self._supports_partial_reuse,
+            type(self).__name__,
+        )
         # Mirror V1's KV reserve sizing (see V1 __init__ for rationale).
         self._kv_reserve_draft_tokens, self._generation_kv_capacity_headroom = (
             _get_generation_kv_capacity(spec_config, is_draft=self.is_draft)
@@ -1580,12 +1612,20 @@ class KVCacheManagerV2(BaseResourceManager):
         logger.info(f"KV cache manager v2 device quota set to {quota / (1 << 30)}GiB")
 
         cache_tiers: List[CacheTierConfig] = [GpuCacheTierConfig(quota=int(quota))]
-        if kv_connector_manager is not None and kv_cache_config.host_cache_size is None:
+        # A capacity-only connector registers nothing for migration to
+        # invalidate, so it keeps the tier the scheduler spills to. The
+        # rejection of non-GPU tiers in `PyExecutor` exempts it to match.
+        connector_registers_pages = (
+            kv_connector_manager is not None and not kv_connector_manager.capacity_only
+        )
+        if connector_registers_pages and kv_cache_config.host_cache_size is None:
             # A connector holds device addresses for its pages, and evicting a
             # page to another tier reassigns its GPU slot underneath it. The
             # automatic host tier only exists to give MAX_UTILIZATION somewhere
             # to spill to, which a connector run never uses, so drop it here; an
             # explicitly configured host_cache_size is rejected at bring-up.
+            # Without a tier to spill to, suspension frees nothing and pages
+            # are reclaimed by preemption instead; see preempt_request.
             host_quota = 0
             logger.info(
                 "KV cache manager v2 host tier disabled: a KV connector is attached "
@@ -1840,7 +1880,6 @@ class KVCacheManagerV2(BaseResourceManager):
             self.max_blocks_per_seq = ((self.max_blocks_per_seq + 3) // 4) * 4
 
         self.enable_block_reuse = kv_cache_config.enable_block_reuse
-        self.enable_partial_reuse = kv_cache_config.enable_partial_reuse
         self.disk_prefetch_num_reqs = kv_cache_config.disk_prefetch_num_reqs
         enable_conversation_manager = (
             self.enable_block_reuse
@@ -1908,6 +1947,9 @@ class KVCacheManagerV2(BaseResourceManager):
             index_mapper_capacity, max_beam_width, self.max_copy_beam_width
         )
         self._early_freed_index_requests: set[int] = set()
+        # Requests whose pages a connector is still reading from, so the
+        # release half of `preempt_request` has to wait.
+        self._pending_preemption: Dict[int, LlmRequest] = {}
         self._prepare_page_table_tensor(index_mapper_capacity)
         self._sparse_layer_group_ids = tuple(
             sorted(
@@ -2998,7 +3040,12 @@ class KVCacheManagerV2(BaseResourceManager):
             typical_step=typical_step,
             constraints=constraints,
             max_util_for_resume=kv_cache_config.max_util_for_resume,
-            enable_partial_reuse=kv_cache_config.enable_partial_reuse,
+            # self, not kv_cache_config: __init__ may have forced this off for a
+            # manager whose pools cannot take a mid-block prefix. Re-reading the
+            # config here would let the two predicates drift and hand the backend
+            # the unsound setting anyway -- the same reason `reuse_match_backoff`
+            # below is read off self.
+            enable_partial_reuse=self.enable_partial_reuse,
             # Partial commit hands the prompt's trailing partial block to the
             # radix tree and canonicalizes it to beam 0, but that block is
             # exactly where the beams diverge and each needs its own writable
@@ -3644,17 +3691,27 @@ class KVCacheManagerV2(BaseResourceManager):
             index = self.index_mapper.get_index(request_id)
             self.sparse_metadata_batch.add(kv_cache, index)
 
-    def _resume_and_restore(self, req_id: int, kv_cache) -> bool:
+    def _resume_and_restore(self, req_id: int, kv_cache, optional_reuse_groups=None) -> bool:
         """Resume a suspended KV cache and restore its page index buffers.
 
         Returns True if the cache is (or becomes) active, False on failure.
         """
         if kv_cache.is_active:
             return True
-        if not kv_cache.resume(self._stream.cuda_stream):
+        if not (
+            kv_cache.resume(self._stream.cuda_stream)
+            if optional_reuse_groups is None
+            else kv_cache.resume(
+                self._stream.cuda_stream, optional_reuse_groups=optional_reuse_groups
+            )
+        ):
             return False
         self._restore_page_index_bufs(req_id, kv_cache)
         return True
+
+    def _resume_context_cache(self, req: LlmRequest, kv_cache: _KVCache) -> bool:
+        """Resume context pages; subclasses may select model-specific reuse groups."""
+        return self._resume_and_restore(req.py_request_id, kv_cache)
 
     def _context_reuse_tokens(
         self, req: LlmRequest, reuse_limit: int | None = None
@@ -3762,7 +3819,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 # Connector loads need persistent destination pages; scratch
                 # slots are reserved for local prefill.
                 kv_cache.enable_swa_scratch_reuse = False
-            if not self._resume_and_restore(req.py_request_id, kv_cache):
+            if not self._resume_context_cache(req, kv_cache):
                 return None
             return kv_cache.num_committed_tokens
 
@@ -3772,9 +3829,13 @@ class KVCacheManagerV2(BaseResourceManager):
         assert kv_cache is not None, (
             f"KV cache missing for non-first context chunk, request {req.py_request_id}"
         )
-        if not self._resume_and_restore(req.py_request_id, kv_cache):
+        if not self._resume_context_cache(req, kv_cache):
             return None
         return kv_cache.num_committed_tokens
+
+    def context_replay_tokens(self, req: LlmRequest) -> int | None:
+        """Pending recovery rows fixed at resume; None keeps ordinary budgeting."""
+        return None
 
     def prepare_context(self, req: LlmRequest) -> bool:
         """Create/resume the cache and expose local or reserved reuse before budgeting."""
@@ -3905,12 +3966,18 @@ class KVCacheManagerV2(BaseResourceManager):
         # reuse (which may leave a non-zero context_current_position).
         # Helix requests carry the rank-local strided slice in prompt_len;
         # the global ledger sizes off the full prompt instead.
+        remote_tail_start = getattr(req, "py_csa2_remote_tail_start", None)
+        history_len = (
+            remote_tail_start
+            if remote_tail_start is not None
+            else (req.total_input_len_cp if self._has_cp_helix else req.prompt_len)
+        )
         prompt_len = req.total_input_len_cp if self._has_cp_helix else req.prompt_len
         target = prompt_len + get_draft_token_length(req) + self.num_extra_kv_tokens
         capacity = max(kv_cache.capacity, target)
         pre_cap = kv_cache.capacity
 
-        success = kv_cache.resize(capacity, prompt_len)
+        success = kv_cache.resize(capacity, history_len)
         if not success:
             if req.is_first_context_chunk:
                 kv_cache.suspend()
@@ -4000,28 +4067,82 @@ class KVCacheManagerV2(BaseResourceManager):
         """True when a suspended page has somewhere to be evicted to."""
         return len(self.impl.cache_tier_list) > 1
 
+    def has_pending_preemption(self) -> bool:
+        """True while a deferred preemption is still waiting on a connector."""
+        return bool(self._pending_preemption)
+
+    def is_preemption_pending(self, req: LlmRequest) -> bool:
+        """True while *req* is parked mid-preemption waiting on a connector.
+
+        `preempt_request` parks the victim in the state the finish path uses,
+        which `LlmRequest.isFinished` reports as finished. That keeps it out of
+        the schedulable range, but a caller reading the state as "done
+        generating", the response path in particular, has to ask here instead,
+        since this request is going to run again.
+        """
+        return req.py_request_id in self._pending_preemption
+
     def preempt_request(self, req: LlmRequest) -> bool:
         """Give up *req*'s KV cache so its pages can be reclaimed.
 
         Unlike :meth:`suspend_request` this does not keep the pages. Closing
         the request's `_KVCache` returns its committed blocks to the radix tree
         as reusable prefix and leaves their pages `DROPPABLE`, which is
-        evictable at every level, unlike `HELD`. The data is not thrown away:
-        it stays resident and locally matchable until something else needs the
-        space.
+        evictable at every level unlike `HELD`, so the data stays resident and
+        locally matchable until something else needs the space.
 
-        The request is reset to context state by the caller and re-prefills
+        The caller resets the request to context state, and it re-prefills
         whatever it can no longer match.
 
-        Returns whether the pages were released. Callers must check: pages
-        still being read out of, such as by a connector save in flight, are
-        not released until that completes.
+        Returns whether the pages were released. Pages a connector save is
+        still reading out of are not released until that completes, since
+        freeing them would let a later request overwrite the bytes mid-transfer
+        and publish them under a valid hash. Callers must not count on the
+        pages until :meth:`try_complete_preemption` has run.
         """
+        # A capacity-only connector has no save to wait for, so the victim's
+        # pages go back now, without the page index gather below.
+        if (
+            self.kv_connector_manager is None
+            or self.is_draft
+            or self.kv_connector_manager.capacity_only
+        ):
+            self._release_preempted(req)
+            return True
+
+        by_layer_group = self.get_page_indices_by_layer_group(req)
+        cache_block_ids = by_layer_group[0] if len(by_layer_group) == 1 else []
+        # The same handshake the finish path uses: the request lands in
+        # DISAGG_CONTEXT_TRANS_IN_PROGRESS, out of the schedulable range, and
+        # keeps holding its pages until every rank reports the save retired.
+        if self.kv_connector_manager.request_finished(req, cache_block_ids, by_layer_group):
+            self._pending_preemption[req.py_request_id] = req
+            return False
+
+        self._release_preempted(req)
+        return True
+
+    def try_complete_preemption(self, req: LlmRequest) -> bool:
+        """Release pages for a request whose deferred preemption just cleared.
+
+        Returns False when *req* was not awaiting preemption, which is how a
+        caller tells a preempted request apart from an ordinary finished one in
+        the connector's `get_finished` output.
+        """
+        if self._pending_preemption.pop(req.py_request_id, None) is None:
+            return False
         self._release_preempted(req)
         return True
 
     def _release_preempted(self, req: LlmRequest) -> None:
         self.free_resources(req)
+        # Ask the connector again on re-admission rather than reusing the
+        # memoised offer, since the store now has more of this prefix than it
+        # did when the request was first admitted.
+        req.py_connector_prefix_start = None
+        req.py_connector_prefix_end = None
+        req.py_connector_load_async = False
+        req.py_connector_delivered = False
         req.py_num_connector_matched_tokens = 0
 
     def admit_mirror(self, req: LlmRequest) -> bool:
@@ -4128,7 +4249,10 @@ class KVCacheManagerV2(BaseResourceManager):
         # KV pages are allocated in `KVCacheV2Scheduler`, so by this point every
         # scheduled request already has them and its page indices are readable.
         # That is what makes this the place to drive the connector.
-        if self.kv_connector_manager is not None:
+        #
+        # A capacity-only connector cannot reach those pages, so reporting them
+        # would cost a page index gather per context request for nothing.
+        if self.kv_connector_manager is not None and not self.kv_connector_manager.capacity_only:
             self._run_kv_connector_hooks(scheduled_batch)
         self._publish_sparse_metadata()
 
@@ -4291,6 +4415,10 @@ class KVCacheManagerV2(BaseResourceManager):
     def _connector_may_serve(self, req: LlmRequest) -> bool:
         """Whether the connector is allowed to serve a prefix for ``req``."""
         if self.kv_connector_manager is None or self.is_draft:
+            return False
+        if self.kv_connector_manager.capacity_only:
+            # It can serve nothing, so both the reservation path and the
+            # query-and-commit path would run over an empty offer.
             return False
         if req.is_dummy:
             # A dummy request has no prompt to serve.
@@ -5504,6 +5632,10 @@ class KVCacheManagerV2(BaseResourceManager):
         self._early_freed_index_requests.add(request_id)
 
     def free_resources(self, request: LlmRequest, pin_on_release: bool = False):
+        # A request awaiting preemption can still be cancelled or fail while
+        # its saves drain, and a dead entry here would block every later
+        # preemption through has_pending_preemption.
+        self._pending_preemption.pop(request.py_request_id, None)
         if self.kv_connector_manager is not None and not self.is_draft:
             self.kv_connector_manager.release_unstarted_prefix_loads(request)
             if self.kv_connector_manager.has_pending_load(request):
