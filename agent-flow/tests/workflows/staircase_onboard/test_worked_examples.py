@@ -25,13 +25,18 @@ PACKAGE = Path(task_schema.__file__).parent
 EXAMPLES = sorted((PACKAGE / "examples").glob("*.md"))
 YAML_BLOCK = re.compile(r"```yaml\n(.*?)```", re.S)
 
-#: What a role is handed or can be pointed at by the run itself.
+#: What a role is handed or can be pointed at by the run itself, and the
+#: documents the package ships beside it.
 ROLE_FACING = (
     *sorted((PACKAGE / "skills").rglob("*.md")),
     PACKAGE / "runtime_index.yaml",
     PACKAGE / "kernel_sources.yaml",
     PACKAGE / "task.example.yaml",
     *sorted((PACKAGE / "prompts").glob("*.py")),
+    PACKAGE / "README.md",
+    PACKAGE / "LESSONS.md",
+    PACKAGE / "TROUBLESHOOTING.md",
+    PACKAGE / "BUILD_AND_TEST.md",
 )
 
 #: Identifiers of the checkpoints the worked examples describe.

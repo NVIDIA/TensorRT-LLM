@@ -145,8 +145,9 @@ the entry above, not this.
 ### Two jobs die together, both at `MPI_Init`
 
 Concurrent `MPI_Init` in the same allocation killed two compute sessions in
-this run. If you are dropping several scripts into a spool at once, either
-serialize the ones that initialize MPI or give them distinct allocations.
+this run. The spool scheduler now removes the allocation's MPI context from
+every job, which is the likely mechanism; if it recurs anyway, serialize the
+jobs that initialize MPI (`--gpus all`) or give them distinct allocations.
 
 *Not caught.* Observed; the mechanism was not isolated further.
 
@@ -248,7 +249,8 @@ This, plus the 300 s cap, plus a 26 GB container image costing 4–8 minutes to
 import **per job**, is why `session_spool` exists and why it is the kind to
 prefer wherever available:
 
-- one allocation, acquired once, running a watcher as its own main process;
+- one allocation, acquired once, running the spool scheduler as its own main
+  process (see *Compute sessions and the spool* below);
 - **work is a file** — drop `pending/<name>.sh`, wait for `done/<name>.rc`,
   read `logs/<name>.log`;
 - so anything that can write a file can run GPU work: the orchestrator, an
@@ -281,13 +283,168 @@ not a workflow bug — `environment.gpus_per_node` exists for it.
 
 ---
 
+## Compute sessions and the spool
+
+A session is an allocation whose main process is the spool scheduler
+(`substrate/scheduler.py`). Every job's verdict is in `done/<name>.json`, and
+its `reason` names what happened. `spoolctl.sh status` shows what runs, what
+waits and why.
+
+### The safe-kill rule, and a whole allocation that died when one job did
+
+Six session deaths in one run had one cause: a process that inherited the
+allocation's Slurm/PMI context died abnormally (a crash, a timeout, an
+operator's `kill`), and Slurm's MPI error handler (`_errhandler status=-61`)
+killed the **whole allocation** — scheduler, orchestrator and every queued job.
+
+**The safe-kill rule:** never signal a process that carries the allocation's
+MPI context (`SLURM_*`, `PMI_FD`, a `slurm.pmix.*` `PMIX_NAMESPACE`). The
+scheduler removes that context from every job it starts, so it can stop its
+own jobs safely; it still checks each process's environment before signalling
+it, and a process that carries the context is left alone: its job is marked
+failed (the waiter unblocks) and its devices are quarantined until it exits by
+itself. To stop a job, use `spoolctl.sh cancel <name>`. Never `kill` a job's
+processes by hand, never `pkill`/`killall` by pattern, and never kill the
+scheduler: it is the allocation.
+
+*Caught by:* `scrub_environment` at launch and `is_mpi_attached` before every
+signal. `session_watchdog.sh` reports quarantined devices.
+
+### `no watcher heartbeat in <spool>: the session is not running` (exit 70)
+
+Either the session is down, or it is watching a different directory. The
+second one reads exactly like the first: a hand-edited entry script copied
+from another run came up on that run's spool, and every submitter reported a
+dead session. Compare `spool=` in the spool's `watcher.status` with the path
+you submit to, and render entry scripts instead of editing them
+(`staircase-onboard session render`).
+
+*Caught by:* `queue_job`, which refuses a spool with no live heartbeat.
+
+### A job waits while devices sit idle
+
+Read the reason in `spoolctl.sh status`:
+
+| reason | meaning |
+|---|---|
+| `waiting for the whole node to drain` | a whole-node job is next; slot jobs are not admitted until it has run |
+| `queued behind <job>` | a GPU job ranked above it is waiting for devices it will need |
+| `host memory N GiB available, M needed` | it declared `host_mem_gb` (whole-node jobs inherit `engine_host_mem_gb`); the previous engine's host memory is still being released |
+| `native rebuild of <tree> in progress` | a rebuild was announced on this session |
+| `... waits for the successor session` | the allocation ends before the job's wall limit would |
+
+*Caught by:* `_admit`, which writes the reason into the status file.
+
+### `reason=wall_limit` (rc 124)
+
+The job ran past `--wall`, counted from its start: time queued behind other
+work is not charged. A gate's timeout is its wall limit.
+
+### `reason=stalled` (rc 210): `no progress for Ns after a failure line`
+
+The log showed a failure (a traceback, `MPI_ABORT`, a segfault, a CUDA or NCCL
+error) and then nothing for `failure_stall` (10 minutes by default for GPU
+jobs). That is the shape of a rank-0 init failure with the other ranks waiting
+in a collective forever. Read the failure line in the receipt's `detail`; the
+rest of the log is the ranks that waited.
+
+*Caught by:* `_track_progress`.
+
+### `reason=mixed_checkout` (rc 217)
+
+The job's processes imported the engine package from more than one checkout,
+or not from its `--tree`. An MPI worker imports from its working directory
+ahead of `PYTHONPATH`, so pointing only `PYTHONPATH` at a worktree runs the
+worktree on rank 0 and the main checkout everywhere else — and the result
+describes neither. Submit with `--tree <worktree>`, which sets both. Every
+process's import is in `logs/<name>.resolve.jsonl` and in the
+`[staircase-resolve]` lines of the log.
+
+*Caught by:* `_judge_provenance`.
+
+### `reason=memory_limit` / `memory_pressure` (rc 211)
+
+The job exceeded its own `--mem-gb`, or host memory fell below the session's
+`pressure_floor_gb` and this job held the most. Twelve concurrent test jobs
+once pushed a session's memory cgroup over its limit and the whole allocation
+was killed; this stops one job instead.
+
+### `reason=host_memory` (rc 214)
+
+The memory the job declared never came back within `host_mem_wait`. The
+receipt names the largest jobs on the session; if none holds it, a process
+outside the scheduler does.
+
+### `reason=orphaned` (rc 212)
+
+The scheduler that ran the job stopped heart-beating (its allocation ended or
+was killed) and a scheduler on the same spool closed the job out. Nothing in
+it is a verdict; run it again.
+
+### `reason=cancelled` (rc 216), `reason=refused` (rc 213), `reason=launch_failed` (rc 215)
+
+`cancelled`: someone ran `spoolctl.sh cancel <name>`; the scheduler stopped the
+job under the safe-kill rule, or never started it. `refused`: the job could
+never run here, and `detail` says why: a header key it does not know (a
+misspelt limit is refused rather than ignored), more GPUs than the session
+hands out, or a `--tree` the compute node cannot see. `launch_failed`: the
+scheduler could not start `bash` for it at all, which is a node problem.
+
+### `job name ... must start with this requester's prefix`
+
+Each external turn gets a prefix (`r014` for request `014-smith`), and the
+submit script refuses names outside it: two turns once picked the same name
+and one deleted the other's receipt. `export STAIRCASE_JOB_PREFIX=<prefix>`
+and name jobs `<prefix>-<what>`.
+
+*Caught by:* `check_name`.
+
+### A process faulted (SIGSEGV) about a minute after someone rebuilt the native libraries
+
+`build_wheel.py` rewrites `tensorrt_llm/libs/*.so` in place, under every
+process that has them mapped, on every node. Rebuild only through the
+workflow's `incremental_build.sh`, which gives every library a fresh inode
+first and holds new GPU jobs against that checkout on every session until the
+build ends.
+
+*Caught by:* `refresh_inodes`.
+
+### The allocation reached its time limit in the middle of a gate
+
+Declare the session's `time_limit`. `handover_lead` before the end, the
+scheduler writes `handover/request.json`, stops admitting jobs that could not
+finish, and leaves them in the spool for the successor; `staircase-onboard
+driver wait` returns `SESSION_REQUEST`, and `staircase-onboard session allocate`
+prints the call that starts the successor on the same spool.
+
+*Caught by:* `_plan_handover`.
+
+### The driver waits and nothing happens
+
+`staircase-onboard driver status` shows the orchestrator's state. `exited`
+means a run that closed, crashed or lost its allocation: its log says which,
+and a relaunch adopts every unanswered turn. `CLAIMED ... OVERDUE` means a turn
+ran past its role's timeout and its subagent has likely died: `release` it and
+dispatch it again.
+
+*Caught by:* `orchestrator_state`.
+
+### `Agent stalled: no progress for 600s (stream watchdog did not recover)`
+
+Too many concurrent turns on one account: seven of twelve died this way within
+twelve minutes. The external transport defaults to eight concurrent smiths and
+`driver wait` to eight turns in flight.
+
+---
+
 ## Python environment
 
 ### The import resolves to a different tree than the one you are measuring
 
 `/root/.local` and `/root/.cache` are symlinked into a shared, relocated home
 on this cluster, so another checkout's develop-install is on the path of every
-container run. Export `PYTHONNOUSERSITE=1` at runtime.
+container run. Export `PYTHONNOUSERSITE=1` at runtime. A worktree has the
+same problem with a different cause; see `reason=mixed_checkout` above.
 
 **But not during the native build:** the CUTLASS kernel CMake runs
 `setup_library.py develop --user` and then imports `cutlass_library`, so the
@@ -414,6 +571,32 @@ The workflow removes the *cause* rather than the lock: smiths commit through
 `bin/commit.sh`, which takes an `flock`, so concurrency becomes a short queue.
 Exit code **75** from that script means "waited for the lock and did not get
 it" — a queue, not a broken repo.
+
+### `commit.sh: REFUSED: ...` (exit 2) and `REFUSING TO LEAVE THIS COMMIT AS IS` (exit 1)
+
+Exit 2 is a refusal before anything was staged; fix the call, not the repo.
+The refusals, each of which once reached a branch:
+
+- `is a symlink git does not track` — a worktree's link to the main
+  checkout's native build (`tensorrt_llm/bindings` and friends). `.gitignore`
+  names the directory form only, so the link is untracked and visible, and a
+  `git add -A` committed it. Name real files only; leave the link alone.
+- `sandbox placeholder` — `.mcp.json`, or anything under `.claude/` or
+  `.cc-writes/`, which the operator's sandbox leaves wherever its shell goes.
+- `outside the paths this run may commit` — `commit_policy.allowed_paths` in
+  `task.yaml` (default `tensorrt_llm/ tests/ cpp/ examples/`).
+- `Co-authored-by` / `Signed-off-by` in the message — the script signs off
+  as the repository's user itself, and the repository takes no co-authors.
+- `no commit identity` — the repository has no `user.name`/`user.email`.
+  Set them (or export both `STAIRCASE_GIT_NAME` and `STAIRCASE_GIT_EMAIL`);
+  the CLI refuses to start without one for the same reason.
+
+Exit 1 with `REFUSING` means the commit was made and undone: the file list
+differed from the request, a symlink was added, a sign-off did not carry the
+author's email, or a `Co-authored-by` appeared — usually a hook or an
+environment variable, never the agent. `staircase-onboard premerge hygiene`
+runs the same checks over a whole branch, and `premerge resign` fixes
+missing sign-offs on a new branch, signing each commit as its own author.
 
 ### `could not lock config file .git/config: File exists` and the lock will not delete
 

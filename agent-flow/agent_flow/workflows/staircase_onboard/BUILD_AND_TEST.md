@@ -28,18 +28,44 @@ before spending an hour, because the answer is usually no:
 |---|---|
 | a target's `modeling.py` / `weights.py` | **no** — pure Python, editable install picks it up |
 | a catalog wrapper `.py` or contract `.md` | **no** |
-| a Triton kernel (sourcing tier 4) | **no** — Triton is JIT |
+| a FlashInfer call (sourcing tier 3) | **no** — the package is installed, its kernels JIT |
+| a Triton kernel (sourcing tier 5) | **no** — Triton is JIT |
 | routing, `_router_index.py` | **no** |
 | anything under `cpp/` | yes |
 | a new `torch.ops.trtllm.*` op | yes |
 | pulling a trunk that touched `cpp/` | yes |
 
-The four sourcing tiers this workflow uses — an exported op, the kernel plane,
-native torch, Triton — **none of them require a native rebuild**. That is why
+The five sourcing tiers this workflow uses — an exported op, the kernel plane,
+FlashInfer's public API, native torch, Triton — **none of them require a native
+rebuild**. That is why
 the orchestrator never builds anything and `environment.python` just points at
 an install someone else made.
 
 If you are rebuilding during an onboard, stop and confirm why.
+
+### Rebuilding while compute sessions are running
+
+`build_wheel.py` installs `tensorrt_llm/libs/*.so` by rewriting each file in
+place. Any process, on any node, that has the old file mapped then faults on
+its next page-in, and when that process is attached to its allocation's MPI it
+takes the whole allocation with it. Measured: a rebuild on one session killed
+another session thirty seconds later.
+
+So rebuild through the workflow's `incremental_build.sh` (in the package's
+`scripts/` directory), as a whole-node spool job:
+
+```bash
+spool_submit.sh --gpus all --wall 3h build-<what> \
+    'bash <package>/scripts/incremental_build.sh --repo <checkout> --spool <spool A> --spool <spool B>'
+```
+
+It takes a per-checkout build lock, announces the rebuild on every listed
+spool (each session's scheduler then holds new GPU jobs against that checkout),
+gives every installed library a fresh inode by copy-and-rename so running
+processes keep the file they mapped, runs the build with ccache, checks the
+checkout still imports, and retracts the announcement — also when the build
+fails. Spools default to `$STAIRCASE_SESSION_SPOOLS`, which every rendered
+session exports.
 
 ## 1. Build
 
@@ -197,6 +223,12 @@ Four things that are each a whole afternoon if you get them wrong:
    behind it is named `enable_worker_single_process_for_tp1` and the source
    calls it a WAR for TP1. It does not scale past one rank.
 
+Inside a multi-node compute session there is no `srun` and no sshd in the
+container. A session declared with `nodes: 2` runs one scheduler per node, and
+the workflow's `mn_mpirun.sh` (in the package's scripts directory, under
+`mn/`, with its own README) starts one `mpirun` across them, launching each remote daemon through
+that node's scheduler.
+
 This workflow emits all of this from `environment.py`; nothing above is an
 agent's decision. It is written out here because a human debugging a gate
 needs to recognize a correct line when they see one.
@@ -207,7 +239,7 @@ needs to recognize a correct line when they see one.
 |---|---|
 | container import, 26 GB / 4–8 min **per job** | `--container-name=<name>` — pyxis skips the import when that name already exists on the node |
 | queue wait per command | a persistent allocation: `salloc` once, then `srun --jobid=<id>` steps into it (see `exec-local-slurm`) |
-| both, plus a transport that cannot reach Slurm at all | the spool pattern — one long-lived job whose **own main process** watches a directory; work is a file |
+| both, plus a transport that cannot reach Slurm at all | a compute session — one long-lived job whose **own main process** is the spool scheduler; work is a file |
 | cold native build | `--use_ccache`, and one cache per checkout |
 
 On the spool: work started inside a `slurm_exec_in_job` step does **not**
@@ -215,6 +247,30 @@ survive the step's teardown, `nohup` included — measured. The long-running
 process has to be the job's own main process. If your cluster's Slurm CLI is
 reachable, prefer the persistent-allocation pattern; the spool exists for the
 case where it is not.
+
+A session is declared in `task.yaml` (`environment.sessions`) and its entry
+script is rendered, never written by hand:
+
+```bash
+staircase-onboard session render --task task.yaml --name a      # <spool>/session_entry.sh
+staircase-onboard session submission --task task.yaml --name a  # the broker call that starts it
+staircase-onboard session status --task task.yaml               # heartbeat, end, queue
+```
+
+Inside a session, size each job instead of picking devices:
+
+| you run | submit it as |
+|---|---|
+| a single-GPU unit test or microbenchmark | `--gpus 1` |
+| a 4-rank collective test | `--gpus 4` |
+| anything that loads the full model, a gate, a rebuild | `--gpus all` |
+| a worktree's code | add `--tree <worktree>` — sets the working directory **and** `PYTHONPATH`, and refuses a result whose ranks imported another checkout |
+| the orchestrator, or anything GPU-free and long-lived | a `free-` name, no `--gpus` |
+
+`--wall` counts from the job's start, so time queued behind other work is
+free. `spoolctl.sh status` says why each waiting job waits; `spoolctl.sh cancel
+<name>` is the only way to stop one (see the safe-kill rule in
+TROUBLESHOOTING.md).
 
 To abort one run without losing the allocation:
 

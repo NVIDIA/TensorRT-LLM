@@ -19,11 +19,13 @@ Start with `--dry-run`. It runs preflight, resolves the launch environment and
 stops before the first agent turn — the cheapest way to find out whether this
 host can host this run.
 
-Two companions to this file: **[TROUBLESHOOTING.md](TROUBLESHOOTING.md)** is keyed on
+Three companions to this file: **[TROUBLESHOOTING.md](TROUBLESHOOTING.md)** is keyed on
 symptoms — the verbatim error you saw. **[BUILD_AND_TEST.md](BUILD_AND_TEST.md)** is
 keyed on tasks — building, rebuilding, and running at CPU / 1 GPU / multi-GPU /
 multi-node scale, collected from the places in TensorRT-LLM that already do each
-of them correctly.
+of them correctly. **[LESSONS.md](LESSONS.md)** is keyed on what real runs got
+wrong — each lesson's symptom, its cause, and the mechanism in this workflow
+that now prevents it, or the gap that is still open.
 
 **When something breaks, read [TROUBLESHOOTING.md](TROUBLESHOOTING.md) before
 you debug the target.** It is keyed on verbatim error text, and the entries
@@ -83,13 +85,16 @@ from TensorRT-LLM's own accuracy references, and the verdict is
 
 ## The gates
 
-| gate | when | cost |
+| gate | when | what |
 |---|---|---|
-| **boot** | after every assembler turn | minutes. `quickstart_advanced.py` with the target's topology flags |
-| **accuracy** | at each unit boundary | the release criterion. `trtllm-eval` against the anchor. One-sided |
-| **acceptance** | only for a distribution-preserving feature | `acceptance_length` under `=require` vs `=off` |
+| **boot** | after every assembler turn | minutes. The declared boot workload through the engine driver; keywords are matched on generated text only, and a multimodal target is sent an image |
+| **accuracy** | at each unit boundary, every member | the release criterion. `trtllm-eval` against the anchor, with a statistical floor |
+| **acceptance** | every unit that keeps a speculator on | `acceptance_length` on ≥ 32 natural-text prompts, paired against the previous verdict |
+| **witness** | each feature boot and accuracy cannot see, every member | two legs that differ in exactly one variable; see [Feature increments](#feature-increments) |
+| **scheduler-equivalence** | every unit, every member | the overlap scheduler on vs off, greedy at batch 1, token-identical |
+| **launch** | last in each unit | a smoke through the unit's own deployment entry (`trtllm-serve`, or its disaggregated launcher) over HTTP |
 
-All three run with **`TRTLLM_MODELING_V2=require`**. Under `auto` a
+All of them run with **`TRTLLM_MODELING_V2=require`**. Under `auto` a
 configuration that misses a target's routing criteria silently gets the
 built-in implementation, and a number measured that way reads as
 modeling_v2's — the single most expensive mistake available in this package.
@@ -106,14 +111,207 @@ unified target gated at a single topology leaves the expert-parallel and
 attention-DP branches unexecuted while its Coverage claims them, so the
 orchestrator enforces the member set rather than trusting the prose. Every
 verdict names its member (`accuracy[gsm8k]@dep4`) and the unit advances only
-when all of them pass. The witness gates run at the first member only: a
-witness is a *contrast between two legs of one configuration*, not a number
-per configuration. `--dry-run` prints the member set and the resulting gate
-count before anything is spent.
+when all of them pass. Witnesses run at every member too, cheapest first.
+`--dry-run` prints the member set and the resulting gate count before anything
+is spent.
+
+## Gate workloads, floors and findings
+
+Every gate's workload is declared in `task.yaml` under `accuracy`, never
+sized from the run it judges. Each key also works inside one unit's entry,
+for that unit only.
+
+- **Accuracy floor** (`accuracy.floor`).
+  - `rule: statistical` (the default) puts the floor `k` standard errors
+    below the anchor; `k` defaults to 2, and the SE comes from the
+    benchmark's sample count (`samples` when the gate cannot read it).
+  - `rule: tolerance` keeps the fixed `tolerance` width instead.
+  - If *every* member of a unit scores more than 1 SE below the anchor, the
+    unit passes but the run records a **finding**. Delivery refuses it
+    (`delivery-failed:findings`) until `floor.acknowledge.<unit>` gives the
+    reason.
+- **Acceptance** (`accuracy.acceptance`).
+  - The workload is `num_prompts` (default 32) questions from the accuracy
+    dataset (`dataset`, read offline), formatted with `prompt_template`. A
+    run may instead declare `prompts` or `prompts_file`.
+  - Fewer than `min_prompts` prompts fail as "workload too small". A workload
+    that reaches fewer than `min_draft_iterations` draft iterations fails as
+    "too short".
+  - Each unit's run is compared prompt by prompt with the previous verdict
+    (`regression: {test, alpha, min_effect}`).
+  - Per unit, set `min_absolute` with a `floor_source`, or set
+    `measured_reference`. A floor with no measured source is warned about.
+- **Boot** (`accuracy.boot`, else the workspace `boot.yaml`).
+  - `prompts` may carry their own `keywords` and `images`, plus `max_tokens`.
+  - `multimodal.prompts` gives the image prompts. Without one, the
+    repository's `merlion.png` is sent; it is a git-lfs file, so pull it in
+    the tree under test.
+- **Witness workloads** (`accuracy.witness.<feature>`).
+  - Token-comparing witnesses declare `prompts`/`prompts_file`, `max_tokens`
+    and `min_generated_tokens` (default 32).
+  - A continuation too short to compare is refused, not passed.
+- **Scheduler equivalence** (`accuracy.scheduler_equivalence`).
+  - Keys: `units`, `num_prompts`, `max_tokens` (≥ 64), `legs`, and
+    `spec_pair: report|agreement|exact`.
+  - A target may implement the optional step-trace hook
+    (`STAIRCASE_STEP_TRACE_DIR`, see `step_check.py`) to name the first
+    divergent step. `step_trace.reference_command` adds a replay through a
+    reference implementation.
+- **Launch smoke** (`accuracy.launch`).
+  - Keys: `num_samples`, `endpoint: chat|completions`, `members: all|first`,
+    and `min_accuracy`. Any non-200 response fails.
+  - A `disagg` unit must declare `launch.disagg.command`, or set
+    `enabled: false` there. The command is a launcher that prints
+    `STAIRCASE_ENDPOINT=<url>` once it serves, and stops everything on
+    SIGTERM.
+
+Per-prompt baselines and findings are kept in `<workspace>/gate_results.jsonl`.
+Every verdict also reaches the evidence ledger.
+
+A unit now runs boot, accuracy, the witness and scheduler equivalence at every
+member, then acceptance and the launch smoke. `scheduler_equivalence.units`
+and `launch.members: first` narrow that.
+
+**Running one gate by hand.** `staircase-onboard gate
+{boot,accuracy,acceptance,scheduler-equivalence,launch,witness} --task task.yaml
+[--unit U] [--member M] [--tree T] [--results F] [--workdir W]` runs a single
+gate or witness exactly as the orchestrator does. With `--tree` it measures
+another checkout, which is how a historical defect is replayed on the trees
+before and after its fix. Assemblers are pointed at the same command.
+
+**Follow-ups, not built yet:**
+- a performance gate: one prefill chunk plus one decode step against the
+  previous tree, failing on more than 5% (the engine driver's timing mode
+  exists);
+- a concurrent, batch > 1 leg beside the batch-1 witness and
+  scheduler-equivalence legs.
+
+## Serving envelope and certification
+
+What a target is certified for is declared, not inferred from whatever the
+gates happened to run. Two optional `task.yaml` blocks declare it:
+
+- `serving_envelope`:
+  - `max_batch_size`, `max_num_tokens` and `max_seq_len`, all required;
+  - `cuda_graph`: `false`, `batch_sizes: [...]`, or `padding` with an
+    optional bound;
+  - `members` in the form `<tp|tep|dep><N>[pp<M>]`. These may include
+    multi-node or pipeline-parallel members that no unit gates;
+  - optional `max_draft_len`, `gpus_per_node` and `probe_prompt_tokens`.
+- `feature_matrix`: named cells, each
+  `{name, features, members, evidence: boot|accuracy|witness|acceptance, at: gate|ceiling|{axis: value}}`.
+
+Preflight derives the certification plan and writes `certification.md`. The
+plan roles, the smiths and the auditor all certify against it.
+
+- **Consistency.** Every gate's launch tuple must sit inside the envelope, and
+  every gated member must be one the envelope claims. Otherwise preflight
+  stops and names the inconsistency.
+- **Ceiling probes.** Each unit gets one boot at the envelope's limits, at its
+  cheapest member, run right after its boot gates. A failed probe sends the
+  unit back to the assembler.
+- **External evidence.** A matrix cell that no gate or probe reaches is
+  *external*. Delivery fails until
+  `<workspace>/evidence/<cell>__<member>__<evidence>__<at>.yaml` records
+  `verdict: pass`, `tree` and `log` for it.
+
+Without a `serving_envelope`, the envelope is derived from the gate tuples and
+marked `DERIVED` wherever it is shown. There are then no probes and no
+external cells. To adopt a declared envelope:
+- `python -m agent_flow.workflows.staircase_onboard.envelope migrate task.yaml [--write]` prints (or appends) a block that
+  restates the gate hull, so adopting it owes nothing new; widen it from
+  there.
+- `... envelope plan task.yaml` prints the resulting plan.
+
+The envelope also drives four further checks:
+
+- **Capacity audit** (`capacity_audit.py`).
+  - Every target constant that bounds or sizes something must be bound to an
+    engine argument on its own line: `# capacity: max_num_tokens`,
+    `# capacity: max_batch_size * world_size`, or `# capacity: fixed: <why>`.
+    A `CAPACITY_BOUNDS` dict also works.
+  - The bound must be at least the envelope's limit.
+  - The reviewer is shown the audit. A failure fails delivery, with or
+    without a declared envelope.
+- **Smith brief** (`smith_brief.py`).
+  - Vocabulary steps may declare
+    `call_sites: [{site, row_multiple, gathered, eager_only, row_width}]`.
+  - Each smith is briefed with the rows every call site reaches at every
+    captured batch size.
+  - The brief also gives the integer-width probes (2^31 elements, 2^31 / row
+    width, 2^24 + 1) that the entry records as hard limits (an `is_valid`
+    guard where the op crosses one silently, its `note` otherwise).
+  - `python -m agent_flow.workflows.staircase_onboard.smith_brief --workspace W <request>` renders one brief by hand.
+- **`certification_gap`.**
+  - Assembler, reviewer and auditor decisions may list
+    `certification_gap: [{entry, values, axis, arch, reason}]`.
+  - The orchestrator dispatches one verify smith per new surface, bounded by
+    `catalog_remediation.max_parallel_verifiers`.
+  - The unit then resumes instead of being re-opened.
+- **Early checks** (`early_checks.py`).
+  - After the plan phase and after each unit, they run as warnings to
+    `early_checks.md`: the delivery checks that need no finished target, plus
+    capacity failures and owed matrix evidence.
+  - The delivery checks covered: test naming, the accuracy test and its
+    test-db listing, and whether CI would skip that test.
+
+## Evidence ledger and reports
+
+Every verdict is appended to `<workspace>/ledger.jsonl` together with what it
+was measured on:
+- the commit and tree object;
+- the native build's fingerprint;
+- the content of the files it depends on;
+- the `TRTLLM_*` switches and their code defaults;
+- the unit's slice of the spec;
+- each role's backend and model.
+
+Gate verdicts, envelope probes, early checks and delivery checks are all
+recorded. A harness run outside the workflow records its own verdict with
+`python -m agent_flow.workflows.staircase_onboard.ledger record <ws> --repo R --gate G --unit U --outcome PASS|FAIL|FINDING`.
+
+- **Freshness** (`freshness.py`).
+  - A verdict goes stale when a dependency, the native build, the unit's spec
+    or a switch default changes.
+  - `python -m agent_flow.workflows.staircase_onboard.freshness status <ws> --repo R` lists stale and failing verdicts and
+    the re-run queue (`rerun_queue.json`).
+- **Delivery is bound to one tree.**
+  - Delivery re-runs that queue on the delivery tree and its native build.
+  - It records a full regression only when every verdict holds there.
+    Otherwise the run closes `delivery-failed:evidence`, and it can be
+    re-entered once fixed.
+  - Lint or a PR split changes the tree. The pre-merge pack therefore carries
+    `python -m agent_flow.workflows.staircase_onboard.freshness check-merge <ws> --repo R --rev <sha>`, to confirm the
+    tree being merged is the one that was regressed.
+- **Reports are generated, not written.**
+  - `progress.json`, `progress.html` and `final-report.md` are rebuilt from
+    the ledger, the checkpoint and the journal after every checkpoint.
+  - Narrative goes in `progress.overlay.yaml`, whose items may cite verdicts
+    as `evidence: {gate, unit, member}`, and in the final report outside its
+    `BEGIN/END GENERATED` regions.
+  - `python -m agent_flow.workflows.staircase_onboard.report <ws> [--final-report]` regenerates them.
+  - `--check [DOC ...]` exits 1 on any contradiction, for example "no
+    finding" beside a FINDING, "all gates pass" beside a failing or stale
+    verdict, or a tree that is not the one regressed. Delivery refuses on the
+    same contradictions.
+  - `--clean` archives the ledger and reports under `<workspace>/archive/`.
+- **Records are never overwritten.**
+  - Decisions are `decisions/<unit>-<role>-<turn>.yaml`; a reused key gets
+    `.2`, `.3` and so on.
+  - An external driver must write the decision path its request names,
+    verbatim.
+  - Journal ordinals are claimed atomically.
+- **The catalog index is generated.**
+  - Smiths write a fragment, `catalog/index.d/<category>/<name>.yaml`.
+  - The orchestrator regenerates `catalog/index.yaml` from the fragments in
+    `HEAD` and commits it on its own.
+  - The first fragment migrates an old-style index losslessly.
+    `python -m agent_flow.workflows.staircase_onboard.catalog_index {migrate,generate,check} --repo R` does the same by
+    hand.
 
 ## The six roles
 
-| role | session | backend | one run does |
+| role | session | default backend | one run does |
 |---|---|---|---|
 | `plan_drafter` | persistent | Claude Code | the checkpoint→catalog mapping and the plan |
 | `plan_reviewer` | persistent | **Codex** | a paper review of both |
@@ -122,28 +320,88 @@ count before anything is spent.
 | `reviewer` | stateless | Claude Code | reads one unit's diff against the gate evidence |
 | `auditor` | stateless | Claude Code | the runtime-value dump vs the certified columns |
 
+A seventh, `runner`, makes no judgement: it relays a command to a scheduler
+only an agent can reach (`environment.kind: slurm_broker`).
+
 The PlanReviewer runs on a different model from the PlanDrafter on purpose: a
 reviewer that shares the author's blind spots reviews its own reasoning back at
 itself. The plan roles are stateful because they are asked to remember what
 they decided; the work roles are not, because staircase's unit of work is one
 entry or one unit, each in its own context.
 
+## Choosing each role's backend and model
+
+The backends above are defaults. An optional `agents` block in `task.yaml`
+chooses the backend (`claude-code` or `codex`), model, reasoning effort and
+extra MCP servers, for every role (`defaults`) or for one
+(`roles.<name>`). It is the shared per-role routing of
+`agent_flow.agent_runtime`, the same block `perf-analyze` and `perf-optimize`
+read, with the role list and defaults in `roles.py`:
+
+```yaml
+agents:
+  defaults: {backend: claude-code, model: claude-opus-5-5}
+  roles:
+    plan_reviewer: {backend: codex, model: gpt-6-astra, reasoning_effort: high}
+```
+
+- A `defaults.model` needs a `defaults.backend` beside it. The roles do not
+  share a default backend, so a bare model name would also be sent to the
+  Codex plan reviewer; the schema refuses it.
+- The CLI warns when `plan_reviewer` and `plan_drafter` resolve to the same
+  backend and model: the run is legal, but its plan review is not
+  cross-model.
+- A role on Codex has its typed-decision tool required through the layer's
+  backend-neutral `required_tools` policy, because Codex refuses Claude SDK
+  hooks. In decision-file mode a Codex role requires no tool; the file is
+  validated when it is read.
+- Under `--agent-transport external` no session is built here. Each
+  `dispatch/<id>.request.json` carries the role's configured backend and model
+  as `agent`, and running the turn on a matching model is the driver's job.
+- The spec is re-read on every resume (see `_refresh_workspace_spec`), so a
+  changed `agents` block applies to every layer the resumed process builds.
+
+Long system prompts are handled by the Claude backend: above
+`AGENT_FLOW_SYSTEM_PROMPT_FILE_THRESHOLD` (64 KiB) the prompt is written to
+`<workspace>/.agent-flow/system-prompt-<sha>.md` and the CLI is given a pointer
+to it, because Linux caps one argv string at 128 KiB. Composed staircase role
+prompts are well under the threshold today. The large per-run blocks (survey,
+runtime areas, kernel sources) travel in the turn prompt, which is not on
+argv.
+
 ## Workspace layout
 
 ```
 <workspace>/
 ├── task.yaml             the resolved spec, defaults filled in
+├── prompts/<role>.md     each role's composed system prompt, snapshotted at every launch
 ├── plan.md               PlanDrafter (+ `## Open risks` if the cap was reached)
 ├── vocabulary.yaml       the typed step→catalog mapping and dispatch queue
 ├── surface.md            the surface survey, unabridged (preflight)
 ├── progress.yaml         every agent's typed decision, by stage
 ├── journal.md            the run's timeline, written as events happen
 ├── reports/NN-<role>-<what>.md   each dispatch's prompt and result
-├── decisions/<role>-N.yaml       typed decisions, when MCP tools are unavailable
+├── reports/premerge.md   the pre-merge pack, after a clean audit
+├── decisions/<unit>-<role>-<turn>.yaml   typed decisions, when MCP tools are unavailable
+├── certification.md      the serving envelope and certification plan (preflight)
+├── early_checks.md       delivery checks run early, as warnings
+├── evidence/             external matrix evidence, one YAML per owed cell
+├── ledger.jsonl          every verdict and what it was measured on
+├── gate_results.jsonl    per-prompt gate baselines and open findings
+├── rerun_queue.json      stale or failing verdicts delivery will re-run
+├── progress.json/.html   generated from the ledger, checkpoint and journal
+├── progress.overlay.yaml the narrative those reports carry (yours to edit)
+├── final-report.md       generated tables, narrative outside them
+├── embargo/attempts.jsonl  every refused or redacted read of an embargoed path
+├── overlap/<unit>/tree   the next unit's early worktree, under --overlap-units
 ├── boot.yaml             the boot gate's prompts and keywords (optional)
 ├── bin/commit.sh         the locking, self-verifying commit helper
 ├── .commit.lock          its lock file
 ├── .claude/skills/       this run's copy of the packaged skills
+├── .agent-flow/          system prompts too long for argv, when there are any
+├── dispatch/             turns, under --agent-transport external
+├── TURN_INSTRUCTIONS.md  the driver's standing instructions, under --agent-transport external
+├── archive/              the previous ledger and reports, after --clean
 └── .staircase_onboard_state.json
 ```
 
@@ -154,9 +412,25 @@ the repo at delivery.
 
 `vocabulary.yaml` is the one artifact with a schema, because the orchestrator
 walks it. `vocabulary.py` validates it and will reject a malformed one:
-`OK`/`CERT` rows quote the contract line that decides coverage, `GAP` rows name
-a candidate, `verify` dispatches name the surface, the two chapters do not
+`OK`/`CERT` rows quote the cell, `note` line or `is_valid` assertion that
+decides coverage, a queue `target` is `<category>/<name>` (shared catalog) or
+`ops/<category>/<name>` (the target's own `ops/`), `GAP` rows name a candidate, `verify` dispatches name the surface, the two chapters do not
 overlap, and a `ceiling` verdict carries its evidence.
+
+A `GAP` row names its rung on the sourcing ladder, cheapest first:
+
+| tier | source | the row names |
+|---|---|---|
+| 1 | a `torch.ops.trtllm.*` op | the op |
+| 2 | an in-tree callable under `tensorrt_llm/_torch/modules/**` | the callable |
+| 3 | FlashInfer's public API, for a kernel no trtllm op wraps | `flashinfer.<module>.<name>` |
+| 4 | native torch, composed by this run | what tiers 1-3 offered (`tried`) |
+| 5 | a Triton kernel, written by this run | what tiers 1-3 offered (`tried`) |
+
+The op inventory sees tier 1 only. FlashInfer is a pinned dependency and the
+tree wraps few of its kernels, so the surface survey also reads the installed
+package's public API off disk and records which callables the engine already
+references; `surface.md` lists them. A ceiling accounts for all five tiers.
 
 A queue row may also name the `unit` that first needs its entry (`core` when
 absent). Every row is dispatched in the smith phase regardless, but only a
@@ -174,13 +448,46 @@ retry fails too, the run closes `smith-blocked:<unit>`.
 | `--dry-run` | off | preflight, then stop. Leaves the checkpoint at `preflight`, so the real run re-claims the devices |
 | `--max-plan-rounds` | `1` | drafter, reviewer, at most one re-draft, then proceed regardless |
 | `--max-assembler-turns-per-unit` | `6` | bounds the self-heal loop |
-| `--max-parallel-smiths` | `10` | where extra compute buys wall-clock. Each dispatch is a full agent session and the upstream rate limit is reported without backoff, so this is bounded by default; `0` opens the whole batch and on a typical queue that is every entry at once |
+| `--max-parallel-smiths` | `10` (`8` with `--agent-transport external`) | where extra compute buys wall-clock. Each dispatch is a full agent session and the upstream rate limit is reported without backoff, so this is bounded by default; `0` opens the whole batch and on a typical queue that is every entry at once |
 | `--reviewer` | `light` | `light` reads the evidence and runs nothing; `full` re-runs the boot gate; `off` skips the turn |
 | `--plan` / `--vocabulary` | — | skip the plan phase with pre-written artifacts |
 | `--skip-substrate-gate` | off | skip the stock-path cold start in preflight. An escape hatch, not a speed-up — see the flag's own help |
 | `--agent-transport` | `inprocess` | how a role turn is delivered. `external` writes it to `<workspace>/dispatch/` and waits — see below |
-| `--agent-turn-timeout` | `10800` | seconds one externally-dispatched turn may take |
+| `--agent-turn-timeout` | per role | seconds one externally-dispatched turn may take, for every role. Without it each role has its own bound: assembler 16 h, smith and auditor 6 h, plan drafter and reviewer 4 h, plan reviewer and runner 3 h |
+| `--overlap-units` | off | start the next unit's assembler in its own worktree once the current unit is `UNIT_READY` — see below |
 | `--clean` | off | wipe the checkpoint and managed files |
+
+Subcommands and tools that are not a run:
+
+| command | does |
+|---|---|
+| `staircase-onboard premerge <step>` | the pre-merge pack — see [Commits and the pre-merge pack](#commits-and-the-pre-merge-pack) |
+| `staircase-onboard gate <name> --task task.yaml [--unit U] [--member M] [--tree T]` | one gate or witness (`boot`, `accuracy`, `acceptance`, `scheduler-equivalence`, `launch`, `witness`) run standalone, exactly as the orchestrator runs it |
+| `staircase-onboard session {render,status,requests,submission,allocate,ack,watchdog} ...` | compute sessions: entry scripts, status, hand-over requests — see [Execution substrate](#execution-substrate) |
+| `staircase-onboard driver --workspace W {wait,pending,status,claim,release,prompt,answer,instructions}` | the driver side of `--agent-transport external` |
+| `python -m agent_flow.workflows.staircase_onboard.envelope {migrate,plan} task.yaml` | adopt a declared serving envelope; print the certification plan |
+| `python -m agent_flow.workflows.staircase_onboard.report <ws> [--final-report] [--check DOC...]` | regenerate the reports, or check documents against the ledger |
+| `python -m agent_flow.workflows.staircase_onboard.freshness {status,check-merge} <ws> --repo R` | stale verdicts and the re-run queue; whether a tree is the one regressed |
+| `python -m agent_flow.workflows.staircase_onboard.ledger record <ws> ...` | record a verdict measured outside the workflow |
+| `python -m agent_flow.workflows.staircase_onboard.catalog_index {migrate,generate,check} --repo R` | the catalog index from its per-entry fragments |
+| `python -m agent_flow.workflows.staircase_onboard.smith_brief --workspace W <request>` | one smith's call-site brief, by hand |
+
+### `--overlap-units`
+
+Units stay ordered — core is green before the first feature — but a unit's
+gates take hours during which the next unit's assembler has nothing to wait
+for. With this flag, as soon as unit N's assembler writes `UNIT_READY`, unit
+N+1's assembler starts in `<workspace>/overlap/<unit>/tree`: a git worktree
+branched from `HEAD`, with the main checkout's untracked native build linked
+in, its own `commit.sh`, its own progress file and decision path. When the
+loop reaches N+1 (N's gates passed), the early result is adopted only if it
+ended `UNIT_READY`, committed, left its worktree clean, rebases onto the
+current `HEAD` without conflict and fast-forwards the main checkout; N+1 then
+goes straight to its gates. **Anything else falls back to sequential**: the
+main checkout is untouched, the worktree is kept with `NOT_ADOPTED.md` and
+`early.patch`, and N+1's assembler is dispatched as usual. A worktree left by
+a process that died is never adopted; remove it with
+`git worktree remove --force`. Off by default (`overlap.py`).
 
 ## Running where the orchestrator cannot authenticate an agent
 
@@ -209,36 +516,195 @@ comes from a gate the orchestrator ran itself.
 
 The one thing a driver must get right: **the role's system prompt travels with
 the turn**. A driver that delivers only the user prompt is running a different
-agent, and its answer still looks plausible.
+agent, and its answer still looks plausible. The request also names the
+backend and model the role is configured for (`agent`); a driver that answers
+every turn on one model turns a cross-model plan review into a same-model one.
+
+## Execution substrate
+
+On a Slurm/pyxis cluster a run stands on one or more **compute sessions**:
+allocations whose main process is the spool scheduler
+(`substrate/scheduler.py`, started by `spool_watcher.sh`). Work is a script
+renamed into `<spool>/pending/`; the receipt is `done/<name>.rc`, written last,
+with the verdict beside it in `done/<name>.json`.
+
+**Declare the sessions, render their entries.** `environment.sessions` in
+`task.yaml` names each session's spool, role (`gates`, `work`, `orchestrator`,
+`any`), node count, GPUs and time limit; `environment.orchestrator` names a
+GPU-free session for the orchestrator. `staircase-onboard session render --task
+task.yaml --name a` writes the session's entry script from that block, so no
+entry script is hand-edited; `session submission` prints the broker call that
+starts it, `session status` shows every session.
+
+**The scheduler** is the default. `STAIRCASE_SPOOL_WATCHER=legacy` falls back
+to the old flock watcher (`scripts/spool_watcher_legacy.sh`), and the
+orchestrator stays correct under it. The scheduler gives each job what its
+header asks for
+(`spool_submit.sh --gpus N|all --wall 2h --tree <checkout> <name> '<cmd>'`):
+
+- one priority queue; whole-node jobs go before slot jobs, and a waiting
+  multi-device job holds the devices it needs, so nothing is starved;
+- device slots, exported as `CUDA_VISIBLE_DEVICES`;
+- a wall limit counted from the job's start, a resident-memory limit, and an
+  optional host-memory pressure floor;
+- the allocation's MPI context (`PMI*`, `PMIX*`, `OMPI*`, `SLURM*`, ...) removed
+  from every job, core dumps off, processes a finished job left behind reaped;
+- names checked against the requester's prefix (each external turn gets one),
+  and earlier results of a reused name archived rather than deleted;
+- **the safe-kill rule**: it stops its own jobs (limits, `spoolctl.sh cancel`)
+  but never signals a process that still carries the allocation's MPI context;
+  such a job is marked failed and its devices are quarantined until it exits.
+
+**`--tree <checkout>`** runs a job with that checkout as its working directory
+and first `PYTHONPATH` entry. Every job carries a resolve hook that records
+which checkout each process imported; a result whose ranks disagree, or that
+did not import the declared tree, is refused (`reason=mixed_checkout`). Gates
+declare `trtllm_repo_path` as their tree.
+
+**Native rebuilds** go through `scripts/incremental_build.sh`: it announces the
+rebuild on every session (their schedulers hold new GPU jobs against that
+tree), gives every installed library a fresh inode so mapped copies are never
+rewritten, builds, checks the import and retracts the announcement.
+
+**No hang needs a human.** A gate's deadline counts from its start; a command
+whose session stops heart-beating fails instead of waiting; a job that prints
+a traceback and then goes silent is marked `stalled`; an engine waits for the
+host memory and `/dev/shm` it declares (the VMM release lag) and is refused
+with the reason if it never comes back; `session_watchdog.sh` returns the
+moment a session is stale, ending without a successor, or quarantined.
+
+**Hand-over.** A session with a `time_limit` writes
+`<spool>/handover/request.json` `handover_lead` before its end and stops
+admitting jobs that would not finish, so they wait in the spool for the
+successor that watches the same spool; once the successor is up the old
+scheduler retires. The successor is acquired by the driver (`session allocate`
+prints the broker call) or by an `allocator.command`; the orchestrator never
+calls the cluster's scheduler.
+
+**Multi-node.** A session with `nodes: 2` runs one scheduler per node;
+`scripts/mn/mn_mpirun.sh` launches one MPI job across them through the
+schedulers, with no sshd or srun in the container (`scripts/mn/README.md`).
+
+**The external driver.** With `--agent-transport external`, the driver session
+runs `staircase-onboard driver --workspace <ws> wait`, which returns `NEW <id>`
+(within an in-flight cap of 8), `ORCHESTRATOR_EXITED`, `SESSION_REQUEST` or a
+session alert; `claim`, `prompt <id>`, `answer` and `status` complete the loop,
+and `instructions` renders the standing `TURN_INSTRUCTIONS.md` from `task.yaml`.
+A relaunched orchestrator adopts every unanswered turn rather than asking again.
+
+## Commits and the pre-merge pack
+
+Agents commit only through `<workspace>/bin/commit.sh` (`committer.py`). It
+commits and signs off as the repository's configured user — so the DCO
+sign-off email always equals the author email — takes explicit repo-relative
+file paths only, and refuses untracked symlinks (a worktree's link to the
+native build), sandbox placeholders (`.mcp.json`, `.claude/`), the run's own
+workspace and anything outside `commit_policy.allowed_paths`. The CLI refuses
+to start without an identity, after one trial commit in a throwaway repository
+proves this environment's git writes what the rules require.
+
+The identity is the target repository's configured `user.name` /
+`user.email`, or `STAIRCASE_GIT_NAME` and `STAIRCASE_GIT_EMAIL` when both are
+set. The optional `commit_policy` block in `task.yaml` sets:
+- `allowed_paths` (default `tensorrt_llm/ tests/ cpp/ examples/`);
+- `allow_co_authors` (default false);
+- `base_ref`, the merge base delivery audits from (default `origin/main`,
+  `upstream/main` or `main`).
+
+A refused commit prints `commit.sh: REFUSED` and the reason; see
+TROUBLESHOOTING.md.
+
+Delivery runs the same rules over the branch: every commit since the merge
+base that touches the run's allowed paths must be signed off by its author,
+with no co-author, symlink or placeholder (`git:commit-hygiene`), or the run
+closes `delivery-failed` and names `premerge resign` as the fix.
+
+What a delivered branch still owes before it is a PR is
+`staircase-onboard premerge <step>`; once the audit is clean, delivery writes
+the cheap half of it to `reports/premerge.md` with the remaining commands:
+
+| step | does |
+|---|---|
+| `lint` | pre-commit twice over the changed files (`PRE_COMMIT_HOME` made writable); commits the formatting only when pass 2 is clean, with an AST proof that it changed nothing but formatting |
+| `ci` | one test-db line, run as CI runs it (the line as `--test-list`, CI's flags and cwd), recording `HEAD` at start and end |
+| `copyright` | NVIDIA headers on new source files, current year on modified ones |
+| `hygiene` | per commit: sign-off by the author, no co-author, no symlink, no placeholder |
+| `split` | the branch split by path into PR stacks, with checks that they reproduce it |
+| `resign` | a new branch with missing sign-offs added, each signed as the commit's own author |
+| `pr-open` | opt-in: a draft PR through the GitHub API; a dry run unless `--yes`. Nothing in the pack pushes |
+
+## Source embargo
+
+`source_embargo` in `task.yaml` lists paths no role may read. Entries take
+three forms:
+- a repo-relative path, for an implementation of this exact checkpoint in the
+  tree;
+- an absolute path outside the repo, for a sibling engine's checkout (a
+  directory embargoes its whole tree);
+- `package:<path>`, inside this workflow package, for its own worked
+  examples, e.g. `package:examples/<model>.md`.
+
+On every in-process role whose backend runs SDK hooks (`embargo.py`, through
+`BackendConfig.hooks`):
+- a `PreToolUse` hook refuses `Read`/`Edit`/`Write` on those paths, `Grep`
+  inside them, and shell commands that read them;
+- a `PostToolUse` hook removes their lines from a broad search's output.
+
+Running the other implementation, as an accuracy oracle, stays allowed.
+
+Where no hook can run, the role's system prompt says so and restates the list
+with absolute paths. That covers a role on `codex`, which refuses per-client
+callbacks, and a turn on the external transport, which runs in a session the
+orchestrator does not own.
+
+Every refusal, redaction and instruction is logged to
+`<workspace>/embargo/attempts.jsonl`.
 
 ## What this workflow does not do
 
 - **Performance.** Perf is measured, never gated, and it is not part of
   onboarding. A target whose two gates are green is deliverable; the tuning
   campaign is separate work.
-- **Isolation.** Staircase denied every agent read access to TensorRT-LLM's
-  per-model definitions, so that a target could not be a transliteration of
-  the implementation it is compared against. That hook is **not** ported: the
-  zoo is an ordinary read. What carries the duty instead is the
+- **Isolation of the model zoo.** Staircase denied every agent read access to
+  TensorRT-LLM's per-model definitions. That blanket hook is **not** ported:
+  the zoo is an ordinary read. What carries the duty instead is the
   `modeling-core` invariants — a copied forward cannot pass the
   closed-vocabulary audit, is not flat, and leans on shared helpers a target
   may not have — plus the rule kept verbatim in all three writing roles:
-  *read to understand an interface, never to copy a structure*. If a future
-  run needs the stronger claim, a per-layer `PreToolUse` hook through
-  `BackendConfig.hooks` is a small, self-contained change.
+  *read to understand an interface, never to copy a structure*.
+
+  A **targeted** embargo is enforced instead: see
+  [Source embargo](#source-embargo).
 
 ## Tests
 
 ```bash
-pytest tests/workflows/staircase_onboard/
+cd agent-flow && pytest tests/workflows/staircase_onboard/
 ```
 
 Every test runs on CPU with no model, no GPU and no cluster: the probes and
 the shell are injected, and the agent layers are replaced by a fake that
-writes the typed decision a real role would have written. Two exceptions earn
-their keep by reading the real checkout — `test_delivery.py` verifies the
-merged `gpt_oss / sm_103 / tp1` target passes every delivery check, and
-`test_skills.py` resolves every repository path the skills name.
+writes the typed decision a real role would have written. A few earn their
+keep by reading the real checkout, and each reads only what main has:
+
+- `test_delivery.py` verifies that both merged targets,
+  `gpt_oss/gpt_oss_120b__sm_103__tp1` and
+  `deepseek_v3/r1_0528_nvfp4__sm_103__dep4`, pass every delivery check;
+- `test_skills.py` resolves every repository path the skills name;
+- `test_kernel_sources.py` and `test_runtime_index.py` hold the registries to
+  the tree they describe;
+- `test_dspark.py` checks the quickstart `DSPARK` contract against a fixture,
+  and against this checkout's quickstart once that has the arm;
+- `test_speculation_support.py` reads this checkout's quickstart and LLM API
+  for the speculators they handle;
+- `test_catalog_index.py` migrates a copy of the real catalog index to
+  fragments without losing a row;
+- `test_build_and_test_doc.py` holds `BUILD_AND_TEST.md` to the repository:
+  its paths, build flags and test lists.
+
+`test_worked_examples.py` and `test_package_hygiene.py` keep checkpoint
+specifics, session placeholders and personal paths out of what the package
+ships.
 
 ## Feature increments
 
@@ -265,14 +731,32 @@ without the offload, token-identical output across the disaggregation hop, or
 stored KV bytes per token against a declared figure (plus token identity with
 bf16 storage).
 
-The bounded-replay row is the opposite case with the same need. DeepSeek-V4.1's
-SWA Bounded Replay truncates sliding-window state on purpose, so accuracy is a
+The bounded-replay row is the opposite case with the same need. Sliding-window
+bounded replay truncates sliding-window state on purpose, so accuracy is a
 real check of it — but the truncation is designed to stay inside the accuracy
 tolerance, and a unit that implements nothing stays inside it too. Its witness
 reads per-request row counters the target prints (`MODELING_V2_WITNESS
 key=<int> ...` under `TRTLLM_MODELING_V2_WITNESS=1`) against a window and a
 workload the spec declares before assembly.
 
-`dspark` is its own kind and never a spelling of `mtp`: DeepSeek-V4.1 stores
+`dspark` is its own kind and never a spelling of `mtp`: a checkpoint can store
 its DSpark block drafter as `mtp.*`, and `--spec_decode_algo=MTP` over those
 weights builds the wrong drafter. The schema refuses the two together.
+
+## Worked examples, and what a run is handed
+
+The skills, `runtime_index.yaml`, `kernel_sources.yaml` and
+`task.example.yaml` describe the workflow's features without naming a
+checkpoint, because a run is handed them and must derive a model's specifics
+itself. One model's values for those features (pool formats and byte
+arithmetic, replay windows, drafter constants, witness switches) are in
+[`examples/`](examples/), as a worked example for operators writing a
+`task.yaml`. A run does not materialize `examples/`. A run that onboards that
+model to measure the workflow embargoes it as `package:examples/<model>.md`,
+which resolves against this package wherever it is installed.
+
+`kernel_sources.yaml` names each kernel source's registration files, and a
+source may also claim unnamed `custom_ops/*.py` files by content
+(`claims_files_containing`). Tree-local Triton ops, which a model's onboarding
+adds one at a time and under no naming convention, therefore classify without
+editing the registry.
