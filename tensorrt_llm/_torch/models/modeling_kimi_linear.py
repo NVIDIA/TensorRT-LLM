@@ -3336,6 +3336,11 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
                     projection = getattr(attention, name)
                     projection._fused_projection = (weakref.ref(fused), offset)
                     offset += projection.out_features
+                    # Repoint to the fused rows now rather than in post_load:
+                    # deferring kept every layer's standalone codes alongside
+                    # its fused copy, ~22.6 GiB at peak across K3's 69 KDA
+                    # layers, which overflows a DEP8 context rank.
+                    projection.transform_weights()
         logger.info(
             f"Kimi K3: loaded {num_params} parameters and expert slices of {num_moe_layers} layers"
         )
