@@ -116,14 +116,15 @@ class _Router:
 
         Copying the router's own fingerprint would make the write-back tests agree by
         construction and hide any difference between how the two sides describe the
-        same rendering configuration.
+        same rendering configuration. A worker's ``processor`` is ``AutoProcessor``'s result,
+        which is the tokenizer itself for a text-only checkpoint, not ``None``.
         """
         from tensorrt_llm.inputs.registry import DefaultInputProcessor
 
         server = SimpleNamespace(
             tokenizer=tokenizer,
             model_config=SimpleNamespace(model_type=None),
-            processor=None,
+            processor=tokenizer,
             chat_template=None,
             allow_request_chat_template=False,
             generator=SimpleNamespace(

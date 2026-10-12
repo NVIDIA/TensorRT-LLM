@@ -222,11 +222,13 @@ class BlockHashMixin:
                     self._custom_tokenizer, model_path, trust_remote_code=trust_remote_code
                 )
             else:
-                from tensorrt_llm.tokenizer import TransformersTokenizer
+                from tensorrt_llm.tokenizer import load_hf_tokenizer
 
-                tokenizer = TransformersTokenizer.from_pretrained(
-                    model_path, trust_remote_code=trust_remote_code
-                )
+                # The loader a worker and the standalone renderer use, so the tokenizer's
+                # init options (and so its fingerprint) are the same as theirs.
+                tokenizer = load_hf_tokenizer(model_path, trust_remote_code=trust_remote_code)
+                if tokenizer is None:
+                    raise ValueError(f"Could not load a tokenizer from {model_path!r}.")
                 self._tokenizers[model] = tokenizer.tokenizer
         return self._tokenizers[model]
 
