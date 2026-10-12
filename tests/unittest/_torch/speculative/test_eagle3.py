@@ -1105,7 +1105,8 @@ def test_multi_eagle3(use_one_model: bool):
 @with_mocked_hf_download_for_single_gpu
 def test_llama_eagle3_rejection_sampling_modes(use_dynamic_tree: bool,
                                                use_cuda_graph: bool):
-    """Test one-model rejection sampling with and without dynamic tree."""
+    """Test one-model rejection sampling with and without dynamic tree, with
+    more than one generation request per step."""
     total_mem_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
     if total_mem_gb < 35:
         pytest.skip("Not enough memory to load target + draft model")
@@ -1114,13 +1115,13 @@ def test_llama_eagle3_rejection_sampling_modes(use_dynamic_tree: bool,
     target_model_dir = f"{models_path}/llama-3.1-model/Llama-3.1-8B-Instruct"
     eagle_model = f"{models_path}/EAGLE3-LLaMA3.1-Instruct-8B"
 
-    max_batch_size = 1
+    max_batch_size = 2
     max_draft_len = 6
     dynamic_tree_max_top_k = 10
     max_total_draft_tokens = 60
     kv_cache_config = KvCacheConfig(enable_block_reuse=False, max_tokens=8192)
     cuda_graph_config = CudaGraphConfig(
-        batch_sizes=[1]) if use_cuda_graph else None
+        batch_sizes=[1, 2]) if use_cuda_graph else None
 
     llm_common_config = dict(
         model=target_model_dir,
@@ -1148,14 +1149,17 @@ def test_llama_eagle3_rejection_sampling_modes(use_dynamic_tree: bool,
                    speculative_config=Eagle3DecodingConfig(
                        **spec_config_kwargs))
 
-    prompts = ["The president of the United States is"]
+    prompts = [
+        "The president of the United States is",
+        "The capital of France is",
+    ]
     sampling_params = SamplingParams(max_tokens=20, temperature=1.0, top_p=1.0)
 
     results = llm_spec.generate(prompts, sampling_params)
     llm_spec.shutdown()
 
     assert len(results) == len(prompts)
-    assert len(results[0].outputs[0].token_ids) > 0
+    assert all(len(result.outputs[0].token_ids) > 0 for result in results)
 
 
 @pytest.mark.parametrize("disable_overlap_scheduler", [False, True])

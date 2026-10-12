@@ -499,6 +499,10 @@ struct MaxInt32Op
 // Matches the maximum supported K branching factor (dynamic_tree_max_topK).
 constexpr int32_t kMaxTriedPerLevel = 32;
 
+//! First Philox subsequence of the per-request streams, as in FusedSamplingParams::perRowRng: a
+//! request's offset selects its subsequence above this base.
+constexpr uint64_t kPerRowSubsequenceBase = 1ull << 63;
+
 //! \param acceptIndex         output [batchSize, numSpecStep] int64 — tree positions of accepted tokens.
 //! \param acceptTokenNum      output [batchSize] int64 — # accepted draft tokens (excl. root).
 //! \param acceptToken         output [batchSize, numSpecStep] int64 — accepted/correction token ids.
@@ -511,8 +515,10 @@ constexpr int32_t kMaxTriedPerLevel = 32;
 //! \param numSpeculativeTokens second dim of acceptIndex/acceptToken (= max_draft_len + 1).
 //! \param numDraftTokens      total tree nodes per request (including root).
 //! \param vocabSize           vocabulary size.
-//! \param seed                [1] int64 on GPU. Philox RNG seed.
-//! \param offset              [1] int64 on GPU. Philox RNG offset.
+//! \param seed                [batchSize] int64 on GPU. Philox RNG seed per request.
+//! \param offset              [batchSize] int64 on GPU. Philox RNG offset per request. It names the
+//!                            request's own subsequence, so the request's draws depend only on its own
+//!                            seed/offset, not on its row.
 template <int32_t BLOCK_SIZE>
 __global__ void verifyDynamicTreeRejectionKernel(int64_t* acceptIndex, int64_t* acceptTokenNum, int64_t* acceptToken,
     int64_t const* draftTokens, float const* targetProbs, int32_t const* retrieveNextToken,
@@ -563,7 +569,7 @@ __global__ void verifyDynamicTreeRejectionKernel(int64_t* acceptIndex, int64_t* 
     if (tid == 0)
     {
         curand_init(
-            static_cast<uint64_t>(seed[0]), static_cast<uint64_t>(bx), static_cast<uint64_t>(offset[0]), &state);
+            static_cast<uint64_t>(seed[bx]), kPerRowSubsequenceBase | static_cast<uint64_t>(offset[bx]), 0, &state);
     }
     __syncthreads();
 
