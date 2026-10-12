@@ -160,13 +160,13 @@ class _Layer:
 @pytest.mark.parametrize(
     "seq_lens,num_contexts,rows,path",
     [
-        ([1], 0, 1, DecodeStep(1, 1, 1)),
-        ([1] * 8, 0, 8, DecodeStep(8, 8, 1)),
-        ([8], 0, 8, DecodeStep(8, 1, 8)),
-        ([8, 8], 0, 16, DecodeStep(16, 2, 8)),
-        ([5], 1, 5, DecodeStep(5)),
-        ([3, 1], 1, 4, DecodeStep(4)),
-        ([3, 2], 0, 5, DecodeStep(5)),
+        ([1], 0, 1, (1, 1, 1)),
+        ([1] * 8, 0, 8, (8, 8, 1)),
+        ([8], 0, 8, (8, 1, 8)),
+        ([8, 8], 0, 16, (16, 2, 8)),
+        ([5], 1, 5, (5,)),
+        ([3, 1], 1, 4, (4,)),
+        ([3, 2], 0, 5, (5,)),
         ([1024], 1, 1024, "generic"),
         ([100, 8], 1, 108, "generic"),
         ([1] * 9, 0, 9, "generic"),
@@ -185,4 +185,4 @@ def test_each_step_takes_one_path_through_every_layer(target, seq_lens, num_cont
     model._latent_push = lambda attn_metadata, step: False
     model._final_norm = lambda hidden_states, *args: hidden_states
     model.forward(_metadata(seq_lens, num_contexts), input_ids=torch.zeros(rows, dtype=torch.long))
-    assert calls == [path] * 3
+    assert calls == [path if path == "generic" else target.DecodeStep(*path)] * 3
