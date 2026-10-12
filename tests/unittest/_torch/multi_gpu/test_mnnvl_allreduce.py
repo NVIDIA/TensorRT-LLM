@@ -859,6 +859,8 @@ def test_mnnvl_checkpoint_rejects_wrong_group_membership(
         range(world_size),
     )
     assert all(results)
+
+
 @pytest.mark.skipif(torch.cuda.device_count() < 2,
                     reason="needs 2 GPUs to run this test")
 @pytest.mark.parametrize("seq_len, hidden_size", RMS_NORM_SHAPE_CASES)
