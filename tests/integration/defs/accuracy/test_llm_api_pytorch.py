@@ -900,7 +900,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_device(4)
     @pytest.mark.skip_device_not_contain(["GB200"])
     @parametrize_with_ids("moe_backend", ["TRTLLM"])
-    @parametrize_with_ids("fp8kv", [True])
+    @parametrize_with_ids("fp8kv", [True, False])
     def test_nvfp4_4gpus_online_eplb(self, moe_backend, fp8kv):
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7)
         num_slots = 80
@@ -1400,6 +1400,18 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         with llm:
             task = JsonModeEval(self.MODEL_NAME)
             task.evaluate(llm)
+
+    @skip_pre_hopper
+    def test_dummy_load_format(self):
+        llm = LLM(
+            f"{llm_models_root()}/DeepSeek-V3-Lite/fp8",
+            load_format="dummy",
+            moe_config=MoeConfig(
+                backend="DEEPGEMM" if get_sm_version() >= 100 else "CUTLASS"),
+        )
+        with llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm, is_integration_test=True)
 
 
 @pytest.mark.timeout(14400)
