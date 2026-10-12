@@ -105,7 +105,7 @@ _FC1_K_ALIGN = _weights.FC1_K_ALIGN
 _SF_LINEAR = False
 
 
-class _Layer(NamedTuple):
+class _LayerWeights(NamedTuple):
     """One decoder layer's weights, as the views the ops read: `.t()` for the GEMM operands,
     and the *next* layer's input norm (the final norm on the last layer) as `norm_next`."""
 
@@ -126,9 +126,9 @@ class _Layer(NamedTuple):
     norm_next: torch.Tensor
 
 
-def _layer_views(w, num_layers: int) -> list[_Layer]:
+def _layer_views(w, num_layers: int) -> list[_LayerWeights]:
     return [
-        _Layer(
+        _LayerWeights(
             qkv=w[f"l{i}_qkv"].t(),
             qkv_bias=w[f"l{i}_qkv_bias"],
             sinks=w[f"l{i}_sinks"],

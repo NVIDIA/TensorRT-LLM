@@ -331,9 +331,22 @@ class DeepseekV3Dep4ModelingV2(DecoderModel):
         lora_params: dict | None = None,
         **kwargs,
     ) -> torch.Tensor:
-        """Derive what the first step fixes, then route."""
-        self._derive_first_step(attn_metadata)
-        return self._select_target(attn_metadata).forward(
+        md = attn_metadata
+        if self._derive_pending:
+            # Two things the first step fixes, both deciding what the model computes
+            # rather than whether it is well-formed -- so unconditional, not part of the
+            # targets' opt-in contract probe. A rope table shorter than the engine's
+            # max_seq_len is read out of bounds with no check, and `rope_max_positions`
+            # is one of the arguments the MLA path ignores; `speculative_config` inflates
+            # max_seq_len past `max_position_embeddings`, so take the engine's own number.
+            if md.max_seq_len > self._rope_positions:
+                self._rope_positions = md.max_seq_len
+                self._rope = self._rope_tables(self.w["final_norm"].device, self._rope_positions)
+            self._cached_ctx = all(hasattr(md, n) for n in _CACHED_CTX_FIELDS) and bool(
+                md.enable_context_mla_with_cached_kv
+            )
+            self._derive_pending = False
+        return self._select_target(md).forward(
             attn_metadata,
             input_ids=input_ids,
             position_ids=position_ids,
@@ -377,36 +390,13 @@ class DeepseekV3Dep4ModelingV2(DecoderModel):
             "head_norm": w[f"l{nl}_head_norm"],
         }
 
-    def _derive_first_step(self, md) -> None:
-        """Grow the rope table to cover every position the engine admits, and fix the context
-        flavor this engine construction runs.
-
-        Unconditional, unlike the targets' contract probe: both of these decide what the
-        model computes, not whether it is well-formed. They used to hang off that probe
-        and so ran only under TRTLLM_MODELING_V2_VALIDATE, which the accuracy tests set
-        and a served engine does not -- leaving production with a rope table sized to
-        `max_position_embeddings` and `_cached_ctx` stuck at False.
-        """
-        if not self._derive_pending:
-            return
-        # A table shorter than the engine's max_seq_len is read out of bounds with no check, and
-        # `rope_max_positions` is one of the arguments the MLA path ignores. `speculative_config`
-        # inflates max_seq_len past `max_position_embeddings`, so take the engine's own number.
-        if md.max_seq_len > self._rope_positions:
-            self._rope_positions = md.max_seq_len
-            self._rope = self._rope_tables(self.w["final_norm"].device, self._rope_positions)
-        self._cached_ctx = all(hasattr(md, n) for n in _CACHED_CTX_FIELDS) and bool(
-            md.enable_context_mla_with_cached_kv
-        )
-        self._derive_pending = False
-
     def _dp_rows(self, md, num_tokens: int) -> int:
         """The uniform row count every rank pads its token block to before the MoE round trip."""
         counts = [int(n) for n in md.all_rank_num_tokens]
         return max(counts)
 
 
-class _Layer(NamedTuple):
+class _LayerWeights(NamedTuple):
     """One trunk layer's weights, as the views the ops read.
 
     GEMM operands are `.t()` views; `k_b` / `v_b_t` are the two halves of `kv_b` in the
@@ -445,8 +435,8 @@ class _Layer(NamedTuple):
     out2_scale: torch.Tensor | None
 
 
-def _layer_views(core: "DeepseekV3Dep4ModelingV2") -> list[_Layer]:
-    """Every trunk layer's `_Layer`, read off the realized weights."""
+def _layer_views(core: "DeepseekV3Dep4ModelingV2") -> list[_LayerWeights]:
+    """Every trunk layer's `_LayerWeights`, read off the realized weights."""
     cfg = core.model_config.pretrained_config
     w = core.w
     num_layers = cfg.num_hidden_layers
@@ -498,7 +488,7 @@ def _layer_views(core: "DeepseekV3Dep4ModelingV2") -> list[_Layer]:
                 out2_scale=(e_isc2 * w[f"l{i}_e_ws2_2"][window]).contiguous(),
             )
         layers.append(
-            _Layer(
+            _LayerWeights(
                 qa=w[f"l{i}_qa"].t(),
                 q_norm=w[f"l{i}_q_norm"],
                 qb=w[f"l{i}_qb"].t(),
@@ -557,7 +547,7 @@ class PrefillTarget:
         """The batch state both MLA calls of one step share."""
         return _build_step_args(md)
 
-    def _dense_mlp(self, x, L: _Layer, dt):
+    def _dense_mlp(self, x, L: _LayerWeights, dt):
         """One NVFP4 SwiGLU MLP over this rank's own tokens, used for both the dense layers' MLP
         and every MoE layer's shared expert."""
         xq, xsf = fp4_quantize(x, L.mlp_gu_gscale, _SF_VEC, False, _SF_SWIZZLED)
@@ -1253,7 +1243,7 @@ class DecodeTarget:
         step["num_ctx_tokens"] = 0
         return step
 
-    def _dense_mlp(self, x, L: _Layer, dt):
+    def _dense_mlp(self, x, L: _LayerWeights, dt):
         """One NVFP4 SwiGLU MLP over this rank's own tokens, used for both the dense layers' MLP
         and every MoE layer's shared expert."""
         xq, xsf = fp4_quantize(x, L.mlp_gu_gscale, _SF_VEC, False, _SF_SWIZZLED)
