@@ -80,6 +80,46 @@ test('author response before stale clears waiting for feedback', () => {
   assert.equal(decide(s, Date.parse(at(13))), 'skip');
   assert.equal(decide(s, Date.parse(at(24))), 'mark');
 });
+test('old-dated push after the feedback request counts as an answer via the recorded head', () => {
+  const s = snapshot(); s.issue.labels = [{name: 'waiting for feedback'}]; s.head = 'def';
+  s.timeline = [{event: 'labeled', label: {name: 'waiting for feedback'}, actor: bot, created_at: at(10)},
+    {event: 'committed', author: user, committer: {date: at(5)}}];
+  assert.equal(decide(s, Date.parse(at(13))), 'answered');
+  s.head = 'abc';
+  assert.equal(decide(s, Date.parse(at(13))), 'skip');
+  assert.equal(decide(s, Date.parse(at(24))), 'mark');
+  // A head recorded before the request says nothing about this request.
+  s.head = 'def'; s.comments[0].created_at = at(9);
+  assert.equal(decide(s, Date.parse(at(13))), 'skip');
+  // Legacy label without a timeline event stays conservative.
+  s.comments[0].created_at = at(10); s.timeline.shift();
+  assert.equal(decide(s, Date.parse(at(13))), 'skip');
+});
+test('feedback re-requested after a stale cycle lifts stale instead of answering or closing', () => {
+  const s = snapshot();
+  s.comments.push({user, created_at: at(12)});
+  s.timeline.push({event: 'unlabeled', label: {name: 'waiting for feedback'}, actor: bot, created_at: at(12)},
+    {event: 'labeled', label: {name: 'waiting for feedback'}, actor: maintainer, created_at: at(15)});
+  assert.equal(decide(s, Date.parse(at(16))), 'lift');
+  s.comments.pop();
+  assert.equal(decide(s, Date.parse(at(40))), 'lift');
+  s.head = 'def';
+  assert.equal(decide(s, Date.parse(at(40))), 'lift');
+  // Once stale is dropped, the new request gets its own 14 days.
+  s.issue.labels = [{name: 'waiting for feedback'}]; s.head = 'abc';
+  assert.equal(decide(s, Date.parse(at(28))), 'skip');
+  assert.equal(decide(s, Date.parse(at(29))), 'mark');
+});
+test('labels restored together a second apart are one request, not a re-request', () => {
+  const s = snapshot();
+  s.timeline.push({event: 'labeled', label: {name: 'waiting for feedback'}, actor: maintainer,
+    created_at: new Date(Date.parse(at(10)) + 1000).toISOString()});
+  assert.equal(decide(s, Date.parse(at(23))), 'skip');
+  assert.equal(decide(s, Date.parse(at(24))), 'close');
+  // An earlier withdrawal, before this stale label, does not qualify either.
+  s.timeline.unshift({event: 'unlabeled', label: {name: 'waiting for feedback'}, actor: bot, created_at: at(2)});
+  assert.equal(decide(s, Date.parse(at(24))), 'close');
+});
 test('legacy waiting label without a timeline event is never cleared by old author comments', () => {
   const s = snapshot(); s.issue.labels = [{name: 'waiting for feedback'}]; s.timeline = [];
   s.comments.push({user, created_at: at(5)});

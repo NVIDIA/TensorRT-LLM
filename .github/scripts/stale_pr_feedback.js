@@ -45,6 +45,7 @@ function decide({issue, timeline, comments, reviews, reviewComments, head}, now)
   let authorActivity = lastActivity;
   let waitingAt = lastActivity;
   let waitingKnown = false;
+  let waitingRemovedAt;
   let staleAt;
   const record = (time, byAuthor) => {
     lastActivity = Math.max(lastActivity, time);
@@ -53,6 +54,7 @@ function decide({issue, timeline, comments, reviews, reviewComments, head}, now)
   for (const event of timeline) {
     const label = event.label?.name?.toLowerCase();
     if (label === WAITING && event.event === 'labeled') { waitingAt = timestamp(event.created_at); waitingKnown = true; }
+    if (label === WAITING && event.event === 'unlabeled') waitingRemovedAt = timestamp(event.created_at);
     if (label === STALE && event.event === 'labeled') staleAt = timestamp(event.created_at);
     if (label === STALE && event.event === 'unlabeled') staleAt = undefined;
     if (!ACTIVITY_EVENTS.has(event.event) || isBot(event.actor)) continue;
@@ -69,34 +71,43 @@ function decide({issue, timeline, comments, reviews, reviewComments, head}, now)
     if (isBot(item.user) || item.state === 'PENDING') continue;
     record(timestamp(item.updated_at || item.submitted_at || item.created_at), isAuthor(item.user));
   }
-  if (!labels.includes(STALE)) {
-    // The label workflow clears the request on comments only; pushes and formal
-    // reviews by the author are answers too. Legacy PRs without a label event
-    // have no request time to compare against and keep the label.
-    if (waitingKnown && authorActivity > waitingAt) return 'answered';
-    return now - Math.max(lastActivity, waitingAt) >= 14 * DAY ? 'mark' : 'skip';
-  }
-  // Never infer a closure deadline from updated_at: bot writes also update it.
-  if (staleAt === undefined) throw new Error('Stale label has no corresponding timeline event');
-  // A pushed commit can retain an old commit date. The recorded head catches
-  // these updates as well as rebases, even when the committer is an automation.
-  // `assessment-head` is written by the external PR-triage publisher
-  // (svc-trtllm-gh-bot) when it labels a PR; `stale-head` and `stale-baseline`
-  // by this script. All record the full 40-hex head SHA.
-  const baselines = comments.filter(comment =>
+  // A pushed commit can retain an old commit date, and an ordinary push leaves
+  // no timeline event. Recorded heads catch these updates as well as rebases,
+  // even when the committer is an automation. `assessment-head` is written by
+  // the external PR-triage publisher (svc-trtllm-gh-bot) when it labels a PR;
+  // `stale-head` and `stale-baseline` by this script. All record the full
+  // 40-hex head SHA. Newest record first.
+  const headRecords = comments.filter(comment =>
     ['svc-trtllm-gh-bot', 'github-actions[bot]'].includes(comment.user?.login)
   ).flatMap(comment => {
     const created = timestamp(comment.created_at);
     const body = comment.body || '';
     const initial = body.match(/<!-- (?:assessment|stale)-head:([0-9a-f]+) -->/);
     const recovery = body.match(/<!-- stale-baseline:(\d+) head:([0-9a-f]+) -->/);
-    if (recovery && Number(recovery[1]) === staleAt && created >= staleAt) {
-      return [{head: recovery[2], created}];
-    }
-    if (initial && created <= staleAt) return [{head: initial[1], created}];
+    if (recovery) return [{head: recovery[2], created, staleAt: Number(recovery[1])}];
+    if (initial) return [{head: initial[1], created}];
     return [];
   }).sort((a, b) => b.created - a.created);
-  const baseline = baselines[0];
+  if (!labels.includes(STALE)) {
+    // The label workflow clears the request on comments only; pushes and formal
+    // reviews by the author are answers too, as is a head that moved since the
+    // newest head recorded for this request. Legacy PRs without a label event
+    // have no request time to compare against and keep the label.
+    const requestHead = headRecords.find(record => record.created >= waitingAt)?.head;
+    if (waitingKnown && authorActivity > waitingAt) return 'answered';
+    if (waitingKnown && head && requestHead && head !== requestHead) return 'answered';
+    return now - Math.max(lastActivity, waitingAt) >= 14 * DAY ? 'mark' : 'skip';
+  }
+  // Never infer a closure deadline from updated_at: bot writes also update it.
+  if (staleAt === undefined) throw new Error('Stale label has no corresponding timeline event');
+  // The label workflow removes only `waiting for feedback` when the author
+  // replies and re-adds it on the next maintainer comment, leaving `stale` from
+  // the previous cycle in place. A request withdrawn and re-issued after the
+  // stale label starts a fresh cycle: drop `stale` and let the pre-stale path
+  // mark again. Labels applied together, in any order, do not qualify.
+  if (waitingRemovedAt !== undefined && waitingRemovedAt >= staleAt && waitingAt > waitingRemovedAt) return 'lift';
+  const baseline = headRecords.find(record => record.staleAt === undefined
+    ? record.created <= staleAt : record.staleAt === staleAt && record.created >= staleAt);
   const recordedHead = baseline?.head;
   if (head && recordedHead && head !== recordedHead) return 'unstale';
   if (authorActivity > staleAt) return 'unstale';
