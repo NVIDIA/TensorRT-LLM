@@ -372,6 +372,7 @@ def test_context_model_capacity_profile_uses_real_dummy_requests(
     if not has_transceiver:
         executor.kv_cache_transceiver = None
     executor.max_beam_width = 1
+    executor.kv_cache_manager = None
     executor.sampler = Mock()
     executor._configure_csa2_remote_tail = types.MethodType(
         PyExecutor._configure_csa2_remote_tail, executor
