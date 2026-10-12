@@ -642,7 +642,9 @@ public:
     }
 
     //! Always set: an unset configured maxQuota resolves to the host memory the
-    //! OS reports, and the pools reserve against that resolved value.
+    //! OS reports, and the pools reserve against that resolved value. Rounded
+    //! up to poolSizeGranularity(), which is the quantum quotas are expressed
+    //! in, so the configured bound is reachable.
     [[nodiscard]] std::optional<size_t> maxQuota() const noexcept override
     {
         return mMaxQuota;

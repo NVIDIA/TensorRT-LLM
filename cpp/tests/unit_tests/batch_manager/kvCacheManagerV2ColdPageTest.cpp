@@ -1057,6 +1057,27 @@ TEST(KvCacheManagerV2ColdPageTest, ResizeBeyondMaxQuotaIsRefused)
     EXPECT_EQ(manager->getQuota(coldLevel), quotaBefore) << "the refused resize must not have taken effect";
 }
 
+//! A max_quota that is not a multiple of the tier's commit unit must still be
+//! reachable. Every requested quota is rounded up to that unit before it is
+//! compared, so a bound left unrounded would sit below the smallest quota that
+//! can represent it and refuse a resize the pools have the address space for.
+TEST(KvCacheManagerV2ColdPageTest, ResizeToUnalignedMaxQuotaIsAllowed)
+{
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    constexpr size_t kQuota = size_t{128} << 20;
+    // One MiB past a multiple of the 2 MiB commit unit this quota resolves to.
+    constexpr size_t kMaxQuota = kQuota + (size_t{1} << 20);
+
+    auto config = makeSplitColdGroupingConfig();
+    config.cacheTiers[1] = HostCacheTierConfig{kQuota, kMaxQuota};
+    auto manager = std::make_shared<KvCacheManager>(std::move(config));
+    CacheLevel const coldLevel{1};
+
+    EXPECT_TRUE(manager->resize(coldLevel, kMaxQuota, /*bestEfforts=*/false))
+        << "growing to an unaligned bound must work";
+    EXPECT_GE(manager->getQuota(coldLevel), kMaxQuota) << "the resize must have taken effect";
+}
+
 TEST(KvCacheManagerV2ColdPageTest, FallenPagesRetainHighestPriorityAcrossLifecycleQueues)
 {
     ASSERT_EQ(cudaSetDevice(0), cudaSuccess);

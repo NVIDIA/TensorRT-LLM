@@ -746,8 +746,11 @@ HostCacheLevelStorage::HostCacheLevelStorage(TypedVec<PoolGroupIndex, SlotDesc> 
     HostMemBackingOptions const& options)
     : mOptions(options)
     // Resolved once here so the bound the pools reserve against is the same one
-    // a later resize is checked against.
-    , mMaxQuota(maxQuota.value_or(hostTotalMemory()))
+    // a later resize is checked against. Quotas are quantized to the commit
+    // unit before they are compared, so the bound is quantized the same way: a
+    // bound that sat between two multiples would reject the very quota the
+    // pools had already reserved for.
+    , mMaxQuota(roundUp(maxQuota.value_or(hostTotalMemory()), options.commitUnit))
 {
     TLLM_CHECK_WITH_INFO(slotCountList.size() == slotDescList.size(),
         "HostCacheLevelStorage: slotCountList and slotDescList must have the same length");
