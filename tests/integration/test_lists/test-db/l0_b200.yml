@@ -266,7 +266,7 @@ l0_b200:
   - unittest/_torch/speculative/test_chain_speculative_sampling_op.py
   - unittest/_torch/speculative/test_dynamic_tree_rejection_op.py
   - unittest/_torch/speculative/test_dynamic_tree_sampling_dispatch.py
-  - unittest/_torch/thop/parallel TIMEOUT (90)
+  - unittest/_torch/thop/parallel
   - unittest/_torch/kernels/parallel TIMEOUT (90)
   - unittest/_torch/visual_gen/kernels/parallel
   - unittest/_torch/thop/serial
