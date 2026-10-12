@@ -6,7 +6,7 @@
 - [KV Cache Compression Framework Design](#kv-cache-compression-framework-design)
   - [Design Philosophy](#design-philosophy)
   - [Architecture Overview](#architecture-overview)
-  - [Configuration and Integration with the Cache Manager](#configuration-and-integration-with-the-cache-manager)
+  - [Configuration and Setup of KV Cache Compression](#configuration-and-setup-of-kv-cache-compression)
   - [KV Cache Compression in the Executor Iteration Loop](#kv-cache-compression-in-the-executor-iteration-loop)
   - [KV Cache Compression in Cross-Request KV Management](#kv-cache-compression-in-cross-request-kv-management)
   - [Covering the Other Stages](#covering-the-other-stages)
@@ -135,7 +135,7 @@ The executor and the KV cache manager are existing components. The framework doe
 
 The executor loop hosts the stages inside a request (stages 1 to 3 in Figure 3); the cache manager hosts the stages beyond it (stages 4 and 5 in Figure 3), which need the cross-request mechanism. In the current implementation we use **storage-bound** compression as the first cross-request mechanism: it acts when a page moves to secondary storage, host or disk memory, and defines how the page is stored there. Today TriAttention implements the decode stage (stage 3) and NVFP4 cold-page compression the offload part of the after-request stage (stage 5). The rest of this section walks through the configuration, the two paths, and the stages still open.
 
-### Configuration and Integration with the Cache Manager
+### Configuration and Setup of KV Cache Compression
 
 TensorRT LLM has many modules a compression method may need to engage or change: the executor loop, the KV cache manager and its storage tiers, block reuse, speculative decoding. Which ones, and how, depends on the method. The configuration is where this is decided. One block, `kv_cache_compression_config`, holds:
 
