@@ -34,8 +34,8 @@ Synthetic loopback coverage of the KDA recurrent-state transfer path:
   ``MambaPolicy`` descriptors tile each layer's slot bytes exactly.
 
 * ``test_kda_transfer`` performs a real single-node NIXL loopback transfer
-  and bitwise-compares both dtypes on the gen side: matched and
-  heterogeneous ctx/gen TP, attention-DP on and off.
+  with V1 and V2 cache managers and bitwise-compares both dtypes on the gen
+  side: matched and heterogeneous ctx/gen TP, attention-DP on and off.
 
 * ``test_kda_hetero_tp_sharded_accepted`` asserts that peer registration
   accepts heterogeneous ctx/gen TP with attention-DP off for what
@@ -49,7 +49,13 @@ from typing import List
 
 import pytest
 import torch
-from test_mamba_transfer import _create_transceivers, _run_concurrent
+from test_mamba_transfer import (
+    _create_transceivers,
+    _mamba_layer_ids,
+    _mamba_state_slot,
+    _run_concurrent,
+    _zero_mamba_states,
+)
 
 import tensorrt_llm
 import tensorrt_llm.bindings
@@ -67,7 +73,10 @@ from tensorrt_llm._torch.disaggregation.resource.kv_extractor import (
 )
 from tensorrt_llm._torch.disaggregation.resource.page import MambaLayerGroup
 from tensorrt_llm._torch.pyexecutor.config_utils import extract_mamba_kv_cache_params
-from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MixedMambaHybridCacheManager
+from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
+    MambaHybridCacheManagerV2,
+    MixedMambaHybridCacheManager,
+)
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestType
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.bindings import DataType
@@ -124,9 +133,12 @@ def _kimi_linear_config():
 
 
 def _create_kda_managers(
-    tp: int, enable_attention_dp: bool = False, max_batch_size: int = MAX_BATCH_SIZE
+    tp: int,
+    enable_attention_dp: bool = False,
+    max_batch_size: int = MAX_BATCH_SIZE,
+    use_v2: bool = False,
 ):
-    """Create MixedMambaHybridCacheManagers with K3-style KDA slots.
+    """Create V1 or V2 hybrid cache managers with K3-style KDA slots.
 
     Mirrors the ``is_kimi_linear`` route in ``_util.py``: the mamba params
     come from ``extract_mamba_kv_cache_params`` UNSCALED (global
@@ -150,7 +162,13 @@ def _create_kda_managers(
             pp_size=1,
             enable_attention_dp=enable_attention_dp,
         )
-        mgr = MixedMambaHybridCacheManager(
+        manager_cls = MambaHybridCacheManagerV2 if use_v2 else MixedMambaHybridCacheManager
+        manager_kwargs = (
+            {"is_disagg": True, "conv_state_layout": "q_k_v"}
+            if use_v2
+            else {"model_type": "qwen3_next"}
+        )
+        mgr = manager_cls(
             mamba_d_state=params.state_size,
             mamba_d_conv=params.conv_kernel,
             mamba_num_heads=params.num_heads,
@@ -165,6 +183,7 @@ def _create_kda_managers(
                 max_tokens=256 * max_batch_size,
                 enable_block_reuse=False,
                 event_buffer_max_size=0,
+                use_kv_cache_manager_v2=use_v2,
             ),
             kv_cache_type=CacheTypeCpp.SELF,
             num_layers=1,
@@ -176,7 +195,7 @@ def _create_kda_managers(
             max_batch_size=max_batch_size,
             mapping=mapping,
             dtype=DataType.FLOAT,
-            model_type="qwen3_next",
+            **manager_kwargs,
         )
         managers.append(mgr)
     return managers
@@ -541,7 +560,9 @@ def _generate_ground_truth(num_requests: int, seed: int = 20260722):
     return results
 
 
-def run_kda_transfer_test(ctx_tp: int, gen_tp: int, enable_attention_dp: bool = False):
+def run_kda_transfer_test(
+    ctx_tp: int, gen_tp: int, enable_attention_dp: bool = False, use_v2: bool = False
+):
     """Loopback KDA transfer, matched or heterogeneous ctx/gen TP.
 
     ADP off: per-rank state is a head shard (state_tp = tp) and every TP rank
@@ -560,13 +581,12 @@ def run_kda_transfer_test(ctx_tp: int, gen_tp: int, enable_attention_dp: bool = 
     def _gen_ranks(req_idx: int) -> List[int]:
         return [req_idx % gen_tp] if enable_attention_dp else list(range(gen_tp))
 
-    ctx_mgrs = _create_kda_managers(ctx_tp, enable_attention_dp=enable_attention_dp)
-    gen_mgrs = _create_kda_managers(gen_tp, enable_attention_dp=enable_attention_dp)
+    ctx_mgrs = _create_kda_managers(ctx_tp, enable_attention_dp=enable_attention_dp, use_v2=use_v2)
+    gen_mgrs = _create_kda_managers(gen_tp, enable_attention_dp=enable_attention_dp, use_v2=use_v2)
     ctx_tcs, gen_tcs = [], []
     try:
         for mgr in ctx_mgrs + gen_mgrs:
-            mgr._impl.mamba_cache.conv.zero_()
-            mgr._impl.mamba_cache.temporal.zero_()
+            _zero_mamba_states(mgr)
 
         config = CacheTransceiverConfig(
             backend="NIXL",
@@ -639,8 +659,8 @@ def run_kda_transfer_test(ctx_tp: int, gen_tp: int, enable_attention_dp: bool = 
             # state); with ADP off rank r holds shard r.
             shard_rank = rank % ctx_state_tp
             for req_idx, rid in enumerate(ctx_rids):
-                slot = mgr.mamba_cache_index[rid]
-                for layer_idx in mgr._impl.mamba_layer_offsets:
+                slot = _mamba_state_slot(mgr, rid)
+                for layer_idx in _mamba_layer_ids(mgr):
                     full = ground_truth[req_idx][layer_idx]
                     mgr.get_conv_states(layer_idx)[slot] = _shard_kda_conv(
                         full["conv"], ctx_state_tp, shard_rank
@@ -681,8 +701,8 @@ def run_kda_transfer_test(ctx_tp: int, gen_tp: int, enable_attention_dp: bool = 
             for req_idx, rid in enumerate(gen_rids):
                 if gen_rank not in _gen_ranks(req_idx):
                     continue
-                slot = mgr.mamba_cache_index[rid]
-                for layer_idx in mgr._impl.mamba_layer_offsets:
+                slot = _mamba_state_slot(mgr, rid)
+                for layer_idx in _mamba_layer_ids(mgr):
                     full = ground_truth[req_idx][layer_idx]
                     expected = {
                         "conv": _shard_kda_conv(full["conv"], gen_state_tp, shard_rank),
@@ -711,6 +731,7 @@ def run_kda_transfer_test(ctx_tp: int, gen_tp: int, enable_attention_dp: bool = 
 
 
 @pytest.mark.timeout(180)
+@pytest.mark.parametrize("use_v2", [False, True], ids=["v1", "v2"])
 @pytest.mark.parametrize(
     "ctx_tp,gen_tp,enable_attention_dp",
     [
@@ -730,11 +751,11 @@ def run_kda_transfer_test(ctx_tp: int, gen_tp: int, enable_attention_dp: bool = 
         "hetero_ctx_tp4_gen_tp2_adp_off_sharded",
     ],
 )
-def test_kda_transfer(ctx_tp, gen_tp, enable_attention_dp):
+def test_kda_transfer(ctx_tp, gen_tp, enable_attention_dp, use_v2):
     """KDA two-dtype state transfer over real NIXL loopback.
 
     Covers matched TP with ADP on/off, hetero DEP with ADP on, and hetero
     ctx/gen TP with ADP off (head-sharded state re-tiled by the TP-mismatch
     mappers, both expand and contract directions).
     """
-    run_kda_transfer_test(ctx_tp, gen_tp, enable_attention_dp=enable_attention_dp)
+    run_kda_transfer_test(ctx_tp, gen_tp, enable_attention_dp=enable_attention_dp, use_v2=use_v2)

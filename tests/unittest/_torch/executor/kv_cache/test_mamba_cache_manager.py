@@ -1027,7 +1027,34 @@ def test_kimi_disagg_rejects_non_python_transceiver_route(
         )
 
 
-def test_kimi_disagg_python_nixl_routes_to_mixed_manager(
+def test_kimi_disagg_defaults_use_v2_manager(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Kimi's default V2 manager supports the resolved Python NIXL route."""
+    from tensorrt_llm._torch.models.modeling_kimi_linear import KimiLinearForCausalLM
+
+    monkeypatch.delenv("TRTLLM_USE_PY_MAMBA", raising=False)
+    monkeypatch.delenv("TLLM_MAMBA_MANAGER_PREFERENCE", raising=False)
+    llm_args = TorchLlmArgs(
+        model="/tmp/dummy_model",
+        kv_cache_config=KvCacheConfig(enable_block_reuse=False, tokens_per_block=64),
+        cache_transceiver_config=CacheTransceiverConfig(backend="NIXL", transceiver_runtime="auto"),
+    )
+    _resolve_transceiver_runtime_auto(llm_args, KimiLinearForCausalLM)
+    _resolve_kv_cache_manager_v2_auto(llm_args, KimiLinearForCausalLM)
+
+    assert llm_args.kv_cache_config.use_kv_cache_manager_v2 is True
+    assert llm_args.cache_transceiver_config.transceiver_runtime == "PYTHON"
+    assert (
+        get_kv_cache_manager_cls(
+            _kimi_model_config(),
+            llm_args.kv_cache_config,
+            is_disagg=True,
+            cache_transceiver_config=llm_args.cache_transceiver_config,
+        )
+        is MambaHybridCacheManagerV2
+    )
+
+
+def test_kimi_disagg_explicit_v1_python_nixl_routes_to_mixed_manager(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.delenv("TRTLLM_USE_PY_MAMBA", raising=False)
