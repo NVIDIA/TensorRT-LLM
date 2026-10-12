@@ -248,7 +248,7 @@ Unless otherwise specified, the experiments below use GB300 GPUs, the paged KV c
 
 #### Performance
 
-The compression ratio follows from the format. Packed NVFP4 data plus one 8-bit scale per 16 values costs 0.5625 bytes per value, against 2 bytes for FP16 or BF16 and 1 byte for FP8. Figure 10 shows the measured size of one attention KV page off the GPU for four models. The recurrent-state buffers of hybrid models are stored as they are and do not shrink.
+The NVFP4 format alone brings a large reduction: a cold page costs 0.5625 bytes per value against 2 for FP16 or BF16 and 1 for FP8. Figure 10 compares the measured size of one attention KV page off the GPU with its uncompressed baseline for four models; the recurrent-state buffers of hybrid models are stored as they are and do not shrink.
 
 <div align="center">
 <figure>
@@ -259,7 +259,7 @@ The compression ratio follows from the format. Packed NVFP4 data plus one 8-bit 
 
 The serving effect of a smaller cold page is more capacity in the host and disk tiers, and therefore a higher prefix-cache hit rate when the working set does not fit. We show it along the GLM-5.2 Pareto frontier, in a GPU-limited deployment, and by where the reused pages are served from.
 
-NVFP4 cold pages extend the Pareto frontier. Figure 11 takes the ten highest-throughput points of the GLM-5.2 frontier with NVFP4 and shows, for each, the same configuration with an uncompressed host cache. The gain is largest where the uncompressed tier misses most, up to 84% more throughput per GPU and 4x the P90 interactivity, and fades to nothing where it already reads most prefixes; averaged over the ten points it is +21% throughput and +92% interactivity.
+Put together, compression and the cold-page mechanism move the serving frontier for agentic workloads. Figure 11 takes the ten highest-throughput points of the GLM-5.2 frontier with NVFP4 and shows, for each, the same configuration with an uncompressed host cache. The gain is largest where the uncompressed tier misses most, up to 84% more throughput per GPU and 4x the P90 interactivity, and fades to nothing where it already reads most prefixes; averaged over the ten points it is +21% throughput and +92% interactivity.
 
 <div align="center">
 <figure>
