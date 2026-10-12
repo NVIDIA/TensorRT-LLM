@@ -170,7 +170,7 @@ Once a request pauses or ends, its KV belongs to the cache manager, so that is w
 
 **How it plugs into `KVCacheManagerV2`.** `KVCacheManagerV2` keeps a hot representation on the GPU, one page spread over several kernel-facing pools, and a cold representation off the GPU, one fixed-size block per page, with a codec translating between the two. The default codec concatenates the pools into the block; NVFP4 cold-page compression is a codec that produces a smaller one, quantizing on the way out and dequantizing on the way back inside the same copy. `KVCacheManagerV2` calls the codec with batches of pages on its own stream and never looks inside the block, so it keeps ownership of pools, mappings and migration while the codec decides how a page is stored while cold. The codec and its kernels are described in the NVFP4 cold-page compression section below and in the [cold-page codec design guide](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/developer-guide/kv-cache-cold-page-codec.md).
 
-**Next.** The same fusion applies to the other movements on this path: the KV transfer between workers in disaggregated serving and the pause at a tool call are fuse points for future methods.
+In the next step, the same fusion applies to the other movements on this path: the KV transfer between workers in disaggregated serving and the pause at a tool call are fuse points for future methods.
 
 ## Algorithm Implementations
 
