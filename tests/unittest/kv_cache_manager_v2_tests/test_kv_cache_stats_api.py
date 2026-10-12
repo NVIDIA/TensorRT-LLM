@@ -155,7 +155,9 @@ def test_pending_connector_reuse_survives_a_split_and_a_shrink() -> None:
         assert iteration.iter_reused_blocks == 2
         assert iteration.iter_full_reused_blocks == 2
         assert iteration.iter_missed_blocks == 2
-    assert pending.connector_reused_blocks_by_life_cycle == {life_cycle: 2 for life_cycle in life_cycles}
+    assert pending.connector_reused_blocks_by_life_cycle == {
+        life_cycle: 2 for life_cycle in life_cycles
+    }
     # A block is rebooked at most once.
     assert not pending.record_connector_reuse(BlockOrdinal(1), BlockOrdinal(3))
 
@@ -164,7 +166,9 @@ def test_pending_connector_reuse_survives_a_split_and_a_shrink() -> None:
     assert pending.global_stats == KVCacheStatsDelta(
         alloc_total_blocks=4, alloc_new_blocks=4, reused_blocks=2, missed_blocks=2
     )
-    assert pending.connector_reused_blocks_by_life_cycle == {life_cycle: 1 for life_cycle in life_cycles}
+    assert pending.connector_reused_blocks_by_life_cycle == {
+        life_cycle: 1 for life_cycle in life_cycles
+    }
 
     assert pending.subtract_allocation_range(BlockOrdinal(0), BlockOrdinal(2))
     assert pending.empty

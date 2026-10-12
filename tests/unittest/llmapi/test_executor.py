@@ -254,17 +254,23 @@ def test_handle_response_propagates_should_abort():
 
 
 def test_PostprocWorker_Output_tracing_fields():
-    """PostprocWorker.Output carries finish_reason and num_generated_tokens for
-    tracing on the num_postprocess_workers > 0 path. Both fields are optional
-    and default to None when not populated by the worker."""
+    """PostprocWorker.Output carries tracing fields for postprocess workers.
+
+    finish_reason and num_generated_tokens are used for tracing on the
+    num_postprocess_workers > 0 path. Both fields are optional and default to
+    None when not populated by the worker.
+    """
     out = PostprocWorker.Output(client_id=0, res=None, is_final=False)
     assert out.finish_reason is None
     assert out.num_generated_tokens is None
 
 
 def test_handle_response_postproc_nonstreaming_propagates_metadata():
-    """On the non-streaming path (res is not CompletionOutput), finish_reason and
-    token_ids are set on _outputs[0] from the PostprocWorker.Output fields."""
+    """Non-streaming postproc responses propagate finish_reason and token_ids.
+
+    On the non-streaming path (res is not CompletionOutput), finish_reason and
+    token_ids are set on _outputs[0] from the PostprocWorker.Output fields.
+    """
     sampling_params = SamplingParams(max_tokens=10)
     result = GenerationResultBase(id=1, sampling_params=sampling_params)
 
@@ -283,10 +289,13 @@ def test_handle_response_postproc_nonstreaming_propagates_metadata():
 
 
 def test_handle_response_postproc_adds_prompt_tokens():
-    """With num_postprocess_workers > 0 the worker's record has no prompt, so
+    """Main-thread result fills PROMPT_TOKENS for postproc worker responses.
+
+    With num_postprocess_workers > 0 the worker's record has no prompt, so
     the main-thread result fills PROMPT_TOKENS in alongside the worker's
     cached-token count. Without it trtllm_prompt_tokens_total stays empty and
-    the Prometheus prefix hit rate has no denominator."""
+    the Prometheus prefix hit rate has no denominator.
+    """
     sampling_params = SamplingParams(max_tokens=10)
     result = GenerationResultBase(id=1, sampling_params=sampling_params)
     result.prompt_token_ids = list(range(300))
@@ -299,14 +308,13 @@ def test_handle_response_postproc_adds_prompt_tokens():
     assert MetricNames.PROMPT_TOKENS not in result.metrics_dict
 
     result._handle_response(
-        PostprocWorker.Output(client_id=1,
-                              res="mock_sse_data",
-                              is_final=True,
-                              metrics={
-                                  MetricNames.PROMPT_CACHE_CACHED_TOKENS: 256
-                              },
-                              finish_reason="length",
-                              num_generated_tokens=1))
+        PostprocWorker.Output(
+            client_id=1,
+            res="mock_sse_data",
+            is_final=True,
+            metrics={MetricNames.PROMPT_CACHE_CACHED_TOKENS: 256},
+            finish_reason="length",
+            num_generated_tokens=1))
     assert result.metrics_dict[MetricNames.PROMPT_TOKENS] == 300
     assert result.metrics_dict[MetricNames.PROMPT_CACHE_CACHED_TOKENS] == 256
 
@@ -516,8 +524,10 @@ def test_get_params_for_first_rsp_returns_disaggregated_params_once():
 
 
 def test_PostprocWorker_disaggregated_params():
-    """GEN-side: disaggregated_params seeded on the record persists across
-    multiple responses (streaming pattern).
+    """GEN-side: disaggregated_params on the record persists across responses.
+
+    The seeded disaggregated_params must survive multiple responses (streaming
+    pattern).
 
     Regression test for https://nvbugs/5991957: PostprocWorker record was
     created without disaggregated_params, causing /v1/chat/completions to
