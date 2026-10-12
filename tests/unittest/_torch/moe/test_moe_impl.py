@@ -30,7 +30,13 @@ import torch
 from _torch.moe.moe_test_utils import MoeBackendType
 
 from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._torch.moe.fused_moe.activation import SwigluActivation
+from tensorrt_llm._torch.moe.fused_moe.activation import (
+    SimpleActivation,
+    SiTuActivation,
+    SwigluActivation,
+    SwigluBiasActivation,
+    activation_constant_names,
+)
 from tensorrt_llm._torch.moe.fused_moe.create_moe import create_moe_backend
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl_fc12 import (
     TrtllmCutedslFusedFc12Nvfp4Impl,
@@ -84,6 +90,7 @@ from tensorrt_llm._torch.moe.fused_moe.trtllm_gen import (
     trtllm_gen_leaves_in_resolution_order,
 )
 from tensorrt_llm._torch.moe.fused_moe.trtllm_gen.eligibility import check_flashinfer_provider
+from tensorrt_llm._torch.utils import ActivationType
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
 # Everything here is a declaration; the one test that reaches a constructor
@@ -141,13 +148,34 @@ def test_pinned_deepgemm_rejects_post_silu_clamping():
     assert "post-SiLU clamping" in report.rejected[-1].detail
 
 
-@pytest.mark.parametrize("sm, eligible", [(90, True), (120, False), (121, False)])
-def test_cutlass_post_silu_clamp_rejects_triton_fallback(sm, eligible):
+@pytest.mark.parametrize("sm", [90, 120, 121])
+@pytest.mark.parametrize(
+    "activation, triton_runs_it",
+    [
+        pytest.param(SwigluActivation(), True, id="swiglu"),
+        pytest.param(SimpleActivation(ActivationType.Geglu), True, id="geglu"),
+        pytest.param(SimpleActivation(ActivationType.Relu2), True, id="relu2"),
+        pytest.param(SimpleActivation(ActivationType.Silu), False, id="silu"),
+        pytest.param(
+            SwigluBiasActivation(gate_sigmoid_scale=1.702, linear_offset=1.0),
+            False,
+            id="swiglu_bias",
+        ),
+        pytest.param(SiTuActivation(gate_softcap=1.0, linear_softcap=1.0), False, id="situ"),
+        pytest.param(SwigluActivation(clamp=5.0), False, id="pre_silu_clamp"),
+        pytest.param(
+            SwigluActivation(clamp=5.0, clamp_after_silu=True), False, id="post_silu_clamp"
+        ),
+    ],
+)
+def test_cutlass_rejects_what_the_triton_fallback_cannot_run(sm, activation, triton_runs_it):
+    # The same fields build_moe_problem reads off the layer's activation.
     problem = MoEProblem(
         quant=canonical_quant(QuantAlgo.FP8_BLOCK_SCALES),
         dtype_act=torch.bfloat16,
-        activation_constants=frozenset({"clamp"}),
-        clamp_after_silu=True,
+        activation=activation.kind.name,
+        activation_constants=activation_constant_names(activation),
+        clamp_after_silu=getattr(activation, "clamp_after_silu", False),
     )
     deployment = MoEDeployment(
         ep_size=1,
@@ -160,6 +188,8 @@ def test_cutlass_post_silu_clamp_rejects_triton_fallback(sm, eligible):
 
     verdict = CutlassFusedMoE.can_implement(problem, deployment)
 
+    # SM90 keeps the CUTLASS kernel, so this gate must leave it unchanged.
+    eligible = sm == 90 or triton_runs_it
     assert verdict.eligible is eligible
     if not eligible:
         assert verdict.reject_reason is MoERejectReason.ACTIVATION_UNSUPPORTED

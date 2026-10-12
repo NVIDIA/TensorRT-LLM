@@ -278,15 +278,24 @@ class CutlassFusedMoE(MoEImplBase):
                 f"CutlassFusedMoE {algo_name} requires {dtype_list}, "
                 f"got {p.dtype_act}")
 
-        # SM120/SM121 FP8 block scales use the Triton fallback below rather than
-        # the CUTLASS adaptor, and that fallback has no clamp-order parameter.
-        if (p.clamp_after_silu and quant_algo == QuantAlgo.FP8_BLOCK_SCALES
+        # SM120/SM121 FP8 block scales use the Triton fallback below, which runs
+        # only SwiGLU, GeGLU and Relu2 and takes no activation clamp.
+        if (quant_algo == QuantAlgo.FP8_BLOCK_SCALES
                 and sm_version in (120, 121)):
-            return _reject(
-                MoERejectReason.ACTIVATION_UNSUPPORTED,
-                "CutlassFusedMoE SM120/SM121 FP8 block scales use a Triton "
-                "fallback that does not implement post-SiLU clamping",
-            )
+            if p.activation_type not in (ActivationType.Swiglu,
+                                         ActivationType.Geglu,
+                                         ActivationType.Relu2):
+                return _reject(
+                    MoERejectReason.ACTIVATION_UNSUPPORTED,
+                    "CutlassFusedMoE SM120/SM121 FP8 block scales use a Triton "
+                    f"fallback that does not implement {p.activation_type.name}",
+                )
+            if p.clamp_after_silu or "clamp" in p.activation_constants:
+                return _reject(
+                    MoERejectReason.ACTIVATION_UNSUPPORTED,
+                    "CutlassFusedMoE SM120/SM121 FP8 block scales use a Triton "
+                    "fallback that does not implement pre- or post-SiLU clamping",
+                )
 
         # Routed-expert MoE LoRA supports unquantized fp16/bf16 or per-tensor FP8 only.
         if d.moe_lora_enabled and quant_algo not in (None, QuantAlgo.FP8):
