@@ -113,6 +113,24 @@ _FALLBACK_TX_WAIT_SLICE_S = 1.0
 _FALLBACK_TX_OVERALL_TIMEOUT_S = 60.0
 
 
+# Every REQUEST_DATA from a generation server on v1.3.0rc25 or a later release that still has
+# the Python KV bounce buffer carries this key, so its presence identifies such a server.
+# Requests from earlier releases also carry other retired keys, so they fail to decode instead.
+_OLDER_RELEASE_REQUEST_KEY = "bounce_dst_base"
+
+
+class OlderReleaseRequestError(ValueError):
+    """REQUEST_DATA from a generation server running an older TensorRT-LLM release."""
+
+    def __init__(self, req_info: RecvReqInfo):
+        super().__init__(
+            f"Failing request {req_info.unique_rid}: generation server {req_info.instance_name} "
+            f"rank {req_info.instance_rank} runs an older TensorRT-LLM release. Context and "
+            "generation servers must run the same release."
+        )
+        self.req_info = req_info
+
+
 @dataclass
 class RecvReqInfo:
     sender_req_id: int
@@ -154,7 +172,12 @@ class RecvReqInfo:
         d["block_ids_per_layer_groups"] = [
             np.frombuffer(b, dtype=np.int64).copy() for b in d["block_ids_per_layer_groups"]
         ]
-        return cls(**d)
+        from_older_release = _OLDER_RELEASE_REQUEST_KEY in d
+        d.pop(_OLDER_RELEASE_REQUEST_KEY, None)
+        info = cls(**d)
+        if from_older_release:
+            raise OlderReleaseRequestError(info)
+        return info
 
 
 @dataclass
@@ -1724,9 +1747,23 @@ class Sender(SenderBase):
 
     @nvtx_range("_respond_with_kv")
     def _respond_with_kv(self, _send_id: bytes, message: list[bytes]):
+        try:
+            info: RecvReqInfo = RecvReqInfo.from_bytes(message[1])
+        except OlderReleaseRequestError as error:
+            # Answer instead of dropping, or the generation server waits out kv_transfer_timeout_ms.
+            info = error.req_info
+            logger.error_once(
+                f"Failing every request from generation server {info.instance_name} rank "
+                f"{info.instance_rank}: it runs an older TensorRT-LLM release. Context and "
+                "generation servers must run the same release. Each rejected request is logged "
+                "at DEBUG.",
+                key=("older_release_request", info.instance_name, info.instance_rank),
+            )
+            logger.debug(str(error))
+            self._send_failed_result_to_receiver(info)
+            return
         # _sessions_lock prevents a race between session lookup and req_info save.
         # session.lock atomically saves peer info and snapshots tasks against send().
-        info: RecvReqInfo = RecvReqInfo.from_bytes(message[1])
         with self._sessions_lock:
             session = self._get_session(info.unique_rid)
             fenced = (
