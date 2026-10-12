@@ -38,7 +38,9 @@ from tensorrt_llm.quantization.mode import QuantAlgo
 
 from ..attention.attention import Attention
 from ..attention.backends import AttentionMetadata
+from ..attention.backends.fmha.flashinfer_trtllm_gen import FlashInferTrtllmGenFmha
 from ..attention.backends.fmha.msa_prefill import _aligned_nvfp4_dequant_scales
+from ..attention.backends.fmha.registry import get_enabled_fmha_lib_classes
 from ..attention.backends.interface import (
     AttentionForwardArgs,
     PositionalEmbeddingParams,
@@ -52,6 +54,7 @@ from ..attention.backends.sparse.minimax_m3 import (
 )
 from ..attention.backends.sparse.minimax_m3.common import index_head_range
 from ..attention.backends.sparse.params import SparseBackendForwardArgs
+from ..attention.backends.trtllm import TrtllmAttention
 from ..distributed import AllReduce, AllReduceFusionOp, AllReduceParams, MiniMaxAllReduceRMS
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
@@ -76,9 +79,7 @@ from .checkpoints.hf.minimaxm3_weight_mapper import MINIMAX_M3_PARAMS_MAP, MiniM
 from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import DecoderModel, ModelConfig, filter_weights, register_auto_model
 
-# Dense layers use SDPA with non-contiguous Q/K/V and a bool attn_mask.
-# Limit backends to memory-efficient and math; cuDNN SDPA fails for this layout,
-# and flash SDPA does not accept attn_mask.
+# Legacy dense fallback: cuDNN cannot consume this SDPA layout.
 _DENSE_SDPA_BACKENDS = [SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH]
 
 
@@ -1125,6 +1126,35 @@ class MiniMaxM3Attention(Attention):
         self.ln_events = [torch.cuda.Event(), torch.cuda.Event()]
 
         self.is_sparse_attention_layer = bool(is_sparse_attention_layer)
+        # Packed NVFP4 KV retains its existing path: native virtual pools do
+        # not yet describe its independent block-scale page strides.
+        native_dense_cache = (
+            self.quant_config is None or not self.quant_config.quant_mode.has_fp4_kv_cache()
+        )
+        if (
+            not self.is_sparse_attention_layer
+            and native_dense_cache
+            and isinstance(self.attn, MiniMaxM3SparseRuntimeBackend)
+        ):
+            # Q/K norm and partial RoPE have already run in the model.
+            native_attn = TrtllmAttention(
+                self.layer_idx,
+                self.num_heads,
+                self.head_dim,
+                num_kv_heads=self.num_key_value_heads,
+                quant_config=self.quant_config,
+                q_scaling=self.q_scaling,
+                pos_embd_params=None,
+                skip_create_weights_in_init=model_config.skip_create_weights_in_init,
+            )
+            # MiniMax's P128 cached-context path needs TRTLLM-Gen. Preserve
+            # the legacy path if hardware or TLLM_FMHA_LIBS excludes it.
+            if (
+                FlashInferTrtllmGenFmha in get_enabled_fmha_lib_classes()
+                and FlashInferTrtllmGenFmha.is_available(native_attn)
+            ):
+                self.attn = native_attn
+                self.support_fused_qkv = self.attn.support_fused_qkv()
         self.disable_index_value = bool(disable_index_value)
         sparse_runtime_cfg = getattr(model_config, "sparse_attention_config", None)
         self.enable_fused_qkv_index_projection = bool(
@@ -1700,39 +1730,7 @@ class MiniMaxM3Attention(Attention):
         all_reduce_params: Optional[AllReduceParams] = None,
         **kwargs,
     ) -> torch.Tensor:
-        """Dense MiniMax-M3 attention for layers 0-2.
-
-        Mirrors :meth:`_sparse_forward` minus the index branch and minus
-        the per-block top-k selection. Bypasses ``self.attn`` because the
-        LLM API constructs ``MiniMaxM3SparseRuntimeBackend`` for every
-        layer when ``sparse_attention_config=MiniMaxM3SparseAttentionConfig()``
-        is set (the only way to get the matching :class:`MiniMaxM3KVCacheManagerV2`
-        through the standard ``_create_kv_cache_manager`` factory), and
-        that backend's ``forward`` strictly requires the M3 index branch
-        and metadata which dense layers cannot supply.
-
-        Steps:
-          1. Project Q/K/V via fused ``qkv_proj``.
-          2-3. Apply per-head Gemma RMSNorm and partial RoPE to Q/K, fused
-             into one kernel by :meth:`_fused_qk_norm_rope` when it applies.
-          4. Pull the paged main K/V cache from the M3 cache manager.
-          5. Read the pre-built :class:`MiniMaxM3SparseAttentionMetadata`
-             from ``attn_metadata.minimax_m3``. Production code paths
-             build this attachment in
-             :meth:`MiniMaxM3AttentionMetadata.prepare` (called by the
-             pyexecutor outside any CUDA-graph capture window); test
-             code paths attach it directly. The forward path **never**
-             builds metadata itself and **never** migrates tensors
-             between devices — both would trigger
-             ``cudaErrorStreamCaptureUnsupported`` for the
-             ``cuda_graph=True`` hard-path runs.
-          6. Write new K/V to ``out_cache_loc`` slots.
-          7. Gather per-request K/V padded to ``[batch, max_k]`` using
-             :func:`_gather_paged_batched` and run standard dense GQA
-             via :func:`torch.nn.functional.scaled_dot_product_attention`
-             (causal for prefill, no-causal for decode).
-          8. Apply ``o_proj``.
-        """
+        """Apply MiniMax Q/K norm and partial RoPE, then dispatch dense attention."""
         if attn_metadata is None:
             raise RuntimeError(
                 f"MiniMax-M3 dense forward (layer {self.layer_idx}) requires "
@@ -2002,13 +2000,14 @@ class MiniMaxM3Attention(Attention):
     ) -> torch.Tensor:
         """Route the attention core to the configured backend.
 
-        self.attn is either a :class:`MiniMaxM3MsaSparseAttention`, which
-        handles both dense and sparse layers, or a
-        :class:`MiniMaxM3SparseRuntimeBackend` (Triton).
+        MSA handles both dense and sparse layers. The Triton configuration
+        uses MiniMaxM3SparseRuntimeBackend for sparse layers and
+        TrtllmAttention for dense layers when TRTLLM-Gen is available. NVFP4
+        KV cache retains SDPA until native block-scale strides are supported.
 
         * MSA → :meth:`_msa_attention_core`
         * Triton sparse → :meth:`_triton_sparse_attention_core`
-        * SDPA dense → :meth:`_sdpa_dense_attention_core`
+        * Dense → generic TRTLLM paged attention
         """
         if isinstance(self.attn, MiniMaxM3MsaSparseAttention):
             return self._msa_attention_core(q, k, v, idx_q, idx_k, attn_metadata, output)
@@ -2017,7 +2016,15 @@ class MiniMaxM3Attention(Attention):
             assert idx_q is not None and idx_k is not None
             return self._triton_sparse_attention_core(q, k, v, idx_q, idx_k, attn_metadata, output)
         assert idx_q is None and idx_k is None
-        return self._sdpa_dense_attention_core(q, k, v, attn_metadata, output)
+        if isinstance(self.attn, MiniMaxM3SparseRuntimeBackend):
+            return self._sdpa_dense_attention_core(q, k, v, attn_metadata, output)
+        # The native fallback expects packed QKV for the current tokens only.
+        # Historical K/V stays in the paged cache and is never gathered here.
+        qkv = torch.cat((q, k, v), dim=-1)
+        self.attn.forward(
+            qkv, None, None, attn_metadata, forward_args=AttentionForwardArgs(output=output)
+        )
+        return output
 
     def _msa_attention_core(
         self,

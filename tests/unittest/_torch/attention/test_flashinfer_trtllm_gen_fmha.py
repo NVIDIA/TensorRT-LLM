@@ -27,6 +27,7 @@ from tensorrt_llm._torch.attention.backends.interface import (
     AttentionForwardArgs,
     AttentionInputType,
 )
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.quantization.mode import QuantMode
 
@@ -57,17 +58,24 @@ def test_flashinfer_fp8_mode_remains_implementation_local() -> None:
         (1, 0, torch.float16, False),
     ],
 )
+@pytest.mark.parametrize("page_size,paged_context", [(32, False), (32, True), (128, True)])
 def test_small_context_fallback_preserves_mixed_batch_generation(
     num_contexts: int,
     num_generations: int,
     dtype: torch.dtype,
     expect_fallback: bool,
+    page_size: int,
+    paged_context: bool,
 ) -> None:
     attn = FakeAttention()
     attn.head_dim = 256
     attn.sparse_params = None
     attn.position_embedding_type = 0
     fmha = FlashInferTrtllmGenFmha(attn)
+    manager = object.__new__(KVCacheManagerV2)
+    manager.dtype = None
+    manager.trtllm_gen_extra_tokens_per_block = frozenset({128})
+    manager.impl = SimpleNamespace(get_page_index_upper_bound=lambda *args: 32)
     metadata = SimpleNamespace(
         num_contexts=num_contexts,
         num_generations=num_generations,
@@ -75,8 +83,9 @@ def test_small_context_fallback_preserves_mixed_batch_generation(
         num_sparse_topk=0,
         use_spec_decoding=False,
         kv_cache_block_offsets=object(),
-        kv_cache_manager=None,
-        tokens_per_block=32,
+        kv_cache_manager=manager,
+        tokens_per_block=page_size,
+        use_paged_context_fmha=paged_context,
         is_cross=False,
         beam_width=1,
     )
@@ -97,6 +106,7 @@ def test_small_context_fallback_preserves_mixed_batch_generation(
         is_fused_qkv=True,
     )
 
+    expect_fallback = expect_fallback and not (paged_context and page_size == 128)
     for phase in phases:
         supported, reason = fmha._is_supported_with_reason(
             q, None, None, attn, metadata, forward_args, phase=phase

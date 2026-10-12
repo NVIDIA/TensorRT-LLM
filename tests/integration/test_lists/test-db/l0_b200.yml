@@ -110,6 +110,7 @@ l0_b200:
   # Cold-JIT runs take about 25 minutes; allow a 45-minute budget.
   - unittest/_torch/attention/sparse/msa/test_minimax_m3_sparse_attn_decode.py TIMEOUT (45)
   - unittest/_torch/attention/sparse/test_cute_dsl_gvr_topk_decode.py TIMEOUT (120)
+  - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_attention_dense_construction_matches_config
   - unittest/_torch/compilation
   - unittest/_torch/debugger
   - unittest/_torch/peft/test_fp8_lora_grouped_gemm_regressions.py
