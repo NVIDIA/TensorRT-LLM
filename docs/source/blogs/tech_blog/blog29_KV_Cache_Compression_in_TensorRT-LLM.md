@@ -137,24 +137,18 @@ The executor loop hosts the stages inside a request (stages 1 to 3 in Figure 3);
 
 ### Configuration and Setup of KV Cache Compression
 
-TensorRT LLM has many modules a compression method may need to engage or change: the executor loop, the KV cache manager and its storage tiers, block reuse, speculative decoding. Which ones, and how, depends on the method. The configuration is where this is decided. One block, `kv_cache_compression_config`, holds:
+**The idea.** One config block says which method to run and with what parameters. From it the framework works out which modules to engage and whether the rest of the setup allows it. The block, `kv_cache_compression_config`, holds:
 
 - **`algorithm`**: which method to run. One method can be active per LLM instance.
-- **Method options**: the detailed parameters of the chosen method, e.g. for TriAttention the token `budget`, the eviction period, the `eviction_mode` and the calibration file.
+- **Method options**: the method's own parameters, e.g. for TriAttention the token `budget`, the eviction period, the `eviction_mode` and the calibration file.
 
-The same block works in the Python API, in `trtllm-serve` YAML and in `trtllm-bench`; the full option table is in the [KV Cache Compression feature documentation](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/features/kv-cache-compression.md).
+It works the same in the Python API, in `trtllm-serve` YAML and in `trtllm-bench`; the full option table is in the [KV Cache Compression feature documentation](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/features/kv-cache-compression.md).
 
-From this block a factory decides what the method needs and checks that the rest of the configuration allows it, before anything is built:
-
-- **Modules to engage**: cold-page compression plugs a codec into the page migration of the KV cache manager (KVCacheManagerV2, V2 from here on); TriAttention registers in the executor loop.
-- **Compatibility**: a method declares whether block reuse stays valid and which speculative decoding modes it supports. Both methods keep block reuse; TriAttention supports speculative decoding only in `union` mode, and both methods only with one-model MTP or EAGLE3.
-- **Platform**: both methods need Blackwell-class GPUs; cold-page compression also needs the C++ V2 backend.
-
-An unsupported combination is rejected with a clear message. Otherwise the factory builds the compression manager, which binds to V2 after V2 is built. V2 keeps the pages, the tiers and the migration between them, and the attention backend is not touched. For the interfaces involved, see the [KV cache compression development guide](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/developer-guide/kv-cache-compression-development.md).
+Before anything is built, a factory reads the block and wires things up: which modules the method engages (the cache manager's page migration for cold-page compression, the executor loop for TriAttention), whether block reuse and the configured speculative decoding mode stay valid, and whether the platform is supported. An unsupported combination is rejected with a clear message; otherwise the compression manager is built and bound to KVCacheManagerV2 (V2 from here on). For the interfaces, see the [KV cache compression development guide](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/developer-guide/kv-cache-compression-development.md).
 
 ### KV Cache Compression in the Executor Iteration Loop
 
-The executor loop drives the stages inside a request (stages 1 to 3 in Figure 3). Between two forward steps the view attention has of the KV cache may change, and that is where compression runs. The way in is the executor's existing resource-manager list: every manager receives three callbacks per iteration, before the forward pass, after it, and when a request ends. The compression manager registers as the last one, so it runs after the KV cache manager has updated its state, and turns the three callbacks into five hooks (Figure 5, Table 3). A method overrides the hooks it needs; all of them do nothing by default.
+**The idea.** The stages inside a request (stages 1 to 3 in Figure 3) are reached by riding on callbacks the executor already makes; a method only overrides the hooks it needs. The executor calls every resource manager three times per iteration: before the forward pass, after it, and when a request ends. The compression manager registers last, so it runs after the KV cache manager has updated its state, and turns the three callbacks into five hooks (Figure 5, Table 3). All of them do nothing by default.
 
 <div align="center">
 <figure>
@@ -177,11 +171,11 @@ The executor loop drives the stages inside a request (stages 1 to 3 in Figure 3)
 
 </div>
 
-Methods on this path change which tokens are kept or how they are laid out in the paged cache. Two rules apply: the policy that picks tokens stays separate from the shared compaction kernel, and a method finishes its GPU work before it shrinks or frees a page. TriAttention uses `on_generation_step_end`; the other hooks are in place for new methods.
+Two rules for methods on this path: the policy that picks tokens stays separate from the shared compaction kernel, and GPU work finishes before a page is shrunk or freed. TriAttention uses `on_generation_step_end`; the other hooks are in place for new methods.
 
 ### KV Cache Compression in Cross-Request KV Management
 
-Outside a request the KV lives with the cache manager: it waits while a tool runs (stage 4 in Figure 3), and after the request it is kept for reuse, transferred to another worker, or offloaded to host or disk memory (stage 5). Every reused page is a prefill that never runs, and compression lets the tiers hold more of them. V2 owns this whole period. It decides which pages stay on the GPU, move, are reused or transferred, and it does no compression itself. The framework plugs compression into V2 at the points where KV can be compressed:
+**The idea.** Outside a request the cache manager owns the KV, so compression plugs into the cache manager at the points where pages move. During a tool call (stage 4 in Figure 3) and after the request (stage 5), V2 decides which pages stay on the GPU, move to host or disk memory, are reused or transferred, and it does no compression itself. Every reused page is a prefill that never runs, and compression lets the tiers hold more of them. The framework adds compression at three points:
 
 - **Offload and onboard**: when a page leaves the GPU and when it returns. A codec encodes the page on the way out and decodes it on the way back, and V2 never sees the difference. This is the storage-bound mechanism; NVFP4 cold-page compression lives here.
 - **Transfer**: when a page moves to another worker.
