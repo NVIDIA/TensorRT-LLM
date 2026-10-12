@@ -66,6 +66,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     DEFAULT_BEAM_INDEX,
     GPU_LEVEL,
     AttentionLayerConfig,
+    AttentionReusePolicy,
     AttnLifeCycle,
     Batch,
     BatchDesc,
@@ -131,13 +132,6 @@ from ..resource_manager import (
     request_context,
 )
 from ..scheduler import ScheduledRequests
-from .layout import (
-    KVCacheLayoutPlan,
-    LayerBufferSpec,
-    LayerCacheOwner,
-    LayerCacheSpec,
-    LayerCacheTransferPolicy,
-)
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
@@ -277,53 +271,92 @@ class BlockReusePolicy(StrEnum):
     PER_CONVERSATION = "per_conversation"
 
 
-class KVCacheLayerView:
-    """Non-owning layer-scoped view of one :class:`KVCacheManagerV2`.
+class KVCacheLayerOwner(StrEnum):
+    """Model component that reads and writes a cache layer."""
 
-    The view can be passed to attention metadata while request lifecycle and
-    transfer remain owned by the underlying manager. It intentionally makes
-    ``free_resources`` a no-op because legacy speculative call sites may free
-    a draft manager independently after a forward pass.
+    TARGET = "target"
+    DRAFT = "draft"
+
+
+@dataclass(frozen=True)
+class KVCacheLayerSpec:
+    """Rank-local attention-layer storage consumed by costing and construction.
+
+    Tuple position is the C++ local layer id. ``global_layer_id`` is the model
+    layer id used by attention metadata.
     """
 
-    def __init__(self, manager: "KVCacheManagerV2", owner: LayerCacheOwner) -> None:
-        layout_plan = manager.kv_cache_layout_plan
-        if layout_plan is None:
-            raise ValueError("layer views require a KV cache layout plan")
-        layers = tuple(layer for layer in layout_plan.layers if layer.owner is owner)
-        if not layers:
-            raise ValueError(f"KV cache layout contains no {owner.value} layers on this rank")
-        self._manager = manager
-        self.owner = owner
-        self.layer_ids = tuple(layer.global_layer_id for layer in layers)
-        self.local_layer_ids = tuple(layer.local_layer_id for layer in layers)
+    global_layer_id: int
+    owner: KVCacheLayerOwner
+    dtype: DataType
+    num_kv_heads: int
+    head_dim: int
+    buffer_roles: tuple[DataRole, ...]
+    sliding_window_size: Optional[int] = None
+    num_sink_tokens: Optional[int] = None
+    reuse_policy: AttentionReusePolicy = AttentionReusePolicy.REQUIRED
 
-    @property
-    def owner_manager(self) -> "KVCacheManagerV2":
-        return self._manager
-
-    def get_layer_spec(self, global_layer_id: int) -> LayerCacheSpec:
-        if global_layer_id not in self.layer_ids:
+    def __post_init__(self) -> None:
+        if self.global_layer_id < 0:
+            raise ValueError(f"global_layer_id must be non-negative, got {self.global_layer_id}")
+        if self.num_kv_heads <= 0:
+            raise ValueError(f"num_kv_heads must be positive, got {self.num_kv_heads}")
+        if self.head_dim <= 0:
+            raise ValueError(f"head_dim must be positive, got {self.head_dim}")
+        if not self.buffer_roles:
+            raise ValueError("buffer_roles must not be empty")
+        if len(set(self.buffer_roles)) != len(self.buffer_roles):
             raise ValueError(
-                f"layer {global_layer_id} does not belong to the {self.owner.value} cache view"
+                f"layer {self.global_layer_id} contains duplicate buffer roles: {self.buffer_roles}"
             )
-        return self._manager.get_layer_cache_spec(global_layer_id)
+        supported_roles = {
+            Role.KEY,
+            Role.VALUE,
+            Role.KEY_BLOCK_SCALE,
+            Role.VALUE_BLOCK_SCALE,
+        }
+        unsupported_roles = set(self.buffer_roles) - supported_roles
+        if unsupported_roles:
+            raise ValueError(
+                f"layer {self.global_layer_id} has unsupported standard buffer roles: "
+                f"{sorted(map(str, unsupported_roles))}"
+            )
+        if Role.KEY not in self.buffer_roles:
+            raise ValueError(f"layer {self.global_layer_id} must contain a key buffer")
+        scale_roles = {Role.KEY_BLOCK_SCALE, Role.VALUE_BLOCK_SCALE}
+        if any(role in scale_roles for role in self.buffer_roles) and self.dtype != DataType.NVFP4:
+            raise ValueError("block-scale roles require NVFP4 KV-cache dtype")
+        if self.dtype == DataType.NVFP4:
+            expected_scale_roles = {Role.KEY_BLOCK_SCALE}
+            if Role.VALUE in self.buffer_roles:
+                expected_scale_roles.add(Role.VALUE_BLOCK_SCALE)
+            if not expected_scale_roles.issubset(self.buffer_roles):
+                raise ValueError(
+                    f"NVFP4 layer {self.global_layer_id} must contain matching block-scale roles"
+                )
+        if self.sliding_window_size is not None and self.sliding_window_size <= 0:
+            raise ValueError(
+                f"sliding_window_size must be positive when set, got {self.sliding_window_size}"
+            )
+        if self.num_sink_tokens is not None and self.num_sink_tokens < 0:
+            raise ValueError(
+                f"num_sink_tokens must be non-negative when set, got {self.num_sink_tokens}"
+            )
 
-    def get_buffers(self, layer_idx: int, kv_layout: str = "NHD") -> Optional[torch.Tensor]:
-        self.get_layer_spec(layer_idx)
-        return self._manager.get_buffers(layer_idx, kv_layout=kv_layout)
-
-    def free_resources(self, request: LlmRequest) -> None:
-        """Leave request lifecycle to the owning manager."""
-
-    def report_batch_to_connector(self, *args, **kwargs) -> None:
-        raise RuntimeError("KV transfer must be initiated through the owning unified manager")
-
-    def __getattr__(self, name):
-        manager = self.__dict__.get("_manager")
-        if manager is None:
-            raise AttributeError(name)
-        return getattr(manager, name)
+    def bytes_per_token(self, role: Optional[DataRole] = None) -> int:
+        """Return storage bytes per token for one role or the whole layer."""
+        if role is None:
+            return sum(self.bytes_per_token(buffer_role) for buffer_role in self.buffer_roles)
+        if role not in self.buffer_roles:
+            raise ValueError(f"role {role} is not present in layer {self.global_layer_id}")
+        elements = self.num_kv_heads * self.head_dim
+        if role in (Role.KEY, Role.VALUE):
+            return get_size_in_bytes(elements, self.dtype)
+        if role in (Role.KEY_BLOCK_SCALE, Role.VALUE_BLOCK_SCALE):
+            if elements % 16 != 0:
+                raise ValueError(f"NVFP4 layer {self.global_layer_id} size must be divisible by 16")
+            return get_size_in_bytes(elements // 16, DataType.FP8)
+        raise ValueError(f"unsupported buffer role: {role}")
 
 
 def _swa_endpoint_priority(
@@ -819,6 +852,21 @@ def _get_static_cache_size_layer_components(
             for layer_idx, window in zip(local_layer_ids, attention_windows)
         ]
     return layer_sizes, attention_windows
+
+
+def _get_layer_spec_cache_size_components(
+    layer_specs: Sequence[KVCacheLayerSpec],
+) -> tuple[List[int], List[Optional[int]]]:
+    """Return the shared costing inputs for an explicit layer-spec sequence."""
+    if not layer_specs:
+        raise ValueError("layer_specs must contain at least one rank-local layer")
+    global_layer_ids = [layer.global_layer_id for layer in layer_specs]
+    if len(set(global_layer_ids)) != len(global_layer_ids):
+        raise ValueError(f"layer_specs contains duplicate global layer IDs: {global_layer_ids}")
+    return (
+        [layer.bytes_per_token() for layer in layer_specs],
+        [layer.sliding_window_size for layer in layer_specs],
+    )
 
 
 class _MmRunMetadata(NamedTuple):
@@ -1346,20 +1394,13 @@ class KVCacheManagerV2(BaseResourceManager):
         cold_page_codec_provider: Optional[object] = None,
         joint_kv_cache_reuse: bool = False,
         max_cuda_graph_batch_size: Optional[int] = None,
-        layout_plan: Optional[KVCacheLayoutPlan] = None,
+        layer_specs: Optional[Sequence[KVCacheLayerSpec]] = None,
         **kwargs,
     ) -> None:
         self.mapping = mapping
         self.dtype = dtype
         self._declared_target_layer_count = num_layers
-        self._explicit_layout_plan = layout_plan
-        self.kv_cache_layout_plan: Optional[KVCacheLayoutPlan] = layout_plan
-        self._layer_views: dict[LayerCacheOwner, KVCacheLayerView] = {}
-        if layout_plan is not None and layout_plan.tokens_per_block != tokens_per_block:
-            raise ValueError(
-                "layout-plan tokens_per_block does not match the manager: "
-                f"{layout_plan.tokens_per_block} != {tokens_per_block}"
-            )
+        self.layer_specs = tuple(layer_specs) if layer_specs is not None else None
         self._validate_speculative_config(spec_config)
         self.is_disagg = is_disagg
         self.kv_connector_manager = kv_connector_manager
@@ -1384,25 +1425,26 @@ class KVCacheManagerV2(BaseResourceManager):
                 and global_layer_id >= self._declared_target_layer_count
             )
         }
-        if layout_plan is not None:
-            planned_global_layers = [layer.global_layer_id for layer in layout_plan.layers]
+        if self.layer_specs is not None:
+            planned_global_layers = [layer.global_layer_id for layer in self.layer_specs]
             if planned_global_layers != self.pp_layers:
                 raise ValueError(
-                    "layout-plan global layers do not match pipeline placement: "
+                    "layer-spec global layers do not match pipeline placement: "
                     f"{planned_global_layers} != {self.pp_layers}"
                 )
             if is_draft and any(
-                layer.owner is not LayerCacheOwner.DRAFT for layer in layout_plan.layers
+                layer.owner is not KVCacheLayerOwner.DRAFT for layer in self.layer_specs
             ):
-                raise ValueError("a draft mirror manager cannot own target layout layers")
-            if layout_plan.has_mixed_dtype:
+                raise ValueError("a draft mirror manager cannot own target cache layers")
+            layer_dtypes = {layer.dtype for layer in self.layer_specs}
+            if len(layer_dtypes) != 1:
                 raise NotImplementedError(
-                    "KVCacheManagerV2 does not yet interpret mixed-dtype layout plans"
+                    "KVCacheManagerV2 does not yet interpret mixed-dtype layer specs"
                 )
-            if layout_plan.uniform_dtype != dtype:
+            layer_dtype = next(iter(layer_dtypes))
+            if layer_dtype != dtype:
                 raise ValueError(
-                    "layout-plan dtype does not match the manager dtype: "
-                    f"{layout_plan.uniform_dtype} != {dtype}"
+                    f"layer-spec dtype does not match the manager dtype: {layer_dtype} != {dtype}"
                 )
 
         # Retained so consumers (e.g. CUDAGraphRunner.preallocate_padding_dummies)
@@ -1545,14 +1587,14 @@ class KVCacheManagerV2(BaseResourceManager):
             self.pp_layers,
         )
         assert len(self.max_attention_window_vec) == self.num_local_layers
-        if layout_plan is not None:
+        if self.layer_specs is not None:
             self.max_attention_window_vec = [
-                layer.sliding_window_size for layer in layout_plan.layers
+                layer.sliding_window_size for layer in self.layer_specs
             ]
 
         # A D-token match backoff needs D more physical SWA history at the
         # committed endpoint so commit_min_snapshot still covers the rewind.
-        if layout_plan is None and kv_cache_config.enable_block_reuse and self.reuse_match_backoff:
+        if kv_cache_config.enable_block_reuse and self.reuse_match_backoff:
             self.max_attention_window_vec = _extend_swa_windows_for_reuse(
                 self.max_attention_window_vec,
                 self.reuse_match_backoff,
@@ -1661,21 +1703,21 @@ class KVCacheManagerV2(BaseResourceManager):
                     f"unique values={set(self.head_dim_per_layer)}"
                 )
 
-        if layout_plan is not None:
-            planned_heads = [layer.num_kv_heads for layer in layout_plan.layers]
+        if self.layer_specs is not None:
+            planned_heads = [layer.num_kv_heads for layer in self.layer_specs]
             if planned_heads != self.num_kv_heads_per_layer:
                 raise ValueError(
-                    "layout-plan KV-head counts do not match the manager: "
+                    "layer-spec KV-head counts do not match the manager: "
                     f"{planned_heads} != {self.num_kv_heads_per_layer}"
                 )
-            planned_head_dims = [layer.head_dim for layer in layout_plan.layers]
+            planned_head_dims = [layer.head_dim for layer in self.layer_specs]
             if planned_head_dims != self.head_dim_per_layer:
                 raise ValueError(
-                    "layout-plan head dimensions do not match the manager: "
+                    "layer-spec head dimensions do not match the manager: "
                     f"{planned_head_dims} != {self.head_dim_per_layer}"
                 )
             planned_kv_factors = {
-                2 if Role.VALUE in layer.buffer_roles else 1 for layer in layout_plan.layers
+                2 if Role.VALUE in layer.buffer_roles else 1 for layer in self.layer_specs
             }
             if planned_kv_factors != {self.kv_factor}:
                 raise NotImplementedError(
@@ -1823,8 +1865,6 @@ class KVCacheManagerV2(BaseResourceManager):
         )
         config = self._build_cache_config(config)
         config = self._remove_zero_size_buffers(config)
-        self._finalize_layout_plan(config)
-        self._validate_transfer_layout()
         has_host_cache_tier = any(
             isinstance(tier, HostCacheTierConfig) for tier in config.cache_tiers
         )
@@ -1955,7 +1995,6 @@ class KVCacheManagerV2(BaseResourceManager):
             layer_id: self.impl.get_layer_group_id(layer_id)
             for layer_id in typed_range(LayerId(num_layers))
         }
-        self.required_transfer_layer_group_ids = self._get_required_transfer_layer_group_ids()
 
         self.kv_cache_map: dict[int, _KVCache] = {}
         self._disagg_receive_ready: dict[int, torch.cuda.Event] = {}
@@ -2606,9 +2645,11 @@ class KVCacheManagerV2(BaseResourceManager):
         )
 
     def _get_runtime_cache_size_layer_components(self) -> tuple[List[int], List[Optional[int]]]:
-        explicit_layout_plan = getattr(self, "_explicit_layout_plan", None)
-        if explicit_layout_plan is not None:
-            return explicit_layout_plan.cache_size_layer_components()
+        if self.layer_specs is not None:
+            return (
+                [layer.bytes_per_token() for layer in self.layer_specs],
+                list(self.max_attention_window_vec),
+            )
         layer_sizes = []
         attention_windows = []
         for local_layer_idx in range(self.num_local_layers):
@@ -3122,9 +3163,23 @@ class KVCacheManagerV2(BaseResourceManager):
                         )
                     )
 
-        explicit_layout_plan = getattr(self, "_explicit_layout_plan", None)
-        if explicit_layout_plan is not None:
-            layer_configs = explicit_layout_plan.to_attention_layer_configs()
+        if self.layer_specs is not None:
+            layer_configs = [
+                AttentionLayerConfig(
+                    layer_id=LayerId(local_layer_id),
+                    buffers=[
+                        BufferConfig(
+                            role=role,
+                            size=layer.bytes_per_token(role) * tokens_per_block,
+                        )
+                        for role in layer.buffer_roles
+                    ],
+                    sliding_window_size=self.max_attention_window_vec[local_layer_id],
+                    num_sink_tokens=layer.num_sink_tokens,
+                    reuse_policy=layer.reuse_policy,
+                )
+                for local_layer_id, layer in enumerate(self.layer_specs)
+            ]
         else:
             # Subclasses (e.g. MiniMax-M3 sparse cache) can register additional
             # per-layer BufferConfig entries — for example a sparse index-K
@@ -3204,157 +3259,6 @@ class KVCacheManagerV2(BaseResourceManager):
     def _build_cache_config(self, config: KVCacheManagerConfigPy) -> KVCacheManagerConfigPy:
         """Customize the general cache config for a specialized cache manager."""
         return config
-
-    def _legacy_layer_owner(self, global_layer_id: int) -> LayerCacheOwner:
-        if global_layer_id in self._legacy_draft_layer_ids:
-            return LayerCacheOwner.DRAFT
-        return LayerCacheOwner.TARGET
-
-    def _layout_plan_from_runtime_config(
-        self, config: KVCacheManagerConfigPy
-    ) -> Optional[KVCacheLayoutPlan]:
-        if not all(isinstance(layer, AttentionLayerConfig) for layer in config.layers):
-            return None
-        if any(heads <= 0 for heads in self.num_kv_heads_per_layer) or any(
-            head_dim <= 0 for head_dim in self.head_dim_per_layer
-        ):
-            return None
-        ignored_roles = self.get_disagg_ignored_roles()
-        layers = []
-        for local_layer_id, layer in enumerate(config.layers):
-            assert isinstance(layer, AttentionLayerConfig)
-            global_layer_id = self.pp_layers[local_layer_id]
-            buffers = tuple(
-                LayerBufferSpec(
-                    role=buffer.role,
-                    size=buffer.size,
-                    tokens_per_block_override=buffer.tokens_per_block_override,
-                    is_sparse=buffer.is_sparse,
-                    transfer_policy=(
-                        LayerCacheTransferPolicy.LOCAL_ONLY
-                        if buffer.role in ignored_roles
-                        else LayerCacheTransferPolicy.REQUIRED
-                    ),
-                )
-                for buffer in layer.buffers
-            )
-            layers.append(
-                LayerCacheSpec(
-                    local_layer_id=local_layer_id,
-                    global_layer_id=global_layer_id,
-                    owner=self._legacy_layer_owner(global_layer_id),
-                    dtype=self.dtype,
-                    num_kv_heads=self.num_kv_heads_per_layer[local_layer_id],
-                    head_dim=self.head_dim_per_layer[local_layer_id],
-                    buffers=buffers,
-                    sliding_window_size=layer.sliding_window_size,
-                    num_sink_tokens=layer.num_sink_tokens,
-                    reuse_policy=layer.reuse_policy,
-                )
-            )
-        return KVCacheLayoutPlan(tokens_per_block=self.tokens_per_block, layers=tuple(layers))
-
-    @staticmethod
-    def _buffer_config_signature(buffer: BufferConfig) -> tuple[DataRole, int, int | None, bool]:
-        return (
-            buffer.role,
-            buffer.size,
-            buffer.tokens_per_block_override,
-            buffer.is_sparse,
-        )
-
-    def _validate_runtime_config_matches_layout_plan(
-        self, config: KVCacheManagerConfigPy, layout_plan: KVCacheLayoutPlan
-    ) -> None:
-        if len(config.layers) != len(layout_plan.layers):
-            raise ValueError(
-                "runtime cache layer count does not match the layout plan: "
-                f"{len(config.layers)} != {len(layout_plan.layers)}"
-            )
-        for planned, runtime in zip(layout_plan.layers, config.layers):
-            if not isinstance(runtime, AttentionLayerConfig):
-                raise ValueError(
-                    "an attention layout plan cannot produce a non-attention runtime layer"
-                )
-            planned_buffers = tuple(
-                self._buffer_config_signature(buffer.to_buffer_config())
-                for buffer in planned.buffers
-            )
-            runtime_buffers = tuple(
-                self._buffer_config_signature(buffer) for buffer in runtime.buffers
-            )
-            if planned_buffers != runtime_buffers:
-                raise ValueError(
-                    f"runtime buffers for layer {planned.global_layer_id} do not match "
-                    f"the layout plan: {runtime_buffers} != {planned_buffers}"
-                )
-            runtime_lifecycle = (
-                runtime.sliding_window_size,
-                runtime.num_sink_tokens,
-                runtime.reuse_policy,
-            )
-            planned_lifecycle = (
-                planned.sliding_window_size,
-                planned.num_sink_tokens,
-                planned.reuse_policy,
-            )
-            if runtime_lifecycle != planned_lifecycle:
-                raise ValueError(
-                    f"runtime lifecycle for layer {planned.global_layer_id} does not match "
-                    f"the layout plan: {runtime_lifecycle} != {planned_lifecycle}"
-                )
-
-    def _finalize_layout_plan(self, config: KVCacheManagerConfigPy) -> None:
-        if self._explicit_layout_plan is None:
-            self.kv_cache_layout_plan = self._layout_plan_from_runtime_config(config)
-            return
-        self._validate_runtime_config_matches_layout_plan(config, self._explicit_layout_plan)
-        self.kv_cache_layout_plan = self._explicit_layout_plan
-
-    def _validate_transfer_layout(self) -> None:
-        layout_plan = self.kv_cache_layout_plan
-        if layout_plan is None or (not self.is_disagg and self.kv_connector_manager is None):
-            return
-        errors = list(layout_plan.transfer_compatibility_errors())
-        ignored_roles = self.get_disagg_ignored_roles()
-        for layer in layout_plan.layers:
-            local_only_roles = [
-                buffer.role
-                for buffer in layer.buffers
-                if buffer.transfer_policy is LayerCacheTransferPolicy.LOCAL_ONLY
-                and buffer.role not in ignored_roles
-            ]
-            if local_only_roles:
-                errors.append(
-                    f"layer {layer.global_layer_id} marks roles {local_only_roles} local-only, "
-                    "but the manager does not exclude them from disaggregation"
-                )
-        for layer in layout_plan.required_transfer_layers():
-            ignored_required_roles = [
-                buffer.role
-                for buffer in layer.buffers
-                if buffer.transfer_policy is LayerCacheTransferPolicy.REQUIRED
-                and buffer.role in ignored_roles
-            ]
-            if ignored_required_roles:
-                errors.append(
-                    f"layer {layer.global_layer_id} requires transfer of ignored roles "
-                    f"{ignored_required_roles}"
-                )
-        if errors:
-            raise NotImplementedError(
-                "the unified KV layout is incompatible with the current transfer metadata: "
-                + "; ".join(errors)
-            )
-
-    def _get_required_transfer_layer_group_ids(self) -> frozenset[int]:
-        layout_plan = self.kv_cache_layout_plan
-        if layout_plan is None:
-            return frozenset()
-        return frozenset(
-            int(self.impl.get_layer_group_id(LayerId(layer.local_layer_id)))
-            for layer in layout_plan.required_transfer_layers()
-        )
 
     def _remove_zero_size_buffers(self, config: KVCacheManagerConfigPy) -> KVCacheManagerConfigPy:
         """Exclude empty buffers before creating the runtime storage pools."""
@@ -3477,14 +3381,24 @@ class KVCacheManagerV2(BaseResourceManager):
         """
         return frozenset()
 
-    def get_layer_cache_spec(self, global_layer_id: int) -> LayerCacheSpec:
-        """Return the immutable layout entry for one rank-local layer."""
-        if self.kv_cache_layout_plan is None:
-            raise RuntimeError("this specialized manager has no attention-only layout plan")
-        return self.kv_cache_layout_plan.get_layer(global_layer_id)
+    def get_layer_cache_spec(self, global_layer_id: int) -> KVCacheLayerSpec:
+        """Return an explicitly supplied rank-local layer specification."""
+        if self.layer_specs is None:
+            raise RuntimeError("this manager was not constructed with explicit layer specs")
+        try:
+            local_layer_id = self.layer_offsets[global_layer_id]
+        except KeyError as error:
+            raise KeyError(f"global layer {global_layer_id} is not local to this rank") from error
+        return self.layer_specs[local_layer_id]
 
-    def get_layer_owner(self, global_layer_id: int) -> LayerCacheOwner:
-        return self.get_layer_cache_spec(global_layer_id).owner
+    def get_layer_owner(self, global_layer_id: int) -> KVCacheLayerOwner:
+        if self.layer_specs is not None:
+            return self.get_layer_cache_spec(global_layer_id).owner
+        if global_layer_id in self._legacy_draft_layer_ids:
+            return KVCacheLayerOwner.DRAFT
+        if global_layer_id not in self.layer_offsets:
+            raise KeyError(f"global layer {global_layer_id} is not local to this rank")
+        return KVCacheLayerOwner.TARGET
 
     def get_layer_dtype(self, global_layer_id: int) -> DataType:
         return self.get_layer_cache_spec(global_layer_id).dtype
@@ -3492,52 +3406,21 @@ class KVCacheManagerV2(BaseResourceManager):
     def get_layer_buffer_roles(self, global_layer_id: int) -> tuple[DataRole, ...]:
         return self.get_layer_cache_spec(global_layer_id).buffer_roles
 
-    def get_layer_transfer_policy(self, global_layer_id: int) -> LayerCacheTransferPolicy:
-        return self.get_layer_cache_spec(global_layer_id).transfer_policy
-
     @property
     def target_layer_ids(self) -> tuple[int, ...]:
-        if self.kv_cache_layout_plan is None:
-            return ()
-        return self.kv_cache_layout_plan.target_layer_ids
+        return tuple(
+            layer_id
+            for layer_id in self.pp_layers
+            if self.get_layer_owner(layer_id) is KVCacheLayerOwner.TARGET
+        )
 
     @property
     def draft_layer_ids(self) -> tuple[int, ...]:
-        if self.kv_cache_layout_plan is None:
-            return ()
-        return self.kv_cache_layout_plan.draft_layer_ids
-
-    def get_layer_view(self, owner: LayerCacheOwner) -> Optional[KVCacheLayerView]:
-        """Return a non-owning attention view for ``owner`` on this rank."""
-        layout_plan = self.kv_cache_layout_plan
-        if layout_plan is None or not any(layer.owner is owner for layer in layout_plan.layers):
-            return None
-        view = self._layer_views.get(owner)
-        if view is None:
-            view = KVCacheLayerView(self, owner)
-            self._layer_views[owner] = view
-        return view
-
-    def get_draft_kv_cache_view(self) -> Optional[KVCacheLayerView]:
-        """Return the draft view only for an explicitly unified layout.
-
-        Legacy construction may append draft-shaped layers without opting an
-        algorithm into the unified lifecycle. Requiring an explicit plan keeps
-        those existing algorithms on their current metadata path.
-        """
-        if self._explicit_layout_plan is None or self.is_draft:
-            return None
-        return self.get_layer_view(LayerCacheOwner.DRAFT)
-
-    def get_target_kv_cache_view(self) -> Optional[KVCacheLayerView]:
-        """Return the target view only for an explicitly unified layout."""
-        if self._explicit_layout_plan is None or self.is_draft:
-            return None
-        return self.get_layer_view(LayerCacheOwner.TARGET)
-
-    def get_required_transfer_layer_group_ids(self) -> frozenset[int]:
-        """Layer groups whose state gates request-level transfer completion."""
-        return self.required_transfer_layer_group_ids
+        return tuple(
+            layer_id
+            for layer_id in self.pp_layers
+            if self.get_layer_owner(layer_id) is KVCacheLayerOwner.DRAFT
+        )
 
     @property
     def blocks_in_primary_pool(self) -> int:
@@ -6327,16 +6210,11 @@ class KVCacheManagerV2(BaseResourceManager):
         max_num_tokens: int = 0,
         spec_config=None,
         is_draft: bool = False,
-        layout_plan: Optional[KVCacheLayoutPlan] = None,
+        layer_specs: Optional[Sequence[KVCacheLayerSpec]] = None,
         **kwargs,
     ):
-        if layout_plan is not None:
-            if layout_plan.tokens_per_block != tokens_per_block:
-                raise ValueError(
-                    "layout-plan tokens_per_block does not match cost calculation: "
-                    f"{layout_plan.tokens_per_block} != {tokens_per_block}"
-                )
-            layer_sizes, attention_windows = layout_plan.cache_size_layer_components()
+        if layer_specs is not None:
+            layer_sizes, attention_windows = _get_layer_spec_cache_size_components(layer_specs)
         else:
             layer_sizes, attention_windows = _get_static_cache_size_layer_components(
                 model_config,
@@ -6351,8 +6229,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 ),
             )
         reuse_backoff_enabled = (
-            layout_plan is None
-            and kv_cache_config is not None
+            kv_cache_config is not None
             and kv_cache_config.enable_block_reuse
             and cls._supports_reuse_match_backoff
         )
@@ -6420,7 +6297,7 @@ class KVCacheManagerV2(BaseResourceManager):
         max_seq_len: Optional[int] = None,
         spec_config=None,
         is_draft: bool = False,
-        layout_plan: Optional[KVCacheLayoutPlan] = None,
+        layer_specs: Optional[Sequence[KVCacheLayerSpec]] = None,
     ) -> Optional[tuple[List[tuple[int, int, int]], int]]:
         """Per-local-layer ``(layer_size, retained_tokens, intercept_tokens)``
         plus the block-rounded full-sequence token count.
@@ -6447,7 +6324,7 @@ class KVCacheManagerV2(BaseResourceManager):
         """
         if max_seq_len is None or int(max_seq_len) <= 0:
             return None
-        if layout_plan is None and num_layers is None:
+        if layer_specs is None and num_layers is None:
             total_hidden_layers = getattr(model_config.pretrained_config, "num_hidden_layers", None)
             if (
                 total_hidden_layers is not None
@@ -6456,13 +6333,8 @@ class KVCacheManagerV2(BaseResourceManager):
                 return None
         max_seq_len = int(max_seq_len)
         tokens_per_block = int(tokens_per_block)
-        if layout_plan is not None:
-            if layout_plan.tokens_per_block != tokens_per_block:
-                raise ValueError(
-                    "layout-plan tokens_per_block does not match per-request cost calculation: "
-                    f"{layout_plan.tokens_per_block} != {tokens_per_block}"
-                )
-            layer_sizes, covered_windows = layout_plan.cache_size_layer_components()
+        if layer_specs is not None:
+            layer_sizes, covered_windows = _get_layer_spec_cache_size_components(layer_specs)
         else:
             layer_sizes, covered_windows = _get_static_cache_size_layer_components(
                 model_config,
@@ -6482,8 +6354,7 @@ class KVCacheManagerV2(BaseResourceManager):
         # charges as fixed per-request retention in the affine intercept; keep
         # them in lockstep with its accounting (reuse backoff included).
         if (
-            layout_plan is None
-            and kv_cache_config is not None
+            kv_cache_config is not None
             and kv_cache_config.enable_block_reuse
             and cls._supports_reuse_match_backoff
         ):
@@ -6497,7 +6368,7 @@ class KVCacheManagerV2(BaseResourceManager):
             # against the draft pool), so the drafter's own windows do not
             # bound per-request retention.
             retained_windows = [None] * len(layer_sizes)
-        elif layout_plan is None and all(window is None for window in covered_windows):
+        elif layer_specs is None and all(window is None for window in covered_windows):
             # The static estimator only sees windows the config carries.
             # Runtime manager creation additionally derives per-layer windows
             # from ``layer_types`` (see
@@ -6570,7 +6441,7 @@ class KVCacheManagerV2(BaseResourceManager):
         max_seq_len: Optional[int] = None,
         spec_config=None,
         is_draft: bool = False,
-        layout_plan: Optional[KVCacheLayoutPlan] = None,
+        layer_specs: Optional[Sequence[KVCacheLayerSpec]] = None,
         **kwargs,
     ) -> Optional[int]:
         """Slope-funded pool bytes ONE max-length request pins in this manager.
@@ -6603,7 +6474,7 @@ class KVCacheManagerV2(BaseResourceManager):
             max_seq_len=max_seq_len,
             spec_config=spec_config,
             is_draft=is_draft,
-            layout_plan=layout_plan,
+            layer_specs=layer_specs,
         )
         if layer_tokens is None:
             return None
@@ -6632,7 +6503,7 @@ class KVCacheManagerV2(BaseResourceManager):
         max_seq_len: Optional[int] = None,
         spec_config=None,
         is_draft: bool = False,
-        layout_plan: Optional[KVCacheLayoutPlan] = None,
+        layer_specs: Optional[Sequence[KVCacheLayerSpec]] = None,
         **kwargs,
     ) -> Optional[int]:
         """Allocator quota ONE max-length request makes this manager insist on.
@@ -6667,7 +6538,7 @@ class KVCacheManagerV2(BaseResourceManager):
             max_seq_len=max_seq_len,
             spec_config=spec_config,
             is_draft=is_draft,
-            layout_plan=layout_plan,
+            layer_specs=layer_specs,
         )
         if layer_tokens is None:
             return None

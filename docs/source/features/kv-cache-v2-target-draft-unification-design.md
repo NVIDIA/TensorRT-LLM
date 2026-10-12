@@ -110,28 +110,26 @@ temporary data layouts to be identical.
 
 ### 1. Introduce one canonical per-layer cache descriptor
 
-Create an internal descriptor such as:
+Define a compact internal descriptor directly in `kv_cache_manager_v2.py`:
 
 ```python
 @dataclass(frozen=True)
-class LayerCacheSpec:
+class KVCacheLayerSpec:
     global_layer_id: int
     owner: LayerOwner                 # TARGET or DRAFT
-    layer_type: LayerType             # ATTENTION or SSM
     dtype: DataType
     num_kv_heads: int
     head_dim: int
-    buffer_specs: tuple[BufferSpec, ...]
+    buffer_roles: tuple[DataRole, ...]
     sliding_window_size: int | None
     num_sink_tokens: int | None
-    is_sparse: bool
     reuse_policy: AttentionReusePolicy
-    placement: LayerPlacement
 ```
 
-The exact names are flexible. Manager construction should consume a single
-target-plus-draft layout instead of deriving most properties from the target
-configuration and appending draft layers afterward.
+The tuple position is the C++ local layer id. Manager construction and the
+pre-construction cost classmethods consume the same target-plus-draft sequence.
+There is no separate layout module or transfer-policy abstraction in the first
+implementation.
 
 `draft_layer_ids` should be derived from `owner`, rather than serving as the
 only source of layer identity.
@@ -197,7 +195,7 @@ Use the following disposition:
 |---|---|
 | Separate request mirror and draft admission | **Eliminate** in the unified path |
 | Separate request index and release behavior | **Eliminate** |
-| Draft-layer identification | `LayerCacheSpec.owner` |
+| Draft-layer identification | `KVCacheLayerSpec.owner` |
 | Dynamic-tree generation reserve | Request-wide `SpeculativeCapacityPolicy` |
 | Accepted-token relocation | Explicit target/draft layer sets or homogeneous layer groups |
 | Block publication | One radix tree, with publication governed by each lifecycle's existing reuse policy |
@@ -344,7 +342,7 @@ remain implementation capability gates.
 
 ## Suggested implementation order
 
-1. Add `LayerCacheSpec` and composite layout construction without changing
+1. Add `KVCacheLayerSpec` directly to `KVCacheManagerV2` without changing
    runtime behavior.
 2. Centralize all per-layer geometry and byte calculations behind the
    descriptor.
