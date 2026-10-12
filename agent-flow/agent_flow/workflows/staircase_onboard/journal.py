@@ -21,13 +21,18 @@ something felt.
 
 from __future__ import annotations
 
+import os
 import re
+import shutil
 import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
 _REPORT_NAME = re.compile(r"^(\d+)-")
+#: Beside ``reports/``, not in it: readers of the reports directory expect
+#: nothing but reports there.
+_CLAIMS_DIRNAME = ".dispatch-ordinals"
 
 
 def _utc_now() -> str:
@@ -63,6 +68,8 @@ class Journal:
         if self.path.exists() and self.path.read_text(encoding="utf-8").strip():
             self.event("run resumed", f"slug={slug}")
             return
+        # A new journal is a new run: its dispatch numbers start again at 01.
+        shutil.rmtree(self.claims_dir, ignore_errors=True)
         lines = [f"# Onboarding journal — {slug}", ""]
         lines.extend(header_lines or [])
         lines.append("")
@@ -86,23 +93,52 @@ class Journal:
             with self.path.open("a", encoding="utf-8") as handle:
                 handle.write(f"\n## {_utc_now()} — {title}\n\n{body.rstrip()}\n")
 
+    @property
+    def claims_dir(self) -> Path:
+        """Where each dispatch number is claimed, one empty file per number."""
+        return self.path.parent / _CLAIMS_DIRNAME
+
+    def _highest_ordinal(self) -> int:
+        seen = [0]
+        if self.reports_dir.is_dir():
+            seen.extend(
+                int(match.group(1))
+                for entry in self.reports_dir.iterdir()
+                if (match := _REPORT_NAME.match(entry.name))
+            )
+        if self.claims_dir.is_dir():
+            seen.extend(
+                int(entry.name) for entry in self.claims_dir.iterdir() if entry.name.isdigit()
+            )
+        return max(seen)
+
     def next_ordinal(self) -> int:
-        """The next dispatch number, counted across the whole run.
+        """Claim and return the next dispatch number, counted across the whole run.
 
         Sequential across every agent, so ``NN`` names exactly one dispatch
         and the next ordinal is visible without counting.
+
+        **Claiming is the allocation**, and it is atomic across threads and
+        processes: the number is taken by creating ``.dispatch-ordinals/<NN>``
+        with ``O_CREAT | O_EXCL``, which exactly one caller can win. Reading
+        the highest number and then writing the report, as this used to, let
+        two concurrent smiths of one batch both read the same maximum and
+        both record dispatch ``NN`` (duplicate numbers in ``journal.md``,
+        measured on the DeepSeek-V4.1 run). A loser moves to the next number.
         """
-        if not self.reports_dir.is_dir():
-            return 1
-        seen = [
-            int(match.group(1))
-            for entry in self.reports_dir.iterdir()
-            if (match := _REPORT_NAME.match(entry.name))
-        ]
-        return max(seen, default=0) + 1
+        self.claims_dir.mkdir(parents=True, exist_ok=True)
+        candidate = self._highest_ordinal() + 1
+        while True:
+            try:
+                fd = os.open(self.claims_dir / str(candidate), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            except FileExistsError:
+                candidate += 1
+                continue
+            os.close(fd)
+            return candidate
 
     def record_dispatch(self, agent: str, what: str, prompt: str) -> Path:
-        """Write a dispatch prompt down **before it is sent**, and reserve its ordinal.
+        """Write a dispatch prompt down **before it is sent**, under a freshly claimed ordinal.
 
         An agent's context does not survive a session cut, so a child's
         prompt only survives if its parent wrote it first. This is also why

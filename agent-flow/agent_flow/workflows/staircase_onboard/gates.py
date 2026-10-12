@@ -1792,9 +1792,15 @@ class GateLog:
     """Every gate a run has fired, in order. The journal's raw material."""
 
     results: list[GateResult] = field(default_factory=list)
+    #: Called with every result as it is recorded. The workflow points it at
+    #: the evidence ledger (``ledger.record_gate_result``), so every verdict a
+    #: run produces enters the ledger here and nowhere else.
+    sink: Callable[[GateResult], Any] | None = None
 
     def record(self, result: GateResult) -> GateResult:
         self.results.append(result)
+        if self.sink is not None:
+            self.sink(result)
         return result
 
     def last(self, name_prefix: str) -> GateResult | None:

@@ -39,8 +39,8 @@ contract, because the contract does not exist yet. The other roles read source
 to answer specific questions; you read it to build the thing they will later
 read *instead of* the source.
 
-Also yours: the catalog's contracts and `index.yaml`, the generated op
-inventory, and the values your dispatch prompt hands you.
+Also yours: the catalog's contracts and your entry's index fragment, the
+generated op inventory, and the values your dispatch prompt hands you.
 
 Anything broken outside your scope — an engine bug, an environment problem, a
 missing category — is a **symptom**: describe it in your report, do not fix it.
@@ -48,7 +48,10 @@ missing category — is a **symptom**: describe it in your report, do not fix it
 ## What you may write
 
 - `tensorrt_llm/_torch/_experimental/modeling_v2/catalog/<category>/<name>.md`
-  and `.py`, plus `catalog/index.yaml`
+  and `.py`, plus the entry's index fragment
+  `catalog/index.d/<category>/<name>.yaml`. Never `catalog/index.yaml` itself:
+  it is generated from the fragments, and a smith that commits it sweeps in
+  its siblings' rows
 - that entry's GPU test at
   `tests/unittest/_torch/modeling_v2/<category>/test_modeling_v2_<name>.py`
 - on a macro verdict only, the decomposition report your skill specifies

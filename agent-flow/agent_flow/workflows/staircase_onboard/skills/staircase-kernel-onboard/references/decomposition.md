@@ -6,7 +6,7 @@ lookup delegating to a module `forward`, module calls, tensor glue beyond the
 single call, a phase dispatch, or nested calls into other registered ops.
 
 A macro verdict ends the onboarding path for this run. Onboard nothing: no
-entry files, no `index.yaml` change. Produce the report instead, land it, and
+entry files, no index fragment. Produce the report instead, land it, and
 dispatch one child per constituent.
 
 `decompositions/mla-custom-op.md` is both a worked example and the shape to

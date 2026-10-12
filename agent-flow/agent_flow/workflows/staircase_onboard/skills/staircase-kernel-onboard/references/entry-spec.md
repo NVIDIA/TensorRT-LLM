@@ -112,13 +112,18 @@ Receipts live in the contract frontmatter and are test outcomes, not claims:
 
 Derive the arch key from the device the test actually ran on (`torch.cuda.get_device_capability()`, e.g. `(10, 0)` → `sm_100`). **A receipt is valid only against the files of its own entry**: it must post-date the last write to every one of them, and an entry spans two trees, so the check looks in both. A write to any of the three makes the receipt stale — never rewrite a receipt without rerunning the test.
 
-## index.yaml
+## Index fragment
 
-Append to `tensorrt_llm/_torch/_experimental/modeling_v2/catalog/index.yaml`,
-matching the existing shape:
+Write the entry's row as its own file,
+`tensorrt_llm/_torch/_experimental/modeling_v2/catalog/index.d/<category>/<name>.yaml`,
+and commit it with the entry:
 
 ```yaml
-  - path: norm/rms_norm.py
-    impl: torch.ops.trtllm.<op>
-    summary: "One-line compute-role summary"
+path: norm/rms_norm.py
+impl: torch.ops.trtllm.<op>
+summary: "One-line compute-role summary"
 ```
+
+`catalog/index.yaml` is generated from these fragments by the orchestrator and
+must not be edited by hand. When several smiths run at once, each commits only
+its own fragment, so no commit carries another entry's row.

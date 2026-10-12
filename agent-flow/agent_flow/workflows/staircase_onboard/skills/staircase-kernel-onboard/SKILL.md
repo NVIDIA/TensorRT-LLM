@@ -54,8 +54,10 @@ Every rule below that says "every file of the entry" means both trees.
    it passes, or until you have established a genuine op failure. A fake pass
    is not a product.
 5. **Record the receipt** from that observed run only.
-6. **Sync
-   `tensorrt_llm/_torch/_experimental/modeling_v2/catalog/index.yaml`.**
+6. **Write the entry's index fragment**
+   `tensorrt_llm/_torch/_experimental/modeling_v2/catalog/index.d/<category>/<name>.yaml`
+   (shape in `references/entry-spec.md`). Never edit `catalog/index.yaml`: the
+   orchestrator regenerates it from the committed fragments.
 7. **Do not format or lint during iteration.** The repo's `pre-commit` runs
    once, at delivery, and covers formatting, import order and the general lint
    rules in one pass. What the retired per-entry recipe taught is why that pass
@@ -77,7 +79,7 @@ Every rule below that says "every file of the entry" means both trees.
 git add tensorrt_llm/_torch/_experimental/modeling_v2/catalog/<category>/<name>.md \
         tensorrt_llm/_torch/_experimental/modeling_v2/catalog/<category>/<name>.py \
         tests/unittest/_torch/modeling_v2/<category>/test_modeling_v2_<name>.py \
-        tensorrt_llm/_torch/_experimental/modeling_v2/catalog/index.yaml
+        tensorrt_llm/_torch/_experimental/modeling_v2/catalog/index.d/<category>/<name>.yaml
 git commit -m "feat(catalog): onboard <name> — <one line>"
 ```
 

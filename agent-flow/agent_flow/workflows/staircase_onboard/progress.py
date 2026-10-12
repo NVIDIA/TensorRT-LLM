@@ -33,6 +33,8 @@ entries to a read-modify-write race.
 
 from __future__ import annotations
 
+import os
+import re
 import threading
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -205,10 +207,14 @@ class ProgressContext:
     ``current_iteration`` is set before each dispatch so an entry is stamped
     without the agent having to pass (or guess) it. ``lock`` serializes the
     read-modify-write, which a concurrent smith batch would otherwise race.
+
+    ``current_unit`` is the assembly unit in progress, or empty outside
+    assembly. Gate verdicts are attributed to it in the evidence ledger.
     """
 
     path: Path
     current_iteration: int = 0
+    current_unit: str = ""
     lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
 
     def append(self, agent: str, entry: dict[str, Any]) -> None:
@@ -424,64 +430,145 @@ def parse_uncovered_records(raw: Any) -> list[dict[str, Any]]:
     return rows
 
 
-def decision_path(workspace: Path, agent: str, iteration: int) -> Path:
-    """Where a role writes its decision when MCP tools are unavailable."""
-    return Path(workspace) / DECISIONS_DIRNAME / f"{agent}-{iteration}.yaml"
+#: The unit a plan-stage or deliver-stage decision is filed under. Those
+#: stages are not per unit, and naming them keeps their files apart from every
+#: assembly unit's.
+PLAN_DECISION_UNIT = "plan"
+DELIVER_DECISION_UNIT = "deliver"
+#: The unit a build-stage decision is filed under when none is in progress.
+DEFAULT_DECISION_UNIT = "core"
 
 
-def _decision_marker_path(workspace: Path, agent: str, iteration: int) -> Path:
+def decision_unit(agent: str, unit: str = "") -> str:
+    """The unit ``agent``'s decision file is named for.
+
+    Plan and deliver roles file under their stage; build roles (smith,
+    assembler, reviewer) under the unit they work for.
+    """
+    stage = _STAGE_BY_AGENT.get(agent)
+    if stage == PLAN_STAGE:
+        return PLAN_DECISION_UNIT
+    if stage == DELIVER_STAGE:
+        return DELIVER_DECISION_UNIT
+    return re.sub(r"[^A-Za-z0-9_.]+", "_", unit or DEFAULT_DECISION_UNIT)
+
+
+def decision_path(
+    workspace: Path, agent: str, iteration: int, *, unit: str = "", attempt: int = 1
+) -> Path:
+    """Where a role writes its decision when MCP tools are unavailable.
+
+    ``decisions/<unit>-<role>-<turn>.yaml``. The unit is part of the name
+    because turn numbers restart with every unit: named by role and turn
+    alone, the multimodal assembler's turn 1 overwrote core's, and reviewers
+    overwrote earlier units' decisions three times in one day (F033).
+
+    A turn number can still come round again for the same unit and role -- a
+    re-entered unit restarts its turn count, a smith row is retried under its
+    own number, a ``--clean`` run starts over in the same workspace. So a
+    second dispatch of the same ``(unit, role, turn)`` gets ``attempt`` 2 and
+    the turn token ``<turn>.2``, and so on: :func:`reserve_decision` never
+    hands out a name that was used before, so no decision file is ever
+    overwritten.
+    """
+    token = f"{iteration}.{attempt}" if attempt > 1 else str(iteration)
+    name = f"{decision_unit(agent, unit)}-{agent}-{token}"
+    return Path(workspace) / DECISIONS_DIRNAME / f"{name}.yaml"
+
+
+def _decision_marker_path(decision: Path) -> Path:
     """The dotfile stamped beside a decision when its turn is dispatched.
 
     A dotfile, and beside the decision rather than under a directory of its
     own, because the two must share a filesystem — see
-    ``mark_decision_dispatch`` for why that is the whole mechanism.
+    ``reserve_decision`` for why that is the whole mechanism.
     """
-    return Path(workspace) / DECISIONS_DIRNAME / f".{agent}-{iteration}.dispatched"
+    return decision.with_name(f".{decision.stem}.dispatched")
 
 
-def mark_decision_dispatch(workspace: Path, agent: str, iteration: int) -> None:
-    """Stamp the moment this turn was dispatched, so a stale answer is detectable.
+def reserve_decision(workspace: Path, agent: str, iteration: int, *, unit: str = "") -> Path:
+    """Claim a decision path no earlier dispatch used, and stamp its dispatch marker.
 
-    ``(agent, iteration)`` is **not unique across a run**: ``iteration`` is 1
-    for every turn of the deliver stage, and it restarts per unit in assembly.
-    So two different turns routinely write the same path — see
-    ``decision_path`` — and a turn that ends *without* writing one leaves the
-    **previous** turn's verdict sitting there looking fresh, which
-    ``collect_decision_file`` then reports as this turn's answer.
+    The first attempt whose decision file and marker both do not exist is
+    claimed by creating the marker with ``O_CREAT | O_EXCL``, so two
+    concurrent dispatches (or two processes) can never be handed the same
+    path. Returns the path the turn must write.
 
-    That is not hypothetical. It happened five times in one onboarding: ten
-    smith decisions collected from the wrong place, an assembler told to write
-    the previous turn's path, decision paths colliding across units, and —
-    worst — three audit verdicts read back as a verdict from two passes
-    earlier, which made the audit loop structurally unable to converge,
-    because a ``CLEAN`` could not end the run. Every one of those was silent.
-
-    This run saw its cousin: a smith committed 380 lines with a passing
-    receipt and then died without writing its decision file, blocking a batch
-    for 58 minutes. Staleness detection is what turns that class of failure
-    from silent into visible.
-
-    The marker is compared by **mtime against the decision file on the same
-    filesystem**, never against a clock. An agent may answer from a different
-    node whose clock is skewed by minutes; both files live under the
-    workspace, so their mtimes are ordered by the one filesystem that wrote
-    them.
+    The marker also orders the turn against its answer. It is compared by
+    **mtime against the decision file on the same filesystem**, never against
+    a clock: an agent may answer from a different node whose clock is skewed
+    by minutes, and both files live under the workspace.
     """
-    marker = _decision_marker_path(workspace, agent, iteration)
-    marker.parent.mkdir(parents=True, exist_ok=True)
-    marker.write_text("", encoding="utf-8")
+    attempt = 1
+    while True:
+        path = decision_path(workspace, agent, iteration, unit=unit, attempt=attempt)
+        marker = _decision_marker_path(path)
+        if not path.exists():
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                os.close(os.open(marker, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644))
+            except FileExistsError:
+                pass
+            else:
+                return path
+        attempt += 1
 
 
-def decision_is_stale(workspace: Path, agent: str, iteration: int) -> bool:
-    """Whether the decision file at this path predates the turn that wants it.
+def mark_decision_dispatch(workspace: Path, agent: str, iteration: int, *, unit: str = "") -> Path:
+    """Reserve this turn's decision path before it is dispatched. See :func:`reserve_decision`.
+
+    Before reservation existed, ``(agent, iteration)`` was the whole name and
+    a turn that ended *without* writing a decision left the **previous**
+    turn's verdict at its path, looking fresh. That happened five times in one
+    onboarding, the worst being three audit verdicts read back from two
+    passes earlier, which made the audit loop unable to converge. A reserved
+    path is new, so it holds nothing until this turn writes it.
+    """
+    return reserve_decision(workspace, agent, iteration, unit=unit)
+
+
+def decision_file_instruction(path: Path) -> str:
+    """The block a dispatch prompt ends with: the one exact path this turn writes.
+
+    Stated in the dispatch rather than left to the system prompt's pattern, so
+    the path is exact and un-guessable: the role is told the absolute file to
+    write, not a pattern to instantiate.
+    """
+    return (
+        "---\n\n"
+        "**Write your decision file to exactly this path when you finish:**\n\n"
+        f"`{path}`\n\n"
+        "Nothing downstream reads your prose. This file is how this turn "
+        "reaches the orchestrator.\n"
+    )
+
+
+def current_decision(workspace: Path, agent: str, iteration: int, *, unit: str = "") -> Path:
+    """The path the latest dispatch of ``(unit, agent, iteration)`` was told to write.
+
+    The highest reserved attempt. With nothing reserved -- a run that never
+    stamped one -- it is the first attempt's path.
+    """
+    latest = decision_path(workspace, agent, iteration, unit=unit)
+    attempt = 1
+    while True:
+        attempt += 1
+        candidate = decision_path(workspace, agent, iteration, unit=unit, attempt=attempt)
+        if not (_decision_marker_path(candidate).exists() or candidate.exists()):
+            return latest
+        latest = candidate
+
+
+def decision_is_stale(workspace: Path, agent: str, iteration: int, *, unit: str = "") -> bool:
+    """Whether the current decision file predates the dispatch that reserved it.
 
     False when either file is absent: a missing decision is the caller's
     "no decision" case, and a missing marker means this run never stamped one
     — in which case the old unconditional behaviour is the honest fallback,
     rather than silently refusing every decision a run ever writes.
     """
-    decision = decision_path(workspace, agent, iteration)
-    marker = _decision_marker_path(workspace, agent, iteration)
+    decision = current_decision(workspace, agent, iteration, unit=unit)
+    marker = _decision_marker_path(decision)
     if not decision.is_file() or not marker.is_file():
         return False
     return decision.stat().st_mtime < marker.stat().st_mtime
@@ -492,6 +579,8 @@ def collect_decision_file(
     workspace: Path,
     agent: str,
     iteration: int,
+    *,
+    unit: str = "",
 ) -> str | None:
     """Read, validate and record the decision file ``agent`` wrote.
 
@@ -513,14 +602,13 @@ def collect_decision_file(
     silence to interpret.
     """
     allowed = DECISIONS_BY_AGENT[agent]
-    path = decision_path(workspace, agent, iteration)
+    path = current_decision(workspace, agent, iteration, unit=unit)
     if not path.is_file():
         return None
     # A file older than this turn's dispatch marker belongs to a PREVIOUS turn
-    # that happened to share this path. Reading it would report that turn's
-    # verdict as this one's — the failure `mark_decision_dispatch` exists to
-    # make visible, and one that is silent every other way.
-    if decision_is_stale(workspace, agent, iteration):
+    # that shared this path. Reservation makes that impossible for paths it
+    # hands out; the check stays for files written before it existed.
+    if decision_is_stale(workspace, agent, iteration, unit=unit):
         return None
 
     try:
@@ -540,6 +628,7 @@ def collect_decision_file(
         "timestamp": _now_iso(),
         "summary": str(raw.get("summary", "")).strip(),
         "decision": decision,
+        "decision_file": path.name,
     }
     for key in EXTRA_KEYS_BY_AGENT.get(agent, ()):
         value = raw.get(key)
@@ -826,13 +915,22 @@ __all__ = [
     "SMITH_DECISIONS",
     "UNCOVERED_OPTIONAL",
     "UNCOVERED_REQUIRED",
+    "DEFAULT_DECISION_UNIT",
+    "DELIVER_DECISION_UNIT",
+    "PLAN_DECISION_UNIT",
     "build_progress_tools",
+    "collect_decision_file",
+    "current_decision",
+    "decision_file_instruction",
     "decision_is_stale",
+    "decision_path",
+    "decision_unit",
     "find_entries",
     "init_progress_file",
     "latest_decision",
     "latest_entry",
     "mark_decision_dispatch",
     "read_progress",
+    "reserve_decision",
     "write_progress",
 ]

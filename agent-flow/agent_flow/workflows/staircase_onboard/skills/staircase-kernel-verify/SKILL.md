@@ -60,10 +60,13 @@ target from a wrong answer into a loud failure.
 
 ```bash
 git add tensorrt_llm/_torch/_experimental/modeling_v2/catalog/<category>/<name>.md \
-        tests/unittest/_torch/modeling_v2/<category>/test_modeling_v2_<name>.py \
-        tensorrt_llm/_torch/_experimental/modeling_v2/catalog/index.yaml
+        tests/unittest/_torch/modeling_v2/<category>/test_modeling_v2_<name>.py
 git commit -m "feat(catalog): certify <name> at <surface>"
 ```
+
+A verify does not touch `catalog/index.yaml`, which is generated. If the
+entry's one-line summary has to change, edit and commit its fragment,
+`catalog/index.d/<category>/<name>.yaml`.
 
 The wrapper usually stays untouched. If it does not — if covering this surface
 needs a signature change — that is worth saying loudly in the report, because

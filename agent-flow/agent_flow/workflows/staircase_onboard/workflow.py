@@ -55,6 +55,7 @@ from . import envelope as envelope_mod
 from . import gates as gates_mod
 from . import overlap as overlap_mod
 from . import remediation
+from .catalog_index import CatalogIndexHook
 from .committer import CommitPolicy, install_committer
 from .delivery import DeliveryReport, summarize_for_auditor, verify_delivery, write_premerge_pack
 from .embargo import display_entries, merge_hook_maps, source_embargo_enforcement
@@ -64,6 +65,7 @@ from .environment import (
     resolve_environment,
     shares_allocation_with_spool,
 )
+from .evidence import RunEvidence
 from .execution import select_command_executor, select_turn_executor, shell_runner_for
 from .journal import Journal
 from .preflight import (
@@ -84,7 +86,8 @@ from .progress import (
     ProgressContext,
     build_progress_tools,
     collect_decision_file,
-    decision_path,
+    current_decision,
+    decision_file_instruction,
     init_progress_file,
     latest_decision,
     latest_entry,
@@ -427,7 +430,11 @@ class StaircaseOnboardWorkflow:
             init_progress_file(self.progress_path)
 
         self.journal = Journal(path=self.journal_path)
-        self.gate_log = gates_mod.GateLog()
+        #: The evidence ledger: every gate result enters it through the log's sink.
+        self.evidence = RunEvidence(self, clean=clean)
+        self.gate_log = gates_mod.GateLog(sink=self.evidence.record)
+        #: catalog/index.yaml, regenerated from the per-entry fragments in HEAD.
+        self._catalog_index = CatalogIndexHook(self)
         self._progress_ctx = ProgressContext(path=self.progress_path)
         self._tools = build_progress_tools(self._progress_ctx)
 
@@ -538,6 +545,7 @@ class StaircaseOnboardWorkflow:
         *,
         iteration: int | None = None,
         layer: Any | None = None,
+        unit: str = "",
     ) -> str:
         """Run one role turn, wherever this run's transport delivers it.
 
@@ -563,7 +571,7 @@ class StaircaseOnboardWorkflow:
             backend=agent.backend,
             model=agent.model,
             decision_file=(
-                str(decision_path(self.workspace, role, iteration))
+                str(current_decision(self.workspace, role, iteration, unit=unit))
                 if self._decision_files and iteration is not None
                 else None
             ),
@@ -1093,6 +1101,7 @@ class StaircaseOnboardWorkflow:
         )
         path = self.workspace / "early_checks.md"
         path.write_text(report.render(), encoding="utf-8")
+        self.evidence.record_early_checks(report)
         warnings = report.warnings
         self.journal.section(
             f"early delivery checks ({stage})",
@@ -1737,6 +1746,7 @@ class StaircaseOnboardWorkflow:
         return [str(u) for u in units[1 : units.index(unit) + 1]]
 
     def _assemble_one_unit(self, state: WorkflowState, unit: str, log) -> bool:
+        self._progress_ctx.current_unit = unit
         # `unit_turns` bounds a self-heal loop, so it has to count WORK. It
         # used to count entries into this loop, and those are not the same
         # number: `task.yaml` is loaded once in `_init_state`, so every spec
@@ -2184,7 +2194,10 @@ class StaircaseOnboardWorkflow:
         print_rule("[bold magenta]deliver[/bold magenta]", log)
         self._progress_ctx.current_iteration = 1
 
-        report = self._delivery_report(state)
+        self._catalog_index.sync(log)
+        report = self.evidence.record_delivery_checks(
+            self._catalog_index.extend(self._delivery_report(state))
+        )
         self.journal.section("delivery checks", f"```\n{report.render()}\n```")
         print_message(report.render(), log)
         if not report.passed:
@@ -2196,13 +2209,20 @@ class StaircaseOnboardWorkflow:
         boot = self.gate_log.last("boot")
         if not self._run_remediation_cycle(state, report, boot, log):
             return False
-        # The delivery tail: what the branch still owes before it is a PR.
+        # The delivery tail. The evidence first: the remediation cycle may
+        # still have committed, so only now is the delivered tree known, and
+        # every verdict has to describe it -- a stale one is re-run, and a tree
+        # no full regression ran on refuses delivery.
+        if not self.evidence.settle_delivery(state, log):
+            return False
+        # Then what the branch still owes before it is a PR.
         pack, summary = write_premerge_pack(
             self.task_data["trtllm_repo_path"],
             self.workspace / "reports",
             family=self._preflight.family,
             policy=CommitPolicy.from_task(self.task_data, workspace=self.workspace),
         )
+        summary.append(self.evidence.annotate_premerge(pack))
         self.journal.section(
             "pre-merge pack", "\n".join(f"- {line}" for line in summary) + f"\n\n`{pack}`"
         )
@@ -2763,6 +2783,7 @@ class StaircaseOnboardWorkflow:
 
     def _checkpoint(self, state: WorkflowState) -> None:
         save_state(self.state_path, state)
+        self.evidence.refresh(state)
 
     @staticmethod
     def _materialize(source: str | Path, destination: Path) -> None:
@@ -2898,7 +2919,9 @@ class StaircaseOnboardWorkflow:
         decision on disk is the failure being retried.
         """
         if self._decision_files and not note and item.n not in self._smiths_dispatched:
-            adopted = collect_decision_file(self._progress_ctx, self.workspace, "smith", item.n)
+            adopted = collect_decision_file(
+                self._progress_ctx, self.workspace, "smith", item.n, unit=item.unit
+            )
             if adopted is not None:
                 print_message(
                     f"[bold cyan]→ smith {item.n} ({item.target}): adopting {adopted} written "
@@ -2919,10 +2942,10 @@ class StaircaseOnboardWorkflow:
         try:
             prompt = self._smith_prompt(item, note)
             if self._decision_files:
-                # Smiths number by queue item rather than by turn, and a batch
-                # re-run reuses those numbers, so the same staleness hazard
-                # applies here.
-                mark_decision_dispatch(self.workspace, "smith", item.n)
+                # Smiths number by queue item rather than by turn, and a retry
+                # reuses that number, so the retry is reserved a path of its own.
+                target = mark_decision_dispatch(self.workspace, "smith", item.n, unit=item.unit)
+                prompt = f"{prompt}\n\n{decision_file_instruction(target)}"
             report = self.journal.record_dispatch("smith", f"{item.mode} {item.target}", prompt)
             result = self._run_turn(
                 "smith",
@@ -2930,17 +2953,19 @@ class StaircaseOnboardWorkflow:
                 prompt,
                 iteration=item.n,
                 layer=layer,
+                unit=item.unit,
             )
             self.journal.record_result(report, result)
             if self._decision_files:
                 decision = collect_decision_file(
-                    self._progress_ctx, self.workspace, "smith", item.n
+                    self._progress_ctx, self.workspace, "smith", item.n, unit=item.unit
                 )
                 if decision is None:
                     print_message(
                         f"[bold yellow]! smith {item.n} ({item.target}) ended its turn "
                         f"without a valid decision file at "
-                        f"{decision_path(self.workspace, 'smith', item.n)}[/bold yellow]",
+                        f"{current_decision(self.workspace, 'smith', item.n, unit=item.unit)}"
+                        f"[/bold yellow]",
                         None,
                     )
             return result
@@ -2968,6 +2993,9 @@ class StaircaseOnboardWorkflow:
     def _dispatch(self, role: str, *, what: str, prompt: str) -> str:
         """Run one agent turn, recording the prompt **before** it is sent."""
         iteration = self._progress_ctx.current_iteration
+        unit = self._progress_ctx.current_unit
+        # Every role that reads the catalog index reads it current.
+        self._catalog_index.sync()
         # Every role, one place. The smith path does not come through here --
         # it owns its own layer per dispatch -- so `_smith_prompt` carries
         # the same block explicitly.
@@ -2975,39 +3003,26 @@ class StaircaseOnboardWorkflow:
         if context:
             prompt = f"{prompt}\n\n{context}\n"
         if self._decision_files:
-            # Stated here rather than only in the system prompt so the path
-            # is exact and un-guessable: the role is told the absolute file
-            # to write, not a pattern to instantiate.
-            target = decision_path(self.workspace, role, iteration)
-            prompt = (
-                f"{prompt}\n\n"
-                f"---\n\n"
-                f"**Write your decision file to exactly this path when you finish:**\n\n"
-                f"`{target}`\n\n"
-                f"Nothing downstream reads your prose. This file is how this turn "
-                f"reaches the orchestrator.\n"
-            )
-            # Stamp BEFORE the turn runs. `(role, iteration)` is not unique
-            # across a run -- `iteration` is 1 for every deliver turn and
-            # restarts per unit in assembly -- so a turn that ends without
-            # writing a decision leaves the PREVIOUS turn's verdict sitting at
-            # this path looking fresh. The marker is what lets
-            # `collect_decision_file` tell those apart.
-            mark_decision_dispatch(self.workspace, role, iteration)
+            # Reserved BEFORE the turn runs, and never a path an earlier turn
+            # used -- see `progress.reserve_decision`.
+            target = mark_decision_dispatch(self.workspace, role, iteration, unit=unit)
+            prompt = f"{prompt}\n\n{decision_file_instruction(target)}"
 
         report = self.journal.record_dispatch(role, what, prompt)
-        result = self._run_turn(role, what, prompt, iteration=iteration)
+        result = self._run_turn(role, what, prompt, iteration=iteration, unit=unit)
         self.journal.record_result(report, result)
 
         if self._decision_files:
-            decision = collect_decision_file(self._progress_ctx, self.workspace, role, iteration)
+            decision = collect_decision_file(
+                self._progress_ctx, self.workspace, role, iteration, unit=unit
+            )
             if decision is None:
                 # Deliberately not silent and deliberately not fatal here:
                 # the caller reads the decision back out of progress.yaml and
                 # already knows what to do with its absence.
                 print_message(
                     f"[bold yellow]! {role} ended its turn without a valid decision "
-                    f"file at {decision_path(self.workspace, role, iteration)}"
+                    f"file at {current_decision(self.workspace, role, iteration, unit=unit)}"
                     f"[/bold yellow]",
                     None,
                 )

@@ -30,12 +30,14 @@ from agent_flow.workflows.staircase_onboard.progress import (
     EXTRA_KEYS_BY_AGENT,
     ProgressContext,
     collect_decision_file,
+    current_decision,
     decision_is_stale,
     decision_path,
     init_progress_file,
     latest_decision,
     latest_entry,
     mark_decision_dispatch,
+    reserve_decision,
 )
 from agent_flow.workflows.staircase_onboard.prompts import build_staircase_onboard_prompts
 from agent_flow.workflows.staircase_onboard.prompts._common import decision_file_block
@@ -162,23 +164,40 @@ def test_a_decision_written_after_the_marker_is_collected(tmp_path):
 
 
 def test_a_decision_older_than_the_marker_is_refused(tmp_path):
-    """The failure this exists for, and it happened five times in one run.
+    """The failure the marker exists for, on a path written before reservation.
 
-    `(agent, iteration)` is not unique across a run — `iteration` is 1 for
-    every deliver-stage turn and restarts per unit in assembly. A turn that
-    ends without writing leaves the PREVIOUS turn's verdict at the same path,
-    looking fresh. Three audit verdicts were read back that way, including a
-    `CLEAN` that could therefore never end the run.
+    A legacy workspace can hold a marker and a decision at the same path, in
+    the wrong order. The decision predates the dispatch that wants it, so it
+    belongs to a previous turn and is refused.
     """
     ctx = _context(tmp_path)
     stale = _write_decision(tmp_path, "auditor", 1, "UNCOVERED")
     os.utime(stale, (1_000_000, 1_000_000))  # written long before this dispatch
-    mark_decision_dispatch(tmp_path, "auditor", 1)
+    marker = stale.with_name(f".{stale.stem}.dispatched")
+    marker.write_text("", encoding="utf-8")
 
     assert decision_is_stale(tmp_path, "auditor", 1)
     assert collect_decision_file(ctx, tmp_path, "auditor", 1) is None
     # and nothing was appended, so `latest_decision` cannot read it either
     assert latest_decision(ctx.path, "auditor", DECISIONS_BY_AGENT["auditor"]) is None
+
+
+def test_a_previous_turns_decision_is_never_read_as_this_ones(tmp_path):
+    """The five silent misreads of one onboarding, now structurally impossible.
+
+    Three audit verdicts were read back from two passes earlier because every
+    deliver turn shared one path. A new dispatch is reserved a new path, so
+    the old verdict is neither read as this turn's nor overwritten by it.
+    """
+    ctx = _context(tmp_path)
+    old = _write_decision(tmp_path, "auditor", 1, "UNCOVERED")
+    target = mark_decision_dispatch(tmp_path, "auditor", 1)
+
+    assert target != old
+    assert collect_decision_file(ctx, tmp_path, "auditor", 1) is None
+    target.write_text("summary: s\ndecision: CLEAN\n", encoding="utf-8")
+    assert collect_decision_file(ctx, tmp_path, "auditor", 1) == "CLEAN"
+    assert old.read_text() == "summary: s\ndecision: UNCOVERED\n"
 
 
 def test_without_a_marker_the_old_behaviour_stands(tmp_path):
@@ -203,7 +222,7 @@ def test_the_marker_does_not_collide_with_the_decision_it_guards(tmp_path):
     """A dotfile beside it, so a marker is never mistaken for an answer."""
     mark_decision_dispatch(tmp_path, "smith", 4)
     written = sorted(p.name for p in decision_path(tmp_path, "smith", 4).parent.iterdir())
-    assert written == [".smith-4.dispatched"]
+    assert written == [".core-smith-4.dispatched"]
 
 
 def test_staleness_is_judged_by_mtime_not_by_the_clock():
@@ -215,6 +234,89 @@ def test_staleness_is_judged_by_mtime_not_by_the_clock():
     src = inspect.getsource(decision_is_stale)
     assert "st_mtime" in src
     assert "time.time" not in src and "datetime.now" not in src
+
+
+# ------------------------------------- F033: named by unit, never overwritten
+
+
+def test_decision_files_are_named_by_unit_role_and_turn(tmp_path):
+    assert decision_path(tmp_path, "assembler", 2, unit="multimodal").name == (
+        "multimodal-assembler-2.yaml"
+    )
+    assert decision_path(tmp_path, "reviewer", 1, unit="core").name == "core-reviewer-1.yaml"
+    assert decision_path(tmp_path, "smith", 7, unit="dspark").name == "dspark-smith-7.yaml"
+    # Plan and deliver are not per unit; they file under their stage.
+    assert decision_path(tmp_path, "plan_drafter", 1, unit="mtp").name == (
+        "plan-plan_drafter-1.yaml"
+    )
+    assert decision_path(tmp_path, "auditor", 3).name == "deliver-auditor-3.yaml"
+
+
+def test_two_units_turn_one_do_not_share_a_file(tmp_path):
+    """F033 as measured: the multimodal assembler's turn 1 overwrote core's."""
+    core = mark_decision_dispatch(tmp_path, "assembler", 1, unit="core")
+    core.write_text("summary: core\ndecision: UNIT_READY\n", encoding="utf-8")
+    multimodal = mark_decision_dispatch(tmp_path, "assembler", 1, unit="multimodal")
+    multimodal.write_text("summary: mm\ndecision: BLOCKED\n", encoding="utf-8")
+    assert core != multimodal
+    assert "core" in core.read_text()
+
+
+def test_a_reused_turn_number_gets_a_new_attempt_not_the_old_file(tmp_path):
+    """A re-entered unit restarts its turn count; a retried smith keeps its number."""
+    first = mark_decision_dispatch(tmp_path, "smith", 7)
+    first.write_text("summary: s\ndecision: FAILED_RECEIPT\n", encoding="utf-8")
+    second = mark_decision_dispatch(tmp_path, "smith", 7)
+    third = mark_decision_dispatch(tmp_path, "smith", 7)
+    assert [first.name, second.name, third.name] == [
+        "core-smith-7.yaml",
+        "core-smith-7.2.yaml",
+        "core-smith-7.3.yaml",
+    ]
+    assert current_decision(tmp_path, "smith", 7) == third
+
+
+def test_concurrent_reservations_never_share_a_path(tmp_path):
+    import threading
+
+    got: list[Path] = []
+    lock = threading.Lock()
+
+    def reserve():
+        path = reserve_decision(tmp_path, "reviewer", 1, unit="core")
+        with lock:
+            got.append(path)
+
+    threads = [threading.Thread(target=reserve) for _ in range(16)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert len(set(got)) == 16
+
+
+def test_the_collected_entry_names_its_file(tmp_path):
+    ctx = _context(tmp_path)
+    path = mark_decision_dispatch(tmp_path, "reviewer", 2, unit="mtp")
+    path.write_text("summary: s\ndecision: APPROVE\n", encoding="utf-8")
+    assert collect_decision_file(ctx, tmp_path, "reviewer", 2, unit="mtp") == "APPROVE"
+    assert latest_entry(ctx.path, "reviewer")["decision_file"] == "mtp-reviewer-2.yaml"
+
+
+def test_a_dispatch_prompt_names_the_reserved_path(tmp_path, task_file, monkeypatch):
+    """The role is told the one exact file, including the unit and any attempt suffix."""
+    from .test_workflow import Script, _install, _workflow
+
+    workflow = _workflow(tmp_path)
+    calls = _install(monkeypatch, workflow, Script(None))
+    workflow._decision_files = True
+    workflow._progress_ctx.current_iteration = 1
+    workflow._progress_ctx.current_unit = "mtp"
+    workflow._dispatch("reviewer", what="mtp", prompt="Review it.")
+    workflow._dispatch("reviewer", what="mtp", prompt="Review it again.")
+    prompts = [prompt for role, prompt in calls if role == "reviewer"]
+    assert "mtp-reviewer-1.yaml`" in prompts[0]
+    assert "mtp-reviewer-1.2.yaml`" in prompts[1]
 
 
 # ------------------------------------------------------------------ prompts
@@ -233,7 +335,7 @@ def test_every_role_gets_a_decision_block_when_the_mode_is_on():
     for role, decisions in DECISIONS_BY_AGENT.items():
         prompt = getattr(bundle, role)
         assert "Ending your turn" in prompt, role
-        assert f"decisions/{role}-<iteration>.yaml" in prompt, role
+        assert f"decisions/<unit>-{role}-<turn>.yaml" in prompt, role
         for value in decisions:
             assert f"`{value}`" in prompt, (role, value)
 
@@ -248,7 +350,7 @@ def test_roles_with_extra_keys_are_told_about_them():
 def test_no_decision_block_when_the_tools_are_available():
     """The tools are the preferred mechanism; this mode is the fallback."""
     bundle = build_staircase_onboard_prompts(decision_files=False)
-    assert "decisions/plan_drafter-<iteration>.yaml" not in bundle.plan_drafter
+    assert "decisions/<unit>-plan_drafter-<turn>.yaml" not in bundle.plan_drafter
 
 
 # ------------------------------------------------- the workspace spec copy
