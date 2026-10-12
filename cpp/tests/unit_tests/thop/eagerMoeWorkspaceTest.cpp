@@ -1,6 +1,17 @@
 /*
  * Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
- * SPDX-License-Identifier: Apache-2.0
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 #include "tensorrt_llm/thop/moe/cutlass/eagerMoeWorkspace.h"
 #include "tensorrt_llm/thop/moe/cutlass/eagerMoeWorkspaceScope.h"
@@ -212,8 +223,13 @@ TEST(EagerMoeWorkspace, ConservativeReservationOomStillAllowsSmallerActualDemand
     size_t free = 0, total = 0;
     ASSERT_EQ(cudaMemGetInfo(&free, &total), cudaSuccess);
     c10::cuda::CUDACachingAllocator::setMemoryFraction(static_cast<double>(live + kMiB) / total, device);
+    auto const previousData = workspace.tensor().data_ptr();
+    ASSERT_EQ(workspace.capacity(), 8 * kMiB);
     ASSERT_TRUE(workspace.beginForward(1, false, 2048));
+    ASSERT_EQ(workspace.capacity(), 8 * kMiB);
+    EXPECT_EQ(workspace.tensor().data_ptr(), previousData);
     workspace.get(4 * kMiB, false);
+    EXPECT_EQ(workspace.tensor().data_ptr(), previousData);
     workspace.finishForward(true);
     EXPECT_EQ(workspace.capacity(), 8 * kMiB);
     auto const after = c10::cuda::CUDACachingAllocator::getDeviceStats(device);
