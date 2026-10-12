@@ -84,25 +84,24 @@ def env():
         # it. GB300 rail NICs carry only IPv6 addresses inside a VRF, which a
         # plain socket cannot bind, so UCX worker creation fails on them. Pin
         # UCX to the NIC this node uses to reach the other node.
-        nic = _ipv4_nic_to(get_the_other_host(0))
-        if nic is not None:
-            e["UCX_NET_DEVICES"] = nic
+        e["UCX_NET_DEVICES"] = _ipv4_nic_to(get_the_other_host(0))
     return e
 
 
 def _ipv4_nic_to(host):
-    """Return the NIC carrying this node's IPv4 route to host, or None."""
+    """Return the NIC carrying this node's IPv4 route to host."""
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
             s.connect((host, 1))
             local_ip = s.getsockname()[0]
-    except OSError:
-        return None
+    except OSError as err:
+        pytest.fail(f"No IPv4 route to {host} for UCX tcp: {err}")
     for nic, addrs in psutil.net_if_addrs().items():
         if any(a.family == socket.AF_INET and a.address == local_ip
                for a in addrs):
             return nic
-    return None
+    pytest.fail(f"No NIC owns local IPv4 {local_ip} used to reach {host}; "
+                "cannot restrict UCX_NET_DEVICES")
 
 
 @pytest.fixture(scope="module")
