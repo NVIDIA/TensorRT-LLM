@@ -94,7 +94,7 @@ Our goals for the framework are two. A user turns a compression method on with *
 Beyond the forward pass, a serving system offers **extra opportunities to compress the KV cache**: moments where the KV already exists, nothing is reading it, and a dedicated algorithm can run at exactly that time. Using them well means three things:
 
 - **Untouched attention**: attention reads the GPU KV as before.
-- **Seamless insertion**: only page contents change.
+- **Seamless insertion**: no exposed overhead; the compression kernels hide inside existing steps and nothing else in the runtime changes.
 - **General to models**: works on KV pages, not on kernels.
 
 To insert precisely, we define five stages in the life of a KV cache (Figure 3):
