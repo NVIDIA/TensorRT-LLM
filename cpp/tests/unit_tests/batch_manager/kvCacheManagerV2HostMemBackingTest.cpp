@@ -88,6 +88,17 @@ TEST_P(HostMemBackingTest, GranularityIsUsable)
     EXPECT_EQ(granularity & (granularity - 1), 0U) << "granularity must be a power of two";
 }
 
+//! Offsets handed to commit() are multiples of the granularity, so the base has
+//! to be one too for the addresses they name to be. cuMemAddressReserve aligns
+//! for the VMM backing; mmap does not, and the mmap backing aligns for itself.
+TEST_P(HostMemBackingTest, ReservationIsGranularityAligned)
+{
+    MemAddress const base = mBacking->reserve(mTotalSize);
+    ASSERT_NE(base, 0U);
+    EXPECT_EQ(base % mBacking->commitGranularity(), 0U)
+        << "base " << reinterpret_cast<void*>(base) << " is not a multiple of " << mBacking->commitGranularity();
+}
+
 //! The factory must hand back the backing that was asked for; every other case
 //! here is parametrized on that assumption.
 TEST_P(HostMemBackingTest, FactoryHonoursRequestedKind)

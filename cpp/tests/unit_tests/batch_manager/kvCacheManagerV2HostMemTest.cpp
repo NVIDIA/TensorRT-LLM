@@ -395,4 +395,23 @@ TEST(KvCacheManagerV2HostMemTest, ConcurrentWaitUsableFromManyThreads)
     }
 }
 
+//! mmap places a mapping wherever it likes, subject only to page alignment, so
+//! a stricter base has to be carved out of a larger one. The alignment asked
+//! for here is far coarser than anything the kernel would return by chance,
+//! which is what keeps this from passing on luck.
+TEST(KvCacheManagerV2HostMemTest, MmapHonoursRequestedAlignment)
+{
+    constexpr size_t kAlignment = size_t{1} << 30;
+    constexpr size_t kSize = size_t{4} << 20;
+
+    MemAddress const addr = hostMmap(kSize, kAlignment);
+    ASSERT_NE(addr, 0U);
+    EXPECT_EQ(addr % kAlignment, 0U) << "base " << reinterpret_cast<void*>(addr) << " is not aligned";
+
+    // The slack must be gone, not merely skipped: writing the whole span and
+    // unmapping exactly it would fail if either end were still mapped short.
+    std::memset(reinterpret_cast<void*>(addr), 0xA5, kSize);
+    hostMunmap(addr, kSize);
+}
+
 } // namespace

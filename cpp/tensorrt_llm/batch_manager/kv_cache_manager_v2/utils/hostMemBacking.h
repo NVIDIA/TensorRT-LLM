@@ -58,6 +58,9 @@ public:
 
     //! Reserves `size` bytes of address space. No physical memory is committed
     //! and no page is resident. Must be called exactly once, before any commit.
+    //!
+    //! The address returned is a multiple of commitGranularity(), so an offset
+    //! that is a multiple of it names an address that is too.
     [[nodiscard]] virtual MemAddress reserve(size_t size) = 0;
 
     //! Makes [offset, offset + size) resident and reachable by both the CPU and

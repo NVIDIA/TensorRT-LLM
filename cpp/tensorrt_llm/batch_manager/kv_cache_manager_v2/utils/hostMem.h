@@ -165,7 +165,11 @@ private:
 // ---------------------------------------------------------------------------
 // Low-level wrappers used internally (also exposed for storage pool use).
 // ---------------------------------------------------------------------------
-MemAddress hostMmap(size_t size);        // throws HostOOMError
+//! Maps `size` bytes of address space, based at a multiple of `alignment`.
+//! `alignment` must be a power of two. Anything up to the page size adds
+//! nothing, mmap already aligning that far; coarser than that is carved out of
+//! a larger mapping, so it costs address space. Throws HostOOMError.
+MemAddress hostMmap(size_t size, size_t alignment = 1);
 void hostMunmap(MemAddress ptr, size_t size) noexcept;
 void resizeFile(int fd, size_t newSize); // throws DiskOOMError
 

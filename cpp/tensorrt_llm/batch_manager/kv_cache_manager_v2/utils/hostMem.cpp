@@ -50,17 +50,37 @@ namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 // Low-level helpers
 // ---------------------------------------------------------------------------
 
-MemAddress hostMmap(size_t size)
+MemAddress hostMmap(size_t size, size_t alignment)
 {
+    TLLM_CHECK_DEBUG(alignment > 0 && (alignment & (alignment - 1)) == 0);
+    auto const pageSize = static_cast<size_t>(::sysconf(_SC_PAGESIZE));
+    // mmap aligns to a page on its own, so anything coarser is carved out of a
+    // larger mapping. A page-aligned base is at most `alignment - pageSize`
+    // below the next multiple of the alignment, so that much extra is enough to
+    // guarantee the oversized range contains an aligned span of `size`.
+    size_t const slack = alignment > pageSize ? alignment - pageSize : 0;
     // MAP_NORESERVE: the mapping is a reservation sized to an upper bound, and
     // only a prefix of it is ever committed. Without it a strict-overcommit
     // system charges the whole range against swap and refuses the mapping.
-    void* ptr = ::mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    void* ptr
+        = ::mmap(nullptr, size + slack, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
     if (ptr == MAP_FAILED || ptr == nullptr)
     {
         throw HostOOMError(std::string("mmap failed: ") + std::strerror(errno));
     }
-    return reinterpret_cast<MemAddress>(ptr);
+    auto const raw = reinterpret_cast<MemAddress>(ptr);
+    auto const aligned = roundUp(raw, alignment);
+    // Returned before anything is committed, so the mapping stays one VMA and
+    // the caller's munmap of [aligned, aligned + size) covers all of it.
+    if (aligned != raw)
+    {
+        hostMunmap(raw, aligned - raw);
+    }
+    if (size_t const tail = (raw + size + slack) - (aligned + size); tail != 0)
+    {
+        hostMunmap(aligned + size, tail);
+    }
+    return aligned;
 }
 
 void hostMunmap(MemAddress ptr, size_t size) noexcept

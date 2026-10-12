@@ -150,7 +150,10 @@ public:
     MemAddress reserve(size_t size) override
     {
         TLLM_CHECK_WITH_INFO(mAddr == 0, "HostMem backing reserved twice");
-        mAddr = hostMmap(size);
+        // Based at a multiple of the commit unit, matching what
+        // cuMemAddressReserve gives the VMM backing, so a committed sub-range
+        // starts at the same offset into a page either way.
+        mAddr = hostMmap(size, mAlignment);
         mSize = size;
         //! Applied once over the whole mapping. Per-chunk page-mode advice would
         //! change VMA flags and split the mapping into one VMA per chunk.
