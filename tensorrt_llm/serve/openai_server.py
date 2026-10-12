@@ -2453,6 +2453,7 @@ class OpenAIServer(_VideoRoutesMixin):
                                             400)
 
         try:
+
             def _count_estimate() -> int:
                 # The simplified renderer: used for requests the shared
                 # pipeline cannot render (media) and under
@@ -2785,8 +2786,8 @@ class OpenAIServer(_VideoRoutesMixin):
                 )
                 rendered, (mm_data, mm_embeddings) = await asyncio.gather(
                     render_task, mm_coroutines)
-                prompt = (rendered.text if rendered.text is not None else
-                          rendered.token_ids)
+                prompt = (rendered.text
+                          if rendered.text is not None else rendered.token_ids)
             prompt = prompt_inputs(prompt)
 
             if request.prompt_token_ids is not None:
@@ -3631,9 +3632,8 @@ class OpenAIServer(_VideoRoutesMixin):
                     self).fingerprint()
                 self._render_fingerprint = render_fingerprint
             except Exception:
-                logger.warning(
-                    "Could not compute the rendering fingerprint:\n"
-                    f"{traceback.format_exc()}")
+                logger.warning("Could not compute the rendering fingerprint:\n"
+                               f"{traceback.format_exc()}")
         if render_fingerprint is not None:
             content["render_fingerprint"] = render_fingerprint
         args = getattr(self.generator, "args", None)
