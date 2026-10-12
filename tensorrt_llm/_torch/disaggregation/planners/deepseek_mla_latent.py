@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Disaggregated KV transfer plan for DeepSeek targets that keep MLA latent KV in one pool.
+"""Disaggregated KV transfer plan for DeepSeek deployments that keep MLA latent KV in one pool.
 
 Under attention-DP every context rank has a generation twin with the same
 dp_rank. MLA keeps one latent-K region per layer in one physical pool, so a
@@ -21,12 +21,14 @@ plain arithmetic: pair block ordinals both sides hold, address the slots, and
 copy. Blocks that are consecutive on both sides move as one fragment.
 
 Which deployments may talk to each other is the ``COVERS`` matrix below: pairs
-of (context target, generation target) ids. A target never names this planner;
-``modeling_v2.transfers`` finds the planner from the target id, and ``describe``
-publishes that id so the peer's planner can look the pair up too. Anything not
-in the matrix is refused at registration; the generic default planner stays
-untouched for the models that need pool matching, head re-sharding or
-recurrent state.
+of (context deployment, generation deployment). A deployment is the
+architecture plus its parallel topology, so the built-in DeepseekV3 model and a
+modeling_v2 target on the same topology are the same deployment and may feed
+each other. A model never names this planner; ``disaggregation.planners``
+finds the planner from the deployment, and ``describe`` publishes that
+deployment so the peer's planner can look the pair up too. Anything not in the
+matrix is refused at registration; the generic default planner stays untouched
+for the models that need pool matching, head re-sharding or recurrent state.
 """
 
 from __future__ import annotations
@@ -52,7 +54,12 @@ from tensorrt_llm._torch.disaggregation.resource.page import (
 )
 from tensorrt_llm._torch.disaggregation.resource.utils import get_physical_pool
 
-_R1_DEP4 = "deepseek_v3/r1_0528_nvfp4__sm_103__dep4"
+from .deployment import Deployment
+
+# Attention-DP over 4 ranks, experts sharded 4 ways, attention replicated.
+_DEEPSEEK_DEP4 = Deployment(
+    architecture="DeepseekV3ForCausalLM", tp=4, pp=1, cp=1, moe_ep=4, moe_tp=1, attention_dp=True
+)
 
 
 def _sole_pool(page_table: Optional[KVCachePageTable], side: str) -> PhysicalPool:
@@ -75,32 +82,36 @@ def _sole_pool(page_table: Optional[KVCachePageTable], side: str) -> PhysicalPoo
 
 
 class DeepseekMlaLatentTransferPlanner(TransferPlanner):
-    planner_id = "modeling_v2.deepseek_mla_latent"
+    planner_id = "trtllm.deepseek_mla_latent"
 
-    #: (context target, generation target) pairs this planner knows how to move
-    #: bytes between. The same pair is listed once; the planner serves both
-    #: roles, so a pair is read from the sender's side or the receiver's side.
-    COVERS: FrozenSet[Tuple[str, str]] = frozenset({(_R1_DEP4, _R1_DEP4)})
+    #: (context deployment, generation deployment) pairs this planner knows how
+    #: to move bytes between. The same pair is listed once; the planner serves
+    #: both roles, so a pair is read from the sender's side or the receiver's.
+    COVERS: FrozenSet[Tuple[Deployment, Deployment]] = frozenset({(_DEEPSEEK_DEP4, _DEEPSEEK_DEP4)})
 
     def __init__(
-        self, self_rank_info: RankInfo, self_extractor: KVRegionExtractorV1, *, self_target: str
+        self,
+        self_rank_info: RankInfo,
+        self_extractor: KVRegionExtractorV1,
+        *,
+        self_deployment: Deployment,
     ):
         self._ri = self_rank_info
-        self._target = self_target
+        self._deployment = self_deployment
         self._page_table = self_extractor.page_table
         self._pool = _sole_pool(self._page_table, "this rank")
 
     def describe(self) -> bytes:
-        return self._target.encode()
+        return self._deployment.to_bytes()
 
-    def _pair(self, peer_ri: RankInfo) -> Tuple[str, str]:
-        """The (self, peer) target pair, or a refusal if the matrix lacks it."""
-        peer_target = peer_ri.planner_blob.decode()
-        if (self._target, peer_target) in self.COVERS or (peer_target, self._target) in self.COVERS:
-            return self._target, peer_target
+    def _pair(self, peer_ri: RankInfo) -> Tuple[Deployment, Deployment]:
+        """The (self, peer) deployment pair, or a refusal if the matrix lacks it."""
+        peer = Deployment.from_bytes(peer_ri.planner_blob)
+        if (self._deployment, peer) in self.COVERS or (peer, self._deployment) in self.COVERS:
+            return self._deployment, peer
         raise PeerIncompatibleError(
-            f"no transfer plan for the pair ({self._target!r}, {peer_target!r}); "
-            f"covered pairs: {sorted(self.COVERS)}"
+            f"no transfer plan for the pair ({self._deployment}, {peer}); "
+            f"covered pairs: {[tuple(map(str, pair)) for pair in self.COVERS]}"
         )
 
     # ---- TransferPlanner protocol -------------------------------------------------

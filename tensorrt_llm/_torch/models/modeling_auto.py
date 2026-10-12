@@ -2,7 +2,6 @@
 # SPDX-License-Identifier: Apache-2.0
 from typing import Generic, Optional, Type
 
-from .._experimental.modeling_v2 import target_id_of
 from ..model_config import ModelConfig
 from ..utils import model_extra_attrs
 from .modeling_utils import (DecoderModelForCausalLM, TConfig, TModel,
@@ -78,11 +77,10 @@ class AutoModelForCausalLM(Generic[TModel, TConfig]):
         with model_extra_attrs(extra_attrs):
             model = cls(config)
         model.extra_attrs = extra_attrs
-        # A modeling_v2 target may be served by a planner that covers it (see
-        # modeling_v2.transfers). Resolved here, where the target is known,
-        # so neither the target nor the disaggregation code names the other.
-        if target_id_of(cls) is not None:
-            from .._experimental.modeling_v2.transfers import \
-                bind_transfer_planner
-            bind_transfer_planner(model, cls)
+        # A KV transfer planner may cover this deployment (architecture and
+        # parallel topology; see disaggregation.planners). Resolved here, where
+        # the config is known and before the transceiver asks for the hook, so
+        # neither the model nor the disaggregation code names the other.
+        from ..disaggregation.planners import bind_transfer_planner
+        bind_transfer_planner(model, config)
         return model

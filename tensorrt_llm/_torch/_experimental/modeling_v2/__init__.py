@@ -33,7 +33,6 @@ from ._router_index import (
     NoTarget,
     modeling_v2_resolve,
     step_contract_enabled,
-    target_id_of,
 )
 
 __all__ = [
@@ -43,5 +42,4 @@ __all__ = [
     "NoTarget",
     "modeling_v2_resolve",
     "step_contract_enabled",
-    "target_id_of",
 ]
