@@ -1841,7 +1841,6 @@ class MixedMambaHybridCacheManager(KVCacheManager, MambaCacheManager,
     Does not support block reuse / prefix caching for mamba states.
     """
 
-
     def __init__(
         self,
         # mamba cache parameters
@@ -2939,9 +2938,8 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         self._setup_state_indices()
         # A folded save-last chunk decodes from its terminal slot S2, which is
         # not its primary slot: give S2 the fresh-context reset/seed too.
-        self._reset_context_mamba_slots(
-            len(scheduled_batch.context_requests),
-            extra_slots=self._fold_terminal_slots)
+        self._reset_context_mamba_slots(len(scheduled_batch.context_requests),
+                                        extra_slots=self._fold_terminal_slots)
 
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
         super().prepare_resources(scheduled_batch)
@@ -2968,9 +2966,8 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         if self.local_num_mamba_layers == 0:
             return
         self._setup_state_indices()
-        self._reset_context_mamba_slots(
-            len(scheduled_batch.context_requests),
-            extra_slots=self._fold_terminal_slots)
+        self._reset_context_mamba_slots(len(scheduled_batch.context_requests),
+                                        extra_slots=self._fold_terminal_slots)
 
     @nvtx_range("hybrid_flush_state_transfers")
     def flush_state_transfers(self) -> None:
