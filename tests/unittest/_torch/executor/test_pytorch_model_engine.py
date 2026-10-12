@@ -1048,7 +1048,7 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
             batch, outputs)
 
     def test_ced_final_context_cannot_promote_to_decode_graph(self) -> None:
-        key = KeyType(batch_size=1, draft_len=0, is_first_draft=False)
+        key = KeyType(batch_size=1, draft_len=0)
         engine, runner, resource_manager, metadata, outputs = \
             _make_forward_only_engine(key, private_decoder=True)
         engine.model.model = SimpleNamespace(ced_kv_precompute=True,
@@ -2956,7 +2956,7 @@ class TestDecodeGraphMetadataPreparation(unittest.TestCase):
         return metadata
 
     def test_scope_requires_selected_ordinary_decode_graph(self):
-        key = KeyType(batch_size=1, draft_len=0, is_first_draft=False)
+        key = KeyType(batch_size=1, draft_len=0)
         cases = (
             "ordinary",
             "ordinary_overlap",
@@ -3009,7 +3009,7 @@ class TestDecodeGraphMetadataPreparation(unittest.TestCase):
 
     def test_forward_scopes_proof_to_prepare_for_capture_replay_and_fallback(
             self):
-        key = KeyType(batch_size=1, draft_len=0, is_first_draft=False)
+        key = KeyType(batch_size=1, draft_len=0)
         for mode in ("warmup", "capture", "replay", "fallback",
                      "prepare_error"):
             with self.subTest(mode=mode):
