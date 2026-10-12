@@ -101,15 +101,15 @@ def test_attn_res_epilogue_ceiling(step, ceiling):
         (DecodeStep(8, 8, 1), {}, True),
         (
             DecodeStep(8, 1, 8),
-            {"kda_token_states": True},
+            {"kda_draft_records": True},
             True,
         ),  # a DSpark verify with per-token states
-        (DecodeStep(4, 2, 2), {"kda_token_states": True}, True),
+        (DecodeStep(4, 2, 2), {"kda_draft_records": True}, True),
         (DecodeStep(8, 1, 8), {}, False),  # the built-in KDA verify
         (DecodeStep(5), {}, False),  # a context request, or rows that are not the step's tokens
         (
             DecodeStep(16, 2, 8),
-            {"kda_token_states": True},
+            {"kda_draft_records": True},
             False,
         ),  # wide: the routed experts' all-reduce
         (DecodeStep(1, 1, 1), {"capturing": False}, False),  # an eager step
@@ -129,7 +129,7 @@ def test_latent_push(step, given, pushes):
     flags = dict(
         capturing=True,
         breakable=False,
-        kda_token_states=False,
+        kda_draft_records=False,
         kda_decode_kernels=True,
         mla_decode_branch=True,
     )

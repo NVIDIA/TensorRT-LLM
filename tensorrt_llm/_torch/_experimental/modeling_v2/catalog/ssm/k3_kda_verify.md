@@ -92,7 +92,7 @@ K = V = 128, conv width 4. Kimi K3's TP16 rank slice is H = 6, num_spec = 7. `mu
 record the sampler wrote after the previous round. No buffer persists in the op.
 
 **The pools and the record.** The cache manager's: with the V2 hybrid manager built with the KDA replay caches and
-`kda_token_states` (`kda_replay_num_spec` = num_spec), layer `l`'s `mamba_layer_cache(l).kda_conv_q` / `kda_conv_k`
+`kda_draft_records` (`kda_replay_num_spec` = num_spec), layer `l`'s `mamba_layer_cache(l).kda_conv_q` / `kda_conv_k`
 / `kda_conv_v` (`cs_*`), `get_ssm_states(l)` (`ssm`, its slots strided by the manager's per-slot coalescing) and
 `mamba_layer_cache(l).kda_state_tok`. `pending` is the manager's `prev_num_accepted_tokens`: one record shared by
 every layer, written between steps by the sampler's acceptance. A call on layer `l` writes only layer `l`'s views, at

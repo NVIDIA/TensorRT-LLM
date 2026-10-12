@@ -77,11 +77,11 @@ def test_tp16_moetp16ep1_decodes_without_speculation():
 
 
 def test_tp16_moetp16ep1_keeps_no_per_token_kda_states(monkeypatch):
-    """The text model answers ``kda_token_states`` (False, without speculation), which a captured step's latent-push
+    """The text model answers ``kda_draft_records`` (False, without speculation), which a captured step's latent-push
     decision reads: a pure decode step on the decode kernels pushes, as on ``tp16_moetp4ep4`` without per-token
     states."""
     model = route_b.KimiLinearModel.__new__(route_b.KimiLinearModel)
-    assert model.kda_token_states is False
+    assert model.kda_draft_records is False
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
     monkeypatch.setattr(route_b, "is_in_breakable_cuda_graph", lambda: False)
     kda = types.SimpleNamespace(

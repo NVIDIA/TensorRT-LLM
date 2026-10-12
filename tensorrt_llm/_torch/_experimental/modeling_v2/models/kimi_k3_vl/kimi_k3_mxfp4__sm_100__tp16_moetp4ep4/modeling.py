@@ -1920,7 +1920,7 @@ class KimiLinearModel(DecoderModel):
         )
 
     @property
-    def kda_token_states(self) -> bool:
+    def kda_draft_records(self) -> bool:
         """Whether the hybrid cache manager keeps the last verify's draft records (``kda_state_tok``), from which
         ``ssm/k3_kda_verify`` and ``ssm/k3_kda_attn`` replay the accepted drafts. The engine reads it once the weights
         are loaded, to build the manager: DFlash / DSpark drafts of an even verify width up to 8, every KDA layer
@@ -1946,7 +1946,7 @@ class KimiLinearModel(DecoderModel):
             step,
             capturing=True,
             breakable=is_in_breakable_cuda_graph(),
-            kda_token_states=self.kda_token_states,
+            kda_draft_records=self.kda_draft_records,
             kda_decode_kernels=all(m.takes_k3_kernels and m.k3_buffers is not None for m in kda),
             mla_decode_branch=all(m.will_run_decode_branch(attn_metadata, step) for m in mla[:1]),
         )
@@ -2166,7 +2166,7 @@ class K3DecodeKDA(KimiKDALinearAttention):
 
     * A decode step of one token per request runs the fused input projection and the plain decode in one
       ``ssm/k3_kda_decode_attn`` launch.
-    * With the cache manager's per-token states (``KimiLinearModel.kda_token_states``), every verify of the layer, on
+    * With the cache manager's per-token states (``KimiLinearModel.kda_draft_records``), every verify of the layer, on
       any step, runs the kernels that keep them: ``ssm/k3_kda_attn`` for one request of 8 tokens (the projection fused
       in), else ``ssm/k3_kda_verify`` on the projection's rows (the ``kda_proj`` decode GEMV site where it takes
       them). The built-in verify replays drafts from caches these kernels do not fill, so the two never run on one
@@ -3189,21 +3189,21 @@ def latent_push(
     *,
     capturing: bool,
     breakable: bool,
-    kda_token_states: bool,
+    kda_draft_records: bool,
     kda_decode_kernels: bool,
     mla_decode_branch: bool,
 ) -> bool:
     """Whether a step's MoE layers push their routed partials (``DecodeStep.latent_push``): a pure decode step of at
     most 8 tokens whose attention layers all run the decode kernels, captured into a CUDA graph and not inside a
     breakable one. The KDA layers run them on one token per request with every KDA layer taking the K3 kernels
-    (``kda_decode_kernels``), and on every verify width with the per-token states (``kda_token_states``); the MLA
+    (``kda_decode_kernels``), and on every verify width with the per-token states (``kda_draft_records``); the MLA
     layers where their decode branch takes the step (``mla_decode_branch``, the same for every MLA layer of a step).
     Every other step keeps the routed experts' all-reduce: the exchange's call-order invariant needs every kernel
     between a reduce and the next push to wait for its predecessor, which only those kernels were checked for, and a
     graph launch orders every pushing replay behind whatever ran before it."""
     if not (step.decode and step.small) or not capturing or breakable:
         return False
-    if not (kda_token_states or (step.tokens_per_request == 1 and kda_decode_kernels)):
+    if not (kda_draft_records or (step.tokens_per_request == 1 and kda_decode_kernels)):
         return False
     return mla_decode_branch
 
