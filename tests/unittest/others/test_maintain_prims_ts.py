@@ -39,11 +39,13 @@ _UPSTREAM = "flashinfer-ai/flashinfer"
 pytestmark = pytest.mark.cpu_only
 
 
-def _git(repo: Path, *args: str, text: str | None = None) -> str:
+def _git(
+    repo: Path, *args: str, text: str | None = None, allowed_returncodes: tuple[int, ...] = (0,)
+) -> str:
     result = subprocess.run(
         ["git", "-C", str(repo), *args], input=text, text=True, capture_output=True, timeout=30
     )
-    assert result.returncode == 0, result.stderr
+    assert result.returncode in allowed_returncodes, result.stderr
     return result.stdout.strip()
 
 
@@ -197,7 +199,13 @@ class World(m.GitHub):
             "total_commits": len(commits),
         }
 
-    def routed_git(self, repo: Path, *args: str, text: str | None = None) -> str:
+    def routed_git(
+        self,
+        repo: Path,
+        *args: str,
+        text: str | None = None,
+        allowed_returncodes: tuple[int, ...] = (0,),
+    ) -> str:
         self.git_calls.append(args)
         replacements = {
             "https://github.com/NVIDIA/TensorRT-LLM.git": str(self.consumer),
@@ -208,7 +216,12 @@ class World(m.GitHub):
         }
         if args[:3] == ("remote", "get-url", "fork"):
             return "https://github.com/maintainer/TensorRT-LLM.git"
-        return _git(repo, *[replacements.get(arg, arg) for arg in args], text=text)
+        return _git(
+            repo,
+            *[replacements.get(arg, arg) for arg in args],
+            text=text,
+            allowed_returncodes=allowed_returncodes,
+        )
 
     def api(
         self, endpoint: str, *, method: str = "GET", payload: dict | None = None
@@ -1286,6 +1299,7 @@ def test_bot_recovers_publication_after_cache_loss(
     workdir = world.root / "bot-state"
     b._initialize_workdir(workdir)
     args = argparse.Namespace(
+        migrate_canonical_branch_from=None,
         canonical_repo="maintainer/flashinfer",
         canonical_branch="trtllm-prims-ts-dev",
         fork="maintainer/TensorRT-LLM",
@@ -1301,8 +1315,13 @@ def test_bot_recovers_publication_after_cache_loss(
         world.state = "CLEAN"
     git, api = world.routed_git, world.api
 
-    def crash_git(repo: Path, *arguments: str, text: str | None = None) -> str:
-        result = git(repo, *arguments, text=text)
+    def crash_git(
+        repo: Path,
+        *arguments: str,
+        text: str | None = None,
+        allowed_returncodes: tuple[int, ...] = (0,),
+    ) -> str:
+        result = git(repo, *arguments, text=text, allowed_returncodes=allowed_returncodes)
         boundary = (
             "worktree"
             if arguments[:2] == ("worktree", "add")
@@ -1471,6 +1490,7 @@ def test_recovery_rejects_changed_artifacts_without_writes(world: World, tamper:
 
 def test_bot_cold_recovery_dry_run_and_superseded_history(world: World) -> None:
     args = argparse.Namespace(
+        migrate_canonical_branch_from=None,
         canonical_repo="maintainer/flashinfer",
         canonical_branch="trtllm-prims-ts-dev",
         fork="maintainer/TensorRT-LLM",

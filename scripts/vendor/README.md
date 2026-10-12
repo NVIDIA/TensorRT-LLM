@@ -41,6 +41,9 @@ flowchart TD
     recover -->|pending recorded operation| verify
     recover -->|no record and pin still pending| metadata
     recover -->|completed promotion| merged
+    refresh[Separate upstream refresh PR and normal CI] -->|merged| migrate[Stop bot and verify explicit branch migration]
+    migrate --> rediscover[Reuse workdir and revalidate GitHub state]
+    rediscover --> rebase
 ```
 
 Promotion preserves the source SHA, selected files, compatibility patch, and
@@ -198,6 +201,43 @@ An existing workdir is bound to its operator and vendor configuration; use a
 different directory for another operator/vendor. Authentication is inherited
 from the launching environment and is not persisted in that state.
 
+### Switching canonical branches after a refresh
+
+Keep the same workdir when a periodic source refresh introduces a new canonical
+branch. Stop the publishing process for the cutover, and wait for the consumer
+refresh PR to merge. Relaunch with the same configuration except for:
+
+```bash
+--canonical-branch consumer-dev-YYYYMMDD \
+--migrate-canonical-branch-from consumer-dev \
+--workdir /path/to/private/vendor-bot-state \
+--once
+```
+
+First omit `--publish`: migration only changes local configuration/cache state;
+this pass makes no remote writes. The bot verifies the merged base lock names
+the new canonical repository/branch and its pin is reachable from that branch.
+It refuses outstanding old-branch promotion PRs or unpublished promotion branches.
+Finish those operations, or explicitly close superseded follow-up PRs after
+maintainer review; migration never deletes branches or redirects old promotions.
+Other operator/vendor identity changes still require a separate workdir.
+
+The configuration update and invalidation are one SQLite transaction. Old
+branch-dependent results are archived, while logs, source caches, promotion
+worktrees, tracked candidates, and the historical `--since` cutoff are retained.
+Discovery restarts and rechecks candidates against Git/GitHub. Old successful
+polls are cleared from active health status; `status` reports the canonical
+repository/branch and the verified migration revision. Existing Git promotion
+provenance is never rewritten. Repeating the same migration is a no-op and does
+not discard subsequent discovery progress.
+
+After inspecting the dry-run results, restart with the new branch and
+`--daemon --publish`, omitting `--migrate-canonical-branch-from`. Verify a completed
+poll under the new configuration, then notify outstanding source-update PRs to
+rebase their temporary source branches, update their consumer PRs and pins, and
+regenerate vendor snapshots. If SQLite is lost, launch normally using the new
+canonical configuration and the same cutoff; omit the migration flag.
+
 The default interval is 120 seconds (`--interval`, minimum 30). A cold start
 discovers existing open PRs and backfills merged PRs from all history. This scan
 can be expensive; subsequent polls use a cached cursor and tracked candidates.
@@ -296,10 +336,35 @@ local consumer checkout; no code or hooks from source forks are executed.
 
 ## Feedback and review safety
 
-With `--publish`, invalid metadata produces an updatable comment containing the
-specific error and a copyable marked block. Eligible open PRs also receive one
-metadata-only `REQUEST_CHANGES` review. The bot deduplicates its feedback and
-never submits `APPROVE` just because metadata is valid.
+With `--publish`, recognized author-actionable problems produce an updatable
+comment containing the specific problem, its location, and a **Fix** section.
+Examples are included only when relevant, using the configured vendor and
+upstream repository. Missing metadata gets a complete copyable marked block;
+field errors get focused instructions; attribution failures get a correctly
+nested resolution example. Existing entries for other vendors must be preserved.
+Edit the **PR description**, not a comment, when correcting metadata. The bot
+rechecks automatically on later polls; no manual recheck comment is required.
+
+| Problem | What the bot tells the author to fix |
+|---------|-------------------------------------|
+| Missing markers | Names exactly which of `<!-- vendor-promotion:start -->` and `<!-- vendor-promotion:end -->` is missing, and where to insert it. |
+| Duplicate or reversed markers | Reports marker counts or ordering; asks the author to consolidate metadata into one block without losing vendor entries. |
+| Malformed YAML or schema | Reports YAML line/column or the affected field path and the expected structure, without copying raw parser excerpts. YAML line 1 is the first line inside the fence. |
+| Invalid upstream PR or resolution | Identifies the list entry, duplicated PR, source SHA, missing reason, or unlisted PR, and gives the correction. |
+| Unresolved attribution | Shows candidate PRs and similarity scores where applicable; explains how to correct the PR list/source pin or supply a targeted author assertion. |
+| Source-history or lock-selection problem | Explains the rebase or lock-file change and vendor regeneration needed. Rebase guidance identifies the canonical pin. Metadata edits alone cannot fix these failures. |
+
+`unpaired_reason` is appropriate only when there genuinely is no paired upstream
+PR, not as a workaround for failed matching. The similarity threshold, matching
+rules, and retained provenance are unchanged by diagnostic formatting.
+
+Eligible open PRs receive one metadata-only `REQUEST_CHANGES` review for an
+author-actionable problem. Waiting for a preceding promotion is identified as
+**maintainer action**, with a comment but no new change-request review. Unexpected
+API, authentication, network, and local-cache failures stay in operator logs and
+`status`; they do not post author-fix instructions or request changes. The bot
+deduplicates feedback, including after SQLite loss, and never submits `APPROVE`
+just because metadata is valid.
 
 After correction it dismisses only its own marked metadata reviews, when
 authorized. If dismissal is forbidden, an authorized human must dismiss the

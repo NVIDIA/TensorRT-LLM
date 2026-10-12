@@ -211,6 +211,12 @@ only to verified lock-only promotions, not changes to these tools.
 Git/GitHub promotion commits are authoritative; SQLite is a disposable cache.
 After cache loss, stop the old process and relaunch with the same operator/config.
 Cold discovery backfills merged PRs; `--since` explicitly limits that history.
+After a canonical-branch refresh merges, stop the bot and reuse its workdir with
+the new `--canonical-branch` plus `--migrate-canonical-branch-from OLD_BRANCH`.
+Start with `--once` without `--publish`; migration verifies the merged lock,
+blocks unresolved old promotions, and atomically archives branch-dependent cache
+results before rediscovery. Other identity changes still require another workdir.
+After cache loss, use the new configuration without the migration flag.
 For monitoring, use INFO poll summaries/30-second active-operation heartbeats
 and `bot.py status --workdir ...`. Check the last poll outcome and next deadline;
 the process lock and heartbeat alone do not establish successful reconciliation.

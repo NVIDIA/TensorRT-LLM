@@ -18,9 +18,11 @@ import yaml
 
 if __package__:
     from . import manage, promote
+    from .diagnostics import Diagnostic, field, yaml_problem
 else:
     import manage
     import promote
+    from diagnostics import Diagnostic, field, yaml_problem
 
 BEGIN = "<!-- vendor-promotion:start -->"
 END = "<!-- vendor-promotion:end -->"
@@ -37,46 +39,201 @@ def template(vendor_name: str, upstream_repo: str) -> str:
     )
 
 
+def _vendor_example(vendor_name: str, content: str) -> str:
+    return f"```yaml\nvendors:\n  {vendor_name}:\n{content}\n```"
+
+
+def _resolution_example(vendor_name: str, upstream_repo: str) -> str:
+    return _vendor_example(
+        vendor_name,
+        f"    upstream_prs:\n      - https://github.com/{upstream_repo}/pull/123\n"
+        "    resolutions:\n      FULL_40_CHARACTER_SOURCE_SHA:\n"
+        f"        upstream_pr: https://github.com/{upstream_repo}/pull/123\n"
+        "        reason: Explain the downstream adaptation or why this PR owns the change.",
+    )
+
+
+def _pr_reference(
+    reference: object, upstream_repo: str, path: str, *, require_url: bool = True
+) -> int:
+    if isinstance(reference, str) and (
+        not require_url or reference.startswith(f"https://github.com/{upstream_repo}/pull/")
+    ):
+        try:
+            return promote._pr_number(reference, upstream_repo)
+        except ValueError:
+            pass
+    raise Diagnostic(
+        f"Invalid upstream PR URL at {field(path)}.",
+        f"In the PR description, use a full URL such as "
+        f"`https://github.com/{upstream_repo}/pull/123` with the actual PR number "
+        "and no query string or fragment.",
+    )
+
+
 def parse(body: str, vendor_name: str, upstream_repo: str) -> dict:
     """Read exactly one marked block and validate the selected vendor's inputs."""
     if len(body) > 65536:
-        raise ValueError("PR description exceeds the supported metadata size.")
+        raise Diagnostic(
+            "PR description exceeds the supported metadata size (65,536 characters).",
+            "Shorten the PR description to at most 65,536 characters, keeping the complete "
+            "vendor-promotion block. Move long logs to an attachment or a comment.",
+        )
     body = body.replace("\r\n", "\n").replace("\r", "\n")
-    if body.count(BEGIN) != 1 or body.count(END) != 1:
-        raise ValueError("PR description must contain exactly one vendor-promotion marked block.")
+    counts = {BEGIN: body.count(BEGIN), END: body.count(END)}
+    missing = [marker for marker, count in counts.items() if count == 0]
+    duplicates = [marker for marker, count in counts.items() if count > 1]
+    full_example = f"````markdown\n{template(vendor_name, upstream_repo)}\n````"
+    if missing or duplicates:
+        problems, actions = [], []
+        if missing:
+            problems.append(
+                "Missing vendor-promotion markers in the PR description: "
+                + ", ".join(f"`{marker}`" for marker in missing)
+                + "."
+            )
+            if len(missing) == 2:
+                actions.append(
+                    "Edit this PR's description—not a comment—and insert the complete block "
+                    "below. Replace the example upstream PR URL with your actual PR URL. "
+                    "If there is genuinely no paired upstream PR, replace `upstream_prs` "
+                    "with a nonempty `unpaired_reason` explaining why."
+                )
+            else:
+                position = "before" if missing[0] == BEGIN else "after"
+                actions.append(
+                    f"Edit this PR's description—not a comment—and insert `{missing[0]}` "
+                    f"on its own line {position} the existing fenced YAML block. "
+                    "Keep the existing metadata and the other marker."
+                )
+        if duplicates:
+            problems.append(
+                "Duplicate vendor-promotion markers: "
+                + ", ".join(f"`{marker}` appears {counts[marker]} times" for marker in duplicates)
+                + "."
+            )
+            actions.append(
+                "Consolidate all vendor entries into one `vendors` mapping in one marked "
+                "block in the PR description. Remove extra markers/blocks, preserving the "
+                "other vendors' metadata; keep one start marker and one end marker."
+            )
+        raise Diagnostic(
+            " ".join(problems),
+            " ".join(actions),
+            example=full_example if len(missing) == 2 else "",
+        )
     start, end = body.index(BEGIN) + len(BEGIN), body.index(END)
+    if start >= end:
+        raise Diagnostic(
+            "The vendor-promotion end marker appears before the start marker.",
+            f"Move `{BEGIN}` before the fenced YAML block and `{END}` after it "
+            "in the PR description. Preserve the metadata between them.",
+        )
     block = body[start:end].strip()
-    if start >= end or not block.startswith("```yaml\n") or not block.endswith("\n```"):
-        raise ValueError("The marked block must contain one fenced yaml mapping.")
+    if not block.startswith("```yaml\n") or not block.endswith("\n```"):
+        raise Diagnostic(
+            "The marked block must contain one fenced yaml mapping.",
+            "In the PR description, put the metadata between an opening line of three "
+            "backticks followed by `yaml` and a closing line of three backticks. "
+            "Keep both markers outside that fence, as shown below; retain your real PR URLs.",
+            example=full_example,
+        )
     try:
         content = block[len("```yaml\n") : -len("\n```")]
         if any(
             isinstance(token, (yaml.tokens.AliasToken, yaml.tokens.AnchorToken))
             for token in yaml.scan(content)
         ):
-            raise ValueError("Promotion YAML aliases and anchors are not allowed.")
+            raise Diagnostic(
+                "Promotion YAML aliases and anchors are not allowed.",
+                "In the PR description's metadata block, replace YAML anchors (`&name`) "
+                "and aliases (`*name`) with explicit values.",
+            )
         data = yaml.load(content, Loader=manage._UniqueKeyLoader)
     except yaml.YAMLError as error:
-        raise ValueError(f"Invalid promotion YAML: {error}") from error
-    if not isinstance(data, dict) or set(data) != {"schema_version", "vendors"}:
-        raise ValueError("Promotion YAML requires only schema_version and vendors.")
+        raise Diagnostic(
+            f"Invalid promotion YAML: {yaml_problem(error)}.",
+            "Correct the metadata block in the PR description at the location above "
+            "(line 1 is the first line inside the YAML fence). Use space indentation, "
+            "balanced brackets/quotes, and unique mapping keys.",
+        ) from error
+    if not isinstance(data, dict):
+        raise Diagnostic(
+            "Promotion YAML must be a mapping, not a list or scalar.",
+            "Use top-level `schema_version: 1` and `vendors:` fields in the PR description, "
+            "following this structure. Replace the example URL.",
+            example=full_example,
+        )
+    missing_keys = {"schema_version", "vendors"} - set(data)
+    extra_keys = set(data) - {"schema_version", "vendors"}
+    if missing_keys or extra_keys:
+        raise Diagnostic(
+            "Invalid top-level promotion YAML fields. "
+            + (
+                "Missing: " + ", ".join(field(key) for key in sorted(missing_keys)) + ". "
+                if missing_keys
+                else ""
+            )
+            + (
+                "Unsupported: " + ", ".join(field(key) for key in sorted(extra_keys, key=str)) + "."
+                if extra_keys
+                else ""
+            ),
+            "In the PR description, keep only top-level `schema_version: 1` and `vendors:`; "
+            "put vendor-specific fields under `vendors.<vendor-name>`.",
+        )
     if type(data["schema_version"]) is not int or data["schema_version"] != 1:
-        raise ValueError("Unsupported promotion schema_version; expected 1.")
+        raise Diagnostic(
+            "Unsupported promotion schema_version; expected integer 1.",
+            "Set `schema_version: 1` (without quotes) in the PR description's metadata block.",
+        )
     entries = data["vendors"]
     if not isinstance(entries, dict) or vendor_name not in entries:
-        raise ValueError(f"Promotion YAML must include vendors.{vendor_name}.")
-    if any(
-        not isinstance(name, str) or not manage._NAME_PATTERN.fullmatch(name) for name in entries
-    ):
-        raise ValueError("Invalid vendor key in promotion YAML.")
+        raise Diagnostic(
+            f"Promotion YAML must include vendors.{vendor_name} as a mapping entry.",
+            f"Add `{vendor_name}:` under `vendors:` in the existing PR-description block. "
+            "Preserve any other vendor entries and replace the example URL.",
+            example=_vendor_example(
+                vendor_name,
+                f"    upstream_prs:\n      - https://github.com/{upstream_repo}/pull/123",
+            ),
+        )
+    invalid_names = [
+        name
+        for name in entries
+        if not isinstance(name, str) or not manage._NAME_PATTERN.fullmatch(name)
+    ]
+    if invalid_names:
+        raise Diagnostic(
+            "Invalid vendor keys under `vendors`: "
+            + ", ".join(field(name) for name in invalid_names)
+            + ".",
+            "Use the exact vendor names from `3rdparty/vendor_sources.lock.yaml` as "
+            "string keys under `vendors` in the PR description.",
+        )
     entry = entries[vendor_name]
+    path = f"vendors.{vendor_name}"
     if not isinstance(entry, dict) or set(entry) - {
         "upstream_prs",
         "unpaired_reason",
         "resolutions",
     }:
-        raise ValueError(
-            "Vendor metadata allows upstream_prs, unpaired_reason, and resolutions only."
+        extra = (
+            set(entry) - {"upstream_prs", "unpaired_reason", "resolutions"}
+            if isinstance(entry, dict)
+            else set()
+        )
+        raise Diagnostic(
+            f"Invalid vendor metadata at {field(path)}. "
+            + (
+                "Unsupported fields: "
+                + ", ".join(field(key) for key in sorted(extra, key=str))
+                + "."
+                if extra
+                else "Expected a mapping."
+            ),
+            "Use only `upstream_prs`, `unpaired_reason`, and `resolutions` under this vendor "
+            "in the PR description. Repository/operator settings do not belong here.",
         )
     if "unpaired_reason" in entry:
         if (
@@ -84,7 +241,13 @@ def parse(body: str, vendor_name: str, upstream_repo: str) -> dict:
             or not isinstance(entry["unpaired_reason"], str)
             or not entry["unpaired_reason"].strip()
         ):
-            raise ValueError("unpaired_reason must be nonempty and cannot accompany upstream PRs.")
+            raise Diagnostic(
+                f"Invalid {field(path + '.unpaired_reason')}: it must be nonempty and "
+                "cannot accompany `upstream_prs` or `resolutions`.",
+                "If there genuinely is no paired upstream PR, keep only `unpaired_reason` "
+                "with an explanation under this vendor. Otherwise remove `unpaired_reason` "
+                "and list the actual upstream PRs. Do not use it to bypass failed matching.",
+            )
         return {
             "upstream_prs": [],
             "resolutions": {},
@@ -92,30 +255,84 @@ def parse(body: str, vendor_name: str, upstream_repo: str) -> dict:
         }
     references = entry.get("upstream_prs")
     if not isinstance(references, list) or not references:
-        raise ValueError("upstream_prs must be a nonempty list of upstream PR URLs.")
+        raise Diagnostic(
+            f"{field(path + '.upstream_prs')} must be a nonempty list of upstream PR URLs.",
+            "In the PR description, list every related upstream PR using YAML list items "
+            "(`- URL`); replace the example URL. If there genuinely is no paired PR, use "
+            "only a nonempty `unpaired_reason` instead.",
+            example=_vendor_example(
+                vendor_name,
+                f"    upstream_prs:\n      - https://github.com/{upstream_repo}/pull/123",
+            ),
+        )
     numbers = []
-    for reference in references:
-        if not isinstance(reference, str) or not reference.startswith(
-            f"https://github.com/{upstream_repo}/pull/"
-        ):
-            raise ValueError(f"Each upstream PR must be a URL in {upstream_repo}.")
-        numbers.append(promote._pr_number(reference, upstream_repo))
-    if len(set(numbers)) != len(numbers):
-        raise ValueError("upstream_prs contains duplicate PRs.")
+    for index, reference in enumerate(references):
+        number = _pr_reference(reference, upstream_repo, f"{path}.upstream_prs[{index}]")
+        if number in numbers:
+            raise Diagnostic(
+                f"{field(path + '.upstream_prs')} contains duplicate upstream PR #{number}.",
+                f"Remove the repeated `https://github.com/{upstream_repo}/pull/{number}` "
+                "entry from the PR description; keep each upstream PR once.",
+            )
+        numbers.append(number)
     resolutions = entry.get("resolutions", {})
     if not isinstance(resolutions, dict):
-        raise ValueError("resolutions must be a mapping keyed by full source commit SHA.")
+        raise Diagnostic(
+            f"{field(path + '.resolutions')} must be a mapping keyed by full source commit SHA.",
+            "Replace it with the structure below inside the existing vendor entry. Use a "
+            "full 40-character source SHA, a listed upstream PR, and a specific explanation.",
+            example=_resolution_example(vendor_name, upstream_repo),
+        )
     normalized = {}
     for sha, resolution in resolutions.items():
-        promote._sha(sha)
+        resolution_path = f"{path}.resolutions.{sha}"
+        try:
+            promote._sha(sha)
+        except ValueError as error:
+            raise Diagnostic(
+                f"Invalid source commit key at {field(resolution_path)}.",
+                "Use the full lowercase 40-character SHA from the bot's unresolved-commit "
+                "list, not a short SHA, branch name, or upstream commit SHA.",
+            ) from error
         if not isinstance(resolution, dict) or set(resolution) != {"upstream_pr", "reason"}:
-            raise ValueError("Each resolution requires upstream_pr and reason.")
+            details = "Expected a mapping."
+            if isinstance(resolution, dict):
+                absent = {"upstream_pr", "reason"} - set(resolution)
+                unknown = set(resolution) - {"upstream_pr", "reason"}
+                details = (
+                    "Missing: " + ", ".join(field(key) for key in sorted(absent)) + ". "
+                    if absent
+                    else ""
+                ) + (
+                    "Unsupported: "
+                    + ", ".join(field(key) for key in sorted(unknown, key=str))
+                    + "."
+                    if unknown
+                    else ""
+                )
+            raise Diagnostic(
+                f"{field(resolution_path)} requires exactly `upstream_pr` and `reason`. {details}",
+                "Add the missing fields or remove extra fields in this resolution, "
+                "following the structure below. Preserve other vendor metadata.",
+                example=_resolution_example(vendor_name, upstream_repo),
+            )
         reference, reason = resolution["upstream_pr"], resolution["reason"]
-        if not isinstance(reference, str):
-            raise ValueError("Resolution upstream_pr must be a PR URL.")
-        number = promote._pr_number(reference, upstream_repo)
-        if number not in numbers or not isinstance(reason, str) or not reason.strip():
-            raise ValueError("Resolution must name a listed PR and explain the unmatched patch.")
+        number = _pr_reference(
+            reference, upstream_repo, f"{resolution_path}.upstream_pr", require_url=False
+        )
+        if number not in numbers:
+            raise Diagnostic(
+                f"{field(resolution_path)} names upstream PR #{number}, which is not listed.",
+                f"Add `https://github.com/{upstream_repo}/pull/{number}` to "
+                f"`{path}.upstream_prs` if it owns this change, or correct the resolution "
+                "to reference a listed PR.",
+            )
+        if not isinstance(reason, str) or not reason.strip():
+            raise Diagnostic(
+                f"{field(resolution_path + '.reason')} must be a nonempty string.",
+                "Explain the downstream adaptation or why this upstream PR owns the "
+                "unmatched change. Author assertions are retained until separately verified.",
+            )
         normalized[sha] = {"upstream_pr": number, "reason": reason.strip()}
     return {"upstream_prs": sorted(numbers), "resolutions": normalized, "unpaired_reason": None}
 
@@ -242,6 +459,7 @@ def match(
     source: str = ".",
     include: tuple[str, ...] = ("**/*",),
     upstream_repo: str | None = None,
+    vendor_name: str = "VENDOR_NAME",
 ) -> tuple[dict[str, int | None], dict[str, dict]]:
     """Match a linear source range against fetched immutable upstream PR snapshots.
 
@@ -251,20 +469,41 @@ def match(
     """
     commits = _commits(repo, previous, reviewed)
     if not commits:
-        raise ValueError("Source update has no new commits to attribute.")
+        raise Diagnostic(
+            "Source update has no new commits to attribute.",
+            "Check the source SHA in `3rdparty/vendor_sources.lock.yaml`. Pin the intended "
+            "new source commit, or remove the unnecessary source update from this PR.",
+        )
     source_parents = {}
     for sha in commits:
         parents = promote._git(repo, "show", "-s", "--format=%P", sha).split()
         if len(parents) != 1:
-            raise ValueError("Source history must be linear; rebase merge commits first.")
+            raise Diagnostic(
+                f"Source history must be linear; commit `{sha}` has {len(parents)} parents.",
+                f"Rebase the temporary source branch onto canonical pin `{previous}` without "
+                "merge commits. Then use `scripts/vendor/manage.py` to update the lock and "
+                "vendored snapshot to the new source SHA, and push the consumer PR.",
+            )
         source_parents[sha] = parents[0]
     resolutions = resolutions or {}
     if set(resolutions) - set(commits):
-        raise ValueError("Resolutions include commits outside the reviewed source delta.")
+        raise Diagnostic(
+            "Resolutions include commits outside the reviewed source delta: "
+            + ", ".join(field(sha) for sha in sorted(set(resolutions) - set(commits)))
+            + ".",
+            f"Remove those stale entries from `vendors.{vendor_name}.resolutions` in the PR "
+            "description. After rebasing, use the new source SHAs reported by the bot.",
+        )
     candidates: dict[str, set[int]] = {sha: set() for sha in commits}
     patches = {sha: _patch(repo, f"{sha}^", sha, source=source, include=include) for sha in commits}
     if any(not patches[sha] for sha in resolutions):
-        raise ValueError("Remove resolutions for commits with no lock-selected file changes.")
+        raise Diagnostic(
+            "Remove resolutions for commits with no lock-selected file changes: "
+            + ", ".join(f"`{sha}`" for sha in resolutions if not patches[sha])
+            + ".",
+            f"Delete only these entries from `vendors.{vendor_name}.resolutions`. "
+            "Excluded-only changes do not need upstream attribution.",
+        )
     series = _patch(repo, previous, reviewed, source=source, include=include)
     methods: dict[tuple[str, int], str] = {}
     comparisons: dict[int, list[tuple[str, str, str, str]]] = {}
@@ -338,7 +577,11 @@ def match(
             resolution = resolutions[sha]
             number = resolution["upstream_pr"]
             if number not in upstream_prs:
-                raise ValueError("Resolution names an unlisted upstream PR.")
+                raise Diagnostic(
+                    f"Resolution for `{sha}` names unlisted upstream PR #{number}.",
+                    f"Add that PR to `vendors.{vendor_name}.upstream_prs` if it owns this "
+                    "change, or correct the resolution to reference a listed PR.",
+                )
             assignments[sha] = number
             evidence[sha] = {
                 "method": "author-assertion",
@@ -364,7 +607,10 @@ def match(
                 evidence[sha]["method"] = methods[sha, number]
         else:
             options = (
-                ", ".join(f"#{number}" for number in sorted(candidates[sha])) or "no exact match"
+                ", ".join(
+                    _upstream_reference(number, upstream_repo) for number in sorted(candidates[sha])
+                )
+                or "no exact match"
             )
             detail = f"- `{sha}`: {options}"
             if sha in similarities:
@@ -386,17 +632,28 @@ def match(
             unresolved.append(detail)
     accepted = similarity_feedback(evidence, upstream_repo)
     if unresolved:
-        raise ValueError(
-            "Author action required: upstream attribution is unresolved. Add missing upstream PRs, "
-            "update/rebase the source pin, or add a targeted resolution with an upstream_pr and "
-            "reason for each commit below. No complete commit_map is required.\n"
+        raise Diagnostic(
+            "Upstream attribution is unresolved for these source commits:\n\n"
             + "\n".join(unresolved)
-            + ("\n\n" + accepted if accepted else "")
+            + ("\n\n" + accepted if accepted else ""),
+            f"In the PR description, add missing PRs to `vendors.{vendor_name}.upstream_prs`, "
+            "remove incorrectly listed PRs, or correct/rebase the source pin and update the "
+            "vendored snapshot. For an intentional adaptation or ambiguous ownership, merge "
+            "a targeted `resolutions` entry into the existing vendor metadata as shown below. "
+            "Replace the SHA and URL and give a specific reason; preserve other entries. "
+            "No complete commit_map is required. A resolution records an author assertion, "
+            "not verified equivalence; it is retained during refresh until separately verified.",
+            example=_resolution_example(vendor_name, upstream_repo or "OWNER/REPO"),
         )
     if set(assignments.values()) - {None} != set(upstream_prs):
-        raise ValueError(
-            "Some listed upstream PRs cover no new lock-selected changes; remove unrelated PRs."
-            + ("\n\n" + accepted if accepted else "")
+        unused = set(upstream_prs) - set(assignments.values())
+        raise Diagnostic(
+            "Some listed upstream PRs cover no new lock-selected changes: "
+            + ", ".join(_upstream_reference(number, upstream_repo) for number in sorted(unused))
+            + "."
+            + ("\n\n" + accepted if accepted else ""),
+            f"Remove these unrelated PRs from `vendors.{vendor_name}.upstream_prs` in the "
+            "PR description. PRs covering only excluded tests/docs do not need to be listed.",
         )
     return assignments, evidence
 
@@ -410,35 +667,58 @@ def resolve(
 ) -> tuple[dict[str, int | None], dict[str, dict]]:
     """Fetch only Git data into a private bare cache and resolve declared PRs."""
     if previous.source != reviewed.source or set(previous.include) != set(reviewed.include):
-        raise ValueError(
-            "Automatic attribution requires unchanged lock source/include selection; "
-            "separate the selection change from the source update."
+        changed = (["source"] if previous.source != reviewed.source else []) + (
+            ["include"] if set(previous.include) != set(reviewed.include) else []
+        )
+        raise Diagnostic(
+            "Automatic attribution requires unchanged lock source/include selection. "
+            "Changed fields: " + ", ".join(f"`{name}`" for name in changed) + ".",
+            "Separate the selection change into a different PR. In this source-update PR, "
+            "restore the canonical `source`/`include` selection in "
+            "`3rdparty/vendor_sources.lock.yaml` and regenerate the vendor snapshot.",
         )
     cache.mkdir(parents=True, exist_ok=True)
     if not (cache / "HEAD").exists():
         promote._git(cache, "init", "--bare", "--quiet")
     if promote._git(cache, "rev-parse", "--is-bare-repository") != "true":
         raise ValueError("Matching cache must be a dedicated bare repository.")
-    promote._check_source_repo(gh, promote._repo_name(reviewed.url))
+    source_repo = promote._repo_name(reviewed.url)
+    try:
+        promote._check_source_repo(gh, source_repo)
+    except Diagnostic as error:
+        raise Diagnostic(
+            f"The source repository {field(source_repo)} is not a fork of {field(gh.upstream_repo)}.",
+            "Push the temporary source branch to a fork of the configured upstream and "
+            "update the lock URL, branch, SHA, and vendored snapshot with "
+            "`scripts/vendor/manage.py`.",
+        ) from error
     for sha in (previous.commit, reviewed.commit):
         promote._git(cache, "fetch", "--quiet", "--no-tags", reviewed.url, sha)
-    try:
-        common = promote._git(cache, "merge-base", previous.commit, reviewed.commit)
-    except RuntimeError as error:
-        raise ValueError(
-            "Source revisions have no merge base; rebase the temporary source branch onto the canonical pin."
-        ) from error
+    # An empty successful query means unrelated histories; Git failures remain
+    # operator errors rather than being relabeled as author mistakes.
+    common = promote._git(
+        cache, "merge-base", previous.commit, reviewed.commit, allowed_returncodes=(0, 1)
+    )
+    rebase_action = (
+        f"Rebase the temporary source branch {field(reviewed.branch)} onto canonical "
+        f"repository {field(previous.url)}, branch {field(previous.branch)}, SHA "
+        f"`{previous.commit}`. Then use `scripts/vendor/manage.py` to update "
+        "`3rdparty/vendor_sources.lock.yaml` and the vendored snapshot to the rebased SHA, "
+        "and push the source branch and consumer PR. Editing metadata alone will not fix this."
+    )
+    if not common:
+        raise Diagnostic("Source revisions have no merge base.", rebase_action)
     if common != previous.commit:
-        raise ValueError(
-            "Source update is not a fast-forward; rebase the temporary source branch onto the canonical pin."
-        )
+        raise Diagnostic("Source update is not a fast-forward.", rebase_action)
     if entry["unpaired_reason"]:
         commits = _commits(cache, previous.commit, reviewed.commit)
         if not commits or any(
             len(promote._git(cache, "show", "-s", "--format=%P", sha).split()) != 1
             for sha in commits
         ):
-            raise ValueError("Unpaired source updates still require a nonempty linear history.")
+            raise Diagnostic(
+                "Unpaired source updates still require a nonempty linear history.", rebase_action
+            )
         return {}, {}
     prs = {}
     for number in entry["upstream_prs"]:
@@ -446,8 +726,18 @@ def resolve(
         if pr["base"]["ref"] != gh.upstream_branch or (
             pr["state"] == "closed" and not pr.get("merged")
         ):
-            raise ValueError(
-                f"Upstream PR #{number} must target {gh.upstream_branch} and be open or merged."
+            raise Diagnostic(
+                f"{_upstream_reference(number, gh.upstream_repo)} must target "
+                f"`{gh.upstream_branch}` and be open or merged; currently targets "
+                f"{field(pr['base']['ref'])} and is "
+                + (
+                    "closed without merging."
+                    if pr["state"] == "closed" and not pr.get("merged")
+                    else f"{field(pr['state'])}."
+                ),
+                "Correct the upstream PR target or reopen the upstream PR if appropriate; "
+                "otherwise replace its URL in the consumer PR description with the correct "
+                "open/merged upstream PR. Do not remove attribution for changes still included.",
             )
         for sha in (pr["base"]["sha"], pr["head"]["sha"]):
             promote._git(
@@ -468,4 +758,5 @@ def resolve(
         source=reviewed.source,
         include=reviewed.include,
         upstream_repo=gh.upstream_repo,
+        vendor_name=gh.vendor_name,
     )

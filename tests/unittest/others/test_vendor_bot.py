@@ -42,6 +42,10 @@ def _body(content: str) -> str:
     return f"{m.BEGIN}\n```yaml\nschema_version: 1\nvendors:\n  toy:\n{content}\n```\n{m.END}"
 
 
+def _issue(message: str = "Missing marked block") -> m.Diagnostic:
+    return m.Diagnostic(message, "Edit the PR description to supply the missing metadata.")
+
+
 @pytest.mark.parametrize("line_ending", ["\n", "\r\n", "\r"], ids=["lf", "crlf", "cr"])
 def test_metadata_only_needs_upstream_urls(line_ending: str) -> None:
     entry = m.parse(
@@ -87,8 +91,10 @@ def test_metadata_size_limit_precedes_line_ending_normalization() -> None:
     ],
 )
 def test_invalid_metadata_rejected(content: str) -> None:
-    with pytest.raises(ValueError):
+    with pytest.raises(m.Diagnostic) as failure:
         m.parse(_body(content), "toy", "org/library")
+    assert failure.value.action
+    assert "**Fix:**" in str(failure.value)
 
 
 @pytest.mark.parametrize(
@@ -109,6 +115,183 @@ def test_author_resolution_requires_explanation() -> None:
     assert entry["resolutions"]["a" * 40] == {"upstream_pr": 42, "reason": "adapted ABI"}
     with pytest.raises(ValueError):
         m.parse(_body(content.replace("adapted ABI", "''")), "toy", "org/library")
+
+
+@pytest.mark.parametrize("line_ending", ["\n", "\r\n", "\r"])
+@pytest.mark.parametrize(
+    "start_count,end_count", [(0, 0), (0, 1), (1, 0), (2, 1), (1, 2), (2, 2), (2, 0)]
+)
+def test_marker_diagnostics_name_missing_and_duplicate_markers(
+    start_count: int, end_count: int, line_ending: str
+) -> None:
+    body = line_ending.join([m.BEGIN] * start_count + [m.END] * end_count)
+    with pytest.raises(m.Diagnostic) as failure:
+        m.parse(body, "toy", "org/library")
+    issue = failure.value
+    for marker, count in ((m.BEGIN, start_count), (m.END, end_count)):
+        if count == 0:
+            assert f"`{marker}`" in issue.problem and "Missing" in issue.problem
+        elif count > 1:
+            assert f"`{marker}` appears {count} times" in issue.problem
+        else:
+            assert f"`{marker}`" not in issue.problem
+    assert "PR" in issue.action
+    if start_count == end_count == 0:
+        example = issue.example.removeprefix("````markdown\n").removesuffix("\n````")
+        assert m.parse(example, "toy", "org/library")["upstream_prs"] == [123]
+        assert "not a comment" in issue.action.replace("—", " ")
+    elif 0 in (start_count, end_count):
+        assert "before" in issue.action if start_count == 0 else "after" in issue.action
+    if max(start_count, end_count) > 1:
+        assert "preserving" in issue.action and "Consolidate" in issue.action
+
+
+def test_reversed_markers_and_bad_fence_have_different_fixes() -> None:
+    with pytest.raises(m.Diagnostic) as reversed_markers:
+        m.parse(m.END + m.BEGIN, "toy", "org/library")
+    assert "end marker appears before" in reversed_markers.value.problem
+    assert f"`{m.BEGIN}` before" in reversed_markers.value.action
+    with pytest.raises(m.Diagnostic) as bad_fence:
+        m.parse(m.BEGIN + "\nschema_version: 1\n" + m.END, "toy", "org/library")
+    assert "fenced yaml" in bad_fence.value.problem
+    assert "three backticks" in bad_fence.value.action
+    assert m.BEGIN in bad_fence.value.example
+
+
+@pytest.mark.parametrize(
+    "content,problem,fix",
+    [
+        ("    upstream_prs: []", "vendors.toy.upstream_prs", "list every related upstream PR"),
+        (
+            "    upstream_prs: [https://github.com/wrong/repo/pull/42]",
+            "upstream_prs[0]",
+            "org/library/pull/123",
+        ),
+        ("    upstream_prs: [42]", "upstream_prs[0]", "full URL"),
+        (
+            "    upstream_prs: [https://github.com/org/library/pull/42#discussion]",
+            "upstream_prs[0]",
+            "no query string or fragment",
+        ),
+        (
+            "    upstream_prs: [https://github.com/org/library/pull/42, https://github.com/org/library/pull/42]",
+            "duplicate upstream PR #42",
+            "Remove the repeated",
+        ),
+        ("    canonical_repo: wrong", "canonical_repo", "Repository/operator settings"),
+        ("    unpaired_reason: ''", "vendors.toy.unpaired_reason", "Do not use it to bypass"),
+        ("    unpaired_reason: downstream\n    resolutions: {}", "cannot accompany", "keep only"),
+        (
+            "    upstream_prs: [https://github.com/org/library/pull/42]\n    resolutions: []",
+            "vendors.toy.resolutions",
+            "full 40-character",
+        ),
+        (
+            "    upstream_prs: &prs [https://github.com/org/library/pull/42]",
+            "aliases and anchors",
+            "explicit values",
+        ),
+    ],
+)
+def test_metadata_diagnostics_identify_field_and_fix(content: str, problem: str, fix: str) -> None:
+    with pytest.raises(m.Diagnostic) as failure:
+        m.parse(_body(content), "toy", "org/library")
+    assert problem in failure.value.problem
+    assert fix in failure.value.action
+
+
+@pytest.mark.parametrize(
+    "content,problem",
+    [
+        ("schema_version: '1'\nvendors: {}", "schema_version"),
+        ("schema_version: 1", "vendors"),
+        ("schema_version: 1\nvendors: {}\nextra: false", "extra"),
+        ("schema_version: 1\nvendors: {}", "vendors.toy"),
+        ("[]", "mapping, not a list"),
+    ],
+)
+def test_metadata_structure_has_targeted_guidance(content: str, problem: str) -> None:
+    with pytest.raises(m.Diagnostic) as failure:
+        m.parse(f"{m.BEGIN}\n```yaml\n{content}\n```\n{m.END}", "toy", "org/library")
+    assert problem in failure.value.problem
+    assert "PR description" in failure.value.action or "PR-description" in failure.value.action
+
+
+@pytest.mark.parametrize(
+    "content,problem",
+    [
+        ("    upstream_prs: [secret-unclosed", "YAML line"),
+        ("    private-key: secret\n    private-key: secret", "duplicate mapping key"),
+        ("    <<: {private-key: secret}", "merge keys are not allowed"),
+    ],
+)
+def test_yaml_errors_show_location_without_echoing_values(content: str, problem: str) -> None:
+    with pytest.raises(m.Diagnostic) as failure:
+        m.parse(_body(content), "toy", "org/library")
+    assert problem in failure.value.problem
+    assert "YAML line" in failure.value.problem and "column" in failure.value.problem
+    assert "secret" not in str(failure.value)
+    assert "line 1 is the first line inside the YAML fence" in failure.value.action
+
+
+@pytest.mark.parametrize(
+    "sha,resolution,problem,fix",
+    [
+        (
+            "abc123",
+            "upstream_pr: https://github.com/org/library/pull/42\n        reason: adapted",
+            "Invalid source commit key",
+            "40-character",
+        ),
+        (
+            "a" * 40,
+            "upstream_pr: https://github.com/org/library/pull/42",
+            "exactly",
+            "missing fields",
+        ),
+        (
+            "a" * 40,
+            "upstream_pr: https://github.com/org/library/pull/43\n        reason: adapted",
+            "not listed",
+            "upstream_prs",
+        ),
+        (
+            "a" * 40,
+            "upstream_pr: https://github.com/org/library/pull/42\n        reason: ''",
+            ".reason",
+            "Explain the downstream adaptation",
+        ),
+    ],
+)
+def test_resolution_errors_identify_commit_and_fix(
+    sha: str, resolution: str, problem: str, fix: str
+) -> None:
+    content = (
+        "    upstream_prs: [https://github.com/org/library/pull/42]\n"
+        f"    resolutions:\n      {sha}:\n        {resolution}"
+    )
+    with pytest.raises(m.Diagnostic) as failure:
+        m.parse(_body(content), "toy", "org/library")
+    assert sha in failure.value.problem and problem in failure.value.problem
+    assert fix in failure.value.action
+
+
+def test_resolution_example_is_nested_under_real_vendor_and_parseable() -> None:
+    example = m._resolution_example("toy", "org/library")
+    yaml_text = example.removeprefix("```yaml\n").removesuffix("\n```")
+    body = (f"{m.BEGIN}\n```yaml\nschema_version: 1\n{yaml_text}\n```\n{m.END}").replace(
+        "FULL_40_CHARACTER_SOURCE_SHA", "a" * 40
+    )
+    entry = m.parse(body, "toy", "org/library")
+    assert entry["resolutions"]["a" * 40]["upstream_pr"] == 123
+
+
+def test_untrusted_field_names_cannot_inject_markdown() -> None:
+    body = _body("    '<img src=x>': value")
+    with pytest.raises(m.Diagnostic) as failure:
+        m.parse(body, "toy", "org/library")
+    assert "<img" not in str(failure.value)
+    assert "&lt;img" in str(failure.value)
 
 
 def test_unpaired_and_template() -> None:
@@ -341,7 +524,7 @@ def test_matching_preserves_whitespace(source: Path, different: str) -> None:
     downstream = _commit(source, "VALUE = 1\n")
     _git(source, "checkout", "-q", "-b", "upstream", base)
     upstream = _commit(source, different)
-    with pytest.raises(ValueError, match="Author action required"):
+    with pytest.raises(ValueError, match="Upstream attribution is unresolved"):
         m.match(source, base, downstream, {42: _pr(base, upstream)})
 
 
@@ -372,7 +555,7 @@ def test_hunk_labels_are_not_part_of_edit_identity(source: Path) -> None:
     assignments, evidence = m.match(source, base, downstream, {42: _pr(base, upstream)})
     assert assignments == {downstream: 42}
     assert evidence[downstream]["method"] == "same-edits"
-    with pytest.raises(ValueError, match="#41, #42"):
+    with pytest.raises(ValueError, match="#41.*#42"):
         m.match(source, base, downstream, {41: _pr(base, downstream), 42: _pr(base, upstream)})
 
 
@@ -405,7 +588,7 @@ def test_matching_squashed_series_and_ambiguous_duplicates(source: Path) -> None
     assignments, evidence = m.match(source, base, second, {42: _pr(base, squash)})
     assert assignments == {first: 42, second: 42}
     assert evidence[first]["method"] == "source-series-aggregate"
-    with pytest.raises(ValueError, match="#42, #43"):
+    with pytest.raises(ValueError, match="#42.*#43"):
         m.match(source, base, second, {42: _pr(base, squash), 43: _pr(base, squash)})
 
 
@@ -480,7 +663,7 @@ def test_multiple_similar_prs_remain_ambiguous(source: Path) -> None:
     downstream = _commit(source, "".join(lines))
     _git(source, "checkout", "-q", "-b", "upstream", base)
     upstream = _commit(source, "".join(lines[:-1]) + "adapted\n")
-    with pytest.raises(ValueError, match="#41, #42") as failure:
+    with pytest.raises(ValueError, match="#41.*#42") as failure:
         m.match(source, base, downstream, {41: _pr(base, upstream), 42: _pr(base, upstream)})
     assert "#41: 95.00%" in str(failure.value)
     assert "#42: 95.00%" in str(failure.value)
@@ -603,6 +786,7 @@ def monitor(tmp_path: Path):
     args = argparse.Namespace(
         canonical_repo="operator/library",
         canonical_branch="dev",
+        migrate_canonical_branch_from=None,
         fork="operator/consumer",
         repo=tmp_path,
         workdir=tmp_path,
@@ -617,13 +801,236 @@ def monitor(tmp_path: Path):
     b._STOP.clear()
 
 
+@pytest.fixture
+def migration(monitor: b.Monitor, monkeypatch: pytest.MonkeyPatch):
+    args = copy.copy(monitor.args)
+    args.canonical_branch = "dev-new"
+    args.migrate_canonical_branch_from = "dev"
+    pin = _vendor("b" * 40, "https://github.com/operator/library.git", "dev-new")
+    monkeypatch.setattr(p, "_main_sha", lambda gh: "c" * 40)
+    monkeypatch.setattr(p, "_lock_at", lambda *args: pin)
+    original_get = monitor.gh.get
+    monkeypatch.setattr(
+        monitor.gh,
+        "get",
+        lambda endpoint: {"object": {"sha": "b" * 40}}
+        if "/git/ref/" in endpoint
+        else original_get(endpoint),
+    )
+    monkeypatch.setattr(monitor.gh, "compare", lambda *args: {"status": "identical"}, raising=False)
+    monkeypatch.setattr(b, "_pages", lambda *args: iter([]))
+    monkeypatch.setattr(p, "_git", lambda *args: "")
+    return args, pin
+
+
+def test_branch_migration_preserves_workdir_and_reconciles_again(
+    monitor: b.Monitor,
+    migration,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO, logger="vendor-bot")
+    args, _ = migration
+    store = monitor.store
+    for key, value in {
+        "complete:7": "old-pr",
+        "promotion:8": 88,
+        "observation:7": {"state": "completed"},
+        "problem:8": "old problem",
+        "bootstrapped": True,
+        "cursor": "old cursor",
+        "last_poll": "old",
+        "health": {"last_successful_poll": "old", "last_completed_poll": "old"},
+        "tracked": [7, 8],
+        "candidate:7": {"head": "a" * 40, "relevant": True},
+    }.items():
+        store.put(key, value)
+    before_since = store.get("since")
+    (args.workdir / "bot.log").write_text("previous log\n")
+    restarted = b.Monitor(args, monitor.gh, store)
+    assert store.get("settings")["canonical_branch"] == "dev-new"
+    assert store.get("complete:7") is None
+    assert store.get("promotion:8") is None
+    assert store.get("problem:8") is None
+    assert store.get("cursor") is None and store.get("bootstrapped") is None
+    assert store.get("tracked") == [7, 8]
+    assert store.get("candidate:7")["relevant"]
+    assert store.get("since") == before_since
+    assert store.get("branch_migrations")[0]["previous_results"]["complete:7"] == "old-pr"
+    assert store.get("migration")["consumer_revision"] == "c" * 40
+    assert restarted.progress.state["last_successful_poll"] is None
+    assert restarted.progress.state["last_completed_poll"] is None
+    assert (args.workdir / "bot.log").read_text() == "previous log\n"
+    assert not monitor.gh.writes
+    assert "dev -> dev-new; rediscovery required" in caplog.text
+    status = b._status(args.workdir)
+    assert status["canonical_branch"] == "dev-new"
+    assert status["migration"]["from"] == "dev"
+
+
+def test_branch_migration_retry_does_not_reset_new_progress(monitor: b.Monitor, migration) -> None:
+    args, _ = migration
+    b.Monitor(args, monitor.gh, monitor.store)
+    monitor.store.put("cursor", "new progress")
+    b.Monitor(args, monitor.gh, monitor.store)
+    assert monitor.store.get("cursor") == "new progress"
+    assert len(monitor.store.get("branch_migrations")) == 1
+    args.migrate_canonical_branch_from = None
+    b.Monitor(args, monitor.gh, monitor.store)
+    assert monitor.store.get("cursor") == "new progress"
+
+
+@pytest.mark.parametrize("old", [None, "wrong"])
+def test_branch_migration_requires_explicit_old_branch(monitor: b.Monitor, migration, old) -> None:
+    args, _ = migration
+    args.migrate_canonical_branch_from = old
+    with pytest.raises(ValueError, match="--migrate-canonical-branch-from dev"):
+        b.Monitor(args, monitor.gh, monitor.store)
+    assert monitor.store.get("settings")["canonical_branch"] == "dev"
+
+
+@pytest.mark.parametrize("key", ["canonical_repo", "fork", "repo"])
+def test_branch_migration_cannot_change_identity(monitor: b.Monitor, migration, key: str) -> None:
+    args, _ = migration
+    setattr(args, key, "other/value")
+    with pytest.raises(ValueError, match="different operator/vendor"):
+        b.Monitor(args, monitor.gh, monitor.store)
+    assert monitor.store.get("settings")["canonical_branch"] == "dev"
+
+
+@pytest.mark.parametrize(
+    "branch,url",
+    [
+        ("dev", "https://github.com/operator/library.git"),
+        ("dev-new", "https://github.com/other/library.git"),
+    ],
+)
+def test_branch_migration_requires_merged_refresh(
+    monitor: b.Monitor,
+    migration,
+    monkeypatch: pytest.MonkeyPatch,
+    branch: str,
+    url: str,
+) -> None:
+    args, _ = migration
+    monkeypatch.setattr(p, "_lock_at", lambda *args: _vendor("b" * 40, url, branch))
+    with pytest.raises(ValueError, match="merged base-branch lock"):
+        b.Monitor(args, monitor.gh, monitor.store)
+    assert monitor.store.get("settings")["canonical_branch"] == "dev"
+
+
+@pytest.mark.parametrize("status", ["behind", "diverged"])
+def test_branch_migration_rejects_unreachable_pin(
+    monitor: b.Monitor,
+    migration,
+    monkeypatch: pytest.MonkeyPatch,
+    status: str,
+) -> None:
+    args, _ = migration
+    monkeypatch.setattr(monitor.gh, "compare", lambda *args: {"status": status})
+    with pytest.raises(ValueError, match="does not contain"):
+        b.Monitor(args, monitor.gh, monitor.store)
+
+
+def test_branch_migration_rejects_lock_race(
+    monitor: b.Monitor,
+    migration,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    args, pin = migration
+    locks = iter([pin, dataclasses.replace(pin, commit="d" * 40)])
+    monkeypatch.setattr(p, "_lock_at", lambda *args: next(locks))
+    with pytest.raises(ValueError, match="changed during migration"):
+        b.Monitor(args, monitor.gh, monitor.store)
+    assert monitor.store.get("settings")["canonical_branch"] == "dev"
+
+
+@pytest.mark.parametrize("state", ["open", "absent", "closed"])
+@pytest.mark.parametrize("origin", ["remote", "local", "pr"])
+def test_branch_migration_checks_pending_promotions(
+    monitor: b.Monitor,
+    migration,
+    monkeypatch: pytest.MonkeyPatch,
+    state: str,
+    origin: str,
+) -> None:
+    args, _ = migration
+    branch = "chore/toy-promote-7-aaaaaaaaaaaa"
+    pr = {
+        "head": {"ref": branch, "sha": "a" * 40},
+        "base": {"ref": "main"},
+        "state": state,
+        "html_url": "https://github.com/org/consumer/pull/88",
+    }
+
+    def pages(gh, endpoint):
+        if endpoint.endswith("/branches"):
+            return iter(
+                [{"name": branch, "commit": {"sha": "a" * 40}}] if origin == "remote" else []
+            )
+        if "state=open" in endpoint:
+            return iter([pr] if origin == "pr" else [])
+        return iter([pr] if state != "absent" else [])
+
+    monkeypatch.setattr(b, "_pages", pages)
+    monkeypatch.setattr(
+        p, "_git", lambda *args: f"{branch} {'a' * 40}" if origin == "local" else ""
+    )
+    monkeypatch.setattr(
+        monitor.gh, "optional", lambda endpoint: {"commit": {"message": "record"}}, raising=False
+    )
+    monkeypatch.setattr(
+        p, "_record_from_message", lambda message: {"vendor": "toy", "canonical_branch": "dev"}
+    )
+    if state == "closed":
+        b.Monitor(args, monitor.gh, monitor.store)
+    else:
+        with pytest.raises(ValueError, match="Unresolved old-branch promotion"):
+            b.Monitor(args, monitor.gh, monitor.store)
+        assert monitor.store.get("settings")["canonical_branch"] == "dev"
+    assert not monitor.gh.writes
+
+
+def test_branch_migration_sqlite_transaction_rolls_back(monitor: b.Monitor, migration) -> None:
+    import sqlite3
+
+    args, _ = migration
+    monitor.store.put("cursor", "preserved")
+    monitor.store.put("complete:7", "preserved")
+    monitor.store.connection.execute(
+        "CREATE TRIGGER fail_migration BEFORE INSERT ON state WHEN NEW.key = 'migration' "
+        "BEGIN SELECT RAISE(ABORT, 'injected failure'); END"
+    )
+    with pytest.raises(sqlite3.IntegrityError, match="injected failure"):
+        b.Monitor(args, monitor.gh, monitor.store)
+    assert monitor.store.get("settings")["canonical_branch"] == "dev"
+    assert monitor.store.get("cursor") == "preserved"
+    assert monitor.store.get("complete:7") == "preserved"
+    assert monitor.store.get("branch_migrations") is None
+    monitor.store.connection.execute("DROP TRIGGER fail_migration")
+    b.Monitor(args, monitor.gh, monitor.store)
+
+
+def test_branch_migration_cache_loss_uses_normal_start(
+    monitor: b.Monitor, migration, tmp_path: Path
+) -> None:
+    args, _ = migration
+    with contextlib.closing(b.Store(tmp_path / "fresh.sqlite")) as store:
+        with pytest.raises(ValueError, match="fresh/cache-loss start"):
+            b.Monitor(args, monitor.gh, store)
+        args.migrate_canonical_branch_from = None
+        b.Monitor(args, monitor.gh, store)
+        assert store.get("settings")["canonical_branch"] == "dev-new"
+        assert store.get("bootstrapped") is None
+
+
 def test_feedback_requests_changes_once_and_clears_only_metadata_review(monitor: b.Monitor) -> None:
     gh = monitor.gh
-    monitor._feedback(gh.pr, "Missing marked block")
-    monitor._feedback(gh.pr, "Missing marked block")
+    monitor._feedback(gh.pr, _issue())
+    monitor._feedback(gh.pr, _issue())
     assert len(gh.comments) == len(gh.reviews) == 1
     assert "PR description" in gh.comments[0]["body"]
-    assert "resolutions:" in gh.comments[0]["body"]
+    assert "resolutions:" not in gh.comments[0]["body"]
+    assert "**Fix:**" in gh.comments[0]["body"]
     assert gh.writes[1][2]["event"] == "REQUEST_CHANGES"
     monitor._feedback(gh.pr, None)
     assert gh.reviews[0]["state"] == "DISMISSED"
@@ -639,7 +1046,7 @@ def test_bot_does_not_override_operator_manual_review(monitor: b.Monitor) -> Non
             "state": "CHANGES_REQUESTED",
         }
     )
-    monitor._feedback(monitor.gh.pr, "Missing metadata")
+    monitor._feedback(monitor.gh.pr, _issue("Missing metadata"))
     monitor._feedback(monitor.gh.pr, None)
     assert monitor.gh.reviews[0]["state"] == "CHANGES_REQUESTED"
     assert len(monitor.gh.reviews) == 1
@@ -647,11 +1054,11 @@ def test_bot_does_not_override_operator_manual_review(monitor: b.Monitor) -> Non
 
 def test_dry_run_and_self_review(monitor: b.Monitor) -> None:
     monitor.args.publish = False
-    monitor._feedback(monitor.gh.pr, "Missing metadata")
+    monitor._feedback(monitor.gh.pr, _issue("Missing metadata"))
     assert not monitor.gh.writes
     monitor.args.publish = True
     monitor.gh.pr["user"]["login"] = "operator"
-    monitor._feedback(monitor.gh.pr, "Missing metadata")
+    monitor._feedback(monitor.gh.pr, _issue("Missing metadata"))
     assert monitor.gh.comments
     assert not monitor.gh.reviews
 
@@ -659,8 +1066,204 @@ def test_dry_run_and_self_review(monitor: b.Monitor) -> None:
 def test_feedback_rechecks_mutable_description(monitor: b.Monitor) -> None:
     stale = copy.deepcopy(monitor.gh.pr)
     monitor.gh.pr["body"] = "updated while checking"
-    monitor._feedback(stale, "Missing metadata")
+    monitor._feedback(stale, _issue("Missing metadata"))
     assert not monitor.gh.writes
+
+
+@pytest.mark.parametrize("missing", [(m.BEGIN, m.END), (m.BEGIN,), (m.END,)])
+def test_posted_marker_feedback_is_specific_and_recovers_without_cache(
+    monitor: b.Monitor, monkeypatch: pytest.MonkeyPatch, missing: tuple[str, ...]
+) -> None:
+    previous = _vendor("a" * 40, "https://github.com/operator/library.git", "dev")
+    reviewed = _vendor("b" * 40, "https://github.com/author/library.git", "temporary")
+    monkeypatch.setattr(monitor, "_inputs", lambda pr: (previous, reviewed))
+    valid = m.template("toy", "org/library")
+    monitor.gh.pr["body"] = valid
+    for marker in missing:
+        monitor.gh.pr["body"] = monitor.gh.pr["body"].replace(marker, "")
+    monitor.inspect(7)
+    body = monitor.gh.comments[0]["body"]
+    for marker in missing:
+        assert f"`{marker}`" in body
+    assert "**Fix:**" in body and "PR's description—not a comment" in body
+    assert "resolutions:" not in body and "exactly one" not in body
+    assert monitor.gh.reviews[0]["state"] == "CHANGES_REQUESTED"
+    writes = copy.deepcopy(monitor.gh.writes)
+    with contextlib.closing(b.Store(":memory:")) as store:
+        restarted = b.Monitor(monitor.args, monitor.gh, store)
+        monkeypatch.setattr(restarted, "_inputs", lambda pr: (previous, reviewed))
+        restarted.inspect(7)
+        assert monitor.gh.writes == writes
+        monitor.gh.pr["body"] = valid
+        monkeypatch.setattr(m, "resolve", lambda *args: ({reviewed.commit: 123}, {}))
+        restarted.inspect(7)
+    assert len(monitor.gh.comments) == 1
+    assert monitor.gh.reviews[0]["state"] == "DISMISSED"
+    assert not any(payload.get("event") == "APPROVE" for _, _, payload in monitor.gh.writes)
+
+
+@pytest.mark.parametrize("stage", ["inputs", "resolve"])
+@pytest.mark.parametrize("error_type", [ValueError, RuntimeError, b.manage.VendorError])
+def test_unrecognized_failures_are_operator_errors_not_author_feedback(
+    monitor: b.Monitor, monkeypatch: pytest.MonkeyPatch, stage: str, error_type: type[Exception]
+) -> None:
+    previous = _vendor("a" * 40, "https://github.com/operator/library.git", "dev")
+    reviewed = _vendor("b" * 40, "https://github.com/author/library.git", "temporary")
+    monitor.gh.pr["body"] = m.template("toy", "org/library")
+    monkeypatch.setattr(monitor, "_inputs", lambda pr: (previous, reviewed))
+
+    def fail(*args):
+        raise error_type("Operator failure; do not request author changes")
+
+    if stage == "inputs":
+        monkeypatch.setattr(monitor, "_inputs", fail)
+    else:
+        monkeypatch.setattr(m, "resolve", fail)
+    monitor.poll()
+    assert not monitor.gh.writes
+    health = monitor.store.get("health")
+    assert health["counts"]["errors"] == 1
+    assert "Operator failure" in health["last_error"]["message"]
+
+
+def test_waiting_for_prior_promotion_is_maintainer_action_without_review(
+    monitor: b.Monitor, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    previous = _vendor("a" * 40, "https://github.com/previous/library.git", "prior-update")
+    reviewed = _vendor("b" * 40, "https://github.com/author/library.git", "temporary")
+    monkeypatch.setattr(p, "_main_sha", lambda gh: "c" * 40)
+    monkeypatch.setattr(
+        p,
+        "_lock_document_at",
+        lambda gh, repo, sha: {
+            "vendors": {"toy": (previous if sha == "c" * 40 else reviewed).to_mapping()}
+        },
+    )
+    monitor.inspect(7)
+    body = monitor.gh.comments[0]["body"]
+    assert "needs maintainer action" in body and "Waiting for the preceding" in body
+    assert "operator/library" in body and "dev" in body
+    assert "After it merges" in body and "No metadata edit" in body
+    assert "```yaml" not in body and "resolutions:" not in body
+    assert not monitor.gh.reviews
+    writes = copy.deepcopy(monitor.gh.writes)
+    monitor.inspect(7)
+    assert monitor.gh.writes == writes
+
+
+def test_invalid_pr_lock_has_file_fix_not_metadata_template(
+    monitor: b.Monitor, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    previous = _vendor("a" * 40, "https://github.com/operator/library.git", "dev")
+    invalid = previous.to_mapping() | {"commit": "short-sha"}
+    monkeypatch.setattr(p, "_main_sha", lambda gh: "c" * 40)
+    monkeypatch.setattr(
+        p,
+        "_lock_document_at",
+        lambda gh, repo, sha: {
+            "vendors": {"toy": previous.to_mapping() if sha == "c" * 40 else invalid}
+        },
+    )
+    monitor.inspect(7)
+    body = monitor.gh.comments[0]["body"]
+    assert "vendors.toy" in body and "40-hex SHA" in body
+    assert p._LOCK in body and "Editing the PR description will not fix" in body
+    assert "```yaml" not in body
+    assert monitor.gh.reviews[0]["state"] == "CHANGES_REQUESTED"
+
+
+@pytest.mark.parametrize("history", ["diverged", "unrelated", "merge"])
+def test_source_history_diagnostic_has_canonical_pin_and_regeneration_steps(
+    source: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, history: str
+) -> None:
+    base = _commit(source, "base\n", "src/code.py")
+    canonical = _commit(source, "canonical\n", "canonical.py")
+    _git(source, "checkout", "-q", "-b", "temporary", base)
+    if history == "unrelated":
+        _git(source, "checkout", "-q", "--orphan", "unrelated")
+    reviewed_sha = _commit(source, "change\n", "src/code.py")
+    if history == "merge":
+        _git(source, "merge", "--no-ff", "-m", "merge canonical", canonical)
+        reviewed_sha = _git(source, "rev-parse", "HEAD")
+    previous = _vendor(canonical, "https://github.com/operator/library.git", "dev")
+    reviewed = _vendor(reviewed_sha, "https://github.com/author/library.git", "temporary")
+    original_git = p._git
+
+    def local_git(repo, *args, **kwargs):
+        if args and args[0] == "fetch":
+            args = tuple(str(source) if arg == reviewed.url else arg for arg in args)
+        return original_git(repo, *args, **kwargs)
+
+    monkeypatch.setattr(p, "_git", local_git)
+    monkeypatch.setattr(p, "_check_source_repo", lambda *args: None)
+    with pytest.raises(m.Diagnostic) as failure:
+        m.resolve(
+            FakeGitHub(),
+            previous,
+            reviewed,
+            {"unpaired_reason": "downstream-only", "upstream_prs": [], "resolutions": {}},
+            tmp_path / "cache.git",
+        )
+    issue = failure.value
+    assert {
+        "diverged": "not a fast-forward",
+        "unrelated": "no merge base",
+        "merge": "linear history",
+    }[history] in issue.problem
+    assert (
+        canonical in issue.action and "operator/library" in issue.action and "dev" in issue.action
+    )
+    assert "temporary" in issue.action and "scripts/vendor/manage.py" in issue.action
+    assert "vendored snapshot" in issue.action and "push" in issue.action
+    assert not issue.example
+
+
+@pytest.mark.parametrize("status", ["closed", "wrong-target"])
+def test_upstream_pr_diagnostic_links_affected_pr_and_fix(
+    source: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, status: str
+) -> None:
+    base = _commit(source, "base\n", "src/code.py")
+    head = _commit(source, "changed\n", "src/code.py")
+    previous = _vendor(base, "https://github.com/operator/library.git", "dev")
+    reviewed = _vendor(head, "https://github.com/author/library.git", "temporary")
+    gh = FakeGitHub()
+    pr = _pr(base, head)
+    if status == "closed":
+        pr["state"] = "closed"
+    else:
+        pr["base"]["ref"] = "release"
+    monkeypatch.setattr(gh, "get", lambda endpoint: pr)
+    monkeypatch.setattr(p, "_check_source_repo", lambda *args: None)
+    original_git = p._git
+
+    def local_git(repo, *args, **kwargs):
+        if args and args[0] == "fetch":
+            args = tuple(str(source) if arg == reviewed.url else arg for arg in args)
+        return original_git(repo, *args, **kwargs)
+
+    monkeypatch.setattr(p, "_git", local_git)
+    with pytest.raises(m.Diagnostic) as failure:
+        m.resolve(
+            gh,
+            previous,
+            reviewed,
+            {"unpaired_reason": None, "upstream_prs": [42], "resolutions": {}},
+            tmp_path / "cache.git",
+        )
+    assert "https://github.com/org/library/pull/42" in failure.value.problem
+    assert (
+        "closed without merging" in failure.value.problem
+        if status == "closed"
+        else "release" in failure.value.problem
+    )
+    assert "reopen" in failure.value.action and "replace its URL" in failure.value.action
+    assert not failure.value.example
+
+
+def test_git_expected_absence_does_not_hide_unexpected_failures(source: Path) -> None:
+    base = _commit(source, "base\n")
+    with pytest.raises(RuntimeError, match="git failed"):
+        p._git(source, "merge-base", base, "f" * 40, allowed_returncodes=(0, 1))
 
 
 def test_discovery_and_persistent_operator_scope(monitor: b.Monitor) -> None:
@@ -751,11 +1354,11 @@ def test_monitor_posts_similarity_and_deduplicates_feedback(
 
 
 def test_feedback_deduplicates_with_empty_sqlite(monitor: b.Monitor) -> None:
-    monitor._feedback(monitor.gh.pr, "Missing block")
+    monitor._feedback(monitor.gh.pr, _issue("Missing block"))
     writes = copy.deepcopy(monitor.gh.writes)
     with contextlib.closing(b.Store(":memory:")) as store:
         restarted = b.Monitor(monitor.args, monitor.gh, store)
-        restarted._feedback(monitor.gh.pr, "Missing block")
+        restarted._feedback(monitor.gh.pr, _issue("Missing block"))
         assert monitor.gh.writes == writes
         restarted._feedback(monitor.gh.pr, None)
     assert len(monitor.gh.comments) == len(monitor.gh.reviews) == 1
@@ -855,7 +1458,7 @@ def test_monitor_reports_attribution_to_author_and_retries_after_correction(
     monitor.gh.pr["body"] = _body("    upstream_prs: [https://github.com/org/library/pull/42]")
 
     def unresolved(*args):
-        raise ValueError("Author action required: no exact match for " + reviewed.commit)
+        raise _issue("Author action required: no exact match for " + reviewed.commit)
 
     monkeypatch.setattr(m, "resolve", unresolved)
     monitor.inspect(7)
@@ -871,7 +1474,7 @@ def test_forbidden_dismissal_informs_author_without_approving(
     monitor: b.Monitor,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monitor._feedback(monitor.gh.pr, "Missing block")
+    monitor._feedback(monitor.gh.pr, _issue("Missing block"))
     original = monitor.gh.api
 
     def forbidden(endpoint, **kwargs):
@@ -1062,8 +1665,8 @@ def test_metadata_transitions_are_logged_once_and_clear_problem(
 ) -> None:
     caplog.set_level(logging.INFO, logger="vendor-bot")
     monitor.args.publish = publish
-    monitor._feedback(monitor.gh.pr, "Missing marked block")
-    monitor._feedback(monitor.gh.pr, "Missing marked block")
+    monitor._feedback(monitor.gh.pr, _issue())
+    monitor._feedback(monitor.gh.pr, _issue())
     assert caplog.text.count("PR #7: blocked: Missing marked block") == 1
     assert monitor.store.get("problem:7") == "Missing marked block"
     monitor._feedback(monitor.gh.pr, None)

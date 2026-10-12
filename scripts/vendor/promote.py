@@ -29,8 +29,10 @@ import yaml
 
 if __package__:
     from . import manage as vendor
+    from .diagnostics import Diagnostic, field, yaml_problem
 else:
     import manage as vendor
+    from diagnostics import Diagnostic, field, yaml_problem
 
 _LOCK = "3rdparty/vendor_sources.lock.yaml"
 _BEGIN = "----- BEGIN VENDOR PROMOTION V1 -----"
@@ -48,6 +50,7 @@ def _run(
     stream: bool = False,
     strip: bool = True,
     binary_output: bool = False,
+    allowed_returncodes: tuple[int, ...] = (0,),
 ) -> str:
     # Do not use manage._run_git here: its synthetic identity is for
     # patch generation. Real promotion commits must use the maintainer's identity.
@@ -68,7 +71,7 @@ def _run(
         capture_output=not stream,
         timeout=timeout,
     )
-    if result.returncode:
+    if result.returncode not in allowed_returncodes:
         detail = (result.stderr or result.stdout or "See streamed output above.").strip()
         raise RuntimeError(f"{command[0]} failed: {detail}")
     output = result.stdout or ""
@@ -77,12 +80,15 @@ def _run(
     return output.strip() if strip else output
 
 
-def _git(repo: Path, *args: str, text: str | None = None) -> str:
+def _git(
+    repo: Path, *args: str, text: str | None = None, allowed_returncodes: tuple[int, ...] = (0,)
+) -> str:
     return _run(
         ["git", "-C", str(repo), *args],
         text=text,
         timeout=1800 if args[:2] == ("worktree", "add") else 300,
         stream=args[:2] == ("worktree", "add") or args[0] in ("fetch", "commit", "push"),
+        allowed_returncodes=allowed_returncodes,
     )
 
 
@@ -175,10 +181,17 @@ def _lock_document_at(gh: GitHub, repo: str, commit: str) -> dict:
             isinstance(token, (yaml.tokens.AliasToken, yaml.tokens.AnchorToken))
             for token in yaml.scan(content)
         ):
-            raise ValueError("Vendor lock YAML aliases and anchors are not allowed.")
+            raise Diagnostic(
+                "Vendor lock YAML aliases and anchors are not allowed.",
+                f"Replace anchors and aliases with explicit values in `{_LOCK}` and push the PR.",
+            )
         data = yaml.load(content, Loader=vendor._UniqueKeyLoader)
     except yaml.YAMLError as error:
-        raise ValueError(f"Invalid vendor lock YAML: {error}") from error
+        raise Diagnostic(
+            f"Invalid vendor lock YAML: {yaml_problem(error)}.",
+            f"Correct the YAML at that location in `{_LOCK}`, keeping keys unique and "
+            "using spaces for indentation; then push the PR.",
+        ) from error
     if (
         not isinstance(data, dict)
         or set(data) != {"schema_version", "vendors"}
@@ -186,7 +199,11 @@ def _lock_document_at(gh: GitHub, repo: str, commit: str) -> dict:
         or data["schema_version"] != 1
         or not isinstance(data["vendors"], dict)
     ):
-        raise ValueError("Unsupported vendor lock schema.")
+        raise Diagnostic(
+            "Unsupported vendor lock schema.",
+            f"In `{_LOCK}`, use only top-level `schema_version: 1` and a `vendors` mapping. "
+            "Preserve other vendors' entries and push the corrected file.",
+        )
     return data
 
 
@@ -205,7 +222,10 @@ def _check_fork(gh: GitHub, repo: str, upstream: str) -> None:
         repo.lower() == upstream.lower()
         or info.get("source", {}).get("full_name", "").lower() != upstream.lower()
     ):
-        raise ValueError(f"{repo} must be a personal fork of {upstream}, not upstream itself.")
+        raise Diagnostic(
+            f"{field(repo)} must be a personal fork of {field(upstream)}, not upstream itself.",
+            "Use a personal fork of the configured upstream repository for publication.",
+        )
 
 
 def _check_source_repo(gh: GitHub, repo: str) -> None:

@@ -24,10 +24,12 @@ from pathlib import Path
 
 if __package__:
     from . import manage, metadata, promote
+    from .diagnostics import Diagnostic, field
 else:
     import manage
     import metadata
     import promote
+    from diagnostics import Diagnostic, field
 
 _LOG = logging.getLogger("vendor-bot")
 _STATE_FILE = "state.sqlite"
@@ -74,6 +76,32 @@ class Store:
     def close(self) -> None:
         """Close SQLite before releasing the process lock."""
         self.connection.close()
+
+    def migrate_branch(self, settings: dict, record: dict) -> None:
+        """Atomically archive derived results and start reconciliation for a new branch."""
+        keys = ("cursor", "bootstrapped", "health", "last_poll")
+        prefixes = ("complete:", "promotion:", "observation:", "problem:")
+        rows = self.connection.execute("SELECT key, value FROM state").fetchall()
+        archived = {
+            key: json.loads(value) for key, value in rows if key in keys or key.startswith(prefixes)
+        }
+        history = self.get("branch_migrations", [])
+        history.append({**record, "previous_results": archived})
+        with self.connection:
+            self.connection.executemany(
+                "DELETE FROM state WHERE key = ?", [(key,) for key in archived]
+            )
+            self.connection.executemany(
+                "INSERT INTO state VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                [
+                    (key, json.dumps(value, sort_keys=True))
+                    for key, value in (
+                        ("settings", settings),
+                        ("branch_migrations", history),
+                        ("migration", record),
+                    )
+                ],
+            )
 
 
 class Progress:
@@ -192,16 +220,146 @@ class Monitor:
             "repo": str(args.repo),
         }
         saved = store.get("settings")
+        migration_from = args.migrate_canonical_branch_from
         if saved is not None and saved != settings:
-            raise ValueError(
-                "Workdir belongs to a different operator/vendor configuration; choose another."
+            changed = {
+                key for key in saved.keys() | settings.keys() if saved.get(key) != settings.get(key)
+            }
+            if changed != {"canonical_branch"}:
+                raise ValueError(
+                    "Workdir belongs to a different operator/vendor configuration; choose another."
+                )
+            if migration_from != saved["canonical_branch"]:
+                raise ValueError(
+                    "Canonical branch changed; stop the old process and restart with "
+                    f"--migrate-canonical-branch-from {saved['canonical_branch']} after the refresh merges."
+                )
+            record = self._verify_branch_migration(migration_from)
+            store.migrate_branch(settings, record)
+            self.progress.update(
+                last_completed_poll=None,
+                last_successful_poll=None,
+                last_poll_summary=None,
+                last_error=None,
+                next_poll_at=None,
             )
+            _LOG.info(
+                "Canonical branch migrated: %s -> %s; rediscovery required",
+                migration_from,
+                args.canonical_branch,
+            )
+        elif migration_from:
+            record = store.get("migration", {})
+            if (
+                saved == settings
+                and record.get("from") == migration_from
+                and record.get("to") == args.canonical_branch
+            ):
+                _LOG.info(
+                    "Canonical branch migration already applied: %s -> %s",
+                    migration_from,
+                    args.canonical_branch,
+                )
+            else:
+                raise ValueError(
+                    "No matching saved branch migration. For a fresh/cache-loss start, omit "
+                    "--migrate-canonical-branch-from and use the current canonical configuration."
+                )
         store.put("settings", settings)
         if store.get("since") is None:
             store.put(
                 "since",
                 args.since or "1970-01-01T00:00:00Z",
             )
+
+    def _verify_branch_migration(self, previous_branch: str) -> dict:
+        """Read authoritative remote state before changing the local configuration."""
+        self.progress.operation("verifying_branch_migration")
+        revision = promote._main_sha(self.gh)
+        current = promote._lock_at(self.gh, self.gh.consumer_repo, revision)
+        if (
+            promote._repo_name(current.url).lower() != self.args.canonical_repo.lower()
+            or current.branch != self.args.canonical_branch
+        ):
+            raise ValueError(
+                "Branch migration requires the merged base-branch lock to point to the new "
+                "canonical repository/branch. Finish the refresh before restarting."
+            )
+        ref = self.gh.get(
+            f"repos/{self.args.canonical_repo}/git/ref/heads/{self.args.canonical_branch}"
+        )
+        tip = promote._sha(ref["object"]["sha"])
+        if self.gh.compare(self.args.canonical_repo, current.commit, tip)["status"] not in (
+            "identical",
+            "ahead",
+        ):
+            raise ValueError(
+                "New canonical branch does not contain the merged lock's pinned commit."
+            )
+        self._check_pending_promotions(previous_branch)
+        latest = promote._lock_at(self.gh, self.gh.consumer_repo, promote._main_sha(self.gh))
+        if latest.to_mapping() != current.to_mapping():
+            raise ValueError("Base vendor lock changed during migration; inspect it and retry.")
+        return {
+            "from": previous_branch,
+            "to": self.args.canonical_branch,
+            "at": _now(),
+            "consumer_revision": revision,
+            "canonical_tip": tip,
+            "pin": current.commit,
+        }
+
+    def _check_pending_promotions(self, previous_branch: str) -> None:
+        """Do not strand open follow-ups or unpublished promotion branches."""
+        prefix = f"chore/{self.gh.vendor_name}-promote-"
+        branches = {
+            item["name"]: item["commit"]["sha"]
+            for item in _pages(self.gh, f"repos/{self.args.fork}/branches")
+            if item["name"].startswith(prefix)
+        }
+        local = promote._git(
+            self.args.repo,
+            "for-each-ref",
+            "--format=%(refname:short) %(objectname)",
+            f"refs/heads/{prefix}*",
+        )
+        for line in local.splitlines():
+            branch, sha = line.split()
+            if branch not in branches:
+                branches[branch] = sha
+        # Open follow-ups can survive deletion of their publishing branch.
+        for pr in _pages(self.gh, f"{self.prefix}/pulls?state=open"):
+            branch = pr["head"]["ref"]
+            if pr["base"]["ref"] == self.gh.base_branch and branch.startswith(prefix):
+                branches[branch] = pr["head"]["sha"]
+        for branch, sha in branches.items():
+            remote = self.gh.optional(f"{self.prefix}/commits/{sha}")
+            if remote is None:
+                remote = self.gh.optional(f"repos/{self.args.fork}/commits/{sha}")
+            message = (
+                remote["commit"]["message"]
+                if remote
+                else promote._git(self.args.repo, "log", "-1", "--format=%B", sha)
+            )
+            record = promote._record_from_message(message)
+            if record.get("canonical_branch") != previous_branch:
+                continue
+            if record.get("vendor") != self.gh.vendor_name:
+                raise ValueError(f"Unexpected vendor provenance on promotion branch {branch}.")
+            prs = list(
+                _pages(
+                    self.gh,
+                    f"{self.prefix}/pulls?state=all&head={self.args.fork.split('/')[0]}:{branch}"
+                    f"&base={self.gh.base_branch}",
+                )
+            )
+            if len(prs) != 1 or prs[0]["state"] != "closed":
+                location = prs[0]["html_url"] if len(prs) == 1 else branch
+                raise ValueError(
+                    f"Unresolved old-branch promotion: {location}. Finish it, or explicitly "
+                    "close its superseded PR before migrating. Unpublished branches need "
+                    "maintainer inspection; migration never deletes or redirects them."
+                )
 
     def _discover(self) -> list[int]:
         # Advance only after a complete scan, with overlap for edits arriving
@@ -266,19 +424,12 @@ class Monitor:
         self.store.put(f"problem:{number}", observation["reason"] if state == "blocked" else None)
 
     def _feedback(
-        self, pr: dict, problem: str | None, *, attribution: dict[str, dict] | None = None
+        self, pr: dict, problem: Diagnostic | None, *, attribution: dict[str, dict] | None = None
     ) -> None:
         number = pr["number"]
         message = (
-            f"@{pr['user']['login']} — vendor promotion needs author action:\n\n{problem}\n\n"
-            "Add or correct this block in the **PR description** (replace the example PR URL):\n\n"
-            f"````markdown\n{metadata.template(self.gh.vendor_name, self.gh.upstream_repo)}\n````\n\n"
-            "List every upstream PR; a full commit_map is not required. For an unresolved commit, "
-            "add a missing PR, update the source pin, or add under this vendor:\n\n"
-            "```yaml\nresolutions:\n  FULL_SOURCE_SHA:\n    upstream_pr: https://github.com/OWNER/REPO/pull/123\n"
-            "    reason: Explain the adaptation or why this PR owns the change.\n```\n\n"
-            "If there is no paired upstream PR, use only `unpaired_reason: ...` for this vendor. "
-            "Author assertions are retained during future refresh until separately verified."
+            f"@{pr['user']['login']} — vendor promotion needs {problem.owner} action:\n\n{problem}"
+            "\n\nThe bot will recheck automatically on a later poll."
             if problem
             else "Vendor promotion metadata and source attribution are valid. "
             "This is **not** a code-review approval. Promotion still requires the source PR to merge."
@@ -296,7 +447,7 @@ class Monitor:
             self._transition(
                 number,
                 "blocked" if problem else "metadata_valid",
-                problem or "dry run; no feedback published",
+                str(problem) if problem else "dry run; no feedback published",
             )
             return
         # Check immutable head and description immediately before feedback. A
@@ -334,7 +485,7 @@ class Monitor:
             self._transition(
                 number,
                 "blocked" if problem else "metadata_valid",
-                problem or "feedback reconciled; not a code-review approval",
+                str(problem) if problem else "feedback reconciled; not a code-review approval",
             )
             return
         reviews = [
@@ -353,7 +504,7 @@ class Monitor:
             if not item.get("body", "").startswith(self.marker)
             and item["state"] in ("APPROVED", "CHANGES_REQUESTED")
         ]
-        if problem and not automated and not manual:
+        if problem and problem.owner == "author" and not automated and not manual:
             self.gh.api(
                 f"{self.prefix}/pulls/{number}/reviews",
                 method="POST",
@@ -361,8 +512,8 @@ class Monitor:
                     "event": "REQUEST_CHANGES",
                     "commit_id": pr["head"]["sha"],
                     "body": (
-                        f"{self.marker}\n{problem}\n\nSee the vendor-bot comment for the required "
-                        "description format and author resolution instructions."
+                        f"{self.marker}\n{problem.problem}\n\nSee the vendor-bot comment for "
+                        "the specific fix and the latest validation result."
                     ),
                 },
             )
@@ -408,7 +559,7 @@ class Monitor:
         self._transition(
             number,
             "blocked" if problem else "metadata_valid",
-            problem or "feedback reconciled; not a code-review approval",
+            str(problem) if problem else "feedback reconciled; not a code-review approval",
         )
 
     def _inputs(self, pr: dict) -> tuple[manage.Vendor, manage.Vendor] | None:
@@ -421,13 +572,25 @@ class Monitor:
             base = commit["parents"][0]["sha"]
         else:
             base, revision = promote._main_sha(self.gh), pr["head"]["sha"]
-        before = promote._lock_document_at(self.gh, self.gh.consumer_repo, base)["vendors"]
+        try:
+            before = promote._lock_document_at(self.gh, self.gh.consumer_repo, base)["vendors"]
+        except Diagnostic as error:
+            raise RuntimeError(f"Canonical/base vendor lock is invalid: {error}") from error
         after = promote._lock_document_at(self.gh, self.gh.consumer_repo, revision)["vendors"]
         name = self.gh.vendor_name
         if name not in before or name not in after:
             return None  # Vendor creation/removal is not promotion.
         previous = manage._validate_vendor(name, before[name])
-        reviewed = manage._validate_vendor(name, after[name])
+        try:
+            reviewed = manage._validate_vendor(name, after[name])
+            promote._repo_name(reviewed.url)
+        except (manage.VendorError, ValueError) as error:
+            raise Diagnostic(
+                f"Invalid lock entry at `vendors.{name}`: {field(_summary(error))}.",
+                f"Correct that entry in `{promote._LOCK}` with `scripts/vendor/manage.py`, "
+                "regenerate the vendored snapshot if its source changed, and push the PR. "
+                "Editing the PR description will not fix a lock-file error.",
+            ) from error
         if previous.commit == reviewed.commit or not reviewed.branch:
             return None  # Includes lock-only promotions and tag-only updates.
         canonical = (
@@ -443,8 +606,16 @@ class Monitor:
         if not canonical:
             if pr.get("merged"):
                 return None  # Historical update belonging to another canonical branch.
-            raise ValueError(
-                "Finish the preceding vendor promotion, then rebase this source-update PR onto the canonical pin."
+            raise Diagnostic(
+                "Waiting for the preceding vendor promotion: the base lock still points "
+                f"to repository {field(previous.url)}, branch {field(previous.branch)}.",
+                f"A maintainer must finish the preceding lock-only promotion back to "
+                f"{field(self.args.canonical_repo)} / {field(self.args.canonical_branch)}. "
+                "After it merges, the author should rebase this consumer PR onto the latest "
+                "base branch and rebase its temporary source branch onto the new canonical "
+                "pin, then update the lock/vendor snapshot. No metadata edit can unblock "
+                "the preceding promotion.",
+                owner="maintainer",
             )
         return previous, reviewed
 
@@ -509,8 +680,8 @@ class Monitor:
                 return
             previous, reviewed = inputs
             self.progress.count("relevant")
-        except (ValueError, manage.VendorError) as error:
-            self._feedback(pr, str(error))
+        except Diagnostic as error:
+            self._feedback(pr, error)
             return
         arguments = self._arguments(number, reviewed)
         if pr.get("merged"):
@@ -532,8 +703,8 @@ class Monitor:
             # Until provenance is committed, decisions follow current remote
             # inputs, not whichever upstream heads a previous process cached.
             _, evidence = metadata.resolve(self.gh, previous, reviewed, entry, cache)
-        except (ValueError, manage.VendorError) as error:
-            self._feedback(pr, str(error))
+        except Diagnostic as error:
+            self._feedback(pr, error)
             return
         self.progress.operation("reconciling_feedback", number)
         self._feedback(pr, None, attribution=evidence)
@@ -787,7 +958,7 @@ def _status(workdir: Path) -> dict:
             sqlite3.connect(f"{database.as_uri()}?mode=ro", uri=True, timeout=1)
         ) as connection:
             rows = connection.execute(
-                "SELECT key, value FROM state WHERE key IN ('health', 'process', 'settings')"
+                "SELECT key, value FROM state WHERE key IN ('health', 'process', 'settings', 'migration')"
             ).fetchall()
         state = {key: json.loads(value) for key, value in rows}
         if any(not isinstance(value, dict) for value in state.values()):
@@ -810,6 +981,9 @@ def _status(workdir: Path) -> dict:
             pid=process.get("pid") if active else None,
             publish=process.get("publish"),
             vendor=state.get("settings", {}).get("vendor"),
+            canonical_repo=state.get("settings", {}).get("canonical_repo"),
+            canonical_branch=state.get("settings", {}).get("canonical_branch"),
+            migration=state.get("migration"),
         )
         if not active:
             result["operation"] = None
@@ -828,6 +1002,10 @@ def _parser() -> argparse.ArgumentParser:
     run.add_argument("--upstream-repo", required=True)
     run.add_argument("--canonical-repo", required=True)
     run.add_argument("--canonical-branch", required=True)
+    run.add_argument(
+        "--migrate-canonical-branch-from",
+        help="Explicitly migrate this stopped workdir from OLD_BRANCH after a merged refresh.",
+    )
     run.add_argument("--fork", required=True, help="Consumer publishing fork OWNER/REPO.")
     run.add_argument("--consumer-repo", default="NVIDIA/TensorRT-LLM")
     run.add_argument("--base-branch", default="main")
@@ -897,6 +1075,10 @@ def main(argv: list[str] | None = None) -> int:
             promote._repo_name(f"https://github.com/{name}")
         for branch in (args.canonical_branch, args.base_branch, args.upstream_branch):
             promote._run(["git", "check-ref-format", f"refs/heads/{branch}"])
+        if args.migrate_canonical_branch_from:
+            promote._run(
+                ["git", "check-ref-format", f"refs/heads/{args.migrate_canonical_branch_from}"]
+            )
         if args.since:
             datetime.datetime.strptime(args.since, "%Y-%m-%dT%H:%M:%SZ")
         args.repo = args.repo.expanduser().resolve()
