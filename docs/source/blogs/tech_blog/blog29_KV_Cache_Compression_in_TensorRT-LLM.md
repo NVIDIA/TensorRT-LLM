@@ -9,7 +9,6 @@
   - [Configuration and Setup of KV Cache Compression](#configuration-and-setup-of-kv-cache-compression)
   - [KV Cache Compression in the Executor Iteration Loop](#kv-cache-compression-in-the-executor-iteration-loop)
   - [KV Cache Compression in Cross-Request KV Management](#kv-cache-compression-in-cross-request-kv-management)
-  - [Covering the Other Stages](#covering-the-other-stages)
 - [Algorithm Implementations](#algorithm-implementations)
   - [NVFP4 Cold-Page Compression](#nvfp4-cold-page-compression)
   - [TriAttention](#triattention)
@@ -112,9 +111,7 @@ To insert precisely, we define five stages in the life of a KV cache (Figure 3):
 </div>
 <p align="center"><sub><em>Figure 3: Five stages in the life of a KV cache where compression can run. TriAttention acts at the decode stage (stage 3) and cold-page compression at the after-request stage (stage 5). The dashed stages are in scope and have no method yet.</em></sub></p>
 
-These stages map to two integration paths in the runtime. **Iteration-driven** methods engage directly at the stages the executor loop passes through: a hook fires at each stage boundary, and the method transforms the retained KV state before the next step reads it. TriAttention is one.
-
-The tool-call and after-request stages (stages 4 and 5) are different in kind. While a tool runs, and after a request ends, the KV is held by the cache manager rather than by a running request: it is kept across requests, reused, and moved across storage levels from the GPU to host and disk memory and back. For these stages we define **cross-request KV management** methods: they run inside the cache manager, where KV is kept, moved and reused across requests. A method may use either path or both; in both the cache manager keeps ownership of every page and the method only changes their contents.
+These stages fall into two groups, and each group has its own integration path. Stages 1 to 3 happen while a request is running, so **iteration-driven** methods hook into the executor loop at each stage boundary and transform the retained KV before the next step reads it; TriAttention is one. Stages 4 and 5 happen while no request is running: the cache manager holds the KV, keeps it across requests, and moves it between GPU, host and disk memory. For them we define **cross-request KV management** methods, which run inside the cache manager. A method may use either path or both, and in both the cache manager keeps ownership of every page.
 
 ### Architecture Overview
 
@@ -133,7 +130,7 @@ The executor and the KV cache manager are existing components. The framework doe
 </div>
 <p align="center"><sub><em>Figure 4: The KV cache compression framework and its execution order. The config builds the manager (1). The manager inserts a hook into the executor and one into the KV cache manager (2). The concrete method inherits the manager and runs inside those hooks (3), launching its own kernels (4). Highlighted boxes are the framework parts; white boxes are existing system components, with the stages each one hosts today and in the future.</em></sub></p>
 
-The executor loop hosts the stages inside a request (stages 1 to 3 in Figure 3); the cache manager hosts the stages beyond it (stages 4 and 5 in Figure 3), which need the cross-request mechanism. In the current implementation we use **storage-bound** compression as the first cross-request mechanism: it acts when a page moves to secondary storage, host or disk memory, and defines how the page is stored there. Today TriAttention implements the decode stage (stage 3) and NVFP4 cold-page compression the offload part of the after-request stage (stage 5). The rest of this section walks through the configuration, the two paths, and the stages still open.
+In the current implementation, **storage-bound** compression is the first cross-request mechanism: it acts when a page moves to host or disk memory and defines how the page is stored there. Today TriAttention implements the decode stage (stage 3) and NVFP4 cold-page compression the offload part of the after-request stage (stage 5). The other stages are reachable the same way and will be filled as new methods need them. The rest of this section covers the configuration and the two paths.
 
 ### Configuration and Setup of KV Cache Compression
 
@@ -182,10 +179,6 @@ Two rules for methods on this path: the policy that picks tokens stays separate 
 - **Request end**: when a request finishes or pauses for a tool.
 
 Today the offload path is the one with a shipped method. The other points are reserved for methods that need them, and the same path could later serve contexts that are similar but not identical, so that one cached block serves prompts that differ around it (KVCOMM is a published example). How the NVFP4 codec is built is described in the NVFP4 cold-page compression section below and in the [cold-page codec design guide](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/developer-guide/kv-cache-cold-page-codec.md).
-
-### Covering the Other Stages
-
-Together, the two paths cover the decode stage (stage 3) and one part of the after-request stage (stage 5), which is what the two shipped methods need. The base class keeps the ability to define more hooks, so every stage that offers a compression opportunity can be reached the same way. How those hooks look is future work, and we will extend the framework as new methods need them.
 
 ## Algorithm Implementations
 
