@@ -14,25 +14,25 @@
 # limitations under the License.
 """Block identity and store key naming for the Mooncake store connector.
 
-`KVCacheManagerV2` exposes no block hashes to a connector, since `RequestData`
-reports them empty, so content identity is derived here instead. The chain is
-the standard one: a block's hash covers its own tokens *and* every token before
-it, so a key can only be reused by a request whose prefix is byte-identical.
+`KVCacheManagerV2` reports `RequestData.block_hashes` empty, so content identity
+is derived here. A block's hash covers its own tokens and every token before it,
+so a key can only be reused by a request whose prefix is byte-identical. The
+chain is seeded with a `ReuseScope` covering what the tokens do not record.
 
-A key is `<namespace>/<block hash>`. The namespace pins down everything that
-would make the stored bytes mean something different: the model, the shard that
-produced them, the layer group inside that shard, the tokens each page holds and
-how many bytes a page is. Anything that changes those reads as a cache miss
-rather than as garbage.
+A key is `<namespace>/<block hash>`. The namespace pins down everything else
+that decides what the stored bytes mean: the model, the shard that produced
+them, the layer group inside that shard, the tokens each page holds and how many
+bytes a page is. A change to any of those reads as a miss rather than as garbage.
 """
 
 import hashlib
-from dataclasses import dataclass
-from typing import List, Optional, Sequence
+from dataclasses import dataclass, field
+from typing import List, Optional, Sequence, Tuple
 
 __all__ = [
     "BlockHashChain",
     "KeyNamespace",
+    "ReuseScope",
     "HASH_DIGEST_BYTES",
 ]
 
@@ -49,21 +49,51 @@ def _digest(*parts: bytes) -> bytes:
     return hasher.digest()
 
 
+def _framed(*parts: bytes) -> bytes:
+    """Length-prefix each part, so no two different part lists encode alike."""
+    return b"".join(len(part).to_bytes(4, "little") + part for part in parts)
+
+
+@dataclass(frozen=True)
+class ReuseScope:
+    """What, besides the tokens, decides whose KV a block hash names.
+
+    A multimodal placeholder token carries the same id whichever image stands
+    behind it, so two requests differing only in their media would otherwise
+    hash alike and read each other's pages. Everything here is a property of
+    the whole request, so it seeds the chain rather than being mixed into each
+    block.
+    """
+
+    #: `LlmRequest.cache_salt`: the caller's own partition of the cache.
+    cache_salt: Optional[str] = None
+    #: Content digest per multimodal item, in prompt order. Seeding with the
+    #: whole set means a request whose media differ diverges from its first
+    #: block, so sharing only a media prefix is a miss rather than a wrong page.
+    multimodal_digests: Tuple[bytes, ...] = field(default_factory=tuple)
+
+    def seed(self) -> bytes:
+        """The digest a request in this scope starts its hash chain from."""
+        return _digest(
+            _framed(
+                b"" if self.cache_salt is None else str(self.cache_salt).encode(),
+                *self.multimodal_digests,
+            )
+        )
+
+
 class BlockHashChain:
     """Rolling hashes of a request's full blocks, one entry per block ordinal.
 
-    Extended in place as a request's token list grows, so generation steps cost
-    one digest per newly completed block rather than a rehash of the prompt.
+    Extended in place as the token list grows, so a generation step costs one
+    digest per newly completed block rather than a rehash of the prompt.
     """
 
-    def __init__(self, tokens_per_block: int, cache_salt: Optional[str] = None):
+    def __init__(self, tokens_per_block: int, scope: Optional[ReuseScope] = None):
         if tokens_per_block <= 0:
             raise ValueError(f"tokens_per_block must be > 0, got {tokens_per_block}")
         self._tokens_per_block = int(tokens_per_block)
-        # The salt seeds the chain rather than being mixed into every block, so
-        # a request carrying a different salt diverges from the first block on.
-        salt_bytes = b"" if cache_salt is None else str(cache_salt).encode()
-        self._seed = _digest(b"salt", salt_bytes)
+        self._seed = (scope or ReuseScope()).seed()
         self._hashes: List[bytes] = []
 
     @property
@@ -80,9 +110,9 @@ class BlockHashChain:
         """Grow the chain to cover every full block of `tokens`.
 
         Args:
-            tokens: The request's complete token list, prompt first. Must be an
-                extension of what was passed previously; a request's tokens only
-                ever grow, so a shorter list means the caller mixed up requests.
+            tokens: The request's complete token list, prompt first. Must
+                extend what was passed previously; a shorter list means the
+                caller mixed up requests.
 
         Returns:
             The full chain, indexed by block ordinal.
@@ -108,7 +138,7 @@ class BlockHashChain:
 class KeyNamespace:
     """The part of a store key that is fixed for one shard and layer group."""
 
-    cache_prefix: str
+    namespace: str
     model_key: str
     #: Global rank of the shard whose KV these bytes are, and the world size it
     #: was produced under. Both are needed: rank 3 of 8 holds different heads
@@ -123,7 +153,7 @@ class KeyNamespace:
     def prefix(self) -> str:
         """The literal string every key in this namespace starts with."""
         return (
-            f"{self.cache_prefix}/{self.model_key}"
+            f"{self.namespace}/{self.model_key}"
             f"/w{self.world_size}r{self.rank}"
             f"/lg{self.layer_group_id}"
             f"/t{self.tokens_per_block}b{self.bytes_per_page}"

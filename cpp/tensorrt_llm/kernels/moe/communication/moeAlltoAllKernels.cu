@@ -141,6 +141,12 @@ using tensorrt_llm::common::launchWithPdlWhenEnabled;
         __VA_ARGS__;                                                                                                   \
         break;                                                                                                         \
     }                                                                                                                  \
+    case 3:                                                                                                            \
+    {                                                                                                                  \
+        constexpr int TOP_K = 3;                                                                                       \
+        __VA_ARGS__;                                                                                                   \
+        break;                                                                                                         \
+    }                                                                                                                  \
     case 2:                                                                                                            \
     {                                                                                                                  \
         constexpr int TOP_K = 2;                                                                                       \

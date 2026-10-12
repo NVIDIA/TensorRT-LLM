@@ -250,6 +250,69 @@ def test_seed_context_windows_preserves_state_across_prefill_chunks():
     assert torch.all(worker._kv_windows[slot] == 2.0)
 
 
+@pytest.mark.parametrize(
+    "chunks",
+    [
+        [(0, 4800), (4800, 150), (4950, 50)],
+        [(3872, 1078), (4950, 50)],
+        [(3872, 178)],
+        [(4000, 1000)],
+        [(4000, 1), (4001, 127)],
+    ],
+)
+@pytest.mark.parametrize("window", [64, 128, 256])
+@pytest.mark.parametrize("final_window", [False, True])
+def test_seed_context_windows_reads_only_each_chunk_tail(chunks, window, final_window):
+    """Never consume dropped captures, including an entirely skipped chunk."""
+    worker = _make_worker()
+    draft = _fake_draft_model()
+    draft._attn_params = dict(draft._attn_params, window_size=window)
+    written = []
+
+    def write(hidden, positions, windows):
+        assert torch.isfinite(hidden).all()
+        torch.testing.assert_close(hidden[:, 0].float(), positions.float() - 1)
+        written.append(positions.tolist())
+
+    draft.write_context_windows = write
+    meta = types.SimpleNamespace(max_num_requests=2, request_ids=[100, 101])
+    worker._lazy_init(draft, meta)
+    expected = []
+    total_kept = 0
+    prompt_end = chunks[-1][0] + chunks[-1][1]
+    for start, length in chunks:
+        # Dropped Decoder rows remain invalid. A second, short context and
+        # generation rows verify that offsets stay in the original batch.
+        captured = torch.full((length + 3 + 6, HIDDEN * NCAP), float("nan"), device="cuda")
+        positions = torch.arange(start, start + length, device="cuda")
+        kept = min(length, max(128, window))
+        if final_window:
+            kept = len(
+                set(range(start, start + length))
+                & set(range(max(0, prompt_end - max(128, window)), prompt_end))
+            )
+            meta.context_capture_lens = (kept, 3)
+        if kept:
+            captured[length - kept : length] = positions[-kept:, None]
+        total_kept += kept if final_window else length
+        captured[length : length + 3] = positions.new_tensor([0, 1, 2])[:, None]
+        captured[-6:] = -99
+        meta.get_hidden_states = lambda count: captured[:count]
+        attn = types.SimpleNamespace(num_contexts=2, _seq_lens=[length, 3, 6])
+        packed_positions = torch.cat(
+            (positions, positions.new_tensor([0, 1, 2, 50, 51, 52, 53, 54, 55]))
+        )
+        worker._seed_context_windows(draft, meta, attn, packed_positions, len(captured))
+        end = start + length
+        if kept:
+            expected.append(list(range(end - min(window, kept) + 1, end + 1)))
+        expected.append([1, 2, 3])
+    assert written == expected
+    slot = worker._req_to_slot[100]
+    assert int(worker._valid_len[slot]) == min(window, total_kept)
+    assert int(worker._ctx_len[slot]) == chunks[-1][0] + chunks[-1][1]
+
+
 def test_prepare_builds_batch_to_slot_on_batched_path():
     """prepare() mirrors the host slot map into _batch_to_slot (default batched path)."""
     worker = _make_worker()
