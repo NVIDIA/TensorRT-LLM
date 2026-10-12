@@ -5,11 +5,19 @@ from __future__ import annotations
 
 import argparse
 import os
-import subprocess
 import sys
 from pathlib import Path
 
 from .agent_home import ensure_agent_home
+from .committer import (
+    ENV_EMAIL,
+    ENV_NAME,
+    CommitIdentity,
+    CommitPolicy,
+    CommitPolicyError,
+    resolve_commit_identity,
+    trial_commit,
+)
 from .roles import shares_the_drafters_model
 from .state import STATE_FILENAME
 from .task_schema import TaskSchemaError, load_and_validate_task_yaml
@@ -24,6 +32,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "Bring one checkpoint to a gated modeling_v2 target: "
             "preflight -> plan -> smith -> assemble -> deliver."
         ),
+        epilog="Other commands: `staircase-onboard premerge --help` (the pre-merge pack).",
     )
     parser.add_argument(
         "--task",
@@ -144,6 +153,16 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "here either way.",
     )
     parser.add_argument(
+        "--overlap-units",
+        action="store_true",
+        help="Start the next unit's assembler in its own git worktree as soon as the "
+        "current unit is UNIT_READY, while the current unit is still being gated. The "
+        "early result is adopted only if it ended UNIT_READY, committed cleanly, rebases "
+        "onto HEAD without conflict and fast-forwards the checkout; anything else falls "
+        "back to a sequential assembly and keeps the worktree for inspection. Off by "
+        "default.",
+    )
+    parser.add_argument(
         "--agent-turn-timeout",
         type=int,
         default=int(DEFAULT_TURN_TIMEOUT_S),
@@ -153,30 +172,33 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-# The identity commits are made under. Needed because redirecting $HOME takes
-# the real ~/.gitconfig off git's search path, and this checkout has no
-# identity of its own -- so without it every smith commit dies with "Please
-# tell me who you are", which is a new infrastructure failure traded for the
-# one just fixed. Not an AI attribution: the sign-off is git's own.
-def _git_config(key: str) -> str:
-    """The operator's own git setting, read before $HOME is redirected."""
+def _commit_identity(task_data: dict) -> CommitIdentity:
+    """The identity every commit of the run is authored and signed off under.
+
+    The repository's configured user, read before $HOME is redirected
+    (redirecting it takes the real ~/.gitconfig off git's search path), and
+    proven by one trial commit through the generated helper: a commit that
+    lands without a sign-off matching its author fails the target
+    repository's DCO check, and finding that out after the run has made fifty
+    of them is the expensive way. Exits 2 when there is no identity, or when
+    this environment's git changes what the helper writes.
+    """
+    repo = str(task_data.get("trtllm_repo_path") or "")
     try:
-        out = subprocess.run(["git", "config", key], capture_output=True, text=True, timeout=10)
-    except (OSError, subprocess.SubprocessError):
-        return ""
-    return out.stdout.strip()
-
-
-GIT_IDENTITY_NAME = (
-    os.environ.get("STAIRCASE_GIT_NAME")
-    or _git_config("user.name")
-    or os.environ.get("USER", "staircase")
-)
-GIT_IDENTITY_EMAIL = (
-    os.environ.get("STAIRCASE_GIT_EMAIL")
-    or _git_config("user.email")
-    or f"{GIT_IDENTITY_NAME}@nvidia.com"
-)
+        identity = resolve_commit_identity(repo)
+    except CommitPolicyError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        sys.exit(2)
+    policy = CommitPolicy.from_task(task_data, identity=identity)
+    problems = trial_commit(policy)
+    if problems:
+        print(
+            "error: a trial commit through the commit helper does not meet the commit "
+            f"rules under {identity.render()}:\n  - " + "\n  - ".join(problems),
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    return identity
 
 
 #: Open file objects whose flock this process holds, kept alive deliberately.
@@ -227,8 +249,25 @@ def _claim_workspace(workspace: Path):
     return handle
 
 
+def _premerge(argv: list[str]) -> int:
+    from .premerge.cli import main as premerge_main
+
+    return premerge_main(argv)
+
+
+#: ``staircase-onboard <subcommand> ...`` for the tools that are not a run.
+#: A run is still ``staircase-onboard --task ...``; a first argument named
+#: here dispatches instead, and everything after it is the subcommand's own.
+SUBCOMMANDS = {
+    "premerge": _premerge,
+}
+
+
 def main(argv: list[str] | None = None) -> None:
     """Run the staircase-onboard workflow as a CLI."""
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv and argv[0] in SUBCOMMANDS:
+        sys.exit(SUBCOMMANDS[argv[0]](argv[1:]))
     args = _parse_args(argv)
 
     # Validate at the CLI boundary: an invalid spec must abort before any
@@ -241,6 +280,10 @@ def main(argv: list[str] | None = None) -> None:
         sys.exit(2)
     if warning := shares_the_drafters_model(task_data):
         print(f"warning: {warning}", file=sys.stderr)
+    identity = _commit_identity(task_data)
+    # Pinned for the rest of the process, so the workflow resolves the same
+    # identity after $HOME has been redirected below.
+    os.environ[ENV_NAME], os.environ[ENV_EMAIL] = identity.name, identity.email
 
     # A sandboxed session's $HOME is read-only, and the first thing a spawned
     # `claude` CLI does is take a lock beside its credential store. Without
@@ -252,7 +295,7 @@ def main(argv: list[str] | None = None) -> None:
 
     staged = ensure_agent_home(
         Path(args.workspace),
-        git_identity=(GIT_IDENTITY_NAME, GIT_IDENTITY_EMAIL),
+        git_identity=(identity.name, identity.email),
     )
     if staged is not None:
         staged.apply()
@@ -260,7 +303,12 @@ def main(argv: list[str] | None = None) -> None:
 
     transport = None
     if args.agent_transport == "external":
-        transport = ExternalAgentTransport(args.workspace, timeout_s=args.agent_turn_timeout)
+        transport = ExternalAgentTransport(
+            args.workspace,
+            timeout_s=args.agent_turn_timeout,
+            source_embargo=task_data.get("source_embargo") or (),
+            repo_root=task_data.get("trtllm_repo_path"),
+        )
         print(
             f"→ role turns go through {transport.root}; a driver session must "
             f"answer each `*.request.json` with a `*.result.md` and a `*.done`"
@@ -280,6 +328,7 @@ def main(argv: list[str] | None = None) -> None:
         dry_run=args.dry_run,
         skip_substrate_gate=args.skip_substrate_gate,
         agent_transport=transport,
+        overlap_units=args.overlap_units,
     ) as workflow:
         workflow.run(args.task)
 

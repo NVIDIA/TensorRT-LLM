@@ -36,6 +36,8 @@ import yaml
 
 from agent_flow.agent_runtime import AGENTS_FIELD, validate_agents
 
+from .committer import COMMIT_POLICY_FIELD, validate_commit_policy_block
+from .embargo import PACKAGE_PREFIX, package_entry_problem, resolve_entry
 from .roles import ROLES, validate_role_defaults
 
 REQUIRED_PATH_FIELDS: tuple[str, ...] = (
@@ -336,6 +338,7 @@ TOP_LEVEL_KEYS: tuple[str, ...] = (
     FEATURE_MATRIX_FIELD,
     # Per-role backend, model and reasoning effort; see `roles.py`.
     AGENTS_FIELD,
+    COMMIT_POLICY_FIELD,
 )
 
 REMEDIATION_KEYS: tuple[str, ...] = (
@@ -761,13 +764,24 @@ def _validate_source_embargo(block: Any, errors: list[str], repo: Any) -> None:
     """
     if not isinstance(block, list) or not all(isinstance(p, str) for p in block):
         raise TaskSchemaError(
-            f"'{SOURCE_EMBARGO_FIELD}' must be a list of paths: repo-relative, or "
-            f"absolute for a tree outside the repo"
+            f"'{SOURCE_EMBARGO_FIELD}' must be a list of paths: repo-relative, absolute for a "
+            f"tree outside the repo, or `{PACKAGE_PREFIX}<path>` inside the workflow package"
         )
     if not isinstance(repo, str):
         return
     repo_root = Path(repo).resolve()
     for entry in block:
+        if entry.startswith(PACKAGE_PREFIX):
+            problem = package_entry_problem(entry)
+            if problem:
+                errors.append(f"'{SOURCE_EMBARGO_FIELD}' names {entry!r}, which {problem}.")
+            elif not resolve_entry(entry).exists():
+                errors.append(
+                    f"'{SOURCE_EMBARGO_FIELD}' names {entry!r}, which does not exist under "
+                    f"the workflow package. An embargo on a path that is not there protects "
+                    f"nothing."
+                )
+            continue
         if entry.startswith("/"):
             resolved = Path(entry).resolve()
             if resolved == repo_root or repo_root in resolved.parents:
@@ -1571,6 +1585,7 @@ def load_and_validate_task_yaml(path: str | Path) -> dict[str, Any]:
     # resolving to no features reads downstream as "the run built core and
     # said it was done", which is a much longer trip back to the cause.
     _validate_remediation(data.get(REMEDIATION_FIELD), errors)
+    validate_commit_policy_block(data.get(COMMIT_POLICY_FIELD), errors)
     reject_unknown_keys(data, TOP_LEVEL_KEYS, errors)
     errors.extend(validate_agents(data, ROLES))
     errors.extend(validate_role_defaults(data))

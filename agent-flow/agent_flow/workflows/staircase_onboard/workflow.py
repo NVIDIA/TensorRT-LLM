@@ -53,9 +53,11 @@ from agent_flow.runtime import CommandExecutor, TurnExecutor, TurnRequest
 
 from . import envelope as envelope_mod
 from . import gates as gates_mod
+from . import overlap as overlap_mod
 from . import remediation
-from .committer import install_committer
-from .delivery import DeliveryReport, summarize_for_auditor, verify_delivery
+from .committer import CommitPolicy, install_committer
+from .delivery import DeliveryReport, summarize_for_auditor, verify_delivery, write_premerge_pack
+from .embargo import display_entries, merge_hook_maps, source_embargo_enforcement
 from .environment import (
     RunEnvironment,
     image_import_warning,
@@ -300,6 +302,7 @@ class StaircaseOnboardWorkflow:
         command_runner: Any | None = None,
         shell_runner: Any | None = None,
         agent_transport: Any | None = None,
+        overlap_units: bool = False,
     ) -> None:
         self.workspace = Path(workspace)
         self.task_path = self.workspace / "task.yaml"
@@ -336,6 +339,10 @@ class StaircaseOnboardWorkflow:
         # queue, the decision validation and every gate; only the turn
         # moves.
         self._agent_transport = agent_transport
+        #: Opt-in unit overlap (overlap.py): the next unit's assembler starts
+        #: in its own worktree once this unit is UNIT_READY.
+        self._overlap_units = overlap_units
+        self._overlap: Any = None
         #: How a role turn is delivered, resolved once. Both transports
         #: answer the same `TurnExecutor` interface, so nothing downstream
         #: of `_run_turn` branches on which one is in force.
@@ -494,6 +501,13 @@ class StaircaseOnboardWorkflow:
             # files with its own tools; the file is validated when it is read.
             hooks = None
             layer_required = () if self._decision_files else tuple(required_tools)
+        # source_embargo: a tool hook where the backend runs SDK callbacks, an
+        # instruction in the system prompt where it cannot (embargo.py).
+        embargo_hooks_map, embargo_note = source_embargo_enforcement(
+            self.task_data, self.workspace, role=name, backend=agent.backend
+        )
+        hooks = merge_hook_maps(hooks, embargo_hooks_map)
+        system_prompt += embargo_note
         return AgentLayer(
             AgentLayerConfig(
                 name=name,
@@ -782,13 +796,17 @@ class StaircaseOnboardWorkflow:
         # followed and still produced two cross-attributed commits — so the
         # rule is now a script that takes a lock and refuses a commit whose
         # contents are not exactly what was asked for.
-        commit_script = install_committer(self.workspace, self.task_data["trtllm_repo_path"])
+        commit_script = install_committer(
+            self.workspace,
+            self.task_data["trtllm_repo_path"],
+            policy=CommitPolicy.from_task(self.task_data, workspace=self.workspace),
+        )
 
         if self._prompts_override is None:
             self.prompts = build_staircase_onboard_prompts(
                 environment=result.environment,
                 reviewer_mode=self.reviewer_mode,
-                source_embargo=self.task_data.get("source_embargo") or (),
+                source_embargo=display_entries(self.task_data),
                 scope=str(self.task_data.get("scope") or "full"),
                 decision_files=self._decision_files,
                 commit_script=str(commit_script),
@@ -1601,6 +1619,7 @@ class StaircaseOnboardWorkflow:
             # BLOCKED on a vocabulary gap the run already knew about.
             if not self._land_deferred(state, unit, log):
                 return False
+            overlap_mod.adopt(self, state, unit, log)
             self._progress_ctx.current_iteration = state.unit_index + 1
 
             if not self._assemble_one_unit(state, unit, log):
@@ -1842,6 +1861,7 @@ class StaircaseOnboardWorkflow:
                     self._checkpoint(state)
                     if not self._fan_out_certification_gaps(state, "assembler", unit, log):
                         continue
+                    overlap_mod.maybe_start(self, state, unit, log)
 
             # The configurations this unit is gated over, resolved once. A
             # `unified` segment is ONE codebase over a FAMILY of parallel
@@ -2174,7 +2194,20 @@ class StaircaseOnboardWorkflow:
             return False
 
         boot = self.gate_log.last("boot")
-        return self._run_remediation_cycle(state, report, boot, log)
+        if not self._run_remediation_cycle(state, report, boot, log):
+            return False
+        # The delivery tail: what the branch still owes before it is a PR.
+        pack, summary = write_premerge_pack(
+            self.task_data["trtllm_repo_path"],
+            self.workspace / "reports",
+            family=self._preflight.family,
+            policy=CommitPolicy.from_task(self.task_data, workspace=self.workspace),
+        )
+        self.journal.section(
+            "pre-merge pack", "\n".join(f"- {line}" for line in summary) + f"\n\n`{pack}`"
+        )
+        print_message(f"→ pre-merge pack: {pack} ({'; '.join(summary)})", log)
+        return True
 
     # ------------------------------------------------------- remediation cycle
 
@@ -2520,6 +2553,7 @@ class StaircaseOnboardWorkflow:
             ),
             model_key=self._model_key(),
             accuracy_test=f"test_modeling_v2_{self._preflight.family}.py",
+            commit_policy=CommitPolicy.from_task(self.task_data, workspace=self.workspace),
         )
         return DeliveryReport(checks=(*report.checks, *self._certification_checks()))
 

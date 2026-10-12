@@ -21,6 +21,7 @@ reach for them, and because the thing they name has not changed.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Sequence
 
 from agent_flow.runtime.turns import (
     DEFAULT_TURN_TIMEOUT_S,
@@ -29,6 +30,8 @@ from agent_flow.runtime.turns import (
     FileDispatchTurnExecutor,
     TurnTimeout,
 )
+
+from .embargo import embargo_transport_note
 
 #: The historical name, kept because it is what the workflow, the CLI and
 #: their tests raise and catch. A `TurnTimeout` from any transport is the
@@ -90,12 +93,17 @@ class ExternalAgentTransport(FileDispatchTurnExecutor):
         *,
         poll_s: float = 5.0,
         timeout_s: float = DEFAULT_TURN_TIMEOUT_S,
+        source_embargo: Sequence[str] = (),
+        repo_root: Path | str | None = None,
     ) -> None:
+        # A driver-run agent is outside this process's tool hooks, so the
+        # embargo they enforce in process is restated here as an instruction.
+        embargo_note = embargo_transport_note(tuple(source_embargo), repo_root=repo_root)
         super().__init__(
             workspace,
             poll_s=poll_s,
             timeout_s=timeout_s,
-            transport_note=staircase_transport_note,
+            transport_note=lambda role: staircase_transport_note(role) + embargo_note,
         )
 
 

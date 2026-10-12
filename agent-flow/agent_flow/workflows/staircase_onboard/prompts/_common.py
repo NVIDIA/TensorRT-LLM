@@ -18,6 +18,8 @@ from __future__ import annotations
 import re
 from typing import Sequence
 
+from ..embargo import PACKAGE_PREFIX
+
 
 def tidy(text: str) -> str:
     """Normalize a composed prompt so it reads as one document.
@@ -300,9 +302,18 @@ def source_embargo_block(paths: Sequence[str]) -> str:
     """
     if not paths:
         return ""
-    listed = "\n".join(f"- `{p}`" for p in paths)
-    out_of_repo = [p for p in paths if p.startswith("/")]
-    in_repo = [p for p in paths if not p.startswith("/")]
+    # `package:<path>` (see `embargo.display_entry`) is the workflow's own
+    # reference material — a worked example of this model — not an
+    # implementation of the checkpoint, so it gets its own premise and no
+    # "running it is expected" paragraph.
+    reference = [p[len(PACKAGE_PREFIX) :] for p in paths if p.startswith(PACKAGE_PREFIX)]
+    sources = [p for p in paths if not p.startswith(PACKAGE_PREFIX)]
+    listed = "\n".join(
+        [f"- `{p}`" for p in sources]
+        + [f"- `{p}` (workflow reference material)" for p in reference]
+    )
+    out_of_repo = [p for p in sources if p.startswith("/")]
+    in_repo = [p for p in sources if not p.startswith("/")]
 
     premise = []
     if in_repo:
@@ -311,6 +322,12 @@ def source_embargo_block(paths: Sequence[str]) -> str:
         premise.append(
             "This checkpoint is implemented in another engine's checkout on this "
             "filesystem, outside this repository."
+        )
+    if reference:
+        premise.append(
+            "This workflow ships reference material about this model — a worked example "
+            "of onboarding it — which you must not read: deriving the target is the "
+            "measurement, and an answer key would void it."
         )
     running = []
     if in_repo:

@@ -39,6 +39,14 @@ from typing import Iterable, Sequence
 
 import yaml
 
+from .committer import (
+    DEFAULT_BASE_REFS,
+    CommitPolicy,
+    CommitPolicyError,
+    audit_commits,
+    resolve_base,
+)
+
 MODELING_V2_PACKAGE = "tensorrt_llm/_torch/_experimental/modeling_v2"
 CATALOG_DIR = f"{MODELING_V2_PACKAGE}/catalog"
 CATALOG_TESTS_DIR = "tests/unittest/_torch/modeling_v2"
@@ -391,6 +399,83 @@ def check_tree_committed(repo_root: Path, paths: Sequence[str]) -> list[Check]:
     ]
 
 
+def check_commit_hygiene(repo_root: Path, policy: CommitPolicy) -> list[Check]:
+    """The run's commits meet the commit rules ``commit.sh`` enforces one at a time.
+
+    Not every commit on a delivered branch went through ``commit.sh`` — the
+    operator's own fixes, a cherry-pick, a rebase that dropped a trailer — and
+    CI's DCO check reads them all. So the same audit runs over every commit
+    since the merge base that touches the paths the run may commit
+    (``commit_policy.allowed_paths``): a sign-off carrying the author's email,
+    no ``Co-authored-by`` unless allowed, no symlink, no sandbox placeholder.
+
+    Returns no check outside a git work tree, or when no base resolves (a
+    fixture is not a delivery, and a branch with no base has nothing to
+    compare); the pre-merge pack says which.
+    """
+    if not (repo_root / ".git").exists():
+        return []
+    base = resolve_base(repo_root, [policy.base_ref] if policy.base_ref else DEFAULT_BASE_REFS)
+    if not base:
+        return []
+    try:
+        findings = audit_commits(
+            repo_root,
+            f"{base}..HEAD",
+            allow_co_authors=policy.allow_co_authors,
+            paths=policy.allowed_paths,
+        )
+    except CommitPolicyError as exc:
+        return [Check(name="git:commit-hygiene", passed=False, detail=str(exc))]
+    return [
+        Check(
+            name="git:commit-hygiene",
+            passed=not findings,
+            detail=(
+                f"every commit since {base[:10]} under {', '.join(policy.allowed_paths) or 'the repo'} "
+                f"is signed off by its author, with no co-author, symlink or placeholder"
+                if not findings
+                else f"{len(findings)} finding(s); `staircase-onboard premerge resign` adds missing "
+                f"sign-offs on a new branch:\n  " + "\n  ".join(f.render() for f in findings[:12])
+            ),
+        )
+    ]
+
+
+def write_premerge_pack(
+    repo_root: Path | str,
+    reports_dir: Path | str,
+    *,
+    family: str,
+    policy: CommitPolicy | None = None,
+) -> tuple[Path, list[str]]:
+    """The delivery tail: the cheap pre-merge checks and the remaining commands.
+
+    Writes ``<reports_dir>/premerge.md`` and returns its path with a short
+    summary. Never fails a delivery: what it reports is the operator's
+    remaining work (lint, the CI cases, the split, the PR), and the one
+    blocking finding — commit hygiene — is already a delivery check.
+    """
+    from .premerge.pack import build_pack, summarize, write_pack
+
+    policy = policy or CommitPolicy()
+    root = Path(repo_root)
+    if (root / ".git").exists():
+        report = build_pack(
+            root,
+            test_pattern=f"test_modeling_v2_{family}",
+            base_ref=policy.base_ref,
+            allow_co_authors=policy.allow_co_authors,
+            paths=policy.allowed_paths,
+        )
+    else:
+        from .premerge.pack import PackReport
+
+        report = PackReport(repo=str(root), notes=["not a git work tree; nothing to check"])
+    path = write_pack(report, reports_dir)
+    return path, list(summarize(report))
+
+
 def verify_delivery(
     *,
     repo_root: Path | str,
@@ -400,6 +485,7 @@ def verify_delivery(
     model_key: str,
     accuracy_test: str,
     extra_entries: Sequence[tuple[str, str]] = (),
+    commit_policy: CommitPolicy | None = None,
 ) -> DeliveryReport:
     """Run every mechanical delivery check and return the report.
 
@@ -430,6 +516,8 @@ def verify_delivery(
     checks.extend(check_accuracy_reference(root, reference_yaml, model_key))
     checks.extend(check_test_registration(root, accuracy_test))
     checks.extend(check_tree_committed(root, (target_rel, MODELING_V2_PACKAGE, CATALOG_TESTS_DIR)))
+    if commit_policy is not None:
+        checks.extend(check_commit_hygiene(root, commit_policy))
     return DeliveryReport(checks=tuple(checks))
 
 
@@ -459,6 +547,7 @@ __all__ = [
     "check_accuracy_reference",
     "check_catalog_entries",
     "check_catalog_tests",
+    "check_commit_hygiene",
     "check_routing",
     "check_target",
     "check_test_registration",
@@ -467,4 +556,5 @@ __all__ = [
     "imported_catalog_entries",
     "summarize_for_auditor",
     "verify_delivery",
+    "write_premerge_pack",
 ]

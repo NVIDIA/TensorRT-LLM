@@ -12,8 +12,8 @@ this file shows one model's values filled in.
 **This file is for operators writing a `task.yaml`.** The run does not
 materialize `examples/` into its workspace, so no role is handed it. A run
 that onboards this checkpoint, or a sibling of it, to measure the workflow
-should add this file to `source_embargo`, because the facts below are what
-the run is meant to derive.
+should embargo it (`source_embargo: [package:examples/deepseek-v4.1.md]`),
+because the facts below are what the run is meant to derive.
 
 Sources: the DeepSeek-V4.1-Flash tech report, the checkpoint's own reference
 code, and SGLang's implementation (branch `origin/dsv4.1`).

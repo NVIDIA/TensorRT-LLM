@@ -126,10 +126,17 @@ trtllm_repo_path: /path/to/TensorRT-LLM
 #
 # Running either kind is expected — the in-repo one under
 # `TRTLLM_MODELING_V2=off`, the out-of-repo one as a black-box server. Only
-# reading is forbidden.
+# reading is forbidden, and it is enforced: a tool hook refuses every Read,
+# Grep and shell read of these paths, strips their lines from broad searches,
+# and logs each attempt to `<workspace>/embargo/attempts.jsonl`.
+#
+# A third spelling, `package:<path>`, is relative to this workflow package
+# wherever it is installed — for its own worked example of the model being
+# onboarded (`package:examples/<model>.md`).
 # source_embargo:
 #   - tensorrt_llm/_torch/models/modeling_qwen3_5.py
 #   - /path/to/vllm
+#   - package:examples/<model>.md
 
 # ----------------------------------------------------------------- runtime
 # What must be true of every gate command. These are declared rather than
@@ -657,3 +664,20 @@ accuracy:
 #   # defaults or an individual role:
 #   #   extra_mcp_servers:
 #   #     knowledge-base: {type: http, url: https://example.test/mcp}
+
+# ----------------------------------------------------------- commit policy
+# What the agents' commit helper (`<workspace>/bin/commit.sh`) accepts, and
+# what delivery checks on the branch. Every commit is authored, committed and
+# signed off (DCO) as the repository's configured user — `git -C
+# <trtllm_repo_path> config user.name/user.email`, or both of
+# STAIRCASE_GIT_NAME / STAIRCASE_GIT_EMAIL — so the sign-off email always
+# equals the author email. The run refuses to start without one.
+#
+# Whatever this block says, the helper refuses directories, globs, absolute
+# paths, symlinks git does not track (a worktree's link to the native build),
+# sandbox placeholders (`.mcp.json`, anything under `.claude/`), and the run's
+# own workspace when it sits inside the repository.
+# commit_policy:
+#   allowed_paths: [tensorrt_llm/, tests/, cpp/, examples/]   # the default
+#   allow_co_authors: false    # the default: no Co-authored-by trailer anywhere
+#   base_ref: origin/main      # delivery audits the commits in merge-base(HEAD, base_ref)..HEAD

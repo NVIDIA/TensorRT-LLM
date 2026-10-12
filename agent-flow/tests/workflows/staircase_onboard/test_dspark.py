@@ -228,9 +228,8 @@ def test_this_checkouts_quickstart_honours_dspark_once_it_has_the_arm():
     branch = _dspark_branch(QUICKSTART.read_text(encoding="utf-8"))
     if branch is None:
         pytest.skip(
-            "this checkout's quickstart_advanced.py has no DSPARK arm yet, so a dspark "
-            "unit's boot and acceptance commands run without a speculator; the "
-            "acceptance gate then finds no accept-rate line and fails closed"
+            "this checkout's quickstart_advanced.py has no DSPARK arm yet; preflight's "
+            "check_speculation_support refuses a dspark unit until it does"
         )
     _assert_honours_dspark(branch)
 
