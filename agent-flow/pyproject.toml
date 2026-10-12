@@ -54,6 +54,19 @@ include = ["agent_flow*"]
     "TROUBLESHOOTING.md",
     "BUILD_AND_TEST.md",
     "README.md",
+    "LESSONS.md",
+    # The compute-session substrate: the watcher entry and the operator's
+    # shell wrappers run by path inside and outside the container.
+    "spool_watcher.sh",
+    "scripts/*.sh",
+    "scripts/mn/*",
+    # Not a package: the scheduler puts this directory on every job's
+    # PYTHONPATH so its sitecustomize records which checkout each process
+    # imported.
+    "substrate/resolvehook/*.py",
+    # The driver's packaged templates: the standing turn instructions and the
+    # per-turn subagent prompt.
+    "driver/*.md",
 ]
 
 ####################################################################################################

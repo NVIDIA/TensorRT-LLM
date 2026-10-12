@@ -749,6 +749,9 @@ class StaircaseOnboardWorkflow:
             # here. Which kind that is remains `execution.py`'s business.
             turns=self._turns,
             workspace=self.workspace,
+            # The checkout under test: gates run in it and the session refuses
+            # a result whose ranks imported the engine from anywhere else.
+            tree=self.task_data.get("trtllm_repo_path"),
         )
         if self._shell_runner_override is None:
             self._shell_runner = shell_runner_for(self._command_executor)

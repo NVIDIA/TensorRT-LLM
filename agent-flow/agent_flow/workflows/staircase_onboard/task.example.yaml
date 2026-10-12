@@ -394,6 +394,50 @@ environment:
   # write `<spool>/pending/<name>.sh`, wait for `<spool>/done/<name>.rc`,
   # read `<spool>/logs/<name>.log`.
   # spool: /path/to/scratch/spool
+  #
+  # The sessions the run stands on. Each one is an allocation whose main
+  # process is the spool scheduler (`substrate/scheduler.py`): it allocates
+  # devices per job (`--gpus N|all`), enforces wall-clock and memory limits,
+  # removes the allocation's MPI context from every job, and never kills a
+  # process that still carries it. Render a session's entry script with
+  #     staircase-onboard session render --task task.yaml --name a
+  # and submit the allocation with that script as its command; there is no
+  # hand-edited entry script to go stale.
+  #
+  # `time_limit` lets the scheduler plan the hand-over: `handover_lead` before
+  # the end it writes a successor request (the driver answers it, see
+  # `staircase-onboard driver wait`) and stops admitting jobs that could not
+  # finish in time, so they wait in the spool for the successor instead of
+  # dying with the allocation. `nodes: 2` makes a multi-node session for
+  # `scripts/mn/mn_mpirun.sh`.
+  #
+  # sessions:
+  #   - name: a
+  #     spool: /path/to/scratch/spool          # the gate spool above
+  #     role: gates                            # gates | work | orchestrator | any
+  #     gpus_per_node: 4
+  #     time_limit: "24:00:00"
+  #     handover_lead: "01:00:00"
+  #     scheduler: {default_wall: 2h, pressure_floor_gb: 32}
+  #   - name: b
+  #     spool: /path/to/scratch/spool-b
+  #     role: work                             # catalog tests, microbenchmarks
+  #   - name: orch
+  #     spool: /path/to/scratch/spool-orch
+  #     role: orchestrator                     # GPU-free and long-lived
+  #     gpus_per_node: 0
+  #
+  # The session the orchestrator runs in. A dedicated GPU-free allocation
+  # outlives compute-session hand-overs; sharing one couples their deaths.
+  # orchestrator:
+  #   session: orch
+  #
+  # How a successor allocation is acquired. `request_file` (default) leaves the
+  # request for the driver session, which holds the cluster's broker tools;
+  # `command` runs a shell command (SESSION_NAME, SESSION_SPOOL, SESSION_ENTRY
+  # and AFTER_JOB are set) and reads the new job id from its output.
+  # allocator:
+  #   kind: request_file
 
 # ---------------------------------------------------------------- accuracy
 # The release criterion. One-sided: measured >= reference - k x SE, the SE

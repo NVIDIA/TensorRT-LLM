@@ -66,6 +66,7 @@ def select_command_executor(
     name_prefix: str = "gate",
     turns: TurnExecutor | None = None,
     workspace: Path | str | None = None,
+    tree: Path | str | None = None,
 ) -> CommandExecutor:
     """The executor this run's commands go through.
 
@@ -80,10 +81,15 @@ def select_command_executor(
     broker path did before it was wired. That fallback is for callers with no
     turn executor to hand over (a bare `--dry-run`, a test), not a mode
     anybody should gate on.
+
+    ``tree`` is the checkout under test. On a spool every command then runs
+    with that checkout as its working directory and first ``PYTHONPATH``
+    entry, and the session refuses a result whose processes imported the
+    engine from anywhere else.
     """
     kind = environment.kind
     if kind == KIND_SESSION_SPOOL and environment.spool:
-        return SpoolCommandExecutor(environment.spool, name_prefix=name_prefix)
+        return SpoolCommandExecutor(environment.spool, name_prefix=name_prefix, tree=tree)
     if kind == KIND_SLURM:
         return SlurmStepExecutor(max_world_size=environment.world_size or None)
     if kind == KIND_SLURM_BROKER and turns is not None and workspace is not None:

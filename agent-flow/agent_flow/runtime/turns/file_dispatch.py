@@ -54,12 +54,16 @@ trust it is complete.
 
 from __future__ import annotations
 
+import atexit
 import itertools
 import json
+import os
+import shutil
+import socket
 import threading
 import time
 from pathlib import Path
-from typing import Callable, ClassVar
+from typing import Callable, ClassVar, Mapping
 
 from .base import TurnExecutor, TurnOutcome, TurnRequest, TurnTimeout
 
@@ -77,6 +81,20 @@ DEFAULT_TURN_TIMEOUT_S = 3 * 60 * 60
 #: penalized --- but one that does gets a fast, named failure instead of a
 #: three-hour wait.
 HEARTBEAT_STALE_S = 300.0
+
+#: The orchestrator side's liveness file, and the file it leaves when it exits.
+ORCHESTRATOR_HEARTBEAT = "orchestrator.heartbeat"
+ORCHESTRATOR_EXIT = "orchestrator.exit"
+
+
+def job_prefix(request_id: str) -> str:
+    """The prefix a turn gives anything it names on shared resources: ``014-smith`` -> ``r014``.
+
+    Unique per request, so two turns can never pick the same spool job name
+    and overwrite each other's results.
+    """
+    return f"r{request_id.split('-', 1)[0]}"
+
 
 #: Builds the paragraph appended to a role's system prompt saying what this
 #: transport cannot honour. Supplied by the caller, because what a role
@@ -101,11 +119,24 @@ class FileDispatchTurnExecutor(TurnExecutor):
         timeout_s: float = DEFAULT_TURN_TIMEOUT_S,
         dispatch_dirname: str = DISPATCH_DIRNAME,
         transport_note: TransportNote | None = None,
+        role_timeouts: Mapping[str, float] | None = None,
+        orchestrator_heartbeat_s: float | None = None,
+        adopt_across_decisions: bool = False,
     ) -> None:
         self.root = Path(workspace) / dispatch_dirname
         self.root.mkdir(parents=True, exist_ok=True)
         self.poll_s = poll_s
         self.timeout_s = timeout_s
+        #: Per-role overrides of ``timeout_s``: an assembly takes far longer than a review.
+        self.role_timeouts = dict(role_timeouts or {})
+        #: Adopt an orphaned request of the same role and ``what`` even when it
+        #: named a different decision file (the caller's turn counter moved on
+        #: across a restart); its decision is copied to the path now expected.
+        self.adopt_across_decisions = adopt_across_decisions
+        self._created = time.time()
+        self._stop = threading.Event()
+        if orchestrator_heartbeat_s:
+            self._start_heartbeat(orchestrator_heartbeat_s)
         self._note = transport_note
         self._counter = itertools.count(self._next_seq())
         self._lock = threading.Lock()
@@ -116,6 +147,48 @@ class FileDispatchTurnExecutor(TurnExecutor):
         self._in_flight: set[str] = set()
 
     # ------------------------------------------------------------ helpers
+
+    def timeout_for(self, role: str) -> float:
+        """How long a turn of ``role`` may take before the run gives up on it."""
+        return float(self.role_timeouts.get(role, self.timeout_s))
+
+    def _start_heartbeat(self, interval_s: float) -> None:
+        """Tell the driver this side is alive, and leave a note when it exits.
+
+        A driver waiting for requests cannot otherwise tell an orchestrator
+        that is busy running gates from one that has exited: a run that closed
+        writes no further request, and the driver waited two hours for one.
+        """
+        record = {"pid": os.getpid(), "host": socket.gethostname(), "started": self._created}
+
+        def beat() -> None:
+            while True:
+                try:
+                    self._write_atomic(
+                        self.root / ORCHESTRATOR_HEARTBEAT,
+                        json.dumps({**record, "at": time.time()}) + "\n",
+                    )
+                except OSError:
+                    return
+                if self._stop.wait(interval_s):
+                    return
+
+        (self.root / ORCHESTRATOR_EXIT).unlink(missing_ok=True)
+        threading.Thread(target=beat, name="dispatch-heartbeat", daemon=True).start()
+        atexit.register(self._mark_exit, record)
+
+    def _mark_exit(self, record: dict) -> None:
+        self._stop.set()
+        try:
+            self._write_atomic(
+                self.root / ORCHESTRATOR_EXIT, json.dumps({**record, "at": time.time()}) + "\n"
+            )
+        except OSError:
+            pass
+
+    def close(self) -> None:
+        """Stop the heartbeat thread, if one runs."""
+        self._stop.set()
 
     def _next_seq(self) -> int:
         """Continue the numbering across a resume rather than restarting it.
@@ -237,16 +310,54 @@ class FileDispatchTurnExecutor(TurnExecutor):
                 return name
         return None
 
+    def _orphaned_turn(self, request: TurnRequest) -> tuple[str, str | None] | None:
+        """An unanswered request a previous process left for this role and ``what``.
+
+        Only consulted when ``adopt_across_decisions`` is set and no exact twin
+        exists: after a restart the caller may number the same turn
+        differently, so the decision file differs while the work asked for does
+        not. Returns the request id and the decision file it named. Call with
+        ``_lock`` held.
+        """
+        for path in sorted(self.root.glob(f"*-{request.role}.request.json")):
+            name = path.name[: -len(".request.json")]
+            if name in self._in_flight or (self.root / f"{name}.done").exists():
+                continue
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            if (
+                data.get("what") != request.what
+                or float(data.get("requested_at", 0)) >= self._created
+            ):
+                continue
+            return name, data.get("decision_file")
+        return None
+
     def run(self, request: TurnRequest) -> TurnOutcome:
+        their_decision = None
         with self._lock:
             adopted = self._unanswered_twin(request)
+            if adopted is None and self.adopt_across_decisions:
+                orphan = self._orphaned_turn(request)
+                if orphan is not None:
+                    adopted, their_decision = orphan
             request_id = adopted or f"{next(self._counter):03d}-{request.role}"
             self._in_flight.add(request_id)
         try:
-            return self._await(request, request_id, adopted)
+            outcome = self._await(request, request_id, adopted)
         finally:
             with self._lock:
                 self._in_flight.discard(request_id)
+        if their_decision and request.decision_file and their_decision != request.decision_file:
+            source, target = Path(their_decision), Path(request.decision_file)
+            # Copied, never moved, and never over an existing file: decision
+            # files are evidence and are not overwritten.
+            if source.is_file() and not target.exists():
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(source, target)
+        return outcome
 
     def _await(self, request: TurnRequest, request_id: str, adopted: str | None) -> TurnOutcome:
         started = time.monotonic()
@@ -263,18 +374,19 @@ class FileDispatchTurnExecutor(TurnExecutor):
         if adopted is None:
             self._write_request(request, request_id, system, prompt, result, done)
 
-        deadline = time.monotonic() + self.timeout_s
+        timeout_s = self.timeout_for(request.role)
+        deadline = time.monotonic() + timeout_s
         while not done.exists():
             if self._driver_is_gone():
                 raise TurnTimeout(
                     f"{request_id}: the dispatch driver's heartbeat is stale. "
                     f"Nothing is reading {self.root}; the run would otherwise wait "
-                    f"{self.timeout_s:.0f}s for a turn nobody is taking."
+                    f"{timeout_s:.0f}s for a turn nobody is taking."
                 )
             if time.monotonic() > deadline:
                 raise TurnTimeout(
-                    f"{request_id}: no answer within {self.timeout_s:.0f}s. "
-                    f"The prompt is at {prompt}."
+                    f"{request_id}: no answer within {timeout_s:.0f}s (the {request.role} "
+                    f"turn timeout). The prompt is at {prompt}."
                 )
             time.sleep(self.poll_s)
 
@@ -309,6 +421,15 @@ class FileDispatchTurnExecutor(TurnExecutor):
                     # would otherwise turn a cross-model review into a
                     # same-model one without anything on disk saying so.
                     "agent": {"backend": request.backend, "model": request.model},
+                    # Names the turn gives shared resources (spool jobs) start
+                    # with this, so two turns never overwrite each other's.
+                    "job_prefix": job_prefix(request_id),
+                    # Relative paths above are relative to this, the
+                    # orchestrator's working directory; a driver elsewhere
+                    # resolves them against it, so it writes exactly the
+                    # files the orchestrator will read.
+                    "cwd": os.getcwd(),
+                    "timeout_s": self.timeout_for(request.role),
                     # Named rather than inlined: a driver that wants the
                     # role's own history reads these, and one that does not
                     # is not forced to carry them in the prompt.
@@ -352,5 +473,8 @@ __all__ = [
     "DISPATCH_DIRNAME",
     "FileDispatchTurnExecutor",
     "HEARTBEAT_STALE_S",
+    "ORCHESTRATOR_EXIT",
+    "ORCHESTRATOR_HEARTBEAT",
     "TransportNote",
+    "job_prefix",
 ]

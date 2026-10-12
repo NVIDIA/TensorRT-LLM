@@ -603,7 +603,17 @@ ENVIRONMENT_KEYS: tuple[str, ...] = (
     "substrate_checkpoint",
     # Per-workload substrate overrides. See `_validate_workloads`.
     "workloads",
+    # The compute sessions the run stands on, the one the orchestrator lives
+    # in, and how a successor allocation is requested. Validated by
+    # `substrate.sessions.validate_sessions`.
+    "sessions",
+    "orchestrator",
+    "allocator",
 )
+
+#: Environment keys that describe the run's sessions rather than one launch,
+#: and so have no meaning inside a per-workload override.
+SESSION_ENVIRONMENT_KEYS: tuple[str, ...] = ("sessions", "orchestrator", "allocator")
 
 ENVIRONMENT_KINDS: tuple[str, ...] = ("local", "slurm", "slurm_broker", "session_spool")
 ENVIRONMENT_REQUIRED_FIELDS: tuple[str, ...] = ("kind", "python")
@@ -1062,7 +1072,14 @@ def _validate_workloads(block: Any, errors: list[str]) -> None:
         # `workloads` itself is excluded from the legal keys: an override that
         # carries its own overrides is a nesting nothing resolves.
         reject_unknown_keys(
-            override, tuple(k for k in ENVIRONMENT_KEYS if k != "workloads"), errors, where=where
+            override,
+            tuple(
+                k
+                for k in ENVIRONMENT_KEYS
+                if k != "workloads" and k not in SESSION_ENVIRONMENT_KEYS
+            ),
+            errors,
+            where=where,
         )
         kind = override.get("kind")
         if kind is not None and kind not in ENVIRONMENT_KINDS:
@@ -1082,6 +1099,10 @@ def _validate_environment(block: Any, errors: list[str]) -> None:
     reject_unknown_keys(block, ENVIRONMENT_KEYS, errors, where=ENVIRONMENT_FIELD)
 
     _validate_workloads(block.get("workloads"), errors)
+
+    from .substrate.sessions import validate_sessions
+
+    validate_sessions(block, errors, where=ENVIRONMENT_FIELD)
 
     for name in ENVIRONMENT_REQUIRED_FIELDS:
         value = block.get(name)

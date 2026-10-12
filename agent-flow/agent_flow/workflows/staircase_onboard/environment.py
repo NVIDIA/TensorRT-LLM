@@ -200,6 +200,9 @@ class RunEnvironment:
     # ``session_spool`` only: the directory a long-lived compute session
     # watches for work.
     spool: str | None = None
+    # ``environment.sessions``, as ``(name, spool, role)``: every session an
+    # agent may submit to, and what each is for.
+    sessions: tuple[tuple[str, str, str], ...] = ()
 
     @property
     def ntasks(self) -> int:
@@ -499,35 +502,55 @@ class RunEnvironment:
         not. A spool has none of that. One allocation is acquired once, and
         work is a **file**, so anything that can write a file can run GPU
         work: the orchestrator, an agent, or a human.
+
+        The session's own scheduler allocates devices, enforces limits and
+        removes the allocation's MPI context from every job, so the block
+        tells the agent how to *ask* for devices rather than how to pick them.
         """
+        from .substrate import SCRIPTS_DIR
+
         spool = self.spool or "<spool>"
         prefix = self.prefix or "(no extra environment)"
+        submit = SCRIPTS_DIR / "spool_submit.sh"
+        control = SCRIPTS_DIR / "spoolctl.sh"
         return (
             "## Running GPU work\n"
             "\n"
-            "A compute session is already running and watching a spool directory. You do "
-            "**not** submit jobs, allocate nodes, or touch Slurm — `srun`/`sbatch` do not "
-            "even work from here. Work is a file.\n"
+            "A compute session is already running and its scheduler watches a spool "
+            "directory. You do **not** submit jobs, allocate nodes, or touch Slurm — "
+            "`srun`/`sbatch` do not even work from here. Work is a file.\n"
             "\n"
-            "To run something:\n"
+            "Run something and wait for it (prints the log, exits with the job's code):\n"
             "\n"
-            f"1. Write a shell script to `{spool}/pending/<name>.sh`. Pick a `<name>` that "
-            "is unique to what you are doing; it names the log.\n"
-            f"2. Wait for `{spool}/done/<name>.rc` to exist. It appears only when the job "
-            "has finished, and it holds the exit code.\n"
-            f"3. Read `{spool}/logs/<name>.log`. **That file is the result.** Your "
-            "recollection of what scrolled past is not.\n"
+            "```bash\n"
+            f"SPOOL={spool} {submit} --gpus <N|all> --wall <limit> <name> '<command>'\n"
+            "```\n"
+            "\n"
+            "- `--gpus N` asks for N devices; the scheduler exports `CUDA_VISIBLE_DEVICES` to "
+            "exactly those. **Never set `CUDA_VISIBLE_DEVICES` yourself.** `--gpus all` holds "
+            "the whole node, exclusively — use it for anything that loads the full model. "
+            "Without `--gpus`, a `free-` name holds no device and any other name holds the "
+            "whole node.\n"
+            "- `--wall` is counted from the job's start; time spent queued is free. A job "
+            "past its limit is stopped and reported as timed out.\n"
+            "- `<name>` must be unique to what you are doing and must start with your "
+            "request's prefix when one is set (`$STAIRCASE_JOB_PREFIX`). Its log is "
+            f"`{spool}/logs/<name>.log` and **that file is the result**; your recollection of "
+            "what scrolled past is not.\n"
+            f"- `{control} status` shows what runs, what waits and why. "
+            f"`{control} cancel <name>` is the only way to stop a job: never `kill`, "
+            "`pkill` or time out a process yourself.\n"
             "\n"
             "The script runs inside the container on the compute node, so it sees the same "
             "filesystem you do. Start it with:\n"
             "\n"
             "```bash\n"
             f"export {prefix.replace(' ', chr(10) + 'export ')}\n"
-            f"export CUDA_VISIBLE_DEVICES=0   # you own device(s) 0..{max(self.world_size - 1, 0)}\n"
             "```\n"
             "\n"
             f"The Python interpreter is `{self.python}`. World size {self.world_size}.\n"
             "\n"
+            + self._describe_sessions()
             + (
                 "This run is **multi-rank**, so an engine command has to be launched with "
                 "the ranks already in place:\n"
@@ -551,13 +574,19 @@ class RunEnvironment:
                 if self.needs_llmapi_launch
                 else ""
             )
-            + "Jobs you drop run **concurrently**, so two scripts that both take device 0 "
-            "will contend. If you need more than one at a time, assign devices yourself.\n"
-            "\n"
-            "**Do not construct a launcher command, do not probe for one, and do not call a "
+            + "**Do not construct a launcher command, do not probe for one, and do not call a "
             "test-runner skill.** The session was resolved before you started and it is not "
             "yours to rediscover. If this protocol does not fit what you need to run, that "
             "is a **symptom to report in your final message** — not a problem to solve.\n"
+        )
+
+    def _describe_sessions(self) -> str:
+        if len(self.sessions) < 2:
+            return ""
+        from .substrate.sessions import SessionSpec, describe_sessions
+
+        return describe_sessions(
+            [SessionSpec(name=n, spool=s, role=r) for n, s, r in self.sessions]
         )
 
     def _describe_broker(self) -> str:
@@ -667,11 +696,11 @@ def shares_allocation_with_spool(env: "RunEnvironment") -> str | None:
     ``pkill -9`` caught the watcher — which *is* the allocation's main process,
     so killing it ends the allocation. Both took every queued job with them.
 
-    The evidence is ``watcher.jobid`` in the spool, written every poll by
-    ``spool_watcher.sh``. It is a **separate file from** ``watcher.heartbeat``
-    on purpose: ``scripts/spool_submit.sh`` pipes the heartbeat straight into
-    ``date -d`` after stripping ``alive=``, so anything else on that line
-    breaks every submitter.
+    The evidence is ``watcher.jobid`` in the spool, written every pass by the
+    session's scheduler (``substrate/scheduler.py``). It is a **separate file
+    from** ``watcher.heartbeat`` on purpose: submitters parse the heartbeat as
+    ``alive=<timestamp>``, so anything else on that line breaks every one of
+    them.
 
     Returns a message when both job ids are known **and equal**, and ``None``
     otherwise. Unknown is not a warning: an orchestrator launched in its own
@@ -680,7 +709,9 @@ def shares_allocation_with_spool(env: "RunEnvironment") -> str | None:
     """
     if env.kind != "session_spool" or not env.spool:
         return None
-    mine = os.environ.get("SLURM_JOB_ID")
+    # A job the spool scheduler started has no SLURM_* variables (they are
+    # scrubbed) and carries the session's job id under this name instead.
+    mine = os.environ.get("SLURM_JOB_ID") or os.environ.get("STAIRCASE_SPOOL_SESSION_JOBID")
     if not mine:
         return None
     marker = Path(env.spool) / "watcher.jobid"
@@ -744,6 +775,9 @@ def resolve_environment(
         block = {**block, **{k: v for k, v in override.items() if k != "env"}}
         block["env"] = merged_env
     env = {str(k): str(v) for k, v in (block.get("env") or {}).items()}
+    from .substrate.sessions import sessions_from_task
+
+    declared = sessions_from_task({"environment": block}) if block.get("sessions") else ()
     return RunEnvironment(
         kind=str(block.get("kind", "local")),
         python=str(block.get("python", "python3")),
@@ -759,6 +793,7 @@ def resolve_environment(
         container_name=block.get("container_name"),
         mpi=str(block.get("mpi") or MPI_AUTO),
         spool=block.get("spool"),
+        sessions=tuple((s.name, s.spool, s.role) for s in declared),
     )
 
 

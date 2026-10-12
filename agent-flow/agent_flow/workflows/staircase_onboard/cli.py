@@ -21,7 +21,12 @@ from .committer import (
 from .roles import shares_the_drafters_model
 from .state import STATE_FILENAME
 from .task_schema import TaskSchemaError, load_and_validate_task_yaml
-from .transport import DEFAULT_TURN_TIMEOUT_S, ExternalAgentTransport
+from .transport import (
+    DEFAULT_ROLE_TURN_TIMEOUTS,
+    EXTERNAL_MAX_PARALLEL_SMITHS,
+    ORCHESTRATOR_HEARTBEAT_S,
+    ExternalAgentTransport,
+)
 from .workflow import DEFAULT_MAX_PARALLEL_SMITHS
 
 
@@ -71,9 +76,11 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--max-parallel-smiths",
         type=int,
-        default=DEFAULT_MAX_PARALLEL_SMITHS,
+        default=None,
         help="Cap on concurrent smith dispatches within one dependency "
-        f"batch. Default {DEFAULT_MAX_PARALLEL_SMITHS}. Catalog entries are "
+        f"batch. Default {DEFAULT_MAX_PARALLEL_SMITHS}, or "
+        f"{EXTERNAL_MAX_PARALLEL_SMITHS} with --agent-transport external, where "
+        "the binding limit is concurrent agent streams on one account. Catalog entries are "
         "independent by construction, so this is where a run spends extra "
         "compute to shorten wall-clock — but each dispatch is a full agent "
         "session, and the upstream rate limit is reported without any "
@@ -165,9 +172,11 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--agent-turn-timeout",
         type=int,
-        default=int(DEFAULT_TURN_TIMEOUT_S),
+        default=None,
         help="Seconds a single externally-dispatched turn may take before "
-        "the run fails. Only meaningful with --agent-transport external.",
+        "the run fails, for every role. Without it each role has its own bound ("
+        + ", ".join(f"{role} {int(s) // 3600}h" for role, s in DEFAULT_ROLE_TURN_TIMEOUTS.items())
+        + "). Only meaningful with --agent-transport external.",
     )
     return parser.parse_args(argv)
 
@@ -264,9 +273,25 @@ def _gate(argv: list[str]) -> int:
 #: ``staircase-onboard <subcommand> ...`` for the tools that are not a run.
 #: A run is still ``staircase-onboard --task ...``; a first argument named
 #: here dispatches instead, and everything after it is the subcommand's own.
+def _session(argv: list[str]) -> int:
+    from .substrate.cli import main as session_main
+
+    return session_main(argv)
+
+
+def _driver(argv: list[str]) -> int:
+    from .driver.cli import main as driver_main
+
+    return driver_main(argv)
+
+
 SUBCOMMANDS = {
     "premerge": _premerge,
     "gate": _gate,
+    # Compute sessions: render entry scripts, status, hand-over, watchdog.
+    "session": _session,
+    # The external-transport driver: wait, claim, prompt, status, instructions.
+    "driver": _driver,
 }
 
 
@@ -315,10 +340,25 @@ def main(argv: list[str] | None = None) -> None:
             timeout_s=args.agent_turn_timeout,
             source_embargo=task_data.get("source_embargo") or (),
             repo_root=task_data.get("trtllm_repo_path"),
+            # The driver tells a busy orchestrator from an exited one by this.
+            heartbeat_s=ORCHESTRATOR_HEARTBEAT_S,
+        )
+        if args.max_parallel_smiths is None:
+            args.max_parallel_smiths = EXTERNAL_MAX_PARALLEL_SMITHS
+        from .driver.core import DriverConfig, install_instructions
+
+        guide = install_instructions(
+            DriverConfig(
+                workspace=Path(args.workspace).resolve(),
+                root=Path(task_data.get("trtllm_repo_path") or ".").resolve(),
+                task=task_data,
+            )
         )
         print(
             f"→ role turns go through {transport.root}; a driver session must "
-            f"answer each `*.request.json` with a `*.result.md` and a `*.done`"
+            f"answer each `*.request.json` with a `*.result.md` and a `*.done`.\n"
+            f"  Driver loop: `staircase-onboard driver --workspace {args.workspace} wait`; "
+            f"standing instructions for its subagents: {guide}"
         )
 
     from .workflow import StaircaseOnboardWorkflow
@@ -327,7 +367,11 @@ def main(argv: list[str] | None = None) -> None:
         workspace=args.workspace,
         max_plan_rounds=args.max_plan_rounds,
         max_assembler_turns_per_unit=args.max_assembler_turns_per_unit,
-        max_parallel_smiths=args.max_parallel_smiths,
+        max_parallel_smiths=(
+            DEFAULT_MAX_PARALLEL_SMITHS
+            if args.max_parallel_smiths is None
+            else args.max_parallel_smiths
+        ),
         reviewer_mode=args.reviewer,
         plan=args.plan,
         vocabulary=args.vocabulary,

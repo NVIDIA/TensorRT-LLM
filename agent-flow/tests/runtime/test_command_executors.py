@@ -216,6 +216,39 @@ def test_a_spool_command_round_trips_through_the_filesystem(tmp_path):
     assert record.label == "accuracy"
 
 
+def test_a_receipt_is_read_only_once_it_holds_an_exit_code(tmp_path):
+    """A receipt created empty and filled a moment later must not read as exit code 1.
+
+    The fake watcher above writes its `.rc` without renaming it into place, so
+    the executor could see the file between its creation and its first byte;
+    that intermittently turned a passing command into a failure.
+    """
+
+    def slow_writer():
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            scripts = (
+                sorted((tmp_path / "pending").glob("*.sh"))
+                if (tmp_path / "pending").is_dir()
+                else []
+            )
+            if scripts:
+                name = scripts[0].stem
+                (tmp_path / "done").mkdir(parents=True, exist_ok=True)
+                receipt = tmp_path / "done" / f"{name}.rc"
+                receipt.touch()  # exists, empty
+                time.sleep(0.3)
+                receipt.write_text("0\n", encoding="utf-8")
+                return
+            time.sleep(0.005)
+
+    threading.Thread(target=slow_writer, daemon=True).start()
+    record = SpoolCommandExecutor(tmp_path, poll_s=0.01).execute(
+        CommandSpec(argv="true", timeout_s=30)
+    )
+    assert record.returncode == 0 and record.ok
+
+
 def test_the_receipt_is_the_exit_code(tmp_path):
     _watch(tmp_path, returncode=7, output="it failed\n")
     record = SpoolCommandExecutor(tmp_path, poll_s=0.01).execute(

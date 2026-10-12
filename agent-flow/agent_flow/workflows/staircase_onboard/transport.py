@@ -21,7 +21,7 @@ reach for them, and because the thing they name has not changed.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Sequence
+from typing import Mapping, Sequence
 
 from agent_flow.runtime.turns import (
     DEFAULT_TURN_TIMEOUT_S,
@@ -32,6 +32,30 @@ from agent_flow.runtime.turns import (
 )
 
 from .embargo import embargo_transport_note
+
+#: Per-role turn timeouts, in seconds. One bound for every role was wrong in
+#: both directions: a core assembly for a new architecture (modeling, weights,
+#: routing, golden and long-context proofs) ran past the old 3 h default and
+#: raised out of the orchestrator (F017), while a stuck plan review would wait
+#: just as long as an assembly.
+DEFAULT_ROLE_TURN_TIMEOUTS: dict[str, float] = {
+    "plan_drafter": 4 * 3600.0,
+    "plan_reviewer": 3 * 3600.0,
+    "smith": 6 * 3600.0,
+    "assembler": 16 * 3600.0,
+    "reviewer": 4 * 3600.0,
+    "auditor": 6 * 3600.0,
+    "runner": 3 * 3600.0,
+}
+
+#: How often the orchestrator tells the driver it is alive.
+ORCHESTRATOR_HEARTBEAT_S = 30.0
+
+#: Concurrent smith dispatches when turns go through the external transport.
+#: The binding limit there is concurrent agent streams on one account: twelve
+#: concurrent turns lost seven to "Agent stalled: no progress for 600s" within
+#: twelve minutes (F010).
+EXTERNAL_MAX_PARALLEL_SMITHS = 8
 
 #: The historical name, kept because it is what the workflow, the CLI and
 #: their tests raise and catch. A `TurnTimeout` from any transport is the
@@ -92,23 +116,35 @@ class ExternalAgentTransport(FileDispatchTurnExecutor):
         workspace: Path | str,
         *,
         poll_s: float = 5.0,
-        timeout_s: float = DEFAULT_TURN_TIMEOUT_S,
+        timeout_s: float | None = None,
+        role_timeouts: Mapping[str, float] | None = None,
+        heartbeat_s: float | None = None,
         source_embargo: Sequence[str] = (),
         repo_root: Path | str | None = None,
     ) -> None:
         # A driver-run agent is outside this process's tool hooks, so the
         # embargo they enforce in process is restated here as an instruction.
         embargo_note = embargo_transport_note(tuple(source_embargo), repo_root=repo_root)
+        # An explicit `timeout_s` is one bound for every role, as it always
+        # was; without one each role gets its own default.
+        timeouts = dict(DEFAULT_ROLE_TURN_TIMEOUTS) if timeout_s is None else {}
+        timeouts.update(role_timeouts or {})
         super().__init__(
             workspace,
             poll_s=poll_s,
-            timeout_s=timeout_s,
+            timeout_s=DEFAULT_TURN_TIMEOUT_S if timeout_s is None else timeout_s,
             transport_note=lambda role: staircase_transport_note(role) + embargo_note,
+            role_timeouts=timeouts,
+            orchestrator_heartbeat_s=heartbeat_s,
+            adopt_across_decisions=True,
         )
 
 
 __all__ = [
+    "DEFAULT_ROLE_TURN_TIMEOUTS",
     "DEFAULT_TURN_TIMEOUT_S",
+    "EXTERNAL_MAX_PARALLEL_SMITHS",
+    "ORCHESTRATOR_HEARTBEAT_S",
     "DISPATCH_DIRNAME",
     "ExternalAgentTransport",
     "ExternalTransportTimeout",

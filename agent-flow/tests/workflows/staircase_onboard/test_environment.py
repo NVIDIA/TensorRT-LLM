@@ -531,22 +531,38 @@ def test_outside_slurm_and_outside_a_spool_it_is_silent(tmp_path, monkeypatch):
     assert environment.shares_allocation_with_spool(_spool_env(tmp_path, kind="slurm")) is None
 
 
-def test_the_watcher_writes_the_marker_as_its_own_file():
+def test_the_watcher_writes_the_marker_as_its_own_file(tmp_path):
     """`watcher.jobid` is the evidence, and it must not share the heartbeat line.
 
-    `scripts/spool_submit.sh` pipes `watcher.heartbeat` straight into `date -d`
-    after stripping `alive=`, so anything extra on that line breaks every
-    submitter. A check nothing writes checks nothing, so this pins both halves:
-    the marker is written, and it is written somewhere else.
+    Submitters parse `watcher.heartbeat` as `alive=<timestamp>`, so anything
+    extra on that line breaks every one of them. A check nothing writes checks
+    nothing, so this pins both halves: the marker is written, and it is written
+    somewhere else.
     """
-    from pathlib import Path
+    from agent_flow.workflows.staircase_onboard.substrate.scheduler import Scheduler
 
-    watcher = Path(environment.__file__).with_name("spool_watcher.sh").read_text(encoding="utf-8")
-    assert '"$SPOOL/watcher.jobid"' in watcher
-    assert "${SLURM_JOB_ID:-unknown}" in watcher
-    for line in watcher.splitlines():
-        if "watcher.heartbeat" in line and "echo" in line:
-            assert "SLURM_JOB_ID" not in line
+    Scheduler(tmp_path, environ={"SLURM_JOB_ID": "559470"}).heartbeat()
+    assert (tmp_path / "watcher.jobid").read_text(encoding="utf-8").strip() == "559470"
+    beat = (tmp_path / "watcher.heartbeat").read_text(encoding="utf-8").strip()
+    assert beat.startswith("alive=") and "559470" not in beat
+    assert Scheduler(tmp_path / "other", environ={}).slurm_job == "unknown"
+
+
+def test_a_job_the_spool_started_is_recognised_as_inside_the_session(tmp_path, monkeypatch):
+    """The scheduler scrubs SLURM_* from its jobs and hands the job id over by name."""
+    (tmp_path / "watcher.jobid").write_text("559470\n", encoding="utf-8")
+    monkeypatch.delenv("SLURM_JOB_ID", raising=False)
+    monkeypatch.setenv("STAIRCASE_SPOOL_SESSION_JOBID", "559470")
+    assert "559470" in (environment.shares_allocation_with_spool(_spool_env(tmp_path)) or "")
+
+
+def test_the_spool_prompt_asks_for_devices_instead_of_picking_them():
+    """Two scripts that both took device 0 used to contend; the scheduler now allocates."""
+    block = RunEnvironment(kind="session_spool", python="/p", world_size=1, spool="/s").describe()
+    assert "--gpus" in block and "spool_submit.sh" in block
+    assert "Never set `CUDA_VISIBLE_DEVICES` yourself" in block
+    assert "cancel <name>" in block and "never `kill`" in block
+    assert "export CUDA_VISIBLE_DEVICES=0" not in block
 
 
 # ------------------------------- per-workload substrate
