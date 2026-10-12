@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pytest
@@ -20,6 +21,7 @@ import cv2  # noqa: E402
 
 import tensorrt_llm.inputs.media_io as media_io_module  # noqa: E402
 from tensorrt_llm.inputs.media_io import VideoMediaIO, _load_video_by_cv2  # noqa: E402
+from tensorrt_llm.inputs.multimodal_data import VideoData  # noqa: E402
 
 pytestmark = pytest.mark.cpu_only
 
@@ -96,33 +98,33 @@ def test_video_conversion_preserves_sequential_sampling(
     captures = []
 
     class SequentialCapture:
-        def __init__(self, *args):
+        def __init__(self, *args: Any) -> None:
             self.next_frame = 0
             self.grabbed = []
             self.released = False
             captures.append(self)
 
-        def isOpened(self):
+        def isOpened(self) -> bool:
             return True
 
-        def get(self, prop):
+        def get(self, prop: int) -> int:
             return {cv2.CAP_PROP_FRAME_COUNT: 20, cv2.CAP_PROP_FPS: 30}[prop]
 
-        def grab(self):
+        def grab(self) -> bool:
             if self.next_frame >= end_frame:
                 return False
             self.grabbed.append(self.next_frame)
             self.next_frame += 1
             return True
 
-        def retrieve(self, scratch):
+        def retrieve(self, scratch: np.ndarray | None) -> tuple[bool, np.ndarray]:
             frame_idx = self.next_frame - 1
             return frame_idx != failed_frame, np.roll(bgr, frame_idx, axis=1)
 
-        def set(self, *args):
+        def set(self, *args: Any) -> None:
             pytest.fail("decode-order video sampling must not seek")
 
-        def release(self):
+        def release(self) -> None:
             self.released = True
 
     monkeypatch.setattr(cv2, "VideoCapture", SequentialCapture)
@@ -150,11 +152,11 @@ def test_load_file_avoids_full_buffer_and_preserves_byte_identity(
     original_decode = media_io_module._load_video_by_cv2
     calls = []
 
-    def decode(*args, **kwargs):
+    def decode(*args: Any, **kwargs: Any) -> VideoData:
         calls.append((args, kwargs))
         return original_decode(*args, **kwargs)
 
-    def fail_read_bytes(path):
+    def fail_read_bytes(path: Path) -> None:
         pytest.fail(f"unexpected full-file buffer: {path}")
 
     monkeypatch.setattr(
@@ -171,10 +173,10 @@ def test_load_file_avoids_full_buffer_and_preserves_byte_identity(
     assert calls[0][1]["cv2_backend"] == cv2.CAP_FFMPEG
 
     class BytesOnlyHasher:
-        def __init__(self):
+        def __init__(self) -> None:
             self.hasher = blake3()
 
-        def update(self, data):
+        def update(self, data: bytes) -> None:
             assert isinstance(data, bytes)
             self.hasher.update(data)
 
@@ -184,11 +186,13 @@ def test_load_file_avoids_full_buffer_and_preserves_byte_identity(
     assert old_hasher.hasher.hexdigest() == new_hasher.hasher.hexdigest()
 
 
-def test_load_file_rejects_changed_source(sample_video_path: str, monkeypatch: pytest.MonkeyPatch):
+def test_load_file_rejects_changed_source(
+    sample_video_path: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Do not associate decoded frames with a hash after the file changes."""
     original_decode = media_io_module._load_video_by_cv2
 
-    def decode_then_touch(*args, **kwargs):
+    def decode_then_touch(*args: Any, **kwargs: Any) -> VideoData:
         video = original_decode(*args, **kwargs)
         path = Path(sample_video_path)
         stat = path.stat()
@@ -213,14 +217,14 @@ def test_load_file_preserves_byte_loader_fallback(
     source = tmp_path / "source.mp4"
     source.write_bytes(b"video data")
     calls = []
-    expected = object()
+    expected = VideoData(frames=np.zeros((1, 1, 1, 3), dtype=np.uint8), metadata={})
 
-    def load_bytes(self, data):
+    def load_bytes(self: VideoMediaIO, data: bytes) -> VideoData:
         calls.append(data)
         return expected
 
     class CustomVideoIO(VideoMediaIO):
-        def load_bytes(self, data):
+        def load_bytes(self, data: bytes) -> VideoData:
             return load_bytes(self, data)
 
     if fallback == "subclass":
@@ -277,7 +281,7 @@ def test_load_file_checks_source_before_decoder(
     if source_kind == "directory":
         source.mkdir()
 
-    def fail_probe():
+    def fail_probe() -> None:
         pytest.fail("decoder capability probe ran before checking the source")
 
     monkeypatch.setattr(media_io_module, "_select_cv2_stream_buffered_backend", fail_probe)
@@ -297,25 +301,25 @@ def test_load_file_hashes_bounded_chunks_and_closes_source(
     source_file = source.open("rb")
     read_sizes = []
     decoded_hashes = []
-    expected = object()
+    expected = VideoData(frames=np.zeros((1, 1, 1, 3), dtype=np.uint8), metadata={})
 
     class ReadSpy:
-        def __enter__(self):
+        def __enter__(self) -> "ReadSpy":
             return self
 
-        def __exit__(self, *args):
+        def __exit__(self, *args: Any) -> None:
             source_file.close()
 
-        def fileno(self):
+        def fileno(self) -> int:
             return source_file.fileno()
 
-        def read(self, size):
+        def read(self, size: int) -> bytes:
             assert size == 1 << 20
             chunk = source_file.read(size)
             read_sizes.append(len(chunk))
             return chunk
 
-    def decode(*args, **kwargs):
+    def decode(*args: Any, **kwargs: Any) -> VideoData:
         decoded_hashes.append(kwargs["raw_bytes_hash"])
         assert not source_file.closed
         if decode_error:
