@@ -35,10 +35,11 @@ from tensorrt_llm._torch.models.modeling_utils import DecoderModelForCausalLM
 from tensorrt_llm._torch.modules.linear import MXFP8LinearMethod
 from tensorrt_llm._torch.pyexecutor.engine.model_call import ModelCaller
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import DecoderRunner
+from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner import _PrefillCompiledModel
 from tensorrt_llm._torch.pyexecutor.engine.runners.encoder_decoder import EncoderDecoderRunner
 from tensorrt_llm._torch.pyexecutor.engine.runners.no_kv_cache import NoKVCacheRunner
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
-from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine, _PrefillCompiledModel
+from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
 from tensorrt_llm._torch.pyexecutor.model_loader import ModelLoader
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager, ResourceManagerType
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
@@ -218,7 +219,7 @@ def test_prefill_compile_uses_all_rank_prefill_decision(
     metadata = SimpleNamespace(num_contexts=local_contexts)
     for eligible in (True, False):
         monkeypatch.setattr(
-            model_engine_module, "get_per_request_prefill_cuda_graph_flag", lambda: eligible
+            decoder_runner_module, "get_per_request_prefill_cuda_graph_flag", lambda: eligible
         )
         assert router(expected, attn_metadata=metadata) is expected
         selected = compiled if eligible else eager
@@ -274,7 +275,7 @@ def test_prefill_compile_preserves_partial_weight_reload(
     inputs = torch.ones(2, 4)
     for eligible in (False, True):
         monkeypatch.setattr(
-            model_engine_module, "get_per_request_prefill_cuda_graph_flag", lambda: eligible
+            decoder_runner_module, "get_per_request_prefill_cuda_graph_flag", lambda: eligible
         )
         torch.testing.assert_close(model.model(inputs), inputs @ replacement.t() + old_bias)
 

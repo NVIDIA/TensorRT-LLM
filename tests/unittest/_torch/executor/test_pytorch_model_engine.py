@@ -29,11 +29,11 @@ from tensorrt_llm._torch.pyexecutor.engine.multimodal import \
     setup_mm_encoder_attn_metadata
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import DecoderRunner
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner import (
-    _get_context_prompt_lookahead_token, _make_single_token_context_graph_batch)
+    _get_context_prompt_lookahead_token, _make_single_token_context_graph_batch,
+    _PrefillCompiledModel)
 from tensorrt_llm._torch.pyexecutor.engine.runners.pooling import PoolingRunner
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
-from tensorrt_llm._torch.pyexecutor.model_engine import (PyTorchModelEngine,
-                                                         _PrefillCompiledModel)
+from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
 from tensorrt_llm.llmapi.llm_args import (DecodingBaseConfig,
                                           PrefillCudaGraphBackend,
                                           SeqLenAwareSparseAttentionConfig,
@@ -296,7 +296,6 @@ def _make_forward_only_engine(
 ) -> tuple[PyTorchModelEngine, Mock, Mock, Mock, dict[str, object]]:
     engine = object.__new__(PyTorchModelEngine)
     decoder = object.__new__(DecoderRunner)
-    decoder._torch_compile_bypass = None
     engine.model = decoder.model = SimpleNamespace(
         extra_attrs={},
         model_config=SimpleNamespace(pretrained_config=SimpleNamespace(
@@ -304,6 +303,7 @@ def _make_forward_only_engine(
     decoder.kv_cache_manager_key = ResourceManagerType.KV_CACHE_MANAGER
     engine.enable_spec_decode = False
     decoder._config = SimpleNamespace(
+        compile_only_piecewise_graphs=False,
         disable_overlap_scheduler=True,
         is_spec_decode=False,
         max_beam_width=1,
@@ -403,9 +403,8 @@ def test_decoder_forward_routes_compile_bypass(enabled: bool,
     eager.forward = Mock(return_value=outputs)
     compiled.forward = Mock(return_value=outputs)
     wrapper = _PrefillCompiledModel(eager, compiled)
-    engine._compile_only_piecewise_graphs = enabled
-    engine._prefill_compiled_model = wrapper
-    engine._runner._torch_compile_bypass = engine._maybe_bypass_torch_compile
+    engine._runner._config.compile_only_piecewise_graphs = enabled
+    engine._runner.model.model = wrapper
     engine._runner._forward_step.side_effect = lambda *args, **kwargs: wrapper()
     graph_runner.needs_capture.return_value = ordinary_capture
     graph_runner.is_warmup_only = ordinary_capture
@@ -418,7 +417,7 @@ def test_decoder_forward_routes_compile_bypass(enabled: bool,
             "tensorrt_llm._torch.pyexecutor.model_engine.torch.cuda.Event",
             return_value=Mock()
     ), patch(
-            "tensorrt_llm._torch.pyexecutor.model_engine.get_per_request_prefill_cuda_graph_flag",
+            "tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner.get_per_request_prefill_cuda_graph_flag",
             return_value=eligible,
     ):
         result = engine.forward(batch, resources)

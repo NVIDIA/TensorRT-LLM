@@ -7,8 +7,8 @@ import os
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from contextlib import contextmanager
-from typing import (Any, Callable, Dict, Hashable, Iterator, List, Optional,
-                    Tuple, Type, Union)
+from typing import (Any, Callable, Dict, Hashable, List, Optional, Tuple, Type,
+                    Union)
 
 import torch
 import torch._dynamo.config
@@ -44,7 +44,7 @@ from ..route_capture import ROUTE_CAPTURE_ATTR, RouteCapture
 from ..speculative import SpecMetadata, update_spec_config_from_loaded_model
 from ..speculative.utils import get_static_draft_len
 from ..tensor_lru_cache import TensorLRUCache
-from ..utils import get_per_request_prefill_cuda_graph_flag, set_torch_compiling
+from ..utils import set_torch_compiling
 from .config_utils import is_hybrid_linear
 from .cuda_graph_runner import CUDAGraphRunner
 from .engine.cuda_graph import filter_cuda_graph_batch_sizes
@@ -58,6 +58,7 @@ from .engine.runners.common import (make_scheduled_inputs,
                                     resolve_mrope_position_deltas_cache,
                                     set_moe_a2a_warmup)
 from .engine.runners.decoder import DecoderRunner, DecoderRunnerConfig
+from .engine.runners.decoder.runner import _PrefillCompiledModel
 from .engine.runners.encoder import EncoderRunner, EncoderRunnerConfig
 from .engine.runners.encoder_decoder import (EncoderDecoderRunner,
                                              EncoderDecoderRunnerConfig,
@@ -74,65 +75,6 @@ from .model_loader import ModelLoader, _construct_checkpoint_loader
 from .resource_manager import ResourceManager, ResourceManagerType
 from .sampler import SampleStateTensors
 from .scheduler import ScheduledRequests
-
-
-class _PrefillCompiledModel(torch.nn.Module):
-    """Share weights between eligible prefill/mixed and original eager paths.
-
-    The prefill flag includes the all-rank attention-DP decision and capture
-    ceiling. A decode-only rank must still compile when another rank prefills.
-    """
-
-    def __init__(self, eager_model: torch.nn.Module,
-                 compiled_model: torch.nn.Module) -> None:
-        """Keep eager and compiled entry points sharing the same model weights."""
-        super().__init__()
-        self.eager_model = eager_model
-        self._bypass_active = False
-        # The compiled callable references the same weights. Register only the
-        # eager tree so state_dict(), children() and _apply() visit it once.
-        object.__setattr__(self, "compiled_model", compiled_model)
-
-    def named_modules(
-        self,
-        memo: Optional[set[torch.nn.Module]] = None,
-        prefix: str = "",
-        remove_duplicate: bool = True,
-    ) -> Iterator[Tuple[str, torch.nn.Module]]:
-        """Expose checkpoint-compatible module names for partial weight reloads."""
-        # Weight reloads match checkpoint prefixes against this traversal.
-        # Hide the eager_model prefix even with remove_duplicate=False.
-        yield from self.eager_model.named_modules(memo, prefix,
-                                                  remove_duplicate)
-
-    def forward(self, *args: Any, **kwargs: Any) -> Any:
-        """Use the compiled path only for globally eligible prefill batches."""
-        model = (self.compiled_model
-                 if self.use_compiled_forward() else self.eager_model)
-        return model(*args, **kwargs)
-
-    def use_compiled_forward(self) -> bool:
-        """Return whether the current forward should use torch.compile."""
-        return (not self._bypass_active
-                and get_per_request_prefill_cuda_graph_flag())
-
-    @contextmanager
-    def bypass(self) -> Iterator[None]:
-        """Temporarily force eager execution regardless of graph eligibility."""
-        previous = self._bypass_active
-        self._bypass_active = True
-        try:
-            yield
-        finally:
-            self._bypass_active = previous
-
-    def __getattr__(self, name: str) -> Any:
-        """Delegate model-specific attributes to the original eager model."""
-        # Epilogues can access transformer attributes after forward returns.
-        try:
-            return super().__getattr__(name)
-        except AttributeError:
-            return getattr(super().__getattr__("eager_model"), name)
 
 
 class ModelEngine(ABC):
@@ -509,7 +451,6 @@ class PyTorchModelEngine(ModelEngine):
 
         self._torch_compile_enabled = torch_compile_enabled
         self._compile_only_piecewise_graphs = compile_only_piecewise_graphs
-        self._prefill_compiled_model: Optional[_PrefillCompiledModel] = None
         self._torch_compile_piecewise_cuda_graph = torch_compile_piecewise_cuda_graph
         self._torch_compile_prefill_only = False
 
@@ -576,9 +517,8 @@ class PyTorchModelEngine(ModelEngine):
                         and (compile_only_piecewise_graphs
                              or not self.model.use_fx_for_pcg_fallback))
                     if self._torch_compile_prefill_only:
-                        self._prefill_compiled_model = _PrefillCompiledModel(
+                        self.model.model = _PrefillCompiledModel(
                             eager_model, compiled_model)
-                        self.model.model = self._prefill_compiled_model
                     else:
                         self.model.model = compiled_model
                 elif callable(apply_llm_torch_compile):
@@ -792,6 +732,7 @@ class PyTorchModelEngine(ModelEngine):
             torch_compile_piecewise_cuda_graph=(
                 self._torch_compile_piecewise_cuda_graph),
             torch_compile_prefill_only=self._torch_compile_prefill_only,
+            compile_only_piecewise_graphs=self._compile_only_piecewise_graphs,
             use_mrope=self.use_mrope,
             is_multimodal=self.is_multimodal,
             mm_encoder_cache_enabled=self._mm_encoder_cache_enabled,
@@ -820,7 +761,6 @@ class PyTorchModelEngine(ModelEngine):
             moe_load_balancer=self.moe_load_balancer,
             sparse_attention_config=self.sparse_attention_config,
             torch_compile_backend=self._torch_compile_backend,
-            torch_compile_bypass=self._maybe_bypass_torch_compile,
             get_runtime_tokens_per_gen_step=self.
             get_runtime_tokens_per_gen_step,
             warmup_timer=self._warmup_timer,
@@ -1088,20 +1028,6 @@ class PyTorchModelEngine(ModelEngine):
             "scheduled warmup requires a resource manager")
         assert isinstance(self._runner, ScheduledModelRunner)
         self._runner.warmup(resource_manager)
-
-    @contextmanager
-    def _maybe_bypass_torch_compile(
-            self,
-            bypass: bool = False,
-            can_run_graph: bool = True) -> Iterator[None]:
-        """Force eager execution for auxiliary work and ordinary CUDA graphs."""
-        if (not self._compile_only_piecewise_graphs
-                or self._prefill_compiled_model is None
-                or not (bypass or can_run_graph)):
-            yield
-            return
-        with self._prefill_compiled_model.bypass():
-            yield
 
     ### Helper methods promoted from the original warmup method ###
 

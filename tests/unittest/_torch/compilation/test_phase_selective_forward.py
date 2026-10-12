@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import contextlib
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pytest
@@ -10,8 +11,10 @@ from utils.llm_data import llm_models_root
 from utils.util import skip_pre_hopper
 
 from tensorrt_llm import LLM, SamplingParams
+from tensorrt_llm._torch.models.modeling_utils import DecoderModelForCausalLM
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import DecoderRunner
-from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine, _PrefillCompiledModel
+from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner import _PrefillCompiledModel
+from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
 from tensorrt_llm.llmapi import CudaGraphConfig, PrefillCudaGraphBackend, TorchCompileConfig
 
 
@@ -28,19 +31,36 @@ def _create_prefill_compiled_model() -> tuple[_PrefillCompiledModel, Mock, Mock]
 def _create_compile_restricted_runner(
     model: _PrefillCompiledModel, enabled: bool = True
 ) -> DecoderRunner:
-    engine = object.__new__(PyTorchModelEngine)
-    engine._compile_only_piecewise_graphs = enabled
-    engine._prefill_compiled_model = model
     runner = object.__new__(DecoderRunner)
-    runner._torch_compile_bypass = engine._maybe_bypass_torch_compile
+    runner._config = SimpleNamespace(compile_only_piecewise_graphs=enabled)
+    runner.model = SimpleNamespace(model=model)
     return runner
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("enabled", [False, True])
+def test_engine_passes_compile_policy_to_decoder_runner(enabled: bool) -> None:
+    engine = Mock()
+    engine._compile_only_piecewise_graphs = enabled
+    config = PyTorchModelEngine._decoder_runner_config(engine)
+    runner_type = Mock()
+
+    result = PyTorchModelEngine._initialize_decoder_runner(
+        engine, runner_type, runner_config=config
+    )
+
+    assert config.compile_only_piecewise_graphs is enabled
+    assert result is runner_type.return_value
+    assert runner_type.call_args.args == (engine.model, config)
+    assert "prefill_compiled_model" not in runner_type.call_args.kwargs
+    assert "torch_compile_bypass" not in runner_type.call_args.kwargs
 
 
 def test_prefill_compiled_model_uses_compiled_when_eligible() -> None:
     model, eager_forward, compiled_forward = _create_prefill_compiled_model()
 
     with patch(
-        "tensorrt_llm._torch.pyexecutor.model_engine.get_per_request_prefill_cuda_graph_flag",
+        "tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner.get_per_request_prefill_cuda_graph_flag",
         return_value=True,
     ):
         assert model("input") == "compiled"
@@ -52,7 +72,7 @@ def test_prefill_compiled_model_bypass_is_restored() -> None:
     model, eager_forward, compiled_forward = _create_prefill_compiled_model()
 
     with patch(
-        "tensorrt_llm._torch.pyexecutor.model_engine.get_per_request_prefill_cuda_graph_flag",
+        "tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner.get_per_request_prefill_cuda_graph_flag",
         return_value=True,
     ):
         assert model() == "compiled"
@@ -81,7 +101,7 @@ def test_decoder_runner_selects_torch_compile_forward(
     runner = _create_compile_restricted_runner(model)
 
     with patch(
-        "tensorrt_llm._torch.pyexecutor.model_engine.get_per_request_prefill_cuda_graph_flag",
+        "tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner.get_per_request_prefill_cuda_graph_flag",
         return_value=prefill_graph_eligible,
     ) as get_prefill_graph_flag:
         with runner._maybe_bypass_torch_compile(can_run_graph=can_run_graph):
@@ -103,7 +123,7 @@ def test_decoder_runner_explicit_bypass_skips_graph_eligibility() -> None:
     runner = _create_compile_restricted_runner(model)
 
     with patch(
-        "tensorrt_llm._torch.pyexecutor.model_engine.get_per_request_prefill_cuda_graph_flag",
+        "tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner.get_per_request_prefill_cuda_graph_flag",
         return_value=True,
     ) as get_prefill_graph_flag:
         with runner._maybe_bypass_torch_compile(bypass=True, can_run_graph=False):
@@ -120,7 +140,7 @@ def test_decoder_runner_bypass_requires_compile_only_option() -> None:
     runner = _create_compile_restricted_runner(model, enabled=False)
 
     with patch(
-        "tensorrt_llm._torch.pyexecutor.model_engine.get_per_request_prefill_cuda_graph_flag",
+        "tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner.get_per_request_prefill_cuda_graph_flag",
         return_value=True,
     ):
         with runner._maybe_bypass_torch_compile(bypass=True):
@@ -131,11 +151,55 @@ def test_decoder_runner_bypass_requires_compile_only_option() -> None:
     eager_forward.assert_not_called()
 
 
-def test_decoder_runner_without_compile_bypass_service() -> None:
+def test_decoder_runner_without_compile_restriction() -> None:
     runner = object.__new__(DecoderRunner)
-    runner._torch_compile_bypass = None
+    runner._config = SimpleNamespace(compile_only_piecewise_graphs=False)
+    runner.model = torch.nn.Identity()
     with runner._maybe_bypass_torch_compile(bypass=True):
         pass
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("has_wrapper", [False, True])
+def test_decoder_runner_validates_compiled_body_at_initialization(
+    monkeypatch: pytest.MonkeyPatch, enabled: bool, has_wrapper: bool
+) -> None:
+    model = object.__new__(DecoderModelForCausalLM)
+    torch.nn.Module.__init__(model)
+    wrapper, _, _ = _create_prefill_compiled_model()
+    model.model = wrapper if has_wrapper else torch.nn.Identity()
+    config = SimpleNamespace(compile_only_piecewise_graphs=enabled)
+    for method in (
+        "_allocate_decoder_buffers",
+        "_init_decoder_state",
+        "_initialize_cuda_graph_runner",
+        "_initialize_breakable_cuda_graph_runner",
+    ):
+        monkeypatch.setattr(DecoderRunner, method, Mock())
+    expected_error = (
+        pytest.raises(AssertionError, match="_PrefillCompiledModel decoder body")
+        if enabled and not has_wrapper
+        else contextlib.nullcontext()
+    )
+    with expected_error:
+        runner = DecoderRunner(
+            model,
+            config,
+            input_processor=Mock(),
+            model_caller=Mock(),
+            mapping=Mock(),
+            dist=None,
+            moe_load_balancer=None,
+            sparse_attention_config=None,
+            torch_compile_backend=None,
+            get_runtime_tokens_per_gen_step=Mock(),
+            warmup_timer=Mock(),
+            iter_states={},
+            metrics={},
+            kv_cache_manager_key=Mock(),
+        )
+        assert runner.model.model is model.model
 
 
 def test_decoder_runner_nested_bypass_restores_after_exception() -> None:
@@ -153,14 +217,12 @@ def test_decoder_runner_nested_bypass_restores_after_exception() -> None:
 @pytest.mark.parametrize("enabled", [False, True])
 def test_decoder_runner_warmup_bypasses_only_auxiliary_phases(monkeypatch, enabled: bool) -> None:
     """Exercise the relocated warmup orchestration with eager/compiled routing."""
-    from types import SimpleNamespace
-
     from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import runner as runner_module
     from tensorrt_llm._torch.pyexecutor.warmup_timer import _WarmupTimer
 
     model, _, _ = _create_prefill_compiled_model()
     runner = _create_compile_restricted_runner(model, enabled=enabled)
-    runner.model = SimpleNamespace(config=SimpleNamespace(vocab_size=128))
+    runner.model.config = SimpleNamespace(vocab_size=128)
     runner.mapping = SimpleNamespace(cp_size=1, has_cp_helix=lambda: False)
     runner.guided_decoder = None
     runner._metrics = {}
@@ -213,7 +275,7 @@ def test_decoder_runner_warmup_bypasses_only_auxiliary_phases(monkeypatch, enabl
             "tensorrt_llm._torch.custom_ops.torch_custom_ops.MoERunner.clear_all_workspaces", Mock()
         ),
         patch(
-            "tensorrt_llm._torch.pyexecutor.model_engine.get_per_request_prefill_cuda_graph_flag",
+            "tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner.get_per_request_prefill_cuda_graph_flag",
             return_value=True,
         ),
     ):
