@@ -30,6 +30,8 @@ dynamic ``range``, so the pipeliner rewrites the code around the barrier; the
 decode kernel only uses ``tl.static_range`` and is unaffected by it.
 """
 
+from typing import Optional
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -50,7 +52,13 @@ skip_unsupported = pytest.mark.skipif(
 LAUNCH_CONFIGS = [(4, 128, 3), (8, 32, 1), (16, 64, 2)]
 
 
-def _conv1d_ref(x, conv_state, weight, bias, activation):
+def _conv1d_ref(
+    x: torch.Tensor,
+    conv_state: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    activation: Optional[str],
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Reference for one convolution step over a dense batch.
 
     x: [batch, dim, seqlen], conv_state: [batch, dim, state_len]
@@ -74,10 +82,12 @@ def _conv1d_ref(x, conv_state, weight, bias, activation):
     return out, padded[..., -state_len:]
 
 
-def _make_inputs(dim, width, dtype, device, seed):
+def _make_inputs(
+    dim: int, width: int, dtype: torch.dtype, device: str, seed: int
+) -> tuple[torch.Tensor, torch.Tensor]:
     generator = torch.Generator(device=device).manual_seed(seed)
 
-    def rand(*shape):
+    def rand(*shape: int) -> torch.Tensor:
         return torch.randn(*shape, dtype=dtype, device=device, generator=generator)
 
     weight = rand(dim, width)
@@ -85,7 +95,7 @@ def _make_inputs(dim, width, dtype, device, seed):
     return weight, bias
 
 
-def _tolerance(dtype):
+def _tolerance(dtype: torch.dtype) -> dict[str, float]:
     return {"atol": 1e-3, "rtol": 1e-3} if dtype == torch.float32 else {"atol": 2e-2, "rtol": 2e-2}
 
 
@@ -93,7 +103,9 @@ def _tolerance(dtype):
 @pytest.mark.parametrize("num_warps, block_n, num_stages", LAUNCH_CONFIGS)
 @pytest.mark.parametrize("width", [2, 3, 4])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-def test_update_preserves_initial_state(num_warps, block_n, num_stages, width, dtype):
+def test_update_preserves_initial_state(
+    num_warps: int, block_n: int, num_stages: int, width: int, dtype: torch.dtype
+) -> None:
     """The decode kernel must convolve against the *old* conv_state."""
     device = "cuda"
     batch, dim, seqlen = 4, 64, 1
@@ -136,7 +148,9 @@ def test_update_preserves_initial_state(num_warps, block_n, num_stages, width, d
 @pytest.mark.parametrize("num_warps, block_n, num_stages", LAUNCH_CONFIGS)
 @pytest.mark.parametrize("width", [2, 3, 4])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-def test_fwd_preserves_initial_state(num_warps, block_n, num_stages, width, dtype):
+def test_fwd_preserves_initial_state(
+    num_warps: int, block_n: int, num_stages: int, width: int, dtype: torch.dtype
+) -> None:
     """The varlen prefill kernel must convolve against the *old* conv_state.
 
     ``seq_lens`` mixes sequences longer and shorter than ``state_len`` so both
@@ -162,7 +176,7 @@ def test_fwd_preserves_initial_state(num_warps, block_n, num_stages, width, dtyp
     initial_conv_state = conv_state.clone()
 
     query_start_loc = torch.tensor(
-        [0] + torch.tensor(seq_lens).cumsum(0).tolist(), dtype=torch.int32, device=device
+        [0, *torch.tensor(seq_lens).cumsum(0).tolist()], dtype=torch.int32, device=device
     )
     cache_indices = torch.arange(1, batch + 1, dtype=torch.int32, device=device)
     # Mix cached and fresh sequences: only the cached ones read conv_state first.
