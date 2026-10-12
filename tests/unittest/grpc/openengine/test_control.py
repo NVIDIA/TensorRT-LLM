@@ -673,9 +673,7 @@ async def test_server_info_disables_dp_rank_targeting_with_conversation_affinity
         enable_attention_dp=False,
         attention_dp_config=SimpleNamespace(kv_cache_routing_conversation_affinity=True),
     )
-    info = await without_adp.GetServerInfo(
-        server_pb2.GetServerInfoRequest(), FakeServicerContext()
-    )
+    info = await without_adp.GetServerInfo(server_pb2.GetServerInfoRequest(), FakeServicerContext())
     assert info.extra["trtllm_supports_subagent_affinity"] is False
 
 

@@ -119,8 +119,8 @@ from .sampler import (AsyncWorkerMixin, Sampler, SamplerEvent, SampleState,
 from .scheduler import (RequestScheduler, ScheduledRequests,
                         SerializableSchedulerOutput, WaitingQueue,
                         create_waiting_queue)
-from .scheduler.adp_router import (ADPRouter, RankIterStatsPayload,
-                                   RankState, count_retiring_requests)
+from .scheduler.adp_router import (ADPRouter, RankIterStatsPayload, RankState,
+                                   count_retiring_requests)
 from .scheduler.scheduler import RemoteTailPhase
 from .scheduler.scheduler_v2 import KVCacheV2Scheduler
 
@@ -6530,8 +6530,10 @@ class PyExecutor:
                 if iter_stats_payload is None:
                     iter_stats_payload = RankIterStatsPayload()
                 iter_stats_payload.kv_used_blocks = load_sample["usedKvBlocks"]
-                iter_stats_payload.kv_total_blocks = load_sample["totalKvBlocks"]
-                iter_stats_payload.kv_load_timestamp_ns = load_sample["timestampUnixNanos"]
+                iter_stats_payload.kv_total_blocks = load_sample[
+                    "totalKvBlocks"]
+                iter_stats_payload.kv_load_timestamp_ns = load_sample[
+                    "timestampUnixNanos"]
             if getattr(self, "_enable_remote_tail_adp", False):
                 context_ids, generation_ids = self._snapshot_remote_tail_phase_work(
                     active_requests)
