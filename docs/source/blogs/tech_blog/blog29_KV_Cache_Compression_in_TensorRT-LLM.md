@@ -182,14 +182,7 @@ In this section, we walk through the two KV cache compression methods currently 
 
 Pages that leave the GPU are the cheapest place to compress: they are being copied anyway, nothing reads them while they are cold, and only the pages pushed out by memory pressure are touched. Compression therefore happens only under pressure and never on the whole cache, which makes it **far friendlier to accuracy** than compressing every page on every step. Cold-page compression stores attention KV pages as NVFP4 while they sit in host or disk memory and keeps the model's normal data type, FP16, BF16 or FP8, on the GPU. The attention kernels never see the compressed form. To try it, see the [NVFP4 cold-page example](https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/kv_cache_compression/nvfp4_cold_page.md).
 
-NVFP4 is NVIDIA's 4-bit floating-point format: 4-bit values (E2M1) with one 8-bit (E4M3) scale per 16 values, 4.5 bits per value on average, the same format TensorRT LLM uses for weights and for the active KV cache. Applying it to cold pages buys four things:
-
-- **Accuracy-friendly**: only pages that go cold are rounded, once; everything on the GPU stays at full precision.
-- **Free transfer**: the encode runs inside the copy that moves the page, so there is no extra pass over the data.
-- **Fewer bytes to move**: a page shrinks to 4.5 bits per value, from 8 or 16, on its way across PCIe and the storage link.
-- **One payload per page**: data, scales and lossless buffers are packed in one fixed-size block with one base address, so the tiers address it like any other page.
-
-Figure 6 compares the three layouts of one KV page.
+NVFP4 is NVIDIA's 4-bit floating-point format: 4-bit values (E2M1) with one 8-bit (E4M3) scale per 16 values, 4.5 bits per value on average, the same format TensorRT LLM uses for weights and for the active KV cache. Applied to cold pages it shrinks a page from 8 or 16 bits per value to 4.5, so fewer bytes cross PCIe and the storage link, and the data, scales and lossless buffers of a page are packed into one fixed-size block that the tiers address like any other page. Figure 6 compares the three layouts of one KV page.
 
 <div align="center">
 <figure>
@@ -200,7 +193,7 @@ Figure 6 compares the three layouts of one KV page.
 
 #### How It Works in TensorRT LLM
 
-Cold-page compression is a compression manager on the cross-request path, enabled with `algorithm: quantization_for_cold_page` and `quant: nvfp4`. Figure 7 follows one page out of the GPU and back.
+Within TensorRT LLM, cold-page compression is a compression manager on the cross-request path, enabled with `algorithm: quantization_for_cold_page` and `quant: nvfp4`. Below we highlight the encode and decode path, the handling of position-encoded values, and the kernel design; Figure 7 follows one page out of the GPU and back.
 
 **Encode, on the way out.** When `KVCacheManagerV2` offloads pages, it hands the codec a batch of page indices and a stream. A fused kernel reads the GPU pages, computes the block scales, quantizes, and writes the packed cold pages straight into the host slots, so quantization and transfer are one pass and no calibration is needed. Which buffers are quantized is decided once at start-up from the page layout: the attention K and V buffers, and for an MLA layer the latent key. Everything else in the page is copied as it is: recurrent and convolution state of hybrid layers and the index buffer of DeepSeek Sparse Attention.
 
