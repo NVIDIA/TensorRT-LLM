@@ -1622,13 +1622,12 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_device(2)
     def test_gen_first_with_block_reuse(self):
-        """Gen-first V2 smoke test with block reuse and no partial reuse."""
+        """Gen-first default V2 test with block reuse and no partial reuse."""
         transceiver_runtime = "PYTHON"
         transceiver_backend = "NIXL"
         kv_cache_config = {
             "enable_block_reuse": True,
             "enable_partial_reuse": False,
-            "use_kv_cache_manager_v2": True,
         }
         ctx_server_config = {
             "disable_overlap_scheduler": True,
@@ -1793,11 +1792,9 @@ class TestGPTOSS20B(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_device(2)
     def test_beam_search(self):
         max_beam_width = 2
-        kv_cache_config = {"use_kv_cache_manager_v2": True}
         ctx_server_config = {
             "disable_overlap_scheduler": True,
             "max_beam_width": max_beam_width,
-            "kv_cache_config": kv_cache_config,
             "cache_transceiver_config": {
                 "backend": "NIXL",
                 "transceiver_runtime": "PYTHON",
@@ -1807,7 +1804,6 @@ class TestGPTOSS20B(LlmapiAccuracyTestHarness):
         gen_server_config = {
             "disable_overlap_scheduler": True,
             "max_beam_width": max_beam_width,
-            "kv_cache_config": kv_cache_config,
             "cache_transceiver_config": {
                 "backend": "NIXL",
                 "transceiver_runtime": "PYTHON",
