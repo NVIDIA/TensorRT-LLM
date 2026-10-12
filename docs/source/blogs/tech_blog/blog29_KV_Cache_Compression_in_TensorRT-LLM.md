@@ -112,9 +112,14 @@ For seamless and precise insertion, we define **five stages in the life of a KV 
 </div>
 <p align="center"><sub><em>Figure 3: Five stages in the life of a KV cache where compression can run. TriAttention acts at the decode stage (stage 3) and cold-page compression at the after-request stage (stage 5). The dashed stages are in scope and have no method yet.</em></sub></p>
 
-Methods reach these stages through **two integration paths**. Iteration-driven methods run between model iterations, from the executor loop, and change the retained KV state. Storage-bound methods run when the cache manager moves a page between the GPU and host or disk memory, and change how the page is stored while it is cold. A method uses one path or both. In both the **cache manager keeps ownership of every page** and the method only changes its contents.
+Methods reach these stages through two integration paths:
 
-A method is selected with one block, `kv_cache_compression_config`, kept separate from the KV cache configuration (capacity, tiers, reuse, data type) and from the sparse attention configuration. One method is active per LLM instance, and it must handle every cache layout it is given or pass through what it does not understand.
+- **Iteration-driven**: runs between model iterations, from the executor loop, and changes the retained KV state.
+- **Storage-bound**: runs when the cache manager moves a page between the GPU and host or disk memory, and changes how the page is stored while it is cold.
+
+A method uses one path or both. In both the cache manager keeps ownership of every page; the method only changes their contents.
+
+A method is selected via `kv_cache_compression_config`, separate from the KV cache config and the sparse attention config. One method can be active per LLM instance.
 
 ### Architecture Overview
 
