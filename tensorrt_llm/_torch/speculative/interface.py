@@ -449,16 +449,22 @@ class SpeculativeDecodingMode(IntEnum):
 
 
 # Philox seed for requests that did not set ``SamplingParams.seed``. Fixed
-# rather than advanced per step so a run is reproducible: a request's stream is
-# separated from other rows' by the kernel's per-row subsequence and from every
-# other unseeded request's, past or present, by the offset (see
-# ``SpecMetadata._rng_window_counter``), which leaves the seed free to be a
+# rather than advanced per step so a run is reproducible: a row's stream is
+# separated from every other row's -- its own request's other rows, and every
+# other unseeded request's, past or present -- by the offset (see
+# ``SpecMetadata._take_rng_window_offsets``), which leaves the seed free to be a
 # constant.
 DEFAULT_SAMPLING_SEED = 42
 
 # Key in ``SpecMetadata._rng_window_counter`` for the window counter shared by
 # all unseeded requests. A string so it cannot collide with a slot id.
 _UNSEEDED_RNG_WINDOW_KEY = "unseeded"
+
+# Philox offsets between consecutive slots of an offset window. The fused
+# kernel needs only distinct offsets, but the flashinfer ops and the acceptance
+# kernels read a single offset and draw several values per row from it, so each
+# slot leaves them room before the next one starts.
+_RNG_SLOT_SPAN = 32
 
 
 @dataclass
@@ -647,10 +653,9 @@ class SpecMetadata:
     # step counter -- keeps a seeded request reproducible regardless of which
     # batch it lands in.
     #
-    # NB: the pinned flashinfer reads only element 0 of each tensor, separating
-    # rows by blockIdx.x, so these per-row values are carried end-to-end but
-    # not yet honored per request. See
-    # https://github.com/flashinfer-ai/flashinfer/pull/2345.
+    # The fused kernel honors these per row. The flashinfer ops behind the
+    # non-fused advanced sampling modes, and the acceptance kernel, read only
+    # element 0.
     request_seeds: Optional[torch.Tensor] = None
     request_offsets: Optional[torch.Tensor] = None
     # Count of RNG windows already handed out. Seeded requests are counted per
@@ -674,16 +679,16 @@ class SpecMetadata:
     # A slot's counter is reset when a different request takes the slot over
     # (see ``_rng_slot_owner``), so a seeded request always starts at the
     # beginning of its stream: with a fixed seed it reproduces bit-exactly
-    # regardless of which slot it lands on or that slot's history. (Batch
-    # composition can still perturb it, because the kernel's per-row
-    # subsequence follows the batch row.)
+    # regardless of which slot it lands on or that slot's history.
     #
     # Unseeded requests all share DEFAULT_SAMPLING_SEED, so a per-slot counter
     # would give two requests on never-used slots the same (seed, offset) and
     # hence the same tokens whenever they also share a batch row. SlotManager
     # hands serial requests a fresh slot each time, so that is the common
     # low-concurrency case. The shared counter guarantees every unseeded
-    # request an offset window no earlier request has used.
+    # request an offset window no earlier request has used, and it counts from
+    # UNSEEDED_OFFSET_BASE so that a user seed equal to DEFAULT_SAMPLING_SEED
+    # does not replay those windows either.
     _rng_window_counter: dict = field(default_factory=dict)
     # seq_slot -> py_request_id mapping to track offset slot ownership.
     _rng_slot_owner: dict = field(default_factory=dict)
@@ -768,12 +773,31 @@ class SpecMetadata:
         self.context_prompt_lookahead_tokens[:num_contexts].copy_(
             tokens_cpu, non_blocking=True)
 
+    @property
+    def _rng_target_slots(self) -> int:
+        return (self.max_total_draft_tokens +
+                1 if self.is_spec_dec_tree else self.max_draft_len + 1)
+
+    def rng_draft_slot(self, draft_step: int) -> int:
+        """Window slot of a draft launch, or of a block sampler's first row."""
+        return self._rng_target_slots + draft_step
+
+    @property
+    def rng_accept_slot(self) -> int:
+        """Window slot of the acceptance kernel."""
+        return self._rng_target_slots + self.max_draft_len
+
     def _take_rng_window_offsets(self, requests: list["LlmRequest"],
                                  seeded: list[bool]) -> list[int]:
         """
         Hand each request the base of a fresh Philox offset window.
+
+        A window holds one ``_RNG_SLOT_SPAN``-wide slot per row the request
+        samples in a step: its target rows first, then its draft steps, then
+        the acceptance kernel. Distinct slots are what keep those rows' draws
+        apart.
         """
-        window = self.max_draft_len + 1
+        window = (self.rng_accept_slot + 1) * _RNG_SLOT_SPAN
         offsets: list[int] = []
         for request, is_seeded in zip(requests, seeded):
             # Dummy/padding requests (no slot) never have their output kept;
@@ -787,11 +811,13 @@ class SpecMetadata:
                 if self._rng_slot_owner.get(key) != request.py_request_id:
                     self._rng_slot_owner[key] = request.py_request_id
                     self._rng_window_counter[key] = 0
+                base = 0
             else:
                 key = _UNSEEDED_RNG_WINDOW_KEY
+                base = fused_sampling.UNSEEDED_OFFSET_BASE
             step = self._rng_window_counter.get(key, 0)
             self._rng_window_counter[key] = step + 1
-            offsets.append(step * window)
+            offsets.append(base + step * window)
         return offsets
 
     def _populate_request_rng_state(
@@ -813,12 +839,11 @@ class SpecMetadata:
         take one or the other.
 
         A request that specified no seed gets ``DEFAULT_SAMPLING_SEED`` and an
-        offset window from the counter shared by all unseeded requests. Its
-        stream is then separated from the other rows' by the kernel's per-row
-        subsequence and from every other unseeded request's, including its own
-        earlier steps, by the offset -- so unseeded requests sample
-        independently of each other, just reproducibly for a given traffic
-        history.
+        offset window from the counter shared by all unseeded requests. Each of
+        its rows takes its own slot of that window, so its streams are separated
+        from each other and from every other unseeded request's, including its
+        own earlier steps -- unseeded requests sample independently of each
+        other, just reproducibly for a given traffic history.
         """
         from tensorrt_llm._torch.pyexecutor.sampler.sampler_common import \
             request_random_seed
@@ -837,7 +862,8 @@ class SpecMetadata:
         for seed, offset, num_tokens in zip(request_seeds, request_offsets,
                                             num_tokens_per_request):
             flat_seeds.extend(seed for _ in range(num_tokens))
-            flat_offsets.extend(offset for _ in range(num_tokens))
+            flat_offsets.extend(offset + row * _RNG_SLOT_SPAN
+                                for row in range(num_tokens))
 
         # A batch wider than the buffers would silently truncate the copies
         # below, so assert rather than grow: CUDA graph batch sizes are already
@@ -2382,13 +2408,12 @@ class SpecWorkerBase(nn.Module, ABC):
         min_ps = spec_metadata.request_min_ps[:batch_size]
 
         # One row per request here, matching the request_* slices above.
-        # Slot 0 of the step's offset window belongs to the target sampler, so
-        # draft step i takes 1 + i. Callers that do not pass a draft_step run
-        # this sampler once per step and take the first draft slot.
-        seed, offset = self._rng_state_per_request(spec_metadata,
-                                                   end=batch_size,
-                                                   step_offset=1 +
-                                                   (draft_step or 0))
+        # Callers that do not pass a draft_step run this sampler once per step
+        # and take the first draft slot.
+        seed, offset = self._rng_state_per_request(
+            spec_metadata,
+            end=batch_size,
+            slot=spec_metadata.rng_draft_slot(draft_step or 0))
         if spec_metadata.use_rejection_sampling and draft_step is not None:
             # The proposal stored below is read back by next iteration's
             # rejection kernel, so a padding row must not poison it either.
@@ -2678,9 +2703,12 @@ class SpecWorkerBase(nn.Module, ABC):
 
             full_draft_tokens = draft_tokens.to(torch.int32).contiguous()
 
-            # One entry per gen request; slot 0 of the step's offset window.
-            seed, offset = self._rng_state_per_request(spec_metadata,
-                                                       num_contexts, batch_size)
+            # One entry per gen request.
+            seed, offset = self._rng_state_per_request(
+                spec_metadata,
+                num_contexts,
+                batch_size,
+                slot=spec_metadata.rng_accept_slot)
 
             gen_accepted, gen_num_accepted = rejection_sampling_one_model(
                 draft_probs=full_draft_probs,
@@ -2724,7 +2752,8 @@ class SpecWorkerBase(nn.Module, ABC):
         start: int = 0,
         end: Optional[int] = None,
         repeat: int = 1,
-        step_offset: int = 0,
+        *,
+        slot: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Philox (seed, offset) laid out one entry per request row.
 
@@ -2732,21 +2761,20 @@ class SpecWorkerBase(nn.Module, ABC):
         the gen slice); ``repeat`` expands each request to the ``K`` rows a
         block sampler flattens it into.
 
-        ``step_offset`` picks a slot inside this decoding step's offset window
-        (see ``_populate_request_rng_state``). The target sampler and the
-        rejection kernel leave it at 0; the draft loop passes ``1 +
-        draft_step`` so each of its launches draws a distinct stream -- with a
-        fixed user seed the offset is the only thing separating them, since
-        every draft launch restarts the kernel's per-row subsequence at 0.
-
+        ``slot`` picks the slot of this step's offset window the rows draw from
+        (see ``SpecMetadata._take_rng_window_offsets``); the ``repeat`` rows of
+        one request take consecutive slots from there.
         """
         seeds = spec_metadata.request_seeds[start:end]
-        offsets = spec_metadata.request_offsets[start:end]
-        if step_offset:
-            offsets = offsets + step_offset
+        offsets = (spec_metadata.request_offsets[start:end] +
+                   slot * _RNG_SLOT_SPAN)
         if repeat > 1:
             seeds = seeds.repeat_interleave(repeat)
-            offsets = offsets.repeat_interleave(repeat)
+            row_slots = torch.arange(repeat,
+                                     dtype=torch.int64,
+                                     device=offsets.device)
+            offsets = (offsets.repeat_interleave(repeat) +
+                       row_slots.repeat(offsets.numel()) * _RNG_SLOT_SPAN)
         return seeds, offsets
 
     def _rng_state_per_token(
@@ -2892,14 +2920,17 @@ class SpecWorkerBase(nn.Module, ABC):
             num_contexts:batch_size].repeat_interleave(K)
 
         flat_logits = gen_logits.reshape(num_gens * K, vocab)
-        # A block sampler emits all K draft positions in one launch, so the
-        # kernel's per-row subsequence already separates them and they share
-        # the first draft slot of the step's offset window.
-        seed, offset = self._rng_state_per_request(spec_metadata,
-                                                   num_contexts,
-                                                   batch_size,
-                                                   repeat=K,
-                                                   step_offset=1)
+        # A block sampler emits all K draft positions in one launch; they take
+        # the step's K draft slots.
+        assert K <= spec_metadata.max_draft_len, (
+            f"{K} draft rows per request exceed max_draft_len="
+            f"{spec_metadata.max_draft_len}")
+        seed, offset = self._rng_state_per_request(
+            spec_metadata,
+            num_contexts,
+            batch_size,
+            repeat=K,
+            slot=spec_metadata.rng_draft_slot(0))
 
         if getattr(spec_metadata, "use_rejection_sampling", False):
             flat_logits = self._zero_padding_rows(flat_logits, spec_metadata,
