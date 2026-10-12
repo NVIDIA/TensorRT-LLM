@@ -28,6 +28,7 @@ set(TRTLLM_FMHA_PARAMS_GENERATOR
     "${TRTLLM_REPO_ROOT_DIR}/scripts/generate_fmha_params.py")
 set(TRTLLM_FMHA_PARAMS_SCHEMAS
     "${TRTLLM_REPO_ROOT_DIR}/tensorrt_llm/_torch/attention/backends/fmha/interface.py"
+    "${TRTLLM_REPO_ROOT_DIR}/tensorrt_llm/_torch/attention/backends/fmha/fallback.py"
     "${TRTLLM_REPO_ROOT_DIR}/tensorrt_llm/_torch/attention/backends/interface.py"
     "${TRTLLM_REPO_ROOT_DIR}/tensorrt_llm/_torch/attention/backends/sparse/params.py"
 )

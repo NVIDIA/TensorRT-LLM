@@ -44,6 +44,7 @@ NATIVE_STRUCT_NAMES = (
 
 DEFAULT_MODULE_PATHS = (
     REPO_ROOT / "tensorrt_llm" / "_torch" / "attention" / "backends" / "fmha" / "interface.py",
+    REPO_ROOT / "tensorrt_llm" / "_torch" / "attention" / "backends" / "fmha" / "fallback.py",
     REPO_ROOT / "tensorrt_llm" / "_torch" / "attention" / "backends" / "interface.py",
     REPO_ROOT / "tensorrt_llm" / "_torch" / "attention" / "backends" / "sparse" / "params.py",
 )

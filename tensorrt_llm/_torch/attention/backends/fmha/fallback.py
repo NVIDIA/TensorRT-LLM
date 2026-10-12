@@ -13,9 +13,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from dataclasses import fields
+from __future__ import annotations
+
+from dataclasses import dataclass, fields
 from threading import Thread, current_thread
-from typing import TYPE_CHECKING, ClassVar, Mapping, Optional
+from typing import TYPE_CHECKING, Any, ClassVar, Mapping, Optional
 
 import torch
 from torch.utils.weak import WeakTensorKeyDictionary
@@ -34,7 +36,7 @@ from tensorrt_llm.logger import logger
 
 from ..sparse.params import SparseRuntimeParams
 from . import interface
-from .interface import FmhaPhase, StaticAttentionConfig, build_op_params
+from .interface import FmhaPhase, build_op_params
 from .phased import FmhaParams, PhasedFmha
 from .utils import get_multi_ctas_kv_counter
 
@@ -43,6 +45,224 @@ if TYPE_CHECKING:
         TrtllmAttention,
         TrtllmAttentionMetadata,
     )
+    from tensorrt_llm.functional import PositionEmbeddingType
+    from tensorrt_llm.quantization.mode import QuantMode
+
+
+@dataclass(kw_only=True, slots=True, frozen=True)
+class StaticAttentionConfig:
+    """The attention-layer configuration used to build native kernel runners."""
+
+    num_heads: int = 0
+    num_kv_heads: int = 0
+    head_size: int = 0
+    tokens_per_block: int = 0
+    type: DataType = None
+    is_fp8_out: bool = False
+    is_fp4_out: bool = False
+    use_kv_cache: bool = False
+    paged_context_fmha: bool = False
+    position_embedding_type: PositionEmbeddingType = 0
+    mask_type: AttentionMaskType = 1
+    q_scaling: float = 1.0
+    rotary_embedding_dim: int = 0
+    attn_logit_softcapping_scale: float = 0.0
+    remove_padding: bool = True
+    cross_attention: bool = False
+    dense_context_fmha: bool = False
+    fuses_dsv4_inv_rope_fp8_quant: bool = False
+    use_sparse_attention: bool = False
+    uses_spcompress: bool = False
+    use_tllm_gen_sparse_attention: bool = False
+    use_nvfp4_mla_kv_cache: bool = False
+    is_spec_decoding_enabled: bool = False
+    spec_decoding_target_max_gen_len: int = 0
+    is_mla_enable: bool = False
+    q_lora_rank: int = 0
+    kv_lora_rank: int = 0
+    qk_nope_head_dim: int = 0
+    qk_rope_head_dim: int = 0
+    v_head_dim: int = 0
+    predicted_tokens_per_seq: int = 1
+    mla_layer_num: int = 0
+    rope_append: bool = True
+    sage_attn_num_elts_per_blk_q: int = 0
+    sage_attn_num_elts_per_blk_k: int = 0
+    sage_attn_num_elts_per_blk_v: int = 0
+    sage_attn_qk_int8: bool = False
+    sage_attn_smooth_k: bool = False
+    quant_mode: QuantMode = 0
+    skip_correction_threshold: float = 0.0
+
+    @classmethod
+    def from_params(
+        cls,
+        params: FmhaParams,
+        *,
+        skip_correction_threshold: float = 0.0,
+    ) -> StaticAttentionConfig:
+        """Capture the runner configuration from the layer and per-call parameters."""
+        from tensorrt_llm._utils import torch_dtype_to_binding
+        from tensorrt_llm.quantization.mode import QuantMode
+
+        attn, meta, fwd = params.attn, params.meta, params.fwd
+        if fwd is None:
+            raise RuntimeError("StaticAttentionConfig requires forward args.")
+        if params.output is None:
+            raise RuntimeError("StaticAttentionConfig requires output.")
+        query = params.qkv_input if params.qkv_input is not None else params.query_input
+        if query is None:
+            raise RuntimeError("StaticAttentionConfig requires qkv_input or query_input.")
+
+        quant_mode = QuantMode(attn.quant_mode)
+        sparse = fwd.sparse_runtime_params
+        has_sparse_attn_indices = (
+            sparse.sparse_attn_indices is not None and sparse.sparse_attn_indices.numel() > 0
+        )
+        has_sparse_attention = (
+            sparse.sparse_kv_indices is not None and sparse.sparse_kv_indices.numel() > 0
+        ) or has_sparse_attn_indices
+        has_paged_sparse_attention = (
+            has_sparse_attn_indices
+            and sparse.sparse_attn_offsets is not None
+            and sparse.sparse_attn_offsets.numel() > 0
+        )
+        use_tllm_gen_sparse_attention = has_sparse_attn_indices and not has_paged_sparse_attention
+        pool_mapping = meta.host_kv_cache_pool_mapping
+        use_kv_cache = (
+            meta.kv_cache_block_offsets is not None
+            and meta.host_kv_cache_pool_pointers is not None
+            and pool_mapping is not None
+        )
+        target_max_gen_len = 0
+        if meta.max_total_draft_tokens is not None:
+            target_max_gen_len = meta.max_total_draft_tokens + 1
+
+        return cls(
+            num_heads=attn.num_heads,
+            num_kv_heads=attn.num_kv_heads,
+            head_size=attn.head_dim,
+            tokens_per_block=params.tokens_per_block,
+            type=torch_dtype_to_binding(query.dtype),
+            is_fp8_out=params.output.dtype == torch.float8_e4m3fn,
+            is_fp4_out=params.output.dtype == torch.uint8,
+            use_kv_cache=use_kv_cache,
+            paged_context_fmha=meta.use_paged_context_fmha,
+            position_embedding_type=attn.position_embedding_type,
+            mask_type=fwd.mask_type,
+            q_scaling=attn.q_scaling,
+            rotary_embedding_dim=attn.rope_params.dim if attn.rope_params is not None else 0,
+            cross_attention=params.is_cross,
+            fuses_dsv4_inv_rope_fp8_quant=fwd.enable_dsv4_epilogue_fusion,
+            use_sparse_attention=has_sparse_attention,
+            uses_spcompress=attn.uses_spcompress,
+            use_tllm_gen_sparse_attention=use_tllm_gen_sparse_attention,
+            use_nvfp4_mla_kv_cache=(
+                quant_mode.has_fp4_kv_cache()
+                and use_tllm_gen_sparse_attention
+                and sparse.sparse_attn_kv_lens is None
+                and sparse.aux_kv_cache_pool_ptr is not None
+            ),
+            is_spec_decoding_enabled=meta.is_spec_decoding_enabled,
+            spec_decoding_target_max_gen_len=target_max_gen_len,
+            is_mla_enable=attn.is_mla_enable,
+            q_lora_rank=attn.q_lora_rank or 0,
+            kv_lora_rank=attn.kv_lora_rank or 0,
+            qk_nope_head_dim=attn.qk_nope_head_dim or 0,
+            qk_rope_head_dim=attn.qk_rope_head_dim or 0,
+            v_head_dim=attn.v_head_dim or 0,
+            predicted_tokens_per_seq=attn.predicted_tokens_per_seq,
+            mla_layer_num=pool_mapping.size(0) if pool_mapping is not None else 0,
+            rope_append=attn.rope_append is not False,
+            sage_attn_num_elts_per_blk_q=fwd.sage_attn_num_elts_per_blk_q,
+            sage_attn_num_elts_per_blk_k=fwd.sage_attn_num_elts_per_blk_k,
+            sage_attn_num_elts_per_blk_v=fwd.sage_attn_num_elts_per_blk_v,
+            sage_attn_qk_int8=fwd.sage_attn_qk_int8,
+            sage_attn_smooth_k=fwd.sage_attn_smooth_k,
+            quant_mode=quant_mode,
+            skip_correction_threshold=skip_correction_threshold,
+        )
+
+    @classmethod
+    def from_legacy_arguments(cls, arguments: Mapping[str, Any]) -> StaticAttentionConfig:
+        """Build the config for the flat compatibility entry point."""
+        from tensorrt_llm._utils import torch_dtype_to_binding
+        from tensorrt_llm.quantization.mode import QuantMode
+
+        def arg(name: str, default: Any = None) -> Any:
+            value = arguments.get(name, default)
+            return default if value is None else value
+
+        quant_mode = QuantMode(arg("quant_mode", 0))
+        attn_indices = arg("sparse_attn_indices")
+        has_attn_indices = attn_indices is not None and attn_indices.numel() > 0
+        kv_indices = arg("sparse_kv_indices")
+        attn_offsets = arg("sparse_attn_offsets")
+        use_tllm_gen_sparse = has_attn_indices and not (
+            attn_offsets is not None and attn_offsets.numel() > 0
+        )
+        pool_mapping = arg("host_kv_cache_pool_mapping")
+        target_max_draft_tokens = arg("spec_decoding_target_max_draft_tokens")
+        output = arguments["output"]
+        return cls(
+            num_heads=arg("num_heads", 0),
+            num_kv_heads=arg("num_kv_heads", 0),
+            head_size=arg("head_size", 0),
+            tokens_per_block=arg("tokens_per_block", 0),
+            position_embedding_type=arg("position_embedding_type", 0),
+            mask_type=arg("mask_type", 1),
+            q_scaling=arg("q_scaling", 1.0),
+            is_spec_decoding_enabled=arg("is_spec_decoding_enabled", False),
+            is_mla_enable=arg("is_mla_enable", False),
+            q_lora_rank=arg("q_lora_rank", 0),
+            kv_lora_rank=arg("kv_lora_rank", 0),
+            qk_nope_head_dim=arg("qk_nope_head_dim", 0),
+            qk_rope_head_dim=arg("qk_rope_head_dim", 0),
+            v_head_dim=arg("v_head_dim", 0),
+            predicted_tokens_per_seq=arg("predicted_tokens_per_seq", 1),
+            rope_append=arg("rope_append", True),
+            sage_attn_num_elts_per_blk_q=arg("sage_attn_num_elts_per_blk_q", 0),
+            sage_attn_num_elts_per_blk_k=arg("sage_attn_num_elts_per_blk_k", 0),
+            sage_attn_num_elts_per_blk_v=arg("sage_attn_num_elts_per_blk_v", 0),
+            sage_attn_qk_int8=arg("sage_attn_qk_int8", False),
+            sage_attn_smooth_k=arg("sage_attn_smooth_k", False),
+            skip_correction_threshold=arg("skip_correction_threshold", 0.0),
+            uses_spcompress=arg("uses_spcompress", False),
+            type=torch_dtype_to_binding(arguments["q"].dtype),
+            is_fp8_out=output.dtype == torch.float8_e4m3fn,
+            is_fp4_out=output.dtype == torch.uint8,
+            use_kv_cache=(
+                arg("kv_cache_block_offsets") is not None
+                and arg("host_kv_cache_pool_pointers") is not None
+                and pool_mapping is not None
+            ),
+            paged_context_fmha=bool(arg("use_paged_context_fmha", False)),
+            rotary_embedding_dim=int(arg("rope_dim", 0)),
+            spec_decoding_target_max_gen_len=(
+                target_max_draft_tokens + 1 if target_max_draft_tokens is not None else 0
+            ),
+            cross_attention=bool(arg("is_cross", False)),
+            fuses_dsv4_inv_rope_fp8_quant=bool(arg("enable_dsv4_epilogue_fusion", False)),
+            use_sparse_attention=(kv_indices is not None and kv_indices.numel() > 0)
+            or has_attn_indices,
+            use_tllm_gen_sparse_attention=use_tllm_gen_sparse,
+            use_nvfp4_mla_kv_cache=(
+                quant_mode.has_fp4_kv_cache()
+                and use_tllm_gen_sparse
+                and arg("sparse_attn_kv_lens") is None
+                and arg("aux_kv_cache_pool_ptr") is not None
+            ),
+            mla_layer_num=pool_mapping.size(0) if pool_mapping is not None else 0,
+            quant_mode=quant_mode,
+        )
+
+    def to_thop_config(self) -> Any:
+        """Build the native constructor configuration."""
+        from tensorrt_llm.bindings.internal import thop
+
+        target = thop.StaticAttentionConfig()
+        build_op_params(target, self)
+        return target
 
 
 class _AttentionOpCache:
