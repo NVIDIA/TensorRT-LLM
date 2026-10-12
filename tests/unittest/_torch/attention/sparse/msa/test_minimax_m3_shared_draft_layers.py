@@ -66,11 +66,16 @@ DRAFT_K_ADDR = 0x7000_0000
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA cache pools")
+@pytest.mark.parametrize("setting", ["0", "1"])
 def test_nvfp4_shared_draft_constructs_and_converts_heterogeneous_page_tables(
     monkeypatch: pytest.MonkeyPatch,
+    setting: str,
 ) -> None:
     """Exercise real pool allocation, the draft page table and the resolved cache views."""
     torch.cuda.init()
+    if setting == "0" and not prefer_pinned():
+        pytest.skip("native host-reading kernel requires GPU-addressable host memory")
+    monkeypatch.setenv(_DEVICE_PAGE_TABLE_ENV, setting)
     manager = MiniMaxM3KVCacheManagerV2(
         KvCacheConfig(
             max_gpu_total_bytes=16 << 20,
@@ -126,7 +131,7 @@ def test_nvfp4_shared_draft_constructs_and_converts_heterogeneous_page_tables(
         )
 
         # One device copy converts the draft layer's slot ids to P128 pages.
-        copy_idx = torch.tensor([0, 1], dtype=torch.int32, pin_memory=True)
+        copy_idx = torch.tensor([0, 1], dtype=torch.int32, pin_memory=prefer_pinned())
         monkeypatch.setattr(
             manager,
             "index_mapper",
@@ -134,12 +139,15 @@ def test_nvfp4_shared_draft_constructs_and_converts_heterogeneous_page_tables(
         )
         device_copy = Mock(wraps=m3_cache_manager.copy_batch_block_offsets_to_device)
         monkeypatch.setattr(m3_cache_manager, "copy_batch_block_offsets_to_device", device_copy)
+        monkeypatch.setattr(kv_cache_manager_v2, "copy_batch_block_offsets_to_device", device_copy)
         draft_output = torch.full(
             (1, 2, 2, draft.max_blocks_per_seq), -7, dtype=torch.int32, device="cuda"
         )
         draft.copy_batch_block_offsets(draft_output, [101, 102], 1, 0, 2)
         torch.cuda.synchronize()
         device_copy.assert_called_once()
+        source, _, indices, scales, offsets, _ = device_copy.call_args.args
+        assert all(t.is_cuda == (setting == "1") for t in (source, indices, scales, offsets))
         converter = manager.impl.get_page_index_converter(4, Role.KEY)
         for row, slot in enumerate((2, 5)):
             expected_k = converter([slot] * draft.max_blocks_per_seq, PageIndexMode.SHARED)
@@ -318,6 +326,8 @@ def test_shared_draft_page_tables_use_real_materialization(
     manager.is_draft = False
     manager.enable_swa_scratch_reuse = False
     manager.tokens_per_block = 128
+    manager.max_copy_beam_width = 1
+    manager.kv_cache_type = CacheType.SELF
     manager._prepare_page_table_tensor(4)
     assert manager._draft_op_pools == ((1, 0), (2, 0))
     assert len(manager._draft_page_table_materializers) == (2 if setting == "1" else 0)
@@ -326,7 +336,9 @@ def test_shared_draft_page_tables_use_real_materialization(
     # reread the live source instead of reusing the preceding batch's rows.
     for request_ids in ([2, 0], [1]):
         copy_idx = torch.tensor(request_ids, dtype=torch.int32, pin_memory=pin)
-        manager.index_mapper = SimpleNamespace(get_copy_index=lambda ids, nc, bw: copy_idx)
+        manager.index_mapper = SimpleNamespace(
+            get_copy_index=lambda ids, nc, bw, replicate_beam_zero=False: copy_idx
+        )
         output = torch.full((3, 4, 2, 8), -12345, dtype=torch.int32, device="cuda")
         manager.copy_batch_block_offsets(output, request_ids, 1, 0, len(request_ids))
         stream.synchronize()
