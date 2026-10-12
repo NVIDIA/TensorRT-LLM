@@ -11,7 +11,8 @@ from typing import Optional, Tuple
 import torch
 
 import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtllm.*
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+
+from .._op import Arch, Cell, OpWrapper
 
 #: NVFP4 block size: one e4m3 scale per 16 elements along K.
 SF_VEC_SIZE = 16
@@ -51,6 +52,68 @@ _E2M1_VALUES = (
 
 #: One expert stack's `(codes, block scales)`, unshuffled and unswizzled.
 Operand = Tuple[torch.Tensor, torch.Tensor]
+
+#: DeepSeek-V4.1-Flash's routed geometry. Every rank passes the whole routing
+#: space (384 experts, top-6) at H = 5120 and the clamped SwiGLU, whatever its
+#: share of the experts or of the intermediate columns.
+_V41 = dict(hidden=5120, num_experts=384, top_k=6, swiglu_limit=10.0)
+
+#: The V4.1 rank forms: (name, local experts, intermediate columns per rank,
+#: ranks). An EP window owns `[r * local, (r + 1) * local)` of the experts at the
+#: full I; a MoE-TP rank owns columns `[r * I_rank, (r + 1) * I_rank)` of every
+#: expert.
+_V41_FORMS = (
+    ("EP4", 96, 2304, 4),
+    ("TP4", 384, 576, 4),
+    ("EP2", 192, 2304, 2),
+    ("TP2", 384, 1152, 2),
+    ("EP8", 48, 2304, 8),
+)
+
+
+def _v41_cell(form: str, rank: int, tokens: int, g2: str, why: str) -> Cell:
+    """One V4.1 cell: `form`'s rank `rank` at `tokens` rows. `g2` is "layer" (one
+    FC2-input global scale in every slot, the target's) or "expert" (`g2[e]`).
+    The decode cells write a caller `output=` buffer, as the target and the
+    CUDA-graph tests' eager calls do; the others return a fresh tensor, as the
+    row-axis sweeps and the per-expert geometry tests ran them."""
+    local, inter = {f[0]: f[1:3] for f in _V41_FORMS + (("full", 384, 2304, 1),)}[form]
+    tp = local == _V41["num_experts"] and form != "full"
+    return Cell(
+        why=why,
+        spec=dict(
+            model="deepseek-v4.1",
+            tokens=tokens,
+            local_expert_offset=0 if tp else rank * local,
+            local_num_experts=local,
+            intermediate=inter,
+            tp_rank=rank if tp else None,
+            g2=g2,
+            output=tokens == 1 and g2 == "layer",
+            **_V41,
+        ),
+    )
+
+
+#: The V4.1 cells: every rank form at its decode row count (1) and at the top
+#: of the target's eager row axis (8192, one full `_moe_chunks` call), on a
+#: different rank at each end, with the layer-level g2 the target passes; then
+#: the per-expert g2 form at the full stack's two ends and on an EP4 window.
+#: The row axis between the ends is the bucket sweeps' in the entry's test.
+_V41_CELLS = tuple(
+    _v41_cell(form, rank, tokens, "layer", f"deepseek-v4.1 {form} rank {rank}, T={tokens}: {what}")
+    for form, local, inter, ranks in _V41_FORMS
+    for rank, tokens, what in (
+        (ranks - 1, 1, f"decode, {local} experts x I={inter}, layer g2"),
+        (0, 8192, "top of the eager row axis, layer g2"),
+    )
+) + (
+    _v41_cell("full", 0, 1, "expert", "deepseek-v4.1 full 384-expert stack, T=1, g2[e] per expert"),
+    _v41_cell(
+        "full", 0, 8192, "expert", "deepseek-v4.1 full 384-expert stack, T=8192, g2[e] per expert"
+    ),
+    _v41_cell("EP4", 1, 1024, "expert", "deepseek-v4.1 EP4 rank 1, T=1024, g2[e] per expert"),
+)
 
 
 def _e2m1_rne(a: torch.Tensor) -> torch.Tensor:
@@ -129,7 +192,7 @@ class Fp4BlockScaleMoeRunner(OpWrapper):
             why="the single-rank shape: all 256 experts local, and one token, the decode row count",
             spec=dict(tokens=1, local_expert_offset=0, local_num_experts=256, **_R1),
         ),
-    )
+    ) + _V41_CELLS
 
     note = """
     Certified pre-routed only: `routing_logits` is `None` at every cell, so the
@@ -149,6 +212,41 @@ class Fp4BlockScaleMoeRunner(OpWrapper):
     checks that, and getting it wrong is 300-3400 bf16 ulp with no error -- the
     entry's test builds the layout twice, once in torch and once through the
     trtllm preprocessing ops, and compares them before either reaches the op.
+
+    DeepSeek-V4.1: every rank passes `num_experts` 384, top-6, H = 5120, pre-routed
+    (`routing_method_type` 1, routing inert), `act_type` 0, `do_finalize=True`,
+    `output=` a caller buffer, bf16 `topk_weights` summing to the routed scale, and
+    one of five rank forms: an EP2 / EP4 / EP8 window (192 / 96 / 48 local experts
+    at offset `r * local`, I = 2304, every weight, scale, scalar and clamp tensor
+    sliced to the window) or a MoE-TP2 / TP4 rank (all 384 experts at offset 0,
+    I = 1152 / 576: columns `[r * I, (r + 1) * I)` of every expert, prepared as a
+    full layer of that width, with the full per-expert scalars and clamp). Two
+    things differ from the R1 cells. The scalars are per expert: with FC1 / FC2
+    weight global scales `gw1[e]`, `gw2[e]` and activation global scales `g1`,
+    `g2`, `output1_scale_gate_scalar[e] = 1 / (g1 * gw1[e])`,
+    `output1_scale_scalar[e] = g2 / (g1 * gw1[e])` and `output2_scale_scalar[e] =
+    1 / (g2 * gw2[e])`. And `gemm1_clamp_limit` is given: it clamps the two FC1
+    accumulators before any scalar (gate from above, up on both sides), so the
+    model's true-domain limit 10 is passed as `10 / output1_scale_gate_scalar[e]`;
+    this is exact only because V4.1's up and gate share a weight global scale.
+    Passing 10 as is, or stacking FC1 `[gate ; up]`, is 256 bf16 ulp RMS wrong with
+    no error; a window issued at offset 0 is 360, scalars shifted by one expert
+    187. The target passes one layer-level `g2` in every slot (a per-expert
+    `1 / w2.input_scale[e]` saturates the FC1-output block scales on the real
+    experts); a per-expert `g2` is certified too. The activation scales must be
+    LINEAR (`fp4_quantize(..., is_sf_swizzled_layout=False)`): the swizzled buffer
+    has the same byte count whenever T is a multiple of 128 and is silently wrong,
+    and no metadata tells the two apart. The certified row axis is 1..8192 per call
+    for every form -- the cells hold its ends; the entry's test sweeps every tuner
+    bucket's edges, both sides of every token-tile and routing kernel change, the
+    engine-dumped counts and dep2 / dep4 / dep8's zero-padding skew in between,
+    cold and autotuned -- and the target cuts larger batches into calls of at most
+    8192 rows. Under CUDA-graph capture each form is certified at its captured
+    counts (`G` and `6G` over the decode batch set, plus a dep member's gathered
+    counts on an EP window, up to 12288 on EP8 as two chunked calls), replay
+    bitwise equal to eager and the tactic fixed at capture; the full 384-expert
+    stack, a per-expert `g2` and counts outside those sets are not certified
+    captured.
     """
 
     def raw_call(
@@ -229,9 +327,12 @@ class Fp4BlockScaleMoeRunner(OpWrapper):
         up: Operand,
         gate: Operand,
         down: Operand,
-        fc2_global_scale: float,
+        fc2_global_scale: float | torch.Tensor,
         local_expert_offset: int = 0,
         local_num_experts: Optional[int] = None,
+        fc1_weight_global_scale: Optional[torch.Tensor] = None,
+        fc2_weight_global_scale: Optional[torch.Tensor] = None,
+        swiglu_limit: Optional[float] = None,
     ) -> torch.Tensor:
         """The layer, in plain torch over dequantized weights, fp32 throughout.
 
@@ -253,6 +354,17 @@ class Fp4BlockScaleMoeRunner(OpWrapper):
         as NVFP4 and FC2's alpha divides it back out. Skipping that step is a
         reference that disagrees with a correct kernel by ~23 ulp RMS, so it is
         not an optional refinement.
+
+        The DeepSeek-V4.1 form adds three things, each absent by default:
+        `fc1_weight_global_scale` / `fc2_weight_global_scale` (`[local]` fp32, the
+        `gw1[e]` / `gw2[e]` each expert's dequantized weight is divided by),
+        `fc2_global_scale` as a `[local]` tensor (one `g2[e]` per expert; the layer-
+        level `g2` is the same value in every slot), and `swiglu_limit`, the
+        true-domain clamp (`gate <= L`, `-L <= up <= L`) applied before the
+        activation. All per-expert tensors are indexed like the weight operands,
+        by local expert. A MoE-TP rank is this computation over its own columns of
+        `up`, `gate` and `down`: its columns start on a multiple of 16, so it
+        requantizes exactly the FC1-output blocks the full layer does.
         """
         num_tokens, hidden = hidden_states.shape
         up_c, up_s = up
@@ -265,11 +377,25 @@ class Fp4BlockScaleMoeRunner(OpWrapper):
             if tok.numel() == 0:
                 continue
             xe = hidden_states[tok]
-            u = xe @ dequantize_nvfp4(up_c[local_e], up_s[local_e]).t()
-            g = xe @ dequantize_nvfp4(gt_c[local_e], gt_s[local_e]).t()
+            w_up = dequantize_nvfp4(up_c[local_e], up_s[local_e])
+            w_gate = dequantize_nvfp4(gt_c[local_e], gt_s[local_e])
+            w_down = dequantize_nvfp4(dn_c[local_e], dn_s[local_e])
+            if fc1_weight_global_scale is not None:
+                w_up = w_up / fc1_weight_global_scale[local_e]
+                w_gate = w_gate / fc1_weight_global_scale[local_e]
+            if fc2_weight_global_scale is not None:
+                w_down = w_down / fc2_weight_global_scale[local_e]
+            g2 = fc2_global_scale
+            if isinstance(g2, torch.Tensor):
+                g2 = float(g2[local_e])
+            u = xe @ w_up.t()
+            g = xe @ w_gate.t()
+            if swiglu_limit is not None:
+                g = torch.clamp(g, max=swiglu_limit)
+                u = torch.clamp(u, min=-swiglu_limit, max=swiglu_limit)
             act = u * g * torch.sigmoid(g)
-            act = quantize_nvfp4(act, fc2_global_scale) / fc2_global_scale
-            y = act @ dequantize_nvfp4(dn_c[local_e], dn_s[local_e]).t()
+            act = quantize_nvfp4(act, g2) / g2
+            y = act @ w_down.t()
             out.index_add_(0, tok, y * topk_weights[tok, slot].float().unsqueeze(1))
         return out
 
@@ -299,6 +425,19 @@ class Fp4BlockScaleMoeRunner(OpWrapper):
         (408/357), a missing row shuffle (508/432), and a reference skipping the
         FC1 requantization (43/28 element, 23/23 RMS). The smallest RMS distance
         any of them reaches is 39.8.
+
+        The DeepSeek-V4.1 cells take the same gate. Measured on sm_103 at the V4.1
+        geometry (H 5120, I 2304, 384 experts, top-6, clamp 10, per-expert global
+        scales), element / RMS: full stack 3.61 / 0.73, an EP4 window 5.75 / 0.86,
+        an EP2 window 5.82 / 0.76, an EP8 window 8.73 / 0.75, a TP4 rank 7.12 /
+        0.82, a TP2 rank 5.59 / 0.70. With the layer-level `g2` over the whole
+        bucket-by-bucket row axis 1..8192: 9.01 / 1.13 on an EP4 window, 7.57 /
+        1.06 on a TP4 rank, 8.00 / 0.76 at most on EP2 / EP8 / TP2; under the dep members' zero-padding skew
+        8.87 / 1.11; CUDA-graph replays 13.82 / 1.09 (an EP8 window, the smallest
+        rows of any layout, over up to 12288 x 5120 elements per graph). The V4.1
+        layer's own mistakes sit 128-360 ulp RMS away: the clamp limit passed in
+        the true domain, FC1 stacked `[gate ; up]`, a window issued at offset 0,
+        the scalars shifted by one expert, a TP4 rank left out of the sum.
         """
         assert out.dtype == ref.dtype == torch.bfloat16, (out.dtype, ref.dtype)
         assert out.shape == ref.shape, (out.shape, ref.shape)

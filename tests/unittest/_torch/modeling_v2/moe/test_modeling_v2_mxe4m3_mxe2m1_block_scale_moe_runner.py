@@ -2,19 +2,24 @@
 # SPDX-License-Identifier: Apache-2.0
 """GPU test for the mxe4m3_mxe2m1_block_scale_moe_runner catalog entry."""
 
+import contextlib
 import math
+import zlib
 
 import pytest
 import torch
+from torch.profiler import ProfilerActivity, profile, record_function
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.gpt_oss.gpt_oss_120b__sm_103__tp1.ops.moe.mxe4m3_mxe2m1_block_scale_moe_runner import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.mxe4m3_mxe2m1_block_scale_moe_runner import (
     mxe4m3_mxe2m1_block_scale_moe_runner as moe,
 )
+from tensorrt_llm._torch.autotuner import AutoTuner, autotune, fallback_tactic
 
-__extra_import_path__ = ["../../../.."]
+__extra_import_path__ = [".."]
 from _validating import validating  # noqa: E402 — needs the path declared above
 
 assert torch.cuda.is_available(), "mxe4m3_mxe2m1_block_scale_moe_runner requires a CUDA device"
+
 
 DEV = "cuda"
 # The reference GEMMs must be true fp32; TF32 would leave the reference with
@@ -75,15 +80,15 @@ def _exp_base(k: int) -> int:
     return 127 + round(0.5 * math.log2(0.01057 / k))
 
 
-def _rand_mxfp4(e: int, n: int, k: int, gen: torch.Generator):
+def _rand_mxfp4(e: int, n: int, k: int, gen: torch.Generator, exp_shift: int = 0):
     """Random mxfp4 expert stack.
 
     Returns `(packed [E, N, K/2] uint8, scales [E, N, K/32] uint8, codes
     [E, N, K] uint8)`. Codes and e8m0 exponents are drawn directly, so the
     fp32 value of every weight is exact — the reference never has to model a
-    quantizer.
+    quantizer. `exp_shift` scales the whole stack by `2^exp_shift`.
     """
-    base = _exp_base(k)
+    base = _exp_base(k) + exp_shift
     codes = torch.randint(0, 16, (e, n, k), dtype=torch.uint8, device=DEV, generator=gen)
     exps = torch.randint(
         base, base + 6, (e, n, k // SV), dtype=torch.uint8, device=DEV, generator=gen
@@ -207,27 +212,44 @@ def _prep_fc2(dn_p, dn_s, dn_b, h2_pad, i_pad):
     )
 
 
-def _build(num_experts: int, hidden: int, inter: int, seed: int):
-    """Build one MoE layer: kernel-ready tensors plus the reference operands."""
+def _build(
+    num_experts: int,
+    hidden: int,
+    inter: int,
+    seed: int,
+    fc1_exp_shift: int = 0,
+    with_bias: bool = True,
+):
+    """Build one MoE layer: kernel-ready tensors plus the reference operands.
+
+    `fc1_exp_shift` scales both FC1 halves by `2^fc1_exp_shift` (so a clamp
+    limit bites more often); `with_bias=False` passes both biases as `None`
+    and gives the reference zero biases.
+    """
     gen = torch.Generator(device=DEV).manual_seed(seed)
     i_pad = _pad_up(inter, WEIGHT_ALIGN)
     h1_pad = _pad_up(hidden, HIDDEN_ALIGN)
     h2_pad = _pad_up(hidden, WEIGHT_ALIGN)
-    up_p, up_s, up_c = _rand_mxfp4(num_experts, inter, hidden, gen)
-    gt_p, gt_s, gt_c = _rand_mxfp4(num_experts, inter, hidden, gen)
+    up_p, up_s, up_c = _rand_mxfp4(num_experts, inter, hidden, gen, fc1_exp_shift)
+    gt_p, gt_s, gt_c = _rand_mxfp4(num_experts, inter, hidden, gen, fc1_exp_shift)
     dn_p, dn_s, dn_c = _rand_mxfp4(num_experts, hidden, inter, gen)
-    up_b = torch.randn(num_experts, inter, device=DEV, generator=gen)
-    gt_b = torch.randn(num_experts, inter, device=DEV, generator=gen)
-    dn_b = torch.randn(num_experts, hidden, device=DEV, generator=gen) * 0.05
+    if with_bias:
+        up_b = torch.randn(num_experts, inter, device=DEV, generator=gen)
+        gt_b = torch.randn(num_experts, inter, device=DEV, generator=gen)
+        dn_b = torch.randn(num_experts, hidden, device=DEV, generator=gen) * 0.05
+    else:
+        up_b = torch.zeros(num_experts, inter, device=DEV)
+        gt_b = torch.zeros(num_experts, inter, device=DEV)
+        dn_b = torch.zeros(num_experts, hidden, device=DEV)
     w1, s1, b1 = _prep_fc1(up_p, gt_p, up_s, gt_s, up_b, gt_b, i_pad, h1_pad)
     w2, s2, b2 = _prep_fc2(dn_p, dn_s, dn_b, h2_pad, i_pad)
     args = dict(
         gemm1_weights=w1,
         gemm1_weights_scale=s1,
-        gemm1_bias=b1,
+        gemm1_bias=b1 if with_bias else None,
         gemm2_weights=w2,
         gemm2_weights_scale=s2,
-        gemm2_bias=b2,
+        gemm2_bias=b2 if with_bias else None,
         intermediate_size=i_pad,
         valid_hidden_size=hidden,
         valid_intermediate_size=inter,
@@ -363,6 +385,9 @@ def _ref_moe(
     num_local: int | None = None,
     swap_gate_up: bool = False,
     quantize_intermediate: bool = True,
+    recipe: str | None = None,
+    weights_before_down: bool = False,
+    stats: dict | None = None,
 ):
     """Native-torch MoE over dequantized mxfp4 weights, fp32 throughout.
 
@@ -370,6 +395,12 @@ def _ref_moe(
     `[offset, offset + num_local)`. `scales[t, j]` multiplies slot `j`'s
     expert output; nothing is renormalized. The FC1 activation is requantized
     to MXFP8 before FC2, which is what the kernel does.
+
+    `weights_before_down=True` is the DeepSeek-V4.1 checkpoint reference's
+    order instead (`Expert.forward` in the checkpoint's `inference/model.py`):
+    the routing weight multiplies the activation, which is rounded to bf16 and
+    then MXFP8-quantized as FC2's input. `stats`, when given, accumulates how
+    many FC1 elements the clamp limit changed.
     """
     num_tokens, hidden = x_valid.shape
     up_c, up_s, up_b = ref["up"]
@@ -390,15 +421,22 @@ def _ref_moe(
         gate = xe @ _dequant(gt_c[local_e], gt_s[local_e]).t() + gt_b[local_e]
         if limit is not None:
             lim = float(limit[local_e])
+            if stats is not None:
+                stats["gate"] = stats.get("gate", 0) + int((gate > lim).sum())
+                stats["up"] = stats.get("up", 0) + int((up.abs() > lim).sum())
+                stats["n"] = stats.get("n", 0) + gate.numel()
             gate = gate.clamp(max=lim)
             up = up.clamp(-lim, lim)
         a = 1.0 if alpha is None else float(alpha[local_e])
         b = 0.0 if beta is None else float(beta[local_e])
         act = (up + b) * gate * torch.sigmoid(a * gate)
+        w = scales[tok, slot].float().unsqueeze(1)
+        if weights_before_down:
+            act = (act * w).to(torch.bfloat16).float()
         if quantize_intermediate:
-            act = _q_intermediate(act)
+            act = _q_intermediate(act, recipe)
         y = act @ _dequant(dn_c[local_e], dn_s[local_e]).t() + dn_b[local_e]
-        out.index_add_(0, tok, y * scales[tok, slot].float().unsqueeze(1))
+        out.index_add_(0, tok, y if weights_before_down else y * w)
     return out
 
 
@@ -422,8 +460,9 @@ def _assert_moe_close(y: torch.Tensor, ref: torch.Tensor) -> None:
     one output ulp of a two-GEMM chain, and per-element `rtol` is meaningless
     where cancellation drives `|ref|` to zero. So the element gate is 8 ulp of
     the row's largest magnitude and the aggregate gate is 4 ulp of relative
-    RMS. Worst values measured over every configuration covered here: 2.0 ulp
-    element-wise (128 experts, 8192 tokens, H=I=2880) and 0.87 ulp RMS. Both
+    RMS. Worst values measured over every configuration covered here: 2.2 ulp
+    element-wise (a skewed-routing capture replay at the DSpark drafter
+    geometry; 2.0 at 128 experts, 8192 tokens, H=I=2880) and 0.87 ulp RMS. Both
     gates were sized against deliberately wrong computations when they were
     set: a reference that skips the FC1-output requantization lands at
     19.6 / 10.6 ulp, and a gate/up-swapped or unshuffled operand at 100+ ulp.
@@ -715,6 +754,306 @@ def test_intermediate_is_mxfp8_quantized():
             "the intermediate was not requantized at all"
         )
     print("  test_intermediate_is_mxfp8_quantized OK")
+
+
+def test_dspark_intermediate_is_mxfp8_quantized():
+    """DeepSeek-V4.1 DSpark drafter geometry, plain clamped SwiGLU: the FC1
+    epilogue's MXFP8 intermediate, read out bit-exactly.
+
+    H = 5120, I = 2304 is not square, so FC2 is a *partial* identity
+    (`down[i, i] = 1` for `i < I`): output columns `[0, I)` are the kernel's own
+    intermediate and `[I, H)` must be zero. alpha/beta are left at `None` and
+    the clamp limit is 10 -- the V4.1 `Expert` (gate <= 10, up in [-10, 10],
+    `silu(gate) * up`). Two FC1 scales: one where the clamp bites on ~10% of
+    gate and ~20% of up elements, one where the saturating-scale branch is hit
+    by ~19% of blocks.
+    """
+    hidden, inter, num_experts, num_tokens = 5120, 2304, 2, 16
+    for seed, shift in ((81, 1), (83, 0)):
+        gen = torch.Generator(device=DEV).manual_seed(seed)
+        up_p, up_s, up_c = _rand_mxfp4(num_experts, inter, hidden, gen, shift)
+        gt_p, gt_s, gt_c = _rand_mxfp4(num_experts, inter, hidden, gen, shift)
+        dn_c = torch.zeros(num_experts, hidden, inter, dtype=torch.uint8, device=DEV)
+        dn_c[:, torch.arange(inter), torch.arange(inter)] = 2  # e2m1 code 2 = 1.0
+        dn_p = (dn_c[..., 0::2] | (dn_c[..., 1::2] << 4)).contiguous()
+        dn_s = torch.full((num_experts, hidden, inter // SV), 127, dtype=torch.uint8, device=DEV)
+        zero1 = torch.zeros(num_experts, inter, device=DEV)
+        zero2 = torch.zeros(num_experts, hidden, device=DEV)
+        w1, s1, _ = _prep_fc1(up_p, gt_p, up_s, gt_s, zero1, zero1, inter, hidden)
+        w2, s2, _ = _prep_fc2(dn_p, dn_s, zero2, hidden, inter)
+        args = dict(
+            gemm1_weights=w1,
+            gemm1_weights_scale=s1,
+            gemm1_bias=None,
+            gemm2_weights=w2,
+            gemm2_weights_scale=s2,
+            gemm2_bias=None,
+            intermediate_size=inter,
+            valid_hidden_size=hidden,
+            valid_intermediate_size=inter,
+        )
+        data, sf, xv = _rand_mxfp8(num_tokens, hidden, hidden, gen)
+        ids = torch.zeros(num_tokens, 1, dtype=torch.int32, device=DEV)
+        wts = torch.ones(num_tokens, 1, dtype=torch.bfloat16, device=DEV)
+        limit = torch.full((num_experts,), 10.0, dtype=torch.float32, device=DEV)
+        out = _call(
+            data, sf, args, num_experts, 1, topk_ids=ids, topk_weights=wts, gemm1_clamp_limit=limit
+        ).float()
+        assert torch.count_nonzero(out[:, inter:]) == 0, "columns past I must be zero"
+        up = xv @ _dequant(up_c[0], up_s[0]).t()
+        gate = xv @ _dequant(gt_c[0], gt_s[0]).t()
+        act = up.clamp(-10.0, 10.0) * torch.nn.functional.silu(gate.clamp(max=10.0))
+        recipe = _scale_recipe()
+        assert torch.equal(out[:, :inter], _q_intermediate(act, recipe)), (
+            f"the FC1 epilogue's MXFP8 requantization at H=5120/I=2304 is not the {recipe!r} "
+            "block scale; see test_intermediate_is_mxfp8_quantized"
+        )
+        other = _OCP_SCALE if recipe == _ROUND_UP_SCALE else _ROUND_UP_SCALE
+        assert not torch.equal(out[:, :inter], _q_intermediate(act, other)), (
+            f"the {other!r} scale fits too -- this case does not separate the recipes"
+        )
+        assert not torch.equal(out[:, :inter], act.to(torch.bfloat16).float())
+        if shift == 1:
+            assert (gate > 10.0).float().mean() > 0.05 and (
+                up.abs() > 10.0
+            ).float().mean() > 0.05, "the clamp limit does not bite in this case"
+    print("  test_dspark_intermediate_is_mxfp8_quantized OK")
+
+
+def _gate_rejects(y: torch.Tensor, ref: torch.Tensor) -> bool:
+    try:
+        _assert_moe_close(y, ref)
+    except AssertionError:
+        return True
+    return False
+
+
+def test_dspark_drafter_surface():
+    """DeepSeek-V4.1 DSpark drafter MoE: H=5120, I=2304, 128 experts all local
+    (offset 0), top-3, clamp limit 10 per expert, no alpha/beta, no biases,
+    pre-routed bf16 weights; decode blocks T = 5..160 and prefill rows to 8192.
+
+    Deliberately wrong references (no clamp, the gpt-oss clamp 7, gate/up
+    swapped, the gpt-oss alpha/beta, no intermediate requantization) must all
+    land outside the gate, and the checkpoint's own order -- routing weight
+    multiplied into the activation before FC2's MXFP8 input quantization --
+    is measured to be a different computation from this kernel's.
+    """
+    num_experts, hidden, inter, top_k = 128, 5120, 2304, 3
+    args, ref = _build(num_experts, hidden, inter, seed=300, fc1_exp_shift=1, with_bias=False)
+    gen = ref["gen"]
+    assert ref["h1_pad"] == hidden and args["intermediate_size"] == inter, (
+        "5120/2304 need no padding"
+    )
+    limit = torch.full((num_experts,), 10.0, dtype=torch.float32, device=DEV)
+    for num_tokens in (1, 5, 40, 85, 160, 1024, 8192):
+        data, sf, xv = _rand_mxfp8(num_tokens, hidden, hidden, gen)
+        ids, _ = _routing(num_tokens, num_experts, top_k, gen)
+        wts = (torch.rand(num_tokens, top_k, device=DEV, generator=gen) * 1.5).to(torch.bfloat16)
+        out = _call(
+            data,
+            sf,
+            args,
+            num_experts,
+            top_k,
+            topk_ids=ids,
+            topk_weights=wts,
+            gemm1_clamp_limit=limit,
+        )
+        assert out.shape == (num_tokens, hidden), out.shape
+        stats = {}
+        exp = _ref_moe(xv, ids, wts, ref, None, None, limit, stats=stats).to(torch.bfloat16)
+        _assert_moe_close(out, exp)
+        elt, rms = _dev(out, exp)
+        print(
+            f"    T={num_tokens}: {elt:.2f} ulp elt, {rms:.2f} ulp RMS; clamp changed "
+            f"{stats['gate'] / stats['n']:.3f} of gate, {stats['up'] / stats['n']:.3f} of up"
+        )
+        if num_tokens >= 40:
+            assert stats["gate"] / stats["n"] > 0.02 and stats["up"] / stats["n"] > 0.02, stats
+        if num_tokens != 160:
+            continue
+        wrong = {
+            "no clamp": _ref_moe(xv, ids, wts, ref, None, None, None),
+            "clamp 7": _ref_moe(xv, ids, wts, ref, None, None, limit * 0.7),
+            "gate/up swapped": _ref_moe(xv, ids, wts, ref, None, None, limit, swap_gate_up=True),
+            "gpt-oss alpha/beta": _ref_moe(
+                xv,
+                ids,
+                wts,
+                ref,
+                torch.full((num_experts,), 1.702, device=DEV),
+                torch.ones(num_experts, device=DEV),
+                limit,
+            ),
+            "no intermediate requant": _ref_moe(
+                xv, ids, wts, ref, None, None, limit, quantize_intermediate=False
+            ),
+        }
+        for name, bad in wrong.items():
+            elt, rms = _dev(out, bad.to(torch.bfloat16))
+            print(f"    WRONG {name}: {elt:.2f} ulp elt, {rms:.2f} ulp RMS")
+            assert _gate_rejects(out, bad.to(torch.bfloat16)), (
+                f"the {name} reference passed the gate"
+            )
+        # the checkpoint's order: weight * act -> bf16 -> MXFP8 -> FC2. The
+        # kernel multiplies after FC2 instead; the two differ by a whole
+        # requantization's worth of rounding (measured ~10 ulp RMS).
+        ckpt = _ref_moe(xv, ids, wts, ref, None, None, limit, weights_before_down=True)
+        elt, rms = _dev(out, ckpt.to(torch.bfloat16))
+        print(f"    checkpoint order: {elt:.2f} ulp elt, {rms:.2f} ulp RMS")
+        assert rms > 6.0, f"checkpoint-order reference unexpectedly close: {rms:.2f} ulp RMS"
+
+    # fed by the certified quantizer: at H = 5120 alignment 512 adds no padding
+    for num_tokens in (40, 160):
+        xb = torch.randn(num_tokens, hidden, device=DEV, dtype=torch.bfloat16, generator=gen) * 2
+        data, sf = torch.ops.trtllm.mxfp8_quantize(xb, False, 512)
+        assert data.shape == (num_tokens, hidden) and sf.shape == (num_tokens * hidden // SV,)
+        ids, _ = _routing(num_tokens, num_experts, top_k, gen)
+        wts = (torch.rand(num_tokens, top_k, device=DEV, generator=gen) * 1.5).to(torch.bfloat16)
+        out = _call(
+            data,
+            sf,
+            args,
+            num_experts,
+            top_k,
+            topk_ids=ids,
+            topk_weights=wts,
+            gemm1_clamp_limit=limit,
+        )
+        exp = _ref_moe(_dequant_mxfp8(data, sf), ids, wts, ref, None, None, limit)
+        _assert_moe_close(out, exp.to(torch.bfloat16))
+        elt, rms = _dev(out, exp.to(torch.bfloat16))
+        print(f"    mxfp8_quantize-fed T={num_tokens}: {elt:.2f} ulp elt, {rms:.2f} ulp RMS")
+
+    # CUDA-graph capture at a decode size, replayed over new inputs written
+    # into the captured buffers, equals an eager call on those inputs bitwise
+    num_tokens = 40
+    data, sf, _ = _rand_mxfp8(num_tokens, hidden, hidden, gen)
+    ids, _ = _routing(num_tokens, num_experts, top_k, gen)
+    wts = (torch.rand(num_tokens, top_k, device=DEV, generator=gen) * 1.5).to(torch.bfloat16)
+    kw = dict(topk_ids=ids, topk_weights=wts, gemm1_clamp_limit=limit)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        _call(data, sf, args, num_experts, top_k, **kw)
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = _call(data, sf, args, num_experts, top_k, **kw)
+    data2, sf2, _ = _rand_mxfp8(num_tokens, hidden, hidden, gen)
+    ids2, _ = _routing(num_tokens, num_experts, top_k, gen)
+    wts2 = (torch.rand(num_tokens, top_k, device=DEV, generator=gen) * 1.5).to(torch.bfloat16)
+    data.copy_(data2)
+    sf.copy_(sf2)
+    ids.copy_(ids2)
+    wts.copy_(wts2)
+    graph.replay()
+    torch.cuda.synchronize()
+    eager = _call(
+        data2,
+        sf2,
+        args,
+        num_experts,
+        top_k,
+        topk_ids=ids2,
+        topk_weights=wts2,
+        gemm1_clamp_limit=limit,
+    )
+    assert torch.equal(captured, eager), "graph replay over new inputs differs from eager"
+    print("  test_dspark_drafter_surface OK")
+
+
+# The DSpark drafter's MoE runs on its 5-token draft block: T = 5G for the
+# drafter batch G = 1..32, inside the target's decode CUDA graphs (the capture
+# set 5 * {1..8, 16, 24, 32} is a subset) and eagerly in mixed steps.
+# Replicated on every rank, so no dep4 gather reaches it.
+_DSPARK_BLOCK_TOKENS = tuple(range(5, 161, 5))
+
+
+def _skewed_routing(num_tokens, num_experts, top_k, gen):
+    """Every token routed to the same top_k experts (first, middle and last), in a per-token order:
+    the most unbalanced routing a captured launch can meet."""
+    hot = torch.tensor(
+        [0, num_experts // 2, num_experts - 1][:top_k], dtype=torch.int32, device=DEV
+    )
+    ids = torch.stack(
+        [hot[torch.randperm(top_k, device=DEV, generator=gen)] for _ in range(num_tokens)]
+    )
+    wts = (torch.rand(num_tokens, top_k, device=DEV, generator=gen) * 1.5).to(torch.bfloat16)
+    return ids.contiguous(), wts
+
+
+def test_dspark_every_block_size_eager_and_capture():
+    """DSpark drafter MoE at every T = 5..160 step 5: eager against the reference, then captured.
+
+    Per T: an eager call on uniform random routing matches the kernel-order
+    reference. The call is then warmed up on a side stream and captured with
+    the op's autotuner cold, so the kernel configuration the graph holds is the
+    one chosen for this T at capture. Two replays follow, each after writing
+    new activations and new routing into the captured buffers: new uniform
+    routing, then every token on the same three experts (first, middle, last:
+    the most unbalanced load). Each replay is bitwise equal to an eager call
+    on the same inputs, and the skewed one also matches the reference.
+    """
+    num_experts, hidden, inter, top_k = 128, 5120, 2304, 3
+    args, ref = _build(num_experts, hidden, inter, seed=400, fc1_exp_shift=1, with_bias=False)
+    gen = ref["gen"]
+    limit = torch.full((num_experts,), 10.0, dtype=torch.float32, device=DEV)
+    worst = [0.0, 0.0]
+    for num_tokens in _DSPARK_BLOCK_TOKENS:
+        data, sf, xv = _rand_mxfp8(num_tokens, hidden, hidden, gen)
+        ids, _ = _routing(num_tokens, num_experts, top_k, gen)
+        wts = (torch.rand(num_tokens, top_k, device=DEV, generator=gen) * 1.5).to(torch.bfloat16)
+        kw = dict(topk_ids=ids, topk_weights=wts, gemm1_clamp_limit=limit)
+        out = _call(data, sf, args, num_experts, top_k, **kw)
+        exp = _ref_moe(xv, ids, wts, ref, None, None, limit).to(torch.bfloat16)
+        _assert_moe_close(out, exp)
+        elt, rms = _dev(out, exp)
+        worst = [max(worst[0], elt), max(worst[1], rms)]
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            _call(data, sf, args, num_experts, top_k, **kw)
+        torch.cuda.current_stream().wait_stream(stream)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured = _call(data, sf, args, num_experts, top_k, **kw)
+        for skewed in (False, True):
+            d2, s2, x2 = _rand_mxfp8(num_tokens, hidden, hidden, gen)
+            if skewed:
+                i2, w2 = _skewed_routing(num_tokens, num_experts, top_k, gen)
+            else:
+                i2, _ = _routing(num_tokens, num_experts, top_k, gen)
+                w2 = (torch.rand(num_tokens, top_k, device=DEV, generator=gen) * 1.5).to(
+                    torch.bfloat16
+                )
+            data.copy_(d2)
+            sf.copy_(s2)
+            ids.copy_(i2)
+            wts.copy_(w2)
+            captured.fill_(float("nan"))
+            graph.replay()
+            torch.cuda.synchronize()
+            eager = _call(
+                d2,
+                s2,
+                args,
+                num_experts,
+                top_k,
+                topk_ids=i2,
+                topk_weights=w2,
+                gemm1_clamp_limit=limit,
+            )
+            assert torch.equal(captured, eager), (num_tokens, "skewed" if skewed else "uniform")
+            if skewed:
+                exp2 = _ref_moe(x2, i2, w2, ref, None, None, limit).to(torch.bfloat16)
+                _assert_moe_close(captured, exp2)
+        del graph, captured
+    print(
+        f"  test_dspark_every_block_size_eager_and_capture OK: worst {worst[0]:.2f} ulp elt, "
+        f"{worst[1]:.2f} ulp RMS over T 5..160"
+    )
 
 
 def test_activation_variants():
@@ -1563,6 +1902,636 @@ def test_determinism_and_purity():
     print("  test_determinism_and_purity OK")
 
 
+# ── the DSpark drafter at max_batch_size 256 ─────────────────────────────
+#
+# The drafter runs this op once per stage on its N = 5G block rows, G the
+# number of drafting requests on the rank (at most max_batch_size = 256), so
+# N <= 1280 and N is always a multiple of 5. Under CUDA graphs G is a captured
+# batch size: every G in Gset, the integers 1..32 plus TRT-LLM's padded list
+# for max_batch_size 256. The target calls the op inside the autotuner's
+# `fallback_tactic()` scope, in which `AutoTuner.choose_one`
+# returns the untuned fallback without reading the profiling cache, so every
+# rank takes the same tactic; the tests below call it exactly that way and
+# record the tactic the AutoTuner hands the op on every call.
+
+_OP = "trtllm::mxe4m3_mxe2m1_block_scale_moe_runner"
+_DSPARK_GSET = tuple(range(1, 33)) + (40, 48, 56, 64, 72, 80, 88, 96, 104, 112, 120, 128, 192, 256)
+_DSPARK_CAPTURE_N = tuple(5 * g for g in _DSPARK_GSET)
+_DSPARK_N_MAX = 5 * 256
+# Every drafter-MoE row count the runtime-value dumps of the max_batch_size
+# 256 engines recorded (padded CUDA-graph, eager, tp4 and dep4 legs) plus the
+# long-context legs.
+_DSPARK_DUMPED_N = (
+    5, 10, 15, 20, 40, 50, 80, 90, 110, 115, 120, 125, 140, 160, 190, 200, 240, 275, 280, 320,
+    360, 370, 385, 400, 440, 455, 480, 520, 560, 580, 585, 600, 640, 650, 665, 710, 715, 720,
+    960, 1280,
+)  # fmt: skip
+
+
+def _drafter_layer(seed):
+    """The drafter's routed experts: 128 local, H 5120, I 2304, clamp 10 per expert, no biases."""
+    args, ref = _build(128, 5120, 2304, seed=seed, fc1_exp_shift=1, with_bias=False)
+    limit = torch.full((128,), 10.0, dtype=torch.float32, device=DEV)
+    return args, ref, limit
+
+
+def _pinned(data, sf, args, num_experts, top_k, **kw):
+    """The call as the target's drafter makes it: inside `fallback_tactic()`."""
+    with fallback_tactic():
+        return _call(data, sf, args, num_experts, top_k, **kw)
+
+
+@contextlib.contextmanager
+def _tactics():
+    """Record `(tactic, tuning mode, capturing)` for every AutoTuner.choose_one call this op makes."""
+    tuner = AutoTuner.get()
+    real = tuner.choose_one
+    rec = []
+
+    def spy(custom_op, runners, tuning_config, inputs, **kw):
+        out = real(custom_op, runners, tuning_config, inputs, **kw)
+        if custom_op == _OP:
+            rec.append((out[1], tuner.is_tuning_mode, torch.cuda.is_current_stream_capturing()))
+        return out
+
+    tuner.choose_one = spy
+    try:
+        yield rec
+    finally:
+        del tuner.choose_one
+
+
+def _op_cache_entries():
+    return len(AutoTuner.get().profiling_cache.get_specific_custom_op(_OP))
+
+
+def _kernel_map(run, rows) -> dict:
+    """{N: the device activity one call at N launched, in launch order}.
+
+    Each call runs in its own `record_function` range, bracketed by two
+    synchronizations, so the device events that start inside the range are
+    exactly the ones that call launched (the range's own device-side
+    annotation is excluded by name).
+    """
+    names = {}
+    for i in range(0, len(rows), 256):
+        chunk = rows[i : i + 256]
+        torch.cuda.synchronize()
+        with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
+            for n in chunk:
+                with record_function(f"N={n}"):
+                    run(n)
+                    torch.cuda.synchronize()
+        evs = prof.events()
+        ranges = [
+            (int(e.name[2:]), e.time_range.start, e.time_range.end)
+            for e in evs
+            if e.name.startswith("N=") and e.device_type == torch.autograd.DeviceType.CPU
+        ]
+        device = sorted(
+            (e.time_range.start, e.name)
+            for e in evs
+            if e.device_type == torch.autograd.DeviceType.CUDA and not e.name.startswith("N=")
+        )
+        for n, lo, hi in ranges:
+            names[n] = tuple(nm for t, nm in device if lo <= t <= hi)
+        del prof
+    return names
+
+
+def _runs(names, rows):
+    """Maximal runs `[first N, last N, activity]` of consecutive N that launch the same device activity."""
+    runs = []
+    for n in rows:
+        assert names.get(n), f"no device activity attributed to the call at N={n}"
+        if runs and runs[-1][2] == names[n]:
+            runs[-1][1] = n
+        else:
+            runs.append([n, n, names[n]])
+    return runs
+
+
+def test_dspark_eager_every_row_count_to_1280():
+    """Every drafter row count N = 1..1280, called as the target calls it, against the reference.
+
+    One 1280-row activation and uniform random top-3 routing; the call at N
+    reads their first N rows and writes the first N rows of a NaN-poisoned
+    buffer (the target passes `output=`). Every N is held to the reference's
+    first N rows at the entry's gates, and a second call on the same inputs
+    must be bitwise equal to the first (every rank of the replicated drafter
+    computes the same rows). Every call is pinned as in the target and must
+    take the untuned fallback tactic.
+
+    The cold tactic picks its kernels by N (the tokens-per-expert tile and the
+    default GEMM configuration, plus the routing kernels), so the test then
+    profiles every call 1..1280, derives the kernel map (maximal runs of
+    consecutive N launching the same device activity), and checks the first,
+    middle and last N of every run again with every token routed to the same
+    three experts (the most unbalanced load), against the reference (every
+    switch point at its edges).
+    """
+    num_experts, hidden, top_k = 128, 5120, 3
+    args, ref, limit = _drafter_layer(seed=500)
+    gen = ref["gen"]
+    n_max, sfw = _DSPARK_N_MAX, hidden // SV
+    data, sf, xv = _rand_mxfp8(n_max, hidden, hidden, gen)
+    ids, _ = _routing(n_max, num_experts, top_k, gen)
+    wts = (torch.rand(n_max, top_k, device=DEV, generator=gen) * 1.5).to(torch.bfloat16)
+    exp = _ref_moe(xv, ids, wts, ref, None, None, limit).to(torch.bfloat16)
+    buf = torch.empty(n_max, hidden, dtype=torch.bfloat16, device=DEV)
+
+    def run(n, out=None, i=None, w=None):
+        out = buf[:n] if out is None else out
+        _pinned(
+            data[:n],
+            sf[: n * sfw],
+            args,
+            num_experts,
+            top_k,
+            topk_ids=ids[:n] if i is None else i,
+            topk_weights=wts[:n] if w is None else w,
+            gemm1_clamp_limit=limit,
+            output=out,
+        )
+        return out
+
+    assert _op_cache_entries() == 0, (
+        "a cached tuned entry would move the pinned call off the fallback"
+    )
+    with _tactics() as rec:
+        full = run(
+            n_max, torch.full((n_max, hidden), float("nan"), dtype=torch.bfloat16, device=DEV)
+        )
+        _assert_moe_close(full, exp)
+        worst, off_prefix = [0.0, 0.0], []
+        for n in range(1, n_max + 1):
+            buf[:n].fill_(float("nan"))
+            out = run(n)
+            _assert_moe_close(out, exp[:n])
+            elt, rms = _dev(out, exp[:n])
+            worst = [max(worst[0], elt), max(worst[1], rms)]
+            again = run(n, torch.full((n, hidden), float("nan"), dtype=torch.bfloat16, device=DEV))
+            assert torch.equal(again, out), f"two identical calls at N={n} differ"
+            if not torch.equal(out, full[:n]):
+                off_prefix.append(n)
+        calls = len(rec)
+        rows = list(range(1, n_max + 1))
+        names = _kernel_map(run, rows)
+        runs = _runs(names, rows)
+        edges = sorted({m for lo, hi, _ in runs for m in (lo, (lo + hi) // 2, hi)})
+        edge_worst = [0.0, 0.0]
+        for n in edges:
+            i2, w2 = _skewed_routing(n, num_experts, top_k, gen)
+            out = run(
+                n, torch.full((n, hidden), float("nan"), dtype=torch.bfloat16, device=DEV), i2, w2
+            )
+            exp2 = _ref_moe(xv[:n], i2, w2, ref, None, None, limit).to(torch.bfloat16)
+            _assert_moe_close(out, exp2)
+            elt, rms = _dev(out, exp2)
+            edge_worst = [max(edge_worst[0], elt), max(edge_worst[1], rms)]
+    assert calls == 1 + 2 * n_max, calls
+    assert {r[0] for r in rec} == {-1}, sorted({str(r[0]) for r in rec})
+    assert _op_cache_entries() == 0
+    assert set(_DSPARK_DUMPED_N) <= set(rows)
+    # The cold path's kernel map as measured on sm_103: at 2 the FC1/FC2
+    # configurations change (N = 1 runs FC1 with a static scheduler and FC2
+    # split-K 2); the routing kernel changes at 5 (block -> dynamic block),
+    # 17, 65 and 129 (cluster kernel sizes 256 / 512 / 1024); the finalize
+    # kernel at 60 (vectorized loads); and the tokens-per-expert tile
+    # (clamp(next_pow2(floor(3N / 128)), 8, 256)) goes 8 -> 16 at 384 and
+    # 16 -> 32 at 726. The contract lists these; a move means both are stale.
+    assert [lo for lo, _, _ in runs] == [1, 2, 5, 17, 60, 65, 129, 384, 726], [
+        lo for lo, _, _ in runs
+    ]
+    # Rows do not depend on N: every N >= 2 is bitwise the first N rows of
+    # the N = 1280 call; N = 1 differs only through its split-K FC2.
+    assert off_prefix == [1], off_prefix[:20]
+    kinds = sorted({nm for _, _, nm in runs})
+    print(
+        f"  test_dspark_eager_every_row_count_to_1280: {n_max} row counts in the gates, worst "
+        f"{worst[0]:.2f} ulp elt / {worst[1]:.2f} ulp RMS; repeat calls bitwise equal; {len(rec)} calls "
+        f"all on tactic -1; not bitwise equal to the first N rows of the N={n_max} call at "
+        f"{len(off_prefix)} N (first {off_prefix[:12]})"
+    )
+    print(
+        f"    kernel map: {len(runs)} runs of {len(kinds)} distinct sequences over N 1..{n_max}; switch "
+        f"points (first N of each run) {[lo for lo, _, _ in runs]}; {len(edges)} run edges/middles on "
+        f"skewed routing: worst {edge_worst[0]:.2f} ulp elt / {edge_worst[1]:.2f} ulp RMS"
+    )
+    prev = ()
+    for lo, hi, nm in runs:
+        changed = [x for x in nm if x not in prev]
+        print(
+            f"    N {lo}..{hi}: {len(nm)} kernels; new vs previous run: {' || '.join(x[:400] for x in changed)}"
+        )
+        prev = nm
+
+
+def test_dspark_capture_every_5G_over_gset():
+    """Capture at every drafter block size N = 5G for G in Gset (46 values, 5..1280), as the target runs it.
+
+    Per N, in the engine's order: an eager call at that shape (the warm-up,
+    checked against the reference), a side-stream warm-up, then the capture
+    of the pinned call writing into an `output` allocated inside the capture
+    (as the target's `_moe` does). Every other capture is made while an
+    outer `autotune()` is open (the engine's tuning pass also runs the
+    drafter). Two replays follow, each after writing new activations and new
+    routing into the captured buffers -- uniform random routing, then every
+    token on the same three experts -- with the output poisoned first. Each
+    replay must be bitwise equal to an eager pinned call on the same inputs,
+    inside the gates against the reference, and differ from the capture-time
+    output on more than 90% of elements (a replay that reran on the old
+    inputs is visible). Every call, captured ones included, must get the
+    fallback tactic, and the op's AutoTuner cache must stay empty.
+    """
+    num_experts, hidden, top_k = 128, 5120, 3
+    args, ref, limit = _drafter_layer(seed=600)
+    gen = ref["gen"]
+    assert len(_DSPARK_CAPTURE_N) == 46 and max(_DSPARK_CAPTURE_N) == _DSPARK_N_MAX
+    assert _op_cache_entries() == 0
+    worst, stale_min = [0.0, 0.0], 1.0
+    with _tactics() as rec:
+        for i, n in enumerate(_DSPARK_CAPTURE_N):
+            data, sf, xv = _rand_mxfp8(n, hidden, hidden, gen)
+            ids, _ = _routing(n, num_experts, top_k, gen)
+            wts = (torch.rand(n, top_k, device=DEV, generator=gen) * 1.5).to(torch.bfloat16)
+            kw = dict(topk_ids=ids, topk_weights=wts, gemm1_clamp_limit=limit)
+            warm = torch.full((n, hidden), float("nan"), dtype=torch.bfloat16, device=DEV)
+            _pinned(data, sf, args, num_experts, top_k, output=warm, **kw)
+            _assert_moe_close(
+                warm, _ref_moe(xv, ids, wts, ref, None, None, limit).to(torch.bfloat16)
+            )
+            stream = torch.cuda.Stream()
+            stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(stream):
+                side = torch.empty(n, hidden, dtype=torch.bfloat16, device=DEV)
+                _pinned(data, sf, args, num_experts, top_k, output=side, **kw)
+            torch.cuda.current_stream().wait_stream(stream)
+            graph = torch.cuda.CUDAGraph()
+            with autotune() if i % 2 else contextlib.nullcontext():
+                with torch.cuda.graph(graph):
+                    captured = torch.empty(n, hidden, dtype=torch.bfloat16, device=DEV)
+                    _pinned(data, sf, args, num_experts, top_k, output=captured, **kw)
+            for skewed in (False, True):
+                d2, s2, x2 = _rand_mxfp8(n, hidden, hidden, gen)
+                if skewed:
+                    i2, w2 = _skewed_routing(n, num_experts, top_k, gen)
+                else:
+                    i2, _ = _routing(n, num_experts, top_k, gen)
+                    w2 = (torch.rand(n, top_k, device=DEV, generator=gen) * 1.5).to(torch.bfloat16)
+                data.copy_(d2)
+                sf.copy_(s2)
+                ids.copy_(i2)
+                wts.copy_(w2)
+                captured.fill_(float("nan"))
+                graph.replay()
+                torch.cuda.synchronize()
+                eager = torch.full((n, hidden), float("nan"), dtype=torch.bfloat16, device=DEV)
+                _pinned(
+                    d2, s2, args, num_experts, top_k,
+                    topk_ids=i2, topk_weights=w2, gemm1_clamp_limit=limit, output=eager,
+                )  # fmt: skip
+                assert torch.equal(captured, eager), (n, "skewed" if skewed else "uniform")
+                exp2 = _ref_moe(x2, i2, w2, ref, None, None, limit).to(torch.bfloat16)
+                _assert_moe_close(captured, exp2)
+                elt, rms = _dev(captured, exp2)
+                worst = [max(worst[0], elt), max(worst[1], rms)]
+                frac = (captured != warm).float().mean().item()
+                stale_min = min(stale_min, frac)
+                assert frac > 0.9, (n, skewed, frac)
+            del graph, captured, side
+    captured_calls = [r for r in rec if r[2]]
+    assert len(captured_calls) == len(_DSPARK_CAPTURE_N), len(captured_calls)
+    assert len(rec) == 5 * len(_DSPARK_CAPTURE_N), len(rec)
+    assert {r[0] for r in rec} == {-1}, sorted({str(r[0]) for r in rec})
+    assert sum(r[1] for r in rec) == len(_DSPARK_CAPTURE_N) // 2, (
+        "the outer autotune() was not open at capture"
+    )
+    assert _op_cache_entries() == 0
+    print(
+        f"  test_dspark_capture_every_5G_over_gset OK: {len(_DSPARK_CAPTURE_N)} captures "
+        f"({len(_DSPARK_CAPTURE_N) // 2} inside an open autotune()), {2 * len(_DSPARK_CAPTURE_N)} replays bitwise = "
+        f"eager and in the gates (worst {worst[0]:.2f} ulp elt / {worst[1]:.2f} ulp RMS), replay vs "
+        f"capture-time output differing on >= {stale_min:.3f} of elements; {len(rec)} calls "
+        f"({len(captured_calls)} under capture, {sum(r[1] for r in rec)} with the outer tuning mode on) all on "
+        f"tactic -1; N {list(_DSPARK_CAPTURE_N)}"
+    )
+
+
+def test_pin_holds_the_cold_tactic_inside_a_tuning_pass():
+    """The target's pin inside the engine's tuning pass, with a tuned entry cached, and a control.
+
+    (1) A pinned call made inside an open `autotune()` -- the engine's warm-up
+    tuning pass, which runs the drafter -- takes the fallback tactic although
+    tuning mode is on at the call, leaves the outer tuning mode on afterwards,
+    adds no cache entry, and is bitwise equal to a call made outside any
+    tuning context, at every dumped row count, every captured N and every
+    cold-tile edge.
+    (2) Control: the same call UNPINNED inside `autotune()` is tuned -- the
+    recorder sees a tactic other than the fallback and the cache gains an
+    entry -- so the recorder in (1) would have seen a tuned call.
+    (3) With that entry cached, the pinned call still takes the fallback and
+    the cold bits, while `autotune(tune_mode=False)` alone (which only stops
+    tuning) takes the cached tactic.
+    """
+    num_experts, hidden, top_k = 128, 5120, 3
+    args, ref, limit = _drafter_layer(seed=700)
+    gen = ref["gen"]
+    tuner = AutoTuner.get()
+    rows = sorted(set(_DSPARK_DUMPED_N) | set(_DSPARK_CAPTURE_N) | {1, 383, 384, 725, 726})
+    n_max, sfw = max(rows), hidden // SV
+    data, sf, _ = _rand_mxfp8(n_max, hidden, hidden, gen)
+    ids, _ = _routing(n_max, num_experts, top_k, gen)
+    wts = (torch.rand(n_max, top_k, device=DEV, generator=gen) * 1.5).to(torch.bfloat16)
+
+    def call(n, pin=True):
+        out = torch.full((n, hidden), float("nan"), dtype=torch.bfloat16, device=DEV)
+        (_pinned if pin else _call)(
+            data[:n], sf[: n * sfw], args, num_experts, top_k,
+            topk_ids=ids[:n], topk_weights=wts[:n], gemm1_clamp_limit=limit, output=out,
+        )  # fmt: skip
+        return out
+
+    assert _op_cache_entries() == 0
+    cold = {n: call(n) for n in rows}
+    cache = tuner.profiling_cache.cache
+    try:
+        with _tactics() as rec:
+            restored, diff = [], []
+            with autotune():
+                for n in rows:
+                    if not torch.equal(call(n), cold[n]):
+                        diff.append(n)
+                    restored.append(tuner.is_tuning_mode)
+            assert diff == [], f"pinned inside autotune() != cold at N {diff}"
+            assert all(restored), "the pin did not restore the outer tuning mode"
+            assert (
+                len(rec) == len(rows) and {r[0] for r in rec} == {-1} and all(r[1] for r in rec)
+            ), rec
+            assert _op_cache_entries() == 0
+            pinned_calls = len(rec)
+
+            rec.clear()
+            with autotune(skip_dynamic_tuning_buckets=True):
+                call(5, pin=False)
+            tuned = rec[-1]
+            assert tuned[1], "the unpinned call inside autotune() did not run in tuning mode"
+            assert tuned[0] != -1, "the control call was not tuned"
+            assert _op_cache_entries() >= 1
+
+            rec.clear()
+            assert torch.equal(call(5), cold[5])
+            assert [r[0] for r in rec] == [-1], (rec, tuned)
+            rec.clear()
+            with autotune(tune_mode=False):
+                call(5, pin=False)
+            untuned_only = rec[-1][0]
+            assert untuned_only == tuned[0], (rec, tuned)
+        print(
+            f"  test_pin_holds_the_cold_tactic_inside_a_tuning_pass OK: {pinned_calls} pinned calls "
+            f"inside autotune() at N {rows[0]}..{rows[-1]} ({len(rows)} row counts) on tactic -1, bitwise = "
+            f"cold, cache empty; control: unpinned call tuned to {tuned[0]}; with that entry cached the pinned "
+            f"call takes -1 and the cold bits, autotune(tune_mode=False) alone takes {untuned_only}"
+        )
+    finally:
+        for key in [k for k in cache if k[0] == _OP]:
+            del cache[key]
+    assert _op_cache_entries() == 0
+    with _tactics() as rec:
+        assert torch.equal(call(5), cold[5])
+    assert [r[0] for r in rec] == [-1], rec
+
+
+def test_tactics_change_output_bits():
+    """Why the drafter pins the cold tactic: the op's tunable tactics do not all give the same bits.
+
+    At one row count per cold tile band and at the drafter's largest block
+    (N 5, 160, 385, 1280), every tactic the AutoTuner may choose from
+    (`get_valid_tactics` of the op's TunableRunner) is run on the same inputs
+    and compared bitwise with the pinned (cold) call, and against the
+    reference at the entry's gates. A rank that tunes on its own can therefore
+    land in a different bit class from its neighbour; the pinned call cannot.
+    """
+    from tensorrt_llm._torch.custom_ops.trtllm_gen_custom_ops import MxE4m3MxE2m1BlockScaleMoERunner
+
+    num_experts, hidden, inter, top_k = 128, 5120, 2304, 3
+    args, ref, limit = _drafter_layer(seed=800)
+    gen = ref["gen"]
+    runner = MxE4m3MxE2m1BlockScaleMoERunner(
+        num_experts, top_k, None, None, inter, hidden, inter, 0, num_experts, None, 1, 0
+    )
+    summary = []
+    for n in (5, 160, 385, 1280):
+        data, sf, xv = _rand_mxfp8(n, hidden, hidden, gen)
+        ids, _ = _routing(n, num_experts, top_k, gen)
+        wts = (torch.rand(n, top_k, device=DEV, generator=gen) * 1.5).to(torch.bfloat16)
+        exp = _ref_moe(xv, ids, wts, ref, None, None, limit).to(torch.bfloat16)
+        cold = torch.full((n, hidden), float("nan"), dtype=torch.bfloat16, device=DEV)
+        _pinned(
+            data,
+            sf,
+            args,
+            num_experts,
+            top_k,
+            topk_ids=ids,
+            topk_weights=wts,
+            gemm1_clamp_limit=limit,
+            output=cold,
+        )
+        inputs = [
+            None, None, data, sf,
+            args["gemm1_weights"], args["gemm1_weights_scale"], None, None, None, limit,
+            args["gemm2_weights"], args["gemm2_weights_scale"], None, wts, ids,
+        ]  # fmt: skip
+        tactics = runner.get_valid_tactics(inputs, None)
+        differ, outside, worst = [], [], [0.0, 0.0]
+        for tac in tactics:
+            out = torch.full((n, hidden), float("nan"), dtype=torch.bfloat16, device=DEV)
+            runner.forward(inputs, tactic=list(tac), output=out)
+            if not torch.equal(out, cold):
+                differ.append(tuple(tac))
+            if _gate_rejects(out, exp):
+                outside.append(tuple(tac))
+            elt, rms = _dev(out, exp)
+            worst = [max(worst[0], elt), max(worst[1], rms)]
+        summary.append((n, len(tactics), len(differ), len(outside), worst, differ[:4], outside[:4]))
+    for n, total, nd, no, w, d4, o4 in summary:
+        print(
+            f"    N={n}: {total} valid tactics, {nd} not bitwise equal to the cold call (first {d4}), "
+            f"{no} outside the gates (first {o4}); worst {w[0]:.2f} ulp elt / {w[1]:.2f} ulp RMS"
+        )
+    assert all(total > 0 for _, total, *_ in summary)
+    assert all(no == 0 for _, _, _, no, *_ in summary), "a valid tactic lands outside the gates"
+    assert any(nd > 0 for _, _, nd, *_ in summary), (
+        "every tactic gave the cold bits: this case separates nothing"
+    )
+
+
+def test_pin_ignores_a_cached_tactic():
+    """The target's pin takes the fallback even when the process holds a tuned entry for this op.
+
+    The drafter never tunes this op, but a process can still hold tuned
+    entries for it: `TLLM_AUTOTUNER_CACHE_PATH` makes the engine's warm-up
+    load an autotuner cache file (`autotune(cache_path=...)`), which another
+    engine may have tuned, rank by rank. The test writes such a file the
+    engine's way. It tunes the op unpinned at one row count per cold tile band
+    and at the drafter maximum (N 5, 160, 385, 1280), sets each entry to a
+    valid tactic whose bits differ from the fallback's where one exists (none
+    does at 1280, where the first valid tactic is used), saves the cache,
+    drops the entries, and loads the file through `autotune(cache_path=...)`.
+
+    Control: the cache is then hit -- `autotune(tune_mode=False)` alone takes
+    the cached tactic and, at N 5, 160 and 385, gives different bits. The
+    target's pin must take tactic -1 and give the uncached call's bits at every
+    N: eagerly, inside an open `autotune()`, and under CUDA-graph capture
+    replayed on new inputs.
+    """
+    import tempfile
+
+    from tensorrt_llm._torch.custom_ops.trtllm_gen_custom_ops import MxE4m3MxE2m1BlockScaleMoERunner
+
+    def _tac(t):
+        return list(t) if isinstance(t, (list, tuple)) else t
+
+    num_experts, hidden, inter, top_k = 128, 5120, 2304, 3
+    args, ref, limit = _drafter_layer(seed=900)
+    gen = ref["gen"]
+    tuner = AutoTuner.get()
+    cache = tuner.profiling_cache.cache
+    rows = (5, 160, 385, 1280)
+
+    def case(n):
+        data, sf, _ = _rand_mxfp8(n, hidden, hidden, gen)
+        ids, _ = _routing(n, num_experts, top_k, gen)
+        wts = (torch.rand(n, top_k, device=DEV, generator=gen) * 1.5).to(torch.bfloat16)
+        return data, sf, ids, wts
+
+    def call(fn, c, out=None):
+        data, sf, ids, wts = c
+        out = (
+            torch.full((data.shape[0], hidden), float("nan"), dtype=torch.bfloat16, device=DEV)
+            if out is None
+            else out
+        )
+        fn(
+            data,
+            sf,
+            args,
+            num_experts,
+            top_k,
+            topk_ids=ids,
+            topk_weights=wts,
+            gemm1_clamp_limit=limit,
+            output=out,
+        )
+        return out
+
+    def old_pin(*a, **kw):
+        with autotune(tune_mode=False):
+            return _call(*a, **kw)
+
+    assert _op_cache_entries() == 0
+    cases = {n: case(n) for n in rows}
+    fresh = {n: case(n) for n in rows}
+    cold = {n: call(_pinned, cases[n]) for n in rows}
+    cold_fresh = {n: call(_pinned, fresh[n]) for n in rows}
+    runner = MxE4m3MxE2m1BlockScaleMoERunner(
+        num_experts, top_k, None, None, inter, hidden, inter, 0, num_experts, None, 1, 0
+    )
+    chosen, differs = {}, {}
+    try:
+        for n in rows:
+            data, sf, ids, wts = cases[n]
+            inputs = [
+                None, None, data, sf,
+                args["gemm1_weights"], args["gemm1_weights_scale"], None, None, None, limit,
+                args["gemm2_weights"], args["gemm2_weights_scale"], None, wts, ids,
+            ]  # fmt: skip
+            tactics = [list(t) for t in runner.get_valid_tactics(inputs, None)]
+            pick = None
+            for tac in tactics:
+                out = torch.full((n, hidden), float("nan"), dtype=torch.bfloat16, device=DEV)
+                runner.forward(inputs, tactic=tac, output=out)
+                if not torch.equal(out, cold[n]):
+                    pick = tac
+                    break
+            differs[n] = pick is not None
+            chosen[n] = pick if pick is not None else tactics[0]
+            before = set(k for k in cache if k[0] == _OP)
+            with autotune(skip_dynamic_tuning_buckets=True):
+                call(_call, cases[n])
+            new = set(k for k in cache if k[0] == _OP) - before
+            assert new, f"the unpinned call at N={n} inside autotune() wrote no cache entry"
+            for key in new:
+                runner_id, _, min_time = cache[key]
+                cache[key] = (runner_id, chosen[n], min_time)
+        assert [differs[n] for n in rows] == [True, True, True, False], differs
+        written = {k: _tac(v[1]) for k, v in cache.items() if k[0] == _OP}
+        with tempfile.TemporaryDirectory() as tmp:
+            path = f"{tmp}/autotuner_cache.json"
+            tuner.profiling_cache.save_cache(path, tuner.mapping.rank)
+            for key in [k for k in cache if k[0] == _OP]:
+                del cache[key]
+            assert _op_cache_entries() == 0
+            with autotune(tune_mode=False, cache_path=path):
+                pass
+        cache = tuner.profiling_cache.cache
+        loaded = {k: _tac(v[1]) for k, v in cache.items() if k[0] == _OP}
+        assert loaded == written, (loaded, written)
+
+        with _tactics() as rec:
+            for n in rows:
+                rec.clear()
+                out = call(old_pin, cases[n])
+                assert [_tac(r[0]) for r in rec] == [chosen[n]], (n, rec)
+                assert torch.equal(out, cold[n]) != differs[n], n
+        print(
+            f"    control: autotune(tune_mode=False) takes the loaded tactics {[chosen[n] for n in rows]}"
+        )
+
+        with _tactics() as rec:
+            for n in rows:
+                assert torch.equal(call(_pinned, cases[n]), cold[n]), (
+                    f"pinned call != uncached call at N={n}"
+                )
+                with autotune():
+                    assert torch.equal(call(_pinned, cases[n]), cold[n]), (
+                        f"pinned in autotune() != uncached at N={n}"
+                    )
+            for i, n in enumerate(rows):
+                c = case(n)
+                stream = torch.cuda.Stream()
+                stream.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(stream):
+                    call(_pinned, c)
+                torch.cuda.current_stream().wait_stream(stream)
+                graph = torch.cuda.CUDAGraph()
+                with autotune() if i % 2 else contextlib.nullcontext():
+                    with torch.cuda.graph(graph):
+                        captured = call(
+                            _pinned, c, torch.empty(n, hidden, dtype=torch.bfloat16, device=DEV)
+                        )
+                for dst, src in zip(c, fresh[n]):
+                    dst.copy_(src)
+                captured.fill_(float("nan"))
+                graph.replay()
+                torch.cuda.synchronize()
+                assert torch.equal(captured, cold_fresh[n]), (
+                    f"replay with a cached tactic present != uncached at N={n}"
+                )
+                del graph, captured
+        assert {str(r[0]) for r in rec} == {"-1"}, sorted({str(r[0]) for r in rec})
+        assert sum(r[2] for r in rec) == len(rows)
+        print(
+            f"  test_pin_ignores_a_cached_tactic OK: with tactics {[chosen[n] for n in rows]} loaded for "
+            f"N {list(rows)}, {len(rec)} pinned calls ({len(rows)} under capture) took -1 and the uncached bits"
+        )
+    finally:
+        for key in [k for k in tuner.profiling_cache.cache if k[0] == _OP]:
+            del tuner.profiling_cache.cache[key]
+    assert _op_cache_entries() == 0
+
+
 def _window(args, ref, offset: int, num_local: int):
     """The `(args, ref)` pair narrowed to one expert-parallel window."""
     sub = dict(args)
@@ -1584,6 +2553,64 @@ def _window(args, ref, offset: int, num_local: int):
             b[offset : offset + num_local],
         )
     return sub, sub_ref
+
+
+_DSPARK_LAYER = None
+
+
+def _dspark_layer():
+    """The drafter layer of `test_dspark_drafter_surface`, built once for the cells."""
+    global _DSPARK_LAYER
+    if _DSPARK_LAYER is None:
+        _DSPARK_LAYER = _drafter_layer(seed=300)
+    return _DSPARK_LAYER
+
+
+def _certify_dspark_cell(cell) -> None:
+    """One DeepSeek-V4.1 drafter cell, called the way the drafter calls it.
+
+    Pre-routed with bf16 weights in `[0, 1.5)`, the clamp at 10 per expert, no
+    alpha / beta, no biases. A pinned cell runs inside `fallback_tactic()` and
+    writes a NaN-filled `output=` buffer, getting back the empty tensor; the
+    other form returns a fresh tensor. The entry's reference is tied bitwise to
+    this file's `_ref_moe` before it gates the kernel.
+    """
+    spec = cell.spec
+    num_experts, hidden, inter, top_k = (
+        spec["num_experts"],
+        spec["hidden"],
+        spec["intermediate"],
+        spec["top_k"],
+    )
+    assert (num_experts, hidden, inter, top_k) == (128, 5120, 2304, 3), spec
+    assert spec["local_expert_offset"] == 0 and spec["local_num_experts"] == num_experts, spec
+    assert not spec["routed_by_kernel"], spec
+    args, ref, limit = _dspark_layer()
+    assert ref["h1_pad"] == hidden and args["intermediate_size"] == inter, "no padding at 5120/2304"
+    assert torch.equal(limit, torch.full_like(limit, spec["swiglu_limit"])), limit
+    tokens = spec["tokens"]
+    gen = torch.Generator(device=DEV).manual_seed(zlib.crc32(cell.why.encode()))
+    data, sf, xv = _rand_mxfp8(tokens, hidden, hidden, gen)
+    ids, _ = _routing(tokens, num_experts, top_k, gen)
+    wts = (torch.rand(tokens, top_k, device=DEV, generator=gen) * 1.5).to(torch.bfloat16)
+
+    # 1. The entry's reference against this file's, on identical inputs.
+    entry_ref = moe.reference(xv, ids, wts, ref["up"], ref["gate"], ref["down"], clamp_limit=limit)
+    local_ref = _ref_moe(xv, ids, wts, ref, None, None, limit)
+    torch.testing.assert_close(entry_ref, local_ref, rtol=0.0, atol=0.0)
+
+    # 2. The entry's reference against the kernel, through the entry's gate.
+    kw = dict(topk_ids=ids, topk_weights=wts, gemm1_clamp_limit=limit)
+    if spec["output"]:
+        out = torch.full((tokens, hidden), float("nan"), dtype=torch.bfloat16, device=DEV)
+        kw["output"] = out
+    run = _pinned if spec["pinned"] else _call
+    y = run(data, sf, args, num_experts, top_k, **kw)
+    if spec["output"]:
+        assert y.numel() == 0, tuple(y.shape)
+        y = out
+    assert y.shape == (tokens, hidden), y.shape
+    moe.compare(y, entry_ref.to(torch.bfloat16))
 
 
 @pytest.mark.parametrize("cell", moe.CELLS, ids=[c.why[:44] for c in moe.CELLS])
@@ -1608,6 +2635,9 @@ def test_certified_cells(cell):
     at all.
     """
     spec = cell.spec
+    if spec.get("model") == "deepseek-v4.1":
+        _certify_dspark_cell(cell)
+        return
     args, ref = _gpt_oss()
     off, n = spec["local_expert_offset"], spec["local_num_experts"]
     num_experts, hidden, top_k = spec["num_experts"], spec["hidden"], spec["top_k"]

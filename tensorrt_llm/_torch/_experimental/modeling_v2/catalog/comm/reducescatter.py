@@ -43,9 +43,10 @@ class Reducescatter(OpWrapper):
 
     ARCHS = frozenset({Arch.SM_103})
 
-    # deepseek-r1 at dep4 is the only caller and always passes `sizes=None`:
-    # it pads to a common height first. The row counts are the full heights an
-    # attention-DP step reduces, which is the rank count times a slice.
+    # deepseek-r1 at dep4 always passes `sizes=None`: it pads to a common
+    # height first. The row counts are the full heights an attention-DP step
+    # reduces, which is the rank count times a slice. deepseek-v4.1 pads the
+    # same way; its cells follow.
     CELLS: tuple[Cell, ...] = (
         Cell(
             why="decode: one row per rank after the split, hidden 7168",
@@ -59,13 +60,60 @@ class Reducescatter(OpWrapper):
             why="prefill chunk height",
             spec=dict(rows_per_rank=2048, trailing=(7168,), dtype=torch.bfloat16, sizes=None),
         ),
+        # deepseek-v4.1 under attention DP: per-rank rows n (input W n rows) at
+        # the ends of the swept range 1..16384 (16384 is the largest
+        # max_num_tokens served) and at 1536, the largest n a decode graph
+        # captures (batch 256 x next_n 6). The matrix sweeps every n in between
+        # for both forms.
+        *(
+            Cell(
+                why=f"deepseek-v4.1 {form} n={n}: {role}",
+                spec=dict(rows_per_rank=n, trailing=trailing, dtype=dtype, sizes=None),
+            )
+            for form, trailing, dtype in (
+                ("engram bf16 [Wn, 6144]", (6144,), torch.bfloat16),
+                ("moe fp32 [Wn, 5120]", (5120,), torch.float32),
+            )
+            for n, role in (
+                (1, "decode end of the swept range"),
+                (1536, "top of the decode capture set"),
+                (16384, "max_num_tokens, prefill end of the swept range"),
+            )
+        ),
     )
 
     note = """
-    The ragged form and dtypes other than bf16 work and are exercised by the op
-    matrix, but no shipped target reaches them, so they are not cells. CUDA
-    graph behaviour is carried by the matrix's own named checks rather than as
-    a cell axis.
+    The ragged form and dtypes other than bf16 (beyond the DeepSeek-V4.1 fp32
+    form below) work and are exercised by the op matrix, but no shipped target
+    reaches them, so they are not cells. CUDA graph behaviour is carried by the
+    matrix's own named checks rather than as a cell axis.
+
+    DeepSeek-V4.1: under attention DP every rank is padded to
+    max(all_rank_num_tokens) and reduce-scatters the gathered token set with
+    `sizes=None`, keeping n rows of a W n-row input (W the group size): on the
+    engram layers (only with the device-resident engram table) the engram rows
+    as bf16 [W n, 6144], and on every layer the routed experts' output as fp32
+    [W n, 5120]. The MoE runner is chunked at 8192 rows; this call is not, it
+    takes the whole concatenated output. No metadata. The sum runs in the input
+    dtype, sequentially in NCCL's ring order, so on real activations the fp32
+    form is not the correctly rounded sum (within (W-1) * 2^-24 * sum|x|
+    elementwise, measured) and the bf16 form carries bf16 rounding per partial
+    sum; the cells and sweeps use exact payloads, which is what makes the gate
+    bitwise. The matrix sweeps every per-rank n in 1..16384 for both forms, in
+    the order an engram layer issues them, ascending and then shuffled,
+    bitwise; it captures one decode graph per per-rank n of the capture set
+    (batch G in 1..32, 40..128 step 8, 192, 256; n = G or 6G for next_n 1 or
+    6, plus 35 and 160: 84 values up to 1536), each holding the forward's 42
+    reduce-scatters, and replays them bitwise against the exact sum and, on
+    unrestricted payloads, against an eager call on the same buffer. A
+    captured step must pad every rank to the same n, because `sizes` is frozen
+    into the graph. The ragged form at V4.1 sizes is certified only at four
+    dumped splits, eagerly. Not certified: n above 16384; capture at an n
+    outside that set. The other group layouts the target runs -- world 2 (one
+    pp2 x dep2 stage), world 4 cut into two groups of 2, world 8 across two
+    trays, world 8 cut into two groups of 4 -- were measured on the MPI-session
+    symbol under an mpirun launcher; this matrix runs one group of 4 on the
+    ProcessGroup symbol and does not certify them.
     """
 
     def raw_call(

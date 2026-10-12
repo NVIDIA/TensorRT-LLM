@@ -85,6 +85,39 @@ SITES_PER_DECODE_GRAPH = 29
 # the accumulation-order test's error budget.
 BF16_U = 2.0**-8
 
+# The DeepSeek-V4.1 core target under attention DP reduce-scatters the gathered
+# token set with sizes = None, each rank padded to max(all_rank_num_tokens): on
+# the engram layers the engram rows as bf16 [WORLD n, 6144], on every layer the
+# routed experts' output as fp32 [WORLD n, 5120].
+CORE_FORMS: Tuple[Tuple[str, torch.dtype, int], ...] = (
+    ("engram bf16 [Wn,6144]", torch.bfloat16, 6144),
+    ("MoE fp32 [Wn,5120]", torch.float32, 5120),
+)
+N_MAX = 16384  # rows per rank: the largest max_num_tokens the target is served at
+SWEEP_SLACK = 509  # extra table rows (prime): every call reads its rows at its own offset
+CORE_LAYERS = 40
+ENGRAM_LAYER_IDS = (1, 14)
+# The V4.1 capture batch set, per rank: every G in 1..32 plus the padded default
+# list of cuda_graph_config {enable_padding: true, max_batch_size: 256} (16..128
+# step 8, 192, 256) -- 46 values. A captured step is generation-only with next_n 1
+# (DSpark off) or 6 (DSpark on), so every rank keeps n = G or n = 6G rows of a
+# WORLD n-row input. The 5G / 6G rows of G in 1..8, 16, 24, 32 are kept beside
+# them (they add 35 and 160): 84 per-rank row counts, up to 1536.
+GSET: Tuple[int, ...] = tuple(range(1, 33)) + tuple(range(40, 129, 8)) + (192, 256)
+_GATE_BATCHES: Tuple[int, ...] = tuple(range(1, 9)) + (16, 24, 32)
+CORE_CAPTURE_ROWS: Tuple[int, ...] = tuple(
+    sorted(
+        set(GSET)
+        | {6 * g for g in GSET}
+        | set(_GATE_BATCHES)
+        | {5 * b for b in _GATE_BATCHES}
+        | {6 * b for b in _GATE_BATCHES}
+    )
+)
+# Eager prefill-sized reduce-scatters (per-rank rows) run between the decode
+# graphs' replays: row counts the runtime dumps showed, and N_MAX.
+PREFILL_BETWEEN_REPLAYS: Tuple[int, ...] = (888, 890, 2048, 9524, 10441, 16378, N_MAX)
+
 # Bound inside the rank body, never in the launcher: importing the entry
 # pulls in tensorrt_llm, which calls MPI_Init at import, and an
 reducescatter: Any = None
@@ -1291,6 +1324,277 @@ def check_the_group_still_works_after_the_negative_tests() -> None:
     dist.barrier()
 
 
+def _core_rows(rank: int, rows: int, seed: int, dtype: torch.dtype, hidden: int) -> torch.Tensor:
+    """`_block`'s exact value set (multiples of 1/8, |x| <= 31/8) for a whole sweep table."""
+    gen = torch.Generator(device="cuda").manual_seed(seed * 977 + rank + 1)
+    raw = torch.randint(-31, 32, (rows, hidden), generator=gen, device="cuda", dtype=torch.int32)
+    return (raw.float() / 8.0).to(dtype)
+
+
+def _core_tables() -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
+    """Per CORE_FORMS entry: this rank's input rows and the exact elementwise sum
+    over the group, WORLD * N_MAX + SWEEP_SLACK rows each (exact in the dtype)."""
+    rows = WORLD * N_MAX + SWEEP_SLACK
+    mine, sums = [], []
+    for f, (_, dtype, hidden) in enumerate(CORE_FORMS):
+        acc = torch.zeros((rows, hidden), dtype=torch.float32, device="cuda")
+        for r in range(WORLD):
+            part = _core_rows(r, rows, 120000 + f, dtype, hidden)
+            acc += part.float()
+            if r == RANK:
+                mine.append(part)
+            del part
+        sums.append(acc.to(dtype))
+        del acc
+    return mine, sums
+
+
+def _sweep_offset(k: int, form: int) -> int:
+    """Row offset of step k's call of one form: no two nearby calls read the
+    same rows, so a result left over from an earlier call cannot pass."""
+    return (k * 131 + form * 211) % SWEEP_SLACK
+
+
+def check_v41_core_reduce_scatters_at_every_per_rank_row_count() -> None:
+    """DeepSeek-V4.1: every per-rank n in 1..N_MAX, the core target's reduce-scatters, twice.
+
+    Input WORLD * n rows (up to WORLD x N_MAX), n kept per rank: per step the
+    engram rows' bf16 [Wn, 6144] and the MoE output's fp32 [Wn, 5120], in the
+    order an engram layer issues them. First with n ascending, then in a seeded
+    shuffle (prefill-sized steps between decode-sized ones). Every element of
+    every result is compared with the exact sum; the mismatch counts stay on
+    the device and are read once per pass. The cells carry the ends of this
+    range; this is what keeps every n between them certified. Bounded at
+    2 x 2 x N_MAX = 65,536 calls, one device-side compare each and no per-call
+    host sync.
+    """
+    mine, sums = _core_tables()
+    # Not blind to a stale result: the previous step's answer differs from this
+    # step's on nearly every element, in both forms.
+    for f, table in enumerate(sums):
+        for n in (1, 8, 890, N_MAX):
+            now, before = _sweep_offset(1000, f), _sweep_offset(999, f)
+            fraction = (table[now : now + n] != table[before : before + n]).float().mean().item()
+            assert fraction > 0.9, (
+                f"{CORE_FORMS[f][0]} n={n}: a stale result differs on only {fraction:.4f}"
+            )
+
+    ascending = list(range(1, N_MAX + 1))
+    shuffled = list(ascending)
+    random.Random(4242).shuffle(shuffled)
+    k = 0
+    started = time.monotonic()
+    for name, order in (("ascending", ascending), ("shuffled", shuffled)):
+        bad = torch.zeros(len(CORE_FORMS), N_MAX + 1, dtype=torch.int64, device="cuda")
+        for n in order:
+            k += 1
+            for f, (_, dtype, hidden) in enumerate(CORE_FORMS):
+                o = _sweep_offset(k, f)
+                out = reducescatter(mine[f][o : o + WORLD * n], None, GROUP)
+                assert out.shape == (n, hidden) and out.dtype is dtype, (n, out.shape, out.dtype)
+                bad[f, n] += (out != sums[f][o + RANK * n : o + (RANK + 1) * n]).sum()
+        torch.cuda.synchronize()
+        wrong = bad.nonzero().tolist()
+        assert not wrong, f"{name}: wrong reduce-scatters at " + ", ".join(
+            f"{CORE_FORMS[f][0]} n={n} ({bad[f, n].item()} elements)" for f, n in wrong[:20]
+        )
+        if RANK == 0:
+            print(
+                f"[rank 0] v4.1 core sweep {name}: n=1..{N_MAX}, {len(CORE_FORMS) * N_MAX} calls, "
+                f"every element exact ({time.monotonic() - started:.0f}s so far)",
+                flush=True,
+            )
+        dist.barrier()
+    del mine, sums
+    torch.cuda.empty_cache()
+    dist.barrier()
+
+
+def check_v41_core_ragged_reduce_scatters_at_the_dumped_row_counts() -> None:
+    """DeepSeek-V4.1: the sizes-vector form at the per-rank counts the runtime dump showed.
+
+    The core target pads to max(all_rank_num_tokens) and passes sizes = None;
+    these are the unpadded splits of the same steps, in both CORE_FORMS.
+    """
+    vectors = [[48, 888, 890, 1], [890, 0, 888, 48], [2048, 890, 14, 888], [888, 890, 890, 888]]
+    for v, sizes in enumerate(vectors):
+        sizes = (sizes * WORLD)[:WORLD]
+        for f, (label, dtype, hidden) in enumerate(CORE_FORMS):
+            seed = 125000 + 10 * v + f
+            out = reducescatter(_input(RANK, sizes, seed, dtype, (hidden,)), sizes, GROUP)
+            assert out.shape == (sizes[RANK], hidden), (sizes, out.shape)
+            _assert_bitwise(
+                out, _ref(sizes, RANK, seed, dtype, (hidden,)), f"ragged {label} sizes={sizes}"
+            )
+    dist.barrier()
+
+
+def check_v41_core_decode_graphs_replay_bitwise_equal_to_eager() -> None:
+    """DeepSeek-V4.1: one decode graph per CORE_CAPTURE_ROWS entry, the core target's reduce-scatters.
+
+    Per graph, in the target's order: on the engram layers (1, 14) the engram
+    rows' bf16 [Wn, 6144], then on every one of the 40 layers the MoE output's
+    fp32 [Wn, 5120] -- 42 sites. Every graph captured largest first into one
+    shared pool and kept alive, then three passes in shuffled order with new
+    data in the captured inputs: exact payloads one graph at a time, with an
+    eager reduce-scatter of each form at a prefill count
+    (PREFILL_BETWEEN_REPLAYS, rotating, per rank) between replays; exact
+    payloads all back to back with nothing synchronizing; and unrestricted
+    normal payloads, where the summation order shows in the bits, every site
+    compared bit for bit with an eager call on the same buffer. Before every
+    replay of the first two passes, every site's output is checked to differ
+    from the new exact sum on more than 90% of its elements, so a replay that
+    did not run (a stale output) cannot pass.
+
+    Each site's output is copied inside the capture into a persistent buffer
+    outside the shared pool, as `_capture_per_batch_size` does and for the same
+    reason: pooled outputs alias across graphs, so a burst of replays would
+    otherwise leave every graph holding the last writer's result.
+    """
+    distinct = 8  # fp32 input buffers per graph, cycled over its 40 MoE sites
+    counts = (len(ENGRAM_LAYER_IDS), distinct)
+    for n in CORE_CAPTURE_ROWS:
+        _warm_up_off_capture_stream(
+            lambda n=n: [
+                reducescatter(_input(RANK, [n] * WORLD, 1, dt, (h,)), None, GROUP)
+                for _, dt, h in CORE_FORMS
+            ],
+            reps=1,
+        )
+
+    keys: List[Tuple[int, int]] = []
+    moe_site = 0
+    for layer in range(CORE_LAYERS):
+        if layer in ENGRAM_LAYER_IDS:
+            keys.append((0, ENGRAM_LAYER_IDS.index(layer)))
+        keys.append((1, moe_site % distinct))
+        moe_site += 1
+    assert len(keys) == CORE_LAYERS + len(ENGRAM_LAYER_IDS), len(keys)
+
+    pool = None
+    graphs: Dict[int, Any] = {}
+    inputs: Dict[int, Dict[int, List[torch.Tensor]]] = {}
+    sites: Dict[int, List[Tuple[int, int, torch.Tensor]]] = {}
+    for n in sorted(CORE_CAPTURE_ROWS, reverse=True):
+        inputs[n] = {
+            f: [_input(RANK, [n] * WORLD, 30 + 10 * f + i, dt, (h,)) for i in range(counts[f])]
+            for f, (_, dt, h) in enumerate(CORE_FORMS)
+        }
+        persistent = [
+            torch.zeros(n, CORE_FORMS[f][2], dtype=CORE_FORMS[f][1], device="cuda") for f, _ in keys
+        ]
+        graph = torch.cuda.CUDAGraph()
+        ctx = torch.cuda.graph(graph) if pool is None else torch.cuda.graph(graph, pool=pool)
+        with ctx:
+            for dst, (f, i) in zip(persistent, keys):
+                dst.copy_(reducescatter(inputs[n][f][i], None, GROUP))
+        sites[n] = [(f, i, dst) for dst, (f, i) in zip(persistent, keys)]
+        pool = graph.pool() if pool is None else pool
+        graphs[n] = graph
+        torch.cuda.synchronize()
+        dist.barrier()
+
+    def stage(n: int, seed: int) -> Dict[Tuple[int, int], torch.Tensor]:
+        refs = {}
+        for f, (_, dt, h) in enumerate(CORE_FORMS):
+            for i, x in enumerate(inputs[n][f]):
+                s = seed + 100 * f + i
+                x.copy_(_input(RANK, [n] * WORLD, s, dt, (h,)))
+                refs[(f, i)] = _ref([n] * WORLD, RANK, s, dt, (h,))
+        return refs
+
+    def verify(n: int, refs: Dict[Tuple[int, int], torch.Tensor], where: str) -> None:
+        bad = torch.zeros((), dtype=torch.int64, device="cuda")
+        for f, i, out in sites[n]:
+            bad += (out != refs[(f, i)]).sum()
+        assert bad.item() == 0, (
+            f"{where} n={n}: {bad.item()} wrong elements over {len(sites[n])} sites"
+        )
+
+    stale_worst = [1.0]
+
+    def assert_stale_is_visible(
+        n: int, refs: Dict[Tuple[int, int], torch.Tensor], where: str
+    ) -> None:
+        """Before the replay: what the outputs hold now must fail the gate."""
+        fractions = torch.stack([(out != refs[(f, i)]).double().mean() for f, i, out in sites[n]])
+        worst = fractions.min().item()
+        stale_worst[0] = min(stale_worst[0], worst)
+        assert worst > 0.9, (
+            f"{where} n={n}: a stale output differs from the new sum on only {worst:.4f}"
+        )
+
+    rng = random.Random(777)
+    order = list(CORE_CAPTURE_ROWS)
+    rng.shuffle(order)
+    for pos, n in enumerate(order):
+        refs = stage(n, 200000 + 1000 * n)
+        assert_stale_is_visible(n, refs, "pass 1 (before replay)")
+        graphs[n].replay()
+        wide, seed = PREFILL_BETWEEN_REPLAYS[pos % len(PREFILL_BETWEEN_REPLAYS)], 300000 + pos
+        eager = {
+            f: reducescatter(_input(RANK, [wide] * WORLD, seed + f, dt, (h,)), None, GROUP)
+            for f, (_, dt, h) in enumerate(CORE_FORMS)
+        }
+        torch.cuda.synchronize()
+        verify(n, refs, "pass 1 (checked)")
+        for f, (label, dt, h) in enumerate(CORE_FORMS):
+            _assert_bitwise(
+                eager[f],
+                _ref([wide] * WORLD, RANK, seed + f, dt, (h,)),
+                f"pass 1 eager {label} n={wide}",
+            )
+        del eager
+        dist.barrier()
+    rng.shuffle(order)
+    staged = {n: stage(n, 400000 + 1000 * n) for n in order}
+    for n in order:
+        assert_stale_is_visible(n, staged[n], "pass 2 (before replay)")
+    for n in order:
+        graphs[n].replay()
+    torch.cuda.synchronize()
+    for n in order:
+        verify(n, staged[n], "pass 2 (burst)")
+    del staged
+    dist.barrier()
+    rng.shuffle(order)
+    for n in order:
+        for f, (_, dt, h) in enumerate(CORE_FORMS):
+            for i, x in enumerate(inputs[n][f]):
+                gen = torch.Generator(device="cuda").manual_seed(
+                    (500000 + 1000 * n + 100 * f + i) * 977 + RANK
+                )
+                x.copy_(
+                    torch.randn(x.shape, generator=gen, device="cuda", dtype=torch.float32).to(dt)
+                )
+        graphs[n].replay()
+        torch.cuda.synchronize()
+        eager_out = {
+            (f, i): reducescatter(x, None, GROUP)
+            for f in inputs[n]
+            for i, x in enumerate(inputs[n][f])
+        }
+        torch.cuda.synchronize()
+        for s, (f, i, out) in enumerate(sites[n]):
+            bits = torch.int16 if out.dtype is torch.bfloat16 else torch.int32
+            assert torch.equal(out.view(bits), eager_out[(f, i)].view(bits)), (
+                f"pass 3 n={n} site={s}: replay differs from eager on the same data"
+            )
+        dist.barrier()
+    if RANK == 0:
+        print(
+            f"[rank 0] v4.1 core graphs: {len(graphs)} captured at per-rank {list(CORE_CAPTURE_ROWS)}; "
+            "before every replay of passes 1-2 a stale output differed from the new reference on "
+            f"at least {stale_worst[0]:.4f} of its elements",
+            flush=True,
+        )
+    for held in (graphs, sites, inputs):
+        held.clear()
+    torch.cuda.synchronize()
+    torch.cuda.empty_cache()
+    dist.barrier()
+
+
 CHECKS = (
     # Stays first: it is the only test that can observe GROUP's first-ever
     # call, and every later test needs the communicator it builds.
@@ -1324,6 +1628,13 @@ CHECKS = (
     check_wrapper_guards_a_sizes_list_of_the_wrong_length,
     check_wrapper_guards_a_split_that_does_not_cover_the_input,
     check_the_group_still_works_after_the_negative_tests,
+    # DeepSeek-V4.1's surface at world size 4: every per-rank row count of both
+    # core forms, the dumped ragged splits, and the decode graphs at the V4.1
+    # capture set. After the group is shown healthy and after every existing
+    # check but the guard check, which refuses before the group opens.
+    check_v41_core_reduce_scatters_at_every_per_rank_row_count,
+    check_v41_core_ragged_reduce_scatters_at_the_dumped_row_counts,
+    check_v41_core_decode_graphs_replay_bitwise_equal_to_eager,
     # The guard check runs first of the two: it refuses the same dtypes
     # before the group opens, so it leaves the communicator usable.
     check_the_guard_refuses_every_dtype_it_cannot_sum,

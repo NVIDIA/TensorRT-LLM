@@ -16,6 +16,49 @@ import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtl
 
 from .._op import Arch, Cell, OpWrapper
 
+# DeepSeek-V4.1's layouts, all bf16 at eps 1e-20:
+# (id tag, width, parent row stride or None for contiguous, column offset, call site).
+# The q / kv views slice one [T, 1792] qkv buffer; the DSpark drafter's ring
+# write slices one [M, 1536] buffer per stage. Each layout is certified at
+# every row count 1..16384 by the row sweep in the test; the cells hold the
+# sweep's two ends, and at one row a column view takes the compact kernel.
+_DSV41_LAYOUTS = (
+    ("hidden 5120", 5120, None, 0, "attn / ffn / final norm"),
+    ("q 1280@0/1792", 1280, 1792, 0, "q_norm on qkv[:, :1280]"),
+    ("kv 512@1280/1792", 512, 1792, 1280, "kv_norm on qkv[:, 1280:]"),
+    ("comp 512", 512, None, 0, "compressed-latent norm"),
+    ("idx 128", 128, None, 0, "index-K norm"),
+    ("ring0 512@0/1536", 512, 1536, 0, "DSpark ring kv_norm, stage 0"),
+    ("ring1 512@512/1536", 512, 1536, 512, "DSpark ring kv_norm, stage 1"),
+    ("ring2 512@1024/1536", 512, 1536, 1024, "DSpark ring kv_norm, stage 2"),
+)
+_DSV41_ROWS = (1, 16384)
+_DSV41_VIT_ROWS = (1, 51111)
+
+_DSV41_CELLS = tuple(
+    Cell(
+        why=f"deepseek-v4.1 {tag} rows={rows}: {site}, eps 1e-20, "
+        f"{'one row' if rows == 1 else 'top'} of the row sweep 1..16384",
+        spec=dict(
+            shape=(rows, width),
+            dtype=torch.bfloat16,
+            eps=1e-20,
+            row_stride=stride,
+            col_offset=offset,
+            data="eps_classes",
+        ),
+    )
+    for tag, width, stride, offset, site in _DSV41_LAYOUTS
+    for rows in _DSV41_ROWS
+) + tuple(
+    Cell(
+        why=f"deepseek-v4.1 vision 1024 rows={rows}: vision tower norm1 / norm2 / "
+        f"final norm, eps 1e-6, {'one row' if rows == 1 else 'top'} of the row sweep 1..51111",
+        spec=dict(shape=(rows, 1024), dtype=torch.bfloat16, eps=1e-6, data="vit"),
+    )
+    for rows in _DSV41_VIT_ROWS
+)
+
 
 class FlashinferRmsnorm(OpWrapper):
     """`x / sqrt(mean(x^2, -1) + eps) * weight`, one op call, new tensor out.
@@ -53,6 +96,10 @@ class FlashinferRmsnorm(OpWrapper):
             why="deepseek kv_lora rank 512, the narrowest row any target asks for",
             spec=dict(shape=(16, 512), dtype=torch.bfloat16, eps=1e-6),
         ),
+        # DeepSeek-V4.1: see `_DSV41_LAYOUTS`. Optional spec keys: `row_stride`
+        # and `col_offset` make `x` a column view of a wider parent, `data`
+        # names the row-magnitude pattern (the test's `_build` documents both).
+        *_DSV41_CELLS,
     )
 
     note = """
@@ -71,6 +118,31 @@ class FlashinferRmsnorm(OpWrapper):
     rejects it below. The CUDA-JIT path
     (`FLASHINFER_USE_CUDA_NORM=1`) does raise, but this entry does not
     certify that path.
+
+    DeepSeek-V4.1: bf16 at eps 1e-20 on the layouts in `_DSV41_LAYOUTS`,
+    metadata none. Every row count 1..16384 is certified at each layout: the
+    16384-row call meets the reference, every prefix of it is bitwise the op
+    on that many rows, nothing is written past the last row, and no kernel
+    variant compiles per row count. Rows mix unit, eps-scale and zero
+    magnitudes, so a kernel that clamped or ignored the tiny eps fails the
+    gate; zero rows come back exactly 0. Column views need a 16-byte-aligned
+    row stride and start; a one-row view reports contiguous and takes the
+    compact kernel, which needs a 128-byte-aligned start (column offset a
+    multiple of 64 elements, as every certified site is). A misaligned view
+    raises `ValueError`; it is never computed wrongly. A column view's output
+    is a new contiguous `[rows, width]` tensor (at one row it keeps the view's
+    row stride). Any width-512 view with a 16-byte-aligned row stride up to
+    2048 and column offset was measured at 13 row counts up to 160. CUDA graphs
+    are certified, after an eager call at the same shape, at the 126 per-rank
+    row counts {G, 3G, 5G, 6G} over the 46 captured batch sizes up to 256 for
+    the five core layouts, and at 473 counts up to 1280 for the ring views.
+    The vision tower calls it at width 1024, eps 1e-6, contiguous `[P, 1024]`
+    with +-2000 massive channels, every P 1..51111, captured at P = 1517, 4680,
+    5325, 8772 and 17037. Not certified for V4.1: fp16 / fp32 at eps 1e-20;
+    rows whose squares underflow fp32 (|x| below about 1e-19, flushed to zero);
+    more than 16384 rows (51111 at width 1024); width 1024 at another eps or as
+    a view; capture at other row counts, or before the shape's kernel variant
+    has compiled; 3-D input at eps 1e-20.
     """
 
     def raw_call(self, x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:

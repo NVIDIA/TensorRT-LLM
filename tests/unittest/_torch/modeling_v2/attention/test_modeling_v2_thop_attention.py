@@ -164,6 +164,18 @@ exercised:
    page. Wrong batch states (the flag left off, context_lengths carrying the
    full KV length or 0, a replaced in-window cached page) are gated far
    outside the tolerance band.
+10. No-KV-cache (pool-free) mode, the DeepSeek-V4.1 vision tower's surface:
+   every pool argument None, 16/16/64 bf16, mask_type 0, variable-length
+   images (1 to 9216 tokens, up to 16 per call) with and without
+   cu_q_seqlens. Gated against a per-image fp32 reference, with a causal-mask
+   rival and a cross-image-leak rival each required far outside the band;
+   mask_type 1 shown causal per image; the batch state pinned (given
+   cu_q_seqlens overrides context_lengths; a context_lengths / sequence_length
+   mismatch is silently wrong; update_kv_cache=False is rejected; page size,
+   max lengths and the input type are inert; rows past T untouched); and
+   CUDA-graph capture/replay -- fixed to the captured split without
+   max_context_q_len_override, following the split rewritten into the device
+   length tensors with it, which is the target's two-slot (image, pad) form.
 """
 
 import math
@@ -5285,6 +5297,852 @@ def test_mla_rejects_null_q_lora_rank() -> None:
         raise AssertionError("q_lora_rank=None was accepted on the MLA path")
 
 
+# ─── No-KV-cache (pool-free) mode: the DeepSeek-V4.1 vision tower ─────
+#
+# Every pool argument None (kv_cache_block_offsets, host_kv_cache_pool_pointers,
+# host_kv_cache_pool_mapping, cache_indirection; tokens_per_block None too):
+# the op then runs a plain packed-QKV context FMHA with no append, which is how
+# a ViT tower is served. mask_type 0 (padding) is full bidirectional attention
+# within each sequence ("image"); sequences never see each other.
+#
+# Tolerance: the standard ATOL / RTOL above, unchanged. Measured on sm_103 over
+# the batches below at q scales 1 and 2 (logit std ~1 and ~2): at most 46% of
+# the allowance with these seeds (37/1296/500/2048 at q scale 2); 64% was the
+# worst over three other seeds of 16 x 576 at q scale 2, where FlashInfer's
+# fmha_varlen and fa2 ragged kernels used the same fraction on the same inputs.
+# A sharper softmax (q scale 3) reached 1.03x on one seed of 16 x 576 -- the
+# probabilities are a bf16 MMA operand, whose rounding error scales with
+# sum(p * |v|) rather than with |out| -- so that regime is reported in the
+# contract and not gated here.
+#
+# Discrimination: every correct result is also required to sit far outside two
+# wrong hypotheses built from the same inputs -- a causal mask within each image,
+# and attention leaking across images (one merged sequence). Measured on sm_103
+# for the cases below: 57-531x (causal) and 48-694x (leak) outside, against a
+# 20x floor.
+
+VIT_HEADS = 16
+VIT_HEAD_DIM = 64
+VIT_MAX_SEQ_LEN = 16384  # measured inert in this mode (64, 1000, 1296, 65536 identical)
+NO_POOL_MIN_SEPARATION = 20.0
+
+
+def _vit_cu(lens: List[int]) -> torch.Tensor:
+    cu = [0]
+    for n in lens:
+        cu.append(cu[-1] + n)
+    return torch.tensor(cu, dtype=torch.int32, device="cuda")
+
+
+def _vit_qkv(lens: List[int], q_scale: float, seed: int) -> torch.Tensor:
+    """Packed [T, 3 * H * D] bf16 q|k|v rows; q scaled to set the softmax sharpness."""
+    torch.manual_seed(seed)
+    qkv = torch.randn(sum(lens), 3 * VIT_HEADS * VIT_HEAD_DIM, dtype=torch.bfloat16, device="cuda")
+    q_w = VIT_HEADS * VIT_HEAD_DIM
+    qkv[:, :q_w] = (qkv[:, :q_w].float() * q_scale).to(torch.bfloat16)
+    return qkv
+
+
+def _no_pool_call(
+    qkv: torch.Tensor,
+    lens: List[int],
+    mask_type: int = MASK_PADDING,
+    cu_q_seqlens: Optional[torch.Tensor] = None,
+    cu_kv_seqlens: Optional[torch.Tensor] = None,
+    ctx_lens: Optional[List[int]] = None,
+    update_kv_cache: bool = True,
+    tokens_per_block: Optional[int] = None,
+    max_seq_len: int = VIT_MAX_SEQ_LEN,
+    attention_input_type: int = 0,
+    output: Optional[torch.Tensor] = None,
+    workspace: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """One pool-free thop_attention call over len(lens) context sequences.
+
+    sequence_length / host_past_key_value_lengths carry `lens`; context_lengths /
+    host_context_lengths carry `ctx_lens` (default: `lens` too).
+    """
+    ns = len(lens)
+    num_tokens = sum(lens)
+    ctx = lens if ctx_lens is None else ctx_lens
+    if output is None:
+        output = torch.empty(
+            num_tokens, VIT_HEADS * VIT_HEAD_DIM, dtype=torch.bfloat16, device="cuda"
+        )
+    op(
+        q=qkv,
+        k=None,
+        v=None,
+        output=output,
+        output_sf=None,
+        workspace_=torch.empty(0, dtype=torch.int8, device="cuda")
+        if workspace is None
+        else workspace,
+        sequence_length=torch.tensor(lens, dtype=torch.int32, device="cuda"),
+        host_past_key_value_lengths=torch.tensor(lens, dtype=torch.int32),
+        host_total_kv_lens=torch.tensor([num_tokens, 0], dtype=torch.int32),
+        context_lengths=torch.tensor(ctx, dtype=torch.int32, device="cuda"),
+        host_context_lengths=torch.tensor(ctx, dtype=torch.int32),
+        host_request_types=torch.zeros(ns, dtype=torch.int32),
+        max_context_q_len_override=None,
+        kv_cache_block_offsets=None,
+        host_kv_cache_pool_pointers=None,
+        host_kv_cache_pool_mapping=None,
+        cache_indirection=None,
+        kv_scale_orig_quant=None,
+        kv_scale_quant_orig=None,
+        out_scale=None,
+        rotary_inv_freq=None,
+        rotary_cos_sin=None,
+        latent_cache=None,
+        q_pe=None,
+        block_ids_per_seq=None,
+        attention_sinks=None,
+        is_fused_qkv=True,
+        update_kv_cache=update_kv_cache,
+        predicted_tokens_per_seq=1,
+        local_layer_idx=0,
+        num_heads=VIT_HEADS,
+        num_kv_heads=VIT_HEADS,
+        head_size=VIT_HEAD_DIM,
+        tokens_per_block=tokens_per_block,
+        max_num_requests=ns,
+        max_context_length=max_seq_len,
+        max_seq_len=max_seq_len,
+        attention_window_size=max_seq_len,
+        beam_width=1,
+        mask_type=mask_type,
+        quant_mode=0,
+        q_scaling=1.0,
+        position_embedding_type=0,  # no in-kernel RoPE (the ViT's 2D RoPE is the caller's)
+        rope_dim=0,
+        rope_base=10000.0,
+        rope_scale_type=0,
+        rope_scale=1.0,
+        rope_short_m_scale=1.0,
+        rope_long_m_scale=1.0,
+        rope_max_positions=1024,
+        rope_original_max_positions=1024,
+        use_paged_context_fmha=False,
+        attention_input_type=attention_input_type,
+        is_mla_enable=False,
+        chunked_prefill_buffer_batch_size=1,
+        q_lora_rank=None,
+        kv_lora_rank=None,
+        qk_nope_head_dim=None,
+        qk_rope_head_dim=None,
+        v_head_dim=None,
+        rope_append=None,
+        mrope_rotary_cos_sin=None,
+        mrope_position_deltas=None,
+        helix_position_offsets=None,
+        helix_is_inactive_rank=None,
+        attention_chunk_size=None,
+        softmax_stats_tensor=None,
+        is_spec_decoding_enabled=False,
+        use_spec_decoding=False,
+        is_spec_dec_tree=False,
+        spec_decoding_generation_lengths=None,
+        spec_decoding_position_offsets_for_cpp=None,
+        spec_decoding_packed_mask=None,
+        spec_decoding_bl_tree_mask_offset=None,
+        spec_decoding_bl_tree_mask=None,
+        spec_bl_tree_first_sparse_mask_offset_kv=None,
+        sparse_kv_indices=None,
+        sparse_kv_offsets=None,
+        sparse_attn_indices=None,
+        sparse_attn_offsets=None,
+        sparse_attn_indices_block_size=0,
+        cu_q_seqlens=cu_q_seqlens,
+        cu_kv_seqlens=cu_kv_seqlens,
+        num_contexts=ns,
+        num_ctx_tokens=num_tokens,
+    )
+    torch.cuda.synchronize()
+    return output
+
+
+def _vit_reference(
+    qkv: torch.Tensor, lens: List[int], causal: bool = False, merged: bool = False
+) -> torch.Tensor:
+    """fp32 SDPA per image, softmax scale 1/sqrt(D). causal=True and merged=True
+    (all images as one sequence) are the two wrong hypotheses."""
+    num_tokens = sum(lens)
+    q_w = VIT_HEADS * VIT_HEAD_DIM
+    q = qkv[:, :q_w].view(num_tokens, VIT_HEADS, VIT_HEAD_DIM)
+    k = qkv[:, q_w : 2 * q_w].view(num_tokens, VIT_HEADS, VIT_HEAD_DIM)
+    v = qkv[:, 2 * q_w :].view(num_tokens, VIT_HEADS, VIT_HEAD_DIM)
+    outs = []
+    start = 0
+    for n in [num_tokens] if merged else lens:
+        o = F.scaled_dot_product_attention(
+            q[start : start + n].transpose(0, 1).float(),
+            k[start : start + n].transpose(0, 1).float(),
+            v[start : start + n].transpose(0, 1).float(),
+            is_causal=causal,
+        )
+        outs.append(o.transpose(0, 1).reshape(n, q_w))
+        start += n
+    return torch.cat(outs)
+
+
+# Single images at the survey's 1296 / 4096 patches and the 9216-patch maximum,
+# four equal images, ragged images (one of 37 patches), and single-patch images.
+VIT_BATCHES = [
+    [1296],
+    [4096],
+    [1296, 1296, 1296, 1296],
+    [37, 1296, 500, 2048],
+    [576] * 16,
+    [9216, 1296],
+    [1, 1, 5, 1],
+]
+
+
+def test_bf16_no_pool_vit_varlen_padding() -> None:
+    """Pool-free, mask_type=0, 16/16/64: per-image bidirectional attention over
+    variable-length images, with cu_q_seqlens given as the target passes it and
+    without it (bitwise identical). Gated against the per-image fp32 reference
+    and required to sit far outside the causal and cross-image-leak rivals."""
+    workspace = torch.empty(0, dtype=torch.int8, device="cuda")
+    for i, lens in enumerate(VIT_BATCHES):
+        for q_scale in (1.0, 2.0):
+            qkv = _vit_qkv(lens, q_scale, seed=400 + i)
+            out = _no_pool_call(qkv, lens, cu_q_seqlens=_vit_cu(lens), workspace=workspace)
+            ref = _vit_reference(qkv, lens)
+            label = f"lens={lens[:4]}.. n={len(lens)} q_scale={q_scale}"
+            torch.testing.assert_close(out.float(), ref, rtol=RTOL, atol=ATOL, msg=label)
+            assert _bitwise_equal(_no_pool_call(qkv, lens, workspace=workspace), out), (
+                f"{label}: cu_q_seqlens=None differs from the given per-image offsets"
+            )
+            if max(lens) > 1:
+                _assert_far_outside_band(
+                    out,
+                    _vit_reference(qkv, lens, causal=True),
+                    NO_POOL_MIN_SEPARATION,
+                    f"{label}: causal-mask rival",
+                    ATOL,
+                    RTOL,
+                )
+            if len(lens) > 1:
+                _assert_far_outside_band(
+                    out,
+                    _vit_reference(qkv, lens, merged=True),
+                    NO_POOL_MIN_SEPARATION,
+                    f"{label}: cross-image leak rival",
+                    ATOL,
+                    RTOL,
+                )
+    # The workspace the op grew in place for all of the above (largest: 9216+1296).
+    assert workspace.numel() < 64 * 1024 * 1024, f"workspace grew to {workspace.numel()} B"
+
+
+def test_bf16_no_pool_vit_mask_type_is_load_bearing() -> None:
+    """The same pool-free call at mask_type=1 is causal within each image: it
+    lands far outside the bidirectional reference (so passing 1 for a ViT is
+    silently wrong, not rejected) and inside the causal one."""
+    lens = [1296, 700, 1296, 64]
+    qkv = _vit_qkv(lens, 1.0, seed=420)
+    causal_out = _no_pool_call(qkv, lens, mask_type=MASK_CAUSAL, cu_q_seqlens=_vit_cu(lens))
+    _assert_far_outside_band(
+        causal_out,
+        _vit_reference(qkv, lens),
+        NO_POOL_MIN_SEPARATION,
+        "mask_type=1 vs the bidirectional reference",
+        ATOL,
+        RTOL,
+    )
+    torch.testing.assert_close(
+        causal_out.float(), _vit_reference(qkv, lens, causal=True), rtol=RTOL, atol=ATOL
+    )
+
+
+def test_bf16_no_pool_vit_batch_state() -> None:
+    """What each batch-state argument has to carry in pool-free mode."""
+    lens = [1296, 700, 1296, 64]
+    qkv = _vit_qkv(lens, 2.0, seed=430)
+    ref = _vit_reference(qkv, lens)
+    base = _no_pool_call(qkv, lens)
+    torch.testing.assert_close(base.float(), ref, rtol=RTOL, atol=ATOL)
+
+    # Inert here, bitwise: explicit cu_kv_seqlens, the context_only input type,
+    # a page size with no pool, and max_seq_len / max_context_length at any
+    # value -- including ones below the longest image.
+    inert = {
+        "cu_q_seqlens + cu_kv_seqlens": dict(
+            cu_q_seqlens=_vit_cu(lens), cu_kv_seqlens=_vit_cu(lens)
+        ),
+        "attention_input_type=1": dict(attention_input_type=1),
+        "tokens_per_block=32": dict(tokens_per_block=32),
+        "max_seq_len=64": dict(max_seq_len=64),
+        "max_seq_len=1000": dict(max_seq_len=1000),
+        "max_seq_len=65536": dict(max_seq_len=65536),
+    }
+    for name, kwargs in inert.items():
+        assert _bitwise_equal(_no_pool_call(qkv, lens, **kwargs), base), f"{name} is not inert"
+    # Deterministic: a repeated call is bitwise identical.
+    assert _bitwise_equal(_no_pool_call(qkv, lens), base)
+
+    # Rows past the batch's token count are never written.
+    sentinel = torch.full(
+        (sum(lens) + 16, VIT_HEADS * VIT_HEAD_DIM),
+        float("nan"),
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    _no_pool_call(qkv, lens, output=sentinel)
+    assert torch.isnan(sentinel[sum(lens) :].float()).all(), "rows past T were written"
+    assert _bitwise_equal(sentinel[: sum(lens)], base)
+
+    # Given cu_q_seqlens is the image split the FMHA uses: offsets for a
+    # different split (same total, same longest image) silently override
+    # context_lengths / sequence_length.
+    lens_a = [1296, 1000, 1296, 1296]
+    lens_b = [1000, 1296, 1296, 1296]
+    qkv_ab = _vit_qkv(lens_a, 2.0, seed=431)
+    out = _no_pool_call(qkv_ab, lens_a, cu_q_seqlens=_vit_cu(lens_b))
+    torch.testing.assert_close(out.float(), _vit_reference(qkv_ab, lens_b), rtol=RTOL, atol=ATOL)
+    _assert_far_outside_band(
+        out,
+        _vit_reference(qkv_ab, lens_a),
+        NO_POOL_MIN_SEPARATION,
+        "cu_q_seqlens vs context_lengths split",
+        ATOL,
+        RTOL,
+    )
+    # context_lengths disagreeing with sequence_length (no cu_q_seqlens): neither
+    # split comes back, and nothing raises.
+    out = _no_pool_call(qkv_ab, lens_a, ctx_lens=lens_b)
+    for split, name in ((lens_a, "sequence_length"), (lens_b, "context_lengths")):
+        _assert_far_outside_band(
+            out,
+            _vit_reference(qkv_ab, split),
+            NO_POOL_MIN_SEPARATION,
+            f"mismatched context_lengths vs the {name} split",
+            ATOL,
+            RTOL,
+        )
+
+    # update_kv_cache=False is rejected outside cross attention.
+    try:
+        _no_pool_call(qkv, lens, update_kv_cache=False)
+    except RuntimeError as exc:
+        assert "KV cache update cannot be disabled" in str(exc), f"unexpected message: {exc}"
+    else:
+        raise AssertionError("update_kv_cache=False was accepted in pool-free mode")
+
+
+def test_bf16_no_pool_vit_cuda_graph() -> None:
+    """A warmed-up pool-free call captures into a CUDA graph; replay is bitwise
+    equal to the eager call and follows new data written into the same q."""
+    lens = [1296, 1296, 1296, 1296]
+    qkv = _vit_qkv(lens, 2.0, seed=440)
+    cu = _vit_cu(lens)
+    workspace = torch.empty(0, dtype=torch.int8, device="cuda")
+    eager = _no_pool_call(qkv, lens, cu_q_seqlens=cu, workspace=workspace).clone()
+
+    output = torch.empty_like(eager)
+    num_tokens = sum(lens)
+    seq = torch.tensor(lens, dtype=torch.int32, device="cuda")
+    host_lens = torch.tensor(lens, dtype=torch.int32)
+    host_total = torch.tensor([num_tokens, 0], dtype=torch.int32)
+    host_types = torch.zeros(len(lens), dtype=torch.int32)
+    kwargs = dict(
+        q=qkv,
+        k=None,
+        v=None,
+        output=output,
+        output_sf=None,
+        workspace_=workspace,
+        sequence_length=seq,
+        host_past_key_value_lengths=host_lens,
+        host_total_kv_lens=host_total,
+        context_lengths=seq,
+        host_context_lengths=host_lens,
+        host_request_types=host_types,
+        max_context_q_len_override=None,
+        kv_cache_block_offsets=None,
+        host_kv_cache_pool_pointers=None,
+        host_kv_cache_pool_mapping=None,
+        cache_indirection=None,
+        kv_scale_orig_quant=None,
+        kv_scale_quant_orig=None,
+        out_scale=None,
+        rotary_inv_freq=None,
+        rotary_cos_sin=None,
+        latent_cache=None,
+        q_pe=None,
+        block_ids_per_seq=None,
+        attention_sinks=None,
+        is_fused_qkv=True,
+        update_kv_cache=True,
+        predicted_tokens_per_seq=1,
+        local_layer_idx=0,
+        num_heads=VIT_HEADS,
+        num_kv_heads=VIT_HEADS,
+        head_size=VIT_HEAD_DIM,
+        tokens_per_block=None,
+        max_num_requests=len(lens),
+        max_context_length=VIT_MAX_SEQ_LEN,
+        max_seq_len=VIT_MAX_SEQ_LEN,
+        attention_window_size=VIT_MAX_SEQ_LEN,
+        beam_width=1,
+        mask_type=MASK_PADDING,
+        quant_mode=0,
+        q_scaling=1.0,
+        position_embedding_type=0,
+        rope_dim=0,
+        rope_base=10000.0,
+        rope_scale_type=0,
+        rope_scale=1.0,
+        rope_short_m_scale=1.0,
+        rope_long_m_scale=1.0,
+        rope_max_positions=1024,
+        rope_original_max_positions=1024,
+        use_paged_context_fmha=False,
+        attention_input_type=0,
+        is_mla_enable=False,
+        chunked_prefill_buffer_batch_size=1,
+        q_lora_rank=None,
+        kv_lora_rank=None,
+        qk_nope_head_dim=None,
+        qk_rope_head_dim=None,
+        v_head_dim=None,
+        rope_append=None,
+        mrope_rotary_cos_sin=None,
+        mrope_position_deltas=None,
+        helix_position_offsets=None,
+        helix_is_inactive_rank=None,
+        attention_chunk_size=None,
+        softmax_stats_tensor=None,
+        is_spec_decoding_enabled=False,
+        use_spec_decoding=False,
+        is_spec_dec_tree=False,
+        spec_decoding_generation_lengths=None,
+        spec_decoding_position_offsets_for_cpp=None,
+        spec_decoding_packed_mask=None,
+        spec_decoding_bl_tree_mask_offset=None,
+        spec_decoding_bl_tree_mask=None,
+        spec_bl_tree_first_sparse_mask_offset_kv=None,
+        sparse_kv_indices=None,
+        sparse_kv_offsets=None,
+        sparse_attn_indices=None,
+        sparse_attn_offsets=None,
+        sparse_attn_indices_block_size=0,
+        cu_q_seqlens=cu,
+        num_contexts=len(lens),
+        num_ctx_tokens=num_tokens,
+    )
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=torch.cuda.Stream()):
+        op(**kwargs)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert _bitwise_equal(output, eager), "graph replay differs from the eager call"
+
+    qkv.copy_(_vit_qkv(lens, 2.0, seed=441))
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(output.float(), _vit_reference(qkv, lens), rtol=RTOL, atol=ATOL)
+    assert not _bitwise_equal(output, eager), "replay did not pick up the new q"
+
+
+# The DeepSeek-V4.1 vision tower's call, in its multi-image form: exactly
+# _no_pool_call's arguments -- 16/16/64 bf16, mask_type 0, is_fused_qkv on the
+# packed [P, 3072] rows, update_kv_cache=True, cu_q_seqlens = the per-image
+# offsets, context_lengths == sequence_length, max_seq_len / max_context_length
+# / attention_window_size 16384, max_num_requests = the image count -- with ONE
+# workspace tensor that the op grows in place across calls. One call holds
+# every image of one request: up to 17037 patches (two images) and up to five
+# images over the MMMU validation documents; one image is at most 8787 patches
+# there and 9189 by the span limit. The target now calls one image per call
+# (the entry's cells); these multi-image calls bound it from above.
+VIT_MMMU_REQUESTS = [
+    [8787, 8250],  # 17037, MMMU's largest request (the split is illustrative)
+    [3600, 3400, 3500, 3337, 3200],  # five images, 17037 in total
+    [1560, 1560, 1560],  # golden mmmu_multi3 (validation_Math_3)
+    [3774, 1551],  # golden carrots_corn
+    [1517],  # golden mmmu_small
+    [8772],  # golden mmmu_large
+    [9189],  # the per-image ceiling
+]
+# The tower's CUDA graph sizes at the reference requests; the largest request
+# is captured too.
+VIT_GRAPH_REQUESTS = [[1517], [8772], [1560, 1560, 1560], [3774, 1551], [8787, 8250]]
+# Rival floor for these requests. With thousands of keys per image and logit
+# std ~1 the softmax is flat, so the correct output and the cross-image rival
+# both shrink toward the mean of v and the rival lands closer to the band than
+# at the shorter batches above: measured 15.9x at [8787, 8250], q scale 1,
+# where the correct result uses ~0.05 of the band (the two ~300x apart).
+VIT_MMMU_MIN_SEPARATION = 10.0
+
+
+def test_bf16_no_pool_vit_mmmu_requests() -> None:
+    """Every MMMU-shaped request in one call, against the full per-image fp32
+    reference at q scales 1 and 2; far outside the causal and cross-image
+    rivals; cu_q_seqlens=None bitwise identical."""
+    workspace = torch.empty(0, dtype=torch.int8, device="cuda")
+    worst = 0.0
+    for i, lens in enumerate(VIT_MMMU_REQUESTS):
+        for q_scale in (1.0, 2.0):
+            qkv = _vit_qkv(lens, q_scale, seed=460 + i)
+            out = _no_pool_call(qkv, lens, cu_q_seqlens=_vit_cu(lens), workspace=workspace)
+            ref = _vit_reference(qkv, lens)
+            label = f"lens={lens} q_scale={q_scale}"
+            torch.testing.assert_close(out.float(), ref, rtol=RTOL, atol=ATOL, msg=label)
+            worst = max(worst, _band_fraction(out, ref, ATOL, RTOL))
+            assert _bitwise_equal(_no_pool_call(qkv, lens, workspace=workspace), out), label
+            causal = _band_fraction(out, _vit_reference(qkv, lens, causal=True), ATOL, RTOL)
+            assert causal > VIT_MMMU_MIN_SEPARATION, (
+                f"{label}: causal rival only {causal:.3g}x outside"
+            )
+            msg = f"causal rival {causal:.0f}x"
+            if len(lens) > 1:
+                merged = _band_fraction(out, _vit_reference(qkv, lens, merged=True), ATOL, RTOL)
+                assert merged > VIT_MMMU_MIN_SEPARATION, (
+                    f"{label}: leak rival only {merged:.3g}x outside"
+                )
+                msg += f", cross-image rival {merged:.0f}x"
+            print(
+                f"\n[vit mmmu] {label}: {_band_fraction(out, ref, ATOL, RTOL):.3f} of the band; {msg} outside"
+            )
+    print(f"[vit mmmu] worst {worst:.3f} of the band; workspace grew to {workspace.numel()} B")
+    assert workspace.numel() < 64 * 1024 * 1024
+
+
+def _vit_sampled_reference(qkv: torch.Tensor, lens: List[int], per_image: int, seed: int):
+    """fp32 per-image attention for a sample of query rows (first, last and random
+    rows of every image) over all of that image's keys: (row indices, reference rows)."""
+    gen = torch.Generator().manual_seed(seed)
+    q_w = VIT_HEADS * VIT_HEAD_DIM
+    rows, outs, start = [], [], 0
+    for n in lens:
+        idx = torch.randperm(n, generator=gen)[: min(per_image, n)]
+        idx[0], idx[-1] = 0, n - 1
+        idx = idx.to("cuda") + start
+        q = qkv[idx, :q_w].view(-1, VIT_HEADS, VIT_HEAD_DIM).float()
+        k = qkv[start : start + n, q_w : 2 * q_w].view(n, VIT_HEADS, VIT_HEAD_DIM).float()
+        v = qkv[start : start + n, 2 * q_w :].view(n, VIT_HEADS, VIT_HEAD_DIM).float()
+        p = torch.softmax(torch.einsum("mhd,nhd->hmn", q, k) / VIT_HEAD_DIM**0.5, dim=-1)
+        outs.append(torch.einsum("hmn,nhd->mhd", p, v).reshape(-1, q_w))
+        rows.append(idx)
+        start += n
+    return torch.cat(rows), torch.cat(outs)
+
+
+def test_bf16_no_pool_vit_large_calls_sampled_rows() -> None:
+    """Far past one request: 80 images of 8787 (702960 tokens; q past 2^31 elements)
+    and one 262144-token sequence, in band on sampled rows, every output finite."""
+    workspace = torch.empty(0, dtype=torch.int8, device="cuda")
+    for i, lens in enumerate(([8787] * 80, [262144])):
+        qkv = _vit_qkv(lens, 1.0, seed=470 + i)
+        out = _no_pool_call(qkv, lens, cu_q_seqlens=_vit_cu(lens), workspace=workspace)
+        assert torch.isfinite(out.float()).all()
+        rows, ref = _vit_sampled_reference(qkv, lens, 256, 471 + i)
+        torch.testing.assert_close(out[rows].float(), ref, rtol=RTOL, atol=ATOL)
+        print(
+            f"\n[vit large] {len(lens)} x {lens[0]} = {sum(lens)} tokens: {rows.numel()} sampled rows "
+            f"at {_band_fraction(out[rows], ref, ATOL, RTOL):.3f} of the band; workspace {workspace.numel()} B"
+        )
+        del qkv, out
+
+
+def _vit_graph_kwargs(qkv, output, workspace, seq, host_lens, cu, num_tokens, ns) -> Dict:
+    return dict(
+        q=qkv,
+        k=None,
+        v=None,
+        output=output,
+        output_sf=None,
+        workspace_=workspace,
+        sequence_length=seq,
+        host_past_key_value_lengths=host_lens,
+        host_total_kv_lens=torch.tensor([num_tokens, 0], dtype=torch.int32),
+        context_lengths=seq,
+        host_context_lengths=host_lens,
+        host_request_types=torch.zeros(ns, dtype=torch.int32),
+        max_context_q_len_override=None,
+        kv_cache_block_offsets=None,
+        host_kv_cache_pool_pointers=None,
+        host_kv_cache_pool_mapping=None,
+        cache_indirection=None,
+        kv_scale_orig_quant=None,
+        kv_scale_quant_orig=None,
+        out_scale=None,
+        rotary_inv_freq=None,
+        rotary_cos_sin=None,
+        latent_cache=None,
+        q_pe=None,
+        block_ids_per_seq=None,
+        attention_sinks=None,
+        is_fused_qkv=True,
+        update_kv_cache=True,
+        predicted_tokens_per_seq=1,
+        local_layer_idx=0,
+        num_heads=VIT_HEADS,
+        num_kv_heads=VIT_HEADS,
+        head_size=VIT_HEAD_DIM,
+        tokens_per_block=None,
+        max_num_requests=ns,
+        max_context_length=VIT_MAX_SEQ_LEN,
+        max_seq_len=VIT_MAX_SEQ_LEN,
+        attention_window_size=VIT_MAX_SEQ_LEN,
+        beam_width=1,
+        mask_type=MASK_PADDING,
+        quant_mode=0,
+        q_scaling=1.0,
+        position_embedding_type=0,
+        rope_dim=0,
+        rope_base=10000.0,
+        rope_scale_type=0,
+        rope_scale=1.0,
+        rope_short_m_scale=1.0,
+        rope_long_m_scale=1.0,
+        rope_max_positions=1024,
+        rope_original_max_positions=1024,
+        use_paged_context_fmha=False,
+        attention_input_type=0,
+        is_mla_enable=False,
+        chunked_prefill_buffer_batch_size=1,
+        q_lora_rank=None,
+        kv_lora_rank=None,
+        qk_nope_head_dim=None,
+        qk_rope_head_dim=None,
+        v_head_dim=None,
+        rope_append=None,
+        mrope_rotary_cos_sin=None,
+        mrope_position_deltas=None,
+        helix_position_offsets=None,
+        helix_is_inactive_rank=None,
+        attention_chunk_size=None,
+        softmax_stats_tensor=None,
+        is_spec_decoding_enabled=False,
+        use_spec_decoding=False,
+        is_spec_dec_tree=False,
+        spec_decoding_generation_lengths=None,
+        spec_decoding_position_offsets_for_cpp=None,
+        spec_decoding_packed_mask=None,
+        spec_decoding_bl_tree_mask_offset=None,
+        spec_decoding_bl_tree_mask=None,
+        spec_bl_tree_first_sparse_mask_offset_kv=None,
+        sparse_kv_indices=None,
+        sparse_kv_offsets=None,
+        sparse_attn_indices=None,
+        sparse_attn_offsets=None,
+        sparse_attn_indices_block_size=0,
+        cu_q_seqlens=cu,
+        num_contexts=ns,
+        num_ctx_tokens=num_tokens,
+    )
+
+
+def test_bf16_no_pool_vit_cuda_graph_prototype_sizes() -> None:
+    """Captured at the prototype's graph sizes with one shared workspace (sized by
+    eager calls first); replays on new q are bitwise equal to eager and in band.
+    Rewriting the device length tensors to another split of the same total does
+    NOT re-split a captured call: the replay no longer matches the new split."""
+    workspace = torch.empty(0, dtype=torch.int8, device="cuda")
+    graphs = []
+    for lens in VIT_GRAPH_REQUESTS:
+        qkv = _vit_qkv(lens, 2.0, seed=480)
+        _no_pool_call(qkv, lens, cu_q_seqlens=_vit_cu(lens), workspace=workspace)
+    for i, lens in enumerate(VIT_GRAPH_REQUESTS):
+        num_tokens, ns = sum(lens), len(lens)
+        qkv = _vit_qkv(lens, 2.0, seed=481 + i)
+        output = torch.empty(
+            num_tokens, VIT_HEADS * VIT_HEAD_DIM, dtype=torch.bfloat16, device="cuda"
+        )
+        seq = torch.tensor(lens, dtype=torch.int32, device="cuda")
+        cu = _vit_cu(lens)
+        kwargs = _vit_graph_kwargs(
+            qkv, output, workspace, seq, torch.tensor(lens, dtype=torch.int32), cu, num_tokens, ns
+        )
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=torch.cuda.Stream()):
+            op(**kwargs)
+        graphs.append((lens, graph, qkv, output, seq, cu))
+    for rnd in range(2):
+        for i, (lens, graph, qkv, output, _, _) in enumerate(graphs):
+            qkv.copy_(_vit_qkv(lens, 2.0, seed=490 + 10 * rnd + i))
+            output.fill_(float("nan"))
+            graph.replay()
+            torch.cuda.synchronize()
+            eager = _no_pool_call(qkv, lens, cu_q_seqlens=_vit_cu(lens), workspace=workspace)
+            assert _bitwise_equal(output, eager), (lens, rnd)
+            torch.testing.assert_close(
+                output.float(), _vit_reference(qkv, lens), rtol=RTOL, atol=ATOL
+            )
+    # The multi3 graph with the device lengths rewritten to (3000, 1000, 680).
+    lens, graph, qkv, output, seq, cu = graphs[2]
+    other = [3000, 1000, 680]
+    seq.copy_(torch.tensor(other, dtype=torch.int32))
+    cu.copy_(_vit_cu(other))
+    output.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    finite = bool(torch.isfinite(output.float()).all())
+    band = (
+        _band_fraction(output, _vit_reference(qkv, other), ATOL, RTOL) if finite else float("nan")
+    )
+    print(
+        f"\n[vit graph] split rewritten after capture: output finite {finite}, band vs the new split {band:.3g}"
+    )
+    assert not finite or band > 1.0
+
+
+# max_context_q_len_override in no-KV-cache mode: a captured call that follows
+# the split. The DeepSeek-V4.1 target's graph form: one call per padded
+# bucket B, slots (image P, pad B - P), captured with the host lengths holding
+# the B rows as one sequence and max_context_q_len_override = B; before each
+# replay only the DEVICE sequence_length / context_lengths / cu_q_seqlens are
+# rewritten. Also a 4-slot form with empty (zero-length) slots.
+VIT_OVERRIDE_BUCKETS = {
+    # bucket: image lengths replayed in that bucket (pad = B - P)
+    1024: [7, 1000, 1023, 1024],
+    1536: [1521, 1100, 1536],
+    2560: [2305, 2432, 2560, 2049],
+    4096: [4095, 3600, 4096],
+    8704: [8613, 8704, 8193],
+    9216: [9189, 8706, 8787, 9216],
+}
+VIT_OVERRIDE_MULTI = (8192, [[2048] * 4, [3000, 1000, 680, 3512], [8000, 64, 64, 64], [5000, 3192, 0, 0],
+                             [8192, 0, 0, 0], [0, 8192, 0, 0]])  # fmt: skip
+
+
+def _vit_override_kwargs(qkv, output, workspace, seq, cu, host_lens, num_tokens, override) -> Dict:
+    kw = _vit_graph_kwargs(qkv, output, workspace, seq, host_lens, cu, num_tokens, len(host_lens))
+    kw["max_context_q_len_override"] = override
+    return kw
+
+
+def _replay_follows_the_split(B: int, splits: List[List[int]], seed: int) -> None:
+    ns = len(splits[0])
+    workspace = torch.empty(0, dtype=torch.int8, device="cuda")
+    qkv = _vit_qkv([B], 2.0, seed=seed)
+    output = torch.empty(B, VIT_HEADS * VIT_HEAD_DIM, dtype=torch.bfloat16, device="cuda")
+    capture_lens = [B] + [0] * (ns - 1)
+    seq = torch.tensor(capture_lens, dtype=torch.int32, device="cuda")
+    cu = _vit_cu(capture_lens)
+    host = torch.tensor(capture_lens, dtype=torch.int32)
+    kw = _vit_override_kwargs(qkv, output, workspace, seq, cu, host, B, B)
+    op(**kw)  # sizes the workspace
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=torch.cuda.Stream()):
+        op(**kw)
+    for rnd in range(2):
+        for i, lens in enumerate(splits):
+            assert sum(lens) == B and len(lens) == ns
+            qkv.copy_(_vit_qkv([B], 2.0, seed=seed + 100 * rnd + i + 1))
+            seq.copy_(torch.tensor(lens, dtype=torch.int32))
+            cu.copy_(_vit_cu(lens))
+            output.fill_(float("nan"))
+            graph.replay()
+            torch.cuda.synchronize()
+            replayed = output.clone()
+            # The same call eagerly, host lengths = the split.
+            eager = torch.empty_like(output)
+            op(**_vit_override_kwargs(
+                qkv, eager, workspace, torch.tensor(lens, dtype=torch.int32, device="cuda"),
+                _vit_cu(lens), torch.tensor(lens, dtype=torch.int32), B, B))  # fmt: skip
+            torch.cuda.synchronize()
+            assert _bitwise_equal(replayed, eager), (B, lens, rnd)
+            nz = [n for n in lens if n]
+            torch.testing.assert_close(
+                replayed.float(), _vit_reference(qkv, nz), rtol=RTOL, atol=ATOL
+            )
+            if len(nz) > 1 and min(nz) >= max(64, B // 20):
+                # A replay stuck at the capture split (one sequence of B rows) is the rival.
+                merged = _band_fraction(replayed, _vit_reference(qkv, nz, merged=True), ATOL, RTOL)
+                assert merged > VIT_MMMU_MIN_SEPARATION, (B, lens, merged)
+
+
+def test_bf16_no_pool_vit_cuda_graph_q_len_override_follows_the_split() -> None:
+    """With max_context_q_len_override fixed (= the call's row count), a captured
+    no-pool call follows whatever split the device length tensors hold at replay:
+    bitwise equal to the eager call over that split and in band, in the target's
+    two-slot (image, pad) form at every tested bucket and in a four-slot form with
+    empty slots. Without the override a capture whose host lengths are shorter
+    than a replayed sequence is wrong (control); with it, right."""
+    for k, (B, images) in enumerate(VIT_OVERRIDE_BUCKETS.items()):
+        _replay_follows_the_split(B, [[P, B - P] for P in images], seed=600 + 10 * k)
+    B, splits = VIT_OVERRIDE_MULTI
+    _replay_follows_the_split(B, splits, seed=700)
+
+    # What the override buys: the launch no longer depends on the capture-time
+    # host lengths. Captured at (1280, 1280) and replayed at (2305, 255): with
+    # the override (2560) the replay is right; without it the launch only covers
+    # 1280-row sequences and the 2305-row one comes back wrong.
+    B, cap, rep = 2560, [1280, 1280], [2305, 255]
+    for override in (B, None):
+        workspace = torch.empty(0, dtype=torch.int8, device="cuda")
+        qkv = _vit_qkv([B], 2.0, seed=710)
+        output = torch.empty(B, VIT_HEADS * VIT_HEAD_DIM, dtype=torch.bfloat16, device="cuda")
+        seq = torch.tensor(cap, dtype=torch.int32, device="cuda")
+        cu = _vit_cu(cap)
+        kw = _vit_override_kwargs(
+            qkv, output, workspace, seq, cu, torch.tensor(cap, dtype=torch.int32), B, override
+        )
+        op(**kw)
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=torch.cuda.Stream()):
+            op(**kw)
+        seq.copy_(torch.tensor(rep, dtype=torch.int32))
+        cu.copy_(_vit_cu(rep))
+        output.fill_(float("nan"))
+        graph.replay()
+        torch.cuda.synchronize()
+        finite = bool(torch.isfinite(output.float()).all())
+        band = (
+            _band_fraction(output, _vit_reference(qkv, rep), ATOL, RTOL) if finite else float("nan")
+        )
+        print(
+            f"\n[vit graph] override {override}, {cap} captured, {rep} replayed: finite {finite}, band {band:.3g}"
+        )
+        if override is None:
+            assert not finite or band > 1.0
+        else:
+            assert finite and band <= 1.0
+
+
+def _vit_two_slot_replay(qkv: torch.Tensor, lens: List[int], bucket: int) -> torch.Tensor:
+    """The target's captured form over `bucket` rows: warm up and capture with
+    the host and device lengths holding every row as one sequence and
+    max_context_q_len_override = bucket, then write `qkv` and the split `lens`
+    into the static buffers and replay. Returns the replayed output after
+    checking it bitwise against the eager call over that split."""
+    ns = len(lens)
+    workspace = torch.empty(0, dtype=torch.int8, device="cuda")
+    static_qkv = _vit_qkv([bucket], 1.0, seed=bucket)
+    output = torch.empty(bucket, VIT_HEADS * VIT_HEAD_DIM, dtype=torch.bfloat16, device="cuda")
+    capture = [bucket] + [0] * (ns - 1)
+    seq = torch.tensor(capture, dtype=torch.int32, device="cuda")
+    cu = _vit_cu(capture)
+    host = torch.tensor(capture, dtype=torch.int32)
+    kw = _vit_override_kwargs(static_qkv, output, workspace, seq, cu, host, bucket, bucket)
+    op(**kw)  # sizes the workspace before capture
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=torch.cuda.Stream()):
+        op(**kw)
+    static_qkv.copy_(qkv)
+    seq.copy_(torch.tensor(lens, dtype=torch.int32))
+    cu.copy_(_vit_cu(lens))
+    output.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    eager = torch.empty_like(output)
+    op(**_vit_override_kwargs(
+        static_qkv, eager, workspace, torch.tensor(lens, dtype=torch.int32, device="cuda"),
+        _vit_cu(lens), torch.tensor(lens, dtype=torch.int32), bucket, bucket))  # fmt: skip
+    torch.cuda.synchronize()
+    assert _bitwise_equal(output, eager), (
+        f"replay over {lens} in bucket {bucket} differs from eager"
+    )
+    return output
+
+
 # ─── The entry's own cell list ──────────────────────────────────────────
 
 
@@ -5390,6 +6248,74 @@ def _cell_mla_context(cell) -> None:
     op.compare(out, ref)
 
 
+def _cell_no_kv_cache(cell) -> None:
+    """A deepseek-v4.1 vision cell: the pool-free call, eager or captured.
+
+    Eager (`q_len_override` None): one sequence with the target's arguments,
+    `cu_q_seqlens` given and, as a check, omitted (bitwise the same).
+    Captured: the two-slot form through `_vit_two_slot_replay`, which also
+    holds the replay bitwise to the eager call over the same split.
+
+    Driven against `op.reference`, cross-checked first against this file's
+    SDPA `_vit_reference`, and gated by `op.compare` and by the bf16
+    atol/rtol band the section above measured; a causal mask within each
+    sequence is required far outside that band.
+    """
+    spec = cell.spec
+    assert (spec["num_heads"], spec["num_kv_heads"], spec["head_size"]) == (
+        VIT_HEADS,
+        VIT_HEADS,
+        VIT_HEAD_DIM,
+    ), "the pool-free builders here are 16/16/64"
+    assert spec["mask_type"] == MASK_PADDING and not spec["kv_cache"]
+    lens = list(spec["seq_lens"])
+    nz = [n for n in lens if n]
+    q_w = VIT_HEADS * VIT_HEAD_DIM
+    for q_scale in spec["q_scales"]:
+        label = f"{cell.why} q_scale={q_scale}"
+        qkv = _vit_qkv(lens, q_scale, seed=500 + sum(lens) + int(10 * q_scale))
+        if spec["cuda_graph"]:
+            out = _vit_two_slot_replay(qkv, lens, spec["q_len_override"])
+        else:
+            assert spec["q_len_override"] is None
+            out = _no_pool_call(qkv, lens, cu_q_seqlens=_vit_cu(lens))
+            assert _bitwise_equal(_no_pool_call(qkv, lens), out), (
+                f"{label}: cu_q_seqlens=None differs from the given offsets"
+            )
+        ref = op.reference(
+            qkv[:, :q_w],
+            qkv[:, q_w : 2 * q_w],
+            qkv[:, 2 * q_w :],
+            lens,
+            lens,
+            num_heads=VIT_HEADS,
+            num_kv_heads=VIT_HEADS,
+            qk_head_dim=VIT_HEAD_DIM,
+            v_head_dim=VIT_HEAD_DIM,
+            softmax_scale=1.0 / math.sqrt(VIT_HEAD_DIM),
+            causal=False,
+        )
+        local = _vit_reference(qkv, nz)
+        torch.testing.assert_close(
+            ref.float(),
+            local,
+            rtol=RTOL,
+            atol=ATOL,
+            msg=lambda m: f"op.reference disagrees with _vit_reference\n{m}",
+        )
+        op.compare(out, ref)
+        torch.testing.assert_close(out.float(), local, rtol=RTOL, atol=ATOL, msg=label)
+        _assert_far_outside_band(
+            out,
+            _vit_reference(qkv, nz, causal=True),
+            VIT_MMMU_MIN_SEPARATION,
+            f"{label}: causal-mask rival",
+            ATOL,
+            RTOL,
+        )
+        del qkv, out, ref, local
+
+
 @pytest.mark.parametrize("cell", op.CELLS, ids=[c.why[:44] for c in op.CELLS])
 def test_certified_cells(cell) -> None:
     """Drive every configuration the entry claims.
@@ -5400,9 +6326,14 @@ def test_certified_cells(cell) -> None:
     it is a configuration a shipped target runs and `is_valid` is checked
     against it; what this file does not do is compare it to `reference`, and
     saying so is better than a cell that quietly proves less than its siblings.
+
+    The deepseek-v4.1 vision cells carry `kv_cache=False` and are driven
+    without a pool; cells without the key are cache-backed.
     """
     kind = cell.spec["input_type"]
-    if kind == STANDARD:
+    if not cell.spec.get("kv_cache", True):
+        _cell_no_kv_cache(cell)
+    elif kind == STANDARD:
         _cell_standard(cell)
     elif kind == MLA_CONTEXT:
         _cell_mla_context(cell)

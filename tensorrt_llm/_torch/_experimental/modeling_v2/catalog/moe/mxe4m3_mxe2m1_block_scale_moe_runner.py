@@ -11,7 +11,8 @@ from typing import Optional, Tuple
 import torch
 
 import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtllm.*
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+
+from .._op import Arch, Cell, OpWrapper
 
 #: routing_method_type values for which the kernel never reads routing_bias:
 #: 0 Default, 1 Renormalize, 4 RenormalizeNaive, 6 SigmoidRenorm. Observed on
@@ -59,6 +60,46 @@ _E2M1_VALUES = (
 
 #: One expert stack's `(codes, e8m0 exponents, bias)`.
 Operand = Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+
+#: The DeepSeek-V4.1 DSpark drafter's routed experts: 128, all local, top-3,
+#: H = 5120 and I = 2304 (neither padded), the clamp at 10 per expert, no
+#: alpha / beta, no biases; pre-routed, into a caller `output`, inside the
+#: autotuner's `fallback_tactic()` scope.
+_DSPARK = dict(
+    hidden=5120,
+    intermediate=2304,
+    num_experts=128,
+    top_k=3,
+    swiglu_limit=10.0,
+    model="deepseek-v4.1",
+    routed_by_kernel=False,
+    local_expert_offset=0,
+    local_num_experts=128,
+    pinned=True,
+    output=True,
+)
+
+#: The drafter's row counts: the ends of the eager sweep 1..1280 (T = 5G for up
+#: to 256 drafting requests), the first draft block, both sides of the two
+#: token-tile changes of the fallback tactic, and the top of the eager column --
+#: which was run as a plain call (no pin, fresh `output`), so its cell is one.
+_DSPARK_CELLS = tuple(
+    Cell(why=f"deepseek-v4.1 DSpark drafter T={tokens}: {what}", spec=dict(_DSPARK, tokens=tokens))
+    for tokens, what in (
+        (1, "bottom of the sweep; FC1 static scheduler, FC2 split-K 2"),
+        (5, "one request's draft block, the smallest captured T"),
+        (383, "top of the 8-token tile"),
+        (384, "bottom of the 16-token tile"),
+        (725, "top of the 16-token tile"),
+        (726, "bottom of the 32-token tile"),
+        (1280, "top of the sweep: 256 requests x 5"),
+    )
+) + (
+    Cell(
+        why="deepseek-v4.1 DSpark drafter T=8192: top of the eager column, unpinned, fresh output",
+        spec=dict(_DSPARK, tokens=8192, pinned=False, output=False),
+    ),
+)
 
 #: The FC1 epilogue's block-scale recipe is architecture-specific, and the
 #: difference is bit-exact rather than a tolerance: trtllm-gen ships one cubin
@@ -179,7 +220,7 @@ class Mxe4m3Mxe2m1BlockScaleMoeRunner(OpWrapper):
                 **_GPT_OSS,
             ),
         ),
-    )
+    ) + _DSPARK_CELLS
 
     note = """
     `act_type` 0 (SwiGlu) only, with the clamp: `gemm1_alpha`, `gemm1_beta` and
@@ -198,6 +239,29 @@ class Mxe4m3Mxe2m1BlockScaleMoeRunner(OpWrapper):
     their scales 128x4 swizzled, padded up to the alignments above. Nothing here
     checks it, and the entry's test builds the layout twice -- once in torch,
     once through the trtllm preprocessing ops -- and compares them first.
+
+    DeepSeek-V4.1: the DSpark drafter calls this once per stage on its draft-block
+    rows, `T = 5G` for the `G` drafting requests on the rank (up to 1280 at
+    `max_batch_size` 256; never chunked, never gathered): 128 experts all local,
+    top-3, H = 5120, I = 2304 (`valid_*` equal to the padded widths -- nothing is
+    padded), `gemm1_clamp_limit` 10 per expert with `gemm1_alpha`, `gemm1_beta`
+    and both biases `None` (so the activation is `silu(min(gate, 10)) *
+    clamp(up, -10, 10)`), pre-routed bf16 weights, `routing_method_type` 1,
+    `hidden_states` from `mxfp8_quantize(x, False, 512)` (linear scales), and
+    `output=` a `[T, 5120]` bf16 buffer. The call is made inside the autotuner's
+    `fallback_tactic()` scope: tactic choice changes output bits (in the gates,
+    but not bitwise), and inside that scope every rank takes the fallback whatever
+    its cache holds -- `autotune(tune_mode=False)` alone still takes a cached
+    tactic and is not certified here. The fallback's token tile is 8 up to 383, 16
+    at 384..725 and 32 from 726; the cells hold those edges and the sweep's ends,
+    and the entry's test runs every T = 1..1280 eagerly (kernel map, skewed
+    routing at every run's edges, bitwise repeatability, rows independent of T
+    from T = 2) and captures and replays the pinned call at every `T = 5G` over
+    the 46 captured batch sizes. The routing weight multiplies FC2's output, so a
+    reference in the checkpoint's own order (weight into the activation before
+    FC2's MXFP8 quantization) is a different computation, about 10 ulp RMS away.
+    Not certified for V4.1: `T` above 1280 except 8192 (no capture there), an
+    unpinned call, an expert window, alpha / beta or biases at this geometry.
     """
 
     def bind_glu(self, num_experts: int, clamp_limit: float, device: torch.device) -> None:
@@ -364,6 +428,14 @@ class Mxe4m3Mxe2m1BlockScaleMoeRunner(OpWrapper):
         maxima. Both were sized against deliberately wrong computations: a
         reference skipping the FC1 requantization lands at 19.6 / 10.6 ulp, and
         a gate/up swap or an unshuffled operand past 100.
+
+        The DeepSeek-V4.1 drafter cells take the same gate. Measured on sm_103 at
+        that geometry (H 5120, I 2304, 128 experts, top-3, clamp 10, no biases):
+        1.98 ulp element-wise / 0.71 ulp RMS at worst over every eager T = 1..1280
+        and the skewed-routing reruns, 2.20 / 0.71 over the CUDA-graph replays.
+        Its wrong references -- no clamp, the clamp at 7, gate/up swapped, alpha /
+        beta 1.702 / 1.0, no FC1 requantization -- all land outside the gate, and
+        the checkpoint's weight-before-FC2 order sits above 6 ulp RMS.
         """
         assert out.dtype == ref.dtype == torch.bfloat16, (out.dtype, ref.dtype)
         assert out.shape == ref.shape, (out.shape, ref.shape)

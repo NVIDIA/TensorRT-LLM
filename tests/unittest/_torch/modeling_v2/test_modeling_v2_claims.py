@@ -218,6 +218,13 @@ def test_targets_do_not_share_files():
                     )
 
 
+def _entry_files() -> list[Path]:
+    """Every entry module: the shared catalog's, and each target's own ``ops/``."""
+    files = sorted((_ROOT / "catalog").glob("*/*.py"))
+    files += sorted((_ROOT / "models").glob("*/*/ops/*/*.py"))
+    return [path for path in files if path.name != "__init__.py"]
+
+
 def test_every_entry_with_cells_has_a_test_that_drives_them():
     """A cell list nothing executes is worse than no cell list.
 
@@ -231,18 +238,15 @@ def test_every_entry_with_cells_has_a_test_that_drives_them():
     name both the entry and `.CELLS`. That is weaker than proving the cells were
     driven, and it is what a check that runs anywhere can say.
     """
-    catalog = _ROOT / "catalog"
     tests = list(Path(__file__).resolve().parent.rglob("*.py"))
     sources = {t: t.read_text() for t in tests}
 
     undriven = []
-    for entry in sorted(catalog.glob("*/*.py")):
-        if entry.name == "__init__.py":
-            continue
+    for entry in _entry_files():
         if "Cell(" not in entry.read_text():
             continue
         if not any(entry.stem in src and ".CELLS" in src for src in sources.values()):
-            undriven.append(f"{entry.parent.name}/{entry.stem}")
+            undriven.append(str(entry.relative_to(_ROOT).with_suffix("")))
 
     assert not undriven, (
         f"{len(undriven)} entry(ies) declare cells that no test drives: "
@@ -339,12 +343,10 @@ def test_every_core_ships_both_targets():
 # reading bound state, and CELLS stops covering what the target actually runs.
 
 
-def _catalog_entries() -> list[tuple[Path, ast.ClassDef]]:
-    """Every OpWrapper subclass in the catalog, as (path, class node)."""
+def _entry_classes() -> list[tuple[Path, ast.ClassDef]]:
+    """Every OpWrapper subclass in an entry module, as (path, class node)."""
     found = []
-    for path in sorted((_ROOT / "catalog").glob("*/*.py")):
-        if path.name == "__init__.py":
-            continue
+    for path in _entry_files():
         for node in ast.walk(ast.parse(path.read_text())):
             if isinstance(node, ast.ClassDef) and any(
                 isinstance(b, ast.Name) and b.id == "OpWrapper" for b in node.bases
@@ -361,7 +363,7 @@ def test_raw_call_reads_no_bound_state():
     `CELLS` silently narrows to whatever the last target happened to bind.
     """
     offenders = []
-    for path, cls in _catalog_entries():
+    for path, cls in _entry_classes():
         for node in cls.body:
             if not isinstance(node, ast.FunctionDef) or node.name != "raw_call":
                 continue
@@ -410,7 +412,7 @@ def test_is_valid_accepts_everything_raw_call_accepts():
     and reported a match.
     """
     problems = []
-    for path, cls in _catalog_entries():
+    for path, cls in _entry_classes():
         funcs = {
             n.name: n
             for n in cls.body

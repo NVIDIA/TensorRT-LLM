@@ -26,6 +26,26 @@ STANDARD, MLA_CONTEXT, MLA_GENERATION = 0, 1, 2
 #: quant_mode bit for an fp8 KV cache.
 QM_FP8_KV_CACHE = 128
 
+#: mask_type 0 (AttentionMaskType.padding): with no pool, full attention
+#: within each sequence.
+MASK_BIDIRECTIONAL = 0
+
+#: The deepseek-v4.1 vision tower's head geometry, the only one run without a
+#: KV pool.
+VIT_HEADS, VIT_HEAD_DIM = 16, 64
+
+#: (why, per-slot lengths, max_context_q_len_override, q scales) of the vision
+#: cells. Slot lengths sum to the call's row count; an override of None is the
+#: eager one-sequence call, an override B the captured two-slot call over a
+#: bucket of B rows. The q scales set the logit std (about 1 and 2).
+_VIT_CELLS = (
+    ("deepseek-v4.1 vision eager P=1296: one image, no pool, 16/16/64", (1296,), None, (1.0, 2.0)),
+    ("deepseek-v4.1 vision eager P=9189: the per-image ceiling", (9189,), None, (1.0, 2.0)),
+    ("deepseek-v4.1 vision graph B=1024 P=7: slots (P, B-P), override B", (7, 1017), 1024, (2.0,)),
+    ("deepseek-v4.1 vision graph B=9216 P=9189: the largest image", (9189, 27), 9216, (2.0,)),
+    ("deepseek-v4.1 vision graph B=9216 P=9216: an empty pad slot", (9216, 0), 9216, (2.0,)),
+)
+
 
 class ThopAttention(OpWrapper):
     """Append this step's K/V to the paged cache, then attend over it.
@@ -99,6 +119,32 @@ class ThopAttention(OpWrapper):
                 quant_mode=QM_FP8_KV_CACHE,
             ),
         ),
+        # The deepseek-v4.1 vision tower: the no-KV-cache mode, one image per
+        # call, eagerly over one sequence or captured over two slots (image,
+        # pad) with the launch fixed by `max_context_q_len_override`. Cells at
+        # the ends of what was measured; the sweeps between them are tests.
+        *(
+            Cell(
+                why=why,
+                spec=dict(
+                    input_type=STANDARD,
+                    num_heads=VIT_HEADS,
+                    num_kv_heads=VIT_HEADS,
+                    head_size=VIT_HEAD_DIM,
+                    v_head_dim=VIT_HEAD_DIM,
+                    sinks=False,
+                    window=None,
+                    quant_mode=0,
+                    kv_cache=False,
+                    mask_type=MASK_BIDIRECTIONAL,
+                    seq_lens=seq_lens,
+                    q_len_override=q_len_override,
+                    cuda_graph=q_len_override is not None,
+                    q_scales=q_scales,
+                ),
+            )
+            for why, seq_lens, q_len_override, q_scales in _VIT_CELLS
+        ),
     )
 
     note = """
@@ -116,6 +162,48 @@ class ThopAttention(OpWrapper):
     The softmax statistics the MLA chunked-prefill path writes are a second
     output; `softmax_stats` states them separately so `reference` stays one
     thing.
+
+    DeepSeek-V4.1: the vision tower calls this op in the no-KV-cache mode --
+    every pool argument and `tokens_per_block` None, so the op runs the
+    packed-QKV context FMHA with no append and no persistent state. bf16,
+    16/16/64 heads, `is_fused_qkv` on the packed `[T, 3072]` rows, `mask_type`
+    0 (bidirectional within each sequence, sequences never see each other),
+    `q_scaling` 1, `position_embedding_type` 0 (the 2D RoPE is the caller's),
+    `update_kv_cache=True` (False raises), every request a context one
+    (`num_contexts` = slots, `num_ctx_tokens` = T). One image per call: eagerly
+    over one sequence of P <= 9189 rows with `cu_q_seqlens` = (0, P); or
+    captured once per padded bucket B in 1024..9216, over two slots (image P,
+    pad B - P) with `max_context_q_len_override = B` and the host lengths
+    holding all B rows as one sequence (`[B, 0]`), after which a replay follows
+    whatever split the device `sequence_length` / `context_lengths` /
+    `cu_q_seqlens` hold -- bitwise what an eager call over that split returns.
+    Metadata consumed: the per-slot lengths in `sequence_length` and
+    `context_lengths` (device), `host_past_key_value_lengths` and
+    `host_context_lengths` (host), `host_total_kv_lens = [T, 0]`,
+    `cu_q_seqlens` (optional; None is bitwise the same as the true offsets).
+    The cells sit at the ends; the measured ranges are the tests': sequences
+    of 1..9216 rows and up to 16 sequences / 17037 rows per call against the
+    full reference, buckets 1024..9216 with P from 7 to B (an empty pad slot
+    included) and four-slot splits with empty slots, and on sampled rows up to
+    702960 rows per call and 262144 per sequence. Gated by `compare` and, in
+    the tests, by the bf16 atol 5e-3 / rtol 1.6e-2 band the measurements used
+    (at most 0.46 of it at logit std 1 and 2), with a causal mask and
+    attention across images each required at least 10x outside it. Silently
+    wrong, and not rejected: `context_lengths` differing from
+    `sequence_length` (neither split comes back); a given `cu_q_seqlens` is
+    the split the FMHA uses, over `context_lengths`; `mask_type` 1 is causal
+    within each sequence; a capture without the override is fixed to its
+    capture-time split, and a replay over another split comes back wrong or
+    non-finite. These are tensor contents, so `is_valid` cannot see them.
+    Inert: `tokens_per_block` 32 vs None, `max_seq_len` /
+    `max_context_length` / `attention_window_size` (even below the longest
+    sequence), `attention_input_type` 0 vs 1; rows `[T:]` of `output` are never
+    written. `workspace_` grows in place, so a graph needs an eager call to
+    size it before capture. Not certified for DeepSeek-V4.1: another head
+    geometry, GQA/MQA, sinks, a window, paged context, `q_scaling` != 1,
+    in-kernel RoPE, fp8, generation rows, an override below the longest
+    sequence or on a cache-backed call, and a softmax sharper than logit std 2
+    (one seed reached 1.03 of the band at std 3).
     """
 
     def raw_call(

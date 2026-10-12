@@ -37,6 +37,21 @@ class FlashinferSiluAndMul(OpWrapper):
             why="the dense layers' wider intermediate, 2 x 18432",
             spec=dict(shape=(16, 36864), dtype=torch.bfloat16),
         ),
+        # DeepSeek-V4.1's vision tower MLP: [gate ; up] at d = 2816, P patches
+        # per tower call, every P in 1..17037 certified by the prefix sweep in
+        # the test; these are the sweep's two ends. `data="vit"` is that test's
+        # input: N(0, 3) with planted zero, large-gate, large-up, tiny-gate and
+        # large-negative-gate rows.
+        Cell(
+            why="deepseek-v4.1 vision [P, 5632] P=1: the tower MLP, "
+            "one row, bottom of the prefix sweep 1..17037",
+            spec=dict(shape=(1, 5632), dtype=torch.bfloat16, data="vit"),
+        ),
+        Cell(
+            why="deepseek-v4.1 vision [P, 5632] P=17037: the tower MLP, "
+            "its largest call, top of the prefix sweep 1..17037",
+            spec=dict(shape=(17037, 5632), dtype=torch.bfloat16, data="vit"),
+        ),
     )
 
     note = """
@@ -44,6 +59,20 @@ class FlashinferSiluAndMul(OpWrapper):
 
     fp16 and fp32 are accepted by the op. No shipped target uses them here, so
     they are not cells.
+
+    DeepSeek-V4.1: the vision tower's MLP calls it on cublas_mm's contiguous
+    bf16 `[P, 5632]` output (`[gate ; up]` in the checkpoint's w1 order,
+    d = 2816), unclamped, eagerly, with P any patch count 1..17037. Metadata
+    none. Every P is certified: the 17037-row call meets the reference, every
+    prefix of it is bitwise the op on that many rows, nothing is written past
+    the last row, and one kernel (block 352, grid P) runs at every count. The
+    kernel is built with fast math: gates in (-88.72, -87.33] and results
+    below 2^-126 in magnitude come back exactly 0 where the fp32 reference is a
+    tiny nonzero (below 1e-36 x max(1, |up|)). The default gate passes them;
+    the test's per-element 1-ulp gate admits exactly that set, measured over
+    every finite bf16 gate. Not certified for V4.1: CUDA-graph capture at this
+    width, fp16, more than 17037 rows, a non-contiguous or row-strided input,
+    NaN or inf input.
     """
 
     def raw_call(self, x: torch.Tensor) -> torch.Tensor:

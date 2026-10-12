@@ -68,6 +68,40 @@ GRAPH_BATCH_SIZES: Tuple[int, ...] = tuple(range(1, 33)) + (64, 128, 256)
 # by one gather of the rank's own rows into the full token set.
 SITES_PER_DECODE_GRAPH = 29
 
+# The DeepSeek-V4.1 core target under attention DP gathers, per rank, rows padded
+# to max(all_rank_num_tokens) with sizes = None: the MoE input as bf16 [n, 5120]
+# on every layer, and on the engram layers the [n, 24] int64 engram ids as their
+# int32 [n, 48] view. int64 [n, 24] is run beside it.
+CORE_FORMS: Tuple[Tuple[str, torch.dtype, Tuple[int, ...]], ...] = (
+    ("MoE bf16 [n,5120]", torch.bfloat16, (5120,)),
+    ("engram ids int32 [n,48]", torch.int32, (48,)),
+    ("engram ids int64 [n,24]", torch.int64, (24,)),
+)
+N_MAX = 16384  # rows per rank: the largest max_num_tokens the target is served at
+SWEEP_SLACK = 509  # extra table rows (prime): every call reads its rows at its own offset
+CORE_LAYERS = 40
+ENGRAM_LAYER_IDS = (1, 14)
+# The V4.1 capture batch set, per rank: every G in 1..32 plus the padded default
+# list of cuda_graph_config {enable_padding: true, max_batch_size: 256} (16..128
+# step 8, 192, 256) -- 46 values. A captured step is generation-only with next_n 1
+# (DSpark off) or 6 (DSpark on), so every rank gathers n = G or n = 6G rows. The
+# 5G / 6G rows of G in 1..8, 16, 24, 32 are kept beside them (they add 35 and
+# 160): 84 per-rank row counts, up to 1536.
+GSET: Tuple[int, ...] = tuple(range(1, 33)) + tuple(range(40, 129, 8)) + (192, 256)
+_GATE_BATCHES: Tuple[int, ...] = tuple(range(1, 9)) + (16, 24, 32)
+CORE_CAPTURE_ROWS: Tuple[int, ...] = tuple(
+    sorted(
+        set(GSET)
+        | {6 * g for g in GSET}
+        | set(_GATE_BATCHES)
+        | {5 * b for b in _GATE_BATCHES}
+        | {6 * b for b in _GATE_BATCHES}
+    )
+)
+# Eager prefill-sized gathers (per-rank rows) run between the decode graphs'
+# replays: row counts the runtime dumps showed, and N_MAX.
+PREFILL_BETWEEN_REPLAYS: Tuple[int, ...] = (888, 890, 2048, 9524, 10441, 16378, N_MAX)
+
 # Bound inside the rank body, never in the launcher: importing the entry
 # pulls in tensorrt_llm, which calls MPI_Init at import, and an
 allgather: Any = None
@@ -896,6 +930,419 @@ def check_call_order_disagreement_corrupts_silently() -> None:
     dist.barrier()
 
 
+def _core_tables() -> List[torch.Tensor]:
+    """Every rank's payload rows for each CORE_FORMS entry, [WORLD, N_MAX + SWEEP_SLACK, ...]."""
+    rows = N_MAX + SWEEP_SLACK
+    return [
+        torch.stack([_payload(r, rows, 120000 + f, dtype, trailing) for r in range(WORLD)])
+        for f, (_, dtype, trailing) in enumerate(CORE_FORMS)
+    ]
+
+
+def _sweep_offset(k: int, form: int) -> int:
+    """Row offset of step k's call of one form: no two nearby calls read the
+    same rows, so a result left over from an earlier call cannot pass."""
+    return (k * 131 + form * 211) % SWEEP_SLACK
+
+
+def check_v41_core_gathers_at_every_per_rank_row_count() -> None:
+    """DeepSeek-V4.1: every per-rank n in 1..N_MAX, the core target's gathers, twice over.
+
+    n rows per rank gather to WORLD * n (up to WORLD x N_MAX): per step one gather
+    of each CORE_FORMS entry, first with n ascending, then in a seeded shuffle
+    (prefill-sized steps between decode-sized ones). Every element is compared
+    with the concatenation of the ranks' rows; the mismatch counts stay on the
+    device and are read once per pass. The cells carry the ends of this range;
+    this is what keeps every n between them certified. Bounded at
+    2 x 3 x N_MAX = 98,304 gathers, one device-side compare each and no
+    per-call host sync.
+    """
+    tables = _core_tables()
+    # Not blind to a stale result: the previous step's rows differ from this
+    # step's on nearly every element, in every form.
+    for f, table in enumerate(tables):
+        for n in (1, 8, 890, N_MAX):
+            now, before = _sweep_offset(1000, f), _sweep_offset(999, f)
+            fraction = (
+                (table[:, now : now + n] != table[:, before : before + n]).float().mean().item()
+            )
+            assert fraction > 0.9, (
+                f"{CORE_FORMS[f][0]} n={n}: a stale result differs on only {fraction:.4f}"
+            )
+
+    ascending = list(range(1, N_MAX + 1))
+    shuffled = list(ascending)
+    random.Random(4242).shuffle(shuffled)
+    k = 0
+    started = time.monotonic()
+    for name, order in (("ascending", ascending), ("shuffled", shuffled)):
+        bad = torch.zeros(len(CORE_FORMS), N_MAX + 1, dtype=torch.int64, device="cuda")
+        for n in order:
+            k += 1
+            for f, (_, dtype, trailing) in enumerate(CORE_FORMS):
+                o = _sweep_offset(k, f)
+                out = allgather(tables[f][RANK, o : o + n], None, GROUP)
+                assert out.shape == (WORLD * n, *trailing) and out.dtype is dtype, (
+                    n,
+                    out.shape,
+                    out.dtype,
+                )
+                bad[f, n] += (out.view(WORLD, n, *trailing) != tables[f][:, o : o + n]).sum()
+        torch.cuda.synchronize()
+        wrong = bad.nonzero().tolist()
+        assert not wrong, f"{name}: wrong gathers at " + ", ".join(
+            f"{CORE_FORMS[f][0]} n={n} ({bad[f, n].item()} elements)" for f, n in wrong[:20]
+        )
+        if RANK == 0:
+            print(
+                f"[rank 0] v4.1 core sweep {name}: n=1..{N_MAX}, {len(CORE_FORMS) * N_MAX} calls, "
+                f"every element exact ({time.monotonic() - started:.0f}s so far)",
+                flush=True,
+            )
+        dist.barrier()
+    del tables
+    torch.cuda.empty_cache()
+    dist.barrier()
+
+
+def check_v41_core_ragged_gathers_at_the_dumped_row_counts() -> None:
+    """DeepSeek-V4.1: the sizes-vector form at the per-rank counts the runtime dump showed.
+
+    The core target pads to max(all_rank_num_tokens) and passes sizes = None;
+    these are the unpadded splits of the same steps, in every CORE_FORMS dtype.
+    """
+    vectors = [[48, 888, 890, 1], [890, 0, 888, 48], [2048, 890, 14, 888], [888, 890, 890, 888]]
+    for v, sizes in enumerate(vectors):
+        sizes = (sizes * WORLD)[:WORLD]
+        for f, (label, dtype, trailing) in enumerate(CORE_FORMS):
+            seed = 125000 + 10 * v + f
+            out = allgather(_payload(RANK, sizes[RANK], seed, dtype, trailing), sizes, GROUP)
+            assert out.shape == (sum(sizes), *trailing), (sizes, out.shape)
+            _assert_bitwise(
+                out, _gather_ref(sizes, seed, dtype, trailing), f"ragged {label} sizes={sizes}"
+            )
+    dist.barrier()
+
+
+def check_v41_core_decode_graphs_replay_bitwise_equal_to_eager() -> None:
+    """DeepSeek-V4.1: one decode graph per CORE_CAPTURE_ROWS entry, the core target's gathers.
+
+    Per graph, in the target's order: on the engram layers (1, 14) the int32
+    [n, 48] id gather (plus an int64 [n, 24] one), then on every one of the 40
+    layers the MoE's bf16 [n, 5120] gather -- 44 sites. Every graph captured
+    largest first into one shared pool and kept alive, then three passes in
+    shuffled order with new data in the captured inputs: one graph at a time
+    with an eager gather at a prefill count (PREFILL_BETWEEN_REPLAYS, rotating)
+    between replays; all back to back with nothing synchronizing; and one where
+    every site is compared bit for bit with an eager gather of the same buffer.
+    Before every replay of the first two passes, every site's output is checked
+    to differ from the new reference on more than 90% of its elements, so a
+    replay that did not run (a stale output) cannot pass.
+
+    Each site's output is copied inside the capture into a persistent buffer
+    outside the shared pool, as `_capture_per_batch_size` does and for the same
+    reason: pooled outputs alias across graphs, so a burst of replays would
+    otherwise leave every graph holding the last writer's result.
+    """
+    distinct = 8  # bf16 input buffers per graph, cycled over its 40 MoE sites
+    for n in CORE_CAPTURE_ROWS:
+        _warm_up_off_capture_stream(
+            lambda n=n: [
+                allgather(_payload(RANK, n, 1, dt, tr), None, GROUP) for _, dt, tr in CORE_FORMS
+            ],
+            reps=1,
+        )
+
+    def site_keys() -> List[Tuple[int, int]]:
+        keys = []
+        moe_site = 0
+        for layer in range(CORE_LAYERS):
+            if layer in ENGRAM_LAYER_IDS:
+                j = ENGRAM_LAYER_IDS.index(layer)
+                keys.append((1, j))
+                keys.append((2, j))
+            keys.append((0, moe_site % distinct))
+            moe_site += 1
+        return keys
+
+    keys = site_keys()
+    assert len(keys) == CORE_LAYERS + 2 * len(ENGRAM_LAYER_IDS), len(keys)
+
+    pool = None
+    graphs: Dict[int, Any] = {}
+    inputs: Dict[int, Dict[int, List[torch.Tensor]]] = {}
+    sites: Dict[int, List[Tuple[int, int, torch.Tensor]]] = {}
+    counts = (distinct, len(ENGRAM_LAYER_IDS), len(ENGRAM_LAYER_IDS))
+    for n in sorted(CORE_CAPTURE_ROWS, reverse=True):
+        inputs[n] = {
+            f: [_payload(RANK, n, 30 + 10 * f + i, dt, tr) for i in range(counts[f])]
+            for f, (_, dt, tr) in enumerate(CORE_FORMS)
+        }
+        persistent = [
+            torch.zeros(WORLD * n, *CORE_FORMS[f][2], dtype=CORE_FORMS[f][1], device="cuda")
+            for f, _ in keys
+        ]
+        graph = torch.cuda.CUDAGraph()
+        ctx = torch.cuda.graph(graph) if pool is None else torch.cuda.graph(graph, pool=pool)
+        with ctx:
+            for dst, (f, i) in zip(persistent, keys):
+                dst.copy_(allgather(inputs[n][f][i], None, GROUP))
+        sites[n] = [(f, i, dst) for dst, (f, i) in zip(persistent, keys)]
+        pool = graph.pool() if pool is None else pool
+        graphs[n] = graph
+        torch.cuda.synchronize()
+        dist.barrier()
+
+    def stage(n: int, seed: int) -> Dict[Tuple[int, int], torch.Tensor]:
+        refs = {}
+        for f, (_, dt, tr) in enumerate(CORE_FORMS):
+            for i, x in enumerate(inputs[n][f]):
+                s = seed + 100 * f + i
+                x.copy_(_payload(RANK, n, s, dt, tr))
+                refs[(f, i)] = _gather_ref([n] * WORLD, s, dt, tr)
+        return refs
+
+    def verify(n: int, refs: Dict[Tuple[int, int], torch.Tensor], where: str) -> None:
+        bad = torch.zeros((), dtype=torch.int64, device="cuda")
+        for f, i, out in sites[n]:
+            bad += (out != refs[(f, i)]).sum()
+        assert bad.item() == 0, (
+            f"{where} n={n}: {bad.item()} wrong elements over {len(sites[n])} sites"
+        )
+
+    stale_worst = [1.0]
+
+    def assert_stale_is_visible(
+        n: int, refs: Dict[Tuple[int, int], torch.Tensor], where: str
+    ) -> None:
+        """Before the replay: what the outputs hold now must fail the gate."""
+        fractions = torch.stack([(out != refs[(f, i)]).double().mean() for f, i, out in sites[n]])
+        worst = fractions.min().item()
+        stale_worst[0] = min(stale_worst[0], worst)
+        assert worst > 0.9, (
+            f"{where} n={n}: a stale output differs from the new reference on only {worst:.4f}"
+        )
+
+    rng = random.Random(777)
+    order = list(CORE_CAPTURE_ROWS)
+    rng.shuffle(order)
+    for pos, n in enumerate(order):
+        refs = stage(n, 200000 + 1000 * n)
+        assert_stale_is_visible(n, refs, "pass 1 (before replay)")
+        graphs[n].replay()
+        wide, seed = PREFILL_BETWEEN_REPLAYS[pos % len(PREFILL_BETWEEN_REPLAYS)], 300000 + pos
+        eager = allgather(_payload(RANK, wide, seed, torch.bfloat16, (5120,)), None, GROUP)
+        torch.cuda.synchronize()
+        verify(n, refs, "pass 1 (checked)")
+        _assert_bitwise(
+            eager,
+            _gather_ref([wide] * WORLD, seed, torch.bfloat16, (5120,)),
+            f"pass 1 eager n={wide}",
+        )
+        del eager
+        dist.barrier()
+    rng.shuffle(order)
+    staged = {n: stage(n, 400000 + 1000 * n) for n in order}
+    for n in order:
+        assert_stale_is_visible(n, staged[n], "pass 2 (before replay)")
+    for n in order:
+        graphs[n].replay()
+    torch.cuda.synchronize()
+    for n in order:
+        verify(n, staged[n], "pass 2 (burst)")
+    del staged
+    dist.barrier()
+    rng.shuffle(order)
+    for n in order:
+        stage(n, 500000 + 1000 * n)
+        graphs[n].replay()
+        torch.cuda.synchronize()
+        eager_out = {
+            (f, i): allgather(x, None, GROUP) for f in inputs[n] for i, x in enumerate(inputs[n][f])
+        }
+        torch.cuda.synchronize()
+        for s, (f, i, out) in enumerate(sites[n]):
+            assert torch.equal(out, eager_out[(f, i)]), (
+                f"pass 3 n={n} site={s}: replay differs from eager"
+            )
+        dist.barrier()
+    if RANK == 0:
+        print(
+            f"[rank 0] v4.1 core graphs: {len(graphs)} captured at per-rank {list(CORE_CAPTURE_ROWS)}; "
+            "before every replay of passes 1-2 a stale output differed from the new reference on "
+            f"at least {stale_worst[0]:.4f} of its elements",
+            flush=True,
+        )
+    for held in (graphs, sites, inputs):
+        held.clear()
+    torch.cuda.synchronize()
+    torch.cuda.empty_cache()
+    dist.barrier()
+
+
+# The multimodal DeepSeek-V4.1 target's attention-DP image-span mask. The router runs
+# on the all-gathered token set, so in every eager step every rank gathers its own
+# [T] bool image mask (all False on a text step) as uint8: `u8 = mask.view(torch.uint8)`,
+# zero-padded at the end to max(all_rank_num_tokens) as the MoE input is, gathered
+# with sizes = None, and the [WORLD * n] result read back as `.view(torch.bool)`.
+# Per-rank valid counts are ragged; the gathered call is uniform. It is not
+# captured (the target skips it under capture: captured steps are generation-only,
+# no row is an image).
+MASK_KINDS = ("random bits", "text step (all False)", "image spans", "all image")
+
+
+def _mask_counts(n: int, k: int) -> List[int]:
+    """Step k's per-rank valid token counts, max n (one rank holds exactly n), others 1..n."""
+    rng = random.Random(7_000_000 + k)
+    counts = [rng.randint(1, n) for _ in range(WORLD)]
+    counts[k % WORLD] = n
+    return counts
+
+
+def _mask_rows(rank: int, count: int, k: int) -> torch.Tensor:
+    """Rank's bool [count] image mask at step k; the kind rotates with (k + rank)."""
+    kind = (k + rank) % len(MASK_KINDS)
+    if kind == 1:
+        return torch.zeros(count, dtype=torch.bool, device="cuda")
+    if kind == 3:
+        return torch.ones(count, dtype=torch.bool, device="cuda")
+    if kind == 0:
+        gen = torch.Generator(device="cuda").manual_seed(k * 977 + rank + 1)
+        return torch.randint(0, 2, (count,), generator=gen, device="cuda", dtype=torch.int32) != 0
+    rng = random.Random(k * 31 + rank)
+    m = torch.zeros(count, dtype=torch.bool, device="cuda")
+    for _ in range(rng.randint(1, 3)):
+        a = rng.randrange(count)
+        m[a : a + rng.randint(1, 2400)] = True
+    return m
+
+
+def _v41_mask_gather(mask: torch.Tensor, rows: int) -> torch.Tensor:
+    """The target's call: bool [T] -> uint8 view -> zero-pad to rows -> allgather(None)."""
+    u8 = mask.view(torch.uint8)
+    if rows > mask.shape[0]:
+        u8 = torch.nn.functional.pad(u8, [0, rows - mask.shape[0]])
+    return allgather(u8, None, GROUP)
+
+
+def _mask_ref(counts: Sequence[int], n: int, k: int) -> torch.Tensor:
+    """Arithmetic reference: every rank's mask, zero-padded to n, in rank order (bool [WORLD * n])."""
+    ref = torch.zeros(WORLD, n, dtype=torch.bool, device="cuda")
+    for r in range(WORLD):
+        ref[r, : counts[r]] = _mask_rows(r, counts[r], k)
+    return ref.flatten()
+
+
+def check_v41_mask_gathers_at_every_per_rank_row_count() -> None:
+    """DeepSeek-V4.1: the image-span mask gather at every padded per-rank n in 1..N_MAX, twice.
+
+    Per step: ragged valid counts (one rank at n, the others 1..n), each rank's mask one of
+    MASK_KINDS, gathered exactly as the target does it, then the engram-id gather that
+    follows it in the target's step (int32 [n, 48]). The uint8 result must be the padded
+    concatenation byte for byte (values 0/1 only), and its bool view the image mask of the
+    gathered token set. Ascending, then in a seeded shuffle. Mismatch counts stay on the
+    device and are read once per pass. Bounded at 2 x 2 x N_MAX = 65,536 gathers.
+    """
+    ids_table = torch.stack(
+        [_payload(r, N_MAX + SWEEP_SLACK, 126000, torch.int32, (48,)) for r in range(WORLD)]
+    )
+    ascending = list(range(1, N_MAX + 1))
+    shuffled = list(ascending)
+    random.Random(5151).shuffle(shuffled)
+    k = 0
+    started = time.monotonic()
+    for name, order in (("ascending", ascending), ("shuffled", shuffled)):
+        bad = torch.zeros(2, N_MAX + 1, dtype=torch.int64, device="cuda")
+        for n in order:
+            k += 1
+            counts = _mask_counts(n, k)
+            mine = _mask_rows(RANK, counts[RANK], k)
+            out = _v41_mask_gather(mine, n)
+            assert out.shape == (WORLD * n,) and out.dtype is torch.uint8 and out.is_contiguous(), (
+                n,
+                out.shape,
+            )
+            ref = _mask_ref(counts, n, k)
+            bad[0, n] += (out != ref.to(torch.uint8)).sum()
+            bad[0, n] += (out.view(torch.bool) != ref).sum()
+            o = _sweep_offset(k, 1)
+            ids = allgather(ids_table[RANK, o : o + n], None, GROUP)
+            bad[1, n] += (ids.view(WORLD, n, 48) != ids_table[:, o : o + n]).sum()
+        torch.cuda.synchronize()
+        wrong = bad.nonzero().tolist()
+        assert not wrong, f"{name}: wrong gathers at " + ", ".join(
+            f"{('mask', 'ids')[f]} n={n} ({bad[f, n].item()} elements)" for f, n in wrong[:20]
+        )
+        if RANK == 0:
+            print(
+                f"[rank 0] v4.1 mask sweep {name}: n=1..{N_MAX}, {2 * N_MAX} calls (uint8 mask + "
+                f"int32 ids), every element exact ({time.monotonic() - started:.0f}s so far)",
+                flush=True,
+            )
+        dist.barrier()
+
+
+def _mask_control_splits() -> List[List[int]]:
+    """Per-rank valid counts for the mask controls: the runtime dump's dep4 splits, cycled over the group.
+
+    Two ranks have no dump; there the splits keep one rank a little short of the
+    padded count and one far short, so that every wrong reading below moves a
+    large share of random bits (with a full first rank, the unpadded layout and
+    the padded one coincide, and a one-row rank shows no padding at all).
+    """
+    if WORLD == 2:
+        return [[888, 890], [1500, 2048], [2000, 2048]]
+    return [
+        (counts * WORLD)[:WORLD]
+        for counts in ([48, 888, 890, 1], [890, 1, 888, 48], [2048, 890, 14, 888])
+    ]
+
+
+def check_v41_mask_gate_discriminates_a_wrong_gather() -> None:
+    """DeepSeek-V4.1: the bitwise mask check rejects the plausible wrong gathers, at a dumped step.
+
+    Per-rank counts from `_mask_control_splits`, random-bit masks on every rank:
+    padding put in front of the rows instead of behind them, the rank blocks
+    reversed, the ranks' rows concatenated unpadded (the sizes-form layout) and
+    read as if padded, and the previous step's result. Each differs from the
+    gathered mask on a large share of elements.
+    """
+    prev = None
+    for step, counts in enumerate(_mask_control_splits()):
+        # k is a multiple of 4, so `_mask_rows(r, _, k - r)` is kind 0 (random
+        # bits) on every rank.
+        n, k = max(counts), 900_000 + step * max(WORLD, 4)
+        rows = [_mask_rows(r, counts[r], k - r) for r in range(WORLD)]
+        out = _v41_mask_gather(rows[RANK], n)
+        ref = torch.zeros(WORLD, n, dtype=torch.bool, device="cuda")
+        front = torch.zeros(WORLD, n, dtype=torch.bool, device="cuda")
+        for r in range(WORLD):
+            ref[r, : counts[r]] = rows[r]
+            front[r, n - counts[r] :] = rows[r]
+        assert torch.equal(out.view(torch.bool), ref.flatten()), counts
+        packed = torch.zeros(WORLD * n, dtype=torch.bool, device="cuda")
+        cat = torch.cat(rows)
+        packed[: cat.numel()] = cat
+        variants = [
+            ("padding in front", front.flatten()),
+            ("rank blocks reversed", ref.flip(0).flatten()),
+            ("unpadded sizes-form layout", packed),
+        ]
+        if prev is not None and prev.numel() == ref.numel():
+            variants.append(("previous step's result", prev))
+        for name, wrong in variants:
+            differ = int((wrong != out.view(torch.bool)).sum().item())
+            if RANK == 0:
+                print(
+                    f"[rank 0] v4.1 mask control {name} counts={counts}: "
+                    f"{differ} of {WORLD * n} elements differ",
+                    flush=True,
+                )
+            assert differ > WORLD * n // 20, (name, counts, differ)
+        prev = ref.flatten()
+    dist.barrier()
+
+
 CHECKS = (
     # Stays first: it is the only test that can observe GROUP's first-ever
     # call, and every later test needs the communicator it builds.
@@ -919,6 +1366,15 @@ CHECKS = (
     check_wrapper_guards_a_non_contiguous_input,
     check_wrapper_guards_a_sizes_list_of_the_wrong_length,
     check_wrapper_guards_a_zero_dim_input,
+    # DeepSeek-V4.1's surface at world size 4: every per-rank row count of the
+    # core forms and of the multimodal mask, the dumped ragged splits, and the
+    # decode graphs at the V4.1 capture set. After every existing check, so none
+    # of them runs on a communicator these left in a different state.
+    check_v41_core_gathers_at_every_per_rank_row_count,
+    check_v41_core_ragged_gathers_at_the_dumped_row_counts,
+    check_v41_core_decode_graphs_replay_bitwise_equal_to_eager,
+    check_v41_mask_gathers_at_every_per_rank_row_count,
+    check_v41_mask_gate_discriminates_a_wrong_gather,
     # Stays last: it deliberately disagrees on call order, and although a
     # swapped pair realigns the communicator (its final assertion proves it),
     # nothing after it should depend on that.
