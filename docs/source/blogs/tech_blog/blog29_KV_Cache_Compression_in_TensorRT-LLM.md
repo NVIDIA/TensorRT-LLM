@@ -97,7 +97,13 @@ Compression can live inside the model or the attention kernel, and TensorRT LLM 
 - **Seamless insertion.** A method changes only the contents of KV pages. The scheduler, the executor loop and the model are unchanged, and the cache manager keeps allocating, moving and reusing pages.
 - **General to models.** A method works on KV pages, not on a model's attention kernel, so the same method and the same insertion points serve every model.
 
-The insertion points are the five stages in the life of a KV cache shown in Figure 3: prefill chunks (1), after prefill (2), decode steps (3), tool calls (4), and after the request ends (5). At each of them nothing is reading the cache, so compression can run safely. Methods reach them through **two integration paths**. Iteration-driven methods run between model iterations, from the executor loop, and change the retained KV state. Storage-bound methods run when the cache manager moves a page between the GPU and host or disk memory, and change how the page is stored while it is cold. A method uses one path or both. In both the **cache manager keeps ownership of every page** and the method only changes its contents.
+For seamless and precise insertion, we define **five stages in the life of a KV cache** where compression can run. Each is a moment when nothing is reading the cache, shown in Figure 3:
+
+1. **Prefill chunks.** Between two chunks of a long prompt. The KV of the chunks already computed can be compressed before the next chunk arrives.
+2. **After prefill.** The prompt's KV is complete and generation has not started. The whole prompt can be compressed once.
+3. **Decode steps.** Between two generation steps. The tokens generated so far can be scored and the least useful evicted. TriAttention runs here.
+4. **Tool calls.** The request pauses while a tool runs and its KV waits, often for seconds. The waiting KV can be compressed or moved.
+5. **After the request.** The KV is kept for the next turn or for a shared prefix, and moves to host or disk memory when the GPU is full. Pages can be stored in a smaller form while they are cold. NVFP4 cold-page compression runs here.
 
 <div align="center">
 <figure>
@@ -105,6 +111,8 @@ The insertion points are the five stages in the life of a KV cache shown in Figu
 </figure>
 </div>
 <p align="center"><sub><em>Figure 3: Five stages in the life of a KV cache where compression can run. TriAttention acts at the decode stage (stage 3) and cold-page compression at the after-request stage (stage 5). The dashed stages are in scope and have no method yet.</em></sub></p>
+
+Methods reach these stages through **two integration paths**. Iteration-driven methods run between model iterations, from the executor loop, and change the retained KV state. Storage-bound methods run when the cache manager moves a page between the GPU and host or disk memory, and change how the page is stored while it is cold. A method uses one path or both. In both the **cache manager keeps ownership of every page** and the method only changes its contents.
 
 A method is selected with one block, `kv_cache_compression_config`, kept separate from the KV cache configuration (capacity, tiers, reuse, data type) and from the sparse attention configuration. One method is active per LLM instance, and it must handle every cache layout it is given or pass through what it does not understand.
 
