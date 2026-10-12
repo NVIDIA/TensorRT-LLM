@@ -67,9 +67,7 @@ class CacheReuseAdapter(ABC):
         Returned values are **primary memory-pool slot indices**, not raw block IDs:
         ``KVRegionExtractorV1.extract`` and downstream transfer code do
         ``base_ptr + slot_idx * slot_bytes`` and require the value to be a current
-        primary-pool offset. With host offload enabled, a block's logical ID can
-        diverge from its primary slot index after offload/onboard, so each backend
-        must translate before returning.
+        primary-pool offset. V2 reports these pool slot indices directly.
         """
 
     @abstractmethod

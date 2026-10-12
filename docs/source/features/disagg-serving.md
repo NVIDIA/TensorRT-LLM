@@ -157,7 +157,7 @@ cache_transceiver_config:
 
 `kv_transfer_timeout_ms` bounds how long a request may wait for its KV cache before it is cancelled and cleaned up. The default is `60000`.
 
-The Python transceiver (`transceiver_runtime: PYTHON`, `KvCacheTransceiverV2`) requires `use_kv_cache_manager_v2: true` and the NIXL backend. Using it with KV cache manager V1 raises an error during initialization. To use KV cache manager V1, select `transceiver_runtime: CPP`.
+The Python transceiver (`transceiver_runtime: PYTHON`, `KvCacheTransceiverV2`) requires `use_kv_cache_manager_v2: true` in `kv_cache_config` and the NIXL backend. Using it with KV cache manager V1 raises an error during initialization. To use KV cache manager V1, select `transceiver_runtime: CPP`.
 
 `kv_cache_bounce_size_mb` is `0` by default, which sends each KV block separately. Setting it to a positive size enables a bounce buffer, which helps when a request's blocks are scattered. With the default Python implementation this is one contiguous buffer of that many MiB per direction and a single NIXL write per request; the C++ implementation (next paragraph) instead uses one buffer shared by both directions and chunked writes. The default Python implementation is designed for fabric (MNNVL) memory; the C++ implementation falls back to `cudaMalloc` where fabric memory is unavailable.
 
