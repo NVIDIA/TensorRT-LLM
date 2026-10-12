@@ -768,7 +768,8 @@ def test_eagle3_spec_decoding_stats(eagle3_one_model):
         pytest.skip(f"Required models not found")
 
     kv_cache_config = KvCacheConfig(enable_block_reuse=False,
-                                    free_gpu_memory_fraction=0.6)
+                                    free_gpu_memory_fraction=0.6,
+                                    use_kv_cache_manager_v2=eagle3_one_model)
     spec_config = Eagle3DecodingConfig(
         max_draft_len=3,
         speculative_model=eagle_model_dir,
@@ -882,9 +883,7 @@ def test_llama_eagle3_long_prompt(use_cuda_graph):
     generated_text_ref = [result.outputs[0].text for result in results_ref]
     llm_ref.shutdown()
 
-    # The LLM with speculation on should dynamically turn it off in this
-    # test since it goes beyond the max seqlen. Thus, the text should be
-    # _exactly_ the same, no need to use similarity scoring.
+    # Greedy decoding must match the non-speculative reference for a long prompt.
     assert generated_text_spec[0] == generated_text_ref[0]
 
 
@@ -1061,7 +1060,8 @@ def test_multi_eagle3(use_one_model: bool):
         max_batch_size = 16
         max_draft_len = 3
         kv_cache_config = KvCacheConfig(enable_block_reuse=enable_block_reuse,
-                                        free_gpu_memory_fraction=0.5)
+                                        free_gpu_memory_fraction=0.5,
+                                        use_kv_cache_manager_v2=use_one_model)
         cuda_graph_config = CudaGraphConfig(
             batch_sizes=[1]) if use_cuda_graph else None
 
