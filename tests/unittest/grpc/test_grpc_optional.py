@@ -114,7 +114,7 @@ def test_protobuf_warning_skips_unavailable_api(monkeypatch, missing_api: str) -
 def test_protobuf_warning_does_not_block_model_startup(
     monkeypatch, protocol: str, implementation_available: bool
 ) -> None:
-    from google.protobuf.internal import api_implementation
+    import google.protobuf.internal as protobuf_internal
 
     if protocol == "smg":
         pytest.importorskip("smg_grpc_proto")
@@ -132,10 +132,15 @@ def test_protobuf_warning_does_not_block_model_startup(
     monkeypatch.setattr(server_module, "PyTorchLLM", llm_factory)
     monkeypatch.setattr(server_module.logger, "warning", warning)
     monkeypatch.setattr(server_module.uvloop, "run", asyncio.run)
-    if implementation_available:
-        monkeypatch.setattr(api_implementation, "Type", lambda: "python")
-    else:
-        monkeypatch.delattr(api_implementation, "Type")
+    # Replace only the package attribute the warning helper imports. Protobuf's own
+    # modules keep their bound api_implementation, so messages first imported during
+    # startup still register against the active backend.
+    fake_api = (
+        types.SimpleNamespace(Type=lambda: "python")
+        if implementation_available
+        else types.SimpleNamespace()
+    )
+    monkeypatch.setattr(protobuf_internal, "api_implementation", fake_api)
     launch = server_module.launch_smg_server if protocol == "smg" else server_module.launch_server
     with pytest.raises(RuntimeError, match="model startup reached"):
         launch("127.0.0.1", 50051, {"backend": "pytorch", "model": "test-model"})
