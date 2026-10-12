@@ -79,6 +79,11 @@ def env():
     # (also sm_103 but x86_64) and avoids depending on the GPU device name string.
     if get_sm_version() == 103 and platform.machine().lower() == "aarch64":
         e["UCX_TLS"] = "cuda_copy,cuda_ipc,sm,self,tcp"
+        # With tcp enabled, UCX opens every NIC unless UCX_NET_DEVICES limits
+        # it, and some GB300 rail NICs carry IPv6 addresses that cannot be
+        # bound, which fails UCX worker creation. Keep the cluster's choice.
+        if "UCX_NET_DEVICES" in os.environ:
+            e["UCX_NET_DEVICES"] = os.environ["UCX_NET_DEVICES"]
     return e
 
 
