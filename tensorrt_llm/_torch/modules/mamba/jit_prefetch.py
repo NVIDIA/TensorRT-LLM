@@ -105,6 +105,14 @@ class MambaSSDProvider:
     def __bool__(self):
         return bool(self.shapes)
 
+    # Modules defining the kernels this provider plans; helpers import them
+    # during warmup (JitPrefetcher.register).
+    kernel_modules = tuple(
+        f"tensorrt_llm._torch.modules.mamba.{m}"
+        for m in ("ssd_bmm", "ssd_chunk_state", "ssd_state_passing", "ssd_chunk_scan",
+                  "mamba2_metadata")
+    )  # fmt: skip
+
     @staticmethod
     def _int_class(v: int) -> int:
         # Triton's integer specialization: == 1, divisible by 16, other.

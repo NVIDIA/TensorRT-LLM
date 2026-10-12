@@ -408,6 +408,8 @@ class JitPrefetcher:
         self._tag = 0
         self._lock = threading.Lock()
         self._procs = []
+        self._procs_by_kind: Dict[str, List[Any]] = {}
+        self._stdin_locks: Dict[int, threading.Lock] = {}
         self._busy: Dict[int, threading.Event] = {}
         self._req_q = None
         # kind -> queue; "triton" uses self._req_q
@@ -462,15 +464,6 @@ class JitPrefetcher:
         }
         env.update(TRITON_CACHE_DIR=cache_dir, CUDA_VISIBLE_DEVICES="", PYTHONNOUSERSITE="1")
         env.pop("PYTHONPATH", None)
-        try:
-            from triton.runtime.driver import driver
-
-            t = driver.active.get_current_target()
-            # The helper warms its compiler for this target before it reports
-            # ready (jit_prefetch_helper._warm_compiler).
-            env["TLLM_JIT_PREFETCH_TARGET"] = f"{t.backend}:{t.arch}:{t.warp_size}"
-        except Exception:  # noqa: BLE001 - warming is optional
-            pass
         n = max(1, int(os.environ.get(_WORKERS_ENV, str(_default_workers()))))
         self._procs = []
         self._req_q = queue.PriorityQueue()
@@ -502,6 +495,7 @@ class JitPrefetcher:
             except OSError:
                 pass
             self._procs.append(p)
+            self._procs_by_kind.setdefault(kind, []).append(p)
             self._ready[p.pid] = threading.Event()
             threading.Thread(target=self._feed_loop, args=(p, q), daemon=True).start()
             threading.Thread(target=self._drain_loop, args=(p,), daemon=True).start()
@@ -655,12 +649,20 @@ class JitPrefetcher:
             if key is not None:
                 self._key_started.add(key)
             self._busy.setdefault(proc.pid, threading.Event()).clear()
-            try:
-                proc.stdin.write(json.dumps({"tag": tag, "spec": spec}) + "\n")
-                proc.stdin.flush()
-            except OSError:
+            if not self._write_line(proc, json.dumps({"tag": tag, "spec": spec}) + "\n"):
                 return
             self._busy[proc.pid].wait()
+
+    def _write_line(self, proc, line: str) -> bool:
+        """Write one request line to a helper; the feed thread and
+        ``register`` (preloads) share its stdin."""
+        with self._stdin_locks.setdefault(proc.pid, threading.Lock()):
+            try:
+                proc.stdin.write(line)
+                proc.stdin.flush()
+                return True
+            except (OSError, ValueError):
+                return False
 
     def _drain_loop(self, proc):
         for line in proc.stdout:
@@ -698,11 +700,21 @@ class JitPrefetcher:
             self._event(f"helper {'done' if ok else 'FAIL'} {label} {dt * 1e3:.0f} ms")
 
     def register(self, name: str, provider: Callable[[Any], List[KernelCall]]):
-        """Register a variant provider once per name (warmup may run twice)."""
+        """Register a variant provider once per name (warmup may run twice).
+
+        Each Triton helper is asked to import the provider's kernel modules
+        now (``provider.kernel_modules``), during warmup, so the first
+        variant a batch needs does not wait for those imports.
+        """
         if name in self._provider_names:
             return False
         self._provider_names.add(name)
         self._providers.append(provider)
+        modules = list(getattr(provider, "kernel_modules", ()) or ())
+        if modules and self.prefetch:
+            line = json.dumps({"preload": modules}) + "\n"
+            for proc in self._procs_by_kind.get("triton", []):
+                self._write_line(proc, line)
         return True
 
     # -- planning (executor thread) --------------------------------------

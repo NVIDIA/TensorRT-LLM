@@ -38,6 +38,10 @@ from . import kernels
 
 
 class DsaDecodeMetadataProvider:
+    # The module defining the kernel this provider plans; helpers import it
+    # during warmup (JitPrefetcher.register).
+    kernel_modules = ("tensorrt_llm._torch.attention.backends.sparse.dsa.kernels",)
+
     def __init__(self, max_batch_size: int):
         self.max_batch_size = int(max_batch_size)
         self._done = False

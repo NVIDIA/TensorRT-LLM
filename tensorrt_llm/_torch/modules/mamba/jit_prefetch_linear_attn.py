@@ -129,6 +129,14 @@ class LinearAttnProvider:
     def __bool__(self):
         return bool(self.shapes)
 
+    # Modules defining the kernels this provider plans; helpers import them
+    # during warmup (JitPrefetcher.register).
+    kernel_modules = (
+        "tensorrt_llm._torch.modules.mamba.layernorm_gated",
+        "tensorrt_llm._torch.modules.mamba.fuse_elementwise_ops",
+        "tensorrt_llm._torch.modules.mamba.mamba2_metadata",
+    )
+
     def _sms(self) -> int:
         if self._num_sms is None:
             from .layernorm_gated import _pdl_device_policy

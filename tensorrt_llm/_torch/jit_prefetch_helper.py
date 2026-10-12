@@ -99,36 +99,22 @@ def _resolve(finder: _StubFinder, full_name: str):
     return obj
 
 
-def _warm_compiler(triton, tl, GPUTarget, ASTSource) -> None:
-    """Compile a trivial kernel once, to a scratch cache, before reporting
-    ready. A helper's first ``triton.compile`` costs about 1.4 s more than
-    later ones (backend and LLVM initialization); paid here, it falls inside
-    warmup instead of delaying the first variant a batch needs.
+def _preload(finder: _StubFinder, modules) -> None:
+    """Import kernel modules ahead of their first compile request.
+
+    A module's first kernel otherwise pays the module's import (about 1.3 s
+    for the linear-attention modules, through their own imports such as
+    torch); a ``{"preload": [module, ...]}`` request lets the parent move
+    that cost into warmup, before any batch needs a variant.
     """
-    import tempfile
-
-    @triton.jit
-    def _warm(x_ptr):
-        tl.store(x_ptr, tl.load(x_ptr) + 1)
-
-    target = os.environ.get("TLLM_JIT_PREFETCH_TARGET")
-    if not target:
-        return
-    backend, arch, warp_size = target.split(":")
-    from triton import knobs
-
-    prev = knobs.cache.dir
-    with tempfile.TemporaryDirectory() as tmp:
-        knobs.cache.dir = tmp
+    for name in modules:
         try:
-            triton.compile(
-                ASTSource(_warm, {"x_ptr": "*fp32"}, {}, {}),
-                target=GPUTarget(backend, int(arch), int(warp_size)),
-            )
-        except Exception:  # noqa: BLE001 - warming is best effort
-            pass
-        finally:
-            knobs.cache.dir = prev
+            # Exactly what _resolve does for a kernel of this module, so the
+            # module is imported for real (not as an inert stand-in).
+            finder.allow_dir_of(name)
+            importlib.import_module(name)
+        except Exception:  # noqa: BLE001 - a failed preload only costs time later
+            sys.modules.pop(name, None)
 
 
 def main():
@@ -154,7 +140,6 @@ def main():
     from triton.runtime.cache import triton_key
 
     triton_key()
-    _warm_compiler(triton, tl, GPUTarget, ASTSource)
     out = sys.stdout
     out.write(json.dumps({"ready": True}) + "\n")
     out.flush()
@@ -163,6 +148,9 @@ def main():
         if not line:
             continue
         req = json.loads(line)
+        if "preload" in req:
+            _preload(finder, req["preload"])  # no reply: the parent does not wait
+            continue
         tag = req["tag"]
         t0 = time.time()
         try:

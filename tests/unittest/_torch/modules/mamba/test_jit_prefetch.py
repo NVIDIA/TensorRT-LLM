@@ -245,6 +245,44 @@ def test_executor_compiles_triton_variant_no_helper_started(monkeypatch):
     assert p.stats.wait_n == 1
 
 
+def test_helper_preload_then_compile(tmp_path):
+    """A helper given a preload request imports the module then still
+    compiles that module's kernels (preload sends no reply)."""
+    import json
+    import os
+    import subprocess
+    import sys
+
+    from tensorrt_llm._torch.modules.mamba import jit_prefetch_linear_attn as la
+
+    helper = os.path.join(os.path.dirname(os.path.abspath(jp.__file__)), "jit_prefetch_helper.py")
+    pkg_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(jp.__file__))))
+    s = la._KdaShape.__new__(la._KdaShape)
+    s.heads, s.head_dim, s.dtype = 4, 128, torch.bfloat16
+    p = la.LinearAttnProvider.__new__(la.LinearAttnProvider)
+    p.shapes, p.max_num_tokens, p.device_index = [s], 256, torch.cuda.current_device()
+    p._seen, p._num_sms, p.chunk_size = set(), None, 64
+    calls = p(type("B", (), {"ctx_chunk_lens": [100], "gen_tokens": 0})(), seen=set())
+    specs = []
+    for call in calls:
+        variants, _ = jp._expand(call)
+        jit_fn, _, _ = jp._unwrap_jit(call.fn)
+        found = jp._lookup_or_serialize(jit_fn, call.args, variants[0])
+        if found:
+            specs.append(found[1])
+    assert specs
+    lines = [json.dumps({"preload": list(la.LinearAttnProvider.kernel_modules)})]
+    lines += [json.dumps({"tag": i, "spec": spec}) for i, spec in enumerate(specs)]
+    env = dict(os.environ, CUDA_VISIBLE_DEVICES="", PYTHONNOUSERSITE="1",
+               TRITON_CACHE_DIR=str(tmp_path))  # fmt: skip
+    out = subprocess.run([sys.executable, "-u", helper, pkg_root], input="\n".join(lines) + "\n",
+                         capture_output=True, text=True, env=env, timeout=600).stdout  # fmt: skip
+    replies = [json.loads(line) for line in out.splitlines()]
+    assert replies[0] == {"ready": True}
+    assert [r["tag"] for r in replies[1:]] == list(range(len(specs)))
+    assert all(r["ok"] for r in replies[1:]), replies
+
+
 def test_cute_dsl_build_skips_a_variant_another_helper_built(tmp_path, monkeypatch):
     """Ranks on a node share the CuTe DSL output dir: a variant already
     exported (or exported while waiting for the lock) is not compiled."""
