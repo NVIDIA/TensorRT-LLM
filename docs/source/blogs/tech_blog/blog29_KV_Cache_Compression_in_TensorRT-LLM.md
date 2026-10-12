@@ -257,7 +257,7 @@ The NVFP4 format alone brings a large reduction: a cold page costs 0.5625 bytes 
 </div>
 <p align="center"><sub><em>Figure 10: Measured size of one attention KV page off the GPU, uncompressed and as an NVFP4 cold page. FP8 pages shrink by 43.75%, BF16 pages by 71.9%; the GLM-5.2 MLA page shrinks a little less because its index buffer stays lossless.</em></sub></p>
 
-The serving effect of a smaller cold page is more capacity in the host and disk tiers, and therefore a higher prefix-cache hit rate when the working set does not fit. We show it along the GLM-5.2 Pareto frontier, in a GPU-limited deployment, and by where the reused pages are served from.
+The serving effect of a smaller cold page is more capacity in the host and disk tiers, and therefore a higher prefix-cache hit rate when the working set does not fit. We show it first along the GLM-5.2 Pareto frontier, then through the hit rate.
 
 Put together, compression and the cold-page mechanism move the serving frontier for agentic workloads. Figure 11 takes the ten highest-throughput points of the GLM-5.2 frontier with NVFP4 and shows, for each, the same configuration with an uncompressed host cache. The gain is largest where the uncompressed tier misses most, up to 84% more throughput per GPU and 4x the P90 interactivity, and fades to nothing where it already reads most prefixes; averaged over the ten points it is +21% throughput and +92% interactivity.
 
@@ -277,7 +277,11 @@ Figure 12 details the four configurations with the largest gains, including Qwen
 </div>
 <p align="center"><sub><em>Figure 12: The four serving configurations with the largest NVFP4 gains · AgentX replay. Each panel is one configuration run with the uncompressed host cache and with the NVFP4 host cache, two or three repeats per setting; bars are throughput per GPU and P90 interactivity, with the cache-read hit rate and P90 TTFT below.</em></sub></p>
 
-**A GPU-limited deployment.** A resource-constrained configuration: Qwen3.5-397B-A17B served on ten GB300s (prefill on 2 GPUs, generation on 8 GPUs) at concurrency 192. With the host tier alone the uncompressed setting reads only 57% of prefixes. Figure 13 grows the disk tier from 0 to 1,024 GiB. NVFP4 hits more, completes more, and answers sooner at every disk size. The gain peaks at 512 GiB: 64% more requests completed and 48% sooner.
+#### Hit Rate
+
+Besides the frontier, the hit rate shows directly where cold-page compression pays off, in **two cases**.
+
+**The hit rate rises.** When the host tier cannot hold the working set, a smaller cold page means more prefixes are still there when the next turn arrives. In the configurations of Figure 12 the hit rate rises by **5 to 34 points**. The effect is clearest in a GPU-limited deployment (Figure 13): Qwen3.5-397B-A17B on ten GB300s at concurrency 192 reads only 57% of prefixes uncompressed. As the disk tier grows from 0 to 1,024 GiB, NVFP4 hits more, completes more and answers sooner at every size, peaking at **64% more requests completed and 48% sooner** at 512 GiB.
 
 <div align="center">
 <figure>
@@ -286,7 +290,7 @@ Figure 12 details the four configurations with the largest gains, including Qwen
 </div>
 <p align="center"><sub><em>Figure 13: Qwen3.5-397B-A17B · ten GB300s · concurrency 192 · growing disk tier. NVFP4 completes more requests, hits more, and answers sooner at every disk size.</em></sub></p>
 
-**Where the hits come from.** A hit rate alone does not say which tier served the prefix. TensorRT LLM now counts every full-block hit by the tier it came from. Figure 14 uses these counters on one GB300 node (4 GPUs, TP4/EP4) with a 512 GiB disk tier and the GPU cache capped so that the working set spills out of it. Both settings reach a similar hit rate in each case. What changes is where the hits are served from. For GLM-5.2 at concurrency 48 with 24 GiB of host cache per GPU, the share of hits served from disk falls from 31% to 19%, p90 TTFT drops from 40 s to 23 s, and 1,581 requests complete in the 30-minute window instead of 1,133. For Qwen3.5-397B-A17B at concurrency 128 with 16 GiB of host cache per GPU, no hit is served from disk at all, p90 TTFT drops from 34 s to 21 s, and 4,621 requests complete instead of 3,070. The same host memory holds more pages, so the prefixes that used to come back from disk now come back from host memory.
+**The hit rate is saturated, and the hits move from disk to host.** A hit served from disk costs far more than one served from host memory, and a hit rate alone does not tell them apart. TensorRT LLM now counts every hit by the tier that served it. Figure 14 shows two cases on one GB300 node with the GPU cache capped: the hit rate barely changes, but the share of hits served from disk falls from **31% to 19%** for GLM-5.2 and from **14% to 0%** for Qwen3.5-397B-A17B, tail TTFT roughly halves, and 40% to 50% more requests complete in the same window. The same host memory holds more pages, so prefixes that used to come back from disk now come back from host memory.
 
 <div align="center">
 <figure>
