@@ -154,9 +154,7 @@ An unsupported combination is rejected with a clear message. Otherwise the facto
 
 ### KV Cache Compression in the Executor Iteration Loop
 
-This path serves the stages inside a request: the prefill-chunk stage (stage 1), the after-prefill stage (stage 2), and the decode stage (stage 3). Today the decode stage (stage 3) is the one with a shipped method. While a prefill or decode step runs, attention reads a fixed view of the KV cache. Between two steps that view can change, and that is where the hooks fire. A method overrides only the hooks it needs, and all of them do nothing by default.
-
-The way in is simple. The executor already keeps a list of resource managers and calls every one of them at fixed points of each iteration: before the forward pass, after it, and when a request ends. The compression manager base inherits the same resource manager class and is registered as the last one in that list, so it runs after the KV cache manager has updated its state. Inside those three callbacks it fires the five hooks, as Figure 5 shows. A method inherits the base and overrides only the hooks it needs; **TriAttention** overrides the one after each decode step.
+The executor loop drives the stages inside a request (stages 1 to 3 in Figure 3). Between two forward steps the view attention has of the KV cache may change, and that is where compression runs. The way in is the executor's existing resource-manager list: every manager receives three callbacks per iteration, before the forward pass, after it, and when a request ends. The compression manager registers as the last one, so it runs after the KV cache manager has updated its state, and turns the three callbacks into five hooks (Figure 5, Table 3). A method overrides the hooks it needs; all of them do nothing by default.
 
 <div align="center">
 <figure>
@@ -179,21 +177,17 @@ The way in is simple. The executor already keeps a list of resource managers and
 
 </div>
 
-We currently define these five hooks. **TriAttention** uses the generation-end hook, so the decode stage (stage 3) is the one exercised by a shipped method. The other hooks are already in place for the prefill-chunk and after-prefill stages (stages 1 and 2) and for the request-level events of the tool-call and after-request stages (stages 4 and 5), and a new method can use them without changes to the framework.
-
-The hooks ride on the executor's existing request cycle, and the framework wires them up. Methods on this path change which tokens are kept or how they are arranged in the paged cache. Two obligations come with it. The policy that chooses tokens stays separate from the shared compaction kernel. And a method must finish its GPU work before it shrinks or frees any cache pages.
+Methods on this path change which tokens are kept or how they are laid out in the paged cache. Two rules apply: the policy that picks tokens stays separate from the shared compaction kernel, and a method finishes its GPU work before it shrinks or frees a page. TriAttention uses `on_generation_step_end`; the other hooks are in place for new methods.
 
 ### KV Cache Compression in Cross-Request KV Management
 
-Cross-request reuse means that the KV one request produces is kept and read again by a later request instead of being recomputed: the next turn of a conversation, the next step of an agent, or a request from another user that shares the same prefix. The benefit is direct. Every reused page is a prefill that never runs, so the fewer pages the tiers have to evict, the higher the cache hit rate and the lower the time to first token. Compression can help here. A smaller cold page means more pages fit in the host and disk tiers, so more prefixes are still there when the next request arrives and the hit rate improves. It is one lever among several, next to more host memory, a disk tier, or a different placement of requests, and it stacks with all of them. The framework brings compression to this path.
+Outside a request the KV lives with the cache manager: it waits while a tool runs (stage 4 in Figure 3), and after the request it is kept for reuse, transferred to another worker, or offloaded to host or disk memory (stage 5). Every reused page is a prefill that never runs, and compression lets the tiers hold more of them. V2 owns this whole period. It decides which pages stay on the GPU, move, are reused or transferred, and it does no compression itself. The framework plugs compression into V2 at the points where KV can be compressed:
 
-This path is the cross-request hook of the framework. It serves the stages outside a single request: the tool-call stage (stage 4), when a request pauses and its KV waits for the tool to return, and the after-request stage (stage 5), when a request has finished and its KV is kept for reuse, transferred to another worker, or offloaded to host or disk memory.
+- **Offload and onboard**: when a page leaves the GPU and when it returns. A codec encodes the page on the way out and decodes it on the way back, and V2 never sees the difference. This is the storage-bound mechanism; NVFP4 cold-page compression lives here.
+- **Transfer**: when a page moves to another worker.
+- **Request end**: when a request finishes or pauses for a tool.
 
-This whole period belongs to KVCacheManagerV2, introduced above. V2 decides which pages stay on the GPU, move to host or disk memory, are reused by a later request, or are transferred to another worker, and it does no compression itself. The framework therefore injects its compression management into V2 at the points where KV can be compressed: when pages are offloaded and onboarded, when they are transferred, and when a request ends. At each of these points a method's Python code and kernels can be plugged in, and V2 keeps working as before.
-
-Today we cover the offloading part of the after-request stage (stage 5) with **NVFP4 cold-page compression**, enabled by `quantization_for_cold_page` with `quant: nvfp4`. It is a good example of how the framework interacts with V2. The storage path of V2 exposes two hook points, one when a page leaves the GPU and one when it returns. A codec plugged into these points encodes the page on the way out and decodes it on the way back, and the cache manager never sees the difference. How this works in detail, and how the NVFP4 codec is built, is described in the NVFP4 cold-page compression section below and in the [cold-page codec design guide](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/developer-guide/kv-cache-cold-page-codec.md).
-
-The remaining hook points of this path, the tool-call stage (stage 4) and the other events of the after-request stage (stage 5), are reserved for methods that need them. The same path could also carry KV across contexts that are similar but not identical, so that one cached block serves prompts that differ around it; KVCOMM is a published example, correcting a reused block with offsets estimated from online anchors so it is not prefilled again. Methods of that kind are future work and are not part of the framework today.
+Today the offload path is the one with a shipped method. The other points are reserved for methods that need them, and the same path could later serve contexts that are similar but not identical, so that one cached block serves prompts that differ around it (KVCOMM is a published example). How the NVFP4 codec is built is described in the NVFP4 cold-page compression section below and in the [cold-page codec design guide](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/developer-guide/kv-cache-cold-page-codec.md).
 
 ### Covering the Other Stages
 
