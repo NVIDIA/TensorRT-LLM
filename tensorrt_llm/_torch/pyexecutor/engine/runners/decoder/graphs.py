@@ -8,7 +8,7 @@ import functools
 import os
 from collections.abc import Callable
 from contextlib import contextmanager
-from typing import Any, Protocol
+from typing import Any, NamedTuple, Protocol
 
 import torch
 
@@ -16,6 +16,7 @@ from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
 from tensorrt_llm._torch.autotuner import AutoTuner, autotune
 from tensorrt_llm._torch.compilation.piecewise_optimizer import PiecewiseRunner
 from tensorrt_llm._torch.compilation.utils import capture_piecewise_cuda_graph
+from tensorrt_llm._torch.memory_buffer_utils import with_shared_pool
 from tensorrt_llm._torch.models.modeling_utils import timing_metric
 from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import (
     MoeLoadBalancer,
@@ -26,14 +27,17 @@ from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDAGraphRunner, Ke
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, get_draft_token_length
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
+    BaseResourceManager,
     KVCacheManager,
     ResourceManager,
     ResourceManagerType,
 )
+from tensorrt_llm._torch.pyexecutor.sampler import SampleStateTensors
 from tensorrt_llm._torch.pyexecutor.sampler.sampler_common import SampleType
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._torch.pyexecutor.scheduler.scheduler import RemoteTailPhase
 from tensorrt_llm._torch.speculative import (
+    SpecMetadata,
     prepare_attn_metadata_for_draft_replay,
     restore_attn_metadata_after_draft_replay,
 )
@@ -147,6 +151,15 @@ def compute_dynamic_draft_len_mapping(config: DecoderRunnerConfig) -> dict[int, 
     return mapping
 
 
+class GraphSelection(NamedTuple):
+    """The graph a batch runs as, and the metadata that graph was captured with."""
+
+    key: KeyType | None
+    attn_metadata: AttentionMetadata | None
+    spec_metadata: SpecMetadata | None
+    use_lora_graph: bool
+
+
 class ForwardWarmup(Protocol):
     """Run one dummy scheduled pass through the runner's forward."""
 
@@ -210,6 +223,109 @@ class DecoderCudaGraphs:
     @property
     def force_lora_graph_for_capture(self) -> bool | None:
         return self._force_lora_graph_for_capture
+
+    @property
+    def enabled(self) -> bool:
+        """Return whether generation batches may run as CUDA graphs."""
+        return self.cuda_graph_runner is not None and self.cuda_graph_runner.enabled
+
+    def register_sample_type_resolver(self, resolver: Callable | None) -> None:
+        """Register how a batch maps to its sampling tier, for the graph key."""
+        self.cuda_graph_runner.register_sample_type_resolver(resolver)
+
+    def pad_batch(
+        self,
+        scheduled_requests: ScheduledRequests,
+        resource_manager: ResourceManager,
+        runtime_draft_len: int,
+    ) -> contextlib.AbstractContextManager[ScheduledRequests]:
+        """Pad ``scheduled_requests`` with dummy rows up to a captured batch size."""
+        return self.cuda_graph_runner.pad_batch(
+            scheduled_requests, resource_manager, runtime_draft_len
+        )
+
+    def select(
+        self,
+        padded_requests: ScheduledRequests,
+        resource_manager: ResourceManager,
+        *,
+        enable_spec_decode: bool,
+        attn_metadata: AttentionMetadata,
+        spec_metadata: SpecMetadata | None,
+        draft_tokens_cuda: torch.Tensor | None,
+        new_tensors_device: SampleStateTensors | None,
+        spec_resource_manager: BaseResourceManager | None,
+        promoted_context_request_ids: frozenset[int],
+    ) -> GraphSelection:
+        """Pick the graph for ``padded_requests``; the key is None to run eagerly."""
+        peft_cache_data_type = None
+        if self._lora.cuda_graph_manager is not None:
+            peft_cache_manager = resource_manager.get_resource_manager(
+                ResourceManagerType.PEFT_CACHE_MANAGER
+            )
+            peft_cache_data_type = peft_cache_manager.data_type
+
+        use_lora_graph = self.use_lora_cuda_graph(padded_requests)
+        graph_attn_metadata, graph_spec_metadata, key = self.cuda_graph_runner.maybe_get_cuda_graph(
+            padded_requests,
+            enable_spec_decode=enable_spec_decode,
+            attn_metadata=attn_metadata,
+            spec_metadata=spec_metadata,
+            draft_tokens_cuda=draft_tokens_cuda,
+            new_tensors_device=new_tensors_device,
+            spec_resource_manager=spec_resource_manager,
+            promoted_context_request_ids=promoted_context_request_ids,
+            peft_cache_data_type=peft_cache_data_type,
+            use_lora_graph=use_lora_graph,
+        )
+        return GraphSelection(key, graph_attn_metadata, graph_spec_metadata, use_lora_graph)
+
+    def attention_dp_execution_batch(
+        self, scheduled_requests: ScheduledRequests
+    ) -> ScheduledRequests:
+        """Give a phase-idle rank its retained graph row without admitting work."""
+        if not scheduled_requests.is_attention_dp_phase_idle:
+            return scheduled_requests
+        if scheduled_requests.batch_size or scheduled_requests.encoder_requests:
+            raise ValueError("An attention-DP phase-idle batch must be semantically empty")
+        dummy = self.cuda_graph_runner.padding_dummy_requests.get(0)
+        if dummy is None:
+            raise RuntimeError("The retained attention-DP execution row is missing")
+        execution_requests = ScheduledRequests()
+        execution_requests.attention_dp_phase = scheduled_requests.attention_dp_phase
+        execution_requests.is_attention_dp_phase_idle = True
+        execution_requests.generation_requests = [dummy]
+        return execution_requests
+
+    def captures_model_body(self, key: KeyType | None) -> bool:
+        """Return whether an eager pass records the model body into a breakable graph."""
+        breakable_runner = self.breakable_cuda_graph_runner
+        return key is None and breakable_runner is not None and breakable_runner.is_capturing
+
+    def reset_padding_dummies(self) -> None:
+        """Drop padding dummies that belong to an earlier KV cache manager."""
+        self.cuda_graph_runner.padding_dummy_requests = {}
+
+    def preallocate_padding_dummies(self, resource_manager: ResourceManager) -> None:
+        """Allocate the padding dummies while the KV cache is still empty."""
+        self.cuda_graph_runner.preallocate_padding_dummies(resource_manager)
+
+    def warmup_and_capture(self, resource_manager: ResourceManager) -> None:
+        """Warm up every graph shape, then capture them all.
+
+        Attention kernels can switch implementations at smaller batch sizes and
+        require a larger workspace, so the first pass grows the workspace to
+        its maximum size. The second pass runs the final per-shape warmup and
+        captures without resizing the workspace.
+        """
+        with self.cuda_graph_runner.allow_capture():
+            self.cuda_graph_runner.is_warmup_only = True
+            try:
+                self.run_cuda_graph_warmup(resource_manager)
+            finally:
+                self.cuda_graph_runner.is_warmup_only = False
+            self.reset_padding_dummies()
+            self.run_cuda_graph_warmup(resource_manager)
 
     def _prepare_capture_batch(
         self,
@@ -365,9 +481,41 @@ class DecoderCudaGraphs:
     ) -> Any:
         """Run the model by replaying the graph for ``key``, capturing it first if needed.
 
-        Without a key, run through a breakable prefill graph when one covers
-        the tokens, otherwise eagerly.
+        Without a key, record the model body while a breakable prefill graph
+        captures, run through one when it covers the tokens, otherwise eagerly.
         """
+        with with_shared_pool(self.cuda_graph_runner.get_graph_pool()):
+            if self.captures_model_body(key):
+                return self.breakable_cuda_graph_runner.capture_model_body(
+                    lambda: run_model(inputs)
+                )
+            return self._run(
+                key,
+                inputs,
+                run_model,
+                postprocess_inputs,
+                attn_metadata=attn_metadata,
+                draft_kv_cache_manager=draft_kv_cache_manager,
+                moe_load_balancer=moe_load_balancer,
+                enable_spec_decode=enable_spec_decode,
+                gather_context_logits=gather_context_logits,
+                position_id_offsets=position_id_offsets,
+            )
+
+    def _run(
+        self,
+        key: KeyType | None,
+        inputs: dict[str, Any],
+        run_model: Callable[[dict[str, Any]], Any],
+        postprocess_inputs: Callable[[dict[str, Any]], None],
+        *,
+        attn_metadata: AttentionMetadata,
+        draft_kv_cache_manager: KVCacheManager | KVCacheManagerV2 | None,
+        moe_load_balancer: MoeLoadBalancer | None,
+        enable_spec_decode: bool,
+        gather_context_logits: bool,
+        position_id_offsets: torch.Tensor | None,
+    ) -> Any:
         breakable_runner = self.breakable_cuda_graph_runner
         if key is None:
             num_tokens = inputs["input_ids"].shape[0]
@@ -831,10 +979,7 @@ class DecoderCudaGraphs:
                     torch.cuda.synchronize()
 
     def release(self) -> None:
-        if hasattr(self, "cuda_graph_runner") and self.cuda_graph_runner is not None:
+        if self.cuda_graph_runner is not None:
             self.cuda_graph_runner.clear()
-        if (
-            hasattr(self, "breakable_cuda_graph_runner")
-            and self.breakable_cuda_graph_runner is not None
-        ):
+        if self.breakable_cuda_graph_runner is not None:
             self.breakable_cuda_graph_runner.clear()

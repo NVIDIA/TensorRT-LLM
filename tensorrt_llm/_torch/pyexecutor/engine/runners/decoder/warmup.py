@@ -33,8 +33,6 @@ from .metadata import resolve_mamba_metadata_cls
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.compilation.backend import Backend
-    from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph_runner import BreakableCUDAGraphRunner
-    from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDAGraphRunner
     from tensorrt_llm._torch.pyexecutor.guided_decoder import CapturableGuidedDecoder
     from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
     from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
@@ -103,14 +101,6 @@ class DecoderWarmup:
     @property
     def guided_decoder(self) -> CapturableGuidedDecoder | None:
         return self._inputs.guided_decoder
-
-    @property
-    def cuda_graph_runner(self) -> CUDAGraphRunner | None:
-        return self._graphs.cuda_graph_runner
-
-    @property
-    def breakable_cuda_graph_runner(self) -> BreakableCUDAGraphRunner | None:
-        return self._graphs.breakable_cuda_graph_runner
 
     def run(self, resource_manager: ResourceManager) -> None:
         kv_cache_manager = resource_manager.get_resource_manager(self.kv_cache_manager_key)
@@ -190,7 +180,7 @@ class DecoderWarmup:
 
         # The lifetime of model engine and kv cache manager can be different.
         # Reset the global cuda graph dummy requests in warmup.
-        self.cuda_graph_runner.padding_dummy_requests = {}
+        self._graphs.reset_padding_dummies()
 
         if self.mapping.cp_size > 1:
             cp_type = self.mapping.cp_config.get("cp_type", None)
@@ -273,25 +263,13 @@ class DecoderWarmup:
             # NVSHMEM).
             gc.collect()
             torch.cuda.empty_cache()
-        # Warm up every graph shape before capturing any graph. Attention
-        # kernels can switch implementations at smaller batch sizes and require
-        # a larger workspace, so the first pass grows the workspace to its
-        # maximum size. The second pass runs the final per-shape warmup and
-        # captures without resizing the workspace.
         # Capture with the steady-state MoE all-to-all budget: the timeout is a
         # launch argument and is baked into every later replay.
         with (
             self._warmup_timer.phase("cuda_graph_capture"),
             moe_a2a_steady_state_budget_for_capture(),
         ):
-            with self.cuda_graph_runner.allow_capture():
-                self.cuda_graph_runner.is_warmup_only = True
-                try:
-                    self._graphs.run_cuda_graph_warmup(resource_manager)
-                finally:
-                    self.cuda_graph_runner.is_warmup_only = False
-                self.cuda_graph_runner.padding_dummy_requests = {}
-                self._graphs.run_cuda_graph_warmup(resource_manager)
+            self._graphs.warmup_and_capture(resource_manager)
         log_mem_snapshot("warmup/after_cuda_graph_capture")
         # Pre-compile DeepGEMM paged_mqa_logits_metadata for every 32-aligned
         # batch bucket the runtime can produce (max_batch_size scaled by the
@@ -330,7 +308,7 @@ class DecoderWarmup:
         # fails every step and padded batches silently run eager.
         if getattr(kv_cache_manager, "context_swa_layer_limit", None) is None:
             with self._warmup_timer.phase("preallocate_padding_dummies"):
-                self.cuda_graph_runner.preallocate_padding_dummies(resource_manager)
+                self._graphs.preallocate_padding_dummies(resource_manager)
         log_mem_snapshot("warmup/after_preallocate_padding_dummies")
 
         # If this is a BOLT-instrumented build (the profile-gen job sets
@@ -354,7 +332,7 @@ class DecoderWarmup:
             or self.mapping.cp_size != 1
             or self.sparse_attention_config is not None
             or self._torch_compile_backend is not None
-            or self.breakable_cuda_graph_runner is not None
+            or self._graphs.breakable_cuda_graph_runner is not None
         ):
             logger.info(
                 "Eager workspace reclamation is disabled for speculative, "
@@ -794,7 +772,7 @@ class DecoderWarmup:
             for method in mxfp8_methods:
                 method.disable_flashinfer_auto()
         use_mxfp8_flashinfer_graph_default = (
-            self.cuda_graph_runner.enabled
+            self._graphs.enabled
             and not compile_all_batches
             and "TRTLLM_MXFP8_GEMM_BACKEND" not in os.environ
             and any(

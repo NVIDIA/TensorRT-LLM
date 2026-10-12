@@ -14,7 +14,6 @@ from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.compilation.backend import Backend
 from tensorrt_llm._torch.distributed import Distributed
-from tensorrt_llm._torch.memory_buffer_utils import with_shared_pool
 from tensorrt_llm._torch.models.modeling_utils import DecoderModelForCausalLM
 from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import (
     MoeLoadBalancer,
@@ -266,13 +265,13 @@ class DecoderRunner(ScheduledModelRunner):
         self, resolver: Callable | None, stage: Callable | None = None
     ) -> None:
         """Register how a batch maps to its sampling tier, for the graph key."""
-        self.cuda_graph_runner.register_sample_type_resolver(resolver)
+        self._graphs.register_sample_type_resolver(resolver)
         self._stage_in_graph_sampling = stage
 
     def init_cuda_graph_lora_manager(self, lora_config: LoraConfig) -> None:
         """Build LoRA preparation state for the current executor resources."""
         cuda_graph_manager = None
-        if self.cuda_graph_runner is not None and self.cuda_graph_runner.enabled:
+        if self._graphs.enabled:
             # For spec decode, each generation request contributes
             # max_draft_len + 1 tokens per forward pass.
             max_tokens_per_seq = (
@@ -400,7 +399,7 @@ class DecoderRunner(ScheduledModelRunner):
         kv_cache_manager = resource_manager.get_resource_manager(self.kv_cache_manager_key)
         assert kv_cache_manager is not None, "the legacy runner requires a KV cache manager"
         semantic_requests = scheduled_requests
-        scheduled_requests = self._get_attention_dp_execution_batch(scheduled_requests)
+        scheduled_requests = self._graphs.attention_dp_execution_batch(scheduled_requests)
         draft_kv_cache_manager = get_draft_kv_cache_manager(
             self._config.spec_config, resource_manager
         )
@@ -438,7 +437,7 @@ class DecoderRunner(ScheduledModelRunner):
             ced_enabled=ced_enabled,
         )
 
-        with self.cuda_graph_runner.pad_batch(
+        with self._graphs.pad_batch(
             graph_requests, resource_manager, runtime_draft_len
         ) as padded_graph_requests:
             # Callee already no-ops when use_mrope=False, but the Python call /
@@ -458,37 +457,28 @@ class DecoderRunner(ScheduledModelRunner):
                 spec_metadata.update_is_all_greedy_sample(padded_graph_requests.all_requests())
                 sync_group_all_greedy_sample(spec_metadata, self.mapping, self.dist)
 
-            peft_cache_data_type = None
-            if self._lora.cuda_graph_manager is not None:
-                peft_cache_manager = resource_manager.get_resource_manager(
-                    ResourceManagerType.PEFT_CACHE_MANAGER
-                )
-                peft_cache_data_type = peft_cache_manager.data_type
-
-            use_lora_graph = self._graphs.use_lora_cuda_graph(padded_graph_requests)
-            maybe_attn_metadata, maybe_spec_metadata, key = (
-                self.cuda_graph_runner.maybe_get_cuda_graph(
-                    padded_graph_requests,
-                    enable_spec_decode=enable_spec_decode,
-                    attn_metadata=attn_metadata,
-                    spec_metadata=spec_metadata,
-                    draft_tokens_cuda=self._buffers.draft_tokens_cuda
-                    if self._config.is_spec_decode
-                    else None,
-                    new_tensors_device=new_tensors_device,
-                    spec_resource_manager=spec_resource_manager,
-                    promoted_context_request_ids=promoted_context_request_ids,
-                    peft_cache_data_type=peft_cache_data_type,
-                    use_lora_graph=use_lora_graph,
-                )
+            selection = self._graphs.select(
+                padded_graph_requests,
+                resource_manager,
+                enable_spec_decode=enable_spec_decode,
+                attn_metadata=attn_metadata,
+                spec_metadata=spec_metadata,
+                draft_tokens_cuda=self._buffers.draft_tokens_cuda
+                if self._config.is_spec_decode
+                else None,
+                new_tensors_device=new_tensors_device,
+                spec_resource_manager=spec_resource_manager,
+                promoted_context_request_ids=promoted_context_request_ids,
             )
+            key = selection.key
+            use_lora_graph = selection.use_lora_graph
 
             can_run_graph = key is not None and not (
                 ced_enabled and scheduled_requests.num_context_requests > 0
             )
             if can_run_graph:
-                attn_metadata = maybe_attn_metadata
-                spec_metadata = maybe_spec_metadata
+                attn_metadata = selection.attn_metadata
+                spec_metadata = selection.spec_metadata
                 execution_requests = padded_graph_requests
                 execution_promoted_context_ids = promoted_context_request_ids
             else:
@@ -575,33 +565,28 @@ class DecoderRunner(ScheduledModelRunner):
                     runtime_draft_len=runtime_draft_len,
                 )
 
-            breakable_runner = self.breakable_cuda_graph_runner
-
-            with with_shared_pool(self.cuda_graph_runner.get_graph_pool()):
-                if (
-                    not can_run_graph
-                    and breakable_runner is not None
-                    and breakable_runner.is_capturing
-                ):
-                    return breakable_runner.capture_model_body(lambda: run_model(inputs))
-                outputs = self._graphs.run(
-                    key if can_run_graph else None,
-                    inputs,
-                    run_model,
-                    postprocess_inputs,
-                    attn_metadata=attn_metadata,
-                    draft_kv_cache_manager=draft_kv_cache_manager,
-                    moe_load_balancer=moe_load_balancer,
-                    enable_spec_decode=enable_spec_decode,
-                    gather_context_logits=gather_context_logits,
-                    position_id_offsets=(
-                        self._buffers.previous_pos_id_offsets_cuda
-                        if enable_spec_decode
-                        and not self._config.disable_overlap_scheduler
-                        and attn_metadata.kv_cache_manager is not None
-                        else None
-                    ),
-                )
+            graph_key = key if can_run_graph else None
+            captures_model_body = self._graphs.captures_model_body(graph_key)
+            outputs = self._graphs.run(
+                graph_key,
+                inputs,
+                run_model,
+                postprocess_inputs,
+                attn_metadata=attn_metadata,
+                draft_kv_cache_manager=draft_kv_cache_manager,
+                moe_load_balancer=moe_load_balancer,
+                enable_spec_decode=enable_spec_decode,
+                gather_context_logits=gather_context_logits,
+                position_id_offsets=(
+                    self._buffers.previous_pos_id_offsets_cuda
+                    if enable_spec_decode
+                    and not self._config.disable_overlap_scheduler
+                    and attn_metadata.kv_cache_manager is not None
+                    else None
+                ),
+            )
+            if captures_model_body:
+                return outputs
 
             if self.forward_pass_callable is not None:
                 self.forward_pass_callable()
@@ -804,23 +789,6 @@ class DecoderRunner(ScheduledModelRunner):
         ):
             return defer()
         return contextlib.nullcontext()
-
-    def _get_attention_dp_execution_batch(
-        self, scheduled_requests: ScheduledRequests
-    ) -> ScheduledRequests:
-        """Give a phase-idle rank its retained graph row without admitting work."""
-        if not scheduled_requests.is_attention_dp_phase_idle:
-            return scheduled_requests
-        if scheduled_requests.batch_size or scheduled_requests.encoder_requests:
-            raise ValueError("An attention-DP phase-idle batch must be semantically empty")
-        dummy = self.cuda_graph_runner.padding_dummy_requests.get(0)
-        if dummy is None:
-            raise RuntimeError("The retained attention-DP execution row is missing")
-        execution_requests = ScheduledRequests()
-        execution_requests.attention_dp_phase = scheduled_requests.attention_dp_phase
-        execution_requests.is_attention_dp_phase_idle = True
-        execution_requests.generation_requests = [dummy]
-        return execution_requests
 
     @staticmethod
     def _restore_attention_dp_semantic_outputs(

@@ -370,7 +370,6 @@ def test_compiled_mxfp8_warmup_backend_selection(
         _torch_compile_backend=None,
         _warmup=SimpleNamespace(eager_workspace_reclaimer=None),
         is_warmup=True,
-        cuda_graph_runner=SimpleNamespace(enabled=True),
         model=SimpleNamespace(
             modules=lambda: [
                 SimpleNamespace(_use_flashinfer_mxfp8_decode_graph_default=True),
@@ -384,7 +383,7 @@ def test_compiled_mxfp8_warmup_backend_selection(
         kv_cache_manager_key="kv_cache",
         is_draft_model=False,
         guided_decoder=None,
-        _graphs=SimpleNamespace(no_cuda_graph=lambda: contextlib.nullcontext()),
+        _graphs=SimpleNamespace(no_cuda_graph=lambda: contextlib.nullcontext(), enabled=True),
         _dummy_requests=SimpleNamespace(
             create_warmup_request=lambda resources, num_tokens, num_gen_requests: Mock(
                 num_gen_requests=num_gen_requests
@@ -1197,7 +1196,7 @@ class TestWarmupCleanup(unittest.TestCase):
             engine = SimpleNamespace(
                 _warmup_timer=_WarmupTimer(rank=0),
                 _config=SimpleNamespace(enable_autotuner=False, torch_compile_enabled=False),
-                cuda_graph_runner=SimpleNamespace(enabled=True),
+                _graphs=SimpleNamespace(enabled=True),
                 model=SimpleNamespace(
                     modules=lambda: [
                         SimpleNamespace(_use_flashinfer_mxfp8_decode_graph_default=True),
@@ -1271,7 +1270,6 @@ class TestWarmupCleanup(unittest.TestCase):
                     max_draft_len=0,
                     spec_config=None,
                 ),
-                cuda_graph_runner=SimpleNamespace(enabled=True),
                 model=SimpleNamespace(
                     modules=lambda: [
                         SimpleNamespace(_use_flashinfer_mxfp8_decode_graph_default=True),
@@ -1282,7 +1280,9 @@ class TestWarmupCleanup(unittest.TestCase):
                 mapping=SimpleNamespace(tp_size=1, has_pp=lambda: False),
                 dist=object(),
                 guided_decoder=None,
-                _graphs=SimpleNamespace(no_cuda_graph=lambda: contextlib.nullcontext()),
+                _graphs=SimpleNamespace(
+                    no_cuda_graph=lambda: contextlib.nullcontext(), enabled=True
+                ),
                 _dummy_requests=SimpleNamespace(
                     create_warmup_request=Mock(return_value=object()),
                     release_batch_context=Mock(
@@ -1395,7 +1395,6 @@ class TestWarmupCleanup(unittest.TestCase):
                     max_draft_len=0,
                     spec_config=None,
                 ),
-                cuda_graph_runner=SimpleNamespace(enabled=True),
                 model=SimpleNamespace(
                     modules=lambda: [
                         SimpleNamespace(_use_flashinfer_mxfp8_decode_graph_default=True),
@@ -1406,7 +1405,9 @@ class TestWarmupCleanup(unittest.TestCase):
                 mapping=SimpleNamespace(tp_size=1, has_pp=lambda: False),
                 dist=object(),
                 guided_decoder=None,
-                _graphs=SimpleNamespace(no_cuda_graph=lambda: contextlib.nullcontext()),
+                _graphs=SimpleNamespace(
+                    no_cuda_graph=lambda: contextlib.nullcontext(), enabled=True
+                ),
                 _dummy_requests=SimpleNamespace(
                     create_warmup_request=Mock(return_value=object()),
                     release_batch_context=Mock(
@@ -1504,7 +1505,6 @@ class TestWarmupCleanup(unittest.TestCase):
                     max_draft_len=0,
                     spec_config=None,
                 ),
-                cuda_graph_runner=SimpleNamespace(enabled=True),
                 model=SimpleNamespace(
                     modules=lambda: [
                         SimpleNamespace(_use_flashinfer_mxfp8_decode_graph_default=True),
@@ -1515,7 +1515,9 @@ class TestWarmupCleanup(unittest.TestCase):
                 mapping=SimpleNamespace(tp_size=2, has_pp=lambda: True),
                 dist=dist,
                 guided_decoder=None,
-                _graphs=SimpleNamespace(no_cuda_graph=lambda: contextlib.nullcontext()),
+                _graphs=SimpleNamespace(
+                    no_cuda_graph=lambda: contextlib.nullcontext(), enabled=True
+                ),
                 _dummy_requests=SimpleNamespace(
                     create_warmup_request=Mock(return_value=object()),
                     release_batch_context=Mock(return_value=contextlib.nullcontext(object())),
@@ -1571,7 +1573,7 @@ class TestWarmupCleanup(unittest.TestCase):
             engine = SimpleNamespace(
                 _warmup_timer=_WarmupTimer(rank=0),
                 _config=SimpleNamespace(enable_autotuner=False, torch_compile_enabled=False),
-                cuda_graph_runner=SimpleNamespace(enabled=False),
+                _graphs=SimpleNamespace(enabled=False),
                 model=SimpleNamespace(modules=lambda: [SimpleNamespace(quant_method=method)]),
             )
 

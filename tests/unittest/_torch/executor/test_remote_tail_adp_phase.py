@@ -18,6 +18,7 @@ from _torch.executor.kv_cache.test_kv_cache_v2_scheduler import (
 )
 
 from tensorrt_llm._torch.pyexecutor import py_executor as executor_module
+from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.graphs import DecoderCudaGraphs
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.inputs import DecoderInputPreparer
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner import DecoderRunner
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState, SamplingConfig
@@ -432,13 +433,13 @@ def test_idle_execution_reuses_retained_row_without_changing_semantic_batch(
 ) -> None:
     dummy = object()
     runner = SimpleNamespace(padding_dummy_requests={0: dummy})
-    engine = SimpleNamespace(cuda_graph_runner=runner)
+    graphs = SimpleNamespace(cuda_graph_runner=runner)
     semantic_batch = ScheduledRequests()
     semantic_batch.attention_dp_phase = phase
     semantic_batch.is_attention_dp_phase_idle = True
 
     for _ in range(2):
-        execution_batch = DecoderRunner._get_attention_dp_execution_batch(engine, semantic_batch)
+        execution_batch = DecoderCudaGraphs.attention_dp_execution_batch(graphs, semantic_batch)
         assert execution_batch is not semantic_batch
         assert execution_batch.generation_requests == [dummy]
         assert execution_batch.attention_dp_phase is phase
@@ -450,15 +451,15 @@ def test_idle_execution_reuses_retained_row_without_changing_semantic_batch(
 
 
 def test_idle_execution_refuses_missing_row_or_nonempty_semantic_batch() -> None:
-    engine = SimpleNamespace(cuda_graph_runner=SimpleNamespace(padding_dummy_requests={}))
+    graphs = SimpleNamespace(cuda_graph_runner=SimpleNamespace(padding_dummy_requests={}))
     batch = ScheduledRequests()
     batch.is_attention_dp_phase_idle = True
     with pytest.raises(RuntimeError, match="execution row is missing"):
-        DecoderRunner._get_attention_dp_execution_batch(engine, batch)
+        DecoderCudaGraphs.attention_dp_execution_batch(graphs, batch)
     for bucket in (batch.generation_requests, batch.encoder_requests):
         bucket.append(object())
         with pytest.raises(ValueError, match="semantically empty"):
-            DecoderRunner._get_attention_dp_execution_batch(engine, batch)
+            DecoderCudaGraphs.attention_dp_execution_batch(graphs, batch)
         bucket.clear()
 
 
@@ -477,7 +478,7 @@ def test_semantic_outputs_hide_execution_row_and_preserve_retained_graph_outputs
     assert restored["hidden_states"] is outputs["hidden_states"]
     assert (restored is outputs) is not idle
     if not idle:
-        assert DecoderRunner._get_attention_dp_execution_batch(object(), batch) is batch
+        assert DecoderCudaGraphs.attention_dp_execution_batch(object(), batch) is batch
 
 
 def test_context_phase_disables_graph_for_real_work_and_idle_rows() -> None:
