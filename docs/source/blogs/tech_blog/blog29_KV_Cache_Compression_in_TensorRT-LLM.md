@@ -140,7 +140,7 @@ The executor loop hosts the stages inside a request (stages 1 to 3 in Figure 3);
 TensorRT LLM has many modules a compression method may need to engage or change: the executor loop, the KV cache manager and its storage tiers, block reuse, speculative decoding. Which ones, and how, depends on the method. The configuration is where this is decided. One block, `kv_cache_compression_config`, holds:
 
 - **`algorithm`**: which method to run. One method can be active per LLM instance.
-- **Method options**: for cold-page compression the cold format (`quant: nvfp4`); for TriAttention the token `budget`, the eviction period, the `eviction_mode` and the calibration file.
+- **Method options**: the detailed parameters of the chosen method, e.g. for TriAttention the token `budget`, the eviction period, the `eviction_mode` and the calibration file.
 
 The same block works in the Python API, in `trtllm-serve` YAML and in `trtllm-bench`; the full option table is in the [KV Cache Compression feature documentation](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/features/kv-cache-compression.md).
 
