@@ -1018,8 +1018,8 @@ def test_generate_maps_target_dp_rank_to_strict_scheduling(
     assert scheduling_params.attention_dp_relax is False
 
 
-def test_generate_lets_conversation_affinity_own_dp_rank() -> None:
-    """A Dynamo rank hint must not override TensorRT-LLM's conversation binding."""
+def test_generate_uses_rank_hint_for_first_conversation_turn() -> None:
+    """A Dynamo KV route seeds the conversation binding on its first turn."""
     llm = _FakeLlm([])
     llm.args.enable_attention_dp = True
     llm.args.tensor_parallel_size = 4
@@ -1039,7 +1039,8 @@ def test_generate_lets_conversation_affinity_own_dp_rank() -> None:
 
     asyncio.run(collect_responses())
 
-    assert llm.generate_kwargs["scheduling_params"] is None
+    assert llm.generate_kwargs["scheduling_params"].attention_dp_rank == 2
+    assert llm.generate_kwargs["scheduling_params"].attention_dp_relax is False
     assert llm.generate_kwargs["conversation_params"].conversation_id == "session-a"
 
 

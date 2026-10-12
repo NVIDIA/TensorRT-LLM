@@ -193,16 +193,13 @@ class OpenEngineInferenceServicer(openengine_pb2_grpc.InferenceServicer):
                 raise UnsupportedFeatureError(
                     "Subagent affinity requires conversation-aware attention DP"
                 )
-            # Match Dynamo's in-process default: the conversation router owns
-            # rank placement when affinity is enabled, even if Dynamo sent a hint.
             if conversation_affinity_enabled(self._llm):
                 if target_dp_rank is not None and (
                     conversation_params is None or not conversation_params.conversation_id.strip()
                 ):
                     raise ValueError(
-                        "A stable conversation ID is required when conversation affinity replaces a DP-rank hint"
+                        "A stable conversation ID is required with conversation affinity and a DP-rank hint"
                     )
-                target_dp_rank = None
             if target_dp_rank is not None:
                 if sampling_params.n > 1:
                     raise ValueError(

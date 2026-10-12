@@ -1453,6 +1453,20 @@ class TestConversationAwareADPRouter:
         for i in range(4):
             assert pos2[100 + i] == home[convs[i]]
 
+    def test_parent_and_child_turns_share_rank(self):
+        router = self._router(tp_size=4)
+        states = self._states(4)
+        parent = _make_conv_request_item(1, "parent", target_dp_rank=2)
+        assert self._route(router, states, [parent])[1] == 2
+
+        turns = [
+            _make_conv_request_item(2, "child-a", subagent_affinity_id="parent"),
+            _make_conv_request_item(3, "child-b", subagent_affinity_id="parent"),
+            _make_conv_request_item(4, "child-a", subagent_affinity_id="parent"),
+        ]
+        for turn in turns:
+            assert self._route(router, states, [turn])[turn.id] == 2
+
     def test_no_conversation_id_falls_back_and_is_not_recorded(self):
         router = self._router(tp_size=4)
         items = [_make_conv_request_item(i, None) for i in range(8)]

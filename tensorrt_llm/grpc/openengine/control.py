@@ -252,10 +252,9 @@ class OpenEngineControlServicer(openengine_pb2_grpc.ControlServicer):
             info.extra.update({"trtllm_node": node})
         info.capacity.CopyFrom(capacity)
 
-        # Advertise strict targeting only when the conversation router does not own rank placement.
-        info.extra.update(
-            {"trtllm_supports_dp_rank_targeting": not conversation_affinity_enabled(self._llm)}
-        )
+        # A rank hint places the first turn; conversation affinity preserves
+        # that binding on later turns, even if their hints differ.
+        info.extra.update({"trtllm_supports_dp_rank_targeting": True})
         info.extra.update(
             {
                 "trtllm_supports_subagent_affinity": bool(
