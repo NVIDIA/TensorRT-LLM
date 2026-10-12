@@ -645,7 +645,7 @@ def spool_runner(
     """Return a :data:`ShellRunner` that executes through a compute session.
 
     The session is a long-lived allocation whose own main process watches
-    ``<spool>/pending`` (see ``scripts/session_watcher.sh``). Work is a
+    ``<spool>/pending`` (see ``spool_watcher.sh``). Work is a
     file, which is the property that matters: **anything able to write a
     file can run GPU work**, including a plain Python process on a host
     with no GPU and no reachable scheduler.

@@ -34,6 +34,10 @@ from typing import Any, Mapping, Sequence
 
 import yaml
 
+from agent_flow.agent_runtime import AGENTS_FIELD, validate_agents
+
+from .roles import ROLES, validate_role_defaults
+
 REQUIRED_PATH_FIELDS: tuple[str, ...] = (
     "checkpoint_path",
     "trtllm_repo_path",
@@ -330,6 +334,8 @@ TOP_LEVEL_KEYS: tuple[str, ...] = (
     REMEDIATION_FIELD,
     SERVING_ENVELOPE_FIELD,
     FEATURE_MATRIX_FIELD,
+    # Per-role backend, model and reasoning effort; see `roles.py`.
+    AGENTS_FIELD,
 )
 
 REMEDIATION_KEYS: tuple[str, ...] = (
@@ -1129,8 +1135,7 @@ def _validate_kv_quant_witness(entry: dict[str, Any], errors: list[str], where: 
     if not _positive_int(expected):
         errors.append(
             f"'{where}.expected_bytes_per_token' is required and must be an integer >= 1, "
-            f"computed from the checkpoint's storage formats before the run (890 for "
-            f"DeepSeek-V4.1 NVFP4); got {expected!r}"
+            f"computed from the checkpoint's storage formats before the run; got {expected!r}"
         )
     exact = entry.setdefault("exact", True)
     if not isinstance(exact, bool):
@@ -1567,6 +1572,8 @@ def load_and_validate_task_yaml(path: str | Path) -> dict[str, Any]:
     # said it was done", which is a much longer trip back to the cause.
     _validate_remediation(data.get(REMEDIATION_FIELD), errors)
     reject_unknown_keys(data, TOP_LEVEL_KEYS, errors)
+    errors.extend(validate_agents(data, ROLES))
+    errors.extend(validate_role_defaults(data))
 
     for name in REQUIRED_PATH_FIELDS:
         if name not in data:
@@ -1627,8 +1634,9 @@ def load_and_validate_task_yaml(path: str | Path) -> dict[str, Any]:
             errors.append(
                 f"'{FEATURES_FIELD}' lists {readers}, and all of them read the checkpoint's "
                 f"`mtp.*` weights, which are MTP modules or DSpark stages, never both. "
-                f"Keep the one the checkpoint ships. A DeepSeek-V4.1 `mtp.*` is DSpark, "
-                f"so its 'MTP' request is spelled `dspark`."
+                f"Keep the one the checkpoint ships. An `mtp.*` that holds DSpark stages "
+                f"(`dspark_*` keys in its config) is spelled `dspark`, even when the "
+                f"request says 'MTP'."
             )
 
     if ENVIRONMENT_FIELD not in data:

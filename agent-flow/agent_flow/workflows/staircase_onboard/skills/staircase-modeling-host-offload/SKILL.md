@@ -14,9 +14,8 @@ The first instance is Qwen3.8-Flash-Next's PLE n-gram embedding table:
 **53.7 GB of a 124 GB checkpoint**. Whether it is resident decides how much of
 a 284 GB device is left for KV. That is the test for whether this feature
 applies: *a single tensor whose size is comparable to the rest of the model*.
-It is not a general memory-pressure remedy. DeepSeek-V4.1's Engram table is
-the second: two modules of 384M rows x 256 FP8 plus E8M0 scales, **202.76 GB**,
-larger than the rest of the checkpoint.
+It is not a general memory-pressure remedy. A hashed n-gram memory table
+larger than the rest of its checkpoint is the same case again.
 
 Read `staircase-modeling-core/references/adapter-rules.md` first if the
 offload is expressed as an adapter rather than inside the forward.
@@ -118,34 +117,32 @@ one host copy that every rank on the node maps and registers.
 
 - rank 0 creates the table in one anonymous shared region (`memfd_create`),
   backed by huge pages (`madvise(MADV_HUGEPAGE)`);
-- the other ranks on the node map the same region — SGLang reaches it through
-  `/proc/<pid>/fd/<n>`, which needs every rank in one PID namespace, so one
+- the other ranks on the node map the same region; reaching it through
+  `/proc/<pid>/fd/<n>` needs every rank in one PID namespace, so one
   container per node;
 - every rank `cudaHostRegister`s the mapping and resolves its own device
   pointer, before capture as above;
 - every GPU can then gather **any** row: no sharding, no zero-fill, no
   allreduce or reduce-scatter, and the lookup is bitwise the resident one.
 
-At 202.76 GB for DeepSeek-V4.1's Engram table, per-rank copies on a four-GPU
-node would be 811 GB of host memory; the shared layout is 202.76 GB, once.
-SGLang ships exactly this behind `SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT=shared`
-(implementation in `python/sglang/srt/layers/engram.py`, branch
-`origin/dsv4.1`); TRT does not have it yet, so it is new target code, and the
-`ple.py` pieces above are the parts it can follow.
+For a table of `T` bytes on a node of `G` GPUs, per-rank copies cost `G x T`
+of host memory and the shared layout costs `T`, once. Where TRT has no shared
+layout yet, it is new target code, and the `ple.py` pieces above are the parts
+it can follow.
 
 What to check before choosing it, none of which is about correctness:
 
 | check | why |
 |---|---|
-| huge pages | SGLang's own note: without them "expect ~10x slower lookups" — TLB misses on a 200 GB mapping |
+| huge pages | without them expect lookups an order of magnitude slower: TLB misses on a mapping of hundreds of GB |
 | NUMA | a GB300 node puts four GPUs on two Grace sockets; one copy lives on one socket (or interleaved), and the far GPUs read it over the socket link |
 | host RAM | the table once, plus pinned staging for weight loading, must fit beside everything else the node holds |
 | lifetime | rank 0 owns the region; the others must map it before rank 0 can exit, and a restarted rank 0 invalidates every mapping |
 
 The residency witness is unchanged by the layout — it compares per-rank
 device memory with the offload on and off — but `expected_mib` is the OFF
-leg's **per-rank** footprint: DeepSeek-V4.1's table row-sharded at TP4 is
-202.76 GB / 4, **48,340 MiB** per rank.
+leg's **per-rank** footprint: a table row-sharded at TP4 contributes a
+quarter of its bytes, in MiB, per rank.
 
 ### The fallback: a host `index_select`
 

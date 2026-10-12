@@ -33,6 +33,9 @@
 #     summary:     what this source is, in a sentence or two
 #     registers:   the file(s) where its ops enter `torch.ops.trtllm`
 #     implementation: where the kernel body lives, when that differs
+#     claims_files_containing: markers; a `custom_ops/*.py` file no
+#                  `registers` path names, but which contains all of them,
+#                  belongs to this source
 #     tier:        which sourcing tier (see vocabulary.py) it satisfies
 #     availability: what decides whether its ops exist in a given build
 #     certifying:  what a receipt for one of these must say, beyond passing
@@ -149,20 +152,20 @@ triton_custom_op:
     them.
   registers:
     - tensorrt_llm/_torch/custom_ops/nvfp4_sfc_finalize.py
-    - tensorrt_llm/_torch/custom_ops/nvfp4_fake_quantize.py
-    - tensorrt_llm/_torch/custom_ops/mxfp8_fake_quantize.py
-    - tensorrt_llm/_torch/custom_ops/mxfp8_dequantize.py
-    - tensorrt_llm/_torch/custom_ops/mxfp8_to_e4m3.py
-    - tensorrt_llm/_torch/custom_ops/nvfp4_kv_to_bf16.py
-    - tensorrt_llm/_torch/custom_ops/nvfp4_kv_to_e4m3.py
-    - tensorrt_llm/_torch/custom_ops/e4m3_quantize_pow2_dynamic.py
+  # These files follow no naming convention, and a model's onboarding adds
+  # them one op at a time, so they are claimed by what they contain: a Triton
+  # kernel and the custom-op registration that exposes it.
+  claims_files_containing:
+    - "@triton.jit"
+    - "torch.library.custom_op"
   tier: 2
   availability: >-
     Never gated --- Triton is a hard dependency of the wheel, and each module
     imports it at module scope rather than behind a try. But an op exists
     only once its module is imported: `nvfp4_sfc_finalize` is imported by the
-    `custom_ops` package, the others by the catalog wrapper that calls them,
-    so an inventory that imports only the package does not list them.
+    `custom_ops` package, while a module the package does not import is
+    imported by the catalog wrapper that calls it, so an inventory that
+    imports only the package does not list its ops.
   certifying: >-
     Read the autotune. A Triton op's numerics are fixed but its launch
     configuration is chosen at runtime, so a receipt that names only the op

@@ -10,8 +10,8 @@ Covers every `--features` value that makes the target draft its own tokens:
 skill because they share a binding surface and a gate; they differ in what the
 draft path computes, which is `references/algorithms.md`.
 
-**A checkpoint's `mtp.*` namespace does not mean MTP.** DeepSeek-V4.1 stores
-its DSpark block drafter there, with `num_nextn_predict_layers: 3` beside it.
+**A checkpoint's `mtp.*` namespace does not mean MTP.** A checkpoint may store
+a DSpark block drafter there, with `num_nextn_predict_layers` beside it.
 Read what the stages compute before choosing the feature — the DSpark section
 of `references/algorithms.md` says how to tell — because `mtp` over DSpark
 weights either fails to load or drafts garbage that verification quietly

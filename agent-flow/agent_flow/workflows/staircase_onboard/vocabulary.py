@@ -140,10 +140,9 @@ class QueueItem:
     #: failed dispatch blocks, not when the dispatch runs: every row is
     #: dispatched in the smith phase, and only a failure that core needs
     #: stops the run there. A feature-only failure is deferred to the start
-    #: of its unit and retried once. Measured on the DeepSeek-V4.1 run: 33
-    #: dispatches queued, six of them needed only by dspark / multimodal /
-    #: host_offload / kv_quant, and any one of those failing closed the run
-    #: `smith-blocked` before core -- which needed none of them -- had begun.
+    #: of its unit and retried once. Without the tag, any one row that only a
+    #: feature unit needs could close the run `smith-blocked` before core,
+    #: which does not need it, had begun.
     unit: str = UNIT_CORE
 
     @classmethod

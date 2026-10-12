@@ -173,18 +173,25 @@ def check_catalog_tests(repo_root: Path, entries: Iterable[tuple[str, str]]) -> 
     ``test_modeling_v2_*`` precisely so it cannot collide with upstream's
     test of the same op, and so the CI selector's pattern matches it exactly.
     A correctly written test under any other name is a test on no list.
+
+    A multi-rank entry's test is an op matrix over world sizes and is named
+    ``test_modeling_v2_<name>_op_matrix.py``, as the in-tree ``comm`` tests
+    are; either name satisfies the check.
     """
     checks: list[Check] = []
     for category, name in entries:
         if category == MIRROR_CATEGORY:
             continue
-        rel = f"{CATALOG_TESTS_DIR}/{category}/test_modeling_v2_{name}.py"
-        path = repo_root / rel
+        candidates = [
+            f"{CATALOG_TESTS_DIR}/{category}/test_modeling_v2_{name}{suffix}.py"
+            for suffix in ("", "_op_matrix")
+        ]
+        found = next((rel for rel in candidates if (repo_root / rel).is_file()), None)
         checks.append(
             Check(
                 name=f"test:{category}/{name}",
-                passed=path.is_file(),
-                detail=str(path) if path.is_file() else f"missing: {rel}",
+                passed=found is not None,
+                detail=str(repo_root / found) if found else f"missing: {candidates[0]}",
             )
         )
     return checks

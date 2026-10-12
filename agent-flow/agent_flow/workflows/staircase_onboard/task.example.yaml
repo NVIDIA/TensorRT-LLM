@@ -84,10 +84,9 @@ parallel: tp1
 # kv_quant and the two replay features it is required here, at spec time.
 #
 # `dspark` is not a spelling of `mtp`. A checkpoint whose `mtp.*` stages are a
-# DSpark block drafter (DeepSeek-V4.1: `dspark_*` keys in its config) asks for
-# `dspark` even when the request says "MTP"; `mtp` over those weights builds
-# three chained heads the checkpoint never trained. The two are refused
-# together.
+# DSpark block drafter (its config carries `dspark_*` keys) asks for `dspark`
+# even when the request says "MTP"; `mtp` over those weights builds chained
+# one-token heads the checkpoint never trained. The two are refused together.
 features: []
 
 trtllm_repo_path: /path/to/TensorRT-LLM
@@ -449,7 +448,7 @@ accuracy:
   #
   # witness:
   #   host_offload:
-  #     contrast_env: {QWEN_PLE_OFFLOAD: "0"}   # the leg WITHOUT the offload
+  #     contrast_env: {MYMODEL_HOST_OFFLOAD: "0"}   # the leg WITHOUT the offload
   #     expected_mib: 48800          # 20 M rows x 2560 dims, fp8
   #   disagg:
   #     contrast_env: {TRTLLM_DISAGG: "1"}       # the leg WITH disagg
@@ -462,8 +461,8 @@ accuracy:
   #     max_batch_size: 1                        # one schedule on BOTH legs
   #     # The environment of BOTH legs (`contrast_env` is leg B's alone).
   #     legs_env:
-  #       TRTLLM_DSV41_ENCODER_SWA_BOUNDED_REPLAY: "0"
-  #       TRTLLM_DSV41_DECODER_SWA_BOUNDED_REPLAY: "0"
+  #       MYMODEL_ENCODER_REPLAY: "0"
+  #       MYMODEL_DECODER_REPLAY: "0"
   #
   # `legs_env` (disagg only): the two legs must differ in exactly ONE thing,
   # the hop. Leg B is a different launcher, and a code path its engines refuse
@@ -495,8 +494,10 @@ accuracy:
   # names a lossy attention path (an FP8-query kernel) and drops that leg.
   #
   #   kv_quant:
-  #     contrast_env: {TRTLLM_DSV41_KV_STORAGE: bf16}   # the leg WITH bf16 storage
-  #     expected_bytes_per_token: 890    # 3 x (288 + 68) / 2 + (288 + 68)
+  #     contrast_env: {MYMODEL_KV_STORAGE: bf16}   # the leg WITH bf16 storage
+  #     # One rank's persistent bytes per token, summed over its pools and
+  #     # computed from the checkpoint's storage formats before the run.
+  #     expected_bytes_per_token: 656
   #     exact: true
   #     bytes_tolerance: 0.02            # default; row padding, not a layout
   #     max_batch_size: 1                # both legs one request at a time
@@ -509,14 +510,14 @@ accuracy:
   # under 16384, since the prompt travels as one argv string.
   #
   #   decoder_replay:
-  #     contrast_env: {TRTLLM_DSV41_DECODER_SWA_BOUNDED_REPLAY: "0"}  # replay OFF
-  #     window: 128
+  #     contrast_env: {MYMODEL_DECODER_REPLAY: "0"}  # replay OFF
+  #     window: 128            # the checkpoint's sliding window
   #     prompt_tokens: 4096
   #   encoder_replay:
-  #     contrast_env: {TRTLLM_DSV41_ENCODER_SWA_BOUNDED_REPLAY: "0"}  # replay OFF
+  #     contrast_env: {MYMODEL_ENCODER_REPLAY: "0"}  # replay OFF
   #     window: 128
   #     prefix_tokens: 4096
-  #     reuse_alignment: 2     # the compress ratio; an odd boundary splits a pair
+  #     reuse_alignment: 2     # e.g. a KV compression ratio the boundary may not split
 
   # The ABSOLUTE `acceptance_length` floor a speculator unit falls back to
   # when the `=off` leg cannot exist. The acceptance gate normally compares
@@ -626,3 +627,33 @@ accuracy:
 #   max_attempts_per_item: 1   # a second attempt at identical work is not progress
 #   max_new_items: 16          # surfaces one round may add to the queue
 #   max_parallel_verifiers: 4  # concurrent verify smiths
+
+# ------------------------------------------------------- agent backends
+# Which backend, model and reasoning effort each role runs on. Omit the block
+# for the defaults: plan_reviewer on codex, every other role on claude-code,
+# each at its backend's default model. The roles are plan_drafter,
+# plan_reviewer, smith, assembler, reviewer, auditor and runner.
+#
+# The plan reviewer runs on a different model from the plan drafter on
+# purpose: the plan phase has no gate, only this review, and a reviewer on the
+# drafter's model shares its blind spots. The CLI warns when the two resolve to
+# the same backend and model.
+#
+# `defaults` applies to every role and `roles.<name>` overrides it per field.
+# A `defaults.model` needs a `defaults.backend` beside it, because the roles do
+# not share a default backend. Under `--agent-transport external` a driver runs
+# the turn; the role's configured backend and model reach it as `agent` in the
+# turn's request file, and choosing a matching model is the driver's job.
+# agents:
+#   defaults:
+#     backend: claude-code         # claude-code | codex
+#     model: claude-opus-5-5
+#     reasoning_effort: max
+#   roles:
+#     plan_reviewer:
+#       backend: codex
+#       model: gpt-6-astra
+#   # Portable external MCP servers (STDIO or streamable HTTP) belong under
+#   # defaults or an individual role:
+#   #   extra_mcp_servers:
+#   #     knowledge-base: {type: http, url: https://example.test/mcp}

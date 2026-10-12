@@ -351,3 +351,94 @@ def test_an_answered_or_different_request_is_never_adopted(tmp_path):
         TurnRequest(role="smith", what="onboard a", prompt="p", decision_file="d/1")
     )
     assert outcome.request_id == "003-smith"
+
+
+def _wait_for(path, timeout_s: float = 5.0) -> None:
+    deadline = time.monotonic() + timeout_s
+    while not path.exists():
+        assert time.monotonic() < deadline, f"{path} never appeared"
+        time.sleep(0.005)
+
+
+def test_a_concurrent_caller_asking_alike_is_never_handed_a_siblings_request(tmp_path):
+    """Two in-flight turns of one process are two questions, even when they read alike.
+
+    The ordering is forced rather than left to the scheduler: the second
+    caller looks only after the first caller's request file is on disk. That
+    is the interleaving in which the twin check used to adopt the sibling's
+    request, so both callers waited on one answer and one prompt was never
+    delivered.
+    """
+    # Bounded, and daemon threads: a regression must fail here, not hang the run.
+    executor = FileDispatchTurnExecutor(tmp_path, poll_s=0.005, timeout_s=10)
+    alike = dict(role="smith", what="onboard a", decision_file=None)
+    outcomes: dict[str, TurnOutcome] = {}
+
+    def ask(key: str) -> threading.Thread:
+        prompt = f"{key} prompt"
+        thread = threading.Thread(
+            target=lambda: outcomes.__setitem__(
+                key, executor.run(TurnRequest(prompt=prompt, **alike))
+            ),
+            daemon=True,
+        )
+        thread.start()
+        return thread
+
+    first = ask("first")
+    _wait_for(executor.root / "001-smith.request.json")
+    second = ask("second")
+    _wait_for(executor.root / "002-smith.request.json")
+
+    executor.answer("001-smith", "answer one")
+    executor.answer("002-smith", "answer two")
+    first.join(timeout=5)
+    second.join(timeout=5)
+
+    assert outcomes["first"].request_id == "001-smith"
+    assert outcomes["second"].request_id == "002-smith"
+    assert outcomes["first"].text == "answer one"
+    assert outcomes["second"].text == "answer two"
+    assert (executor.root / "002-smith.prompt.md").read_text(encoding="utf-8") == "second prompt"
+
+
+def test_a_retry_in_the_same_process_waits_on_its_own_unanswered_request(tmp_path):
+    """Once its caller has given up, a request is an orphan like a dead process's.
+
+    Re-asking would duplicate work a driver may still be doing, exactly as on
+    a resume.
+    """
+    executor = FileDispatchTurnExecutor(tmp_path, poll_s=0.005, timeout_s=0.05)
+    request = TurnRequest(role="smith", what="onboard a", prompt="p", decision_file="d/1")
+    with pytest.raises(TurnTimeout):
+        executor.run(request)
+
+    def answer_once_adopted():
+        # Answering before the retry has looked would make 001 an answered
+        # request, which is rightly never adopted; wait until the retry holds it.
+        deadline = time.monotonic() + 5
+        while "001-smith" not in executor._in_flight and time.monotonic() < deadline:
+            time.sleep(0.005)
+        executor.answer("001-smith", "late answer")
+
+    executor.timeout_s = 5.0
+    threading.Thread(target=answer_once_adopted, daemon=True).start()
+    outcome = executor.run(request)
+    assert outcome.request_id == "001-smith"
+    assert outcome.text == "late answer"
+    assert not (executor.root / "002-smith.request.json").exists()
+
+
+def test_the_request_file_names_the_backend_the_role_is_configured_for(tmp_path):
+    """A driver can only honour a role's model if the request says which one it is."""
+    import json
+
+    executor = FileDispatchTurnExecutor(tmp_path, poll_s=0.005)
+    _answer_after(executor, "001-plan_reviewer", "ok")
+    executor.run(
+        TurnRequest(role="plan_reviewer", what="r1", prompt="p", backend="codex", model="m")
+    )
+    request = json.loads(
+        (executor.root / "001-plan_reviewer.request.json").read_text(encoding="utf-8")
+    )
+    assert request["agent"] == {"backend": "codex", "model": "m"}

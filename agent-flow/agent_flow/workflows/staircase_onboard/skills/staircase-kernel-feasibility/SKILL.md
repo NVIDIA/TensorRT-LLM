@@ -170,10 +170,10 @@ wall-clock. The tag changes only what a **failure** blocks. An untagged row
 reads as `core`, and a `core` row that fails stops the run before assembly. A
 tagged row that fails is deferred instead, and retried once before its unit's
 first assembler turn; the run stops only if that retry fails too, and then at
-that unit rather than before core. Measured on DeepSeek-V4.1: a 33-dispatch
-queue with six feature-only rows — among them the Engram host-gather ports,
-the ViT attention verify, a DSpark-only routing surface and the MXFP4 drafter
-MoE — any one of which could close the run before core started.
+that unit rather than before core. Measured on one run: a 33-dispatch queue
+with six feature-only rows — host-offload gathers, a vision-tower verify and
+speculator-only surfaces among them — any one of which could close the run
+before core started.
 
 - Tag the **first** unit that needs the entry, in `task.yaml` feature order.
 - Leave the tag off when core uses the entry at all, or when you are unsure.

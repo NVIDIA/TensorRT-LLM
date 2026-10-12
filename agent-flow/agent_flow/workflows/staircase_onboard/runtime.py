@@ -53,7 +53,7 @@ INDEX_PATH = Path(__file__).parent / "runtime_index.yaml"
 KERNEL_SOURCES_PATH = Path(__file__).parent / "kernel_sources.yaml"
 
 KERNEL_SOURCE_REQUIRED: tuple[str, ...] = ("summary", "tier", "availability", "certifying")
-KERNEL_SOURCE_OPTIONAL: tuple[str, ...] = ("registers", "implementation")
+KERNEL_SOURCE_OPTIONAL: tuple[str, ...] = ("registers", "implementation", "claims_files_containing")
 
 #: Areas every run needs regardless of what the checkpoint declares. A target
 #: always sits somewhere in the parallel topology and is always captured or
@@ -215,10 +215,20 @@ class KernelSource:
     certifying: str
     registers: tuple[str, ...] = ()
     implementation: tuple[str, ...] = ()
+    #: Markers that claim a `custom_ops/*.py` file `registers` does not name:
+    #: a file containing every one of them belongs to this source. For a
+    #: source whose files carry no naming convention, so a tree that adds one
+    #: does not need this registry edited to classify it.
+    claims_files_containing: tuple[str, ...] = ()
 
     @property
     def pointers(self) -> tuple[str, ...]:
         return (*self.registers, *self.implementation)
+
+    def claims(self, text: str) -> bool:
+        """Whether a registration file's source text belongs to this source by content."""
+        markers = self.claims_files_containing
+        return bool(markers) and all(marker in text for marker in markers)
 
     def render(self) -> str:
         lines = [f"### {self.name} (tier {self.tier})", "", " ".join(self.summary.split()), ""]
@@ -228,6 +238,9 @@ class KernelSource:
             lines.append(
                 f"- **implemented in**: {', '.join(f'`{p}`' for p in self.implementation)}"
             )
+        if self.claims_files_containing:
+            markers = " and ".join(f"`{m}`" for m in self.claims_files_containing)
+            lines.append(f"- **also any `custom_ops/*.py` containing**: {markers}")
         lines.append(f"- **availability**: {' '.join(self.availability.split())}")
         lines.append(f"- **certifying one**: {' '.join(self.certifying.split())}")
         return "\n".join(lines)
@@ -253,6 +266,10 @@ def load_kernel_sources(path: str | Path = KERNEL_SOURCES_PATH) -> dict[str, Ker
                 errors.append(f"{name}: missing required field '{required}'")
         if not entry.get("registers") and not entry.get("implementation"):
             errors.append(f"{name}: needs at least one of 'registers' or 'implementation'")
+        markers = entry.get("claims_files_containing", [])
+        if not isinstance(markers, list) or not all(isinstance(m, str) and m for m in markers):
+            errors.append(f"{name}: 'claims_files_containing' must be a list of non-empty strings")
+            markers = []
         sources[str(name)] = KernelSource(
             name=str(name),
             summary=str(entry.get("summary", "")),
@@ -261,6 +278,7 @@ def load_kernel_sources(path: str | Path = KERNEL_SOURCES_PATH) -> dict[str, Ker
             certifying=str(entry.get("certifying", "")),
             registers=tuple(str(p) for p in entry.get("registers", ())),
             implementation=tuple(str(p) for p in entry.get("implementation", ())),
+            claims_files_containing=tuple(markers),
         )
     if errors:
         raise RuntimeIndexError(f"{path} is malformed:\n  - " + "\n  - ".join(errors))
@@ -268,7 +286,10 @@ def load_kernel_sources(path: str | Path = KERNEL_SOURCES_PATH) -> dict[str, Ker
 
 
 def source_for_stem(
-    stem: str, sources: "Mapping[str, KernelSource] | None" = None
+    stem: str,
+    sources: "Mapping[str, KernelSource] | None" = None,
+    *,
+    text: str | None = None,
 ) -> KernelSource | None:
     """Map a `custom_ops/<stem>.py` file back to the source it represents.
 
@@ -279,13 +300,20 @@ def source_for_stem(
 
     ``cpp_thop`` is returned for the C++ plane, which the probe reports for
     any op no Python file claims --- a conclusion, not a fallback.
+
+    ``text`` is the file's source. Given, a file no path names can still be
+    claimed by content (``claims_files_containing``); a named path always wins.
     """
     sources = load_kernel_sources() if sources is None else sources
     for source in sources.values():
         for path in source.registers:
             if Path(path).stem == stem or path.rstrip("/").endswith(stem):
                 return source
-    return sources.get(stem)
+    if stem in sources:
+        return sources[stem]
+    if text is not None:
+        return next((source for source in sources.values() if source.claims(text)), None)
+    return None
 
 
 def format_kernel_sources(sources: "Mapping[str, KernelSource]") -> str:

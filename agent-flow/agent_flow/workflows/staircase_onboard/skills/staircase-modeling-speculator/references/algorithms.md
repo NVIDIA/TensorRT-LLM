@@ -19,7 +19,7 @@ draft-target is a different shape and is not covered.
 | **MTP** | the checkpoint's own MTP module, replayed autoregressively `max_draft_len` times | the MTP module in the checkpoint | `references/multi-token-prediction.md` is the depth. `num_nextn_predict_layers` is a module count, **not** the draft-length knob |
 | **Eagle3** | a separate small drafter reading the target's hidden states | a separate drafter checkpoint | needs hidden states exported from the trunk — a forward-shape change the other modes do not require |
 | **DFlash** | as upstream `_torch/speculative/dflash.py` | | not yet exercised by any target here |
-| **DSpark** | the checkpoint's own block drafter: one 3-stage pass drafts a whole block, then a sequential Markov refine | the drafter stages — on DeepSeek-V4.1 stored as `mtp.*` | **not MTP, whatever the namespace says.** See the DSpark section below |
+| **DSpark** | the checkpoint's own block drafter: one 3-stage pass drafts a whole block, then a sequential Markov refine | the drafter stages, which a checkpoint may store as `mtp.*` | **not MTP, whatever the namespace says.** See the DSpark section below |
 | n-gram, suffix automaton, PARD | no weights at all — drafts from the emitted prefix | none | no weight-loading change, so the gate reduces to acceptance alone |
 
 Only MTP has been carried end to end here. Everything about the others below is
@@ -59,11 +59,10 @@ reference is still required, because "drafts nothing, accepts nothing" and
 
 ## DSpark — a block drafter that lives where MTP would
 
-DeepSeek-V4.1-Flash is the first checkpoint here. Its tech report (§2.4.3):
-"We omit the MTP module during backbone pre-training and use DSpark for
-speculative decoding." The drafter nevertheless ships under `mtp.0..2` with
-`num_nextn_predict_layers: 3` in the config, which is exactly what makes the
-wrong feature easy to pick.
+A checkpoint can ship a DSpark drafter under `mtp.*` with
+`num_nextn_predict_layers` in its config, which is exactly what makes the
+wrong feature easy to pick. Its tech report says which drafter it trained;
+quote that in the plan.
 
 ### Telling it from MTP
 
@@ -71,7 +70,7 @@ Any one of these settles it:
 
 - the config carries `dspark_*` keys — `dspark_block_size`,
   `dspark_noise_token_id`, `dspark_target_layer_ids`, `dspark_markov_rank`
-  (DeepSeek-V4.1 nests them under `text_config`);
+  (a multimodal config may nest them under `text_config`);
 - the `mtp.*` weights include `main_proj`, `markov_head`, `confidence_head`
   and lack MTP's signature: no `e_proj` / `h_proj` / `enorm` / `hnorm` /
   `shared_head`;
@@ -79,8 +78,8 @@ Any one of these settles it:
   module.
 
 Then the feature is `dspark` and never `mtp`. `MTPDecodingConfig` would read
-`num_nextn_predict_layers: 3`, pick vanilla sequential MTP, and build three
-chained one-token heads over weights trained as one 3-stage block pass: it
+`num_nextn_predict_layers: N`, pick vanilla sequential MTP, and build N
+chained one-token heads over weights trained as one N-stage block pass: it
 either fails to load the missing MTP keys or drafts garbage that verification
 rejects — and the second passes accuracy. If a request says "MTP" for such a
 checkpoint, it means "speculate with the bundled drafter", which is `dspark`;
@@ -92,29 +91,28 @@ From the checkpoint's reference forward. Each item is a place a transliteration
 from an MTP or Eagle mental model goes wrong **and still drafts**, so the only
 symptom is a lower acceptance length.
 
-1. **One pass drafts the whole block.** The input is a `block_size`-token block
-   `[x, NOISE, NOISE, NOISE, NOISE]` at block size 5: `x` is the token the
-   target just emitted, NOISE is `dspark_noise_token_id` (128799). The three
-   stages run **once**, in sequence, over all five positions — each a full
-   block (sliding-window attention plus a 128-expert top-3 MoE, with
-   hyper-connections) — and the head produces base logits for all five
-   positions in parallel. Not five passes; not three heads chained.
+1. **One pass drafts the whole block.** The input is a `block_size`-token
+   block `[x, NOISE, ..., NOISE]`: `x` is the token the target just emitted,
+   NOISE is `dspark_noise_token_id`. The stages run **once**, in sequence,
+   over every block position — each stage a full transformer block as the
+   reference defines it — and the head produces base logits for all positions
+   in parallel. Not one pass per position; not chained heads.
 2. **Attention inside the block is non-causal.** Every block position attends
    to every other block position plus the filled ring slots. A causal mask
    here is the most likely error to carry over from a one-token drafter.
-3. **The ring holds TARGET state.** Each stage owns a sliding-window ring
-   (window 128). It is filled from the target's hidden states: the *input* of
-   target layers `dspark_target_layer_ids` (37, 38, 39), averaged over the
-   hyper-connection copies, concatenated, projected once by stage 0's
-   `main_proj` + `main_norm`, then per stage through `wkv` and `kv_norm` with
-   plain RoPE. Inputs, not outputs — vLLM's DeepSeek-V4 path captures
-   outputs, which is a different checkpoint's contract. The block's own K/V
-   are transient and never enter the ring. After a multi-token acceptance,
-   every newly committed position's target state must reach the ring before
-   the next draft, not just the last one.
+3. **The ring holds TARGET state.** Each stage owns a sliding-window ring,
+   filled from the target's hidden states at the layers
+   `dspark_target_layer_ids` names, combined and projected as the reference
+   does it. Read from the reference whether a ring takes each layer's
+   **input or output**, and how parallel residual streams are reduced: that is
+   a per-checkpoint contract, and another engine's choice for a different
+   checkpoint is no evidence. The block's own K/V are transient and never
+   enter the ring. After a multi-token acceptance, every newly committed
+   position's target state must reach the ring before the next draft, not
+   just the last one.
 4. **The Markov head is applied sequentially.** After the parallel pass, for
-   each position in order: add a rank-256 bigram bias computed from the
-   *previous* position's token, then choose this position's token. Applied in
+   each position in order: add a low-rank (`dspark_markov_rank`) bigram bias
+   computed from the *previous* position's token, then choose this position's token. Applied in
    parallel it would condition on NOISE tokens.
 5. **The confidence head only schedules.** It predicts per-position acceptance
    probabilities so a scheduler can choose how many drafts each request
@@ -171,7 +169,7 @@ absolute claim.
 
 - The `TorchLlmArgs` DSpark validation reads `dspark_*` at the top level of the
   drafter's `config.json`, or inside `dspark_config` / `dflash_config` — **not
-  under `text_config`**, where DeepSeek-V4.1 keeps them. So
+  under `text_config`**, where a multimodal checkpoint may keep them. So
   `target_layer_ids`, `mask_token_id` and `markov_rank` stay unset unless the
   spec states them, and with `target_layer_ids` unset `DSparkSpecMetadata`
   captures nothing: the drafter sees no target context and acceptance falls

@@ -109,6 +109,11 @@ class FileDispatchTurnExecutor(TurnExecutor):
         self._note = transport_note
         self._counter = itertools.count(self._next_seq())
         self._lock = threading.Lock()
+        #: Request ids a caller of this executor is waiting on right now. Such
+        #: a request is never a twin: its caller will read the answer, and the
+        #: next caller's prompt may differ even when the role, ``what`` and
+        #: decision file match. Guarded by ``_lock``.
+        self._in_flight: set[str] = set()
 
     # ------------------------------------------------------------ helpers
 
@@ -210,10 +215,17 @@ class FileDispatchTurnExecutor(TurnExecutor):
         writing a second request would duplicate the work -- or, worse, give
         two agents the same decision path. Waiting on the first one is the
         same answer to the same question.
+
+        A request some caller of this executor is still waiting on is not a
+        twin. Without that rule, whether two concurrent callers asking alike
+        shared one id depended on whether the first caller's request file was
+        on disk yet when the second one looked, so they sometimes received one
+        answer between them. An orphan is likewise adopted by one caller at a
+        time. Call with ``_lock`` held.
         """
         for path in sorted(self.root.glob(f"*-{request.role}.request.json")):
             name = path.name[: -len(".request.json")]
-            if (self.root / f"{name}.done").exists():
+            if name in self._in_flight or (self.root / f"{name}.done").exists():
                 continue
             try:
                 data = json.loads(path.read_text(encoding="utf-8"))
@@ -229,7 +241,14 @@ class FileDispatchTurnExecutor(TurnExecutor):
         with self._lock:
             adopted = self._unanswered_twin(request)
             request_id = adopted or f"{next(self._counter):03d}-{request.role}"
+            self._in_flight.add(request_id)
+        try:
+            return self._await(request, request_id, adopted)
+        finally:
+            with self._lock:
+                self._in_flight.discard(request_id)
 
+    def _await(self, request: TurnRequest, request_id: str, adopted: str | None) -> TurnOutcome:
         started = time.monotonic()
         # The role's system prompt travels WITH the turn. In-process it is
         # set on the session and is easy to forget here -- and a driver that
@@ -285,6 +304,11 @@ class FileDispatchTurnExecutor(TurnExecutor):
                     "done_file": str(done),
                     "decision_file": request.decision_file,
                     "context_refs": list(request.context_refs),
+                    # Which backend and model the role is configured for. A
+                    # driver that runs every turn on whatever model it has
+                    # would otherwise turn a cross-model review into a
+                    # same-model one without anything on disk saying so.
+                    "agent": {"backend": request.backend, "model": request.model},
                     # Named rather than inlined: a driver that wants the
                     # role's own history reads these, and one that does not
                     # is not forced to carry them in the prompt.

@@ -60,6 +60,12 @@ class TurnRequest:
     #: Paths the role should read as input. Named rather than inlined, so a
     #: transport that cannot afford the prompt budget can hand over pointers.
     context_refs: tuple[str, ...] = ()
+    #: The backend and model the caller configured for this role. An
+    #: in-process transport already built its session from them; a transport
+    #: that hands the turn to someone else passes them on, because otherwise
+    #: nothing tells that driver which model the role was meant to run on.
+    backend: str | None = None
+    model: str | None = None
 
 
 @dataclass(frozen=True)

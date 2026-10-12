@@ -1,17 +1,17 @@
 ---
 name: staircase-modeling-kv-quant
-description: Load when switching a target's KV pools from bf16 containers of the reference's fake-quantized values to the checkpoint's native storage formats (DeepSeek-V4.1's FP4 main KV, MXFP4 indexer K, FP8 SWA KV). Output-identical by construction when attention dequantizes exactly, so boot and accuracy cannot see it; it needs a bytes-per-token witness against a declared figure.
+description: Load when switching a target's KV pools from bf16 containers of the reference's fake-quantized values to the checkpoint's native storage formats (for example FP4 compressed KV, MXFP4 indexer keys, FP8 sliding-window KV). Output-identical by construction when attention dequantizes exactly, so boot and accuracy cannot see it; it needs a bytes-per-token witness against a declared figure.
 ---
 
 # staircase-modeling-kv-quant
 
 `--features kv_quant`. Core stores the **same values** the reference computes —
 the reference fake-quantizes KV to its storage formats and attends over the
-dequantized result — but in bf16 pools, because the only sm_103 sparse
-attention kernels that serve DeepSeek-V4.1 are exact only over bf16 KV. This
-unit switches the pools to the formats the checkpoint was trained for. It is
-what a request for "FP4 KV cache", "FP8 attention" or "890 bytes of KV per
-token" actually asks for.
+dequantized result — but in bf16 pools, typically because the attention
+kernels that serve the model are exact only over bf16 KV. This unit switches
+the pools to the formats the checkpoint was trained for. It is what a request
+for "FP4 KV cache", "FP8 attention" or "N bytes of KV per token" actually asks
+for.
 
 ## The rule: store the reference's value set, never a different one
 
@@ -25,51 +25,46 @@ Substitutions that look like this feature and are not:
 
 | format | why it is a different value set |
 |---|---|
-| `kv_cache_config.dtype: fp8` as a per-tensor FP8 cache | one scalar scale, not UE8M0 per 32 channels |
-| `fp8_ds_mla` — DeepSeek-V4's 584 B layout | 448 FP8 + 64 bf16 RoPE dims with block-64 scales; V4.1 quantizes all 512 dims, RoPE included, after RoPE (`tensorrt_llm/_torch/attention/backends/sparse/deepseek_v4/footer_scale_kv.py` is the V4 layout) |
-| TRT's `nvfp4` compressed pool as DeepSeek-V4 uses it | NVFP4 with a second-level global scale and a 64-dim residual; V4.1 has no global scale (it is 1) and all 512 dims in FP4 |
+| `kv_cache_config.dtype: fp8` as a per-tensor FP8 cache | one scalar scale, not a block scale per group of channels |
+| an in-tree preset with the same bit budget | its scale type, scale granularity, quantized dims (is RoPE included, and before or after rotation?) or second-level global scale differ from the reference's; compare each, never the bit width alone |
 
-The DeepSeek-V4 machinery in
+The sparse-attention cache machinery in
 `tensorrt_llm/_torch/attention/backends/sparse/deepseek_v4/` — the
 `KVCacheDtype` presets in `compressor.py`, `DeepseekV4CacheManager` and its
 `get_cache_bytes_per_token` in `cache_manager.py` — is the closest thing in
-tree, and it encodes the **V4** layouts. Read it to learn the interface; do
-not assume its byte formulas describe V4.1.
+tree to a multi-pool quantized KV cache. Read it to learn the interface; do
+not assume its byte formulas describe the checkpoint in hand.
 
-## DeepSeek-V4.1's formats
+## Deriving the checkpoint's formats
 
-From the tech report (§2.4.4) and the reference's fake-quantization:
+From the checkpoint's tech report and the reference's fake-quantization, write
+down one row per KV pool before touching the target:
 
 | pool | who owns one | format | bytes per entry |
 |---|---|---|---|
-| SWA KV | every layer (40), the window only | FP8 E4M3 per 32 channels with a UE8M0 scale, over all 512 dims including RoPE | 512 + 16 = **528** |
-| main (compressed global) KV | the KV-source layers only: 2, 8, 14 (compress ratio 2) and 20 (ratio 1) | FP4 E2M1 with an E4M3 scale per 16, **no global scale** | 256 + 32 = **288** |
-| indexer K | the same KV-source layers | MXFP4: E2M1 with a UE8M0 scale per 32, 128 dims | 64 + 4 = **68** |
+| e.g. sliding-window KV | which layers, and whether only the window is held | element type, scale type and group size, which dims | payload + scales |
+| e.g. compressed global KV | which layers **own** a pool, and at what compress ratio | | |
+| e.g. indexer keys | | | |
 
-**Only layers 2, 8, 14 and 20 own compressed and indexer pools.** Every other
-layer reads a source layer's pool through `kv_source_layer_ids`. A pool
-allocated per compressed layer (38 of them) comes to 10324 B/token, more than
-ten times the figure below, and is the sign the sharing was never wired.
+**Find out which layers own a pool and which read another layer's.** A model
+whose layers share pools through a source-layer mapping (a config key such as
+`kv_source_layer_ids`) allocates far fewer pools than it has layers. A pool
+allocated per layer multiplies the figure, and is the sign the sharing was
+never wired.
 
-**Bytes per token** is the persistent, growing part — global KV only:
-
-```
-3 x (288 + 68) / 2  +  (288 + 68)  =  534 + 356  =  890 B/token
-   ratio-2 layers       ratio-1 layer
-```
-
-The tech report's headline figure. The same formula gives 3200 for bf16
-containers of these values (core) and 1490 with FP8 main KV. The SWA window
-is per request, not per token — 40 layers x 128 x 528 B, about 2.7 MB — and so
-is the compressor's carry-over state; neither belongs in the figure.
+**Bytes per token** is the persistent, growing part, global KV only: for each
+pool-owning layer, its entry size divided by its compress ratio, summed. The
+same formula over bf16 containers of the same values gives core's figure,
+which the contrast leg must exceed. A sliding window is per request, not per
+token, and so is any compressor carry-over state; neither belongs in the
+figure.
 
 ## Attention over native storage
 
-The kernels that serve V4.1 on sm_103 — trtllm-gen's H512 DynamicTokenSparse
-path through FlashInfer's `trtllm_batch_decode_sparse_mla_dsv4`, and the
-catalog's `thop_attention` — are exact only over bf16 KV. The native formats
-are consumed by SGLang's FlashMLA fork, which TRT does not vendor, or by a
-**dequantize-and-gather to bf16** step ahead of the kernel. So:
+The attention kernels that serve the model may be exact only over bf16 KV.
+The native formats are then consumed by a kernel that reads them directly,
+where one exists, or by a **dequantize-and-gather to bf16** step ahead of the
+kernel. So:
 
 - native storage + exact dequantization + bf16 Q is **output-identical** to
   core. Declare `exact: true` (the default) and the witness demands token
@@ -86,7 +81,7 @@ boot → accuracy → **kv_quant witness**, all under `TRTLLM_MODELING_V2=requir
 once per rank after its KV pools are allocated:
 
 ```
-MODELING_V2_WITNESS kv_bytes_per_token=890
+MODELING_V2_WITNESS kv_bytes_per_token=656
 ```
 
 Computed from the pools **as allocated** — the tensors' dtypes and shapes,
@@ -98,8 +93,9 @@ compressor state are per request and excluded.
 **The verdict**, against the spec's declared figure:
 
 - native storage reports `expected_bytes_per_token` within `bytes_tolerance`
-  (default 2%) — enough for row padding, not for a layout change: padding the
-  4-byte indexer scale to 16 moves 890 to 920;
+  (default 2%) — enough for row padding, not for a layout change: padding a
+  4-byte scale to 16 bytes on one pool already moves the figure by a few
+  percent;
 - with `exact: true`, the leg under `contrast_env` (bf16 storage) reports MORE
   bytes per token — otherwise it selected nothing and the next check compares
   native storage with itself — and the greedy continuations are
@@ -111,16 +107,16 @@ features: [kv_quant]
 accuracy:
   witness:
     kv_quant:
-      contrast_env: {TRTLLM_DSV41_KV_STORAGE: bf16}   # the leg WITH bf16 storage
-      expected_bytes_per_token: 890
+      contrast_env: {MYMODEL_KV_STORAGE: bf16}   # the leg WITH bf16 storage
+      expected_bytes_per_token: 656              # derived above, before the run
       exact: true
       # bytes_tolerance: 0.02
       max_batch_size: 1   # both legs one request at a time
 ```
 
 Compare at batch 1 -- `max_batch_size: 1` in the witness block runs both legs
-there: SGLang reports that this model's output is not bitwise stable across
-batch composition, and the identity check must measure storage, not batching.
+there: a model's output is often not bitwise stable across batch composition,
+and the identity check must measure storage, not batching.
 
 ## What the gates still do not tell you
 
@@ -131,8 +127,7 @@ the pools hold the checkpoint's formats and that the output did not move.
 ## Report additions
 
 - each pool: owner layers, format, bytes per entry, and the allocated dtype
-- measured bytes per token against 890, and the bf16 leg's figure
+- measured bytes per token against the declared figure, and the bf16 leg's figure
 - `exact`, and if false, which attention path is lossy and why it was chosen
 - how attention reads the native values (dequantize-gather, or which kernel)
-- confirmation that only the KV-source layers allocate compressed and indexer
-  pools
+- confirmation that only the pool-owning layers allocate pools

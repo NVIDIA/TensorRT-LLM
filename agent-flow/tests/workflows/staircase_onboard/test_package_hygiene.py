@@ -64,3 +64,50 @@ def test_no_tracked_file_names_a_personal_path(root):
             if PERSONAL_PATH.search(line):
                 offences.append(f"{path.relative_to(root)}:{number}: {line.strip()[:100]}")
     assert not offences, "personal paths:\n  " + "\n  ".join(offences)
+
+
+def test_raw_run_reports_do_not_ship_and_their_lessons_do():
+    """Run reports stay out of the package; the lessons drawn from them are linked and shipped."""
+    assert not (PACKAGE / "findings").exists()
+    assert "(LESSONS.md)" in (PACKAGE / "README.md").read_text(encoding="utf-8")
+    pyproject = PACKAGE.parents[2] / "pyproject.toml"
+    assert '"LESSONS.md"' in pyproject.read_text(encoding="utf-8")
+
+
+def test_the_readme_flags_table_is_the_cli():
+    """Every flag the CLI accepts is in the README's table, and the table names no other."""
+    import argparse
+
+    from agent_flow.workflows.staircase_onboard import cli
+
+    captured: list[argparse.ArgumentParser] = []
+    original = argparse.ArgumentParser.parse_args
+
+    def capture(self, args=None, namespace=None):
+        captured.append(self)
+        return original(self, ["--task", "t.yaml"], namespace)
+
+    argparse.ArgumentParser.parse_args = capture
+    try:
+        cli._parse_args([])
+    finally:
+        argparse.ArgumentParser.parse_args = original
+    accepted = {
+        option
+        for action in captured[0]._actions
+        for option in action.option_strings
+        if option.startswith("--") and option != "--help"
+    }
+
+    readme = (PACKAGE / "README.md").read_text(encoding="utf-8")
+    table = readme.split("## Flags", 1)[1].split("\n\n", 2)[1]
+    documented = set(re.findall(r"`(--[a-z-]+)`", table))
+    assert documented == accepted
+    for subcommand in cli.SUBCOMMANDS:
+        assert f"`staircase-onboard {subcommand} " in readme
+
+
+def test_the_readme_has_no_placeholder_left():
+    readme = (PACKAGE / "README.md").read_text(encoding="utf-8")
+    assert "To be written" not in readme
+    assert "workstream" not in readme

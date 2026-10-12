@@ -280,19 +280,44 @@ _REPO_ROOT = Path(__file__).resolve().parents[4]
     not (_REPO_ROOT / delivery.MODELING_V2_PACKAGE).is_dir(),
     reason="not running inside a TensorRT-LLM checkout with modeling_v2 present",
 )
-def test_the_real_merged_target_passes_every_check():
+@pytest.mark.parametrize(
+    ("target_rel", "family", "model_key", "accuracy_test"),
+    [
+        (TARGET_REL, "gpt_oss", "openai/gpt-oss-120b", "test_modeling_v2_gpt_oss.py"),
+        (
+            f"{delivery.MODELING_V2_PACKAGE}/models/deepseek_v3/r1_0528_nvfp4__sm_103__dep4",
+            "deepseek_v3",
+            "deepseek-ai/DeepSeek-R1-0528",
+            "test_modeling_v2_deepseek_v3.py",
+        ),
+    ],
+    ids=["gpt_oss", "deepseek_v3"],
+)
+def test_the_real_merged_target_passes_every_check(target_rel, family, model_key, accuracy_test):
     """The path conventions must match what the repository actually uses.
 
-    `gpt_oss / sm_103 / tp1` is merged and gated, so every check here has a
-    known-good answer. If this fails, a convention moved and the checks are
-    describing a layout that no longer exists.
+    Both targets are merged and gated, so every check here has a known-good
+    answer. If this fails, a convention moved and the checks are describing a
+    layout that no longer exists. The DeepSeek one is multi-rank, so it also
+    holds the convention for the `comm` entries' op-matrix tests.
     """
     report = delivery.verify_delivery(
         repo_root=_REPO_ROOT,
-        target_rel=TARGET_REL,
-        family="gpt_oss",
+        target_rel=target_rel,
+        family=family,
         reference_yaml=f"{delivery.ACCURACY_REFERENCES_DIR}/gsm8k.yaml",
-        model_key="openai/gpt-oss-120b",
-        accuracy_test="test_modeling_v2_gpt_oss.py",
+        model_key=model_key,
+        accuracy_test=accuracy_test,
     )
     assert report.passed, report.render()
+
+
+def test_a_multi_rank_entry_is_satisfied_by_its_op_matrix_test(tmp_path):
+    tests = tmp_path / delivery.CATALOG_TESTS_DIR / "comm"
+    tests.mkdir(parents=True)
+    (tests / "test_modeling_v2_allgather_op_matrix.py").write_text("", encoding="utf-8")
+    [check] = delivery.check_catalog_tests(tmp_path, [("comm", "allgather")])
+    assert check.passed, check.detail
+    [missing] = delivery.check_catalog_tests(tmp_path, [("comm", "reducescatter")])
+    assert not missing.passed
+    assert missing.detail.endswith("comm/test_modeling_v2_reducescatter.py")

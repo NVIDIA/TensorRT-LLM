@@ -3,8 +3,8 @@
 
 """DSpark as its own speculator kind, and never a spelling of MTP.
 
-DeepSeek-V4.1 ships its DSpark block drafter as `mtp.*` with
-`num_nextn_predict_layers: 3`. Every test here guards one of the ways that
+A checkpoint can ship its DSpark block drafter as `mtp.*` beside
+`num_nextn_predict_layers`. Every test here guards one of the ways that
 namespace leads a run to gate the wrong drafter, or the right drafter at the
 wrong depth, or not at all.
 """
@@ -12,6 +12,7 @@ wrong depth, or not at all.
 from __future__ import annotations
 
 import ast
+import textwrap
 from pathlib import Path
 
 import pytest
@@ -105,7 +106,7 @@ def _runner(accept_line):
         if "TRTLLM_MODELING_V2=off" in command:
             return ShellResult(
                 returncode=1,
-                stderr="RuntimeError: Unknown model architecture: DeepseekV41ForCausalLM",
+                stderr="RuntimeError: Unknown model architecture: NewArchForCausalLM",
             )
         return ShellResult(returncode=0, stdout=accept_line)
 
@@ -153,21 +154,85 @@ def test_below_the_declared_floor_fails(tmp_path):
 # --------------------------------------------------------------- quickstart
 
 
-def _function_source(name: str) -> str:
-    source = QUICKSTART.read_text(encoding="utf-8")
+def _function_source(name: str, source: str | None = None) -> str:
+    source = QUICKSTART.read_text(encoding="utf-8") if source is None else source
     node = next(
         n for n in ast.parse(source).body if isinstance(n, ast.FunctionDef) and n.name == name
     )
     return ast.get_source_segment(source, node) or ""
 
 
-def test_quickstart_builds_a_dspark_config():
-    """The gates emit `--spec_decode_algo=DSPARK`; quickstart has to honour it."""
-    setup = _function_source("setup_llm")
-    branch = setup[setup.index('spec_decode_algo == "DSPARK"') :]
-    branch = branch[: branch.index("elif")]
+def _dspark_branch(source: str) -> str | None:
+    """The `DSPARK` arm of `setup_llm`'s speculator chain, or None when it has none.
+
+    Quickstart falls through to `spec_config = None` for an algorithm it does
+    not know, so a checkout without this arm runs the dspark unit's boot and
+    acceptance commands with no speculator at all.
+    """
+    setup = _function_source("setup_llm", source)
+    marker = 'spec_decode_algo == "DSPARK"'
+    if marker not in setup:
+        return None
+    branch = setup[setup.index(marker) :]
+    return branch[: branch.index("elif")]
+
+
+#: The shape of a quickstart that honours `--spec_decode_algo=DSPARK`. A
+#: fixture, so the contract is checked whether or not this checkout's
+#: quickstart has the arm yet.
+QUICKSTART_WITH_DSPARK = textwrap.dedent(
+    """\
+    def setup_llm(args, **kwargs):
+        spec_decode_algo = args.spec_decode_algo.upper(
+        ) if args.spec_decode_algo is not None else None
+        if spec_decode_algo == 'MTP':
+            spec_config = MTPDecodingConfig(max_draft_len=args.spec_decode_max_draft_len)
+        elif spec_decode_algo == "DSPARK":
+            spec_config = DSparkDecodingConfig(
+                max_draft_len=args.spec_decode_max_draft_len,
+                speculative_model=args.draft_model_dir)
+        elif spec_decode_algo == "NGRAM":
+            spec_config = NGramDecodingConfig(max_draft_len=args.spec_decode_max_draft_len)
+        else:
+            spec_config = None
+    """
+)
+
+
+def _assert_honours_dspark(branch: str | None) -> None:
+    assert branch is not None, "setup_llm has no DSPARK arm"
     assert "DSparkDecodingConfig(" in branch
     assert "max_draft_len=args.spec_decode_max_draft_len" in branch
+
+
+def test_a_quickstart_with_a_dspark_arm_builds_the_config_at_the_flag_depth():
+    """The gates emit `--spec_decode_algo=DSPARK`; quickstart has to honour it."""
+    _assert_honours_dspark(_dspark_branch(QUICKSTART_WITH_DSPARK))
+
+
+def test_a_quickstart_without_a_dspark_arm_is_told_apart():
+    without = QUICKSTART_WITH_DSPARK.replace('"DSPARK"', '"OTHER"')
+    assert _dspark_branch(without) is None
+
+
+def test_a_dspark_arm_at_another_depth_is_rejected():
+    fixed = QUICKSTART_WITH_DSPARK.replace(
+        "max_draft_len=args.spec_decode_max_draft_len,", "max_draft_len=1,"
+    )
+    with pytest.raises(AssertionError):
+        _assert_honours_dspark(_dspark_branch(fixed))
+
+
+@pytest.mark.skipif(not QUICKSTART.is_file(), reason="not inside a TensorRT-LLM checkout")
+def test_this_checkouts_quickstart_honours_dspark_once_it_has_the_arm():
+    branch = _dspark_branch(QUICKSTART.read_text(encoding="utf-8"))
+    if branch is None:
+        pytest.skip(
+            "this checkout's quickstart_advanced.py has no DSPARK arm yet, so a dspark "
+            "unit's boot and acceptance commands run without a speculator; the "
+            "acceptance gate then finds no accept-rate line and fails closed"
+        )
+    _assert_honours_dspark(branch)
 
 
 def test_the_accept_rate_line_does_not_depend_on_the_algorithm():

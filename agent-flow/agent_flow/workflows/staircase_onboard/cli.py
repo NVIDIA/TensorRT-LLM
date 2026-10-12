@@ -10,6 +10,7 @@ import sys
 from pathlib import Path
 
 from .agent_home import ensure_agent_home
+from .roles import shares_the_drafters_model
 from .state import STATE_FILENAME
 from .task_schema import TaskSchemaError, load_and_validate_task_yaml
 from .transport import DEFAULT_TURN_TIMEOUT_S, ExternalAgentTransport
@@ -234,10 +235,12 @@ def main(argv: list[str] | None = None) -> None:
     # agent is constructed, and the message must list every problem at
     # once so the user fixes them in a single pass.
     try:
-        load_and_validate_task_yaml(args.task)
+        task_data = load_and_validate_task_yaml(args.task)
     except TaskSchemaError as exc:
         print(f"error: {exc}", file=sys.stderr)
         sys.exit(2)
+    if warning := shares_the_drafters_model(task_data):
+        print(f"warning: {warning}", file=sys.stderr)
 
     # A sandboxed session's $HOME is read-only, and the first thing a spawned
     # `claude` CLI does is take a lock beside its credential store. Without

@@ -1,46 +1,44 @@
 ---
 name: staircase-modeling-bounded-replay
-description: Load when adding DeepSeek-V4.1's SWA Bounded Replay to a target — `decoder_replay` (the layers after the last KV-source layer run over only the last `window` prompt tokens) or `encoder_replay` (a prefix-cache hit rebuilds sliding-window KV by re-forwarding the last `window` cached tokens). Deliberately not output-identical, and gated by a work witness, because a unit that implements nothing passes accuracy too.
+description: Load when adding sliding-window (SWA) bounded replay to a target — `decoder_replay` (the layers after the last KV-source layer run over only the last `window` prompt tokens) or `encoder_replay` (a prefix-cache hit rebuilds sliding-window KV by re-forwarding the last `window` cached tokens). Deliberately not output-identical, and gated by a work witness, because a unit that implements nothing passes accuracy too.
 ---
 
 # staircase-modeling-bounded-replay
 
-`--features decoder_replay` and `--features encoder_replay`. Both come from
-DeepSeek-V4.1-Flash's tech report (§3.2.2, "SWA Bounded Replay"), where the
-model is a **Causal Encoder-Decoder**: layers 0-19 are the "encoder", layers
-20-39 the "decoder", and decoder global KV is projected from the encoder's
-final hidden state rather than from each decoder layer's own. "Encoder" here
-is those causal layers — **never the vision tower** — and "replay" is neither
-CUDA-graph replay nor recurrent-state replay.
+`--features decoder_replay` and `--features encoder_replay`. Both belong to a
+model that keeps two kinds of KV, global (often compressed) KV and
+sliding-window (SWA) KV, and that was post-trained to tolerate truncated SWA
+state. Such a model may be a **causal encoder-decoder**: the first block of
+layers is the "encoder", the rest the "decoder", and decoder global KV is
+projected from the encoder's final hidden state rather than from each decoder
+layer's own. "Encoder" here is those causal layers — **never the vision
+tower** — and "replay" is neither CUDA-graph replay nor recurrent-state
+replay. The checkpoint's tech report says whether it was trained for either
+feature; quote it in the plan.
 
-## The definitions, verbatim
+## The definitions
 
-TR §3.2.2:
+**Bounded replay** replays only the most recent `n_win` tokens and truncates
+SWA to the replay segment, accepting approximate states: for a replay starting
+at position `r`, a query at position `i` attends to SWA keys in
+`[max(r, i - n_win + 1), i]`.
 
-> "SWA Bounded Replay instead replays only the most recent n_win tokens and
-> truncates SWA to the replay segment, accepting approximate states: for a
-> replay starting at position r, a query at position i attends to SWA keys in
-> [max(r, i−n_win+1), i]."
+**Encoder bounded replay** makes prefix caching depend only on global KV, so
+SWA KV can leave the persistent cache. On a prefix hit the last `n_win` cached
+tokens are replayed together with the uncached suffix. The replayed tokens
+regenerate only SWA KV, reusing the cached global KV without recomputing or
+overwriting it; the uncached suffix generates both. The replayed prefix state
+is approximate by design.
 
-> "**Encoder SWA Bounded Replay** makes prefix caching depend only on global
-> KV, allowing SWA KV to be removed from the persistent KV cache. When the
-> encoder SWA KV is missing, we replay the last n_win tokens of the cached
-> prefix and process them together with the uncached suffix. The replayed
-> tokens regenerate only SWA KV, reusing the cached global KV without
-> recomputation or overwriting, while the uncached suffix generates both
-> global KV and SWA KV. By design, the replayed prefix state is approximate…"
+**Decoder bounded replay** bounds the decoder's forward pass to `n_win`
+tokens. Decoder global KV comes from the encoder's output, so the only thing
+standing between prefill and stopping at the encoder is decoder SWA KV: at
+every prefill the last `n_win` prompt tokens' encoder outputs run through the
+decoder layers under the same SWA truncation, and the decoder SWA KV that
+produces serves decoding only, never prefix caching. Not mathematically
+equivalent to the full computation; the training simulated it.
 
-> "**Decoder SWA Bounded Replay** bounds the decoder forward pass to n_win
-> tokens, nearly halving total prefill computation. Under CED, decoder global
-> KV is projected from the final encoder hidden states. The only obstacle to
-> ending prefill at the encoder is decoder SWA KV … at every prefill, we
-> replay the last n_win tokens of the prompt, feed their encoder outputs
-> through the decoder layers under the same SWA truncation, and use the
-> resulting decoder SWA KV only for decoding, not for prefix caching. … not
-> mathematically equivalent … we additionally simulate the same replay during
-> post-training for train-aware adaptation."
-
-`n_win` is the checkpoint's sliding window: 128 for DeepSeek-V4.1.
+`n_win` is the checkpoint's sliding window, read from its config.
 
 ## The property that shapes the gates
 
@@ -61,14 +59,13 @@ declared before assembly. See **Gates**.
 
 Target-local: no runtime component, no scheduler change.
 
-- **Which layers are bounded.** The ones after the last KV-source layer
-  (`kv_source_layer_ids` in the config; its last entry is 20 on
-  DeepSeek-V4.1). The boundary is a decision, not a fact: the tech report's
-  decoder starts at layer 20, while SGLang's implementation computes
-  `late_layer_start = max(kv_source_layer_ids) + 1` and runs layer 20 over
-  every prompt token, because layer 20's compressor is what produces the
-  decoder's global KV. Pick one, say why, and record it — the plan's open
-  risks carry it.
+- **Which layers are bounded.** The decoder's: for example the layers after
+  the last KV-source layer (the last entry of a `kv_source_layer_ids` config
+  key). The boundary is a decision, not a fact. A tech report may start the
+  decoder *at* the last KV-source layer, while an implementation may start it
+  one layer later and run that layer over every prompt token, because its
+  compressor is what produces the decoder's global KV. Pick one, say why, and
+  record it — the plan's open risks carry it.
 - **Context phase.** Every layer up to the boundary — including the last
   KV-source layer's compressor and index-K projection — runs over all prompt
   tokens. The bounded layers run over only the last `min(N, window)` prompt
@@ -84,15 +81,15 @@ Target-local: no runtime component, no scheduler change.
   accuracy.
 - **What it cannot return.** The bounded layers never computed rows before the
   tail, so prompt logprobs, context logits and full hidden-state capture do
-  not exist under this feature. SGLang refuses them; the target must fail fast
-  rather than return rows it did not compute.
+  not exist under this feature. The target must fail fast rather than return
+  rows it did not compute.
 - The decoder SWA KV the replay produces serves decoding only — it is not
   something prefix caching may reuse.
 
-SGLang's help text for its flag states the contract compactly: "after the last
-kv_source layer, run the remaining layers over only the last window_size
-tokens of a prefill. Main and indexer KV stay exact; nothing is replayed.
-Deterministic for a fixed prompt and chunk size."
+The contract, compactly: after the last KV-source layer, run the remaining
+layers over only the last `window` tokens of a prefill. Main and indexer KV
+stay exact; nothing is replayed. Deterministic for a fixed prompt and chunk
+size.
 
 ## encoder_replay — runtime and target, and the runtime half is new
 
@@ -107,8 +104,8 @@ Deterministic for a fixed prompt and chunk size."
 
 An odd boundary on a ratio-2 layer splits a compressed pair: one half is
 cached and the other was never computed, and the result is a quietly wrong
-global entry rather than an error. SGLang refuses the combination; the witness
-checks it when the spec declares `reuse_alignment: 2`.
+global entry rather than an error. Refuse the combination in the runtime; the
+witness checks it when the spec declares `reuse_alignment`.
 
 **TRT has none of the runtime half today.** `DeepseekV4CacheManager` in
 `tensorrt_llm/_torch/attention/backends/sparse/deepseek_v4/cache_manager.py`
@@ -118,16 +115,15 @@ cannot own the scheduler, so name that work in the plan as runtime work, with
 its owner — a target that fakes it by re-forwarding the whole prefix on a hit
 is exactly what the witness's accounting check catches.
 
-SGLang's implementation (branch `origin/dsv4.1`,
-`python/sglang/srt/model_executor/encoder_swa_replay.py`) is the reference for
-the mechanics: it re-runs the cached tokens `[end - window, end)` through the
-layers with the compressor skipped, keeps SWA in a per-request ring, and
-charges at most `window` replay tokens per request to the scheduler.
+Where another engine already implements it, read that for the mechanics and
+name it in the plan. The shape is: re-run the cached tokens
+`[end - window, end)` through the layers with the compressor skipped, keep SWA
+in a per-request ring, and charge at most `window` replay tokens per request
+to the scheduler.
 
 ## Interaction rules, and saying which combinations work
 
-From SGLang's argument checks for this model
-(`python/sglang/srt/arg_groups/deepseek_v4_hook.py`, branch `origin/dsv4.1`):
+Combinations a published implementation of these features refuses:
 
 | feature | refused together with |
 |---|---|
@@ -159,7 +155,7 @@ boot → accuracy → **replay witness**, all under `TRTLLM_MODELING_V2=require`
 
 **The switch.** Each feature is turned off by an environment variable the
 target reads at construction — for example
-`TRTLLM_DSV41_DECODER_SWA_BOUNDED_REPLAY=0` — and the spec names it as the
+`MYMODEL_DECODER_REPLAY=0` — and the spec names it as the
 witness's `contrast_env`. Off must mean the full computation, not an error:
 the witness runs both.
 
@@ -213,14 +209,14 @@ features: [decoder_replay, encoder_replay]
 accuracy:
   witness:
     decoder_replay:
-      contrast_env: {TRTLLM_DSV41_DECODER_SWA_BOUNDED_REPLAY: "0"}
-      window: 128
+      contrast_env: {MYMODEL_DECODER_REPLAY: "0"}
+      window: 128                # the checkpoint's sliding window
       prompt_tokens: 4096        # > window; at most 16384
     encoder_replay:
-      contrast_env: {TRTLLM_DSV41_ENCODER_SWA_BOUNDED_REPLAY: "0"}
+      contrast_env: {MYMODEL_ENCODER_REPLAY: "0"}
       window: 128
       prefix_tokens: 4096        # > window; at most 16384
-      reuse_alignment: 2         # the compress ratio
+      reuse_alignment: 2         # e.g. the compress ratio
 ```
 
 `runtime.max_seq_len` (through `extra_flags`) must admit the longest witness

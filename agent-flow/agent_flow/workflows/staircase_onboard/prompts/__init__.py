@@ -136,6 +136,10 @@ DEFAULT_PROMPTS = PromptBundle(
 )
 
 
+#: Where the orchestrator snapshots the composed prompts inside the workspace.
+PROMPTS_DIRNAME = "prompts"
+
+
 def build_staircase_onboard_prompts(
     *,
     environment: "RunEnvironment | None" = None,
@@ -193,6 +197,7 @@ __all__ = [
     "DEFAULT_PROMPTS",
     "PLAN_DRAFTER_SYSTEM_PROMPT",
     "PLAN_REVIEWER_SYSTEM_PROMPT",
+    "PROMPTS_DIRNAME",
     "PromptBundle",
     "REVIEWER_FULL_EXTENSION",
     "REVIEWER_SYSTEM_PROMPT",

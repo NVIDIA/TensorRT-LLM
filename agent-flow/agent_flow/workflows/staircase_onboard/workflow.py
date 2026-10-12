@@ -40,8 +40,6 @@ import yaml
 from rich.markup import escape as escape_markup
 
 from agent_flow import (
-    CLAUDE_CODE_DEFAULT_MODEL,
-    CODEX_DEFAULT_MODEL,
     AgentLayer,
     AgentLayerConfig,
     BackendConfig,
@@ -50,6 +48,7 @@ from agent_flow import (
 )
 from agent_flow.console import print_message, print_rule
 from agent_flow.logger import get_logger
+from agent_flow.prompts import dump_prompt_bundle
 from agent_flow.runtime import CommandExecutor, TurnExecutor, TurnRequest
 
 from . import envelope as envelope_mod
@@ -89,7 +88,8 @@ from .progress import (
     latest_entry,
     mark_decision_dispatch,
 )
-from .prompts import PromptBundle, build_staircase_onboard_prompts
+from .prompts import PROMPTS_DIRNAME, PromptBundle, build_staircase_onboard_prompts
+from .roles import resolve_role_agent
 from .runtime import (
     areas_for_demands,
     format_areas,
@@ -134,12 +134,6 @@ from .vocabulary import (
     load_vocabulary,
     needed_by,
 )
-
-# Which backend each role runs on. The PlanReviewer is deliberately not the
-# same model as the PlanDrafter — a reviewer that shares the author's blind
-# spots reviews its own reasoning back at itself. Every other role needs the
-# skill system, which is a Claude Code feature.
-_CODEX_ROLES = frozenset({"plan_reviewer"})
 
 #: The role that submits a command to a scheduler the orchestrator cannot
 #: reach. It is the only one that returns no typed decision, because it makes
@@ -477,8 +471,9 @@ class StaircaseOnboardWorkflow:
         required_tools: list[str],
         session_mode: str = "stateless",
     ) -> AgentLayer:
-        backend_kind = "codex" if name in _CODEX_ROLES else "claude-code"
-        model = CODEX_DEFAULT_MODEL if name in _CODEX_ROLES else CLAUDE_CODE_DEFAULT_MODEL
+        # Backend, model and reasoning effort come from `task.yaml`'s `agents`
+        # block, over the defaults in `roles.py`.
+        agent = resolve_role_agent(self.task_data, name)
         # Under an enterprise MCP configuration the in-process tool server
         # cannot be registered at all, so the role reports by writing a file
         # and the Stop hook requires the write rather than the tool. `Write`
@@ -491,15 +486,25 @@ class StaircaseOnboardWorkflow:
         hooks = _compose_required_tools_hooks(
             (["Write"] if self._decision_files else required_tools) if required_tools else []
         )
+        layer_required: tuple[str, ...] = ()
+        if agent.backend == "codex":
+            # Codex refuses per-client Claude SDK hooks, so the requirement
+            # moves to the layer's backend-neutral policy. A decision that
+            # travels as a file has no tool to require on Codex, which writes
+            # files with its own tools; the file is validated when it is read.
+            hooks = None
+            layer_required = () if self._decision_files else tuple(required_tools)
         return AgentLayer(
             AgentLayerConfig(
                 name=name,
                 system_prompt=system_prompt,
                 backend=BackendConfig(
-                    kind=backend_kind,
-                    model=model,
+                    kind=agent.backend,
+                    model=agent.model,
+                    reasoning_effort=agent.reasoning_effort,
                     tools=tools,
                     hooks=hooks,
+                    extra_mcp_servers=agent.extra_mcp_servers,
                     # The workspace is the session cwd so the run's own
                     # materialized skills are the ones the agent discovers,
                     # rather than whatever happens to be configured in the
@@ -507,6 +512,7 @@ class StaircaseOnboardWorkflow:
                     cwd=self.workspace,
                 ),
                 session=SessionConfig(mode=session_mode),
+                required_tools=layer_required,
             )
         )
 
@@ -534,11 +540,14 @@ class StaircaseOnboardWorkflow:
         rather than the executor -- ten smiths are ten agents, not ten turns
         of one. `bound` is a no-op for transports with no session concept.
         """
+        agent = resolve_role_agent(self.task_data, role)
         request = TurnRequest(
             role=role,
             what=what,
             prompt=prompt,
             system_prompt=getattr(self.prompts, role, "") if self.prompts else "",
+            backend=agent.backend,
+            model=agent.model,
             decision_file=(
                 str(decision_path(self.workspace, role, iteration))
                 if self._decision_files and iteration is not None
@@ -784,6 +793,10 @@ class StaircaseOnboardWorkflow:
                 decision_files=self._decision_files,
                 commit_script=str(commit_script),
             )
+        # What every role is told, verbatim and per launch: the composition
+        # depends on the resolved environment and the spec, so it otherwise
+        # exists only in this process's memory.
+        dump_prompt_bundle(self.prompts, self.workspace / PROMPTS_DIRNAME)
         # Written here, from what preflight has just resolved, so that the
         # first agent turn of the run already has them. Both files are
         # referenced by `_context_block`, which every dispatch carries.

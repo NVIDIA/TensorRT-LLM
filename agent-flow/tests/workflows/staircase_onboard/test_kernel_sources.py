@@ -70,11 +70,11 @@ def test_every_registration_file_in_the_tree_is_classified(sources):
     A new `custom_ops/<something>_custom_ops.py` lands and nothing tells an
     agent what kind of kernel it holds. This fails when that happens.
     """
-    known = {Path(path).stem for source in sources.values() for path in source.registers}
     unclassified = sorted(
         py.stem
         for py in CUSTOM_OPS.glob("*.py")
-        if py.stem not in known and py.stem not in NOT_A_SOURCE
+        if py.stem not in NOT_A_SOURCE
+        and source_for_stem(py.stem, sources, text=py.read_text(encoding="utf-8")) is None
     )
     assert not unclassified, (
         "custom_ops files no kernel source claims --- an agent meeting an op "
@@ -104,8 +104,10 @@ def test_attribution_resolves_real_catalog_ops_to_real_sources(sources):
         pytest.skip("catalog index not present")
 
     registrations = {}
+    texts = {}
     for py in sorted(CUSTOM_OPS.glob("*.py")):
-        for name in re.findall(r'"trtllm::([a-zA-Z0-9_]+)', py.read_text(encoding="utf-8")):
+        texts[py.stem] = py.read_text(encoding="utf-8")
+        for name in re.findall(r'"trtllm::([a-zA-Z0-9_]+)', texts[py.stem]):
             registrations.setdefault(name, py.stem)
 
     entries = yaml.safe_load(index.read_text(encoding="utf-8"))["entries"]
@@ -121,11 +123,64 @@ def test_attribution_resolves_real_catalog_ops_to_real_sources(sources):
         stem = registrations.get(op, "cpp_thop")
         if stem in NOT_A_SOURCE:
             continue  # a registration mechanism; provenance is elsewhere
-        if source_for_stem(stem, sources) is None:
+        if source_for_stem(stem, sources, text=texts.get(stem)) is None:
             unresolved.append(f"{op} (registered by {stem})")
     assert not unresolved, "catalog ops whose provenance cannot be resolved:\n  " + "\n  ".join(
         unresolved
     )
+
+
+_TRITON_OP_FILE = """
+import torch
+import triton
+
+
+@triton.jit
+def _kernel(x_ptr):
+    pass
+
+
+@torch.library.custom_op("trtllm::new_triton_op", mutates_args=())
+def new_triton_op(x: torch.Tensor) -> torch.Tensor:
+    return x
+"""
+
+
+def test_a_triton_custom_op_file_no_path_names_is_claimed_by_content(sources):
+    """A model's onboarding adds these one op at a time, under names nobody predicted.
+
+    Naming each in the registry made every such addition fail this suite
+    until the registry was edited to match the model's tree.
+    """
+    source = source_for_stem("new_triton_op", sources, text=_TRITON_OP_FILE)
+    assert source is not None and source.name == "triton_custom_op"
+
+
+def test_a_file_with_only_one_marker_is_not_claimed(sources):
+    plain_op = _TRITON_OP_FILE.replace("@triton.jit", "")
+    assert source_for_stem("new_plain_op", sources, text=plain_op) is None
+
+
+def test_a_named_path_wins_over_content(sources):
+    """Content is the fallback for unnamed files, never a reclassification."""
+    source = source_for_stem("cute_dsl_custom_ops", sources, text=_TRITON_OP_FILE)
+    assert source.name == "cute_dsl"
+
+
+def test_the_rendered_block_names_the_content_markers(sources):
+    rendered = sources["triton_custom_op"].render()
+    assert "`@triton.jit` and `torch.library.custom_op`" in rendered
+
+
+def test_schema_rejects_content_markers_that_are_not_strings(tmp_path):
+    bad = tmp_path / "k.yaml"
+    bad.write_text(
+        "x:\n  summary: s\n  tier: 1\n  availability: a b c d e\n  certifying: a b c d e\n"
+        "  registers: [a.py]\n  claims_files_containing: [1]\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(RuntimeIndexError, match="claims_files_containing"):
+        load_kernel_sources(bad)
 
 
 def test_the_cpp_plane_is_the_conclusion_for_an_unclaimed_op(sources):
