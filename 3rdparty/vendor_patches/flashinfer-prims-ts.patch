@@ -1,5 +1,14 @@
+diff --git a/_q_token_kv_block_sparse_policy.py b/_q_token_kv_block_sparse_policy.py
+index a0ea3425aab7a23e26b7292eaaf7f5fb772621e8..45f495c955d878625fd88e13cd86212fd85f3e1b 100644
+--- a/_q_token_kv_block_sparse_policy.py
++++ b/_q_token_kv_block_sparse_policy.py
+@@ -1,3 +1,4 @@
++# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+ # Copyright (c) 2026 by FlashInfer team.
+ # Licensed under the Apache License, Version 2.0 (the "License");
+ # you may not use this file except in compliance with the License.
 diff --git a/block_sparse.py b/block_sparse.py
-index c7e881ca73dfb95314da532912db39fe7b05eb94..e19dc7b1de7fca03c44b8e98217f8d10fb17e26b 100644
+index d4652b8b68958ee3dab29d062a7cd082ea604c47..bb56724e986d302854722bf33962bea063f9e6e4 100644
 --- a/block_sparse.py
 +++ b/block_sparse.py
 @@ -1,3 +1,4 @@
@@ -7,70 +16,79 @@ index c7e881ca73dfb95314da532912db39fe7b05eb94..e19dc7b1de7fca03c44b8e98217f8d10
  # Copyright (c) 2026 by FlashInfer team.
  #
  # Licensed under the Apache License, Version 2.0 (the "License");
-@@ -35,12 +36,6 @@ from typing import Literal
+@@ -36,13 +37,7 @@ from typing import Literal
+ 
  import torch
  
- from flashinfer.api_logging import flashinfer_api
+-from flashinfer.api_logging import flashinfer_experimental_api
 -from flashinfer.trace.templates.attention import (
 -    prims_ts_block_sparse_trace_dispatch,
 -    prims_ts_block_sparse_wrapper_trace_dispatch,
 -    prims_ts_paged_block_sparse_trace_dispatch,
 -    prims_ts_paged_block_sparse_wrapper_trace_dispatch,
 -)
++from flashinfer.api_logging import flashinfer_api as flashinfer_experimental_api
  
- from ._block_sparse.common import _validate_contiguous_route_mode
- from ._block_sparse.config import _validate_block_sparse_static_profile
-@@ -239,7 +234,7 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
+ from ._block_sparse.common import (
+     _num_sparse_pattern_heads,
+@@ -301,7 +296,7 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
          # previously published revision intact and runnable.
          self._plan_state = candidate
  
--    @flashinfer_api(trace=prims_ts_block_sparse_wrapper_trace_dispatch)
-+    @flashinfer_api
+-    @flashinfer_experimental_api(trace=prims_ts_block_sparse_wrapper_trace_dispatch)
++    @flashinfer_experimental_api
      def run(
          self,
          q: torch.Tensor,
-@@ -361,7 +356,7 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
+@@ -433,7 +428,7 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
          return self._launch_validated_run(state, run_args, run_stream)
  
  
--@flashinfer_api(trace=prims_ts_block_sparse_trace_dispatch)
-+@flashinfer_api
+-@flashinfer_experimental_api(trace=prims_ts_block_sparse_trace_dispatch)
++@flashinfer_experimental_api
  def block_sparse_attention(
      q: torch.Tensor,
      k: torch.Tensor,
-@@ -607,7 +602,7 @@ class BlockSparsePagedTSWrapper(_BlockSparseWrapperBase):
+@@ -726,9 +721,7 @@ class BlockSparsePagedTSWrapper(_BlockSparseWrapperBase):
              )
          self._plan_state = candidate
  
--    @flashinfer_api(trace=prims_ts_paged_block_sparse_wrapper_trace_dispatch)
-+    @flashinfer_api
+-    @flashinfer_experimental_api(
+-        trace=prims_ts_paged_block_sparse_wrapper_trace_dispatch
+-    )
++    @flashinfer_experimental_api
      def run(
          self,
          q: torch.Tensor,
-@@ -727,7 +722,7 @@ class BlockSparsePagedTSWrapper(_BlockSparseWrapperBase):
+@@ -850,7 +843,7 @@ class BlockSparsePagedTSWrapper(_BlockSparseWrapperBase):
          return self._launch_validated_run(state, run_args, run_stream)
  
  
--@flashinfer_api(trace=prims_ts_paged_block_sparse_trace_dispatch)
-+@flashinfer_api
+-@flashinfer_experimental_api(trace=prims_ts_paged_block_sparse_trace_dispatch)
++@flashinfer_experimental_api
  def block_sparse_attention_with_paged_kv_cache(
      q: torch.Tensor,
      paged_kv_cache: PagedKVCache,
 diff --git a/context.py b/context.py
-index 4ada42762c38c1c7215d2dfbe4582926fd8f9701..678432780332b20a78fb553405ad1e29d692b430 100644
+index dd9a29c3e36111a0de9a57c487068b6b5caa4ea2..a8a337373ad1607ca12ac12b2bb3117e485704d8 100644
 --- a/context.py
 +++ b/context.py
-@@ -31,8 +31,7 @@ position is ``q + (S_kv - S_q)`` and ``window_left`` is measured from that
- position.
+@@ -1,4 +1,5 @@
+ # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
++# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+ # Copyright (c) 2026 by FlashInfer team.
+ #
+ # Licensed under the Apache License, Version 2.0 (the "License");
+@@ -46,7 +47,7 @@ from typing import TYPE_CHECKING, Callable, Literal, Optional
  
- PrimTS context entry points are intentionally excluded from ``fi_trace`` for
--now; unlike the decode APIs, their ``@flashinfer_api`` decorators do not
--register trace templates.
-+now; their ``@flashinfer_api`` decorators do not register trace templates.
- """
+ import torch
  
- from dataclasses import dataclass
-@@ -438,7 +437,7 @@ def _validate_device(device: torch.device) -> int:
+-from flashinfer.api_logging import flashinfer_experimental_api
++from flashinfer.api_logging import flashinfer_api as flashinfer_experimental_api
+ 
+ 
+ if TYPE_CHECKING:
+@@ -488,7 +489,7 @@ def _validate_device(device: torch.device) -> int:
      # Rubin runs through the sm_100f family target; a CuTe DSL older than 4.8
      # cannot emit for it unless CUTE_DSL_ARCH=sm_100f is set before import.
      if capability == (10, 7):
@@ -80,7 +98,7 @@ index 4ada42762c38c1c7215d2dfbe4582926fd8f9701..678432780332b20a78fb553405ad1e29
          require_cute_dsl_arch(device_index)
      return device_index
 diff --git a/decode.py b/decode.py
-index b47093bd298ea9b5514e6b25ad2a34a47ac3bff0..35236fcc7ce98bdee1f51f72dbd1f841cdbce7b2 100644
+index 41479a386d72c27eb0df76107318dc09256aff06..3fcec5efdc2a3825be0dc1d9a238aaaa6d76a609 100644
 --- a/decode.py
 +++ b/decode.py
 @@ -1,3 +1,4 @@
@@ -88,19 +106,20 @@ index b47093bd298ea9b5514e6b25ad2a34a47ac3bff0..35236fcc7ce98bdee1f51f72dbd1f841
  # Copyright (c) 2026 by FlashInfer team.
  #
  # Licensed under the Apache License, Version 2.0 (the "License");
-@@ -25,11 +26,6 @@ from typing import TYPE_CHECKING, Literal, Optional, Union
+@@ -24,11 +25,7 @@ from typing import TYPE_CHECKING, Literal, NamedTuple, Optional, Union, cast
+ 
  import torch
  
- from flashinfer.api_logging import flashinfer_api
+-from flashinfer.api_logging import flashinfer_experimental_api
 -from flashinfer.trace.templates.attention import (
 -    attention_ts_decode_trace_dispatch,
--    prims_ts_decode_trace_dispatch,
 -    prims_ts_decode_wrapper_trace_dispatch,
 -)
++from flashinfer.api_logging import flashinfer_api as flashinfer_experimental_api
  
- from ._tensor_aliasing import (
-     _validate_out_does_not_overlap_inputs,
-@@ -702,7 +698,7 @@ def _validate_runtime_device(device: torch.device) -> int:
+ from . import _q_token_kv_block_sparse_policy as _sparse_policy
+ from ._block_sparse.common import _num_sparse_pattern_heads
+@@ -789,7 +786,7 @@ def _validate_runtime_device(device: torch.device) -> None:
      # Rubin runs through the sm_100f family target; a CuTe DSL older than 4.8
      # cannot emit for it unless CUTE_DSL_ARCH=sm_100f is set before import.
      if capability == (10, 7):
@@ -108,36 +127,72 @@ index b47093bd298ea9b5514e6b25ad2a34a47ac3bff0..35236fcc7ce98bdee1f51f72dbd1f841
 +        from flashinfer.cute_dsl.utils import require_cute_dsl_arch
  
          require_cute_dsl_arch(device_index)
-     return device_index
-@@ -2145,7 +2141,7 @@ def _validate_decode_run_metadata_values(
-                 )
  
- 
--@flashinfer_api(trace=prims_ts_decode_trace_dispatch)
-+@flashinfer_api
- def prims_ts_batch_decode_with_kv_cache(
-     query: torch.Tensor,
-     kv_cache: PagedKVCache,
-@@ -2708,7 +2704,7 @@ class BatchDecodePagedTSWrapper:
+@@ -4046,7 +4043,7 @@ class BatchDecodePagedTSWrapper:
          # previous complete plan revision usable.
          self._plan_state = candidate
  
--    @flashinfer_api(trace=prims_ts_decode_wrapper_trace_dispatch)
-+    @flashinfer_api
+-    @flashinfer_experimental_api(trace=prims_ts_decode_wrapper_trace_dispatch)
++    @flashinfer_experimental_api
      def run(
          self,
          q: torch.Tensor,
-@@ -2893,7 +2889,7 @@ class BatchDecodePagedTSWrapper:
+@@ -4228,7 +4225,7 @@ class BatchDecodePagedTSWrapper:
          )
  
  
--@flashinfer_api(trace=attention_ts_decode_trace_dispatch)
-+@flashinfer_api
+-@flashinfer_experimental_api(trace=attention_ts_decode_trace_dispatch)
++@flashinfer_experimental_api
  def batch_decode_with_paged_kv_cache(
      q: torch.Tensor,
      paged_kv_cache: PagedKVCache,
+diff --git a/kernels/fmha_decode/direct_sparse_metadata.py b/kernels/fmha_decode/direct_sparse_metadata.py
+index 8bffb076c4a3ef56bc9e463733066abcaf0a7725..15d6f271029540de1e76633e1a81cd78bc553729 100644
+--- a/kernels/fmha_decode/direct_sparse_metadata.py
++++ b/kernels/fmha_decode/direct_sparse_metadata.py
+@@ -1,3 +1,4 @@
++# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+ # Copyright (c) 2026 by FlashInfer team.
+ # Licensed under the Apache License, Version 2.0 (the "License");
+ # you may not use this file except in compliance with the License.
+diff --git a/kernels/fmha_decode/fmha_decode_resources/sage_scales.py b/kernels/fmha_decode/fmha_decode_resources/sage_scales.py
+index f2df9bbeafcbdf22e67f9a754d06144b8e3a1dab..4d862f9fa1f1be3e8830a7bbc502e0369237f0d4 100644
+--- a/kernels/fmha_decode/fmha_decode_resources/sage_scales.py
++++ b/kernels/fmha_decode/fmha_decode_resources/sage_scales.py
+@@ -1,3 +1,4 @@
++# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+ # Copyright (c) 2026 by FlashInfer team.
+ #
+ # Licensed under the Apache License, Version 2.0 (the "License");
+diff --git a/kernels/fmha_decode/fmha_decode_resources/smem_transformed_kv.py b/kernels/fmha_decode/fmha_decode_resources/smem_transformed_kv.py
+index 184326c482f21ecb1a81f8ba337a996f9ab2bea8..148ebcae6b7431985bb91c02e7fa6d5ddfe69253 100644
+--- a/kernels/fmha_decode/fmha_decode_resources/smem_transformed_kv.py
++++ b/kernels/fmha_decode/fmha_decode_resources/smem_transformed_kv.py
+@@ -1,3 +1,4 @@
++# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+ # Copyright (c) 2026 by FlashInfer team.
+ #
+ # Licensed under the Apache License, Version 2.0 (the "License");
+diff --git a/kernels/fmha_decode/fmha_decode_resources/tmem_transformed_kv.py b/kernels/fmha_decode/fmha_decode_resources/tmem_transformed_kv.py
+index 18f2c272cf5c1e089193a8a5437560f45cbbbb8e..1d607a92e63df03c04465a9c7836422088c13d49 100644
+--- a/kernels/fmha_decode/fmha_decode_resources/tmem_transformed_kv.py
++++ b/kernels/fmha_decode/fmha_decode_resources/tmem_transformed_kv.py
+@@ -1,3 +1,4 @@
++# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+ # Copyright (c) 2026 by FlashInfer team.
+ #
+ # Licensed under the Apache License, Version 2.0 (the "License");
+diff --git a/kernels/task_compat.py b/kernels/task_compat.py
+index 80a80102c3ecf6a856d441c0dac2ca5c8215ad82..69f60317b172457e7fda347a3b935ae67dbdd892 100644
+--- a/kernels/task_compat.py
++++ b/kernels/task_compat.py
+@@ -1,3 +1,4 @@
++# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+ # Copyright (c) 2026 by FlashInfer team.
+ #
+ # Licensed under the Apache License, Version 2.0 (the "License");
 diff --git a/mla_decode.py b/mla_decode.py
-index 8b7f19d1cc2baab6309018d46213f509c44d919a..cff2ee7d2ad051c8061ad396b87ee973eebed788 100644
+index 41ba3b9055d229d227ac10cfc6f7d0f403eae69f..6d69ae7b554afe1502f4c369e5ddc805847b876c 100644
 --- a/mla_decode.py
 +++ b/mla_decode.py
 @@ -1,3 +1,4 @@
@@ -145,20 +200,73 @@ index 8b7f19d1cc2baab6309018d46213f509c44d919a..cff2ee7d2ad051c8061ad396b87ee973
  # Copyright (c) 2026 by FlashInfer team.
  #
  # Licensed under the Apache License, Version 2.0 (the "License");
-@@ -25,7 +26,6 @@ from flashinfer.api_logging import flashinfer_api
- from flashinfer.trace.templates.attention import (
-     prims_ts_decode_mla_one_shot_trace_dispatch,
-     prims_ts_decode_mla_trace_dispatch,
--    prims_ts_decode_mla_wrapper_trace_dispatch,
- )
+@@ -21,11 +22,7 @@ from typing import Any, Literal, Optional, cast
  
- from ._tensor_aliasing import (
-@@ -1799,7 +1799,7 @@ class BatchMLADecodePagedTSWrapper:
+ import torch
+ 
+-from flashinfer.api_logging import flashinfer_experimental_api
+-from flashinfer.trace.templates.attention import (
+-    prims_ts_decode_mla_one_shot_trace_dispatch,
+-    prims_ts_decode_mla_wrapper_trace_dispatch,
+-)
++from flashinfer.api_logging import flashinfer_api as flashinfer_experimental_api
+ 
+ from .decode import (
+     _WorkspaceSection,
+@@ -1576,7 +1573,7 @@ class BatchMLADecodePagedTSWrapper:
              split_kv=int(dict(policy)["split_kv"]),
          )
  
--    @flashinfer_api(trace=prims_ts_decode_mla_wrapper_trace_dispatch)
-+    @flashinfer_api
+-    @flashinfer_experimental_api(trace=prims_ts_decode_mla_wrapper_trace_dispatch)
++    @flashinfer_experimental_api
      def run(
          self,
          query: torch.Tensor,
+@@ -1681,7 +1678,7 @@ class BatchMLADecodePagedTSWrapper:
+         )
+ 
+ 
+-@flashinfer_experimental_api(trace=prims_ts_decode_mla_one_shot_trace_dispatch)
++@flashinfer_experimental_api
+ def batch_mla_decode_with_paged_kv_cache(
+     query: torch.Tensor,
+     kv_cache: torch.Tensor,
+diff --git a/q_token_kv_block_sparse_metadata.py b/q_token_kv_block_sparse_metadata.py
+index 35efc60b7ff3dac6af1c5c5e46631712a171fb72..0c5cf40dbd4e4708b8f74bfa698f3c0788f9f3a4 100644
+--- a/q_token_kv_block_sparse_metadata.py
++++ b/q_token_kv_block_sparse_metadata.py
+@@ -1,3 +1,4 @@
++# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+ # Copyright (c) 2026 by FlashInfer team.
+ #
+ # Licensed under the Apache License, Version 2.0 (the "License");
+@@ -40,9 +41,9 @@ from dataclasses import dataclass
+ from typing import Any, Literal, Optional
+ 
+ import torch
+-from flashinfer.api_logging import flashinfer_experimental_api
++from flashinfer.api_logging import flashinfer_api as flashinfer_experimental_api
+ 
+-from ...utils import device_support_pdl
++from flashinfer.utils import device_support_pdl
+ from ._block_sparse.common import _num_sparse_pattern_heads
+ 
+ _Q_TOKEN_KV_BLOCK_SPARSE_MIN_BLOCK_SIZE = 4
+@@ -62,7 +63,7 @@ _Q_TOKEN_KV_BLOCK_SPARSE_WORKSPACE_ALIGNMENT = 256
+ def _get_prims_ts_q_token_kv_block_sparse_metadata_module() -> Any:
+     """Build and cache the CUDA C++ QToken-KvBlock-Sparse-Attention metadata implementation."""
+ 
+-    from ...jit import gen_prims_ts_q_token_kv_block_sparse_metadata_module
++    from flashinfer.jit import gen_prims_ts_q_token_kv_block_sparse_metadata_module
+ 
+     return gen_prims_ts_q_token_kv_block_sparse_metadata_module().build_and_load()
+ 
+diff --git a/sage.py b/sage.py
+index 97708c79525ba840e4ebfd11876084eae952254d..dcf0d4ae05a0d1358cfa796a3e23dbe098fbab10 100644
+--- a/sage.py
++++ b/sage.py
+@@ -1,3 +1,4 @@
++# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+ # Copyright (c) 2026 by FlashInfer team.
+ #
+ # Licensed under the Apache License, Version 2.0 (the "License");

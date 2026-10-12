@@ -16,7 +16,7 @@
 import math
 from dataclasses import replace
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, create_autospec
 
 import pytest
 import torch
@@ -947,7 +947,7 @@ def test_context_wrapper_plans_once_and_reads_live_fixed_metadata(
         )
     )
     context_postprocess = Mock()
-    wrapper = Mock()
+    wrapper = create_autospec(prims_context_module.BatchPrefillPagedTSWrapper, instance=True)
     wrapper_factory = Mock(return_value=wrapper)
     monkeypatch.setattr(
         prims_ts_module.thop,
@@ -1034,7 +1034,8 @@ def test_context_wrapper_plans_once_and_reads_live_fixed_metadata(
         "num_kv_heads": attn.num_kv_heads,
         "head_dim": attn.head_dim,
         "q_dtype": torch.bfloat16,
-        "kv_dtype": torch.bfloat16,
+        "k_dtype": torch.bfloat16,
+        "v_dtype": torch.bfloat16,
         "out_dtype": torch.bfloat16,
         "page_size": 32,
         "mask_type": "causal",

@@ -14,12 +14,24 @@
 
 """Dependency-neutral semantic contract for PrimTS block-sparse attention."""
 
+from collections.abc import Iterable
+
 _FINE_KV_BLOCK_SIZES = (8, 16, 32)
 _PREPARED_KV_ROUTE_SIZE = 128
 _MAX_KV_ATOM_SIZE = 64
 _SIGNED_INT32_MAX = (1 << 31) - 1
 _BLOCK_SPARSE_Q_TILE_SIZES = (8, 16, 32, 64, 128)
 _BLOCK_SPARSE_MAX_HEADS_Q_PER_KV = 32
+
+
+def _num_sparse_pattern_heads(
+    num_kv_heads: int, share_pattern_across_kv_heads: bool
+) -> int:
+    """Return metadata head count without changing physical KV-head geometry.
+
+    The caller resolves its API's pattern-sharing default before calling.
+    """
+    return 1 if share_pattern_across_kv_heads else num_kv_heads
 
 
 def _validate_contiguous_route_mode(
@@ -34,6 +46,19 @@ def _validate_contiguous_route_mode(
         raise ValueError("sparse_format must be 'bsr' or 'bitmask'")
     if type(use_proxy_routes) is not bool:
         raise TypeError("use_proxy_routes must be a bool")
+
+
+def _validate_dense_contiguous_plan_inputs(
+    inputs: Iterable[tuple[str, object, object]],
+) -> None:
+    """Reject block-sparse-only inputs given to a dense contiguous plan.
+
+    Each entry is ``(name, value, unused value)``.
+    """
+
+    for name, value, unused in inputs:
+        if value != unused:
+            raise ValueError(f"{name} is unsupported by a dense contiguous plan")
 
 
 def _validate_sparse_q_block_size(value: object) -> int:
