@@ -118,13 +118,13 @@ The fifth stage is different in kind. After a request ends, its KV is kept acros
 
 ### Architecture Overview
 
-The framework has three well-defined parts that together form KV cache compression in TensorRT LLM.
+The framework has three parts, shown in Figure 4:
 
-- **Compression config.** One configuration block collects everything the user asks for, validates it, and routes it to the concrete method. A factory then builds that method's manager before the model runs.
-- **Compression manager base.** This base class is the core of the framework: it defines where in the runtime compression is injected. For a method that works between decode steps, such as TriAttention, the base provides the ability to run after every decode step. For a method that works on pages leaving the GPU, such as cold-page compression, the base hooks into the KV cache manager and adds compression to offloading and onboarding. A concrete method inherits the base and is injected at the matching points automatically.
-- **Method-specific kernels.** Each method brings its own kernels that compress and decompress the KV cache. The architecture lets a method define a new series of such kernels, optimize them, and fuse them with neighboring kernels, for example with the copy that moves a page off the GPU.
+- **Compression config**: one block that selects the method and carries its options; a factory builds the method from it before the model runs.
+- **Compression manager**: the class a method inherits. It already sits at every hook in the executor loop and in the cache manager's page migration; a method overrides the functions for the stages it needs and the compression flow is in place.
+- **Method-specific kernels**: each method brings its own compress and decompress kernels, which can be fused with neighboring work such as the copy that moves a page off the GPU.
 
-The executor and the KV cache manager are existing components of TensorRT LLM. The framework does not replace them. It interacts with them at the insertion points and leaves scheduling and memory ownership where they are.
+The executor and the KV cache manager are existing components. The framework does not replace them; it meets them at the hooks and leaves scheduling and memory ownership where they are.
 
 <div align="center">
 <figure>
@@ -133,9 +133,7 @@ The executor and the KV cache manager are existing components of TensorRT LLM. T
 </div>
 <p align="center"><sub><em>Figure 4: The KV cache compression framework and its execution order. The config builds the manager (1). The manager base inserts a hook into the executor and one into the KV cache manager (2). The concrete method inherits the base and runs inside those hooks (3), launching its own kernels (4). Highlighted boxes are the framework parts; white boxes are existing system components, with the stages each one hosts today and in the future.</em></sub></p>
 
-Figure 4 introduces the whole framework and how it follows the lifetime of a KV cache. The framework interacts with different parts of the TensorRT LLM runtime so that compression can be injected at the five stages defined above. The executor iteration loop hosts the stages inside a request: the prefill-chunk, after-prefill, and decode stages (stages 1 to 3). The KV cache manager hosts the stages beyond a single request: the tool-call and after-request stages (stages 4 and 5), when the KV cache is kept and managed across requests.
-
-Some of these stages have a method today and some do not. The decode stage (stage 3) is implemented by TriAttention. The after-request stage (stage 5) is implemented in part by cold-page compression, which handles the pages that leave the GPU for host or disk memory. The rest of this section walks through the framework in detail: how a user configures it and which cache manager it works with, how each path works, and how the other stages will be covered.
+The executor loop hosts the stages inside a request (1 to 3); the cache manager hosts the stages beyond it (4 and 5). Today TriAttention implements the decode stage (3) and cold-page compression the offload part of the after-request stage (5). The rest of this section walks through the configuration, the two paths, and the stages still open.
 
 ### Configuration and Integration with the Cache Manager
 
