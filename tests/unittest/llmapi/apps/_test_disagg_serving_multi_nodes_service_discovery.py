@@ -111,6 +111,10 @@ def worker(model_name: str, disagg_cluster_config: dict):
             "enable_block_reuse": False,
         },
         "disable_overlap_scheduler": True,
+        # Qwen3.5 reserves recurrent state for max_batch_size * pp_size
+        # sequences up front; the defaults do not fit on 80 GB GPUs.
+        "max_batch_size": 128,
+        "max_seq_len": 8192,
     }
     # start workers on 0.0.0.0:<free_port>, then the workers should be able to
     # report their correct hostname:port to the disagg server

@@ -103,11 +103,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.torch.view_dtype impo
 from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._torch.models.modeling_utils import (
-    DecoderModel,
-    DecoderModelForCausalLM,
-    register_auto_model,
-)
+from tensorrt_llm._torch.models.modeling_utils import DecoderModel, DecoderModelForCausalLM
 from tensorrt_llm._torch.speculative import get_spec_worker
 
 from . import weights as _weights
@@ -2022,7 +2018,6 @@ class DraftModel:
         return self.core.w["embed"]
 
 
-@register_auto_model("ModelingV2DeepseekR10528Nvfp4Sm103Dep4")
 class ModelingV2DeepseekR10528Nvfp4Sm103Dep4(
     DecoderModelForCausalLM[ModelingV2Core, PretrainedConfig]
 ):

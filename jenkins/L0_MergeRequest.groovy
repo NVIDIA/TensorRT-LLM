@@ -2301,7 +2301,9 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
         "OSS-Compliance-Check": {
             script {
                 stage("[OSS-Compliance-Check] Run") {
-                    if (!testFilter[(OSS_COMPLIANCE_FILE_CHANGED)]) {
+                    // Nightly releases always scan; merge requests scan only when compliance files change.
+                    def isNightlyRelease = runMode == "nightly_release"
+                    if (!isNightlyRelease && !testFilter[(OSS_COMPLIANCE_FILE_CHANGED)]) {
                         echo "Skipping OSS Compliance Check: no OSS compliance-related files changed."
                         jUtils.markStageSkippedForConditional(STAGE_NAME)
                         return
@@ -2326,7 +2328,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                             string(name: 'forkOwner', value: ''),
                             string(name: 'postMergePipelineName', value: ''),
                             string(name: 'postMergeBuildNumber', value: ''),
-                            string(name: 'scanMode', value: 'pre_merge'),
+                            string(name: 'scanMode', value: isNightlyRelease ? 'release' : 'pre_merge'),
                             string(name: 'runSourceCodeScanning', value: 'true'),
                             string(name: 'runContainerScanning', value: 'false'),
                             string(name: 'runSonarQube', value: 'false'),
@@ -2337,7 +2339,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                             parameters: params,
                             propagate: false
                         )
-                        if (handle.result == "UNSTABLE") {
+                        if (handle.result == "UNSTABLE" && !isNightlyRelease) {
                             logger.log("OSS Compliance Check downstream job is UNSTABLE, ignoring")
                         } else if (handle.result != "SUCCESS") {
                             error "Downstream job did not succeed"
@@ -2345,6 +2347,9 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                     } catch (InterruptedException e) {
                         throw e
                     } catch (Exception e) {
+                        if (isNightlyRelease) {
+                            throw e
+                        }
                         catchError(buildResult: 'Failure', stageResult: 'Failure') {
                             error "OSS Compliance Check failed: ${e.getMessage()}, please rerun."
                         }
@@ -2907,7 +2912,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                             string(
                                 name: 'scanMode',
                                 value: runMode == "nightly_release" ? 'release' : 'pre_merge'),
-                            string(name: 'runSourceCodeScanning', value: runMode == "nightly_release" ? 'true' : 'false'),
+                            string(name: 'runSourceCodeScanning', value: 'false'),
                             string(name: 'runContainerScanning', value: 'true'),
                             string(name: 'runSonarQube', value: 'false'),
                         ]
@@ -2944,8 +2949,6 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
     if (runMode == "nightly_release") {
         testFilter[TEST_STAGE_LIST] = null
         testFilter[EXTRA_STAGE_LIST] = null
-        stages.remove("Release-Check")
-        stages.remove("OSS-Compliance-Check")
         if (!wheelSelected) {
             stages.remove("x86_64-Linux")
             stages.remove("SBSA-Linux")

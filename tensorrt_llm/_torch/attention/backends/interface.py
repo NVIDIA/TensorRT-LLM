@@ -165,6 +165,14 @@ class AttentionMetadata:
     # The number of tokens in each rank.
     all_rank_num_tokens: Optional[List[int]] = None
 
+    def get_adp_token_counts(self) -> List[int]:
+        """Local execution-stage counts carried by the input count exchange."""
+        return [self.num_tokens]
+
+    def set_adp_token_counts(self, counts: List[List[int]]) -> List[int]:
+        """Save stage counts and return the input-stage counts for padding."""
+        return counts[0]
+
     # These fields are set when changing seq_lens and _num_contexts to avoid computation
     # during execution. If the calculation happens during execution, torch compile treats it
     # as DDS and fails to compile.
@@ -468,6 +476,7 @@ class AttentionMetadata:
         self,
         helix_position_offsets: List[int],
         helix_is_inactive_rank: List[bool],
+        helix_owned_new_tokens: Optional[List[int]] = None,
     ) -> None:
         """
         Hook to be called when using helix parallelism.
@@ -1120,6 +1129,24 @@ class AttentionBackend(Generic[TMetadata]):
         that prefix.
         """
         return True
+
+    @classmethod
+    def runtime_workspace_fixed_bytes(
+        cls,
+        model_config: "ModelConfig",
+        mapping: Mapping,
+        *,
+        max_batch_size: int,
+        max_num_tokens: int,
+        max_seq_len: int,
+        enable_cuda_graph: bool,
+    ) -> int:
+        """Capacity-sized workspace not bounded by summed attended KV length.
+
+        The estimator reserves the full capacity alongside the profiled peak,
+        covering arenas first allocated after the peak prefill step.
+        """
+        return 0
 
     def create_output(self, q: torch.Tensor, **kwargs) -> List[torch.Tensor]:
         """

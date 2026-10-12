@@ -13,33 +13,43 @@ instead of shared abstractions. The one-to-one correspondence between
 
 ## Using it
 
-```bash
-export TRTLLM_MODELING_V2=require        # off | auto | require
+```python
+LLM(model, modeling_v2="require")        # off | auto | require
 ```
 
-| `TRTLLM_MODELING_V2` | Behaviour |
+```yaml
+# trtllm-serve --config serve.yaml
+modeling_v2: require
+```
+
+| `modeling_v2` | Behaviour |
 |---|---|
-| unset or `off` (default) | The resolver returns immediately. Nothing in this package is imported and behaviour is byte-for-byte what it is today. |
-| `auto` | Uses a target when one matches this exact configuration; falls back to the built-in implementation when none does. |
-| `require` | Raises instead of falling back, naming the criterion that did not match. |
+| `off` (default) | The resolver returns immediately. Nothing beyond it is imported and behaviour is byte-for-byte what it is today. |
+| `auto` | Uses a target when one claims this exact configuration; falls back to the built-in implementation otherwise, logging why. |
+| `require` | Raises instead of falling back, saying which criterion did not hold. |
+
+It is an LLM API argument rather than an environment variable so that it
+reaches every rank the way the rest of the arguments do; a variable set after
+MPI initialized reached the driver and not the workers, and a driver building
+a target while its workers build the built-in is exactly the split `require`
+exists to catch.
+
+The decision is one function, `route`, in the family's `routing.py`. It reads
+the facts that fix which code runs -- the checkpoint's config shape, the
+parallel mapping, the GPU's compute capability and the speculative-decoding
+config -- and either returns a target class or raises `NoTarget` with the
+reason in words. Tuning knobs such as `max_batch_size`, `max_num_tokens` and CUDA graph
+settings are not routing inputs: they do not change which code runs, so a
+target claims a configuration regardless of them. `require` therefore promises
+that the target ran, not that a particular knob setting was measured. The model
+loader decides when it is about to build the model, after the built-in model's
+defaults have been applied to the arguments, and carries the answer on
+`ModelConfig.modeling_v2_target`.
 
 **Use `require` for anything you will attribute to modeling_v2.** Under `auto`,
 a configuration that misses a target's criteria silently gets the built-in
 implementation — and a performance curve measured that way reads as
 modeling_v2's. That is the single most expensive mistake available here.
-
-**Export it before the ranks start**, not merely before `LLM(...)`. Worker
-ranks receive the environment as it stood when MPI initialized, and long-lived
-ranks under `trtllm-llmapi-launch` receive it once at launch, so a value set
-later reaches the driver and not them -- and a driver resolving a target while
-its workers resolve the built-in is the silent split this package exists to
-prevent.
-
-An environment variable rather than an LLM-API field is a deliberate trade: it
-keeps the entire concept inside this package, so the only change modeling_v2
-needs anywhere else is the `_resolve_class` hook. The cost is that the switch
-does not appear in a run's recorded `llm.args` and cannot be set through
-`--extra_llm_api_options`.
 
 The predecessor `MODELING_V2_TARGET` is gone. It named a *target*; this names
 only a mode, and routing picks the target from the configuration.
@@ -50,29 +60,27 @@ The checkpoint is read exactly as published, with no target-owned
 ## How a config finds its target
 
 ```
-LLM(model=...)  ->  ModelLoader  ->  AutoModelForCausalLM._resolve_class
+LLM(model=..., modeling_v2=...)  ->  ModelLoader
+                                        |  model defaults applied to llm_args
                                         |
-                                        +-- modeling_v2_resolve(config)
+                                        +-- modeling_v2_resolve(config, llm_args)
                                               |
                     _router_index.py          +-- architectures[0] -> routing module
-                    models/<x>/routing.py     +-- one forward-reading decision tree
-                                              +-- returns a synthetic class name
+                    models/<x>/routing.py     +-- route(config, mapping, compute_capability,
+                                              |         spec_config) -> target class, or NoTarget
                                         |
-                                     get_registered_model_class(name)
+                                     config.modeling_v2_target = class
+                                        |
+                    AutoModelForCausalLM._resolve_class(config)
+                                        |
+                                     returns that class; the registry is not consulted
 ```
 
-The synthetic name (`ModelingV2GptOss120bSm103Tp1`) is a registry key that no
-checkpoint declares. Upstream already does exactly this for `EAGLE3<Arch>`,
-which also exists only as a `_resolve_class` rewrite.
+`route` imports the target class on the branch that returns it, so a routing
+module that declines never loads modeling code, and the class a reader sees
+returned is the class that runs -- no name to look up elsewhere.
 
-To ask why a configuration landed where it did:
-
-```
-python -m tensorrt_llm._torch._experimental.modeling_v2.explain \
-    --model /path/to/DeepSeek-R1-0528-NVFP4 --tp 4 --ep 4 --attention-dp
-```
-
-### What may decide a target
+## What may decide a target
 
 A quantity may be a routing criterion only if it is known when
 `_resolve_class` runs **and** constant for the engine's life — and only if it
@@ -97,7 +105,6 @@ checkpoint of the same shape is ungated.
 
 ```
 _router_index.py    architectures[0] -> routing module. Small, stable, test-guarded.
-explain.py          why a configuration routed where it did
 models/<family>/
   routing.py        one forward-reading decision tree per architecture family
   <checkpoint>__<gpu arch>__<parallel>/
@@ -112,7 +119,7 @@ The third piece of a catalog entry, its GPU test, lives in the tests tree:
 
 ```
 tests/unittest/_torch/modeling_v2/
-  test_modeling_v2_claims.py     routing tables vs the targets they name (no GPU)
+  test_modeling_v2_claims.py     routing modules vs the target directories they import (no GPU)
   test_modeling_v2_routing.py    what modeling_v2_resolve does (no GPU)
   <category>/test_modeling_v2_<entry>.py
   comm/_<entry>_op_matrix.py   the two collectives' 4-rank rank bodies
@@ -140,15 +147,10 @@ carries the same triple; `test_modeling_v2_claims.py` asserts they agree.
 
 ### Why beside `_torch/models/`, not inside it
 
-Two upstream mechanisms, and together they are the worst combination —
-inheriting the built-in constraints without inheriting the built-in guards:
-
-* `is_builtin_zoo_module` matches on the zoo's package prefix. Inside it,
-  modeling_v2 registrations would count as built-in and only fill *empty*
-  registry slots. Outside it they are external and always win their slot.
-* `test_lazy_model_zoo.py`'s scan of the zoo directory is **non-recursive**,
-  so decorators in a subpackage are invisible to it — putting synthetic names
-  in the built-in static index would fail its staleness assertion.
+Targets are not registered in the model zoo: `route` returns the class and the
+loader builds it. Inside `_torch/models/` they would still be swept up by the
+zoo's own guards -- `test_lazy_model_zoo.py` scans that directory and expects
+every modeling module there to appear in the built-in static index.
 
 Conceptually `models/` means "one architecture, one class, shared across
 checkpoints", which is the opposite of what this package is for.
@@ -156,13 +158,13 @@ checkpoints", which is the opposite of what this package is for.
 ## Gates
 
 1. **Boot** — minutes, binary. `examples/llm-api/quickstart_advanced.py` with
-   the target's topology flags and `TRTLLM_MODELING_V2=require` exported. Engine
+   the target's topology flags and `modeling_v2=require` passed. Engine
    cold start, weight-manifest coverage, a handful of greedy continuations.
    Catches catastrophes, not accuracy. A variant that changes the forward gets
    its own minutes-scale gate on the same footing.
 2. **Accuracy** — the release criterion. `trtllm-eval` with the protocol from
-   `tests/integration/defs/accuracy/references/` and `TRTLLM_MODELING_V2=require`
-   exported. One-sided: measured >= reference − tol. This is the gate CI runs,
+   `tests/integration/defs/accuracy/references/` and `modeling_v2=require`
+   passed. One-sided: measured >= reference − tol. This is the gate CI runs,
    in the accuracy suite's modeling_v2 files.
 3. **Acceptance** — required whenever a variant is distribution-preserving by
    construction, speculative decoding above all. Rejection sampling holds the
@@ -170,7 +172,7 @@ checkpoints", which is the opposite of what this package is for.
    produces correct text more slowly: boot passes, accuracy passes, only
    speed moves. The detector is `acceptance_length` against the same
    checkpoint under stock in-tree modeling at the same workload and the same
-   `speculative_config` — i.e. `TRTLLM_MODELING_V2=off` versus `=require`,
+   `speculative_config` — i.e. `modeling_v2=off` versus `=require`,
    which is now one variable rather than two harnesses.
 
 Compare a variant against an identity run **in the same session**: one target
@@ -209,7 +211,7 @@ tolerance, and each is written up in its own contract:
   by the op, not certified here).
 
 **gpt-oss-120b / sm_103 / tp1 is gated on GB300.** Both gates pass with
-`TRTLLM_MODELING_V2=require` in force, which is what rules out the built-in
+`modeling_v2=require` in force, which is what rules out the built-in
 implementation having been measured instead:
 
 | Gate | Result |

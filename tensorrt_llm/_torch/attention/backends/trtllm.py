@@ -1875,6 +1875,11 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 (latent_dim + nvfp4_gather_aux_bytes_per_compressed_token) /
                 min_compress_ratio)
 
+        if sparse_algorithm == "csa2":
+            from .sparse.csa2.backend import CSA2TrtllmAttention
+            return CSA2TrtllmAttention.runtime_workspace_bytes_per_token(
+                model_config, mapping)
+
         fp8_context_mla = (quant_config is not None
                            and quant_config.quant_mode.has_fp8_kv_cache()
                            and get_sm_version() in (90, 100, 103, 107, 120))
@@ -1911,6 +1916,24 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             ))
 
     @classmethod
+    def runtime_workspace_fixed_bytes(cls, model_config: "ModelConfig",
+                                      mapping: "Mapping", *,
+                                      max_batch_size: int, max_num_tokens: int,
+                                      max_seq_len: int,
+                                      enable_cuda_graph: bool) -> int:
+        if getattr(model_config.sparse_attention_config, "algorithm",
+                   None) != "csa2":
+            return 0
+        from .sparse.csa2.backend import CSA2TrtllmAttention
+        return CSA2TrtllmAttention.runtime_workspace_fixed_bytes(
+            model_config,
+            mapping,
+            max_batch_size=max_batch_size,
+            max_num_tokens=max_num_tokens,
+            max_seq_len=max_seq_len,
+            enable_cuda_graph=enable_cuda_graph)
+
+    @classmethod
     def runtime_workspace_is_chunked_prefill_bounded(
             cls, model_config: "ModelConfig") -> bool:
         """NVFP4 sparse MLA gathers from the complete attended prefix."""
@@ -1921,6 +1944,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         quant_mode = getattr(quant_config, "quant_mode", None)
         sparse_algorithm = getattr(model_config.sparse_attention_config,
                                    "algorithm", None)
+        if sparse_algorithm == "csa2":
+            return False
         return not (quant_mode is not None
                     and getattr(quant_mode, "has_fp4_kv_cache", lambda: False)()
                     and sparse_algorithm in ("dsa", "deepseek_v4")

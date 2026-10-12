@@ -55,6 +55,7 @@ class FakeConnectorManager:
 
     def __init__(self, num_matched=OFFER_TOKENS, load_async=False):
         self.prefix_reservations_enabled = False
+        self.capacity_only = False
         self.reservations = {}
         self.reservation_requests = {}
         self.next_reservation_id = 1

@@ -236,8 +236,8 @@ def _megamoe_problem(quant_algo=QuantAlgo.W4A8_MXFP4_MXFP8) -> MoEProblem:
     return MoEProblem(
         quant=canonical_quant(quant_algo),
         dtype_act=torch.bfloat16,
-        # Both widths are % 512 == 0, which is what the packed-UE8M0 SF rows
-        # need to stay TMA-aligned.
+        # Both widths are % 512 == 0, which is what keeps the packed-UE8M0 SF
+        # records in DeepGEMM's dispatch buffer TMA-aligned.
         hidden_size=1024,
         intermediate_size=1024,
         num_experts=8,

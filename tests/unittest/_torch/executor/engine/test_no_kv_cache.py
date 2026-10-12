@@ -24,6 +24,12 @@ class _AttentionMetadata:
         self.kv_cache_manager = None
         self.prepare = Mock()
 
+    def get_adp_token_counts(self) -> list[int]:
+        return [self.num_tokens]
+
+    def set_adp_token_counts(self, counts: list[list[int]]) -> list[int]:
+        return counts[0]
+
 
 class _AttentionBackend:
     Metadata = _AttentionMetadata

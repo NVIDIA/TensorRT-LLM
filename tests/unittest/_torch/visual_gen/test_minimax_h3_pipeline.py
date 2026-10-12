@@ -29,6 +29,7 @@ from tensorrt_llm._torch.visual_gen.config import (
     DiffusionPipelineConfig,
     discover_pipeline_components,
 )
+from tensorrt_llm._torch.visual_gen.mapping import VisualGenMapping
 from tensorrt_llm._torch.visual_gen.models.minimax_h3 import pipeline_minimax_h3 as h3_pipeline
 from tensorrt_llm._torch.visual_gen.models.minimax_h3.packing import (
     MINIMAX_H3_TEXT_TAG,
@@ -100,6 +101,7 @@ class _SyntheticMiniMaxH3Pipeline(MiniMaxH3Pipeline):
         self.scheduler = MiniMaxH3Scheduler(shift=12.0)
         self.audio_scheduler = MiniMaxH3Scheduler(shift=3.0)
         self._is_warmup = True
+        self._parallel_vae_enabled = False
 
     def _encode_prompt(
         self,
@@ -348,6 +350,8 @@ def test_pipeline_keeps_torch_compile_enabled(
         return SimpleNamespace(
             extra_attrs={},
             mapping=SimpleNamespace(world_size=1),
+            visual_gen_mapping=None,
+            parallel=SimpleNamespace(parallel_vae_size=1),
             attention=SimpleNamespace(backend="VANILLA"),
             cache=None,
             cpu_offload_config=SimpleNamespace(enable=False),
@@ -427,6 +431,8 @@ def test_trtllm_attention_rejects_unvalidated_gpu(
     config = SimpleNamespace(
         extra_attrs={},
         mapping=SimpleNamespace(world_size=1),
+        visual_gen_mapping=None,
+        parallel=SimpleNamespace(parallel_vae_size=1),
         attention=SimpleNamespace(backend="TRTLLM"),
     )
     with pytest.raises(NotImplementedError, match="SM100"):
@@ -444,6 +450,8 @@ def test_trtllm_attention_accepts_supported_gpu(
     config = SimpleNamespace(
         extra_attrs={},
         mapping=SimpleNamespace(world_size=1),
+        visual_gen_mapping=None,
+        parallel=SimpleNamespace(parallel_vae_size=1),
         attention=SimpleNamespace(backend="TRTLLM"),
         cache=None,
         cpu_offload_config=SimpleNamespace(enable=False),
@@ -1105,3 +1113,182 @@ def test_ref2va_native_layout_matches_diffusers(order: tuple[str, ...]) -> None:
     ):
         torch.testing.assert_close(getattr(actual, name), value, rtol=0, atol=0)
     assert (actual.num_condition_video_rows, actual.num_condition_audio_rows) == expected[5:]
+
+
+def _ulysses_pipeline_config(world_size: int = 8) -> SimpleNamespace:
+    return SimpleNamespace(
+        mapping=SimpleNamespace(world_size=1, tp_size=1),
+        parallel=SimpleNamespace(parallel_vae_size=1),
+        visual_gen_mapping=SimpleNamespace(
+            world_size=world_size,
+            cfg_size=1,
+            ulysses_size=world_size,
+            cp_size=1,
+            ring_size=1,
+            attn2d_row_size=1,
+            attn2d_col_size=1,
+        ),
+        attention=SimpleNamespace(backend="VANILLA"),
+        cache=None,
+        cpu_offload_config=SimpleNamespace(enable=False),
+        cuda_graph=SimpleNamespace(enable=False),
+        extra_attrs={},
+    )
+
+
+@pytest.mark.parametrize("world_size", [2, 4, 8])
+def test_pipeline_accepts_pure_ulysses(monkeypatch: pytest.MonkeyPatch, world_size: int) -> None:
+    initialized = []
+
+    def initialize(self, config):
+        torch.nn.Module.__init__(self)
+        initialized.append(config)
+
+    monkeypatch.setattr(h3_pipeline.BasePipeline, "__init__", initialize)
+    config = _ulysses_pipeline_config(world_size)
+    MiniMaxH3Pipeline(config)
+    assert initialized == [config]
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("cfg_size", 2),
+        ("ulysses_size", 4),
+        ("cp_size", 2),
+        ("ring_size", 2),
+        ("attn2d_row_size", 2),
+        ("attn2d_col_size", 2),
+        ("tp_size", 2),
+        ("missing_mapping", True),
+    ],
+)
+def test_pipeline_rejects_unsupported_ulysses_topology(field: str, value: int) -> None:
+    config = _ulysses_pipeline_config()
+    if field == "missing_mapping":
+        config.visual_gen_mapping = None
+        config.mapping.world_size = 8
+    elif field == "tp_size":
+        config.mapping.tp_size = value
+        config.visual_gen_mapping.world_size *= value
+    else:
+        setattr(config.visual_gen_mapping, field, value)
+        if field != "ulysses_size":
+            config.visual_gen_mapping.world_size *= value
+    with pytest.raises(NotImplementedError, match="pure Ulysses"):
+        MiniMaxH3Pipeline(config)
+
+
+@pytest.mark.parametrize("backend", ["TRTLLM", "CUTEDSL"])
+def test_pipeline_rejects_unvalidated_ulysses_attention(backend: str) -> None:
+    config = _ulysses_pipeline_config()
+    config.attention.backend = backend
+    with pytest.raises(NotImplementedError, match="VANILLA"):
+        MiniMaxH3Pipeline(config)
+
+
+@pytest.mark.parametrize("size", [0, 9])
+def test_h3_rejects_out_of_range_vae_groups(size: int) -> None:
+    config = _ulysses_pipeline_config(8)
+    config.parallel.parallel_vae_size = size
+    with pytest.raises(ValueError, match="parallel_vae_size"):
+        MiniMaxH3Pipeline(config)
+
+
+@pytest.mark.parametrize("size", [2, 3, 4])
+@pytest.mark.parametrize("rank", range(4))
+def test_h3_uses_shared_vae_group(monkeypatch: pytest.MonkeyPatch, size: int, rank: int) -> None:
+    pipeline = MiniMaxH3Pipeline.__new__(MiniMaxH3Pipeline)
+    torch.nn.Module.__init__(pipeline)
+    group = object()
+    pipeline.pipeline_config = _ulysses_pipeline_config(4)
+    pipeline.pipeline_config.parallel.parallel_vae_size = size
+    pipeline.pipeline_config.visual_gen_mapping.vae_ranks = list(range(size))
+    pipeline.pipeline_config.visual_gen_mapping.vae_group = group if rank < size else None
+    monkeypatch.setattr(MiniMaxH3Pipeline, "rank", property(lambda self: rank))
+    calls = []
+    pipeline.vae = SimpleNamespace(configure_parallel=lambda group: calls.append(group))
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group: size)
+    pipeline.setup_parallel_vae()
+    assert calls == ([group] if rank < size else [])
+    assert pipeline._parallel_vae_enabled
+
+
+def test_h3_parallel_vae_allows_skipped_vae() -> None:
+    pipeline = MiniMaxH3Pipeline.__new__(MiniMaxH3Pipeline)
+    torch.nn.Module.__init__(pipeline)
+    pipeline.pipeline_config = _ulysses_pipeline_config(2)
+    pipeline.pipeline_config.parallel.parallel_vae_size = 2
+    pipeline.vae = None
+    pipeline._parallel_vae_enabled = False
+    pipeline.setup_parallel_vae()
+    assert not pipeline._parallel_vae_enabled
+
+
+@pytest.mark.parametrize("size", range(1, 9))
+def test_h3_accepts_vae_groups_up_to_ulysses_size(
+    monkeypatch: pytest.MonkeyPatch, size: int
+) -> None:
+    initialized = []
+
+    def initialize(self, config):
+        torch.nn.Module.__init__(self)
+        initialized.append(config)
+
+    monkeypatch.setattr(h3_pipeline.BasePipeline, "__init__", initialize)
+    config = _ulysses_pipeline_config(8)
+    config.parallel.parallel_vae_size = size
+    config.visual_gen_mapping = VisualGenMapping(
+        world_size=8, rank=0, ulysses_size=8, parallel_vae_size=size
+    )
+    config.mapping = config.visual_gen_mapping.to_llm_mapping()
+    assert config.mapping.world_size == 1
+    MiniMaxH3Pipeline(config)
+    assert initialized == [config]
+
+
+@pytest.mark.parametrize("size", [1, 2, 3, 4])
+@pytest.mark.parametrize("rank", range(4))
+def test_h3_forward_decodes_only_on_vae_ranks(
+    monkeypatch: pytest.MonkeyPatch, size: int, rank: int
+) -> None:
+    pipeline = _SyntheticMiniMaxH3Pipeline()
+    pipeline._parallel_vae_enabled = size > 1
+    pipeline.pipeline_config.visual_gen_mapping = VisualGenMapping(
+        world_size=4, rank=rank, ulysses_size=4, parallel_vae_size=size
+    )
+    monkeypatch.setattr(MiniMaxH3Pipeline, "rank", property(lambda self: rank))
+    calls = []
+    video_decode, audio_decode = pipeline._decode_video, pipeline._decode_audio
+
+    def decode_video(*args):
+        calls.append("video")
+        return video_decode(*args)
+
+    def decode_audio(*args):
+        calls.append("audio")
+        return audio_decode(*args)
+
+    monkeypatch.setattr(pipeline, "_decode_video", decode_video)
+    monkeypatch.setattr(pipeline, "_decode_audio", decode_audio)
+    output = pipeline.forward(
+        prompt="a synthetic prompt",
+        seed=42,
+        height=32,
+        width=32,
+        num_frames=124,
+        frame_rate=24.0,
+        num_inference_steps=2,
+    )
+    assert calls == (["video", "audio"] if rank < size else [])
+    assert (output.video is not None) == (rank < size)
+    assert (output.audio is not None) == (rank < size)
+
+
+def test_pipeline_accepts_fa4_ulysses(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        h3_pipeline.BasePipeline, "__init__", lambda self, config: torch.nn.Module.__init__(self)
+    )
+    config = _ulysses_pipeline_config(2)
+    config.attention.backend = "FA4"
+    MiniMaxH3Pipeline(config)

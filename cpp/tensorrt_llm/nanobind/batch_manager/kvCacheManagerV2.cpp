@@ -1397,16 +1397,24 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def_ro("slot_ids", &kv::ScratchDesc::slotIds)
         .def("__bool__", [](kv::ScratchDesc const& self) { return static_cast<bool>(self); });
 
+    nb::enum_<kv::AttentionReusePolicy>(m, "AttentionReusePolicy")
+        .value("REQUIRED", kv::AttentionReusePolicy::REQUIRED)
+        .value("PRIVATE", kv::AttentionReusePolicy::PRIVATE)
+        .value("OPTIONAL", kv::AttentionReusePolicy::OPTIONAL);
+
     nb::class_<kv::AttnLifeCycle>(m, "AttnLifeCycle")
-        .def(nb::init<std::optional<int>, int, bool>(), nb::arg("window_size").none(), nb::arg("num_sink_blocks"),
-            nb::arg("is_sparse") = false)
+        .def(nb::init<std::optional<int>, int, bool, kv::AttentionReusePolicy>(), nb::arg("window_size").none(),
+            nb::arg("num_sink_blocks"), nb::arg("is_sparse") = false,
+            nb::arg("reuse_policy") = kv::AttentionReusePolicy::REQUIRED)
         // Sink tokens round up to whole blocks. Bound rather than repeated in Python so the
         // connector's view of a life cycle is built by the same code as the allocator's.
         .def_static("make", &kv::AttnLifeCycle::make, nb::arg("window_size").none(), nb::arg("num_sink_tokens").none(),
-            nb::arg("tokens_per_block"), nb::arg("is_sparse") = false)
+            nb::arg("tokens_per_block"), nb::arg("is_sparse") = false,
+            nb::arg("reuse_policy") = kv::AttentionReusePolicy::REQUIRED)
         .def_prop_ro("window_size", [](kv::AttnLifeCycle const& self) { return self.windowSize; })
         .def_ro("num_sink_blocks", &kv::AttnLifeCycle::numSinkBlocks)
         .def_ro("is_sparse", &kv::AttnLifeCycle::isSparse)
+        .def_ro("reuse_policy", &kv::AttnLifeCycle::reusePolicy)
         .def("get_stale_range", &kv::AttnLifeCycle::getStaleRange, nb::arg("history_length"),
             nb::arg("tokens_per_block"))
         .def("__eq__", &kv::AttnLifeCycle::operator==);
@@ -1605,13 +1613,15 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def_rw("is_sparse", &kv::BufferConfig::isSparse) DEF_COPY(kv::BufferConfig);
 
     nb::class_<kv::AttentionLayerConfig>(m, "AttentionLayerConfig")
-        .def(nb::init<kv::LayerId, std::vector<kv::BufferConfig>, std::optional<int>, std::optional<int>>(),
+        .def(nb::init<kv::LayerId, std::vector<kv::BufferConfig>, std::optional<int>, std::optional<int>,
+                 kv::AttentionReusePolicy>(),
             nb::arg("layer_id"), nb::arg("buffers"), nb::arg("sliding_window_size") = std::nullopt,
-            nb::arg("num_sink_tokens") = std::nullopt)
+            nb::arg("num_sink_tokens") = std::nullopt, nb::arg("reuse_policy") = kv::AttentionReusePolicy::REQUIRED)
         .def_rw("layer_id", &kv::AttentionLayerConfig::layerId)
         .def_rw("buffers", &kv::AttentionLayerConfig::buffers)
         .def_rw("sliding_window_size", &kv::AttentionLayerConfig::slidingWindowSize)
         .def_rw("num_sink_tokens", &kv::AttentionLayerConfig::numSinkTokens)
+        .def_rw("reuse_policy", &kv::AttentionLayerConfig::reusePolicy)
         .def_prop_ro("window_size", &kv::AttentionLayerConfig::windowSize) DEF_COPY(kv::AttentionLayerConfig);
 
     nb::enum_<kv::LayerType>(m, "LayerType")
@@ -1868,19 +1878,37 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             },
             nb::arg("layer_group_id"));
 
+    nb::class_<kv::ReuseGroupStatus>(m, "ReuseGroupStatus")
+        .def_prop_ro("group_id", [](kv::ReuseGroupStatus const& s) { return s.groupId.value(); })
+        .def_ro("policy", &kv::ReuseGroupStatus::policy)
+        .def_ro("endpoint", &kv::ReuseGroupStatus::endpoint)
+        .def_ro("complete", &kv::ReuseGroupStatus::complete)
+        .def_ro("coverage", &kv::ReuseGroupStatus::coverage);
+
     // ---- KvCache -----------------------------------------------------------
     nb::class_<kv::KvCache>(m, "_KVCache")
         .def(
             "resume",
-            [](kv::KvCache& self, nb::object stream, std::optional<bool> isDecoding)
+            [](kv::KvCache& self, nb::object stream, std::optional<bool> isDecoding,
+                std::optional<std::vector<int>> groups)
             {
                 std::optional<CUstream> optStream;
                 if (!stream.is_none())
                     optStream = reinterpret_cast<CUstream>(nb::cast<intptr_t>(stream));
+                std::optional<std::vector<kv::LifeCycleId>> selected;
+                if (groups)
+                {
+                    selected.emplace();
+                    for (int group : *groups)
+                    {
+                        selected->push_back(kv::LifeCycleId{group});
+                    }
+                }
                 nb::gil_scoped_release rel;
-                return self.resume(optStream, isDecoding);
+                return self.resume(optStream, isDecoding, std::move(selected));
             },
-            nb::arg("cuda_stream") = nb::none(), nb::arg("is_decoding") = nb::none())
+            nb::arg("cuda_stream") = nb::none(), nb::arg("is_decoding") = nb::none(),
+            nb::arg("optional_reuse_groups") = nb::none())
         .def("enter_decode", &kv::KvCache::enterDecode, nb::call_guard<nb::gil_scoped_release>())
         .def_prop_ro("is_decoding", &kv::KvCache::isDecoding)
         .def_prop_ro("page_storage_version", &kv::KvCache::pageStorageVersion, nb::call_guard<nb::gil_scoped_release>())
@@ -2001,6 +2029,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 }
                 return level->value();
             })
+        .def_prop_ro("reuse_status", &kv::KvCache::reuseStatus, nb::rv_policy::copy)
         .def("_get_num_reusable_tokens_before_hybrid_pruning", &kv::KvCache::numReusableTokensBeforeHybridPruning)
         .def("_get_num_reusable_tokens_before_pruning", &kv::KvCache::numReusableTokensBeforePruning)
         // Both setters reach resize(), which takes the exclusive API lock: release the GIL first.
@@ -2257,6 +2286,43 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         nb::arg("kv_cache"), nb::call_guard<nb::gil_scoped_release>());
     mIntrospection.def("committed_page_is_linked", &kv::KvCacheIntrospection::committedPageIsLinked,
         nb::arg("kv_cache"), nb::arg("ordinal"), nb::arg("lc_id"), nb::call_guard<nb::gil_scoped_release>());
+    mIntrospection.def(
+        "drop_optional_pages",
+        [](kv::KvCache& cache, int end, std::optional<std::vector<int>> groups)
+        {
+            if (end <= 0 || end % cache.tokensPerBlock() || end > cache.numCommittedTokens())
+            {
+                throw nb::value_error("Expected a committed, block-aligned checkpoint endpoint");
+            }
+            nb::gil_scoped_release rel;
+            auto const apiLock = cache.manager().lockExclusive();
+            auto const& block = cache.blocks()[kv::BlockOrdinal{end / cache.tokensPerBlock() - 1}].treeBlock;
+            if (block)
+            {
+                for (auto const& [lc, attention] : cache.manager().lifeCycles().attentionLifeCycles())
+                {
+                    if (!attention->allowsCheckpoint()
+                        || (groups && std::find(groups->begin(), groups->end(), lc.value()) == groups->end()))
+                    {
+                        continue;
+                    }
+                    auto* page = block->unlinkPage(lc);
+                    if (!page)
+                    {
+                        continue;
+                    }
+                    if (block->eventSink)
+                    {
+                        block->eventSink->addRemovedLifeCycle(block->key, lc);
+                    }
+                    if (page->status() == kv::PageStatus::DROPPABLE && page->scheduledForEviction())
+                    {
+                        page->manager->excludeFromEviction(*page);
+                    }
+                }
+            }
+        },
+        nb::arg("kv_cache"), nb::arg("end"), nb::arg("groups") = nb::none());
     mIntrospection.def("all_tree_pages_droppable", &kv::KvCacheIntrospection::allTreePagesDroppable, nb::arg("manager"),
         nb::call_guard<nb::gil_scoped_release>());
     mIntrospection.def(

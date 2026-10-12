@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import pytest
 import torch
 from utils.llm_data import llm_models_root
@@ -342,7 +345,6 @@ def _run_nemotron_h_prefill_backend(backend: PrefillCudaGraphBackend,
         # logits, so the first-step distribution must be read from the first
         # streamed response, before the stream moves on.
         next(decoding)
-        decoding_first_step_logprobs = _first_step_logprobs(decoding)
         admitted = llm.generate_async([_BCG_PROMPT_TOKEN] * 65,
                                       sampling_params=SamplingParams(
                                           max_tokens=4,
@@ -351,6 +353,9 @@ def _run_nemotron_h_prefill_backend(backend: PrefillCudaGraphBackend,
                                           return_generation_logits=True,
                                           return_perf_metrics=True),
                                       streaming=False)
+        # Submit before the CPU logits conversion so it cannot delay admission.
+        # The first response stays current until the next stream consumption.
+        decoding_first_step_logprobs = _first_step_logprobs(decoding)
         decoding_out = decoding.result()
         admitted_out = admitted.result()
         _assert_mixed_batch_overlap(decoding_out, admitted_out)

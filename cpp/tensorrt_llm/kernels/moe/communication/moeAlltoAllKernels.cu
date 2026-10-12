@@ -192,6 +192,12 @@ int64_t moeA2AGetTimeoutCycles(bool is_warmup)
         __VA_ARGS__;                                                                                                   \
         break;                                                                                                         \
     }                                                                                                                  \
+    case 3:                                                                                                            \
+    {                                                                                                                  \
+        constexpr int TOP_K = 3;                                                                                       \
+        __VA_ARGS__;                                                                                                   \
+        break;                                                                                                         \
+    }                                                                                                                  \
     case 2:                                                                                                            \
     {                                                                                                                  \
         constexpr int TOP_K = 2;                                                                                       \
@@ -1369,7 +1375,6 @@ __device__ void vectorized_combine_impl(OutputT* dst_typed_base, int size_per_to
 #pragma unroll
         for (int k = 0; k < TOP_K; ++k)
         {
-            int target_rank = ptrs.topk_target_ranks[local_token_idx * TOP_K + k];
             int dst_idx = ptrs.topk_send_indices[local_token_idx * TOP_K + k];
             if (dst_idx < 0)
             {

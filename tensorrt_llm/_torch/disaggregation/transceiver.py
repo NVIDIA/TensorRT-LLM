@@ -536,7 +536,16 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         tpb = adapter.tokens_per_block
         assert self._page_table is not None
         layer_groups = self._page_table.layer_groups
-        prompt_blocks = (req.prompt_len + tpb - 1) // tpb
+        remote_tail_start = getattr(req, "py_csa2_remote_tail_start", None)
+        transfer_len = remote_tail_start if remote_tail_start is not None else req.prompt_len
+        prompt_blocks = (transfer_len + tpb - 1) // tpb
+        remote_tail_split = getattr(req, "py_csa2_remote_tail_split", None)
+        excluded_pool_views = set()
+        if remote_tail_split is not None:
+            exclude = getattr(self._kv_cache_manager, "remote_tail_excluded_pool_views", None)
+            if exclude is None:
+                raise ValueError("remote-tail replay requires a CSA2 cache manager")
+            excluded_pool_views = exclude(self._page_table, remote_tail_split)
 
         is_gen_only = req.is_generation_only_request
         cached_per_lg = (
@@ -563,8 +572,9 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         return Chunk(
             block_ids_per_layer_groups=groups,
             kind_per_layer_group=kinds,
-            token_range=TokenRange(start=0, end=req.prompt_len),
+            token_range=TokenRange(start=0, end=transfer_len),
             is_last=True,
+            excluded_pool_views=excluded_pool_views,
         )
 
     @staticmethod
@@ -607,7 +617,9 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             if n == 0:
                 continue
             lg = pt.layer_groups[lg_id]
-            for pv in lg.pool_views:
+            for pool_idx, pv in enumerate(lg.pool_views):
+                if (lg_id, pool_idx) in chunk.excluded_pool_views:
+                    continue
                 # The view's byte regions within one slot (all of its layers).
                 view_bytes = get_pool_view_slot_bytes(pv)
                 if lg.kind == CacheKind.STATE:
@@ -1040,6 +1052,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 kind_per_layer_group=whole.kind_per_layer_group,
                 token_range=TokenRange(start=chunk_start * tpb, end=chunk_end_token),
                 is_last=is_last_chunk,
+                excluded_pool_views=whole.excluded_pool_views,
             ),
         )
 
@@ -1469,7 +1482,9 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         get_history = getattr(self._kv_cache_manager, "get_history_length", None)
         if get_history is None:
             return
-        prompt_len = getattr(req, "prompt_len", None)
+        prompt_len = getattr(req, "py_csa2_remote_tail_start", None)
+        if prompt_len is None:
+            prompt_len = getattr(req, "prompt_len", None)
         if not prompt_len or prompt_len <= 0:
             return
         history = get_history(req)

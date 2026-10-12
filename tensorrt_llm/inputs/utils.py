@@ -43,6 +43,7 @@ from tensorrt_llm.llmapi.llm_utils import ModelLoader
 from tensorrt_llm.tokenizer import TokenizerBase, TransformersTokenizer
 from tensorrt_llm.tokenizer.deepseek_v4 import DeepseekV4Tokenizer
 from tensorrt_llm.tokenizer.deepseek_v32 import DeepseekV32Tokenizer
+from tensorrt_llm.tokenizer.deepseek_v41 import DeepseekV41Tokenizer
 
 logger = logging.get_logger(__name__)
 
@@ -759,8 +760,25 @@ def apply_chat_template(
     - STRING: keeps flattened text with pre-inserted placeholders
     """
 
+    if isinstance(tokenizer, DeepseekV41Tokenizer):
+        # The native renderer deep-copies messages; omit pending media coroutines
+        # and retain flattened content with its interleaved image placeholders.
+        messages = [{
+            key: value
+            for key, value in message.items()
+            if key not in ("media", "content_parts")
+        } for message in conversation]
+        native_kwargs = dict(chat_template_kwargs or {})
+        native_kwargs.update(tokenize=enable_tokenize,
+                             add_generation_prompt=add_generation_prompt)
+        return tokenizer.apply_chat_template(messages=messages,
+                                             tools=tools,
+                                             **native_kwargs)
+
     # Handle DeepSeek tokenizers with custom chat templates.
-    if isinstance(tokenizer, (DeepseekV32Tokenizer, DeepseekV4Tokenizer)):
+    if isinstance(
+            tokenizer,
+        (DeepseekV32Tokenizer, DeepseekV4Tokenizer, DeepseekV41Tokenizer)):
         prompt = tokenizer.apply_chat_template(
             messages=conversation,
             tools=tools,
