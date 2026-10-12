@@ -53,9 +53,9 @@ async def _produce(address: str, count: int, request_seen: bool = True) -> None:
 
 def _scenario(case: str, directory: str) -> None:
     root = Path(directory)
-    # Shorten the producer deadline, but retain real sockets and finite linger.
-    asynchronous._ITERATION_LOG_DRAIN_TIMEOUT_SEC = 0.5
     if case in ("dead_small", "dead_full", "no_requests"):
+        # Keep missing-consumer cases fast while retaining real sockets.
+        asynchronous._ITERATION_LOG_DRAIN_TIMEOUT_SEC = 0.5
         count = 2000 if case == "dead_full" else 5
         if case == "no_requests":
             with patch.object(asynchronous.logger, "warning") as warning:
@@ -123,6 +123,7 @@ def _scenario(case: str, directory: str) -> None:
             with processes.IterationWriter(root).capture():
                 pytest.fail("invalid path entered benchmark body")
     elif case == "shared_context":
+        asynchronous._ITERATION_LOG_DRAIN_TIMEOUT_SEC = 0.5
 
         async def check() -> None:
             context = zmq.asyncio.Context.instance()
