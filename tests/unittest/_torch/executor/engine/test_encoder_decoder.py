@@ -4,7 +4,7 @@
 from contextlib import nullcontext
 from dataclasses import dataclass
 from types import SimpleNamespace
-from unittest.mock import Mock, call, patch
+from unittest.mock import ANY, Mock, call, patch
 
 import pytest
 import torch
@@ -17,6 +17,7 @@ from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.dummy_requests import
 from tensorrt_llm._torch.pyexecutor.engine.runners.encoder import EncoderPreparedInputs
 from tensorrt_llm._torch.pyexecutor.engine.runners.encoder_decoder import (
     CrossAttentionInputs,
+    EncoderDecoderInputPreparer,
     EncoderDecoderRunner,
     EncoderStage,
 )
@@ -192,12 +193,25 @@ def test_encoder_decoder_runner_builds_stage_before_decoder() -> None:
     shapes = frozenset({(1, 16)})
 
     order = Mock()
+    decoder_state = SimpleNamespace(
+        _config=config,
+        sparse_attention_config=None,
+        _inputs=object(),
+        _buffers=object(),
+        iter_states={},
+    )
+
+    def decoder_init(self, *args, **kwargs) -> None:
+        order.decoder(*args, **kwargs)
+        vars(self).update(vars(decoder_state))
+
     with (
         patch.object(encoder_decoder_module, "EncoderStage") as stage_type,
-        patch.object(DecoderRunner, "__init__", return_value=None) as decoder_init,
+        patch.object(encoder_decoder_module, "EncoderDecoderInputPreparer") as preparer_type,
+        patch.object(DecoderRunner, "__init__", decoder_init),
     ):
         order.attach_mock(stage_type, "stage")
-        order.attach_mock(decoder_init, "decoder")
+        order.attach_mock(preparer_type, "inputs")
         stage_type.return_value._encoder_graph_shapes = shapes
         runner = EncoderDecoderRunner(
             model,
@@ -221,7 +235,18 @@ def test_encoder_decoder_runner_builds_stage_before_decoder() -> None:
             moe_load_balancer=None,
             input_processor=input_processor,
         ),
+        call.inputs(
+            config,
+            mapping,
+            model,
+            None,
+            decoder_state._inputs,
+            decoder_state._buffers,
+            decoder_state.iter_states,
+            uses_lora=ANY,
+        ),
     ]
+    assert runner._encoder_decoder_inputs is preparer_type.return_value
 
 
 def test_encoder_decoder_runner_releases_stage_before_decoder_graphs() -> None:
@@ -444,8 +469,8 @@ def test_mixed_warmup_request_orders_context_generation_and_longest_rows() -> No
 
 
 def test_cross_attention_inputs_project_context_and_repeat_generation_rows() -> None:
-    runner = Mock()
-    inputs = CrossAttentionInputs(runner)
+    preparer = Mock()
+    inputs = CrossAttentionInputs(preparer)
     encoder_output = torch.zeros(3, 2)
     inputs.add_context_request(
         SimpleNamespace(
@@ -472,12 +497,12 @@ def test_cross_attention_inputs_project_context_and_repeat_generation_rows() -> 
 
     built = inputs.build(attn_metadata, resource_manager)
 
-    assert built is runner._prepare_enc_dec_cross_attn_inputs.return_value
-    runner._prepare_enc_dec_cross_attn_inputs.assert_called_once_with(
+    assert built is preparer.prepare_cross_attention.return_value
+    preparer.prepare_cross_attention.assert_called_once_with(
         [encoder_output], [3, 0, 0, 0, 0], [0, 4, 6, 5, 5], attn_metadata, resource_manager
     )
     with pytest.raises(RuntimeError, match="has no encoder output"):
-        CrossAttentionInputs(runner).add_context_request(
+        CrossAttentionInputs(preparer).add_context_request(
             SimpleNamespace(
                 py_request_id=5, encoder_output_len=3, py_skip_cross_kv_projection=False
             )
@@ -496,13 +521,13 @@ def test_cross_attention_inputs_project_context_and_repeat_generation_rows() -> 
 def test_input_fast_path_clears_staged_request_ids_when_not_taken(
     promoted_context_request_ids: frozenset[int], eligible: bool, taken: bool
 ) -> None:
-    runner = object.__new__(EncoderDecoderRunner)
+    preparer = object.__new__(EncoderDecoderInputPreparer)
     staged_request_ids = object()
-    runner._encoder_decoder_staged_request_ids = staged_request_ids
-    runner._can_use_encoder_decoder_input_fast_path = Mock(return_value=eligible)
-    runner._prepare_encoder_decoder_inputs_fast = Mock()
+    preparer._staged_request_ids = staged_request_ids
+    preparer._can_use_fast_path = Mock(return_value=eligible)
+    preparer._prepare_fast = Mock()
 
-    result = runner._prepare_inputs_fast_path(
+    result = preparer.prepare_fast_path(
         ScheduledRequests(),
         Mock(),
         object.__new__(TrtllmAttentionMetadata),
@@ -514,9 +539,9 @@ def test_input_fast_path_clears_staged_request_ids_when_not_taken(
     )
 
     if taken:
-        assert result is runner._prepare_encoder_decoder_inputs_fast.return_value
-        assert runner._encoder_decoder_staged_request_ids is staged_request_ids
+        assert result is preparer._prepare_fast.return_value
+        assert preparer._staged_request_ids is staged_request_ids
     else:
         assert result is None
-        assert runner._encoder_decoder_staged_request_ids is None
-        runner._prepare_encoder_decoder_inputs_fast.assert_not_called()
+        assert preparer._staged_request_ids is None
+        preparer._prepare_fast.assert_not_called()

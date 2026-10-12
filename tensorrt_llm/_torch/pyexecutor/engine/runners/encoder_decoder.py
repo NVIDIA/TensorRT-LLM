@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, replace
 from typing import Any
@@ -24,6 +24,7 @@ from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import (
     ENC_DEC_CUDA_GRAPH_DUMMY_TOKEN_NUM,
     CUDAGraphRunnerConfig,
 )
+from tensorrt_llm._torch.pyexecutor.guided_decoder import CapturableGuidedDecoder
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
@@ -32,21 +33,16 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import (
     ResourceManagerType,
 )
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
-from tensorrt_llm._torch.utils import set_per_request_prefill_cuda_graph_flag
 from tensorrt_llm._utils import nvtx_range, prefer_pinned
 from tensorrt_llm.bindings.internal import batch_manager as batch_manager_bindings
+from tensorrt_llm.llmapi.llm_args import BaseSparseAttentionConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
 from ..cuda_graph import resolve_cuda_graph_batch_sizes
-from .common import (
-    apply_position_id_offset,
-    get_all_rank_num_tokens,
-    get_padding_params,
-    get_position_id_offset,
-    get_top_level_model,
-)
+from .common import apply_position_id_offset, get_position_id_offset, get_top_level_model
 from .decoder import DecoderRunner, DecoderRunnerConfig, ExtraInputsCollector
+from .decoder.inputs import DecoderInputBuffers, DecoderInputPreparer
 from .encoder import EncoderConfigMixin, EncoderMixin, EncoderPreparedInputs
 from .interface import PreparedInputs, RunnerConfig, ScheduledInputs
 
@@ -443,8 +439,8 @@ class EncoderDecoderRunnerConfig(DecoderRunnerConfig):
 class CrossAttentionInputs(ExtraInputsCollector):
     """Collect the cross-attention state of one decoder batch."""
 
-    def __init__(self, runner: EncoderDecoderRunner) -> None:
-        self._runner = runner
+    def __init__(self, preparer: EncoderDecoderInputPreparer) -> None:
+        self._preparer = preparer
         self._encoder_hidden_states: list[torch.Tensor] = []
         # New encoder K/V tokens per decoder sequence.
         self._encoder_seq_lens: list[int] = []
@@ -494,13 +490,448 @@ class CrossAttentionInputs(ExtraInputsCollector):
     def build(
         self, attn_metadata: AttentionMetadata, resource_manager: ResourceManager | None
     ) -> dict[str, Any]:
-        return self._runner._prepare_enc_dec_cross_attn_inputs(
+        return self._preparer.prepare_cross_attention(
             self._encoder_hidden_states,
             self._encoder_seq_lens,
             self._encoder_cached_tokens_per_seq,
             attn_metadata,
             resource_manager,
         )
+
+
+class EncoderDecoderInputPreparer:
+    """Prepares cross-attention inputs, and whole simple batches on the native fast path."""
+
+    def __init__(
+        self,
+        config: EncoderDecoderRunnerConfig,
+        mapping: Mapping,
+        model: nn.Module,
+        sparse_attention_config: BaseSparseAttentionConfig | None,
+        inputs: DecoderInputPreparer,
+        buffers: DecoderInputBuffers,
+        iter_states: dict[str, Any],
+        *,
+        uses_lora: Callable[[], bool],
+    ) -> None:
+        self._config = config
+        self.mapping = mapping
+        self.model = model
+        self.sparse_attention_config = sparse_attention_config
+        self._inputs = inputs
+        self._buffers = buffers
+        self.iter_states = iter_states
+        self._uses_lora = uses_lora
+        self._host_buffer_pool: list[dict[str, Any]] = []
+        self._fast_path_static_eligible: bool | None = None
+        self._position_id_offset: int | None = None
+        self._staged_request_ids: list[int] | None = None
+        # Cache for enc-dec cross-attention stable generation steps.
+        # Populated on the first CUDA-graph generation step; cleared whenever
+        # the batch composition changes (new encoder request arrives).
+        self._cross_attn_stable_cached_tokens: list[int] | None = None
+        self._cross_attn_stable_request_ids: list[int] | None = None
+
+    @property
+    def guided_decoder(self) -> CapturableGuidedDecoder | None:
+        return self._inputs.guided_decoder
+
+    def prepare_fast_path(
+        self,
+        scheduled_requests: ScheduledRequests,
+        kv_cache_manager: KVCacheManager | KVCacheManagerV2,
+        attn_metadata: AttentionMetadata,
+        new_tokens_device: torch.Tensor | None,
+        next_draft_tokens_device: torch.Tensor | None,
+        resource_manager: ResourceManager | None,
+        *,
+        promoted_context_request_ids: frozenset[int],
+        enable_spec_decode: bool,
+    ) -> PreparedInputs | None:
+        if (
+            not promoted_context_request_ids
+            and type(attn_metadata) is TrtllmAttentionMetadata
+            and self._can_use_fast_path(
+                scheduled_requests, new_tokens_device, next_draft_tokens_device, enable_spec_decode
+            )
+        ):
+            return self._prepare_fast(
+                scheduled_requests,
+                kv_cache_manager,
+                attn_metadata,
+                new_tokens_device,
+                resource_manager,
+            )
+        self._staged_request_ids = None
+        return None
+
+    def prepare_cross_attention(
+        self,
+        encoder_hidden_states: list[torch.Tensor],
+        encoder_seq_lens: list[int],
+        encoder_num_cached_tokens_per_seq: list[int],
+        attn_metadata: AttentionMetadata,
+        resource_manager: ResourceManager | None,
+        encoder_kv_lens: torch.Tensor | None = None,
+        context_encoder_kv_tokens: int = 0,
+        generation_encoder_kv_tokens: int = 0,
+        max_encoder_kv_len: int = 0,
+    ) -> dict[str, Any]:
+        if not encoder_seq_lens:
+            return {}
+
+        if len(encoder_seq_lens) != attn_metadata.num_seqs:
+            raise RuntimeError(
+                "Cross-attention encoder lengths must align with decoder "
+                f"sequences: got {len(encoder_seq_lens)} encoder lengths for "
+                f"{attn_metadata.num_seqs} decoder sequences."
+            )
+
+        if resource_manager is None:
+            raise RuntimeError(
+                "Encoder-decoder decoder forward requires a resource manager "
+                "with a cross-KV cache manager."
+            )
+        cross_kv_cache_manager = resource_manager.get_resource_manager(
+            ResourceManagerType.CROSS_KV_CACHE_MANAGER
+        )
+        if cross_kv_cache_manager is None:
+            raise RuntimeError(
+                "Encoder-decoder decoder forward requires "
+                "ResourceManagerType.CROSS_KV_CACHE_MANAGER."
+            )
+
+        new_encoder_tokens = sum(encoder_seq_lens)
+        if encoder_hidden_states:
+            packed_encoder_hidden_states = (
+                encoder_hidden_states[0]
+                if len(encoder_hidden_states) == 1
+                else torch.cat(encoder_hidden_states, dim=0)
+            )
+            if packed_encoder_hidden_states.shape[0] != new_encoder_tokens:
+                raise RuntimeError(
+                    "Packed encoder hidden states do not match cross-attention "
+                    "metadata: got "
+                    f"{packed_encoder_hidden_states.shape[0]} rows for "
+                    f"{new_encoder_tokens} new encoder KV tokens."
+                )
+            skip_cross_kv_projection = False
+        else:
+            if new_encoder_tokens != 0:
+                raise RuntimeError(
+                    "Cross-attention metadata asks to project encoder K/V, "
+                    "but no encoder hidden states were supplied."
+                )
+            packed_encoder_hidden_states = None
+            skip_cross_kv_projection = True
+
+        def prepare_cross_metadata(cross_attn_metadata: AttentionMetadata) -> None:
+            if encoder_kv_lens is None:
+                cross_attn_metadata.prepare()
+                return
+            assert isinstance(cross_attn_metadata, TrtllmAttentionMetadata)
+            cross_attn_metadata.prepare_encoder_decoder_from_precomputed_lengths(
+                prompt_lens=attn_metadata.prompt_lens,
+                kv_lens=encoder_kv_lens,
+                context_kv_tokens=context_encoder_kv_tokens,
+                generation_kv_tokens=generation_encoder_kv_tokens,
+                max_kv_len=max_encoder_kv_len,
+            )
+
+        if attn_metadata.is_cuda_graph and attn_metadata.has_cross_sub_metadata:
+            # Fast path for stable CUDA-graph generation steps: the encoder
+            # KV lengths (kv_lens_cuda) and the frozen prompt lengths
+            # (prompt_lens_cuda) are identical across all generation steps
+            # for a fixed batch. Skip the expensive torch.tensor() allocations
+            # and H2D copies inside prepare() when nothing has changed.
+            is_stable_gen_step = (
+                new_encoder_tokens == 0  # pure generation, no new cross-KV
+                and self._cross_attn_stable_cached_tokens == encoder_num_cached_tokens_per_seq
+                and self._cross_attn_stable_request_ids
+                == attn_metadata.request_ids  # same batch and row order
+            )
+            if is_stable_gen_step:
+                cross_attn_metadata = attn_metadata.cross
+                # Only refresh the decoder-side Python references that the
+                # kernel reads; these are pointer-level updates with no alloc.
+                cross_attn_metadata._seq_lens = attn_metadata.seq_lens
+                cross_attn_metadata._seq_lens_cuda = attn_metadata.seq_lens_cuda
+                cross_attn_metadata.prompt_lens = attn_metadata.prompt_lens
+                cross_attn_metadata.request_ids = attn_metadata.request_ids
+                cross_attn_metadata.num_contexts = attn_metadata.num_contexts
+            else:
+                cross_attn_metadata = attn_metadata.update_cross_metadata(
+                    encoder_seq_lens=encoder_seq_lens,
+                    cross_kv_cache_manager=cross_kv_cache_manager,
+                    encoder_num_cached_tokens_per_seq=encoder_num_cached_tokens_per_seq,
+                )
+                prepare_cross_metadata(cross_attn_metadata)
+                if new_encoder_tokens == 0:
+                    # Record this stable state for future fast-path use.
+                    self._cross_attn_stable_cached_tokens = list(encoder_num_cached_tokens_per_seq)
+                    self._cross_attn_stable_request_ids = list(attn_metadata.request_ids)
+                else:
+                    # Batch changed (new encoder request); reset cache.
+                    self._cross_attn_stable_cached_tokens = None
+                    self._cross_attn_stable_request_ids = None
+        else:
+            cross_attn_metadata = attn_metadata.create_cross_metadata(
+                cross_kv_cache_manager=cross_kv_cache_manager,
+                encoder_seq_lens=encoder_seq_lens,
+                encoder_num_cached_tokens_per_seq=encoder_num_cached_tokens_per_seq,
+            )
+            if attn_metadata.is_cuda_graph:
+                attn_metadata.cross = cross_attn_metadata
+                if new_encoder_tokens == 0:
+                    self._cross_attn_stable_cached_tokens = list(encoder_num_cached_tokens_per_seq)
+                    self._cross_attn_stable_request_ids = list(attn_metadata.request_ids)
+                else:
+                    self._cross_attn_stable_cached_tokens = None
+                    self._cross_attn_stable_request_ids = None
+            else:
+                self._cross_attn_stable_cached_tokens = None
+                self._cross_attn_stable_request_ids = None
+            prepare_cross_metadata(cross_attn_metadata)
+
+        return {
+            "encoder_hidden_states": packed_encoder_hidden_states,
+            "cross_attn_metadata": cross_attn_metadata,
+            "skip_cross_kv_projection": skip_cross_kv_projection,
+        }
+
+    def _can_use_fast_path(
+        self,
+        scheduled_requests: ScheduledRequests,
+        new_tokens_device: torch.Tensor | None,
+        next_draft_tokens_device: torch.Tensor | None,
+        enable_spec_decode: bool,
+    ) -> bool:
+        """Return whether the TRT-like persistent input path is sufficient."""
+        static_eligible = self._fast_path_static_eligible
+        if static_eligible is None:
+            static_eligible = (
+                hasattr(batch_manager_bindings, "prepare_encoder_decoder_inputs")
+                and self._config.max_beam_width == 1
+                and self.sparse_attention_config is None
+                and not self._config.use_mrope
+                and not self._config.enable_attention_dp
+                and not self.mapping.has_cp_helix()
+                and not self._config.is_multimodal
+                and not self._config.attention_runtime_features.chunked_prefill
+                and not self._config.attention_runtime_features.cache_reuse
+                and not self._config.attention_runtime_features.has_speculative_draft_tokens
+            )
+            self._fast_path_static_eligible = static_eligible
+        if (
+            not static_eligible
+            or enable_spec_decode
+            or self._uses_lora()
+            or new_tokens_device is None
+            or next_draft_tokens_device is not None
+            or self.guided_decoder is not None
+        ):
+            return False
+
+        if scheduled_requests.batch_size == 0:
+            return False
+        for request in scheduled_requests.generation_requests:
+            if request.py_batch_idx is None and not request.is_dummy:
+                return False
+        return True
+
+    def _acquire_host_buffers(self) -> dict[str, Any]:
+        """Acquire pinned staging whose preceding asynchronous copies finished."""
+        pool = self._host_buffer_pool
+        for buffers in pool:
+            event = buffers["event"]
+            if event is None or event.query():
+                return buffers
+
+        buffers = {
+            "input_ids": torch.empty(
+                self._config.max_num_tokens, dtype=torch.int, pin_memory=prefer_pinned()
+            ),
+            "position_ids": torch.empty(
+                self._config.max_num_tokens, dtype=torch.int, pin_memory=prefer_pinned()
+            ),
+            "sequence_lengths": torch.empty(
+                self._config.max_batch_size, dtype=torch.int, pin_memory=prefer_pinned()
+            ),
+            "prompt_lengths": torch.empty(
+                self._config.max_batch_size, dtype=torch.int, pin_memory=prefer_pinned()
+            ),
+            "cached_token_lengths": torch.empty(
+                self._config.max_batch_size, dtype=torch.int, pin_memory=prefer_pinned()
+            ),
+            "kv_lengths": torch.empty(
+                self._config.max_batch_size, dtype=torch.int, pin_memory=prefer_pinned()
+            ),
+            "encoder_kv_lengths": torch.empty(
+                self._config.max_batch_size, dtype=torch.int, pin_memory=prefer_pinned()
+            ),
+            "previous_batch_indices": torch.empty(
+                self._config.max_batch_size, dtype=torch.int, pin_memory=prefer_pinned()
+            ),
+            "event": None,
+        }
+        pool.append(buffers)
+        return buffers
+
+    @nvtx_range("_prepare_encoder_decoder_inputs_fast")
+    def _prepare_fast(
+        self,
+        scheduled_requests: ScheduledRequests,
+        kv_cache_manager: KVCacheManager | KVCacheManagerV2,
+        attn_metadata: AttentionMetadata,
+        new_tokens_device: torch.Tensor,
+        resource_manager: ResourceManager | None,
+    ) -> PreparedInputs:
+        """Prepare a simple BART batch with native collation and reused buffers."""
+        buffers = self._acquire_host_buffers()
+        position_id_offset = self._position_id_offset
+        if position_id_offset is None:
+            position_id_offset = get_position_id_offset(self.model)
+            self._position_id_offset = position_id_offset
+        (
+            request_ids,
+            encoder_seq_lens,
+            encoder_cached_token_lengths,
+            total_num_tokens,
+            num_context_tokens,
+            num_previous_batch_requests,
+            cached_kv_tokens,
+            context_kv_tokens,
+            generation_kv_tokens,
+            max_kv_len,
+            context_encoder_kv_tokens,
+            generation_encoder_kv_tokens,
+            max_encoder_kv_len,
+        ) = batch_manager_bindings.prepare_encoder_decoder_inputs(
+            scheduled_requests.context_requests,
+            scheduled_requests.generation_requests,
+            buffers["input_ids"],
+            buffers["position_ids"],
+            buffers["sequence_lengths"],
+            buffers["prompt_lengths"],
+            buffers["cached_token_lengths"],
+            buffers["kv_lengths"],
+            buffers["encoder_kv_lengths"],
+            buffers["previous_batch_indices"],
+            position_id_offset,
+        )
+
+        num_sequences = scheduled_requests.batch_size
+        num_context_requests = scheduled_requests.num_context_requests
+        num_generation_requests = scheduled_requests.num_generation_requests
+        generation_request_ids = request_ids[num_context_requests:]
+        if num_context_tokens:
+            self._buffers.input_ids_cuda[:num_context_tokens].copy_(
+                buffers["input_ids"][:num_context_tokens], non_blocking=True
+            )
+        if num_previous_batch_requests:
+            previous_slots = self._buffers.previous_batch_indices_cuda[:num_previous_batch_requests]
+            staged_request_ids = generation_request_ids[:num_previous_batch_requests]
+            # Sequence slots are stable for a request's lifetime, so the
+            # device indices remain valid while this ordered batch does.
+            if self._staged_request_ids != staged_request_ids:
+                previous_slots.copy_(
+                    buffers["previous_batch_indices"][:num_previous_batch_requests],
+                    non_blocking=True,
+                )
+                self._staged_request_ids = staged_request_ids
+            generation_begin = num_context_tokens
+            generation_end = generation_begin + num_previous_batch_requests
+            torch.index_select(
+                new_tokens_device[0, :, 0],
+                dim=0,
+                index=previous_slots,
+                out=self._buffers.input_ids_cuda[generation_begin:generation_end],
+            )
+        else:
+            self._staged_request_ids = None
+        dummy_begin = num_context_tokens + num_previous_batch_requests
+        if dummy_begin < total_num_tokens:
+            self._buffers.input_ids_cuda[dummy_begin:total_num_tokens].fill_(0)
+
+        self._buffers.position_ids_cuda[:total_num_tokens].copy_(
+            buffers["position_ids"][:total_num_tokens], non_blocking=True
+        )
+
+        sequence_lengths = buffers["sequence_lengths"][:num_sequences]
+        attn_metadata._seq_lens = sequence_lengths
+        if attn_metadata.is_cuda_graph and attn_metadata._seq_lens_cuda is not None:
+            attn_metadata._seq_lens_cuda.copy_(sequence_lengths, non_blocking=True)
+        else:
+            attn_metadata._seq_lens_cuda = sequence_lengths.cuda(non_blocking=True)
+
+        attn_metadata._num_contexts = scheduled_requests.num_context_requests
+        attn_metadata._num_ctx_tokens = num_context_tokens
+        attn_metadata._num_generations = num_generation_requests
+        attn_metadata._num_tokens = total_num_tokens
+        attn_metadata.beam_width = 1
+        attn_metadata.request_ids = request_ids
+        attn_metadata.prompt_lens = buffers["prompt_lengths"][:num_sequences]
+        attn_metadata.num_chunked_ctx_requests = 0
+        attn_metadata.kv_cache_params = KVCacheParams(
+            use_cache=True,
+            num_cached_tokens_per_seq=buffers["cached_token_lengths"][:num_sequences],
+            num_extra_kv_tokens=0,
+        )
+        attn_metadata.kv_cache_manager = kv_cache_manager
+        assert isinstance(attn_metadata, TrtllmAttentionMetadata)
+        attn_metadata.prepare_encoder_decoder_from_precomputed_lengths(
+            prompt_lens=buffers["prompt_lengths"][:num_sequences],
+            kv_lens=buffers["kv_lengths"][:num_sequences],
+            context_kv_tokens=context_kv_tokens,
+            generation_kv_tokens=generation_kv_tokens,
+            max_kv_len=max_kv_len,
+        )
+
+        encoder_hidden_states = []
+        for request in scheduled_requests.context_requests:
+            encoder_output = request.py_encoder_output
+            if encoder_output is None:
+                raise RuntimeError(
+                    f"Decoder context request {request.py_request_id} has no encoder output."
+                )
+            encoder_hidden_states.append(encoder_output)
+            request.py_batch_idx = request.py_seq_slot
+
+        cross_attention_inputs = self.prepare_cross_attention(
+            encoder_hidden_states,
+            encoder_seq_lens,
+            encoder_cached_token_lengths,
+            attn_metadata,
+            resource_manager,
+            encoder_kv_lens=buffers["encoder_kv_lengths"][:num_sequences],
+            context_encoder_kv_tokens=context_encoder_kv_tokens,
+            generation_encoder_kv_tokens=generation_encoder_kv_tokens,
+            max_encoder_kv_len=max_encoder_kv_len,
+        )
+
+        virtual_num_tokens = self._inputs.pad_tokens(
+            attn_metadata, total_num_tokens, scheduled_requests.num_context_requests
+        )
+        inputs = self._inputs.model_inputs(attn_metadata, resource_manager, virtual_num_tokens, [])
+        inputs.update(cross_attention_inputs)
+
+        self.iter_states["num_ctx_requests"] = scheduled_requests.num_context_requests
+        self.iter_states["num_ctx_tokens"] = num_context_tokens
+        self.iter_states["num_generation_tokens"] = num_generation_requests
+        self.iter_states["cached_kv_tokens"] = cached_kv_tokens
+        if self._inputs.log_cached_kv_tokens_per_req:
+            self._inputs.record_cached_kv_tokens_per_req(
+                buffers["cached_token_lengths"][:num_sequences].tolist(),
+                (
+                    (scheduled_requests.context_requests, 1),
+                    (scheduled_requests.generation_requests, 1),
+                ),
+            )
+
+        event = torch.cuda.Event()
+        event.record(torch.cuda.current_stream())
+        buffers["event"] = event
+        return PreparedInputs(inputs)
 
 
 class EncoderDecoderRunner(DecoderRunner):
@@ -537,6 +968,16 @@ class EncoderDecoderRunner(DecoderRunner):
             moe_load_balancer=moe_load_balancer,
             **decoder_services,
         )
+        self._encoder_decoder_inputs = EncoderDecoderInputPreparer(
+            self._config,
+            mapping,
+            model,
+            self.sparse_attention_config,
+            self._inputs,
+            self._buffers,
+            self.iter_states,
+            uses_lora=lambda: self.lora_model_config is not None,
+        )
 
     def forward_encoder(
         self,
@@ -565,18 +1006,6 @@ class EncoderDecoderRunner(DecoderRunner):
     def release_graphs(self) -> None:
         self._encoder_stage.release_graphs()
         super().release_graphs()
-
-    def _init_decoder_state(self) -> None:
-        super()._init_decoder_state()
-        self._encoder_decoder_host_buffer_pool: list[dict[str, Any]] = []
-        self._encoder_decoder_input_fast_path_static_eligible: bool | None = None
-        self._encoder_decoder_position_id_offset: int | None = None
-        self._encoder_decoder_staged_request_ids: list[int] | None = None
-        # Cache for enc-dec cross-attention stable generation steps.
-        # Populated on the first CUDA-graph generation step; cleared whenever
-        # the batch composition changes (new encoder request arrives).
-        self._cross_attn_stable_cached_tokens: list[int] | None = None
-        self._cross_attn_stable_request_ids: list[int] | None = None
 
     def _cuda_graph_runner_config(self) -> CUDAGraphRunnerConfig:
         return replace(
@@ -821,25 +1250,19 @@ class EncoderDecoderRunner(DecoderRunner):
         promoted_context_request_ids: frozenset[int],
         enable_spec_decode: bool,
     ) -> PreparedInputs | None:
-        if (
-            not promoted_context_request_ids
-            and type(attn_metadata) is TrtllmAttentionMetadata
-            and self._can_use_encoder_decoder_input_fast_path(
-                scheduled_requests, new_tokens_device, next_draft_tokens_device, enable_spec_decode
-            )
-        ):
-            return self._prepare_encoder_decoder_inputs_fast(
-                scheduled_requests,
-                kv_cache_manager,
-                attn_metadata,
-                new_tokens_device,
-                resource_manager,
-            )
-        self._encoder_decoder_staged_request_ids = None
-        return None
+        return self._encoder_decoder_inputs.prepare_fast_path(
+            scheduled_requests,
+            kv_cache_manager,
+            attn_metadata,
+            new_tokens_device,
+            next_draft_tokens_device,
+            resource_manager,
+            promoted_context_request_ids=promoted_context_request_ids,
+            enable_spec_decode=enable_spec_decode,
+        )
 
     def _new_extra_inputs(self) -> CrossAttentionInputs:
-        return CrossAttentionInputs(self)
+        return CrossAttentionInputs(self._encoder_decoder_inputs)
 
     def _capture_mixed_encoder_decoder_cuda_graphs(self, resource_manager: ResourceManager) -> None:
         """Warm and capture reachable mixed encoder-decoder graph shapes.
@@ -1069,405 +1492,3 @@ class EncoderDecoderRunner(DecoderRunner):
                 "hidden size from the model config."
             )
         return int(hidden_size)
-
-    def _prepare_enc_dec_cross_attn_inputs(
-        self,
-        encoder_hidden_states: list[torch.Tensor],
-        encoder_seq_lens: list[int],
-        encoder_num_cached_tokens_per_seq: list[int],
-        attn_metadata: AttentionMetadata,
-        resource_manager: ResourceManager | None,
-        encoder_kv_lens: torch.Tensor | None = None,
-        context_encoder_kv_tokens: int = 0,
-        generation_encoder_kv_tokens: int = 0,
-        max_encoder_kv_len: int = 0,
-    ) -> dict[str, Any]:
-        if not encoder_seq_lens:
-            return {}
-
-        if len(encoder_seq_lens) != attn_metadata.num_seqs:
-            raise RuntimeError(
-                "Cross-attention encoder lengths must align with decoder "
-                f"sequences: got {len(encoder_seq_lens)} encoder lengths for "
-                f"{attn_metadata.num_seqs} decoder sequences."
-            )
-
-        if resource_manager is None:
-            raise RuntimeError(
-                "Encoder-decoder decoder forward requires a resource manager "
-                "with a cross-KV cache manager."
-            )
-        cross_kv_cache_manager = resource_manager.get_resource_manager(
-            ResourceManagerType.CROSS_KV_CACHE_MANAGER
-        )
-        if cross_kv_cache_manager is None:
-            raise RuntimeError(
-                "Encoder-decoder decoder forward requires "
-                "ResourceManagerType.CROSS_KV_CACHE_MANAGER."
-            )
-
-        new_encoder_tokens = sum(encoder_seq_lens)
-        if encoder_hidden_states:
-            packed_encoder_hidden_states = (
-                encoder_hidden_states[0]
-                if len(encoder_hidden_states) == 1
-                else torch.cat(encoder_hidden_states, dim=0)
-            )
-            if packed_encoder_hidden_states.shape[0] != new_encoder_tokens:
-                raise RuntimeError(
-                    "Packed encoder hidden states do not match cross-attention "
-                    "metadata: got "
-                    f"{packed_encoder_hidden_states.shape[0]} rows for "
-                    f"{new_encoder_tokens} new encoder KV tokens."
-                )
-            skip_cross_kv_projection = False
-        else:
-            if new_encoder_tokens != 0:
-                raise RuntimeError(
-                    "Cross-attention metadata asks to project encoder K/V, "
-                    "but no encoder hidden states were supplied."
-                )
-            packed_encoder_hidden_states = None
-            skip_cross_kv_projection = True
-
-        def prepare_cross_metadata(cross_attn_metadata: AttentionMetadata) -> None:
-            if encoder_kv_lens is None:
-                cross_attn_metadata.prepare()
-                return
-            assert isinstance(cross_attn_metadata, TrtllmAttentionMetadata)
-            cross_attn_metadata.prepare_encoder_decoder_from_precomputed_lengths(
-                prompt_lens=attn_metadata.prompt_lens,
-                kv_lens=encoder_kv_lens,
-                context_kv_tokens=context_encoder_kv_tokens,
-                generation_kv_tokens=generation_encoder_kv_tokens,
-                max_kv_len=max_encoder_kv_len,
-            )
-
-        if attn_metadata.is_cuda_graph and attn_metadata.has_cross_sub_metadata:
-            # Fast path for stable CUDA-graph generation steps: the encoder
-            # KV lengths (kv_lens_cuda) and the frozen prompt lengths
-            # (prompt_lens_cuda) are identical across all generation steps
-            # for a fixed batch. Skip the expensive torch.tensor() allocations
-            # and H2D copies inside prepare() when nothing has changed.
-            is_stable_gen_step = (
-                new_encoder_tokens == 0  # pure generation, no new cross-KV
-                and self._cross_attn_stable_cached_tokens == encoder_num_cached_tokens_per_seq
-                and self._cross_attn_stable_request_ids
-                == attn_metadata.request_ids  # same batch and row order
-            )
-            if is_stable_gen_step:
-                cross_attn_metadata = attn_metadata.cross
-                # Only refresh the decoder-side Python references that the
-                # kernel reads; these are pointer-level updates with no alloc.
-                cross_attn_metadata._seq_lens = attn_metadata.seq_lens
-                cross_attn_metadata._seq_lens_cuda = attn_metadata.seq_lens_cuda
-                cross_attn_metadata.prompt_lens = attn_metadata.prompt_lens
-                cross_attn_metadata.request_ids = attn_metadata.request_ids
-                cross_attn_metadata.num_contexts = attn_metadata.num_contexts
-            else:
-                cross_attn_metadata = attn_metadata.update_cross_metadata(
-                    encoder_seq_lens=encoder_seq_lens,
-                    cross_kv_cache_manager=cross_kv_cache_manager,
-                    encoder_num_cached_tokens_per_seq=encoder_num_cached_tokens_per_seq,
-                )
-                prepare_cross_metadata(cross_attn_metadata)
-                if new_encoder_tokens == 0:
-                    # Record this stable state for future fast-path use.
-                    self._cross_attn_stable_cached_tokens = list(encoder_num_cached_tokens_per_seq)
-                    self._cross_attn_stable_request_ids = list(attn_metadata.request_ids)
-                else:
-                    # Batch changed (new encoder request); reset cache.
-                    self._cross_attn_stable_cached_tokens = None
-                    self._cross_attn_stable_request_ids = None
-        else:
-            cross_attn_metadata = attn_metadata.create_cross_metadata(
-                cross_kv_cache_manager=cross_kv_cache_manager,
-                encoder_seq_lens=encoder_seq_lens,
-                encoder_num_cached_tokens_per_seq=encoder_num_cached_tokens_per_seq,
-            )
-            if attn_metadata.is_cuda_graph:
-                attn_metadata.cross = cross_attn_metadata
-                if new_encoder_tokens == 0:
-                    self._cross_attn_stable_cached_tokens = list(encoder_num_cached_tokens_per_seq)
-                    self._cross_attn_stable_request_ids = list(attn_metadata.request_ids)
-                else:
-                    self._cross_attn_stable_cached_tokens = None
-                    self._cross_attn_stable_request_ids = None
-            else:
-                self._cross_attn_stable_cached_tokens = None
-                self._cross_attn_stable_request_ids = None
-            prepare_cross_metadata(cross_attn_metadata)
-
-        return {
-            "encoder_hidden_states": packed_encoder_hidden_states,
-            "cross_attn_metadata": cross_attn_metadata,
-            "skip_cross_kv_projection": skip_cross_kv_projection,
-        }
-
-    def _can_use_encoder_decoder_input_fast_path(
-        self,
-        scheduled_requests: ScheduledRequests,
-        new_tokens_device: torch.Tensor | None,
-        next_draft_tokens_device: torch.Tensor | None,
-        enable_spec_decode: bool,
-    ) -> bool:
-        """Return whether the TRT-like persistent input path is sufficient."""
-        static_eligible = self._encoder_decoder_input_fast_path_static_eligible
-        if static_eligible is None:
-            static_eligible = (
-                hasattr(batch_manager_bindings, "prepare_encoder_decoder_inputs")
-                and self._config.max_beam_width == 1
-                and self.sparse_attention_config is None
-                and not self._config.use_mrope
-                and not self._config.enable_attention_dp
-                and not self.mapping.has_cp_helix()
-                and not self._config.is_multimodal
-                and not self._config.attention_runtime_features.chunked_prefill
-                and not self._config.attention_runtime_features.cache_reuse
-                and not self._config.attention_runtime_features.has_speculative_draft_tokens
-            )
-            self._encoder_decoder_input_fast_path_static_eligible = static_eligible
-        if (
-            not static_eligible
-            or enable_spec_decode
-            or self.lora_model_config is not None
-            or new_tokens_device is None
-            or next_draft_tokens_device is not None
-            or self.guided_decoder is not None
-        ):
-            return False
-
-        if scheduled_requests.batch_size == 0:
-            return False
-        for request in scheduled_requests.generation_requests:
-            if request.py_batch_idx is None and not request.is_dummy:
-                return False
-        return True
-
-    def _acquire_encoder_decoder_host_buffers(self) -> dict[str, Any]:
-        """Acquire pinned staging whose preceding asynchronous copies finished."""
-        pool = self._encoder_decoder_host_buffer_pool
-        for buffers in pool:
-            event = buffers["event"]
-            if event is None or event.query():
-                return buffers
-
-        buffers = {
-            "input_ids": torch.empty(
-                self._config.max_num_tokens, dtype=torch.int, pin_memory=prefer_pinned()
-            ),
-            "position_ids": torch.empty(
-                self._config.max_num_tokens, dtype=torch.int, pin_memory=prefer_pinned()
-            ),
-            "sequence_lengths": torch.empty(
-                self._config.max_batch_size, dtype=torch.int, pin_memory=prefer_pinned()
-            ),
-            "prompt_lengths": torch.empty(
-                self._config.max_batch_size, dtype=torch.int, pin_memory=prefer_pinned()
-            ),
-            "cached_token_lengths": torch.empty(
-                self._config.max_batch_size, dtype=torch.int, pin_memory=prefer_pinned()
-            ),
-            "kv_lengths": torch.empty(
-                self._config.max_batch_size, dtype=torch.int, pin_memory=prefer_pinned()
-            ),
-            "encoder_kv_lengths": torch.empty(
-                self._config.max_batch_size, dtype=torch.int, pin_memory=prefer_pinned()
-            ),
-            "previous_batch_indices": torch.empty(
-                self._config.max_batch_size, dtype=torch.int, pin_memory=prefer_pinned()
-            ),
-            "event": None,
-        }
-        pool.append(buffers)
-        return buffers
-
-    @nvtx_range("_prepare_encoder_decoder_inputs_fast")
-    def _prepare_encoder_decoder_inputs_fast(
-        self,
-        scheduled_requests: ScheduledRequests,
-        kv_cache_manager: KVCacheManager | KVCacheManagerV2,
-        attn_metadata: AttentionMetadata,
-        new_tokens_device: torch.Tensor,
-        resource_manager: ResourceManager | None,
-    ) -> PreparedInputs:
-        """Prepare a simple BART batch with native collation and reused buffers."""
-        buffers = self._acquire_encoder_decoder_host_buffers()
-        position_id_offset = self._encoder_decoder_position_id_offset
-        if position_id_offset is None:
-            position_id_offset = get_position_id_offset(self.model)
-            self._encoder_decoder_position_id_offset = position_id_offset
-        (
-            request_ids,
-            encoder_seq_lens,
-            encoder_cached_token_lengths,
-            total_num_tokens,
-            num_context_tokens,
-            num_previous_batch_requests,
-            cached_kv_tokens,
-            context_kv_tokens,
-            generation_kv_tokens,
-            max_kv_len,
-            context_encoder_kv_tokens,
-            generation_encoder_kv_tokens,
-            max_encoder_kv_len,
-        ) = batch_manager_bindings.prepare_encoder_decoder_inputs(
-            scheduled_requests.context_requests,
-            scheduled_requests.generation_requests,
-            buffers["input_ids"],
-            buffers["position_ids"],
-            buffers["sequence_lengths"],
-            buffers["prompt_lengths"],
-            buffers["cached_token_lengths"],
-            buffers["kv_lengths"],
-            buffers["encoder_kv_lengths"],
-            buffers["previous_batch_indices"],
-            position_id_offset,
-        )
-
-        num_sequences = scheduled_requests.batch_size
-        num_context_requests = scheduled_requests.num_context_requests
-        num_generation_requests = scheduled_requests.num_generation_requests
-        generation_request_ids = request_ids[num_context_requests:]
-        if num_context_tokens:
-            self._buffers.input_ids_cuda[:num_context_tokens].copy_(
-                buffers["input_ids"][:num_context_tokens], non_blocking=True
-            )
-        if num_previous_batch_requests:
-            previous_slots = self._buffers.previous_batch_indices_cuda[:num_previous_batch_requests]
-            staged_request_ids = generation_request_ids[:num_previous_batch_requests]
-            # Sequence slots are stable for a request's lifetime, so the
-            # device indices remain valid while this ordered batch does.
-            if self._encoder_decoder_staged_request_ids != staged_request_ids:
-                previous_slots.copy_(
-                    buffers["previous_batch_indices"][:num_previous_batch_requests],
-                    non_blocking=True,
-                )
-                self._encoder_decoder_staged_request_ids = staged_request_ids
-            generation_begin = num_context_tokens
-            generation_end = generation_begin + num_previous_batch_requests
-            torch.index_select(
-                new_tokens_device[0, :, 0],
-                dim=0,
-                index=previous_slots,
-                out=self._buffers.input_ids_cuda[generation_begin:generation_end],
-            )
-        else:
-            self._encoder_decoder_staged_request_ids = None
-        dummy_begin = num_context_tokens + num_previous_batch_requests
-        if dummy_begin < total_num_tokens:
-            self._buffers.input_ids_cuda[dummy_begin:total_num_tokens].fill_(0)
-
-        self._buffers.position_ids_cuda[:total_num_tokens].copy_(
-            buffers["position_ids"][:total_num_tokens], non_blocking=True
-        )
-        final_position_ids = self._buffers.position_ids_cuda[:total_num_tokens].unsqueeze(0)
-
-        sequence_lengths = buffers["sequence_lengths"][:num_sequences]
-        attn_metadata._seq_lens = sequence_lengths
-        if attn_metadata.is_cuda_graph and attn_metadata._seq_lens_cuda is not None:
-            attn_metadata._seq_lens_cuda.copy_(sequence_lengths, non_blocking=True)
-        else:
-            attn_metadata._seq_lens_cuda = sequence_lengths.cuda(non_blocking=True)
-
-        attn_metadata._num_contexts = scheduled_requests.num_context_requests
-        attn_metadata._num_ctx_tokens = num_context_tokens
-        attn_metadata._num_generations = num_generation_requests
-        attn_metadata._num_tokens = total_num_tokens
-        attn_metadata.beam_width = 1
-        attn_metadata.request_ids = request_ids
-        attn_metadata.prompt_lens = buffers["prompt_lengths"][:num_sequences]
-        attn_metadata.num_chunked_ctx_requests = 0
-        attn_metadata.kv_cache_params = KVCacheParams(
-            use_cache=True,
-            num_cached_tokens_per_seq=buffers["cached_token_lengths"][:num_sequences],
-            num_extra_kv_tokens=0,
-        )
-        attn_metadata.kv_cache_manager = kv_cache_manager
-        assert isinstance(attn_metadata, TrtllmAttentionMetadata)
-        attn_metadata.prepare_encoder_decoder_from_precomputed_lengths(
-            prompt_lens=buffers["prompt_lengths"][:num_sequences],
-            kv_lens=buffers["kv_lengths"][:num_sequences],
-            context_kv_tokens=context_kv_tokens,
-            generation_kv_tokens=generation_kv_tokens,
-            max_kv_len=max_kv_len,
-        )
-
-        encoder_hidden_states = []
-        for request in scheduled_requests.context_requests:
-            encoder_output = request.py_encoder_output
-            if encoder_output is None:
-                raise RuntimeError(
-                    f"Decoder context request {request.py_request_id} has no encoder output."
-                )
-            encoder_hidden_states.append(encoder_output)
-            request.py_batch_idx = request.py_seq_slot
-
-        cross_attention_inputs = self._prepare_enc_dec_cross_attn_inputs(
-            encoder_hidden_states,
-            encoder_seq_lens,
-            encoder_cached_token_lengths,
-            attn_metadata,
-            resource_manager,
-            encoder_kv_lens=buffers["encoder_kv_lengths"][:num_sequences],
-            context_encoder_kv_tokens=context_encoder_kv_tokens,
-            generation_encoder_kv_tokens=generation_encoder_kv_tokens,
-            max_encoder_kv_len=max_encoder_kv_len,
-        )
-
-        attn_all_rank_num_tokens = get_all_rank_num_tokens(
-            attn_metadata,
-            enable_attention_dp=self._config.enable_attention_dp,
-            mapping=self.mapping,
-            dist=self.dist,
-        )
-        (padded_num_tokens, can_run_piecewise_cuda_graph, attn_all_rank_num_tokens) = (
-            get_padding_params(
-                total_num_tokens,
-                scheduled_requests.num_context_requests,
-                attn_all_rank_num_tokens,
-                dist=self.dist,
-                enable_attention_dp=self._config.enable_attention_dp,
-                prefill_cuda_graph_backend=self._config.prefill_cuda_graph_backend,
-                prefill_cuda_graph_num_tokens=self._config.prefill_cuda_graph_num_tokens,
-            )
-        )
-        set_per_request_prefill_cuda_graph_flag(can_run_piecewise_cuda_graph)
-        attn_metadata.padded_num_tokens = (
-            padded_num_tokens if padded_num_tokens != total_num_tokens else None
-        )
-
-        virtual_num_tokens = total_num_tokens
-        if attn_metadata.padded_num_tokens is not None:
-            self._buffers.input_ids_cuda[total_num_tokens:padded_num_tokens].fill_(0)
-            self._buffers.position_ids_cuda[total_num_tokens:padded_num_tokens].fill_(0)
-            virtual_num_tokens = padded_num_tokens
-            final_position_ids = self._buffers.position_ids_cuda[:virtual_num_tokens].unsqueeze(0)
-
-        inputs = {
-            "attn_metadata": attn_metadata,
-            "input_ids": self._buffers.input_ids_cuda[:virtual_num_tokens],
-            "position_ids": final_position_ids,
-            "inputs_embeds": None,
-            "multimodal_params": [],
-            "resource_manager": resource_manager,
-        }
-        inputs.update(cross_attention_inputs)
-
-        self.iter_states["num_ctx_requests"] = scheduled_requests.num_context_requests
-        self.iter_states["num_ctx_tokens"] = num_context_tokens
-        self.iter_states["num_generation_tokens"] = num_generation_requests
-        self.iter_states["cached_kv_tokens"] = cached_kv_tokens
-        if self._inputs.log_cached_kv_tokens_per_req:
-            self._inputs.record_cached_kv_tokens_per_req(
-                buffers["cached_token_lengths"][:num_sequences].tolist(),
-                (
-                    (scheduled_requests.context_requests, 1),
-                    (scheduled_requests.generation_requests, 1),
-                ),
-            )
-
-        event = torch.cuda.Event()
-        event.record(torch.cuda.current_stream())
-        buffers["event"] = event
-        return PreparedInputs(inputs)

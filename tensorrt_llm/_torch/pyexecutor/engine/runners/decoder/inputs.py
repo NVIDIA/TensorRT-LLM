@@ -441,6 +441,83 @@ class DecoderInputPreparer:
             num_cached_tokens_per_seq
         ) - sum(counts)
 
+    def pad_tokens(
+        self,
+        attn_metadata: AttentionMetadata,
+        num_tokens: int,
+        num_contexts: int,
+        attn_all_rank_num_tokens: list[int] | None = None,
+        *,
+        allow_prefill_cuda_graph: bool = True,
+    ) -> int:
+        """Pad the batch to the token count its graph or attention-DP peers need.
+
+        Zeroes the padded input rows and returns the token count the model runs on.
+        """
+        if attn_all_rank_num_tokens is None:
+            attn_all_rank_num_tokens = get_all_rank_num_tokens(
+                attn_metadata,
+                enable_attention_dp=self._config.enable_attention_dp,
+                mapping=self.mapping,
+                dist=self.dist,
+            )
+        (padded_num_tokens, can_run_prefill_cuda_graph, attn_all_rank_num_tokens) = (
+            get_padding_params(
+                num_tokens,
+                num_contexts,
+                attn_all_rank_num_tokens,
+                dist=self.dist,
+                enable_attention_dp=self._config.enable_attention_dp,
+                prefill_cuda_graph_backend=(
+                    self._config.prefill_cuda_graph_backend
+                    if allow_prefill_cuda_graph
+                    else PrefillCudaGraphBackend.DISABLED
+                ),
+                prefill_cuda_graph_num_tokens=self._config.prefill_cuda_graph_num_tokens,
+            )
+        )
+        set_per_request_prefill_cuda_graph_flag(can_run_prefill_cuda_graph)
+        attn_metadata.padded_num_tokens = (
+            padded_num_tokens if padded_num_tokens != num_tokens else None
+        )
+
+        virtual_num_tokens = num_tokens
+        if attn_metadata.padded_num_tokens is not None:
+            self._buffers.input_ids_cuda[num_tokens:padded_num_tokens].fill_(0)
+            virtual_num_tokens = padded_num_tokens
+            if self._config.use_mrope:
+                # Zero-fill padding on dim 2 (token dim) of (3,1,N) buffer.
+                self._buffers.mrope_position_ids_cuda[:, :, num_tokens:padded_num_tokens].fill_(0)
+            else:
+                self._buffers.position_ids_cuda[num_tokens:padded_num_tokens].fill_(0)
+
+        if self._config.enable_attention_dp:
+            attn_metadata.all_rank_num_tokens = attn_all_rank_num_tokens
+        return virtual_num_tokens
+
+    def model_inputs(
+        self,
+        attn_metadata: AttentionMetadata,
+        resource_manager: ResourceManager | None,
+        num_tokens: int,
+        multimodal_params: list[MultimodalParams],
+    ) -> dict[str, Any]:
+        """Return the model inputs over the first ``num_tokens`` buffer rows."""
+        # MRoPE models always use the (3,1,N) layout, padded or not, to keep
+        # torch.compile guards stable.
+        if self._config.use_mrope:
+            position_ids = self._buffers.mrope_position_ids_cuda[:, :, :num_tokens]
+        else:
+            position_ids = self._buffers.position_ids_cuda[:num_tokens].unsqueeze(0)
+        return {
+            "attn_metadata": attn_metadata,
+            "input_ids": self._buffers.input_ids_cuda[:num_tokens],
+            "position_ids": position_ids,
+            "inputs_embeds": None,
+            "multimodal_params": multimodal_params,
+            "resource_manager": resource_manager,
+        }
+
     def _can_use_steady_gen_fast_prepare(
         self,
         scheduled_requests: ScheduledRequests,
@@ -549,37 +626,7 @@ class DecoderInputPreparer:
         with nvtx_range("steady_gen_metadata_prepare"):
             attn_metadata.prepare()
 
-        attn_all_rank_num_tokens = get_all_rank_num_tokens(
-            attn_metadata,
-            enable_attention_dp=self._config.enable_attention_dp,
-            mapping=self.mapping,
-            dist=self.dist,
-        )
-        padded_num_tokens, can_run_piecewise_cuda_graph, attn_all_rank_num_tokens = (
-            get_padding_params(
-                num_requests,
-                0,
-                attn_all_rank_num_tokens,
-                dist=self.dist,
-                enable_attention_dp=self._config.enable_attention_dp,
-                prefill_cuda_graph_backend=self._config.prefill_cuda_graph_backend,
-                prefill_cuda_graph_num_tokens=self._config.prefill_cuda_graph_num_tokens,
-            )
-        )
-        set_per_request_prefill_cuda_graph_flag(can_run_piecewise_cuda_graph)
-        attn_metadata.padded_num_tokens = (
-            padded_num_tokens if padded_num_tokens != num_requests else None
-        )
-        virtual_num_tokens = num_requests
-        if attn_metadata.padded_num_tokens is not None:
-            self._buffers.input_ids_cuda[num_requests:padded_num_tokens].fill_(0)
-            # Zero-fill the padding tail of whichever position layout the
-            # model consumes, matching the full pass.
-            if use_mrope:
-                self._buffers.mrope_position_ids_cuda[:, :, num_requests:padded_num_tokens].fill_(0)
-            else:
-                self._buffers.position_ids_cuda[num_requests:padded_num_tokens].fill_(0)
-            virtual_num_tokens = padded_num_tokens
+        virtual_num_tokens = self.pad_tokens(attn_metadata, num_requests, 0)
 
         self.iter_states["num_ctx_requests"] = 0
         self.iter_states["num_ctx_tokens"] = 0
@@ -588,19 +635,9 @@ class DecoderInputPreparer:
         if self.log_cached_kv_tokens_per_req:
             self.record_cached_kv_tokens_per_req(num_cached_tokens_per_seq)
 
-        if use_mrope:
-            final_position_ids = self._buffers.mrope_position_ids_cuda[:, :, :virtual_num_tokens]
-        else:
-            final_position_ids = self._buffers.position_ids_cuda[:virtual_num_tokens].unsqueeze(0)
-        inputs = {
-            "attn_metadata": attn_metadata,
-            "input_ids": self._buffers.input_ids_cuda[:virtual_num_tokens],
-            "position_ids": final_position_ids,
-            "inputs_embeds": None,
-            "multimodal_params": [],
-            "resource_manager": resource_manager,
-        }
-        return PreparedInputs(inputs)
+        return PreparedInputs(
+            self.model_inputs(attn_metadata, resource_manager, virtual_num_tokens, [])
+        )
 
     def _build_multimodal_data_for_llm(
         self,
@@ -1982,6 +2019,7 @@ class DecoderInputPreparer:
             )
 
         spec_all_rank_counts = None
+        attn_all_rank_num_tokens = None
         if scheduled_requests.attention_dp_phase is RemoteTailPhase.DECODE:
             attn_all_rank_num_tokens = self._get_remote_tail_decode_rank_tokens(
                 attn_metadata, maybe_graph
@@ -1990,48 +2028,16 @@ class DecoderInputPreparer:
             (attn_all_rank_num_tokens, spec_all_rank_counts) = (
                 self._get_all_rank_num_tokens_and_spec_counts(attn_metadata, spec_metadata)
             )
-        else:
-            attn_all_rank_num_tokens = get_all_rank_num_tokens(
-                attn_metadata,
-                enable_attention_dp=self._config.enable_attention_dp,
-                mapping=self.mapping,
-                dist=self.dist,
-            )
-        (padded_num_tokens, can_run_prefill_cuda_graph, attn_all_rank_num_tokens) = (
-            get_padding_params(
-                total_num_tokens,
-                host.num_ctx_requests,
-                attn_all_rank_num_tokens,
-                dist=self.dist,
-                enable_attention_dp=self._config.enable_attention_dp,
-                prefill_cuda_graph_backend=(
-                    PrefillCudaGraphBackend.DISABLED
-                    if host.remote_tail_modes
-                    or scheduled_requests.attention_dp_phase is RemoteTailPhase.CONTEXT
-                    else self._config.prefill_cuda_graph_backend
-                ),
-                prefill_cuda_graph_num_tokens=self._config.prefill_cuda_graph_num_tokens,
-            )
+        virtual_num_tokens = self.pad_tokens(
+            attn_metadata,
+            total_num_tokens,
+            host.num_ctx_requests,
+            attn_all_rank_num_tokens,
+            allow_prefill_cuda_graph=(
+                not host.remote_tail_modes
+                and scheduled_requests.attention_dp_phase is not RemoteTailPhase.CONTEXT
+            ),
         )
-        set_per_request_prefill_cuda_graph_flag(can_run_prefill_cuda_graph)
-        attn_metadata.padded_num_tokens = (
-            padded_num_tokens if padded_num_tokens != total_num_tokens else None
-        )
-
-        virtual_num_tokens = total_num_tokens
-        if attn_metadata.padded_num_tokens is not None:
-            self._buffers.input_ids_cuda[total_num_tokens:padded_num_tokens].fill_(0)
-            virtual_num_tokens = padded_num_tokens
-            if self._config.use_mrope:
-                # Zero-fill padding on dim 2 (token dim) of (3,1,N) buffer.
-                self._buffers.mrope_position_ids_cuda[
-                    :, :, total_num_tokens:padded_num_tokens
-                ].fill_(0)
-            else:
-                self._buffers.position_ids_cuda[total_num_tokens:padded_num_tokens].fill_(0)
-
-        if self._config.enable_attention_dp:
-            attn_metadata.all_rank_num_tokens = attn_all_rank_num_tokens
 
         host.spec_all_rank_counts = spec_all_rank_counts
         host.virtual_num_tokens = virtual_num_tokens
@@ -2047,23 +2053,9 @@ class DecoderInputPreparer:
         lora_params: dict[str, Any] | None,
         runtime_draft_len: int,
     ) -> dict[str, Any]:
-        virtual_num_tokens = host.virtual_num_tokens
-        # MRoPE models always use the (3,1,N) layout, padded or not, to keep
-        # torch.compile guards stable.
-        if self._config.use_mrope:
-            final_position_ids = self._buffers.mrope_position_ids_cuda[:, :, :virtual_num_tokens]
-        else:
-            final_position_ids = self._buffers.position_ids_cuda[:virtual_num_tokens].unsqueeze(0)
-
-        # Prepare inputs
-        inputs = {
-            "attn_metadata": attn_metadata,
-            "input_ids": self._buffers.input_ids_cuda[:virtual_num_tokens],
-            "position_ids": final_position_ids,
-            "inputs_embeds": None,
-            "multimodal_params": host.multimodal_params_list,
-            "resource_manager": resource_manager,
-        }
+        inputs = self.model_inputs(
+            attn_metadata, resource_manager, host.virtual_num_tokens, host.multimodal_params_list
+        )
         inputs.update(extra_model_inputs)
 
         if self._config.use_mrope:
