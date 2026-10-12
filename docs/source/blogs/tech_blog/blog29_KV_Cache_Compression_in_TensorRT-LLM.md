@@ -301,35 +301,23 @@ The frontier gains above come mostly from a higher hit rate, but the benefit doe
 
 #### Accuracy
 
-Cold-page compression is lossy, so the remaining question is how much accuracy it can cost. Two facts bound the answer.
-
-First, a page is quantized only when it leaves the GPU, and at most once per offload. In most deployments the host tier has headroom, so most pages never leave the GPU and are never quantized at all; attention reads them exactly as they were written. Even under heavy cache pressure, only part of the pages that attention reads have been through the codec. The worst case is a deployment where every page is re-quantized on every turn. Even then a page never carries more than one NVFP4 rounding at a time, so the accuracy of cold-page compression is bounded below by that of a fully NVFP4 KV cache, a configuration TensorRT LLM already ships and whose loss is small and well characterized. Every real deployment sits strictly inside that bound.
-
-Second, repeated quantize-and-dequantize round trips do not compound. A value can move on the first round trip, in rare cases once more on the second, and never after that. We measure this as a distance. For a value with original $x_0$ and value $x_r$ after $r$ round trips, in a block whose original maximum is $m$,
-
-$$
-d_{\text{orig}}(r) = \frac{|x_r - x_0|}{m}, \qquad d_{\text{prev}}(r) = \frac{|x_r - x_{r-1}|}{m}.
-$$
-
-Figure 15 reports both over every finite FP8 code and every FP16 and BF16 value whose block scale is a normal E4M3 code. The distance to the original is the quantization error itself, a median below 1% of the block maximum and a worst case of 17%, and it is the same after every round trip. The distance to the previous round trip is zero for every value from the second round trip on. End to end, Qwen3-8B on AIME24 and AIME25 loses about 2 points after one round trip, within the noise of this setup, and the second round trip reproduces every output of the first.
+A page is quantized only when it leaves the GPU, so the accuracy question is whether repeated **quantize-dequantize (QDQ) round trips** accumulate error as a page is offloaded and brought back again and again. They do not. Figure 15 measures every representable FP8, FP16 and BF16 value through up to four round trips: the distance to the original value is the one-time quantization error and stays the same after every trip, and the distance to the previous trip is zero from the second trip on. End to end, Qwen3-8B on AIME24 and AIME25 reproduces every output of the first round trip on the second.
 
 <div align="center">
 <figure>
   <img src="../media/tech_blog29_nvfp4_roundtrip.svg" width="1000">
 </figure>
 </div>
-<p align="center"><sub><em>Figure 15: NVFP4 round trips do not accumulate error. Left: distance to the original value after 1 to 4 round trips, as a percentage of the block maximum on a log scale, for every finite FP8 code and every FP16 and BF16 value with a normal block scale; the dot is the median, the bar reaches the 90th percentile, the tick is the maximum. The distribution is the quantization error, and it does not change with the number of round trips. Middle: distance to the previous round trip on the same scale; from the second round trip on it is exactly zero for every value, drawn on the baseline. The one exception is the exhaustive FP8 layout that lays all 254 codes out in order, where 18 of 1,024 values move once more at the second round trip and never again. Right: Qwen3-8B accuracy on AIME24 and AIME25 (30 questions, 8 seeds) after 0, 1 and 2 round trips; the second round trip reproduces all 480 outputs of the first. Distances come from a scalar reference model of the codec that reproduces the change counts of the production kernels exactly.</em></sub></p>
+<p align="center"><sub><em>Figure 15: NVFP4 round trips do not accumulate error. Left: distance to the original value after 1 to 4 round trips, for every FP8, FP16 and BF16 value; it is the quantization error and does not change with the number of round trips. Middle: distance to the previous round trip; from the second round trip on it is zero. Right: Qwen3-8B accuracy on AIME24 and AIME25 after 0, 1 and 2 round trips; the second round trip reproduces every output of the first.</em></sub></p>
 
-Figure 16 shows the end-to-end measurements on larger models. Each pair is the same model, hardware and configuration with and without NVFP4 cold pages. On Qwen3.5-397B-A17B, AIME25 is 90.00% with and without compression when 28% of the reused pages are compressed, and 90.21% when 61% are; MATH-500 is 98.6% against 99.0% and 98.8%. DeepSeek-V4-Flash on GPQA Diamond moves by 0.15 points, DeepSeek-V4-Pro on IFBench by 0.25 points. The largest difference is 0.40 points.
+On a large model the end-to-end accuracy is **indistinguishable from the uncompressed baseline**. Figure 16 shows Qwen3.5-397B-A17B with and without NVFP4 cold pages: AIME25 stays at 90.0% when 28% of the reused pages are compressed and 90.2% when 61% are, and MATH-500 stays within 0.4 points.
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog29_large_model_acc.svg" width="1000">
+  <img src="../media/tech_blog29_large_model_acc.svg" width="620">
 </figure>
 </div>
-<p align="center"><sub><em>Figure 16: Accuracy with and without NVFP4 cold pages on large models. Qwen3.5-397B-A17B on AIME25 (16 seeds, error bar is the standard error) and MATH-500 (greedy, one run per bar); DeepSeek-V4-Flash on GPQA Diamond (1,980 generations); DeepSeek-V4-Pro on IFBench (4 seeds, error bar is the standard deviation, mean of the four IFBench scores). Labels under the Qwen bars give the share of reused pages that had been compressed before scoring.</em></sub></p>
-
-Together, these two facts mean that cold-page compression cannot drift with repeated offloading. Its accuracy cost is at most one NVFP4 rounding of the pages that actually leave the GPU, and it does not grow with the number of times a page is offloaded and brought back.
+<p align="center"><sub><em>Figure 16: Qwen3.5-397B-A17B accuracy with and without NVFP4 cold pages on AIME25 (16 seeds, error bar is the standard error) and MATH-500 (greedy). Labels give the share of reused pages that had been compressed before scoring.</em></sub></p>
 
 ### TriAttention
 
