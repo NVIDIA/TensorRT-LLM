@@ -3808,6 +3808,7 @@ def _v2_kda_replay_stub(num_slots=4):
     mgr._request_id_to_is_dummy = {}
     mgr._kda_replay_suspended = set()
     mgr._kda_replay_acceptance_pending = set()
+    mgr._kda_replay_unseeded = set()
     mgr._host_state_indices = torch.zeros(num_slots, dtype=torch.int32)
     mgr.cuda_state_indices = torch.zeros(num_slots, dtype=torch.int32)
     mgr._dummy_request_mask = None
@@ -3918,6 +3919,39 @@ def test_v2_kda_replay_refuses_a_suspend_before_the_host_drafter_acceptance(
     mgr.suspend_request(request)
     assert mgr.committed_slots == [0]
     assert not mgr.kv_cache_map[1].is_active
+
+
+@pytest.mark.parametrize("seeded", [False, True], ids=["before_seeding", "after_seeding"])
+def test_v2_kda_replay_disagg_generation_request_suspends_its_transferred_state(
+    monkeypatch, seeded
+):
+    mgr = _v2_kda_replay_stub()
+    monkeypatch.setattr(KVCacheManagerV2, "prepare_resources", MagicMock())
+    request = SimpleNamespace(py_request_id=1, is_dummy=False, is_disagg_generation_init_state=True)
+    mgr.kv_cache_map[1] = _SlotCache(0)
+    _write_kda_replay_slot(mgr, 0, accepted=0, value=5.0)
+    mgr.prepare_resources(SimpleNamespace(context_requests=[request], generation_requests=[]))
+    request.is_disagg_generation_init_state = False
+    window = torch.arange(18.0).view(6, 3)
+    mgr.all_conv_states[0][0] = window
+    if seeded:
+        mgr.seed_kda_replay_caches_for_disagg_gen([1])
+
+    mgr.suspend_request(request)
+    assert mgr.committed_slots == ([0] if seeded else [])
+    assert 1 not in mgr._request_id_to_state_index
+    assert not mgr.kv_cache_map[1].is_active
+
+    mgr.kv_cache_map[1].slot = 2
+    mgr.kv_cache_map[1].is_active = True
+    mgr.all_conv_states[0][2] = window
+    mgr._setup_state_indices([request], num_contexts=0)
+    for section, name in enumerate(("kda_conv_q", "kda_conv_k", "kda_conv_v")):
+        assert torch.equal(getattr(mgr, name)[0, 2][:, :3], window[2 * section : 2 * section + 2])
+    assert not mgr._kda_replay_unseeded
+
+    mgr.suspend_request(request)
+    assert mgr.committed_slots == ([0, 2] if seeded else [2])
 
 
 def _v2_kda_replay_manager_with_large_slots():
@@ -4220,6 +4254,7 @@ def test_v2_kda_state_index_setup_relocates_generation_history():
 def test_v2_kda_replay_seeds_disaggregated_generation_slots():
     mgr = object.__new__(MambaHybridCacheManagerV2)
     mgr._use_kda_replay_update = True
+    mgr._kda_replay_unseeded = set()
     mgr.local_num_mamba_layers = 2
     mgr.conv_state_shape = [6, 4]
     mgr.conv_section_dims = [2, 2, 2]
@@ -4277,6 +4312,7 @@ def test_v2_kda_replay_seeds_bf16_conv_state_from_disagg_transfer():
     torch.manual_seed(0)
     mgr = object.__new__(MambaHybridCacheManagerV2)
     mgr._use_kda_replay_update = True
+    mgr._kda_replay_unseeded = set()
     mgr.local_num_mamba_layers = 2
     mgr.conv_state_shape = [6, 4]
     mgr.conv_section_dims = [2, 2, 2]
