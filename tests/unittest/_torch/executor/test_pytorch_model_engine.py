@@ -2072,12 +2072,13 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
             [_dummy_request() for _ in range(3)],
             [_dummy_request()],
         ])
-        model_engine._get_draft_kv_cache_manager = Mock(return_value=None)
+        runner = model_engine._runner
+        runner._get_draft_kv_cache_manager = Mock(return_value=None)
 
-        model_engine._create_cuda_graph_warmup_request(resource_manager,
-                                                       batch_size=4,
-                                                       draft_len=0,
-                                                       max_seq_len=512)
+        runner._create_cuda_graph_warmup_request(resource_manager,
+                                                 batch_size=4,
+                                                 draft_len=0,
+                                                 max_seq_len=512)
 
         self.assertEqual(
             kv_cache_manager.add_dummy_requests.call_args_list[0].args[0],

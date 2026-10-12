@@ -64,10 +64,6 @@ def _generate(model_path, prompts, *, localized: bool):
         # from the device rather than mocked: the mock only reaches the KV cache
         # allocator, so the fork/join runtime still requires real hardware.
         enable_locality_domains=localized,
-        env_overrides={
-            # Locality domains are only implemented in the Python backend.
-            "TLLM_KV_CACHE_MANAGER_V2_BACKEND": "python",
-        },
     ) as llm:
         return llm.generate(prompts, sampling_params=sampling)
 
