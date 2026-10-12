@@ -3,7 +3,7 @@
 
 import pytest
 import torch
-from _torch.thop.parallel._cute_dsl_bf16_rubin_test_utils import (
+from _torch.kernels.parallel._cute_dsl_bf16_rubin_test_utils import (
     RUBIN_CUTE_DSL_MARKS,
     bf16_matmul_atol,
     make_bf16_bmm_runner,
