@@ -1,7 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 620 330" width="620" height="330">
 <defs><marker id="ah" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto" markerUnits="userSpaceOnUse"><path d="M0,0.5 L7,4 L0,7.5" fill="none" stroke="#4f5d75" stroke-width="1"/></marker></defs>
 <rect width="620" height="330" fill="#f5f5f5"/>
-<text x="50.0" y="30.0" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">Accuracy with NVFP4 cold pages on large models (%)</text>
 <rect x="50" y="44" width="11" height="11" fill="#ffffff" stroke="#2d3142"/>
 <text x="66.0" y="53.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" fill="#4f5d75" text-anchor="start">uncompressed KV cache</text>
 <rect x="240" y="44" width="11" height="11" fill="rgba(118,185,0,0.08)" stroke="#76B900"/>
