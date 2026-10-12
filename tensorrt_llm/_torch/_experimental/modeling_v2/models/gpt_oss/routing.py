@@ -2,58 +2,57 @@
 # SPDX-License-Identifier: Apache-2.0
 """Where a GptOssForCausalLM config lands. Read this file and you know.
 
-One forward-reading decision tree per architecture family: the criteria are
-evaluated in the order a reader would ask them, and every branch that does not
-end in a target returns None (in ``auto`` the engine then uses the built-in
-GptOss implementation; in ``require`` it raises, quoting the trace below).
+``route`` is one forward-reading decision: the facts that fix which code runs,
+compared against the deployments the targets below were written for. When none
+fits it raises ``NoTarget`` stating those facts. In ``auto`` the engine then
+uses the built-in GptOss implementation; in ``require`` it raises that error.
 """
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Any, Optional, Tuple
 
-from ..._router_index import NULL_TRACE, ModelingV2Context, Trace
-
-# The one GPU architecture these targets are written for. sm is part of a
-# target's identity, not a knob: a different SM is a different target.
-_SM = (10, 3)
-
-# Config-shape fingerprint -> checkpoint identity. Sniffing the shape is the
-# upstream idiom (``is_mla``, ``is_nemotron_hybrid`` do the same). It buys
-# automatic routing at a stated cost: a *fine-tune* of this checkpoint has the
-# same shape and is routed here silently. The accuracy gate is what pins the
-# identity: it names the checkpoint this target was measured on.
-#
-# (num_hidden_layers, hidden_size, num_local_experts). Layer count alone
-# separates 120b from 20b, but the expert count is what makes the MoE operand
-# geometry this target declares correct, so it is part of the fingerprint.
-_CHECKPOINTS = {
-    (36, 2880, 128): "gpt_oss_120b",
-}
-
-_TARGETS = {
-    ("gpt_oss_120b", "tp1"): "ModelingV2GptOss120bSm103Tp1",
-}
-
-# Synthetic architecture name -> the module whose import registers it.
-TARGET_MODULES = {
-    "ModelingV2GptOss120bSm103Tp1": "models.gpt_oss.gpt_oss_120b__sm_103__tp1.modeling",
-}
+from ..._router_index import NoTarget
 
 
-def route(ctx: ModelingV2Context, trace: Trace = NULL_TRACE) -> Optional[str]:
-    c, m = ctx.pretrained_config, ctx.mapping
+def route(
+    pretrained_config: Any,
+    mapping: Any,
+    compute_capability: Tuple[int, int],
+    spec_config: Optional[Any],
+) -> type:
+    """Return the target class for this deployment, or raise ``NoTarget`` saying why none fits.
 
-    if not trace.check("sm", ctx.sm, ctx.sm == _SM):
-        return None
+    Each target is imported where it is returned, so declining costs no import
+    of modeling code.
+    """
+    # The checkpoint is recognized by its config shape, the upstream idiom
+    # (``is_mla``, ``is_nemotron_hybrid`` do the same). A fine-tune with the
+    # same shape routes here too; the accuracy gate is what pins the identity.
+    # The expert count is in the shape because it fixes the MoE operand
+    # geometry the target declares; layer count alone separates 120b from 20b.
+    shape = (
+        pretrained_config.num_hidden_layers,
+        pretrained_config.hidden_size,
+        pretrained_config.num_local_experts,
+    )
 
-    shape = (c.num_hidden_layers, c.hidden_size, c.num_local_experts)
-    ckpt = trace.resolve("shape", shape, _CHECKPOINTS.get(shape))
-    if ckpt is None:
-        return None
+    # gpt-oss-120b on one GB300 (sm103), no speculative decoding: the target
+    # implements no draft path, so claiming such a deployment would crash in
+    # the model instead of falling back.
+    if (
+        compute_capability == (10, 3)
+        and shape == (36, 2880, 128)
+        and mapping.world_size == 1
+        and spec_config is None
+    ):
+        from .gpt_oss_120b__sm_103__tp1.modeling import ModelingV2GptOss120bSm103Tp1
 
-    parallel = trace.resolve("parallel", f"ws={m.world_size}", "tp1" if m.world_size == 1 else None)
-    if parallel is None:
-        return None
+        return ModelingV2GptOss120bSm103Tp1
 
-    return _TARGETS.get((ckpt, parallel))
+    raise NoTarget(
+        f"compute capability {compute_capability}, config shape {shape}, "
+        f"{mapping.world_size} ranks, speculative decoding "
+        f"{type(spec_config).__name__ if spec_config is not None else 'off'}; "
+        "the one gpt_oss target is gpt-oss-120b on sm103, tp1, without speculative decoding"
+    )

@@ -38,6 +38,7 @@ if not TYPE_CHECKING and find_spec("kv_cache_manager_v2") is not None:
         DEFAULT_BEAM_INDEX,
         GPU_LEVEL,
         AttentionLayerConfig,
+        Batch,
         BatchDesc,
         BufferConfig,
         BufferId,
@@ -53,6 +54,7 @@ if not TYPE_CHECKING and find_spec("kv_cache_manager_v2") is not None:
         KVCacheManagerConfig,
         LayerGroupId,
         LayerId,
+        LogicError,
         MemAddress,
         OutOfPagesError,
         PageIndexMode,
@@ -89,6 +91,7 @@ else:
         DEFAULT_BEAM_INDEX,
         GPU_LEVEL,
         AttentionLayerConfig,
+        Batch,
         BatchDesc,
         BufferConfig,
         BufferId,
@@ -104,6 +107,7 @@ else:
         KVCacheManagerConfig,
         LayerGroupId,
         LayerId,
+        LogicError,
         MemAddress,
         OutOfPagesError,
         PageIndexMode,
@@ -456,6 +460,212 @@ class TestStorageStatistics(TestKVCacheManagerV2):
 
 
 class TestNoBatching(TestKVCacheManagerV2):
+    def test_batch_publishes_sparse_gpu_metadata(self) -> None:
+        import torch
+
+        self.manager = KVCacheManager(
+            KVCacheManagerConfig(
+                tokens_per_block=4,
+                cache_tiers=[GpuCacheTierConfig(4 << 20), HostCacheTierConfig(4 << 20)],
+                layers=[
+                    AttentionLayerConfig(0, [BufferConfig("key", 4096, is_sparse=True)]),
+                    AttentionLayerConfig(1, [BufferConfig("key", 4096)]),
+                ],
+            )
+        )
+        batch = Batch(self.manager, max_rows=3, max_blocks=4)
+        cache = self.manager.create_kv_cache()
+        sparse_group = self.manager.get_layer_group_id(0)
+        dense_group = self.manager.get_layer_group_id(1)
+        stream = torch.cuda.Stream()
+        with torch.cuda.stream(stream):
+            try:
+                self.assertTrue(cache.resume(stream.cuda_stream))
+                self.assertTrue(cache.resize(12, 6))
+                self.assertEqual(batch.add(cache, row=2), 2)
+                with self.assertRaises(LogicError):
+                    torch.from_dlpack(batch.page_table(sparse_group))
+                self.assertEqual(batch.publish(stream.cuda_stream), [0, 1, 2])
+                table = torch.from_dlpack(batch.page_table(sparse_group))
+                counts = torch.from_dlpack(batch.num_blocks(sparse_group))
+                dense_counts = torch.from_dlpack(batch.num_blocks(dense_group))
+                self.assertEqual(tuple(table.shape), (3, 1, 4))
+                self.assertEqual(table.dtype, torch.int32)
+                self.assertEqual(counts.cpu().tolist(), [[0], [0], [0]])
+                address = table.data_ptr()
+                batch.record_read(stream.cuda_stream)
+
+                old_version = cache.page_storage_version
+                self.assertTrue(cache.enter_decode())
+                self.assertFalse(cache.acknowledge_page_storage(old_version))
+                self.assertEqual(batch.dirty_rows, [2])
+                self.assertEqual(batch.publish(stream.cuda_stream), [2])
+                batch.wait_ready(stream.cuda_stream)
+                expected = [
+                    [[BAD_PAGE_INDEX] * 4],
+                    [[BAD_PAGE_INDEX] * 4],
+                    [list(cache.get_base_page_indices(sparse_group)) + [BAD_PAGE_INDEX]],
+                ]
+                self.assertEqual(table.cpu().tolist(), expected)
+                self.assertEqual(counts.cpu().tolist(), [[0], [0], [1]])
+                self.assertEqual(dense_counts.cpu().tolist(), [[0], [0], [0]])
+                self.assertFalse(cache.page_storage_dirty)
+                self.assertEqual(batch.publish(stream.cuda_stream), [])
+                batch.record_read(stream.cuda_stream)
+
+                cache.suspend()
+                self.assertEqual(batch.publish(stream.cuda_stream), [2])
+                self.assertEqual(counts.cpu().tolist(), [[0], [0], [0]])
+                self.assertEqual(table.cpu().tolist(), [[[BAD_PAGE_INDEX] * 4]] * 3)
+                self.assertTrue(cache.resume())
+                self.assertEqual(batch.publish(stream.cuda_stream), [2])
+                self.assertEqual(counts.cpu().tolist(), [[0], [0], [1]])
+                self.assertEqual(table.data_ptr(), address)
+                batch.record_read(stream.cuda_stream)
+                cache.close()
+                self.assertIsNone(cache.page_storage_row)
+                self.assertEqual(batch.publish(stream.cuda_stream), [2])
+                self.assertEqual(table.cpu().tolist(), [[[BAD_PAGE_INDEX] * 4]] * 3)
+                self.assertEqual(counts.cpu().tolist(), [[0], [0], [0]])
+                batch.close()
+                self.assertEqual(table.data_ptr(), address)
+                self.assertEqual(table.cpu().tolist(), [[[BAD_PAGE_INDEX] * 4]] * 3)
+                with self.assertRaises(LogicError):
+                    torch.from_dlpack(batch.page_table(sparse_group))
+            finally:
+                stream.synchronize()
+                batch.close()
+                cache.close()
+
+    @parameterized.expand(["decode", "suspend", "close"])
+    def test_shared_prefill_defers_sparse_offload(self, release: str) -> None:
+        import torch
+
+        self.manager = KVCacheManager(
+            KVCacheManagerConfig(
+                tokens_per_block=4,
+                cache_tiers=[GpuCacheTierConfig(4 << 20), HostCacheTierConfig(4 << 20)],
+                layers=[AttentionLayerConfig(0, [BufferConfig("key", 4096, is_sparse=True)])],
+            )
+        )
+        decoder = self.manager.create_kv_cache()
+        prefill = None
+        batch = Batch(self.manager, max_rows=1, max_blocks=3)
+        group = self.manager.get_layer_group_id(0)
+        stream = torch.cuda.Stream()
+        with torch.cuda.stream(stream):
+            try:
+                self.assertTrue(decoder.resume(stream.cuda_stream))
+                self.assertTrue(decoder.resize(12, 8))
+                decoder.commit([0, 1, 2, 3])
+                prefill = self.manager.create_kv_cache(ReuseScope(), [0, 1, 2, 3])
+                self.assertTrue(prefill.resume(stream.cuda_stream))
+                self.assertEqual(
+                    decoder.get_base_page_indices(group)[0], prefill.get_base_page_indices(group)[0]
+                )
+                self.assertTrue(decoder.enter_decode())
+                self.assertTrue(decoder.is_decoding)
+                deferred = decoder.get_page_storage_snapshot(group)
+                self.assertEqual(deferred.cache_levels, [0, 1, 0])
+                self.assertEqual(deferred.eligible_history_blocks, 0)
+                batch.add(decoder)
+                self.assertEqual(batch.publish(stream.cuda_stream), [0])
+                table = torch.from_dlpack(batch.page_table(group))
+                counts = torch.from_dlpack(batch.num_blocks(group))
+                address = table.data_ptr()
+                self.assertEqual(table.cpu().tolist(), [[deferred.base_page_indices]])
+                self.assertEqual(counts.cpu().tolist(), [[0]])
+                batch.record_read(stream.cuda_stream)
+                self.assertEqual(batch.publish(stream.cuda_stream), [])
+
+                if release == "decode":
+                    self.assertTrue(prefill.enter_decode())
+                elif release == "suspend":
+                    prefill.suspend()
+                else:
+                    prefill.close()
+                self.assertEqual(batch.publish(stream.cuda_stream), [0])
+                batch.wait_ready(stream.cuda_stream)
+                self.assertEqual(decoder.history_length, 8)
+                completed = decoder.get_page_storage_snapshot(group)
+                self.assertEqual(completed.cache_levels, [1, 1, 0])
+                self.assertEqual(completed.eligible_history_blocks, 2)
+                self.assertGreater(completed.version, deferred.version)
+                self.assertEqual(table.data_ptr(), address)
+                self.assertEqual(table.cpu().tolist(), [[completed.base_page_indices]])
+                self.assertEqual(counts.cpu().tolist(), [[2]])
+                batch.record_read(stream.cuda_stream)
+                self.assertEqual(batch.publish(stream.cuda_stream), [])
+            finally:
+                stream.synchronize()
+                batch.close()
+                decoder.close()
+                if prefill is not None:
+                    prefill.close()
+
+    def test_sparse_page_storage_metadata(self) -> None:
+        self.manager = KVCacheManager(
+            KVCacheManagerConfig(
+                tokens_per_block=4,
+                cache_tiers=[GpuCacheTierConfig(4 << 20), HostCacheTierConfig(4 << 20)],
+                layers=[
+                    AttentionLayerConfig(0, [BufferConfig("key", 4096, is_sparse=True)]),
+                    AttentionLayerConfig(1, [BufferConfig("key", 4096)]),
+                ],
+            )
+        )
+        self.assertTrue(self.manager.is_sparse(0, "key"))
+        self.assertFalse(self.manager.is_sparse(1, "key"))
+        sparse_group = self.manager.get_layer_group_id(0)
+        dense_group = self.manager.get_layer_group_id(1)
+        cache = self.manager.create_kv_cache()
+        with TemporaryCudaStream([]) as stream_holder:
+            stream = cast(CudaStream, stream_holder.handle)
+            try:
+                self.assertTrue(cache.resume(stream))
+                self.assertTrue(cache.resize(12, 6))
+                cache.bind_page_storage_row(3)
+                prefill = cache.get_page_storage_snapshot(sparse_group)
+                self.assertEqual(prefill.row, 3)
+                self.assertEqual(prefill.eligible_history_blocks, 0)
+                self.assertEqual(prefill.cache_levels, [0, 0, 0])
+                self.assertTrue(cache.acknowledge_page_storage(prefill.version))
+                self.assertFalse(cache.page_storage_dirty)
+                self.assertTrue(cache.enter_decode())
+                self.assertTrue(cache.page_storage_dirty)
+                self.assertFalse(cache.acknowledge_page_storage(prefill.version))
+                decode = cache.get_page_storage_snapshot(sparse_group)
+                self.assertEqual(decode.version, cache.page_storage_version)
+                self.assertEqual(decode.eligible_history_blocks, 1)
+                self.assertEqual(decode.cache_levels, [1, 0, 0])
+                self.assertEqual(
+                    decode.base_page_indices, list(cache.get_base_page_indices(sparse_group))
+                )
+                self.assertEqual(
+                    cache.get_page_storage_snapshot(dense_group).eligible_history_blocks, 0
+                )
+                copied_indices = decode.base_page_indices
+                copied_indices[0] = BAD_PAGE_INDEX
+                self.assertNotEqual(decode.base_page_indices[0], BAD_PAGE_INDEX)
+                decode.wait_ready(stream)
+                cache.record_page_storage_read(stream)
+                self.assertTrue(cache.acknowledge_page_storage(decode.version))
+                cache.commit([0, 1, 2, 3])
+                self.assertTrue(cache.page_storage_dirty)
+                cache.suspend()
+                suspended = cache.get_page_storage_snapshot(sparse_group)
+                self.assertEqual(suspended.base_page_indices, [BAD_PAGE_INDEX] * 3)
+                self.assertEqual(suspended.cache_levels, [None] * 3)
+                self.assertEqual(suspended.eligible_history_blocks, 0)
+                self.assertEqual(cache.page_storage_row, 3)
+                self.assertTrue(cache.resume())
+                cache.bind_page_storage_row(None)
+                self.assertIsNone(cache.page_storage_row)
+            finally:
+                cache.close()
+        stream_holder.take_finish_event().synchronize()
+        self.assertEqual(cache.get_page_storage_snapshot(sparse_group).base_page_indices, [])
+
     class Request(NamedTuple):
         id: int
         kv_cache: _KVCache
