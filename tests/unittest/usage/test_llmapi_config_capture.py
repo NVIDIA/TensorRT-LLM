@@ -720,6 +720,7 @@ def test_collect_llm_api_config_captures_max_total_draft_tokens_for_every_arm():
 def test_collect_llm_api_config_captures_sparse_algorithm_for_every_arm():
     """Every reachable sparse algorithm Literal is captured from its active model arm."""
     from tensorrt_llm.llmapi.llm_args import (
+        CSA2SparseAttentionConfig,
         DeepSeekSparseAttentionConfig,
         DeepSeekV4SparseAttentionConfig,
         MiniMaxM3SparseAttentionConfig,
@@ -733,6 +734,7 @@ def test_collect_llm_api_config_captures_sparse_algorithm_for_every_arm():
         QSASparseAttentionConfig(),
         DeepSeekSparseAttentionConfig(),
         DeepSeekV4SparseAttentionConfig(),
+        CSA2SparseAttentionConfig(),
         RocketSparseAttentionConfig(),
         SkipSoftmaxAttentionConfig(),
         MiniMaxM3SparseAttentionConfig(),
