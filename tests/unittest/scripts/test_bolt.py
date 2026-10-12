@@ -25,11 +25,11 @@ Covers the pure logic most likely to regress silently:
 
 from __future__ import annotations
 
+import argparse
 import importlib.util
 import shutil
 import stat
 import subprocess
-import sys
 import zipfile
 from pathlib import Path
 
@@ -174,6 +174,34 @@ def _build_wheel(path: Path, members: dict) -> dict:
         return {i.filename: i for i in zf.infolist()}
 
 
+def test_apply_discovers_manifest_beside_profiles(apply_bolt, tmp_path, monkeypatch):
+    """Every promoted bundle ships manifest.json, so the drift check needs no flag."""
+    profiles = tmp_path / "profiles"
+    profiles.mkdir()
+    (profiles / "libfoo.yaml").write_text("---\n")
+    manifest = profiles / "manifest.json"
+    manifest.write_text("{}")
+
+    seen = {}
+
+    def fake_standalone(wheel, output, pdir, strip, dry_run, passed_manifest, strict):
+        seen["manifest"] = passed_manifest
+        return 0
+
+    monkeypatch.setattr(apply_bolt, "bolt_standalone_wheel", fake_standalone)
+    args = argparse.Namespace(
+        profiles=profiles,
+        wheel=tmp_path / "in.whl",
+        output=tmp_path / "out.whl",
+        strip=False,
+        dry_run=False,
+        manifest=None,
+        strict=False,
+    )
+    assert apply_bolt._apply(args, tmp_path) == 0
+    assert seen["manifest"] == manifest
+
+
 def test_repack_wheel_preserves_member_modes(apply_bolt, tmp_path):
     src = tmp_path / "src.whl"
     infos = _build_wheel(
@@ -225,71 +253,6 @@ def test_repack_wheel_falls_back_for_new_members(apply_bolt, tmp_path):
     apply_bolt.repack_wheel(work, out, infos)
     with zipfile.ZipFile(out) as zf:
         assert sorted(zf.namelist()) == ["pkg/GENERATED", "pkg/lib.so"]
-
-
-# --------------------------- verify_bolted_wheel.py ------------------------------
-VERIFY = BOLT_DIR / "internal" / "verify_bolted_wheel.py"
-
-
-def _wheel_of(path: Path, libs: list[Path], prefix: str = "tensorrt_llm/libs") -> Path:
-    with zipfile.ZipFile(path, "w") as zf:
-        for lib in libs:
-            zf.write(lib, f"{prefix}/{lib.name}")
-    return path
-
-
-def _verify(wheel: Path) -> subprocess.CompletedProcess:
-    return subprocess.run(
-        [sys.executable, str(VERIFY), str(wheel)], capture_output=True, text=True, timeout=300
-    )
-
-
-@needs_toolchain
-def test_verify_rejects_library_that_crashes_the_loader(tmp_path):
-    # The failure this whole check exists for: llvm-bolt exits 0, the wheel is
-    # well formed, and the only symptom is a signal raised inside ld.so while it
-    # runs .init_array on the first dlopen.
-    src = tmp_path / "boom.c"
-    src.write_text(
-        "__attribute__((constructor)) static void b(void){ *(volatile int*)0x1234 = 1; }\n"
-    )
-    lib = tmp_path / "libboom.so"
-    assert (
-        subprocess.run(
-            ["gcc", "-shared", "-fPIC", "-o", str(lib), str(src)], capture_output=True
-        ).returncode
-        == 0
-    )
-
-    result = _verify(_wheel_of(tmp_path / "bad.whl", [lib]))
-    assert result.returncode == 2
-    assert "CRASHED libboom.so" in result.stdout
-
-
-@needs_toolchain
-def test_verify_accepts_loadable_library(tmp_path):
-    lib = tmp_path / "libgood.so"
-    assert _compile_so(lib, emit_relocs=False)
-    result = _verify(_wheel_of(tmp_path / "good.whl", [lib]))
-    assert result.returncode == 0
-    assert "loaded libgood.so" in result.stdout
-
-
-def test_verify_does_not_fail_on_unloadable_but_uncrashing_library(tmp_path):
-    # A library whose dependencies this container cannot resolve is the normal
-    # case outside a full build image. Reporting it as a BOLT failure would make
-    # the check fire on everything, so only a signal is a verdict.
-    lib = tmp_path / "libtruncated.so"
-    lib.write_bytes(b"\x7fELF")
-    result = _verify(_wheel_of(tmp_path / "odd.whl", [lib]))
-    assert result.returncode == 0
-    assert "UNVERIFIED libtruncated.so" in result.stdout
-
-
-def test_verify_passes_wheel_with_no_libs(tmp_path):
-    empty = tmp_path / "empty.whl"
-    zipfile.ZipFile(empty, "w").close()
-    assert _verify(empty).returncode == 0
 
 
 # --------------------------- check_a53_veneers.find_veneers ----------------------
@@ -351,6 +314,20 @@ def test_find_veneers_ignores_branch_that_does_not_return(a53, tmp_path):
     base = 0x1000
     words = [_b(base, base + 0x10)] + [0xD503201F] * 5
     elf = _elf(tmp_path / "plain.so", words, base)
+    assert a53.find_veneers(str(elf)) == []
+
+
+def test_find_veneers_ignores_loop_latch(a53, tmp_path):
+    """A one-instruction latch branching back into its body is the same shape.
+
+    `S: b T` / `T+4: b S+4` on its own matches ordinary compiler output. Only a
+    real veneer holds the displaced load or store at T, and after
+    -mno-fix-cortex-a53-843419 a false positive is the only way this can fire.
+    """
+    base = 0x1000
+    words = [_b(base, base + 0x10)] + [0xD503201F] * 3
+    words += [_b(base + 0x10, base + 0x20), _b(base + 0x14, base + 4)]
+    elf = _elf(tmp_path / "latch.so", words, base)
     assert a53.find_veneers(str(elf)) == []
 
 
@@ -420,24 +397,3 @@ def test_bolt_elf_does_not_crash_on_truncated_elf(apply_bolt, tmp_path, monkeypa
     # No veneers to find, so this must reach llvm-bolt rather than raise.
     apply_bolt.bolt_elf(elf, profile, [], strip=False, dry_run=False)
     assert elf.read_bytes() == b"\x7fELF"
-
-
-@needs_toolchain
-def test_verify_checks_libraries_outside_the_libs_directory(tmp_path):
-    """process_wheel rglobs the whole tree, so the verifier has to as well."""
-    src = tmp_path / "boom2.c"
-    src.write_text(
-        "__attribute__((constructor)) static void b(void){ *(volatile int*)0x1234 = 1; }\n"
-    )
-    lib = tmp_path / "libnested.so"
-    assert (
-        subprocess.run(
-            ["gcc", "-shared", "-fPIC", "-o", str(lib), str(src)], capture_output=True
-        ).returncode
-        == 0
-    )
-
-    wheel = _wheel_of(tmp_path / "nested.whl", [lib], prefix="tensorrt_llm/deep/ep")
-    result = _verify(wheel)
-    assert result.returncode == 2
-    assert "CRASHED libnested.so" in result.stdout

@@ -283,7 +283,7 @@ def process_wheel(
             zf.extractall(wd)
 
         if manifest is not None:
-            verify_manifest(manifest, wd, strict)
+            verify_manifest(manifest, wd, strict, subset=True)
 
         bolted = 0
         changed: list[Path] = []
@@ -365,9 +365,10 @@ def bolt_standalone_wheel(
         bolted = process_wheel(
             output, profiles_dir, DEFAULT_BOLT_FLAGS, strip, False, manifest, strict
         )
-    except BoltApplyError:
+    except (BoltApplyError, SystemExit):
         # Partially bolted: drop it rather than leave something uploadable that
-        # looks finished.
+        # looks finished. SystemExit covers --strict manifest verification,
+        # which rejects the wheel after the copy above has already been made.
         output.unlink(missing_ok=True)
         raise
     if bolted == 0:
@@ -398,7 +399,7 @@ def _rewrite_record(record_path: Path, wheel_root: Path, changed: list[Path]) ->
 # ---------------------------------------------------------------------------
 # Manifest verification (optional)
 # ---------------------------------------------------------------------------
-def verify_manifest(manifest_path: Path, tree: Path, strict: bool) -> None:
+def verify_manifest(manifest_path: Path, tree: Path, strict: bool, subset: bool = False) -> None:
     manifest = json.loads(manifest_path.read_text())
     want = manifest.get("original_elf_sha256", {})
     if not want:
@@ -413,7 +414,10 @@ def verify_manifest(manifest_path: Path, tree: Path, strict: bool) -> None:
     for name, h in want.items():
         got = found.get(name)
         if got is None:
-            mismatches.append(f"missing in tarball: {name}")
+            # A wheel ships a subset of what profilegen recorded, so an entry
+            # with nothing to compare against is not a defect on that path.
+            if not subset:
+                mismatches.append(f"missing in tarball: {name}")
         elif got != h:
             mismatches.append(f"hash mismatch (rebuilt since profiling?): {name}")
     if mismatches:
@@ -424,7 +428,7 @@ def verify_manifest(manifest_path: Path, tree: Path, strict: bool) -> None:
         log("WARNING: " + msg)
         log("(continuing; -infer-stale-profile will absorb drift. Use --strict to fail.)")
     else:
-        log(f"manifest verify OK ({len(want)} ELF hashes matched)")
+        log(f"manifest verify OK ({len(found)} of {len(want)} ELF hashes matched)")
 
 
 # ---------------------------------------------------------------------------

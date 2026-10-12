@@ -46,12 +46,27 @@ Exit codes:
 """
 
 import argparse
+import mmap
+import os
+import re
 import struct
 import sys
 
 EM_AARCH64 = 183
 SHF_EXECINSTR = 0x4
 B_MASK, B_OP = 0xFC000000, 0x14000000
+# A64 top-level "Loads and stores" encoding class: bits 28..25 are x1x0.
+LDST_MASK, LDST_OP = 0x0A000000, 0x08000000
+
+# Bits 31..26 of an unconditional `b` are 0b000101, so its most significant byte
+# is 0x14..0x17. Testing that one byte per instruction keeps the Python-level
+# work proportional to the number of branches rather than the number of
+# instructions.
+_B_HIGH_BYTE = re.compile(rb"[\x14-\x17]")
+
+# Instruction bytes per strided copy. Bounds the extra memory the scan needs to
+# a quarter of this, independent of how large .text is.
+_CHUNK = 1 << 23
 
 
 def _sx(value: int, bits: int) -> int:
@@ -65,18 +80,19 @@ def _branch_target(word: int, addr: int) -> int | None:
     return addr + (_sx(word & 0x03FFFFFF, 26) << 2)
 
 
-def exec_sections(f) -> list[tuple[int, bytes]]:
-    """(vaddr, contents) for each executable section of an AArch64 ELF64.
+def exec_ranges(mm) -> list[tuple[int, int, int]]:
+    """(vaddr, file offset, size) for each executable section of an AArch64 ELF64.
 
     Returns [] for anything else, so callers can treat "not applicable" and
-    "nothing found" the same way.
+    "nothing found" the same way. Offsets rather than contents: .text runs to
+    tens of megabytes and the scan below reads it through the mapping.
     """
 
     def field(offset: int, fmt: str):
         """Unpack a fixed-width header field, or None if the file is short."""
-        f.seek(offset)
-        raw = f.read(struct.calcsize(fmt))
-        return struct.unpack(fmt, raw) if len(raw) == struct.calcsize(fmt) else None
+        size = struct.calcsize(fmt)
+        raw = mm[offset : offset + size]
+        return struct.unpack(fmt, raw) if len(raw) == size else None
 
     # A four-byte \x7fELF prefix is enough for apply_bolt.is_elf to send a file
     # here, so every read below has to tolerate a truncated one.
@@ -101,47 +117,69 @@ def exec_sections(f) -> list[tuple[int, bytes]]:
 
     out = []
     for i in range(shnum):
-        f.seek(shoff + i * shentsize)
-        hdr = f.read(64)
-        if len(hdr) < 64:
+        hdr = field(shoff + i * shentsize, "<IIQQQQ")
+        if hdr is None:
             break
-        _, sh_type, sh_flags, sh_addr, sh_offset, sh_size = struct.unpack_from("<IIQQQQ", hdr, 0)
+        _, sh_type, sh_flags, sh_addr, sh_offset, sh_size = hdr
         if sh_type == 8 or not sh_size:  # SHT_NOBITS / empty
             continue
         if not sh_flags & SHF_EXECINSTR:
             continue
-        f.seek(sh_offset)
-        out.append((sh_addr, f.read(sh_size)))
+        # A malformed or truncated file can describe a section past the end.
+        sh_size = min(sh_size, max(0, len(mm) - sh_offset))
+        if sh_size >= 4:
+            out.append((sh_addr, sh_offset, sh_size))
     return out
+
+
+def _branch_sites(mm, mv, vaddr: int, off: int, size: int):
+    """Yield (addr, word) for each unconditional `b` in one executable range."""
+    size -= size % 4
+    for start in range(0, size, _CHUNK):
+        n = min(_CHUNK, size - start)
+        n -= n % 4
+        base = off + start
+        for match in _B_HIGH_BYTE.finditer(bytes(mv[base + 3 : base + n : 4])):
+            at = base + 4 * match.start()
+            yield vaddr + start + 4 * match.start(), int.from_bytes(mm[at : at + 4], "little")
 
 
 def find_veneers(path: str) -> list[tuple[int, int]]:
     """(branch_site, veneer) for every erratum-843419 veneer round trip."""
     with open(path, "rb") as f:
-        secs = exec_sections(f)
-    if not secs:
-        return []
+        if os.fstat(f.fileno()).st_size == 0:
+            return []
+        with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+            ranges = exec_ranges(mm)
+            if not ranges:
+                return []
 
-    def word_at(va: int) -> int | None:
-        for base, data in secs:
-            if base <= va < base + len(data) - 3:
-                return struct.unpack_from("<I", data, va - base)[0]
-        return None
+            def word_at(va: int) -> int | None:
+                for vaddr, off, size in ranges:
+                    if vaddr <= va <= vaddr + size - 4:
+                        at = off + (va - vaddr)
+                        return int.from_bytes(mm[at : at + 4], "little")
+                return None
 
-    found = []
-    for base, data in secs:
-        words = struct.unpack_from(f"<{len(data) // 4}I", data, 0)
-        for i, word in enumerate(words):
-            src = base + 4 * i
-            tgt = _branch_target(word, src)
-            if tgt is None or tgt == src:
-                continue
-            back = word_at(tgt + 4)
-            if back is None:
-                continue
-            if _branch_target(back, tgt + 4) == src + 4:
-                found.append((src, tgt))
-    return found
+            mv = memoryview(mm)
+            found = []
+            for vaddr, off, size in ranges:
+                for src, word in _branch_sites(mm, mv, vaddr, off, size):
+                    tgt = _branch_target(word, src)
+                    if tgt is None or tgt == src:
+                        continue
+                    # A real veneer holds the displaced load or store. Without
+                    # this, any `S: b T` / `T+4: b S+4` pair matches, and
+                    # ordinary code produces those: a loop whose latch is a
+                    # single branch back into the body is the same shape.
+                    head = word_at(tgt)
+                    if head is None or (head & LDST_MASK) != LDST_OP:
+                        continue
+                    back = word_at(tgt + 4)
+                    if back is not None and _branch_target(back, tgt + 4) == src + 4:
+                        found.append((src, tgt))
+            mv.release()
+            return found
 
 
 def main() -> int:
