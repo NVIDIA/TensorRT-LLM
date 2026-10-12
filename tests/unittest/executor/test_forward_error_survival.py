@@ -54,6 +54,7 @@ def _validating_executor(model):
     """Executor shell exposing only what _validate_request touches."""
     executor = object.__new__(PyExecutor)
     executor.kv_cache_transceiver = None
+    executor.kv_cache_manager = None
     executor.model_engine = SimpleNamespace(model=model)
     executor.sampler = Mock()
     executor._validate_token_id_range = Mock()
