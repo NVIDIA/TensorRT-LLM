@@ -2,10 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """Where a KimiK3ForConditionalGeneration config lands. Read this file and you know.
 
-One forward-reading decision tree per architecture family: the criteria are
-evaluated in the order a reader would ask them, and every branch that does not
-end in a target returns None (in ``auto`` the engine then uses the built-in
-Kimi K3 implementation; in ``require`` it raises, quoting the trace below).
+``route`` is one forward-reading decision: the facts that fix which code runs,
+compared against the deployments the targets below were written for. When none
+fits it raises ``NoTarget`` stating those facts. In ``auto`` the engine then
+uses the built-in Kimi K3 implementation; in ``require`` it raises that error.
 
 The checkpoint declares the vision-language wrapper, and the language model's
 shape lives in its ``text_config``, so that is what this tree reads. The
@@ -14,41 +14,25 @@ targets are text-only: they load no vision tower and refuse image input.
 
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any, Optional, Tuple
 
 from tensorrt_llm.quantization.mode import QuantAlgo
 
-from ..._router_index import NULL_TRACE, ModelingV2Context, Trace
+from ..._router_index import NoTarget
 
 # The one GPU architecture these targets are written for. sm is part of a
 # target's identity, not a knob: a different SM is a different target. The K3
 # decode kernels (the tcgen05 GEMVs, the fused MoE) are built for GB200 only.
 _SM = (10, 0)
 
-# Config-shape fingerprint -> checkpoint identity; see the note in the sibling
-# gpt_oss routing module for what shape-sniffing does and does not pin.
+# The MXFP4 checkpoint's config shape; see the note in the sibling gpt_oss
+# routing module for what shape-sniffing does and does not pin.
 #
 # (num_hidden_layers, hidden_size, num_experts, routed_expert_hidden_size), all
 # read from ``text_config``. The NVFP4 requant of the same checkpoint has this
-# shape too; the quantization criterion below is what keeps it out.
-_CHECKPOINTS = {
-    (93, 7168, 896, 3584): "kimi_k3_mxfp4",
-}
-
-_TARGETS = {
-    ("kimi_k3_mxfp4", "tp16_moetp4ep4"): "ModelingV2KimiK3Mxfp4Sm100Tp16Moetp4ep4",
-    ("kimi_k3_mxfp4", "tp16_moetp16ep1"): "ModelingV2KimiK3Mxfp4Sm100Tp16Moetp16ep1",
-}
-
-# Synthetic architecture name -> the module whose import registers it.
-TARGET_MODULES = {
-    "ModelingV2KimiK3Mxfp4Sm100Tp16Moetp4ep4": (
-        "models.kimi_k3_vl.kimi_k3_mxfp4__sm_100__tp16_moetp4ep4.modeling"
-    ),
-    "ModelingV2KimiK3Mxfp4Sm100Tp16Moetp16ep1": (
-        "models.kimi_k3_vl.kimi_k3_mxfp4__sm_100__tp16_moetp16ep1.modeling"
-    ),
-}
+# shape too; the quantization criterion below reads only what ``config.json``
+# declares, since ``route`` does not see ``hf_quant_config.json``.
+_SHAPE = (93, 7168, 896, 3584)
 
 
 def _field(config: Any, name: str) -> Any:
@@ -58,18 +42,26 @@ def _field(config: Any, name: str) -> Any:
     return getattr(config, name, None)
 
 
-def _mxfp4(quant_config: Any) -> bool:
-    """Whether the checkpoint is the MXFP4 one these targets load.
+def _quant_algo(pretrained_config: Any) -> Optional[QuantAlgo]:
+    """The quantization the checkpoint's config declares, as the engine reads it.
 
     The MXFP4 checkpoint declares its quantization inside
     ``text_config.quantization_config`` (compressed-tensors,
     ``mxfp4-pack-quantized``); ``KimiK3Config`` surfaces it and the model
-    config reads it as W4A16_MXFP4. The NVFP4 requant ships
-    ``hf_quant_config.json`` and reads as MIXED_PRECISION, and a checkpoint
-    without quantization reads as none; the experts of either would land in a
-    loader that reads packed MXFP4 tensors.
+    config reads it as W4A16_MXFP4. A checkpoint without quantization reads as
+    none; the experts of either would land in a loader that reads packed MXFP4
+    tensors.
     """
-    return quant_config is not None and quant_config.quant_algo == QuantAlgo.W4A16_MXFP4
+    from tensorrt_llm._torch.model_config import ModelConfig
+
+    declared = getattr(pretrained_config, "quantization_config", None)
+    if declared is None:
+        return None
+    try:
+        quant_config, _ = ModelConfig.load_hf_quant_config(declared, "TRTLLM")
+    except ValueError:
+        return None
+    return quant_config.quant_algo
 
 
 def _parallel(m) -> Optional[str]:
@@ -97,41 +89,58 @@ def _parallel(m) -> Optional[str]:
     return None
 
 
-def route(ctx: ModelingV2Context, trace: Trace = NULL_TRACE) -> Optional[str]:
-    c, m = ctx.pretrained_config, ctx.mapping
+def route(
+    pretrained_config: Any,
+    mapping: Any,
+    compute_capability: Tuple[int, int],
+    spec_config: Optional[Any],
+) -> type:
+    """Return the target class for this deployment, or raise ``NoTarget`` saying why none fits.
 
-    if not trace.check("sm", ctx.sm, ctx.sm == _SM):
-        return None
-
-    t = getattr(c, "text_config", None)
-    if not trace.check("text_config", type(t).__name__, t is not None):
-        return None
-
-    shape = tuple(
-        _field(t, name)
-        for name in (
-            "num_hidden_layers",
-            "hidden_size",
-            "num_experts",
-            "routed_expert_hidden_size",
+    Each target is imported where it is returned, so declining costs no import
+    of modeling code.
+    """
+    text_config = getattr(pretrained_config, "text_config", None)
+    shape = (
+        None
+        if text_config is None
+        else tuple(
+            _field(text_config, name)
+            for name in (
+                "num_hidden_layers",
+                "hidden_size",
+                "num_experts",
+                "routed_expert_hidden_size",
+            )
         )
     )
-    ckpt = trace.resolve("shape", shape, _CHECKPOINTS.get(shape))
-    if ckpt is None:
-        return None
-
-    quant_algo = getattr(ctx.quant_config, "quant_algo", None)
-    if not trace.check("quant", quant_algo, _mxfp4(ctx.quant_config)):
-        return None
-
-    parallel = trace.resolve(
-        "parallel",
-        f"ws={m.world_size} tp={m.tp_size} pp={m.pp_size} moe_tp={m.moe_tp_size} "
-        f"moe_ep={m.moe_ep_size} split_set={getattr(m, 'moe_tp_ep_user_specified', False)} "
-        f"attention_dp={m.enable_attention_dp}",
-        _parallel(m),
+    quant_algo = _quant_algo(pretrained_config)
+    parallel = _parallel(mapping)
+    mxfp4_on_sm100 = (
+        compute_capability == _SM and shape == _SHAPE and quant_algo == QuantAlgo.W4A16_MXFP4
     )
-    if parallel is None:
-        return None
 
-    return _TARGETS.get((ckpt, parallel))
+    if mxfp4_on_sm100 and parallel == "tp16_moetp4ep4":
+        from .kimi_k3_mxfp4__sm_100__tp16_moetp4ep4.modeling import (
+            ModelingV2KimiK3Mxfp4Sm100Tp16Moetp4ep4,
+        )
+
+        return ModelingV2KimiK3Mxfp4Sm100Tp16Moetp4ep4
+
+    if mxfp4_on_sm100 and parallel == "tp16_moetp16ep1":
+        from .kimi_k3_mxfp4__sm_100__tp16_moetp16ep1.modeling import (
+            ModelingV2KimiK3Mxfp4Sm100Tp16Moetp16ep1,
+        )
+
+        return ModelingV2KimiK3Mxfp4Sm100Tp16Moetp16ep1
+
+    raise NoTarget(
+        f"compute capability {compute_capability}, text_config shape {shape}, "
+        f"quantization {quant_algo.name if quant_algo is not None else 'none'}, parallel "
+        f"ws={mapping.world_size} tp={mapping.tp_size} pp={mapping.pp_size} "
+        f"moe_tp={mapping.moe_tp_size} moe_ep={mapping.moe_ep_size} "
+        f"split_set={getattr(mapping, 'moe_tp_ep_user_specified', False)} "
+        f"attention_dp={mapping.enable_attention_dp}; the kimi_k3_vl targets are the MXFP4 "
+        "Kimi K3 checkpoint on sm100 (GB200), 16 ranks of tensor-parallel attention, with the "
+        "experts split moe_tp 4 x moe_ep 4 or, set explicitly, moe_tp 16 x moe_ep 1"
+    )

@@ -123,7 +123,7 @@ from tensorrt_llm._torch.models.modeling_dspark import (
 )
 from tensorrt_llm._torch.models.modeling_kimi_linear import KimiLinearForCausalLM
 from tensorrt_llm._torch.models.modeling_speculative import SpecDecOneEngineForCausalLM
-from tensorrt_llm._torch.models.modeling_utils import DecoderModel, register_auto_model
+from tensorrt_llm._torch.models.modeling_utils import DecoderModel
 from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
 from tensorrt_llm._torch.modules.kimi_k3_mla import KimiK3MLAAttention
 from tensorrt_llm._torch.modules.kimi_kda import KimiKDALinearAttention
@@ -3125,7 +3125,7 @@ def _row_parallel_reduce(linear: nn.Module, partial: torch.Tensor) -> torch.Tens
 
 
 # ----------------------------------------------------------------------------------------------------------------------
-# The target: step classification, the construction checks and the registration shell.
+# The target: step classification, the construction checks and the class route returns.
 # ----------------------------------------------------------------------------------------------------------------------
 
 
@@ -3282,9 +3282,8 @@ def _check_construction(model_config: ModelConfig) -> None:
     )
 
 
-@register_auto_model("ModelingV2KimiK3Mxfp4Sm100Tp16Moetp4ep4")
 class ModelingV2KimiK3Mxfp4Sm100Tp16Moetp4ep4(KimiLinearForCausalLM):
-    """The registration shell: this target's text model (`KimiLinearModel` above) behind its checks.
+    """The class ``route`` returns: this target's text model (`KimiLinearModel` above) behind its checks.
 
     It inherits the built-in Kimi K3 causal LM for the checkpoint load and the engine hooks (`load_weights` through
     weights.py, the KDA metadata class, the model defaults), which walk the model by its module names; the text model

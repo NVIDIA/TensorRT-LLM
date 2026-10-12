@@ -30,13 +30,15 @@ there is no substring that could claim an unrelated entry, and no
 `mtp_nextn=0`-style carve-out is needed.
 
 Outward fallback: not needed, and that is a property of the design
-rather than an accident. Nothing imports this subtree unless
-`TRTLLM_MODELING_V2` is set: `AutoModelForCausalLM._resolve_class` calls
+rather than an accident. Nothing beyond the resolver module is imported
+unless `LLM(modeling_v2=...)` is on: the model loader calls
 `modeling_v2_resolve`, which returns immediately when the switch is off,
-and the routing modules are imported lazily behind it. The one caller
-outside the subtree is `tensorrt_llm/_torch/models/modeling_auto.py`,
-which this rule does not claim -- a PR touching it falls back to
-baseline, which is what a change to the shared resolver deserves.
+and the routing modules are imported lazily behind it. The callers
+outside the subtree are `tensorrt_llm/_torch/pyexecutor/model_loader.py`
+(decides) and `tensorrt_llm/_torch/models/modeling_auto.py` (reads the
+decision off `ModelConfig`), neither of which this rule claims -- a PR
+touching them falls back to baseline, which is what a change to the
+shared resolver deserves.
 
 `.md` exclusion matters more here than for most rules: the catalog
 carries a contract document per entry, so roughly a fifth of the files

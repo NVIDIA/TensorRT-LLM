@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""The routing tables and the targets they name must not drift apart.
+"""The routing modules and the target directories they import must not drift apart.
 
 Everything here is read off disk as text -- no target module is imported, so
 this runs anywhere, including a CI machine with no GPU and no built
@@ -31,6 +31,8 @@ from tensorrt_llm._torch._experimental.modeling_v2._router_index import (
 
 # The package, not this file: these paths address the tree under test, and this
 # test lives in tests/ while that tree lives in tensorrt_llm/.
+pytestmark = pytest.mark.cpu_only
+
 _ROOT = Path(_modeling_v2.__file__).resolve().parent
 _ARCHS = sorted(MODELING_V2_ROUTERS)
 
@@ -38,6 +40,24 @@ _ARCHS = sorted(MODELING_V2_ROUTERS)
 def _module_path(dotted: str) -> Path:
     """Resolve a package-relative dotted module name to its file."""
     return _ROOT / (dotted.replace(".", "/") + ".py")
+
+
+# ``route`` hands back the class itself, imported from the target directory
+# right where it is returned. That import line is the one place a family's
+# routing module names its targets, so it is what these tests read.
+_TARGET_IMPORT = re.compile(
+    r"^\s*from \.(\w+)\.modeling import (?:(\w+)|\(\s*(\w+),?\s*\))$", re.MULTILINE
+)
+
+
+def _routed_targets(arch: str):
+    """(target directory, class name) for every target ``route`` can return."""
+    source = _module_path(MODELING_V2_ROUTERS[arch]).read_text()
+    family_dir = _module_path(MODELING_V2_ROUTERS[arch]).parent
+    return [
+        (family_dir / target, plain or wrapped)
+        for target, plain, wrapped in _TARGET_IMPORT.findall(source)
+    ]
 
 
 def test_every_routed_architecture_has_an_importable_routing_module():
@@ -56,120 +76,36 @@ def test_no_routing_module_is_orphaned():
 
 
 @pytest.mark.parametrize("arch", _ARCHS)
-def test_targets_table_and_target_modules_agree(arch):
-    """Every name the tree can return must have a module that registers it."""
-    routing = routing_module(arch)
-    produced = set(routing._TARGETS.values())
-    declared = set(routing.TARGET_MODULES)
-    assert produced == declared, (
-        f"{arch}: _TARGETS yields {sorted(produced - declared)} with no "
-        f"TARGET_MODULES entry; TARGET_MODULES declares "
-        f"{sorted(declared - produced)} the tree cannot return"
+def test_no_target_directory_is_orphaned(arch):
+    """A target directory ``route`` never imports from is dead code: nothing
+    else can reach it."""
+    family_dir = _module_path(MODELING_V2_ROUTERS[arch]).parent
+    on_disk = {p.parent for p in family_dir.glob("*/modeling.py")}
+    routed = {target_dir for target_dir, _ in _routed_targets(arch)}
+    assert on_disk == routed, (
+        f"{arch}: target directories route() never imports: "
+        f"{sorted(p.name for p in on_disk - routed)}; imports with no directory: "
+        f"{sorted(p.name for p in routed - on_disk)}"
     )
 
 
 @pytest.mark.parametrize("arch", _ARCHS)
-def test_each_target_module_registers_its_own_name(arch):
-    """The synthetic name is only a registry key -- the module must fill it.
-
-    Nothing else can: the built-in static index does not carry modeling_v2
-    names, so a target whose decorator says something different resolves to
-    None and the engine reports an unknown architecture.
-    """
-    routing = routing_module(arch)
-    for name, dotted in routing.TARGET_MODULES.items():
-        path = _module_path(dotted)
-        assert path.is_file(), f"{arch}: {name} -> missing {path}"
-        source = path.read_text()
-        assert f'@register_auto_model("{name}")' in source, (
-            f"{arch}: {path.relative_to(_ROOT)} does not register {name!r}"
-        )
-
-
-@pytest.mark.parametrize("arch", _ARCHS)
 def test_target_identity_matches_its_path(arch):
-    """Identity is the directory name: <checkpoint>__<gpu arch>__<parallel>.
-
-    The class name encodes the same triple, and the routing module's ``_SM``
-    has to be the arch segment those targets actually live under -- a target
-    moved to a new SM without its routing constant following is the one drift
-    that would still route, and route wrong.
-    """
-    routing = routing_module(arch)
-    major, minor = routing._SM
-    expected_segment = f"sm_{major}{minor}"
-
-    for name, dotted in routing.TARGET_MODULES.items():
-        parts = dotted.split(".")
-        assert parts[-1] == "modeling", dotted
-        segments = parts[-2].split("__")
+    """Identity is the directory name: <checkpoint>__<gpu arch>__<parallel>,
+    and the class name encodes the same triple."""
+    for target_dir, name in _routed_targets(arch):
+        segments = target_dir.name.split("__")
         assert len(segments) == 3, (
-            f"{arch}: {parts[-2]!r} is not a <checkpoint>__<sm>__<parallel> directory name"
-        )
-        checkpoint, sm_segment, parallel = segments
-
-        assert sm_segment == expected_segment, (
-            f"{arch}: {name} lives under {sm_segment} but its routing module "
-            f"only ever matches {expected_segment}"
+            f"{arch}: {target_dir.name!r} is not a <checkpoint>__<sm>__<parallel> directory name"
         )
 
         def camel(segment: str) -> str:
             return "".join(w.capitalize() for w in segment.split("_"))
 
-        for segment in (checkpoint, sm_segment, parallel):
+        for segment in segments:
             assert camel(segment).lower() in name.lower(), (
                 f"{arch}: {name} does not carry path segment {segment!r}"
             )
-
-        assert (checkpoint, parallel) in routing._TARGETS, (
-            f"{arch}: no _TARGETS entry keyed ({checkpoint!r}, {parallel!r})"
-        )
-        assert routing._TARGETS[(checkpoint, parallel)] == name
-
-
-@pytest.mark.parametrize("arch", _ARCHS)
-def test_checkpoint_fingerprints_are_distinct(arch):
-    """Two checkpoints sharing a fingerprint would route to one target."""
-    routing = routing_module(arch)
-    names = list(routing._CHECKPOINTS.values())
-    assert len(names) == len(set(names)), f"{arch}: duplicate checkpoint names in _CHECKPOINTS"
-    assert set(names) == {c for c, _ in routing._TARGETS}, (
-        f"{arch}: _CHECKPOINTS and _TARGETS name different checkpoints"
-    )
-
-
-# Context fields a routing tree may not branch on yet, and what has to happen
-# before it can. Both would otherwise decide silently on a value that is not
-# the deployment's -- the failure ``require`` exists to prevent. Delete a row
-# once its prerequisite is met.
-_UNREADABLE_CONTEXT_FIELDS = {
-    "is_disagg": (
-        "no caller sets it, so it reads False in every deployment, "
-        "disaggregated or not; plumb it onto ModelConfig first"
-    ),
-    "spec_config": (
-        "explain.py has no flag for a speculative config, so it would report "
-        "the wrong target for every drafting configuration; give explain a "
-        "way to name one first"
-    ),
-}
-
-
-@pytest.mark.parametrize("arch", _ARCHS)
-@pytest.mark.parametrize("field", sorted(_UNREADABLE_CONTEXT_FIELDS))
-def test_no_routing_module_reads_an_unplumbed_dimension(arch, field):
-    """A routing tree may only read what both the engine and explain can fill.
-
-    ``explain`` replays the same tree to answer "why did I not get the target
-    I expected". A criterion it cannot evaluate makes that answer wrong on
-    exactly the configurations someone would ask about -- so the set of
-    readable fields is bounded by the weaker of the two callers, not the
-    engine alone.
-    """
-    source = _module_path(MODELING_V2_ROUTERS[arch]).read_text()
-    assert field not in source, (
-        f"{arch}: routing reads ctx.{field}, but {_UNREADABLE_CONTEXT_FIELDS[field]}"
-    )
 
 
 def test_every_target_ships_both_products():
@@ -187,9 +123,7 @@ def test_every_target_ships_both_products():
     rather than by a reader.
     """
     for arch in _ARCHS:
-        routing = routing_module(arch)
-        for name, dotted in routing.TARGET_MODULES.items():
-            target_dir = _module_path(dotted).parent
+        for target_dir, name in _routed_targets(arch):
             for product in ("modeling.py", "weights.py"):
                 assert (target_dir / product).is_file(), f"{name}: missing {product}"
 
@@ -202,9 +136,7 @@ def test_targets_do_not_share_files():
     the abstraction this package exists to avoid.
     """
     for arch in _ARCHS:
-        routing = routing_module(arch)
-        for name, dotted in routing.TARGET_MODULES.items():
-            target_dir = _module_path(dotted).parent
+        for target_dir, name in _routed_targets(arch):
             for source_file in target_dir.glob("*.py"):
                 text = source_file.read_text()
                 for match in re.finditer(r"^from (\.+)([\w.]*) import", text, re.MULTILINE):
@@ -220,7 +152,7 @@ def test_targets_do_not_share_files():
 
 #: tensorrt_llm imports that compute nothing, so a target's generic path need not declare them: types and configs
 #: it reads, enums it passes, the metadata it is handed and the views it takes of it, the graph-capture context it
-#: asks about, its registration and its logger.
+#: asks about and its logger.
 _NON_COMPUTE_IMPORTS = frozenset(
     {
         "AllReduceStrategy",
@@ -236,7 +168,6 @@ _NON_COMPUTE_IMPORTS = frozenset(
         "is_in_breakable_cuda_graph",
         "k3_mla_decode_view",
         "logger",
-        "register_auto_model",
     }
 )
 
@@ -257,9 +188,8 @@ def test_uncertified_generic_calls_name_every_stock_import():
     declares nothing it does not import, so the list cannot go stale as entries replace stock calls."""
     checked = 0
     for arch in _ARCHS:
-        routing = routing_module(arch)
-        for name, dotted in routing.TARGET_MODULES.items():
-            tree = ast.parse(_module_path(dotted).read_text())
+        for target_dir, name in _routed_targets(arch):
+            tree = ast.parse((target_dir / "modeling.py").read_text())
             declared = _declared_tuple(tree, "UNCERTIFIED_GENERIC_CALLS")
             if declared is None:
                 continue

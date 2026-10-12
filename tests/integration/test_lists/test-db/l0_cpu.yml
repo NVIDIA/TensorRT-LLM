@@ -51,6 +51,10 @@ l0_cpu:
   - unittest/_torch/peft
   - unittest/_torch/memory
   - unittest/_torch/modeling
+  # modeling_v2 routing and routing-table claims: config shapes and a monkeypatched
+  # compute capability, no device. The rest of unittest/_torch/modeling_v2 needs a GPU.
+  - unittest/_torch/modeling_v2/test_modeling_v2_claims.py
+  - unittest/_torch/modeling_v2/test_modeling_v2_routing.py
   # l0_b300 selects unittest/_torch/modeling_v2 with -m "not cpu_only", so this entry is what runs it.
   - unittest/_torch/modeling_v2/test_modeling_v2_kimi_k3_decode_step.py
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_fp8_indexer_rejects_different_qk_norm_epsilons
