@@ -128,7 +128,7 @@ public:
     //! native resource retains its own duplicate after a successful restore.
     [[nodiscard]] bool checkpointRestore(int64_t mpiCommFortranHandle)
     {
-        return mMcastDeviceMemory->checkpointRestore(std::move(groupComm));
+        return mMcastDeviceMemory->checkpointRestore(mpiCommFortranHandle);
     }
 
     //! \brief checkpointRestore for orchestrators that supply a host collective rather than an MPI
@@ -504,7 +504,7 @@ public:
 
         mBuffer = std::make_shared<McastGPUBuffer>(workspaceSize, static_cast<uint32_t>(groupSize),
             static_cast<uint32_t>(groupRank), static_cast<uint32_t>(deviceIdx), transport == MnnvlTransport::kFabric,
-            mpiCommFortranHandle);
+            std::move(groupComm));
 
         mGroupRank = static_cast<uint32_t>(groupRank);
     }
