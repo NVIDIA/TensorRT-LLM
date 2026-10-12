@@ -86,7 +86,7 @@ def test_thread_leaves_other_messages_to_the_receiver():
     thread = MpiProgressThread(comm.py2f(), 1000, int(PPCommTag.MPI_PROGRESS_PROBE))
     try:
         request = comm.isend("payload", dest=rank, tag=tag)
-        _wait_for_probes(thread, 3)
+        assert _wait_for_probes(thread, 3) >= 3
         assert comm.recv(source=rank, tag=tag) == "payload"
         request.wait()
     finally:

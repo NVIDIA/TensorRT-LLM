@@ -1862,6 +1862,16 @@ class PyExecutor:
                     f"(interval {interval_us} us).")
         return thread
 
+    def _stop_mpi_progress_thread(self):
+        """Stop the native MPI progress thread if it runs.
+
+        stop() waits only for a probe already in flight to return, and
+        MPI_Iprobe is non-blocking.
+        """
+        if self._mpi_progress_thread is not None:
+            self._mpi_progress_thread.stop()
+            self._mpi_progress_thread = None
+
     def shutdown(self):
         """
         Signals the server to shutdown.
@@ -1881,9 +1891,11 @@ class PyExecutor:
             # Since the whole process will shutdown after this `shutdown` call,
             # All threads and memory pools will be freed properly.
             logger.error("Hang detected, shutting down immediately.")
-            # Stop the relay thread from probing while the hang detector
-            # aborts MPI. A probe already in flight is not interrupted.
+            # Stop the relay thread and the native progress thread from
+            # probing while the hang detector aborts MPI. A relay-thread probe
+            # already in flight is not interrupted.
             self._pp_mpi_progress_stop.set()
+            self._stop_mpi_progress_thread()
             return
         self.worker_thread.join()
         if self.kv_connector_manager is not None:
@@ -1897,9 +1909,7 @@ class PyExecutor:
             # pump tick, so acknowledge the quiesce here; otherwise the exit
             # hook would wait out its full timeout.
             self._pp_mpi_progress_quiesced.set()
-        if self._mpi_progress_thread is not None:
-            self._mpi_progress_thread.stop()
-            self._mpi_progress_thread = None
+        self._stop_mpi_progress_thread()
         # Signal non-rank-0 sleep/wakeup listener threads to exit.  This runs
         # after the worker thread has joined, which guarantees that the non-rank-0
         # executor loops have already processed the shutdown broadcast and are
