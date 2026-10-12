@@ -33,6 +33,7 @@
 
 #include <cassert>
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <optional>
 #include <set>
@@ -250,7 +251,6 @@ struct FmhaParams
     std::int64_t sink_token_length = 0;
     bool spec_decoding_is_generation_length_variable = false;
     std::int64_t spec_decoding_max_generation_length = 1;
-    std::int64_t spec_decoding_target_max_gen_len = 0;
     std::int64_t total_kv_len = 0;
     bool unfuse_qkv_gemm = false;
     std::int64_t unidirectional = 1;
@@ -527,9 +527,13 @@ struct FmhaParams
 
     char* getSparseKvCachePool(int32_t poolIndex) const
     {
-        return host_kv_cache_pool_pointers.has_value()
-            ? reinterpret_cast<char*>(host_kv_cache_pool_pointers.value().index({poolIndex, 0}).item<int64_t>())
-            : nullptr;
+        if (!host_kv_cache_pool_pointers.has_value())
+        {
+            return nullptr;
+        }
+        auto const& poolPointers = host_kv_cache_pool_pointers.value();
+        return reinterpret_cast<char*>(poolPointers.dim() == 3 ? poolPointers.index({poolIndex, 0, 0}).item<int64_t>()
+                                                               : poolPointers.index({poolIndex, 0}).item<int64_t>());
     }
 };
 
@@ -539,7 +543,7 @@ public:
     /// Acquires the handles the op keeps for its lifetime and derives everything that
     /// follows from the layer's fixed shape. Deliberately not per call: cublasCreate()
     /// is illegal while a stream is capturing, so the op has to be built outside
-    /// capture and reused for every call from its layer.
+    /// capture and reused for calls with the same configuration.
     explicit AttentionOp(StaticAttentionConfig const& cfg);
 
     using RotaryScalingType = tensorrt_llm::kernels::RotaryScalingType;
@@ -561,13 +565,18 @@ public:
     template <typename T>
     void runMlaGenerationImpl(FmhaParams& p);
 
-    /// Phased attention entry points. Reuse one op per layer: it owns the cuBLAS handle,
+    /// Phased attention entry points. Reuse one op per configuration: it owns the cuBLAS handle,
     /// which is expensive to create and cannot be created while a stream is capturing.
     /// The caller's params are filled in place: Python builds a fresh holder for every
     /// call, so there is nothing to preserve and nothing to copy.
     void runContext(FmhaParams& params);
     void runGeneration(FmhaParams& params);
     void runMlaGeneration(FmhaParams& params);
+
+    [[nodiscard]] bool supportsNvFp4Output() const
+    {
+        return mEnableContextFMHA && mEnableXQA;
+    }
 
     /// Max of the context and generation workspace byte requirements.
     int64_t getAttentionWorkspaceSize(FmhaParams const& params, int64_t numTokens, int64_t maxAttentionWindowSize,
@@ -794,21 +803,12 @@ public:
         return mSM;
     }
 
-    [[nodiscard]] bool supportsNvFp4Output() const
-    {
-        return mEnableContextFMHA && mEnableXQA;
-    }
-
     [[nodiscard]] int getMultiProcessorCount() const
     {
         return mMultiProcessorCount;
     }
 
-    // ---------------------------------------------------------------------------
-    // Op state: the derived, hardware and dispatcher members. Per-call configuration
-    // scalars are read off `FmhaParams` directly and are not mirrored here.
-    // ---------------------------------------------------------------------------
-
+private:
     int mNumKVHeads = -1;
     int mHeadSize = -1;
 
@@ -830,7 +830,7 @@ public:
     // The layer's fixed configuration, captured at construction. Every value the
     // kernel-runner selection and the per-call paths read that does not vary between
     // calls lives here rather than being resent on each FmhaParams.
-    StaticAttentionConfig mCfg{};
+    StaticAttentionConfig const mCfg;
     tensorrt_llm::kernels::MlaMetaParams mMLAParams{};
     int mNumAttnKVHeads = -1;
 
@@ -843,12 +843,13 @@ public:
 
     bool mFuseFp4Quant = false;
 
+    using XqaPrepareProfile = std::tuple<bool, bool, bool, bool, bool, int64_t, int64_t, bool>;
+    std::map<XqaPrepareProfile, int64_t> mXqaPreparedBeamWidths;
+
 #ifdef SKIP_SOFTMAX_STAT
-    uint32_t* mSkipSoftmaxTotalBlocks;
-    uint32_t* mSkipSoftmaxSkippedBlocks;
+    at::Tensor mDefaultSkipSoftmaxStat;
 #endif
 
-private:
     void initialize();
     int finishPrepare(FmhaParams& p, bool isGen);
 

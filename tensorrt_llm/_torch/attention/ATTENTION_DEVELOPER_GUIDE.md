@@ -418,9 +418,17 @@ starting with an empty selection cache. `TrtllmAttention` prepares the complete
 per-forward state, passes itself to the manager for selection, and then executes
 the selected library.
 
-`FallbackFmha` and its `attention()` compatibility adapter own separate native
-`AttentionOp` caches, keyed by `StaticAttentionConfig`, CUDA device, and host thread.
+`FallbackFmha` and its `attention()` compatibility adapter share a native
+`AttentionOp` cache, keyed by `StaticAttentionConfig`, CUDA device, and host thread.
 Streams are excluded so CUDA graph capture can reuse runners initialized during warmup.
+Each fallback instance caches ops by the configuration inputs that vary between
+calls. Workspace preparation resolves the op once per forward; context and
+generation reuse it without rebuilding `StaticAttentionConfig`.
+
+`FallbackFmha._is_supported()` accepts separate Q/K/V only for MLA, cross
+attention, or SageAttention; self-attention requires KV-cache updates. It rejects
+raw FP8 E4M3 query input and custom masks. Keep this admission contract aligned
+with the native `AttentionOp` input requirements.
 
 `TLLM_FMHA_LIBS` controls the ordered selection. Dense PrimTS is opt-in because
 it may add host overhead; use `TLLM_FMHA_LIBS=+prims_ts` to add it to the
@@ -509,7 +517,8 @@ The FMHA package is split by role:
   MLA FMHA library.
 - `fmha/flashinfer_trtllm_gen.py` implements the FlashInfer trtllm-gen FMHA
   library.
-- `fmha/fallback.py` implements the regular `thop.attention` fallback library.
+- `fmha/fallback.py` implements the fallback library on the native phased
+  `thop.AttentionOp`.
 - `fmha/registry.py` owns `TLLM_FMHA_LIBS` parsing and library ordering.
 
 Use `PhasedFmha` for libraries that implement one or more phase-specific entry
@@ -556,10 +565,11 @@ chunk alone: the cached prefix is dropped from attention and then overwritten
 by the chunk's write-back, which turns a missing kernel into a plausible wrong
 answer rather than an error.
 
-The `AttentionOp` constructor in `thop/attentionOp.cpp` therefore refuses a non-MLA,
-non-cross paged-context configuration whose initialization produced no context
-FMHA kernel. The check runs after `initialize()`, because only the initialized
-op reflects the exact Q/KV/output precision, mask type and page size.
+`AttentionOp::prepare()` refuses a non-MLA, non-cross paged-context request whose
+initialized op has no context FMHA kernel, so an unsupported configuration fails
+when the first context call prepares its workspace (normally during warmup), not
+at op construction. The check uses the exact Q/KV/output precision, mask type and
+page size.
 
 The refusal has three distinct causes, each with its own message, and the
 distinction matters when triaging:
@@ -582,7 +592,7 @@ distinction matters when triaging:
 The last two share one message ("requires a fused context FMHA kernel, and this
 build has none").
 
-Cross attention is exempt from the op-construction check. Its unfused path
+Cross attention is exempt from this self-attention check. Its unfused path
 builds K and V from the encoder output (`params.cross_kv`) rather than from a
 cached prefix, so it is correct whenever the encoder output is supplied, which
 is the case on the first decoder context step and on every generation step.
@@ -605,7 +615,7 @@ family, or head size 72) rather than trip that runner's Q/KV precision
 assertion. It is a diagnostic aid: the output dtype is an explicit
 argument because the runtime chooses it independently of the KV cache dtype,
 and the probe fixes the mask, layout and head ratio, so its answer does not by
-itself describe the configuration a given model will run. The op-level refusal
+itself describe the configuration a given model will run. The context preparation check
 above is the authoritative check.
 
 ## 4. Evaluating New Attention

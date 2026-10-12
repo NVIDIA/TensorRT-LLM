@@ -18,6 +18,7 @@ from threading import Thread, current_thread
 from typing import TYPE_CHECKING, ClassVar, Mapping, Optional
 
 import torch
+from torch.utils.weak import WeakTensorKeyDictionary
 
 from tensorrt_llm._torch.attention.backends.interface import (
     AttentionForwardArgs,
@@ -124,9 +125,8 @@ class FallbackFmha(PhasedFmha):
 
     REQUIRES_PAGED_KV = False
     NEEDS_BLOCK_EXTENT = False
-    # The flat compatibility entry point is a classmethod with no layer instance, so its
-    # runners hang off the class instead, reused across calls and captures.
-    _compat_attention_ops: ClassVar[_AttentionOpCache] = _AttentionOpCache()
+    _attention_ops: ClassVar[_AttentionOpCache] = _AttentionOpCache()
+    _compat_counters: ClassVar[WeakTensorKeyDictionary] = WeakTensorKeyDictionary()
     supports_skip_correction = True
     supports_workspace_reclamation = True
 
@@ -143,8 +143,8 @@ class FallbackFmha(PhasedFmha):
     # configuration the op can run (MLA, cross attention, 16-bit context
     # math over an FP8 KV cache), so probing unconditionally would refuse
     # configurations the op serves correctly. The authoritative
-    # exact-parameter check is the op-level refusal in
-    # thop/attentionOp.cpp's AttentionOp constructor; this gate exists to move the
+    # exact-parameter check is the context preparation check in
+    # thop/attentionOp.cpp; this gate exists to move the
     # proven-problematic cells to FMHA dispatch with a remedial error.
     # Extend as further combinations are proven.
     CONTEXT_FMHA_ABSENT_HEAD_DIMS: ClassVar[dict[int, tuple[int, ...]]] = {
@@ -282,14 +282,59 @@ class FallbackFmha(PhasedFmha):
     def __init__(self, attn: "TrtllmAttention"):
         super().__init__(attn)
         self._multi_ctas_kv_counter: Optional[torch.Tensor] = None
-        # Construct lazily: the layer can be initialized on meta before CUDA is ready.
-        self._attention_ops = _AttentionOpCache()
+        self._ops_by_signature: dict[tuple[object, ...], thop.AttentionOp] = {}
+        self._op: Optional[thop.AttentionOp] = None
 
     def attention_op(self, params: FmhaParams) -> "thop.AttentionOp":
+        meta, fwd = params.meta, params.fwd
+        query = _phase_query(params)
+        sparse = fwd.sparse_runtime_params
+        sparse_signature = ()
+        if sparse.sparse_kv_indices is not None or sparse.sparse_attn_indices is not None:
+            sparse_signature = (
+                sparse.sparse_kv_indices is not None and sparse.sparse_kv_indices.numel() > 0,
+                sparse.sparse_attn_indices is not None and sparse.sparse_attn_indices.numel() > 0,
+                sparse.sparse_attn_offsets is not None and sparse.sparse_attn_offsets.numel() > 0,
+                sparse.sparse_attn_kv_lens is None,
+                sparse.aux_kv_cache_pool_ptr is not None,
+            )
+        pool_mapping = meta.host_kv_cache_pool_mapping
+        # Layer geometry is fixed; cache only the configuration inputs that can vary
+        # across batches, output precisions, or sparse/Sage execution modes.
+        signature = (
+            current_thread(),
+            query.device,
+            query.dtype,
+            params.output.dtype,
+            params.tokens_per_block,
+            fwd.mask_type,
+            params.is_cross,
+            meta.use_paged_context_fmha,
+            meta.is_spec_decoding_enabled,
+            meta.max_total_draft_tokens,
+            meta.kv_cache_block_offsets is not None
+            and meta.host_kv_cache_pool_pointers is not None
+            and pool_mapping is not None,
+            pool_mapping.size(0) if pool_mapping is not None else 0,
+            self.attn.quant_mode,
+            self.attn.skip_correction_threshold,
+            fwd.enable_dsv4_epilogue_fusion,
+            fwd.sage_attn_num_elts_per_blk_q,
+            fwd.sage_attn_num_elts_per_blk_k,
+            fwd.sage_attn_num_elts_per_blk_v,
+            fwd.sage_attn_qk_int8,
+            fwd.sage_attn_smooth_k,
+            sparse_signature,
+        )
+        op = self._ops_by_signature.get(signature)
+        if op is not None:
+            return op
         config = StaticAttentionConfig.from_params(
             params, skip_correction_threshold=self.attn.skip_correction_threshold
         )
-        return self._attention_ops.get(config, _phase_query(params).device)
+        op = self._attention_ops.get(config, query.device)
+        self._ops_by_signature[signature] = op
+        return op
 
     @classmethod
     def _is_available(cls, attn: "TrtllmAttention") -> bool:
@@ -342,6 +387,15 @@ class FallbackFmha(PhasedFmha):
         if q is not None and q.dtype == torch.float8_e4m3fn:
             return False
         if forward_args.attention_mask == CustomAttentionMask.CUSTOM:
+            return False
+        if not (
+            self.attn.is_mla_enable
+            or forward_args.is_fused_qkv
+            or metadata.is_cross
+            or forward_args.sage_attn_num_elts_per_blk_q > 0
+            or forward_args.sage_attn_num_elts_per_blk_k > 0
+            or forward_args.sage_attn_num_elts_per_blk_v > 0
+        ):
             return False
         if not forward_args.update_kv_cache and not metadata.is_cross:
             return False
@@ -475,7 +529,7 @@ class FallbackFmha(PhasedFmha):
         ops. Direct callers supply the flat attention arguments and workspace.
         """
         arguments = locals().copy()
-        del host_request_types, update_kv_cache, skip_softmax_stat
+        del host_request_types, update_kv_cache
 
         if workspace is None:
             raise RuntimeError("FallbackFmha.attention requires workspace.")
@@ -512,8 +566,12 @@ class FallbackFmha(PhasedFmha):
         multi_ctas_kv_counter = None
         if num_generations > 0:
             multi_ctas_kv_counter = get_multi_ctas_kv_counter(
-                None, q.device, num_heads, max_num_sequences or max_num_requests
+                cls._compat_counters.get(workspace),
+                q.device,
+                num_heads,
+                max_num_sequences or max_num_requests,
             )
+            cls._compat_counters[workspace] = multi_ctas_kv_counter
 
         effective_beam_width = 1 if is_cross else beam_width
         sizing_num_contexts = num_contexts if num_ctx_tokens > 0 and not is_gen_only else 0
@@ -547,7 +605,7 @@ class FallbackFmha(PhasedFmha):
             ),
         )
         tp = params.to_op_params()
-        op = cls._compat_attention_ops.get(
+        op = cls._attention_ops.get(
             StaticAttentionConfig.from_legacy_arguments(arguments), arguments["q"].device
         )
 
@@ -665,11 +723,11 @@ class FallbackFmha(PhasedFmha):
             ("host_kv_cache_pool_pointers", meta.host_kv_cache_pool_pointers),
             ("host_kv_cache_pool_mapping", meta.host_kv_cache_pool_mapping),
             ("cache_indirection", meta.cache_indirection),
-            ("spec_decoding_target_max_draft_tokens", meta.max_total_draft_tokens),
             ("attention_chunk_size", attn.attention_chunk_size),
             ("rotary_inv_freq", attn.rotary_inv_freq),
             ("rotary_cos_sin", attn.rotary_cos_sin),
             ("multi_ctas_kv_counter", self._multi_ctas_kv_counter),
+            ("skip_softmax_stat", attn.skip_softmax_stat),
         ):
             if value is not None:
                 setattr(tp, name, value)
@@ -765,7 +823,8 @@ class FallbackFmha(PhasedFmha):
             if metadata.effective_beam_width == 1
             else params.max_attention_window_size
         )
-        workspace_size = self.attention_op(params).get_attention_workspace_size(
+        self._op = self.attention_op(params)
+        workspace_size = self._op.get_attention_workspace_size(
             tp,
             num_tokens,
             max_attention_window_size,
@@ -777,16 +836,20 @@ class FallbackFmha(PhasedFmha):
 
     @torch.compiler.disable
     def run_context(self, params: FmhaParams) -> None:
-        self.attention_op(params).run_context(self._to_op_params(params))
+        assert self._op is not None
+        self._op.run_context(self._to_op_params(params))
 
     @torch.compiler.disable
     def run_mla_context(self, params: FmhaParams) -> None:
-        self.attention_op(params).run_context(self._to_op_params(params))
+        assert self._op is not None
+        self._op.run_context(self._to_op_params(params))
 
     @torch.compiler.disable
     def run_generation(self, params: FmhaParams) -> None:
-        self.attention_op(params).run_generation(self._to_op_params(params))
+        assert self._op is not None
+        self._op.run_generation(self._to_op_params(params))
 
     @torch.compiler.disable
     def run_mla_generation(self, params: FmhaParams) -> None:
-        self.attention_op(params).run_mla_generation(self._to_op_params(params))
+        assert self._op is not None
+        self._op.run_mla_generation(self._to_op_params(params))

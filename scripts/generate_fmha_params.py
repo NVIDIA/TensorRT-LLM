@@ -279,16 +279,6 @@ def render_accessors(schema: Schema, struct: Struct) -> str:
     return "\n".join(lines).rstrip("\n") + "\n"
 
 
-def _accessor_names(schema: Schema, struct: Struct) -> set[str]:
-    """Names a struct answers itself, generated or forwarded."""
-    names = {_accessor_name(f.name) for f in struct.fields if _is_tensor(f) and f.dtype is not None}
-    for field in struct.fields:
-        nested = schema.nested(field)
-        if nested is not None:
-            names |= _accessor_names(schema, nested)
-    return names
-
-
 def render_forwarding(schema: Schema, struct: Struct) -> str:
     """Render getters that reach through a nested member.
 

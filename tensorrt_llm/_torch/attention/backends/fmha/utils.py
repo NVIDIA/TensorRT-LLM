@@ -151,7 +151,7 @@ def get_multi_ctas_kv_counter(
     num_heads: int,
     max_num_sequences: int,
 ) -> torch.Tensor:
-    """Return a zeroed counter buffer, reusing `counter` when it already fits.
+    """Initialize a counter buffer once and reuse it when it already fits.
 
     The buffer is per FMHA library, not shared: two libraries running different phases
     of one batch each need their own, and the kernels reset it at the end of a launch.
@@ -159,12 +159,17 @@ def get_multi_ctas_kv_counter(
     generation phase must supply one.
     """
     index = device.index if device.index is not None else torch.cuda.current_device()
+    device = torch.device("cuda", index)
     size = get_multi_ctas_kv_counter_size(
         num_heads, max_num_sequences, get_multi_processor_count_for_device(index)
     )
     if counter is None or counter.device != device or counter.numel() < size:
-        counter = torch.empty(size, dtype=torch.uint8, device=device)
-    counter.zero_()
+        with torch.cuda.device(device):
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    "The multi-CTA KV counter must be allocated before CUDA graph capture."
+                )
+            counter = torch.zeros(size, dtype=torch.uint8, device=device)
     return counter
 
 

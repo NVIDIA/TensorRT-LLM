@@ -30,6 +30,7 @@ from tensorrt_llm._torch.attention.backends.interface import AttentionForwardArg
 from tensorrt_llm.logger import logger
 
 if TYPE_CHECKING:
+    from tensorrt_llm._torch.attention.backends.fmha.phased import FmhaParams as PhasedFmhaParams
     from tensorrt_llm._torch.attention.backends.trtllm import (
         TrtllmAttention,
         TrtllmAttentionMetadata,
@@ -114,7 +115,7 @@ class StaticAttentionConfig:
     @classmethod
     def from_params(
         cls,
-        params: FmhaParams,
+        params: PhasedFmhaParams,
         *,
         skip_correction_threshold: float = 0.0,
     ) -> StaticAttentionConfig:
@@ -219,6 +220,7 @@ class StaticAttentionConfig:
             attn_offsets is not None and attn_offsets.numel() > 0
         )
         pool_mapping = arg("host_kv_cache_pool_mapping")
+        target_max_draft_tokens = arg("spec_decoding_target_max_draft_tokens")
         output = arguments["output"]
         direct = {
             name: arguments[name]
@@ -237,6 +239,9 @@ class StaticAttentionConfig:
             ),
             paged_context_fmha=bool(arg("use_paged_context_fmha", False)),
             rotary_embedding_dim=int(arg("rope_dim", 0)),
+            spec_decoding_target_max_gen_len=(
+                target_max_draft_tokens + 1 if target_max_draft_tokens is not None else 0
+            ),
             cross_attention=bool(arg("is_cross", False)),
             fuses_dsv4_inv_rope_fp8_quant=bool(arg("enable_dsv4_epilogue_fusion", False)),
             use_sparse_attention=(kv_indices is not None and kv_indices.numel() > 0)
@@ -263,7 +268,7 @@ class StaticAttentionConfig:
 
 @dataclass(slots=True)
 class FmhaParams:
-    """Attention parameters shared by Python, DSL, Triton, and native FMHA paths.
+    """Schema for native phased-attention parameters.
 
     Offset contract, relied on by the native side. It splits by memory space:
 
@@ -313,10 +318,9 @@ class FmhaParams:
     force_prepare_spec_dec_tree_mask: bool = False
     attention_chunk_size: Optional[int] = None
 
-    spec_decoding_target_max_draft_tokens: Optional[int] = None
-
     workspace: torch.Tensor = None
     output: torch.Tensor = None
+    skip_softmax_stat: Optional[torch.Tensor] = cpp_metadata(dtype=torch.uint32)
     qkv_or_q: torch.Tensor = None
     k: Optional[torch.Tensor] = None
     v: Optional[torch.Tensor] = None
@@ -378,7 +382,7 @@ class FmhaParams:
         values.update(overrides)
         return cls(**values)
 
-    def to_op_params(self, context: object = None) -> Any:
+    def to_op_params(self) -> Any:
         """Build native parameters from this Python interface."""
         from tensorrt_llm.bindings.internal import thop
 

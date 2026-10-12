@@ -39,6 +39,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <limits>
+#include <map>
 #include <torch/extension.h>
 #include <type_traits>
 
@@ -600,8 +601,8 @@ bool AttentionOp::convertMMHAParamsToXQAParams(
         = static_cast<float>(p.fwd.sparse_runtime_params.threshold_scale_factor_decode);
 #ifdef SKIP_SOFTMAX_STAT
     // Statistics of skip-softmax, pointers of device memory for output
-    xqaParams.skip_softmax_total_blocks = mSkipSoftmaxTotalBlocks;
-    xqaParams.skip_softmax_skipped_blocks = mSkipSoftmaxSkippedBlocks;
+    xqaParams.skip_softmax_total_blocks = p.getSkipSoftmaxStat();
+    xqaParams.skip_softmax_skipped_blocks = p.getSkipSoftmaxStat() + 1;
 #endif
     // Cross attention parameters.
     xqaParams.encoder_input_lengths = p.getEncoderInputLengths();
@@ -2162,8 +2163,8 @@ int AttentionOp::enqueueContext(FmhaParams const& p, MlaParams<T>* mlaParam, cud
         // Skip-softmax attention parameters
         fmhaParams.skipSoftmaxThresholdScaleFactor = p.fwd.sparse_runtime_params.threshold_scale_factor_prefill;
 #ifdef SKIP_SOFTMAX_STAT
-        fmhaParams.skipSoftmaxTotalBlocks = mSkipSoftmaxTotalBlocks;
-        fmhaParams.skipSoftmaxSkippedBlocks = mSkipSoftmaxSkippedBlocks;
+        fmhaParams.skipSoftmaxTotalBlocks = p.getSkipSoftmaxStat();
+        fmhaParams.skipSoftmaxSkippedBlocks = p.getSkipSoftmaxStat() + 1;
 #else
         if (tensorrt_llm::common::getEnvPrintSkipSoftmaxStat())
         {
@@ -3151,7 +3152,8 @@ void AttentionOp::runMlaGenerationImpl(FmhaParams& p)
 }
 
 AttentionOp::AttentionOp(StaticAttentionConfig const& cfg)
-    : mDriver(CUDADriverWrapper::getInstance())
+    : mCfg(cfg)
+    , mDriver(CUDADriverWrapper::getInstance())
     , mCublasWrapper(new tc::CublasMMWrapper(getCublasHandle(), getCublasLtHandle(), nullptr, nullptr))
 {
     // Reading these caches the parsed values, keeping getenv() off the per-call path.
@@ -3179,49 +3181,82 @@ AttentionOp::AttentionOp(StaticAttentionConfig const& cfg)
     mNumAttnHeads = static_cast<int>(cfg.num_heads);
     mNumAttnKVHeads = mNumKVHeads;
 
-    mCfg = cfg;
     mMLAParams = {static_cast<int>(cfg.q_lora_rank), static_cast<int>(cfg.kv_lora_rank),
         static_cast<int>(cfg.qk_nope_head_dim), static_cast<int>(cfg.qk_rope_head_dim),
         static_cast<int>(cfg.v_head_dim), static_cast<int>(cfg.predicted_tokens_per_seq),
         static_cast<int>(cfg.mla_layer_num), static_cast<int>(cfg.rope_append)};
     mUseNvfp4MlaKvCache = cfg.use_nvfp4_mla_kv_cache;
     initialize();
-
-    // Unfused self-attention cannot read a cached prefix. Cross attention can run
-    // unfused when encoder K/V is supplied; runContextImpl checks that per call.
-    bool const needsFusedPagedContext
-        = cfg.paged_context_fmha && cfg.use_kv_cache && !cfg.is_mla_enable && !cfg.cross_attention;
-    TLLM_CHECK_WITH_INFO(!needsFusedPagedContext || !isRelativePosition(),
-        "Paged-context attention (chunked prefill, KV cache reuse or speculative draft tokens) is not supported with "
-        "relative position embedding: that attention always runs unfused, and the unfused path cannot attend to "
-        "cached KV. Disable chunked prefill, KV cache reuse and speculative decoding for this model.");
-    TLLM_CHECK_WITH_INFO(!needsFusedPagedContext || mEnableContextFMHA,
-        "Paged-context attention requires a fused context FMHA kernel, and this build has none for this "
-        "configuration. The unfused fallback cannot attend to cached KV. If the device's SM is not named in the "
-        "build's --cuda_architectures then the build carries no kernels for it at all; check that first. Otherwise "
-        "use another attention backend, or disable chunked prefill, KV cache reuse and speculative decoding.");
+#ifdef SKIP_SOFTMAX_STAT
+    mDefaultSkipSoftmaxStat = at::zeros({2}, at::TensorOptions().dtype(at::kUInt32).device(at::kCUDA));
+#endif
 }
 
 int AttentionOp::prepare(FmhaParams& p, bool isGen)
 {
+    TLLM_CHECK_WITH_INFO(mCfg.is_mla_enable || p.fwd.is_fused_qkv || sageAttnRequested() || p.is_cross,
+        "For non-MLA, non-cross, non-SageAttention attention, only fused QKV is supported now.");
+    TORCH_CHECK(!mFuseFp4Quant || p.fwd.output_sf.has_value(), "NVFP4 output requires output_sf.");
+
+    if (isGen)
+    {
+        TORCH_CHECK(
+            p.num_seqs > 0 && p.beam_width > 0, "Generation attention requires positive num_seqs and beam_width.");
+        TORCH_CHECK(p.num_seqs % p.beam_width == 0, "num_seqs must be divisible by beam_width.");
+        TORCH_CHECK(p.num_tokens % p.num_seqs == 0,
+            "seq_len should be same for all generation requests, num_tokens=", p.num_tokens, ", num_seqs=", p.num_seqs);
+    }
+
+    if (p.fwd.softmax_stats_tensor.has_value())
+    {
+        auto const& stats = p.fwd.softmax_stats_tensor.value();
+        TORCH_CHECK(stats.scalar_type() == at::ScalarType::Float, "softmax_stats_tensor must have float type");
+        TORCH_CHECK(stats.dim() == 3, "softmax_stats_tensor must have shape [num_tokens, num_heads, 2]");
+        TORCH_CHECK(stats.size(0) >= p.num_tokens, "softmax_stats_tensor must have first dimension >= num_tokens");
+        TORCH_CHECK(stats.size(1) >= mCfg.num_heads, "softmax_stats_tensor must have second dimension >= num_heads");
+        TORCH_CHECK(stats.size(2) == 2, "softmax_stats_tensor must have third dimension == 2");
+    }
+
+#ifdef SKIP_SOFTMAX_STAT
+    if (!p.skip_softmax_stat.has_value())
+    {
+        p.skip_softmax_stat = mDefaultSkipSoftmaxStat;
+    }
+    auto const& skipStats = p.skip_softmax_stat.value();
+    TORCH_CHECK(skipStats.is_cuda() && skipStats.is_contiguous() && skipStats.scalar_type() == at::ScalarType::UInt32
+            && skipStats.numel() >= 2,
+        "skip_softmax_stat must contain at least two contiguous CUDA uint32 values.");
+#endif
+
+    if (!isGen && p.num_seqs > 0)
+    {
+        // Unfused self-attention cannot read a cached prefix. Cross attention can run
+        // unfused when encoder K/V is supplied; runContextImpl checks that per call.
+        bool const needsFusedPagedContext
+            = mCfg.paged_context_fmha && mCfg.use_kv_cache && !mCfg.is_mla_enable && !mCfg.cross_attention;
+        TLLM_CHECK_WITH_INFO(!needsFusedPagedContext || !isRelativePosition(),
+            "Paged-context attention (chunked prefill, KV cache reuse or speculative draft tokens) is not supported "
+            "with relative position embedding: that attention always runs unfused, and the unfused path cannot attend "
+            "to "
+            "cached KV. Disable chunked prefill, KV cache reuse and speculative decoding for this model.");
+        TLLM_CHECK_WITH_INFO(!needsFusedPagedContext || mEnableContextFMHA,
+            "Paged-context attention requires a fused context FMHA kernel, and this build has none for this "
+            "configuration. The unfused fallback cannot attend to cached KV. If the device's SM is not named in the "
+            "build's --cuda_architectures then the build carries no kernels for it at all; check that first. Otherwise "
+            "use another attention backend, or disable chunked prefill, KV cache reuse and speculative decoding.");
+    }
 
     // Phase extents. Python sends the phase's token and row counts, which only it can
     // know before the phase split; the rest is a reduction over the host length arrays,
     // which the op can do itself.
     p.max_past_kv_length = p.getMaxHostPastKeyValueLength(p.seq_offset, p.num_seqs);
     p.total_kv_len = p.getTotalKvLen(p.seq_offset, p.num_seqs, isGen);
-    p.input_seq_length = isGen ? p.num_tokens / std::max<std::int64_t>(p.num_seqs, 1)
-                               : p.getMaxHostContextLength(p.seq_offset, p.num_seqs);
+    p.input_seq_length = isGen ? p.num_tokens / p.num_seqs : p.getMaxHostContextLength(p.seq_offset, p.num_seqs);
     // Encoder CUDA graphs capture a padded context extent; the override widens both.
     if (!isGen && p.max_context_q_len_override.has_value())
     {
         p.input_seq_length = p.max_context_q_len_override.value();
         p.max_past_kv_length = p.max_context_q_len_override.value();
-    }
-
-    if (p.spec_decoding_target_max_draft_tokens.has_value() && p.spec_decoding_target_max_gen_len == 0)
-    {
-        p.spec_decoding_target_max_gen_len = static_cast<int32_t>(p.spec_decoding_target_max_draft_tokens.value()) + 1;
     }
 
     bool const hasSparseAttnIndices = p.fwd.sparse_runtime_params.sparse_attn_indices.has_value()
@@ -3346,6 +3381,12 @@ int AttentionOp::prepare(FmhaParams& p, bool isGen)
         TORCH_CHECK(bias.dim() == 2 || bias.dim() == 3,
             "relative_attention_bias must be [num_heads, num_buckets] for implicit mode or "
             "[num_heads, max_seq_len, max_seq_len] for explicit mode");
+        TORCH_CHECK(bias.dim() != 2 || p.fwd.relative_attention_max_distance > 0,
+            "relative_attention_max_distance must be positive when relative_attention_bias is a bucket table");
+        TORCH_CHECK(bias.dim() != 3 || p.fwd.relative_attention_max_distance == 0,
+            "relative_attention_max_distance must be 0 when relative_attention_bias is precomputed");
+        TLLM_CHECK_WITH_INFO(
+            isRelativePosition(), "relative_attention_bias requires position_embedding_type to be relative.");
         TORCH_CHECK(bias.is_contiguous(), "relative_attention_bias must be contiguous");
         TORCH_CHECK(bias.scalar_type() == p.qkv_or_q.scalar_type(),
             "relative_attention_bias dtype must match attention input dtype");
@@ -3879,13 +3920,21 @@ int AttentionOp::finishPrepare(FmhaParams& p, bool isGen)
 
 #if ENABLE_MULTI_DEVICE
 #endif // ENABLE_MULTI_DEVICE
-    // JIT the generation XQA kernel only for a generation call. Its cubin key carries
-    // `input_seq_length`, `num_requests` and the window extents, which only the
-    // generation phase fills in; the workspace-sizing pass runs `prepare` before the
-    // phase split, and compiling from those zeros fails inside NVRTC on SM90.
-    if (isGen)
+    if (isGen && mXqaDispatcher && !tensorrt_llm::common::isSM100Family(mSM))
     {
-        DISPATCH_ON_DTYPE(p.getType(), prepareEnqueueGeneration, p);
+        // Batch size and window extents do not specialize XQA cubins. Only prepare
+        // again for a new execution mode or a beam width beyond the covered range.
+        bool const multiQueryTokens = mCfg.is_spec_decoding_enabled && p.use_spec_decoding;
+        bool const smallQueryTile = multiQueryTokens && p.input_seq_length * mNumAttnHeads / mNumAttnKVHeads < 16;
+        auto const profile = std::make_tuple(multiQueryTokens, p.is_spec_dec_tree, smallQueryTile, p.pos_shift_enabled,
+            p.sink_token_length > 0, p.unidirectional, p.attention_chunk_size.value_or(INT_MAX),
+            p.fwd.sparse_runtime_params.threshold_scale_factor_decode != 0.0);
+        auto& preparedBeamWidth = mXqaPreparedBeamWidths[profile];
+        if (p.beam_width > preparedBeamWidth)
+        {
+            DISPATCH_ON_DTYPE(p.getType(), prepareEnqueueGeneration, p);
+            preparedBeamWidth = p.beam_width;
+        }
     }
 
     p.sparse_params = {};
@@ -3945,8 +3994,7 @@ int64_t AttentionOp::getAttentionWorkspaceSize(FmhaParams const& p, int64_t num_
 {
     TORCH_CHECK(num_gen_tokens >= 0 && num_gen_tokens <= num_tokens, "num_gen_tokens must be in [0, num_tokens]");
     auto params = p;
-    AttentionOp& op = *this;
-    op.prepare(params, /*isGen=*/false);
+    prepare(params, /*isGen=*/false);
     int64_t const numContextTokens = num_tokens - num_gen_tokens;
     int32_t const numContexts = numContextTokens > 0 ? static_cast<int32_t>(params.num_seqs) : 0;
     int32_t const maxContextLength = numContexts > 0 ? static_cast<int32_t>(params.input_seq_length) : 0;
@@ -3960,12 +4008,12 @@ int64_t AttentionOp::getAttentionWorkspaceSize(FmhaParams const& p, int64_t num_
     {
         maxCrossKvLength = params.getMaxHostPastKeyValueLength(params.seq_offset, numContexts);
     }
-    size_t const contextWorkspaceSize = op.getWorkspaceSizeForContext(params, numContexts, maxContextLength,
+    size_t const contextWorkspaceSize = getWorkspaceSizeForContext(params, numContexts, maxContextLength,
         maxCrossKvLength, static_cast<int>(numContextTokens), static_cast<int>(params.total_kv_len));
     // The generation workspace is sized per sequence (max_num_requests * beam_width), not
     // per request; they only coincide when beam_width == 1.
     int64_t const maxNumSequences = params.max_num_sequences > 0 ? params.max_num_sequences : params.max_num_requests;
-    size_t const generationWorkspaceSize = op.getWorkspaceSizeForGeneration(params, static_cast<int>(maxNumSequences),
+    size_t const generationWorkspaceSize = getWorkspaceSizeForGeneration(params, static_cast<int>(maxNumSequences),
         static_cast<int>(max_attention_window_size), static_cast<int>(num_gen_tokens),
         static_cast<int>(max_blocks_per_sequence));
     return static_cast<int64_t>(std::max(contextWorkspaceSize, generationWorkspaceSize));
@@ -4003,6 +4051,16 @@ bool attention_supports_nvfp4_output(int64_t const num_heads, int64_t const num_
         return false;
     }
 
+    int device;
+    check_cuda_error(cudaGetDevice(&device));
+    auto const key = std::make_tuple(device, num_heads, num_kv_heads, head_size, tokens_per_block.value_or(0),
+        mask_type, quant_mode, use_paged_context_fmha);
+    static thread_local std::map<std::decay_t<decltype(key)>, bool> cache;
+    if (auto const it = cache.find(key); it != cache.end())
+    {
+        return it->second;
+    }
+
     StaticAttentionConfig cfg{};
     cfg.num_heads = num_heads;
     cfg.num_kv_heads = num_kv_heads;
@@ -4019,7 +4077,9 @@ bool attention_supports_nvfp4_output(int64_t const num_heads, int64_t const num_
     cfg.quant_mode = tensorrt_llm::common::QuantMode(uint32_t(quant_mode));
 
     AttentionOp op{cfg};
-    return op.supportsNvFp4Output();
+    bool const supported = op.supportsNvFp4Output();
+    cache.emplace(key, supported);
+    return supported;
 }
 
 KvCachePoolPointers buildKvCachePoolPointers(at::Tensor const& hostKvCachePoolPointers, int32_t poolIndex,
