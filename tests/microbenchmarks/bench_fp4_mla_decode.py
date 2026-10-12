@@ -1824,7 +1824,7 @@ def main() -> None:
                 p.error("--backend cutedsl requires a Rubin SM107 GPU.")
             if not _cutedsl_backend_available():
                 p.error(
-                    "--backend cutedsl requires the nvidia-cutlass-dsl and cuda-python packages."
+                    "--backend cutedsl requires a CuTe DSL build that supports the FP4 MLA kernels."
                 )
         if args.backend == "trtllm_fp8_rubin" and not is_rubin:
             p.error("--backend trtllm_fp8_rubin requires a Rubin SM107 GPU.")

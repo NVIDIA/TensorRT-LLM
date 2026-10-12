@@ -62,6 +62,7 @@ def test_cutedsl_availability_needs_only_the_kernel_imports(monkeypatch, fresh_a
         return object()
 
     monkeypatch.setattr(fp4_mla_config.importlib.util, "find_spec", find_spec)
+    monkeypatch.setattr(fp4_mla_config, "_cutedsl_dsl_supports_fp4_mla_kernels", lambda: True)
 
     assert fp4_mla_config._cutedsl_backend_available()
     assert "ctm" not in queried
@@ -75,8 +76,38 @@ def test_cutedsl_availability_requires_each_kernel_import(monkeypatch, fresh_ava
         "find_spec",
         lambda name: None if name == missing else object(),
     )
+    monkeypatch.setattr(fp4_mla_config, "_cutedsl_dsl_supports_fp4_mla_kernels", lambda: True)
 
     assert not fp4_mla_config._cutedsl_backend_available()
+
+
+def test_cutedsl_availability_requires_the_kernel_dsl_api(monkeypatch, fresh_availability):
+    monkeypatch.setattr(fp4_mla_config.importlib.util, "find_spec", lambda name: object())
+    monkeypatch.setattr(fp4_mla_config, "_cutedsl_dsl_supports_fp4_mla_kernels", lambda: False)
+
+    assert not fp4_mla_config._cutedsl_backend_available()
+
+
+@pytest.mark.parametrize("supported", [False, True])
+def test_kernel_dsl_api_probe_reads_the_descriptor_signature(monkeypatch, supported):
+    import cutlass.experimental.primitives as primitives
+
+    class SmemDesc:
+        if supported:
+
+            @staticmethod
+            def build(start_address, k_segment_offset=0):
+                pass
+
+        else:
+
+            @staticmethod
+            def build(start_address):
+                pass
+
+    monkeypatch.setattr(primitives, "Tcgen05SmemDesc", SmemDesc)
+
+    assert fp4_mla_config._cutedsl_dsl_supports_fp4_mla_kernels() is supported
 
 
 def test_cutedsl_availability_without_cutlass(monkeypatch, fresh_availability):

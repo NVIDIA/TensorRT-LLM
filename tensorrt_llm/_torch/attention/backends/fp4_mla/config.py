@@ -4,6 +4,7 @@
 
 import functools
 import importlib.util
+import inspect
 import os
 from typing import Any, Literal, Optional
 
@@ -152,12 +153,25 @@ _CUTEDSL_REQUIRED_MODULES = (
 )
 
 
+def _cutedsl_dsl_supports_fp4_mla_kernels() -> bool:
+    """Whether the installed CuTe DSL has the descriptor API the kernels use.
+
+    The kernels build tcgen05 shared-memory descriptors with a K-segment
+    offset, which the public nvidia-cutlass-dsl release does not provide.
+    """
+    from cutlass.experimental.primitives import Tcgen05SmemDesc
+
+    return "k_segment_offset" in inspect.signature(Tcgen05SmemDesc.build).parameters
+
+
 @functools.cache
 def _cutedsl_backend_available() -> bool:
     try:
-        return all(
+        if not all(
             importlib.util.find_spec(module) is not None for module in _CUTEDSL_REQUIRED_MODULES
-        )
+        ):
+            return False
+        return _cutedsl_dsl_supports_fp4_mla_kernels()
     except ImportError:
         return False
 
