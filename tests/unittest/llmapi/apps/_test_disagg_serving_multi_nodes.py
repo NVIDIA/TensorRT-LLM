@@ -4,6 +4,7 @@ import socket
 import time
 
 import openai
+import psutil
 import pytest
 from test_common.http_utils import (wait_for_endpoint_down,
                                     wait_for_endpoint_ready)
@@ -80,11 +81,28 @@ def env():
     if get_sm_version() == 103 and platform.machine().lower() == "aarch64":
         e["UCX_TLS"] = "cuda_copy,cuda_ipc,sm,self,tcp"
         # With tcp enabled, UCX opens every NIC unless UCX_NET_DEVICES limits
-        # it, and some GB300 rail NICs carry IPv6 addresses that cannot be
-        # bound, which fails UCX worker creation. Keep the cluster's choice.
-        if "UCX_NET_DEVICES" in os.environ:
-            e["UCX_NET_DEVICES"] = os.environ["UCX_NET_DEVICES"]
+        # it. GB300 rail NICs carry only IPv6 addresses inside a VRF, which a
+        # plain socket cannot bind, so UCX worker creation fails on them. Pin
+        # UCX to the NIC this node uses to reach the other node.
+        nic = _ipv4_nic_to(get_the_other_host(0))
+        if nic is not None:
+            e["UCX_NET_DEVICES"] = nic
     return e
+
+
+def _ipv4_nic_to(host):
+    """Return the NIC carrying this node's IPv4 route to host, or None."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect((host, 1))
+            local_ip = s.getsockname()[0]
+    except OSError:
+        return None
+    for nic, addrs in psutil.net_if_addrs().items():
+        if any(a.family == socket.AF_INET and a.address == local_ip
+               for a in addrs):
+            return nic
+    return None
 
 
 @pytest.fixture(scope="module")
