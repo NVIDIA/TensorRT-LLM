@@ -494,7 +494,7 @@ class PrimsTSFmha(PhasedFmha):
             return False, f"context head dimension {attn.head_dim} is unsupported."
         if q.dtype not in self.SUPPORTED_DTYPES:
             return False, f"query dtype {q.dtype} is unsupported."
-        recipe = attn.quant_attention_config
+        recipe = getattr(attn, "quant_attention_config", None)
         if recipe is not None and recipe.qk_dtype == "bf16" and q.dtype != torch.bfloat16:
             return False, f"the attention recipe keeps Q/K in BF16, got {q.dtype}."
         output = fwd.output
@@ -842,7 +842,7 @@ class PrimsTSFmha(PhasedFmha):
         # Per-tensor E4M3 operands as selected by the layer's attention recipe. The Q and K
         # dequant scales fold into the per-run base-2 softmax scale and the V dequant scale
         # into the kernel output scale.
-        recipe = attn.quant_attention_config
+        recipe = getattr(attn, "quant_attention_config", None)
         sm_scale = self._get_bmm1_scale(attn)
         scale_softmax_log2 = None
         if recipe is not None and recipe.qk_dtype == "fp8":

@@ -2473,7 +2473,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             if fmha is None:
                 raise RuntimeError(
                     "No TRT-LLM attention FMHA library supports this request.")
-            recipe = self.quant_attention_config
+            # Backends built without __init__ (test doubles) carry no recipe.
+            recipe = getattr(self, "quant_attention_config", None)
             if recipe is not None and recipe.algorithm != "sage" and not isinstance(
                     fmha, PrimsTSFmha):
                 raise RuntimeError(
