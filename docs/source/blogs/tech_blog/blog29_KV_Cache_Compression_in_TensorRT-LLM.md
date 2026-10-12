@@ -87,7 +87,7 @@ The rest of the blog covers the framework design shared by all methods, with col
 
 ## KV Cache Compression Framework Design
 
-Our goals for the framework are two. A user turns a compression method on with **one configuration block** and nothing else. A developer adds a new method with **plain Python and a just-in-time compiled kernel**, without touching the runtime. The framework takes care of the rest.
+Our goals for the framework are two. A user turns a compression method on with **one configuration block** and nothing else. A developer adds a new method with **plain Python and kernels**, without touching the runtime. The framework takes care of the rest.
 
 ### Design Philosophy
 
