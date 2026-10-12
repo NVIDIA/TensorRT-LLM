@@ -52,6 +52,7 @@ l0_b300:
   - unittest/_torch/thop/serial
   - unittest/_torch/executor # 250s
   - unittest/_torch/disaggregation
+  - unittest/disaggregated/test_deepseek_v41_kv_transfer.py
   # ------------- modules (non-MoE) ---------------
   - unittest/_torch/modules/test_fused_add_rms_norm_quant.py
   - unittest/_torch/modules/test_fused_activation_quant.py
@@ -132,8 +133,9 @@ l0_b300:
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_chunked_prefill[quant_dtype=fp8-kv_cache_reuse=True-fp8kv=True-overlap_scheduler=True] # Cover nvbugs 6084445
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16_flashinfer[enable_chunked_prefill=False]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16_flashinfer[enable_chunked_prefill=True]
-  # TIMEOUT measured: 348 cases in 5m34s on one GB300, so 30 is 5x headroom.
-  - unittest/_torch/modeling_v2 --ignore=unittest/_torch/modeling_v2/comm TIMEOUT (30)
+  # TIMEOUT: ~47 min estimated on one GB300 -- 5m34s for the 348 base cases plus ~37 min that pr-a's
+  # receipts measured for the shared files carrying DeepSeek-V4.1 cells -- so 90 is ~2x headroom.
+  - unittest/_torch/modeling_v2 --ignore=unittest/_torch/modeling_v2/comm --ignore=unittest/_torch/modeling_v2/models/deepseek_v41 TIMEOUT (90)
   - accuracy/test_modeling_v2_gpt_oss.py::TestModelingV2GptOss120bSm103Tp1::test_gsm8k
 - condition:
     ranges:
@@ -150,6 +152,11 @@ l0_b300:
       stage: post_merge
       backend: pytorch
   tests:
+  # TIMEOUT from pr-a's whole-file receipts on one GB300: attention 144 min, quantization 80 min,
+  # the rest 35 min; each is ~1.7-1.9x headroom.
+  - unittest/_torch/modeling_v2/models/deepseek_v41/deepseek_v4_1_flash_nvfp4__sm_103__unified/attention -k "not test_capture_set_replays_identical_across_processes_and_gpus and not test_bitwise_identical_across_calls_processes_and_gpus" TIMEOUT (240)
+  - unittest/_torch/modeling_v2/models/deepseek_v41/deepseek_v4_1_flash_nvfp4__sm_103__unified/quantization TIMEOUT (150)
+  - unittest/_torch/modeling_v2/models/deepseek_v41/deepseek_v4_1_flash_nvfp4__sm_103__unified --ignore=unittest/_torch/modeling_v2/models/deepseek_v41/deepseek_v4_1_flash_nvfp4__sm_103__unified/attention --ignore=unittest/_torch/modeling_v2/models/deepseek_v41/deepseek_v4_1_flash_nvfp4__sm_103__unified/quantization --ignore=unittest/_torch/modeling_v2/models/deepseek_v41/deepseek_v4_1_flash_nvfp4__sm_103__unified/comm -k "not test_vmm_table_created_by_a_one_gpu_process and not test_real_host_table_four_ranks_read_the_same_mapping" TIMEOUT (60)
   # ---- moved to post-merge (MoE CI optimization) ----
   - unittest/_torch/moe/test_moe_backend.py::test_moe_backend -k "CUTLASS"
   - unittest/_torch/moe/test_moe_backend.py::test_moe_backend -k "TRTLLM"

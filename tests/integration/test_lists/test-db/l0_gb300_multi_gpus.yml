@@ -17,9 +17,21 @@ l0_gb300_multi_gpus:
   tests:
   # One ordered sequence in one job: the cases share module-global rank state.
   - unittest/_torch/modeling_v2/comm
+  - unittest/_torch/modeling_v2/models/deepseek_v41/deepseek_v4_1_flash_nvfp4__sm_103__unified/comm
+  - unittest/_torch/modeling_v2/models/deepseek_v41/deepseek_v4_1_flash_nvfp4__sm_103__unified/attention/test_modeling_v2_flashinfer_top_k_ragged_deterministic.py::test_capture_set_replays_identical_across_processes_and_gpus
+  - unittest/_torch/modeling_v2/models/deepseek_v41/deepseek_v4_1_flash_nvfp4__sm_103__unified/attention/test_modeling_v2_flashinfer_top_k_ragged_deterministic.py::test_bitwise_identical_across_calls_processes_and_gpus
+  - unittest/_torch/modeling_v2/models/deepseek_v41/deepseek_v4_1_flash_nvfp4__sm_103__unified/embedding/test_modeling_v2_engram_gather.py::test_vmm_table_created_by_a_one_gpu_process
+  - unittest/_torch/modeling_v2/models/deepseek_v41/deepseek_v4_1_flash_nvfp4__sm_103__unified/embedding/test_modeling_v2_engram_gather.py::test_real_host_table_four_ranks_read_the_same_mapping
   - accuracy/test_modeling_v2_deepseek_v3.py::TestModelingV2DeepseekR10528Nvfp4Sm103Dep4::test_gsm8k_identity_vs_mtp3
   - accuracy/test_modeling_v2_deepseek_v3.py::TestModelingV2DeepseekR10528Nvfp4Sm103Dep4::test_mtp3_acceptance[modeling_v2]
   - accuracy/test_modeling_v2_deepseek_v3.py::TestModelingV2DeepseekR10528Nvfp4Sm103Dep4::test_mtp3_acceptance[stock]
+  # TIMEOUT measured on 4x GB300: 4.5-8.5 min per case, engine boot included.
+  - accuracy/test_modeling_v2_deepseek_v41.py::TestModelingV2DeepseekV41FlashNvfp4Sm103Unified::test_gsm8k[tep4] TIMEOUT (90)
+  - accuracy/test_modeling_v2_deepseek_v41.py::TestModelingV2DeepseekV41FlashNvfp4Sm103Unified::test_gsm8k[dep4] TIMEOUT (90)
+  - accuracy/test_modeling_v2_deepseek_v41.py::TestModelingV2DeepseekV41FlashNvfp4Sm103Unified::test_gsm8k[tp4] TIMEOUT (90)
+  - accuracy/test_modeling_v2_deepseek_v41.py::TestModelingV2DeepseekV41FlashNvfp4Sm103Unified::test_mmmu[tep4] TIMEOUT (90)
+  - accuracy/test_modeling_v2_deepseek_v41_replay.py::test_encoder_replay_bitwise[tep4] TIMEOUT (90)
+  - accuracy/test_modeling_v2_deepseek_v41_replay.py::test_encoder_replay_bitwise[dep4] TIMEOUT (90)
   # Covers tests/unittest/_torch/attention/. Two sub-trees moved in here from elsewhere
   # under tests/unittest/_torch/ and have no entry of their own on any list, so this entry
   # is what picks them up:

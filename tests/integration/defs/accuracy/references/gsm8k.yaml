@@ -138,6 +138,27 @@ deepseek-ai/DeepSeek-V4.1-Flash:
     accuracy: 93.3283
     threshold: 91.0
     num_samples: 1319
+nvidia/DeepSeek-V4.1-Flash-NVFP4:
+  # Read by the modeling_v2 target's gates (test_modeling_v2_deepseek_v41.py).
+  # Self-measured on an independent engine: the model card publishes no GSM8K
+  # number. vLLM 0.1.dev20904+g179dd0fa9 (vllm/vllm-openai:deepseekv41-flash-0909,
+  # arm64 sha256:d84a123255b822fc22508635218000187221794f59c0694c33b0650d1e377d58),
+  # 4x GB300 TP4, NVFP4 experts on the FLASHINFER_TRTLLM MoE backend, no
+  # speculative decoding, 2026-09-23. Protocol = trtllm-eval gsm8k with NO chat
+  # template: 5-shot plain completion (task default), random_seed=0 (dataset
+  # shuffle + few-shot seed as LmEvalEvaluator does), greedy,
+  # max_output_length=512, max_input_length=4096, full 1319 samples,
+  # lm_eval==0.4.10. strict-match 92.343, flexible-extract 92.267; the value is
+  # their mean, which is what trtllm-eval reports without a scores filter.
+  # The chat-template protocol was measured too and rejected: its two filters
+  # diverge (81.73 vs 95.30). The DSpark row (this checkpoint's mtp.* stages
+  # are its DSpark drafter) carries the same number because speculative
+  # verification is output-preserving.
+  - quant_algo: MIXED_PRECISION
+    accuracy: 92.30
+  - quant_algo: MIXED_PRECISION
+    spec_dec_algo: DSpark
+    accuracy: 92.30
 deepseek-ai/DeepSeek-V4-Flash-Base:
   # Base (pretrained, non-instruct) checkpoint, so GSM8K lands well below the
   # instruct DeepSeek-V4-Flash above. GSM8K measurements from

@@ -22,9 +22,9 @@ from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm.llmapi import (AttentionDpConfig, AutoDecodingConfig,
                                  CudaGraphConfig, DFlashDecodingConfig,
                                  DraftTargetDecodingConfig,
-                                 Eagle3DecodingConfig, KvCacheConfig, MoeConfig,
-                                 MTPDecodingConfig, NGramDecodingConfig,
-                                 TorchCompileConfig)
+                                 DSparkDecodingConfig, Eagle3DecodingConfig,
+                                 KvCacheConfig, MoeConfig, MTPDecodingConfig,
+                                 NGramDecodingConfig, TorchCompileConfig)
 
 example_prompts = [
     "Hello, my name is",
@@ -318,6 +318,13 @@ def setup_llm(args, **kwargs):
             max_total_draft_tokens=args.max_total_draft_tokens)
     elif spec_decode_algo == "DFLASH":
         spec_config = DFlashDecodingConfig(
+            max_draft_len=args.spec_decode_max_draft_len,
+            speculative_model=args.draft_model_dir)
+    elif spec_decode_algo == "DSPARK":
+        # Without --draft_model_dir the drafter is the target checkpoint's own
+        # mtp.* stages; TorchLlmArgs resolves that, and requires
+        # max_draft_len to equal the drafter's trained block size.
+        spec_config = DSparkDecodingConfig(
             max_draft_len=args.spec_decode_max_draft_len,
             speculative_model=args.draft_model_dir)
     elif spec_decode_algo == "DRAFT_TARGET":
