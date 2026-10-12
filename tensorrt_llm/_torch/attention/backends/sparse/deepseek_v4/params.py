@@ -28,6 +28,12 @@ class DeepseekV4AttentionType(Enum):
     COMPRESS = 5
     INDEXER_COMPRESS = 6
 
+    # Sliding-window role of DeepSeek-V4.1 only: the Engram token history, one
+    # int32 compressed token id per position. Appended after the DeepSeek-V4
+    # roles and kept out of DEEPSEEK_V4_SLIDING_ATTENTION / DEEPSEEK_V4_ATTENTION,
+    # so DeepSeek-V4's table widths and disaggregated layer ids do not change.
+    ENGRAM_TOKEN = 7
+
     @property
     def role(self) -> DataRole:
         return DataRole(f"deepseek_v4_{self.name.lower()}")
@@ -48,6 +54,14 @@ DEEPSEEK_V4_NON_SLIDING_ATTENTION = (
     DeepseekV4AttentionType.COMPRESS,
     DeepseekV4AttentionType.INDEXER_COMPRESS,
 )
+DEEPSEEK_V4_ATTENTION = DEEPSEEK_V4_SLIDING_ATTENTION + DEEPSEEK_V4_NON_SLIDING_ATTENTION
+
+
+def is_sliding_attention_type(attn_type: DeepseekV4AttentionType) -> bool:
+    return (
+        attn_type in DEEPSEEK_V4_SLIDING_ATTENTION
+        or attn_type == DeepseekV4AttentionType.ENGRAM_TOKEN
+    )
 
 
 def is_overlap_compressor(compress_ratio: int) -> bool:
@@ -80,6 +94,9 @@ def compress_ratio_has_attention(compress_ratio: int, attn_type: DeepseekV4Atten
         return is_sparse
     if attn_type == DeepseekV4AttentionType.INDEXER_COMPRESSOR_SCORE:
         return is_sparse
+    if attn_type == DeepseekV4AttentionType.ENGRAM_TOKEN:
+        # Owned per layer in the DeepSeek-V4.1 layout, never by compress ratio.
+        return False
     raise ValueError(f"Unsupported DeepSeek-V4 attention type: {attn_type}")
 
 

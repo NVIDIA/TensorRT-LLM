@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 import math
-from typing import TYPE_CHECKING, Dict, Optional, Set, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple
 
 import torch
 
@@ -23,9 +23,20 @@ from .params import (
     DeepSeekV4MetadataParams,
     is_compress_layer,
 )
+from .v41_layout import DeepseekV41Layout
 
 if TYPE_CHECKING:
     from .cache_manager import DeepseekV4CacheManager
+
+
+def _v41_layout_of(manager) -> Optional[DeepseekV41Layout]:
+    """The DeepSeek-V4.1 layout a cache manager runs in, or None for DeepSeek-V4."""
+    layout = getattr(manager, "v41_layout", None)
+    return layout if isinstance(layout, DeepseekV41Layout) else None
+
+
+def _num_sliding_table_columns(manager) -> int:
+    return getattr(manager, "num_sliding_attention_columns", len(DEEPSEEK_V4_SLIDING_ATTENTION))
 
 
 class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
@@ -37,6 +48,9 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
     num_total_compressed_tokens: Dict[int, int]
     # The max number of context compressed tokens for each compress ratio
     max_ctx_compressed_tokens: Dict[int, int]
+    # DeepSeek-V4.1 layout of the cache manager, or None (DeepSeek-V4). A class
+    # default, so an instance that skipped __post_init__ reads DeepSeek-V4.
+    v41_layout: Optional["DeepseekV41Layout"] = None
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -45,6 +59,10 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         """Invalidate request- and token-prefix buffers derived from sequence lengths."""
         super()._invalidate_mla_scheduler_buffers()
         self._fused_q_gen_cu_seqlens_valid = False
+
+    @property
+    def is_deepseek_v41(self) -> bool:
+        return self.v41_layout is not None
 
     def __post_init__(self):
         super().__post_init__()
@@ -62,39 +80,15 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             f"TileSizeKV of the FMHA kernel. (got {window_size})."
         )
         capture_graph = self.is_cuda_graph
-        self.compress_ratio_set = set(self.compress_ratios)
-        # Cache a sorted list for deterministic iteration order across
-        # torch.compile traces. Avoids repeated set→list conversion and
-        # guarantees stable specialization keys.
-        self._compress_ratios_sorted = sorted(self.compress_ratio_set)
-        _supported_ratios = {1, 4, 128}
-        _unsupported = self.compress_ratio_set - _supported_ratios
-        assert not _unsupported, (
-            f"Unsupported compress ratios {_unsupported}. Only {_supported_ratios} are supported."
-        )
-
-        attention_types = []
-        for compress_ratio in self.compress_ratio_set:
-            if compress_ratio == 1:
-                attention_types.append((1, DeepseekV4AttentionType.SWA))
-            elif compress_ratio == 4:
-                attention_types.append((1, DeepseekV4AttentionType.SWA))
-                attention_types.append((compress_ratio, DeepseekV4AttentionType.COMPRESS))
-                attention_types.append((compress_ratio, DeepseekV4AttentionType.COMPRESSOR_KV))
-                attention_types.append((compress_ratio, DeepseekV4AttentionType.COMPRESSOR_SCORE))
-                attention_types.append((compress_ratio, DeepseekV4AttentionType.INDEXER_COMPRESS))
-                attention_types.append(
-                    (compress_ratio, DeepseekV4AttentionType.INDEXER_COMPRESSOR_KV)
-                )
-                attention_types.append(
-                    (compress_ratio, DeepseekV4AttentionType.INDEXER_COMPRESSOR_SCORE)
-                )
-            else:
-                attention_types.append((1, DeepseekV4AttentionType.SWA))
-                attention_types.append((compress_ratio, DeepseekV4AttentionType.COMPRESS))
-                attention_types.append((compress_ratio, DeepseekV4AttentionType.COMPRESSOR_KV))
-                attention_types.append((compress_ratio, DeepseekV4AttentionType.COMPRESSOR_SCORE))
-        self.attention_type_set = set(attention_types)
+        # DeepSeek-V4.1 layout mode follows the cache manager, which selects it
+        # from the checkpoint config. The layer ratios then come from the
+        # checkpoint (0 = window only, 1 / 2 = compressed); the sparse config's
+        # normalized compress_ratios carry no layout.
+        self.v41_layout = _v41_layout_of(self.kv_cache_manager)
+        if self.v41_layout is not None:
+            self._init_v41_ratio_sets(self.v41_layout)
+        else:
+            self._init_v4_ratio_sets()
 
         # Create buffers for the compressor
         # cu_seq_lens_cuda is the cumulative sequence lengths for the requests
@@ -232,26 +226,35 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             capture_graph=capture_graph,
         )
 
-        # Compute max_compressed_indices for CUDA graph compatibility.
-        # For ratio=4, the indexer selects index_topk compressed tokens.
-        # For ratio=128, use max_seq_len / 128 rounded up to next power of 2
-        raw_128 = math.ceil(self.max_seq_len / 128)
-        po2_128 = 1 << (raw_128 - 1).bit_length() if raw_128 > 0 else 1
-        self.max_compressed_indices = {
-            1: 0,  # No compressed indices
-            4: self.sparse_mla_topk,  # index_topk from indexer
-            128: po2_128,  # All compressed tokens, rounded to power of 2
-        }
+        if self.v41_layout is not None:
+            # Every compressed V4.1 layer attends the window plus the index
+            # top-k; the compressed local indices come from the indexer.
+            self.max_compressed_indices = {
+                ratio: (self.sparse_mla_topk if ratio > 0 else 0) for ratio in self._topk_len_ratios
+            }
+            self.compressed_local_indices_cuda = None
+            self._init_v41_buffers(capture_graph)
+        else:
+            # Compute max_compressed_indices for CUDA graph compatibility.
+            # For ratio=4, the indexer selects index_topk compressed tokens.
+            # For ratio=128, use max_seq_len / 128 rounded up to next power of 2
+            raw_128 = math.ceil(self.max_seq_len / 128)
+            po2_128 = 1 << (raw_128 - 1).bit_length() if raw_128 > 0 else 1
+            self.max_compressed_indices = {
+                1: 0,  # No compressed indices
+                4: self.sparse_mla_topk,  # index_topk from indexer
+                128: po2_128,  # All compressed tokens, rounded to power of 2
+            }
 
-        # Compressed local indices for compress_ratio=128
-        # Note: ratio=4 uses dynamic topk_indices from indexer, so we only pre-allocate for ratio=128
-        self.compressed_local_indices_cuda = self.get_empty(
-            self.cuda_graph_buffers,
-            (self.max_num_tokens, self.max_compressed_indices[128]),
-            cache_name="compressed_local_indices_cuda",
-            dtype=torch.int32,
-            capture_graph=capture_graph,
-        )
+            # Compressed local indices for compress_ratio=128
+            # Note: ratio=4 uses dynamic topk_indices from indexer, so we only pre-allocate for ratio=128
+            self.compressed_local_indices_cuda = self.get_empty(
+                self.cuda_graph_buffers,
+                (self.max_num_tokens, self.max_compressed_indices[128]),
+                cache_name="compressed_local_indices_cuda",
+                dtype=torch.int32,
+                capture_graph=capture_graph,
+            )
 
         # Sliding-window caches use per-layer page indices and are indexed by
         # [local_layer_idx, attention_type.value, sequence, block]. COMPRESS
@@ -259,7 +262,7 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         # compatibility table for the generic DSA indexer path.
         block_table_shape = (
             self.kv_cache_manager.num_local_layers,
-            len(DEEPSEEK_V4_SLIDING_ATTENTION),
+            _num_sliding_table_columns(self.kv_cache_manager),
             self.max_num_sequences,
             self.kv_cache_manager.max_blocks_per_seq,
         )
@@ -283,8 +286,7 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
                 dtype=torch.int32,
                 capture_graph=capture_graph,
             )
-            for compress_ratio in self._compress_ratios_sorted
-            if is_compress_layer(compress_ratio)
+            for compress_ratio in self._compress_table_ratios
         }
         self._init_sparse_offload_state()
 
@@ -298,7 +300,7 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
                 dtype=torch.int32,
                 capture_graph=capture_graph,
             )
-            for compress_ratio in self.compress_ratio_set
+            for compress_ratio in self._topk_len_ratios
         }
 
         # cached_token_lens_cuda: number of tokens already cached per request
@@ -424,6 +426,380 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         # therefore captured once after the layout update and replayed in order.
         self._invalidate_mla_scheduler_buffers()
 
+    def _init_v4_ratio_sets(self) -> None:
+        self.compress_ratio_set = set(self.compress_ratios)
+        # Cache a sorted list for deterministic iteration order across
+        # torch.compile traces. Avoids repeated set→list conversion and
+        # guarantees stable specialization keys.
+        self._compress_ratios_sorted = sorted(self.compress_ratio_set)
+        _supported_ratios = {1, 4, 128}
+        _unsupported = self.compress_ratio_set - _supported_ratios
+        assert not _unsupported, (
+            f"Unsupported compress ratios {_unsupported}. Only {_supported_ratios} are supported."
+        )
+
+        attention_types = []
+        for compress_ratio in self.compress_ratio_set:
+            if compress_ratio == 1:
+                attention_types.append((1, DeepseekV4AttentionType.SWA))
+            elif compress_ratio == 4:
+                attention_types.append((1, DeepseekV4AttentionType.SWA))
+                attention_types.append((compress_ratio, DeepseekV4AttentionType.COMPRESS))
+                attention_types.append((compress_ratio, DeepseekV4AttentionType.COMPRESSOR_KV))
+                attention_types.append((compress_ratio, DeepseekV4AttentionType.COMPRESSOR_SCORE))
+                attention_types.append((compress_ratio, DeepseekV4AttentionType.INDEXER_COMPRESS))
+                attention_types.append(
+                    (compress_ratio, DeepseekV4AttentionType.INDEXER_COMPRESSOR_KV)
+                )
+                attention_types.append(
+                    (compress_ratio, DeepseekV4AttentionType.INDEXER_COMPRESSOR_SCORE)
+                )
+            else:
+                attention_types.append((1, DeepseekV4AttentionType.SWA))
+                attention_types.append((compress_ratio, DeepseekV4AttentionType.COMPRESS))
+                attention_types.append((compress_ratio, DeepseekV4AttentionType.COMPRESSOR_KV))
+                attention_types.append((compress_ratio, DeepseekV4AttentionType.COMPRESSOR_SCORE))
+        self.attention_type_set = set(attention_types)
+        # sparse_mla_topk_lens keys: every layer ratio.
+        self._topk_len_ratios = self.compress_ratio_set
+        # Ratios with a COMPRESS page table.
+        self._compress_table_ratios = [
+            compress_ratio
+            for compress_ratio in self._compress_ratios_sorted
+            if is_compress_layer(compress_ratio)
+        ]
+
+    def _init_v41_ratio_sets(self, layout: "DeepseekV41Layout") -> None:
+        """Ratio key spaces of the DeepSeek-V4.1 layout mode.
+
+        Per-ratio compressed metadata (lengths, positions, masks, page tables)
+        is keyed by the ratios that have a compressed stream, {1, 2};
+        ``sparse_mla_topk_lens`` is keyed by every layer ratio, {0, 1, 2}.
+        """
+        self.compress_ratios = list(layout.compress_ratios)
+        self.compress_ratio_set = set(layout.compressed_ratios)
+        self._compress_ratios_sorted = sorted(self.compress_ratio_set)
+        self._topk_len_ratios = list(layout.layer_ratios)
+        self._compress_table_ratios = list(self._compress_ratios_sorted)
+        attention_types = {(0, DeepseekV4AttentionType.SWA)}
+        for layer in range(layout.num_layers):
+            ratio = layout.compress_ratios[layer]
+            for attn_type in layout.attention_types(layer):
+                attention_types.add((ratio, attn_type))
+        self.attention_type_set = attention_types
+
+    def _init_v41_buffers(self, capture_graph: bool) -> None:
+        """Buffers only the DeepSeek-V4.1 layout mode fills."""
+        # Per-ratio INDEXER_COMPRESS (native MXFP4 index K) page tables, one
+        # row per sequence of the batch, in pages of the owner's index-K pool
+        # (tokens_per_block // ratio entries per page).
+        self.indexer_compress_block_tables = {
+            compress_ratio: self.get_empty(
+                self.cuda_graph_buffers,
+                (self.max_num_sequences, self.kv_cache_manager.max_blocks_per_seq),
+                cache_name=f"indexer_compress_block_tables_{compress_ratio}",
+                dtype=torch.int32,
+                capture_graph=capture_graph,
+            )
+            for compress_ratio in self._compress_ratios_sorted
+        }
+        self.host_indexer_compress_block_tables = {
+            compress_ratio: torch.empty_like(
+                self.indexer_compress_block_tables[compress_ratio],
+                device="cpu",
+                pin_memory=prefer_pinned(),
+            )
+            for compress_ratio in self._compress_ratios_sorted
+        }
+        # Per token: compressed entries visible at ratio r, (position + 1) // r.
+        # Its generation rows, viewed [num_generations, tokens_per_generation],
+        # are the paged indexer's context lengths.
+        self.compressed_visible_lens_cuda = {
+            compress_ratio: self.get_empty(
+                self.cuda_graph_buffers,
+                (self.max_num_tokens,),
+                cache_name=f"compressed_visible_lens_cuda_{compress_ratio}",
+                dtype=torch.int32,
+                capture_graph=capture_graph,
+            )
+            for compress_ratio in self._compress_ratios_sorted
+        }
+        max_positions = self.max_seq_len + max(self.max_draft_tokens, 0)
+        # Static upper bound of compressed_visible_lens per ratio, e.g. the
+        # paged indexer's max_context_len inside a captured step.
+        self.max_compressed_kv_lens = {
+            compress_ratio: max_positions // compress_ratio
+            for compress_ratio in self._compress_ratios_sorted
+        }
+
+        # Address book: where this step's KV rows are written. Filled by
+        # _prepare_v41_address_book() in prepare() and on_update_kv_lens();
+        # -1 marks a row that must not be written. Rows at or past the step's
+        # token / compressed-row count are not written.
+        manager = self.kv_cache_manager
+        # MXFP4 index-K entry: two E2M1 codes per byte, then one UE8M0 byte
+        # per quant block (64 + 4 bytes at index_head_dim 128).
+        self._v41_index_k_data_bytes = manager.index_head_dim // 2
+        self._v41_index_k_scale_bytes = manager.index_head_dim // manager.quant_block_size
+        # [num_local_layers, max_num_tokens]: row of token t's window KV in
+        # get_buffers(L, SWA) viewed [pages * tokens_per_block, head_dim], at
+        # local layer layer_offsets[L].
+        self.v41_swa_slot_mapping = self.get_empty(
+            self.cuda_graph_buffers,
+            (manager.num_local_layers, self.max_num_tokens),
+            cache_name="v41_swa_slot_mapping",
+            dtype=torch.int64,
+            capture_graph=capture_graph,
+        )
+        # Per ratio r, [max_num_tokens], in the packed order of
+        # compressed_position_ids_cuda[r]: row of the entry in
+        # get_buffers(kv_source, COMPRESS) viewed [pages * block, head_dim],
+        # block = tokens_per_block // r.
+        self.v41_compress_slot_mapping = {
+            compress_ratio: self.get_empty(
+                self.cuda_graph_buffers,
+                (self.max_num_tokens,),
+                cache_name=f"v41_compress_slot_mapping_{compress_ratio}",
+                dtype=torch.int64,
+                capture_graph=capture_graph,
+            )
+            for compress_ratio in self._compress_ratios_sorted
+        }
+        # Same rows: flat byte offsets of the entry's code bytes and scale word
+        # in get_indexer_k_cache_buffers(index owner), uint8
+        # [pages, block, 1, 68]; per page block * 64 code bytes, then block * 4
+        # scale bytes.
+        self.v41_index_k_slot_data = {
+            compress_ratio: self.get_empty(
+                self.cuda_graph_buffers,
+                (self.max_num_tokens,),
+                cache_name=f"v41_index_k_slot_data_{compress_ratio}",
+                dtype=torch.int64,
+                capture_graph=capture_graph,
+            )
+            for compress_ratio in self._compress_ratios_sorted
+        }
+        self.v41_index_k_slot_scale = {
+            compress_ratio: self.get_empty(
+                self.cuda_graph_buffers,
+                (self.max_num_tokens,),
+                cache_name=f"v41_index_k_slot_scale_{compress_ratio}",
+                dtype=torch.int64,
+                capture_graph=capture_graph,
+            )
+            for compress_ratio in self._compress_ratios_sorted
+        }
+        # Context-only prefill index-K inputs; see _prepare_v41_ctx_index_k().
+        self._reset_v41_ctx_index_k()
+        self._init_v41_replay_buffers(capture_graph)
+
+    def _init_v41_replay_buffers(self, capture_graph: bool) -> None:
+        """Encoder SWA bounded replay fields, filled by _prepare_v41_replay().
+
+        Without replay rows in the step they hold the plain values: no replay rows,
+        every row a compute row, compute start = cached tokens, compute cu =
+        cu_seq_lens, SWA floor 0, no Engram history rows.
+        """
+        num_seqs = self.max_num_sequences
+
+        def buf(name: str, shape: tuple, dtype: torch.dtype) -> torch.Tensor:
+            return self.get_empty(
+                self.cuda_graph_buffers,
+                shape,
+                cache_name=name,
+                dtype=dtype,
+                capture_graph=capture_graph,
+            )
+
+        # Per request row: replay rows at the head of its rows this step.
+        self.v41_num_replay_tokens_cuda = buf(
+            "v41_num_replay_tokens_cuda", (num_seqs,), torch.int32
+        )
+        self.v41_num_replay_tokens_cpu = torch.zeros(
+            (num_seqs,), dtype=torch.int32, device="cpu", pin_memory=prefer_pinned()
+        )
+        self.v41_num_replay_tokens_total = 0
+        # Per request row: lowest position its window may attend (the replay start).
+        self.v41_swa_floor_cuda = buf("v41_swa_floor_cuda", (num_seqs,), torch.int32)
+        # Per context request row: the sparse attention's seq_lens, its kv length
+        # minus its SWA floor (see _prepare_v41_swa_seq_lens()).
+        self.v41_swa_seq_lens_cuda = buf("v41_swa_seq_lens_cuda", (num_seqs,), torch.int32)
+        # Per token row: whether it is a replay row.
+        self.v41_is_replay_token_cuda = buf(
+            "v41_is_replay_token_cuda", (self.max_num_tokens,), torch.bool
+        )
+        # Rows that compute main KV / index K / compressor state, packed in row order.
+        self.v41_compute_token_index_cuda = buf(
+            "v41_compute_token_index_cuda", (self.max_num_tokens,), torch.int32
+        )
+        self.v41_num_compute_tokens = 0
+        # Per request row: first computed position (cached + replay rows), and the
+        # cumulative row counts of the packed compute rows.
+        self.v41_compute_start_pos_cuda = buf(
+            "v41_compute_start_pos_cuda", (num_seqs,), torch.int32
+        )
+        self.v41_compute_cu_seq_lens_cuda = buf(
+            "v41_compute_cu_seq_lens_cuda", (num_seqs + 1,), torch.int32
+        )
+        # Engram history of the replay starts, as engram_hash input rows: ids,
+        # context request row, per-context-row cu, and start position.
+        history = max(1, self.v41_layout.engram_history_len)
+        self.v41_replay_history_len = 0
+        self.v41_replay_history_token_ids_cuda = buf(
+            "v41_replay_history_token_ids_cuda", (num_seqs * history,), torch.int32
+        )
+        self.v41_replay_history_req_idx_cuda = buf(
+            "v41_replay_history_req_idx_cuda", (num_seqs * history,), torch.int32
+        )
+        self.v41_replay_history_cu_seq_lens_cuda = buf(
+            "v41_replay_history_cu_seq_lens_cuda", (num_seqs + 1,), torch.int32
+        )
+        self.v41_replay_history_start_pos_cuda = buf(
+            "v41_replay_history_start_pos_cuda", (num_seqs,), torch.int32
+        )
+
+    def _prepare_v41_replay(self, num_requests: int) -> None:
+        """Encoder SWA bounded replay rows of this step, from the cache manager's plans.
+
+        A context request whose chunk starts at its replay start (a prefix-cache hit of
+        ``reused`` tokens under replay; ``cached_token_lens`` is then ``reused - R``)
+        has ``R = min(window, reused)`` replay rows at the head of its rows: cached
+        tokens re-forwarded to rebuild the sliding windows. Filled here:
+
+        - ``v41_num_replay_tokens_cuda/_cpu[b]`` = R (0 for other rows),
+          ``v41_num_replay_tokens_total`` (host);
+        - ``v41_is_replay_token_cuda[t]``;
+        - ``v41_compute_token_index_cuda[:v41_num_compute_tokens]``: the other rows;
+        - ``v41_compute_start_pos_cuda[b]`` = cached + R and
+          ``v41_compute_cu_seq_lens_cuda``: the compute rows as a step starting at the
+          reuse boundary;
+        - ``v41_swa_floor_cuda[b]`` = the replay start (0 without replay): the
+          window of a replay row starts no earlier (tech report 3.2.2);
+        - ``v41_swa_seq_lens_cuda[b]`` = kv length - floor for each context
+          request (``_prepare_v41_swa_seq_lens()``);
+        - the Engram history rows of each replay start.
+
+        The compressed stream (``past_kv_lens``, ``new_comp_kv_lens``, positions, the
+        COMPRESS / index-K write slots) is then computed from the compute start, so no
+        cached main-KV or index-K entry is rewritten.
+        """
+        manager = self.kv_cache_manager
+        num_contexts = self.num_contexts
+        num_tokens = self.num_tokens
+        device = self.v41_num_replay_tokens_cuda.device
+        replay = self.v41_num_replay_tokens_cpu
+        replay[:num_requests] = 0
+        cached = self.cached_token_lens_cpu[:num_requests]
+        history_ids: List[int] = []
+        history_req: List[int] = []
+        history_lens = [0] * num_contexts
+        history_start = [0] * num_contexts
+        if num_contexts > 0 and getattr(manager, "v41_encoder_replay", False):
+            plans = manager.get_v41_replay_plans(
+                self.request_ids[:num_contexts], cached[:num_contexts].tolist()
+            )
+            for b, plan in enumerate(plans):
+                if plan is None:
+                    continue
+                if int(self.seq_lens[b]) < plan.num_tokens:
+                    raise RuntimeError(
+                        f"request {self.request_ids[b]}: a chunk of {int(self.seq_lens[b])} "
+                        f"rows cannot hold its {plan.num_tokens} replay rows"
+                    )
+                replay[b] = plan.num_tokens
+                ids = plan.history_token_ids
+                history_ids.extend(ids)
+                history_req.extend([b] * len(ids))
+                history_lens[b] = len(ids)
+                history_start[b] = plan.start - len(ids)
+        total = int(replay[:num_requests].sum())
+        self.v41_num_replay_tokens_total = total
+        self.v41_num_compute_tokens = num_tokens - total
+        replay_cuda = self.v41_num_replay_tokens_cuda[:num_requests]
+        replay_cuda.copy_(replay[:num_requests], non_blocking=True)
+        cached_cuda = self.cached_token_lens_cuda[:num_requests]
+        cu = self.cu_seq_lens_cuda[: num_requests + 1]
+        if total == 0:
+            self.v41_swa_floor_cuda[:num_requests].zero_()
+            self.v41_compute_start_pos_cuda[:num_requests].copy_(cached_cuda)
+            self.v41_compute_cu_seq_lens_cuda[: num_requests + 1].copy_(cu)
+            self.v41_is_replay_token_cuda[:num_tokens].zero_()
+            torch.arange(num_tokens, out=self.v41_compute_token_index_cuda[:num_tokens])
+            self._prepare_v41_swa_seq_lens()
+        else:
+            cu = cu.to(torch.int32)
+            self.v41_swa_floor_cuda[:num_requests] = torch.where(replay_cuda > 0, cached_cuda, 0)
+            self._prepare_v41_swa_seq_lens()
+            self.v41_compute_start_pos_cuda[:num_requests] = cached_cuda + replay_cuda
+            compute_cu = torch.nn.functional.pad(
+                torch.cumsum(self._seq_lens_cuda[:num_requests].to(torch.int32) - replay_cuda, 0),
+                (1, 0),
+            ).to(torch.int32)
+            self.v41_compute_cu_seq_lens_cuda[: num_requests + 1] = compute_cu
+            rows = torch.arange(num_tokens, dtype=torch.int32, device=device)
+            req_idx = self.req_idx_per_token[:num_tokens].to(torch.int64)
+            self.v41_is_replay_token_cuda[:num_tokens] = (rows - cu[req_idx]) < replay_cuda[req_idx]
+            num_compute = num_tokens - total
+            if num_compute > 0:
+                crow = rows[:num_compute]
+                creq = torch.searchsorted(compute_cu[1:], crow, right=True).to(torch.int64)
+                self.v41_compute_token_index_cuda[:num_compute] = (
+                    crow - compute_cu[creq] + cu[creq] + replay_cuda[creq]
+                )
+        num_history = len(history_ids)
+        self.v41_replay_history_len = num_history
+        if num_history > 0:
+            history_cu = [0]
+            for n in history_lens:
+                history_cu.append(history_cu[-1] + n)
+            self.v41_replay_history_token_ids_cuda[:num_history].copy_(
+                torch.tensor(history_ids, dtype=torch.int32), non_blocking=True
+            )
+            self.v41_replay_history_req_idx_cuda[:num_history].copy_(
+                torch.tensor(history_req, dtype=torch.int32), non_blocking=True
+            )
+            self.v41_replay_history_cu_seq_lens_cuda[: num_contexts + 1].copy_(
+                torch.tensor(history_cu, dtype=torch.int32), non_blocking=True
+            )
+            self.v41_replay_history_start_pos_cuda[:num_contexts].copy_(
+                torch.tensor(history_start, dtype=torch.int32), non_blocking=True
+            )
+
+    def _prepare_v41_swa_seq_lens(self) -> None:
+        """``v41_swa_seq_lens_cuda[b]`` for each context request ``b``: its kv length
+        minus its SWA floor, the ``seq_lens`` of the context sparse attention call.
+
+        The kernel takes a query's window count from ``seq_lens``,
+        ``min(window, seq_lens - q_len + j + 1)`` for query ``j`` of a request, and
+        reads a -1 window column inside that count as an all-zero K/V row, not as
+        a mask. A replay request's windows start at its floor, its replay start
+        (the chunk's first position), so its kv length would count up to
+        ``window - 1`` columns below the floor; ``kv_len - floor`` counts exactly
+        its floored window, ``min(window, p - floor + 1)`` keys at position ``p``.
+        With floor 0 (no replay) this is the kv length itself. Generation rows'
+        windows are never floored and are not covered: they pass their kv
+        lengths, which speculative decoding may move after prepare(). Refreshed
+        by on_update_kv_lens() whenever the step has context requests.
+        """
+        n = self.num_contexts
+        if n:
+            torch.sub(
+                self.kv_lens_cuda_runtime[:n],
+                self.v41_swa_floor_cuda[:n],
+                out=self.v41_swa_seq_lens_cuda[:n],
+            )
+
+    @property
+    def engram_token_block_table(self) -> Optional[torch.Tensor]:
+        """[max_num_sequences, max_blocks] page table of the Engram token history pool."""
+        layout = self.v41_layout
+        if layout is None or layout.engram_token_owner is None:
+            return None
+        local_layer = self.kv_cache_manager.layer_offsets.get(layout.engram_token_owner)
+        if local_layer is None:
+            return None
+        return self.sliding_block_tables[local_layer, DeepseekV4AttentionType.ENGRAM_TOKEN.value]
+
     def prepare_for_indexer_k_cache(self):
         """Prepare the shared indexer K-cache decode table for DSA kernels."""
         # INDEXER_COMPRESS uses shared page indices, so the generic DSA
@@ -475,9 +851,24 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
                 num_contexts=self.num_contexts,
                 num_seqs=self.num_seqs,
             )
+        if self.v41_layout is not None:
+            for compress_ratio, table in self.indexer_compress_block_tables.items():
+                host_table = self.host_indexer_compress_block_tables[compress_ratio]
+                self.kv_cache_manager.copy_batch_indexer_compress_block_tables(
+                    host_table,
+                    self.request_ids,
+                    beam_width=self.beam_width,
+                    num_contexts=self.num_contexts,
+                    num_seqs=self.num_seqs,
+                    compress_ratio=compress_ratio,
+                )
+                table[: self.num_seqs].copy_(host_table[: self.num_seqs], non_blocking=True)
 
-    def prepare_for_deepseek_v4_indices(self, token_positions=None):
-        """Prepare SWA/compressed local indices and sparse_mla_topk_lens."""
+    def prepare_for_deepseek_v4_indices(self, token_positions=None) -> torch.Tensor:
+        """Prepare SWA/compressed local indices and sparse_mla_topk_lens.
+
+        Returns the per-token absolute positions used, ``[num_tokens]`` int32.
+        """
         window_size = self.window_size
         device = self.swa_local_indices_cuda.device
 
@@ -495,6 +886,21 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             offsets = token_idx - cu_seq_lens[req_idx].to(torch.int32)
             token_positions = cached_tokens[req_idx].to(torch.int32) + offsets
 
+        if self.v41_layout is not None:
+            num_tokens = token_positions.shape[0]
+            swa_floor = self.v41_swa_floor_cuda[self.req_idx_per_token[:num_tokens].to(torch.int64)]
+            self._prepare_deepseek_v41_indices_compiled(
+                token_positions,
+                swa_floor,
+                window_size,
+                self.sparse_mla_topk,
+                self.swa_local_indices_cuda,
+                self.sparse_mla_topk_lens,
+                self.compressed_visible_lens_cuda,
+                self._topk_len_ratios,
+            )
+            return token_positions
+
         if self.use_fp8_ds_mla:
             self.token_positions_cuda[: token_positions.shape[0]] = token_positions
 
@@ -508,6 +914,7 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             self.sparse_mla_topk_lens,
             self._compress_ratios_sorted,
         )
+        return token_positions
 
     @staticmethod
     @maybe_compile(dynamic=True, options={"max-autotune": True})
@@ -572,10 +979,60 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
                 raise ValueError(f"Unsupported compress_ratio: {compress_ratio}")
             sparse_mla_topk_lens_bufs[compress_ratio][:num_tokens] = total_count.to(torch.int32)
 
+    @staticmethod
+    @maybe_compile(dynamic=True, options={"max-autotune": True})
+    def _prepare_deepseek_v41_indices_compiled(
+        token_positions: torch.Tensor,
+        swa_floor: torch.Tensor,
+        window_size: int,
+        sparse_mla_topk: int,
+        swa_local_indices_buf: torch.Tensor,
+        sparse_mla_topk_lens_bufs: Dict[int, torch.Tensor],
+        compressed_visible_lens_bufs: Dict[int, torch.Tensor],
+        layer_ratios: list,
+    ):
+        """DeepSeek-V4.1 SWA local indices, visible compressed lengths and topk_lens.
+
+        For a query at absolute position ``p`` (prefill, chunked prefill,
+        decode and speculative-verify rows alike):
+        - window: positions ``max(floor, p - window_size + 1) .. p`` in order,
+          then -1, i.e. the reference's causal prefill window, and in decode the
+          ring's slots as positions; ``floor`` is 0, or the replay start of an
+          encoder-replay step's request (the window truncated to the replay
+          segment, tech report 3.2.2);
+        - ``compressed_visible_lens[r] = (p + 1) // r``, the reference's
+          ``compress_lens``;
+        - ``sparse_mla_topk_lens[r]``: ``window_size`` for window-only layers
+          (the kernel takes the window count from ``seq_lens``), and
+          ``window_size + min((p + 1) // r, index_topk)`` for compressed ones,
+          the number of valid top-k entries the indexer packs at the front.
+        """
+        device = token_positions.device
+        num_tokens = token_positions.shape[0]
+
+        positions = token_positions.unsqueeze(1)
+        swa_offsets = torch.arange(window_size, dtype=torch.int32, device=device)
+        swa_start = torch.maximum(positions - window_size + 1, swa_floor.unsqueeze(1)).clamp(min=0)
+        swa_indices = swa_start + swa_offsets
+        swa_indices = torch.where(swa_indices > positions, -1, swa_indices).to(torch.int32)
+        swa_local_indices_buf[:num_tokens] = swa_indices
+
+        kv_lens = token_positions + 1
+        for compress_ratio in layer_ratios:
+            if compress_ratio == 0:
+                total_count = torch.full_like(kv_lens, window_size)
+            else:
+                visible = kv_lens // compress_ratio
+                compressed_visible_lens_bufs[compress_ratio][:num_tokens] = visible.to(torch.int32)
+                total_count = window_size + visible.clamp(max=sparse_mla_topk)
+            sparse_mla_topk_lens_bufs[compress_ratio][:num_tokens] = total_count.to(torch.int32)
+
     def _build_cache_buffer_data_pointers(
         self, manager: "DeepseekV4CacheManager", compress_ratios_by_layer: list[int]
     ) -> tuple[dict[int, int], dict[int, int], dict[int, int]]:
         """Build sparse cache pointers for a target or draft manager."""
+        if _v41_layout_of(manager) is not None:
+            return self._build_v41_cache_buffer_data_pointers(manager)
         sparse_mla_base_ptrs = {1: manager.swa_pool_ptr}
         for ratio, compress_pool_ptr in manager.compress_pool_ptrs.items():
             sparse_mla_base_ptrs[ratio] = compress_pool_ptr
@@ -588,7 +1045,42 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         }
         return sparse_mla_base_ptrs, swa_buffer_ptrs, compressed_buffer_ptrs
 
+    @staticmethod
+    def _build_v41_cache_buffer_data_pointers(
+        manager: "DeepseekV4CacheManager",
+    ) -> tuple[dict[int, int], dict[int, int], dict[int, int]]:
+        """DeepSeek-V4.1 pool pointers keyed by layer ratio and by layer.
+
+        ``sparse_mla_base_ptrs``: 0 -> the SWA pool, r -> the COMPRESS base of
+        the first local KV source of ratio r. ``compressed_buffer_ptrs[L]`` is
+        the COMPRESS base of ``kv_source(L)`` for every compressed layer, so a
+        reader layer resolves to its owner's pool instead of a missing entry.
+        """
+        layout = manager.v41_layout
+        sparse_mla_base_ptrs = {0: manager.swa_pool_ptr}
+        sparse_mla_base_ptrs.update(manager.compress_pool_ptrs)
+        swa_buffer_ptrs = {layer_idx: manager.swa_pool_ptr for layer_idx in manager.pp_layers}
+        owner_ptrs: dict[int, int] = {}
+        compressed_buffer_ptrs = {}
+        for layer_idx in manager.pp_layers:
+            owner = layout.kv_source(layer_idx)
+            if owner is None:
+                continue
+            if owner not in owner_ptrs:
+                owner_ptrs[owner] = manager.get_buffers(
+                    owner, DeepseekV4AttentionType.COMPRESS
+                ).data_ptr()
+            compressed_buffer_ptrs[layer_idx] = owner_ptrs[owner]
+        return sparse_mla_base_ptrs, swa_buffer_ptrs, compressed_buffer_ptrs
+
     def _init_cache_buffer_data_pointers(self):
+        if self.v41_layout is not None:
+            (
+                self.sparse_mla_base_ptrs,
+                self.swa_buffer_ptrs,
+                self.compressed_buffer_ptrs,
+            ) = self._build_v41_cache_buffer_data_pointers(self.kv_cache_manager)
+            return
         # If MTP is enabled, enlarge the compress ratios by max_draft_tokens - 1.
         extend_compress_ratios = self.compress_ratios + [self.compress_ratios[-1]] * (
             self.max_draft_tokens - 1
@@ -610,6 +1102,11 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
 
         if not isinstance(draft_mgr, DeepseekV4CacheManager):
             return
+        if self.v41_layout is not None:
+            raise NotImplementedError(
+                "DeepSeek-V4.1 has no separate draft KV cache: its DSpark stages keep their "
+                "windows in the drafter."
+            )
 
         # Current DSv4 MTP layers are SWA-only. Fail fast if a future model
         # introduces a compressed or indexer MTP layer.
@@ -622,7 +1119,7 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
 
         draft_block_table_shape = (
             draft_mgr.num_local_layers,
-            len(DEEPSEEK_V4_SLIDING_ATTENTION),
+            _num_sliding_table_columns(draft_mgr),
             self.max_num_sequences,
             draft_mgr.max_blocks_per_seq,
         )
@@ -757,6 +1254,9 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         # For indices conversion
         self.prepare_for_indices_conversion()
 
+        if self.v41_layout is not None:
+            self._prepare_v41_replay(num_requests)
+
         has_sparse_layers = DEEPSEEK_V4_SPARSE_RATIO in self.compress_ratio_set
 
         # For block offsets
@@ -770,7 +1270,7 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         self.prepare_for_spec_decode(kv_lens)
 
         # For DeepSeek-V4 indices
-        self.prepare_for_deepseek_v4_indices()
+        token_positions = self.prepare_for_deepseek_v4_indices()
 
         # Prepare metadata for indexer (only needed when sparse layers exist)
         if has_sparse_layers:
@@ -784,6 +1284,9 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         num_generations = self.num_generations
         kv_lens_slice = kv_lens[:num_requests]
         cached_slice = cached_token_lens[:num_requests]
+        if self.v41_layout is not None:
+            # Replay rows compute no compressed entry: the stream starts after them.
+            cached_slice = cached_slice + self.v41_num_replay_tokens_cpu[:num_requests]
 
         # Host-side per-ratio ctx compressed-token counts (Python ints), so
         # _compute_ctx_compressed_position_ids never reads a device scalar
@@ -823,6 +1326,8 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             self.cached_token_lens_cuda[:num_requests] + self._seq_lens_cuda[:num_requests]
         )
         cached_tokens_cuda = self.cached_token_lens_cuda[:num_requests]
+        if self.v41_layout is not None:
+            cached_tokens_cuda = self.v41_compute_start_pos_cuda[:num_requests]
         self.prepare_compressed_kv_metadata(kv_lens_cuda, cached_tokens_cuda, ctx_output_sizes)
 
         self._compute_compressed_mask(
@@ -833,6 +1338,10 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             self.num_total_compressed_tokens,
             self._compress_ratios_sorted,
         )
+
+        if self.v41_layout is not None:
+            self._prepare_v41_address_book(token_positions)
+            self._prepare_v41_ctx_index_k(token_positions)
 
     def _sync_gen_tokens_per_seq(self, num_gen_tokens: int) -> int:
         """Synchronize the compressor's scalar and per-request token counts.
@@ -941,7 +1450,11 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         ctx_output_sizes = (
             self._ctx_output_sizes if getattr(self, "num_chunked_ctx_requests", 0) == 0 else None
         )
-        self.prepare_compressed_kv_metadata(kv_lens, cached_tokens, ctx_output_sizes)
+        compressed_start = cached_tokens
+        if self.v41_layout is not None:
+            # Replay rows compute no compressed entry (see _prepare_v41_replay).
+            compressed_start = cached_tokens + self.v41_num_replay_tokens_cuda[:batch_size]
+        self.prepare_compressed_kv_metadata(kv_lens, compressed_start, ctx_output_sizes)
 
         self._compute_compressed_mask(
             self.new_comp_kv_lens_cuda,
@@ -962,6 +1475,203 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         )
 
         self.prepare_for_deepseek_v4_indices(token_positions)
+
+        if self.v41_layout is not None:
+            self._prepare_v41_address_book(token_positions)
+            self._prepare_v41_swa_seq_lens()
+
+    @staticmethod
+    def _v41_pages(
+        block_table: torch.Tensor,
+        req_idx: torch.Tensor,
+        entry_idx: torch.Tensor,
+        entries_per_page: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Page id and in-page slot of entry ``entry_idx`` of request row ``req_idx``.
+
+        ``block_table`` is ``[..., rows, max_blocks]``; the page has its leading
+        dims followed by ``entry_idx``'s. The page is -1 where the entry is
+        negative, lies past the table, or sits on an unallocated page. The
+        block index is clamped before the gather, so stale rows of a captured
+        graph never read out of bounds. Graph-safe: no host synchronization.
+        """
+        max_blocks = block_table.shape[-1]
+        block = torch.div(entry_idx, entries_per_page, rounding_mode="floor")
+        in_table = (entry_idx >= 0) & (block < max_blocks)
+        page = block_table[..., req_idx, block.clamp(0, max_blocks - 1)].to(torch.int64)
+        page = torch.where(in_table & (page >= 0), page, -1)
+        return page, torch.remainder(entry_idx, entries_per_page)
+
+    def _v41_index_k_offsets(
+        self,
+        block_table: torch.Tensor,
+        req_idx: torch.Tensor,
+        entry_idx: torch.Tensor,
+        entries_per_page: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Flat byte offsets of an index-K entry's code bytes and scale word.
+
+        A page of ``block`` entries holds ``block * data_bytes`` code bytes,
+        then ``block * scale_bytes`` scale bytes (the DeepGEMM paged layout,
+        as in the DSA indexer's ``_compute_slot_mappings``). -1 where the page
+        is -1.
+        """
+        data_bytes = self._v41_index_k_data_bytes
+        scale_bytes = self._v41_index_k_scale_bytes
+        page, slot = self._v41_pages(block_table, req_idx, entry_idx, entries_per_page)
+        page_base = page * (entries_per_page * (data_bytes + scale_bytes))
+        valid = page >= 0
+        data = torch.where(valid, page_base + slot * data_bytes, -1)
+        scale = torch.where(
+            valid, page_base + entries_per_page * data_bytes + slot * scale_bytes, -1
+        )
+        return data, scale
+
+    def _prepare_v41_address_book(self, token_positions: torch.Tensor) -> None:
+        """DeepSeek-V4.1 write addresses of this step's KV rows, on device.
+
+        Runs at the end of prepare() and of on_update_kv_lens(), so it is
+        recomputed inside CUDA-graph capture and replay: it only reads device
+        tensors and host ints (the token count, ``num_seqs``,
+        ``num_total_compressed_tokens``), and writes the persistent buffers in
+        place.
+
+        - ``v41_swa_slot_mapping[l, t]`` for local layer ``l`` and token ``t``
+          at position ``p`` of request row ``b``:
+          ``page * tokens_per_block + p % tokens_per_block`` with
+          ``page = sliding_block_tables[l, SWA, b, p // tokens_per_block]``.
+        - Per ratio r, row ``i`` of the packed compressed stream (the order of
+          ``compressed_position_ids_cuda[r]``), request row ``b`` from
+          ``cu_new_comp_kv_cuda[r]``, entry ``k = compressed_position_ids // r``,
+          ``block = tokens_per_block // r``:
+          ``v41_compress_slot_mapping[r][i] = page * block + k % block`` with
+          ``page = compress_block_tables[r][b, k // block]``, and
+          ``v41_index_k_slot_data[r][i]`` / ``v41_index_k_slot_scale[r][i]``
+          from ``indexer_compress_block_tables[r]``.
+
+        Rows whose ``compressed_mask_cuda[r]`` is False (reserved generation
+        slots) or whose page is unallocated get -1. The masked rows' positions
+        in ``compressed_position_ids_cuda[r]`` are set to 0: they are derived
+        past the last request's entries and can reach ``max_seq_len``, and a
+        RoPE table lookup reads every row.
+        """
+        manager = self.kv_cache_manager
+        tokens_per_block = manager.tokens_per_block
+        device = token_positions.device
+        num_tokens = token_positions.shape[0]
+
+        req_idx = self.req_idx_per_token[:num_tokens].to(torch.int64)
+        positions = token_positions.to(torch.int64)
+        swa_table = self.sliding_block_tables[:, DeepseekV4AttentionType.SWA.value]
+        page, slot = self._v41_pages(swa_table, req_idx, positions, tokens_per_block)
+        self.v41_swa_slot_mapping[:, :num_tokens] = torch.where(
+            page >= 0, page * tokens_per_block + slot, -1
+        )
+
+        batch_size = self.num_seqs
+        for compress_ratio in self._compress_ratios_sorted:
+            total = self.num_total_compressed_tokens[compress_ratio]
+            if total == 0:
+                continue
+            entries_per_page = tokens_per_block // compress_ratio
+            cu_new_comp = self.cu_new_comp_kv_cuda[compress_ratio][: batch_size + 1]
+            rows = torch.arange(total, dtype=cu_new_comp.dtype, device=device)
+            row_req = torch.searchsorted(cu_new_comp, rows, right=True) - 1
+            row_req = row_req.clamp(0, batch_size - 1).to(torch.int64)
+            valid = self.compressed_mask_cuda[compress_ratio][:total]
+            position_ids = self.compressed_position_ids_cuda[compress_ratio][:total]
+            entry = torch.where(
+                valid,
+                torch.div(position_ids, compress_ratio, rounding_mode="floor").to(torch.int64),
+                -1,
+            )
+
+            page, slot = self._v41_pages(
+                self.compress_block_tables[compress_ratio], row_req, entry, entries_per_page
+            )
+            self.v41_compress_slot_mapping[compress_ratio][:total] = torch.where(
+                page >= 0, page * entries_per_page + slot, -1
+            )
+            data, scale = self._v41_index_k_offsets(
+                self.indexer_compress_block_tables[compress_ratio],
+                row_req,
+                entry,
+                entries_per_page,
+            )
+            self.v41_index_k_slot_data[compress_ratio][:total] = data
+            self.v41_index_k_slot_scale[compress_ratio][:total] = scale
+            position_ids.masked_fill_(~valid, 0)
+
+    def _reset_v41_ctx_index_k(self) -> None:
+        ratios = self._compress_ratios_sorted
+        self.v41_max_ctx_q_len = 0
+        self.v41_ctx_index_k_len = {compress_ratio: 0 for compress_ratio in ratios}
+        self.v41_ctx_index_k_gather_data = {compress_ratio: None for compress_ratio in ratios}
+        self.v41_ctx_index_k_gather_scale = {compress_ratio: None for compress_ratio in ratios}
+        self.v41_ctx_index_ks = {compress_ratio: None for compress_ratio in ratios}
+        self.v41_ctx_index_ke = {compress_ratio: None for compress_ratio in ratios}
+
+    def _prepare_v41_ctx_index_k(self, token_positions: torch.Tensor) -> None:
+        """DeepSeek-V4.1 prefill indexer inputs of the context requests (eager).
+
+        Per ratio r, with ``kv_len_b = cached_b + seq_len_b`` of context
+        request ``b``:
+
+        - ``v41_ctx_index_k_len[r]`` (host int): ``S_r = sum_b kv_len_b // r``.
+        - ``v41_ctx_index_k_gather_data[r]`` / ``v41_ctx_index_k_gather_scale[r]``:
+          int64 ``[S_r]`` byte offsets into the index-K pool of every
+          compressed entry ``k = 0 .. kv_len_b // r - 1`` of every context
+          request (cached entries included), request after request in batch
+          order; -1 on an unallocated page.
+        - ``v41_ctx_index_ks[r]`` / ``v41_ctx_index_ke[r]``: int32
+          ``[num_ctx_tokens]``; context token ``t`` at position ``p`` of
+          request ``b`` scores rows ``[ks, ke)`` of the gathered array: ``ks``
+          = the first row of ``b``, ``ke = ks + (p + 1) // r``.
+        - ``v41_max_ctx_q_len`` (host int): the longest context chunk.
+
+        Sizes come from host lengths, so nothing reads the device. Every call
+        replaces the previous step's values: without context requests the host
+        ints are 0 and the tensors None. on_update_kv_lens() does not touch
+        them.
+        """
+        self._reset_v41_ctx_index_k()
+        num_contexts = self.num_contexts
+        if num_contexts == 0:
+            return
+        device = token_positions.device
+        num_ctx_tokens = self.num_ctx_tokens
+        seq_lens = self.seq_lens[:num_contexts]
+        kv_lens = self.cached_token_lens_cpu[:num_contexts] + seq_lens
+        kv_lens_cuda = (
+            self.cached_token_lens_cuda[:num_contexts] + self._seq_lens_cuda[:num_contexts]
+        ).to(torch.int64)
+        self.v41_max_ctx_q_len = int(seq_lens.max())
+
+        ctx_req = self.req_idx_per_token[:num_ctx_tokens].to(torch.int64)
+        visible_end = token_positions[:num_ctx_tokens].to(torch.int64) + 1
+        tokens_per_block = self.kv_cache_manager.tokens_per_block
+        for compress_ratio in self._compress_ratios_sorted:
+            total = int((kv_lens // compress_ratio).sum())
+            cu_comp = torch.nn.functional.pad(
+                torch.cumsum(kv_lens_cuda // compress_ratio, dim=0), (1, 0)
+            )
+            rows = torch.arange(total, dtype=torch.int64, device=device)
+            row_req = torch.searchsorted(cu_comp, rows, right=True) - 1
+            entry = rows - cu_comp[row_req]
+            data, scale = self._v41_index_k_offsets(
+                self.indexer_compress_block_tables[compress_ratio],
+                row_req,
+                entry,
+                tokens_per_block // compress_ratio,
+            )
+            ks = cu_comp[ctx_req]
+            self.v41_ctx_index_k_len[compress_ratio] = total
+            self.v41_ctx_index_k_gather_data[compress_ratio] = data
+            self.v41_ctx_index_k_gather_scale[compress_ratio] = scale
+            self.v41_ctx_index_ks[compress_ratio] = ks.to(torch.int32)
+            self.v41_ctx_index_ke[compress_ratio] = (
+                ks + torch.div(visible_end, compress_ratio, rounding_mode="floor")
+            ).to(torch.int32)
 
     @staticmethod
     @maybe_compile(dynamic=True, options={"max-autotune": True})

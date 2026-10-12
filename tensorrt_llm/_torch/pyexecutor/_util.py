@@ -1419,6 +1419,28 @@ class KvCacheCreator:
         finally:
             self._dummy_encoder_inputs = []
 
+    def _profile_inline_mm_encoder(self) -> Optional[torch.Tensor]:
+        """Run the largest encoder work of a model that encodes inside its forward.
+
+        Such a model runs its multimodal encoder within the language model's
+        context step rather than through ``encode_multimodal_inputs``, so the
+        text-only dummy requests never reach it. It exposes
+        ``profile_inline_mm_encoder(max_num_tokens)``, which runs the largest
+        encoder work one step can carry and returns the storage that step keeps
+        while its language-model layers run. The measured peak then covers the
+        encoder like the separately encoded models above.
+        """
+        model = self._model_engine.model
+        profile = getattr(model, "profile_inline_mm_encoder", None)
+        if profile is None or self._llm_args.disable_mm_encoder:
+            return None
+        if isinstance(
+                self._profiling_stage_data,
+                dict) and not self._profiling_stage_data.get("enable_mm_reqs"):
+            return None
+        with torch.inference_mode():
+            return profile(max_num_tokens=self._max_num_tokens)
+
     def _get_multimodal_encoder_memory_reserve(self,
                                                profiled_output_bytes: int = 0
                                                ) -> int:
@@ -1668,6 +1690,8 @@ class KvCacheCreator:
             # equivalent runtime-owned embeddings resident while the text-only
             # LLM dummy fills max_num_tokens.
             encoder_profile_output = self._encode_dummy_inputs()
+            if encoder_profile_output is None:
+                encoder_profile_output = self._profile_inline_mm_encoder()
             if encoder_profile_output is not None:
                 profiled_output_bytes = (encoder_profile_output.numel() *
                                          encoder_profile_output.element_size())

@@ -205,11 +205,12 @@ def _make_remote_tail_executor_and_request(
         scheduler=types.SimpleNamespace(max_context_length=8192),
         max_num_tokens=8192,
         resource_manager=types.SimpleNamespace(
+            validate_request=lambda _request: None,
             resource_managers={
                 ResourceManagerType.KV_CACHE_MANAGER: types.SimpleNamespace(
                     enable_block_reuse=False
                 )
-            }
+            },
         ),
     )
     request = types.SimpleNamespace(

@@ -67,6 +67,8 @@ _MLA_CHUNKED_PREFILL_SUPPORTED_SM_VERSIONS_STR = "/".join(
     f"SM{sm_version}"
     for sm_version in _MLA_CHUNKED_PREFILL_SUPPORTED_SM_VERSIONS)
 FP4_MLA_TOKENS_PER_BLOCK = 128
+# DeepseekV4CacheManager in DeepSeek-V4.1 layout mode requires this page size.
+_DEEPSEEK_V41_TOKENS_PER_BLOCK = 128
 
 
 class _ExecutorMemoryMonitor:
@@ -877,6 +879,23 @@ def _create_py_executor(
             logger.info(
                 f"Change tokens_per_block to: {tokens_per_block} for using FlashMLA"
             )
+        elif getattr(sparse_attention_config, "algorithm",
+                     None) == "deepseek_v4":
+            from ..attention.backends.sparse.deepseek_v4.v41_layout import \
+                is_deepseek_v41_config
+            if (is_deepseek_v41_config(config)
+                    and tokens_per_block != _DEEPSEEK_V41_TOKENS_PER_BLOCK):
+                # DeepseekV4CacheManager's V4.1 layout addresses every pool
+                # in 128-token pages and rejects any other page size, so the
+                # default of 32 would fail at cache-manager construction. A
+                # DeepSeek-V4.1 checkpoint reaches this sparse config only
+                # through use_deepseek_v41_layout_mode(); the in-tree model
+                # runs on CSA2 and keeps its page size.
+                tokens_per_block = _DEEPSEEK_V41_TOKENS_PER_BLOCK
+                kv_cache_config.tokens_per_block = tokens_per_block
+                logger.info(
+                    f"Change tokens_per_block to: {tokens_per_block} for "
+                    "DeepSeek-V4.1")
 
         sm_version = get_sm_version()
         if (kv_cache_config.enable_block_reuse and sm_version

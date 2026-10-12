@@ -14,9 +14,9 @@
 # limitations under the License.
 
 from collections import defaultdict
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from math import gcd
-from typing import TYPE_CHECKING, Dict, Iterable, List, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import torch
 
@@ -47,6 +47,7 @@ from tensorrt_llm.runtime import ModelConfig
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     BAD_PAGE_INDEX,
     AttentionLayerConfig,
+    AttentionReusePolicy,
     BatchDesc,
     BufferConfig,
     BufferId,
@@ -68,18 +69,137 @@ from .kernels import (
 )
 from .offload import SparseOffloadLayerDescriptor, SparseOffloadState
 from .params import (
+    DEEPSEEK_V4_ATTENTION,
     DEEPSEEK_V4_NON_SLIDING_ATTENTION,
     DEEPSEEK_V4_SLIDING_ATTENTION,
     DEEPSEEK_V4_SPARSE_RATIO,
     DeepseekV4AttentionType,
     compress_ratio_has_attention,
     is_overlap_compressor,
+    is_sliding_attention_type,
+)
+from .v41_layout import (
+    DEEPSEEK_V41_ATTENTION,
+    DEEPSEEK_V41_DECODER_REPLAY_ENV,
+    DEEPSEEK_V41_DEFAULT_ENCODER_REPLAY,
+    DEEPSEEK_V41_ENCODER_REPLAY_ENV,
+    DEEPSEEK_V41_KV_STORAGE_ENV,
+    DEEPSEEK_V41_KV_STORAGE_NATIVE,
+    DEEPSEEK_V41_NON_SLIDING_ATTENTION,
+    DEEPSEEK_V41_SLIDING_ATTENTION,
+    DEEPSEEK_V41_SLIDING_TABLE_COLUMNS,
+    DeepseekV41Layout,
+    deepseek_v41_native_entry_split,
+    deepseek_v41_token_bytes,
+    get_deepseek_v41_decoder_replay_setting,
+    get_deepseek_v41_encoder_replay_setting,
+    get_deepseek_v41_layout,
 )
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
 
 COMPRESS_BLOCK_SCALE_ROLE = DataRole("deepseek_v4_compress_block_scale")
+
+
+def _v41_encoder_replay_refusal(
+    layout: DeepseekV41Layout, mapping: Mapping, max_num_tokens: Optional[int], kwargs: dict
+) -> Optional[Tuple[type, str]]:
+    """Why encoder SWA bounded replay cannot run on this engine, as (error type, reason),
+    or None when it can. Attention TP and attention DP both run it: under attention DP
+    each rank's manager replays the hits of the requests that rank holds."""
+    if kwargs.get("is_disagg", False):
+        return ValueError, (
+            "disaggregated serving: a generation engine receives the context's windows and "
+            "has nothing to replay"
+        )
+    if kwargs.get("joint_kv_cache_reuse", False):
+        return ValueError, "a separately reused draft KV pool"
+    if kwargs.get("kv_connector_manager") is not None:
+        return ValueError, (
+            "a KV cache connector: a connector-served prefix brings no window to replay from"
+        )
+    if max_num_tokens is not None and max_num_tokens <= layout.replay_window:
+        return ValueError, (
+            f"max_num_tokens <= {layout.replay_window} (got {max_num_tokens}): the first chunk "
+            "after a hit holds every replay row"
+        )
+    return None
+
+
+_V41_ENCODER_REPLAY_ANNOUNCED = set()
+
+
+def _announce_v41_encoder_replay_off(mapping: Mapping, reason: str) -> None:
+    """One line per process on rank 0 (on stdout: worker ranks log below the info level)."""
+    if mapping.rank != 0 or reason in _V41_ENCODER_REPLAY_ANNOUNCED:
+        return
+    _V41_ENCODER_REPLAY_ANNOUNCED.add(reason)
+    print(
+        f"[TRT-LLM] [I] {DEEPSEEK_V41_ENCODER_REPLAY_ENV} unset: DeepSeek-V4.1 encoder SWA "
+        f"bounded replay resolves off, it does not support {reason}; it runs aggregated "
+        "(tep4, dep4, tp4), without a KV connector",
+        flush=True,
+    )
+
+
+def _v41_decoder_replay_refusal(
+    layout: DeepseekV41Layout, enable_block_reuse: bool, encoder_replay_off: Optional[str]
+) -> Optional[str]:
+    """Why decoder SWA bounded replay cannot run beside this engine's prefix cache, or None
+    when it can. ``encoder_replay_off`` is why encoder replay resolved off (None when on).
+
+    Decoder replay leaves the sliding-window KV of the layers after the last KV-source
+    layer holding each prompt's last ``replay_window`` positions only. A prefix-cache hit
+    inside that tail is served correctly only when encoder replay re-forwards the tail's
+    cached rows; otherwise the request reads window KV that none of its forwards wrote.
+    """
+    if enable_block_reuse and encoder_replay_off is not None:
+        return (
+            f"block reuse while encoder SWA bounded replay is off ({encoder_replay_off}): a "
+            f"prefix-cache hit inside a prompt's last {layout.replay_window} positions would "
+            "read sliding-window KV that no forward of the request wrote"
+        )
+    return None
+
+
+_V41_DECODER_REPLAY_ANNOUNCED = set()
+
+
+def _announce_v41_decoder_replay_off(mapping: Mapping, reason: str) -> None:
+    """One line per process on rank 0 (on stdout: worker ranks log below the info level)."""
+    if mapping.rank != 0 or reason in _V41_DECODER_REPLAY_ANNOUNCED:
+        return
+    _V41_DECODER_REPLAY_ANNOUNCED.add(reason)
+    print(
+        f"[TRT-LLM] [I] {DEEPSEEK_V41_DECODER_REPLAY_ENV} unset: DeepSeek-V4.1 decoder SWA "
+        f"bounded replay resolves off, it does not support {reason}; it runs with encoder "
+        "replay on or with block reuse off",
+        flush=True,
+    )
+
+
+@dataclass(frozen=True)
+class DeepseekV41ReplayPlan:
+    """Replay rows of one request's first context chunk after a prefix-cache hit.
+
+    The chunk starts at ``start`` = ``reused - num_tokens``: its first ``num_tokens``
+    rows re-forward cached tokens (their main KV, index K and compressor state are
+    cached and stay as they are), the rest is the uncached suffix.
+    ``history_token_ids`` are the prompt ids of positions
+    ``start - len(history_token_ids) .. start - 1`` (the Engram history the first
+    replay rows hash, which no cached page holds).
+    """
+
+    start: int
+    num_tokens: int
+    history_token_ids: Tuple[int, ...]
+
+    @property
+    def reused(self) -> int:
+        return self.start + self.num_tokens
+
+
 KV_CACHE_COPY_ALIGNMENT = 16
 NVFP4_VECTOR_SIZE = 16
 
@@ -102,6 +222,8 @@ def get_attn_dim(
         return state_factor * index_head_dim
     if attn_type == DeepseekV4AttentionType.INDEXER_COMPRESSOR_SCORE:
         return state_factor * index_head_dim
+    if attn_type == DeepseekV4AttentionType.ENGRAM_TOKEN:
+        return 1
     raise ValueError(f"Unsupported DeepSeek-V4 attention type: {attn_type}")
 
 
@@ -278,8 +400,55 @@ def _get_attn_bytes_per_token(
     return token_bytes
 
 
+def _estimate_v41_swa_cache_size(
+    layout: DeepseekV41Layout,
+    layers: List[int],
+    tokens_per_block: int,
+    max_draft_len: int,
+    *,
+    context: bool,
+    scratch: bool,
+) -> Tuple[int, int]:
+    """DeepSeek-V4.1 counterpart of ``_estimate_swa_cache_size`` over owned windowed roles.
+
+    Scratch keys are (role, compress ratio), as in DeepSeek-V4. A window that
+    does not start on a block boundary spans one more block than its
+    rounded-up length, so each windowed layer-role is charged one extra block
+    per request.
+    """
+    tokens_per_block = int(tokens_per_block)
+    size_per_token = 0
+    size_per_request = 0
+    scratch_keys = set()
+    for layer in layers:
+        for attn_type in DEEPSEEK_V41_SLIDING_ATTENTION:
+            if not layout.has_attention(layer, attn_type):
+                continue
+            window_size = layout.window(attn_type, max_draft_len)
+            if window_size is None or window_size <= 0:
+                continue
+            window_tokens = (
+                (int(window_size) + tokens_per_block - 1) // tokens_per_block + 1
+            ) * tokens_per_block
+            token_bytes = deepseek_v41_token_bytes(
+                attn_type, layout.head_dim, layout.index_head_dim, layout.kv_storage
+            )
+            if not context:
+                size_per_request += window_tokens * token_bytes
+            elif not scratch:
+                size_per_token += token_bytes
+            else:
+                scratch_key = (attn_type, layout.compress_ratios[layer])
+                if scratch_key in scratch_keys:
+                    size_per_request += window_tokens * token_bytes
+                else:
+                    scratch_keys.add(scratch_key)
+                    size_per_token += token_bytes
+    return size_per_token, size_per_request
+
+
 def _get_index_mode(attn_type: DeepseekV4AttentionType) -> PageIndexMode:
-    if attn_type in DEEPSEEK_V4_SLIDING_ATTENTION:
+    if is_sliding_attention_type(attn_type):
         return PageIndexMode.PER_LAYER
     else:
         return PageIndexMode.SHARED
@@ -299,6 +468,13 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
     # The block size of the (indexer) compressed cache.
     # For other attention types, block size is tokens_per_block.
     compressed_block_sizes: List[int]
+    # DeepSeek-V4.1 layout mode, selected by the checkpoint config passed as
+    # ``pretrained_config``; None keeps the DeepSeek-V4 layout.
+    v41_layout: Optional[DeepseekV41Layout] = None
+    # Why encoder SWA bounded replay resolved off (None while it is on), and whether
+    # decoder SWA bounded replay runs on this engine; both resolved at construction.
+    v41_encoder_replay_off_reason: Optional[str] = None
+    v41_decoder_replay: bool = False
 
     def _get_typical_seq_len(self, kv_cache_config: KvCacheConfig) -> int:
         """Retain DeepSeek-V4's max-length pool-sizing model by default."""
@@ -346,6 +522,28 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
                 "DeepSeek-V4 KV cache offload requires the KVCM v2 sparse runtime "
                 "and validated fetch addressing, scratch lifetime, and transfer ordering."
             )
+
+        self.v41_layout = get_deepseek_v41_layout(kwargs.get("pretrained_config"))
+        if self.v41_layout is not None:
+            self._init_deepseek_v41(
+                kv_cache_config,
+                kv_cache_type,
+                num_layers=num_layers,
+                num_kv_heads=num_kv_heads,
+                max_batch_size=max_batch_size,
+                max_beam_width=max_beam_width,
+                tokens_per_block=tokens_per_block,
+                max_seq_len=max_seq_len,
+                vocab_size=vocab_size,
+                mapping=mapping,
+                dtype=dtype,
+                compressor_dtype=compressor_dtype,
+                sparse_attn_config=sparse_attn_config,
+                max_input_len=max_input_len,
+                max_num_tokens=max_num_tokens,
+                **kwargs,
+            )
+            return
 
         # DeepSeek-V4 specific attributes initialization
         assert kv_cache_type == CacheTypeCpp.SELFKONLY, "DeepSeek-V4 only supports SELFKONLY"
@@ -476,6 +674,342 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
                     PageIndexMode.SHARED,
                 )
 
+    def _init_deepseek_v41(
+        self,
+        kv_cache_config: KvCacheConfig,
+        kv_cache_type: CacheTypeCpp,
+        *,
+        num_layers: int,
+        num_kv_heads: int,
+        max_batch_size: int,
+        max_beam_width: int,
+        tokens_per_block: int,
+        max_seq_len: int,
+        vocab_size: int,
+        mapping: Mapping,
+        dtype: DataType,
+        compressor_dtype: DataType,
+        sparse_attn_config: DeepSeekV4SparseAttentionConfig,
+        max_input_len: Optional[int],
+        max_num_tokens: Optional[int],
+        **kwargs,
+    ) -> None:
+        """Initialize the DeepSeek-V4.1 layout mode.
+
+        Pools follow ``self.v41_layout``: SWA on every backbone layer; main KV
+        (``COMPRESS``) and native MXFP4 index K (``INDEXER_COMPRESS``) on the
+        KV-source layers only; the compressor pending pair on ratio-2 KV sources;
+        the Engram token history on the first Engram layer. SWA and main KV
+        hold the reference's fake-quantized values, stored as selected by
+        ``TRTLLM_DSV41_KV_STORAGE``: bf16 containers, or native uint8 entries
+        (``get_v41_native_kv_views``).
+        """
+        layout = self.v41_layout
+        assert kv_cache_type == CacheTypeCpp.SELFKONLY, "DeepSeek-V4.1 only supports SELFKONLY"
+        assert num_kv_heads == 1, "DeepSeek-V4.1 only supports num_kv_heads == 1"
+        assert compressor_dtype == DataType.FLOAT, (
+            f"Unsupported compressor dtype: {compressor_dtype}, only support FP32/TF32"
+        )
+        if dtype != DataType.BF16:
+            raise ValueError(
+                "DeepSeek-V4.1 selects its SWA / main-KV storage with "
+                f"{DEEPSEEK_V41_KV_STORAGE_ENV} (bf16 containers or native), not with the KV "
+                f"cache dtype; got KV cache dtype {dtype}. Leave the KV cache quantization unset."
+            )
+        if kv_cache_config.dtype == "fp8_ds_mla":
+            raise ValueError("DeepSeek-V4.1 does not use the fp8_ds_mla KV cache layout.")
+        if tokens_per_block != 128:
+            raise ValueError(
+                "DeepSeek-V4.1 requires tokens_per_block == 128: a ratio-1 index-K page holds "
+                "tokens_per_block entries and the paged indexer logits kernel accepts at most "
+                f"128. Got {tokens_per_block}."
+            )
+        if num_layers > layout.num_layers:
+            raise ValueError(
+                f"DeepSeek-V4.1 cache manager got {num_layers} layers, but the checkpoint "
+                f"layout has {layout.num_layers} backbone layers."
+            )
+        if sparse_attn_config.window_size != layout.window_size:
+            raise ValueError(
+                f"sparse_attention_config.window_size ({sparse_attn_config.window_size}) must "
+                f"equal the checkpoint's sliding_window ({layout.window_size})."
+            )
+        if sparse_attn_config.index_head_dim != layout.index_head_dim:
+            raise ValueError(
+                f"sparse_attention_config.index_head_dim ({sparse_attn_config.index_head_dim}) "
+                f"must equal the checkpoint's index_head_dim ({layout.index_head_dim})."
+            )
+        # Pipeline parallelism: a stage holds only its own layers' pools, so no
+        # layer may read a pool of another stage.
+        stage_error = layout.stage_dependency_error(mapping.pp_layers(layout.num_layers))
+        if stage_error is not None:
+            raise ValueError(
+                f"DeepSeek-V4.1 pipeline stage {mapping.pp_rank}: {stage_error}. This "
+                f"checkpoint's stage boundaries can only be at layers "
+                f"{list(layout.pipeline_boundaries())} (set pp_partition)."
+            )
+
+        self.use_fp8_ds_mla = False
+        self.index_head_dim = layout.index_head_dim
+        # Per backbone layer, 0 / 1 / 2 exactly as in the checkpoint.
+        self._compress_ratios = list(layout.compress_ratios)
+        spec_config = kwargs.get("spec_config", None)
+        self._max_draft_len = spec_config.max_draft_len if spec_config is not None else 0
+        self._swa_window_size = layout.window_size
+        self._compressor_dtype = compressor_dtype
+        self._use_nvfp4_compress = False
+        self._nvfp4_residual_dim = 0
+        self.compressed_block_sizes = [
+            tokens_per_block // ratio if ratio > 0 else tokens_per_block
+            for ratio in self._compress_ratios
+        ]
+        self._init_indexer_dtype(sparse_attn_config)
+        if self._indexer_k_dtype != "fp4":
+            raise ValueError(
+                "DeepSeek-V4.1 stores index K natively as MXFP4 (indexer_k_dtype='fp4'); "
+                f"got {self._indexer_k_dtype!r}."
+            )
+        self._max_input_len = max_input_len
+        self._max_num_tokens = max_num_tokens
+        self._v41_replay_plans: Dict[int, DeepseekV41ReplayPlan] = {}
+        layout = self._resolve_v41_encoder_replay(mapping, max_num_tokens, kwargs)
+        self.v41_decoder_replay = self._resolve_v41_decoder_replay(
+            mapping, kv_cache_config.enable_block_reuse
+        )
+
+        super().__init__(
+            kv_cache_config,
+            kv_cache_type,
+            num_layers=num_layers,
+            num_kv_heads=num_kv_heads,
+            max_batch_size=max_batch_size,
+            max_beam_width=max_beam_width,
+            tokens_per_block=tokens_per_block,
+            max_seq_len=max_seq_len,
+            vocab_size=vocab_size,
+            mapping=mapping,
+            dtype=dtype,
+            max_num_tokens=max_num_tokens,
+            **kwargs,
+        )
+        self.is_vswa = True
+        self._assert_layer_pool_scale()
+
+        first_pp_layer = self.pp_layers[0]
+        self.swa_pool_ptr = self.impl.get_mem_pool_base_address(
+            self._layer_attn_to_layer_id[first_pp_layer, DeepseekV4AttentionType.SWA],
+            DeepseekV4AttentionType.SWA.role,
+            PageIndexMode.PER_LAYER,
+        )
+        # Base of the first local KV source of each ratio. Every KV source has
+        # its own base (``get_buffers(owner, COMPRESS)``); the per-ratio page
+        # table is shared by all owners of that ratio.
+        self.compress_pool_ptrs = {}
+        self.compress_scale_pool_ptrs = {}
+        for ratio in layout.compressed_ratios:
+            owner = next(
+                (
+                    layer
+                    for layer in self.pp_layers
+                    if layout.is_kv_source(layer) and self._compress_ratios[layer] == ratio
+                ),
+                None,
+            )
+            if owner is None:
+                continue
+            self.compress_pool_ptrs[ratio] = self.impl.get_mem_pool_base_address(
+                self._layer_attn_to_layer_id[owner, DeepseekV4AttentionType.COMPRESS],
+                DeepseekV4AttentionType.COMPRESS.role,
+                PageIndexMode.SHARED,
+            )
+        entry_bytes = {
+            attn_type.name: deepseek_v41_token_bytes(
+                attn_type, self.head_dim, self.index_head_dim, layout.kv_storage
+            )
+            for attn_type in (
+                DeepseekV4AttentionType.SWA,
+                DeepseekV4AttentionType.COMPRESS,
+                DeepseekV4AttentionType.INDEXER_COMPRESS,
+            )
+        }
+        logger.info(
+            f"DeepSeek-V4.1 KV storage {layout.kv_storage!r}: bytes per entry {entry_bytes}, "
+            f"persistent KV bytes per token {self.get_cache_bytes_per_token()}"
+        )
+        if layout.encoder_replay:
+            logger.info(
+                "DeepSeek-V4.1 encoder SWA bounded replay on: the prefix cache holds main KV "
+                "and index K only; a hit of r tokens (r a multiple of "
+                f"{layout.reuse_alignment}) re-forwards the last min({layout.replay_window}, r) "
+                f"cached tokens (block reuse {'on' if self.enable_block_reuse else 'off'})"
+            )
+
+    def _resolve_v41_encoder_replay(
+        self, mapping: Mapping, max_num_tokens: Optional[int], kwargs: dict
+    ) -> DeepseekV41Layout:
+        """Resolve encoder SWA bounded replay against this engine and return the layout.
+
+        An explicit ``TRTLLM_DSV41_ENCODER_SWA_BOUNDED_REPLAY=1`` on a configuration
+        replay does not support raises; an explicit 0 turns it off. Unset, it is
+        ``DEEPSEEK_V41_DEFAULT_ENCODER_REPLAY`` where supported (aggregated, no KV
+        connector; attention TP or DP) and off otherwise, which rank 0 states once.
+        """
+        layout = self.v41_layout
+        setting = get_deepseek_v41_encoder_replay_setting()
+        refusal = _v41_encoder_replay_refusal(layout, mapping, max_num_tokens, kwargs)
+        if setting is None:
+            enabled = DEEPSEEK_V41_DEFAULT_ENCODER_REPLAY and refusal is None
+            if DEEPSEEK_V41_DEFAULT_ENCODER_REPLAY and refusal is not None:
+                _announce_v41_encoder_replay_off(mapping, refusal[1])
+                off_reason = refusal[1].split(": ", 1)[0]
+            else:
+                off_reason = None if enabled else f"{DEEPSEEK_V41_ENCODER_REPLAY_ENV} unset"
+        elif setting:
+            if refusal is not None:
+                error, reason = refusal
+                raise error(
+                    f"{DEEPSEEK_V41_ENCODER_REPLAY_ENV}=1 (DeepSeek-V4.1 encoder SWA bounded "
+                    f"replay) does not support {reason}. Set {DEEPSEEK_V41_ENCODER_REPLAY_ENV}=0."
+                )
+            enabled, off_reason = True, None
+        else:
+            enabled, off_reason = False, f"{DEEPSEEK_V41_ENCODER_REPLAY_ENV}=0"
+        self.v41_encoder_replay_off_reason = off_reason
+        if enabled != layout.encoder_replay:
+            layout = replace(layout, encoder_replay=enabled)
+            self.v41_layout = layout
+        return layout
+
+    def _resolve_v41_decoder_replay(self, mapping: Mapping, enable_block_reuse: bool) -> bool:
+        """Resolve decoder SWA bounded replay against this engine (ruling R21).
+
+        The model runs it; the manager decides where it may run, after encoder replay:
+        with block reuse on it needs encoder replay (``_v41_decoder_replay_refusal``).
+        Unset, it is on (attention TP or DP) unless that refusal applies, which rank 0
+        states once; an explicit ``TRTLLM_DSV41_DECODER_SWA_BOUNDED_REPLAY=1`` there
+        raises. An explicit 0 is always off.
+        """
+        setting = get_deepseek_v41_decoder_replay_setting()
+        if setting is False:
+            return False
+        refusal = _v41_decoder_replay_refusal(
+            self.v41_layout, enable_block_reuse, self.v41_encoder_replay_off_reason
+        )
+        if refusal is None:
+            return True
+        if setting is None:
+            _announce_v41_decoder_replay_off(mapping, refusal)
+            return False
+        raise ValueError(
+            f"{DEEPSEEK_V41_DECODER_REPLAY_ENV}=1 (DeepSeek-V4.1 decoder SWA bounded replay) "
+            f"does not support {refusal}. Set {DEEPSEEK_V41_DECODER_REPLAY_ENV}=0, or run it "
+            "with encoder replay on or with block reuse off (kv_cache_config.enable_block_reuse)."
+        )
+
+    def _v41_has_local_source(self, compress_ratio: int) -> bool:
+        """Whether this pipeline stage holds a KV source of ``compress_ratio``."""
+        layout = self.v41_layout
+        return any(
+            layout.is_kv_source(layer) and layout.compress_ratios[layer] == compress_ratio
+            for layer in self.pp_layers
+        )
+
+    def _is_v41_native_kv(self, attn_type: DeepseekV4AttentionType) -> bool:
+        """Whether ``attn_type``'s pool holds native uint8 entries (V4.1 native storage)."""
+        return (
+            self.v41_layout is not None
+            and self.v41_layout.kv_storage == DEEPSEEK_V41_KV_STORAGE_NATIVE
+            and attn_type in (DeepseekV4AttentionType.SWA, DeepseekV4AttentionType.COMPRESS)
+        )
+
+    @property
+    def num_sliding_attention_columns(self) -> int:
+        """Width of the per-layer sliding block table; column = ``attn_type.value``."""
+        if self.v41_layout is not None:
+            return DEEPSEEK_V41_SLIDING_TABLE_COLUMNS
+        return len(DEEPSEEK_V4_SLIDING_ATTENTION)
+
+    @property
+    def _sliding_attention_types(self) -> Tuple[DeepseekV4AttentionType, ...]:
+        if self.v41_layout is not None:
+            return DEEPSEEK_V41_SLIDING_ATTENTION
+        return DEEPSEEK_V4_SLIDING_ATTENTION
+
+    @property
+    def _attention_types(self) -> Tuple[DeepseekV4AttentionType, ...]:
+        if self.v41_layout is not None:
+            return DEEPSEEK_V41_ATTENTION
+        return DEEPSEEK_V4_ATTENTION
+
+    @property
+    def disagg_num_attn_types(self) -> int:
+        """Width of the (model layer, role) encoding of the disaggregated synthetic layer ids.
+
+        ``kv_extractor`` encodes a manager layer as ``model_layer * width + role.value``.
+        The width counts the roles this manager's layout can allocate, so it is the
+        same on every pipeline stage: 7 for DeepSeek-V4, whose roles end before
+        ``ENGRAM_TOKEN``, and 8 in the DeepSeek-V4.1 layout mode, which owns an
+        ``ENGRAM_TOKEN`` pool.
+        """
+        return max(attn_type.value for attn_type in self._attention_types) + 1
+
+    def _layer_has_attention(self, layer_idx: int, attn_type: DeepseekV4AttentionType) -> bool:
+        """Whether ``layer_idx`` owns a pool of ``attn_type``."""
+        if self.v41_layout is not None:
+            return self.v41_layout.has_attention(layer_idx, attn_type)
+        return compress_ratio_has_attention(self._compress_ratios[layer_idx], attn_type)
+
+    def _compress_table_ratios(self) -> List[int]:
+        """Ratios that have a shared COMPRESS page table."""
+        if self.v41_layout is not None:
+            return list(self.v41_layout.compressed_ratios)
+        return [
+            compress_ratio
+            for compress_ratio in set(self._compress_ratios)
+            if compress_ratio_has_attention(compress_ratio, DeepseekV4AttentionType.COMPRESS)
+        ]
+
+    def _non_sliding_bytes_per_token(self) -> int:
+        """Persistent (non-windowed) cache bytes per token of the local layers."""
+        if self.v41_layout is not None:
+            return self.v41_layout.persistent_bytes_per_token(self.pp_layers)
+        compress_ratios = [self._compress_ratios[layer] for layer in self.pp_layers]
+        return _estimate_non_sliding_attn_size_per_token(
+            self.head_dim,
+            self.index_head_dim,
+            compress_ratios,
+            self.dtype == DataType.FP8,
+            indexer_k_dtype=self._indexer_k_dtype,
+            use_fp8_ds_mla=self.use_fp8_ds_mla,
+            has_nvfp4_compress=self._use_nvfp4_compress,
+            nvfp4_residual_dim=self.nvfp4_residual_dim,
+        )
+
+    def _swa_cache_size(self, *, context: bool, scratch: bool) -> Tuple[int, int]:
+        """Windowed-cache (bytes per token, bytes per request) of the local layers."""
+        if self.v41_layout is not None:
+            return _estimate_v41_swa_cache_size(
+                self.v41_layout,
+                list(self.pp_layers),
+                self.tokens_per_block,
+                self._max_draft_len,
+                context=context,
+                scratch=scratch,
+            )
+        compress_ratios = [self._compress_ratios[layer] for layer in self.pp_layers]
+        return _estimate_swa_cache_size(
+            self.head_dim,
+            self.index_head_dim,
+            compress_ratios,
+            self.dtype == DataType.FP8,
+            self.tokens_per_block,
+            self._swa_window_size,
+            context=context,
+            scratch=scratch,
+            indexer_k_dtype=self._indexer_k_dtype,
+            use_fp8_ds_mla=self.use_fp8_ds_mla,
+        )
+
     @property
     def nvfp4_residual_dim(self) -> int:
         """Residual dimensions fixed when the NVFP4 cache is constructed."""
@@ -543,6 +1077,8 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         Returns:
             The buffer tensor (shape: [num_blocks, tokens_per_block, attn_dim])
             For blockwise FP8 layers, shape is [num_blocks, tokens_per_block, attn_dim + scale_size]
+            For DeepSeek-V4.1 native SWA / main KV, uint8 [num_blocks, block, entry bytes]
+            (528 / 288); see ``get_v41_native_kv_views``.
         """
         layer_id = self._layer_attn_to_layer_id[(layer_idx, attn_type)]
         data_role = attn_type.role
@@ -563,9 +1099,13 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             DeepseekV4AttentionType.SWA,
             DeepseekV4AttentionType.COMPRESS,
         )
+        v41_native = self._is_v41_native_kv(attn_type)
         if attn_type == DeepseekV4AttentionType.INDEXER_COMPRESS:
             # Indexer always pack data + per-block scales into the same row.
             dim_per_token = self._indexer_data_size + self._indexer_scale_size
+        elif v41_native:
+            # One contiguous row per entry: codes, then block scales.
+            dim_per_token = sum(deepseek_v41_native_entry_split(attn_type, self.head_dim))
         elif footer_scale:
             # Footer-scale pages are byte-packed rather than token-major.
             from . import footer_scale_kv
@@ -595,12 +1135,42 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             dtype = self._compressor_dtype
         elif attn_type == DeepseekV4AttentionType.INDEXER_COMPRESS:
             dtype = self._indexer_dtype
-        elif footer_scale or (
-            attn_type == DeepseekV4AttentionType.COMPRESS and self._use_nvfp4_compress
+        elif attn_type == DeepseekV4AttentionType.ENGRAM_TOKEN:
+            dtype = DataType.INT32
+        elif (
+            footer_scale
+            or v41_native
+            or (attn_type == DeepseekV4AttentionType.COMPRESS and self._use_nvfp4_compress)
         ):
             dtype = DataType.UINT8
 
         return convert_to_torch_tensor(TensorWrapper(addr, dtype, shape))
+
+    def get_v41_native_kv_views(
+        self, layer_idx: int, attn_type: DeepseekV4AttentionType
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """(codes, scales) views of a DeepSeek-V4.1 native SWA or main-KV pool.
+
+        Both are uint8 views of ``get_buffers(layer_idx, attn_type)``, page
+        geometry ``[num_blocks, block]`` and slot numbering unchanged:
+
+        - SWA: codes ``[..., 512]`` E4M3, scales ``[..., 16]`` UE8M0 (one per 32);
+        - COMPRESS: codes ``[..., 256]`` packed E2M1 (even element in the low
+          nibble), scales ``[..., 32]`` E4M3 (one per 16, no global scale).
+
+        These are the ``out`` / ``out_scale`` of the native writers
+        (``mxfp8_fake_quantize`` / ``nvfp4_fake_quantize``) and the
+        ``codes`` / ``scales`` (``kv_cache`` / ``kv_cache_sf`` after
+        ``unsqueeze(2)``) of the dequantizing readers.
+        """
+        if not self._is_v41_native_kv(attn_type):
+            raise RuntimeError(
+                f"{attn_type.name} of layer {layer_idx} is not a DeepSeek-V4.1 native pool "
+                f"(set {DEEPSEEK_V41_KV_STORAGE_ENV}={DEEPSEEK_V41_KV_STORAGE_NATIVE})."
+            )
+        code_bytes, _ = deepseek_v41_native_entry_split(attn_type, self.head_dim)
+        buffer = self.get_buffers(layer_idx, attn_type)
+        return buffer[..., :code_bytes], buffer[..., code_bytes:]
 
     def get_compress_scale_buffers(self, layer_idx: int) -> torch.Tensor:
         """Return E4M3 per-16 scales for an NVFP4 COMPRESS layer."""
@@ -717,34 +1287,39 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
                 pin_memory=prefer_pinned(),
                 device="cpu",
             )
-            for compress_ratio in set(self._compress_ratios)
-            if compress_ratio_has_attention(compress_ratio, DeepseekV4AttentionType.COMPRESS)
+            for compress_ratio in self._compress_table_ratios()
         }
+        # DeepSeek-V4.1: (role, ratio) -> (pool id, page-index scale) of the page
+        # table shared by the KV sources of that ratio, for COMPRESS and
+        # INDEXER_COMPRESS.
+        self._v41_shared_table_params: Dict[
+            Tuple[DeepseekV4AttentionType, int], Tuple[int, int]
+        ] = {}
 
-        # layer offsets per layer and attn, shape [num_local_layers, len(DEEPSEEK_V4_SLIDING_ATTENTION)].
+        # layer offsets per layer and attn, shape [num_local_layers, num_sliding_attention_columns].
         self._layer_offsets = torch.full(
-            (self.num_local_layers, len(DEEPSEEK_V4_SLIDING_ATTENTION)),
+            (self.num_local_layers, self.num_sliding_attention_columns),
             -1,
             dtype=torch.int32,
             device="cpu",
         )
         # Pool ids per layer and sliding attention type, shape [num_local_layers, num_sliding_attention_types].
         self._layer_attn_pool_ids = torch.full(
-            (self.num_local_layers, len(DEEPSEEK_V4_SLIDING_ATTENTION)),
+            (self.num_local_layers, self.num_sliding_attention_columns),
             -1,
             dtype=torch.int32,
             device="cpu",
         )
         # Scales per layer and sliding attention type, shape [num_local_layers, num_sliding_attention_types].
         self._layer_attn_scales = torch.ones(
-            (self.num_local_layers, len(DEEPSEEK_V4_SLIDING_ATTENTION)),
+            (self.num_local_layers, self.num_sliding_attention_columns),
             dtype=torch.int32,
             device="cpu",
         )
         # Scratch pages per block per layer and sliding attention type, shape
         # [num_local_layers, num_sliding_attention_types].
         self._scratch_pages = torch.zeros(
-            (self.num_local_layers, len(DEEPSEEK_V4_SLIDING_ATTENTION)),
+            (self.num_local_layers, self.num_sliding_attention_columns),
             dtype=torch.int32,
             device="cpu",
         )
@@ -786,9 +1361,20 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
                 self._hca_compress_pool_id = self.layer_to_pool_mapping_dict[compress_layer_id]
                 self._hca_compress_scale = int(compress_converter.scale)
 
+            if self.v41_layout is not None and self.v41_layout.is_kv_source(layer_idx):
+                for attn_type in DEEPSEEK_V41_NON_SLIDING_ATTENTION:
+                    shared_layer_id = self._layer_attn_to_layer_id[layer_idx, attn_type]
+                    shared_converter = self.impl.get_page_index_converter(
+                        shared_layer_id, attn_type.role
+                    )
+                    self._v41_shared_table_params[attn_type, compress_ratio] = (
+                        self.layer_to_pool_mapping_dict[shared_layer_id],
+                        int(shared_converter.scale),
+                    )
+
             local_layer_idx = self.layer_offsets[layer_idx]
-            for attn_type in DEEPSEEK_V4_SLIDING_ATTENTION:
-                if not compress_ratio_has_attention(self._compress_ratios[layer_idx], attn_type):
+            for attn_type in self._sliding_attention_types:
+                if not self._layer_has_attention(layer_idx, attn_type):
                     continue
                 layer_id = self._layer_attn_to_layer_id[layer_idx, attn_type]
                 pool_id = self.layer_to_pool_mapping_dict[layer_id]
@@ -808,7 +1394,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         self._precomputed_sliding_block_tables = torch.empty(
             (
                 self.num_local_layers,
-                len(DEEPSEEK_V4_SLIDING_ATTENTION),
+                self.num_sliding_attention_columns,
                 self.host_kv_cache_block_offsets.size(1),
                 self.max_blocks_per_seq,
             ),
@@ -946,51 +1532,18 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
 
     def _get_extra_quota_padding(self) -> int:
         """Ensure each attention type has minimal space when max_tokens is small."""
-        return len(DeepseekV4AttentionType) * (2 << 20)
+        return len(self._attention_types) * (2 << 20)
 
     def _get_quota_from_max_tokens(self, max_tokens: int) -> int:
-        compress_ratios = [self._compress_ratios[layer] for layer in self.pp_layers]
-        has_fp8_kv_cache = self.dtype == DataType.FP8
-        non_sliding_attn_size_per_token = _estimate_non_sliding_attn_size_per_token(
-            self.head_dim,
-            self.index_head_dim,
-            compress_ratios,
-            has_fp8_kv_cache,
-            indexer_k_dtype=self._indexer_k_dtype,
-            use_fp8_ds_mla=self.use_fp8_ds_mla,
-            has_nvfp4_compress=self._use_nvfp4_compress,
-            nvfp4_residual_dim=self.nvfp4_residual_dim,
-        )
+        non_sliding_attn_size_per_token = self._non_sliding_bytes_per_token()
         (
             context_swa_size_per_token,
             _,
-        ) = _estimate_swa_cache_size(
-            self.head_dim,
-            self.index_head_dim,
-            compress_ratios,
-            has_fp8_kv_cache,
-            self.tokens_per_block,
-            self._swa_window_size,
-            context=True,
-            scratch=self.enable_swa_scratch_reuse,
-            indexer_k_dtype=self._indexer_k_dtype,
-            use_fp8_ds_mla=self.use_fp8_ds_mla,
-        )
+        ) = self._swa_cache_size(context=True, scratch=self.enable_swa_scratch_reuse)
         (
             generation_swa_size_per_token,
             generation_swa_size_per_request,
-        ) = _estimate_swa_cache_size(
-            self.head_dim,
-            self.index_head_dim,
-            compress_ratios,
-            has_fp8_kv_cache,
-            self.tokens_per_block,
-            self._swa_window_size,
-            context=False,
-            scratch=False,
-            indexer_k_dtype=self._indexer_k_dtype,
-            use_fp8_ds_mla=self.use_fp8_ds_mla,
-        )
+        ) = self._swa_cache_size(context=False, scratch=False)
         max_context_tokens = (
             self._max_num_tokens if self._max_num_tokens is not None else max_tokens
         )
@@ -1006,45 +1559,14 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         return int(generation_quota + context_extra_quota + padding)
 
     def _get_max_tokens_from_quota(self, quota: int) -> float:
-        compress_ratios = [self._compress_ratios[layer] for layer in self.pp_layers]
-        has_fp8_kv_cache = self.dtype == DataType.FP8
-        non_sliding_attn_size_per_token = _estimate_non_sliding_attn_size_per_token(
-            self.head_dim,
-            self.index_head_dim,
-            compress_ratios,
-            has_fp8_kv_cache,
-            indexer_k_dtype=self._indexer_k_dtype,
-            use_fp8_ds_mla=self.use_fp8_ds_mla,
-            has_nvfp4_compress=self._use_nvfp4_compress,
-            nvfp4_residual_dim=self.nvfp4_residual_dim,
-        )
-        context_swa_size_per_token, _ = _estimate_swa_cache_size(
-            self.head_dim,
-            self.index_head_dim,
-            compress_ratios,
-            has_fp8_kv_cache,
-            self.tokens_per_block,
-            self._swa_window_size,
-            context=True,
-            scratch=self.enable_swa_scratch_reuse,
-            indexer_k_dtype=self._indexer_k_dtype,
-            use_fp8_ds_mla=self.use_fp8_ds_mla,
+        non_sliding_attn_size_per_token = self._non_sliding_bytes_per_token()
+        context_swa_size_per_token, _ = self._swa_cache_size(
+            context=True, scratch=self.enable_swa_scratch_reuse
         )
         (
             generation_swa_size_per_token,
             generation_swa_size_per_request,
-        ) = _estimate_swa_cache_size(
-            self.head_dim,
-            self.index_head_dim,
-            compress_ratios,
-            has_fp8_kv_cache,
-            self.tokens_per_block,
-            self._swa_window_size,
-            context=False,
-            scratch=False,
-            indexer_k_dtype=self._indexer_k_dtype,
-            use_fp8_ds_mla=self.use_fp8_ds_mla,
-        )
+        ) = self._swa_cache_size(context=False, scratch=False)
         padding = self._get_extra_quota_padding()
         size_per_batch = self.max_batch_size * generation_swa_size_per_request + padding
         if quota < size_per_batch:
@@ -1066,6 +1588,8 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         """
         Add DeepSeek-V4 layers and warmup constraints to the cache config.
         """
+        if self.v41_layout is not None:
+            return self._build_v41_cache_config(config)
         layers: List[AttentionLayerConfig] = []
         layer_attn_to_layer_id: Dict[Tuple[int, DeepseekV4AttentionType], LayerId] = {}
         manager_layer_id_to_layer_attn: Dict[
@@ -1215,6 +1739,20 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         # number of layers in the KVCacheManagerPy
         self._num_manager_layers = len(layers)
 
+        return replace(
+            config,
+            layers=layers,
+            constraints=self._decode_capacity_constraints(config),
+        )
+
+    def _decode_capacity_constraints(self, config: KVCacheManagerConfigPy) -> List[BatchDesc]:
+        """``config.constraints`` plus the longest decode request beside short ones.
+
+        The windowed and compressed pools must also hold one request at
+        ``max_seq_len`` alongside minimal decode requests filling the resident
+        capacity. Added only while the pool split is derived
+        (``kv_cache_config.pool_ratio`` unset); used by both layouts.
+        """
         constraints = list(config.constraints)
         # _build_base_config copies kv_cache_config.pool_ratio to initial_pool_ratio.
         if config.initial_pool_ratio is None:
@@ -1242,10 +1780,104 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
                     * (constraint_batch_size - 1)
                 )
             )
+        return constraints
+
+    def _build_v41_cache_config(self, config: KVCacheManagerConfigPy) -> KVCacheManagerConfigPy:
+        """Add the DeepSeek-V4.1 owner-only pools to the cache config.
+
+        One manager layer per (model layer, lifecycle): SWA on every layer; the
+        persistent COMPRESS + INDEXER_COMPRESS pair on KV sources; the windowed
+        compressor pending pair on ratio-2 KV sources; the windowed Engram token
+        history on its owner. Reader layers get no compressed entry here, so
+        every ``(layer, role)`` key names exactly one owner.
+        """
+        layout = self.v41_layout
+        layers: List[AttentionLayerConfig] = []
+        layer_attn_to_layer_id: Dict[Tuple[int, DeepseekV4AttentionType], LayerId] = {}
+        manager_layer_id_to_layer_attn: Dict[
+            Tuple[LayerId, DataRole], Tuple[int, DeepseekV4AttentionType]
+        ] = {}
+
+        def _add_layer(
+            layer_idx: int,
+            attention_types: List[DeepseekV4AttentionType],
+            sliding_window_size: int | None,
+        ) -> None:
+            layer_id = LayerId(len(layers))
+            for attn_type in attention_types:
+                layer_attn_to_layer_id[layer_idx, attn_type] = layer_id
+                manager_layer_id_to_layer_attn[layer_id, attn_type.role] = (layer_idx, attn_type)
+            # Encoder SWA bounded replay: the windowed roles (SWA, compressor state,
+            # Engram history) stay private to each request and out of the prefix
+            # cache; a reuse hit gets fresh pages for its live window, which the
+            # replay rows rebuild. Only main KV and index K are shared.
+            reuse_policy = (
+                AttentionReusePolicy.PRIVATE
+                if layout.encoder_replay and sliding_window_size is not None
+                else AttentionReusePolicy.REQUIRED
+            )
+            layers.append(
+                AttentionLayerConfig(
+                    layer_id=layer_id,
+                    buffers=[
+                        BufferConfig(
+                            role=attn_type.role,
+                            size=self._get_attn_bytes_per_block(attn_type, layer_idx),
+                        )
+                        for attn_type in attention_types
+                    ],
+                    sliding_window_size=sliding_window_size,
+                    num_sink_tokens=None,
+                    reuse_policy=reuse_policy,
+                )
+            )
+
+        draft_len = self._max_draft_len
+        for layer in self.pp_layers:
+            if not 0 <= layer < layout.num_layers:
+                raise NotImplementedError(
+                    f"Layer {layer} is outside the {layout.num_layers} DeepSeek-V4.1 backbone "
+                    "layers; speculative layers appended to the target cache are not supported "
+                    "(DSpark keeps its stage windows in the drafter)."
+                )
+            _add_layer(
+                layer,
+                [DeepseekV4AttentionType.SWA],
+                layout.window(DeepseekV4AttentionType.SWA, draft_len),
+            )
+            if layout.has_attention(layer, DeepseekV4AttentionType.COMPRESS):
+                _add_layer(
+                    layer,
+                    [
+                        DeepseekV4AttentionType.COMPRESS,
+                        DeepseekV4AttentionType.INDEXER_COMPRESS,
+                    ],
+                    None,
+                )
+            if layout.has_attention(layer, DeepseekV4AttentionType.COMPRESSOR_KV):
+                _add_layer(
+                    layer,
+                    [
+                        DeepseekV4AttentionType.COMPRESSOR_KV,
+                        DeepseekV4AttentionType.COMPRESSOR_SCORE,
+                    ],
+                    layout.window(DeepseekV4AttentionType.COMPRESSOR_KV, draft_len),
+                )
+            if layout.has_attention(layer, DeepseekV4AttentionType.ENGRAM_TOKEN):
+                _add_layer(
+                    layer,
+                    [DeepseekV4AttentionType.ENGRAM_TOKEN],
+                    layout.window(DeepseekV4AttentionType.ENGRAM_TOKEN, draft_len),
+                )
+
+        self._layer_attn_to_layer_id = layer_attn_to_layer_id
+        self._manager_layer_id_to_layer_attn = manager_layer_id_to_layer_attn
+        self._disagg_ignored_roles = frozenset()
+        self._num_manager_layers = len(layers)
         return replace(
             config,
             layers=layers,
-            constraints=constraints,
+            constraints=self._decode_capacity_constraints(config),
         )
 
     def _init_indexer_dtype(self, sparse_attn_config: DeepSeekV4SparseAttentionConfig) -> None:
@@ -1299,7 +1931,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             (attn_type, layer_idx)
             for attn_type in DeepseekV4AttentionType
             for layer_idx in self.pp_layers
-            if compress_ratio_has_attention(self._compress_ratios[layer_idx], attn_type)
+            if self._layer_has_attention(layer_idx, attn_type)
         ]
         for attn_type, layer_idx in comb:
             compress_ratio = self._compress_ratios[layer_idx]
@@ -1359,6 +1991,13 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         """
         Get the cache bytes per block for a specific attention type and layer.
         """
+        if self.v41_layout is not None:
+            block_size = self.tokens_per_block
+            if attn_type in DEEPSEEK_V41_NON_SLIDING_ATTENTION:
+                block_size = self.compressed_block_sizes[layer_idx]
+            return block_size * deepseek_v41_token_bytes(
+                attn_type, self.head_dim, self.index_head_dim, self.v41_layout.kv_storage
+            )
         has_fp8_kv_cache = self.dtype == DataType.FP8
         token_bytes = get_token_bytes(
             self.head_dim,
@@ -1386,18 +2025,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
 
     def get_cache_bytes_per_token(self) -> int:
         """Get the average cache bytes per token for DeepSeek-V4."""
-        has_fp8_kv_cache = self.dtype == DataType.FP8
-        compress_ratios = [self._compress_ratios[layer] for layer in self.pp_layers]
-        return _estimate_non_sliding_attn_size_per_token(
-            self.head_dim,
-            self.index_head_dim,
-            compress_ratios,
-            has_fp8_kv_cache,
-            indexer_k_dtype=self._indexer_k_dtype,
-            use_fp8_ds_mla=self.use_fp8_ds_mla,
-            has_nvfp4_compress=self._use_nvfp4_compress,
-            nvfp4_residual_dim=self.nvfp4_residual_dim,
-        )
+        return self._non_sliding_bytes_per_token()
 
     def get_max_resource_count(self) -> int:
         # Keep scheduler capacity tied to physical GPU KV quota in bytes.
@@ -1432,29 +2060,9 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         return self._get_cache_bytes_for_tokens(total_tokens, context=False)
 
     def _get_cache_bytes_for_tokens(self, total_tokens: int, *, context: bool) -> int:
-        has_fp8_kv_cache = self.dtype == DataType.FP8
-        compress_ratios = [self._compress_ratios[layer] for layer in self.pp_layers]
-        non_sliding_attn_size_per_token = _estimate_non_sliding_attn_size_per_token(
-            self.head_dim,
-            self.index_head_dim,
-            compress_ratios,
-            has_fp8_kv_cache,
-            indexer_k_dtype=self._indexer_k_dtype,
-            use_fp8_ds_mla=self.use_fp8_ds_mla,
-            has_nvfp4_compress=self._use_nvfp4_compress,
-            nvfp4_residual_dim=self.nvfp4_residual_dim,
-        )
-        swa_size_per_token, swa_size_per_request = _estimate_swa_cache_size(
-            self.head_dim,
-            self.index_head_dim,
-            compress_ratios,
-            has_fp8_kv_cache,
-            self.tokens_per_block,
-            self._swa_window_size,
-            context=context,
-            scratch=self.enable_swa_scratch_reuse,
-            indexer_k_dtype=self._indexer_k_dtype,
-            use_fp8_ds_mla=self.use_fp8_ds_mla,
+        non_sliding_attn_size_per_token = self._non_sliding_bytes_per_token()
+        swa_size_per_token, swa_size_per_request = self._swa_cache_size(
+            context=context, scratch=self.enable_swa_scratch_reuse
         )
         return int(
             total_tokens * (non_sliding_attn_size_per_token + swa_size_per_token)
@@ -1480,6 +2088,138 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
     def get_disagg_ignored_roles(self) -> frozenset[DataRole]:
         """Exclude storage-only NVFP4 alignment pages from KV transfer."""
         return self._disagg_ignored_roles
+
+    # ------------------------------------------------------------------
+    # DeepSeek-V4.1 encoder SWA bounded replay: scheduling of replay rows.
+    # ------------------------------------------------------------------
+
+    @property
+    def v41_encoder_replay(self) -> bool:
+        return self.v41_layout is not None and self.v41_layout.encoder_replay
+
+    def validate_request(self, request: llm_request.LlmRequest) -> None:
+        """Refuse, at admission, what DeepSeek-V4.1 decoder SWA bounded replay cannot serve.
+
+        Under decoder replay the layers after the last KV-source layer run over each
+        prompt's last ``replay_window`` positions only, so context logits, and the prompt
+        logprobs computed from them, do not exist. The model refuses them inside the
+        forward, which fails the whole executor step; here only the request fails. A
+        generation-only request (disaggregated serving) ran its context elsewhere.
+
+        Nothing here depends on the prompt length, so a request paused for recompute,
+        whose prompt then holds its generated tokens too, needs no second check.
+        """
+        super().validate_request(request)
+        if not self.v41_decoder_replay or request.is_generation_only_request:
+            return
+        if getattr(request, "py_return_context_logits", False):
+            raise ValueError(
+                "DeepSeek-V4.1 decoder SWA bounded replay runs the layers after the last "
+                f"KV-source layer over each prompt's last {self.v41_layout.replay_window} "
+                "positions only, so return_context_logits / prompt_logprobs do not exist. "
+                "Drop these options from the request, or serve them with "
+                f"{DEEPSEEK_V41_DECODER_REPLAY_ENV}=0."
+            )
+
+    @staticmethod
+    def _v41_replayable(request: llm_request.LlmRequest) -> bool:
+        """Whether a request's cached rows can be re-forwarded from their token ids alone.
+
+        Multimodal rows need their embeddings, and context logits would include the
+        replay rows' approximate logits: such requests take no prefix reuse instead.
+        """
+        return request.multimodal_hashes is None and not getattr(
+            request, "py_return_context_logits", False
+        )
+
+    def prepare_context_cache(
+        self, req: llm_request.LlmRequest, reuse_limit: int | None = None
+    ) -> int | None:
+        """Claim the prefix cache; under encoder replay, return the replay start.
+
+        Encoder SWA bounded replay keeps no sliding-window state in the prefix cache, so
+        a hit of ``reused`` tokens (a multiple of ``reuse_alignment``) re-forwards the
+        last ``min(replay_window, reused)`` of them. Returning the replay start makes the
+        caller settle the context cursor there, so the replay rows are scheduled at the
+        head of the first chunk and charged to the token budget like any context row.
+        """
+        if not self.v41_encoder_replay or not self.enable_block_reuse:
+            return super().prepare_context_cache(req, reuse_limit)
+        if not req.is_first_context_chunk:
+            return super().prepare_context_cache(req, reuse_limit)
+        layout = self.v41_layout
+        align = layout.reuse_alignment
+        if not self._v41_replayable(req):
+            reuse_limit = 0
+        elif req.py_request_id not in self.kv_cache_map:
+            probed = self.probe_context_reuse(req)
+            if probed is not None:
+                aligned = probed - probed % align
+                reuse_limit = aligned if reuse_limit is None else min(reuse_limit, aligned)
+        reused = super().prepare_context_cache(req, reuse_limit)
+        if reused is not None and reused % align:
+            # A partially covered page can end the claimed match off the alignment.
+            # Claim again below it; the tree still covers that shorter prefix.
+            for limit in (reused - reused % align, 0):
+                self.free_resources(req)
+                reused = super().prepare_context_cache(req, limit)
+                if reused is None or reused % align == 0:
+                    break
+            if reused is not None and reused % align:
+                raise RuntimeError(
+                    f"request {req.py_request_id}: no reuse boundary aligned to {align} "
+                    f"(claimed {reused} tokens)"
+                )
+        if reused is None:
+            return None
+        num_replay = min(layout.replay_window, reused)
+        start = reused - num_replay
+        history = layout.engram_history_len if layout.engram_token_owner is not None else 0
+        history_ids = (
+            tuple(req.get_tokens_range(0, max(0, start - history), start)) if start > 0 else ()
+        )
+        self._v41_replay_plans[req.py_request_id] = DeepseekV41ReplayPlan(
+            start, num_replay, history_ids
+        )
+        return start
+
+    def resize_context(self, req: llm_request.LlmRequest, num_tokens: int) -> bool:
+        plan = self._v41_replay_plans.get(req.py_request_id) if self.v41_encoder_replay else None
+        if (
+            plan is not None
+            and req.context_current_position == plan.start
+            and num_tokens < plan.num_tokens
+        ):
+            # Every replay row belongs to the first chunk: a later chunk would start
+            # inside the cached prefix, below the cache's history.
+            return False
+        return super().resize_context(req, num_tokens)
+
+    def free_resources(self, request: llm_request.LlmRequest, pin_on_release: bool = False):
+        if self.v41_layout is not None:
+            self._v41_replay_plans.pop(request.py_request_id, None)
+        return super().free_resources(request, pin_on_release)
+
+    def get_v41_replay_plan(
+        self, request_id: int, context_start: int
+    ) -> Optional[DeepseekV41ReplayPlan]:
+        """The replay plan of a context chunk starting at ``context_start``, if it has one.
+
+        Only the chunk starting at the replay start carries replay rows; later chunks
+        of the same request are ordinary.
+        """
+        plan = self._v41_replay_plans.get(request_id)
+        if plan is None or plan.num_tokens == 0 or plan.start != context_start:
+            return None
+        return plan
+
+    def get_v41_replay_plans(
+        self, request_ids: Sequence[int], context_starts: Sequence[int]
+    ) -> List[Optional[DeepseekV41ReplayPlan]]:
+        return [
+            self.get_v41_replay_plan(request_id, int(start))
+            for request_id, start in zip(request_ids, context_starts)
+        ]
 
     def get_indexer_k_cache_buffers(self, layer_idx: int) -> torch.Tensor:
         """
@@ -1976,7 +2716,16 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         assert beam_width == 1, "DSV4 only supports beam width 1 now"
         copy_idx = self.index_mapper.get_copy_index(request_ids, num_contexts, beam_width)
         staging = self._host_compress_block_tables_staging[compress_ratio]
-        if compress_ratio == 4:
+        if self.v41_layout is not None:
+            pool_id, scale = self._v41_shared_table_params.get(
+                (DeepseekV4AttentionType.COMPRESS, compress_ratio), (None, None)
+            )
+            if pool_id is None and not self._v41_has_local_source(compress_ratio):
+                # A pipeline stage without a KV source of this ratio: no layer of
+                # the stage reads the table.
+                dst_tensor[:num_seqs].fill_(BAD_PAGE_INDEX)
+                return
+        elif compress_ratio == 4:
             pool_id = self._csa_compress_pool_id
             scale = self._csa_compress_scale
         elif compress_ratio == 128:
@@ -2002,10 +2751,28 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         beam_width: int,
         num_contexts: int,
         num_seqs: int,
+        compress_ratio: Optional[int] = None,
     ) -> None:
-        """Build the shared INDEXER_COMPRESS compatibility block table."""
+        """Build the shared INDEXER_COMPRESS compatibility block table.
+
+        ``compress_ratio`` selects the per-ratio table in the DeepSeek-V4.1
+        layout and is ignored by DeepSeek-V4, which has one indexer ratio.
+        """
         assert beam_width == 1, "DSV4 only supports beam width 1 now"
         copy_idx = self.index_mapper.get_copy_index(request_ids, num_contexts, beam_width)
+        if self.v41_layout is not None:
+            pool_id, scale = self._v41_shared_table_params.get(
+                (DeepseekV4AttentionType.INDEXER_COMPRESS, compress_ratio), (None, None)
+            )
+            if pool_id is None and not self._v41_has_local_source(compress_ratio):
+                host_block_table[:num_seqs] = BAD_PAGE_INDEX
+                return
+            if pool_id is None or scale is None:
+                raise RuntimeError(
+                    f"Missing INDEXER_COMPRESS pool metadata for compress ratio {compress_ratio}"
+                )
+            host_block_table[:num_seqs] = self._compute_shared_block_table(pool_id, scale, copy_idx)
+            return
         pool_id = self._csa_indexer_compress_pool_id
         scale = self._csa_indexer_compress_scale
         if pool_id is None or scale is None:
@@ -2015,6 +2782,33 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
     @staticmethod
     def get_cache_size_per_token(model_config: ModelConfig, mapping: Mapping, **kwargs):
         config = model_config.pretrained_config
+        v41_layout = get_deepseek_v41_layout(config)
+        if v41_layout is not None:
+            if (
+                v41_layout.encoder_replay
+                and get_deepseek_v41_encoder_replay_setting() is None
+                and _v41_encoder_replay_refusal(
+                    v41_layout, mapping, kwargs.get("max_num_tokens"), kwargs
+                )
+                is not None
+            ):
+                v41_layout = replace(v41_layout, encoder_replay=False)
+            pp_layers = mapping.pp_layers(v41_layout.num_layers)
+            spec_config = getattr(model_config, "spec_config", None)
+            max_draft_len = getattr(spec_config, "max_draft_len", 0) or 0
+            swa_size_per_token, swa_size_per_request = _estimate_v41_swa_cache_size(
+                v41_layout,
+                pp_layers,
+                kwargs["tokens_per_block"],
+                max_draft_len,
+                context=False,
+                scratch=False,
+            )
+            max_batch_size = int(kwargs.get("max_batch_size") or 0)
+            return (
+                v41_layout.persistent_bytes_per_token(pp_layers) + swa_size_per_token,
+                swa_size_per_request * max_batch_size,
+            )
         head_dim = config.kv_lora_rank + config.qk_rope_head_dim
         index_head_dim = model_config.sparse_attention_config.index_head_dim
         pp_layers = mapping.pp_layers(model_config.get_num_attention_layers())

@@ -494,9 +494,13 @@ def _compute_global_layer_ids(manager, lg_idx: int) -> List[int]:
     # a rank with only ratio=128 layers won't have INDEXER_* types), so using
     # max(local values) would produce different num_attn_types across ranks,
     # causing the same (model_layer, attn_type) to map to different global IDs.
-    first_key = next(iter(manager._layer_attn_to_layer_id.keys()))
-    attn_type_class = type(first_key[1])
-    num_attn_types = max(e.value for e in attn_type_class) + 1
+    # A manager whose role type has members its layout never allocates states
+    # the width itself (``disagg_num_attn_types``, the same on every rank).
+    num_attn_types = getattr(manager, "disagg_num_attn_types", None)
+    if num_attn_types is None:
+        first_key = next(iter(manager._layer_attn_to_layer_id.keys()))
+        attn_type_class = type(first_key[1])
+        num_attn_types = max(e.value for e in attn_type_class) + 1
 
     return [inverse[lid][0] * num_attn_types + inverse[lid][1] for lid in local_layer_ids]
 

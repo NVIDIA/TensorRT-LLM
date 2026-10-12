@@ -65,20 +65,41 @@ class HfCheckpointLoader(BaseCheckpointLoader):
                 and getattr(getattr(model, "model", None),
                             "disagg_context_only", False) is True)
 
+    def _uses_model_requested_lazy_loading(self, model: Any) -> bool:
+        """Whether the model asks for lazy safetensors handles.
+
+        A model class that sets ``requires_lazy_safetensors = True`` streams the
+        rank-local slices it owns out of the mmapped handles in its
+        ``load_weights``, so its checkpoint is never materialized in host RAM.
+        """
+        return (type(self) is HfCheckpointLoader
+                and type(self.weight_loader) is HfWeightLoader
+                and getattr(model, "requires_lazy_safetensors", False) is True)
+
+    def _lazy_loading_reason(self, model: Any) -> Optional[str]:
+        """Why this load must hand out lazy safetensors slices, or None."""
+        if self._uses_context_only_lazy_loading(model):
+            return ("context-only model loading requires lazy safetensors "
+                    "without full-checkpoint read-ahead")
+        if self._uses_model_requested_lazy_loading(model):
+            return ("the model streams rank-local slices out of lazy "
+                    "safetensors handles")
+        return None
+
     def load_weights(self, checkpoint_dir: str, mapping: Mapping,
                      **kwargs) -> dict[str, Any]:
-        """Keep omitted decoder tensors lazy on a context-only worker."""
-        if self._uses_context_only_lazy_loading(kwargs.get("model")):
-            # The model remapper drops unowned keys before touching their
-            # slices. Eager loading or read-ahead would read those bytes anyway.
+        """Keep the checkpoint lazy on a context-only worker, or when the model
+        asks for lazy safetensors handles."""
+        lazy_reason = self._lazy_loading_reason(kwargs.get("model"))
+        if lazy_reason is not None:
+            # The model reads only the slices it owns. Eager loading or
+            # read-ahead would read every byte anyway.
             loader = self.weight_loader
             loader._reset_checkpoint_io_status()
             status = loader._last_checkpoint_io_status
             status.selected = "native"
             if loader.checkpoint_io_policy != "native":
-                status.fallback_reason = (
-                    "context-only model loading requires lazy safetensors "
-                    "without full-checkpoint read-ahead")
+                status.fallback_reason = lazy_reason
             weights = loader._load_lazy_safetensors(
                 checkpoint_dir, kwargs.get("use_consolidated", False))
             status.effective = "native"
@@ -92,8 +113,8 @@ class HfCheckpointLoader(BaseCheckpointLoader):
         """Delegate the optimized session only for the built-in HF path."""
         if (type(self) is HfCheckpointLoader
                 and type(self.weight_loader) is HfWeightLoader
-                and self.weight_loader.checkpoint_io_policy != "native" and
-                not self._uses_context_only_lazy_loading(kwargs.get("model"))):
+                and self.weight_loader.checkpoint_io_policy != "native"
+                and self._lazy_loading_reason(kwargs.get("model")) is None):
             with self.weight_loader.open_weight_session(checkpoint_dir,
                                                         mapping=mapping,
                                                         **kwargs) as weights:

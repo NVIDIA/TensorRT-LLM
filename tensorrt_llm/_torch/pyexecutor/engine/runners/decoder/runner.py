@@ -3101,6 +3101,8 @@ class DecoderRunner(ScheduledModelRunner):
         attn_metadata.beam_width = 1
         attn_metadata.request_ids = cache["request_ids"]
         attn_metadata.prompt_lens = cache["prompt_lens"]
+        attn_metadata.context_last_chunk = []
+        attn_metadata.context_return_logits = []
         attn_metadata.num_contexts = 0
         attn_metadata.num_chunked_ctx_requests = 0
         attn_metadata.kv_cache_params = KVCacheParams(
@@ -3272,6 +3274,8 @@ class DecoderRunner(ScheduledModelRunner):
         sequence_lengths = []  # per sequence
         prompt_lengths = []  # per sequence
         request_ids = []  # per request
+        context_last_chunk = []  # per context request
+        context_return_logits = []  # per context request
         gather_ids = []
         position_ids = []  # per sequence
         num_cached_tokens_per_seq = []  # per sequence
@@ -3306,6 +3310,8 @@ class DecoderRunner(ScheduledModelRunner):
 
         for request in scheduled_requests.context_requests:
             request_ids.append(request.py_request_id)
+            context_last_chunk.append(bool(request.is_last_context_chunk))
+            context_return_logits.append(bool(getattr(request, "py_return_context_logits", False)))
             draft_lens.append(0)
             begin_compute = request.context_current_position
             end_compute = begin_compute + request.context_chunk_size
@@ -4137,6 +4143,8 @@ class DecoderRunner(ScheduledModelRunner):
 
         attn_metadata.request_ids = request_ids
         attn_metadata.prompt_lens = prompt_lengths
+        attn_metadata.context_last_chunk = context_last_chunk
+        attn_metadata.context_return_logits = context_return_logits
         attn_metadata.num_contexts = scheduled_requests.num_context_requests
         remote_tail_modes = {
             getattr(request, "py_csa2_remote_tail_mode", None)

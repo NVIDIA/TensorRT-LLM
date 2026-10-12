@@ -362,6 +362,27 @@ def autotune(tune_mode: bool = True,
                 autotuner._dist = prev_dist
 
 
+@contextlib.contextmanager
+def fallback_tactic():
+    """Make every ``AutoTuner.choose_one`` call inside the scope return the fallback.
+
+    Inside the scope ``choose_one`` returns ``runners[0]`` with tactic ``-1``
+    without profiling and without reading or writing the profiling cache, so
+    the choice does not depend on what this process tuned or loaded from a
+    cache file (``autotune(cache_path=...)``). ``autotune(tune_mode=False)``
+    only stops tuning: a cached tactic is still taken. Use this for a
+    computation replicated across ranks that must launch the same kernels on
+    every rank.
+    """
+    autotuner = AutoTuner.get()
+    old = autotuner.force_fallback_tactic
+    autotuner.force_fallback_tactic = True
+    try:
+        yield
+    finally:
+        autotuner.force_fallback_tactic = old
+
+
 @dataclass
 class AutoTunerStatistics:
     """Statistics collected by the AutoTuner.
@@ -941,6 +962,8 @@ class AutoTuner:
         self._primed_cached_tactics: set[tuple[str, str, str, str]] = set()
         self.is_tuning_mode = False
         self.skip_dynamic_tuning_buckets = False
+        # Set by fallback_tactic(): choose_one returns the fallback, no cache lookup.
+        self.force_fallback_tactic = False
 
         # Timing backend: globaltimer kernel vs cuda events.
         # TLLM_PROFILING_TIMER env var overrides auto-detection:
@@ -1138,6 +1161,9 @@ class AutoTuner:
                 'inputs': inputs,
                 'kwargs': kwargs,
             })
+
+        if self.force_fallback_tactic:
+            return (runners[0], -1)
 
         input_shapes = tuple(self._get_input_sizes(inputs))
 

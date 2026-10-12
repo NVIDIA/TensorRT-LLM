@@ -850,3 +850,179 @@ def prepare_sparse_write_table(
             PAGE_SCALE=page_scale,
             BLOCK=256,
         )
+
+
+########################################################
+# torch custom op over the same kernel
+########################################################
+
+_INT32_MAX = 2**31 - 1
+
+
+def _is_power_of_two(n: int) -> bool:
+    return n > 0 and (n & (n - 1)) == 0
+
+
+@torch.library.custom_op(
+    "trtllm::dsv4_local_to_global_indices",
+    mutates_args=(),
+    schema=(
+        "(Tensor req_id, Tensor swa_block_table, Tensor swa_local_indices, "
+        "int swa_tokens_per_block, int swa_row_offset, Tensor? compressed_block_table, "
+        "Tensor? compressed_local_indices, int compressed_tokens_per_block, "
+        "int compressed_row_offset, bool enable_pdl) -> Tensor"
+    ),
+)
+def dsv4_local_to_global_indices(
+    req_id: torch.Tensor,
+    swa_block_table: torch.Tensor,
+    swa_local_indices: torch.Tensor,
+    swa_tokens_per_block: int,
+    swa_row_offset: int,
+    compressed_block_table: torch.Tensor | None,
+    compressed_local_indices: torch.Tensor | None,
+    compressed_tokens_per_block: int,
+    compressed_row_offset: int,
+    enable_pdl: bool,
+) -> torch.Tensor:
+    """Map per-token local SWA and compressed indices to pool rows, one kernel launch.
+
+    Same kernel as ``deepseek_v4_local_to_global_indices`` with each pool's page size
+    passed explicitly instead of derived from a compress ratio, so a compressed
+    segment exists whenever its two tensors are given -- including a 1:1 compressed
+    pool. For token ``t`` of request row ``r = req_id[t]`` and a local index ``l`` in
+    a segment with block table ``bt``, page size ``tpb`` and row offset ``off``::
+
+        out = off + bt[r, l // tpb] * tpb + l % tpb   if 0 <= l and l // tpb < bt.shape[1]
+        out = -1                                        otherwise
+
+    Returns int32 ``[T, W_swa + W_compressed]``: the SWA segment in its own columns
+    first, then the compressed segment (width 0 when the compressed tensors are None).
+    """
+    if (compressed_block_table is None) != (compressed_local_indices is None):
+        raise ValueError(
+            "compressed_block_table and compressed_local_indices are given together or not at all"
+        )
+    has_compressed = compressed_block_table is not None
+    int_args = (req_id, swa_block_table, swa_local_indices)
+    if has_compressed:
+        int_args += (compressed_block_table, compressed_local_indices)
+    for t in int_args:
+        if t.dtype != torch.int32:
+            raise ValueError(
+                f"req_id, block tables and local indices must be int32 tensors, got {t.dtype}"
+            )
+    if req_id.dim() != 1 or req_id.stride(0) != 1:
+        raise ValueError("req_id must be a contiguous 1-D tensor")
+    num_tokens = req_id.shape[0]
+    if swa_local_indices.dim() != 2 or swa_local_indices.shape[0] != num_tokens:
+        raise ValueError("swa_local_indices must be [num_tokens, W_swa]")
+    if swa_block_table.dim() != 2:
+        raise ValueError("swa_block_table must be [rows, max_blocks]")
+    num_swa = swa_local_indices.shape[1]
+    if not _is_power_of_two(num_swa):
+        raise ValueError(f"W_swa must be a power of two, got {num_swa}")
+    if swa_tokens_per_block <= 0:
+        raise ValueError(f"swa_tokens_per_block must be positive, got {swa_tokens_per_block}")
+    if not 0 <= swa_row_offset <= _INT32_MAX:
+        raise ValueError(f"swa_row_offset must be in [0, 2**31), got {swa_row_offset}")
+
+    if has_compressed:
+        if compressed_local_indices.dim() != 2 or compressed_local_indices.shape[0] != num_tokens:
+            raise ValueError("compressed_local_indices must be [num_tokens, W_compressed]")
+        if compressed_block_table.dim() != 2:
+            raise ValueError("compressed_block_table must be [rows, max_blocks]")
+        num_compressed = compressed_local_indices.shape[1]
+        if not _is_power_of_two(num_compressed):
+            raise ValueError(f"W_compressed must be a power of two, got {num_compressed}")
+        if compressed_tokens_per_block <= 0:
+            raise ValueError(
+                f"compressed_tokens_per_block must be positive, got {compressed_tokens_per_block}"
+            )
+        if not 0 <= compressed_row_offset <= _INT32_MAX:
+            raise ValueError(
+                f"compressed_row_offset must be in [0, 2**31), got {compressed_row_offset}"
+            )
+        bt_c, idx_c = compressed_block_table, compressed_local_indices
+        tpb_c = compressed_tokens_per_block
+        max_blocks_c = compressed_block_table.shape[1]
+        offset_c = compressed_row_offset
+    else:
+        # Never read: has_compressed is a constexpr that compiles the segment out.
+        num_compressed = 0
+        bt_c, idx_c = swa_block_table, swa_local_indices
+        tpb_c = swa_tokens_per_block
+        max_blocks_c = 1
+        offset_c = 0
+
+    out = torch.empty(
+        (num_tokens, num_swa + num_compressed), dtype=torch.int32, device=req_id.device
+    )
+    if num_tokens == 0:
+        return out
+
+    _deepseek_v4_local_to_global_kernel[(num_tokens,)](
+        req_id,
+        swa_block_table,
+        bt_c,
+        swa_local_indices,
+        idx_c,
+        out,
+        out,
+        swa_row_offset,
+        offset_c,
+        swa_tokens_per_block,
+        tpb_c,
+        swa_block_table.shape[1],
+        max_blocks_c,
+        num_swa,
+        num_compressed,
+        num_swa + num_compressed,
+        has_compressed,
+        swa_block_table.stride(0),
+        swa_block_table.stride(1),
+        bt_c.stride(0),
+        bt_c.stride(1),
+        swa_local_indices.stride(0),
+        swa_local_indices.stride(1),
+        idx_c.stride(0),
+        idx_c.stride(1),
+        out.stride(0),
+        out.stride(1),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        1.0,
+        WRITE_FMHA_SCHEDULER=False,
+        out_extra_stride0=out.stride(0),
+        out_extra_stride1=out.stride(1),
+        SPLIT_EXTRA=False,
+        LAUNCH_WITH_PDL=enable_pdl,
+        active_request_count_ptr=None,
+        MASK_DECODE_PADDING=False,
+        MASK_INVALID_PAGES=False,
+        launch_pdl=enable_pdl,
+    )
+    return out
+
+
+@dsv4_local_to_global_indices.register_fake
+def _(
+    req_id,
+    swa_block_table,
+    swa_local_indices,
+    swa_tokens_per_block,
+    swa_row_offset,
+    compressed_block_table,
+    compressed_local_indices,
+    compressed_tokens_per_block,
+    compressed_row_offset,
+    enable_pdl,
+):
+    width = swa_local_indices.shape[1]
+    if compressed_local_indices is not None:
+        width += compressed_local_indices.shape[1]
+    return req_id.new_empty((req_id.shape[0], width), dtype=torch.int32)

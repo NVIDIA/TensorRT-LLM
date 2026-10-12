@@ -150,6 +150,14 @@ class AttentionMetadata:
     # The shape is (batch_size) if provided.
     prompt_lens: Optional[List[int]] = None
 
+    # Per context request, in batch order: whether this step's chunk is the
+    # last chunk of the request's context phase (``prompt_lens`` holds the
+    # chunk length, so a chunk alone cannot tell), and whether the request
+    # asked for context logits (prompt logprobs imply them). Set by the
+    # PyTorch decoder runner's input preparation; None where it is not set.
+    context_last_chunk: Optional[List[bool]] = None
+    context_return_logits: Optional[List[bool]] = None
+
     # Explicit query/KV sequence boundaries for attention kernels that operate
     # on packed varlen context inputs. These are sequence/segment boundaries,
     # not necessarily request boundaries.

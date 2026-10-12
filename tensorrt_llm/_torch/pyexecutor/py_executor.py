@@ -6218,6 +6218,9 @@ class PyExecutor:
         # Perform sampler-specific validation
         self.sampler.validate_request(request)
 
+        # Perform resource-manager-specific validation
+        self.resource_manager.validate_request(request)
+
         # Check if request has enough budget
         self._validate_request_budget(request)
 

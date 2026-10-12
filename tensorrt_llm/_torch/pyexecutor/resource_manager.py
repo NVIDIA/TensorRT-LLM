@@ -230,6 +230,15 @@ class BaseResourceManager(ABC):
         """
         return False
 
+    def validate_request(self, request: LlmRequest) -> None:
+        """Raise ``ValueError`` for a request this manager's engine cannot serve.
+
+        Called at admission (``PyExecutor._validate_request``), so only the
+        offending request fails rather than the executor step that would run
+        it. The default accepts every request.
+        """
+        return None
+
     def add_dummy_requests(self, request_ids: List[int]):
         pass
 
@@ -3133,6 +3142,12 @@ class ResourceManager:
                     key=f"missing_kv_block_budget:{resource_type.value}",
                 )
         return budgets
+
+    def validate_request(self, request: LlmRequest) -> None:
+        """Let every resource manager refuse the request at admission."""
+        for resource_manager in self.resource_managers.values():
+            if hasattr(resource_manager, "validate_request"):
+                resource_manager.validate_request(request)
 
     def get_unchecked_kv_block_budget_pools(self) -> List[ResourceManagerType]:
         """KV pools present but excluded from the admission check, i.e. those
