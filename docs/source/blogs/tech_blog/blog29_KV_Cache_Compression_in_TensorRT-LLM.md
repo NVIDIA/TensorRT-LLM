@@ -73,7 +73,7 @@ The two tables below summarize the current coverage.
 
 | Memory Tier | NVFP4 Cold-Page Compression | TriAttention |
 | :--- | :--- | :--- |
-| **GPU (active KV)** | Unchanged (FP16 / BF16 / FP8) | Generated tokens evicted periodically; prompt kept |
+| **GPU (active KV)** | Unchanged (FP16 / BF16 / FP8) | Generated tokens evicted periodically |
 | **Host memory** | NVFP4 | Not affected |
 | **Disk** | NVFP4 | Not affected |
 
