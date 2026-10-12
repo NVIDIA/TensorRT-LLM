@@ -51,7 +51,17 @@ class LogicError(Exception):
     """An operation violates the cache or batch's state and usage requirements."""
 
 class OutOfMemoryError(Exception): ...
-class OutOfPagesError(OutOfMemoryError): ...
+
+class HostOOMError(OutOfMemoryError):
+    """The host tier could not be backed by physical memory."""
+
+class DiskOOMError(OutOfMemoryError):
+    """The disk tier's backing file could not be grown."""
+
+class CuOOMError(OutOfMemoryError):
+    """A CUDA allocation failed for want of device memory."""
+
+class OutOfPagesError(Exception): ...
 
 def poison_reason() -> str | None:
     """First recorded invariant violation, or None. Never clears, so it is safe to poll."""
