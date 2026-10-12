@@ -68,6 +68,9 @@ class KVCacheV2LifeCycleIterationStats:
     window_size: int | None
     kind: str
     stats: Any
+    # The share of `stats.iter_reused_blocks` a KV connector loaded from an
+    # external store rather than matching on device.
+    connector_reused_blocks: int = 0
 
 
 @dataclass(slots=True)
@@ -206,5 +209,6 @@ def append_kv_cache_iteration_stats(stats_dict: dict, kv_iter_stats) -> None:
             serialized.update(
                 serialize_kv_cache_iteration_stats(stats.stats, KV_CACHE_ITERATION_STATS_REUSE_KEYS)
             )
+            serialized["iterConnectorReusedBlocks"] = stats.connector_reused_blocks
         stats_by_life_cycle[str(life_cycle_id)] = serialized
     stats_dict["kvCacheIterationStatsByLifecycle"] = stats_by_life_cycle

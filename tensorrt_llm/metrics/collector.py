@@ -279,6 +279,12 @@ class MetricsCollector:
             name=self.metric_prefix + "kv_cache_iter_missed_blocks",
             documentation="Total missed KV cache blocks (context phase)",
             labelnames=self.labels.keys())
+        self.kv_cache_iter_connector_reused_blocks = Counter(
+            name=self.metric_prefix + "kv_cache_iter_connector_reused_blocks",
+            documentation=
+            "Total reused KV cache blocks loaded by a KV cache connector "
+            "from an external store (a subset of the reused blocks)",
+            labelnames=self.labels.keys())
         self.kv_cache_gen_alloc_blocks_total = Counter(
             name=self.metric_prefix + "kv_cache_gen_alloc_blocks_total",
             documentation="Total blocks allocated during generation phase",
@@ -821,6 +827,7 @@ class MetricsCollector:
             total_full_reused = 0
             total_partial_reused = 0
             total_missed = 0
+            total_connector_reused = 0
             total_gen_alloc = 0
             total_onboard_bytes = 0
             total_offload_bytes = 0
@@ -831,6 +838,8 @@ class MetricsCollector:
                 total_full_reused += stats.get("iterFullReusedBlocks", 0)
                 total_partial_reused += stats.get("iterPartialReusedBlocks", 0)
                 total_missed += stats.get("iterMissedBlocks", 0)
+                total_connector_reused += stats.get("iterConnectorReusedBlocks",
+                                                    0)
 
             for stats in pool_group_stats.values():
                 total_secondary_max += stats.get("secondaryMaxNumBlocks", 0)
@@ -863,6 +872,9 @@ class MetricsCollector:
             if total_missed > 0:
                 self._log_counter(self.kv_cache_iter_missed_blocks, {},
                                   total_missed)
+            if total_connector_reused > 0:
+                self._log_counter(self.kv_cache_iter_connector_reused_blocks,
+                                  {}, total_connector_reused)
             if total_gen_alloc > 0:
                 self._log_counter(self.kv_cache_gen_alloc_blocks_total, {},
                                   total_gen_alloc)

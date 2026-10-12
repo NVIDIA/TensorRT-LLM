@@ -410,7 +410,9 @@ class _KVCache:
             self.discard_pending_stats()
             return KVCacheStatsDelta()
         self.manager.commit_stats(
-            self._pending_stats.global_stats, self._pending_stats.iteration_stats_by_life_cycle
+            self._pending_stats.global_stats,
+            self._pending_stats.iteration_stats_by_life_cycle,
+            self._pending_stats.connector_reused_blocks_by_life_cycle,
         )
         self.manager._commit_ssm_snapshot_iteration_stats(
             self._pending_stats.ssm_snapshot_iteration_stats_by_life_cycle
@@ -423,6 +425,18 @@ class _KVCache:
     def discard_pending_stats(self) -> None:
         self._pending_stats.clear()
         self.manager.clear_stats_dirty(self.id)
+
+    def record_connector_reuse(self, block_begin: BlockOrdinal, block_end: BlockOrdinal) -> None:
+        """Count the uncommitted allocations in ``[block_begin, block_end)`` as reused.
+
+        For blocks whose content a KV connector loads from an external store
+        rather than the forward pass computing it. Must be called before the
+        pending stats covering their allocation are committed.
+        """
+        if not self._should_record_stats():
+            return
+        if self._pending_stats.record_connector_reuse(block_begin, block_end):
+            self._refresh_stats_dirty_state()
 
     def _refresh_stats_dirty_state(self) -> None:
         if not self._pending_stats.empty:

@@ -814,6 +814,7 @@ class TestLogIterationStatsKvCacheIteration:
                     "iterFullReusedBlocks": 4,
                     "iterPartialReusedBlocks": 1,
                     "iterMissedBlocks": 3,
+                    "iterConnectorReusedBlocks": 2,
                 },
                 "1": {
                     "kind": "ssm",
@@ -843,6 +844,9 @@ class TestLogIterationStatsKvCacheIteration:
 
         before_reused = _get_counter_value(collector, "kv_cache_iter_reused_blocks")
         before_missed = _get_counter_value(collector, "kv_cache_iter_missed_blocks")
+        before_connector_reused = _get_counter_value(
+            collector, "kv_cache_iter_connector_reused_blocks"
+        )
         before_gen_alloc = _get_counter_value(collector, "kv_cache_gen_alloc_blocks_total")
         before_onboard = _get_counter_value(collector, "kv_cache_onboard_bytes_total")
 
@@ -856,6 +860,9 @@ class TestLogIterationStatsKvCacheIteration:
         assert _get_counter_value(
             collector, "kv_cache_iter_missed_blocks"
         ) - before_missed == pytest.approx(3)
+        assert _get_counter_value(
+            collector, "kv_cache_iter_connector_reused_blocks"
+        ) - before_connector_reused == pytest.approx(2)
         assert _get_counter_value(
             collector, "kv_cache_gen_alloc_blocks_total"
         ) - before_gen_alloc == pytest.approx(2)

@@ -525,6 +525,7 @@ def test_iteration_stats_reports_physical_pool_groups_without_window_metadata() 
     manager.impl = SimpleNamespace(
         cache_tier_list=[object()],
         get_and_reset_iteration_stats=lambda: {},
+        get_and_reset_iteration_connector_reused_blocks=lambda: {},
         get_and_reset_ssm_snapshot_iteration_stats=lambda: {3: snapshot_delta},
     )
     manager._stats_life_cycle_metadata = lambda: {3: (1, None, "ssm")}

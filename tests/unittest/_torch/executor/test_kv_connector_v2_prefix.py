@@ -51,7 +51,11 @@ class FakeKvCache:
         self.resize_ok = resize_ok
         self.is_active = active
         self.resize_calls = []
+        self.connector_reuse_calls = []
         self.trace = trace if trace is not None else []
+
+    def record_connector_reuse(self, block_begin, block_end):
+        self.connector_reuse_calls.append((block_begin, block_end))
 
     def resume(self, cuda_stream):
         self.is_active = True
@@ -418,6 +422,51 @@ class TestWriteRangeAtDelivery:
 
         recorded = connector.commits[0][1]
         assert req.context_current_position - recorded == 64
+
+
+class TestConnectorReuseStats:
+    """Delivered blocks are rebooked from missed to reused.
+
+    Phase 2's ``resize`` books every block it allocates as a miss. Only the
+    blocks the connector fills completely, past the current commit boundary,
+    are reused.
+    """
+
+    def test_the_transferred_full_blocks_are_rebooked(self):
+        connector = FakeConnectorManager(num_matched=96)
+        manager = make_manager(connector)
+        req = FakeRequest()
+        kv_cache = FakeKvCache(committed=32)
+
+        prepare(manager, req, kv_cache)
+        manager._deliver_connector_prefix(req)
+
+        assert kv_cache.connector_reuse_calls == [(1, 4)]
+
+    def test_a_partially_filled_last_block_stays_a_miss(self):
+        connector = FakeConnectorManager(num_matched=PROMPT_LEN)
+        manager = make_manager(connector)
+        req = FakeRequest()
+        kv_cache = FakeKvCache(committed=0)
+
+        prepare(manager, req, kv_cache)
+        manager._deliver_connector_prefix(req)
+
+        assert req.py_connector_prefix_end == PROMPT_LEN - 1
+        assert kv_cache.connector_reuse_calls == [(0, PROMPT_LEN // TOKENS_PER_BLOCK - 1)]
+
+    def test_nothing_is_rebooked_when_nothing_is_transferred(self):
+        connector = FakeConnectorManager(num_matched=64)
+        manager = make_manager(connector)
+        req = FakeRequest()
+        kv_cache = FakeKvCache(committed=0)
+
+        prepare(manager, req, kv_cache)
+        kv_cache.num_committed_tokens = 128
+        prepare(manager, req, kv_cache)
+        manager._deliver_connector_prefix(req)
+
+        assert kv_cache.connector_reuse_calls == []
 
 
 class TestResidency:

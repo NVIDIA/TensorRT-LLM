@@ -26,8 +26,11 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     KVCacheManager,
     KVCacheManagerConfig,
     KVCacheStatsDelta,
+    LifeCycleId,
     SsmSnapshotIterationStatsDelta,
 )
+from tensorrt_llm.runtime.kv_cache_manager_v2._common import BlockOrdinal
+from tensorrt_llm.runtime.kv_cache_manager_v2._core._pending_stats import _PendingStats
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 
@@ -127,6 +130,72 @@ def test_manager_stats_config_and_api(enable_stats: bool) -> None:
             assert request_stats == KVCacheStatsDelta()
             assert committed == KVCacheStatsDelta()
             assert iteration == {}
+        stream.synchronize()
+    finally:
+        if cache is not None:
+            cache.close()
+        manager.shutdown()
+
+
+def test_pending_connector_reuse_survives_a_split_and_a_shrink() -> None:
+    life_cycles = (LifeCycleId(0), LifeCycleId(1))
+    pending = _PendingStats()
+    for life_cycle in life_cycles:
+        assert pending.record_allocation_range(
+            life_cycle, BlockOrdinal(0), BlockOrdinal(4), beam_width=1, count_as_missed=True
+        )
+
+    assert pending.record_connector_reuse(BlockOrdinal(1), BlockOrdinal(3))
+    assert pending.global_stats == KVCacheStatsDelta(
+        alloc_total_blocks=8, alloc_new_blocks=8, reused_blocks=4, missed_blocks=4
+    )
+    assert pending.request_stats == pending.global_stats
+    for life_cycle in life_cycles:
+        iteration = pending.iteration_stats_by_life_cycle[life_cycle]
+        assert iteration.iter_reused_blocks == 2
+        assert iteration.iter_full_reused_blocks == 2
+        assert iteration.iter_missed_blocks == 2
+    assert pending.connector_reused_blocks_by_life_cycle == {life_cycle: 2 for life_cycle in life_cycles}
+    # A block is rebooked at most once.
+    assert not pending.record_connector_reuse(BlockOrdinal(1), BlockOrdinal(3))
+
+    # Shrinking drops each life cycle's tail from whichever category it was in.
+    assert pending.subtract_allocation_range(BlockOrdinal(2), BlockOrdinal(4))
+    assert pending.global_stats == KVCacheStatsDelta(
+        alloc_total_blocks=4, alloc_new_blocks=4, reused_blocks=2, missed_blocks=2
+    )
+    assert pending.connector_reused_blocks_by_life_cycle == {life_cycle: 1 for life_cycle in life_cycles}
+
+    assert pending.subtract_allocation_range(BlockOrdinal(0), BlockOrdinal(2))
+    assert pending.empty
+    assert pending.allocation_segments == []
+
+
+def test_connector_reuse_is_committed_as_reused() -> None:
+    manager = KVCacheManager(_make_config())
+    cache = None
+    try:
+        cache = manager.create_kv_cache(id=17, expected_prompt_length=16)
+        stream = torch.cuda.Stream()
+        assert cache.resume(stream.cuda_stream)
+        assert cache.resize(12)
+        cache.record_connector_reuse(BlockOrdinal(0), BlockOrdinal(2))
+
+        request_stats = cache.commit_pending_stats()
+        assert request_stats == KVCacheStatsDelta(
+            alloc_total_blocks=3, alloc_new_blocks=3, reused_blocks=2, missed_blocks=1
+        )
+        assert manager.get_committed_stats() == request_stats
+        (iteration,) = manager.get_and_reset_iteration_stats().values()
+        assert iteration.iter_reused_blocks == 2
+        assert iteration.iter_full_reused_blocks == 2
+        assert iteration.iter_missed_blocks == 1
+        assert list(manager.get_and_reset_iteration_connector_reused_blocks().values()) == [2]
+        assert manager.get_and_reset_iteration_connector_reused_blocks() == {}
+
+        # Once committed, the allocation is no longer pending and stays a miss.
+        cache.record_connector_reuse(BlockOrdinal(2), BlockOrdinal(3))
+        assert cache.commit_pending_stats() == KVCacheStatsDelta()
         stream.synchronize()
     finally:
         if cache is not None:

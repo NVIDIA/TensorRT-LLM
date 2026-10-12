@@ -28,6 +28,9 @@ class _PendingAllocationSegment:
     beam_width: int
     count_as_missed: bool
     count_as_generation: bool
+    # Allocated for content a KV connector loaded from an external store:
+    # booked as reused rather than missed.
+    count_as_connector_reused: bool = False
 
 
 @dataclass(slots=True)
@@ -36,10 +39,16 @@ class _PendingStatsDelta:
     request_stats: KVCacheStatsDelta
     iteration_stats: KVCacheIterationStatsDelta
     life_cycle: LifeCycleId | None = None
+    connector_reused_blocks: int = 0
 
     @property
     def empty(self) -> bool:
-        return self.global_stats.empty and self.request_stats.empty and self.iteration_stats.empty
+        return (
+            self.global_stats.empty
+            and self.request_stats.empty
+            and self.iteration_stats.empty
+            and self.connector_reused_blocks == 0
+        )
 
 
 @dataclass(slots=True)
@@ -52,6 +61,9 @@ class _PendingStats:
     ssm_snapshot_iteration_stats_by_life_cycle: dict[
         LifeCycleId, SsmSnapshotIterationStatsDelta
     ] = field(default_factory=dict)
+    # The connector-loaded share of the reused blocks in
+    # `iteration_stats_by_life_cycle`.
+    connector_reused_blocks_by_life_cycle: dict[LifeCycleId, int] = field(default_factory=dict)
     allocation_segments: list[_PendingAllocationSegment] = field(default_factory=list)
 
     @property
@@ -61,6 +73,7 @@ class _PendingStats:
             and self.global_stats.empty
             and not self.iteration_stats_by_life_cycle
             and not self.ssm_snapshot_iteration_stats_by_life_cycle
+            and not self.connector_reused_blocks_by_life_cycle
         )
 
     def clear(self) -> None:
@@ -68,7 +81,18 @@ class _PendingStats:
         self.global_stats.clear()
         self.iteration_stats_by_life_cycle.clear()
         self.ssm_snapshot_iteration_stats_by_life_cycle.clear()
+        self.connector_reused_blocks_by_life_cycle.clear()
         self.allocation_segments.clear()
+
+    def _add_connector_reused_blocks(self, life_cycle: LifeCycleId | None, num_blocks: int) -> None:
+        if num_blocks == 0:
+            return
+        assert life_cycle is not None
+        total = self.connector_reused_blocks_by_life_cycle.get(life_cycle, 0) + num_blocks
+        if total == 0:
+            del self.connector_reused_blocks_by_life_cycle[life_cycle]
+        else:
+            self.connector_reused_blocks_by_life_cycle[life_cycle] = total
 
     def add(self, delta: _PendingStatsDelta) -> bool:
         if delta.empty:
@@ -83,6 +107,7 @@ class _PendingStats:
                 delta.life_cycle, KVCacheIterationStatsDelta()
             )
             pending.add(delta.iteration_stats)
+        self._add_connector_reused_blocks(delta.life_cycle, delta.connector_reused_blocks)
         return True
 
     def subtract(self, delta: _PendingStatsDelta) -> bool:
@@ -99,6 +124,7 @@ class _PendingStats:
                 pending.subtract(delta.iteration_stats)
                 if pending.empty:
                     del self.iteration_stats_by_life_cycle[delta.life_cycle]
+        self._add_connector_reused_blocks(delta.life_cycle, -delta.connector_reused_blocks)
         return True
 
     @staticmethod
@@ -108,19 +134,86 @@ class _PendingStats:
         block_end: BlockOrdinal,
     ) -> _PendingStatsDelta:
         num_blocks = max(0, int(block_end) - int(block_begin)) * segment.beam_width
+        missed_blocks = num_blocks if segment.count_as_missed else 0
+        connector_reused_blocks = num_blocks if segment.count_as_connector_reused else 0
         stats = KVCacheStatsDelta(
             alloc_total_blocks=num_blocks,
             alloc_new_blocks=num_blocks,
-            missed_blocks=num_blocks if segment.count_as_missed else 0,
+            reused_blocks=connector_reused_blocks,
+            missed_blocks=missed_blocks,
         )
         request_stats = stats.copy()
         iteration_stats = KVCacheIterationStatsDelta(
             iter_alloc_total_blocks=num_blocks,
             iter_alloc_new_blocks=num_blocks,
-            iter_missed_blocks=num_blocks if segment.count_as_missed else 0,
+            iter_reused_blocks=connector_reused_blocks,
+            iter_full_reused_blocks=connector_reused_blocks,
+            iter_missed_blocks=missed_blocks,
             iter_gen_alloc_blocks=num_blocks if segment.count_as_generation else 0,
         )
-        return _PendingStatsDelta(stats, request_stats, iteration_stats, segment.life_cycle)
+        return _PendingStatsDelta(
+            stats,
+            request_stats,
+            iteration_stats,
+            segment.life_cycle,
+            connector_reused_blocks,
+        )
+
+    @staticmethod
+    def _sub_segment(
+        segment: _PendingAllocationSegment,
+        block_begin: BlockOrdinal,
+        block_end: BlockOrdinal,
+        *,
+        count_as_connector_reused: bool,
+    ) -> _PendingAllocationSegment:
+        return _PendingAllocationSegment(
+            life_cycle=segment.life_cycle,
+            block_begin=block_begin,
+            block_end=block_end,
+            beam_width=segment.beam_width,
+            count_as_missed=segment.count_as_missed and not count_as_connector_reused,
+            count_as_generation=segment.count_as_generation,
+            count_as_connector_reused=count_as_connector_reused,
+        )
+
+    def record_connector_reuse(self, block_begin: BlockOrdinal, block_end: BlockOrdinal) -> bool:
+        """Rebook pending missed allocations in ``[block_begin, block_end)`` as reused.
+
+        The blocks stay counted as allocated: the connector fills freshly
+        allocated pages instead of the forward pass computing them.
+        """
+        if block_begin >= block_end:
+            return False
+        changed = False
+        segments: list[_PendingAllocationSegment] = []
+        for segment in self.allocation_segments:
+            served_begin = max(block_begin, segment.block_begin)
+            served_end = min(block_end, segment.block_end)
+            if served_begin >= served_end or not segment.count_as_missed:
+                segments.append(segment)
+                continue
+            changed = True
+            self.subtract(self._allocation_delta(segment, served_begin, served_end))
+            if segment.block_begin < served_begin:
+                segments.append(
+                    self._sub_segment(
+                        segment, segment.block_begin, served_begin, count_as_connector_reused=False
+                    )
+                )
+            served = self._sub_segment(
+                segment, served_begin, served_end, count_as_connector_reused=True
+            )
+            self.add(self._allocation_delta(served, served_begin, served_end))
+            segments.append(served)
+            if served_end < segment.block_end:
+                segments.append(
+                    self._sub_segment(
+                        segment, served_end, segment.block_end, count_as_connector_reused=False
+                    )
+                )
+        self.allocation_segments = segments
+        return changed
 
     def record_allocation_range(
         self,
@@ -207,11 +300,11 @@ class _PendingStats:
         if block_begin >= block_end or not self.allocation_segments:
             return False
         changed = False
+        # Not ordered by position across life cycles once `record_connector_reuse`
+        # has split segments, so every segment is examined.
         idx = len(self.allocation_segments) - 1
         while idx >= 0:
             segment = self.allocation_segments[idx]
-            if segment.block_end <= block_begin:
-                break
             removed_begin = max(block_begin, segment.block_begin)
             removed_end = min(block_end, segment.block_end)
             if removed_begin >= removed_end:

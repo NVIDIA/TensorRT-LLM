@@ -2496,6 +2496,14 @@ class KVCacheManagerV2(BaseResourceManager):
         self.kv_connector_manager.commit_new_matched_tokens(
             req, recorded, req.py_connector_load_async
         )
+        if recorded > 0 and kv_cache is not None:
+            # Phase 2 booked these blocks as misses; the stats commit for this
+            # batch has not run yet. A block the forward pass still writes part
+            # of stays a miss.
+            tokens_per_block = self.tokens_per_block
+            kv_cache.record_connector_reuse(
+                (committed + tokens_per_block - 1) // tokens_per_block, end // tokens_per_block
+            )
 
     def _release_undelivered_connector_prefix(self, req: LlmRequest) -> None:
         """Hand back an offer for a request that died before it was delivered.
@@ -3173,6 +3181,7 @@ class KVCacheManagerV2(BaseResourceManager):
         primary_peak_stats,
         secondary_peak_stats_by_level,
         reuse_delta,
+        connector_reused_blocks: int = 0,
     ) -> KVCacheV2LifeCycleIterationStats:
         pool_group_id, window_size, kind = life_cycle_metadata[life_cycle_id]
         assert kind == "attention"
@@ -3190,6 +3199,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 reuse_delta,
                 KV_CACHE_ITERATION_STATS_REUSE_FIELDS,
             ),
+            connector_reused_blocks=connector_reused_blocks,
         )
 
     @staticmethod
@@ -3263,6 +3273,7 @@ class KVCacheManagerV2(BaseResourceManager):
         pool_groups_by_window = self._storage_pool_groups_by_window()
         windows_by_pool_group = self._windows_by_pool_group(pool_groups_by_window)
         raw_iteration_stats = self.impl.get_and_reset_iteration_stats()
+        connector_reused_blocks = self.impl.get_and_reset_iteration_connector_reused_blocks()
         raw_ssm_snapshot_iteration_stats = self.impl.get_and_reset_ssm_snapshot_iteration_stats()
         primary_peak_stats = self._get_and_reset_iteration_peak_block_stats(GPU_LEVEL)
         num_cache_levels = len(self.impl.cache_tier_list)
@@ -3326,6 +3337,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 primary_peak_stats,
                 secondary_peak_stats_by_level,
                 reuse_delta,
+                connector_reused_blocks.get(LifeCycleId(life_cycle_id), 0),
             )
             for life_cycle_id, reuse_delta in sorted(reuse_deltas_by_life_cycle.items())
         }

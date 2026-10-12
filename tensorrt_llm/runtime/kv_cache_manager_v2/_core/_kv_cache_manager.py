@@ -212,6 +212,7 @@ class KVCacheManager:
         "_stats_enabled",
         "_committed_stats",
         "_iteration_stats_by_life_cycle",
+        "_iteration_connector_reused_blocks_by_life_cycle",
         "_ssm_snapshot_iteration_stats_by_life_cycle",
         "_iteration_peak_num_blocks_by_cache_level",
         "_dirty_stats_kv_cache_ids",
@@ -242,6 +243,7 @@ class KVCacheManager:
     _stats_enabled: bool
     _committed_stats: KVCacheStatsDelta
     _iteration_stats_by_life_cycle: dict[LifeCycleId, KVCacheIterationStatsDelta]
+    _iteration_connector_reused_blocks_by_life_cycle: dict[LifeCycleId, int]
     _ssm_snapshot_iteration_stats_by_life_cycle: dict[LifeCycleId, SsmSnapshotIterationStatsDelta]
     _iteration_peak_num_blocks_by_cache_level: TypedIndexList[
         CacheLevel, TypedIndexList[PoolGroupIndex, PoolGroupPeakBlockStats]
@@ -286,6 +288,7 @@ class KVCacheManager:
         self._stats_enabled = config.enable_stats
         self._committed_stats = KVCacheStatsDelta()
         self._iteration_stats_by_life_cycle = {}
+        self._iteration_connector_reused_blocks_by_life_cycle = {}
         self._ssm_snapshot_iteration_stats_by_life_cycle = {}
         self._reset_iteration_peak_num_blocks()
         self._dirty_stats_kv_cache_ids = set()
@@ -515,11 +518,18 @@ class KVCacheManager:
         self,
         stats: KVCacheStatsDelta,
         iteration_stats_by_life_cycle: dict[LifeCycleId, KVCacheIterationStatsDelta] | None = None,
+        connector_reused_blocks_by_life_cycle: dict[LifeCycleId, int] | None = None,
     ) -> None:
         if not self._stats_enabled:
             return
         self._update_iteration_peak_num_blocks()
         self._committed_stats.add(stats)
+        if connector_reused_blocks_by_life_cycle is not None:
+            for life_cycle, num_blocks in connector_reused_blocks_by_life_cycle.items():
+                self._iteration_connector_reused_blocks_by_life_cycle[life_cycle] = (
+                    self._iteration_connector_reused_blocks_by_life_cycle.get(life_cycle, 0)
+                    + num_blocks
+                )
         if iteration_stats_by_life_cycle is None:
             return
         for life_cycle, iteration_stats in iteration_stats_by_life_cycle.items():
@@ -540,6 +550,16 @@ class KVCacheManager:
             if not delta.empty
         }
         self._iteration_stats_by_life_cycle.clear()
+        return stats
+
+    def get_and_reset_iteration_connector_reused_blocks(self) -> dict[LifeCycleId, int]:
+        """The share of each life cycle's reused blocks that a KV connector loaded."""
+        stats = {
+            life_cycle: num_blocks
+            for life_cycle, num_blocks in self._iteration_connector_reused_blocks_by_life_cycle.items()
+            if num_blocks != 0
+        }
+        self._iteration_connector_reused_blocks_by_life_cycle.clear()
         return stats
 
     def _commit_ssm_snapshot_iteration_stats(
