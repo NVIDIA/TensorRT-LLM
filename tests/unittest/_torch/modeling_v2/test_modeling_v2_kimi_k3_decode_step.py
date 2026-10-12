@@ -1,18 +1,25 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """How the Kimi K3 target classifies a step for its decode kernels (host-side, no GPU): ``decode_step`` of
-``kimi_k3_mxfp4__sm_100__tp16_moetp4ep4``, and the attention-residual epilogue ceiling it sets."""
+``kimi_k3_mxfp4__sm_100__tp16_moetp4ep4``, the attention-residual epilogue ceiling it sets, and the one path each
+route target's text model runs for a step."""
 
 import types
 
 import pytest
 import torch
 
+from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_mxfp4__sm_100__tp16_moetp4ep4 import (  # noqa: E501
+    modeling as route_a,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_mxfp4__sm_100__tp16_moetp4ep4.modeling import (  # noqa: E501
     DecodeStep,
     _attn_res_max_tokens,
     decode_step,
     latent_push,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_mxfp4__sm_100__tp16_moetp16ep1 import (  # noqa: E501
+    modeling as route_b,
 )
 
 pytestmark = pytest.mark.cpu_only
@@ -74,7 +81,6 @@ def test_other_steps_take_the_generic_path(seq_lens, num_contexts, rows):
 @pytest.mark.parametrize(
     "step,ceiling",
     [
-        (None, None),  # the generic path: KIMI_K3_FUSED_ATTN_RES_MAX_TOKENS
         (DecodeStep(5), 8),  # a short prefill or mixed step
         (DecodeStep(8, 8, 1), 8),  # a decode step of one token tile
         (DecodeStep(6, 1, 6), 8),
@@ -83,8 +89,8 @@ def test_other_steps_take_the_generic_path(seq_lens, num_contexts, rows):
     ],
 )
 def test_attn_res_epilogue_ceiling(step, ceiling):
-    """The fused attn_res kernels take a classified step up to one token tile and a wide decode step up to 32 tokens;
-    any other step keeps the generic path's ceiling."""
+    """The fused attn_res kernels take a classified step up to one token tile and a wide decode step up to 32
+    tokens."""
     assert _attn_res_max_tokens(step) == ceiling
 
 
@@ -114,7 +120,6 @@ def test_attn_res_epilogue_ceiling(step, ceiling):
             False,
         ),  # a KDA layer on the built-in kernels
         (DecodeStep(1, 1, 1), {"mla_decode_branch": False}, False),  # MLA on the built-in path
-        (None, {}, False),
     ],
 )
 def test_latent_push(step, given, pushes):
@@ -130,3 +135,54 @@ def test_latent_push(step, given, pushes):
     )
     flags.update(given)
     assert latent_push(step, **flags) == pushes
+
+
+class _Layer:
+    is_moe = False
+
+    def __init__(self, calls):
+        self.calls = calls
+
+    def __call__(
+        self, hidden_states, block_residual, num_snapshots, attn_metadata, *, step, **kwargs
+    ):
+        self.calls.append(step)
+        return hidden_states, num_snapshots
+
+    def forward_generic(
+        self, hidden_states, block_residual, num_snapshots, attn_metadata, capture=None
+    ):
+        self.calls.append("generic")
+        return hidden_states, num_snapshots
+
+
+@pytest.mark.parametrize("target", [route_a, route_b], ids=["tp16_moetp4ep4", "tp16_moetp16ep1"])
+@pytest.mark.parametrize(
+    "seq_lens,num_contexts,rows,path",
+    [
+        ([1], 0, 1, DecodeStep(1, 1, 1)),
+        ([1] * 8, 0, 8, DecodeStep(8, 8, 1)),
+        ([8], 0, 8, DecodeStep(8, 1, 8)),
+        ([8, 8], 0, 16, DecodeStep(16, 2, 8)),
+        ([5], 1, 5, DecodeStep(5)),
+        ([3, 1], 1, 4, DecodeStep(4)),
+        ([3, 2], 0, 5, DecodeStep(5)),
+        ([1024], 1, 1024, "generic"),
+        ([100, 8], 1, 108, "generic"),
+        ([1] * 9, 0, 9, "generic"),
+        ([1] * 16, 0, 16, "generic"),
+        ([8, 4], 0, 12, "generic"),
+    ],
+)
+def test_each_step_takes_one_path_through_every_layer(target, seq_lens, num_contexts, rows, path):
+    model = object.__new__(target.KimiLinearModel)
+    torch.nn.Module.__init__(model)
+    calls = []
+    model.layers = [_Layer(calls), _Layer(calls), _Layer(calls)]
+    model.embed_tokens = torch.nn.Embedding(4, 8)
+    model.num_attn_res_snapshots = 2
+    model.decode_gemvs = None
+    model._latent_push = lambda attn_metadata, step: False
+    model._final_norm = lambda hidden_states, *args: hidden_states
+    model.forward(_metadata(seq_lens, num_contexts), input_ids=torch.zeros(rows, dtype=torch.long))
+    assert calls == [path] * 3

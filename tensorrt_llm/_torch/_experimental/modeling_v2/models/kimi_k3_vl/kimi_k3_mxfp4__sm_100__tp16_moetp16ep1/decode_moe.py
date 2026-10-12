@@ -366,7 +366,7 @@ class K3DecodeMoeLayer:
         `MAX_TOKENS` tokens, with or without ``partial_tail``."""
         # <<< route B
         rows = hidden_states.shape[0]
-        if hidden_states.dtype != torch.bfloat16 or step is None:
+        if hidden_states.dtype != torch.bfloat16:
             return False
         # >>> route B: no wide step (k3_moe's wide build does not fit 896 local experts)
         return 0 < rows <= MAX_TOKENS

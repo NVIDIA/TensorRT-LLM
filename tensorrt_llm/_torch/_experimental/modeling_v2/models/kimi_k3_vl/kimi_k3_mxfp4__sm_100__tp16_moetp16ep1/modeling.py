@@ -814,12 +814,9 @@ def _apply_attn_res_add_and_rmsnorm(
 _WIDE_ATTN_RES_MAX_TOKENS = 32
 
 
-def _attn_res_max_tokens(step: Optional[DecodeStep]) -> Optional[int]:
+def _attn_res_max_tokens(step: DecodeStep) -> int:
     """The most tokens of ``step`` the fused attn_res kernels take: one token tile (``DECODE_MAX_TOKENS``) on a step
-    ``decode_step`` classifies, ``_WIDE_ATTN_RES_MAX_TOKENS`` on a wide decode step; None on any other step (the
-    generic path's ``KIMI_K3_FUSED_ATTN_RES_MAX_TOKENS``)."""
-    if step is None:
-        return None
+    ``decode_step`` classifies, ``_WIDE_ATTN_RES_MAX_TOKENS`` on a wide decode step."""
     return _WIDE_ATTN_RES_MAX_TOKENS if step.wide else DECODE_MAX_TOKENS
 
 
@@ -1211,7 +1208,7 @@ class KimiK3MoERuntime(nn.Module):
         routed_model_config._frozen = True
         return routed_model_config
 
-    def tail_rp_eligible(self, hidden_states: torch.Tensor, step: Optional[DecodeStep]) -> bool:
+    def tail_rp_eligible(self, hidden_states: torch.Tensor, step: DecodeStep) -> bool:
         """Whether this layer's forward on ``step`` can hand its output on as this rank's unreduced row-parallel
         share (``partial_tail``): the decode path takes the step with that tail."""
         return self.decode_moe is not None and self.decode_moe.takes(hidden_states, step, True)
@@ -1221,7 +1218,8 @@ class KimiK3MoERuntime(nn.Module):
         hidden_states: torch.Tensor,
         all_rank_num_tokens=None,
         partial_tail: bool = False,
-        step: Optional[DecodeStep] = None,
+        *,
+        step: DecodeStep,
     ) -> Union[torch.Tensor, _decode_comm.PendingTail]:
         """``hidden_states``: ``[num_tokens, hidden_size]`` bf16. ``step``: the step's classification
         (``decode_step``); the decode path (``decode_moe.py``) runs the steps it takes. ``partial_tail`` (only where
@@ -1234,6 +1232,11 @@ class KimiK3MoERuntime(nn.Module):
             )
         if partial_tail:
             raise RuntimeError("the row-parallel MoE tail needs the decode path to take the step")
+        return self.forward_generic(hidden_states, all_rank_num_tokens)
+
+    def forward_generic(
+        self, hidden_states: torch.Tensor, all_rank_num_tokens=None
+    ) -> torch.Tensor:
         identity = hidden_states
         router_logits = self.gate.compute_logits(hidden_states)
         moe_all_reduce = self.routed_experts.all_reduce if self._reduce_routed_output else None
@@ -1387,9 +1390,7 @@ class KimiMLARuntime(nn.Module):
             aux_stream_dict=aux_stream_dict,
         )
 
-    def will_run_decode_branch(
-        self, attn_metadata: AttentionMetadata, step: Optional[DecodeStep]
-    ) -> bool:
+    def will_run_decode_branch(self, attn_metadata: AttentionMetadata, step: DecodeStep) -> bool:
         """Whether the mixer runs ``step`` on the decode kernels (``K3DecodeMLA.will_run_decode_branch``)."""
         return self.mixer.will_run_decode_branch(attn_metadata, step)
 
@@ -1397,7 +1398,7 @@ class KimiMLARuntime(nn.Module):
         self,
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
-        step: Optional[DecodeStep] = None,
+        step: DecodeStep,
         reduce_output: bool = True,
         project_output: bool = True,
     ) -> torch.Tensor:
@@ -1407,11 +1408,21 @@ class KimiMLARuntime(nn.Module):
         out = self.mixer(
             None, hidden_states, attn_metadata, step=step, project_output=project_output
         )
-        if project_output and reduce_output and self._o_allreduce is not None:
-            # Head-sharded TP: sum the row-sharded o_proj partials across
-            # the head-shard group.
-            out = self._o_allreduce(out)
-        return out
+        return self._reduce(out) if project_output and reduce_output else out
+
+    def forward_generic(
+        self,
+        hidden_states: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+        reduce_output: bool = True,
+    ) -> torch.Tensor:
+        out = self.mixer.forward_generic(None, hidden_states, attn_metadata)
+        return self._reduce(out) if reduce_output else out
+
+    def _reduce(self, out: torch.Tensor) -> torch.Tensor:
+        # Head-sharded TP: sum the row-sharded o_proj partials across
+        # the head-shard group.
+        return self._o_allreduce(out) if self._o_allreduce is not None else out
 
 
 class KimiLinearDecoderLayer(nn.Module):
@@ -1532,8 +1543,8 @@ class KimiLinearDecoderLayer(nn.Module):
         block_residual: torch.Tensor,
         num_snapshots: int,
         attn_metadata: AttentionMetadata,
+        step: DecodeStep,
         capture: Optional[Tuple[Any, int]] = None,
-        step: Optional[DecodeStep] = None,
         prenormed: bool = False,
         pending_moe_partial: Optional[Union[torch.Tensor, _decode_comm.PendingTail]] = None,
         defer_moe_tail: bool = False,
@@ -1678,7 +1689,6 @@ class KimiLinearDecoderLayer(nn.Module):
         if comm is not None and comm.takes_post_attention(hidden_states, step):
             if (
                 self.sandwich_oproj
-                and step is not None
                 and step.num_tokens <= _decode_comm.SANDWICH_MAX_TOKENS
                 and attention.will_run_decode_branch(attn_metadata, step)
             ):
@@ -1703,7 +1713,7 @@ class KimiLinearDecoderLayer(nn.Module):
                     self.post_attention_layernorm,
                 )
         else:
-            if comm is not None and step is not None and step.wide:
+            if comm is not None and step.wide:
                 partial = attention(hidden_states, attn_metadata, step=step, reduce_output=False)
                 attention_output = _decode_comm.wide_all_reduce(self._o_allreduce(), partial)
             else:
@@ -1742,11 +1752,87 @@ class KimiLinearDecoderLayer(nn.Module):
         prefix_sum = prefix_sum + hidden_states
         return prefix_sum, num_snapshots
 
-    def _dense_mlp(self, hidden_states: torch.Tensor, step: Optional[DecodeStep]) -> torch.Tensor:
+    def forward_generic(
+        self,
+        hidden_states: torch.Tensor,
+        block_residual: torch.Tensor,
+        num_snapshots: int,
+        attn_metadata: AttentionMetadata,
+        capture: Optional[Tuple[Any, int]] = None,
+    ) -> Tuple[torch.Tensor, int]:
+        prefix_sum = hidden_states
+        valid_block_residual = block_residual[:num_snapshots]
+        if capture is not None:
+            if num_snapshots > 0:
+                hidden_states = _apply_attn_res(
+                    prefix_sum,
+                    valid_block_residual,
+                    self.self_attention_res_proj,
+                    self.self_attention_res_norm,
+                )
+            tapped = hidden_states if _AUX_ATTN_RES_STREAM_ENABLED else prefix_sum
+            capture[0].maybe_capture_hidden_states(capture[1], tapped, None)
+            hidden_states = self.input_layernorm(hidden_states)
+        elif num_snapshots > 0:
+            hidden_states = _apply_attn_res_and_rmsnorm(
+                prefix_sum,
+                valid_block_residual,
+                self.self_attention_res_proj,
+                self.self_attention_res_norm,
+                self.input_layernorm,
+            )
+        else:
+            hidden_states = self.input_layernorm(hidden_states)
+
+        if self.layer_idx % self.attn_res_block_size == 0:
+            block_residual[num_snapshots].copy_(prefix_sum)
+            num_snapshots += 1
+            valid_block_residual = block_residual[:num_snapshots]
+            prefix_sum = None
+        attention = self.linear_attn if self.is_kda else self.self_attn
+        comm = self.decode_comm
+        if comm is not None and comm.takes_post_attention(hidden_states, None):
+            partial = attention.forward_generic(hidden_states, attn_metadata, reduce_output=False)
+            hidden_states, prefix_sum = comm.allreduce_attn_res(
+                partial,
+                prefix_sum,
+                valid_block_residual,
+                self.mlp_res_proj,
+                self.mlp_res_norm,
+                self.post_attention_layernorm,
+            )
+        elif prefix_sum is None:
+            prefix_sum = attention.forward_generic(hidden_states, attn_metadata)
+            hidden_states = _apply_attn_res_and_rmsnorm(
+                prefix_sum,
+                valid_block_residual,
+                self.mlp_res_proj,
+                self.mlp_res_norm,
+                self.post_attention_layernorm,
+            )
+        else:
+            prefix_sum, hidden_states = _apply_attn_res_add_and_rmsnorm(
+                prefix_sum,
+                attention.forward_generic(hidden_states, attn_metadata),
+                valid_block_residual,
+                self.mlp_res_proj,
+                self.mlp_res_norm,
+                self.post_attention_layernorm,
+            )
+        if self.is_moe:
+            all_rank_num_tokens = getattr(attn_metadata, "all_rank_num_tokens", None)
+            hidden_states = self.block_sparse_moe.forward_generic(
+                hidden_states, all_rank_num_tokens
+            )
+        else:
+            hidden_states = self.mlp(hidden_states)
+        return prefix_sum + hidden_states, num_snapshots
+
+    def _dense_mlp(self, hidden_states: torch.Tensor, step: DecodeStep) -> torch.Tensor:
         """The dense MLP: on a step of at most DECODE_MAX_TOKENS tokens, its GEMVs and activation on the decode
         kernels (``K3DecodeGemvs.dense_mlp``), then the down projection's all-reduce; else the module."""
         gemvs = self.decode_gemvs
-        if gemvs is not None and step is not None and step.small:
+        if gemvs is not None and step.small:
             out = gemvs.dense_mlp(
                 hidden_states,
                 self.mlp.gate_up_proj.weight,
@@ -1873,7 +1959,7 @@ class KimiLinearModel(DecoderModel):
         num_snapshots: int,
         spec_metadata,
         capture_set,
-        step: Optional[DecodeStep],
+        step: DecodeStep,
     ) -> bool:
         """Whether layer ``i`` hands its MoE output on unreduced (the row-parallel tail, ``decode_moe.py``): its MoE
         takes the step with that tail, and its consumer, the next layer's pre-attention step or the final norm after
@@ -1903,13 +1989,14 @@ class KimiLinearModel(DecoderModel):
 
         num_tokens = (input_ids if inputs_embeds is None else inputs_embeds).shape[0]
         step = decode_step(attn_metadata, num_tokens)
-        if step is not None and self._latent_push(attn_metadata, step):
+        if step is None:
+            return self._generic_forward(attn_metadata, input_ids, inputs_embeds, spec_metadata)
+        if self._latent_push(attn_metadata, step):
             step = replace(step, latent_push=True)
         # A decode step embeds and norms for layer 0 in one launch, the embedding written as layer 0's first snapshot.
         prenormed = None
         if (
             inputs_embeds is None
-            and step is not None
             and self.decode_gemvs is not None
             and len(self.layers) > 0
             and self.num_attn_res_snapshots > 0
@@ -1931,32 +2018,11 @@ class KimiLinearModel(DecoderModel):
                 hidden_states.shape[1],
             )
         num_snapshots = 0
-        capture_set = (
-            getattr(spec_metadata, "_capture_layer_set", None)
-            if spec_metadata is not None
-            else None
-        )
+        capture_set = getattr(spec_metadata, "_capture_layer_set", None)
         # A MoE layer's output handed on unreduced, which the next layer's pre-attention step (or the final norm)
         # reduces: a decode_comm.PendingTail, or a wide decode step's tensor.
         pending_moe_partial = None
         for i, layer in enumerate(self.layers):
-            # DFlash/DSpark hidden-state capture. The drafter is distilled on
-            # the aggregated stream value -- the pre-norm softmax mixture its
-            # next consumer sees -- not on the raw prefix sum a layer returns,
-            # which is SGLang's fallback for models without the
-            # attention-residual scheme. Capturing the prefix sum costs 4.5pt
-            # of draft acceptance on K3 + RadixArk DSpark (AR 66.9% -> 71.4%).
-            # The tap fires inside layer i+1, which computes that tensor
-            # anyway; see its forward docstring. Ground truth: SGLang
-            # kimi_k3.py:2697 _dspark_capture_stream, attn_residual.py:313
-            # aggregate_stream_torch.
-            capture = None
-            if (
-                spec_metadata is not None
-                and i > 0
-                and (capture_set is None or self.layers[i - 1].layer_idx in capture_set)
-            ):
-                capture = (spec_metadata, self.layers[i - 1].layer_idx)
             defer_moe_tail = self._defer_moe_tail(
                 i, hidden_states, num_snapshots, spec_metadata, capture_set, step
             )
@@ -1965,8 +2031,8 @@ class KimiLinearModel(DecoderModel):
                 block_residual,
                 num_snapshots,
                 attn_metadata,
-                capture=capture,
                 step=step,
+                capture=self._capture(spec_metadata, capture_set, i),
                 prenormed=i == 0 and prenormed is not None,
                 pending_moe_partial=pending_moe_partial,
                 defer_moe_tail=defer_moe_tail,
@@ -1997,7 +2063,70 @@ class KimiLinearModel(DecoderModel):
                 _attn_res_max_tokens(step),
             )
             return normed
+        return self._final_norm(
+            hidden_states,
+            block_residual,
+            num_snapshots,
+            spec_metadata,
+            capture_set,
+            _attn_res_max_tokens(step),
+        )
 
+    def _generic_forward(
+        self,
+        attn_metadata: AttentionMetadata,
+        input_ids: Optional[torch.IntTensor],
+        inputs_embeds: Optional[torch.FloatTensor],
+        spec_metadata,
+    ) -> torch.Tensor:
+        hidden_states = self.embed_tokens(input_ids) if inputs_embeds is None else inputs_embeds
+        block_residual = hidden_states.new_empty(
+            self.num_attn_res_snapshots,
+            hidden_states.shape[0],
+            hidden_states.shape[1],
+        )
+        num_snapshots = 0
+        capture_set = getattr(spec_metadata, "_capture_layer_set", None)
+        for i, layer in enumerate(self.layers):
+            hidden_states, num_snapshots = layer.forward_generic(
+                hidden_states,
+                block_residual,
+                num_snapshots,
+                attn_metadata,
+                capture=self._capture(spec_metadata, capture_set, i),
+            )
+        return self._final_norm(
+            hidden_states, block_residual, num_snapshots, spec_metadata, capture_set
+        )
+
+    def _capture(self, spec_metadata, capture_set, i: int) -> Optional[Tuple[Any, int]]:
+        # DFlash/DSpark hidden-state capture. The drafter is distilled on
+        # the aggregated stream value -- the pre-norm softmax mixture its
+        # next consumer sees -- not on the raw prefix sum a layer returns,
+        # which is SGLang's fallback for models without the
+        # attention-residual scheme. Capturing the prefix sum costs 4.5pt
+        # of draft acceptance on K3 + RadixArk DSpark (AR 66.9% -> 71.4%).
+        # The tap fires inside layer i+1, which computes that tensor
+        # anyway; see its forward docstring. Ground truth: SGLang
+        # kimi_k3.py:2697 _dspark_capture_stream, attn_residual.py:313
+        # aggregate_stream_torch.
+        if (
+            spec_metadata is not None
+            and i > 0
+            and (capture_set is None or self.layers[i - 1].layer_idx in capture_set)
+        ):
+            return (spec_metadata, self.layers[i - 1].layer_idx)
+        return None
+
+    def _final_norm(
+        self,
+        hidden_states: torch.Tensor,
+        block_residual: torch.Tensor,
+        num_snapshots: int,
+        spec_metadata,
+        capture_set,
+        max_fused_tokens: Optional[int] = None,
+    ) -> torch.Tensor:
         # The last layer has no successor, so this one recompute is
         # unavoidable -- output-side score weights, matching SGLang's
         # layer_idx + 1 >= end_layer branch. Unreachable for K3's capture set
@@ -2024,7 +2153,7 @@ class KimiLinearModel(DecoderModel):
             self.output_attn_res_proj,
             self.output_attn_res_norm,
             self.norm,
-            _attn_res_max_tokens(step),
+            max_fused_tokens,
         )
 
 
@@ -2086,32 +2215,26 @@ class K3DecodeKDA(KimiKDALinearAttention):
         self.k3_proj_weight = fused
         self._qkvg_proj_weight, self._bfa_proj_weight = fused[:rows], fused[rows:]
 
-    def will_run_decode_branch(
-        self, attn_metadata: AttentionMetadata, step: Optional[DecodeStep]
-    ) -> bool:
-        """Whether ``forward`` runs ``step`` on the decode branch: a step ``decode_step`` classifies, outside a
-        breakable CUDA graph."""
-        return step is not None and not is_in_breakable_cuda_graph()
+    def will_run_decode_branch(self, attn_metadata: AttentionMetadata, step: DecodeStep) -> bool:
+        """Whether ``forward`` runs ``step`` on the decode branch: outside a breakable CUDA graph."""
+        return not is_in_breakable_cuda_graph()
 
     def forward(
         self,
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
-        step: Optional[DecodeStep] = None,
+        step: DecodeStep,
         reduce_output: bool = True,
         project_output: bool = True,
     ) -> torch.Tensor:
-        """The built-in forward where ``will_run_decode_branch`` does not hold. On the decode branch: the plain decode
+        """``forward_generic`` where ``will_run_decode_branch`` does not hold. On the decode branch: the plain decode
         on ``ssm/k3_kda_decode_attn`` on a decode step of one token per request, else the built-in dispatch; then
         ``o_proj`` on its decode GEMV site and the TP all-reduce.
 
-        On every path, ``reduce_output=False`` returns ``o_proj``'s TP partial (no all-reduce), and
+        ``reduce_output=False`` returns ``o_proj``'s TP partial (no all-reduce), and, on the decode branch only,
         ``project_output=False`` the post-o_norm core ``[N, H * 128]`` (no ``o_proj``)."""
         if not self.will_run_decode_branch(attn_metadata, step):
-            if reduce_output and project_output:
-                return super().forward(hidden_states, attn_metadata)
-            core = self._builtin_core(hidden_states, attn_metadata).reshape(-1, self.proj_size)
-            return self.o_proj(core) if project_output else core
+            return self.forward_generic(hidden_states, attn_metadata, reduce_output)
         if (
             step.decode
             and step.tokens_per_request == 1
@@ -2124,6 +2247,18 @@ class K3DecodeKDA(KimiKDALinearAttention):
         if not project_output:
             return core.reshape(-1, self.proj_size)
         return self._k3_project_output(core, reduce_output)
+
+    def forward_generic(
+        self,
+        hidden_states: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+        reduce_output: bool = True,
+    ) -> torch.Tensor:
+        if reduce_output:
+            return super().forward(hidden_states, attn_metadata)
+        return self.o_proj(
+            self._builtin_core(hidden_states, attn_metadata).reshape(-1, self.proj_size)
+        )
 
     def _builtin_core(
         self, hidden_states: torch.Tensor, attn_metadata: AttentionMetadata
@@ -2265,22 +2400,17 @@ class K3DecodeMLA(KimiK3MLAAttention):
         )
         return [why for ok, why in checks if not ok]
 
-    def will_run_decode_branch(
-        self, attn_metadata: AttentionMetadata, step: Optional[DecodeStep]
-    ) -> bool:
+    def will_run_decode_branch(self, attn_metadata: AttentionMetadata, step: DecodeStep) -> bool:
         """Whether ``forward`` runs ``step`` on the decode kernels (see ``_k3_step_view``). Only there does it return
         the gated attention output before ``o_proj``; the KV writes forbid running the attention twice, so a caller
         that needs it asks first."""
         return self._k3_step_view(attn_metadata, step) is not None
 
-    def _k3_step_view(
-        self, attn_metadata: AttentionMetadata, step: Optional[DecodeStep]
-    ) -> Optional[dict]:
+    def _k3_step_view(self, attn_metadata: AttentionMetadata, step: DecodeStep) -> Optional[dict]:
         """The paged-cache view the decode kernels read on ``step``: a decode step, this layer's ``[W_a; W_g]`` and
         workspace built, outside a breakable CUDA graph, and a cache ``k3_mla_decode_view`` takes. Else None."""
         if not (
-            step is not None
-            and step.decode
+            step.decode
             and self.k3_ag_weight is not None
             and self.k3_workspace is not None
             and not is_in_breakable_cuda_graph()
@@ -2293,21 +2423,17 @@ class K3DecodeMLA(KimiK3MLAAttention):
         position_ids: Optional[torch.Tensor],
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
-        all_reduce_params=None,
-        latent_cache_gen: Optional[torch.Tensor] = None,
-        step: Optional[DecodeStep] = None,
+        step: DecodeStep,
         project_output: bool = True,
     ) -> torch.Tensor:
-        """The built-in forward, except on a decode step whose cache the decode kernels read
+        """``forward_generic``, except on a decode step whose cache the decode kernels read
         (``will_run_decode_branch``). There only, ``project_output=False`` returns the gated attention output
         ``[M, H * 128]``, the input of ``o_proj``."""
-        view = None if latent_cache_gen is not None else self._k3_step_view(attn_metadata, step)
+        view = self._k3_step_view(attn_metadata, step)
         if view is None:
             if not project_output:
                 raise ValueError("project_output=False needs a step will_run_decode_branch takes")
-            return super().forward(
-                position_ids, hidden_states, attn_metadata, all_reduce_params, latent_cache_gen
-            )
+            return self.forward_generic(position_ids, hidden_states, attn_metadata)
         x = hidden_states[: step.num_tokens].contiguous()
         rows = self.kv_a_proj_with_mqa.weight.shape[0]
         gemvs = self.decode_gemvs
@@ -2348,10 +2474,16 @@ class K3DecodeMLA(KimiK3MLAAttention):
             return attn_output
         out = None if gemvs is None else gemvs.project("o_proj", attn_output, self.o_proj.weight)
         if out is None:
-            out = self._project_output(
-                [attn_output], position_ids, attn_metadata, all_reduce_params
-            )
+            out = self._project_output([attn_output], position_ids, attn_metadata, None)
         return out
+
+    def forward_generic(
+        self,
+        position_ids: Optional[torch.Tensor],
+        hidden_states: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+    ) -> torch.Tensor:
+        return super().forward(position_ids, hidden_states, attn_metadata)
 
     def _k3_decode_view(self, attn_metadata: AttentionMetadata, num_tokens: int) -> Optional[dict]:
         """The paged latent cache as the decode kernels read it this step, or None when they do not read it (the
@@ -2975,7 +3107,7 @@ class DecodeStep:
 
 
 def latent_push(
-    step: Optional[DecodeStep],
+    step: DecodeStep,
     *,
     capturing: bool,
     breakable: bool,
@@ -2991,7 +3123,7 @@ def latent_push(
     Every other step keeps the routed experts' all-reduce: the exchange's call-order invariant needs every kernel
     between a reduce and the next push to wait for its predecessor, which only those kernels were checked for, and a
     graph launch orders every pushing replay behind whatever ran before it."""
-    if step is None or not (step.decode and step.small) or not capturing or breakable:
+    if not (step.decode and step.small) or not capturing or breakable:
         return False
     if not (kda_token_states or (step.tokens_per_request == 1 and kda_decode_kernels)):
         return False

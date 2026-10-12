@@ -107,11 +107,9 @@ class _Attention(nn.Module):
         self.calls = []
 
     def will_run_decode_branch(self, attn_metadata, step) -> bool:
-        return step is not None and (step.decode or not self.decode_only)
+        return step.decode or not self.decode_only
 
-    def forward(
-        self, hidden_states, attn_metadata, step=None, reduce_output=True, project_output=True
-    ):
+    def forward(self, hidden_states, attn_metadata, step, reduce_output=True, project_output=True):
         self.calls.append((reduce_output, project_output))
         self.last_input = hidden_states.clone()
         core = self.core
@@ -120,6 +118,14 @@ class _Attention(nn.Module):
             if not self.will_run_decode_branch(attn_metadata, step):
                 raise ValueError("project_output=False off the decode branch")
             return core
+        out = self.o_proj(core)
+        return self._o_allreduce(out) if reduce_output else out
+
+    def forward_generic(self, hidden_states, attn_metadata, reduce_output=True):
+        self.calls.append((reduce_output, True))
+        self.last_input = hidden_states.clone()
+        core = self.core
+        assert core.shape[0] == hidden_states.shape[0], (core.shape, hidden_states.shape)
         out = self.o_proj(core)
         return self._o_allreduce(out) if reduce_output else out
 
@@ -148,10 +154,11 @@ class _MLARuntime(nn.Module):
     def will_run_decode_branch(self, attn_metadata, step) -> bool:
         return self.mixer.will_run_decode_branch(attn_metadata, step)
 
-    def forward(
-        self, hidden_states, attn_metadata, step=None, reduce_output=True, project_output=True
-    ):
+    def forward(self, hidden_states, attn_metadata, step, reduce_output=True, project_output=True):
         return self.mixer(hidden_states, attn_metadata, step, reduce_output, project_output)
+
+    def forward_generic(self, hidden_states, attn_metadata, reduce_output=True):
+        return self.mixer.forward_generic(hidden_states, attn_metadata, reduce_output)
 
 
 class _Moe(nn.Module):
@@ -170,13 +177,17 @@ class _Moe(nn.Module):
         self.last_input = None
 
     def tail_rp_eligible(self, hidden_states, step) -> bool:
-        return self.pending is not None and step is not None and hidden_states.shape[0] <= 8
+        return self.pending is not None and hidden_states.shape[0] <= 8
 
-    def forward(self, hidden_states, all_rank_num_tokens=None, partial_tail=False, step=None):
+    def forward(self, hidden_states, all_rank_num_tokens=None, partial_tail=False, *, step):
+        if partial_tail:
+            self.last_input = hidden_states.clone()
+            return self.pending
+        return self.forward_generic(hidden_states, all_rank_num_tokens)
+
+    def forward_generic(self, hidden_states, all_rank_num_tokens=None):
         self.last_input = hidden_states.clone()
         p = self.pending
-        if partial_tail:
-            return p
         if p is None:
             return torch.zeros_like(hidden_states)
         lat, w = p.latent.float(), p.weight.float()
@@ -205,7 +216,7 @@ class _Recorder:
     def __init__(self):
         self.normed = None
 
-    def __call__(self, hidden_states, step):
+    def __call__(self, hidden_states, step=None):
         self.normed = hidden_states.clone()
         return torch.zeros_like(hidden_states)
 
@@ -251,6 +262,7 @@ def build_layers():
             if not layer.is_moe:
                 layer.recorder = _Recorder()
                 layer._dense_mlp = layer.recorder
+                layer.mlp.forward = layer.recorder
             g = _gen(1000 + idx)  # replicated
             with torch.no_grad():
                 for norm in (
@@ -295,6 +307,12 @@ class Case:
         self.core = ls.exact_bf16(gr, (tokens, K_IN), -4, 5, 1 / 8)
 
 
+def _layer_step(layer, x, bank, snapshots, step):
+    if step is None:
+        return layer.forward_generic(x, bank, snapshots, SimpleNamespace())
+    return layer(x, bank, snapshots, SimpleNamespace(), step=step)
+
+
 def run(layer, case, step, comm, sandwich=True):
     """``(updated, normed, calls)`` of one layer call on clones of the case's tensors."""
     attention = _attention(layer)
@@ -303,7 +321,7 @@ def run(layer, case, step, comm, sandwich=True):
     layer.decode_comm = comm
     layer.sandwich_oproj = sandwich
     bank = case.bank.clone()
-    updated, _ = layer(case.x.clone(), bank, case.snapshots, SimpleNamespace(), step=step)
+    updated, _ = _layer_step(layer, case.x.clone(), bank, case.snapshots, step)
     torch.cuda.synchronize()
     return updated.clone(), layer.recorder.normed, list(attention.calls)
 
@@ -426,7 +444,7 @@ def _chain(cases, step):
         _attention(layer).core = case.core_buf
         layer.decode_comm = COMM
         layer.sandwich_oproj = True
-        x, _ = layer(x, case.bank_buf, case.snapshots, SimpleNamespace(), step=step)
+        x, _ = _layer_step(layer, x, case.bank_buf, case.snapshots, step)
         outs.append((x, layer.recorder.normed))
     return outs
 

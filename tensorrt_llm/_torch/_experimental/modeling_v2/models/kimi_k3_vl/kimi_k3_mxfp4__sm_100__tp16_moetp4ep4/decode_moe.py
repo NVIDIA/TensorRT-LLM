@@ -303,7 +303,7 @@ class K3DecodeMoeLayer:
         """Whether this decode path runs the layer on ``step`` (bf16 rows ``hidden_states``): any step of at most
         `MAX_TOKENS` tokens; with ``partial_tail``, also a wide decode step."""
         rows = hidden_states.shape[0]
-        if hidden_states.dtype != torch.bfloat16 or step is None:
+        if hidden_states.dtype != torch.bfloat16:
             return False
         return 0 < rows <= MAX_TOKENS or (partial_tail and step.wide and rows <= WIDE_MAX_TOKENS)
 

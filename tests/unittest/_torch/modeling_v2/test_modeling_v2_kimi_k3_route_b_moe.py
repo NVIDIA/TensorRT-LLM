@@ -76,7 +76,7 @@ def test_other_situ_caps_keep_the_generic_path():
 
 def test_the_path_takes_at_most_8_tokens():
     """Steps of 1..8 tokens, with or without the deferred tail; no wide step (k3_moe's wide build does not fit 896
-    local experts), so 9 tokens and more stay on the generic path, as does a step decode_step did not classify."""
+    local experts), so 9 tokens and more stay on the generic path."""
     takes = route_b_moe.K3DecodeMoeLayer.takes
     step = types.SimpleNamespace(wide=True)
 
@@ -88,7 +88,6 @@ def test_the_path_takes_at_most_8_tokens():
             assert takes(None, rows(n), step, partial_tail)
         for n in (9, 16, 64):
             assert not takes(None, rows(n), step, partial_tail)
-    assert not takes(None, rows(4), None, False)
 
 
 def test_a_pushing_step_runs_the_engines_push_form(monkeypatch):
