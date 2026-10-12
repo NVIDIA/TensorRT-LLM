@@ -289,3 +289,12 @@ with AgentTeamWorkflow(workspace=Path("workspace/run"),
                        prompts=MODELING_BRINGUP_PROMPTS) as workflow:
     workflow.run("...")
 ```
+
+To keep a record of what each agent was told, call
+`agent_flow.dump_prompt_bundle(workflow.prompts, directory)` inside the `with`
+block, before `run`: it writes each role's composed system prompt verbatim to
+`directory/<role>.md`. Pass `workflow.prompts` rather than the bundle you
+handed in, since that is what the agents are built from (`AgentTeamWorkflow`
+appends its MCP-tool protocol to the bundle it is given). The `perf-analyze`
+and `perf-optimize` CLIs use it to snapshot `<workspace>/prompts/` at every
+launch.

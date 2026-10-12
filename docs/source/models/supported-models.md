@@ -13,14 +13,18 @@ The following is a table of supported models for the PyTorch backend:
 | `DeepseekV3ForCausalLM`              | DeepSeek-V3, Kimi-K2               | `deepseek-ai/DeepSeek-V3`                    |
 | `DeepseekV32ForCausalLM`             | DeepSeek-V3.2                      | `deepseek-ai/DeepSeek-V3.2`                  |
 | `DeepseekV4ForCausalLM` [^11]        | DeepSeek-V4                        | `deepseek-ai/DeepSeek-V4-Pro`                |
+| `DeepseekV41ForCausalLM`            | DeepSeek-V4.1 (text decoder)       | —                                          |
+| `DeepseekV41ForConditionalGeneration` | DeepSeek-V4.1                    | —                                          |
 | `Exaone4ForCausalLM`                 | EXAONE 4.0                         | `LGAI-EXAONE/EXAONE-4.0-32B`                 |
-| `ExaoneMoEForCausalLM`               | K-EXAONE                           | `LGAI-EXAONE/K-EXAONE-236B-A23B`             |
+| `ExaoneMoeForCausalLM`               | K-EXAONE                           | `LGAI-EXAONE/K-EXAONE-236B-A23B`             |
+| `ExaoneMoeForCausalLM`               | K-EXAONE 2.0                       | `LGAI-EXAONE/K-EXAONE-2.0-750B-A37B`         |
 | `Gemma3ForCausalLM`                  | Gemma 3                            | `google/gemma-3-1b-it`                       |
 | `Gemma4ForConditionalGeneration`     | Gemma 4                            | `google/gemma-4-E2B-it`, `google/gemma-4-E4B-it`, `google/gemma-4-26B-A4B-it`, `google/gemma-4-31B-it` |
 | `Gemma4UnifiedForConditionalGeneration` | Gemma 4 12B Unified (encoder-free) | `google/gemma-4-12B`, `google/gemma-4-12B-it`              |
 | `Gemma4AssistantForCausalLM`         | Gemma 4 MTP assistant              | `google/gemma-4-E2B-it-assistant`, `google/gemma-4-E4B-it-assistant`, `google/gemma-4-26B-A4B-it-assistant`, `google/gemma-4-31B-it-assistant` |
 | `Glm4MoeForCausalLM`                 | GLM-4.5, GLM-4.6, GLM-4.7          | `THUDM/GLM-4-100B-A10B`                      |
 | `GlmMoeDsaForCausalLM`               | GLM-5, GLM-5.2, GLM-5.3            | `zai-org/GLM-5`, `zai-org/GLM-5.2`, `zai-org/GLM-5.3` |
+| `Glm5NextForConditionalGeneration` [^20] | GLM-5.3-Flash                 | `zai-org/GLM-5.3-Flash`                     |
 | `GptOssForCausalLM`                  | GPT-OSS                            | `openai/gpt-oss-20b`, `openai/gpt-oss-120b`  |
 | `KimiK25ForConditionalGeneration`    | Kimi-K2.5                          | `moonshotai/Kimi-K2.5`                       |
 | `KimiK3ForConditionalGeneration` [^15]| Kimi-K3                            | `moonshotai/Kimi-K3`                         |
@@ -95,6 +99,7 @@ statuses for the same architecture in the two matrices.
 [^17]: Kimi K3 has no MTP or EAGLE-3 head, and its DSpark checkpoints are not compatible with plain `DFlash`.
 [^18]: NGram and standalone Suffix Automaton (SA) use model-free drafting on the PyTorch backend, so they are not listed in individual entries. This does not imply universal end-to-end support: compatibility depends on each model's multi-token verification and cache-management paths and may be untested or explicitly restricted.
 [^19]: KV cache reuse for hybrid recurrent-attention models requires an explicit recurrent-state snapshot policy, such as `kv_cache_config.mamba_state_config.periodic_snapshot_interval`; the model default disables reuse when no snapshot policy is configured.
+[^20]: Supports text, image, and video inputs, MTP (including with attention data parallelism), and FP8 KV cache. Image and video inputs require `transformers==5.17.0`. Beam search is not supported. See the [GLM-5.3-Flash deployment guide](../deployment-guide/deployment-guide-for-glm-5.3-flash-on-trtllm.md) for setup and feature-specific requirements.
 
 # Encoder-Decoder Feature Support Matrix (PyTorch Backend)
 
@@ -172,16 +177,24 @@ The following optimizations are available to models that implement
   exclusive with `multimodal_config.encoder_cuda_graph` and can increase peak GPU memory use. It
   can be combined with the multimodal embeddings cache so side-stream cache hits skip encoder work
   and misses populate the cache.
-- **Multimodal embeddings cache** is a per-model, cross-request LRU cache of encoder embeddings.
-  Set `multimodal_config.encoder_cache_max_bytes` to its capacity (for example, `"512MiB"`), or
-  `0` to disable it. Entries are cached per multimodal item, but a request reuses cached embeddings
-  only when all of its items hit the cache. At present, only single-modality requests are cacheable;
-  mixed-modality requests bypass the cache. For models with item-level encoder scheduling, the
-  cache also composes with the item path: cached items skip encoder execution after selection but
-  still count against the per-iteration item and token budgets, partially cached requests re-compute
-  only the missing items, and items encoded through the item path populate the cache for later
-  requests. When combined with side-stream prefetch, peak memory is the cache capacity plus any
-  in-flight prefetched encoder inputs and outputs.
+- **Multimodal embeddings cache** is a per-model, cross-request LRU cache of encoder embeddings,
+  stored per multimodal item. Set `multimodal_config.encoder_cache_max_bytes` to its capacity (for
+  example, `"512MiB"`), or `0` to disable cross-request reuse. The capacity applies per rank; ranks
+  do not share a cache.
+  - On the inline encoder path, a request whose items all hit the cache skips the encoder, and a
+    partially cached request encodes only its missing items. Inline caching supports only
+    single-modality requests. When combined with side-stream prefetch, peak memory is the cache
+    capacity plus any in-flight prefetched encoder inputs and outputs.
+  - Models with item-level encoder scheduling use the item path unless
+    `multimodal_config.encoder_scheduling_policy` is `DISABLED`. Cached items are reused before
+    encoder work is selected, so they use none of the per-iteration encoder item or token budget.
+    Only missing items are encoded, mixed-modality requests are cached per item, and newly encoded
+    items populate the cache for later requests. The item path also keeps encoder outputs in this
+    cache until the request's prefill completes, so the cache is never smaller than the output of
+    one encoder iteration, even when `encoder_cache_max_bytes` is `0`. Item scheduling does not
+    support side-stream prefetch or pipeline parallelism yet. With `pipeline_parallel_size > 1`,
+    the `DEFAULT` policy, explicit or unset, logs a warning and falls back to the inline path, and
+    the `EAGER` policy raises an error.
 
 # Visual Generation Models
 
@@ -222,8 +235,8 @@ For full documentation, see the [Visual Generation](./visual-generation.md) page
 | **Wan 2.1** | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
 | **Wan 2.2** | Yes | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
 | **LTX-2** | Yes | Yes | No | Yes | Yes | No | No | Yes | Yes | Yes | Yes | No |
-| **MiniMax-H3** | Yes | Yes | No | No | No | No | No | Yes | Yes | No | No | No |
+| **MiniMax-H3** | Yes | Yes | No | No | Yes | Yes | No | Yes | Yes | No | No | No |
 | **Qwen-Image** | Yes | Yes | Yes | Yes | Yes | No | Yes | Yes | Yes | Yes | Yes | No |
-| **Qwen-Image-Layered** | No | No | No | No | No | No | Yes | Yes | Yes | No | No | No |
+| **Qwen-Image-Layered** | Yes | No | No | No | No | No | Yes | Yes | Yes | No | No | No |
 | **Qwen-Image-Edit-2511** | Yes | Yes | No | Yes | No | No | Yes | Yes | Yes | No | No | No |
 | **Cosmos3** | Yes | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | No | No | Yes |

@@ -118,7 +118,8 @@ comprehensive early-validation layer for every incompatible feature.
 ```text
 [EPLB start_wait_gpu] → routing → [EPLB done_wait_gpu + update_statistic + route]
   → [comm.prepare_dispatch (NVLink2-sided)] → quantize/dispatch (adaptive order)
-  → backend.run_moe → [EPLB start_set_cpu] → comm.combine → [EPLB done_set_cpu]
+  → backend.run_moe → [EPLB start_set_cpu] → [unfinalized_combine_fn]
+  → comm.combine → [EPLB done_set_cpu]
 
 Adaptive quantize/dispatch order (gated by comm.supports_post_quant_dispatch()):
   Post-quant flow: quantize_input() → comm.dispatch()   (send quantized data)
@@ -126,6 +127,8 @@ Adaptive quantize/dispatch order (gated by comm.supports_post_quant_dispatch()):
 ```
 
 EPLB hooks fire only at the first/last chunk of the first/last `repeat_idx`. Multi-stream chunk overlap is enabled when `not enable_alltoall and aux_stream is not None`.
+
+`unfinalized_combine_fn` is a constructor argument (`create_moe(..., unfinalized_combine_fn=...)`) for a model that needs a per-`(token, expert)` transform applied to each expert output *before* the top-k sum. Once registered it runs on **every** `do_finalize=False` forward, with or without a comm strategy, so the forward's return type (dense tensor vs. unfinalized triple) depends only on static config. Under a comm strategy the scheduler runs it on the dispatched rows and the combine reduces already-finalized partials — equal to finalizing after the combine, because each term depends on one row alone and non-local slots contribute exact zeros. That reordering is only sound for a combine that is an unweighted row sum over a dense per-token tensor; `DeepEPLowLatency.combine` is not one (it consumes expert-major rows and applies the routing weights itself), which is what `Communication.supports_finalize_before_combine()` declares. `ConfigurableMoE.validate_backend` rejects at construction: a backend without `supports_unfinalized_output()`, a comm without `supports_finalize_before_combine()`, and `apply_router_weight_on_input`. With no hook registered, `do_finalize=False` plus a comm strategy stays a named runtime refusal instead of a crash inside the comm layer.
 
 ### Fused-comm execution flow (MegaMoE-style)
 
@@ -587,11 +590,13 @@ activation. Three types in `activation.py` carry that instead.
 | Layer | Type | Written by |
 |-------|------|------------|
 | Carrier | `MoEActivation` = `SwigluActivation` \| `SwigluBiasActivation` \| `SiTuActivation` \| `SimpleActivation` | The **model**, passed as `create_moe(activation=...)`; the default `DEFAULT_MOE_ACTIVATION` is plain SwiGLU. One frozen dataclass per kind, so a kind and its constants cannot disagree, and a constant the kind does not have cannot be written down at all |
-| Declaration | `MoEActivationSupport` — `kinds`, plus an `ActivationParamShape` for `alpha_beta` and one for `limit` | The **backend**, as an `activation_support` class attribute. Every backend declares one; `resolve_activation_support` raises if a module does not |
+| Declaration | `MoEActivationSupport` — `kinds`, an `ActivationParamShape` for `alpha_beta` and `limit`, plus `clamp_after_silu` | The **backend**, as an `activation_support` class attribute. Every backend declares one; `resolve_activation_support` raises if a module does not |
 | Adapter | `install_activation_params` → `materialize_activation_params` | Not the backend: the `apply_moe_impl_construction_state()` every execution unit already calls installs the slots, and `ConfigurableMoE` re-installs after the EPLB sync and inside `create_weights`. A complete layer that owns kernels directly (`TritonFusedMoE`, `VanillaMoE`) calls it itself — `MoE.__init__` deliberately does not, because a wrapper's declaration is the backend's |
 
 The carrier names constants **semantically**, per kind; only the declaration and
-the adapter speak the ABI. `SwigluActivation` has just `clamp`;
+the adapter speak the ABI. `SwigluActivation` has `clamp` and the
+`clamp_after_silu` mode (false by default, preserving the historical
+pre-activation clamp);
 `SwigluBiasActivation` has `gate_sigmoid_scale` / `linear_offset` / `clamp`;
 `SiTuActivation` has `gate_softcap` / `linear_softcap` and no clamp at all;
 `SimpleActivation(kind)` covers the kinds that take no constants. `constants()`
@@ -607,8 +612,9 @@ the kind, which is exactly the lookup this split removes.
 backends quietly narrow an accepted kind to SwiGLU or SiLU, and those kinds must
 stay out of the declaration.
 
-The adapter assigns exactly three slots — `act_alpha`, `act_beta`, `act_clamp` —
-and those are the only names a forward path or a quantization method reads. The
+The adapter assigns the three constant slots — `act_alpha`, `act_beta`,
+`act_clamp` — plus the scalar `act_clamp_after_silu` mode, and those are the
+only names a forward path or a quantization method reads. The
 op schemas keep their historical spelling, so a backend passes
 `torch.ops.trtllm.fused_moe(swiglu_alpha=self.act_alpha, ...)`; only the Python
 plumbing was renamed. The slots' *types* come from the backend's declaration,
@@ -624,6 +630,12 @@ never from the checkpoint:
 - `UNSUPPORTED` → the candidate is declined during resolution
   (`MoERejectReason.ACTIVATION_UNSUPPORTED`) whenever the layer's activation
   fills that register, so a backend that can serve it is still reachable.
+
+`clamp_after_silu=True` is a separate execution capability rather than a
+register shape. The resolver declines a backend unless its declaration opts in,
+and materialization enforces the same contract. CUTLASS opts in because its
+SwiGLU adaptor consumes the mode; its SM120 FP8-block-scale Triton fallback is
+rejected separately because that path does not.
 
 Declare `limit_when_absent` only when the ABI has no encoding for "no clamp":
 `CuteDslFusedMoE` passes `float("inf")` because its epilogue always applies the
@@ -642,9 +654,11 @@ guarded so a pass that is not allocating does not re-run the in-place division
 `NVFP4TRTLLMGenFusedMoEBaseMethod` applies to `beta` and `clamp`.
 
 Selection keeps both halves of the picture in the tuning key —
-`MoEProblem.activation` (the kind) and `MoEProblem.activation_constants` (which
-registers the carrier actually fills) — because the kind alone does not separate
-a clamped layer from an unclamped one, and those compile to different kernels.
+`MoEProblem.activation` (the kind), `MoEProblem.activation_constants` (which
+registers the carrier actually fills), and `MoEProblem.clamp_after_silu` (the
+clamp order) — because the kind alone does not separate a clamped layer from an
+unclamped one or distinguish the two clamp orders, and those compile to
+different kernels.
 
 Quantization support (the matrix above) is a separate axis, and a backend can
 execute a kind while still rejecting the quant algorithm it arrives with. The

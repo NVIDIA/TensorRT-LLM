@@ -135,6 +135,7 @@ class DisaggServerConfig():
     ctx_router_config: Optional[RouterConfig] = None
     gen_router_config: Optional[RouterConfig] = None
     conditional_disagg_config: Optional[ConditionalDisaggConfig] = None
+    bounded_replay_on_generation: bool = False
     otlp_config: Optional[OtlpConfig] = None
     max_retries: int = 1
     perf_metrics_max_requests: int = 0
@@ -253,6 +254,7 @@ def extract_disagg_cfg(
         context_servers: Optional[dict] = None,
         generation_servers: Optional[dict] = None,
         conditional_disagg_config: Optional[dict] = None,
+        bounded_replay_on_generation: bool = False,
         otlp_config: Optional[dict] = None,
         disagg_cluster: Optional[dict] = None,
         node_id: Optional[int] = None,
@@ -273,7 +275,11 @@ def extract_disagg_cfg(
     internal_request_auth_key = _extract_internal_request_auth_key(
         internal_request_auth_key, context_servers, generation_servers)
 
-    inherited_args = dict(kwargs)
+    bounded_replay_on_generation = validate_config_bool(
+        bounded_replay_on_generation, "bounded_replay_on_generation")
+    inherited_args = {
+        **kwargs, "bounded_replay_on_generation": bounded_replay_on_generation
+    }
 
     # If parameters are specified outside the context_severs and generation_servers sections,
     # make sure they match
@@ -316,6 +322,7 @@ def extract_disagg_cfg(
         ctx_router_config=ctx_router_config,
         gen_router_config=gen_router_config,
         conditional_disagg_config=conditional_disagg_config,
+        bounded_replay_on_generation=bounded_replay_on_generation,
         otlp_config=otlp_config,
         max_retries=max_retries,
         perf_metrics_max_requests=perf_metrics_max_requests,

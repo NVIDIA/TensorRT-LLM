@@ -115,12 +115,18 @@ enum class AttentionMaskType {
   Dense = 0,
   // Causal mask.
   Causal,
-  // Sliding window causal mask or chunked attention causal mask.
+  // Shared non-variable sliding/chunked mask. Runtime params select the flavor:
+  //   * mChunkedAttentionSize > 0: chunked causal attention.
+  //   * otherwise: sliding window with inclusive K range [q - mLeftSlidingWindow, q + mRightSlidingWindow].
   SlidingOrChunkedCausal,
   // Custom mask.
   Custom,
   // Sliding window mask combined with custom packed mask.
-  SlidingWindowCustom
+  SlidingWindowCustom,
+  // Per-token contiguous window. Each packed-Q row provides an inclusive K index range
+  // [start, end]. Start/end are absolute positions within the batch item's K/V sequence,
+  // and the range must include the Q row's K-space position: start <= qPosK <= end.
+  VariableWindow
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -136,6 +142,7 @@ ATTENTION_MASK_TYPE_FUNCTION(Dense)
 ATTENTION_MASK_TYPE_FUNCTION(Causal)
 ATTENTION_MASK_TYPE_FUNCTION(SlidingOrChunkedCausal)
 ATTENTION_MASK_TYPE_FUNCTION(SlidingWindowCustom)
+ATTENTION_MASK_TYPE_FUNCTION(VariableWindow)
 
 #undef ATTENTION_MASK_TYPE_FUNCTION
 
@@ -144,9 +151,12 @@ __host__ __device__ inline bool isCustomMask(AttentionMaskType maskType) {
          maskType == AttentionMaskType::SlidingWindowCustom;
 }
 
-__host__ __device__ inline bool usesSlidingWindowMask(AttentionMaskType maskType) {
-  return maskType == AttentionMaskType::SlidingOrChunkedCausal ||
-         maskType == AttentionMaskType::SlidingWindowCustom;
+// True for any contiguous-window mask: the shared non-variable sliding/chunked mask, native
+// sliding-window custom mask, or per-token VariableWindow mask.
+__host__ __device__ inline bool isAnySlidingWindowMask(AttentionMaskType maskType) {
+  return isSlidingOrChunkedCausalMask(maskType) ||
+         isSlidingWindowCustomMask(maskType) ||
+         isVariableWindowMask(maskType);
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -181,6 +191,23 @@ FMHA_KERNEL_TYPE_FUNCTION(SwapsMmaAbForGeneration)
 FMHA_KERNEL_TYPE_FUNCTION(KeepsMmaAbForGeneration)
 
 #undef FMHA_KERNEL_TYPE_FUNCTION
+
+// Context SlidingOrChunkedCausal is the only mask that emits a runtime two-sided
+// (left + optional right) sliding/chunked window in a single cubin. Generation (swapsMmaAb)
+// SlidingOrChunkedCausal stays left-bound only, and VariableWindow is per-row on its own path;
+// neither takes the two-sided window codegen.
+__host__ __device__ inline bool isContextSlidingOrChunked(AttentionMaskType maskType,
+                                                          FmhaKernelType kernelType) {
+  return isSlidingOrChunkedCausalMask(maskType) && isContextKernel(kernelType);
+}
+
+// A mask applies a right (upper) K bound when it is context SlidingOrChunkedCausal (runtime
+// rightSlidingWindow) or VariableWindow (per-row end). swapsMmaAb generation kernels emit only the
+// left-bound-only causal/sliding shape, so they are incompatible with right-bounded masks.
+__host__ __device__ inline bool needsRightBound(AttentionMaskType maskType,
+                                                FmhaKernelType kernelType) {
+  return isContextSlidingOrChunked(maskType, kernelType) || isVariableWindowMask(maskType);
+}
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -401,6 +428,8 @@ template <> inline std::string toString(AttentionMaskType e) {
     return "Custom";
   case AttentionMaskType::SlidingWindowCustom:
     return "SlidingWindowCustom";
+  case AttentionMaskType::VariableWindow:
+    return "VariableWindow";
   default:
     TLLM_LOG_ERROR("Unsupported enum.");
     return "";
@@ -659,6 +688,8 @@ __host__ __device__ inline float getSoftmaxPScale(tg::Dtype dtypeBmm2,
   X(bool, mUseBlockSparseAttention, false, bool)                                                   \
   /* Whether to emit the DSv4 fused-epilogue scales as UE8M0 exponent bytes instead of FP32. */    \
   X(bool, mUsesDsv4Ue8m0ScaleO, false, bool)                                                       \
+  /* Whether to compute softmax row sums with P times an all-ones matrix using UTCMMA. */          \
+  X(bool, mUsesMmaForSoftmaxSum, false, bool)                                                      \
   /* Whether to use an ordered sequence between softmax0 and softmax1. */                          \
   X(bool, mUsesOrderedSequence, true, bool)                                                        \
   /* Whether to use CGA reduction (deprecated, kept for benchmarking). */                          \

@@ -25,9 +25,11 @@ NVLINK One-Sided supports post-quant dispatch.
 """
 
 import os
+import re
 import sys
 from typing import Callable, Dict, List, Optional, Tuple
 
+import pynvml
 import torch
 
 from tensorrt_llm._mnnvl_utils import CftMnnvlMemory, MnnvlCheckpointCommunicator, MnnvlMemory
@@ -57,6 +59,7 @@ _CFT_DEFAULT_MAX_BATCH_FOR_COMBINE = 128
 _CFT_MAX_BATCH_FOR_COMBINE_ENV = "TRTLLM_MOE_A2A_CFT_MAX_BATCH_FOR_COMBINE"
 FORCE_CFT_ENV = "TRTLLM_MOE_A2A_FORCE_CFT"
 _CFT_ALIGNMENT_BYTES = 16
+_CFT_MIN_DRIVER_BRANCH = 615
 
 
 def get_force_cft() -> bool | None:
@@ -68,17 +71,60 @@ def get_force_cft() -> bool | None:
     return None
 
 
+def _get_nvidia_driver_version() -> str | None:
+    try:
+        try:
+            pynvml.nvmlDeviceGetCount()
+        except pynvml.NVMLError_Uninitialized:
+            pynvml.nvmlInit()
+        value = pynvml.nvmlSystemGetDriverVersion()
+    except pynvml.NVMLError as error:
+        tllm_logger.warning_once(
+            "CFT counted writes disabled: failed to query the NVIDIA driver "
+            f"version via NVML ({error}). Falling back to fence-based dispatch.",
+            key="moe_a2a_cft_driver_query_failed",
+        )
+        return None
+    if isinstance(value, bytes):
+        return value.decode(errors="replace")
+    return str(value)
+
+
+def cft_driver_is_supported(driver_version: str | bytes | None) -> bool:
+    if isinstance(driver_version, bytes):
+        driver_version = driver_version.decode(errors="replace")
+    if not driver_version:
+        return False
+    match = re.match(r"^(\d+)(?:\.|$)", driver_version.strip())
+    return bool(match and int(match.group(1)) >= _CFT_MIN_DRIVER_BRANCH)
+
+
 def resolve_can_use_cft(can_use_cft_counted_writes: bool) -> bool:
-    """Apply the TRTLLM_MOE_A2A_FORCE_CFT override to a caller's request.
+    """Apply the TRTLLM_MOE_A2A_FORCE_CFT override, then the driver requirement.
 
     Workspace sizing and workspace layout both depend on this, so they must
     resolve it identically: a caller that sizes without the override and then
     constructs with it would lay out the CFT region in an undersized buffer.
+
+    The driver check applies even when CFT is forced. Logical endpoints need
+    kernel-driver support; under CUDA forward compatibility a newer user-mode
+    driver exports the API but endpoint creation fails on the older kernel driver.
     """
     force_cft = get_force_cft()
-    if force_cft is None:
-        return can_use_cft_counted_writes
-    return force_cft
+    requested = can_use_cft_counted_writes if force_cft is None else force_cft
+    if not requested:
+        return False
+    driver_version = _get_nvidia_driver_version()
+    if not cft_driver_is_supported(driver_version):
+        if driver_version is not None:
+            tllm_logger.warning_once(
+                "CFT counted writes disabled: NVIDIA driver "
+                f"{driver_version} is below required {_CFT_MIN_DRIVER_BRANCH}.00. "
+                "Falling back to fence-based dispatch.",
+                key=f"moe_a2a_cft_driver_unsupported_{driver_version}",
+            )
+        return False
+    return True
 
 
 def should_use_cft(
@@ -578,6 +624,36 @@ class NVLinkOneSided(Communication):
         """
         return True
 
+    @classmethod
+    def _release_workspace(cls, workspace_key: Tuple[object, ...]) -> None:
+        """Release a shared workspace after its last communicator is destroyed."""
+        workspace_state = cls._WORKSPACES.get(workspace_key)
+        if workspace_state is None:
+            return
+
+        try:
+            if workspace_state.get("cft_initialized", False):
+                # The C++ manager owns a logical endpoint bound to this
+                # allocation. Destroy it before dropping the final Python
+                # references to the MNNVL memory, otherwise the endpoint
+                # outlives its backing pages and a recycled virtual address
+                # could resolve to it.
+                torch.ops.trtllm.moe_a2a_cft_release(
+                    workspace_state["workspace"], workspace_state["ep_rank"]
+                )
+        finally:
+            # Drop the workspace whether or not the release succeeded. By the
+            # time we get here ``destroy`` has already decremented the refcount
+            # and unregistered the lifecycle, so nothing will call this again:
+            # leaving the entry behind would hand a later communicator an
+            # allocation whose endpoint state is unknown. The exception still
+            # propagates -- the caller learns the release failed, but not by
+            # inheriting a reusable half-released workspace.
+            cls._WORKSPACES.pop(workspace_key, None)
+            if cls._WORKSPACE is workspace_state:
+                cls._WORKSPACE = None
+            workspace_state.clear()
+
     def destroy(self):
         """Release shared state during explicit, rank-coordinated teardown."""
         if getattr(self, "_destroyed", False):
@@ -601,11 +677,7 @@ class NVLinkOneSided(Communication):
             NVLinkOneSided._WORKSPACE_REFCOUNTS[workspace_key] = refcount
         else:
             NVLinkOneSided._WORKSPACE_REFCOUNTS.pop(workspace_key, None)
-            workspace_state = NVLinkOneSided._WORKSPACES.pop(workspace_key, None)
-            if NVLinkOneSided._WORKSPACE is workspace_state:
-                NVLinkOneSided._WORKSPACE = None
-            if workspace_state is not None:
-                workspace_state.clear()
+            NVLinkOneSided._release_workspace(workspace_key)
 
         self.mnnvl_mem = None
         self.workspace = None

@@ -377,7 +377,8 @@ def _register_fake():
           index_topk,
           compress_ratio=1,
           radix_aux_indices=None,
-          radix_aux_logits=None):
+          radix_aux_logits=None,
+          row_kv_lens=None):
         # In-place operation, no return value (void function)
         pass
 
@@ -480,6 +481,21 @@ def _register_fake():
                 packed.new_empty((num_tokens, num_heads_index, head_dim),
                                  dtype=torch.float8_e4m3fn))
 
+    @torch.library.register_fake(
+        "trtllm::minimax_m3_nvfp4_qkv_indexer_norm_rope_kv_insert")
+    def _(packed, kv_data_cache, kv_scale_cache, index_k_cache, out_cache_loc,
+          kv_quant_scale, num_heads_q, num_heads_kv, num_heads_index, head_dim,
+          rotary_dim, eps, q_weight, k_weight, index_q_weight, index_k_weight,
+          rotary_cos_sin, position_ids):
+        del kv_data_cache, kv_scale_cache, index_k_cache, out_cache_loc
+        del kv_quant_scale, num_heads_kv, rotary_dim, eps, q_weight, k_weight
+        del index_q_weight, index_k_weight, rotary_cos_sin, position_ids
+        num_tokens = packed.shape[0]
+        return (packed.new_empty((num_tokens, num_heads_q, head_dim),
+                                 dtype=torch.float8_e4m3fn),
+                packed.new_empty((num_tokens, num_heads_index, head_dim),
+                                 dtype=torch.float8_e4m3fn))
+
     @torch.library.register_fake("trtllm::userbuffers_allreduce_finalize")
     def _(input, force_applying_finalize):
         return torch.empty_like(input)
@@ -501,6 +517,8 @@ def _register_fake():
         topk: int,
         route_scale: float,
         is_hash: bool,
+        image_mask: Optional[torch.Tensor] = None,
+        vision_bias: Optional[torch.Tensor] = None,
     ) -> None:
         # In-place operation, no return value.
         pass

@@ -11,9 +11,7 @@ import tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 as resource_m
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, SamplingConfig
-from tensorrt_llm.runtime.kv_cache_manager_v2._block_radix_tree import (
-    gen_multimodal_cache_key_tokens,
-)
+from tensorrt_llm.runtime.kv_cache_manager_v2 import gen_multimodal_cache_key_tokens
 
 pytestmark = pytest.mark.cpu_only
 

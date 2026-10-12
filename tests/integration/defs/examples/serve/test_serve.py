@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import os
 import queue
 import subprocess
@@ -77,8 +92,7 @@ def wait_for_log(log_queue, expected_log, timeout=10):
     return False
 
 
-def check_openai_chat_completion(http_port,
-                                 model_name="TinyLlama-1.1B-Chat-v1.0"):
+def check_openai_chat_completion(http_port, model_name="Qwen3-0.6B"):
     """
     Test the launched trtllm-serve server using OpenAI client.
 
@@ -211,6 +225,51 @@ def check_mixed_prompt_batch(client,
         print_info(f"[{label}] content:   {content!r}")
 
 
+def test_config_override_precedence(llm_root, llm_venv, tmp_path) -> None:
+    """Verify YAML < dedicated CLI < --set with a single-GPU serving request."""
+    llm_venv.run_cmd([
+        "-m", "pip", "install", "-r",
+        os.path.join(llm_root, "examples", "serve", "requirements.txt")
+    ])
+    model_path = os.environ.get("LLM_ENGINE_DIR") or os.path.join(
+        llm_models_root(), "llama-models-v2", "TinyLlama-1.1B-Chat-v1.0")
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml.safe_dump({
+        "tensor_parallel_size": 99,
+        "max_num_tokens": 16384,
+    }),
+                           encoding="utf-8")
+    port = get_free_port_in_ci()
+    # TP=99 or PP=2 would fail on one GPU, so startup checks both boundaries.
+    cmd = [
+        "trtllm-serve",
+        model_path,
+        "--host",
+        "0.0.0.0",
+        "--port",
+        str(port),
+        "--tp_size",
+        "1",
+        "--pp_size",
+        "2",
+        "--config",
+        str(config_path),
+        "--set",
+        "pipeline_parallel_size=1",
+    ]
+    with popen(cmd) as proc:
+        _wait_for_server_ready(proc, http_port=port)
+        with OpenAI(base_url=f"http://localhost:{port}/v1",
+                    api_key="tensorrt_llm",
+                    timeout=600) as client:
+            response = client.completions.create(
+                model="TinyLlama-1.1B-Chat-v1.0",
+                prompt="Where is New York?",
+                max_tokens=20,
+            )
+            assert response.choices, "Server returned no completion choices"
+
+
 @pytest.mark.parametrize("config_flag", ["--extra_llm_api_options", "--config"])
 @skip_no_hopper
 def test_config_file_loading(serve_test_root, config_flag):
@@ -261,7 +320,7 @@ def test_env_overrides_pdl(tmp_path):
     environment variables to the server workers. Specifically, it sets `TRTLLM_ENABLE_PDL=1`
     (Programmatic Dependent Launch) via config and verifies it overrides the env var initially set to 0.
 
-    1. This model (TinyLlama-1.1B-Chat-v1.0) architecture uses RMSNorm, which triggers 'flashinfer' kernels that use PDL when `TRTLLM_ENABLE_PDL=1`.
+    1. This model (Qwen3-0.6B) architecture uses RMSNorm, which triggers 'flashinfer' kernels that use PDL when `TRTLLM_ENABLE_PDL=1`.
     2. When `TRTLLM_ENABLE_PDL=1` is actually propagated into worker env, flashinfer custom ops log "PDL enabled" to stdout/stderr.
     """
     pdl_enabled = "1"
@@ -284,8 +343,7 @@ def test_env_overrides_pdl(tmp_path):
     })
 
     cmd = [
-        "trtllm-serve", "serve",
-        f"{llm_models_root()}/llama-models-v2/TinyLlama-1.1B-Chat-v1.0",
+        "trtllm-serve", "serve", f"{llm_models_root()}/Qwen3/Qwen3-0.6B",
         "--host", "0.0.0.0", "--port",
         str(port), "--backend", "pytorch", "--config",
         str(config_file)
@@ -305,7 +363,7 @@ def test_env_overrides_pdl(tmp_path):
         check_server_ready(http_port=port, timeout_timer=300)
         response = OpenAI(base_url=f"http://localhost:{port}/v1",
                           api_key="tensorrt_llm").chat.completions.create(
-                              model="TinyLlama-1.1B-Chat-v1.0",
+                              model="Qwen3-0.6B",
                               messages=[{
                                   "role": "user",
                                   "content": "Test"

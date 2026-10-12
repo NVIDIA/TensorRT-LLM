@@ -97,9 +97,9 @@ void validate_kda_decode_fusion_inputs(at::Tensor x_q, at::Tensor x_k, at::Tenso
     int const HV = static_cast<int>(x_v.size(2));
     TORCH_CHECK(B > 0, "KDA decode requires a non-empty batch");
     bool const supportedHeads = H == 1 || H == 2 || H == 3 || H == 4 || H == 6 || H == 8 || H == 12 || H == 16
-        || H == 24 || H == 32 || H == 48 || H == 96;
+        || H == 24 || H == 32 || H == 48 || H == 64 || H == 96;
     TORCH_CHECK(
-        H == HV && supportedHeads, "KDA decode fusion CUDA supports H == HV in {1,2,3,4,6,8,12,16,24,32,48,96}");
+        H == HV && supportedHeads, "KDA decode fusion CUDA supports H == HV in {1,2,3,4,6,8,12,16,24,32,48,64,96}");
     TORCH_CHECK(x_k.size(1) == B && x_k.size(2) == H && x_v.size(1) == B,
         "x_q, x_k, and x_v batch/head dimensions are inconsistent");
     TORCH_CHECK(HV % H == 0, "HV must be divisible by H");

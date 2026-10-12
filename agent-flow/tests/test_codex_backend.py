@@ -106,6 +106,16 @@ async def test_backend_start_and_close_use_configured_runtime(monkeypatch):
     assert instance._transport is None
 
 
+async def test_backend_disables_skills_in_codex_config(monkeypatch):
+    monkeypatch.setattr(codex_module, "CodexTransport", FakeTransport)
+    monkeypatch.setattr(codex_module, "_resolve_codex_bin", lambda: "/configured/codex")
+    instance = CodexBackend(disabled_skills=("perf-optimization-casebook",))
+    async with instance:
+        assert instance._transport.config.config_overrides == (
+            'skills.config=[{name="perf-optimization-casebook", enabled=false}]',
+        )
+
+
 async def test_session_options_use_developer_instructions_and_preserve_native_defaults(
     backend, tmp_path
 ):
@@ -128,6 +138,10 @@ async def test_session_options_use_developer_instructions_and_preserve_native_de
     assert transport.registered == {}
     assert transport.unregistered == ["thread-1"]
     assert ("thread/unsubscribe", {"threadId": "thread-1"}) in transport.requests
+
+
+def test_reasoning_effort_override():
+    assert CodexBackend(reasoning_effort="ultra").reasoning_effort() == "ultra"
 
 
 async def test_empty_prompt_does_not_replace_runtime_instructions(backend, tmp_path):

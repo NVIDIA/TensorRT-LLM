@@ -289,6 +289,11 @@ void invokeNoAuxTc(InputT* scores, BiasT* bias, OutputT* topk_values, IdxT* topk
 
     if (is_single_group || is_multi_group)
     {
+        if (num_tokens == 0)
+        {
+            return;
+        }
+
         cudaLaunchConfig_t config;
         auto* kernel_instance = &deepseek_v3_topk_kernel<InputT, BiasT, OutputT, IdxT, NumDeepseekExperts, true>;
         int num_threads = NumDeepseekExperts;

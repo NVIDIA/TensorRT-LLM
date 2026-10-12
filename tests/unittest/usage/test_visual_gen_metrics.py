@@ -30,8 +30,7 @@ def session(monkeypatch, enable_telemetry):
     monkeypatch.setattr(usage_lib, "_SESSION_DISABLED", False)
     monkeypatch.setattr(usage_lib, "_REPORTER_STARTED", False)
     monkeypatch.setattr(usage_lib, "_REPORTER_ACTIVE", False)
-    monkeypatch.setattr(usage_lib, "_REPORTER_STOP", threading.Event())
-    monkeypatch.setattr(usage_lib, "_PENDING_TERMINAL", None)
+    monkeypatch.setattr(usage_lib, "_HEARTBEAT_STOP", threading.Event())
     assert usage_lib.record_visual_gen_initialization_attempt()
     assert usage_lib.record_visual_gen_initialized()
     return usage_lib._SESSION

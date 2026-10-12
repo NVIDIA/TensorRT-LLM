@@ -42,6 +42,8 @@ from tensorrt_llm.models.modeling_utils import QuantAlgo
 from tensorrt_llm.quantization.utils.fp4_utils import float4_e2m1x2
 
 from ...llmapi.llm_args import LoadFormat
+from .._experimental.modeling_v2 import modeling_v2_resolve
+from ..locality_domain.policy import LocalityDomainPolicy
 from ..model_config import ModelConfig
 from ..models import AutoModelForCausalLM
 from ..models.checkpoints.base_checkpoint_loader import BaseCheckpointLoader
@@ -249,6 +251,15 @@ def validate_encoder_decoder_kv_cache_config(model_config: ModelConfig,
             raise ValueError(
                 "Encoder-decoder models require kv_cache_config.cross_kv_cache_fraction to be set."
             )
+        if (kv_cache_config.use_kv_cache_manager_v2 is True
+                and kv_cache_config.enable_block_reuse):
+            # Both self- and cross-attention K/V depend on the full encoder
+            # input, which is not part of V2's prefix reuse identity.
+            logger.warning(
+                "Disabling KV cache block reuse for encoder-decoder models "
+                "with KV cache manager V2: reuse requires the full encoder "
+                "input identity.")
+            kv_cache_config.enable_block_reuse = False
         return
 
     if kv_cache_config.cross_kv_cache_fraction is not None:
@@ -359,6 +370,14 @@ def initialize_dummy_weights(
         # constants and not weights.
         elif torch.is_floating_point(param):
             param.uniform_(low, high, generator=generator)
+
+    # Non-persistent buffers are intentionally absent from state_dict(). Let
+    # modules that need such buffers during dummy execution initialize them
+    # explicitly after the regular state has been populated.
+    for module in model.modules():
+        initialize_dummy_state = getattr(module, "initialize_dummy_state", None)
+        if initialize_dummy_state is not None:
+            initialize_dummy_state(low=low, high=high, seed=seed)
 
 
 def get_rank_model_storage(model):
@@ -830,9 +849,13 @@ class ModelLoader:
             # Resolve FP4 MLA before the generic model preference turns auto
             # into False. Keep an explicit False distinguishable and reject it
             # during FP4 validation instead of silently overriding the user.
-            fp4_mla_config = copy.copy(config)
-            fp4_mla_config.attn_backend = llm_args.attn_backend
-            fp4_mla_config.sparse_attention_config = llm_args.sparse_attention_config
+            fp4_mla_config = replace(
+                config,
+                attn_backend=llm_args.attn_backend,
+                sparse_attention_config=llm_args.sparse_attention_config,
+                quant_config=copy.deepcopy(config.quant_config),
+                quant_config_dict=copy.deepcopy(config.quant_config_dict),
+            )
             if supports_fp4_mla_attention(fp4_mla_config):
                 validate_and_set_kv_cache_quant(fp4_mla_config,
                                                 llm_args.kv_cache_config.dtype)
@@ -922,6 +945,14 @@ class ModelLoader:
         post_transform_config_identity = PostTransformConfigIdentity.from_model_config(
             config)
         load_format = self.llm_args.load_format
+        locality_domain_policy = getattr(config, "locality_domain_policy", None)
+        if (load_format == LoadFormat.GMS
+                and getattr(locality_domain_policy, "enabled", False)):
+            raise ValueError(
+                "LoadFormat.GMS is incompatible with locality domain localized weights. "
+                "GMS shares registered parameters, while locality domain execution "
+                "releases those parameters after creating partition-local "
+                "weight shards.")
         self._startup_metadata = _checkpoint_startup_metadata(
             checkpoint_loader, load_format)
 
@@ -1540,9 +1571,8 @@ class ModelLoader:
             checkpoint_loader: BaseCheckpointLoader) -> None:
         """Load draft/MTP weights from ``speculative_model`` into the one-engine model.
 
-        Eagle3 / external drafters use a draft-specific mapper and ``draft_config``.
-        One-model MTP with separate heads reuses the target architecture mapper
-        because MTP modules are already attached under the target model.
+        Each draft config initializes its own architecture mapper so replacement
+        MTP weights use the draft's quantization and MoE backend.
         """
         draft_load_kwargs = {}
         if checkpoint_loader.checkpoint_format == "MX":
@@ -1566,7 +1596,7 @@ class ModelLoader:
             draft_weight_mapper.init_model_and_config(model.draft_model,
                                                       model.draft_config)
         else:
-            # MTP one-model + separate MTP checkpoint: no draft HF architecture.
+            # Drafters without a separate config reuse the target mapper.
             draft_weight_mapper = self.weight_mapper
 
         with timing_metric(
@@ -1591,6 +1621,11 @@ class ModelLoader:
         enabled_features = set()
         if loads_draft_weights:
             enabled_features.add(PostTransformFeature.SEPARATE_DRAFT_MODEL)
+        locality_domain_policy = getattr(model.model_config,
+                                         "locality_domain_policy", None)
+        if getattr(locality_domain_policy, "enabled", False):
+            enabled_features.add(
+                PostTransformFeature.LOCALITY_DOMAIN_LOCALIZED_WEIGHTS)
         return cls._post_transform_profile_registry().qualify(
             root_model_class=type(model),
             architecture=config_identity.architecture,
@@ -1911,6 +1946,8 @@ class ModelLoader:
             multimodal_config=self.llm_args.multimodal_config,
             use_cute_dsl_bf16_bmm=self.llm_args.use_cute_dsl_bf16_bmm,
             use_cute_dsl_bf16_gemm=self.llm_args.use_cute_dsl_bf16_gemm,
+            locality_domain_policy=LocalityDomainPolicy(
+                enabled=self.llm_args.enable_locality_domains),
         )
 
         # Only pass model_kwargs if it's explicitly set (not None)
@@ -1918,6 +1955,14 @@ class ModelLoader:
             load_config_kwargs['model_kwargs'] = self.llm_args.model_kwargs
 
         config = checkpoint_loader.load_config(**load_config_kwargs)
+
+        # Decided here, after `load_config_and_apply_defaults` resolved the
+        # built-in class and applied its model defaults to `llm_args`: a
+        # modeling_v2 target reads the arguments as the engine will run with
+        # them and never overrides those defaults.
+        config = replace(config,
+                         modeling_v2_target=modeling_v2_resolve(
+                             config, self.llm_args))
 
         if uses_mtp_head_checkpoint(self.spec_config):
             # `load_config_and_apply_defaults` already ran this, but against a
@@ -1932,6 +1977,8 @@ class ModelLoader:
             'nvfp4_gemm_allowed_backends'] = config.nvfp4_gemm_allowed_backends
         config.extra_attrs[
             'kv_cache_dtype'] = self.llm_args.kv_cache_config.dtype
+        config.extra_attrs["bounded_replay_on_generation"] = (
+            self.llm_args.bounded_replay_on_generation)
         # Store allreduce pre-allocation config for AllReduce module access.
         # Use get_text_config() so VLM wrapper configs (e.g. KimiK2VLConfig,
         # KimiK25Config) that store the text config under .text_config are
@@ -2065,7 +2112,7 @@ class ModelLoader:
                 draft_weight_mapper.init_model_and_config(
                     model.draft_model, model.draft_config)
             else:
-                # MTP one-model + separate MTP checkpoint: no draft HF architecture.
+                # Drafters without a separate config reuse the target mapper.
                 draft_weight_mapper = self.weight_mapper
             _inspect_shadow_weight_load_plan(
                 checkpoint_loader,

@@ -88,7 +88,9 @@ class SolMethodology:
         return None
 
 
-def resolve_sol_methodology(enabled: bool = True) -> SolMethodology:
+def resolve_sol_methodology(
+    enabled: bool = True, backend_kind: str = "claude-code"
+) -> SolMethodology:
     """Probe the live skill list and return the methodology the projector has.
 
     Costs one backend connection and no model call (~1 s), and is
@@ -101,7 +103,9 @@ def resolve_sol_methodology(enabled: bool = True) -> SolMethodology:
     from agent_flow.utils import resolve_first_available_skill
 
     try:
-        loaded, probe_ok = resolve_first_available_skill(SOL_SKILL_CANDIDATES)
+        loaded, probe_ok = resolve_first_available_skill(
+            SOL_SKILL_CANDIDATES, backend_kinds=(backend_kind,)
+        )
     except Exception:  # noqa: BLE001 - a probe failure must never fail the run
         return SolMethodology(probed=False)
     if not probe_ok:

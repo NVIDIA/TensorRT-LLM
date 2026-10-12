@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 ### :title KV Cache Connector
 ### :order 6
 ### :section Customization
@@ -74,17 +89,18 @@ python llm_kv_cache_connector.py meta-llama/Llama-3.1-8B-Instruct
 - Cache files are stored in a temporary directory (cleaned up after the demo)
 - The implementation is simplified and not optimized for production use
 - Does not support chunked prefill in this example
-- See `tensorrt_llm/_torch/pyexecutor/kv_cache_connector.py` for the full connector interface
+- See `tensorrt_llm/_torch/pyexecutor/connectors/kv_cache_connector.py` for the full connector interface
 
 **NOTE:** This example connector implementation is designed for demonstration purposes
 and is NOT suitable for production use without additional optimizations and error handling.
 '''
 
+import hashlib
 import os
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from tempfile import TemporaryDirectory
+from tempfile import NamedTemporaryFile, TemporaryDirectory
 from typing import Optional
 
 import click
@@ -105,6 +121,7 @@ CONNECTOR_CACHE_FOLDER_KEY = "CONNECTOR_CACHE_FOLDER"
 class PersistentKvCacheConnectorMetadata:
     load: list[tuple[str, int]] = field(default_factory=list)
     save: list[tuple[str, int]] = field(default_factory=list)
+    prefix_load_ids: list[int] = field(default_factory=list)
 
 
 class PersistentKvCacheConnectorWorker(KvCacheConnectorWorker):
@@ -113,6 +130,7 @@ class PersistentKvCacheConnectorWorker(KvCacheConnectorWorker):
         super().__init__(llm_args)
 
         self.kv_cache_tensor = None
+        self._finished_prefix_loads: list[int] = []
 
     def register_kv_caches(self, kv_cache_tensor: torch.Tensor):
         # This is the only registration hook this connector needs. A cache that
@@ -130,6 +148,12 @@ class PersistentKvCacheConnectorWorker(KvCacheConnectorWorker):
 
             # Copy into the device block.
             self.kv_cache_tensor[block_id].copy_(cpu_tensor, non_blocking=False)
+
+        self._finished_prefix_loads.extend(self._metadata.prefix_load_ids)
+
+    def get_finished_prefix_loads(self) -> list[int]:
+        finished, self._finished_prefix_loads = self._finished_prefix_loads, []
+        return finished
 
     def wait_for_layer_load(self, layer_idx: int, stream: torch.cuda.Stream):
         pass
@@ -149,8 +173,14 @@ class PersistentKvCacheConnectorWorker(KvCacheConnectorWorker):
             if Path(path).exists():
                 continue
 
-            # Do a blocking save to the file. This way, we only return once all saves are complete.
-            torch.save(cpu_tensor, path)
+            # Publish complete immutable files so a reservation can retain an
+            # inode while another process replaces or removes its cache key.
+            with NamedTemporaryFile(dir=Path(path).parent) as staging:
+                torch.save(cpu_tensor, staging.name)
+                try:
+                    os.link(staging.name, path)
+                except FileExistsError:
+                    pass
 
     def get_finished(
             self, finished_gen_req_ids: list[int],
@@ -171,69 +201,67 @@ class PersistentKvCacheConnectorLeader(KvCacheConnectorScheduler):
                                            "./connector_cache")
 
         os.makedirs(self.cache_folder, exist_ok=True)
+        self._reservation_folder = TemporaryDirectory(prefix=".reservations-",
+                                                      dir=self.cache_folder)
+        self._reserved_files: dict[int, dict[int, Path]] = {}
+        self._reserved_ranges: dict[int, list[tuple[int, int]]] = {}
 
     def build_connector_meta(self, scheduler_output: SchedulerOutput):
         # NOTE: This is a simplified implementation, and does not work with chunked prefill.
 
         metadata = PersistentKvCacheConnectorMetadata()
 
-        for req in scheduler_output.new_requests:
-            # If we don't have any pending loads for this request, we can skip it.
-            if req.request_id not in self.pending_loads:
-                continue
-
-            num_computed_blocks = req.computed_position // self.block_size
-            block_ids = req.new_block_ids
-
-            pending_load = self.pending_loads[req.request_id]
-
-            # Ordinal -> page slot for the blocks that have a page. Blocks with
-            # none keep their ordinal in `block_ids` so that entry `i` always
-            # describes the same token range; they are dropped here so no
-            # transfer can be built against one.
+        accepted_ends = {}
+        for load in scheduler_output.prefix_loads:
+            if len(load.block_ids_by_layer_group) != 1:
+                raise ValueError(
+                    "Persistent connector requires one layer group")
+            if load.start % self.block_size or load.end % self.block_size:
+                raise ValueError("Persistent connector loads complete blocks")
+            block_ids = load.block_ids_by_layer_group[0]
+            if load.end // self.block_size > len(block_ids):
+                raise ValueError(
+                    "Confirmed prefix exceeds destination allocation")
             slots = dict(valid_page_slots(block_ids))
+            files = self._reserved_files[load.reservation_id]
+            for ordinal in range(load.start // self.block_size,
+                                 load.end // self.block_size):
+                if ordinal in slots:
+                    metadata.load.append((str(files[ordinal]), slots[ordinal]))
+            metadata.prefix_load_ids.append(load.reservation_id)
+            accepted_ends[load.request_id] = load.end
 
-            for file_path, block_pos in zip(
-                    pending_load, range(num_computed_blocks, len(block_ids))):
-                slot = slots.get(block_pos)
-                if slot is None:
+        for req in scheduler_output.new_requests:
+            num_computed_blocks = req.computed_position // self.block_size
+            slots = dict(valid_page_slots(req.new_block_ids))
+            pending_load = self.pending_loads.get(req.request_id, [])
+            for ordinal, path in enumerate(pending_load, num_computed_blocks):
+                if ordinal in slots:
+                    metadata.load.append((str(path), slots[ordinal]))
+
+            loaded_end = accepted_ends.get(
+                req.request_id,
+                (num_computed_blocks + len(pending_load)) * self.block_size)
+            computed_end = max(req.computed_position,
+                               loaded_end) + req.num_scheduled_tokens
+            for ordinal, slot in slots.items():
+                end = (ordinal + 1) * self.block_size
+                if end <= loaded_end or end > min(len(req.new_tokens),
+                                                  computed_end):
                     continue
-                metadata.load.append((file_path, slot))
-
-            # Break up the remainder of the token sequence into chunks.
-            chunks = self._chunk_tokens(req.new_tokens)
-
-            # For each chunk that isn't already on device, and isn't in our connector cache, we need to save it.
-            for block_pos in range(num_computed_blocks + len(pending_load),
-                                   len(block_ids)):
-                slot = slots.get(block_pos)
-                if slot is None:
-                    continue
-                if len(chunks[block_pos]) == self.block_size:
-                    hashed_tokens = self._hash_tokens(chunks[block_pos],
-                                                      req.cache_salt)
-
-                    file_path = self._file_path(hashed_tokens)
-
-                    metadata.save.append((file_path, slot))
+                key = self._hash_tokens(req.new_tokens[:end], req.cache_salt)
+                metadata.save.append((str(self._file_path(key)), slot))
 
         self.pending_loads = {}
-
         return metadata
 
-    def _hash_tokens(self, tokens: list[int], cache_salt: Optional[str]) -> int:
-        # cache_salt must participate in the hash so that requests carrying
-        # different salts (or no salt) cannot collide on the same cache file.
-        return abs(hash((cache_salt, tuple(tokens))))
+    def _hash_tokens(self, tokens: list[int], cache_salt: Optional[str]) -> str:
+        # KV depends on every preceding token, including those in other blocks.
+        key = repr((cache_salt, tuple(tokens))).encode("utf-8")
+        return hashlib.sha256(key).hexdigest()
 
-    def _file_path(self, hash_value: int) -> Path:
+    def _file_path(self, hash_value: str) -> Path:
         return Path(self.cache_folder) / f"{hash_value}.pt"
-
-    def _chunk_tokens(self, tokens: list[int]) -> list[list[int]]:
-        return [
-            tokens[i:i + self.block_size]
-            for i in range(0, len(tokens), self.block_size)
-        ]
 
     def get_num_new_matched_tokens(
             self, request: LlmRequest,
@@ -244,28 +272,14 @@ class PersistentKvCacheConnectorLeader(KvCacheConnectorScheduler):
         if (num_computed_tokens % self.block_size) != 0:
             return 0, False
 
-        computed_blocks = num_computed_tokens // self.block_size
-
-        # Get all the tokens that don't have a cache hit on device.
-        remaining_tokens = request.get_tokens(0)[computed_blocks *
-                                                 self.block_size:]
-
-        remaining_chunks = self._chunk_tokens(remaining_tokens)
-
-        # For each chunk, check if it exists in our cache.
-        for chunk in remaining_chunks:
-            # Only do full blocks.
-            if len(chunk) == self.block_size:
-                hashed_tokens = self._hash_tokens(chunk, request.cache_salt)
-
-                file_path = self._file_path(hashed_tokens)
-
-                # If we get a cache hit, we want to load it into device.
-                # Otherwise, we can stop looking.
-                if file_path.exists():
-                    self.pending_loads[request.request_id].append(file_path)
-                else:
-                    break
+        tokens = request.get_tokens(0)
+        for end in range(num_computed_tokens + self.block_size,
+                         len(tokens) + 1, self.block_size):
+            key = self._hash_tokens(tokens[:end], request.cache_salt)
+            file_path = self._file_path(key)
+            if not file_path.exists():
+                break
+            self.pending_loads[request.request_id].append(file_path)
 
         logger.info(
             f"KV CONNECTOR: Matched {len(self.pending_loads[request.request_id])} blocks for request {request.request_id}"
@@ -273,6 +287,63 @@ class PersistentKvCacheConnectorLeader(KvCacheConnectorScheduler):
 
         return len(
             self.pending_loads[request.request_id]) * self.block_size, False
+
+    def reserve_prefix(self, request: LlmRequest, num_computed_tokens: int,
+                       reservation_id: int) -> tuple[int, bool]:
+        """Protect immutable source files without reading their KV data."""
+        if num_computed_tokens % self.block_size:
+            return 0, False
+        tokens = request.get_tokens(0)
+        folder = Path(self._reservation_folder.name) / str(reservation_id)
+        folder.mkdir()
+        files = {}
+        for end in range(num_computed_tokens + self.block_size,
+                         len(tokens) + 1, self.block_size):
+            ordinal = end // self.block_size - 1
+            key = self._hash_tokens(tokens[:end], request.cache_salt)
+            protected = folder / f"{ordinal}.pt"
+            try:
+                os.link(self._file_path(key), protected)
+            except FileNotFoundError:
+                break
+            files[ordinal] = protected
+        count = len(files) * self.block_size
+        if count:
+            self._reserved_files[reservation_id] = files
+            self._reserved_ranges[reservation_id] = [
+                (num_computed_tokens, num_computed_tokens + count)
+            ]
+        else:
+            folder.rmdir()
+        return count, False
+
+    def release_prefix_reservation(self, request: LlmRequest,
+                                   reservation_id: int, start: int,
+                                   end: int) -> None:
+        """Release only the named range; overlapping reservations retain it."""
+        remaining = []
+        for left, right in self._reserved_ranges[reservation_id]:
+            if right <= start or left >= end:
+                remaining.append((left, right))
+            else:
+                if left < start:
+                    remaining.append((left, start))
+                if end < right:
+                    remaining.append((end, right))
+        files = self._reserved_files[reservation_id]
+        for ordinal, path in list(files.items()):
+            block_start = ordinal * self.block_size
+            block_end = block_start + self.block_size
+            if not any(left < block_end and right > block_start
+                       for left, right in remaining):
+                path.unlink()
+                del files[ordinal]
+        if remaining:
+            self._reserved_ranges[reservation_id] = remaining
+        else:
+            del self._reserved_ranges[reservation_id]
+            del self._reserved_files[reservation_id]
+            (Path(self._reservation_folder.name) / str(reservation_id)).rmdir()
 
     def request_finished(self, request: LlmRequest,
                          cache_block_ids: list[int]) -> bool:

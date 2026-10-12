@@ -19,7 +19,7 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._torch.models.modeling_utils import DecoderModelForCausalLM
+from tensorrt_llm._torch.models.modeling_utils import apply_quant_config_exclude_modules
 from tensorrt_llm._torch.moe.fused_moe.activation import (
     DEFAULT_MOE_ACTIVATION,
     ActivationParamShape,
@@ -163,7 +163,7 @@ def test_exclusions_only_recreate_matching_moe_weights() -> None:
     )
     root.experts = wrapper
 
-    DecoderModelForCausalLM.apply_quant_config_exclude_modules(root)
+    apply_quant_config_exclude_modules(root.model_config, root.named_modules())
 
     assert not backend._weights_created
     wrapper.create_weights()

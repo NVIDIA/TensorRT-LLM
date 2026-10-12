@@ -107,6 +107,12 @@ class PhasedFmha(Fmha):
         if local_layer_idx is None:
             local_layer_idx = self.attn.get_local_layer_idx(meta)
 
+        # Views can address a different page size and pool root than their
+        # owning manager, so its physical pool bound cannot be reused.
+        view_bound = getattr(kv_cache_manager, "get_attention_op_num_blocks", None)
+        if view_bound is not None:
+            return int(view_bound(local_layer_idx))
+
         if isinstance(kv_cache_manager, KVCacheManagerV2):
             return int(kv_cache_manager.impl.get_page_index_upper_bound(local_layer_idx, Role.KEY))
         if not isinstance(kv_cache_manager, KVCacheManager):

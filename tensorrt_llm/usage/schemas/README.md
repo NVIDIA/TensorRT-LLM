@@ -44,9 +44,17 @@ login context.
 
 ### `trtllm_initial_report`
 
-Sent once after the first successful LLM initialization. Contains system info
-and the first successfully reported LLM's serving configuration. A process that
-fails earlier can send a terminal report without an initial report.
+Normally sent after the first successful LLM initialization with system information
+and serving configuration. If startup fails, it can instead be sent alongside the
+exit report with as much information as is available (**partial context**).
+These partial reports are marked with
+`llmApiConfigMetaJson.report_context == "pre_initialization_exit"` and do not
+indicate successful initialization.
+
+For dashboards, the top-level event parameter `llmInstancesCreated >= 1`
+confirms successful LLM initialization; partial reports have `llmInstancesCreated == 0`.
+Do not count initial reports alone as successful deployments. Treat a missing
+counter in older records as unknown, not zero.
 
 #### System fields
 
@@ -69,6 +77,10 @@ fails earlier can send a terminal report without an initial report.
 
 #### Parallelism fields
 
+In partial reports, `0` for `tensorParallelSize`, `pipelineParallelSize`, or
+`contextParallelSize` means unknown (not captured), not a real parallelism degree;
+exclude these sentinel values from parallelism averages and distributions.
+
 | Field | Type | Description | Example |
 |-------|------|-------------|---------|
 | `tensorParallelSize` | PositiveInt | Tensor parallelism degree. | `8` |
@@ -81,9 +93,9 @@ fails earlier can send a terminal report without an initial report.
 
 | Field | Type | Description | Example |
 |-------|------|-------------|---------|
-| `architectureClassName` | LongString | Exact model architecture class when it appears in the checked-in public Hugging Face architecture allowlist; otherwise empty. | `"MixtralForCausalLM"`, `"LlamaForCausalLM"`, `""` |
+| `architectureClassName` | LongString | Public model architecture identifier when it appears in the checked-in allowlist; otherwise empty. The identifier may come from a public model checkpoint or a documented TensorRT-LLM runtime architecture. | `"LlamaForCausalLM"`, `"Qwen3ForTextEmbedding"`, `""` |
 | `architectureClassHash` | LongString | Pseudonymous, deterministic SHA-256 grouping key for a non-empty architecture outside the public allowlist; otherwise empty. | `"sha256:76873a...ccd04"`, `""` |
-| `backend` | ShortString | Execution backend. | `"pytorch"`, `"tensorrt"` |
+| `backend` | ShortString | Execution backend. | `"pytorch"` |
 | `dtype` | ShortString | Model data type. | `"float16"`, `"bfloat16"`, `"auto"` |
 | `quantizationAlgo` | ShortString | Quantization algorithm. Empty string if none. | `""`, `"fp8"`, `"w4a16_awq"` |
 | `kvCacheDtype` | ShortString | KV cache data type. Empty string if default. | `""`, `"fp8"`, `"auto"` |
@@ -115,10 +127,17 @@ makes the same unknown architecture globally correlatable across deployments.
 The intended guarantee is only that the raw name is not transmitted while stable
 grouping remains possible; the hash must not be treated as anonymous or secret.
 
-Extraction uses the first Hugging Face `architectures` value and also supports
-legacy singular values and nested engine configs. Invalid or empty values leave
-both fields empty. The conservative allowlist is maintained manually; custom
-names remain excluded until reviewed.
+Extraction uses the first `architectures` value from the pretrained
+configuration. Encode-only models use the effective runtime configuration after
+model overrides are applied, falling back to the checkpoint configuration if
+the runtime metadata is unavailable. Generation models use the checkpoint
+configuration; architecture overrides applied in their worker process are not
+currently reflected in telemetry. If the list is absent or empty, the config
+class name is used. An invalid or empty first entry leaves both fields empty.
+The conservative allowlist is maintained manually. An identifier may be
+included when it is publicly documented by the upstream model provider or in
+TensorRT-LLM's supported-models table; custom names remain excluded until
+reviewed.
 
 #### Aggregate LLM lifecycle counters
 
@@ -136,12 +155,12 @@ heartbeat, and the terminal report. Cumulative counters saturate at uint32 max;
 
 ### `trtllm_heartbeat`
 
-Sent periodically (default: every 600s) to track session duration. Up to 1000
-heartbeats per session.
+Sent periodically (default: every 600s) to track session duration until process
+exit, a terminal report, or telemetry opt-out, with no heartbeat-count limit.
 
 | Field | Type | Description | Example |
 |-------|------|-------------|---------|
-| `seq` | PositiveInt | Zero-based heartbeat sequence number. | `0`, `1`, `42` |
+| `seq` | PositiveInt | Zero-based heartbeat sequence number, saturating at uint32 max. | `0`, `1`, `42` |
 | `ingressPoint` | ShortString | Invocation boundary for the process session. | `"cli_serve"` |
 | `disaggRole` | ShortString | Disaggregated role: `context`, `generation`, `coordinator`, `server_coordinator`, or compatible legacy values such as `ctx0`/`gen0`. | `"context"` |
 | `deploymentId` | ShortString | Optional shared disaggregated deployment ID. | `"dep-abc123"` |
@@ -310,7 +329,6 @@ The docs build renders the full table under **Developer Guide > Telemetry**.
 | `backend` | Execution backend. Captured as the `Literal["pytorch"]` value on the PyTorch args. |
 | `dtype` | Model dtype, captured through an explicit allowlist. |
 | `load_format` | Weight load format, captured as a low-cardinality enum/string value. |
-| `quant_config.quant_algo` | Quantization algorithm, captured as a closed `QuantAlgo` enum value (TRT args only). Empty/absent when unquantized. |
 | `kv_cache_config.dtype` | KV cache dtype, captured through an explicit allowlist. |
 | `kv_cache_config.enable_block_reuse` | Whether KV cache block reuse/prefix caching is enabled. |
 | `cuda_graph_config.batch_sizes` | CUDA graph batch sizes when configured. |
@@ -402,7 +420,7 @@ type-driven), and v3 (composed branch-policy) payloads coexist in the same index
 - P2 tuning/output fields are not collected.
 - A process has one reporter. The first runtime/object supplies static metadata. VisualGen request and lifecycle summaries aggregate across VisualGen objects, while queue peaks are the maximum observed on any individual executor, not a sum of executor gauges.
 - If an LLM starts the reporter first, VisualGen aggregates are available in the final terminal snapshot but not the LLM heartbeat. If VisualGen starts first, its heartbeats carry the VisualGen summaries. Mixed sessions retain the existing LLM telemetry contract.
-- Telemetry reuses the existing opt-outs, CI/test suppression, notification, heartbeat limits, and best-effort terminal delivery. Schema registration and production approval are separate deployment steps.
+- Telemetry reuses the existing opt-outs, CI/test suppression, notification, and best-effort terminal delivery. Both runtimes send heartbeats until stopped, with no count limit and a sequence number saturating at uint32 max. Exit delivery uses an independent sender so it cannot queue behind a blocked heartbeat. Schema registration and production approval are separate deployment steps.
 
 ### Conventions
 

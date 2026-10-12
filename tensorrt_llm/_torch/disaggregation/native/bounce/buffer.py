@@ -21,7 +21,7 @@ from typing import Dict, Optional, Tuple
 
 from tensorrt_llm import logger
 from tensorrt_llm._torch.disaggregation.base.agent import RegMemoryDescs
-from tensorrt_llm.runtime.kv_cache_manager_v2._cuda_virt_mem import PooledPhysMemAllocator, VirtMem
+from tensorrt_llm.runtime.kv_cache_manager_v2._introspection import PooledPhysMemAllocator, VirtMem
 
 _MIB = 1024 * 1024
 

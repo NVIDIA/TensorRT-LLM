@@ -150,33 +150,15 @@ def test_prefix_store_and_readback_roundtrip():
 def test_create_gating_and_fail_closed():
     common = dict(rank=0, model_engine=None)
     # Feature off -> no capturer at all.
-    assert (
-        RouteCapture.create(
-            **common, enabled=False, pp_size=1, is_spec_decode=False, is_draft_model=False
-        )
-        is None
-    )
-    # Draft engines never capture, even with the feature on.
-    assert (
-        RouteCapture.create(
-            **common, enabled=True, pp_size=1, is_spec_decode=False, is_draft_model=True
-        )
-        is None
-    )
+    assert RouteCapture.create(**common, enabled=False, pp_size=1, is_spec_decode=False) is None
     # Supported path -> a capturer instance.
-    rc = RouteCapture.create(
-        **common, enabled=True, pp_size=1, is_spec_decode=False, is_draft_model=False
-    )
+    rc = RouteCapture.create(**common, enabled=True, pp_size=1, is_spec_decode=False)
     assert isinstance(rc, RouteCapture)
     # Unsupported paths fail closed instead of returning wrong routes.
     with pytest.raises(RuntimeError):
-        RouteCapture.create(
-            **common, enabled=True, pp_size=2, is_spec_decode=False, is_draft_model=False
-        )
+        RouteCapture.create(**common, enabled=True, pp_size=2, is_spec_decode=False)
     with pytest.raises(RuntimeError):
-        RouteCapture.create(
-            **common, enabled=True, pp_size=1, is_spec_decode=True, is_draft_model=False
-        )
+        RouteCapture.create(**common, enabled=True, pp_size=1, is_spec_decode=True)
 
 
 def test_active_capturer_is_looked_up_per_engine_forward():

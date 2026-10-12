@@ -24,31 +24,38 @@ from tensorrt_llm.logger import logger
 GUARDRAIL_HF_REPO = "nvidia/Cosmos-1.0-Guardrail"
 GUARDRAIL_REVISION = "cf03c0395fac8c4de386c0bdab12cc4fc8d66362"
 
+# The guardrail repo carries ~17 GB of Cosmos 1.0-era checkpoints that
+# CosmosSafetyChecker no longer instantiates; fetch only what it loads.
+GUARDRAIL_ALLOW_PATTERNS = ["blocklist/*", "face_blur_filter/*"]
+
 
 def download_guardrail_checkpoint() -> str:
     from huggingface_hub import snapshot_download
     from huggingface_hub.errors import GatedRepoError
 
+    kwargs = dict(
+        repo_id=GUARDRAIL_HF_REPO,
+        revision=GUARDRAIL_REVISION,
+        allow_patterns=GUARDRAIL_ALLOW_PATTERNS,
+    )
     try:
-        return snapshot_download(
-            GUARDRAIL_HF_REPO,
-            revision=GUARDRAIL_REVISION,
-            local_files_only=True,
-        )
+        snapshot = snapshot_download(local_files_only=True, **kwargs)
     except FileNotFoundError:
+        snapshot = None
+
+    if snapshot is None:
         logger.warning(f"Guardrail checkpoint not found, downloading from {GUARDRAIL_HF_REPO}")
         try:
-            return snapshot_download(
-                GUARDRAIL_HF_REPO,
-                revision=GUARDRAIL_REVISION,
-            )
-        except GatedRepoError:
+            snapshot = snapshot_download(**kwargs)
+        except GatedRepoError as e:
             raise ValueError(
                 "Cosmos Guardrail checkpoint not found. "
                 "Please ensure "
                 "a) you have accepted the terms of use (https://huggingface.co/nvidia/Cosmos-1.0-Guardrail) "
                 "b) you have set a valid HF_TOKEN environment variable"
-            )
+            ) from e
+
+    return snapshot
 
 
 def check_video_safety(video_tensor: torch.Tensor, safety_checker: Any) -> torch.Tensor | None:

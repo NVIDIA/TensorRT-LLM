@@ -6,9 +6,9 @@
 from collections.abc import Sequence
 from typing import Any
 
-from openengine.v1 import error_pb2, generation_pb2
-
 from tensorrt_llm.sampling_params import SamplingParams
+
+from .bindings import error_pb2, generation_pb2
 
 # Floor for logprob values so a -inf (masked token) is JSON/proto-safe, matching
 # the HTTP /v1/completions clamp in create_logprobs.

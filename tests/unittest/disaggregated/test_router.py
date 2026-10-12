@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import asyncio
 import copy
 import random
@@ -2171,7 +2174,9 @@ def test_tokenize_forwards_tools_and_chat_template_kwargs(router_class):
 
     tok = _mock_tokenizer()
     documents = [{"title": "Paris", "text": "Paris is in France."}]
-    chat_template = "{% for message in messages %}{{ message.content }}{% endfor %}"
+    chat_template = (
+        "{% if thinking %}<think>{% endif %}"
+        "{% for message in messages %}{{ message.content }}{% endfor %}")
     with mock.patch.object(router, "_get_tokenizer", return_value=tok):
         req = ChatCompletionRequest(
             model="TinyLlama",
@@ -2200,6 +2205,30 @@ def test_tokenize_forwards_tools_and_chat_template_kwargs(router_class):
     assert kwargs.get("thinking") is True
     assert kwargs["documents"] == documents
     assert kwargs["chat_template"] == chat_template
+
+
+@pytest.mark.parametrize("router_class",
+                         [KvCacheAwareRouter, ConversationRouter])
+def test_tokenize_rejects_kwargs_the_template_never_reads(router_class):
+    router = router_class(server_role=None,
+                          servers=["server1"],
+                          use_tokens=False,
+                          max_batch_size=32,
+                          tokens_per_block=32)
+    tok = _mock_tokenizer()
+    request = ChatCompletionRequest(
+        model="test-model",
+        messages=[{
+            "role": "user",
+            "content": "hello"
+        }],
+        chat_template="{{ messages[0].content }}",
+        chat_template_kwargs={"disable_reasoning": True},
+    )
+    with mock.patch.object(router, "_get_tokenizer", return_value=tok):
+        with pytest.raises(ValueError, match="disable_reasoning"):
+            router._tokenize(request)
+    tok.apply_chat_template.assert_not_called()
 
 
 @pytest.mark.parametrize("router_class",
@@ -2479,3 +2508,72 @@ async def test_conversation_affinity_pins_across_load(servers):
                                          "content": "v1"
                                      }])
         assert (await router.get_next_server(req3))[0] != home
+
+
+# Frozen expectations for the V2 routing hash. Derived from the format itself -- a
+# SHA-256 chain seeded with the reuse-scope digest, each block folding in its token ids
+# as 4-byte little-endian -- not by recording what the implementation currently emits.
+# The router hashes token_list[:-1] and drops the root, so a 10-token prompt at
+# tokens_per_block=4 yields blocks of 4, 4 and 1.
+_V2_GOLDEN_BOUNDARY_EXACT = [
+    "e432228522a304ab556d66e6e40979ad05575f28b19b554264dd3c6277aaf073",
+    "78c7ad438ce9372cfaedc888ad7a907162dd57ea7ab540fd3ad0c3c7c97d9c06",
+]
+_V2_GOLDEN_PARTIAL_TAIL = [
+    "e432228522a304ab556d66e6e40979ad05575f28b19b554264dd3c6277aaf073",
+    "756b1d258c63ccc0cbd6284ab33b043c81175086163f9d2821f5764079efb75c",
+    "2c2a73c72b0bccbf74a5d46d131499ca726b1d2a650836cb548a10fb3c8acf2e",
+]
+_V2_GOLDEN_SALTED = [
+    "db459ee4f851fc0f200670146f089ab0ec5180332f6e5ef79c89f005da17d385",
+    "4a7983401932bc87d9894dd530d5f5e4aa998d7a71e457d8b6e049669962db4c",
+    "1a5e8d70d15180a91358f33109a4caf41be7bf78597a1263dbaf73a54433aff9",
+]
+
+
+@pytest.mark.parametrize(
+    "tokens,cache_salt_id,expected",
+    [
+        ([1, 2, 3, 4, 5, 6, 7, 8], None, _V2_GOLDEN_BOUNDARY_EXACT),
+        ([1, 2, 3, 4, 5, 6, 7, 8, 9, 10], None, _V2_GOLDEN_PARTIAL_TAIL),
+        ([1, 2, 3, 4, 5, 6, 7, 8, 9, 10], 4242, _V2_GOLDEN_SALTED),
+    ],
+    ids=["boundary_exact", "partial_tail", "salted"],
+)
+def test_v2_block_hashes_match_frozen_wire_values(servers, tokens,
+                                                  cache_salt_id, expected):
+    """Pin the V2 routing hash to fixed values, not to whatever the engine computes.
+
+    The other V2 cases here build their expectation with the same
+    sequence_to_blockchain_keys the router calls, so they check the wiring -- the root
+    skip and the final-token exclusion -- but move with the hash if its format ever
+    changes. Routing compares these against hashes the engine produced, so the format is
+    a cross-language wire contract: freeze it here so a change has to be deliberate.
+    """
+    router = KvCacheAwareRouter(server_role=None,
+                                servers=servers,
+                                tokens_per_block=4)
+
+    block_hashes = router._compute_block_hashes([tokens],
+                                                hash_algo=KV_CACHE_HASH_ALGO_V2,
+                                                cache_salt_id=cache_salt_id)
+
+    assert block_hashes == [expected]
+
+
+def test_v2_sha256_64_block_hashes_are_big_endian_prefix_of_frozen_values(
+        servers):
+    """The 64-bit variant is the first 8 bytes of the same key, read big-endian."""
+    router = KvCacheAwareRouter(server_role=None,
+                                servers=servers,
+                                tokens_per_block=4)
+
+    block_hashes = router._compute_block_hashes(
+        [[1, 2, 3, 4, 5, 6, 7, 8, 9, 10]],
+        hash_algo=KV_CACHE_HASH_ALGO_V2_SHA256_64)
+
+    expected = [
+        int.from_bytes(bytes.fromhex(key)[:8], "big")
+        for key in _V2_GOLDEN_PARTIAL_TAIL
+    ]
+    assert block_hashes == [expected]

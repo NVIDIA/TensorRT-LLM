@@ -14,6 +14,8 @@
 
 import contextlib
 import ctypes
+import os
+import sys
 from collections.abc import Sequence
 from functools import lru_cache
 from importlib.util import find_spec
@@ -28,16 +30,21 @@ except ImportError:
     from cuda.core.experimental._module import ObjectCode
 
 if not TYPE_CHECKING and find_spec("kv_cache_manager_v2") is not None:
-    from kv_cache_manager_v2._common import CudaStream, LayerId, MemAddress, TokenIdExt
-    from kv_cache_manager_v2._utils import _unwrap, div_up, exact_div
+    from kv_cache_manager_v2 import CudaStream, LayerId, MemAddress, TokenIdExt
 else:
-    from tensorrt_llm.runtime.kv_cache_manager_v2._common import (
-        CudaStream,
-        LayerId,
-        MemAddress,
-        TokenIdExt,
-    )
-    from tensorrt_llm.runtime.kv_cache_manager_v2._utils import _unwrap, div_up, exact_div
+    from tensorrt_llm.runtime.kv_cache_manager_v2 import CudaStream, LayerId, MemAddress, TokenIdExt
+
+_TEST_DIR = os.path.dirname(os.path.abspath(__file__))
+# cuda_test_utils supplies temporary_sys_path, so its own path entry is added and
+# removed by hand here; every later sibling import goes through that helper.
+_ADDED_TEST_DIR = _TEST_DIR not in sys.path
+if _ADDED_TEST_DIR:
+    sys.path.insert(0, _TEST_DIR)
+try:
+    from cuda_test_utils import _unwrap, div_up, exact_div  # noqa: E402
+finally:
+    if _ADDED_TEST_DIR:
+        sys.path.remove(_TEST_DIR)
 
 _SLEEP_TIME_NS: int = 0
 

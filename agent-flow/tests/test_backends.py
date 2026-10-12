@@ -27,6 +27,7 @@ from agent_flow.backends import create_backend
 from agent_flow.backends.base import ResultEvent
 from agent_flow.backends.claude_code import ClaudeCodeBackend, ClaudeCodeClient
 from agent_flow.backends.codex import CodexBackend
+from agent_flow.config import BackendConfig
 from agent_flow.types import (
     AgentTextEvent,
     CompactBoundaryEvent,
@@ -82,6 +83,14 @@ class TestCreateBackend:
     def test_factory_rejects_unknown_backends(self):
         with pytest.raises(ValueError, match="Unknown backend"):
             create_backend("unknown")
+
+    def test_factory_passes_disabled_skills(self):
+        config = BackendConfig(
+            kind="codex",
+            model="gpt-6-astra",
+            disabled_skills=("perf-optimization-casebook",),
+        )
+        assert create_backend(config)._disabled_skills == ("perf-optimization-casebook",)
 
 
 class TestClaudeBackend:
@@ -742,6 +751,9 @@ _RECURSIVE_NODE_SCHEMA = {
 
 
 class TestClaudeBackendCreateClient:
+    def test_reasoning_effort_override(self):
+        assert ClaudeCodeBackend(reasoning_effort="medium").reasoning_effort() == "medium"
+
     async def test_framework_tools_keep_annotations_and_independent_handlers(self):
         from agent_flow.tools import tool
 
@@ -797,7 +809,7 @@ class TestClaudeBackendCreateClient:
         with pytest.raises(jsonschema.ValidationError):
             jsonschema.validate(instance=rejected, schema=advertised)
 
-    async def _capture_options(self, monkeypatch, **kwargs):
+    async def _capture_options(self, monkeypatch, backend=None, **kwargs):
         # Stand-in for ``ClaudeSDKClient`` that just records the options
         # ``create_client`` would have launched the real SDK with.
 
@@ -818,10 +830,19 @@ class TestClaudeBackendCreateClient:
         # but we patch defensively in case that changes.
         monkeypatch.setattr(cc_mod, "create_sdk_mcp_server", lambda **_: object())
 
-        backend = ClaudeCodeBackend()
+        backend = backend or ClaudeCodeBackend()
         async with backend.create_client(system_prompt="hi", model="claude-test", **kwargs):
             pass
         return captured["options"]
+
+    async def test_create_client_denies_disabled_skills(self, monkeypatch):
+        options = await self._capture_options(
+            monkeypatch,
+            backend=ClaudeCodeBackend(
+                disabled_skills=("perf-optimization-casebook",),
+            ),
+        )
+        assert options.disallowed_tools == ["Skill(perf-optimization-casebook)"]
 
     async def test_create_client_disables_bash_sandbox(self, monkeypatch):
         # ``danger_full_access`` analogue for Claude Code: the bash
@@ -1092,3 +1113,27 @@ class TestCodexBackendVersion:
             lambda *a, **k: SimpleNamespace(returncode=1, stdout="", stderr="boom"),
         )
         assert codex_mod._codex_cli_version() == ""
+
+
+class TestSystemPromptSpill:
+    def test_short_prompt_passes_through_unchanged(self, tmp_path):
+        assert cc_mod.spill_system_prompt("hello", tmp_path, threshold=1024) == "hello"
+        assert not (tmp_path / ".agent-flow").exists()
+
+    def test_long_prompt_is_written_to_a_file_and_replaced_by_a_pointer(self, tmp_path):
+        prompt = "x" * 5000
+        pointer = cc_mod.spill_system_prompt(prompt, tmp_path, threshold=1024)
+        files = list((tmp_path / ".agent-flow").glob("system-prompt-*.md"))
+        assert len(files) == 1
+        assert files[0].read_text() == prompt
+        assert str(files[0]) in pointer
+        assert "Read tool" in pointer
+        assert len(pointer.encode()) < 1024
+
+    def test_spill_files_are_content_addressed(self, tmp_path):
+        prompt = "x" * 5000
+        cc_mod.spill_system_prompt(prompt, tmp_path, threshold=1024)
+        # Same content -> same file, no duplicate; different content -> new file.
+        cc_mod.spill_system_prompt(prompt, tmp_path, threshold=1024)
+        cc_mod.spill_system_prompt(prompt + "y", tmp_path, threshold=1024)
+        assert len(list((tmp_path / ".agent-flow").glob("system-prompt-*.md"))) == 2

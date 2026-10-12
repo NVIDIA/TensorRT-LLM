@@ -1085,6 +1085,15 @@ scope. If the skill is not available in this environment, note that in one
 line and proceed — never block the run on it.
 """
 
+CASEBOOK_DISABLED = """\
+## Casebook experiment
+
+This run intentionally disables `perf-optimization-casebook`. Do not invoke or
+use that skill, even if an earlier section asks for it. Ground conclusions only
+in the task, source, measurements, and other enabled skills; `casebook_ref` may
+be omitted.
+"""
+
 
 # --------------------------------------------------------------------------- #
 # Remote execution boundary (appended with task-specific values by the CLI)

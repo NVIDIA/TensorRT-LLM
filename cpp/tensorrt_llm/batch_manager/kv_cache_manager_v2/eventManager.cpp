@@ -485,20 +485,6 @@ int EventManager::getWindowSize(EventLayerGroupId layerGroupId) const
     return windowSize == mWindowSizeByLayerGroup.end() ? mWindowSize : windowSize->second;
 }
 
-std::string EventManager::digestToHex(Digest const& digest)
-{
-    constexpr char kHex[] = "0123456789abcdef";
-    std::string result;
-    result.resize(digest.size() * 2);
-    for (size_t i = 0; i < digest.size(); ++i)
-    {
-        auto const value = std::to_integer<uint8_t>(digest[i]);
-        result[2 * i] = kHex[value >> 4U];
-        result[2 * i + 1] = kHex[value & 0x0FU];
-    }
-    return result;
-}
-
 uint64_t EventManager::truncateDigestToInt64(Digest const& digest)
 {
     uint64_t result = 0;
@@ -566,54 +552,15 @@ std::optional<KVCacheStoredBlockData> EventManager::storedBlockFromBlock(
         return std::nullopt;
     }
 
-    std::vector<MmKey> mmKeys;
-    Digest const* itemDigest = nullptr;
-    if (mMmTokenIdOffset.has_value() && block.prev != nullptr && block.prev->type() == NodeBase::Type::kBLOCK)
-    {
-        itemDigest = static_cast<Block const*>(block.prev)->getLastTokenDigest().get();
-    }
-    bool inMmRun = false;
+    auto decoded = decodeEventBlock(block, mMmTokenIdOffset);
     std::vector<UniqueToken> tokens;
-    tokens.reserve(block.tokens.size());
-    for (auto const& token : block.tokens)
+    tokens.reserve(decoded.tokenIds.size());
+    for (auto& tokenId : decoded.tokenIds)
     {
-        if (!token.isDigest())
-        {
-            UniqueToken uniqueToken;
-            uniqueToken.tokenId = EventTokenId{std::in_place_index<0>, token.tokenId()};
-            tokens.push_back(std::move(uniqueToken));
-            if (itemDigest != nullptr && token.tokenId() > *mMmTokenIdOffset)
-            {
-                if (!inMmRun)
-                {
-                    mmKeys.push_back(
-                        {std::string(reinterpret_cast<char const*>(itemDigest->data()), itemDigest->size()),
-                            token.tokenId() - *mMmTokenIdOffset, std::nullopt, false});
-                }
-                inMmRun = true;
-            }
-            else
-            {
-                // Text separates runs of the same item, so retain its digest for later continuations.
-                inMmRun = false;
-            }
-        }
-        else
-        {
-            UniqueToken uniqueToken;
-            uniqueToken.tokenId = EventTokenId{std::in_place_index<1>, digestToHex(token.digest())};
-            tokens.push_back(std::move(uniqueToken));
-            if (mMmTokenIdOffset.has_value())
-            {
-                itemDigest = &token.digest();
-                mmKeys.push_back({std::string(reinterpret_cast<char const*>(itemDigest->data()), itemDigest->size()), 0,
-                    std::nullopt, false});
-                inMmRun = true;
-            }
-        }
+        tokens.push_back(UniqueToken{std::move(tokenId)});
     }
     return KVCacheStoredBlockData{
-        hashFromBlock(block), std::move(tokens), cacheLevel.value(), priority, std::move(mmKeys), std::nullopt};
+        hashFromBlock(block), std::move(tokens), cacheLevel.value(), priority, std::move(decoded.mmKeys), std::nullopt};
 }
 
 uint64_t EventManager::hashV1BlockKey(std::vector<TokenId> const& tokens, uint64_t parentHash,
