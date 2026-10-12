@@ -757,6 +757,19 @@ class ConfigurableMoE(MoE):
             self._weights_transformed = False
         return result
 
+    def supports_expert_stack_loading(self) -> bool:
+        """Whether the backend loads whole expert stacks (see ``load_expert_stacks``)."""
+        supports = getattr(self.backend, "supports_expert_stack_loading", None)
+        return bool(supports is not None and supports())
+
+    def load_expert_stacks(self, expert_ids, **stacks) -> None:
+        """
+        Load whole expert projection stacks - delegated to backend
+
+        """
+        self.backend.load_expert_stacks(expert_ids, **stacks)
+        self._weights_transformed = False
+
     def transform_weights(self) -> None:
         """
         Transform weights - delegated to backend

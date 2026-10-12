@@ -2561,7 +2561,8 @@ class PyTorchModelEngine(ModelEngine):
                     warm(kv_cache_manager)
                 except Exception as e:  # perf-only: fall back to lazy compilation
                     logger.warning(
-                        f"GDN fold kernel warmup skipped: {type(e).__name__}: {e}")
+                        f"GDN fold kernel warmup skipped: {type(e).__name__}: {e}"
+                    )
                 break
         clear_memory_buffers()
         torch.cuda.empty_cache()
@@ -3925,6 +3926,13 @@ class PyTorchModelEngine(ModelEngine):
         path, and ``allow_partial_loading=True`` then skips the whole compiled
         subtree in silence, so it simply keeps its pre-refit weights.
 
+        The loader now strips ``_orig_mod`` from module paths itself
+        (``modeling_utils.strip_torch_compile_wrapper``), so a load into a
+        wrapped model matches again. The unwrap stays because callers that key
+        their own module maps by ``named_modules()`` path (NeMo-RL's direct
+        expert load) still expect wrapper-free names during the refit, and
+        the swap itself is just two attribute writes.
+
         The piecewise captures are deliberately NOT cleared. Refit moves no
         tensor (0 of 1405 parameters, buffers and tensor attributes change
         address), so the captures stay valid; clearing them only forces PWCG
@@ -3962,6 +3970,12 @@ class PyTorchModelEngine(ModelEngine):
         torch.compile is disabled, because the early return below happens
         inside the wrapped method.
 
+        No ``gc.collect()`` either. The previous wrapper is released by
+        reference count when it is replaced, and a full collection in a
+        process holding the executor, the request bookkeeping and the
+        trainer-side Ray state costs seconds; this hook sits inside the
+        refit bubble, so that was pure generation-idle time.
+
         ``resource_manager`` is unused here; it stays in the signature because
         callers (including NeMo-RL) already pass it.
         """
@@ -3969,7 +3983,6 @@ class PyTorchModelEngine(ModelEngine):
             return
         self._apply_torch_compile(self._torch_compile_backend,
                                   self.torch_compile_config.enable_fullgraph)
-        gc.collect()
 
     # Back-compat aliases. Callers probe these names with getattr() and fall
     # back to doing nothing, so removing them would silently skip the unwrap
@@ -4774,8 +4787,7 @@ class PyTorchModelEngine(ModelEngine):
             attn_metadata.num_chunked_ctx_requests = 0
             attn_metadata.kv_cache_params = kv_cache_params
             attn_metadata.kv_cache_manager = kv_cache_manager
-            if hasattr(self.model.model_config.pretrained_config,
-                       'chunk_size'):
+            if hasattr(self.model.model_config.pretrained_config, 'chunk_size'):
                 attn_metadata.mamba_chunk_size = \
                     self.model.model_config.pretrained_config.chunk_size
             with nvtx_range("steady_gen_metadata_prepare"):
@@ -4989,10 +5001,12 @@ class PyTorchModelEngine(ModelEngine):
             # its chunks; compared against prompt_len - cached_tokens it
             # exposes prefill work that prefix reuse did not save.
             request.py_ctx_computed_tokens = getattr(
-                request, 'py_ctx_computed_tokens', 0) + (end_compute - begin_compute)
+                request, 'py_ctx_computed_tokens',
+                0) + (end_compute - begin_compute)
             if getattr(request, 'py_ctx_num_chunks', 0) == 0:
                 request.py_ctx_first_begin = begin_compute
-            request.py_ctx_num_chunks = getattr(request, 'py_ctx_num_chunks', 0) + 1
+            request.py_ctx_num_chunks = getattr(request, 'py_ctx_num_chunks',
+                                                0) + 1
             # Fetch only the current chunk. get_tokens(0) marshals the whole
             # O(seq_len) VecTokens into a Python list of boxed ints; chunked
             # prefill re-enters this loop for every chunk of the same prompt, so
@@ -6153,9 +6167,9 @@ class PyTorchModelEngine(ModelEngine):
                     and num_ctx_requests == 0 and not extend_requests
                     and not first_draft_requests and _n_gen > 0
                     and previous_batch_len == _n_gen - _n_cuda_graph_dummy
-                    and previous_batch_len > 0 and num_tokens == 0
-                    and (_n_cuda_graph_dummy == 0 or all(
-                        r.is_cuda_graph_dummy
+                    and previous_batch_len > 0 and num_tokens == 0 and
+                (_n_cuda_graph_dummy == 0
+                 or all(r.is_cuda_graph_dummy
                         for r in generation_requests[previous_batch_len:]))
                     and not _has_any_multimodal_request
                     and not multimodal_params_list and not lora_params

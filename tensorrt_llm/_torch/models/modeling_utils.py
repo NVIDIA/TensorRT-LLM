@@ -1434,6 +1434,26 @@ def filter_weights(prefix, weights: Dict):
     return result
 
 
+_TORCH_COMPILE_WRAPPER_ATTR = "_orig_mod"
+
+
+def strip_torch_compile_wrapper(name: str) -> str:
+    """Drop the ``torch.compile`` wrapper segments from a module path.
+
+    ``torch.compile(module)`` returns an ``OptimizedModule`` whose only child
+    is the original module under the attribute ``_orig_mod``, so every path
+    below the compiled scope gains a ``_orig_mod`` component in
+    ``named_modules()`` / ``named_parameters()`` -- e.g.
+    ``model._orig_mod.layers.0.mlp`` for a checkpoint key prefix of
+    ``model.layers.0.mlp``. The wrapper owns no parameters of its own, so
+    removing the component gives back the path the checkpoint uses.
+    """
+    if _TORCH_COMPILE_WRAPPER_ATTR not in name:
+        return name
+    return '.'.join(part for part in name.split('.')
+                    if part != _TORCH_COMPILE_WRAPPER_ATTR)
+
+
 def _get_load_weights_num_workers() -> Optional[int]:
     """Return the per-rank module-loading worker limit, or None for the default.
 
@@ -1547,6 +1567,10 @@ def _load_weights_impl(model: Union[nn.Module, DecoderModelForCausalLM],
     def load_single_module(name, module):
         torch.cuda.set_device(device_id)
         if len(module._parameters) > 0:
+            # A torch.compile wrapper in the tree (refit into a compiled
+            # engine) inserts `_orig_mod` into the path; checkpoint keys
+            # never carry it.
+            name = strip_torch_compile_wrapper(name)
             # skip load weights if module is in skip_modules
             if any(skip_module in name for skip_module in skip_modules):
                 return
@@ -1697,8 +1721,12 @@ def _load_weights_impl_v2(model: Union[nn.Module, DecoderModelForCausalLM],
 
     def load_single_module(name, module):
         torch.cuda.set_device(device_id)
-        if len(module._parameters) == 0 or weight_mapper.should_skip_module(
-                name):
+        if len(module._parameters) == 0:
+            return
+        # A torch.compile wrapper in the tree (refit into a compiled engine)
+        # inserts `_orig_mod` into the path; checkpoint keys never carry it.
+        name = strip_torch_compile_wrapper(name)
+        if weight_mapper.should_skip_module(name):
             return
 
         names = name.split('.')

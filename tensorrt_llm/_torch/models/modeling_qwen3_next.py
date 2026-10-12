@@ -1132,6 +1132,9 @@ class Qwen3NextModel(DecoderModel):
 @register_auto_model("Qwen3NextForCausalLM")
 class Qwen3NextForCausalLM(SpecDecOneEngineForCausalLM[Qwen3NextModel,
                                                        Qwen3NextConfig]):
+    # load_weights below only pre-processes the dict and delegates to the
+    # generic loader, which tolerates a torch.compile wrapper in the tree.
+    load_weights_strips_compile_wrapper = True
 
     def __init__(
         self,

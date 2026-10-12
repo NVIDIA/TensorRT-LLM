@@ -184,6 +184,40 @@ class MoEWeightOwnerMixin:
             kargs["allow_partial_loading"] = allow_partial_loading
         self.quant_method.load_weights(self, weights[0], self.weight_loading_mode, **kargs)
 
+    def supports_expert_stack_loading(self) -> bool:
+        """Whether :meth:`load_expert_stacks` is available for this quant method."""
+        return self.quant_method.supports_expert_stack_loading()
+
+    def load_expert_stacks(
+        self,
+        expert_ids,
+        *,
+        w1: Optional[torch.Tensor] = None,
+        w3: Optional[torch.Tensor] = None,
+        w2: Optional[torch.Tensor] = None,
+        w1_scale: Optional[torch.Tensor] = None,
+        w3_scale: Optional[torch.Tensor] = None,
+        w2_scale: Optional[torch.Tensor] = None,
+    ) -> None:
+        """Load whole ``[len(expert_ids), ...]`` projection stacks into this rank's slots.
+
+        One copy per stack instead of ``load_weights``'s per-expert walk; the
+        contract is ``FusedMoEMethodBase.load_expert_stacks``. The deferred
+        transforms are armed the same way, so the finalize hooks still apply
+        exactly once.
+        """
+        assert self._weights_created
+        self.quant_method.load_expert_stacks(
+            self,
+            expert_ids,
+            w1=w1,
+            w3=w3,
+            w2=w2,
+            w1_scale=w1_scale,
+            w3_scale=w3_scale,
+            w2_scale=w2_scale,
+        )
+
     def transform_weights(self) -> None:
         if getattr(self, "_weights_transformed", False):
             return

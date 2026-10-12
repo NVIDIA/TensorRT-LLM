@@ -400,3 +400,172 @@ def test_mxfp8_cutedsl_interleave_pending_slots_drained_after_finalize():
     torch.cuda.synchronize()
     assert not backend._cute_dsl_mxfp8_w3_w1_interleave_pending
     assert not backend._mxfp8_w3_w1_sf_pending_slots
+
+
+# --------------------------------------------------------------------------- #
+# Whole-stack expert loading (load_expert_stacks)
+# --------------------------------------------------------------------------- #
+def _stacks_from(
+    weights: Dict[str, torch.Tensor], expert_ids: List[int]
+) -> Dict[str, torch.Tensor]:
+    """Stack the per-expert VANILLA tensors of ``expert_ids`` into the API's kwargs."""
+
+    def stack(leaf: str, suffix: str) -> torch.Tensor:
+        return torch.stack([weights[f"{e}.{leaf}.{suffix}"] for e in expert_ids])
+
+    return {
+        "w1": stack("w1", "weight"),
+        "w3": stack("w3", "weight"),
+        "w2": stack("w2", "weight"),
+        "w1_scale": stack("w1", "weight_scale_inv"),
+        "w3_scale": stack("w3", "weight_scale_inv"),
+        "w2_scale": stack("w2", "weight_scale_inv"),
+    }
+
+
+def _stack_refit(module, calls) -> None:
+    # Same bracket as _refit, with load_expert_stacks in place of load_weights.
+    for mod in module.modules():
+        if hasattr(mod, "pre_reload_weights") and not getattr(mod, "_weights_removed", False):
+            mod.pre_reload_weights()
+    for expert_ids, stacks in calls:
+        _backend(module).load_expert_stacks(expert_ids, **stacks)
+    _rlhf_finalize(module)
+    torch.cuda.synchronize()
+
+
+@requires_mxfp8_moe
+@pytest.mark.parametrize("backend", BACKENDS)
+@pytest.mark.parametrize(
+    "split", ["all_at_once", "two_chunks", "odd_then_even_slots", "weights_then_scales"]
+)
+def test_mxfp8_expert_stack_load_matches_single_shot(backend, split):
+    """load_expert_stacks lands bitwise on the per-expert single-shot load.
+
+    Chunked calls (the refit converts 16 experts at a time), non-contiguous
+    slots (index_copy path) and weights-before-scales must all end up in the
+    same finalized layout, with the deferred swizzle/interleave applied once.
+    """
+    torch.manual_seed(20260821)
+    generator = torch.Generator(device="cuda").manual_seed(1234)
+    weights = _mxfp8_expert_weights(generator)
+    expected = _fresh_load(_make_module(backend), weights)
+
+    ids = list(range(NUM_EXPERTS))
+    if split == "all_at_once":
+        calls = [(ids, _stacks_from(weights, ids))]
+    elif split == "two_chunks":
+        calls = [
+            (ids[:2], _stacks_from(weights, ids[:2])),
+            (ids[2:], _stacks_from(weights, ids[2:])),
+        ]
+    elif split == "odd_then_even_slots":
+        calls = [([1, 3], _stacks_from(weights, [1, 3])), ([0, 2], _stacks_from(weights, [0, 2]))]
+    else:
+        stacks = _stacks_from(weights, ids)
+        calls = [
+            (ids, {k: v for k, v in stacks.items() if "scale" not in k}),
+            (ids, {k: v for k, v in stacks.items() if "scale" in k}),
+        ]
+
+    module = _make_module(backend)
+    assert _backend(module).supports_expert_stack_loading()
+    _stack_refit(module, calls)
+    _assert_matches(module, expected, f"stack load ({split})")
+    # Repeated finalize stays a no-op: the pending sets were drained.
+    for _ in range(2):
+        _rlhf_finalize(module)
+    torch.cuda.synchronize()
+    _assert_matches(module, expected, f"stack load ({split}) after repeated finalize")
+
+
+@requires_mxfp8_moe
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_mxfp8_expert_stack_load_rejects_bad_input(backend):
+    module = _make_module(backend)
+    b = _backend(module)
+    w2 = torch.zeros(1, HIDDEN_SIZE, INTERMEDIATE_SIZE, dtype=torch.float8_e4m3fn, device="cuda")
+    with pytest.raises(ValueError, match="not stored on this rank"):
+        b.load_expert_stacks([NUM_EXPERTS + 1], w2=w2)
+    with pytest.raises(ValueError, match="duplicate"):
+        b.load_expert_stacks([0, 0], w2=torch.cat([w2, w2]))
+    with pytest.raises(ValueError, match="does not match"):
+        b.load_expert_stacks([0, 1], w2=w2)
+
+
+@requires_mxfp8_moe
+def test_mxfp8_range_swizzle_matches_per_slot():
+    """A slot run swizzled in one op equals the slots swizzled one by one."""
+    method = MXFP8CutlassFusedMoEMethod()
+    generator = torch.Generator(device="cuda").manual_seed(99)
+    scales = torch.randint(
+        0,
+        256,
+        (NUM_EXPERTS, 2 * INTERMEDIATE_SIZE, HIDDEN_SIZE // BLOCK_SIZE),
+        generator=generator,
+        device="cuda",
+        dtype=torch.uint8,
+    ).view(torch.int32)
+    per_slot = scales.clone()
+    ranged = scales.clone()
+    for slot in (1, 2, 3):
+        method._swizzle_slot_scale(per_slot, slot)
+    method._swizzle_slot_range(ranged, 1, 4)
+    torch.cuda.synchronize()
+    assert torch.equal(per_slot, ranged)
+    assert torch.equal(ranged[0], scales[0]), "slot outside the run was touched"
+
+
+@requires_mxfp8_moe
+def test_mxfp8_cutedsl_range_interleave_matches_per_slot():
+    from types import SimpleNamespace
+
+    method = MXFP8CuteDslFusedMoEMethod()
+    module = SimpleNamespace(
+        expand_intermediate_size_per_partition=2 * INTERMEDIATE_SIZE, hidden_size=HIDDEN_SIZE
+    )
+    generator = torch.Generator(device="cuda").manual_seed(7)
+    weight = torch.randint(
+        0,
+        256,
+        (NUM_EXPERTS, 2 * INTERMEDIATE_SIZE, HIDDEN_SIZE),
+        generator=generator,
+        device="cuda",
+        dtype=torch.uint8,
+    ).view(torch.float8_e4m3fn)
+    scales = torch.randint(
+        0,
+        256,
+        (NUM_EXPERTS, 2 * INTERMEDIATE_SIZE, HIDDEN_SIZE // BLOCK_SIZE),
+        generator=generator,
+        device="cuda",
+        dtype=torch.uint8,
+    ).view(torch.int32)
+
+    w_per_slot, w_ranged = weight.clone(), weight.clone()
+    for slot in (1, 2, 3):
+        method._interleave_w3_w1_weight(w_per_slot[slot])
+    method._interleave_w3_w1_weight_range(w_ranged, 1, 4)
+    s_per_slot, s_ranged = scales.clone(), scales.clone()
+    for slot in (1, 2, 3):
+        method._interleave_w3_w1_weight_scale(module, s_per_slot[slot])
+    method._interleave_w3_w1_weight_scale_range(module, s_ranged, 1, 4)
+    torch.cuda.synchronize()
+    assert torch.equal(_bits(w_per_slot), _bits(w_ranged))
+    assert torch.equal(_bits(w_ranged[0]), _bits(weight[0]))
+    assert torch.equal(s_per_slot, s_ranged)
+    assert torch.equal(s_ranged[0], scales[0])
+
+
+def test_slot_batches_split_runs_and_budget():
+    from tensorrt_llm._torch.moe.fused_moe.quantization import FusedMoEMethodBase
+
+    class _Tiny(FusedMoEMethodBase):
+        FINALIZE_BATCH_BYTES = 2
+
+    assert list(FusedMoEMethodBase._slot_batches({6, 5, 0, 2, 1}, 1)) == [(0, 3), (5, 7)]
+    # Budget of two slots per batch: the run of three splits, the pair stays.
+    assert list(_Tiny._slot_batches([0, 1, 2, 5, 6], 1)) == [(0, 2), (2, 3), (5, 7)]
+    assert list(_Tiny._slot_batches([], 1)) == []
+    # An oversized slot still goes alone rather than never.
+    assert list(_Tiny._slot_batches([3, 4], 10)) == [(3, 4), (4, 5)]
