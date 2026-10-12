@@ -40,7 +40,7 @@ The next section gives an overview of what ships, followed by the framework desi
 
 ## Overview of KV Cache Compression in TensorRT LLM
 
-The general idea is simple: **shrink the KV cache at every safe point of the serving workflow, not only inside the forward pass**. Figure 2 shows how this fits with the two paths TensorRT LLM already has. Active KV cache quantization sets the data type of the GPU cache and is read and written by every forward step. Sparse attention changes which KV entries attention keeps or reads, inside prefill and generation. The KV cache compression framework covers the rest: it runs at stable boundaries outside the forward pass, between steps or when a page moves between cache tiers, and it works on the KV pages the cache manager owns.
+The general idea is simple: **shrink the KV cache at every safe point of the serving workflow, not only inside the forward pass**. Figure 2 shows how this fits with the two paths TensorRT LLM already has. Active KV cache quantization sets the data type of the GPU cache and is read and written by every forward step. Sparse attention changes which KV entries attention keeps or reads. The **KV cache compression framework** covers the rest: it runs at stable boundaries outside the forward pass, between steps or when a page moves between cache tiers, and it works on KV pages across the whole inference system, from the GPU cache at runtime to host and disk storage.
 
 <div align="center">
 <figure>
