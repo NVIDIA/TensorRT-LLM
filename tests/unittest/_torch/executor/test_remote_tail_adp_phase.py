@@ -620,6 +620,7 @@ def test_constructor_initializes_remote_tail_adp_before_starting_worker(
             iter_perf_stats_interval=1,
             stream_interval=1,
             attention_dp_config=None,
+            kv_connector_config=None,
             batch_wait_timeout_ms=0,
             batch_wait_timeout_iters=0,
             batch_wait_max_tokens_ratio=0,
@@ -712,7 +713,15 @@ def test_rank_state_appends_forward_counts_without_changing_legacy_stats() -> No
     state.iter_stats.num_context_requests = 7
     payload = state.serialize()
     assert RankState.deserialize(payload) == state
-    legacy = RankState.deserialize(payload[:-2])
+    legacy = RankState.deserialize(
+        [
+            state.rank,
+            state.num_active_requests,
+            state.num_active_tokens,
+            state.num_retiring_requests,
+            *state.iter_stats.serialize(),
+        ]
+    )
     assert legacy.iter_stats == state.iter_stats
     assert legacy.num_context_requests == legacy.num_generation_requests == 0
     short_legacy = RankState.deserialize([3, 8])

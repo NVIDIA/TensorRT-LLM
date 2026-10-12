@@ -614,6 +614,7 @@ def test_free_request_resources_releases_target_and_draft_model_state() -> None:
         draft_model_engine=types.SimpleNamespace(model=draft),
         resource_manager=Mock(),
         _prefetched_request_ids={41},
+        enable_attention_dp=False,
         disagg=Mock(),
     )
     request = types.SimpleNamespace(py_request_id=41)

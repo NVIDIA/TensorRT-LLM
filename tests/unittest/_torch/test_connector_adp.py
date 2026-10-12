@@ -1568,7 +1568,10 @@ def test_prefix_load_recovery_lifetime(
 
 
 @pytest.mark.parametrize("peer_has_work", [False, True])
-def test_phase_idle_connector_owner_joins_ready_peer(peer_has_work: bool) -> None:
+@pytest.mark.parametrize("missing_padding", [False, True])
+def test_phase_idle_connector_owner_joins_ready_peer(
+    peer_has_work: bool, missing_padding: bool
+) -> None:
     """A phase-idle row can join compute, but an all-idle fleet cannot."""
     from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 
@@ -1582,8 +1585,11 @@ def test_phase_idle_connector_owner_joins_ready_peer(peer_has_work: bool) -> Non
         executor.model_engine = SimpleNamespace(
             cuda_graph_runner=SimpleNamespace(padding_dummy_requests={0: object()})
         )
+        if rank == 1 and missing_padding:
+            executor.model_engine.cuda_graph_runner.padding_dummy_requests.clear()
         executor.kv_connector_manager = _manager(rank)
         executor.dist.tp_size = 2
+        executor.dist.tp_allgather.side_effect = partial(collective.gather, rank)
         executor.dist.tp_allgather_int64.side_effect = partial(collective.gather_int64, rank)
         batch = ScheduledRequests()
         if rank == 0 and peer_has_work:
@@ -1598,6 +1604,12 @@ def test_phase_idle_connector_owner_joins_ready_peer(peer_has_work: bool) -> Non
 
     with ThreadPoolExecutor(max_workers=2) as pool:
         futures = [pool.submit(e._kv_connector_start_batch, b) for e, b in zip(executors, batches)]
+        if missing_padding:
+            for future in futures:
+                with pytest.raises(RuntimeError, match="ADP owner 1:.*reserved CUDA graph padding"):
+                    future.result(timeout=10)
+            assert all(executor._kv_connector_failed for executor in executors)
+            return
         results = [future.result(timeout=10) for future in futures]
     assert results == [(peer_has_work, peer_has_work), (peer_has_work, False)]
     for executor in executors:
