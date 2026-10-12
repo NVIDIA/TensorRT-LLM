@@ -32,8 +32,6 @@ from typing import TYPE_CHECKING, Any, Dict, Optional
 if TYPE_CHECKING:
     from .resources import RenderResources
 
-FINGERPRINT_VERSION = 3
-
 
 def _sha256(value: Any) -> Optional[str]:
     """Stable digest of a JSON-serializable value; ``None`` stays ``None``."""
@@ -194,7 +192,6 @@ def compute_fingerprint(res: "RenderResources") -> Dict[str, Any]:
         else type(input_processor).__qualname__
     )
     compared: Dict[str, Any] = {
-        "version": FINGERPRINT_VERSION,
         "model_type": res.model_type,
         "extension": type(res.extension).__qualname__,
         # Bumped by an extension whose rendering output changes between revisions.
