@@ -178,9 +178,46 @@ void KvCacheManager::clearReusableBlocks()
 {
     KVCM2_API_GUARD();
     auto const apiLock = lockExclusive();
-    _checkNoLivingKvCaches("clear_reusable_blocks()");
     TLLM_CHECK_DEBUG(mRadixTree);
+    // V1-equivalent semantics: open caches keep the pages they still need (HELD pages
+    // survive Block::releasePages, which only touches DROPPABLE ones) but must not commit
+    // again -- their tree blocks become orphans and hold pre-refit data. Without
+    // this, KvCache::_reattachOrphanTreeBlocks would re-insert the stale blocks
+    // into the freshly cleared tree on the next commit.
+    for (KvCache* kvc : mLivingKvCaches)
+    {
+        // ALLOWED -> VIRTUAL_STOP; also drops the stale SWA pages that were held only for a commit.
+        kvc->markReuseStateStale();
+    }
     mRadixTree->clear();
+}
+
+std::vector<bool> KvCacheManager::resizeMany(std::vector<KvCache*> const& caches,
+    std::vector<std::optional<int>> const& capacities, std::vector<std::optional<int>> const& historyLengths)
+{
+    KVCM2_API_GUARD();
+    TLLM_CHECK_WITH_INFO(caches.size() == capacities.size() && caches.size() == historyLengths.size(),
+        "resize_many(): caches, capacities and history_lengths must have the same length");
+    // The API mutex is reentrant: taking it once here makes every nested KvCache::resize() lock free
+    // and keeps the whole batch atomic w.r.t. the transceiver / RPC threads' shared-lock readers.
+    auto const apiLock = lockExclusive();
+    std::vector<bool> ok(caches.size(), false);
+    for (size_t i = 0; i < caches.size(); ++i)
+    {
+        TLLM_CHECK_WITH_INFO(caches[i] != nullptr, "resize_many(): null KvCache at index %zu", i);
+        ok[i] = caches[i]->resize(capacities[i], historyLengths[i]);
+    }
+    return ok;
+}
+
+void KvCacheManager::getSsmBlockBaseIndices(
+    std::vector<KvCache const*> const& caches, LayerGroupId lgId, BeamIndex beamIdx, int* out) const
+{
+    for (size_t i = 0; i < caches.size(); ++i)
+    {
+        TLLM_CHECK_WITH_INFO(caches[i] != nullptr, "get_ssm_block_base_indices(): null KvCache at index %zu", i);
+        out[i] = caches[i]->getSsmBlockBaseIndex(lgId, beamIdx);
+    }
 }
 
 std::shared_ptr<KvCache> KvCacheManager::createKvCache(ReuseScope reuseScope, TokenSpan inputTokens,
