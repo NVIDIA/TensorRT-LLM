@@ -396,8 +396,9 @@ class DSv4DSparkWorker(SpecWorkerBase):
 
         Two bounds exist and neither dominates: ``attn_metadata`` carries the KV
         manager's ``max_seq_len`` while ``_freqs_cap`` carries the user's, and
-        ``_create_cuda_graph_warmup_request`` sizes its dummy request at whichever is
-        larger. Covering both is what keeps warmup off the end of the table.
+        ``DummyRequestFactory.create_cuda_graph_warmup_request`` sizes its dummy
+        request at whichever is larger. Covering both is what keeps warmup off
+        the end of the table.
         """
         inner_model = getattr(draft_model, "dspark_model", None) or draft_model
         config_cap = int(getattr(inner_model, "_freqs_cap", 0) or 0)
