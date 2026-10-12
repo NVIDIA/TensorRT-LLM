@@ -1829,6 +1829,15 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             self.has_w4a8_nvfp4_fp8 = self.quant_config.layer_quant_mode.has_w4a8_nvfp4_fp8(
             )
         self._fmha_manager = FmhaManager(self)
+        recipe = getattr(self, "quant_attention_config", None)
+        has_prims_ts = any(
+            isinstance(fmha, PrimsTSFmha)
+            for fmha in self._fmha_manager.fmha_libs)
+        if recipe is not None and recipe.algorithm == "primsts" and not has_prims_ts:
+            raise RuntimeError(
+                f"The {recipe.algorithm} attention recipe needs the PrimTS FMHA "
+                "library (TLLM_FMHA_LIBS=+prims_ts), which is not enabled or "
+                "not available on this platform.")
 
     @classmethod
     def runtime_workspace_bytes_per_token(cls, model_config: "ModelConfig",
@@ -2475,7 +2484,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                     "No TRT-LLM attention FMHA library supports this request.")
             # Backends built without __init__ (test doubles) carry no recipe.
             recipe = getattr(self, "quant_attention_config", None)
-            if recipe is not None and recipe.algorithm != "sage" and not isinstance(
+            if recipe is not None and recipe.algorithm == "primsts" and not isinstance(
                     fmha, PrimsTSFmha):
                 raise RuntimeError(
                     f"The {recipe.algorithm} attention recipe needs the PrimTS FMHA "

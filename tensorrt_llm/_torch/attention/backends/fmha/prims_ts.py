@@ -823,6 +823,11 @@ class PrimsTSFmha(PhasedFmha):
             raise RuntimeError("PrimTS context requires an output buffer.")
         batch_size = int(metadata.num_contexts)
         seq_len = int(metadata.max_seq_len)
+        # Library selection is cached without sequence lengths, so a ragged batch can
+        # reach this path on a cache hit. Re-check before the view below.
+        host_lens = metadata.prompt_lens_cpu_runtime[:batch_size]
+        if q.shape[0] != batch_size * seq_len or not bool((host_lens == seq_len).all()):
+            raise RuntimeError("PrimTS cache-free context requires uniform sequence lengths.")
         num_heads, num_kv_heads, head_dim = attn.num_heads, attn.num_kv_heads, attn.head_dim
         q_width, kv_width = num_heads * head_dim, num_kv_heads * head_dim
         qkv = q.view(batch_size, seq_len, q_width + 2 * kv_width)

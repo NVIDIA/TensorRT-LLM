@@ -1311,11 +1311,17 @@ _CACHE_FREE_CASE = dict(
 )
 
 
+@pytest.mark.parametrize("outlier", [1.0, 10.0])
 @pytest.mark.parametrize(("qk_dtype", "v_dtype"), [("bf16", "fp8"), ("fp8", "fp8")])
 def test_prims_ts_cache_free_fp8_recipes(
-    monkeypatch: pytest.MonkeyPatch, qk_dtype: str, v_dtype: str
+    monkeypatch: pytest.MonkeyPatch, qk_dtype: str, v_dtype: str, outlier: float
 ) -> None:
-    """Cache-free recipes plan FP8 operands, fold the per-tensor scales, and match SDPA."""
+    """Cache-free recipes plan FP8 operands, fold the per-tensor scales, and match SDPA.
+
+    ``outlier`` multiplies the second sample's Q and V and divides its K, so the two
+    samples differ in magnitude and set different per-tensor scales while their QK
+    logits are unchanged. Each sample is checked against SDPA.
+    """
     from tensorrt_llm._torch.attention.backends.prims_ts.context import BatchPrefillTSWrapper
     from tensorrt_llm.visual_gen.args import QuantAttentionConfig
 
@@ -1338,6 +1344,10 @@ def test_prims_ts_cache_free_fp8_recipes(
     monkeypatch.setenv("TLLM_FMHA_LIBS", "+prims_ts")
     case = BackendCase(**_CACHE_FREE_CASE)
     inputs = generate_inputs(case, seed=0)
+    second = slice(case.seq_lens[0], None)
+    inputs["q"][second] *= outlier
+    inputs["new_k"][second] /= outlier
+    inputs["new_v"][second] *= outlier
 
     out = run_backend(case, "TRTLLM", inputs, kv_dtype=torch.bfloat16, kv_layout="HND")
 
@@ -1375,7 +1385,14 @@ def test_prims_ts_cache_free_fp8_recipes(
         torch.testing.assert_close(run_kwargs["scale_softmax_log2"], expected, rtol=1e-2, atol=0.0)
     else:
         assert run_kwargs["scale_softmax_log2"] is None
-    torch.testing.assert_close(out, golden, atol=FP8_ATOL + BF16_ATOL, rtol=BF16_RTOL)
+    # The second sample's output is ``outlier`` times larger. Normalize it before comparing.
+    sample_gain = torch.tensor([1.0, outlier], device=out.device).view(-1, 1)
+    torch.testing.assert_close(
+        out.view(case.num_seqs, -1) / sample_gain,
+        golden.view(case.num_seqs, -1) / sample_gain,
+        atol=FP8_ATOL + BF16_ATOL,
+        rtol=BF16_RTOL,
+    )
 
 
 def test_prims_ts_recipe_requires_prims_ts_library(monkeypatch: pytest.MonkeyPatch) -> None:
