@@ -1472,8 +1472,9 @@ class KVCacheManager(BaseResourceManager):
 
         Returns:
             Requests in ``request_ids`` order, or ``None`` if the target cache
-            has no free blocks at entry. Allocation exceptions trigger an
-            attempt to release all sequences registered by this call, then
+            has no free blocks at entry, or if the beam-aware estimate shows
+            that the dummy requests cannot fit. Allocation exceptions trigger
+            an attempt to release all sequences registered by this call, then
             propagate (a cleanup exception takes precedence if cleanup fails).
 
         The caller must release each returned request with ``free_resources``
@@ -2101,20 +2102,14 @@ class KVCacheManager(BaseResourceManager):
                                           beam_width: int) -> int:
         """Number of blocks ``add_dummy_requests`` allocates for one sequence
         of ``token_num`` prompt tokens followed by ``num_appended_tokens``
-        tokens added one at a time.
-
-        Blocks fully covered by the prompt are shared among beams (for cross
-        KV, the partial last prompt block is shared too); every other block is
-        allocated once per beam.
-        """
-        num_blocks = math.ceil(
-            (token_num + num_appended_tokens) / self.tokens_per_block)
-        if beam_width == 1:
-            return num_blocks
-        if self.kv_cache_type == CacheTypeCpp.CROSS:
-            num_shared_blocks = math.ceil(token_num / self.tokens_per_block)
-        else:
-            num_shared_blocks = token_num // self.tokens_per_block
+        tokens added one at a time."""
+        if self.kv_cache_type != CacheTypeCpp.CROSS:
+            return self._num_blocks_to_completion(token_num,
+                                                  num_appended_tokens,
+                                                  beam_width)
+        # Cross KV also shares the partial last prompt block among beams.
+        num_shared_blocks = self.get_num_kv_blocks(token_num)
+        num_blocks = self.get_num_kv_blocks(token_num + num_appended_tokens)
         return num_shared_blocks + beam_width * (num_blocks - num_shared_blocks)
 
     def get_buffers(self,

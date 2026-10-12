@@ -9,9 +9,7 @@ from _torch.pyexecutor.engine.runners.decoder.utils import decoder_config
 from _torch.pyexecutor.engine_test_utils import DummyModel
 
 import tensorrt_llm
-from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.dummy_requests import (
-    DummyRequestFactory,
-)
+from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.dummy_requests import DummyRequestFactory
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
     KVCacheManager,
     ResourceManager,
