@@ -4657,11 +4657,18 @@ def test_v2_kda_replay_slot_resets(device):
     mgr = _kda_v2_replay_manager(device)
     mgr.cuda_state_indices[:2] = torch.tensor([5, 1], dtype=torch.int32)
 
+    # Host slot ids, list or CPU tensor, go through the pinned upload: a pageable CPU tensor's
+    # .to(non_blocking=True) would still block.
+    uploads = []
+    upload = mgr._upload_kda_slots
+    mgr._upload_kda_slots = lambda slots: uploads.append(list(slots)) or upload(slots)
+
     mgr._reset_context_mamba_slots(2)
     mgr._reset_kda_replay_slots([3])
     mgr._reset_kda_replay_slots([])
     mgr._reset_kda_replay_slots(torch.tensor([6]))
 
+    assert uploads == [[3], [6]]
     assert mgr.prev_num_accepted_tokens.tolist() == [1, 0, 3, 0, 5, 0, 0, 8]
 
 
@@ -4725,6 +4732,9 @@ def test_v2_kda_replay_slot_writes_do_not_synchronize():
     mgr = _kda_v2_replay_manager("cuda")
     mgr.cuda_state_indices[:2] = torch.tensor([5, 1], dtype=torch.int32)
     mgr._request_id_to_state_index = {10: 4, 11: 2}
+    # Slot ids also arrive as tensors: a pageable CPU one and one already on the device.
+    cpu_slots = torch.tensor([7])
+    device_slots = torch.tensor([6], device="cuda")
     torch.cuda.synchronize()
 
     previous_mode = torch.cuda.get_sync_debug_mode()
@@ -4732,10 +4742,12 @@ def test_v2_kda_replay_slot_writes_do_not_synchronize():
     try:
         mgr._reset_context_mamba_slots(2)
         mgr._reset_kda_replay_slots([3])
+        mgr._reset_kda_replay_slots(cpu_slots)
+        mgr._reset_kda_replay_slots(device_slots)
         mgr._relocate_kda_replay_slots([1], [6])
         mgr.seed_kda_replay_caches_for_disagg_gen([10, 11])
     finally:
         torch.cuda.set_sync_debug_mode(previous_mode)
 
-    # Reset slots 5, 1 and 3; slot 6 takes slot 1's (reset) count; seeding resets 4 and 2.
-    assert mgr.prev_num_accepted_tokens.tolist() == [1, 0, 0, 0, 0, 0, 0, 8]
+    # Reset slots 5, 1, 3, 7 and 6; slot 6 then takes slot 1's (reset) count; seeding resets 4 and 2.
+    assert mgr.prev_num_accepted_tokens.tolist() == [1, 0, 0, 0, 0, 0, 0, 0]

@@ -4299,14 +4299,18 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         """Reset pending KDA drafts for newly initialized logical slots."""
         assert self.use_kda_replay_update
         assert self.prev_num_accepted_tokens is not None
-        if isinstance(slots, torch.Tensor):
+        if isinstance(slots, torch.Tensor) and slots.device.type != "cpu":
             slots = slots.to(device=self.prev_num_accepted_tokens.device,
                              dtype=torch.long,
                              non_blocking=True)
-        elif slots:
-            slots = self._upload_kda_slots(slots)
         else:
-            return
+            # A pageable CPU tensor would still block in .to(non_blocking=True),
+            # so host slot ids of either kind go through the pinned upload.
+            if isinstance(slots, torch.Tensor):
+                slots = slots.tolist()
+            if not slots:
+                return
+            slots = self._upload_kda_slots(slots)
         if slots.numel() > 0:
             self.prev_num_accepted_tokens.index_fill_(0, slots, 0)
 
