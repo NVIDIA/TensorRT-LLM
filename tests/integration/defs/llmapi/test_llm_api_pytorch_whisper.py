@@ -284,15 +284,15 @@ def test_whisper_pytorch_beam_search(
 def _assert_cuda_graph_state(llm: LLM, captured: bool, encoder_captured: bool = False) -> None:
     """Introspect the in-process engine (single-process mode only).
 
-    The independent encoder phase owns its graphs inside EncoderDecoderRunner;
-    the engine retains the decoder graphs.
+    EncoderDecoderRunner owns both the encoder stage graphs and the decoder
+    graphs.
     """
     model_engine = llm._executor.engine.model_engine
     assert model_engine.cuda_graph_runner.enabled == captured
     assert bool(model_engine.cuda_graph_runner.graphs) == captured
 
     assert isinstance(model_engine._runner, EncoderDecoderRunner)
-    encoder_runner = model_engine._runner._encoder_cuda_graph_runner
+    encoder_runner = model_engine._runner._encoder_stage._encoder_cuda_graph_runner
     if not encoder_captured:
         assert not encoder_runner.enabled
         assert not encoder_runner.graphs

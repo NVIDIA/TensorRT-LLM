@@ -39,6 +39,7 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64")
 endif()
 
 set(KV_CACHE_MANAGER_V2_SRCS
+    kv_cache_manager_v2/batch.cpp
     kv_cache_manager_v2/common.cpp
     kv_cache_manager_v2/config.cpp
     kv_cache_manager_v2/lifeCycleRegistry.cpp

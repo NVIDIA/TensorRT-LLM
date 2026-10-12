@@ -7,6 +7,7 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
 from tensorrt_llm._torch.pyexecutor.engine.runners import common
 from tensorrt_llm._torch.pyexecutor.engine.runners.common import (
     apply_position_id_offset,
@@ -15,7 +16,6 @@ from tensorrt_llm._torch.pyexecutor.engine.runners.common import (
     get_top_level_model,
     make_scheduled_inputs,
     prepare_multimodal_indices,
-    set_spec_metadata_all_rank_num_tokens,
     ship_multimodal_indices,
 )
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
@@ -57,7 +57,12 @@ def test_get_all_rank_num_tokens_uses_tp_collective() -> None:
     mapping = SimpleNamespace(has_cp_helix=lambda: False)
 
     result = get_all_rank_num_tokens(
-        SimpleNamespace(num_tokens=5),
+        SimpleNamespace(
+            get_adp_token_counts=lambda: [5],
+            set_adp_token_counts=lambda counts: AttentionMetadata.set_adp_token_counts(
+                None, counts
+            ),
+        ),
         enable_attention_dp=True,
         mapping=mapping,
         dist=dist,
@@ -74,7 +79,12 @@ def test_get_all_rank_num_tokens_reports_post_reduce_scatter_helix_count() -> No
     mapping = SimpleNamespace(cp_size=2, has_cp_helix=lambda: True)
 
     result = get_all_rank_num_tokens(
-        SimpleNamespace(num_tokens=5),
+        SimpleNamespace(
+            get_adp_token_counts=lambda: [5],
+            set_adp_token_counts=lambda counts: AttentionMetadata.set_adp_token_counts(
+                None, counts
+            ),
+        ),
         enable_attention_dp=True,
         mapping=mapping,
         dist=dist,
@@ -131,26 +141,6 @@ def test_attention_dp_padding_uses_all_rank_context_and_token_counts(
         )
         == expected
     )
-
-
-def test_set_spec_metadata_all_rank_counts_for_one_model() -> None:
-    mode = SimpleNamespace(
-        is_mtp_eagle_one_model=Mock(return_value=True),
-        is_eagle3_one_model=Mock(return_value=False),
-    )
-    spec_metadata = SimpleNamespace(spec_dec_mode=mode)
-
-    set_spec_metadata_all_rank_num_tokens(
-        spec_metadata,
-        [8, 9],
-        [2, 3],
-        [1, 2],
-    )
-
-    assert spec_metadata.all_rank_num_tokens == [8, 9]
-    assert spec_metadata.all_rank_num_seqs == [2, 3]
-    assert spec_metadata.all_rank_num_gens == [1, 2]
-    assert spec_metadata.subseq_all_rank_num_tokens == [2, 3]
 
 
 def test_position_offset_helpers_preserve_identity_and_unwrap_models() -> None:

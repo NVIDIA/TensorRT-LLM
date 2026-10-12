@@ -17,9 +17,11 @@
 
 #include "kv_cache_manager_v2/storageManager.h"
 #include "kv_cache_manager_v2/batchedPageCopy.h"
+#include "kv_cache_manager_v2/blockRadixTree.h"
 #include "kv_cache_manager_v2/common.h"
 #include "kv_cache_manager_v2/copyEngine.h"
 #include "kv_cache_manager_v2/exceptions.h"
+#include "kv_cache_manager_v2/kvCache.h"
 #include "kv_cache_manager_v2/page.h"
 #include "kv_cache_manager_v2/stagingBuffer.h"
 #include "kv_cache_manager_v2/utils/hostMem.h"
@@ -396,12 +398,14 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
 
     TypedVec<LifeCycleId, PoolGroupIndex> coldGrouping(numLifeCycles());
     TypedVec<PoolGroupIndex, SlotDesc> coldSlotDescList;
-    std::map<size_t, PoolGroupIndex> coldGroupByPageBytes;
+    std::map<std::pair<AttentionReusePolicy, size_t>, PoolGroupIndex> coldGroupByPageBytes;
     for (LifeCycleId lifeCycle{0}; lifeCycle < numLifeCycles(); ++lifeCycle)
     {
         size_t const coldPageBytes = coldPageBytesByLifeCycle[lifeCycle];
+        auto const* attn = std::get_if<AttnLifeCycle>(&mLifeCycles[lifeCycle]);
+        auto const policy = attn ? attn->reusePolicy : AttentionReusePolicy::REQUIRED;
         auto [it, inserted] = coldGroupByPageBytes.emplace(
-            coldPageBytes, PoolGroupIndex{static_cast<int>(coldSlotDescList.size().value())});
+            std::make_pair(policy, coldPageBytes), PoolGroupIndex{static_cast<int>(coldSlotDescList.size().value())});
         PoolGroupIndex const coldPgIdx = it->second;
         if (inserted)
         {
@@ -743,7 +747,14 @@ bool StorageManager::isEvictable(Page const& page, std::optional<CacheLevel> lev
 {
     PageStatus s = page.status();
     CacheLevel lvl = level.value_or(page.cacheLevel);
-    return (s == PageStatus::DROPPABLE && page.isCommitted()) || (s == PageStatus::HELD && lvl < numCacheLevels() - 1);
+    if (s == PageStatus::DROPPABLE && page.isCommitted())
+    {
+        // A migration batch can outlive checkpoint invalidation. Do not put
+        // detached bundle members back in an LRU that would retain their slots.
+        auto const& committed = static_cast<CommittedPage const&>(page);
+        return committed.block && !committed.block->isOrphan() && committed.block->holdsPage(committed);
+    }
+    return s == PageStatus::HELD && lvl < numCacheLevels() - 1;
 }
 
 // ---------------------------------------------------------------------------
@@ -1078,10 +1089,7 @@ void StorageManager::_prepareFreeSlots(TypedVec<CacheLevel, TypedVec<PoolGroupIn
             _batchedMigrate(lvlId, srcLevel, pages, /*updateSrc=*/true, migrationRecorder);
             for (auto const& page : pages)
             {
-                if (!isLast || page->status() != PageStatus::HELD)
-                {
-                    lvl.controller.scheduleForEviction(*page);
-                }
+                scheduleForEviction(*page);
             }
         }
     }
@@ -1263,6 +1271,196 @@ void StorageManager::batchedMigrate(
     }
 }
 
+void StorageManager::offloadSparsePages(KvCache& requestingCache, std::vector<SharedPtr<Page>> const& pages,
+    MigrationRecorder const& migrationRecorder, DropRecorder const& dropRecorder)
+{
+    if (requestingCache.storageManager() != this)
+    {
+        throw LogicError("Offload pages and requesting cache must belong to the same manager");
+    }
+    _migrateLockedSparsePages(
+        requestingCache.cudaStream(), kSparseHistoryLevel, pages, &requestingCache, migrationRecorder, dropRecorder);
+}
+
+void StorageManager::promoteSparsePages(CUstream stream, std::vector<SharedPtr<Page>> const& pages,
+    MigrationRecorder const& migrationRecorder, DropRecorder const& dropRecorder)
+{
+    _migrateLockedSparsePages(stream, kHotLevel, pages, nullptr, migrationRecorder, dropRecorder);
+}
+
+void StorageManager::_migrateLockedSparsePages(CUstream stream, CacheLevel dstLevel,
+    std::vector<SharedPtr<Page>> const& pages, KvCache const* offloadingCache,
+    MigrationRecorder const& migrationRecorder, DropRecorder const& dropRecorder)
+{
+    CacheLevel const srcLevel = dstLevel == kHotLevel ? kSparseHistoryLevel : kHotLevel;
+
+    struct MigrationBatch
+    {
+        std::vector<SharedPtr<Page>> srcPages;
+        std::vector<SharedPtr<UniqPageLock>> srcPageLocks;
+        std::vector<Slot> dstSlots;
+        std::vector<PageIndexPair> srcDstPageIndices;
+    };
+
+    std::map<LayerGroupId, MigrationBatch> batches;
+    std::set<Page*> seen;
+    std::set<CUstream> ownerStreams;
+    for (auto const& page : pages)
+    {
+        if (!page || page->manager != this)
+        {
+            throw LogicError("Sparse migration pages must belong to the same manager");
+        }
+        if (!seen.insert(page.get()).second)
+        {
+            continue;
+        }
+        auto holder = page->holder.lock();
+        auto lock = holder ? holder->uniqLock.lock() : nullptr;
+        if (!lock)
+        {
+            throw LogicError("Sparse migration requires a locked page");
+        }
+        if (offloadingCache)
+        {
+            lock->prepareSparseOffload(*offloadingCache);
+        }
+        else
+        {
+            lock->prepareSparsePromotion();
+        }
+        if (page->cacheLevel == dstLevel)
+        {
+            continue;
+        }
+        auto& batch = batches[getMigrationBatchingLayerGroupId(dstLevel, srcLevel, page->lifeCycle)];
+        batch.srcPages.push_back(page);
+        for (auto const& owner : lock->owners())
+        {
+            ownerStreams.insert(owner.kvCache->cudaStream());
+        }
+        batch.srcPageLocks.push_back(std::move(lock));
+    }
+    if (batches.empty())
+    {
+        return;
+    }
+
+    TypedVec<PoolGroupIndex, SlotCount> requirements(numPoolGroups(dstLevel), 0);
+    for (auto const& [layerGroup, batch] : batches)
+    {
+        requirements[getPoolGroupIndex(dstLevel, layerGroup)] += slotCountValueFromSize(batch.srcPages.size());
+    }
+    prepareFreeSlots(dstLevel, requirements, migrationRecorder, dropRecorder);
+    auto releaseDestinations = FuncGuard(
+        [&]()
+        {
+            for (auto& [layerGroup, batch] : batches)
+            {
+                for (auto& slot : batch.dstSlots)
+                {
+                    if (slot.hasValidSlot())
+                    {
+                        releaseSlot(layerGroup, dstLevel, std::move(slot));
+                    }
+                }
+            }
+        });
+    for (auto& [layerGroup, batch] : batches)
+    {
+        auto& pool = poolGroup(dstLevel, getPoolGroupIndex(dstLevel, layerGroup));
+        batch.dstSlots = pool.allocateMultiple(slotCountValueFromSize(batch.srcPages.size()));
+        batch.srcDstPageIndices.reserve(batch.srcPages.size());
+        for (size_t i = 0; i < batch.srcPages.size(); ++i)
+        {
+            batch.srcDstPageIndices.push_back({.dst = slotIdToPageIndexValue(batch.dstSlots[i].slotId()),
+                .src = slotIdToPageIndexValue(batch.srcPages[i]->slotId())});
+        }
+    }
+
+    auto const cudaStream = reinterpret_cast<CudaStream>(stream);
+    std::vector<CachedCudaEvent> ownerEvents;
+    ownerEvents.reserve(ownerStreams.size());
+    for (auto const ownerStream : ownerStreams)
+    {
+        ownerEvents.emplace_back(reinterpret_cast<CudaStream>(ownerStream));
+        ownerEvents.back().waitInStream(cudaStream);
+    }
+    for (auto const& [layerGroup, batch] : batches)
+    {
+        for (size_t i = 0; i < batch.srcPages.size(); ++i)
+        {
+            batch.srcPages[i]->readyEvent.waitInStream(cudaStream);
+            batch.dstSlots[i].readyEvent.waitInStream(cudaStream);
+            for (auto const& event : batch.srcPageLocks[i]->finishEvents)
+            {
+                event.waitInStream(cudaStream);
+            }
+        }
+    }
+
+    // Install the fence even when a codec rejects after enqueueing only part of a batch.
+    CachedCudaEvent completion = CachedCudaEvent::makeNull();
+    auto fenceCopies = FuncGuard(
+        [&]()
+        {
+            completion = CachedCudaEvent(cudaStream);
+            for (auto& [layerGroup, batch] : batches)
+            {
+                for (size_t i = 0; i < batch.srcPages.size(); ++i)
+                {
+                    batch.dstSlots[i].readyEvent = completion;
+                    batch.srcPageLocks[i]->recordMigrationEvent(completion);
+                }
+            }
+        });
+    for (auto const& [layerGroup, batch] : batches)
+    {
+        submitMigrationBatch(
+            dstLevel, srcLevel, layerGroup, batch.srcDstPageIndices.data(), batch.srcDstPageIndices.size(), stream);
+    }
+    fenceCopies.run();
+
+    // Subsequent readers on every owner's stream must observe the completed copy.
+    for (auto const ownerStream : ownerStreams)
+    {
+        completion.waitInStream(reinterpret_cast<CudaStream>(ownerStream));
+    }
+    for (auto const& [layerGroup, batch] : batches)
+    {
+        if (migrationRecorder)
+        {
+            migrationRecorder(batch.srcPages, batch.dstSlots, srcLevel, dstLevel);
+        }
+    }
+    for (auto& [layerGroup, batch] : batches)
+    {
+        for (size_t i = 0; i < batch.srcPages.size(); ++i)
+        {
+            Slot source = batch.srcPageLocks[i]->moveToCacheLevel(dstLevel, std::move(batch.dstSlots[i]));
+            releaseSlot(batch.srcPages[i]->lifeCycle, srcLevel, std::move(source));
+        }
+    }
+    if (mEventSink)
+    {
+        for (auto const& [layerGroup, batch] : batches)
+        {
+            for (auto const& page : batch.srcPages)
+            {
+                if (page->isCommitted())
+                {
+                    auto const& committed = static_cast<CommittedPage const&>(*page);
+                    auto const* block = committed.block;
+                    if (block && !block->isOrphan() && block->holdsPage(committed))
+                    {
+                        mEventSink->addCacheLevelUpdated(block->key, srcLevel, dstLevel, page->lifeCycle);
+                    }
+                }
+            }
+        }
+    }
+}
+
 int64_t StorageManager::prefetch(
     CacheLevel dstLevel, TypedVec<LifeCycleId, TypedVec<CacheLevel, std::vector<SharedPtr<Page>>>> const& pages)
 {
@@ -1328,6 +1526,24 @@ int64_t StorageManager::prefetch(
     for (auto& [migrationPath, migrationPages] : migrationGroups)
     {
         CacheLevel const srcLevel = migrationPath.first;
+        if (dstLevel == kHotLevel && srcLevel == kSparseHistoryLevel)
+        {
+            std::vector<SharedPtr<Page>> lockedPages;
+            for (auto const& page : migrationPages)
+            {
+                if (page->status() == PageStatus::LOCKED)
+                {
+                    lockedPages.push_back(page);
+                }
+            }
+            if (!lockedPages.empty())
+            {
+                TemporaryCudaStream stream({});
+                auto scope = stream.enter();
+                promoteSparsePages(stream.get(), lockedPages);
+                std::erase_if(migrationPages, [](auto const& page) { return page->cacheLevel == kHotLevel; });
+            }
+        }
         _batchedMigrate(dstLevel, srcLevel, migrationPages, /*updateSrc=*/true);
         // Per batch, after it landed: the pages are already grouped by source level, so this costs
         // nothing per page and never credits a batch that did not run.
@@ -1734,7 +1950,16 @@ TypedVec<PoolGroupIndex, float> StorageManager::projectPoolGroupRatio(
 TypedVec<LifeCycleId, float> StorageManager::ratioFromBatch(BatchDesc const& batch, int tokensPerBlock,
     std::optional<SwaScratchReuseConfig> const& swaScratchReuse, size_t granularity) const
 {
-    auto const numSlots = computeSlotsForBatch(batch, tokensPerBlock, swaScratchReuse);
+    auto numSlots = computeSlotsForBatch(batch, tokensPerBlock, swaScratchReuse);
+    // A soft preference, not a feasibility floor: keep one optional endpoint
+    // per typical request in addition to its private working pages.
+    for (auto const& [lc, attention] : mLifeCycles.attentionLifeCycles())
+    {
+        if (attention->allowsCheckpoint())
+        {
+            numSlots[lc] += slotCountValueFromSize(batch.kvCaches.size());
+        }
+    }
     return normalizeToRatio(slotsToBytes(numSlots, granularity));
 }
 

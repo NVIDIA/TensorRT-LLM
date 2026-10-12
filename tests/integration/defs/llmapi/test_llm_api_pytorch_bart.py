@@ -696,7 +696,7 @@ def test_bart_pytorch_continuous_admission_replays_encoder_and_mixed_cuda_graphs
         if tensor_parallel_size == 1:
             model_engine = llm._executor.engine.model_engine
             assert isinstance(model_engine._runner, EncoderDecoderRunner)
-            encoder_runner = model_engine._runner._encoder_cuda_graph_runner
+            encoder_runner = model_engine._runner._encoder_stage._encoder_cuda_graph_runner
             decoder_runner = model_engine.cuda_graph_runner
 
             assert encoder_runner.enabled

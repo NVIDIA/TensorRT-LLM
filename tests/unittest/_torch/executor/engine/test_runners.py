@@ -14,8 +14,8 @@ from tensorrt_llm._torch.attention.backends.interface import AttentionRuntimeFea
 from tensorrt_llm._torch.compilation.backend import Backend
 from tensorrt_llm._torch.pyexecutor.engine.input_buffers import InputBuffers
 from tensorrt_llm._torch.pyexecutor.engine.model_call import ModelCaller
-from tensorrt_llm._torch.pyexecutor.engine.runners import no_kv_cache as no_kv_cache_module
 from tensorrt_llm._torch.pyexecutor.engine.runners import resolve_runner_type
+from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import DecoderRunner
 from tensorrt_llm._torch.pyexecutor.engine.runners.encoder import EncoderRunner
 from tensorrt_llm._torch.pyexecutor.engine.runners.encoder_decoder import EncoderDecoderRunner
 from tensorrt_llm._torch.pyexecutor.engine.runners.interface import (
@@ -69,14 +69,6 @@ def _make_runner(
     buffers = InputBuffers(
         input_ids_cuda=torch.empty(config.max_num_tokens, dtype=torch.int),
         position_ids_cuda=torch.empty(config.max_num_tokens, dtype=torch.int),
-        gather_ids_cuda=torch.empty(config.max_num_tokens, dtype=torch.int)
-        if config.spec_config is not None
-        else None,
-        draft_tokens_cuda=torch.empty(
-            config.max_draft_loop_tokens * config.max_batch_size, dtype=torch.int
-        )
-        if config.spec_config is not None
-        else None,
     )
     kwargs = dict(mapping=SimpleNamespace(), dist=SimpleNamespace(), moe_load_balancer=None)
     if issubclass(runner_type, PoolingRunner):
@@ -98,12 +90,6 @@ def _config() -> NoKVCacheRunnerConfig:
         prefill_cuda_graph_backend=PrefillCudaGraphBackend.DISABLED,
         prefill_cuda_graph_num_tokens=[],
         mm_encoder_cache_enabled=False,
-        spec_config=None,
-        num_seq_slots=None,
-        original_max_draft_len=0,
-        original_max_total_draft_tokens=0,
-        spec_dec_max_total_draft_tokens=0,
-        max_draft_loop_tokens=0,
     )
 
 
@@ -113,6 +99,7 @@ def _model(*, is_generation: bool, is_encoder_decoder: bool = False) -> SimpleNa
         num_key_value_heads=2,
     )
     return SimpleNamespace(
+        extra_attrs={},
         model_config=SimpleNamespace(
             is_generation=is_generation,
             is_encoder_decoder=is_encoder_decoder,
@@ -131,7 +118,7 @@ def _model(*, is_generation: bool, is_encoder_decoder: bool = False) -> SimpleNa
         (False, False, False, False, PoolingRunner),
         (True, False, False, False, EncoderRunner),
         (False, False, True, True, EncoderDecoderRunner),
-        (False, False, True, False, None),
+        (False, False, True, False, DecoderRunner),
     ],
 )
 def test_resolve_runner_dispatches_startup_families(
@@ -139,7 +126,7 @@ def test_resolve_runner_dispatches_startup_families(
     mm_encoder_only: bool,
     is_generation: bool,
     is_encoder_decoder: bool,
-    runner_type: type[ModelRunner] | None,
+    runner_type: type[ModelRunner],
 ) -> None:
     args = SimpleNamespace(encode_only=encode_only, mm_encoder_only=mm_encoder_only)
 
@@ -175,6 +162,7 @@ def test_resolve_runner_checks_mm_encoder_before_non_generation() -> None:
         (EncoderRunner, "_initialize_encoder_runner"),
         (EncoderDecoderRunner, "_initialize_encoder_decoder_runner"),
         (NoKVCacheRunner, "_initialize_no_kv_cache_runner"),
+        (DecoderRunner, "_initialize_decoder_runner"),
     ],
 )
 def test_model_engine_initializes_runner_by_family(
@@ -268,8 +256,10 @@ def _model_engine_with_runner(
     engine._model_caller = Mock()
     engine.model = SimpleNamespace(extra_attrs={})
     engine.kv_cache_manager_key = ResourceManagerType.KV_CACHE_MANAGER
+    if runner is None:
+        runner = object.__new__(DecoderRunner)
+        runner.model = engine.model
     engine._runner = runner
-    engine._fallback_to_engine = False
     engine.enable_spec_decode = False
     engine.runtime_draft_len = 0
     engine.moe_load_balancer = None
@@ -318,7 +308,7 @@ def test_no_kv_cache_runner_rejects_kv_manager_before_preparation() -> None:
 def test_model_engine_forward_encoder_delegates_scheduled_encoder_batch() -> None:
     runner = Mock(spec=EncoderDecoderRunner)
     hidden_states = object()
-    runner.forward.return_value = {
+    runner.forward_encoder.return_value = {
         "encoder_hidden_states": hidden_states,
         "encoder_seq_lens": [2, 3],
     }
@@ -334,9 +324,9 @@ def test_model_engine_forward_encoder_delegates_scheduled_encoder_batch() -> Non
     outputs = engine.forward_encoder(requests, resource_manager)
 
     assert outputs == (hidden_states, [2, 3])
-    inputs = runner.forward.call_args.args[0]
+    inputs = runner.forward_encoder.call_args.args[0]
     assert inputs.batch.encoder_requests == requests
-    runner.forward.assert_called_once_with(
+    runner.forward_encoder.assert_called_once_with(
         inputs,
         resource_manager=resource_manager,
         is_dummy=False,
@@ -348,8 +338,6 @@ def test_model_engine_releases_runner_owned_graphs() -> None:
     engine._model_caller = Mock()
     engine._runner = Mock(spec=EncoderRunner)
     engine._torch_compile_backend = None
-    engine.cuda_graph_runner = None
-    engine.breakable_cuda_graph_runner = None
 
     engine._release_cuda_graphs()
 
@@ -394,64 +382,6 @@ def test_no_kv_cache_runner_owns_and_reuses_attention_metadata() -> None:
     assert first.num_heads_per_kv == 4
     assert first.block_ids_per_seq is None
     assert first.kv_block_ids_per_seq is None
-
-
-def test_no_kv_cache_runner_owns_spec_metadata_setup(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    spec_mode = SimpleNamespace(
-        attention_need_spec_dec_mode=Mock(return_value=True),
-        is_parallel_draft=Mock(return_value=False),
-    )
-    spec_metadata = SimpleNamespace(
-        spec_dec_mode=spec_mode,
-        is_spec_dec_tree=True,
-        is_spec_dec_dynamic_tree=False,
-    )
-    get_spec_metadata = Mock(return_value=spec_metadata)
-    monkeypatch.setattr(no_kv_cache_module, "get_spec_metadata", get_spec_metadata)
-    runner = _make_runner(
-        PoolingRunner,
-        _model(is_generation=False),
-        replace(
-            _config(),
-            spec_config=SimpleNamespace(
-                get_runtime_tokens_per_gen_step=lambda runtime_draft_len: runtime_draft_len + 1,
-            ),
-            original_max_draft_len=2,
-            spec_dec_max_total_draft_tokens=3,
-        ),
-    )
-    attn_metadata = SimpleNamespace(update_spec_dec_param=Mock())
-    scheduled_requests = SimpleNamespace(
-        batch_size=2,
-        num_context_requests=2,
-        context_requests=[object(), object()],
-        generation_requests=[],
-    )
-    resource_manager = SimpleNamespace(get_resource_manager=Mock(return_value=None))
-
-    result = runner.setup_spec_metadata(
-        scheduled_requests,
-        resource_manager,
-        attn_metadata,
-        runtime_draft_len=1,
-    )
-
-    assert result is spec_metadata
-    assert spec_metadata.runtime_draft_len == 1
-    assert spec_metadata.runtime_tokens_per_gen_step == 2
-    attn_metadata.update_spec_dec_param.assert_called_once_with(
-        batch_size=2,
-        is_spec_decoding_enabled=True,
-        is_spec_dec_tree=True,
-        is_spec_dec_dynamic_tree=False,
-        max_draft_len=2,
-        max_total_draft_tokens=3,
-        spec_metadata=spec_metadata,
-        spec_tree_manager=None,
-        num_contexts=2,
-    )
 
 
 def test_pooling_runner_owns_forward_output_processing(
@@ -649,9 +579,8 @@ def test_engine_consumes_optional_length_update_and_passes_call_state(effective_
 
 
 @pytest.mark.parametrize("is_dummy", [False, True])
-def test_decoder_fallback_passes_call_state_without_engine_writes(is_dummy):
+def test_decoder_runner_passes_call_state_without_engine_writes(is_dummy):
     engine, resources = _model_engine_with_runner(None, kv_cache_manager=object())
-    engine._fallback_to_engine = True
     # The dummy flag comes from the caller, not from the warmup scope.
     engine._is_warmup = not is_dummy
     engine.enable_spec_decode = False
@@ -660,37 +589,33 @@ def test_decoder_fallback_passes_call_state_without_engine_writes(is_dummy):
         batch=ScheduledRequests(), enable_spec_decode=True, runtime_draft_len=2
     )
     expected = {"logits": object(), "runtime_draft_len": 4}
-    engine._forward_decoder = Mock(return_value=expected)
+    engine._runner._forward_decoder = Mock(return_value=expected)
 
     outputs = engine._forward_scheduled(inputs, resource_manager=resources, is_dummy=is_dummy)
 
     assert outputs is expected
-    engine._forward_decoder.assert_called_once_with(inputs, resources, is_dummy=is_dummy)
+    engine._runner._forward_decoder.assert_called_once_with(inputs, resources, is_dummy=is_dummy)
     assert (engine.enable_spec_decode, engine.runtime_draft_len) == (False, 5)
     assert (inputs.enable_spec_decode, inputs.runtime_draft_len) == (True, 2)
 
 
 def test_engine_forward_keeps_call_state_when_decoder_fails():
     engine, resources = _model_engine_with_runner(None, kv_cache_manager=object())
-    engine._fallback_to_engine = True
     engine._is_warmup = False
     engine.enable_spec_decode = True
     engine.runtime_draft_len = 2
-    engine._forward_decoder = Mock(side_effect=RuntimeError("decoder failure"))
+    engine._runner._forward_decoder = Mock(side_effect=RuntimeError("decoder failure"))
 
     with pytest.raises(RuntimeError, match="decoder failure"):
         engine.forward(ScheduledRequests(), resources)
 
-    inputs = engine._forward_decoder.call_args.args[0]
+    inputs = engine._runner._forward_decoder.call_args.args[0]
     assert (inputs.enable_spec_decode, inputs.runtime_draft_len) == (True, 2)
     assert (engine.enable_spec_decode, engine.runtime_draft_len) == (True, 2)
 
 
 def test_forward_warmup_runs_local_call_state_in_forward_context():
     engine, resources = _model_engine_with_runner(None, kv_cache_manager=object())
-    engine._is_warmup = True
-    engine.enable_spec_decode = False
-    engine.runtime_draft_len = 5
     batch = ScheduledRequests()
 
     def decoder_forward(inputs, resource_manager, *, is_dummy):
@@ -698,18 +623,55 @@ def test_forward_warmup_runs_local_call_state_in_forward_context():
         assert get_model_extra_attrs() is engine.model.extra_attrs
         return {"logits": object(), "runtime_draft_len": 3}
 
-    engine._forward_decoder = Mock(side_effect=decoder_forward)
+    engine._runner._forward_decoder = Mock(side_effect=decoder_forward)
 
-    outputs = engine._forward_warmup(batch, resources, enable_spec_decode=True, runtime_draft_len=1)
+    outputs = engine._runner._forward_warmup(
+        batch, resources, enable_spec_decode=True, runtime_draft_len=1
+    )
 
-    inputs = engine._forward_decoder.call_args.args[0]
+    inputs = engine._runner._forward_decoder.call_args.args[0]
     assert inputs.batch is batch
     assert inputs.new_tensors_device is None
     assert inputs.cache_indirection_buffer is None
     assert (inputs.enable_spec_decode, inputs.runtime_draft_len) == (True, 1)
-    assert engine._forward_decoder.call_args.kwargs == {"is_dummy": True}
+    assert engine._runner._forward_decoder.call_args.kwargs == {"is_dummy": True}
     assert outputs["runtime_draft_len"] == 3
-    assert (engine.enable_spec_decode, engine.runtime_draft_len) == (False, 5)
+    assert get_model_extra_attrs() is None
+
+
+def test_decoder_runner_forward_enters_model_context():
+    engine, resources = _model_engine_with_runner(None, kv_cache_manager=object())
+    inputs = ScheduledInputs(batch=ScheduledRequests())
+
+    def decoder_forward(inputs, resource_manager, *, is_dummy):
+        assert torch.is_inference_mode_enabled()
+        assert get_model_extra_attrs() is engine.model.extra_attrs
+        return {"logits": object()}
+
+    engine._runner._forward_decoder = Mock(side_effect=decoder_forward)
+
+    engine._runner.forward(inputs, resource_manager=resources)
+
+    engine._runner._forward_decoder.assert_called_once_with(inputs, resources, is_dummy=False)
+    assert get_model_extra_attrs() is None
+
+
+def test_no_kv_forward_enters_model_context():
+    model = _model(is_generation=False)
+
+    def model_forward(**kwargs):
+        assert torch.is_inference_mode_enabled()
+        assert get_model_extra_attrs() is model.extra_attrs
+        return {"hidden_states": object()}
+
+    caller = Mock(side_effect=model_forward)
+    runner = _make_runner(PoolingRunner, model, model_caller=caller)
+    runner.prepare_inputs = Mock(return_value=PreparedInputs({}))
+    resources = SimpleNamespace(get_resource_manager=Mock(return_value=None))
+
+    runner.forward(ScheduledInputs(batch=ScheduledRequests()), resource_manager=resources)
+
+    caller.assert_called_once()
     assert get_model_extra_attrs() is None
 
 
@@ -732,15 +694,14 @@ def test_no_kv_forward_preserves_model_output_dictionary_without_length_update()
 @pytest.mark.parametrize("is_dummy", [False, True])
 def test_engine_forward_preserves_raw_decoder_outputs_and_length(raw_output, is_dummy):
     engine, resources = _model_engine_with_runner(None, kv_cache_manager=object())
-    engine._fallback_to_engine = True
     engine._is_warmup = is_dummy
     engine.runtime_draft_len = 2
-    engine._forward_decoder = Mock(return_value=raw_output)
+    engine._runner._forward_decoder = Mock(return_value=raw_output)
 
     assert engine.forward(ScheduledRequests(), resources) is raw_output
     assert engine.runtime_draft_len == 2
-    assert engine._forward_decoder.call_args.args[0].runtime_draft_len == 2
-    assert engine._forward_decoder.call_args.kwargs == {"is_dummy": is_dummy}
+    assert engine._runner._forward_decoder.call_args.args[0].runtime_draft_len == 2
+    assert engine._runner._forward_decoder.call_args.kwargs == {"is_dummy": is_dummy}
 
 
 def test_model_caller_uses_current_forward_and_restores_outer_attribute_context():
