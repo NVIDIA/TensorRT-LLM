@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Unit tests for the hang-traceback dumping in PeriodicJUnitXML.
+"""Unit tests for XML reporting and hang-traceback dumping in PeriodicJUnitXML.
 
 These exercise the pure-Python wiring only (timeout resolution and the watchdog
 that writes output-dir/hang_traceback.txt); they need no GPU or model access.
@@ -26,10 +26,12 @@ by directory the same way ``test_test_to_stage_mapping.py`` imports from
 import faulthandler
 import os
 import time
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Callable
 
 import pytest
+from _pytest.reports import TestReport
 
 __extra_import_path__ = ["~/tests/integration/defs/utils"]
 from periodic_junit import PeriodicJUnitXML
@@ -212,3 +214,54 @@ def test_hang_traceback_off_by_default(make_reporter: ReporterFactory) -> None:
     assert reporter._hang_timer is None
     assert reporter._hang_file is None
     assert not os.path.exists(reporter._hang_traceback_path())
+
+
+@pytest.mark.parametrize("failed_phase", ["setup", "call", "teardown"])
+@pytest.mark.parametrize("final_outcome", ["passed", "failed"])
+def test_rerun_attempt_retains_failure(
+    make_reporter: ReporterFactory,
+    pytestconfig: pytest.Config,
+    failed_phase: str,
+    final_outcome: str,
+) -> None:
+    reporter = make_reporter(dump_hang_traceback=False, batch_size=1)
+    reporter.config = pytestconfig
+    originals = []
+    for attempt, outcome in enumerate(("rerun", final_outcome)):
+        for phase in ("setup", "call", "teardown"):
+            if failed_phase == "setup" and outcome != "passed" and phase == "call":
+                continue
+            phase_outcome = outcome if phase == failed_phase else "passed"
+            report = TestReport(
+                nodeid="test_example.py::test_retry",
+                location=("test_example.py", 0, "test_retry"),
+                keywords={},
+                outcome=phase_outcome,
+                longrepr="attempt failed" if phase_outcome != "passed" else None,
+                when=phase,
+                sections=[("Captured stdout", f"attempt {attempt}")],
+                duration=1.0,
+            )
+            originals.append((report, phase_outcome, report.longrepr))
+            reporter.pytest_runtest_logreport(report)
+
+        # Each completed attempt is already visible in the periodic snapshot.
+        cases = ET.parse(reporter.xmlpath).findall(".//testcase")
+        assert len(cases) == attempt + 1
+
+    reporter.pytest_sessionfinish()
+    suite = ET.parse(reporter.xmlpath).getroot().find("testsuite")
+    assert suite is not None
+    cases = suite.findall("testcase")
+    tag = "failure" if failed_phase == "call" else "error"
+    assert cases[0].find(tag) is not None
+    assert "attempt failed" in cases[0].find(tag).text
+    assert "attempt 0" in cases[0].find("system-out").text
+    assert (cases[1].find(tag) is not None) == (final_outcome == "failed")
+    assert suite.get("tests") == "2"
+    count = "2" if final_outcome == "failed" else "1"
+    assert suite.get("failures" if tag == "failure" else "errors") == count
+    assert suite.get("errors" if tag == "failure" else "failures") == "0"
+    for report, outcome, longrepr in originals:
+        assert report.outcome == outcome
+        assert report.longrepr == longrepr
