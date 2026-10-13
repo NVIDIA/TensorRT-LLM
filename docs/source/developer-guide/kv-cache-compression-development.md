@@ -194,13 +194,11 @@ defines its compressed format and implements the relevant APIs below.
 | `encode_cold_pages()` | Encode a batch of KV Pages into the cold-page representation |
 | `decode_cold_pages()` | Decode a batch of cold Pages back into the hot KV representation |
 
-Storage-bound subclasses can override the shared
-`KVCacheCompressionManager.gpu_resident_token_bounds` property to return
-`(first_n, last_n)` confirmed-token counts. The default is `(0, 0)`.
-Counts must be nonnegative KV-block-size multiples and include prefill and
-accepted decode tokens. `ColdPageQuantizationCompression` supplies them from
-its `first_n` and `last_n` configuration options, so format subclasses need no
-separate protection logic or iteration hooks.
+`ColdPageQuantizationCompression` provides optional First/Last-N protection
+through `first_n` and `last_n`. Both default to `0`, leaving page protection
+disabled. Counts must be nonnegative KV-block-size multiples and include
+prefill and accepted decode tokens. Format subclasses inherit this policy;
+other compression methods do not need to define these options.
 
 The compression manager selects protected dense, non-sliding-window pages and
 moves the tail window as confirmed tokens advance. KVCM supplies page

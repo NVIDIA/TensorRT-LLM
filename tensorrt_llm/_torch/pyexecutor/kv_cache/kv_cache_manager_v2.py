@@ -3769,7 +3769,7 @@ class KVCacheManagerV2(BaseResourceManager):
                     provider = self._cold_page_codec_provider
                     if (
                         provider is None
-                        or not any(provider.gpu_resident_token_bounds)
+                        or not provider.uses_gpu_page_protection
                         or not self.enable_block_reuse
                         or req.is_disagg_generation_init_state
                     ):

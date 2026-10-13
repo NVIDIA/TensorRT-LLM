@@ -1257,7 +1257,7 @@ def test_host_init_fallback_recreates_cold_codec_and_keeps_disk(tmp_path) -> Non
     impl = Mock()
     codecs = [object(), object()]
     codec_provider = Mock()
-    codec_provider.gpu_resident_token_bounds = (0, 0)
+    codec_provider.uses_gpu_page_protection = False
     codec_provider.create_cold_page_codec.side_effect = codecs
     manager, impl_constructor = _make_manager_for_cache_tier_test(
         KvCacheConfig(
@@ -1286,7 +1286,7 @@ def test_host_init_fallback_recreates_cold_codec_and_keeps_disk(tmp_path) -> Non
 def test_cold_codec_provider_receives_draft_role() -> None:
     impl = Mock()
     codec_provider = Mock()
-    codec_provider.gpu_resident_token_bounds = (0, 0)
+    codec_provider.uses_gpu_page_protection = False
     codec_provider.create_cold_page_codec.return_value = object()
     _make_manager_for_cache_tier_test(
         KvCacheConfig(max_gpu_total_bytes=16 << 20),

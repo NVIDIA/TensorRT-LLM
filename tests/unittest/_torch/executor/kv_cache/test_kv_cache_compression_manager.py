@@ -143,7 +143,15 @@ class TestBaseABC:
     def test_lifecycle_hooks_default_noop(self, fake_kv_cache_manager):
         m = KVCacheCompressionManager(_compression_config())
         m.bind_kv_cache_managers(fake_kv_cache_manager)
-        assert m.gpu_resident_token_bounds == (0, 0)
+        assert not m.uses_gpu_page_protection
+        assert "gpu_resident_token_bounds" not in KVCacheCompressionManager.__dict__
+        assert m.update_gpu_page_protection(MagicMock()) is None
+        assert (
+            m.get_precision_reuse_limit(
+                [], reused_length=256, protected_length=256, tokens_per_block=64
+            )
+            == 256
+        )
         assert m.on_request_init(MagicMock()) is None
         assert m.on_context_step_end([MagicMock()]) is None
         assert m.on_generation_step_begin(MagicMock()) is None
@@ -219,7 +227,12 @@ def test_cold_page_base_supplies_first_last_n_without_iteration_hooks() -> None:
         ColdPageQuantizationCompressionConfig(first_n=64, last_n=256)
     )
     assert default.gpu_resident_token_bounds == (0, 0)
+    assert not default.uses_gpu_page_protection
     assert protected.gpu_resident_token_bounds == (64, 256)
+    assert protected.uses_gpu_page_protection
+    cache = MagicMock()
+    default.update_gpu_page_protection(cache)
+    cache.get_page_info.assert_not_called()
     assert protected.provides_cold_page_codec
     assert not protected.uses_iteration_lifecycle
 
@@ -229,12 +242,15 @@ def test_cold_page_base_supplies_first_last_n_without_iteration_hooks() -> None:
 def test_cold_page_provider_bounds_validated_before_cache_construction(
     bounds: tuple[int, int],
 ) -> None:
+    from tensorrt_llm._torch.kv_cache_compression.quantization_for_cold_page.quantization_for_cold_page import (
+        ColdPageQuantizationCompression,
+    )
     from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 
     manager = KVCacheManagerV2.__new__(KVCacheManagerV2)
     provider = SimpleNamespace(gpu_resident_token_bounds=bounds)
     provider.validate_gpu_resident_token_bounds = (
-        lambda block_size: KVCacheCompressionManager.validate_gpu_resident_token_bounds(
+        lambda block_size: ColdPageQuantizationCompression.validate_gpu_resident_token_bounds(
             provider, block_size
         )
     )
