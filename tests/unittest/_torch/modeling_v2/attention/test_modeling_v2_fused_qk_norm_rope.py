@@ -7,11 +7,11 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.gpt_oss.gpt_oss_120b__sm_103__tp1.ops.attention.fused_qk_norm_rope import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.fused_qk_norm_rope import (  # noqa: E501
     fused_qk_norm_rope as op,
 )
 
-__extra_import_path__ = ["../../../.."]
+__extra_import_path__ = [".."]
 from _validating import assert_within_ulp, validating  # noqa: E402 — needs the path declared above
 
 assert torch.cuda.is_available(), "fused_qk_norm_rope requires a CUDA device"

@@ -7,12 +7,12 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.deepseek_v3.r1_0528_nvfp4__sm_103__dep4.ops.moe.fp4_block_scale_moe_runner import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.fp4_block_scale_moe_runner import (  # noqa: E501
     fp4_block_scale_moe_runner as moe,
 )
 from tensorrt_llm._torch.autotuner import AutoTuner, autotune
 
-__extra_import_path__ = ["../../../.."]
+__extra_import_path__ = [".."]
 from _validating import validating  # noqa: E402 — needs the path declared above
 
 assert torch.cuda.is_available(), "fp4_block_scale_moe_runner requires a CUDA device"
