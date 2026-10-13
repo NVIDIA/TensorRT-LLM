@@ -694,6 +694,48 @@ _EMBEDDING_ARCH_MAP = {
 }
 
 
+def _is_pplx_decider_checkpoint(model: str,
+                                revision: Optional[str] = None) -> bool:
+    """Return whether a checkpoint has the pplx-decider decision contract."""
+    try:
+        if os.path.isdir(model):
+            decision_config_file = os.path.join(model, "decision_config.json")
+            if not os.path.isfile(decision_config_file):
+                return False
+        else:
+            from transformers.utils.hub import cached_file
+            decision_config_file = cached_file(
+                model,
+                "decision_config.json",
+                revision=revision,
+                _raise_exceptions_for_missing_entries=False,
+                _raise_exceptions_for_connection_errors=False,
+            )
+            if decision_config_file is None:
+                return False
+
+        with open(decision_config_file) as config_file:
+            decision_config = json.load(config_file)
+    except (OSError, ValueError) as e:
+        logger.warning(
+            f"Could not read decision config for embedding routing ({model}): {e}"
+        )
+        return False
+
+    if not isinstance(decision_config, dict):
+        return False
+    from tensorrt_llm._torch.models.modeling_pplx_decider import \
+        PPLX_DECIDER_NUM_LABELS
+    codes = decision_config.get("codes")
+    token_ids = decision_config.get("token_ids")
+    return (decision_config.get("attention_mode") == "noncausal_full_attention"
+            and decision_config.get("pooling") == "last"
+            and isinstance(codes, list)
+            and len(codes) == PPLX_DECIDER_NUM_LABELS
+            and isinstance(token_ids, list)
+            and len(token_ids) == PPLX_DECIDER_NUM_LABELS)
+
+
 def _resolve_embedding_architecture_override(
         model: str,
         trust_remote_code: bool,
@@ -718,14 +760,19 @@ def _resolve_embedding_architecture_override(
 
     if not architectures:
         return None
-    target = _EMBEDDING_ARCH_MAP.get(architectures[0])
+    architecture = architectures[0]
+    if architecture == "Qwen3_5Model" and _is_pplx_decider_checkpoint(
+            model, revision):
+        target = "PplxDeciderForDecision"
+    else:
+        target = _EMBEDDING_ARCH_MAP.get(architecture)
     if target is None:
         return None
 
     # Best-effort sanity check on a local checkpoint: warn (don't fail) if the
     # sentence-transformers pooling layout is absent. The subcommand is explicit
     # embedding intent, so we still proceed with last-token pooling + L2 norm.
-    if os.path.isdir(model):
+    if target == "Qwen3ForTextEmbedding" and os.path.isdir(model):
         pooling_cfg = os.path.join(model, "1_Pooling", "config.json")
         if not os.path.isfile(pooling_cfg):
             logger.warning(
@@ -733,7 +780,7 @@ def _resolve_embedding_architecture_override(
                 "proceeding with last-token pooling + L2 normalize.")
 
     logger.info(f"Embedding routing: overriding architecture "
-                f"{architectures[0]} -> {target}")
+                f"{architecture} -> {target}")
     return {"architectures": [target]}
 
 

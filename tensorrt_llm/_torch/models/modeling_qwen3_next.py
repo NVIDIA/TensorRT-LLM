@@ -45,6 +45,7 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from ...logger import logger
 from ..attention.backends import AttentionMetadata
+from ..attention.backends.interface import PredefinedAttentionMask
 from ..distributed import (AllReduce, AllReduceFusionOp, AllReduceParams,
                            MoEAllReduce, MoEAllReduceParams, allgather)
 from ..model_config import ModelConfig
@@ -482,6 +483,8 @@ def _create_mlp(model_config, aux_stream, layer_idx):
 
 class Qwen3NextLinearDecoderLayer(DecoderLayer):
 
+    linear_attn_cls = Qwen3NextGatedDeltaNet
+
     def __init__(
         self,
         model_config: ModelConfig[Qwen3NextConfig],
@@ -491,8 +494,8 @@ class Qwen3NextLinearDecoderLayer(DecoderLayer):
         super().__init__()
         self.model_config = model_config
         config = model_config.pretrained_config
-        self.linear_attn = Qwen3NextGatedDeltaNet(model_config, aux_stream,
-                                                  layer_idx)
+        self.linear_attn = self.linear_attn_cls(model_config, aux_stream,
+                                                layer_idx)
 
         self.mapping = model_config.mapping
         self.enable_attention_dp = self.mapping.enable_attention_dp
@@ -660,6 +663,8 @@ class Qwen3NextAttention(Qwen3Attention):
 
 class Qwen3NextFullAttentionDecoderLayer(DecoderLayer):
 
+    attention_mask = PredefinedAttentionMask.CAUSAL
+
     def __init__(self, model_config: ModelConfig[Qwen3NextConfig],
                  layer_idx: int, aux_stream: torch.cuda.Stream):
         super().__init__()
@@ -757,6 +762,7 @@ class Qwen3NextFullAttentionDecoderLayer(DecoderLayer):
             self.fusion_config.POST_MOE_FUSION = False
 
         # Self Attention
+        kwargs.setdefault("attention_mask", self.attention_mask)
         hidden_states = self.self_attn(
             position_ids=position_ids,
             hidden_states=hidden_states,
@@ -1029,6 +1035,8 @@ ALL_DECODER_LAYER_TYPES = {
 
 class Qwen3NextModel(DecoderModel):
 
+    decoder_layer_types = ALL_DECODER_LAYER_TYPES
+
     def __init__(self, model_config: ModelConfig[Qwen3NextConfig]):
         super().__init__(model_config)
         config = self.model_config
@@ -1069,9 +1077,9 @@ class Qwen3NextModel(DecoderModel):
 
         layer_types = get_qwen3_hybrid_layer_types(pretrained_config)
         self.layers = nn.ModuleList([
-            ALL_DECODER_LAYER_TYPES[layer_types[layer_idx]](model_config,
-                                                            layer_idx,
-                                                            self.aux_stream)
+            self.decoder_layer_types[layer_types[layer_idx]](model_config,
+                                                             layer_idx,
+                                                             self.aux_stream)
             for layer_idx in range(pretrained_config.num_hidden_layers)
         ])
         self.num_hidden_layers = pretrained_config.num_hidden_layers
