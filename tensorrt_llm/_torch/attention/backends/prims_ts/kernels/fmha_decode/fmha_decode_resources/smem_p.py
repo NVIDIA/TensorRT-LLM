@@ -336,6 +336,10 @@ class SmemPResource(DecodeGenResourceBase):
         if cutlass.const_expr(guards_masked_rows):
             if safe_new_max == _neg_max_f32():
                 safe_new_max = Float32(0.0)
+        if cutlass.const_expr(cfg.store_softmax_stats):
+            # Statistics-enabled paths center the raw scores before scaling,
+            # avoiding cancellation against a rounded absolute exponent offset.
+            safe_new_max = Float32(0.0)
         # Not ``cute.math.fma``: the fused form makes ptxas spill in the callers.
         addend = Float32(-self.scale_softmax_log2 * safe_new_max)
         if cutlass.const_expr(self.cfg.use_fp8_pv):
@@ -525,6 +529,16 @@ class SmemPResource(DecodeGenResourceBase):
             prims.tcgen05_wait(kind=prims.Tcgen05Wait.LOAD)
             for score_idx in cutlass.range_constexpr(fragment_regs):
                 s_arr[score_idx] = pending_scores[score_idx]
+            if cutlass.const_expr(cfg.store_softmax_stats):
+                safe_new_max = new_max_arr[0]
+                if safe_new_max == _neg_max_f32():
+                    safe_new_max = Float32(0.0)
+                for pair_idx in cutlass.range_constexpr(fragment_regs // 2):
+                    idx = pair_idx * 2
+                    s_arr[idx], s_arr[idx + 1] = fadd2(
+                        (s_arr[idx], s_arr[idx + 1]), (-safe_new_max, -safe_new_max)
+                    )
+
             if cutlass.const_expr(dequantized):
                 self._scale_fragment_pairs(
                     s_arr, row_addends, row_multipliers, groups=1
@@ -979,6 +993,20 @@ class SmemPResource(DecodeGenResourceBase):
     ) -> None:
         """Compute P from S, stage its BMM2 operand, and publish local sums."""
         cfg = self.cfg
+        if cutlass.const_expr(cfg.store_softmax_stats):
+            # Keeps lanes own a row; the small-Q layouts interleave pairs of
+            # rows and repeat their scale groups across the K fragments.
+            for score_idx in cutlass.range_constexpr(cfg.num_s_regs_per_thread):
+                if cutlass.const_expr(cfg.use_keeps_mma_ab):
+                    scale_idx = 0
+                else:
+                    scale_idx = (score_idx // 4) % max(
+                        cfg.tile_size_q // 8, 1
+                    ) * 2 + score_idx % 2
+                safe_new_max = new_max_arr[scale_idx]
+                if safe_new_max == _neg_max_f32():
+                    safe_new_max = Float32(0.0)
+                s_arr[score_idx] = s_arr[score_idx] - safe_new_max
         if cutlass.const_expr(cfg.use_keeps_mma_ab):
             self._compute_keeps_p(
                 stage_info,

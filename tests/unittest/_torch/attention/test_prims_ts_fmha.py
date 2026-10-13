@@ -1008,6 +1008,8 @@ def test_mla_context_wrapper_reuses_plan_and_updates_chunk_offsets(
     assert wrapper.run.call_args.kwargs["out"] is output
     assert wrapper.run.call_args.args[1].shape == (9, 6, 192)
     assert wrapper.plan.call_args.kwargs["store_softmax_stats"]
+    assert wrapper.plan.call_args.kwargs["k_dtype"] == k.dtype
+    assert wrapper.plan.call_args.kwargs["v_dtype"] == v.dtype
     assert wrapper.run.call_args.kwargs["validate"] is False
 
 

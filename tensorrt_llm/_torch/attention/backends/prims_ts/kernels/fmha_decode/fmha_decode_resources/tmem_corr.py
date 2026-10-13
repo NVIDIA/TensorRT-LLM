@@ -21,6 +21,7 @@ split-KV reduction.
 """
 
 from dataclasses import dataclass
+import math
 
 import cutlass
 import cutlass.cute as cute
@@ -125,6 +126,7 @@ class TmemCorrResource(DecodeGenResourceBase):
     # the schedule waits and releases it, the epilogue only reads it. ``None``
     # without Sage attention.
     sage_v_scales_ref: Constexpr[SageVScalesResource | None] = None
+    softmax_stats_ptr: cute.Pointer | None = None
     seqlens_kv: cute.Pointer = None
     max_seq_len_kv: Constexpr[int] = 0
     seq_len_q: Int32 = None
@@ -621,6 +623,88 @@ class TmemCorrResource(DecodeGenResourceBase):
         return lse_val
 
     @cute.jit
+    def _store_separate_stats(
+        self, workspace_row: Int64, max_val: Float32, sum_val: Float32
+    ) -> None:
+        """Publish LSE and optional raw QK maximum / unscaled denominator."""
+        stride = 3 if self.cfg.store_softmax_stats else 1
+        ptr = self.partial_stats_ptr + workspace_row * Int64(stride)
+        ptr.store(self._separate_partial_lse(max_val, sum_val))
+        if cutlass.const_expr(self.cfg.store_softmax_stats):
+            raw_max = Float32(-Float32.inf)
+            if sum_val > Float32(0.0):
+                raw_max = max_val
+            denominator = sum_val
+            if cutlass.const_expr(self.cfg.use_fp8_pv):
+                denominator *= Float32(1.0 / 448.0)
+            (ptr + Int32(1)).store(raw_max)
+            (ptr + Int32(2)).store(denominator)
+
+    @cute.jit
+    def _store_final_stats(
+        self,
+        logical_h_k_idx: Int32,
+        logical_b_idx: Int32,
+        logical_row: Int32,
+        max_val: Float32,
+        sum_val: Float32,
+    ) -> None:
+        """Write one owned row after its final reduction and sink contribution."""
+        if cutlass.const_expr(self.cfg.store_softmax_stats):
+            row = _q_physical_output_row_from_logical(
+                self.cfg,
+                self.h_r,
+                self.num_heads_kv,
+                logical_b_idx,
+                logical_h_k_idx,
+                logical_row,
+                self.q_token_offset,
+            )
+            scaled_max = Float32(-Float32.inf)
+            if sum_val > Float32(0.0):
+                scaled_max = max_val * self.scale_softmax_log2 * Float32(math.log(2.0))
+            denominator = sum_val
+            if cutlass.const_expr(self.cfg.use_fp8_pv):
+                denominator *= Float32(1.0 / 448.0)
+            (self.softmax_stats_ptr + Int64(row) * Int64(2)).store(scaled_max)
+            (self.softmax_stats_ptr + Int64(row) * Int64(2) + Int64(1)).store(
+                denominator
+            )
+
+    @cute.jit
+    def _store_direct_swaps_stats(
+        self,
+        stage_info: StageInfo,
+        warp_idx: Int32,
+        lane_idx: Int32,
+        final_max: cutlass.Array,
+        reduced_sum: cutlass.Array,
+        num_scale_groups: Constexpr[int],
+    ) -> None:
+        if cutlass.const_expr(self.cfg.store_softmax_stats):
+            if warp_idx == Int32(0) and lane_idx < Int32(4 * num_scale_groups):
+                stats_idx = lane_idx >> Int32(2)
+                row = (
+                    (lane_idx & Int32(3)) * Int32(2)
+                    + (stats_idx >> Int32(1)) * Int32(8)
+                    + (stats_idx & Int32(1))
+                )
+                q_group = _logical_q_group_idx(self.cfg, stage_info, self.q_group_idx)
+                if _q_row_is_valid_for_seq(
+                    self.cfg, self.h_r, q_group, row, self.seq_len_q
+                ):
+                    head, batch = _logical_head_batch(
+                        stage_info, self.h_k_idx, self.b_idx
+                    )
+                    self._store_final_stats(
+                        head,
+                        batch,
+                        _q_tile_output_row_base(self.cfg, q_group) + row,
+                        final_max[stats_idx],
+                        reduced_sum[stats_idx],
+                    )
+
+    @cute.jit
     def _pack_separate_partial_o_pair(self, val0: Float32, val1: Float32) -> Int32:
         """Pack normalized separate partial O in the selected 16-bit type."""
 
@@ -1109,6 +1193,7 @@ class TmemCorrResource(DecodeGenResourceBase):
             reduce_row_idx,
             sum_val,
             max_val,
+            store_stats=reduce_col_idx == Int32(0),
         )
         dst_offset = dst_row_base + reduce_col_idx * Int32(self.cfg.o_dtype_bytes)
         final_o_dst = cutlass.inttoptr(
@@ -1132,6 +1217,7 @@ class TmemCorrResource(DecodeGenResourceBase):
         reduce_row_idx: Int32,
         sum_val: Float32,
         max_val: Float32,
+        store_stats: cutlass.Boolean = False,
     ) -> tuple[Int64, Float32]:
         """Resolve one logical row's output address and normalization once.
 
@@ -1153,6 +1239,11 @@ class TmemCorrResource(DecodeGenResourceBase):
             self.num_heads_kv,
             attention_sink_head_idx,
         )
+        if cutlass.const_expr(cfg.store_softmax_stats):
+            if store_stats:
+                self._store_final_stats(
+                    logical_h_k_idx, logical_b_idx, reduce_row_idx, max_val, sum_val
+                )
         # ``output_scale`` is the public bmm2_scale. Fold it into the final
         # normalization for every output dtype; split partials reach this
         # helper only after the cross-CTA reduction has completed.
@@ -2237,16 +2328,8 @@ class TmemCorrResource(DecodeGenResourceBase):
                         cta_idx_kv,
                         stats_row_idx,
                     )
-                    lse_ptr = cutlass.inttoptr(
-                        self.partial_stats_ptr.toint() + lse_row * Int64(4),
-                        mem_space=1,
-                        dtype=Float32,
-                    )
-                    lse_ptr.store(
-                        self._separate_partial_lse(
-                            final_max[stats_idx], reduced_sum[stats_idx]
-                        ),
-                        alignment=4,
+                    self._store_separate_stats(
+                        lse_row, final_max[stats_idx], reduced_sum[stats_idx]
                     )
                 elif cutlass.const_expr(enable_cluster):
                     cluster_owner = self._cluster_reduction_cta_for_row(
@@ -2595,6 +2678,7 @@ class TmemCorrResource(DecodeGenResourceBase):
         self,
         *,
         resolves: cutlass.Boolean,
+        stats_owner: cutlass.Boolean,
         logical_h_k_idx: Int32,
         logical_b_idx: Int32,
         logical_kv_idx: Int32,
@@ -2637,6 +2721,7 @@ class TmemCorrResource(DecodeGenResourceBase):
                     logical_output_row_idx,
                     denominator,
                     global_max,
+                    store_stats=valid_output_row & stats_owner,
                 )
         return valid_output_row, row_base, row_scale
 
@@ -2679,6 +2764,7 @@ class TmemCorrResource(DecodeGenResourceBase):
         logical_output_row_idx = q_row_offset + exchange_row_idx
         valid_output_row, row_base, row_scale = self._kv_tile_256_output_row_state(
             resolves=output_lane,
+            stats_owner=output_lane,
             logical_h_k_idx=logical_h_k_idx,
             logical_b_idx=logical_b_idx,
             logical_kv_idx=logical_kv_idx,
@@ -2773,15 +2859,7 @@ class TmemCorrResource(DecodeGenResourceBase):
             logical_output_row_idx,
         )
         if cutlass.const_expr(self.cfg.use_separate_reduction_kernel):
-            stats_ptr = cutlass.inttoptr(
-                self.partial_stats_ptr.toint() + stats_row * Int64(4),
-                mem_space=1,
-                dtype=Float32,
-            )
-            stats_ptr.store(
-                self._separate_partial_lse(global_max, denominator),
-                alignment=4,
-            )
+            self._store_separate_stats(stats_row, global_max, denominator)
         else:
             stats_ptr = cutlass.inttoptr(
                 self.partial_stats_ptr.toint() + stats_row * Int64(2 * 4),
@@ -3013,6 +3091,7 @@ class TmemCorrResource(DecodeGenResourceBase):
         logical_output_row_idx = q_row_offset + exchange_row_idx
         valid_output_row, row_base, row_scale = self._kv_tile_256_output_row_state(
             resolves=cutlass.Boolean(True),
+            stats_owner=owned_col_base == Int32(0),
             logical_h_k_idx=logical_h_k_idx,
             logical_b_idx=logical_b_idx,
             logical_kv_idx=logical_kv_idx,
@@ -3311,15 +3390,7 @@ class TmemCorrResource(DecodeGenResourceBase):
                         cta_idx_kv,
                         logical_output_row_idx,
                     )
-                    stats_ptr = cutlass.inttoptr(
-                        self.partial_stats_ptr.toint() + stats_row * Int64(4),
-                        mem_space=1,
-                        dtype=Float32,
-                    )
-                    stats_ptr.store(
-                        self._separate_partial_lse(final_max_0, reduced_sum_0),
-                        alignment=4,
-                    )
+                    self._store_separate_stats(stats_row, final_max_0, reduced_sum_0)
                 else:
                     stats_row = self._gmem_partial_row_offset(
                         logical_kv_idx,
@@ -3373,6 +3444,15 @@ class TmemCorrResource(DecodeGenResourceBase):
             self.num_heads_kv,
             attention_sink_head_idx,
         )
+        if cutlass.const_expr(cfg.store_softmax_stats):
+            if col_base == Int32(0) and valid_output_row:
+                self._store_final_stats(
+                    logical_h_k_idx,
+                    logical_b_idx,
+                    logical_output_row_idx,
+                    final_max_0,
+                    reduced_sum_0,
+                )
         # Apply public bmm2_scale in the final direct-output normalization.
         # The split-KV branch above returns before reaching this point, so its
         # partial O remains unscaled for the selected reducer.
@@ -3975,6 +4055,9 @@ class TmemCorrResource(DecodeGenResourceBase):
             )
             return
 
+        self._store_direct_swaps_stats(
+            stage_info, warp_idx, lane_idx, final_max, reduced_sum, num_scale_groups
+        )
         for scale_idx in cutlass.range_constexpr(num_scale_groups):
             # Direct final-output scales include both the reciprocal softmax
             # denominator and public bmm2_scale. Split partials returned above
@@ -4482,6 +4565,9 @@ class TmemCorrResource(DecodeGenResourceBase):
             )
             return
 
+        self._store_direct_swaps_stats(
+            stage_info, warp_idx, lane_idx, final_max, reduced_sum, num_scale_groups
+        )
         for scale_idx in cutlass.range_constexpr(num_scale_groups):
             # Direct final-output scales include both the reciprocal softmax
             # denominator and public bmm2_scale. Split partials returned above
