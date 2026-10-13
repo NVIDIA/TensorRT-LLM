@@ -37,6 +37,7 @@ TensorRT-LLM **VisualGen** provides a unified inference stack for diffusion mode
 | `Wan-AI/Wan2.2-TI2V-5B-Diffusers` | Text-to-Video, Image-to-Video |
 | `FastVideo/FastWan2.2-TI2V-5B-FullAttn-Diffusers` | Text-to-Video (3-step distilled) |
 | `Lightricks/LTX-2` | Text-to-Video (with Audio), Image-to-Video (with Audio) |
+| `Lightricks/LTX-2.3` | Text-to-Video (with Audio), Video Retake (with Audio) |
 | `Qwen/Qwen-Image` | Text-to-Image |
 | `Qwen/Qwen-Image-2512` | Text-to-Image |
 | `Qwen/Qwen-Image-Layered` | Image-to-Image |
@@ -65,6 +66,7 @@ Models are auto-detected from the checkpoint directory. Diffusers-format models 
 | **Wan 2.2** | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
 | **FastWan 2.2** | Yes | Yes | No | No | No | No | No | No | Yes | Yes | Yes | No | No | No | No |
 | **LTX-2** | Yes | Yes | Yes | Yes | No | Yes | Yes | No | No | Yes | Yes | Yes | Yes | No | Yes |
+| **LTX-2.3** | No | No | No | No | No | No | No | No | No | Yes | Yes | No | No | No | No |
 | **MiniMax-H3** | Yes | Yes | No | No | No | No | Yes | Yes | No | Yes | Yes | No | No | No | No |
 | **Qwen-Image** | Yes | Yes | Yes | Yes | No | Yes | Yes | No | Yes | Yes | Yes | Yes | Yes | No | No |
 | **Qwen-Image-Layered** | No | No | No | No | No | No | No | No | Yes | Yes | Yes | No | No | No | No |
