@@ -59,6 +59,7 @@ worker_config:
       max_batch_size: 16
     kv_cache_config:
       enable_block_reuse: false
+      use_kv_cache_manager_v2: false
       free_gpu_memory_fraction: 0.85
     moe_config:
       backend: TRTLLM
@@ -82,6 +83,7 @@ worker_config:
       max_batch_size: 16
     kv_cache_config:
       enable_block_reuse: false
+      use_kv_cache_manager_v2: false
       free_gpu_memory_fraction: 0.85
     moe_config:
       backend: TRTLLM
