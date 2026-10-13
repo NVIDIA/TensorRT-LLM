@@ -45,6 +45,7 @@ l0_cpu:
   - unittest/_torch/distributed
   - unittest/_torch/executor
   - unittest/test_startup.py
+  - unittest/test_unified_cache.py
   - unittest/_torch/disaggregation
   - unittest/_torch/peft
   - unittest/_torch/memory
