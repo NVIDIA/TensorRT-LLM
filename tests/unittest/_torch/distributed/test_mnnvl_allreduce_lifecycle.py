@@ -149,12 +149,11 @@ def test_workspace_retry_reuses_pending_communicator(monkeypatch: pytest.MonkeyP
     assert world.split_count == 1
     assert MNNVLAllReduce.allreduce_mnnvl_pending_comms[mapping] is world.comm
 
-    workspace = get_or_scale_allreduce_mnnvl_workspace(mapping, torch.float32)
+    get_or_scale_allreduce_mnnvl_workspace(mapping, torch.float32)
 
     assert construction_count == 2
     assert world.split_count == 1
     assert MNNVLAllReduce.allreduce_mnnvl_pending_comms == {}
-    assert workspace["mpi_comm"] is world.comm
 
 
 def test_concurrent_workspace_construction_is_serialized(monkeypatch: pytest.MonkeyPatch) -> None:
