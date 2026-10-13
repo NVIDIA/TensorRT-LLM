@@ -76,7 +76,7 @@ RUN --mount=type=bind,source=docker/common,target=/opt/docker/common \
 COPY constraints.txt /tmp/constraints.txt
 RUN --mount=type=cache,target=/root/.cache/pip \
     if [ -n "$GITHUB_MIRROR" ]; then \
-      export PIP_INDEX_URL="https://urm.nvidia.com/artifactory/api/pypi/pypi-remote/simple"; \
+      export PIP_INDEX_URL="https://artifactory.pdx.nvidia.com/artifactory/api/pypi/pypi-remote/simple"; \
     fi && \
     # numpy is deliberately absent from this list: the base image's scipy and pandas import
     # it, and constraints.txt no longer carries a pin that would put it back.
@@ -162,7 +162,7 @@ ARG BUILD_WHEEL_SCRIPT="scripts/build_wheel.py"
 RUN --mount=type=cache,target=/root/.cache/pip --mount=type=cache,target=${CCACHE_DIR} \
     --mount=type=secret,id=github_clone_token \
     if [ -n "$GITHUB_MIRROR" ]; then \
-      export PIP_INDEX_URL="https://urm.nvidia.com/artifactory/api/pypi/pypi-remote/simple"; \
+      export PIP_INDEX_URL="https://artifactory.pdx.nvidia.com/artifactory/api/pypi/pypi-remote/simple"; \
     fi && \
     # Authenticates `git submodule update` and the CMake FetchContent clones
     # (3rdparty/fetch_content.json) that this build pulls from github.com.
@@ -177,7 +177,7 @@ WORKDIR /app/tensorrt_llm
 ARG GITHUB_MIRROR=""
 RUN --mount=type=cache,target=/root/.cache/pip --mount=type=bind,from=wheel,source=/src/tensorrt_llm/build,target=/tmp/wheel \
     if [ -n "$GITHUB_MIRROR" ]; then \
-      export PIP_INDEX_URL="https://urm.nvidia.com/artifactory/api/pypi/pypi-remote/simple"; \
+      export PIP_INDEX_URL="https://artifactory.pdx.nvidia.com/artifactory/api/pypi/pypi-remote/simple"; \
     fi && \
     TRTLLM_WHEEL=$(find /tmp/wheel -maxdepth 1 -name 'tensorrt_llm*.whl' -print -quit) && \
     test -n "${TRTLLM_WHEEL}" && \

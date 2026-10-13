@@ -23,6 +23,7 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+from utils.util import skip_num_gpus_less_than, skip_single_gpu
 
 from tensorrt_llm._torch.visual_gen.attention_backend.parallel import (
     Attention2DAttention,
@@ -163,13 +164,13 @@ def _test_qwen_image_attention_parallel_topology(
 @pytest.mark.parametrize(
     "world_size,parallel,backend,topology",
     [
-        pytest.param(2, {"tp_size": 2}, "VANILLA", "tp", marks=pytest.mark.gpu2, id="tp2"),
+        pytest.param(2, {"tp_size": 2}, "VANILLA", "tp", marks=skip_single_gpu, id="tp2"),
         pytest.param(
             4,
             {"ring_size": 2, "ulysses_size": 2},
             "FA4",
             "ring",
-            marks=pytest.mark.gpu4,
+            marks=skip_num_gpus_less_than(4),
             id="ring2_ulysses2",
         ),
         pytest.param(
@@ -177,7 +178,7 @@ def _test_qwen_image_attention_parallel_topology(
             {"attn2d_size": (2, 1), "ulysses_size": 2},
             "FA4",
             "attn2d",
-            marks=pytest.mark.gpu4,
+            marks=skip_num_gpus_less_than(4),
             id="attn2d_2x1_ulysses2",
         ),
     ],
