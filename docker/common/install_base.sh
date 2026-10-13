@@ -88,7 +88,6 @@ init_ubuntu() {
     libstdc++-14-dev \
     libnuma1 \
     libnuma-dev \
-    libhwloc-dev \
     python3-dev \
     python3-pip \
     python-is-python3 \

@@ -12,6 +12,14 @@ if [[ ! -f "${LIBFABRIC_INSTALL_PATH}/include/rdma/fabric.h" ||
       ! -f "${LIBFABRIC_INSTALL_PATH}/lib/libfabric.so" ]]; then
     LIBFABRIC_INSTALL_PATH=""
 fi
+# Reuse the default MPI's hwloc in NGC PyTorch images for the EFA plugin.
+HWLOC_INSTALL_PATH="/usr/local/mpi"
+if [[ -n "${LIBFABRIC_INSTALL_PATH}" &&
+      -f "${HWLOC_INSTALL_PATH}/include/hwloc.h" &&
+      -f "${HWLOC_INSTALL_PATH}/lib/libhwloc.so" &&
+      -f "${HWLOC_INSTALL_PATH}/lib/pkgconfig/hwloc.pc" ]]; then
+    export PKG_CONFIG_PATH="${HWLOC_INSTALL_PATH}/lib/pkgconfig${PKG_CONFIG_PATH:+:${PKG_CONFIG_PATH}}"
+fi
 CUDA_PATH="/usr/local/cuda"
 NIXL_VERSION="v1.4.0"
 NIXL_REPO="https://github.com/ai-dynamo/nixl.git"

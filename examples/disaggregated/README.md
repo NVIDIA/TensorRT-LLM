@@ -57,9 +57,9 @@ If an unsupported backend is specified, NIXL will automatically fall back to UCX
 - For EFA-enabled AWS instances using a non-bundled version, install through the [AWS EFA installer](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/efa-start.html) (recommend using the latest version)
 
 **hwloc**
-- Ubuntu container builds install `libhwloc-dev` in `docker/common/install_base.sh`. For other base images, ensure the hwloc development files are installed before building the plugin.
+- NGC PyTorch container builds reuse the hwloc development files bundled with HPC-X under `/usr/local/mpi`. When the bundled EFA and hwloc development files are present, `docker/common/install_nixl.sh` prepends `/usr/local/mpi/lib/pkgconfig` to `PKG_CONFIG_PATH`; no extra `libhwloc-dev` installation is needed for this configuration.
 - hwloc is used to understand the underlying architecture to optimize application performance
-- **Suggested version:** 2.10.0 or newer
+- For other base images or custom MPI installations, provide compatible hwloc development files and ensure their `hwloc.pc` is discoverable through `PKG_CONFIG_PATH`.
 
 **Network Hardware Requirements:**
 - Validated compatibility with AWS EFA (Elastic Fabric Adapter)
@@ -77,8 +77,8 @@ Skip these steps if your container already includes the NIXL LIBFABRIC plugin fo
 1. **Install libfabric dependencies:**
    - Follow the installation instructions from the links above based on your system
 
-2. **Install hwloc:**
-   - Ubuntu container builds already include `libhwloc-dev`; install the equivalent development package if it is missing from your image
+2. **Provide hwloc development files:**
+   - Reuse the hwloc bundled with your MPI installation when available, and ensure its `hwloc.pc` is discoverable through `PKG_CONFIG_PATH`. Otherwise, install a compatible hwloc development package before rebuilding NIXL.
 
 3. **Reinstall NIXL after installing libfabric:**
    - After installing libfabric and hwloc, you must rebuild NIXL to generate the LIBFABRIC plugin against your custom path
