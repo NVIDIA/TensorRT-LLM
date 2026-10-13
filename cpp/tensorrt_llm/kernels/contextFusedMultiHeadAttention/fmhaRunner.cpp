@@ -211,6 +211,10 @@ void FusedMHARunnerV2::setupKernelParams(MHARunnerParams runnerParams)
                 mKernelParams.v_stride_in_bytes
                     = get_size_in_bytes(mFixedParams.numKvHeads * mFixedParams.headSizeV, mFixedParams.dataType);
             }
+            if (runnerParams.vStrideInBytes > 0)
+            {
+                mKernelParams.v_stride_in_bytes = runnerParams.vStrideInBytes;
+            }
         }
     }
 
