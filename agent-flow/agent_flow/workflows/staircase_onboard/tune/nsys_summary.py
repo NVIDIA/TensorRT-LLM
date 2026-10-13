@@ -75,11 +75,40 @@ def load(db: str):
     if "CUPTI_ACTIVITY_KIND_RUNTIME" in tables:
         for corr, start in cur.execute("SELECT correlationId, start FROM CUPTI_ACTIVITY_KIND_RUNTIME"):
             api[corr] = start
-    kernels = []
-    for start, end, corr, nameid in cur.execute(
-        "SELECT start, end, correlationId, shortName FROM CUPTI_ACTIVITY_KIND_KERNEL"
-    ):
-        kernels.append((start, end, api.get(corr, start), names.get(nameid, str(nameid))))
+    cols = {r[1] for r in cur.execute("PRAGMA table_info(CUPTI_ACTIVITY_KIND_KERNEL)")}
+    has_graph = {"graphId", "graphNodeId"} <= cols
+    query = "SELECT start, end, correlationId, shortName" + (", graphId, graphNodeId" if has_graph else "")
+    kernels, graph = [], defaultdict(list)
+    for row in cur.execute(query + " FROM CUPTI_ACTIVITY_KIND_KERNEL"):
+        start, end, corr, nameid = row[:4]
+        name = names.get(nameid, str(nameid))
+        if has_graph and row[4] is not None:
+            graph[row[4]].append((start, end, row[5], name))
+        else:
+            kernels.append((start, end, api.get(corr, start), name, False))
+    # Kernels replayed from a CUDA graph carry no runtime correlation: group them
+    # into replays (one chunk of distinct node ids per replay, by GPU start) and
+    # place the k-th replay at the k-th cudaGraphLaunch -- the host time that puts
+    # it inside an executor step. Attributing them by GPU start instead charges a
+    # replay to whichever step the host was in when it ran (the overlap scheduler
+    # runs the host one step ahead), which reads as idle that is not there.
+    launches = []
+    if "CUPTI_ACTIVITY_KIND_RUNTIME" in tables:
+        launches = sorted(r[0] for r in cur.execute(
+            "SELECT r.start FROM CUPTI_ACTIVITY_KIND_RUNTIME r JOIN StringIds s ON r.nameId = s.id "
+            "WHERE s.value LIKE 'cudaGraphLaunch%'"))  # fmt: skip
+    replays = []
+    for ks in graph.values():
+        ks.sort()
+        n = len({k[2] for k in ks})
+        for i in range(0, len(ks) - n + 1, n):
+            chunk = ks[i : i + n]
+            replays.append((chunk[0][0], chunk))
+    replays.sort(key=lambda r: r[0])
+    offset = max(0, len(launches) - len(replays))
+    for j, (first, chunk) in enumerate(replays):
+        when = launches[j + offset] if j + offset < len(launches) else first
+        kernels.extend((k[0], k[1], when, k[3], True) for k in chunk)
     return nvtx, kernels
 
 
@@ -111,8 +140,15 @@ def summarize(db: str, top: int = 15) -> dict:
         if s["k"]:
             by_kind[s["kind"]].append(s)
     for kind, ss in by_kind.items():
-        busy = [union_us([(k[0], k[1]) for k in s["k"]]) for s in ss]
-        span = [(max(k[1] for k in s["k"]) - min(k[0] for k in s["k"])) / 1e3 for s in ss]
+        def core(step):
+            # A step with a graph replay is judged on the replay: eager kernels
+            # launched in the same host range run around another step's replay.
+            g = [k for k in step["k"] if k[4]]
+            return g or step["k"]
+
+        busy = [union_us([(k[0], k[1]) for k in core(s)]) for s in ss]
+        span = [(max(k[1] for k in core(s)) - min(k[0] for k in core(s))) / 1e3 for s in ss]
+        eager = [sum((k[1] - k[0]) for k in s["k"] if not k[4]) / 1e3 for s in ss if any(k[4] for k in s["k"])]
         fam = defaultdict(float)
         names = defaultdict(lambda: [0.0, 0])
         for s in ss:
@@ -129,6 +165,8 @@ def summarize(db: str, top: int = 15) -> dict:
             "gpu_span_us": round(statistics.median(span), 1),
             "idle_in_span_pct": round(100 * (1 - statistics.median(busy) / max(statistics.median(span), 1e-9)), 1),
             "kernels_per_step": round(sum(len(s["k"]) for s in ss) / n, 1),
+            "graph_replay": any(k[4] for s in ss for k in s["k"]),
+            "eager_us_beside_replay": round(statistics.median(eager), 1) if eager else 0.0,
             "family_us_per_step": {f: round(t / n, 1) for f, t in sorted(fam.items(), key=lambda x: -x[1])},
             "top_kernels": [
                 {"name": nm[:120], "us_per_step": round(t / n, 1), "calls_per_step": round(c / n, 1)}
@@ -147,7 +185,8 @@ def render(summary: dict) -> str:
             "",
             f"## {kind}: {c['steps']} steps, gen reqs ~{c['gen_reqs_median']}, ctx tokens ~{c['ctx_tokens_median']}",
             f"GPU busy {c['gpu_busy_us']} us, span {c['gpu_span_us']} us, idle in span {c['idle_in_span_pct']}%, "
-            f"{c['kernels_per_step']} kernels/step",
+            f"{c['kernels_per_step']} kernels/step"
+            + (f" (graph replay; {c['eager_us_beside_replay']} us of eager kernels beside it)" if c.get("graph_replay") else ""),
             "",
             "| family | us/step |",
             "|---|---|",
