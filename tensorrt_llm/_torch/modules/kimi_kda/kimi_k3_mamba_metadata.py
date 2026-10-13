@@ -89,17 +89,17 @@ class KimiK3MambaMetadata(Mamba2Metadata):
             num_rows = 0
         assert 0 <= generation_start <= self.max_batch_size - num_rows
         generation_end = generation_start + num_rows
-        num_generations = len(accepted_draft_tokens)
-        assert generation_end <= num_generations <= self.max_batch_size
+        num_requests = len(accepted_draft_tokens)
+        assert generation_end <= num_requests <= self.max_batch_size
         self.prev_num_accepted_tokens.zero_()
-        if generation_start > 0 or generation_end < num_generations:
+        if generation_start > 0 or generation_end < num_requests:
             # Upload the full CPU counts in one copy, then overwrite rows
             # with GPU results below. Fresh pinned storage stays valid until
             # the asynchronous upload completes.
             staging = torch.tensor(
                 accepted_draft_tokens, dtype=torch.int32, pin_memory=prefer_pinned()
             )
-            self.prev_num_accepted_tokens[:num_generations].copy_(staging, non_blocking=True)
+            self.prev_num_accepted_tokens[:num_requests].copy_(staging, non_blocking=True)
         if previous_slots is not None and num_rows > 0:
             counts = self.prev_num_accepted_tokens[generation_start:generation_end]
             torch.index_select(previous_new_tokens_lens, 0, previous_slots, out=counts)
