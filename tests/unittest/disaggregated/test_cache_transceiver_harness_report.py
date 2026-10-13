@@ -42,6 +42,7 @@ from report import (
     emit_launch_vars,
     emit_ucx_env,
 )
+from submit import validate
 
 
 @pytest.fixture
@@ -99,6 +100,33 @@ def sample_cfg():
 # build_cases
 # ---------------------------------------------------------------------------
 class TestBuildCases:
+    @pytest.mark.parametrize("versions", [None, ["V1"]])
+    def test_python_only_without_v2_rejects_empty_matrix(self, sample_cfg, versions):
+        """A requested Python test cannot silently succeed without running a case."""
+        sample_cfg["test_matrix"]["combinations"] = [{"backend": "NIXL", "runtime": "PYTHON"}]
+        if versions is None:
+            sample_cfg["test_matrix"].pop("cache_manager_versions")
+        else:
+            sample_cfg["test_matrix"]["cache_manager_versions"] = versions
+        with pytest.raises(ValueError, match="no supported cases"):
+            build_cases(sample_cfg)
+
+    def test_dropped_combination_identified(self, sample_cfg, caplog):
+        """Warn about a requested runtime even when other combinations remain valid."""
+        sample_cfg["test_matrix"]["cache_manager_versions"] = ["V1"]
+        cases = build_cases(sample_cfg)
+        assert cases
+        assert "NIXL/PYTHON has no supported cache manager version" in caplog.text
+
+    def test_submit_rejects_empty_matrix_before_launch(self, sample_cfg, capsys):
+        """Submission fails before reserving GPUs for an unsupported matrix."""
+        sample_cfg["test_matrix"]["combinations"] = [{"backend": "NIXL", "runtime": "PYTHON"}]
+        sample_cfg["test_matrix"]["cache_manager_versions"] = ["V1"]
+        with pytest.raises(SystemExit) as error:
+            validate(sample_cfg)
+        assert error.value.code == 1
+        assert "Test matrix contains no supported cases" in capsys.readouterr().err
+
     def test_basic(self, sample_cfg):
         cases = build_cases(sample_cfg)
         labels = [c["label"] for c in cases]

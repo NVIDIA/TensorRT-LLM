@@ -243,9 +243,12 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         if not isinstance(kv_cache_manager, KVCacheManagerV2):
             raise ValueError(
                 "KvCacheTransceiverV2 does not support KV cache manager V1. "
-                "Set use_kv_cache_manager_v2=True to use "
-                "transceiver_runtime='PYTHON', or use "
-                "transceiver_runtime='CPP' with KV cache manager V1."
+                f"Selected manager: {type(kv_cache_manager).__name__}. "
+                "Use a compatible KVCacheManagerV2 configuration for "
+                "transceiver_runtime='PYTHON'; enabling "
+                "use_kv_cache_manager_v2=True does not override incompatible "
+                "model features. To use V1, select transceiver_runtime='CPP' "
+                "with use_kv_cache_manager_v2=False for a model that supports V1."
             )
         self._shutdown_lock = threading.Lock()
         self._shutdown_complete = False
