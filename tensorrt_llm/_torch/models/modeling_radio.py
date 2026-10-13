@@ -788,27 +788,6 @@ class VisionTransformer(nn.Module, MultimodalEncoderMixin):
             metadata_kwargs["kv_layout"] = "NHD"
         self.attn_metadata = self.metadata_cls(**metadata_kwargs)
 
-    def enable_blocks_cuda_graph(
-        self,
-        config: "MultimodalEncoderCudaGraphConfig",
-        *,
-        device: Optional[torch.device] = None,
-    ) -> None:
-        """Build the block-stack runner from `config` and capture startup graphs.
-
-        The caller must ensure the model parameters already live on `device`
-        (or on a CUDA device discoverable from `self.parameters()`); captures
-        are recorded immediately.
-        """
-        if self._blocks_graph_runner is not None:
-            return
-
-        graph_runner = self._build_blocks_graph_runner(config)
-        if device is None:
-            device = next(self.parameters()).device
-        graph_runner.capture_all(device)
-        self._blocks_graph_runner = graph_runner
-
     def clear_blocks_cuda_graph(self,
                                 *,
                                 release_nccl_window_owners: bool = True
@@ -1308,6 +1287,7 @@ class RADIOVisionModel(PreTrainedModel):
             inter_feature_normalizer=inter_feature_normalizer,
             model_config=self.model_config,
         )
+        self.radio_model.model._encoder_cuda_graph_config = encoder_cuda_graph_config
 
     def load_weights(self, weights):
         # Load radio_model weights for pytorch modules.

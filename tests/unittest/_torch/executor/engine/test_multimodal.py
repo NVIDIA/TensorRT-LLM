@@ -12,6 +12,7 @@ from _torch.executor.multimodal_utils import (
     make_mm_request,
 )
 
+from tensorrt_llm._torch.models.modeling_multimodal_encoder import MultimodalEncoderMixin
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import (
     MultimodalEncoderContractError,
     MultimodalModelMixin,
@@ -21,6 +22,7 @@ from tensorrt_llm._torch.pyexecutor.engine.multimodal import (
     resolve_bytes_per_mm_encoder_embedding,
     resolve_mm_encoder_output_budget,
     setup_mm_encoder_attn_metadata,
+    setup_mm_encoder_cuda_graphs,
     validate_mm_encoder_scheduling_compatibility,
 )
 from tensorrt_llm._torch.pyexecutor.llm_request import (
@@ -40,7 +42,11 @@ from tensorrt_llm.inputs.registry import (
     BaseMultimodalDummyInputsBuilder,
     MultimodalEncoderItemMetadata,
 )
-from tensorrt_llm.llmapi.llm_args import MultimodalConfig, MultimodalEncoderSchedulingPolicy
+from tensorrt_llm.llmapi.llm_args import (
+    MultimodalConfig,
+    MultimodalEncoderCudaGraphConfig,
+    MultimodalEncoderSchedulingPolicy,
+)
 
 # The item-scheduling surface is pure logic: no kernels, no device transfers.
 pytestmark = pytest.mark.cpu_only
@@ -53,6 +59,57 @@ def test_disabled_encoder_does_not_initialize_processor():
     model.mm_encoder = None
     setup_mm_encoder_attn_metadata(model, processor, 1024, None)
     processor.get_mm_max_tokens_per_item.assert_not_called()
+
+
+def test_encoder_graph_capture_follows_metadata_setup_and_runs_once() -> None:
+    events = []
+
+    class Encoder(torch.nn.Module, MultimodalEncoderMixin):
+        def __init__(self, name: str, config: MultimodalEncoderCudaGraphConfig | None) -> None:
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.empty(1))
+            self.name = name
+            self._encoder_cuda_graph_config = config
+            self._blocks_graph_runner = None
+            self.runner = Mock()
+            self.runner.capture_all.side_effect = lambda device: events.append(
+                (self.name, "capture", device)
+            )
+
+        def setup_attn_metadata(
+            self,
+            max_num_tokens: int,
+            attention_metadata_capacity: dict[str, int] | None = None,
+        ) -> None:
+            events.append((self.name, "metadata", max_num_tokens))
+
+        def _build_blocks_graph_runner(self, config: MultimodalEncoderCudaGraphConfig) -> Mock:
+            assert events.index((self.name, "metadata", 1024)) >= 0
+            assert config is self._encoder_cuda_graph_config
+            return self.runner
+
+    config = MultimodalEncoderCudaGraphConfig(buckets=[(256, 1)])
+    model = torch.nn.Module()
+    model.first = Encoder("first", config)
+    model.second = Encoder("second", config)
+    model.disabled = Encoder("disabled", None)
+    model.shared = model.first
+    model.unrelated = torch.nn.Linear(1, 1)
+
+    setup_mm_encoder_attn_metadata(model, object(), 1024, None)
+    setup_mm_encoder_cuda_graphs(model)
+    setup_mm_encoder_cuda_graphs(model)
+
+    assert events == [
+        ("first", "metadata", 1024),
+        ("second", "metadata", 1024),
+        ("disabled", "metadata", 1024),
+        ("first", "capture", torch.device("cpu")),
+        ("second", "capture", torch.device("cpu")),
+    ]
+    assert model.first._blocks_graph_runner is model.first.runner
+    assert model.second._blocks_graph_runner is model.second.runner
+    model.disabled.runner.capture_all.assert_not_called()
 
 
 def _bind_items(mm_item_scheduler: MultimodalItemScheduler, request, *, row_bytes: int = 8) -> None:

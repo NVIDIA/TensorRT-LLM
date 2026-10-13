@@ -2949,7 +2949,6 @@ class NemotronHMultimodalModel(MultimodalModelMixin, transformers.PreTrainedMode
         # Load vision encoder weights.
         if self.vision_encoder is not None:
             self.vision_encoder.load_weights(weights)
-            self.vision_encoder.enable_radio_cuda_graph()
 
         # Free vision encoder weights from the dict so the backing mmap pages can be released.
         if hasattr(weights, "mark_consumed"):
