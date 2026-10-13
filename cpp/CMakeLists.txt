@@ -241,6 +241,10 @@ endif()
 # or newer to align with that coverage.
 find_package(CUDAToolkit 13.0 REQUIRED COMPONENTS ${CUDA_TOOLKIT_COMPONENTS})
 
+if(NOT WIN32)
+  find_package(NUMA REQUIRED)
+endif()
+
 set(CMAKE_CUDA_RUNTIME_LIBRARY Static)
 
 resolve_dirs(CUDAToolkit_INCLUDE_DIRS "${CUDAToolkit_INCLUDE_DIRS}")

@@ -26,7 +26,7 @@ other live in ``test_sol_parity.py``.
 from __future__ import annotations
 
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
@@ -904,13 +904,16 @@ def test_sol_and_attention_quantization_are_mutually_exclusive(
 ) -> None:
     """A recipe the backend accepts on its own is still rejected next to SOL."""
 
-    AttentionConfig(backend=backend, quant_attention_config=QuantAttentionConfig(**quant_recipe))
-    with pytest.raises(ValidationError, match="SOL and quant_attention_config"):
+    with patch("tensorrt_llm.visual_gen.args.get_sm_version", return_value=100):
         AttentionConfig(
-            backend=backend,
-            quant_attention_config=QuantAttentionConfig(**quant_recipe),
-            sparse_attention_config=SolAttentionConfig(),
+            backend=backend, quant_attention_config=QuantAttentionConfig(**quant_recipe)
         )
+        with pytest.raises(ValidationError, match="SOL and quant_attention_config"):
+            AttentionConfig(
+                backend=backend,
+                quant_attention_config=QuantAttentionConfig(**quant_recipe),
+                sparse_attention_config=SolAttentionConfig(),
+            )
 
 
 @_CPU_ONLY

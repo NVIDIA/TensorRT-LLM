@@ -84,6 +84,7 @@ class TopK(nn.Module):
         row_ends: torch.Tensor | None = None,
         sequence_lengths: torch.Tensor | None = None,
         scan_lengths: torch.Tensor | None = None,
+        row_kv_lens: torch.Tensor | None = None,
         next_n: int = 1,
         max_seq_len: int | None = None,
         gvr_ext_kwargs: dict[str, torch.Tensor | None] | None = None,
@@ -100,6 +101,11 @@ class TopK(nn.Module):
             row_ends: Per-row exclusive ends for prefill.
             sequence_lengths: Per-request logical KV lengths for decode.
             scan_lengths: Per-request score-column lengths for decode.
+            row_kv_lens: Optional int32 logical KV lengths in uncompressed
+                token units, with shape ``[num_rows]`` on ``scores.device``,
+                for ragged decode. The kernel divides by ``compress_ratio``.
+                When present, dispatches the CUDA radix kernel;
+                uniform ``next_n`` implementations cannot represent this map.
             next_n: Number of decode rows per request.
             max_seq_len: Maximum decode score width used for GVR kernel tuning.
             gvr_ext_kwargs: GVR-only keyword arguments. ``gvr_prior_indices``
@@ -127,6 +133,7 @@ class TopK(nn.Module):
             scores,
             sequence_lengths,
             scan_lengths,
+            row_kv_lens,
             output_indices,
             next_n,
             max_seq_len,
@@ -244,6 +251,7 @@ class TopK(nn.Module):
         scores: torch.Tensor,
         sequence_lengths: torch.Tensor,
         scan_lengths: torch.Tensor,
+        row_kv_lens: torch.Tensor | None,
         output_indices: torch.Tensor,
         next_n: int,
         max_seq_len: int | None,
@@ -251,6 +259,27 @@ class TopK(nn.Module):
         radix_aux_indices: torch.Tensor | None,
         radix_aux_logits: torch.Tensor | None,
     ) -> torch.Tensor:
+        if row_kv_lens is not None:
+            if (
+                self.decode_implementation != TopKImplementation.CUDA_RADIX
+                and not torch.compiler.is_dynamo_compiling()
+            ):
+                logger.info_once(
+                    "Ragged per-row KV lengths require CUDA radix decode Top-K; "
+                    f"using it instead of {self.decode_implementation.value}.",
+                    key="ragged_decode_radix_fallback",
+                )
+            return self._forward_decode_radix(
+                scores,
+                sequence_lengths,
+                scan_lengths,
+                output_indices,
+                next_n,
+                radix_aux_indices,
+                radix_aux_logits,
+                row_kv_lens=row_kv_lens,
+            )
+
         if self.decode_implementation == TopKImplementation.TORCH:
             return self._forward_decode_torch(scores, scan_lengths, output_indices, next_n)
 
@@ -285,9 +314,12 @@ class TopK(nn.Module):
         next_n: int,
         radix_aux_indices: torch.Tensor | None,
         radix_aux_logits: torch.Tensor | None,
+        row_kv_lens: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        use_cute_dsl = self.decode_implementation == TopKImplementation.CUTE_DSL_RADIX and not (
-            self.compress_ratio > 1 and next_n > 1
+        use_cute_dsl = (
+            row_kv_lens is None
+            and self.decode_implementation == TopKImplementation.CUTE_DSL_RADIX
+            and not (self.compress_ratio > 1 and next_n > 1)
         )
         if use_cute_dsl:
             torch.ops.trtllm.cute_dsl_indexer_topk_decode(
@@ -311,6 +343,7 @@ class TopK(nn.Module):
             compress_ratio=self.compress_ratio,
             radix_aux_indices=radix_indices,
             radix_aux_logits=radix_values,
+            row_kv_lens=row_kv_lens,
         )
         return output_indices
 

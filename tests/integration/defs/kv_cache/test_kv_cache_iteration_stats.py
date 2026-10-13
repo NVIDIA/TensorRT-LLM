@@ -42,7 +42,7 @@ from tensorrt_llm.sampling_params import SamplingParams
 
 from ..conftest import llm_models_root
 
-MODEL = f"{llm_models_root()}/llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
+MODEL = f"{llm_models_root()}/Qwen3/Qwen3-0.6B"
 # Pin the host tier for all scenarios so cold-pool field coverage is deterministic.
 HOST_CACHE_SIZE = 64 << 20
 

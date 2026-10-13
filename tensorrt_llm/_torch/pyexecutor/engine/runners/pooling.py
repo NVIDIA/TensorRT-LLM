@@ -52,8 +52,6 @@ class PoolingRunner(NoKVCacheRunner):
         attn_metadata = inputs.get("attn_metadata")
         if attn_metadata is not None:
             attn_metadata.on_update_kv_lens()
-        if inputs.get("spec_metadata") is not None:
-            gather_ids = inputs["spec_metadata"].gather_ids
 
         outputs = self._model_caller(
             **inputs,

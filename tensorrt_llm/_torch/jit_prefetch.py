@@ -570,13 +570,14 @@ class JitPrefetcher:
         if not jdg.supported():
             jdg.log_unsupported_once("DeepGEMM lacks compile_only_fp8_fp4_gemm_nt or not SM100")
             return False
-        major, minor, sms = jdg.target()
+        tgt = jdg.target()
+        major, minor, sms = tgt[:3]
         env = {
             k: v
             for k, v in os.environ.items()
             if not k.startswith(("OMPI_", "PMIX_", "PMI_", "SLURM_", "UCX_", "MPI_"))
         }
-        env.update(CUDA_VISIBLE_DEVICES="", PYTHONNOUSERSITE="1", DG_JIT_COMPILE_ONLY="1")
+        env.update(CUDA_VISIBLE_DEVICES="", PYTHONNOUSERSITE="1")
         env.pop("PYTHONPATH", None)
         helper = os.path.join(
             os.path.dirname(os.path.abspath(__file__)), "jit_prefetch_dg_helper.py"
@@ -585,7 +586,7 @@ class JitPrefetcher:
         self._queues[jdg.KIND] = queue.PriorityQueue()
         self._spawn(
             jdg.KIND,
-            [sys.executable, "-u", helper, jdg.package_dir(), str(major), str(minor), str(sms)],
+            [sys.executable, "-u", helper, jdg.package_dir(), *(str(x) for x in tgt)],
             env,
             n,
         )

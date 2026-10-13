@@ -335,6 +335,9 @@ deployment, and not linked to users. The data we collect includes:
 
 Telemetry is automatically disabled in CI and test environments.
 
+If LLM startup fails, an initial report can still include the available environment
+and sanitized configuration information, marked as partial context.
+
 ### Opting Out of Telemetry Data Collection
 
 To disable telemetry data collection, use any of the following methods:

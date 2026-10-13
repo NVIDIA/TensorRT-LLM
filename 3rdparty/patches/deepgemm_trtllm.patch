@@ -1,147 +1,158 @@
 diff --git a/csrc/apis/attention.hpp b/csrc/apis/attention.hpp
-index 1abfd5c..6a10d9f 100644
+index d236ea4..799dd25 100644
 --- a/csrc/apis/attention.hpp
 +++ b/csrc/apis/attention.hpp
-@@ -273,6 +273,40 @@ static torch::Tensor get_paged_mqa_logits_metadata(const torch::Tensor& context_
-     return schedule_metadata;
+@@ -471,6 +471,42 @@ static torch::Tensor fp8_fp4_paged_sparse_mqa_logits(const std::tuple<torch::Ten
+     return logits;
  }
  
-+// Compile-only entry points for the SM100 MQA-logits kernels (see the
-+// matching *_compile_only in sm100_mqa_logits.hpp). Arguments are the values
-+// the real ops derive from their tensors.
++// Compile-only entry points for the SM100 MQA-logits kernels: the variants the
++// real ops would build, from the values they derive from their tensors, with
++// nothing allocated, loaded or launched. Each returns true if it compiled.
 +static bool compile_only_paged_mqa_logits_metadata(const int& next_n, const bool& is_varlen,
 +                                                   const int& num_sms) {
-+    DG_HOST_ASSERT(device_runtime->get_arch_major() == 10 and "compile-only is implemented for SM100 only");
-+    return sm100_paged_mqa_logits_metadata_compile_only(next_n, num_sms, true, is_varlen);
++    DG_HOST_ASSERT(jit->device.get_arch_major() == 10);
++    DG_HOST_ASSERT(not is_varlen or next_n == 1);
++    return sm100_paged_mqa_logits_metadata_compile_only(next_n, num_sms, is_varlen);
 +}
 +
 +static bool compile_only_mqa_logits(const int& num_heads, const int& head_dim,
 +                                    const bool& is_fp4, const bool& is_mx_sf,
-+                                    const bool& compressed_logits,
++                                    const bool& compressed_logits, const bool& clean_logits,
++                                    const bool& has_schedule_meta,
 +                                    const at::ScalarType& logits_dtype,
 +                                    const at::ScalarType& weights_dtype) {
-+    DG_HOST_ASSERT(device_runtime->get_arch_major() == 10 and "compile-only is implemented for SM100 only");
-+    DG_HOST_ASSERT(weights_dtype != torch::kFloat16 and "the FP16-weight variant is not covered");
-+    return sm100_mqa_logits_compile_only(num_heads, head_dim, is_mx_sf, compressed_logits,
-+                                         is_fp4 ? kPackedFP4 : torch::kFloat8_e4m3fn,
-+                                         logits_dtype, weights_dtype);
++    DG_HOST_ASSERT(jit->device.get_arch_major() == 10);
++    DG_HOST_ASSERT(weights_dtype != torch::kFloat16 and "FP16-weights MQA has its own kernel");
++    DG_HOST_ASSERT(not (clean_logits and compressed_logits));
++    return sm100_mqa_logits_compile_only(num_heads, head_dim, is_fp4 ? kPackedFP4 : torch::kFloat8_e4m3fn,
++                                         is_mx_sf, weights_dtype, logits_dtype,
++                                         compressed_logits, clean_logits, has_schedule_meta);
 +}
 +
-+static bool compile_only_paged_mqa_logits(const int& next_n, const int& num_heads,
-+                                          const int& head_dim, const int& block_kv,
-+                                          const bool& is_fp4, const bool& is_mx_sf,
++static bool compile_only_paged_mqa_logits(const int& next_n, const int& num_heads, const int& head_dim,
++                                          const int& block_kv, const bool& is_fp4, const bool& is_mx_sf,
 +                                          const bool& is_varlen,
 +                                          const at::ScalarType& logits_dtype,
 +                                          const at::ScalarType& weights_dtype) {
-+    DG_HOST_ASSERT(device_runtime->get_arch_major() == 10 and "compile-only is implemented for SM100 only");
-+    return sm100_paged_mqa_logits_compile_only(next_n, num_heads, head_dim, block_kv, is_mx_sf,
-+                                               true, is_varlen, 256, 16,
-+                                               is_fp4 ? kPackedFP4 : torch::kFloat8_e4m3fn,
-+                                               logits_dtype, weights_dtype);
++    DG_HOST_ASSERT(jit->device.get_arch_major() == 10);
++    DG_HOST_ASSERT(block_kv == 32 or block_kv == 64 or block_kv == 128);
++    return sm100_paged_mqa_logits_compile_only(next_n, num_heads, head_dim, block_kv,
++                                               is_fp4 ? kPackedFP4 : torch::kFloat8_e4m3fn, is_mx_sf,
++                                               weights_dtype, logits_dtype, is_varlen);
 +}
 +
- static torch::Tensor fp8_fp4_paged_mqa_logits(const std::tuple<torch::Tensor, std::optional<torch::Tensor>>& q,
-                                               const torch::Tensor& fused_kv_cache,
-                                               const torch::Tensor& weights,
-@@ -476,6 +510,18 @@ static void register_apis(pybind11::module_& m) {
-           py::arg("clean_logits") = true,
-           py::arg("max_seqlen_k") = 0,
-           py::arg("logits_dtype") = torch::kFloat32);
+ static torch::Tensor get_paged_mqa_logits_metadata(const torch::Tensor& context_lens, int block_kv, int num_sms, const std::optional<torch::Tensor>& indices) {
+     // NOTES: Only 2D context lens is supported for now
+     DG_HOST_ASSERT(context_lens.dim() == 2);
+@@ -711,6 +747,16 @@ static void register_apis(pybind11::module_& m) {
+           py::arg("recipe") = std::nullopt,
+           py::arg("compiled_dims") = "nk",
+           py::arg("disable_ue8m0_cast") = false);
 +    m.def("compile_only_paged_mqa_logits_metadata", &compile_only_paged_mqa_logits_metadata,
-+          py::arg("next_n"), py::arg("is_varlen"), py::arg("num_sms"),
-+          py::call_guard<py::gil_scoped_release>());
++          py::arg("next_n"), py::arg("is_varlen"), py::arg("num_sms"));
 +    m.def("compile_only_mqa_logits", &compile_only_mqa_logits,
 +          py::arg("num_heads"), py::arg("head_dim"), py::arg("is_fp4"), py::arg("is_mx_sf"),
-+          py::arg("compressed_logits"), py::arg("logits_dtype"), py::arg("weights_dtype"),
-+          py::call_guard<py::gil_scoped_release>());
++          py::arg("compressed_logits"), py::arg("clean_logits"), py::arg("has_schedule_meta"),
++          py::arg("logits_dtype"), py::arg("weights_dtype"));
 +    m.def("compile_only_paged_mqa_logits", &compile_only_paged_mqa_logits,
 +          py::arg("next_n"), py::arg("num_heads"), py::arg("head_dim"), py::arg("block_kv"),
 +          py::arg("is_fp4"), py::arg("is_mx_sf"), py::arg("is_varlen"),
-+          py::arg("logits_dtype"), py::arg("weights_dtype"),
-+          py::call_guard<py::gil_scoped_release>());
-     m.def("get_paged_mqa_logits_metadata", &get_paged_mqa_logits_metadata,
-           py::arg("context_lens"), py::arg("block_kv"), py::arg("num_sms"),
-           py::arg("indices") = std::nullopt);
++          py::arg("logits_dtype"), py::arg("weights_dtype"));
+     m.def("fp8_fp4_mqa_logits", &fp8_fp4_mqa_logits,
+           py::arg("q"), py::arg("kv"), py::arg("weights"),
+           py::arg("cu_seq_len_k_start"), py::arg("cu_seq_len_k_end"),
 diff --git a/csrc/apis/gemm.hpp b/csrc/apis/gemm.hpp
-index 902ae69..8f906f1 100644
+index e7ddd58..839ab69 100644
 --- a/csrc/apis/gemm.hpp
 +++ b/csrc/apis/gemm.hpp
-@@ -782,7 +782,60 @@ static void cublaslt_gemm_tt(const torch::Tensor& a, const torch::Tensor& b,
-     cublaslt_gemm_nt(a.transpose(0, 1), b, d, c);
+@@ -173,6 +173,25 @@ static void fp8_fp4_gemm_nt(const std::pair<torch::Tensor, torch::Tensor>& a,
+     }
  }
  
-+// Compile, without launching or loading, the SM100 FP8/FP4 1D1D kernel that
-+// `fp8_fp4_gemm_nt` would run for an [m, k] x [n, k]^T GEMM. Covers the
-+// arch-10 path of `fp8_fp4_gemm_nt` with int (UE8M0) scaling factors and
-+// K-major A and B, which is how TensorRT-LLM calls it. Returns True if it
-+// compiled, False if the variant was already in the cache.
-+static bool compile_only_m_grouped_fp8_fp4_gemm_nt_masked(const int& num_groups, const int& m,
-+                                                          const int& n, const int& k,
-+                                                          const int& expected_m,
-+                                                          const at::ScalarType& a_dtype,
-+                                                          const at::ScalarType& b_dtype,
-+                                                          const std::tuple<int, int, int>& recipe,
-+                                                          const std::string& compiled_dims) {
-+    DG_HOST_ASSERT(device_runtime->get_arch_major() == 10 and "compile-only is implemented for SM100 only");
-+    DG_HOST_ASSERT(expected_m > 0 and m > 0 and n > 0 and k > 0 and num_groups > 0);
-+    const auto gran_k = std::get<2>(recipe);
-+    return sm100_m_grouped_fp8_fp4_gemm_masked_1d1d_compile_only(num_groups, m, n, k, expected_m,
-+                                                                 a_dtype, b_dtype, torch::kBFloat16,
-+                                                                 gran_k, gran_k,
-+                                                                 cute::UMMA::Major::K, cute::UMMA::Major::K,
-+                                                                 compiled_dims);
-+}
-+
++// Compile-only `fp8_fp4_gemm_nt` on SM100 for K-major FP8 operands with packed
++// UE8M0 scales (the 1D1D recipe): builds the kernel the real call would build
++// for this (m, n, k) and dtypes, without tensors, loading or launching.
++// Returns true if it compiled, false if the kernel was already cached.
 +static bool compile_only_fp8_fp4_gemm_nt(const int& m, const int& n, const int& k,
 +                                         const at::ScalarType& a_dtype,
 +                                         const at::ScalarType& b_dtype,
 +                                         const at::ScalarType& d_dtype,
 +                                         const std::tuple<int, int, int>& recipe,
-+                                         const bool& with_accumulation,
 +                                         const std::string& compiled_dims) {
-+    DG_HOST_ASSERT(device_runtime->get_arch_major() == 10 and "compile-only is implemented for SM100 only");
++    DG_HOST_ASSERT(jit->device.get_arch_major() == 10);
 +    DG_HOST_ASSERT(d_dtype == torch::kBFloat16 or d_dtype == torch::kFloat);
-+    if (m == 0 or n == 0 or k == 0)
++    if (m == 0 or n == 0)
 +        return false;
-+    const auto gran_k = std::get<2>(recipe);
-+    return sm100_fp8_fp4_gemm_1d1d_compile_only(m, n, k, a_dtype, b_dtype, d_dtype,
-+                                                gran_k, gran_k,
-+                                                cute::UMMA::Major::K, cute::UMMA::Major::K,
-+                                                with_accumulation, compiled_dims);
++    return sm100_fp8_fp4_gemm_1d1d_compile_only(
++        m, n, k, a_dtype, b_dtype, d_dtype, std::get<2>(recipe), std::get<2>(recipe),
++        cute::UMMA::Major::K, cute::UMMA::Major::K, false, compiled_dims);
 +}
 +
+ static void fp8_fp4_gemm_nn(const std::pair<torch::Tensor, torch::Tensor>& a,
+                             const std::pair<torch::Tensor, torch::Tensor>& b,
+                             const torch::Tensor& d,
+@@ -317,6 +336,21 @@ static void m_grouped_fp8_fp4_gemm_nn_contiguous(const std::pair<torch::Tensor,
+                                          use_psum_layout, ensure_zero_padding, std::nullopt);
+ }
+ 
++// Compile-only `m_grouped_fp8_fp4_gemm_nt_masked` on SM100 for K-major FP8
++// operands with packed UE8M0 scales: the kernel the real call would build for
++// this (G, M, N, K, expected_m), without tensors, loading or launching.
++static bool compile_only_m_grouped_fp8_fp4_gemm_nt_masked(
++        const int& num_groups, const int& m, const int& n, const int& k, const int& expected_m,
++        const at::ScalarType& a_dtype, const at::ScalarType& b_dtype,
++        const std::tuple<int, int, int>& recipe, const std::string& compiled_dims) {
++    DG_HOST_ASSERT(jit->device.get_arch_major() == 10);
++    DG_HOST_ASSERT(expected_m > 0 and m > 0 and n > 0 and k > 0 and num_groups > 0);
++    return sm100_m_grouped_fp8_fp4_gemm_masked_1d1d_compile_only(
++        num_groups, m, n, k, expected_m, a_dtype, b_dtype, torch::kBFloat16,
++        std::get<2>(recipe), std::get<2>(recipe),
++        cute::UMMA::Major::K, cute::UMMA::Major::K, compiled_dims);
++}
++
+ static void m_grouped_fp8_fp4_gemm_nt_masked(const std::pair<torch::Tensor, torch::Tensor>& a,
+                                              const std::pair<torch::Tensor, torch::Tensor>& b,
+                                              const torch::Tensor& d,
+@@ -991,6 +1025,11 @@ static void batched_symm(const torch::Tensor& a, const torch::Tensor& b,
  static void register_apis(pybind11::module_& m) {
+ 
+     // FP8 FP4 GEMMs
 +    m.def("compile_only_fp8_fp4_gemm_nt", &compile_only_fp8_fp4_gemm_nt,
 +          py::arg("m"), py::arg("n"), py::arg("k"),
 +          py::arg("a_dtype"), py::arg("b_dtype"), py::arg("d_dtype"),
 +          py::arg("recipe") = std::make_tuple(1, 1, 128),
-+          py::arg("with_accumulation") = false,
-+          py::arg("compiled_dims") = "nk",
-+          py::call_guard<py::gil_scoped_release>());
++          py::arg("compiled_dims") = "nk");
+     m.def("fp8_fp4_gemm_nt", &fp8_fp4_gemm_nt,
+           py::arg("a"), py::arg("b"), py::arg("d"),
+           py::arg("c") = std::nullopt, py::arg("recipe") = std::nullopt,
+@@ -1036,6 +1075,11 @@ static void register_apis(pybind11::module_& m) {
+           py::arg("disable_ue8m0_cast") = false,
+           py::arg("use_psum_layout") = false,
+           py::arg("ensure_zero_padding") = true);
 +    m.def("compile_only_m_grouped_fp8_fp4_gemm_nt_masked", &compile_only_m_grouped_fp8_fp4_gemm_nt_masked,
 +          py::arg("num_groups"), py::arg("m"), py::arg("n"), py::arg("k"), py::arg("expected_m"),
 +          py::arg("a_dtype"), py::arg("b_dtype"),
 +          py::arg("recipe") = std::make_tuple(1, 1, 128),
-+          py::arg("compiled_dims") = "nk",
-+          py::call_guard<py::gil_scoped_release>());
- 
- #if DG_FP8_COMPATIBLE and DG_TENSORMAP_COMPATIBLE
-     // FP8 FP4 GEMMs
-diff --git a/csrc/apis/mega.hpp b/csrc/apis/mega.hpp
-index 6466f30..bbe258d 100644
---- a/csrc/apis/mega.hpp
-+++ b/csrc/apis/mega.hpp
-@@ -32,6 +32,32 @@ static int get_block_m_for_mega_moe(
++          py::arg("compiled_dims") = "nk");
+     m.def("m_grouped_fp8_fp4_gemm_nt_masked", &m_grouped_fp8_fp4_gemm_nt_masked,
+           py::arg("a"), py::arg("b"), py::arg("d"), py::arg("masked_m"),
+           py::arg("expected_m"), py::arg("recipe") = std::nullopt,
+diff --git a/csrc/apis/mega_moe.hpp b/csrc/apis/mega_moe.hpp
+index d440ad1..716801d 100644
+--- a/csrc/apis/mega_moe.hpp
++++ b/csrc/apis/mega_moe.hpp
+@@ -35,6 +35,34 @@ static int get_block_m_for_mega_moe(
      return block_m;
  }
  
-+// Ring capacities of the symmetric buffer: worst-case live pool blocks over all
-+// candidate BLOCK_M, and the matching SF ring. Shared by the buffer sizing and
-+// the compile-only entry so both see the values the kernel is built with.
-+static std::pair<int, int> get_mega_moe_ring_tokens(const int& num_sms, const int& num_experts_per_rank,
-+                                                    const int& num_max_routed_tokens,
-+                                                    const int& hidden, const int& intermediate_hidden,
-+                                                    const bool& with_sf) {
++// Token ring capacity (the worst-case live pool blocks over all candidate
++// BLOCK_M, mirroring the kernel assert) and SF ring capacity of the symmetric
++// buffer. The kernel is compiled with both.
++static std::pair<int, int> get_ring_tokens_for_mega_moe(
++    const int& num_sms, const int& num_experts_per_rank, const int& num_max_routed_tokens,
++    const int& hidden, const int& intermediate_hidden, const bool& with_sf) {
++    // Iterate all block candidates to get the maximum ring size
 +    int num_ring_tokens = 0;
 +    for (const auto& block_m: layout::kCandidateBlockM) {
 +        const auto num_pool_blocks = ceil_div(num_max_routed_tokens, block_m) + num_experts_per_rank;
@@ -150,6 +161,8 @@ index 6466f30..bbe258d 100644
 +        num_ring_tokens = std::max(num_ring_tokens, num_live_pool_blocks * block_m);
 +    }
 +    num_ring_tokens = math::align(num_ring_tokens, layout::kLCMCandidateBlockM);
++
++    // Compute num_sf_ring_tokens (max across all candidate block sizes)
 +    int num_sf_ring_tokens = 0;
 +    if (with_sf) {
 +        for (auto block_m: layout::kCandidateBlockM) {
@@ -164,7 +177,7 @@ index 6466f30..bbe258d 100644
  static std::tuple<int64_t, std::function<std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
                                                      torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
                                                      torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>(const torch::Tensor&)>>
-@@ -55,29 +81,11 @@ get_symm_buffer_size_for_mega_moe(
+@@ -62,29 +90,14 @@ get_symm_buffer_size_for_mega_moe(
      // Shared
      const int shared_intermediate_hidden = intermediate_hidden * num_shared_experts;
  
@@ -181,7 +194,7 @@ index 6466f30..bbe258d 100644
      // Parse MMA type
      const auto mma_kind = parse_mma_kind(mma_type);
      const auto with_sf = is_mma_with_sf(mma_kind);
--
+ 
 -    // Compute num_sf_ring_tokens (max across all candidate block sizes)
 -    int num_sf_ring_tokens = 0;
 -    if (with_sf) {
@@ -191,315 +204,169 @@ index 6466f30..bbe258d 100644
 -                layout::get_num_sf_ring_tokens(num_ring_tokens, block_m));
 -        }
 -    }
-+    const auto [num_ring_tokens, num_sf_ring_tokens] = get_mega_moe_ring_tokens(
++    const auto ring_tokens = get_ring_tokens_for_mega_moe(
 +        num_sms, num_experts_per_rank, num_max_routed_tokens, hidden, intermediate_hidden, with_sf);
++    const int num_ring_tokens = ring_tokens.first;
++    const int num_sf_ring_tokens = ring_tokens.second;
  
      // All buffers
      const auto mega_buffer = layout::MegaMoEBuffer(
-@@ -155,6 +163,35 @@ get_symm_buffer_size_for_mega_moe(
+@@ -162,6 +175,45 @@ get_symm_buffer_size_for_mega_moe(
      return {mega_buffer.get_num_bytes(), slice_input_buffers};
  }
  
-+// Compile-only twin of fp8_fp4_mega_moe for one per-rank token count: same
-+// config, ring sizes and activation handling, no tensors.
-+static bool compile_only_fp8_fp4_mega_moe(const int& num_ranks, const int& num_experts,
-+                                          const int& num_max_tokens_per_rank, const int& num_topk,
-+                                          const int& num_tokens, const int& hidden,
-+                                          const int& intermediate_hidden,
-+                                          const int& num_shared_experts,
-+                                          const std::string& activation,
-+                                          const std::optional<float>& activation_clamp_opt,
-+                                          const bool& fast_math,
-+                                          const std::optional<float>& situ_beta_opt,
-+                                          const std::optional<float>& situ_linear_beta_opt) {
-+    DG_HOST_ASSERT(device_runtime->get_arch_major() == 10 and "compile-only is implemented for SM100 only");
++// Compile-only `fp8_fp4_mega_moe` on SM100 for one per-rank token count: the
++// ring sizes, block config and source the real call derives from its symmetric
++// buffer and weights, without tensors, loading or launching.
++// `num_max_tokens_per_rank` is the buffer's (aligned) value and `mma_type` the
++// buffer's: `fp8xfp4` for packed FP4 weights, `fp8xfp8` for FP8 weights.
++// Returns true if it compiled, false if the kernel was already cached.
++static bool compile_only_fp8_fp4_mega_moe(
++    const int& num_ranks, const int& num_experts,
++    const int& num_max_tokens_per_rank, const int& num_topk,
++    const int& num_tokens, const int& hidden, const int& intermediate_hidden,
++    const int& num_shared_experts,
++    const std::string& activation,
++    const std::optional<float>& activation_clamp_opt,
++    const bool& fast_math,
++    const std::optional<float>& situ_beta_opt,
++    const std::optional<float>& situ_linear_beta_opt,
++    const std::string& mma_type) {
++    DG_HOST_ASSERT(jit->device.get_arch_major() == 10);
++    DG_HOST_ASSERT(mma_type == "fp8xfp4" or mma_type == "fp8xfp8");
 +    DG_HOST_ASSERT(activation == "swiglu" or activation == "situ");
-+    DG_HOST_ASSERT(num_tokens <= num_max_tokens_per_rank and num_experts % num_ranks == 0);
++    DG_HOST_ASSERT(num_ranks > 0 and num_experts % num_ranks == 0 and num_shared_experts >= 0);
++    DG_HOST_ASSERT(0 <= num_tokens and num_tokens <= num_max_tokens_per_rank);
++    const auto use_situ = activation == "situ";
++    DG_HOST_ASSERT(not use_situ or mma_type == "fp8xfp4");
 +    const auto num_experts_per_rank = num_experts / num_ranks;
 +    const auto num_active_topk = std::min(num_topk, num_experts_per_rank);
-+    const auto [num_ring_tokens, num_sf_ring_tokens] = get_mega_moe_ring_tokens(
-+        device_runtime->get_num_sms(), num_experts_per_rank,
++    const auto ring_tokens = get_ring_tokens_for_mega_moe(
++        runtime->get_num_sms(), num_experts_per_rank,
 +        num_max_tokens_per_rank * num_ranks * num_active_topk,
 +        hidden, intermediate_hidden, true);
 +    return sm100_fp8_fp4_mega_moe_compile_only(
 +        num_ranks, num_max_tokens_per_rank, num_experts_per_rank, num_shared_experts,
 +        num_tokens, num_topk, hidden, intermediate_hidden,
-+        num_ring_tokens, num_sf_ring_tokens,
++        ring_tokens.first, ring_tokens.second,
 +        activation_clamp_opt.value_or(std::numeric_limits<float>::infinity()), fast_math,
-+        activation == "situ", situ_beta_opt.value_or(0.0f), situ_linear_beta_opt.value_or(0.0f));
++        use_situ, situ_beta_opt.value_or(0.0f), situ_linear_beta_opt.value_or(0.0f),
++        mma_type == "fp8xfp8" ? torch::kFloat8_e4m3fn : kPackedFP4);
 +}
 +
  static void fp8_fp4_mega_moe(
      const torch::Tensor& y,
      const std::tuple<torch::Tensor, torch::Tensor>& l1_weights_tuple,
-@@ -412,6 +449,14 @@ static void register_apis(pybind11::module_& m) {
-     m.def("get_block_m_for_mega_moe", &get_block_m_for_mega_moe);
+@@ -424,6 +476,17 @@ static void register_apis(pybind11::module_& m) {
      m.def("get_symm_buffer_size_for_mega_moe", &get_symm_buffer_size_for_mega_moe);
+     m.def("fp4_fp4_mega_moe", &nvfp4::fp4_fp4_mega_moe);
      m.def("fp8_fp4_mega_moe", &fp8_fp4_mega_moe);
 +    m.def("compile_only_fp8_fp4_mega_moe", &compile_only_fp8_fp4_mega_moe,
-+          py::arg("num_ranks"), py::arg("num_experts"), py::arg("num_max_tokens_per_rank"),
-+          py::arg("num_topk"), py::arg("num_tokens"), py::arg("hidden"),
-+          py::arg("intermediate_hidden"), py::arg("num_shared_experts") = 0,
-+          py::arg("activation") = "swiglu", py::arg("activation_clamp") = std::nullopt,
-+          py::arg("fast_math") = true, py::arg("situ_beta") = std::nullopt,
-+          py::arg("situ_linear_beta") = std::nullopt,
-+          py::call_guard<py::gil_scoped_release>());
++          pybind11::arg("num_ranks"), pybind11::arg("num_experts"),
++          pybind11::arg("num_max_tokens_per_rank"), pybind11::arg("num_topk"),
++          pybind11::arg("num_tokens"), pybind11::arg("hidden"),
++          pybind11::arg("intermediate_hidden"), pybind11::arg("num_shared_experts") = 0,
++          pybind11::arg("activation") = "swiglu",
++          pybind11::arg("activation_clamp") = std::nullopt,
++          pybind11::arg("fast_math") = true,
++          pybind11::arg("situ_beta") = std::nullopt,
++          pybind11::arg("situ_linear_beta") = std::nullopt,
++          pybind11::arg("mma_type") = "fp8xfp4");
      m.def("bf16_mega_moe", &bf16_mega_moe);
- #endif
  }
-diff --git a/csrc/apis/runtime.hpp b/csrc/apis/runtime.hpp
-index 58fef94..96e1cb0 100644
---- a/csrc/apis/runtime.hpp
-+++ b/csrc/apis/runtime.hpp
-@@ -9,6 +9,12 @@
- namespace deep_gemm::runtime {
- 
- static void register_apis(pybind11::module_& m) {
-+    // Compile-only mode: pin the target arch and SM count so heuristics and
-+    // the NVCC arch flag never query a CUDA device. Must be called before the
-+    // first compile. Pair with DG_JIT_COMPILE_ONLY=1 in the environment.
-+    m.def("set_compile_target", [&](const int& arch_major, const int& arch_minor, const int& num_sms) {
-+        device_runtime->set_compile_target(arch_major, arch_minor, num_sms);
-+    }, py::arg("arch_major"), py::arg("arch_minor"), py::arg("num_sms"));
-     m.def("set_num_sms", [&](const int& new_num_sms) {
-         device_runtime->set_num_sms(new_num_sms);
-     });
-diff --git a/csrc/jit/compiler.hpp b/csrc/jit/compiler.hpp
-index 42beaf5..884c556 100644
---- a/csrc/jit/compiler.hpp
-+++ b/csrc/jit/compiler.hpp
-@@ -59,6 +59,12 @@ public:
-             flags += " --ptxas-options=--verbose,--warn-on-local-memory-usage";
-         if (get_env("DG_JIT_WITH_LINEINFO", 0))
-             flags += " -Xcompiler -rdynamic -lineinfo";
-+
-+        // Allow overriding the in-kernel barrier timeout, see `comm/barrier.cuh`
-+        // NOTES: `flags` is part of the kernel signature, so changing this value
-+        // naturally invalidates the JIT cache
-+        if (const auto barrier_timeout_seconds = get_env("DG_JIT_BARRIER_TIMEOUT_SECONDS", 0); barrier_timeout_seconds > 0)
-+            flags += fmt::format(" -DDG_BARRIER_TIMEOUT_SECONDS={}", barrier_timeout_seconds);
-     }
- 
-     virtual ~Compiler() = default;
-@@ -97,14 +103,39 @@ public:
-         fsync_path(path);
-     }
- 
--    std::shared_ptr<KernelRuntime> build(const std::string& name, const std::string& code) const {
-+    std::filesystem::path get_cache_dir(const std::string& name, const std::string& code) const {
-         const auto kernel_signature = fmt::format("{}$${}$${}$${}", name, signature, flags, code);
--        const auto dir_path = cache_dir_path / "cache" / fmt::format("kernel.{}.{}", name, get_hex_digest(kernel_signature));
-+        return cache_dir_path / "cache" / fmt::format("kernel.{}.{}", name, get_hex_digest(kernel_signature));
-+    }
-+
-+    // Compile `code` into the on-disk cache entry `build` would use, without
-+    // loading the cubin. Returns true if it compiled, false if already cached.
-+    // Needs no CUDA context.
-+    bool build_only(const std::string& name, const std::string& code) const {
-+        const auto dir_path = get_cache_dir(name, code);
-+        if (KernelRuntime::check_validity(dir_path))
-+            return false;
-+        compile_into(code, dir_path);
-+        return true;
-+    }
-+
-+    std::shared_ptr<KernelRuntime> build(const std::string& name, const std::string& code) const {
-+        const auto dir_path = get_cache_dir(name, code);
- 
-         // Hit the runtime cache
-         if (const auto runtime = kernel_runtime_cache->get(dir_path); runtime != nullptr)
-             return runtime;
- 
-+        compile_into(code, dir_path);
-+
-+        // Put into the runtime cache
-+        const auto runtime = kernel_runtime_cache->get(dir_path);
-+        DG_HOST_ASSERT(runtime != nullptr);
-+        return runtime;
-+    }
-+
-+    void compile_into(const std::string& code, const std::filesystem::path& dir_path) const {
-+
-         // Compile into a temporary directory, then atomically rename the whole directory
-         // NOTES: renaming a directory is atomic on both local and distributed filesystems,
-         // avoiding the stale inode issue that occurs when renaming individual files
-@@ -141,11 +172,6 @@ public:
-             // on the same parent directory, causing stale directory entries
-             safe_remove_all(tmp_dir_path);
-         }
--
--        // Put into the runtime cache
--        const auto runtime = kernel_runtime_cache->get(dir_path);
--        DG_HOST_ASSERT(runtime != nullptr);
--        return runtime;
-     }
- 
-     static void disassemble(const std::filesystem::path &cubin_path, const std::filesystem::path &sass_path) {
-diff --git a/csrc/jit/device_runtime.hpp b/csrc/jit/device_runtime.hpp
-index d433558..72895df 100644
---- a/csrc/jit/device_runtime.hpp
-+++ b/csrc/jit/device_runtime.hpp
-@@ -42,6 +42,12 @@ public:
-         // when the workspace tensor is destructed after CUDA driver shutdown.
-         use_temp_cublaslt_workspace = get_env<int>("DG_USE_TEMP_CUBLASLT_WORKSPACE", 0) > 0;
- 
-+        // A compile-only process (DG_JIT_COMPILE_ONLY=1) never launches, so it
-+        // creates neither the cuBLASLt handle nor its CUDA workspace.
-+        compile_only_process = get_env<int>("DG_JIT_COMPILE_ONLY", 0) > 0;
-+        if (compile_only_process)
-+            return;
-+
-         if (not use_pytorch_managed_cublaslt_handle)
-             DG_CUBLASLT_CHECK(cublasLtCreate(&cublaslt_handle));
- 
-@@ -49,8 +55,10 @@ public:
-             cublaslt_workspace = torch::empty({kCublasLtWorkspaceSize}, dtype(torch::kByte).device(at::kCUDA));
-     }
- 
-+    bool compile_only_process = false;
-+
-     ~DeviceRuntime() noexcept(false) {
--        if (not use_pytorch_managed_cublaslt_handle)
-+        if (not compile_only_process and not use_pytorch_managed_cublaslt_handle)
-             DG_CUBLASLT_CHECK(cublasLtDestroy(cublaslt_handle));
-     }
- 
-@@ -70,7 +78,21 @@ public:
-         return cublaslt_workspace;
-     }
- 
-+    // Compile-only target override. When set, arch and SM count come from here
-+    // and no CUDA device is queried (see `set_compile_target`).
-+    int target_major = 0, target_minor = 0, target_num_sms = 0;
-+
-+    void set_compile_target(const int& major, const int& minor, const int& sms) {
-+        DG_HOST_ASSERT(major > 0 and sms > 0);
-+        target_major = major, target_minor = minor, target_num_sms = sms;
-+    }
-+
-+    bool has_compile_target() const {
-+        return target_major > 0;
-+    }
-+
-     std::shared_ptr<cudaDeviceProp> get_prop() {
-+        DG_HOST_ASSERT(not has_compile_target() and "device properties are unavailable in compile-only mode");
-         if (cached_prop == nullptr) {
-             int device_idx;
-             cudaDeviceProp prop;
-@@ -82,6 +104,8 @@ public:
-     }
- 
-     std::pair<int, int> get_arch_pair() {
-+        if (has_compile_target())
-+            return {target_major, target_minor};
-         const auto prop = get_prop();
-         return {prop->major, prop->minor};
-     }
-@@ -116,13 +140,13 @@ public:
-     }
- 
-     void set_num_sms(const int& new_num_sms) {
--        DG_HOST_ASSERT(0 <= new_num_sms and new_num_sms <= get_prop()->multiProcessorCount);
-+        DG_HOST_ASSERT(0 <= new_num_sms and new_num_sms <= (has_compile_target() ? target_num_sms : get_prop()->multiProcessorCount));
-         num_sms = new_num_sms;
-     }
- 
-     int get_num_sms() {
-         if (num_sms == 0)
--            num_sms = get_prop()->multiProcessorCount;
-+            num_sms = has_compile_target() ? target_num_sms : get_prop()->multiProcessorCount;
-         return num_sms;
-     }
  
 diff --git a/csrc/jit_kernels/impls/sm100_fp8_fp4_gemm_1d1d.hpp b/csrc/jit_kernels/impls/sm100_fp8_fp4_gemm_1d1d.hpp
-index 9e4ba58..de11992 100644
+index 0e637da..92e4ce7 100644
 --- a/csrc/jit_kernels/impls/sm100_fp8_fp4_gemm_1d1d.hpp
 +++ b/csrc/jit_kernels/impls/sm100_fp8_fp4_gemm_1d1d.hpp
-@@ -90,6 +90,54 @@ static void __instantiate_kernel() {{
-     }
- };
+@@ -33,12 +33,14 @@ public:
+         CUtensorMap tensor_map_cd;
+     };
  
-+// Kernel code for one SM100 FP8/FP4 1D1D GEMM variant, with no tensors: the
-+// shape-dependent part of `sm100_fp8_fp4_gemm_1d1d`. Shared by the real op and
-+// `sm100_fp8_fp4_gemm_1d1d_compile_only` so both hit the same cache entry.
-+static std::pair<GemmConfig, std::string> sm100_fp8_fp4_gemm_1d1d_code(
-+        const GemmDesc& desc, const int& gran_k_a, const int& gran_k_b,
-+        const std::optional<std::string>& epilogue_type) {
-+    const auto config = get_best_config<SM100ArchSpec>(desc);
-+    SM100FP8FP4Gemm1D1DRuntime::Args args = {
-+        .gemm_desc = desc,
-+        .gemm_config = config,
-+        .launch_args = LaunchArgs(config.launch_config.num_sms, config.launch_config.num_threads,
-+                                  config.pipeline_config.smem_size,
-+                                  config.layout.get_cluster_size()),
-+        .epilogue_type = epilogue_type,
-+        .gran_k_a = gran_k_a,
-+        .gran_k_b = gran_k_b,
-+        // NOTES: `k_alignment` is only used by k-grouped psum, dummy here
-+        .k_alignment = gran_k_a,
-+        .grouped_layout = nullptr,
-+    };
-+    return {config, SM100FP8FP4Gemm1D1DRuntime::generate(args)};
-+}
+-    static void compile_and_launch(const std::string& tag, const Args& args) {
++    // The kernel source for `args`; the cache key is derived from it, so a
++    // compile-only call and the real launch must use the same function.
++    static std::string generate_source(const Args& args) {
+         // NOTES: an FP4xFP4 pair uses the MXF4 MMA; other combinations use the MXF8F6F4 MMA.
+         //        Both share the same kernel template and only differ in the operand dtype strings.
+         const auto a_dtype = to_string(args.gemm_desc.a_dtype, not args.gemm_desc.is_mxf4_mma());
+         const auto b_dtype = to_string(args.gemm_desc.b_dtype, not args.gemm_desc.is_mxf4_mma());
+-        const auto kernel = jit->compile(tag, std::format(R"(
++        return std::format(R"(
+ #include <deep_gemm/impls/sm100_fp8_fp4_gemm_1d1d.cuh>
+ 
+ using namespace deep_gemm;
+@@ -77,7 +79,17 @@ static void __instantiate_kernel() {{
+         args.gemm_config.layout.swap_ab, args.gemm_desc.ensure_zero_padding,
+         to_string(args.gemm_desc.gemm_type), args.gemm_desc.with_accumulation,
+         a_dtype, b_dtype, to_string(args.gemm_desc.cd_dtype),
+-        args.epilogue.type));
++        args.epilogue.type);
++    }
 +
-+// Compile the variant `sm100_fp8_fp4_gemm_1d1d` would launch for these shapes
-+// into the on-disk cache, without launching or loading it. Returns true if it
-+// compiled, false if the variant was already cached.
-+static bool sm100_fp8_fp4_gemm_1d1d_compile_only(
-+        const int& m, const int& n, const int& k,
-+        const at::ScalarType& a_dtype, const at::ScalarType& b_dtype, const at::ScalarType& cd_dtype,
-+        const int& gran_k_a, const int& gran_k_b,
-+        const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
-+        const bool& with_accumulation, const std::string& compiled_dims,
-+        const std::optional<std::string>& epilogue_type = std::nullopt) {
++    // Compile into the disk cache without loading or launching. Returns true
++    // if it compiled, false if the kernel was already cached.
++    static bool compile_only(const std::string& tag, const Args& args) {
++        return compile_only_source(tag, generate_source(args));
++    }
++
++    static void compile_and_launch(const std::string& tag, const Args& args) {
++        const auto kernel = jit->compile(tag, generate_source(args));
+ 
+         // Launch
+         jit->launch(
+@@ -168,6 +180,42 @@ static void sm100_fp8_fp4_gemm_1d1d(const torch::Tensor& a, const torch::Tensor&
+     });
+ }
+ 
++// Compile-only twin of `sm100_fp8_fp4_gemm_1d1d`: the same descriptor, the
++// same heuristic and the same kernel source, from shapes and dtypes alone.
++// Nothing is allocated, loaded or launched. Returns true if it compiled.
++static bool sm100_fp8_fp4_gemm_1d1d_compile_only(const int& m, const int& n, const int& k,
++                                                 const at::ScalarType& a_dtype,
++                                                 const at::ScalarType& b_dtype,
++                                                 const at::ScalarType& d_dtype,
++                                                 const int& gran_k_a, const int& gran_k_b,
++                                                 const cute::UMMA::Major& major_a,
++                                                 const cute::UMMA::Major& major_b,
++                                                 const bool& with_accumulation,
++                                                 const std::string& compiled_dims) {
 +    const auto desc = GemmDesc {
 +        .gemm_type = GemmType::Normal,
 +        .kernel_type = KernelType::Kernel1D1D,
 +        .m = m, .n = n, .k = k, .num_groups = 1,
-+        .a_dtype = a_dtype, .b_dtype = b_dtype, .cd_dtype = cd_dtype,
++        .a_dtype = a_dtype, .b_dtype = b_dtype,
++        .cd_dtype = d_dtype,
 +        .major_a = major_a, .major_b = major_b,
 +        .with_accumulation = with_accumulation,
-+        .num_sms = device_runtime->get_num_sms(),
-+        .tc_util = device_runtime->get_tc_util(),
++        .num_sms = runtime->get_num_sms(),
++        .tc_util = runtime->get_tc_util(),
 +        .compiled_dims = compiled_dims
 +    };
-+    const auto [config, code] = sm100_fp8_fp4_gemm_1d1d_code(desc, gran_k_a, gran_k_b, epilogue_type);
-+    return compiler->build_only("sm100_fp8_fp4_gemm_1d1d", code);
++    const auto config = get_best_config<SM100ArchSpec>(desc);
++    return SM100FP8FP4Gemm1D1DRuntime::compile_only("sm100_fp8_fp4_gemm_1d1d", {
++        .gemm_desc = desc,
++        .gemm_config = config,
++        .epilogue = make_epilogue_input(m, n, std::nullopt, std::nullopt),
++        .gran_k_a = gran_k_a,
++        .gran_k_b = gran_k_b,
++        .k_alignment = gran_k_a,
++        .grouped_layout = nullptr,
++    });
 +}
 +
- static void sm100_fp8_fp4_gemm_1d1d(const torch::Tensor& a, const torch::Tensor& sfa,
-                                     const torch::Tensor& b, const torch::Tensor& sfb,
-                                     const std::optional<torch::Tensor>& c,
-@@ -111,7 +159,7 @@ static void sm100_fp8_fp4_gemm_1d1d(const torch::Tensor& a, const torch::Tensor&
-         .tc_util = device_runtime->get_tc_util(),
-         .compiled_dims = compiled_dims
-     };
--    const auto config = get_best_config<SM100ArchSpec>(desc);
-+    const auto [config, code] = sm100_fp8_fp4_gemm_1d1d_code(desc, gran_k_a, gran_k_b, epilogue_type);
- 
-     const auto cd = c.value_or(d);
-     const auto tensor_map_a = make_tma_a_desc(major_a, a, m, k,
-@@ -153,7 +201,6 @@ static void sm100_fp8_fp4_gemm_1d1d(const torch::Tensor& a, const torch::Tensor&
-         .tensor_map_sfb = tensor_map_sfb,
-         .tensor_map_cd = tensor_map_cd
-     };
--    const auto code = SM100FP8FP4Gemm1D1DRuntime::generate(args);
-     const auto runtime = compiler->build("sm100_fp8_fp4_gemm_1d1d", code);
-     SM100FP8FP4Gemm1D1DRuntime::launch(runtime, args);
- }
-@@ -241,6 +288,47 @@ static void sm100_m_grouped_fp8_fp4_gemm_contiguous_1d1d(const torch::Tensor& a,
-     SM100FP8FP4Gemm1D1DRuntime::launch(runtime, args);
+ static void sm100_m_grouped_fp8_fp4_gemm_contiguous_1d1d(const torch::Tensor& a, const torch::Tensor& sfa,
+                                                          const torch::Tensor& b, const torch::Tensor& sfb,
+                                                          const torch::Tensor& d,
+@@ -320,6 +368,38 @@ static void sm100_m_grouped_fp8_fp4_gemm_masked_1d1d(const torch::Tensor& a, con
+     });
  }
  
-+// Compile the variant `sm100_m_grouped_fp8_fp4_gemm_masked_1d1d` would launch
-+// for these shapes into the on-disk cache, without launching or loading it.
-+// The generated code depends on the shapes and the heuristic's config only
-+// (the masked-M tensor is a launch argument), so the cache key matches the
-+// real op's. Returns true if it compiled, false if already cached.
++// Compile-only twin of `sm100_m_grouped_fp8_fp4_gemm_masked_1d1d` (same
++// descriptor, heuristic and source; nothing allocated, loaded or launched).
 +static bool sm100_m_grouped_fp8_fp4_gemm_masked_1d1d_compile_only(
-+        const int& num_groups, const int& m, const int& n, const int& k,
-+        const int& expected_m,
-+        const at::ScalarType& a_dtype, const at::ScalarType& b_dtype, const at::ScalarType& cd_dtype,
++        const int& num_groups, const int& m, const int& n, const int& k, const int& expected_m,
++        const at::ScalarType& a_dtype, const at::ScalarType& b_dtype, const at::ScalarType& d_dtype,
 +        const int& gran_k_a, const int& gran_k_b,
 +        const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
 +        const std::string& compiled_dims) {
@@ -507,46 +374,160 @@ index 9e4ba58..de11992 100644
 +        .gemm_type = GemmType::MGroupedMasked,
 +        .kernel_type = KernelType::Kernel1D1D,
 +        .m = m, .n = n, .k = k, .num_groups = num_groups,
-+        .a_dtype = a_dtype, .b_dtype = b_dtype, .cd_dtype = cd_dtype,
++        .a_dtype = a_dtype, .b_dtype = b_dtype,
++        .cd_dtype = d_dtype,
 +        .major_a = major_a, .major_b = major_b,
 +        .with_accumulation = false,
-+        .num_sms = device_runtime->get_num_sms(),
-+        .tc_util = device_runtime->get_tc_util(),
++        .num_sms = runtime->get_num_sms(),
++        .tc_util = runtime->get_tc_util(),
 +        .compiled_dims = compiled_dims,
 +        .expected_m = expected_m, .expected_n = n, .expected_k = k, .expected_num_groups = num_groups
 +    };
 +    const auto config = get_best_config<SM100ArchSpec>(desc);
-+    SM100FP8FP4Gemm1D1DRuntime::Args args = {
++    return SM100FP8FP4Gemm1D1DRuntime::compile_only("sm100_m_grouped_fp8_fp4_gemm_masked_1d1d", {
 +        .gemm_desc = desc,
 +        .gemm_config = config,
-+        .launch_args = LaunchArgs(config.launch_config.num_sms, config.launch_config.num_threads,
-+                                  config.pipeline_config.smem_size,
-+                                  config.layout.get_cluster_size()),
-+        .epilogue_type = std::nullopt,
 +        .gran_k_a = gran_k_a,
 +        .gran_k_b = gran_k_b,
 +        .k_alignment = gran_k_a,
 +        .grouped_layout = nullptr,
-+    };
-+    const auto code = SM100FP8FP4Gemm1D1DRuntime::generate(args);
-+    return compiler->build_only("sm100_m_grouped_fp8_fp4_gemm_masked_1d1d", code);
++    });
 +}
 +
- static void sm100_m_grouped_fp8_fp4_gemm_masked_1d1d(const torch::Tensor& a, const torch::Tensor& sfa,
-                                                      const torch::Tensor& b, const torch::Tensor& sfb,
-                                                      const torch::Tensor& d,
+ static void sm100_k_grouped_fp8_gemm_1d1d(const torch::Tensor& a, const torch::Tensor& sfa,
+                                           const torch::Tensor& b, const torch::Tensor& sfb,
+                                           const std::optional<torch::Tensor>& c,
 diff --git a/csrc/jit_kernels/impls/sm100_fp8_fp4_mega_moe.hpp b/csrc/jit_kernels/impls/sm100_fp8_fp4_mega_moe.hpp
-index b323baa..f649fd1 100644
+index f703a0c..e2cb532 100644
 --- a/csrc/jit_kernels/impls/sm100_fp8_fp4_mega_moe.hpp
 +++ b/csrc/jit_kernels/impls/sm100_fp8_fp4_mega_moe.hpp
-@@ -329,4 +329,41 @@ static void sm100_fp8_fp4_mega_moe(
-     SM100FP8FP4MegaMoERuntime::launch(runtime, args);
+@@ -13,6 +13,62 @@
+ 
+ namespace deep_gemm {
+ 
++// Kernel source for one MegaMoE variant. Everything it depends on is a
++// scalar or the heuristic config, so the launch and the compile-only twin
++// below produce the same source and hence the same cache entry.
++static std::string sm100_fp8_fp4_mega_moe_source(
++    const int& num_max_tokens_per_rank, const int& hidden, const int& intermediate_hidden,
++    const int& num_experts, const int& num_shared_experts, const int& num_topk,
++    const MegaMoEConfig& config, const int& num_sms, const int& num_ranks,
++    const float& activation_clamp, const bool& fast_math,
++    const bool& use_situ, const float& situ_beta, const float& situ_linear_beta,
++    const at::ScalarType& weight_dtype) {
++    return std::format(R"(
++#include <deep_gemm/impls/sm100_fp8_fp4_mega_moe.cuh>
++
++using namespace deep_gemm;
++
++static void __instantiate_kernel() {{
++    auto ptr = reinterpret_cast<void*>(&sm100_fp8_fp4_mega_moe_impl<
++        {},
++        {}, {},
++        {}, {},
++        {}, {}, {},
++        {},
++        {}, {},
++        {},
++        {},
++        {},
++        {},
++        {},
++        {}, {}, {},
++        {}, {},
++        {},
++        {},
++        {}, {}, {},
++        {}
++    >);
++}};
++)", num_max_tokens_per_rank,
++        hidden, intermediate_hidden,
++        num_experts, num_shared_experts,
++        num_topk,
++        config.block_m, config.block_n, config.block_k,
++        config.store_block_m,
++        config.sf_block_m, config.sf_block_n,
++        config.num_ring_tokens,
++        config.num_sf_ring_tokens,
++        config.num_stages,
++        config.num_bytes_per_pull,
++        config.num_dispatch_threads, config.num_non_epilogue_threads, config.num_epilogue_threads,
++        num_sms, num_ranks,
++        to_string(activation_clamp),
++        fast_math ? "true" : "false",
++        use_situ ? "true" : "false",
++        to_string(situ_beta), to_string(situ_linear_beta),
++        to_string(weight_dtype));
++}
++
+ static void sm100_fp8_fp4_mega_moe(
+     const torch::Tensor& y,
+     const torch::Tensor& l1_acts, const torch::Tensor& l1_acts_sf,
+@@ -164,50 +220,11 @@ static void sm100_fp8_fp4_mega_moe(
+     const auto num_sms = runtime->get_num_sms();
+ 
+     // Compile
+-    const auto kernel = jit->compile("sm100_fp8_fp4_mega_moe", std::format(R"(
+-#include <deep_gemm/impls/sm100_fp8_fp4_mega_moe.cuh>
+-
+-using namespace deep_gemm;
+-
+-static void __instantiate_kernel() {{
+-    auto ptr = reinterpret_cast<void*>(&sm100_fp8_fp4_mega_moe_impl<
+-        {},
+-        {}, {},
+-        {}, {},
+-        {}, {}, {},
+-        {},
+-        {}, {},
+-        {},
+-        {},
+-        {},
+-        {},
+-        {},
+-        {}, {}, {},
+-        {}, {},
+-        {},
+-        {},
+-        {}, {}, {},
+-        {}
+-    >);
+-}};
+-)", num_max_tokens_per_rank,
+-        hidden, intermediate_hidden,
+-        num_experts, num_shared_experts,
+-        num_topk,
+-        config.block_m, config.block_n, config.block_k,
+-        config.store_block_m,
+-        config.sf_block_m, config.sf_block_n,
+-        config.num_ring_tokens,
+-        config.num_sf_ring_tokens,
+-        config.num_stages,
+-        config.num_bytes_per_pull,
+-        config.num_dispatch_threads, config.num_non_epilogue_threads, config.num_epilogue_threads,
+-        num_sms, num_ranks,
+-        to_string(activation_clamp),
+-        fast_math ? "true" : "false",
+-        use_situ ? "true" : "false",
+-        to_string(situ_beta), to_string(situ_linear_beta),
+-        to_string(l1_weights.scalar_type())));
++    const auto kernel = jit->compile("sm100_fp8_fp4_mega_moe", sm100_fp8_fp4_mega_moe_source(
++        num_max_tokens_per_rank, hidden, intermediate_hidden,
++        num_experts, num_shared_experts, num_topk, config, num_sms, num_ranks,
++        activation_clamp, fast_math, use_situ, situ_beta, situ_linear_beta,
++        l1_weights.scalar_type()));
+ 
+     // Launch
+     jit->launch(
+@@ -241,4 +258,29 @@ static void __instantiate_kernel() {{
+         tensor_map_shared_l2_weights_sf);
  }
  
-+// Compile-only twin of sm100_fp8_fp4_mega_moe: the generated code depends on
-+// the scalars below and on get_mega_moe_config (whose block config follows
-+// the per-rank token count, in 6 bands), never on tensor contents. Builds the
-+// variant into the on-disk cache without launching or loading it.
++// Compile-only twin of `sm100_fp8_fp4_mega_moe`: the source depends on the
++// scalars below and on `get_mega_moe_config` (whose block config follows the
++// per-rank token count), never on tensor contents. Builds the variant into the
++// disk cache without loading or launching it; returns true if it compiled.
 +static bool sm100_fp8_fp4_mega_moe_compile_only(
 +    const int& num_ranks, const int& num_max_tokens_per_rank,
 +    const int& num_experts_per_rank, const int& num_shared_experts,
@@ -554,214 +535,456 @@ index b323baa..f649fd1 100644
 +    const int& hidden, const int& intermediate_hidden,
 +    const int& num_ring_tokens, const int& num_sf_ring_tokens,
 +    const float& activation_clamp, const bool& fast_math,
-+    const bool& use_situ, const float& situ_beta, const float& situ_linear_beta) {
++    const bool& use_situ, const float& situ_beta, const float& situ_linear_beta,
++    const at::ScalarType& weight_dtype) {
 +    const auto num_experts = num_experts_per_rank * num_ranks;
 +    const auto config = get_mega_moe_config(
 +        num_ranks, num_experts, num_experts_per_rank,
 +        num_max_tokens_per_rank, num_tokens, num_topk, hidden, intermediate_hidden,
 +        num_ring_tokens, num_sf_ring_tokens,
 +        MmaKind::MXFP8FP4);
-+    SM100FP8FP4MegaMoERuntime::Args args = {
-+        .num_max_tokens_per_rank = num_max_tokens_per_rank,
-+        .hidden = hidden, .intermediate_hidden = intermediate_hidden,
-+        .num_experts = num_experts, .num_shared_experts = num_shared_experts,
-+        .num_topk = num_topk,
-+        .num_ranks = num_ranks,
-+        .activation_clamp = activation_clamp,
-+        .fast_math = fast_math,
-+        .use_situ = use_situ,
-+        .situ_beta = situ_beta, .situ_linear_beta = situ_linear_beta,
-+        .config = config,
-+        .launch_args = LaunchArgs(device_runtime->get_num_sms(),
-+                                  config.num_dispatch_threads + config.num_non_epilogue_threads + config.num_epilogue_threads,
-+                                  config.smem_size, 2)
-+    };
-+    return compiler->build_only("sm100_fp8_fp4_mega_moe", SM100FP8FP4MegaMoERuntime::generate(args));
++    return compile_only_source("sm100_fp8_fp4_mega_moe", sm100_fp8_fp4_mega_moe_source(
++        num_max_tokens_per_rank, hidden, intermediate_hidden,
++        num_experts, num_shared_experts, num_topk, config, runtime->get_num_sms(), num_ranks,
++        activation_clamp, fast_math, use_situ, situ_beta, situ_linear_beta, weight_dtype));
 +}
 +
  } // namespace deep_gemm
-+
 diff --git a/csrc/jit_kernels/impls/sm100_mqa_logits.hpp b/csrc/jit_kernels/impls/sm100_mqa_logits.hpp
-index c594d2b..0406005 100644
+index e9b68a2..2a85a86 100644
 --- a/csrc/jit_kernels/impls/sm100_mqa_logits.hpp
 +++ b/csrc/jit_kernels/impls/sm100_mqa_logits.hpp
-@@ -487,4 +487,81 @@ static void sm100_paged_mqa_logits(const torch::Tensor& q,
-     SM100PagedMQALogitsRuntime::launch(runtime, args);
+@@ -10,6 +10,33 @@
+ 
+ namespace deep_gemm {
+ 
++// The paged metadata kernel's source; its JIT cache key is derived from it.
++static std::string sm100_paged_mqa_logits_metadata_source(const int& next_n, const int& num_sms,
++                                                          const bool& is_context_lens_2d,
++                                                          const bool& is_varlen,
++                                                          const int& split_kv) {
++    return std::format(R"(
++#include <deep_gemm/scheduler/sm100_paged_mqa_logits.cuh>
++
++using namespace deep_gemm;
++
++static void __instantiate_kernel() {{
++    auto ptr = reinterpret_cast<void*>(&sched::sm100_paged_mqa_logits_metadata<
++        {}, {}, {}, {}, {}
++    >);
++}};
++)", next_n, is_context_lens_2d ? "true" : "false", is_varlen ? "true" : "false",
++    split_kv, num_sms);
++}
++
++// Compile-only twin of `sm100_paged_mqa_logits_metadata`. Returns true if it compiled.
++static bool sm100_paged_mqa_logits_metadata_compile_only(const int& next_n, const int& num_sms,
++                                                         const bool& is_varlen) {
++    constexpr int split_kv = 256;
++    return compile_only_source("sm100_paged_mqa_logits_metadata",
++        sm100_paged_mqa_logits_metadata_source(next_n, num_sms, true, is_varlen, split_kv));
++}
++
+ // SM100 paged metadata emits per-SM starts as (q_token_idx, kv_split_idx)
+ static void sm100_paged_mqa_logits_metadata(const torch::Tensor& context_lens,
+                                             const torch::Tensor& schedule_meta,
+@@ -24,18 +51,8 @@ static void sm100_paged_mqa_logits_metadata(const torch::Tensor& context_lens,
+     DG_HOST_ASSERT(smem_size <= SM100ArchSpec::smem_capacity);
+ 
+     // Compile
+-    const auto kernel = jit->compile("sm100_paged_mqa_logits_metadata", std::format(R"(
+-#include <deep_gemm/scheduler/sm100_paged_mqa_logits.cuh>
+-
+-using namespace deep_gemm;
+-
+-static void __instantiate_kernel() {{
+-    auto ptr = reinterpret_cast<void*>(&sched::sm100_paged_mqa_logits_metadata<
+-        {}, {}, {}, {}, {}
+-    >);
+-}};
+-)", next_n, is_context_lens_2d ? "true" : "false", is_varlen ? "true" : "false",
+-    split_kv, num_sms));
++    const auto kernel = jit->compile("sm100_paged_mqa_logits_metadata",
++        sm100_paged_mqa_logits_metadata_source(next_n, num_sms, is_context_lens_2d, is_varlen, split_kv));
+ 
+     // Launch
+     jit->launch(
+@@ -144,6 +161,58 @@ static int get_mqa_logits_smem_size(const int& num_heads, const int& head_dim,
+     return static_cast<int>(math::align(num_smem_bytes, swizzle_alignment));
  }
  
-+// Compile-only twins of the three SM100 MQA-logits kernels: generate the same
-+// code the real ops do (every value printed into generate_impl is a scalar or
-+// a dtype; tensors only reach tensor maps and launch arguments) and build it
-+// into the on-disk cache without launching or loading it. Return true if the
-+// variant compiled, false if it was already cached.
-+static bool sm100_paged_mqa_logits_metadata_compile_only(const int& next_n, const int& num_sms,
-+                                                         const bool& is_context_lens_2d,
-+                                                         const bool& is_varlen) {
-+    SM100PagedMQALogitsMetadataRuntime::Args args = { .launch_args = LaunchArgs(1, 1) };
-+    args.next_n = next_n;
-+    args.is_context_lens_2d = is_context_lens_2d;
-+    args.is_varlen = is_varlen;
-+    args.split_kv = 256;
-+    args.num_sms = num_sms;
-+    return compiler->build_only("sm100_paged_mqa_logits_metadata",
-+                                SM100PagedMQALogitsMetadataRuntime::generate(args));
++// The contiguous-KV MQA logits kernel's source; its JIT cache key is derived from it.
++static std::string sm100_mqa_logits_source(const int& num_heads, const int& head_dim,
++                                           const bool& is_mx_sf, const at::ScalarType& qk_dtype,
++                                           const at::ScalarType& weights_dtype,
++                                           const at::ScalarType& logits_dtype,
++                                           const int& block_q, const int& split_kv,
++                                           const int& num_q_stages, const int& num_kv_stages,
++                                           const int& smem_size, const int& num_sms,
++                                           const bool& is_compressed_logits, const bool& clean_logits,
++                                           const bool& has_schedule_meta,
++                                           const int& num_specialized_threads, const int& num_math_threads) {
++    return std::format(R"(
++#include <deep_gemm/impls/sm100_mqa_logits.cuh>
++
++using namespace deep_gemm;
++
++static_assert(sizeof(layout::MQALogitsSharedStorage<
++    {}, {}, {}, {}, {}, {}, {}, 3, {}, {}
++>) == {}, "Incorrect MQA logits shared-memory size");
++
++static void __instantiate_kernel() {{
++    auto ptr = reinterpret_cast<void*>(&sm100_mqa_logits<
++        {}, {},
++        {},
++        {}, {}, {},
++        {}, {},
++        {}, {},
++        {},
++        {}, {},
++        {}, {},
++        {}
++    >);
++}};
++)",
++    num_heads, head_dim, is_mx_sf ? "true" : "false",
++    block_q, split_kv, num_q_stages, num_kv_stages,
++    qk_dtype == kPackedFP4 ? "cutlass::float_e2m1_t" : "cutlass::float_e4m3_t",
++    weights_dtype == torch::kBFloat16 ? "__nv_bfloat16" : "float",
++    smem_size,
++    num_heads, head_dim,
++    is_mx_sf ? "true" : "false",
++    is_compressed_logits, clean_logits,
++    has_schedule_meta,
++    block_q, split_kv,
++    num_q_stages, num_kv_stages,
++    num_sms,
++    num_specialized_threads, num_math_threads,
++    qk_dtype == kPackedFP4 ? "cutlass::float_e2m1_t" : "cutlass::float_e4m3_t",
++    to_string(logits_dtype),
++    weights_dtype == torch::kBFloat16 ? "__nv_bfloat16" : "float");
 +}
 +
+ // Unified contiguous-KV runtime for FP8 / MXFP4 / MXFP8; FP8 reuses the unused `sf_q` descriptor slot
+ static void sm100_mqa_logits(const torch::Tensor& q, const std::optional<torch::Tensor>& sf_q,
+                              const torch::Tensor& kv, const torch::Tensor& sf_kv,
+@@ -223,7 +292,73 @@ static void sm100_mqa_logits(const torch::Tensor& q, const std::optional<torch::
+     DG_HOST_ASSERT(smem_size <= SM100ArchSpec::smem_capacity);
+ 
+     // Compile
+-    const auto kernel = jit->compile("sm100_mqa_logits", std::format(R"(
++    const auto kernel = jit->compile("sm100_mqa_logits", sm100_mqa_logits_source(
++        num_heads, head_dim, is_mx_sf, qk_dtype, weights.scalar_type(), logits_dtype,
++        block_q, split_kv, num_q_stages, num_kv_stages, smem_size, num_sms,
++        is_compressed_logits, clean_logits, schedule_meta.has_value(),
++        num_specialized_threads, num_math_threads));
++
++    // Launch
++    jit->launch(
++        kernel, {
++            .num_smem_bytes = smem_size,
++            .grid_dim = dim3(num_sms, 1, 1),
++            .block_dim = dim3(num_specialized_threads + num_math_threads, 1, 1),
++        },
++        num_q_tokens, num_kv_tokens,
++        stride_logits,
++        cu_seq_len_k_start.data_ptr<int>(), cu_seq_len_k_end.data_ptr<int>(),
++        schedule_meta.has_value() ? schedule_meta.value().data_ptr<int>() : nullptr,
++        logits.data_ptr(),
++        tensor_map_q, tensor_map_sf_q,
++        tensor_map_kv, tensor_map_sf_kv,
++        tensor_map_weights
++    );
++}
++
++// Compile-only twin of `sm100_mqa_logits`, from the values the real call
++// derives from its tensors. Returns true if it compiled.
 +static bool sm100_mqa_logits_compile_only(const int& num_heads, const int& head_dim,
-+                                          const bool& is_mx_sf, const bool& is_compressed_logits,
-+                                          const at::ScalarType& qk_dtype,
++                                          const at::ScalarType& qk_dtype, const bool& is_mx_sf,
++                                          const at::ScalarType& weights_dtype,
 +                                          const at::ScalarType& logits_dtype,
-+                                          const at::ScalarType& weights_dtype) {
++                                          const bool& is_compressed_logits, const bool& clean_logits,
++                                          const bool& has_schedule_meta) {
 +    const bool is_fp4 = qk_dtype == kPackedFP4;
-+    DG_HOST_ASSERT(128 % num_heads == 0);
-+    SM100MQALogitsRuntime::Args args = { .launch_args = LaunchArgs(1, 1) };
-+    args.num_heads = num_heads;
-+    args.head_dim = head_dim;
-+    args.is_mx_sf = is_mx_sf;
-+    args.is_compressed_logits = is_compressed_logits;
-+    args.num_q_stages = 3;
-+    args.num_kv_stages = is_fp4 ? 10 : 5;
-+    args.block_q = 128 / num_heads;
-+    args.split_kv = 256;
-+    args.qk_dtype = qk_dtype;
-+    args.logits_dtype = logits_dtype;
-+    args.weights_dtype = weights_dtype;
-+    args.num_specialized_threads = 128;
-+    args.num_math_threads = 2 * 128;
-+    args.launch_args = LaunchArgs(device_runtime->get_num_sms(), 128 + 2 * 128, 0);
-+    return compiler->build_only("sm100_mqa_logits", SM100MQALogitsRuntime::generate(args));
++    constexpr int num_specialized_threads = 128;
++    const int num_math_threads = 2 * 128;
++    const int num_q_stages = 3;
++    const int num_kv_stages = is_fp4 ? 10 : 5;
++    // fp8_fp4_mqa_logits: block_q = 128 / num_heads, block_kv (split_kv) = 256 on SM100.
++    const int block_q = 128 / num_heads;
++    const int split_kv = 256;
++    const int num_sms = runtime->get_num_sms();
++    const int smem_size = get_mqa_logits_smem_size(
++        num_heads, head_dim, is_mx_sf, qk_dtype, weights_dtype,
++        block_q, split_kv, num_q_stages, num_kv_stages, 3);
++    DG_HOST_ASSERT(smem_size <= SM100ArchSpec::smem_capacity);
++    return compile_only_source("sm100_mqa_logits", sm100_mqa_logits_source(
++        num_heads, head_dim, is_mx_sf, qk_dtype, weights_dtype, logits_dtype,
++        block_q, split_kv, num_q_stages, num_kv_stages, smem_size, num_sms,
++        is_compressed_logits, clean_logits, has_schedule_meta,
++        num_specialized_threads, num_math_threads));
 +}
 +
-+static bool sm100_paged_mqa_logits_compile_only(const int& tokens_per_request,
-+                                                const int& num_heads, const int& head_dim,
-+                                                const int& page_kv,
-+                                                const bool& is_mx_sf,
-+                                                const bool& is_context_lens_2d,
-+                                                const bool& is_varlen,
-+                                                const int& split_kv,
-+                                                const int& splits_per_chunk,
-+                                                const at::ScalarType& qk_dtype,
++// Paged variant: separate host/runtime path, shared device core
++
++// The paged MQA logits kernel's source; its JIT cache key is derived from it.
++static std::string sm100_paged_mqa_logits_source(const int& num_heads, const int& head_dim,
++                                                 const bool& is_mx_sf, const at::ScalarType& qk_dtype,
++                                                 const at::ScalarType& weights_dtype,
++                                                 const at::ScalarType& logits_dtype,
++                                                 const int& block_q, const int& split_kv,
++                                                 const int& num_q_stages, const int& num_kv_stages,
++                                                 const int& smem_size, const int& tokens_per_request,
++                                                 const int& page_kv, const bool& is_context_lens_2d,
++                                                 const bool& is_varlen, const int& splits_per_chunk,
++                                                 const int& num_specialized_threads,
++                                                 const int& num_math_threads) {
++    return std::format(R"(
+ #include <deep_gemm/impls/sm100_mqa_logits.cuh>
+ 
+ using namespace deep_gemm;
+@@ -233,55 +368,61 @@ static_assert(sizeof(layout::MQALogitsSharedStorage<
+ >) == {}, "Incorrect MQA logits shared-memory size");
+ 
+ static void __instantiate_kernel() {{
+-    auto ptr = reinterpret_cast<void*>(&sm100_mqa_logits<
++    auto ptr = reinterpret_cast<void*>(&sm100_paged_mqa_logits<
+         {}, {},
+-        {},
+-        {}, {}, {},
+         {}, {},
++        {}, {}, {},
+         {}, {},
+-        {},
+         {}, {},
+         {}, {},
+-        {}
++        {}, {}, {}
+     >);
+ }};
+ )",
+     num_heads, head_dim, is_mx_sf ? "true" : "false",
+     block_q, split_kv, num_q_stages, num_kv_stages,
+     qk_dtype == kPackedFP4 ? "cutlass::float_e2m1_t" : "cutlass::float_e4m3_t",
+-    weights.scalar_type() == torch::kBFloat16 ? "__nv_bfloat16" : "float",
++    weights_dtype == torch::kBFloat16 ? "__nv_bfloat16" : "float",
+     smem_size,
+-    num_heads, head_dim,
++    tokens_per_request, num_heads,
++    head_dim, page_kv,
+     is_mx_sf ? "true" : "false",
+-    is_compressed_logits, clean_logits,
+-    schedule_meta.has_value(),
+-    block_q, split_kv,
++    is_context_lens_2d, is_varlen ? "true" : "false",
+     num_q_stages, num_kv_stages,
+-    num_sms,
++    split_kv, splits_per_chunk,
+     num_specialized_threads, num_math_threads,
+     qk_dtype == kPackedFP4 ? "cutlass::float_e2m1_t" : "cutlass::float_e4m3_t",
+     to_string(logits_dtype),
+-    weights.scalar_type() == torch::kBFloat16 ? "__nv_bfloat16" : "float"));
+-
+-    // Launch
+-    jit->launch(
+-        kernel, {
+-            .num_smem_bytes = smem_size,
+-            .grid_dim = dim3(num_sms, 1, 1),
+-            .block_dim = dim3(num_specialized_threads + num_math_threads, 1, 1),
+-        },
+-        num_q_tokens, num_kv_tokens,
+-        stride_logits,
+-        cu_seq_len_k_start.data_ptr<int>(), cu_seq_len_k_end.data_ptr<int>(),
+-        schedule_meta.has_value() ? schedule_meta.value().data_ptr<int>() : nullptr,
+-        logits.data_ptr(),
+-        tensor_map_q, tensor_map_sf_q,
+-        tensor_map_kv, tensor_map_sf_kv,
+-        tensor_map_weights
+-    );
++    weights_dtype == torch::kBFloat16 ? "__nv_bfloat16" : "float"));
+ }
+ 
+-// Paged variant: separate host/runtime path, shared device core
++// Compile-only twin of `sm100_paged_mqa_logits` (``fp8_fp4_paged_mqa_logits``
++// on SM100: split_kv 256, 16 splits per chunk, 2D context lens). Returns true
++// if it compiled.
++static bool sm100_paged_mqa_logits_compile_only(const int& next_n, const int& num_heads,
++                                                const int& head_dim, const int& page_kv,
++                                                const at::ScalarType& qk_dtype, const bool& is_mx_sf,
++                                                const at::ScalarType& weights_dtype,
 +                                                const at::ScalarType& logits_dtype,
-+                                                const at::ScalarType& weights_dtype) {
++                                                const bool& is_varlen) {
 +    const bool is_fp4 = qk_dtype == kPackedFP4;
-+    DG_HOST_ASSERT(split_kv == 256 and 128 % num_heads == 0);
-+    SM100PagedMQALogitsRuntime::Args args = { .launch_args = LaunchArgs(1, 1) };
-+    args.tokens_per_request = tokens_per_request;
-+    args.num_heads = num_heads;
-+    args.head_dim = head_dim;
-+    args.page_kv = page_kv;
-+    args.is_mx_sf = is_mx_sf;
-+    args.is_context_lens_2d = is_context_lens_2d;
-+    args.is_varlen = is_varlen;
-+    args.num_q_stages = 3;
-+    args.num_kv_stages = is_fp4 ? 10 : 5;
-+    args.split_kv = split_kv;
-+    args.splits_per_chunk = splits_per_chunk;
-+    args.qk_dtype = qk_dtype;
-+    args.logits_dtype = logits_dtype;
-+    args.weights_dtype = weights_dtype;
-+    args.num_specialized_threads = 128;
-+    args.num_math_threads = 2 * 128;
-+    return compiler->build_only("sm100_paged_mqa_logits", SM100PagedMQALogitsRuntime::generate(args));
++    const int num_specialized_threads = 128;
++    const int num_math_threads = 2 * 128;
++    const int split_kv = 256;
++    constexpr int splits_per_chunk = 16;
++    const int num_q_stages = 3;
++    const int num_kv_stages = is_fp4 ? 10 : 5;
++    DG_HOST_ASSERT(num_heads > 0 and num_heads <= 128 and num_heads % 4 == 0);
++    const int block_q = 128 / num_heads;
++    const int smem_size = get_mqa_logits_smem_size(
++        num_heads, head_dim, is_mx_sf, qk_dtype, weights_dtype,
++        block_q, split_kv, num_q_stages, num_kv_stages, 3);
++    DG_HOST_ASSERT(smem_size <= SM100ArchSpec::smem_capacity);
++    return compile_only_source("sm100_paged_mqa_logits", sm100_paged_mqa_logits_source(
++        num_heads, head_dim, is_mx_sf, qk_dtype, weights_dtype, logits_dtype,
++        block_q, split_kv, num_q_stages, num_kv_stages, smem_size, next_n, page_kv,
++        true, is_varlen, splits_per_chunk, num_specialized_threads, num_math_threads));
++}
+ 
+ // Unified paged runtime for FP8 / MXFP4 / MXFP8; FP8 reuses the unused `sf_q` descriptor slot
+ static void sm100_paged_mqa_logits(const torch::Tensor& q,
+@@ -361,42 +502,10 @@ static void sm100_paged_mqa_logits(const torch::Tensor& q,
+     DG_HOST_ASSERT(smem_size <= SM100ArchSpec::smem_capacity);
+ 
+     // Compile
+-    const auto kernel = jit->compile("sm100_paged_mqa_logits", std::format(R"(
+-#include <deep_gemm/impls/sm100_mqa_logits.cuh>
+-
+-using namespace deep_gemm;
+-
+-static_assert(sizeof(layout::MQALogitsSharedStorage<
+-    {}, {}, {}, {}, {}, {}, {}, 3, {}, {}
+->) == {}, "Incorrect MQA logits shared-memory size");
+-
+-static void __instantiate_kernel() {{
+-    auto ptr = reinterpret_cast<void*>(&sm100_paged_mqa_logits<
+-        {}, {},
+-        {}, {},
+-        {}, {}, {},
+-        {}, {},
+-        {}, {},
+-        {}, {},
+-        {}, {}, {}
+-    >);
+-}};
+-)",
+-    num_heads, head_dim, is_mx_sf ? "true" : "false",
+-    block_q, split_kv, num_q_stages, num_kv_stages,
+-    qk_dtype == kPackedFP4 ? "cutlass::float_e2m1_t" : "cutlass::float_e4m3_t",
+-    weights.scalar_type() == torch::kBFloat16 ? "__nv_bfloat16" : "float",
+-    smem_size,
+-    tokens_per_request, num_heads,
+-    head_dim, page_kv,
+-    is_mx_sf ? "true" : "false",
+-    is_context_lens_2d, is_varlen ? "true" : "false",
+-    num_q_stages, num_kv_stages,
+-    split_kv, splits_per_chunk,
+-    num_specialized_threads, num_math_threads,
+-    qk_dtype == kPackedFP4 ? "cutlass::float_e2m1_t" : "cutlass::float_e4m3_t",
+-    to_string(logits_dtype),
+-    weights.scalar_type() == torch::kBFloat16 ? "__nv_bfloat16" : "float"));
++    const auto kernel = jit->compile("sm100_paged_mqa_logits", sm100_paged_mqa_logits_source(
++        num_heads, head_dim, is_mx_sf, qk_dtype, weights.scalar_type(), logits_dtype,
++        block_q, split_kv, num_q_stages, num_kv_stages, smem_size, tokens_per_request, page_kv,
++        is_context_lens_2d, is_varlen, splits_per_chunk, num_specialized_threads, num_math_threads));
+ 
+     // Launch
+     jit->launch(
+diff --git a/csrc/runtime/jit.hpp b/csrc/runtime/jit.hpp
+index 7ee09da..f167fe8 100644
+--- a/csrc/runtime/jit.hpp
++++ b/csrc/runtime/jit.hpp
+@@ -34,4 +34,19 @@ inline void init_jit(const std::string& library_root_path) {
+     });
+ }
+ 
++// Compile `source` into the disk cache under the key `jit->compile` would look
++// up, without loading or launching it. Returns true if it compiled, false if
++// the kernel was already cached. With `DJ_COMPILE_TARGET` set, this needs no
++// visible GPU (see deep_jit::cuda::Device::get_prop).
++inline bool compile_only_source(const std::string& tag, const std::string& source) {
++    const auto& options = jit->default_compiler_options;
++    const auto key = jit->cache_key(source, options);
++    auto entry = jit->disk_cache.entry(tag, key);
++    if (entry.hit)
++        return false;
++    jit->backend.compile(source, entry.path, jit->env, jit->config, options);
++    entry.commit();
++    return true;
 +}
 +
- } // namespace deep_gemm
-+
+ }  // namespace deep_gemm
 diff --git a/deep_gemm/__init__.py b/deep_gemm/__init__.py
-index f5e52b2..7ee5a07 100644
+index 1c18563..b7107fe 100644
 --- a/deep_gemm/__init__.py
 +++ b/deep_gemm/__init__.py
-@@ -15,6 +15,7 @@ except ImportError:
- # Configs
- from . import _C
+@@ -36,6 +36,8 @@ from ._C import (
+ # DeepGEMM Kernels
  from ._C import (
-+    set_compile_target,
-     set_num_sms,
-     get_num_sms,
-     set_tc_util,
-@@ -35,6 +36,8 @@ try:
-     # DeepGEMM Kernels
-     from ._C import (
-         # FP8 FP4 GEMMs
-+        compile_only_fp8_fp4_gemm_nt,
-+        compile_only_m_grouped_fp8_fp4_gemm_nt_masked,
-         fp8_fp4_gemm_nt, fp8_fp4_gemm_nn,
-         fp8_fp4_gemm_tn, fp8_fp4_gemm_tt,
-         m_grouped_fp8_fp4_gemm_nt_contiguous,
-@@ -60,6 +63,9 @@ try:
-         einsum,
-         fp8_einsum,
-         # Attention kernels
-+        compile_only_mqa_logits,
-+        compile_only_paged_mqa_logits,
-+        compile_only_paged_mqa_logits_metadata,
-         fp8_fp4_mqa_logits,
-         get_paged_mqa_logits_metadata,
-         fp8_fp4_paged_mqa_logits,
-@@ -88,6 +94,7 @@ from .mega import (
-     get_symm_buffer_for_mega_moe,
-     transform_weights_for_mega_moe,
-     fp8_fp4_mega_moe,
+     # FP8-FP4 GEMMs (accept any FP8/FP4 operand combination)
++    compile_only_fp8_fp4_gemm_nt,
++    compile_only_m_grouped_fp8_fp4_gemm_nt_masked,
+     fp8_fp4_gemm_nt, fp8_fp4_gemm_nn,
+     fp8_fp4_gemm_tn, fp8_fp4_gemm_tt,
+     m_grouped_fp8_fp4_gemm_nt_contiguous,
+@@ -67,6 +69,9 @@ from ._C import (
+     einsum,
+     fp8_einsum,
+     # Attention kernels
++    compile_only_mqa_logits,
++    compile_only_paged_mqa_logits,
++    compile_only_paged_mqa_logits_metadata,
+     fp8_fp4_mqa_logits,
+     get_mqa_logits_metadata,
+     get_paged_mqa_logits_metadata,
+@@ -85,6 +90,7 @@ from ._C import (
+     transform_sf_into_required_layout,
+     # MegaMoE
+     get_block_m_for_mega_moe,
 +    compile_only_fp8_fp4_mega_moe,
-     bf16_mega_moe,
  )
  
-diff --git a/deep_gemm/include/deep_gemm/comm/barrier.cuh b/deep_gemm/include/deep_gemm/comm/barrier.cuh
-index 50b894e..cc2f65d 100644
---- a/deep_gemm/include/deep_gemm/comm/barrier.cuh
-+++ b/deep_gemm/include/deep_gemm/comm/barrier.cuh
-@@ -8,8 +8,16 @@
+ # Mega kernels
+diff --git a/third-party/deep_jit/include/deep_jit/backend/cuda/device.hpp b/third-party/deep_jit/include/deep_jit/backend/cuda/device.hpp
+index 3cfb206..edb40ca 100644
+--- a/third-party/deep_jit/include/deep_jit/backend/cuda/device.hpp
++++ b/third-party/deep_jit/include/deep_jit/backend/cuda/device.hpp
+@@ -1,6 +1,8 @@
+ #pragma once
  
- namespace deep_gemm::comm {
+ #include <cstdint>
++#include <cstdio>
++#include <cstdlib>
+ #include <string>
+ #include <utility>
  
--// 60s timeout, at 2 GHz
--constexpr int64_t kNumTimeoutCycles = 60ll * 2000000000ll;
-+// Barrier timeout in seconds, overridable at JIT compile time. The host-side compiler
-+// turns the `DG_JIT_BARRIER_TIMEOUT_SECONDS` environment variable into this definition,
-+// so slow-but-healthy rendezvous (e.g. large expert-parallel groups whose first
-+// collective follows a long warm-up) can be distinguished from a genuine hang.
-+#ifndef DG_BARRIER_TIMEOUT_SECONDS
-+#define DG_BARRIER_TIMEOUT_SECONDS 60
-+#endif
-+
-+// Timeout in cycles, at 2 GHz
-+constexpr int64_t kNumTimeoutCycles = static_cast<int64_t>(DG_BARRIER_TIMEOUT_SECONDS) * 2000000000ll;
+@@ -32,6 +34,16 @@ class Device {
+ public:
+     const cudaDeviceProp& get_prop() {
+         if (not initialized) {
++            // `DJ_COMPILE_TARGET=major,minor,num_sms,smem_optin_bytes,l2_bytes`:
++            // a compile-only process (no visible GPU) describes the device it
++            // compiles for instead of querying one. Nothing may be launched.
++            if (const char* target = std::getenv("DJ_COMPILE_TARGET"); target != nullptr and *target) {
++                int major = 0, minor = 0, num_sms = 0, smem = 0, l2 = 0;
++                DJ_HOST_ASSERT(std::sscanf(target, "%d,%d,%d,%d,%d", &major, &minor, &num_sms, &smem, &l2) == 5,
++                               "DJ_COMPILE_TARGET must be major,minor,num_sms,smem_optin_bytes,l2_bytes");
++                set_compile_target(major, minor, num_sms, smem, l2);
++                return prop;
++            }
+             // `cudaFree(nullptr)` is to ensure the current CUDA context exists before later driver API calls
+             int device_index = 0;
+             DJ_CUDA_RUNTIME_CHECK(cudaGetDevice(&device_index));
+@@ -42,6 +54,20 @@ public:
+         return prop;
+     }
  
- CUTLASS_DEVICE void cluster_sync_with_relaxed_arrive() {
-     // Perform cluster_sync with `barrier.cluster.arrive.relaxed`
-@@ -34,8 +42,8 @@ CUTLASS_DEVICE void grid_sync(const layout::Workspace& workspace,
-         do {
-             new_value = ptx::ld_acq(count_ptr);
-             if (clock64() - start_clock >= kNumTimeoutCycles) {
--                printf("DeepGEMM grid sync timeout: sm=%u, thread=%u, grid_sync_idx=%u, old=%u, current=%u, expected_tag=%u\n",
--                       sm_idx, thread_idx, kGridSyncIndex, old_value, new_value, old_value ^ kFinishSumTag);
-+                printf("DeepGEMM grid sync timeout (%ds): sm=%u, thread=%u, grid_sync_idx=%u, old=%u, current=%u, expected_tag=%u\n",
-+                       DG_BARRIER_TIMEOUT_SECONDS, sm_idx, thread_idx, kGridSyncIndex, old_value, new_value, old_value ^ kFinishSumTag);
-                 DG_DEVICE_ASSERT(false and "Grid sync timeout");
-             }
-         } while (((new_value ^ old_value) & kFinishSumTag) == 0);
-@@ -75,8 +83,8 @@ CUTLASS_DEVICE void nvlink_barrier(const layout::Workspace& workspace,
-             const auto start_clock = clock64();
-             while (ptx::ld_acq_sys(signal_ptr) != target) {
-                 if (clock64() - start_clock >= kNumTimeoutCycles) {
--                    printf("DeepGEMM NVLink barrier timeout: rank=%d, counter=%d, signal=%d, target=%d, phase=%d, sign=%d, tag=%d\n",
--                           sym_buffer.rank_idx, *counter_ptr, ptx::ld_acq_sys(signal_ptr), target, signal_phase, signal_sign, kTag);
-+                    printf("DeepGEMM NVLink barrier timeout (%ds): rank=%d, counter=%d, signal=%d, target=%d, phase=%d, sign=%d, tag=%d\n",
-+                           DG_BARRIER_TIMEOUT_SECONDS, sym_buffer.rank_idx, *counter_ptr, ptx::ld_acq_sys(signal_ptr), target, signal_phase, signal_sign, kTag);
-                     DG_DEVICE_ASSERT(false and "NVLink barrier timeout");
-                 }
-             }
-diff --git a/deep_gemm/mega/__init__.py b/deep_gemm/mega/__init__.py
-index f4233c0..c5bdc9b 100644
---- a/deep_gemm/mega/__init__.py
-+++ b/deep_gemm/mega/__init__.py
-@@ -207,3 +207,9 @@ def bf16_mega_moe(y: torch.Tensor,
-         activation, activation_clamp,
-         fast_math
-     )
++    // Use these properties instead of querying a device, so a process with no
++    // visible GPU can compile (without loading) for the given target. The
++    // fields set here are all a compile reads; nothing may be launched.
++    void set_compile_target(const int& major, const int& minor, const int& num_sms,
++                            const int& smem_optin_bytes, const int& l2_bytes) {
++        prop = cudaDeviceProp{};
++        prop.major = major;
++        prop.minor = minor;
++        prop.multiProcessorCount = num_sms;
++        prop.sharedMemPerBlockOptin = static_cast<size_t>(smem_optin_bytes);
++        prop.l2CacheSize = l2_bytes;
++        initialized = true;
++    }
 +
-+
-+def compile_only_fp8_fp4_mega_moe(*args, **kwargs) -> bool:
-+    """Build the fp8_fp4_mega_moe variant for one per-rank token count into the
-+    JIT cache without launching it (SM100). Returns True if it compiled."""
-+    return _C.compile_only_fp8_fp4_mega_moe(*args, **kwargs)
+     int get_num_sms() { return get_prop().multiProcessorCount; }
+ 
+     int get_num_l2_cache_bytes() { return get_prop().l2CacheSize; }

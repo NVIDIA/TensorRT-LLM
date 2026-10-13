@@ -199,7 +199,7 @@ class BreakableCUDAGraphRunner:
 
     def execute(self, num_tokens: int, outer_forward: Callable[[], Any]) -> Any:
         """Patch the body with replay while preserving the outer forward.
-        this function reuse model_engine._forward_step to set flags.
+        this function reuse DecoderRunner._forward_step to set flags.
         and just patch the body model forward"""
         if self._state != BreakableCUDAGraphRunnerState.IDLE:
             raise RuntimeError(f"Cannot execute BCG while runner is {self._state.value}")

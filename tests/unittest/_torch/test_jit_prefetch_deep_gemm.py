@@ -70,23 +70,25 @@ _REAL_MOE = textwrap.dedent("""
         recipe=(1, 128, 128), num_groups=g, is_sfa=False)
     d = torch.empty(g, m, n, device="cuda", dtype=torch.bfloat16)
     masked_m = torch.full((g,), min(m, expected_m), device="cuda", dtype=torch.int32)
-    deep_gemm.fp8_m_grouped_gemm_nt_masked((a, sfa), (b, sfb), d, masked_m, expected_m,
+    deep_gemm.m_grouped_fp8_gemm_nt_masked((a, sfa), (b, sfb), d, masked_m, expected_m,
                                            disable_ue8m0_cast=True)
     torch.cuda.synchronize()
 """)
 
 
 def _entries(cache):
+    """Committed kernel entries of a DeepGEMM JIT disk cache."""
     root = os.path.join(cache, "cache")
-    return set(os.listdir(root)) if os.path.isdir(root) else set()
+    if not os.path.isdir(root):
+        return set()
+    return {e for e in os.listdir(root) if os.path.exists(os.path.join(root, e, ".committed"))}
 
 
 def _helper_compile(cache, specs):
-    major, minor, sms = jdg.target()
     env = dict(os.environ, DG_JIT_CACHE_DIR=cache, CUDA_VISIBLE_DEVICES="", PYTHONNOUSERSITE="1")
     inp = "".join(json.dumps({"tag": i, "spec": s}) + "\n" for i, s in enumerate(specs))
     out = subprocess.run(
-        [sys.executable, "-u", _HELPER, jdg.package_dir(), str(major), str(minor), str(sms)],
+        [sys.executable, "-u", _HELPER, jdg.package_dir(), *(str(x) for x in jdg.target())],
         input=inp,
         capture_output=True,
         text=True,
@@ -194,7 +196,7 @@ _REAL_INDEXER = textwrap.dedent("""
 def _indexer_specs(kind, next_n, heads, dim, block_kv, num_sms):
     if kind == "mqa":
         return [json.dumps(dict(op="mqa_logits", num_heads=heads, head_dim=dim, is_fp4=False,
-                                is_mx_sf=False, compressed=False, logits="float32",
+                                is_mx_sf=False, compressed=False, clean_logits=False, logits="float32",
                                 weights="float32"), sort_keys=True)]  # fmt: skip
     return [
         json.dumps(
@@ -257,24 +259,37 @@ _GPU_MEGA = textwrap.dedent("""
     built = deep_gemm.compile_only_fp8_fp4_mega_moe(
         s["num_ranks"], s["num_experts"], s["max_tokens"], s["topk"], s["num_tokens"],
         s["hidden"], s["inter"], 0, s["activation"], s["clamp"], s["fast_math"],
-        s["situ_beta"], s["situ_linear_beta"])
+        s["situ_beta"], s["situ_linear_beta"], s["mma_type"])
     print("BUILT", built)
 """)
 
 
 # MegaMoE has no separate real-op path to reach here without a symmetric
-# memory group, so the check is that the GPU process (real arch and SM count
-# from the device, not set_compile_target) resolves every band to the cubin
-# the GPU-less helper built: build_only reports nothing new to compile.
+# memory group, so the check is that a GPU process (arch, SM count and memory
+# sizes read from the device, not DJ_COMPILE_TARGET) resolves every variant to
+# the entry the GPU-less helper built: its compile-only call finds it cached.
 @pytest.mark.skipif(not jdg.supports_mega_moe(), reason="needs the MegaMoE compile-only entry")
 def test_mega_moe_helper_builds_every_band(tmp_path):
+    from tensorrt_llm import deep_gemm, deep_gemm_cpp_tllm
+
     p = jdg.MegaMoEProvider()
-    counts = p.band_token_counts(num_ranks=8, num_experts=256, max_tokens=512, topk=8)
-    assert len(counts) == 6, counts
+    # SymmBuffer aligns the per-rank token capacity; the layer records that.
+    max_tok = 512
+    max_tok += -max_tok % deep_gemm_cpp_tllm.get_token_alignment_for_mega_moe("fp8xfp4")
+    counts = p.band_token_counts(num_ranks=8, num_experts=256, max_tokens=max_tok, topk=8)
+
+    def block_m(n):
+        return deep_gemm.get_block_m_for_mega_moe(8, 256, max_tok, n, 8, "fp8xfp4")
+
+    # One token count per BLOCK_M, and every count in range picks one of them.
+    picked = [block_m(n) for n in counts]
+    assert len(set(picked)) == len(picked) > 1, (counts, picked)
+    assert {block_m(n) for n in range(max_tok + 1)} == set(picked)
     specs = [
-        json.dumps(dict(op="mega_moe", num_ranks=8, num_experts=256, max_tokens=512, topk=8,
+        json.dumps(dict(op="mega_moe", num_ranks=8, num_experts=256, max_tokens=max_tok, topk=8,
                         num_tokens=n, hidden=7168, inter=2048, activation="swiglu", clamp=None,
-                        fast_math=True, situ_beta=None, situ_linear_beta=None), sort_keys=True)
+                        fast_math=True, situ_beta=None, situ_linear_beta=None,
+                        mma_type="fp8xfp4"), sort_keys=True)
         for n in counts
     ]  # fmt: skip
     cache = str(tmp_path / "dg")

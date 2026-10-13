@@ -5,6 +5,8 @@
 
 import asyncio
 import base64
+import gc
+import weakref
 from collections.abc import AsyncIterator, Sequence
 from types import SimpleNamespace
 from typing import Any
@@ -20,7 +22,7 @@ import tensorrt_llm.grpc.openengine.disagg as oe_disagg  # noqa: E402
 import tensorrt_llm.grpc.openengine.formatting as oe_formatting  # noqa: E402
 import tensorrt_llm.grpc.openengine.servicer as openengine_servicer  # noqa: E402
 import tensorrt_llm.grpc.openengine.streaming as oe_streaming  # noqa: E402
-from tensorrt_llm.grpc.openengine.bindings import generation_pb2  # noqa: E402
+from tensorrt_llm.grpc.openengine.bindings import generation_pb2, openengine_pb2_grpc  # noqa: E402
 from tensorrt_llm.grpc.openengine.request_mapping import sampling_params_from_request  # noqa: E402
 from tensorrt_llm.grpc.openengine.servicer import OpenEngineInferenceServicer  # noqa: E402
 from tensorrt_llm.sampling_params import SamplingParams  # noqa: E402
@@ -649,6 +651,222 @@ def test_generate_aborts_when_response_stream_closes() -> None:
     asyncio.run(close_after_first_response())
 
     assert llm.result_handle.aborted
+
+
+def test_generate_releases_result_after_completion() -> None:
+    """A finished stream releases its result while its consumer task is still alive."""
+
+    class _SelfIteratingHandle(_FakeResultHandle):
+        """Iterates the way GenerationResult does: ``__aiter__`` returns the handle."""
+
+        def __aiter__(self) -> "_SelfIteratingHandle":
+            self._iterator = iter(self._results)
+            return self
+
+        async def __anext__(self) -> Any:
+            try:
+                result = next(self._iterator)
+            except StopIteration:
+                raise StopAsyncIteration from None
+            result.finished = all(o.finish_reason for o in result.outputs)
+            self.finished = result.finished
+            self.prompt_token_ids = result.prompt_token_ids
+            self.outputs = result.outputs
+            self.cached_tokens = result.cached_tokens
+            self.error = result.error
+            return result
+
+    output = SimpleNamespace(
+        index=0,
+        token_ids=[10],
+        text="A",
+        logprobs=[],
+        prompt_logprobs=[],
+        finish_reason="length",
+        stop_reason=None,
+    )
+    result = SimpleNamespace(prompt_token_ids=[1], outputs=[output], cached_tokens=0, error=None)
+    handle_refs = []
+
+    class _HandOffLlm:
+        """Gives each result handle to the servicer and keeps only a weak reference."""
+
+        args = _fake_llm_args()
+        tokenizer = _FakeTokenizer()
+
+        def generate_async(self, **kwargs: Any) -> _SelfIteratingHandle:
+            kwargs["sampling_params"]._validate()
+            handle = _SelfIteratingHandle([result])
+            handle_refs.append(weakref.ref(handle))
+            return handle
+
+    servicer = OpenEngineInferenceServicer(_HandOffLlm(), model="test-model")
+    request = generation_pb2.GenerateRequest(
+        request_id="request-release",
+        model="test-model",
+        prompt="hello",
+    )
+    context = FakeServicerContext()
+
+    async def consume() -> None:
+        async for _ in servicer.Generate(request, context):
+            pass
+        assert len(handle_refs) == 1
+        assert handle_refs[0]() is None
+
+    asyncio.run(consume())
+
+
+@pytest.mark.threadleak(enabled=False)
+def test_generate_releases_rpc_contexts_without_gc() -> None:
+    """Completed real gRPC contexts must not accumulate when cyclic GC is disabled."""
+    context_types: dict[int, type] = {}
+    output = SimpleNamespace(
+        index=0,
+        token_ids=[10],
+        text="A",
+        logprobs=[],
+        prompt_logprobs=[],
+        finish_reason="length",
+        stop_reason=None,
+    )
+    result = SimpleNamespace(prompt_token_ids=[1], outputs=[output], cached_tokens=0, error=None)
+
+    class _TrackingServicer(OpenEngineInferenceServicer):
+        async def Generate(
+            self, request: generation_pb2.GenerateRequest, context: grpc.aio.ServicerContext
+        ) -> AsyncIterator[generation_pb2.GenerateResponse]:
+            context_types[id(context)] = type(context)
+            async for response in super().Generate(request, context):
+                yield response
+
+    async def exercise_server() -> None:
+        servicer = _TrackingServicer(_FakeLlm([result]), model="test-model")
+        server = grpc.aio.server()
+        openengine_pb2_grpc.add_InferenceServicer_to_server(servicer, server)
+        port = server.add_insecure_port("127.0.0.1:0")
+        await server.start()
+        try:
+            async with grpc.aio.insecure_channel(f"127.0.0.1:{port}") as channel:
+                stub = openengine_pb2_grpc.InferenceStub(channel)
+                for i in range(100):
+                    request = generation_pb2.GenerateRequest(
+                        request_id=f"release-{i}", model="test-model", prompt="hello"
+                    )
+                    responses = [response async for response in stub.Generate(request, timeout=5)]
+                    assert responses[-1].HasField("finished")
+                assert servicer.active_request_count() == 0
+                # Let gRPC finish its transport cleanup while the server remains
+                # live. No collection is allowed to rescue a context cycle.
+                deadline = asyncio.get_running_loop().time() + 5
+                while True:
+                    await asyncio.sleep(0.01)
+                    retained = sum(
+                        context_types.get(id(obj)) is type(obj) for obj in gc.get_objects()
+                    )
+                    if retained == 0 or asyncio.get_running_loop().time() >= deadline:
+                        break
+                assert retained == 0, f"Retained {retained} completed RPC contexts without GC"
+        finally:
+            await server.stop(0)
+
+    gc_was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        asyncio.run(exercise_server())
+    finally:
+        if gc_was_enabled:
+            gc.enable()
+
+
+@pytest.mark.threadleak(enabled=False)
+@pytest.mark.parametrize("cancel_point", ["engine", "write"])
+def test_generate_aborts_on_transport_cancellation(cancel_point: str) -> None:
+    """Cancellation aborts work during an engine wait or a suspended response yield."""
+
+    async def exercise_server() -> None:
+        entered = asyncio.Event()
+        aborted = asyncio.Event()
+        streams = []
+
+        class _BlockingHandle(_FakeResultHandle):
+            async def __aiter__(self) -> AsyncIterator[SimpleNamespace]:
+                if cancel_point == "engine":
+                    entered.set()
+                    await asyncio.Event().wait()
+                yield SimpleNamespace(
+                    prompt_token_ids=[1],
+                    outputs=[
+                        SimpleNamespace(
+                            index=0,
+                            token_ids=[10],
+                            text="A",
+                            logprobs=[],
+                            prompt_logprobs=[],
+                            finish_reason=None,
+                            stop_reason=None,
+                        )
+                    ],
+                    cached_tokens=0,
+                    error=None,
+                    finished=False,
+                )
+
+            def abort(self) -> None:
+                super().abort()
+                aborted.set()
+
+        llm = _FakeLlm([])
+        llm.result_handle = _BlockingHandle([])
+        servicer = OpenEngineInferenceServicer(llm, model="test-model")
+
+        async def generate(
+            request: generation_pb2.GenerateRequest, context: grpc.aio.ServicerContext
+        ) -> None:
+            stream = servicer.Generate(request, context)
+            # Keep the generator alive so finalization cannot mask a missing
+            # task callback when cancellation happens outside __anext__.
+            streams.append(stream)
+            async for _ in stream:
+                entered.set()
+                await asyncio.Event().wait()  # A transport write under backpressure.
+
+        server = grpc.aio.server()
+        server.add_generic_rpc_handlers(
+            (
+                grpc.method_handlers_generic_handler(
+                    "test.Inference",
+                    {
+                        "Generate": grpc.unary_stream_rpc_method_handler(
+                            generate, request_deserializer=generation_pb2.GenerateRequest.FromString
+                        )
+                    },
+                ),
+            )
+        )
+        port = server.add_insecure_port("127.0.0.1:0")
+        await server.start()
+        try:
+            async with grpc.aio.insecure_channel(f"127.0.0.1:{port}") as channel:
+                generate_rpc = channel.unary_stream(
+                    "/test.Inference/Generate",
+                    request_serializer=generation_pb2.GenerateRequest.SerializeToString,
+                )
+                request = generation_pb2.GenerateRequest(
+                    request_id="cancel", model="test-model", prompt="hello"
+                )
+                call = generate_rpc(request, timeout=10)
+                await asyncio.wait_for(entered.wait(), timeout=5)
+                assert call.cancel()
+                await asyncio.wait_for(aborted.wait(), timeout=5)
+                assert llm.result_handle.aborted
+        finally:
+            await server.stop(0)
+            for stream in streams:
+                await stream.aclose()
+        assert servicer.active_request_count() == 0
+
+    asyncio.run(exercise_server())
 
 
 def test_generate_aborts_stalled_response_consumer(monkeypatch: pytest.MonkeyPatch) -> None:

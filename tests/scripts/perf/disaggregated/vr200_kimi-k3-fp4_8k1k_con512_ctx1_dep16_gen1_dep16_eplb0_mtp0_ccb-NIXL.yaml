@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 # VR200 (Vera Rubin, SM107a) disagg case, derived from tests/scripts/perf/disaggregated/gb300_kimi-k3-fp4_8k1k_con512_ctx1_dep16_gen1_dep16_eplb0_mtp0_ccb-NIXL.yaml.
 # The topology is carried over unchanged: a VR200 NVL72 node exposes 4 GPUs, the
 # same shape the GB300 case was sized for, so ctx/gen parallelism and
@@ -104,10 +107,9 @@ worker_config:
       # K3's MixedMambaHybridCacheManager.
       transceiver_runtime: PYTHON
       max_tokens_in_buffer: 8448
-      # Must hold one full request payload (433 MiB KDA state + ~27 KB/token
-      # MLA latent = 649 MiB at 8k ISL); undersizing silently falls back to
-      # the host-staged tcp path.
+      # Shared C++ agent arena for chunked gather/write/scatter transfers.
       kv_cache_bounce_size_mb: 1024
+      agent_bounce_buffer_enable: true
     disable_overlap_scheduler: false
     trust_remote_code: true
   ctx:
@@ -134,5 +136,6 @@ worker_config:
       transceiver_runtime: PYTHON
       max_tokens_in_buffer: 8448
       kv_cache_bounce_size_mb: 1024
+      agent_bounce_buffer_enable: true
     disable_overlap_scheduler: true
     trust_remote_code: true

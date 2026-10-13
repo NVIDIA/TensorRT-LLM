@@ -14,22 +14,21 @@
 # limitations under the License.
 """CPU-only DeepGEMM compile helper for ``jit_prefetch.py``. Run as a script.
 
-    jit_prefetch_dg_helper.py <deep_gemm package dir> <arch_major> <arch_minor> <num_sms>
+    jit_prefetch_dg_helper.py <package dir> <arch_major> <arch_minor> <num_sms>
+                              <smem_optin_bytes> <l2_bytes>
 
 Reads one JSON request per stdin line, ``{"tag": int, "spec": str}``, where
-``spec`` is a JSON object, either ``{"op": "fp8_fp4_gemm_nt", "m", "n", "k",
-"a", "b", "d", "recipe"}`` or ``{"op": "m_grouped_fp8_fp4_gemm_nt_masked", "g",
-"m", "n", "k", "expected_m", "a", "b", "recipe"}`` (dtype names as in
-``torch``). Compiles the variant with
-DeepGEMM's compile-only entry point into ``DG_JIT_CACHE_DIR`` and writes
+``spec`` is a JSON object naming one DeepGEMM kernel variant (``"op"`` plus the
+values the real op derives from its tensors; dtype names as in ``torch``).
+Compiles it with DeepGEMM's compile-only entry point into the JIT disk cache
+the real launch reads, and writes
 ``{"tag": int, "ok": bool, "s": float, "err": str, "built": bool}``.
 
-The process has no visible GPU and never launches a kernel:
-``DG_JIT_COMPILE_ONLY=1`` keeps DeepGEMM from creating its cuBLASLt handle and
-CUDA workspace, and ``set_compile_target`` supplies the target arch and SM
-count that the kernel heuristic and the NVCC arch flag would otherwise read
-from the device. The DeepGEMM extension is imported from the installed
-``tensorrt_llm`` package directory without running ``tensorrt_llm/__init__``.
+The process has no visible GPU and never launches a kernel. ``DJ_COMPILE_TARGET``
+gives DeepJIT the target device's arch, SM count and memory sizes, which the
+kernel heuristic and the NVCC arch flag would otherwise read from a device. The
+DeepGEMM extension is imported from the installed ``tensorrt_llm`` package
+directory without running ``tensorrt_llm/__init__``.
 """
 
 import importlib.util
@@ -57,19 +56,24 @@ def _load_deep_gemm(pkg_dir: str):
     spec = importlib.util.spec_from_file_location("deep_gemm_cpp_tllm", ext)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
-    cuda_home = os.environ.get("CUDA_HOME") or os.environ.get("CUDA_PATH") or "/usr/local/cuda"
-    # Same arguments as deep_gemm/__init__.py: library root, CUDA home.
-    mod.init(os.path.join(pkg_dir, "deep_gemm"), cuda_home)
+    # Same argument as deep_gemm/__init__.py: the library root.
+    mod.init(os.path.join(pkg_dir, "deep_gemm"))
     return mod
 
 
 def main():
-    pkg_dir, arch_major, arch_minor, num_sms = sys.argv[1:5]
-    os.environ["DG_JIT_COMPILE_ONLY"] = "1"
+    pkg_dir, arch_major, arch_minor, num_sms, smem_optin, l2_bytes = sys.argv[1:7]
+    # DeepJIT reads the target device from this instead of querying a GPU
+    # (none is visible here); set before the JIT runtime is first used.
+    os.environ["DJ_COMPILE_TARGET"] = ",".join(
+        (arch_major, arch_minor, num_sms, smem_optin, l2_bytes)
+    )
+    # DeepGEMM's runtime otherwise creates a cuBLASLt handle, which needs a
+    # device; nothing here runs cuBLASLt.
+    os.environ["DG_USE_PYTORCH_CUBLASLT_HANDLE"] = "1"
     import torch
 
     dg = _load_deep_gemm(pkg_dir)
-    dg.set_compile_target(int(arch_major), int(arch_minor), int(num_sms))
 
     out = sys.stdout
     out.write(json.dumps({"ready": True}) + "\n")
@@ -109,17 +113,18 @@ def main():
                     int(s["num_ranks"]), int(s["num_experts"]), int(s["max_tokens"]),
                     int(s["topk"]), int(s["num_tokens"]), int(s["hidden"]),
                     int(s["inter"]), 0, s["activation"], s["clamp"], bool(s["fast_math"]),
-                    s["situ_beta"], s["situ_linear_beta"],
+                    s["situ_beta"], s["situ_linear_beta"], s.get("mma_type", "fp8xfp4"),
                 )  # fmt: skip
             elif s["op"] == "paged_mqa_logits_metadata":
                 built = dg.compile_only_paged_mqa_logits_metadata(
                     int(s["next_n"]), bool(s["is_varlen"]), int(s["num_sms"])
                 )
             elif s["op"] == "mqa_logits":
+                # The indexer passes no schedule metadata to this kernel.
                 built = dg.compile_only_mqa_logits(
                     int(s["num_heads"]), int(s["head_dim"]), bool(s["is_fp4"]),
-                    bool(s["is_mx_sf"]), bool(s["compressed"]),
-                    getattr(torch, s["logits"]), getattr(torch, s["weights"]),
+                    bool(s["is_mx_sf"]), bool(s["compressed"]), bool(s["clean_logits"]),
+                    False, getattr(torch, s["logits"]), getattr(torch, s["weights"]),
                 )  # fmt: skip
             elif s["op"] == "paged_mqa_logits":
                 built = dg.compile_only_paged_mqa_logits(

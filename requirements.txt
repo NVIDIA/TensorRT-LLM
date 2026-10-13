@@ -23,17 +23,17 @@ pandas
 h5py==3.12.1
 StrEnum
 sentencepiece>=0.1.99
-# https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-26-08.html#rel-26-08 uses 2.14.0a0.
+# https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-26-09.html#rel-26-09 uses 2.14.0a0.
 # The floor is the NGC alpha, which PEP 440 orders below the public release of the same
 # series; the ceiling is that public release, which is what the resolver picks off the public
 # index. Ordered comparisons drop the local version, so the container's +nv build stays
 # admissible against the floor.
 torch>=2.14.0a0,<=2.14.0
 torchvision
-# https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-26-08.html#rel-26-08 uses 2.30.7
-# The public torch above pins the same version, so an exact pin covers both it and the NGC
-# container's own NCCL; as with triton, carrying no local version keeps the +nv build admissible.
-nvidia-nccl-cu13==2.30.7
+# The floor is the exact pin of the public torch above; the ceiling is the NCCL that
+# https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-26-09.html#rel-26-09
+# ships, so the resolver lands on the container's own NCCL version there instead of an older one.
+nvidia-nccl-cu13>=2.30.7,<=2.31.2
 # NCCL-EP uses nccl4py's nccl.ep package. The nccl-extensions wheel is built
 # from pinned source by CMake so it links against the container's NCCL.
 nccl4py>=0.4,<=0.5
@@ -79,7 +79,7 @@ meson
 ninja
 blake3
 soundfile
-# https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-26-08.html#rel-26-08
+# https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-26-09.html#rel-26-09
 # ships 3.8.0 and the torch pin above requires the same series, so floor and ceiling coincide.
 # The pin carries no local version, which keeps the container's own +nv build admissible -- it
 # must not be reinstalled underneath the rest of the stack that was built against it. This is

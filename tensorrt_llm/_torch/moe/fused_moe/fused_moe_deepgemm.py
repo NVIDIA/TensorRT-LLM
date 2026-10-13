@@ -739,7 +739,7 @@ def deepgemm_fp8_group_blockwise_gemm(
 
     obs = jit_prefetch_deep_gemm.done_observer
     t0 = time.perf_counter() if obs is not None else 0.0
-    deep_gemm.fp8_m_grouped_gemm_nt_masked((a, sfa), (b, sfb),
+    deep_gemm.m_grouped_fp8_gemm_nt_masked((a, sfa), (b, sfb),
                                            d,
                                            masked_m,
                                            expected_m,

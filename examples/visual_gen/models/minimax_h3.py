@@ -23,6 +23,7 @@ before downloading or running the model.
 import argparse
 
 from tensorrt_llm import VisualGen, VisualGenArgs
+from tensorrt_llm.visual_gen.params import MediaRef
 
 
 def main() -> None:
@@ -41,6 +42,34 @@ def main() -> None:
         default="minimax_h3_t2va_output.mp4",
         help="Path to save the generated video and audio.",
     )
+    parser.add_argument(
+        "--image",
+        action="append",
+        default=[],
+        help="Ref2VA reference image path; repeat for multiple images.",
+    )
+    parser.add_argument(
+        "--video",
+        action="append",
+        default=[],
+        help="Ref2VA reference video path, including its soundtrack.",
+    )
+    parser.add_argument(
+        "--audio",
+        action="append",
+        default=[],
+        help="Ref2VA reference audio path; requires an image or video.",
+    )
+    parser.add_argument(
+        "--reference_order",
+        nargs="+",
+        help="Optional ordered image:N/video:N/audio:N entries, zero-based.",
+    )
+    parser.add_argument(
+        "--prompt",
+        default=None,
+        help="Prompt; references use <Picture 1>, <Video 1>, and <Audio 1> labels.",
+    )
     args = parser.parse_args()
 
     extra_args = VisualGenArgs.from_yaml(args.visual_gen_args) if args.visual_gen_args else None
@@ -52,8 +81,20 @@ def main() -> None:
     params.width = 960
     params.seed = 42
 
+    for kind in ("image", "video", "audio"):
+        paths = getattr(args, kind)
+        if paths:
+            setattr(
+                params,
+                f"{kind}_reference",
+                [MediaRef(content=path, format="path", role="reference") for path in paths],
+            )
+    if args.reference_order is not None:
+        params.extra_params = {"reference_order": args.reference_order}
+
     output = visual_gen.generate(
-        inputs=(
+        inputs=args.prompt
+        or (
             "A woman with long brown hair and light skin smiles at the camera "
             "while standing in a sunlit park, her hair gently blowing in the "
             "breeze as she tilts her head slightly to the side."

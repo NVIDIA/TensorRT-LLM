@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 metadata:
   model_name: k25_thinking_fp4
   precision: fp4
@@ -76,6 +79,7 @@ worker_config:
       backend: NIXL
       transceiver_runtime: PYTHON
       kv_cache_bounce_size_mb: 2048
+      agent_bounce_buffer_enable: true
       kv_transfer_timeout_ms: 600000
     disable_overlap_scheduler: false
     trust_remote_code: true
@@ -104,6 +108,7 @@ worker_config:
       backend: NIXL
       transceiver_runtime: PYTHON
       kv_cache_bounce_size_mb: 2048
+      agent_bounce_buffer_enable: true
       kv_transfer_timeout_ms: 600000
     disable_overlap_scheduler: true
     trust_remote_code: true

@@ -1,6 +1,25 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import asyncio
+import gc
 import time
+import weakref
+from collections import UserDict
+from collections.abc import Iterator
 from threading import Thread
+from typing import Literal
 
 import pytest
 import zmq
@@ -8,6 +27,33 @@ import zmq
 from tensorrt_llm.executor.ipc import ZeroMqQueue
 
 pytestmark = pytest.mark.cpu_only
+
+
+@pytest.fixture(params=[zmq.PAIR, zmq.ROUTER], ids=["pair", "router"])
+def async_queue_pair(request: pytest.FixtureRequest) -> Iterator[tuple[ZeroMqQueue, ZeroMqQueue]]:
+    """Provide real HMAC queues for single-frame and multipart receives.
+
+    Args:
+        request: Selects the receiving socket type.
+
+    Yields:
+        The receiving queue and its connected sender.
+    """
+    receiver = ZeroMqQueue(socket_type=request.param, is_server=True, is_async=True)
+    sender = ZeroMqQueue(
+        address=receiver.address,
+        socket_type=zmq.PAIR if request.param == zmq.PAIR else zmq.DEALER,
+        is_server=False,
+        is_async=True,
+    )
+    try:
+        receiver.setup_lazily()
+        sender.setup_lazily()
+        yield receiver, sender
+    finally:
+        for queue in (sender, receiver):
+            queue.socket.setsockopt(zmq.LINGER, 0)
+            queue.close()
 
 
 class TestIpcBasics:
@@ -313,6 +359,162 @@ class TestIpcBasics:
 
 class TestIpcAsyncBasics:
     """Test asynchronous IPC operations."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("delivery", ["ready", "delayed", "stale-ready"])
+    async def test_get_async_noblock_releases_payload_without_gc(
+        self,
+        async_queue_pair: tuple[ZeroMqQueue, ZeroMqQueue],
+        monkeypatch: pytest.MonkeyPatch,
+        delivery: Literal["ready", "delayed", "stale-ready"],
+    ) -> None:
+        """Release received payloads by refcount, including after a real Again.
+
+        Args:
+            async_queue_pair: Real receiver and sender using HMAC.
+            monkeypatch: Overrides only readiness for the stale-event case.
+            delivery: Whether input is ready, delayed, or follows stale readiness.
+        """
+        receiver, sender = async_queue_pair
+        real_get = zmq.asyncio.Socket.get
+        inject_readiness = False
+        stale_reads = 0
+
+        def get_events(socket: zmq.asyncio.Socket, option: int) -> int | bytes:
+            """Report one stale POLLIN while leaving recv and its Future real.
+
+            Args:
+                socket: Socket whose option is being queried.
+                option: Requested ZeroMQ socket option.
+
+            Returns:
+                Injected readiness once, or the real socket option value.
+            """
+            nonlocal inject_readiness, stale_reads
+            if socket is receiver.socket and option == zmq.EVENTS and inject_readiness:
+                inject_readiness = False
+                stale_reads += 1
+                return zmq.POLLIN
+            return real_get(socket, option)
+
+        if delivery == "stale-ready":
+            monkeypatch.setattr(zmq.asyncio.Socket, "get", get_events)
+
+        gc_was_enabled = gc.isenabled()
+        gc.disable()
+        send_task = None
+        try:
+            for index in range(3):
+                payload = UserDict(index=index)
+
+                async def send_delayed() -> None:
+                    """Let the receive reach its empty-socket wait before sending."""
+                    await asyncio.sleep(0)
+                    await sender.put_async(payload)
+
+                if delivery == "ready":
+                    await sender.put_async(payload)
+                    assert await receiver.socket.poll(timeout=2000, flags=zmq.POLLIN)
+                else:
+                    inject_readiness = delivery == "stale-ready"
+                    send_task = asyncio.create_task(send_delayed())
+
+                received, identity = await receiver.get_async_noblock(
+                    timeout=0 if delivery == "ready" else 2, return_identity=True
+                )
+                if send_task is not None:
+                    await send_task
+                assert received == payload
+                if receiver.socket_type == zmq.ROUTER:
+                    assert identity == receiver._last_identity and identity is not None
+                else:
+                    assert identity is None
+                received_ref = weakref.ref(received)
+                del received
+                assert received_ref() is None
+            if delivery == "stale-ready":
+                assert stale_reads == 3
+        finally:
+            if send_task is not None:
+                send_task.cancel()
+                await asyncio.gather(send_task, return_exceptions=True)
+            if gc_was_enabled:
+                gc.enable()
+            gc.collect()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("interruption", ["timeout", "cancel"])
+    async def test_get_async_noblock_after_interruption(
+        self,
+        async_queue_pair: tuple[ZeroMqQueue, ZeroMqQueue],
+        interruption: Literal["timeout", "cancel"],
+    ) -> None:
+        """Keep the next message available after a receive stops waiting.
+
+        Args:
+            async_queue_pair: Real receiver and sender using HMAC.
+            interruption: Whether the first empty receive times out or is cancelled.
+        """
+        receiver, sender = async_queue_pair
+        if interruption == "timeout":
+            with pytest.raises(asyncio.TimeoutError):
+                await receiver.get_async_noblock(timeout=0.01)
+        else:
+            receive_task = asyncio.create_task(receiver.get_async_noblock(timeout=2))
+            try:
+                await asyncio.sleep(0)
+                assert not receive_task.done()
+                receive_task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await receive_task
+            finally:
+                receive_task.cancel()
+                await asyncio.gather(receive_task, return_exceptions=True)
+
+        await sender.put_async({"after": interruption})
+        assert await receiver.get_async_noblock(timeout=2) == {"after": interruption}
+        with pytest.raises(asyncio.TimeoutError):
+            await receiver.get_async_noblock(timeout=0)
+
+    @pytest.mark.asyncio
+    async def test_get_async_noblock_stale_readiness_respects_timeout(
+        self,
+        async_queue_pair: tuple[ZeroMqQueue, ZeroMqQueue],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Bound retries when POLLIN remains stale after the deadline.
+
+        Args:
+            async_queue_pair: Real receiver and sender using HMAC.
+            monkeypatch: Forces stale readiness without replacing receives.
+        """
+        receiver, _ = async_queue_pair
+        real_get = zmq.asyncio.Socket.get
+        readiness_reads = 0
+
+        def get_events(socket: zmq.asyncio.Socket, option: int) -> int | bytes:
+            """Cap stale readiness checks so a broken loop cannot hang the test.
+
+            Args:
+                socket: Socket whose option is being queried.
+                option: Requested ZeroMQ socket option.
+
+            Returns:
+                Stale readiness for the receiver, or the real socket option value.
+
+            Raises:
+                AssertionError: If receive keeps retrying past its deadline.
+            """
+            nonlocal readiness_reads
+            if socket is receiver.socket and option == zmq.EVENTS:
+                readiness_reads += 1
+                assert readiness_reads <= 16, "receive ignored its deadline after zmq.Again"
+                return zmq.POLLIN
+            return real_get(socket, option)
+
+        monkeypatch.setattr(zmq.asyncio.Socket, "get", get_events)
+        with pytest.raises(asyncio.TimeoutError):
+            await receiver.get_async_noblock(timeout=0)
 
     @pytest.mark.asyncio
     async def test_async_pair_with_hmac(self):

@@ -56,6 +56,15 @@ fi
 DEST="$(mktemp -d)"
 trap 'rm -rf "$DEST"' EXIT
 
+# 0) Put llvm-bolt on PATH. No-op when the caller already staged it (the Jenkins
+#    build pods do), which keeps this free for them and lets callers that cannot
+#    stage it themselves -- notably the image build, where this runs inside a
+#    docker layer -- just call apply_latest.sh and get a working toolchain.
+if ! . "$HERE/stage_llvm_bolt.sh"; then
+    echo "[apply_latest] FATAL: could not stage llvm-bolt" >&2
+    exit 2
+fi
+
 # 1) Pull the branch `latest` bundle. A missing bundle is fatal here (see header):
 #    consumption was requested but there is nothing promoted to consume.
 if ! bash "$HERE/artifactory.sh" pull-latest "$BRANCH" "$TRIPLE" "$DEST"; then
