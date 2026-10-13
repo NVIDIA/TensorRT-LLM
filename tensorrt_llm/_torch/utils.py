@@ -449,11 +449,6 @@ def deep_gemm_jit_warmup_buckets(max_m: int):
     own (``block_m=16``: one wave, best last-wave utilization) that a step-128
     grid steps over, sampling 2304 and 2432.
     """
-    from .jit_prefetch import warmup_jit_coverage_enabled
-    if not warmup_jit_coverage_enabled():
-        # JIT prefetch compiles the layouts this grid exists for, so warmup
-        # keeps only the tuning grid.
-        return deep_gemm_gen_tuning_buckets(max_m)
     # A worker whose M never leaves the low band -- a disagg GEN worker runs at
     # batch x MTP tokens -- must not be pulled up to the 4096 floor. Measured
     # cost of doing so: +283 s of GEN autotune, +1096 tuning-cache entries.
