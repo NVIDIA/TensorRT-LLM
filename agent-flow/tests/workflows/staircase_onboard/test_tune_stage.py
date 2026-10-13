@@ -510,3 +510,60 @@ def test_the_gate_runs_the_target_suite_first_and_fails_without_the_eval(tmp_pat
     assert "1 failed" in result["reason"] and not (out / "eval.log").exists()
     cmd = campaign_mod.gate_command(Path("/pkg"), Path("/env.sh"), "m", 96.0, tests=["tests/unittest/t"])(tree, [], out)
     assert "--tests tests/unittest/t" in cmd
+
+
+def test_a_measurement_lost_with_its_session_is_re_queued_not_reverted(tmp_path):
+    """The session running a candidate's e2e dies (rc 212, orphaned): the substrate's
+    failure is not the candidate's; it is measured again and kept. A full filesystem
+    during a step is retried on the next poll."""
+    import errno
+
+    from agent_flow.workflows.staircase_onboard.tune.campaign import Campaign
+    from agent_flow.workflows.staircase_onboard.tune.ladder import BenchSpec
+    from agent_flow.workflows.staircase_onboard.tune.records import NoiseFloor
+    from agent_flow.workflows.staircase_onboard.tune.worktree import open_candidate
+
+    class LosesFirstRun(FakeRunner):
+        lost = False
+
+        def poll(self):
+            for name, (spool, label) in list(self.inflight.items()):
+                if label.startswith("e2e-") and not self.lost:
+                    self.lost = True
+                    del self.inflight[name]
+                    return [(label, spool, 212)]
+            return super().poll()
+
+    repo = _repo(tmp_path)
+    identity = tmp_path / "identity.yaml"
+    identity.write_text(yaml.safe_dump({"modeling_v2": "require"}))
+    bench = BenchSpec(bench_py="b", model="m", env_script="e", isl=8192, osl=1024, concurrencies=[1, 128], tree=str(repo))
+    perf, gates = LosesFirstRun(["s1"], "camp", _effect), FakeRunner(["g1"], "campg", _effect)
+    work = tmp_path / "camp"
+    msgs = []
+    camp = Campaign(workdir=work, repo=repo, bench=bench, base_configs=[identity], perf_runner=perf, gate_runner=gates,
+                    gate_cmd=lambda tree, configs, out: f"python gate_accuracy.py --out {out}",
+                    noise=NoiseFloor(spread={"con1.tok_s_user": 0.001}), log=msgs.append)
+    camp.state.best_tree = str(open_candidate(repo, work / "wt", "best", "HEAD"))
+    camp.state.best_commit = _git(Path(camp.state.best_tree), "rev-parse", "HEAD")
+    wt = open_candidate(repo, work / "wt", "fast-path", "HEAD")
+    (wt / "modeling.py").write_text("FAST = True\n")
+    _git(wt, "commit", "-q", "-am", "fast")
+    d = tmp_path / "fast-path.yaml"
+    d.write_text(yaml.safe_dump({"decision": "CANDIDATE", "worktree": str(wt), "commits": [_git(wt, "rev-parse", "HEAD")]}))
+    camp.submit_candidate("fast-path", d)
+
+    real_save, full = camp.state.save, {"n": 1}
+
+    def save(path):
+        if full["n"]:
+            full["n"] -= 1
+            raise OSError(errno.EDQUOT, "Disk quota exceeded")
+        real_save(path)
+
+    camp.state.save = save
+    for _ in range(30):
+        if not camp.step():
+            break
+    assert camp.state.candidates["fast-path"].status == "kept"
+    assert any("re-queued" in m for m in msgs) and any("Disk quota exceeded" in m for m in msgs)

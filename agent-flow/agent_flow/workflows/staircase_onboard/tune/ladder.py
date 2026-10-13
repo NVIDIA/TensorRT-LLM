@@ -271,6 +271,11 @@ class SpoolRunner:
         if tree:
             header["tree"] = tree
         script = self._spoolctl.render_job(command, header=header)
+        receipt = Path(spool) / "done" / f"{name}.rc"
+        if receipt.exists():
+            # A re-run of a label whose earlier run failed: its old receipt would
+            # read as this run finishing at once.
+            receipt.rename(receipt.with_name(f"{receipt.name}.superseded-{int(time.time())}"))
         try:
             self._spoolctl.queue_job(spool, name, script)
         except self._spoolctl.SpoolError as exc:

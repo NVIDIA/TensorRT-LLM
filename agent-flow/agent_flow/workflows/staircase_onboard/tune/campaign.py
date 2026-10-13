@@ -65,6 +65,9 @@ class CandidateState:
     # batch (rebased onto the batch while the batch is measured).
     rebase_onto: str = ""
     rebase_ref: str = ""
+    # Failed runs of the current e2e label / gate: a session that dies (a full
+    # filesystem, a node fault) fails the job without saying anything about it.
+    retries: int = 0
 
 
 @dataclass
@@ -103,6 +106,10 @@ def read_decision(path: Path) -> dict:
         raise ValueError(f"{path}: decision {decision!r} is not one of {TUNER_DECISIONS}")
     data["decision"] = decision
     return data
+
+
+#: Return codes the substrate gives a job that it, not the job, ended (scheduler.RC_*).
+INFRA_RCS = frozenset({210, 212, 214, 215})  # stalled, orphaned, host memory, launch failed
 
 
 def git(tree: Path | str, *args: str, check: bool = True) -> str:
@@ -341,6 +348,7 @@ class Campaign:
         import hashlib
 
         st.eval_config = self._config_key()
+        st.retries = 0
         cfg = hashlib.sha1(st.eval_config.encode()).hexdigest()[:6] if st.eval_config else "id"
         st.e2e_label = f"e2e-{st.slug}-{git(Path(st.eval_tree), 'rev-parse', '--short=10', 'HEAD')}-{cfg}"
 
@@ -358,25 +366,55 @@ class Campaign:
         for path in sorted((self.workdir / "inbox").glob("*.json")):
             try:
                 item = json.loads(path.read_text())
-                if item["slug"] not in self.state.candidates or self.state.candidates[item["slug"]].status in ("conflict", "blocked"):
+                if item["slug"] not in self.state.candidates or self.state.candidates[item["slug"]].status in ("issued", "conflict", "blocked"):
                     self.submit_candidate(item["slug"], Path(item["decision"]))
                     self.log(f"[campaign] ingested {item['slug']}")
             except (OSError, ValueError, KeyError, RuntimeError) as exc:
+                if getattr(exc, "errno", None) in (28, 122) or "quota exceeded" in str(exc) or "No space left" in str(exc):
+                    # The filesystem is full, not the submission wrong: keep it for the next poll.
+                    self.log(f"[campaign] could not ingest {path.name} yet: {exc}")
+                    return
                 self.log(f"[campaign] could not ingest {path.name}: {exc}")
             path.unlink(missing_ok=True)
 
     def step(self) -> bool:
-        """Advance every candidate as far as possible; True while any is in flight."""
+        """Advance every candidate as far as possible; True while any is in flight.
+
+        A full filesystem (a shared quota other users fill) fails the loop's own
+        small writes for minutes at a time: the step is retried on the next poll."""
+        try:
+            return self._step()
+        except OSError as exc:
+            if exc.errno not in (28, 122):  # ENOSPC, EDQUOT
+                raise
+            self.log(f"[campaign] {exc.strerror}; retrying on the next poll")
+            return True
+
+    def _retry(self, st: CandidateState, rc: int, what: str) -> bool:
+        """True when a failed run is re-queued: once for any failure, twice for the substrate's own."""
+        limit = 2 if rc in INFRA_RCS else 1
+        if st.retries >= limit:
+            return False
+        st.retries += 1
+        self.ledger.append("retry", slug=st.slug, what=what, rc=rc, attempt=st.retries)
+        self.log(f"[campaign] {st.slug}: {what} failed (rc={rc}); re-queued (attempt {st.retries + 1})")
+        return True
+
+    def _step(self) -> bool:
         self._ingest()
-        finished = {label for label, _, _ in self.perf.poll()} | {label for label, _, _ in self.gates.poll()}
+        polled = [*self.perf.poll(), *self.gates.poll()]
+        finished = {label for label, _, _ in polled}
+        self._rcs = {label: rc for label, _, rc in polled}
         busy = False
         for st in self.state.candidates.values():
             if st.status == "e2e":
                 busy = True
                 m = self._measurement(st.e2e_label)
                 if m is None and f"{self.perf.prefix}-{st.e2e_label}" not in self.perf.inflight:
-                    if st.e2e_label in finished:
+                    if st.e2e_label in finished and not self._retry(st, self._rcs[st.e2e_label], "e2e"):
                         st.status, st.reason = "reverted", "e2e measurement failed (see the label's .partial dir)"
+                        continue
+                    if st.e2e_label in finished:
                         continue
                     if st.eval_base and st.eval_base != git(Path(self.state.best_tree), "rev-parse", "HEAD"):
                         # Not measured yet and the best tree moved: stack on it first.
@@ -422,6 +460,7 @@ class Campaign:
                 # winners are stacked and measured once (see _batch) instead of being
                 # kept one by one, each keep forcing the rest to re-measure.
                 st.status = "won" if cmp.verdict == "WIN" else "reverted"
+                st.retries = 0
             if st.status == "gate":
                 busy = True
                 # Keyed by the tree gated: a candidate re-stacked on a new best is a
@@ -431,8 +470,10 @@ class Campaign:
                 result = out / "result.json"
                 job = f"gate-{st.slug}-{tree_sha}"
                 if not result.exists() and f"{self.gates.prefix}-{job}" not in self.gates.inflight:
-                    if job in finished:
+                    if job in finished and not self._retry(st, self._rcs[job], "gate"):
                         st.status, st.reason = "reverted", f"accuracy gate did not produce a result; see {out}"
+                        continue
+                    if job in finished:
                         continue
                     free = self.gates.free_spools()
                     if free:
@@ -529,6 +570,8 @@ class Campaign:
         if b["status"] == "e2e":
             m = self._measurement(b["label"])
             if m is None:
+                if b["label"] in getattr(self, "_rcs", {}) and self._batch_failed(b, winners, "e2e", b["label"]):
+                    return True
                 if f"{self.perf.prefix}-{b['label']}" not in self.perf.inflight:
                     spool = self._queue_measurement(b["label"], b["tree"])
                     if spool:
@@ -563,6 +606,8 @@ class Campaign:
             result = out / "result.json"
             job = f"gate-batch-{sha}"
             if not result.exists():
+                if job in getattr(self, "_rcs", {}) and self._batch_failed(b, winners, "gate", job):
+                    return True
                 if f"{self.gates.prefix}-{job}" not in self.gates.inflight:
                     free = self.gates.free_spools()
                     if free:
@@ -597,6 +642,20 @@ class Campaign:
                 if other.status == "e2e" and other.e2e_label and self.perf.cancel(other.e2e_label):
                     other.e2e_label = ""
             self._end_batch(kept=True)
+        return True
+
+    def _batch_failed(self, b: dict, winners: Sequence[CandidateState], what: str, key: str) -> bool:
+        """A batch run that failed is re-queued once (twice for the substrate's own failures);
+        after that the batch is abandoned and its strongest member is gated alone."""
+        rc = self._rcs.get(key, 1)
+        b["retries"] = int(b.get("retries", 0)) + 1
+        self.ledger.append("retry", slug="batch", what=what, rc=rc, attempt=b["retries"])
+        if b["retries"] <= (2 if rc in INFRA_RCS else 1):
+            self.log(f"[campaign] batch {what} failed (rc={rc}); re-queued")
+            return False
+        self.log(f"[campaign] batch {what} failed {b['retries']} times; gating {winners[0].slug} alone")
+        winners[0].status = "gate"
+        self._end_batch(kept=False)
         return True
 
     def _end_batch(self, *, kept: bool) -> None:

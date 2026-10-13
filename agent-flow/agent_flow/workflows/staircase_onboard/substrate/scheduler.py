@@ -106,6 +106,8 @@ ALL_GPUS = "all"
 #: Names a job may have. A name is a file name on a shared filesystem.
 NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
+#: errno values of a full filesystem or quota: transient for a long-lived watcher.
+FULL_FILESYSTEM_ERRNOS = frozenset({28, 122})  # ENOSPC, EDQUOT
 RC_WALL_LIMIT = 124
 RC_STALLED = 210
 RC_MEMORY_LIMIT = 211
@@ -733,7 +735,15 @@ class Scheduler:
     def serve(self) -> int:
         """Run until ``STOP`` is present and every job this watcher started is gone."""
         while True:
-            self.tick()
+            try:
+                self.tick()
+            except OSError as exc:
+                if exc.errno not in FULL_FILESYSTEM_ERRNOS:
+                    raise
+                # A full filesystem (a shared project quota other users fill) fails
+                # our small writes for minutes at a time. The jobs keep running;
+                # dying here would orphan every one of them and end the session.
+                print(f"watcher: {exc.strerror} at {utc_iso()}; retrying next tick", file=sys.stderr, flush=True)
             if self.stopping() and not self.jobs:
                 self._append_status(f"watcher: STOP honoured, exiting at {utc_iso()}")
                 self._retire()

@@ -572,6 +572,35 @@ def test_stop_drains_running_work_then_exits(spool, clock):
     assert rc(spool, "free-never") is None
 
 
+def test_a_full_filesystem_does_not_end_the_session(spool, clock):
+    """A shared project quota hits its limit: the heartbeat write fails with EDQUOT.
+    The watcher keeps serving (its running job finishes and is reaped) instead of
+    exiting and orphaning every job in the session."""
+    import errno
+
+    sched = make(spool, clock, poll_s=0.02)
+    submit(spool, "survivor", blocking(spool, "survivor"))
+    pump(sched, lambda: "survivor" in running(sched))
+    real, failures = sched.heartbeat, {"n": 0}
+
+    def full():
+        if failures["n"] < 3:
+            failures["n"] += 1
+            raise OSError(errno.EDQUOT, "Disk quota exceeded")
+        real()
+
+    sched.heartbeat = full
+    SpoolPaths(spool).stop.write_text("")
+    result = {}
+    thread = threading.Thread(target=lambda: result.setdefault("rc", sched.serve()), daemon=True)
+    thread.start()
+    time.sleep(0.2)
+    assert thread.is_alive() and failures["n"] == 3
+    release(spool, "survivor")
+    thread.join(timeout=10)
+    assert result.get("rc") == 0 and rc(spool, "survivor") == 0
+
+
 # ---------------------------------------------------------------- the client
 
 
