@@ -603,6 +603,9 @@ class TestFlashInferAttention(unittest.TestCase):
         self.assertIn("kv_indptr", wrapper.plan_kwargs)
         self.assertNotIn("v_indptr", wrapper.plan_kwargs)
         self.assertNotIn("o_indptr", wrapper.plan_kwargs)
+        # FlashInfer's cudnn backend takes token-unit indptrs like every other backend.
+        self.assertEqual(wrapper.plan_kwargs["qo_indptr"].tolist(), [0, 3, 8])
+        self.assertEqual(wrapper.plan_kwargs["kv_indptr"].tolist(), [0, 3, 8])
 
     @parameterized.expand([
         Scenario(num_layers=1,
