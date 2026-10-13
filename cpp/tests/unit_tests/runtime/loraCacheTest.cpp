@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -323,7 +323,7 @@ TEST_F(LoraCacheTest, basicPutGet)
     auto const tpSize = mWorldConfig->getTensorParallelism();
     for (size_t i = 0; i < values.size(); ++i)
     {
-        auto const configRowPtr = bufferCast<int32_t>(*ITensor::slice(loraReqKeys, i, 1));
+        auto const configRowPtr = ITensor::slice(loraReqKeys, i, 1)->getBufferPtr<int32_t>();
         auto const modId = configRowPtr[lora::kLORA_CONFIG_MODULE_OFF];
         auto const adapterSize = configRowPtr[lora::kLORA_CONFIG_ADAPTER_SIZE_OFF];
         auto modIt = std::find_if(mModelConfig->getLoraModules().begin(), mModelConfig->getLoraModules().end(),
@@ -339,8 +339,8 @@ TEST_F(LoraCacheTest, basicPutGet)
         TensorPtr rowFlatView = ITensor::view(row, ITensor::makeShape({rowSize}));
         TensorPtr expectedIn = ITensor::slice(rowFlatView, 0, inSize);
         TensorPtr expectedOut = ITensor::slice(rowFlatView, inSize, outSize);
-        auto const expectedInPtr = bufferCast<float>(*expectedIn);
-        auto const expectedOutPtr = bufferCast<float>(*expectedOut);
+        auto const expectedInPtr = expectedIn->getBufferPtr<float>();
+        auto const expectedOutPtr = expectedOut->getBufferPtr<float>();
         for (size_t j = 0; j < values.at(i).inSize; ++j)
         {
             EXPECT_FLOAT_EQ(weightsInPtr[j], expectedInPtr[j]);
@@ -363,8 +363,8 @@ TEST_F(LoraCacheTest, basicPutGet)
         auto hostPage2 = mManager->copyFrom(*page2, runtime::MemoryType::kCPU);
         ASSERT_TRUE(ITensor::shapeEquals(page1->getShape(), page2->getShape()));
         auto const pageSize = page1->getSize();
-        auto const p1 = bufferCast<float>(*page1);
-        auto const p2 = bufferCast<float>(*hostPage2);
+        auto const p1 = page1->getBufferPtr<float>();
+        auto const p2 = hostPage2->getBufferPtr<float>();
         for (size_t i = 0; i < static_cast<size_t>(pageSize); ++i)
         {
             ASSERT_FLOAT_EQ(p1[i], p2[i]);
@@ -396,8 +396,8 @@ TEST_F(LoraCacheTest, splitTransposeCpu)
         mManager->setZero(*outputTensorRank0);
         mManager->setZero(*outputTensorRank1);
 
-        auto outputPtrRank0 = bufferCast<SizeType32>(*outputTensorRank0);
-        auto outputPtrRank1 = bufferCast<SizeType32>(*outputTensorRank1);
+        auto outputPtrRank0 = outputTensorRank0->getBufferPtr<SizeType32>();
+        auto outputPtrRank1 = outputTensorRank1->getBufferPtr<SizeType32>();
 
         LoraCache::splitTransposeCpu(*outputTensorRank0, *inputTensor, split, 0);
         LoraCache::splitTransposeCpu(*outputTensorRank1, *inputTensor, split, 1);
@@ -424,8 +424,8 @@ TEST_F(LoraCacheTest, splitTransposeCpu)
         LoraCache::splitTransposeCpu(*outputTensorRank0, *inputTensor, split, 0);
         LoraCache::splitTransposeCpu(*outputTensorRank1, *inputTensor, split, 1);
 
-        auto outputPtrRank0 = bufferCast<SizeType32>(*outputTensorRank0);
-        auto outputPtrRank1 = bufferCast<SizeType32>(*outputTensorRank1);
+        auto outputPtrRank0 = outputTensorRank0->getBufferPtr<SizeType32>();
+        auto outputPtrRank1 = outputTensorRank1->getBufferPtr<SizeType32>();
 
         for (SizeType32 i = 0; i < static_cast<SizeType32>(outputRank0.size()); ++i)
         {
@@ -489,8 +489,8 @@ TEST_P(LoraCacheTest, copyToPages_tp1)
     auto locations = LoraCache::copyToPages(
         loraReqWeights, loraReqKeys, modelConfig, worldConfig, moduleIdToModule, *mManager, pages, pageIds);
 
-    auto pagePtr = bufferCast<float>(*pageBlock);
-    auto targetPtr = bufferCast<float>(*targetPageBlock);
+    auto pagePtr = pageBlock->getBufferPtr<float>();
+    auto targetPtr = targetPageBlock->getBufferPtr<float>();
 
     for (SizeType32 i = 0; i < pageBlock->getSize(); ++i)
     {
@@ -550,8 +550,8 @@ TEST_P(LoraCacheTest, copyToPages_tp2_rank0)
     auto locations = LoraCache::copyToPages(
         loraReqWeights, loraReqKeys, modelConfig, worldConfig, moduleIdToModule, *mManager, pages, pageIds);
 
-    auto pagePtr = bufferCast<float>(*pageBlock);
-    auto targetPtr = bufferCast<float>(*targetPageBlock);
+    auto pagePtr = pageBlock->getBufferPtr<float>();
+    auto targetPtr = targetPageBlock->getBufferPtr<float>();
 
     for (SizeType32 i = 0; i < pageBlock->getSize(); ++i)
     {
@@ -611,8 +611,8 @@ TEST_P(LoraCacheTest, copyToPages_tp2_rank1)
     auto locations = LoraCache::copyToPages(
         loraReqWeights, loraReqKeys, modelConfig, worldConfig, moduleIdToModule, *mManager, pages, pageIds);
 
-    auto pagePtr = bufferCast<float>(*pageBlock);
-    auto targetPtr = bufferCast<float>(*targetPageBlock);
+    auto pagePtr = pageBlock->getBufferPtr<float>();
+    auto targetPtr = targetPageBlock->getBufferPtr<float>();
 
     for (SizeType32 i = 0; i < pageBlock->getSize(); ++i)
     {

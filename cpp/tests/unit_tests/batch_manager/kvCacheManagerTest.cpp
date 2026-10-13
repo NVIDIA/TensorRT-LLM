@@ -748,13 +748,13 @@ TEST_F(KVCacheManagerTest, FP4AttentionWithHalfRecurrentStatesPoolTest)
     ASSERT_NE(blockScalePoolPointers, nullptr);
     EXPECT_EQ(blockPoolPointers->getShape().d[0], 2);
     EXPECT_EQ(blockScalePoolPointers->getShape().d[0], 1);
-    auto const blockScalePoolPointersRange = tr::BufferRange<void*>(*blockScalePoolPointers);
+    auto const blockScalePoolPointersRange = blockScalePoolPointers->getBufferRange<void*>();
     EXPECT_NE(blockScalePoolPointersRange[0], nullptr);
     EXPECT_EQ(blockScalePoolPointersRange[1], nullptr);
 
     auto const layerToPoolMapping = kvCacheManager.getLayerToPoolMapping();
     ASSERT_NE(layerToPoolMapping, nullptr);
-    auto const layerToPoolMappingRange = tr::BufferRange<SizeType32>(*layerToPoolMapping);
+    auto const layerToPoolMappingRange = layerToPoolMapping->getBufferRange<SizeType32>();
     EXPECT_EQ(layerToPoolMappingRange[0], 0);
     EXPECT_EQ(layerToPoolMappingRange[2], 1);
 }
@@ -3526,7 +3526,7 @@ TEST_P(KVCacheManagerTest, KVCacheManagerTest)
         tr::ITensor::makeShape({expectedNumPools, maxNumSequences * maxBeamWidth, 2, maxBlocksPerSeq}),
         tr::TRTDataType<tk::KVCacheIndex>::value);
 
-    auto kvCacheBlockOffsetsRange = tensorrt_llm::runtime::BufferRange<tk::KVCacheIndex>(*kvCacheBlockOffsets);
+    auto kvCacheBlockOffsetsRange = kvCacheBlockOffsets->getBufferRange<tk::KVCacheIndex>();
     std::fill(kvCacheBlockOffsetsRange.begin(), kvCacheBlockOffsetsRange.end(),
         tk::KVCacheIndex{std::numeric_limits<tk::KVCacheIndex::UnderlyingType>::max()});
 
@@ -3554,7 +3554,7 @@ TEST_P(KVCacheManagerTest, KVCacheManagerTest)
             tr::ITensor::SharedPtr blockOffsetsSlice
                 = tr::ITensor::slice(tr::ITensor::at(kvCacheBlockOffsets, {poolIdx}), 0, maxBeamWidth);
             auto blockOffsetsShape = blockOffsetsSlice->getShape();
-            auto* const blockOffsetsPtr = tr::bufferCast<tk::KVCacheIndex>(*blockOffsetsSlice);
+            auto* const blockOffsetsPtr = blockOffsetsSlice->getBufferPtr<tk::KVCacheIndex>();
 
             tk::KVCacheIndex::UnderlyingType runningSum{0};
             for (auto block = 0; block < numSharedBlocks; ++block)
@@ -3828,7 +3828,7 @@ TEST_P(KVCacheManagerTest, KVCacheManagerMaxAttentionWindowTest)
         tr::ITensor::SharedPtr const blockOffsetsSlice
             = tr::ITensor::slice(tr::ITensor::at(kvCacheBlockOffsets, {poolIdx}), 0, maxBeamWidth);
         auto blockOffsetsShape = blockOffsetsSlice->getShape();
-        auto* const blockOffsetsPtr = tr::bufferCast<tk::KVCacheIndex>(*blockOffsetsSlice);
+        auto* const blockOffsetsPtr = blockOffsetsSlice->getBufferPtr<tk::KVCacheIndex>();
 
         tk::KVCacheIndex::UnderlyingType runningSum{0};
         for (auto block = 0; block < numSharedBlocks; ++block)
@@ -5211,7 +5211,7 @@ TEST_F(KVCacheManagerTest, KVCacheTransferManagerConcurrencyTest)
     // Write some specific data into the cpu blocks.
     for (int i = 0; i < blockSize; i++)
     {
-        tr::bufferCast<float>(*pool.secondaryPtr)[i] = 1;
+        pool.secondaryPtr->getBufferPtr<float>()[i] = 1;
     }
 
     auto primaryBlock = std::make_shared<KVCacheBlock>(0, tensorrt_llm::kernels::KVCacheIndex(0, false));
@@ -5227,7 +5227,7 @@ TEST_F(KVCacheManagerTest, KVCacheTransferManagerConcurrencyTest)
 
     for (int i = 0; i < blockSize; i++)
     {
-        EXPECT_EQ(tr::bufferCast<float>(*pool.secondaryPtr)[i], 0);
+        EXPECT_EQ(pool.secondaryPtr->getBufferPtr<float>()[i], 0);
     }
 }
 
@@ -5382,7 +5382,7 @@ TEST_P(KVCacheManagerTest, DISABLED_KVCacheManagerSinkTokenLengthTest)
             tr::ITensor::SharedPtr blockOffsetsSlice
                 = tr::ITensor::slice(tr::ITensor::at(kvCacheBlockOffsets, {poolIdx}), 0, maxBeamWidth);
             auto blockOffsetsShape = blockOffsetsSlice->getShape();
-            auto const blockOffsetsPtr = tr::bufferCast<tk::KVCacheIndex>(*blockOffsetsSlice);
+            auto const blockOffsetsPtr = blockOffsetsSlice->getBufferPtr<tk::KVCacheIndex>();
 
             tk::KVCacheIndex::UnderlyingType runningSum{0};
             for (auto block = 0; block < numSharedBlocksCtx; ++block)
@@ -5550,7 +5550,7 @@ TEST_P(KVCacheManagerTest, KVCacheManagerBatchTest)
             tr::ITensor::SharedPtr const blockOffsetsSlice = tr::ITensor::slice(
                 tr::ITensor::at(kvCacheBlockOffsets, {poolIdx}), 0, maxNumSequences * maxBeamWidth);
             auto blockOffsetsShape = blockOffsetsSlice->getShape();
-            auto* const blockOffsetsPtr = tr::bufferCast<tk::KVCacheIndex>(*blockOffsetsSlice);
+            auto* const blockOffsetsPtr = blockOffsetsSlice->getBufferPtr<tk::KVCacheIndex>();
 
             tk::KVCacheIndex::UnderlyingType runningSum{0};
             for (auto requestId = 0; requestId < maxNumSequences; ++requestId)
@@ -8148,7 +8148,7 @@ void testKVCacheManagerLinearAttention_BlockCopying(
         tr::ITensor::at(kvCacheBlockOffsets, {linearPoolIdx}), 0, beamWidth); // {beamWidth, 2(k&v), maxBlocksPerSeq}
 
     auto blockOffsetsShape = blockOffsetsSlice->getShape();
-    auto* const blockOffsetsPtr = tr::bufferCast<tk::KVCacheIndex>(*blockOffsetsSlice);
+    auto* const blockOffsetsPtr = blockOffsetsSlice->getBufferPtr<tk::KVCacheIndex>();
 
     auto blockIds = kvCacheManager.getCacheBlockIds(llmRequest0->mRequestId, linearWindowSizeCode);
     for (int beam = 0; beam < beamWidth; ++beam)
