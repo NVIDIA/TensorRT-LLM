@@ -573,6 +573,7 @@ class TestCrossKvCacheConstruction:
 
     @pytest.mark.parametrize("use_kv_cache_manager_v2", [False, True])
     def test_build_managers_registers_cross_pool_for_enc_dec(self, use_kv_cache_manager_v2):
+        expected_cls = KVCacheManagerV2 if use_kv_cache_manager_v2 else KVCacheManager
         creator = _make_creator(
             _make_kv_cache_config(
                 cross_kv_cache_fraction=0.5,
@@ -584,13 +585,25 @@ class TestCrossKvCacheConstruction:
         creator.configure_kv_cache_capacity = Mock()
         creator._should_create_separate_draft_kv_cache = Mock(return_value=False)
         creator._split_kv_cache_budget_for_cross = Mock(return_value=(Mock(), Mock()))
-        creator._create_kv_cache_manager = Mock(return_value=Mock())
-        creator._create_cross_kv_cache_manager = Mock(return_value=Mock())
+        self_mgr = Mock(spec=expected_cls)
+        cross_mgr = Mock(spec=expected_cls)
+        creator._create_kv_cache_manager = Mock(return_value=self_mgr)
 
         resources = {}
-        creator.build_managers(resources, estimating_kv_cache=False)
+        with patch(
+            "tensorrt_llm._torch.pyexecutor._util._create_kv_cache_manager",
+            return_value=cross_mgr,
+        ) as create_mock:
+            creator.build_managers(resources, estimating_kv_cache=False)
 
-        creator._create_cross_kv_cache_manager.assert_called_once()
+        assert resources[ResourceManagerType.KV_CACHE_MANAGER] is self_mgr
+        assert resources[ResourceManagerType.CROSS_KV_CACHE_MANAGER] is cross_mgr
+        create_mock.assert_called_once()
+        kwargs = create_mock.call_args.kwargs
+        assert kwargs["kv_cache_manager_cls"] is expected_cls
+        assert kwargs["kv_cache_type"] == (
+            tensorrt_llm.bindings.internal.batch_manager.CacheType.CROSS
+        )
 
     @pytest.mark.parametrize("use_kv_cache_manager_v2", [False, True])
     def test_build_managers_registers_cross_pool_for_enc_dec_estimation(
@@ -821,164 +834,6 @@ class TestKVCacheV2SchedulerCrossParam:
         assert kwargs["cross_kv_cache_manager"] is cross_mgr
         assert kwargs["no_schedule_until_state"] == LlmRequestState.ENCODER_INIT
         assert kwargs["enable_recompute_pause"] is enable_recompute_pause
-
-
-# ---------------------------------------------------------------------------
-# Tests: V1 scheduler cross_kv_cache_manager wiring.
-# ---------------------------------------------------------------------------
-
-
-class TestBindCapacitySchedulerCrossParam:
-    """C++-bound V1 ``BindCapacityScheduler`` exposes cross-KV wiring.
-
-    The C++ ``CapacityScheduler`` already accepts a cross manager. The Python
-    wrapper forwards the cross pool and the ENCODER_INIT gating.
-    """
-
-    def test_default_cross_is_none_and_default_until_state(self):
-        from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
-        from tensorrt_llm._torch.pyexecutor.scheduler.scheduler import BindCapacityScheduler
-
-        with patch(
-            "tensorrt_llm._torch.pyexecutor.scheduler.scheduler.tb_internal.algorithms.CapacityScheduler"
-        ) as cap_cls:
-            cap_cls.return_value = Mock()
-            scheduler = BindCapacityScheduler(
-                max_num_requests=8,
-                kv_cache_manager=Mock(),
-                peft_cache_manager=None,
-                scheduler_policy=CapacitySchedulerPolicy.MAX_UTILIZATION,
-            )
-
-        assert scheduler.cross_kv_cache_manager is None
-        kwargs = cap_cls.call_args.kwargs
-        assert kwargs["no_schedule_until_state"] == LlmRequestState.CONTEXT_INIT
-
-    def test_cross_kv_cache_manager_and_until_state_are_forwarded(self):
-        from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
-        from tensorrt_llm._torch.pyexecutor.scheduler.scheduler import BindCapacityScheduler
-
-        cross_mgr = Mock()
-        kv_mgr = Mock()
-        with patch(
-            "tensorrt_llm._torch.pyexecutor.scheduler.scheduler.tb_internal.algorithms.CapacityScheduler"
-        ) as cap_cls:
-            impl = Mock()
-            cap_cls.return_value = impl
-            scheduler = BindCapacityScheduler(
-                max_num_requests=8,
-                kv_cache_manager=kv_mgr,
-                peft_cache_manager=None,
-                scheduler_policy=CapacitySchedulerPolicy.MAX_UTILIZATION,
-                cross_kv_cache_manager=cross_mgr,
-                no_schedule_until_state=LlmRequestState.ENCODER_INIT,
-            )
-
-            # Construction forwarded the gating to the C++ binding.
-            ctor_kwargs = cap_cls.call_args.kwargs
-            assert ctor_kwargs["no_schedule_until_state"] == LlmRequestState.ENCODER_INIT
-
-            # schedule_request must forward the cross manager to the C++
-            # __call__ so the dual-pool scheduling logic activates.
-            impl.return_value = ([], [], [])
-            scheduler.schedule_request([])
-            impl.assert_called_once_with([], kv_mgr, None, cross_mgr)
-
-
-class TestSimpleUnifiedSchedulerCrossParam:
-    """V1 Python ``SimpleUnifiedScheduler`` exposes cross-KV wiring."""
-
-    def test_cross_kv_cache_manager_and_until_state_are_forwarded(self):
-        from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
-        from tensorrt_llm._torch.pyexecutor.scheduler.scheduler import SimpleUnifiedScheduler
-
-        kv_mgr = Mock()
-        kv_mgr.is_variable_window = False
-        kv_mgr.enable_block_reuse = False
-        cross_mgr = Mock()
-        cross_mgr.is_variable_window = False
-        cross_mgr.enable_block_reuse = False
-
-        scheduler = SimpleUnifiedScheduler(
-            max_batch_size=8,
-            max_num_tokens=4096,
-            kv_cache_manager=kv_mgr,
-            peft_cache_manager=None,
-            scheduler_policy=CapacitySchedulerPolicy.MAX_UTILIZATION,
-            cross_kv_cache_manager=cross_mgr,
-            no_schedule_until_state=LlmRequestState.ENCODER_INIT,
-        )
-
-        assert scheduler.capacity_scheduler.cross_kv_cache_manager is cross_mgr
-        assert scheduler.capacity_scheduler.no_schedule_until_state == LlmRequestState.ENCODER_INIT
-        assert (
-            scheduler.micro_batch_scheduler.no_schedule_until_state == LlmRequestState.ENCODER_INIT
-        )
-
-
-# ---------------------------------------------------------------------------
-# Tests: V1 dual-pool smoke test.
-# ---------------------------------------------------------------------------
-
-
-class TestV1DualPoolSmoke:
-    """Smoke test exercising V1 dual-pool construction.
-
-    Constructs both pools as V1 ``KVCacheManager`` instances with
-    ``CacheType.SELF`` / ``CacheType.CROSS`` (via mocked
-    ``_create_kv_cache_manager``) and verifies that ``build_managers``
-    wires both pools into the resource map for the V1 production path.
-
-    Running an actual encoder + decoder context iteration requires GPUs
-    and a full model engine; that lives in the integration suite. Here
-    we verify the V1 construction wiring with mocks consistent with the
-    rest of this file.
-    """
-
-    def test_build_managers_uses_v1_kv_cache_manager_for_both_pools(self):
-        kv_cache_config = _make_kv_cache_config(
-            cross_kv_cache_fraction=0.5,
-            max_gpu_total_bytes=8 * (1 << 30),
-            use_kv_cache_manager_v2=False,
-        )
-        creator = _make_creator(kv_cache_config, is_enc_dec=True, manager_cls=KVCacheManager)
-        creator.configure_kv_cache_capacity = Mock()
-        creator._should_create_separate_draft_kv_cache = Mock(return_value=False)
-        creator._split_kv_cache_budget_for_cross = Mock(return_value=(Mock(), Mock()))
-
-        # Both _create_kv_cache_manager (self pool) and
-        # _create_cross_kv_cache_manager are exercised through the
-        # underlying free-function _create_kv_cache_manager so we can
-        # assert the manager_cls and CacheType for each call.
-        import tensorrt_llm
-
-        cache_type_self = tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF
-        cache_type_cross = tensorrt_llm.bindings.internal.batch_manager.CacheType.CROSS
-
-        # Stub the self-pool path (_create_kv_cache_manager method) to
-        # avoid invoking the heavyweight free function.
-        self_mgr = Mock(spec=KVCacheManager)
-        self_mgr.kv_cache_type = cache_type_self
-        creator._create_kv_cache_manager = Mock(return_value=self_mgr)
-
-        cross_mgr = Mock(spec=KVCacheManager)
-        cross_mgr.kv_cache_type = cache_type_cross
-        with patch(
-            "tensorrt_llm._torch.pyexecutor._util._create_kv_cache_manager",
-            return_value=cross_mgr,
-        ) as create_mock:
-            resources = {}
-            creator.build_managers(resources, estimating_kv_cache=False)
-
-        # Self pool: registered as KV_CACHE_MANAGER.
-        assert resources[ResourceManagerType.KV_CACHE_MANAGER] is self_mgr
-
-        # Cross pool: registered as CROSS_KV_CACHE_MANAGER and built
-        # with the V1 KVCacheManager class + CacheType.CROSS.
-        assert resources[ResourceManagerType.CROSS_KV_CACHE_MANAGER] is cross_mgr
-        cross_kwargs = create_mock.call_args.kwargs
-        assert cross_kwargs["kv_cache_manager_cls"] is KVCacheManager
-        assert cross_kwargs["kv_cache_type"] == cache_type_cross
 
 
 class TestCrossCacheV2Lifecycle:
