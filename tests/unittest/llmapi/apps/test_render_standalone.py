@@ -32,23 +32,9 @@ from tensorrt_llm.inputs.registry import DefaultInputProcessor
 from tensorrt_llm.serve.render import RenderResources, fingerprints_match, render_chat
 from tensorrt_llm.serve.render.__main__ import build_parser
 
-from .render_helpers import chat_request, make_tokenizer, resources
+from .render_helpers import chat_request, checkpoint_dir, make_tokenizer, resources
 
 pytestmark = [pytest.mark.cpu_only, pytest.mark.threadleak(enabled=False)]
-
-TINY_LLAMA_CONFIG = {
-    "model_type": "llama",
-    "architectures": ["LlamaForCausalLM"],
-    "hidden_size": 16,
-    "intermediate_size": 32,
-    "num_attention_heads": 2,
-    "num_hidden_layers": 1,
-    "vocab_size": 340,
-    "max_position_embeddings": 128,
-    "rms_norm_eps": 1e-5,
-    "bos_token_id": 1,
-    "eos_token_id": 2,
-}
 
 CHAT_BODY = {
     "model": "tiny",
@@ -62,11 +48,8 @@ CHAT_BODY = {
 
 @pytest.fixture(scope="module")
 def checkpoint(tmp_path_factory):
-    """A checkpoint directory with a tokenizer and a config and nothing else."""
-    directory = tmp_path_factory.mktemp("tiny_checkpoint")
-    make_tokenizer().save_pretrained(directory)
-    (directory / "config.json").write_text(json.dumps(TINY_LLAMA_CONFIG))
-    return directory
+    """A real checkpoint directory with the tokenizer and config files and no weights."""
+    return checkpoint_dir(tmp_path_factory.mktemp("qwen3_checkpoint"))
 
 
 def _free_port() -> int:
@@ -84,7 +67,7 @@ class TestLoad:
     def test_load_reads_only_tokenizer_and_config(self, checkpoint) -> None:
         loaded = RenderResources.load(str(checkpoint))
 
-        assert loaded.model_type == "llama"
+        assert loaded.model_type == "qwen3"
         assert isinstance(loaded.input_processor, DefaultInputProcessor)
         assert loaded.hf_config is not None
         assert loaded.use_harmony is False
@@ -131,7 +114,7 @@ class TestLoad:
 
         router_fingerprint = router._render_resources("tiny").fingerprint()
 
-        assert router_fingerprint["compared"]["model_type"] == "llama"
+        assert router_fingerprint["compared"]["model_type"] == "qwen3"
         assert fingerprints_match(router_fingerprint, worker.fingerprint())
 
     def test_a_missing_checkpoint_is_a_clear_error(self, tmp_path) -> None:
@@ -141,10 +124,10 @@ class TestLoad:
     def test_an_unreadable_model_config_is_refused_not_rendered_generically(self, tmp_path) -> None:
         # A tokenizer and no config: rendering would silently lose the model type (the
         # serving extension, Harmony) and produce a prompt a worker would not.
-        make_tokenizer().save_pretrained(tmp_path)
+        tokenizer_only = checkpoint_dir(tmp_path, config=False)
 
         with pytest.raises(Exception, match="onfig"):
-            RenderResources.load(str(tmp_path))
+            RenderResources.load(str(tokenizer_only))
 
 
 class TestCommandLine:

@@ -21,6 +21,7 @@ from typing import Any, Optional
 
 import pytest
 
+from llmapi.apps.render_helpers import LLAMA, real_tokenizer
 from tensorrt_llm.inputs.registry import DefaultInputProcessor
 from tensorrt_llm.inputs.tokenization import TIKTOKEN_ALLOWED_SPECIAL_TOKENS, tokenize_prompt
 from tensorrt_llm.sampling_params import SamplingParams
@@ -30,20 +31,8 @@ pytestmark = pytest.mark.cpu_only
 
 @pytest.fixture(scope="module")
 def tokenizer():
-    """A fast word-level tokenizer whose post-processor adds BOS/EOS."""
-    from tokenizers import Tokenizer
-    from tokenizers.models import WordLevel
-    from tokenizers.pre_tokenizers import Whitespace
-    from tokenizers.processors import TemplateProcessing
-    from transformers import PreTrainedTokenizerFast
-
-    vocab = {"[UNK]": 0, "<s>": 1, "</s>": 2, "hello": 3, "world": 4, "again": 5}
-    backend = Tokenizer(WordLevel(vocab, unk_token="[UNK]"))
-    backend.pre_tokenizer = Whitespace()
-    backend.post_processor = TemplateProcessing(
-        single="<s> $A </s>", special_tokens=[("<s>", 1), ("</s>", 2)]
-    )
-    return PreTrainedTokenizerFast(tokenizer_object=backend, unk_token="[UNK]")
+    """The real Llama-3.1 tokenizer: it adds BOS by default and truncates on the left."""
+    return real_tokenizer(LLAMA)
 
 
 PROMPT = "hello world again hello world"
@@ -54,12 +43,15 @@ class TestTokenizePrompt:
         without = tokenize_prompt(tokenizer, PROMPT, add_special_tokens=False)
         with_specials = tokenize_prompt(tokenizer, PROMPT, add_special_tokens=True)
 
-        assert without == [3, 4, 5, 3, 4]
-        assert with_specials == [1, 3, 4, 5, 3, 4, 2]
+        assert without == tokenizer.encode(PROMPT, add_special_tokens=False)
+        assert with_specials == [tokenizer.bos_token_id, *without]
 
-    def test_truncation_keeps_the_leading_tokens(self, tokenizer) -> None:
+    def test_truncation_keeps_the_end_for_a_left_truncating_tokenizer(self, tokenizer) -> None:
+        full = tokenize_prompt(tokenizer, PROMPT, add_special_tokens=False)
         ids = tokenize_prompt(tokenizer, PROMPT, add_special_tokens=False, truncate_prompt_tokens=3)
-        assert ids == [3, 4, 5]
+
+        assert tokenizer.truncation_side == "left"
+        assert ids == full[-3:]
 
     def test_truncating_and_plain_encodes_can_share_a_tokenizer_across_threads(
         self, tokenizer
@@ -67,6 +59,8 @@ class TestTokenizePrompt:
         # A fast tokenizer truncates by changing its own state; a plain encode that overlaps
         # fails with "Already borrowed". Truncation runs on a private copy instead.
         errors: list = []
+        plain = tokenize_prompt(tokenizer, PROMPT, add_special_tokens=False)
+        truncated = plain[-3:]
 
         def run(truncate: Optional[int], expected: list) -> None:
             try:
@@ -78,8 +72,8 @@ class TestTokenizePrompt:
             except Exception as error:  # noqa: BLE001
                 errors.append(error)
 
-        threads = [threading.Thread(target=run, args=(3, [3, 4, 5])) for _ in range(4)]
-        threads += [threading.Thread(target=run, args=(None, [3, 4, 5, 3, 4])) for _ in range(4)]
+        threads = [threading.Thread(target=run, args=(3, truncated)) for _ in range(4)]
+        threads += [threading.Thread(target=run, args=(None, plain)) for _ in range(4)]
         for thread in threads:
             thread.start()
         for thread in threads:
@@ -91,19 +85,19 @@ class TestTokenizePrompt:
         with pytest.raises(ValueError, match="tokenizer is required"):
             tokenize_prompt(None, PROMPT, add_special_tokens=False)
 
-    def test_tiktoken_style_tokenizers_get_the_allowed_special_set(self) -> None:
-        calls: list = []
+    def test_a_tiktoken_encoding_gets_the_allowed_special_set(self) -> None:
+        # A tiktoken `Encoding` has no `add_special_tokens` argument, so the first call raises
+        # TypeError and the second passes the special tokens the Harmony prompt contains.
+        tiktoken = pytest.importorskip("tiktoken")
+        try:
+            encoding = tiktoken.get_encoding("o200k_base")
+        except Exception:  # noqa: BLE001 - the vocabulary is downloaded or read from a cache
+            pytest.skip("the o200k_base vocabulary is not available")
+        text = "<|start|>user<|message|>hi<|end|>"
 
-        class TiktokenLike:
-            def encode(self, text: str, **kwargs: Any) -> list[int]:
-                calls.append(kwargs)
-                if "add_special_tokens" in kwargs:
-                    raise TypeError("unexpected keyword argument 'add_special_tokens'")
-                return [11, 12]
+        ids = tokenize_prompt(encoding, text, add_special_tokens=True)
 
-        assert tokenize_prompt(TiktokenLike(), "x", add_special_tokens=True) == [11, 12]
-        assert calls[0] == {"add_special_tokens": True}
-        assert calls[1] == {"allowed_special": TIKTOKEN_ALLOWED_SPECIAL_TOKENS}
+        assert ids == encoding.encode(text, allowed_special=TIKTOKEN_ALLOWED_SPECIAL_TOKENS)
 
     def test_prefix_cache_is_used_only_when_the_tokenizer_is_called_as_the_cache_does(
         self, tokenizer
