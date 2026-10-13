@@ -119,6 +119,9 @@ def test_the_stage_runs_ground_ladder_campaign_and_wrap(tmp_path):
 
     def dispatch(role, what, prompt):
         turns.append(what)
+        if what == "roadmap-2":
+            (spec.workdir / "roadmap-2.yaml").write_text("[]")
+            return "nothing left"
         if what == "roadmap":
             (spec.workdir / "roadmap.yaml").write_text(yaml.safe_dump([
                 {"slug": "fast-path", "kind": "fusion", "hypothesis": "make it fast"},
@@ -143,7 +146,7 @@ def test_the_stage_runs_ground_ladder_campaign_and_wrap(tmp_path):
     assert state["phase"] == "done"
     assert state["ladder_kept"] == ["cg-padding"]
     assert state["kept"] == ["fast-path"]
-    assert set(turns) == {"roadmap", "fast-path", "no-op"}
+    assert set(turns) == {"roadmap", "fast-path", "no-op", "roadmap-2"}  # the spent roadmap is refreshed once
     best = Path(state["best_tree"])
     assert (best / "modeling.py").read_text() == "FAST = True\n"
     summary = (spec.workdir / "summary.md").read_text()
@@ -248,6 +251,9 @@ def test_a_candidate_that_conflicts_with_a_keep_is_rebased_and_retried(tmp_path)
         ws = spec.workdir
         if what == "roadmap":
             (ws / "roadmap.yaml").write_text(yaml.safe_dump([{"slug": "fast-path"}, {"slug": "side-path"}]))
+            return ""
+        if what.startswith("roadmap-"):
+            assert "side-path" in Path(ws / f"{what}-request.md").read_text()  # told what was tried
             return ""
         slug = what.removeprefix("rebase-")
         wt = ws / "worktrees" / slug

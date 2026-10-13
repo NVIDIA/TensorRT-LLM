@@ -852,6 +852,7 @@ accuracy:
 #     max_parallel_tuners: 4
 #     max_iterations: 12
 #     max_consecutive_misses: 3
+#     max_roadmaps: 2              # a spent roadmap with budget left is re-profiled on the moved best tree
 #     accuracy: {task: gsm8k, anchor: 96.36}
 #   source_embargo: [<this checkpoint's in-tree modeling, its modules and kernels>]
 #   sister_engines: [<other engines' checkouts: strategies may inform, code may not be copied>]

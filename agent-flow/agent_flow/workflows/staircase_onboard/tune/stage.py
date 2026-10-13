@@ -243,18 +243,29 @@ class TuneStage:
         ms = [Measurement.load(self.data / l) for l in (self.t.get("baseline"), self.t.get("reference")) if l and (self.data / l / "meta.json").exists()]
         return format_table(ms, ms[0] if ms else None) if ms else "(no measurement yet)"
 
-    def _roadmap(self) -> list[dict]:
-        path = self.spec.workdir / "roadmap.yaml"
+    def _roadmap(self, n: int = 1, tried: Sequence[str] = ()) -> list[dict]:
+        """Roadmap ``n``: the first from the baseline profile, later ones re-profiled on the moved best tree."""
+        what = "roadmap" if n == 1 else f"roadmap-{n}"
+        path = self.spec.workdir / f"{what}.yaml"
         if not path.exists():
-            request = self.spec.workdir / "roadmap-request.md"
+            request = self.spec.workdir / f"{what}-request.md"
+            again = ""
+            if tried:
+                again = (
+                    "\n\nThis is roadmap " + str(n) + ": re-profile the best tree (`" + str(self.spec.workdir / "worktrees" / "best")
+                    + "`) -- the kept candidates moved the profile. Already attempted (do not repeat; their decision files under `"
+                    + str(self.spec.workdir / "candidates") + "/<slug>/decision.yaml` list measured follow-ups worth ranking): "
+                    + ", ".join(f"`{t}`" for t in tried) + "."
+                )
             request.write_text(
-                "# Tuner request: roadmap\n\nProfile the target at the campaign config (nsys through the substrate, "
+                f"# Tuner request: {what}\n\nProfile the target at the campaign config (nsys through the substrate, "
                 f"see the skill's references/nsys.md), read the forward, and write `{path}`: a YAML list of "
                 "`{slug, kind, hypothesis, evidence, expected, modeling_edits}` ranked by the exclusive time each "
-                "can remove. Then write the decision file `" + str(self.spec.workdir / "roadmap-decision.yaml")
-                + "` with `decision: CANDIDATE` (roadmap ready) or `STOP`.\n\n## Standings\n\n" + self._standings() + "\n"
+                "can remove. Then write the decision file `" + str(self.spec.workdir / f"{what}-decision.yaml")
+                + "` with `decision: CANDIDATE` (roadmap ready) or `STOP`." + again
+                + "\n\n## Standings\n\n" + self._standings() + "\n"
             )
-            self.dispatch("tuner", "roadmap", turn_prompt(PACKAGE, request))
+            self.dispatch("tuner", what, turn_prompt(PACKAGE, request))
         if not path.exists():
             return []
         return [dict(r) for r in yaml.safe_load(path.read_text()) or []]
@@ -281,7 +292,10 @@ class TuneStage:
             ctrl = self._measure({"t-control": [*s.identity_configs, *map(Path, camp.state.config_overlays)]}, tree=camp.state.best_tree)
             if ctrl.get("t-control"):
                 camp.set_control(self.data / "t-control")
-        roadmap = [r for r in self._roadmap() if r.get("slug") not in camp.state.candidates]
+        n_road = int(self.t.get("roadmaps", 1))
+        roadmap = [r for r in self._roadmap(n_road, tried=list(camp.state.candidates) if n_road > 1 else ())
+                   if r.get("slug") not in camp.state.candidates]
+        max_roadmaps = int(cfg.get("max_roadmaps", 2))
         max_par = int(cfg.get("max_parallel_tuners", 4))
         misses, budget = int(self.t.get("misses", 0)), int(cfg.get("max_iterations", 12))
         max_misses = int(cfg.get("max_consecutive_misses", 3))
@@ -333,6 +347,14 @@ class TuneStage:
                         misses += 1
                 self.t["misses"] = misses
                 self.checkpoint()
+                n = int(self.t.get("roadmaps", 1))
+                if (not futures and not busy and not roadmap and misses < max_misses and len(camp.state.candidates) < budget
+                        and n < max_roadmaps):
+                    # The roadmap is spent with budget left: profile the moved best tree for the next one.
+                    self.t["roadmaps"] = n + 1
+                    self.checkpoint()
+                    roadmap = [r for r in self._roadmap(n + 1, tried=list(camp.state.candidates)) if r.get("slug") not in camp.state.candidates]
+                    continue
                 if not futures and not busy and (not roadmap or misses >= max_misses or len(camp.state.candidates) >= budget):
                     break
                 time.sleep(self.poll_s)
