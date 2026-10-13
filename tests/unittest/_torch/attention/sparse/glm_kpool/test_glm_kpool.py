@@ -421,7 +421,7 @@ def test_metadata_prepare_rejects_non_glm_cache_manager():
     manager.get_batch_slot_tables.assert_not_called()
 
 
-def _metadata_with_target_tables(target):
+def _metadata_with_target_tables(target: torch.Tensor) -> Glm5NextMamba2Metadata:
     prepared = object.__new__(Glm5NextMamba2Metadata)
     prepared.glm_block_tables = target.clone()
     prepared._glm_block_tables_cpu = target.clone()
@@ -430,7 +430,7 @@ def _metadata_with_target_tables(target):
     return prepared
 
 
-def test_draft_forward_reads_the_draft_manager_slot_tables():
+def test_draft_forward_reads_the_draft_manager_slot_tables() -> None:
     from tensorrt_llm._torch.attention.backends.sparse.glm_kpool.cache_manager import (
         Glm5NextCacheManager,
     )
@@ -469,7 +469,7 @@ def test_draft_forward_reads_the_draft_manager_slot_tables():
     TrtllmAttentionMetadata.restore_after_draft_forward(attn_metadata, saved)
 
 
-def test_draft_forward_keeps_the_tables_without_a_glm_draft_manager():
+def test_draft_forward_keeps_the_tables_without_a_glm_draft_manager() -> None:
     from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 
     target = torch.tensor([[7, 8, 9, 0]])

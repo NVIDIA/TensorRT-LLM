@@ -16,12 +16,17 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import torch
 
 from tensorrt_llm._torch.modules.kimi_kda.kimi_k3_mamba_metadata import KimiK3MambaMetadata
 from tensorrt_llm._utils import prefer_pinned
 
 from .cache_manager import Glm5NextCacheManager
+
+if TYPE_CHECKING:
+    from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 
 
 class Glm5NextMamba2Metadata(KimiK3MambaMetadata):
@@ -94,7 +99,7 @@ class Glm5NextMamba2Metadata(KimiK3MambaMetadata):
                 staging[row, : len(page_ids)].copy_(torch.as_tensor(page_ids, dtype=torch.long))
         self.glm_block_tables[:batch].copy_(staging[:batch], non_blocking=True)
 
-    def prepare_for_draft_forward(self, attn_metadata) -> dict | None:
+    def prepare_for_draft_forward(self, attn_metadata: TrtllmAttentionMetadata) -> dict | None:
         """Select the draft cache manager's slot tables for a draft forward.
 
         The caller has already swapped attn_metadata.kv_cache_manager to the
@@ -132,7 +137,9 @@ class Glm5NextMamba2Metadata(KimiK3MambaMetadata):
         self._glm_draft_block_tables[:batch].copy_(staging[:batch], non_blocking=True)
         return saved_state
 
-    def restore_after_draft_forward(self, attn_metadata, saved_state: dict | None) -> None:
+    def restore_after_draft_forward(
+        self, attn_metadata: TrtllmAttentionMetadata, saved_state: dict | None
+    ) -> None:
         """Rebind the target manager's slot tables after a draft forward."""
         del attn_metadata
         if saved_state is not None and "glm_block_tables" in saved_state:
