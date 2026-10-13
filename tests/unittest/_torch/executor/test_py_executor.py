@@ -2725,6 +2725,78 @@ def test_pad_still_warns_on_a_genuine_routable_surplus():
     assert "exceeds expected_num_active_requests" in mock_logger.warning.call_args[0][0]
 
 
+def _run_non_adp_fetch(active_requests, *, exclude_retiring_requests, max_num_active_requests=4):
+    """Drive the non-attention-DP branch of ``_fetch_new_requests``.
+
+    Returns the ``total_num_live_requests`` handed to the queue wait and the
+    ``total_num_active_requests`` that admission subtracts from its capacity.
+    """
+    stub = types.SimpleNamespace(
+        enable_attention_dp=False,
+        adp_router=Mock(exclude_retiring_requests=exclude_retiring_requests),
+        max_num_active_requests=max_num_active_requests,
+        enable_iter_perf_stats=False,
+        num_fetch_requests=0,
+        dist=Mock(cp_config={}, cp_rank=0, cp_size=1, rank=0),
+        _should_exclude_last_generation_logits=lambda: False,
+    )
+    seen = {}
+    stub._fetch_and_enqueue_requests = lambda waiting_queue, live: seen.update(live=live)
+
+    def _pop(waiting_queue, total_num_active_requests, all_ranks_num_active_requests):
+        seen["active"] = total_num_active_requests
+        seen["all_ranks"] = all_ranks_num_active_requests
+        return []
+
+    stub._pop_from_waiting_queue = _pop
+    with patch(
+        "tensorrt_llm._torch.pyexecutor.py_executor.merge_requests", return_value=[]
+    ) as merge:
+        assert PyExecutor._fetch_new_requests(stub, Mock(), active_requests) == []
+    merge.assert_called_once()
+    return seen
+
+
+def test_non_adp_admission_excludes_retiring_requests_with_headroom():
+    """A context server under overlap: every request retires one iteration late.
+
+    With ``max_batch_size`` 4 and the previous batch's 4 requests all retiring,
+    admission must see an empty pool so it can seat a full replacement batch in
+    the headroom (nvbug 6919819); counting the retirees capped every refill at
+    the seats the previous iteration had left unused. The retirees still count
+    as live, so the idle wait does not block while they are resident.
+    """
+    retiring = [_make_adp_request(_STATE_GENERATION_TO_COMPLETE, request_id=i) for i in range(4)]
+
+    seen = _run_non_adp_fetch(retiring, exclude_retiring_requests=True)
+
+    assert seen == {"live": 4, "active": 0, "all_ranks": None}
+
+
+def test_non_adp_admission_counts_retiring_requests_without_headroom():
+    """Without the headroom a retiring request still holds one of the B seats."""
+    active = [
+        _make_adp_request(_STATE_GENERATION_TO_COMPLETE, request_id=1),
+        _make_adp_request(_STATE_GENERATION_IN_PROGRESS, request_id=2),
+    ]
+
+    seen = _run_non_adp_fetch(active, exclude_retiring_requests=False)
+
+    assert seen == {"live": 2, "active": 2, "all_ranks": None}
+
+
+def test_non_adp_admission_keeps_counting_requests_that_are_not_retiring():
+    active = [
+        _make_adp_request(LlmRequestState.CONTEXT_INIT, request_id=1),
+        _make_adp_request(_STATE_GENERATION_IN_PROGRESS, request_id=2),
+        _make_adp_request(_STATE_GENERATION_TO_COMPLETE, request_id=3),
+    ]
+
+    seen = _run_non_adp_fetch(active, exclude_retiring_requests=True)
+
+    assert seen == {"live": 3, "active": 2, "all_ranks": None}
+
+
 def test_generic_disagg_adp_mixed_rank_states_stay_queueable():
     # The generic non-PP path must give both ranks a non-empty scheduled batch:
     # one rank schedules its real request, while the terminal-only rank

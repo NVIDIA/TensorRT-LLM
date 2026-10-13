@@ -3880,8 +3880,17 @@ def should_enable_overlap_headroom(mapping: Mapping,
     """Gate the extra micro-batch of sequence slots.
 
     True only where a retiring request and the replacement that took its place
-    can own a seat at the same time: attention DP, non-PP, overlap-on, V2 and
-    non-hybrid.
+    can own a seat at the same time: non-PP, overlap-on, V2 and non-hybrid.
+
+    Under the overlap scheduler a request that emitted its last token keeps its
+    seat until the next iteration's ``_process_previous_batch``, which runs
+    after that iteration has already admitted new work. Admission excludes such
+    retiring requests whenever this gate is on (``ADPRouter`` on the
+    attention-DP path, ``_fetch_new_requests`` otherwise), so the replacement
+    cohort needs seats of its own. Without the extra micro-batch, a workload
+    whose requests retire after one iteration -- a context server, where every
+    request finishes in its prefill step -- can only refill the seats the
+    previous iteration did not use, and runs at roughly half its batch.
 
     Widening the pool is only safe when every ``py_seq_slot``-indexed pool is
     sized from ``compute_max_num_sequences``. Two model families size one from
@@ -3898,8 +3907,7 @@ def should_enable_overlap_headroom(mapping: Mapping,
     """
     if is_hybrid or has_mrope_delta_cache or not kv_cache_manager_is_v2:
         return False
-    return (mapping.enable_attention_dp and not mapping.has_pp()
-            and not disable_overlap_scheduler)
+    return not mapping.has_pp() and not disable_overlap_scheduler
 
 
 def validate_seq_slot_pool_covers_admission(max_num_sequences: int,
