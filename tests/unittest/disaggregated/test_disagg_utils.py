@@ -298,6 +298,9 @@ def test_ctx_gen_server_address_formats_existing_ipv6_config():
     "[::1]",
     "worker:not-a-port",
     "[::1:8000",
+    "[[::1]]:8000",
+    "[[::1]:8000",
+    "[::1]]:8000",
     "worker:8000:extra",
 ])
 def test_ctx_gen_server_address_rejects_invalid_input(address):

@@ -413,6 +413,9 @@ def extract_ctx_gen_cfgs(type: Literal['ctx', 'gen'],
             hostname, port_str = url.rsplit(':', 1)
             if hostname.startswith('[') and hostname.endswith(']'):
                 hostname = hostname[1:-1]
+                if '[' in hostname or ']' in hostname:
+                    raise ValueError(
+                        'IPv6 server addresses must not use nested brackets')
             elif ':' in hostname:
                 raise ValueError('IPv6 server addresses must use brackets')
             port = int(port_str)
