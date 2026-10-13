@@ -1541,7 +1541,7 @@ def executeLLMTestOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, p
         // TODO: refactor the finallyRunner to reuse within slurm or nonslurm job.
         cacheErrorAndUploadResult(pipeline, stageName, {
             try {
-                runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, skipInstallWheel, cpver, postTag)
+                runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, skipInstallWheel, cpver, postTag, true)
             } catch (InterruptedException e) {
                 throw e
             } catch (Exception e) {
@@ -5070,7 +5070,7 @@ def priorAttemptTags(String postTag) {
     return priors
 }
 
-def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, skipInstallWheel=false, cpver="cp312", String postTag="")
+def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, skipInstallWheel=false, cpver="cp312", String postTag="", boolean onSlurm=false)
 {
     // Step 1: create LLM_ROOT dir and clean up the workspace
     def llmRootConfig = "${LLM_ROOT}${config}"
@@ -5243,9 +5243,13 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         def clusterDurationsArgs = []
         def clusterDurationsPath = ""
         String clusterNameForDurations = null
-        def partition = SlurmConfig.resolvePlatform(platform)
-        def clusterKey = partition.clusterName.replaceAll('[^a-zA-Z0-9]', '_')
-        clusterNameForDurations = clusterKey
+        // Only Slurm platforms map to a cluster; non-Slurm jobs use the shared .general durations.
+        def clusterKey = "general"
+        if (onSlurm) {
+            def partition = SlurmConfig.resolvePlatform(platform)
+            clusterKey = partition.clusterName.replaceAll('[^a-zA-Z0-9]', '_')
+            clusterNameForDurations = clusterKey
+        }
         clusterDurationsPath = "${llmSrc}/${resolveClusterDurationsRelPath(llmSrc, clusterKey)}"
         clusterDurationsArgs = ["--durations-path ${clusterDurationsPath}"]
 
