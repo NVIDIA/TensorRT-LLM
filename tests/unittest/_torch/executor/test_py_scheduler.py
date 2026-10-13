@@ -2512,12 +2512,13 @@ class TestPyCapacitySchedulerCrossKVCache:
 
 class TestPyCapacitySchedulerEncoderInit:
     """
-    V1 ``GUARANTEED_NO_EVICT`` capacity scheduler ``ENCODER_INIT`` admission.
+    V1 capacity scheduler ``ENCODER_INIT`` admission across policies.
 
     Encoder admission schedules encoder compute but does not reserve self- or
     cross-KV blocks; the later decoder ``CONTEXT_INIT`` admission owns that
-    budgeting. Tests below cover ``GuaranteedNoEvictPolicy`` and the error
-    when no cross manager is configured.
+    budgeting. Tests below cover both ``GuaranteedNoEvictPolicy`` and
+    ``MaxUtilizationPolicy``, plus the safety fallback when no cross
+    manager is configured.
 
     All tests below widen ``no_schedule_until_state=ENCODER_INIT`` so
     that encoder-init requests pass the state gate (the default
@@ -2594,6 +2595,68 @@ class TestPyCapacitySchedulerEncoderInit:
         fitting, disagg, paused = scheduler.schedule_request(requests)
         # All three admitted: self pool isn't dented by encoders.
         assert {r.request_id for r in fitting} == {0, 1, 2}
+
+    def test_max_utilization_admits_encoder_with_cross_pool(self):
+        kv = MockKVCacheManager(num_free_blocks=100, blocks_per_request=5)
+        cross_kv = MockKVCacheManager(num_free_blocks=10, blocks_per_request=2)
+        scheduler = self._make_scheduler(kv, cross_kv, CapacitySchedulerPolicy.MAX_UTILIZATION)
+        requests = [
+            make_encoder_request(0, encoder_output_len=10),
+            make_generation_request(1),
+        ]
+        fitting, disagg, paused = scheduler.schedule_request(requests)
+        assert {r.request_id for r in fitting} == {0, 1}
+        assert len(paused) == 0
+
+    def test_max_utilization_encoder_does_not_consume_cross_pool(self):
+        """Cross pool pressure does not throttle MaxUtilization encoder admission."""
+        kv = MockKVCacheManager(num_free_blocks=100, blocks_per_request=5)
+
+        class CrossPoolThatWouldRejectEncoder(MockKVCacheManager):
+            def get_needed_blocks_one_step(
+                self, req, two_step_lookahead: bool, window_size: int
+            ) -> int:
+                if req.is_encoder_init_state:
+                    return self._blocks_per_request
+                return super().get_needed_blocks_one_step(req, two_step_lookahead, window_size)
+
+        # Only 1 cross block free. If encoder admission reserved cross blocks,
+        # this would reject each encoder request.
+        cross_kv = CrossPoolThatWouldRejectEncoder(num_free_blocks=1, blocks_per_request=2)
+        scheduler = self._make_scheduler(kv, cross_kv, CapacitySchedulerPolicy.MAX_UTILIZATION)
+        requests = [
+            make_encoder_request(0, encoder_output_len=10),
+            make_encoder_request(1, encoder_output_len=10),
+        ]
+        fitting, disagg, paused = scheduler.schedule_request(requests)
+        assert {r.request_id for r in fitting} == {0, 1}
+        assert len(paused) == 0
+
+    def test_max_utilization_raises_encoder_without_cross_pool(self):
+        """MaxUtilization without a cross manager fails enc-dec admission."""
+        kv = MockKVCacheManager(num_free_blocks=100, blocks_per_request=5)
+        scheduler = self._make_scheduler(kv, None, CapacitySchedulerPolicy.MAX_UTILIZATION)
+        requests = [make_encoder_request(0, encoder_output_len=10)]
+        with pytest.raises(RuntimeError, match="requires a cross_kv_cache_manager"):
+            scheduler.schedule_request(requests)
+
+    def test_max_utilization_encoder_not_evictable_victim(self):
+        """Encoder-init has no started self-pool blocks → never an eviction
+        victim. When a decoder context request can't fit, MaxUtilization
+        skips the encoder while looking for a victim and gives up."""
+        kv = MockKVCacheManager(num_free_blocks=3, blocks_per_request=5)
+        cross_kv = MockKVCacheManager(num_free_blocks=10, blocks_per_request=2)
+        scheduler = self._make_scheduler(kv, cross_kv, CapacitySchedulerPolicy.MAX_UTILIZATION)
+        # First-chunk context can't fit (3 < 5), encoder ahead of it
+        # is not a valid eviction victim (no started self blocks).
+        requests = [
+            make_encoder_request(0, encoder_output_len=10),
+            make_context_request(1),
+        ]
+        fitting, disagg, paused = scheduler.schedule_request(requests)
+        # Encoder admits cleanly; context can't fit (no victim available).
+        assert 0 in {r.request_id for r in fitting}
+        assert 1 not in {r.request_id for r in fitting}
 
 
 class TestPyCapacitySchedulerPriority:
