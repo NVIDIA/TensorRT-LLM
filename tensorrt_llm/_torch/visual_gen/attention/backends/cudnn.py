@@ -43,7 +43,7 @@ from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.logger import logger
 from tensorrt_llm.visual_gen.args import QuantAttentionConfig
 
-from ...attention.backends.interface import PredefinedAttentionMask
+from ....attention.backends.interface import PredefinedAttentionMask
 from .interface import AttentionBackend, AttentionTensorLayout
 
 

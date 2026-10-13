@@ -24,11 +24,11 @@ from tensorrt_llm.visual_gen.sparse_attention import SkipSoftmaxAttentionConfig,
 
 from ...modules.linear import Linear, TensorParallelMode, WeightMode, WeightsLoadingConfig
 from ...utils import Fp4QuantizedTensor
-from ..attention_backend.interface import AttentionTensorLayout
-from ..attention_backend.parallel import wrap_parallel_attention
-from ..attention_backend.utils import create_attention
 from ..config import DiffusionModelConfig
 from ..modules.rms_norm import RMSNormTPAware
+from .backends.interface import AttentionTensorLayout
+from .backends.parallel import wrap_parallel_attention
+from .backends.utils import create_attention
 
 
 class QKVMode(str, Enum):

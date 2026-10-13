@@ -25,7 +25,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 from utils.util import skip_num_gpus_less_than, skip_single_gpu
 
-from tensorrt_llm._torch.visual_gen.attention_backend.parallel import (
+from tensorrt_llm._torch.visual_gen.attention.backends.parallel import (
     Attention2DAttention,
     RingAttention,
     UlyssesAttention,
@@ -36,10 +36,10 @@ from tensorrt_llm._torch.visual_gen.models.qwen_image import QwenJointAttention
 from tensorrt_llm.visual_gen.args import ParallelConfig
 
 try:
-    from tensorrt_llm._torch.visual_gen.attention_backend.flash_attn4 import (
+    from tensorrt_llm._torch.visual_gen.attention.backends.flash_attn4 import (
         _flash_attn_fwd as _fa4_fwd,
     )
-    from tensorrt_llm._torch.visual_gen.attention_backend.parallel import (
+    from tensorrt_llm._torch.visual_gen.attention.backends.parallel import (
         _flash_attn_combine as _fa_combine,
     )
 

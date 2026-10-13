@@ -30,7 +30,7 @@ from tensorrt_llm._torch.visual_gen.cuda_graph_runner import resolved_extra_key
 from tensorrt_llm.logger import logger
 from tensorrt_llm.visual_gen.args import QuantAttentionConfig
 
-from ....attention.backends.interface import PredefinedAttentionMask
+from .....attention.backends.interface import PredefinedAttentionMask
 from ..interface import AttentionBackend, AttentionTensorLayout
 
 _cute_dsl_import_error: BaseException | None = None

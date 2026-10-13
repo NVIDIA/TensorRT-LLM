@@ -39,9 +39,9 @@ import torch.multiprocessing as mp
 import torch.nn.functional as F
 
 from tensorrt_llm._torch.device_mesh import DeviceMeshTopologyImpl
+from tensorrt_llm._torch.visual_gen.attention.attention import Attention, QKVMode
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm._torch.visual_gen.mapping import VisualGenMapping
-from tensorrt_llm._torch.visual_gen.modules.attention import Attention, QKVMode
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.visual_gen.args import AttentionConfig
 
