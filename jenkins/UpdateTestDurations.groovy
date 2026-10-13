@@ -15,14 +15,21 @@
 
 @Library(['bloom-jenkins-shared-lib@main', 'trtllm-jenkins-shared-lib@main']) _
 
+import com.nvidia.bloom.SlurmConfig
+
 LLM_ROOT = "llm"
 
 UBUNTU_24_04_IMAGE = "urm.nvidia.com/docker/ubuntu:24.04"
-DURATION_FILE_PATH = "tests/integration/defs/.test_durations"
+TEST_DURATIONS_DIR = "tests/integration/defs/test_durations"
+DURATION_FILE_PATH = "${TEST_DURATIONS_DIR}/.general"
 // Target repository the updated duration file is committed straight back into.
 TARGET_REPO = "NVIDIA/TensorRT-LLM"
 
-def sanityCheckItemCount(String oldPath, String newPath) {
+def sanityCheckItemCount(String oldPath, String newPath, boolean requireOld = true) {
+    if (!requireOld && !fileExists(oldPath)) {
+        echo "No existing duration file at ${oldPath}; treating as a new cluster, skipping sanity gate."
+        return
+    }
     def countItems = { path ->
         sh(script: "python3 -c \"import json; print(len(json.load(open('${path}'))))\"",
            returnStdout: true).trim() as Integer
@@ -208,6 +215,34 @@ pipeline {
             }
         } // stage Generate Duration File
 
+        stage('Generate Per-Cluster Duration Files') {
+            steps {
+                container('trt-llm') {
+                    script {
+                        for (clusterName in SlurmConfig.activeClusterNames()) {
+                            def clusterKey = clusterName.replaceAll('[^a-zA-Z0-9]', '_')
+                            def outFile = "new_test_durations_${clusterKey}.json"
+                            sh """
+                                cd ${LLM_ROOT}
+                                python3 jenkins/scripts/generate_duration.py \
+                                    --days ${params.DAYS} \
+                                    --cluster ${clusterName} \
+                                    --duration-file ${outFile}
+                            """
+                            // generate_duration.py skips writing the file entirely when
+                            // OpenSearch has no records for the cluster (i.e. it's not
+                            // currently in use); nothing to archive or commit for those.
+                            if (fileExists("${LLM_ROOT}/${outFile}")) {
+                                archiveArtifacts(artifacts: "${LLM_ROOT}/${outFile}", fingerprint: true)
+                            } else {
+                                echo "No records for cluster '${clusterName}'; skipping."
+                            }
+                        }
+                    }
+                }
+            }
+        } // stage Generate Per-Cluster Duration Files
+
         stage('Commit and Push') {
             when {
                 expression { !params.DRY_RUN }
@@ -249,20 +284,44 @@ pipeline {
                                     "${LLM_ROOT}/${DURATION_FILE_PATH}",
                                     "${LLM_ROOT}/new_test_durations.json")
 
-                                sh "cp ${LLM_ROOT}/new_test_durations.json ${LLM_ROOT}/${DURATION_FILE_PATH}"
+                                sh "mkdir -p \$(dirname ${LLM_ROOT}/${DURATION_FILE_PATH}) && cp ${LLM_ROOT}/new_test_durations.json ${LLM_ROOT}/${DURATION_FILE_PATH}"
+
+                                // Same reset-then-overlay treatment for each per-cluster file that
+                                // was generated (clusters with no OpenSearch records were skipped
+                                // upstream, so there's nothing to copy for those).
+                                def trackedPaths = [DURATION_FILE_PATH]
+                                for (clusterName in SlurmConfig.activeClusterNames()) {
+                                    def clusterKey = clusterName.replaceAll('[^a-zA-Z0-9]', '_')
+                                    def newFile = "new_test_durations_${clusterKey}.json"
+                                    def clusterDurationPath = "${TEST_DURATIONS_DIR}/.${clusterKey}"
+                                    if (!fileExists("${LLM_ROOT}/${newFile}")) {
+                                        continue
+                                    }
+                                    sanityCheckItemCount(
+                                        "${LLM_ROOT}/${clusterDurationPath}",
+                                        "${LLM_ROOT}/${newFile}",
+                                        false)
+                                    sh "mkdir -p \$(dirname ${LLM_ROOT}/${clusterDurationPath}) && cp ${LLM_ROOT}/${newFile} ${LLM_ROOT}/${clusterDurationPath}"
+                                    trackedPaths << clusterDurationPath
+                                }
+
+                                // Stage before diffing: `git diff --name-only` only compares
+                                // tracked paths against HEAD and misses untracked files, so a
+                                // brand-new per-cluster file (no prior baseline) would otherwise
+                                // be invisible and the pipeline would skip committing it.
+                                sh "cd ${LLM_ROOT} && git add ${trackedPaths.join(' ')}"
 
                                 def changeCount = sh(
-                                    script: "cd ${LLM_ROOT} && git diff --name-only ${DURATION_FILE_PATH} | wc -l",
+                                    script: "cd ${LLM_ROOT} && git diff --cached --name-only -- ${trackedPaths.join(' ')} | wc -l",
                                     returnStdout: true).trim()
                                 echo "Changed duration-file count: ${changeCount}"
                                 if (changeCount == "0") {
-                                    echo "Duration file already up to date on ${params.TARGET_BRANCH}; nothing to push."
+                                    echo "Duration files already up to date on ${params.TARGET_BRANCH}; nothing to push."
                                     return
                                 }
 
                                 sh """
                                     cd ${LLM_ROOT}
-                                    git add ${DURATION_FILE_PATH}
                                     git commit -s -m "[None][infra] Auto-update test durations from OpenSearch (last ${params.DAYS} days)"
                                 """
 
