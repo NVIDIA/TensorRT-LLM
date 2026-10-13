@@ -861,6 +861,8 @@ def _get_static_cache_size_layer_components(
 
 def _get_layer_spec_cache_size_components(
     layer_specs: Sequence[KVCacheLayerSpec],
+    *,
+    max_seq_len: Optional[int] = None,
 ) -> tuple[List[int], List[Optional[int]]]:
     """Return the shared costing inputs for an explicit layer-spec sequence."""
     if not layer_specs:
@@ -870,7 +872,14 @@ def _get_layer_spec_cache_size_components(
         raise ValueError(f"layer_specs contains duplicate global layer IDs: {global_layer_ids}")
     return (
         [layer.bytes_per_token() for layer in layer_specs],
-        [layer.sliding_window_size for layer in layer_specs],
+        [
+            None
+            if max_seq_len is not None
+            and layer.sliding_window_size is not None
+            and layer.sliding_window_size >= max_seq_len
+            else layer.sliding_window_size
+            for layer in layer_specs
+        ],
     )
 
 
@@ -1589,7 +1598,10 @@ class KVCacheManagerV2(BaseResourceManager):
         assert len(self.max_attention_window_vec) == self.num_local_layers
         if self.layer_specs is not None:
             self.max_attention_window_vec = [
-                layer.sliding_window_size for layer in self.layer_specs
+                None
+                if layer.sliding_window_size is None or layer.sliding_window_size >= max_seq_len
+                else layer.sliding_window_size
+                for layer in self.layer_specs
             ]
 
         # A D-token match backoff needs D more physical SWA history at the
@@ -6277,7 +6289,9 @@ class KVCacheManagerV2(BaseResourceManager):
         **kwargs,
     ):
         if layer_specs is not None:
-            layer_sizes, attention_windows = _get_layer_spec_cache_size_components(layer_specs)
+            layer_sizes, attention_windows = _get_layer_spec_cache_size_components(
+                layer_specs, max_seq_len=max_seq_len
+            )
         else:
             layer_sizes, attention_windows = _get_static_cache_size_layer_components(
                 model_config,
@@ -6398,7 +6412,9 @@ class KVCacheManagerV2(BaseResourceManager):
         max_seq_len = int(max_seq_len)
         tokens_per_block = int(tokens_per_block)
         if layer_specs is not None:
-            layer_sizes, covered_windows = _get_layer_spec_cache_size_components(layer_specs)
+            layer_sizes, covered_windows = _get_layer_spec_cache_size_components(
+                layer_specs, max_seq_len=max_seq_len
+            )
         else:
             layer_sizes, covered_windows = _get_static_cache_size_layer_components(
                 model_config,
