@@ -2341,8 +2341,8 @@ def _reference_assemble_final_beams(order, all_normed, pool_width, width,
             tokens[out_idx, :num_generated_tokens] = active_path[active_idx]
             cum_logprobs[out_idx] = active_cum[active_idx]
             if log_probs is not None:
-                log_probs[out_idx, :num_generated_tokens] = active_lp_path[
-                    active_idx]
+                log_probs[
+                    out_idx, :num_generated_tokens] = active_lp_path[active_idx]
     return tokens, cum_logprobs, log_probs
 
 
@@ -2361,17 +2361,19 @@ def test_assemble_final_beams_matches_reference(seed, with_log_probs):
     active_width = int(torch.randint(1, 6, (1, ), generator=gen))
     num_generated = int(torch.randint(1, 5, (1, ), generator=gen))
     snap_width = num_generated + int(torch.randint(0, 3, (1, ), generator=gen))
-    num_beams = int(torch.randint(1, pool_width + active_width + 1, (1, ),
-                                  generator=gen))
+    num_beams = int(
+        torch.randint(1, pool_width + active_width + 1, (1, ), generator=gen))
 
-    cba_lengths = torch.randint(0, snap_width + 1, (pool_width, ),
+    cba_lengths = torch.randint(0,
+                                snap_width + 1, (pool_width, ),
                                 generator=gen).to(torch.int32)
     cba_normed = torch.randn(pool_width, generator=gen)
     cba_normed[cba_lengths == 0] = float("-inf")
     cba_cum = torch.randn(pool_width, generator=gen)
     cba_tokens = torch.randint(0, 1000, (pool_width, snap_width),
                                generator=gen).to(torch.int32)
-    active_path = torch.randint(0, 1000, (active_width, num_generated),
+    active_path = torch.randint(0,
+                                1000, (active_width, num_generated),
                                 generator=gen).to(torch.int32)
     active_cum = torch.randn(active_width, generator=gen)
     active_cum[torch.rand(active_width, generator=gen) < 0.5] = float("-inf")
@@ -2382,8 +2384,7 @@ def test_assemble_final_beams_matches_reference(seed, with_log_probs):
     cba_log_probs = active_lp_path = None
     if with_log_probs:
         cba_log_probs = torch.randn(pool_width, snap_width, generator=gen)
-        active_lp_path = torch.randn(active_width, num_generated,
-                                     generator=gen)
+        active_lp_path = torch.randn(active_width, num_generated, generator=gen)
 
     kwargs = dict(order=order,
                   all_normed=all_normed,

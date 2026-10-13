@@ -1701,9 +1701,7 @@ class BeamSearchHandler:
         # The consumer reads only generated positions, so the per-step snapshot
         # of the [slot, beam, position] tensors starts at the smallest prompt
         # length of the group instead of copying the whole prompt region.
-        token_base = min(
-            attn_width, min(request.py_prompt_len for request in cba_requests)
-        )
+        token_base = min(attn_width, min(request.py_prompt_len for request in cba_requests))
         snap_width = min(
             cba.cba_tokens.size(-1),
             max(
@@ -1726,9 +1724,7 @@ class BeamSearchHandler:
             cache_indirection=d2h_copier(
                 store.cache_indirection[slots_cuda, :, token_base:attn_width]
             ),
-            original_tokens=d2h_copier(
-                store.original_tokens[slots_cuda, :, token_base:attn_width]
-            ),
+            original_tokens=d2h_copier(store.original_tokens[slots_cuda, :, token_base:attn_width]),
             cum=d2h_copier(store.cum_log_probs[slots_cuda]),
             cba_tokens=d2h_copier(cba.cba_tokens[slots_cuda, :, :snap_width]),
             cba_cum=d2h_copier(cba.cba_cum_log_probs[slots_cuda]),
