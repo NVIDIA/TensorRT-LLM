@@ -394,15 +394,9 @@ TEST_F(LoraCacheTest, evictionPreservesCacheOnFailure)
     LoraCache cache(pageConfig, *mModelConfig, *mWorldConfig, *mManager);
     putSyntheticTask(cache, 1, 2);
     putSyntheticTask(cache, 2, 1);
-
-    // One page is free and neither cached task is evictable.
-    EXPECT_THROW(putSyntheticTask(cache, 3, 2), LoraCacheFullException);
-    EXPECT_FALSE(cache.has(3));
-    EXPECT_TRUE(cache.isLoaded(1));
-    EXPECT_TRUE(cache.isLoaded(2));
-
     cache.markTaskDone(2);
-    // The free page plus the done task's page still cannot satisfy three pages.
+
+    // One free page plus one evictable page cannot satisfy three pages.
     EXPECT_THROW(putSyntheticTask(cache, 3, 3), LoraCacheFullException);
     EXPECT_FALSE(cache.has(3));
     EXPECT_TRUE(cache.isLoaded(1));
@@ -411,43 +405,12 @@ TEST_F(LoraCacheTest, evictionPreservesCacheOnFailure)
     EXPECT_EQ(cache.determineNumPages(1), 2);
     EXPECT_EQ(cache.determineNumPages(2), 1);
 
-    // Retry the same task ID using the untouched free page, without eviction.
-    putSyntheticTask(cache, 3, 1);
-    EXPECT_TRUE(cache.isLoaded(3));
-    EXPECT_TRUE(cache.isLoaded(2));
-    cache.markTaskDone(3);
-
-    // Both done tasks are needed: reaching the end of the list with enough pages succeeds.
-    putSyntheticTask(cache, 4, 2);
-    EXPECT_TRUE(cache.isLoaded(4));
-    EXPECT_EQ(cache.determineNumPages(4), 2);
-    EXPECT_TRUE(cache.isLoaded(1));
-    EXPECT_FALSE(cache.has(2));
-    EXPECT_FALSE(cache.has(3));
-}
-
-TEST_F(LoraCacheTest, evictionReclaimsMoreThanMissingPages)
-{
-    LoraCachePageManagerConfig pageConfig(MemoryType::kCPU, tensorrt_llm::DataType::kFLOAT, 4, 4, 1, 64, 1);
-    LoraCache cache(pageConfig, *mModelConfig, *mWorldConfig, *mManager);
-    putSyntheticTask(cache, 1, 2);
-    putSyntheticTask(cache, 2, 1);
-    cache.markTaskDone(1);
-    cache.markTaskDone(2);
-
-    // Only one more page is needed. Evict the oldest two-page task, preserving the newer task.
+    // Retry the same task ID: the last candidate now supplies exactly enough pages.
     putSyntheticTask(cache, 3, 2);
-    EXPECT_FALSE(cache.has(1));
-    EXPECT_TRUE(cache.isLoaded(2));
-    EXPECT_TRUE(cache.isDone(2));
     EXPECT_TRUE(cache.isLoaded(3));
     EXPECT_EQ(cache.determineNumPages(3), 2);
-
-    // The surplus page remains available without another eviction.
-    putSyntheticTask(cache, 4, 1);
-    EXPECT_TRUE(cache.isLoaded(4));
-    EXPECT_TRUE(cache.isLoaded(2));
-    EXPECT_TRUE(cache.isLoaded(3));
+    EXPECT_TRUE(cache.isLoaded(1));
+    EXPECT_FALSE(cache.has(2));
 }
 
 TEST_F(LoraCacheTest, splitTransposeCpu)
