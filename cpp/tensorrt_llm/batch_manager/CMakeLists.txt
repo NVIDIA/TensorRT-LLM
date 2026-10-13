@@ -107,6 +107,11 @@ target_link_libraries(
   PRIVATE tllm::common_environment tllm::executor_transfer_agent
           tllm::kernel_kv_cache_copy)
 
+if(BUILD_PYT)
+  target_link_libraries(tllm_kv_cache PRIVATE tllm::common_profiler)
+  target_link_libraries(tllm_kv_cache_legacy PRIVATE tllm::common_profiler)
+endif()
+
 add_library(
   tllm_batch_scheduler STATIC
   agentTree.cpp capacityScheduler.cpp contextProgress.cpp
