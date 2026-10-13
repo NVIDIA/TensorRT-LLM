@@ -84,7 +84,7 @@ def test_prefill_compiled_model_bypass_is_restored() -> None:
 
 
 @pytest.mark.parametrize(
-    ("can_run_graph", "prefill_graph_eligible", "expected"),
+    ("bypass", "prefill_graph_eligible", "expected"),
     [
         pytest.param(False, True, "compiled", id="pcg-eligible-prefill"),
         pytest.param(False, False, "eager", id="pcg-ineligible-prefill"),
@@ -93,7 +93,7 @@ def test_prefill_compiled_model_bypass_is_restored() -> None:
     ],
 )
 def test_decoder_runner_selects_torch_compile_forward(
-    can_run_graph: bool,
+    bypass: bool,
     prefill_graph_eligible: bool,
     expected: str,
 ) -> None:
@@ -104,7 +104,7 @@ def test_decoder_runner_selects_torch_compile_forward(
         "tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner.get_per_request_prefill_cuda_graph_flag",
         return_value=prefill_graph_eligible,
     ) as get_prefill_graph_flag:
-        with runner._maybe_bypass_torch_compile(can_run_graph=can_run_graph):
+        with runner._maybe_bypass_torch_compile(bypass=bypass):
             actual = model()
 
     assert actual == expected
@@ -112,7 +112,7 @@ def test_decoder_runner_selects_torch_compile_forward(
     other_forward = eager_forward if expected == "compiled" else compiled_forward
     selected_forward.assert_called_once_with()
     other_forward.assert_not_called()
-    if can_run_graph:
+    if bypass:
         get_prefill_graph_flag.assert_not_called()
     else:
         get_prefill_graph_flag.assert_called_once_with()
@@ -126,7 +126,7 @@ def test_decoder_runner_explicit_bypass_skips_graph_eligibility() -> None:
         "tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner.get_per_request_prefill_cuda_graph_flag",
         return_value=True,
     ) as get_prefill_graph_flag:
-        with runner._maybe_bypass_torch_compile(bypass=True, can_run_graph=False):
+        with runner._maybe_bypass_torch_compile(bypass=True):
             actual = model()
 
     assert actual == "eager"

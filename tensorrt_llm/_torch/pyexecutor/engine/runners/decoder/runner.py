@@ -4824,10 +4824,7 @@ class DecoderRunner(ScheduledModelRunner):
             with with_shared_pool(self.cuda_graph_runner.get_graph_pool()):
 
                 def forward_step():
-                    with (
-                        self._maybe_bypass_torch_compile(can_run_graph=can_run_graph),
-                        MoeLoadBalancerIterContext(moe_load_balancer),
-                    ):
+                    with MoeLoadBalancerIterContext(moe_load_balancer):
                         return self._forward_step(
                             inputs,
                             enable_spec_decode=enable_spec_decode,
@@ -4866,7 +4863,7 @@ class DecoderRunner(ScheduledModelRunner):
 
                         def capture_forward_fn(inputs: dict[str, Any]):
                             with (
-                                self._maybe_bypass_torch_compile(can_run_graph=can_run_graph),
+                                self._maybe_bypass_torch_compile(bypass=True),
                                 MoeLoadBalancerIterContext(moe_load_balancer),
                             ):
                                 return self._forward_step(
@@ -4930,11 +4927,9 @@ class DecoderRunner(ScheduledModelRunner):
             return {**outputs, "runtime_draft_len": runtime_draft_len}
 
     @contextmanager
-    def _maybe_bypass_torch_compile(
-        self, bypass: bool = False, can_run_graph: bool = True
-    ) -> Iterator[None]:
+    def _maybe_bypass_torch_compile(self, bypass: bool = False) -> Iterator[None]:
         """Force eager execution for auxiliary work and ordinary CUDA graphs."""
-        if not self._config.compile_only_piecewise_graphs or not (bypass or can_run_graph):
+        if not self._config.compile_only_piecewise_graphs or not bypass:
             yield
             return
         with self.model.model.bypass():
