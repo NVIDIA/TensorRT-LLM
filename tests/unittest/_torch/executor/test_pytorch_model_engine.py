@@ -523,10 +523,17 @@ def test_kda_replay_counts_follow_engine_request_rows(
             "promoted": 0,
             "dummy": 0
         }
-        expected = [expected_by_name[name] for name in row_order]
+        expected_by_request = {
+            requests[name].py_request_id: expected_by_name[name]
+            for name in row_order
+        }
         assert metadata.num_contexts == int(with_context)
-        assert metadata.request_ids[metadata.num_contexts:] == [
-            requests[name].py_request_id for name in row_order
+        # Packing may move promoted contexts ahead of ordinary generation
+        # rows. Replay counts must follow the final metadata order.
+        generation_ids = metadata.request_ids[metadata.num_contexts:]
+        assert sorted(generation_ids) == sorted(expected_by_request)
+        expected = [
+            expected_by_request[request_id] for request_id in generation_ids
         ]
         assert metadata.mamba_metadata.prev_num_accepted_tokens.tolist() == (
             expected + [0] * (8 - len(expected)))
