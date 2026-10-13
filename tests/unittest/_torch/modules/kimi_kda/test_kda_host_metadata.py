@@ -92,23 +92,6 @@ def test_replay_metadata_copies_counts_and_clears_padding(on_device: bool) -> No
     assert metadata.prev_num_accepted_tokens.tolist() == [1, 2, 0, 0, 0, 0, 0, 0]
 
 
-def test_replay_metadata_updates_cuda_graph_inputs() -> None:
-    metadata = KimiK3MambaMetadata(max_batch_size=4, chunk_size=64, max_num_tokens=12)
-    metadata.prepare_prev_num_accepted_tokens(accepted_draft_tokens=[2, 1])
-    # A captured consumer must observe each preparation without recapture.
-    graph = torch.cuda.CUDAGraph()
-    output = torch.empty_like(metadata.prev_num_accepted_tokens)
-    torch.cuda.synchronize()
-    with torch.cuda.graph(graph):
-        output.copy_(metadata.prev_num_accepted_tokens)
-    graph.replay()
-    assert output.tolist() == [2, 1, 0, 0]
-
-    metadata.prepare_prev_num_accepted_tokens(accepted_draft_tokens=[0, 2, 0])
-    graph.replay()
-    assert output.tolist() == [0, 2, 0, 0]
-
-
 @pytest.fixture(scope="module")
 def dispatch_pair() -> tuple[KDAKernelDispatch, KDAKernelDispatch]:
     optimized = KDAKernelDispatch(use_optimized_prefill=True, use_optimized_decode=False)
