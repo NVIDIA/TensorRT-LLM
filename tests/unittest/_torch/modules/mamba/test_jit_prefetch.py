@@ -320,3 +320,5 @@ def test_deep_gemm_compile_counted_once_per_shape(monkeypatch):
     jdg.done_observer(32, 7168, 2048, 0.0)  # fast first launch: a cache hit
     jdg.done_observer(32, 7168, 2048, slow)  # a stall, not a compile
     assert p.stats.dg_executor_compiles == 2
+    # Each one is reported, whatever the logger's level.
+    assert sum("DeepGEMM compile on executor" in e for e in p.stats.events) == 2

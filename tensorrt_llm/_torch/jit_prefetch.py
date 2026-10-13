@@ -530,10 +530,7 @@ class JitPrefetcher:
             else:
                 self._record(jdg.KIND, "deep_gemm", jdg.spec_for(m, n, k))
                 what = f"m={m}"
-            logger.info(
-                f"[JIT stats] rank {self.rank} DeepGEMM compile on executor "
-                f"{what} n={n} k={k} {dt:.3f}s"
-            )
+            self._event(f"DeepGEMM compile on executor {what} n={n} k={k} {dt:.3f}s")
 
         jdg.done_observer = _done
         if jdg.launch_observer is None:
