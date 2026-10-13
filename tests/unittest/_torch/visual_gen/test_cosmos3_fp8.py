@@ -28,6 +28,7 @@ os.environ["TLLM_DISABLE_MPI"] = "1"
 import pytest
 import torch
 from utils.llm_data import get_checkpoint
+from utils.util import skip_fp8_pre_ada
 
 from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.visual_gen.config import DiffusionPipelineConfig
@@ -126,6 +127,12 @@ def _requires_cuda() -> None:
     """
     if not torch.cuda.is_available():
         pytest.skip("CUDA not available")
+
+
+def _requires_fp8_gpu() -> None:
+    """Gate for tests that execute FP8 GEMMs, not just build FP8 modules."""
+    _requires_cuda()
+    skip_fp8_pre_ada(True)
 
 
 def _tower_of(module_name: str) -> str:
@@ -770,7 +777,7 @@ class TestDistilledSamplingWithStaticFp8:
     """4-step SDE sampling drives a static-FP8 transformer (no checkpoint)."""
 
     def test_fp8_matches_dequantized_bf16_through_distilled_loop(self, _cleanup_gpu):
-        _requires_cuda()
+        _requires_fp8_gpu()
         device = torch.device("cuda")
         fp8_model, bf16_model = _build_distilled_test_models(device)
 
@@ -799,7 +806,7 @@ class TestDistilledSamplingWithStaticFp8:
         assert cosine >= 0.9999
 
     def test_fp8_distilled_loop_is_deterministic(self, _cleanup_gpu):
-        _requires_cuda()
+        _requires_fp8_gpu()
         device = torch.device("cuda")
         fp8_model, _ = _build_distilled_test_models(device)
 
