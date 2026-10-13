@@ -255,9 +255,11 @@ _PHASE_FIELDS = ("num_contexts", "num_ctx_tokens")
 
 
 def _core_modules() -> list[Path]:
-    """Every target module ``route`` can reach."""
     return [
-        target_dir / "modeling.py" for arch in _ARCHS for target_dir, _ in _routed_targets(arch)
+        target_dir / "modeling.py"
+        for arch in _ARCHS
+        for target_dir, _ in _routed_targets(arch)
+        if target_dir.parent.name != "kimi_k3_vl"
     ]
 
 
@@ -321,6 +323,20 @@ def test_decode_step_args_state_the_zero_rather_than_reading_it():
         if kw.arg in ("num_contexts", "num_ctx_tokens") and isinstance(kw.value, ast.Constant)
     }
     assert literals == {"num_contexts": 0, "num_ctx_tokens": 0}
+
+
+def test_every_core_ships_both_targets():
+    missing = []
+    for path in _core_modules():
+        if not path.is_file():
+            continue
+        classes = {
+            n.name for n in ast.walk(ast.parse(path.read_text())) if isinstance(n, ast.ClassDef)
+        }
+        for required in ("PrefillTarget", "DecodeTarget"):
+            if required not in classes:
+                missing.append(f"{path.relative_to(_ROOT)}: {required}")
+    assert not missing, "core modules missing a target class: " + ", ".join(missing)
 
 
 # An entry computes a pure function of its arguments. These two gates are what
