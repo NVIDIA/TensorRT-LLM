@@ -493,6 +493,12 @@ def _resize_input_buffers(runner: DecoderRunner, max_num_tokens: int) -> None:
     runner._buffers = runner._inputs._buffers = runner._metadata._buffers = buffers
 
 
+def _set_runner_config(runner: DecoderRunner, **changes) -> None:
+    """Replace the config shared by the runner and its input components."""
+    config = replace(runner._config, **changes)
+    runner._config = runner._inputs._config = runner._metadata._config = config
+
+
 def _clone_tensors(values: dict) -> dict:
     return {
         name: value.clone() if isinstance(value, torch.Tensor) else value
@@ -2798,8 +2804,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         model_engine.model.model_config.pretrained_config.rope_scaling = {
             "type": "mrope"
         }
-        model_engine._runner._config = replace(model_engine._runner._config,
-                                               use_mrope=True)
+        _set_runner_config(model_engine._runner, use_mrope=True)
 
         mapping = Mapping(world_size=1, tp_size=1, rank=0)
         kv_cache_config = KvCacheConfig(max_tokens=max_num_tokens)
@@ -2820,8 +2825,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
                                           kv_cache_manager=kv_cache_manager)
         attn_metadata.is_cuda_graph = False
 
-        model_engine._runner._config = replace(model_engine._runner._config,
-                                               max_num_tokens=max_num_tokens)
+        _set_runner_config(model_engine._runner, max_num_tokens=max_num_tokens)
         _resize_input_buffers(model_engine._runner, max_num_tokens)
         return model_engine, kv_cache_manager, attn_metadata
 
@@ -2834,9 +2838,9 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
                 engine.model.model_config.pretrained_config.rope_scaling = None
                 engine.model.model = SimpleNamespace(ced_kv_precompute=True,
                                                      decoder_replay_split=20)
-                engine._runner._config = replace(engine._runner._config,
-                                                 use_mrope=False,
-                                                 disable_overlap_scheduler=True)
+                _set_runner_config(engine._runner,
+                                   use_mrope=False,
+                                   disable_overlap_scheduler=True)
                 engine._runner.is_warmup = warmup
                 engine._runner._graphs.cuda_graph_runner = SimpleNamespace(
                     enabled=False)
@@ -2875,10 +2879,9 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
                 engine.model.model_config.pretrained_config.rope_scaling = None
                 engine.model.model = SimpleNamespace(ced_kv_precompute=True,
                                                      decoder_replay_split=20)
-                engine._runner._config = replace(
-                    engine._runner._config,
-                    use_mrope=False,
-                    disable_overlap_scheduler=not overlap)
+                _set_runner_config(engine._runner,
+                                   use_mrope=False,
+                                   disable_overlap_scheduler=not overlap)
                 engine._runner.is_warmup = False
                 engine._runner._graphs.cuda_graph_runner = SimpleNamespace(
                     enabled=not mixed)
