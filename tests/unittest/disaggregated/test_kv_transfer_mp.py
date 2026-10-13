@@ -42,17 +42,10 @@ from tensorrt_llm.bindings import DataType
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 
 
-def _initialize_cache(manager: KVCacheManagerV2, seed: int | None = None) -> None:
+def _initialize_cache(manager: KVCacheManagerV2) -> None:
     for layer_idx in manager.pp_layers:
         buffer = manager.get_buffers(layer_idx, kv_layout="HND")
-        generator = (
-            torch.Generator(device=buffer.device).manual_seed(seed + layer_idx)
-            if seed is not None
-            else None
-        )
-        buffer.copy_(
-            torch.rand(buffer.shape, dtype=torch.float32, device=buffer.device, generator=generator)
-        )
+        buffer.copy_(torch.rand(buffer.shape, dtype=torch.float32, device=buffer.device))
 
 
 def _allocate_request(manager: KVCacheManagerV2, request: LlmRequest) -> None:
