@@ -157,6 +157,9 @@ def test_executor_stops_its_progress_thread_on_shutdown(monkeypatch, hang_detect
     finally:
         if thread is not None:
             thread.stop()
+        # The hang-detected path returns without joining these threads.
+        executor.worker_thread.join()
+        executor.broadcast_sample_state_handler.join()
         executor._broadcast_mpi_comm.Free()
 
 
