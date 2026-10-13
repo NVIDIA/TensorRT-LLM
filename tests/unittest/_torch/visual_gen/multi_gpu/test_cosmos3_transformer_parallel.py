@@ -37,6 +37,8 @@ from tensorrt_llm._torch.visual_gen.models.cosmos3.transformer_cosmos3 import (
 )
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
+from ._worker_pool import run_distributed
+
 # Attention2D (attn2d) wraps the compute backend in Attention2DAttention, which
 # requires (a) an LSE-capable inner backend — only FA4, VANILLA does not support
 # LSE — and (b) the ``flash_attn_combine`` JIT kernel.  Detect both up front so the
@@ -226,8 +228,6 @@ def _cleanup_mpi_env():
 def run_test_in_distributed(world_size: int, test_fn: Callable, use_cuda: bool = True):
     if use_cuda and torch.cuda.device_count() < world_size:
         pytest.skip(f"Test requires {world_size} GPUs, only {torch.cuda.device_count()} available")
-    from ._worker_pool import run_distributed
-
     run_distributed(
         world_size, test_fn, backend="nccl" if use_cuda else "gloo", preload=("tensorrt_llm",)
     )
