@@ -60,6 +60,7 @@ def fp32_router_gemm(hidden_states: torch.Tensor, weight: torch.Tensor) -> torch
     num_tokens, hidden_size = hidden_states.shape
     if not (
         0 < num_tokens <= MAX_GEMV_TOKENS
+        and hidden_size == weight.shape[1]
         and hidden_states.stride(1) == 1
         and weight.stride(1) == 1
     ):

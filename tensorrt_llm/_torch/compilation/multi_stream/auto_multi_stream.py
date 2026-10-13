@@ -23,6 +23,7 @@ from torch.fx import Graph, GraphModule, Node
 
 from tensorrt_llm.logger import logger
 
+from ...modules import fp32_router_gemm  # noqa: F401  (registers trtllm::fp32_router_gemm)
 from ..utils import inplace_info
 
 
@@ -66,6 +67,7 @@ def estimate_time(node: Node) -> int:
         torch.ops.trtllm.cublas_scaled_mm.default,
         torch.ops.trtllm.cublas_mm.default,
         torch.ops.trtllm.dsv3_router_gemm_op.default,
+        torch.ops.trtllm.fp32_router_gemm.default,
         torch.ops.trtllm.dsv3_fused_a_gemm_op.default,
         torch.ops.trtllm.fp4_gemm.default,
         torch.ops.trtllm.fp4_bmm.default,
