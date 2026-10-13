@@ -128,7 +128,7 @@ def _reference_scores(q, w, pool, tables, kv_lens, *, num_pools_max, q_scale, w_
     return out
 
 
-@pytest.mark.parametrize("precision", ["ieee", "tf32"])
+@pytest.mark.parametrize("precision", ["ieee", "tf32", "bf16"])
 def test_pool_scores_generation_rows(precision):
     gen = torch.Generator(device="cuda").manual_seed(1)
     n, heads, slots, pages = 6, 4, 64, 8
@@ -147,9 +147,94 @@ def test_pool_scores_generation_rows(precision):
     want = _reference_scores(q, w, pool, tables, kv_lens, **kwargs)
     visible = want > FP32_MIN
     assert torch.equal(got <= FP32_MIN, ~visible)
-    # bf16 inputs are exact in tf32, so both precisions are fp32 accumulations
-    # of exact products.
+    # bf16 x bf16 products are exact in fp32, so every precision is an fp32
+    # accumulation of exact products.
     torch.testing.assert_close(got[visible], want[visible], atol=2e-3, rtol=2e-3)
+
+
+def test_pool_scores_bf16_precision_falls_back_for_fp32_queries():
+    """FP32 queries are not exact in bf16, so precision="bf16" keeps the tf32 dot."""
+    gen = torch.Generator(device="cuda").manual_seed(5)
+    n, heads, slots, pages = 6, 4, 64, 8
+    pool = _strided_index_pool(slots, gen)
+    tables = _paged_tables(n, pages, slots, gen)
+    q = torch.randn(n, heads, HD, generator=gen, device="cuda")
+    w = torch.rand(n, heads, generator=gen, device="cuda").to(torch.bfloat16)
+    kv_lens = torch.tensor([2, 5, 16, 33, 60, 64], dtype=torch.int64, device="cuda")
+    kwargs = dict(num_pools_max=100, q_scale=HD**-0.5, w_scale=0.25)
+
+    def score(precision):
+        return kpool_score(
+            q,
+            w,
+            pool,
+            tables,
+            kv_lens,
+            TPB,
+            head_dim=HD,
+            kpool=KPOOL,
+            precision=precision,
+            **kwargs,
+        )
+
+    assert torch.equal(score("bf16"), score("tf32"))
+
+
+@pytest.mark.parametrize("rows_per_program", [1, 16])
+@pytest.mark.parametrize("precision", ["tf32", "bf16"])
+def test_pool_scores_max_kv_len_bounds_scored_pools(rows_per_program, precision):
+    """A host bound on kv_lens limits the launch to pools some row can see.
+
+    Two packed context requests continue from cached prefixes, so the visible
+    pools of every row stay far below the block-table capacity. Each row's
+    complete pools match the reference and the unbounded launch, which is what
+    a top-k scanning kv_len // kpool columns reads.
+    """
+    gen = torch.Generator(device="cuda").manual_seed(29)
+    heads, num_pools_max = 8, 520
+    pages = num_pools_max * KPOOL // TPB
+    slots = 2 * pages + 8
+    pool = _strided_index_pool(slots, gen)
+    tables = _paged_tables(2, pages, slots, gen)
+    cached, lens = [250, 0], [37, 29]
+    request_ids = torch.cat(
+        [torch.full((length,), i, dtype=torch.int32) for i, length in enumerate(lens)]
+    ).cuda()
+    kv_lens = torch.cat(
+        [torch.arange(c + 1, c + length + 1) for c, length in zip(cached, lens)]
+    ).cuda()
+    n = kv_lens.shape[0]
+    q = torch.randn(n, heads, HD, generator=gen, device="cuda").to(torch.bfloat16)
+    w = torch.rand(n, heads, generator=gen, device="cuda").to(torch.bfloat16)
+    kwargs = dict(num_pools_max=num_pools_max, q_scale=HD**-0.5, w_scale=heads**-0.5)
+
+    def score(max_kv_len):
+        return kpool_score(
+            q,
+            w,
+            pool,
+            tables,
+            kv_lens,
+            TPB,
+            head_dim=HD,
+            kpool=KPOOL,
+            rows_per_program=rows_per_program,
+            request_ids=request_ids,
+            precision=precision,
+            max_kv_len=max_kv_len,
+            **kwargs,
+        )
+
+    max_kv_len = max(c + length for c, length in zip(cached, lens))
+    got = score(max_kv_len)
+    unbounded = score(None)
+    want = _reference_scores(q, w, pool, tables[request_ids.long()], kv_lens, **kwargs)
+    assert got.shape == (n, num_pools_max)
+    for r, num_pools in enumerate((kv_lens // KPOOL).tolist()):
+        assert torch.equal(got[r, :num_pools], unbounded[r, :num_pools])
+        torch.testing.assert_close(got[r, :num_pools], want[r, :num_pools], atol=2e-3, rtol=2e-3)
+    # No row has a complete pool: nothing is launched.
+    assert score(KPOOL - 1).shape == (n, num_pools_max)
 
 
 @pytest.mark.parametrize("layout", ["generation", "prefill_shared", "prefill_boundary"])
