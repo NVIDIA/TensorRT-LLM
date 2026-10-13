@@ -39,7 +39,6 @@ from typing import Any, ClassVar, Dict, Optional, Tuple
 import cudnn
 import torch
 
-from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.logger import logger
 from tensorrt_llm.visual_gen.args import QuantAttentionConfig
 
@@ -208,6 +207,12 @@ class _CuDNNProblemShape:
 # ============================================================================
 
 
+def _device_sm_version(device: torch.device) -> int:
+    """SM version (e.g. 107) of ``device``, not of CUDA device 0."""
+    major, minor = torch.cuda.get_device_capability(device)
+    return major * 10 + minor
+
+
 class CuDNNAttention(AttentionBackend):
     """cuDNN SDPA backend for visual generation.
 
@@ -300,8 +305,13 @@ class CuDNNAttention(AttentionBackend):
     def check_hardware_compatibility(
         cls, device: torch.device, quant_dtype: str | None = None
     ) -> None:
-        if get_sm_version() not in (100, 103) and quant_dtype is not None:
-            raise RuntimeError("cuDNN quantized attention requires NVIDIA Blackwell-class GPU.")
+        if quant_dtype is None:
+            return
+        if _device_sm_version(device) not in (100, 103, 107):
+            raise RuntimeError(
+                "cuDNN quantized attention requires an NVIDIA Blackwell- or Rubin-class GPU "
+                "(SM 100, 103 or 107)."
+            )
 
     @classmethod
     def check_library_feature(cls, quant_dtype: str | None = None) -> None:
@@ -708,8 +718,8 @@ class CuDNNAttention(AttentionBackend):
 
         self._execute_graph(bundle, tensor_map, device)
 
-        # Stats is packed [B, H, S, 1]; other backends expose LSE as [B, S, H].
-        lse = None if stats is None else stats.squeeze(-1).transpose(1, 2).contiguous()
+        # Stats is packed [B, H, S, 1]; LSE consumers (Ring/Attention2D) expect [B, H, S].
+        lse = None if stats is None else stats.squeeze(-1)
         return output, lse
 
     def forward(
@@ -752,7 +762,7 @@ class CuDNNAttention(AttentionBackend):
 
         Returns:
             output: ``[B, S_q, H, D_v]``
-            lse: ``[B, S_q, H]`` float32
+            lse: ``[B, H, S_q]`` float32
         """
         output, lse = self._run(
             q, k, v, is_causal=self._resolve_mask(attention_mask, key_padding_mask), with_lse=True

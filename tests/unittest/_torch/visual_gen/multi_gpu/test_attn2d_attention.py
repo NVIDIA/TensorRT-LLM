@@ -35,6 +35,7 @@ import torch.nn.functional as F
 
 from tensorrt_llm._torch.attention.backends.interface import PredefinedAttentionMask
 from tensorrt_llm._torch.visual_gen.attention_backend import Attention2DAttention
+from tensorrt_llm._torch.visual_gen.attention_backend.cudnn import CuDNNAttention
 from tensorrt_llm._torch.visual_gen.attention_backend.flash_attn4 import FlashAttn4Attention
 from tensorrt_llm._torch.visual_gen.attention_backend.flash_attn4 import _flash_attn_fwd as _fa4_fwd
 from tensorrt_llm._torch.visual_gen.attention_backend.interface import AttentionTensorLayout
@@ -282,6 +283,51 @@ def _logic_attn2d_vs_standard(rank, world_size):
         rtol=1e-3,
         atol=1e-3,
         msg=f"Rank {rank}: Attention2D output differs from standard attention",
+    )
+
+
+def _logic_attn2d_cudnn_vs_standard(rank, world_size):
+    """cuDNN inner backend: its LSE layout must match what Attention2D combines."""
+    row_size, col_size = 2, 2
+    batch, num_heads, head_dim = 1, 4, 64
+    seq_per_rank = 64
+    seq_full = seq_per_rank * world_size
+    device = torch.device(f"cuda:{rank}")
+
+    row_pg, col_pg = _make_process_groups(rank, world_size, row_size, col_size)
+
+    torch.manual_seed(42)
+    q_full, k_full, v_full = (
+        torch.randn(batch, seq_full, num_heads, head_dim, device=device, dtype=torch.bfloat16)
+        for _ in range(3)
+    )
+    shard = slice(rank * seq_per_rank, (rank + 1) * seq_per_rank)
+
+    inner = CuDNNAttention(num_heads=num_heads, head_dim=head_dim, dtype=torch.bfloat16)
+    try:
+        attn = Attention2DAttention(inner, row_pg, col_pg)
+    except ImportError:
+        pytest.skip("flash_attn_combine JIT kernels not available")
+
+    output = attn(
+        q_full[:, shard].contiguous(),
+        k_full[:, shard].contiguous(),
+        v_full[:, shard].contiguous(),
+        batch_size=batch,
+    )
+
+    reference = F.scaled_dot_product_attention(
+        q_full.transpose(1, 2).float(),
+        k_full.transpose(1, 2).float(),
+        v_full.transpose(1, 2).float(),
+        scale=1.0 / math.sqrt(head_dim),
+    ).transpose(1, 2)
+    torch.testing.assert_close(
+        output.float(),
+        reference[:, shard],
+        rtol=2e-2,
+        atol=2e-2,
+        msg=f"Rank {rank}: Attention2D(cuDNN) output differs from standard attention",
     )
 
 
@@ -662,6 +708,12 @@ class TestAttn2DAttention:
     def test_attn2d_vs_standard_attention(self):
         """Attention2DAttention output matches standard full-sequence SDPA (2x2 mesh)."""
         run_test_in_distributed(world_size=4, test_fn=_logic_attn2d_vs_standard, use_cuda=True)
+
+    def test_attn2d_cudnn_vs_standard_attention(self):
+        """Attention2D with the cuDNN inner backend matches standard SDPA (2x2 mesh)."""
+        run_test_in_distributed(
+            world_size=4, test_fn=_logic_attn2d_cudnn_vs_standard, use_cuda=True
+        )
 
     def test_attn2d_replicated_kv_unequal_lengths(self):
         """A 1x2 mesh matches full attention with unequal context lengths."""
