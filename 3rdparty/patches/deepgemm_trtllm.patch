@@ -551,7 +551,7 @@ index f703a0c..e2cb532 100644
 +
  } // namespace deep_gemm
 diff --git a/csrc/jit_kernels/impls/sm100_mqa_logits.hpp b/csrc/jit_kernels/impls/sm100_mqa_logits.hpp
-index e9b68a2..2a85a86 100644
+index e9b68a2..a018c99 100644
 --- a/csrc/jit_kernels/impls/sm100_mqa_logits.hpp
 +++ b/csrc/jit_kernels/impls/sm100_mqa_logits.hpp
 @@ -10,6 +10,33 @@
@@ -801,7 +801,7 @@ index e9b68a2..2a85a86 100644
 -        tensor_map_kv, tensor_map_sf_kv,
 -        tensor_map_weights
 -    );
-+    weights_dtype == torch::kBFloat16 ? "__nv_bfloat16" : "float"));
++    weights_dtype == torch::kBFloat16 ? "__nv_bfloat16" : "float");
  }
  
 -// Paged variant: separate host/runtime path, shared device core
