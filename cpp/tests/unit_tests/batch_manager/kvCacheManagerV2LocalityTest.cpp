@@ -356,6 +356,43 @@ TEST_F(KvCacheManagerV2MockLocalityTest, ResizeKeepsDomainsIndependent)
     EXPECT_GT(storage.getPerLocalityDomainFreeSlots()[1], 0);
 }
 
+// One 16 KiB-slot pool, 2 MiB physical grains, two domains: the per-domain share is the raw
+// quota halved and rounded down to a grain, both at construction and on resize.
+TEST_F(KvCacheManagerV2MockLocalityTest, QuotaIsSharedPerDomainConsistentlyOnInitAndResize)
+{
+    auto makeConfig = [](size_t quota)
+    {
+        KVCacheManagerConfig config;
+        config.tokensPerBlock = 32;
+        GpuCacheTierConfig gpu{quota};
+        gpu.enableLocalityDomains = true;
+        config.cacheTiers.emplace_back(gpu);
+        AttentionLayerConfig layer;
+        layer.layerId = 0;
+        layer.buffers.push_back(BufferConfig{"key", 16384, std::nullopt});
+        config.layers.emplace_back(std::move(layer));
+        return config;
+    };
+    constexpr size_t kMiB = 1ULL << 20;
+    constexpr SlotCount kSlotsPerGrain = 128;
+    PoolGroupIndex const pg{0};
+
+    for (auto const& [quotaMiB, grainsPerDomain] : std::vector<std::pair<size_t, SlotCount>>{{6, 1}, {7, 1}, {8, 2}})
+    {
+        auto manager = std::make_shared<KvCacheManager>(makeConfig(quotaMiB * kMiB));
+        auto& storage = manager->storage();
+        EXPECT_EQ(storage.numSlots(pg), grainsPerDomain * kSlotsPerGrain) << quotaMiB << " MiB at init";
+        for (auto const& [resizeMiB, resizeGrains] : std::vector<std::pair<size_t, SlotCount>>{{8, 2}, {7, 1}, {6, 1}})
+        {
+            storage.adjustCacheLevel(kHotLevel, resizeMiB * kMiB, storage.getRatioList(kHotLevel), nullptr);
+            EXPECT_EQ(storage.numSlots(pg), resizeGrains * kSlotsPerGrain) << resizeMiB << " MiB on resize";
+            auto const free = storage.getPerLocalityDomainFreeSlots();
+            EXPECT_EQ(free[0], free[1]);
+            EXPECT_EQ(free[0], resizeGrains * kSlotsPerGrain);
+        }
+    }
+}
+
 TEST_F(KvCacheManagerV2MockLocalityTest, NonLocalizedScopesHashAsBefore)
 {
     // The third ReuseScope field must not change the key of scopes that do not set it.

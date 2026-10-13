@@ -1909,14 +1909,18 @@ void StorageManager::adjustCacheLevel(CacheLevel level, std::optional<size_t> ne
 {
     auto& lvlStorage = *mLevels.at(level).storage;
     auto oldNumSlots = lvlStorage.slotCountList();
-    size_t quota = newQuota.has_value()
-        ? roundUp(newQuota.value(), static_cast<size_t>(lvlStorage.poolSizeGranularity()))
-        : lvlStorage.totalQuota();
-    // Slot counts and the feasibility floor are per domain; the quota covers the whole level.
+    size_t const granularity = lvlStorage.poolSizeGranularity();
     int const numDomains = lvlStorage.numLocalityDomains();
+    size_t quota;
     if (numDomains > 1)
     {
-        quota = roundDown(quota / static_cast<size_t>(numDomains), lvlStorage.poolSizeGranularity());
+        // Slot counts and the feasibility floor are per domain. The share is taken from the
+        // requested quota before any rounding, as construction does, so init and resize agree.
+        quota = roundDown(newQuota.value_or(lvlStorage.totalQuota()) / static_cast<size_t>(numDomains), granularity);
+    }
+    else
+    {
+        quota = newQuota.has_value() ? roundUp(newQuota.value(), granularity) : lvlStorage.totalQuota();
     }
     auto const minSlots
         = level == kHotLevel ? mMinSlots : TypedVec<PoolGroupIndex, SlotCount>(numPoolGroups(level), SlotCount{1});
