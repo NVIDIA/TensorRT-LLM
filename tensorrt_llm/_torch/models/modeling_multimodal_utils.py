@@ -353,7 +353,12 @@ def get_multimodal_embeddings(
             )
             return encoder_embeddings
 
-        # Step 3: Cache the computed embeddings to multimodal_data["multimodal_embedding"]
+        # Step 3: Cache the computed embeddings to multimodal_data["multimodal_embedding"].
+        # A TP-sharded encoder can return an NCCL window tensor whose lease ends
+        # with the enclosing ModelCaller scope, while chunked prefill reads the
+        # cached rows in later iterations, so cache an owned copy instead of
+        # views of the encoder output.
+        encoder_embeddings = [encoder_embeddings[0].clone()]
         _store_chunked_prefill_embeddings(uncached_multimodal_params,
                                           encoder_embeddings)
 

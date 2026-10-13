@@ -251,6 +251,58 @@ def test_item_encoder_does_not_translate_system_errors(failure_stage: str) -> No
         mm_item_scheduler.forward_items([request], {request.request_id: [0]})
 
 
+@pytest.mark.parametrize(
+    "forward_failure,expected_error,scope_failed",
+    [
+        ("output_count", MultimodalEncoderRequestError, False),
+        ("contract", MultimodalEncoderRequestError, False),
+        ("system", torch.cuda.OutOfMemoryError, True),
+    ],
+)
+def test_item_encoder_closes_window_scope_before_request_errors(
+    forward_failure: str, expected_error: type, scope_failed: bool
+) -> None:
+    class _Model(MultimodalModelMixin):
+        def prepare_multimodal_encoder_inputs(self, _):
+            encoder_input = SimpleNamespace(to_device=lambda *_args, **_kwargs: None)
+            return [(encoder_input, [1], "image")]
+
+        def forward_multimodal_encoder_items(self, _):
+            if forward_failure == "contract":
+                raise MultimodalEncoderContractError("bad encoder output rows")
+            if forward_failure == "system":
+                raise torch.cuda.OutOfMemoryError("encoder OOM")
+            return []
+
+    class _RecordingScope:
+        exits = []
+
+        def __init__(self, _inputs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, _exc, _tb):
+            self.exits.append(exc_type is not None)
+            return False
+
+    mm_item_scheduler = bare_mm_item_scheduler(_Model())
+    request = make_mm_request(1, [4])
+    _bind_items(mm_item_scheduler, request)
+
+    with patch(
+        "tensorrt_llm._torch.pyexecutor.engine.multimodal.discard_nccl_window_tensor_outputs",
+        _RecordingScope,
+    ):
+        with pytest.raises(expected_error):
+            mm_item_scheduler.forward_items([request], {request.request_id: [0]})
+
+    # Request-level failures leave the scope normally so its window leases are
+    # released; anything else still fails the scope and quarantines them.
+    assert _RecordingScope.exits == [scope_failed]
+
+
 @pytest.mark.parametrize("invalid_output", ["rows", "width", "dtype", "rank", "type"])
 def test_item_encoder_validates_all_outputs_before_commit(invalid_output: str) -> None:
     class _Model(MultimodalModelMixin):

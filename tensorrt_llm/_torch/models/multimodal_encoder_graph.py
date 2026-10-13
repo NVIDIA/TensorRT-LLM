@@ -39,6 +39,7 @@ import torch
 
 from ...logger import logger
 from ..nccl_window_graph import nccl_window_graph_capture, release_nccl_window_graph_owner
+from ..nccl_window_tensor_scope import discard_nccl_window_tensor_outputs
 from ..utils import make_weak_ref, torch_compiling
 
 if TYPE_CHECKING:
@@ -396,13 +397,17 @@ class MultimodalEncoderGraphRunner:
         # engine's value. `encoder_fn` is handed its metadata explicitly, so its layers must take
         # the eager path rather than the custom op, which resolves metadata from `extra_attrs` that
         # only an engine forward binds.
+        # Capture can run from `load_weights`, outside any engine forward or `ModelCaller` scope, so
+        # NCCL-window tensors produced by a TP-sharded tower need a local lease scope here.
         with torch.inference_mode(), torch_compiling(False):
             for _ in range(self._config.warmup_steps):
-                self._encoder_fn(static_inputs, metadata)
+                with discard_nccl_window_tensor_outputs(static_inputs):
+                    self._encoder_fn(static_inputs, metadata)
             torch.cuda.synchronize()
 
             with nccl_window_graph_capture(graph, graph_pool):
-                outputs = self._encoder_fn(static_inputs, metadata)
+                with discard_nccl_window_tensor_outputs(static_inputs):
+                    outputs = self._encoder_fn(static_inputs, metadata)
 
         captured_outputs = {name: make_weak_ref(tensor) for name, tensor in outputs.items()}
         self._captured[key] = _CapturedGraph(

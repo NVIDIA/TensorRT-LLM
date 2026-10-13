@@ -194,13 +194,20 @@ def profile_allreduce(
 
     if fusion == AllReduceFusionOp.NONE and not profile_gemm_allreduce:
         allreduce_ref = (input * mapping.world_size)
-        torch.testing.assert_close(
-            output,
-            allreduce_ref,
-            atol=1e-2,
-            rtol=1e-2,
-            msg="Allreduce result mismatch",
-        )
+        # func's per-iteration scopes release eager window outputs on exit, so
+        # verify a fresh result while its lease is held. A captured output stays
+        # owned by graph_pool until release_nccl_window_graph_owner below.
+        with torch.cuda.stream(stream), \
+                discard_nccl_window_tensor_outputs((input, residual)):
+            if not enable_cudagraph:
+                output = allreduce(input, all_reduce_params=allreduce_params)
+            torch.testing.assert_close(
+                output,
+                allreduce_ref,
+                atol=1e-2,
+                rtol=1e-2,
+                msg="Allreduce result mismatch",
+            )
     # A symmetric benchmark input may itself own a registered window.
     with nccl_window_tensor_scope(input):
         pass
