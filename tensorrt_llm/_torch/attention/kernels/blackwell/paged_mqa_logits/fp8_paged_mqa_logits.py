@@ -245,7 +245,9 @@ class FP8MQALogitsKernel:
         self.num_epi_subtiles = num_epi_subtiles
         self.epi_dtype = epi_dtype
         # relu(x) = (x + |x|) / 2 (FADD2 + abs) instead of max(x, 0)
-        # (FMNMX). fp32 epilogue only -- f16x2 has no abs modifier.
+        # (FMNMX), fp32 epilogue only. x + |x| overflows to inf for finite
+        # x >= 2^127 (block scales and weights are unbounded); DeepGEMM's
+        # SM100 epilogue takes the same risk unconditionally.
         self.use_relu_trick = use_relu_trick
         # Flat logits view + carried row offset: the store address is
         # base + out_row*stride0 + kv_pos, but out_row only changes on a

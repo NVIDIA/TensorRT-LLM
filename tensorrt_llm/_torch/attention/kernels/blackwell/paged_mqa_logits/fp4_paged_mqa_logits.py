@@ -519,7 +519,9 @@ class FP4MQALogitsKernel:
         ), f"FP4 output_dtype must be fp32/bf16/fp16; got {output_dtype}"
         assert block_kv == 128, "FP4 compute tile (block_kv) hardcoded to 128"
         # relu(x) = (x + |x|) / 2 (FADD2 + abs) instead of max(x, 0)
-        # (FMNMX). fp32 epilogue only -- f16x2 has no abs modifier.
+        # (FMNMX), fp32 epilogue only. x + |x| overflows to inf for finite
+        # x >= 2^127 (block scales and weights are unbounded); DeepGEMM's
+        # SM100 epilogue takes the same risk unconditionally.
         self.use_relu_trick = use_relu_trick
         self.block_kv = block_kv
         self.phys_block_kv = phys_block_kv
