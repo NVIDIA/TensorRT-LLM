@@ -73,6 +73,8 @@ class CampaignState:
     # Same-host controls, keyed "<best commit>|<overlays>|<host>": hosts differ by
     # more than most candidates move, so a candidate is judged on its own host.
     controls: dict[str, str] = field(default_factory=dict)
+    # Winners on one best tree measured together: {members, base, tree, label, status}.
+    batch: dict = field(default_factory=dict)
 
     @classmethod
     def load(cls, path: Path) -> "CampaignState":
@@ -366,7 +368,10 @@ class Campaign:
                 st.verdict, st.reason, st.deltas = cmp.verdict, cmp.reason, dict(cmp.deltas)
                 self.ledger.append("candidate_e2e", slug=st.slug, **cmp.as_dict())
                 self.log(f"[campaign] {st.slug}: {cmp.verdict} {cmp.reason}")
-                st.status = "gate" if cmp.verdict == "WIN" else "reverted"
+                # A winner waits for the other measurements on this best tree: several
+                # winners are stacked and measured once (see _batch) instead of being
+                # kept one by one, each keep forcing the rest to re-measure.
+                st.status = "won" if cmp.verdict == "WIN" else "reverted"
             if st.status == "gate":
                 busy = True
                 # Keyed by the tree gated: a candidate re-stacked on a new best is a
@@ -394,8 +399,142 @@ class Campaign:
                     self._keep(st)
                 else:
                     st.status, st.reason = "reverted", f"accuracy {st.gate.get('score')} < floor {st.gate.get('floor')}"
+        busy = self._batch() or busy
         self.state.save(self.state_path)
         return busy
+
+    def _best_head(self) -> str:
+        return git(Path(self.state.best_tree), "rev-parse", "HEAD")
+
+    def _batch(self) -> bool:
+        """Decide what the winners on the current best tree become: one gate, or one stack."""
+        from .worktree import add_worktree, link_native
+
+        head = self._best_head()
+        cands = self.state.candidates
+        b = self.state.batch
+        if b and b.get("base") != head:
+            for slug in b.get("members", []):
+                if cands[slug].status == "won":
+                    cands[slug].status, cands[slug].e2e_label = "e2e", ""
+            self.state.batch = b = {}
+        for st in cands.values():
+            if st.status == "won" and st.eval_base != head:
+                st.status, st.e2e_label = "e2e", ""  # the best moved: re-stack
+        winners = sorted((st for st in cands.values() if st.status == "won"),
+                         key=lambda st: max(st.deltas.values() or [0.0]), reverse=True)
+        if not b:
+            waiting = [st for st in cands.values() if st.status == "e2e" and st.eval_base == head and st.e2e_label
+                       and self._measurement(st.e2e_label) is None]
+            if not winners or waiting:
+                return bool(winners)
+            if len(winners) == 1:
+                winners[0].status = "gate"
+                return True
+            tree = Path(self.state.best_tree).parent / "eval-batch"
+            if (tree / ".git").exists():
+                git(tree, "cherry-pick", "--abort", check=False)
+                git(tree, "checkout", "-q", "-B", "tune/eval-batch", head)
+                git(tree, "reset", "-q", "--hard", head)
+            else:
+                add_worktree(self.repo, tree, "-B", "tune/eval-batch", str(tree), head)
+            link_native(self.repo, tree)
+            members = []
+            for st in winners:
+                tip = git(tree, "rev-parse", "HEAD")
+                out = subprocess.run(["git", "-C", str(tree), "cherry-pick", *st.commits], capture_output=True, text=True)
+                if out.returncode != 0:
+                    git(tree, "cherry-pick", "--abort", check=False)
+                    git(tree, "reset", "-q", "--hard", tip)
+                    continue  # stays `won`: kept alone or re-stacked after the batch
+                members.append(st.slug)
+            if len(members) < 2:
+                winners[0].status = "gate"
+                return True
+            import hashlib
+
+            cfg = self._config_key()
+            tag = hashlib.sha1(cfg.encode()).hexdigest()[:6] if cfg else "id"
+            label = f"e2e-batch-{git(tree, 'rev-parse', '--short=10', 'HEAD')}-{tag}"
+            self.state.batch = b = {"members": members, "base": head, "tree": str(tree), "label": label, "status": "e2e"}
+            self.ledger.append("batch_formed", members=members, base=head, label=label)
+            self.log(f"[campaign] batch {members} stacked on {head[:10]}")
+        if b["status"] == "e2e":
+            m = self._measurement(b["label"])
+            if m is None:
+                if f"{self.perf.prefix}-{b['label']}" not in self.perf.inflight:
+                    for spool in self.perf.free_spools():
+                        if not self._ensure_control(spool):
+                            continue
+                        cmd = self.bench.command(b["label"], self.data, self.configs())
+                        self.perf.submit(spool, b["label"], cmd, wall=self.bench.wall, tree=b["tree"])
+                        self.log(f"[campaign] batch e2e queued on {spool}")
+                        break
+                return True
+            ctrl = self._control_for(str(m.meta.get("hostname") or ""))
+            if ctrl is None:
+                spool = next((sp for sp in self.perf.spools if self.spool_host(sp) == m.meta.get("hostname")), None)
+                if spool is not None:
+                    self._ensure_control(spool)
+                return True
+            self.ledger.measurement(m, candidate="batch")
+            cmp = compare(m, ctrl, self.noise, min_gain=self.min_gain, noise_factor=self.noise_factor)
+            best_single = {}
+            for slug in b["members"]:
+                for k, v in cands[slug].deltas.items():
+                    best_single[k] = max(best_single.get(k, v), v)
+            # The stack must hold every metric's best single gain, within the loss floor.
+            holds = cmp.verdict == "WIN" and all(
+                cmp.deltas.get(k, 0.0) >= v - max(0.01, self.noise_factor * self.noise.of(k))
+                for k, v in best_single.items() if v > 0)
+            self.ledger.append("batch_e2e", members=b["members"], holds=holds, best_single=best_single, **cmp.as_dict())
+            self.log(f"[campaign] batch {b['members']}: {cmp.verdict} {cmp.reason}; holds={holds}")
+            if not holds:
+                winners[0].status = "gate"
+                self.state.batch = {}
+                return True
+            b["status"], b["deltas"] = "gate", dict(cmp.deltas)
+        if b["status"] == "gate":
+            sha = git(Path(b["tree"]), "rev-parse", "--short=10", "HEAD")
+            out = self.workdir / "gates" / f"batch-{sha}"
+            result = out / "result.json"
+            job = f"gate-batch-{sha}"
+            if not result.exists():
+                if f"{self.gates.prefix}-{job}" not in self.gates.inflight:
+                    free = self.gates.free_spools()
+                    if free:
+                        self.gates.submit(free[0], job, self.gate_cmd(Path(b["tree"]), self.configs(), out),
+                                          wall="1h", tree=b["tree"], gpus="1")
+                        self.log(f"[campaign] gate batch queued on {free[0]}")
+                return True
+            gate = json.loads(result.read_text())
+            self.ledger.append("candidate_gate", slug="batch", members=b["members"], **gate)
+            if gate.get("verdict") != "PASS":
+                winners[0].status = "gate"  # fall back to the strongest single
+                self.state.batch = {}
+                return True
+            best = Path(self.state.best_tree)
+            before = git(best, "rev-parse", "HEAD")
+            out = subprocess.run(["git", "-C", str(best), "merge", "--ff-only", git(Path(b["tree"]), "rev-parse", "HEAD")],
+                                 capture_output=True, text=True)
+            if out.returncode != 0:
+                winners[0].status = "gate"
+                self.state.batch = {}
+                return True
+            self.state.best_commit = git(best, "rev-parse", "HEAD")
+            for slug in b["members"]:
+                st = cands[slug]
+                st.status, st.gate = "kept", gate
+                self.state.kept.append(slug)
+            self.state.controls[self._control_key(str(self._measurement(b["label"]).meta.get("hostname") or ""))] = b["label"]
+            self.ledger.append("batch_kept", members=b["members"], best=self.state.best_commit, deltas=b.get("deltas"),
+                               commits=git(best, "rev-list", "--reverse", f"{before}..HEAD").splitlines(), gate=gate)
+            self.log(f"[campaign] KEEP batch {b['members']} -> tune/best {self.state.best_commit[:10]}")
+            for other in cands.values():
+                if other.status == "e2e" and other.e2e_label and self.perf.cancel(other.e2e_label):
+                    other.e2e_label = ""
+            self.state.batch = {}
+        return True
 
     def _keep(self, st: CandidateState) -> None:
         best = Path(self.state.best_tree)
@@ -421,6 +560,8 @@ class Campaign:
         # Every other measurement in flight was stacked on the old best and would be
         # re-measured anyway: stop it now and re-stack on the next pass.
         for other in self.state.candidates.values():
+            if other.slug != st.slug and other.status == "won":
+                other.status, other.e2e_label = "e2e", ""
             if other.slug != st.slug and other.status == "e2e" and other.e2e_label:
                 if self.perf.cancel(other.e2e_label):
                     self.log(f"[campaign] {other.slug}: cancelled its measurement on the old best")
