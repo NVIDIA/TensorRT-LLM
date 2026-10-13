@@ -26,10 +26,15 @@ from tensorrt_llm._torch.visual_gen.models.minimax_h3.transformer_minimax_h3 imp
 )
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
-from tensorrt_llm.visual_gen.args import AttentionConfig
+from tensorrt_llm.visual_gen.args import AttentionConfig, ParallelConfig
 
 
-def _make_model_config(backend: str = "VANILLA") -> DiffusionModelConfig:
+def _make_model_config(
+    backend: str = "VANILLA", async_ulysses: bool = False
+) -> DiffusionModelConfig:
+    parallel = (
+        ParallelConfig(ulysses_size=2, async_ulysses=True) if async_ulysses else ParallelConfig()
+    )
     return DiffusionModelConfig(
         pretrained_config=SimpleNamespace(
             num_attention_heads=2,
@@ -55,7 +60,21 @@ def _make_model_config(backend: str = "VANILLA") -> DiffusionModelConfig:
         mapping=Mapping(),
         attention=AttentionConfig(backend=backend),
         attention_metadata_state=create_attention_metadata_state(),
+        parallel=parallel,
     )
+
+
+def _split_fused_qkv(state: dict[str, torch.Tensor], keys) -> dict[str, torch.Tensor]:
+    """Translate a fused-QKV state dict to the separate to_q / to_k / to_v layout of async Ulysses."""
+    out = {}
+    for key in keys:
+        if key in state:
+            out[key] = state[key]
+            continue
+        prefix, name = key.rsplit(".", 2)[0], key.rsplit(".", 2)[1]
+        q, k, v = state[f"{prefix}.qkv_proj.weight"].chunk(3, dim=0)
+        out[key] = {"to_q": q, "to_k": k, "to_v": v}[name]
+    return out
 
 
 class _TileDecoder(torch.nn.Module):
@@ -76,7 +95,7 @@ def _make_vae() -> TiledAutoencoderKLMiniMaxH3:
     return vae
 
 
-def _worker(rank: int, port: int, backend: str) -> None:
+def _worker(rank: int, port: int, backend: str, async_ulysses: bool = False) -> None:
     torch.cuda.set_device(rank)
     dist.init_process_group(
         "nccl",
@@ -96,12 +115,12 @@ def _worker(rank: int, port: int, backend: str) -> None:
                     parameter.fill_(1)
                 else:
                     parameter.normal_(0, 0.02)
-        config = _make_model_config(backend)
+        config = _make_model_config(backend, async_ulysses)
         vgm = VisualGenMapping(world_size=2, rank=rank, ulysses_size=2, parallel_vae_size=2)
         config.visual_gen_mapping = vgm
         config.mapping = vgm.to_llm_mapping()
         candidate = MiniMaxH3Transformer3DModel(config).to(device).eval()
-        candidate.load_state_dict(reference.state_dict())
+        candidate.load_state_dict(_split_fused_qkv(reference.state_dict(), candidate.state_dict()))
         # Five packed rows and one text row both require padding for two ranks.
         inputs = {
             "hidden_states": torch.randn(1, 3, 2, device=device),
@@ -140,14 +159,19 @@ def _worker(rank: int, port: int, backend: str) -> None:
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Requires two CUDA GPUs")
+@pytest.mark.parametrize("async_ulysses", [False, True], ids=["nccl", "async"])
 @pytest.mark.parametrize("backend", ["VANILLA", "FA4"])
-def test_h3_ulysses_and_parallel_vae(monkeypatch: pytest.MonkeyPatch, backend: str) -> None:
+def test_h3_ulysses_and_parallel_vae(
+    monkeypatch: pytest.MonkeyPatch, backend: str, async_ulysses: bool
+) -> None:
     from ._visual_gen_dist_utils import spawn_with_retry
 
     if backend == "FA4" and torch.cuda.get_device_capability()[0] < 10:
         pytest.skip("FA4 requires SM100 or newer")
     monkeypatch.setenv("TLLM_DISABLE_MPI", "1")
-    spawn_with_retry(lambda port: mp.spawn(_worker, args=(port, backend), nprocs=2, join=True))
+    spawn_with_retry(
+        lambda port: mp.spawn(_worker, args=(port, backend, async_ulysses), nprocs=2, join=True)
+    )
 
 
 def _partial_vae_worker(rank: int, port: int) -> None:
