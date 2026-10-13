@@ -3278,7 +3278,10 @@ def test_connector_adp_transfer_timeout(
             except ProcessLookupError:
                 pass
             process.wait()
-    output = log_path.read_text()
+            # Preserve consumer diagnostics even when the wait raises before
+            # the assertions below can include them in a failure report.
+            output = log_path.read_text(errors="replace")
+            print(output)
     assert _connector_event_count(records, 0,
                                   "withheld_prefix_load") > 0, output
     assert returncode != 0, output

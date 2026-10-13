@@ -147,7 +147,9 @@ def _run_timeout_consumer() -> None:
     try:
         # A fatal transfer error requires immediate process exit. A context
         # manager would try graceful shutdown before reaching the handler.
+        print("ADP timeout consumer: initializing executor", flush=True)
         llm = LLM(**options)
+        print("ADP timeout consumer: starting stalled generation", flush=True)
         llm.generate([prompt] * 2, SamplingParams(max_tokens=8, ignore_eos=True))
     except Exception:
         traceback.print_exc()
