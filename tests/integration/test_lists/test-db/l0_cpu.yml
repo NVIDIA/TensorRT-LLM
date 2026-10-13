@@ -48,6 +48,7 @@ l0_cpu:
   - unittest/_torch/kernels/kimi_k3/test_k3_mla_decode_view.py
   - unittest/_torch/kernels/kimi_k3/test_k3_mla_launch.py
   - unittest/_torch/kernels/kimi_k3/test_k3_kda_pool_layout.py
+  - unittest/_torch/cute_dsl_kernels/test_megamoe_shared_fc12_autotune.py
   - unittest/_torch/compilation/test_auto_multi_stream.py
   - unittest/_torch/compilation/test_phase_selective_forward.py
   - unittest/_torch/compilation/test_remove_copy_pass.py::test_remove_copy_preserves_minimax_producer_outputs
@@ -207,6 +208,7 @@ l0_cpu:
   - unittest/executor/test_forward_error_survival.py
   - unittest/executor/test_rpc_worker_mixin.py
   - unittest/executor/test_sleep_collective_rpc_guards.py
+  - unittest/executor/test_shutdown_retry_contracts.py
   - unittest/executor/test_stats_serializer.py
   - unittest/executor/test_spec_dec_perf_metrics.py
   - unittest/executor/test_stop_word_side_output_trim.py
@@ -277,6 +279,7 @@ l0_cpu:
   - unittest/llmapi/test_whisper_suppress_tokens_processor.py
   - unittest/llmapi/test_kv_cache_dtype_override.py
   - unittest/llmapi/test_llm_args.py
+  - unittest/llmapi/test_gms_args.py
   - unittest/llmapi/test_mx_args.py
   - unittest/llmapi/test_custom_tokenizer_aliases.py
   # Reads the Muse Spark Open tokenizer files from LLM_MODELS_ROOT.

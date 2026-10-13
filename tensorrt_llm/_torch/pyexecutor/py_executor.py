@@ -505,6 +505,8 @@ class PyExecutor:
     # The model's executor events (RuntimeHooks.executor_events); read once at
     # construction.
     _executor_events: Optional[ExecutorEvents] = None
+    # Shutdown publication is leader-only, while join/finalize runs on every rank.
+    shutdown_all_ranks = True
 
     # Minimum number of async micro batches for async PP execution.
     # This is a trade-off between memory usage and performance.
@@ -1120,6 +1122,8 @@ class PyExecutor:
                     self.encoder_launch_executor.submit(
                         self._warmup_encoder_cuda_graphs_enc_dec).result()
 
+        self._handoff_rebalance_warmup_owners()
+
         # Snapshot some cumulative KV cache counters so that stats reported to
         # users exclude blocks reused and missed during warmup dummy requests.
         if hasattr(self.kv_cache_manager, 'snapshot_warmup_baseline'):
@@ -1397,6 +1401,38 @@ class PyExecutor:
         """
         connector = getattr(self, "kv_connector_manager", None)
         return connector is not None and not connector.capacity_only
+
+    def _handoff_rebalance_warmup_owners(self) -> None:
+        """Transfer model-level EPLB submitters from warmup to serving."""
+        managers = {}
+        for engine in (self.model_engine, self.draft_model_engine):
+            manager = getattr(engine, "moe_load_balancer", None)
+            handoff = getattr(manager, "handoff_submission_owner", None)
+            if callable(handoff):
+                managers[id(manager)] = manager
+        if not managers:
+            return
+
+        # Target, draft, and encoder warmup have all completed. One device
+        # drain covers every manager's compute and copy streams before the
+        # serving worker binds submission ownership.
+        torch.cuda.synchronize(self.execution_stream.device)
+        execution_stream_handle = int(self.execution_stream.cuda_stream)
+        for manager in managers.values():
+            manager.handoff_submission_owner(execution_stream_handle)
+
+    def _release_quiesced_rebalance_submission_owners(self) -> None:
+        """Release EPLB submitters after the worker exits and device drains."""
+        execution_stream_handle = int(self.execution_stream.cuda_stream)
+        managers = {}
+        for engine in (self.model_engine, self.draft_model_engine):
+            manager = getattr(engine, "moe_load_balancer", None)
+            release = getattr(manager, "release_quiesced_submission_owner",
+                              None)
+            if callable(release):
+                managers[id(manager)] = manager
+        for manager in managers.values():
+            manager.release_quiesced_submission_owner(execution_stream_handle)
 
     def _maybe_init_kv_connector_manager(self) -> None:
         if self.kv_connector_manager is not None:
@@ -2288,7 +2324,8 @@ class PyExecutor:
             logger.error("Hang detected, shutting down immediately.")
             # Stop the relay thread and the native progress thread from
             # probing while the hang detector aborts MPI. A relay-thread probe
-            # already in flight is not interrupted.
+            # already in flight is not interrupted. Do not let the outer worker
+            # enter model collectives on a broken rank set.
             self._pp_mpi_progress_stop.set()
             self._stop_mpi_progress_thread()
             return False
@@ -2316,10 +2353,13 @@ class PyExecutor:
             encoder_launch_executor.shutdown(wait=True)
             self.encoder_launch_executor = None
 
-        # Stop the sampler's async worker, if it was used
-        if (isinstance(self.sampler, AsyncWorkerMixin)
-                and self.sampler.async_worker_enabled()):
-            self.sampler.async_worker_stop()
+        # Stop the sampler's async worker, if it was used. A retried
+        # shutdown stops it only once.
+        if not getattr(self, "_shutdown_sampler_complete", False):
+            if (isinstance(self.sampler, AsyncWorkerMixin)
+                    and self.sampler.async_worker_enabled()):
+                self.sampler.async_worker_stop()
+            self._shutdown_sampler_complete = True
 
         self.worker_started = False
         if self._kv_connector_failed:
@@ -2334,10 +2374,9 @@ class PyExecutor:
         # empty_cache), the subsequent CUDA graph teardown can trigger a
         # device-wide cudaErrorIllegalAddress when the driver touches metadata
         # for the now-freed memory regions.
-        for engine in (self.model_engine, self.draft_model_engine):
-            if engine is not None:
-                engine.release_executor_resources(
-                    release_model_owned_graphs=release_model_owned_graphs)
+        for engine in self._terminal_model_engines:
+            engine.release_executor_resources(
+                release_model_owned_graphs=release_model_owned_graphs)
         # Ensure graph destruction has fully completed on device before
         # resource managers start freeing GPU-backed workspaces.
         if torch.cuda.is_available():
@@ -2351,9 +2390,10 @@ class PyExecutor:
         if self.virtual_memory_pools is not None:
             keys = list(self.virtual_memory_pools.keys())
             for key in keys:
-                del self.virtual_memory_pools[key]
-        if self.dwdp_manager is not None:
-            self.dwdp_manager.__exit__(None, None, None)
+                del virtual_memory_pools[key]
+        dwdp_manager = getattr(self, "dwdp_manager", None)
+        if dwdp_manager is not None:
+            dwdp_manager.__exit__(None, None, None)
             self.dwdp_manager = None
         return True
 

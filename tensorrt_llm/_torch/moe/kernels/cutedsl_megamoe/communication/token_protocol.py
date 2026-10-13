@@ -9,7 +9,6 @@ import cutlass.cute as cute
 from cutlass.cute.typing import AddressSpace
 from cutlass.cutlass_dsl import Int32, Int64
 
-
 @dataclasses.dataclass(frozen=True)
 class TokenSrcMetadata:
     """One i64 routing record: rank:u16, topk:u16, token:u32."""
@@ -22,11 +21,15 @@ class TokenSrcMetadata:
 
     def pack(self) -> Int64:
         high = (Int64(self.src_rank) << Int64(16)) | Int64(self.src_topk)
-        return (high << Int64(32)) | (Int64(self.src_token) & Int64(0xFFFFFFFF))
+        return (high << Int64(32)) | (
+            Int64(self.src_token) & Int64(0xFFFFFFFF)
+        )
 
     @staticmethod
     def _pointer(address: Union[cute.Pointer, Int64]) -> cute.Pointer:
-        raw_address = address if isinstance(address, Int64) else address.toint()
+        raw_address = (
+            address if isinstance(address, Int64) else address.toint()
+        )
         return cute.make_ptr(
             Int64,
             raw_address,
@@ -42,7 +45,9 @@ class TokenSrcMetadata:
         cls,
         address: Union[cute.Pointer, Int64],
     ) -> "TokenSrcMetadata":
-        packed = Int64(cute.arch.load(cls._pointer(address), Int64, scope="gpu"))
+        packed = Int64(
+            cute.arch.load(cls._pointer(address), Int64, scope="gpu")
+        )
         high = packed >> Int64(32)
         return cls(
             src_rank=Int32((high >> Int64(16)) & Int64(0xFFFF)),
