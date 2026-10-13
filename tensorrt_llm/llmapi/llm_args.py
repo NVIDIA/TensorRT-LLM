@@ -1287,10 +1287,11 @@ class DeepSeekSparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
         "Whether to use CuTE DSL top-k kernel instead of the CUDA C++ indexer_topk_decode."
     )
     use_cute_dsl_paged_mqa_logits: bool = Field(
-        default=False,
+        default=True,
         description=
-        "Whether to use CuTE DSL paged MQA logits kernel on SM100-family GPUs instead of C++ DeepGEMM."
-    )
+        "Whether to use the CuTe DSL paged MQA logits kernel on SM100-family "
+        "GPUs instead of C++ DeepGEMM. Falls back to DeepGEMM off the SM100 "
+        "family or when the cutlass-dsl package is missing.")
     q_split_threshold: int = Field(
         default=8192,
         description=

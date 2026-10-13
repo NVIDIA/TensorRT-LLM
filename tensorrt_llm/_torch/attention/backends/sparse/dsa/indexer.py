@@ -27,7 +27,7 @@ from tensorrt_llm._torch.modules.multi_stream_utils import (
 )
 from tensorrt_llm._torch.modules.top_k import TopK, TopKImplementation
 from tensorrt_llm._torch.utils import Fp4QuantizedTensor, maybe_compile
-from tensorrt_llm._utils import get_sm_version, maybe_pin_memory, prefer_pinned
+from tensorrt_llm._utils import get_sm_version, is_sm_100f, maybe_pin_memory, prefer_pinned
 from tensorrt_llm.deep_gemm import (
     fp8_fp4_mqa_logits,
     fp8_fp4_paged_mqa_logits,
@@ -683,8 +683,13 @@ class Indexer(nn.Module):
         self.prev_topk_copy_events = [torch.cuda.Event(), torch.cuda.Event()]
         self._prev_topk_copy_pending = False
         self.use_cute_dsl_topk = sparse_params.use_cute_dsl_topk and IS_CUTLASS_DSL_AVAILABLE
+        # is_sm_100f is the op's own precondition (cute_dsl_custom_ops raises a
+        # ValueError below it), so the gate has to match it exactly now that the
+        # flag defaults on -- otherwise every non-Blackwell DSA run aborts.
         self.use_cute_dsl_paged_mqa_logits = (
-            sparse_params.use_cute_dsl_paged_mqa_logits and IS_CUTLASS_DSL_AVAILABLE
+            sparse_params.use_cute_dsl_paged_mqa_logits
+            and IS_CUTLASS_DSL_AVAILABLE
+            and is_sm_100f()
         )
         self.weight_scale_factor = self.softmax_scale * self.n_heads**-0.5
 
