@@ -98,6 +98,7 @@ class FakeRequest:
         self.py_connector_prefix_end = None
         self.py_connector_load_async = False
         self.py_connector_delivered = False
+        self.py_connector_load_failed = False
 
     def set_prepopulated_prompt_len(self, prepopulated_prompt_len, tokens_per_block):
         assert prepopulated_prompt_len < self.prompt_len, (
@@ -595,6 +596,53 @@ class TestAsyncLoad:
         # Lossy for an async load -- the transfer began inside the query -- but
         # still the only signal the connector gets that the tail is dead.
         assert connector.cancels == [(0, PROMPT_LEN - 1, PROMPT_LEN)]
+
+
+class TestFailedLoadRestart:
+    """A request restarted after a failed load is not offered a prefix again.
+
+    A store whose lookup keeps reporting a key present while its reads fail
+    would otherwise offer the same prefix on every admission, and the request
+    would restart forever without computing a token.
+    """
+
+    @staticmethod
+    def restart(manager, req):
+        manager.free_resources = lambda request: None
+        manager.drop_context_allocation(req)
+
+    def test_the_restarted_request_runs_from_the_local_match(self):
+        connector = FakeConnectorManager(num_matched=64, load_async=True)
+        manager = make_manager(connector)
+        req = FakeRequest()
+
+        assert prepare(manager, req, FakeKvCache(committed=0)) == 64
+        for _ in range(2):
+            self.restart(manager, req)
+            kv_cache = FakeKvCache(committed=0)
+
+            assert prepare(manager, req, kv_cache) == 0
+            assert kv_cache.resize_calls == []
+            assert req.context_current_position == 0
+            assert req.py_connector_load_async is False
+
+        # Still asked, so the connector keeps tracking the request for saves,
+        # but every later offer is handed back whole.
+        assert connector.queries == [(0, 0)] * 3
+        assert connector.cancels == [(0, 0, 64)] * 2
+        manager._deliver_connector_prefix(req)
+        assert connector.commits == [(0, 0, False)]
+
+    def test_the_local_match_still_applies(self):
+        connector = FakeConnectorManager(num_matched=64)
+        manager = make_manager(connector)
+        req = FakeRequest()
+
+        prepare(manager, req, FakeKvCache(committed=0))
+        self.restart(manager, req)
+
+        assert prepare(manager, req, FakeKvCache(committed=32)) == 32
+        assert connector.cancels == [(0, 32, 96)]
 
 
 class TestPhasesMustAgree:

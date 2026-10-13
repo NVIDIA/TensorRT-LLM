@@ -1397,12 +1397,14 @@ def test_async_load_separates_the_failure_from_the_success(store_config, fake_st
 
 
 def test_async_load_stats_summarise_the_interval(store_config, fake_store, monkeypatch):
-    monkeypatch.setattr(worker_module, "ASYNC_STATS_INTERVAL", 0.0)
     with make_async_worker(fake_store, store_config) as worker:
         block_hash = b"\x17" * 16
         fake_store.objects.add(worker._namespaces[0].key(block_hash))
         worker.start_async_load(15, RequestTransfers(15, [PageTransfer(block_hash, 0, 1)]))
+        # get_finished also emits the summary, so the interval may only lapse
+        # once the load is reported, or the polling consumes the line.
         wait_for_async_load(worker, 15)
+        monkeypatch.setattr(worker_module, "ASYNC_STATS_INTERVAL", 0.0)
 
         line = worker._maybe_log_async_stats()
         assert line is not None
