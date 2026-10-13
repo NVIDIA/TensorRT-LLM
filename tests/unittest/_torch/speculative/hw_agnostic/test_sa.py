@@ -465,7 +465,6 @@ class TestKdaReplaySeedOnDisaggTransfer(unittest.TestCase):
         cache.kda_qkg_cache = torch.full((L, SLOTS, M, 3, D), 7.0)
         cache.kda_v_cache = torch.full((L, SLOTS, M, D), 7.0)
         cache.kda_beta_cache = torch.full((L, SLOTS, M, NH), 7.0)
-        cache.prev_num_accepted_tokens = torch.full((SLOTS,), 5, dtype=torch.int32)
 
         mgr = PythonMambaCacheManager.__new__(PythonMambaCacheManager)
         mgr._use_kda_replay_update = use_kda_replay
@@ -493,14 +492,12 @@ class TestKdaReplaySeedOnDisaggTransfer(unittest.TestCase):
             assert (cache.kda_qkg_cache[:, slot] == 0).all()
             assert (cache.kda_v_cache[:, slot] == 0).all()
             assert (cache.kda_beta_cache[:, slot] == 0).all()
-            assert cache.prev_num_accepted_tokens[slot] == 0
         # Conv pool itself must not be modified.
         torch.testing.assert_close(cache.conv, conv_before)
         # Untouched slots keep their contents.
         for slot in (0, 2):
             assert (cache.kda_conv_q[:, slot] == 7.0).all()
             assert (cache.kda_qkg_cache[:, slot] == 7.0).all()
-            assert cache.prev_num_accepted_tokens[slot] == 5
 
     def test_noop_without_kda_replay_or_unknown_ids(self):
         mgr, cache = self._make_manager(use_kda_replay=False)

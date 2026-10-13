@@ -6,6 +6,7 @@ import torch
 
 from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
+from tensorrt_llm._utils import prefer_pinned
 
 KDA_PREFILL_CHUNK_SIZE = 64
 
@@ -57,6 +58,53 @@ class KimiK3MambaMetadata(Mamba2Metadata):
             max_batch_size, dtype=torch.int32, device="cuda"
         )
         self.generation_state_indices: torch.Tensor | None = None
+
+        # KDA accepted-draft counts in generation-batch order. The backing
+        # allocation stays fixed across CUDA graph replays.
+        self.prev_num_accepted_tokens = torch.zeros(
+            max_batch_size, dtype=torch.int32, device="cuda"
+        )
+
+    def prepare_prev_num_accepted_tokens(
+        self,
+        accepted_draft_tokens: list[int],
+        previous_slots: torch.Tensor | None = None,
+        *,
+        previous_new_tokens_lens: torch.Tensor | None = None,
+        generation_start: int = 0,
+    ) -> None:
+        """Fill the stable replay buffer from GPU sampler slots or CPU counts.
+
+        ``accepted_draft_tokens`` contains CPU fallback counts for the full
+        generation batch. GPU results override the consecutive rows starting
+        at ``generation_start``. Rows without a slot use their CPU count;
+        unused buffer rows are cleared.
+        """
+        if previous_slots is not None:
+            assert previous_slots.ndim == 1 and previous_new_tokens_lens is not None
+            num_rows = previous_slots.numel()
+        else:
+            assert previous_new_tokens_lens is None
+            assert generation_start == 0
+            num_rows = 0
+        assert 0 <= generation_start <= self.max_batch_size - num_rows
+        generation_end = generation_start + num_rows
+        num_generations = len(accepted_draft_tokens)
+        assert generation_end <= num_generations <= self.max_batch_size
+        self.prev_num_accepted_tokens.zero_()
+        if generation_start > 0 or generation_end < num_generations:
+            # Upload the full CPU counts in one copy, then overwrite rows
+            # with GPU results below. Fresh pinned storage stays valid until
+            # the asynchronous upload completes.
+            staging = torch.tensor(
+                accepted_draft_tokens, dtype=torch.int32, pin_memory=prefer_pinned()
+            )
+            self.prev_num_accepted_tokens[:num_generations].copy_(staging, non_blocking=True)
+        if previous_slots is not None and num_rows > 0:
+            counts = self.prev_num_accepted_tokens[generation_start:generation_end]
+            torch.index_select(previous_new_tokens_lens, 0, previous_slots, out=counts)
+            # Sampler lengths include the golden token; replay only the drafts.
+            counts.sub_(1).clamp_(min=0)
 
     def prepare(self, attn_metadata: AttentionMetadata) -> None:
         context_lengths = attn_metadata.seq_lens[: attn_metadata.num_contexts].tolist()

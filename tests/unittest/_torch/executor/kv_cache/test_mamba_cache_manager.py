@@ -3625,9 +3625,6 @@ def test_v2_kda_replay_allocates_logical_slot_caches():
                         == 0
                     )
         assert layer_cache.kda_qkg_cache.dtype is torch.float32
-        assert layer_cache.prev_num_accepted_tokens.data_ptr() == (
-            mgr.prev_num_accepted_tokens.data_ptr()
-        )
         assert layer_cache.intermediate_ssm is None
         assert layer_cache.intermediate_conv_window is None
     finally:
@@ -3684,68 +3681,6 @@ def test_mamba_cache_manager_delegates_kda_replay_capability() -> None:
     assert mgr.use_kda_replay_update
 
 
-def test_v2_kda_replay_records_acceptance_and_skips_dummy_rows():
-    mgr = object.__new__(MambaHybridCacheManagerV2)
-    mgr.local_num_mamba_layers = 1
-    mgr._use_kda_replay_update = True
-    mgr._use_replay_state_update = False
-    mgr.prev_num_accepted_tokens = torch.tensor([7, 8, 9], dtype=torch.int32)
-    mgr._dummy_request_mask = torch.tensor([False, False, True])
-
-    mgr.update_mamba_states(
-        SimpleNamespace(num_seqs=3, num_contexts=1),
-        torch.tensor([1, 3, 2], dtype=torch.int32),
-        state_indices=torch.tensor([0, 1, 2], dtype=torch.int32),
-    )
-
-    assert mgr.prev_num_accepted_tokens.tolist() == [7, 2, 9]
-
-
-def test_v2_kda_replay_resets_context_slots():
-    mgr = object.__new__(MambaHybridCacheManagerV2)
-    mgr._use_kda_replay_update = True
-    mgr._use_replay_state_update = False
-    mgr.cuda_state_indices = torch.tensor([2, 1], dtype=torch.int32)
-    mgr.prev_num_accepted_tokens = torch.tensor([5, 6, 7], dtype=torch.int32)
-    mgr.mamba_ssm_rand_seed = None
-
-    mgr._reset_context_mamba_slots(num_contexts=1)
-
-    assert mgr.prev_num_accepted_tokens.tolist() == [5, 6, 0]
-
-
-def test_v2_kda_replay_host_drafter_records_active_requests(monkeypatch):
-    mgr = object.__new__(MambaHybridCacheManagerV2)
-    mgr.local_num_mamba_layers = 1
-    mgr._record_kda_replay_in_update_resources = True
-    mgr._request_id_to_state_index = {101: 1, 303: 2}
-    mgr._request_id_to_is_dummy = {101: False, 303: True}
-    mgr.prev_num_accepted_tokens = torch.tensor([7, 8, 9], dtype=torch.int32)
-    base_update = MagicMock()
-    monkeypatch.setattr(KVCacheManagerV2, "update_resources", base_update)
-    active = SimpleNamespace(
-        py_request_id=101,
-        py_draft_tokens=[11, 12],
-        py_num_accepted_draft_tokens=2,
-    )
-    completed = SimpleNamespace(
-        py_request_id=202,
-        py_draft_tokens=[21, 22],
-        py_num_accepted_draft_tokens=1,
-    )
-    dummy = SimpleNamespace(
-        py_request_id=303,
-        py_draft_tokens=[31, 32],
-        py_num_accepted_draft_tokens=1,
-    )
-    scheduled_batch = SimpleNamespace(generation_requests=[active, completed, dummy])
-
-    mgr.update_resources(scheduled_batch)
-
-    base_update.assert_called_once_with(scheduled_batch, None, None)
-    assert mgr.prev_num_accepted_tokens.tolist() == [7, 2, 9]
-
-
 @skip_no_cuda
 def test_v2_kda_replay_relocates_live_slot_history():
     mgr = _build_v2_hybrid_with_mamba_layer(
@@ -3756,10 +3691,6 @@ def test_v2_kda_replay_relocates_live_slot_history():
         kda_replay_num_spec=2,
     )
     try:
-        assert mgr.prev_num_accepted_tokens is not None
-        mgr.prev_num_accepted_tokens[:3].copy_(
-            torch.tensor([10, 20, 30], dtype=torch.int32, device="cuda")
-        )
         replay_buffers = (
             mgr.kda_conv_q,
             mgr.kda_conv_k,
@@ -3778,7 +3709,6 @@ def test_v2_kda_replay_relocates_live_slot_history():
 
         mgr._relocate_kda_replay_slots([0, 1], [1, 2])
 
-        assert mgr.prev_num_accepted_tokens[:3].tolist() == [10, 10, 20]
         for replay_buffer, (source_zero, source_one) in zip(replay_buffers, source_rows):
             torch.testing.assert_close(replay_buffer[:, 1], source_zero)
             torch.testing.assert_close(replay_buffer[:, 2], source_one)
@@ -3811,9 +3741,6 @@ def test_v2_kda_state_index_setup_relocates_generation_history():
     mgr.kv_cache_map.update({101: StateCache(0), 202: StateCache(1)})
     try:
         mgr._setup_state_indices([context, relocated], num_contexts=1)
-        assert mgr.prev_num_accepted_tokens is not None
-        mgr.prev_num_accepted_tokens[1] = 7
-        mgr.prev_num_accepted_tokens[3] = 9
         replay_buffers = (
             mgr.kda_conv_q,
             mgr.kda_conv_k,
@@ -3833,8 +3760,6 @@ def test_v2_kda_state_index_setup_relocates_generation_history():
         mgr._setup_state_indices([context, relocated, first_generation], num_contexts=1)
 
         assert mgr._request_id_to_state_index == {101: 0, 202: 2, 303: 3}
-        assert mgr.prev_num_accepted_tokens[2] == 7
-        assert mgr.prev_num_accepted_tokens[3] == 0
         for replay_buffer, relocated_row in zip(replay_buffers, relocated_rows):
             torch.testing.assert_close(replay_buffer[:, 2], relocated_row)
     finally:
@@ -3848,7 +3773,6 @@ def test_v2_kda_replay_seeds_disaggregated_generation_slots():
     mgr.conv_state_shape = [6, 4]
     mgr.conv_section_dims = [2, 2, 2]
     mgr._request_id_to_state_index = {101: 1, 202: 3}
-    mgr.prev_num_accepted_tokens = torch.full((4,), 5, dtype=torch.int32)
     mgr.all_conv_states = [
         torch.arange(4 * 6 * 4, dtype=torch.float32).reshape(4, 6, 4),
         torch.arange(4 * 6 * 4, dtype=torch.float32).reshape(4, 6, 4) + 1000,
@@ -3881,9 +3805,6 @@ def test_v2_kda_replay_seeds_disaggregated_generation_slots():
             assert torch.count_nonzero(mgr.kda_qkg_cache[layer_offset, slot]) == 0
             assert torch.count_nonzero(mgr.kda_v_cache[layer_offset, slot]) == 0
             assert torch.count_nonzero(mgr.kda_beta_cache[layer_offset, slot]) == 0
-            assert mgr.prev_num_accepted_tokens[slot] == 0
-    assert mgr.prev_num_accepted_tokens[0] == 5
-    assert mgr.prev_num_accepted_tokens[2] == 5
 
 
 def test_v2_kda_replay_seeds_bf16_conv_state_from_disagg_transfer():
@@ -3905,7 +3826,6 @@ def test_v2_kda_replay_seeds_bf16_conv_state_from_disagg_transfer():
     mgr.conv_state_shape = [6, 4]
     mgr.conv_section_dims = [2, 2, 2]
     mgr._request_id_to_state_index = {101: 1, 202: 3}
-    mgr.prev_num_accepted_tokens = torch.full((4,), 5, dtype=torch.int32)
     # The restored (transferred) conv pool, in the dtype the transceiver moves.
     mgr.all_conv_states = [(torch.randn(4, 6, 4) * 0.1).to(torch.bfloat16) for _ in range(2)]
     restored = [conv.clone() for conv in mgr.all_conv_states]
@@ -3946,7 +3866,6 @@ def test_v2_kda_replay_seeds_bf16_conv_state_from_disagg_transfer():
             assert torch.count_nonzero(mgr.kda_qkg_cache[layer_offset, slot]) == 0
             assert torch.count_nonzero(mgr.kda_v_cache[layer_offset, slot]) == 0
             assert torch.count_nonzero(mgr.kda_beta_cache[layer_offset, slot]) == 0
-            assert mgr.prev_num_accepted_tokens[slot] == 0
         # Slots no request restored keep their pre-seed contents.
         for slot in (0, 2):
             assert (mgr.kda_conv_q[layer_offset, slot] == 7.0).all()
@@ -3954,8 +3873,6 @@ def test_v2_kda_replay_seeds_bf16_conv_state_from_disagg_transfer():
         # The restored bf16 pool is read-only here: plain decode (speculation
         # off) reuses exactly the state the transfer wrote.
         torch.testing.assert_close(conv_state, restored[layer_offset], rtol=0, atol=0)
-    assert mgr.prev_num_accepted_tokens[0] == 5
-    assert mgr.prev_num_accepted_tokens[2] == 5
 
 
 @skip_no_cuda

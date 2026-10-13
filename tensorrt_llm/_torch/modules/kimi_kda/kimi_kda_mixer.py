@@ -496,10 +496,9 @@ class KimiKDALinearAttention(nn.Module):
             else:
                 # Speculative verification: each generation request carries
                 # 1 + draft_len tokens (drafts are padded to the static max,
-                # so T is uniform). Per-step states go to the manager's
-                # SpeculativeState scratch buffers — never the live pools —
-                # and kv_cache_manager.update_mamba_states() promotes the
-                # accepted step after sampling.
+                # so T is uniform). Fused verify replays the previous
+                # accepted prefix; sequential verify stages full states for
+                # promotion after sampling.
                 assert decode_rows % num_decodes == 0, (
                     f"ragged generation batch: {decode_rows} tokens for {num_decodes} requests"
                 )
@@ -510,6 +509,7 @@ class KimiKDALinearAttention(nn.Module):
                     conv_pool,
                     ssm_pool,
                     generation_state_indices,
+                    prev_num_accepted_tokens=mamba_metadata.prev_num_accepted_tokens[:num_decodes],
                     output=(output[num_ctx_tokens:num_tokens] if output is not None else None),
                 )
                 if output is None:
@@ -1056,6 +1056,8 @@ class KimiKDALinearAttention(nn.Module):
         ssm_pool,
         slot_indices,
         output: Optional[torch.Tensor] = None,
+        *,
+        prev_num_accepted_tokens: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Speculative verification: advance each request ``num_steps``
         tokens (1 golden + ``num_steps - 1`` padded drafts).
@@ -1067,21 +1069,28 @@ class KimiKDALinearAttention(nn.Module):
           round's accepted drafts from the per-slot replay caches, then
           processes the new tokens, committing the recurrent state and conv
           windows **in place** after the golden token and caching the new
-          drafts. ``update_mamba_states()`` afterwards only records the
-          accepted count for the next round's replay.
+          drafts. Metadata supplies the previous accepted-draft counts in
+          generation-batch order from the sampler's acceptance result.
         * Legacy (sequential per-step FLA): per-step states go to the
           manager's batch-row-indexed intermediate scratch buffers and
           ``update_mamba_states()`` promotes the accepted step's state
           after sampling.
         """
         if self._has_kda_replay_caches(layer_cache):
+            assert prev_num_accepted_tokens is not None
             assert self._dispatch.verify_kernel_path == "optimized", (
                 "KDA replay caches are allocated but the fused verify "
                 "kernel is unavailable; the legacy intermediate buffers "
                 "were not allocated so there is no fallback"
             )
             return self.forward_verify_fused(
-                x2d, num_steps, layer_cache, ssm_pool, slot_indices, output=output
+                x2d,
+                num_steps,
+                layer_cache,
+                ssm_pool,
+                slot_indices,
+                prev_num_accepted_tokens=prev_num_accepted_tokens,
+                output=output,
             )
         return self.forward_verify_sequential(
             x2d,
@@ -1158,6 +1167,8 @@ class KimiKDALinearAttention(nn.Module):
         ssm_pool,
         slot_indices,
         output: Optional[torch.Tensor] = None,
+        *,
+        prev_num_accepted_tokens: torch.Tensor,
     ) -> torch.Tensor:
         """Fused multi-token verify via ``trtllm::kda_mtp_decode``.
 
@@ -1197,13 +1208,10 @@ class KimiKDALinearAttention(nn.Module):
         w_q, w_k, w_v = self._get_mtp_conv_weights()
         lower_bound = self.gate_lower_bound
 
-        pending = layer_cache.prev_num_accepted_tokens[
-            slot_indices
-        ]  # accepted drafts of the previous round, per req
         cu_seqlens = torch.arange(
             0, (num_generations + 1) * num_steps, num_steps, dtype=torch.int32, device=x2d.device
         )
-        cu_seqlens[:num_generations].sub_(pending)
+        cu_seqlens[:num_generations].sub_(prev_num_accepted_tokens)
 
         out = self._dispatch.mtp_verify(
             x_q=x_q,
@@ -1228,7 +1236,7 @@ class KimiKDALinearAttention(nn.Module):
             ssm_state_indices=slot_indices,
             cu_seqlens=cu_seqlens,
             num_spec=num_spec,
-            num_accepted_tokens=pending,
+            num_accepted_tokens=prev_num_accepted_tokens,
             lower_bound=lower_bound,
             scale=self.head_k_dim**-0.5,
         )

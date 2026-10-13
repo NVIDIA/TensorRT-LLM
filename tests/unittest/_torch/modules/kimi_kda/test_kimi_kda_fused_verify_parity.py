@@ -166,7 +166,6 @@ def _make_fused_layer_cache(B, conv_pool, *, num_heads=H):
         kda_qkg_cache=torch.zeros(B, M, 3, d, device="cuda", dtype=torch.float32),
         kda_v_cache=torch.zeros(B, M, d, device="cuda", dtype=torch.float32),
         kda_beta_cache=torch.zeros(B, M, num_heads, device="cuda", dtype=torch.float32),
-        prev_num_accepted_tokens=torch.zeros(B, dtype=torch.int32, device="cuda"),
         has_kda_replay_caches=True,
         intermediate_conv_window=None,
         intermediate_ssm=None,
@@ -267,6 +266,10 @@ def test_fused_vs_sequential_two_rounds(
     cache_seq = _make_seq_layer_cache(B, num_heads=num_heads)
     cache_fused = _make_fused_layer_cache(B, conv_pool_fused, num_heads=num_heads)
 
+    from tensorrt_llm._torch.modules.kimi_kda.kimi_k3_mamba_metadata import KimiK3MambaMetadata
+
+    metadata = KimiK3MambaMetadata(max_batch_size=B, chunk_size=64, max_num_tokens=B * T)
+
     gen = torch.Generator(device="cuda").manual_seed(3)
 
     def tokens(scale=0.5):
@@ -285,7 +288,13 @@ def test_fused_vs_sequential_two_rounds(
     with with_multi_stream(True):
         out1_fused = rt_fused._project_output(
             rt_fused.forward_verify(
-                x1, T, cache_fused, conv_pool_fused, ssm_pool_fused, slot_indices
+                x1,
+                T,
+                cache_fused,
+                conv_pool_fused,
+                ssm_pool_fused,
+                slot_indices,
+                prev_num_accepted_tokens=metadata.prev_num_accepted_tokens,
             )
         )
     print("round 1:")
@@ -294,7 +303,11 @@ def test_fused_vs_sequential_two_rounds(
     # ---- Acceptance: 0, 1, 2, 0 drafts across the 4 requests ----
     accept = torch.tensor([0, 1, 2, 0], dtype=torch.long, device="cuda")
     _promote_sequential(cache_seq, conv_pool_seq, ssm_pool_seq, accept)
-    cache_fused.prev_num_accepted_tokens.copy_(accept.to(torch.int32))
+    metadata.prepare_prev_num_accepted_tokens(
+        accepted_draft_tokens=[0] * B,
+        previous_slots=torch.arange(B, dtype=torch.int32, device="cuda"),
+        previous_new_tokens_lens=accept.to(torch.int32) + 1,
+    )
 
     # ---- Round 2 (fused path replays the accepted drafts) ----
     x2 = tokens()
@@ -313,6 +326,7 @@ def test_fused_vs_sequential_two_rounds(
             ssm_pool_fused,
             slot_indices,
             output=core2_fused,
+            prev_num_accepted_tokens=metadata.prev_num_accepted_tokens,
         )
     assert result2_fused is core2_fused
     out2_fused = rt_fused._project_output(core2_fused)

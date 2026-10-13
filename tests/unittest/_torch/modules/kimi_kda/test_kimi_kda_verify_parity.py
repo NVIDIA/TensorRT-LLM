@@ -94,8 +94,10 @@ def test_forward_preserves_native_int32_state_indices(monkeypatch):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+@pytest.mark.parametrize("on_device", [False, True])
 def test_forward_uses_metadata_aligned_generation_state_indices(
     monkeypatch: pytest.MonkeyPatch,
+    on_device: bool,
 ) -> None:
     attention = KimiKDALinearAttention(_Cfg(), layer_idx=0).cuda()
     captured: dict[str, torch.Tensor] = {}
@@ -113,8 +115,11 @@ def test_forward_uses_metadata_aligned_generation_state_indices(
         ssm_pool: torch.Tensor,
         slot_indices: torch.Tensor,
         output: torch.Tensor | None = None,
+        *,
+        prev_num_accepted_tokens: torch.Tensor | None = None,
     ) -> torch.Tensor:
         captured["slot_indices"] = slot_indices
+        captured["prev_num_accepted_tokens"] = prev_num_accepted_tokens
         return torch.zeros_like(hidden_states)
 
     monkeypatch.setattr(attention, "forward_prefill", forward_prefill)
@@ -151,6 +156,13 @@ def test_forward_uses_metadata_aligned_generation_state_indices(
         ),
     )
     mamba_metadata.prepare(metadata)
+    previous_slots = torch.tensor([0], dtype=torch.int32, device="cuda") if on_device else None
+    previous_lengths = torch.tensor([3], dtype=torch.int32, device="cuda") if on_device else None
+    mamba_metadata.prepare_prev_num_accepted_tokens(
+        previous_slots=previous_slots,
+        accepted_draft_tokens=[2],
+        previous_new_tokens_lens=previous_lengths,
+    )
     metadata.mamba_metadata = mamba_metadata
     hidden_states = torch.empty(4, _Cfg.hidden_size, dtype=torch.bfloat16, device="cuda")
     generation_slice = mamba_metadata.state_indices[1:]
@@ -163,6 +175,7 @@ def test_forward_uses_metadata_aligned_generation_state_indices(
 
     assert output.shape == hidden_states.shape
     assert captured["slot_indices"].data_ptr() == aligned_indices.data_ptr()
+    assert captured["prev_num_accepted_tokens"].tolist() == [2]
     torch.testing.assert_close(aligned_indices, generation_slice)
 
 

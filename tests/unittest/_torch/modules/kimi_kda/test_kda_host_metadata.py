@@ -2,12 +2,21 @@
 # SPDX-License-Identifier: Apache-2.0
 """Parity coverage for host-derived KDA prefill metadata."""
 
+from unittest.mock import Mock
+
 import pytest
 import torch
 
 pytest.importorskip("fla")
 
+from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata  # noqa: E402
 from tensorrt_llm._torch.modules.kimi_kda._kda_kernels import KDAKernelDispatch  # noqa: E402
+from tensorrt_llm._torch.modules.kimi_kda.kimi_k3_mamba_metadata import (
+    KimiK3MambaMetadata,  # noqa: E402
+)
+from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (  # noqa: E402
+    BaseMambaCacheManager,
+)
 
 NUM_HEADS = 6
 HEAD_DIM = 128
@@ -26,6 +35,78 @@ pytestmark = pytest.mark.skipif(
     not _has_supported_gpu(),
     reason="Kimi K3 is supported only on Blackwell SM100/SM103 or Rubin SM107",
 )
+
+
+@pytest.mark.parametrize("on_device", [False, True])
+def test_replay_metadata_copies_counts_and_clears_padding(on_device: bool) -> None:
+    counts = [4, 2, 2, 1, 0, 3]
+    previous_lengths = torch.tensor([2, 99, 1, 3], dtype=torch.int32, device="cuda")
+    # Reuse a view of the engine's slot buffer. Slot zero is valid, while
+    # recycled slot one contains stale data and is excluded from the view.
+    slot_buffer = torch.tensor([99, 3, 0, 2, 99], dtype=torch.int32, device="cuda")
+    previous_slots = slot_buffer[1:4]
+    state_indices = torch.arange(8, dtype=torch.int32, device="cuda")
+    manager = Mock(spec=BaseMambaCacheManager)
+    manager.use_kda_replay_update = True
+    manager.get_state_indices.side_effect = lambda request_ids, is_padding: state_indices[
+        : len(request_ids)
+    ]
+    attn_metadata = AttentionMetadata(
+        max_num_requests=8,
+        max_num_tokens=24,
+        mamba_chunk_size=64,
+        mamba_metadata_cls=KimiK3MambaMetadata,
+        num_contexts=0,
+        seq_lens=torch.ones(6, dtype=torch.int32),
+        request_ids=[10, 11, 12, 13, 14, 15],
+        kv_cache_manager=manager,
+    )
+    # Initialize through the general attention path before checking that
+    # subsequent input preparation avoids synchronization.
+    attn_metadata.prepare()
+    metadata = attn_metadata.mamba_metadata
+    old_mode = torch.cuda.get_sync_debug_mode()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        attn_metadata.prepare()
+        metadata.prepare_prev_num_accepted_tokens(
+            previous_slots=previous_slots if on_device else None,
+            # Stale host counts for rows with slots must lose to GPU results.
+            accepted_draft_tokens=[4, 2, 9, 9, 9, 3] if on_device else counts,
+            previous_new_tokens_lens=previous_lengths if on_device else None,
+            generation_start=2 if on_device else 0,
+        )
+    finally:
+        torch.cuda.set_sync_debug_mode(old_mode)
+    assert metadata.prev_num_accepted_tokens.tolist() == [4, 2, 2, 1, 0, 3, 0, 0]
+
+    # A later, smaller batch must clear replay counts left in padding rows.
+    attn_metadata.request_ids = [10, 15]
+    attn_metadata.seq_lens = attn_metadata.seq_lens[:2]
+    attn_metadata.prepare()
+    metadata.prepare_prev_num_accepted_tokens(
+        previous_slots=previous_slots[:0] if on_device else None,
+        accepted_draft_tokens=[1, 2],
+        previous_new_tokens_lens=previous_lengths if on_device else None,
+    )
+    assert metadata.prev_num_accepted_tokens.tolist() == [1, 2, 0, 0, 0, 0, 0, 0]
+
+
+def test_replay_metadata_updates_cuda_graph_inputs() -> None:
+    metadata = KimiK3MambaMetadata(max_batch_size=4, chunk_size=64, max_num_tokens=12)
+    metadata.prepare_prev_num_accepted_tokens(accepted_draft_tokens=[2, 1])
+    # A captured consumer must observe each preparation without recapture.
+    graph = torch.cuda.CUDAGraph()
+    output = torch.empty_like(metadata.prev_num_accepted_tokens)
+    torch.cuda.synchronize()
+    with torch.cuda.graph(graph):
+        output.copy_(metadata.prev_num_accepted_tokens)
+    graph.replay()
+    assert output.tolist() == [2, 1, 0, 0]
+
+    metadata.prepare_prev_num_accepted_tokens(accepted_draft_tokens=[0, 2, 0])
+    graph.replay()
+    assert output.tolist() == [0, 2, 0, 0]
 
 
 @pytest.fixture(scope="module")
