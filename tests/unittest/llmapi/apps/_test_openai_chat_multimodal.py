@@ -138,7 +138,6 @@ def test_single_chat_session_image(client: openai.OpenAI, model_name: str):
         == chat_completion.choices[0].message.content
 
 
-@pytest.mark.asyncio(loop_scope="module")
 @pytest.mark.parametrize("typed", [True, False], ids=["message", "untyped"])
 def test_responses_image_input(client: openai.OpenAI, model_name: str,
                                typed: bool):
