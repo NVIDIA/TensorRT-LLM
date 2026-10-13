@@ -103,6 +103,7 @@ class CSA2Indexer(Indexer):
         layer = layout.layer(layer_idx)
         if layer.mode not in (CSA2Mode.FULL, CSA2Mode.REINDEX):
             raise ValueError("Only CSA2 Full/Reindex layers construct an indexer")
+        options = options or CSA2Params(layout=layout)
         super().__init__(
             quant_config=None,
             pos_embd_params=None,
@@ -113,13 +114,14 @@ class CSA2Indexer(Indexer):
                 index_head_dim=head_dim,
                 index_topk=layout.index_topk,
                 indexer_k_dtype="fp4",
+                gvr_deterministic_topk=options.gvr_deterministic_topk,
             ),
             dtype=torch.bfloat16,
             layer_idx=layer_idx,
             projection_free=True,
         )
         self.layout = layout
-        self.options = options or CSA2Params(layout=layout)
+        self.options = options
         sm = get_sm_version() if torch.cuda.is_available() else 0
         compatible = IS_CUTLASS_DSL_AVAILABLE and 100 <= sm < 110
         exact = (

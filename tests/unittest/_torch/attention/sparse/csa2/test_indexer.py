@@ -419,6 +419,19 @@ def test_short_sequence_skip_preserves_candidate_scores(monkeypatch, has_hook):
     )
 
 
+def test_topk_deterministic_opt_in_plumbs_to_selector():
+    """gvr_deterministic_topk reaches the shared TopK selector; default stays off."""
+    layout = CSA2Layout((1,), (0,), (0,), index_topk=512)
+    options = CSA2Params(enable_heuristic_topk=True, gvr_deterministic_topk=True)
+    selector = CSA2Indexer(layout, 0, 64, 128, options).top_k
+    assert selector.gvr_deterministic is True
+    assert selector._gvr_det_kwargs == {"deterministic": True, "sorting": None}
+
+    default = CSA2Indexer(layout, 0, 64, 128).top_k
+    assert default.gvr_deterministic is False
+    assert default._gvr_det_kwargs == {}
+
+
 @skip_pre_blackwell
 @pytest.mark.parametrize("implementation", ["dsl", "self_sampling"])
 @pytest.mark.parametrize("is_prefill", [False, True])

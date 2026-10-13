@@ -159,6 +159,11 @@ class CSA2Params(SparseParams):
     use_self_sampling_topk: bool = True
     use_cute_dsl_paged_mqa_logits: bool = False
     use_gvr_emission: bool = False
+    # Deterministic self-sampling GVR Top-K: repeatable selected set (ties at
+    # the threshold break toward the smaller index) and a fixed output order.
+    # Only meaningful with enable_heuristic_topk=True and
+    # use_self_sampling_topk=True; ignored otherwise (mirrors the DSA knob).
+    gvr_deterministic_topk: bool = False
     fuse_index_q: bool = False
     use_packed_sparse_attention: bool = False
     fuse_packed_output_rope: bool = False
