@@ -841,10 +841,15 @@ class OpenAIServer(_VideoRoutesMixin):
             if self.disagg_cluster_config:
                 self.disagg_cluster_storage = create_cluster_storage_client(
                     self.disagg_cluster_config.cluster_uri,
-                    self.disagg_cluster_config.cluster_name)
+                    self.disagg_cluster_config.cluster_name,
+                    internal_request_auth_key=self._internal_disagg_auth_key)
                 self.disagg_cluster_worker = DisaggClusterWorker(
-                    self.server_role, self.host, self.port,
-                    self.disagg_cluster_config, self.disagg_cluster_storage)
+                    self.server_role,
+                    self.host,
+                    self.port,
+                    self.disagg_cluster_config,
+                    self.disagg_cluster_storage,
+                    internal_request_auth_key=self._internal_disagg_auth_key)
 
             # VisualGen has no args
             if not self._is_visual_gen:

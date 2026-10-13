@@ -50,6 +50,8 @@ from tensorrt_llm.serve.cluster_storage import (
     validate_http_cluster_storage_scope)
 from tensorrt_llm.serve.conversation_id import (extract_subagent_parent_id,
                                                 resolve_request_conversation_id)
+from tensorrt_llm.serve.disagg_auth import \
+    validate_internal_disagg_control_request
 from tensorrt_llm.serve.disagg_coordinator import (CoordinatorClient,
                                                    DisaggCoordinatorService)
 from tensorrt_llm.serve.openai_client import OpenAIClient, OpenAIHttpClient
@@ -237,7 +239,8 @@ class OpenAIDisaggServer:
         self._disagg_cluster_storage = None
         if config.disagg_cluster_config:
             validate_http_cluster_storage_scope(
-                config.disagg_cluster_config.cluster_uri, config.hostname)
+                config.disagg_cluster_config.cluster_uri, config.hostname,
+                config.internal_request_auth_key)
             self._disagg_cluster_storage = create_cluster_storage(
                 config.disagg_cluster_config.cluster_uri,
                 config.disagg_cluster_config.cluster_name)
@@ -248,7 +251,8 @@ class OpenAIDisaggServer:
             self._coordinator = CoordinatorClient(
                 self._coordinator_url, self._config, metadata_server_cfg,
                 request_timeout_s=self._req_timeout_secs,
-                startup_timeout_s=self._server_start_timeout_secs)
+                startup_timeout_s=self._server_start_timeout_secs,
+                internal_request_auth_key=self._config.internal_request_auth_key)
         else:
             self._coordinator = DisaggCoordinatorService(
                 self._config, self._create_client,
@@ -354,7 +358,8 @@ class OpenAIDisaggServer:
         # owns those routes (CoordinatorClient has no cluster_storage).
         cluster_storage = getattr(self._coordinator, "cluster_storage", None)
         if isinstance(cluster_storage, HttpClusterStorageServer):
-            cluster_storage.add_routes(self.app)
+            cluster_storage.add_routes(
+                self.app, internal_request_auth_key=self._config.internal_request_auth_key)
         elif (isinstance(self._coordinator, CoordinatorClient)
               and isinstance(self._disagg_cluster_storage,
                              HttpClusterStorageServer)):
@@ -369,12 +374,20 @@ class OpenAIDisaggServer:
 
     async def _proxy_cluster_storage_request(self,
                                              raw_req: Request) -> Response:
+        raw_body = await raw_req.body()
+        if self._config.internal_request_auth_key:
+            try:
+                validate_internal_disagg_control_request(
+                    self._config.internal_request_auth_key, raw_req.method,
+                    raw_req.url.path, raw_req.url.query, raw_body, raw_req.headers)
+            except ValueError as error:
+                return JSONResponse(status_code=401, content={"error": str(error)})
         try:
             body, status, content_type = (
                 await self._coordinator.proxy_cluster_storage_request(
                     raw_req.method, raw_req.url.path,
                     list(raw_req.query_params.multi_items()),
-                    await raw_req.body(), raw_req.headers.get("Content-Type")))
+                    raw_body, raw_req.headers.get("Content-Type")))
         except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
             logger.warning(f"Failed to proxy cluster storage request: {e}")
             return JSONResponse(status_code=502,

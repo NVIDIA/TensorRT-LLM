@@ -83,6 +83,7 @@ async def test_http_cluster_storage_request_is_proxied_to_coordinator():
         receive,
     )
     server = OpenAIDisaggServer.__new__(OpenAIDisaggServer)
+    server._config = SimpleNamespace(internal_request_auth_key=None)
     server._coordinator = SimpleNamespace(
         proxy_cluster_storage_request=AsyncMock(
             return_value=(b'{"result":true}', 200, "application/json")

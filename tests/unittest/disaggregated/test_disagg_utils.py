@@ -49,6 +49,7 @@ def get_yaml_config_with_disagg_cluster():
     config = {
         "hostname": "test_host",
         "port": 9000,
+        "internal_request_auth_key": "test-secret",
         "context_servers": {
             "max_batch_size": 1,
             "tensor_parallel_size": 2,
@@ -118,12 +119,10 @@ def test_parse_disagg_config_file(sample_yaml_file, sample_yaml_config):
                          indirect=True)
 def test_extract_disagg_cfg(sample_yaml_config):
     sample_yaml_config.update({
-        "gen_tokids_ctxbytes":
-        True,
-        "num_workers":
-        4,
-        "disagg_coordinator_url":
-        "http://coordinator:7999",
+        "gen_tokids_ctxbytes": True,
+        "num_workers": 4,
+        "disagg_coordinator_url": "http://coordinator:7999",
+        "internal_request_auth_key": "test-secret",
     })
     config = extract_disagg_cfg(**sample_yaml_config)
     assert isinstance(config, DisaggServerConfig)
@@ -131,6 +130,30 @@ def test_extract_disagg_cfg(sample_yaml_config):
     assert config.gen_tokids_ctxbytes is True
     assert config.num_workers == 4
     assert config.disagg_coordinator_url == "http://coordinator:7999"
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {
+            "num_workers": 2
+        },
+        {
+            "disagg_coordinator_url": "http://coordinator:7999"
+        },
+        {
+            "disagg_cluster": {
+                "cluster_uri": "http://localhost:9000"
+            }
+        },
+    ],
+)
+def test_extract_disagg_cfg_requires_key_for_internal_control_plane(override):
+    config = get_yaml_config()
+    config.update(override)
+
+    with pytest.raises(ValueError, match="internal_request_auth_key"):
+        extract_disagg_cfg(**config)
 
 
 def test_extract_disagg_metrics_controls():

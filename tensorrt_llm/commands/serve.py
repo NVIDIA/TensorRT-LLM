@@ -2227,10 +2227,16 @@ def _serve_coordinator_and_fleet(disagg_cfg, config_file,
     state, and centralized ZMQ ingest) on ``port-1``; a uvicorn fleet on the
     public port delegates to it.
     """
+    from tensorrt_llm.serve.cluster_storage import \
+        validate_http_cluster_storage_scope
     from tensorrt_llm.serve.coordinator_server import CoordinatorServer
     from tensorrt_llm.serve.disagg_coordinator import DisaggCoordinatorService
 
     public_host, public_port = disagg_cfg.hostname, disagg_cfg.port
+    if disagg_cfg.disagg_cluster_config:
+        validate_http_cluster_storage_scope(
+            disagg_cfg.disagg_cluster_config.cluster_uri, public_host,
+            disagg_cfg.internal_request_auth_key)
     coord_port = int(
         os.environ.get(DisaggWorkerEnvs.TLLM_DISAGG_COORDINATOR_PORT,
                        public_port - 1))
@@ -2298,12 +2304,14 @@ def _serve_coordinator_and_fleet(disagg_cfg, config_file,
 
     async def _serve_and_monitor():
         server_task = asyncio.create_task(
-            CoordinatorServer(coordinator)(
-                public_host,
-                coord_port,
-                uds=coord_uds,
-                keep_alive_timeout=disagg_cfg.server_keep_alive_timeout,
-                sockets=[coord_socket]))
+            CoordinatorServer(
+                coordinator,
+                internal_request_auth_key=disagg_cfg.internal_request_auth_key)(
+                    public_host,
+                    coord_port,
+                    uds=coord_uds,
+                    keep_alive_timeout=disagg_cfg.server_keep_alive_timeout,
+                    sockets=[coord_socket]))
 
         async def _monitor_fleet():
             while True:

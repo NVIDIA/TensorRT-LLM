@@ -272,6 +272,12 @@ def extract_disagg_cfg(
     generation_servers = generation_servers or {}
     internal_request_auth_key = _extract_internal_request_auth_key(
         internal_request_auth_key, context_servers, generation_servers)
+    if internal_request_auth_key is None and (disagg_cluster is not None
+                                              or disagg_coordinator_url
+                                              or num_workers > 1):
+        raise ValueError(
+            "internal_request_auth_key is required for disaggregated "
+            "coordinator or cluster storage deployments")
 
     inherited_args = dict(kwargs)
 

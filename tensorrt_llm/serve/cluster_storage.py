@@ -3,6 +3,7 @@ import asyncio
 import importlib.metadata as importlib_metadata
 import importlib.util
 import ipaddress
+import json
 import sys
 import time
 from dataclasses import dataclass
@@ -12,11 +13,14 @@ from typing import Callable, Dict, List, Optional
 from urllib.parse import urlparse
 
 import aiohttp
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from tensorrt_llm.logger import logger
+from tensorrt_llm.serve.disagg_auth import (
+    build_internal_disagg_control_auth_headers,
+    validate_internal_disagg_control_request)
 
 
 def is_loopback_host(host: Optional[str]) -> bool:
@@ -30,17 +34,22 @@ def is_loopback_host(host: Optional[str]) -> bool:
         return False
 
 
-def validate_http_cluster_storage_scope(cluster_uri: str,
-                                        server_host: str) -> None:
+def validate_http_cluster_storage_scope(
+        cluster_uri: str,
+        server_host: str,
+        internal_request_auth_key: Optional[str] = None) -> None:
     parsed_uri = urlparse(cluster_uri)
     if parsed_uri.scheme not in ("http", "https"):
+        return
+    if internal_request_auth_key:
         return
     if is_loopback_host(parsed_uri.hostname) and is_loopback_host(server_host):
         return
     raise ValueError(
         "HTTP cluster storage is only supported for loopback-only "
-        "disaggregated serving. Use a loopback disagg_cluster.cluster_uri and "
-        "hostname, or use etcd for cluster storage.")
+        "disaggregated serving unless internal_request_auth_key is configured. "
+        "Use a loopback disagg_cluster.cluster_uri and hostname, configure "
+        "internal_request_auth_key, or use etcd for cluster storage.")
 
 
 def _find_module_file_in_distribution(dist, module_name: str):
@@ -202,6 +211,24 @@ def jsonify(f):
     return wrapper
 
 
+def _control_auth_dependency(internal_request_auth_key: Optional[str]):
+
+    async def authenticate(request: Request) -> None:
+        if not internal_request_auth_key:
+            return
+        body = await request.body()
+        try:
+            validate_internal_disagg_control_request(internal_request_auth_key,
+                                                     request.method,
+                                                     request.url.path,
+                                                     request.url.query, body,
+                                                     request.headers)
+        except ValueError as error:
+            raise HTTPException(status_code=401, detail=str(error)) from error
+
+    return Depends(authenticate)
+
+
 def key_time():
     return time.monotonic()
 
@@ -222,16 +249,30 @@ class HttpClusterStorageServer(ClusterStorage):
         if server:
             self.add_routes(server)
 
-    def add_routes(self, server: FastAPI):
-        server.add_api_route("/set", jsonify(self._set), methods=["POST"])
-        server.add_api_route("/get", jsonify(self.get), methods=["GET"])
+    def add_routes(self,
+                   server: FastAPI,
+                   internal_request_auth_key: Optional[str] = None):
+        dependencies = [_control_auth_dependency(internal_request_auth_key)]
+        server.add_api_route("/set",
+                             jsonify(self._set),
+                             methods=["POST"],
+                             dependencies=dependencies)
+        server.add_api_route("/get",
+                             jsonify(self.get),
+                             methods=["GET"],
+                             dependencies=dependencies)
         server.add_api_route("/delete",
                              jsonify(self.delete),
-                             methods=["DELETE"])
-        server.add_api_route("/expire", jsonify(self.expire), methods=["GET"])
+                             methods=["DELETE"],
+                             dependencies=dependencies)
+        server.add_api_route("/expire",
+                             jsonify(self.expire),
+                             methods=["GET"],
+                             dependencies=dependencies)
         server.add_api_route("/get_prefix",
                              jsonify(self.get_prefix),
-                             methods=["GET"])
+                             methods=["GET"],
+                             dependencies=dependencies)
 
     async def start(self):
         if self._check_expired_task:
@@ -365,12 +406,17 @@ class HttpClusterStorageServer(ClusterStorage):
 
 class HttpClusterStorageClient(ClusterStorage):
 
-    def __init__(self, cluster_uri, cluster_name, **kwargs):
+    def __init__(self,
+                 cluster_uri,
+                 cluster_name,
+                 internal_request_auth_key=None,
+                 **kwargs):
         self._session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(
             total=5))
         self._cluster_uri = cluster_uri if cluster_uri.startswith(
             "http") else f"http://{cluster_uri}"
         self._cluster_name = cluster_name
+        self._internal_request_auth_key = internal_request_auth_key
 
     def __del__(self):
         try:
@@ -383,16 +429,28 @@ class HttpClusterStorageClient(ClusterStorage):
     def _url_for(self, endpoint: str) -> str:
         return f"{self._cluster_uri}/{endpoint}"
 
+    def _auth_headers(self,
+                      method: str,
+                      endpoint: str,
+                      query=None,
+                      body: bytes = b"") -> dict:
+        return build_internal_disagg_control_auth_headers(
+            self._internal_request_auth_key, method, f"/{endpoint}", query,
+            body)
+
     async def _post_json(self,
                          endpoint: str,
                          data: StorageItem,
-                         headers: dict = {},
+                         headers: Optional[dict] = None,
                          ignore_result: bool = False) -> bool:
+        body = json.dumps(data.model_dump()).encode("utf-8")
+        headers = dict(headers or {})
         headers["Content-Type"] = "application/json"
+        headers.update(self._auth_headers("POST", endpoint, body=body))
         try:
             async with self._session.post(self._url_for(endpoint),
                                           headers=headers,
-                                          json=data.model_dump()) as resp:
+                                          data=body) as resp:
                 if resp.status == 200:
                     json = await resp.json()
                     return json.get("result") if not ignore_result else True
@@ -405,9 +463,11 @@ class HttpClusterStorageClient(ClusterStorage):
                    endpoint: str,
                    ignore_result: bool = False,
                    **kwargs) -> bool:
+        headers = self._auth_headers("GET", endpoint, query=kwargs)
         try:
             async with self._session.get(self._url_for(endpoint),
-                                         params=kwargs) as resp:
+                                         params=kwargs,
+                                         headers=headers) as resp:
                 if resp.status == 200:
                     json = await resp.json()
                     return json.get("result") if not ignore_result else True
@@ -445,8 +505,13 @@ class HttpClusterStorageClient(ClusterStorage):
 
     async def delete(self, key: str) -> bool:
         try:
+            params = {"key": key}
             async with self._session.delete(self._url_for("delete"),
-                                            params={"key": key}) as resp:
+                                            params=params,
+                                            headers=self._auth_headers(
+                                                "DELETE",
+                                                "delete",
+                                                query=params)) as resp:
                 return resp.status == 200
         except (aiohttp.ClientError, OSError) as e:
             logger.warning(f"Failed to delete key {key}, error: {e}")

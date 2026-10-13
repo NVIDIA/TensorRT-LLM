@@ -16,7 +16,8 @@ import hashlib
 import hmac
 import json
 import warnings
-from typing import Any, Mapping, Optional
+from typing import Any, Iterable, Mapping, Optional
+from urllib.parse import parse_qsl, urlencode
 
 from tensorrt_llm.llmapi.disagg_utils import ServerRole
 from tensorrt_llm.serve.conversation_id import (
@@ -28,9 +29,15 @@ from tensorrt_llm.serve.conversation_id import (
 from tensorrt_llm.serve.openai_protocol import UCompletionRequest
 
 INTERNAL_DISAGG_AUTH_HEADER = "x-trtllm-disagg-auth"
+INTERNAL_DISAGG_CONTROL_AUTH_HEADER = "x-trtllm-disagg-control-auth"
 SUBAGENT_AFFINITY_AUTH_HEADER = "x-trtllm-subagent-affinity-auth"
 _SIGNATURE_PREFIX = "sha256="
 _INTERNAL_DISAGG_AUTH_FIELDS = ("encoded_opaque_state", "ctx_info_endpoint")
+_WORKER_INFO_FIELD = "worker_info"
+_WORKER_AUTH_FIELD = "worker_auth"
+_ControlQuery = str | Mapping[str, Any] | Iterable[tuple[str, Any]] | None
+
+
 _MISSING_AUTH_KEY_WARNING = (
     "Internal disaggregated authentication key is required for protected "
     "disaggregated request fields. In a future release the requirement to "
@@ -109,6 +116,126 @@ def validate_internal_disagg_request(
         provided.encode("utf-8"), expected.encode("utf-8")
     ):
         raise ValueError("Invalid internal disaggregated request authentication")
+
+
+def _canonical_control_query(query: _ControlQuery) -> str:
+    if query is None:
+        return ""
+    if isinstance(query, str):
+        pairs = parse_qsl(query, keep_blank_values=True)
+    elif isinstance(query, Mapping):
+        pairs = [(str(key), str(value)) for key, value in query.items()]
+    else:
+        pairs = [(str(key), str(value)) for key, value in query]
+    return urlencode(sorted(pairs))
+
+
+def _control_auth_payload(method: str, path: str, query: _ControlQuery, body: bytes) -> bytes:
+    return b"\n".join(
+        [
+            method.upper().encode("utf-8"),
+            path.encode("utf-8"),
+            _canonical_control_query(query).encode("utf-8"),
+            body,
+        ]
+    )
+
+
+def _sign_control_request(
+    key: str, method: str, path: str, query: _ControlQuery, body: bytes
+) -> str:
+    signature = hmac.new(
+        key.encode("utf-8"), _control_auth_payload(method, path, query, body), hashlib.sha256
+    ).hexdigest()
+    return f"{_SIGNATURE_PREFIX}{signature}"
+
+
+def build_internal_disagg_control_auth_headers(
+    key: Optional[str],
+    method: str,
+    path: str,
+    query: _ControlQuery = "",
+    body: bytes = b"",
+) -> dict[str, str]:
+    if not key:
+        return {}
+    return {
+        INTERNAL_DISAGG_CONTROL_AUTH_HEADER: _sign_control_request(key, method, path, query, body)
+    }
+
+
+def validate_internal_disagg_control_request(
+    key: Optional[str],
+    method: str,
+    path: str,
+    query: _ControlQuery,
+    body: bytes,
+    headers: Optional[Mapping[str, str]],
+) -> None:
+    if not key:
+        raise ValueError("Internal disaggregated control authentication key is required")
+    expected = _sign_control_request(key, method, path, query, body)
+    lower_headers = (
+        {} if headers is None else {name.lower(): value for name, value in headers.items()}
+    )
+    provided = lower_headers.get(INTERNAL_DISAGG_CONTROL_AUTH_HEADER)
+    if provided is None or not hmac.compare_digest(
+        provided.encode("utf-8"), expected.encode("utf-8")
+    ):
+        raise ValueError("Invalid internal disaggregated control authentication")
+
+
+def _worker_auth_payload(worker_key: str, worker_info: Mapping[str, Any]) -> bytes:
+    payload = {"worker_key": worker_key, "worker_info": worker_info}
+    return json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
+def _sign_worker_info(key: str, worker_key: str, worker_info: Mapping[str, Any]) -> str:
+    signature = hmac.new(
+        key.encode("utf-8"), _worker_auth_payload(worker_key, worker_info), hashlib.sha256
+    ).hexdigest()
+    return f"{_SIGNATURE_PREFIX}{signature}"
+
+
+def encode_internal_disagg_worker_info(
+    key: Optional[str], worker_key: str, worker_info: Mapping[str, Any]
+) -> str:
+    if not key:
+        return json.dumps(worker_info)
+    return json.dumps(
+        {
+            _WORKER_INFO_FIELD: worker_info,
+            _WORKER_AUTH_FIELD: _sign_worker_info(key, worker_key, worker_info),
+        }
+    )
+
+
+def decode_internal_disagg_worker_info(
+    key: Optional[str], worker_key: str, encoded_worker_info: str
+) -> Mapping[str, Any]:
+    decoded = json.loads(encoded_worker_info)
+    if not key:
+        if (
+            isinstance(decoded, dict)
+            and _WORKER_INFO_FIELD in decoded
+            and _WORKER_AUTH_FIELD in decoded
+        ):
+            return decoded[_WORKER_INFO_FIELD]
+        return decoded
+    if (
+        not isinstance(decoded, dict)
+        or _WORKER_INFO_FIELD not in decoded
+        or _WORKER_AUTH_FIELD not in decoded
+    ):
+        raise ValueError("Missing internal disaggregated worker authentication")
+    worker_info = decoded[_WORKER_INFO_FIELD]
+    expected = _sign_worker_info(key, worker_key, worker_info)
+    provided = decoded[_WORKER_AUTH_FIELD]
+    if not isinstance(provided, str) or not hmac.compare_digest(
+        provided.encode("utf-8"), expected.encode("utf-8")
+    ):
+        raise ValueError("Invalid internal disaggregated worker authentication")
+    return worker_info
 
 
 def _sign_subagent_affinity(
