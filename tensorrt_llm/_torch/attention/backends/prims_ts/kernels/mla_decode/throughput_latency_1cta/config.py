@@ -26,7 +26,7 @@ through to DSL division or GMEM reduction layout errors.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, replace as dataclass_replace, replace
 from math import ceil
 from typing import Any
 
@@ -165,6 +165,16 @@ class MlaConfig:
     correction_num_warps: int = 4
     mma_num_warps: int = 1
     load_num_warps: int = 1
+    sparse_reuse_kv: bool = False
+    paired_sparse_correction: bool = False
+    defer_sparse_max_update: bool = False
+    cache_uniform_sparse_quads: bool = False
+    fuse_sparse_epilogue: bool = False
+    fuse_sparse_cluster_epilogue: bool = False
+    fuse_sparse_reduction: bool = False
+    sparse_direct: bool = False
+    sparse_static_scales: bool = False
+    sparse_direct_capacities: tuple[int, int] = (0, 0)
     page_offsets_num_warps: int = 1
     scheduler_num_warps: int = 1
     clc_padding_warp_idx: int = 14
@@ -192,6 +202,47 @@ class MlaConfig:
     use_attention_sinks: int = 0
     use_sliding_window_causal: int = 0
     attention_window_size: int = 0
+
+    @property
+    def one_insts_kv_swap(self) -> bool:
+        """One KV stream with swapped MMA operands (P remains in SMEM)."""
+        return self.num_insts_kv == 1 and self.kernel_variant == "swaps_mma_ab"
+
+    @property
+    def single_kv_pipe(self) -> bool:
+        """Use one softmax/P stream while retaining two score stages."""
+        return self.num_insts_kv == 1
+
+    @property
+    def short_merged_softmax(self) -> bool:
+        """Process two independent KV streams with one softmax warp group.
+
+        Each planned split fits one two-tile group, so no online-correction
+        loop runs. Keep both streams' final statistics and PV accumulators;
+        live lengths still mask partial/empty tiles. This is num_insts_kv=2,
+        not the one-stream schedule selected by one_insts_kv_swap.
+        """
+        return (
+            self.sparse_direct
+            and not self.one_insts_kv_swap
+            and self.kernel_variant == "swaps_mma_ab"
+            and self.fixed_sparse_kv_tiles > 0
+        )
+
+    @property
+    def serial_swap_reuse(self):
+        return (
+            self.sparse_reuse_kv
+            and self.num_insts_kv == 2
+            and not self.is_fp8_qkv()
+            and self.kernel_variant == "swaps_mma_ab"
+        )
+
+    @property
+    def sparse_cache_words(self):
+        if self.cache_uniform_sparse_quads:
+            return 6 + self.tile_size_kv // self.load_num_warps
+        return 6
 
     @property
     def softmax0_num_warps(self) -> int:
@@ -368,6 +419,21 @@ class MlaConfig:
         """Return whether Q/K/V tensors use E4M3 data."""
 
         return self.qkv_dtype == "e4m3"
+
+    @property
+    def fixed_sparse_kv_tiles(self) -> int:
+        """Return the minimum instruction group when bounded by the plan.
+
+        Keep-AB uses one KV tile and Swap-AB uses two independent streams.
+        If the maximum planned split fits that group, every shorter valid
+        prefix already has the same partition. Live lengths still mask data.
+        """
+        tiles = self.local_kv_tiles(self.total_kv_tiles)
+        return (
+            self.num_insts_kv
+            if self.sparse_direct and tiles == self.num_insts_kv
+            else 0
+        )
 
     def local_kv_tiles(self, total_kv_tiles: int) -> int:
         """Return per-CTA KV tiles after multi-CTA KV splitting."""
@@ -1233,10 +1299,13 @@ def is_throughput_latency_mla_supported_shape(
     del batch_size
     return (
         latent_dim == 512
-        and rope_dim == 64
+        and rope_dim in (0, 64)
         and 1 <= num_heads_q <= 128
         and is_power_of_two(num_heads_q)
-        and num_tokens_per_page in SUPPORTED_MLA_PAGE_SIZES
+        and (
+            num_tokens_per_page in SUPPORTED_MLA_PAGE_SIZES
+            or (num_tokens_per_page == 1 and rope_dim == 0)
+        )
         and seq_len_q >= 1
         and seq_len_kv >= 128
     )
@@ -1479,7 +1548,9 @@ def make_throughput_latency_mla_config(
         raise ValueError("latent_dim must be positive")
     if rope_dim < 0:
         raise ValueError("rope_dim must be non-negative")
-    if num_tokens_per_page not in SUPPORTED_MLA_PAGE_SIZES:
+    if num_tokens_per_page not in SUPPORTED_MLA_PAGE_SIZES and not (
+        num_tokens_per_page == 1 and rope_dim == 0
+    ):
         raise ValueError(
             "num_tokens_per_page must be one of "
             f"{SUPPORTED_MLA_PAGE_SIZES}, got {num_tokens_per_page}"
@@ -1491,7 +1562,10 @@ def make_throughput_latency_mla_config(
             f"num_tokens_per_page={num_tokens_per_page}"
         )
     pages_per_kv_tile = MlaConfig.tile_size_kv // num_tokens_per_page
-    if pages_per_kv_tile > MlaConfig.page_offsets_entries_per_stage:
+    metadata_capacity = (
+        128 if num_tokens_per_page == 1 else MlaConfig.page_offsets_entries_per_stage
+    )
+    if pages_per_kv_tile > metadata_capacity:
         raise ValueError(
             "page-offset staging capacity is smaller than one KV tile: "
             f"pages_per_kv_tile={pages_per_kv_tile}, "
@@ -1528,6 +1602,11 @@ def make_throughput_latency_mla_config(
         selected_profile,
         explicit_persistent,
     )
+    if selected_profile.use_persistent_scheduler and selected_profile.use_multi_ctas_kv:
+        # Persistent work queues enumerate Q/head-dimension tiles, not KV
+        # splits. Direct MlaProfile callers must obey the same restriction
+        # as persistent_override_profile, or only split zero gets produced.
+        raise ValueError("persistent scheduling is not supported with split-KV")
     tile_size_q = tile_size_q_for_profile(
         selected_profile, num_heads_q, seq_len_q, tile_size_q
     )
@@ -1612,6 +1691,7 @@ def make_throughput_latency_mla_config(
         softmax_regs=softmax_register_budget(tile_size_q),
         correction_regs=correction_register_budget(tile_size_q),
         num_tokens_per_page=num_tokens_per_page,
+        page_offsets_entries_per_stage=metadata_capacity,
         max_num_pages_per_seq_kv=max(1, ceil(seq_len_kv / num_tokens_per_page)),
         tmem_s_cols=tile_size_q,
         tmem_stats_cols=MlaConfig.tmem_stats_cols,
@@ -1635,3 +1715,196 @@ def make_throughput_latency_mla_config(
         reduction_mode=reduction_mode,
     )
     return cfg
+
+
+def configure_sparse_mla(
+    cfg: MlaConfig,
+    profile,
+    *,
+    finalize_output=False,
+    direct_inputs=False,
+    static_scales=False,
+    source_capacities=(0, 0),
+) -> MlaConfig:
+    """Resolve one selected sparse profile without order-dependent overrides.
+
+    Policy selects the schedule. This builder checks its implementation
+    constraints, fixes topology, then assigns buffers and warp/register roles.
+    """
+    keep = cfg.kernel_variant == "keeps_mma_ab"
+    issuers = profile.gather_issue_warps
+    reuse = profile.reuse_kv
+    uniform = profile.uniform_offset_cache
+    single = profile.single_kv_stream
+    if cfg.num_tokens_per_page != 1 or cfg.rope_dim != 0:
+        raise ValueError("sparse profiles require native page-size-one MLA")
+    if issuers not in (1, 2, 4, 8):
+        raise ValueError("sparse profiles require one, two, four or eight issuers")
+    if (keep and cfg.tile_size_q != 64) or (
+        not keep and cfg.tile_size_q not in (8, 16, 32)
+    ):
+        raise ValueError("unsupported sparse query tile")
+    if single and (
+        keep
+        or cfg.tile_size_q not in (8, 16)
+        or cfg.num_ctas_per_head_dim != 1
+        or issuers != 4
+        or cfg.use_cluster_reduction
+        or (cfg.num_ctas_per_seq_kv > 1 and cfg.use_persistent_scheduler)
+    ):
+        raise ValueError(
+            "one-instance Swap-AB requires M8/M16, V1, four issuers and no cluster reduction"
+        )
+    if reuse and cfg.num_ctas_per_head_dim != 1:
+        raise ValueError("retained KV requires one V owner")
+    if profile.kv_tile_size not in (64, 128) or (
+        profile.kv_tile_size == 64 and (not keep or cfg.is_fp8_qkv() or not reuse)
+    ):
+        raise ValueError("BK64 requires native BF16 Keep-AB reuse")
+    if uniform and (
+        not reuse
+        or issuers not in (4, 8)
+        or (cfg.is_fp8_qkv() and not keep)
+        or (issuers == 8 and not keep)
+    ):
+        raise ValueError("uniform coordinate caching requires a qualified reuse layout")
+    if profile.balanced_registers and (keep or cfg.tile_size_q not in (8, 16)):
+        raise ValueError("balanced registers require Swap-AB M8/M16")
+    if profile.defer_max_update and cfg.is_fp8_qkv():
+        raise ValueError("deferred maxima require native BF16 probabilities")
+    if profile.paired_correction and not keep:
+        raise ValueError("paired correction requires Keep-AB")
+    if profile.page_pipeline_stages and (profile.page_pipeline_stages < 1 or not keep):
+        raise ValueError("page-stage overrides require positive stages and Keep-AB")
+
+    # Final stream count and tile geometry must precede short-loop eligibility.
+    splits = cfg.num_ctas_per_seq_kv
+    cluster_finish = finalize_output and bool(cfg.use_cluster_reduction)
+    direct_finish = finalize_output and splits == 1
+    separate_finish = finalize_output and splits > 1 and not cluster_finish
+    if cluster_finish and (
+        keep or cfg.tile_size_q not in (16, 32) or not cfg.use_bf16_output
+    ):
+        raise ValueError("cluster finishing requires native Swap-AB M16/M32")
+    if direct_finish and cfg.logical_seq_len_q != 1:
+        raise ValueError("fused output requires one logical query per virtual request")
+    if direct_inputs and (not finalize_output or cfg.qkv_dtype not in ("bf16", "e4m3")):
+        raise ValueError("separate sparse indices require native BF16/FP8 final output")
+    cfg = dataclass_replace(
+        cfg,
+        num_insts_kv=1 if keep or single else 2,
+        tile_size_kv=profile.kv_tile_size,
+        page_offsets_entries_per_stage=profile.kv_tile_size,
+        sparse_reuse_kv=reuse,
+        cache_uniform_sparse_quads=uniform,
+        paired_sparse_correction=profile.paired_correction,
+        defer_sparse_max_update=profile.defer_max_update,
+        sparse_direct=direct_inputs,
+        sparse_static_scales=static_scales,
+        sparse_direct_capacities=source_capacities if direct_inputs else (0, 0),
+        fuse_sparse_epilogue=direct_finish,
+        fuse_sparse_cluster_epilogue=cluster_finish,
+        fuse_sparse_reduction=separate_finish,
+        load_num_warps=issuers,
+    )
+    short = cfg.short_merged_softmax
+    if (
+        issuers == 8
+        and not keep
+        and (
+            cfg.tile_size_q not in (8, 16)
+            or cfg.local_kv_tiles(cfg.total_kv_tiles) <= cfg.num_insts_kv
+        )
+    ):
+        raise ValueError("eight Swap-AB issuers require a steady-state loop")
+
+    # Four D128 slices make one D512 tile. FP8/BK64 reuse keeps two tiles;
+    # BF16 BK128 retains one, with additional stages used for prefetch.
+    kv_stages = (
+        profile.reuse_kv_stages if reuse and profile.reuse_kv_stages else cfg.kv_stages
+    )
+    if reuse and profile.reuse_kv_stages:
+        retained_tiles = 2 if cfg.is_fp8_qkv() or cfg.tile_size_kv == 64 else 1
+        if kv_stages < retained_tiles * cfg.qk_head_dim_stages:
+            raise ValueError("insufficient stages to retain KV through PV")
+    if cfg.tile_size_kv == 64 and profile.reuse_kv_stages < 2 * cfg.qk_head_dim_stages:
+        raise ValueError("BK64 requires two retained K tiles")
+    page_stages = cfg.page_offsets_stages
+    if (
+        reuse
+        and profile.reuse_kv_stages
+        and keep
+        and (kv_stages == (12 if cfg.is_fp8_qkv() else 5) or cfg.tile_size_kv == 64)
+    ):
+        page_stages = 1
+    if profile.page_pipeline_stages:
+        page_stages = profile.page_pipeline_stages
+    if single and reuse and kv_stages >= 6 and not cfg.is_fp8_qkv():
+        page_stages = 1
+
+    # Select the final layout once. Sharing a softmax group in a short split
+    # preserves two numerical streams; the one-instance layout is distinct.
+    if single:
+        roles = dict(
+            threads_per_cta=512,
+            correction_warp_idx=4,
+            mma_warp_idx=8,
+            load_warp_idx=12,
+            page_offsets_warp_idx=10,
+            scheduler_warp_idx=11,
+            softmax_regs=128,
+            correction_regs=160,
+            mma_load_regs=64,
+            scheduler_regs=64,
+            o_stages=1,
+        )
+    elif short:
+        roles = dict(
+            threads_per_cta=512,
+            correction_warp_idx=4,
+            mma_warp_idx=8,
+            load_warp_idx=12,
+            page_offsets_warp_idx=9,
+            scheduler_warp_idx=10,
+            softmax_regs=96,
+            correction_regs=96,
+            mma_load_regs=96,
+            scheduler_regs=96,
+        )
+    elif keep:
+        roles = dict(
+            threads_per_cta=640 if issuers == 8 else 512,
+            load_warp_idx=12,
+            softmax_regs=128 if uniform or issuers == 8 else 192,
+            correction_regs=160 if issuers == 8 else 192,
+            mma_load_regs=96 if uniform and issuers == 4 else 64,
+        )
+    else:
+        balanced = profile.balanced_registers
+        roles = dict(
+            threads_per_cta=768 if issuers == 8 else 640,
+            load_warp_idx=16,
+            softmax_regs=96
+            if balanced
+            else 128
+            if uniform
+            else 144
+            if cfg.tile_size_q == 32
+            else 160,
+            correction_regs=96 if balanced else 192 if uniform else cfg.correction_regs,
+            mma_load_regs=(64 if issuers == 8 else 96)
+            if balanced
+            else 96
+            if uniform
+            else 48,
+            scheduler_regs=(64 if issuers == 8 else 96)
+            if balanced
+            else cfg.scheduler_regs,
+        )
+    return dataclass_replace(
+        cfg,
+        **roles,
+        kv_stages=kv_stages,
+        page_offsets_stages=page_stages,
+        q_stages=1 if single or (reuse and profile.reuse_kv_stages) else cfg.q_stages,
+    )
