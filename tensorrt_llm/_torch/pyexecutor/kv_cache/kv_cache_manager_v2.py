@@ -39,6 +39,7 @@ from strenum import StrEnum
 from tensorrt_llm._torch.disaggregation.resource.page import MapperKind, RoleLayout
 from tensorrt_llm._torch.distributed.communicator import Distributed, ReduceOp
 from tensorrt_llm._torch.utils import helix_local_len, maybe_compile
+from tensorrt_llm._torch.virtual_memory import RestoreMode
 from tensorrt_llm._utils import (
     TensorWrapper,
     binding_to_torch_dtype,
@@ -153,6 +154,20 @@ KV_CACHE_ITERATION_STATS_POOL_GROUP_FIELDS = tuple(
 
 # Shared by capacity estimation and growth, in addition to speculative tokens.
 BASE_GENERATION_TOKEN_COUNT = 1
+
+
+@dataclass(frozen=True)
+class _SleepingCacheState:
+    reuse_scope: ReuseScope
+    capacity: int
+    history_length: int
+    beam_width: int
+    expected_prompt_length: int | None
+    is_active: bool
+    is_decoding: bool
+    enable_swa_scratch_reuse: bool
+    text_only: bool
+
 
 # Readable name per CacheTier, used only to label level-indexed counters. The levels themselves
 # come from the configured tier list, so several levels may share a name. Keyed by the enum
@@ -1846,6 +1861,9 @@ class KVCacheManagerV2(BaseResourceManager):
         }
 
         self.kv_cache_map: dict[int, _KVCache] = {}
+        self._sleep_restore_mode: RestoreMode | None = None
+        self._sleeping_caches: dict[int, _SleepingCacheState] = {}
+        self._sleeping_active_caches: set[int] = set()
         self._disagg_receive_ready: dict[int, torch.cuda.Event] = {}
         self._request_stats_enabled_ids: set[int] = set()
 
@@ -1933,7 +1951,6 @@ class KVCacheManagerV2(BaseResourceManager):
         self._guard_page_fill = os.environ.get("TRTLLM_KV_GUARD_PAGE", "").strip().lower()
         self._guard_page_value = _parse_kv_fill_value(self._guard_page_fill, "TRTLLM_KV_GUARD_PAGE")
         self._guard_page_by_layer: dict[int, int] = {}
-        self._sleep_guard_page_pending = False
         self._fresh_page_fill = _parse_kv_fill_value(
             os.environ.get("TRTLLM_KV_FRESH_PAGE_FILL", "").strip().lower(),
             "TRTLLM_KV_FRESH_PAGE_FILL",
@@ -6749,23 +6766,100 @@ class KVCacheManagerV2(BaseResourceManager):
                 kv_cache.close()
         return success
 
-    def prepare_sleep(self) -> None:
-        """Close the diagnostic cache before its backing can be discarded."""
-        guard = self.kv_cache_map.pop(_GUARD_PAGE_REQUEST_ID, None)
-        if guard is not None:
-            guard.close()
-            self.index_mapper.remove_sequence(_GUARD_PAGE_REQUEST_ID)
-            self.impl.clear_stats_excluded(_GUARD_PAGE_REQUEST_ID)
-            self._guard_page_by_layer.clear()
-            self._sleep_guard_page_pending = True
+    def validate_sleep_config(self) -> None:
+        """Require a host tier at least as large as the configured GPU cache."""
+        tiers = self.impl.init_config.cache_tiers
+        if (
+            len(tiers) < 2
+            or not isinstance(tiers[1], HostCacheTierConfig)
+            or tiers[1].quota < tiers[0].quota
+        ):
+            raise ValueError(
+                "KVCacheManagerV2 sleep requires a host tier with host_cache_size "
+                "at least as large as the GPU cache quota"
+            )
 
-    def finish_wakeup(self) -> None:
-        """Recreate and refill the diagnostic page after memory is restored."""
-        if self._sleep_guard_page_pending:
-            self._reserve_guard_page()
+    def release_memory(self, mode: RestoreMode) -> None:
+        """Release GPU backing with the executor drained and its CUDA work complete."""
+        if self._sleep_restore_mode is not None:
+            return
+        self.validate_sleep_config()
+        discard = mode in (RestoreMode.NONE, RestoreMode.MEMSET)
+        if discard and any(
+            not self.impl.is_stats_excluded(req_id) or cache.num_committed_tokens != 0
+            for req_id, cache in self.kv_cache_map.items()
+        ):
+            raise RuntimeError(
+                "Discarding KV cache memory requires all user requests to be drained"
+            )
+        self._sleep_restore_mode = mode
+        for req_id, cache in self.kv_cache_map.items():
+            if discard:
+                self._sleeping_caches[req_id] = _SleepingCacheState(
+                    reuse_scope=cache.reuse_scope,
+                    capacity=cache.capacity,
+                    history_length=cache.history_length,
+                    beam_width=cache.beam_width,
+                    expected_prompt_length=cache.expected_prompt_length,
+                    is_active=cache.is_active,
+                    is_decoding=cache.is_decoding,
+                    enable_swa_scratch_reuse=cache.enable_swa_scratch_reuse,
+                    text_only=cache.text_only,
+                )
+                cache.close()
+            elif cache.is_active:
+                self._sleeping_active_caches.add(req_id)
+                cache.suspend()
+        if discard:
+            self.kv_cache_map.clear()
+            self._fresh_pages_filled.clear()
+            if self.conversation_manager is not None:
+                self.conversation_manager.clear()
+            self.impl.clear_reusable_blocks()
+        self.impl.release_gpu_memory()
+
+    def materialize_memory(self) -> None:
+        """Restore GPU backing and reconnect surviving requests to their cache pages."""
+        mode = self._sleep_restore_mode
+        if mode is None:
+            return
+        self.impl.materialize_gpu_memory(zero=mode == RestoreMode.MEMSET)
+        for req_id, state in self._sleeping_caches.items():
+            cache = self.impl.create_kv_cache(
+                state.reuse_scope,
+                id=req_id,
+                expected_prompt_length=state.expected_prompt_length,
+                text_only=state.text_only,
+            )
+            self.kv_cache_map[req_id] = cache
+            cache.enable_swa_scratch_reuse = state.enable_swa_scratch_reuse
+            if not cache.resume(self._stream.cuda_stream, is_decoding=state.is_decoding):
+                raise RuntimeError(f"Could not recreate KV cache for request {req_id}")
+            cache.stop_committing()
+            if not cache.resize(state.capacity, history_length=state.history_length):
+                raise RuntimeError(f"Could not restore KV cache capacity for request {req_id}")
+            cache.beam_width = state.beam_width
+            if not state.is_active:
+                cache.suspend()
+            self._restore_page_index_bufs(req_id, cache)
+        for req_id in self._sleeping_active_caches:
+            if not self._resume_and_restore(req_id, self.kv_cache_map[req_id]):
+                raise RuntimeError(f"Could not resume KV cache for request {req_id}")
+        if _GUARD_PAGE_REQUEST_ID in self.kv_cache_map:
+            self._guard_page_by_layer.clear()
+            for candidate in self._iter_guard_candidate_buffers():
+                key, buffer, pages = self._resolve_guard_candidate(candidate)
+                page = next((int(p) for p in pages if p != BAD_PAGE_INDEX), None)
+                if page is not None and _fill_kv_pages(buffer, [page], self._guard_page_value):
+                    self._guard_page_by_layer[key] = page
             if not self._guard_page_by_layer:
                 raise RuntimeError("Could not restore the KV cache guard page after wakeup")
-            self._sleep_guard_page_pending = False
+        if self.sparse_metadata_batch is not None:
+            self.sparse_metadata_batch.publish(self._stream.cuda_stream)
+        self._stream.synchronize()
+        self._sleeping_caches.clear()
+        self._sleeping_active_caches.clear()
+        self._sleep_restore_mode = None
 
     def reset_reuse_state(self):
         self.impl.clear_reusable_blocks()

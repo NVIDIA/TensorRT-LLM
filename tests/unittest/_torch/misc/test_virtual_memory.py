@@ -233,15 +233,33 @@ def test_kv_cache_manager(process_gpu_memory_info_available, manager_cls,
 
     buffers = mgr.get_buffers(0)
     pointers = [buffer.data_ptr() for buffer in buffers]
+    resource = None
+    if manager_cls is KVCacheManagerV2:
+        from types import SimpleNamespace
+
+        resource = SimpleNamespace(
+            release_memory=lambda tags, manager=mgr: manager.release_memory(
+                restore_mode),
+            materialize_memory=lambda tags, manager=mgr: manager.
+            materialize_memory(),
+        )
+        dummy = mgr.add_dummy_requests([123], token_nums=[128], is_gen=True)[0]
+        index = mgr.index_mapper.get_index(dummy.py_request_id)
     for cycle in range(2):
         for buffer in buffers:
             buffer.fill_(cycle + 1)
         torch.cuda.synchronize()
-        assert virtual_memory.release_with_tag(tag) > 0
+        if manager_cls is KVCacheManagerV2:
+            old_cache = mgr.kv_cache_map[dummy.py_request_id]
+        assert virtual_memory.release_with_tag(tag, resource=resource) > 0
+        if manager_cls is KVCacheManagerV2:
+            assert mgr.index_mapper.get_index(dummy.py_request_id) == index
+            assert all(desc.num_slots == 0
+                       for desc in mgr.impl.pool_group_descs)
         memory_usage_released = get_current_process_gpu_memory()
         if process_gpu_memory_info_available:
             assert memory_usage_materialized - memory_usage_released >= alloc_size
-        assert virtual_memory.materialize_with_tag(tag) > 0
+        assert virtual_memory.materialize_with_tag(tag, resource=resource) > 0
         torch.cuda.synchronize()
         memory_usage_rematerialized = get_current_process_gpu_memory()
         if process_gpu_memory_info_available:
@@ -249,24 +267,103 @@ def test_kv_cache_manager(process_gpu_memory_info_available, manager_cls,
         assert [buffer.data_ptr() for buffer in mgr.get_buffers(0)] == pointers
         if manager_cls is KVCacheManagerV2:
             assert torch.equal(metadata.cpu(), expected_metadata)
+            assert mgr.index_mapper.get_index(dummy.py_request_id) == index
+            cache = mgr.kv_cache_map[dummy.py_request_id]
+            assert cache.is_active
+            assert (cache
+                    is old_cache) == (restore_mode
+                                      in (virtual_memory.RestoreMode.CPU,
+                                          virtual_memory.RestoreMode.PINNED))
         if restore_mode != virtual_memory.RestoreMode.NONE:
             expected = 0 if restore_mode == virtual_memory.RestoreMode.MEMSET else cycle + 1
-            for buffer in buffers:
-                assert torch.all(buffer.cpu().float() == expected)
+            if manager_cls is KVCacheManagerV2 and restore_mode != virtual_memory.RestoreMode.MEMSET:
+                pages = mgr.get_batch_cache_indices([dummy.py_request_id],
+                                                    layer_idx=0)[0]
+                assert pages
+                for page in pages:
+                    assert torch.all(
+                        mgr.get_buffers(0)[page].cpu().float() == expected)
+            else:
+                for buffer in buffers:
+                    assert torch.all(buffer.cpu().float() == expected)
 
     del buffer, buffers
     if manager_cls is KVCacheManagerV2:
         del metadata, expected_metadata
     # Destruction must also be valid while the physical pages are released.
-    virtual_memory.release_with_tag(tag)
+    virtual_memory.release_with_tag(tag, resource=resource)
 
     mgr.shutdown()
+    if manager_cls is KVCacheManagerV2:
+        del cache, old_cache, dummy, resource
     del mgr
     del pool
 
     memory_usage_end = get_current_process_gpu_memory()
     if process_gpu_memory_info_available:
         assert memory_usage_begin == memory_usage_end
+
+
+@pytest.mark.parametrize("restore_mode,disk_bytes", [
+    (virtual_memory.RestoreMode.CPU, 0),
+    (virtual_memory.RestoreMode.PINNED, 16 << 20),
+])
+def test_kv_sleep_preserves_held_pages_under_cold_tier_pressure(
+        tmp_path, restore_mode, disk_bytes):
+    from tensorrt_llm.runtime.kv_cache_manager_v2 import ReuseScope
+
+    mgr = KVCacheManagerV2(
+        kv_cache_config=KvCacheConfig(
+            max_gpu_total_bytes=16 << 20,
+            host_cache_size=16 << 20,
+            disk_cache_size=disk_bytes,
+            disk_cache_path=str(tmp_path),
+        ),
+        kv_cache_type=CacheType.SELF,
+        num_layers=1,
+        num_kv_heads=128,
+        head_dim=1024,
+        tokens_per_block=4,
+        max_seq_len=16,
+        max_batch_size=1,
+        mapping=Mapping(world_size=1, tp_size=1, rank=0),
+        dtype=tensorrt_llm.bindings.DataType.HALF,
+    )
+    try:
+        dummy = mgr.add_dummy_requests([123], token_nums=[4], is_gen=True)[0]
+        held = mgr.kv_cache_map[dummy.py_request_id]
+        # Each block occupies 2 MiB. Fill GPU and cold tiers with distinct prefixes.
+        prefixes = [[i * 4 + j for j in range(4)] for i in range(24)]
+        for tokens in prefixes:
+            cache = mgr.impl.create_kv_cache(ReuseScope(), tokens)
+            assert cache.resume(mgr._stream.cuda_stream)
+            assert cache.resize(4)
+            cache.commit(tokens)
+            cache.close()
+        reusable_before = sum(
+            mgr.impl.probe_reuse(ReuseScope(), tokens) for tokens in prefixes)
+        assert reusable_before > 0
+        pages = mgr.get_batch_cache_indices([dummy.py_request_id],
+                                            layer_idx=0)[0]
+        for page in pages:
+            mgr.get_buffers(0)[page].fill_(7)
+        torch.cuda.synchronize()
+        slots = [desc.num_slots for desc in mgr.impl.pool_group_descs]
+        mgr.release_memory(restore_mode)
+        assert all(desc.num_slots == 0 for desc in mgr.impl.pool_group_descs)
+        mgr.materialize_memory()
+        assert [desc.num_slots for desc in mgr.impl.pool_group_descs] == slots
+        assert mgr.kv_cache_map[dummy.py_request_id] is held
+        pages = mgr.get_batch_cache_indices([dummy.py_request_id],
+                                            layer_idx=0)[0]
+        assert pages
+        for page in pages:
+            assert torch.all(mgr.get_buffers(0)[page].cpu() == 7)
+        reusable_after = sum(
+            mgr.impl.probe_reuse(ReuseScope(), tokens) for tokens in prefixes)
+        assert 0 < reusable_after < reusable_before
+    finally:
+        mgr.shutdown()
 
 
 def test_cuda_graph(process_gpu_memory_info_available):

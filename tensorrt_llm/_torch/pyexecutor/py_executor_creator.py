@@ -1305,6 +1305,9 @@ def _create_py_executor(
                 max_num_sequences=max_num_seq_slots,
             )
 
+    if enable_sleep:
+        py_executor.validate_sleep_config()
+
     _adjust_torch_mem_fraction()
 
     if mapping.rank == 0:

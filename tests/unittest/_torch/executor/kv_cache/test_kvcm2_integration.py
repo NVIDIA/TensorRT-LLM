@@ -3127,6 +3127,21 @@ def test_fresh_fill_preserves_kv_across_block_onboard(
     assert torch.equal(buffer[22], torch.full((2,), 5.0))
 
 
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("host_quota", [None, 8 << 20, 16 << 20, 32 << 20])
+def test_sleep_requires_host_capacity_covering_gpu(host_quota: int | None) -> None:
+    manager = object.__new__(KVCacheManagerV2)
+    tiers = [GpuCacheTierConfig(quota=16 << 20)]
+    if host_quota is not None:
+        tiers.append(HostCacheTierConfig(quota=host_quota))
+    manager.impl = Mock(init_config=SimpleNamespace(cache_tiers=tiers))
+    if host_quota is None or host_quota < tiers[0].quota:
+        with pytest.raises(ValueError, match="host_cache_size"):
+            manager.validate_sleep_config()
+    else:
+        manager.validate_sleep_config()
+
+
 class _GuardKVCache:
     """Scriptable stand-in for the guard sequence's KV cache."""
 
@@ -3135,15 +3150,25 @@ class _GuardKVCache:
         self.resize_ok = resize_ok
         self.closed = False
         self.committing_stopped = False
+        self.capacity = 1
+        self.history_length = 0
+        self.beam_width = 1
+        self.expected_prompt_length = 1
+        self.is_active = True
+        self.is_decoding = False
+        self.enable_swa_scratch_reuse = False
+        self.text_only = True
+        self.reuse_scope = None
+        self.num_committed_tokens = 0
 
-    def resume(self, stream: object) -> bool:
+    def resume(self, stream: object, is_decoding: bool = False) -> bool:
         del stream
         return self.resume_ok
 
     def stop_committing(self) -> None:
         self.committing_stopped = True
 
-    def resize(self, num_tokens: int) -> bool:
+    def resize(self, num_tokens: int, history_length: int | None = None) -> bool:
         del num_tokens
         return self.resize_ok
 
@@ -3162,10 +3187,17 @@ def _make_guard_manager(
     manager._guard_page_fill = "nan"
     manager._guard_page_value = float("nan")
     manager._guard_page_by_layer = {}
-    manager._sleep_guard_page_pending = False
+    manager._sleep_restore_mode = None
+    manager._sleeping_caches = {}
+    manager._sleeping_active_caches = set()
+    manager._fresh_pages_filled = {}
+    manager.conversation_manager = None
+    manager.sparse_metadata_batch = None
+    manager.validate_sleep_config = Mock()
+    manager._restore_page_index_bufs = Mock()
     manager.num_extra_kv_tokens = 0
     manager.pp_layers = [0]
-    manager._stream = SimpleNamespace(cuda_stream=None)
+    manager._stream = SimpleNamespace(cuda_stream=None, synchronize=lambda: None)
     manager.kv_cache_map = {}
     manager.index_mapper = Mock()
     manager.impl = Mock()
@@ -3199,20 +3231,18 @@ def test_reserve_guard_page_fills_and_publishes_the_page(
     assert kv_cache.committing_stopped
     assert not kv_cache.closed
 
-    manager.prepare_sleep()
+    from tensorrt_llm._torch.virtual_memory import RestoreMode
+
+    manager.release_memory(RestoreMode.NONE)
     assert kv_cache.closed
-    assert not manager.guard_page_indices()
     assert not manager.kv_cache_map
+    manager.index_mapper.remove_sequence.assert_not_called()
 
     restored_cache = _GuardKVCache()
 
-    def recreate(request_id, *args, **kwargs):
-        manager.kv_cache_map[request_id] = restored_cache
-        return restored_cache
-
-    manager._create_kv_cache = recreate
+    manager.impl.create_kv_cache.return_value = restored_cache
     buffer.fill_(1)
-    manager.finish_wakeup()
+    manager.materialize_memory()
     assert torch.isnan(buffer[3]).all()
     assert torch.equal(buffer[2], torch.ones(2))
     assert manager.guard_page_indices() == frozenset({3})

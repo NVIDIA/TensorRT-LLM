@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2025-2026, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -343,19 +343,9 @@ void CudaVirtualMemoryAllocator::allocate(Pointer* ptr, std::size_t n, int devic
     std::size_t const alignedSize = mConfig->aligned(n, device);
     TLLM_CU_CHECK(cuMemAddressReserve(&address, alignedSize, 0, {}, 0));
 
-    map(address, alignedSize, n,
-        CUmemAllocationProp{CU_MEM_ALLOCATION_TYPE_PINNED, CU_MEM_HANDLE_TYPE_NONE,
-            CUmemLocation{CU_MEM_LOCATION_TYPE_DEVICE, {device}}});
-    *ptr = deviceptr_cast(address);
-}
-
-void CudaVirtualMemoryAllocator::map(CUdeviceptr address, std::size_t alignedSize, std::size_t n,
-    CUmemAllocationProp const& prop, VirtualMemoryCudaErrorCheck check) const
-{
-
     CUDAVirtualMemoryChunk::Configurators configurators;
-    configurators.push_back(std::make_unique<UnicastConfigurator>(
-        address, alignedSize, CUmemAccessDesc{prop.location, CU_MEM_ACCESS_FLAGS_PROT_READWRITE}, check));
+    configurators.push_back(std::make_unique<UnicastConfigurator>(address, alignedSize,
+        CUmemAccessDesc{CUmemLocation{CU_MEM_LOCATION_TYPE_DEVICE, {device}}, CU_MEM_ACCESS_FLAGS_PROT_READWRITE}));
 
     switch (mConfig->mMode)
     {
@@ -373,13 +363,13 @@ void CudaVirtualMemoryAllocator::map(CUdeviceptr address, std::size_t alignedSiz
         break;
     }
 
-    mConfig->mManager.add(
-        address, mConfig->mTag, std::make_unique<LocalCreator<>>(prop, alignedSize, check), std::move(configurators));
-}
+    mConfig->mManager.add(address, mConfig->mTag,
+        std::make_unique<LocalCreator<>>(CUmemAllocationProp{CU_MEM_ALLOCATION_TYPE_PINNED, CU_MEM_HANDLE_TYPE_NONE,
+                                             CUmemLocation{CU_MEM_LOCATION_TYPE_DEVICE, {device}}},
+            alignedSize),
+        std::move(configurators));
 
-void CudaVirtualMemoryAllocator::unmap(CUdeviceptr address) const
-{
-    mConfig->mManager.remove(address);
+    *ptr = deviceptr_cast(address);
 }
 
 void CudaVirtualMemoryAllocator::deallocate(Pointer ptr, std::size_t n) const

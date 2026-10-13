@@ -185,6 +185,25 @@ void KvCacheManager::clearReusableBlocks()
     mRadixTree->clear();
 }
 
+void KvCacheManager::releaseGpuMemory()
+{
+    KVCM2_API_GUARD();
+    auto const apiLock = lockExclusive();
+    for (KvCache const* cache : mLivingKvCaches)
+    {
+        TLLM_CHECK_WITH_INFO(
+            cache->status() == KvCache::Status::SUSPENDED, "GPU memory release requires every KvCache to be suspended");
+    }
+    mStorage->releaseGpuMemory();
+}
+
+void KvCacheManager::materializeGpuMemory(bool zero)
+{
+    KVCM2_API_GUARD();
+    auto const apiLock = lockExclusive();
+    mStorage->materializeGpuMemory(zero);
+}
+
 std::shared_ptr<KvCache> KvCacheManager::createKvCache(ReuseScope reuseScope, TokenSpan inputTokens,
     std::optional<RequestIdType> id, KvCache::PriorityCb priorityCb, std::optional<int> expectedPromptLength,
     std::optional<bool> textOnly, bool enableRequestStats)

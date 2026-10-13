@@ -121,7 +121,6 @@ PooledPhysMemAllocator::PooledPhysMem PooledPhysMemAllocator::acquire()
 VirtMem::VirtMem(size_t vmSize, PooledPhysMemAllocator& physMemAllocator, size_t initNumPhysMem)
     : mVmSize(vmSize)
     , mPhysMemAllocator(physMemAllocator)
-    , mSleepAllocator(runtime::getVirtualMemoryAllocator())
 {
     TLLM_CHECK_DEBUG(vmSize % physMemAllocator.physMemSize() == 0);
 
@@ -150,23 +149,14 @@ VirtMem::~VirtMem() noexcept
     KVCM2_POISON_ON_EXCEPT([this]() { destroy(); });
 }
 
-void VirtMem::push()
+void VirtMem::push(PooledPhysMemAllocator::PooledPhysMem handle)
 {
     size_t physSize = mPhysMemAllocator.physMemSize();
     CUdeviceptr offset = mAddr + physSize * static_cast<size_t>(mPhysHandles.size());
     TLLM_CHECK_DEBUG(physSize * (mPhysHandles.size() + 1) <= mVmSize);
 
-    PooledPhysMemAllocator::PooledPhysMem handle;
-    if (mSleepAllocator)
-    {
-        mSleepAllocator.map(offset, physSize, physSize, mPhysMemAllocator.allocationProp(), cuCheck);
-    }
-    else
-    {
-        handle = mPhysMemAllocator.acquire();
-        cuCheck(cuMemMap(offset, physSize, 0, handle->handle(), 0));
-        cuCheck(cuMemSetAccess(offset, physSize, &mAccessDesc, 1));
-    }
+    cuCheck(cuMemMap(offset, physSize, 0, handle->handle(), 0));
+    cuCheck(cuMemSetAccess(offset, physSize, &mAccessDesc, 1));
     mPhysHandles.push_back(std::move(handle));
 }
 
@@ -175,27 +165,18 @@ void VirtMem::pop()
     TLLM_CHECK_DEBUG(!mPhysHandles.empty());
     size_t physSize = mPhysMemAllocator.physMemSize();
     CUdeviceptr offset = mAddr + physSize * (mPhysHandles.size() - 1);
-    if (mSleepAllocator)
-    {
-        mSleepAllocator.unmap(offset);
-    }
-    else
-    {
-        cuCheck(cuMemUnmap(offset, physSize));
-    }
+    cuCheck(cuMemUnmap(offset, physSize));
     mPhysHandles.pop_back(); // PhysMemHandle destructor returns to pool
 }
 
 void VirtMem::extend(size_t numToAdd)
 {
     size_t old = numPhysMem();
-    // Reserve before mapping so vector growth cannot strand a mapped chunk.
-    mPhysHandles.reserve(old + numToAdd);
     try
     {
         for (size_t i = 0; i < numToAdd; ++i)
         {
-            push();
+            push(mPhysMemAllocator.acquire());
         }
     }
     catch (...)

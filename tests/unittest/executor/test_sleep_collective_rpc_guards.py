@@ -55,8 +55,8 @@ def _make_worker(backend="pytorch", world_size=1, sleep_config=_SLEEP_CONFIG_DEF
         sleep_config=sleep_config,
     )
     w.engine = SimpleNamespace(
-        prepare_sleep=MagicMock(),
-        finish_wakeup=MagicMock(),
+        release_memory=MagicMock(),
+        materialize_memory=MagicMock(),
         begin_sleep_transition=MagicMock(),
         complete_sleep_transition=MagicMock(),
         abort_sleep_transition=MagicMock(),
@@ -391,8 +391,8 @@ class TestMultiRankSleepWakeupLock:
             yield None
 
         w.engine = SimpleNamespace(
-            prepare_sleep=MagicMock(),
-            finish_wakeup=MagicMock(),
+            release_memory=MagicMock(),
+            materialize_memory=MagicMock(),
             _sleep_wakeup_lock=SpyLock(),
             _sleep_wakeup_comm=mock_comm,
             control_action=_noop_control_action,
@@ -551,8 +551,8 @@ def _make_proto_worker(recv_responses, world_size=3):
         yield None
 
     w.engine = SimpleNamespace(
-        prepare_sleep=MagicMock(),
-        finish_wakeup=MagicMock(),
+        release_memory=MagicMock(),
+        materialize_memory=MagicMock(),
         _sleep_wakeup_lock=threading.Lock(),
         _sleep_wakeup_comm=FakeComm(),
         control_action=_noop_control_action,
@@ -646,8 +646,8 @@ class TestMnnvlSleepWakeupCoordination:
             modules.append(SimpleNamespace(comm=resource))
 
         executor = object.__new__(PyExecutor)
-        executor.prepare_sleep = MagicMock()
-        executor.finish_wakeup = MagicMock()
+        executor.release_memory = MagicMock()
+        executor.materialize_memory = MagicMock()
         executor.model_engine = SimpleNamespace(model=SimpleNamespace(modules=lambda: modules))
         executor.draft_model_engine = None
 
@@ -689,7 +689,7 @@ class TestMnnvlSleepWakeupCoordination:
         with (
             patch(
                 "tensorrt_llm._torch.virtual_memory.release_with_tag",
-                side_effect=lambda *tags: events.append(("local_vmm", "sleep")),
+                side_effect=lambda *tags, resource=None: events.append(("local_vmm", "sleep")),
             ),
             patch("tensorrt_llm._torch.virtual_memory.materialize_with_tag"),
             patch("torch.cuda.synchronize"),
@@ -713,12 +713,15 @@ class TestMnnvlSleepWakeupCoordination:
         worker.engine._has_mnnvl_checkpoint_resources = lambda tags: False
         worker.engine._run_mnnvl_checkpoint_resources = run_mnnvl
         events = []
-        worker.engine.prepare_sleep.side_effect = lambda tags: events.append("prepare_sleep")
+
+        def release(*tags, resource):
+            assert resource is worker.engine
+            events.append("release")
 
         with (
             patch(
                 "tensorrt_llm._torch.virtual_memory.release_with_tag",
-                side_effect=lambda *tags: events.append("release"),
+                side_effect=release,
             ),
             patch("tensorrt_llm._torch.virtual_memory.materialize_with_tag"),
             patch("torch.cuda.synchronize", side_effect=lambda: events.append("synchronize")),
@@ -728,8 +731,7 @@ class TestMnnvlSleepWakeupCoordination:
             worker._multi_rank_sleep_wakeup("sleep", [ExecutorMemoryType.KV_CACHE])
 
         run_mnnvl.assert_not_called()
-        worker.engine.prepare_sleep.assert_called_once_with([ExecutorMemoryType.KV_CACHE])
-        assert events.index("synchronize") < events.index("prepare_sleep") < events.index("release")
+        assert events.index("synchronize") < events.index("release")
 
 
 class TestMultiRankSendFailureRecovery:
@@ -789,8 +791,8 @@ class TestMultiRankSendFailureRecovery:
             sleep_config=object(),
         )
         w.engine = SimpleNamespace(
-            prepare_sleep=MagicMock(),
-            finish_wakeup=MagicMock(),
+            release_memory=MagicMock(),
+            materialize_memory=MagicMock(),
             _sleep_wakeup_lock=threading.Lock(),
             _sleep_wakeup_comm=FakeComm(),
             control_action=_noop_control_action,
@@ -876,8 +878,8 @@ class TestMultiRankSendFailureRecovery:
             sleep_config=object(),
         )
         w.engine = SimpleNamespace(
-            prepare_sleep=MagicMock(),
-            finish_wakeup=MagicMock(),
+            release_memory=MagicMock(),
+            materialize_memory=MagicMock(),
             _sleep_wakeup_lock=threading.Lock(),
             _sleep_wakeup_comm=FakeComm(),
             control_action=_noop_control_action,
@@ -1013,8 +1015,8 @@ class TestMultiRankSendFailureRecovery:
             sleep_config=object(),
         )
         w.engine = SimpleNamespace(
-            prepare_sleep=MagicMock(),
-            finish_wakeup=MagicMock(),
+            release_memory=MagicMock(),
+            materialize_memory=MagicMock(),
             _sleep_wakeup_lock=threading.Lock(),
             _sleep_wakeup_comm=FakeComm(),
             control_action=_noop_control_action,
@@ -1095,8 +1097,8 @@ class TestMultiRankSendFailureRecovery:
         )
         run_mnnvl = Mock()
         worker.engine = SimpleNamespace(
-            prepare_sleep=MagicMock(),
-            finish_wakeup=MagicMock(),
+            release_memory=MagicMock(),
+            materialize_memory=MagicMock(),
             _sleep_wakeup_lock=threading.Lock(),
             _sleep_wakeup_comm=FakeComm(),
             control_action=control_action,
@@ -1120,7 +1122,9 @@ class TestMultiRankSendFailureRecovery:
             _SleepWakeupAction.SLEEP,
             [ExecutorMemoryType.MODEL_ENGINE_MAIN],
         )
-        release.assert_called_once_with(ExecutorMemoryType.MODEL_ENGINE_MAIN)
+        release.assert_called_once_with(
+            ExecutorMemoryType.MODEL_ENGINE_MAIN, resource=worker.engine
+        )
         fail_stop.assert_called_once()
 
     def test_mnnvl_all_commit_send_errors_are_treated_as_uncertain_delivery(self):
@@ -1169,8 +1173,8 @@ class TestMultiRankSendFailureRecovery:
         )
         run_mnnvl = Mock()
         worker.engine = SimpleNamespace(
-            prepare_sleep=MagicMock(),
-            finish_wakeup=MagicMock(),
+            release_memory=MagicMock(),
+            materialize_memory=MagicMock(),
             _sleep_wakeup_lock=threading.Lock(),
             _sleep_wakeup_comm=FakeComm(),
             control_action=control_action,
@@ -1194,7 +1198,9 @@ class TestMultiRankSendFailureRecovery:
             _SleepWakeupAction.SLEEP,
             [ExecutorMemoryType.MODEL_ENGINE_MAIN],
         )
-        release.assert_called_once_with(ExecutorMemoryType.MODEL_ENGINE_MAIN)
+        release.assert_called_once_with(
+            ExecutorMemoryType.MODEL_ENGINE_MAIN, resource=worker.engine
+        )
         fail_stop.assert_called_once()
 
     def test_postcommit_non_runtime_error_fail_stops_worker(self):
@@ -1235,8 +1241,8 @@ class TestMultiRankSendFailureRecovery:
         worker = object.__new__(BaseWorker)
         worker._fatal_error = None
         worker.engine = SimpleNamespace(
-            prepare_sleep=MagicMock(),
-            finish_wakeup=MagicMock(),
+            release_memory=MagicMock(),
+            materialize_memory=MagicMock(),
             _fatal_error=None,
             is_shutdown=False,
             fail_sleep_wakeup_transition=MagicMock(),
@@ -1310,8 +1316,8 @@ class TestListenerUncaughtExceptionSendsErrorAck:
         from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 
         executor = object.__new__(PyExecutor)
-        executor.prepare_sleep = MagicMock()
-        executor.finish_wakeup = MagicMock()
+        executor.release_memory = MagicMock()
+        executor.materialize_memory = MagicMock()
         executor._sleep_wakeup_comm = FakeComm()
         executor.device_id = 0
         executor.dist = SimpleNamespace(rank=1)
@@ -1322,8 +1328,8 @@ class TestListenerUncaughtExceptionSendsErrorAck:
         executor._is_kv_manager_v2 = False
         executor.enable_kv_cache_reuse = False
 
-        def fail_release(*tags):
-            executor.prepare_sleep.assert_called_once_with(["kv_cache"])
+        def fail_release(*tags, resource):
+            assert resource is executor
             raise MemoryError("simulated OOM outside except list")
 
         with (
@@ -1383,8 +1389,8 @@ class TestListenerAbortAndShutdown:
                 sent_acks.append(payload)
 
         executor = object.__new__(PyExecutor)
-        executor.prepare_sleep = MagicMock()
-        executor.finish_wakeup = MagicMock()
+        executor.release_memory = MagicMock()
+        executor.materialize_memory = MagicMock()
         executor._sleep_wakeup_comm = FakeComm()
         executor.device_id = 0
         executor.dist = SimpleNamespace(rank=1)
@@ -1448,8 +1454,8 @@ class TestListenerAbortAndShutdown:
                 sent_acks.append(payload)
 
         executor = object.__new__(PyExecutor)
-        executor.prepare_sleep = MagicMock()
-        executor.finish_wakeup = MagicMock()
+        executor.release_memory = MagicMock()
+        executor.materialize_memory = MagicMock()
         executor._sleep_wakeup_comm = FakeComm()
         executor.device_id = 0
         executor.dist = SimpleNamespace(rank=1)
@@ -1510,8 +1516,8 @@ class TestListenerAbortAndShutdown:
                 sent_acks.append(payload)
 
         executor = object.__new__(PyExecutor)
-        executor.prepare_sleep = MagicMock()
-        executor.finish_wakeup = MagicMock()
+        executor.release_memory = MagicMock()
+        executor.materialize_memory = MagicMock()
         executor._sleep_wakeup_comm = FakeComm()
         executor.device_id = 0
         executor.dist = SimpleNamespace(rank=1)
@@ -1560,8 +1566,8 @@ class TestListenerAbortAndShutdown:
                 sent_acks.append(payload)
 
         executor = object.__new__(PyExecutor)
-        executor.prepare_sleep = MagicMock()
-        executor.finish_wakeup = MagicMock()
+        executor.release_memory = MagicMock()
+        executor.materialize_memory = MagicMock()
         executor._sleep_wakeup_comm = FakeComm()
         executor.device_id = 0
         executor.dist = SimpleNamespace(rank=1)
@@ -1604,8 +1610,8 @@ class TestListenerAbortAndShutdown:
                 raise AssertionError("shutdown ACK drain must probe before recv")
 
         executor = object.__new__(PyExecutor)
-        executor.prepare_sleep = MagicMock()
-        executor.finish_wakeup = MagicMock()
+        executor.release_memory = MagicMock()
+        executor.materialize_memory = MagicMock()
         executor._sleep_wakeup_comm = FakeComm()
         executor._sleep_wakeup_listener_thread = None
         executor.dist = SimpleNamespace(rank=0, world_size=3)
@@ -1741,8 +1747,8 @@ class TestSingleRankLockAcquired:
             yield None
 
         w.engine = SimpleNamespace(
-            prepare_sleep=MagicMock(),
-            finish_wakeup=MagicMock(),
+            release_memory=MagicMock(),
+            materialize_memory=MagicMock(),
             _sleep_wakeup_lock=SpyLock(),
             control_action=_noop_control_action,
             begin_sleep_transition=MagicMock(),

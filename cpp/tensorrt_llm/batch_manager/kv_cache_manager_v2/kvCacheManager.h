@@ -125,6 +125,12 @@ public:
     // Clear all reusable (committed) blocks from the radix tree.
     void clearReusableBlocks();
 
+    //! Release GPU backing after all living caches have been suspended or closed.
+    void releaseGpuMemory();
+
+    //! Restore GPU backing before resuming living caches or creating replacement caches.
+    void materializeGpuMemory(bool zero = false);
+
     // ---- KvCache creation -------------------------------------------------
 
     // Create a new KvCache. Returned cache is SUSPENDED; call resume() with a stream.

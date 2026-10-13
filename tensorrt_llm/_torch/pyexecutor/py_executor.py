@@ -569,8 +569,6 @@ class PyExecutor:
         self.enable_early_first_token_response = enable_early_first_token_response
         self.virtual_memory_pools = virtual_memory_pools
         self._sleeping_memory_tags: set[ExecutorMemoryType] = set()
-        self._sleeping_padding_dummies = []
-        self._sleeping_kv_managers: list[KVCacheManagerV2] = []
 
         # enqueue and _fetch_new_requests used data
         self.active = True
@@ -2071,66 +2069,38 @@ class PyExecutor:
                 "memory re-registration, which is not supported. "
                 "Exclude KV_CACHE when using a cache transceiver.")
 
-    def prepare_sleep(self, tags: list[ExecutorMemoryType]) -> None:
-        """Invalidate cached prefixes before their contents are discarded.
+    def _kv_memory_resources(self) -> list[KVCacheManagerV2]:
+        managers: list[KVCacheManagerV2] = []
+        for manager in self.resource_manager.resource_managers.values():
+            if isinstance(manager, KVCacheManagerV2) and not any(
+                    manager is existing for existing in managers):
+                managers.append(manager)
+        return managers
 
-        Called on each rank with the executor drained and CUDA synchronized.
-        CPU/PINNED modes retain both the cache contents and reuse metadata.
-        """
-        from tensorrt_llm._torch.virtual_memory import RestoreMode
+    def validate_sleep_config(self) -> None:
+        for manager in self._kv_memory_resources():
+            manager.validate_sleep_config()
 
+    def release_memory(self, tags: tuple[str, ...]) -> None:
+        """Release native KV pools before the runtime releases tagged auxiliary buffers."""
         if not self._is_kv_manager_v2:
             return
-        if not self._sleeping_memory_tags:
-            # Release shared speculative slots before any tag is unmapped.
-            # Suspended caches still prevent V2 from clearing its reuse tree.
-            released_resources = set()
-            for engine in (self.model_engine, self.draft_model_engine):
-                runner = getattr(engine, "cuda_graph_runner", None)
-                if runner is not None and runner.padding_dummy_requests:
-                    draft_lengths = set(runner.padding_dummy_requests)
-                    for draft_len in draft_lengths:
-                        runner.release_padding_dummy(self.resource_manager,
-                                                     draft_len,
-                                                     released_resources)
-                    self._sleeping_padding_dummies.append(
-                        (runner, draft_lengths))
-            for manager in self.resource_manager.resource_managers.values():
-                if isinstance(manager, KVCacheManagerV2) and not any(
-                        manager is seen for seen in self._sleeping_kv_managers):
-                    manager.prepare_sleep()
-                    self._sleeping_kv_managers.append(manager)
-            if self._sleeping_kv_managers or self._sleeping_padding_dummies:
-                # Speculative resource cleanup can enqueue device writes.
-                torch.cuda.synchronize()
+        self._sleeping_memory_tags.update(
+            ExecutorMemoryType(tag) for tag in tags)
+        self._pp_rebalance_drain_iters = None
         if ExecutorMemoryType.KV_CACHE in tags:
             mode = self.llm_args.sleep_config.restore_modes[
                 ExecutorMemoryType.KV_CACHE]
-            if mode in (RestoreMode.NONE, RestoreMode.MEMSET):
-                self.reset_prefix_cache()
-        # Every rank updates this state while the control barrier holds the
-        # executor loop. Rebalance must not touch any released buffers.
-        self._sleeping_memory_tags.update(tags)
-        self._pp_rebalance_drain_iters = None
+            for manager in self._kv_memory_resources():
+                manager.release_memory(mode)
 
-    def finish_wakeup(self, tags: list[ExecutorMemoryType]) -> None:
-        """Resume maintenance only after every released tag is restored."""
+    def materialize_memory(self, tags: tuple[str, ...]) -> None:
+        """Restore native KV pools after tagged auxiliary buffers are available."""
         if not self._is_kv_manager_v2:
             return
-        if not self._sleeping_memory_tags.difference(tags):
-            for manager in self._sleeping_kv_managers:
-                manager.finish_wakeup()
-            for runner, draft_lengths in self._sleeping_padding_dummies:
-                for draft_len in sorted(draft_lengths):
-                    if runner._get_or_create_padding_dummy(
-                            self.resource_manager, draft_len) is None:
-                        raise RuntimeError(
-                            "Could not restore CUDA graph padding requests after wakeup"
-                        )
-            if self._sleeping_kv_managers or self._sleeping_padding_dummies:
-                torch.cuda.synchronize()
-            self._sleeping_kv_managers.clear()
-            self._sleeping_padding_dummies.clear()
+        if ExecutorMemoryType.KV_CACHE in tags:
+            for manager in self._kv_memory_resources():
+                manager.materialize_memory()
         self._sleeping_memory_tags.difference_update(tags)
 
     def complete_sleep_transition(self) -> None:
@@ -3740,20 +3710,17 @@ class PyExecutor:
                                     self._has_mnnvl_checkpoint_resources(tags))
                                 release_control_request = False
                             elif target_action == _SleepWakeupAction.SLEEP:
-                                self.prepare_sleep(tags)
                                 self._run_mnnvl_checkpoint_resources(
                                     target_action, tags)
-                                self.invalidate_v1_prefix_cache_for_sleep(tags)
-                                release_with_tag(*tags)
+                                release_with_tag(*tags, resource=self)
                                 torch.cuda.synchronize()
                                 gc.collect()
                                 torch.cuda.empty_cache()
                             elif target_action == _SleepWakeupAction.WAKEUP:
-                                materialize_with_tag(*tags)
+                                materialize_with_tag(*tags, resource=self)
                                 torch.cuda.synchronize()
                                 self._run_mnnvl_checkpoint_resources(
                                     target_action, tags)
-                                self.finish_wakeup(tags)
                             else:
                                 error_msg = (
                                     f"unknown target action '{target_action}'")

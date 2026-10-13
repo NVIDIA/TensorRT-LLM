@@ -4,7 +4,7 @@
 import contextlib
 import functools
 from contextlib import contextmanager
-from typing import Generator
+from typing import Generator, Protocol
 
 import torch
 
@@ -141,18 +141,32 @@ def maybe_scope(
         yield
 
 
-def release_with_tag(*tags: str) -> int:
+class TaggedMemoryResource(Protocol):
+    """An owner of memory that is not allocated by the runtime allocator."""
+
+    def release_memory(self, tags: tuple[str, ...]) -> None:
+        ...
+
+    def materialize_memory(self, tags: tuple[str, ...]) -> None:
+        ...
+
+
+def release_with_tag(*tags: str,
+                     resource: TaggedMemoryResource | None = None) -> int:
     """Release virtual memory allocated with given tags
 
     :param tags: The tag of the scope when the virtual memory is allocated
     :return: Number of memory blobs released
     """
+    if resource is not None:
+        resource.release_memory(tags)
     manager = get_virtual_memory_manager()
     released_blobs = sum(manager.release_with_tag(tag) for tag in tags)
     return released_blobs
 
 
-def materialize_with_tag(*tags: str) -> int:
+def materialize_with_tag(*tags: str,
+                         resource: TaggedMemoryResource | None = None) -> int:
     """Materialize virtual memory allocated with given tags
 
     :param tags: The tag of the scope when the virtual memory is allocated
@@ -160,4 +174,7 @@ def materialize_with_tag(*tags: str) -> int:
     """
     manager = get_virtual_memory_manager()
     materialized_blobs = sum(manager.materialize_with_tag(tag) for tag in tags)
+    if resource is not None:
+        torch.cuda.synchronize()
+        resource.materialize_memory(tags)
     return materialized_blobs

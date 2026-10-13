@@ -1706,6 +1706,58 @@ void StorageManager::expandPoolGroup(CacheLevel level, PoolGroupIndex pgIdx, Slo
     pg.slotAllocator().expand(newNumSlots);
 }
 
+void StorageManager::releaseGpuMemory()
+{
+    TLLM_CHECK_WITH_INFO(!mSleepingGpuSlots.has_value(), "GPU cache memory is already released");
+    auto& hot = mLevels.at(kHotLevel);
+    auto const slotCounts = hot.storage->slotCountList();
+    TypedVec<PoolGroupIndex, SlotCount> evictCounts(slotCounts.size(), 0);
+    for (PoolGroupIndex pgIdx{0}; pgIdx < slotCounts.size(); ++pgIdx)
+    {
+        evictCounts[pgIdx] = hot.controller.numEvictablePages(pgIdx);
+    }
+    forceEvict(kHotLevel, evictCounts);
+    for (PoolGroupIndex pgIdx{0}; pgIdx < slotCounts.size(); ++pgIdx)
+    {
+        TLLM_CHECK_WITH_INFO(poolGroup(kHotLevel, pgIdx).slotAllocator().numOccupiedSlots() == 0,
+            "GPU cache memory still has held pages; configure sufficient host cache capacity");
+    }
+    // Complete codec copies before any source buffer is unmapped.
+    cuCheck(cuCtxSynchronize());
+    mSleepingGpuSlots = slotCounts;
+    for (PoolGroupIndex pgIdx{0}; pgIdx < slotCounts.size(); ++pgIdx)
+    {
+        if (slotCounts[pgIdx] != 0)
+        {
+            shrinkPoolGroup(kHotLevel, pgIdx, 0, {});
+        }
+    }
+    mGpuPhysMemAllocator->clear();
+}
+
+void StorageManager::materializeGpuMemory(bool zero)
+{
+    TLLM_CHECK_WITH_INFO(mSleepingGpuSlots.has_value(), "GPU cache memory is not released");
+    auto const& slotCounts = *mSleepingGpuSlots;
+    for (PoolGroupIndex pgIdx{0}; pgIdx < slotCounts.size(); ++pgIdx)
+    {
+        if (slotCounts[pgIdx] != 0)
+        {
+            expandPoolGroup(kHotLevel, pgIdx, slotCounts[pgIdx]);
+        }
+        if (zero)
+        {
+            auto const& sizes = slotSize(kHotLevel, pgIdx);
+            for (PoolIndex poolIdx{0}; poolIdx < sizes.size(); ++poolIdx)
+            {
+                cuCheck(cuMemsetD8(static_cast<CUdeviceptr>(getMemPoolBaseAddress(pgIdx, poolIdx)), 0,
+                    slotCountToSizeT(slotCounts[pgIdx]) * sizes[poolIdx]));
+            }
+        }
+    }
+    mSleepingGpuSlots.reset();
+}
+
 // ---------------------------------------------------------------------------
 // shrinkPoolGroup — mirrors Python _storage_manager.py::shrink_pool_group
 // ---------------------------------------------------------------------------

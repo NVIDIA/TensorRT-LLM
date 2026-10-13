@@ -259,6 +259,33 @@ configured separately from `KvCacheConfig`; see
 [KV Cache Compression](kv-cache-compression.md) for the available methods and
 their activation points.
 
+### Sleep and Wakeup with V2
+
+When `sleep_config` is enabled with KV cache manager V2, the host cache tier must
+have a quota at least as large as the GPU cache quota on each rank. Set
+`kv_cache_config.host_cache_size` accordingly. Automatic host sizing may choose a
+smaller quota because of available host memory or pinned-memory limits; such a
+configuration is rejected during initialization when sleep is enabled.
+
+The `kv_cache` entry in `sleep_config.restore_modes` controls the KV data policy:
+
+| Mode | Sleep | Wakeup |
+| --- | --- | --- |
+| `CPU`, `PINNED` | Suspend internal requests and evict GPU pages through the configured host and optional disk tiers. Reusable pages may be dropped under capacity pressure. | Restore GPU pool capacity and resume internal requests. Reusable pages return to GPU on demand. |
+| `NONE` | Discard KV contents and reusable prefixes, retaining the information needed to recreate internal request caches. | Recreate internal request caches with uninitialized KV storage. |
+| `MEMSET` | Discard KV contents and reusable prefixes as for `NONE`. | Zero the restored GPU pools, then recreate internal request caches. |
+
+V2 uses its existing pinned host tier for both `CPU` and `PINNED`; these modes
+provide the same KV-cache policy and do not promise to retain every reusable
+prefix. Other memory tags retain their runtime restore-mode behavior. Live pages
+held by suspended internal requests cannot be dropped; an inability to place
+those pages in the configured tiers fails the sleep operation.
+
+Sleep drains user requests before changing memory. Internal padding requests
+retain their request identities and metadata buffers, while their page indices
+are refreshed on wakeup. GPU pool virtual addresses remain reserved throughout
+sleep. Sleeping registered V2 KV memory used by a cache transceiver is unsupported.
+
 ### Partial Reuse
 
 Partial reuse of a block can happen when some but not all tokens are matched. It is enabled by default, but can be disabled by setting ```enable_partial_reuse``` to False.

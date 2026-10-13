@@ -3357,90 +3357,67 @@ def test_reset_prefix_cache_clears_target_and_draft_reuse_trees():
 
 @pytest.mark.parametrize("mode", ["NONE", "MEMSET", "CPU", "PINNED"])
 @pytest.mark.parametrize("release_kv", [False, True])
-@pytest.mark.parametrize("joint_reuse", [False, True])
-def test_prepare_sleep_invalidates_only_discarded_kv(mode, release_kv, joint_reuse, monkeypatch):
-    from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDAGraphRunner
+@pytest.mark.parametrize("has_draft", [False, True])
+def test_sleep_routes_native_kv_memory_without_recreating_dummies(
+    mode, release_kv, has_draft, monkeypatch
+):
+    from tensorrt_llm._torch import virtual_memory
+    from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
     from tensorrt_llm.llmapi.llm_args import ExecutorMemoryType, SleepConfig
 
     stub = object.__new__(PyExecutor)
     stub._is_kv_manager_v2 = True
     stub._sleeping_memory_tags = set()
-    stub._sleeping_padding_dummies = []
-    stub._sleeping_kv_managers = []
     stub.llm_args = types.SimpleNamespace(
         sleep_config=SleepConfig(restore_modes={ExecutorMemoryType.KV_CACHE: mode})
     )
-    stub.kv_cache_manager = Mock()
-    stub.draft_kv_cache_manager = Mock()
-    stub.enable_joint_kv_cache_reuse = joint_reuse
-    stub.resource_manager = types.SimpleNamespace(resource_managers={})
-    shared_spec = Mock()
-    cleanup_order = []
-    shared_spec.free_resources.side_effect = lambda _: cleanup_order.append("cleanup")
-    monkeypatch.setattr(
-        torch.cuda, "synchronize", Mock(side_effect=lambda: cleanup_order.append("synchronize"))
-    )
-    dummy = types.SimpleNamespace(py_request_id=42)
-
-    def make_runner(manager):
-        runner = object.__new__(CUDAGraphRunner)
-        runner.graphs = {}
-        runner.graph_outputs = {}
-        runner.graph_metadata = {}
-        runner.memory_pool = None
-        runner.padding_dummy_requests = {0: dummy}
-        runner._padding_dummy_managers = lambda _: [manager, shared_spec]
-        # Attention-DP can create dummies even when every batch size has a
-        # graph, so warmup preallocation does not necessarily cover them.
-        runner.preallocate_padding_dummies = Mock()
-
-        def create_dummy(_, draft_len):
-            runner.padding_dummy_requests[draft_len] = dummy
-            return dummy
-
-        runner._get_or_create_padding_dummy = Mock(side_effect=create_dummy)
-        return runner
-
-    main_runner = make_runner(stub.kv_cache_manager)
-    draft_runner = make_runner(stub.draft_kv_cache_manager)
-    stub.model_engine = types.SimpleNamespace(cuda_graph_runner=main_runner, route_capture=None)
-    stub.draft_model_engine = types.SimpleNamespace(cuda_graph_runner=draft_runner)
-
-    def clear_reuse():
-        assert not main_runner.padding_dummy_requests
-        assert not draft_runner.padding_dummy_requests
-
-    stub.kv_cache_manager.reset_reuse_state.side_effect = clear_reuse
-    stub.draft_kv_cache_manager.reset_reuse_state.side_effect = clear_reuse
+    main = Mock(spec=KVCacheManagerV2)
+    draft = Mock(spec=KVCacheManagerV2)
+    spec = Mock()
+    managers = {"main": main, "alias": main, "spec": spec}
+    if has_draft:
+        managers["draft"] = draft
+    stub.resource_manager = types.SimpleNamespace(resource_managers=managers)
+    dummy = object()
+    runner = Mock(padding_dummy_requests={0: dummy})
+    stub.model_engine = types.SimpleNamespace(cuda_graph_runner=runner)
+    events = []
+    for manager in (main, draft):
+        manager.release_memory.side_effect = lambda _: events.append("native_release")
+        manager.materialize_memory.side_effect = lambda: events.append("native_materialize")
+    runtime = Mock()
+    runtime.release_with_tag.side_effect = lambda _: events.append("runtime_release") or 1
+    runtime.materialize_with_tag.side_effect = lambda _: events.append("runtime_materialize") or 1
+    monkeypatch.setattr(virtual_memory, "get_virtual_memory_manager", lambda: runtime)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: events.append("synchronize"))
     tags = [
         ExecutorMemoryType.KV_CACHE if release_kv else ExecutorMemoryType.MODEL_ENGINE_MAIN,
         ExecutorMemoryType.SPEC_RESOURCES,
     ]
 
-    PyExecutor.prepare_sleep(stub, tags)
+    virtual_memory.release_with_tag(*tags, resource=stub)
 
-    expected = int(release_kv and mode in ("NONE", "MEMSET"))
-    assert stub.kv_cache_manager.reset_reuse_state.call_count == expected
-    assert stub.draft_kv_cache_manager.reset_reuse_state.call_count == expected * joint_reuse
     assert stub._sleeping_memory_tags == set(tags)
-    shared_spec.free_resources.assert_called_once_with(dummy)
-    stub.kv_cache_manager.free_resources.assert_called_once_with(dummy)
-    stub.draft_kv_cache_manager.free_resources.assert_called_once_with(dummy)
-    assert cleanup_order == ["cleanup", "synchronize"]
-    torch.cuda.synchronize.reset_mock()
+    assert stub._pp_rebalance_drain_iters is None
+    assert main.release_memory.call_count == int(release_kv)
+    assert draft.release_memory.call_count == int(release_kv and has_draft)
+    if release_kv:
+        main.release_memory.assert_called_once_with(virtual_memory.RestoreMode[mode])
+        assert events.index("native_release") < events.index("runtime_release")
 
-    PyExecutor.finish_wakeup(stub, tags[:1])
-    main_runner._get_or_create_padding_dummy.assert_not_called()
-    draft_runner._get_or_create_padding_dummy.assert_not_called()
-    torch.cuda.synchronize.assert_not_called()
-    PyExecutor.finish_wakeup(stub, tags[1:])
+    events.clear()
+    virtual_memory.materialize_with_tag(tags[0], resource=stub)
+    assert stub._sleeping_memory_tags == {tags[1]}
+    assert main.materialize_memory.call_count == int(release_kv)
+    if release_kv:
+        assert events.index("runtime_materialize") < events.index("synchronize")
+        assert events.index("synchronize") < events.index("native_materialize")
+    virtual_memory.materialize_with_tag(tags[1], resource=stub)
     assert not stub._sleeping_memory_tags
-    assert main_runner.padding_dummy_requests == {0: dummy}
-    assert draft_runner.padding_dummy_requests == {0: dummy}
-    for runner in (main_runner, draft_runner):
-        runner.preallocate_padding_dummies.assert_not_called()
-        runner._get_or_create_padding_dummy.assert_called_once_with(stub.resource_manager, 0)
-    torch.cuda.synchronize.assert_called_once_with()
+    assert runner.padding_dummy_requests == {0: dummy}
+    runner.release_padding_dummy.assert_not_called()
+    runner._get_or_create_padding_dummy.assert_not_called()
+    spec.free_resources.assert_not_called()
 
 
 class TestPendingTransferResponseFlush:

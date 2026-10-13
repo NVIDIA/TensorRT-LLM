@@ -371,6 +371,11 @@ public:
         return mCommitState;
     }
 
+    std::optional<int> expectedPromptLength() const noexcept
+    {
+        return mExpectedPromptLength;
+    }
+
     bool isActive() const noexcept
     {
         return mStatus == Status::ACTIVE;

@@ -89,8 +89,6 @@ def _make_executor(
     # Gate inputs.
     exe.enable_kv_pool_rebalance = enable_kv_pool_rebalance
     exe._sleeping_memory_tags = set()
-    exe._sleeping_padding_dummies = []
-    exe._sleeping_kv_managers = []
     exe._is_kv_manager_v2 = True
     exe.dist = MagicMock(pp_size=pp_size, tp_size=tp_size, cp_size=cp_size)
     exe.enable_attention_dp = enable_attention_dp
@@ -243,14 +241,14 @@ class TestCanPauseForRebalance:
         model = [ExecutorMemoryType.MODEL_ENGINE_MAIN]
         for _ in range(2):
             exe._pp_rebalance_drain_iters = 1
-            PyExecutor.prepare_sleep(exe, kv + model)
+            PyExecutor.release_memory(exe, tuple(kv + model))
             assert not PyExecutor._can_pause_for_rebalance(exe)
             PyExecutor._maybe_finish_pp_rebalance(exe)
             exe.kv_cache_manager.impl.adjust.assert_not_called()
             assert exe._pp_rebalance_drain_iters is None
-            PyExecutor.finish_wakeup(exe, kv)
+            PyExecutor.materialize_memory(exe, tuple(kv))
             assert not PyExecutor._can_pause_for_rebalance(exe)
-            PyExecutor.finish_wakeup(exe, model)
+            PyExecutor.materialize_memory(exe, tuple(model))
             assert PyExecutor._can_pause_for_rebalance(exe)
 
     def test_pp_size_gt_one_is_allowed(self):

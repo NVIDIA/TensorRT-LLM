@@ -321,8 +321,7 @@ class RayGPUWorker(RpcWorkerMixin, BaseWorker):
         try:
             logger.info(f"Sleep: {tags}")
             torch.cuda.synchronize()
-            self.engine.prepare_sleep(tags)
-            release_with_tag(*tags)
+            release_with_tag(*tags, resource=self.engine)
             torch.cuda.synchronize()
             gc.collect()
             torch.cuda.empty_cache()
@@ -343,10 +342,8 @@ class RayGPUWorker(RpcWorkerMixin, BaseWorker):
             tags = [ExecutorMemoryType(tag) for tag in wakeup_tags]
             logger.info(f"Wakeup: {tags}")
             torch.cuda.synchronize()
-            mutation_started = True
-            materialize_with_tag(*tags)
+            materialize_with_tag(*tags, resource=self.engine)
             torch.cuda.synchronize()
-            self.engine.finish_wakeup(tags)
         except Exception as e:
             logger.error(f"Encountered an error in wakeup")
             raise e

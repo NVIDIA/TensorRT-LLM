@@ -1938,6 +1938,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             nb::arg("optional_reuse_groups") = nb::none())
         .def("enter_decode", &kv::KvCache::enterDecode, nb::call_guard<nb::gil_scoped_release>())
         .def_prop_ro("is_decoding", &kv::KvCache::isDecoding)
+        .def_prop_ro("expected_prompt_length", &kv::KvCache::expectedPromptLength)
         .def_prop_ro("page_storage_version", &kv::KvCache::pageStorageVersion, nb::call_guard<nb::gil_scoped_release>())
         .def_prop_ro("page_storage_dirty", &kv::KvCache::pageStorageDirty, nb::call_guard<nb::gil_scoped_release>())
         .def_prop_ro("page_storage_row", &kv::KvCache::pageStorageRow, nb::call_guard<nb::gil_scoped_release>())
@@ -2604,6 +2605,9 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             nb::arg("config"), nb::arg("event_manager").none() = nb::none(),
             nb::arg("cold_page_codec").none() = nb::none())
         .def("shutdown", &kv::KvCacheManager::shutdown, nb::call_guard<nb::gil_scoped_release>())
+        .def("release_gpu_memory", &kv::KvCacheManager::releaseGpuMemory, nb::call_guard<nb::gil_scoped_release>())
+        .def("materialize_gpu_memory", &kv::KvCacheManager::materializeGpuMemory, nb::arg("zero") = false,
+            nb::call_guard<nb::gil_scoped_release>())
         .def("is_sparse", &kv::KvCacheManager::isSparse, nb::arg("layer_id"), nb::arg("data_role"))
         .def(
             "clear_reusable_blocks", &kv::KvCacheManager::clearReusableBlocks, nb::call_guard<nb::gil_scoped_release>())

@@ -19,7 +19,6 @@
 
 #include "kv_cache_manager_v2/common.h"
 #include "kv_cache_manager_v2/utils/cudaEvent.h"
-#include "tensorrt_llm/runtime/virtualMemory.h"
 
 #include <cuda.h>
 #include <vector>
@@ -84,11 +83,6 @@ public:
     int deviceId() const noexcept
     {
         return mDeviceId;
-    }
-
-    [[nodiscard]] CUmemAllocationProp const& allocationProp() const noexcept
-    {
-        return mProp;
     }
 
 private:
@@ -156,14 +150,12 @@ public:
     }
 
 private:
-    void push();
+    void push(PooledPhysMemAllocator::PooledPhysMem handle);
     void pop();
 
     CUdeviceptr mAddr = 0;
     size_t mVmSize = 0;
     PooledPhysMemAllocator& mPhysMemAllocator;
-    // Keep the creation scope even when the pool grows outside that scope.
-    runtime::CudaVirtualMemoryAllocator mSleepAllocator;
     std::vector<PooledPhysMemAllocator::PooledPhysMem> mPhysHandles;
     CUmemAccessDesc mAccessDesc{};
 };
