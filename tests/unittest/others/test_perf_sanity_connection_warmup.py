@@ -48,10 +48,28 @@ def _record(arrival: float, ctx_queue_s: float) -> str:
 
 def test_connection_warmup_records_are_skipped(tmp_path: Path) -> None:
     jsonl = tmp_path / "perf_metrics-disagg-node0-1-x.jsonl"
-    # An overlapping burst of cold connection-warmup requests, then the line-count
-    # snapshot DisaggTestCmds takes before the measured clients.
-    jsonl.write_text("".join(_record(i * 0.001, ctx_queue_s=5.0) for i in range(32)))
-    _, after_connection_warmup = tbm.wait_for_perf_metrics_files(str(tmp_path), stable_seconds=0)
+    # An overlapping burst of cold connection-warmup requests. The server has not written
+    # the last record yet when DisaggTestCmds starts its line-count snapshot.
+    connection_warmup_records = [_record(i * 0.001, ctx_queue_s=5.0) for i in range(32)]
+    jsonl.write_text("".join(connection_warmup_records[:-1]))
+    late_records = connection_warmup_records[-1:]
+
+    def flush_late_records() -> None:
+        with jsonl.open("a") as handle:
+            handle.writelines(late_records)
+        late_records.clear()
+
+    # The server flushes the last record while the snapshot polls.
+    _, after_connection_warmup = tbm.wait_for_perf_metrics_files(
+        str(tmp_path),
+        expected_requests=len(connection_warmup_records),
+        wait_for_expected_requests=True,
+        stable_seconds=0,
+        sleep=lambda _seconds: flush_late_records(),
+    )
+    # Does nothing if the snapshot waited for the late record. Otherwise the record lands
+    # after the snapshot, and the assertion below catches the leak.
+    flush_late_records()
 
     # The measured client's isolated test request, then its measured burst.
     with jsonl.open("a") as handle:

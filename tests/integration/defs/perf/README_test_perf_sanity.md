@@ -391,10 +391,13 @@ file would silently reroute the per-request groups to same-role worker fallbacks
 which produce plausible values for the wrong phase.
 
 The servers also append records of the e2e connection warmup's requests to these
-files. The harness therefore notes each file's line count once those records have
-settled, and the aggregation skips those leading lines and leaves them out of the
-census. The log line `Time breakdown: excluded connection-warmup records from {...}`
-prints the counts as JSON. To reproduce the uploaded numbers offline, run
+files. The harness therefore waits until the largest file holds a record for every
+successful warmup request and the files hold still, then notes each file's line count; the aggregation skips those leading lines and leaves
+them out of the census. Unlike the measured run's census, this one is a failure: if
+the count is not reached within `PERF_METRICS_SETTLE_TIMEOUT`, the test fails rather
+than mixing late warmup records into the breakdown. The log line
+`Time breakdown: excluded connection-warmup records from {...}` prints the counts as
+JSON. To reproduce the uploaded numbers offline, run
 `time_breakdown_metrics.py --mode e2e --output-dir <test output dir>/perf_metrics
 --drop-warmup-request --leading-lines-to-skip '<that JSON>'`.
 

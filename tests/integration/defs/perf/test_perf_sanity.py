@@ -3236,39 +3236,43 @@ class DisaggTestCmds(NamedTuple):
     def _wait_for_connection_warmup_line_counts(
         self, num_succeeded_requests: int
     ) -> Dict[str, int]:
-        """Wait for the warmup's perf_metrics records to settle; return per-file line counts.
+        """Wait for every warmup perf_metrics record to be written; return per-file line counts.
 
-        The time breakdown skips this many leading lines per file. The servers queue each
-        record before answering its request, so once the files stop growing, every
-        successful warmup request's record is on disk.
+        The time breakdown skips this many leading lines per file, so a warmup record
+        written after this snapshot would count as measured. Each server queues a
+        request's record before it finishes answering that request, so every warmup record
+        is already queued when the warmup client exits; this waits for them to be written.
+        First, the largest file must reach num_succeeded_requests lines. That file belongs
+        to a server that saw every warmup request: the disagg server, or a lone ctx or gen
+        server. Then the files must hold still for PERF_METRICS_SETTLE_SECONDS, so the
+        other servers' queued records are written too.
 
         Args:
-            num_succeeded_requests: Warmup requests that succeeded. The disagg server
-                writes one record per request, so the largest file should hold this many
-                lines.
+            num_succeeded_requests: Warmup requests that succeeded.
 
         Returns:
             Line count per perf_metrics JSONL basename.
+
+        Raises:
+            RuntimeError: That did not happen within PERF_METRICS_SETTLE_TIMEOUT.
         """
         _, settle_info = wait_for_perf_metrics_files(
             self.perf_metrics_output_dir,
+            expected_requests=num_succeeded_requests,
+            wait_for_expected_requests=True,
             stable_seconds=PERF_METRICS_SETTLE_SECONDS,
             timeout_seconds=PERF_METRICS_SETTLE_TIMEOUT,
         )
-        line_counts = settle_info["line_counts"]
-        census = max(line_counts.values(), default=0)
-        consequence = "warmup records written after this count as measured in d_tb_*"
         if not settle_info["stable"]:
-            print_warning(
-                "Connection warmup: perf_metrics files were still growing at the settle "
-                f"timeout; {consequence}"
+            raise RuntimeError(
+                f"Connection warmup: expected {num_succeeded_requests} warmup records in the "
+                f"largest perf_metrics file under {self.perf_metrics_output_dir}, but the "
+                f"files did not reach that count and stop growing within "
+                f"{PERF_METRICS_SETTLE_TIMEOUT:.0f}s (line counts: "
+                f"{settle_info['line_counts']}). Failing so that late warmup records are "
+                "not counted as measured in d_tb_*."
             )
-        elif census < num_succeeded_requests:
-            print_warning(
-                f"Connection warmup: the largest perf_metrics file holds {census} of "
-                f"{num_succeeded_requests} warmup records; {consequence}"
-            )
-        return line_counts
+        return settle_info["line_counts"]
 
     def run_cmd(self, server_idx: int) -> List[str]:
         """Run commands for a server and return outputs."""

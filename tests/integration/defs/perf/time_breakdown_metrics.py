@@ -742,6 +742,14 @@ def _count_lines(path: str) -> int:
             total += chunk.count(b"\n")
 
 
+def _census(line_counts: Mapping[str, int], leading_lines_to_skip: Mapping[str, int]) -> int:
+    """Largest per-file line count after subtracting that file's skipped leading lines."""
+    return max(
+        (count - leading_lines_to_skip.get(name, 0) for name, count in line_counts.items()),
+        default=0,
+    )
+
+
 def wait_for_perf_metrics_files(
     output_dir: str,
     expected_requests: Optional[int] = None,
@@ -751,8 +759,9 @@ def wait_for_perf_metrics_files(
     sleep=time.sleep,
     monotonic=time.monotonic,
     leading_lines_to_skip: Optional[Mapping[str, int]] = None,
+    wait_for_expected_requests: bool = False,
 ) -> Tuple[List[str], Dict[str, Any]]:
-    """Wait for the perf_metrics JSONLs to stop growing, then return them.
+    """Wait for the perf_metrics JSONLs to hold still (and optionally to reach a count).
 
     Positive completion gate for the aggregation. The harness has no completion signal for
     the context workers or the disaggregated server -- unlike the generation workers, whose
@@ -769,14 +778,26 @@ def wait_for_perf_metrics_files(
     ``leading_lines_to_skip`` entry is subtracted from its count first, so earlier traffic
     cannot mask a shortfall. ``info["line_counts"]`` stays raw (before the subtraction).
 
+    With ``wait_for_expected_requests``, the files also need a census of at least
+    ``expected_requests`` before they count as settled, and an empty directory is polled
+    instead of returned at once. On timeout, ``info["stable"]`` is False and the caller
+    decides. The connection warmup's snapshot uses this mode because it starts as soon as
+    the warmup client exits. At that point the servers may not have written their last
+    records, or even created their files.
+
     ``sleep`` / ``monotonic`` are injected so the unit tests can drive this without wall
     time.
 
-    Returns ``(paths, info)``; ``info`` carries ``stable`` (bool), ``waited_seconds``,
-    ``total_bytes``, ``line_counts`` and ``warnings``.
+    Returns ``(paths, info)``; ``info`` carries ``stable`` (bool: the files held still for
+    ``stable_seconds`` and, with ``wait_for_expected_requests``, the census reached
+    ``expected_requests``), ``waited_seconds``, ``total_bytes``, ``line_counts`` and
+    ``warnings``.
     """
+    if wait_for_expected_requests and not expected_requests:
+        raise ValueError("wait_for_expected_requests needs a positive expected_requests")
     warnings: List[str] = []
     deadline = monotonic() + timeout_seconds
+    leading_lines_to_skip = leading_lines_to_skip or {}
 
     def snapshot() -> Tuple[List[str], Tuple[Tuple[str, Optional[int]], ...]]:
         paths = discover_perf_metrics_files(output_dir)
@@ -790,12 +811,19 @@ def wait_for_perf_metrics_files(
                 sizes.append((os.path.basename(path), None))
         return paths, tuple(sizes)
 
+    def holds_expected_requests(paths: List[str]) -> bool:
+        try:
+            line_counts = {os.path.basename(path): _count_lines(path) for path in paths}
+        except OSError:
+            return False
+        return _census(line_counts, leading_lines_to_skip) >= expected_requests
+
     started = monotonic()
     paths, fingerprint = snapshot()
-    if not paths:
-        # Nothing was ever created, so there is nothing to wait for: the workers write
-        # their first record long before the client exits. The caller reports the empty
-        # discovery itself.
+    if not paths and not wait_for_expected_requests:
+        # Without a count to wait for, no file means nothing was ever written: the workers
+        # write their first record long before the client exits. The caller reports the
+        # empty discovery itself.
         return [], {
             "stable": True,
             "waited_seconds": 0.0,
@@ -808,14 +836,18 @@ def wait_for_perf_metrics_files(
     stable = False
     while True:
         now = monotonic()
-        if now - unchanged_since >= stable_seconds:
+        held_still = now - unchanged_since >= stable_seconds
+        if held_still and (not wait_for_expected_requests or holds_expected_requests(paths)):
             stable = True
             break
         if now >= deadline:
-            warnings.append(
-                f"perf_metrics files under {output_dir} were still growing after "
-                f"{timeout_seconds:.0f}s; aggregating what is on disk"
-            )
+            # If the files held still, only a short census kept this waiting; the census
+            # check below reports it when any file exists.
+            if not held_still:
+                warnings.append(
+                    f"perf_metrics files under {output_dir} were still growing after "
+                    f"{timeout_seconds:.0f}s; aggregating what is on disk"
+                )
             break
         sleep(min(poll_seconds, max(0.0, deadline - now)))
         paths, new_fingerprint = snapshot()
@@ -831,10 +863,7 @@ def wait_for_perf_metrics_files(
             warnings.append(f"{os.path.basename(path)}: could not count lines ({exc})")
 
     if expected_requests and line_counts:
-        leading_lines_to_skip = leading_lines_to_skip or {}
-        census = max(
-            count - leading_lines_to_skip.get(name, 0) for name, count in line_counts.items()
-        )
+        census = _census(line_counts, leading_lines_to_skip)
         if census < expected_requests:
             warnings.append(
                 f"the largest perf_metrics file holds {census} complete record(s) but the "
