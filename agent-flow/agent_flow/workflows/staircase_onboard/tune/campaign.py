@@ -519,6 +519,13 @@ class Campaign:
         head = self._best_head()
         cands = self.state.candidates
         b = self.state.batch
+        if b and b.get("status") == "single":
+            # One winner gating alone, the winners that conflict with it rebased onto it.
+            (st1,) = (cands[s] for s in b["members"])
+            if st1.status == "gate":
+                return True
+            self._end_batch(kept=st1.status == "kept" and head == b.get("tip"))
+            b = {}
         if b and b.get("base") != head:
             for slug in b.get("members", []):
                 if cands[slug].status == "won":
@@ -543,7 +550,21 @@ class Campaign:
             # one large winner that excludes three others); the rest rebase onto it.
             chosen = self._compatible_set(head, winners)
             if len(chosen) < 2:
-                (chosen or winners)[0].status = "gate"
+                single = (chosen or winners)[0]
+                single.status = "gate"
+                # The others conflict with it: rebase them onto its stacked tree while it
+                # is gated, as for a batch, instead of gating them on a tree it will move.
+                tip = git(Path(single.eval_tree), "rev-parse", "HEAD") if single.eval_tree else ""
+                others = [st for st in winners if st is not single]
+                if tip and others:
+                    self.state.batch = {"members": [single.slug], "base": head, "tree": single.eval_tree,
+                                        "label": single.e2e_label, "status": "single", "tip": tip}
+                    for st in others:
+                        st.status, st.e2e_label = "conflict", ""
+                        st.reason = f"does not stack with {single.slug} on {head[:10]}"
+                        st.rebase_onto, st.rebase_ref = "tune/eval-batch", tip
+                        self.ledger.append("candidate_conflict", slug=st.slug, best=head, batch=single.slug, detail=st.reason)
+                    self.log(f"[campaign] {single.slug} gated alone; to rebase onto it: {[st.slug for st in others]}")
                 return True
             tree = Path(self.state.best_tree).parent / "eval-batch"
             if (tree / ".git").exists():

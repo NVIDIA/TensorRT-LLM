@@ -650,3 +650,63 @@ def test_a_turn_that_finished_during_a_restart_is_not_dispatched_again(tmp_path)
                       runner_factory=lambda spools, prefix: FakeRunner(spools, prefix, _effect), poll_s=0, log=lambda m: None)
     assert stage.run() == "tuned"
     assert "slow-path" not in turns
+
+
+def test_a_winner_that_conflicts_with_a_lone_gated_winner_is_rebased_onto_it(tmp_path):
+    """Two winners that do not stack: the larger is gated alone; the other is not gated
+    on a tree that keep will move -- it is rebased onto the gated one meanwhile, waits,
+    and is measured on the new best after the keep."""
+    import os
+
+    from agent_flow.workflows.staircase_onboard.tune.campaign import Campaign
+    from agent_flow.workflows.staircase_onboard.tune.ladder import BenchSpec
+    from agent_flow.workflows.staircase_onboard.tune.records import NoiseFloor
+    from agent_flow.workflows.staircase_onboard.tune.worktree import open_candidate
+
+    repo = _repo(tmp_path)
+
+    def effect(config, tree):
+        text = Path(tree, "modeling.py").read_text() if tree else ""
+        return 100.0 * (1.2 if "FAST = True" in text else 1.0) * (1.1 if "SIDE = 1" in text else 1.0), 2000.0
+
+    identity = tmp_path / "identity.yaml"
+    identity.write_text(yaml.safe_dump({"modeling_v2": "require"}))
+    bench = BenchSpec(bench_py="b", model="m", env_script="e", isl=8192, osl=1024, concurrencies=[1, 128], tree=str(repo))
+    perf, gates = FakeRunner(["s1"], "camp", effect), FakeRunner(["g1"], "campg", effect)
+    work = tmp_path / "camp"
+    camp = Campaign(workdir=work, repo=repo, bench=bench, base_configs=[identity], perf_runner=perf, gate_runner=gates,
+                    gate_cmd=lambda tree, configs, out: f"python gate_accuracy.py --out {out}",
+                    noise=NoiseFloor(spread={"con1.tok_s_user": 0.001}), log=lambda m: None)
+    camp.state.best_tree = str(open_candidate(repo, work / "wt", "best", "HEAD"))
+    camp.state.best_commit = _git(Path(camp.state.best_tree), "rev-parse", "HEAD")
+    wts = {}
+    for slug, text in (("fast-path", "FAST = True\n"), ("side-path", "FAST = False\nSIDE = 1\n")):
+        wt = wts[slug] = open_candidate(repo, work / "wt", slug, "HEAD")
+        (wt / "modeling.py").write_text(text)
+        _git(wt, "commit", "-q", "-am", slug)
+        d = tmp_path / f"{slug}.yaml"
+        d.write_text(yaml.safe_dump({"decision": "CANDIDATE", "worktree": str(wt), "commits": [_git(wt, "rev-parse", "HEAD")]}))
+        camp.submit_candidate(slug, d)
+    for _ in range(20):
+        camp.step()
+        if camp.state.candidates["side-path"].status == "conflict":
+            break
+    side = camp.state.candidates["side-path"]
+    assert side.status == "conflict" and camp.state.candidates["fast-path"].status in ("gate", "kept")
+    wt = wts["side-path"]
+    env = {**os.environ, "GIT_EDITOR": "true"}
+    subprocess.run(["git", "-C", str(wt), "rebase", side.rebase_ref], capture_output=True, env=env)
+    (wt / "modeling.py").write_text("FAST = True\nSIDE = 1\n")
+    _git(wt, "add", "-A")
+    subprocess.run(["git", "-C", str(wt), "rebase", "--continue"], check=True, capture_output=True, env=env)
+    d = tmp_path / "side-path.yaml"
+    d.write_text(yaml.safe_dump({"decision": "CANDIDATE", "worktree": str(wt),
+                                 "commits": _git(wt, "rev-list", "--reverse", f"{side.rebase_ref}..HEAD").splitlines()}))
+    camp.submit_candidate("side-path", d)
+    for _ in range(40):
+        if not camp.step():
+            break
+    assert {s: c.status for s, c in camp.state.candidates.items()} == {"fast-path": "kept", "side-path": "kept"}
+    assert Path(camp.state.best_tree, "modeling.py").read_text() == "FAST = True\nSIDE = 1\n"
+    gated = [json.loads(l)["slug"] for l in (work / "perf_ledger.jsonl").read_text().splitlines() if '"candidate_gate"' in l]
+    assert gated == ["fast-path", "side-path"]  # side-path never gated on the old tree
