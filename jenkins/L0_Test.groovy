@@ -2366,20 +2366,22 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 } catch (InterruptedException e) {
                     throw e
                 } catch (Exception submitEx) {
-                    def classified = classifyFailure(pipeline, submitEx, InfraFailure.SLURM, retryContext)
-                    if (classified instanceof PipelineInterruption || classified instanceof InfraFailure) {
-                        throw submitEx
-                    }
-
-                    // If the error msg didn't match any predefined pattern. Extract
-                    // only the bounded final-failure line emitted by our submit script.
+                    // The step log contains set -x command text, including catalog
+                    // signatures used by the submit script itself. Prefer the bounded
+                    // final-failure line so only the actual final sbatch output is
+                    // classified; let the outer retry boundary scan the whole step log
+                    // only if no marker exists.
                     def diagnosticEvidence = FailureEvidenceCollector.collectOriginatingStepEvidence(
                         pipeline,
                         submitEx,
                         [[id: "slurm-sbatch-final-failure", anyOf: [sbatchFailureMarker]]]
                     )
                     if (diagnosticEvidence.collectionStatus == "MATCHED") {
-                        throw new UserFailure("SLURM job submission failed for ${stageName}: ${diagnosticEvidence.matchedMessage}", submitEx)
+                        def finalFailure = new Exception(
+                            "SLURM job submission failed for ${stageName}: ${diagnosticEvidence.matchedMessage}",
+                            submitEx
+                        )
+                        throw FailureClassifier.classify(finalFailure, InfraFailure.SLURM)
                     }
                     throw submitEx
                 }

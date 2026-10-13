@@ -139,6 +139,18 @@ class InfraDryRunPipelineTest(unittest.TestCase):
             upload_results.index('sh "tar -czvf results-${stageName}${postTag}.tar.gz'),
         )
 
+    def test_sbatch_final_failure_is_classified_without_scanning_the_whole_step_log(
+        self,
+    ) -> None:
+        sbatch = _function_body(L0_TEST, "runLLMTestlistWithSbatch", "cbtsResizeSplits")
+
+        marker_query = '[[id: "slurm-sbatch-final-failure", anyOf: [sbatchFailureMarker]]]'
+        self.assertIn(marker_query, sbatch)
+        self.assertIn("FailureClassifier.classify(finalFailure, InfraFailure.SLURM)", sbatch)
+        self.assertNotIn(
+            "classifyFailure(pipeline, submitEx, InfraFailure.SLURM, retryContext)", sbatch
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
