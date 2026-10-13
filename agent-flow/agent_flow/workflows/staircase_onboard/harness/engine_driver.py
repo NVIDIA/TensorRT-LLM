@@ -47,8 +47,10 @@ from __future__ import annotations
 
 import argparse
 import copy
+import functools
 import importlib.util
 import json
+import os
 import random
 import sys
 import time
@@ -80,6 +82,17 @@ def build_llm(quickstart: Any, argv: list[str]) -> tuple[Any, Any]:
         args = quickstart.parse_arguments()
     finally:
         sys.argv = saved
+    mode = os.environ.get("TRTLLM_MODELING_V2")
+    llm_class = getattr(quickstart, "LLM", None)
+    if mode and llm_class is not None:
+        # The quickstart has no flag for target selection, which is the LLM-API
+        # argument `modeling_v2` (default "off"); the gates export the switch
+        # as TRTLLM_MODELING_V2. Hand it to the constructor the quickstart calls.
+        quickstart.LLM = functools.partial(llm_class, modeling_v2=mode)
+        try:
+            return quickstart.setup_llm(args)
+        finally:
+            quickstart.LLM = llm_class
     return quickstart.setup_llm(args)
 
 

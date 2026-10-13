@@ -626,6 +626,28 @@ def test_the_eval_gates_carry_the_declared_runtime_configuration(tmp_path):
     assert parts[-1] == "gsm8k"
 
 
+def test_the_accuracy_command_selects_the_target_through_the_llm_api(tmp_path):
+    """Nothing in the engine reads TRTLLM_MODELING_V2 any more: target selection is the
+    LLM-API argument `modeling_v2`, default "off". A gate that only exported the switch
+    served the built-in model and recorded the verdict as the target's."""
+    from dataclasses import replace
+
+    import yaml
+
+    from agent_flow.workflows.staircase_onboard.gates import MODELING_V2_ENV, eval_command
+
+    options = tmp_path / "llm_api.yaml"
+    options.write_text("kv_cache_config: {dtype: fp8}\n", encoding="utf-8")
+    environment = resolve_environment({"environment": {"kind": "local", "python": "/py"}}, world_size=1)
+    environment = replace(environment, env={**environment.env, MODELING_V2_ENV: "require"})
+    task = {"checkpoint_path": "/ckpt", "parallel": "tp1", "accuracy": {"llm_api_options": str(options)}}
+    joined = " ".join(eval_command(task, environment, "gsm8k"))
+    used = joined.split('--extra_llm_api_options="', 1)[1].split('"', 1)[0]
+    merged = yaml.safe_load(open(used, encoding="utf-8"))
+    assert merged["modeling_v2"] == "require"
+    assert merged["kv_cache_config"] == {"dtype": "fp8"}
+
+
 def test_the_benchmark_stays_last_when_a_dataset_path_is_present():
     """MMLU needs --dataset_path, and it follows the positional benchmark."""
     from agent_flow.workflows.staircase_onboard.gates import eval_command

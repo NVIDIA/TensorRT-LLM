@@ -1181,6 +1181,13 @@ def eval_command(
     ]
     options = resolve_llm_api_options(accuracy, unit)
     overlay = member_llm_api_overlay(member)
+    mode = environment.env.get(MODELING_V2_ENV)
+    if mode:
+        # Target selection is the LLM-API argument `modeling_v2`; nothing in
+        # the engine reads the environment switch any more. Without this the
+        # gate serves the built-in model (the argument defaults to "off") and
+        # its verdict reads as the target's.
+        overlay = {**overlay, "modeling_v2": mode}
     if overlay:
         # `trtllm-eval` has no attention-DP flag, so a `dep` member can only
         # be served through the options YAML. Writing a merged copy rather
