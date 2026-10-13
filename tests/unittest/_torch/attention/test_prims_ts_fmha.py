@@ -88,7 +88,6 @@ class _Attention:
         self.v_head_dim = 128 if is_mla else None
         self.predicted_tokens_per_seq = 1
         self.sparse_params = None
-        self.quant_attention_config = None
         self.skip_correction_threshold = 0.0
         self.position_embedding_type = 0
         self.quant_mode = 0
@@ -2343,10 +2342,9 @@ def test_cache_free_context_plans_contiguous_wrapper_once(monkeypatch: pytest.Mo
     wrapper_factory = Mock(return_value=wrapper)
     monkeypatch.setattr(prims_context_module, "BatchPrefillTSWrapper", wrapper_factory)
     batch_size, seq_len = 2, 16
-    q = torch.empty(
-        (batch_size * seq_len, (attn.num_heads + 2 * attn.num_kv_heads) * attn.head_dim),
-        dtype=torch.bfloat16,
-    )
+    q = torch.empty((batch_size * seq_len, attn.num_heads * attn.head_dim), dtype=torch.bfloat16)
+    k = torch.empty((batch_size * seq_len, attn.num_kv_heads * attn.head_dim), dtype=torch.bfloat16)
+    v = torch.empty_like(k)
     output = torch.empty(
         (batch_size * seq_len, attn.num_heads * attn.head_dim), dtype=torch.bfloat16
     )
@@ -2363,8 +2361,8 @@ def test_cache_free_context_plans_contiguous_wrapper_once(monkeypatch: pytest.Mo
         attention_mask=PredefinedAttentionMask.FULL,
     )
 
-    fmha.forward(q, None, None, metadata, forward_args)
-    fmha.forward(q, None, None, metadata, forward_args)
+    fmha.forward(q, k, v, metadata, forward_args)
+    fmha.forward(q, k, v, metadata, forward_args)
 
     wrapper_factory.assert_called_once_with()
     wrapper.plan.assert_called_once()
@@ -2379,6 +2377,8 @@ def test_cache_free_context_plans_contiguous_wrapper_once(monkeypatch: pytest.Mo
     run_args, run_kwargs = wrapper.run.call_args
     assert tuple(run_args[0].shape) == (batch_size, seq_len, attn.num_heads, attn.head_dim)
     assert tuple(run_args[2].shape) == (batch_size, seq_len, attn.num_kv_heads, attn.head_dim)
+    assert run_args[0].data_ptr() == q.data_ptr()
+    assert run_args[2].data_ptr() == v.data_ptr()
     assert run_kwargs["out"].data_ptr() == output.data_ptr()
     assert run_kwargs["scale_softmax_log2"] is None
     assert run_kwargs["output_scale"] is None

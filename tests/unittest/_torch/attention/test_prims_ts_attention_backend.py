@@ -1283,19 +1283,23 @@ def test_prims_ts_decode_wrappers_share_workspace_across_serialized_layers() -> 
         torch.testing.assert_close(actual, reference, atol=3e-2, rtol=3e-3)
 
 
-def _build_trtllm_attention_with_recipe(monkeypatch: pytest.MonkeyPatch, recipe) -> None:
-    """Make the shared harness pass the attention recipe to the TRTLLM layer it builds."""
+def _forward_with_recipe(monkeypatch: pytest.MonkeyPatch, recipe) -> None:
+    """Make the shared harness send separate Q/K/V with the per-tensor recipe flags."""
     import backend_case
 
-    create_attention = backend_case.create_attention
+    from tensorrt_llm._torch.attention.backends.interface import AttentionForwardArgs
+    from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention
 
-    def create_attention_with_recipe(backend, **kwargs):
-        attn = create_attention(backend, **kwargs)
-        if backend == "TRTLLM":
-            attn.quant_attention_config = recipe
-        return attn
-
-    monkeypatch.setattr(backend_case, "create_attention", create_attention_with_recipe)
+    monkeypatch.setattr(TrtllmAttention, "support_fused_qkv", classmethod(lambda cls: False))
+    monkeypatch.setattr(
+        backend_case,
+        "AttentionForwardArgs",
+        functools.partial(
+            AttentionForwardArgs,
+            qk_fp8_per_tensor=recipe.qk_dtype == "fp8",
+            v_fp8_per_tensor=recipe.v_dtype == "fp8",
+        ),
+    )
 
 
 _CACHE_FREE_CASE = dict(
@@ -1325,8 +1329,8 @@ def test_prims_ts_cache_free_fp8_recipes(
     from tensorrt_llm._torch.attention.backends.prims_ts.context import BatchPrefillTSWrapper
     from tensorrt_llm.visual_gen.args import QuantAttentionConfig
 
-    recipe = QuantAttentionConfig(qk_dtype=qk_dtype, v_dtype=v_dtype, algorithm="primsts")
-    _build_trtllm_attention_with_recipe(monkeypatch, recipe)
+    recipe = QuantAttentionConfig(qk_dtype=qk_dtype, v_dtype=v_dtype)
+    _forward_with_recipe(monkeypatch, recipe)
     plans: list[dict] = []
     runs: list[dict] = []
     plan, run = BatchPrefillTSWrapper.plan, BatchPrefillTSWrapper.run
@@ -1396,11 +1400,11 @@ def test_prims_ts_cache_free_fp8_recipes(
 
 
 def test_prims_ts_recipe_requires_prims_ts_library(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A PrimTS recipe fails instead of running unquantized on another FMHA library."""
+    """A per-tensor recipe fails instead of running unquantized on another FMHA library."""
     from tensorrt_llm.visual_gen.args import QuantAttentionConfig
 
-    recipe = QuantAttentionConfig(qk_dtype="bf16", v_dtype="fp8", algorithm="primsts")
-    _build_trtllm_attention_with_recipe(monkeypatch, recipe)
+    recipe = QuantAttentionConfig(qk_dtype="bf16", v_dtype="fp8")
+    _forward_with_recipe(monkeypatch, recipe)
     monkeypatch.delenv("TLLM_FMHA_LIBS", raising=False)
     case = BackendCase(**_CACHE_FREE_CASE)
 

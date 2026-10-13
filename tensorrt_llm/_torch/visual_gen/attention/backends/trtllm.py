@@ -191,7 +191,7 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
     - Metadata creation and preparation
     - No KV cache operation
     - SageAttention per-block QKV quantization (when a quant_attention_config is provided. requires unfused QKV)
-    - PrimTS per-tensor FP8 recipes (quant_attention_config with algorithm primsts, fused QKV)
+    - PrimTS per-tensor FP8 recipes (quant_attention_config with zero block sizes, requires unfused QKV)
     - Separate-QKV forwarding for generic block-sparse attention and backends that reject fused QKV
     """
 
@@ -223,7 +223,6 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
             head_dim=head_dim,
             quant_config=quant_config,
             sparse_params=sparse_params,
-            quant_attention_config=quant_attention_config,
             dtype=dtype,
         )
 
@@ -233,6 +232,18 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
         self.metadata = TrtllmAttentionMetadata(
             attention_metadata_state=attention_metadata_state,
         )
+
+        self.quant_attention_config = quant_attention_config
+        if (
+            quant_attention_config is not None
+            and quant_attention_config.q_block_size == 0
+            and not any(fmha.supports_per_tensor_fp8 for fmha in self._fmha_manager.fmha_libs)
+        ):
+            raise RuntimeError(
+                "The per-tensor FP8 attention recipe needs the PrimTS FMHA library "
+                "(TLLM_FMHA_LIBS=+prims_ts), which is not enabled or not available on this "
+                "platform."
+            )
 
     @property
     def timestep_cutoff(self) -> Optional[float]:
@@ -376,7 +387,7 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
         # self-attention from fused QKV only.
         use_separate_qkv = (
             block_sparse_inputs is not None
-            or (self.quant_attention_config is not None and not self.support_fused_qkv())
+            or self.quant_attention_config is not None
             or (not self.support_fused_qkv() and self.should_use_sparse(sparse_attn_phase))
         )
         if use_separate_qkv and (k is None or v is None):
@@ -399,6 +410,9 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
                     "sage_attn_num_elts_per_blk_v": quant_cfg.v_block_size,
                     "sage_attn_qk_int8": quant_cfg.qk_dtype == "int8",
                     "sage_attn_smooth_k": quant_cfg.smooth_k,
+                    "qk_fp8_per_tensor": quant_cfg.q_block_size == 0
+                    and quant_cfg.qk_dtype == "fp8",
+                    "v_fp8_per_tensor": quant_cfg.v_block_size == 0 and quant_cfg.v_dtype == "fp8",
                 }
         else:
             if k is None and v is None:
@@ -428,7 +442,5 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
         return self._preferred_layout
 
     def support_fused_qkv(self) -> bool:
-        """Standard and PrimTS paths fuse QKV. SageAttention does not."""
-        return (
-            self.quant_attention_config is None or self.quant_attention_config.algorithm != "sage"
-        )
+        """Standard path fuses QKV; SageAttention path does not."""
+        return self.quant_attention_config is None
