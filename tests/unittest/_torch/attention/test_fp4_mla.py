@@ -1222,6 +1222,8 @@ def _materialize_reference_cache_tokens(
     batch_indices: torch.Tensor,
     positions: torch.Tensor,
     head_dim: int,
+    *,
+    include_k_residual: bool = False,
 ) -> torch.Tensor:
     kv_cache, sf_cache = metadata.kv_cache_manager.get_fp4_mla_cache_buffers(layer_idx)
     sf_cache = sf_cache.view(torch.float8_e4m3fn)
@@ -1247,7 +1249,16 @@ def _materialize_reference_cache_tokens(
                 sf_per_token=storage_head_dim // FP4_BLOCK_SIZE,
                 global_scale=static_global_scale,
             )
-        tokens.append(dequantized_pages[physical_page][page_position, :head_dim])
+        token = dequantized_pages[physical_page][page_position, :head_dim].clone()
+        if include_k_residual:
+            # The K residual is stored after head_dim and added back onto the
+            # RoPE tail, as the chunked-cache gather kernel does.
+            residual_end = head_dim + FP4_MLA_K_RESIDUAL_DIM
+            token[-FP4_MLA_K_RESIDUAL_DIM:] += dequantized_pages[physical_page][
+                page_position,
+                head_dim:residual_end,
+            ]
+        tokens.append(token)
     return torch.stack(tokens, dim=0)
 
 
@@ -2083,9 +2094,10 @@ def test_fp4_mla_context_tail_uses_draft_slack_ring(
         torch.cuda.synchronize()
 
         hp_page = int(metadata.fp4_mla_state.hp_page_indices[0].item())
-        hp_ring = metadata.fp4_mla_state.hp_pool.view(
-            metadata.fp4_mla_state.hp_pool.shape[0], 1, 1, ring_size, head_dim
-        )
+        # hp_pool is [pages, FP4 MLA layers, kv_factor, ring * head_dim]; with
+        # MTP the draft layer adds a second FP4 layer. Layer 0 is the target.
+        hp_pool = metadata.fp4_mla_state.hp_pool
+        hp_ring = hp_pool.view(*hp_pool.shape[:3], ring_size, head_dim)
         torch.testing.assert_close(
             hp_ring[hp_page, 0, 0, expected_slot],
             latent[-1],
