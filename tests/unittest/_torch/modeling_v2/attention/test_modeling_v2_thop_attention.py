@@ -3080,7 +3080,7 @@ class _MlaPagedEnv:
                 mask_type=mask_type,
                 quant_mode=self.quant_mode,
                 q_scaling=self.q_scaling,
-                position_embedding_type=POSITION_EMBEDDING_TYPE_YARN,
+                position_embedding_type=self.position_embedding_type,
                 rope_dim=QK_ROPE_HEAD_DIM,
                 rope_base=self.rope_scalars.rope_base,
                 rope_scale_type=self.rope_scalars.rope_scale_type,

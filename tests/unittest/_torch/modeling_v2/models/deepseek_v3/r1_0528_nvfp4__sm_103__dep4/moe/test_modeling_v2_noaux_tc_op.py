@@ -100,7 +100,12 @@ def test_kimi_k3_config() -> None:
         weights, ids = op(logits, bias, 1, 1, 16, 1.0)
         ref_weights, ref_ids = op.reference(logits, bias, 1, 1, 16, 1.0)
         assert torch.equal(ids, ref_ids)
-        torch.testing.assert_close(weights, ref_weights)
+        torch.testing.assert_close(
+            weights, ref_weights, rtol=torch.finfo(logits.dtype).eps, atol=0.0
+        )
+        assert int((weights != ref_weights).sum()) <= 1 + weights.numel() // 10000
+        assert ids.dtype == torch.int32 and ids.device == logits.device
+        assert weights.is_contiguous() and ids.is_contiguous()
         assert int(ids.min()) >= 0 and int(ids.max()) < 896
         assert (torch.sort(ids, dim=-1).values.diff(dim=-1) > 0).all()
         torch.testing.assert_close(
