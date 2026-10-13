@@ -1158,9 +1158,14 @@ class Qwen3VisionModel(torch.nn.Module, MultimodalEncoderMixin):
             if graph_outputs is not None:
                 # Replay outputs borrow graph-owned buffers; the mergers run
                 # eagerly so the returned features own their storage.
+                # Blocks emit deepstack states in layer order; each merger's
+                # checkpoint index follows deepstack_visual_indexes instead.
+                mergers = [
+                    self.deepstack_merger_list[merger_idx]
+                    for _, merger_idx in sorted(self._deepstack_layer_to_merger_idx.items())
+                ]
                 return self.merger(graph_outputs["hidden_states"]), [
-                    merger(graph_outputs[f"deepstack_{idx}"])
-                    for idx, merger in enumerate(self.deepstack_merger_list)
+                    merger(graph_outputs[f"deepstack_{idx}"]) for idx, merger in enumerate(mergers)
                 ]
 
         hidden_states, deepstack_features = self._run_encoder_blocks(
