@@ -118,14 +118,14 @@ class TestBuildCases:
         assert cases
         assert "NIXL/PYTHON has no supported cache manager version" in caplog.text
 
-    def test_submit_rejects_empty_matrix_before_launch(self, sample_cfg, capsys):
+    def test_submit_rejects_empty_matrix_before_launch(self, sample_cfg, capfd):
         """Submission fails before reserving GPUs for an unsupported matrix."""
         sample_cfg["test_matrix"]["combinations"] = [{"backend": "NIXL", "runtime": "PYTHON"}]
         sample_cfg["test_matrix"]["cache_manager_versions"] = ["V1"]
         with pytest.raises(SystemExit) as error:
             validate(sample_cfg)
         assert error.value.code == 1
-        assert "Test matrix contains no supported cases" in capsys.readouterr().err
+        assert "Test matrix contains no supported cases" in capfd.readouterr().err
 
     def test_basic(self, sample_cfg):
         cases = build_cases(sample_cfg)
