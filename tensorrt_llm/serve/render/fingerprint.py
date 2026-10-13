@@ -101,6 +101,9 @@ def _tokenizer_digest(tokenizer: Any) -> Dict[str, Any]:
     """
     inner = getattr(tokenizer, "tokenizer", tokenizer)
     info: Dict[str, Any] = {"class": f"{type(inner).__module__}.{type(inner).__qualname__}"}
+    # Which end of the prompt ``truncate_prompt_tokens`` keeps; it is tokenizer state, not part
+    # of the serialized encoding.
+    info["truncation_side"] = getattr(inner, "truncation_side", None)
     get_vocab = getattr(inner, "get_vocab", None)
     if callable(get_vocab):
         try:
@@ -163,13 +166,18 @@ def _resolved_templates(res: "RenderResources") -> Dict[str, Optional[str]]:
     from tensorrt_llm.inputs.utils import resolve_hf_chat_template
 
     inner = getattr(res.tokenizer, "tokenizer", res.tokenizer)
+    # A request can select a named template (``chat_template="alternate"``) from a dict-valued
+    # tokenizer template, so every variant is part of the identity, not only the defaults.
+    named = getattr(inner, "chat_template", None)
+    resolved: Dict[str, Optional[str]] = {
+        "named": _sha256(named if isinstance(named, dict) else None)
+    }
     if not any(
         getattr(source, "chat_template", None) is not None for source in (res.processor, inner)
     ) and (res.default_chat_template is None):
         # No Jinja template anywhere (a tokenizer-native renderer): the tokenizer's own
         # identity covers it, and the resolver would only log a warning.
-        return {"without_tools": None, "with_tools": None}
-    resolved: Dict[str, Optional[str]] = {}
+        return {**resolved, "without_tools": None, "with_tools": None}
     for shape, tools in (("without_tools", None), ("with_tools", [{}])):
         try:
             template = resolve_hf_chat_template(

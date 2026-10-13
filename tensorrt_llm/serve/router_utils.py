@@ -318,12 +318,15 @@ class BlockHashMixin:
                     "config); it renders as a generic text model. Models that need a serving "
                     "extension or Harmony route on estimated ids and never forward them."
                 )
+            use_harmony = uses_harmony_tokenization(
+                use_harmony=self._use_harmony, model_type_resolver=self._get_model_type
+            )
             resources = RenderResources.from_tokenizer(
-                self._get_tokenizer(model),
+                # Harmony renders token ids itself. Loading a tokenizer here would fail for a
+                # client that sends the served name when no tokenizer directory is configured.
+                None if use_harmony else self._get_tokenizer(model),
                 model_type=model_type,
-                use_harmony=uses_harmony_tokenization(
-                    use_harmony=self._use_harmony, model_type_resolver=self._get_model_type
-                ),
+                use_harmony=use_harmony,
                 custom_tokenizer=self._custom_tokenizer,
             )
             cache[model] = resources

@@ -16,7 +16,8 @@
 
 from __future__ import annotations
 
-from typing import Any
+import threading
+from typing import Any, Optional
 
 import pytest
 
@@ -59,6 +60,32 @@ class TestTokenizePrompt:
     def test_truncation_keeps_the_leading_tokens(self, tokenizer) -> None:
         ids = tokenize_prompt(tokenizer, PROMPT, add_special_tokens=False, truncate_prompt_tokens=3)
         assert ids == [3, 4, 5]
+
+    def test_truncating_and_plain_encodes_can_share_a_tokenizer_across_threads(
+        self, tokenizer
+    ) -> None:
+        # A fast tokenizer truncates by changing its own state; a plain encode that overlaps
+        # fails with "Already borrowed". Truncation runs on a private copy instead.
+        errors: list = []
+
+        def run(truncate: Optional[int], expected: list) -> None:
+            try:
+                for _ in range(300):
+                    ids = tokenize_prompt(
+                        tokenizer, PROMPT, add_special_tokens=False, truncate_prompt_tokens=truncate
+                    )
+                    assert ids == expected
+            except Exception as error:  # noqa: BLE001
+                errors.append(error)
+
+        threads = [threading.Thread(target=run, args=(3, [3, 4, 5])) for _ in range(4)]
+        threads += [threading.Thread(target=run, args=(None, [3, 4, 5, 3, 4])) for _ in range(4)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        assert not errors, errors[:1]
 
     def test_missing_tokenizer_is_rejected(self) -> None:
         with pytest.raises(ValueError, match="tokenizer is required"):
