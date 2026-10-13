@@ -7,6 +7,11 @@ source "$(dirname "${BASH_SOURCE[0]}")/github_auth.sh"
 GITHUB_URL="https://github.com"
 UCX_INSTALL_PATH="/usr/local/ucx/"
 LIBFABRIC_INSTALL_PATH="/opt/amazon/efa"
+# Use bundled EFA only when its development files are available.
+if [[ ! -f "${LIBFABRIC_INSTALL_PATH}/include/rdma/fabric.h" ||
+      ! -f "${LIBFABRIC_INSTALL_PATH}/lib/libfabric.so" ]]; then
+    LIBFABRIC_INSTALL_PATH=""
+fi
 CUDA_PATH="/usr/local/cuda"
 NIXL_VERSION="v1.4.0"
 NIXL_REPO="https://github.com/ai-dynamo/nixl.git"
@@ -39,7 +44,7 @@ CUDA_SO_PATH=$(dirname $CUDA_SO_PATH)
 export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:$CUDA_SO_PATH
 meson setup builddir \
     -Ducx_path=$UCX_INSTALL_PATH \
-    -Dlibfabric_path=$LIBFABRIC_INSTALL_PATH \
+    -Dlibfabric_path="${LIBFABRIC_INSTALL_PATH}" \
     -Dcudapath_lib="$CUDA_PATH/lib64" \
     -Dcudapath_inc="$CUDA_PATH/include" \
     -Dgds_path="$GDS_PATH" \
