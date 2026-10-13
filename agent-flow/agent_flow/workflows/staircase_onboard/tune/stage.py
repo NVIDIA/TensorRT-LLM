@@ -27,7 +27,7 @@ import yaml
 from .campaign import Campaign, gate_command, read_decision
 from .ladder import BenchSpec, Ladder, SpoolRunner, default_rungs, rungs_from_spec
 from .records import Measurement, NoiseFloor, PerfLedger, format_table
-from .requests import CampaignContext, render_request, turn_prompt
+from .requests import CampaignContext, render_rebase_request, render_request, turn_prompt
 from .worktree import open_candidate
 
 PACKAGE = Path(__file__).resolve().parent.parent
@@ -306,11 +306,21 @@ class TuneStage:
                         decision = s.workdir / "candidates" / slug / "decision.yaml"
                         try:
                             read_decision(decision)
+                            if slug in camp.state.candidates and camp.state.candidates[slug].status not in ("conflict", "blocked"):
+                                continue
                             camp.submit_candidate(slug, decision)
                         except (OSError, ValueError) as exc:
                             self.log(f"[tune] {slug}: no valid decision ({exc}); counted as a miss")
                             misses += 1
                 busy = camp.step()
+                for st in list(camp.state.candidates.values()):
+                    key = f"rebase-{st.slug}"
+                    if st.status == "conflict" and not self.t.get(key) and st.slug not in futures and st.worktree:
+                        # A textual conflict with an earlier keep is not a verdict: rebase and retry, once.
+                        self.t[key] = True
+                        req = render_rebase_request(self._context(self._standings()), slug=st.slug,
+                                                    worktree=Path(st.worktree), best_branch="tune/best", reason=st.reason)
+                        futures[st.slug] = pool.submit(self.dispatch, "tuner", f"rebase-{st.slug}", turn_prompt(PACKAGE, req))
                 for st in camp.state.candidates.values():
                     if st.status in ("kept",) and not self.t.get(f"counted-{st.slug}"):
                         self.t[f"counted-{st.slug}"] = True

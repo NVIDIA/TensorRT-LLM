@@ -221,3 +221,53 @@ def test_a_config_change_re_measures_against_a_control_of_that_config_and_host(t
     assert ctrl["hostname"] == cand["hostname"]
     assert st.control_label != "" and "-id-" not in st.control_label   # a control of the new config
     assert round(st.deltas["con1.tok_s_user"], 3) == 0.2
+
+
+def test_a_candidate_that_conflicts_with_a_keep_is_rebased_and_retried(tmp_path):
+    repo = _repo(tmp_path)
+    identity = tmp_path / "identity.yaml"
+    identity.write_text(yaml.safe_dump({"modeling_v2": "require"}))
+    task = {
+        "trtllm_repo_path": str(repo), "checkpoint_path": "/ckpt",
+        "perf": {"identity_configs": [str(identity)], "workload": {"isl": 8192, "osl": 1024, "concurrency": [1, 128]},
+                 "spools": ["s1"], "env_script": "/env.sh", "reference": "none", "ladder": {"enabled": False},
+                 "campaign": {"max_parallel_tuners": 1, "accuracy": {"task": "gsm8k", "anchor": 96.36}}},
+    }
+    spec = TuneSpec.from_task(task, tmp_path / "ws", target="t/")
+    turns = []
+
+    def effect(config, tree):
+        text = Path(tree, "modeling.py").read_text() if tree else ""
+        return 100.0 * (1.2 if "FAST" in text and "= True" in text else 1.0) * (1.1 if "SIDE" in text else 1.0), 2000.0
+
+    def dispatch(role, what, prompt):
+        turns.append(what)
+        ws = spec.workdir
+        if what == "roadmap":
+            (ws / "roadmap.yaml").write_text(yaml.safe_dump([{"slug": "fast-path"}, {"slug": "side-path"}]))
+            return ""
+        slug = what.removeprefix("rebase-")
+        wt = ws / "worktrees" / slug
+        if what == "fast-path":
+            (wt / "modeling.py").write_text("FAST = True\n")
+        elif what == "side-path":
+            (wt / "modeling.py").write_text("FAST = False\nSIDE = 1\n")
+        else:  # the rebase turn: resolve by keeping both sides
+            subprocess.run(["git", "-C", str(wt), "rebase", "tune/best"], capture_output=True)
+            (wt / "modeling.py").write_text("FAST = True\nSIDE = 1\n")
+            _git(wt, "add", "modeling.py")
+            subprocess.run(["git", "-C", str(wt), "-c", "core.editor=true", "rebase", "--continue"], capture_output=True)
+        if what in ("fast-path", "side-path"):
+            _git(wt, "commit", "-q", "-am", what)
+        commits = _git(wt, "rev-list", "--reverse", "tune/best..HEAD").split()
+        (ws / "candidates" / slug / "decision.yaml").write_text(
+            yaml.safe_dump({"decision": "CANDIDATE", "worktree": str(wt), "commits": commits}))
+        return ""
+
+    state: dict = {"phase": "campaign", "noise_spread": {}, "noise_samples": 0}
+    stage = TuneStage(spec, state, dispatch=dispatch, checkpoint=lambda: None,
+                      runner_factory=lambda spools, prefix: FakeRunner(spools, prefix, effect), poll_s=0, log=lambda m: None)
+    assert stage.run() == "tuned"
+    assert "rebase-side-path" in turns, turns
+    assert state["kept"] == ["fast-path", "side-path"], state
+    assert Path(state["best_tree"], "modeling.py").read_text() == "FAST = True\nSIDE = 1\n"

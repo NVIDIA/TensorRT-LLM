@@ -145,3 +145,36 @@ Operating rules for this environment:
   record and drop sub-ideas that stall.
 
 Final message: <= 25 lines: decision, files changed, test results, micro-bench table, projection, risks."""
+
+
+def render_rebase_request(ctx: CampaignContext, *, slug: str, worktree: Path, best_branch: str, reason: str) -> Path:
+    """A candidate that won on its own but does not stack on the best tree: rebase it.
+
+    Parallel candidates written from one base collide in the forward file once
+    one of them is kept; the textual conflict is not a verdict on either."""
+    out_dir = ctx.campaign_dir / "candidates" / slug
+    out_dir.mkdir(parents=True, exist_ok=True)
+    text = f"""# Tuner request: rebase {slug}
+
+Kind: REBASE. Your candidate does not stack on the campaign's best tree `{best_branch}`:
+
+```
+{reason[:1500]}
+```
+
+1. `git -C {worktree} rebase {best_branch}`; resolve every conflict so BOTH sides keep their intent (the
+   best tree's kept changes untouched, your candidate's change applied on top -- in both PrefillTarget and
+   DecodeTarget where it applies). Read your own `decision.yaml` in `{out_dir}` for what the candidate does.
+2. Run the target tests that cover both sides plus the claims / target-contract / weight-table tests on the
+   dev spools ({', '.join(f'`{s}`' for s in ctx.dev_spools)}; launch + poll, `--tree {worktree}`, env script
+   `{ctx.env_script}`).
+3. Commit with `git -C {worktree} commit -s` if you changed code beyond the conflict markers. Do not push.
+4. Update `{out_dir / 'decision.yaml'}` in place: `commits:` = `git -C {worktree} rev-list --reverse
+   {best_branch}..HEAD`, `rebased_onto: <sha>`, a `notes` line on the conflict and its resolution;
+   `decision: CANDIDATE` if the tests pass, else `BLOCKED` with the failure.
+
+Embargo: {', '.join(f'`{e}`' for e in ctx.embargo)}.
+"""
+    path = out_dir / "rebase-request.md"
+    path.write_text(text)
+    return path
