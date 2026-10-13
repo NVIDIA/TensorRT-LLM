@@ -44,6 +44,7 @@ def render_request(
     deliverables: str,
     job_prefix: str,
     modeling_edits: bool = True,
+    branch: str = "",
 ) -> Path:
     out_dir = ctx.campaign_dir / "candidates" / slug
     (out_dir / "microbench").mkdir(parents=True, exist_ok=True)
@@ -72,7 +73,7 @@ Issued {time.strftime('%Y-%m-%d %H:%M %Z')} by the tune stage.
 | name | value |
 |---|---|
 | repo (main checkout, read-only for you) | `{R}` |
-| **your worktree** (edit here only) | `{worktree}`, branch `tune/{slug}` off `{base[:10]}` |
+| **your worktree** (edit here only) | `{worktree}`, branch `{branch or 'tune/' + slug}` off `{base[:10]}` |
 | target dir (inside the worktree) | `{ctx.target_dir}` |
 | target tests (inside the worktree) | `{ctx.target_tests}` |
 | package (skills, microbench, spoolctl) | `PKG = {ctx.package}` |

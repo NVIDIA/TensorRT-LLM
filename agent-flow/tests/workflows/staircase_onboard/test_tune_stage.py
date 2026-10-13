@@ -265,13 +265,13 @@ def test_a_candidate_that_conflicts_with_a_keep_is_rebased_and_retried(tmp_path)
         elif what == "side-path":
             (wt / "modeling.py").write_text("FAST = False\nSIDE = 1\n")
         else:  # the rebase turn: resolve by keeping both sides
-            subprocess.run(["git", "-C", str(wt), "rebase", "tune/best"], capture_output=True)
+            subprocess.run(["git", "-C", str(wt), "rebase", f"{stage.branch_prefix}/best"], capture_output=True)
             (wt / "modeling.py").write_text("FAST = True\nSIDE = 1\n")
             _git(wt, "add", "modeling.py")
             subprocess.run(["git", "-C", str(wt), "-c", "core.editor=true", "rebase", "--continue"], capture_output=True)
         if what in ("fast-path", "side-path"):
             _git(wt, "commit", "-q", "-am", what)
-        commits = _git(wt, "rev-list", "--reverse", "tune/best..HEAD").split()
+        commits = _git(wt, "rev-list", "--reverse", f"{stage.branch_prefix}/best..HEAD").split()
         (ws / "candidates" / slug / "decision.yaml").write_text(
             yaml.safe_dump({"decision": "CANDIDATE", "worktree": str(wt), "commits": commits}))
         return ""
@@ -612,3 +612,18 @@ def test_ground_truth_survives_a_lost_baseline_run_and_another_runs_receipts(tmp
                       log=lambda m: None)
     assert stage.ground() is True and (spec.workdir / "data" / "t-baseline" / "meta.json").exists()
     assert prefixes[0].startswith("tune") and prefixes[0] != "tune"
+
+
+def test_a_second_run_in_the_same_repository_does_not_collide_on_branches(tmp_path):
+    """A manual campaign left `tune/best` checked out in its own worktree; the stage's
+    best tree lives on a run-scoped branch, so git does not refuse it."""
+    from agent_flow.workflows.staircase_onboard.tune.worktree import open_candidate
+
+    repo = _repo(tmp_path)
+    open_candidate(repo, tmp_path / "manual", "best", "HEAD")  # holds tune/best
+    task = {"trtllm_repo_path": str(repo), "checkpoint_path": "/ckpt",
+            "perf": {"identity_configs": [str(tmp_path / "identity.yaml")], "spools": ["s1"], "env_script": "/env.sh"}}
+    stage = TuneStage(TuneSpec.from_task(task, tmp_path / "ws"), {}, dispatch=lambda *a: "", checkpoint=lambda: None,
+                      runner_factory=lambda spools, prefix: FakeRunner(spools, prefix, _effect), poll_s=0, log=lambda m: None)
+    tree = open_candidate(repo, tmp_path / "ws" / "tune" / "worktrees", "best", "HEAD", prefix=stage.branch_prefix)
+    assert _git(tree, "rev-parse", "--abbrev-ref", "HEAD") == f"{stage.branch_prefix}/best" != "tune/best"

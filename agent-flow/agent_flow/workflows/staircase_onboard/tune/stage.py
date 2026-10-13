@@ -160,6 +160,7 @@ class TuneStage:
         # "tune-t-baseline" must never adopt the first run's receipt.
         run = hashlib.sha1(str(spec.workdir.resolve()).encode()).hexdigest()[:6]
         self.runners = lambda spools, prefix: factory(spools, f"{prefix}{run}")
+        self.branch_prefix = f"tune/{run}"
         self.perf = self.runners(spec.spools, "tune")
         self.t.setdefault("phase", "ground")
 
@@ -313,11 +314,12 @@ class TuneStage:
             gate_cmd=gate_command(PACKAGE, s.env_script, s.model, float(acc.get("anchor", 0.0)), acc.get("task", "gsm8k"),
                                   tests=self._gate_tests()),
             noise=NoiseFloor(spread=dict(self.t.get("noise_spread") or {}), samples=int(self.t.get("noise_samples", 0))),
-            min_gain=float(cfg.get("min_gain", 0.01)), noise_factor=float(cfg.get("noise_factor", 3.0)), log=self.log,
+            min_gain=float(cfg.get("min_gain", 0.01)), noise_factor=float(cfg.get("noise_factor", 3.0)),
+            branch_prefix=self.branch_prefix, log=self.log,
         )  # fmt: skip
         worktrees = s.workdir / "worktrees"
         if not camp.state.best_tree:
-            camp.state.best_tree = str(open_candidate(s.repo, worktrees, "best", "HEAD"))
+            camp.state.best_tree = str(open_candidate(s.repo, worktrees, "best", "HEAD", prefix=self.branch_prefix))
             camp.state.config_overlays = list(self.t.get("config_overlays") or [])
         if not camp.state.control_label:
             ctrl = self._measure({"t-control": [*s.identity_configs, *map(Path, camp.state.config_overlays)]}, tree=camp.state.best_tree)
@@ -337,9 +339,10 @@ class TuneStage:
                     item = roadmap.pop(0)
                     slug = str(item["slug"])
                     base = camp.state.best_commit or "HEAD"
-                    wt = open_candidate(s.repo, worktrees, slug, base)
+                    wt = open_candidate(s.repo, worktrees, slug, base, prefix=self.branch_prefix)
                     req = render_request(
                         self._context(self._standings()), slug=slug, worktree=wt, base=base,
+                        branch=f"{self.branch_prefix}/{slug}",
                         hypothesis=str(item.get("hypothesis", "")), job_prefix=slug[:12],
                         deliverables=str(item.get("deliverables", "Commits, entry tests, micro-bench, decision.yaml.")),
                         modeling_edits=bool(item.get("modeling_edits", True)),
@@ -365,7 +368,7 @@ class TuneStage:
                     if st.status == "conflict" and not self.t.get(key) and st.slug not in futures and st.worktree:
                         # A textual conflict with an earlier keep is not a verdict: rebase and retry.
                         self.t[key] = True
-                        onto = st.rebase_ref if st.rebase_onto == "tune/eval-batch" else "tune/best"
+                        onto = st.rebase_ref if st.rebase_onto == "tune/eval-batch" else f"{self.branch_prefix}/best"
                         req = render_rebase_request(self._context(self._standings()), slug=st.slug,
                                                     worktree=Path(st.worktree), best_branch=onto, reason=st.reason)
                         futures[st.slug] = pool.submit(self.dispatch, "tuner", f"rebase-{st.slug}", turn_prompt(PACKAGE, req))

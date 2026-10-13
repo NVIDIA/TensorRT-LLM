@@ -57,13 +57,16 @@ def add_worktree(repo: Path, tree: Path, *args: str) -> None:
             time.sleep(5)
 
 
-def open_candidate(repo: Path, root: Path, slug: str, base: str = "HEAD") -> Path:
-    """Create (or reuse) ``root/<slug>`` on branch ``tune/<slug>`` from ``base``."""
+def open_candidate(repo: Path, root: Path, slug: str, base: str = "HEAD", prefix: str = "tune") -> Path:
+    """Create (or reuse) ``root/<slug>`` on branch ``<prefix>/<slug>`` from ``base``.
+
+    A run passes its own prefix: two campaigns in one repository must not share
+    ``tune/best`` (git refuses a branch checked out by another worktree)."""
     tree = root / slug
     if tree.exists():
         return tree
     root.mkdir(parents=True, exist_ok=True)
-    branch = f"tune/{slug}"
+    branch = f"{prefix}/{slug}"
     exists = _git(repo, "rev-parse", "--verify", "--quiet", branch, check=False)
     if exists:
         add_worktree(repo, tree, str(tree), branch)

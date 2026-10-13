@@ -133,10 +133,12 @@ class Campaign:
         noise: NoiseFloor,
         min_gain: float = 0.01,
         noise_factor: float = 3.0,
+        branch_prefix: str = "tune",
         log: Callable[[str], None] = print,
     ) -> None:
         self.workdir = workdir
         self.repo = repo
+        self.bp = branch_prefix
         self.bench = bench
         self.base_configs = list(base_configs)
         self.perf = perf_runner
@@ -302,7 +304,7 @@ class Campaign:
             if pending:
                 st.commits = pending
         eval_tree = Path(self.state.best_tree).parent / f"eval-{st.slug}"
-        branch = f"tune/eval-{st.slug}"
+        branch = f"{self.bp}/eval-{st.slug}"
         if (eval_tree / ".git").exists():
             # Reuse the checkout: moving it to the new head rewrites only the files
             # that differ, where a fresh worktree checks out the whole tree (minutes
@@ -541,10 +543,10 @@ class Campaign:
             tree = Path(self.state.best_tree).parent / "eval-batch"
             if (tree / ".git").exists():
                 git(tree, "cherry-pick", "--abort", check=False)
-                git(tree, "checkout", "-q", "-f", "-B", "tune/eval-batch", head)
+                git(tree, "checkout", "-q", "-f", "-B", f"{self.bp}/eval-batch", head)
                 git(tree, "reset", "-q", "--hard", head)
             else:
-                add_worktree(self.repo, tree, "-B", "tune/eval-batch", str(tree), head)
+                add_worktree(self.repo, tree, "-B", f"{self.bp}/eval-batch", str(tree), head)
             link_native(self.repo, tree)
             members = []
             for st in chosen:
