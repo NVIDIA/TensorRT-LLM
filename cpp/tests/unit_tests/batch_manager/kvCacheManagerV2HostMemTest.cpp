@@ -18,6 +18,7 @@
 #include "tensorrt_llm/batch_manager/kv_cache_manager_v2/exceptions.h"
 #include "tensorrt_llm/batch_manager/kv_cache_manager_v2/storage/core.h"
 #include "tensorrt_llm/batch_manager/kv_cache_manager_v2/utils/hostMem.h"
+#include "tensorrt_llm/batch_manager/kv_cache_manager_v2/utils/poison.h"
 
 #include <cuda_runtime_api.h>
 #include <gtest/gtest.h>
@@ -192,6 +193,19 @@ TEST(KvCacheManagerV2HostMemTest, AllocationSupportsGpuRoundTrip)
     auto const* bytes = reinterpret_cast<unsigned char const*>(memory.address());
     EXPECT_TRUE(std::all_of(bytes, bytes + kSize, [](unsigned char value) { return value == 0x5A; }));
     EXPECT_EQ(cudaFree(devicePtr), cudaSuccess);
+}
+
+//! A poisoned KVCM2 skips HostMem's cleanup, but the fill worker must still be
+//! joined: destroying a joinable std::thread terminates the process.
+TEST(KvCacheManagerV2HostMemTest, DestructionAfterPoisonDoesNotTerminate)
+{
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    {
+        HostMem memory(HostMem::kAlignment);
+        Poison::set("DestructionAfterPoisonDoesNotTerminate", "simulated invariant violation");
+        ASSERT_TRUE(Poison::poisoned());
+    }
+    EXPECT_TRUE(takePoison().has_value());
 }
 
 //! Small pinned buffers, such as batch metadata staging, request arbitrary byte

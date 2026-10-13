@@ -296,6 +296,9 @@ HostMem::HostMem(size_t vmSize, size_t initialSize, HostMemBackingOptions const&
 
 HostMem::~HostMem()
 {
+    // Joined outside the poison guard: once KVCM2 is poisoned the guard skips destroy(), and a
+    // joinable mFillWorker would then terminate the process when the member is destroyed.
+    joinFill();
     KVCM2_POISON_ON_EXCEPT([this]() { destroy(); });
 }
 
