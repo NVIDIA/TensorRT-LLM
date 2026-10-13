@@ -532,8 +532,11 @@ class Ladder:
             return ""
 
     def _spools_without_control(self) -> list[str]:
+        """Live sessions whose host has no control yet. A session that died (preempted,
+        its Slurm job requeued) refuses jobs; it gets a control when it is back."""
         hosts = {m.meta.get("hostname") for m in self._controls()}
-        return [s for s in self.runner.spools if self.spool_host(s) not in hosts]
+        live = set(self.runner.free_spools()) | {spool for spool, _ in self.runner.inflight.values()}
+        return [s for s in self.runner.spools if s in live and self.spool_host(s) not in hosts]
 
     def _submit(self, label: str, configs: Sequence[Path]) -> bool:
         free = self.runner.free_spools()

@@ -252,3 +252,24 @@ def test_a_probe_that_finished_while_no_process_watched_is_judged_on_resume(tmp_
             break
     assert set(again.state.kept) == {"cg-padding", "in-graph-sampling"}
     assert not any(l.startswith("w00-cg-padding") for l in runner2.submitted)  # not measured twice
+
+
+def test_a_dead_session_gets_no_control(tmp_path):
+    """A session preempted mid-ladder refuses jobs (stale heartbeat); queuing a control
+    there crashed the stage. Controls go to live sessions only."""
+
+    class OneDead(FakeRunner):
+        def free_spools(self):
+            return [s for s in super().free_spools() if s != "s3"]
+
+    rungs = [r for r in default_rungs() if r.name in ("cg-padding", "in-graph-sampling")]
+    base = tmp_path / "identity.yaml"
+    base.write_text(yaml.safe_dump({"modeling_v2": "require", "max_batch_size": 128}))
+    bench = BenchSpec(bench_py="bench.py", model="m", env_script="env.sh", isl=8192, osl=1024, concurrencies=[1, 128], tree=".")
+    runner = OneDead(["s1", "s2", "s3"], tmp_path / "work" / "data", _effect)
+    ladder = Ladder(workdir=tmp_path / "work", base_configs=[base], rungs=rungs, bench=bench, runner=runner, log=lambda m: None)
+    for _ in range(50):
+        if not ladder.step():
+            break
+    assert set(ladder.state.kept) == {"cg-padding", "in-graph-sampling"}
+    assert not any(l.endswith("control-s3") for l in runner.submitted)

@@ -384,12 +384,18 @@ class Campaign:
 
         A full filesystem (a shared quota other users fill) fails the loop's own
         small writes for minutes at a time: the step is retried on the next poll."""
+        from ..substrate.spoolctl import SpoolError
+
         try:
             return self._step()
         except OSError as exc:
             if exc.errno not in (28, 122):  # ENOSPC, EDQUOT
                 raise
             self.log(f"[campaign] {exc.strerror}; retrying on the next poll")
+            return True
+        except SpoolError as exc:
+            # A session died between choosing it and queuing on it (preempted).
+            self.log(f"[campaign] {exc}; retrying on the next poll")
             return True
 
     def _retry(self, st: CandidateState, rc: int, what: str) -> bool:

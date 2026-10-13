@@ -25,6 +25,7 @@ from typing import Any, Callable, Mapping, Sequence
 
 import yaml
 
+from ..substrate.spoolctl import SpoolError
 from .campaign import INFRA_RCS, Campaign, gate_command, read_decision
 from .ladder import BenchSpec, Ladder, SpoolRunner, default_rungs, rungs_from_spec
 from .records import Measurement, NoiseFloor, PerfLedger, format_table
@@ -235,7 +236,13 @@ class TuneStage:
             )  # fmt: skip
             seeds = [self.data / l for l in ["t-baseline", *[f"t-baseline-r{i}" for i in range(1, s.noise_repeats + 1)]]]
             lad.seed_controls([p for p in seeds if (p / "meta.json").exists()])
-            while lad.step():
+            while True:
+                try:
+                    if not lad.step():
+                        break
+                except SpoolError as exc:
+                    # A session died between choosing it and queuing on it (preempted).
+                    self.log(f"[ladder] {exc}; retrying on the next poll")
                 time.sleep(self.poll_s)
             self.t["ladder_overlay"] = lad.state.control_overlay
             self.t["ladder_kept"] = lad.state.kept
