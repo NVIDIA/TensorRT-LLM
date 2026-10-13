@@ -40,17 +40,10 @@ if(${BUILD_PYT})
     common
     SOURCES
     profilerTest.cpp
-    ../../../tensorrt_llm/common/profiler.cpp
     LINK_LIBRARIES
-    ${TORCH_LIBRARIES}
+    tllm::common_profiler
     LABELS
     "unit;common;host")
-  target_compile_definitions(
-    profilerTest
-    PRIVATE TRTLLM_ENABLE_NCCL_PROFILING=$<BOOL:${ENABLE_NCCL_PROFILING}>)
-  if(ENABLE_NCCL_PROFILING)
-    target_link_libraries(profilerTest PRIVATE CUDA::cudart)
-  endif()
   add_tllm_gtest(
     thUtilsTest
     SOURCES
