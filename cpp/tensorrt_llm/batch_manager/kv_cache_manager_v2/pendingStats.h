@@ -64,7 +64,7 @@ public:
     {
         return mRequestStats.empty() && mGlobalStats.empty() && mIterationStatsByLifeCycle.empty()
             && mSsmSnapshotIterationStatsByLifeCycle.empty() && countsByLevelEmpty(mCachedTokensByLevel)
-            && mConnectorReusedBlocksByLifeCycle.empty();
+            && mConnectorReusedBlocksByLifeCycle.empty() && mConnectorCachedTokens == 0;
     }
 
     void clear() noexcept
@@ -76,6 +76,7 @@ public:
         mReusedBlocksByLevelByLifeCycle.clear();
         mConnectorReusedBlocksByLifeCycle.clear();
         mCachedTokensByLevel.clear();
+        mConnectorCachedTokens = 0;
         mAllocationSegments.clear();
     }
 
@@ -314,6 +315,24 @@ public:
         return mCachedTokensByLevel;
     }
 
+    // Prompt tokens a KV connector loaded from an external store, the cached tokens that sit on no
+    // cache level. Manager-global like the attribution above, for the same reason.
+    bool recordConnectorCachedTokens(int64_t numTokens)
+    {
+        TLLM_CHECK_DEBUG(numTokens >= 0);
+        if (numTokens <= 0)
+        {
+            return false;
+        }
+        mConnectorCachedTokens += numTokens;
+        return true;
+    }
+
+    [[nodiscard]] int64_t connectorCachedTokens() const noexcept
+    {
+        return mConnectorCachedTokens;
+    }
+
 private:
     static PendingStatsDelta allocationDelta(
         PendingAllocationSegment const& segment, BlockOrdinal blockBegin, BlockOrdinal blockEnd)
@@ -411,6 +430,7 @@ private:
     ReusedBlocksByLevelByLifeCycle mReusedBlocksByLevelByLifeCycle;
     ConnectorReusedBlocksByLifeCycle mConnectorReusedBlocksByLifeCycle;
     CountsByLevel mCachedTokensByLevel;
+    int64_t mConnectorCachedTokens{0};
     std::vector<PendingAllocationSegment> mAllocationSegments;
 };
 

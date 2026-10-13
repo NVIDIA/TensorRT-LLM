@@ -295,6 +295,10 @@ public:
     // Return the per-cache-level cached-token counts accumulated since the last drain and reset
     // them.
     CountsByLevel getAndResetIterationCachedTokensByLevel();
+    // The cached tokens a KV connector loaded from an external store, which sit on no cache level
+    // and so are not in the per-level counts. Committed alongside them.
+    void commitConnectorCachedTokens(int64_t numTokens);
+    int64_t getAndResetIterationConnectorCachedTokens();
     // Return {suspended, resumed} counts since the last drain and reset them.
     // Both counters track the same population, so the running
     // (suspended - resumed) total is the number of requests still parked in
@@ -470,6 +474,7 @@ private:
     int64_t mIterResumedRequests{0};
     int64_t mIterDiskPrefetchBlocks{0};
     CountsByLevel mIterCachedTokensByLevel;
+    int64_t mIterConnectorCachedTokens{0};
 };
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

@@ -48,8 +48,8 @@ class FakeKvCache:
     def close(self) -> None:
         self.closed = True
 
-    def record_connector_reuse(self, block_begin, block_end):
-        self.connector_reuse_calls.append((block_begin, block_end))
+    def record_connector_reuse(self, token_begin, token_end):
+        self.connector_reuse_calls.append((token_begin, token_end))
 
     def discard_pending_stats(self) -> None:
         pass
@@ -455,22 +455,23 @@ class TestOfferIsClamped:
 
 
 class TestConnectorReuseStats:
-    """Served blocks are rebooked from missed to reused.
+    """The served token span is reported to the core's stats.
 
-    The scheduling pass books every block it allocates as a miss. Only the
-    blocks the connector fills completely, past the local match, are reused.
+    The span runs from the local match to the honoured end. The core counts
+    its tokens as connector cached tokens and rebooks the blocks they fill
+    completely from missed to reused.
     """
 
-    def test_the_served_full_blocks_are_rebooked(self):
+    def test_the_served_span_is_recorded(self):
         connector = FakeConnectorManager(num_matched=96)
         manager = make_manager(connector)
         kv_cache = FakeKvCache(committed=32, capacity=PROMPT_LEN)
 
         assert serve(manager, FakeRequest(), kv_cache)
 
-        assert kv_cache.connector_reuse_calls == [(1, 4)]
+        assert kv_cache.connector_reuse_calls == [(32, 128)]
 
-    def test_a_partially_filled_last_block_stays_a_miss(self):
+    def test_the_span_ends_at_the_honoured_position(self):
         connector = FakeConnectorManager(num_matched=PROMPT_LEN)
         manager = make_manager(connector)
         req = FakeRequest()
@@ -479,16 +480,16 @@ class TestConnectorReuseStats:
         assert serve(manager, req, kv_cache)
 
         assert req.context_current_position == PROMPT_LEN - 1
-        assert kv_cache.connector_reuse_calls == [(0, PROMPT_LEN // TOKENS_PER_BLOCK - 1)]
+        assert kv_cache.connector_reuse_calls == [(0, PROMPT_LEN - 1)]
 
-    def test_a_partially_matched_first_block_stays_a_miss(self):
+    def test_the_span_starts_at_a_mid_block_local_match(self):
         connector = FakeConnectorManager(num_matched=47)
         manager = make_manager(connector)
         kv_cache = FakeKvCache(committed=17, capacity=PROMPT_LEN)
 
         assert serve(manager, FakeRequest(), kv_cache)
 
-        assert kv_cache.connector_reuse_calls == [(1, 2)]
+        assert kv_cache.connector_reuse_calls == [(17, 64)]
 
     def test_nothing_is_rebooked_when_nothing_is_served(self):
         connector = FakeConnectorManager(num_matched=0)
@@ -991,7 +992,7 @@ class TestPrefixReservations:
         manager.report_batch_to_connector(scheduled(req))
 
         assert len(connector.accepted) == 1
-        assert cache.connector_reuse_calls == [(0, 2)]
+        assert cache.connector_reuse_calls == [(0, 64)]
 
     def test_an_unaccepted_reservation_is_not_rebooked(self) -> None:
         manager, connector, req, cache = self.prepare()

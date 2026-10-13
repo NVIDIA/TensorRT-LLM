@@ -461,11 +461,15 @@ class MetricsCollector:
                 "the index into the configured tier list and cache_tier names "
                 "the memory backing it, so a deployment with a hot and a cold "
                 "GPU level reports them as two series sharing the gpu name. "
-                "Pages already prefetched from disk to host count as host."),
+                "Pages already prefetched from disk to host count as host. "
+                "Tokens a KV cache connector loaded from an external store "
+                "are reported as cache_tier=connector with an empty "
+                "cache_level, since the store is not a configured level."),
             labelnames=self.labels_with_cache_level.keys())
         # The configured levels are only known once stats arrive; children are created then so
         # that zero-valued levels are still visible before their first cache hit.
         self._registered_cache_levels = False
+        self._registered_connector_cache_tier = False
         self.histogram_tokens_cached_prompt = Histogram(
             name=self.metric_prefix + "prompt_cached_tokens_per_request",
             documentation="Histogram of cached prompt tokens per request.",
@@ -613,6 +617,25 @@ class MetricsCollector:
                 self._log_counter(self.counter_tokens_cached_prompt_by_tier,
                                   self._cache_level_labels(level, level_tiers),
                                   count)
+
+    def _log_connector_cached_tokens(self, count: Optional[int]) -> None:
+        """Log cached prompt tokens a KV cache connector loaded from an external store.
+
+        Reported only when a connector can serve tokens, so the series appears only then.
+        """
+        if count is None:
+            return
+        labels = {
+            self.labelname_cache_level: "",
+            self.labelname_cache_tier: "connector",
+        }
+        if not self._registered_connector_cache_tier:
+            self.counter_tokens_cached_prompt_by_tier.labels(
+                **self._label_merge(labels))
+            self._registered_connector_cache_tier = True
+        if count > 0:
+            self._log_counter(self.counter_tokens_cached_prompt_by_tier, labels,
+                              count)
 
     def _log_gauge(self, gauge, data: Union[int, float]) -> None:
         # Convenience function for logging to gauge.
@@ -890,6 +913,8 @@ class MetricsCollector:
         self._log_cached_tokens_by_level(
             iteration_stats.get("iterCachedTokensByLevel"),
             iteration_stats.get("kvCacheLevelTiers"))
+        self._log_connector_cached_tokens(
+            iteration_stats.get("iterConnectorCachedTokens"))
 
         kv_iter = iteration_stats.get("kvCacheIterationStats")
         kv_iter_by_lifecycle = iteration_stats.get(

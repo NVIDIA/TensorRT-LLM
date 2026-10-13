@@ -677,6 +677,24 @@ CountsByLevel KvCacheManager::getAndResetIterationCachedTokensByLevel()
     return counts;
 }
 
+void KvCacheManager::commitConnectorCachedTokens(int64_t numTokens)
+{
+    TLLM_CHECK_DEBUG(numTokens >= 0);
+    if (!mConfig.enableStats)
+    {
+        return;
+    }
+    mIterConnectorCachedTokens += numTokens;
+}
+
+int64_t KvCacheManager::getAndResetIterationConnectorCachedTokens()
+{
+    auto const apiLock = lockExclusive();
+    auto const numTokens = mIterConnectorCachedTokens;
+    mIterConnectorCachedTokens = 0;
+    return numTokens;
+}
+
 std::pair<int64_t, int64_t> KvCacheManager::getAndResetIterationSuspendResumeStats()
 {
     auto const apiLock = lockExclusive();

@@ -1072,6 +1072,7 @@ KVCacheStatsDelta KvCache::commitPendingStats()
         mManager->commitReusedBlocksByLevel(mPendingStats.reusedBlocksByLevelByLifeCycle());
         mManager->commitConnectorReusedBlocks(mPendingStats.connectorReusedBlocksByLifeCycle());
         mManager->commitCachedTokensByLevel(mPendingStats.cachedTokensByLevel());
+        mManager->commitConnectorCachedTokens(mPendingStats.connectorCachedTokens());
     }
     KVCacheStatsDelta const requestStats
         = _shouldRecordRequestStats() ? mPendingStats.requestStats().copy() : KVCacheStatsDelta{};
@@ -1088,10 +1089,22 @@ void KvCache::discardPendingStats()
     mManager->clearStatsDirty(id);
 }
 
-void KvCache::recordConnectorReuse(BlockOrdinal blockBegin, BlockOrdinal blockEnd)
+void KvCache::recordConnectorReuse(int tokenBegin, int tokenEnd)
 {
     KVCM2_REJECT_IF_POISONED();
-    if (mPendingStats.recordConnectorReuse(blockBegin, blockEnd))
+    TLLM_CHECK_DEBUG(0 <= tokenBegin);
+    if (tokenBegin >= tokenEnd)
+    {
+        return;
+    }
+    BlockOrdinal const blockBegin{divUp(tokenBegin, mTokensPerBlock)};
+    BlockOrdinal const blockEnd{tokenEnd / mTokensPerBlock};
+    bool changed = mPendingStats.recordConnectorReuse(blockBegin, blockEnd);
+    if (_shouldRecordManagerStats())
+    {
+        changed |= mPendingStats.recordConnectorCachedTokens(tokenEnd - tokenBegin);
+    }
+    if (changed)
     {
         _refreshStatsDirtyState();
     }
