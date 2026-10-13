@@ -8,19 +8,22 @@ import threading
 import time
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
-from queue import Empty
+from queue import Empty, Queue
+from unittest.mock import Mock
 
 import pytest
 import torch
 import zmq
 
-from tensorrt_llm._utils import mpi_world_size
+from tensorrt_llm._utils import mpi_world_size, nvtx_range_debug
 from tensorrt_llm.bindings import executor as tllm
 from tensorrt_llm.disaggregated_params import DisaggregatedParams
 from tensorrt_llm.executor import (DetokenizedGenerationResultBase,
                                    GenerationRequest, GenerationResult,
                                    GenerationResultBase, PostprocWorker)
 from tensorrt_llm.executor.ipc import FusedIpcQueue, ZeroMqQueue
+from tensorrt_llm.executor.proxy import GenerationExecutorProxy
+from tensorrt_llm.executor.utils import RequestError
 from tensorrt_llm.inputs.multimodal import MultimodalInput, MultimodalParams
 from tensorrt_llm.llmapi.tokenizer import TransformersTokenizer
 from tensorrt_llm.llmapi.utils import AsyncQueue
@@ -689,3 +692,51 @@ def test_PostprocWorker_disaggregated_params():
 
 if __name__ == '__main__':
     test_FusedIpcQueue()
+
+
+def _executor_with_error_queue():
+    # Bare proxy: _handle_background_error is GenerationExecutor's own.
+    executor = GenerationExecutorProxy.__new__(GenerationExecutorProxy)
+    executor._error_queue = Queue()
+    executor._set_fatal_error = Mock()
+    executor.shutdown = Mock()
+    return executor
+
+
+def test_handle_background_error_without_pending_error_is_noop():
+    executor = _executor_with_error_queue()
+    executor._handle_background_error()
+    executor._set_fatal_error.assert_not_called()
+    executor.shutdown.assert_not_called()
+
+
+def test_handle_background_error_raises_pending_request_error():
+    executor = _executor_with_error_queue()
+    executor._error_queue.put("bad request")
+    with pytest.raises(RequestError, match="bad request"):
+        executor._handle_background_error()
+    executor._set_fatal_error.assert_not_called()
+    executor.shutdown.assert_not_called()
+    assert executor._error_queue.empty()
+
+
+def test_handle_background_error_raises_pending_fatal_error():
+    executor = _executor_with_error_queue()
+    cause = RuntimeError("worker died")
+    executor._error_queue.put(cause)
+    with pytest.raises(RuntimeError, match="worker died"):
+        executor._handle_background_error()
+    executor._set_fatal_error.assert_called_once_with(cause)
+    executor.shutdown.assert_called_once()
+
+
+def test_nvtx_range_debug_disabled_is_noop(monkeypatch):
+    monkeypatch.delenv("TLLM_LLMAPI_ENABLE_NVTX", raising=False)
+    monkeypatch.delenv("TLLM_NVTX_DEBUG", raising=False)
+
+    def func():
+        return 42
+
+    assert nvtx_range_debug("test")(func) is func
+    with nvtx_range_debug("test"):
+        pass
