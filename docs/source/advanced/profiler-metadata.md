@@ -41,8 +41,9 @@ Do not initialize from a collective, profiler callback, ABI entry point or
 shared-library static initializer.
 
 `ENABLE_NCCL_PROFILING` and `ENABLE_NANOBIND_PROFILING` default to OFF.
-Builds enabling either option validate native selection once at the Python
-module's exception-handling startup boundary, before registering bindings.
+PyTorch-enabled builds (`BUILD_PYT`, with the existing `TORCH_CUDA` guard)
+validate native selection once at the Python module's exception-handling
+startup boundary, before registering bindings, regardless of either option.
 Runtime selection cannot enable instrumentation omitted at build time.
 
 ## TRTLLM1 envelope
@@ -104,8 +105,10 @@ non-throwing; malformed selectors fail at explicit startup instead. Python
 does not swallow process-control `BaseException` subclasses from factories.
 
 The ATen-dependent implementation is excluded from the generic common-library
-source glob, embedded in the PyTorch `th_common` library and compiled into the
-CPU-capable native unit test target. `BUILD_PYT=OFF` does not build it. No new
+source glob and owned once by the existing native shared library when
+`BUILD_PYT` is enabled; Torch ops and bindings reuse that owner. It is compiled
+separately into the standalone CPU-capable native unit test target.
+`BUILD_PYT=OFF` does not build it. No new
 runtime library or wheel artifact is required. Profiling has measurable costs,
 including callbacks, scope creation and active metadata encoding.
 
@@ -168,8 +171,8 @@ bool in both configurations. OFF builds retain the upstream dispatch paths.
 ON scopes are named `trtllm::nanobind::<module>.<qualname>`. All four pinned
 function vectorcall paths are covered, including rejected arguments and
 exceptions. Bound methods and constructors delegate to those paths without
-adding a second scope. Native startup and probes use the existing shared
-`th_common` implementation, not a second embedded selector.
+adding a second scope. Native startup and probes use the existing native
+shared-core implementation, not a second embedded selector.
 
 Names are extracted only for active callbacks. Direct Tensor positional and
 keyword arguments are inspected only when callbacks request inputs; nested
