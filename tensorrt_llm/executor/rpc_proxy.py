@@ -272,7 +272,11 @@ class GenerationExecutorRpcProxy(RpcExecutorMixin, GenerationExecutor):
 
     def shutdown_remote(self):
         logger_debug("Shutting down rpc remote", color="yellow")
-        self.rpc_client.shutdown().remote(need_response=False)
+        # Cleanup must be acknowledged before main_task is allowed to close the
+        # server. The second RPC commits that acknowledged all-rank result; its
+        # response is sent before RpcWorker wakes main_task.
+        self.rpc_client.shutdown().remote(need_response=True)
+        self.rpc_client.commit_shutdown().remote(need_response=True)
 
     def abort_request(self, request_id: int) -> None:
         return self.rpc_client.abort_request(request_id).remote()
@@ -297,13 +301,18 @@ class GenerationExecutorRpcProxy(RpcExecutorMixin, GenerationExecutor):
         self._shutdown_event.set()
         logger_debug("Shutting down GenerationExecutorRpcProxy", color="yellow")
 
-        # 1. shutdown the rpc server (PyExecutor Rank 0 + RPC server)
-        self.shutdown_remote()
+        # Keep the server, MPI workers, and retry gate live until every rank has
+        # acknowledged cleanup. RpcWorker resets its engine shutdown guard on a
+        # failed attempt, so the caller may invoke shutdown() again explicitly.
+        try:
+            self.shutdown_remote()
+        except BaseException:
+            self._shutdown_event.clear()
+            raise
 
-        # 2. stop the main loop, so that no new rpc requests
+        # Stop the response loop only after cleanup and commit are acknowledged.
         if self.main_loop and self.main_loop_task_obj:
             logger_debug("Cancelling main loop task.", color="yellow")
-            # The cancel() is thread-safe
             try:
                 self.main_loop.call_soon_threadsafe(
                     self.main_loop_task_obj.cancel)
@@ -311,38 +320,39 @@ class GenerationExecutorRpcProxy(RpcExecutorMixin, GenerationExecutor):
                 logger_debug(f"Error cancelling main loop task: {e}",
                              color="yellow")
 
-        # Only join if we're not calling from the main_loop_thread itself
-        # (e.g., during garbage collection in that thread)
         if self.main_loop_thread and threading.current_thread(
         ) != self.main_loop_thread:
             self.main_loop_thread.join(timeout=2.0)
             if self.main_loop_thread.is_alive():
                 logger.warning("Main loop thread did not exit gracefully")
 
-        # 3. shutdown the mpi session, this should wait until all the PyExecutor
-        # processes are shutdown
+        shutdown_errors = []
+        # Worker futures complete only after followers observe the commit and
+        # rank zero has joined its RPC server. Always converge them, including
+        # for an externally owned pool, before allowing that pool to be reused.
+        for future in getattr(self, "worker_futures", []):
+            try:
+                future.result()
+            except BaseException as error:
+                shutdown_errors.append(error)
+
         if self.mpi_session is not None:
             if self._owns_mpi_session:
                 logger_debug("Shutting down mpi session", color="yellow")
-                self.mpi_session.shutdown()
-            else:
-                # Externally owned (shared) session: leave the pool alive, but
-                # wait for this executor's worker tasks to finish so the next
-                # LLM on the pool doesn't race with PyExecutor teardown. Block
-                # without a timeout, mirroring the owned path above
-                # (mpi_session.shutdown() also waits indefinitely); a timeout
-                # that expires would just reintroduce the race it prevents.
-                for future in getattr(self, "worker_futures", []):
-                    try:
-                        future.result()
-                    except Exception as e:
-                        logger.warning(
-                            f"RPC worker task raised during shutdown on "
-                            f"shared MPI session: {e}")
+                try:
+                    self.mpi_session.shutdown()
+                except BaseException as error:
+                    shutdown_errors.append(error)
             logger_debug("Mpi session shutdown", color="yellow")
             self.mpi_session = None
 
-        self.rpc_client.close()
+        try:
+            self.rpc_client.close()
+        except BaseException as error:
+            shutdown_errors.append(error)
+
+        if shutdown_errors:
+            raise shutdown_errors[0]
 
     def __enter__(self):
         return self

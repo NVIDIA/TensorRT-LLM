@@ -1,6 +1,3 @@
-# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
-
 """Compatibility wrapper for optional in-kernel event tracing support."""
 
 try:
@@ -9,7 +6,6 @@ except (ImportError, NotImplementedError):
     try:
         from cutlass.cute import iket  # type: ignore
     except (ImportError, NotImplementedError):
-
         class _IketShim:
             """No-op IKET interface for toolchains without the dialect."""
 

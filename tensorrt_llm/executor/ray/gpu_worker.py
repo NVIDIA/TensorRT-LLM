@@ -30,6 +30,7 @@ from tensorrt_llm._torch.virtual_memory import (materialize_with_tag,
 from tensorrt_llm.executor.ray.utils import control_action_decorator
 
 from ... import TorchLlmArgs
+from ...llmapi._load_balance_env import configure_moe_launch_queues
 from ...llmapi.llm_args import BaseLlmArgs, ExecutorMemoryType
 from ...llmapi.tokenizer import TokenizerBase
 from ...llmapi.utils import configure_cpu_affinity
@@ -57,6 +58,15 @@ def resolve_obj_by_qualname(qualname: str) -> Any:
 class RayWorkerWrapper:
 
     def __init__(self, worker_cls, worker_kwargs, world_size, rank):
+        llm_args = worker_kwargs.get("llm_args")
+        if llm_args is not None and llm_args.env_overrides:
+            os.environ.update(llm_args.env_overrides)
+        if llm_args is not None and llm_args.backend == "pytorch":
+            queue_overrides = configure_moe_launch_queues(
+                getattr(llm_args, "moe_config", None), llm_args.env_overrides)
+            if queue_overrides is not llm_args.env_overrides:
+                llm_args.env_overrides = queue_overrides
+
         self.master_address = os.environ["MASTER_ADDR"]
         self.world_size = world_size
         self.rank = rank
@@ -353,43 +363,89 @@ class RayGPUWorker(RpcWorkerMixin, BaseWorker):
 
         if self.doing_shutdown:
             return
-        else:
-            self.doing_shutdown = True
+        self.doing_shutdown = True
+        shutdown_succeeded = False
 
-        logger.debug(f'Worker {self.rank} shutting down...')
+        try:
+            logger.debug(f'Worker {self.rank} shutting down...')
 
-        if hasattr(self, 'shutdown_event'):
-            self.shutdown_event.set()
+            if hasattr(self, 'shutdown_event'):
+                self.shutdown_event.set()
 
-        if getattr(self, '_postproc_pool', None) is not None:
-            self.shutdown_postproc_workers()
+            shutdown_error = None
+            local_safe = True
+            if getattr(self, '_postproc_pool', None) is not None:
+                try:
+                    self.shutdown_postproc_workers()
+                except BaseException as error:
+                    shutdown_error = error
+                    local_safe = False
 
-        if hasattr(self, 'rpc_server') and self.rpc_server is not None:
-            logger.info(f"[Rank {self.global_rank}] Shutting down RPC server")
-            try:
-                self.rpc_server.shutdown()
-            except Exception as e:
-                # Suppress errors during RPC server shutdown
-                # These can occur if the server is already closed or during cleanup
-                logger.debug(
-                    f"[Rank {self.global_rank}] Suppressed error during RPC server shutdown: {e}"
-                )
-            self.rpc_server = None
+            if hasattr(self, 'rpc_server') and self.rpc_server is not None:
+                logger.info(
+                    f"[Rank {self.global_rank}] Shutting down RPC server")
+                try:
+                    self.rpc_server.shutdown()
+                except Exception as e:
+                    # Suppress errors during RPC server shutdown. These can occur
+                    # if the server is already closed or during cleanup.
+                    logger.debug(
+                        f"[Rank {self.global_rank}] Suppressed error during RPC server shutdown: {e}"
+                    )
+                self.rpc_server = None
 
-        if self.engine is not None:
-            self.engine.shutdown()
-            self.engine = None
+            if self.engine is not None:
+                engine = self.engine
+                engine_shutdown_completed = bool(
+                    getattr(self, "_engine_shutdown_completed", False))
+                if not engine_shutdown_completed:
+                    try:
+                        engine.shutdown()
+                        self._engine_shutdown_completed = True
+                    except BaseException as error:
+                        if shutdown_error is None:
+                            shutdown_error = error
+                        local_safe = False
+                terminal_cleanup = getattr(engine, "terminal_cleanup", None)
+                if terminal_cleanup is not None:
+                    try:
+                        if getattr(engine, "shutdown_all_ranks", False):
+                            terminal_cleanup(local_safe=local_safe)
+                        elif local_safe:
+                            terminal_cleanup()
+                    except BaseException as error:
+                        if shutdown_error is None:
+                            shutdown_error = error
 
-            if (self.llm_args.backend == "pytorch"
-                    and hasattr(self, "checkpoint_loader")
+            if (getattr(getattr(self, "llm_args", None), "backend", None)
+                    == "pytorch" and hasattr(self, "checkpoint_loader")
                     and self.checkpoint_loader is not None):
-                self.checkpoint_loader.cleanup()
-                self.checkpoint_loader = None
+                try:
+                    self.checkpoint_loader.cleanup()
+                except BaseException as error:
+                    if shutdown_error is None:
+                        shutdown_error = error
+                else:
+                    self.checkpoint_loader = None
 
-        # Check if there are any errors from the threads before shutdown.
-        self._handle_background_error()
+            # Check if there are any errors from the threads before shutdown.
+            try:
+                self._handle_background_error()
+            except BaseException as error:
+                if shutdown_error is None:
+                    shutdown_error = error
 
-        logger.debug(f"Worker {self.rank} shutdown done.")
+            if shutdown_error is not None:
+                raise shutdown_error
+            self.engine = None
+            self._engine_shutdown_completed = False
+            shutdown_succeeded = True
+            logger.debug(f"Worker {self.rank} shutdown done.")
+        finally:
+            if not shutdown_succeeded:
+                # Preserve the engine and allow an explicit retry to finish any
+                # model-owned collective teardown that could not complete.
+                self.doing_shutdown = False
 
     def _get_comm_ranks_device_id(self):
         # Make sure C++ executor would use same devices/ranks as py_executor

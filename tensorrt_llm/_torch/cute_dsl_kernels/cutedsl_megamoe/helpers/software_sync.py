@@ -1,6 +1,3 @@
-# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
-
 """Software grid and NVLink synchronization for persistent kernels."""
 
 import cutlass
@@ -172,7 +169,10 @@ class NvlinkBarrier(SoftwareGridSync):
             signal_base_address = self._signal.toint()
             signal_byte_offset = Int64(signal_phase * Int32(4))
             for rank_round in cutlass.range_constexpr(rank_round_count):
-                destination_rank = Int32(rank_round * participating_threads) + thread_idx_in_group
+                destination_rank = (
+                    Int32(rank_round * participating_threads)
+                    + thread_idx_in_group
+                )
                 if destination_rank < Int32(self.world_size):
                     destination_address = self._peer_rank_ptr_mapper.map(
                         signal_base_address,
@@ -193,15 +193,12 @@ class NvlinkBarrier(SoftwareGridSync):
                     scope="gpu",
                 )
                 local_signal = self._signal + signal_phase
-                while (
-                    cute.arch.load(
-                        local_signal,
-                        Int32,
-                        sem="acquire",
-                        scope="sys",
-                    )
-                    != signal_target
-                ):
+                while cute.arch.load(
+                    local_signal,
+                    Int32,
+                    sem="acquire",
+                    scope="sys",
+                ) != signal_target:
                     pass
 
         if cutlass.const_expr(epilogue_grid_sync):
