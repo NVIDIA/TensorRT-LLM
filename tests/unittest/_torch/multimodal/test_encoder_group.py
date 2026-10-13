@@ -157,18 +157,58 @@ class TestReorderEmbedsByManifest:
         expected = torch.tensor([1.0] * 2 + [2.0] * 3 + [3.0] * 1)
         assert torch.equal(out[:, 0], expected)
 
-    def test_single_modality_falls_back_to_synthesized_manifest(self):
+    def test_one_populated_modality_ignores_empty_group_peer(self):
         # Two image items, no explicit manifest — reorder still works by
-        # synthesizing a trivial per-modality manifest from the request's
-        # multimodal_embedding_lengths.
+        # synthesizing a trivial manifest. Qwen's shared image/video group also
+        # contributes an empty video view; it must not force an image copy.
         mp = _mp(embedding_lengths=[2, 3], buckets={"image": {}})
+        image_embeddings = torch.cat([self._marker_tensor(7, 2), self._marker_tensor(9, 3)], dim=0)
         per_modality_embeds = {
-            "image": torch.cat([self._marker_tensor(7, 2), self._marker_tensor(9, 3)], dim=0),
+            "image": image_embeddings,
+            "video": image_embeddings.new_empty((0, image_embeddings.shape[1])),
         }
-        per_modality_lengths = {"image": [2, 3]}
+        per_modality_lengths = {"image": [2, 3], "video": []}
         out = _reorder_embeds_by_manifest([mp], per_modality_embeds, per_modality_lengths)
         expected = torch.tensor([7.0] * 2 + [9.0] * 3)
         assert torch.equal(out[:, 0], expected)
+        assert out is image_embeddings
+
+    def test_single_modality_noncanonical_manifest_is_reordered(self):
+        mp = _mp(
+            mm_item_order=[
+                {"modality": "image", "index": 1},
+                {"modality": "image", "index": 0},
+            ],
+            buckets={"image": {}},
+        )
+        image_embeddings = torch.cat([self._marker_tensor(7, 2), self._marker_tensor(9, 3)], dim=0)
+        out = _reorder_embeds_by_manifest([mp], {"image": image_embeddings}, {"image": [2, 3]})
+
+        expected = torch.tensor([9.0] * 3 + [7.0] * 2)
+        assert torch.equal(out[:, 0], expected)
+        assert out is not image_embeddings
+
+    @pytest.mark.parametrize("b_item_order", [[0, 1], [1, 0]])
+    def test_single_modality_batch_reorders_only_out_of_order_requests(self, b_item_order):
+        # Request A uses a synthesized manifest; request B lists its two images
+        # explicitly. The request-major encoder output is already in prompt
+        # order unless B lists its second image first.
+        mp_a = _mp(embedding_lengths=[2], buckets={"image": {}})
+        mp_b = _mp(
+            mm_item_order=[{"modality": "image", "index": i} for i in b_item_order],
+            buckets={"image": {}},
+        )
+        image_embeddings = torch.cat(
+            [self._marker_tensor(1, 2), self._marker_tensor(2, 3), self._marker_tensor(3, 1)],
+            dim=0,
+        )
+        out = _reorder_embeds_by_manifest(
+            [mp_a, mp_b], {"image": image_embeddings}, {"image": [2, 3, 1]}
+        )
+        b_rows = {0: [2.0] * 3, 1: [3.0] * 1}
+        expected = torch.tensor([1.0] * 2 + b_rows[b_item_order[0]] + b_rows[b_item_order[1]])
+        assert torch.equal(out[:, 0], expected)
+        assert (out is image_embeddings) == (b_item_order == [0, 1])
 
     def test_empty_bookkeeping_returns_typed_empty(self):
         # Mirrors the executor KV-cache profiling pass: the dummy batch runs the
