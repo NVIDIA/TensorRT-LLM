@@ -226,7 +226,7 @@ def process_result():
         detail = ", ".join(RISKY_DEPENDENCIES)
         status = "unstable"
         if args.scan_mode == "monitor":
-            post_slack_msg(args.build_number, args.ref, detail)
+            post_slack_msg(args.build_number, args.ref, detail, args.build_url)
 
         result = {
             "status": status,
