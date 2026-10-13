@@ -65,6 +65,8 @@ public:
 
     virtual bool isCommitted() const = 0;
 
+    bool isPrivate() const;
+
     PageStatus status() const noexcept;
 
     // Residency protection does not retain a CUDA reader lock. The owner must also hold the page.

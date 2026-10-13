@@ -215,6 +215,15 @@ that file for the current config/backend combinations. Consult the
 for the supported attention shapes; do not infer support from algorithm
 registration alone.
 
+| Algorithm | Sparse backend | Metadata | Cache manager |
+|---|---|---|---|
+| `csa2` | `CSA2TrtllmAttention`, with hardware-selected Flash helpers | `CSA2TrtllmMetadata` | `CSA2CacheManager` (V2) |
+
+CSA2 implements DeepSeek-V4.1 compressed sparse MLA. Its module adapter owns
+compression and shared KV/index sources; per-phase query tiles feed selected
+rows to attention. See the [CSA2 implementation guide](backends/sparse/csa2/README.md)
+for SM90, SM100-family and SM120/121 routing, persistent cache formats, and replay.
+
 Block-sparse FMHA is a kernel-library contract rather than a sparse algorithm.
 Algorithms lower their live routing state to an algorithm-neutral
 `BlockSparseForwardInputs`, nested at
@@ -268,6 +277,9 @@ The core contract is:
 - `runtime_workspace_is_chunked_prefill_bounded(model_config)` — whether
   chunked prefill limits that workspace to the current KV chunk (default
   `True`)
+- `runtime_workspace_fixed_bytes(model_config, mapping, **capacities)` — retained
+  workspace sized by serving capacity rather than admitted attended-KV length
+  (default `0`)
 
 `**kwargs` is only a temporary compatibility path. It is merged into
 `AttentionForwardArgs`, rejects unknown fields, and must not be mixed with
@@ -292,6 +304,18 @@ from `max_num_tokens` (`TrtllmAttention.runtime_workspace_bytes_per_token`).
 NVFP4 sparse MLA reads the complete attended prefix even with chunked prefill,
 so it also returns `False` from
 `runtime_workspace_is_chunked_prefill_bounded`.
+
+CSA2 also gathers the complete compressed prefix during index prefill and
+declares a conservative gather rate even with chunked prefill. Its native
+index descriptor/radix arena follows maximum batch, draft width and sequence
+length, so it declares a separate fixed reserve for an eager arena and, when
+enabled, a shared CUDA graph arena. The estimator conservatively reserves the
+full arena capacity alongside the profiled peak: a decode arena may first be
+allocated after peak prefill, so its final retained bytes cannot safely be
+subtracted from that earlier peak.
+The attended-KV admission cap applies to the prefix gather, independently of
+the fixed graph arena. Projection, native/provider scratch and transient logits
+still require representative peak-memory profiling.
 
 ### 2.4 Capability reference
 
@@ -385,6 +409,21 @@ The main question is not just "does the backend read K and V?" but:
 A backend may support the score computation you want, but still be the wrong
 fit because it assumes a different KV-cache layout or a different decode-time
 update pattern.
+
+CSA2 uses model-native cache ownership and the following policies when block
+reuse is enabled (Encoder SWA is `PRIVATE` when reuse is disabled):
+
+| Storage | Ownership and format | Reuse policy |
+|---|---|---|
+| GLOBAL main/index | KV-source layers; 288-byte main and 68-byte index records sharing physical pages | `REQUIRED` |
+| Encoder SWA | Per layer; 528-byte E4M3 rows | `REQUIRED`, or `OPTIONAL` with Encoder replay |
+| Decoder SWA | Per layer; same row format | `PRIVATE` for eligible bounded replay; ordinary lifecycle for full prefill |
+| Ratio-two compressor state | Source owners; FP32 partial-group values/scores | Managed with the owner's page lifecycle |
+
+`CSA2TrtllmMetadata.prepare()` publishes owner tables, compression inputs,
+visibility and SWA read/write slots. Live accepted-length updates refresh
+captured buffers in place. Graph clones share reserved index arenas and query
+tiles; eager shape eviction must preserve every graph-owned allocation.
 
 #### 3.2.1 Common paged-KV model
 

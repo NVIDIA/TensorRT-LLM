@@ -15,6 +15,11 @@
 
 from tensorrt_llm._torch.configs.cosmos3 import Cosmos3Config
 from tensorrt_llm._torch.configs.deepseek_v3 import DeepseekV3Config
+from tensorrt_llm._torch.configs.deepseek_v41 import (
+    DeepseekV41Config,
+    DeepseekV41TextConfig,
+    DeepseekV41VisionConfig,
+)
 from tensorrt_llm._torch.configs.deepseekv4 import DeepseekV4Config
 from tensorrt_llm._torch.configs.gemma4 import (
     Gemma4AssistantConfig,
@@ -66,6 +71,14 @@ def _register_custom_configs_with_transformers() -> None:
         "deepseek_v32": DeepseekV3Config,
         "kimi_k2": DeepseekV3Config,
         "deepseek_v4": DeepseekV4Config,
+        # DeepSeek-V4.1 composite multimodal config ("deepseek_v41") plus its two
+        # sub-configs. V4.1 is NOT config-compatible with V4 (the compress_ratios
+        # encoding changed kind, the FP8 block moved to 32x32, the router grew a
+        # second bias, and Engram is reparameterized), so it gets its own family
+        # rather than an alias onto "deepseek_v4".
+        "deepseek_v41": DeepseekV41Config,
+        "deepseek_v41_text": DeepseekV41TextConfig,
+        "deepseek_v41_vision": DeepseekV41VisionConfig,
         "glm5_next": Glm5NextConfig,
         "glm5_next_text": Glm5NextTextConfig,
         "glm5_next_vision": Glm5NextVisionConfig,
@@ -110,6 +123,9 @@ del _register_custom_configs_with_transformers
 __all__ = [
     "Cosmos3Config",
     "DeepseekV3Config",
+    "DeepseekV41Config",
+    "DeepseekV41TextConfig",
+    "DeepseekV41VisionConfig",
     "DeepseekV4Config",
     "Glm5NextConfig",
     "Glm5NextTextConfig",

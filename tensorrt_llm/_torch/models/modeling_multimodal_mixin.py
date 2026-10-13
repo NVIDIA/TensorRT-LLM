@@ -791,11 +791,14 @@ class MultimodalModelMixin:
         embeddings: torch.Tensor,
         **forward_kwargs: Any,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Optional hook before active chunk rows are selected.
+        """Optional hook after multimodal embeddings are gathered.
 
-        Runs after cache lookup or encoder execution has produced full
-        per-request multimodal embeddings, but before the mixin selects rows
-        active in the current forward chunk.
+        Runs after cache lookup or encoder execution, before active-row model
+        hooks. The row layout depends on the whole batch: if any param carries
+        item-scheduled current-chunk rows, the gather also cuts every other
+        param that has runtime data down to its current-chunk rows; otherwise
+        each param keeps its full-request rows. Row-dependent model transforms
+        should use `after_active_multimodal_embeddings` instead.
         """
         return input_ids, embeddings
 
@@ -1003,8 +1006,8 @@ class MultimodalModelMixin:
         """Prepare multimodal inputs for a concrete model forward.
 
         This method owns the common framework sequence around a model-specific
-        encoder hook: retrieve/cache full request embeddings, select active
-        chunk rows, run optional model hooks, and fuse rows into text embeds.
+        encoder hook: retrieve/cache embeddings, select active chunk rows if
+        needed, run optional model hooks, and fuse rows into text embeds.
         """
         context_params = list(
             self.select_multimodal_params(
@@ -1015,16 +1018,16 @@ class MultimodalModelMixin:
         if not context_params:
             return PreparedLlmInputs(input_ids=input_ids, inputs_embeds=None)
 
-        full_embeddings = self._get_or_encode_multimodal_embeddings(context_params)
+        embeddings = self._get_or_encode_multimodal_embeddings(context_params)
 
-        input_ids, full_embeddings = self.after_full_multimodal_embeddings(
+        input_ids, embeddings = self.after_full_multimodal_embeddings(
             input_ids=input_ids,
             multimodal_params=context_params,
-            embeddings=full_embeddings,
+            embeddings=embeddings,
             **forward_kwargs,
         )
 
-        active_embeddings = find_input_mm_embeds([full_embeddings], list(context_params))
+        active_embeddings = find_input_mm_embeds([embeddings], list(context_params))
         active_embeddings, extra_embeds = self.after_active_multimodal_embeddings(
             active_embeddings=active_embeddings,
             multimodal_params=context_params,
@@ -1060,13 +1063,15 @@ class MultimodalModelMixin:
 
         Delegates cache lookup and gather behavior to `get_multimodal_embeddings`, then validates
         the single tensor contract for both encoded and cached-only paths.
+        If item scheduling supplies current-chunk rows, the gather selects
+        current-chunk rows for every request before concatenating the batch.
 
         During side-stream prefetch, this runs with the auxiliary stream current, so the H2D copies,
         the encoder, and every persistent-cache `put()` are issued on that stream. `TensorLRUCache`
         records each entry's producer event on the issuing (aux) stream; the next iteration's
         main-stream consumer waits on the request-level `encoder_event` for ordering.
         """
-        encoder_cache = self._get_multimodal_encoder_cache()
+        encoder_cache = self._multimodal_encoder_cache
         cache_misses: list[MultimodalParams] = []
         partial_hits: list[tuple[MultimodalParams, EncoderCachePartition]] = []
         if encoder_cache is not None:
@@ -1104,63 +1109,67 @@ class MultimodalModelMixin:
 
         # Validate post-gather so cached-only paths (KV reuse, all-cached chunked prefill) are also
         # checked, not just paths that ran the encoder.
-        self._validate_embeddings(embeddings, multimodal_params)
+        self._validate_embeddings(
+            embeddings,
+            multimodal_params,
+            current_chunk_only=any(
+                param.multimodal_data.get("multimodal_embedding_is_chunk", False)
+                for param in multimodal_params
+            ),
+        )
         return embeddings[0]
 
-    def _get_multimodal_encoder_cache(self) -> Optional[TensorLRUCache]:
-        """Return the per-model full-request-path encoder clone cache, if enabled.
+    def _initialize_multimodal_encoder_cache(self, max_bytes: int) -> Optional[TensorLRUCache]:
+        """Initialize the model-owned multimodal encoder-output cache once.
 
         The cache stores per-item embeddings for params that can be represented by one modality.
         See `_encoder_cache_keys` for the mixed-modality skip path and its technical limitation.
-
-        Scope: the single encoder cache instance for a cache-enabled model
-        (`supports_encoder_cache`). The full-request (legacy inline-encode) consumers — side-stream
-        prefetch, `mm_encoder_only`/disagg encoding — populate and read it inline; the
-        item-scheduling path consumes the same instance read-through at encode time
-        (`ModelEngine.forward_multimodal_encoder_items`). The key format is shared
-        (`_encoder_cache_item_key`) so hits cross between paths. The item path's recorded outputs
-        are cloned, so cache eviction never invalidates an in-flight request.
+        `ModelEngine` resolves `max_bytes` as the larger of the item-scheduling
+        output budget and persistent-reuse capacity before runtime access.
+        Zero leaves the cache disabled.
         """
-        if not self.encoder_cache_active:
+        if self._multimodal_encoder_cache is not None:
+            if max_bytes != self._multimodal_encoder_cache.max_bytes:
+                raise ValueError(
+                    f"{_MM_ENCODER_CACHE_LOG_NAME}: already initialized with "
+                    f"max_bytes={self._multimodal_encoder_cache.max_bytes}; "
+                    f"cannot reinitialize with max_bytes={max_bytes}"
+                )
+            return self._multimodal_encoder_cache
+
+        if max_bytes == 0:
             logger.debug_once(
-                f"{_MM_ENCODER_CACHE_LOG_NAME}: disabled because the model does not opt in via "
-                "supports_encoder_cache or multimodal_config.encoder_cache_max_bytes=0.",
+                f"{_MM_ENCODER_CACHE_LOG_NAME}: disabled because neither item scheduling nor "
+                "persistent reuse requires storage.",
                 key="mm_encoder_cache_disabled",
             )
             return None
 
         multimodal_config = self.model_config.multimodal_config
-        max_bytes = multimodal_config.encoder_cache_max_bytes
-        if self._multimodal_encoder_cache is None:
-            # Per-item embeddings are views produced by splitting a request-level encoder output.
-            # Clone them so a cached item neither aliases mutable caller output nor retains the
-            # entire batch allocation while cache accounting charges only its logical size. This
-            # briefly needs source and clone memory during insertion, but preserves existing cache
-            # entries when the copy cannot be allocated.
-            self._multimodal_encoder_cache = TensorLRUCache(
-                max_bytes,
-                name=_MM_ENCODER_CACHE_LOG_NAME,
-                cuda_stream_aware=multimodal_config.encoder_side_stream_max_ahead > 0,
+        self._multimodal_encoder_cache = TensorLRUCache(
+            max_bytes,
+            name=_MM_ENCODER_CACHE_LOG_NAME,
+            cuda_stream_aware=multimodal_config.encoder_side_stream_max_ahead > 0,
+        )
+        try:
+            embedding_dim = self.embedding_dim
+            embedding_dtype = self.embedding_dtype
+        except NotImplementedError:
+            logger.info(
+                f"{_MM_ENCODER_CACHE_LOG_NAME}: created with max_bytes={max_bytes}, "
+                "embedding row capacity unavailable because the model does not implement "
+                "embedding_dim and embedding_dtype."
             )
-            try:
-                embedding_dim = self.embedding_dim
-                embedding_dtype = self.embedding_dtype
-            except NotImplementedError:
-                logger.info(
-                    f"{_MM_ENCODER_CACHE_LOG_NAME}: created with max_bytes={max_bytes}, "
-                    "embedding row capacity unavailable because the model does not implement "
-                    "embedding_dim and embedding_dtype."
-                )
-            else:
-                bytes_per_embedding_row = (
-                    embedding_dim * torch.empty((), dtype=embedding_dtype).element_size()
-                )
-                max_embedding_rows = max_bytes // bytes_per_embedding_row
-                logger.info(
-                    f"{_MM_ENCODER_CACHE_LOG_NAME}: created with max_bytes={max_bytes}, "
-                    f"max_embedding_rows={max_embedding_rows}, embedding_dim={embedding_dim}, "
-                    f"embedding_dtype={embedding_dtype}"
-                )
+        else:
+            bytes_per_embedding_row = (
+                embedding_dim * torch.empty((), dtype=embedding_dtype).element_size()
+            )
+            max_embedding_rows = max_bytes // bytes_per_embedding_row
+            logger.info(
+                f"{_MM_ENCODER_CACHE_LOG_NAME}: created with max_bytes={max_bytes}, "
+                f"max_embedding_rows={max_embedding_rows}, embedding_dim={embedding_dim}, "
+                f"embedding_dtype={embedding_dtype}"
+            )
         return self._multimodal_encoder_cache
 
     @staticmethod
@@ -1550,9 +1559,13 @@ class MultimodalModelMixin:
     def _validate_embeddings(
         embeddings: list[torch.Tensor],
         multimodal_params: Sequence[MultimodalParams],
+        *,
+        current_chunk_only: bool = False,
     ) -> None:
         """Validate gathered embeddings' row count against runtime metadata.
 
+        `current_chunk_only` matches the gather layout; it does not change the
+        original per-request runtime counts used for later prefill chunks.
         Skipped if any param lacks `multimodal_runtime.total_embeds_in_request`, since the contract
         cannot be evaluated without complete metadata.
         """
@@ -1570,7 +1583,11 @@ class MultimodalModelMixin:
             has_runtime = runtime is not None and runtime.total_embeds_in_request is not None
             has_runtime_metadata.append(has_runtime)
             if has_runtime:
-                expected_rows += runtime.total_embeds_in_request
+                expected_rows += (
+                    runtime.num_mm_tokens_in_chunk
+                    if current_chunk_only
+                    else runtime.total_embeds_in_request
+                )
 
         if any(has_runtime_metadata) and not all(has_runtime_metadata):
             raise ValueError(
@@ -1678,7 +1695,7 @@ def _dispatch_cross_iter_prefetch(
     encoder_event = None
     try:
         with _run_on_aux_stream(aux_stream) as encoder_event:
-            encoder_cache = model._get_multimodal_encoder_cache() if encoder_cache_enabled else None
+            encoder_cache = model._multimodal_encoder_cache if encoder_cache_enabled else None
             cache_misses: list[MultimodalParams] = []
             partial_hits: list[tuple[MultimodalParams, EncoderCachePartition]] = []
             if encoder_cache is None:

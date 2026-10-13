@@ -1832,6 +1832,17 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
             spec_metadata=spec_metadata,
             **kwargs,
         )
+        if getattr(attn_metadata, "csa2_remote_tail_mode", None) == "source":
+            # The context worker intentionally stopped at the encoder/decoder
+            # boundary. Produce a disposable token for the existing context-only
+            # completion machinery, but do not run an embedded draft worker from
+            # an encoder-boundary activation. The handoff strips this token.
+            return self.logits_processor.forward(
+                hidden_states,
+                self.lm_head,
+                attn_metadata,
+                False,
+            )
         if spec_metadata is not None and spec_metadata.is_layer_capture(
                 self.layer_idx):
             spec_metadata.maybe_capture_hidden_states(self.layer_idx,

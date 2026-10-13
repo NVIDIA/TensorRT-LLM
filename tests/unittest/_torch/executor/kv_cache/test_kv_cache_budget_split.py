@@ -64,12 +64,13 @@ def _make_creator(
     c._max_seq_len = 1024
     c._max_num_tokens = 0
     c._max_batch_size = 1
+    c._max_beam_width = 1
     c._is_disagg = False
     c._cache_transceiver_config = None
     c._speculative_config = None
     c._mapping = Mock()
     c._model_engine = Mock()
-    c._llm_args = SimpleNamespace(kv_cache_compression_config=None)
+    c._llm_args = SimpleNamespace(kv_cache_compression_config=None, sleep_config=None)
     c._disable_overlap_scheduler = False
 
     c._kv_cache_manager_cls = Mock()
@@ -334,6 +335,7 @@ class TestSplitGpuBudgetForDraft:
         max_batch_size = 2
         creator = object.__new__(KvCacheCreator)
         creator._kv_cache_config = target_kv_config
+        creator._llm_args = SimpleNamespace(sleep_config=None)
         creator._tokens_per_block = 64
         creator._max_seq_len = 16384
         creator._max_batch_size = max_batch_size

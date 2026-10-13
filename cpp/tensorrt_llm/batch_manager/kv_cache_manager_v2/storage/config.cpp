@@ -206,15 +206,17 @@ StorageConfig createStorageConfig(KVCacheManagerConfig const& config)
         slotGroups.push_back(std::move(var));
     }
 
-    // Keep sparse and dense lifecycles in separate GPU pools even when slot sizes match.
+    // Distinct sparsity and reuse policies need separate GPU pools and eviction queues.
     struct PoolGroupKey
     {
+        AttentionReusePolicy reusePolicy = AttentionReusePolicy::REQUIRED;
         std::vector<size_t> slotSizes;
         bool isSparse = false;
 
         bool operator<(PoolGroupKey const& other) const
         {
-            return std::tie(slotSizes, isSparse) < std::tie(other.slotSizes, other.isSparse);
+            return std::tie(reusePolicy, slotSizes, isSparse)
+                < std::tie(other.reusePolicy, other.slotSizes, other.isSparse);
         }
     };
 
@@ -224,7 +226,8 @@ StorageConfig createStorageConfig(KVCacheManagerConfig const& config)
         auto const sizes = sg.slotSizeList();
         auto const* attn = std::get_if<AttnLifeCycle>(&registry.getLifeCycle(sg.lifeCycleId));
         bool const isSparse = attn != nullptr && attn->isSparse;
-        poolGroups[{.slotSizes = sizes.raw(), .isSparse = isSparse}].push_back(std::move(sg));
+        auto const policy = attn ? attn->reusePolicy : AttentionReusePolicy::REQUIRED;
+        poolGroups[{.reusePolicy = policy, .slotSizes = sizes.raw(), .isSparse = isSparse}].push_back(std::move(sg));
     }
 
     StorageConfig out;

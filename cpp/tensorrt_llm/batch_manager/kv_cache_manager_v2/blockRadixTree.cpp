@@ -482,7 +482,8 @@ std::vector<SharedPtr<Block>> Block::clearStaleBlocksAfterPageUnlink(
 
     // If this is a full-attention block or a sink block: evict subtree.
     // Mirrors Python: pages = remove_subtree(self)
-    if (alc && (!alc->windowSize.has_value() || block.ordinal() < BlockOrdinal{alc->numSinkBlocks}))
+    if (alc && alc->requiresPrefixCoverage()
+        && (!alc->windowSize.has_value() || block.ordinal() < BlockOrdinal{alc->numSinkBlocks}))
     {
         pruneStart = block.prev;
         detachedBlocks.push_back(removeSubtree(block));
@@ -887,6 +888,10 @@ std::vector<BlockRadixTree::MatchResult> BlockRadixTree::pruneMatch(
         bool shortened = false;
         for (auto [lcId, attn] : attnLcs)
         {
+            if (!attn->requiresPrefixCoverage())
+            {
+                continue;
+            }
             auto const staleRange = attn->getStaleRange(numTok, mTokensPerBlock);
             int const staleBeg = staleRange.beg.value();
             int const staleEnd = staleRange.end.value();

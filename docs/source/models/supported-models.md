@@ -13,6 +13,8 @@ The following is a table of supported models for the PyTorch backend:
 | `DeepseekV3ForCausalLM`              | DeepSeek-V3, Kimi-K2               | `deepseek-ai/DeepSeek-V3`                    |
 | `DeepseekV32ForCausalLM`             | DeepSeek-V3.2                      | `deepseek-ai/DeepSeek-V3.2`                  |
 | `DeepseekV4ForCausalLM` [^11]        | DeepSeek-V4                        | `deepseek-ai/DeepSeek-V4-Pro`                |
+| `DeepseekV41ForCausalLM`            | DeepSeek-V4.1 (text decoder)       | —                                          |
+| `DeepseekV41ForConditionalGeneration` | DeepSeek-V4.1                    | —                                          |
 | `Exaone4ForCausalLM`                 | EXAONE 4.0                         | `LGAI-EXAONE/EXAONE-4.0-32B`                 |
 | `ExaoneMoeForCausalLM`               | K-EXAONE                           | `LGAI-EXAONE/K-EXAONE-236B-A23B`             |
 | `ExaoneMoeForCausalLM`               | K-EXAONE 2.0                       | `LGAI-EXAONE/K-EXAONE-2.0-750B-A37B`         |
@@ -175,16 +177,24 @@ The following optimizations are available to models that implement
   exclusive with `multimodal_config.encoder_cuda_graph` and can increase peak GPU memory use. It
   can be combined with the multimodal embeddings cache so side-stream cache hits skip encoder work
   and misses populate the cache.
-- **Multimodal embeddings cache** is a per-model, cross-request LRU cache of encoder embeddings.
-  Set `multimodal_config.encoder_cache_max_bytes` to its capacity (for example, `"512MiB"`), or
-  `0` to disable it. Entries are cached per multimodal item, but a request reuses cached embeddings
-  only when all of its items hit the cache. At present, only single-modality requests are cacheable;
-  mixed-modality requests bypass the cache. For models with item-level encoder scheduling, the
-  cache also composes with the item path: cached items skip encoder execution after selection but
-  still count against the per-iteration item and token budgets, partially cached requests re-compute
-  only the missing items, and items encoded through the item path populate the cache for later
-  requests. When combined with side-stream prefetch, peak memory is the cache capacity plus any
-  in-flight prefetched encoder inputs and outputs.
+- **Multimodal embeddings cache** is a per-model, cross-request LRU cache of encoder embeddings,
+  stored per multimodal item. Set `multimodal_config.encoder_cache_max_bytes` to its capacity (for
+  example, `"512MiB"`), or `0` to disable cross-request reuse. The capacity applies per rank; ranks
+  do not share a cache.
+  - On the inline encoder path, a request whose items all hit the cache skips the encoder, and a
+    partially cached request encodes only its missing items. Inline caching supports only
+    single-modality requests. When combined with side-stream prefetch, peak memory is the cache
+    capacity plus any in-flight prefetched encoder inputs and outputs.
+  - Models with item-level encoder scheduling use the item path unless
+    `multimodal_config.encoder_scheduling_policy` is `DISABLED`. Cached items are reused before
+    encoder work is selected, so they use none of the per-iteration encoder item or token budget.
+    Only missing items are encoded, mixed-modality requests are cached per item, and newly encoded
+    items populate the cache for later requests. The item path also keeps encoder outputs in this
+    cache until the request's prefill completes, so the cache is never smaller than the output of
+    one encoder iteration, even when `encoder_cache_max_bytes` is `0`. Item scheduling does not
+    support side-stream prefetch or pipeline parallelism yet. With `pipeline_parallel_size > 1`,
+    the `DEFAULT` policy, explicit or unset, logs a warning and falls back to the inline path, and
+    the `EAGER` policy raises an error.
 
 # Visual Generation Models
 

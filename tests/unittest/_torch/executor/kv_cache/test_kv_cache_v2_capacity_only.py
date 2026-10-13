@@ -23,6 +23,7 @@ def _manager(
     kv_reserve_draft_tokens: int = 0,
 ) -> KVCacheManagerV2:
     manager = KVCacheManagerV2.__new__(KVCacheManagerV2)
+    manager.kv_cache_type = CacheType.SELF
     manager.is_draft = is_draft
     manager._has_cp_helix = False
     manager.kv_compression_manages_history = kv_compression_manages_history
