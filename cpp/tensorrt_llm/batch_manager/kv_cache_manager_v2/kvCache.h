@@ -285,10 +285,12 @@ public:
     KVCacheStatsDelta commitPendingStats();
     void discardPendingStats();
 
-    //! Count the uncommitted allocations in [blockBegin, blockEnd) as reused, for blocks whose
-    //! content a KV connector loads from an external store rather than the forward pass computing
-    //! it. Must be called before the pending stats covering their allocation are committed.
-    void recordConnectorReuse(BlockOrdinal blockBegin, BlockOrdinal blockEnd);
+    //! Record the prompt tokens [tokenBegin, tokenEnd) as loaded by a KV connector from an external
+    //! store rather than computed by the forward pass. They count as connector cached tokens, and
+    //! the uncommitted allocations of the blocks they fill completely count as reused. A block the
+    //! forward pass still writes part of stays a miss. Must be called before the pending stats
+    //! covering those allocations are committed.
+    void recordConnectorReuse(int tokenBegin, int tokenEnd);
 
     // Best-effort prefetch active pages to the target cache level.
     bool prefetch(CacheLevel target);

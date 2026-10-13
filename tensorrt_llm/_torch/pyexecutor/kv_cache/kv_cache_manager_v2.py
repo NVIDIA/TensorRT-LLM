@@ -4485,17 +4485,15 @@ class KVCacheManagerV2(BaseResourceManager):
         return position > local_end
 
     def _record_connector_reuse(self, kv_cache, start: int, end: int) -> None:
-        """Book the blocks a connector fills in ``[start, end)`` as reused.
+        """Book the prompt tokens a connector fills in ``[start, end)`` as cached.
 
-        The scheduling pass allocated them as misses and this batch's stats are
-        not committed yet. A block the forward pass still writes part of stays
-        a miss.
+        The scheduling pass allocated their blocks as misses and this batch's
+        stats are not committed yet. The core rebooks the blocks they fill
+        completely as reused; a block the forward pass still writes part of
+        stays a miss.
         """
-        tokens_per_block = self.tokens_per_block
-        block_begin = (start + tokens_per_block - 1) // tokens_per_block
-        block_end = end // tokens_per_block
-        if block_begin < block_end:
-            kv_cache.record_connector_reuse(block_begin, block_end)
+        if start < end:
+            kv_cache.record_connector_reuse(start, end)
 
     def _reserve_connector_prefix(
         self, req: LlmRequest, kv_cache, local_end: int, offered_end: int
@@ -5297,6 +5295,7 @@ class KVCacheManagerV2(BaseResourceManager):
 
         disk_prefetch_blocks = self.impl.get_and_reset_iteration_disk_prefetch_blocks()
         cached_tokens_by_level = self.impl.get_and_reset_iteration_cached_tokens_by_level()
+        connector_cached_tokens = self.impl.get_and_reset_iteration_connector_cached_tokens()
         reused_blocks_by_level = self.impl.get_and_reset_iteration_reused_blocks_by_level()
         connector_reused_blocks = self.impl.get_and_reset_iteration_connector_reused_blocks()
 
@@ -5400,6 +5399,17 @@ class KVCacheManagerV2(BaseResourceManager):
             disk_prefetch_blocks=disk_prefetch_blocks,
             cached_tokens_by_level=list(cached_tokens_by_level),
             cache_level_tiers=self._stats_cache_level_tier_names(),
+            connector_cached_tokens=(
+                connector_cached_tokens if self._connector_reports_cached_tokens() else None
+            ),
+        )
+
+    def _connector_reports_cached_tokens(self) -> bool:
+        """Whether a KV connector can serve prompt tokens, so its cache tier is reported."""
+        return (
+            self.kv_connector_manager is not None
+            and not self.is_draft
+            and not self.kv_connector_manager.capacity_only
         )
 
     def get_block_ids_per_seq(self, request_ids: List[int]) -> torch.Tensor:

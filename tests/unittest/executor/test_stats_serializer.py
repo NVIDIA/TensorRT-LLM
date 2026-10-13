@@ -491,6 +491,7 @@ class TestStatsSerializer:
             disk_prefetch_blocks=7,
             cached_tokens_by_level=[5, 2, 1],
             cache_level_tiers=["gpu", "host", "disk"],
+            connector_cached_tokens=4,
         )
 
         result = BaseWorker._stats_serializer((iter_stats, None, kv_iter))
@@ -501,6 +502,7 @@ class TestStatsSerializer:
         assert d["iterDiskPrefetchBlocks"] == 7
         assert d["iterCachedTokensByLevel"] == [5, 2, 1]
         assert d["kvCacheLevelTiers"] == ["gpu", "host", "disk"]
+        assert d["iterConnectorCachedTokens"] == 4
         # Manager-level, not nested inside the per-pool-group breakdown.
         pool_group = d["kvCacheIterationStatsByPoolGroup"]["0"]
         assert "iterSuspendedRequests" not in pool_group
