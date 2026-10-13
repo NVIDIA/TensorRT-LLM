@@ -259,8 +259,27 @@ class TuneStage:
             target_tests=s.target.replace("tensorrt_llm/_torch/_experimental/", "tests/unittest/_torch/"),
             model=s.model, dev_spools=[Path(p) for p in s.dev_spools], env_script=s.env_script, embargo=s.embargo,
             workload=f"ISL {s.isl} / OSL {s.osl}, concurrency {s.concurrency}, CUDA graphs on.",
-            standings_table=standings, sister_engines=s.sister_engines,
+            standings_table=standings, sister_engines=s.sister_engines, notes=self._sources_note(),
         )  # fmt: skip
+
+    def _sources_note(self) -> str:
+        """Where a tuner looks before writing a kernel (the skill's 'Where hypotheses come from')."""
+        s = self.spec
+        surface = s.workdir.parent / "surface.md"
+        lines = ["## Sources to check before writing a kernel", ""]
+        if surface.exists():
+            lines.append(f"- FlashInfer **as installed**: `{surface}` section 'FlashInfer API' lists the installed version's "
+                         "public callables the engine does not call yet -- a demand one answers is a tier-3 entry "
+                         "(`from flashinfer import ...` in the entry), not a new kernel.")
+        lines += [
+            f"- Earlier choices for this target: `{s.workdir / '08-kernel-sources' / 'kernel_choices.json'}` (chosen + "
+            "alternatives with timings); extend it, do not re-race what is recorded.",
+            f"- Prior art in this repository: `git -C {s.repo} log --oneline -i --grep='perf' -- "
+            "tensorrt_llm/_torch/modules/<similar module> tensorrt_llm/_torch/models/<similar model>` (strategies "
+            "for the same op shapes in other models -- never the embargoed in-tree implementation of this model).",
+            "- Profiles of the current best tree: the latest `roadmap*.yaml` evidence in the campaign workdir.",
+        ]
+        return "\n".join(lines)
 
     def _standings(self) -> str:
         ms = [Measurement.load(self.data / l) for l in (self.t.get("baseline"), self.t.get("reference")) if l and (self.data / l / "meta.json").exists()]

@@ -801,3 +801,22 @@ def test_a_suite_that_cannot_collect_is_an_error_not_a_failure(tmp_path):
     subprocess.run([sys.executable, str(gate), "--model", "m", "--out", str(out), "--anchor", "96.0",
                     "--tests", "tests/unittest/t"], cwd=tree, capture_output=True, text=True)
     assert json.loads((out / "result.json").read_text())["verdict"] == "ERROR"
+
+
+def test_a_tuner_request_names_its_sources(tmp_path):
+    """Every tuner request points at the installed FlashInfer inventory (preflight's surface.md),
+    the recorded kernel choices and the repository's prior perf work -- not just the hypothesis."""
+    from agent_flow.workflows.staircase_onboard.tune.requests import render_request
+
+    repo = _repo(tmp_path)
+    task = {"trtllm_repo_path": str(repo), "checkpoint_path": "/ckpt",
+            "perf": {"identity_configs": [str(tmp_path / "identity.yaml")], "spools": ["s1"], "env_script": "/env.sh",
+                     "sister_engines": ["/engines/vllm"]}}
+    spec = TuneSpec.from_task(task, tmp_path / "ws", target="tensorrt_llm/_torch/_experimental/modeling_v2/models/f/t/")
+    (tmp_path / "ws").mkdir()
+    (tmp_path / "ws" / "surface.md").write_text("## FlashInfer API\n")
+    stage = TuneStage(spec, {}, dispatch=lambda *a: "", checkpoint=lambda: None,
+                      runner_factory=lambda spools, prefix: FakeRunner(spools, prefix, _effect), poll_s=0, log=lambda m: None)
+    req = render_request(stage._context("(none)"), slug="x", worktree=tmp_path / "wt", base="HEAD", hypothesis="h",
+                         deliverables="d", job_prefix="x").read_text()
+    assert "surface.md" in req and "kernel_choices.json" in req and "--grep='perf'" in req and "/engines/vllm" in req

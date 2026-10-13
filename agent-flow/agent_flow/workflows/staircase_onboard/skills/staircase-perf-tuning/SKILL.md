@@ -120,9 +120,31 @@ identical config = best / trtllm-tuned.
 
 ## Profiling
 
-Through the substrate only: `bench.py --nsys <prefix>` with `TLLM_PROFILE_START_STOP=A-B`, inside a
-spool job. The capture flags and the GUI-free extraction recipes are in
+Through the substrate only: `bench.py --nsys` inside a spool job. Session mode is the default (`nsys
+launch` + an external start/stop window after `--nsys-delay`); TensorRT-LLM's in-process recipe
+(`TLLM_PROFILE_START_STOP=A-B`, `-c cudaProfilerApi`) is `--nsys-mode api`. Summarize with
+`tune/nsys_summary.py` per step class (decode / mixed / prefill): at high concurrency about half the
+run is mixed (prefill) steps, which a decode-only profile hides. Flags and extraction recipes:
 [references/nsys.md](references/nsys.md). Never quote a profiled run's throughput.
+
+## Where hypotheses come from
+
+Look in this order; each source has a place in the stage, and a candidate names its source in the
+decision file.
+
+| source | how | where it lives in the stage |
+|---|---|---|
+| runtime knobs and the target's own switches | the Python config ladder; a target switch (an env var, a dormant capability) is an `extra_rungs` entry | `tune/ladder.py`, `perf.ladder.extra_rungs` |
+| the profile | nsys per step class, ranked by exclusive time a change can remove; refreshed on the moved best tree when the roadmap is spent | roadmap turns -> `roadmap*.yaml` |
+| fusion (memory round trips) | a producer/consumer pair that writes and re-reads an activation: fold it into one kernel or a GEMM epilogue ([references/modeling-iterations.md](references/modeling-iterations.md) "Fusion patterns") | tuner turns |
+| ordering and overlap | independent work on a side stream; PDL between dependent small kernels; hoist per-step invariants (same reference, "Ordering") | tuner turns |
+| FlashInfer as installed | the preflight's `surface.md` "FlashInfer API" lists the installed version's callables the engine does not call -- a tier-3 entry (`from flashinfer import ...`), raced against the alternatives | request "Sources to check", `kernel_choices.json` |
+| prior art | this repository's perf commits on similar modules (`git log -i --grep=perf -- <module>`), and the sister engines' strategies (vLLM, SGLang paths in the request) -- strategies only, never the embargoed in-tree implementation of this model | request "Sources to check", `perf.sister_engines` |
+| earlier campaigns | `kernel_choices.json` records the chosen kernel *and* the losing alternatives with timings: a new workload re-reads it before racing again | `<workdir>/08-kernel-sources/kernel_choices.json` |
+
+Micro-bench first, e2e second: a tuner proves a hypothesis on the op or block (`tune/microbench.py`,
+graph and eager timings, cold weights) before the orchestrator spends a node on it, and several
+winners are stacked and measured once.
 
 ## Stop
 
