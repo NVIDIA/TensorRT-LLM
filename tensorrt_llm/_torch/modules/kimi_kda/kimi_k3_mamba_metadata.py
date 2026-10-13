@@ -79,8 +79,8 @@ class KimiK3MambaMetadata(Mamba2Metadata):
 
         ``accepted_draft_tokens`` contains CPU fallback counts for the full
         generation batch. Each ``previous_slots`` entry selects a GPU sampler
-        result, or is None to use that row's CPU count. Unused buffer rows
-        are cleared.
+        result, or is None to use that row's CPU count. Without GPU sampler
+        lengths, all rows use CPU counts. Unused buffer rows are cleared.
         """
         num_generations = len(accepted_draft_tokens)
         assert len(previous_slots) == num_generations <= self.max_batch_size
@@ -103,8 +103,9 @@ class KimiK3MambaMetadata(Mamba2Metadata):
         replay_counts_and_slots.copy_(staging, non_blocking=True)
         host_counts, slots = replay_counts_and_slots.unbind(dim=1)
         counts = self.prev_num_accepted_tokens[:num_generations]
-        if any(slot is not None for slot in previous_slots):
-            assert previous_new_tokens_lens is not None
+        if previous_new_tokens_lens is not None and any(
+            slot is not None for slot in previous_slots
+        ):
             sampled = previous_new_tokens_lens.index_select(0, slots.clamp(min=0))
             # Sampler lengths include the golden token; replay only the drafts.
             sampled.sub_(1).clamp_(min=0)

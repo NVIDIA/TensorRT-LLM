@@ -69,7 +69,8 @@ def test_replay_metadata_copies_counts_and_clears_padding(on_device: bool) -> No
     try:
         attn_metadata.prepare()
         metadata.prepare_prev_num_accepted_tokens(
-            previous_slots=previous_slots if on_device else [None] * len(counts),
+            # Slots can exist without sampler lengths in ordinary overlap.
+            previous_slots=previous_slots,
             # Stale host counts for rows with slots must lose to GPU results.
             accepted_draft_tokens=[4, 9, 2, 9, 9, 3] if on_device else counts,
             previous_new_tokens_lens=previous_lengths if on_device else None,

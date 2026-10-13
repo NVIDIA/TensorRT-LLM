@@ -5406,9 +5406,8 @@ class PyTorchModelEngine(ModelEngine):
                     # the request has previous tensor
                     # previous_batch_indices is per-request, not per-beam
                     previous_batch_indices.append(request.py_batch_idx)
-                    if new_tokens_lens_device is not None:
-                        previous_slot_by_request[
-                            request.py_request_id] = request.py_batch_idx
+                    previous_slot_by_request[
+                        request.py_request_id] = request.py_batch_idx
                     past_seen_token_num = request.max_beam_num_tokens
                     request_has_previous_tensor = True
 
