@@ -208,6 +208,16 @@ Eviction controller
 
 ## Correctness invariants
 
+- The salt component of reuse identity must always be the optional `uint64_t`
+  `ReuseScope::salt`. Scope equality, root/block-key hashing, indexing, and all
+  prefix matching must use this integer, never the original salt string. Preserve
+  the distinction between an absent integer salt and zero.
+- `ReuseScope::originalCacheSalt` and `NodeBase::originalCacheSalt` only preserve
+  the original request string for event payloads. Never compare or hash this
+  metadata, use it as a matching fallback, or derive a new reuse namespace from it
+  inside KVCM. String-to-integer salt derivation belongs to the request adapter.
+  Tests must cover equal integer salts with different strings reusing the same
+  prefix, and different integer salts with the same string remaining isolated.
 - Block keys are SHA-256 digests over the reuse scope and the token sequence.
   They are a security boundary for cross-request reuse. Do not replace,
   truncate, or use a non-cryptographic hash unless prefix matching also gains a

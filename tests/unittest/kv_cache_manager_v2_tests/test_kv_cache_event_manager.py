@@ -1550,15 +1550,44 @@ def test_v2_legacy_reuse_scope_preserves_optional_event_metadata() -> None:
     try:
         scopes = [
             SimpleNamespace(lora_id=None, salt=1),
-            SimpleNamespace(lora_id=None, salt=2, cache_salt="tenant-中文"),
+            SimpleNamespace(lora_id=None, salt=2, original_cache_salt="tenant-中文"),
         ]
         for scope in scopes:
             cache = manager.create_kv_cache(scope)
             try:
                 assert cache.reuse_scope.salt == scope.salt
-                assert cache.reuse_scope.cache_salt == getattr(scope, "cache_salt", None)
+                assert cache.reuse_scope.original_cache_salt == getattr(
+                    scope, "original_cache_salt", None
+                )
             finally:
                 cache.close()
+    finally:
+        manager.shutdown()
+
+
+@pytest.mark.skipif(torch is None or not torch.cuda.is_available(), reason="requires CUDA")
+def test_v2_reuse_matches_only_integer_salt() -> None:
+    init_cuda_once()
+    event_manager = KVCacheEventManager(max_kv_event_entries=16, window_size=128)
+    manager = _create_test_manager(event_manager)
+    try:
+        stream_holder = CachedCudaStream()
+        stream = cast(CudaStream, stream_holder.handle)
+        prefix = _token_ids(1, 9)
+        _commit_and_close(
+            manager,
+            stream,
+            prefix,
+            reuse_scope=ReuseScope(salt=123, original_cache_salt="tenant-A"),
+        )
+        for original_salt in (None, "", "tenant-A", "tenant-中文"):
+            assert manager.probe_reuse(
+                ReuseScope(salt=123, original_cache_salt=original_salt), prefix
+            ) == len(prefix)
+            assert (
+                manager.probe_reuse(ReuseScope(salt=456, original_cache_salt=original_salt), prefix)
+                == 0
+            )
     finally:
         manager.shutdown()
 
@@ -1577,7 +1606,7 @@ def test_v2_stored_events_preserve_original_salt_after_request_close(
     try:
         stream_holder = CachedCudaStream()
         stream = cast(CudaStream, stream_holder.handle)
-        scope = ReuseScope(salt=123, cache_salt=cache_salt)
+        scope = ReuseScope(salt=123, original_cache_salt=cache_salt)
         prefix = _token_ids(1, 9)
         _commit_and_close(manager, stream, prefix, reuse_scope=scope)
         del scope

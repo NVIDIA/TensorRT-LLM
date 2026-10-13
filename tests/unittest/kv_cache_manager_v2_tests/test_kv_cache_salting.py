@@ -45,8 +45,8 @@ class TestReuseScope(unittest.TestCase):
         expected_keys = list(sequence_to_blockchain_keys(2, scope, tokens))
         for cache_salt in (None, "", "tenant-A", "tenant-中文"):
             with self.subTest(cache_salt=cache_salt):
-                with_metadata = ReuseScope(7, 11, cache_salt=cache_salt)
-                self.assertEqual(with_metadata.cache_salt, cache_salt)
+                with_metadata = ReuseScope(7, 11, original_cache_salt=cache_salt)
+                self.assertEqual(with_metadata.original_cache_salt, cache_salt)
                 self.assertEqual(with_metadata, scope)
                 self.assertEqual(with_metadata, (7, 11))
                 self.assertEqual(hash(with_metadata), hash(scope))

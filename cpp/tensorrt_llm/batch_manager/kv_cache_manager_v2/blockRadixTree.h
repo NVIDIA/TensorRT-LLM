@@ -55,7 +55,7 @@ struct ReuseScope
     std::optional<LoraTaskIdType> loraId;
     std::optional<std::uint64_t> salt;
     //! Original salt for event payloads; excluded from reuse identity and block-key hashing.
-    std::shared_ptr<std::string const> cacheSalt;
+    std::shared_ptr<std::string const> originalCacheSalt;
 
     bool operator==(ReuseScope const& other) const noexcept
     {
@@ -71,7 +71,7 @@ struct ReuseScope
 // collision-resistant and >= 256-bit. The radix tree is a globally shared,
 // cross-request/cross-tenant cache index, prefix matching is decided purely by
 // digest equality with NO re-verification of the underlying tokens, and the
-// hashed input (tokens, the user-supplied cache_salt in ReuseScope, multimodal
+// hashed input (tokens, the derived salt in ReuseScope, multimodal
 // content bytes) is attacker-influenceable. A hash collision therefore silently
 // reuses another request's KV blocks (cross-request corruption / data leak),
 // and tenant isolation via cache_salt relies entirely on this hash's collision
@@ -183,7 +183,7 @@ struct NodeBase
     std::unordered_map<BlockKey, SharedPtr<Block>> next;
     EventSink* eventSink;
     //! Shared event metadata remains valid after detachment without retaining ancestor nodes.
-    std::shared_ptr<std::string const> cacheSalt;
+    std::shared_ptr<std::string const> originalCacheSalt;
 
     virtual ~NodeBase();
 
@@ -200,10 +200,10 @@ struct NodeBase
     virtual LifeCycleId numLifeCycles() const noexcept = 0;
 
 protected:
-    NodeBase(BlockKey k, EventSink* sink, std::shared_ptr<std::string const> salt)
+    NodeBase(BlockKey k, EventSink* sink, std::shared_ptr<std::string const> originalCacheSalt_)
         : key(k)
         , eventSink(sink)
-        , cacheSalt(std::move(salt))
+        , originalCacheSalt(std::move(originalCacheSalt_))
     {
     }
 };
