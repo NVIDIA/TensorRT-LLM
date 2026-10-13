@@ -484,6 +484,19 @@ def _bind_failure(kind: str, host: str, port: int,
                         f"Port holder(s): {holder}")
 
 
+def _listener_address_family(kind: str, host: str,
+                             port: int) -> socket.AddressFamily:
+    """The family to bind ``host`` with: IPv6 only if it resolves to nothing else."""
+    try:
+        addr_info = socket.getaddrinfo(host, port, socket.AF_UNSPEC,
+                                       socket.SOCK_STREAM)
+    except socket.gaierror as e:
+        raise _bind_failure(kind, host, port, e) from e
+    if all(info[0] == socket.AF_INET6 for info in addr_info):
+        return socket.AF_INET6
+    return socket.AF_INET
+
+
 class MultiFrontendMode(NamedTuple):
     """This process's role under multi-frontend serving (prototype)."""
     num_frontends: int
@@ -686,10 +699,7 @@ def launch_server(
                 "in-memory store cannot be shared across frontends.")
         os.environ["TRTLLM_RESPONSES_API_DISABLE_STORE"] = "1"
 
-    addr_info = socket.getaddrinfo(host, port, socket.AF_UNSPEC,
-                                   socket.SOCK_STREAM)
-    address_family = socket.AF_INET6 if all(
-        [info[0] == socket.AF_INET6 for info in addr_info]) else socket.AF_INET
+    address_family = _listener_address_family("server", host, port)
     with socket.socket(address_family, socket.SOCK_STREAM) as s:
         # port == 0 lets the kernel pick the port; the caller then needs a way
         # to learn it, either by service discovery or by report_addr.
@@ -916,10 +926,7 @@ def launch_visual_gen_server(
     # uvicorn. VisualGen initialization can take many minutes; if we deferred
     # the bind until uvicorn started, anything else on the host could grab the
     # port in that window and trtllm-serve would die at bind() time.
-    addr_info = socket.getaddrinfo(host, port, socket.AF_UNSPEC,
-                                   socket.SOCK_STREAM)
-    address_family = socket.AF_INET6 if all(
-        [info[0] == socket.AF_INET6 for info in addr_info]) else socket.AF_INET
+    address_family = _listener_address_family("VisualGen server", host, port)
     with socket.socket(address_family, socket.SOCK_STREAM) as s:
         # See launch_server: without this, TIME_WAIT tombstones from the
         # connections this server accepted refuse a restart for ~60s.

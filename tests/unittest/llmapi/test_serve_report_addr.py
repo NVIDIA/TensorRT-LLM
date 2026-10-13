@@ -38,6 +38,7 @@ from tensorrt_llm.commands.serve import (
     _publish_bound_address,
     disaggregated,
     launch_server,
+    launch_visual_gen_server,
 )
 
 # The reader half lives with the integration helpers, so both halves of the
@@ -247,6 +248,26 @@ def test_bind_failure_reports_an_unresolvable_host(monkeypatch: pytest.MonkeyPat
     )
     assert "Port holder" not in str(raised)
     assert diagnosed_ports == []
+
+
+@pytest.mark.parametrize(
+    "launch",
+    [
+        lambda host: launch_server(host, 8000, {"backend": "pytorch", "model": "dummy"}),
+        lambda host: launch_visual_gen_server(host, 8000, "dummy"),
+    ],
+    ids=["server", "visual_gen_server"],
+)
+def test_listeners_report_an_unresolvable_host(monkeypatch: pytest.MonkeyPatch, launch) -> None:
+    """The lookup that picks the address family fails before any bind is tried."""
+
+    def unresolvable(host, *args, **kwargs):
+        raise socket.gaierror(socket.EAI_NONAME, "Name or service not known")
+
+    monkeypatch.setattr(serve_module.socket, "getaddrinfo", unresolvable)
+
+    with pytest.raises(RuntimeError, match="cannot resolve host 'nvl72049-T03'"):
+        launch("nvl72049-T03")
 
 
 def test_bind_failure_names_the_port_holder(monkeypatch: pytest.MonkeyPatch) -> None:
