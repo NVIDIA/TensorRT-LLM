@@ -489,7 +489,7 @@ def pulseMalwareScanContainer(llmRepo, ref) {
                 echo "Scanning ${key}: ${entry.image} (${entry.platform}) -> ${outputDir}"
                 try {
                     sh(
-                        script: "pulse-malware-scanner-cli -n \$NSPECT_ID image-scan --image-ref ${entry.image} --output-dir=${outputDir} --wait-sec=300 --wait-retries=24 --tenant=general-access",
+                        script: "pulse-malware-scanner-cli -n \$NSPECT_ID image-scan --image-ref ${entry.image} --output-dir=${outputDir} --wait-sec=300 --wait-retries=3 --tenant=general-access",
                         label: "Scan ${entry.image}"
                     )
                     sh "ls ${outputDir}"
