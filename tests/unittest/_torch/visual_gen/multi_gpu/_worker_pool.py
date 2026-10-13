@@ -38,12 +38,14 @@ finally a barrier so a collective leaked by one test surfaces in that test's
 deadline rather than in the next test.
 
 A pool is also retired when the parent's env / ``sys.path`` no longer match
-what the ranks froze at spawn, and after ``TRTLLM_TEST_VISUALGEN_POOL_MAX_USES``
-tests (default 16). ``run_distributed(..., reuse=False)`` gives one test fresh
-ranks and drains the cache first; ``TRTLLM_TEST_REUSE_VISUALGEN_WORKERS=0``
-does that for every test (spawn-per-test semantics for state-bleed debugging
-and CI A/B timing). Reuse is off under pytest-xdist workers, where parallel
-pytest processes would multiply live pools on the same GPUs.
+what the ranks froze at spawn. How long a pool otherwise lives is
+``TRTLLM_TEST_VISUALGEN_POOL_LIFETIME``: ``session`` (default: the whole
+pytest run), ``module`` (the package conftest shuts pools down at each test
+file's teardown), or ``test`` (fresh ranks for every test, i.e. the old
+spawn-per-test behaviour, for state-bleed debugging and CI A/B timing).
+``run_distributed(..., reuse=False)`` gives one test fresh ranks and drains the
+cache first. Under pytest-xdist workers the lifetime is forced to ``test``,
+since parallel pytest processes would multiply live pools on the same GPUs.
 
 Parent/rank plumbing is ``mp.Pipe`` connections, not ``mp.Queue``: queues run
 a feeder thread in the parent for the life of the queue, which pytest-threadleak
@@ -53,6 +55,7 @@ charges to whichever test left a pool cached.
 import atexit
 import importlib
 import multiprocessing as mp
+import multiprocessing.util  # registers multiprocessing's atexit hook; see atexit.register below
 import os
 import pickle
 import random
@@ -66,80 +69,68 @@ from typing import Any, Callable
 
 from test_common._session_utils import _spawn_snapshot
 
-# The CI-aware port allocator lives in tests/integration/defs/common.py; it is
-# imported lazily (parent only) because the rank processes are plain
-# interpreters without the __extra_import_path__ finder.
-__extra_import_path__ = ["~/tests/integration"]
-
+# Rank -> parent report tags.
 _READY = "ready"
 _OK = "ok"
 _ERROR = "error"
 
-_SPAWN_RETRIES = 10
-_ADDR_IN_USE_MARKERS = ("EADDRINUSE", "address already in use")
-# After the first failure or death, how long the parent keeps collecting
-# reports from the other ranks before killing the pool. Long enough for a rank
-# that raised independently to get its traceback out, short enough that a
-# peer wedged in a collective does not stall the run.
-_PEER_GRACE_S = 5.0
-_POLL_S = 0.2
-_GRACEFUL_EXIT_S = 30.0
-_REAP_S = 10.0
-_GPU_RELEASE_S = 30.0
-_RESEED = 0
+# The one timing constant: how long the parent waits for a rank to react on
+# its own before escalating. Used for: the other ranks' reports after the
+# first failure, exit after the shutdown sentinel, reaping after SIGKILL, and
+# the driver releasing a killed rank's GPU memory. The pool's margin before
+# pytest-timeout is three of these (reports, reap, GPU release).
+_GRACE_SECONDS = 10.0
+_RNG_SEED_BETWEEN_TESTS = 0
+_LIFETIMES = ("session", "module", "test")
 
-
-def _truthy(name: str, default: str) -> bool:
-    return os.environ.get(name, default).lower() in ("1", "true", "yes", "on")
-
-
+# Mutable module state.
+# Cached live pools keyed by (world_size, backend, preload).
+_POOLS: dict[tuple[int, str, tuple], "_Pool"] = {}
+# The current test's effective pytest-timeout, set per test by the conftest.
+_pytest_timeout: float | None = None
+# The xdist notice is printed once per session.
 _xdist_noted = False
 
 
-def _reuse_enabled() -> bool:
+def lifetime() -> str:
+    """``session``, ``module`` or ``test``; see the module docstring."""
     global _xdist_noted
     if os.environ.get("PYTEST_XDIST_WORKER"):
         if not _xdist_noted:
             _xdist_noted = True
-            _log("pytest-xdist worker: rank pools are not reused (fresh ranks per test)")
-        return False
-    return _truthy("TRTLLM_TEST_REUSE_VISUALGEN_WORKERS", "1")
+            _log("pytest-xdist worker: pool lifetime forced to one test")
+        return "test"
+    value = os.environ.get("TRTLLM_TEST_VISUALGEN_POOL_LIFETIME", "session").lower()
+    if value not in _LIFETIMES:
+        raise ValueError(
+            f"TRTLLM_TEST_VISUALGEN_POOL_LIFETIME={value!r}; expected one of {_LIFETIMES}"
+        )
+    return value
 
 
-def _max_uses() -> int:
-    if not _reuse_enabled():
-        return 1
-    return int(os.environ.get("TRTLLM_TEST_VISUALGEN_POOL_MAX_USES", "16"))
+def set_pytest_timeout(seconds: float | None) -> None:
+    """Record the current test's effective pytest-timeout (conftest calls this).
+
+    The pool's deadline for a test (spawn included) is that value minus the
+    time the kill path needs, so the pool fails one test before pytest-timeout
+    kills the whole pytest process. Without pytest-timeout there is no
+    deadline, as with the mp.spawn harness before.
+    """
+    global _pytest_timeout
+    _pytest_timeout = seconds or None
 
 
-def _spawn_timeout() -> float:
-    return float(os.environ.get("TRTLLM_TEST_VISUALGEN_POOL_SPAWN_TIMEOUT", "600"))
-
-
-def _test_timeout() -> float:
-    return float(os.environ.get("TRTLLM_TEST_VISUALGEN_POOL_TEST_TIMEOUT", "900"))
-
-
-def _is_addr_in_use(exc: BaseException) -> bool:
-    msg = str(exc)
-    return any(marker in msg for marker in _ADDR_IN_USE_MARKERS)
+def _default_timeout() -> float | None:
+    if _pytest_timeout is None:
+        return None
+    margin = 3 * _GRACE_SECONDS
+    # A pytest-timeout too short to leave a margin: use it whole and let
+    # pytest-timeout win the race, which is the test author's choice.
+    return _pytest_timeout - margin if _pytest_timeout > margin else _pytest_timeout
 
 
 def _log(msg: str) -> None:
     print(f"[visualgen-pool] {msg}", flush=True)
-
-
-def _free_port() -> int:
-    try:
-        from defs.common import get_free_port_in_ci
-    except ImportError:
-        # Outside pytest (no __extra_import_path__ finder): plain ephemeral port.
-        import socket
-
-        with socket.socket() as s:
-            s.bind(("127.0.0.1", 0))
-            return s.getsockname()[1]
-    return get_free_port_in_ci()
 
 
 class WorkerPoolError(RuntimeError):
@@ -215,11 +206,11 @@ def _reset_rank_state(env_snapshot: dict) -> None:
     os.environ.clear()
     os.environ.update(env_snapshot)
 
-    random.seed(_RESEED)
+    random.seed(_RNG_SEED_BETWEEN_TESTS)
     numpy = sys.modules.get("numpy")
     if numpy is not None:
-        numpy.random.seed(_RESEED)
-    torch.manual_seed(_RESEED)
+        numpy.random.seed(_RNG_SEED_BETWEEN_TESTS)
+    torch.manual_seed(_RNG_SEED_BETWEEN_TESTS)
 
     # Only touch singletons of modules the test actually loaded; importing
     # them here would pull the whole library into a rank that never used it.
@@ -339,7 +330,6 @@ class _Pool:
         self.world_size = world_size
         self.backend = backend
         self.preload = preload
-        self.uses = 0
         self.snapshot = _spawn_snapshot()
         self._ctx = mp.get_context("spawn")
         self._procs: list = []
@@ -348,23 +338,17 @@ class _Pool:
 
     # ---- lifecycle ----
 
-    def start(self) -> None:
-        last_exc: BaseException | None = None
-        for _ in range(_SPAWN_RETRIES):
-            port = _free_port()
+    def start(self, deadline_at: float | None) -> None:
+        from ._visual_gen_dist_utils import spawn_with_retry
+
+        def attempt(port: int) -> None:
             self._launch(port)
-            try:
-                self._collect(_READY, _spawn_timeout(), f"spawn on port {port}")
-                return
-            except WorkerPoolError as exc:
-                # _collect already killed the ranks. The rendezvous TCPStore can
-                # lose the bind race on a busy node; anything else (CUDA init
-                # failure included) is real and raised at once.
-                if not _is_addr_in_use(exc):
-                    raise
-                last_exc = exc
-        assert last_exc is not None
-        raise last_exc
+            # On failure _collect has already killed the ranks. A rendezvous
+            # EADDRINUSE is retried with a fresh port by spawn_with_retry;
+            # anything else (CUDA init failure included) is raised at once.
+            self._collect(_READY, deadline_at, f"spawn on port {port}")
+
+        spawn_with_retry(attempt, retryable=(WorkerPoolError,))
 
     def _launch(self, port: int) -> None:
         self._procs, self._task_conns, self._result_conns = [], [], []
@@ -393,13 +377,13 @@ class _Pool:
             self._task_conns.append(task_w)
             self._result_conns.append(result_r)
 
-    def run(self, fn: Callable, args: tuple, kwargs: dict, timeout: float) -> None:
+    def run(self, fn: Callable, args: tuple, kwargs: dict, deadline_at: float | None) -> None:
         # Pickle up front so an unpicklable fn fails here with a clear error.
         payload = pickle.dumps((fn, args, kwargs))
         try:
             for conn in self._task_conns:
                 conn.send(payload)
-            self._collect(_OK, timeout, getattr(fn, "__name__", repr(fn)))
+            self._collect(_OK, deadline_at, getattr(fn, "__name__", repr(fn)))
         except BaseException:
             self.kill()
             raise
@@ -415,7 +399,7 @@ class _Pool:
                 conn.send(None)
             except (OSError, ValueError):
                 pass
-        deadline = time.monotonic() + _GRACEFUL_EXIT_S
+        deadline = time.monotonic() + _GRACE_SECONDS
         for p in self._procs:
             p.join(timeout=max(0.0, deadline - time.monotonic()))
         return self.kill()
@@ -430,63 +414,75 @@ class _Pool:
         and ``shutdown`` are the only things that end them.
 
         Returns a report of anything that did not go away: a rank the kernel
-        did not reap within ``_REAP_S`` (stuck in the driver), or rank pids
-        that nvidia-smi still lists after ``_GPU_RELEASE_S``. Empty on success.
+        did not reap in time (stuck in the driver), or rank pids that
+        nvidia-smi still lists as holding GPU memory. Empty on success.
         """
         pids = {p.pid for p in self._procs if p.pid is not None}
         for p in self._procs:
             if p.is_alive():
                 p.kill()
         for p in self._procs:
-            p.join(timeout=_REAP_S)
+            p.join(timeout=_GRACE_SECONDS)
         for conn in [*self._task_conns, *self._result_conns]:
             conn.close()
         problems = []
         alive = sorted(p.pid for p in self._procs if p.is_alive())
         if alive:
-            problems.append(f"ranks not reaped {_REAP_S:.0f}s after SIGKILL (pids {alive})")
+            problems.append(f"ranks not reaped {_GRACE_SECONDS:.0f}s after SIGKILL (pids {alive})")
         if self.backend == "nccl" and pids:
-            held = _gpu_holders(pids, _GPU_RELEASE_S)
+            held = _gpu_holders(pids, _GRACE_SECONDS)
             if held:
                 problems.append(
-                    f"rank pids {held} still hold GPU memory {_GPU_RELEASE_S:.0f}s after SIGKILL"
+                    f"rank pids {held} still hold GPU memory {_GRACE_SECONDS:.0f}s after SIGKILL"
                 )
         self._procs, self._task_conns, self._result_conns = [], [], []
         return "\n".join(problems)
 
     # ---- result collection ----
 
-    def _collect(self, expect: str, timeout: float, what: str) -> None:
+    def _collect(self, expect: str, deadline_at: float | None, what: str) -> None:
         """Wait for one report per rank; raise unless all of them are ``expect``.
 
-        Stops waiting early once any rank has failed or died, after a grace
-        period for the other ranks' reports -- the survivors may be blocked in
-        a collective and would never report on their own.
+        Sleeps on the ranks' result pipes and their death sentinels at once, so
+        a report or a dead rank wakes the parent immediately. Stops waiting
+        early once any rank has failed or died, after a grace period for the
+        other ranks' reports -- the survivors may be blocked in a collective
+        and would never report on their own.
         """
-        deadline = time.monotonic() + timeout
         reports: dict[int, tuple[str, Any]] = {}
         first_failure_at: float | None = None
 
         while len(reports) < self.world_size:
             now = time.monotonic()
-            if now >= deadline:
-                msg = self._describe(
-                    what, reports, f"timed out after {timeout:.0f}s", "no report by the deadline"
-                )
+            if deadline_at is not None and now >= deadline_at:
+                msg = self._describe(what, reports, "deadline reached", "no report by the deadline")
                 raise WorkerPoolError(self._append_kill_report(msg))
-            if first_failure_at is not None and now - first_failure_at >= _PEER_GRACE_S:
+            if first_failure_at is not None and now - first_failure_at >= _GRACE_SECONDS:
                 break
-            pending = [self._result_conns[r] for r in range(self.world_size) if r not in reports]
-            for conn in _wait_connections(pending, timeout=_POLL_S):
-                try:
-                    rank, status, detail = conn.recv()
-                except EOFError:
-                    continue  # rank died; picked up by _dead_ranks below
-                reports[rank] = (status, detail)
-                if status != expect and first_failure_at is None:
-                    first_failure_at = time.monotonic()
-            if first_failure_at is None and self._dead_ranks(reports):
-                first_failure_at = time.monotonic()
+            pending = [r for r in range(self.world_size) if r not in reports]
+            waitables = [self._result_conns[r] for r in pending]
+            waitables += [self._procs[r].sentinel for r in pending if self._procs[r].is_alive()]
+            if len(waitables) == len(pending) and first_failure_at is not None:
+                break  # every pending rank is dead; nothing more will arrive
+            budgets = []
+            if deadline_at is not None:
+                budgets.append(deadline_at - now)
+            if first_failure_at is not None:
+                budgets.append(_GRACE_SECONDS - (now - first_failure_at))
+            ready = _wait_connections(waitables, timeout=min(budgets) if budgets else None)
+            for obj in ready:
+                if obj in self._result_conns:
+                    try:
+                        rank, status, detail = obj.recv()
+                    except EOFError:  # rank died before reporting
+                        if first_failure_at is None:
+                            first_failure_at = time.monotonic()
+                        continue
+                    reports[rank] = (status, detail)
+                    if status != expect and first_failure_at is None:
+                        first_failure_at = time.monotonic()
+                elif first_failure_at is None:
+                    first_failure_at = time.monotonic()  # a sentinel fired: rank died
 
         if len(reports) == self.world_size and all(s == expect for s, _ in reports.values()):
             return
@@ -536,8 +532,6 @@ class _Pool:
 # Pool cache
 # ---------------------------------------------------------------------------
 
-_POOLS: dict[tuple[int, str, tuple], _Pool] = {}
-
 
 def _retire(pool: _Pool, reason: str) -> None:
     _log(f"retiring {pool.world_size}-rank {pool.backend} pool: {reason}")
@@ -546,31 +540,24 @@ def _retire(pool: _Pool, reason: str) -> None:
         raise WorkerPoolError(f"retired {pool.world_size}-rank {pool.backend} pool:\n{problems}")
 
 
-def _acquire(world_size: int, backend: str, preload: tuple) -> _Pool:
+def _acquire(world_size: int, backend: str, preload: tuple, deadline_at: float | None) -> _Pool:
     key = (world_size, backend, preload)
     pool = _POOLS.pop(key, None)
-    if pool is not None:
-        if pool.snapshot != _spawn_snapshot():
-            _retire(pool, "env/sys.path changed since spawn")
-            pool = None
-        elif pool.uses >= _max_uses():
-            _retire(pool, f"use cap {_max_uses()} reached")
-            pool = None
+    if pool is not None and pool.snapshot != _spawn_snapshot():
+        _retire(pool, "env/sys.path changed since spawn")
+        pool = None
     if pool is None:
         _log(f"spawning {world_size}-rank {backend} pool")
         t0 = time.monotonic()
         pool = _Pool(world_size, backend, preload)
-        pool.start()
+        pool.start(deadline_at)
         _log(f"{world_size}-rank {backend} pool ready in {time.monotonic() - t0:.0f}s")
     return pool
 
 
 def _release(pool: _Pool) -> None:
-    pool.uses += 1
-    if pool.uses >= _max_uses():
-        _retire(
-            pool, "fresh ranks per test" if _max_uses() == 1 else f"use cap {_max_uses()} reached"
-        )
+    if lifetime() == "test":
+        _retire(pool, "pool lifetime is one test")
     else:
         _POOLS[(pool.world_size, pool.backend, pool.preload)] = pool
 
@@ -586,9 +573,8 @@ def shutdown_all() -> None:
 
 # multiprocessing's own exit hook joins non-daemon children, which would block
 # forever on ranks parked at their task connection. atexit runs hooks last-in
-# first-out, so make sure that hook is registered before ours.
-import multiprocessing.util  # noqa: E402,F401
-
+# first-out; importing multiprocessing.util above registered that hook first,
+# so ours runs before it.
 atexit.register(shutdown_all)
 
 
@@ -605,9 +591,11 @@ def run_distributed(
     """Run ``fn(rank, world_size, *args, **kwargs)`` on every rank of a pool.
 
     Raises :class:`WorkerPoolError` carrying every rank's traceback if any rank
-    fails, dies, or the run exceeds ``timeout`` seconds (default
-    ``TRTLLM_TEST_VISUALGEN_POOL_TEST_TIMEOUT``, 900). ``fn`` and its arguments
-    must be picklable; ``fn`` must be a module-level function.
+    fails, dies, or the run (spawn included) exceeds ``timeout`` seconds. The
+    default deadline is the test's pytest-timeout minus the kill path's budget,
+    so the pool fails one test instead of pytest-timeout killing the whole
+    process; without pytest-timeout there is no deadline. ``fn`` and its
+    arguments must be picklable; ``fn`` must be a module-level function.
 
     ``reuse=False`` drains every cached pool first and runs ``fn`` on fresh
     ranks that are shut down afterwards, for a test that depends on process
@@ -617,15 +605,16 @@ def run_distributed(
     slow library import is paid under the spawn deadline and shows in the
     pool's ready time instead of inflating the first test's time.
     """
-    deadline = _test_timeout() if timeout is None else timeout
+    budget = _default_timeout() if timeout is None else timeout
+    deadline_at = None if budget is None else time.monotonic() + budget
     if not reuse:
         shutdown_all()
-        pool = _acquire(world_size, backend, preload)
+        pool = _acquire(world_size, backend, preload, deadline_at)
         try:
-            pool.run(fn, args, kwargs, deadline)
+            pool.run(fn, args, kwargs, deadline_at)
         finally:
             _retire(pool, "test asked for fresh ranks")
         return
-    pool = _acquire(world_size, backend, preload)
-    pool.run(fn, args, kwargs, deadline)
+    pool = _acquire(world_size, backend, preload, deadline_at)
+    pool.run(fn, args, kwargs, deadline_at)
     _release(pool)

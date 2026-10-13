@@ -8,11 +8,49 @@
   down after its teardown, the same rule the MPI session reuse applies.
 - Session end: shut the pools down before pytest exits so their GPU memory is
   released on the pool's terms rather than by the interpreter's exit sequence.
+- Module lifetime: with TRTLLM_TEST_VISUALGEN_POOL_LIFETIME=module, shut the
+  pools down at every test file's teardown.
+- Deadline: hand the pool each test's effective pytest-timeout (marker, then
+  --timeout, then PYTEST_TIMEOUT, then the ini key: the plugin's own
+  precedence), so the pool's per-test deadline follows whatever CI configures
+  instead of a knob of its own.
 """
 
-from ._worker_pool import shutdown_all
+import os
+
+import pytest
+
+from ._worker_pool import lifetime, set_pytest_timeout, shutdown_all
 
 _FAILED_ITEMS: set[str] = set()
+
+
+def _effective_pytest_timeout(item) -> float | None:
+    marker = item.get_closest_marker("timeout")
+    if marker is not None:
+        value = marker.kwargs.get("timeout", marker.args[0] if marker.args else None)
+        if value is not None:
+            return float(value)
+    value = item.config.getoption("timeout", default=None)
+    if value is None:
+        value = os.environ.get("PYTEST_TIMEOUT") or None
+    if value is None:
+        try:
+            value = item.config.getini("timeout") or None
+        except ValueError:  # pytest-timeout not installed: no such ini key
+            value = None
+    return float(value) if value is not None else None
+
+
+def pytest_runtest_setup(item):
+    set_pytest_timeout(_effective_pytest_timeout(item))
+
+
+@pytest.fixture(autouse=True, scope="module")
+def _pool_module_lifetime():
+    yield
+    if lifetime() == "module":
+        shutdown_all()
 
 
 def pytest_runtest_logreport(report):

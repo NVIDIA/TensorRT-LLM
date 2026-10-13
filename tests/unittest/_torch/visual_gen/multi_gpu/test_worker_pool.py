@@ -4,7 +4,7 @@
 
 Every scenario in the pool's failure contract gets a case: reuse across tests,
 a rank raising while its peer blocks in a collective, a rank dying without a
-report, a hung test hitting the deadline, the kill switch / use cap, the between-test
+report, a hung test hitting the deadline, the pool lifetime knob, the between-test
 reset of process state, and ranks dying with their parent.
 """
 
@@ -136,13 +136,14 @@ def test_rank_failure_kills_pool_and_reports_peer(tmp_path):
 
     t0 = time.monotonic()
     with pytest.raises(WorkerPoolError) as exc_info:
-        run_distributed(2, _rank1_raises_rank0_waits, backend="gloo", timeout=_TIMEOUT)
+        run_distributed(2, _rank1_raises_rank0_waits, backend="gloo", timeout=120)
     elapsed = time.monotonic() - t0
     msg = str(exc_info.value)
     assert "boom on rank 1" in msg
     assert "rank 0: no report (killed after peer failure)" in msg
-    # Rank 0 was stuck in a collective; we must not have waited for the deadline.
-    assert elapsed < _TIMEOUT
+    # Rank 0 was stuck in a collective; we must not have waited for the deadline,
+    # only the grace period for its report.
+    assert elapsed < 2 * pool_mod._GRACE_SECONDS
 
     run_distributed(2, _write_pid, p, backend="gloo", timeout=_TIMEOUT)
     assert set(_read_pids(p, 2)).isdisjoint(before)
@@ -157,28 +158,49 @@ def test_dead_rank_is_detected():
 
 
 def test_hung_test_hits_deadline():
-    with pytest.raises(WorkerPoolError, match="timed out after 3s"):
-        run_distributed(2, _hang_forever, backend="gloo", timeout=3.0)
+    t0 = time.monotonic()
+    with pytest.raises(WorkerPoolError, match="deadline reached"):
+        run_distributed(2, _hang_forever, backend="gloo", timeout=15)
+    assert time.monotonic() - t0 < 15 + pool_mod._GRACE_SECONDS
 
 
-def test_kill_switch_gives_fresh_ranks(tmp_path, monkeypatch):
-    monkeypatch.setenv("TRTLLM_TEST_REUSE_VISUALGEN_WORKERS", "0")
+@pytest.mark.timeout(60)
+def test_default_deadline_follows_pytest_timeout():
+    """With a 60 s pytest-timeout the pool must give up first (at 60 s minus
+    the kill path's margin), so the test fails on its own instead of
+    pytest-timeout killing the whole process."""
+    t0 = time.monotonic()
+    with pytest.raises(WorkerPoolError, match="deadline reached"):
+        run_distributed(2, _hang_forever, backend="gloo")
+    assert time.monotonic() - t0 < 60 - pool_mod._GRACE_SECONDS
+
+
+def test_lifetime_test_gives_fresh_ranks(tmp_path, monkeypatch):
+    monkeypatch.setenv("TRTLLM_TEST_VISUALGEN_POOL_LIFETIME", "test")
     p = str(tmp_path / "pid")
     run_distributed(2, _write_pid, p, backend="gloo", timeout=_TIMEOUT)
     first = _read_pids(p, 2)
+    assert not pool_mod._POOLS
     run_distributed(2, _write_pid, p, backend="gloo", timeout=_TIMEOUT)
     assert set(_read_pids(p, 2)).isdisjoint(first)
 
 
-def test_use_cap_retires_pool(tmp_path, monkeypatch):
-    monkeypatch.setenv("TRTLLM_TEST_VISUALGEN_POOL_MAX_USES", "2")
+def test_lifetime_module_keeps_pool_until_module_teardown(tmp_path, monkeypatch):
+    """Within a module the pool is reused; the conftest fixture shuts it down at
+    module teardown, which cannot be observed from inside the module."""
+    monkeypatch.setenv("TRTLLM_TEST_VISUALGEN_POOL_LIFETIME", "module")
     p = str(tmp_path / "pid")
     run_distributed(2, _write_pid, p, backend="gloo", timeout=_TIMEOUT)
     first = _read_pids(p, 2)
     run_distributed(2, _write_pid, p, backend="gloo", timeout=_TIMEOUT)
     assert _read_pids(p, 2) == first
-    run_distributed(2, _write_pid, p, backend="gloo", timeout=_TIMEOUT)
-    assert set(_read_pids(p, 2)).isdisjoint(first)
+    assert pool_mod._POOLS
+
+
+def test_lifetime_value_is_validated(monkeypatch):
+    monkeypatch.setenv("TRTLLM_TEST_VISUALGEN_POOL_LIFETIME", "forever")
+    with pytest.raises(ValueError, match="TRTLLM_TEST_VISUALGEN_POOL_LIFETIME"):
+        pool_mod.lifetime()
 
 
 def test_env_change_retires_pool(tmp_path, monkeypatch):
