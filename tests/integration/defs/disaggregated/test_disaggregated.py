@@ -349,8 +349,6 @@ def get_test_config(test_desc, example_dir, test_root):
         f"{test_configs_root}/disagg_config_ctxpp4_genpp4.yaml",
         "ctxpp4_gentp4":
         f"{test_configs_root}/disagg_config_ctxpp4_gentp4.yaml",
-        "deepseek_v3_lite_fp8_mpi":
-        f"{test_configs_root}/disagg_config_ctxtp2_gentp2_deepseek_v3_lite_mpi.yaml",
         "deepseek_v3_lite_fp8_nixl":
         f"{test_configs_root}/disagg_config_ctxtp2_gentp2_deepseek_v3_lite_nixl.yaml",
         "deepseek_v3_lite_fp8_tp1":
@@ -1823,28 +1821,6 @@ def test_disaggregated_ctxpp4_gentp4(disaggregated_test_root, llm_venv,
                            "ctxpp4_gentp4",
                            env=llm_venv._new_env,
                            model_path=qwen_model_root,
-                           cwd=llm_venv.get_working_directory())
-
-
-@skip_no_hopper
-@pytest.mark.skip_less_device(4)
-@pytest.mark.skip(
-    reason="MPI cache transceiver requires shared MPI process group, "
-    "incompatible with service discovery which launches separate subprocesses")
-@pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
-                         indirect=True)
-def test_disaggregated_deepseek_v3_lite_fp8_mpi(disaggregated_test_root,
-                                                disaggregated_example_root,
-                                                llm_venv,
-                                                deepseek_v3_model_root):
-    setup_model_symlink(llm_venv, deepseek_v3_model_root,
-                        "DeepSeek-V3-Lite/fp8")
-    env = llm_venv._new_env.copy()
-    env["TRTLLM_USE_MPI_KVCACHE"] = "1"
-    run_disaggregated_test(disaggregated_example_root,
-                           "deepseek_v3_lite_fp8_mpi",
-                           env=env,
-                           model_path=deepseek_v3_model_root,
                            cwd=llm_venv.get_working_directory())
 
 
@@ -4310,14 +4286,19 @@ def test_disaggregated_logprobs_serving(disaggregated_test_root,
                         **base
                     }
 
-                # 1) Streaming vs non-streaming consistency check
-                async with session.post(url,
-                                        json=make_payload(prompt, False),
-                                        timeout=timeout) as resp:
-                    assert resp.status == 200, \
-                        f"[{api_type}] non-streaming: {await resp.text()}"
-                    ns_tokens, ns_logprobs = extract_logprobs(
-                        await resp.json(), api_type)
+                # 1) Streaming vs non-streaming consistency check.
+                # Block reuse is on, and a cold prefill is not bit-identical
+                # to a reused prefix. Issue the non-streaming request twice
+                # and keep the second result so both sides of the comparison
+                # hit the reuse path.
+                for _ in range(2):
+                    async with session.post(url,
+                                            json=make_payload(prompt, False),
+                                            timeout=timeout) as resp:
+                        assert resp.status == 200, \
+                            f"[{api_type}] non-streaming: {await resp.text()}"
+                        ns_tokens, ns_logprobs = extract_logprobs(
+                            await resp.json(), api_type)
 
                 async with session.post(url,
                                         json=make_payload(prompt, True),
@@ -4332,13 +4313,10 @@ def test_disaggregated_logprobs_serving(disaggregated_test_root,
                 assert len(ns_logprobs) == len(st_logprobs), (
                     f"[{api_type}] logprobs length: "
                     f"{len(ns_logprobs)} vs {len(st_logprobs)}")
-                # Skip position 0: the first token logprob can diverge
-                # between streaming and non-streaming in disaggregated mode
-                # due to the context/generation handoff boundary.
                 comparable = 0
                 for i, (n, s) in enumerate(
                         zip(ns_logprobs, st_logprobs, strict=True)):
-                    if i == 0 or n is None or s is None:
+                    if n is None or s is None:
                         continue
                     comparable += 1
                     rtol, atol = (1e-3, 1e-4) if api_type == "chat" else (1e-4,
@@ -4346,7 +4324,7 @@ def test_disaggregated_logprobs_serving(disaggregated_test_root,
                     assert np.isclose(n, s, rtol=rtol, atol=atol), \
                         f"[{api_type}] logprob mismatch at {i}: {n} vs {s}"
                 assert comparable > 0, (
-                    f"[{api_type}] no comparable post-handoff logprobs found")
+                    f"[{api_type}] no comparable logprobs found")
 
                 # 2) Chat API with top_logprobs (requires gather_generation_logits)
                 if api_type == "chat":

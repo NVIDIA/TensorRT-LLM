@@ -28,6 +28,7 @@ def _manager(
     manager = KVCacheManagerV2.__new__(KVCacheManagerV2)
     manager.enable_block_reuse = False
     manager.block_reuse_policy = BlockReusePolicy.ALL_REUSABLE
+    manager.kv_cache_type = CacheType.SELF
     manager.is_draft = is_draft
     manager.max_beam_width = 1
     manager._has_cp_helix = False
