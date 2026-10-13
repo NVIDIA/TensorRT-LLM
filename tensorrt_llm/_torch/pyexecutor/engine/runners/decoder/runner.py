@@ -238,7 +238,7 @@ class ExtraInputsCollector:
 _NO_EXTRA_INPUTS = ExtraInputsCollector()
 
 
-class _PrefillCompiledModel(torch.nn.Module):
+class PrefillCompiledModel(torch.nn.Module):
     """Share weights between eligible prefill/mixed and original eager paths.
 
     The prefill flag includes the all-rank attention-DP decision and capture
@@ -329,8 +329,8 @@ class DecoderRunner(ScheduledModelRunner):
             assert isinstance(model, DecoderModelForCausalLM), (
                 "compile_only_piecewise_graphs requires DecoderModelForCausalLM"
             )
-            assert isinstance(model.model, _PrefillCompiledModel), (
-                "compile_only_piecewise_graphs requires a _PrefillCompiledModel decoder body"
+            assert isinstance(model.model, PrefillCompiledModel), (
+                "compile_only_piecewise_graphs requires a PrefillCompiledModel decoder body"
             )
         self.input_processor = input_processor
         self._model_caller = model_caller

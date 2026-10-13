@@ -35,7 +35,7 @@ from tensorrt_llm._torch.models.modeling_utils import DecoderModelForCausalLM
 from tensorrt_llm._torch.modules.linear import MXFP8LinearMethod
 from tensorrt_llm._torch.pyexecutor.engine.model_call import ModelCaller
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import DecoderRunner
-from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner import _PrefillCompiledModel
+from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner import PrefillCompiledModel
 from tensorrt_llm._torch.pyexecutor.engine.runners.encoder_decoder import EncoderDecoderRunner
 from tensorrt_llm._torch.pyexecutor.engine.runners.no_kv_cache import NoKVCacheRunner
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
@@ -191,7 +191,7 @@ def test_pcg_fx_fallback_policy_is_model_specific(
         )
         assert backend_factory.call_args.args[0] is False  # Inductor stays disabled.
         if expected_prefill_only:
-            assert isinstance(model.model, _PrefillCompiledModel)
+            assert isinstance(model.model, PrefillCompiledModel)
             assert model.model.eager_model is eager
             assert model.model.compiled_model is compiled
         else:
@@ -211,7 +211,7 @@ def test_prefill_compile_uses_all_rank_prefill_decision(
     expected = torch.ones((2, 4))
     eager.forward = Mock(return_value=expected)
     compiled.forward = Mock(return_value=expected)
-    router = _PrefillCompiledModel(eager, compiled)
+    router = PrefillCompiledModel(eager, compiled)
     assert router.weight is eager.weight
     assert list(router.parameters()) == list(eager.parameters())
     # Local decode-only ranks participate when another attention-DP rank
@@ -241,7 +241,7 @@ def test_prefill_compile_preserves_partial_weight_reload(
     model.model_config = SimpleNamespace(
         pretrained_config=SimpleNamespace(tie_word_embeddings=False)
     )
-    model.model = _PrefillCompiledModel(eager, compiled)
+    model.model = PrefillCompiledModel(eager, compiled)
     mapper = HfWeightMapper()
     mapper._model = model
     loader = ModelLoader.__new__(ModelLoader)
@@ -309,7 +309,7 @@ def test_prefill_compile_scopes_whole_model_forward(
     eager_model.forward = forward
     compiled_model = torch.nn.Identity()
     compiled_model.forward = forward
-    prefill_compiled_model = _PrefillCompiledModel(eager_model, compiled_model)
+    prefill_compiled_model = PrefillCompiledModel(eager_model, compiled_model)
     model = prefill_compiled_model if prefill_only else eager_model
     engine = SimpleNamespace(
         _model_caller=ModelCaller(model, prefill_compile_only=prefill_only),

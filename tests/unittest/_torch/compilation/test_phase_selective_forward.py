@@ -13,23 +13,23 @@ from utils.util import skip_pre_hopper
 from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm._torch.models.modeling_utils import DecoderModelForCausalLM
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import DecoderRunner
-from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner import _PrefillCompiledModel
+from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner import PrefillCompiledModel
 from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
 from tensorrt_llm.llmapi import CudaGraphConfig, PrefillCudaGraphBackend, TorchCompileConfig
 
 
-def _create_prefill_compiled_model() -> tuple[_PrefillCompiledModel, Mock, Mock]:
+def _create_prefill_compiled_model() -> tuple[PrefillCompiledModel, Mock, Mock]:
     eager_model = torch.nn.Module()
     compiled_model = torch.nn.Module()
     eager_forward = Mock(return_value="eager")
     compiled_forward = Mock(return_value="compiled")
     eager_model.forward = eager_forward
     compiled_model.forward = compiled_forward
-    return (_PrefillCompiledModel(eager_model, compiled_model), eager_forward, compiled_forward)
+    return (PrefillCompiledModel(eager_model, compiled_model), eager_forward, compiled_forward)
 
 
 def _create_compile_restricted_runner(
-    model: _PrefillCompiledModel, enabled: bool = True
+    model: PrefillCompiledModel, enabled: bool = True
 ) -> DecoderRunner:
     runner = object.__new__(DecoderRunner)
     runner._config = SimpleNamespace(compile_only_piecewise_graphs=enabled)
@@ -178,7 +178,7 @@ def test_decoder_runner_validates_compiled_body_at_initialization(
     ):
         monkeypatch.setattr(DecoderRunner, method, Mock())
     expected_error = (
-        pytest.raises(AssertionError, match="_PrefillCompiledModel decoder body")
+        pytest.raises(AssertionError, match="PrefillCompiledModel decoder body")
         if enabled and not has_wrapper
         else contextlib.nullcontext()
     )

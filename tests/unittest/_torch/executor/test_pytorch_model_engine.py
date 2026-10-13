@@ -29,8 +29,8 @@ from tensorrt_llm._torch.pyexecutor.engine.multimodal import \
     setup_mm_encoder_attn_metadata
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import DecoderRunner
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner import (
-    _get_context_prompt_lookahead_token, _make_single_token_context_graph_batch,
-    _PrefillCompiledModel)
+    PrefillCompiledModel, _get_context_prompt_lookahead_token,
+    _make_single_token_context_graph_batch)
 from tensorrt_llm._torch.pyexecutor.engine.runners.pooling import PoolingRunner
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
@@ -402,7 +402,7 @@ def test_decoder_forward_routes_compile_bypass(enabled: bool,
     compiled = torch.nn.Identity()
     eager.forward = Mock(return_value=outputs)
     compiled.forward = Mock(return_value=outputs)
-    wrapper = _PrefillCompiledModel(eager, compiled)
+    wrapper = PrefillCompiledModel(eager, compiled)
     engine._runner._config.compile_only_piecewise_graphs = enabled
     engine._runner.model.model = wrapper
     engine._runner._forward_step.side_effect = lambda *args, **kwargs: wrapper()

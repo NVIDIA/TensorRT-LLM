@@ -58,7 +58,7 @@ from .engine.runners.common import (make_scheduled_inputs,
                                     resolve_mrope_position_deltas_cache,
                                     set_moe_a2a_warmup)
 from .engine.runners.decoder import DecoderRunner, DecoderRunnerConfig
-from .engine.runners.decoder.runner import _PrefillCompiledModel
+from .engine.runners.decoder.runner import PrefillCompiledModel
 from .engine.runners.encoder import EncoderRunner, EncoderRunnerConfig
 from .engine.runners.encoder_decoder import (EncoderDecoderRunner,
                                              EncoderDecoderRunnerConfig,
@@ -517,7 +517,7 @@ class PyTorchModelEngine(ModelEngine):
                         and (compile_only_piecewise_graphs
                              or not self.model.use_fx_for_pcg_fallback))
                     if self._torch_compile_prefill_only:
-                        self.model.model = _PrefillCompiledModel(
+                        self.model.model = PrefillCompiledModel(
                             eager_model, compiled_model)
                     else:
                         self.model.model = compiled_model
