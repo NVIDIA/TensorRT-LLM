@@ -601,12 +601,12 @@ def processScanResults(ref) {
                         }
                         rows << sep
                         detectedLicensesTable = "Non-permissive licenses detected:\n${rows.join('\n')}"
-                        if (params.scanMode == "monitor") {
+                        if (params.scanMode in ["monitor", "pre_merge"]) {
                             echo detectedLicensesTable
                             currentBuild.description = "⚠️ Non-permissive licenses detected — click 'Console Output' to review"
                         }
                     }
-                    if (result.detected_vulnerabilities && params.scanMode == "monitor") {
+                    if (result.detected_vulnerabilities && params.scanMode in ["monitor", "pre_merge"]) {
                         def vulnCols = [
                             [title: 'SCAN TYPE',       key: 'scan_type'],
                             [title: 'PACKAGE NAME',    key: 'package_name'],
