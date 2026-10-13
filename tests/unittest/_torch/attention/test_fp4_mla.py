@@ -410,6 +410,8 @@ def test_mla_fp4_helix_generation_reaches_fused_cache_update() -> None:
         aux_stream=None,
         ln_events=[None, None],
         _bmm_bf16_out=lambda *args: None,
+        # MLA.__init__ default; the BF16 k_b_proj BMM passes it through.
+        _locality_domain_k_b_proj_trans_shards=None,
     )
     metadata = SimpleNamespace(
         num_seqs=num_tokens,
