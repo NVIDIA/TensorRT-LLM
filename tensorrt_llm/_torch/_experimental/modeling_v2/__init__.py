@@ -26,11 +26,20 @@ loader builds it, so nothing here competes for an architecture slot and the
 zoo's static index never has to know these classes exist.
 """
 
-from ._router_index import MODELING_V2_ROUTERS, ModelingV2Mode, NoTarget, modeling_v2_resolve
+from ._router_index import (
+    MODELING_V2_ROUTERS,
+    MODELING_V2_VALIDATE_ENV,
+    ModelingV2Mode,
+    NoTarget,
+    modeling_v2_resolve,
+    step_contract_enabled,
+)
 
 __all__ = [
     "MODELING_V2_ROUTERS",
+    "MODELING_V2_VALIDATE_ENV",
     "ModelingV2Mode",
     "NoTarget",
     "modeling_v2_resolve",
+    "step_contract_enabled",
 ]
