@@ -15,8 +15,7 @@
 """Tests for dual-pool KV cache construction (enc-dec Steps 4 and 5).
 
 Validates budget splitting, ResourceManagerType.CROSS_KV_CACHE_MANAGER
-registration, and the cross pool wiring for the default V2 ``KVCacheManagerV2``
-and the V1 ``KVCacheManager`` compatibility path.
+registration, and the cross pool wiring for ``KVCacheManagerV2``.
 """
 
 from types import SimpleNamespace
@@ -36,7 +35,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
 from tensorrt_llm._torch.pyexecutor.model_loader import validate_encoder_decoder_kv_cache_config
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
-from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager, ResourceManagerType
+from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
 from tensorrt_llm.llmapi.llm_args import CapacitySchedulerPolicy, KvCacheConfig, TorchLlmArgs
 from tensorrt_llm.mapping import Mapping
 
@@ -58,7 +57,6 @@ _DUMMY_MODEL = "/tmp/dummy_model_dual_pool_test"
 def _make_kv_cache_config(
     cross_kv_cache_fraction=None,
     max_gpu_total_bytes=None,
-    use_kv_cache_manager_v2=True,
     max_tokens=None,
     free_gpu_memory_fraction=0.9,
     host_cache_size=None,
@@ -67,7 +65,7 @@ def _make_kv_cache_config(
     return KvCacheConfig(
         cross_kv_cache_fraction=cross_kv_cache_fraction,
         max_gpu_total_bytes=max_gpu_total_bytes or 0,
-        use_kv_cache_manager_v2=use_kv_cache_manager_v2,
+        use_kv_cache_manager_v2=True,
         max_tokens=max_tokens,
         free_gpu_memory_fraction=free_gpu_memory_fraction,
         host_cache_size=host_cache_size,
@@ -126,24 +124,12 @@ def _make_creator(
     kv_cache_config,
     model_config=None,
     is_enc_dec=False,
-    manager_cls=None,
     mapping=None,
 ):
-    """Create a KvCacheCreator from real config objects and a mock engine.
-
-    ``manager_cls`` selects the KV cache manager class the creator binds to.
-    Defaults to ``KVCacheManagerV2`` when ``kv_cache_config.use_kv_cache_manager_v2``
-    is True, otherwise the V1 ``KVCacheManager``.  Tests can override
-    explicitly via ``manager_cls`` to exercise either path independently.
-    """
+    """Create a V2 KvCacheCreator from real config objects and a mock engine."""
     if model_config is None:
         model_config = _make_model_config(is_encoder_decoder=is_enc_dec)
     model_engine = _make_mock_model_engine(model_config)
-
-    if manager_cls is None:
-        manager_cls = (
-            KVCacheManagerV2 if kv_cache_config.use_kv_cache_manager_v2 else KVCacheManager
-        )
 
     llm_args = TorchLlmArgs(model=_DUMMY_MODEL, skip_tokenizer_init=True)
     # TorchLlmArgs defaults max_input_len to 1024, which would silently cap
@@ -172,7 +158,7 @@ def _make_creator(
     creator._net_max_seq_len = 2048
     creator._dummy_reqs = None
     creator._profiling_stage_data = None
-    creator._kv_cache_manager_cls = manager_cls
+    creator._kv_cache_manager_cls = KVCacheManagerV2
     creator._execution_stream = None
     creator._draft_config = None
     creator._skip_est = True
@@ -345,13 +331,10 @@ class TestResourceManagerType:
 class TestCrossKvCacheConstruction:
     """Exercise the Steps 4 and 5 construction path beyond helper math."""
 
-    @pytest.mark.parametrize("use_kv_cache_manager_v2", [False, True])
-    def test_create_cross_kv_cache_manager_uses_encoder_geometry(self, use_kv_cache_manager_v2):
-        expected_cls = KVCacheManagerV2 if use_kv_cache_manager_v2 else KVCacheManager
+    def test_create_cross_kv_cache_manager_uses_encoder_geometry(self):
         config = _make_kv_cache_config(
             cross_kv_cache_fraction=0.5,
             max_gpu_total_bytes=8 * (1 << 30),
-            use_kv_cache_manager_v2=use_kv_cache_manager_v2,
         )
         model_config = _make_model_config(
             is_encoder_decoder=True,
@@ -366,7 +349,7 @@ class TestCrossKvCacheConstruction:
             d_model=768,
             max_position_embeddings=1024,
         )
-        creator = _make_creator(config, model_config=model_config, manager_cls=expected_cls)
+        creator = _make_creator(config, model_config=model_config)
         cross_cfg = config.model_copy()
 
         with patch(
@@ -378,7 +361,7 @@ class TestCrossKvCacheConstruction:
         kwargs = create_mock.call_args.kwargs
         # Cross pool must use the same manager class as the self pool so
         # both pools share the same runtime ABI.
-        assert kwargs["kv_cache_manager_cls"] is expected_cls
+        assert kwargs["kv_cache_manager_cls"] is KVCacheManagerV2
         assert kwargs["num_layers"] == 10
         assert kwargs["num_kv_heads"] == 12
         assert kwargs["head_dim"] == 64
@@ -400,7 +383,6 @@ class TestCrossKvCacheConstruction:
             cross_kv_cache_fraction=0.5,
             max_gpu_total_bytes=8 * (1 << 30),
             max_tokens=2048,
-            use_kv_cache_manager_v2=True,
             host_cache_size=0,
         )
         model_config = _make_model_config(
@@ -571,22 +553,19 @@ class TestCrossKvCacheConstruction:
         assert proxy_model_config.pretrained_config.head_dim == 64
         assert cross_call.kwargs["num_layers"] == 10
 
-    @pytest.mark.parametrize("use_kv_cache_manager_v2", [False, True])
-    def test_build_managers_registers_cross_pool_for_enc_dec(self, use_kv_cache_manager_v2):
-        expected_cls = KVCacheManagerV2 if use_kv_cache_manager_v2 else KVCacheManager
+    def test_build_managers_registers_cross_pool_for_enc_dec(self):
         creator = _make_creator(
             _make_kv_cache_config(
                 cross_kv_cache_fraction=0.5,
                 max_gpu_total_bytes=8 * (1 << 30),
-                use_kv_cache_manager_v2=use_kv_cache_manager_v2,
             ),
             is_enc_dec=True,
         )
         creator.configure_kv_cache_capacity = Mock()
         creator._should_create_separate_draft_kv_cache = Mock(return_value=False)
         creator._split_kv_cache_budget_for_cross = Mock(return_value=(Mock(), Mock()))
-        self_mgr = Mock(spec=expected_cls)
-        cross_mgr = Mock(spec=expected_cls)
+        self_mgr = Mock(spec=KVCacheManagerV2)
+        cross_mgr = Mock(spec=KVCacheManagerV2)
         creator._create_kv_cache_manager = Mock(return_value=self_mgr)
 
         resources = {}
@@ -600,22 +579,18 @@ class TestCrossKvCacheConstruction:
         assert resources[ResourceManagerType.CROSS_KV_CACHE_MANAGER] is cross_mgr
         create_mock.assert_called_once()
         kwargs = create_mock.call_args.kwargs
-        assert kwargs["kv_cache_manager_cls"] is expected_cls
+        assert kwargs["kv_cache_manager_cls"] is KVCacheManagerV2
         assert kwargs["kv_cache_type"] == (
             tensorrt_llm.bindings.internal.batch_manager.CacheType.CROSS
         )
 
-    @pytest.mark.parametrize("use_kv_cache_manager_v2", [False, True])
-    def test_build_managers_registers_cross_pool_for_enc_dec_estimation(
-        self, use_kv_cache_manager_v2
-    ):
+    def test_build_managers_registers_cross_pool_for_enc_dec_estimation(self):
         creator = _make_creator(
             _make_kv_cache_config(
                 cross_kv_cache_fraction=0.5,
                 max_gpu_total_bytes=0,
                 max_tokens=1024,
                 free_gpu_memory_fraction=0.8,
-                use_kv_cache_manager_v2=use_kv_cache_manager_v2,
             ),
             is_enc_dec=True,
         )
@@ -630,17 +605,13 @@ class TestCrossKvCacheConstruction:
 
         creator._create_cross_kv_cache_manager.assert_called_once()
 
-    @pytest.mark.parametrize("use_kv_cache_manager_v2", [False, True])
-    def test_build_managers_uses_split_cross_budget_without_mutating_base_config(
-        self, use_kv_cache_manager_v2
-    ):
+    def test_build_managers_uses_split_cross_budget_without_mutating_base_config(self):
         total_budget = 10 * (1 << 30)
         creator = _make_creator(
             _make_kv_cache_config(
                 cross_kv_cache_fraction=0.5,
                 max_gpu_total_bytes=total_budget,
                 free_gpu_memory_fraction=0.9,
-                use_kv_cache_manager_v2=use_kv_cache_manager_v2,
             ),
             is_enc_dec=True,
         )
@@ -933,18 +904,15 @@ class TestCrossCacheV2Lifecycle:
             cross_manager.update_context_resources.assert_called_once_with(batch)
 
 
-@pytest.mark.parametrize("use_v2", [False, True])
 @pytest.mark.parametrize("is_encoder_decoder", [False, True])
-def test_v2_encoder_decoder_reuse_requires_source_identity(
-    use_v2: bool, is_encoder_decoder: bool
-) -> None:
+def test_v2_encoder_decoder_reuse_requires_source_identity(is_encoder_decoder: bool) -> None:
     model_config = _make_model_config(is_encoder_decoder=is_encoder_decoder)
     cache_config = KvCacheConfig(
-        use_kv_cache_manager_v2=use_v2,
+        use_kv_cache_manager_v2=True,
         enable_block_reuse=True,
         cross_kv_cache_fraction=0.5 if is_encoder_decoder else None,
     )
     validate_encoder_decoder_kv_cache_config(model_config, cache_config)
 
-    assert cache_config.enable_block_reuse is not (use_v2 and is_encoder_decoder)
-    assert cache_config.use_kv_cache_manager_v2 is use_v2
+    assert cache_config.enable_block_reuse is not is_encoder_decoder
+    assert cache_config.use_kv_cache_manager_v2 is True
