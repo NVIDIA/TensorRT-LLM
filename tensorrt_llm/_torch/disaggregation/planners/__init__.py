@@ -12,24 +12,25 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Which disaggregated KV transfer planner serves a deployment.
+"""The KV transfer planner the user asks for, bound to the model it will serve.
 
-Each planner class judges deployments itself through
-``supports_deployment(architecture, mapping)``: the model architecture and the
-parallel topology are the whole input, so the built-in model and any
-modeling_v2 target of the same architecture are judged alike. Models declare
-nothing. This module is the one place that knows every planner, and it answers
-one question: which planner supports the deployment a model instance was built
-for? None means the engine keeps the framework's default plan.
+The user names a planner by setting ``TRTLLM_KV_TRANSFER_PLANNER`` to its
+``planner_id``; ``PLANNERS`` maps every id to its class. Unset, every model
+keeps the framework's default plan. The named planner must support the
+deployment, the model architecture under the parallel topology it is built
+for, or binding fails with a clear reason. Both sides of a disaggregated pair
+must name the same planner; the framework refuses to connect ranks whose
+``planner_id`` differs.
 
 Binding happens where the model is constructed (``AutoModelForCausalLM``),
-by installing the covering planner's factory as the instance's
+by installing the planner's factory as the instance's
 ``build_transfer_planner``; the framework reads that hook and nothing else.
 """
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Optional, Type
+import os
+from typing import TYPE_CHECKING, Dict, Optional, Type
 
 from tensorrt_llm._torch.disaggregation.base.planner import TransferPlanner
 
@@ -37,34 +38,43 @@ from .deepseek_mla_latent import DeepseekMlaLatentTransferPlanner
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.model_config import ModelConfig
-    from tensorrt_llm.mapping import Mapping
 
-#: Every planner a deployment may be served by. Order carries no meaning: a
-#: deployment two planners support is a configuration error, not a priority
-#: question.
-PLANNERS: tuple = (DeepseekMlaLatentTransferPlanner,)
+PLANNER_ENV_VAR = "TRTLLM_KV_TRANSFER_PLANNER"
 
-
-def planner_for(architecture: str, mapping: "Mapping") -> Optional[Type[TransferPlanner]]:
-    """The planner that supports ``architecture`` sharded as ``mapping`` says, or None."""
-    found = [p for p in PLANNERS if p.supports_deployment(architecture, mapping)]
-    if len(found) > 1:
-        names = ", ".join(p.__name__ for p in found)
-        raise ValueError(f"{architecture} is supported by more than one planner: {names}")
-    return found[0] if found else None
+#: Every planner a user may name, keyed by its ``planner_id``.
+PLANNERS: Dict[str, Type[TransferPlanner]] = {
+    p.planner_id: p for p in (DeepseekMlaLatentTransferPlanner,)
+}
 
 
 def bind_transfer_planner(model, model_config: "ModelConfig") -> Optional[Type[TransferPlanner]]:
-    """Install the supporting planner's factory on ``model``; return the planner or None.
+    """Install the planner named by the environment on ``model``; return it, or None if none is named.
 
-    The factory has the ``build_transfer_planner`` signature the framework calls.
+    Raises ``ValueError`` when the name is unknown or the planner does not
+    support this deployment.
     """
+    key = os.environ.get(PLANNER_ENV_VAR, "")
+    if not key:
+        return None
+    planner_cls = PLANNERS.get(key)
+    if planner_cls is None:
+        raise ValueError(
+            f"{PLANNER_ENV_VAR}={key!r} names no KV transfer planner; "
+            f"known planners: {sorted(PLANNERS)}"
+        )
     architectures = getattr(model_config.pretrained_config, "architectures", None)
     if not architectures:
-        return None
-    planner_cls = planner_for(architectures[0], model_config.mapping)
-    if planner_cls is None:
-        return None
+        raise ValueError(
+            f"{PLANNER_ENV_VAR}={key!r} needs a model architecture, "
+            "but the pretrained config names none"
+        )
+    mapping = model_config.mapping
+    if not planner_cls.supports_deployment(architectures[0], mapping):
+        raise ValueError(
+            f"{planner_cls.__name__} does not support {architectures[0]} with "
+            f"tp={mapping.tp_size} pp={mapping.pp_size} cp={mapping.cp_size} "
+            f"attention_dp={bool(mapping.enable_attention_dp)}"
+        )
 
     def build_transfer_planner(kv_cache_manager, self_rank_info, self_extractor):
         return planner_cls(self_rank_info, self_extractor)
@@ -73,4 +83,4 @@ def bind_transfer_planner(model, model_config: "ModelConfig") -> Optional[Type[T
     return planner_cls
 
 
-__all__ = ["PLANNERS", "bind_transfer_planner", "planner_for"]
+__all__ = ["PLANNER_ENV_VAR", "PLANNERS", "bind_transfer_planner"]

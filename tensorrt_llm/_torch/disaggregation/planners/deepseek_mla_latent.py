@@ -20,7 +20,8 @@ block's bytes for all local layers are one contiguous slot. The plan is then
 plain arithmetic: pair block ordinals both sides hold, address the slots, and
 copy. Blocks that are consecutive on both sides move as one fragment.
 
-``supports_deployment`` says which deployments this plan holds for: a
+The user selects this planner by name (see ``disaggregation.planners``);
+``supports_deployment`` then checks that the plan holds for the deployment: a
 DeepSeek-V3 architecture under attention-DP with no pipeline or context
 parallelism. The latent KV is never sharded across ranks, so the width of
 either side does not matter and a dep4 context may feed a dep8 generation.
