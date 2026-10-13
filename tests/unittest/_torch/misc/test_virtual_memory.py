@@ -199,6 +199,11 @@ def test_kv_cache_manager(process_gpu_memory_info_available, manager_cls,
         kv_cache_params["head_dim"] = [64, 32] * 4
 
     mgr = manager_cls(**kv_cache_params)
+    if manager_cls is KVCacheManagerV2:
+        # Page migration lazily initializes process-wide CUDA stream pools.
+        mgr.add_dummy_requests([123], token_nums=[128], is_gen=True)
+        mgr.release_memory(restore_mode)
+        mgr.materialize_memory()
     mgr.shutdown()
     del mgr
 
@@ -249,6 +254,7 @@ def test_kv_cache_manager(process_gpu_memory_info_available, manager_cls,
         for buffer in buffers:
             buffer.fill_(cycle + 1)
         torch.cuda.synchronize()
+        memory_usage_materialized = get_current_process_gpu_memory()
         if manager_cls is KVCacheManagerV2:
             old_cache = mgr.kv_cache_map[dummy.py_request_id]
         assert virtual_memory.release_with_tag(tag, resource=resource) > 0
