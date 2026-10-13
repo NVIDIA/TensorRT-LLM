@@ -491,3 +491,22 @@ def test_one_control_is_queued_per_waiting_measurement_not_per_host(tmp_path):
         if not camp.step():
             break
     assert camp.state.candidates["fast-path"].status == "kept"
+
+
+def test_the_gate_runs_the_target_suite_first_and_fails_without_the_eval(tmp_path):
+    import sys
+
+    from agent_flow.workflows.staircase_onboard.tune import campaign as campaign_mod
+
+    tree = tmp_path / "tree"
+    (tree / "tests" / "unittest" / "t").mkdir(parents=True)
+    (tree / "tests" / "unittest" / "t" / "test_block.py").write_text("def test_block():\n    assert False, 'in_proj'\n")
+    gate = Path(campaign_mod.__file__).parent / "gate_accuracy.py"
+    out = tmp_path / "out"
+    rc = subprocess.run([sys.executable, str(gate), "--model", "m", "--out", str(out), "--anchor", "96.0",
+                         "--tests", "tests/unittest/t"], cwd=tree, capture_output=True, text=True).returncode
+    result = json.loads((out / "result.json").read_text())
+    assert rc == 1 and result["verdict"] == "FAIL" and result["score"] is None
+    assert "1 failed" in result["reason"] and not (out / "eval.log").exists()
+    cmd = campaign_mod.gate_command(Path("/pkg"), Path("/env.sh"), "m", 96.0, tests=["tests/unittest/t"])(tree, [], out)
+    assert "--tests tests/unittest/t" in cmd

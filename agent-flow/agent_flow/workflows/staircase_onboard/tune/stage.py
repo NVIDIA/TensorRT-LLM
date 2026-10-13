@@ -243,6 +243,14 @@ class TuneStage:
         ms = [Measurement.load(self.data / l) for l in (self.t.get("baseline"), self.t.get("reference")) if l and (self.data / l / "meta.json").exists()]
         return format_table(ms, ms[0] if ms else None) if ms else "(no measurement yet)"
 
+    def _gate_tests(self) -> list[str]:
+        """The target's own suite and the modeling_v2 contract tests: run on every tree gated."""
+        if not self.spec.campaign.get("gate_tests", True):
+            return []
+        shared = "tests/unittest/_torch/modeling_v2/"
+        return [self.spec.target.replace("tensorrt_llm/_torch/_experimental/", "tests/unittest/_torch/"),
+                *(shared + f"test_modeling_v2_{n}.py" for n in ("claims", "no_stale_claims", "target_contract", "routing"))]
+
     def _roadmap(self, n: int = 1, tried: Sequence[str] = ()) -> list[dict]:
         """Roadmap ``n``: the first from the baseline profile, later ones re-profiled on the moved best tree."""
         what = "roadmap" if n == 1 else f"roadmap-{n}"
@@ -280,7 +288,8 @@ class TuneStage:
         camp = Campaign(
             workdir=s.workdir, repo=s.repo, bench=s.bench(), base_configs=s.identity_configs,
             perf_runner=self.runners(s.spools, "tunec"), gate_runner=self.runners(s.dev_spools, "tuneg"),
-            gate_cmd=gate_command(PACKAGE, s.env_script, s.model, float(acc.get("anchor", 0.0)), acc.get("task", "gsm8k")),
+            gate_cmd=gate_command(PACKAGE, s.env_script, s.model, float(acc.get("anchor", 0.0)), acc.get("task", "gsm8k"),
+                                  tests=self._gate_tests()),
             noise=NoiseFloor(spread=dict(self.t.get("noise_spread") or {}), samples=int(self.t.get("noise_samples", 0))),
             min_gain=float(cfg.get("min_gain", 0.01)), noise_factor=float(cfg.get("noise_factor", 3.0)), log=self.log,
         )  # fmt: skip

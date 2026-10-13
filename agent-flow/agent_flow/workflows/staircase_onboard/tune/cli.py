@@ -101,7 +101,7 @@ def build_campaign(perf: dict, log=print) -> Campaign:
         perf_runner=SpoolRunner(c.get("perf_spools", perf["spools"]), prefix="camp"),
         gate_runner=SpoolRunner(c.get("gate_spools", perf["spools"]), prefix="camp"),
         gate_cmd=gate_command(Path(__file__).resolve().parent.parent, Path(perf["env_script"]), perf["model"],
-                              float(c.get("anchor", 0.0)), c.get("task", "gsm8k")),
+                              float(c.get("anchor", 0.0)), c.get("task", "gsm8k"), tests=c.get("gate_tests") or ()),
         noise=NoiseFloor(spread=noise_spread, samples=int(c.get("noise_samples", 0))),
         min_gain=float(c.get("min_gain", 0.01)),
         noise_factor=float(c.get("noise_factor", 3.0)),

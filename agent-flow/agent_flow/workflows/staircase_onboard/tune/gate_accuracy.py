@@ -8,6 +8,10 @@ Merges the identity config with every kept overlay, **forces**
 argument; an environment variable selects nothing), runs ``trtllm-eval`` and
 writes ``result.json`` with the score, the floor and the verdict. The floor is
 the anchor minus ``k`` standard errors of the benchmark's own sample count.
+
+With ``--tests``, the target's test suite runs first on the same tree: a stack
+of candidates that each passed their own op tests can still break a block test
+neither ran. A failing suite fails the gate without spending the eval.
 """
 
 from __future__ import annotations
@@ -39,9 +43,29 @@ def main() -> int:
     p.add_argument("--anchor", type=float, required=True)
     p.add_argument("--k", type=float, default=2.0)
     p.add_argument("--eval-args", default='--apply_chat_template --fewshot_as_multiturn --chat_template_kwargs={"enable_thinking":false} --random_seed=0 --max_output_length=512 --max_input_length=4096')
+    p.add_argument("--tests", action="append", default=[],
+                   help="repo-relative test path run with pytest from tests/unittest before the eval")
     args = p.parse_args()
 
     args.out.mkdir(parents=True, exist_ok=True)
+    tests = None
+    if args.tests:
+        root = Path.cwd() / "tests" / "unittest"
+        paths = [str(Path(t).relative_to("tests/unittest")) if t.startswith("tests/unittest/") else t for t in args.tests]
+        tlog = args.out / "tests.log"
+        with tlog.open("w") as fh:
+            trc = subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", *paths], cwd=root,
+                                 stdout=fh, stderr=subprocess.STDOUT).returncode
+        lines = [l for l in tlog.read_text(errors="replace").splitlines() if l.strip()]
+        tests = {"rc": trc, "summary": lines[-1] if lines else "", "log": str(tlog), "paths": args.tests,
+                 "failed": [l.split(" ", 1)[1] for l in lines if l.startswith("FAILED ")][:50]}
+        if trc != 0:
+            result = {"task": args.task, "score": None, "anchor": args.anchor, "verdict": "FAIL",
+                      "reason": f"target tests failed: {tests['summary']}", "tests": tests,
+                      "tree": os.environ.get("STAIRCASE_TREE", "")}
+            (args.out / "result.json").write_text(json.dumps(result, indent=2) + "\n")
+            print(f"[gate] tests FAILED: {tests['summary']}")
+            return 1
     config = resolve_config(args.config, [])
     config["modeling_v2"] = "require"
     env_overrides = config.get("env_overrides") or {}
@@ -65,7 +89,7 @@ def main() -> int:
     result = {"task": args.task, "score": score, "anchor": args.anchor, "se": round(se, 4), "k": args.k,
               "floor": round(floor, 4), "verdict": verdict, "rc": rc, "configs": [str(c) for c in args.config],
               "merged": str(merged), "seconds": round(time.time() - started, 1),
-              "tree": os.environ.get("STAIRCASE_TREE", ""), "argv": argv}
+              "tree": os.environ.get("STAIRCASE_TREE", ""), "argv": argv, "tests": tests}
     (args.out / "result.json").write_text(json.dumps(result, indent=2) + "\n")
     print(f"[gate] {args.task} score={score} floor={floor:.2f} verdict={verdict}")
     return 0 if verdict == "PASS" else 1

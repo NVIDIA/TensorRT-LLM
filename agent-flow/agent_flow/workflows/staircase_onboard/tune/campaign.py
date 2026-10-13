@@ -693,10 +693,13 @@ class Campaign:
         return "\n".join(lines)
 
 
-def gate_command(package: Path, env_script: Path, model: str, anchor: float, task: str = "gsm8k"):
+def gate_command(package: Path, env_script: Path, model: str, anchor: float, task: str = "gsm8k",
+                 tests: Sequence[str] = ()):
     def build(tree: Path, configs: Sequence[Path], out: Path) -> str:
         argv = ["python", str(package / "tune" / "gate_accuracy.py"), "--model", model, "--out", str(out),
                 "--task", task, "--anchor", str(anchor)]
+        for t in tests:
+            argv += ["--tests", str(t)]
         for c in configs:
             argv += ["--config", str(c)]
         return f"source {shlex.quote(str(env_script))}\ncd {shlex.quote(str(tree))}\n" + " ".join(shlex.quote(a) for a in argv)
