@@ -61,7 +61,9 @@ def _make_model_config(backend: str = "VANILLA") -> DiffusionModelConfig:
 class _TileDecoder(torch.nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Tile-dependent values expose wrong ordering and overlap blending.
-        return (x + x.mean()).repeat_interleave(2, -2).repeat_interleave(2, -1)
+        # Per batch entry, like the ViT decoder: the single-rank path batches tiles.
+        mean = x.mean(dim=tuple(range(1, x.ndim)), keepdim=True)
+        return (x + mean).repeat_interleave(2, -2).repeat_interleave(2, -1)
 
 
 def _make_vae() -> TiledAutoencoderKLMiniMaxH3:
@@ -171,6 +173,8 @@ def _partial_vae_worker(rank: int, port: int) -> None:
                 visual_gen_mapping=vgm,
             )
             pipeline.vae = _make_vae().to(device).eval()
+            # Two tiles per decoder call: several gathers per clip, the last one padded.
+            pipeline.vae.max_tiles_per_decoder_call = 2
             pipeline.setup_parallel_vae()
             assert pipeline._parallel_vae_enabled == (size > 1)
             assert (pipeline.vae.tile_parallel_group is not None) == (size > 1 and rank < size)
