@@ -582,7 +582,9 @@ class KimiKDALinearAttention(nn.Module):
             weight = self._qkvg_proj_weight
             # The transposed GEMM writes rows of T elements; cuBLAS's fast
             # kernels need each row to start on a 16-byte boundary and fall
-            # back to a several-times-slower one otherwise.
+            # back to a several-times-slower one otherwise. When aligned, the
+            # channel-major result is still preferred: its in-place convolution
+            # is faster than the channel-last one for single long sequences.
             if x2d.shape[0] * x2d.element_size() % 16 == 0:
                 packed_conv = torch.mm(weight[: 3 * d], x2d.t())
             else:

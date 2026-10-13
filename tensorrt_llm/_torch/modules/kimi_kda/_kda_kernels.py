@@ -68,14 +68,15 @@ def is_kda_optimized_supported() -> bool:
     return get_kda_sm_version() in (100, 103)
 
 
-@triton.jit(do_not_specialize=["num_tokens", "outer_stride"])
+@triton.jit(do_not_specialize=["num_tokens", "feature_stride"])
 def _fused_kda_post_conv_kernel(
     packed_ptr,
     q_out_ptr,
     k_out_ptr,
     v_out_ptr,
     num_tokens,
-    outer_stride,
+    token_stride,
+    feature_stride,
     l2_norm_eps,
     NUM_HEADS: tl.constexpr,
     HEAD_DIM: tl.constexpr,
@@ -87,7 +88,10 @@ def _fused_kda_post_conv_kernel(
 
     ``packed`` is ``[3 * NUM_HEADS * HEAD_DIM, num_tokens]`` with one unit
     stride: along tokens (channel-major) or, with ``TOKEN_MAJOR``, along
-    features. ``outer_stride`` is the other stride.
+    features. ``token_stride`` stays specialized so Triton sees when
+    token-major rows start 16-byte aligned and vectorizes their loads.
+    ``feature_stride`` is the token count in channel-major mode, where
+    specializing it selects a slower layout.
     """
     token_offsets = tl.program_id(0) * BLOCK_TOKENS + tl.arange(0, BLOCK_TOKENS)
     head_idx = tl.program_id(1)
@@ -98,13 +102,14 @@ def _fused_kda_post_conv_kernel(
 
     feature_offsets = head_idx * HEAD_DIM + dim_offsets
     projection_size = NUM_HEADS * HEAD_DIM
-    outer_stride_i64 = outer_stride.to(tl.int64)
     if TOKEN_MAJOR:
+        outer_stride_i64 = token_stride.to(tl.int64)
         source_offsets = token_offsets[:, None].to(tl.int64) * outer_stride_i64 + feature_offsets[
             None, :
         ].to(tl.int64)
         section_stride = projection_size
     else:
+        outer_stride_i64 = feature_stride.to(tl.int64)
         source_offsets = feature_offsets[None, :].to(tl.int64) * outer_stride_i64 + token_offsets[
             :, None
         ].to(tl.int64)
@@ -156,11 +161,7 @@ def fused_kda_post_conv(
     num_tokens = packed.shape[1]
     feature_stride, token_stride = packed.stride()
     token_major = feature_stride == 1 and num_tokens > 1
-    if token_major:
-        outer_stride = token_stride
-    elif token_stride == 1 or num_tokens <= 1:
-        outer_stride = feature_stride
-    else:
+    if not token_major and token_stride != 1 and num_tokens > 1:
         raise ValueError(
             "Packed KDA post-conv requires a unit stride along tokens or features, "
             f"got strides {packed.stride()}"
@@ -182,7 +183,8 @@ def fused_kda_post_conv(
         k_out,
         v_out,
         num_tokens,
-        outer_stride,
+        token_stride,
+        feature_stride,
         l2_norm_eps,
         num_heads,
         head_dim,
