@@ -241,7 +241,3 @@ For full documentation, see the [Visual Generation](./visual-generation.md) page
 | **Qwen-Image-Layered** | Yes | No | No | No | No | No | Yes | Yes | Yes | No | No | No |
 | **Qwen-Image-Edit-2511** | Yes | Yes | No | Yes | No | No | Yes | Yes | Yes | No | No | No |
 | **Cosmos3** | Yes | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | No | No | Yes |
-
-MiniMax-H3 tensor parallelism applies to the DiT attention and gated MLPs; the
-text encoder remains replicated. Backend restrictions, supported combinations,
-and measured results are in the [MiniMax-H3 notes](visual-generation.md#minimax-h3-notes).
