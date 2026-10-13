@@ -710,3 +710,77 @@ def test_a_winner_that_conflicts_with_a_lone_gated_winner_is_rebased_onto_it(tmp
     assert Path(camp.state.best_tree, "modeling.py").read_text() == "FAST = True\nSIDE = 1\n"
     gated = [json.loads(l)["slug"] for l in (work / "perf_ledger.jsonl").read_text().splitlines() if '"candidate_gate"' in l]
     assert gated == ["fast-path", "side-path"]  # side-path never gated on the old tree
+
+
+def test_a_gate_on_a_tree_another_keep_moved_is_cancelled_and_re_stacked(tmp_path):
+    """Two compatible winners gated one after the other: when the first keeps, the second's
+    gate (on the old stack) is stopped, the candidate re-stacked and measured on the new best."""
+    from agent_flow.workflows.staircase_onboard.tune.campaign import Campaign
+    from agent_flow.workflows.staircase_onboard.tune.ladder import BenchSpec
+    from agent_flow.workflows.staircase_onboard.tune.records import NoiseFloor
+    from agent_flow.workflows.staircase_onboard.tune.worktree import open_candidate
+
+    repo = _repo(tmp_path)
+    (repo / "attn.py").write_text("FUSED = False\n")
+    _git(repo, "add", "attn.py")
+    _git(repo, "commit", "-q", "-m", "attn")
+
+    class SlowGates(FakeRunner):
+        """A gate finishes only once its slug is released."""
+        released: set = set()
+
+        def poll(self):
+            held = {n: v for n, v in self.inflight.items() if not any(f"gate-{r}-" in n for r in self.released)}
+            for n in held:
+                del self.inflight[n]
+            done = super().poll()
+            self.inflight.update(held)
+            return done
+
+    def effect(config, tree):
+        lat = 100.0
+        if tree and "FAST = True" in Path(tree, "modeling.py").read_text():
+            lat *= 1.20
+        if tree and "FUSED = True" in Path(tree, "attn.py").read_text():
+            lat *= 1.10
+        return lat, 2000.0
+
+    identity = tmp_path / "identity.yaml"
+    identity.write_text(yaml.safe_dump({"modeling_v2": "require"}))
+    bench = BenchSpec(bench_py="b", model="m", env_script="e", isl=8192, osl=1024, concurrencies=[1, 128], tree=str(repo))
+    perf, gates = FakeRunner(["s1"], "camp", effect), SlowGates(["g1", "g2"], "campg", effect)
+    work = tmp_path / "camp"
+    msgs = []
+    camp = Campaign(workdir=work, repo=repo, bench=bench, base_configs=[identity], perf_runner=perf, gate_runner=gates,
+                    gate_cmd=lambda tree, configs, out: f"python gate_accuracy.py --out {out}",
+                    noise=NoiseFloor(spread={"con1.tok_s_user": 0.001}), log=msgs.append)
+    camp.state.best_tree = str(open_candidate(repo, work / "wt", "best", "HEAD"))
+    camp.state.best_commit = _git(Path(camp.state.best_tree), "rev-parse", "HEAD")
+    a = camp.state.candidates
+    for slug, path, text in (("fast-path", "modeling.py", "FAST = True\n"), ("fused-attn", "attn.py", "FUSED = True\n")):
+        wt = open_candidate(repo, work / "wt", slug, "HEAD")
+        (wt / path).write_text(text)
+        _git(wt, "commit", "-q", "-am", slug)
+        d = tmp_path / f"{slug}.yaml"
+        d.write_text(yaml.safe_dump({"decision": "CANDIDATE", "worktree": str(wt), "commits": [_git(wt, "rev-parse", "HEAD")]}))
+        camp.submit_candidate(slug, d)
+        for _ in range(10):  # each wins and goes to its gate alone
+            camp.step()
+            if a[slug].status == "gate":
+                break
+    assert a["fast-path"].status == "gate" and a["fused-attn"].status == "gate"
+    for _ in range(3):
+        camp.step()  # both gates queued, held
+    gates.released.add("fast-path")
+    for _ in range(5):
+        camp.step()
+        if a["fast-path"].status == "kept":
+            break
+    camp.step()
+    assert a["fused-attn"].status == "e2e"  # its gate on the old stack was stopped
+    gates.released.add("fused-attn")
+    for _ in range(40):
+        if not camp.step():
+            break
+    assert {s: c.status for s, c in a.items()} == {"fast-path": "kept", "fused-attn": "kept"}
+    assert any("gate cancelled" in m for m in msgs), msgs

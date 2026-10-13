@@ -484,6 +484,14 @@ class Campaign:
                 out = self.workdir / "gates" / f"{st.slug}-{tree_sha}"
                 result = out / "result.json"
                 job = f"gate-{st.slug}-{tree_sha}"
+                if not result.exists() and st.eval_base and st.eval_base != git(Path(self.state.best_tree), "rev-parse", "HEAD"):
+                    # Another keep moved the best tree under this gate: its verdict would be
+                    # about a tree that will never be kept. Stop it, re-stack, measure again.
+                    if self.gates.cancel(job):
+                        self.log(f"[campaign] {st.slug}: best moved during its gate; gate cancelled, re-stacking")
+                    if self._stack(st):
+                        st.status, st.gate = "e2e", {}
+                    continue
                 if not result.exists() and f"{self.gates.prefix}-{job}" not in self.gates.inflight:
                     if job in finished and not self._retry(st, self._rcs[job], "gate"):
                         st.status, st.reason = "reverted", f"accuracy gate did not produce a result; see {out}"
