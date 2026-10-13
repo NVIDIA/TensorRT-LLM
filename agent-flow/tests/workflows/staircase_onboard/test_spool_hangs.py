@@ -361,3 +361,33 @@ def test_the_watchdog_returns_on_the_first_alert(tmp_path):
     alerts, lines = watchdog.watch([tmp_path / "a"], timeout_s=3600, interval_s=1, sleep=fake_sleep)
     assert [a.kind for a in alerts] == ["STALE"] and len(calls) == 1
     assert lines and str(tmp_path / "a") in lines[0]
+
+
+# ------------------------------------------------- processes that setsid away
+
+
+def test_a_process_that_escaped_the_jobs_session_is_reaped(spool, clock, tmp_path):
+    """nsys profile setsid()s itself and the server it launches; once the job's leader
+    exits they are re-parented to init and were never killed, holding the GPU for every
+    later job (observed 2026-10-12 on a GB300 session)."""
+    pidfile = tmp_path / "escaped.pid"
+    sched = make(spool, clock)
+    submit(spool, "escapes", f"setsid sh -c 'echo $$ > {pidfile}; exec sleep 300' & sleep 0.5; exit 0", header="gpus=1")
+    pump(sched, lambda: pidfile.exists() and pidfile.read_text().strip())
+    escaped = int(pidfile.read_text().strip())
+    pump(sched, lambda: rc(spool, "escapes") is not None)
+    clock.advance(1)
+    pump(sched, lambda: not sched.jobs)
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        try:
+            os.kill(escaped, 0)
+        except ProcessLookupError:
+            break
+        with open(f"/proc/{escaped}/stat") as fh:
+            if fh.read().split()[2] == "Z":
+                break
+        time.sleep(0.1)
+    else:
+        os.kill(escaped, 9)
+        raise AssertionError("the escaped process outlived its job")

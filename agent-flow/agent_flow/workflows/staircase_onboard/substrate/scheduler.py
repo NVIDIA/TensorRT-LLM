@@ -422,6 +422,30 @@ def job_processes(leader: int, table: Mapping[int, ProcInfo]) -> list[int]:
     return sorted(pid for pid in found if pid in table and table[pid].state != "Z")
 
 
+def processes_with_marker(
+    table: Mapping[int, ProcInfo], job: str, watcher: str, proc_root: Path = Path("/proc")
+) -> list[int]:
+    """Live processes whose environment names this job of this watcher.
+
+    A process that calls ``setsid`` and is re-parented to init once the job's
+    leader exits (``nsys profile`` and the application it launches do exactly
+    that) is neither in the leader's session nor its descendant any more, so
+    :func:`job_processes` stops seeing it. Its environment still carries the
+    markers every job is started with, and that is what this finds."""
+    want = {f"STAIRCASE_SPOOL_JOB={job}".encode(), f"STAIRCASE_SPOOL_WATCHER={watcher}".encode()}
+    found = []
+    for pid, info in table.items():
+        if info.state == "Z" or pid == os.getpid():
+            continue
+        try:
+            parts = set((proc_root / str(pid) / "environ").read_bytes().split(b"\0"))
+        except OSError:
+            continue
+        if want <= parts:
+            found.append(pid)
+    return sorted(found)
+
+
 def host_memory_available_gb(
     meminfo: Path = Path("/proc/meminfo"), cgroup_root: Path = Path("/sys/fs/cgroup")
 ) -> float | None:
@@ -1211,6 +1235,14 @@ class Scheduler:
 
         if job.verdict is None:
             return
+
+        if table:
+            # Once the job is over, also find what escaped its session (see
+            # processes_with_marker): a stranded profiler or server keeps the
+            # job's devices busy for every job admitted after it.
+            escaped = processes_with_marker(table, job.spec.name, self.watcher_id, self.proc_root)
+            pids = sorted(set(pids) | set(escaped))
+            job.pids = tuple(pids)
 
         live = [pid for pid in pids if pid != job.proc.pid or leader_rc is None]
         safe = [pid for pid in live if pid not in job.unsafe_pids]
