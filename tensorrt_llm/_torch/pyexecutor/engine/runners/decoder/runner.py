@@ -148,7 +148,7 @@ class DecoderRunner(ScheduledModelRunner):
         metrics: dict[str, float],
         mm_item_scheduler: MultimodalItemScheduler | None = None,
     ) -> None:
-        self.model = model
+        self._model = model
         if config.compile_only_piecewise_graphs:
             assert isinstance(model, DecoderModelForCausalLM), (
                 "compile_only_piecewise_graphs requires DecoderModelForCausalLM"
@@ -157,15 +157,15 @@ class DecoderRunner(ScheduledModelRunner):
                 "compile_only_piecewise_graphs requires a PrefillCompiledModel decoder body"
             )
         self._model_caller = model_caller
-        self.mapping = mapping
-        self.dist = dist
+        self._mapping = mapping
+        self._dist = dist
         self._agreement = WarmupAgreement(dist, mapping)
-        self.moe_load_balancer = moe_load_balancer
-        self.sparse_attention_config = sparse_attention_config
+        self._moe_load_balancer = moe_load_balancer
+        self._sparse_attention_config = sparse_attention_config
         self._attention_runtime_features = attention_runtime_features
-        self.get_runtime_tokens_per_gen_step = get_runtime_tokens_per_gen_step
+        self._get_runtime_tokens_per_gen_step = get_runtime_tokens_per_gen_step
         self._warmup_timer = warmup_timer
-        self.iter_states = iter_states
+        self._iter_states = iter_states
         self._metrics = metrics
 
         self._config = config
@@ -185,7 +185,7 @@ class DecoderRunner(ScheduledModelRunner):
         self._eager_workspace_reclaimer: EagerWorkspaceReclaimer | None = None
         self._moe_workspace_reclaimer: CutlassWorkspaceReclaimer | None = None
 
-        self._buffers = DecoderInputBuffers.for_config(self._config, self.use_beam_search)
+        self._buffers = DecoderInputBuffers.for_config(self._config, self._use_beam_search)
         self._metadata = DecoderMetadata(
             config=self._config,
             mapping=mapping,
@@ -235,9 +235,9 @@ class DecoderRunner(ScheduledModelRunner):
     def _dummy_requests_kwargs(self) -> dict[str, Any]:
         return dict(
             config=self._config,
-            model=self.model,
-            get_runtime_tokens_per_gen_step=self.get_runtime_tokens_per_gen_step,
-            release_request_state=getattr(self.model, "release_request_state", None),
+            model=self._model,
+            get_runtime_tokens_per_gen_step=self._get_runtime_tokens_per_gen_step,
+            release_request_state=getattr(self._model, "release_request_state", None),
         )
 
     def _input_preparer_kwargs(
@@ -246,13 +246,13 @@ class DecoderRunner(ScheduledModelRunner):
         return dict(
             buffers=self._buffers,
             config=self._config,
-            mapping=self.mapping,
-            dist=self.dist,
-            model=self.model,
-            get_runtime_tokens_per_gen_step=self.get_runtime_tokens_per_gen_step,
-            iter_states=self.iter_states,
+            mapping=self._mapping,
+            dist=self._dist,
+            model=self._model,
+            get_runtime_tokens_per_gen_step=self._get_runtime_tokens_per_gen_step,
+            iter_states=self._iter_states,
             lora=self._lora,
-            use_beam_search=self.use_beam_search,
+            use_beam_search=self._use_beam_search,
             steady_gen_cache_supported=self._steady_gen_cache_supported,
             mm_item_scheduler=mm_item_scheduler,
         )
@@ -265,14 +265,14 @@ class DecoderRunner(ScheduledModelRunner):
                 cuda_graph_runner
             ),
             config=self._config,
-            mapping=self.mapping,
-            model=self.model,
-            sparse_attention_config=self.sparse_attention_config,
+            mapping=self._mapping,
+            model=self._model,
+            sparse_attention_config=self._sparse_attention_config,
             metrics=self._metrics,
             dummy_requests=self._dummy_requests,
             agreement=self._agreement,
             metadata=self._metadata,
-            get_runtime_tokens_per_gen_step=self.get_runtime_tokens_per_gen_step,
+            get_runtime_tokens_per_gen_step=self._get_runtime_tokens_per_gen_step,
             dynamic_draft_len_mapping=self._dynamic_draft_len_mapping,
             lora=self._lora,
             forward_warmup=self._forward_warmup,
@@ -309,16 +309,8 @@ class DecoderRunner(ScheduledModelRunner):
     def cuda_graph_runner(self) -> CUDAGraphRunner | None:
         return self._graphs.cuda_graph_runner
 
-    @property
-    def breakable_cuda_graph_runner(self) -> BreakableCUDAGraphRunner | None:
-        return self._graphs.breakable_cuda_graph_runner
-
-    @property
-    def max_beam_width(self) -> int:
-        return self._config.max_beam_width
-
     @torch.inference_mode()
-    @with_model_extra_attrs(lambda self: self.model.extra_attrs)
+    @with_model_extra_attrs(lambda self: self._model.extra_attrs)
     def forward(
         self,
         inputs: ScheduledInputs,
@@ -334,10 +326,10 @@ class DecoderRunner(ScheduledModelRunner):
         if (
             os.environ.get("TRTLLM_RECLAIM_WORKSPACE", "1") != "0"
             and not self._config.is_spec_decode
-            and self.mapping.cp_size == 1
+            and self._mapping.cp_size == 1
             and self._eager_workspace_reclaim_supported
             and not self._config.torch_compile_enabled
-            and self.breakable_cuda_graph_runner is None
+            and self._graphs.breakable_cuda_graph_runner is None
         ):
             self._moe_workspace_reclaimer = CutlassWorkspaceReclaimer()
 
@@ -368,7 +360,7 @@ class DecoderRunner(ScheduledModelRunner):
                 (self._config.original_max_draft_len + 1) if self._config.is_spec_decode else 1
             )
             cuda_graph_manager = make_cuda_graph_lora_manager(
-                self.model,
+                self._model,
                 lora_config,
                 self.lora_model_config,
                 self._config.max_batch_size,
@@ -402,7 +394,7 @@ class DecoderRunner(ScheduledModelRunner):
 
     def _initialize_cuda_graph_runner(self) -> CUDAGraphRunner | None:
         cuda_graph_runner = CUDAGraphRunner(self._cuda_graph_runner_config())
-        register_hooks = getattr(self.model, "register_cuda_graph_pre_replay_hooks", None)
+        register_hooks = getattr(self._model, "register_cuda_graph_pre_replay_hooks", None)
         if register_hooks is not None:
             register_hooks(cuda_graph_runner)
         return cuda_graph_runner
@@ -425,10 +417,10 @@ class DecoderRunner(ScheduledModelRunner):
             enable_attention_dp=self._config.enable_attention_dp,
             is_encoder_decoder=False,
             batch_size=self._config.max_batch_size,
-            mapping=self.mapping,
-            dist=self.dist,
+            mapping=self._mapping,
+            dist=self._dist,
             kv_cache_manager_key=ResourceManagerType.KV_CACHE_MANAGER,
-            sparse_attention_config=self.sparse_attention_config,
+            sparse_attention_config=self._sparse_attention_config,
             enable_in_graph_sampling=self._config.enable_in_graph_sampling,
             # Speculative steps rewrite every input token and position, so
             # captured graphs can read the persistent buffers directly.
@@ -454,16 +446,16 @@ class DecoderRunner(ScheduledModelRunner):
             return None
 
         decoder_model = (
-            self.model
-            if isinstance(self.model, DecoderModelForCausalLM)
-            else getattr(self.model, "llm", None)
+            self._model
+            if isinstance(self._model, DecoderModelForCausalLM)
+            else getattr(self._model, "llm", None)
         )
         if not isinstance(decoder_model, DecoderModelForCausalLM):
             raise ValueError("breakable prefill CUDA graph requires a decoder model body")
         return BreakableCUDAGraphRunner(decoder_model.model)
 
     @property
-    def use_beam_search(self) -> bool:
+    def _use_beam_search(self) -> bool:
         return self._config.max_beam_width > 1
 
     def _forward_warmup(
@@ -532,11 +524,11 @@ class DecoderRunner(ScheduledModelRunner):
             spec_resource_manager = None
             spec_metadata = None
 
-        moe_load_balancer = self.moe_load_balancer
+        moe_load_balancer = self._moe_load_balancer
         from tensorrt_llm._torch.pyexecutor.ced_replay import uses_private_decoder_cache
 
         ced_enabled = uses_private_decoder_cache(
-            getattr(self.model, "model", None), kv_cache_manager
+            getattr(self._model, "model", None), kv_cache_manager
         )
         graph_requests, promoted_context_request_ids = self._graphs.promote_final_contexts(
             scheduled_requests,
@@ -564,7 +556,7 @@ class DecoderRunner(ScheduledModelRunner):
             # unpopulated (greedy) buffers, hanging the run (e.g. MTP nextn>=2).
             if spec_metadata is not None:
                 spec_metadata.update_is_all_greedy_sample(padded_graph_requests.all_requests())
-                sync_group_all_greedy_sample(spec_metadata, self.mapping, self.dist)
+                sync_group_all_greedy_sample(spec_metadata, self._mapping, self._dist)
 
             selection = self._graphs.select(
                 padded_graph_requests,
@@ -711,14 +703,14 @@ class DecoderRunner(ScheduledModelRunner):
         if not self._config.compile_only_piecewise_graphs or not bypass:
             yield
             return
-        with self.model.model.bypass():
+        with self._model.model.bypass():
             yield
 
     def _bypass_torch_compile(self) -> contextlib.AbstractContextManager[None]:
         """Run auxiliary warmups and ordinary CUDA graph capture eagerly."""
         return self._maybe_bypass_torch_compile(bypass=True)
 
-    def model_forward(self, *, is_dummy: bool, **kwargs: Any) -> Any:
+    def _model_forward(self, *, is_dummy: bool, **kwargs: Any) -> Any:
         assert self._model_caller is not None
         reclaimer = self._eager_workspace_reclaimer
         metadata = kwargs["attn_metadata"]
@@ -761,7 +753,7 @@ class DecoderRunner(ScheduledModelRunner):
             # Distinguish that sparse gather from a real all-context request.
             dspark_metadata._requires_all_context_logits = bool(gather_context_logits)
         try:
-            outputs = self.model_forward(
+            outputs = self._model_forward(
                 **inputs,
                 is_dummy=is_dummy,
                 return_context_logits=gather_ids is not None or gather_context_logits,
@@ -799,7 +791,7 @@ class DecoderRunner(ScheduledModelRunner):
         # that is the right shape but never filled, so a shape check waves it
         # through and they would sample garbage every step -- discarded, but
         # not free. _execute_logit_post_processors skips them for this reason.
-        if self.sample_in_graph_callable is not None and self.mapping.is_last_pp_rank():
+        if self.sample_in_graph_callable is not None and self._mapping.is_last_pp_rank():
             self.sample_in_graph_callable(outputs)
 
         return outputs
@@ -831,7 +823,7 @@ class DecoderRunner(ScheduledModelRunner):
     ) -> None:
         """Apply logit post processors (in-place modify outputs Tensors) if any."""
 
-        if not (self.mapping.is_last_pp_rank()):
+        if not (self._mapping.is_last_pp_rank()):
             return
 
         if not isinstance(outputs, dict) or "logits" not in outputs:
@@ -845,7 +837,7 @@ class DecoderRunner(ScheduledModelRunner):
             # gather them first, only when a request has one. Every TP rank
             # schedules the same requests, so all of them take the gather;
             # under attention DP they would not.
-            if self.mapping.enable_attention_dp:
+            if self._mapping.enable_attention_dp:
                 raise RuntimeError(
                     "vocabulary-sharded spec-worker logits need every TP rank "
                     "to schedule the same requests, which attention DP does "
@@ -858,10 +850,10 @@ class DecoderRunner(ScheduledModelRunner):
                 return
             from tensorrt_llm._torch.distributed import allgather
 
-            logits_tensor = allgather(logits_tensor, self.mapping, dim=-1).float()
+            logits_tensor = allgather(logits_tensor, self._mapping, dim=-1).float()
             # Drop the vocabulary's TP padding, as the LM head's own gather
             # does.
-            vocab_size = getattr(getattr(self.model, "lm_head", None), "num_embeddings", None)
+            vocab_size = getattr(getattr(self._model, "lm_head", None), "num_embeddings", None)
             if vocab_size is not None:
                 logits_tensor = logits_tensor[..., :vocab_size]
 
@@ -934,9 +926,9 @@ class DecoderRunner(ScheduledModelRunner):
             and scheduled_requests.num_generation_requests > 0
             and not promoted_context_request_ids
             and not enable_spec_decode
-            and not self.use_beam_search
+            and not self._use_beam_search
             and self._deferred_decode_outputs_supported
-            and self.mapping.cp_size == 1
+            and self._mapping.cp_size == 1
         ):
             return defer()
         return contextlib.nullcontext()

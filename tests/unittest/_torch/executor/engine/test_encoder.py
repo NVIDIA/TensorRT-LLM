@@ -244,7 +244,7 @@ def test_packed_inputs_reject_inconsistent_request_boundaries(
     runner = object.__new__(EncoderRunner)
 
     with pytest.raises(ValueError, match=message):
-        runner.prepare_inputs(PackedInputs(input_ids, sequence_lengths, multi_item_part_lens))
+        runner._prepare_inputs(PackedInputs(input_ids, sequence_lengths, multi_item_part_lens))
 
 
 @pytest.mark.parametrize(
@@ -262,7 +262,7 @@ def test_encoder_runner_rejects_model_inputs_owned_by_the_runner(reserved_name: 
     runner._encoder_cuda_graph_runner = SimpleNamespace(enabled=False)
 
     with pytest.raises(ValueError, match=reserved_name):
-        runner.prepare_inputs(PackedInputs([11, 12], [2], model_inputs={reserved_name: object()}))
+        runner._prepare_inputs(PackedInputs([11, 12], [2], model_inputs={reserved_name: object()}))
 
 
 def test_encoder_runner_forwards_model_inputs_to_eager_preparation() -> None:
@@ -272,7 +272,7 @@ def test_encoder_runner_forwards_model_inputs_to_eager_preparation() -> None:
     runner._prepare_encoder_batch = Mock(return_value=expected)
     token_type_ids = torch.tensor([0, 1])
 
-    actual = runner.prepare_inputs(
+    actual = runner._prepare_inputs(
         PackedInputs([11, 12], [2], model_inputs={"token_type_ids": token_type_ids})
     )
 
@@ -305,7 +305,7 @@ def test_encoder_runner_rejects_undeclared_tensor_input_when_graph_is_usable() -
     runner = _graph_enabled_runner()
 
     with pytest.raises(ValueError, match="not declared"):
-        runner.prepare_inputs(
+        runner._prepare_inputs(
             PackedInputs([11, 12], [2], model_inputs={"token_type_ids": torch.tensor([0, 1])})
         )
 
@@ -315,7 +315,7 @@ def test_multi_item_batch_skips_extra_input_validation() -> None:
     runner = _graph_enabled_runner()
     token_type_ids = torch.tensor([0, 1])
 
-    runner.prepare_inputs(
+    runner._prepare_inputs(
         PackedInputs([11, 12], [2], [[1, 1]], model_inputs={"token_type_ids": token_type_ids})
     )
 
@@ -326,7 +326,7 @@ def test_unsupported_attention_backend_skips_extra_input_validation() -> None:
     """A backend that cannot replay encoder graphs keeps every call eager."""
     runner = _graph_enabled_runner(attention_backend=SimpleNamespace(Metadata=AttentionMetadata))
 
-    runner.prepare_inputs(
+    runner._prepare_inputs(
         PackedInputs([11, 12], [2], model_inputs={"token_type_ids": torch.tensor([0, 1])})
     )
 

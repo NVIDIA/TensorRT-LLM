@@ -110,10 +110,10 @@ def _prepare(
         )
     monkeypatch.setattr(
         runner,
-        "setup_attn_metadata",
+        "_setup_attn_metadata",
         Mock(return_value=attn_metadata),
     )
-    prepared = runner.prepare_inputs(
+    prepared = runner._prepare_inputs(
         scheduled_requests,
         resource_manager=SimpleNamespace(name="resources"),
     )

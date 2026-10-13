@@ -352,7 +352,7 @@ def _make_forward_only_engine(
 ) -> tuple[PyTorchModelEngine, Mock, Mock, Mock, dict[str, object]]:
     engine = object.__new__(PyTorchModelEngine)
     decoder = object.__new__(DecoderRunner)
-    engine.model = decoder.model = SimpleNamespace(
+    engine.model = decoder._model = SimpleNamespace(
         extra_attrs={},
         model_config=SimpleNamespace(pretrained_config=SimpleNamespace(
             rope_scaling=None)))
@@ -371,17 +371,18 @@ def _make_forward_only_engine(
         spec_config=None,
     )
     engine.llm_args = SimpleNamespace(mm_encoder_only=False)
-    engine.mapping = decoder.mapping = SimpleNamespace(
+    engine.mapping = decoder._mapping = SimpleNamespace(
         cp_size=1,
         enable_lm_head_tp_in_adp=False,
     )
-    decoder.dist = None
+    decoder._dist = None
     engine.runtime_draft_len = 0
-    decoder.get_runtime_tokens_per_gen_step = Mock(return_value=1)
-    engine.iter_states = decoder.iter_states = {}
+    get_runtime_tokens_per_gen_step = Mock(return_value=1)
+    decoder._get_runtime_tokens_per_gen_step = get_runtime_tokens_per_gen_step
+    engine.iter_states = decoder._iter_states = {}
     decoder.forward_pass_callable = None
     decoder._stage_in_graph_sampling = None
-    decoder.moe_load_balancer = None
+    decoder._moe_load_balancer = None
     engine._runner = decoder
     decoder._lora = SimpleNamespace(cuda_graph_manager=None)
     decoder._trtllm_gen_jit_warmup = False
@@ -429,14 +430,14 @@ def _make_forward_only_engine(
         cuda_graph_runner=runner,
         breakable_cuda_graph_runner=None,
         config=decoder._config,
-        mapping=decoder.mapping,
-        model=decoder.model,
+        mapping=decoder._mapping,
+        model=decoder._model,
         sparse_attention_config=None,
         metrics={},
         dummy_requests=None,
         agreement=None,
         metadata=decoder._metadata,
-        get_runtime_tokens_per_gen_step=decoder.get_runtime_tokens_per_gen_step,
+        get_runtime_tokens_per_gen_step=get_runtime_tokens_per_gen_step,
         dynamic_draft_len_mapping=None,
         lora=decoder._lora,
         forward_warmup=decoder._forward_warmup,
@@ -477,7 +478,7 @@ def test_decoder_forward_routes_compile_bypass(enabled: bool,
     compiled.forward = Mock(return_value=outputs)
     wrapper = PrefillCompiledModel(eager, compiled)
     engine._runner._config.compile_only_piecewise_graphs = enabled
-    engine._runner.model.model = wrapper
+    engine._runner._model.model = wrapper
     engine._runner._forward_step.side_effect = lambda *args, **kwargs: wrapper()
     graph_runner.needs_capture.return_value = ordinary_capture
     graph_runner.is_warmup_only = ordinary_capture
@@ -559,7 +560,7 @@ def _resize_input_buffers(runner: DecoderRunner, max_num_tokens: int) -> None:
     """Reallocate the runner's input buffers for ``max_num_tokens`` tokens."""
     buffers = DecoderInputBuffers.for_config(
         replace(runner._config, max_num_tokens=max_num_tokens),
-        runner.use_beam_search)
+        runner._use_beam_search)
     runner._buffers = runner._inputs._buffers = runner._metadata._buffers = buffers
 
 
@@ -2171,7 +2172,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         )
         decoder.cuda_graph_runner.clear.assert_called_once_with(
             release_nccl_window_owners=True)
-        decoder.breakable_cuda_graph_runner.clear.assert_called_once_with(
+        decoder._graphs.breakable_cuda_graph_runner.clear.assert_called_once_with(
             release_nccl_window_owners=True)
 
     def test_prepare_inputs_returns_steady_gen_fast_inputs(self) -> None:
