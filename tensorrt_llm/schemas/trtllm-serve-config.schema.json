@@ -369,6 +369,34 @@
       "title": "BlockReuseConfig",
       "type": "object"
     },
+    "CSA2SparseAttentionConfig": {
+      "additionalProperties": false,
+      "description": "Use checkpoint-owned CSA2 geometry with the PyTorch sparse backend.",
+      "properties": {
+        "algorithm": {
+          "const": "csa2",
+          "default": "csa2",
+          "title": "Algorithm",
+          "type": "string"
+        },
+        "use_fp8_staging": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Stage CSA2 KV as E4M3 for native trtllm-gen on SM100-family. The per-tensor staging scale is a power of two derived every forward from the persistent pools' own group scales, so staged rows keep the E4M3 range they decode to. Left unset, staging turns on wherever that path is available: attn_backend=TRTLLM on an SM100-family GPU, an FP8 kv_cache_config.dtype, and no packed sparse attention. Set True to require it, which rejects a configuration that cannot serve it instead of falling back, or False to pin BF16 staging.",
+          "status": "prototype",
+          "title": "Use Fp8 Staging"
+        }
+      },
+      "title": "CSA2SparseAttentionConfig",
+      "type": "object"
+    },
     "CacheTransceiverConfig": {
       "additionalProperties": false,
       "description": "Configuration for the cache transceiver.",
@@ -497,8 +525,8 @@
               "type": "null"
             }
           ],
-          "default": "auto",
-          "description": "The runtime implementation. 'auto' (default) adopts the model's preferred runtime when it declares one; otherwise it selects the Python transceiver, falling back to the C++ transceiver only when this config itself rules it out (non-NIXL backend or a null kv_transfer_timeout_ms) \u2014 any other incompatibility fails at transceiver creation. The fallback is decided independently on each server and is only logged, not surfaced, so keep context and generation server configurations consistent. 'CPP' selects the C++ transceiver, 'PYTHON' the Python transceiver. None is equivalent to 'CPP'. 'auto' is resolved on the PyTorch backend's standard model-loading path.",
+          "default": "PYTHON",
+          "description": "The runtime implementation. 'PYTHON' (default) selects the Python transceiver, while 'CPP' selects the C++ transceiver and requires kv_cache_config.use_kv_cache_manager_v2=False with a model that supports V1. 'auto' adopts the model's preferred runtime when it declares one; otherwise it selects the Python transceiver, falling back to the C++ transceiver only when this config itself rules it out (non-NIXL backend or a null kv_transfer_timeout_ms) \u2014 any other incompatibility fails at transceiver creation. The fallback is decided independently on each server and is only logged, not surfaced, so keep context and generation server configurations consistent. None is equivalent to 'CPP'. 'auto' is resolved on the PyTorch backend's standard model-loading path.",
           "title": "Transceiver Runtime"
         }
       },
@@ -524,6 +552,17 @@
           "title": "Algorithm",
           "type": "string"
         },
+        "nvfp4_residual_dim": {
+          "default": 64,
+          "description": "64 (default): use two independently scaled FP4 components for the 64 DeepSeek-V4 target cold-page RoPE values: a main component and its residual. 0: use a single NVFP4 component. Only 0 and 64 are supported. Ignored for other models, draft caches, and when skip_rope_quantization preserves the original RoPE precision.",
+          "enum": [
+            0,
+            64
+          ],
+          "status": "prototype",
+          "title": "Nvfp4 Residual Dim",
+          "type": "integer"
+        },
         "quant": {
           "const": "nvfp4",
           "default": "nvfp4",
@@ -547,6 +586,13 @@
             "exclude": true
           },
           "title": "Scale Checkpoint Path"
+        },
+        "skip_rope_quantization": {
+          "default": false,
+          "description": "True: preserve the position-encoded (RoPE) part of each K vector in its original active-cache precision and quantize the rest to NVFP4. False (default): quantize both parts, using residual RoPE quantization for DeepSeek-V4 when nvfp4_residual_dim is 64. An option to explore; measure its accuracy effect on your model.",
+          "status": "prototype",
+          "title": "Skip Rope Quantization",
+          "type": "boolean"
         }
       },
       "title": "ColdPageQuantizationCompressionConfig",
@@ -678,6 +724,19 @@
           ],
           "title": "Attention Backend",
           "type": "string"
+        },
+        "context_recompute_tail": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": 0,
+          "description": "Number of prompt-tail tokens to recompute through the target forward when a request takes a KV-cache prefix hit, so the drafter's hidden-state context covers them (reused tokens never pass a target forward, which otherwise degrades acceptance length exactly when prefix caching helps most). 0 (the default) disables the recompute: the feature is opt-in, because recomputing reused tokens trades TTFT and prefill throughput for acceptance length and disables KV-connector prefix loads for the recomputed span. None resolves from the draft model config: dflash_config.swa_window_size when the drafter's context attention is windowed (a tail of the window size reproduces the no-reuse drafter inputs exactly), else -1. -1 forces a full re-prefill on a hit. Prefix reuse ahead of the recomputed tail is kept. Requires chunked prefill and the all_reusable block-reuse policy, and sliding-window attention layers are unsupported on the V1 KV cache manager; the KV cache managers disable it with a warning otherwise.",
+          "title": "Context Recompute Tail"
         },
         "decoding_type": {
           "const": "DFlash",
@@ -1215,6 +1274,12 @@
           "title": "Enable Heuristic Topk",
           "type": "boolean"
         },
+        "gvr_deterministic_topk": {
+          "default": false,
+          "description": "Make the self-sampling GVR Top-K deterministic: the selected index set is {score > tau} plus the smallest indices among the ties at tau, and the output order is a fixed function of the input (decode and prefill). Costs about 0.2-3 us per Top-K launch. Only takes effect with enable_heuristic_topk=True and use_self_sampling_topk=True; ignored otherwise.",
+          "title": "Gvr Deterministic Topk",
+          "type": "boolean"
+        },
         "index_head_dim": {
           "anyOf": [
             {
@@ -1379,6 +1444,12 @@
           "description": "Offload ratio-4 compressed attention KV history to host memory with KV cache manager v2. The indexer and sliding-window caches remain on GPU. This feature is under development and currently cannot be enabled for inference.",
           "status": "prototype",
           "title": "Enable Kv Cache Offload",
+          "type": "boolean"
+        },
+        "gvr_deterministic_topk": {
+          "default": false,
+          "description": "Make the self-sampling GVR Top-K deterministic: the selected index set is {score > tau} plus the smallest indices among the ties at tau, and the output order is a fixed function of the input (decode and prefill). Costs about 0.2-3 us per Top-K launch. Only takes effect with enable_heuristic_topk=True and use_self_sampling_topk=True; ignored otherwise.",
+          "title": "Gvr Deterministic Topk",
           "type": "boolean"
         },
         "index_head_dim": {
@@ -2980,8 +3051,8 @@
               "type": "string"
             }
           ],
-          "default": "auto",
-          "description": "Whether to use the KV cache manager v2 (experimental). 'auto' uses the model-specific preference and falls back to False when the model does not declare one.",
+          "default": true,
+          "description": "Whether to use the KV cache manager v2 (experimental). Defaults to True. Set False to select V1 for models that support it. 'auto' uses the model-specific preference and falls back to False when the model does not declare one.",
           "status": "prototype",
           "title": "Use Kv Cache Manager V2"
         },
@@ -3014,7 +3085,8 @@
             "allowed_values": [
               "lmcache",
               "lmcache-mp",
-              "kvbm"
+              "kvbm",
+              "mooncake-store"
             ]
           },
           "title": "Connector"
@@ -3057,6 +3129,18 @@
           "default": null,
           "description": "The class name of the worker within the module.",
           "title": "Connector Worker Class"
+        },
+        "mooncake_store": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MooncakeStoreConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Pool topology for the 'mooncake-store' connector. When set, trtllm-serve provisions the pool during bringup instead of requiring MOONCAKE_CONFIG_PATH from an external script."
         },
         "server_url": {
           "anyOf": [
@@ -3855,13 +3939,136 @@
       "title": "MoeConfig",
       "type": "object"
     },
+    "MooncakeStoreConfig": {
+      "additionalProperties": false,
+      "description": "How this server joins a Mooncake store pool.\n\nThe settings every participant shares come from the master named by\n`pool`; what is left here is per-server. Setting this makes\n`trtllm-serve` render the Mooncake client config and export\n`MOONCAKE_CONFIG_PATH`; an inherited `MOONCAKE_CONFIG_PATH` wins.",
+      "properties": {
+        "local_hostname": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Address this server's ranks register their segments under, for peers to reach them at. Derived by default from the interface that routes to the master. One value covers every rank, so only set it on a server whose ranks share a node.",
+          "telemetry": {
+            "exclude": true
+          },
+          "title": "Local Hostname"
+        },
+        "master_timeout": {
+          "default": 60.0,
+          "description": "Seconds to wait for the pool manifest to appear and the master to accept connections. Raise it when the wait spans a container start on another node. Expiring fails the server at startup.",
+          "telemetry": {
+            "exclude": true
+          },
+          "title": "Master Timeout",
+          "type": "number"
+        },
+        "model_key": {
+          "description": "What the pool keys identify this checkpoint by. Two engines share cache only when they agree on it, and two that disagree read each other's pages as their own, so it has no default and must be unique per checkpoint.",
+          "telemetry": {
+            "exclude": true
+          },
+          "title": "Model Key",
+          "type": "string"
+        },
+        "namespace": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Key namespace, isolating this deployment's cache from others on the same pool. Bump it after any change to page layout or contents. Defaults to the pool manifest's.",
+          "title": "Namespace"
+        },
+        "pool": {
+          "description": "The pool to join: 'file://<path>' naming a manifest published by 'trtllm-serve mooncake_master --pool_file', or a master's 'host:port'. The manifest form also carries the settings every participant must agree on.",
+          "title": "Pool",
+          "type": "string"
+        },
+        "role": {
+          "default": "both",
+          "description": "What this server does with the pool. 'both' reads and writes, 'producer' only writes, 'consumer' only reads, and 'capacity' does neither: its ranks lend memory without moving any KV, so they pin no staging buffers and pay no per-request cost.",
+          "enum": [
+            "both",
+            "producer",
+            "consumer",
+            "capacity"
+          ],
+          "title": "Role",
+          "type": "string"
+        },
+        "run_dir": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Where this server keeps the Mooncake client config it renders and each rank's record of the segment it mounted. Required when a launcher starts one task per rank, as trtllm-llmapi-launch does, and must not be shared between servers. Defaults to a temporary directory removed at shutdown.",
+          "telemetry": {
+            "exclude": true
+          },
+          "title": "Run Dir"
+        },
+        "segment_size": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "string"
+            }
+          ],
+          "default": "16GiB",
+          "description": "Host memory each of this server's ranks contributes to the pool, as a binary size ('16GiB') or a byte count; ambiguous units such as 'GB' are refused. A node's demand is ranks_on_node x segment_size, checked against available memory at startup. Zero lends nothing, leaving the server to use only capacity its peers hold.",
+          "title": "Segment Size"
+        },
+        "stage_through_host": {
+          "default": true,
+          "description": "Copy pages through a pinned host buffer instead of registering the KV pools with Mooncake. The only transfer path supported today, so 'false' is ignored with a warning. Costs a copy each way and needs no GPUDirect RDMA.",
+          "telemetry": {
+            "exclude": true
+          },
+          "title": "Stage Through Host",
+          "type": "boolean"
+        },
+        "transfer_batch_size": {
+          "default": 64,
+          "description": "Page keys per store call.",
+          "exclusiveMinimum": 0,
+          "telemetry": {
+            "exclude": true
+          },
+          "title": "Transfer Batch Size",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "pool",
+        "model_key"
+      ],
+      "title": "MooncakeStoreConfig",
+      "type": "object"
+    },
     "MultimodalConfig": {
       "additionalProperties": false,
       "description": "Multimodal model configuration.",
       "properties": {
         "encoder_cache_max_bytes": {
           "default": 134217728,
-          "description": "Maximum bytes for the opt-in multimodal encoder embedding cache; 0 disables it. String values such as '512MB' and '1GiB' use binary units. Inline encoding caches whole single-modality requests; item scheduling caches individual items. Compatible with side-stream prefetch; their memory limits are additive.",
+          "description": "Target capacity in bytes for reusable multimodal encoder embeddings; 0 disables cross-request reuse. The capacity applies per rank; ranks do not share a cache. With item scheduling, encoder outputs still use the model-owned cache and its capacity is at least one legal encoder iteration; this value can make that cache larger. String values such as '512MB' and '1GiB' use binary units. Both inline encoding and item scheduling cache individual items; inline caching supports only single-modality parameters. Compatible with side-stream prefetch.",
           "minimum": 0,
           "status": "prototype",
           "title": "Encoder Cache Max Bytes",
@@ -3887,7 +4094,7 @@
         "encoder_scheduling_policy": {
           "$ref": "#/$defs/MultimodalEncoderSchedulingPolicy",
           "default": "DEFAULT",
-          "description": "MM encoder scheduling policy for models that support item-level encoder scheduling. DISABLED: legacy inline encode (item scheduling and its byte budget off). DEFAULT: item scheduling. EAGER: item scheduling that advances encoder work for active requests before LLM capacity filtering. Ignored for models that do not support item scheduling.",
+          "description": "MM encoder scheduling policy for models that support item-level encoder scheduling. DISABLED: legacy inline encode (item scheduling and its byte budget off). DEFAULT: item scheduling. EAGER: item scheduling that advances encoder work for active requests before LLM capacity filtering. Ignored for models that do not support item scheduling. Item scheduling does not support pipeline parallelism yet: with pipeline_parallel_size > 1, DEFAULT (explicit or unset) logs a warning and falls back to legacy inline encode, while EAGER raises an error.",
           "status": "prototype"
         },
         "encoder_side_stream_max_ahead": {
@@ -5900,7 +6107,7 @@
       "type": "string"
     }
   },
-  "$id": "https://nvidia.github.io/TensorRT-LLM/1.4.0rc0/_static/schemas/trtllm-serve-config.schema.json",
+  "$id": "https://nvidia.github.io/TensorRT-LLM/1.4.0rc1/_static/schemas/trtllm-serve-config.schema.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "additionalProperties": false,
   "description": "Static YAML checks only; runtime validation remains authoritative.",
@@ -6001,6 +6208,16 @@
     "batched_logits_processor": {
       "description": "Live objects require the Python LLM API.",
       "type": "null"
+    },
+    "bounded_replay_on_generation": {
+      "default": false,
+      "description": "Run the DeepSeek-V4.1 bounded decoder replay tail on the generation worker in disaggregated serving. Configure both worker roles alike.",
+      "status": "prototype",
+      "telemetry": {
+        "exclude": true
+      },
+      "title": "Bounded Replay On Generation",
+      "type": "boolean"
     },
     "cache_transceiver_config": {
       "anyOf": [
@@ -6262,6 +6479,13 @@
       "description": "Enable LM head TP in attention dp.",
       "status": "prototype",
       "title": "Enable Lm Head Tp In Adp",
+      "type": "boolean"
+    },
+    "enable_locality_domains": {
+      "default": false,
+      "description": "Enable locality domain execution for supported PyTorch backend ops.",
+      "status": "prototype",
+      "title": "Enable Locality Domains",
       "type": "boolean"
     },
     "enable_lora": {
@@ -6696,6 +6920,18 @@
       "status": "prototype",
       "title": "Model Kwargs"
     },
+    "modeling_v2": {
+      "default": "off",
+      "description": "Whether to build the model from a modeling_v2 target (experimental) instead of the built-in implementation. 'off' never does. 'auto' uses a target when one claims this deployment and falls back to the built-in implementation otherwise. 'require' raises instead of falling back.",
+      "enum": [
+        "off",
+        "auto",
+        "require"
+      ],
+      "status": "prototype",
+      "title": "Modeling V2",
+      "type": "string"
+    },
     "moe_cluster_parallel_size": {
       "anyOf": [
         {
@@ -6767,7 +7003,7 @@
     },
     "num_serve_frontends": {
       "default": 1,
-      "description": "The number of HTTP frontend processes serving one executor. Used by trtllm-serve: values > 1 run additional attached frontend processes that share the serving port via SO_REUSEPORT (classic IPC executor path only).",
+      "description": "The number of HTTP or OpenEngine frontend processes serving one executor. Used by trtllm-serve: values > 1 run additional attached frontend processes that share the serving port via SO_REUSEPORT (classic IPC executor path only).",
       "maximum": 64,
       "minimum": 1,
       "status": "prototype",
@@ -7019,7 +7255,8 @@
           "nano-v3",
           "gemma4",
           "kimi_k2",
-          "kimi_k25"
+          "kimi_k25",
+          "k-exaone"
         ]
       },
       "title": "Reasoning Parser"
@@ -7108,6 +7345,7 @@
         {
           "discriminator": {
             "mapping": {
+              "csa2": "#/$defs/CSA2SparseAttentionConfig",
               "deepseek_v4": "#/$defs/DeepSeekV4SparseAttentionConfig",
               "dsa": "#/$defs/DeepSeekSparseAttentionConfig",
               "minimax_m3": "#/$defs/MiniMaxM3SparseAttentionConfig",
@@ -7129,6 +7367,9 @@
             },
             {
               "$ref": "#/$defs/DeepSeekV4SparseAttentionConfig"
+            },
+            {
+              "$ref": "#/$defs/CSA2SparseAttentionConfig"
             },
             {
               "$ref": "#/$defs/SkipSoftmaxAttentionConfig"
@@ -7338,6 +7579,6 @@
     }
   },
   "required": [],
-  "title": "TensorRT-LLM 1.4.0rc0 trtllm-serve --config",
+  "title": "TensorRT-LLM 1.4.0rc1 trtllm-serve --config",
   "type": "object"
 }
