@@ -226,8 +226,6 @@ def _cleanup_mpi_env():
 def run_test_in_distributed(world_size: int, test_fn: Callable, use_cuda: bool = True):
     if use_cuda and torch.cuda.device_count() < world_size:
         pytest.skip(f"Test requires {world_size} GPUs, only {torch.cuda.device_count()} available")
-    # Ranks come from the persistent per-world-size pool in _worker_pool.py;
-    # test_fn runs as test_fn(rank, world_size).
     from ._worker_pool import run_distributed
 
     run_distributed(

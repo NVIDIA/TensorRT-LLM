@@ -10,17 +10,17 @@
   released on the pool's terms rather than by the interpreter's exit sequence.
 - Module lifetime: with TRTLLM_TEST_VISUALGEN_POOL_LIFETIME=module, shut the
   pools down at every test file's teardown.
-- Deadline: hand the pool each test's effective pytest-timeout (marker, then
-  --timeout, then PYTEST_TIMEOUT, then the ini key: the plugin's own
-  precedence), so the pool's per-test deadline follows whatever CI configures
-  instead of a knob of its own.
+- Deadline: at test setup, when pytest-timeout's clock is running, hand the
+  pool the test's effective pytest-timeout (marker, then --timeout, then
+  PYTEST_TIMEOUT, then the ini key: the plugin's own precedence). Every pool
+  call in the test is then bounded by the time remaining.
 """
 
 import os
 
 import pytest
 
-from ._worker_pool import lifetime, set_pytest_timeout, shutdown_all
+from ._worker_pool import lifetime, set_test_deadline, shutdown_all
 
 _FAILED_ITEMS: set[str] = set()
 
@@ -43,14 +43,19 @@ def _effective_pytest_timeout(item) -> float | None:
 
 
 def pytest_runtest_setup(item):
-    set_pytest_timeout(_effective_pytest_timeout(item))
+    set_test_deadline(_effective_pytest_timeout(item))
+
+
+def end_of_module() -> None:
+    """Module-teardown action: under lifetime ``module``, shut the pools down."""
+    if lifetime() == "module":
+        shutdown_all()
 
 
 @pytest.fixture(autouse=True, scope="module")
 def _pool_module_lifetime():
     yield
-    if lifetime() == "module":
-        shutdown_all()
+    end_of_module()
 
 
 def pytest_runtest_logreport(report):

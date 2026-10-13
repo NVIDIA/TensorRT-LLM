@@ -8,7 +8,10 @@ report, a hung test hitting the deadline, the pool lifetime knob, the between-te
 reset of process state, and ranks dying with their parent.
 """
 
+import multiprocessing
 import os
+import pickle
+import select
 import signal
 import subprocess
 import sys
@@ -96,6 +99,18 @@ def _read_values(path, world_size):
     return out
 
 
+def _read_pids(path, world_size):
+    return [int(v) for v in _read_values(path, world_size)]
+
+
+def _pid_gone(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    return False
+
+
 def _make_extra_group(rank, world_size):
     from torch.distributed import distributed_c10d as c10d
 
@@ -107,14 +122,6 @@ def _assert_only_default_group(rank, world_size):
     from torch.distributed import distributed_c10d as c10d
 
     assert len(c10d._world.pg_map) == 1
-
-
-def _read_pids(path, world_size):
-    pids = []
-    for rank in range(world_size):
-        with open(f"{path}.{rank}") as f:
-            pids.append(int(f.read()))
-    return pids
 
 
 # ---- tests ----
@@ -185,9 +192,9 @@ def test_lifetime_test_gives_fresh_ranks(tmp_path, monkeypatch):
     assert set(_read_pids(p, 2)).isdisjoint(first)
 
 
-def test_lifetime_module_keeps_pool_until_module_teardown(tmp_path, monkeypatch):
-    """Within a module the pool is reused; the conftest fixture shuts it down at
-    module teardown, which cannot be observed from inside the module."""
+def test_lifetime_module_reuses_within_a_module_and_drains_at_its_end(tmp_path, monkeypatch):
+    from . import conftest
+
     monkeypatch.setenv("TRTLLM_TEST_VISUALGEN_POOL_LIFETIME", "module")
     p = str(tmp_path / "pid")
     run_distributed(2, _write_pid, p, backend="gloo", timeout=_TIMEOUT)
@@ -195,6 +202,15 @@ def test_lifetime_module_keeps_pool_until_module_teardown(tmp_path, monkeypatch)
     run_distributed(2, _write_pid, p, backend="gloo", timeout=_TIMEOUT)
     assert _read_pids(p, 2) == first
     assert pool_mod._POOLS
+    conftest.end_of_module()  # what the module-scoped fixture runs at teardown
+    assert not pool_mod._POOLS
+    for pid in first:
+        assert _pid_gone(pid)
+    monkeypatch.setenv("TRTLLM_TEST_VISUALGEN_POOL_LIFETIME", "session")
+    run_distributed(2, _write_pid, p, backend="gloo", timeout=_TIMEOUT)
+    assert pool_mod._POOLS
+    conftest.end_of_module()
+    assert pool_mod._POOLS  # session lifetime: untouched at module end
 
 
 def test_lifetime_value_is_validated(monkeypatch):
@@ -217,17 +233,15 @@ def test_env_is_restored_between_runs():
     run_distributed(2, _assert_env_clean, backend="gloo", timeout=_TIMEOUT)
 
 
-def test_rng_is_reseeded_between_runs(tmp_path):
-    """Fresh ranks start from torch's per-process seed; every run after the
-    first starts from the reset's fixed seed, identical on all ranks."""
+def test_rng_is_seeded_before_every_run(tmp_path):
+    """Every run, the first included, starts from the fixed seed on every rank."""
     p = str(tmp_path / "rand")
-    run_distributed(2, _write_random, p, backend="gloo", timeout=_TIMEOUT)
-    run_distributed(2, _write_random, p, backend="gloo", timeout=_TIMEOUT)
-    second = _read_values(p, 2)
-    run_distributed(2, _write_random, p, backend="gloo", timeout=_TIMEOUT)
-    third = _read_values(p, 2)
-    assert second == third
-    assert len(set(second)) == 1
+    draws = []
+    for _ in range(3):
+        run_distributed(2, _write_random, p, backend="gloo", timeout=_TIMEOUT)
+        draws.append(_read_values(p, 2))
+    assert draws[0] == draws[1] == draws[2]
+    assert len(set(draws[0])) == 1
 
 
 def test_extra_process_groups_are_destroyed():
@@ -248,14 +262,6 @@ def test_reuse_false_gives_fresh_ranks_and_drains(tmp_path):
             os.kill(pid, 0)
 
 
-def _pid_gone(pid):
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return True
-    return False
-
-
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="PR_SET_PDEATHSIG is Linux-only")
 def test_ranks_die_with_parent(tmp_path):
     """SIGKILL the pytest-side owner while its ranks are busy in a test body."""
@@ -274,12 +280,18 @@ signal.pause()
 """
     env = dict(os.environ, PYTHONPATH=os.pathsep.join(sys.path))
     owner = subprocess.Popen(
-        [sys.executable, "-c", script], env=env, stdout=subprocess.PIPE, text=True
+        [sys.executable, "-c", script], env=env, stdout=subprocess.PIPE, bufsize=0
     )
     try:
         deadline = time.monotonic() + 120
-        while owner.stdout.readline().strip() != "READY":
-            assert time.monotonic() < deadline and owner.poll() is None, "owner did not start"
+        seen = b""
+        while b"READY\n" not in seen:
+            remaining = deadline - time.monotonic()
+            assert remaining > 0 and owner.poll() is None, "owner did not start"
+            if select.select([owner.stdout], [], [], remaining)[0]:
+                chunk = os.read(owner.stdout.fileno(), 4096)
+                assert chunk, "owner closed stdout before READY"
+                seen += chunk
         ranks = _read_pids(p, 2)
         assert not any(_pid_gone(pid) for pid in ranks)
         owner.send_signal(signal.SIGKILL)
@@ -291,6 +303,30 @@ signal.pause()
     finally:
         if owner.poll() is None:
             owner.kill()
-        for pid in _read_pids(p, 2):
+        for rank in range(2):
+            try:
+                with open(f"{p}.{rank}") as f:
+                    pid = int(f.read())
+            except FileNotFoundError:
+                continue  # startup failed before this rank wrote its pid
             if not _pid_gone(pid):
                 os.kill(pid, signal.SIGKILL)
+
+
+def test_unpicklable_fn_touches_no_ranks():
+    before = len(multiprocessing.active_children())
+    with pytest.raises((pickle.PicklingError, AttributeError)):
+        run_distributed(2, lambda rank, world_size: None, backend="gloo", timeout=_TIMEOUT)
+    assert not pool_mod._POOLS
+    assert len(multiprocessing.active_children()) == before
+
+
+def test_call_deadline_is_capped_by_test_deadline(monkeypatch):
+    now = time.monotonic()
+    monkeypatch.setattr(pool_mod, "_test_deadline_at", now + 30)
+    assert abs(pool_mod._deadline_for(None) - (now + 30)) < 1
+    assert abs(pool_mod._deadline_for(5) - (now + 5)) < 1
+    assert abs(pool_mod._deadline_for(100) - (now + 30)) < 1
+    monkeypatch.setattr(pool_mod, "_test_deadline_at", None)
+    assert pool_mod._deadline_for(None) is None
+    assert abs(pool_mod._deadline_for(5) - (now + 5)) < 1
