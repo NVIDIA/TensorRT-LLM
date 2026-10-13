@@ -27,6 +27,7 @@ import pytest
 import torch
 from backend_case import BACKENDS_UNDER_TEST, BackendCase, generate_inputs, run_backend, run_case
 from model_attn_config import MODEL_CONFIGS, ModelAttnConfig
+from utils.util import getSMVersion
 
 # Precision variants as (dtype, kv_dtype): bf16/fp16 are compute-only; fp8 is an
 # fp8 KV cache with bf16 compute.
@@ -238,31 +239,24 @@ def test_attention_backend(name):
 # or workload shape and therefore do not belong in the cross-backend model
 # matrix above.
 # ---------------------------------------------------------------------------
+@pytest.mark.skipif(
+    getSMVersion() not in (100, 103),
+    reason="Kimi K3 TRTLLM-Gen MLA regression requires SM100 or SM103",
+)
 @pytest.mark.parametrize("page_size", [32, 64], ids=["p32", "p64"])
-def test_trtllm_legacy_fallback_mla_kimi_k3_h96(
+@pytest.mark.parametrize("seq_len_q", [1, 3], ids=["q1", "q3"])
+def test_trtllm_mla_kimi_k3_h96(
     monkeypatch: pytest.MonkeyPatch,
     page_size: int,
+    seq_len_q: int,
 ) -> None:
-    """K3 H96 must decline FlashInfer TRTLLM-Gen and run the legacy fallback.
-
-    page_size=32 is also declined by the pre-existing slower-kernel gate;
-    page_size=64 (the production K3 page size) reaches the fallback only
-    through the num_heads == 96 gate. Both must land on the legacy path.
-    """
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability(0) not in (
-        (10, 0),
-        (10, 3),
-    ):
-        pytest.skip("Kimi K3 TRTLLM-Gen MLA regression requires SM100 or SM103")
-
-    # The old heuristic selects an invalid KeepsMmaAb/Q64 head tile for the
-    # 96-head group; the updated autotuner must select SwapsMmaAb/Q16.
+    """Verify K3 H96 MLA generation numerics in eager and CUDA Graph execution."""
     batch_size = 32
     case = BackendCase(
         num_heads=96,
         num_kv_heads=1,
         head_dim=192,
-        seq_lens=[1] * batch_size,
+        seq_lens=[seq_len_q] * batch_size,
         num_cached_tokens=[31] * batch_size,
         num_contexts=0,
         dtype="bfloat16",

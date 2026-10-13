@@ -518,13 +518,14 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
                 f"headDimQk={head_dim_qk}, headDimV={head_dim_v}. Supported: {supported}.",
             )
 
-        # FlashInfer's TRTLLM-Gen MLA decode rejects H=96. The legacy
-        # TRTLLM-Gen fallback can serve it through the updated Q16 autotuner.
-        if num_heads == 96:
+        # FlashInfer's TRTLLM-Gen MLA decode does not support 64 < H < 128.
+        # Let selection fall through to the legacy TRTLLM-Gen backend.
+        if 64 < num_heads < 128:
             return (
                 False,
                 "[Generation][MLA] FlashInfer TRTLLM-GEN backend is disabled "
-                "for num_heads=96 as it may select unsupported kernels.",
+                f"for num_heads={num_heads} (64 < num_heads < 128) "
+                "as it may select unsupported kernels.",
             )
 
         if (head_dim_qk, head_dim_v, tokens_per_block) in cls.SLOWER_MLA_GENERATION_KERNELS:
