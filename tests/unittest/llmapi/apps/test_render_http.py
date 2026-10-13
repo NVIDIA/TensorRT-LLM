@@ -34,7 +34,15 @@ from tensorrt_llm.serve.render import (
 from tensorrt_llm.serve.render._http import build_render_app
 from tensorrt_llm.serve.serving_extensions import ServingExtension
 
-from .render_helpers import SERVER_TEMPLATE, WEATHER_TOOL, chat_request, make_tokenizer, resources
+from .render_helpers import (
+    LLAMA,
+    SERVER_TEMPLATE,
+    WEATHER_TOOL,
+    chat_request,
+    copy_of,
+    make_tokenizer,
+    resources,
+)
 
 pytestmark = pytest.mark.cpu_only
 
@@ -196,6 +204,14 @@ class TestStandaloneApp:
 
 
 class TestCompletionsRender:
+    @pytest.fixture(scope="class")
+    def tokenizer(self):
+        return make_tokenizer(name=LLAMA)  # adds BOS by default, as completions expect
+
+    @pytest.fixture
+    def client(self, tokenizer):
+        return TestClient(build_render_app(resources(tokenizer), served_model_name="m"))
+
     def _render(self, client, prompt, **extra):
         return client.post("/v1/completions/render", json={"model": "m", "prompt": prompt, **extra})
 
@@ -216,7 +232,9 @@ class TestCompletionsRender:
         (truncated,) = self._render(client, "hello world", truncate_prompt_tokens=2).json()
 
         assert without_bos["token_ids"] == tokenizer.encode("hello world", add_special_tokens=False)
-        assert truncated["token_ids"] == tokenizer.encode("hello world")[:2]
+        # Hugging Face's own truncation, on a private copy so the shared tokenizer is not changed.
+        expected = copy_of(LLAMA).encode("hello world", truncation=True, max_length=2)
+        assert truncated["token_ids"] == expected
 
     def test_a_batch_of_strings_returns_one_prepared_request_per_prompt(
         self, client, tokenizer

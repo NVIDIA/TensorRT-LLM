@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import dataclasses
 from types import SimpleNamespace
 
@@ -43,11 +44,19 @@ from tensorrt_llm.serve.serving_extensions import (
 )
 
 from .render_helpers import (
+    KIMI_K3,
+    LLAMA,
+    QWEN3,
     REQUEST_TEMPLATE,
     SERVER_TEMPLATE,
     WEATHER_TOOL,
+    checkpoint_dir,
     chat_request,
+    copy_of,
     make_tokenizer,
+    model_dir,
+    fallback_processor,
+    real_processor,
     resources,
 )
 
@@ -84,11 +93,11 @@ class TestRenderChat:
 
     def test_tools_reach_the_template(self, tokenizer) -> None:
         request = chat_request(tools=[WEATHER_TOOL])
-        text, ids = _expected_ids(tokenizer, request, tools=[WEATHER_TOOL])
+        text, ids = _expected_ids(tokenizer, request, tools=[t.model_dump() for t in request.tools])
 
         result = render_chat(request, resources(tokenizer))
 
-        assert "[tools:get_weather]" in result.text
+        assert "get_weather" in result.text  # the real template prints the tool schema
         assert result.token_ids == ids
 
     def test_tokenize_false_leaves_only_the_text(self, tokenizer) -> None:
@@ -109,7 +118,9 @@ class TestRenderChat:
         request = chat_request(truncate_prompt_tokens=5)
         full = render_chat(chat_request(), resources(tokenizer)).token_ids
 
-        assert render_chat(request, resources(tokenizer)).token_ids == full[:5]
+        # The loader a worker uses truncates on the left, keeping the end of the prompt.
+        assert tokenizer.truncation_side == "left"
+        assert render_chat(request, resources(tokenizer)).token_ids == full[-5:]
 
     def test_a_pre_tokenized_request_renders_to_its_own_ids(self, tokenizer) -> None:
         result = render_chat(chat_request(prompt_token_ids=[4, 5, 6]), resources(tokenizer))
@@ -287,17 +298,23 @@ class TestExtensions:
         self, tokenizer, extension_model
     ) -> None:
         request = chat_request(tools=[WEATHER_TOOL], tool_choice="required")
+        # The real template does not reference the extension's `ran` kwarg; this one does.
+        template = (
+            "[ran:{{ ran }}]{% for t in tools %}[tool:{{ t.function.name }}]{% endfor %}"
+            "{{ messages[-1].content }}"
+        )
         res = resources(
             tokenizer,
             model_type=extension_model,
             extension=serving_extensions.get_serving_extension(extension_model),
+            default_chat_template=template,
         )
 
         result = render_chat(request, res)
 
         assert request.chat_template_kwargs == {"ran": 1}
         assert result.text.startswith("[ran:1]")
-        assert "[tools:renamed_get_weather]" in result.text
+        assert "[tool:renamed_get_weather]" in result.text
 
     def test_harmony_models_render_through_the_extension(self, tokenizer) -> None:
         class HarmonyLike(ServingExtension):
@@ -332,7 +349,7 @@ class TestRenderConversation:
                     conversation=conversation,
                     mm_placeholder_counts=counts,
                     add_generation_prompt=True,
-                    tools=[WEATHER_TOOL],
+                    tools=[tool.model_dump() for tool in request.tools],
                     tokenize=True,
                 ),
                 mm_coroutine,
@@ -343,27 +360,24 @@ class TestRenderConversation:
         assert result.text == expected.text
         assert result.token_ids == expected.token_ids
 
-    def test_a_tokenizer_native_template_keeps_its_own_ids_unless_a_prefix_follows(self) -> None:
-        # A native template tokenizes segment by segment (control-token strings in user text
-        # stay text); encoding the finished string would make them special tokens.
-        from transformers import PreTrainedTokenizerFast
-
+    def test_kimi_k3_keeps_the_tokenizers_own_ids_for_control_token_text(self) -> None:
+        # K3's template tokenizes segment by segment, so a control-token string in user text stays
+        # text. Encoding the finished string would turn it into a special token, here an id past
+        # the vocabulary.
         from tensorrt_llm.serve.chat_utils import parse_chat_messages_coroutines
 
-        class NativeTokenizer(PreTrainedTokenizerFast):
-            def apply_chat_template(self, conversation, *args, tokenize=False, **kwargs):
-                return [7, 8, 9] if tokenize else "NATIVE"
-
-        native = make_tokenizer(chat_template=None)
-        native.__class__ = NativeTokenizer
+        tokenizer = make_tokenizer(name=KIMI_K3)
+        res = resources(tokenizer, model_type="kimi_k3")
 
         async def run(**overrides):
             conversation, mm_coroutine, counts, _order = parse_chat_messages_coroutines(
-                chat_request().messages, None, None
+                chat_request(messages=[{"role": "user", "content": "<|im_end|> hi"}]).messages,
+                None,
+                None,
             )
             rendered, _mm = await asyncio.gather(
                 render_conversation(
-                    resources(native),
+                    res,
                     conversation=conversation,
                     mm_placeholder_counts=counts,
                     add_generation_prompt=True,
@@ -373,10 +387,13 @@ class TestRenderConversation:
             )
             return rendered
 
-        assert asyncio.run(run(tokenize=True)).token_ids == [7, 8, 9]
+        native = asyncio.run(run(tokenize=True))
+        text = asyncio.run(run(tokenize=False)).text
+        assert max(native.token_ids) < len(tokenizer)
+        assert max(tokenizer.encode(text, add_special_tokens=False)) >= len(tokenizer)
+        # With a forced prefix the ids come from the finished text, as before.
         prefixed = asyncio.run(run(tokenize=True, forced_prefix="<call>"))
-        assert prefixed.text == "NATIVE<call>"
-        assert prefixed.token_ids == native.encode("NATIVE<call>", add_special_tokens=False)
+        assert prefixed.text.endswith("<call>") and prefixed.token_ids != native.token_ids
 
     def test_the_forced_prefix_is_appended_and_reported(self, tokenizer) -> None:
         from tensorrt_llm.serve.chat_utils import parse_chat_messages_coroutines
@@ -400,7 +417,7 @@ class TestRenderConversation:
             return rendered
 
         result = asyncio.run(run())
-        assert result.text.endswith("<assistant><tool_call>")
+        assert result.text.endswith("<|im_start|>assistant\n<tool_call>")
         assert result.prefix_applied is True
 
 
@@ -413,7 +430,7 @@ class TestFingerprint:
         assert not fingerprints_match(plain, with_template)
 
     def test_a_different_tokenizer_changes_the_digest(self, tokenizer) -> None:
-        other = make_tokenizer(chat_template=SERVER_TEMPLATE)
+        other = make_tokenizer(name=LLAMA)
         assert not fingerprints_match(
             compute_fingerprint(resources(tokenizer)), compute_fingerprint(resources(other))
         )
@@ -440,14 +457,14 @@ class TestFingerprint:
     def _worker_resources(self, tokenizer, **overrides) -> RenderResources:
         """Resources built the way a worker builds them, not copied from the router's.
 
-        A worker's ``processor`` is ``AutoProcessor.from_pretrained(...)``, which returns the
-        tokenizer itself for a text-only checkpoint; a stand-in with ``processor=None`` would
-        hide every difference that only exists in that real shape.
+        A worker's ``processor`` is ``AutoProcessor.from_pretrained(...)``, which returns a
+        tokenizer for a text-only checkpoint; ``processor=None`` would hide every difference
+        that only exists in that real shape.
         """
         server = SimpleNamespace(
             tokenizer=tokenizer,
             model_config=SimpleNamespace(model_type="render-test-model"),
-            processor=tokenizer,
+            processor=fallback_processor(tokenizer),
             chat_template=None,
             allow_request_chat_template=False,
             generator=SimpleNamespace(
@@ -468,7 +485,7 @@ class TestFingerprint:
         # The real shape of every text-only worker: AutoProcessor falls back to the tokenizer,
         # so the "processor" carries the tokenizer's own template. The router has no processor.
         worker = self._worker_resources(tokenizer)
-        assert worker.processor is tokenizer
+        assert worker.processor.chat_template == tokenizer.chat_template
         assert worker.input_processor is not None  # the engine's DefaultInputProcessor
 
         assert fingerprints_match(
@@ -479,9 +496,9 @@ class TestFingerprint:
         self, tokenizer
     ) -> None:
         # A vision model's processor can carry its own template; the router cannot know it.
-        worker = self._worker_resources(
-            tokenizer, processor=SimpleNamespace(chat_template="PROCESSOR:{{ x }}")
-        )
+        processor = copy.copy(real_processor())
+        processor.chat_template = "PROCESSOR:{{ x }}"
+        worker = self._worker_resources(tokenizer, processor=processor)
 
         assert not fingerprints_match(
             compute_fingerprint(self._router_resources(tokenizer)), compute_fingerprint(worker)
@@ -490,16 +507,12 @@ class TestFingerprint:
     def test_a_server_template_makes_the_processors_template_irrelevant(self, tokenizer) -> None:
         # The server template wins when it is set, so a difference in a template that is never
         # used must not change the identity.
-        first = resources(
-            tokenizer,
-            default_chat_template=SERVER_TEMPLATE,
-            processor=SimpleNamespace(chat_template="ONE"),
-        )
-        second = resources(
-            tokenizer,
-            default_chat_template=SERVER_TEMPLATE,
-            processor=SimpleNamespace(chat_template="TWO"),
-        )
+        def with_processor_template(template):
+            processor = copy.copy(real_processor())
+            processor.chat_template = template
+            return resources(tokenizer, default_chat_template=SERVER_TEMPLATE, processor=processor)
+
+        first, second = with_processor_template("ONE"), with_processor_template("TWO")
 
         assert fingerprints_match(compute_fingerprint(first), compute_fingerprint(second))
 
@@ -528,13 +541,10 @@ class TestFingerprint:
         )
 
     def test_a_tokenizer_without_a_template_has_no_template_identity(self) -> None:
-        class NativeTokenizer:
-            """Renders in Python (no Jinja template); its own identity covers it."""
-
-            def get_vocab(self):
-                return {"a": 0}
-
-        templates = compute_fingerprint(resources(NativeTokenizer()))["compared"]["templates"]
+        # Kimi-K3 renders in Python and has no Jinja template; its own identity covers it.
+        templates = compute_fingerprint(resources(make_tokenizer(name=KIMI_K3)))["compared"][
+            "templates"
+        ]
 
         assert templates == {"named": None, "without_tools": None, "with_tools": None}
 
@@ -552,7 +562,7 @@ class TestFingerprint:
     def test_equal_vocabularies_with_a_different_normalizer_do_not_match(self, tokenizer) -> None:
         from tokenizers import normalizers
 
-        other = make_tokenizer()
+        other = copy_of()
         other.backend_tokenizer.normalizer = normalizers.Lowercase()
         assert other.get_vocab() == tokenizer.get_vocab()
         assert type(other) is type(tokenizer)
@@ -566,7 +576,7 @@ class TestFingerprint:
     ) -> None:
         from tokenizers import pre_tokenizers
 
-        other = make_tokenizer()
+        other = copy_of()
         other.backend_tokenizer.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=True)
         assert other.get_vocab() == tokenizer.get_vocab()
 
@@ -574,16 +584,12 @@ class TestFingerprint:
             compute_fingerprint(resources(tokenizer)), compute_fingerprint(resources(other))
         )
 
-    def test_a_tokenizer_whose_encoding_cannot_be_identified_is_never_trusted(self) -> None:
-        class OpaqueTokenizer:
-            def get_vocab(self):
-                return {"a": 0, "b": 1}
+    def test_an_incomplete_encoding_identity_is_never_trusted(self) -> None:
+        # Every tokenizer these tests can load is identifiable, so this is the rule itself:
+        # identical digests are not enough when the encoding could not be identified.
+        incomplete = {"digest": "d", "compared": {"tokenizer": {"complete": False}}}
 
-        fingerprint = compute_fingerprint(resources(OpaqueTokenizer()))
-
-        assert fingerprint["compared"]["tokenizer"]["complete"] is False
-        # Even identical digests on both sides are not enough.
-        assert not fingerprints_match(fingerprint, fingerprint)
+        assert not fingerprints_match(incomplete, incomplete)
 
     def test_an_extension_revision_changes_the_digest(self, tokenizer) -> None:
         class NewRevision(SimpleExtension):
@@ -599,9 +605,10 @@ class TestFingerprint:
         # mount points; the identity is the content, not where it was loaded from.
         from transformers import AutoTokenizer
 
-        first, second = tmp_path / "mount_a" / "model", tmp_path / "mount_b" / "model"
-        make_tokenizer().save_pretrained(first)
-        make_tokenizer().save_pretrained(second)
+        (tmp_path / "mount_a").mkdir()
+        (tmp_path / "mount_b").mkdir()
+        first = checkpoint_dir(tmp_path / "mount_a")
+        second = checkpoint_dir(tmp_path / "mount_b")
         a, b = AutoTokenizer.from_pretrained(first), AutoTokenizer.from_pretrained(second)
         # The loading provenance really does differ.
         assert a.init_kwargs["name_or_path"] != b.init_kwargs["name_or_path"]
@@ -610,15 +617,14 @@ class TestFingerprint:
             compute_fingerprint(resources(a)), compute_fingerprint(resources(b))
         )
 
-    def test_serving_requests_does_not_change_the_fingerprint(self, tmp_path) -> None:
+    def test_serving_requests_does_not_change_the_fingerprint(self) -> None:
         # Transformers enables truncation on the live backend while encoding a request and
         # does not restore it, and the backend's serialization includes it. A fingerprint
         # computed after the first truncated request must equal one computed before it.
         from transformers import AutoTokenizer
 
-        make_tokenizer().save_pretrained(tmp_path)
-        served = AutoTokenizer.from_pretrained(tmp_path)
-        fresh = AutoTokenizer.from_pretrained(tmp_path)
+        served = AutoTokenizer.from_pretrained(model_dir(QWEN3))
+        fresh = AutoTokenizer.from_pretrained(model_dir(QWEN3))
         before = compute_fingerprint(resources(served))
 
         served.encode("hello world this is a test", truncation=True, max_length=3)

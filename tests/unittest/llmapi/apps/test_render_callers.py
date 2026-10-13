@@ -23,7 +23,15 @@ import pytest
 
 from tensorrt_llm.serve.render import RenderResources, render_chat
 
-from .render_helpers import SERVER_TEMPLATE, WEATHER_TOOL, chat_request, make_tokenizer, resources
+from .render_helpers import (
+    LLAMA,
+    SERVER_TEMPLATE,
+    WEATHER_TOOL,
+    chat_request,
+    make_tokenizer,
+    fallback_processor,
+    resources,
+)
 
 pytestmark = pytest.mark.cpu_only
 
@@ -124,7 +132,7 @@ class _Router:
         server = SimpleNamespace(
             tokenizer=tokenizer,
             model_config=SimpleNamespace(model_type=None),
-            processor=tokenizer,
+            processor=fallback_processor(tokenizer),
             chat_template=None,
             allow_request_chat_template=False,
             generator=SimpleNamespace(
@@ -430,11 +438,12 @@ class TestCountTokens:
         )
         assert templated != plain
 
-    def test_the_legacy_switch_restores_the_old_count(self, tokenizer, monkeypatch) -> None:
-        modern = self._client(tokenizer).post("/v1/messages/count_tokens", json=self.BODY).json()
+    def test_the_legacy_switch_restores_the_old_count(self, monkeypatch) -> None:
+        llama = make_tokenizer(name=LLAMA)  # a tokenizer that adds BOS by default
+        modern = self._client(llama).post("/v1/messages/count_tokens", json=self.BODY).json()
         monkeypatch.setenv("TRTLLM_RENDER_LEGACY", "1")
 
-        legacy = self._client(tokenizer).post("/v1/messages/count_tokens", json=self.BODY).json()
+        legacy = self._client(llama).post("/v1/messages/count_tokens", json=self.BODY).json()
 
         # The old count encoded with the tokenizer's default special tokens (BOS),
         # which the chat route does not add; the shared pipeline matches the route.
