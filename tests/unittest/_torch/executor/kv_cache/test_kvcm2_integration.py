@@ -28,6 +28,8 @@ from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import DecoderRunner
 from tensorrt_llm._torch.pyexecutor.kv_cache import kv_cache_manager_v2 as kv_cache_v2_module
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     BlockReusePolicy,
+    KVCacheLayerOwner,
+    KVCacheLayerSpec,
     KVCacheManagerV2,
     Role,
     _extend_swa_windows_for_reuse,
@@ -358,6 +360,8 @@ def _make_manager_for_cache_tier_test(
     joint_reuse: bool = False,
     mapping: Mapping | None = None,
     vocab_size: int | None = 16,
+    dtype: DataType = DataType.HALF,
+    layer_specs: list[KVCacheLayerSpec] | None = None,
 ) -> tuple[KVCacheManagerV2, Mock]:
     impl_constructor = Mock(side_effect=impl_side_effect)
     if mapping is None:
@@ -421,7 +425,8 @@ def _make_manager_for_cache_tier_test(
             max_seq_len=MAX_SEQ_LEN,
             max_batch_size=1,
             mapping=mapping,
-            dtype=DataType.HALF,
+            dtype=dtype,
+            layer_specs=layer_specs,
             spec_config=spec_config,
             is_draft=is_draft,
             is_disagg=is_disagg,
@@ -1299,6 +1304,85 @@ def test_cold_codec_provider_receives_draft_role() -> None:
     )
 
     assert codec_provider.create_cold_page_codec.call_args.kwargs["is_draft"] is True
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "manager_dtype,layer_dtype",
+    [
+        (DataType.HALF, DataType.BF16),
+        (DataType.BF16, DataType.HALF),
+        (DataType.HALF, DataType.FP8),
+    ],
+)
+def test_cold_codec_provider_receives_layer_spec_dtype(
+    manager_dtype: DataType, layer_dtype: DataType
+) -> None:
+    codec_provider = Mock()
+    layer = KVCacheLayerSpec(
+        global_layer_id=0,
+        owner=KVCacheLayerOwner.TARGET,
+        dtype=layer_dtype,
+        num_kv_heads=1,
+        head_dim=1,
+        buffer_roles=(Role.KEY,),
+    )
+    manager, _ = _make_manager_for_cache_tier_test(
+        KvCacheConfig(max_gpu_total_bytes=16 << 20),
+        [Mock()],
+        cold_page_codec_provider=codec_provider,
+        dtype=manager_dtype,
+        layer_specs=[layer],
+    )
+
+    assert manager.dtype == manager_dtype
+    codec_provider.create_cold_page_codec.assert_called_once()
+    assert codec_provider.create_cold_page_codec.call_args.kwargs["runtime_dtype"] == layer_dtype
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("manager_dtype", [DataType.HALF, DataType.BF16])
+def test_cold_codec_provider_receives_legacy_manager_dtype(manager_dtype: DataType) -> None:
+    codec_provider = Mock()
+    _make_manager_for_cache_tier_test(
+        KvCacheConfig(max_gpu_total_bytes=16 << 20),
+        [Mock()],
+        cold_page_codec_provider=codec_provider,
+        dtype=manager_dtype,
+    )
+
+    codec_provider.create_cold_page_codec.assert_called_once()
+    assert codec_provider.create_cold_page_codec.call_args.kwargs["runtime_dtype"] == manager_dtype
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "layer_dtypes", [(DataType.BF16, DataType.HALF), (DataType.BF16, DataType.FP8)]
+)
+def test_cold_codec_provider_rejects_mixed_layer_spec_dtypes(
+    layer_dtypes: tuple[DataType, DataType],
+) -> None:
+    codec_provider = Mock()
+    layer_specs = [
+        KVCacheLayerSpec(
+            global_layer_id=layer_id,
+            owner=KVCacheLayerOwner.TARGET,
+            dtype=layer_dtype,
+            num_kv_heads=1,
+            head_dim=1,
+            buffer_roles=(Role.KEY,),
+        )
+        for layer_id, layer_dtype in enumerate(layer_dtypes)
+    ]
+    with pytest.raises(NotImplementedError, match="mixed-dtype KV-cache layer specs"):
+        _make_manager_for_cache_tier_test(
+            KvCacheConfig(max_gpu_total_bytes=16 << 20),
+            [Mock()],
+            cold_page_codec_provider=codec_provider,
+            layer_specs=layer_specs,
+        )
+
+    codec_provider.create_cold_page_codec.assert_not_called()
 
 
 def test_extra_tokens_are_in_context_capacity() -> None:
