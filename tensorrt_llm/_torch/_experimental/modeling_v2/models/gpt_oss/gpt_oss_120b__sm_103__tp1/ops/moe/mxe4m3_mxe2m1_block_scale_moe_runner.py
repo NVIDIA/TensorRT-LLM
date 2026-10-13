@@ -60,19 +60,8 @@ _E2M1_VALUES = (
 #: One expert stack's `(codes, e8m0 exponents, bias)`.
 Operand = Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
 
-#: The FC1 epilogue's block-scale recipe is architecture-specific, and the
-#: difference is bit-exact rather than a tolerance: trtllm-gen ships one cubin
-#: per architecture. Measured on each with an identity down-projection reading
-#: the intermediate out element by element.
-#:
-#:   sm_100   e8m0 = floor(log2(amax)) - 8      "OCP scale"
-#:   sm_103   e8m0 = ceil(log2(amax / 448))     "round-up scale"
-#:
-#: The round-up form is the one ``torch.ops.trtllm.mxfp8_quantize`` has always
-#: used, so sm_103 makes the MoE epilogue and the standalone quantizer agree.
-#: Both are named so that a future cubin switching back cannot pass silently.
 OCP_SCALE, ROUND_UP_SCALE = "ocp", "round_up"
-SCALE_RECIPE_BY_SM = {(10, 0): OCP_SCALE, (10, 3): ROUND_UP_SCALE}
+SCALE_RECIPE_BY_SM = {(10, 0): ROUND_UP_SCALE, (10, 3): ROUND_UP_SCALE}
 
 
 def scale_recipe() -> str:
