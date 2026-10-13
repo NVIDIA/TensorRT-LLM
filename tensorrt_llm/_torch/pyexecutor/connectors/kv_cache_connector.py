@@ -623,7 +623,9 @@ class KvCacheConnectorSchedulerOutputRequest:
         # Report the native pages' current priorities, including shared-page claims.
         priorities = None
         if req.kv_cache_retention_config is not None:
-            if is_v2:
+            if not new_block_ids:
+                priorities = []
+            elif is_v2:
                 kv_cache = kv_cache_manager.kv_cache_map[req.py_request_id]
                 priorities = kv_cache.get_page_priorities(0)[
                     len(self.block_ids) - len(new_block_ids) : len(self.block_ids)

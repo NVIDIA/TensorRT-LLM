@@ -138,6 +138,8 @@ def test_single_group_priorities_follow_new_page_ordinals() -> None:
     assert second.new_block_ids == [9]
     assert second.priorities == [20]
 
+    cache.get_page_priorities.reset_mock()
     unchanged = tracker.update_and_build_data(req, manager)
     assert unchanged.new_block_ids == []
     assert unchanged.priorities == []
+    cache.get_page_priorities.assert_not_called()
