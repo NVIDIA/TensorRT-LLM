@@ -32,6 +32,7 @@ from benchmark_utils import (  # noqa: E402
     DISAGG_BENCHMARK_MODES,
     DISAGG_CONFIG_MODES,
     GEN_ONLY_NO_CONTEXT_MODE,
+    ctx_only_world_size,
     dwdp_ctx_layout,
     dwdp_ctx_size,
     gen_only_no_context_server_counts,
@@ -252,11 +253,7 @@ def get_hardware_config(config, runtime_mode, benchmark_mode, test_name=None):
             gpus_per_server = gen_only_no_context_world_size(config)
         else:
             # Use ctx worker config to determine hardware
-            ctx_config = worker_config.get("ctx", {})
-            ctx_tp = ctx_config.get("tensor_parallel_size", 1)
-            ctx_pp = ctx_config.get("pipeline_parallel_size", 1)
-            ctx_cp = ctx_config.get("context_parallel_size", 1)
-            gpus_per_server = ctx_tp * ctx_pp * ctx_cp
+            gpus_per_server = ctx_only_world_size(config)
 
         nodes_per_server = (gpus_per_server + gpus_per_node - 1) // gpus_per_node
         total_nodes = nodes_per_server

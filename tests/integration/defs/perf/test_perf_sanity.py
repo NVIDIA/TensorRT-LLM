@@ -1580,6 +1580,22 @@ def to_env_dict(env_vars: str) -> Dict[str, str]:
     return env
 
 
+# AgentX knobs a ctx_only lane overrides on top of the yaml's client_env_var.
+# One ctx server must prefill every trajectory's full-length snapshot primer
+# before aiperf measures anything (DSv4 24-GPU: 1232 primers, ~45 min on one
+# 8-GPU server), so the optional cache-pressure warmup stage after them is
+# dropped and the window is halved to fit a CI stage. 1800 s is above the
+# agentx scenario's 900 s minimum, so the export stays submission_valid.
+AGENTX_CTX_ONLY_CLIENT_ENV = {"AGENTX_WARMUP_PER_LANE": "0", "AGENTX_DURATION": "1800"}
+
+
+def agentx_ctx_only_client_env(env_vars: str) -> str:
+    """The yaml's agentx client_env_var with the ctx_only overrides applied."""
+    env = to_env_dict(env_vars)
+    env.update(AGENTX_CTX_ONLY_CLIENT_ENV)
+    return " ".join(f"{key}={value}" for key, value in env.items())
+
+
 def force_num_accepted_tokens_from_env_str(env_vars: str) -> int:
     """Extract TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS from a space-separated KEY=val env-var string.
 
@@ -2241,7 +2257,7 @@ class ClientConfig:
                 f"Client {self.name} uses benchmark_client={AGENTX_BENCHMARK_CLIENT} but sets no "
                 "dataset_file; the agentx scenario has no default corpus."
             )
-        return [
+        cmd = [
             "python",
             os.path.join(os.path.dirname(os.path.abspath(__file__)), "agentx_client.py"),
             "--model",
@@ -2251,6 +2267,12 @@ class ClientConfig:
             "--dataset",
             self.dataset_file,
         ]
+        # The trace sets each turn's output length, so osl is not passed through
+        # in general. osl == 1 is the ctx_only mode's prefill-only request, which
+        # the client applies to every turn.
+        if self.osl == 1:
+            cmd += ["--max-output-tokens", "1"]
+        return cmd
 
     def _to_sa_benchmark_cmd(self) -> List[str]:
         """Generate SA benchmark command (bench_serving repo)."""
@@ -2587,10 +2609,26 @@ class AggrTestCmds(NamedTuple):
             server_addr_path = os.path.join(self.test_output_dir, f"trtllm-serve.{server_idx}.addr")
             if os.path.exists(server_addr_path):
                 os.remove(server_addr_path)
-            server_cmd_with_port = add_host_port_to_cmd(server_cmd, server_hostname, 0) + [
-                "--report_addr",
-                server_addr_path,
-            ]
+            num_frontends = 1
+            if server_idx < len(self.server_configs):
+                num_frontends = (
+                    getattr(self.server_configs[server_idx], "num_serve_frontends", 1) or 1
+                )
+            if num_frontends > 1:
+                # trtllm-serve refuses port 0 / --report_addr with several
+                # frontends (a ctx_only case inherits them from the disagg ctx
+                # worker), so reserve the port here and publish it on the
+                # server's behalf, as DisaggTestCmds does for its workers.
+                server_port = reserve_multi_frontend_port(server_hostname)
+                server_cmd_with_port = add_host_port_to_cmd(
+                    server_cmd, server_hostname, server_port
+                )
+                publish_addr_file(server_addr_path, server_hostname, server_port)
+            else:
+                server_cmd_with_port = add_host_port_to_cmd(server_cmd, server_hostname, 0) + [
+                    "--report_addr",
+                    server_addr_path,
+                ]
 
             print_info(f"Starting server. cmd is {server_cmd_with_port}")
             server_file_path = os.path.join(self.test_output_dir, f"trtllm-serve.{server_idx}.log")
@@ -3882,19 +3920,21 @@ class AggrGenOnlyNoContextCmds(NamedTuple):
         proxy_proc = None
         try:
             num_frontends = getattr(gen_cfg, "num_serve_frontends", 1) or 1
-            if num_frontends > 1:
-                raise RuntimeError(
-                    f"{GEN_ONLY_NO_CONTEXT_MODE} does not support num_serve_frontends="
-                    f"{num_frontends}: the worker is launched with port 0 and "
-                    "--report_addr, which trtllm-serve refuses with several frontends."
-                )
             gen_addr_path = os.path.join(self.test_output_dir, f"GEN_0.{server_idx}.addr")
             if os.path.exists(gen_addr_path):
                 os.remove(gen_addr_path)
-            gen_cmd_with_port = add_host_port_to_cmd(gen_cmd, "localhost", 0) + [
-                "--report_addr",
-                gen_addr_path,
-            ]
+            if num_frontends > 1:
+                # trtllm-serve refuses port 0 / --report_addr with several
+                # frontends, so reserve the port here and publish it on the
+                # worker's behalf, as DisaggTestCmds does for its workers.
+                gen_port = reserve_multi_frontend_port("localhost")
+                gen_cmd_with_port = add_host_port_to_cmd(gen_cmd, "localhost", gen_port)
+                publish_addr_file(gen_addr_path, "localhost", gen_port)
+            else:
+                gen_cmd_with_port = add_host_port_to_cmd(gen_cmd, "localhost", 0) + [
+                    "--report_addr",
+                    gen_addr_path,
+                ]
             print_info(f"Starting gen worker. cmd is {gen_cmd_with_port}")
             gen_log_path = self._gen_worker_log(server_idx)
             gen_env = copy.deepcopy(os.environ)
@@ -4410,6 +4450,19 @@ class PerfSanityTestConfig:
             ctx_config = dict(worker_config.get("ctx", {}))
             # Ignore cache_transceiver_config for ctx_only
             ctx_config.pop("cache_transceiver_config", None)
+            dwdp_size = dwdp_ctx_size(worker_config)
+            if dwdp_size:
+                # A DWDP ctx side is num_ctx_servers one-GPU servers sharing
+                # experts. Aggregated, the same group is one server with
+                # attention DP over all of them: every rank stays a complete
+                # replica with one expert slice, which DWDP requires. The MoE
+                # parallel sizes stay as configured; DWDP overrides them to 1 in
+                # Mapping. The launch script sizes the job by
+                # ctx_only_world_size().
+                ctx_config.update(
+                    tensor_parallel_size=hardware.get("num_ctx_servers", dwdp_size),
+                    enable_attention_dp=True,
+                )
 
             # Create server config for ctx_only (single ServerConfig, not tuple)
             ctx_server_config_data = {
@@ -4496,11 +4549,17 @@ class PerfSanityTestConfig:
             self.server_configs = [(ctx_server_config, gen_server_config, disagg_config)]
 
         # Create client configs for each concurrency value
-        # For ctx_only: OSL is set to 1 and dataset_file is empty
-        osl = 1 if benchmark_mode == "ctx_only" else benchmark.get("output_length", 1024)
-        dataset_file = "" if benchmark_mode == "ctx_only" else benchmark.get("dataset_file", "")
-        use_nv_sa_benchmark = benchmark.get("use_nv_sa_benchmark", False)
+        # For ctx_only: OSL is set to 1 and dataset_file is empty, except for
+        # the agentx client, whose dataset is the trace being replayed: it keeps
+        # the trace and caps every turn's output to the one token osl == 1 asks for.
         benchmark_client = benchmark.get("benchmark_client", "")
+        osl = 1 if benchmark_mode == "ctx_only" else benchmark.get("output_length", 1024)
+        dataset_file = (
+            ""
+            if benchmark_mode == "ctx_only" and benchmark_client != AGENTX_BENCHMARK_CLIENT
+            else benchmark.get("dataset_file", "")
+        )
+        use_nv_sa_benchmark = benchmark.get("use_nv_sa_benchmark", False)
         if benchmark_client not in ("", AGENTX_BENCHMARK_CLIENT):
             # There is no schema validation on these yamls, so an unrecognised
             # value would otherwise fall through to the default client and
@@ -4554,6 +4613,9 @@ class PerfSanityTestConfig:
         # benchmark: (since `benchmark` is what becomes the disagg ClientConfig).
         accuracy_data = config.get("accuracy") or None
         only_run_accuracy = bool(benchmark.get("only_run_accuracy", False))
+
+        if benchmark_mode == "ctx_only" and benchmark_client == AGENTX_BENCHMARK_CLIENT:
+            client_env_var = agentx_ctx_only_client_env(client_env_var)
 
         client_configs = []
         for concurrency in concurrency_values:

@@ -53,6 +53,7 @@ from benchmark_utils import (
     AGGREGATED_DISAGG_YAML_MODES,
     DISAGG_BENCHMARK_MODES,
     GEN_ONLY_NO_CONTEXT_MODE,
+    ctx_only_world_size,
     dwdp_ctx_layout,
     dwdp_ctx_size,
     gen_only_no_context_server_counts,
@@ -484,10 +485,7 @@ def get_hardware_config(config, runtime_mode, benchmark_mode, server_name):
         ctx_config = worker_config.get("ctx", {}) or {}
         if not ctx_config:
             raise ValueError("worker_config.ctx is required for ctx_only mode")
-        tp = ctx_config.get("tensor_parallel_size", 1)
-        pp = ctx_config.get("pipeline_parallel_size", 1)
-        cp = ctx_config.get("context_parallel_size", 1)
-        gpus_per_server = ctx_config.get("world_size") or (tp * pp * cp)
+        gpus_per_server = ctx_config.get("world_size") or ctx_only_world_size(config)
     elif runtime_mode == "aggregated":
         # Regular agg: match server_configs by name.
         server_configs = config.get("server_configs", []) or []

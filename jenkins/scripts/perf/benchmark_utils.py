@@ -71,6 +71,30 @@ def dwdp_ctx_size(config):
     return dwdp_size
 
 
+def ctx_only_world_size(config):
+    """GPU count of the single aggregated server a ctx_only case runs.
+
+    A plain ctx side is one server of ``tp * pp * cp`` GPUs. A DWDP ctx side is
+    ``num_ctx_servers`` one-GPU servers; ctx_only folds them into one aggregated
+    server with attention DP over all of them, the layout in which DWDP shares
+    experts outside disaggregated serving (each rank stays a full replica).
+
+    Args:
+        config: The parsed disaggregated config YAML.
+
+    Returns:
+        int: The ctx_only server's world size.
+    """
+    if dwdp_ctx_size(config):
+        return config["hardware"]["num_ctx_servers"]
+    ctx_config = ((config or {}).get("worker_config", {}) or {}).get("ctx", {}) or {}
+    return (
+        ctx_config.get("tensor_parallel_size", 1)
+        * ctx_config.get("pipeline_parallel_size", 1)
+        * ctx_config.get("context_parallel_size", 1)
+    )
+
+
 def dwdp_ctx_layout(config):
     """Node layout of a DWDP context side: one world rank per context server.
 

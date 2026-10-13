@@ -563,3 +563,25 @@ def test_dwdp_ctx_worker_command_replaces_llmapi_launch(ci_submit_module: Module
         'export partialPytestCommandDWDPCtxWorker="LLM_ROOT=/src COLUMNS=300 '
         'bash /rank.sh pytest -vv --test-list=/w/list.txt"'
     )
+
+
+def _aggregated_hardware(module: ModuleType, config: dict, benchmark_mode: str) -> dict:
+    if Path(module.__file__).parent.name == "local":
+        return module.get_hardware_config(config, "aggregated", benchmark_mode)
+    return module.get_hardware_config(config, "aggregated", benchmark_mode, None)
+
+
+def test_ctx_only_folds_dwdp_ctx_servers_into_one_server(submit_module: ModuleType):
+    # ctx_only runs the 16 single-GPU DWDP ctx servers as one 16-GPU
+    # attention-DP server, not as a single one-GPU server.
+    hardware = _aggregated_hardware(submit_module, _dwdp_disagg_config(), "ctx_only")
+    assert hardware["gpus_per_server"] == 16
+    assert hardware["total_nodes"] == 4
+
+
+def test_ctx_only_without_dwdp_sizes_from_ctx_parallelism(submit_module: ModuleType):
+    config = _dwdp_disagg_config(num_ctx_servers=2, ctx_tp=8)
+    del config["worker_config"]["ctx"]["dwdp_config"]
+    hardware = _aggregated_hardware(submit_module, config, "ctx_only")
+    assert hardware["gpus_per_server"] == 8
+    assert hardware["total_nodes"] == 2
