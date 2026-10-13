@@ -12,7 +12,8 @@ if [[ ! -f "${LIBFABRIC_INSTALL_PATH}/include/rdma/fabric.h" ||
       ! -f "${LIBFABRIC_INSTALL_PATH}/lib/libfabric.so" ]]; then
     LIBFABRIC_INSTALL_PATH=""
 fi
-# Reuse HPC-X's hwloc via NGC PyTorch's default Open MPI prefix for the EFA plugin.
+# NGC PyTorch's default Open MPI comes from HPC-X and is exposed at /usr/local/mpi.
+# Reuse the hwloc bundled with that MPI installation for the EFA plugin.
 HWLOC_INSTALL_PATH="/usr/local/mpi"
 if [[ -n "${LIBFABRIC_INSTALL_PATH}" &&
       -f "${HWLOC_INSTALL_PATH}/include/hwloc.h" &&
