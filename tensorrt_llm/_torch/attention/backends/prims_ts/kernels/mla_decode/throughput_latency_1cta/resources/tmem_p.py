@@ -80,6 +80,7 @@ class TmemPResource(MlaResource):
         ("p_stage_idx", Int32, Int32(0), "Current TMEM P pipeline stage."),
     )
     inst_id: cutlass.Constexpr[int] = 0
+    store_softmax_stats: cutlass.Constexpr[bool] = False
     scale_softmax_log2: Float32 = None
     tmem_alias_ref: Optional[MlaResource] = None
     p_stage_idx: cutlass.Constexpr[TaskLocalVariable] = (
@@ -167,26 +168,54 @@ class TmemPResource(MlaResource):
                 p2 = Float32(0.0)
                 p3 = Float32(0.0)
                 if has_finite_max:
-                    scaled01 = fadd2(
-                        fmul2(
-                            (
-                                s_arr[s_base + 0],
-                                s_arr[s_base + 1],
+                    if cutlass.const_expr(self.store_softmax_stats):
+                        # Keep the probability origin exact before log2 scaling.
+                        neg_raw_pair = (-new_max_arr[0], -new_max_arr[0])
+                        quant_pair = (
+                            fp8_log2_quant_scale(),
+                            fp8_log2_quant_scale(),
+                        )
+                        scaled01 = fadd2(
+                            fmul2(
+                                fadd2(
+                                    (s_arr[s_base + 0], s_arr[s_base + 1]),
+                                    neg_raw_pair,
+                                ),
+                                log2_scale_pair,
                             ),
-                            log2_scale_pair,
-                        ),
-                        neg_scaled_pair,
-                    )
-                    scaled23 = fadd2(
-                        fmul2(
-                            (
-                                s_arr[s_base + 2],
-                                s_arr[s_base + 3],
+                            quant_pair,
+                        )
+                        scaled23 = fadd2(
+                            fmul2(
+                                fadd2(
+                                    (s_arr[s_base + 2], s_arr[s_base + 3]),
+                                    neg_raw_pair,
+                                ),
+                                log2_scale_pair,
                             ),
-                            log2_scale_pair,
-                        ),
-                        neg_scaled_pair,
-                    )
+                            quant_pair,
+                        )
+                    else:
+                        scaled01 = fadd2(
+                            fmul2(
+                                (
+                                    s_arr[s_base + 0],
+                                    s_arr[s_base + 1],
+                                ),
+                                log2_scale_pair,
+                            ),
+                            neg_scaled_pair,
+                        )
+                        scaled23 = fadd2(
+                            fmul2(
+                                (
+                                    s_arr[s_base + 2],
+                                    s_arr[s_base + 3],
+                                ),
+                                log2_scale_pair,
+                            ),
+                            neg_scaled_pair,
+                        )
                     p0 = cute.math.exp2(scaled01[0], fastmath=True)
                     p1 = cute.math.exp2(scaled01[1], fastmath=True)
                     p2 = cute.math.exp2(scaled23[0], fastmath=True)
@@ -208,12 +237,20 @@ class TmemPResource(MlaResource):
                     scale_idx = scale_base + (s_idx % 2)
                     p_val = Float32(0.0)
                     if new_max_arr[scale_idx] != neg_max_f32():
-                        p_val = cute.math.exp2(
-                            s_arr[s_idx] * self.scale_softmax_log2
-                            + neg_scaled_max[scale_idx]
-                            + fp8_log2_quant_scale(),
-                            fastmath=True,
-                        )
+                        if cutlass.const_expr(self.store_softmax_stats):
+                            p_val = cute.math.exp2(
+                                (s_arr[s_idx] - new_max_arr[scale_idx])
+                                * self.scale_softmax_log2
+                                + fp8_log2_quant_scale(),
+                                fastmath=True,
+                            )
+                        else:
+                            p_val = cute.math.exp2(
+                                s_arr[s_idx] * self.scale_softmax_log2
+                                + neg_scaled_max[scale_idx]
+                                + fp8_log2_quant_scale(),
+                                fastmath=True,
+                            )
                     p_vals[elem_idx] = p_val
                     local_sums[scale_idx] += p_val
                 regs_p[packed_idx] = pack_float4_to_fp8_e4m3(
@@ -228,14 +265,24 @@ class TmemPResource(MlaResource):
                 if cutlass.const_expr(cfg.kernel_variant == "keeps_mma_ab"):
                     new_max = new_max_arr[0]
                     if new_max != neg_max_f32():
-                        p0 = cute.math.exp2(
-                            s_arr[s0] * self.scale_softmax_log2 + neg_scaled_max[0],
-                            fastmath=True,
-                        )
-                        p1 = cute.math.exp2(
-                            s_arr[s1] * self.scale_softmax_log2 + neg_scaled_max[0],
-                            fastmath=True,
-                        )
+                        if cutlass.const_expr(self.store_softmax_stats):
+                            p0 = cute.math.exp2(
+                                (s_arr[s0] - new_max) * self.scale_softmax_log2,
+                                fastmath=True,
+                            )
+                            p1 = cute.math.exp2(
+                                (s_arr[s1] - new_max) * self.scale_softmax_log2,
+                                fastmath=True,
+                            )
+                        else:
+                            p0 = cute.math.exp2(
+                                s_arr[s0] * self.scale_softmax_log2 + neg_scaled_max[0],
+                                fastmath=True,
+                            )
+                            p1 = cute.math.exp2(
+                                s_arr[s1] * self.scale_softmax_log2 + neg_scaled_max[0],
+                                fastmath=True,
+                            )
                     local_sums[0] += p0
                     local_sums[0] += p1
                 else:
@@ -244,17 +291,29 @@ class TmemPResource(MlaResource):
                     new_max0 = new_max_arr[scale0]
                     new_max1 = new_max_arr[scale1]
                     if new_max0 != neg_max_f32():
-                        p0 = cute.math.exp2(
-                            s_arr[s0] * self.scale_softmax_log2
-                            + neg_scaled_max[scale0],
-                            fastmath=True,
-                        )
+                        if cutlass.const_expr(self.store_softmax_stats):
+                            p0 = cute.math.exp2(
+                                (s_arr[s0] - new_max0) * self.scale_softmax_log2,
+                                fastmath=True,
+                            )
+                        else:
+                            p0 = cute.math.exp2(
+                                s_arr[s0] * self.scale_softmax_log2
+                                + neg_scaled_max[scale0],
+                                fastmath=True,
+                            )
                     if new_max1 != neg_max_f32():
-                        p1 = cute.math.exp2(
-                            s_arr[s1] * self.scale_softmax_log2
-                            + neg_scaled_max[scale1],
-                            fastmath=True,
-                        )
+                        if cutlass.const_expr(self.store_softmax_stats):
+                            p1 = cute.math.exp2(
+                                (s_arr[s1] - new_max1) * self.scale_softmax_log2,
+                                fastmath=True,
+                            )
+                        else:
+                            p1 = cute.math.exp2(
+                                s_arr[s1] * self.scale_softmax_log2
+                                + neg_scaled_max[scale1],
+                                fastmath=True,
+                            )
                     local_sums[scale0] += p0
                     local_sums[scale1] += p1
                 regs_p[pair_idx] = pack_float2_to_bf16(p0, p1)

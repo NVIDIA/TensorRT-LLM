@@ -461,6 +461,8 @@ def build_throughput_latency_mla_task_manager(
     lse_tensor=None,
     acc_o_tensor=None,
     acc_lse_tensor=None,
+    softmax_stats=None,
+    softmax_stats_scale=None,
     tile_sched_params=None,
     clc_response_ptr=None,
     use_clc_dynamic_scheduler: bool = False,
@@ -510,6 +512,8 @@ def build_throughput_latency_mla_task_manager(
             lse_tensor=lse_tensor,
             acc_o_tensor=acc_o_tensor,
             acc_lse_tensor=acc_lse_tensor,
+            softmax_stats=softmax_stats,
+            softmax_stats_scale=softmax_stats_scale,
             tile_sched_params=tile_sched_params,
             clc_response_ptr=clc_response_ptr,
             use_clc_dynamic_scheduler=use_clc_dynamic_scheduler,
@@ -721,6 +725,7 @@ def build_throughput_latency_mla_task_manager(
     )
     smem_p0 = SmemPResource(
         cfg=cfg,
+        store_softmax_stats=softmax_stats is not None,
         pipeline_config=smem_p0_cfg,
         inst_id=0,
         scale_softmax_log2=scale_softmax_log2,
@@ -730,6 +735,7 @@ def build_throughput_latency_mla_task_manager(
     )
     smem_p1 = SmemPResource(
         cfg=cfg,
+        store_softmax_stats=softmax_stats is not None,
         pipeline_config=smem_p1_cfg,
         inst_id=1,
         scale_softmax_log2=scale_softmax_log2,
@@ -774,6 +780,8 @@ def build_throughput_latency_mla_task_manager(
         lse_tensor=lse_tensor,
         acc_o_tensor=acc_o_tensor,
         acc_lse_tensor=acc_lse_tensor,
+        softmax_stats=softmax_stats,
+        softmax_stats_scale=softmax_stats_scale,
         cache_seqs=cache_seqs,
         cu_seqlens_q=cu_seqlens_q,
         head_idx=head_idx,
@@ -792,6 +800,8 @@ def build_throughput_latency_mla_task_manager(
         lse_tensor=lse_tensor,
         acc_o_tensor=acc_o_tensor,
         acc_lse_tensor=acc_lse_tensor,
+        softmax_stats=softmax_stats,
+        softmax_stats_scale=softmax_stats_scale,
         cache_seqs=cache_seqs,
         cu_seqlens_q=cu_seqlens_q,
         head_idx=head_idx,
@@ -1036,6 +1046,8 @@ def _make_keeps_mma_ab_task_graph(
     lse_tensor=None,
     acc_o_tensor=None,
     acc_lse_tensor=None,
+    softmax_stats=None,
+    softmax_stats_scale=None,
     tile_sched_params=None,
     clc_response_ptr=None,
     use_clc_dynamic_scheduler: bool = False,
@@ -1208,6 +1220,7 @@ def _make_keeps_mma_ab_task_graph(
     )
     tmem_p = TmemPResource(
         cfg=cfg,
+        store_softmax_stats=softmax_stats is not None,
         pipeline_config=tmem_p_cfg,
         inst_id=0,
         scale_softmax_log2=scale_softmax_log2,
@@ -1244,6 +1257,8 @@ def _make_keeps_mma_ab_task_graph(
         lse_tensor=lse_tensor,
         acc_o_tensor=acc_o_tensor,
         acc_lse_tensor=acc_lse_tensor,
+        softmax_stats=softmax_stats,
+        softmax_stats_scale=softmax_stats_scale,
         cache_seqs=cache_seqs,
         cu_seqlens_q=cu_seqlens_q,
         head_idx=head_idx,
@@ -1666,6 +1681,7 @@ class ThroughputLatencyMlaDecodeTs:
         softmax_scale: cutlass.Float32,
         output_scale: cutlass.Float32,
         stream: object,
+        softmax_stats: cute.Tensor | None = None,
     ):
         """Execute throughput-latency 1CTA MLA with fixed or compact ragged Q."""
         cfg = self._make_config()
@@ -1846,6 +1862,7 @@ class ThroughputLatencyMlaDecodeTs:
         )
 
         softmax_scale_log2 = softmax_scale * LOG2_E
+        softmax_stats_scale = softmax_scale if softmax_stats is not None else None
         use_gmem_reduction = cutlass.const_expr(
             cfg.use_multi_ctas_kv == 1 and cfg.use_cluster_reduction != 1
         )
@@ -1923,6 +1940,8 @@ class ThroughputLatencyMlaDecodeTs:
             softmax_scale_log2,
             output_scale,
             tile_sched_params,
+            softmax_stats,
+            softmax_stats_scale,
         ).launch(
             grid=grid,
             block=[cfg.threads_per_cta, 1, 1],
@@ -1956,6 +1975,8 @@ class ThroughputLatencyMlaDecodeTs:
                     acc_lse,
                     cache_seqs,
                     cu_seqlens_q,
+                    softmax_stats,
+                    softmax_stats_scale,
                 )
                 if cutlass.const_expr(topology.cluster_size == 1):
                     parallel_reducer.launch(
@@ -2000,6 +2021,8 @@ class ThroughputLatencyMlaDecodeTs:
                 cache_seqs,
                 cu_seqlens_q,
                 cutlass.Int32(reduction_ctas),
+                softmax_stats,
+                softmax_stats_scale,
             ).launch(
                 grid=reduction_grid,
                 block=[reduction_threads, 1, 1],
@@ -2028,6 +2051,8 @@ class ThroughputLatencyMlaDecodeTs:
         softmax_scale_log2: cutlass.Float32,
         output_scale: cutlass.Float32,
         tile_sched_params: object,
+        softmax_stats: cute.Tensor | None = None,
+        softmax_stats_scale=None,
     ):
         """Execute one flat-Q, batch, KV-split, and V head-dimension tile."""
         cfg = self._make_config()
@@ -2134,6 +2159,8 @@ class ThroughputLatencyMlaDecodeTs:
             lse_tensor=lse,
             acc_o_tensor=acc_o,
             acc_lse_tensor=acc_lse,
+            softmax_stats=softmax_stats,
+            softmax_stats_scale=softmax_stats_scale,
             tile_sched_params=tile_sched_params,
             clc_response_ptr=clc_response_ptr,
             use_clc_dynamic_scheduler=use_clc_dynamic,
@@ -2239,6 +2266,8 @@ class ThroughputLatencyMlaDecodeTs:
         cache_seqs: cute.Tensor,
         cu_seqlens_q: cute.Tensor,
         num_reduction_ctas: cutlass.Int32,
+        softmax_stats: cute.Tensor | None = None,
+        softmax_stats_scale=None,
     ):
         """Dispatch the throughput-latency split-KV reduction body."""
         cfg = self._make_config()
@@ -2252,6 +2281,8 @@ class ThroughputLatencyMlaDecodeTs:
             cu_seqlens_q,
             cfg,
             num_reduction_ctas,
+            softmax_stats,
+            softmax_stats_scale,
         )
 
     @cute.kernel
@@ -2263,6 +2294,8 @@ class ThroughputLatencyMlaDecodeTs:
         acc_lse: cute.Tensor,
         cache_seqs: cute.Tensor,
         cu_seqlens_q: cute.Tensor,
+        softmax_stats: cute.Tensor | None = None,
+        softmax_stats_scale=None,
     ):
         """Dispatch the automatically selected parallel standalone reducer."""
 
@@ -2280,4 +2313,6 @@ class ThroughputLatencyMlaDecodeTs:
             topology.slots_per_rank,
             topology.actual_splits,
             self.parallel_reduction_elements_per_slice,
+            softmax_stats,
+            softmax_stats_scale,
         )

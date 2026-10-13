@@ -1369,6 +1369,9 @@ class FmhaDecodeConfig:
     # denominator (extra logit that absorbs probability mass). Requires the
     # `attention_sinks` tensor argument at launch.
     use_attention_sinks: bool = False
+    # Export merge-compatible (natural-log maximum, unscaled denominator).
+    # Only separate reducers require an additional per-split maximum scalar.
+    store_softmax_stats: bool = False
     # Optional profile and reduction knobs selected by launcher policy or tests.
     use_keeps_mma_ab: bool = False
     # Sage attention: a nonzero ``sage_k_block_size`` enables per-block Q/K
@@ -2417,8 +2420,12 @@ class FmhaDecodeConfig:
         the static 448 scale, which needs ``p <= 1``, so it always anchors on
         the exact row maximum.
         """
+        # The public statistics contract requires the actual maximum, not a
+        # merge-equivalent delayed anchor. Keep the fast default policy intact;
+        # statistics-enabled kernels maintain the exact online maximum.
         return (
-            self.use_keeps_mma_ab
+            not self.store_softmax_stats
+            and self.use_keeps_mma_ab
             and not self.use_fp8_pv
             and (self.tile_size_kv == 256 or self.use_block_sparse)
         )
