@@ -15,7 +15,7 @@ from mpi4py import MPI
 from mpi4py.futures import MPIPoolExecutor
 
 import tensorrt_llm as tllm
-from tensorrt_llm._mnnvl_utils import MnnvlMemory
+from tensorrt_llm._torch.distributed.mnnvl_memory import MnnvlMemory
 from tensorrt_llm._torch.moe.fused_moe.communication.nvlink_one_sided import (
     _CFT_MIN_DRIVER_BRANCH,
     NVLinkOneSided,
@@ -103,12 +103,15 @@ def _run_worker(capture, in_workspace, use_cft, low_precision):
         with pytest.MonkeyPatch.context() as patch:
             # Pin worker-side policy rather than inheriting user/CI overrides.
             for name in (
-                "TRTLLM_MOE_A2A_FORCE_CFT",
-                "TRTLLM_MOE_A2A_CFT_MAX_BATCH_FOR_DISPATCH",
-                "TRTLLM_MOE_A2A_CFT_MAX_BATCH_FOR_COMBINE",
-                "TRTLLM_MOE_A2A_WORKSPACE_MB",
+                "TRTLLM_NVLINK_ONE_SIDED_A2A_FORCE_CFT",
+                "TRTLLM_NVLINK_ONE_SIDED_A2A_CFT_MAX_BATCH_FOR_DISPATCH",
+                "TRTLLM_NVLINK_ONE_SIDED_A2A_CFT_MAX_BATCH_FOR_COMBINE",
+                "TRTLLM_NVLINK_ONE_SIDED_A2A_WORKSPACE_MB",
             ):
                 patch.delenv(name, raising=False)
+            # The constructor now selects CFT itself, so pin the mode under
+            # test explicitly rather than relying on platform auto-detection.
+            patch.setenv("TRTLLM_NVLINK_ONE_SIDED_A2A_FORCE_CFT", "1" if use_cft else "0")
             try:
                 rank = tllm.mpi_rank()
                 assert tllm.mpi_world_size() == _EP_SIZE
@@ -146,7 +149,6 @@ def _run_worker(capture, in_workspace, use_cft, low_precision):
                             payload_in_workspace=in_workspace,
                             hidden_size=hidden,
                             dtype=torch.bfloat16,
-                            can_use_cft_counted_writes=use_cft,
                             use_low_precision_combine=low_precision,
                         )
                     )
@@ -154,8 +156,6 @@ def _run_worker(capture, in_workspace, use_cft, low_precision):
                 assert first.workspace.data_ptr() == second.workspace.data_ptr()
                 assert first.use_cft_for_dispatch(32) == use_cft
                 assert first.use_cft_for_combine(32) == use_cft
-                assert not first.use_cft_for_dispatch(capacity)
-                assert not first.use_cft_for_combine(capacity)
                 failures = _run_rounds(first, second, rank, hidden, capacity, capture, in_workspace)
                 return None, failures
             except Exception:

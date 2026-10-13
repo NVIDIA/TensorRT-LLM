@@ -140,6 +140,7 @@ def _init_pool_data(
         seed_base: Base seed offset (different for ctx vs gen to avoid collisions).
         fill_random: If True fill with random data (ctx), if False fill with zeros (gen).
     """
+    initialized_devices = set()
     for rank, mgr in enumerate(managers):
         pp_rank = rank // tp
         page_table = KVRegionExtractorV1(mgr).page_table
@@ -160,6 +161,7 @@ def _init_pool_data(
             pool_tensor = convert_to_torch_tensor(
                 TensorWrapper(pool_base_ptr, DataType.HALF, [pool_size_elements])
             )
+            initialized_devices.add(pool_tensor.device)
             if fill_random:
                 # Same seed for same pp_rank across TP ranks (kv_heads=1)
                 seed = seed_base + pp_rank
@@ -173,6 +175,11 @@ def _init_pool_data(
                 pool_tensor.copy_(random_values)
             else:
                 pool_tensor.zero_()
+
+    # NIXL's worker streams do not inherit this torch stream's dependencies.
+    # Finish synthetic source writes and destination clearing before transfer.
+    for device in initialized_devices:
+        torch.cuda.current_stream(device).synchronize()
 
 
 # ---------------------------------------------------------------------------

@@ -53,6 +53,22 @@ class CheckpointableCommunication(Protocol):
         ...
 
 
+@runtime_checkable
+class CheckpointBlockable(Protocol):
+    """Optional veto on sleep/wakeup, asked once before the engine serves.
+
+    Implementing CheckpointableCommunication is a property of the class;
+    whether a given instance may actually use it can depend on how that
+    instance was configured. Not implementing this protocol means nothing
+    blocks checkpointing.
+    """
+
+    def checkpoint_blocked_reason(self) -> Optional[str]:
+        """Return why this instance's current configuration blocks
+        checkpointing, or None when it can proceed."""
+        ...
+
+
 class Communication(ABC):
     """
     Abstract base class for MoE communication methods
@@ -79,6 +95,15 @@ class Communication(ABC):
                 f"is not supported on this platform."
             )
         self._is_platform_supported = True
+
+    def checkpoint_blocked_reason(self) -> Optional[str]:
+        """Return why this instance's current configuration blocks
+        checkpointing, or None when it can proceed.
+
+        Defined here so every strategy answers the question, and only those
+        whose configuration can block checkpointing need to override it.
+        """
+        return None
 
     @staticmethod
     @abstractmethod

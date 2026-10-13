@@ -314,6 +314,11 @@ def _make_cache_config_for_test(
     cache_manager.dtype = dtype
     cache_manager.head_dim_per_layer = [128] * len(pp_layers)
     cache_manager.enable_swa_scratch_reuse = False
+    cache_manager.enable_partial_reuse = kv_cache_v2_module._effective_partial_reuse(
+        kv_cache_config.enable_partial_reuse,
+        cache_manager._supports_partial_reuse,
+        type(cache_manager).__name__,
+    )
     cache_manager.num_extra_kv_tokens = num_extra_kv_tokens
     cache_manager.enable_stats = False
     cache_manager.block_reuse_policy = BlockReusePolicy(kv_cache_config.block_reuse_config.policy)
@@ -1488,6 +1493,7 @@ def test_draft_manager_keeps_shared_progress_across_context_and_generation() -> 
 def _make_publishing_manager(policy: BlockReusePolicy) -> KVCacheManagerV2:
     """A manager wired just far enough to run the publish/history bookkeeping."""
     manager = object.__new__(KVCacheManagerV2)
+    manager.kv_cache_type = CacheType.SELFKONLY
     manager.enable_block_reuse = True
     manager.is_draft = False
     manager._can_publish_block_reuse = True

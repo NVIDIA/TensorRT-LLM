@@ -20,7 +20,7 @@ import torch
 assert torch.cuda.is_available(), "allgather requires CUDA devices"
 
 
-# Each case starts its own 4-rank mpirun over every visible device. Under
+# Each case spawns its own 4 rank processes over every visible device. Under
 # xdist several workers would fight for the same GPUs, so this must run
 # alone -- the same reason the other collective entry in this repo
 # (_torch/thop/serial/test_moe_alltoall.py) carries the marker.
