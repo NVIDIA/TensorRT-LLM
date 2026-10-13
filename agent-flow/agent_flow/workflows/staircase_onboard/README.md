@@ -711,16 +711,39 @@ Three layers, cheapest first (`tune/`):
 - **The roadmap** comes from a first tuner turn (profile + code reading ->
   `W/tune/roadmap.yaml`), or from the operator. Candidates run
   `perf.campaign.max_parallel_tuners` at a time; the stage stops after
-  `max_consecutive_misses` misses or `max_iterations` candidates.
+  `max_consecutive_misses` misses or `max_iterations` candidates. A spent
+  roadmap with budget left is refreshed by a roadmap turn on the moved best
+  tree (`roadmap-2.yaml`, ...; `max_roadmaps`, default 2), told what was tried.
+- **Stacked evaluation and batches.** A candidate is measured cherry-picked
+  onto the current best tree, against a control of that tree on the same host
+  (hosts differ by more than most candidates move). Winners on one best tree
+  wait for each other and are stacked: the compatible set with the largest
+  summed gain (stacking simulated in the object store, no checkout) is
+  measured once and gated once, and must hold every member's best single
+  gain. A winner left out conflicts with the batch in the forward file: it is
+  sent to a REBASE turn onto the batch commit while the batch measures, waits,
+  and stacks on the new best when the batch is kept.
+- **The keep gate** runs the target's own test suite and the modeling_v2
+  contract tests on the gated tree before gsm8k (`gate_accuracy.py --tests`):
+  candidates each pass their own op tests, a stack of them can still break a
+  block test none of them ran.
+- **Failures that are not the candidate's** -- a session that dies with its
+  job, a full filesystem -- re-queue the measurement (once, twice for the
+  substrate's own return codes) instead of reverting the candidate; the
+  watcher and the campaign loop retry their own writes on ENOSPC/EDQUOT.
 - **Kernel sourcing for perf** adds two tiers to the onboarding ladder:
   FlashInfer *as installed* (a newer FlashInfer's kernel is an upgrade
   candidate, not a source) and Triton / CuTe DSL / CUDA written by the run.
   When several sources serve one op, all are micro-benchmarked and the
   alternatives are recorded in `kernel_choices.json`.
-- **Profiling** goes through the substrate: `bench.py --nsys` with
-  TensorRT-LLM's capture flags (`-c cudaProfilerApi --capture-range-end=stop
-  --cuda-graph-trace node --gpu-metrics-devices=none`, window from
-  `TLLM_PROFILE_START_STOP`).
+- **Profiling** goes through the substrate: `bench.py --nsys`. The default
+  is session mode (`nsys launch` + an external `nsys start/stop` window after
+  `--nsys-delay`), because the in-process `cuProfilerStop` of TensorRT-LLM's
+  recipe (`-c cudaProfilerApi --capture-range-end=stop --cuda-graph-trace node
+  --gpu-metrics-devices=none`, window from `TLLM_PROFILE_START_STOP`;
+  `--nsys-mode api`) never returned on this server. `tune/nsys_summary.py`
+  attributes per step class (decode / mixed / prefill), placing CUDA-graph
+  replays at their launch.
 
 The `perf:` block (validated by `tune/stage.py:validate_perf_block`; excluded
 from the evidence spec, so adding it never stales a delivered verdict):
