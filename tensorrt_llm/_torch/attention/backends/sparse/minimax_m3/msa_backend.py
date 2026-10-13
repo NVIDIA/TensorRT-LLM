@@ -60,7 +60,12 @@ from .kernels.trtllm_gen_dense_decode import (
     uniform_subpages_per_slot,
     write_subpage_block_table,
 )
-from .msa_indexer import MsaIndexer, cutedsl_score_runner, plan_proxy, prewarm_split_proxy_variants
+from .msa_indexer import (
+    MsaIndexer,
+    cutedsl_score_runner,
+    prewarm_split_proxy_variants,
+    segmented_proxy_plan,
+)
 
 
 def _cache_device(meta) -> torch.device:
@@ -221,8 +226,8 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         super().__post_init__()
         params = self.sparse_metadata_params
         self._msa_params = params if isinstance(params, MiniMaxM3SparseMetadataParams) else None
-        self._validate_decode_kernel_support()
         self._create_msa_buffers()
+        self._validate_decode_kernel_support()
 
     @property
     def msa_qo_lens_cpu(self) -> Optional[torch.Tensor]:
@@ -282,7 +287,7 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
 
     @property
     def msa_prefill_proxy_kv_indices(self) -> Optional[torch.Tensor]:
-        """Flattened page table msa_prefill_proxy_plan reads; see plan_proxy."""
+        """Flattened page table msa_prefill_proxy_plan reads; see segmented_proxy_plan."""
         kv_indices = self._msa_prefill_proxy_kv_indices
         return self.msa_kv_indices if kv_indices is None else kv_indices
 
@@ -520,22 +525,23 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         params = self._msa_params
         if params is not None:
             fmha_sm100 = require_msa_module()
-            num_index_heads = params.sharded_index_head_count(self.mapping)
             max_k_tiles = _worst_case_proxy_max_k_tiles(
                 fmha_sm100,
-                num_index_heads=num_index_heads,
+                num_index_heads=params.sharded_index_head_count(self.mapping),
                 kv_cache_manager=kv_cache_manager,
                 max_batch=max_num_sequences,
             )
             self._msa_worst_case_max_k_tiles = int(max_k_tiles)
             self._alloc_msa_proxy_scratch(
-                num_index_heads=num_index_heads,
+                num_index_heads=params.sharded_index_head_count(self.mapping),
                 max_tokens=self._msa_max_decode_tokens(),
                 max_k_tiles=max_k_tiles,
                 capture_graph=capture_graph,
             )
             prewarm_split_proxy_variants(
-                self._msa_index_kv_dtype(), num_index_heads, int(kv_cache_manager.tokens_per_block)
+                self._msa_index_kv_dtype(),
+                params.sharded_index_head_count(self.mapping),
+                int(kv_cache_manager.tokens_per_block),
             )
         self._msa_buffers_ready = True
 
@@ -977,16 +983,22 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         # branch; output_maxscore feeds the indexer's top-k block selection.
         # Its rows are a batch prefix, so their pages prefix msa_kv_indices.
         proxy_rows = self._msa_proxy_plan_rows()
-        if proxy_rows is not None:
-            last = proxy_rows[1]
-            self._msa_prefill_proxy_plan, self._msa_prefill_proxy_kv_indices = plan_proxy(
-                fmha_sm100,
-                qo_lens_cpu[:last],
-                kv_lens_cpu[:last],
-                qo_offset_cpu[:last],
-                num_index_heads=num_index_heads,
-                page_size=page_size,
-                kv_indices=self.msa_kv_indices,
+        segmented = proxy_rows is not None and segmented_proxy_plan(
+            fmha_sm100,
+            qo_lens_cpu[: proxy_rows[1]],
+            qo_offset_cpu[: proxy_rows[1]],
+            num_index_heads=num_index_heads,
+            page_size=page_size,
+            kv_indices=self.msa_kv_indices,
+        )
+        if segmented:
+            self._msa_prefill_proxy_plan, self._msa_prefill_proxy_kv_indices = segmented
+        else:
+            self._msa_prefill_proxy_plan = plan_for(
+                proxy_rows,
+                num_qo_heads=num_index_heads,
+                num_kv_heads=1,
+                output_maxscore=True,
             )
         attn_rows = self._msa_attn_plan_rows()
         # Sparse layers: kv_block_num=topk limits attention to top-k blocks.

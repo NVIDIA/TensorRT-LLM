@@ -230,63 +230,47 @@ def _segmented_proxy_plan(
     return plan, kv_indices.index_select(0, gather)
 
 
-def plan_proxy(
+def segmented_proxy_plan(
     fmha_sm100: ModuleType,
     qo_lens_cpu: torch.Tensor,
-    kv_lens_cpu: torch.Tensor,
     qo_offset_cpu: torch.Tensor,
     *,
     num_index_heads: int,
     page_size: int,
     kv_indices: torch.Tensor,
-) -> tuple[tuple, torch.Tensor]:
-    """Plan the fmha_sm100 proxy pass over a prefix of the batch's rows.
+) -> Optional[tuple[tuple, torch.Tensor]]:
+    """KV-split proxy plan for these rows and the page table it reads, or None to plan them unsplit.
+
+    Run it over exactly these rows' query tokens: its per-split workspace is strided by that count.
 
     Args:
         fmha_sm100: The MSA kernel module.
         qo_lens_cpu: [rows] host int32 query lengths.
-        kv_lens_cpu: [rows] host int32 KV lengths.
-        qo_offset_cpu: [rows] host int32 cached prefixes, kv_len - qo_len.
+        qo_offset_cpu: [rows] host int32 cached prefix lengths.
         num_index_heads: Index heads on this rank.
         page_size: Tokens per page.
         kv_indices: Device int32 flattened page table whose prefix holds these rows' pages.
-
-    Returns:
-        The plan and the page table it reads. Run the plan over exactly these rows' query tokens:
-        a split plan strides its per-split workspace by the token count it is handed.
     """
     qo_lens, qo_offsets = qo_lens_cpu.tolist(), qo_offset_cpu.tolist()
     num_kv_splits = _proxy_kv_splits(qo_lens, qo_offsets, num_index_heads)
-    if num_kv_splits > 0:
-        return _segmented_proxy_plan(
-            fmha_sm100,
-            qo_lens,
-            qo_offsets,
-            num_index_heads=num_index_heads,
-            page_size=page_size,
-            num_kv_splits=num_kv_splits,
-            kv_indices=kv_indices,
-        )
-    plan = fmha_sm100.fmha_sm100_plan(
-        qo_lens_cpu,
-        kv_lens_cpu,
-        qo_offset=qo_offset_cpu,
+    if num_kv_splits == 0:
+        return None
+    return _segmented_proxy_plan(
+        fmha_sm100,
+        qo_lens,
+        qo_offsets,
+        num_index_heads=num_index_heads,
         page_size=page_size,
-        num_kv_splits=1,
-        causal=True,
-        num_qo_heads=num_index_heads,
-        num_kv_heads=1,
-        output_maxscore=True,
+        num_kv_splits=num_kv_splits,
+        kv_indices=kv_indices,
     )
-    return plan, kv_indices
 
 
 @functools.lru_cache(maxsize=None)
 def prewarm_split_proxy_variants(dtype: torch.dtype, num_index_heads: int, page_size: int) -> None:
     """Load, compiling where missing, the fmha_sm100 variants segmented proxy plans run.
 
-    Warmup has no cached prefix to run them, and an inline compile stalls every rank over a minute.
-    A plan's longest segment has 65-128 queries: the unpacked two-warpgroup variant, split or not.
+    Warmup never segments, and compiling a variant inline stalls every rank for over a minute.
 
     Args:
         dtype: Index-K cache dtype, which index Q is cast to.
@@ -564,4 +548,9 @@ class MsaIndexer:
         )
 
 
-__all__ = ["MsaIndexer", "cutedsl_score_runner", "plan_proxy", "prewarm_split_proxy_variants"]
+__all__ = [
+    "MsaIndexer",
+    "cutedsl_score_runner",
+    "prewarm_split_proxy_variants",
+    "segmented_proxy_plan",
+]
