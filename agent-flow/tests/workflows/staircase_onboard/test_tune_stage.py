@@ -323,3 +323,78 @@ def test_winners_on_one_best_are_stacked_measured_and_gated_once(tmp_path):
     assert sum(1 for k in kinds if k == "candidate_gate") == 1      # one gate for the stack
     best = Path(camp.state.best_tree)
     assert (best / "modeling.py").read_text() == "FAST = True\n" and (best / "attn.py").read_text() == "FUSED = True\n"
+
+
+def test_a_batch_stacks_the_compatible_winners_with_the_largest_summed_gain(tmp_path):
+    """The largest single winner conflicts with two smaller ones that stack together:
+    the batch takes the pair, and the large one is rebased onto the batch while it is
+    measured, waits, and is measured on the new best once the batch is kept."""
+    import os
+
+    from agent_flow.workflows.staircase_onboard.tune.campaign import Campaign
+    from agent_flow.workflows.staircase_onboard.tune.ladder import BenchSpec
+    from agent_flow.workflows.staircase_onboard.tune.records import NoiseFloor
+    from agent_flow.workflows.staircase_onboard.tune.worktree import open_candidate
+
+    repo = _repo(tmp_path)
+    (repo / "attn.py").write_text("FUSED = False\n")
+    _git(repo, "add", "attn.py")
+    _git(repo, "commit", "-q", "-m", "attn")
+
+    def effect(config, tree):
+        lat = 100.0
+        text = Path(tree, "modeling.py").read_text() + Path(tree, "attn.py").read_text() if tree else ""
+        for flag, gain in (("FAST = True", 1.20), ("FUSED = True", 1.10), ("BIG = True", 1.25)):
+            if flag in text:
+                lat *= gain
+        return lat, 2000.0
+
+    identity = tmp_path / "identity.yaml"
+    identity.write_text(yaml.safe_dump({"modeling_v2": "require"}))
+    bench = BenchSpec(bench_py="b", model="m", env_script="e", isl=8192, osl=1024, concurrencies=[1, 128], tree=str(repo))
+    perf, gates = FakeRunner(["s1"], "camp", effect), FakeRunner(["g1"], "campg", effect)
+    work = tmp_path / "camp"
+    camp = Campaign(workdir=work, repo=repo, bench=bench, base_configs=[identity], perf_runner=perf, gate_runner=gates,
+                    gate_cmd=lambda tree, configs, out: f"python gate_accuracy.py --out {out}",
+                    noise=NoiseFloor(spread={"con1.tok_s_user": 0.001}), log=lambda m: None)
+    camp.state.best_tree = str(open_candidate(repo, work / "wt", "best", "HEAD"))
+    camp.state.best_commit = _git(Path(camp.state.best_tree), "rev-parse", "HEAD")
+    edits = {"fast-path": {"modeling.py": "FAST = True\n"}, "fused-attn": {"attn.py": "FUSED = True\n"},
+             "big-one": {"modeling.py": "BIG = True\n", "attn.py": "BIG_ATTN = True\n"}}
+    wts = {}
+    for slug, files in edits.items():
+        wt = wts[slug] = open_candidate(repo, work / "wt", slug, "HEAD")
+        for path, text in files.items():
+            (wt / path).write_text(text)
+        _git(wt, "commit", "-q", "-am", slug)
+        d = tmp_path / f"{slug}.yaml"
+        d.write_text(yaml.safe_dump({"decision": "CANDIDATE", "worktree": str(wt), "commits": [_git(wt, "rev-parse", "HEAD")]}))
+        camp.submit_candidate(slug, d)
+    for _ in range(40):
+        camp.step()
+        if camp.state.candidates["big-one"].status == "conflict":
+            break
+    big = camp.state.candidates["big-one"]
+    assert big.status == "conflict" and big.rebase_onto == "tune/eval-batch"
+    assert sorted(camp.state.batch["members"]) == ["fast-path", "fused-attn"]
+
+    # The rebase turn: onto the batch's commit, both sides kept.
+    wt = wts["big-one"]
+    env = {**os.environ, "GIT_EDITOR": "true"}
+    subprocess.run(["git", "-C", str(wt), "rebase", big.rebase_ref], capture_output=True, text=True, env=env)
+    (wt / "modeling.py").write_text("FAST = True\nBIG = True\n")
+    (wt / "attn.py").write_text("FUSED = True\nBIG_ATTN = True\n")
+    _git(wt, "add", "-A")
+    subprocess.run(["git", "-C", str(wt), "rebase", "--continue"], check=True, capture_output=True, env=env)
+    d = tmp_path / "big-one.yaml"
+    d.write_text(yaml.safe_dump({"decision": "CANDIDATE", "worktree": str(wt),
+                                 "commits": _git(wt, "rev-list", "--reverse", f"{big.rebase_ref}..HEAD").splitlines()}))
+    assert camp.submit_candidate("big-one", d).status == "waiting"
+    for _ in range(60):
+        if not camp.step():
+            break
+    assert {s: c.status for s, c in camp.state.candidates.items()} == {"fast-path": "kept", "fused-attn": "kept", "big-one": "kept"}
+    best = Path(camp.state.best_tree)
+    assert (best / "modeling.py").read_text() == "FAST = True\nBIG = True\n"
+    formed = [json.loads(l) for l in (work / "perf_ledger.jsonl").read_text().splitlines() if '"batch_formed"' in l]
+    assert formed[0]["excluded"] == ["big-one"]

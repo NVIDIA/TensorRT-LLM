@@ -138,6 +138,9 @@ Operating rules for this environment:
 - You are on a login node with no GPU. All GPU work goes through the dev spools (`spoolctl.py launch ...
   --tree <worktree>`) and polling. A single tool call must finish within ~8 minutes: never block on a job.
 - Never emit more than ~150 lines in a single Write/Edit call; build big files with several calls.
+- Always give grep/rg/find an explicit search root (your worktree's target dir, a shared module path, the
+  package); never search from the repository root or the current directory -- an embargoed file's lines in
+  a search result are a read of it. If one appears anyway, do not use it and say so in your final message.
 - Edit only inside your worktree and your candidate output dir (and append to kernel_choices.json).
 - Commit in your worktree with `git -C <worktree> commit -s -m "..."` (no co-author lines). Do not push.
 - Formatting polish is not required; correctness and measured numbers are.
@@ -156,7 +159,8 @@ def render_rebase_request(ctx: CampaignContext, *, slug: str, worktree: Path, be
     out_dir.mkdir(parents=True, exist_ok=True)
     text = f"""# Tuner request: rebase {slug}
 
-Kind: REBASE. Your candidate does not stack on the campaign's best tree `{best_branch}`:
+Kind: REBASE. Your candidate does not stack on `{best_branch}` (the campaign's best tree, or a batch of
+winners being measured on top of it):
 
 ```
 {reason[:1500]}

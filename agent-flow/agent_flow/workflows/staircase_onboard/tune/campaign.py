@@ -42,7 +42,7 @@ TUNER_DECISIONS = ("CANDIDATE", "DROPPED", "NEED_SMITH", "NEED_RUNTIME", "NEED_R
 @dataclass
 class CandidateState:
     slug: str
-    status: str = "issued"  # issued | e2e | gate | kept | reverted | dropped | blocked | conflict
+    status: str = "issued"  # issued | e2e | won | waiting | gate | kept | reverted | dropped | blocked | conflict
     decision: str = ""
     worktree: str = ""
     commits: list[str] = field(default_factory=list)
@@ -60,6 +60,11 @@ class CandidateState:
     # The config the e2e label was measured at; a campaign whose config moved
     # (the ladder's overlay adopted) re-measures before judging.
     eval_config: str = ""
+    # A conflict names the branch to rebase onto and the commit it stood at:
+    # ``tune/best``, or ``tune/eval-batch`` for a winner left out of a pending
+    # batch (rebased onto the batch while the batch is measured).
+    rebase_onto: str = ""
+    rebase_ref: str = ""
 
 
 @dataclass
@@ -237,6 +242,21 @@ class Campaign:
             st.status, st.reason = "blocked", "worktree has uncommitted changes; the candidate is its commits"
             self.state.save(self.state_path)
             return st
+        b = self.state.batch
+        if b.get("tip") and subprocess.run(["git", "-C", str(tree), "merge-base", "--is-ancestor", b["tip"], "HEAD"]).returncode == 0:
+            # Rebased onto a batch still being measured: it stacks once the batch is kept.
+            st.status, st.reason = "waiting", f"rebased onto batch {b['label']}"
+            self.state.save(self.state_path)
+            return st
+        if (st.rebase_onto == "tune/eval-batch" and st.rebase_ref and st.rebase_ref != b.get("tip")
+                and subprocess.run(["git", "-C", str(tree), "merge-base", "--is-ancestor", st.rebase_ref, "HEAD"]).returncode == 0
+                and subprocess.run(["git", "-C", str(tree), "merge-base", "--is-ancestor", st.rebase_ref,
+                                    self._best_head()]).returncode != 0):
+            # Rebased onto a batch that was not kept: it carries the batch's commits.
+            st.status, st.reason = "conflict", "rebased onto a batch that was not kept"
+            st.rebase_onto, st.rebase_ref = "tune/best", self._best_head()
+            self.state.save(self.state_path)
+            return st
         if not self._stack(st):
             self.state.save(self.state_path)
             return st
@@ -274,6 +294,7 @@ class Campaign:
         if out.returncode != 0:
             git(eval_tree, "cherry-pick", "--abort", check=False)
             st.status, st.reason = "conflict", f"does not stack on tune/best {head[:10]}: {out.stderr.strip()[:300]}"
+            st.rebase_onto, st.rebase_ref = "tune/best", head
             self.ledger.append("candidate_conflict", slug=st.slug, best=head, detail=st.reason)
             return False
         st.eval_tree, st.eval_base = str(eval_tree), head
@@ -417,7 +438,8 @@ class Campaign:
             for slug in b.get("members", []):
                 if cands[slug].status == "won":
                     cands[slug].status, cands[slug].e2e_label = "e2e", ""
-            self.state.batch = b = {}
+            self._end_batch(kept=False)
+            b = {}
         for st in cands.values():
             if st.status == "won" and st.eval_base != head:
                 st.status, st.e2e_label = "e2e", ""  # the best moved: re-stack
@@ -431,6 +453,13 @@ class Campaign:
             if len(winners) == 1:
                 winners[0].status = "gate"
                 return True
+            # Winners written in parallel collide in the forward file. Stack the
+            # compatible set with the largest summed gain (greedy by gain can pick
+            # one large winner that excludes three others); the rest rebase onto it.
+            chosen = self._compatible_set(head, winners)
+            if len(chosen) < 2:
+                (chosen or winners)[0].status = "gate"
+                return True
             tree = Path(self.state.best_tree).parent / "eval-batch"
             if (tree / ".git").exists():
                 git(tree, "cherry-pick", "--abort", check=False)
@@ -440,7 +469,7 @@ class Campaign:
                 add_worktree(self.repo, tree, "-B", "tune/eval-batch", str(tree), head)
             link_native(self.repo, tree)
             members = []
-            for st in winners:
+            for st in chosen:
                 tip = git(tree, "rev-parse", "HEAD")
                 out = subprocess.run(["git", "-C", str(tree), "cherry-pick", *st.commits], capture_output=True, text=True)
                 if out.returncode != 0:
@@ -449,16 +478,25 @@ class Campaign:
                     continue  # stays `won`: kept alone or re-stacked after the batch
                 members.append(st.slug)
             if len(members) < 2:
-                winners[0].status = "gate"
+                (cands[members[0]] if members else winners[0]).status = "gate"
                 return True
             import hashlib
 
             cfg = self._config_key()
             tag = hashlib.sha1(cfg.encode()).hexdigest()[:6] if cfg else "id"
             label = f"e2e-batch-{git(tree, 'rev-parse', '--short=10', 'HEAD')}-{tag}"
-            self.state.batch = b = {"members": members, "base": head, "tree": str(tree), "label": label, "status": "e2e"}
-            self.ledger.append("batch_formed", members=members, base=head, label=label)
-            self.log(f"[campaign] batch {members} stacked on {head[:10]}")
+            tip = git(tree, "rev-parse", "HEAD")
+            self.state.batch = b = {"members": members, "base": head, "tree": str(tree), "label": label, "status": "e2e",
+                                    "tip": tip}
+            excluded = [st.slug for st in winners if st.slug not in members]
+            for slug in excluded:
+                st = cands[slug]
+                st.status, st.e2e_label = "conflict", ""
+                st.reason = f"does not stack with batch {members} on {head[:10]}"
+                st.rebase_onto, st.rebase_ref = "tune/eval-batch", tip
+                self.ledger.append("candidate_conflict", slug=slug, best=head, batch=label, detail=st.reason)
+            self.ledger.append("batch_formed", members=members, excluded=excluded, base=head, label=label)
+            self.log(f"[campaign] batch {members} stacked on {head[:10]}" + (f"; to rebase onto it: {excluded}" if excluded else ""))
         if b["status"] == "e2e":
             m = self._measurement(b["label"])
             if m is None:
@@ -491,7 +529,7 @@ class Campaign:
             self.log(f"[campaign] batch {b['members']}: {cmp.verdict} {cmp.reason}; holds={holds}")
             if not holds:
                 winners[0].status = "gate"
-                self.state.batch = {}
+                self._end_batch(kept=False)
                 return True
             b["status"], b["deltas"] = "gate", dict(cmp.deltas)
         if b["status"] == "gate":
@@ -511,7 +549,7 @@ class Campaign:
             self.ledger.append("candidate_gate", slug="batch", members=b["members"], **gate)
             if gate.get("verdict") != "PASS":
                 winners[0].status = "gate"  # fall back to the strongest single
-                self.state.batch = {}
+                self._end_batch(kept=False)
                 return True
             best = Path(self.state.best_tree)
             before = git(best, "rev-parse", "HEAD")
@@ -519,7 +557,7 @@ class Campaign:
                                  capture_output=True, text=True)
             if out.returncode != 0:
                 winners[0].status = "gate"
-                self.state.batch = {}
+                self._end_batch(kept=False)
                 return True
             self.state.best_commit = git(best, "rev-parse", "HEAD")
             for slug in b["members"]:
@@ -533,8 +571,51 @@ class Campaign:
             for other in cands.values():
                 if other.status == "e2e" and other.e2e_label and self.perf.cancel(other.e2e_label):
                     other.e2e_label = ""
-            self.state.batch = {}
+            self._end_batch(kept=True)
         return True
+
+    def _end_batch(self, *, kept: bool) -> None:
+        """Release the candidates rebased onto the batch: stack them on the new best, or rebase again."""
+        head = self._best_head()
+        for st in self.state.candidates.values():
+            if st.status != "waiting":
+                continue
+            if kept and self._stack(st):
+                st.status, st.control_label = "e2e", self.state.control_label
+            elif not kept:
+                st.status, st.reason = "conflict", f"rebased onto batch {self.state.batch.get('label')}, which was not kept"
+                st.rebase_onto, st.rebase_ref = "tune/best", head
+        self.state.batch = {}
+
+    def _pick(self, tip: str, commits: Sequence[str]) -> str | None:
+        """Cherry-pick ``commits`` onto ``tip`` in the object store only (no checkout): the new tip, or None."""
+        for c in commits:
+            out = subprocess.run(["git", "-C", str(self.repo), "merge-tree", "--write-tree", f"--merge-base={c}^", tip, c],
+                                 capture_output=True, text=True)
+            if out.returncode != 0:
+                return None
+            tip = git(self.repo, "commit-tree", out.stdout.split()[0], "-p", tip, "-m", f"stack {c}")
+        return tip
+
+    def _compatible_set(self, head: str, winners: Sequence[CandidateState]) -> list[CandidateState]:
+        """The winners that cherry-pick together onto ``head`` with the largest summed gain."""
+        gain = [max(st.deltas.values() or [0.0]) for st in winners]
+        best: tuple[list[CandidateState], float] = ([], -1.0)
+
+        def walk(i: int, tip: str, chosen: list[CandidateState], total: float) -> None:
+            nonlocal best
+            if total + sum(g for g in gain[i:] if g > 0) <= best[1]:
+                return
+            if i == len(winners):
+                best = (chosen, total)
+                return
+            nxt = self._pick(tip, winners[i].commits)
+            if nxt is not None:
+                walk(i + 1, nxt, [*chosen, winners[i]], total + gain[i])
+            walk(i + 1, tip, chosen, total)
+
+        walk(0, head, [], 0.0)
+        return best[0]
 
     def _keep(self, st: CandidateState) -> None:
         best = Path(self.state.best_tree)
@@ -553,6 +634,7 @@ class Campaign:
         if out.returncode != 0:
             git(best, "cherry-pick", "--abort", check=False)
             st.status, st.reason = "conflict", f"could not move tune/best: {out.stderr.strip()[:300]}"
+            st.rebase_onto, st.rebase_ref = "tune/best", before
             self.ledger.append("candidate_conflict", slug=st.slug, detail=st.reason)
             return
         st.kept_commits = git(best, "rev-list", "--reverse", f"{before}..HEAD").splitlines()
