@@ -34,8 +34,8 @@ Failure contract
   re-checked at every later shutdown.
 - Ranks die with the parent: ``PR_SET_PDEATHSIG`` at rank start (kernel
   delivered SIGKILL, works even when the rank is wedged in a collective) and,
-  once ``tensorrt_llm`` is loaded in the rank, the library's native coordinator
-  watchdog on top.
+  when ``preload`` brought ``tensorrt_llm`` in, the library's native
+  coordinator watchdog on top.
 
 Deadline
 --------
@@ -52,9 +52,10 @@ Ranks are seeded to ``_RNG_SEED`` before their first task. After a passing test
 body each rank restores ``os.environ`` to its post-spawn contents, re-seeds
 ``random``/``numpy``/``torch``/CUDA, clears the logger's log-once memory and
 Dynamo caches, resets the visual_gen mesh singletons, destroys every process
-group except the world group and clears torch's mesh cache, empties the CUDA
-allocator cache, and runs a barrier so a collective leaked by one test
-surfaces in that test's deadline rather than in the next test. Not covered:
+group except the world group, clears torch's current-mesh context stack,
+empties the CUDA allocator cache, and runs a barrier so a collective leaked by
+one test surfaces in that test's deadline rather than in the next test. Not
+covered:
 torch's default dtype, grad mode and backend flags, and any other module
 global a test mutates. A test that changes such state runs with
 ``reuse=False``.
@@ -111,17 +112,11 @@ _POOLS: dict[tuple[int, str, tuple], "_Pool"] = {}
 _UNREAPED: list[mp.Process] = []
 # Absolute (monotonic) deadline of the current test, set per test by the conftest.
 _test_deadline_at: float | None = None
-# The xdist notice is printed once per session.
-_xdist_noted = False
 
 
 def lifetime() -> str:
     """``session``, ``module`` or ``test``; see the module docstring."""
-    global _xdist_noted
     if os.environ.get("PYTEST_XDIST_WORKER"):
-        if not _xdist_noted:
-            _xdist_noted = True
-            _log("pytest-xdist worker: pool lifetime forced to one test")
         return "test"
     value = os.environ.get("TRTLLM_TEST_VISUALGEN_POOL_LIFETIME", "session").lower()
     if value not in _LIFETIMES:
@@ -147,10 +142,12 @@ def set_test_deadline(pytest_timeout: float | None) -> None:
 def _deadline_for(timeout: float | None) -> float | None:
     """Absolute deadline of one pool call: the test's remaining time, shortened
     further by an explicit ``timeout``."""
-    own = None if timeout is None else time.monotonic() + timeout
-    if own is None or _test_deadline_at is None:
-        return own if own is not None else _test_deadline_at
-    return min(own, _test_deadline_at)
+    if timeout is None:
+        return _test_deadline_at
+    call_deadline_at = time.monotonic() + timeout
+    if _test_deadline_at is None:
+        return call_deadline_at
+    return min(call_deadline_at, _test_deadline_at)
 
 
 def _log(msg: str) -> None:
@@ -188,9 +185,9 @@ def _bind_to_parent(parent_pid: int) -> None:
 
 
 def _try_start_native_watchdog(parent_pid: int) -> None:
-    """Add the library's coordinator watchdog; only called once ``tensorrt_llm``
-    is in ``sys.modules`` (the import is then cheap). Failure is reported, not
-    fatal: PDEATHSIG already covers parent death."""
+    """Add the library's coordinator watchdog; only called when ``tensorrt_llm``
+    is already in ``sys.modules`` (the import is then cheap). Failure is
+    reported, not fatal: PDEATHSIG already covers parent death."""
     try:
         from tensorrt_llm.bindings.internal import start_coordinator_watchdog
 
@@ -222,11 +219,11 @@ def _destroy_extra_process_groups() -> None:
     mesh_mod = sys.modules.get("torch.distributed.device_mesh")
     resources = getattr(mesh_mod, "_mesh_resources", None)
     if resources is not None:
-        # The mesh registry's attributes are caches keyed by meshes whose groups
-        # were just destroyed; their names vary across torch versions.
-        for value in getattr(resources, "__dict__", {}).values():
-            if isinstance(value, (dict, list, set)):
-                value.clear()
+        # A `with mesh:` context leaked by a test would make the next test's
+        # current mesh wrong. The registry's other fields are either caches
+        # keyed by this test's (now unreferenced) mesh objects, harmless once
+        # their groups are destroyed, or user-set options that must survive.
+        resources.mesh_stack.clear()
 
 
 def _reset_rank_state(env_snapshot: dict[str, str]) -> None:
@@ -292,35 +289,30 @@ def _rank_main(
             importlib.import_module(name)
         _reseed()
     except Exception:
-        result_conn.send((rank, _ERROR, traceback.format_exc()))
+        result_conn.send((_ERROR, traceback.format_exc()))
         return
     env_snapshot = dict(os.environ)
-    watchdog_tried = False
-    if "tensorrt_llm" in sys.modules:
+    if "tensorrt_llm" in sys.modules:  # brought in by preload
         _try_start_native_watchdog(parent_pid)
-        watchdog_tried = True
-    result_conn.send((rank, _READY, None))
+    result_conn.send((_READY, None))
 
     while True:
         try:
-            payload = task_conn.recv()
+            payload = task_conn.recv_bytes()
         except EOFError:
             break
-        if payload is None:
+        if not payload:  # shutdown sentinel
             break
         try:
             fn, args, kwargs = pickle.loads(payload)
-            if not watchdog_tried and "tensorrt_llm" in sys.modules:
-                _try_start_native_watchdog(parent_pid)
-                watchdog_tried = True
             fn(rank, world_size, *args, **kwargs)
             _reset_rank_state(env_snapshot)
         except Exception:
-            result_conn.send((rank, _ERROR, traceback.format_exc()))
+            result_conn.send((_ERROR, traceback.format_exc()))
             # Stay parked: the parent kills the whole pool. Exiting here would
             # run NCCL destructors against peers that may be wedged.
             continue
-        result_conn.send((rank, _OK, None))
+        result_conn.send((_OK, None))
 
     try:
         dist.destroy_process_group()
@@ -373,34 +365,28 @@ class _Pool:
         self.backend = backend
         self.preload = preload
         self.snapshot = _spawn_snapshot()
-        self._ctx = mp.get_context("spawn")
         self._ranks: list[_Rank] = []
 
     # ---- lifecycle ----
 
     def start(self, deadline_at: float | None) -> None:
-        """Spawn the ranks and wait for every READY. On any failure or interrupt
-        the ranks started so far are killed before the exception propagates."""
+        """Spawn the ranks and wait for every READY."""
         from ._visual_gen_dist_utils import spawn_with_retry
 
         def attempt(port: int) -> None:
-            try:
-                self._launch(port)
-                self._collect(_READY, deadline_at, f"spawn on port {port}")
-            except BaseException:
-                self.kill()
-                raise
+            self._owning(lambda: self._launch(port), _READY, deadline_at, f"spawn on port {port}")
 
         # A rendezvous EADDRINUSE is retried with a fresh port; anything else
         # (CUDA init failure included) is raised at once.
         spawn_with_retry(attempt, retryable=(WorkerPoolError,))
 
     def _launch(self, port: int) -> None:
+        ctx = mp.get_context("spawn")
         self._ranks = []
         for rank in range(self.world_size):
-            task_r, task_w = self._ctx.Pipe(duplex=False)
-            result_r, result_w = self._ctx.Pipe(duplex=False)
-            proc = self._ctx.Process(
+            task_r, task_w = ctx.Pipe(duplex=False)
+            result_r, result_w = ctx.Pipe(duplex=False)
+            proc = ctx.Process(
                 target=_rank_main,
                 args=(rank, self.world_size, self.backend, port, os.getpid(), self.preload),
                 kwargs={"task_conn": task_r, "result_conn": result_w},
@@ -414,12 +400,27 @@ class _Pool:
             self._ranks.append(_Rank(proc, task_w, result_r))
 
     def run(self, payload: bytes, what: str, deadline_at: float | None) -> None:
-        """Run one pre-pickled task on every rank. On any failure or interrupt
-        the ranks are killed before the exception propagates."""
-        try:
+        """Run one pre-pickled task on every rank."""
+
+        def dispatch() -> None:
             for r in self._ranks:
-                r.task_conn.send(payload)
-            self._collect(_OK, deadline_at, what)
+                r.task_conn.send_bytes(payload)
+
+        self._owning(dispatch, _OK, deadline_at, what)
+
+    def _owning(
+        self, action: Callable[[], None], expect: str, deadline_at: float | None, what: str
+    ) -> None:
+        """Run ``action`` and collect one ``expect`` report per rank, as the single
+        owner of cleanup for this attempt: on a reported failure the ranks are
+        killed and the kill report is appended to the error; on any other
+        exception (interrupts included) they are killed and it propagates."""
+        try:
+            action()
+            self._collect(expect, deadline_at, what)
+        except WorkerPoolError as e:
+            problems = self.kill()
+            raise WorkerPoolError(f"{e}\n{problems}" if problems else str(e)) from None
         except BaseException:
             self.kill()
             raise
@@ -428,7 +429,7 @@ class _Pool:
         """Ask the ranks to exit, give them one grace period, then ``kill``."""
         for r in self._ranks:
             try:
-                r.task_conn.send(None)
+                r.task_conn.send_bytes(b"")  # shutdown sentinel
             except (OSError, ValueError):
                 pass
         deadline_at = time.monotonic() + _GRACE_SECONDS
@@ -485,16 +486,15 @@ class _Pool:
 
     def _collect(self, expect: str, deadline_at: float | None, what: str) -> None:
         """Wait for one report per rank; raise ``WorkerPoolError`` unless all of
-        them are ``expect``.
+        them are ``expect``. Does not kill anything; see ``_owning``.
 
-        Sleeps on the ranks' result pipes and death sentinels at once. Once any
-        rank has failed or died, waits one more grace period for the others'
-        reports, then gives up on them: survivors may be blocked in a
-        collective and would never report on their own. The raised error
-        carries every report and the kill report.
+        Sleeps on the pending ranks' result pipes and death sentinels at once.
+        Once any rank has failed or died, waits one more grace period for the
+        others' reports, then gives up on them: survivors may be blocked in a
+        collective and would never report on their own.
         """
+        pending = {r.result_conn: i for i, r in enumerate(self._ranks)}
         reports: dict[int, tuple[str, Any]] = {}
-        closed: set[int] = set()  # ranks whose result pipe hit EOF (rank died)
         first_failure_at: float | None = None
 
         def note_failure() -> None:
@@ -502,43 +502,41 @@ class _Pool:
             if first_failure_at is None:
                 first_failure_at = time.monotonic()
 
-        while len(reports) < self.world_size:
+        while pending:
             now = time.monotonic()
             if deadline_at is not None and now >= deadline_at:
-                msg = self._describe(what, reports, "deadline reached", "no report by the deadline")
-                raise WorkerPoolError(self._append_kill_report(msg))
+                raise WorkerPoolError(
+                    self._describe(what, reports, "deadline reached", "no report by the deadline")
+                )
             if first_failure_at is not None and now - first_failure_at >= _GRACE_SECONDS:
                 break
-            live = [i for i in range(self.world_size) if i not in reports and i not in closed]
-            if not live:
-                break  # every rank has reported or died
-            conns = {self._ranks[i].result_conn: i for i in live}
             sentinels = [
-                self._ranks[i].proc.sentinel for i in live if self._ranks[i].proc.is_alive()
+                self._ranks[i].proc.sentinel
+                for i in pending.values()
+                if self._ranks[i].proc.is_alive()
             ]
             budgets = []
             if deadline_at is not None:
                 budgets.append(deadline_at - now)
             if first_failure_at is not None:
                 budgets.append(_GRACE_SECONDS - (now - first_failure_at))
-            ready = _wait_connections(
-                [*conns, *sentinels], timeout=min(budgets) if budgets else None
-            )
-            for obj in ready:
-                if obj in conns:
-                    try:
-                        rank, status, detail = obj.recv()
-                    except EOFError:  # rank died before reporting
-                        closed.add(conns[obj])
-                        note_failure()
-                        continue
-                    reports[rank] = (status, detail)
-                    if status != expect:
-                        note_failure()
-                else:
-                    note_failure()  # a death sentinel fired
+            for obj in _wait_connections(
+                [*pending, *sentinels], timeout=min(budgets, default=None)
+            ):
+                if obj not in pending:
+                    note_failure()  # a death sentinel fired; its pipe reports EOF next
+                    continue
+                try:
+                    status, detail = obj.recv()
+                except EOFError:  # rank died before reporting
+                    del pending[obj]
+                    note_failure()
+                    continue
+                reports[pending.pop(obj)] = (status, detail)
+                if status != expect:
+                    note_failure()
 
-        if len(reports) == self.world_size and all(s == expect for s, _ in reports.values()):
+        if not pending and all(s == expect for s, _ in reports.values()):
             return
         failed = [i for i, (s, _) in reports.items() if s != expect]
         dead = [i for i, r in enumerate(self._ranks) if i not in reports and not r.proc.is_alive()]
@@ -547,17 +545,14 @@ class _Pool:
             parts.append(f"ranks {failed} failed")
         if dead:
             parts.append(f"ranks {dead} died")
-        msg = self._describe(
-            what,
-            reports,
-            ", ".join(parts) or "incomplete reports",
-            "no report (killed after peer failure)",
+        raise WorkerPoolError(
+            self._describe(
+                what,
+                reports,
+                ", ".join(parts) or "incomplete reports",
+                "no report (killed after peer failure)",
+            )
         )
-        raise WorkerPoolError(self._append_kill_report(msg))
-
-    def _append_kill_report(self, msg: str) -> str:
-        problems = self.kill()
-        return f"{msg}\n{problems}" if problems else msg
 
     def _describe(self, what: str, reports: dict, headline: str, silent_alive: str) -> str:
         lines = [f"{self.world_size}-rank {self.backend} pool, {what}: {headline}"]

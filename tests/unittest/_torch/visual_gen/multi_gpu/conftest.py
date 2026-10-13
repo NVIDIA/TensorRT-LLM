@@ -22,6 +22,12 @@ import pytest
 
 from ._worker_pool import lifetime, set_test_deadline, shutdown_all
 
+
+def pytest_sessionstart(session):
+    if os.environ.get("PYTEST_XDIST_WORKER"):
+        print("[visualgen-pool] pytest-xdist worker: pool lifetime forced to test", flush=True)
+
+
 _FAILED_ITEMS: set[str] = set()
 
 
