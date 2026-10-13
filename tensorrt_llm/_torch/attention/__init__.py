@@ -31,7 +31,8 @@ beside it. Keep it that way: those modules pull in torch, the attention
 backends and the distributed layer, so an eager import here would make every
 backend-only caller pay for the whole module layer at import time. It would
 also put this ``__init__`` on the ``backends`` -> ``rotary_embedding`` import
-path, where a partially initialized package root fails with ``ImportError``.
+path, so a module on that path that imported a name from the package root would
+find the package partially initialized and fail with ``ImportError``.
 
 Code inside this package imports from the defining submodule
 (``from tensorrt_llm._torch.attention.rotary_embedding import RotaryEmbedding``),

@@ -52,6 +52,7 @@ MODULE_LAYER = [
     f"{PKG}.cross_attention",
     f"{PKG}.mla",
     f"{PKG}.qk_norm_attention",
+    f"{PKG}.rotary_embedding",
 ]
 
 _SENTINEL = "CLOSURE-OK"
@@ -132,6 +133,7 @@ def test_package_root_import_is_lazy():
         import sys
         import tensorrt_llm._torch
         before = set(sys.modules)
+        assert {PKG!r} not in before, "tensorrt_llm._torch already imports the package root"
         import {PKG}
         added = set(sys.modules) - before
         assert added <= {{{PKG!r}}}, sorted(added)
