@@ -345,6 +345,17 @@ class TuneStage:
                 while roadmap and len(futures) < max_par and len(camp.state.candidates) + len(futures) < budget:
                     item = roadmap.pop(0)
                     slug = str(item["slug"])
+                    done = s.workdir / "candidates" / slug / "decision.yaml"
+                    if done.exists():
+                        # The turn finished while no orchestrator watched it (a restart):
+                        # take its decision instead of asking the same question again.
+                        try:
+                            read_decision(done)
+                            camp.submit_candidate(slug, done)
+                            self.log(f"[tune] {slug}: decision found on resume; not re-dispatched")
+                            continue
+                        except (OSError, ValueError) as exc:
+                            self.log(f"[tune] {slug}: unreadable decision on resume ({exc}); dispatching")
                     base = camp.state.best_commit or "HEAD"
                     wt = open_candidate(s.repo, worktrees, slug, base, prefix=self.branch_prefix)
                     req = render_request(

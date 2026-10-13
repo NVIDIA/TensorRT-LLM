@@ -627,3 +627,26 @@ def test_a_second_run_in_the_same_repository_does_not_collide_on_branches(tmp_pa
                       runner_factory=lambda spools, prefix: FakeRunner(spools, prefix, _effect), poll_s=0, log=lambda m: None)
     tree = open_candidate(repo, tmp_path / "ws" / "tune" / "worktrees", "best", "HEAD", prefix=stage.branch_prefix)
     assert _git(tree, "rev-parse", "--abbrev-ref", "HEAD") == f"{stage.branch_prefix}/best" != "tune/best"
+
+
+def test_a_turn_that_finished_during_a_restart_is_not_dispatched_again(tmp_path):
+    """The orchestrator restarted while a tuner turn was running; the turn wrote its
+    decision before the new orchestrator asked. The decision is taken, not re-asked."""
+    repo = _repo(tmp_path)
+    identity = tmp_path / "identity.yaml"
+    identity.write_text(yaml.safe_dump({"modeling_v2": "require"}))
+    task = {"trtllm_repo_path": str(repo), "checkpoint_path": "/ckpt",
+            "perf": {"identity_configs": [str(identity)], "spools": ["s1"], "env_script": "/env.sh",
+                     "campaign": {"max_roadmaps": 1}}}
+    spec = TuneSpec.from_task(task, tmp_path / "ws", target="tensorrt_llm/_torch/_experimental/modeling_v2/models/f/t/")
+    spec.workdir.mkdir(parents=True, exist_ok=True)
+    (spec.workdir / "roadmap.yaml").write_text(yaml.safe_dump([{"slug": "slow-path"}]))
+    out = spec.workdir / "candidates" / "slow-path"
+    out.mkdir(parents=True)
+    (out / "decision.yaml").write_text(yaml.safe_dump({"decision": "DROPPED", "worktree": ""}))
+    turns = []
+    state: dict = {"phase": "campaign", "noise_spread": {}, "noise_samples": 0}
+    stage = TuneStage(spec, state, dispatch=lambda role, what, prompt: turns.append(what) or "", checkpoint=lambda: None,
+                      runner_factory=lambda spools, prefix: FakeRunner(spools, prefix, _effect), poll_s=0, log=lambda m: None)
+    assert stage.run() == "tuned"
+    assert "slow-path" not in turns
