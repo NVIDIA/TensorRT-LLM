@@ -308,13 +308,15 @@ class Campaign:
             # that differ, where a fresh worktree checks out the whole tree (minutes
             # on a network filesystem).
             git(eval_tree, "cherry-pick", "--abort", check=False)
-            git(eval_tree, "checkout", "-q", "-B", branch, head)
+            # Forced: an interrupted earlier checkout (a full filesystem) leaves
+            # local changes that would refuse a plain one.
+            git(eval_tree, "checkout", "-q", "-f", "-B", branch, head)
             git(eval_tree, "reset", "-q", "--hard", head)
         elif (spare := self._spare_eval_tree(st.slug)) is not None:
             # A finished candidate's checkout, renamed and moved to the new head:
             # seconds, where a fresh worktree is a full checkout.
             git(self.repo, "worktree", "move", str(spare), str(eval_tree))
-            git(eval_tree, "checkout", "-q", "-B", branch, head)
+            git(eval_tree, "checkout", "-q", "-f", "-B", branch, head)
             git(eval_tree, "reset", "-q", "--hard", head)
             git(eval_tree, "clean", "-q", "-fd")
         else:
@@ -533,7 +535,7 @@ class Campaign:
             tree = Path(self.state.best_tree).parent / "eval-batch"
             if (tree / ".git").exists():
                 git(tree, "cherry-pick", "--abort", check=False)
-                git(tree, "checkout", "-q", "-B", "tune/eval-batch", head)
+                git(tree, "checkout", "-q", "-f", "-B", "tune/eval-batch", head)
                 git(tree, "reset", "-q", "--hard", head)
             else:
                 add_worktree(self.repo, tree, "-B", "tune/eval-batch", str(tree), head)
