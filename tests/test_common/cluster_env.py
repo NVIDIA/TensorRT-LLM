@@ -16,7 +16,9 @@ There are two consumers:
   with get_ucx_tls_cmd(). L0_Test.groovy passes the resolved cluster via
   --cluster-name.
 * Multi-node tests call apply_ucx_env() on the environment they hand to the
-  servers they spawn, with the cluster taken from SLURM_CLUSTER_NAME.
+  servers they spawn, with the cluster taken from SLURM_CLUSTER_NAME. Only
+  cluster-specific rules are applied there; the catch-all rule's clear-only
+  behavior is limited to PerfSanity.
 
 Cluster names follow SlurmPartition.clusterName in the bloom Jenkins shared
 library (src/com/nvidia/bloom/SlurmConfig.groovy), e.g. "gcp-nrt", "aws-cmh",
@@ -26,6 +28,7 @@ bloom "oci-jhb" -> slurm.conf "oci-jhb-slurm-1"), so rules use prefix
 wildcards to match both forms.
 """
 
+import functools
 import os
 import subprocess
 from fnmatch import fnmatch
@@ -205,8 +208,12 @@ def get_ucx_tls_cmd(cluster_name, gpu_type):
     return f"{BASE_UCX_UNSET} &&"
 
 
+@functools.lru_cache(maxsize=None)
 def detect_gpu_type():
-    """Return the GPU type token of GPU 0 from nvidia-smi, or "" if unknown."""
+    """Return the GPU type token of GPU 0 from nvidia-smi, or "" if unknown.
+
+    The result is cached for the life of the process.
+    """
     try:
         out = subprocess.run(
             ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader", "--id=0"],
@@ -223,9 +230,9 @@ def detect_gpu_type():
 def apply_ucx_env(environ=None, cluster_name=None, gpu_type=None):
     """Apply the cluster's UCX rule to an environment mapping in place.
 
-    Clears BASE_UCX_UNSET_VARS and sets the vars from the matching rule.
-    Does nothing when the cluster is unknown, so runs outside Slurm keep
-    whatever UCX settings they were given.
+    When a cluster-specific rule matches, clears BASE_UCX_UNSET_VARS and sets
+    the rule's vars. When the cluster is unset or only the catch-all rule
+    matches, the mapping is left unchanged.
 
     Args:
         environ: Mapping to update; defaults to os.environ.
@@ -233,7 +240,7 @@ def apply_ucx_env(environ=None, cluster_name=None, gpu_type=None):
         gpu_type: GPU type token; defaults to detect_gpu_type().
 
     Returns:
-        The vars that were set, or None when the cluster is unknown.
+        The vars that were set, or None when no cluster-specific rule applies.
     """
     if environ is None:
         environ = os.environ
@@ -243,9 +250,11 @@ def apply_ucx_env(environ=None, cluster_name=None, gpu_type=None):
         return None
     if gpu_type is None:
         gpu_type = detect_gpu_type()
+    env = get_ucx_env(cluster_name, gpu_type)
+    if not env:
+        return None
     for key in BASE_UCX_UNSET_VARS:
         environ.pop(key, None)
-    env = get_ucx_env(cluster_name, gpu_type)
     environ.update(env)
     print(
         f"UCX env for cluster={cluster_name!r} gpu={gpu_type!r}: "

@@ -15,6 +15,7 @@
 # limitations under the License.
 
 import importlib.util
+import subprocess
 from pathlib import Path
 from types import ModuleType
 
@@ -162,13 +163,17 @@ def test_apply_ucx_env_uses_slurm_cluster_name() -> None:
     assert environ == {"SLURM_CLUSTER_NAME": "oci-jhb-slurm-1", "OTHER": "kept", **expected}
 
 
-def test_apply_ucx_env_clears_leaked_vars_on_unlisted_cluster() -> None:
-    environ = {"UCX_TLS": "tcp", "UCX_NET_DEVICES": "eth0"}
+def test_apply_ucx_env_is_noop_on_unlisted_cluster() -> None:
+    environ = {"UCX_TLS": "tcp", "UCX_NET_DEVICES": "eth0", "UCX_CUDA_IPC_ENABLE_MNNVL": "n"}
 
     applied = cluster_env.apply_ucx_env(environ, cluster_name="dlcluster", gpu_type="H100")
 
-    assert applied == {}
-    assert environ == {}
+    assert applied is None
+    assert environ == {
+        "UCX_TLS": "tcp",
+        "UCX_NET_DEVICES": "eth0",
+        "UCX_CUDA_IPC_ENABLE_MNNVL": "n",
+    }
 
 
 def test_apply_ucx_env_is_noop_outside_slurm() -> None:
@@ -176,3 +181,41 @@ def test_apply_ucx_env_is_noop_outside_slurm() -> None:
 
     assert cluster_env.apply_ucx_env(environ, gpu_type="H100") is None
     assert environ == {"UCX_TLS": "tcp", "UCX_NET_DEVICES": "eth0"}
+
+
+@pytest.fixture
+def fresh_detect_gpu_type():
+    cluster_env.detect_gpu_type.cache_clear()
+    yield cluster_env.detect_gpu_type
+    cluster_env.detect_gpu_type.cache_clear()
+
+
+def test_detect_gpu_type_parses_nvidia_smi_once(
+    monkeypatch: pytest.MonkeyPatch, fresh_detect_gpu_type
+) -> None:
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, stdout="NVIDIA GB300\n", stderr="")
+
+    monkeypatch.setattr(cluster_env.subprocess, "run", fake_run)
+
+    assert fresh_detect_gpu_type() == "GB300"
+    assert fresh_detect_gpu_type() == "GB300"
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize(
+    "error",
+    (FileNotFoundError("nvidia-smi"), subprocess.TimeoutExpired("nvidia-smi", 30)),
+)
+def test_detect_gpu_type_returns_empty_on_failure(
+    monkeypatch: pytest.MonkeyPatch, fresh_detect_gpu_type, error: Exception
+) -> None:
+    def fake_run(cmd, **kwargs):
+        raise error
+
+    monkeypatch.setattr(cluster_env.subprocess, "run", fake_run)
+
+    assert fresh_detect_gpu_type() == ""
