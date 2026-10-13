@@ -722,7 +722,9 @@ Three layers, cheapest first (`tune/`):
   measured once and gated once, and must hold every member's best single
   gain. A winner left out conflicts with the batch in the forward file: it is
   sent to a REBASE turn onto the batch commit while the batch measures, waits,
-  and stacks on the new best when the batch is kept.
+  and stacks on the new best when the batch is kept. The same holds for winners
+  that conflict with a lone winner being gated, and a gate whose stacked tree
+  another keep moved is stopped and the candidate re-stacked.
 - **The keep gate** runs the target's own test suite and the modeling_v2
   contract tests on the gated tree before gsm8k (`gate_accuracy.py --tests`):
   candidates each pass their own op tests, a stack of them can still break a
