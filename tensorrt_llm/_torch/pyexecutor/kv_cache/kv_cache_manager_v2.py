@@ -3424,9 +3424,9 @@ class KVCacheManagerV2(BaseResourceManager):
     @property
     def num_locality_domains(self) -> int:
         """Number of locality domains. Returns 1 for non-localized configurations."""
-        value = self.impl.num_locality_domains
-        # A Mock impl answers every attribute; read anything that is not an int as
-        # non-localized rather than comparing it below.
+        # Test stand-ins build the manager without an impl, and a Mock impl answers
+        # every attribute; read anything that is not an int as non-localized.
+        value = getattr(getattr(self, "impl", None), "num_locality_domains", 1)
         return value if isinstance(value, int) else 1
 
     def pick_locality_domain(self, request_id: int) -> int | None:
