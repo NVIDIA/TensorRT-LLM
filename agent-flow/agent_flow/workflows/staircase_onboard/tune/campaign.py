@@ -157,8 +157,18 @@ class Campaign:
             for label in (st.e2e_label,) if st.status == "e2e" else ():
                 if label and not (self.data / label / "meta.json").exists():
                     self.perf.adopt(label)
-            if st.status == "gate":
-                self.gates.adopt(f"gate-{st.slug}")
+            if st.status == "gate" and (st.eval_tree or st.worktree):
+                # Gate jobs are named by the tree gated (see the gate step).
+                sha = git(Path(st.eval_tree or st.worktree), "rev-parse", "--short=10", "HEAD", check=False)
+                if sha:
+                    self.gates.adopt(f"gate-{st.slug}-{sha}")
+        b = self.state.batch
+        if b.get("status") == "e2e" and b.get("label") and not (self.data / b["label"] / "meta.json").exists():
+            self.perf.adopt(b["label"])
+        elif b.get("status") == "gate" and b.get("tree"):
+            sha = git(Path(b["tree"]), "rev-parse", "--short=10", "HEAD", check=False)
+            if sha:
+                self.gates.adopt(f"gate-batch-{sha}")
         for label in self.state.controls.values():
             if not (self.data / label / "meta.json").exists():
                 self.perf.adopt(label)
