@@ -27,8 +27,8 @@
   </noscript>
   
   <!-- Loaded before other Sphinx assets -->
-  <link href="../_static/styles/theme.css?digest=64cc4de3f052d77215f0" rel="stylesheet" />
-<link href="../_static/styles/pydata-sphinx-theme.css?digest=64cc4de3f052d77215f0" rel="stylesheet" />
+  <link href="../_static/styles/theme.css?digest=18bd87630a240e9c25be" rel="stylesheet" />
+<link href="../_static/styles/pydata-sphinx-theme.css?digest=18bd87630a240e9c25be" rel="stylesheet" />
 
     <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=8f2a1f02" />
     <link rel="stylesheet" type="text/css" href="../_static/styles/nvidia-sphinx-theme.css?v=933278ad" />
@@ -39,10 +39,10 @@
     <link rel="stylesheet" type="text/css" href="../_static/custom.css?v=19d20f17" />
   
   <!-- So that users can add custom icons -->
-  <script defer src="../_static/scripts/fontawesome.js?digest=64cc4de3f052d77215f0"></script>
+  <script defer src="../_static/scripts/fontawesome.js?digest=18bd87630a240e9c25be"></script>
   <!-- Pre-loaded scripts that we'll load fully later -->
-  <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=64cc4de3f052d77215f0" />
-<link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=64cc4de3f052d77215f0" />
+  <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=18bd87630a240e9c25be" />
+<link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=18bd87630a240e9c25be" />
 
 
 
@@ -60,9 +60,9 @@
     <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
     <script>DOCUMENTATION_OPTIONS.pagename = 'installation/installation-guide';</script>
     <script>
-        DOCUMENTATION_OPTIONS.theme_version = '0.22.0';
+        DOCUMENTATION_OPTIONS.theme_version = '0.23.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc29';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc0';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -77,8 +77,9 @@
 
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="color-scheme" content="light dark"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc29" />
+  <meta name="docsearch:version" content="1.4.0rc0" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -412,6 +413,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-qwen3.8-flash-next-on-trtllm.html">Deployment Guide for Qwen3.8-Flash-Next on TensorRT LLM - Blackwell Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-kimi-k3-on-trtllm.html">Deployment Guide for Kimi K3 on TensorRT LLM - Blackwell</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-glm-5-on-trtllm.html">Deployment Guide for GLM-5 on TensorRT LLM - Blackwell Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-glm-5.3-flash-on-trtllm.html">Deployment Guide for GLM-5.3-Flash on TensorRT LLM - Blackwell Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-minimax-m3-on-trtllm.html">Deployment Guide for MiniMax-M3 on TensorRT LLM</a></li>
 </ul>
 </details></li>
@@ -458,6 +460,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CudaGraphConfig.html">CudaGraphConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/DecodeCudaGraphConfig.html">DecodeCudaGraphConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/EncodeCudaGraphConfig.html">EncodeCudaGraphConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/EncodeExtraInputSpec.html">EncodeExtraInputSpec</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/MoeConfig.html">MoeConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/EagleDecodingConfig.html">EagleDecodingConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/Eagle3DecodingConfig.html">Eagle3DecodingConfig</a></li>
@@ -669,16 +672,16 @@ the latest changes, but their quality is not guaranteed and they may contain bug
 <p>Pre-built TensorRT LLM releases are available as <a class="reference external" href="https://catalog.ngc.nvidia.com/orgs/nvidia/teams/tensorrt-llm/containers/release">container images on NGC</a>. This is the simplest way to obtain TensorRT LLM.</p>
 <p>Replace <code class="docutils literal notranslate"><span class="pre">x.y.z</span></code> with the desired version tag. The <a class="reference external" href="https://catalog.ngc.nvidia.com/orgs/nvidia/teams/tensorrt-llm/containers/release/tags">available tags on NGC</a>
 include both regular and <code class="docutils literal notranslate"><span class="pre">.dev</span></code> nightly releases.</p>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>docker<span class="w"> </span>pull<span class="w"> </span>nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc29
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>docker<span class="w"> </span>pull<span class="w"> </span>nvcr.io/nvidia/tensorrt-llm/release:1.4.0rc0
 
-docker<span class="w"> </span>run<span class="w"> </span>--rm<span class="w"> </span>-it<span class="w"> </span>--ipc<span class="w"> </span>host<span class="w"> </span>--gpus<span class="w"> </span>all<span class="w"> </span>--ulimit<span class="w"> </span><span class="nv">memlock</span><span class="o">=</span>-1<span class="w"> </span>--ulimit<span class="w"> </span><span class="nv">stack</span><span class="o">=</span><span class="m">67108864</span><span class="w"> </span>-p<span class="w"> </span><span class="m">8000</span>:8000<span class="w"> </span>nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc29
+docker<span class="w"> </span>run<span class="w"> </span>--rm<span class="w"> </span>-it<span class="w"> </span>--ipc<span class="w"> </span>host<span class="w"> </span>--gpus<span class="w"> </span>all<span class="w"> </span>--ulimit<span class="w"> </span><span class="nv">memlock</span><span class="o">=</span>-1<span class="w"> </span>--ulimit<span class="w"> </span><span class="nv">stack</span><span class="o">=</span><span class="m">67108864</span><span class="w"> </span>-p<span class="w"> </span><span class="m">8000</span>:8000<span class="w"> </span>nvcr.io/nvidia/tensorrt-llm/release:1.4.0rc0
 </pre></div>
 </div>
 <div class="dropdown note admonition">
 <p class="admonition-title">Container image tags</p>
 <p>In the example shell commands, <code class="docutils literal notranslate"><span class="pre">x.y.z</span></code> corresponds to the TensorRT-LLM container
 version to use. If omitted, <code class="docutils literal notranslate"><span class="pre">IMAGE_TAG</span></code> will default to <code class="docutils literal notranslate"><span class="pre">tensorrt_llm.__version__</span></code>
-(e.g., this documentation was generated from the <code class="docutils literal notranslate"><span class="pre">1.3.0rc29</span></code> source tree).
+(e.g., this documentation was generated from the <code class="docutils literal notranslate"><span class="pre">1.4.0rc0</span></code> source tree).
 If this does not work, e.g., because a container for the version you are
 currently working with has not been released yet, you can try using a
 container published for a previous
@@ -705,9 +708,9 @@ If you are using the NGC PyTorch container, install the wheel built specifically
 <h3>Install prerequisites<a class="headerlink" href="#install-prerequisites" title="Link to this heading">#</a></h3>
 <p>Before the pre-built Python wheel can be installed via <code class="docutils literal notranslate"><span class="pre">pip</span></code>, a few
 prerequisites must be put into place:</p>
-<p>Install CUDA Toolkit 13.2 following the <a class="reference external" href="https://docs.nvidia.com/cuda/cuda-installation-guide-linux/">CUDA Installation Guide for Linux</a>
+<p>Install CUDA Toolkit 13.4 following the <a class="reference external" href="https://docs.nvidia.com/cuda/cuda-installation-guide-linux/">CUDA Installation Guide for Linux</a>
 and make sure <code class="docutils literal notranslate"><span class="pre">CUDA_HOME</span></code> environment variable is properly set.</p>
-<p>The <code class="docutils literal notranslate"><span class="pre">cuda-compat-13-2</span></code> package may be required depending on your system’s NVIDIA GPU
+<p>The <code class="docutils literal notranslate"><span class="pre">cuda-compat-13-4</span></code> package may be required depending on your system’s NVIDIA GPU
 driver version. For additional information, refer to the <a class="reference external" href="https://docs.nvidia.com/deploy/cuda-compatibility/forward-compatibility.html">CUDA Forward Compatibility</a>.</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># By default, the PyTorch CUDA 13.0 package is installed. Install the PyTorch CUDA 13.2 package instead to better align with the CUDA version used to build the TensorRT LLM wheels.</span>
 pip3<span class="w"> </span>install<span class="w"> </span><span class="nv">torch</span><span class="o">==</span><span class="m">2</span>.14.0<span class="w"> </span>torchvision<span class="w"> </span>--index-url<span class="w"> </span>https://download.pytorch.org/whl/cu132
@@ -813,8 +816,25 @@ to discover a SLURM installation in the usual places.
 </pre></div>
 </div>
 </li>
+<li><p>Prevent Open MPI 5 from rejecting a long hostname when spawning workers</p>
+<p>Where the MPI implementation is Open MPI 5 – which the release container now provides, since
+its base image ships it – a singleton <code class="docutils literal notranslate"><span class="pre">MPI_Comm_spawn</span></code> fails when the hostname is too long,
+despite being a perfectly valid hostname. This is an upstream Open MPI issue; the fix
+(<a class="reference external" href="https://github.com/open-mpi/ompi/pull/14398">open-mpi/ompi#14398</a>) has been merged and will
+ship in a future Open MPI release. TensorRT LLM spawns one such worker per <code class="docutils literal notranslate"><span class="pre">MpiPoolSession</span></code>,
+so on a host with a long name, a Kubernetes pod for instance, startup fails with:</p>
+<div class="highlight-text notranslate"><div class="highlight"><pre><span></span>mpi4py.MPI.Exception: MPI_ERR_UNKNOWN: unknown error
+</pre></div>
+</div>
+<p>Until that fix is available, export a shorter <code class="docutils literal notranslate"><span class="pre">PMIX_HOSTNAME</span></code> in the environment TensorRT LLM
+starts from. PMIx only uses the value to identify the node during the handshake, so it does not
+have to resolve; any short string will do:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nb">export</span><span class="w"> </span><span class="nv">PMIX_HOSTNAME</span><span class="o">=</span>trtllm-node
+</pre></div>
+</div>
+</li>
 <li><p>Prevent <code class="docutils literal notranslate"><span class="pre">pip</span></code> from replacing existing PyTorch installation</p>
-<p>On certain systems, particularly Ubuntu 22.04, users installing TensorRT LLM would find that their existing, CUDA 13.0 compatible PyTorch installation (e.g., <code class="docutils literal notranslate"><span class="pre">torch==2.9.0+cu130</span></code>) was being uninstalled by <code class="docutils literal notranslate"><span class="pre">pip</span></code>. It was then replaced by a CUDA 12.8 version (<code class="docutils literal notranslate"><span class="pre">torch==2.9.0</span></code>), causing the TensorRT LLM installation to be unusable and leading to runtime errors.</p>
+<p>On certain systems, particularly Ubuntu 22.04, users installing TensorRT LLM would find that their existing, CUDA 13.x compatible PyTorch installation (e.g., <code class="docutils literal notranslate"><span class="pre">torch==2.9.0+cu130</span></code>) was being uninstalled by <code class="docutils literal notranslate"><span class="pre">pip</span></code>. It was then replaced by a CUDA 12.y version (<code class="docutils literal notranslate"><span class="pre">torch==2.9.0</span></code>), causing the TensorRT LLM installation to be unusable and leading to runtime errors.</p>
 <p>The solution is to create a <code class="docutils literal notranslate"><span class="pre">pip</span></code> constraints file, locking <code class="docutils literal notranslate"><span class="pre">torch</span></code> to the currently installed version. Here is an example of how this can be done manually:</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nv">CURRENT_TORCH_VERSION</span><span class="o">=</span><span class="k">$(</span>python3<span class="w"> </span>-c<span class="w"> </span><span class="s2">"import torch; print(torch.__version__)"</span><span class="k">)</span>
 <span class="nb">echo</span><span class="w"> </span><span class="s2">"torch==</span><span class="nv">$CURRENT_TORCH_VERSION</span><span class="s2">"</span><span class="w"> </span>&gt;<span class="w"> </span>/tmp/torch-constraint.txt
@@ -910,8 +930,8 @@ pip3<span class="w"> </span>install<span class="w"> </span>--ignore-installed<sp
   
 
   <!-- Scripts loaded after <body> so the DOM is not blocked -->
-  <script defer src="../_static/scripts/bootstrap.js?digest=64cc4de3f052d77215f0"></script>
-<script defer src="../_static/scripts/pydata-sphinx-theme.js?digest=64cc4de3f052d77215f0"></script>
+  <script defer src="../_static/scripts/bootstrap.js?digest=18bd87630a240e9c25be"></script>
+<script defer src="../_static/scripts/pydata-sphinx-theme.js?digest=18bd87630a240e9c25be"></script>
 
 
   <footer class="bd-footer">
@@ -983,9 +1003,9 @@ pip3<span class="w"> </span>install<span class="w"> </span>--ignore-installed<sp
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on September 26, 2026.</p>
+  <p>Last updated on October 09, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/c76f4a8">c76f4a8</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/cc63e66">cc63e66</a>.</p>
   
 </div></div>
       

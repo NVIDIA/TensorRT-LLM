@@ -27,8 +27,8 @@
   </noscript>
   
   <!-- Loaded before other Sphinx assets -->
-  <link href="../../_static/styles/theme.css?digest=64cc4de3f052d77215f0" rel="stylesheet" />
-<link href="../../_static/styles/pydata-sphinx-theme.css?digest=64cc4de3f052d77215f0" rel="stylesheet" />
+  <link href="../../_static/styles/theme.css?digest=18bd87630a240e9c25be" rel="stylesheet" />
+<link href="../../_static/styles/pydata-sphinx-theme.css?digest=18bd87630a240e9c25be" rel="stylesheet" />
 
     <link rel="stylesheet" type="text/css" href="../../_static/pygments.css?v=8f2a1f02" />
     <link rel="stylesheet" type="text/css" href="../../_static/styles/nvidia-sphinx-theme.css?v=933278ad" />
@@ -39,10 +39,10 @@
     <link rel="stylesheet" type="text/css" href="../../_static/custom.css?v=19d20f17" />
   
   <!-- So that users can add custom icons -->
-  <script defer src="../../_static/scripts/fontawesome.js?digest=64cc4de3f052d77215f0"></script>
+  <script defer src="../../_static/scripts/fontawesome.js?digest=18bd87630a240e9c25be"></script>
   <!-- Pre-loaded scripts that we'll load fully later -->
-  <link rel="preload" as="script" href="../../_static/scripts/bootstrap.js?digest=64cc4de3f052d77215f0" />
-<link rel="preload" as="script" href="../../_static/scripts/pydata-sphinx-theme.js?digest=64cc4de3f052d77215f0" />
+  <link rel="preload" as="script" href="../../_static/scripts/bootstrap.js?digest=18bd87630a240e9c25be" />
+<link rel="preload" as="script" href="../../_static/scripts/pydata-sphinx-theme.js?digest=18bd87630a240e9c25be" />
 
 
 
@@ -60,9 +60,9 @@
     <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
     <script>DOCUMENTATION_OPTIONS.pagename = 'llm-api/reference/LLM';</script>
     <script>
-        DOCUMENTATION_OPTIONS.theme_version = '0.22.0';
+        DOCUMENTATION_OPTIONS.theme_version = '0.23.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc29';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc0';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -77,8 +77,9 @@
 
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="color-scheme" content="light dark"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc29" />
+  <meta name="docsearch:version" content="1.4.0rc0" />
   
     
     <script src="../../_static/searchtools.js"></script>
@@ -412,6 +413,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-qwen3.8-flash-next-on-trtllm.html">Deployment Guide for Qwen3.8-Flash-Next on TensorRT LLM - Blackwell Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-kimi-k3-on-trtllm.html">Deployment Guide for Kimi K3 on TensorRT LLM - Blackwell</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-glm-5-on-trtllm.html">Deployment Guide for GLM-5 on TensorRT LLM - Blackwell Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-glm-5.3-flash-on-trtllm.html">Deployment Guide for GLM-5.3-Flash on TensorRT LLM - Blackwell Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-minimax-m3-on-trtllm.html">Deployment Guide for MiniMax-M3 on TensorRT LLM</a></li>
 </ul>
 </details></li>
@@ -458,6 +460,7 @@
 <li class="toctree-l2"><a class="reference internal" href="CudaGraphConfig.html">CudaGraphConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="DecodeCudaGraphConfig.html">DecodeCudaGraphConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="EncodeCudaGraphConfig.html">EncodeCudaGraphConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="EncodeExtraInputSpec.html">EncodeExtraInputSpec</a></li>
 <li class="toctree-l2"><a class="reference internal" href="MoeConfig.html">MoeConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="EagleDecodingConfig.html">EagleDecodingConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="Eagle3DecodingConfig.html">Eagle3DecodingConfig</a></li>
@@ -732,6 +735,7 @@
 <li><p><strong>reasoning_parser</strong> (<em>Optional</em><em>[</em><em>str</em><em>]</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> The parser to separate reasoning content from output. Defaults to None.</p></li>
 <li><p><strong>otlp_traces_endpoint</strong> (<em>Optional</em><em>[</em><em>str</em><em>]</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Target URL to which OpenTelemetry traces will be sent. Defaults to None.</p></li>
 <li><p><strong>return_perf_metrics</strong> (<em>bool</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Allow serving responses to include per-request performance metrics when the request sets X-TRTLLM-return-metrics: 1. Defaults to False.</p></li>
+<li><p><strong>per_request_spec_decode_stats</strong> (<em>bool</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Include per-request speculative-decoding acceptance statistics on each response choice. Server-side opt-in only: unlike return_perf_metrics this needs no per-request header, so benchmarking clients that discover the payload by shape do not have to know they are talking to TensorRT-LLM. Deliberately independent of return_perf_metrics, which also mounts the Prometheus endpoint. PyTorch backend only. Defaults to False.</p></li>
 <li><p><strong>perf_metrics_output_dir</strong> (<em>Optional</em><em>[</em><em>str</em><em>]</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Directory for per-process performance metrics JSONL files. Setting this enables collection even when return_perf_metrics is false. Defaults to None.</p></li>
 <li><p><strong>prometheus_metrics_config</strong> (<em>Optional</em><em>[</em><a class="reference internal" href="PrometheusMetricsConfig.html#tensorrt_llm.llmapi.PrometheusMetricsConfig" title="tensorrt_llm.llmapi.llm_args.PrometheusMetricsConfig"><em>tensorrt_llm.llmapi.llm_args.PrometheusMetricsConfig</em></a><em>]</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Configuration for Prometheus metrics collection, including custom histogram bucket boundaries. Defaults to None.</p></li>
 <li><p><strong>enable_energy_metrics</strong> (<em>bool</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Enable GPU energy monitoring via NVML. When enabled, the server exposes an /energy_metrics endpoint that reports cumulative GPU energy consumption in joules. Defaults to False.</p></li>
@@ -763,6 +767,7 @@
 <li><p><strong>enable_iter_perf_stats</strong> (<em>bool</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Enable iteration performance statistics. Defaults to False.</p></li>
 <li><p><strong>enable_tokenization_cache</strong> (<em>bool</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Cache the tokenization of recent prompts so that a prompt extending a cached one only tokenizes its tail, which speeds up multi-turn serving with long prompts. Requires a fast tokenizer and applies only to prompts tokenized with add_special_tokens=False and no truncation. The output is identical to tokenizing the whole prompt. Defaults to False.</p></li>
 <li><p><strong>enable_iter_req_stats</strong> (<em>bool</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> If true, enables per request stats per iteration. Must also set enable_iter_perf_stats to true to get request stats. Defaults to False.</p></li>
+<li><p><strong>iter_perf_stats_interval</strong> (<em>int</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Build an iteration statistics record only every N executor iterations when enable_iter_perf_stats is true, which reduces the host overhead of collecting the statistics (including the per-request statistics of enable_iter_req_stats). A value of 1 builds a record every iteration. With N &gt; 1, numCompletedRequests, numNewActiveRequests and the KV cache iteration deltas of skipped iterations are carried into a later record, so their totals stay exact but can be reported late. Without attention DP, one extra record is emitted when the last active request finishes in a skipped iteration; with attention DP, what is left after the last record of a busy period is reported when the executor resumes. All other fields describe only the sampled iteration, so Prometheus counters built from them (e.g. speculative decoding draft and accepted token totals) reach only about 1/N of the true totals, and gauges such as KV cache utilization refresh every N iterations. With enable_iter_req_stats, requests that finish in a skipped iteration get no requestStats entry. Defaults to 1.</p></li>
 <li><p><strong>print_iter_log</strong> (<em>bool</em>) – <code class="tag beta docutils literal notranslate"><span class="pre">beta</span></code> Print iteration logs. Defaults to False.</p></li>
 <li><p><strong>batch_wait_timeout_ms</strong> (<em>float</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> If greater than 0, the request queue might wait up to batch_wait_timeout_ms to receive max_batch_size requests, if fewer than max_batch_size requests are currently available. If 0, no waiting occurs. Defaults to 0.</p></li>
 <li><p><strong>batch_wait_timeout_iters</strong> (<em>int</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Maximum number of iterations the scheduler will wait to accumulate new coming requests for improved GPU utilization efficiency. If greater than 0, the scheduler will delay batch processing to gather more requests up to the specified iteration limit. If 0, disables timeout-iters-based batching delays. Defaults to 0.</p></li>
@@ -894,8 +899,11 @@ It can be a single prompt or batched prompts.</p></li>
 <li><p><strong>batch_indexed_model_output</strong> (<em>bool</em>) – If specified, assume batched model output indexed by request index, as opposed to token index. Defaults to True.</p></li>
 <li><p><strong>copy_logits_to_host</strong> (<em>bool</em>) – If set, copy logits from device to host. Otherwise, return a view into the on-device logits tensor. Defaults to True.</p></li>
 <li><p><strong>return_raw_logits</strong> (<em>bool</em>) – Whether to return the raw CPU logits tensor for the whole input batch. Defaults to False.</p></li>
-<li><p><strong>model_kwargs</strong> (<em>Any</em>) – Model-specific inputs passed through to the model’s forward(). Examples: token_type_ids (BERT),
-inputs_embeds (reward models).</p></li>
+<li><p><strong>model_kwargs</strong> (<em>Any</em>) – Model-specific inputs passed through to the model’s forward(). Examples:
+token_type_ids (BERT), inputs_embeds (reward models). Pass tensors where they already live (host or device).
+With encoder CUDA graphs enabled, every tensor kwarg must be declared in
+<cite>cuda_graph_config.extra_model_inputs</cite>: an undeclared tensor raises, and a non-tensor
+value runs that call eagerly.</p></li>
 </ul>
 </dd>
 <dt class="field-even">Returns<span class="colon">:</span></dt>
@@ -1383,8 +1391,8 @@ resolves to <code class="docutils literal notranslate"><span class="pre">[&quot;
   
 
   <!-- Scripts loaded after <body> so the DOM is not blocked -->
-  <script defer src="../../_static/scripts/bootstrap.js?digest=64cc4de3f052d77215f0"></script>
-<script defer src="../../_static/scripts/pydata-sphinx-theme.js?digest=64cc4de3f052d77215f0"></script>
+  <script defer src="../../_static/scripts/bootstrap.js?digest=18bd87630a240e9c25be"></script>
+<script defer src="../../_static/scripts/pydata-sphinx-theme.js?digest=18bd87630a240e9c25be"></script>
 
 
   <footer class="bd-footer">
@@ -1456,9 +1464,9 @@ resolves to <code class="docutils literal notranslate"><span class="pre">[&quot;
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on September 26, 2026.</p>
+  <p>Last updated on October 09, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/c76f4a8">c76f4a8</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/cc63e66">cc63e66</a>.</p>
   
 </div></div>
       

@@ -27,8 +27,8 @@
   </noscript>
   
   <!-- Loaded before other Sphinx assets -->
-  <link href="../_static/styles/theme.css?digest=64cc4de3f052d77215f0" rel="stylesheet" />
-<link href="../_static/styles/pydata-sphinx-theme.css?digest=64cc4de3f052d77215f0" rel="stylesheet" />
+  <link href="../_static/styles/theme.css?digest=18bd87630a240e9c25be" rel="stylesheet" />
+<link href="../_static/styles/pydata-sphinx-theme.css?digest=18bd87630a240e9c25be" rel="stylesheet" />
 
     <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=8f2a1f02" />
     <link rel="stylesheet" type="text/css" href="../_static/styles/nvidia-sphinx-theme.css?v=933278ad" />
@@ -39,10 +39,10 @@
     <link rel="stylesheet" type="text/css" href="../_static/custom.css?v=19d20f17" />
   
   <!-- So that users can add custom icons -->
-  <script defer src="../_static/scripts/fontawesome.js?digest=64cc4de3f052d77215f0"></script>
+  <script defer src="../_static/scripts/fontawesome.js?digest=18bd87630a240e9c25be"></script>
   <!-- Pre-loaded scripts that we'll load fully later -->
-  <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=64cc4de3f052d77215f0" />
-<link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=64cc4de3f052d77215f0" />
+  <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=18bd87630a240e9c25be" />
+<link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=18bd87630a240e9c25be" />
 
 
 
@@ -60,9 +60,9 @@
     <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
     <script>DOCUMENTATION_OPTIONS.pagename = 'features/kv-cache-connector';</script>
     <script>
-        DOCUMENTATION_OPTIONS.theme_version = '0.22.0';
+        DOCUMENTATION_OPTIONS.theme_version = '0.23.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc29';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc0';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -77,8 +77,9 @@
 
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="color-scheme" content="light dark"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc29" />
+  <meta name="docsearch:version" content="1.4.0rc0" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -412,6 +413,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-qwen3.8-flash-next-on-trtllm.html">Deployment Guide for Qwen3.8-Flash-Next on TensorRT LLM - Blackwell Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-kimi-k3-on-trtllm.html">Deployment Guide for Kimi K3 on TensorRT LLM - Blackwell</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-glm-5-on-trtllm.html">Deployment Guide for GLM-5 on TensorRT LLM - Blackwell Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-glm-5.3-flash-on-trtllm.html">Deployment Guide for GLM-5.3-Flash on TensorRT LLM - Blackwell Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-minimax-m3-on-trtllm.html">Deployment Guide for MiniMax-M3 on TensorRT LLM</a></li>
 </ul>
 </details></li>
@@ -458,6 +460,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CudaGraphConfig.html">CudaGraphConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/DecodeCudaGraphConfig.html">DecodeCudaGraphConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/EncodeCudaGraphConfig.html">EncodeCudaGraphConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/EncodeExtraInputSpec.html">EncodeExtraInputSpec</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/MoeConfig.html">MoeConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/EagleDecodingConfig.html">EagleDecodingConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/Eagle3DecodingConfig.html">Eagle3DecodingConfig</a></li>
@@ -691,8 +694,21 @@
 </li>
 <li><p><strong><code class="docutils literal notranslate"><span class="pre">get_num_new_matched_tokens(self,</span> <span class="pre">request:</span> <span class="pre">LlmRequest,</span> <span class="pre">num_computed_tokens:</span> <span class="pre">int)</span> <span class="pre">-&gt;</span> <span class="pre">tuple[int,</span> <span class="pre">bool]</span></code></strong></p>
 <ul class="simple">
-<li><p><strong>Description</strong>: Called when a new request arrives. It checks to see if any KV cache can be loaded from an external KV store.</p></li>
+<li><p><strong>Description</strong>: Queries external KV after the compute batch is selected on the legacy path. Connectors that implement the complete reservation protocol use <code class="docutils literal notranslate"><span class="pre">reserve_prefix</span></code> during admission when prefix-aware scheduling and KV cache manager V2 are enabled.</p></li>
 <li><p><strong>Returns</strong>: A tuple <code class="docutils literal notranslate"><span class="pre">(num_tokens,</span> <span class="pre">is_async)</span></code>. <code class="docutils literal notranslate"><span class="pre">num_tokens</span></code> is the number of tokens found in the external cache. <code class="docutils literal notranslate"><span class="pre">is_async</span></code> indicates if the loading will happen asynchronously (background) or requires blocking.</p></li>
+</ul>
+</li>
+<li><p><strong><code class="docutils literal notranslate"><span class="pre">reserve_prefix(self,</span> <span class="pre">request:</span> <span class="pre">LlmRequest,</span> <span class="pre">num_computed_tokens:</span> <span class="pre">int,</span> <span class="pre">reservation_id:</span> <span class="pre">int)</span> <span class="pre">-&gt;</span> <span class="pre">tuple[int,</span> <span class="pre">bool]</span></code></strong></p>
+<ul class="simple">
+<li><p><strong>Description</strong>: Reserves an additional contiguous prefix beginning at <code class="docutils literal notranslate"><span class="pre">num_computed_tokens</span></code> during batch construction. A positive answer protects that source range against mutation and eviction. The query must start no KV transmission or destination writes.</p></li>
+<li><p><strong>Returns</strong>: <code class="docutils literal notranslate"><span class="pre">(additional_tokens,</span> <span class="pre">is_async)</span></code>. The runtime may accept a shorter, block-aligned range and keeps at least the final prompt token for local computation. <code class="docutils literal notranslate"><span class="pre">is_async=True</span></code> parks an accepted request until all workers finish its load.</p></li>
+<li><p><strong>Identity</strong>: The runtime assigns a fresh <code class="docutils literal notranslate"><span class="pre">reservation_id</span></code> to each attempt. Keep reservation state by this identity, including when the same request is retried.</p></li>
+</ul>
+</li>
+<li><p><strong><code class="docutils literal notranslate"><span class="pre">release_prefix_reservation(self,</span> <span class="pre">request:</span> <span class="pre">LlmRequest,</span> <span class="pre">reservation_id:</span> <span class="pre">int,</span> <span class="pre">start:</span> <span class="pre">int,</span> <span class="pre">end:</span> <span class="pre">int)</span> <span class="pre">-&gt;</span> <span class="pre">None</span></code></strong></p>
+<ul class="simple">
+<li><p><strong>Description</strong>: Releases the named reservation’s protection for the absolute half-open token interval <code class="docutils literal notranslate"><span class="pre">[start,</span> <span class="pre">end)</span></code>. The runtime releases rejected or clipped portions before transmission and the accepted portion after all workers report completion. Overlapping reservations must keep their own protection.</p></li>
+<li><p><strong>Lifetime</strong>: This callback never asks the connector to interrupt an active transfer. Client cancellation after dispatch drains the load before releasing its source and destination resources.</p></li>
 </ul>
 </li>
 <li><p><strong><code class="docutils literal notranslate"><span class="pre">request_finished(self,</span> <span class="pre">request:</span> <span class="pre">LlmRequest,</span> <span class="pre">cache_block_ids:</span> <span class="pre">list[int])</span> <span class="pre">-&gt;</span> <span class="pre">bool</span></code></strong></p>
@@ -917,8 +933,8 @@ error can appear without the flag being set anywhere in your configuration.</p><
 <h5>A page slot must not be reassigned underneath the connector<a class="headerlink" href="#a-page-slot-must-not-be-reassigned-underneath-the-connector" title="Link to this heading">#</a></h5>
 <p>The connector holds page indices across iterations, and <code class="docutils literal notranslate"><span class="pre">RequestData</span></code> reports only the pages appended
 since the last call. Anything that hands a slot the connector already knows about to a different
-request therefore goes unreported and corrupts the next transfer against it. Three configurations do
-that, and each is rejected at bring-up.</p>
+request therefore requires resetting the connector state before replay. The runtime applies the
+following configuration limits at bring-up.</p>
 <div class="pst-scrollable-table-container"><table class="table">
 <thead>
 <tr class="row-odd"><th class="head"><p>Configuration</p></th>
@@ -929,8 +945,8 @@ that, and each is rejected at bring-up.</p>
 <tr class="row-even"><td><p>Speculative decoding</p></td>
 <td><p>Rejected draft tokens shrink a request’s page list, and the freed slot goes to whichever request allocates next. The connector is never told the tail block moved.</p></td>
 </tr>
-<tr class="row-odd"><td><p>A capacity scheduler policy other than <code class="docutils literal notranslate"><span class="pre">GUARANTEED_NO_EVICT</span></code></p></td>
-<td><p>A destroyed-and-replayed request comes back on different pages, and the connector’s per-request block delta is then measured against pages that were freed with it.</p></td>
+<tr class="row-odd"><td><p>A capacity scheduler policy other than <code class="docutils literal notranslate"><span class="pre">GUARANTEED_NO_EVICT</span></code> with KV cache manager V1</p></td>
+<td><p>V1 does not reset the connector block delta when a request is destroyed and replayed. V2 resets that state and permits replay; an active connector load retains its allocation until completion.</p></td>
 </tr>
 <tr class="row-even"><td><p>A host or disk cache tier</p></td>
 <td><p>Tier eviction reassigns the GPU slot. See <a class="reference internal" href="#kv-cache-tiers-are-gpu-only-under-a-connector">KV cache tiers are GPU-only under a connector</a>.</p></td>
@@ -1007,14 +1023,92 @@ the same page-list shrink happens there.</p>
 <p>A connector that implements only the flat callbacks and <code class="docutils literal notranslate"><span class="pre">register_kv_caches</span></code> runs unchanged on any model with a single <em>non-sliding</em> attention window. Where the cache describes itself as pools rather than one tensor it calls <code class="docutils literal notranslate"><span class="pre">register_kv_cache_layout</span></code> instead — but that method’s default reconstructs the single-pool tensor, in the same <code class="docutils literal notranslate"><span class="pre">[num_blocks,</span> <span class="pre">num_layers,</span> <span class="pre">kv_factor,</span> <span class="pre">block_size]</span></code> shape and KV dtype, and forwards it to <code class="docutils literal notranslate"><span class="pre">register_kv_caches</span></code>. The same applies to the two block-id callbacks: their per-layer-group forms default to the flat ones when there is a single layer group.</p>
 <p>Variable sliding-window attention is the case where that stops working, because the cache then allocates one pool per window size and a page index is scoped to a layer group. See <a class="reference internal" href="#running-under-vswa">Running under VSWA</a>.</p>
 <p>A model whose layers all share one sliding window stays a single layer group, so the flat callbacks still apply and such a connector is not refused. What differs is that the callbacks cover the <strong>live window only</strong>. Blocks the window has passed report <code class="docutils literal notranslate"><span class="pre">-1</span></code> (<code class="docutils literal notranslate"><span class="pre">BAD_PAGE_INDEX</span></code>) in place — the list stays aligned to block ordinals, so entry <code class="docutils literal notranslate"><span class="pre">i</span></code> still describes tokens <code class="docutils literal notranslate"><span class="pre">[i</span> <span class="pre">*</span> <span class="pre">tokens_per_block,</span> <span class="pre">(i+1)</span> <span class="pre">*</span> <span class="pre">tokens_per_block)</span></code>, but the up-front blocks carry no page and are not available to load into or save from. Filter with <code class="docutils literal notranslate"><span class="pre">valid_page_slots</span></code>, described in <a class="reference internal" href="#blocks-with-no-page">Blocks with no page</a>; without it a <code class="docutils literal notranslate"><span class="pre">-1</span></code> resolves to the last page slot of the pool. A warning naming the window size is logged at start-up when a flat-only connector is attached to such a model.</p>
-<p><code class="docutils literal notranslate"><span class="pre">get_num_new_matched_tokens</span></code> is asked once the batch for the upcoming forward pass is final. A request that is asked is therefore a request that runs, and the connector can take ownership of remote blocks in the query and release it in <code class="docutils literal notranslate"><span class="pre">request_finished</span></code>.</p>
-<p>Two things are worth knowing when tuning a deployment.</p>
-<ul class="simple">
-<li><p><strong>The runtime may honour less than you offer.</strong> With chunked prefill the cache is allocated per context chunk, which is what bounds its memory, so an offer reaching past the current chunk requires the runtime to grow the allocation and that can fail under pressure. The runtime then serves the part it can cover and computes the rest locally. The amount actually served is what <code class="docutils literal notranslate"><span class="pre">RequestData.computed_position</span></code> reflects; the unserved remainder needs no action from the connector beyond its usual <code class="docutils literal notranslate"><span class="pre">request_finished</span></code> cleanup.</p></li>
-<li><p><strong>The query is not part of the scheduler’s budget.</strong> The scheduler sizes a request’s chunk as if the connector will serve nothing, so a served prefix reduces the work in the forward pass but does not free budget for another request in the same iteration.</p></li>
-</ul>
-<p>Specify <code class="docutils literal notranslate"><span class="pre">enable_block_reuse=True</span></code> alongside the connector for any of this to run; see <a class="reference internal" href="#block-reuse-alongside-the-connector">Block reuse alongside the connector</a>.</p>
-<p><code class="docutils literal notranslate"><span class="pre">get_num_new_matched_tokens</span></code> is called <strong>at most once per KV allocation</strong>. This is the precise form of the “once per request” rule: if a request’s KV cache is destroyed and the request is replayed – which <code class="docutils literal notranslate"><span class="pre">MAX_UTILIZATION</span></code> does under memory pressure – the replay asks again, because the pages the first answer described are gone.</p>
+</section>
+<section id="reserving-a-prefix-during-admission">
+<h5>Reserving a prefix during admission<a class="headerlink" href="#reserving-a-prefix-during-admission" title="Link to this heading">#</a></h5>
+<p>For connector implementers, scheduler participation requires three optional methods together:
+<code class="docutils literal notranslate"><span class="pre">reserve_prefix</span></code> and <code class="docutils literal notranslate"><span class="pre">release_prefix_reservation</span></code> on the scheduler, and
+<code class="docutils literal notranslate"><span class="pre">get_finished_prefix_loads</span></code> on the worker. Bring-up rejects a partial implementation. KV cache
+manager V2 enables this protocol when <code class="docutils literal notranslate"><span class="pre">SchedulerConfig.enable_prefix_aware_scheduling=True</span></code>.
+Connectors using the existing methods retain the final-batch query path.</p>
+<p>The scheduler charges compute tokens after the local and reserved external prefix. The complete
+prefix still needs destination KV pages, so a token-budget hit can remain limited by KV capacity.
+After the final admission checks, <code class="docutils literal notranslate"><span class="pre">SchedulerOutput.prefix_loads</span></code> authorizes the exact loads:</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p><code class="docutils literal notranslate"><span class="pre">PrefixLoad</span></code> field</p></th>
+<th class="head"><p>Meaning</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">reservation_id</span></code></p></td>
+<td><p>The identity supplied to <code class="docutils literal notranslate"><span class="pre">reserve_prefix</span></code>, also returned on completion.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">request_id</span></code></p></td>
+<td><p>The request owning the allocation.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">start</span></code>, <code class="docutils literal notranslate"><span class="pre">end</span></code></p></td>
+<td><p>Absolute half-open token interval to load.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">is_async</span></code></p></td>
+<td><p>Whether the request waits outside the compute batch.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">block_ids_by_layer_group</span></code></p></td>
+<td><p>Complete destination page lists, indexed by group and block ordinal. Filter entries through <code class="docutils literal notranslate"><span class="pre">valid_page_slots</span></code>.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">tokens</span></code>, <code class="docutils literal notranslate"><span class="pre">cache_salt</span></code></p></td>
+<td><p>Request tokens and cache-key isolation salt.</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>Build transfers from this collection. A confirmed async load appears here even when it is absent
+from <code class="docutils literal notranslate"><span class="pre">new_requests</span></code> and <code class="docutils literal notranslate"><span class="pre">cached_requests</span></code>, and even when the compute batch is empty. Those two
+lists continue to describe computation and its token/block deltas. The reservation itself supplies
+no permission to write destination memory.</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Event</p></th>
+<th class="head"><p>Connector and runtime behavior</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>Candidate queried</p></td>
+<td><p>Connector protects the promised source; no transmission starts.</p></td>
+</tr>
+<tr class="row-odd"><td><p>Candidate rejected or offer shortened</p></td>
+<td><p>Runtime releases the unused source interval. A later attempt gets a new reservation identity.</p></td>
+</tr>
+<tr class="row-even"><td><p>Accepted load dispatched</p></td>
+<td><p>Connector starts only the confirmed interval; runtime retains its destination allocation.</p></td>
+</tr>
+<tr class="row-odd"><td><p>Client cancels during transmission</p></td>
+<td><p>Runtime keeps the allocation while the connector completes the load.</p></td>
+</tr>
+<tr class="row-even"><td><p>Every worker completes</p></td>
+<td><p>Runtime releases the source reservation, resumes a live request, or finalizes a cancelled request and frees its allocation.</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>Each worker reports completion after its destination writes and source reads finish. Reports are
+sent to the leader without a collective. Once every worker has reported, an ordered control item
+retires the load on all ranks before scheduling. This releases the source reservation and allows
+an async request to rejoin the compute batch, or a cancelled request to release its allocation.
+The runtime continues polling when no forward pass is scheduled. A transfer that never completes
+retains its resources; elapsed time alone cannot make pages safe to reuse.</p>
+<p>For a load admitted with computation, <code class="docutils literal notranslate"><span class="pre">wait_for_layer_load</span></code> establishes the dependency on that
+worker’s transfer stream. Inference does not wait for the retirement control item.</p>
+</section>
+<section id="legacy-final-batch-queries">
+<h5>Legacy final-batch queries<a class="headerlink" href="#legacy-final-batch-queries" title="Link to this heading">#</a></h5>
+<p><code class="docutils literal notranslate"><span class="pre">get_num_new_matched_tokens</span></code> is called at most once per KV allocation after batch selection.
+Its offer can reduce computation for that request, but does not free token budget for another
+request in the same iteration. With chunked prefill, allocation growth can limit the served prefix;
+<code class="docutils literal notranslate"><span class="pre">RequestData.computed_position</span></code> reflects the load interval that the runtime honors.</p>
+<p>Destroying an allocation clears its connector state, so replay queries again. Specify
+<code class="docutils literal notranslate"><span class="pre">enable_block_reuse=True</span></code> alongside the connector; see
+<a class="reference internal" href="#block-reuse-alongside-the-connector">Block reuse alongside the connector</a>.</p>
 <p><strong>Deployment note.</strong> Under a connector, a workload that was token-bound becomes KV-bound: the connector removes forward-pass tokens but its prefix still occupies GPU pages. Lowering <code class="docutils literal notranslate"><span class="pre">max_num_tokens</span></code> to hand memory back to the KV pool is usually the right adjustment, the opposite of the guidance for a connector-free deployment.</p>
 </section>
 </section>
@@ -1061,6 +1155,12 @@ the same page-list shrink happens there.</p>
 <li><p><strong>Returns</strong>: Two lists of request IDs: those that have finished saving, and those that have finished loading.</p></li>
 </ul>
 </li>
+<li><p><strong><code class="docutils literal notranslate"><span class="pre">get_finished_prefix_loads(self)</span> <span class="pre">-&gt;</span> <span class="pre">list[int]</span></code></strong></p>
+<ul>
+<li><p><strong>Description</strong>: Reports locally completed reservation identities for loads dispatched through <code class="docutils literal notranslate"><span class="pre">SchedulerOutput.prefix_loads</span></code>, including synchronous loads. Completion means this worker has finished all reads and writes and established the required CUDA stream visibility. This method must not wait for other workers. The runtime collects reports asynchronously and distributes retirement decisions before scheduling; parked async requests resume and shared resources are released only after every worker has reported.</p></li>
+<li><p><strong>Compatibility</strong>: Legacy request-ID load and save completions continue through <code class="docutils literal notranslate"><span class="pre">get_finished</span></code>.</p></li>
+</ul>
+</li>
 </ul>
 </section>
 </section>
@@ -1072,18 +1172,19 @@ the same page-list shrink happens there.</p>
 <h3>Overview<a class="headerlink" href="#overview" title="Link to this heading">#</a></h3>
 <p>This example implements a file-system based KV cache.</p>
 <ol class="arabic simple">
-<li><p><strong>Save</strong>: When a request finishes or needs to be swapped out, its KV blocks are saved to disk as <code class="docutils literal notranslate"><span class="pre">.pt</span></code> files.</p></li>
+<li><p><strong>Save</strong>: After prefill, complete computed KV blocks are saved to disk as immutable <code class="docutils literal notranslate"><span class="pre">.pt</span></code> files.</p></li>
 <li><p><strong>Load</strong>: When a new request arrives with the same prompt prefix, the connector identifies the cached files and loads them back into GPU memory, skipping re-computation.</p></li>
 </ol>
 </section>
 <section id="implementation-details">
 <h3>Implementation Details<a class="headerlink" href="#implementation-details" title="Link to this heading">#</a></h3>
 <ul class="simple">
-<li><p><strong>Metadata</strong>: The example defines a <code class="docutils literal notranslate"><span class="pre">PersistentKvCacheConnectorMetadata</span></code> dataclass containing lists of <code class="docutils literal notranslate"><span class="pre">(file_path,</span> <span class="pre">block_id)</span></code> tuples for both loading and saving. This simple structure allows the Scheduler to tell the Worker exactly which file corresponds to which GPU block index.</p></li>
-<li><p><strong>Hashing Strategy</strong>: The <code class="docutils literal notranslate"><span class="pre">PersistentKvCacheConnectorLeader</span></code> hashes the token sequence of a block to generate a unique filename (e.g., <code class="docutils literal notranslate"><span class="pre">hash_value.pt</span></code>). This acts as the lookup key.</p></li>
+<li><p><strong>Metadata</strong>: <code class="docutils literal notranslate"><span class="pre">PersistentKvCacheConnectorMetadata</span></code> carries <code class="docutils literal notranslate"><span class="pre">(file_path,</span> <span class="pre">block_id)</span></code> load/save targets and accepted reservation identities. The worker returns those identities after the copies finish.</p></li>
+<li><p><strong>Source protection</strong>: Saves publish complete files atomically and never overwrite an existing inode. <code class="docutils literal notranslate"><span class="pre">reserve_prefix</span></code> creates private hard links to these immutable files without reading KV data. Releasing a range removes only its reservation links, so another reservation keeps its source available. External cache management must preserve this immutability: remove or replace a path rather than writing into a published file.</p></li>
+<li><p><strong>Hashing Strategy</strong>: <code class="docutils literal notranslate"><span class="pre">PersistentKvCacheConnectorLeader</span></code> hashes the entire token prefix through each block, together with <code class="docutils literal notranslate"><span class="pre">cache_salt</span></code>, using SHA-256. This distinguishes identical blocks reached through different preceding tokens and remains stable across Python processes. Use separate cache directories for different models and KV layouts.</p></li>
 <li><p><strong>Worker Logic</strong>:</p>
 <ul>
-<li><p><code class="docutils literal notranslate"><span class="pre">start_load_kv</span></code>: Iterates through the load list provided in the metadata, loads the <code class="docutils literal notranslate"><span class="pre">.pt</span></code> file to CPU, and copies it to the specific <code class="docutils literal notranslate"><span class="pre">block_id</span></code> in the GPU tensor.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">start_load_kv</span></code>: Reads only accepted load targets, copies their <code class="docutils literal notranslate"><span class="pre">.pt</span></code> data to GPU with blocking copies, and records their reservation identities for <code class="docutils literal notranslate"><span class="pre">get_finished_prefix_loads</span></code>.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">wait_for_save</span></code>: Performs the reverse. It copies data from the GPU <code class="docutils literal notranslate"><span class="pre">block_id</span></code> to CPU and saves it to disk using <code class="docutils literal notranslate"><span class="pre">torch.save</span></code>.</p></li>
 </ul>
 </li>
@@ -1094,7 +1195,7 @@ the same page-list shrink happens there.</p>
 <p>This example illustrates the API mechanics but has several limitations that make it unsuitable for high-performance production use without modification:</p>
 <ol class="arabic simple">
 <li><p><strong>Blocking I/O</strong>: The example uses <code class="docutils literal notranslate"><span class="pre">torch.load</span></code> and <code class="docutils literal notranslate"><span class="pre">torch.save</span></code> synchronously. In a real implementation, these should be offloaded to a background thread or asynchronous I/O handler to avoid stalling the GPU.</p></li>
-<li><p><strong>Simplified Block Matching</strong>: The <code class="docutils literal notranslate"><span class="pre">get_num_new_matched_tokens</span></code> implementation in the example only matches full blocks. It does not handle partial cache hits.</p></li>
+<li><p><strong>Simplified Block Matching</strong>: The example matches and loads complete blocks, requires one layer group, and saves only the first context chunk. It does not demonstrate chunked-prefill persistence.</p></li>
 <li><p><strong>FileSystem Latency</strong>: Storing one file per block can create high filesystem overhead.</p></li>
 </ol>
 </section>
@@ -1178,6 +1279,8 @@ the same page-list shrink happens there.</p>
 <li class="toc-h5 nav-item toc-entry"><a class="reference internal nav-link" href="#blocks-with-no-page">Blocks with no page</a></li>
 <li class="toc-h5 nav-item toc-entry"><a class="reference internal nav-link" href="#what-a-connector-can-persist-under-a-sliding-window">What a connector can persist under a sliding window</a></li>
 <li class="toc-h5 nav-item toc-entry"><a class="reference internal nav-link" href="#serving-a-prefix">Serving a prefix</a></li>
+<li class="toc-h5 nav-item toc-entry"><a class="reference internal nav-link" href="#reserving-a-prefix-during-admission">Reserving a prefix during admission</a></li>
+<li class="toc-h5 nav-item toc-entry"><a class="reference internal nav-link" href="#legacy-final-batch-queries">Legacy final-batch queries</a></li>
 </ul>
 </li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#worker-interface-kvcacheconnectorworker">2. Worker Interface (<code class="docutils literal notranslate"><span class="pre">KvCacheConnectorWorker</span></code>)</a></li>
@@ -1210,8 +1313,8 @@ the same page-list shrink happens there.</p>
   
 
   <!-- Scripts loaded after <body> so the DOM is not blocked -->
-  <script defer src="../_static/scripts/bootstrap.js?digest=64cc4de3f052d77215f0"></script>
-<script defer src="../_static/scripts/pydata-sphinx-theme.js?digest=64cc4de3f052d77215f0"></script>
+  <script defer src="../_static/scripts/bootstrap.js?digest=18bd87630a240e9c25be"></script>
+<script defer src="../_static/scripts/pydata-sphinx-theme.js?digest=18bd87630a240e9c25be"></script>
 
 
   <footer class="bd-footer">
@@ -1283,9 +1386,9 @@ the same page-list shrink happens there.</p>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on September 26, 2026.</p>
+  <p>Last updated on October 09, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/c76f4a8">c76f4a8</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/cc63e66">cc63e66</a>.</p>
   
 </div></div>
       

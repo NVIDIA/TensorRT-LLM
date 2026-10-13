@@ -27,8 +27,8 @@
   </noscript>
   
   <!-- Loaded before other Sphinx assets -->
-  <link href="../_static/styles/theme.css?digest=64cc4de3f052d77215f0" rel="stylesheet" />
-<link href="../_static/styles/pydata-sphinx-theme.css?digest=64cc4de3f052d77215f0" rel="stylesheet" />
+  <link href="../_static/styles/theme.css?digest=18bd87630a240e9c25be" rel="stylesheet" />
+<link href="../_static/styles/pydata-sphinx-theme.css?digest=18bd87630a240e9c25be" rel="stylesheet" />
 
     <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=8f2a1f02" />
     <link rel="stylesheet" type="text/css" href="../_static/styles/nvidia-sphinx-theme.css?v=933278ad" />
@@ -39,10 +39,10 @@
     <link rel="stylesheet" type="text/css" href="../_static/custom.css?v=19d20f17" />
   
   <!-- So that users can add custom icons -->
-  <script defer src="../_static/scripts/fontawesome.js?digest=64cc4de3f052d77215f0"></script>
+  <script defer src="../_static/scripts/fontawesome.js?digest=18bd87630a240e9c25be"></script>
   <!-- Pre-loaded scripts that we'll load fully later -->
-  <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=64cc4de3f052d77215f0" />
-<link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=64cc4de3f052d77215f0" />
+  <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=18bd87630a240e9c25be" />
+<link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=18bd87630a240e9c25be" />
 
 
 
@@ -60,9 +60,9 @@
     <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
     <script>DOCUMENTATION_OPTIONS.pagename = 'features/visualgen-quantized-attention';</script>
     <script>
-        DOCUMENTATION_OPTIONS.theme_version = '0.22.0';
+        DOCUMENTATION_OPTIONS.theme_version = '0.23.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc29';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc0';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -77,8 +77,9 @@
 
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="color-scheme" content="light dark"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc29" />
+  <meta name="docsearch:version" content="1.4.0rc0" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -412,6 +413,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-qwen3.8-flash-next-on-trtllm.html">Deployment Guide for Qwen3.8-Flash-Next on TensorRT LLM - Blackwell Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-kimi-k3-on-trtllm.html">Deployment Guide for Kimi K3 on TensorRT LLM - Blackwell</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-glm-5-on-trtllm.html">Deployment Guide for GLM-5 on TensorRT LLM - Blackwell Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-glm-5.3-flash-on-trtllm.html">Deployment Guide for GLM-5.3-Flash on TensorRT LLM - Blackwell Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-minimax-m3-on-trtllm.html">Deployment Guide for MiniMax-M3 on TensorRT LLM</a></li>
 </ul>
 </details></li>
@@ -458,6 +460,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CudaGraphConfig.html">CudaGraphConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/DecodeCudaGraphConfig.html">DecodeCudaGraphConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/EncodeCudaGraphConfig.html">EncodeCudaGraphConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/EncodeExtraInputSpec.html">EncodeExtraInputSpec</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/MoeConfig.html">MoeConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/EagleDecodingConfig.html">EagleDecodingConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/Eagle3DecodingConfig.html">Eagle3DecodingConfig</a></li>
@@ -673,9 +676,9 @@
 </ul>
 </li>
 <li><p><a class="reference internal" href="#qk16pv8-attention-kernels-in-the-cutedsl-backend">QK16PV8 Attention Kernels in the CUTEDSL Backend</a></p></li>
-<li><p><a class="reference internal" href="#sageattention-in-the-trtllm-backend">SageAttention (TRTLLM)</a></p></li>
+<li><p><a class="reference internal" href="#sageattention-in-the-trtllm-backend">SageAttention in the <code class="docutils literal notranslate"><span class="pre">TRTLLM</span></code> backend</a></p></li>
 <li><p><a class="reference internal" href="#fp8-and-mxfp8-in-the-cudnn-backend">FP8 and MXFP8 in the cuDNN Backend</a></p></li>
-<li><p><a class="reference internal" href="#mxfp8-and-nvfp4-in-the-cutedsl-and-flashinfer-backends">MXFP8 / NVFP4 (CUTEDSL / FlashInfer)</a></p></li>
+<li><p><a class="reference internal" href="#mxfp8-and-nvfp4-in-the-cutedsl-and-flashinfer-backends">MXFP8 and NVFP4 in the <code class="docutils literal notranslate"><span class="pre">CUTEDSL</span></code> and <code class="docutils literal notranslate"><span class="pre">FlashInfer</span></code> backends</a></p></li>
 <li><p><a class="reference internal" href="#interaction-with-other-features">Interaction With Other Features</a></p></li>
 </ul>
 <section id="overview">
@@ -698,58 +701,64 @@
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">TRTLLM</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">int8</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">fp8</span></code></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">(1,</span> <span class="pre">1,</span> <span class="pre">1)</span></code>, <code class="docutils literal notranslate"><span class="pre">(1,</span> <span class="pre">4,</span> <span class="pre">1)</span></code>, <code class="docutils literal notranslate"><span class="pre">(1,</span> <span class="pre">16,</span> <span class="pre">1)</span></code></p></td>
-<td><p>SageAttention (INT8 QK)</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">(2,</span> <span class="pre">16,</span> <span class="pre">1)</span></code></p></td>
+<td><p>SageAttention (INT8 QK) for Hopper</p></td>
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">TRTLLM</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">int8</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">fp8</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">(1,</span> <span class="pre">1,</span> <span class="pre">1)</span></code>, <code class="docutils literal notranslate"><span class="pre">(1,</span> <span class="pre">4,</span> <span class="pre">1)</span></code>, <code class="docutils literal notranslate"><span class="pre">(1,</span> <span class="pre">16,</span> <span class="pre">1)</span></code></p></td>
+<td><p>SageAttention (INT8 QK) for Blackwell</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">TRTLLM</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">fp8</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">fp8</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">(1,</span> <span class="pre">1,</span> <span class="pre">1)</span></code>, <code class="docutils literal notranslate"><span class="pre">(1,</span> <span class="pre">4,</span> <span class="pre">1)</span></code></p></td>
-<td><p>SageAttention (FP8 QK)</p></td>
+<td><p>SageAttention (FP8 QK) for Blackwell</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">CUDNN</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">CUDNN</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">fp8</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">fp8</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">(0,</span> <span class="pre">0,</span> <span class="pre">0)</span></code></p></td>
 <td><p>cuDNN FP8</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">CUDNN</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">CUDNN</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">mxfp8</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">mxfp8</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">(0,</span> <span class="pre">0,</span> <span class="pre">0)</span></code></p></td>
 <td><p>cuDNN MXFP8</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">CUTEDSL</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">CUTEDSL</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">bf16</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">fp8</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">(0,</span> <span class="pre">0,</span> <span class="pre">0)</span></code></p></td>
 <td><p>QK16PV8</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">CUTEDSL</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">CUTEDSL</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">mxfp8</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">fp8</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">(0,</span> <span class="pre">0,</span> <span class="pre">0)</span></code>, <code class="docutils literal notranslate"><span class="pre">(0,</span> <span class="pre">0,</span> <span class="pre">1)</span></code></p></td>
 <td><p>MXFP8 Q/K</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">CUTEDSL</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">CUTEDSL</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">nvfp4</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">fp8</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">(0,</span> <span class="pre">0,</span> <span class="pre">0)</span></code>, <code class="docutils literal notranslate"><span class="pre">(0,</span> <span class="pre">0,</span> <span class="pre">1)</span></code></p></td>
 <td><p>NVFP4 Q/K</p></td>
-</tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">FLASHINFER</span></code></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">mxfp8</span></code></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">fp8</span></code></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">(0,</span> <span class="pre">0,</span> <span class="pre">0)</span></code></p></td>
-<td><p>MXFP8 Q/K</p></td>
 </tr>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">FLASHINFER</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">mxfp8</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">fp8</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">(0,</span> <span class="pre">0,</span> <span class="pre">0)</span></code></p></td>
+<td><p>MXFP8 Q/K</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">FLASHINFER</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">nvfp4</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">fp8</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">(0,</span> <span class="pre">0,</span> <span class="pre">0)</span></code></p></td>
 <td><p>NVFP4 Q/K</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">FLASHINFER</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">FLASHINFER</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">nvfp4</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">nvfp4</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">(0,</span> <span class="pre">0,</span> <span class="pre">0)</span></code></p></td>
@@ -767,7 +776,7 @@
 <li><p>QK16PV8 keeps Q/K in BF16 and only quantizes V, making it the most conservative quantized-attention recipe.</p></li>
 <li><p>On B200/GB200, SageAttention with INT8 Q/K typically matches QK16PV8 quality while delivering higher end-to-end throughput.</p></li>
 <li><p>On B300/GB300, start with MXFP8 when optimizing the quality-throughput balance. SageAttention with FP8 Q/K remains an alternative when the <code class="docutils literal notranslate"><span class="pre">TRTLLM</span></code> backend is preferred for the surrounding workload.</p></li>
-<li><p>For SageAttention with INT8 Q/K, the default <code class="docutils literal notranslate"><span class="pre">(1,</span> <span class="pre">16,</span> <span class="pre">1)</span></code> block-size recipe works well for most cases. Use <code class="docutils literal notranslate"><span class="pre">(1,</span> <span class="pre">4,</span> <span class="pre">1)</span></code> when video quality is not satisfactory.</p></li>
+<li><p>For SageAttention with INT8 Q/K, the default <code class="docutils literal notranslate"><span class="pre">(2,</span> <span class="pre">16,</span> <span class="pre">1)</span></code> or <code class="docutils literal notranslate"><span class="pre">(1,</span> <span class="pre">16,</span> <span class="pre">1)</span></code> block-size recipes works well for most cases. Use <code class="docutils literal notranslate"><span class="pre">(1,</span> <span class="pre">4,</span> <span class="pre">1)</span></code> when video quality is not satisfactory.</p></li>
 <li><p>The <code class="docutils literal notranslate"><span class="pre">CUDNN</span></code> backend requires Q/K and V to use the same format. Use <code class="docutils literal notranslate"><span class="pre">fp8</span></code> for per-tensor scaling or <code class="docutils literal notranslate"><span class="pre">mxfp8</span></code> for block scaling.</p></li>
 <li><p>For <code class="docutils literal notranslate"><span class="pre">CUTEDSL</span></code> MXFP8 or NVFP4 recipes, <code class="docutils literal notranslate"><span class="pre">v_block_size:</span> <span class="pre">1</span></code> uses a separate V scale per head and channel, while <code class="docutils literal notranslate"><span class="pre">v_block_size:</span> <span class="pre">0</span></code> uses one tensor-wide V scale. Try the per-channel variant when the tensor-wide scale loses quality.</p></li>
 </ul>
@@ -857,8 +866,9 @@
 </ul>
 <p><strong>Requirements and behavior.</strong></p>
 <ul class="simple">
-<li><p>SageAttention is supported on B200/GB200 and B300/GB300 GPUs.</p></li>
-<li><p>On B200/GB200, use the recommended <code class="docutils literal notranslate"><span class="pre">qk_dtype:</span> <span class="pre">&quot;int8&quot;</span></code> recipe.</p></li>
+<li><p>SageAttention is supported on H100/H200/H800/H20, B200/GB200, and B300/GB300 GPUs.</p></li>
+<li><p>On H100/H200/H800/H20, only one recipe with fixed <code class="docutils literal notranslate"><span class="pre">qk_dtype:</span> <span class="pre">&quot;int8&quot;</span></code> is supported.</p></li>
+<li><p>On B200/GB200, it is recommended to use the <code class="docutils literal notranslate"><span class="pre">qk_dtype:</span> <span class="pre">&quot;int8&quot;</span></code> recipes.</p></li>
 <li><p>On B300/GB300, use <code class="docutils literal notranslate"><span class="pre">qk_dtype:</span> <span class="pre">&quot;fp8&quot;</span></code> and evaluate output quality because it can be less accurate than the INT8 Q/K recipe on B200/GB200.</p></li>
 </ul>
 <p><strong>Configuration.</strong></p>
@@ -890,6 +900,7 @@
 <span class="w">    </span><span class="nt">v_block_size</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">1</span>
 </pre></div>
 </div>
+<p>For Hopper SageAttention, set <code class="docutils literal notranslate"><span class="pre">q_block_size</span></code> to <code class="docutils literal notranslate"><span class="pre">2</span></code>.</p>
 </section>
 <section id="fp8-and-mxfp8-in-the-cudnn-backend">
 <h2>FP8 and MXFP8 in the cuDNN Backend<a class="headerlink" href="#fp8-and-mxfp8-in-the-cudnn-backend" title="Link to this heading">#</a></h2>
@@ -1094,8 +1105,8 @@
   
 
   <!-- Scripts loaded after <body> so the DOM is not blocked -->
-  <script defer src="../_static/scripts/bootstrap.js?digest=64cc4de3f052d77215f0"></script>
-<script defer src="../_static/scripts/pydata-sphinx-theme.js?digest=64cc4de3f052d77215f0"></script>
+  <script defer src="../_static/scripts/bootstrap.js?digest=18bd87630a240e9c25be"></script>
+<script defer src="../_static/scripts/pydata-sphinx-theme.js?digest=18bd87630a240e9c25be"></script>
 
 
   <footer class="bd-footer">
@@ -1167,9 +1178,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on September 26, 2026.</p>
+  <p>Last updated on October 09, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/c76f4a8">c76f4a8</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/cc63e66">cc63e66</a>.</p>
   
 </div></div>
       

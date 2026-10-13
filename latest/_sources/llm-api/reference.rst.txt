@@ -53,6 +53,7 @@ API Reference
     reference/CudaGraphConfig
     reference/DecodeCudaGraphConfig
     reference/EncodeCudaGraphConfig
+    reference/EncodeExtraInputSpec
     reference/MoeConfig
     reference/EagleDecodingConfig
     reference/Eagle3DecodingConfig
@@ -191,6 +192,11 @@ This page provides a searchable index of API names and parameters. Open an entry
     :no-index:
 
     :doc:`View the full EncodeCudaGraphConfig reference <reference/EncodeCudaGraphConfig>`
+
+.. autoclass:: tensorrt_llm.llmapi.EncodeExtraInputSpec
+    :no-index:
+
+    :doc:`View the full EncodeExtraInputSpec reference <reference/EncodeExtraInputSpec>`
 
 .. autoclass:: tensorrt_llm.llmapi.MoeConfig
     :no-index:

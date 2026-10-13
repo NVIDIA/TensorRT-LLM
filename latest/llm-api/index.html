@@ -27,8 +27,8 @@
   </noscript>
   
   <!-- Loaded before other Sphinx assets -->
-  <link href="../_static/styles/theme.css?digest=64cc4de3f052d77215f0" rel="stylesheet" />
-<link href="../_static/styles/pydata-sphinx-theme.css?digest=64cc4de3f052d77215f0" rel="stylesheet" />
+  <link href="../_static/styles/theme.css?digest=18bd87630a240e9c25be" rel="stylesheet" />
+<link href="../_static/styles/pydata-sphinx-theme.css?digest=18bd87630a240e9c25be" rel="stylesheet" />
 
     <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=8f2a1f02" />
     <link rel="stylesheet" type="text/css" href="../_static/styles/nvidia-sphinx-theme.css?v=933278ad" />
@@ -39,10 +39,10 @@
     <link rel="stylesheet" type="text/css" href="../_static/custom.css?v=19d20f17" />
   
   <!-- So that users can add custom icons -->
-  <script defer src="../_static/scripts/fontawesome.js?digest=64cc4de3f052d77215f0"></script>
+  <script defer src="../_static/scripts/fontawesome.js?digest=18bd87630a240e9c25be"></script>
   <!-- Pre-loaded scripts that we'll load fully later -->
-  <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=64cc4de3f052d77215f0" />
-<link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=64cc4de3f052d77215f0" />
+  <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=18bd87630a240e9c25be" />
+<link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=18bd87630a240e9c25be" />
 
 
 
@@ -60,9 +60,9 @@
     <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
     <script>DOCUMENTATION_OPTIONS.pagename = 'llm-api/index';</script>
     <script>
-        DOCUMENTATION_OPTIONS.theme_version = '0.22.0';
+        DOCUMENTATION_OPTIONS.theme_version = '0.23.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc29';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc0';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -77,8 +77,9 @@
 
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="color-scheme" content="light dark"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc29" />
+  <meta name="docsearch:version" content="1.4.0rc0" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -412,6 +413,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-qwen3.8-flash-next-on-trtllm.html">Deployment Guide for Qwen3.8-Flash-Next on TensorRT LLM - Blackwell Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-kimi-k3-on-trtllm.html">Deployment Guide for Kimi K3 on TensorRT LLM - Blackwell</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-glm-5-on-trtllm.html">Deployment Guide for GLM-5 on TensorRT LLM - Blackwell Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-glm-5.3-flash-on-trtllm.html">Deployment Guide for GLM-5.3-Flash on TensorRT LLM - Blackwell Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-minimax-m3-on-trtllm.html">Deployment Guide for MiniMax-M3 on TensorRT LLM</a></li>
 </ul>
 </details></li>
@@ -458,6 +460,7 @@
 <li class="toctree-l2"><a class="reference internal" href="reference/CudaGraphConfig.html">CudaGraphConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="reference/DecodeCudaGraphConfig.html">DecodeCudaGraphConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="reference/EncodeCudaGraphConfig.html">EncodeCudaGraphConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="reference/EncodeExtraInputSpec.html">EncodeExtraInputSpec</a></li>
 <li class="toctree-l2"><a class="reference internal" href="reference/MoeConfig.html">MoeConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="reference/EagleDecodingConfig.html">EagleDecodingConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="reference/Eagle3DecodingConfig.html">Eagle3DecodingConfig</a></li>
@@ -698,7 +701,7 @@
 <span class="linenos">33</span>    <span class="n">main</span><span class="p">()</span>
 </pre></div>
 </div>
-<p>For more advanced usage including distributed inference, multimodal, and speculative decoding, please refer to this <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/c76f4a8/examples/llm-api/README.md">README</a>.</p>
+<p>For more advanced usage including distributed inference, multimodal, and speculative decoding, please refer to this <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/cc63e66/examples/llm-api/README.md">README</a>.</p>
 </section>
 <section id="model-input">
 <h2>Model Input<a class="headerlink" href="#model-input" title="Link to this heading">#</a></h2>
@@ -729,29 +732,196 @@
 </section>
 <section id="startup-metrics">
 <h2>Startup Metrics<a class="headerlink" href="#startup-metrics" title="Link to this heading">#</a></h2>
-<p>For the PyTorch backend, the beta <code class="docutils literal notranslate"><span class="pre">LLM.startup_metrics</span></code> property reports weight-loading timings from
-worker rank 0. Values are wall-clock seconds. The property returns an empty dictionary when the
-backend does not provide startup metrics.</p>
+<p>For the PyTorch backend, the beta <code class="docutils literal notranslate"><span class="pre">LLM.startup_metrics</span></code> property reports executor construction,
+model-engine warmup, and weight-loading timings from worker rank 0. Values are wall-clock seconds.
+The property returns an empty dictionary when the backend does not provide startup metrics.</p>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">llm</span> <span class="o">=</span> <span class="n">LLM</span><span class="p">(</span><span class="n">model</span><span class="o">=</span><span class="s2">"TinyLlama/TinyLlama-1.1B-Chat-v1.0"</span><span class="p">)</span>
 <span class="nb">print</span><span class="p">(</span><span class="n">llm</span><span class="o">.</span><span class="n">startup_metrics</span><span class="p">)</span>
 </pre></div>
 </div>
-<p>A typical result has the following structure:</p>
+<p>A typical result has the following structure (values are illustrative):</p>
 <div class="highlight-json notranslate"><div class="highlight"><pre><span></span><span class="p">{</span>
+<span class="w">  </span><span class="nt">"initial_model_engine"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="nt">"sampling_warmup_seconds"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.342</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">"attention_warmup_seconds"</span><span class="p">:</span><span class="w"> </span><span class="mf">2.911</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">"general_warmup_seconds"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.387</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">"autotuner_warmup_seconds"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.041</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">"mamba_hybrid_warmup_seconds"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.000</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">"ctx_cuda_graph_warmup_seconds"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.480</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">"ctx_cuda_graph_capture_seconds"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.320</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">"post_ctx_cuda_graph_capture_warmup_seconds"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.110</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">"gen_cuda_graph_warmup_seconds"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.566</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">"gen_cuda_graph_capture_seconds"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.950</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">"dg_paged_mqa_warmup_seconds"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.000</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">"cute_dsl_radix_topk_warmup_seconds"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.000</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">"memory_pool_prepopulation_seconds"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.094</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">"kv_cache_cleanup_seconds"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.194</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">"total_warmup_seconds"</span><span class="p">:</span><span class="w"> </span><span class="mf">5.485</span>
+<span class="w">  </span><span class="p">},</span>
+<span class="w">  </span><span class="nt">"final_model_engine"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="nt">"sampling_warmup_seconds"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.291</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">"attention_warmup_seconds"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.057</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">"general_warmup_seconds"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.492</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">"autotuner_warmup_seconds"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.046</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">"mamba_hybrid_warmup_seconds"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.000</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">"gen_cuda_graph_warmup_seconds"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.599</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">"gen_cuda_graph_capture_seconds"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.991</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">"dg_paged_mqa_warmup_seconds"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.000</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">"cute_dsl_radix_topk_warmup_seconds"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.000</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">"memory_pool_prepopulation_seconds"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.097</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">"kv_cache_cleanup_seconds"</span><span class="p">:</span><span class="w"> </span><span class="mf">1.657</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">"total_warmup_seconds"</span><span class="p">:</span><span class="w"> </span><span class="mf">4.230</span>
+<span class="w">  </span><span class="p">},</span>
+<span class="w">  </span><span class="nt">"py_executor"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="nt">"config_and_checkpoint_loader_initialization_seconds"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.004</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">"model_engine_creation_seconds"</span><span class="p">:</span><span class="w"> </span><span class="mf">1.554</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">"sampler_creation_seconds"</span><span class="p">:</span><span class="w"> </span><span class="mf">1.195</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">"initial_kv_cache_creation_seconds"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.025</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">"speculative_decoding_resource_manager_creation_seconds"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.000</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">"speculative_drafter_creation_seconds"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.000</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">"initial_py_executor_creation_seconds_for_kv_cache_estimation"</span><span class="p">:</span><span class="w"> </span><span class="mf">5.766</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">"kv_cache_capacity_configuration_seconds"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.075</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">"final_kv_cache_creation_seconds"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.057</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">"final_py_executor_creation_seconds"</span><span class="p">:</span><span class="w"> </span><span class="mf">4.459</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">"worker_start_seconds"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.000</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">"total_py_executor_creation_seconds"</span><span class="p">:</span><span class="w"> </span><span class="mf">13.373</span>
+<span class="w">  </span><span class="p">},</span>
 <span class="w">  </span><span class="nt">"model_loader"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
-<span class="w">    </span><span class="nt">"total_model_loading_seconds"</span><span class="p">:</span><span class="w">  </span><span class="mf">1.971</span><span class="p">,</span>
-<span class="w">    </span><span class="nt">"checkpoint_preparation_seconds"</span><span class="p">:</span><span class="w"> </span><span class="mf">1.177</span><span class="p">,</span>
-<span class="w">    </span><span class="nt">"weight_population_seconds"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.598</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">"checkpoint_preparation_seconds"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.719</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">"weight_population_seconds"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.272</span><span class="p">,</span>
 <span class="w">    </span><span class="nt">"checkpoint_finalization_seconds"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.031</span><span class="p">,</span>
-<span class="w">    </span><span class="nt">"post_load_processing_seconds"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.005</span>
+<span class="w">    </span><span class="nt">"post_load_processing_seconds"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.004</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">"total_model_loading_seconds"</span><span class="p">:</span><span class="w"> </span><span class="mf">1.545</span>
 <span class="w">  </span><span class="p">}</span>
 <span class="p">}</span>
 </pre></div>
 </div>
-<p>The <code class="docutils literal notranslate"><span class="pre">model_loader</span></code> object contains timings for the main LLM weights. If a draft
-model is used, the additional fields <code class="docutils literal notranslate"><span class="pre">draft_checkpoint_preparation_seconds</span></code>,
-<code class="docutils literal notranslate"><span class="pre">draft_weight_population_seconds</span></code>, and <code class="docutils literal notranslate"><span class="pre">draft_checkpoint_finalization_seconds</span></code>
-appear.</p>
+<p>Some of the timing metrics may not appear or may show as a very small value if the corresponding codepath is not executed, e.g.
+if the prefill CUDA graphs are not enabled, its related metrics “…ctx_cuda_graph…” will not appear.</p>
+<p>The <code class="docutils literal notranslate"><span class="pre">py_executor</span></code> property contains the timed scopes in <code class="docutils literal notranslate"><span class="pre">create_py_executor()</span></code>, which creates the <a class="reference internal" href="../developer-guide/overview.html"><span class="std std-doc">PyExecutor</span></a>.</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>PyExecutor metric</p></th>
+<th class="head"><p>Scope</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">config_and_checkpoint_loader_initialization_seconds</span></code></p></td>
+<td><p>Initialize the model config and checkpoint loader.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">model_engine_creation_seconds</span></code></p></td>
+<td><p>Construct the main model engine, which includes loading model weights.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">draft_model_engine_creation_seconds</span></code></p></td>
+<td><p>Construct the separate draft model engine in the deprecated two-model MTP setting.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">guided_decoder_creation_seconds</span></code></p></td>
+<td><p>Construct guided-decoding resources.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">sampler_creation_seconds</span></code></p></td>
+<td><p>Construct the sampler.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">initial_kv_cache_creation_seconds</span></code></p></td>
+<td><p>Construct the temporary KV cache used to estimate final capacity.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">speculative_decoding_resource_manager_creation_seconds</span></code></p></td>
+<td><p>Construct the speculative-decoding resource manager.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">speculative_drafter_creation_seconds</span></code></p></td>
+<td><p>Construct the speculative drafter.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">initial_py_executor_creation_seconds_for_kv_cache_estimation</span></code></p></td>
+<td><p>Construct the temporary PyExecutor for KV cache capacity estimation, which includes the initial model engine warmup.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">kv_cache_capacity_configuration_seconds</span></code></p></td>
+<td><p>Determine final KV cache capacity from the temporary executor and available memory.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">final_kv_cache_creation_seconds</span></code></p></td>
+<td><p>Construct the final KV cache retained for serving.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">final_py_executor_creation_seconds</span></code></p></td>
+<td><p>Using the final KV cache, construct the final PyExecutor retained for serving, which includes the final model engine warmup.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">worker_start_seconds</span></code></p></td>
+<td><p>Start the final PyExecutor worker.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">total_py_executor_creation_seconds</span></code></p></td>
+<td><p>Total time for the <code class="docutils literal notranslate"><span class="pre">create_py_executor()</span></code> call, including all applicable scopes above.</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>The two model-engine properties contain times for various <code class="docutils literal notranslate"><span class="pre">PyTorchModelEngine</span></code> warmup stages.
+<code class="docutils literal notranslate"><span class="pre">initial_model_engine</span></code> measures the timings for the initial model engine creation as part of the
+<code class="docutils literal notranslate"><span class="pre">py_executor.initial_py_executor_creation_seconds_for_kv_cache_estimation</span></code> timing.
+Likewise, <code class="docutils literal notranslate"><span class="pre">final_model_engine</span></code> measures the timings for the final model engine creation as part of
+the <code class="docutils literal notranslate"><span class="pre">py_executor.final_py_executor_creation_seconds</span></code> timing.
+The deprecated two-model speculative decoding setting may produce the additional properties
+<code class="docutils literal notranslate"><span class="pre">initial_draft_model_engine</span></code> and <code class="docutils literal notranslate"><span class="pre">final_draft_model_engine</span></code>.</p>
+<p>Each model-engine property contains the warmup scopes below. Which scopes appear depends on the model
+and configuration; for example, encoder-decoder and context-parallel configurations can skip some
+stages.</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Model-engine metric</p></th>
+<th class="head"><p>Scope</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">sampling_warmup_seconds</span></code></p></td>
+<td><p>Warm up sampling kernels and run <code class="docutils literal notranslate"><span class="pre">torch.compile()</span></code> on sampling operators.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">attention_warmup_seconds</span></code></p></td>
+<td><p>Warm up the attention backend and kernels.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">general_warmup_seconds</span></code></p></td>
+<td><p>Prepare and warm up general input shapes and release temporary workspaces.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">autotuner_warmup_seconds</span></code></p></td>
+<td><p>Run kernel autotuning warmup.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">mamba_hybrid_warmup_seconds</span></code></p></td>
+<td><p>Warm up Mamba hybrid kernels, when applicable.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">gen_cuda_graph_warmup_seconds</span></code></p></td>
+<td><p>Run the warmup-only pass for generation and mixed encoder-decoder CUDA graphs, including LoRA autotuning and pipeline-parallel cache synchronization and cleanup.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">gen_cuda_graph_capture_seconds</span></code></p></td>
+<td><p>Capture generation and mixed encoder-decoder CUDA graphs for serving.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">ctx_cuda_graph_warmup_seconds</span></code></p></td>
+<td><p>Warm up prefill forwards before CUDA graph capture.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">ctx_cuda_graph_capture_seconds</span></code></p></td>
+<td><p>Capture prefill CUDA graphs.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">post_ctx_cuda_graph_capture_warmup_seconds</span></code></p></td>
+<td><p>Warm up prefill logits buffers with many requests after CUDA graph capture.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">dg_paged_mqa_warmup_seconds</span></code></p></td>
+<td><p>Warm up DeepGEMM paged-MQA metadata, when applicable.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">cute_dsl_radix_topk_warmup_seconds</span></code></p></td>
+<td><p>Warm up the CuTe DSL radix top-k kernel, when applicable.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">memory_pool_prepopulation_seconds</span></code></p></td>
+<td><p>Prepare maximum-shape requests and pre-populate the memory pool.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">kv_cache_cleanup_seconds</span></code></p></td>
+<td><p>Check and clear invalid KV cache values produced during warmup.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">total_warmup_seconds</span></code></p></td>
+<td><p>Complete model-engine warmup, including KV cache cleanup.</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>The <code class="docutils literal notranslate"><span class="pre">model_loader</span></code> property contains timings for loading the main LLM weights, including
+<code class="docutils literal notranslate"><span class="pre">checkpoint_finalization_seconds</span></code> for checkpoint-session synchronization and cleanup after weight population.
+If a draft model is used, additional fields <code class="docutils literal notranslate"><span class="pre">draft_checkpoint_preparation_seconds</span></code>,
+<code class="docutils literal notranslate"><span class="pre">draft_weight_population_seconds</span></code>, and <code class="docutils literal notranslate"><span class="pre">draft_checkpoint_finalization_seconds</span></code> will appear.
+A <code class="docutils literal notranslate"><span class="pre">draft_model_loader</span></code> property can also appear in the deprecated two-model MTP setting.
+The <code class="docutils literal notranslate"><span class="pre">py_executor.model_engine_creation_seconds</span></code> timing includes the total <code class="docutils literal notranslate"><span class="pre">model_loader</span></code> timing.</p>
 <div class="pst-scrollable-table-container"><table class="table">
 <thead>
 <tr class="row-odd"><th class="head"><p>Metric</p></th>
@@ -759,29 +929,29 @@ appear.</p>
 </tr>
 </thead>
 <tbody>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">total_model_loading_seconds</span></code></p></td>
-<td><p>Overall model construction and loading interval measured after checkpoint configuration validation. It includes the named phases below.</p></td>
-</tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">checkpoint_preparation_seconds</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">checkpoint_preparation_seconds</span></code></p></td>
 <td><p>Time spent warming up, parsing and preparing checkpoint tensors for the model. Some checkpoint formats can populate model storage directly during this phase.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">weight_population_seconds</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">weight_population_seconds</span></code></p></td>
 <td><p>Time spent copying prepared checkpoint tensors into model parameters on GPUs. This metric can be absent for formats that populate weights directly during the above checkpoint preparation phase.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">checkpoint_finalization_seconds</span></code></p></td>
-<td><p>Time spent finalizing the checkpoint session after weight population. This includes loader-specific synchronization and cleanup; rank-striped read-ahead includes waiting for peer ranks and stopping background readers.</p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">checkpoint_finalization_seconds</span></code></p></td>
+<td><p>Time spent finalizing the checkpoint session after weight population. This includes loader-specific synchronization and cleanup.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">draft_checkpoint_preparation_seconds</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">draft_checkpoint_preparation_seconds</span></code></p></td>
 <td><p>Checkpoint preparation time for draft weights loaded as part of the model loader.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">draft_weight_population_seconds</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">draft_weight_population_seconds</span></code></p></td>
 <td><p>Weight population time for draft weights loaded as part of the model loader.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">draft_checkpoint_finalization_seconds</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">draft_checkpoint_finalization_seconds</span></code></p></td>
 <td><p>Checkpoint finalization time for draft weights loaded as part of the model loader.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">post_load_processing_seconds</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">post_load_processing_seconds</span></code></p></td>
 <td><p>Time spent in format-specific hooks and model finalization, including post-load weight transformation, quantization and memory cleanup.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">total_model_loading_seconds</span></code></p></td>
+<td><p>Overall model construction and loading interval measured after checkpoint configuration validation. It includes the named phases below.</p></td>
 </tr>
 </tbody>
 </table>
@@ -794,7 +964,7 @@ appear.</p>
 <div class="highlight-json notranslate"><div class="highlight"><pre><span></span><span class="p">{</span>
 <span class="w">  </span><span class="nt">"startup_metrics"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
 <span class="w">    </span><span class="nt">"model_loader"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
-<span class="w">      </span><span class="nt">"total_model_loading_seconds"</span><span class="p">:</span><span class="w"> </span><span class="mf">1.971</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">"total_model_loading_seconds"</span><span class="p">:</span><span class="w"> </span><span class="mf">1.545</span><span class="p">,</span>
 <span class="w">      </span><span class="err">...</span>
 <span class="w">    </span><span class="p">}</span>
 <span class="w">  </span><span class="p">}</span>
@@ -952,8 +1122,8 @@ instead of being downloaded concurrently into the shared directory.</p>
   
 
   <!-- Scripts loaded after <body> so the DOM is not blocked -->
-  <script defer src="../_static/scripts/bootstrap.js?digest=64cc4de3f052d77215f0"></script>
-<script defer src="../_static/scripts/pydata-sphinx-theme.js?digest=64cc4de3f052d77215f0"></script>
+  <script defer src="../_static/scripts/bootstrap.js?digest=18bd87630a240e9c25be"></script>
+<script defer src="../_static/scripts/pydata-sphinx-theme.js?digest=18bd87630a240e9c25be"></script>
 
 
   <footer class="bd-footer">
@@ -1025,9 +1195,9 @@ instead of being downloaded concurrently into the shared directory.</p>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on September 26, 2026.</p>
+  <p>Last updated on October 09, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/c76f4a8">c76f4a8</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/cc63e66">cc63e66</a>.</p>
   
 </div></div>
       
