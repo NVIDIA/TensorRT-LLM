@@ -3355,6 +3355,35 @@ def test_reset_prefix_cache_clears_target_and_draft_reuse_trees():
     stub.draft_kv_cache_manager.reset_reuse_state.assert_called_once_with()
 
 
+@pytest.mark.parametrize("local_invalid", [False, True])
+@pytest.mark.parametrize("has_manager", [False, True])
+def test_sleep_config_rejection_is_shared_across_ranks(local_invalid, has_manager):
+    from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+
+    stub = object.__new__(PyExecutor)
+    manager = Mock(spec=KVCacheManagerV2, is_estimating_kv_cache=False)
+    manager.validate_sleep_config.side_effect = (
+        ValueError("host quota is too small") if local_invalid else None
+    )
+    managers = {"main": manager, "alias": manager} if has_manager else {}
+    estimating = Mock(spec=KVCacheManagerV2, is_estimating_kv_cache=True)
+    managers["estimating"] = estimating
+    stub.resource_manager = types.SimpleNamespace(resource_managers=managers)
+    local_errors = ["host quota is too small"] if local_invalid and has_manager else []
+    stub.dist = Mock()
+    stub.dist.allgather.return_value = [local_errors, ["peer host quota is too small"]]
+
+    with pytest.raises(ValueError, match="rank 1: peer host quota is too small"):
+        stub.validate_sleep_config()
+
+    stub.dist.allgather.assert_called_once_with(local_errors)
+    assert manager.validate_sleep_config.call_count == int(has_manager)
+    estimating.validate_sleep_config.assert_not_called()
+    stub.dist.allgather.return_value = [[], []]
+    manager.validate_sleep_config.side_effect = None
+    stub.validate_sleep_config()
+
+
 @pytest.mark.parametrize("mode", ["NONE", "MEMSET", "CPU", "PINNED"])
 @pytest.mark.parametrize("release_kv", [False, True])
 @pytest.mark.parametrize("has_draft", [False, True])

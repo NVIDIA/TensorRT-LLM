@@ -39,7 +39,7 @@ from strenum import StrEnum
 from tensorrt_llm._torch.disaggregation.resource.page import MapperKind, RoleLayout
 from tensorrt_llm._torch.distributed.communicator import Distributed, ReduceOp
 from tensorrt_llm._torch.utils import helix_local_len, maybe_compile
-from tensorrt_llm._torch.virtual_memory import RestoreMode
+from tensorrt_llm._torch.virtual_memory import RestoreMode, preserve_contents
 from tensorrt_llm._utils import (
     TensorWrapper,
     binding_to_torch_dtype,
@@ -1988,8 +1988,6 @@ class KVCacheManagerV2(BaseResourceManager):
         # Requests whose pages a connector is still reading from, so the
         # release half of `preempt_request` has to wait.
         self._pending_preemption: Dict[int, LlmRequest] = {}
-        from tensorrt_llm._torch.virtual_memory import preserve_contents
-
         with preserve_contents():
             self._prepare_page_table_tensor(index_mapper_capacity)
         self._sparse_layer_group_ids = tuple(
@@ -6813,9 +6811,7 @@ class KVCacheManagerV2(BaseResourceManager):
         if discard:
             self.kv_cache_map.clear()
             self._fresh_pages_filled.clear()
-            if self.conversation_manager is not None:
-                self.conversation_manager.clear()
-            self.impl.clear_reusable_blocks()
+            self.reset_reuse_state()
         self.impl.release_gpu_memory()
 
     def materialize_memory(self) -> None:
@@ -6833,7 +6829,9 @@ class KVCacheManagerV2(BaseResourceManager):
             )
             self.kv_cache_map[req_id] = cache
             cache.enable_swa_scratch_reuse = state.enable_swa_scratch_reuse
-            if not cache.resume(self._stream.cuda_stream, is_decoding=state.is_decoding):
+            if not cache.resume(
+                self._stream.cuda_stream, is_decoding=state.is_decoding, check_utilization=False
+            ):
                 raise RuntimeError(f"Could not recreate KV cache for request {req_id}")
             cache.stop_committing()
             if not cache.resize(state.capacity, history_length=state.history_length):
@@ -6843,14 +6841,18 @@ class KVCacheManagerV2(BaseResourceManager):
                 cache.suspend()
             self._restore_page_index_bufs(req_id, cache)
         for req_id in self._sleeping_active_caches:
-            if not self._resume_and_restore(req_id, self.kv_cache_map[req_id]):
+            cache = self.kv_cache_map[req_id]
+            if not cache.resume(self._stream.cuda_stream, check_utilization=False):
                 raise RuntimeError(f"Could not resume KV cache for request {req_id}")
+            self._restore_page_index_bufs(req_id, cache)
         if _GUARD_PAGE_REQUEST_ID in self.kv_cache_map:
             self._guard_page_by_layer.clear()
             for candidate in self._iter_guard_candidate_buffers():
                 key, buffer, pages = self._resolve_guard_candidate(candidate)
                 page = next((int(p) for p in pages if p != BAD_PAGE_INDEX), None)
-                if page is not None and _fill_kv_pages(buffer, [page], self._guard_page_value):
+                if page is None or not 0 <= page < buffer.shape[0]:
+                    continue
+                if _fill_kv_pages(buffer, [page], self._guard_page_value):
                     self._guard_page_by_layer[key] = page
             if not self._guard_page_by_layer:
                 raise RuntimeError("Could not restore the KV cache guard page after wakeup")

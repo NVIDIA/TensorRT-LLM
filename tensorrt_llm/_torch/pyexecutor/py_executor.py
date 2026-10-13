@@ -893,6 +893,9 @@ class PyExecutor:
                     "Speculative decoding with CUDA graph is not supported "
                     "for encoder-decoder models.")
 
+        if self.llm_args is not None and self.llm_args.sleep_config is not None:
+            self.validate_sleep_config()
+
         # Synchronize all ranks before warmup. This prevents a PP
         # communication deadlock when ranks on the last PP stage are delayed
         # by heavy initialisation (e.g. guided-decoder / llguidance tokenizer
@@ -2078,8 +2081,22 @@ class PyExecutor:
         return managers
 
     def validate_sleep_config(self) -> None:
+        errors = []
         for manager in self._kv_memory_resources():
-            manager.validate_sleep_config()
+            if manager.is_estimating_kv_cache:
+                continue
+            try:
+                manager.validate_sleep_config()
+            except ValueError as error:
+                errors.append(str(error))
+        rank_errors = self.dist.allgather(errors)
+        failures = [
+            f"rank {rank}: {error}" for rank, errors in enumerate(rank_errors)
+            for error in errors
+        ]
+        if failures:
+            raise ValueError("Invalid sleep configuration: " +
+                             "; ".join(failures))
 
     def release_memory(self, tags: tuple[str, ...]) -> None:
         """Release native KV pools before the runtime releases tagged auxiliary buffers."""

@@ -3161,7 +3161,9 @@ class _GuardKVCache:
         self.reuse_scope = None
         self.num_committed_tokens = 0
 
-    def resume(self, stream: object, is_decoding: bool = False) -> bool:
+    def resume(
+        self, stream: object, is_decoding: bool = False, check_utilization: bool = True
+    ) -> bool:
         del stream
         return self.resume_ok
 

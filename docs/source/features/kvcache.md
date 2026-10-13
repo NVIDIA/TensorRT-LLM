@@ -262,10 +262,13 @@ their activation points.
 ### Sleep and Wakeup with V2
 
 When `sleep_config` is enabled with KV cache manager V2, the host cache tier must
-have a quota at least as large as the GPU cache quota on each rank. Set
-`kv_cache_config.host_cache_size` accordingly. Automatic host sizing may choose a
-smaller quota because of available host memory or pinned-memory limits; such a
-configuration is rejected during initialization when sleep is enabled.
+have a quota at least as large as the GPU cache quota for each KV manager on
+each rank, including draft managers. Set `kv_cache_config.host_cache_size`
+accordingly; speculative decoding splits this budget between the target and
+draft managers. Automatic host sizing uses the minimum across ranks and may
+choose a smaller quota because of available host memory or pinned-memory limits.
+All ranks reject an insufficient quota during initialization, before the final
+executor's warmup.
 
 The `kv_cache` entry in `sleep_config.restore_modes` controls the KV data policy:
 

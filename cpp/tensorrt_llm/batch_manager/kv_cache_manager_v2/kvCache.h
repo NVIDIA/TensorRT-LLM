@@ -261,9 +261,10 @@ public:
     // Optionally sets a new CUDA stream; if nullopt, uses the existing one.
     // isDecoding defaults to the current phase. A cache starts in prefill and cannot return to it
     // after decode admission. Set true when admitting a suspended request directly to decode.
+    // Restoring already-admitted caches may skip the utilization threshold; allocation limits still apply.
     // Returns false if utilization too high or out of memory.
     bool resume(std::optional<CUstream> stream = std::nullopt, std::optional<bool> isDecoding = std::nullopt,
-        std::optional<std::vector<LifeCycleId>> optionalReuseGroups = std::nullopt);
+        std::optional<std::vector<LifeCycleId>> optionalReuseGroups = std::nullopt, bool checkUtilization = true);
 
     // Enter decode only after prefill has submitted its final KV accesses. Offloads complete sparse
     // history, deferring pages still needed on GPU by another owner. Retries deferred pages even

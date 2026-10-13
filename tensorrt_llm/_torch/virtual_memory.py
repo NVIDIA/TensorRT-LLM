@@ -15,8 +15,8 @@ from tensorrt_llm.bindings.internal.runtime import (
     push_virtual_memory_allocator)
 
 __all__ = [
-    "RestoreMode", "maybe_scope", "scope", "release_with_tag",
-    "materialize_with_tag"
+    "RestoreMode", "TaggedMemoryResource", "maybe_scope", "scope",
+    "preserve_contents", "release_with_tag", "materialize_with_tag"
 ]
 
 
