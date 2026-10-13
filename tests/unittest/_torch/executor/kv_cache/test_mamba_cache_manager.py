@@ -297,8 +297,10 @@ def _kimi_model_config() -> SimpleNamespace:
     )
     return SimpleNamespace(
         pretrained_config=config,
+        mapping=Mapping(),
         quant_config=None,
         sparse_attention_config=None,
+        spec_config=None,
         get_num_mamba_layers=lambda: 2,
     )
 

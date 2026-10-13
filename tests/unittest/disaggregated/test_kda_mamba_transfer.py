@@ -636,13 +636,28 @@ def run_kda_transfer_test(
             gen_reqs.append(gen_req)
 
         ctx_batch = ScheduledRequests()
-        ctx_batch.reset_context_requests(ctx_reqs)
-        for mgr in ctx_mgrs:
-            mgr.prepare_resources(ctx_batch)
+        if use_v2:
+            ctx_batch.context_requests_last_chunk = ctx_reqs
+            for mgr in ctx_mgrs:
+                for req in ctx_reqs:
+                    assert mgr.prepare_context(req)
+                    assert mgr.resize_context(req, req.context_chunk_size)
+                mgr.prepare_resources(ctx_batch)
+        else:
+            ctx_batch.reset_context_requests(ctx_reqs)
+            for mgr in ctx_mgrs:
+                mgr.prepare_resources(ctx_batch)
         gen_batch = ScheduledRequests()
-        gen_batch.reset_context_requests(gen_reqs)
-        for mgr in gen_mgrs:
-            mgr.prepare_resources(gen_batch)
+        if use_v2:
+            gen_batch.context_requests_last_chunk = gen_reqs
+            for mgr in gen_mgrs:
+                for req in gen_reqs:
+                    assert mgr.prepare_disagg_gen_init(req)
+                mgr.prepare_resources(gen_batch)
+        else:
+            gen_batch.reset_context_requests(gen_reqs)
+            for mgr in gen_mgrs:
+                mgr.prepare_resources(gen_batch)
         for req in ctx_reqs + gen_reqs:
             req.context_current_position = req.prompt_len
             req.add_new_token(req.prompt_len, 0)
