@@ -378,6 +378,24 @@ def build_glm5_next_runtime_context(attn_metadata: AttentionMetadata) -> Glm5Nex
     )
 
 
+def glm5_next_text_quant_config(model_config: ModelConfig) -> ModelConfig:
+    """Copy ``model_config`` with checkpoint quantization exclusions renamed for the text runtime.
+
+    The checkpoint names text modules ``model.language_model.*``; the runtime omits the
+    ``language_model`` level. Which modules stay unquantized, including the MTP layer, is
+    taken from the checkpoint's ``exclude_modules`` as is.
+    """
+    quant = model_config.quant_config
+    if quant is None or quant.exclude_modules is None:
+        return model_config
+    model_config = copy.copy(model_config)
+    model_config.quant_config = copy.deepcopy(quant)
+    model_config.quant_config.exclude_modules = [
+        name.replace("model.language_model.", "model.", 1) for name in quant.exclude_modules
+    ]
+    return model_config
+
+
 @register_auto_model("Glm5NextForCausalLM")
 class Glm5NextForCausalLM(SpecDecOneEngineForCausalLM):
     """GLM-5.3-Flash decoder with an optional one-model MTP drafter.
@@ -407,25 +425,7 @@ class Glm5NextForCausalLM(SpecDecOneEngineForCausalLM):
                 "glm5_next MTP with attention DP and a tensor-parallel LM head is not supported"
             )
         text_config = unwrap_glm5_next_text_config(model_config.pretrained_config)
-        if model_config.quant_config is not None:
-            model_config = copy.copy(model_config)
-            model_config.quant_config = copy.deepcopy(model_config.quant_config)
-            quant = model_config.quant_config
-            # Text-runtime module names omit the checkpoint's language_model level.
-            if quant.exclude_modules is not None:
-                quant.exclude_modules = [
-                    name.replace("model.language_model.", "model.", 1)
-                    for name in quant.exclude_modules
-                ]
-            if quant.quant_algo == QuantAlgo.NVFP4:
-                # The NVFP4 checkpoint's appended MTP layer remains BF16.
-                quant.exclude_modules = list(quant.exclude_modules or []) + [
-                    f"model.layers.{i}.*"
-                    for i in range(
-                        text_config.num_hidden_layers,
-                        text_config.num_hidden_layers + text_config.num_nextn_predict_layers,
-                    )
-                ]
+        model_config = glm5_next_text_quant_config(model_config)
         # tie_word_embeddings is false on this checkpoint, so lm_head is a real
         # weight rather than a view of the embedding; it is asserted, not assumed.
         if bool(getattr(text_config, "tie_word_embeddings", False)):
@@ -545,7 +545,7 @@ class Glm5NextForCausalLM(SpecDecOneEngineForCausalLM):
         weights: Any,
         weight_mapper: BaseWeightMapper | None = None,
     ) -> None:
-        """Load checkpoint tensors one owner at a time to bound peak memory.
+        """Load checkpoint tensors owner by owner into the allocated model.
 
         The registered GLM mapper resolves keys and destination owners. FP8 payloads
         and FP32 block scales retain their checkpoint representation; module loaders
@@ -576,8 +576,8 @@ class Glm5NextForCausalLM(SpecDecOneEngineForCausalLM):
         num_layers = self.schedule.num_layers + len(self.mtp_layers)
         audit = weight_mapper.audit(list(weights.keys()))
 
-        # Each owner is materialized and filled on its own, so peak memory is
-        # one layer above the final footprint rather than a second full copy.
+        # Checkpoint tensors are grouped by owner (a decoder layer or a named
+        # top-level part) and placed by that owner's modules.
         targets: dict[Any, tuple[nn.Module, str]] = {
             **{i: (self.model.layers[i], f"model.layers.{i}.") for i in range(num_layers)},
             "embed": (self.model.embed_tokens, "model.embed_tokens."),
@@ -607,7 +607,6 @@ class Glm5NextForCausalLM(SpecDecOneEngineForCausalLM):
         for owner, (module, prefix) in targets.items():
             if owner in remote:
                 continue
-            module.to_empty(device=device)
             self._fill_module(module, owner, prefix, by_owner.get(owner, []), weights, device)
         # The shared KDA mixer's post-load kernel constants (built from the
         # just-loaded local shards; the same step the Kimi K3 loader runs).
@@ -731,12 +730,8 @@ class Glm5NextForCausalLM(SpecDecOneEngineForCausalLM):
                 linear.quant_config is not None
                 and linear.quant_config.quant_algo == QuantAlgo.NVFP4
             ):
-                # The shared loader derives alpha and input_scale. These extra
-                # fields need initialization after the owner's to_empty().
-                with torch.no_grad():
-                    linear.inv_input_scale.copy_(linear.input_scale / 6.0)
-                    linear.kv_scales.fill_(1)
-                    linear.inv_kv_scales.fill_(1)
+                # The shared loader fills the calibrated scales and derives
+                # alpha; the KV scales keep their construction values.
                 param_names += [
                     "input_scale",
                     "inv_input_scale",
@@ -784,6 +779,15 @@ class Glm5NextForCausalLM(SpecDecOneEngineForCausalLM):
             else:
                 # Replicated fusions: one row-concatenated tensor (and block
                 # scales), the order being the module's declared source order.
+                fused_quant = getattr(dest_mod, "quant_config", None)
+                if fused_quant is not None and fused_quant.quant_algo == QuantAlgo.NVFP4:
+                    # Each NVFP4 source has its own per-tensor scales; merging them is not
+                    # implemented.
+                    raise ValueError(
+                        f"glm5_next owner {owner!r}: cannot fuse NVFP4 projections into "
+                        f"{fused_path!r}: each source has its own per-tensor scales "
+                        "(weight_scale_2, input_scale); exclude the sources from quantization"
+                    )
                 merged = {"weight": torch.cat([g["weight"] for g in groups], dim=0)}
                 if all("weight_scale_inv" in g for g in groups):
                     merged["weight_scale_inv"] = torch.cat(
@@ -805,11 +809,6 @@ class Glm5NextForCausalLM(SpecDecOneEngineForCausalLM):
                     f"glm5_next owner {owner!r}: fused MoE collected {len(moe_weights)} expert "
                     f"tensors, expected {expected} (local experts {len(local_expert_ids)})"
                 )
-            from ..moe.fused_moe.activation import install_activation_params
-
-            # Recreate non-checkpoint constants after to_empty, before quantization
-            # transforms them into the backend's scale convention.
-            install_activation_params(getattr(experts, "backend", experts), device=device)
             experts.load_weights([moe_weights])
             if hasattr(experts, "post_load_weights"):
                 experts.post_load_weights()
@@ -817,7 +816,7 @@ class Glm5NextForCausalLM(SpecDecOneEngineForCausalLM):
 
         # FP8_BLOCK_SCALES' static activation scales: this checkpoint is
         # activation_scheme='dynamic', so they are never read; zero them rather
-        # than leave to_empty garbage behind.
+        # than leave uninitialized memory behind.
         unused = {
             n for n in params if n not in filled and n.endswith(("input_scale", "inv_input_scale"))
         }
@@ -1565,7 +1564,7 @@ class Glm5NextMoE(nn.Module):
 
         # The gate's own routing method (DeepSeek noaux_tc; the bias is
         # fetched per call so it follows the parameter through
-        # to_empty/materialization onto its final device).
+        # materialization onto its final device).
         routing = self.gate.routing_method
         # Routed experts use the checkpoint's quantization; excluded layers
         # (including the NVFP4 checkpoint's BF16 MTP layer) stay unquantized.

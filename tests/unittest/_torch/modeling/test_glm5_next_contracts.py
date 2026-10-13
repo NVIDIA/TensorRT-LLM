@@ -233,6 +233,11 @@ def test_mixed_processor_matches_separate_inputs(tensor_images):
             )
 
 
+def _materialize_meta(module: torch.nn.Module) -> None:
+    """Allocate meta tensors on CUDA as ModelLoader does after MetaInitMode construction."""
+    module._apply(lambda t: torch.empty_like(t, device="cuda") if t.is_meta else t)
+
+
 def _config():
     config = PretrainedConfig(
         model_type="glm5_next",
@@ -421,6 +426,7 @@ def test_checkpoint_routes_vision_and_optional_mtp_separately():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_nvfp4_loader_preserves_calibrated_scales():
+    from tensorrt_llm._torch.models.modeling_utils import MetaInitMode
     from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
     from tensorrt_llm._utils import get_sm_version
     from tensorrt_llm.models.modeling_utils import QuantConfig
@@ -429,23 +435,23 @@ def test_nvfp4_loader_preserves_calibrated_scales():
     if get_sm_version() not in (100, 103):
         pytest.skip("NVFP4 comparison requires SM100/103")
     config = ModelConfig(quant_config=QuantConfig(quant_algo=QuantAlgo.NVFP4, group_size=16))
+
+    def build():
+        return GatedMLP(
+            hidden_size=128,
+            intermediate_size=256,
+            bias=False,
+            dtype=torch.bfloat16,
+            config=config,
+            swiglu_limit=7.0,
+        )
+
     with torch.device("cuda"):
-        actual = GatedMLP(
-            hidden_size=128,
-            intermediate_size=256,
-            bias=False,
-            dtype=torch.bfloat16,
-            config=config,
-            swiglu_limit=7.0,
-        )
-        reference = GatedMLP(
-            hidden_size=128,
-            intermediate_size=256,
-            bias=False,
-            dtype=torch.bfloat16,
-            config=config,
-            swiglu_limit=7.0,
-        )
+        reference = build()
+        # The model loader path: meta construction, then uninitialized allocation.
+        with MetaInitMode():
+            actual = build()
+    _materialize_meta(actual)
     generator = torch.Generator().manual_seed(19136)
     groups = {}
     for name, rows, cols in (
@@ -468,7 +474,6 @@ def test_nvfp4_loader_preserves_calibrated_scales():
         for name, group in groups.items()
         for label, tensor in group.items()
     }
-    actual.to_empty(device="cuda")
     Glm5NextForCausalLM._fill_module(
         None, actual, "dense", "", [(key, key) for key in weights], weights, torch.device("cuda")
     )
@@ -513,8 +518,9 @@ def test_checkpoint_lazy_scalar_materialization(tmp_path) -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_nvfp4_moe_loader_restores_activation_constants() -> None:
+def test_nvfp4_moe_meta_init_load_matches_eager() -> None:
     from tensorrt_llm._torch.models.modeling_glm5_next import Glm5NextMoE
+    from tensorrt_llm._torch.models.modeling_utils import MetaInitMode
     from tensorrt_llm._utils import get_sm_version
     from tensorrt_llm.models.modeling_utils import QuantConfig
     from tensorrt_llm.quantization.mode import QuantAlgo
@@ -559,13 +565,16 @@ def test_nvfp4_moe_loader_restores_activation_constants() -> None:
             weights[base + "weight_scale_2"] = torch.tensor(0.02)
     x = (torch.randn(8, 128, generator=generator) * 10).to(device="cuda", dtype=torch.bfloat16)
     outputs = []
-    for materialize in (False, True):
+    for meta_init in (False, True):
         with torch.device("cuda"):
             owner = torch.nn.Module()
-            owner.mlp = Glm5NextMoE(text, config, 0)
-        if materialize:
-            owner.to_empty(device="cuda")
-            owner.mlp.experts.backend.act_clamp.zero_()
+            if meta_init:
+                with MetaInitMode():
+                    owner.mlp = Glm5NextMoE(text, config, 0)
+            else:
+                owner.mlp = Glm5NextMoE(text, config, 0)
+        if meta_init:
+            _materialize_meta(owner)
         Glm5NextForCausalLM._fill_module(
             None, owner, 0, prefix, [(key, key) for key in weights], weights, torch.device("cuda")
         )
@@ -577,6 +586,127 @@ def test_nvfp4_moe_loader_restores_activation_constants() -> None:
         )
         outputs.append(owner.mlp(x))
     torch.testing.assert_close(outputs[0], outputs[1], rtol=0, atol=0)
+
+
+@pytest.mark.cpu_only
+def test_nvfp4_excluded_layer_keeps_experts_unquantized(monkeypatch) -> None:
+    import importlib
+
+    from tensorrt_llm._torch.models.modeling_glm5_next import Glm5NextMoE
+    from tensorrt_llm._torch.modules import linear
+    from tensorrt_llm.models.modeling_utils import QuantConfig
+    from tensorrt_llm.quantization.mode import QuantAlgo
+
+    # The package re-exports the create_moe function under the submodule's name.
+    create_moe_module = importlib.import_module("tensorrt_llm._torch.moe.fused_moe.create_moe")
+    monkeypatch.setattr(linear, "get_sm_version", lambda: 100)
+    expert_quant = {}
+
+    def fake_create_moe(*, layer_idx, override_quant_config, **_):
+        expert_quant[layer_idx] = override_quant_config
+        return torch.nn.Module()
+
+    monkeypatch.setattr(create_moe_module, "create_moe", fake_create_moe)
+    text = PretrainedConfig(
+        hidden_size=128,
+        moe_intermediate_size=256,
+        n_routed_experts=4,
+        n_shared_experts=1,
+        num_experts_per_tok=2,
+        n_group=1,
+        topk_group=1,
+        routed_scaling_factor=1.0,
+        norm_topk_prob=True,
+        swiglu_limit=10.0,
+    )
+    # Layer 1 is excluded with the text-runtime name the model rewrites
+    # checkpoint exclusions to.
+    config = ModelConfig(
+        pretrained_config=text,
+        moe_backend="CUTLASS",
+        quant_config=QuantConfig(
+            quant_algo=QuantAlgo.NVFP4, group_size=16, exclude_modules=["model.layers.1.*"]
+        ),
+    )
+    for layer_idx in (0, 1):
+        Glm5NextMoE(text, config, layer_idx)
+    assert expert_quant[0].quant_algo == QuantAlgo.NVFP4
+    assert expert_quant[1].quant_algo is None
+
+
+@pytest.mark.cpu_only
+def test_text_quant_config_renames_checkpoint_exclusions() -> None:
+    from tensorrt_llm._torch.models.modeling_glm5_next import glm5_next_text_quant_config
+    from tensorrt_llm.models.modeling_utils import QuantConfig
+    from tensorrt_llm.quantization.mode import QuantAlgo
+
+    checkpoint_exclusions = [
+        "lm_head",
+        "model.language_model.layers.3.self_attn*",
+        "model.language_model.layers.45*",
+        "model.visual*",
+    ]
+    config = ModelConfig(
+        quant_config=QuantConfig(
+            quant_algo=QuantAlgo.NVFP4, group_size=16, exclude_modules=list(checkpoint_exclusions)
+        )
+    )
+    quant = glm5_next_text_quant_config(config).quant_config
+    assert quant.exclude_modules == [
+        "lm_head",
+        "model.layers.3.self_attn*",
+        "model.layers.45*",
+        "model.visual*",
+    ]
+    # Exclusions come from the checkpoint only: layer 45 (MTP) because it is listed.
+    assert quant.is_module_excluded_from_quantization("model.layers.45.mlp.experts")
+    assert not quant.is_module_excluded_from_quantization("model.layers.44.mlp.experts")
+    assert config.quant_config.exclude_modules == checkpoint_exclusions
+    unquantized = ModelConfig(quant_config=QuantConfig())
+    assert glm5_next_text_quant_config(unquantized) is unquantized
+
+
+class _ReplicatedFusionOwner(torch.nn.Module):
+    """An owner whose ``fused`` Linear concatenates two checkpoint projections."""
+
+    FUSED_LINEARS = (("fused", ("first", "second")),)
+
+
+@pytest.mark.cpu_only
+def test_nvfp4_replicated_fusion_is_rejected(monkeypatch) -> None:
+    from tensorrt_llm._torch.modules import linear
+    from tensorrt_llm.models.modeling_utils import QuantConfig
+    from tensorrt_llm.quantization.mode import QuantAlgo
+
+    monkeypatch.setattr(linear, "get_sm_version", lambda: 100)
+    owner = _ReplicatedFusionOwner()
+    owner.fused = linear.Linear(
+        128,
+        256,
+        bias=False,
+        dtype=torch.bfloat16,
+        quant_config=QuantConfig(quant_algo=QuantAlgo.NVFP4, group_size=16),
+        skip_create_weights_in_init=True,
+        reduce_output=False,
+    )
+    weights = {}
+    for name in ("first", "second"):
+        weights[f"{name}.weight"] = torch.zeros(128, 64, dtype=torch.uint8)
+        weights[f"{name}.weight_scale"] = torch.ones(128, 8, dtype=torch.float8_e4m3fn)
+        weights[f"{name}.weight_scale_2"] = torch.tensor(0.02)
+        weights[f"{name}.input_scale"] = torch.tensor(0.01)
+    with patch.object(owner.fused, "load_weights") as load:
+        with pytest.raises(ValueError, match="cannot fuse NVFP4 projections into 'fused'"):
+            Glm5NextForCausalLM._fill_module(
+                None,
+                owner,
+                "replicated",
+                "",
+                [(key, key) for key in weights],
+                weights,
+                torch.device("cpu"),
+            )
+        load.assert_not_called()
 
 
 @pytest.mark.cpu_only

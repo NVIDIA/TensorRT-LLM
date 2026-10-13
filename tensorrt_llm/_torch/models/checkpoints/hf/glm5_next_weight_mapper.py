@@ -135,7 +135,7 @@ def glm5_next_is_quantized(model_config: ModelConfig[PretrainedConfig]) -> bool:
     if quant.quant_algo not in (QuantAlgo.FP8_BLOCK_SCALES, QuantAlgo.NVFP4):
         raise ValueError(
             "glm5_next supports FP8_BLOCK_SCALES and NVFP4 checkpoints "
-            f"form or unquantized bf16 modules; got quant_algo={quant.quant_algo}"
+            f"or unquantized bf16 modules; got quant_algo={quant.quant_algo}"
         )
     return True
 
