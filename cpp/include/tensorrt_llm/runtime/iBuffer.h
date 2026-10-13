@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,7 +16,6 @@
 
 #pragma once
 
-#include "tensorrt_llm/common/arrayView.h"
 #include "tensorrt_llm/common/dataType.h"
 #include "tensorrt_llm/kernels/kvCacheIndex.h"
 #include "tensorrt_llm/runtime/common.h"
@@ -35,6 +34,7 @@
 #include <memory>
 #include <optional>
 #include <ostream>
+#include <span>
 #include <type_traits>
 #include <typeinfo>
 #include <vector>
@@ -663,10 +663,10 @@ T const* bufferCastOrNull(std::optional<IBuffer::SharedConstPtr> const& optional
 }
 
 template <typename T>
-class BufferRange : public tensorrt_llm::common::ArrayView<T>
+class BufferRange : public std::span<T>
 {
 public:
-    using Base = tensorrt_llm::common::ArrayView<T>;
+    using Base = std::span<T>;
     using typename Base::size_type;
 
     BufferRange(T* data, size_type size)
