@@ -534,6 +534,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             kind_per_layer_group=kinds,
             token_range=TokenRange(start=0, end=req.prompt_len),
             is_last=True,
+            pages_ready_event=getattr(req, "py_kv_pages_ready_event", None),
         )
 
     def _chunk_num_bytes(self, chunk: Chunk) -> int:
@@ -977,6 +978,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 kind_per_layer_group=whole.kind_per_layer_group,
                 token_range=TokenRange(start=chunk_start * tpb, end=chunk_end_token),
                 is_last=is_last_chunk,
+                pages_ready_event=getattr(req, "py_kv_pages_ready_event", None),
             ),
         )
 

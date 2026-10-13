@@ -61,6 +61,37 @@ _CLOSE_JOIN_S = 2.0  # max wait for the scatter thread to drain on close
 _QUARANTINE_GRACE_S = 60.0  # how long an orphaned region is held out of reuse
 
 
+def _event_handle(event):
+    """The raw ``cudaEvent_t`` behind a ``torch.cuda.Event`` (or an already-raw handle), or None
+    when there is nothing to wait on: a torch event that was never recorded has handle 0."""
+    if event is None:
+        return None
+    handle = getattr(event, "cuda_event", event)
+    return int(handle) or None
+
+
+def _stream_wait_event(stream, event) -> None:
+    """Order the stream's later work after ``event`` (no-op without one)."""
+    handle = _event_handle(event)
+    if handle is not None:
+        CUASSERT(cudart.cudaStreamWaitEvent(stream, cudart.cudaEvent_t(handle), 0))
+
+
+def _pages_ready_event(write_meta):
+    """The executor's mark for the pages this write reads (``Chunk.pages_ready_event``), or None."""
+    chunk = getattr(getattr(write_meta, "task", None), "_chunk", None)
+    return getattr(chunk, "pages_ready_event", None)
+
+
+def _drain_stream(stream) -> None:
+    """Best-effort wait for the stream's queued copies, used before memory they read or write is
+    handed back on an error path."""
+    try:
+        CUASSERT(cudart.cudaStreamSynchronize(stream))
+    except Exception as e:  # the original error is what the caller reports
+        logger.warning(f"[kv-bounce] stream drain failed: {e}")
+
+
 class VmmBounceTransport(BounceTransport):
     """The real transport: gather the request's cache into one fabric region, issue a single coalesced
     multi-rail write, and scatter it back on the receiver."""
@@ -168,14 +199,24 @@ class VmmBounceTransport(BounceTransport):
         self._scatter_thread.start()
 
     def _new_stream(self):
-        return CUASSERT(cudart.cudaStreamCreate())[0]
+        # Non-blocking: a plain cudaStreamCreate() stream synchronises with the legacy default
+        # stream, and the executor keeps that stream ordered behind its execution stream, so a copy
+        # issued while an iteration was in flight waited for the whole iteration (one context
+        # iteration of latency on every bounced transfer, and the single sender worker held with
+        # it). The ordering a copy really needs is carried by the piece's pages_ready_event.
+        return CUASSERT(cudart.cudaStreamCreateWithFlags(cudart.cudaStreamNonBlocking))[0]
 
-    def _gather_blocking(self, src_addr: int, write_meta, total: int) -> None:
+    def _gather_blocking(
+        self, src_addr: int, write_meta, total: int, pages_ready_event=None
+    ) -> None:
         """Gather the scattered fragments into the send region and block until done. The whole gather
         runs under the stream lock so a second sender thread can't overwrite the shared staging buffer
-        mid-copy and corrupt this region; only the fast gather serializes, the writes stay parallel."""
+        mid-copy and corrupt this region; only the fast gather serializes, the writes stay parallel.
+        The copy is ordered after ``pages_ready_event``, the executor's mark that the source pages
+        hold their final content, instead of after everything the engine had in flight."""
         plan = Plan(write_meta.src_ptrs, write_meta.dst_ptrs, write_meta.sizes, total)
         with self._send_stream_lock:
+            _stream_wait_event(self._send_stream, pages_ready_event)
             gather_contiguous(
                 src_addr, plan.src_ptrs, plan.sizes, plan.offsets, stream=self._send_stream
             )
@@ -214,9 +255,12 @@ class VmmBounceTransport(BounceTransport):
             return None
         slot_id, src_addr = res
         try:
-            self._gather_blocking(src_addr, write_meta, total)
+            self._gather_blocking(src_addr, write_meta, total, _pages_ready_event(write_meta))
         except Exception:
-            self._send_alloc.release(slot_id)  # free the slot if the gather raises
+            # The copy may still be queued on the stream: let it drain before the slot (and, once
+            # the task fails, the request's pages) can go back into circulation.
+            _drain_stream(self._send_stream)
+            self._send_alloc.release(slot_id)
             raise
         return slot_id, src_addr, total
 
@@ -249,6 +293,7 @@ class VmmBounceTransport(BounceTransport):
         *,
         timeout: Optional[float] = None,
         extra_bytes: int = 0,
+        pages_ready_event=None,
     ) -> bool:
         """Reserve a region and create its state, recording the address for the senders. Returns
         False to fall back to the per-fragment path. A fan-in splits the region evenly, so the total
@@ -363,6 +408,7 @@ class VmmBounceTransport(BounceTransport):
                 base_addr=addr,
                 per_writer_bytes=total // num_writers,
                 num_writers=num_writers,
+                pages_ready_event=pages_ready_event,
             )
             self._reserved_map[ctx.rid_slice] = ctx  # inactive until the first writer reports
         # Positive marker: all fall-back guards above passed, so this transfer provably takes the
@@ -494,6 +540,9 @@ class VmmBounceTransport(BounceTransport):
             ctx, descs = item
             ok = True
             try:
+                # The destination pages may still be touched by the iteration that was in flight
+                # when they were handed to this request; the executor's mark orders us after it.
+                _stream_wait_event(self._scatter_stream, ctx.pages_ready_event)
                 # Scatter each writer's fragments from its own source, never one global offset, so a
                 # missing or fallback writer cannot shift where the others are read from.
                 for src_base, dst_ptrs, sizes in descs:
@@ -544,6 +593,7 @@ class NoBounceTransport(BounceTransport):
         *,
         timeout: Optional[float] = _RESERVE_TIMEOUT_S,
         extra_bytes: int = 0,
+        pages_ready_event=None,
     ) -> bool:
         return False
 

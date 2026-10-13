@@ -371,6 +371,10 @@ class BatchState:
     gpu_forward_start_event: Optional[torch.cuda.Event] = None
     gpu_forward_end_event: Optional[torch.cuda.Event] = None
     gpu_forward_events_from_perf_pool: bool = False
+    # Where the execution stream stood once this iteration's work (forward, V2 context finalize)
+    # was enqueued: the KV transceiver orders its device copies for this batch's finished context
+    # requests after it, see PyExecutor._kv_pages_ready_event.
+    kv_pages_ready_event: Optional[torch.cuda.Event] = None
 
 
 @dataclasses.dataclass
@@ -5739,7 +5743,8 @@ class PyExecutor:
 
                     self._stage_mark('update_requests')
                     self._send_kv_async(
-                        self.previous_batch.scheduled_requests.all_requests())
+                        self.previous_batch.scheduled_requests.all_requests(),
+                        self.previous_batch.kv_pages_ready_event)
 
                 if self.enable_early_first_token_response:
                     if self.previous_batch is not None and should_process_previous_batch:
@@ -5858,7 +5863,8 @@ class PyExecutor:
                         gpu_forward_start_event=gpu_forward_start,
                         gpu_forward_end_event=gpu_forward_end,
                         gpu_forward_events_from_perf_pool=
-                        gpu_forward_events_from_perf_pool)
+                        gpu_forward_events_from_perf_pool,
+                        kv_pages_ready_event=self._kv_pages_ready_event())
                 elif not can_queue_this_rank:
                     # If the batch is empty on this rank, we need to clear the previous batch.
                     self.previous_batch = None
@@ -7741,6 +7747,13 @@ class PyExecutor:
             kv_cache_manager.report_batch_to_connector(
                 disagg_gen_init_to_prepare)
 
+        # The pages these requests were just given may still be read or
+        # written by the iteration in flight (the overlap loop frees a
+        # finished request's pages one forward before that forward has run);
+        # mark where the execution stream stands so the transceiver's copies
+        # into them wait for exactly that and nothing later.
+        self._mark_kv_pages_ready(requests, None)
+
     @nvtx_range("_prepare_disagg_gen_transmission_complete")
     def _prepare_disagg_gen_transmission_complete(self, scheduled_batch):
         cache_trans_complete_requests = self.disagg.completed_gen_receives(
@@ -7952,10 +7965,43 @@ class PyExecutor:
             return False
         return getattr(disagg_params, 'first_gen_logits', None) is not None
 
+    def _kv_pages_ready_event(self) -> Optional[torch.cuda.Event]:
+        """Mark where the execution stream stands, for the KV transceiver.
+
+        Taken once an iteration's work is enqueued, the event completes when
+        that iteration's pages hold their final content (context side) or
+        when the pages a finished request vacated are no longer touched
+        (generation side). The bounce transport's copy streams wait on it
+        instead of synchronising with the legacy default stream, which
+        ordered every copy behind whatever iteration was in flight when the
+        copy was issued (one context iteration of latency per transfer).
+        """
+        if self.kv_cache_transceiver is None:
+            return None
+        event = torch.cuda.Event()
+        event.record(self.execution_stream)
+        return event
+
+    def _mark_kv_pages_ready(self, requests: Iterable[LlmRequest],
+                             event: Optional[torch.cuda.Event]) -> None:
+        """Attach ``event`` (or a fresh mark when None) to the requests about
+        to be handed to the KV transceiver (``py_kv_pages_ready_event``)."""
+        if self.kv_cache_transceiver is None:
+            return
+        for req in requests:
+            if event is None:
+                event = self._kv_pages_ready_event()
+            req.py_kv_pages_ready_event = event
+
     @nvtx_range("_send_kv_async")
-    def _send_kv_async(self, scheduled_requests: List[LlmRequest]):
+    def _send_kv_async(self,
+                       scheduled_requests: List[LlmRequest],
+                       pages_ready_event: Optional[torch.cuda.Event] = None):
         # Order matters: reaping before the connector registers its transfer
         # can release a request the connector still needs.
+        self._mark_kv_pages_ready(
+            (req for req in scheduled_requests if req.is_context_only_request),
+            pages_ready_event)
         self.disagg.send_completed_context(scheduled_requests)
         self._save_kv_to_connector_async(scheduled_requests)
         self.disagg.reap_context_sends(0)

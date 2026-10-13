@@ -119,15 +119,18 @@ _meta_lock = threading.Lock()
 _meta_buffers = {}  # each stream maps to its pinned host buffer, device buffer, and capacity
 
 
-def _get_meta_buffers(stream_handle: int, need: int, dev):
+def _get_meta_buffers(stream_handle: int, need: int, dev, alloc_stream):
     """Return the pinned host and device buffers for the stream, large enough for the request,
-    growing them under a lock."""
+    growing them under a lock. The device buffer is allocated on the copy stream itself: the
+    caching allocator only hands a stream blocks that stream's own earlier work has released, so
+    a non-blocking copy stream never inherits memory another stream is still using."""
     with _meta_lock:
         ent = _meta_buffers.get(stream_handle)
         if ent is None or ent[2] < need:
             new_cap = max(need, (ent[2] * 2 if ent else 0), 4096)
             pinned = torch.empty(new_cap, dtype=torch.int64, pin_memory=prefer_pinned())
-            devt = torch.empty(new_cap, dtype=torch.int64, device=dev)
+            with torch.cuda.stream(alloc_stream):
+                devt = torch.empty(new_cap, dtype=torch.int64, device=dev)
             ent = (pinned, devt, new_cap)
             _meta_buffers[stream_handle] = ent
         return ent[0], ent[1]
@@ -153,7 +156,8 @@ def _launch_batched_copy(
     # pack all three address arrays into one pinned buffer and one async copy, so the kernel is
     # ordered after it
     stream_handle = int(stream)
-    pinned, devt = _get_meta_buffers(stream_handle, 3 * n, dev)
+    ext_stream = torch.cuda.ExternalStream(stream_handle)
+    pinned, devt = _get_meta_buffers(stream_handle, 3 * n, dev, ext_stream)
     host = pinned.numpy()
     host[:n] = dst_addrs
     host[n : 2 * n] = src_addrs
@@ -164,7 +168,6 @@ def _launch_batched_copy(
 
     # buffer reuse is safe: every caller syncs the stream between calls, so the previous copy and
     # kernel finish before the refill
-    ext_stream = torch.cuda.ExternalStream(stream_handle)
     with torch.cuda.stream(ext_stream):
         devt[: 3 * n].copy_(pinned[: 3 * n], non_blocking=True)
         _batched_copy_kernel[grid](

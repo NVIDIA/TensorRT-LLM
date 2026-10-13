@@ -1173,6 +1173,11 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         # KV cache manager v2: the event after which the copies that resuming a reused prefix
         # made into this request's fresh pages are complete (see prepare_context_cache).
         self.py_kv_reuse_copy_event = None
+        # Disaggregation: the executor's mark on its execution stream, taken when this request is
+        # handed to the KV transceiver, after which its pages hold their final content (context
+        # side) or are no longer touched by an in-flight iteration (generation side). The bounce
+        # transport orders its device copies after it (see Chunk.pages_ready_event).
+        self.py_kv_pages_ready_event = None
         self._cached_tokens = 0
         self._cached_tokens_set = False
 

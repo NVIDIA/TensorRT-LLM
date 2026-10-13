@@ -19,6 +19,7 @@ no-op fallback, and the TP fan-in reserve/record/settle logic (GPU allocators/st
 """
 
 import queue
+import threading
 from types import SimpleNamespace
 
 import numpy as np
@@ -1188,3 +1189,183 @@ class TestQuarantine:
         a.quarantine(s, grace_s=float("inf"))  # close-only reclaim
         assert a.reclaim_expired() == 0
         assert a.quarantined_bytes == 512
+
+
+# ---------------------------------------------------------------------------
+# Copy-stream ordering: non-blocking streams + the executor's pages_ready_event
+# ---------------------------------------------------------------------------
+
+
+def _cuassert(x):
+    """Like the real CUASSERT: drop the leading error code of a cudart result tuple."""
+    return x[1:] if isinstance(x, tuple) else x
+
+
+@pytest.mark.skipif(not _HAVE_TRANSPORT, reason="bounce.transport import needs CUDA bindings")
+class TestCopyStreamOrdering:
+    """Non-blocking copy streams, ordered by the piece's ``pages_ready_event``.
+
+    The streams no longer synchronise with the legacy default stream (which ordered every copy
+    behind the iteration in flight); the ordering a copy needs comes from the event the executor
+    attached to the piece (Chunk on the sender, TransferContext on the receiver).
+    """
+
+    def test_streams_are_created_non_blocking(self, monkeypatch):
+        flags = []
+        monkeypatch.setattr(btr, "CUASSERT", _cuassert)
+        monkeypatch.setattr(
+            btr.cudart, "cudaStreamCreateWithFlags", lambda f: (flags.append(f), 0, 42)[1:]
+        )
+        assert btr.VmmBounceTransport._new_stream(SimpleNamespace()) == 42
+        assert flags == [btr.cudart.cudaStreamNonBlocking]
+
+    def test_event_handle_accepts_torch_events_and_raw_handles(self):
+        assert btr._event_handle(None) is None
+        assert btr._event_handle(SimpleNamespace(cuda_event=0)) is None  # never recorded
+        assert btr._event_handle(SimpleNamespace(cuda_event=0x1234)) == 0x1234
+        assert btr._event_handle(0x1234) == 0x1234
+
+    def test_pages_ready_event_is_read_from_the_tasks_chunk(self):
+        ev = object()
+        wm = SimpleNamespace(task=SimpleNamespace(_chunk=SimpleNamespace(pages_ready_event=ev)))
+        assert btr._pages_ready_event(wm) is ev
+        assert btr._pages_ready_event(SimpleNamespace(task=SimpleNamespace())) is None  # aux
+        assert btr._pages_ready_event(SimpleNamespace()) is None
+
+    @staticmethod
+    def _patch_cuda(monkeypatch, log):
+        monkeypatch.setattr(btr, "CUASSERT", _cuassert)
+        monkeypatch.setattr(btr.cudart, "cudaEvent_t", lambda h: ("event", h))
+        monkeypatch.setattr(
+            btr.cudart, "cudaStreamWaitEvent", lambda s, e, f: log.append(("wait", s, e, f))
+        )
+        monkeypatch.setattr(btr.cudart, "cudaEventCreate", lambda: (0, "ev"))
+        monkeypatch.setattr(btr.cudart, "cudaEventRecord", lambda e, s: log.append(("record", s)))
+        monkeypatch.setattr(btr.cudart, "cudaEventSynchronize", lambda e: log.append(("sync", e)))
+        monkeypatch.setattr(btr.cudart, "cudaEventDestroy", lambda e: 0)
+        monkeypatch.setattr(
+            btr.cudart, "cudaStreamSynchronize", lambda s: log.append(("stream_sync", s))
+        )
+        monkeypatch.setattr(btr.cudart, "cudaSetDevice", lambda d: 0)
+
+    @staticmethod
+    def _write_meta(n, event=None, with_task=False):
+        wm = SimpleNamespace(
+            src_ptrs=np.arange(1, n + 1, dtype=np.int64),
+            dst_ptrs=np.arange(101, 101 + n, dtype=np.int64),
+            sizes=np.full(n, 16, dtype=np.int64),
+        )
+        if with_task:
+            wm.task = SimpleNamespace(_chunk=SimpleNamespace(pages_ready_event=event))
+        return wm
+
+    def test_gather_waits_on_the_event_before_copying(self, monkeypatch):
+        log = []
+        self._patch_cuda(monkeypatch, log)
+        monkeypatch.setattr(
+            btr, "gather_contiguous", lambda *a, **k: log.append(("gather", k["stream"]))
+        )
+        t = _make_transport(monkeypatch, block_bytes_per_group=[100])
+        t._send_stream = 7
+        t._gather_blocking(0x100, self._write_meta(2), 32, SimpleNamespace(cuda_event=0x55))
+        assert log[:2] == [("wait", 7, ("event", 0x55), 0), ("gather", 7)]
+        assert ("sync", "ev") in log  # still host-synchronised before the write is issued
+
+    def test_gather_without_an_event_does_not_wait(self, monkeypatch):
+        log = []
+        self._patch_cuda(monkeypatch, log)
+        monkeypatch.setattr(
+            btr, "gather_contiguous", lambda *a, **k: log.append(("gather", k["stream"]))
+        )
+        t = _make_transport(monkeypatch, block_bytes_per_group=[100])
+        t._send_stream = 7
+        t._gather_blocking(0x100, self._write_meta(1), 16, None)
+        assert [e for e in log if e[0] == "wait"] == []
+        assert log[0] == ("gather", 7)
+
+    def test_build_request_passes_the_chunks_event_to_the_gather(self, monkeypatch):
+        log = []
+        self._patch_cuda(monkeypatch, log)
+        monkeypatch.setattr(
+            btr, "gather_contiguous", lambda *a, **k: log.append(("gather", k["stream"]))
+        )
+        t = _make_transport(monkeypatch, block_bytes_per_group=[100])
+        t._send_stream = 7
+        monkeypatch.setattr(t, "_make_write", lambda src, wm, total: ("write", src, total))
+        ev = SimpleNamespace(cuda_event=0x66)
+        req, slot = t.build_request(self._write_meta(2, event=ev, with_task=True))
+        assert req == ("write", t._send_alloc.base, 32) and slot == 0
+        assert log[:2] == [("wait", 7, ("event", 0x66), 0), ("gather", 7)]
+
+    def test_failed_gather_drains_the_stream_before_releasing_the_slot(self, monkeypatch):
+        log = []
+        self._patch_cuda(monkeypatch, log)
+
+        def boom(*a, **k):
+            raise RuntimeError("launch failed")
+
+        monkeypatch.setattr(btr, "gather_contiguous", boom)
+        t = _make_transport(monkeypatch, block_bytes_per_group=[100])
+        t._send_stream = 7
+        t._send_alloc.release = lambda sid: log.append(("release", sid))
+        with pytest.raises(RuntimeError, match="launch failed"):
+            t._reserve_and_gather(self._write_meta(1, with_task=True), timeout=0)
+        assert log[-2:] == [("stream_sync", 7), ("release", 0)]
+
+    def test_reserve_stores_the_event_and_the_scatter_waits_on_it(self, monkeypatch):
+        log = []
+        self._patch_cuda(monkeypatch, log)
+        monkeypatch.setattr(
+            btr, "scatter_contiguous", lambda *a, **k: log.append(("scatter", k["stream"]))
+        )
+        t = _make_transport(monkeypatch, block_bytes_per_group=[100])
+        req = SimpleNamespace(
+            block_ids_per_layer_groups=[np.arange(4, dtype=np.int64)],
+            unique_rid=9,
+            slice_id=0,
+            bounce_dst_base=None,
+        )
+        ev = SimpleNamespace(cuda_event=0x77)
+        assert t.reserve(req, 1, pages_ready_event=ev)
+        ctx = t._reserved_map[(9, 0)]
+        assert ctx.pages_ready_event is ev
+        # Run one item through the worker loop (the fixture replaced the thread with a bare queue).
+        t._scatter_stream = 11
+        t._stop = threading.Event()
+        descs = [(0x200, np.array([5], dtype=np.int64), np.array([16], dtype=np.int64))]
+        t._scatter_q.put((ctx, descs))
+        t._scatter_q.put(None)  # poison pill: exit after the item
+        monkeypatch.setattr(t, "_apply", lambda rid_slice, mut: log.append(("apply", rid_slice)))
+        t._scatter_loop()
+        assert log[:3] == [("wait", 11, ("event", 0x77), 0), ("scatter", 11), ("stream_sync", 11)]
+        assert log[3] == ("apply", (9, 0))
+
+    def test_reserve_without_an_event_leaves_the_context_unordered(self, monkeypatch):
+        t = _make_transport(monkeypatch, block_bytes_per_group=[100])
+        req = SimpleNamespace(
+            block_ids_per_layer_groups=[np.arange(4, dtype=np.int64)],
+            unique_rid=9,
+            slice_id=0,
+            bounce_dst_base=None,
+        )
+        assert t.reserve(req, 1)
+        assert t._reserved_map[(9, 0)].pages_ready_event is None
+
+    @pytest.mark.skipif(
+        not (_HAVE_TRANSPORT and __import__("torch").cuda.is_available()), reason="needs a GPU"
+    )
+    def test_real_stream_waits_on_a_torch_event(self):
+        """The real bindings: a non-blocking stream can wait on a torch event's raw handle."""
+        import torch
+
+        stream = btr.VmmBounceTransport._new_stream(SimpleNamespace())
+        try:
+            flags = btr.CUASSERT(btr.cudart.cudaStreamGetFlags(stream))[0]
+            assert flags & btr.cudart.cudaStreamNonBlocking
+            event = torch.cuda.Event()
+            event.record(torch.cuda.current_stream())
+            btr._stream_wait_event(stream, event)
+            btr._stream_wait_event(stream, torch.cuda.Event())  # unrecorded: no-op
+            btr.CUASSERT(btr.cudart.cudaStreamSynchronize(stream))
+        finally:
+            btr.CUASSERT(btr.cudart.cudaStreamDestroy(stream))

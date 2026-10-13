@@ -2877,7 +2877,10 @@ class Receiver(ReceiverBase):
                     dst_slot=mamba_dst_slot,
                 ) * self._get_mamba_slot_count(receiver_req)
         bounced = allow_bounce and self._bounce.reserve(
-            receiver_req, task.expected_transfers, extra_bytes=extra_bytes
+            receiver_req,
+            task.expected_transfers,
+            extra_bytes=extra_bytes,
+            pages_ready_event=getattr(task._chunk, "pages_ready_event", None),
         )
         session = self._get_session(task._unique_rid)
         if session is None:

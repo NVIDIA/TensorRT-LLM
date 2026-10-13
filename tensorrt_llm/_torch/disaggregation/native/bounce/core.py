@@ -70,6 +70,10 @@ class TransferContext:
     per_writer_bytes: int
     num_writers: int
     on_done: Optional[Callable[[bool], None]] = None
+    # The executor's mark on its execution stream for the iteration that last touched these
+    # destination pages before they were handed to this request; the scatter is ordered after it
+    # (see ``Chunk.pages_ready_event``). None means no ordering is required.
+    pages_ready_event: Optional[object] = None
 
     # Whether each writer that reported succeeded, keyed by rank; presence means it reported.
     _writer_ok: Dict[int, bool] = field(default_factory=dict)
@@ -235,10 +239,13 @@ class BounceTransport(ABC):
         *,
         timeout: Optional[float] = None,
         extra_bytes: int = 0,
+        pages_ready_event=None,
     ) -> bool:
         """Reserve a region and record its address for the senders. False falls back to per-fragment.
         ``extra_bytes`` sizes the sender's non-paged payload (mamba/KDA recurrent state) that rides
-        the same coalesced write as the KV blocks."""
+        the same coalesced write as the KV blocks. ``pages_ready_event`` is the executor's mark after
+        which the destination pages may be written (the scatter waits on it); None when the pages
+        need no ordering."""
 
     @abstractmethod
     def writer_base(self, rid_slice, writer_index: int) -> Optional[int]:

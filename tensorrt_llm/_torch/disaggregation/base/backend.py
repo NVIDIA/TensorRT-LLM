@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import IntEnum
-from typing import List, Optional, Protocol, Union, runtime_checkable
+from typing import Any, List, Optional, Protocol, Union, runtime_checkable
 
 import numpy as np
 
@@ -95,6 +95,12 @@ class Chunk:
 
     Cannot be derived from ``token_range``: a windowed or recurrent-state group never fills the
     span, so comparing against the full length lies."""
+
+    pages_ready_event: Optional[Any] = None
+    """The executor's mark (a ``torch.cuda.Event`` recorded on its execution stream, or a raw
+    handle) after which this piece's pages hold their final content on the sender, or are no longer
+    touched by an in-flight iteration on the receiver. The transport's device copies are ordered
+    after it instead of after the legacy default stream. None when no ordering is needed."""
 
     def __post_init__(self):
         if len(self.kind_per_layer_group) != len(self.block_ids_per_layer_groups):
