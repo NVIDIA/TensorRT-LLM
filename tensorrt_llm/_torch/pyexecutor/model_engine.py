@@ -5164,9 +5164,8 @@ class PyTorchModelEngine(ModelEngine):
         # will contain previous batch indices of generation requests
         previous_batch_indices = []
         previous_pos_indices = []
-        # Save KDA sampler slots before the packing loops update py_batch_idx.
-        previous_slot_by_request: dict[int, int] | None = ({} if getattr(
-            kv_cache_manager, "use_kda_replay_update", False) else None)
+        # Save sampler slots before the packing loops update py_batch_idx.
+        previous_slot_by_request: dict[int, int] = {}
         runtime_tokens_per_gen_step = self.get_runtime_tokens_per_gen_step(
             runtime_draft_len)
         runtime_draft_token_buffer_width = runtime_tokens_per_gen_step - 1
@@ -5243,9 +5242,8 @@ class PyTorchModelEngine(ModelEngine):
             else:
                 # update batch index
                 previous_batch_idx = request.py_batch_idx
-                if previous_slot_by_request is not None:
-                    previous_slot_by_request[
-                        request.py_request_id] = previous_batch_idx
+                previous_slot_by_request[
+                    request.py_request_id] = previous_batch_idx
                 request.py_batch_idx = request.py_seq_slot
 
                 sequence_lengths.append(runtime_tokens_per_gen_step)
@@ -5408,8 +5406,7 @@ class PyTorchModelEngine(ModelEngine):
                     # the request has previous tensor
                     # previous_batch_indices is per-request, not per-beam
                     previous_batch_indices.append(request.py_batch_idx)
-                    if (previous_slot_by_request is not None
-                            and new_tokens_lens_device is not None):
+                    if new_tokens_lens_device is not None:
                         previous_slot_by_request[
                             request.py_request_id] = request.py_batch_idx
                     past_seen_token_num = request.max_beam_num_tokens
@@ -5812,7 +5809,7 @@ class PyTorchModelEngine(ModelEngine):
         # that the per-step prepare() can re-clamp from scratch.
         num_cached_tokens_snapshot = list(num_cached_tokens_per_seq)
         attn_metadata.prepare()
-        if previous_slot_by_request is not None:
+        if getattr(kv_cache_manager, "use_kda_replay_update", False):
             previous_slots, accepted_draft_tokens = self._prepare_prev_num_accepted_tokens(
                 attn_metadata=attn_metadata,
                 generation_requests=scheduled_requests.generation_requests,
