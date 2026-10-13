@@ -29,7 +29,7 @@ def _manager(
     manager.kv_compression_manages_history = kv_compression_manages_history
     manager._kv_reserve_draft_tokens = kv_reserve_draft_tokens
     manager._allocated_draft_lens = {}
-    manager._pending_overlap_slack = {}
+    manager._inflight_draft_lens = {}
     manager.kv_cache_map = {}
     return manager
 
@@ -236,8 +236,7 @@ def test_disagg_gen_transition_reserves_target_drafts_without_context_drafts():
     )
 
     assert manager._effective_draft_len(request) == 4
-    # 1 base token + 4 draft slots + 4 overlap-slack tokens.
-    assert manager._required_gen_capacity(request, 128) == 137
+    assert manager._required_gen_capacity(request, 128) == 133
 
 
 def test_disagg_gen_transition_does_not_reserve_disabled_speculation():
@@ -284,120 +283,172 @@ def _generation_manager(draft_len: int, capacity: int = 100) -> tuple[KVCacheMan
     return manager, cache
 
 
-def _generation_request(request_id: int, *, accepted: int, committed: int) -> SimpleNamespace:
+def _generation_request(request_id: int, *, committed: int) -> SimpleNamespace:
     return SimpleNamespace(
         py_request_id=request_id,
         py_beam_width=1,
         is_dummy_request=False,
         py_rewind_len=0,
-        py_num_accepted_draft_tokens=accepted,
+        py_num_accepted_draft_tokens=0,
         max_beam_num_tokens=committed,
         state=LlmRequestState.GENERATION_IN_PROGRESS,
     )
 
 
-def test_generation_allocation_grants_and_trims_overlap_slack() -> None:
-    manager, cache = _generation_manager(draft_len=3)
-    request = _generation_request(5, accepted=1, committed=90)
+def _finish_step(request: SimpleNamespace, *, draft_len: int, accepted: int) -> None:
+    """Record a verification step's outcome the way the sampler does."""
+    request.py_num_accepted_draft_tokens = accepted
+    request.py_rewind_len = draft_len - accepted
+    request.max_beam_num_tokens += 1 + accepted
+
+
+def _drive(widths: list[int], accepted: list[int], *, overlap: bool) -> None:
+    """Allocate and update in executor order and check every in-flight step.
+
+    ``tokens`` is the device-side token count (golden token included, so KV
+    exists for ``tokens - 1`` positions). A step with draft width ``d`` writes
+    KV for the golden token and ``d`` drafts, so it needs capacity
+    ``tokens + d`` from its launch until it is reconciled. Under the overlap
+    scheduler step N+1 is allocated and launched before step N's update, so
+    step N's rewind must leave step N+1's pages in place.
+    """
+    manager, cache = _generation_manager(draft_len=widths[0])
+    request = _generation_request(3, committed=cache.capacity + 1)
     manager.kv_cache_map[request.py_request_id] = cache
+    batch = SimpleNamespace(generation_requests=[request])
+    tokens = request.max_beam_num_tokens
 
-    assert manager.try_allocate_generation(request)
-    # 1 base token + 3 draft slots + 3 overlap-slack tokens.
-    assert cache.capacity == 107
-    assert manager._pending_overlap_slack == {5: 3}
-
-    manager.update_resources(SimpleNamespace(generation_requests=[request]))
-
-    # Keeps 1 base token + 1 accepted draft token; slack and rejected drafts go.
-    assert cache.capacity == 102
-    assert manager._pending_overlap_slack == {}
-
-
-def test_overlap_slack_does_not_compound_across_iterations() -> None:
-    manager, cache = _generation_manager(draft_len=3)
-    request = _generation_request(6, accepted=2, committed=10)
-    manager.kv_cache_map[request.py_request_id] = cache
-
-    for iteration in range(1, 5):
+    def allocate(step: int) -> None:
+        manager._effective_draft_len.return_value = widths[step]
         assert manager.try_allocate_generation(request)
-        manager.update_resources(SimpleNamespace(generation_requests=[request]))
-        # Net growth per iteration is 1 base token + 2 accepted draft tokens.
-        assert cache.capacity == 100 + 3 * iteration
-    assert manager._pending_overlap_slack == {}
+
+    if overlap:
+        allocate(0)
+    for step, (width, step_accepted) in enumerate(zip(widths, accepted)):
+        if not overlap:
+            allocate(step)
+        assert cache.capacity >= tokens + width, f"step {step} launched short"
+        tokens += 1 + step_accepted
+        has_next = overlap and step + 1 < len(widths)
+        if has_next:
+            # The scheduler allocates step N+1 before step N's update runs.
+            allocate(step + 1)
+            assert cache.capacity >= tokens + widths[step + 1], f"step {step + 1} launched short"
+        _finish_step(request, draft_len=width, accepted=step_accepted)
+        manager.update_resources(batch)
+        if has_next:
+            assert cache.capacity >= tokens + widths[step + 1], (
+                f"step {step} update freed pages step {step + 1} is writing"
+            )
+        else:
+            assert cache.capacity == tokens - 1
+    # Every allocation was reconciled exactly once: nothing leaks.
+    assert cache.capacity == tokens - 1
+    assert manager._inflight_draft_lens == {}
 
 
-def test_revert_generation_allocation_returns_overlap_slack() -> None:
-    manager, cache = _generation_manager(draft_len=2)
-    request = _generation_request(7, accepted=0, committed=90)
-    manager.kv_cache_map[request.py_request_id] = cache
-
-    assert manager.try_allocate_generation(request)
-    assert cache.capacity == 105
-
-    manager.revert_allocate_generation(request)
-
-    assert cache.capacity == 100
-    assert manager._pending_overlap_slack == {}
+_WIDTH_SCHEDULES = {
+    "constant": [3, 3, 3, 3, 3, 3],
+    "growing": [1, 1, 3, 3, 3, 3],
+    "shrinking": [3, 3, 1, 1, 0, 0],
+    "mixed": [0, 3, 1, 3, 2, 3],
+}
 
 
-def test_overlap_slack_trim_never_drops_below_committed_history() -> None:
-    manager, cache = _generation_manager(draft_len=0)
-    request = _generation_request(8, accepted=0, committed=100)
-    manager.kv_cache_map[request.py_request_id] = cache
-    manager._pending_overlap_slack[request.py_request_id] = 5
+@pytest.mark.parametrize("overlap", [False, True])
+@pytest.mark.parametrize("schedule", list(_WIDTH_SCHEDULES))
+@pytest.mark.parametrize("acceptance", ["none", "all", "alternating"])
+def test_generation_rewind_uses_each_steps_own_draft_width(
+    overlap: bool, schedule: str, acceptance: str
+) -> None:
+    widths = _WIDTH_SCHEDULES[schedule]
+    accepted = {
+        "none": [0] * len(widths),
+        "all": list(widths),
+        "alternating": [width if step % 2 else 0 for step, width in enumerate(widths)],
+    }[acceptance]
+    _drive(widths, accepted, overlap=overlap)
 
-    manager.update_resources(SimpleNamespace(generation_requests=[request]))
 
-    assert cache.capacity == 99
-
-
-def test_cuda_graph_padding_extension_grows_draft_slots_and_slack() -> None:
+def test_overlap_update_reconciles_the_older_allocation() -> None:
     manager, cache = _generation_manager(draft_len=1)
-    request = _generation_request(9, accepted=0, committed=90)
+    request = _generation_request(4, committed=101)
     manager.kv_cache_map[request.py_request_id] = cache
 
     assert manager.try_allocate_generation(request)
-    # 1 base token + 1 draft slot + 1 overlap-slack token.
-    assert cache.capacity == 103
+    manager._effective_draft_len.return_value = 3
+    assert manager.try_allocate_generation(request)
+    # Step N: 1 base + 1 draft; step N+1: 1 base + 3 drafts.
+    assert cache.capacity == 106
+    assert manager._inflight_draft_lens == {4: [1, 3]}
 
-    # CUDA-graph padding restores the static draft length of 3.
+    # Step N accepted its draft: nothing of step N is rewound, and step N+1's
+    # four slots stay allocated.
+    _finish_step(request, draft_len=1, accepted=1)
+    manager.update_resources(SimpleNamespace(generation_requests=[request]))
+    assert cache.capacity == 106
+    assert manager._inflight_draft_lens == {4: [3]}
+
+    # Step N+1 accepted none of its three drafts.
+    _finish_step(request, draft_len=3, accepted=0)
+    manager.update_resources(SimpleNamespace(generation_requests=[request]))
+    assert cache.capacity == 103
+    assert manager._inflight_draft_lens == {}
+
+
+def test_overlap_revert_drops_only_the_newest_allocation() -> None:
+    manager, cache = _generation_manager(draft_len=2)
+    request = _generation_request(5, committed=101)
+    manager.kv_cache_map[request.py_request_id] = cache
+
+    assert manager.try_allocate_generation(request)
+    manager._effective_draft_len.return_value = 4
+    assert manager.try_allocate_generation(request)
+    assert cache.capacity == 108
+
+    # Step N+1 is skipped (can_queue=False) before step N's update.
+    manager.revert_allocate_generation(request)
+    assert cache.capacity == 103
+    assert manager._inflight_draft_lens == {5: [2]}
+
+    _finish_step(request, draft_len=2, accepted=0)
+    manager.update_resources(SimpleNamespace(generation_requests=[request]))
+    assert cache.capacity == 101
+    assert manager._inflight_draft_lens == {}
+
+
+def test_overlap_cuda_graph_padding_widens_only_the_newest_allocation() -> None:
+    manager, cache = _generation_manager(draft_len=1)
+    request = _generation_request(6, committed=101)
+    manager.kv_cache_map[request.py_request_id] = cache
+
+    assert manager.try_allocate_generation(request)
+    assert manager.try_allocate_generation(request)
+    assert cache.capacity == 104
+
+    # CUDA-graph padding restores step N+1's draft length to the static 3.
     request.py_draft_tokens = [0, 0, 0]
     manager.extend_capacity_for_tokens(request)
+    assert cache.capacity == 106
+    assert manager._inflight_draft_lens == {6: [1, 3]}
 
-    # Draft slots and overlap slack both grow by the 2-token padding delta.
-    assert cache.capacity == 107
-    assert manager._allocated_draft_lens == {9: 3}
-    assert manager._pending_overlap_slack == {9: 3}
+    # Step N rejected its draft: rewind its one slot, keep step N+1's four.
+    _finish_step(request, draft_len=1, accepted=0)
+    manager.update_resources(SimpleNamespace(generation_requests=[request]))
+    assert cache.capacity == 105
+    assert manager._inflight_draft_lens == {6: [3]}
 
+
+def test_update_of_a_suspended_cache_still_consumes_its_allocation() -> None:
+    manager, cache = _generation_manager(draft_len=2)
+    request = _generation_request(7, committed=101)
+    manager.kv_cache_map[request.py_request_id] = cache
+
+    assert manager.try_allocate_generation(request)
+    # The next iteration's scheduler suspended the cache before this update.
+    cache.is_active = False
+    _finish_step(request, draft_len=2, accepted=1)
     manager.update_resources(SimpleNamespace(generation_requests=[request]))
 
-    # Only the base token remains: no padded draft slot or slack leaks.
-    assert cache.capacity == 101
-    assert manager._pending_overlap_slack == {}
-
-
-def test_generation_headroom_covers_overlap_slack_in_swa_retention() -> None:
-    # One-model MTP with 12 drafts: 11 extra KV tokens, 13 tokens per step.
-    spec_config = SimpleNamespace(
-        max_total_draft_tokens=12,
-        max_draft_len=12,
-        tokens_per_gen_step=13,
-        spec_dec_mode=SimpleNamespace(use_one_engine=lambda: True),
-    )
-
-    reserve, headroom = kv_cache_v2_module._get_generation_kv_capacity(spec_config, is_draft=False)
-
-    assert reserve == 12
-    # 11 extra + 13 per step + 12 overlap slack.
-    assert headroom == 36
-    _, swa_tokens_per_request = kv_cache_v2_module._estimate_swa_cache_size(
-        [1],
-        [128],
-        32,
-        context=False,
-        scratch=False,
-        generation_capacity_headroom=headroom,
-    )
-    # A 128-token window plus the slack-inclusive lead spans 7 pages of 32;
-    # without the slack the estimate would retain only 6.
-    assert swa_tokens_per_request == 7 * 32
+    assert cache.capacity == 103
+    assert manager._inflight_draft_lens == {}
