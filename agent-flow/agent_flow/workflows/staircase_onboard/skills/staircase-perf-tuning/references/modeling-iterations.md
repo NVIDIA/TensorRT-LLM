@@ -12,7 +12,11 @@ Read `tensorrt_llm/_torch/_experimental/modeling_v2/README.md` and `catalog/_op.
   `reference`, `is_valid`, `CELLS`, `ARCHS`, `note`, and a module-level instance. The tolerance band
   lives in the entry's GPU test.
 - Ops one target calls live in that target's `ops/<category>/`; ops two targets call live in
-  `catalog/<category>/`. Promote only when a second caller exists.
+  `catalog/<category>/`. Promote only when a second caller exists -- except a thin entry over an
+  installed FlashInfer API (tier 3): it goes straight to `catalog/<category>/`, shape-generic (shapes
+  come from the cells), so the next target reaches it with one import (e.g.
+  `catalog/ssm/gated_delta_rule_decode_pretranspose.py`, `catalog/gemm/low_m_bf16_mm.py`). No version
+  pin in the entry; the version raced against lives in `kernel_choices.json`.
 - The forward passes every argument at the call site (per-layer weights as rows of the target's
   `_LayerWeights`). `PrefillTarget` handles any batch with context rows; `DecodeTarget` is
   generation-only and never reads `num_contexts`/`num_ctx_tokens`.

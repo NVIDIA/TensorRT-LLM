@@ -138,7 +138,7 @@ decision file.
 | the profile | nsys per step class, ranked by exclusive time a change can remove; refreshed on the moved best tree when the roadmap is spent | roadmap turns -> `roadmap*.yaml` |
 | fusion (memory round trips) | a producer/consumer pair that writes and re-reads an activation: fold it into one kernel or a GEMM epilogue ([references/modeling-iterations.md](references/modeling-iterations.md) "Fusion patterns") | tuner turns |
 | ordering and overlap | independent work on a side stream; PDL between dependent small kernels; hoist per-step invariants (same reference, "Ordering") | tuner turns |
-| FlashInfer as installed | the preflight's `surface.md` "FlashInfer API" lists the installed version's callables the engine does not call -- a tier-3 entry (`from flashinfer import ...`), raced against the alternatives | request "Sources to check", `kernel_choices.json` |
+| FlashInfer as installed | the preflight's `surface.md` "FlashInfer API" lists the installed version's callables the engine does not call -- a tier-3 entry (`from flashinfer import ...`) in the shared `catalog/<category>/`, raced against the alternatives | request "Sources to check", `kernel_choices.json`, `modeling_v2/catalog/` |
 | prior art | this repository's perf commits on similar modules (`git log -i --grep=perf -- <module>`), and the sister engines' strategies (vLLM, SGLang paths in the request) -- strategies only, never the embargoed in-tree implementation of this model | request "Sources to check", `perf.sister_engines` |
 | earlier campaigns | `kernel_choices.json` records the chosen kernel *and* the losing alternatives with timings: a new workload re-reads it before racing again | `<workdir>/08-kernel-sources/kernel_choices.json` |
 
