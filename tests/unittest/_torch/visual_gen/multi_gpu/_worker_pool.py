@@ -52,10 +52,12 @@ Ranks are seeded to ``_RNG_SEED`` before their first task. After a passing test
 body each rank restores ``os.environ`` to its post-spawn contents, re-seeds
 ``random``/``numpy``/``torch``/CUDA, clears the logger's log-once memory and
 Dynamo caches, resets the visual_gen mesh singletons, destroys every process
-group except the world group, clears torch's current-mesh context stack,
-empties the CUDA allocator cache, and runs a barrier so a collective leaked by
-one test surfaces in that test's deadline rather than in the next test. Not
-covered:
+group except the world group, clears torch's current-mesh context stack and
+empties the CUDA allocator cache. Ranks do not wait for each other in the
+reset: a test may let some ranks return early while others keep computing, and
+the parent's wait for every rank's report is the fence (a rank stuck in a
+collective a test leaked never reports, and that test fails at its deadline).
+Not covered:
 torch's default dtype, grad mode and backend flags, and any other module
 global a test mutates. A test that changes such state runs with
 ``reuse=False``.
@@ -228,7 +230,6 @@ def _destroy_extra_process_groups() -> None:
 
 def _reset_rank_state(env_snapshot: dict[str, str]) -> None:
     import torch
-    import torch.distributed as dist
 
     os.environ.clear()
     os.environ.update(env_snapshot)
@@ -255,9 +256,9 @@ def _reset_rank_state(env_snapshot: dict[str, str]) -> None:
     _destroy_extra_process_groups()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-    # Fence: a collective leaked by the test blocks here, where the parent's
-    # deadline turns it into a failure of the right test.
-    dist.barrier()
+    # No barrier here: ranks may finish a test at different times (a test can
+    # let non-VAE ranks return while rank 0 runs a single-GPU reference), and
+    # the parent's wait for every rank's report is the fence already.
 
 
 def _rank_main(
