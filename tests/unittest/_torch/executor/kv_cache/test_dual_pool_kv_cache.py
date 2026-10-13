@@ -15,9 +15,8 @@
 """Tests for dual-pool KV cache construction (enc-dec Steps 4 and 5).
 
 Validates budget splitting, ResourceManagerType.CROSS_KV_CACHE_MANAGER
-registration, and the cross pool wiring for both the V1 ``KVCacheManager``
-(default and production target) and the V2 ``KVCacheManagerV2``
-(additive secondary path) scheduler integrations.
+registration, and the cross pool wiring for the default V2 ``KVCacheManagerV2``
+and the V1 ``KVCacheManager`` compatibility path.
 """
 
 from types import SimpleNamespace
@@ -51,29 +50,6 @@ pytestmark = pytest.mark.cpu_only
 
 class _FakeCudaStream:
     cuda_stream = 0
-
-
-class _FakeKVCacheManagerCpp:
-    def __init__(self, **kwargs):
-        self.kwargs = kwargs
-        self.num_pools = 1
-        self.max_blocks_per_seq = 1
-        self.max_num_blocks = 1
-
-    def allocate_pools(self, _use_uvm):
-        pass
-
-    def get_block_pool_pointers(self):
-        return torch.empty(0, dtype=torch.int64)
-
-    def get_block_scale_pool_pointers(self):
-        return torch.empty(0, dtype=torch.int64)
-
-    def get_layer_to_pool_mapping(self):
-        return torch.empty(0, dtype=torch.int32)
-
-    def release_pools(self):
-        pass
 
 
 _DUMMY_MODEL = "/tmp/dummy_model_dual_pool_test"
@@ -401,8 +377,7 @@ class TestCrossKvCacheConstruction:
 
         kwargs = create_mock.call_args.kwargs
         # Cross pool must use the same manager class as the self pool so
-        # both pools share the same runtime ABI.  V1 is the default and
-        # production target; V2 is an additive secondary path.
+        # both pools share the same runtime ABI.
         assert kwargs["kv_cache_manager_cls"] is expected_cls
         assert kwargs["num_layers"] == 10
         assert kwargs["num_kv_heads"] == 12
@@ -425,7 +400,8 @@ class TestCrossKvCacheConstruction:
             cross_kv_cache_fraction=0.5,
             max_gpu_total_bytes=8 * (1 << 30),
             max_tokens=2048,
-            use_kv_cache_manager_v2=False,
+            use_kv_cache_manager_v2=True,
+            host_cache_size=0,
         )
         model_config = _make_model_config(
             is_encoder_decoder=True,
@@ -439,26 +415,32 @@ class TestCrossKvCacheConstruction:
         creator = _make_creator(
             config,
             model_config=model_config,
-            manager_cls=KVCacheManager,
             mapping=mapping,
         )
         creator._skip_est = False
+        creator._execution_stream = _FakeCudaStream()
+        creator._model_engine.is_multimodal = False
+        creator._model_engine._max_cuda_graph_batch_size = None
 
-        import tensorrt_llm
+        distributed = Mock()
+        distributed.allreduce.side_effect = lambda value, op: value
+        impl = Mock(
+            layer_grouping=[list(range(num_decoder_layers))],
+            pool_group_descs=[],
+            all_buffer_ids=[],
+        )
+        impl.get_layer_group_id.return_value = 0
+        impl.clamp_max_seq_len_for_mem.side_effect = lambda batch_size, length: length
 
+        # Keep V2 geometry and buffer sizing real; stub distributed collectives
+        # and device allocation so this remains a CPU-only construction test.
+        module = "tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2"
         with (
-            patch(
-                "tensorrt_llm._torch.pyexecutor.resource_manager.KVCacheManagerCpp",
-                _FakeKVCacheManagerCpp,
-            ),
-            patch(
-                "tensorrt_llm._torch.pyexecutor.resource_manager.torch.cuda.Stream",
-                return_value=_FakeCudaStream(),
-            ),
-            patch(
-                "tensorrt_llm._torch.pyexecutor.resource_manager.prefer_pinned",
-                return_value=False,
-            ),
+            patch(f"{module}.Distributed.get", return_value=distributed),
+            patch(f"{module}.KVCacheManagerPy", return_value=impl),
+            patch(f"{module}.IndexMapper"),
+            patch.object(KVCacheManagerV2, "_prepare_page_table_tensor"),
+            patch.object(KVCacheManagerV2, "_log_kv_cache_pool_lifecycle_mapping"),
         ):
             cross_kv_cache_manager = creator._create_cross_kv_cache_manager(
                 config.model_copy(),
@@ -466,6 +448,7 @@ class TestCrossKvCacheConstruction:
             )
 
         try:
+            assert isinstance(cross_kv_cache_manager, KVCacheManagerV2)
             assert cross_kv_cache_manager.mapping is mapping
             assert cross_kv_cache_manager.kv_cache_type == (
                 tensorrt_llm.bindings.internal.batch_manager.CacheType.CROSS
@@ -480,15 +463,22 @@ class TestCrossKvCacheConstruction:
                 == [local_kv_heads] * num_decoder_layers
             )
             assert cross_kv_cache_manager.head_dim == head_dim
+            layers = cross_kv_cache_manager.kv_cache_manager_py_config.layers
+            assert len(layers) == num_decoder_layers
+            bytes_per_buffer = local_kv_heads * head_dim * creator._tokens_per_block * 2
+            for layer in layers:
+                assert len(layer.buffers) == 2
+                assert all(buffer.size == bytes_per_buffer for buffer in layer.buffers)
         finally:
             cross_kv_cache_manager.shutdown()
 
-        size_per_token = creator._get_cross_kv_size_per_token()
+        size_per_token, fixed_size = creator._get_cross_kv_size_per_token()
         kv_factor = 2  # key and value caches
         bytes_per_element = 2  # bfloat16
         assert size_per_token == (
             num_decoder_layers * kv_factor * local_kv_heads * head_dim * bytes_per_element
         )
+        assert fixed_size == 0
 
     def test_cross_layout_uses_max_input_len_for_encoder_capacity(self):
         config = _make_kv_cache_config(
