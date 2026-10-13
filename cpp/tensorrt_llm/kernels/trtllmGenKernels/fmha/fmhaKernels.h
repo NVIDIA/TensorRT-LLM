@@ -287,11 +287,6 @@ public:
         {
             return std::make_pair(false, "VariableWindow requires both start and end bound arrays");
         }
-        if (isVariableWindowMask(params.mMaskType) != hasVariableWindowStarts)
-        {
-            return std::make_pair(false, "VariableWindow mask type and bound arrays must be provided together");
-        }
-
         // Some conditions to check if the kernel is supported.
         // This is meant to avoid occupying unnecessary hashId bits.
         if (params.mHeadDimQk % 8 != 0 || params.mHeadDimV % 8 != 0)

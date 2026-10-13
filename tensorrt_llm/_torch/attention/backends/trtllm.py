@@ -2177,19 +2177,25 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         self,
         *,
         dtype: torch.dtype,
-        tokens_per_block: Optional[int],
-        use_paged_context_fmha: bool,
+        output_dtype: torch.dtype,
+        metadata: TrtllmAttentionMetadata,
     ) -> bool:
         if get_sm_version() not in _VARIABLE_WINDOW_SUPPORTED_SMS:
             return False
         return torch.ops.trtllm.attention_supports_variable_window(
             dtype,
+            output_dtype,
             self.num_heads,
             self.num_kv_heads,
             self.head_dim,
-            tokens_per_block,
+            metadata.tokens_per_block,
             self.quant_mode,
-            use_paged_context_fmha,
+            metadata.max_num_requests,
+            metadata.max_context_length,
+            metadata.max_seq_len,
+            self.attention_chunk_size,
+            metadata.kv_cache_manager is not None,
+            metadata.use_paged_context_fmha,
         )
 
     def create_output(self, q, *, is_quantize_output: bool,
