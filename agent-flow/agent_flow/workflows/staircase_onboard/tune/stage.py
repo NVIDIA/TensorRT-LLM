@@ -93,18 +93,20 @@ class TuneSpec:
         session_spools = [s.get("spool") for s in env.get("sessions") or [] if s.get("spool")]
         spools = [str(s) for s in perf.get("spools") or session_spools]
         return cls(
-            workdir=workspace / "tune",
-            repo=Path(task.get("trtllm_repo_path") or "."),
+            # Absolute: every path in a job script is read on a compute node from
+            # the job's own cwd (the tree measured), not from where the CLI ran.
+            workdir=Path(workspace).resolve() / "tune",
+            repo=Path(task.get("trtllm_repo_path") or ".").resolve(),
             model=str(perf.get("model") or task.get("checkpoint_path")),
             target=str(perf.get("target") or target),
-            identity_configs=[Path(p) for p in perf.get("identity_configs") or []],
+            identity_configs=[Path(p).resolve() for p in perf.get("identity_configs") or []],
             isl=int(workload.get("isl", 1024)),
             osl=int(workload.get("osl", 1024)),
             concurrency=[int(c) for c in workload.get("concurrency", [1, 128])],
             reference=str(perf.get("reference", "stock")),
-            spools=spools,
-            dev_spools=[str(s) for s in perf.get("dev_spools") or spools],
-            env_script=Path(perf.get("env_script") or workspace / "tune" / "env.sh"),
+            spools=[str(Path(s).resolve()) for s in spools],
+            dev_spools=[str(Path(s).resolve()) for s in perf.get("dev_spools") or spools],
+            env_script=Path(perf.get("env_script") or Path(workspace) / "tune" / "env.sh").resolve(),
             noise_repeats=int(perf.get("noise_repeats", 2)),
             ladder=dict(perf.get("ladder") or {}),
             campaign=dict(perf.get("campaign") or {}),

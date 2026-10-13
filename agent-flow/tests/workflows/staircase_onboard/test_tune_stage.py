@@ -567,3 +567,15 @@ def test_a_measurement_lost_with_its_session_is_re_queued_not_reverted(tmp_path)
             break
     assert camp.state.candidates["fast-path"].status == "kept"
     assert any("re-queued" in m for m in msgs) and any("Disk quota exceeded" in m for m in msgs)
+
+
+def test_a_relative_workspace_becomes_absolute_paths_in_job_scripts(tmp_path, monkeypatch):
+    """Job scripts run on a compute node from the measured tree's cwd: a workspace given
+    relative to where the CLI ran must not leak relative paths into them."""
+    monkeypatch.chdir(tmp_path)
+    task = {"trtllm_repo_path": ".", "checkpoint_path": "/ckpt",
+            "perf": {"identity_configs": ["identity.yaml"], "spools": ["s1"], "env_script": "env.sh"}}
+    spec = TuneSpec.from_task(task, Path("ws"))
+    assert spec.workdir == tmp_path / "ws" / "tune" and spec.repo == tmp_path
+    assert spec.identity_configs == [tmp_path / "identity.yaml"] and spec.env_script == tmp_path / "env.sh"
+    assert spec.spools == [str(tmp_path / "s1")]
