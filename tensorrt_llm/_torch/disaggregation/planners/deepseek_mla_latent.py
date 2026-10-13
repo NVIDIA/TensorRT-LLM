@@ -17,8 +17,9 @@
 Under attention-DP every context rank has a generation twin with the same
 dp_rank. MLA keeps one latent-K region per layer in one physical pool, so a
 block's bytes for all local layers are one contiguous slot. The plan is then
-plain arithmetic: pair block ordinals both sides hold, address the slots, and
-copy. Blocks that are consecutive on both sides move as one fragment.
+plain arithmetic: pair the rows both sides hold by block ordinal and copy
+slot for slot. Rows that are consecutive in memory on both sides move as one
+fragment.
 
 The user selects this planner by name (see ``disaggregation.planners``);
 ``supports_deployment`` then checks that the plan holds for the deployment: a
@@ -36,12 +37,13 @@ recurrent state.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Optional, Sequence
 
 import numpy as np
 
-from tensorrt_llm._torch.disaggregation.base.backend import Chunk, RecvReqInfo
+from tensorrt_llm._torch.disaggregation.base.backend import RecvReqInfo, TokenRange
 from tensorrt_llm._torch.disaggregation.base.planner import (
+    LayerGroupRows,
     PeerIncompatibleError,
     PeerTargets,
     TransferPlan,
@@ -125,42 +127,44 @@ class DeepseekMlaLatentTransferPlanner(TransferPlanner):
         # destination means the fan-in split is trivially uniform.
         return PeerTargets(ranks=[peer_dp_rank], uniform_writers=True)
 
-    def plan(
+    def pair(
         self,
         self_ri: RankInfo,
         peer_ri: RankInfo,
-        chunk: Chunk,
-        req_info: RecvReqInfo,
+        self_rows: Sequence[LayerGroupRows],
+        peer_rows: Sequence[LayerGroupRows],
+        *,
+        token_range: TokenRange,
         prompt_len: int,
+        dst_start_token: Optional[int],
     ) -> TransferPlan:
-        del prompt_len  # cp == 1: a partial piece needs no projection
-        if (0, 0) in chunk.excluded_pool_views:  # the sole latent pool is layer group 0, view 0
+        del token_range, prompt_len  # cp == 1: a partial piece needs no projection
+        # The sole latent pool is layer group 0, view 0; the describer leaves it
+        # out of a piece that excludes it.
+        src = next((r for r in self_rows if (r.layer_group_index, r.view_index) == (0, 0)), None)
+        if src is None:
             return TransferPlan.empty()
+        dst = next(r for r in peer_rows if (r.layer_group_index, r.view_index) == (0, 0))
         tpb = self._page_table.tokens_per_block
-        dst_start_token = req_info.dst_start_token
         dst_start_block = dst_start_token // tpb if dst_start_token is not None else 0
-        src_ids, dst_ids = DefaultTransferPlanner._pair_ordinals(
-            np.asarray(chunk.block_ids_per_layer_groups[0], dtype=np.int64),
-            np.asarray(req_info.block_ids_per_layer_groups[0], dtype=np.int64),
-            dst_start_block=dst_start_block,
+        src_sel, dst_sel = DefaultTransferPlanner._pair_rows(
+            src, dst, dst_start_block=dst_start_block
         )
-        if src_ids.size == 0:
+        if src_sel.size == 0:
             return TransferPlan.empty()
 
-        src_pool, dst_pool = self._pool, _sole_pool(peer_ri.page_table, "peer")
-        slot = src_pool.slot_bytes
-        # Consecutive slots are consecutive bytes only when the stride is the slot.
-        mergeable = src_pool.slot_stride_bytes == slot and dst_pool.slot_stride_bytes == slot
-        if mergeable and src_ids.size > 1:
-            breaks = np.flatnonzero((np.diff(src_ids) != 1) | (np.diff(dst_ids) != 1)) + 1
+        src_ptrs, dst_ptrs, slot = src.addresses[src_sel], dst.addresses[dst_sel], src.row_bytes
+        # Consecutive rows are consecutive bytes only when they sit one slot apart on both sides.
+        if src_sel.size > 1:
+            breaks = np.flatnonzero((np.diff(src_ptrs) != slot) | (np.diff(dst_ptrs) != slot)) + 1
             starts = np.concatenate(([0], breaks))
-            lengths = np.diff(np.concatenate((starts, [src_ids.size])))
+            lengths = np.diff(np.concatenate((starts, [src_sel.size])))
         else:
-            starts = np.arange(src_ids.size)
-            lengths = np.ones(src_ids.size, dtype=np.int64)
+            starts = np.zeros(1, dtype=np.int64)
+            lengths = np.ones(1, dtype=np.int64)
         return TransferPlan(
-            src_ptrs=src_pool.base_address + src_ids[starts] * src_pool.slot_stride_bytes,
-            dst_ptrs=dst_pool.base_address + dst_ids[starts] * dst_pool.slot_stride_bytes,
+            src_ptrs=src_ptrs[starts],
+            dst_ptrs=dst_ptrs[starts],
             sizes=lengths.astype(np.int64) * slot,
         )
 

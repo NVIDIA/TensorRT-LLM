@@ -49,6 +49,8 @@ class RankInfo:
     # only the planner decodes planner_blob.
     planner_id: str = ""
     planner_blob: bytes = b""
+    # Which CacheDescriber class described this rank's rows; compared across peers too.
+    describer_id: str = ""
 
     attention: Optional[AttentionInfo] = None
     aux_meta: Optional[AuxBufferMeta] = None

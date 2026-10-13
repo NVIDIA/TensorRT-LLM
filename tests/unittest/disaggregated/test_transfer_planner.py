@@ -18,6 +18,8 @@ import numpy as np
 import pytest
 
 from tensorrt_llm._torch.disaggregation.base.planner import (
+    CacheDescriber,
+    LayerGroupRows,
     PeerIncompatibleError,
     PeerTargets,
     TransferPlan,
@@ -34,6 +36,8 @@ def test_transfer_plan_empty_is_three_int64_arrays():
 def test_transfer_planner_is_abstract():
     with pytest.raises(TypeError):
         TransferPlanner()  # type: ignore[abstract]
+    with pytest.raises(TypeError):
+        CacheDescriber()  # type: ignore[abstract]
 
 
 def test_peer_incompatible_error_is_value_error():
@@ -73,15 +77,42 @@ class _ToyPlanner(TransferPlanner):
     def targets(self, self_ri, peer_ri, peer_dp_rank):
         return PeerTargets(ranks=list(self._ranks), uniform_writers=True)
 
-    def plan(self, self_ri, peer_ri, chunk, req_info, prompt_len):
-        self.calls.append((chunk, req_info, prompt_len))
+    def pair(
+        self, self_ri, peer_ri, self_rows, peer_rows, *, token_range, prompt_len, dst_start_token
+    ):
+        self.calls.append((self_rows, peer_rows, token_range, prompt_len, dst_start_token))
         return self._plan
 
     def receiver_payload_bytes(self, self_ri, peer_ri, req_info):
         return 0
 
 
-def _sender_with(planner: TransferPlanner) -> Sender:
+class _ToyDescriber(CacheDescriber):
+    """One row per held slot at address == slot; records what the framework handed it."""
+
+    describer_id = "toy"
+
+    def __init__(self):
+        self.calls: list = []
+
+    def rows(self, page_table, slot_table_per_layer_group, excluded_views):
+        self.calls.append((page_table, slot_table_per_layer_group, excluded_views))
+        table = np.asarray(slot_table_per_layer_group[0], dtype=np.int64)
+        held = np.flatnonzero(table >= 0)
+        return [
+            LayerGroupRows(
+                layer_group_index=0,
+                view_index=0,
+                kind=CacheKind.PAGED,
+                block_ordinals=held,
+                addresses=table[held],
+                row_bytes=1,
+                span_blocks=int(table.size),
+            )
+        ]
+
+
+def _sender_with(planner: TransferPlanner, describer: CacheDescriber | None = None) -> Sender:
     peer_ri = SimpleNamespace(
         instance_name="gen",
         instance_rank=3,
@@ -89,15 +120,16 @@ def _sender_with(planner: TransferPlanner) -> Sender:
         device_id=1,
         cp_size=1,
         self_endpoint="tcp://gen:1",
-        page_table=None,
+        page_table="peer page table",
     )
     sender = Sender.__new__(Sender)
     sender._registrar = Mock()
     sender._registrar.self_rank_info = SimpleNamespace(
-        cp_size=1, instance_name="ctx", instance_rank=0
+        cp_size=1, instance_name="ctx", instance_rank=0, page_table="self page table"
     )
     sender._registrar.get_peer_rank_info.return_value = peer_ri
     sender._planner = planner
+    sender._describer = describer or _ToyDescriber()
     return sender
 
 
@@ -108,6 +140,7 @@ def _task_and_req():
             kind_per_layer_group=[CacheKind.PAGED],
             token_range=TokenRange(0, 64),
             is_last=True,
+            excluded_pool_views={(0, 1)},
         ),
         DisaggregatedParams(disagg_request_id=1),
         slice_id=0,
@@ -125,14 +158,15 @@ def _task_and_req():
     return task, req
 
 
-def test_build_kv_write_meta_uses_planner_plan():
+def test_build_kv_write_meta_describes_both_sides_then_pairs():
     plan = TransferPlan(
         src_ptrs=np.array([100, 200], dtype=np.int64),
         dst_ptrs=np.array([300, 400], dtype=np.int64),
         sizes=np.array([16, 16], dtype=np.int64),
     )
     planner = _ToyPlanner(plan, ranks=(3, 4))
-    sender = _sender_with(planner)
+    describer = _ToyDescriber()
+    sender = _sender_with(planner, describer)
     task, req = _task_and_req()
 
     wm = sender._build_kv_write_meta(task, req)
@@ -140,9 +174,16 @@ def test_build_kv_write_meta_uses_planner_plan():
     assert wm.src_ptrs is plan.src_ptrs and wm.dst_ptrs is plan.dst_ptrs and wm.sizes is plan.sizes
     assert wm.expected_transfers == 2 and task.expected_transfers == 2
     assert wm.dst_device_id == 1 and wm.peer_rank == 3 and wm.peer_endpoint == "tcp://gen:1"
-    # The planner gets both request descriptions whole, not fields picked out of them.
-    ((chunk, req_info, prompt_len),) = planner.calls
-    assert chunk is task._chunk and req_info is req and prompt_len == 64
+    # The describer sees each side's page table and slot tables; only this side excludes views.
+    (self_pt, self_tables, self_excluded), (peer_pt, peer_tables, peer_excluded) = describer.calls
+    assert self_pt == "self page table" and self_tables is task._chunk.block_ids_per_layer_groups
+    assert self_excluded == {(0, 1)}
+    assert peer_pt == "peer page table" and peer_tables is req.block_ids_per_layer_groups
+    assert not peer_excluded
+    # The planner pairs the rows the describer produced, plus the request's bounds.
+    ((self_rows, peer_rows, token_range, prompt_len, dst_start_token),) = planner.calls
+    assert self_rows[0].addresses.tolist() == [5, 6] and peer_rows[0].addresses.tolist() == [9, 10]
+    assert token_range == task._chunk.token_range and prompt_len == 64 and dst_start_token == 32
 
 
 def test_build_kv_write_meta_empty_plan_still_delivers():
@@ -252,6 +293,17 @@ def test_registrar_rejects_planner_id_mismatch():
         reg.get_peer_rank_info("gen", 0)
 
 
+def test_registrar_rejects_describer_id_mismatch():
+    self_ri = _minimal_rank_info(planner_id="toy", describer_id="toy")
+    peer_ri = _minimal_rank_info(
+        instance_name="gen", planner_id="toy", describer_id="trtllm.default"
+    )
+    reg = PeerRegistrar(self_ri, Mock(), _ToyPlanner(TransferPlan.empty()))
+
+    with pytest.raises(PeerIncompatibleError, match="describes its cache"):
+        reg.register("gen", 0, peer_ri)
+
+
 def test_receiver_rejects_planner_id_mismatch(monkeypatch):
     recv = Receiver.__new__(Receiver)
     recv._incompatible_peers = {}
@@ -349,7 +401,7 @@ def wrapping_nvtx_range(*_a, **_k):
     return deco
 u.nvtx_range = wrapping_nvtx_range
 from tensorrt_llm._torch.disaggregation.native.default_planner import DefaultTransferPlanner as P
-for name in ("_fanin_bounce_safe", "_pair_ordinals", "_get_mamba_slot", "_get_buffers_per_layer", "_find_overlap"):
+for name in ("_fanin_bounce_safe", "_pair_rows", "_get_mamba_slot", "_get_buffers_per_layer", "_find_overlap"):
     assert isinstance(P.__dict__[name], staticmethod), name
 print("STATICS_OK")
 """

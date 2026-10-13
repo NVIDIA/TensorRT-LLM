@@ -18,7 +18,12 @@ import numpy as np
 import pytest
 
 from tensorrt_llm._torch.disaggregation.base import CacheKind, Chunk, RecvReqInfo, TokenRange
-from tensorrt_llm._torch.disaggregation.base.planner import PeerIncompatibleError, TransferPlan
+from tensorrt_llm._torch.disaggregation.base.planner import (
+    PeerIncompatibleError,
+    TransferPlan,
+    plan_transfer,
+)
+from tensorrt_llm._torch.disaggregation.native.default_describer import DefaultCacheDescriber
 from tensorrt_llm._torch.disaggregation.native.default_planner import DefaultTransferPlanner
 from tensorrt_llm._torch.disaggregation.native.mixers.attention.spec import AttentionInfo
 from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
@@ -154,8 +159,9 @@ def test_plan_matches_default_planner_byte_for_byte(src, dst, dst_start_token):
     target, default, self_ri, peer_ri = _pair()
     chunk, req_info, prompt_len = _request(src, dst, dst_start_token)
 
-    ours = target.plan(self_ri, peer_ri, chunk, req_info, prompt_len)
-    ref = default.plan(self_ri, peer_ri, chunk, req_info, prompt_len)
+    describer = DefaultCacheDescriber()
+    ours = plan_transfer(describer, target, self_ri, peer_ri, chunk, req_info, prompt_len)
+    ref = plan_transfer(describer, default, self_ri, peer_ri, chunk, req_info, prompt_len)
 
     assert _fragments_at_slot_granularity(ours) == _fragments_at_slot_granularity(ref)
     assert int(ours.sizes.sum()) == int(ref.sizes.sum())
@@ -163,7 +169,9 @@ def test_plan_matches_default_planner_byte_for_byte(src, dst, dst_start_token):
 
 def test_contiguous_blocks_merge_into_one_fragment():
     target, _, self_ri, peer_ri = _pair()
-    plan = target.plan(self_ri, peer_ri, *_request([3, 4, 5, 6], [10, 11, 12, 13]))
+    plan = plan_transfer(
+        DefaultCacheDescriber(), target, self_ri, peer_ri, *_request([3, 4, 5, 6], [10, 11, 12, 13])
+    )
     assert plan.sizes.tolist() == [4 * SLOT_BYTES]
 
 

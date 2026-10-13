@@ -47,9 +47,11 @@ from tensorrt_llm._torch.disaggregation.base.agent import (
     TransferRequest,
 )
 from tensorrt_llm._torch.disaggregation.base.planner import (  # noqa: F401  (re-exported)
+    CacheDescriber,
     PeerIncompatibleError,
     PeerTargets,
     TransferPlanner,
+    plan_transfer,
 )
 from tensorrt_llm._torch.disaggregation.base.transfer import (
     ReceiverBase,
@@ -65,6 +67,7 @@ from tensorrt_llm._torch.disaggregation.native.auxiliary import (
     build_aux_transfer_layout,
     get_non_empty_aux_indices,
 )
+from tensorrt_llm._torch.disaggregation.native.default_describer import DefaultCacheDescriber
 from tensorrt_llm._torch.disaggregation.native.default_planner import DefaultTransferPlanner
 from tensorrt_llm._torch.disaggregation.native.messenger import ZMQMessenger, decode_message
 from tensorrt_llm._torch.disaggregation.native.peer import PeerRegistrar
@@ -869,12 +872,14 @@ class Sender(SenderBase):
         self,
         peer_registrar: PeerRegistrar,
         agent: BaseTransferAgent,
+        describer: CacheDescriber,
         bounce=None,
         enforce_physical_ownership: bool = False,
         retirement_watchdog: Optional[RetirementWatchdog] = None,
     ) -> None:
         self._registrar = peer_registrar
         self._planner = peer_registrar.planner
+        self._describer = describer
         self._device_id = peer_registrar.self_rank_info.device_id
         self._agent = agent
         self._bounce = bounce
@@ -1645,9 +1650,18 @@ class Sender(SenderBase):
         # handle has to answer how many writes are still out after one of them has already failed.
         task.expected_transfers = expected_transfers
 
-        # Which of this rank's bytes land where on the peer is the model's planner's call;
-        # an empty plan still goes out so the peer's expected-writer count settles.
-        plan = self._planner.plan(self_ri, peer_ri, task._chunk, req_info, task._prompt_len)
+        # Which of this rank's bytes land where on the peer is the model's call: the describer
+        # says what each side holds, the planner pairs it. An empty plan still goes out so the
+        # peer's expected-writer count settles.
+        plan = plan_transfer(
+            self._describer,
+            self._planner,
+            self_ri,
+            peer_ri,
+            task._chunk,
+            req_info,
+            task._prompt_len,
+        )
 
         if timer:
             timer.record_prepare_args_end(peer_ri.instance_rank)
@@ -3157,7 +3171,14 @@ class Receiver(ReceiverBase):
                         f"this rank with '{self._planner.planner_id}'; both sides of a "
                         "disaggregated deployment must run the same model planner"
                     )
-                self._planner.check_peer(self._registrar.self_rank_info, sender_info)
+                self_ri = self._registrar.self_rank_info
+                if sender_info.describer_id != self_ri.describer_id:
+                    raise PeerIncompatibleError(
+                        f"context peer describes its cache with '{sender_info.describer_id}', "
+                        f"this rank with '{self_ri.describer_id}'; both sides of a "
+                        "disaggregated deployment must run the same cache describer"
+                    )
+                self._planner.check_peer(self_ri, sender_info)
             except PeerIncompatibleError as e:
                 msg = (
                     f"context peer at '{info_endpoint}' is incompatible: {e} "
@@ -4369,14 +4390,18 @@ class TransferWorker:
             lambda _kvm, ri, ext: DefaultTransferPlanner(ri, ext)
         )
         self._planner = factory(kvm, self._rank_info, self._kv_extractor)
-        # The envelope says who planned this rank's transfers and carries what
-        # that planner wants the peer's planner to know. RankInfoServer holds
-        # the object and serializes on request, so setting it here is in time.
+        self._describer = DefaultCacheDescriber()
+        # The envelope says who described this rank's cache and who planned its
+        # transfers, and carries what the planner wants the peer's planner to
+        # know. RankInfoServer holds the object and serializes on request, so
+        # setting it here is in time.
+        self._rank_info.describer_id = self._describer.describer_id
         self._rank_info.planner_id = self._planner.planner_id
         self._rank_info.planner_blob = self._planner.describe()
         logger.info(
             f"TransferWorker: KV transfer planned by {type(self._planner).__name__} "
-            f"(planner_id={self._planner.planner_id!r})"
+            f"(planner_id={self._planner.planner_id!r}, "
+            f"describer_id={self._describer.describer_id!r})"
         )
         self._peer_registrar = PeerRegistrar(self._rank_info, self._kv_extractor, self._planner)
 
@@ -4423,6 +4448,7 @@ class TransferWorker:
             self._sender = Sender(
                 self._peer_registrar,
                 self._agent,
+                self._describer,
                 bounce=self._bounce,
                 enforce_physical_ownership=self._config.enforce_physical_ownership,
                 retirement_watchdog=self._retirement_watchdog,

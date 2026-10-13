@@ -61,6 +61,33 @@ class TransferPlan:
     # An empty plan is valid: this rank writes nothing to this peer but still
     # completes the handshake, as duplicate-head non-owners do today.
 
+@dataclass(frozen=True)
+class LayerGroupRows:
+    """The rows one rank holds for a request in one pool view of one layer group.
+    A row is a whole pool slot: block ordinal block_ordinals[i] starts at device
+    address addresses[i] and is row_bytes long. span_blocks is how many ordinals
+    the request covers on this side. A STATE group is one row, ordinal 0."""
+    layer_group_index: int
+    view_index: int
+    kind: CacheKind
+    block_ordinals: np.ndarray
+    addresses: np.ndarray
+    row_bytes: int
+    span_blocks: int
+
+class CacheDescriber(ABC):
+    describer_id: str           # must match on both sides of a transfer
+
+    @abstractmethod
+    def rows(
+        self,
+        page_table: KVCachePageTable,
+        slot_table_per_layer_group: Sequence[np.ndarray],   # positional, -1 = not held
+        excluded_views: AbstractSet[tuple[int, int]],       # (layer group, view) left out
+    ) -> list[LayerGroupRows]:
+        """Single-sided: what this rank's cache holds for a request, off its own
+        page table. Knows the model's cache layout, never the peer."""
+
 class TransferPlanner(ABC):
     planner_id: str             # must match on both sides of a transfer
 
@@ -80,15 +107,19 @@ class TransferPlanner(ABC):
         Replaces get_peer_overlap + should_send_pool + _fanin_bounce_safe."""
 
     @abstractmethod
-    def plan(
+    def pair(
         self,
         self_ri: RankInfo,
         peer_ri: RankInfo,
-        chunk: Chunk,            # sender's description of the piece (base/backend.py)
-        req_info: RecvReqInfo,   # receiver's description of where it lands (base/backend.py)
+        self_rows: Sequence[LayerGroupRows],   # what this rank holds for the piece
+        peer_rows: Sequence[LayerGroupRows],   # what the receiver holds
+        *,
+        token_range: TokenRange,               # the piece within the prompt
         prompt_len: int,
+        dst_start_token: Optional[int],        # receiver accepts nothing below this
     ) -> TransferPlan:
-        """Sender side. Replaces the body of _build_kv_write_meta."""
+        """Sender side, two-sided: pair the rows. Replaces the body of
+        _build_kv_write_meta."""
 
     @abstractmethod
     def receiver_payload_bytes(
@@ -97,18 +128,36 @@ class TransferPlanner(ABC):
         """Receiver side, bytes beyond the paged blocks that ride the same write
         (recurrent state today). None = cannot size, receiver disables bounce.
         Replaces _get_mamba_slot + mamba_receiver_payload_bytes."""
+
+def plan_transfer(describer, planner, self_ri, peer_ri, chunk, req_info, prompt_len) -> TransferPlan:
+    """Framework composition for one piece: describe this side from chunk, describe
+    the receiver from its wire message (req_info) against its published page table,
+    then planner.pair(...)."""
 ```
 
-`plan` and `receiver_payload_bytes` take the two request descriptions whole,
-never fields picked out of them. `Chunk` is what the sender holds for the piece
-(block tables per layer group, token range, and whatever per-request facts the
-transceiver records later, e.g. pool views a request excludes); `RecvReqInfo` is
-the receiver's wire message (its block tables, `dst_start_token`, bounce
-address, aux slot). Both live in `base/backend.py`, so the planner package
-depends on protocol types only, never on `native/transfer.py`'s task objects
-(`KVSendTask` carries transfer progress and timers a planner must not touch).
-A new per-request fact is added to one of these two types and every planner
-sees it; the interface does not change and nothing silently stops flowing.
+The split follows where the knowledge lives. The describer looks at one side
+only: it reads this rank's page table and a request's positional slot tables
+(`Chunk.block_ids_per_layer_groups`, `RecvReqInfo.block_ids_per_layer_groups`)
+and says which whole slots exist for the request and where. That is the model's
+cache layout, nothing about the peer, so it is the half a KV cache manager
+could export on its own. The planner looks at both sides: pool matching, head
+re-sharding, who writes, and the ordinal intersection that decides which rows
+move. It only ever consumes rows, so it never addresses memory itself and
+never reads a slot table.
+
+`RecvReqInfo` stays the receiver's wire message (its block tables,
+`dst_start_token`, bounce address, aux slot); the sender rebuilds the
+receiver's rows from it with the same describer. `receiver_payload_bytes`
+still takes it whole. Both request types live in `base/backend.py`, so the
+planner package depends on protocol types only, never on
+`native/transfer.py`'s task objects.
+
+The framework compares `describer_id` and `planner_id` across peers before
+anything else; both travel on `RankInfo`. Today every model runs
+`DefaultCacheDescriber` (`native/default_describer.py`): one row per held
+slot at `base_address + slot * slot_stride_bytes`. There is no selection hook
+for a describer yet because no model needs one; when one does, it is chosen
+where the planner is chosen.
 
 Threading contract is unchanged from today: `plan` is called where
 `_build_kv_write_meta` is called now, `targets` and `receiver_payload_bytes`

@@ -54,6 +54,12 @@ class PeerRegistrar:
                 f"with '{peer_ri.planner_id}', this rank with '{self._planner.planner_id}'; "
                 "both sides of a disaggregated deployment must run the same model planner"
             )
+        if peer_ri.describer_id != self._ri.describer_id:
+            raise PeerIncompatibleError(
+                f"PeerRegistrar.register: peer {peer_name} (rank={peer_rank}) describes its cache "
+                f"with '{peer_ri.describer_id}', this rank with '{self._ri.describer_id}'; "
+                "both sides of a disaggregated deployment must run the same cache describer"
+            )
         self._planner.check_peer(self._ri, peer_ri)
         key = self._unique_key(peer_name, peer_rank)
         self._peer_ri_cache[key] = peer_ri

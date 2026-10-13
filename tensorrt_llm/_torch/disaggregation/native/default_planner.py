@@ -16,28 +16,34 @@
 
 Attention (PAGED) and recurrent-state (STATE) layer groups are planned by
 ``AttentionPolicy`` and ``MambaPolicy``; pools are matched by role and layer
-overlap; TP/PP/CP overlap decides which peer ranks receive what. All of it is
-behind the :class:`TransferPlanner` protocol, so ``native/transfer.py`` only
-ever sees ranks, pointer arrays and byte counts.
+overlap; TP/PP/CP overlap decides which peer ranks receive what. The rows each
+side holds come in from the cache describer; this class only pairs them. All of
+it is behind the :class:`TransferPlanner` protocol, so ``native/transfer.py``
+only ever sees ranks, pointer arrays and byte counts.
 """
 
 from __future__ import annotations
 
 from collections import Counter
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 
 from tensorrt_llm import logger
-from tensorrt_llm._torch.disaggregation.base.backend import Chunk, RecvReqInfo
+from tensorrt_llm._torch.disaggregation.base.backend import RecvReqInfo, TokenRange
 from tensorrt_llm._torch.disaggregation.base.planner import (
+    LayerGroupRows,
     PeerIncompatibleError,
     PeerTargets,
     TransferPlan,
     TransferPlanner,
 )
-from tensorrt_llm._torch.disaggregation.base.region import RegionMapperBase
+from tensorrt_llm._torch.disaggregation.base.region import (
+    MemRegionGroup,
+    RegionMapperBase,
+    SpecRegion,
+)
 from tensorrt_llm._torch.disaggregation.native.mixers.attention.peer import AttentionPolicy
 from tensorrt_llm._torch.disaggregation.native.mixers.ssm.peer import (
     MambaPolicy,
@@ -101,19 +107,12 @@ class DefaultTransferPlanner(TransferPlanner):
         self._lg_pool_mapping_cache: Dict[
             str, Dict[LGPoolKey, LGPoolKey]
         ] = {}  # peer_key -> {(self_lg, self_pi) -> (peer_lg, peer_pi)}
-        self._peer_ext_cache: Dict[str, KVRegionExtractorV1] = {}
+        # (peer_key or "", layer group, view) -> per-layer offsets within a STATE slot
+        self._state_layout_cache: Dict[Tuple[str, int, int], Tuple[np.ndarray, int]] = {}
 
     @staticmethod
     def _unique_key(name: str, rank: int) -> str:
         return name + str(rank)
-
-    def peer_extractor(self, peer_ri: RankInfo) -> KVRegionExtractorV1:
-        key = self._unique_key(peer_ri.instance_name, peer_ri.instance_rank)
-        ext = self._peer_ext_cache.get(key)
-        if ext is None:
-            ext = KVRegionExtractorV1(peer_ri.page_table)
-            self._peer_ext_cache[key] = ext
-        return ext
 
     # ---- TransferPlanner protocol -------------------------------------------------
 
@@ -210,18 +209,17 @@ class DefaultTransferPlanner(TransferPlanner):
         self._targets_cache[key] = targets
         return targets
 
-    def plan(
+    def pair(
         self,
         self_ri: RankInfo,
         peer_ri: RankInfo,
-        chunk: Chunk,
-        req_info: RecvReqInfo,
+        self_rows: Sequence[LayerGroupRows],
+        peer_rows: Sequence[LayerGroupRows],
+        *,
+        token_range: TokenRange,
         prompt_len: int,
+        dst_start_token: Optional[int],
     ) -> TransferPlan:
-        src_block_ids_per_lg = chunk.block_ids_per_layer_groups
-        dst_block_ids_per_lg = req_info.block_ids_per_layer_groups
-        token_range = chunk.token_range
-        dst_start_token = req_info.dst_start_token
         # Only a piece short of the whole prompt runs the chunk projection below, and that is the
         # part with no answer under CP; a sole piece covering everything takes the untouched path.
         is_partial = token_range.start > 0 or token_range.end < prompt_len
@@ -231,6 +229,18 @@ class DefaultTransferPlanner(TransferPlanner):
                 f"(sender cp_size={self_ri.cp_size}, receiver cp_size={peer_ri.cp_size})"
             )
         targets = self.get_peer_overlap(peer_ri, peer_ri.dp_rank)
+        self_by_view = {(r.layer_group_index, r.view_index): r for r in self_rows}
+        peer_by_view = {(r.layer_group_index, r.view_index): r for r in peer_rows}
+        tpb = self._self_ext_cache.page_table.tokens_per_block
+        dst_start_block = dst_start_token // tpb if dst_start_token is not None else 0
+        # Helix: the receiver owns global blocks [cp_rank::cp_size] (same protocol as
+        # partition_context_for_helix), so its ordinals are the strided subset of ours;
+        # block reuse is rejected under helix.
+        helix = (
+            (peer_ri.cp_rank, peer_ri.cp_size)
+            if peer_ri.cp_size > 1 and self_ri.cp_size == 1
+            else None
+        )
 
         # Aggregate fragment pointers from all matching pool pairs.
         # Each pool pair produces one or more region pairs (rp), each containing
@@ -242,53 +252,39 @@ class DefaultTransferPlanner(TransferPlanner):
         # tuples and construct the final sizes array with a single np.repeat().
         # For 48k+ items this avoids many small allocations in the hot loop.
         size_specs: list[tuple[int, int]] = []
-        extractor = self._self_ext_cache
-        peer_extractor = self.peer_extractor(peer_ri)
         pool_mapping = self.get_pool_mapping(peer_ri)
 
         # Aggregate fragments from all matching pools using numpy concatenation.
         # Send ownership is per pool: replicated pools elect one fan-in
         # owner, sharded pools keep head-duplication routing.
         for (self_lg, self_pi), (peer_lg, peer_pi) in pool_mapping.items():
-            if (self_lg, self_pi) in chunk.excluded_pool_views:
+            src = self_by_view.get((self_lg, self_pi))
+            if src is None:  # a view the describer left out for this piece
                 continue
+            dst = peer_by_view[(peer_lg, peer_pi)]
             if not self.should_send_pool(targets, peer_ri, self_lg, self_pi):
                 continue
 
-            lg_info = extractor.page_table.layer_groups[self_lg]
-            src_block_ids = src_block_ids_per_lg[self_lg]
-            dst_block_ids = dst_block_ids_per_lg[peer_lg]
-
-            # Extract regions: STATE = per-layer ptrs, PAGED = per-block ptrs
-            if lg_info.kind == CacheKind.STATE:
-                if src_block_ids.size == 0 or dst_block_ids.size == 0:
+            # Build regions: STATE = per-layer ptrs of the one slot, PAGED = per-block ptrs
+            if src.kind == CacheKind.STATE:
+                if len(src) == 0 or len(dst) == 0:
                     continue
                 if not MambaPolicy.is_paired(self_ri, peer_ri):
                     continue
-                src_region = extractor.extract_slot(int(src_block_ids[0]), self_lg, self_pi)
-                dst_region = peer_extractor.extract_slot(int(dst_block_ids[0]), peer_lg, peer_pi)
-            else:
-                src_block_ids = np.asarray(src_block_ids, dtype=np.int64)
-                dst_block_ids = np.asarray(dst_block_ids, dtype=np.int64)
-                if peer_ri.cp_size > 1 and self_ri.cp_size == 1:
-                    # Helix: the receiver owns global blocks [cp_rank::cp_size]
-                    # (same protocol as partition_context_for_helix), so its
-                    # table is the strided subset of ours; block reuse is
-                    # rejected under helix.
-                    src_block_ids = src_block_ids[peer_ri.cp_rank :: peer_ri.cp_size]
-                tpb = extractor.page_table.tokens_per_block
-                dst_start_block = dst_start_token // tpb if dst_start_token is not None else 0
-                # Both tables are positional (index == block ordinal, -1 == not
-                # held), so pairing is a plain intersection: SWA eviction, prefix
-                # reuse, and pipelined chunk bounds are all already encoded as
-                # holes by whichever side owns that state.
-                src_block_ids, dst_block_ids = self._pair_ordinals(
-                    src_block_ids, dst_block_ids, dst_start_block=dst_start_block
+                src_region = self._state_region("", self_ri.page_table, src)
+                dst_region = self._state_region(
+                    self._unique_key(peer_ri.instance_name, peer_ri.instance_rank),
+                    peer_ri.page_table,
+                    dst,
                 )
-                if src_block_ids.size == 0:
+            else:
+                src_sel, dst_sel = self._pair_rows(
+                    src, dst, dst_start_block=dst_start_block, helix=helix
+                )
+                if src_sel.size == 0:
                     continue
-                src_region = extractor.extract(src_block_ids, self_lg, self_pi)
-                dst_region = peer_extractor.extract(dst_block_ids, peer_lg, peer_pi)
+                src_region = SpecRegion(MemRegionGroup(src.addresses[src_sel], src.row_bytes))
+                dst_region = SpecRegion(MemRegionGroup(dst.addresses[dst_sel], dst.row_bytes))
 
             # Map and collect fragments (same for all layer types)
             mapper = self.get_kv_map(peer_ri, (self_lg, self_pi), (peer_lg, peer_pi))
@@ -312,6 +308,24 @@ class DefaultTransferPlanner(TransferPlanner):
             sizes=np.repeat(np.array(values, dtype=np.int64), counts),
         )
 
+    def _state_region(
+        self, peer_key: str, page_table: KVCachePageTable, rows: LayerGroupRows
+    ) -> SpecRegion:
+        """Per-layer pointers of a STATE row: ``slot address + view offset of each layer``.
+
+        View offsets are explicit because a recurrent role may exist on only a
+        subset of layers or be interleaved with another role in a V2 pool.
+        """
+        key = (peer_key, rows.layer_group_index, rows.view_index)
+        layout = self._state_layout_cache.get(key)
+        if layout is None:
+            pv = page_table.layer_groups[rows.layer_group_index].pool_views[rows.view_index]
+            layer_offsets, bytes_per_layer = get_layer_byte_ranges(pv)
+            layout = (np.array(sorted(layer_offsets.values()), dtype=np.int64), bytes_per_layer)
+            self._state_layout_cache[key] = layout
+        ordered_offsets, bytes_per_layer = layout
+        return SpecRegion(MemRegionGroup(ordered_offsets + int(rows.addresses[0]), bytes_per_layer))
+
     def receiver_payload_bytes(
         self, self_ri: RankInfo, peer_ri: RankInfo, req_info: RecvReqInfo
     ) -> Optional[int]:
@@ -329,10 +343,11 @@ class DefaultTransferPlanner(TransferPlanner):
 
     def forget_peer(self, peer_ri: RankInfo) -> None:
         key = self._unique_key(peer_ri.instance_name, peer_ri.instance_rank)
-        self._peer_ext_cache.pop(key, None)
         self._lg_pool_mapping_cache.pop(key, None)
         for k in [k for k in self._kv_map_cache if k[0] == key]:
             del self._kv_map_cache[k]
+        for k in [k for k in self._state_layout_cache if k[0] == key]:
+            del self._state_layout_cache[k]
 
     # ---- helpers moved from the transfer framework ---------------------------------
 
@@ -351,31 +366,43 @@ class DefaultTransferPlanner(TransferPlanner):
         return None
 
     @staticmethod
-    def _pair_ordinals(
-        src_block_ids: np.ndarray,
-        dst_block_ids: np.ndarray,
+    def _pair_rows(
+        src: LayerGroupRows,
+        dst: LayerGroupRows,
+        *,
         dst_start_block: int = 0,
+        helix: Optional[Tuple[int, int]] = None,
     ) -> tuple[np.ndarray, np.ndarray]:
-        """Pair src/dst positional block tables ordinal by ordinal.
+        """Pair the rows both sides hold, ordinal by ordinal; returns row indices into each side.
 
-        Both tables are indexed by block ordinal (see Chunk); an entry is -1
-        where that side has nothing to offer/accept. A block moves only where
-        both sides hold it, so a sender that has not evicted yet, a receiver
-        that already reused a prefix, a receiver with a wider speculative
-        window, or a sender chunk that blanks everything outside its range all
-        fall out of the same intersection without any per-case arithmetic.
-        Ordinals below ``dst_start_block`` are excluded as well.
+        Rows are keyed by block ordinal, and a side lists only the ordinals it
+        holds, so a block moves exactly where both sides hold it: a sender that
+        has not evicted yet, a receiver that already reused a prefix, a receiver
+        with a wider speculative window, or a sender chunk that blanks everything
+        outside its range all fall out of the same intersection without any
+        per-case arithmetic. Ordinals below ``dst_start_block`` are excluded as
+        well. Under ``helix=(cp_rank, cp_size)`` the receiver holds every
+        ``cp_size``-th global ordinal from ``cp_rank``, numbered from 0.
         """
-        if src_block_ids.size != dst_block_ids.size:
+        src_ordinals = src.block_ordinals
+        src_index = np.arange(src_ordinals.size)
+        src_span = src.span_blocks
+        if helix is not None:
+            cp_rank, cp_size = helix
+            keep = (src_ordinals >= cp_rank) & ((src_ordinals - cp_rank) % cp_size == 0)
+            src_index = src_index[keep]
+            src_ordinals = (src_ordinals[keep] - cp_rank) // cp_size
+            src_span = len(range(cp_rank, src_span, cp_size))
+        if src_span != dst.span_blocks:
             raise ValueError(
-                f"positional block tables differ in length: src={src_block_ids.size} "
-                f"dst={dst_block_ids.size}; both sides must span the same prompt"
+                f"positional block tables differ in length: src={src_span} "
+                f"dst={dst.span_blocks}; both sides must span the same prompt"
             )
-        mask = (src_block_ids >= 0) & (dst_block_ids >= 0)
-        if dst_start_block > 0:
-            mask[:dst_start_block] = False
-        idx = np.flatnonzero(mask)
-        return src_block_ids[idx], dst_block_ids[idx]
+        common, src_pos, dst_pos = np.intersect1d(
+            src_ordinals, dst.block_ordinals, assume_unique=True, return_indices=True
+        )
+        accepted = common >= dst_start_block
+        return src_index[src_pos[accepted]], dst_pos[accepted]
 
     @staticmethod
     def _fanin_bounce_safe(
@@ -626,11 +653,11 @@ class DefaultTransferPlanner(TransferPlanner):
         policy = self._get_policy(self_lg.kind)
 
         # For mamba, compute ptr-array layer offsets for partial PP overlap.
-        # extract_slot returns ptrs for ALL local_layer_ids in sorted order;
+        # _state_region returns ptrs for ALL local_layer_ids in sorted order;
         # the mapper must slice only the overlapping subset.
         extra_kwargs = {}
         if self_lg.kind == CacheKind.STATE:
-            # Positions index the ptr array ``extract_slot`` builds, which is
+            # Positions index the ptr array ``_state_region`` builds, which is
             # ordered by view offset.
             self_gid_to_pos = {gid: i for i, gid in enumerate(self_global_ids)}
             peer_gid_to_pos = {gid: i for i, gid in enumerate(peer_global_ids)}

@@ -223,10 +223,11 @@ def _minimal_rank_info(**overrides) -> RankInfo:
 
 
 def test_rank_info_planner_fields_round_trip():
-    ri = _minimal_rank_info(planner_id="toy", planner_blob=b"\x00\x01")
+    ri = _minimal_rank_info(planner_id="toy", planner_blob=b"\x00\x01", describer_id="rows")
     back = RankInfo.from_bytes(ri.to_bytes())
     assert back.planner_id == "toy"
     assert back.planner_blob == b"\x00\x01"
+    assert back.describer_id == "rows"
 
 
 def test_rank_info_from_bytes_without_planner_fields():
@@ -240,8 +241,16 @@ def test_rank_info_from_bytes_without_planner_fields():
     import msgpack
 
     data = asdict(_minimal_rank_info())
-    for key in ("planner_id", "planner_blob", "attention", "aux_meta", "page_table"):
+    for key in (
+        "planner_id",
+        "planner_blob",
+        "describer_id",
+        "attention",
+        "aux_meta",
+        "page_table",
+    ):
         data.pop(key, None)
     back = RankInfo.from_bytes(msgpack.packb(data))
     assert back.planner_id == ""
     assert back.planner_blob == b""
+    assert back.describer_id == ""

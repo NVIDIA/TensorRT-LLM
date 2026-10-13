@@ -13,6 +13,7 @@ from tensorrt_llm._torch.attention.backends.sparse.csa2.cache_manager import (
     CSA2CacheRole,
 )
 from tensorrt_llm._torch.attention.backends.sparse.csa2.params import CSA2Layout
+from tensorrt_llm._torch.disaggregation.native.default_describer import DefaultCacheDescriber
 from tensorrt_llm._torch.disaggregation.native.default_planner import DefaultTransferPlanner
 from tensorrt_llm._torch.disaggregation.native.peer import PeerRegistrar
 from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
@@ -212,6 +213,7 @@ def test_context_only_physical_cache_transfer_preserves_logical_owners(
         sender = Sender.__new__(Sender)
         sender._registrar = registrar
         sender._planner = planner
+        sender._describer = DefaultCacheDescriber()
         task = SimpleNamespace(
             _chunk=source_slice,
             _prompt_len=length,
