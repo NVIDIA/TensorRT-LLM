@@ -153,6 +153,8 @@ def _hybrid_model_config():
     return SimpleNamespace(
         pretrained_config=config,
         sparse_attention_config=None,
+        mapping=None,
+        spec_config=None,
         get_num_mamba_layers=lambda: 1,
     )
 
@@ -3771,6 +3773,7 @@ def test_v2_kda_replay_validates_configuration(
         )
 
 
+@skip_no_cuda
 @pytest.mark.parametrize("kda_replay", [True, False], ids=["kda_replay", "no_replay"])
 def test_v2_kda_replay_refuses_kv_pool_rebalance(kda_replay):
     """The KDA replay caches and prev_num_accepted_tokens hold one entry per SSM slot the pool keeps at construction,
@@ -3833,6 +3836,7 @@ def _v2_kda_draft_record_manager(kda_draft_records, enable_block_reuse):
     return mgr
 
 
+@skip_no_cuda
 @pytest.mark.parametrize(
     ("kda_draft_records", "enable_block_reuse", "at_floor"),
     [(True, False, True), (False, False, False), (False, True, False)],
