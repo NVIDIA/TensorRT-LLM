@@ -38,6 +38,7 @@ from tensorrt_llm.quantization.mode import QuantAlgo
 
 from ..attention.attention import Attention
 from ..attention.backends import AttentionMetadata
+from ..attention.backends.fmha.fallback import FallbackFmha
 from ..attention.backends.fmha.flashinfer_trtllm_gen import FlashInferTrtllmGenFmha
 from ..attention.backends.fmha.msa_prefill import _aligned_nvfp4_dequant_scales
 from ..attention.backends.fmha.registry import get_enabled_fmha_lib_classes
@@ -1136,25 +1137,7 @@ class MiniMaxM3Attention(Attention):
             and native_dense_cache
             and isinstance(self.attn, MiniMaxM3SparseRuntimeBackend)
         ):
-            # Q/K norm and partial RoPE have already run in the model.
-            native_attn = TrtllmAttention(
-                self.layer_idx,
-                self.num_heads,
-                self.head_dim,
-                num_kv_heads=self.num_key_value_heads,
-                quant_config=self.quant_config,
-                q_scaling=self.q_scaling,
-                pos_embd_params=None,
-                skip_create_weights_in_init=model_config.skip_create_weights_in_init,
-            )
-            # MiniMax's P128 cached-context path needs TRTLLM-Gen. Preserve
-            # the legacy path if hardware or TLLM_FMHA_LIBS excludes it.
-            if (
-                FlashInferTrtllmGenFmha in get_enabled_fmha_lib_classes()
-                and FlashInferTrtllmGenFmha.is_available(native_attn)
-            ):
-                self.attn = native_attn
-                self.support_fused_qkv = self.attn.support_fused_qkv()
+            self._init_native_dense_attention(model_config)
         self.disable_index_value = bool(disable_index_value)
         sparse_runtime_cfg = getattr(model_config, "sparse_attention_config", None)
         self.enable_fused_qkv_index_projection = bool(
@@ -1239,6 +1222,32 @@ class MiniMaxM3Attention(Attention):
                 dtype=config.torch_dtype,
                 use_gemma=self.use_gemma_norm,
             )
+
+    def _init_native_dense_attention(self, model_config: ModelConfig) -> None:
+        """Use native dense attention only when TRTLLM-Gen precedes C++ fallback."""
+        enabled_libs = get_enabled_fmha_lib_classes()
+        if FlashInferTrtllmGenFmha not in enabled_libs:
+            return
+        if FallbackFmha in enabled_libs and enabled_libs.index(FallbackFmha) < enabled_libs.index(
+            FlashInferTrtllmGenFmha
+        ):
+            # A fallback-first policy cannot serve P128 cached prefill safely.
+            return
+        # Q/K norm and partial RoPE run in the model before backend dispatch.
+        native_attn = TrtllmAttention(
+            self.layer_idx,
+            self.num_heads,
+            self.head_dim,
+            num_kv_heads=self.num_key_value_heads,
+            quant_config=self.quant_config,
+            q_scaling=self.q_scaling,
+            pos_embd_params=None,
+            skip_create_weights_in_init=model_config.skip_create_weights_in_init,
+        )
+        if not FlashInferTrtllmGenFmha.is_available(native_attn):
+            return
+        self.attn = native_attn
+        self.support_fused_qkv = self.attn.support_fused_qkv()
 
     def apply_qk_norm(self, q: torch.Tensor, k: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """Per-head Gemma RMSNorm on the main attention Q/K.

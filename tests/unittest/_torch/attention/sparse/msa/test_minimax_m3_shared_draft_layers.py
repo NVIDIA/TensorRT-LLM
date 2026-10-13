@@ -489,7 +489,10 @@ def test_sparse_view_writes_native_hnd_storage_without_copy(monkeypatch, heads):
     )
 
     # Include another layer and an index page in every allocation slot.
-    storage = torch.zeros(3, 7, heads, 8, 16)
+    storage = (torch.arange(3 * 7 * heads * 8 * 16, dtype=torch.float32) + 1).reshape(
+        3, 7, heads, 8, 16
+    )
+    before = storage.clone()
     manager = MiniMaxM3KVCacheManagerV2.__new__(MiniMaxM3KVCacheManagerV2)
     manager._kv_slot_geometry = lambda i, layout: (
         storage.data_ptr(),
@@ -506,7 +509,9 @@ def test_sparse_view_writes_native_hnd_storage_without_copy(monkeypatch, heads):
     values = torch.arange(4 * heads * 16, dtype=storage.dtype).reshape(4, heads, 16)
     write_kv_slots(nhd[:, 0], slots, values, num_live_tokens=slots.numel())
     torch.testing.assert_close(hnd[slots // 8, 0, :, slots % 8], values)
-    assert torch.count_nonzero(storage[:, 1:]) == 0
+    touched = torch.zeros_like(storage, dtype=torch.bool)
+    touched[slots // 8, 0, :, slots % 8] = True
+    assert torch.equal(storage[~touched], before[~touched])
     torch.testing.assert_close(nhd, hnd.transpose(2, 3))
 
 
@@ -534,6 +539,7 @@ def test_flat_subpage_views_preserve_physical_hnd_order(monkeypatch, heads):
 def test_cached_index_views_support_both_layouts_without_pool_lookups(backend_layout):
     """Explicit transfer layouts must preserve the eagerly cached forward view."""
     storage = torch.arange(3 * 2 * 8 * 16, dtype=torch.float32).reshape(3, 2, 8, 1, 16)
+    before = storage.clone()
     nhd = storage[:, 0]
     manager = MiniMaxM3KVCacheManagerV2.__new__(MiniMaxM3KVCacheManagerV2)
     manager._main_kv_view_layout = backend_layout
@@ -550,6 +556,7 @@ def test_cached_index_views_support_both_layouts_without_pool_lookups(backend_la
         torch.testing.assert_close(view, expected)
         view.fill_(5)
         assert torch.all(nhd == 5)
+        assert torch.equal(storage[:, 1], before[:, 1])
         assert manager.get_index_k_buffer(0, layout) is None
     with pytest.raises(ValueError, match="Unsupported kv_layout"):
         manager.get_index_k_buffer(3, "invalid")
