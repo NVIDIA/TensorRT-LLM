@@ -313,12 +313,35 @@ def test_qualified_workspace_receives_correct_communicator(monkeypatch, use_ray)
 def test_dispatch_plan_supports_both_orchestrators(monkeypatch, use_ray):
     import torch
 
-    from tensorrt_llm.mapping import Mapping
+    from tensorrt_llm._torch import device_mesh
+    from tensorrt_llm.mapping import DeviceMeshTopology, Mapping, MpiTopology
 
-    monkeypatch.setattr(ops, "mpi_disabled", lambda: use_ray)
+    monkeypatch.setenv("TLLM_DISABLE_MPI", "1" if use_ray else "0")
     monkeypatch.delenv("TRTLLM_FORCE_MNNVL_AR_FABRIC", raising=False)
     monkeypatch.delenv("TRTLLM_FORCE_MNNVL_AR", raising=False)
+
+    if use_ray:
+        process_group = object()
+
+        class FakeMesh:
+            mesh_dim_names = ("tp",)
+
+            def __getitem__(self, name):
+                assert name == "tp"
+                return self
+
+            def get_group(self):
+                return process_group
+
+        def get_process_group_ranks(group):
+            assert group is process_group
+            return [0, 1]
+
+        monkeypatch.setattr(device_mesh.DeviceMeshTopologyImpl, "device_mesh", FakeMesh())
+        monkeypatch.setattr(device_mesh, "get_process_group_ranks", get_process_group_ranks)
+
     mapping = Mapping(world_size=2, tp_size=2, rank=0)
+    assert isinstance(mapping, DeviceMeshTopology if use_ray else MpiTopology)
     plan = ops._get_mnnvl_dispatch_plan(mapping, torch.bfloat16)
     assert plan.is_supported
     assert plan.transport == ops.MnnvlTransport.POSIX_FD
