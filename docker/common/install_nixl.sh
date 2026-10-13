@@ -12,7 +12,7 @@ if [[ ! -f "${LIBFABRIC_INSTALL_PATH}/include/rdma/fabric.h" ||
       ! -f "${LIBFABRIC_INSTALL_PATH}/lib/libfabric.so" ]]; then
     LIBFABRIC_INSTALL_PATH=""
 fi
-# Reuse the default MPI's hwloc in NGC PyTorch images for the EFA plugin.
+# Reuse HPC-X's hwloc via NGC PyTorch's default Open MPI prefix for the EFA plugin.
 HWLOC_INSTALL_PATH="/usr/local/mpi"
 if [[ -n "${LIBFABRIC_INSTALL_PATH}" &&
       -f "${HWLOC_INSTALL_PATH}/include/hwloc.h" &&
@@ -50,6 +50,7 @@ fi
 CUDA_SO_PATH=$(dirname $CUDA_SO_PATH)
 
 export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:$CUDA_SO_PATH
+# An empty libfabric_path uses optional system detection; no match skips the plugin.
 meson setup builddir \
     -Ducx_path=$UCX_INSTALL_PATH \
     -Dlibfabric_path="${LIBFABRIC_INSTALL_PATH}" \
