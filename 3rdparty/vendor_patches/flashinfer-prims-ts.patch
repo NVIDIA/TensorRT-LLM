@@ -1,5 +1,5 @@
 diff --git a/block_sparse.py b/block_sparse.py
-index d4652b8b68958ee3dab29d062a7cd082ea604c47..bb56724e986d302854722bf33962bea063f9e6e4 100644
+index fa055618705216cddf6b7f3e9ed4c1d680c2af9a..38de4926a045f17c5b6f206f4a20ecbe2532a1c7 100644
 --- a/block_sparse.py
 +++ b/block_sparse.py
 @@ -1,3 +1,4 @@
@@ -7,7 +7,7 @@ index d4652b8b68958ee3dab29d062a7cd082ea604c47..bb56724e986d302854722bf33962bea0
  # Copyright (c) 2026 by FlashInfer team.
  #
  # Licensed under the Apache License, Version 2.0 (the "License");
-@@ -36,13 +37,7 @@ from typing import Literal
+@@ -37,13 +38,7 @@ from typing import Literal
  
  import torch
  
@@ -22,7 +22,7 @@ index d4652b8b68958ee3dab29d062a7cd082ea604c47..bb56724e986d302854722bf33962bea0
  
  from ._block_sparse.common import (
      _num_sparse_pattern_heads,
-@@ -301,7 +296,7 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
+@@ -320,7 +315,7 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
          # previously published revision intact and runnable.
          self._plan_state = candidate
  
@@ -31,7 +31,7 @@ index d4652b8b68958ee3dab29d062a7cd082ea604c47..bb56724e986d302854722bf33962bea0
      def run(
          self,
          q: torch.Tensor,
-@@ -433,7 +428,7 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
+@@ -452,7 +447,7 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
          return self._launch_validated_run(state, run_args, run_stream)
  
  
@@ -40,7 +40,7 @@ index d4652b8b68958ee3dab29d062a7cd082ea604c47..bb56724e986d302854722bf33962bea0
  def block_sparse_attention(
      q: torch.Tensor,
      k: torch.Tensor,
-@@ -726,9 +721,7 @@ class BlockSparsePagedTSWrapper(_BlockSparseWrapperBase):
+@@ -757,9 +752,7 @@ class BlockSparsePagedTSWrapper(_BlockSparseWrapperBase):
              )
          self._plan_state = candidate
  
@@ -51,7 +51,7 @@ index d4652b8b68958ee3dab29d062a7cd082ea604c47..bb56724e986d302854722bf33962bea0
      def run(
          self,
          q: torch.Tensor,
-@@ -850,7 +843,7 @@ class BlockSparsePagedTSWrapper(_BlockSparseWrapperBase):
+@@ -881,7 +874,7 @@ class BlockSparsePagedTSWrapper(_BlockSparseWrapperBase):
          return self._launch_validated_run(state, run_args, run_stream)
  
  
@@ -61,10 +61,10 @@ index d4652b8b68958ee3dab29d062a7cd082ea604c47..bb56724e986d302854722bf33962bea0
      q: torch.Tensor,
      paged_kv_cache: PagedKVCache,
 diff --git a/context.py b/context.py
-index dd9a29c3e36111a0de9a57c487068b6b5caa4ea2..1163324ec632f2a0938f78a3636fb415450369df 100644
+index 6d4e6a22fbf38956ec0a773876b06b211f41594a..502cb3dcfccf52dc01d92e8efd9476cb73ea13c7 100644
 --- a/context.py
 +++ b/context.py
-@@ -46,7 +46,7 @@ from typing import TYPE_CHECKING, Callable, Literal, Optional
+@@ -45,7 +45,7 @@ from typing import TYPE_CHECKING, Callable, Literal, Optional
  
  import torch
  
@@ -73,7 +73,7 @@ index dd9a29c3e36111a0de9a57c487068b6b5caa4ea2..1163324ec632f2a0938f78a3636fb415
  
  
  if TYPE_CHECKING:
-@@ -488,7 +488,7 @@ def _validate_device(device: torch.device) -> int:
+@@ -487,7 +487,7 @@ def _validate_device(device: torch.device) -> int:
      # Rubin runs through the sm_100f family target; a CuTe DSL older than 4.8
      # cannot emit for it unless CUTE_DSL_ARCH=sm_100f is set before import.
      if capability == (10, 7):
@@ -83,7 +83,7 @@ index dd9a29c3e36111a0de9a57c487068b6b5caa4ea2..1163324ec632f2a0938f78a3636fb415
          require_cute_dsl_arch(device_index)
      return device_index
 diff --git a/decode.py b/decode.py
-index 41479a386d72c27eb0df76107318dc09256aff06..3fcec5efdc2a3825be0dc1d9a238aaaa6d76a609 100644
+index d85dd274917cf9a5a67ef1400155bb60985f1f77..205e875fc39022ca492cb40acea5b329fc4a3c11 100644
 --- a/decode.py
 +++ b/decode.py
 @@ -1,3 +1,4 @@
@@ -113,7 +113,7 @@ index 41479a386d72c27eb0df76107318dc09256aff06..3fcec5efdc2a3825be0dc1d9a238aaaa
  
          require_cute_dsl_arch(device_index)
  
-@@ -4046,7 +4043,7 @@ class BatchDecodePagedTSWrapper:
+@@ -4048,7 +4045,7 @@ class BatchDecodePagedTSWrapper:
          # previous complete plan revision usable.
          self._plan_state = candidate
  
@@ -122,7 +122,7 @@ index 41479a386d72c27eb0df76107318dc09256aff06..3fcec5efdc2a3825be0dc1d9a238aaaa
      def run(
          self,
          q: torch.Tensor,
-@@ -4228,7 +4225,7 @@ class BatchDecodePagedTSWrapper:
+@@ -4230,7 +4227,7 @@ class BatchDecodePagedTSWrapper:
          )
  
  
