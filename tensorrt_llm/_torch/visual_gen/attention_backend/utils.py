@@ -38,7 +38,7 @@ def get_visual_gen_attention_backend(
     Get diffusion attention backend class by name and sparse algorithm.
 
     Args:
-        backend_name: Backend identifier ("VANILLA", "TRTLLM", "CUDNN", "FLASHINFER", "CUTEDSL", "FA4")
+        backend_name: Backend identifier ("VANILLA", "TRTLLM", "CUDNN", "FLASHINFER", "CUTEDSL", "FA4", "TE")
         sparse_algorithm: ``algorithm`` of the sparse attention config, if any. VSA
             ("vsa") and SOL ("sol_attn") have their own TRTLLM and CUTEDSL classes;
             other algorithms, such as skip-softmax, run in the dense class.
@@ -102,6 +102,10 @@ def get_visual_gen_attention_backend(
         from .cudnn import CuDNNAttention
 
         return CuDNNAttention
+    elif backend_name == "TE":
+        from .te import TEAttention
+
+        return TEAttention
     else:
         # Default to VANILLA for maximum compatibility
         from .vanilla import VanillaAttention
@@ -130,7 +134,7 @@ def create_attention(
     internally, simplifying the forward() call.
 
     Args:
-        backend: Backend identifier ("VANILLA", "TRTLLM", "CUDNN", "FLASHINFER", "CUTEDSL", "FA4")
+        backend: Backend identifier ("VANILLA", "TRTLLM", "CUDNN", "FLASHINFER", "CUTEDSL", "FA4", "TE")
         layer_idx: Layer index in the model
         num_heads: Number of attention heads
         head_dim: Dimension per head
