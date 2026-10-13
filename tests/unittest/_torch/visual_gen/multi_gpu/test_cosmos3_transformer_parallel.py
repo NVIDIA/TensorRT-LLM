@@ -21,7 +21,6 @@ os.environ["TRTLLM_DISABLE_COSMOS3_GUARDRAILS"] = "1"
 import pytest
 import torch
 import torch.distributed as dist
-import torch.multiprocessing as mp
 
 from tensorrt_llm._torch.visual_gen.config import (
     AttentionConfig,
@@ -220,59 +219,19 @@ def _cleanup_mpi_env():
 
 
 # =============================================================================
-# Distributed helpers (same pattern as test_wan_tp.py)
+# Distributed helpers
 # =============================================================================
-
-
-def init_distributed_worker(rank: int, world_size: int, backend: str = "nccl", port: int = 29500):
-    os.environ["MASTER_ADDR"] = "127.0.0.1"
-    os.environ["MASTER_PORT"] = str(port)
-    os.environ["RANK"] = str(rank)
-    os.environ["WORLD_SIZE"] = str(world_size)
-    torch.cuda.set_device(rank % torch.cuda.device_count())
-    dist.init_process_group(backend=backend, rank=rank, world_size=world_size)
-
-
-def cleanup_distributed():
-    try:
-        from tensorrt_llm._torch.device_mesh import DeviceMeshTopologyImpl
-
-        DeviceMeshTopologyImpl.device_mesh = None
-        DeviceMeshTopologyImpl.tp_mesh = None
-        VisualGenMapping.seq_mesh = None
-    except ImportError:
-        pass
-    if dist.is_initialized():
-        dist.barrier()
-        dist.destroy_process_group()
-
-
-def _distributed_worker(rank, world_size, backend, test_fn, port):
-    try:
-        init_distributed_worker(rank, world_size, backend, port)
-        test_fn(rank, world_size)
-    except Exception as e:
-        print(f"Rank {rank} failed with error: {e}", flush=True)
-        raise
-    finally:
-        cleanup_distributed()
 
 
 def run_test_in_distributed(world_size: int, test_fn: Callable, use_cuda: bool = True):
     if use_cuda and torch.cuda.device_count() < world_size:
         pytest.skip(f"Test requires {world_size} GPUs, only {torch.cuda.device_count()} available")
-    backend = "nccl" if use_cuda else "gloo"
-    # Spawn distributed workers via a helper that retries with a fresh master
-    # port when the c10d rendezvous TCPStore loses the bind race (EADDRINUSE).
-    from ._visual_gen_dist_utils import spawn_with_retry
+    # Ranks come from the persistent per-world-size pool in _worker_pool.py;
+    # test_fn runs as test_fn(rank, world_size).
+    from ._worker_pool import run_distributed
 
-    spawn_with_retry(
-        lambda port: mp.spawn(
-            _distributed_worker,
-            args=(world_size, backend, test_fn, port),
-            nprocs=world_size,
-            join=True,
-        )
+    run_distributed(
+        world_size, test_fn, backend="nccl" if use_cuda else "gloo", preload=("tensorrt_llm",)
     )
 
 
@@ -623,7 +582,7 @@ def _assert_parity(actual: torch.Tensor, expected: torch.Tensor, *, msg: str) ->
 
 
 # =============================================================================
-# Test logic (module-level for mp.spawn pickling)
+# Test logic (module-level so the pool can pickle it by reference)
 # =============================================================================
 
 
