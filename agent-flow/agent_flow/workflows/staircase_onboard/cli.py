@@ -171,6 +171,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--stage",
+        dest="entry_stage",
         choices=["", "tune"],
         default="",
         help="Start at a later stage. `tune` runs the performance stage (ground truth, "
@@ -402,7 +403,7 @@ def main(argv: list[str] | None = None) -> None:
         skip_substrate_gate=args.skip_substrate_gate,
         agent_transport=transport,
         overlap_units=args.overlap_units,
-        entry_stage=args.stage,
+        entry_stage=args.entry_stage,
     ) as workflow:
         workflow.run(args.task)
 

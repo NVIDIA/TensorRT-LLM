@@ -2,24 +2,30 @@
 
 ## Capture
 
-TensorRT-LLM's own recipe, as `bench.py --nsys <prefix>` runs it:
+`bench.py --nsys <prefix>` (or `<perf workdir>/scripts/nsys_capture.sh`) inside a spool job. Two modes:
+
+- **session (default)**: `nsys launch -t cuda,nvtx --cuda-graph-trace node trtllm-serve ...`, then
+  `nsys start -o <prefix>` `--nsys-delay` seconds into the first measured point and `nsys stop`
+  `--nsys-duration` seconds later. Nothing inside the server calls the profiler API.
+- **api**: TensorRT-LLM's documented recipe, `TLLM_PROFILE_START_STOP=<A>-<B> nsys profile -t cuda,nvtx
+  -c cudaProfilerApi --cuda-graph-trace node --capture-range-end=stop --gpu-metrics-devices=none`. On
+  this target's single-process server the in-process stop never returned (2026-10-13, nsys 2026.5.1,
+  GB300) -- first because `cudaProfilerStop` held the GIL (fixed in `pyexecutor/profiling.py`), then
+  inside CUPTI. Use it where it works; do not add `osrt`.
+
+`--cuda-graph-trace node` shows every kernel inside a replayed graph; `graph` shows one range per replay.
+Boot under CUPTI is several times slower; the harness allows 90 minutes. A profiled run's throughput is
+perturbed: use a throwaway label and never quote it.
+
+Then summarize per step (standard library only):
 
 ```bash
-TLLM_PROFILE_START_STOP=<A>-<B> nsys profile -o <prefix> -f true -t cuda,nvtx \
-  -c cudaProfilerApi --cuda-graph-trace node --capture-range-end=stop \
-  --gpu-metrics-devices=none trtllm-serve <model> --host ... --port ... --config <yaml>
+python3 <PKG>/tune/nsys_summary.py <prefix>.sqlite --top 15 --json <prefix>.summary.json
 ```
 
-- `-c cudaProfilerApi` + `TLLM_PROFILE_START_STOP` collect only iterations A..B of the executor.
-- `--capture-range-end=stop` keeps the server serving after the window. nsys's default
-  (`stop-shutdown`) tore the server down mid-sweep and, with `osrt` tracing added, hung the capture
-  with the report never written (observed 2026-10-12, nsys 2026.5.1, GB300). Do not add `osrt`.
-- `--cuda-graph-trace node` shows every kernel inside a replayed graph; `graph` shows one range per
-  replay (cheaper, no per-kernel attribution).
-- Boot under CUPTI is several times slower; the harness allows 90 minutes.
-- A profiled run's throughput is perturbed. Use a throwaway label; never quote it.
-
-Use `<perf workdir>/scripts/nsys_capture.sh` (or the same flags) inside a whole-node spool job.
+It attributes kernels to the executor step whose host range launched them and reports, per step class
+(decode / mixed / prefill): GPU busy time, span, idle in span, kernels per step, time per kernel family,
+the top kernels, and the executor's host ranges.
 
 ### Window arithmetic
 

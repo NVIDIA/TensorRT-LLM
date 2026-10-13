@@ -131,6 +131,7 @@ def main(argv: list[str] | None = None) -> int:
     camp.add_argument("--slug", default="")
     camp.add_argument("--decision", type=Path, default=None)
     camp.add_argument("--poll", type=float, default=30.0)
+    camp.add_argument("--idle-exit", type=float, default=0.0, help="seconds idle before `run` exits; 0 = never")
     tab = sub.add_parser("table")
     tab.add_argument("--baseline", type=Path, default=None)
     tab.add_argument("dirs", nargs="+", type=Path)
@@ -155,13 +156,22 @@ def main(argv: list[str] | None = None) -> int:
         log = lambda msg: print(msg, flush=True)  # noqa: E731
         c = build_campaign(perf, log=log)
         if args.action == "submit":
-            c.submit_candidate(args.slug, args.decision)
-            c.step()
+            # The running loop ingests it; two processes never write the state file.
+            print(f"[campaign] queued {c.enqueue(args.slug, args.decision)}")
         elif args.action == "step":
             c.step()
         elif args.action == "run":
-            while c.step():
+            # A campaign loop stays up while candidates may still arrive (--idle-exit 0).
+            idle = 0.0
+            while True:
+                busy = c.step()
+                inbox = list((c.workdir / "inbox").glob("*.json"))
+                if busy or inbox:
+                    idle = 0.0
+                elif args.idle_exit and idle >= args.idle_exit:
+                    break
                 time.sleep(args.poll)
+                idle += args.poll
         print(c.summary())
         return 0
     if args.cmd == "table":

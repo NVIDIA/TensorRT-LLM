@@ -11,7 +11,10 @@ candidate that changes native code is a ``NEED_REBUILD``, not a worktree edit.
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import subprocess
+import time
 from pathlib import Path
 
 from ..overlap import native_artifacts
@@ -24,6 +27,36 @@ def _git(repo: Path, *args: str, check: bool = True) -> str:
     return out.stdout.strip()
 
 
+@contextlib.contextmanager
+def repo_lock(repo: Path):
+    """Serialize worktree creation: concurrent `git worktree add` on one repository
+    (a campaign stacking a candidate while a tuner request opens another) failed with
+    `Could not reset index file to revision 'HEAD'`."""
+    path = Path(_git(repo, "rev-parse", "--git-common-dir"))
+    if not path.is_absolute():
+        path = repo / path
+    with open(path / "staircase-worktree.lock", "w") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+
+
+def add_worktree(repo: Path, tree: Path, *args: str) -> None:
+    """`git worktree add` under the repo lock, retried once after cleaning up a failed attempt."""
+    with repo_lock(repo):
+        for attempt in (1, 2):
+            out = subprocess.run(["git", "-C", str(repo), "worktree", "add", *args], capture_output=True, text=True)
+            if out.returncode == 0:
+                return
+            _git(repo, "worktree", "remove", "--force", str(tree), check=False)
+            _git(repo, "worktree", "prune", check=False)
+            if attempt == 2:
+                raise RuntimeError(f"git worktree add {' '.join(args)}: {out.stderr.strip()}")
+            time.sleep(5)
+
+
 def open_candidate(repo: Path, root: Path, slug: str, base: str = "HEAD") -> Path:
     """Create (or reuse) ``root/<slug>`` on branch ``tune/<slug>`` from ``base``."""
     tree = root / slug
@@ -33,9 +66,9 @@ def open_candidate(repo: Path, root: Path, slug: str, base: str = "HEAD") -> Pat
     branch = f"tune/{slug}"
     exists = _git(repo, "rev-parse", "--verify", "--quiet", branch, check=False)
     if exists:
-        _git(repo, "worktree", "add", str(tree), branch)
+        add_worktree(repo, tree, str(tree), branch)
     else:
-        _git(repo, "worktree", "add", "-b", branch, str(tree), base)
+        add_worktree(repo, tree, "-b", branch, str(tree), base)
     link_native(repo, tree)
     return tree
 

@@ -194,7 +194,13 @@ verbatim error text, use [TROUBLESHOOTING.md](TROUBLESHOOTING.md) instead.
   serving path returns errors no gate saw. A number measured through
   fallback reads as the target's.
 - **Prevented by.**
-  - Every gate runs under `=require`.
+  - Every gate runs under `=require` -- and since modeling_v2's selection
+    became the LLM-API argument `modeling_v2` (default `"off"`), the switch is
+    translated into it: `eval_command` merges `modeling_v2: <mode>` into the
+    member's options YAML and the engine driver passes it to the quickstart's
+    `LLM(...)`. Exporting the environment variable alone selected nothing and
+    every gate served the built-in model (found 2026-10-12; test
+    `test_the_accuracy_command_selects_the_target_through_the_llm_api`).
   - The speculator depth comes from the unit's own options YAML
     (`resolve_max_draft_len`).
   - The unit's own LLM-API options file (`accuracy.llm_api_options`).
@@ -395,3 +401,56 @@ verbatim error text, use [TROUBLESHOOTING.md](TROUBLESHOOTING.md) instead.
     Codex roles, and turns a driver runs.
   - Every attempt is logged to `<workspace>/embargo/attempts.jsonl`.
   - Running another implementation as an oracle stays allowed.
+
+## Performance (the tune stage)
+
+### 35. Hosts differ by more than knobs do; judge on the same host
+- **Symptom.** Six unrelated config rungs (a GC threshold, early first token,
+  stream interval, PLE residency, a token budget, graph sizes) all measured
+  -3% to -4% at concurrency 1. Each had run on one of two nodes that were
+  slower for identical configs (GB300, 2026-10-12: s3 -4%, s2 -3%, s1/s4
+  within 0.1% of each other). The ladder rejected a +4.8% rung as a loss.
+- **Prevented by.** `ladder.Ladder.control(host)` and
+  `campaign.Campaign._control_for(host)`: every measurement is judged
+  against a control of the same config measured on the same host; the noise
+  floor is the worst same-host spread, never the cross-host one. Test
+  `test_probes_are_judged_against_their_own_host`.
+
+### 36. A profiler that cannot finish is worse than none
+- **Symptom.** nsys captures that never wrote a report; the server idle at
+  0% GPU forever after `Profiling started at iteration N`.
+- **Cause.** Two, stacked. `torch.cuda.cudart().cudaProfilerStop()` holds the
+  GIL while CUPTI waits for GPU work that other Python threads must
+  complete (gdb: every other thread in `PyGILState_Ensure`). Fixed in
+  `pyexecutor/profiling.py` (driver call through ctypes). Then
+  `cuProfilerStop` itself still did not return on this target's server, with
+  node- and graph-level graph tracing alike.
+- **Prevented by.** `bench.py --nsys` defaults to session mode: `nsys launch`
+  injects, `nsys start`/`stop` from outside the server time the window, and
+  nothing in the server calls the profiler API.
+
+### 37. A job's processes include the ones that left its session
+- **Symptom.** A 137 GB server from a cancelled capture shared GPU 0 with the
+  next measurement; every node had one after a batch of cancels.
+- **Cause.** `nsys profile` and a server started with `start_new_session`
+  are re-parented to init when the job's leader exits, and the scheduler
+  found a job's processes by session and ancestry only.
+- **Prevented by.** `scheduler.processes_with_marker` (the job's environment
+  markers survive `setsid`); `bench.py` turns SIGTERM into its teardown and
+  refuses a device that already has memory in use.
+
+### 38. Module knobs never reach a target
+- **Symptom.** A config rung that selects a kernel (`moe_config.backend`,
+  `attn_backend`, `use_cute_dsl_*`) measures as noise on the target.
+- **Cause.** A modeling_v2 target pins its kernels through the catalog.
+- **Prevented by.** The ladder skips module knobs for targets; they belong to
+  the stock-tuned reference, where a win is evidence for a catalog change.
+
+### 39. Measure candidates stacked on the current best
+- **Symptom.** Candidates written in parallel from one base, each measured
+  against the base, would be judged against a control that no longer
+  exists once the first keep moves the best tree.
+- **Prevented by.** `campaign.Campaign._stack`: an `eval-<slug>` worktree is
+  the best tree plus the candidate's commits; a keep that moves the best
+  tree re-stacks and re-measures the others before their verdict.
+

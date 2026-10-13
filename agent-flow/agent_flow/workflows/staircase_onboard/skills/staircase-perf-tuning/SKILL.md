@@ -1,6 +1,6 @@
 ---
 name: staircase-perf-tuning
-description: Load for any performance work on a modeling_v2 target -- the tune stage of staircase-onboard. Carries the campaign discipline (ground truth, noise floor, keep rule, reference curves, gap decomposition), the split between the Python config ladder and agent modeling iterations, the kernel sourcing ladder for perf (trtllm op / in-tree module / FlashInfer installed version / torch / Triton / CuTe DSL / CUDA), the candidate protocol (worktree, entry + GPU test, micro-bench, decision file), and how to profile through the spool substrate.
+description: Load for any performance work on a modeling_v2 target -- the tune stage of the staircase onboarding workflow. Carries the campaign discipline (ground truth, noise floor, keep rule, reference curves, gap decomposition), the split between the Python config ladder and agent modeling iterations, the kernel sourcing ladder for perf (trtllm op / in-tree module / FlashInfer installed version / torch / Triton / CuTe DSL / CUDA), the candidate protocol (worktree, entry + GPU test, micro-bench, decision file), and how to profile through the spool substrate.
 ---
 
 # staircase-perf-tuning

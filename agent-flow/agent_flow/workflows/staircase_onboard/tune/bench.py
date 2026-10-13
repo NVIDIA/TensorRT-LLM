@@ -208,6 +208,33 @@ def run_client(
             raise SystemExit(f"client exceeded {CLIENT_POINT_TIMEOUT_S}s at concurrency {concurrency}")
 
 
+class NsysWindow:
+    """Collect ``duration`` seconds, ``delay`` seconds after ``start()``, via nsys session control."""
+
+    def __init__(self, session: str, output: str, delay: float, duration: float) -> None:
+        import threading
+
+        self.session, self.output, self.delay, self.duration = session, output, delay, duration
+        self.log: list[str] = []
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def _nsys(self, *args: str) -> None:
+        out = subprocess.run(["nsys", *args], capture_output=True, text=True, timeout=1800)
+        self.log.append(f"nsys {' '.join(args)} -> rc={out.returncode} {out.stdout[-400:]} {out.stderr[-400:]}")
+
+    def _run(self) -> None:
+        time.sleep(self.delay)
+        self._nsys("start", f"--session={self.session}", "-o", self.output, "-f", "true")
+        time.sleep(self.duration)
+        self._nsys("stop", f"--session={self.session}")
+
+    def join(self, timeout: float) -> None:
+        self._thread.join(timeout)
+
+
 def git(tree: Path, *args: str) -> str:
     try:
         return subprocess.run(
@@ -342,6 +369,9 @@ def main() -> int:
     parser.add_argument("--tree", type=Path, default=None, help="checkout the measurement runs on (identity only)")
     parser.add_argument("--nsys", default=None, metavar="PREFIX", help="profile the server under nsys")
     parser.add_argument("--nsys-extra", default="", help="extra nsys profile flags (space separated)")
+    parser.add_argument("--nsys-mode", choices=["session", "api"], default="session")
+    parser.add_argument("--nsys-delay", type=float, default=30.0, help="session mode: seconds into the first point")
+    parser.add_argument("--nsys-duration", type=float, default=3.0, help="session mode: seconds collected")
     parser.add_argument("--allow-auto", action="store_true", help="permit modeling_v2: auto (not recommended)")
     parser.add_argument("--force", action="store_true", help="overwrite a completed label")
     parser.add_argument("--max-used-mib", type=int, default=2048, help="refuse a device with more memory in use")
@@ -387,17 +417,29 @@ def main() -> int:
     server_argv = [
         serve, args.model, "--host", "127.0.0.1", "--port", str(port), "--config", str(config_path)
     ]  # fmt: skip
-    if args.nsys:
+    nsys_session = ""
+    if args.nsys and args.nsys_mode == "api":
         # TensorRT-LLM's documented capture: the iteration window comes from
         # TLLM_PROFILE_START_STOP, `-c cudaProfilerApi` collects only inside it,
         # and `--capture-range-end=stop` keeps the server serving after the
-        # window closes (the default, stop-shutdown, tears the server down and
-        # has hung the capture instead). GPU metrics sampling stays off.
+        # window closes. On this target's server the in-process
+        # cuProfilerStop never returned (2026-10-13); prefer --nsys-mode session.
         server_argv = [
             "nsys", "profile", "-o", args.nsys, "-f", "true",
             "-t", "cuda,nvtx", "-c", "cudaProfilerApi",
             "--cuda-graph-trace", os.environ.get("STAIRCASE_NSYS_GRAPH_TRACE", "node"),
             "--capture-range-end=stop", "--gpu-metrics-devices=none",
+            *filter(None, args.nsys_extra.split(" ")),
+        ] + server_argv  # fmt: skip
+    elif args.nsys:
+        # Session mode: nsys injects at launch and collects only between an
+        # external `nsys start` and `nsys stop`, timed from the measured point
+        # (see NsysWindow). Nothing inside the server calls the profiler API,
+        # so nothing in it can block on the flush.
+        nsys_session = f"bench-{os.getpid()}"
+        server_argv = [
+            "nsys", "launch", f"--session-new={nsys_session}", "-t", "cuda,nvtx",
+            "--cuda-graph-trace", os.environ.get("STAIRCASE_NSYS_GRAPH_TRACE", "node"),
             *filter(None, args.nsys_extra.split(" ")),
         ] + server_argv  # fmt: skip
 
@@ -424,9 +466,13 @@ def main() -> int:
             concurrency=args.warmup_concurrency, num_prompts=args.warmup_prompts, seed=WARMUP_SEED,
             server=server, log_path=log_path, client_log=client_log,
         )  # fmt: skip
+        window = None
         for concurrency in concurrencies:
             n = num_prompts_for(concurrency, args.rounds, fixed)
             print(f"[perf] con={concurrency} num_prompts={n}", flush=True)
+            if nsys_session and window is None:
+                window = NsysWindow(nsys_session, args.nsys, args.nsys_delay, args.nsys_duration)
+                window.start()
             timings[f"con{concurrency}_s"] = run_client(
                 model=args.model, tokenizer=args.model, port=port, isl=args.isl, osl=args.osl,
                 concurrency=concurrency, num_prompts=n, seed=concurrency,
@@ -434,6 +480,10 @@ def main() -> int:
                 save_to=out_dir / point_file(concurrency),
                 metadata={"label": args.label, "isl": args.isl, "osl": args.osl, "seed": concurrency},
             )  # fmt: skip
+        if window is not None:
+            window.join(timeout=1800)
+            timings["nsys"] = window.log
+            print("[perf] nsys: " + " | ".join(window.log), flush=True)
     finally:
         try:
             os.killpg(server.pid, signal.SIGTERM)

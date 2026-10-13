@@ -437,6 +437,33 @@ twelve minutes. The external transport defaults to eight concurrent smiths and
 
 ---
 
+## Performance measurement (the tune stage)
+
+### nsys: `Profiling started at iteration N`, then the server sits at 0% GPU and no report is written
+
+Two causes, stacked, on a single-process `trtllm-serve` (2026-10-13):
+
+- `torch.cuda.cudart().cudaProfilerStop()` holds the GIL while CUPTI waits for GPU work that other
+  Python threads must complete: gdb shows every other thread in `PyGILState_Ensure`. Fixed in
+  `tensorrt_llm/_torch/pyexecutor/profiling.py` (driver `cuProfilerStop` through ctypes).
+- With that fixed, `cuProfilerStop` still did not return with `-c cudaProfilerApi`, with node- and
+  graph-level graph tracing alike.
+
+Use `bench.py --nsys <prefix>` in its default session mode: `nsys launch` + `nsys start/stop` timed from
+the measured point (`--nsys-delay`, `--nsys-duration`); nothing in the server calls the profiler API.
+
+### A measurement shares its GPU with a server nobody is running
+
+A cancelled job's `nsys profile` (or any server started in its own session) is re-parented to init and
+outlives the job. Sessions started before the scheduler's `processes_with_marker` fix still leak them:
+find processes whose parent is 1 (`ps -eo pid,ppid,comm | awk '$2==1'`) and kill them by pid -- never by a
+pattern that also matches your own shell. `bench.py` now refuses a device with more than 2 GiB in use.
+
+### Every probe on one node looks 3-4% worse at concurrency 1
+
+Not the knob: the node. Identical configs differed by up to 4% between GB300 nodes of one cluster while
+same-node repeats agreed within 0.1%. Judge against a same-host control (the ladder and the campaign do).
+
 ## Python environment
 
 ### The import resolves to a different tree than the one you are measuring

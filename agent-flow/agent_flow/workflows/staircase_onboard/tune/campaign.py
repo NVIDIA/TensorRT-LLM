@@ -53,6 +53,10 @@ class CandidateState:
     deltas: dict = field(default_factory=dict)
     gate: dict = field(default_factory=dict)
     kept_commits: list[str] = field(default_factory=list)
+    # The candidate is measured stacked on the best tree as it stood at
+    # ``eval_base``; a keep that moves the best tree first re-stacks it.
+    eval_tree: str = ""
+    eval_base: str = ""
 
 
 @dataclass
@@ -136,6 +140,9 @@ class Campaign:
                     self.perf.adopt(label)
             if st.status == "gate":
                 self.gates.adopt(f"gate-{st.slug}")
+        for label in self.state.controls.values():
+            if not (self.data / label / "meta.json").exists():
+                self.perf.adopt(label)
 
     # -- configuration ---------------------------------------------------------------
     def configs(self) -> list[Path]:
@@ -204,18 +211,72 @@ class Campaign:
             self.state.save(self.state_path)
             return st
         tree = Path(st.worktree)
+        if tree.is_dir() and self.state.best_tree:
+            # A candidate built on another candidate's branch carries that branch's
+            # commits too: stack everything since it left the best tree.
+            base = git(tree, "merge-base", "HEAD", git(Path(self.state.best_tree), "rev-parse", "HEAD"), check=False)
+            if base:
+                since = git(tree, "rev-list", "--reverse", f"{base}..HEAD").splitlines()
+                if since and set(st.commits) <= set(since) | {c[:10] for c in since} | set(since):
+                    st.commits = since
         if git(tree, "status", "--porcelain", "-uno"):
             st.status, st.reason = "blocked", "worktree has uncommitted changes; the candidate is its commits"
             self.state.save(self.state_path)
             return st
-        st.e2e_label = f"e2e-{slug}-{git(tree, 'rev-parse', '--short=10', 'HEAD')}"
+        if not self._stack(st):
+            self.state.save(self.state_path)
+            return st
         st.control_label = self.state.control_label
         st.status = "e2e"
         self.state.save(self.state_path)
         return st
 
+    def _stack(self, st: CandidateState) -> bool:
+        """Build ``eval-<slug>``: the current best tree with the candidate's commits on top."""
+        from .worktree import add_worktree, link_native
+
+        best = Path(self.state.best_tree)
+        head = git(best, "rev-parse", "HEAD")
+        eval_tree = Path(self.state.best_tree).parent / f"eval-{st.slug}"
+        branch = f"tune/eval-{st.slug}"
+        if eval_tree.exists():
+            git(self.repo, "worktree", "remove", "--force", str(eval_tree), check=False)
+        add_worktree(self.repo, eval_tree, "-B", branch, str(eval_tree), head)
+        link_native(self.repo, eval_tree)
+        out = subprocess.run(["git", "-C", str(eval_tree), "cherry-pick", *st.commits], capture_output=True, text=True)
+        if out.returncode != 0:
+            git(eval_tree, "cherry-pick", "--abort", check=False)
+            st.status, st.reason = "conflict", f"does not stack on tune/best {head[:10]}: {out.stderr.strip()[:300]}"
+            self.ledger.append("candidate_conflict", slug=st.slug, best=head, detail=st.reason)
+            return False
+        st.eval_tree, st.eval_base = str(eval_tree), head
+        st.e2e_label = f"e2e-{st.slug}-{git(eval_tree, 'rev-parse', '--short=10', 'HEAD')}"
+        return True
+
+    def enqueue(self, slug: str, decision_path: Path) -> Path:
+        """Hand a decision to the running loop: only the loop writes the state file."""
+        inbox = self.workdir / "inbox"
+        inbox.mkdir(exist_ok=True)
+        path = inbox / f"{slug}.json"
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps({"slug": slug, "decision": str(decision_path)}))
+        tmp.replace(path)
+        return path
+
+    def _ingest(self) -> None:
+        for path in sorted((self.workdir / "inbox").glob("*.json")):
+            try:
+                item = json.loads(path.read_text())
+                if item["slug"] not in self.state.candidates or self.state.candidates[item["slug"]].status in ("conflict", "blocked"):
+                    self.submit_candidate(item["slug"], Path(item["decision"]))
+                    self.log(f"[campaign] ingested {item['slug']}")
+            except (OSError, ValueError, KeyError, RuntimeError) as exc:
+                self.log(f"[campaign] could not ingest {path.name}: {exc}")
+            path.unlink(missing_ok=True)
+
     def step(self) -> bool:
         """Advance every candidate as far as possible; True while any is in flight."""
+        self._ingest()
         finished = {label for label, _, _ in self.perf.poll()} | {label for label, _, _ in self.gates.poll()}
         busy = False
         for st in self.state.candidates.values():
@@ -230,11 +291,16 @@ class Campaign:
                         if not self._ensure_control(spool):
                             continue
                         cmd = self.bench.command(st.e2e_label, self.data, self.configs())
-                        self.perf.submit(spool, st.e2e_label, cmd, wall=self.bench.wall, tree=st.worktree)
+                        self.perf.submit(spool, st.e2e_label, cmd, wall=self.bench.wall, tree=st.eval_tree or st.worktree)
                         self.log(f"[campaign] e2e {st.slug} queued on {spool}")
                         break
                     continue
                 if m is None:
+                    continue
+                if st.eval_base and st.eval_base != git(Path(self.state.best_tree), "rev-parse", "HEAD"):
+                    # The best tree moved while this was measured: judge it on the new best.
+                    self.log(f"[campaign] {st.slug}: best moved, re-stacking")
+                    self._stack(st)
                     continue
                 ctrl = self._control_for(str(m.meta.get("hostname") or ""))
                 if ctrl is None:
@@ -257,8 +323,9 @@ class Campaign:
                         continue
                     free = self.gates.free_spools()
                     if free:
-                        self.gates.submit(free[0], job, self.gate_cmd(Path(st.worktree), self.configs(), out),
-                                          wall="1h", tree=st.worktree, gpus="1")
+                        tree = st.eval_tree or st.worktree
+                        self.gates.submit(free[0], job, self.gate_cmd(Path(tree), self.configs(), out),
+                                          wall="1h", tree=tree, gpus="1")
                         self.log(f"[campaign] gate {st.slug} queued on {free[0]}")
                     continue
                 if not result.exists():
@@ -275,10 +342,20 @@ class Campaign:
     def _keep(self, st: CandidateState) -> None:
         best = Path(self.state.best_tree)
         before = git(best, "rev-parse", "HEAD")
-        out = subprocess.run(["git", "-C", str(best), "cherry-pick", *st.commits], capture_output=True, text=True)
+        if st.eval_tree and before != st.eval_base:
+            # Another keep landed while this one was gated: measure it again on the new best.
+            self.log(f"[campaign] {st.slug}: best moved during its gate, re-stacking")
+            if self._stack(st):
+                st.status, st.gate = "e2e", {}
+            return
+        source = git(Path(st.eval_tree), "rev-parse", "HEAD") if st.eval_tree else ""
+        out = subprocess.run(
+            ["git", "-C", str(best), "merge", "--ff-only", source] if source else ["git", "-C", str(best), "cherry-pick", *st.commits],
+            capture_output=True, text=True,
+        )  # fmt: skip
         if out.returncode != 0:
             git(best, "cherry-pick", "--abort", check=False)
-            st.status, st.reason = "conflict", f"cherry-pick onto tune/best failed: {out.stderr.strip()[:300]}"
+            st.status, st.reason = "conflict", f"could not move tune/best: {out.stderr.strip()[:300]}"
             self.ledger.append("candidate_conflict", slug=st.slug, detail=st.reason)
             return
         st.kept_commits = git(best, "rev-list", "--reverse", f"{before}..HEAD").splitlines()

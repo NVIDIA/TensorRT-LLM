@@ -827,3 +827,31 @@ accuracy:
 #   allowed_paths: [tensorrt_llm/, tests/, cpp/, examples/]   # the default
 #   allow_co_authors: false    # the default: no Co-authored-by trailer anywhere
 #   base_ref: origin/main      # delivery audits the commits in merge-base(HEAD, base_ref)..HEAD
+
+# ------------------------------------------------------------- performance
+# The tune stage (README "The tune stage"). Chained after delivery with
+# `enabled: true`, or run on an already-onboarded target with
+# `staircase-onboard tune --task task.yaml --workspace W`. Perf is measured,
+# never a release gate; every kept change passes the accuracy gate. Excluded
+# from the evidence spec: adding or editing this block stales no verdict.
+# perf:
+#   enabled: true
+#   identity_configs: [<gate runtime settings + workload capacity, LLM-API yaml>]
+#   workload: {isl: 8192, osl: 1024, concurrency: [1, 128]}
+#   reference: stock               # the same checkpoint and configs under modeling_v2: "off"
+#   spools: [<whole-node session spools for e2e measurements>]
+#   dev_spools: [<sessions for 1-GPU tuner jobs and the accuracy gate>]
+#   env_script: <sourced by every perf job: interpreter, PYTHONNOUSERSITE, CUDA_VISIBLE_DEVICES>
+#   noise_repeats: 2               # identity repeats; the noise floor is the same-host spread
+#   ladder:
+#     min_gain: 0.01               # keep threshold = max(min_gain, noise_factor x spread)
+#     noise_factor: 3.0
+#     extra_rungs:                 # the target's own switches
+#       - {name: ple-hbm, overlay: {env_overrides: {TRTLLM_MODELING_V2_PLE_HOST_OFFLOAD: "0"}}, why: "..."}
+#   campaign:
+#     max_parallel_tuners: 4
+#     max_iterations: 12
+#     max_consecutive_misses: 3
+#     accuracy: {task: gsm8k, anchor: 96.36}
+#   source_embargo: [<this checkpoint's in-tree modeling, its modules and kernels>]
+#   sister_engines: [<other engines' checkouts: strategies may inform, code may not be copied>]

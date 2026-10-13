@@ -254,8 +254,16 @@ class SpoolRunner:
         self.inflight: dict[str, tuple[str, str]] = {}  # job -> (spool, label)
 
     def free_spools(self) -> list[str]:
+        """Sessions with a live watcher and nothing of ours in flight."""
         busy = {spool for spool, _ in self.inflight.values()}
-        return [s for s in self.spools if s not in busy]
+        live = []
+        for spool in self.spools:
+            if spool in busy:
+                continue
+            age = self._spoolctl.watcher_age(spool)
+            if age is not None and age <= self._spoolctl.WATCHER_STALE_S:
+                live.append(spool)
+        return live
 
     def submit(self, spool: str, label: str, command: str, *, wall: str = "2h", tree: str | None = None, gpus: str = "all") -> str:
         name = f"{self.prefix}-{label}"
@@ -263,7 +271,13 @@ class SpoolRunner:
         if tree:
             header["tree"] = tree
         script = self._spoolctl.render_job(command, header=header)
-        self._spoolctl.queue_job(spool, name, script)
+        try:
+            self._spoolctl.queue_job(spool, name, script)
+        except self._spoolctl.SpoolError as exc:
+            # Queued by an earlier process of this campaign: adopt it, never twice.
+            if "already queued or running" not in str(exc) or not self.adopt(label):
+                raise
+            return name
         self.inflight[name] = (spool, label)
         return name
 
