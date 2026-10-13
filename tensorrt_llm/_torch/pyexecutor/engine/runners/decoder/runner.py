@@ -716,12 +716,6 @@ class DecoderRunner(ScheduledModelRunner):
         )
 
         log_mem_snapshot("warmup/before_warmup")
-        # Compile the DSv4 indexer-Q CuTe DSL kernels before the first
-        # collective-bearing forward, so their JIT cost is not charged against the
-        # MoE all-to-all completion-flag deadline.
-        with self._warmup_timer.phase("cute_dsl_indexer_q"):
-            self._prewarm_cute_dsl_indexer_q()
-        log_mem_snapshot("warmup/after_cute_dsl_indexer_q")
         if self._context_warmups_supported:
             with self._warmup_timer.phase(
                 "attention_jit", metrics=self._metrics, metric_name="attention_warmup_seconds"
@@ -978,69 +972,6 @@ class DecoderRunner(ScheduledModelRunner):
                     f"skipping bucket. {type(e).__name__}: {e}"
                 )
         torch.cuda.synchronize()
-
-    def _prewarm_cute_dsl_indexer_q(self) -> None:
-        """Pre-compile the DSv4 indexer-Q CuTe DSL kernels, then barrier.
-
-        Runs before any collective-bearing forward so this op's first-touch
-        ``cute.compile`` is not charged against the MoE all-to-all
-        completion-flag deadline. It is a partial mitigation only: other
-        first-touch compiles remain inside collective-bearing forwards, and some
-        sit on the all-to-all path itself and cannot be pre-compiled this way.
-        The runtime budget (``moeA2AGetTimeoutCycles``) covers the general case.
-
-        Only the fallback tactics are compiled -- what an eager, cache-miss
-        forward selects. The runner's kernel cache key excludes m/n/k, so one
-        compile per tactic covers every shape. Uses the real module and weights,
-        so it cannot drift from what the model runs.
-
-        No-op on non-DSA models. See nvbugs/6482566.
-        """
-        try:
-            from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.deepseek_v4 import (
-                DeepseekV4Indexer,
-            )
-        except ImportError:
-            return
-
-        indexer = next(
-            (
-                m
-                for m in self.model.modules()
-                if isinstance(m, DeepseekV4Indexer) and getattr(m, "wq_b", None) is not None
-            ),
-            None,
-        )
-        if indexer is None:
-            return
-
-        weight = indexer.wq_b.weight
-        # _fallback_tactic() branches on m at 4 and 8, so these three token
-        # counts cover every fallback tactic it can return.
-        with torch.inference_mode():
-            for num_tokens in (4, 8, 16):
-                try:
-                    qr = torch.zeros(
-                        (num_tokens, weight.shape[1]), dtype=torch.bfloat16, device=weight.device
-                    )
-                    position_ids = torch.zeros(
-                        (num_tokens,), dtype=torch.int32, device=weight.device
-                    )
-                    indexer._project_and_quantize_q(qr, position_ids)
-                except Exception as e:
-                    # Never fail startup for a prewarm miss; the kernel would
-                    # simply be compiled later, as it is today.
-                    logger.warning(
-                        f"indexer-Q CuTe DSL prewarm skipped for {num_tokens} "
-                        f"tokens. {type(e).__name__}: {e}"
-                    )
-        torch.cuda.synchronize()
-
-        # Hold every rank here until the slowest has finished compiling, so the
-        # first MoE all-to-all dispatch is entered without JIT skew.
-        if self.mapping.tp_size > 1 and self.dist is not None:
-            self.dist.tp_allgather(1)
-        logger.info("indexer-Q CuTe DSL prewarm complete")
 
     def _ensure_dsa_attn_metadata_for_warmup(self, resource_manager: ResourceManager) -> None:
         """Build the DSA attention metadata if no warmup forward created it, so
