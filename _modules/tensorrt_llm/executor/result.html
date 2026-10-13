@@ -26,8 +26,8 @@
   </noscript>
   
   <!-- Loaded before other Sphinx assets -->
-  <link href="../../../_static/styles/theme.css?digest=64cc4de3f052d77215f0" rel="stylesheet" />
-<link href="../../../_static/styles/pydata-sphinx-theme.css?digest=64cc4de3f052d77215f0" rel="stylesheet" />
+  <link href="../../../_static/styles/theme.css?digest=18bd87630a240e9c25be" rel="stylesheet" />
+<link href="../../../_static/styles/pydata-sphinx-theme.css?digest=18bd87630a240e9c25be" rel="stylesheet" />
 
     <link rel="stylesheet" type="text/css" href="../../../_static/pygments.css?v=8f2a1f02" />
     <link rel="stylesheet" type="text/css" href="../../../_static/styles/nvidia-sphinx-theme.css?v=933278ad" />
@@ -38,10 +38,10 @@
     <link rel="stylesheet" type="text/css" href="../../../_static/custom.css?v=19d20f17" />
   
   <!-- So that users can add custom icons -->
-  <script defer src="../../../_static/scripts/fontawesome.js?digest=64cc4de3f052d77215f0"></script>
+  <script defer src="../../../_static/scripts/fontawesome.js?digest=18bd87630a240e9c25be"></script>
   <!-- Pre-loaded scripts that we'll load fully later -->
-  <link rel="preload" as="script" href="../../../_static/scripts/bootstrap.js?digest=64cc4de3f052d77215f0" />
-<link rel="preload" as="script" href="../../../_static/scripts/pydata-sphinx-theme.js?digest=64cc4de3f052d77215f0" />
+  <link rel="preload" as="script" href="../../../_static/scripts/bootstrap.js?digest=18bd87630a240e9c25be" />
+<link rel="preload" as="script" href="../../../_static/scripts/pydata-sphinx-theme.js?digest=18bd87630a240e9c25be" />
 
 
 
@@ -417,9 +417,9 @@ window.addEventListener("load", load);
 window.runMermaid = runMermaid;</script>
     <script>DOCUMENTATION_OPTIONS.pagename = '_modules/tensorrt_llm/executor/result';</script>
     <script>
-        DOCUMENTATION_OPTIONS.theme_version = '0.22.0';
+        DOCUMENTATION_OPTIONS.theme_version = '0.23.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc29';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc0';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -432,8 +432,9 @@ window.runMermaid = runMermaid;</script>
 
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="color-scheme" content="light dark"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc29" />
+  <meta name="docsearch:version" content="1.4.0rc0" />
   
     
     <script src="../../../_static/searchtools.js"></script>
@@ -763,6 +764,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/deployment-guide-for-qwen3.8-flash-next-on-trtllm.html">Deployment Guide for Qwen3.8-Flash-Next on TensorRT LLM - Blackwell Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/deployment-guide-for-kimi-k3-on-trtllm.html">Deployment Guide for Kimi K3 on TensorRT LLM - Blackwell</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/deployment-guide-for-glm-5-on-trtllm.html">Deployment Guide for GLM-5 on TensorRT LLM - Blackwell Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/deployment-guide-for-glm-5.3-flash-on-trtllm.html">Deployment Guide for GLM-5.3-Flash on TensorRT LLM - Blackwell Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/deployment-guide-for-minimax-m3-on-trtllm.html">Deployment Guide for MiniMax-M3 on TensorRT LLM</a></li>
 </ul>
 </details></li>
@@ -809,6 +811,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/CudaGraphConfig.html">CudaGraphConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/DecodeCudaGraphConfig.html">DecodeCudaGraphConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/EncodeCudaGraphConfig.html">EncodeCudaGraphConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/EncodeExtraInputSpec.html">EncodeExtraInputSpec</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/MoeConfig.html">MoeConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/EagleDecodingConfig.html">EagleDecodingConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/Eagle3DecodingConfig.html">Eagle3DecodingConfig</a></li>
@@ -1085,6 +1088,16 @@ window.runMermaid = runMermaid;</script>
     <span class="n">generation</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">TokenLogprobs</span> <span class="o">|</span> <span class="n">SimpleTokenLogprobs</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
 
 
+<span class="k">class</span><span class="w"> </span><span class="nc">_SpecDecCounters</span><span class="p">(</span><span class="n">NamedTuple</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""Speculative-decoding counters reported by the request behind one sequence.</span>
+
+<span class="sd">    Field names match the executor response so a formatter can read either.</span>
+<span class="sd">    """</span>
+    <span class="n">per_pos_drafted</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">List</span><span class="p">[</span><span class="nb">int</span><span class="p">]]</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">per_pos_accepted</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">List</span><span class="p">[</span><span class="nb">int</span><span class="p">]]</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">spec_dec_totals</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">tuple</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">int</span><span class="p">]]</span> <span class="o">=</span> <span class="kc">None</span>
+
+
 <span class="k">class</span><span class="w"> </span><span class="nc">ResponseWrapper</span><span class="p">:</span>
 <span class="w">    </span><span class="sd">"""1. Wrapper of runtime response with optional outputs computed post runtime.</span>
 <span class="sd">    2. A workaround to pass around RequestPerfMetrics.</span>
@@ -1171,6 +1184,10 @@ window.runMermaid = runMermaid;</script>
                                                 <span class="nb">repr</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
     <span class="c1"># the result of result_handler passed to postprocess workers</span>
     <span class="n">_postprocess_result</span><span class="p">:</span> <span class="n">Any</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="c1"># this sequence's own spec-decode counters; see _handle_sequence</span>
+    <span class="n">_spec_dec_counters</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">_SpecDecCounters</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+                                                           <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+                                                           <span class="nb">repr</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">__getstate__</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">:</span>
         <span class="c1"># _incremental_states holds a tokenizers.DecodeStream (a Rust object,</span>
@@ -1382,6 +1399,15 @@ window.runMermaid = runMermaid;</script>
         <span class="n">output</span><span class="o">.</span><span class="n">disaggregated_params</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">disaggregated_params</span>
         <span class="n">output</span><span class="o">.</span><span class="n">_last_token_ids_len</span> <span class="o">=</span> <span class="nb">len</span><span class="p">(</span><span class="n">output</span><span class="o">.</span><span class="n">token_ids</span><span class="p">)</span>
         <span class="n">output</span><span class="o">.</span><span class="n">_last_logprobs_len</span> <span class="o">=</span> <span class="nb">len</span><span class="p">(</span><span class="n">output</span><span class="o">.</span><span class="n">logprobs</span><span class="p">)</span>
+        <span class="c1"># With n &gt; 1 each candidate is its own child request with its own</span>
+        <span class="c1"># counters, while the request-level copies on self are overwritten by</span>
+        <span class="c1"># every candidate's response. Capture this sequence's here so a choice</span>
+        <span class="c1"># never reports whichever candidate happened to respond last.</span>
+        <span class="n">output</span><span class="o">.</span><span class="n">_spec_dec_counters</span> <span class="o">=</span> <span class="n">_SpecDecCounters</span><span class="p">(</span>
+            <span class="n">per_pos_drafted</span><span class="o">=</span><span class="nb">getattr</span><span class="p">(</span><span class="n">response_tensors</span><span class="p">,</span> <span class="s1">'per_pos_drafted'</span><span class="p">,</span> <span class="kc">None</span><span class="p">),</span>
+            <span class="n">per_pos_accepted</span><span class="o">=</span><span class="nb">getattr</span><span class="p">(</span><span class="n">response_tensors</span><span class="p">,</span> <span class="s1">'per_pos_accepted'</span><span class="p">,</span>
+                                     <span class="kc">None</span><span class="p">),</span>
+            <span class="n">spec_dec_totals</span><span class="o">=</span><span class="nb">getattr</span><span class="p">(</span><span class="n">response_tensors</span><span class="p">,</span> <span class="s1">'spec_dec_totals'</span><span class="p">,</span> <span class="kc">None</span><span class="p">))</span>
         <span class="n">decoder_output_prefix</span> <span class="o">=</span> <span class="p">()</span>
         <span class="k">if</span> <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">sampling_params</span><span class="o">.</span><span class="n">exclude_input_from_output</span>
                 <span class="ow">or</span> <span class="nb">getattr</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="s2">"_streaming"</span><span class="p">,</span> <span class="kc">False</span><span class="p">)):</span>
@@ -2478,8 +2504,8 @@ window.runMermaid = runMermaid;</script>
   
 
   <!-- Scripts loaded after <body> so the DOM is not blocked -->
-  <script defer src="../../../_static/scripts/bootstrap.js?digest=64cc4de3f052d77215f0"></script>
-<script defer src="../../../_static/scripts/pydata-sphinx-theme.js?digest=64cc4de3f052d77215f0"></script>
+  <script defer src="../../../_static/scripts/bootstrap.js?digest=18bd87630a240e9c25be"></script>
+<script defer src="../../../_static/scripts/pydata-sphinx-theme.js?digest=18bd87630a240e9c25be"></script>
 
 
   <footer class="bd-footer">
@@ -2551,9 +2577,9 @@ window.runMermaid = runMermaid;</script>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on September 26, 2026.</p>
+  <p>Last updated on October 09, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/c76f4a8">c76f4a8</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/cc63e66">cc63e66</a>.</p>
   
 </div></div>
       

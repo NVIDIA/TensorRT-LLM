@@ -27,8 +27,8 @@
   </noscript>
   
   <!-- Loaded before other Sphinx assets -->
-  <link href="../_static/styles/theme.css?digest=64cc4de3f052d77215f0" rel="stylesheet" />
-<link href="../_static/styles/pydata-sphinx-theme.css?digest=64cc4de3f052d77215f0" rel="stylesheet" />
+  <link href="../_static/styles/theme.css?digest=18bd87630a240e9c25be" rel="stylesheet" />
+<link href="../_static/styles/pydata-sphinx-theme.css?digest=18bd87630a240e9c25be" rel="stylesheet" />
 
     <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=8f2a1f02" />
     <link rel="stylesheet" type="text/css" href="../_static/styles/nvidia-sphinx-theme.css?v=933278ad" />
@@ -39,10 +39,10 @@
     <link rel="stylesheet" type="text/css" href="../_static/custom.css?v=19d20f17" />
   
   <!-- So that users can add custom icons -->
-  <script defer src="../_static/scripts/fontawesome.js?digest=64cc4de3f052d77215f0"></script>
+  <script defer src="../_static/scripts/fontawesome.js?digest=18bd87630a240e9c25be"></script>
   <!-- Pre-loaded scripts that we'll load fully later -->
-  <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=64cc4de3f052d77215f0" />
-<link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=64cc4de3f052d77215f0" />
+  <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=18bd87630a240e9c25be" />
+<link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=18bd87630a240e9c25be" />
 
 
 
@@ -60,9 +60,9 @@
     <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
     <script>DOCUMENTATION_OPTIONS.pagename = 'examples/llm_kv_cache_connector';</script>
     <script>
-        DOCUMENTATION_OPTIONS.theme_version = '0.22.0';
+        DOCUMENTATION_OPTIONS.theme_version = '0.23.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc29';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc0';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -77,8 +77,9 @@
 
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="color-scheme" content="light dark"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc29" />
+  <meta name="docsearch:version" content="1.4.0rc0" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -408,6 +409,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-qwen3.8-flash-next-on-trtllm.html">Deployment Guide for Qwen3.8-Flash-Next on TensorRT LLM - Blackwell Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-kimi-k3-on-trtllm.html">Deployment Guide for Kimi K3 on TensorRT LLM - Blackwell</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-glm-5-on-trtllm.html">Deployment Guide for GLM-5 on TensorRT LLM - Blackwell Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-glm-5.3-flash-on-trtllm.html">Deployment Guide for GLM-5.3-Flash on TensorRT LLM - Blackwell Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-minimax-m3-on-trtllm.html">Deployment Guide for MiniMax-M3 on TensorRT LLM</a></li>
 </ul>
 </details></li>
@@ -454,6 +456,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CudaGraphConfig.html">CudaGraphConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/DecodeCudaGraphConfig.html">DecodeCudaGraphConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/EncodeCudaGraphConfig.html">EncodeCudaGraphConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/EncodeExtraInputSpec.html">EncodeExtraInputSpec</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/MoeConfig.html">MoeConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/EagleDecodingConfig.html">EagleDecodingConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/Eagle3DecodingConfig.html">Eagle3DecodingConfig</a></li>
@@ -656,353 +659,424 @@
                   
   <section id="kv-cache-connector">
 <h1>KV Cache Connector<a class="headerlink" href="#kv-cache-connector" title="Link to this heading">#</a></h1>
-<p>Source <a class="github reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/c76f4a856447820aa1f994b053da7580d69b657d/examples/llm-api/llm_kv_cache_connector.py">NVIDIA/TensorRT-LLM</a>.</p>
-<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="linenos">  1</span><span class="sd">'''</span>
-<span class="linenos">  2</span><span class="sd">This script demonstrates the KV cache connector feature in TensorRT-LLM, which enables</span>
-<span class="linenos">  3</span><span class="sd">custom persistence and reuse of KV cache blocks across different LLM instances.</span>
-<span class="linenos">  4</span>
-<span class="linenos">  5</span><span class="sd">**Scenario:**</span>
-<span class="linenos">  6</span><span class="sd">The script implements a persistent KV cache connector that saves computed KV cache blocks</span>
-<span class="linenos">  7</span><span class="sd">to disk and loads them back in subsequent runs, eliminating redundant computation for</span>
-<span class="linenos">  8</span><span class="sd">recurring prompts.</span>
-<span class="linenos">  9</span>
-<span class="linenos"> 10</span><span class="sd">**What is a KV Cache Connector?**</span>
-<span class="linenos"> 11</span>
-<span class="linenos"> 12</span><span class="sd">A KV cache connector is a customizable interface that allows you to:</span>
-<span class="linenos"> 13</span><span class="sd">1.  **Save KV Cache:** Persist computed KV cache blocks to an external storage</span>
-<span class="linenos"> 14</span><span class="sd">    (disk, database, distributed cache, etc.)</span>
-<span class="linenos"> 15</span><span class="sd">2.  **Load KV Cache:** Retrieve previously computed cache blocks instead of recomputing them</span>
-<span class="linenos"> 16</span><span class="sd">3.  **Share Cache Across Instances:** Reuse cache blocks across different LLM instances</span>
-<span class="linenos"> 17</span><span class="sd">    or sessions, unlike regular block reuse which is limited to a single instance</span>
-<span class="linenos"> 18</span>
-<span class="linenos"> 19</span><span class="sd">**How It Works:**</span>
-<span class="linenos"> 20</span>
-<span class="linenos"> 21</span><span class="sd">This example implements a `PersistentKvCacheConnector` with two key components:</span>
-<span class="linenos"> 22</span>
-<span class="linenos"> 23</span><span class="sd">* **PersistentKvCacheConnectorLeader (Scheduler):**</span>
-<span class="linenos"> 24</span><span class="sd">    - Hashes token sequences to create unique identifiers for each cache block</span>
-<span class="linenos"> 25</span><span class="sd">    - Checks if cached blocks exist on disk for incoming requests</span>
-<span class="linenos"> 26</span><span class="sd">    - Schedules load operations for cache hits</span>
-<span class="linenos"> 27</span><span class="sd">    - Schedules save operations for newly computed blocks</span>
-<span class="linenos"> 28</span>
-<span class="linenos"> 29</span><span class="sd">* **PersistentKvCacheConnectorWorker:**</span>
-<span class="linenos"> 30</span><span class="sd">    - Executes the actual load/save operations between GPU and disk</span>
-<span class="linenos"> 31</span><span class="sd">    - Loads cached blocks from disk files into GPU memory</span>
-<span class="linenos"> 32</span><span class="sd">    - Saves newly computed blocks from GPU to disk files</span>
+<p>Source <a class="github reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/cc63e66daf52644f1441e117bb7ba67d20566016/examples/llm-api/llm_kv_cache_connector.py">NVIDIA/TensorRT-LLM</a>.</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="linenos">  1</span><span class="c1"># SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION &amp; AFFILIATES. All rights reserved.</span>
+<span class="linenos">  2</span><span class="c1"># SPDX-License-Identifier: Apache-2.0</span>
+<span class="linenos">  3</span><span class="c1">#</span>
+<span class="linenos">  4</span><span class="c1"># Licensed under the Apache License, Version 2.0 (the "License");</span>
+<span class="linenos">  5</span><span class="c1"># you may not use this file except in compliance with the License.</span>
+<span class="linenos">  6</span><span class="c1"># You may obtain a copy of the License at</span>
+<span class="linenos">  7</span><span class="c1">#</span>
+<span class="linenos">  8</span><span class="c1"># http://www.apache.org/licenses/LICENSE-2.0</span>
+<span class="linenos">  9</span><span class="c1">#</span>
+<span class="linenos"> 10</span><span class="c1"># Unless required by applicable law or agreed to in writing, software</span>
+<span class="linenos"> 11</span><span class="c1"># distributed under the License is distributed on an "AS IS" BASIS,</span>
+<span class="linenos"> 12</span><span class="c1"># WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.</span>
+<span class="linenos"> 13</span><span class="c1"># See the License for the specific language governing permissions and</span>
+<span class="linenos"> 14</span><span class="c1"># limitations under the License.</span>
+<span class="linenos"> 15</span>
+<span class="linenos"> 16</span><span class="sd">'''</span>
+<span class="linenos"> 17</span><span class="sd">This script demonstrates the KV cache connector feature in TensorRT-LLM, which enables</span>
+<span class="linenos"> 18</span><span class="sd">custom persistence and reuse of KV cache blocks across different LLM instances.</span>
+<span class="linenos"> 19</span>
+<span class="linenos"> 20</span><span class="sd">**Scenario:**</span>
+<span class="linenos"> 21</span><span class="sd">The script implements a persistent KV cache connector that saves computed KV cache blocks</span>
+<span class="linenos"> 22</span><span class="sd">to disk and loads them back in subsequent runs, eliminating redundant computation for</span>
+<span class="linenos"> 23</span><span class="sd">recurring prompts.</span>
+<span class="linenos"> 24</span>
+<span class="linenos"> 25</span><span class="sd">**What is a KV Cache Connector?**</span>
+<span class="linenos"> 26</span>
+<span class="linenos"> 27</span><span class="sd">A KV cache connector is a customizable interface that allows you to:</span>
+<span class="linenos"> 28</span><span class="sd">1.  **Save KV Cache:** Persist computed KV cache blocks to an external storage</span>
+<span class="linenos"> 29</span><span class="sd">    (disk, database, distributed cache, etc.)</span>
+<span class="linenos"> 30</span><span class="sd">2.  **Load KV Cache:** Retrieve previously computed cache blocks instead of recomputing them</span>
+<span class="linenos"> 31</span><span class="sd">3.  **Share Cache Across Instances:** Reuse cache blocks across different LLM instances</span>
+<span class="linenos"> 32</span><span class="sd">    or sessions, unlike regular block reuse which is limited to a single instance</span>
 <span class="linenos"> 33</span>
-<span class="linenos"> 34</span><span class="sd">**Demonstration:**</span>
+<span class="linenos"> 34</span><span class="sd">**How It Works:**</span>
 <span class="linenos"> 35</span>
-<span class="linenos"> 36</span><span class="sd">The script processes the same prompt twice using two separate LLM instances:</span>
+<span class="linenos"> 36</span><span class="sd">This example implements a `PersistentKvCacheConnector` with two key components:</span>
 <span class="linenos"> 37</span>
-<span class="linenos"> 38</span><span class="sd">1.  **First Run (Instance 1):**</span>
-<span class="linenos"> 39</span><span class="sd">    - The LLM computes the KV cache for the input prompt</span>
-<span class="linenos"> 40</span><span class="sd">    - The connector saves the computed cache blocks to disk (as .pt files)</span>
-<span class="linenos"> 41</span><span class="sd">    - The generation completes and the LLM instance is destroyed</span>
-<span class="linenos"> 42</span>
-<span class="linenos"> 43</span><span class="sd">2.  **Second Run (Instance 2):**</span>
-<span class="linenos"> 44</span><span class="sd">    - A new LLM instance is created with the same connector configuration</span>
-<span class="linenos"> 45</span><span class="sd">    - When processing the same prompt, the connector finds matching cache blocks on disk</span>
-<span class="linenos"> 46</span><span class="sd">    - The cache is loaded from disk instead of being recomputed</span>
-<span class="linenos"> 47</span><span class="sd">    - **Expected Outcome:** Faster prefill as cache blocks are loaded rather than computed</span>
-<span class="linenos"> 48</span><span class="sd">    - Both outputs should be identical, demonstrating deterministic cache reuse</span>
-<span class="linenos"> 49</span>
-<span class="linenos"> 50</span><span class="sd">**Key Benefits:**</span>
-<span class="linenos"> 51</span>
-<span class="linenos"> 52</span><span class="sd">- **Cross-Instance Cache Sharing:** Share computed caches across multiple LLM instances</span>
-<span class="linenos"> 53</span><span class="sd">- **Persistent Storage:** Cache survives beyond the lifetime of a single LLM instance</span>
-<span class="linenos"> 54</span><span class="sd">- **Custom Storage Backends:** Implement any storage mechanism (shown here: disk files)</span>
-<span class="linenos"> 55</span><span class="sd">- **Reduced Computation:** Eliminate redundant KV cache computation for repeated prompts</span>
-<span class="linenos"> 56</span>
-<span class="linenos"> 57</span><span class="sd">**How to Run:**</span>
-<span class="linenos"> 58</span>
-<span class="linenos"> 59</span><span class="sd">```bash</span>
-<span class="linenos"> 60</span><span class="sd">python llm_kv_cache_connector.py &lt;model_path&gt;</span>
-<span class="linenos"> 61</span><span class="sd">```</span>
-<span class="linenos"> 62</span>
-<span class="linenos"> 63</span><span class="sd">Example:</span>
-<span class="linenos"> 64</span><span class="sd">```bash</span>
-<span class="linenos"> 65</span><span class="sd">python llm_kv_cache_connector.py meta-llama/Llama-3.1-8B-Instruct</span>
-<span class="linenos"> 66</span><span class="sd">```</span>
-<span class="linenos"> 67</span>
-<span class="linenos"> 68</span><span class="sd">**Implementation Notes:**</span>
-<span class="linenos"> 69</span>
-<span class="linenos"> 70</span><span class="sd">- This example uses content-based hashing to identify cache blocks</span>
-<span class="linenos"> 71</span><span class="sd">- Cache files are stored in a temporary directory (cleaned up after the demo)</span>
-<span class="linenos"> 72</span><span class="sd">- The implementation is simplified and not optimized for production use</span>
-<span class="linenos"> 73</span><span class="sd">- Does not support chunked prefill in this example</span>
-<span class="linenos"> 74</span><span class="sd">- See `tensorrt_llm/_torch/pyexecutor/kv_cache_connector.py` for the full connector interface</span>
-<span class="linenos"> 75</span>
-<span class="linenos"> 76</span><span class="sd">**NOTE:** This example connector implementation is designed for demonstration purposes</span>
-<span class="linenos"> 77</span><span class="sd">and is NOT suitable for production use without additional optimizations and error handling.</span>
-<span class="linenos"> 78</span><span class="sd">'''</span>
-<span class="linenos"> 79</span>
-<span class="linenos"> 80</span><span class="kn">import</span><span class="w"> </span><span class="nn">os</span>
-<span class="linenos"> 81</span><span class="kn">import</span><span class="w"> </span><span class="nn">sys</span>
-<span class="linenos"> 82</span><span class="kn">from</span><span class="w"> </span><span class="nn">dataclasses</span><span class="w"> </span><span class="kn">import</span> <span class="n">dataclass</span><span class="p">,</span> <span class="n">field</span>
-<span class="linenos"> 83</span><span class="kn">from</span><span class="w"> </span><span class="nn">pathlib</span><span class="w"> </span><span class="kn">import</span> <span class="n">Path</span>
-<span class="linenos"> 84</span><span class="kn">from</span><span class="w"> </span><span class="nn">tempfile</span><span class="w"> </span><span class="kn">import</span> <span class="n">TemporaryDirectory</span>
-<span class="linenos"> 85</span><span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">Optional</span>
-<span class="linenos"> 86</span>
-<span class="linenos"> 87</span><span class="kn">import</span><span class="w"> </span><span class="nn">click</span>
-<span class="linenos"> 88</span><span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
-<span class="linenos"> 89</span>
-<span class="linenos"> 90</span><span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm</span><span class="w"> </span><span class="kn">import</span> <span class="n">LLM</span><span class="p">,</span> <span class="n">SamplingParams</span><span class="p">,</span> <span class="n">logger</span>
-<span class="linenos"> 91</span><span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span>
-<span class="linenos"> 92</span>    <span class="n">KvCacheConnectorScheduler</span><span class="p">,</span> <span class="n">KvCacheConnectorWorker</span><span class="p">,</span> <span class="n">SchedulerOutput</span><span class="p">)</span>
-<span class="linenos"> 93</span><span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm._torch.pyexecutor.connectors.kv_cache_layout</span><span class="w"> </span><span class="kn">import</span> \
-<span class="linenos"> 94</span>    <span class="n">valid_page_slots</span>
-<span class="linenos"> 95</span><span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.bindings.internal.batch_manager</span><span class="w"> </span><span class="kn">import</span> <span class="n">LlmRequest</span>
-<span class="linenos"> 96</span><span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.llmapi.llm_args</span><span class="w"> </span><span class="kn">import</span> <span class="n">KvCacheConnectorConfig</span><span class="p">,</span> <span class="n">TorchLlmArgs</span>
-<span class="linenos"> 97</span>
-<span class="linenos"> 98</span><span class="n">CONNECTOR_CACHE_FOLDER_KEY</span> <span class="o">=</span> <span class="s2">"CONNECTOR_CACHE_FOLDER"</span>
-<span class="linenos"> 99</span>
-<span class="linenos">100</span>
-<span class="linenos">101</span><span class="nd">@dataclass</span>
-<span class="linenos">102</span><span class="k">class</span><span class="w"> </span><span class="nc">PersistentKvCacheConnectorMetadata</span><span class="p">:</span>
-<span class="linenos">103</span>    <span class="n">load</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">tuple</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">int</span><span class="p">]]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">list</span><span class="p">)</span>
-<span class="linenos">104</span>    <span class="n">save</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">tuple</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">int</span><span class="p">]]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">list</span><span class="p">)</span>
+<span class="linenos"> 38</span><span class="sd">* **PersistentKvCacheConnectorLeader (Scheduler):**</span>
+<span class="linenos"> 39</span><span class="sd">    - Hashes token sequences to create unique identifiers for each cache block</span>
+<span class="linenos"> 40</span><span class="sd">    - Checks if cached blocks exist on disk for incoming requests</span>
+<span class="linenos"> 41</span><span class="sd">    - Schedules load operations for cache hits</span>
+<span class="linenos"> 42</span><span class="sd">    - Schedules save operations for newly computed blocks</span>
+<span class="linenos"> 43</span>
+<span class="linenos"> 44</span><span class="sd">* **PersistentKvCacheConnectorWorker:**</span>
+<span class="linenos"> 45</span><span class="sd">    - Executes the actual load/save operations between GPU and disk</span>
+<span class="linenos"> 46</span><span class="sd">    - Loads cached blocks from disk files into GPU memory</span>
+<span class="linenos"> 47</span><span class="sd">    - Saves newly computed blocks from GPU to disk files</span>
+<span class="linenos"> 48</span>
+<span class="linenos"> 49</span><span class="sd">**Demonstration:**</span>
+<span class="linenos"> 50</span>
+<span class="linenos"> 51</span><span class="sd">The script processes the same prompt twice using two separate LLM instances:</span>
+<span class="linenos"> 52</span>
+<span class="linenos"> 53</span><span class="sd">1.  **First Run (Instance 1):**</span>
+<span class="linenos"> 54</span><span class="sd">    - The LLM computes the KV cache for the input prompt</span>
+<span class="linenos"> 55</span><span class="sd">    - The connector saves the computed cache blocks to disk (as .pt files)</span>
+<span class="linenos"> 56</span><span class="sd">    - The generation completes and the LLM instance is destroyed</span>
+<span class="linenos"> 57</span>
+<span class="linenos"> 58</span><span class="sd">2.  **Second Run (Instance 2):**</span>
+<span class="linenos"> 59</span><span class="sd">    - A new LLM instance is created with the same connector configuration</span>
+<span class="linenos"> 60</span><span class="sd">    - When processing the same prompt, the connector finds matching cache blocks on disk</span>
+<span class="linenos"> 61</span><span class="sd">    - The cache is loaded from disk instead of being recomputed</span>
+<span class="linenos"> 62</span><span class="sd">    - **Expected Outcome:** Faster prefill as cache blocks are loaded rather than computed</span>
+<span class="linenos"> 63</span><span class="sd">    - Both outputs should be identical, demonstrating deterministic cache reuse</span>
+<span class="linenos"> 64</span>
+<span class="linenos"> 65</span><span class="sd">**Key Benefits:**</span>
+<span class="linenos"> 66</span>
+<span class="linenos"> 67</span><span class="sd">- **Cross-Instance Cache Sharing:** Share computed caches across multiple LLM instances</span>
+<span class="linenos"> 68</span><span class="sd">- **Persistent Storage:** Cache survives beyond the lifetime of a single LLM instance</span>
+<span class="linenos"> 69</span><span class="sd">- **Custom Storage Backends:** Implement any storage mechanism (shown here: disk files)</span>
+<span class="linenos"> 70</span><span class="sd">- **Reduced Computation:** Eliminate redundant KV cache computation for repeated prompts</span>
+<span class="linenos"> 71</span>
+<span class="linenos"> 72</span><span class="sd">**How to Run:**</span>
+<span class="linenos"> 73</span>
+<span class="linenos"> 74</span><span class="sd">```bash</span>
+<span class="linenos"> 75</span><span class="sd">python llm_kv_cache_connector.py &lt;model_path&gt;</span>
+<span class="linenos"> 76</span><span class="sd">```</span>
+<span class="linenos"> 77</span>
+<span class="linenos"> 78</span><span class="sd">Example:</span>
+<span class="linenos"> 79</span><span class="sd">```bash</span>
+<span class="linenos"> 80</span><span class="sd">python llm_kv_cache_connector.py meta-llama/Llama-3.1-8B-Instruct</span>
+<span class="linenos"> 81</span><span class="sd">```</span>
+<span class="linenos"> 82</span>
+<span class="linenos"> 83</span><span class="sd">**Implementation Notes:**</span>
+<span class="linenos"> 84</span>
+<span class="linenos"> 85</span><span class="sd">- This example uses content-based hashing to identify cache blocks</span>
+<span class="linenos"> 86</span><span class="sd">- Cache files are stored in a temporary directory (cleaned up after the demo)</span>
+<span class="linenos"> 87</span><span class="sd">- The implementation is simplified and not optimized for production use</span>
+<span class="linenos"> 88</span><span class="sd">- Does not support chunked prefill in this example</span>
+<span class="linenos"> 89</span><span class="sd">- See `tensorrt_llm/_torch/pyexecutor/connectors/kv_cache_connector.py` for the full connector interface</span>
+<span class="linenos"> 90</span>
+<span class="linenos"> 91</span><span class="sd">**NOTE:** This example connector implementation is designed for demonstration purposes</span>
+<span class="linenos"> 92</span><span class="sd">and is NOT suitable for production use without additional optimizations and error handling.</span>
+<span class="linenos"> 93</span><span class="sd">'''</span>
+<span class="linenos"> 94</span>
+<span class="linenos"> 95</span><span class="kn">import</span><span class="w"> </span><span class="nn">hashlib</span>
+<span class="linenos"> 96</span><span class="kn">import</span><span class="w"> </span><span class="nn">os</span>
+<span class="linenos"> 97</span><span class="kn">import</span><span class="w"> </span><span class="nn">sys</span>
+<span class="linenos"> 98</span><span class="kn">from</span><span class="w"> </span><span class="nn">dataclasses</span><span class="w"> </span><span class="kn">import</span> <span class="n">dataclass</span><span class="p">,</span> <span class="n">field</span>
+<span class="linenos"> 99</span><span class="kn">from</span><span class="w"> </span><span class="nn">pathlib</span><span class="w"> </span><span class="kn">import</span> <span class="n">Path</span>
+<span class="linenos">100</span><span class="kn">from</span><span class="w"> </span><span class="nn">tempfile</span><span class="w"> </span><span class="kn">import</span> <span class="n">NamedTemporaryFile</span><span class="p">,</span> <span class="n">TemporaryDirectory</span>
+<span class="linenos">101</span><span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">Optional</span>
+<span class="linenos">102</span>
+<span class="linenos">103</span><span class="kn">import</span><span class="w"> </span><span class="nn">click</span>
+<span class="linenos">104</span><span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
 <span class="linenos">105</span>
-<span class="linenos">106</span>
-<span class="linenos">107</span><span class="k">class</span><span class="w"> </span><span class="nc">PersistentKvCacheConnectorWorker</span><span class="p">(</span><span class="n">KvCacheConnectorWorker</span><span class="p">):</span>
-<span class="linenos">108</span>
-<span class="linenos">109</span>    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">llm_args</span><span class="p">:</span> <span class="n">TorchLlmArgs</span><span class="p">):</span>
-<span class="linenos">110</span>        <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">(</span><span class="n">llm_args</span><span class="p">)</span>
-<span class="linenos">111</span>
-<span class="linenos">112</span>        <span class="bp">self</span><span class="o">.</span><span class="n">kv_cache_tensor</span> <span class="o">=</span> <span class="kc">None</span>
+<span class="linenos">106</span><span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm</span><span class="w"> </span><span class="kn">import</span> <span class="n">LLM</span><span class="p">,</span> <span class="n">SamplingParams</span><span class="p">,</span> <span class="n">logger</span>
+<span class="linenos">107</span><span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span>
+<span class="linenos">108</span>    <span class="n">KvCacheConnectorScheduler</span><span class="p">,</span> <span class="n">KvCacheConnectorWorker</span><span class="p">,</span> <span class="n">SchedulerOutput</span><span class="p">)</span>
+<span class="linenos">109</span><span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm._torch.pyexecutor.connectors.kv_cache_layout</span><span class="w"> </span><span class="kn">import</span> \
+<span class="linenos">110</span>    <span class="n">valid_page_slots</span>
+<span class="linenos">111</span><span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.bindings.internal.batch_manager</span><span class="w"> </span><span class="kn">import</span> <span class="n">LlmRequest</span>
+<span class="linenos">112</span><span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.llmapi.llm_args</span><span class="w"> </span><span class="kn">import</span> <span class="n">KvCacheConnectorConfig</span><span class="p">,</span> <span class="n">TorchLlmArgs</span>
 <span class="linenos">113</span>
-<span class="linenos">114</span>    <span class="k">def</span><span class="w"> </span><span class="nf">register_kv_caches</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">kv_cache_tensor</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">):</span>
-<span class="linenos">115</span>        <span class="c1"># This is the only registration hook this connector needs. A cache that</span>
-<span class="linenos">116</span>        <span class="c1"># describes itself as a layout instead still arrives here, through</span>
-<span class="linenos">117</span>        <span class="c1"># `register_kv_cache_layout`'s default, as long as one tensor can</span>
-<span class="linenos">118</span>        <span class="c1"># describe it. See llm_kv_cache_connector_vswa.py for the case where it</span>
-<span class="linenos">119</span>        <span class="c1"># cannot -- one attention window size per layer group.</span>
-<span class="linenos">120</span>        <span class="k">assert</span> <span class="bp">self</span><span class="o">.</span><span class="n">kv_cache_tensor</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">,</span> <span class="s2">"KV cache tensor already registered"</span>
-<span class="linenos">121</span>        <span class="bp">self</span><span class="o">.</span><span class="n">kv_cache_tensor</span> <span class="o">=</span> <span class="n">kv_cache_tensor</span>
+<span class="linenos">114</span><span class="n">CONNECTOR_CACHE_FOLDER_KEY</span> <span class="o">=</span> <span class="s2">"CONNECTOR_CACHE_FOLDER"</span>
+<span class="linenos">115</span>
+<span class="linenos">116</span>
+<span class="linenos">117</span><span class="nd">@dataclass</span>
+<span class="linenos">118</span><span class="k">class</span><span class="w"> </span><span class="nc">PersistentKvCacheConnectorMetadata</span><span class="p">:</span>
+<span class="linenos">119</span>    <span class="n">load</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">tuple</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">int</span><span class="p">]]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">list</span><span class="p">)</span>
+<span class="linenos">120</span>    <span class="n">save</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">tuple</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">int</span><span class="p">]]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">list</span><span class="p">)</span>
+<span class="linenos">121</span>    <span class="n">prefix_load_ids</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">list</span><span class="p">)</span>
 <span class="linenos">122</span>
-<span class="linenos">123</span>    <span class="k">def</span><span class="w"> </span><span class="nf">start_load_kv</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">stream</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">Stream</span><span class="p">):</span>
-<span class="linenos">124</span>        <span class="c1"># Do all loads synchronously, and blockwise.</span>
-<span class="linenos">125</span>        <span class="k">for</span> <span class="n">path</span><span class="p">,</span> <span class="n">block_id</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_metadata</span><span class="o">.</span><span class="n">load</span><span class="p">:</span>
-<span class="linenos">126</span>            <span class="n">cpu_tensor</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">path</span><span class="p">,</span> <span class="n">map_location</span><span class="o">=</span><span class="s2">"cpu"</span><span class="p">)</span>
-<span class="linenos">127</span>
-<span class="linenos">128</span>            <span class="c1"># Copy into the device block.</span>
-<span class="linenos">129</span>            <span class="bp">self</span><span class="o">.</span><span class="n">kv_cache_tensor</span><span class="p">[</span><span class="n">block_id</span><span class="p">]</span><span class="o">.</span><span class="n">copy_</span><span class="p">(</span><span class="n">cpu_tensor</span><span class="p">,</span> <span class="n">non_blocking</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
-<span class="linenos">130</span>
-<span class="linenos">131</span>    <span class="k">def</span><span class="w"> </span><span class="nf">wait_for_layer_load</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">layer_idx</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">stream</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">Stream</span><span class="p">):</span>
-<span class="linenos">132</span>        <span class="k">pass</span>
-<span class="linenos">133</span>
-<span class="linenos">134</span>    <span class="k">def</span><span class="w"> </span><span class="nf">save_kv_layer</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">layer_idx</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">stream</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">Stream</span><span class="p">):</span>
-<span class="linenos">135</span>        <span class="k">pass</span>
-<span class="linenos">136</span>
-<span class="linenos">137</span>    <span class="k">def</span><span class="w"> </span><span class="nf">wait_for_save</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">stream</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">Stream</span><span class="p">):</span>
-<span class="linenos">138</span>
-<span class="linenos">139</span>        <span class="c1"># Make sure the forward pass is complete before beginning our save.</span>
-<span class="linenos">140</span>        <span class="n">stream</span><span class="o">.</span><span class="n">synchronize</span><span class="p">()</span>
-<span class="linenos">141</span>
-<span class="linenos">142</span>        <span class="k">for</span> <span class="n">path</span><span class="p">,</span> <span class="n">block_id</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_metadata</span><span class="o">.</span><span class="n">save</span><span class="p">:</span>
-<span class="linenos">143</span>            <span class="n">cpu_tensor</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">kv_cache_tensor</span><span class="p">[</span><span class="n">block_id</span><span class="p">]</span><span class="o">.</span><span class="n">cpu</span><span class="p">()</span>
-<span class="linenos">144</span>
-<span class="linenos">145</span>            <span class="c1"># Don't write anything if this specific block already exists.</span>
-<span class="linenos">146</span>            <span class="k">if</span> <span class="n">Path</span><span class="p">(</span><span class="n">path</span><span class="p">)</span><span class="o">.</span><span class="n">exists</span><span class="p">():</span>
-<span class="linenos">147</span>                <span class="k">continue</span>
+<span class="linenos">123</span>
+<span class="linenos">124</span><span class="k">class</span><span class="w"> </span><span class="nc">PersistentKvCacheConnectorWorker</span><span class="p">(</span><span class="n">KvCacheConnectorWorker</span><span class="p">):</span>
+<span class="linenos">125</span>
+<span class="linenos">126</span>    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">llm_args</span><span class="p">:</span> <span class="n">TorchLlmArgs</span><span class="p">):</span>
+<span class="linenos">127</span>        <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">(</span><span class="n">llm_args</span><span class="p">)</span>
+<span class="linenos">128</span>
+<span class="linenos">129</span>        <span class="bp">self</span><span class="o">.</span><span class="n">kv_cache_tensor</span> <span class="o">=</span> <span class="kc">None</span>
+<span class="linenos">130</span>        <span class="bp">self</span><span class="o">.</span><span class="n">_finished_prefix_loads</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="p">[]</span>
+<span class="linenos">131</span>
+<span class="linenos">132</span>    <span class="k">def</span><span class="w"> </span><span class="nf">register_kv_caches</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">kv_cache_tensor</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">):</span>
+<span class="linenos">133</span>        <span class="c1"># This is the only registration hook this connector needs. A cache that</span>
+<span class="linenos">134</span>        <span class="c1"># describes itself as a layout instead still arrives here, through</span>
+<span class="linenos">135</span>        <span class="c1"># `register_kv_cache_layout`'s default, as long as one tensor can</span>
+<span class="linenos">136</span>        <span class="c1"># describe it. See llm_kv_cache_connector_vswa.py for the case where it</span>
+<span class="linenos">137</span>        <span class="c1"># cannot -- one attention window size per layer group.</span>
+<span class="linenos">138</span>        <span class="k">assert</span> <span class="bp">self</span><span class="o">.</span><span class="n">kv_cache_tensor</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">,</span> <span class="s2">"KV cache tensor already registered"</span>
+<span class="linenos">139</span>        <span class="bp">self</span><span class="o">.</span><span class="n">kv_cache_tensor</span> <span class="o">=</span> <span class="n">kv_cache_tensor</span>
+<span class="linenos">140</span>
+<span class="linenos">141</span>    <span class="k">def</span><span class="w"> </span><span class="nf">start_load_kv</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">stream</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">Stream</span><span class="p">):</span>
+<span class="linenos">142</span>        <span class="c1"># Do all loads synchronously, and blockwise.</span>
+<span class="linenos">143</span>        <span class="k">for</span> <span class="n">path</span><span class="p">,</span> <span class="n">block_id</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_metadata</span><span class="o">.</span><span class="n">load</span><span class="p">:</span>
+<span class="linenos">144</span>            <span class="n">cpu_tensor</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">path</span><span class="p">,</span> <span class="n">map_location</span><span class="o">=</span><span class="s2">"cpu"</span><span class="p">)</span>
+<span class="linenos">145</span>
+<span class="linenos">146</span>            <span class="c1"># Copy into the device block.</span>
+<span class="linenos">147</span>            <span class="bp">self</span><span class="o">.</span><span class="n">kv_cache_tensor</span><span class="p">[</span><span class="n">block_id</span><span class="p">]</span><span class="o">.</span><span class="n">copy_</span><span class="p">(</span><span class="n">cpu_tensor</span><span class="p">,</span> <span class="n">non_blocking</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
 <span class="linenos">148</span>
-<span class="linenos">149</span>            <span class="c1"># Do a blocking save to the file. This way, we only return once all saves are complete.</span>
-<span class="linenos">150</span>            <span class="n">torch</span><span class="o">.</span><span class="n">save</span><span class="p">(</span><span class="n">cpu_tensor</span><span class="p">,</span> <span class="n">path</span><span class="p">)</span>
-<span class="linenos">151</span>
-<span class="linenos">152</span>    <span class="k">def</span><span class="w"> </span><span class="nf">get_finished</span><span class="p">(</span>
-<span class="linenos">153</span>            <span class="bp">self</span><span class="p">,</span> <span class="n">finished_gen_req_ids</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">],</span>
-<span class="linenos">154</span>            <span class="n">started_loading_req_ids</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">],</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]]:</span>
-<span class="linenos">155</span>
-<span class="linenos">156</span>        <span class="k">return</span> <span class="p">[],</span> <span class="p">[]</span>
+<span class="linenos">149</span>        <span class="bp">self</span><span class="o">.</span><span class="n">_finished_prefix_loads</span><span class="o">.</span><span class="n">extend</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_metadata</span><span class="o">.</span><span class="n">prefix_load_ids</span><span class="p">)</span>
+<span class="linenos">150</span>
+<span class="linenos">151</span>    <span class="k">def</span><span class="w"> </span><span class="nf">get_finished_prefix_loads</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]:</span>
+<span class="linenos">152</span>        <span class="n">finished</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_finished_prefix_loads</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_finished_prefix_loads</span><span class="p">,</span> <span class="p">[]</span>
+<span class="linenos">153</span>        <span class="k">return</span> <span class="n">finished</span>
+<span class="linenos">154</span>
+<span class="linenos">155</span>    <span class="k">def</span><span class="w"> </span><span class="nf">wait_for_layer_load</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">layer_idx</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">stream</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">Stream</span><span class="p">):</span>
+<span class="linenos">156</span>        <span class="k">pass</span>
 <span class="linenos">157</span>
-<span class="linenos">158</span>
-<span class="linenos">159</span><span class="k">class</span><span class="w"> </span><span class="nc">PersistentKvCacheConnectorLeader</span><span class="p">(</span><span class="n">KvCacheConnectorScheduler</span><span class="p">):</span>
+<span class="linenos">158</span>    <span class="k">def</span><span class="w"> </span><span class="nf">save_kv_layer</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">layer_idx</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">stream</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">Stream</span><span class="p">):</span>
+<span class="linenos">159</span>        <span class="k">pass</span>
 <span class="linenos">160</span>
-<span class="linenos">161</span>    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">llm_args</span><span class="p">:</span> <span class="n">TorchLlmArgs</span><span class="p">):</span>
-<span class="linenos">162</span>        <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">(</span><span class="n">llm_args</span><span class="p">)</span>
-<span class="linenos">163</span>
-<span class="linenos">164</span>        <span class="bp">self</span><span class="o">.</span><span class="n">block_size</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_llm_args</span><span class="o">.</span><span class="n">kv_cache_config</span><span class="o">.</span><span class="n">tokens_per_block</span>
-<span class="linenos">165</span>        <span class="bp">self</span><span class="o">.</span><span class="n">pending_loads</span> <span class="o">=</span> <span class="p">{}</span>
-<span class="linenos">166</span>
-<span class="linenos">167</span>        <span class="bp">self</span><span class="o">.</span><span class="n">cache_folder</span> <span class="o">=</span> <span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">CONNECTOR_CACHE_FOLDER_KEY</span><span class="p">,</span>
-<span class="linenos">168</span>                                           <span class="s2">"./connector_cache"</span><span class="p">)</span>
-<span class="linenos">169</span>
-<span class="linenos">170</span>        <span class="n">os</span><span class="o">.</span><span class="n">makedirs</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">cache_folder</span><span class="p">,</span> <span class="n">exist_ok</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
-<span class="linenos">171</span>
-<span class="linenos">172</span>    <span class="k">def</span><span class="w"> </span><span class="nf">build_connector_meta</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">scheduler_output</span><span class="p">:</span> <span class="n">SchedulerOutput</span><span class="p">):</span>
-<span class="linenos">173</span>        <span class="c1"># NOTE: This is a simplified implementation, and does not work with chunked prefill.</span>
-<span class="linenos">174</span>
-<span class="linenos">175</span>        <span class="n">metadata</span> <span class="o">=</span> <span class="n">PersistentKvCacheConnectorMetadata</span><span class="p">()</span>
-<span class="linenos">176</span>
-<span class="linenos">177</span>        <span class="k">for</span> <span class="n">req</span> <span class="ow">in</span> <span class="n">scheduler_output</span><span class="o">.</span><span class="n">new_requests</span><span class="p">:</span>
-<span class="linenos">178</span>            <span class="c1"># If we don't have any pending loads for this request, we can skip it.</span>
-<span class="linenos">179</span>            <span class="k">if</span> <span class="n">req</span><span class="o">.</span><span class="n">request_id</span> <span class="ow">not</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">pending_loads</span><span class="p">:</span>
-<span class="linenos">180</span>                <span class="k">continue</span>
+<span class="linenos">161</span>    <span class="k">def</span><span class="w"> </span><span class="nf">wait_for_save</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">stream</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">Stream</span><span class="p">):</span>
+<span class="linenos">162</span>
+<span class="linenos">163</span>        <span class="c1"># Make sure the forward pass is complete before beginning our save.</span>
+<span class="linenos">164</span>        <span class="n">stream</span><span class="o">.</span><span class="n">synchronize</span><span class="p">()</span>
+<span class="linenos">165</span>
+<span class="linenos">166</span>        <span class="k">for</span> <span class="n">path</span><span class="p">,</span> <span class="n">block_id</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_metadata</span><span class="o">.</span><span class="n">save</span><span class="p">:</span>
+<span class="linenos">167</span>            <span class="n">cpu_tensor</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">kv_cache_tensor</span><span class="p">[</span><span class="n">block_id</span><span class="p">]</span><span class="o">.</span><span class="n">cpu</span><span class="p">()</span>
+<span class="linenos">168</span>
+<span class="linenos">169</span>            <span class="c1"># Don't write anything if this specific block already exists.</span>
+<span class="linenos">170</span>            <span class="k">if</span> <span class="n">Path</span><span class="p">(</span><span class="n">path</span><span class="p">)</span><span class="o">.</span><span class="n">exists</span><span class="p">():</span>
+<span class="linenos">171</span>                <span class="k">continue</span>
+<span class="linenos">172</span>
+<span class="linenos">173</span>            <span class="c1"># Publish complete immutable files so a reservation can retain an</span>
+<span class="linenos">174</span>            <span class="c1"># inode while another process replaces or removes its cache key.</span>
+<span class="linenos">175</span>            <span class="k">with</span> <span class="n">NamedTemporaryFile</span><span class="p">(</span><span class="nb">dir</span><span class="o">=</span><span class="n">Path</span><span class="p">(</span><span class="n">path</span><span class="p">)</span><span class="o">.</span><span class="n">parent</span><span class="p">)</span> <span class="k">as</span> <span class="n">staging</span><span class="p">:</span>
+<span class="linenos">176</span>                <span class="n">torch</span><span class="o">.</span><span class="n">save</span><span class="p">(</span><span class="n">cpu_tensor</span><span class="p">,</span> <span class="n">staging</span><span class="o">.</span><span class="n">name</span><span class="p">)</span>
+<span class="linenos">177</span>                <span class="k">try</span><span class="p">:</span>
+<span class="linenos">178</span>                    <span class="n">os</span><span class="o">.</span><span class="n">link</span><span class="p">(</span><span class="n">staging</span><span class="o">.</span><span class="n">name</span><span class="p">,</span> <span class="n">path</span><span class="p">)</span>
+<span class="linenos">179</span>                <span class="k">except</span> <span class="ne">FileExistsError</span><span class="p">:</span>
+<span class="linenos">180</span>                    <span class="k">pass</span>
 <span class="linenos">181</span>
-<span class="linenos">182</span>            <span class="n">num_computed_blocks</span> <span class="o">=</span> <span class="n">req</span><span class="o">.</span><span class="n">computed_position</span> <span class="o">//</span> <span class="bp">self</span><span class="o">.</span><span class="n">block_size</span>
-<span class="linenos">183</span>            <span class="n">block_ids</span> <span class="o">=</span> <span class="n">req</span><span class="o">.</span><span class="n">new_block_ids</span>
-<span class="linenos">184</span>
-<span class="linenos">185</span>            <span class="n">pending_load</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">pending_loads</span><span class="p">[</span><span class="n">req</span><span class="o">.</span><span class="n">request_id</span><span class="p">]</span>
-<span class="linenos">186</span>
-<span class="linenos">187</span>            <span class="c1"># Ordinal -&gt; page slot for the blocks that have a page. Blocks with</span>
-<span class="linenos">188</span>            <span class="c1"># none keep their ordinal in `block_ids` so that entry `i` always</span>
-<span class="linenos">189</span>            <span class="c1"># describes the same token range; they are dropped here so no</span>
-<span class="linenos">190</span>            <span class="c1"># transfer can be built against one.</span>
-<span class="linenos">191</span>            <span class="n">slots</span> <span class="o">=</span> <span class="nb">dict</span><span class="p">(</span><span class="n">valid_page_slots</span><span class="p">(</span><span class="n">block_ids</span><span class="p">))</span>
-<span class="linenos">192</span>
-<span class="linenos">193</span>            <span class="k">for</span> <span class="n">file_path</span><span class="p">,</span> <span class="n">block_pos</span> <span class="ow">in</span> <span class="nb">zip</span><span class="p">(</span>
-<span class="linenos">194</span>                    <span class="n">pending_load</span><span class="p">,</span> <span class="nb">range</span><span class="p">(</span><span class="n">num_computed_blocks</span><span class="p">,</span> <span class="nb">len</span><span class="p">(</span><span class="n">block_ids</span><span class="p">))):</span>
-<span class="linenos">195</span>                <span class="n">slot</span> <span class="o">=</span> <span class="n">slots</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">block_pos</span><span class="p">)</span>
-<span class="linenos">196</span>                <span class="k">if</span> <span class="n">slot</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
-<span class="linenos">197</span>                    <span class="k">continue</span>
-<span class="linenos">198</span>                <span class="n">metadata</span><span class="o">.</span><span class="n">load</span><span class="o">.</span><span class="n">append</span><span class="p">((</span><span class="n">file_path</span><span class="p">,</span> <span class="n">slot</span><span class="p">))</span>
+<span class="linenos">182</span>    <span class="k">def</span><span class="w"> </span><span class="nf">get_finished</span><span class="p">(</span>
+<span class="linenos">183</span>            <span class="bp">self</span><span class="p">,</span> <span class="n">finished_gen_req_ids</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">],</span>
+<span class="linenos">184</span>            <span class="n">started_loading_req_ids</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">],</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]]:</span>
+<span class="linenos">185</span>
+<span class="linenos">186</span>        <span class="k">return</span> <span class="p">[],</span> <span class="p">[]</span>
+<span class="linenos">187</span>
+<span class="linenos">188</span>
+<span class="linenos">189</span><span class="k">class</span><span class="w"> </span><span class="nc">PersistentKvCacheConnectorLeader</span><span class="p">(</span><span class="n">KvCacheConnectorScheduler</span><span class="p">):</span>
+<span class="linenos">190</span>
+<span class="linenos">191</span>    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">llm_args</span><span class="p">:</span> <span class="n">TorchLlmArgs</span><span class="p">):</span>
+<span class="linenos">192</span>        <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">(</span><span class="n">llm_args</span><span class="p">)</span>
+<span class="linenos">193</span>
+<span class="linenos">194</span>        <span class="bp">self</span><span class="o">.</span><span class="n">block_size</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_llm_args</span><span class="o">.</span><span class="n">kv_cache_config</span><span class="o">.</span><span class="n">tokens_per_block</span>
+<span class="linenos">195</span>        <span class="bp">self</span><span class="o">.</span><span class="n">pending_loads</span> <span class="o">=</span> <span class="p">{}</span>
+<span class="linenos">196</span>
+<span class="linenos">197</span>        <span class="bp">self</span><span class="o">.</span><span class="n">cache_folder</span> <span class="o">=</span> <span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">CONNECTOR_CACHE_FOLDER_KEY</span><span class="p">,</span>
+<span class="linenos">198</span>                                           <span class="s2">"./connector_cache"</span><span class="p">)</span>
 <span class="linenos">199</span>
-<span class="linenos">200</span>            <span class="c1"># Break up the remainder of the token sequence into chunks.</span>
-<span class="linenos">201</span>            <span class="n">chunks</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_chunk_tokens</span><span class="p">(</span><span class="n">req</span><span class="o">.</span><span class="n">new_tokens</span><span class="p">)</span>
-<span class="linenos">202</span>
-<span class="linenos">203</span>            <span class="c1"># For each chunk that isn't already on device, and isn't in our connector cache, we need to save it.</span>
-<span class="linenos">204</span>            <span class="k">for</span> <span class="n">block_pos</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">num_computed_blocks</span> <span class="o">+</span> <span class="nb">len</span><span class="p">(</span><span class="n">pending_load</span><span class="p">),</span>
-<span class="linenos">205</span>                                   <span class="nb">len</span><span class="p">(</span><span class="n">block_ids</span><span class="p">)):</span>
-<span class="linenos">206</span>                <span class="n">slot</span> <span class="o">=</span> <span class="n">slots</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">block_pos</span><span class="p">)</span>
-<span class="linenos">207</span>                <span class="k">if</span> <span class="n">slot</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
-<span class="linenos">208</span>                    <span class="k">continue</span>
-<span class="linenos">209</span>                <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">chunks</span><span class="p">[</span><span class="n">block_pos</span><span class="p">])</span> <span class="o">==</span> <span class="bp">self</span><span class="o">.</span><span class="n">block_size</span><span class="p">:</span>
-<span class="linenos">210</span>                    <span class="n">hashed_tokens</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_hash_tokens</span><span class="p">(</span><span class="n">chunks</span><span class="p">[</span><span class="n">block_pos</span><span class="p">],</span>
-<span class="linenos">211</span>                                                      <span class="n">req</span><span class="o">.</span><span class="n">cache_salt</span><span class="p">)</span>
-<span class="linenos">212</span>
-<span class="linenos">213</span>                    <span class="n">file_path</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_file_path</span><span class="p">(</span><span class="n">hashed_tokens</span><span class="p">)</span>
-<span class="linenos">214</span>
-<span class="linenos">215</span>                    <span class="n">metadata</span><span class="o">.</span><span class="n">save</span><span class="o">.</span><span class="n">append</span><span class="p">((</span><span class="n">file_path</span><span class="p">,</span> <span class="n">slot</span><span class="p">))</span>
-<span class="linenos">216</span>
-<span class="linenos">217</span>        <span class="bp">self</span><span class="o">.</span><span class="n">pending_loads</span> <span class="o">=</span> <span class="p">{}</span>
-<span class="linenos">218</span>
-<span class="linenos">219</span>        <span class="k">return</span> <span class="n">metadata</span>
-<span class="linenos">220</span>
-<span class="linenos">221</span>    <span class="k">def</span><span class="w"> </span><span class="nf">_hash_tokens</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">tokens</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">],</span> <span class="n">cache_salt</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
-<span class="linenos">222</span>        <span class="c1"># cache_salt must participate in the hash so that requests carrying</span>
-<span class="linenos">223</span>        <span class="c1"># different salts (or no salt) cannot collide on the same cache file.</span>
-<span class="linenos">224</span>        <span class="k">return</span> <span class="nb">abs</span><span class="p">(</span><span class="nb">hash</span><span class="p">((</span><span class="n">cache_salt</span><span class="p">,</span> <span class="nb">tuple</span><span class="p">(</span><span class="n">tokens</span><span class="p">))))</span>
-<span class="linenos">225</span>
-<span class="linenos">226</span>    <span class="k">def</span><span class="w"> </span><span class="nf">_file_path</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">hash_value</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Path</span><span class="p">:</span>
-<span class="linenos">227</span>        <span class="k">return</span> <span class="n">Path</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">cache_folder</span><span class="p">)</span> <span class="o">/</span> <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">hash_value</span><span class="si">}</span><span class="s2">.pt"</span>
-<span class="linenos">228</span>
-<span class="linenos">229</span>    <span class="k">def</span><span class="w"> </span><span class="nf">_chunk_tokens</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">tokens</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]]:</span>
-<span class="linenos">230</span>        <span class="k">return</span> <span class="p">[</span>
-<span class="linenos">231</span>            <span class="n">tokens</span><span class="p">[</span><span class="n">i</span><span class="p">:</span><span class="n">i</span> <span class="o">+</span> <span class="bp">self</span><span class="o">.</span><span class="n">block_size</span><span class="p">]</span>
-<span class="linenos">232</span>            <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="nb">len</span><span class="p">(</span><span class="n">tokens</span><span class="p">),</span> <span class="bp">self</span><span class="o">.</span><span class="n">block_size</span><span class="p">)</span>
-<span class="linenos">233</span>        <span class="p">]</span>
-<span class="linenos">234</span>
-<span class="linenos">235</span>    <span class="k">def</span><span class="w"> </span><span class="nf">get_num_new_matched_tokens</span><span class="p">(</span>
-<span class="linenos">236</span>            <span class="bp">self</span><span class="p">,</span> <span class="n">request</span><span class="p">:</span> <span class="n">LlmRequest</span><span class="p">,</span>
-<span class="linenos">237</span>            <span class="n">num_computed_tokens</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">bool</span><span class="p">]:</span>
-<span class="linenos">238</span>        <span class="bp">self</span><span class="o">.</span><span class="n">pending_loads</span><span class="p">[</span><span class="n">request</span><span class="o">.</span><span class="n">request_id</span><span class="p">]</span> <span class="o">=</span> <span class="p">[]</span>
-<span class="linenos">239</span>
-<span class="linenos">240</span>        <span class="c1"># Don't bother with sequences with partial matches.</span>
-<span class="linenos">241</span>        <span class="k">if</span> <span class="p">(</span><span class="n">num_computed_tokens</span> <span class="o">%</span> <span class="bp">self</span><span class="o">.</span><span class="n">block_size</span><span class="p">)</span> <span class="o">!=</span> <span class="mi">0</span><span class="p">:</span>
-<span class="linenos">242</span>            <span class="k">return</span> <span class="mi">0</span><span class="p">,</span> <span class="kc">False</span>
-<span class="linenos">243</span>
-<span class="linenos">244</span>        <span class="n">computed_blocks</span> <span class="o">=</span> <span class="n">num_computed_tokens</span> <span class="o">//</span> <span class="bp">self</span><span class="o">.</span><span class="n">block_size</span>
-<span class="linenos">245</span>
-<span class="linenos">246</span>        <span class="c1"># Get all the tokens that don't have a cache hit on device.</span>
-<span class="linenos">247</span>        <span class="n">remaining_tokens</span> <span class="o">=</span> <span class="n">request</span><span class="o">.</span><span class="n">get_tokens</span><span class="p">(</span><span class="mi">0</span><span class="p">)[</span><span class="n">computed_blocks</span> <span class="o">*</span>
-<span class="linenos">248</span>                                                 <span class="bp">self</span><span class="o">.</span><span class="n">block_size</span><span class="p">:]</span>
-<span class="linenos">249</span>
-<span class="linenos">250</span>        <span class="n">remaining_chunks</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_chunk_tokens</span><span class="p">(</span><span class="n">remaining_tokens</span><span class="p">)</span>
+<span class="linenos">200</span>        <span class="n">os</span><span class="o">.</span><span class="n">makedirs</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">cache_folder</span><span class="p">,</span> <span class="n">exist_ok</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="linenos">201</span>        <span class="bp">self</span><span class="o">.</span><span class="n">_reservation_folder</span> <span class="o">=</span> <span class="n">TemporaryDirectory</span><span class="p">(</span><span class="n">prefix</span><span class="o">=</span><span class="s2">".reservations-"</span><span class="p">,</span>
+<span class="linenos">202</span>                                                      <span class="nb">dir</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">cache_folder</span><span class="p">)</span>
+<span class="linenos">203</span>        <span class="bp">self</span><span class="o">.</span><span class="n">_reserved_files</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="n">Path</span><span class="p">]]</span> <span class="o">=</span> <span class="p">{}</span>
+<span class="linenos">204</span>        <span class="bp">self</span><span class="o">.</span><span class="n">_reserved_ranges</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">list</span><span class="p">[</span><span class="nb">tuple</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">int</span><span class="p">]]]</span> <span class="o">=</span> <span class="p">{}</span>
+<span class="linenos">205</span>
+<span class="linenos">206</span>    <span class="k">def</span><span class="w"> </span><span class="nf">build_connector_meta</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">scheduler_output</span><span class="p">:</span> <span class="n">SchedulerOutput</span><span class="p">):</span>
+<span class="linenos">207</span>        <span class="c1"># NOTE: This is a simplified implementation, and does not work with chunked prefill.</span>
+<span class="linenos">208</span>
+<span class="linenos">209</span>        <span class="n">metadata</span> <span class="o">=</span> <span class="n">PersistentKvCacheConnectorMetadata</span><span class="p">()</span>
+<span class="linenos">210</span>
+<span class="linenos">211</span>        <span class="n">accepted_ends</span> <span class="o">=</span> <span class="p">{}</span>
+<span class="linenos">212</span>        <span class="k">for</span> <span class="n">load</span> <span class="ow">in</span> <span class="n">scheduler_output</span><span class="o">.</span><span class="n">prefix_loads</span><span class="p">:</span>
+<span class="linenos">213</span>            <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">load</span><span class="o">.</span><span class="n">block_ids_by_layer_group</span><span class="p">)</span> <span class="o">!=</span> <span class="mi">1</span><span class="p">:</span>
+<span class="linenos">214</span>                <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+<span class="linenos">215</span>                    <span class="s2">"Persistent connector requires one layer group"</span><span class="p">)</span>
+<span class="linenos">216</span>            <span class="k">if</span> <span class="n">load</span><span class="o">.</span><span class="n">start</span> <span class="o">%</span> <span class="bp">self</span><span class="o">.</span><span class="n">block_size</span> <span class="ow">or</span> <span class="n">load</span><span class="o">.</span><span class="n">end</span> <span class="o">%</span> <span class="bp">self</span><span class="o">.</span><span class="n">block_size</span><span class="p">:</span>
+<span class="linenos">217</span>                <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s2">"Persistent connector loads complete blocks"</span><span class="p">)</span>
+<span class="linenos">218</span>            <span class="n">block_ids</span> <span class="o">=</span> <span class="n">load</span><span class="o">.</span><span class="n">block_ids_by_layer_group</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span>
+<span class="linenos">219</span>            <span class="k">if</span> <span class="n">load</span><span class="o">.</span><span class="n">end</span> <span class="o">//</span> <span class="bp">self</span><span class="o">.</span><span class="n">block_size</span> <span class="o">&gt;</span> <span class="nb">len</span><span class="p">(</span><span class="n">block_ids</span><span class="p">):</span>
+<span class="linenos">220</span>                <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+<span class="linenos">221</span>                    <span class="s2">"Confirmed prefix exceeds destination allocation"</span><span class="p">)</span>
+<span class="linenos">222</span>            <span class="n">slots</span> <span class="o">=</span> <span class="nb">dict</span><span class="p">(</span><span class="n">valid_page_slots</span><span class="p">(</span><span class="n">block_ids</span><span class="p">))</span>
+<span class="linenos">223</span>            <span class="n">files</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_reserved_files</span><span class="p">[</span><span class="n">load</span><span class="o">.</span><span class="n">reservation_id</span><span class="p">]</span>
+<span class="linenos">224</span>            <span class="k">for</span> <span class="n">ordinal</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">load</span><span class="o">.</span><span class="n">start</span> <span class="o">//</span> <span class="bp">self</span><span class="o">.</span><span class="n">block_size</span><span class="p">,</span>
+<span class="linenos">225</span>                                 <span class="n">load</span><span class="o">.</span><span class="n">end</span> <span class="o">//</span> <span class="bp">self</span><span class="o">.</span><span class="n">block_size</span><span class="p">):</span>
+<span class="linenos">226</span>                <span class="k">if</span> <span class="n">ordinal</span> <span class="ow">in</span> <span class="n">slots</span><span class="p">:</span>
+<span class="linenos">227</span>                    <span class="n">metadata</span><span class="o">.</span><span class="n">load</span><span class="o">.</span><span class="n">append</span><span class="p">((</span><span class="nb">str</span><span class="p">(</span><span class="n">files</span><span class="p">[</span><span class="n">ordinal</span><span class="p">]),</span> <span class="n">slots</span><span class="p">[</span><span class="n">ordinal</span><span class="p">]))</span>
+<span class="linenos">228</span>            <span class="n">metadata</span><span class="o">.</span><span class="n">prefix_load_ids</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">load</span><span class="o">.</span><span class="n">reservation_id</span><span class="p">)</span>
+<span class="linenos">229</span>            <span class="n">accepted_ends</span><span class="p">[</span><span class="n">load</span><span class="o">.</span><span class="n">request_id</span><span class="p">]</span> <span class="o">=</span> <span class="n">load</span><span class="o">.</span><span class="n">end</span>
+<span class="linenos">230</span>
+<span class="linenos">231</span>        <span class="k">for</span> <span class="n">req</span> <span class="ow">in</span> <span class="n">scheduler_output</span><span class="o">.</span><span class="n">new_requests</span><span class="p">:</span>
+<span class="linenos">232</span>            <span class="n">num_computed_blocks</span> <span class="o">=</span> <span class="n">req</span><span class="o">.</span><span class="n">computed_position</span> <span class="o">//</span> <span class="bp">self</span><span class="o">.</span><span class="n">block_size</span>
+<span class="linenos">233</span>            <span class="n">slots</span> <span class="o">=</span> <span class="nb">dict</span><span class="p">(</span><span class="n">valid_page_slots</span><span class="p">(</span><span class="n">req</span><span class="o">.</span><span class="n">new_block_ids</span><span class="p">))</span>
+<span class="linenos">234</span>            <span class="n">pending_load</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">pending_loads</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">req</span><span class="o">.</span><span class="n">request_id</span><span class="p">,</span> <span class="p">[])</span>
+<span class="linenos">235</span>            <span class="k">for</span> <span class="n">ordinal</span><span class="p">,</span> <span class="n">path</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="n">pending_load</span><span class="p">,</span> <span class="n">num_computed_blocks</span><span class="p">):</span>
+<span class="linenos">236</span>                <span class="k">if</span> <span class="n">ordinal</span> <span class="ow">in</span> <span class="n">slots</span><span class="p">:</span>
+<span class="linenos">237</span>                    <span class="n">metadata</span><span class="o">.</span><span class="n">load</span><span class="o">.</span><span class="n">append</span><span class="p">((</span><span class="nb">str</span><span class="p">(</span><span class="n">path</span><span class="p">),</span> <span class="n">slots</span><span class="p">[</span><span class="n">ordinal</span><span class="p">]))</span>
+<span class="linenos">238</span>
+<span class="linenos">239</span>            <span class="n">loaded_end</span> <span class="o">=</span> <span class="n">accepted_ends</span><span class="o">.</span><span class="n">get</span><span class="p">(</span>
+<span class="linenos">240</span>                <span class="n">req</span><span class="o">.</span><span class="n">request_id</span><span class="p">,</span>
+<span class="linenos">241</span>                <span class="p">(</span><span class="n">num_computed_blocks</span> <span class="o">+</span> <span class="nb">len</span><span class="p">(</span><span class="n">pending_load</span><span class="p">))</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">block_size</span><span class="p">)</span>
+<span class="linenos">242</span>            <span class="n">computed_end</span> <span class="o">=</span> <span class="nb">max</span><span class="p">(</span><span class="n">req</span><span class="o">.</span><span class="n">computed_position</span><span class="p">,</span>
+<span class="linenos">243</span>                               <span class="n">loaded_end</span><span class="p">)</span> <span class="o">+</span> <span class="n">req</span><span class="o">.</span><span class="n">num_scheduled_tokens</span>
+<span class="linenos">244</span>            <span class="k">for</span> <span class="n">ordinal</span><span class="p">,</span> <span class="n">slot</span> <span class="ow">in</span> <span class="n">slots</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
+<span class="linenos">245</span>                <span class="n">end</span> <span class="o">=</span> <span class="p">(</span><span class="n">ordinal</span> <span class="o">+</span> <span class="mi">1</span><span class="p">)</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">block_size</span>
+<span class="linenos">246</span>                <span class="k">if</span> <span class="n">end</span> <span class="o">&lt;=</span> <span class="n">loaded_end</span> <span class="ow">or</span> <span class="n">end</span> <span class="o">&gt;</span> <span class="nb">min</span><span class="p">(</span><span class="nb">len</span><span class="p">(</span><span class="n">req</span><span class="o">.</span><span class="n">new_tokens</span><span class="p">),</span>
+<span class="linenos">247</span>                                                  <span class="n">computed_end</span><span class="p">):</span>
+<span class="linenos">248</span>                    <span class="k">continue</span>
+<span class="linenos">249</span>                <span class="n">key</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_hash_tokens</span><span class="p">(</span><span class="n">req</span><span class="o">.</span><span class="n">new_tokens</span><span class="p">[:</span><span class="n">end</span><span class="p">],</span> <span class="n">req</span><span class="o">.</span><span class="n">cache_salt</span><span class="p">)</span>
+<span class="linenos">250</span>                <span class="n">metadata</span><span class="o">.</span><span class="n">save</span><span class="o">.</span><span class="n">append</span><span class="p">((</span><span class="nb">str</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_file_path</span><span class="p">(</span><span class="n">key</span><span class="p">)),</span> <span class="n">slot</span><span class="p">))</span>
 <span class="linenos">251</span>
-<span class="linenos">252</span>        <span class="c1"># For each chunk, check if it exists in our cache.</span>
-<span class="linenos">253</span>        <span class="k">for</span> <span class="n">chunk</span> <span class="ow">in</span> <span class="n">remaining_chunks</span><span class="p">:</span>
-<span class="linenos">254</span>            <span class="c1"># Only do full blocks.</span>
-<span class="linenos">255</span>            <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">chunk</span><span class="p">)</span> <span class="o">==</span> <span class="bp">self</span><span class="o">.</span><span class="n">block_size</span><span class="p">:</span>
-<span class="linenos">256</span>                <span class="n">hashed_tokens</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_hash_tokens</span><span class="p">(</span><span class="n">chunk</span><span class="p">,</span> <span class="n">request</span><span class="o">.</span><span class="n">cache_salt</span><span class="p">)</span>
-<span class="linenos">257</span>
-<span class="linenos">258</span>                <span class="n">file_path</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_file_path</span><span class="p">(</span><span class="n">hashed_tokens</span><span class="p">)</span>
+<span class="linenos">252</span>        <span class="bp">self</span><span class="o">.</span><span class="n">pending_loads</span> <span class="o">=</span> <span class="p">{}</span>
+<span class="linenos">253</span>        <span class="k">return</span> <span class="n">metadata</span>
+<span class="linenos">254</span>
+<span class="linenos">255</span>    <span class="k">def</span><span class="w"> </span><span class="nf">_hash_tokens</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">tokens</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">],</span> <span class="n">cache_salt</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="nb">str</span><span class="p">:</span>
+<span class="linenos">256</span>        <span class="c1"># KV depends on every preceding token, including those in other blocks.</span>
+<span class="linenos">257</span>        <span class="n">key</span> <span class="o">=</span> <span class="nb">repr</span><span class="p">((</span><span class="n">cache_salt</span><span class="p">,</span> <span class="nb">tuple</span><span class="p">(</span><span class="n">tokens</span><span class="p">)))</span><span class="o">.</span><span class="n">encode</span><span class="p">(</span><span class="s2">"utf-8"</span><span class="p">)</span>
+<span class="linenos">258</span>        <span class="k">return</span> <span class="n">hashlib</span><span class="o">.</span><span class="n">sha256</span><span class="p">(</span><span class="n">key</span><span class="p">)</span><span class="o">.</span><span class="n">hexdigest</span><span class="p">()</span>
 <span class="linenos">259</span>
-<span class="linenos">260</span>                <span class="c1"># If we get a cache hit, we want to load it into device.</span>
-<span class="linenos">261</span>                <span class="c1"># Otherwise, we can stop looking.</span>
-<span class="linenos">262</span>                <span class="k">if</span> <span class="n">file_path</span><span class="o">.</span><span class="n">exists</span><span class="p">():</span>
-<span class="linenos">263</span>                    <span class="bp">self</span><span class="o">.</span><span class="n">pending_loads</span><span class="p">[</span><span class="n">request</span><span class="o">.</span><span class="n">request_id</span><span class="p">]</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">file_path</span><span class="p">)</span>
-<span class="linenos">264</span>                <span class="k">else</span><span class="p">:</span>
-<span class="linenos">265</span>                    <span class="k">break</span>
-<span class="linenos">266</span>
-<span class="linenos">267</span>        <span class="n">logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span>
-<span class="linenos">268</span>            <span class="sa">f</span><span class="s2">"KV CONNECTOR: Matched </span><span class="si">{</span><span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">pending_loads</span><span class="p">[</span><span class="n">request</span><span class="o">.</span><span class="n">request_id</span><span class="p">])</span><span class="si">}</span><span class="s2"> blocks for request </span><span class="si">{</span><span class="n">request</span><span class="o">.</span><span class="n">request_id</span><span class="si">}</span><span class="s2">"</span>
-<span class="linenos">269</span>        <span class="p">)</span>
-<span class="linenos">270</span>
-<span class="linenos">271</span>        <span class="k">return</span> <span class="nb">len</span><span class="p">(</span>
-<span class="linenos">272</span>            <span class="bp">self</span><span class="o">.</span><span class="n">pending_loads</span><span class="p">[</span><span class="n">request</span><span class="o">.</span><span class="n">request_id</span><span class="p">])</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">block_size</span><span class="p">,</span> <span class="kc">False</span>
-<span class="linenos">273</span>
-<span class="linenos">274</span>    <span class="k">def</span><span class="w"> </span><span class="nf">request_finished</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">request</span><span class="p">:</span> <span class="n">LlmRequest</span><span class="p">,</span>
-<span class="linenos">275</span>                         <span class="n">cache_block_ids</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
-<span class="linenos">276</span>        <span class="c1"># We don't do any asynchronous saving, so always return False</span>
-<span class="linenos">277</span>        <span class="k">return</span> <span class="kc">False</span>
-<span class="linenos">278</span>
-<span class="linenos">279</span>    <span class="k">def</span><span class="w"> </span><span class="nf">update_state_after_alloc</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">request</span><span class="p">:</span> <span class="n">LlmRequest</span><span class="p">,</span>
-<span class="linenos">280</span>                                 <span class="n">block_ids</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]):</span>
-<span class="linenos">281</span>        <span class="k">pass</span>
-<span class="linenos">282</span>
-<span class="linenos">283</span>
-<span class="linenos">284</span><span class="nd">@click</span><span class="o">.</span><span class="n">command</span><span class="p">()</span>
-<span class="linenos">285</span><span class="nd">@click</span><span class="o">.</span><span class="n">argument</span><span class="p">(</span><span class="s2">"model"</span><span class="p">,</span> <span class="nb">type</span><span class="o">=</span><span class="nb">str</span><span class="p">)</span>
-<span class="linenos">286</span><span class="k">def</span><span class="w"> </span><span class="nf">main</span><span class="p">(</span><span class="n">model</span><span class="p">:</span> <span class="nb">str</span><span class="p">):</span>
-<span class="linenos">287</span>    <span class="n">sys</span><span class="o">.</span><span class="n">path</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">os</span><span class="o">.</span><span class="n">path</span><span class="o">.</span><span class="n">join</span><span class="p">(</span>
-<span class="linenos">288</span>        <span class="n">os</span><span class="o">.</span><span class="n">path</span><span class="o">.</span><span class="n">dirname</span><span class="p">(</span><span class="vm">__file__</span><span class="p">),</span>
-<span class="linenos">289</span>        <span class="s2">".."</span><span class="p">,</span>
-<span class="linenos">290</span>    <span class="p">))</span>
-<span class="linenos">291</span>
-<span class="linenos">292</span>    <span class="n">this_module</span> <span class="o">=</span> <span class="vm">__file__</span><span class="p">[</span><span class="vm">__file__</span><span class="o">.</span><span class="n">rfind</span><span class="p">(</span><span class="s2">"/"</span><span class="p">)</span> <span class="o">+</span> <span class="mi">1</span><span class="p">:</span><span class="vm">__file__</span><span class="o">.</span><span class="n">rfind</span><span class="p">(</span><span class="s2">".py"</span><span class="p">)]</span>
-<span class="linenos">293</span>
-<span class="linenos">294</span>    <span class="c1"># --- KV Cache Connector Config ---</span>
-<span class="linenos">295</span>    <span class="n">kv_connector_config</span> <span class="o">=</span> <span class="n">KvCacheConnectorConfig</span><span class="p">(</span>
-<span class="linenos">296</span>        <span class="n">connector_module</span><span class="o">=</span><span class="n">this_module</span><span class="p">,</span>
-<span class="linenos">297</span>        <span class="n">connector_scheduler_class</span><span class="o">=</span><span class="s2">"PersistentKvCacheConnectorLeader"</span><span class="p">,</span>
-<span class="linenos">298</span>        <span class="n">connector_worker_class</span><span class="o">=</span><span class="s2">"PersistentKvCacheConnectorWorker"</span><span class="p">,</span>
-<span class="linenos">299</span>    <span class="p">)</span>
-<span class="linenos">300</span>
-<span class="linenos">301</span>    <span class="n">connector_cache_dir</span> <span class="o">=</span> <span class="n">TemporaryDirectory</span><span class="p">()</span>
-<span class="linenos">302</span>    <span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="p">[</span><span class="n">CONNECTOR_CACHE_FOLDER_KEY</span><span class="p">]</span> <span class="o">=</span> <span class="n">connector_cache_dir</span><span class="o">.</span><span class="n">name</span>
-<span class="linenos">303</span>
-<span class="linenos">304</span>    <span class="c1"># Create LLM instance with KV Cache Connector</span>
-<span class="linenos">305</span>    <span class="n">llm</span> <span class="o">=</span> <span class="n">LLM</span><span class="p">(</span><span class="n">model</span><span class="o">=</span><span class="n">model</span><span class="p">,</span>
-<span class="linenos">306</span>              <span class="n">backend</span><span class="o">=</span><span class="s2">"pytorch"</span><span class="p">,</span>
-<span class="linenos">307</span>              <span class="n">cuda_graph_config</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
-<span class="linenos">308</span>              <span class="n">kv_connector_config</span><span class="o">=</span><span class="n">kv_connector_config</span><span class="p">)</span>
-<span class="linenos">309</span>
-<span class="linenos">310</span>    <span class="n">test_text</span> <span class="o">=</span> <span class="p">(</span>
-<span class="linenos">311</span>        <span class="s2">"Nvidia Corporation is an American technology company headquartered in Santa Clara, California."</span>
-<span class="linenos">312</span>        <span class="s2">"Founded in 1993 by Jensen Huang, Chris Malachowsky, and Curtis Priem, it develops graphics processing units (GPUs), "</span>
-<span class="linenos">313</span>        <span class="s2">"system on a chips (SoCs), and application programming interfaces (APIs) for data science, high-performance computing, "</span>
-<span class="linenos">314</span>        <span class="s2">"and mobile and automotive applications. Tell me about the company."</span><span class="p">)</span>
-<span class="linenos">315</span>
-<span class="linenos">316</span>    <span class="n">sampling_params</span> <span class="o">=</span> <span class="n">SamplingParams</span><span class="p">(</span><span class="n">max_tokens</span><span class="o">=</span><span class="mi">32</span><span class="p">)</span>
-<span class="linenos">317</span>
-<span class="linenos">318</span>    <span class="c1"># Generate text with the first LLM instance and save the kv cache blocks by the connector.</span>
-<span class="linenos">319</span>    <span class="n">output</span> <span class="o">=</span> <span class="n">llm</span><span class="o">.</span><span class="n">generate</span><span class="p">([</span><span class="n">test_text</span><span class="p">],</span> <span class="n">sampling_params</span><span class="p">)</span>
-<span class="linenos">320</span>    <span class="n">text0</span> <span class="o">=</span> <span class="n">output</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">outputs</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">text</span>
-<span class="linenos">321</span>
-<span class="linenos">322</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"First output: "</span><span class="p">,</span> <span class="n">text0</span><span class="p">)</span>
-<span class="linenos">323</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"Loading new LLM instance..."</span><span class="p">)</span>
-<span class="linenos">324</span>
-<span class="linenos">325</span>    <span class="k">del</span> <span class="n">llm</span>
-<span class="linenos">326</span>
-<span class="linenos">327</span>    <span class="c1"># Create a new LLM instance with the same connector configuration</span>
-<span class="linenos">328</span>    <span class="n">llm</span> <span class="o">=</span> <span class="n">LLM</span><span class="p">(</span><span class="n">model</span><span class="o">=</span><span class="n">model</span><span class="p">,</span>
-<span class="linenos">329</span>              <span class="n">backend</span><span class="o">=</span><span class="s2">"pytorch"</span><span class="p">,</span>
-<span class="linenos">330</span>              <span class="n">cuda_graph_config</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
-<span class="linenos">331</span>              <span class="n">kv_connector_config</span><span class="o">=</span><span class="n">kv_connector_config</span><span class="p">)</span>
-<span class="linenos">332</span>
-<span class="linenos">333</span>    <span class="c1"># Generate text with the second LLM instance and it should reuse the kv cache blocks from the connector.</span>
-<span class="linenos">334</span>    <span class="n">output</span> <span class="o">=</span> <span class="n">llm</span><span class="o">.</span><span class="n">generate</span><span class="p">([</span><span class="n">test_text</span><span class="p">],</span> <span class="n">sampling_params</span><span class="p">)</span>
-<span class="linenos">335</span>    <span class="n">text1</span> <span class="o">=</span> <span class="n">output</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">outputs</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">text</span>
-<span class="linenos">336</span>
-<span class="linenos">337</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"Second output (using connector cache): "</span><span class="p">,</span> <span class="n">text1</span><span class="p">)</span>
-<span class="linenos">338</span>
-<span class="linenos">339</span>    <span class="c1"># Verify that the two outputs are identical</span>
-<span class="linenos">340</span>    <span class="k">assert</span> <span class="n">text0</span> <span class="o">==</span> <span class="n">text1</span>
-<span class="linenos">341</span>
-<span class="linenos">342</span>    <span class="n">connector_cache_dir</span><span class="o">.</span><span class="n">cleanup</span><span class="p">()</span>
-<span class="linenos">343</span>
+<span class="linenos">260</span>    <span class="k">def</span><span class="w"> </span><span class="nf">_file_path</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">hash_value</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Path</span><span class="p">:</span>
+<span class="linenos">261</span>        <span class="k">return</span> <span class="n">Path</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">cache_folder</span><span class="p">)</span> <span class="o">/</span> <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">hash_value</span><span class="si">}</span><span class="s2">.pt"</span>
+<span class="linenos">262</span>
+<span class="linenos">263</span>    <span class="k">def</span><span class="w"> </span><span class="nf">get_num_new_matched_tokens</span><span class="p">(</span>
+<span class="linenos">264</span>            <span class="bp">self</span><span class="p">,</span> <span class="n">request</span><span class="p">:</span> <span class="n">LlmRequest</span><span class="p">,</span>
+<span class="linenos">265</span>            <span class="n">num_computed_tokens</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">bool</span><span class="p">]:</span>
+<span class="linenos">266</span>        <span class="bp">self</span><span class="o">.</span><span class="n">pending_loads</span><span class="p">[</span><span class="n">request</span><span class="o">.</span><span class="n">request_id</span><span class="p">]</span> <span class="o">=</span> <span class="p">[]</span>
+<span class="linenos">267</span>
+<span class="linenos">268</span>        <span class="c1"># Don't bother with sequences with partial matches.</span>
+<span class="linenos">269</span>        <span class="k">if</span> <span class="p">(</span><span class="n">num_computed_tokens</span> <span class="o">%</span> <span class="bp">self</span><span class="o">.</span><span class="n">block_size</span><span class="p">)</span> <span class="o">!=</span> <span class="mi">0</span><span class="p">:</span>
+<span class="linenos">270</span>            <span class="k">return</span> <span class="mi">0</span><span class="p">,</span> <span class="kc">False</span>
+<span class="linenos">271</span>
+<span class="linenos">272</span>        <span class="n">tokens</span> <span class="o">=</span> <span class="n">request</span><span class="o">.</span><span class="n">get_tokens</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span>
+<span class="linenos">273</span>        <span class="k">for</span> <span class="n">end</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">num_computed_tokens</span> <span class="o">+</span> <span class="bp">self</span><span class="o">.</span><span class="n">block_size</span><span class="p">,</span>
+<span class="linenos">274</span>                         <span class="nb">len</span><span class="p">(</span><span class="n">tokens</span><span class="p">)</span> <span class="o">+</span> <span class="mi">1</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">block_size</span><span class="p">):</span>
+<span class="linenos">275</span>            <span class="n">key</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_hash_tokens</span><span class="p">(</span><span class="n">tokens</span><span class="p">[:</span><span class="n">end</span><span class="p">],</span> <span class="n">request</span><span class="o">.</span><span class="n">cache_salt</span><span class="p">)</span>
+<span class="linenos">276</span>            <span class="n">file_path</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_file_path</span><span class="p">(</span><span class="n">key</span><span class="p">)</span>
+<span class="linenos">277</span>            <span class="k">if</span> <span class="ow">not</span> <span class="n">file_path</span><span class="o">.</span><span class="n">exists</span><span class="p">():</span>
+<span class="linenos">278</span>                <span class="k">break</span>
+<span class="linenos">279</span>            <span class="bp">self</span><span class="o">.</span><span class="n">pending_loads</span><span class="p">[</span><span class="n">request</span><span class="o">.</span><span class="n">request_id</span><span class="p">]</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">file_path</span><span class="p">)</span>
+<span class="linenos">280</span>
+<span class="linenos">281</span>        <span class="n">logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span>
+<span class="linenos">282</span>            <span class="sa">f</span><span class="s2">"KV CONNECTOR: Matched </span><span class="si">{</span><span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">pending_loads</span><span class="p">[</span><span class="n">request</span><span class="o">.</span><span class="n">request_id</span><span class="p">])</span><span class="si">}</span><span class="s2"> blocks for request </span><span class="si">{</span><span class="n">request</span><span class="o">.</span><span class="n">request_id</span><span class="si">}</span><span class="s2">"</span>
+<span class="linenos">283</span>        <span class="p">)</span>
+<span class="linenos">284</span>
+<span class="linenos">285</span>        <span class="k">return</span> <span class="nb">len</span><span class="p">(</span>
+<span class="linenos">286</span>            <span class="bp">self</span><span class="o">.</span><span class="n">pending_loads</span><span class="p">[</span><span class="n">request</span><span class="o">.</span><span class="n">request_id</span><span class="p">])</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">block_size</span><span class="p">,</span> <span class="kc">False</span>
+<span class="linenos">287</span>
+<span class="linenos">288</span>    <span class="k">def</span><span class="w"> </span><span class="nf">reserve_prefix</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">request</span><span class="p">:</span> <span class="n">LlmRequest</span><span class="p">,</span> <span class="n">num_computed_tokens</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+<span class="linenos">289</span>                       <span class="n">reservation_id</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">bool</span><span class="p">]:</span>
+<span class="linenos">290</span><span class="w">        </span><span class="sd">"""Protect immutable source files without reading their KV data."""</span>
+<span class="linenos">291</span>        <span class="k">if</span> <span class="n">num_computed_tokens</span> <span class="o">%</span> <span class="bp">self</span><span class="o">.</span><span class="n">block_size</span><span class="p">:</span>
+<span class="linenos">292</span>            <span class="k">return</span> <span class="mi">0</span><span class="p">,</span> <span class="kc">False</span>
+<span class="linenos">293</span>        <span class="n">tokens</span> <span class="o">=</span> <span class="n">request</span><span class="o">.</span><span class="n">get_tokens</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span>
+<span class="linenos">294</span>        <span class="n">folder</span> <span class="o">=</span> <span class="n">Path</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_reservation_folder</span><span class="o">.</span><span class="n">name</span><span class="p">)</span> <span class="o">/</span> <span class="nb">str</span><span class="p">(</span><span class="n">reservation_id</span><span class="p">)</span>
+<span class="linenos">295</span>        <span class="n">folder</span><span class="o">.</span><span class="n">mkdir</span><span class="p">()</span>
+<span class="linenos">296</span>        <span class="n">files</span> <span class="o">=</span> <span class="p">{}</span>
+<span class="linenos">297</span>        <span class="k">for</span> <span class="n">end</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">num_computed_tokens</span> <span class="o">+</span> <span class="bp">self</span><span class="o">.</span><span class="n">block_size</span><span class="p">,</span>
+<span class="linenos">298</span>                         <span class="nb">len</span><span class="p">(</span><span class="n">tokens</span><span class="p">)</span> <span class="o">+</span> <span class="mi">1</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">block_size</span><span class="p">):</span>
+<span class="linenos">299</span>            <span class="n">ordinal</span> <span class="o">=</span> <span class="n">end</span> <span class="o">//</span> <span class="bp">self</span><span class="o">.</span><span class="n">block_size</span> <span class="o">-</span> <span class="mi">1</span>
+<span class="linenos">300</span>            <span class="n">key</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_hash_tokens</span><span class="p">(</span><span class="n">tokens</span><span class="p">[:</span><span class="n">end</span><span class="p">],</span> <span class="n">request</span><span class="o">.</span><span class="n">cache_salt</span><span class="p">)</span>
+<span class="linenos">301</span>            <span class="n">protected</span> <span class="o">=</span> <span class="n">folder</span> <span class="o">/</span> <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">ordinal</span><span class="si">}</span><span class="s2">.pt"</span>
+<span class="linenos">302</span>            <span class="k">try</span><span class="p">:</span>
+<span class="linenos">303</span>                <span class="n">os</span><span class="o">.</span><span class="n">link</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_file_path</span><span class="p">(</span><span class="n">key</span><span class="p">),</span> <span class="n">protected</span><span class="p">)</span>
+<span class="linenos">304</span>            <span class="k">except</span> <span class="ne">FileNotFoundError</span><span class="p">:</span>
+<span class="linenos">305</span>                <span class="k">break</span>
+<span class="linenos">306</span>            <span class="n">files</span><span class="p">[</span><span class="n">ordinal</span><span class="p">]</span> <span class="o">=</span> <span class="n">protected</span>
+<span class="linenos">307</span>        <span class="n">count</span> <span class="o">=</span> <span class="nb">len</span><span class="p">(</span><span class="n">files</span><span class="p">)</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">block_size</span>
+<span class="linenos">308</span>        <span class="k">if</span> <span class="n">count</span><span class="p">:</span>
+<span class="linenos">309</span>            <span class="bp">self</span><span class="o">.</span><span class="n">_reserved_files</span><span class="p">[</span><span class="n">reservation_id</span><span class="p">]</span> <span class="o">=</span> <span class="n">files</span>
+<span class="linenos">310</span>            <span class="bp">self</span><span class="o">.</span><span class="n">_reserved_ranges</span><span class="p">[</span><span class="n">reservation_id</span><span class="p">]</span> <span class="o">=</span> <span class="p">[</span>
+<span class="linenos">311</span>                <span class="p">(</span><span class="n">num_computed_tokens</span><span class="p">,</span> <span class="n">num_computed_tokens</span> <span class="o">+</span> <span class="n">count</span><span class="p">)</span>
+<span class="linenos">312</span>            <span class="p">]</span>
+<span class="linenos">313</span>        <span class="k">else</span><span class="p">:</span>
+<span class="linenos">314</span>            <span class="n">folder</span><span class="o">.</span><span class="n">rmdir</span><span class="p">()</span>
+<span class="linenos">315</span>        <span class="k">return</span> <span class="n">count</span><span class="p">,</span> <span class="kc">False</span>
+<span class="linenos">316</span>
+<span class="linenos">317</span>    <span class="k">def</span><span class="w"> </span><span class="nf">release_prefix_reservation</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">request</span><span class="p">:</span> <span class="n">LlmRequest</span><span class="p">,</span>
+<span class="linenos">318</span>                                   <span class="n">reservation_id</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">start</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+<span class="linenos">319</span>                                   <span class="n">end</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="linenos">320</span><span class="w">        </span><span class="sd">"""Release only the named range; overlapping reservations retain it."""</span>
+<span class="linenos">321</span>        <span class="n">remaining</span> <span class="o">=</span> <span class="p">[]</span>
+<span class="linenos">322</span>        <span class="k">for</span> <span class="n">left</span><span class="p">,</span> <span class="n">right</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_reserved_ranges</span><span class="p">[</span><span class="n">reservation_id</span><span class="p">]:</span>
+<span class="linenos">323</span>            <span class="k">if</span> <span class="n">right</span> <span class="o">&lt;=</span> <span class="n">start</span> <span class="ow">or</span> <span class="n">left</span> <span class="o">&gt;=</span> <span class="n">end</span><span class="p">:</span>
+<span class="linenos">324</span>                <span class="n">remaining</span><span class="o">.</span><span class="n">append</span><span class="p">((</span><span class="n">left</span><span class="p">,</span> <span class="n">right</span><span class="p">))</span>
+<span class="linenos">325</span>            <span class="k">else</span><span class="p">:</span>
+<span class="linenos">326</span>                <span class="k">if</span> <span class="n">left</span> <span class="o">&lt;</span> <span class="n">start</span><span class="p">:</span>
+<span class="linenos">327</span>                    <span class="n">remaining</span><span class="o">.</span><span class="n">append</span><span class="p">((</span><span class="n">left</span><span class="p">,</span> <span class="n">start</span><span class="p">))</span>
+<span class="linenos">328</span>                <span class="k">if</span> <span class="n">end</span> <span class="o">&lt;</span> <span class="n">right</span><span class="p">:</span>
+<span class="linenos">329</span>                    <span class="n">remaining</span><span class="o">.</span><span class="n">append</span><span class="p">((</span><span class="n">end</span><span class="p">,</span> <span class="n">right</span><span class="p">))</span>
+<span class="linenos">330</span>        <span class="n">files</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_reserved_files</span><span class="p">[</span><span class="n">reservation_id</span><span class="p">]</span>
+<span class="linenos">331</span>        <span class="k">for</span> <span class="n">ordinal</span><span class="p">,</span> <span class="n">path</span> <span class="ow">in</span> <span class="nb">list</span><span class="p">(</span><span class="n">files</span><span class="o">.</span><span class="n">items</span><span class="p">()):</span>
+<span class="linenos">332</span>            <span class="n">block_start</span> <span class="o">=</span> <span class="n">ordinal</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">block_size</span>
+<span class="linenos">333</span>            <span class="n">block_end</span> <span class="o">=</span> <span class="n">block_start</span> <span class="o">+</span> <span class="bp">self</span><span class="o">.</span><span class="n">block_size</span>
+<span class="linenos">334</span>            <span class="k">if</span> <span class="ow">not</span> <span class="nb">any</span><span class="p">(</span><span class="n">left</span> <span class="o">&lt;</span> <span class="n">block_end</span> <span class="ow">and</span> <span class="n">right</span> <span class="o">&gt;</span> <span class="n">block_start</span>
+<span class="linenos">335</span>                       <span class="k">for</span> <span class="n">left</span><span class="p">,</span> <span class="n">right</span> <span class="ow">in</span> <span class="n">remaining</span><span class="p">):</span>
+<span class="linenos">336</span>                <span class="n">path</span><span class="o">.</span><span class="n">unlink</span><span class="p">()</span>
+<span class="linenos">337</span>                <span class="k">del</span> <span class="n">files</span><span class="p">[</span><span class="n">ordinal</span><span class="p">]</span>
+<span class="linenos">338</span>        <span class="k">if</span> <span class="n">remaining</span><span class="p">:</span>
+<span class="linenos">339</span>            <span class="bp">self</span><span class="o">.</span><span class="n">_reserved_ranges</span><span class="p">[</span><span class="n">reservation_id</span><span class="p">]</span> <span class="o">=</span> <span class="n">remaining</span>
+<span class="linenos">340</span>        <span class="k">else</span><span class="p">:</span>
+<span class="linenos">341</span>            <span class="k">del</span> <span class="bp">self</span><span class="o">.</span><span class="n">_reserved_ranges</span><span class="p">[</span><span class="n">reservation_id</span><span class="p">]</span>
+<span class="linenos">342</span>            <span class="k">del</span> <span class="bp">self</span><span class="o">.</span><span class="n">_reserved_files</span><span class="p">[</span><span class="n">reservation_id</span><span class="p">]</span>
+<span class="linenos">343</span>            <span class="p">(</span><span class="n">Path</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_reservation_folder</span><span class="o">.</span><span class="n">name</span><span class="p">)</span> <span class="o">/</span> <span class="nb">str</span><span class="p">(</span><span class="n">reservation_id</span><span class="p">))</span><span class="o">.</span><span class="n">rmdir</span><span class="p">()</span>
 <span class="linenos">344</span>
-<span class="linenos">345</span><span class="k">if</span> <span class="vm">__name__</span> <span class="o">==</span> <span class="s2">"__main__"</span><span class="p">:</span>
-<span class="linenos">346</span>    <span class="n">main</span><span class="p">()</span>
+<span class="linenos">345</span>    <span class="k">def</span><span class="w"> </span><span class="nf">request_finished</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">request</span><span class="p">:</span> <span class="n">LlmRequest</span><span class="p">,</span>
+<span class="linenos">346</span>                         <span class="n">cache_block_ids</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+<span class="linenos">347</span>        <span class="c1"># We don't do any asynchronous saving, so always return False</span>
+<span class="linenos">348</span>        <span class="k">return</span> <span class="kc">False</span>
+<span class="linenos">349</span>
+<span class="linenos">350</span>    <span class="k">def</span><span class="w"> </span><span class="nf">update_state_after_alloc</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">request</span><span class="p">:</span> <span class="n">LlmRequest</span><span class="p">,</span>
+<span class="linenos">351</span>                                 <span class="n">block_ids</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]):</span>
+<span class="linenos">352</span>        <span class="k">pass</span>
+<span class="linenos">353</span>
+<span class="linenos">354</span>
+<span class="linenos">355</span><span class="nd">@click</span><span class="o">.</span><span class="n">command</span><span class="p">()</span>
+<span class="linenos">356</span><span class="nd">@click</span><span class="o">.</span><span class="n">argument</span><span class="p">(</span><span class="s2">"model"</span><span class="p">,</span> <span class="nb">type</span><span class="o">=</span><span class="nb">str</span><span class="p">)</span>
+<span class="linenos">357</span><span class="k">def</span><span class="w"> </span><span class="nf">main</span><span class="p">(</span><span class="n">model</span><span class="p">:</span> <span class="nb">str</span><span class="p">):</span>
+<span class="linenos">358</span>    <span class="n">sys</span><span class="o">.</span><span class="n">path</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">os</span><span class="o">.</span><span class="n">path</span><span class="o">.</span><span class="n">join</span><span class="p">(</span>
+<span class="linenos">359</span>        <span class="n">os</span><span class="o">.</span><span class="n">path</span><span class="o">.</span><span class="n">dirname</span><span class="p">(</span><span class="vm">__file__</span><span class="p">),</span>
+<span class="linenos">360</span>        <span class="s2">".."</span><span class="p">,</span>
+<span class="linenos">361</span>    <span class="p">))</span>
+<span class="linenos">362</span>
+<span class="linenos">363</span>    <span class="n">this_module</span> <span class="o">=</span> <span class="vm">__file__</span><span class="p">[</span><span class="vm">__file__</span><span class="o">.</span><span class="n">rfind</span><span class="p">(</span><span class="s2">"/"</span><span class="p">)</span> <span class="o">+</span> <span class="mi">1</span><span class="p">:</span><span class="vm">__file__</span><span class="o">.</span><span class="n">rfind</span><span class="p">(</span><span class="s2">".py"</span><span class="p">)]</span>
+<span class="linenos">364</span>
+<span class="linenos">365</span>    <span class="c1"># --- KV Cache Connector Config ---</span>
+<span class="linenos">366</span>    <span class="n">kv_connector_config</span> <span class="o">=</span> <span class="n">KvCacheConnectorConfig</span><span class="p">(</span>
+<span class="linenos">367</span>        <span class="n">connector_module</span><span class="o">=</span><span class="n">this_module</span><span class="p">,</span>
+<span class="linenos">368</span>        <span class="n">connector_scheduler_class</span><span class="o">=</span><span class="s2">"PersistentKvCacheConnectorLeader"</span><span class="p">,</span>
+<span class="linenos">369</span>        <span class="n">connector_worker_class</span><span class="o">=</span><span class="s2">"PersistentKvCacheConnectorWorker"</span><span class="p">,</span>
+<span class="linenos">370</span>    <span class="p">)</span>
+<span class="linenos">371</span>
+<span class="linenos">372</span>    <span class="n">connector_cache_dir</span> <span class="o">=</span> <span class="n">TemporaryDirectory</span><span class="p">()</span>
+<span class="linenos">373</span>    <span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="p">[</span><span class="n">CONNECTOR_CACHE_FOLDER_KEY</span><span class="p">]</span> <span class="o">=</span> <span class="n">connector_cache_dir</span><span class="o">.</span><span class="n">name</span>
+<span class="linenos">374</span>
+<span class="linenos">375</span>    <span class="c1"># Create LLM instance with KV Cache Connector</span>
+<span class="linenos">376</span>    <span class="n">llm</span> <span class="o">=</span> <span class="n">LLM</span><span class="p">(</span><span class="n">model</span><span class="o">=</span><span class="n">model</span><span class="p">,</span>
+<span class="linenos">377</span>              <span class="n">backend</span><span class="o">=</span><span class="s2">"pytorch"</span><span class="p">,</span>
+<span class="linenos">378</span>              <span class="n">cuda_graph_config</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+<span class="linenos">379</span>              <span class="n">kv_connector_config</span><span class="o">=</span><span class="n">kv_connector_config</span><span class="p">)</span>
+<span class="linenos">380</span>
+<span class="linenos">381</span>    <span class="n">test_text</span> <span class="o">=</span> <span class="p">(</span>
+<span class="linenos">382</span>        <span class="s2">"Nvidia Corporation is an American technology company headquartered in Santa Clara, California."</span>
+<span class="linenos">383</span>        <span class="s2">"Founded in 1993 by Jensen Huang, Chris Malachowsky, and Curtis Priem, it develops graphics processing units (GPUs), "</span>
+<span class="linenos">384</span>        <span class="s2">"system on a chips (SoCs), and application programming interfaces (APIs) for data science, high-performance computing, "</span>
+<span class="linenos">385</span>        <span class="s2">"and mobile and automotive applications. Tell me about the company."</span><span class="p">)</span>
+<span class="linenos">386</span>
+<span class="linenos">387</span>    <span class="n">sampling_params</span> <span class="o">=</span> <span class="n">SamplingParams</span><span class="p">(</span><span class="n">max_tokens</span><span class="o">=</span><span class="mi">32</span><span class="p">)</span>
+<span class="linenos">388</span>
+<span class="linenos">389</span>    <span class="c1"># Generate text with the first LLM instance and save the kv cache blocks by the connector.</span>
+<span class="linenos">390</span>    <span class="n">output</span> <span class="o">=</span> <span class="n">llm</span><span class="o">.</span><span class="n">generate</span><span class="p">([</span><span class="n">test_text</span><span class="p">],</span> <span class="n">sampling_params</span><span class="p">)</span>
+<span class="linenos">391</span>    <span class="n">text0</span> <span class="o">=</span> <span class="n">output</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">outputs</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">text</span>
+<span class="linenos">392</span>
+<span class="linenos">393</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"First output: "</span><span class="p">,</span> <span class="n">text0</span><span class="p">)</span>
+<span class="linenos">394</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"Loading new LLM instance..."</span><span class="p">)</span>
+<span class="linenos">395</span>
+<span class="linenos">396</span>    <span class="k">del</span> <span class="n">llm</span>
+<span class="linenos">397</span>
+<span class="linenos">398</span>    <span class="c1"># Create a new LLM instance with the same connector configuration</span>
+<span class="linenos">399</span>    <span class="n">llm</span> <span class="o">=</span> <span class="n">LLM</span><span class="p">(</span><span class="n">model</span><span class="o">=</span><span class="n">model</span><span class="p">,</span>
+<span class="linenos">400</span>              <span class="n">backend</span><span class="o">=</span><span class="s2">"pytorch"</span><span class="p">,</span>
+<span class="linenos">401</span>              <span class="n">cuda_graph_config</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+<span class="linenos">402</span>              <span class="n">kv_connector_config</span><span class="o">=</span><span class="n">kv_connector_config</span><span class="p">)</span>
+<span class="linenos">403</span>
+<span class="linenos">404</span>    <span class="c1"># Generate text with the second LLM instance and it should reuse the kv cache blocks from the connector.</span>
+<span class="linenos">405</span>    <span class="n">output</span> <span class="o">=</span> <span class="n">llm</span><span class="o">.</span><span class="n">generate</span><span class="p">([</span><span class="n">test_text</span><span class="p">],</span> <span class="n">sampling_params</span><span class="p">)</span>
+<span class="linenos">406</span>    <span class="n">text1</span> <span class="o">=</span> <span class="n">output</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">outputs</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">text</span>
+<span class="linenos">407</span>
+<span class="linenos">408</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"Second output (using connector cache): "</span><span class="p">,</span> <span class="n">text1</span><span class="p">)</span>
+<span class="linenos">409</span>
+<span class="linenos">410</span>    <span class="c1"># Verify that the two outputs are identical</span>
+<span class="linenos">411</span>    <span class="k">assert</span> <span class="n">text0</span> <span class="o">==</span> <span class="n">text1</span>
+<span class="linenos">412</span>
+<span class="linenos">413</span>    <span class="n">connector_cache_dir</span><span class="o">.</span><span class="n">cleanup</span><span class="p">()</span>
+<span class="linenos">414</span>
+<span class="linenos">415</span>
+<span class="linenos">416</span><span class="k">if</span> <span class="vm">__name__</span> <span class="o">==</span> <span class="s2">"__main__"</span><span class="p">:</span>
+<span class="linenos">417</span>    <span class="n">main</span><span class="p">()</span>
 </pre></div>
 </div>
 </section>
@@ -1059,8 +1133,8 @@
   
 
   <!-- Scripts loaded after <body> so the DOM is not blocked -->
-  <script defer src="../_static/scripts/bootstrap.js?digest=64cc4de3f052d77215f0"></script>
-<script defer src="../_static/scripts/pydata-sphinx-theme.js?digest=64cc4de3f052d77215f0"></script>
+  <script defer src="../_static/scripts/bootstrap.js?digest=18bd87630a240e9c25be"></script>
+<script defer src="../_static/scripts/pydata-sphinx-theme.js?digest=18bd87630a240e9c25be"></script>
 
 
   <footer class="bd-footer">
@@ -1132,9 +1206,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on September 26, 2026.</p>
+  <p>Last updated on October 09, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/c76f4a8">c76f4a8</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/cc63e66">cc63e66</a>.</p>
   
 </div></div>
       

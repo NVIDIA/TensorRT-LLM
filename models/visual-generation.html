@@ -27,8 +27,8 @@
   </noscript>
   
   <!-- Loaded before other Sphinx assets -->
-  <link href="../_static/styles/theme.css?digest=64cc4de3f052d77215f0" rel="stylesheet" />
-<link href="../_static/styles/pydata-sphinx-theme.css?digest=64cc4de3f052d77215f0" rel="stylesheet" />
+  <link href="../_static/styles/theme.css?digest=18bd87630a240e9c25be" rel="stylesheet" />
+<link href="../_static/styles/pydata-sphinx-theme.css?digest=18bd87630a240e9c25be" rel="stylesheet" />
 
     <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=8f2a1f02" />
     <link rel="stylesheet" type="text/css" href="../_static/styles/nvidia-sphinx-theme.css?v=933278ad" />
@@ -39,10 +39,10 @@
     <link rel="stylesheet" type="text/css" href="../_static/custom.css?v=19d20f17" />
   
   <!-- So that users can add custom icons -->
-  <script defer src="../_static/scripts/fontawesome.js?digest=64cc4de3f052d77215f0"></script>
+  <script defer src="../_static/scripts/fontawesome.js?digest=18bd87630a240e9c25be"></script>
   <!-- Pre-loaded scripts that we'll load fully later -->
-  <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=64cc4de3f052d77215f0" />
-<link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=64cc4de3f052d77215f0" />
+  <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=18bd87630a240e9c25be" />
+<link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=18bd87630a240e9c25be" />
 
 
 
@@ -60,9 +60,9 @@
     <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
     <script>DOCUMENTATION_OPTIONS.pagename = 'models/visual-generation';</script>
     <script>
-        DOCUMENTATION_OPTIONS.theme_version = '0.22.0';
+        DOCUMENTATION_OPTIONS.theme_version = '0.23.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc29';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc0';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -77,8 +77,9 @@
 
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="color-scheme" content="light dark"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc29" />
+  <meta name="docsearch:version" content="1.4.0rc0" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -412,6 +413,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-qwen3.8-flash-next-on-trtllm.html">Deployment Guide for Qwen3.8-Flash-Next on TensorRT LLM - Blackwell Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-kimi-k3-on-trtllm.html">Deployment Guide for Kimi K3 on TensorRT LLM - Blackwell</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-glm-5-on-trtllm.html">Deployment Guide for GLM-5 on TensorRT LLM - Blackwell Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-glm-5.3-flash-on-trtllm.html">Deployment Guide for GLM-5.3-Flash on TensorRT LLM - Blackwell Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-minimax-m3-on-trtllm.html">Deployment Guide for MiniMax-M3 on TensorRT LLM</a></li>
 </ul>
 </details></li>
@@ -458,6 +460,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CudaGraphConfig.html">CudaGraphConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/DecodeCudaGraphConfig.html">DecodeCudaGraphConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/EncodeCudaGraphConfig.html">EncodeCudaGraphConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/EncodeExtraInputSpec.html">EncodeExtraInputSpec</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/MoeConfig.html">MoeConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/EagleDecodingConfig.html">EagleDecodingConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/Eagle3DecodingConfig.html">Eagle3DecodingConfig</a></li>
@@ -785,7 +788,7 @@ actively evolving and may change in future releases.</p>
 <th class="head"><p>Attention2D</p></th>
 <th class="head"><p>Ring Attention</p></th>
 <th class="head"><p>Tensor Parallelism</p></th>
-<th class="head"><p>VSA</p></th>
+<th class="head"><p>SOL-Attn</p></th>
 </tr>
 </thead>
 <tbody>
@@ -838,7 +841,7 @@ actively evolving and may change in future releases.</p>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
-<td><p>No</p></td>
+<td><p>Yes</p></td>
 </tr>
 <tr class="row-odd"><td><p><strong>Wan 2.1 VSA</strong></p></td>
 <td><p>Yes</p></td>
@@ -872,7 +875,7 @@ actively evolving and may change in future releases.</p>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
-<td><p>No</p></td>
+<td><p>Yes</p></td>
 </tr>
 <tr class="row-odd"><td><p><strong>FastWan 2.2</strong></p></td>
 <td><p>Yes</p></td>
@@ -906,7 +909,7 @@ actively evolving and may change in future releases.</p>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
 <td><p>No</p></td>
-<td><p>No</p></td>
+<td><p>Yes</p></td>
 </tr>
 <tr class="row-odd"><td><p><strong>MiniMax-H3</strong></p></td>
 <td><p>Yes</p></td>
@@ -1030,6 +1033,7 @@ actively evolving and may change in future releases.</p>
 </tbody>
 </table>
 </div>
+<p>SOL-Attn is a runtime sparse-attention feature of the <code class="docutils literal notranslate"><span class="pre">TRTLLM</span></code> and <code class="docutils literal notranslate"><span class="pre">CUTEDSL</span></code> backends (bfloat16 self-attention with <code class="docutils literal notranslate"><span class="pre">head_dim=128</span></code> on SM100/SM103); it needs no dedicated checkpoint. Video Sparse Attention (VSA) requires a VSA-fine-tuned checkpoint and is therefore listed as its own model, <code class="docutils literal notranslate"><span class="pre">Wan</span> <span class="pre">2.1</span> <span class="pre">VSA</span></code>. See <a class="reference internal" href="../features/visualgen-sparse-attention.html"><span class="std std-doc">VisualGen Sparse Attention</span></a> for both.</p>
 </section>
 </section>
 <section id="quick-start">
@@ -1162,8 +1166,13 @@ and Tensor Parallelism are not enabled for this pipeline yet.</p>
 <section id="minimax-h3-notes">
 <h2>MiniMax-H3 Notes<a class="headerlink" href="#minimax-h3-notes" title="Link to this heading">#</a></h2>
 <ul class="simple">
-<li><p>Text-to-video (T2VA) and first/last-frame-to-video (FL2VA) are supported. Reference-to-video
-(Ref2VA) is not enabled yet.</p></li>
+<li><p>Text-to-video (T2VA), first/last-frame-to-video (FL2VA), and reference-to-video
+with audio (Ref2VA) are supported on one GPU. Enable Ref2VA with
+<code class="docutils literal notranslate"><span class="pre">pipeline_config:</span> <span class="pre">{workflow:</span> <span class="pre">ref2va}</span></code>; it requires <code class="docutils literal notranslate"><span class="pre">transformer_ref/</span></code> weights.
+Pass image, video, and audio inputs through the existing reference slots with
+role <code class="docutils literal notranslate"><span class="pre">reference</span></code>. Audio requires an image or video reference. See the
+<span class="xref myst">Ref2VA example</span>
+for input limits, ordering, and media dependencies.</p></li>
 <li><p>MiniMax-H3 currently restricts TRTLLM attention to SM100 or SM103. This is a
 model-specific restriction, not a general VisualGen backend requirement.</p></li>
 <li><p>The published <a class="reference external" href="https://huggingface.co/MiniMaxAI/MiniMax-H3/blob/main/LICENSE">MiniMax-H3 checkpoint license</a>
@@ -1414,38 +1423,15 @@ for a Wan 2.2 VAE NVFP4 calibration and checkpoint-generation recipe.</p>
 <p><strong>Wan 2.2 dual-transformer note:</strong> Wan 2.2 uses two expert transformers (high-noise and low-noise stacks). All <code class="docutils literal notranslate"><span class="pre">CacheDiTConfig</span></code> parameters apply to both stacks, except <code class="docutils literal notranslate"><span class="pre">max_warmup_steps</span></code> and <code class="docutils literal notranslate"><span class="pre">max_cached_steps</span></code>: the low-noise stack always uses fixed internal caps (<code class="docutils literal notranslate"><span class="pre">max_warmup_steps=2</span></code>, <code class="docutils literal notranslate"><span class="pre">max_cached_steps=20</span></code>) regardless of user config.</p>
 </section>
 </section>
-<section id="video-sparse-attention-vsa">
-<h3>Video Sparse Attention (VSA)<a class="headerlink" href="#video-sparse-attention-vsa" title="Link to this heading">#</a></h3>
-<p>VSA reduces the compute cost of self-attention in video diffusion models by selectively attending to only the most relevant spatial-temporal blocks. It uses a two-branch design: a lightweight coarse mean-pool branch computes block-level attention scores to identify the top-K most relevant token blocks, then a fine branch runs a block-sparse CuTe kernel over only those blocks. The two outputs are blended with learned gates.</p>
-<p><strong>Requirements:</strong></p>
+<section id="sparse-attention">
+<h3>Sparse Attention<a class="headerlink" href="#sparse-attention" title="Link to this heading">#</a></h3>
+<p>Attention dominates a denoising step at high resolution or long video length. VisualGen ships three sparse attention algorithms, all configured through <code class="docutils literal notranslate"><span class="pre">attention_config.sparse_attention_config</span></code> and all served by the <code class="docutils literal notranslate"><span class="pre">TRTLLM</span></code> and <code class="docutils literal notranslate"><span class="pre">CUTEDSL</span></code> attention backends:</p>
 <ul class="simple">
-<li><p>VSA-fine-tuned checkpoint: <a class="reference external" href="https://huggingface.co/FastVideo/Wan2.1-VSA-T2V-14B-720P-Diffusers"><code class="docutils literal notranslate"><span class="pre">FastVideo/Wan2.1-VSA-T2V-14B-720P-Diffusers</span></code></a>. Standard Wan checkpoints do not have the learned VSA gates.</p></li>
-<li><p>Blackwell GPU (sm_100+) for the CuTe JIT kernel. Falls back to dense SDPA on older hardware with no accuracy loss.</p></li>
-<li><p><code class="docutils literal notranslate"><span class="pre">CUTEDSL</span></code> attention backend.</p></li>
-<li><p>Not compatible with Ring attention or Attention2D (VSA does not produce per-split LSE). Ulysses is supported.</p></li>
+<li><p><strong>Skip Softmax Attention</strong> (<code class="docutils literal notranslate"><span class="pre">algorithm:</span> <span class="pre">skip_softmax</span></code>) skips negligible softmax blocks inside the FlashAttention-style kernel. It is plug-and-play for existing checkpoints; a ModelOpt-calibrated checkpoint can additionally map a <code class="docutils literal notranslate"><span class="pre">target_sparsity</span></code> to the kernel threshold.</p></li>
+<li><p><strong>SOL Attention</strong> (<code class="docutils literal notranslate"><span class="pre">algorithm:</span> <span class="pre">sol_attn</span></code>) routes attention blocks at runtime: blocks whose scores stand out are computed exactly and the rest are folded in from compact K/V proxies. It needs no dedicated checkpoint and applies to bfloat16 self-attention with <code class="docutils literal notranslate"><span class="pre">head_dim=128</span></code> on SM100/SM103 GPUs.</p></li>
+<li><p><strong>Video Sparse Attention (VSA)</strong> (<code class="docutils literal notranslate"><span class="pre">algorithm:</span> <span class="pre">vsa</span></code>) combines a coarse mean-pooled branch with a top-K block-sparse fine branch and requires a VSA-fine-tuned checkpoint such as <a class="reference external" href="https://huggingface.co/FastVideo/Wan2.1-VSA-T2V-14B-720P-Diffusers"><code class="docutils literal notranslate"><span class="pre">FastVideo/Wan2.1-VSA-T2V-14B-720P-Diffusers</span></code></a>.</p></li>
 </ul>
-<p><strong><code class="docutils literal notranslate"><span class="pre">vsa_sparsity</span></code></strong> controls the fraction of K/V blocks skipped in the fine branch (0.0 = dense, 0.9 = 90% blocks skipped). Higher sparsity gives more speedup at the cost of some quality.</p>
-<p>Python API:</p>
-<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm</span><span class="w"> </span><span class="kn">import</span> <span class="n">VisualGenArgs</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.visual_gen.args</span><span class="w"> </span><span class="kn">import</span> <span class="n">AttentionConfig</span><span class="p">,</span> <span class="n">VideoSparseAttentionConfig</span>
-
-<span class="n">args</span> <span class="o">=</span> <span class="n">VisualGenArgs</span><span class="p">(</span>
-    <span class="n">model</span><span class="o">=</span><span class="s2">"FastVideo/Wan2.1-VSA-T2V-14B-720P-Diffusers"</span><span class="p">,</span>
-    <span class="n">attention_config</span><span class="o">=</span><span class="n">AttentionConfig</span><span class="p">(</span>
-        <span class="n">backend</span><span class="o">=</span><span class="s2">"CUTEDSL"</span><span class="p">,</span>
-        <span class="n">sparse_attention_config</span><span class="o">=</span><span class="n">VideoSparseAttentionConfig</span><span class="p">(</span><span class="n">vsa_sparsity</span><span class="o">=</span><span class="mf">0.9</span><span class="p">),</span>
-    <span class="p">),</span>
-<span class="p">)</span>
-</pre></div>
-</div>
-<p>YAML (for use with <code class="docutils literal notranslate"><span class="pre">--visual_gen_args</span></code> or <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code>):</p>
-<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">attention_config</span><span class="p">:</span>
-<span class="w">  </span><span class="nt">backend</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">CUTEDSL</span>
-<span class="w">  </span><span class="nt">sparse_attention_config</span><span class="p">:</span>
-<span class="w">    </span><span class="nt">algorithm</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">vsa</span>
-<span class="w">    </span><span class="nt">vsa_sparsity</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">0.90</span>
-</pre></div>
-</div>
+<p>Skip Softmax and SOL share the <code class="docutils literal notranslate"><span class="pre">disabled_until_timestep</span></code> schedule that keeps the high-noise prefix dense, and every algorithm participates in the CUDA Graph key so dense and sparse phases never share a graph. Configuration, requirements and Python/YAML examples for each algorithm are in <a class="reference internal" href="../features/visualgen-sparse-attention.html"><span class="std std-doc">VisualGen Sparse Attention</span></a>.</p>
 </section>
 <section id="cpu-offloading">
 <h3>CPU Offloading<a class="headerlink" href="#cpu-offloading" title="Link to this heading">#</a></h3>
@@ -1637,7 +1623,7 @@ peer or the coordinator exits.</p>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#cache-dit">Cache-DiT</a></li>
 </ul>
 </li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#video-sparse-attention-vsa">Video Sparse Attention (VSA)</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#sparse-attention">Sparse Attention</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#cpu-offloading">CPU Offloading</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#multi-gpu-parallelism">Multi-GPU Parallelism</a></li>
 </ul>
@@ -1671,8 +1657,8 @@ peer or the coordinator exits.</p>
   
 
   <!-- Scripts loaded after <body> so the DOM is not blocked -->
-  <script defer src="../_static/scripts/bootstrap.js?digest=64cc4de3f052d77215f0"></script>
-<script defer src="../_static/scripts/pydata-sphinx-theme.js?digest=64cc4de3f052d77215f0"></script>
+  <script defer src="../_static/scripts/bootstrap.js?digest=18bd87630a240e9c25be"></script>
+<script defer src="../_static/scripts/pydata-sphinx-theme.js?digest=18bd87630a240e9c25be"></script>
 
 
   <footer class="bd-footer">
@@ -1744,9 +1730,9 @@ peer or the coordinator exits.</p>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on September 26, 2026.</p>
+  <p>Last updated on October 09, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/c76f4a8">c76f4a8</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/cc63e66">cc63e66</a>.</p>
   
 </div></div>
       

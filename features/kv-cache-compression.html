@@ -27,8 +27,8 @@
   </noscript>
   
   <!-- Loaded before other Sphinx assets -->
-  <link href="../_static/styles/theme.css?digest=64cc4de3f052d77215f0" rel="stylesheet" />
-<link href="../_static/styles/pydata-sphinx-theme.css?digest=64cc4de3f052d77215f0" rel="stylesheet" />
+  <link href="../_static/styles/theme.css?digest=18bd87630a240e9c25be" rel="stylesheet" />
+<link href="../_static/styles/pydata-sphinx-theme.css?digest=18bd87630a240e9c25be" rel="stylesheet" />
 
     <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=8f2a1f02" />
     <link rel="stylesheet" type="text/css" href="../_static/styles/nvidia-sphinx-theme.css?v=933278ad" />
@@ -39,10 +39,10 @@
     <link rel="stylesheet" type="text/css" href="../_static/custom.css?v=19d20f17" />
   
   <!-- So that users can add custom icons -->
-  <script defer src="../_static/scripts/fontawesome.js?digest=64cc4de3f052d77215f0"></script>
+  <script defer src="../_static/scripts/fontawesome.js?digest=18bd87630a240e9c25be"></script>
   <!-- Pre-loaded scripts that we'll load fully later -->
-  <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=64cc4de3f052d77215f0" />
-<link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=64cc4de3f052d77215f0" />
+  <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=18bd87630a240e9c25be" />
+<link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=18bd87630a240e9c25be" />
 
 
 
@@ -60,9 +60,9 @@
     <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
     <script>DOCUMENTATION_OPTIONS.pagename = 'features/kv-cache-compression';</script>
     <script>
-        DOCUMENTATION_OPTIONS.theme_version = '0.22.0';
+        DOCUMENTATION_OPTIONS.theme_version = '0.23.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc29';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc0';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -77,8 +77,9 @@
 
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="color-scheme" content="light dark"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc29" />
+  <meta name="docsearch:version" content="1.4.0rc0" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -412,6 +413,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-qwen3.8-flash-next-on-trtllm.html">Deployment Guide for Qwen3.8-Flash-Next on TensorRT LLM - Blackwell Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-kimi-k3-on-trtllm.html">Deployment Guide for Kimi K3 on TensorRT LLM - Blackwell</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-glm-5-on-trtllm.html">Deployment Guide for GLM-5 on TensorRT LLM - Blackwell Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-glm-5.3-flash-on-trtllm.html">Deployment Guide for GLM-5.3-Flash on TensorRT LLM - Blackwell Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-minimax-m3-on-trtllm.html">Deployment Guide for MiniMax-M3 on TensorRT LLM</a></li>
 </ul>
 </details></li>
@@ -458,6 +460,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CudaGraphConfig.html">CudaGraphConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/DecodeCudaGraphConfig.html">DecodeCudaGraphConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/EncodeCudaGraphConfig.html">EncodeCudaGraphConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/EncodeExtraInputSpec.html">EncodeExtraInputSpec</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/MoeConfig.html">MoeConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/EagleDecodingConfig.html">EagleDecodingConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/Eagle3DecodingConfig.html">Eagle3DecodingConfig</a></li>
@@ -868,7 +871,7 @@ NVFP4 only in a cold cache tier and restores the runtime type before Attention;
 the latter sets <code class="docutils literal notranslate"><span class="pre">KvCacheConfig(dtype=&quot;nvfp4&quot;)</span></code> and keeps active GPU KV in
 NVFP4. See <a class="reference internal" href="quantization.html"><span class="std std-doc">Quantization</span></a> for active KV-cache quantization.
 For complete single-GPU and disaggregated-serving configurations, see the
-<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/c76f4a8/examples/kv_cache_compression/nvfp4_cold_page.md">NVFP4 cold-page compression example</a>.</p>
+<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/cc63e66/examples/kv_cache_compression/nvfp4_cold_page.md">NVFP4 cold-page compression example</a>.</p>
 </section>
 <section id="triattention">
 <h3>TriAttention<a class="headerlink" href="#triattention" title="Link to this heading">#</a></h3>
@@ -897,7 +900,7 @@ implementation runs over the compacted cache.</p>
 </pre></div>
 </div>
 <p>For calibration, configuration parameters, and current requirements, see the
-<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/c76f4a8/examples/kv_cache_compression/triattention.md">detailed TriAttention example</a>.</p>
+<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/cc63e66/examples/kv_cache_compression/triattention.md">detailed TriAttention example</a>.</p>
 </section>
 </section>
 <section id="support">
@@ -971,8 +974,8 @@ examples for method-specific requirements.</p>
 <section id="further-reading">
 <h2>Further Reading<a class="headerlink" href="#further-reading" title="Link to this heading">#</a></h2>
 <ul class="simple">
-<li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/c76f4a8/examples/kv_cache_compression/nvfp4_cold_page.md">NVFP4 Cold-Page KV-Cache Compression example</a></p></li>
-<li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/c76f4a8/examples/kv_cache_compression/triattention.md">TriAttention KV-Cache Compression example</a></p></li>
+<li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/cc63e66/examples/kv_cache_compression/nvfp4_cold_page.md">NVFP4 Cold-Page KV-Cache Compression example</a></p></li>
+<li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/cc63e66/examples/kv_cache_compression/triattention.md">TriAttention KV-Cache Compression example</a></p></li>
 <li><p><a class="reference internal" href="../developer-guide/kv-cache-compression-development.html"><span class="std std-doc">KV Cache Compression Development Guide</span></a></p></li>
 <li><p><a class="reference internal" href="../developer-guide/kv-cache-cold-page-codec.html"><span class="std std-doc">KVCacheManagerV2 Cold-Page Codec Design</span></a></p></li>
 <li><p><a class="reference internal" href="kvcache.html"><span class="std std-doc">KV Cache System</span></a></p></li>
@@ -991,14 +994,14 @@ KVCM V2, and an NVIDIA GPU with compute capability SM100, SM103, or SM107.</p>
 <span class="label"><span class="fn-bracket">[</span><a role="doc-backlink" href="#id2">2</a><span class="fn-bracket">]</span></span>
 <p>NVFP4 cold-page quantization additionally requires
 the native C++ KVCM V2 backend and a nonzero Host or Disk cache. See the
-<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/c76f4a8/examples/kv_cache_compression/nvfp4_cold_page.md">NVFP4 cold-page compression example</a>
+<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/cc63e66/examples/kv_cache_compression/nvfp4_cold_page.md">NVFP4 cold-page compression example</a>
 for its remaining requirements and validated modes.</p>
 </aside>
 <aside class="footnote brackets" id="triattention-requirements" role="doc-footnote">
 <span class="label"><span class="fn-bracket">[</span><a role="doc-backlink" href="#id3">3</a><span class="fn-bracket">]</span></span>
 <p>TriAttention requires a model-specific offline
 calibration file. See the
-<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/c76f4a8/examples/kv_cache_compression/triattention.md">detailed TriAttention example</a>
+<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/cc63e66/examples/kv_cache_compression/triattention.md">detailed TriAttention example</a>
 for its remaining requirements and validated modes.</p>
 </aside>
 <aside class="footnote brackets" id="deepseek-v4" role="doc-footnote">
@@ -1095,8 +1098,8 @@ is not used.</p>
   
 
   <!-- Scripts loaded after <body> so the DOM is not blocked -->
-  <script defer src="../_static/scripts/bootstrap.js?digest=64cc4de3f052d77215f0"></script>
-<script defer src="../_static/scripts/pydata-sphinx-theme.js?digest=64cc4de3f052d77215f0"></script>
+  <script defer src="../_static/scripts/bootstrap.js?digest=18bd87630a240e9c25be"></script>
+<script defer src="../_static/scripts/pydata-sphinx-theme.js?digest=18bd87630a240e9c25be"></script>
 
 
   <footer class="bd-footer">
@@ -1168,9 +1171,9 @@ is not used.</p>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on September 26, 2026.</p>
+  <p>Last updated on October 09, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/c76f4a8">c76f4a8</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/cc63e66">cc63e66</a>.</p>
   
 </div></div>
       

@@ -26,8 +26,8 @@
   </noscript>
   
   <!-- Loaded before other Sphinx assets -->
-  <link href="../../../_static/styles/theme.css?digest=64cc4de3f052d77215f0" rel="stylesheet" />
-<link href="../../../_static/styles/pydata-sphinx-theme.css?digest=64cc4de3f052d77215f0" rel="stylesheet" />
+  <link href="../../../_static/styles/theme.css?digest=18bd87630a240e9c25be" rel="stylesheet" />
+<link href="../../../_static/styles/pydata-sphinx-theme.css?digest=18bd87630a240e9c25be" rel="stylesheet" />
 
     <link rel="stylesheet" type="text/css" href="../../../_static/pygments.css?v=8f2a1f02" />
     <link rel="stylesheet" type="text/css" href="../../../_static/styles/nvidia-sphinx-theme.css?v=933278ad" />
@@ -38,10 +38,10 @@
     <link rel="stylesheet" type="text/css" href="../../../_static/custom.css?v=19d20f17" />
   
   <!-- So that users can add custom icons -->
-  <script defer src="../../../_static/scripts/fontawesome.js?digest=64cc4de3f052d77215f0"></script>
+  <script defer src="../../../_static/scripts/fontawesome.js?digest=18bd87630a240e9c25be"></script>
   <!-- Pre-loaded scripts that we'll load fully later -->
-  <link rel="preload" as="script" href="../../../_static/scripts/bootstrap.js?digest=64cc4de3f052d77215f0" />
-<link rel="preload" as="script" href="../../../_static/scripts/pydata-sphinx-theme.js?digest=64cc4de3f052d77215f0" />
+  <link rel="preload" as="script" href="../../../_static/scripts/bootstrap.js?digest=18bd87630a240e9c25be" />
+<link rel="preload" as="script" href="../../../_static/scripts/pydata-sphinx-theme.js?digest=18bd87630a240e9c25be" />
 
 
 
@@ -417,9 +417,9 @@ window.addEventListener("load", load);
 window.runMermaid = runMermaid;</script>
     <script>DOCUMENTATION_OPTIONS.pagename = '_modules/tensorrt_llm/llmapi/llm_args';</script>
     <script>
-        DOCUMENTATION_OPTIONS.theme_version = '0.22.0';
+        DOCUMENTATION_OPTIONS.theme_version = '0.23.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc29';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc0';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -432,8 +432,9 @@ window.runMermaid = runMermaid;</script>
 
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="color-scheme" content="light dark"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc29" />
+  <meta name="docsearch:version" content="1.4.0rc0" />
   
     
     <script src="../../../_static/searchtools.js"></script>
@@ -763,6 +764,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/deployment-guide-for-qwen3.8-flash-next-on-trtllm.html">Deployment Guide for Qwen3.8-Flash-Next on TensorRT LLM - Blackwell Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/deployment-guide-for-kimi-k3-on-trtllm.html">Deployment Guide for Kimi K3 on TensorRT LLM - Blackwell</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/deployment-guide-for-glm-5-on-trtllm.html">Deployment Guide for GLM-5 on TensorRT LLM - Blackwell Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/deployment-guide-for-glm-5.3-flash-on-trtllm.html">Deployment Guide for GLM-5.3-Flash on TensorRT LLM - Blackwell Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/deployment-guide-for-minimax-m3-on-trtllm.html">Deployment Guide for MiniMax-M3 on TensorRT LLM</a></li>
 </ul>
 </details></li>
@@ -809,6 +811,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/CudaGraphConfig.html">CudaGraphConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/DecodeCudaGraphConfig.html">DecodeCudaGraphConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/EncodeCudaGraphConfig.html">EncodeCudaGraphConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/EncodeExtraInputSpec.html">EncodeExtraInputSpec</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/MoeConfig.html">MoeConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/EagleDecodingConfig.html">EagleDecodingConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/Eagle3DecodingConfig.html">Eagle3DecodingConfig</a></li>
@@ -1306,10 +1309,177 @@ window.runMermaid = runMermaid;</script>
 
 
 
+<span class="c1"># Symbolic dim names allowed in EncodeExtraInputSpec.shape; a spec uses exactly</span>
+<span class="c1"># one. "num_tokens" resolves to the padded token bucket, "batch_size" to the</span>
+<span class="c1"># padded request count (per-request features that ignore sequence length).</span>
+<span class="n">_ENCODE_EXTRA_INPUT_SYMBOLIC_DIMS</span><span class="p">:</span> <span class="n">Tuple</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span>
+                                         <span class="o">...</span><span class="p">]</span> <span class="o">=</span> <span class="p">(</span><span class="s2">"num_tokens"</span><span class="p">,</span> <span class="s2">"batch_size"</span><span class="p">)</span>
+
+<span class="c1"># Encode-only inputs the encoder runner builds itself; callers cannot supply them</span>
+<span class="c1"># as model_kwargs.</span>
+<span class="n">ENCODER_RUNNER_MANAGED_INPUTS</span><span class="p">:</span> <span class="nb">frozenset</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="nb">frozenset</span><span class="p">({</span>
+    <span class="s2">"input_ids"</span><span class="p">,</span>
+    <span class="s2">"seq_lens"</span><span class="p">,</span>
+    <span class="s2">"multi_item_part_lens"</span><span class="p">,</span>
+    <span class="s2">"attn_metadata"</span><span class="p">,</span>
+    <span class="s2">"return_context_logits"</span><span class="p">,</span>
+<span class="p">})</span>
+<span class="c1"># Names that may not be declared as extra model inputs. position_ids may be</span>
+<span class="c1"># passed through (the runner consumes it) but cannot name an extra input.</span>
+<span class="n">ENCODER_RESERVED_INPUT_NAMES</span><span class="p">:</span> <span class="nb">frozenset</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="p">(</span><span class="n">ENCODER_RUNNER_MANAGED_INPUTS</span>
+                                                <span class="o">|</span> <span class="p">{</span><span class="s2">"position_ids"</span><span class="p">})</span>
+
+
+<div class="viewcode-block" id="EncodeExtraInputSpec">
+<a class="viewcode-back" href="../../../llm-api/reference/EncodeExtraInputSpec.html#tensorrt_llm.llmapi.EncodeExtraInputSpec">[docs]</a>
+<span class="k">class</span><span class="w"> </span><span class="nc">EncodeExtraInputSpec</span><span class="p">(</span><span class="n">StrictBaseModel</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""Declares an extra encoder-forward tensor kwarg for CUDA graph capture.</span>
+
+<span class="sd">    One spec is required for every tensor kwarg passed to</span>
+<span class="sd">    `LLM.encode(..., **model_kwargs)` (e.g. `token_type_ids` for BERT). The</span>
+<span class="sd">    runner backs each with a static buffer sized at the bucket maximum, and</span>
+<span class="sd">    warmup captures every bucket with a zero-filled stand-in so the graph sees</span>
+<span class="sd">    the full forward signature before the first real call.</span>
+
+<span class="sd">    Only tensors can be declared: a non-tensor kwarg cannot be captured and</span>
+<span class="sd">    instead forces that `encode()` call onto the eager path. Device is not part</span>
+<span class="sd">    of the spec: pass tensors where they already live. Each replay copies them</span>
+<span class="sd">    into the graph's buffer asynchronously, H2D for host tensors and D2D for</span>
+<span class="sd">    device tensors.</span>
+<span class="sd">    """</span>
+
+    <span class="n">name</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">description</span><span class="o">=</span><span class="s2">"Kwarg name as it appears in the encoder forward() "</span>
+        <span class="s2">"signature (e.g. </span><span class="se">\"</span><span class="s2">token_type_ids</span><span class="se">\"</span><span class="s2">)."</span><span class="p">)</span>
+
+    <span class="n">shape</span><span class="p">:</span> <span class="n">Tuple</span><span class="p">[</span><span class="n">Union</span><span class="p">[</span><span class="n">Literal</span><span class="p">[</span><span class="s2">"num_tokens"</span><span class="p">,</span> <span class="s2">"batch_size"</span><span class="p">],</span> <span class="n">PositiveInt</span><span class="p">],</span>
+                 <span class="o">...</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+                     <span class="n">description</span><span class="o">=</span><span class="s2">"Tensor shape. Use exactly one symbolic dim "</span>
+                     <span class="s2">"from {</span><span class="se">\"</span><span class="s2">num_tokens</span><span class="se">\"</span><span class="s2">, </span><span class="se">\"</span><span class="s2">batch_size</span><span class="se">\"</span><span class="s2">}: </span><span class="se">\"</span><span class="s2">num_tokens</span><span class="se">\"</span><span class="s2"> "</span>
+                     <span class="s2">"scales with the packed token bucket (e.g. "</span>
+                     <span class="s2">"token_type_ids), </span><span class="se">\"</span><span class="s2">batch_size</span><span class="se">\"</span><span class="s2"> scales with the request "</span>
+                     <span class="s2">"bucket (e.g. per-request features that are independent "</span>
+                     <span class="s2">"of sequence length). Remaining dims must be positive "</span>
+                     <span class="s2">"integer literals (e.g. hidden_size)."</span><span class="p">)</span>
+
+    <span class="n">dtype</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">description</span><span class="o">=</span><span class="s2">"Tensor dtype string accepted by tensorrt_llm "</span>
+        <span class="s2">"(e.g. </span><span class="se">\"</span><span class="s2">int32</span><span class="se">\"</span><span class="s2">, </span><span class="se">\"</span><span class="s2">float32</span><span class="se">\"</span><span class="s2">, </span><span class="se">\"</span><span class="s2">bfloat16</span><span class="se">\"</span><span class="s2">). See "</span>
+        <span class="s2">"`tensorrt_llm._utils._str_to_torch_dtype_dict` for the full list."</span><span class="p">)</span>
+
+    <span class="nd">@field_validator</span><span class="p">(</span><span class="s2">"name"</span><span class="p">)</span>
+    <span class="nd">@classmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">_validate_name</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">value</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span><span class="p">:</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="n">value</span> <span class="ow">or</span> <span class="ow">not</span> <span class="n">value</span><span class="o">.</span><span class="n">isidentifier</span><span class="p">():</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                <span class="sa">f</span><span class="s2">"EncodeExtraInputSpec.name must be a non-empty Python "</span>
+                <span class="sa">f</span><span class="s2">"identifier, got </span><span class="si">{</span><span class="n">value</span><span class="si">!r}</span><span class="s2">"</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">value</span> <span class="ow">in</span> <span class="n">ENCODER_RESERVED_INPUT_NAMES</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                <span class="sa">f</span><span class="s2">"EncodeExtraInputSpec.name </span><span class="si">{</span><span class="n">value</span><span class="si">!r}</span><span class="s2"> is reserved by the "</span>
+                <span class="sa">f</span><span class="s2">"encode-only path. Reserved names: "</span>
+                <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="nb">sorted</span><span class="p">(</span><span class="n">ENCODER_RESERVED_INPUT_NAMES</span><span class="p">)</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">value</span>
+
+    <span class="nd">@field_validator</span><span class="p">(</span><span class="s2">"shape"</span><span class="p">)</span>
+    <span class="nd">@classmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">_validate_shape</span><span class="p">(</span>
+            <span class="bp">cls</span><span class="p">,</span> <span class="n">value</span><span class="p">:</span> <span class="n">Tuple</span><span class="p">[</span><span class="n">Union</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">int</span><span class="p">],</span>
+                              <span class="o">...</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="n">Tuple</span><span class="p">[</span><span class="n">Union</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">int</span><span class="p">],</span> <span class="o">...</span><span class="p">]:</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="n">value</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                <span class="s2">"EncodeExtraInputSpec.shape must contain at least one "</span>
+                <span class="s2">"dimension"</span><span class="p">)</span>
+        <span class="n">symbolic_count</span> <span class="o">=</span> <span class="nb">sum</span><span class="p">(</span>
+            <span class="mi">1</span> <span class="k">for</span> <span class="n">d</span> <span class="ow">in</span> <span class="n">value</span>
+            <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">d</span><span class="p">,</span> <span class="nb">str</span><span class="p">)</span> <span class="ow">and</span> <span class="n">d</span> <span class="ow">in</span> <span class="n">_ENCODE_EXTRA_INPUT_SYMBOLIC_DIMS</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">symbolic_count</span> <span class="o">!=</span> <span class="mi">1</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                <span class="sa">f</span><span class="s2">"EncodeExtraInputSpec.shape must contain exactly one "</span>
+                <span class="sa">f</span><span class="s2">"symbolic dim from </span><span class="si">{</span><span class="n">_ENCODE_EXTRA_INPUT_SYMBOLIC_DIMS</span><span class="si">}</span><span class="s2"> "</span>
+                <span class="sa">f</span><span class="s2">"(a tensor may use </span><span class="se">\"</span><span class="s2">num_tokens</span><span class="se">\"</span><span class="s2"> OR </span><span class="se">\"</span><span class="s2">batch_size</span><span class="se">\"</span><span class="s2">, never "</span>
+                <span class="sa">f</span><span class="s2">"both), got shape=</span><span class="si">{</span><span class="n">value</span><span class="si">}</span><span class="s2"> with </span><span class="si">{</span><span class="n">symbolic_count</span><span class="si">}</span><span class="s2"> symbolic dims"</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">value</span>
+
+    <span class="nd">@field_validator</span><span class="p">(</span><span class="s2">"dtype"</span><span class="p">)</span>
+    <span class="nd">@classmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">_validate_dtype</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">value</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span><span class="p">:</span>
+        <span class="k">if</span> <span class="n">value</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">_str_to_torch_dtype_dict</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                <span class="sa">f</span><span class="s2">"EncodeExtraInputSpec.dtype </span><span class="si">{</span><span class="n">value</span><span class="si">!r}</span><span class="s2"> is not supported. "</span>
+                <span class="sa">f</span><span class="s2">"Supported dtypes: </span><span class="si">{</span><span class="nb">sorted</span><span class="p">(</span><span class="n">_str_to_torch_dtype_dict</span><span class="p">)</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">value</span>
+
+<div class="viewcode-block" id="EncodeExtraInputSpec.resolve_shape">
+<a class="viewcode-back" href="../../../llm-api/reference/EncodeExtraInputSpec.html#tensorrt_llm.llmapi.EncodeExtraInputSpec.resolve_shape">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">resolve_shape</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">num_tokens</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+                      <span class="n">batch_size</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Tuple</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="o">...</span><span class="p">]:</span>
+<span class="w">        </span><span class="sd">"""Substitute the symbolic dim with the matching size, leaving literals alone.</span>
+
+<span class="sd">        Each spec uses exactly one symbolic dim (validated). The caller passes</span>
+<span class="sd">        both candidate sizes; only the one this spec actually uses is consumed.</span>
+<span class="sd">        """</span>
+        <span class="n">resolved</span><span class="p">:</span> <span class="n">List</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="p">[]</span>
+        <span class="k">for</span> <span class="n">d</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">shape</span><span class="p">:</span>
+            <span class="k">if</span> <span class="n">d</span> <span class="o">==</span> <span class="s2">"num_tokens"</span><span class="p">:</span>
+                <span class="n">resolved</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">num_tokens</span><span class="p">)</span>
+            <span class="k">elif</span> <span class="n">d</span> <span class="o">==</span> <span class="s2">"batch_size"</span><span class="p">:</span>
+                <span class="n">resolved</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">batch_size</span><span class="p">)</span>
+            <span class="k">else</span><span class="p">:</span>
+                <span class="n">resolved</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="nb">int</span><span class="p">(</span><span class="n">d</span><span class="p">))</span>
+        <span class="k">return</span> <span class="nb">tuple</span><span class="p">(</span><span class="n">resolved</span><span class="p">)</span></div>
+
+
+<div class="viewcode-block" id="EncodeExtraInputSpec.symbolic_dim">
+<a class="viewcode-back" href="../../../llm-api/reference/EncodeExtraInputSpec.html#tensorrt_llm.llmapi.EncodeExtraInputSpec.symbolic_dim">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">symbolic_dim</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Tuple</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">int</span><span class="p">]:</span>
+<span class="w">        </span><span class="sd">"""Return ``(name, axis)`` of the spec's single symbolic dim.</span>
+
+<span class="sd">        The shape validator guarantees exactly one symbolic dim is present.</span>
+<span class="sd">        """</span>
+        <span class="k">for</span> <span class="n">axis</span><span class="p">,</span> <span class="n">d</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">shape</span><span class="p">):</span>
+            <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">d</span><span class="p">,</span> <span class="nb">str</span><span class="p">)</span> <span class="ow">and</span> <span class="n">d</span> <span class="ow">in</span> <span class="n">_ENCODE_EXTRA_INPUT_SYMBOLIC_DIMS</span><span class="p">:</span>
+                <span class="k">return</span> <span class="n">d</span><span class="p">,</span> <span class="n">axis</span>
+        <span class="c1"># Unreachable: validator enforces exactly-one occurrence.</span>
+        <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+            <span class="sa">f</span><span class="s2">"EncodeExtraInputSpec.shape=</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">shape</span><span class="si">}</span><span class="s2"> has no symbolic dim"</span><span class="p">)</span></div>
+
+
+<div class="viewcode-block" id="EncodeExtraInputSpec.torch_dtype">
+<a class="viewcode-back" href="../../../llm-api/reference/EncodeExtraInputSpec.html#tensorrt_llm.llmapi.EncodeExtraInputSpec.torch_dtype">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">torch_dtype</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">dtype</span><span class="p">:</span>
+        <span class="k">return</span> <span class="n">_str_to_torch_dtype_dict</span><span class="p">[</span><span class="bp">self</span><span class="o">.</span><span class="n">dtype</span><span class="p">]</span></div>
+</div>
+
+
+
 <div class="viewcode-block" id="EncodeCudaGraphConfig">
 <a class="viewcode-back" href="../../../llm-api/reference/EncodeCudaGraphConfig.html#tensorrt_llm.llmapi.EncodeCudaGraphConfig">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">EncodeCudaGraphConfig</span><span class="p">(</span><span class="n">BaseCudaGraphConfig</span><span class="p">):</span>
-<span class="w">    </span><span class="sd">"""CUDA graph configuration for encode-only requests."""</span>
+<span class="w">    </span><span class="sd">"""CUDA graph configuration for encode-only requests (``LLM.encode()``).</span>
+
+<span class="sd">    A graph is captured at startup for every feasible combination of</span>
+<span class="sd">    ``batch_sizes``, ``num_tokens`` and ``seq_lens``. A batch runs the graph</span>
+<span class="sd">    for its (batch size, total tokens, longest request) shape, rounded up when</span>
+<span class="sd">    ``enable_padding`` is set, and runs eagerly if no graph matches.</span>
+
+<span class="sd">    Example::</span>
+
+<span class="sd">        cuda_graph_config = EncodeCudaGraphConfig(</span>
+<span class="sd">            batch_sizes=[1, 2, 4, 8],</span>
+<span class="sd">            num_tokens=[128, 256, 512],</span>
+<span class="sd">            seq_lens=[64, 128],</span>
+<span class="sd">            enable_padding=True,</span>
+<span class="sd">            extra_model_inputs=[</span>
+<span class="sd">                EncodeExtraInputSpec(name="token_type_ids",</span>
+<span class="sd">                                     shape=("num_tokens",),</span>
+<span class="sd">                                     dtype="int32"),</span>
+<span class="sd">            ],</span>
+<span class="sd">        )</span>
+<span class="sd">        llm = LLM(model, encode_only=True, cuda_graph_config=cuda_graph_config)</span>
+<span class="sd">        # token_type_ids: one value per token, prompts packed in order.</span>
+<span class="sd">        outputs = llm.encode(prompts, token_type_ids=token_type_ids)</span>
+<span class="sd">    """</span>
 
     <span class="n">mode</span><span class="p">:</span> <span class="n">Literal</span><span class="p">[</span><span class="s2">"encode"</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
         <span class="n">default</span><span class="o">=</span><span class="s2">"encode"</span><span class="p">,</span> <span class="n">description</span><span class="o">=</span><span class="s2">"CUDA graph configuration mode."</span><span class="p">)</span>
@@ -1348,6 +1518,18 @@ window.runMermaid = runMermaid;</script>
         <span class="s2">"`seq_lens` is provided, must equal max(seq_lens); otherwise "</span>
         <span class="s2">"`seq_lens` is generated from this value. Ignored by a fixed-shape "</span>
         <span class="s2">"feature encoder."</span><span class="p">)</span>
+
+    <span class="n">extra_model_inputs</span><span class="p">:</span> <span class="n">List</span><span class="p">[</span><span class="n">EncodeExtraInputSpec</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default_factory</span><span class="o">=</span><span class="nb">list</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span>
+        <span class="s2">"Tensor kwargs (beyond input_ids / position_ids) that LLM.encode() "</span>
+        <span class="s2">"passes to the encoder forward() under CUDA graphs. Each is backed "</span>
+        <span class="s2">"by a static buffer sized along its symbolic dim at the bucket "</span>
+        <span class="s2">"maximum (`num_tokens` → `max(num_tokens)`, `batch_size` → "</span>
+        <span class="s2">"`max(batch_sizes)`). With encoder CUDA graphs enabled, every tensor "</span>
+        <span class="s2">"kwarg passed to encode() must be declared here, and every declared "</span>
+        <span class="s2">"input must be passed on every call. Tensors may be on host or "</span>
+        <span class="s2">"device."</span><span class="p">)</span>
 
 <div class="viewcode-block" id="EncodeCudaGraphConfig.validate_encoder_cuda_graph_config">
 <a class="viewcode-back" href="../../../llm-api/reference/EncodeCudaGraphConfig.html#tensorrt_llm.llmapi.EncodeCudaGraphConfig.validate_encoder_cuda_graph_config">[docs]</a>
@@ -1389,6 +1571,15 @@ window.runMermaid = runMermaid;</script>
         <span class="k">elif</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_seq_len</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">:</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">seq_lens</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_generate_cuda_graph_seq_lens</span><span class="p">(</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">max_seq_len</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">enable_padding</span><span class="p">)</span>
+
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">extra_model_inputs</span><span class="p">:</span>
+            <span class="n">seen_names</span><span class="p">:</span> <span class="n">Set</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="nb">set</span><span class="p">()</span>
+            <span class="k">for</span> <span class="n">spec</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">extra_model_inputs</span><span class="p">:</span>
+                <span class="k">if</span> <span class="n">spec</span><span class="o">.</span><span class="n">name</span> <span class="ow">in</span> <span class="n">seen_names</span><span class="p">:</span>
+                    <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                        <span class="sa">f</span><span class="s2">"EncodeCudaGraphConfig.extra_model_inputs contains "</span>
+                        <span class="sa">f</span><span class="s2">"duplicate name </span><span class="si">{</span><span class="n">spec</span><span class="o">.</span><span class="n">name</span><span class="si">!r}</span><span class="s2">"</span><span class="p">)</span>
+                <span class="n">seen_names</span><span class="o">.</span><span class="n">add</span><span class="p">(</span><span class="n">spec</span><span class="o">.</span><span class="n">name</span><span class="p">)</span>
 
         <span class="k">return</span> <span class="bp">self</span></div>
 
@@ -1977,7 +2168,7 @@ window.runMermaid = runMermaid;</script>
         <span class="s2">"also use a horizontal norm/RoPE/cache-insertion producer for prefill, "</span>
         <span class="s2">"mixed, and CUDA-graph decode execution. The MiniMax-M3-specific path "</span>
         <span class="s2">"requires the MSA implementation, indexer_kv_dtype='fp8', and an FP8 "</span>
-        <span class="s2">"main KV cache."</span><span class="p">,</span>
+        <span class="s2">"or NVFP4 main KV cache."</span><span class="p">,</span>
         <span class="n">status</span><span class="o">=</span><span class="s2">"prototype"</span><span class="p">,</span>
     <span class="p">)</span>
     <span class="n">num_attention_heads</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
@@ -1995,9 +2186,10 @@ window.runMermaid = runMermaid;</script>
     <span class="n">implementation</span><span class="p">:</span> <span class="n">Literal</span><span class="p">[</span><span class="s2">"triton"</span><span class="p">,</span> <span class="s2">"msa"</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
         <span class="n">default</span><span class="o">=</span><span class="s2">"triton"</span><span class="p">,</span>
         <span class="n">description</span><span class="o">=</span>
-        <span class="s2">"Sparse attention implementation: 'triton' reference (default) or 'msa' "</span>
-        <span class="s2">"(fmha_sm100 kernels). The 'msa' implementation requires an SM100 GPU, "</span>
-        <span class="s2">"the fmha_sm100 package, and sparse_block_size == 128."</span><span class="p">,</span>
+        <span class="s2">"Sparse attention implementation: 'triton' legacy reference (default) "</span>
+        <span class="s2">"or the recommended 'msa' backend. MSA requires an SM100 or SM103 GPU, "</span>
+        <span class="s2">"the fmha_sm100 package, and sparse_block_size == 128. NVFP4 KV cache "</span>
+        <span class="s2">"requires 'msa'; it uses MSA prefill and Triton sparse decode kernels."</span><span class="p">,</span>
         <span class="n">status</span><span class="o">=</span><span class="s2">"prototype"</span><span class="p">,</span>
     <span class="p">)</span>
 
@@ -2460,6 +2652,14 @@ window.runMermaid = runMermaid;</script>
         <span class="n">description</span><span class="o">=</span><span class="s2">"The sliding window size in tokens for SWA layers."</span><span class="p">)</span>
     <span class="n">index_topk</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="mi">512</span><span class="p">,</span>
                                       <span class="n">description</span><span class="o">=</span><span class="s2">"The top-k for the indexer."</span><span class="p">)</span>
+    <span class="n">enable_kv_cache_offload</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">status</span><span class="o">=</span><span class="s2">"prototype"</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span>
+        <span class="s2">"Offload ratio-4 compressed attention KV history to host memory with "</span>
+        <span class="s2">"KV cache manager v2. The indexer and sliding-window caches remain on "</span>
+        <span class="s2">"GPU. This feature is under development and currently cannot be "</span>
+        <span class="s2">"enabled for inference."</span><span class="p">)</span>
 
 <div class="viewcode-block" id="DeepSeekV4SparseAttentionConfig.validate_index_head_dim">
 <a class="viewcode-back" href="../../../llm-api/reference/DeepSeekV4SparseAttentionConfig.html#tensorrt_llm.llmapi.DeepSeekV4SparseAttentionConfig.validate_index_head_dim">[docs]</a>
@@ -2482,6 +2682,22 @@ window.runMermaid = runMermaid;</script>
         <span class="k">if</span> <span class="nb">any</span><span class="p">(</span><span class="n">ratio</span> <span class="o">&lt;</span> <span class="mi">0</span> <span class="k">for</span> <span class="n">ratio</span> <span class="ow">in</span> <span class="n">compress_ratios</span><span class="p">):</span>
             <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s2">"compress_ratios must be non-negative."</span><span class="p">)</span>
         <span class="k">return</span> <span class="p">[</span><span class="mi">1</span> <span class="k">if</span> <span class="n">ratio</span> <span class="o">==</span> <span class="mi">0</span> <span class="k">else</span> <span class="n">ratio</span> <span class="k">for</span> <span class="n">ratio</span> <span class="ow">in</span> <span class="n">compress_ratios</span><span class="p">]</span></div>
+
+
+<div class="viewcode-block" id="DeepSeekV4SparseAttentionConfig.validate_kv_cache_offload">
+<a class="viewcode-back" href="../../../llm-api/reference/DeepSeekV4SparseAttentionConfig.html#tensorrt_llm.llmapi.DeepSeekV4SparseAttentionConfig.validate_kv_cache_offload">[docs]</a>
+    <span class="nd">@model_validator</span><span class="p">(</span><span class="n">mode</span><span class="o">=</span><span class="s2">"after"</span><span class="p">)</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">validate_kv_cache_offload</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="s2">"DeepSeekV4SparseAttentionConfig"</span><span class="p">:</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">enable_kv_cache_offload</span><span class="p">:</span>
+            <span class="k">if</span> <span class="mi">4</span> <span class="ow">not</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">compress_ratios</span><span class="p">:</span>
+                <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                    <span class="s2">"DeepSeek-V4 KV cache offload requires a ratio-4 attention layer."</span>
+                <span class="p">)</span>
+            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">index_topk</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="bp">self</span><span class="o">.</span><span class="n">index_topk</span> <span class="o">&lt;=</span> <span class="mi">0</span><span class="p">:</span>
+                <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                    <span class="s2">"DeepSeek-V4 KV cache offload requires a positive index_topk."</span>
+                <span class="p">)</span>
+        <span class="k">return</span> <span class="bp">self</span></div>
 
 
 <div class="viewcode-block" id="DeepSeekV4SparseAttentionConfig.supports_backend">
@@ -2529,6 +2745,7 @@ window.runMermaid = runMermaid;</script>
             <span class="n">indexer_k_dtype</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">indexer_k_dtype</span><span class="p">,</span>
             <span class="n">compress_ratios</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">compress_ratios</span><span class="p">,</span>
             <span class="n">window_size</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">window_size</span><span class="p">,</span>
+            <span class="n">enable_kv_cache_offload</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">enable_kv_cache_offload</span><span class="p">,</span>
         <span class="p">)</span></div>
 
 
@@ -2561,6 +2778,7 @@ window.runMermaid = runMermaid;</script>
             <span class="n">q_split_threshold</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">q_split_threshold</span><span class="p">,</span>
             <span class="n">compress_ratios</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">compress_ratios</span><span class="p">,</span>
             <span class="n">window_size</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">window_size</span><span class="p">,</span>
+            <span class="n">enable_kv_cache_offload</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">enable_kv_cache_offload</span><span class="p">,</span>
         <span class="p">)</span></div>
 </div>
 
@@ -3167,8 +3385,8 @@ window.runMermaid = runMermaid;</script>
             <span class="s2">"layer quantization, and a concrete backend applies only to the "</span>
             <span class="s2">"draft model or layers. Resolution may fall back based on model, "</span>
             <span class="s2">"quantization, and hardware support. Replacement-head MTP "</span>
-            <span class="s2">"checkpoints are unsupported because their independent "</span>
-            <span class="s2">"quantization metadata is not loaded. Nemotron-H embedded MTP "</span>
+            <span class="s2">"checkpoints must inherit the target model's MoE backend; leave "</span>
+            <span class="s2">"this option unset. Nemotron-H embedded MTP "</span>
             <span class="s2">"layers must inherit the target backend because their checkpoint "</span>
             <span class="s2">"mapper uses a shared backend-dependent layout. Decoding methods "</span>
             <span class="s2">"without a neural draft model ignore this option."</span><span class="p">))</span>
@@ -3382,10 +3600,10 @@ window.runMermaid = runMermaid;</script>
                 <span class="ow">or</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">uses_replacement_heads</span><span class="p">):</span>
             <span class="k">return</span>
         <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
-            <span class="s2">"speculative_config.moe_backend does not support replacement-head "</span>
-            <span class="s2">"MTP checkpoints because their independent quantization metadata "</span>
-            <span class="s2">"is not loaded. Leave moe_backend unset to inherit the target "</span>
-            <span class="s2">"backend, or use a full external draft-model checkpoint."</span><span class="p">)</span>
+            <span class="s2">"speculative_config.moe_backend cannot be set for replacement-head "</span>
+            <span class="s2">"MTP checkpoints. Replacement heads inherit the target model's "</span>
+            <span class="s2">"MoE backend. Leave moe_backend unset, or use a full external "</span>
+            <span class="s2">"draft-model checkpoint."</span><span class="p">)</span>
 
     <span class="nd">@property</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">uses_replacement_heads</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
@@ -5436,7 +5654,28 @@ window.runMermaid = runMermaid;</script>
         <span class="s2">"Maximum number of completed conversation turns whose committed SWA-window "</span>
         <span class="s2">"blocks and Mamba stable-boundary state are retained by KV cache manager v2. "</span>
         <span class="s2">"Only used when "</span>
-        <span class="s2">"`policy` is 'per_conversation'."</span><span class="p">)</span></div>
+        <span class="s2">"`policy` is 'per_conversation'."</span><span class="p">)</span>
+
+    <span class="n">swa_endpoint_rewind_tokens</span><span class="p">:</span> <span class="n">NonNegativeInt</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span>
+        <span class="n">status</span><span class="o">=</span><span class="s2">"prototype"</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span><span class="s2">"Extra tokens before the final SWA window whose cache blocks "</span>
+        <span class="s2">"receive higher eviction priority, together with sink blocks. Zero "</span>
+        <span class="s2">"disables the entire endpoint-priority callback. Positive values require "</span>
+        <span class="s2">"KV cache manager v2, block reuse enabled, and policy='all_reusable'. "</span>
+        <span class="s2">"This preference does not guarantee residency or change attention windows "</span>
+        <span class="s2">"or prefix matching. Dummy and draft requests are excluded."</span><span class="p">)</span>
+
+<div class="viewcode-block" id="BlockReuseConfig.validate_swa_endpoint_policy">
+<a class="viewcode-back" href="../../../llm-api/reference/BlockReuseConfig.html#tensorrt_llm.llmapi.BlockReuseConfig.validate_swa_endpoint_policy">[docs]</a>
+    <span class="nd">@model_validator</span><span class="p">(</span><span class="n">mode</span><span class="o">=</span><span class="s2">"after"</span><span class="p">)</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">validate_swa_endpoint_policy</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="s1">'BlockReuseConfig'</span><span class="p">:</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">swa_endpoint_rewind_tokens</span> <span class="o">&gt;</span> <span class="mi">0</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">policy</span> <span class="o">!=</span> <span class="s2">"all_reusable"</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                <span class="s2">"block_reuse_config.swa_endpoint_rewind_tokens requires "</span>
+                <span class="s2">"block_reuse_config.policy='all_reusable'."</span><span class="p">)</span>
+        <span class="k">return</span> <span class="bp">self</span></div>
+</div>
 
 
 
@@ -5802,6 +6041,22 @@ window.runMermaid = runMermaid;</script>
             <span class="n">update</span><span class="o">=</span><span class="p">{</span>
                 <span class="s2">"periodic_snapshot_interval"</span><span class="p">:</span> <span class="bp">self</span><span class="o">.</span><span class="n">mamba_state_cache_interval</span>
             <span class="p">})</span>
+        <span class="k">return</span> <span class="bp">self</span></div>
+
+
+<div class="viewcode-block" id="KvCacheConfig.validate_swa_endpoint_rewind">
+<a class="viewcode-back" href="../../../llm-api/reference/KvCacheConfig.html#tensorrt_llm.llmapi.KvCacheConfig.validate_swa_endpoint_rewind">[docs]</a>
+    <span class="nd">@model_validator</span><span class="p">(</span><span class="n">mode</span><span class="o">=</span><span class="s1">'after'</span><span class="p">)</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">validate_swa_endpoint_rewind</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="s1">'KvCacheConfig'</span><span class="p">:</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">block_reuse_config</span><span class="o">.</span><span class="n">swa_endpoint_rewind_tokens</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">:</span>
+            <span class="k">if</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">enable_block_reuse</span><span class="p">:</span>
+                <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                    <span class="s2">"block_reuse_config.swa_endpoint_rewind_tokens requires "</span>
+                    <span class="s2">"kv_cache_config.enable_block_reuse=True."</span><span class="p">)</span>
+            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">use_kv_cache_manager_v2</span> <span class="ow">is</span> <span class="kc">False</span><span class="p">:</span>
+                <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                    <span class="s2">"block_reuse_config.swa_endpoint_rewind_tokens requires "</span>
+                    <span class="s2">"kv_cache_config.use_kv_cache_manager_v2=True."</span><span class="p">)</span>
         <span class="k">return</span> <span class="bp">self</span></div>
 
 
@@ -6448,7 +6703,7 @@ window.runMermaid = runMermaid;</script>
                                              <span class="s1">'qwen3_5'</span><span class="p">,</span> <span class="s1">'minimax_m2'</span><span class="p">,</span>
                                              <span class="s1">'minimax_m2_append_think'</span><span class="p">,</span>
                                              <span class="s1">'nano-v3'</span><span class="p">,</span> <span class="s1">'gemma4'</span><span class="p">,</span> <span class="s1">'kimi_k2'</span><span class="p">,</span>
-                                             <span class="s1">'kimi_k25'</span><span class="p">))</span>
+                                             <span class="s1">'kimi_k25'</span><span class="p">,</span> <span class="s1">'k-exaone'</span><span class="p">))</span>
 
     <span class="c1"># TODO[Superjomn]: To deprecate this config.</span>
     <span class="n">decoding_config</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">object</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
@@ -6487,6 +6742,17 @@ window.runMermaid = runMermaid;</script>
         <span class="n">description</span><span class="o">=</span>
         <span class="s2">"Allow serving responses to include per-request performance metrics when "</span>
         <span class="s2">"the request sets X-TRTLLM-return-metrics: 1."</span><span class="p">,</span>
+        <span class="n">status</span><span class="o">=</span><span class="s2">"prototype"</span><span class="p">)</span>
+
+    <span class="n">per_request_spec_decode_stats</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span>
+        <span class="s2">"Include per-request speculative-decoding acceptance statistics on each "</span>
+        <span class="s2">"response choice. Server-side opt-in only: unlike return_perf_metrics "</span>
+        <span class="s2">"this needs no per-request header, so benchmarking clients that "</span>
+        <span class="s2">"discover the payload by shape do not have to know they are talking to "</span>
+        <span class="s2">"TensorRT-LLM. Deliberately independent of return_perf_metrics, which "</span>
+        <span class="s2">"also mounts the Prometheus endpoint. PyTorch backend only."</span><span class="p">,</span>
         <span class="n">status</span><span class="o">=</span><span class="s2">"prototype"</span><span class="p">)</span>
 
     <span class="n">perf_metrics_output_dir</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
@@ -7226,6 +7492,27 @@ window.runMermaid = runMermaid;</script>
         <span class="n">default</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
         <span class="n">description</span><span class="o">=</span>
         <span class="s2">"If true, enables per request stats per iteration. Must also set enable_iter_perf_stats to true to get request stats."</span><span class="p">,</span>
+        <span class="n">status</span><span class="o">=</span><span class="s2">"prototype"</span><span class="p">)</span>
+
+    <span class="n">iter_perf_stats_interval</span><span class="p">:</span> <span class="n">PositiveInt</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span>
+        <span class="s2">"Build an iteration statistics record only every N executor iterations "</span>
+        <span class="s2">"when enable_iter_perf_stats is true, which reduces the host overhead "</span>
+        <span class="s2">"of collecting the statistics (including the per-request statistics of "</span>
+        <span class="s2">"enable_iter_req_stats). A value of 1 builds a record every iteration. "</span>
+        <span class="s2">"With N &gt; 1, numCompletedRequests, numNewActiveRequests and the KV "</span>
+        <span class="s2">"cache iteration deltas of skipped iterations are carried into a later "</span>
+        <span class="s2">"record, so their totals stay exact but can be reported late. Without "</span>
+        <span class="s2">"attention DP, one extra record is emitted when the last active "</span>
+        <span class="s2">"request finishes in a skipped iteration; with attention DP, what is "</span>
+        <span class="s2">"left after the last record of a busy period is reported when the "</span>
+        <span class="s2">"executor resumes. All other fields describe only the sampled "</span>
+        <span class="s2">"iteration, so Prometheus counters built from them (e.g. speculative "</span>
+        <span class="s2">"decoding draft and accepted token totals) reach only about 1/N of the "</span>
+        <span class="s2">"true totals, and gauges such as KV cache utilization refresh every N "</span>
+        <span class="s2">"iterations. With enable_iter_req_stats, requests that finish in a "</span>
+        <span class="s2">"skipped iteration get no requestStats entry."</span><span class="p">,</span>
         <span class="n">status</span><span class="o">=</span><span class="s2">"prototype"</span><span class="p">)</span>
 
     <span class="n">print_iter_log</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
@@ -8509,6 +8796,9 @@ window.runMermaid = runMermaid;</script>
             <span class="k">if</span> <span class="ow">not</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">base_mm</span><span class="p">,</span> <span class="nb">dict</span><span class="p">):</span>
                 <span class="n">base_mm</span> <span class="o">=</span> <span class="p">{}</span>
             <span class="n">merged</span> <span class="o">=</span> <span class="nb">dict</span><span class="p">(</span><span class="n">base_mm</span><span class="p">)</span> <span class="o">|</span> <span class="nb">dict</span><span class="p">(</span><span class="n">yaml_mm</span><span class="p">)</span>
+            <span class="k">if</span> <span class="p">(</span><span class="s2">"video_pruning_rate"</span> <span class="ow">in</span> <span class="n">explicit_cli_keys</span>
+                    <span class="ow">and</span> <span class="s2">"video_pruning_rate"</span> <span class="ow">in</span> <span class="n">base_mm</span><span class="p">):</span>
+                <span class="n">merged</span><span class="p">[</span><span class="s2">"video_pruning_rate"</span><span class="p">]</span> <span class="o">=</span> <span class="n">base_mm</span><span class="p">[</span><span class="s2">"video_pruning_rate"</span><span class="p">]</span>
             <span class="n">llm_args_dict</span><span class="p">[</span><span class="s1">'multimodal_config'</span><span class="p">]</span> <span class="o">=</span> <span class="n">merged</span>
 
     <span class="c1"># Drop YAML keys claimed by explicit CLI flags so the outer merge below</span>
@@ -8544,10 +8834,14 @@ window.runMermaid = runMermaid;</script>
     <span class="p">}</span>
     <span class="k">for</span> <span class="n">field_name</span><span class="p">,</span> <span class="n">field_type</span> <span class="ow">in</span> <span class="n">field_mapping</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
         <span class="k">if</span> <span class="n">field_name</span> <span class="ow">in</span> <span class="n">llm_args_dict</span><span class="p">:</span>
-            <span class="n">llm_args_dict</span><span class="p">[</span><span class="n">field_name</span><span class="p">]</span> <span class="o">=</span> <span class="n">field_type</span><span class="p">(</span><span class="o">**</span><span class="n">llm_args_dict</span><span class="p">[</span><span class="n">field_name</span><span class="p">])</span>
+            <span class="c1"># Preserve explicit nulls; LlmArgs validates whether the field is optional.</span>
+            <span class="k">if</span> <span class="n">llm_args_dict</span><span class="p">[</span><span class="n">field_name</span><span class="p">]</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="n">llm_args_dict</span><span class="p">[</span><span class="n">field_name</span><span class="p">]</span> <span class="o">=</span> <span class="n">field_type</span><span class="p">(</span>
+                    <span class="o">**</span><span class="n">llm_args_dict</span><span class="p">[</span><span class="n">field_name</span><span class="p">])</span>
             <span class="k">if</span> <span class="n">field_name</span> <span class="ow">in</span> <span class="n">llm_args</span><span class="p">:</span>
                 <span class="n">extra_llm_str</span> <span class="o">=</span> <span class="sa">f</span><span class="s2">" because it's specified in </span><span class="si">{</span><span class="n">extra_llm_api_options</span><span class="si">}</span><span class="s2">"</span> <span class="k">if</span> <span class="n">extra_llm_api_options</span> <span class="k">else</span> <span class="s2">""</span>
-                <span class="n">logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span><span class="sa">f</span><span class="s2">"YAML overrides </span><span class="si">{</span><span class="n">field_name</span><span class="si">}{</span><span class="n">extra_llm_str</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+                <span class="n">logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span>
+                    <span class="sa">f</span><span class="s2">"Configuration overrides </span><span class="si">{</span><span class="n">field_name</span><span class="si">}{</span><span class="n">extra_llm_str</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
 
     <span class="n">llm_args</span> <span class="o">=</span> <span class="n">llm_args</span> <span class="o">|</span> <span class="n">llm_args_dict</span>
 
@@ -8613,8 +8907,8 @@ window.runMermaid = runMermaid;</script>
   
 
   <!-- Scripts loaded after <body> so the DOM is not blocked -->
-  <script defer src="../../../_static/scripts/bootstrap.js?digest=64cc4de3f052d77215f0"></script>
-<script defer src="../../../_static/scripts/pydata-sphinx-theme.js?digest=64cc4de3f052d77215f0"></script>
+  <script defer src="../../../_static/scripts/bootstrap.js?digest=18bd87630a240e9c25be"></script>
+<script defer src="../../../_static/scripts/pydata-sphinx-theme.js?digest=18bd87630a240e9c25be"></script>
 
 
   <footer class="bd-footer">
@@ -8686,9 +8980,9 @@ window.runMermaid = runMermaid;</script>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on September 26, 2026.</p>
+  <p>Last updated on October 09, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/c76f4a8">c76f4a8</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/cc63e66">cc63e66</a>.</p>
   
 </div></div>
       

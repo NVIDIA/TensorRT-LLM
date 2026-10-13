@@ -26,8 +26,8 @@
   </noscript>
   
   <!-- Loaded before other Sphinx assets -->
-  <link href="../../../_static/styles/theme.css?digest=64cc4de3f052d77215f0" rel="stylesheet" />
-<link href="../../../_static/styles/pydata-sphinx-theme.css?digest=64cc4de3f052d77215f0" rel="stylesheet" />
+  <link href="../../../_static/styles/theme.css?digest=18bd87630a240e9c25be" rel="stylesheet" />
+<link href="../../../_static/styles/pydata-sphinx-theme.css?digest=18bd87630a240e9c25be" rel="stylesheet" />
 
     <link rel="stylesheet" type="text/css" href="../../../_static/pygments.css?v=8f2a1f02" />
     <link rel="stylesheet" type="text/css" href="../../../_static/styles/nvidia-sphinx-theme.css?v=933278ad" />
@@ -38,10 +38,10 @@
     <link rel="stylesheet" type="text/css" href="../../../_static/custom.css?v=19d20f17" />
   
   <!-- So that users can add custom icons -->
-  <script defer src="../../../_static/scripts/fontawesome.js?digest=64cc4de3f052d77215f0"></script>
+  <script defer src="../../../_static/scripts/fontawesome.js?digest=18bd87630a240e9c25be"></script>
   <!-- Pre-loaded scripts that we'll load fully later -->
-  <link rel="preload" as="script" href="../../../_static/scripts/bootstrap.js?digest=64cc4de3f052d77215f0" />
-<link rel="preload" as="script" href="../../../_static/scripts/pydata-sphinx-theme.js?digest=64cc4de3f052d77215f0" />
+  <link rel="preload" as="script" href="../../../_static/scripts/bootstrap.js?digest=18bd87630a240e9c25be" />
+<link rel="preload" as="script" href="../../../_static/scripts/pydata-sphinx-theme.js?digest=18bd87630a240e9c25be" />
 
 
 
@@ -417,9 +417,9 @@ window.addEventListener("load", load);
 window.runMermaid = runMermaid;</script>
     <script>DOCUMENTATION_OPTIONS.pagename = '_modules/tensorrt_llm/llmapi/llm';</script>
     <script>
-        DOCUMENTATION_OPTIONS.theme_version = '0.22.0';
+        DOCUMENTATION_OPTIONS.theme_version = '0.23.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc29';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc0';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -432,8 +432,9 @@ window.runMermaid = runMermaid;</script>
 
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="color-scheme" content="light dark"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc29" />
+  <meta name="docsearch:version" content="1.4.0rc0" />
   
     
     <script src="../../../_static/searchtools.js"></script>
@@ -763,6 +764,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/deployment-guide-for-qwen3.8-flash-next-on-trtllm.html">Deployment Guide for Qwen3.8-Flash-Next on TensorRT LLM - Blackwell Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/deployment-guide-for-kimi-k3-on-trtllm.html">Deployment Guide for Kimi K3 on TensorRT LLM - Blackwell</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/deployment-guide-for-glm-5-on-trtllm.html">Deployment Guide for GLM-5 on TensorRT LLM - Blackwell Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/deployment-guide-for-glm-5.3-flash-on-trtllm.html">Deployment Guide for GLM-5.3-Flash on TensorRT LLM - Blackwell Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/deployment-guide-for-minimax-m3-on-trtllm.html">Deployment Guide for MiniMax-M3 on TensorRT LLM</a></li>
 </ul>
 </details></li>
@@ -809,6 +811,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/CudaGraphConfig.html">CudaGraphConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/DecodeCudaGraphConfig.html">DecodeCudaGraphConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/EncodeCudaGraphConfig.html">EncodeCudaGraphConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/EncodeExtraInputSpec.html">EncodeExtraInputSpec</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/MoeConfig.html">MoeConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/EagleDecodingConfig.html">EagleDecodingConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/Eagle3DecodingConfig.html">Eagle3DecodingConfig</a></li>
@@ -1068,7 +1071,8 @@ window.runMermaid = runMermaid;</script>
 <span class="kn">from</span><span class="w"> </span><span class="nn">..logger</span><span class="w"> </span><span class="kn">import</span> <span class="n">logger</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">..sampling_params</span><span class="w"> </span><span class="kn">import</span> <span class="n">LogitsProcessor</span><span class="p">,</span> <span class="n">SamplingParams</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">..scheduling_params</span><span class="w"> </span><span class="kn">import</span> <span class="n">SchedulingParams</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">.llm_args</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span><span class="n">TORCH_LLMARGS_EXPLICIT_DOCSTRING</span><span class="p">,</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">.llm_args</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span><span class="n">ENCODER_RUNNER_MANAGED_INPUTS</span><span class="p">,</span>
+                       <span class="n">TORCH_LLMARGS_EXPLICIT_DOCSTRING</span><span class="p">,</span>
                        <span class="n">TORCH_LLMARGS_REMOVED_ARGS</span><span class="p">,</span> <span class="n">TorchLlmArgs</span><span class="p">,</span>
                        <span class="n">validate_token_encoder_bucket_config</span><span class="p">)</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">.llm_utils</span><span class="w"> </span><span class="kn">import</span> <span class="n">CachedModelLoader</span><span class="p">,</span> <span class="n">KvCacheRetentionConfig</span><span class="p">,</span> <span class="n">ModelLoader</span>
@@ -1411,6 +1415,14 @@ window.runMermaid = runMermaid;</script>
                     <span class="sa">f</span><span class="s2">"Unknown backend: </span><span class="si">{</span><span class="n">backend</span><span class="si">!r}</span><span class="s2">. Supported backends are "</span>
                     <span class="s2">"'pytorch'."</span><span class="p">)</span>
 
+            <span class="c1"># TRTLLM_MODELING_V2=require promises the run measured a modeling_v2</span>
+            <span class="c1"># target. Only the pytorch backend reaches the resolver that could</span>
+            <span class="c1"># select one, so on any other backend the promise would be broken</span>
+            <span class="c1"># silently -- the one failure that mode exists to prevent.</span>
+            <span class="kn">from</span><span class="w"> </span><span class="nn">.._torch._experimental.modeling_v2</span><span class="w"> </span><span class="kn">import</span> \
+                <span class="n">assert_backend_can_route</span>
+            <span class="n">assert_backend_can_route</span><span class="p">(</span><span class="n">backend</span><span class="p">)</span>
+
             <span class="c1"># check the kwargs and raise ValueError directly</span>
             <span class="n">valid_keys</span> <span class="o">=</span> <span class="nb">set</span><span class="p">(</span>
                 <span class="nb">list</span><span class="p">(</span><span class="n">llm_args_cls</span><span class="o">.</span><span class="n">model_fields</span><span class="o">.</span><span class="n">keys</span><span class="p">())</span> <span class="o">+</span>
@@ -1434,6 +1446,8 @@ window.runMermaid = runMermaid;</script>
                                      <span class="n">revision</span><span class="o">=</span><span class="n">revision</span><span class="p">,</span>
                                      <span class="n">tokenizer_revision</span><span class="o">=</span><span class="n">tokenizer_revision</span><span class="p">,</span>
                                      <span class="o">**</span><span class="n">kwargs</span><span class="p">)</span>
+
+            <span class="bp">self</span><span class="o">.</span><span class="n">_capture_usage_startup</span><span class="p">(</span><span class="n">llm_args</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="p">)</span>
 
         <span class="k">except</span> <span class="ne">Exception</span> <span class="k">as</span> <span class="n">e</span><span class="p">:</span>
             <span class="n">logger</span><span class="o">.</span><span class="n">error</span><span class="p">(</span>
@@ -1518,6 +1532,21 @@ window.runMermaid = runMermaid;</script>
         <span class="n">exception_handler</span><span class="o">.</span><span class="n">register</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="s1">'shutdown'</span><span class="p">)</span>
         <span class="n">atexit</span><span class="o">.</span><span class="n">register</span><span class="p">(</span><span class="n">LLM</span><span class="o">.</span><span class="n">_shutdown_wrapper</span><span class="p">,</span> <span class="n">weakref</span><span class="o">.</span><span class="n">ref</span><span class="p">(</span><span class="bp">self</span><span class="p">))</span>
 
+    <span class="k">def</span><span class="w"> </span><span class="nf">_capture_usage_startup</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="o">**</span><span class="n">context</span><span class="p">:</span> <span class="n">Any</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Capture optional startup context without affecting model construction."""</span>
+        <span class="k">try</span><span class="p">:</span>
+            <span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.usage</span><span class="w"> </span><span class="kn">import</span> <span class="n">record_llm_initialization_attempt</span>
+            <span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.usage.usage_lib</span><span class="w"> </span><span class="kn">import</span> <span class="n">_capture_startup_context</span>
+
+            <span class="n">args</span> <span class="o">=</span> <span class="n">context</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"llm_args"</span><span class="p">)</span>
+            <span class="k">if</span> <span class="p">(</span><span class="n">args</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="nb">hasattr</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="s2">"_usage_attempt_tracked"</span><span class="p">)</span>
+                    <span class="ow">and</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">_usage_attempt_tracked</span><span class="p">):</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_usage_attempt_tracked</span> <span class="o">=</span> <span class="n">record_llm_initialization_attempt</span><span class="p">(</span>
+                    <span class="n">args</span><span class="o">.</span><span class="n">telemetry_config</span><span class="p">)</span>
+            <span class="n">_capture_startup_context</span><span class="p">(</span><span class="o">**</span><span class="n">context</span><span class="p">)</span>
+        <span class="k">except</span> <span class="ne">Exception</span> <span class="k">as</span> <span class="n">exc</span><span class="p">:</span>
+            <span class="n">logger</span><span class="o">.</span><span class="n">debug</span><span class="p">(</span><span class="s2">"Usage telemetry startup capture failed: </span><span class="si">%s</span><span class="s2">"</span><span class="p">,</span> <span class="n">exc</span><span class="p">)</span>
+
     <span class="k">def</span><span class="w"> </span><span class="nf">_start_usage_reporting</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">"""Start the success-only initial report and heartbeat stream."""</span>
         <span class="k">try</span><span class="p">:</span>
@@ -1531,9 +1560,20 @@ window.runMermaid = runMermaid;</script>
                     <span class="o">==</span> <span class="n">_usage</span><span class="o">.</span><span class="n">UsageContext</span><span class="o">.</span><span class="n">UNKNOWN</span><span class="p">):</span>
                 <span class="n">telemetry_config</span> <span class="o">=</span> <span class="n">telemetry_config</span><span class="o">.</span><span class="n">model_copy</span><span class="p">(</span>
                     <span class="n">update</span><span class="o">=</span><span class="p">{</span><span class="s2">"usage_context"</span><span class="p">:</span> <span class="n">_usage</span><span class="o">.</span><span class="n">UsageContext</span><span class="o">.</span><span class="n">LLM_CLASS</span><span class="p">})</span>
+            <span class="n">pretrained_config</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_hf_model_config</span>
+            <span class="k">if</span> <span class="nb">getattr</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="s2">"_encoder_executor"</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="k">try</span><span class="p">:</span>
+                    <span class="n">runtime_pretrained_config</span> <span class="o">=</span> <span class="p">(</span>
+                        <span class="bp">self</span><span class="o">.</span><span class="n">_encoder_executor</span><span class="o">.</span><span class="n">model_engine</span><span class="o">.</span><span class="n">model</span><span class="o">.</span><span class="n">model_config</span><span class="o">.</span>
+                        <span class="n">pretrained_config</span><span class="p">)</span>
+                    <span class="k">if</span> <span class="n">runtime_pretrained_config</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+                        <span class="n">pretrained_config</span> <span class="o">=</span> <span class="n">runtime_pretrained_config</span>
+                <span class="k">except</span> <span class="ne">AttributeError</span><span class="p">:</span>
+                    <span class="c1"># Missing runtime metadata must not suppress usage reporting.</span>
+                    <span class="k">pass</span>
             <span class="n">_usage</span><span class="o">.</span><span class="n">report_usage</span><span class="p">(</span>
                 <span class="n">llm_args</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="p">,</span>
-                <span class="n">pretrained_config</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_hf_model_config</span><span class="p">,</span>
+                <span class="n">pretrained_config</span><span class="o">=</span><span class="n">pretrained_config</span><span class="p">,</span>
                 <span class="n">telemetry_config</span><span class="o">=</span><span class="n">telemetry_config</span><span class="p">,</span>
             <span class="p">)</span>
         <span class="k">except</span> <span class="ne">Exception</span> <span class="k">as</span> <span class="n">exc</span><span class="p">:</span>
@@ -2173,8 +2213,11 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">            batch_indexed_model_output (bool): If specified, assume batched model output indexed by request index, as opposed to token index. Defaults to True.</span>
 <span class="sd">            copy_logits_to_host (bool): If set, copy logits from device to host. Otherwise, return a view into the on-device logits tensor. Defaults to True.</span>
 <span class="sd">            return_raw_logits (bool): Whether to return the raw CPU logits tensor for the whole input batch. Defaults to False.</span>
-<span class="sd">            model_kwargs (Any): Model-specific inputs passed through to the model's forward(). Examples: token_type_ids (BERT),</span>
-<span class="sd">                inputs_embeds (reward models).</span>
+<span class="sd">            model_kwargs (Any): Model-specific inputs passed through to the model's forward(). Examples:</span>
+<span class="sd">                token_type_ids (BERT), inputs_embeds (reward models). Pass tensors where they already live (host or device).</span>
+<span class="sd">                With encoder CUDA graphs enabled, every tensor kwarg must be declared in</span>
+<span class="sd">                `cuda_graph_config.extra_model_inputs`: an undeclared tensor raises, and a non-tensor</span>
+<span class="sd">                value runs that call eagerly.</span>
 
 <span class="sd">        Returns:</span>
 <span class="sd">            Union[tensorrt_llm.llmapi.llm.EncoderOutput, List[tensorrt_llm.llmapi.llm.EncoderOutput], torch.Tensor]:</span>
@@ -2263,16 +2306,10 @@ window.runMermaid = runMermaid;</script>
         <span class="c1"># Build inputs dict — common + model-specific kwargs.</span>
         <span class="c1"># Filter keys that are supplied by EncoderRunner itself to avoid</span>
         <span class="c1"># "multiple values for keyword argument" errors.</span>
-        <span class="n">_RESERVED_KEYS</span> <span class="o">=</span> <span class="p">{</span>
-            <span class="s1">'input_ids'</span><span class="p">,</span>
-            <span class="s1">'seq_lens'</span><span class="p">,</span>
-            <span class="s1">'multi_item_part_lens'</span><span class="p">,</span>
-            <span class="s1">'attn_metadata'</span><span class="p">,</span>
-            <span class="s1">'return_context_logits'</span><span class="p">,</span>
-        <span class="p">}</span>
         <span class="n">filtered_kwargs</span> <span class="o">=</span> <span class="p">{</span>
             <span class="n">k</span><span class="p">:</span> <span class="n">v</span>
-            <span class="k">for</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span> <span class="ow">in</span> <span class="n">model_kwargs</span><span class="o">.</span><span class="n">items</span><span class="p">()</span> <span class="k">if</span> <span class="n">k</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">_RESERVED_KEYS</span>
+            <span class="k">for</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span> <span class="ow">in</span> <span class="n">model_kwargs</span><span class="o">.</span><span class="n">items</span><span class="p">()</span>
+            <span class="k">if</span> <span class="n">k</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">ENCODER_RUNNER_MANAGED_INPUTS</span>
         <span class="p">}</span>
 
         <span class="n">forward_inputs</span> <span class="o">=</span> <span class="p">{</span>
@@ -2822,13 +2859,13 @@ window.runMermaid = runMermaid;</script>
         <span class="bp">self</span><span class="o">.</span><span class="n">_usage_lifecycle_active</span> <span class="o">=</span> <span class="kc">False</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_usage_lifecycle_lock</span> <span class="o">=</span> <span class="n">threading</span><span class="o">.</span><span class="n">Lock</span><span class="p">()</span>
         <span class="n">telemetry_config</span> <span class="o">=</span> <span class="n">kwargs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"telemetry_config"</span><span class="p">)</span>
-        <span class="n">usage_attempt_tracked</span> <span class="o">=</span> <span class="kc">False</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_usage_attempt_tracked</span> <span class="o">=</span> <span class="kc">False</span>
         <span class="n">_usage</span> <span class="o">=</span> <span class="kc">None</span>
         <span class="c1"># Telemetry: Track before construction so initialization failures are visible.</span>
         <span class="k">try</span><span class="p">:</span>
             <span class="kn">import</span><span class="w"> </span><span class="nn">tensorrt_llm.usage</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">_usage</span>
 
-            <span class="n">usage_attempt_tracked</span> <span class="o">=</span> <span class="n">_usage</span><span class="o">.</span><span class="n">record_llm_initialization_attempt</span><span class="p">(</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_usage_attempt_tracked</span> <span class="o">=</span> <span class="n">_usage</span><span class="o">.</span><span class="n">record_llm_initialization_attempt</span><span class="p">(</span>
                 <span class="n">telemetry_config</span><span class="p">,</span>
                 <span class="n">default_usage_context</span><span class="o">=</span><span class="n">_usage</span><span class="o">.</span><span class="n">UsageContext</span><span class="o">.</span><span class="n">LLM_CLASS</span><span class="o">.</span><span class="n">value</span><span class="p">,</span>
             <span class="p">)</span>
@@ -2837,6 +2874,13 @@ window.runMermaid = runMermaid;</script>
                 <span class="sa">f</span><span class="s2">"Usage telemetry initialization tracking failed: </span><span class="si">{</span><span class="n">exc</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
 
         <span class="n">backend</span> <span class="o">=</span> <span class="n">kwargs</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="s2">"backend"</span><span class="p">,</span> <span class="s2">"pytorch"</span><span class="p">)</span>
+
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_usage_attempt_tracked</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_capture_usage_startup</span><span class="p">(</span>
+                <span class="n">requested</span><span class="o">=</span><span class="nb">dict</span><span class="p">(</span><span class="n">kwargs</span><span class="p">,</span>
+                               <span class="n">backend</span><span class="o">=</span><span class="n">backend</span><span class="p">,</span>
+                               <span class="n">tensor_parallel_size</span><span class="o">=</span><span class="n">tensor_parallel_size</span><span class="p">,</span>
+                               <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">))</span>
 
         <span class="k">try</span><span class="p">:</span>
             <span class="c1"># Validate that only arguments supported by the PyTorch backend are passed.</span>
@@ -2854,18 +2898,18 @@ window.runMermaid = runMermaid;</script>
                              <span class="n">backend</span><span class="o">=</span><span class="n">backend</span><span class="p">,</span>
                              <span class="o">**</span><span class="n">kwargs</span><span class="p">)</span>
         <span class="k">except</span> <span class="ne">Exception</span><span class="p">:</span>
-            <span class="k">if</span> <span class="n">usage_attempt_tracked</span><span class="p">:</span>
+            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_usage_attempt_tracked</span> <span class="ow">and</span> <span class="n">_usage</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
                 <span class="n">_usage</span><span class="o">.</span><span class="n">record_llm_initialization_failure</span><span class="p">()</span>
             <span class="k">raise</span>
 
         <span class="k">try</span><span class="p">:</span>
-            <span class="k">if</span> <span class="ow">not</span> <span class="n">usage_attempt_tracked</span> <span class="ow">and</span> <span class="n">_usage</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-                <span class="n">usage_attempt_tracked</span> <span class="o">=</span> <span class="n">_usage</span><span class="o">.</span><span class="n">record_llm_initialization_attempt</span><span class="p">(</span>
+            <span class="k">if</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">_usage_attempt_tracked</span> <span class="ow">and</span> <span class="n">_usage</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_usage_attempt_tracked</span> <span class="o">=</span> <span class="n">_usage</span><span class="o">.</span><span class="n">record_llm_initialization_attempt</span><span class="p">(</span>
                     <span class="nb">getattr</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="p">,</span> <span class="s1">'telemetry_config'</span><span class="p">,</span> <span class="kc">None</span><span class="p">),</span>
                     <span class="n">default_usage_context</span><span class="o">=</span><span class="n">_usage</span><span class="o">.</span><span class="n">UsageContext</span><span class="o">.</span><span class="n">LLM_CLASS</span><span class="o">.</span><span class="n">value</span><span class="p">,</span>
                 <span class="p">)</span>
 
-            <span class="k">if</span> <span class="n">usage_attempt_tracked</span><span class="p">:</span>
+            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_usage_attempt_tracked</span><span class="p">:</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">_usage_lifecycle_active</span> <span class="o">=</span> <span class="n">_usage</span><span class="o">.</span><span class="n">record_llm_initialized</span><span class="p">()</span>
         <span class="k">except</span> <span class="ne">Exception</span> <span class="k">as</span> <span class="n">exc</span><span class="p">:</span>
             <span class="n">logger</span><span class="o">.</span><span class="n">debug</span><span class="p">(</span><span class="sa">f</span><span class="s2">"Usage telemetry completion tracking failed: </span><span class="si">{</span><span class="n">exc</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
@@ -2953,6 +2997,7 @@ window.runMermaid = runMermaid;</script>
         <span class="c1"># It should also be before bindings ExecutorConfig, which may depend on tokenizer info.</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_tokenizer</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_try_load_tokenizer</span><span class="p">()</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_hf_model_config</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_try_load_hf_model_config</span><span class="p">()</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_capture_usage_startup</span><span class="p">(</span><span class="n">pretrained_config</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_hf_model_config</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_reject_token_encoder_config_without_buckets</span><span class="p">()</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_generation_config</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_try_load_generation_config</span><span class="p">()</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_generation_config_explicit_values</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_try_load_generation_config_explicit_values</span><span class="p">(</span>
@@ -3111,8 +3156,8 @@ window.runMermaid = runMermaid;</script>
   
 
   <!-- Scripts loaded after <body> so the DOM is not blocked -->
-  <script defer src="../../../_static/scripts/bootstrap.js?digest=64cc4de3f052d77215f0"></script>
-<script defer src="../../../_static/scripts/pydata-sphinx-theme.js?digest=64cc4de3f052d77215f0"></script>
+  <script defer src="../../../_static/scripts/bootstrap.js?digest=18bd87630a240e9c25be"></script>
+<script defer src="../../../_static/scripts/pydata-sphinx-theme.js?digest=18bd87630a240e9c25be"></script>
 
 
   <footer class="bd-footer">
@@ -3184,9 +3229,9 @@ window.runMermaid = runMermaid;</script>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on September 26, 2026.</p>
+  <p>Last updated on October 09, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/c76f4a8">c76f4a8</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/cc63e66">cc63e66</a>.</p>
   
 </div></div>
       

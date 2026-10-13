@@ -27,8 +27,8 @@
   </noscript>
   
   <!-- Loaded before other Sphinx assets -->
-  <link href="../_static/styles/theme.css?digest=64cc4de3f052d77215f0" rel="stylesheet" />
-<link href="../_static/styles/pydata-sphinx-theme.css?digest=64cc4de3f052d77215f0" rel="stylesheet" />
+  <link href="../_static/styles/theme.css?digest=18bd87630a240e9c25be" rel="stylesheet" />
+<link href="../_static/styles/pydata-sphinx-theme.css?digest=18bd87630a240e9c25be" rel="stylesheet" />
 
     <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=8f2a1f02" />
     <link rel="stylesheet" type="text/css" href="../_static/styles/nvidia-sphinx-theme.css?v=933278ad" />
@@ -39,10 +39,10 @@
     <link rel="stylesheet" type="text/css" href="../_static/custom.css?v=19d20f17" />
   
   <!-- So that users can add custom icons -->
-  <script defer src="../_static/scripts/fontawesome.js?digest=64cc4de3f052d77215f0"></script>
+  <script defer src="../_static/scripts/fontawesome.js?digest=18bd87630a240e9c25be"></script>
   <!-- Pre-loaded scripts that we'll load fully later -->
-  <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=64cc4de3f052d77215f0" />
-<link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=64cc4de3f052d77215f0" />
+  <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=18bd87630a240e9c25be" />
+<link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=18bd87630a240e9c25be" />
 
 
 
@@ -60,9 +60,9 @@
     <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
     <script>DOCUMENTATION_OPTIONS.pagename = 'features/visualgen-sparse-attention';</script>
     <script>
-        DOCUMENTATION_OPTIONS.theme_version = '0.22.0';
+        DOCUMENTATION_OPTIONS.theme_version = '0.23.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc29';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc0';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -77,8 +77,9 @@
 
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="color-scheme" content="light dark"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc29" />
+  <meta name="docsearch:version" content="1.4.0rc0" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -412,6 +413,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-qwen3.8-flash-next-on-trtllm.html">Deployment Guide for Qwen3.8-Flash-Next on TensorRT LLM - Blackwell Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-kimi-k3-on-trtllm.html">Deployment Guide for Kimi K3 on TensorRT LLM - Blackwell</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-glm-5-on-trtllm.html">Deployment Guide for GLM-5 on TensorRT LLM - Blackwell Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-glm-5.3-flash-on-trtllm.html">Deployment Guide for GLM-5.3-Flash on TensorRT LLM - Blackwell Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-minimax-m3-on-trtllm.html">Deployment Guide for MiniMax-M3 on TensorRT LLM</a></li>
 </ul>
 </details></li>
@@ -458,6 +460,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CudaGraphConfig.html">CudaGraphConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/DecodeCudaGraphConfig.html">DecodeCudaGraphConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/EncodeCudaGraphConfig.html">EncodeCudaGraphConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/EncodeExtraInputSpec.html">EncodeExtraInputSpec</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/MoeConfig.html">MoeConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/EagleDecodingConfig.html">EagleDecodingConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/Eagle3DecodingConfig.html">Eagle3DecodingConfig</a></li>
@@ -668,16 +671,16 @@
 <li><p><a class="reference internal" href="#overview">Overview</a></p>
 <ul>
 <li><p><a class="reference internal" href="#algorithms">Algorithms</a></p></li>
-<li><p><a class="reference internal" href="#sol-attn">Sol-Attn</a></p></li>
 </ul>
 </li>
 <li><p><a class="reference internal" href="#skip-softmax-attention">Skip Softmax Attention</a></p></li>
+<li><p><a class="reference internal" href="#sol-attention">SOL Attention</a></p></li>
 <li><p><a class="reference internal" href="#video-sparse-attention-vsa">Video Sparse Attention (VSA)</a></p></li>
 </ul>
 <section id="overview">
 <h2>Overview<a class="headerlink" href="#overview" title="Link to this heading">#</a></h2>
 <p>Visual generation models naturally operate on long image or video token sequences. Each denoising step is closer to a full-context prefill pass than to autoregressive decoding, and attention can dominate runtime for high-resolution image generation or long video generation.</p>
-<p>Sparse attention in VisualGen is configured through <code class="docutils literal notranslate"><span class="pre">VisualGenArgs.attention_config.sparse_attention_config</span></code>. The user-facing config stays in VisualGen args or model config. Checkpoint calibration metadata remains internal and is lowered into per-attention-backend <code class="docutils literal notranslate"><span class="pre">SparseParams</span></code> when each attention module is constructed.</p>
+<p>Sparse attention in VisualGen is configured through <code class="docutils literal notranslate"><span class="pre">VisualGenArgs.attention_config.sparse_attention_config</span></code>. The user-facing config stays in VisualGen args or model config, while <code class="docutils literal notranslate"><span class="pre">attention_config.backend</span></code> selects the kernel family. Algorithms produce their block-sparse routes through the core <code class="docutils literal notranslate"><span class="pre">block_sparse_attn_predict</span></code> hook: a backend either predicts inside that hook from the flattened Q/K/V, or predicts before the core forward and hands the complete <code class="docutils literal notranslate"><span class="pre">BlockSparseForwardInputs</span></code> through <code class="docutils literal notranslate"><span class="pre">AttentionForwardArgs.sparse_backend_args</span></code>, which the default hook passes through. The VisualGen TRTLLM wrapper owns the timestep schedule those backends consult: it prepares the denoising timestep once per eager call and answers whether a layer runs sparse for it (dense layers and dense timestep phases do not). <code class="docutils literal notranslate"><span class="pre">SparseRuntimeParams</span></code> is the single lowered runtime carrier passed as <code class="docutils literal notranslate"><span class="pre">AttentionForwardArgs.sparse_runtime_params</span></code>; its optional <code class="docutils literal notranslate"><span class="pre">block_sparse_inputs</span></code> field nests the algorithm-neutral routes for the general block-sparse FMHA. <code class="docutils literal notranslate"><span class="pre">None</span></code> means prediction has not run, while an empty <code class="docutils literal notranslate"><span class="pre">SparseRuntimeParams()</span></code> records that prediction ran without a sparse payload.</p>
 <section id="algorithms">
 <h3>Algorithms<a class="headerlink" href="#algorithms" title="Link to this heading">#</a></h3>
 <div class="pst-scrollable-table-container"><table class="table">
@@ -694,45 +697,15 @@
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">vsa</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">VideoSparseAttentionConfig</span></code></p></td>
-<td><p>Supported (CUTEDSL)</p></td>
+<td><p>Supported (<code class="docutils literal notranslate"><span class="pre">CUTEDSL</span></code>, <code class="docutils literal notranslate"><span class="pre">TRTLLM</span></code>)</p></td>
 </tr>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">sol_attn</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">SolAttentionConfig</span></code></p></td>
-<td><p>Supported (CUTEDSL, sm100/sm103)</p></td>
+<td><p>Supported (<code class="docutils literal notranslate"><span class="pre">TRTLLM</span></code>, <code class="docutils literal notranslate"><span class="pre">CUTEDSL</span></code>)</p></td>
 </tr>
 </tbody>
 </table>
 </div>
-</section>
-<section id="sol-attn">
-<h3>Sol-Attn<a class="headerlink" href="#sol-attn" title="Link to this heading">#</a></h3>
-<p>Sol-Attn (<a class="reference external" href="https://arxiv.org/abs/2607.24027">arXiv:2607.24027</a>) folds dynamic block
-routing, sparse computation, and an approximation-correction term into one
-online-softmax pass. It runs on the <strong>CUTEDSL</strong> backend only, on datacenter
-Blackwell – sm100 (B200/GB200) and sm103 (B300/GB300) – and requires
-<code class="docutils literal notranslate"><span class="pre">head_dim=128</span></code>, bfloat16, and MHA
-(<code class="docutils literal notranslate"><span class="pre">num_kv_heads</span> <span class="pre">==</span> <span class="pre">num_heads</span></code>).</p>
-<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">attention_config</span><span class="p">:</span>
-<span class="w">  </span><span class="nt">backend</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">CUTEDSL</span>
-<span class="w">  </span><span class="nt">sparse_attention_config</span><span class="p">:</span>
-<span class="w">    </span><span class="nt">algorithm</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">sol_attn</span>
-<span class="w">    </span><span class="nt">tau</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">2.0</span><span class="w">                        </span><span class="c1"># routing threshold; higher routes more blocks sparse</span>
-<span class="w">    </span><span class="nt">thresh_type</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">diag</span><span class="w">               </span><span class="c1"># or "exact"</span>
-<span class="w">    </span><span class="nt">disabled_until_timestep</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">0.9090</span><span class="w"> </span><span class="c1"># dense while normalized timestep &gt;= cutoff</span>
-<span class="w">    </span><span class="nt">dense_layers</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">0</span><span class="p p-Indicator">]</span><span class="w">               </span><span class="c1"># optional: layer indices forced dense</span>
-</pre></div>
-</div>
-<p><code class="docutils literal notranslate"><span class="pre">disabled_until_timestep</span></code> has the same meaning as it does for Skip Softmax:
-attention runs dense while the normalized denoising timestep is at or above the
-cutoff, protecting the high-noise prefix, and switches to the sparse kernel
-below it. Use <code class="docutils literal notranslate"><span class="pre">None</span></code> rather than <code class="docutils literal notranslate"><span class="pre">0.0</span></code> to disable the prefix.</p>
-<p>On an input the kernel is known not to serve — an unsupported architecture, a
-<code class="docutils literal notranslate"><span class="pre">head_dim</span></code> other than 128, a non-bfloat16 dtype — Sol-Attn runs dense
-attention instead (the configured backend’s dense kernel where available,
-torch SDPA otherwise), logs the specific reason once, and counts the fallback.
-Set <code class="docutils literal notranslate"><span class="pre">TRTLLM_SOL_ATTN_STRICT=1</span></code> to raise instead, which is useful when
-benchmarking to confirm the kernel actually ran. Errors raised by the kernel
-itself are not caught.</p>
 </section>
 </section>
 <section id="skip-softmax-attention">
@@ -795,7 +768,7 @@ itself are not caught.</p>
 <li><p>Set <code class="docutils literal notranslate"><span class="pre">disabled_until_timestep</span></code> to disable Skip Softmax Attention at the beginning of denoising. The cutoff is expressed in normalized scheduler time; the number of dense steps it produces depends on the scheduler and the number of inference steps.</p></li>
 </ul>
 <p><code class="docutils literal notranslate"><span class="pre">threshold_scale_factor</span></code> and <code class="docutils literal notranslate"><span class="pre">target_sparsity</span></code> are alternatives: if both are present, <code class="docutils literal notranslate"><span class="pre">threshold_scale_factor</span></code> takes precedence and the calibration formula is not used. User-provided <code class="docutils literal notranslate"><span class="pre">target_sparsity</span></code> and <code class="docutils literal notranslate"><span class="pre">disabled_until_timestep</span></code> override checkpoint defaults. Checkpoint <code class="docutils literal notranslate"><span class="pre">ignore</span></code> patterns always disable Skip Softmax Attention for matching layers.</p>
-<p>Skip Softmax Attention works with both the <strong>TRTLLM</strong> and <strong>CUTEDSL</strong> attention backends in VisualGen. Set <code class="docutils literal notranslate"><span class="pre">attention_config.backend</span></code> to either when enabling it. On CUTEDSL, Skip Softmax Attention can also be combined with <code class="docutils literal notranslate"><span class="pre">quant_attention_config</span></code>’s block-scaled Q/K recipes (MXFP8, NVFP4); VSA and Sol-Attn are currently the two supported sparse-attention algorithms, both available only through the CuTeDSL attention backend; quantized attention is not yet supported or enabled with either mode.</p>
+<p>Skip Softmax Attention works with both the <strong>TRTLLM</strong> and <strong>CUTEDSL</strong> attention backends in VisualGen. Set <code class="docutils literal notranslate"><span class="pre">attention_config.backend</span></code> to either when enabling it. On CUTEDSL, Skip Softmax Attention can also be combined with <code class="docutils literal notranslate"><span class="pre">quant_attention_config</span></code>’s block-scaled Q/K recipes (MXFP8, NVFP4); VSA and SOL cannot be combined with quantized attention on any backend.</p>
 <section id="mapping-disabled-until-timestep-to-actual-denoising-steps">
 <h4>Mapping <code class="docutils literal notranslate"><span class="pre">disabled_until_timestep</span></code> to Actual Denoising Steps<a class="headerlink" href="#mapping-disabled-until-timestep-to-actual-denoising-steps" title="Link to this heading">#</a></h4>
 <p>VisualGen passes each transformer a normalized scheduler timestep <code class="docutils literal notranslate"><span class="pre">t</span></code> in <code class="docutils literal notranslate"><span class="pre">[0,</span> <span class="pre">1]</span></code>. Denoising proceeds from high to low <code class="docutils literal notranslate"><span class="pre">t</span></code>. Skip Softmax Attention is disabled while <code class="docutils literal notranslate"><span class="pre">t</span> <span class="pre">&gt;=</span> <span class="pre">disabled_until_timestep</span></code> and enabled once <code class="docutils literal notranslate"><span class="pre">t</span> <span class="pre">&lt;</span> <span class="pre">disabled_until_timestep</span></code>. Equality therefore belongs to the dense phase.</p>
@@ -933,9 +906,137 @@ shifted_sigma[i] = 3 * s[i] / (1 + 2 * s[i])
 <p>Graphs are captured lazily. The first denoising step seen for a given tensor shape and sparse-attention phase captures a graph; later steps with the same shape and phase replay that graph. When denoising crosses the cutoff, the phase key changes, so VisualGen captures a second graph for the enabled phase instead of replaying the graph from the disabled phase.</p>
 </section>
 </section>
+<section id="sol-attention">
+<h2>SOL Attention<a class="headerlink" href="#sol-attention" title="Link to this heading">#</a></h2>
+<p>SOL (<a class="reference external" href="https://arxiv.org/abs/2607.24027">arXiv:2607.24027</a>) routes attention
+blocks dynamically: blocks whose scores stand out are computed exactly, the
+rest are approximated from compact K/V proxies and folded back into the online
+softmax. VisualGen serves it on two backends behind one <code class="docutils literal notranslate"><span class="pre">SolAttentionConfig</span></code>:</p>
+<ul class="simple">
+<li><p><strong>TRTLLM</strong> runs SOL in two stages. A TRT-LLM-owned predictor first produces
+an exact block bitmask and K/V proxy summaries from Q/K/V; the shared
+<code class="docutils literal notranslate"><span class="pre">PrimsTSBlockSparseFmha</span></code> library then executes that route from the shared
+<code class="docutils literal notranslate"><span class="pre">SparseRuntimeParams</span></code>. <code class="docutils literal notranslate"><span class="pre">SOLTrtllmAttention</span></code> is only the VisualGen bridge: it
+overrides the core <code class="docutils literal notranslate"><span class="pre">block_sparse_attn_predict</span></code> hook, so prediction runs
+inside the core forward from the flattened Q/K/V, the batch layout in the
+attention metadata and the <code class="docutils literal notranslate"><span class="pre">timestep</span></code> in the forward arguments; dense layers
+and dense timestep phases return no routes. The VisualGen wrapper compacts
+fused projection split views once and shares those tensors between
+prediction and the block-sparse FMHA. Cross-attention, context parallelism,
+attention quantization and unsupported tensor envelopes raise an error
+instead of silently falling back to dense attention.</p></li>
+<li><p><strong>CUTEDSL</strong> runs the fused kernel vendored from the reference implementation
+(<code class="docutils literal notranslate"><span class="pre">SOLCuTeDSLAttention</span></code>), which folds routing, sparse computation and the
+approximation correction into one online-softmax pass. It runs on datacenter
+Blackwell, sm100 (B200/GB200) and sm103 (B300/GB300), and requires
+<code class="docutils literal notranslate"><span class="pre">head_dim=128</span></code>, bfloat16 and MHA (<code class="docutils literal notranslate"><span class="pre">num_kv_heads</span> <span class="pre">==</span> <span class="pre">num_heads</span></code>). On an input
+the kernel is known not to serve, such as an unsupported architecture, a
+<code class="docutils literal notranslate"><span class="pre">head_dim</span></code> other than 128 or a non-bfloat16 dtype, it runs dense attention
+instead (the CuTe DSL FMHA where available, torch SDPA otherwise), logs the
+reason once and counts the fallback; set <code class="docutils literal notranslate"><span class="pre">TRTLLM_SOL_ATTN_STRICT=1</span></code> to raise
+instead, which is useful when benchmarking to confirm the kernel actually
+ran. Errors raised by the kernel itself are not caught. Cross-attention and
+masked calls are delegated to dense attention per call.</p></li>
+</ul>
+<p>Configure SOL with <code class="docutils literal notranslate"><span class="pre">SolAttentionConfig</span></code> and either backend:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.visual_gen</span><span class="w"> </span><span class="kn">import</span> <span class="n">AttentionConfig</span><span class="p">,</span> <span class="n">SolAttentionConfig</span>
+
+<span class="n">attention_config</span> <span class="o">=</span> <span class="n">AttentionConfig</span><span class="p">(</span>
+    <span class="n">backend</span><span class="o">=</span><span class="s2">"TRTLLM"</span><span class="p">,</span>  <span class="c1"># or "CUTEDSL"</span>
+    <span class="n">sparse_attention_config</span><span class="o">=</span><span class="n">SolAttentionConfig</span><span class="p">(</span>
+        <span class="n">tau</span><span class="o">=</span><span class="mf">1.0</span><span class="p">,</span>
+        <span class="n">disabled_until_timestep</span><span class="o">=</span><span class="mf">0.6</span><span class="p">,</span>
+        <span class="n">dense_layers</span><span class="o">=</span><span class="p">[</span><span class="mi">0</span><span class="p">,</span> <span class="mi">2</span><span class="p">,</span> <span class="mi">3</span><span class="p">,</span> <span class="mi">4</span><span class="p">],</span>
+    <span class="p">),</span>
+<span class="p">)</span>
+</pre></div>
+</div>
+<p>The equivalent YAML is:</p>
+<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">attention_config</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">backend</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">TRTLLM</span><span class="w">                 </span><span class="c1"># or CUTEDSL</span>
+<span class="w">  </span><span class="nt">sparse_attention_config</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">algorithm</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">sol_attn</span>
+<span class="w">    </span><span class="nt">tau</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">1.0</span><span class="w">                      </span><span class="c1"># routing threshold; higher tau routes more blocks sparse</span>
+<span class="w">    </span><span class="nt">disabled_until_timestep</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">0.6</span><span class="w">  </span><span class="c1"># dense while the normalized timestep &gt;= cutoff</span>
+<span class="w">    </span><span class="nt">dense_layers</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">0</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">2</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">3</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">4</span><span class="p p-Indicator">]</span><span class="w">    </span><span class="c1"># optional: layer indices forced dense</span>
+<span class="w">    </span><span class="nt">thresh_type</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">diag</span><span class="w">             </span><span class="c1"># block threshold policy: "diag" or "exact"</span>
+</pre></div>
+</div>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">tau</span></code> is the routing threshold in standard deviations above the mean block
+score; higher values route more blocks sparse.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">disabled_until_timestep</span></code> has the same meaning as it does for Skip Softmax
+Attention: attention runs dense while the normalized denoising timestep is at
+or above the cutoff, protecting the high-noise prefix, and switches to SOL
+below it. Use <code class="docutils literal notranslate"><span class="pre">None</span></code> rather than <code class="docutils literal notranslate"><span class="pre">0.0</span></code> to disable the prefix.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">dense_layers</span></code> lists zero-based layer indices that always use dense
+attention.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">thresh_type</span></code> selects how the routing threshold models the key blocks:
+<code class="docutils literal notranslate"><span class="pre">diag</span></code> treats every key channel independently, <code class="docutils literal notranslate"><span class="pre">exact</span></code> uses the full key
+covariance. Both backends implement both policies from the same per-block
+statistics.</p></li>
+</ul>
+<p>The TRTLLM envelope is full-mask BF16 self-attention on SM100 or SM103 with 4-D
+BSHD Q/K/V tensors, equal Q/K/V shapes and head dimension 128. The predictor is
+one graph-visible operator that allocates its route and summary tensors per
+call, so it composes with CUDA Graph capture and with torch.compile, including
+<code class="docutils literal notranslate"><span class="pre">fullgraph</span></code>, without keeping any state between calls.</p>
+<p>When a cutoff is configured, VisualGen includes the dense-or-sparse phase in
+the CUDA Graph key. The TRTLLM attention metadata reduces the timestep to a host
+value during graph warmup, keeps it in the component attention state and reuses
+it during capture for every timestep-scheduled algorithm (Skip Softmax Attention
+and SOL), while the SOL predictor’s outputs are allocated inside the captured
+graph and replayed with it; the CuTeDSL backends read the
+phase the CUDA Graph runner resolved for the graph key instead of the device
+tensor. Per-token timesteps, such as Wan I2V where the conditioning frame stays
+at timestep zero, reduce to their largest live value, so the schedule stays
+dense until every token is below the cutoff. A dense capture therefore cannot
+be reused for the sparse phase.</p>
+</section>
 <section id="video-sparse-attention-vsa">
 <h2>Video Sparse Attention (VSA)<a class="headerlink" href="#video-sparse-attention-vsa" title="Link to this heading">#</a></h2>
-<p>TODO</p>
+<p>VSA reduces the cost of self-attention in video diffusion models by attending only to the most relevant spatial-temporal blocks. It uses a two-branch design: a lightweight coarse branch mean-pools tokens into (4, 4, 4) cubes and computes cube-level attention scores to select the top-K most relevant cubes per query, then a fine branch runs the selected backend’s block-sparse kernel over those cubes only. The two outputs are blended with learned gates, which is why VSA needs a fine-tuned checkpoint. Select either <code class="docutils literal notranslate"><span class="pre">CUTEDSL</span></code> for the CuTe DSL fine-stage kernel or <code class="docutils literal notranslate"><span class="pre">TRTLLM</span></code> for PrimTS block-sparse attention.</p>
+<p>Requirements:</p>
+<ul class="simple">
+<li><p>A VSA-fine-tuned checkpoint such as <a class="reference external" href="https://huggingface.co/FastVideo/Wan2.1-VSA-T2V-14B-720P-Diffusers"><code class="docutils literal notranslate"><span class="pre">FastVideo/Wan2.1-VSA-T2V-14B-720P-Diffusers</span></code></a>. Standard Wan checkpoints do not carry the learned VSA gates.</p></li>
+<li><p>The <code class="docutils literal notranslate"><span class="pre">CUTEDSL</span></code> or <code class="docutils literal notranslate"><span class="pre">TRTLLM</span></code> attention backend. <code class="docutils literal notranslate"><span class="pre">CUTEDSL</span></code> uses the CuTe DSL fine-stage kernel; <code class="docutils literal notranslate"><span class="pre">TRTLLM</span></code> lowers the selected cubes through the generic PrimTS block-sparse FMHA contract.</p></li>
+<li><p>A supported CUDA device and tensor shape for the selected block-sparse kernel. When that kernel is unavailable or the input is outside its envelope, the fine branch runs the compact Q/K/V through that backend’s dense path (SDPA for <code class="docutils literal notranslate"><span class="pre">CUTEDSL</span></code>, TRTLLM attention for <code class="docutils literal notranslate"><span class="pre">TRTLLM</span></code>) and the VSA post-processing still applies.</p></li>
+<li><p>VSA cannot be combined with <code class="docutils literal notranslate"><span class="pre">quant_attention_config</span></code>.</p></li>
+<li><p>VSA is not compatible with Ring attention or Attention2D (it does not produce per-split LSE). Ulysses is supported.</p></li>
+</ul>
+<p>Configure VSA with <code class="docutils literal notranslate"><span class="pre">VideoSparseAttentionConfig</span></code> and either backend:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm</span><span class="w"> </span><span class="kn">import</span> <span class="n">VisualGenArgs</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.visual_gen.args</span><span class="w"> </span><span class="kn">import</span> <span class="n">AttentionConfig</span><span class="p">,</span> <span class="n">VideoSparseAttentionConfig</span>
+
+<span class="n">args</span> <span class="o">=</span> <span class="n">VisualGenArgs</span><span class="p">(</span>
+    <span class="n">model</span><span class="o">=</span><span class="s2">"FastVideo/Wan2.1-VSA-T2V-14B-720P-Diffusers"</span><span class="p">,</span>
+    <span class="n">attention_config</span><span class="o">=</span><span class="n">AttentionConfig</span><span class="p">(</span>
+        <span class="n">backend</span><span class="o">=</span><span class="s2">"TRTLLM"</span><span class="p">,</span>  <span class="c1"># or "CUTEDSL"</span>
+        <span class="n">sparse_attention_config</span><span class="o">=</span><span class="n">VideoSparseAttentionConfig</span><span class="p">(</span><span class="n">vsa_sparsity</span><span class="o">=</span><span class="mf">0.9</span><span class="p">),</span>
+    <span class="p">),</span>
+<span class="p">)</span>
+</pre></div>
+</div>
+<p>The equivalent YAML, for <code class="docutils literal notranslate"><span class="pre">--visual_gen_args</span></code> or <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code>:</p>
+<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">attention_config</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">backend</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">TRTLLM</span><span class="w">                 </span><span class="c1"># or CUTEDSL</span>
+<span class="w">  </span><span class="nt">sparse_attention_config</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">algorithm</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">vsa</span>
+<span class="w">    </span><span class="nt">vsa_sparsity</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">0.90</span><span class="w">            </span><span class="c1"># fraction of K/V cubes skipped by the fine branch</span>
+</pre></div>
+</div>
+<p><code class="docutils literal notranslate"><span class="pre">vsa_sparsity</span></code> controls the fraction of K/V cubes the fine branch skips (0.0 keeps every cube and reproduces dense attention, 0.9 skips 90% of them). Higher sparsity gives more speedup at the cost of some quality.</p>
+<p>VSA retains shape-dependent metadata and route tensors so CUDA Graph replay can reuse stable addresses. A pipeline instance keeps one set of these tensors per distinct shape profile for as long as the CUDA Graphs that reference them, so their footprint grows with the number of served resolution/frame profiles exactly like the graphs do.</p>
+<p>Both VSA backends use the same VisualGen-owned predictor implementation, one
+instance per attention layer, and identical post-processing. The <code class="docutils literal notranslate"><span class="pre">TRTLLM</span></code> path runs the coarse stage before the core
+forward, hands the predicted <code class="docutils literal notranslate"><span class="pre">BlockSparseForwardInputs</span></code> (including the
+tile-padding validity bits only the VSA predictor knows) through
+<code class="docutils literal notranslate"><span class="pre">sparse_backend_args</span></code>, lets the default core prediction hook pass them to the
+general block-sparse FMHA, and then blends the fine and coarse outputs. Its
+compact dense fallback passes no sparse inputs, so the core runs dense attention
+and VSA post-processing still runs. <code class="docutils literal notranslate"><span class="pre">CUTEDSL</span></code> retains only its backend-specific
+fine-attention execution. The core FMHA registry owns the reusable block-sparse
+implementation rather than a VSA-specific lifecycle.</p>
 </section>
 </section>
 
@@ -990,7 +1091,6 @@ shifted_sigma[i] = 3 * s[i] / (1 + 2 * s[i])
     <ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#overview">Overview</a><ul class="nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#algorithms">Algorithms</a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#sol-attn">Sol-Attn</a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#skip-softmax-attention">Skip Softmax Attention</a><ul class="nav section-nav flex-column">
@@ -1004,6 +1104,7 @@ shifted_sigma[i] = 3 * s[i] / (1 + 2 * s[i])
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#cuda-graphs">CUDA Graphs</a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#sol-attention">SOL Attention</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#video-sparse-attention-vsa">Video Sparse Attention (VSA)</a></li>
 </ul>
   </nav></div>
@@ -1023,8 +1124,8 @@ shifted_sigma[i] = 3 * s[i] / (1 + 2 * s[i])
   
 
   <!-- Scripts loaded after <body> so the DOM is not blocked -->
-  <script defer src="../_static/scripts/bootstrap.js?digest=64cc4de3f052d77215f0"></script>
-<script defer src="../_static/scripts/pydata-sphinx-theme.js?digest=64cc4de3f052d77215f0"></script>
+  <script defer src="../_static/scripts/bootstrap.js?digest=18bd87630a240e9c25be"></script>
+<script defer src="../_static/scripts/pydata-sphinx-theme.js?digest=18bd87630a240e9c25be"></script>
 
 
   <footer class="bd-footer">
@@ -1096,9 +1197,9 @@ shifted_sigma[i] = 3 * s[i] / (1 + 2 * s[i])
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on September 26, 2026.</p>
+  <p>Last updated on October 09, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/c76f4a8">c76f4a8</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/cc63e66">cc63e66</a>.</p>
   
 </div></div>
       
