@@ -151,3 +151,73 @@ def test_the_stage_runs_ground_ladder_campaign_and_wrap(tmp_path):
     again = TuneStage(spec, state, dispatch=dispatch, checkpoint=lambda: None,
                       runner_factory=lambda spools, prefix: FakeRunner(spools, prefix, _effect), poll_s=0, log=lambda m: None)
     assert again.run() == "tuned"
+
+
+def test_a_config_change_re_measures_against_a_control_of_that_config_and_host(tmp_path):
+    """Controls are keyed by tree, config AND host: after the ladder's overlay is adopted a
+    candidate measured at the old config is re-measured, and judged only against a control
+    of the new config from its own host (a 4% slower host must not turn a win into a loss)."""
+    from agent_flow.workflows.staircase_onboard.tune.campaign import Campaign
+    from agent_flow.workflows.staircase_onboard.tune.ladder import BenchSpec
+    from agent_flow.workflows.staircase_onboard.tune.records import NoiseFloor
+    from agent_flow.workflows.staircase_onboard.tune.worktree import open_candidate
+
+    repo = _repo(tmp_path)
+    spools = []
+    for name, host in (("s1", "fast"), ("s2", "slow")):
+        d = tmp_path / name
+        d.mkdir()
+        (d / "status.json").write_text(json.dumps({"host": host}))
+        spools.append(str(d))
+
+    class HostRunner(FakeRunner):
+        def poll(self):
+            done = super().poll()
+            for label, spool, rc in done:
+                if "gate" in label:
+                    continue
+                tokens = self.jobs[label][0].split()
+                d = Path(tokens[tokens.index("--out-root") + 1]) / label
+                meta = json.loads((d / "meta.json").read_text())
+                meta["hostname"] = json.loads((Path(spool) / "status.json").read_text())["host"]
+                (d / "meta.json").write_text(json.dumps(meta))
+                if meta["hostname"] == "slow":
+                    rows = json.loads((d / "summary.json").read_text())
+                    for r in rows:
+                        r["tok_s_user"] *= 0.96
+                        r["output_tok_s_gpu"] *= 0.96
+                    (d / "summary.json").write_text(json.dumps(rows))
+            return done
+
+    identity = tmp_path / "identity.yaml"
+    identity.write_text(yaml.safe_dump({"modeling_v2": "require"}))
+    overlay = tmp_path / "ladder.yaml"
+    overlay.write_text(yaml.safe_dump({"cuda_graph_config": {"enable_padding": True}}))
+    bench = BenchSpec(bench_py="b", model="m", env_script="e", isl=8192, osl=1024, concurrencies=[1, 128], tree=str(repo))
+    perf = HostRunner(spools, "camp", _effect)
+    gates = HostRunner([spools[0]], "campg", _effect)
+    work = tmp_path / "camp"
+    camp = Campaign(workdir=work, repo=repo, bench=bench, base_configs=[identity], perf_runner=perf, gate_runner=gates,
+                    gate_cmd=lambda tree, configs, out: f"python gate_accuracy.py --out {out}",
+                    noise=NoiseFloor(spread={"con1.tok_s_user": 0.001}), log=lambda m: None)
+    camp.state.best_tree = str(open_candidate(repo, work / "wt", "best", "HEAD"))
+    camp.state.best_commit = _git(Path(camp.state.best_tree), "rev-parse", "HEAD")
+    wt = open_candidate(repo, work / "wt", "fast-path", "HEAD")
+    (wt / "modeling.py").write_text("FAST = True\n")
+    _git(wt, "commit", "-q", "-am", "fast")
+    decision = tmp_path / "decision.yaml"
+    decision.write_text(yaml.safe_dump({"decision": "CANDIDATE", "worktree": str(wt), "commits": [_git(wt, "rev-parse", "HEAD")]}))
+    camp.submit_candidate("fast-path", decision)
+    camp.step()                                   # controls queued on both hosts, nothing judged yet
+    camp.state.config_overlays = [str(overlay)]   # the ladder's overlay is adopted mid-campaign
+    for _ in range(30):
+        if not camp.step():
+            break
+    st = camp.state.candidates["fast-path"]
+    assert st.status == "kept", camp.summary()
+    assert st.eval_config == str(overlay)
+    ctrl = json.loads((work / "data" / st.control_label / "meta.json").read_text())
+    cand = json.loads((work / "data" / st.e2e_label / "meta.json").read_text())
+    assert ctrl["hostname"] == cand["hostname"]
+    assert st.control_label != "" and "-id-" not in st.control_label   # a control of the new config
+    assert round(st.deltas["con1.tok_s_user"], 3) == 0.2

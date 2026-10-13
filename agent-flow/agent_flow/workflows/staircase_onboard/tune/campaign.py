@@ -57,6 +57,9 @@ class CandidateState:
     # ``eval_base``; a keep that moves the best tree first re-stacks it.
     eval_tree: str = ""
     eval_base: str = ""
+    # The config the e2e label was measured at; a campaign whose config moved
+    # (the ladder's overlay adopted) re-measures before judging.
+    eval_config: str = ""
 
 
 @dataclass
@@ -179,8 +182,14 @@ class Campaign:
         host = self.spool_host(spool)
         if self._control_for(host) is not None:
             return True
+        import hashlib
+
         key = self._control_key(host)
-        label = f"ctl-{self.state.best_commit[:10]}-{host or Path(spool).name}"
+        cfg = self._config_key()
+        tag = hashlib.sha1(cfg.encode()).hexdigest()[:6] if cfg else "id"
+        # The label names the tree AND the config: a control of another config
+        # already on disk under a shorter name must never stand in for this one.
+        label = f"ctl-{self.state.best_commit[:10]}-{tag}-{host or Path(spool).name}"
         self.state.controls.setdefault(key, label)
         if f"{self.perf.prefix}-{label}" not in self.perf.inflight and not (self.data / label / "meta.json").exists():
             cmd = self.bench.command(label, self.data, self.configs())
@@ -214,11 +223,14 @@ class Campaign:
         if tree.is_dir() and self.state.best_tree:
             # A candidate built on another candidate's branch carries that branch's
             # commits too: stack everything since it left the best tree.
-            base = git(tree, "merge-base", "HEAD", git(Path(self.state.best_tree), "rev-parse", "HEAD"), check=False)
-            if base:
-                since = git(tree, "rev-list", "--reverse", f"{base}..HEAD").splitlines()
-                if since and set(st.commits) <= set(since) | {c[:10] for c in since} | set(since):
-                    st.commits = since
+            best_head = git(Path(self.state.best_tree), "rev-parse", "HEAD")
+            # Commits on the candidate that the best tree does not already carry,
+            # by patch identity: a parent candidate kept earlier was cherry-picked
+            # onto the best tree under another SHA and must not be applied twice.
+            since = git(tree, "rev-list", "--reverse", "--cherry-pick", "--right-only", "--no-merges",
+                        f"{best_head}...HEAD", check=False).splitlines()
+            if since and set(st.commits) <= set(since) | {c[:10] for c in since}:
+                st.commits = since
         if git(tree, "status", "--porcelain", "-uno"):
             st.status, st.reason = "blocked", "worktree has uncommitted changes; the candidate is its commits"
             self.state.save(self.state_path)
@@ -237,11 +249,24 @@ class Campaign:
 
         best = Path(self.state.best_tree)
         head = git(best, "rev-parse", "HEAD")
+        if st.worktree and Path(st.worktree).is_dir():
+            # Re-derive against the best tree as it is now: whatever it already
+            # carries (by patch identity) is not applied again.
+            pending = git(Path(st.worktree), "rev-list", "--reverse", "--cherry-pick", "--right-only",
+                          "--no-merges", f"{head}...HEAD", check=False).splitlines()
+            if pending:
+                st.commits = pending
         eval_tree = Path(self.state.best_tree).parent / f"eval-{st.slug}"
         branch = f"tune/eval-{st.slug}"
-        if eval_tree.exists():
-            git(self.repo, "worktree", "remove", "--force", str(eval_tree), check=False)
-        add_worktree(self.repo, eval_tree, "-B", branch, str(eval_tree), head)
+        if (eval_tree / ".git").exists():
+            # Reuse the checkout: moving it to the new head rewrites only the files
+            # that differ, where a fresh worktree checks out the whole tree (minutes
+            # on a network filesystem).
+            git(eval_tree, "cherry-pick", "--abort", check=False)
+            git(eval_tree, "checkout", "-q", "-B", branch, head)
+            git(eval_tree, "reset", "-q", "--hard", head)
+        else:
+            add_worktree(self.repo, eval_tree, "-B", branch, str(eval_tree), head)
         link_native(self.repo, eval_tree)
         out = subprocess.run(["git", "-C", str(eval_tree), "cherry-pick", *st.commits], capture_output=True, text=True)
         if out.returncode != 0:
@@ -250,8 +275,18 @@ class Campaign:
             self.ledger.append("candidate_conflict", slug=st.slug, best=head, detail=st.reason)
             return False
         st.eval_tree, st.eval_base = str(eval_tree), head
-        st.e2e_label = f"e2e-{st.slug}-{git(eval_tree, 'rev-parse', '--short=10', 'HEAD')}"
+        self._label(st)
         return True
+
+    def _config_key(self) -> str:
+        return ",".join(self.state.config_overlays)
+
+    def _label(self, st: CandidateState) -> None:
+        import hashlib
+
+        st.eval_config = self._config_key()
+        cfg = hashlib.sha1(st.eval_config.encode()).hexdigest()[:6] if st.eval_config else "id"
+        st.e2e_label = f"e2e-{st.slug}-{git(Path(st.eval_tree), 'rev-parse', '--short=10', 'HEAD')}-{cfg}"
 
     def enqueue(self, slug: str, decision_path: Path) -> Path:
         """Hand a decision to the running loop: only the loop writes the state file."""
@@ -287,6 +322,10 @@ class Campaign:
                     if st.e2e_label in finished:
                         st.status, st.reason = "reverted", "e2e measurement failed (see the label's .partial dir)"
                         continue
+                    if st.eval_base and st.eval_base != git(Path(self.state.best_tree), "rev-parse", "HEAD"):
+                        # Not measured yet and the best tree moved: stack on it first.
+                        if not self._stack(st):
+                            continue
                     for spool in self.perf.free_spools():
                         if not self._ensure_control(spool):
                             continue
@@ -297,13 +336,29 @@ class Campaign:
                     continue
                 if m is None:
                     continue
-                if st.eval_base and st.eval_base != git(Path(self.state.best_tree), "rev-parse", "HEAD"):
+                best_moved = bool(st.eval_base) and st.eval_base != git(Path(self.state.best_tree), "rev-parse", "HEAD")
+                if st.eval_config != self._config_key():
+                    self.ledger.measurement(m, candidate=st.slug, attribution_only=True, config=st.eval_config)
+                    self.log(f"[campaign] {st.slug}: measured at an older config; re-measuring at the current one")
+                    if best_moved:
+                        self._stack(st)
+                    else:
+                        self._label(st)
+                    continue
+                if best_moved:
                     # The best tree moved while this was measured: judge it on the new best.
                     self.log(f"[campaign] {st.slug}: best moved, re-stacking")
                     self._stack(st)
                     continue
-                ctrl = self._control_for(str(m.meta.get("hostname") or ""))
+                host = str(m.meta.get("hostname") or "")
+                ctrl = self._control_for(host)
                 if ctrl is None:
+                    # No control of this tree and config on this host yet: measure
+                    # one there and judge when it lands -- never against another config.
+                    spool = next((sp for sp in self.perf.spools if self.spool_host(sp) == host), None)
+                    if spool is not None:
+                        self._ensure_control(spool)
+                        continue
                     ctrl = self._measurement(st.control_label or self.state.control_label)
                 st.control_label = ctrl.label if ctrl else ""
                 self.ledger.measurement(m, candidate=st.slug)
