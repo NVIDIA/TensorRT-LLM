@@ -86,7 +86,7 @@ extra_llm_api_options_yaml: /tmp/pytorch_extra.yaml
 # [optional] trtllm-bench subcommand: throughput | latency. Default: throughput
 bench_subcommand: throughput
 
-# [optional] Backend: pytorch | tensorrt | _autodeploy. Default: pytorch
+# [optional] Backend: pytorch. Default: pytorch
 backend: pytorch
 
 # [optional] trtllm-bench --workspace: directory for benchmark intermediate files.

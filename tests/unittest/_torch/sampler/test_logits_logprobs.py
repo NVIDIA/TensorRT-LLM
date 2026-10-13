@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 import os
 from itertools import product
 from typing import Any, Final, Generator, cast
@@ -15,8 +17,8 @@ from tensorrt_llm._torch.pyexecutor.llm_request import (
     LlmRequestState,
     get_draft_token_length,
 )
+from tensorrt_llm._torch.pyexecutor.sampler.ops.custom import fused_compute_probs_from_logits
 from tensorrt_llm._torch.pyexecutor.sampler.sampler import Logprob, ScheduledRequests, TorchSampler
-from tensorrt_llm._torch.pyexecutor.sampler.sampler_strategy import _StrategyImpls
 from tensorrt_llm.bindings import SamplingConfig
 from tensorrt_llm.executor.result import TokenLogprobs
 from tensorrt_llm.llmapi.llm_utils import KvCacheConfig
@@ -99,7 +101,7 @@ def llm(
         )
 
     llm = LLM(
-        model=os.path.join(llm_models_root(), "llama-models-v2", "TinyLlama-1.1B-Chat-v1.0"),
+        model=os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B"),
         kv_cache_config=global_kvcache_config,
         max_batch_size=128,  # reduce buffer sizes, specially for generation logits
         disable_overlap_scheduler=disable_overlap_scheduler,
@@ -112,7 +114,7 @@ def llm(
 @pytest.fixture(scope="module")
 def simple_llm() -> LLM:
     llm = LLM(
-        model=os.path.join(llm_models_root(), "llama-models-v2", "TinyLlama-1.1B-Chat-v1.0"),
+        model=os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B"),
         max_batch_size=8,
         kv_cache_config=global_kvcache_config_prompt_logprobs,
     )
@@ -131,8 +133,7 @@ def check_generated_output(
 ):
     if gather_context_logits:
         assert output.context_logits is not None
-        # NOTE: prompt_token_ids of "A B C" becomes [1, 319, 350, 315]
-        expected_len = len(prompts[0].split()) + 1
+        expected_len = len(output.prompt_token_ids)
         assert expected_len == output.context_logits.shape[0]
     else:
         assert output.context_logits is None
@@ -791,16 +792,13 @@ def test_processed_logprobs_e2e(logprobs_k: int, simple_llm: LLM):
                 topp = topp if topp is not None else 1.0
                 temperature = temperature if temperature is not None else 1.0
 
-                # perform masking top-k top-p via the flashinfer strategy impl
-                _, probs = _StrategyImpls.StrategyImplWithProbs._sample_with_probs(
+                # perform masking top-k top-p via the sampler's fused kernel
+                probs = fused_compute_probs_from_logits(
                     logits_for_token,
-                    group_logit_indices=None,
-                    top_k=torch.tensor([topk], dtype=torch.int32, device="cuda"),
-                    top_p=torch.tensor([topp], dtype=torch.float32, device="cuda"),
-                    # None disables the min-p stage; no request here sets min_p.
-                    min_p=None,
-                    temperature=torch.tensor([temperature], dtype=torch.float32, device="cuda"),
-                    generator=None,
+                    torch.tensor([temperature], dtype=torch.float32, device="cuda"),
+                    torch.tensor([topk], dtype=torch.int32, device="cuda"),
+                    torch.tensor([topp], dtype=torch.float32, device="cuda"),
+                    torch.zeros(1, dtype=torch.float32, device="cuda"),
                 )
 
             if temperature != 0:
@@ -825,7 +823,7 @@ def test_processed_logprobs_e2e(logprobs_k: int, simple_llm: LLM):
 @force_ampere
 @pytest.mark.gpu2
 def test_logprobs_match_hf_tp2():
-    model_path = os.path.join(llm_models_root(), "llama-models-v2", "TinyLlama-1.1B-Chat-v1.0")
+    model_path = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
     llm = LLM(
         model=model_path,
         tensor_parallel_size=2,
@@ -881,7 +879,7 @@ def test_logprobs_pp2():
     Without the fix, logprobs length = 2N-1 instead of N due to duplication
     in the PP ring broadcast diff mechanism.
     """
-    model_path = os.path.join(llm_models_root(), "llama-models-v2", "TinyLlama-1.1B-Chat-v1.0")
+    model_path = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
     max_tokens = 16
     llm = LLM(
         model=model_path,

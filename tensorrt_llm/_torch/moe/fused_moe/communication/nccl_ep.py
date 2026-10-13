@@ -203,7 +203,7 @@ class NcclEP(Communication):
 
         Returns rank-major-shaped tensors directly:
           (recv_hs [N, H], recv_sf [N, H/128] or None, recv_slots [N, top_k] int32,
-           recv_scales [N, top_k] float32)
+           recv_scales [N, top_k] with token_final_scales.dtype)
 
         where N = ep_size * max_tokens_per_rank. Rows beyond
         ``recv_rank_counter[r]`` for source rank r have recv_slots = -1
@@ -370,7 +370,8 @@ class NcclEP(Communication):
 
         # Output buffers are 3D [ep_size, max_tokens_per_rank, ...] per the
         # LL rank-major contract; downstream MoE pipeline expects 2D --
-        # flatten via view.
+        # flatten via view. Restore routing weights to their input dtype for
+        # downstream MoE backends; NCCL-EP transports them as FP32.
         output_tokens = window_tokens if window_tokens is not None else ctx.output_tokens_buf
         if self.use_external_fp8:
             output_tokens = output_tokens.view(torch.float8_e4m3fn)
@@ -399,7 +400,9 @@ class NcclEP(Communication):
             # both contracts hold; -1 sentinels survive the cast. Under LL the
             # buffer is already int32 and this is a no-op.
             recv_slots_global.to(torch.int32),
-            ctx.recv_topk_weights_buf.reshape(self.max_recv_tokens, self.max_top_k),
+            ctx.recv_topk_weights_buf.reshape(self.max_recv_tokens, self.max_top_k).to(
+                token_final_scales.dtype
+            ),
         )
 
     # ------------------------------------------------------------------

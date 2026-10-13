@@ -44,8 +44,8 @@ The kernel-facing API accepts contiguous BF16
 ``[batch, tokens, heads, 128]`` Q/K/V, ``tau``, ``thresh_type``,
 ``kv_splits``, and an optional exact KV sink range.
 
-TRT-LLM's dispatch path (``attention_backend/cute_dsl/sol_attn.py``,
-``SolAttention``) consumes exactly two names from this module:
+TRT-LLM's dispatch path (``attention_backend/sparse/sol/backend.py``,
+``SOLCuTeDSLAttention``) consumes exactly two names from this module:
 ``_run_sol_attn_bthd`` and ``sol_attn_supported``. The dense-prefix decision
 lives there too, keyed off the normalized timestep forward kwarg.
 

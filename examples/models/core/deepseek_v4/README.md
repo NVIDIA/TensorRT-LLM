@@ -63,7 +63,7 @@ for larger KV cache budgets, longer context windows, or higher throughput target
 `--tp_size`, `--ep_size`, `--max_num_tokens`, and the KV cache memory fraction for your deployment
 target.
 
-Hopper (`SM90`) and Blackwell (`SM100`) support 128- or 256-token blocks. Hopper uses the
+Hopper (`SM90`) and Blackwell/Rubin (`SM100`, `SM103`, `SM107`) support 128- or 256-token blocks. Hopper uses the
 `fp8_ds_mla` cache layout; on `SM120`/`SM121`, this layout requires 256-token blocks.
 
 

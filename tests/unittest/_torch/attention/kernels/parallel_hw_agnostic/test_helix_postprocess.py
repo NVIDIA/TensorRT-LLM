@@ -412,6 +412,38 @@ class TestHelixPostProcess(unittest.TestCase):
         with pytest.raises(RuntimeError):
             torch.ops.trtllm.helix_post_process_native(gathered_o, gathered_stats, 1.0, 2)
 
+    @parameterized.expand([("empty",), ("not_a_divisor",)])
+    def test_alltoall_helix_native_rejects_bad_zero_kv_mask_length(self, case):
+        """Reject mask lengths that cannot map all-to-all entries to tokens."""
+        device = torch.device("cuda")
+        num_tokens, cp_size, value_dim = 8, 2, 64
+        partial_o = torch.randn(num_tokens, cp_size, value_dim, dtype=torch.float16, device=device)
+        softmax_stats = torch.randn(num_tokens, cp_size, 2, dtype=torch.float32, device=device)
+        workspace = torch.zeros(cp_size, 8, dtype=torch.uint64, device=device)
+        mask_size = 0 if case == "empty" else 3
+        mask = torch.zeros(mask_size, dtype=torch.bool, device=device)
+
+        with pytest.raises(RuntimeError, match="must divide the all-to-all entry count"):
+            torch.ops.trtllm.alltoall_helix_native(
+                partial_o, softmax_stats, workspace, 0, cp_size, mask
+            )
+
+    @unittest.skipIf(torch.cuda.device_count() < 2, "needs 2 GPUs")
+    def test_alltoall_helix_native_rejects_cross_device_zero_kv_mask(self):
+        """Reject a mask whose pointer cannot be dereferenced on the input device."""
+        num_tokens, cp_size, value_dim = 8, 2, 64
+        partial_o = torch.randn(
+            num_tokens, cp_size, value_dim, dtype=torch.float16, device="cuda:0"
+        )
+        softmax_stats = torch.randn(num_tokens, cp_size, 2, dtype=torch.float32, device="cuda:0")
+        workspace = torch.zeros(cp_size, 8, dtype=torch.uint64, device="cuda:0")
+        mask = torch.zeros(num_tokens, dtype=torch.bool, device="cuda:1")
+
+        with pytest.raises(RuntimeError, match="same device as partial_o"):
+            torch.ops.trtllm.alltoall_helix_native(
+                partial_o, softmax_stats, workspace, 0, cp_size, mask
+            )
+
     @parameterized.expand(
         [
             # (layout,) — "nccl", "fifo_v1", "fifo_v2".

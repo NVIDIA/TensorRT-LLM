@@ -623,7 +623,7 @@ class TestHubIdRevalidation:
     validation time and must not be checked twice.
     """
 
-    def _loader(self, tmp_path, speculative_model):
+    def _loader(self, speculative_model):
         from tensorrt_llm.llmapi.llm_args import DFlashDecodingConfig, KvCacheConfig, TorchLlmArgs
         from tensorrt_llm.llmapi.llm_utils import CachedModelLoader
 
@@ -638,8 +638,7 @@ class TestHubIdRevalidation:
             tensor_parallel_size=4,
             kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.8),
         )
-        # A string workspace avoids creating a TemporaryDirectory.
-        return CachedModelLoader(args, llm_build_stats=None, workspace=str(tmp_path))
+        return CachedModelLoader(args)
 
     def test_hub_id_budget_checked_after_download(self, tmp_path, monkeypatch):
         from types import SimpleNamespace
@@ -651,7 +650,7 @@ class TestHubIdRevalidation:
         drafter_dir = tmp_path / "drafter"
         drafter_dir.mkdir()
         (drafter_dir / "config.json").write_text(json.dumps(DRAFT_CONFIG))
-        loader = self._loader(tmp_path, speculative_model="hf-org/dflash-drafter")
+        loader = self._loader(speculative_model="hf-org/dflash-drafter")
 
         # A device too small for 33 slots at max_seq_len 8192 (~1.3 GiB): with
         # no weight estimate the arena-first budget is total - overhead -
@@ -679,7 +678,7 @@ class TestHubIdRevalidation:
         drafter_dir = tmp_path / "drafter"
         drafter_dir.mkdir()
         (drafter_dir / "config.json").write_text(json.dumps(DRAFT_CONFIG))
-        loader = self._loader(tmp_path, speculative_model=str(drafter_dir))
+        loader = self._loader(speculative_model=str(drafter_dir))
 
         class _Stop(Exception):
             pass

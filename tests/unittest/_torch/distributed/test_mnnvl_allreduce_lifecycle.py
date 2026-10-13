@@ -27,6 +27,17 @@ from tensorrt_llm._torch.distributed.ops import (
 from tensorrt_llm.mapping import Mapping
 
 
+@pytest.fixture(autouse=True)
+def mpi_mode(monkeypatch):
+    """Pin the checkpoint hooks to their MPI branch.
+
+    These tests assert MPI ownership semantics -- the workspace duplicates the communicator it is
+    handed and frees its own copy. The hooks pick that branch on mpi_disabled(), which reads the
+    environment, so pin it rather than inherit whatever the runner happens to export.
+    """
+    monkeypatch.setattr(ops_module, "mpi_disabled", lambda: False)
+
+
 class _FakeComm:
     def __init__(self) -> None:
         self.allreduce_count = 0
@@ -190,7 +201,7 @@ def test_checkpoint_restore_resets_inference_protocol_state(monkeypatch) -> None
         "uc_buffer": uc_buffer,
         "buffer_flags": buffer_flags,
         "buffer_size_bytes": 1024,
-        "mpi_comm": stale_comm,
+        "comm": stale_comm,
     }
     allreduce = object.__new__(MNNVLAllReduce)
     torch.nn.Module.__init__(allreduce)
@@ -206,7 +217,7 @@ def test_checkpoint_restore_resets_inference_protocol_state(monkeypatch) -> None
     allreduce.checkpoint_restore(comm)
     allreduce.checkpoint_restore(redundant_comm)
 
-    assert workspace["mpi_comm"] is comm.duplicates[0]
+    assert workspace["comm"] is comm.duplicates[0]
     assert stale_comm.allreduce_count == 0
     assert stale_comm.free_count == 1
     assert handle.prepare_count == 1
@@ -235,7 +246,7 @@ def test_checkpoint_restore_protocol_failure_is_terminal(monkeypatch) -> None:
         "uc_buffer": torch.ones(8, dtype=torch.float32),
         "buffer_flags": torch.ones(9, dtype=torch.uint32),
         "buffer_size_bytes": 1024,
-        "mpi_comm": _FakeComm(),
+        "comm": _FakeComm(),
     }
     allreduce = object.__new__(MNNVLAllReduce)
     torch.nn.Module.__init__(allreduce)
@@ -256,7 +267,7 @@ def test_checkpoint_restore_protocol_failure_is_terminal(monkeypatch) -> None:
     assert not handle.is_mapped()
     assert not handle.restore_pending
     assert handle.complete_count == 1
-    assert workspace["mpi_comm"] is None
+    assert workspace["comm"] is None
     assert comm.duplicates[0].free_count == 1
 
 
@@ -268,7 +279,7 @@ def test_checkpoint_restore_communicator_duplication_failure_is_terminal(monkeyp
         "uc_buffer": torch.ones(8, dtype=torch.float32),
         "buffer_flags": torch.ones(9, dtype=torch.uint32),
         "buffer_size_bytes": 1024,
-        "mpi_comm": _FakeComm(),
+        "comm": _FakeComm(),
     }
     allreduce = object.__new__(MNNVLAllReduce)
     torch.nn.Module.__init__(allreduce)
@@ -282,4 +293,4 @@ def test_checkpoint_restore_communicator_duplication_failure_is_terminal(monkeyp
     assert not handle.is_mapped()
     assert not handle.restore_pending
     assert handle.complete_count == 1
-    assert workspace["mpi_comm"] is None
+    assert workspace["comm"] is None

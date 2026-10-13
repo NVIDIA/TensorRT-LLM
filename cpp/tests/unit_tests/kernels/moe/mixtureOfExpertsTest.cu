@@ -321,6 +321,7 @@ protected:
     float mSwigluAlphaValue{0.5f};
     float mSwigluBetaValue{MX_QUANT_ACT ? 0.0f : 1.f};
     float mSwigluLimitValue{MX_QUANT_ACT ? FP8_MAX / 4 : NVFP4 ? 2.f : 0.5f};
+    bool mSwigluClampAfterSilu{false};
     float* mSwigluAlpha{};
     float* mSwigluBeta{};
     float* mSwigluLimit{};
@@ -1428,16 +1429,16 @@ protected:
         mMoERunner.setTactic(tactic1, tactic2);
 #ifdef USING_OSS_CUTLASS_MOE_GEMM
         mMoERunner.runMoe(mInputTensor, nullptr, true, mSelectedExpert, mTokenFinalScales, weight1_ptr, bias1_ptr,
-            ActivationParams(mActType, mSwigluAlpha, mSwigluBeta, mSwigluLimit), weight2_ptr, bias2_ptr, quant_params,
-            mTotalTokens, mTotalTokens, mHiddenSize, mUnpaddedHiddenSize > 0 ? mUnpaddedHiddenSize : mHiddenSize,
-            mInterSize / parallelism_config.tp_size, mNumExperts, mK, mWorkspace, mFinalOutput, mSourceToExpandedMap,
-            parallelism_config, enable_alltoall, mUseLora, lora_params, useFp8BlockScales, minLatencyMode,
-            min_latency_params, stream);
+            ActivationParams(mActType, mSwigluAlpha, mSwigluBeta, mSwigluLimit, mSwigluClampAfterSilu), weight2_ptr,
+            bias2_ptr, quant_params, mTotalTokens, mTotalTokens, mHiddenSize,
+            mUnpaddedHiddenSize > 0 ? mUnpaddedHiddenSize : mHiddenSize, mInterSize / parallelism_config.tp_size,
+            mNumExperts, mK, mWorkspace, mFinalOutput, mSourceToExpandedMap, parallelism_config, enable_alltoall,
+            mUseLora, lora_params, useFp8BlockScales, minLatencyMode, min_latency_params, stream);
 #else
         mMoERunner.runMoe(mInputTensor, nullptr, true, mSelectedExpert, mTokenFinalScales, weight1_ptr, bias1_ptr,
-            ActivationParams(mActType, mSwigluAlpha, mSwigluBeta, mSwigluLimit), weight2_ptr, bias2_ptr, quant_params,
-            mTotalTokens, mTotalTokens, mHiddenSize, mInterSize / parallelism_config.tp_size, mNumExperts, mK,
-            mWorkspace, mFinalOutput, mSourceToExpandedMap, parallelism_config, mUseLora, lora_params,
+            ActivationParams(mActType, mSwigluAlpha, mSwigluBeta, mSwigluLimit, mSwigluClampAfterSilu), weight2_ptr,
+            bias2_ptr, quant_params, mTotalTokens, mTotalTokens, mHiddenSize, mInterSize / parallelism_config.tp_size,
+            mNumExperts, mK, mWorkspace, mFinalOutput, mSourceToExpandedMap, parallelism_config, mUseLora, lora_params,
             useFp8BlockScales, minLatencyMode, min_latency_params, stream);
 #endif
 
@@ -1527,6 +1528,12 @@ protected:
         case ActivationType::Swiglu: return actfn(gate, 0.0f, ActivationType::Silu) * linear;
         case ActivationType::SwigluBias:
             linear = std::min(std::max(linear, -mSwigluLimitValue), mSwigluLimitValue);
+            if (mSwigluClampAfterSilu)
+            {
+                gate = std::min(
+                    actfn(gate * mSwigluAlphaValue, 0.0f, ActivationType::Silu) / mSwigluAlphaValue, mSwigluLimitValue);
+                return gate * (linear + mSwigluBetaValue);
+            }
             gate = std::min(gate, mSwigluLimitValue);
             // silu(gate * alpha) / alpha = gate * sigmoid(gate * alpha)
             return actfn(gate * mSwigluAlphaValue, 0.0f, ActivationType::Silu) / mSwigluAlphaValue
@@ -1655,8 +1662,19 @@ protected:
     {
         if (mActType == ActivationType::SwigluBias)
         {
-            ASSERT_GT(mMaxInput * std::max(mExpertWDiag1, mExpertWDiagGated), mSwigluLimitValue)
-                << "SwigluBias limit values don't change the result";
+            float const maxGate = mMaxInput * std::max(mExpertWDiag1, mExpertWDiagGated);
+            ASSERT_GT(maxGate, mSwigluLimitValue) << "SwigluBias limit values don't change the result";
+            if (mSwigluClampAfterSilu)
+            {
+                float const postSiluGate
+                    = actfn(maxGate * mSwigluAlphaValue, 0.0f, ActivationType::Silu) / mSwigluAlphaValue;
+                float const preSiluGate
+                    = actfn(std::min(maxGate, mSwigluLimitValue) * mSwigluAlphaValue, 0.0f, ActivationType::Silu)
+                    / mSwigluAlphaValue;
+                ASSERT_GT(postSiluGate, mSwigluLimitValue) << "Post-SiLU clamp order is not observable";
+                ASSERT_NE(std::min(postSiluGate, mSwigluLimitValue), preSiluGate)
+                    << "Pre- and post-SiLU clamp orders produce the same reference value";
+            }
         }
 
         ASSERT_EQ(expected_experts.size(), token_final_scales.size());
@@ -1965,6 +1983,22 @@ TYPED_TEST(MixtureOfExpertsTest, PermuteSwigluBias)
     this->mActType = ActivationType::SwigluBias;
     this->BasicPermuteTest();
     this->BasicPermuteTest(2);
+    this->BasicPermuteTest(3);
+}
+
+TYPED_TEST(MixtureOfExpertsTest, PermuteSwigluPostSiluClamp)
+{
+    if (this->W4A8_AWQ)
+    {
+        GTEST_SKIP() << "W4A8 does not support gated activations";
+    }
+    this->mActType = ActivationType::SwigluBias;
+    // MX uses a much larger clamp limit, so keep alpha small enough that the
+    // pre-SiLU reference does not round back to the same limit.
+    this->mSwigluAlphaValue = this->MX_QUANT_ACT ? 0.02f : 0.25f;
+    this->mSwigluBetaValue = this->MX_QUANT_ACT ? 0.0f : 1.25f;
+    this->mSwigluClampAfterSilu = true;
+    this->BasicPermuteTest();
     this->BasicPermuteTest(3);
 }
 

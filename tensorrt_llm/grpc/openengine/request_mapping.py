@@ -7,10 +7,11 @@ from collections.abc import Mapping
 from typing import Any
 
 import grpc
-from openengine.v1 import generation_pb2
 
+from tensorrt_llm.conversation_params import ConversationParams
 from tensorrt_llm.sampling_params import GuidedDecodingParams, SamplingParams
 
+from .bindings import generation_pb2
 from .capabilities import supported_guides
 from .errors import UnsupportedFeatureError
 
@@ -18,6 +19,8 @@ from .errors import UnsupportedFeatureError
 # output index and a scan of every generated token, so an unbounded list lets a
 # single request tax the event loop for the whole stream.
 _MAX_STOP_CONDITIONS = 64
+_CONVERSATION_ID_EXTRA_KEY = "conversation_id"
+_DETOKENIZE_EXTRA_KEY = "detokenize"
 
 
 def _top_n_candidates(selection: Any, name: str) -> int:
@@ -137,6 +140,14 @@ def sampling_params_from_request(
         if response.HasField("return_output_logprobs") and response.return_output_logprobs:
             kwargs["logprobs"] = _top_n_candidates(response.output_candidates, "output")
 
+    if (
+        request.HasField("extra")
+        and (detokenize := request.extra.fields.get(_DETOKENIZE_EXTRA_KEY)) is not None
+    ):
+        if detokenize.WhichOneof("kind") != "bool_value":
+            raise ValueError(f"extra.{_DETOKENIZE_EXTRA_KEY} must be a boolean")
+        kwargs["detokenize"] = detokenize.bool_value
+
     guided_decoding = _guided_decoding_from_request(request, guided_backend)
     if guided_decoding is not None:
         kwargs["guided_decoding"] = guided_decoding
@@ -173,6 +184,20 @@ def sampling_params_from_request(
     return sampling_params
 
 
+def conversation_params_from_request(
+    request: generation_pb2.GenerateRequest,
+) -> ConversationParams | None:
+    """Translate the caller's stable conversation identity, when supplied."""
+    if not request.HasField("extra"):
+        return None
+    conversation_id = request.extra.fields.get(_CONVERSATION_ID_EXTRA_KEY)
+    if conversation_id is None:
+        return None
+    if conversation_id.WhichOneof("kind") != "string_value":
+        raise ValueError(f"extra.{_CONVERSATION_ID_EXTRA_KEY} must be a string")
+    return ConversationParams(conversation_id=conversation_id.string_value)
+
+
 def _trace_headers(context: grpc.aio.ServicerContext) -> Mapping[str, str] | None:
     headers: dict[str, str] = {}
     openengine_keys: set[str] = set()
@@ -200,10 +225,11 @@ def _input_from_request(request: generation_pb2.GenerateRequest) -> str | dict[s
     if input_kind == "prompt":
         return request.prompt
     if input_kind == "token_ids":
-        return {"prompt_token_ids": list(request.token_ids.ids)}
+        return {"prompt_token_ids": request.token_ids.ids[:]}
     raise ValueError("exactly one of prompt or token_ids must be set")
 
 
 __all__ = [
+    "conversation_params_from_request",
     "sampling_params_from_request",
 ]

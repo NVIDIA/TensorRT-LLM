@@ -444,7 +444,6 @@ _BACKEND_PATTERNS = [
     ("-CPP-", "cpp"),
     ("-Triton-", "triton"),
     ("-FMHA-", "fmha"),
-    ("-AutoDeploy-", "autodeploy"),
     ("-Generic-", "generic"),
     ("-Verl-", "verl"),
 ]

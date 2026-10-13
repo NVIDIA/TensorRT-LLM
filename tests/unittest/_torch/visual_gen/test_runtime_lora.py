@@ -46,6 +46,38 @@ class TinyAttention(nn.Module):
         self.attn.qkv_proj = nn.Linear(2, 9, bias=False)
 
 
+class TinyMiniMaxH3Block(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.attn = nn.Module()
+        self.attn.qkv_proj = nn.Linear(2, 9, bias=False)
+        self.attn.to_out = nn.Sequential(nn.Linear(2, 3, bias=False))
+        self.ff = nn.Module()
+        self.ff.gate_up_proj = nn.Linear(2, 3, bias=False)
+        self.ff.down_proj = nn.Linear(2, 3, bias=False)
+        self.adaln_proj = nn.Module()
+        self.adaln_proj.linear = nn.Linear(2, 3, bias=False)
+
+
+class TinyMiniMaxH3Transformer(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.transformer_blocks = nn.ModuleList([TinyMiniMaxH3Block()])
+        self.token_refiner = nn.Module()
+        self.token_refiner.refiner_blocks = nn.ModuleList([TinyMiniMaxH3Block()])
+        self.norm_out = nn.Module()
+        self.norm_out.linear = nn.Linear(2, 3, bias=False)
+
+
+def _add_rank_one_lora_pair(
+    tensors: dict[str, torch.Tensor],
+    name: str,
+    value: float = 1.0,
+) -> None:
+    tensors[f"{name}.lora_A.weight"] = torch.tensor([[1.0, 0.0]])
+    tensors[f"{name}.lora_B.weight"] = torch.full((3, 1), value)
+
+
 class TinyUnsupportedTPLinear(nn.Linear):
     def __init__(self) -> None:
         super().__init__(2, 3, bias=False)
@@ -205,6 +237,82 @@ def test_runtime_lora_fuses_qkv_segments(tmp_path: Path) -> None:
             ]
         ),
     )
+
+
+def test_runtime_lora_maps_minimax_h3_turbo_names(tmp_path: Path) -> None:
+    model = TinyMiniMaxH3Transformer()
+    with torch.no_grad():
+        for module in model.modules():
+            if isinstance(module, nn.Linear):
+                module.weight.zero_()
+
+    lora_dir = tmp_path / "renamed_adapter"
+    lora_dir.mkdir()
+    lora_path = lora_dir / "adapter.safetensors"
+    tensors: dict[str, torch.Tensor] = {}
+    qkv_targets = ("blocks.0.attn", "token_refiner.blocks.0.attn")
+    for prefix in qkv_targets:
+        for suffix, value in (("to_q", 1.0), ("to_k", 2.0), ("to_v", 3.0)):
+            _add_rank_one_lora_pair(tensors, f"{prefix}.{suffix}", value)
+        _add_rank_one_lora_pair(tensors, f"{prefix}.out_proj", 4.0)
+
+    for name, value in (
+        ("blocks.0.mlp.fc1", 5.0),
+        ("blocks.0.mlp.fc2", 6.0),
+        ("blocks.0.adaln_proj.linear", 7.0),
+        ("token_refiner.blocks.0.mlp.fc1", 8.0),
+        ("token_refiner.blocks.0.mlp.fc2", 9.0),
+        ("final_layer.adaln_proj.linear", 10.0),
+    ):
+        _add_rank_one_lora_pair(tensors, name, value)
+    save_file(tensors, str(lora_path))
+
+    report = apply_runtime_lora(model, RuntimeLoRAConfig(path=str(lora_path)))
+
+    assert set(report.applied_modules) == {
+        "transformer_blocks.0.attn.qkv_proj",
+        "transformer_blocks.0.attn.to_out.0",
+        "transformer_blocks.0.ff.gate_up_proj",
+        "transformer_blocks.0.ff.down_proj",
+        "transformer_blocks.0.adaln_proj.linear",
+        "token_refiner.refiner_blocks.0.attn.qkv_proj",
+        "token_refiner.refiner_blocks.0.attn.to_out.0",
+        "token_refiner.refiner_blocks.0.ff.gate_up_proj",
+        "token_refiner.refiner_blocks.0.ff.down_proj",
+        "norm_out.linear",
+    }
+    assert report.skipped_non_targets == 0
+    torch.testing.assert_close(
+        model.transformer_blocks[0].attn.qkv_proj.weight,
+        torch.tensor([[1.0, 0.0]] * 3 + [[2.0, 0.0]] * 3 + [[3.0, 0.0]] * 3),
+    )
+    torch.testing.assert_close(
+        model.norm_out.linear.weight,
+        torch.tensor([[10.0, 0.0]] * 3),
+    )
+
+
+def test_runtime_lora_does_not_map_minimax_aliases_for_other_transformers(
+    tmp_path: Path,
+) -> None:
+    model = TinyTransformer()
+    lora_dir = tmp_path / "MiniMax-H3-Turbo-Lora"
+    lora_dir.mkdir()
+    lora_path = lora_dir / "adapter.safetensors"
+    save_file(
+        {
+            "blocks.0.mlp.fc1.lora_A.weight": torch.tensor([[1.0, 0.0]]),
+            "blocks.0.mlp.fc1.lora_B.weight": torch.ones(3, 1),
+            "token_refiner.blocks.0.mlp.fc1.lora_A.weight": torch.tensor([[1.0, 0.0]]),
+            "token_refiner.blocks.0.mlp.fc1.lora_B.weight": torch.ones(3, 1),
+            "final_layer.adaln_proj.linear.lora_A.weight": torch.tensor([[1.0, 0.0]]),
+            "final_layer.adaln_proj.linear.lora_B.weight": torch.ones(3, 1),
+        },
+        str(lora_path),
+    )
+
+    with pytest.raises(ValueError, match="Runtime LoRA skipped 3 adapter target"):
+        apply_runtime_lora(model, RuntimeLoRAConfig(path=str(lora_path)))
 
 
 def test_runtime_lora_rejects_mismatched_qkv_total_span(tmp_path: Path) -> None:

@@ -635,10 +635,26 @@ class TestPipelineSchedulerLoading:
 
 class TestWarmupAndForwardValidation:
     def test_warmup_steps_follow_distilled_schedule(self):
-        assert _bare_pipeline(sampling=_distilled_policy()).default_warmup_steps == 4
+        pipeline = _bare_pipeline(sampling=_distilled_policy(), transformer=SimpleNamespace())
+        assert pipeline.default_warmup_steps == 4
 
     def test_warmup_steps_base_default(self):
-        assert _bare_pipeline().default_warmup_steps == 2  # BasePipeline default
+        pipeline = _bare_pipeline(transformer=SimpleNamespace())
+        assert pipeline.default_warmup_steps == 2  # BasePipeline default
+
+    def test_warmup_steps_reach_the_middle_of_a_step_policy(self):
+        """Both steps of a two-step warmup sit in a 3/3 policy's edge windows,
+        so warmup would never run the FP8 path; one step past both windows does."""
+        policy = SimpleNamespace(first_steps=3, last_steps=3)
+        pipeline = _bare_pipeline(transformer=SimpleNamespace(step_precision_controller=policy))
+        assert pipeline.default_warmup_steps == 7
+
+        # A distilled checkpoint still runs only its fixed schedule length.
+        pipeline = _bare_pipeline(
+            sampling=_distilled_policy(),
+            transformer=SimpleNamespace(step_precision_controller=policy),
+        )
+        assert pipeline.default_warmup_steps == 4
 
     @pytest.mark.parametrize(
         "policy_factory, expected_guidance",

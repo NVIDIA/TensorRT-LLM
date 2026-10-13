@@ -28,7 +28,6 @@ so it never reaches the join.
 
 import faulthandler
 import itertools
-import os
 import threading
 import time
 
@@ -38,6 +37,7 @@ import torch
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     GPU_LEVEL,
     AttentionLayerConfig,
+    AttentionReusePolicy,
     BufferConfig,
     CudaStream,
     GpuCacheTierConfig,
@@ -45,17 +45,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     KVCacheManagerConfig,
 )
 
-KV_CACHE_MANAGER_V2_BACKEND = os.environ.get("TLLM_KV_CACHE_MANAGER_V2_BACKEND", "cpp").lower()
-
-pytestmark = [
-    pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA"),
-    # The pure-Python backend is not thread-safe: it relies on the GIL and has no API lock, so
-    # these tests would race against it rather than exercise the property they assert.
-    pytest.mark.skipif(
-        KV_CACHE_MANAGER_V2_BACKEND != "cpp",
-        reason="GIL-free API locking exists only in the C++ backend",
-    ),
-]
+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 
 # Generous relative to the work each test does (milliseconds); tight enough that a deadlock fails
 # the run in reasonable time rather than hanging it.
@@ -187,6 +177,56 @@ def _await_antagonist(antagonist: threading.Thread, hits: dict) -> None:
         assert antagonist.is_alive(), "antagonist thread exited before running a priority callback"
         assert time.monotonic() < deadline, "antagonist thread never reached the priority callback"
         time.sleep(0.001)
+
+
+def test_optional_selection_and_resume_with_concurrent_priority_callbacks() -> None:
+    """Candidate claims and selection share the ordinary resume lock/GIL contract."""
+    config = _make_config()
+    config.layers = [
+        *config.layers,
+        AttentionLayerConfig(
+            layer_id=1,
+            buffers=[BufferConfig(role="key", size=4096)],
+            sliding_window_size=4,
+            reuse_policy=AttentionReusePolicy.OPTIONAL,
+        ),
+    ]
+    manager = KVCacheManager(config)
+    source = None
+    try:
+        tokens = list(range(100000, 100008))
+        stream = CudaStream(torch.cuda.Stream().cuda_stream)
+        source = manager.create_kv_cache(None, [])
+        assert source.resume(stream)
+        assert source.resize(len(tokens))
+        source.commit(tokens, is_end=True)
+        source.suspend()
+        group = manager.get_layer_group_id(1)
+        stop = threading.Event()
+        hits = {"n": 0}
+        antagonist = _priority_callback_antagonist(manager, stop, hits)
+        antagonist.start()
+        try:
+            _await_antagonist(antagonist, hits)
+            for iteration in range(50):
+                reader = manager.create_kv_cache(None, tokens)
+                try:
+                    status = next(s for s in reader.reuse_status if s.group_id == group)
+                    assert status.complete and status.endpoint == len(tokens)
+                    selected = [group] if iteration % 2 else []
+                    assert reader.resume(stream, optional_reuse_groups=selected)
+                    reader.suspend()
+                    assert reader.resume(stream)
+                finally:
+                    reader.close()
+            assert manager.probe_reuse(None, tokens) == len(tokens)
+        finally:
+            stop.set()
+            _join(antagonist)
+    finally:
+        if source is not None:
+            source.close()
+        manager.shutdown()
 
 
 def test_capacity_and_history_length_setters_do_not_deadlock() -> None:

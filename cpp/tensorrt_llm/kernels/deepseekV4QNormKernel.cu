@@ -168,6 +168,13 @@ void dispatchDeepseekV4QNorm(
 // (kPairsPerLane-1) iterations cover the nope range and the last iteration
 // covers the rope range exactly.
 
+// `applyNorm`: false makes the RMS scale an identity, for models that have no
+// per-head query norm at all (V4.1 deleted V4's). The norm here carries no learned
+// weight -- it is one per-row scalar -- so skipping it is exactly `normScale = 1`,
+// and the warp reduction that produced it goes with it. Runtime rather than a fifth
+// template parameter: the branch is warp-uniform, and the instantiation set is
+// already 8-way (2 dtypes x kFuseRope x kWideVec).
+//
 // `kFuseRope`: rotate the rope segment here too and store it FP8 in the same row.
 // Register-local -- `kRopePairs == kWarpSize`, so lane `l` owns rope pair `l` and
 // needs only one float2 of cos/sin.
@@ -180,7 +187,7 @@ void dispatchDeepseekV4QNorm(
 template <typename T, int kHeadDim, int kNopeDim, bool kFuseRope = false, bool kWideVec = true>
 __global__ void deepseekV4QNormFusedKernel(T const* __restrict__ input, __nv_fp8_e4m3* __restrict__ quant_q_nope,
     T* __restrict__ q_pe_out, float const* __restrict__ quant_scale_qkv_ptr, int totalRows,
-    int quantQNopeRowStrideBytes, float eps, float2 const* __restrict__ cos_sin_cache = nullptr,
+    int quantQNopeRowStrideBytes, float eps, bool applyNorm, float2 const* __restrict__ cos_sin_cache = nullptr,
     int const* __restrict__ cache_seq_lens = nullptr, int num_heads = 0, int seq_len = 0,
     int const* __restrict__ cu_q_seqlens = nullptr, int num_seqs = 0, int num_heads_shift = -1, int seq_len_shift = -1)
 {
@@ -272,8 +279,15 @@ __global__ void deepseekV4QNormFusedKernel(T const* __restrict__ input, __nv_fp8
         }
     }
 
-    sumSquares = warpReduceSum(sumSquares);
-    float const normScale = rsqrtf(sumSquares / static_cast<float>(kHeadDim) + eps);
+    // The per-lane squares above stay unconditional: they ride along with loads this
+    // path needs anyway, and branching inside the unrolled loop would cost the norming
+    // model. The cross-lane reduction is what is worth skipping.
+    float normScale = 1.0F;
+    if (applyNorm)
+    {
+        sumSquares = warpReduceSum(sumSquares);
+        normScale = rsqrtf(sumSquares / static_cast<float>(kHeadDim) + eps);
+    }
     float const fp8Scale = normScale * quantScale;
 
     // Position depends on the token, which every lane of the warp shares, so this is
@@ -410,8 +424,8 @@ __global__ void deepseekV4QNormFusedKernel(T const* __restrict__ input, __nv_fp8
 template <typename T>
 void dispatchDeepseekV4QNormFused(void const* input, void* quant_q_nope, void* q_pe_out,
     void const* quant_scale_qkv_ptr, int totalRows, int headDim, int nopeDim, int quantQNopeRowStrideBytes, float eps,
-    void const* cos_sin_cache, int const* cache_seq_lens, int num_heads, int seq_len, int const* cu_q_seqlens,
-    int num_seqs, cudaStream_t stream)
+    bool applyNorm, void const* cos_sin_cache, int const* cache_seq_lens, int num_heads, int seq_len,
+    int const* cu_q_seqlens, int num_seqs, cudaStream_t stream)
 {
     TLLM_CHECK_WITH_INFO(headDim == 512, "deepseekV4QNormFused only supports head_dim=512, got %d", headDim);
     TLLM_CHECK_WITH_INFO(nopeDim == 448, "deepseekV4QNormFused only supports nope_dim=448, got %d", nopeDim);
@@ -457,7 +471,7 @@ void dispatchDeepseekV4QNormFused(void const* input, void* quant_q_nope, void* q
             tensorrt_llm::common::launchWithPdlWhenEnabled("deepseekV4QNormFused",
                 deepseekV4QNormFusedKernel<T, 512, 448, true, kWide>, grid, block, 0, stream,
                 static_cast<T const*>(input), static_cast<__nv_fp8_e4m3*>(quant_q_nope), static_cast<T*>(q_pe_out),
-                static_cast<float const*>(quant_scale_qkv_ptr), totalRows, quantQNopeRowStrideBytes, eps,
+                static_cast<float const*>(quant_scale_qkv_ptr), totalRows, quantQNopeRowStrideBytes, eps, applyNorm,
                 static_cast<float2 const*>(cos_sin_cache), cache_seq_lens, num_heads, seq_len, cu_q_seqlens, num_seqs,
                 num_heads_shift, seq_len_shift);
         }
@@ -466,7 +480,7 @@ void dispatchDeepseekV4QNormFused(void const* input, void* quant_q_nope, void* q
             tensorrt_llm::common::launchWithPdlWhenEnabled("deepseekV4QNormFused",
                 deepseekV4QNormFusedKernel<T, 512, 448, false, kWide>, grid, block, 0, stream,
                 static_cast<T const*>(input), static_cast<__nv_fp8_e4m3*>(quant_q_nope), static_cast<T*>(q_pe_out),
-                static_cast<float const*>(quant_scale_qkv_ptr), totalRows, quantQNopeRowStrideBytes, eps,
+                static_cast<float const*>(quant_scale_qkv_ptr), totalRows, quantQNopeRowStrideBytes, eps, applyNorm,
                 static_cast<float2 const*>(nullptr), static_cast<int const*>(nullptr), 0, 0,
                 static_cast<int const*>(nullptr), 0, -1, -1);
         }
@@ -504,8 +518,8 @@ void invokeDeepseekV4QNorm(
 
 void invokeDeepseekV4QNormFusedFp8(void const* input, void* quant_q_nope, void* q_pe_out,
     void const* quant_scale_qkv_ptr, int totalRows, int headDim, int nopeDim, int quantQNopeRowStrideBytes,
-    bool isBfloat16, float eps, void const* cos_sin_cache, int const* cache_seq_lens, int num_heads, int seq_len,
-    int const* cu_q_seqlens, int num_seqs, cudaStream_t stream)
+    bool isBfloat16, float eps, bool applyNorm, void const* cos_sin_cache, int const* cache_seq_lens, int num_heads,
+    int seq_len, int const* cu_q_seqlens, int num_seqs, cudaStream_t stream)
 {
     if (totalRows == 0)
     {
@@ -515,14 +529,14 @@ void invokeDeepseekV4QNormFusedFp8(void const* input, void* quant_q_nope, void* 
     if (isBfloat16)
     {
         dispatchDeepseekV4QNormFused<__nv_bfloat16>(input, quant_q_nope, q_pe_out, quant_scale_qkv_ptr, totalRows,
-            headDim, nopeDim, quantQNopeRowStrideBytes, eps, cos_sin_cache, cache_seq_lens, num_heads, seq_len,
-            cu_q_seqlens, num_seqs, stream);
+            headDim, nopeDim, quantQNopeRowStrideBytes, eps, applyNorm, cos_sin_cache, cache_seq_lens, num_heads,
+            seq_len, cu_q_seqlens, num_seqs, stream);
     }
     else
     {
         dispatchDeepseekV4QNormFused<half>(input, quant_q_nope, q_pe_out, quant_scale_qkv_ptr, totalRows, headDim,
-            nopeDim, quantQNopeRowStrideBytes, eps, cos_sin_cache, cache_seq_lens, num_heads, seq_len, cu_q_seqlens,
-            num_seqs, stream);
+            nopeDim, quantQNopeRowStrideBytes, eps, applyNorm, cos_sin_cache, cache_seq_lens, num_heads, seq_len,
+            cu_q_seqlens, num_seqs, stream);
     }
 }
 

@@ -259,13 +259,22 @@ class PipelineLoader:
         _attn_backend = config.attention.backend
         _sa_cfg = config.attention.sparse_attention_config
         if (
-            _attn_backend == "CUTEDSL"
+            _attn_backend in ("CUTEDSL", "TRTLLM")
             and _sa_cfg is not None
             and getattr(_sa_cfg, "algorithm", None) == "vsa"
         ):
-            kernel_path = "CuTe DSL block-sparse" if CUTE_AVAILABLE else "dense SDPA fallback"
+            if _attn_backend == "CUTEDSL":
+                kernel_path = (
+                    "CuTe DSL block-sparse when supported; dense SDPA fallback otherwise"
+                    if CUTE_AVAILABLE
+                    else "dense SDPA fallback"
+                )
+            else:
+                kernel_path = (
+                    "PrimTS block-sparse when supported; compact dense TRTLLM fallback otherwise"
+                )
             logger.info(
-                f"Attention backend: CUTEDSL (algorithm=vsa, "
+                f"Attention backend: {_attn_backend} (algorithm=vsa, "
                 f"sparsity={_sa_cfg.vsa_sparsity}, fine-stage={kernel_path})"
             )
         else:

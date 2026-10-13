@@ -237,7 +237,13 @@ else()
   list(APPEND CUDA_TOOLKIT_COMPONENTS nvrtc_static nvrtc_builtins_static)
 endif()
 
-find_package(CUDAToolkit 11.2 REQUIRED COMPONENTS ${CUDA_TOOLKIT_COMPONENTS})
+# TRT-LLM currently validates CUDA 13.x toolkits. Require CUDA major version 13
+# or newer to align with that coverage.
+find_package(CUDAToolkit 13.0 REQUIRED COMPONENTS ${CUDA_TOOLKIT_COMPONENTS})
+
+if(NOT WIN32)
+  find_package(NUMA REQUIRED)
+endif()
 
 set(CMAKE_CUDA_RUNTIME_LIBRARY Static)
 
