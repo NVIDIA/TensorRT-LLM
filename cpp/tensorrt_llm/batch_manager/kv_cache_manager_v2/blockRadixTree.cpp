@@ -227,7 +227,7 @@ BlockKey RootBlock::makeKey(ReuseScope const& reuseScope)
 }
 
 RootBlock::RootBlock(ReuseScope reuseScope_, BlockRadixTree* treePtr)
-    : NodeBase(makeKey(reuseScope_), treePtr->eventSink().get(), reuseScope_.cacheSalt)
+    : NodeBase(makeKey(reuseScope_), treePtr->eventSink().get(), reuseScope_.originalCacheSalt)
     , reuseScope(std::move(reuseScope_))
     , tree(treePtr)
 {
@@ -312,7 +312,7 @@ BlockKey Block::makeKey(BlockKey const& prevKey, TokenIdExt const* tokens, size_
 }
 
 Block::Block(BlockKey k, std::vector<TokenIdExt> toks, NodeBase* prevNode)
-    : NodeBase(k, prevNode->eventSink, prevNode->cacheSalt)
+    : NodeBase(k, prevNode->eventSink, prevNode->originalCacheSalt)
     , tokens(std::move(toks))
     , prev(prevNode)
     , storage(prevNode->numLifeCycles(), nullptr) // tree-wide count, derived from prev

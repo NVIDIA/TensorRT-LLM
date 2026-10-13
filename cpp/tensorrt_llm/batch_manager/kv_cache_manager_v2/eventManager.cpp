@@ -560,7 +560,8 @@ std::optional<KVCacheStoredBlockData> EventManager::storedBlockFromBlock(
         tokens.push_back(UniqueToken{std::move(tokenId)});
     }
     return KVCacheStoredBlockData{hashFromBlock(block), std::move(tokens), cacheLevel.value(), priority,
-        std::move(decoded.mmKeys), block.cacheSalt ? std::optional<std::string>(*block.cacheSalt) : std::nullopt};
+        std::move(decoded.mmKeys),
+        block.originalCacheSalt ? std::optional<std::string>(*block.originalCacheSalt) : std::nullopt};
 }
 
 uint64_t EventManager::hashV1BlockKey(std::vector<TokenId> const& tokens, uint64_t parentHash,
