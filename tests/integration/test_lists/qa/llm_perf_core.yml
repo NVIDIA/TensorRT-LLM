@@ -442,7 +442,7 @@ llm_perf_core:
       - '*gb110*'
       cpu: aarch64
   tests:
-  - perf/test_perf.py::test_perf[deepseek_v41_flash_nvfp4_dspark-serve-pytorch-streaming-float4-maxbs:32-maxnt:8192-kv_frac:0.5-input_output_len:8192,1024-reqs:32-con:1-ep:4-tp:4-gpus:4] TIMEOUT(120)
-  - perf/test_perf.py::test_perf[deepseek_v41_flash_nvfp4_dspark-serve-pytorch-streaming-float4-maxbs:32-maxnt:8192-kv_frac:0.5-input_output_len:8192,1024-reqs:128-con:8-ep:4-tp:4-gpus:4] TIMEOUT(120)
   - perf/test_perf.py::test_perf[deepseek_v41_flash_nvfp4-serve-pytorch-streaming-float4-maxbs:32-maxnt:8192-kv_frac:0.5-input_output_len:8192,1024-reqs:32-con:1-ep:4-tp:4-gpus:4] TIMEOUT(120)
   - perf/test_perf.py::test_perf[deepseek_v41_flash_nvfp4-serve-pytorch-streaming-float4-maxbs:32-maxnt:8192-kv_frac:0.5-input_output_len:8192,1024-reqs:128-con:8-ep:4-tp:4-gpus:4] TIMEOUT(120)
+  - perf/test_perf.py::test_perf[deepseek_v41_flash_nvfp4_dspark-serve-pytorch-streaming-float4-maxbs:32-maxnt:8192-kv_frac:0.5-input_output_len:8192,1024-reqs:32-con:1-ep:4-tp:4-gpus:4] TIMEOUT(120)
+  - perf/test_perf.py::test_perf[deepseek_v41_flash_nvfp4_dspark-serve-pytorch-streaming-float4-maxbs:32-maxnt:8192-kv_frac:0.5-input_output_len:8192,1024-reqs:128-con:8-ep:4-tp:4-gpus:4] TIMEOUT(120)
