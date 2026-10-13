@@ -158,28 +158,34 @@ def release_symm_buffer_cache() -> None:
     """
     if not _MEGA_MOE_SYMM_BUFFER_CACHE:
         return
-    # Detach before freeing so a raising free cannot leave a half-destroyed
-    # buffer in the cache for a later lookup to trip over.
-    entries = list(_MEGA_MOE_SYMM_BUFFER_CACHE.values())
+    # Detach before freeing so successful entries cannot be reused while
+    # teardown is in progress. Failed entries are restored below so the worker
+    # can retry them before destroying their EP process group.
+    entries = list(_MEGA_MOE_SYMM_BUFFER_CACHE.items())
     _MEGA_MOE_SYMM_BUFFER_CACHE.clear()
-    # Free one at a time and keep going on failure: the entries are already
-    # out of the cache, so any buffer skipped by a raising predecessor would
-    # be unreclaimable for the rest of the process lifetime.
     released = 0
     total_bytes = 0
-    for buffered, _ in entries:
+    first_error = None
+    for key, (buffered, process_group) in entries:
         try:
             total_bytes += _free_symm_buffer(buffered)
             released += 1
-        except Exception as e:
+        except Exception as error:
+            _MEGA_MOE_SYMM_BUFFER_CACHE[key] = (buffered, process_group)
+            if first_error is None:
+                first_error = error
             logger.error(
                 f"[MegaMoE] failed to release a DG SymmBuffer during executor "
-                f"teardown, continuing with the remaining buffers: {e}"
+                f"teardown, retaining it for retry: {error}"
             )
     logger.info(
         f"[MegaMoE] released {released}/{len(entries)} DG SymmBuffer(s): "
         f"{total_bytes / 2**30:.2f} GiB"
     )
+    if first_error is not None:
+        raise RuntimeError(
+            f"failed to release {len(_MEGA_MOE_SYMM_BUFFER_CACHE)} MegaMoE DG SymmBuffer(s)"
+        ) from first_error
 
 
 # ---- Fused MXFP8 per-token quant backends --------------------------------

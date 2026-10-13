@@ -376,7 +376,8 @@ class SourceIdentity:
 
         Returns:
             A hex digest covering attention/MoE backends, allowed GEMM
-            backends, fusion flags, and the all-reduce strategy.
+            backends, fusion flags, the all-reduce strategy, and -- only when
+            one is configured -- the MoE rebalance config.
         """
         payload = {
             "attn_backend": getattr(model_config, "attn_backend", None),
@@ -401,6 +402,9 @@ class SourceIdentity:
             "use_cute_dsl_bf16_bmm": getattr(model_config, "use_cute_dsl_bf16_bmm", False),
             "use_cute_dsl_bf16_gemm": getattr(model_config, "use_cute_dsl_bf16_gemm", False),
         }
+        load_balancer = getattr(model_config, "moe_load_balancer", None)
+        if load_balancer is not None:
+            payload["moe_load_balancer"] = load_balancer.model_dump(mode="python")
         return _canonical_hash(payload)
 
     @staticmethod

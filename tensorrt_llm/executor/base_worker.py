@@ -16,6 +16,7 @@ import datetime
 import enum
 import gc
 import json
+import os
 import time
 import traceback
 import uuid
@@ -35,6 +36,7 @@ from .._torch.pyexecutor.llm_request import LlmResponse
 from .._utils import (global_mpi_rank, global_mpi_size, mpi_comm, mpi_rank,
                       nvtx_range_debug)
 from ..bindings import executor as tllm
+from ..llmapi._load_balance_env import configure_moe_launch_queues
 from ..llmapi.llm_args import BaseLlmArgs, ExecutorMemoryType
 from ..llmapi.tokenizer import TokenizerBase
 from ..llmapi.tracer import global_tracer
@@ -100,6 +102,15 @@ class BaseWorker(GenerationExecutor):
         tokenizer: Optional[TokenizerBase] = None,
         llm_args: Optional[BaseLlmArgs] = None,
     ) -> None:
+        # Direct worker construction also bypasses BaseLLM/worker_main.
+        if llm_args is not None and llm_args.env_overrides:
+            os.environ.update(llm_args.env_overrides)
+        if llm_args is not None and llm_args.backend == "pytorch":
+            queue_overrides = configure_moe_launch_queues(
+                getattr(llm_args, "moe_config", None), llm_args.env_overrides)
+            if queue_overrides is not llm_args.env_overrides:
+                llm_args.env_overrides = queue_overrides
+
         postproc_config = postproc_worker_config or PostprocWorkerConfig()
         super().__init__(
             num_postprocess_workers=postproc_config.num_postprocess_workers,
@@ -1017,16 +1028,50 @@ class BaseWorker(GenerationExecutor):
     def shutdown(self):
         if self.doing_shutdown:
             return
-        else:
-            self.doing_shutdown = True
+        self.doing_shutdown = True
 
-        if self.engine is not None:
-            can_shutdown = getattr(self.engine, "can_shutdown", None)
-            if can_shutdown is None:
-                can_shutdown = self.engine.can_enqueue_requests
-            if can_shutdown():
-                self.engine.shutdown()
-                self.engine = None
+        try:
+            if self.engine is not None:
+                engine = self.engine
+                engine_shutdown_completed = bool(
+                    getattr(self, "_engine_shutdown_completed", False))
+                can_shutdown = getattr(engine, "can_shutdown", None)
+                if can_shutdown is None:
+                    can_shutdown = engine.can_enqueue_requests
+                # PyExecutor separates leader-only shutdown publication from the
+                # all-rank join/finalize path. Other backends retain their gate.
+                # A retry must bypass that gate once shutdown already completed.
+                if (engine_shutdown_completed
+                        or getattr(engine, "shutdown_all_ranks", False)
+                        or can_shutdown()):
+                    shutdown_error = None
+                    local_safe = engine_shutdown_completed
+                    if not local_safe:
+                        try:
+                            engine.shutdown()
+                            self._engine_shutdown_completed = True
+                            local_safe = True
+                        except BaseException as error:
+                            shutdown_error = error
+                    terminal_cleanup = getattr(engine, "terminal_cleanup", None)
+                    if terminal_cleanup is not None:
+                        try:
+                            if getattr(engine, "shutdown_all_ranks", False):
+                                terminal_cleanup(local_safe=local_safe)
+                            elif local_safe:
+                                terminal_cleanup()
+                        except BaseException as error:
+                            if shutdown_error is None:
+                                shutdown_error = error
+                    if shutdown_error is not None:
+                        raise shutdown_error
+                    self.engine = None
+                    self._engine_shutdown_completed = False
+        except BaseException:
+            # Keep the engine reachable so a caller can retry a failed
+            # collective terminal cleanup in this long-lived worker process.
+            self.doing_shutdown = False
+            raise
 
     def get_disaggregated_params(self) -> dict:
         if self.engine is None or self.engine.kv_cache_transceiver is None:

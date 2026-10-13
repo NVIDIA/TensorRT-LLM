@@ -1,5 +1,26 @@
 schema_version: 1
 vendors:
+  cutedsl-megamoe:
+    url: https://gitlab-master.nvidia.com/bangyus/cutedsl_megamoe.git
+    branch: main
+    commit: 382ce4a6f111d0769f31c4c975e1c643f0dc4f70
+    source: sources
+    destination: tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe
+    include:
+    - '*.py'
+    - communication/**/*.py
+    - helpers/[!mt]*.py
+    - helpers/megamoe_aot.py
+    - helpers/topk_reduce.py
+    - kernel_src/*.py
+    - kernel_src/blackwell/*.py
+    - kernel_src/rubin/*.py
+    - kernel_src/*/inference/**/*.py
+    - kernel_src/schedulers/[!w]*.py
+    - kernel_src/schedulers/work_id_claim.py
+    patch: 3rdparty/vendor_patches/cutedsl-megamoe.patch
+    patch_digest: sha256:c8d074c17a259a2de98b611a8ce1a1a7796124841c56eda511797a0dbc7fe284
+    digest: sha256-tree-v1:698ba8b2d2a4ae7bd370fb135aed38c0097562cb1623b01392dc7fd27b256b2e
   flashinfer-prims-ts:
     url: https://github.com/yuxianq/flashinfer.git
     branch: trtllm-prims-ts-dev-20261012
@@ -11,6 +32,18 @@ vendors:
     patch: 3rdparty/vendor_patches/flashinfer-prims-ts.patch
     patch_digest: sha256:65cc08e20a9cc7bdc190eb6f3e79124986dced74394c1f3250ae2d100a8ee340
     digest: sha256-tree-v1:e411b6c6679474d362b166e586df4276f52322d75a35c59c782d6266143e560e
+  megamoe-scheduler:
+    url: https://gitlab-master.nvidia.com/jintaop/cutedsl_eplb_scheduler_copy.git
+    branch: trtllm/pr-19646-single-plane-spec
+    commit: 4dc8616031b18dd948bdf11b49afe0d86be15e22
+    source: megamoe_scheduler
+    destination: tensorrt_llm/_torch/cute_dsl_kernels/megamoe_scheduler
+    include:
+    - __init__.py
+    - cuda_scheduler/*.py
+    - geometry.py
+    - sami/*.py
+    digest: sha256-tree-v1:00210684fbffaa623fc00839bcacce000650db9090cf7a1a07bdd0ef3a9afc33
   openengine-proto:
     url: https://github.com/ai-dynamo/openengine.git
     tag: v0.1.0
