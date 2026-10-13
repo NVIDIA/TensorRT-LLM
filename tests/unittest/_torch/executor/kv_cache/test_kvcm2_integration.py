@@ -2992,6 +2992,7 @@ def _make_fresh_fill_manager(
     monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
     manager = object.__new__(KVCacheManagerV2)
     manager._fresh_page_fill = fill_value
+    manager.layer_specs = None
     manager._fresh_pages_filled = {}
     manager._fresh_fill_announced = True
     manager.kv_cache_map = {1: kv_cache}
@@ -3287,6 +3288,7 @@ def test_warmup_zeroing_preserves_guard_page(monkeypatch: pytest.MonkeyPatch) ->
 
     manager = object.__new__(KVCacheManagerV2)
     manager.layer_offsets = {0: 0}
+    manager.layer_specs = None
     manager.layer_to_pool_mapping_dict = {0: 0}
     manager.get_buffers = lambda layer_idx, kv_layout="NHD": buffer
     manager._guard_page_by_layer = {0: guard_page}

@@ -2381,7 +2381,8 @@ class KVCacheManagerV2(BaseResourceManager):
                 scale = self.get_layer_page_index_scale(layer_idx)
                 layer_offset = self.layer_offsets[layer_idx]
                 kv_factor = self._get_layer_kv_factor_by_local_id(layer_offset)
-                pages = [page * scale // kv_factor for page in fresh]
+                view_stride = self._get_cache_view_page_stride(scale, kv_factor)
+                pages = [page * scale // view_stride for page in fresh]
                 pages = [page for page in pages if 0 <= page < buffer.shape[0]]
                 if pages:
                     if _fill_kv_pages(buffer, pages, self._fresh_page_fill):
@@ -3498,6 +3499,7 @@ class KVCacheManagerV2(BaseResourceManager):
         )
 
     def get_buffers(self, layer_idx: int, kv_layout: str = "NHD") -> Optional[torch.Tensor]:
+        """Return a zero-copy KV view; its slot dimension may be strided."""
         layer_offset = self.layer_offsets[layer_idx]
         addr_key = self.impl.get_mem_pool_base_address(layer_offset, Role.KEY, PageIndexMode.SHARED)
         layer_kv_factor = self._get_layer_kv_factor_by_local_id(layer_offset)
@@ -3536,13 +3538,27 @@ class KVCacheManagerV2(BaseResourceManager):
                 layer_head_dim // element_per_container,
             ]
 
-        return convert_to_torch_tensor(
-            TensorWrapper(
-                addr_key,
-                dtype,
-                shape,
+        wrapper = TensorWrapper(addr_key, dtype, shape)
+        scale = self.get_layer_page_index_scale(layer_idx)
+        view_stride = self._get_cache_view_page_stride(scale, layer_kv_factor)
+        if view_stride != layer_kv_factor:
+            # A slot containing, for example, three buffers cannot be indexed
+            # as contiguous K/V pairs. Expose only this layer's buffers with
+            # the physical slot stride, indexed by raw slot IDs.
+            converter = self.impl.get_page_index_converter(layer_offset, Role.KEY)
+            page_upper = self.impl.get_page_index_upper_bound(layer_offset, Role.KEY)
+            shape[0] = exact_div(page_upper + int(converter.layer_offset), scale)
+            element_size = torch.empty(0, dtype=wrapper.dtype).element_size()
+            page_elements = exact_div(
+                self.impl.get_page_stride(layer_offset, Role.KEY), element_size
             )
-        )
+            wrapper.shape = shape
+            wrapper.strides = [
+                view_stride * page_elements,
+                page_elements,
+                *[math.prod(shape[i + 1 :]) for i in range(2, len(shape))],
+            ]
+        return convert_to_torch_tensor(wrapper)
 
     def get_index_k_buffer(
         self,
@@ -5677,10 +5693,17 @@ class KVCacheManagerV2(BaseResourceManager):
         )
 
     def get_block_ids_per_seq(self, request_ids: List[int]) -> torch.Tensor:
-        block_ids_per_seq = self.get_batch_cache_indices(request_ids)
+        if self.layer_specs is not None:
+            block_ids_per_seq = self.get_batch_cache_indices(request_ids, raw_indices=True)
+            div_factor = 1
+        else:
+            block_ids_per_seq = self.get_batch_cache_indices(request_ids)
+            div_factor = self.num_local_layers
+            if self.kv_factor > 1 and self._index_scale_ints[0] % self.kv_factor != 0:
+                div_factor = 1
         block_ids_per_seq_tensors = [
             torch.tensor(
-                [i // self.num_local_layers if i != BAD_PAGE_INDEX else 0 for i in sublist],
+                [i // div_factor if i != BAD_PAGE_INDEX else 0 for i in sublist],
                 dtype=torch.int,
             )
             for sublist in block_ids_per_seq
@@ -5982,6 +6005,15 @@ class KVCacheManagerV2(BaseResourceManager):
         must not use the pool-level scale."""
         return int(self.impl.get_page_index_scale(self.layer_offsets[layer_idx], Role.KEY))
 
+    @staticmethod
+    def _get_cache_view_page_stride(index_scale: int, kv_factor: int) -> int:
+        """Physical buffer pages between rows of the KV tensor view.
+
+        Contiguous K/V rows are usable only when every slot starts on a row
+        boundary. Otherwise, rows span whole slots and use unscaled slot IDs.
+        """
+        return kv_factor if index_scale % kv_factor == 0 else index_scale
+
     def get_batch_cache_indices(
         self,
         request_ids: List[int],
@@ -5990,7 +6022,10 @@ class KVCacheManagerV2(BaseResourceManager):
         *,
         raw_indices: bool = False,
     ) -> List[List[int]]:
-        """Return cache indices for a layer, or pool 0 when no layer is given.
+        """Return indices into a layer's ``get_buffers()`` view.
+
+        With explicit specs, omitting the layer selects pool 0's KEY
+        representative. Callers accessing other layers must pass their IDs.
 
         Set raw_indices for slot-major views that need base slot IDs without
         page-index scaling or KV aggregation.
@@ -5998,7 +6033,11 @@ class KVCacheManagerV2(BaseResourceManager):
         if layer_idx is None:
             pool_id = 0
             index_scale = 1 if raw_indices else None
-            kv_factor = self.kv_factor
+            kv_factor = (
+                self._get_layer_kv_factor_by_local_id(self._pool_layer_ids_by_role[(0, Role.KEY)])
+                if self.layer_specs is not None
+                else self.kv_factor
+            )
         else:
             pool_id = self.layer_to_pool_mapping_dict[self.layer_offsets[layer_idx]]
             index_scale = 1 if raw_indices else self.get_layer_page_index_scale(layer_idx)
@@ -6022,15 +6061,15 @@ class KVCacheManagerV2(BaseResourceManager):
         index_scale: Optional[int] = None,
         kv_factor: Optional[int] = None,
     ) -> List[List[int]]:
-        if is_kv_aggregate:
-            # Div by kv_factor to index kv cache with size
-            # [num_blocks, kv_factor, tokens_per_block, num_kv_heads, head_dim]
-            div_factor = self.kv_factor if kv_factor is None else kv_factor
-        else:
-            div_factor = 1
-
         if index_scale is None:
             index_scale = int(self.index_scales[pool_id])
+        div_factor = (
+            self._get_cache_view_page_stride(
+                index_scale, self.kv_factor if kv_factor is None else kv_factor
+            )
+            if is_kv_aggregate
+            else 1
+        )
         res = []
 
         for req_idx, req_id in enumerate(request_ids):
@@ -6074,7 +6113,11 @@ class KVCacheManagerV2(BaseResourceManager):
         if layer_idx is None:
             pool_id = 0
             scale = self._index_scale_ints[pool_id]
-            div_factor = self.kv_factor
+            kv_factor = (
+                self._get_layer_kv_factor_by_local_id(self._pool_layer_ids_by_role[(0, Role.KEY)])
+                if self.layer_specs is not None
+                else self.kv_factor
+            )
         else:
             pool_id = self.layer_to_pool_mapping_dict[self.layer_offsets[layer_idx]]
             # Layers sharing a pool can still require different page-index
@@ -6082,7 +6125,8 @@ class KVCacheManagerV2(BaseResourceManager):
             # scale so this flat block table matches get_batch_cache_indices()
             # and never feeds out-of-range page ids to FlashInfer.
             scale = self.get_layer_page_index_scale(layer_idx)
-            div_factor = self.get_layer_kv_factor(layer_idx)
+            kv_factor = self.get_layer_kv_factor(layer_idx)
+        div_factor = self._get_cache_view_page_stride(scale, kv_factor)
 
         out_tensor = torch.empty(sum(num_blocks), dtype=torch.int32, pin_memory=prefer_pinned())
         out = out_tensor.numpy()
@@ -6188,11 +6232,25 @@ class KVCacheManagerV2(BaseResourceManager):
     def _iter_cache_buffers_for_invalid_check(self) -> Iterable[Tuple[int, torch.Tensor]]:
         pool_handled = set()
         for layer_id, layer_offset in self.layer_offsets.items():
-            pool_id = self.layer_to_pool_mapping_dict[layer_offset]
-            if pool_id in pool_handled:
-                continue
             buffer = self.get_buffers(layer_id)
             if buffer is None:
+                continue
+            if self.layer_specs is not None:
+                # Inspect each explicit layer's own rows, without reading
+                # another layer's bytes through the wrong dtype.
+                scale = self.get_layer_page_index_scale(layer_id)
+                view_stride = self._get_cache_view_page_stride(
+                    scale, self.get_layer_kv_factor(layer_id)
+                )
+                yield layer_id, buffer[:: exact_div(scale, view_stride)]
+                continue
+            if buffer.stride(0) != math.prod(buffer.shape[1:]):
+                # Slot-strided views cover only one layer, including legacy
+                # layouts that coalesce extra buffers alongside K/V.
+                yield layer_id, buffer
+                continue
+            pool_id = self.layer_to_pool_mapping_dict[layer_offset]
+            if pool_id in pool_handled:
                 continue
             yield layer_id, buffer
             pool_handled.add(pool_id)
@@ -6218,10 +6276,16 @@ class KVCacheManagerV2(BaseResourceManager):
                 # before inference, but that must not wipe the guard-page
                 # sentinel -- doing so would leave the startup warning claiming
                 # a guard that no longer exists. Rewrite the guard page after
-                # the zero. Each pool is zeroed on one representative layer, so
-                # only that layer's guard page needs restoring here.
+                # the zero. Explicit specs expose one view per layer here;
+                # contiguous legacy views use a single representative.
                 guard_page = self._guard_page_by_layer.get(layer_id)
                 if guard_page is not None and self._guard_page_value is not None:
+                    if self.layer_specs is not None:
+                        scale = self.get_layer_page_index_scale(layer_id)
+                        view_stride = self._get_cache_view_page_stride(
+                            scale, self.get_layer_kv_factor(layer_id)
+                        )
+                        guard_page = exact_div(guard_page, exact_div(scale, view_stride))
                     _fill_kv_pages(buffer, [guard_page], self._guard_page_value)
         torch.cuda.synchronize()
 
