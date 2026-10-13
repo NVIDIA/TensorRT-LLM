@@ -398,9 +398,11 @@ class Ladder:
         min_gain: float = 0.03,
         noise_factor: float = 2.0,
         target_mode: bool = True,
+        reprobe_min: float = 0.005,
         log: Callable[[str], None] = print,
     ) -> None:
         self.workdir = workdir
+        self.reprobe_min = reprobe_min
         self.base_configs = list(base_configs)
         self.bench = bench
         self.runner = runner
@@ -678,8 +680,11 @@ class Ladder:
             self.state.save(self.state_path)
             self._write_final()
             return False
-        # Rungs that were neutral get one more chance against the new control;
-        # rejected and failed rungs do not, and nothing from a kept group re-runs.
+        # A neutral rung that came close (best delta >= reprobe_min) gets one more
+        # chance against the new control; a flat one does not: with same-host
+        # noise at 0.1-0.4%, a rung flat at wave 0 rarely flips, and re-probing
+        # every neutral rung costs a whole wave. Rejected and failed rungs never
+        # re-run, nor does anything from a kept group.
         kept_groups = {self.rungs[n].group or n for n in st.kept}
         adoption = st.history[-1].get("label") if st.history else ""
         st.wave += 1
@@ -687,7 +692,7 @@ class Ladder:
         st.control_labels = [adoption] if adoption else []
         for rs in st.rungs.values():
             group = self.rungs[rs.name].group or rs.name
-            if rs.status == "neutral" and group not in kept_groups:
+            if rs.status == "neutral" and group not in kept_groups and max(rs.deltas.values() or [0.0]) >= self.reprobe_min:
                 rs.status, rs.label, rs.verdict, rs.reason, rs.deltas = "pending", "", "", "", {}
         if not any(rs.status == "pending" for rs in st.rungs.values()):
             st.phase = "done"

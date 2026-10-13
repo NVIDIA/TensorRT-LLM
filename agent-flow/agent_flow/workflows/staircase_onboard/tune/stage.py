@@ -230,7 +230,8 @@ class TuneStage:
             lad = Ladder(
                 workdir=s.workdir / "ladder", base_configs=s.identity_configs, rungs=rungs, bench=s.bench(),
                 runner=self.runners(s.spools, "tunel"), min_gain=float(cfg.get("min_gain", 0.01)),
-                noise_factor=float(cfg.get("noise_factor", 3.0)), log=self.log,
+                noise_factor=float(cfg.get("noise_factor", 3.0)), reprobe_min=float(cfg.get("reprobe_min", 0.005)),
+                log=self.log,
             )  # fmt: skip
             seeds = [self.data / l for l in ["t-baseline", *[f"t-baseline-r{i}" for i in range(1, s.noise_repeats + 1)]]]
             lad.seed_controls([p for p in seeds if (p / "meta.json").exists()])

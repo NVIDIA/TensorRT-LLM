@@ -212,3 +212,26 @@ def test_a_job_on_a_session_that_died_is_reported_lost(tmp_path):
     runner.inflight["camp-e2e-x"] = (str(spool), "e2e-x")
     assert runner.poll() == [("e2e-x", str(spool), 212)]
     assert not (spool / "running" / "camp-e2e-x.sh").exists() and not runner.inflight
+
+
+def test_only_near_miss_neutral_rungs_are_probed_again(tmp_path):
+    """After a keep, a neutral rung that came within reach (+0.7%) is measured against the
+    new control; a flat one (+0.0%) is not -- re-probing every neutral rung costs a wave."""
+
+    def effect(config, label):
+        lat = 100.0 * (1.05 if config.get("enable_in_graph_sampling") else 1.0)
+        return lat * (1.007 if config.get("stream_interval") == 4 else 1.0), 2000.0
+
+    rungs = [r for r in default_rungs() if r.name in ("in-graph-sampling", "stream-interval-4", "gc-gen0-100k")]
+    base = tmp_path / "identity.yaml"
+    base.write_text(yaml.safe_dump({"modeling_v2": "require", "max_batch_size": 128}))
+    bench = BenchSpec(bench_py="bench.py", model="m", env_script="env.sh", isl=8192, osl=1024, concurrencies=[1, 128], tree=".")
+    runner = FakeRunner(["s1", "s2", "s3"], tmp_path / "work" / "data", effect)
+    ladder = Ladder(workdir=tmp_path / "work", base_configs=[base], rungs=rungs, bench=bench, runner=runner,
+                    min_gain=0.01, noise_factor=1.0, log=lambda m: None)
+    for _ in range(80):
+        if not ladder.step():
+            break
+    probes = [l for l in runner.submitted if "control" not in l and "combine" not in l]
+    assert sum("stream-interval-4" in l for l in probes) == 2, probes
+    assert sum("gc-gen0-100k" in l for l in probes) == 1, probes
