@@ -5164,6 +5164,9 @@ class PyTorchModelEngine(ModelEngine):
         # will contain previous batch indices of generation requests
         previous_batch_indices = []
         previous_pos_indices = []
+        # Save KDA sampler slots before the packing loops update py_batch_idx.
+        previous_slot_by_request: dict[int, int] | None = ({} if getattr(
+            kv_cache_manager, "use_kda_replay_update", False) else None)
         runtime_tokens_per_gen_step = self.get_runtime_tokens_per_gen_step(
             runtime_draft_len)
         runtime_draft_token_buffer_width = runtime_tokens_per_gen_step - 1
@@ -5240,6 +5243,9 @@ class PyTorchModelEngine(ModelEngine):
             else:
                 # update batch index
                 previous_batch_idx = request.py_batch_idx
+                if previous_slot_by_request is not None:
+                    previous_slot_by_request[
+                        request.py_request_id] = previous_batch_idx
                 request.py_batch_idx = request.py_seq_slot
 
                 sequence_lengths.append(runtime_tokens_per_gen_step)
@@ -5402,6 +5408,10 @@ class PyTorchModelEngine(ModelEngine):
                     # the request has previous tensor
                     # previous_batch_indices is per-request, not per-beam
                     previous_batch_indices.append(request.py_batch_idx)
+                    if (previous_slot_by_request is not None
+                            and new_tokens_lens_device is not None):
+                        previous_slot_by_request[
+                            request.py_request_id] = request.py_batch_idx
                     past_seen_token_num = request.max_beam_num_tokens
                     request_has_previous_tensor = True
 
@@ -5802,23 +5812,17 @@ class PyTorchModelEngine(ModelEngine):
         # that the per-step prepare() can re-clamp from scratch.
         num_cached_tokens_snapshot = list(num_cached_tokens_per_seq)
         attn_metadata.prepare()
-        if getattr(kv_cache_manager, "use_kda_replay_update", False):
-            previous_slots, accepted_draft_tokens, generation_start = self._prepare_prev_num_accepted_tokens(
+        if previous_slot_by_request is not None:
+            previous_slots, accepted_draft_tokens = self._prepare_prev_num_accepted_tokens(
                 attn_metadata=attn_metadata,
                 generation_requests=scheduled_requests.generation_requests,
-                previous_new_tokens_lens=new_tokens_lens_device,
                 promoted_context_request_ids=promoted_context_request_ids,
-                previous_batch_len=previous_batch_len,
-                previous_batch_start=(scheduled_requests.num_context_requests +
-                                      len(extend_requests) -
-                                      len(extend_dummy_requests) -
-                                      previous_batch_len),
+                previous_slot_by_request=previous_slot_by_request,
             )
             attn_metadata.mamba_metadata.prepare_prev_num_accepted_tokens(
                 previous_slots=previous_slots,
                 accepted_draft_tokens=accepted_draft_tokens,
-                previous_new_tokens_lens=new_tokens_lens_device,
-                generation_start=generation_start)
+                previous_new_tokens_lens=new_tokens_lens_device)
         cross_attention_inputs = (self._prepare_enc_dec_cross_attn_inputs(
             cross_encoder_hidden_states,
             cross_encoder_seq_lens,
@@ -6035,12 +6039,10 @@ class PyTorchModelEngine(ModelEngine):
         *,
         attn_metadata: AttentionMetadata,
         generation_requests: list[LlmRequest],
-        previous_new_tokens_lens: Optional[torch.Tensor],
         promoted_context_request_ids: frozenset[int],
-        previous_batch_len: int,
-        previous_batch_start: int,
-    ) -> Tuple[Optional[torch.Tensor], list[int], int]:
-        """Return GPU slots, CPU fallback counts, and the first generation row."""
+        previous_slot_by_request: dict[int, int],
+    ) -> tuple[list[int | None], list[int]]:
+        """Return previous sampler slots and CPU counts in generation-row order."""
         batch_size = attn_metadata.seq_lens.shape[0]
         num_contexts = attn_metadata.num_contexts
         # CPU counts already exclude the golden token. Use them for real
@@ -6051,30 +6053,15 @@ class PyTorchModelEngine(ModelEngine):
             for request in generation_requests if not request.is_dummy
             and request.py_request_id not in promoted_context_request_ids
         }
-        request_ids = attn_metadata.request_ids or []
-        accepted_draft_tokens = [
-            host_counts.get(request_id, 0)
-            for request_id in request_ids[num_contexts:batch_size]
+        request_ids = (attn_metadata.request_ids or [])[num_contexts:batch_size]
+        previous_slots = [
+            previous_slot_by_request.get(request_id)
+            for request_id in request_ids
         ]
-        # With overlap, the latest acceptance counts are in the GPU sampler
-        # buffer. Pass a view of the valid slots so K3 metadata can gather
-        # directly into its replay buffer without an intermediate allocation.
-        if previous_new_tokens_lens is not None:
-            previous_slots = self.previous_batch_indices_cuda[:
-                                                              previous_batch_len]
-            # The engine's uploaded slots describe a contiguous batch interval.
-            # Exclude any extend-context rows, which do not replay drafts.
-            first_row = max(num_contexts, previous_batch_start)
-            last_row = min(batch_size,
-                           previous_batch_start + previous_slots.numel())
-            if first_row < last_row:
-                first_slot = first_row - previous_batch_start
-                slots = previous_slots[first_slot:first_slot + last_row -
-                                       first_row]
-                return slots, accepted_draft_tokens, first_row - num_contexts
-            return previous_slots[:0], accepted_draft_tokens, 0
-
-        return None, accepted_draft_tokens, 0
+        accepted_draft_tokens = [
+            host_counts.get(request_id, 0) for request_id in request_ids
+        ]
+        return previous_slots, accepted_draft_tokens
 
     @nvtx_range("_prepare_inputs")
     def _prepare_inputs(

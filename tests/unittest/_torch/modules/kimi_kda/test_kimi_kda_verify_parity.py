@@ -156,7 +156,7 @@ def test_forward_uses_metadata_aligned_generation_state_indices(
         ),
     )
     mamba_metadata.prepare(metadata)
-    previous_slots = torch.tensor([0], dtype=torch.int32, device="cuda") if on_device else None
+    previous_slots = [0] if on_device else [None]
     previous_lengths = torch.tensor([3], dtype=torch.int32, device="cuda") if on_device else None
     mamba_metadata.prepare_prev_num_accepted_tokens(
         previous_slots=previous_slots,

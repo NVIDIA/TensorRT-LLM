@@ -305,7 +305,7 @@ def test_fused_vs_sequential_two_rounds(
     _promote_sequential(cache_seq, conv_pool_seq, ssm_pool_seq, accept)
     metadata.prepare_prev_num_accepted_tokens(
         accepted_draft_tokens=[0] * B,
-        previous_slots=torch.arange(B, dtype=torch.int32, device="cuda"),
+        previous_slots=list(range(B)),
         previous_new_tokens_lens=accept.to(torch.int32) + 1,
     )
 

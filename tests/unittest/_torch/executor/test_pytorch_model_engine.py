@@ -21,8 +21,8 @@ from tensorrt_llm._torch.models.modeling_utils import DecoderModelForCausalLM
 from tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector import \
     KvCacheConnectorWorker
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import (
-    CUDAGraphRunner, KeyType, SampleType, _restore_spec_decode_capture_state,
-    _save_spec_decode_capture_state)
+    CUDA_GRAPH_DUMMY_REQUEST_ID, CUDAGraphRunner, KeyType, SampleType,
+    _restore_spec_decode_capture_state, _save_spec_decode_capture_state)
 from tensorrt_llm._torch.pyexecutor.engine.input_buffers import InputBuffers
 from tensorrt_llm._torch.pyexecutor.engine.model_call import ModelCaller
 from tensorrt_llm._torch.pyexecutor.engine.multimodal import \
@@ -419,6 +419,119 @@ def create_model_engine_and_kvcache(
     )
 
     return model_engine, kv_cache_manager
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("overlap", [False, True])
+@pytest.mark.parametrize(
+    "row_order,with_context",
+    [
+        (("gen0", "gen1"), False),
+        (("new", "gen0", "gen1"), False),
+        (("gen0", "new", "gen1"), False),
+        (("promoted", "gen0"), False),
+        (("gen0", "promoted"), False),
+        (("gen0", "gen1", "dummy"), True),
+    ],
+)
+def test_kda_replay_counts_follow_engine_request_rows(
+    overlap: bool,
+    row_order: tuple[str, ...],
+    with_context: bool,
+) -> None:
+    pytest.importorskip("fla")
+    from tensorrt_llm._torch.modules.kimi_kda.kimi_k3_mamba_metadata import \
+        KimiK3MambaMetadata
+
+    runtime_draft_len = 0 if "promoted" in row_order else 2
+    spec_config = SADecodingConfig(max_draft_len=2, draft_len_schedule={1: 2})
+    engine, manager = create_model_engine_and_kvcache(spec_config=spec_config)
+    try:
+        manager.use_kda_replay_update = True
+        states = torch.arange(8, dtype=torch.int32, device="cuda")
+        manager.get_state_indices = Mock(side_effect=lambda request_ids,
+                                         is_padding: states[:len(request_ids)])
+        metadata = AttentionMetadata(max_num_requests=8,
+                                     max_num_tokens=32,
+                                     kv_cache_manager=manager,
+                                     mamba_metadata=KimiK3MambaMetadata(
+                                         8, 64, 32))
+        metadata.is_cuda_graph = False
+        spec_metadata = Mock(_force_non_greedy_for_capture=False,
+                             context_prompt_lookahead_tokens=None)
+
+        requests = {}
+        # Previous sampler slots deliberately differ from the slots assigned
+        # for this forward. CPU counts are also different from GPU results.
+        for name, request_id, previous_slot, current_slot, host_count in (
+            ("gen0", 10, 0, 2, 1),
+            ("gen1", 11, 3, 0, 0),
+            ("new", 12, None, 1, 2),
+            ("promoted", 13, 3, 4, 8),
+            ("dummy", CUDA_GRAPH_DUMMY_REQUEST_ID, 3, 7, 9),
+        ):
+            request = _create_request_with_tokens([10, 11, 12, 13], request_id)
+            request.py_seq_slot = current_slot
+            request.py_batch_idx = previous_slot
+            request.py_num_accepted_draft_tokens = host_count
+            request.py_draft_tokens = [20, 21][:runtime_draft_len]
+            requests[name] = request
+        requests["dummy"].is_cuda_graph_dummy = True
+        requests["promoted"].context_current_position = 3
+        requests["promoted"].context_chunk_size = 1
+
+        batch = ScheduledRequests()
+        batch.generation_requests = [requests[name] for name in row_order]
+        if with_context:
+            context = _create_request_with_tokens([30, 31, 32], 14)
+            context.context_chunk_size = 3
+            context.py_seq_slot = 5
+            batch.context_requests_last_chunk = [context]
+        promoted_ids = (frozenset({requests["promoted"].py_request_id})
+                        if "promoted" in row_order else frozenset())
+        overlap_state = None
+        if overlap:
+            overlap_state = SampleStateTensorsSpec(
+                new_tokens=torch.full((1 + runtime_draft_len, 8, 1),
+                                      77,
+                                      dtype=torch.int32,
+                                      device="cuda"),
+                new_tokens_lens=torch.tensor([3, 99, 98, 2, 97, 96, 95, 94],
+                                             dtype=torch.int32,
+                                             device="cuda"),
+                next_draft_tokens=torch.zeros((8, runtime_draft_len),
+                                              dtype=torch.int32,
+                                              device="cuda"),
+            )
+        engine._prepare_tp_inputs(
+            scheduled_requests=batch,
+            kv_cache_manager=manager,
+            attn_metadata=metadata,
+            spec_metadata=spec_metadata,
+            new_tensors_device=overlap_state,
+            resource_manager=ResourceManager(
+                {ResourceManagerType.KV_CACHE_MANAGER: manager}),
+            promoted_context_request_ids=promoted_ids,
+            enable_spec_decode=True,
+            runtime_draft_len=runtime_draft_len,
+            is_dummy=False,
+        )
+        expected_by_name = {
+            "gen0": 2 if overlap else 1,
+            "gen1": 1 if overlap else 0,
+            "new": 2,
+            "promoted": 0,
+            "dummy": 0
+        }
+        expected = [expected_by_name[name] for name in row_order]
+        assert metadata.num_contexts == int(with_context)
+        assert metadata.request_ids[metadata.num_contexts:] == [
+            requests[name].py_request_id for name in row_order
+        ]
+        assert metadata.mamba_metadata.prev_num_accepted_tokens.tolist() == (
+            expected + [0] * (8 - len(expected)))
+    finally:
+        manager.shutdown()
 
 
 def test_cleanup_releases_runner_model_before_release_gc() -> None:

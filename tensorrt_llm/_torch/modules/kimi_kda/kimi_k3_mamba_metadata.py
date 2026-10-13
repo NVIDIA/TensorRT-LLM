@@ -64,47 +64,53 @@ class KimiK3MambaMetadata(Mamba2Metadata):
         self.prev_num_accepted_tokens = torch.zeros(
             max_batch_size, dtype=torch.int32, device="cuda"
         )
+        self._prev_count_staging = torch.empty(
+            (max_batch_size, 2), dtype=torch.int32, device="cuda"
+        )
 
     def prepare_prev_num_accepted_tokens(
         self,
         accepted_draft_tokens: list[int],
-        previous_slots: torch.Tensor | None = None,
+        previous_slots: list[int | None],
         *,
         previous_new_tokens_lens: torch.Tensor | None = None,
-        generation_start: int = 0,
     ) -> None:
         """Fill the stable replay buffer from GPU sampler slots or CPU counts.
 
         ``accepted_draft_tokens`` contains CPU fallback counts for the full
-        generation batch. GPU results override the consecutive rows starting
-        at ``generation_start``. Rows without a slot use their CPU count;
-        unused buffer rows are cleared.
+        generation batch. Each ``previous_slots`` entry selects a GPU sampler
+        result, or is None to use that row's CPU count. Unused buffer rows
+        are cleared.
         """
-        if previous_slots is not None:
-            assert previous_slots.ndim == 1 and previous_new_tokens_lens is not None
-            num_rows = previous_slots.numel()
-        else:
-            assert previous_new_tokens_lens is None
-            assert generation_start == 0
-            num_rows = 0
-        assert 0 <= generation_start <= self.max_batch_size - num_rows
-        generation_end = generation_start + num_rows
         num_generations = len(accepted_draft_tokens)
-        assert generation_end <= num_generations <= self.max_batch_size
+        assert len(previous_slots) == num_generations <= self.max_batch_size
         self.prev_num_accepted_tokens.zero_()
-        if generation_start > 0 or generation_end < num_generations:
-            # Upload the full CPU counts in one copy, then overwrite rows
-            # with GPU results below. Fresh pinned storage stays valid until
-            # the asynchronous upload completes.
-            staging = torch.tensor(
-                accepted_draft_tokens, dtype=torch.int32, pin_memory=prefer_pinned()
-            )
-            self.prev_num_accepted_tokens[:num_generations].copy_(staging, non_blocking=True)
-        if previous_slots is not None and num_rows > 0:
-            counts = self.prev_num_accepted_tokens[generation_start:generation_end]
-            torch.index_select(previous_new_tokens_lens, 0, previous_slots, out=counts)
+        if num_generations == 0:
+            return
+
+        # Pack counts and slots into one contiguous asynchronous H2D copy.
+        # Fresh pinned storage cannot be overwritten by later preparation
+        # while the upload is pending.
+        staging = torch.tensor(
+            [
+                (count, -1 if slot is None else slot)
+                for count, slot in zip(accepted_draft_tokens, previous_slots)
+            ],
+            dtype=torch.int32,
+            pin_memory=prefer_pinned(),
+        )
+        device_inputs = self._prev_count_staging[:num_generations]
+        device_inputs.copy_(staging, non_blocking=True)
+        host_counts, slots = device_inputs.unbind(dim=1)
+        counts = self.prev_num_accepted_tokens[:num_generations]
+        if any(slot is not None for slot in previous_slots):
+            assert previous_new_tokens_lens is not None
+            sampled = previous_new_tokens_lens.index_select(0, slots.clamp(min=0))
             # Sampler lengths include the golden token; replay only the drafts.
-            counts.sub_(1).clamp_(min=0)
+            sampled.sub_(1).clamp_(min=0)
+            torch.where(slots >= 0, sampled, host_counts, out=counts)
+        else:
+            counts.copy_(host_counts, non_blocking=True)
 
     def prepare(self, attn_metadata: AttentionMetadata) -> None:
         context_lengths = attn_metadata.seq_lens[: attn_metadata.num_contexts].tolist()

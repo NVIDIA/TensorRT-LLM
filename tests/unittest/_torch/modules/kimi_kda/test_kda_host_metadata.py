@@ -41,10 +41,9 @@ pytestmark = pytest.mark.skipif(
 def test_replay_metadata_copies_counts_and_clears_padding(on_device: bool) -> None:
     counts = [4, 2, 2, 1, 0, 3]
     previous_lengths = torch.tensor([2, 99, 1, 3], dtype=torch.int32, device="cuda")
-    # Reuse a view of the engine's slot buffer. Slot zero is valid, while
-    # recycled slot one contains stale data and is excluded from the view.
-    slot_buffer = torch.tensor([99, 3, 0, 2, 99], dtype=torch.int32, device="cuda")
-    previous_slots = slot_buffer[1:4]
+    # Slot zero is valid; rows without slots can be interleaved with GPU rows.
+    # Recycled slot one contains stale data and must never supply a count.
+    previous_slots = [None, 3, None, 0, 2, None]
     state_indices = torch.arange(8, dtype=torch.int32, device="cuda")
     manager = Mock(spec=BaseMambaCacheManager)
     manager.use_kda_replay_update = True
@@ -70,11 +69,10 @@ def test_replay_metadata_copies_counts_and_clears_padding(on_device: bool) -> No
     try:
         attn_metadata.prepare()
         metadata.prepare_prev_num_accepted_tokens(
-            previous_slots=previous_slots if on_device else None,
+            previous_slots=previous_slots if on_device else [None] * len(counts),
             # Stale host counts for rows with slots must lose to GPU results.
-            accepted_draft_tokens=[4, 2, 9, 9, 9, 3] if on_device else counts,
+            accepted_draft_tokens=[4, 9, 2, 9, 9, 3] if on_device else counts,
             previous_new_tokens_lens=previous_lengths if on_device else None,
-            generation_start=2 if on_device else 0,
         )
     finally:
         torch.cuda.set_sync_debug_mode(old_mode)
@@ -85,7 +83,7 @@ def test_replay_metadata_copies_counts_and_clears_padding(on_device: bool) -> No
     attn_metadata.seq_lens = attn_metadata.seq_lens[:2]
     attn_metadata.prepare()
     metadata.prepare_prev_num_accepted_tokens(
-        previous_slots=previous_slots[:0] if on_device else None,
+        previous_slots=[None, None],
         accepted_draft_tokens=[1, 2],
         previous_new_tokens_lens=previous_lengths if on_device else None,
     )
