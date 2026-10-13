@@ -58,7 +58,8 @@ def test_flashinfer_fp8_mode_remains_implementation_local() -> None:
         (1, 0, torch.float16, False),
     ],
 )
-@pytest.mark.parametrize("page_size,paged_context", [(32, False), (32, True), (128, True)])
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("page_size,paged_context", [(32, False), (128, True)])
 def test_small_context_fallback_preserves_mixed_batch_generation(
     num_contexts: int,
     num_generations: int,

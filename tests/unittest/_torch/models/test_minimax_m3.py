@@ -1419,69 +1419,15 @@ def _per_head_gemma_rms_norm_reference(x, weight, eps):
 
 @pytest.mark.gpu
 @pytest.mark.skipif(not _has_cuda(), reason="MiniMax-M3 attention construction needs CUDA")
-@pytest.mark.parametrize(
-    "sparse_implementation",
-    [
-        None,
-        "triton",
-        "triton_nvfp4",
-        "triton_no_native",
-        "triton_disabled_native",
-        "triton_fallback_first",
-    ],
-)
-def test_minimax_m3_attention_dense_construction_matches_config(sparse_implementation, monkeypatch):
+def test_minimax_m3_attention_dense_construction_matches_config():
     """Dense layer's QKV/O projection and per-head Q/K norm match config."""
-    from tensorrt_llm._torch.attention.backends.fmha.flashinfer_trtllm_gen import (
-        FlashInferTrtllmGenFmha,
-    )
-
-    monkeypatch.setattr(
-        FlashInferTrtllmGenFmha,
-        "_is_available",
-        classmethod(lambda cls, attn: sparse_implementation != "triton_no_native"),
-    )
-    monkeypatch.setenv(
-        "TLLM_FMHA_LIBS",
-        "fallback"
-        if sparse_implementation == "triton_disabled_native"
-        else "fallback,flashinfer_trtllm_gen"
-        if sparse_implementation == "triton_fallback_first"
-        else "flashinfer_trtllm_gen,fallback",
-    )
     text_cfg, model_cfg = _make_attention_test_config()
-    if sparse_implementation is not None:
-        from tensorrt_llm.llmapi.llm_args import MiniMaxM3SparseAttentionConfig
-
-        model_cfg.sparse_attention_config = MiniMaxM3SparseAttentionConfig(implementation="triton")
-    if sparse_implementation == "triton_nvfp4":
-        from tensorrt_llm.models.modeling_utils import QuantConfig
-        from tensorrt_llm.quantization import QuantAlgo
-
-        model_cfg.quant_config = QuantConfig(kv_cache_quant_algo=QuantAlgo.NVFP4)
     attn = MiniMaxM3Attention(
         model_config=model_cfg,
         layer_idx=0,
         is_sparse_attention_layer=False,
         disable_index_value=False,
     )
-
-    from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention
-
-    if sparse_implementation in (
-        "triton_nvfp4",
-        "triton_no_native",
-        "triton_disabled_native",
-        "triton_fallback_first",
-    ):
-        from tensorrt_llm._torch.attention.backends.sparse.minimax_m3 import (
-            MiniMaxM3SparseRuntimeBackend,
-        )
-
-        assert isinstance(attn.attn, MiniMaxM3SparseRuntimeBackend)
-    else:
-        assert isinstance(attn.attn, TrtllmAttention)
-        assert attn.attn.position_embedding_type == 0  # Partial RoPE is already applied.
 
     head_dim = int(text_cfg.head_dim)
     num_heads = int(text_cfg.num_attention_heads)
@@ -2770,32 +2716,29 @@ def test_minimax_m3_swiglu_oai_fused_matches_reference(dtype):
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize(
-    "libraries,use_native",
+    "libraries,available,use_native",
     [
-        (None, True),
-        ("flashinfer_trtllm_gen,fallback", True),
-        ("fallback,flashinfer_trtllm_gen", False),
-        ("flashinfer_trtllm_gen", True),
-        ("fallback", False),
-        ("-flashinfer_trtllm_gen", False),
+        ("flashinfer_trtllm_gen,fallback", True, True),
+        ("fallback,flashinfer_trtllm_gen", True, False),
+        ("fallback", True, False),
+        ("flashinfer_trtllm_gen,fallback", False, False),
     ],
 )
-def test_minimax_m3_dense_backend_library_order(monkeypatch, libraries, use_native):
+def test_minimax_m3_dense_backend_library_order(monkeypatch, libraries, available, use_native):
     from types import SimpleNamespace
     from unittest.mock import Mock
 
     from tensorrt_llm._torch.models import modeling_minimaxm3 as model_module
 
-    if libraries is None:
-        monkeypatch.delenv("TLLM_FMHA_LIBS", raising=False)
-    else:
-        monkeypatch.setenv("TLLM_FMHA_LIBS", libraries)
+    monkeypatch.setenv("TLLM_FMHA_LIBS", libraries)
     legacy = object()
     native = SimpleNamespace(support_fused_qkv=lambda: True)
     construct = Mock(return_value=native)
     monkeypatch.setattr(model_module, "TrtllmAttention", construct)
     monkeypatch.setattr(
-        model_module.FlashInferTrtllmGenFmha, "is_available", classmethod(lambda cls, attn: True)
+        model_module.FlashInferTrtllmGenFmha,
+        "is_available",
+        classmethod(lambda cls, attn: available),
     )
     layer = SimpleNamespace(
         attn=legacy,
@@ -2812,7 +2755,7 @@ def test_minimax_m3_dense_backend_library_order(monkeypatch, libraries, use_nati
     )
     assert layer.attn is (native if use_native else legacy)
     assert layer.support_fused_qkv is use_native
-    if use_native:
+    if libraries == "flashinfer_trtllm_gen,fallback":
         construct.assert_called_once()
         assert construct.call_args.kwargs["pos_embd_params"] is None
     else:

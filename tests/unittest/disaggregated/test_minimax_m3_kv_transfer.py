@@ -95,6 +95,7 @@ def test_v2_disagg_role_mapper_kind_defaults() -> None:
     }
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "implementation,cache_dtype,expected_main_mapper",
     [

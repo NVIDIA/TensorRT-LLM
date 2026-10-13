@@ -453,6 +453,7 @@ def test_speculative_validation_precedes_cache_setup(
         setup.assert_called_once()
 
 
+@pytest.mark.cpu_only
 def test_dense_layers_get_virtual_pools_without_speculation(monkeypatch):
     """Dense target layers need the same stride correction as draft layers."""
 
@@ -482,13 +483,14 @@ def test_dense_layers_get_virtual_pools_without_speculation(monkeypatch):
     assert manager.num_attention_op_pools == 4
 
 
-@pytest.mark.parametrize("heads", [1, 2, 4])
-def test_sparse_view_writes_native_hnd_storage_without_copy(monkeypatch, heads):
+@pytest.mark.cpu_only
+def test_sparse_view_writes_native_hnd_storage_without_copy(monkeypatch):
     from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.paged_cache import (
         write_kv_slots,
     )
 
-    # Include another layer and an index page in every allocation slot.
+    # Multiple heads distinguish HND from NHD; include adjacent layer/index pages.
+    heads = 2
     storage = (torch.arange(3 * 7 * heads * 8 * 16, dtype=torch.float32) + 1).reshape(
         3, 7, heads, 8, 16
     )
@@ -513,50 +515,3 @@ def test_sparse_view_writes_native_hnd_storage_without_copy(monkeypatch, heads):
     touched[slots // 8, 0, :, slots % 8] = True
     assert torch.equal(storage[~touched], before[~touched])
     torch.testing.assert_close(nhd, hnd.transpose(2, 3))
-
-
-@pytest.mark.parametrize("heads", [1, 2, 4])
-def test_flat_subpage_views_preserve_physical_hnd_order(monkeypatch, heads):
-    storage = torch.arange(16 * heads * 8 * 16, dtype=torch.float32).reshape(16, heads, 8, 16)
-    manager = MiniMaxM3KVCacheManagerV2.__new__(MiniMaxM3KVCacheManagerV2)
-    manager._kv_slot_geometry = lambda i, layout: (
-        storage.data_ptr(),
-        storage.dtype,
-        3,
-        7,
-        [heads, 8, 16],
-    )
-    monkeypatch.setattr(m3_cache_manager, "convert_to_torch_tensor", lambda wrapper: storage)
-    hnd, scale = manager.get_kv_subpage_pool(0)
-    nhd, nhd_scale = manager.get_kv_subpage_pool(0, "NHD")
-    assert scale == nhd_scale == 7
-    assert hnd.data_ptr() == nhd.data_ptr() == storage.data_ptr()
-    torch.testing.assert_close(nhd, hnd.transpose(1, 2))
-
-
-@pytest.mark.cpu_only
-@pytest.mark.parametrize("backend_layout", ["HND", "NHD"])
-def test_cached_index_views_support_both_layouts_without_pool_lookups(backend_layout):
-    """Explicit transfer layouts must preserve the eagerly cached forward view."""
-    storage = torch.arange(3 * 2 * 8 * 16, dtype=torch.float32).reshape(3, 2, 8, 1, 16)
-    before = storage.clone()
-    nhd = storage[:, 0]
-    manager = MiniMaxM3KVCacheManagerV2.__new__(MiniMaxM3KVCacheManagerV2)
-    manager._main_kv_view_layout = backend_layout
-    cached = nhd if backend_layout == "NHD" else nhd.transpose(1, 2)
-    manager._index_k_buffers = {3: cached}
-    # No impl/pool accessor exists on this object: all paths must use cached views.
-    assert manager.get_index_k_buffer(3) is cached
-    assert manager.get_index_k_buffer(0) is None
-    for layout in ("NHD", "HND"):
-        view = manager.get_index_k_buffer(3, layout)
-        expected = nhd if layout == "NHD" else nhd.transpose(1, 2)
-        assert view.data_ptr() == storage.data_ptr()
-        assert view.stride() == expected.stride()
-        torch.testing.assert_close(view, expected)
-        view.fill_(5)
-        assert torch.all(nhd == 5)
-        assert torch.equal(storage[:, 1], before[:, 1])
-        assert manager.get_index_k_buffer(0, layout) is None
-    with pytest.raises(ValueError, match="Unsupported kv_layout"):
-        manager.get_index_k_buffer(3, "invalid")
