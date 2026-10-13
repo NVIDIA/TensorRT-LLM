@@ -125,6 +125,8 @@ from .scheduler.scheduler_v2 import KVCacheV2Scheduler
 if TYPE_CHECKING:
     from ray.actor import ActorHandle
 
+    from tensorrt_llm.bindings import MpiProgressThread
+
     from ..moe.fused_moe.communication.base import CheckpointableCommunication
 
 _UNBOUNDED_STATS_MAX_LEN = -1
@@ -206,7 +208,7 @@ def _resolve_pp_mpi_progress_interval_us() -> int:
     try:
         return int(raw)
     except ValueError:
-        logger.warning(
+        logger.error(
             f"Ignoring malformed {PP_MPI_PROGRESS_INTERVAL_US_ENV_VAR_NAME}="
             f"{raw!r}; using {DEFAULT_PP_MPI_PROGRESS_INTERVAL_US} us.")
         return DEFAULT_PP_MPI_PROGRESS_INTERVAL_US
@@ -1100,7 +1102,7 @@ class PyExecutor:
         self._pp_mpi_progress: Optional[MpiProgressPump] = None
         self._pp_mpi_progress_stop = threading.Event()
         self._pp_mpi_progress_quiesced = threading.Event()
-        self._mpi_progress_thread = None
+        self._mpi_progress_thread: Optional["MpiProgressThread"] = None
         # Secondary MPI communicator and listener thread for multi-rank
         # sleep/wakeup control messages.  Both are None until start_worker()
         # calls Dup() (a collective) on the main thread.
@@ -1822,7 +1824,7 @@ class PyExecutor:
         """
         self.executor_request_queue.enqueue_cancel_request(id)
 
-    def _start_mpi_progress_thread(self):
+    def _start_mpi_progress_thread(self) -> Optional["MpiProgressThread"]:
         """Start a native thread that keeps this rank's MPI sends moving.
 
         Pipeline-parallel ranks post their schedule and sample-state messages
@@ -1838,7 +1840,7 @@ class PyExecutor:
         """
         interval_us = _resolve_pp_mpi_progress_interval_us()
         if interval_us <= 0:
-            logger.warning(
+            logger.error(
                 f"{PP_MPI_PROGRESS_INTERVAL_US_ENV_VAR_NAME}={interval_us}: the "
                 f"pipeline-parallel MPI progress thread is disabled.")
             return None
@@ -1862,7 +1864,7 @@ class PyExecutor:
                     f"(interval {interval_us} us).")
         return thread
 
-    def _stop_mpi_progress_thread(self):
+    def _stop_mpi_progress_thread(self) -> None:
         """Stop the native MPI progress thread if it runs.
 
         stop() waits only for a probe already in flight to return, and
