@@ -664,8 +664,9 @@ class PyExecutor:
                 self.kv_cache_manager, "streaming_kv_events_enabled", False))
         # Event routing also needs the sum of actual per-rank capacities after
         # pool rebalance. Keep sampling internal unless GetLoad was enabled.
-        routing_load_enabled = (self.llm_args._enable_routing_load or getattr(
-            self.kv_cache_manager, "streaming_kv_events_enabled", False))
+        routing_load_enabled = (getattr(
+            self.llm_args, "_enable_routing_load", False) or getattr(
+                self.kv_cache_manager, "streaming_kv_events_enabled", False))
         self._kv_load_tracker = KvLoadTracker(
             self.kv_cache_manager,
             int(self.dist.tp_rank) if self.enable_attention_dp else 0,

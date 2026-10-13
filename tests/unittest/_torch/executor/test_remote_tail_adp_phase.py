@@ -382,7 +382,7 @@ def test_rebalance_reserves_execution_row_before_resuming_real_requests(
 ) -> None:
     executor = _make_executor()
     executor._enable_remote_tail_adp = True
-    executor.resource_manager = object()
+    executor.resource_manager = SimpleNamespace(resource_managers={})
     real = SimpleNamespace(py_request_id=1)
     dummy = SimpleNamespace(py_request_id=2)
     executor.active_requests = [real]
@@ -576,6 +576,8 @@ def test_constructor_initializes_remote_tail_adp_before_starting_worker(
         event_buffer_max_size=0,
         enable_block_reuse=False,
         tokens_per_block=128,
+        get_kv_cache_stats=lambda: SimpleNamespace(max_num_blocks=0),
+        get_max_resource_count=lambda: 0,
     )
     resource_manager = SimpleNamespace(
         resource_managers={ResourceManagerType.KV_CACHE_MANAGER: manager}
@@ -583,7 +585,13 @@ def test_constructor_initializes_remote_tail_adp_before_starting_worker(
     scheduler = make_scheduler(make_kv_cache_manager())
     transceiver = SimpleNamespace(get_status_dump=Mock()) if has_transceiver else None
     dist = SimpleNamespace(
-        rank=0, tp_size=4, pp_size=1, cp_size=1, mapping=object(), barrier=Mock()
+        rank=0,
+        tp_rank=0,
+        tp_size=4,
+        pp_size=1,
+        cp_size=1,
+        mapping=object(),
+        barrier=Mock(),
     )
     dummy = object()
     runner = SimpleNamespace(enabled=False, padding_enabled=True, padding_dummy_requests={})
