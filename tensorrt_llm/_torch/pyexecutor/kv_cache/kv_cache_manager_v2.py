@@ -1878,7 +1878,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 )
             return cold_page_codec_provider.create_cold_page_codec(
                 cache_config,
-                runtime_dtype=self.dtype,
+                runtime_dtype=self.layer_specs[0].dtype if self.layer_specs else self.dtype,
                 pp_layers=self.pp_layers,
                 num_kv_heads_per_layer=self.num_kv_heads_per_layer,
                 head_dim_per_layer=self.head_dim_per_layer,
