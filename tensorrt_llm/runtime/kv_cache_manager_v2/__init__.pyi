@@ -676,6 +676,11 @@ class _KVCache:
         """Read the final state under the manager lock, including after a failed operation's rollback."""
     def record_page_storage_read(self, cuda_stream: CudaStream) -> None:
         """Join submitted reader work into the active request's stream before any cache mutation."""
+    def wait_allocation_fence(self) -> None:
+        """Block until pages given since the last call are free of earlier GPU work.
+
+        For writers no CUDA stream orders, such as the NIC.
+        """
     def prefetch(self, target: CacheLevel) -> bool: ...
     def get_scratch_desc(self, layer_group_id: LayerGroupId) -> ScratchDesc | None: ...
     @property
