@@ -60,8 +60,11 @@ def main() -> int:
         tests = {"rc": trc, "summary": lines[-1] if lines else "", "log": str(tlog), "paths": args.tests,
                  "failed": [l.split(" ", 1)[1] for l in lines if l.startswith("FAILED ")][:50]}
         if trc != 0:
-            result = {"task": args.task, "score": None, "anchor": args.anchor, "verdict": "FAIL",
-                      "reason": f"target tests failed: {tests['summary']}", "tests": tests,
+            # pytest rc 1 = tests failed (the candidate's verdict); 2-5 = interrupted,
+            # internal or usage error, nothing collected (the tree's environment).
+            verdict = "FAIL" if trc == 1 else "ERROR"
+            result = {"task": args.task, "score": None, "anchor": args.anchor, "verdict": verdict,
+                      "reason": f"target tests {'failed' if trc == 1 else 'could not run'}: {tests['summary']}", "tests": tests,
                       "tree": os.environ.get("STAIRCASE_TREE", "")}
             (args.out / "result.json").write_text(json.dumps(result, indent=2) + "\n")
             print(f"[gate] tests FAILED: {tests['summary']}")

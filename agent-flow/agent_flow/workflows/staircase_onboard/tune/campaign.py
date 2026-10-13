@@ -335,7 +335,9 @@ class Campaign:
             git(self.repo, "worktree", "move", str(spare), str(eval_tree))
             git(eval_tree, "checkout", "-q", "-f", "-B", branch, head)
             git(eval_tree, "reset", "-q", "--hard", head)
-            git(eval_tree, "clean", "-q", "-fd")
+            # Ignored files too: __pycache__ written at the old path made pytest import
+            # stale modules and fail collection; the native links are re-made below.
+            git(eval_tree, "clean", "-q", "-fdx")
         else:
             add_worktree(self.repo, eval_tree, "-B", branch, str(eval_tree), head)
         link_native(self.repo, eval_tree)
@@ -519,6 +521,12 @@ class Campaign:
                     continue
                 st.gate = json.loads(result.read_text())
                 self.ledger.append("candidate_gate", slug=st.slug, **st.gate)
+                if st.gate.get("verdict") == "ERROR" and self._retry(st, 2, "gate (could not run)"):
+                    # The suite could not even collect or the eval did not start: the
+                    # tree's environment, not the candidate. Run the gate again.
+                    result.rename(result.with_name(f"result.error-{int(time.time())}.json"))
+                    st.gate = {}
+                    continue
                 if st.gate.get("verdict") == "PASS":
                     self._keep(st)
                 else:

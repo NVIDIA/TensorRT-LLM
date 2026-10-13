@@ -784,3 +784,20 @@ def test_a_gate_on_a_tree_another_keep_moved_is_cancelled_and_re_stacked(tmp_pat
             break
     assert {s: c.status for s, c in a.items()} == {"fast-path": "kept", "fused-attn": "kept"}
     assert any("gate cancelled" in m for m in msgs), msgs
+
+
+def test_a_suite_that_cannot_collect_is_an_error_not_a_failure(tmp_path):
+    """A reused eval checkout with stale caches failed test collection (pytest rc 2); that is
+    the tree's environment, not the candidate, so the gate reports ERROR (re-run), not FAIL."""
+    import sys
+
+    from agent_flow.workflows.staircase_onboard.tune import campaign as campaign_mod
+
+    tree = tmp_path / "tree"
+    (tree / "tests" / "unittest" / "t").mkdir(parents=True)
+    (tree / "tests" / "unittest" / "t" / "test_x.py").write_text("import _missing_helper\n\ndef test_x():\n    pass\n")
+    gate = Path(campaign_mod.__file__).parent / "gate_accuracy.py"
+    out = tmp_path / "out"
+    subprocess.run([sys.executable, str(gate), "--model", "m", "--out", str(out), "--anchor", "96.0",
+                    "--tests", "tests/unittest/t"], cwd=tree, capture_output=True, text=True)
+    assert json.loads((out / "result.json").read_text())["verdict"] == "ERROR"
