@@ -89,8 +89,14 @@ def _log(message: str) -> None:
     and crash the pytest process. Writing the descriptor reaches the same
     destination, since pytest's fd capture redirects fd 1, without touching a
     Python stream object.
+
+    Best-effort: a failed write is dropped so it can never skip the cleanup
+    that follows a log call.
     """
-    os.write(1, f"{message}\n".encode("utf-8", "replace"))
+    try:
+        os.write(1, f"{message}\n".encode("utf-8", "replace"))
+    except OSError:
+        pass
 
 
 def _fallback_identity_timeout() -> float:
