@@ -12,9 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""The DeepSeek MLA-latent planner must produce the default planner's bytes for the pairs it covers."""
-
-from dataclasses import replace
+"""The DeepSeek MLA-latent planner must produce the default planner's bytes for the deployments it supports."""
 
 import numpy as np
 import pytest
@@ -27,7 +25,6 @@ from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
 from tensorrt_llm._torch.disaggregation.planners.deepseek_mla_latent import (
     DeepseekMlaLatentTransferPlanner,
 )
-from tensorrt_llm._torch.disaggregation.planners.deployment import Deployment
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
 from tensorrt_llm._torch.disaggregation.resource.page import (
     BUFFER_ENTRY_DTYPE,
@@ -45,9 +42,6 @@ NUM_LAYERS = 6
 LAYER_BYTES = 512  # one latent-K region per layer per block
 SLOT_BYTES = NUM_LAYERS * LAYER_BYTES
 TPB = 16
-DEP4 = Deployment(
-    architecture="DeepseekV3ForCausalLM", tp=4, pp=1, cp=1, moe_ep=4, moe_tp=1, attention_dp=True
-)
 
 
 def _mla_page_table(base: int, *, num_layers: int = NUM_LAYERS, extra_pool: bool = False):
@@ -74,12 +68,9 @@ def _mla_page_table(base: int, *, num_layers: int = NUM_LAYERS, extra_pool: bool
     )
 
 
-def _dep4_rank_info(
-    name: str, dp_rank: int, page_table, *, dp_size: int = 4, pp_size: int = 1, blob: bytes = None
-):
+def _dep4_rank_info(name: str, dp_rank: int, page_table, *, dp_size: int = 4, pp_size: int = 1):
     return RankInfo(
         planner_id=DeepseekMlaLatentTransferPlanner.planner_id,
-        planner_blob=DEP4.to_bytes() if blob is None else blob,
         instance_name=name,
         instance_rank=dp_rank,
         tp_size=dp_size,
@@ -110,7 +101,7 @@ def _pair(dp_rank: int = 2):
     peer_ri = _dep4_rank_info("gen", dp_rank, peer_pt)
     ext = KVRegionExtractorV1(self_pt)
     return (
-        DeepseekMlaLatentTransferPlanner(self_ri, ext, self_deployment=DEP4),
+        DeepseekMlaLatentTransferPlanner(self_ri, ext),
         DefaultTransferPlanner(self_ri, ext),
         self_ri,
         peer_ri,
@@ -183,23 +174,9 @@ def test_targets_is_the_matching_dp_rank_only():
     assert ours.uniform_writers is True
 
 
-def test_check_peer_accepts_a_covered_pair_and_refuses_everything_else():
+def test_check_peer_refuses_a_peer_whose_latent_geometry_differs():
     target, _, self_ri, peer_ri = _pair()
-    target.check_peer(self_ri, peer_ri)  # (dep4, dep4) is in the matrix
-    with pytest.raises(PeerIncompatibleError, match="pair"):
-        target.check_peer(
-            self_ri,
-            _dep4_rank_info(
-                "gen",
-                2,
-                _mla_page_table(0x9000_0000),
-                blob=replace(DEP4, tp=8, moe_ep=8).to_bytes(),
-            ),
-        )
-    with pytest.raises(PeerIncompatibleError, match="pair"):
-        target.check_peer(
-            self_ri, _dep4_rank_info("gen", 2, _mla_page_table(0x9000_0000), blob=b"")
-        )
+    target.check_peer(self_ri, peer_ri)
     with pytest.raises(PeerIncompatibleError, match="pool"):
         target.check_peer(
             self_ri, _dep4_rank_info("gen", 2, _mla_page_table(0x9000_0000, extra_pool=True))
@@ -208,9 +185,3 @@ def test_check_peer_accepts_a_covered_pair_and_refuses_everything_else():
         target.check_peer(
             self_ri, _dep4_rank_info("gen", 2, _mla_page_table(0x9000_0000, num_layers=5))
         )
-
-
-def test_describe_publishes_own_deployment():
-    target, _, _, _ = _pair()
-    assert Deployment.from_bytes(target.describe()) == DEP4
-    assert target.planner_id == "trtllm.deepseek_mla_latent"

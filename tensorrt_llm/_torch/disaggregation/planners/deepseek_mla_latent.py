@@ -20,20 +20,22 @@ block's bytes for all local layers are one contiguous slot. The plan is then
 plain arithmetic: pair block ordinals both sides hold, address the slots, and
 copy. Blocks that are consecutive on both sides move as one fragment.
 
-Which deployments may talk to each other is the ``COVERS`` matrix below: pairs
-of (context deployment, generation deployment). A deployment is the
-architecture plus its parallel topology, so the built-in DeepseekV3 model and a
-modeling_v2 target on the same topology are the same deployment and may feed
-each other. A model never names this planner; ``disaggregation.planners``
-finds the planner from the deployment, and ``describe`` publishes that
-deployment so the peer's planner can look the pair up too. Anything not in the
-matrix is refused at registration; the generic default planner stays untouched
-for the models that need pool matching, head re-sharding or recurrent state.
+``supports_deployment`` says which deployments this plan holds for: a
+DeepSeek-V3 architecture under attention-DP with no pipeline or context
+parallelism. The latent KV is never sharded across ranks, so the width of
+either side does not matter and a dep4 context may feed a dep8 generation.
+Which implementation computed the KV does not matter either: the built-in
+``DeepseekV3ForCausalLM`` and a modeling_v2 target write the same bytes. The
+framework only connects ranks that bound the same ``planner_id``, so a peer
+has already passed the same check for itself; ``check_peer`` then compares the
+latent geometry both sides published. The generic default planner stays
+untouched for the models that need pool matching, head re-sharding or
+recurrent state.
 """
 
 from __future__ import annotations
 
-from typing import FrozenSet, Optional, Tuple
+from typing import TYPE_CHECKING, Optional
 
 import numpy as np
 
@@ -54,12 +56,8 @@ from tensorrt_llm._torch.disaggregation.resource.page import (
 )
 from tensorrt_llm._torch.disaggregation.resource.utils import get_physical_pool
 
-from .deployment import Deployment
-
-# Attention-DP over 4 ranks, experts sharded 4 ways, attention replicated.
-_DEEPSEEK_DEP4 = Deployment(
-    architecture="DeepseekV3ForCausalLM", tp=4, pp=1, cp=1, moe_ep=4, moe_tp=1, attention_dp=True
-)
+if TYPE_CHECKING:
+    from tensorrt_llm.mapping import Mapping
 
 
 def _sole_pool(page_table: Optional[KVCachePageTable], side: str) -> PhysicalPool:
@@ -84,40 +82,24 @@ def _sole_pool(page_table: Optional[KVCachePageTable], side: str) -> PhysicalPoo
 class DeepseekMlaLatentTransferPlanner(TransferPlanner):
     planner_id = "trtllm.deepseek_mla_latent"
 
-    #: (context deployment, generation deployment) pairs this planner knows how
-    #: to move bytes between. The same pair is listed once; the planner serves
-    #: both roles, so a pair is read from the sender's side or the receiver's.
-    COVERS: FrozenSet[Tuple[Deployment, Deployment]] = frozenset({(_DEEPSEEK_DEP4, _DEEPSEEK_DEP4)})
+    @classmethod
+    def supports_deployment(cls, architecture: str, mapping: "Mapping") -> bool:
+        """Whether this plan holds for ``architecture`` sharded as ``mapping`` says."""
+        return (
+            architecture == "DeepseekV3ForCausalLM"
+            and mapping.pp_size == 1
+            and mapping.cp_size == 1
+            and bool(mapping.enable_attention_dp)
+        )
 
-    def __init__(
-        self,
-        self_rank_info: RankInfo,
-        self_extractor: KVRegionExtractorV1,
-        *,
-        self_deployment: Deployment,
-    ):
+    def __init__(self, self_rank_info: RankInfo, self_extractor: KVRegionExtractorV1):
         self._ri = self_rank_info
-        self._deployment = self_deployment
         self._page_table = self_extractor.page_table
         self._pool = _sole_pool(self._page_table, "this rank")
-
-    def describe(self) -> bytes:
-        return self._deployment.to_bytes()
-
-    def _pair(self, peer_ri: RankInfo) -> Tuple[Deployment, Deployment]:
-        """The (self, peer) deployment pair, or a refusal if the matrix lacks it."""
-        peer = Deployment.from_bytes(peer_ri.planner_blob)
-        if (self._deployment, peer) in self.COVERS or (peer, self._deployment) in self.COVERS:
-            return self._deployment, peer
-        raise PeerIncompatibleError(
-            f"no transfer plan for the pair ({self._deployment}, {peer}); "
-            f"covered pairs: {[tuple(map(str, pair)) for pair in self.COVERS]}"
-        )
 
     # ---- TransferPlanner protocol -------------------------------------------------
 
     def check_peer(self, self_ri: RankInfo, peer_ri: RankInfo) -> None:
-        self._pair(peer_ri)
         peer_pool = _sole_pool(peer_ri.page_table, "peer")
         self_layers = len(self._page_table.layer_groups[0].local_layers)
         peer_layers = len(peer_ri.page_table.layer_groups[0].local_layers)
@@ -137,9 +119,9 @@ class DeepseekMlaLatentTransferPlanner(TransferPlanner):
             )
 
     def targets(self, self_ri: RankInfo, peer_ri: RankInfo, peer_dp_rank: int) -> PeerTargets:
-        # Every covered pair is attention-DP with pp = cp = 1 and tp == dp, so
-        # the peer's flat rank is its dp_rank, and one writer per destination
-        # means the fan-in split is trivially uniform.
+        # Every supported deployment is attention-DP with pp = cp = 1 and
+        # tp == dp, so the peer's flat rank is its dp_rank, and one writer per
+        # destination means the fan-in split is trivially uniform.
         return PeerTargets(ranks=[peer_dp_rank], uniform_writers=True)
 
     def plan(

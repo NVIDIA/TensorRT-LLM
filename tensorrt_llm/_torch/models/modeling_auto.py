@@ -77,7 +77,7 @@ class AutoModelForCausalLM(Generic[TModel, TConfig]):
         with model_extra_attrs(extra_attrs):
             model = cls(config)
         model.extra_attrs = extra_attrs
-        # A KV transfer planner may cover this deployment (architecture and
+        # A KV transfer planner may support this deployment (architecture and
         # parallel topology; see disaggregation.planners). Resolved here, where
         # the config is known and before the transceiver asks for the hook, so
         # neither the model nor the disaggregation code names the other.

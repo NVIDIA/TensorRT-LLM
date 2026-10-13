@@ -14,14 +14,13 @@
 # limitations under the License.
 """Which disaggregated KV transfer planner serves a deployment.
 
-A planner owns a compatibility set: the (context deployment, generation
-deployment) pairs it can move bytes between, declared on the class as
-``COVERS``. A :class:`Deployment` is the architecture plus the parallel
-topology, so one entry covers the built-in model and any modeling_v2 target
-alike. Models declare nothing. This module is the one place that knows every
-planner, and it answers one question: given the deployment a model instance
-was built for, which planner covers it? None means the engine keeps the
-framework's default plan.
+Each planner class judges deployments itself through
+``supports_deployment(architecture, mapping)``: the model architecture and the
+parallel topology are the whole input, so the built-in model and any
+modeling_v2 target of the same architecture are judged alike. Models declare
+nothing. This module is the one place that knows every planner, and it answers
+one question: which planner supports the deployment a model instance was built
+for? None means the engine keeps the framework's default plan.
 
 Binding happens where the model is constructed (``AutoModelForCausalLM``),
 by installing the covering planner's factory as the instance's
@@ -35,44 +34,43 @@ from typing import TYPE_CHECKING, Optional, Type
 from tensorrt_llm._torch.disaggregation.base.planner import TransferPlanner
 
 from .deepseek_mla_latent import DeepseekMlaLatentTransferPlanner
-from .deployment import Deployment
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.model_config import ModelConfig
+    from tensorrt_llm.mapping import Mapping
 
 #: Every planner a deployment may be served by. Order carries no meaning: a
-#: deployment covered by two planners is a configuration error, not a priority
+#: deployment two planners support is a configuration error, not a priority
 #: question.
 PLANNERS: tuple = (DeepseekMlaLatentTransferPlanner,)
 
 
-def planner_for(deployment: Deployment) -> Optional[Type[TransferPlanner]]:
-    """The planner whose matrix mentions ``deployment`` on either side, or None."""
-    found = [p for p in PLANNERS if any(deployment in pair for pair in p.COVERS)]
+def planner_for(architecture: str, mapping: "Mapping") -> Optional[Type[TransferPlanner]]:
+    """The planner that supports ``architecture`` sharded as ``mapping`` says, or None."""
+    found = [p for p in PLANNERS if p.supports_deployment(architecture, mapping)]
     if len(found) > 1:
         names = ", ".join(p.__name__ for p in found)
-        raise ValueError(f"{deployment} is covered by more than one planner: {names}")
+        raise ValueError(f"{architecture} is supported by more than one planner: {names}")
     return found[0] if found else None
 
 
 def bind_transfer_planner(model, model_config: "ModelConfig") -> Optional[Type[TransferPlanner]]:
-    """Install the covering planner's factory on ``model``; return the planner or None.
+    """Install the supporting planner's factory on ``model``; return the planner or None.
 
-    The factory has the ``build_transfer_planner`` signature the framework
-    calls, closing over the deployment so the planner can publish it.
+    The factory has the ``build_transfer_planner`` signature the framework calls.
     """
-    deployment = Deployment.of(model_config)
-    if deployment is None:
+    architectures = getattr(model_config.pretrained_config, "architectures", None)
+    if not architectures:
         return None
-    planner_cls = planner_for(deployment)
+    planner_cls = planner_for(architectures[0], model_config.mapping)
     if planner_cls is None:
         return None
 
     def build_transfer_planner(kv_cache_manager, self_rank_info, self_extractor):
-        return planner_cls(self_rank_info, self_extractor, self_deployment=deployment)
+        return planner_cls(self_rank_info, self_extractor)
 
     model.build_transfer_planner = build_transfer_planner
     return planner_cls
 
 
-__all__ = ["PLANNERS", "Deployment", "bind_transfer_planner", "planner_for"]
+__all__ = ["PLANNERS", "bind_transfer_planner", "planner_for"]
