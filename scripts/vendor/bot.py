@@ -593,6 +593,25 @@ class Monitor:
             ) from error
         if previous.commit == reviewed.commit or not reviewed.branch:
             return None  # Includes lock-only promotions and tag-only updates.
+        if not pr.get("merged"):
+            comparison = self.gh.compare(self.gh.consumer_repo, base, revision)
+            merge_base = promote._sha(comparison["merge_base_commit"]["sha"])
+            try:
+                original = (
+                    before
+                    if merge_base == base
+                    else promote._lock_document_at(self.gh, self.gh.consumer_repo, merge_base)[
+                        "vendors"
+                    ]
+                )
+            except Diagnostic as error:
+                raise RuntimeError(f"PR merge-base vendor lock is invalid: {error}") from error
+            # Classify the PR's own changes, but retain the current canonical
+            # pin as the baseline for source-history checks and promotion.
+            if name not in original or (
+                manage._validate_vendor(name, original[name]).commit == reviewed.commit
+            ):
+                return None
         canonical = (
             promote._repo_name(previous.url).lower() == self.args.canonical_repo.lower()
             and previous.branch == self.args.canonical_branch

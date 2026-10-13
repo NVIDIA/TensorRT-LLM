@@ -732,6 +732,7 @@ class FakeGitHub(p.GitHub):
         self.comments: list[dict] = []
         self.reviews: list[dict] = []
         self.writes: list[tuple[str, str, dict]] = []
+        self.merge_base_sha = "c" * 40
 
     def api(
         self, endpoint: str, *, method: str = "GET", payload: dict | None = None
@@ -740,6 +741,8 @@ class FakeGitHub(p.GitHub):
             self.writes.append((endpoint, method, payload))
         if endpoint == "user":
             return {"login": "operator"}
+        if endpoint.startswith("repos/org/consumer/compare/"):
+            return {"merge_base_commit": {"sha": self.merge_base_sha}}
         if endpoint.endswith("/pulls/7"):
             return copy.deepcopy(self.pr)
         if "/pulls?" in endpoint:
@@ -1124,6 +1127,48 @@ def test_unrecognized_failures_are_operator_errors_not_author_feedback(
     health = monitor.store.get("health")
     assert health["counts"]["errors"] == 1
     assert "Operator failure" in health["last_error"]["message"]
+
+
+@pytest.mark.parametrize("change", ["other-vendor", "patch-only", "vendor-created"])
+def test_refresh_ignores_prs_without_selected_source_pin_change(
+    monitor: b.Monitor, monkeypatch: pytest.MonkeyPatch, change: str
+) -> None:
+    current = _vendor("1" * 40, "https://github.com/operator/library.git", "dev")
+    old = _vendor("2" * 40, "https://github.com/operator/library.git", "dev-old")
+    original = {"toy": old.to_mapping()}
+    reviewed = copy.deepcopy(original)
+    if change == "other-vendor":
+        reviewed["other"] = current.to_mapping()
+    elif change == "patch-only":
+        reviewed["toy"]["digest"] = "sha256-tree-v1:" + "3" * 64
+    else:
+        original = {}
+    monitor.gh.merge_base_sha = "d" * 40
+    locks = {"c" * 40: {"toy": current.to_mapping()}, "d" * 40: original, "a" * 40: reviewed}
+    monkeypatch.setattr(p, "_main_sha", lambda gh: "c" * 40)
+    monkeypatch.setattr(p, "_lock_document_at", lambda gh, repo, sha: {"vendors": locks[sha]})
+    monitor.inspect(7)
+    assert not monitor.gh.writes
+    assert monitor._inputs(monitor.gh.pr) is None
+    with contextlib.closing(b.Store(monitor.args.workdir / "fresh.sqlite")) as store:
+        b.Monitor(monitor.args, monitor.gh, store).inspect(7)
+    assert not monitor.gh.writes
+
+
+def test_refresh_source_update_uses_current_canonical_as_promotion_baseline(
+    monitor: b.Monitor, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    current = _vendor("1" * 40, "https://github.com/operator/library.git", "dev")
+    old = _vendor("2" * 40, "https://github.com/operator/library.git", "dev-old")
+    reviewed = _vendor("3" * 40, "https://github.com/author/library.git", "temporary")
+    monitor.gh.merge_base_sha = "d" * 40
+    locks = {"c" * 40: current, "d" * 40: old, "a" * 40: reviewed}
+    monkeypatch.setattr(p, "_main_sha", lambda gh: "c" * 40)
+    monkeypatch.setattr(
+        p, "_lock_document_at", lambda gh, repo, sha: {"vendors": {"toy": locks[sha].to_mapping()}}
+    )
+    assert monitor._inputs(monitor.gh.pr) == (current, reviewed)
+    assert not monitor.gh.writes
 
 
 def test_waiting_for_prior_promotion_is_maintainer_action_without_review(

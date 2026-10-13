@@ -246,6 +246,13 @@ same cutoff on every launch, including recovery. Historical updates belonging
 to another canonical branch, or superseded pins without a recoverable promotion,
 are not promoted or sent author feedback.
 
+Open PRs qualify only when they change the selected vendor's source commit
+relative to their Git merge base. A stale PR head after a canonical refresh is
+not itself a source update: changes only to other vendors or patch/digest fields
+do not require promotion metadata. Eligible updates are still checked against
+the latest canonical lock, so their source branches must include the refreshed
+canonical history before promotion.
+
 ### Monitoring health
 
 `--log-level INFO` is the default, in both foreground and daemon mode. Logs use
