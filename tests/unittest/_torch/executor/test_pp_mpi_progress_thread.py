@@ -14,15 +14,19 @@
 # limitations under the License.
 """CPU-only tests for the native pipeline parallelism MPI progress thread."""
 
+import threading
 import time
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 from mpi4py import MPI
 
-from tensorrt_llm._torch.pyexecutor.pp_utils import PPCommTag
+from tensorrt_llm._torch.pyexecutor.pp_utils import MPI_PROGRESS_POLL_MS_ENV_VAR_NAME, PPCommTag
 from tensorrt_llm._torch.pyexecutor.py_executor import (
     DEFAULT_PP_MPI_PROGRESS_INTERVAL_US,
     PP_MPI_PROGRESS_INTERVAL_US_ENV_VAR_NAME,
+    PyExecutor,
     _resolve_pp_mpi_progress_interval_us,
 )
 from tensorrt_llm.bindings import MpiProgressThread
@@ -97,3 +101,67 @@ def test_thread_leaves_other_messages_to_the_receiver():
 def test_rejects_nonpositive_interval(interval_us):
     with pytest.raises(RuntimeError, match="interval must be positive"):
         MpiProgressThread(MPI.COMM_WORLD.py2f(), interval_us, int(PPCommTag.MPI_PROGRESS_PROBE))
+
+
+def _executor(monkeypatch, pp_size: int) -> PyExecutor:
+    """An executor double that can run start_worker() and shutdown().
+
+    The executor and relay loops are replaced with no-ops, and the relay
+    thread's Python pump is disabled, so the native thread is the only MPI
+    progress source under test.
+    """
+    monkeypatch.setenv("TLLM_NUMA_AWARE_WORKER_AFFINITY", "0")
+    monkeypatch.setenv(MPI_PROGRESS_POLL_MS_ENV_VAR_NAME, "0")
+    monkeypatch.delenv(PP_MPI_PROGRESS_INTERVAL_US_ENV_VAR_NAME, raising=False)
+    executor = object.__new__(PyExecutor)
+    executor.dist = SimpleNamespace(rank=0, world_size=1, pp_size=pp_size)
+    executor.worker_lock = threading.Lock()
+    executor.worker_started = False
+    executor.num_micro_batches = 2
+    executor._disable_mpi = False
+    executor._mpi_progress_thread = None
+    executor.sampler = None
+    executor._event_loop_wrapper = lambda: None
+    executor._broadcast_sample_state_loop = lambda: None
+    executor.executor_request_queue = Mock()
+    executor.shutdown_event = Mock()
+    executor._profile_manager = Mock()
+    executor.hang_detector = Mock()
+    executor.hang_detector.detected.return_value = False
+    executor.kv_connector_manager = None
+    executor._shutdown_sleep_wakeup_listeners = Mock()
+    executor.model_engine = None
+    executor.draft_model_engine = None
+    executor.resource_manager = SimpleNamespace(resource_managers={})
+    executor.virtual_memory_pools = None
+    executor.dwdp_manager = None
+    return executor
+
+
+@needs_thread_multiple
+@pytest.mark.parametrize("hang_detected", [False, True], ids=["normal", "hang_detected"])
+def test_executor_stops_its_progress_thread_on_shutdown(monkeypatch, hang_detected):
+    executor = _executor(monkeypatch, pp_size=2)
+    executor.start_worker()
+    thread = executor._mpi_progress_thread
+    try:
+        assert thread is not None
+        assert thread.is_running
+        assert _wait_for_probes(thread, 3) >= 3
+
+        executor.hang_detector.detected.return_value = hang_detected
+        executor.shutdown()
+
+        assert executor._mpi_progress_thread is None
+        assert not thread.is_running
+    finally:
+        if thread is not None:
+            thread.stop()
+        executor._broadcast_mpi_comm.Free()
+
+
+def test_single_stage_executor_starts_no_progress_thread(monkeypatch):
+    executor = _executor(monkeypatch, pp_size=1)
+    executor.start_worker()
+    assert executor._mpi_progress_thread is None
+    executor.shutdown()
