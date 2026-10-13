@@ -1909,7 +1909,7 @@ class PyExecutor:
             # pump tick, so acknowledge the quiesce here; otherwise the exit
             # hook would wait out its full timeout.
             self._pp_mpi_progress_quiesced.set()
-        self._stop_mpi_progress_thread()
+            self._stop_mpi_progress_thread()
         # Signal non-rank-0 sleep/wakeup listener threads to exit.  This runs
         # after the worker thread has joined, which guarantees that the non-rank-0
         # executor loops have already processed the shutdown broadcast and are
