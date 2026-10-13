@@ -41,6 +41,8 @@ from tensorrt_llm._torch.visual_gen.config import (
 )
 from tensorrt_llm._torch.visual_gen.mapping import VisualGenMapping
 
+from ._visual_gen_dist_utils import single_rank_llm_mapping
+
 try:
     from tensorrt_llm._torch.visual_gen.attention_backend.flash_attn4 import (
         _flash_attn_fwd as _fa4_fwd,
@@ -225,7 +227,7 @@ def _make_model_config(
         cache=None,
         skip_create_weights_in_init=False,
     )
-    config.mapping = vgm.to_llm_mapping()
+    config.mapping = vgm.to_llm_mapping() if vgm.tp_size > 1 else single_rank_llm_mapping()
     return config
 
 

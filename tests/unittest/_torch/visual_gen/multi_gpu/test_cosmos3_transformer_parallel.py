@@ -38,6 +38,8 @@ from tensorrt_llm._torch.visual_gen.models.cosmos3.transformer_cosmos3 import (
 )
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
+from ._visual_gen_dist_utils import single_rank_llm_mapping
+
 # Attention2D (attn2d) wraps the compute backend in Attention2DAttention, which
 # requires (a) an LSE-capable inner backend — only FA4, VANILLA does not support
 # LSE — and (b) the ``flash_attn_combine`` JIT kernel.  Detect both up front so the
@@ -315,7 +317,7 @@ def _make_model_config(
         visual_gen_mapping=vgm,
         skip_create_weights_in_init=False,
     )
-    config.mapping = vgm.to_llm_mapping()
+    config.mapping = vgm.to_llm_mapping() if vgm.tp_size > 1 else single_rank_llm_mapping()
     return config
 
 

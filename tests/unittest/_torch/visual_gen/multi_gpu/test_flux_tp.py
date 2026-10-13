@@ -47,6 +47,7 @@ from tensorrt_llm._torch.visual_gen.models.flux.joint_proj import (
 )
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
+from ._visual_gen_dist_utils import single_rank_llm_mapping
 from .tp_shard_utils import (
     copy_tp_parameter,
     shard_dim1,
@@ -191,7 +192,7 @@ def _make_model_config(pretrained_dict, tp_size=1, ulysses_size=1, backend="VANI
         ),
         skip_create_weights_in_init=False,
     )
-    config.mapping = vgm.to_llm_mapping()
+    config.mapping = vgm.to_llm_mapping() if vgm.tp_size > 1 else single_rank_llm_mapping()
     return config
 
 

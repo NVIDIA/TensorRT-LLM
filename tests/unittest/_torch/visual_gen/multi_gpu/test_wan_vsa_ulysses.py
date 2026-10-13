@@ -49,6 +49,8 @@ from tensorrt_llm._torch.visual_gen.mapping import VisualGenMapping
 from tensorrt_llm._utils import get_free_port
 from tensorrt_llm.visual_gen.sparse_attention import VideoSparseAttentionConfig
 
+from ._visual_gen_dist_utils import single_rank_llm_mapping
+
 _cute_dsl_available = _cute_dsl_import_error is None
 
 
@@ -145,7 +147,7 @@ def _make_vsa_model_config(
         visual_gen_mapping=vgm,
         skip_create_weights_in_init=False,
     )
-    config.mapping = vgm.to_llm_mapping()
+    config.mapping = vgm.to_llm_mapping() if vgm.tp_size > 1 else single_rank_llm_mapping()
     return config
 
 
