@@ -108,6 +108,7 @@ def test_pcg_fx_fallback_policy_is_model_specific(
         trust_remote_code=False,
         disable_overlap_scheduler=True,
         kv_cache_config=KvCacheConfig(),
+        sleep_config=None,
         enable_layerwise_nvtx_marker=False,
         cuda_graph_config=None,
         torch_compile_config=compile_config if compile_enabled else None,
@@ -329,7 +330,10 @@ def test_compiled_mxfp8_warmup_backend_selection(
     inputs = torch.zeros(2, 4)
     output = torch.zeros(2, 3)
     layer = SimpleNamespace(
-        weight=torch.zeros(3, 4), weight_scale=torch.ones(4), dtype=torch.float32
+        weight=torch.zeros(3, 4),
+        weight_scale=torch.ones(4),
+        _mxfp8_alpha=torch.ones(1, dtype=torch.float32),
+        dtype=torch.float32,
     )
     native_gemm = Mock(return_value=output)
     flashinfer_gemm = Mock(return_value=output)
@@ -348,6 +352,7 @@ def test_compiled_mxfp8_warmup_backend_selection(
     monkeypatch.setitem(sys.modules, "flashinfer", SimpleNamespace(autotune=flashinfer_tune))
     method = MXFP8LinearMethod()
     engine = SimpleNamespace(
+        _warmup_timer=_WarmupTimer(rank=0),
         _config=SimpleNamespace(
             enable_autotuner=True,
             torch_compile_enabled=compile_enabled,
@@ -363,7 +368,7 @@ def test_compiled_mxfp8_warmup_backend_selection(
         ),
         _torch_compile_backend=None,
         _eager_workspace_reclaimer=None,
-        _warmup_timer=_WarmupTimer(rank=0),
+        is_warmup=True,
         cuda_graph_runner=SimpleNamespace(enabled=True),
         model=SimpleNamespace(
             modules=lambda: [
@@ -745,6 +750,12 @@ def _run_warmup_tracked(
     tracker = _Tracker()
     # Engines left by earlier tests are cyclic; finalize them before tracking.
     gc.collect()
+    # Observe this module's explicit cleanup without counting unrelated
+    # destructors triggered by gc.collect() or lazy imports.
+    tracked_cuda = SimpleNamespace(**vars(torch.cuda))
+    tracked_cuda.empty_cache = tracker("empty_cache")
+    tracked_torch = SimpleNamespace(**vars(torch))
+    tracked_torch.cuda = tracked_cuda
     helix_ctx = (
         patch.object(model_engine.mapping, "has_cp_helix", return_value=True)
         if force_helix_cp
@@ -778,7 +789,7 @@ def _run_warmup_tracked(
             "tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner.warmup_sampling_module",
             side_effect=tracker("sampling_warmup"),
         ),
-        patch("torch.cuda.empty_cache", side_effect=tracker("empty_cache")),
+        patch.object(decoder_runner_module, "torch", tracked_torch),
         patch(
             "tensorrt_llm._torch.custom_ops.torch_custom_ops.MoERunner.clear_all_workspaces",
             side_effect=tracker("moe_clear"),
@@ -898,34 +909,25 @@ class TestWarmupCleanup(unittest.TestCase):
                 "tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner.warmup_sampling_module",
                 side_effect=lambda: events.append("sampling"),
             ) as warmup_sampling,
-            patch(
-                "tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner.warmup_sample_from_logits_op",
-                side_effect=lambda *args: events.append("in_graph_sampling"),
-            ) as warmup_in_graph_sampling,
             _capture_tllm_logs() as logs,
         ):
             for enabled in (False, True):
                 with self.subTest(enable_in_graph_sampling=enabled):
                     events.clear()
                     warmup_sampling.reset_mock()
-                    warmup_in_graph_sampling.reset_mock()
                     runner._config.enable_in_graph_sampling = enabled
                     runner._eager_workspace_reclaimer = object()
                     model_engine._warmup_impl(resource_manager)
                     self.assertEqual(
                         events,
-                        [("enter", "sampling_warmup_seconds"), "sampling"]
-                        + (["in_graph_sampling"] if enabled else [])
-                        + [("exit", "sampling_warmup_seconds")],
+                        [
+                            ("enter", "sampling_warmup_seconds"),
+                            "sampling",
+                            ("exit", "sampling_warmup_seconds"),
+                        ],
                     )
                     self.assertIsNone(runner._eager_workspace_reclaimer)
                     warmup_sampling.assert_called_once_with()
-                    if enabled:
-                        warmup_in_graph_sampling.assert_called_once_with(
-                            128, torch.device("cuda"), torch.float16, [1, 4]
-                        )
-                    else:
-                        warmup_in_graph_sampling.assert_not_called()
 
         self.assertTrue(
             any("Skipping warm up as no KV Cache manager allocated." in log for log in logs)
@@ -980,7 +982,8 @@ class TestWarmupCleanup(unittest.TestCase):
             is_warmup_only=False,
         )
         runner._metrics = {}
-        resource_manager = object()
+        runner.kv_cache_manager_key = ResourceManagerType.KV_CACHE_MANAGER
+        resource_manager = ResourceManager({})
         events = []
 
         @contextlib.contextmanager

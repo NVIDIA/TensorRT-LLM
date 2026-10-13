@@ -79,6 +79,7 @@ def _finished_ctx_only_request(request_id: int = 1) -> SimpleNamespace:
         is_finished_due_to_cancellation=False,
         is_child=False,
         parent_request_id=None,
+        request_id=request_id,
         py_request_id=request_id,
         py_kv_transfer_start_time=None,
     )
@@ -86,8 +87,9 @@ def _finished_ctx_only_request(request_id: int = 1) -> SimpleNamespace:
 
 def _connector_executor() -> PyExecutor:
     executor = _stub_executor()
-    executor.kv_connector_manager = Mock()
+    executor.kv_connector_manager = Mock(capacity_only=False)
     executor.kv_connector_manager.request_finished.return_value = True
+    executor.kv_connector_manager.has_outstanding_save.return_value = False
     executor.kv_cache_manager = Mock()
     executor.kv_cache_manager.get_cache_indices.return_value = [7]
     executor.async_transfer_manager = Mock()
@@ -97,11 +99,11 @@ def _connector_executor() -> PyExecutor:
 def test_connector_save_uses_previous_batch_with_overlap_scheduler() -> None:
     executor = _connector_executor()
     executor.disable_overlap_scheduler = False
-    prev_req = SimpleNamespace(is_finished=True, py_request_id=2)
+    prev_req = SimpleNamespace(is_finished=True, request_id=2, py_request_id=2)
     executor.previous_batch = SimpleNamespace(
         scheduled_requests=SimpleNamespace(all_requests=lambda: [prev_req])
     )
-    current_req = SimpleNamespace(is_finished=True, py_request_id=3)
+    current_req = SimpleNamespace(is_finished=True, request_id=3, py_request_id=3)
 
     PyExecutor._save_kv_to_connector_async(executor, [current_req])
 
@@ -112,8 +114,8 @@ def test_connector_save_uses_previous_batch_with_overlap_scheduler() -> None:
 def test_connector_save_uses_scheduled_batch_without_overlap_scheduler() -> None:
     executor = _connector_executor()
     executor.disable_overlap_scheduler = True
-    finished = SimpleNamespace(is_finished=True, py_request_id=4)
-    running = SimpleNamespace(is_finished=False, py_request_id=5)
+    finished = SimpleNamespace(is_finished=True, request_id=4, py_request_id=4)
+    running = SimpleNamespace(is_finished=False, request_id=5, py_request_id=5)
 
     PyExecutor._save_kv_to_connector_async(executor, [finished, running])
 
@@ -125,7 +127,7 @@ def test_connector_save_skips_transfer_when_connector_declines() -> None:
     executor = _connector_executor()
     executor.disable_overlap_scheduler = True
     executor.kv_connector_manager.request_finished.return_value = False
-    finished = SimpleNamespace(is_finished=True, py_request_id=6)
+    finished = SimpleNamespace(is_finished=True, request_id=6, py_request_id=6)
 
     PyExecutor._save_kv_to_connector_async(executor, [finished])
 
@@ -148,7 +150,8 @@ def _dual_claim_executor() -> PyExecutor:
     transceiver.kv_transfer_timeout_ms = None
     transceiver.has_retired_send_session.return_value = False
     executor.kv_cache_transceiver = transceiver
-    executor.kv_connector_manager = Mock()
+    executor.kv_connector_manager = Mock(capacity_only=False)
+    executor.kv_connector_manager.has_outstanding_save.return_value = False
     executor.disable_overlap_scheduler = True
     executor.active_requests = []
     executor.canceled_req_ids = []

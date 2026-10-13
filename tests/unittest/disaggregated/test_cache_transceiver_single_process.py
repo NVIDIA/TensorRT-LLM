@@ -2331,6 +2331,7 @@ def _offload_lifecycle_executor(
     executor.iter_counter = 0
     executor.stream_interval = 1
     executor.model_engine = SimpleNamespace(route_capture=None)
+    executor.draft_model_engine = None
     executor.perf_manager = SimpleNamespace(
         get_timestamp=time.monotonic, append_step_metrics=lambda *args, **kwargs: None
     )

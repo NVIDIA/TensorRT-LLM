@@ -88,8 +88,8 @@ struct SeqBlock
         bool ret = treeBlock != nullptr;
         if (TLLM_UNLIKELY(gDebug))
         {
-            // When committed: must have one canonical beam, and all non-null
-            // pages must be CommittedPage.
+            // Committed blocks have one canonical beam; publication concerns reusable pages.
+            // Request-private state stays uncommitted.
             if (ret)
             {
                 TLLM_CHECK(pages.size() == BeamIndex{1});
@@ -98,7 +98,7 @@ struct SeqBlock
                         if (!blockPageIsNull(bp))
                         {
                             auto pg = blockPageGetPage(bp);
-                            TLLM_CHECK(!pg || dynamicPointerCast<CommittedPage>(pg));
+                            TLLM_CHECK(!pg || dynamicPointerCast<CommittedPage>(pg) || pg->isPrivate());
                         }
             }
             else
@@ -204,6 +204,25 @@ private:
     std::vector<CachedCudaEvent> mReadyEvents;
 };
 
+// Availability at the claimed prefix, indexed by LayerGroupId. OPTIONAL
+// candidates are held until the first successful resume or close.
+// Describes the initial prefix claim, not subsequent request progress.
+struct ReuseGroupStatus
+{
+    // Lifecycle group returned by getLayerGroupId(layerId), not a physical pool index.
+    LayerGroupId groupId;
+    // REQUIRED constrains the prefix match; OPTIONAL is selected at resume; PRIVATE is never reused.
+    AttentionReusePolicy policy;
+    // Exclusive token endpoint of the prefix claimed by REQUIRED groups, shared by all groups.
+    int endpoint;
+    // All state needed by this group at endpoint is available; does not imply GPU residency or selection.
+    // False for an empty prefix, PRIVATE groups, or missing/discarded OPTIONAL candidates.
+    bool complete;
+    // Retained token ranges [begin, end), including block-rounded SWA windows and sinks.
+    // SSM uses (endpoint, endpoint) for its exact state; empty when complete is false.
+    std::vector<std::pair<int, int>> coverage;
+};
+
 // ---------------------------------------------------------------------------
 // KvCache — manages the per-sequence KV cache state.
 // Mirrors Python's _KVCache.
@@ -243,7 +262,8 @@ public:
     // isDecoding defaults to the current phase. A cache starts in prefill and cannot return to it
     // after decode admission. Set true when admitting a suspended request directly to decode.
     // Returns false if utilization too high or out of memory.
-    bool resume(std::optional<CUstream> stream = std::nullopt, std::optional<bool> isDecoding = std::nullopt);
+    bool resume(std::optional<CUstream> stream = std::nullopt, std::optional<bool> isDecoding = std::nullopt,
+        std::optional<std::vector<LifeCycleId>> optionalReuseGroups = std::nullopt);
 
     // Enter decode only after prefill has submitted its final KV accesses. Offloads complete sparse
     // history, deferring pages still needed on GPU by another owner. Retries deferred pages even
@@ -404,6 +424,11 @@ public:
     //! transfer overwrites the incomplete tail block of the local match while complete blocks
     //! survive, so only the tail stops counting as a local hit.
     void dropPartialBlockCachedTokenAttribution();
+
+    std::vector<ReuseGroupStatus> const& reuseStatus() const noexcept
+    {
+        return mReuseStatus;
+    }
 
     // Internal diagnostic: prefix supported by the attention pages alone,
     // before recurrent-state (SSM) snapshot pruning shortened the reuse.
@@ -781,6 +806,14 @@ private:
     bool mHasResumed = false; // Successful admission, independent of completed deferred copies.
 
     PendingStats mPendingStats;
+
+    std::vector<ReuseGroupStatus> mReuseStatus;
+    TypedVec<LifeCycleId, std::vector<std::pair<BlockOrdinal, SharedPtr<PageHolder>>>> mOptionalCandidates;
+    std::vector<LifeCycleId> mSelectedOptionalGroups;
+    void _collectReuseCandidates();
+    void _selectOptionalGroups(std::vector<LifeCycleId> const& groups);
+    // PRIVATE and unselected OPTIONAL groups need fresh pages for the claimed prefix.
+    bool _needsFreshPrefixPages(LifeCycleId lc) const;
 
     // SWA scratch slot support.
     bool mEnableSwaScratchReuse = false;

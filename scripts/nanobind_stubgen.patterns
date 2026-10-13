@@ -13,6 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-^bindings\.internal\.batch_manager\.kv_cache_manager_v2\.CachedCudaEvent\.NULL$:
+^(?:tensorrt_llm\.)?bindings\.internal\.batch_manager\.kv_cache_manager_v2\.CachedCudaEvent\.NULL$:
     \from typing import ClassVar
     NULL: ClassVar[CachedCudaEvent]
