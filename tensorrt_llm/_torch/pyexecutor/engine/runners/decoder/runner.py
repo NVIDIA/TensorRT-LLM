@@ -3417,10 +3417,10 @@ class DecoderRunner(ScheduledModelRunner):
                         mrope_delta_write_seq_slots.append(request.py_seq_slot)
                         request.py_mrope_delta_cache_slot = request.py_seq_slot
 
-                # Item scheduling builds a per-forward copy holding this chunk's joined rows.
-                # Keep it off the request so chunked prefill does not retain those rows between
-                # chunks outside the encoder-cache memory budget. Legacy requests keep their
-                # device payload for generation.
+                # Item scheduling builds a per-forward prompt-window copy with this chunk's
+                # joined rows. Keep it off the request so chunked prefill does not retain rows
+                # outside the encoder-cache budget, and keeps its full CPU payload for later
+                # items and a restarted prefill. Legacy requests keep their generation payload.
                 if request.py_mm_encoder_state is None:
                     request.py_multimodal_data = multimodal_params.multimodal_data
                 multimodal_params_list.append(multimodal_params)
