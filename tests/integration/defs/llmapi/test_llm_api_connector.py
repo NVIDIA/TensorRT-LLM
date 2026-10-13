@@ -720,13 +720,6 @@ SWA_WINDOW = 64
 SWA_MAX_SEQ_LEN = 512
 SWA_NUM_INPUT_TOKENS = 256
 
-MULTI_GROUP_CONNECTOR_UNSUPPORTED = pytest.mark.xfail(
-    raises=NotImplementedError,
-    strict=True,
-    reason=
-    "Connector initialization rejects multiple layer groups until grouped retention priorities are supported",
-)
-
 
 @pytest.mark.threadleak(enabled=False)
 @pytest.mark.parametrize("use_kv_cache_manager_v2", [True],
@@ -1034,10 +1027,7 @@ def test_connector_sliding_window_prefix_is_backed_by_real_pages(
 
 
 @pytest.mark.threadleak(enabled=False)
-@pytest.mark.parametrize("use_kv_cache_manager_v2", [
-    False,
-    pytest.param(True, marks=MULTI_GROUP_CONNECTOR_UNSUPPORTED),
-],
+@pytest.mark.parametrize("use_kv_cache_manager_v2", [False, True],
                          ids=["kv_cache_manager_v1", "kv_cache_manager_v2"],
                          indirect=True)
 def test_connector_vswa_reports_page_indices_per_layer_group(
@@ -1082,6 +1072,13 @@ def test_connector_vswa_reports_page_indices_per_layer_group(
     scheduler.get_num_new_matched_tokens.return_value = 0, False
     worker.get_finished.return_value = [], []
 
+    with pytest.raises(RequestError, match="retention.*multiple layer groups"):
+        model.generate([0] * SWA_NUM_INPUT_TOKENS,
+                       sampling_params=SamplingParams(max_tokens=4),
+                       kv_cache_retention_config=KvCacheRetentionConfig([]))
+    scheduler.update_state_after_alloc_by_layer_group.assert_not_called()
+    scheduler.request_finished_by_layer_group.assert_not_called()
+
     generate_and_wait(model, scheduler, worker, [0] * SWA_NUM_INPUT_TOKENS,
                       SamplingParams(max_tokens=4, ignore_eos=True))
 
@@ -1099,6 +1096,7 @@ def test_connector_vswa_reports_page_indices_per_layer_group(
     req = sched_output.new_requests[0]
 
     assert req.new_block_ids == []
+    assert req.priorities is None
     assert len(req.new_block_ids_by_layer_group) == 2
     # Ordinals stay positionally aligned across groups: a block with no page in
     # the sliding group, or one the window has passed, reads back as
@@ -1130,6 +1128,34 @@ def test_connector_vswa_reports_page_indices_per_layer_group(
     assert live[1] > live[0], (
         f"the full-attention group should keep more than the sliding one: {saved}"
     )
+
+
+@pytest.mark.threadleak(enabled=False)
+@pytest.mark.parametrize("use_kv_cache_manager_v2", [True],
+                         ids=["kv_cache_manager_v2"],
+                         indirect=True)
+def test_capacity_only_connector_accepts_multigroup_retention(
+        enforce_single_worker, model_with_connector, use_kv_cache_manager_v2):
+    model_fn, scheduler, worker = model_with_connector
+    worker.capacity_only = True
+    model = model_fn(disable_overlap_scheduler=True,
+                     max_seq_len=SWA_MAX_SEQ_LEN,
+                     kv_cache_config=KvCacheConfig(
+                         free_gpu_memory_fraction=0.1,
+                         max_attention_window=[SWA_WINDOW, SWA_MAX_SEQ_LEN]))
+    assert_kv_caches_registered(worker, use_kv_cache_manager_v2)
+    layout = worker.register_kv_cache_layout.call_args.args[0]
+    assert len(layout.groups) == 2
+
+    result = model.generate([0] * SWA_NUM_INPUT_TOKENS,
+                            sampling_params=SamplingParams(max_tokens=4,
+                                                           ignore_eos=True),
+                            kv_cache_retention_config=KvCacheRetentionConfig(
+                                [], decode_retention_priority=80))
+    assert len(result.outputs[0].token_ids) == 4
+    scheduler.build_connector_meta.assert_not_called()
+    scheduler.update_state_after_alloc_by_layer_group.assert_not_called()
+    scheduler.request_finished_by_layer_group.assert_not_called()
 
 
 def _disagg_transceiver_config(use_kv_cache_manager_v2):
@@ -1513,14 +1539,6 @@ def test_connector_max_utilization_is_rejected_on_v1_only(
             "beam",
             "beam",
             id="beam_search",
-        ),
-        pytest.param(
-            dict(kv_cache_config=KvCacheConfig(
-                free_gpu_memory_fraction=0.1,
-                max_attention_window=[SWA_WINDOW, SWA_MAX_SEQ_LEN])),
-            "VSWA",
-            "single layer group",
-            id="multiple_layer_groups",
         ),
         pytest.param(
             dict(enable_attention_dp=True),
@@ -2145,7 +2163,6 @@ VSWA_E2E_MAX_SEQ_LEN = 512
 
 
 @pytest.mark.threadleak(enabled=False)
-@MULTI_GROUP_CONNECTOR_UNSUPPORTED
 def test_connector_multi_pool_e2e_persistent_cache(enforce_single_worker,
                                                    monkeypatch):
     """The multi-pool data path, end to end, with a connector that moves real bytes.
@@ -2347,7 +2364,6 @@ GEMMA3_MAX_SEQ_LEN = 2048
 
 
 @pytest.mark.threadleak(enabled=False)
-@MULTI_GROUP_CONNECTOR_UNSUPPORTED
 def test_connector_vswa_e2e_gemma3(enforce_single_worker, monkeypatch):
     """A KV connector on a model whose architecture is variable-window.
 
@@ -2653,7 +2669,6 @@ GEMMA3_ENGAGED_GEN_TOKENS = 64
 
 
 @pytest.mark.threadleak(enabled=False)
-@MULTI_GROUP_CONNECTOR_UNSUPPORTED
 def test_connector_vswa_out_of_window_blocks_reach_the_connector(
         enforce_single_worker, monkeypatch):
     """The sliding window passing blocks, delivered per layer group.
@@ -2885,7 +2900,6 @@ SELECTIVE_WINDOW = 64
                          get_sm_version() not in (100, 103),
                          reason="gpt-oss-20b is MXFP4 and needs SM100/SM103")),
     ])
-@MULTI_GROUP_CONNECTOR_UNSUPPORTED
 def test_connector_transfers_only_in_window_blocks_to_the_sliding_group(
         enforce_single_worker, monkeypatch, model_rel, assert_round_trip):
     """The connector transfers each layer group only what that group can read.

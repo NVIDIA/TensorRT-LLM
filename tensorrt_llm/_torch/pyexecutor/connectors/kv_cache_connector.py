@@ -80,7 +80,8 @@ class RequestData:
     # hash is committed in the same scheduler step.
     block_hashes: List[int] = field(default_factory=list)
     # The retention priorities for each new block (same length as new_block_ids).
-    # Used for priority-based offload filtering. None means use default priority.
+    # Used for priority-based offload filtering. None omits priority metadata
+    # when the request has no explicit retention config.
     priorities: Optional[List[int]] = None
     # Per-request cache salt that the KV cache manager uses to isolate reuse
     # between requests carrying different salts. Connectors that key cached

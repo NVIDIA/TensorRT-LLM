@@ -1041,7 +1041,9 @@ def _create_py_executor(
                 and v2_selection is False):
             raise NotImplementedError(
                 "KV connector is not supported with VSWA (Variable Sliding Window Attention) "
-                "in this configuration. Use a single attention window.")
+                "in this configuration. Use KVCacheManagerV2 with a connector "
+                "that implements the per-layer-group APIs, or use a single attention window."
+            )
 
         if mapping.enable_attention_dp:
             raise NotImplementedError(

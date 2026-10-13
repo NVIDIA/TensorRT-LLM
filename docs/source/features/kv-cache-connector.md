@@ -76,14 +76,16 @@ These methods run on the leader process and drive the connector's behavior.
 
     | Set | Models it covers |
     |---|---|
-    | per-layer-group | single-layer-group models; multi-group configurations are currently rejected |
+    | per-layer-group | single-layer-group models and VSWA with KVCacheManagerV2 |
     | flat | non-VSWA, non-hybrid only |
 
     A set is complete when both of its methods are defined. An existing flat connector needs no change on the models it already covers: with a single layer group the base per-layer-group implementation folds back to the flat call. Hybrid / linear-attention models are not enabled for the connector yet; the per-layer-group set is the shape their cache will need. See [Running under VSWA](#running-under-vswa).
 
 ##### Running under VSWA
 
-Multi-layer-group configurations currently fail during connector initialization because retention priorities are represented by a single list. This applies to both KV cache managers, even when the connector implements the grouped APIs below. Single-window SWA remains allowed. The grouped interfaces and example describe the addressing needed for future VSWA connector support.
+KVCacheManagerV2 supports multiple layer groups with a connector implementing the grouped APIs below. KVCacheManagerV1 registers a single primary pool and cannot describe VSWA to a connector. Single-window SWA remains allowed with either manager.
+
+With V2, a connector that transfers KV rejects requests carrying `KvCacheRetentionConfig` when the cache has multiple layer groups: `RequestData.priorities` is a single list and cannot describe priorities per group. This is a request validation error; the service can start and process requests without an explicit retention config. Capacity-only connectors are exempt from this restriction because they do not transfer KV or emit this priority metadata. Native V2 retention without a connector remains supported across layer groups.
 
 Under variable sliding-window attention the KV cache allocates one pool per attention window size, and a page index only means something inside its own layer group. A single tensor and a single flat block list cannot describe that, so three methods have to be implemented together:
 
@@ -95,7 +97,7 @@ Under variable sliding-window attention the KV cache allocates one pool per atte
 
 Implementing the per-layer-group form of a pair is enough — the flat method it replaces does not also have to be defined.
 
-The current single-group restriction is checked during executor bring-up, before worker registration or request admission. Implementing all three methods does not bypass that restriction.
+The executor checks that both per-layer-group scheduler callbacks are implemented during bring-up for a multi-group cache. The worker then receives the layout through `register_kv_cache_layout`; its default implementation rejects multiple groups if only flat registration is implemented.
 
 `examples/llm-api/llm_kv_cache_connector_vswa.py` is a worked connector for this case. A VSWA connector has to do five things:
 
@@ -210,9 +212,9 @@ Two `RequestData` fields can be reported empty depending on the cache configurat
 | Field | When empty | Consequence |
 |---|---|---|
 | `block_hashes` | `[]` | No block-hash accessor exists on this path. Nothing in the runtime reads the field, and neither example connector uses it — both hash the token sequence themselves. A connector that keys its external store on `block_hashes` gets no key and therefore no hits and no saves; it does not mis-address a transfer. |
-| `priorities` | `None` | `KvCacheRetentionConfig` is not honoured, so every page carries the default priority. A warning is logged the first time a request carrying a retention config is reported. The gap is wider than the connector: the retention config has no effect either way in that configuration. |
+| `priorities` | `None` when the request has no explicit `KvCacheRetentionConfig` | Priority metadata is omitted; this does not imply that reused pages have default priority. For a single-group V2 cache, requests with an explicit retention config report native page priorities aligned with `new_block_ids`. Multi-group retention requests are rejected as described above. |
 
-Both are gaps to be closed rather than intended behaviour.
+The missing V2 block hashes remain a gap. Omitting priority metadata for requests without an explicit retention config is intentional.
 
 ##### Blocks with no page
 
