@@ -39,6 +39,24 @@ def _root_key(scope):
 
 
 class TestReuseScope(unittest.TestCase):
+    def test_event_salt_preserves_reuse_identity(self) -> None:
+        scope = ReuseScope(7, 11)
+        tokens = [TokenId(1), TokenId(2), TokenId(3)]
+        expected_keys = list(sequence_to_blockchain_keys(2, scope, tokens))
+        for cache_salt in (None, "", "tenant-A", "tenant-中文"):
+            with self.subTest(cache_salt=cache_salt):
+                with_metadata = ReuseScope(7, 11, cache_salt=cache_salt)
+                self.assertEqual(with_metadata.cache_salt, cache_salt)
+                self.assertEqual(with_metadata, scope)
+                self.assertEqual(with_metadata, (7, 11))
+                self.assertEqual(hash(with_metadata), hash(scope))
+                self.assertEqual(tuple(with_metadata), (7, 11))
+                self.assertEqual(len(with_metadata), 2)
+                self.assertEqual(with_metadata[-1], 11)
+                self.assertEqual(
+                    list(sequence_to_blockchain_keys(2, with_metadata, tokens)), expected_keys
+                )
+
     def test_reuse_scope_seeds_distinct_keys(self) -> None:
         # Distinct reuse scopes -- including the None-vs-0 cases for each field --
         # must seed distinct radix-tree keys.

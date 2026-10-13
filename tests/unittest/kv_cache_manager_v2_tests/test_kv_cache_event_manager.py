@@ -20,6 +20,7 @@ import sys
 import threading
 import time
 from importlib.util import find_spec
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, cast
 
 import msgspec
@@ -1539,6 +1540,72 @@ def test_v2_stored_events_match_block_hash_chain():
         gc.enable()
         if manager is not None:
             manager.shutdown()
+
+
+@pytest.mark.skipif(torch is None or not torch.cuda.is_available(), reason="requires CUDA")
+def test_v2_legacy_reuse_scope_preserves_optional_event_metadata() -> None:
+    init_cuda_once()
+    event_manager = KVCacheEventManager(max_kv_event_entries=16, window_size=128)
+    manager = _create_test_manager(event_manager)
+    try:
+        scopes = [
+            SimpleNamespace(lora_id=None, salt=1),
+            SimpleNamespace(lora_id=None, salt=2, cache_salt="tenant-中文"),
+        ]
+        for scope in scopes:
+            cache = manager.create_kv_cache(scope)
+            try:
+                assert cache.reuse_scope.salt == scope.salt
+                assert cache.reuse_scope.cache_salt == getattr(scope, "cache_salt", None)
+            finally:
+                cache.close()
+    finally:
+        manager.shutdown()
+
+
+@pytest.mark.skipif(torch is None or not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("hash_algo", [KV_CACHE_HASH_ALGO_V1, "v2_sha256"])
+@pytest.mark.parametrize("cache_salt", [None, "", "tenant-A", "tenant-中文"])
+def test_v2_stored_events_preserve_original_salt_after_request_close(
+    hash_algo: str, cache_salt: str | None
+) -> None:
+    init_cuda_once()
+    event_manager = KVCacheEventManager(
+        max_kv_event_entries=16, window_size=128, hash_algo=hash_algo
+    )
+    manager = _create_test_manager(event_manager)
+    try:
+        stream_holder = CachedCudaStream()
+        stream = cast(CudaStream, stream_holder.handle)
+        scope = ReuseScope(salt=123, cache_salt=cache_salt)
+        prefix = _token_ids(1, 9)
+        _commit_and_close(manager, stream, prefix, reuse_scope=scope)
+        del scope
+        initial = _flush_serialized_events(event_manager)
+        assert len(_stored_block_hashes(initial)) == 2
+
+        # The cached prefix and salt must survive the first request; only the new tail is stored.
+        _commit_and_close(
+            manager,
+            stream,
+            _token_ids(9, 11),
+            input_tokens=prefix,
+            reuse_scope=ReuseScope(salt=123),
+        )
+        extension = _flush_serialized_events(event_manager)
+        assert len(_stored_block_hashes(extension)) == 1
+        assert set(_stored_block_hashes(initial)).isdisjoint(_stored_block_hashes(extension))
+        blocks = [
+            block
+            for event in _stored_events(initial + extension)
+            for block in event["data"]["blocks"]
+        ]
+        assert [block["cache_salt"] for block in blocks] == [cache_salt] * 3
+        assert [token["token_id"] for token in blocks[-1]["tokens"]] == [9, 10]
+
+        assert manager.probe_reuse(ReuseScope(salt=123), prefix) == len(prefix)
+    finally:
+        manager.shutdown()
 
 
 @pytest.mark.skipif(torch is None or not torch.cuda.is_available(), reason="requires CUDA")
