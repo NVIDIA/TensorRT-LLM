@@ -372,6 +372,8 @@ def apply_layerwise_quant_config(
     quant_config_dict = model_config.quant_config_dict
     if quant_config_dict is not None:
         for name, module in named_modules:
+            if getattr(module, '_skip_layerwise_quant_config', False):
+                continue
             if isinstance(module, (MoE, VanillaMoE)):
                 for n, q in quant_config_dict.items():
                     # all linear layers inside FusedMoE share the same quant config
@@ -578,7 +580,7 @@ class DecoderModelForCausalLM(nn.Module,
                 hidden_size,
                 dtype=config.pretrained_config.torch_dtype,
                 quant_config=lm_head_quant_config,
-                output_dtype=config.lm_head_dtype,
+                output_dtype=config.lm_head_output_dtype,
             )
         else:
             if (hasattr(config, 'lora_config')
@@ -608,7 +610,7 @@ class DecoderModelForCausalLM(nn.Module,
                 use_custom_cublas_mm=getattr(model, 'use_custom_cublas_mm',
                                              False),
                 quant_config=lm_head_quant_config,
-                output_dtype=config.lm_head_dtype,
+                output_dtype=config.lm_head_output_dtype,
             )
 
             if self.has_custom_lm_head:
@@ -704,9 +706,10 @@ class DecoderModelForCausalLM(nn.Module,
             pretrained_config: Any = None) -> Optional[Literal["V1", "V2"]]:
         """Return the model's preferred KV cache manager version.
 
-        The preference is adopted only when the user leaves
-        ``kv_cache_config.use_kv_cache_manager_v2`` at ``"auto"``. Return
-        ``None`` to use the built-in V1 fallback.
+        The preference is adopted only when the user explicitly sets
+        ``kv_cache_config.use_kv_cache_manager_v2`` to ``"auto"``. The default
+        is ``True`` and does not consult this preference. Return ``None`` to
+        use the built-in V1 fallback for ``"auto"``.
 
         Args:
             pretrained_config: The loaded Hugging Face config. Shared model
@@ -724,9 +727,10 @@ class DecoderModelForCausalLM(nn.Module,
 
         Subclasses can override this to pin a specific transceiver
         implementation ('CPP' or 'PYTHON') that is adopted verbatim when the
-        user leaves ``cache_transceiver_config.transceiver_runtime`` at its
-        default 'auto'; unsupported configurations then fail loudly at
-        transceiver creation rather than being rerouted. Return None to
+        user explicitly sets ``cache_transceiver_config.transceiver_runtime``
+        to 'auto'. The default is 'PYTHON' and does not consult this preference.
+        Unsupported configurations fail loudly at transceiver creation rather
+        than being rerouted. Return None to
         defer to the global default: the Python transceiver, falling back to
         C++ only for conditions decidable from the transceiver config itself
         (non-NIXL backend or an infinite ``kv_transfer_timeout_ms``) — other

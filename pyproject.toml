@@ -45,6 +45,7 @@ exclude = [
     "triton_kernels/**",
     "tensorrt_llm/_torch/cute_dsl_kernels/rubin/moe/manual_mma_128dp.py",
     "tensorrt_llm/_torch/cute_dsl_kernels/rubin/moe/rubin_contiguous_grouped_blockscaled_gemm_fused_fc12.py",
+    "tensorrt_llm/grpc/openengine/_generated/**",
 ]
 
 
@@ -62,7 +63,6 @@ exclude = [
     ".devcontainer/make_env.py",
     ".github/scripts/label_community_user.py",
     ".github/scripts/pr_checklist_check.py",
-    "cpp/conanfile.py",
     "cpp/kernels/fmha_v2/conftest.py",
     "cpp/kernels/fmha_v2/fmha_test.py",
     "cpp/kernels/fmha_v2/setup.py",
@@ -81,7 +81,6 @@ exclude = [
     "cpp/kernels/xqa/gen_cpp_header.py",
     "cpp/kernels/xqa/gen_cubins.py",
     "cpp/kernels/xqa/ref.py",
-    "cpp/libnuma_conan.py",
     "cpp/micro_benchmarks/gen-moe-benchmark-file.py",
     "cpp/tensorrt_llm/deep_ep/strip_nvshmem_helper.py",
     "cpp/tensorrt_llm/kernels/cutlass_kernels/python/generate_kernels.py",
@@ -326,7 +325,6 @@ exclude = [
     "tensorrt_llm/_torch/modules/triton_linear.py",
     "tensorrt_llm/_torch/moe/expert_statistic.py",
     "tensorrt_llm/_torch/moe/fused_moe/__init__.py",
-    "tensorrt_llm/_torch/moe/fused_moe/communication/moe_alltoall.py",
     "tensorrt_llm/_torch/moe/fused_moe/create_moe.py",
     "tensorrt_llm/_torch/moe/fused_moe/deep_ep_utils.py",
     "tensorrt_llm/_torch/moe/fused_moe/fused_moe_cute_dsl.py",
@@ -635,7 +633,6 @@ exclude = [
     "tests/unittest/_torch/modeling/test_modeling_vila.py",
     "tests/unittest/_torch/modules/test_group_rmn_norm.py",
     "tests/unittest/_torch/modules/test_triton_linear.py",
-    "tests/unittest/_torch/moe/multi_gpu/test_moe_a2a.py",
     "tests/unittest/_torch/moe/test_fused_moe.py",
     "tests/unittest/_torch/moe/test_moe_host_sharer.py",
     "tests/unittest/_torch/moe/test_moe_load_balancer.py",
@@ -901,6 +898,12 @@ mypy_path = ".:tests/unittest:tests/unittest/_torch/sampler"
 [[tool.mypy.overrides]]
 module = ["tensorrt_llm.bindings.*"]
 ignore_errors = true
+
+# Generated pybind11 stub; DeepGEMM returns a bare py::dict from
+# get_bf16_mega_gate_config, which stubgen renders without type parameters.
+[[tool.mypy.overrides]]
+module = ["tensorrt_llm.deep_gemm_cpp_tllm", "deep_gemm_cpp_tllm"]
+disallow_any_generics = false
 
 [[tool.mypy.overrides]]
 module = [

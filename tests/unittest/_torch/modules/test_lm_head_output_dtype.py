@@ -12,13 +12,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""LMHead(output_dtype=torch.float32), which backs LlmArgs.lm_head_dtype="float32".
+"""LMHead(output_dtype=torch.float32), which backs LlmArgs.lm_head_output_dtype="float32".
 
 The weights and inputs stay bf16; the GEMM writes its float32 accumulator instead of
 rounding the logits to bf16. The float64 reference uses the same bf16 values, so the
 float32 path should match it up to accumulation order, while the default path is off
 by the bf16 rounding of each logit.
 """
+
+from pathlib import Path
 
 import pytest
 import torch
@@ -34,7 +36,8 @@ HIDDEN_SIZE = 1024
 DTYPE = torch.bfloat16
 
 
-def _make_inputs(num_tokens: int):
+def _make_inputs(num_tokens: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Generate BF16 inputs that expose final-output rounding."""
     torch.manual_seed(0)
     hidden = torch.randn(num_tokens, HIDDEN_SIZE, dtype=DTYPE)
     # Logits with a std of about 4, where bf16 rounding is on the order of 1e-2.
@@ -42,13 +45,15 @@ def _make_inputs(num_tokens: int):
     return hidden.cuda(), weight
 
 
-def _make_lm_head(weight: torch.Tensor, output_dtype, **kwargs) -> LMHead:
+def _make_lm_head(weight: torch.Tensor, output_dtype: torch.dtype | None, **kwargs) -> LMHead:
+    """Load the same unquantized weights into either output-dtype path."""
     lm_head = LMHead(VOCAB_SIZE, HIDDEN_SIZE, dtype=DTYPE, output_dtype=output_dtype, **kwargs)
     lm_head.load_weights([{"weight": weight}])
     return lm_head.cuda()
 
 
 def _reference_logits(hidden: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """Compute an independent FP64 reference from the same BF16 inputs."""
     return hidden.double() @ weight.cuda().double().t()
 
 
@@ -56,7 +61,10 @@ def _reference_logits(hidden: torch.Tensor, weight: torch.Tensor) -> torch.Tenso
     "tp_mode", [None, TensorParallelMode.COLUMN], ids=["no_tp", "column_gather"]
 )
 @pytest.mark.parametrize("num_tokens", [0, 1, 7, 128])
-def test_float32_output_matches_reference(num_tokens: int, tp_mode):
+def test_float32_output_matches_reference(
+    num_tokens: int, tp_mode: TensorParallelMode | None
+) -> None:
+    """Avoid BF16 output rounding for empty, single-token, and batched inputs."""
     hidden, weight = _make_inputs(num_tokens)
     kwargs = dict(
         mapping=Mapping(), tensor_parallel_mode=tp_mode, gather_output=True, reduce_output=False
@@ -84,7 +92,8 @@ def test_float32_output_matches_reference(num_tokens: int, tp_mode):
     assert lp_err_fp32 * 10 < lp_err_bf16
 
 
-def test_float32_output_one_dim_input():
+def test_float32_output_one_dim_input() -> None:
+    """Accept the one-dimensional hidden state used without attention metadata."""
     # LogitsProcessor passes hidden_states[-1] (1-D) when there is no attention metadata.
     hidden, weight = _make_inputs(1)
     logits = _make_lm_head(weight, torch.float32)(hidden[0])
@@ -95,7 +104,8 @@ def test_float32_output_one_dim_input():
     )
 
 
-def test_float32_output_spec_decoding_head_slice():
+def test_float32_output_spec_decoding_head_slice() -> None:
+    """Keep FP32 output precision when the speculative head slices the vocabulary."""
     # With lm_head TP in attention DP, the spec-decoding head slices the vocab at forward time.
     hidden, weight = _make_inputs(16)
     mapping = Mapping(enable_attention_dp=True, enable_lm_head_tp_in_adp=True)
@@ -114,7 +124,8 @@ def test_float32_output_spec_decoding_head_slice():
     torch.testing.assert_close(logits.double(), reference, rtol=1e-4, atol=1e-3)
 
 
-def test_output_dtype_rejects_quantized_head():
+def test_output_dtype_rejects_quantized_head() -> None:
+    """Reject the FP32-output option for unsupported quantized weights."""
     with pytest.raises(NotImplementedError, match="unquantized"):
         LMHead(
             VOCAB_SIZE,
@@ -125,7 +136,8 @@ def test_output_dtype_rejects_quantized_head():
         )
 
 
-def test_output_dtype_rejects_row_parallel():
+def test_output_dtype_rejects_row_parallel() -> None:
+    """Reject ROW parallelism rather than silently changing reduction precision."""
     with pytest.raises(NotImplementedError, match="ROW"):
         LMHead(
             VOCAB_SIZE,
@@ -136,8 +148,12 @@ def test_output_dtype_rejects_row_parallel():
         )
 
 
-def test_llm_args_lm_head_dtype(tmp_path):
-    assert TorchLlmArgs(model=str(tmp_path)).lm_head_dtype == "auto"
-    assert TorchLlmArgs(model=str(tmp_path), lm_head_dtype="float32").lm_head_dtype == "float32"
+def test_llm_args_lm_head_output_dtype(tmp_path: Path) -> None:
+    """Validate the public option's default, FP32 value, and unsupported values."""
+    assert TorchLlmArgs(model=str(tmp_path)).lm_head_output_dtype == "auto"
+    assert (
+        TorchLlmArgs(model=str(tmp_path), lm_head_output_dtype="float32").lm_head_output_dtype
+        == "float32"
+    )
     with pytest.raises(ValueError):
-        TorchLlmArgs(model=str(tmp_path), lm_head_dtype="float16")
+        TorchLlmArgs(model=str(tmp_path), lm_head_output_dtype="float16")

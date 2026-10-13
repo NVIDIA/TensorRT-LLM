@@ -32,6 +32,7 @@
 #include "tensorrt_llm/batch_manager/peftCacheManagerConfig.h"
 #include "tensorrt_llm/common/quantization.h"
 #include "tensorrt_llm/common/tllmDataType.h"
+#include "tensorrt_llm/kernels/moe/communication/moeAlltoAllCftSupport.h"
 #include "tensorrt_llm/nanobind/batch_manager/algorithms.h"
 #include "tensorrt_llm/nanobind/batch_manager/bindings.h"
 #include "tensorrt_llm/nanobind/batch_manager/cacheTransceiver.h"
@@ -149,6 +150,7 @@ NB_MODULE(TRTLLM_NB_MODULE, m)
 
     auto buildInfo = m.def_submodule("BuildInfo");
     buildInfo.attr("ENABLE_MULTI_DEVICE") = nb::int_(ENABLE_MULTI_DEVICE);
+    buildInfo.attr("CFT_COUNTED_WRITES") = nb::bool_(static_cast<bool>(TLLM_CFT_HAS_CUDA_13_4_SUPPORT));
 
     nb::class_<tb::PeftCacheManagerConfig>(m, "PeftCacheManagerConfig")
         .def(nb::init<SizeType32, SizeType32, SizeType32, SizeType32, SizeType32, SizeType32, SizeType32, SizeType32,

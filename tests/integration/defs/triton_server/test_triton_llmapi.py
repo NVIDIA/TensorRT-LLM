@@ -30,7 +30,7 @@ import torch
 import yaml
 
 from .common import check_server_ready, prepare_llmapi_model_repo, set_llmapi_decoupled_mode
-from .conftest import find_repo_root, venv_check_call, venv_check_output
+from .conftest import find_repo_root, llm_models_root, venv_check_call, venv_check_output
 from .trt_test_alternative import call, check_call, print_info
 
 LLM_ROOT = os.environ.get("LLM_ROOT", find_repo_root())
@@ -62,12 +62,18 @@ def test_llmapi_backend(
     llm_backend_inflight_batcher_llm_root,
     llm_backend_venv,
     llm_backend_dataset_root,
-    tiny_llama_model_root,
 ):
     llm_backend_repo_root = os.path.join(LLM_ROOT, "triton_backend")
 
     if torch.cuda.device_count() < int(TENSOR_PARALLEL_SIZE):
         pytest.skip("Skipping. Not enough GPUs.")
+
+    models_root = llm_models_root()
+    assert models_root, "Did you set LLM_MODELS_ROOT?"
+    qwen_model_root = os.path.join(models_root, "Qwen3", "Qwen3-0.6B")
+    assert os.path.exists(qwen_model_root), (
+        f"{qwen_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
+    )
 
     # Prepare model repo
     new_model_repo = os.path.join(llm_backend_repo_root, "triton_repo")
@@ -80,7 +86,7 @@ def test_llmapi_backend(
     model_config["triton_config"]["max_batch_size"] = int(TRITON_MAX_BATCH_SIZE)
     model_config["tensor_parallel_size"] = int(TENSOR_PARALLEL_SIZE)
     model_config["kv_cache_config"] = {"free_gpu_memory_fraction": 0.8}
-    model_config["model"] = tiny_llama_model_root
+    model_config["model"] = qwen_model_root
     with open(model_config_path, "w") as f:
         yaml.dump(model_config, f)
 
@@ -143,7 +149,7 @@ def test_llmapi_backend(
             run_cmd += [
                 "dataset",
                 f"--dataset={os.path.join(llm_backend_dataset_root, 'mini_cnn_eval.json')}",
-                f"--tokenizer-dir={tiny_llama_model_root}",
+                f"--tokenizer-dir={qwen_model_root}",
             ]
 
             print_info("DEBUG:: run_cmd: python3 " + " ".join(run_cmd))
@@ -185,7 +191,6 @@ def test_llmapi_lora(
     TENSOR_PARALLEL_SIZE,
     llm_backend_inflight_batcher_llm_root,
     llm_backend_venv,
-    tiny_llama_model_root,
     tiny_llama_lora_model_root,
 ):
     """E2E LoRA test for the new llmapi triton backend.
@@ -201,6 +206,15 @@ def test_llmapi_lora(
 
     if torch.cuda.device_count() < int(TENSOR_PARALLEL_SIZE):
         pytest.skip("Skipping. Not enough GPUs.")
+
+    # The LoRA adapter is fine-tuned specifically for TinyLlama-1.1B-Chat-v1.0
+    # and has no Qwen3-0.6B equivalent, so the base model stays on TinyLlama.
+    models_root = llm_models_root()
+    assert models_root, "Did you set LLM_MODELS_ROOT?"
+    tiny_llama_model_root = os.path.join(models_root, "llama-models-v2", "TinyLlama-1.1B-Chat-v1.0")
+    assert os.path.exists(tiny_llama_model_root), (
+        f"{tiny_llama_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
+    )
 
     # Prepare model repo with lora_config
     new_model_repo = os.path.join(llm_backend_repo_root, "triton_repo")
@@ -256,9 +270,14 @@ def test_llmapi_backend_multi_instance(
     llm_backend_inflight_batcher_llm_root,
     llm_backend_venv,
     llm_backend_dataset_root,
-    tiny_llama_model_root,
 ):
     llm_backend_repo_root = os.path.join(LLM_ROOT, "triton_backend")
+    models_root = llm_models_root()
+    assert models_root, "Did you set LLM_MODELS_ROOT?"
+    qwen_model_root = os.path.join(models_root, "Qwen3", "Qwen3-0.6B")
+    assert os.path.exists(qwen_model_root), (
+        f"{qwen_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
+    )
 
     # Prepare model repo
     new_model_repo = os.path.join(llm_backend_repo_root, "triton_repo")
@@ -274,7 +293,7 @@ def test_llmapi_backend_multi_instance(
     model_config["tensor_parallel_size"] = 1
     # Low KV cache to ensure both instances fit on GPU 0
     model_config["kv_cache_config"] = {"free_gpu_memory_fraction": 0.3}
-    model_config["model"] = tiny_llama_model_root
+    model_config["model"] = qwen_model_root
     with open(model_config_path, "w") as f:
         yaml.dump(model_config, f)
 
@@ -343,7 +362,7 @@ def test_llmapi_backend_multi_instance(
         "--decoupled",
         "dataset",
         f"--dataset={os.path.join(llm_backend_dataset_root, 'mini_cnn_eval.json')}",
-        f"--tokenizer-dir={tiny_llama_model_root}",
+        f"--tokenizer-dir={qwen_model_root}",
     ]
     print_info("DEBUG:: run_cmd: python3 " + " ".join(run_cmd))
     venv_check_call(llm_backend_venv, run_cmd)

@@ -31,6 +31,7 @@ from tensorrt_llm.bench.benchmark.utils.general import generate_warmup_dataset
 from tensorrt_llm.bench.dataclasses.configuration import RuntimeConfig
 from tensorrt_llm.bench.dataclasses.general import BenchmarkEnvironment
 from tensorrt_llm.bench.dataclasses.reporting import ReportUtility
+from tensorrt_llm.commands._telemetry import TelemetryCommand
 from tensorrt_llm.llmapi import CapacitySchedulerPolicy
 from tensorrt_llm.models.modeling_utils import SpeculativeDecodingMode
 
@@ -47,7 +48,7 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.sampling_params import SamplingParams
 
 
-@click.command(name="latency")
+@click.command(name="latency", cls=TelemetryCommand, telemetry_llm_startup=True)
 @optgroup.group("Engine run configuration",
                 help="Runtime settings for executing a TensorRT LLM model.")
 @optgroup.option(
@@ -266,10 +267,6 @@ def latency_command(
     exec_settings["settings_config"]["chunking"] = False
     exec_settings["settings_config"][
         "scheduler_policy"] = CapacitySchedulerPolicy.GUARANTEED_NO_EVICT
-
-    # Performance options
-    exec_settings["performance_options"]["cuda_graphs"] = True
-    exec_settings["performance_options"]["multi_block_mode"] = True
 
     exec_settings["extra_llm_api_options"] = params.get("extra_llm_api_options")
     exec_settings["explicit_cli_keys"] = collect_explicit_cli_keys()

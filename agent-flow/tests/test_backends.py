@@ -1113,3 +1113,27 @@ class TestCodexBackendVersion:
             lambda *a, **k: SimpleNamespace(returncode=1, stdout="", stderr="boom"),
         )
         assert codex_mod._codex_cli_version() == ""
+
+
+class TestSystemPromptSpill:
+    def test_short_prompt_passes_through_unchanged(self, tmp_path):
+        assert cc_mod.spill_system_prompt("hello", tmp_path, threshold=1024) == "hello"
+        assert not (tmp_path / ".agent-flow").exists()
+
+    def test_long_prompt_is_written_to_a_file_and_replaced_by_a_pointer(self, tmp_path):
+        prompt = "x" * 5000
+        pointer = cc_mod.spill_system_prompt(prompt, tmp_path, threshold=1024)
+        files = list((tmp_path / ".agent-flow").glob("system-prompt-*.md"))
+        assert len(files) == 1
+        assert files[0].read_text() == prompt
+        assert str(files[0]) in pointer
+        assert "Read tool" in pointer
+        assert len(pointer.encode()) < 1024
+
+    def test_spill_files_are_content_addressed(self, tmp_path):
+        prompt = "x" * 5000
+        cc_mod.spill_system_prompt(prompt, tmp_path, threshold=1024)
+        # Same content -> same file, no duplicate; different content -> new file.
+        cc_mod.spill_system_prompt(prompt, tmp_path, threshold=1024)
+        cc_mod.spill_system_prompt(prompt + "y", tmp_path, threshold=1024)
+        assert len(list((tmp_path / ".agent-flow").glob("system-prompt-*.md"))) == 2

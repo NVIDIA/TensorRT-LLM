@@ -34,6 +34,7 @@ from typing import Optional
 from blocks import Stage, YAMLIndex
 
 from .base import PRInputs, Rule, RuleResult
+from .docs_rule import is_docs_path
 
 # Stage key as declared in jenkins/L0_Test.groovy. Keep in sync.
 AGENT_FLOW_STAGE = "CPU-AgentFlow-UnitTest"
@@ -47,13 +48,13 @@ def _is_agent_flow_claim(path: str) -> bool:
 
     Claims everything under ``agent-flow/`` — source, tests, and build
     metadata (``pyproject.toml``, ``.pre-commit-config.yaml``) all affect
-    what the pytest stage installs and runs — except ``*.md`` docs, which
-    ``OutOfScopeRule`` claims as noop so a docs-only edit doesn't force the
-    stage.
+    what the pytest stage installs and runs — except documentation files,
+    which ``DocsRule`` routes to the dedicated docs build so a docs-only
+    edit doesn't force the agent-flow test stage.
     """
     if not path.startswith(_AGENT_FLOW_PREFIX):
         return False
-    if path.endswith(".md"):
+    if is_docs_path(path):
         return False
     return True
 

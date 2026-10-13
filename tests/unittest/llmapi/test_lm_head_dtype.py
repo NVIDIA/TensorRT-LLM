@@ -12,11 +12,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""End-to-end test for LlmArgs.lm_head_dtype.
+"""End-to-end test for LlmArgs.lm_head_output_dtype.
 
 With the default LM head, logits are rounded to the model dtype before the float32
 upcast, so every returned logit is exactly representable in the model dtype. With
-lm_head_dtype="float32" the LM head GEMM writes its float32 accumulator, so the
+lm_head_output_dtype="float32" the LM head GEMM writes its float32 accumulator, so the
 returned logits are not rounded, and greedy decoding still follows them.
 """
 
@@ -35,6 +35,7 @@ _MODEL = os.path.join("llama-models-v2", "TinyLlama-1.1B-Chat-v1.0")
 
 
 def _model_dir() -> str:
+    """Locate the CI checkpoint or skip when its weights are unavailable."""
     root = llm_models_root()
     path = os.path.join(root, _MODEL) if root else None
     if not path or not os.path.isdir(path):
@@ -43,11 +44,13 @@ def _model_dir() -> str:
 
 
 def _rounded_to(logits: torch.Tensor, dtype: torch.dtype) -> bool:
+    """Check whether all logits remain exactly representable in the model dtype."""
     return torch.equal(logits, logits.to(dtype).float())
 
 
-@pytest.mark.parametrize("lm_head_dtype", ["auto", "float32"])
-def test_lm_head_dtype_returned_logits(lm_head_dtype: str):
+@pytest.mark.parametrize("lm_head_output_dtype", ["auto", "float32"])
+def test_lm_head_output_dtype_returned_logits(lm_head_output_dtype: str) -> None:
+    """Check context and decode precision through the public LLM API."""
     model_dir = _model_dir()
     with open(os.path.join(model_dir, "config.json")) as f:
         model_dtype = getattr(torch, json.load(f)["torch_dtype"])
@@ -60,7 +63,7 @@ def test_lm_head_dtype_returned_logits(lm_head_dtype: str):
     )
     with LLM(
         model=model_dir,
-        lm_head_dtype=lm_head_dtype,
+        lm_head_output_dtype=lm_head_output_dtype,
         max_batch_size=8,
         # Context logits are not recomputed for reused KV cache blocks.
         kv_cache_config=KvCacheConfig(max_tokens=10000, enable_block_reuse=False),
@@ -75,7 +78,7 @@ def test_lm_head_dtype_returned_logits(lm_head_dtype: str):
     assert context_logits.shape[0] == len(output.prompt_token_ids)
     assert generation_logits.shape[0] == len(completion.token_ids)
 
-    rounded = lm_head_dtype == "auto"
+    rounded = lm_head_output_dtype == "auto"
     assert _rounded_to(context_logits, model_dtype) == rounded
     assert _rounded_to(generation_logits, model_dtype) == rounded
     assert torch.argmax(generation_logits, dim=-1).tolist() == completion.token_ids

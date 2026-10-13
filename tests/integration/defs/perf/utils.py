@@ -22,6 +22,7 @@ import re
 import signal
 import socket
 import subprocess
+import tempfile
 import threading
 import time
 from datetime import datetime
@@ -30,7 +31,8 @@ from pathlib import Path
 from typing import Dict, List, NamedTuple, Optional
 
 import pytest
-from defs.trt_test_alternative import print_error, print_info
+from defs.trt_test_alternative import (Popen, cleanup_process_tree, print_error,
+                                       print_info)
 
 from ..common import get_trt_llm_lib_dir
 from ..local_venv import PythonVenvRunnerImpl
@@ -180,11 +182,11 @@ def _run_command_with_captured_output(cmd: list[str],
         env = env.copy()
         env.setdefault("PYTHONUNBUFFERED", "1")
 
-    proc = subprocess.Popen(cmd,
-                            env=env,
-                            stdout=subprocess.PIPE,
-                            stderr=subprocess.STDOUT,
-                            start_new_session=True)
+    proc = Popen(cmd,
+                 env=env,
+                 stdout=subprocess.PIPE,
+                 stderr=subprocess.STDOUT,
+                 start_new_session=True)
 
     output_lines: list = []
     lock = threading.Lock()
@@ -212,11 +214,10 @@ def _run_command_with_captured_output(cmd: list[str],
     thread = threading.Thread(target=_reader, daemon=True)
     thread.start()
 
-    def _cleanup_after_abort():
-        try:
-            os.killpg(proc.pid, signal.SIGKILL)
-        except OSError:
-            pass
+    def _cleanup_after_abort() -> None:
+        # MPI workers can have their own process groups while sharing our
+        # subprocess's session, even after the session leader has exited.
+        cleanup_process_tree(proc, has_session=True)
         proc.wait()
         thread.join(timeout=10)
 
@@ -236,8 +237,11 @@ def _run_command_with_captured_output(cmd: list[str],
                 os.killpg(proc.pid, signal.SIGKILL)
                 break
 
-        thread.join(timeout=30)
         proc.wait()
+        # Leftover workers may also keep the stdout pipe open, even when the
+        # launcher exits successfully.
+        _cleanup_after_abort()
+        thread.join(timeout=30)
 
         with lock:
             output = ''.join(output_lines)
@@ -388,10 +392,17 @@ class PerfServeScriptTestCmds:
             "--host", self._host, "--port",
             str(self._port)
         ]
-        self._server_log_path = os.path.join(os.getcwd(),
-                                             "trtllm-serve-perf.log")
         print_info(f"Starting trtllm-serve: {' '.join(cmd)}")
-        self._server_log_file = open(self._server_log_path, "w")
+        # Cluster jobs can share a working directory. Create a unique log for
+        # each launch so another server cannot truncate its startup metrics.
+        self._server_log_file = tempfile.NamedTemporaryFile(
+            mode="w",
+            prefix="trtllm-serve-perf-",
+            suffix=".log",
+            dir=os.getcwd(),
+            delete=False)
+        self._server_log_path = self._server_log_file.name
+        print_info(f"trtllm-serve log: {self._server_log_path}")
         self._server_proc = subprocess.Popen(cmd,
                                              env=self.server_env,
                                              stdout=self._server_log_file,

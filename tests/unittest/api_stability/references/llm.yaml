@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 methods:
   __init__:
     parameters:
@@ -14,6 +17,10 @@ methods:
         annotation: bool
         default: False
         status: beta
+      enable_locality_domains:
+        annotation: bool
+        default: False
+        status: prototype
       cp_config:
         annotation: Optional[tensorrt_llm.llmapi.llm_args.CpConfig]
         default: null
@@ -99,6 +106,10 @@ methods:
         annotation: Literal["pytorch"]
         default: pytorch
         status: deprecated
+      modeling_v2:
+        annotation: Literal['off', 'auto', 'require']
+        default: 'off'
+        status: prototype
       cuda_graph_config:
         annotation: Union[tensorrt_llm.llmapi.llm_args.DecodeCudaGraphConfig, tensorrt_llm.llmapi.llm_args.EncodeCudaGraphConfig, NoneType]
         default: null
@@ -171,7 +182,7 @@ methods:
         annotation: bool
         default: False
         status: beta
-      lm_head_dtype:
+      lm_head_output_dtype:
         annotation: Literal['auto', 'float32']
         default: auto
         status: prototype
@@ -227,6 +238,10 @@ methods:
         annotation: bool
         default: False
         status: prototype
+      iter_perf_stats_interval:
+        annotation: int
+        default: 1
+        status: prototype
       batch_wait_timeout_ms:
         annotation: float
         default: 0
@@ -252,6 +267,10 @@ methods:
         default: null
         status: prototype
       enable_energy_metrics:
+        annotation: bool
+        default: False
+        status: prototype
+      bounded_replay_on_generation:
         annotation: bool
         default: False
         status: prototype
@@ -308,7 +327,7 @@ methods:
         default: null
         status: prototype
       sparse_attention_config:
-        annotation: Union[tensorrt_llm.llmapi.llm_args.QSASparseAttentionConfig, tensorrt_llm.llmapi.llm_args.RocketSparseAttentionConfig, tensorrt_llm.llmapi.llm_args.DeepSeekSparseAttentionConfig, tensorrt_llm.llmapi.llm_args.DeepSeekV4SparseAttentionConfig, tensorrt_llm.llmapi.llm_args.SkipSoftmaxAttentionConfig, tensorrt_llm.llmapi.llm_args.MiniMaxM3SparseAttentionConfig, NoneType]
+        annotation: Union[tensorrt_llm.llmapi.llm_args.QSASparseAttentionConfig, tensorrt_llm.llmapi.llm_args.RocketSparseAttentionConfig, tensorrt_llm.llmapi.llm_args.DeepSeekSparseAttentionConfig, tensorrt_llm.llmapi.llm_args.DeepSeekV4SparseAttentionConfig, tensorrt_llm.llmapi.llm_args.CSA2SparseAttentionConfig, tensorrt_llm.llmapi.llm_args.SkipSoftmaxAttentionConfig, tensorrt_llm.llmapi.llm_args.MiniMaxM3SparseAttentionConfig, NoneType]
         default: null
         status: prototype
       kv_cache_compression_config:

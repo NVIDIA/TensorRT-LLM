@@ -9,7 +9,7 @@ same reuse the explicit fixtures in this PR provide, but through shared test
 infrastructure only: no test signature changes, no wrapper functions.
 
 Eligibility is automatic:
-- size mismatch            -> new pool (cache keeps the old one for later)
+- size mismatch            -> incompatible cached pools drained before handout
 - env/sys.path mismatch    -> cached pool retired (workers froze that state
                               at spawn; a stale pool would silently miss it)
 - RPC executors            -> keep a private, never-cached pool; their seam
@@ -354,6 +354,8 @@ class SessionReuseCache:
             return real_cls(n_workers=n_workers, wait_shutdown=True)
         with self._lock:
             real = self._pools.pop(n_workers, None)
+        # Idle pools of other sizes still hold GPU memory.
+        self.drain()
         if real is not None:
             # Compare against the state FROZEN INTO the workers at spawn time:
             # if the current test expects different env/sys.path, the cached
@@ -470,8 +472,8 @@ class SessionReuseCache:
 
         Also reaps in-flight retire threads: drain runs at natural rendezvous
         points (failure fence, opt-out, session finish), so waiting here keeps
-        disposals from leaking past the session without ever blocking the
-        per-test hot path. The join is bounded for the same reason as below.
+        disposals from leaking into subsequent handouts. The join is bounded
+        for the same reason as below.
         """
         _reap_retires()
         with self._lock:

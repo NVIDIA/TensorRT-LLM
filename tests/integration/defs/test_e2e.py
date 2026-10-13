@@ -241,16 +241,16 @@ class BenchRunner:
         return result
 
 
-@pytest.mark.parametrize(
-    "model_name, llama_model_root",
-    [pytest.param("TinyLlama-1.1B-Chat-v1.0", "TinyLlama-1.1B-Chat-v1.0")],
-    indirect=["llama_model_root"])
-def test_trtllm_bench_invalid_token_pytorch(llm_root, llm_venv, model_name,
-                                            llama_model_root):
+def test_trtllm_bench_invalid_token_pytorch(llm_root, llm_venv):
+    model_name = "Qwen3-0.6B"
+    qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
+    assert os.path.exists(
+        qwen_model_root
+    ), f"{qwen_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
     # Prepare dataset with invalid tokens
     _, dataset_path = trtllm_bench_prolog(llm_root,
                                           llm_venv,
-                                          model_subdir=llama_model_root,
+                                          model_subdir=qwen_model_root,
                                           model_name=model_name,
                                           quant=None,
                                           streaming=False)
@@ -275,7 +275,7 @@ def test_trtllm_bench_invalid_token_pytorch(llm_root, llm_venv, model_name,
         output_path = Path(tmpdir) / "stdout.log"
         benchmark_cmd = \
                 f"trtllm-bench --model {model_name} " \
-                f"--model_path {llama_model_root} " \
+                f"--model_path {qwen_model_root} " \
                 f"throughput " \
                 f"--dataset {str(dataset_path)} --backend pytorch " \
                 f"--config {extra_options_path} " \
@@ -1337,10 +1337,6 @@ def test_ptp_quickstart_bert(llm_root, llm_venv, model_name, model_path,
                  None,
                  marks=skip_pre_blackwell,
                  id='DeepSeek-R1/DeepSeek-R1-0528-FP4'),
-    pytest.param('Kimi-K2-Thinking-NVFP4',
-                 None,
-                 marks=skip_pre_blackwell,
-                 id='Kimi-K2-Thinking-NVFP4'),
     pytest.param('MiniMax-M3',
                  _MINIMAX_M3_EVAL_CONFIG,
                  marks=skip_pre_blackwell,
@@ -1364,7 +1360,7 @@ def test_multi_nodes_eval(model_path: str, llm_api_config: Optional[dict[str,
         "--backend=pytorch",
     ]
 
-    if "Kimi" in model_path or "MiniMax-M3" in model_path:
+    if "MiniMax-M3" in model_path:
         run_cmd.append("--trust_remote_code")
     else:
         run_cmd.append(f"--tokenizer={model_dir}")

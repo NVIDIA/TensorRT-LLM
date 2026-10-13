@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import math
 from typing import Dict, List, Optional, Tuple
 
@@ -159,6 +162,7 @@ class LMHead(Linear):
         self.output_dtype = output_dtype
 
     def _writes_output_dtype(self) -> bool:
+        """Whether the GEMM must store a dtype different from its weights."""
         return (self.output_dtype is not None
                 and self.output_dtype != self.weight.dtype)
 
@@ -199,10 +203,11 @@ class LMHead(Linear):
         return output
 
     def apply_linear(self,
-                     input,
-                     bias,
+                     input: torch.Tensor,
+                     bias: Optional[torch.Tensor],
                      lora_params: Optional[dict] = None,
-                     layer_idx: Optional[int] = None):
+                     layer_idx: Optional[int] = None) -> torch.Tensor:
+        """Project hidden states in the configured GEMM output dtype."""
         # Linear.forward runs the GEMM through apply_linear for the COLUMN and
         # non-parallel modes, so the TP all-gather and the vocab-padding slice
         # in forward() apply unchanged to the output_dtype logits.

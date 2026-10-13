@@ -40,6 +40,9 @@ def _prepare_kda_chunk_indices(
 class KimiK3MambaMetadata(Mamba2Metadata):
     """Mamba metadata extended with Kimi K3 KDA preparation."""
 
+    # The KDA prefill kernel keys its compile cache on chunk alignment.
+    prefill_chunk_alignment = KDA_PREFILL_CHUNK_SIZE
+
     def __init__(self, max_batch_size: int, chunk_size: int, max_num_tokens: int) -> None:
         super().__init__(max_batch_size, chunk_size, max_num_tokens)
         # Every chunk contains at least one token, so this is a hard upper bound.
