@@ -30,6 +30,7 @@ from .indexer import (
     _effective_compress_ratio_divisor,
     _pick_dsl_expand,
     _select_indexer_compress_ratio,
+    use_cute_dsl_paged_mqa_logits,
 )
 from .kernels import fused_dsa_decode_metadata
 from .params import DSAMetadataParams
@@ -321,6 +322,9 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self.use_cute_dsl_topk = (
             sparse_metadata_params.use_cute_dsl_topk and IS_CUTLASS_DSL_AVAILABLE
         )
+        self.use_cute_dsl_paged_mqa_logits = use_cute_dsl_paged_mqa_logits(
+            sparse_metadata_params.use_cute_dsl_paged_mqa_logits
+        )
         self.enable_gvr_topk = (
             sparse_metadata_params.enable_heuristic_topk and get_sm_version() >= 100
         )
@@ -590,7 +594,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                 "self-sampling GVR prefill warmup ran out of memory; prefill "
                 "engines will JIT-compile lazily on first touch instead."
             )
-        if self.sparse_metadata_params.use_cute_dsl_paged_mqa_logits:
+        if self.use_cute_dsl_paged_mqa_logits:
             # mirror the DSL paged-MQA arena stride (rows round up to 256
             # elements). A drift here only degrades warmup to unused keys —
             # dispatch still lazy-JITs the true key outside capture.
@@ -1688,7 +1692,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         # TODO:
         # - Drop this sm90 branch (and the expanded buffers) once
         #   fp8_paged_mqa_logits supports an arbitrary next_n on sm90 too.
-        use_dsl = self.sparse_metadata_params.use_cute_dsl_paged_mqa_logits
+        use_dsl = self.use_cute_dsl_paged_mqa_logits
         if not self.is_ragged_verify:
             self._ragged_num_rows = 0
             self._attn_num_rows = 0

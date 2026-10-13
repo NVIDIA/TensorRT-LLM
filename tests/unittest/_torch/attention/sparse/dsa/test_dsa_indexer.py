@@ -61,6 +61,10 @@ from tensorrt_llm._torch.attention.backends.sparse.dsa.cache_manager import (
 from tensorrt_llm._torch.attention.backends.sparse.dsa.indexer import (
     transform_local_topk_and_prepare_pool_view_grouped,
 )
+from tensorrt_llm._torch.attention.backends.sparse.dsa.indexer import (
+    use_cute_dsl_paged_mqa_logits as resolve_cute_dsl_paged_mqa_logits,
+)
+from tensorrt_llm._torch.attention.backends.sparse.dsa.params import DSAParams
 from tensorrt_llm._torch.attention.backends.sparse.params import use_self_sampling_gvr
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream
@@ -175,6 +179,61 @@ def test_metadata_cache_geometry_comes_from_sparse_metadata_params(use_self_samp
     # The metadata mirror of the two-level dispatch drives prior allocation.
     assert metadata.use_self_sampling_topk == use_self_sampling
     assert metadata.needs_gvr_prior == (not use_self_sampling)
+
+
+@pytest.mark.parametrize(
+    "requested,cute_dsl_available,sm_100f,expected",
+    [
+        (True, True, True, True),
+        (True, True, False, False),  # Hopper / SM120: the custom op raises
+        (True, False, True, False),  # cutlass-dsl not installed
+        (False, True, True, False),
+    ],
+)
+def test_cute_dsl_paged_mqa_logits_gate(requested, cute_dsl_available, sm_100f, expected):
+    """Metadata and Indexer take the same decision: metadata builds the DSL
+    atom-split buffers and skips the sm90 MTP expansion off it."""
+    sparse_config = DeepSeekV4SparseAttentionConfig(
+        compress_ratios=[1, 4, 128],
+        index_head_dim=96,
+        index_topk=512,
+        indexer_k_dtype="fp8",
+        use_cute_dsl_paged_mqa_logits=requested,
+    )
+    metadata = object.__new__(DSAtrtllmAttentionMetadata)
+    metadata.sparse_metadata_params = sparse_config.to_sparse_metadata_params()
+    metadata.kv_cache_manager = SimpleNamespace(
+        tokens_per_block=256,
+        compressed_block_sizes={},
+        get_cache_indices=Mock(),
+    )
+    metadata.is_cuda_graph = False
+    metadata.create_buffers_for_mla_rope_append = Mock()
+    metadata.create_buffers_for_indexer = Mock()
+
+    indexer_mod = "tensorrt_llm._torch.attention.backends.sparse.dsa.indexer"
+    with (
+        patch(
+            "tensorrt_llm._torch.attention.backends.sparse.dsa.metadata.TrtllmAttentionMetadata.__post_init__"
+        ),
+        patch(f"{indexer_mod}.IS_CUTLASS_DSL_AVAILABLE", cute_dsl_available),
+        patch(f"{indexer_mod}.is_sm_100f", return_value=sm_100f),
+    ):
+        DSAtrtllmAttentionMetadata.__post_init__(metadata)
+        indexer_decision = resolve_cute_dsl_paged_mqa_logits(
+            sparse_config.to_sparse_params().use_cute_dsl_paged_mqa_logits
+        )
+
+    assert metadata.use_cute_dsl_paged_mqa_logits is expected
+    assert indexer_decision is expected
+
+
+def test_cute_dsl_paged_mqa_logits_default_is_aligned():
+    """ModelConfig.from_pretrained's no-config fallback reads the config
+    default, so the config classes and DSAParams must agree on it."""
+    assert DeepSeekSparseAttentionConfig().use_cute_dsl_paged_mqa_logits is True
+    assert DeepSeekV4SparseAttentionConfig().use_cute_dsl_paged_mqa_logits is True
+    assert DSAParams().use_cute_dsl_paged_mqa_logits is True
 
 
 @pytest.mark.parametrize(
@@ -308,7 +367,7 @@ def test_metadata_warmup_selfsampling_prefill_leg(
         _indexer_compress_ratio=4,
         kv_cache_manager=SimpleNamespace(),
         get_indexer_max_seq_len=Mock(return_value=msl_c),
-        sparse_metadata_params=SimpleNamespace(use_cute_dsl_paged_mqa_logits=True),
+        use_cute_dsl_paged_mqa_logits=True,
         num_sms=148,
     )
     ss_host = "tensorrt_llm._torch.kernels.blackwell.top_k.gvr_topk_decode_self_sampling_host"
@@ -1775,12 +1834,18 @@ def _create_mock_metadata(
     enable_context_mla_with_cached_kv=False,
     index_topk=2048,
     enable_indexer_skip=False,
-    use_cute_dsl_paged_mqa_logits=False,
+    use_cute_dsl_paged_mqa_logits=None,
     compress_ratio=1,
     indexer_head_dim=128,
     max_num_tokens=8192,
 ):
     """Helper to create mock metadata for testing."""
+    if use_cute_dsl_paged_mqa_logits is None:
+        # Match the indexer built from the config default: the buffer layout
+        # (separate full-next_n schedule) differs between the two kernels.
+        use_cute_dsl_paged_mqa_logits = resolve_cute_dsl_paged_mqa_logits(
+            DeepSeekSparseAttentionConfig.model_fields["use_cute_dsl_paged_mqa_logits"].default
+        )
 
     class MockKVCacheParams:
         """Mock KV cache parameters holding per-sequence cached token counts."""

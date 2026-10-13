@@ -89,6 +89,17 @@ except ImportError:
 _DG_SCHEDULE_BLOCK_KV = 64
 
 
+def use_cute_dsl_paged_mqa_logits(requested: bool) -> bool:
+    """Whether the CuTe DSL paged MQA logits kernel runs instead of DeepGEMM.
+
+    The indexer and the metadata must both use this: the metadata builds
+    DSL-only buffers (atom-split expansion, padded logits row stride) and
+    skips the sm90 MTP expansion off the same decision. is_sm_100f() is the
+    custom op's own precondition.
+    """
+    return requested and IS_CUTLASS_DSL_AVAILABLE and is_sm_100f()
+
+
 def _pick_dsl_expand(
     next_n: int,
     num_sms: int,
@@ -857,13 +868,8 @@ class Indexer(nn.Module):
         )
         self._prev_topk_copy_pending = False
         self.use_cute_dsl_topk = sparse_params.use_cute_dsl_topk and IS_CUTLASS_DSL_AVAILABLE
-        # is_sm_100f is the op's own precondition (cute_dsl_custom_ops raises a
-        # ValueError below it), so the gate has to match it exactly now that the
-        # flag defaults on -- otherwise every non-Blackwell DSA run aborts.
-        self.use_cute_dsl_paged_mqa_logits = (
+        self.use_cute_dsl_paged_mqa_logits = use_cute_dsl_paged_mqa_logits(
             sparse_params.use_cute_dsl_paged_mqa_logits
-            and IS_CUTLASS_DSL_AVAILABLE
-            and is_sm_100f()
         )
         self.weight_scale_factor = self.softmax_scale * self.n_heads**-0.5
 
