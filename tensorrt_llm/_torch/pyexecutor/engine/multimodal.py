@@ -157,6 +157,13 @@ def mm_encoder_cache_enabled(model: nn.Module) -> bool:
     return isinstance(model, MultimodalModelMixin) and model.encoder_cache_active
 
 
+def setup_mm_encoder_cuda_graphs(model: nn.Module) -> None:
+    """Capture local encoder graphs after metadata setup and before KV sizing."""
+    for module in model.modules():
+        if isinstance(module, MultimodalEncoderMixin):
+            module.enable_blocks_cuda_graph()
+
+
 def setup_mm_encoder_attn_metadata(
     model: nn.Module,
     input_processor: InputProcessor,

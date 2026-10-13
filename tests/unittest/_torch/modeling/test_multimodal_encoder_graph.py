@@ -300,6 +300,27 @@ def test_empty_buckets_rejected():
         )
 
 
+def test_capture_all_processes_largest_bucket_first() -> None:
+    runner = _make_logic_runner(
+        buckets=[
+            EncoderGraphKey(num_contexts=1, total_tokens=256),
+            EncoderGraphKey(num_contexts=1, total_tokens=1024),
+            EncoderGraphKey(num_contexts=1, total_tokens=512),
+        ]
+    )
+    captured_keys = []
+
+    def record_capture(
+        key: EncoderGraphKey, padded_seq_lengths: list[int], device: torch.device
+    ) -> None:
+        captured_keys.append(key)
+
+    with mock.patch.object(runner, "_capture_key", side_effect=record_capture):
+        runner.capture_all(torch.device("cpu"))
+
+    assert [key.total_tokens for key in captured_keys] == [1025, 513, 257]
+
+
 def test_metadata_buffer_snapshot_records_declared_attrs():
     md = _ToyMetadata(
         max_contexts=2,

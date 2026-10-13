@@ -55,7 +55,8 @@ from .engine.lora import resolve_lora_owner
 from .engine.model_call import ModelCaller
 from .engine.multimodal import (MultimodalItemScheduler, is_multimodal,
                                 mm_encoder_cache_enabled,
-                                setup_mm_encoder_attn_metadata, use_mrope)
+                                setup_mm_encoder_attn_metadata,
+                                setup_mm_encoder_cuda_graphs, use_mrope)
 from .engine.runners import resolve_runner_type
 from .engine.runners.common import (make_scheduled_inputs,
                                     resolve_mrope_position_deltas_cache)
@@ -538,6 +539,10 @@ class PyTorchModelEngine(ModelEngine):
                 set_torch_compiling(False)
                 self._nccl_window_tensor_scope_hooks = (
                     install_eager_nccl_window_tensor_scopes(self.model))
+
+            # Capture local encoders after their metadata is sized and before
+            # KV-cache estimation, so graph memory is included in the profile.
+            setup_mm_encoder_cuda_graphs(self.model)
         except Exception as e:
             import traceback
             traceback.print_exception(Exception, e, e.__traceback__)
