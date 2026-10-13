@@ -11925,6 +11925,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
         BlackwellMultiHeadLatentAttentionForwardFP8
     from ..cute_dsl_kernels.blackwell.attention.mla.mla_decode_fp16 import \
         BlackwellMultiHeadLatentAttentionForwardFP16
+    from ..cute_dsl_kernels.blackwell.attention.mla.mla_helpers import \
+        MAX_SPLITS as MLA_DECODE_MAX_SPLITS
 
     class CuteDSLNVMlaDecodeBlackwellRunner(TunableRunner):
         """Generic TunableRunner for the Blackwell CuTe DSL MLA decode kernels.
@@ -12407,6 +12409,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         tensor; element 0 is the BMM1 (softmax) scale.
                     inputs[11] (output_scale): FP8 runner only. float32 device
                         tensor; element 0 is the BMM2 (output) scale.
+                    inputs[12] (FP8) / inputs[10] (FP16) (block_split_kvs):
+                        Optional int32 tensor of shape (B): the per-request
+                        split-KV count planned on the device for this step's
+                        KV lengths (clamped by the kernel to the tactic's
+                        split_kv); absent = uniform split_kv.
                 tactic: Tuple containing (mma_qk_tiler_mn, mma_pv_tiler_mn,
                     split_kv, is_persistent).
                 **kwargs: Optional scalar softmax_scale and output_scale values
@@ -12424,8 +12431,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
             # FP8 KV keeps its scales on the device so neither the first call
             # nor CUDA graph replay needs a host read of the scale tensors.
             has_fp8_input = self.in_dtype == cutlass.Float8E4M3FN
+            fixed_inputs = 12 if has_fp8_input else 10
+            block_split_kvs = (inputs[fixed_inputs]
+                               if len(inputs) > fixed_inputs else None)
             if has_fp8_input:
-                if len(inputs) != 12:
+                if len(inputs) not in (12, 13):
                     raise RuntimeError(
                         "CuteDSLNVMlaDecodeBlackwellRunner FP8 input requires "
                         "softmax_scale and output_scale tensors at inputs[10:12]."
@@ -12542,6 +12552,25 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         f"{expected_bounds_shape}, got shape="
                         f"{tuple(kv_bounds.shape)}, dtype={kv_bounds.dtype}.")
 
+            if block_split_kvs is not None and (
+                    block_split_kvs.numel() != batch_size
+                    or block_split_kvs.dtype != torch.int32
+                    or block_split_kvs.device != o.device
+                    or not block_split_kvs.is_contiguous()):
+                if AutoTuner.get().is_tuning_mode:
+                    # Profiling rebuilds cache_seqs at bucketed sizes; the
+                    # step's plan does not apply to them (uniform split).
+                    block_split_kvs = None
+                else:
+                    raise RuntimeError(
+                        "CuteDSLNVMlaDecodeBlackwellRunner requires contiguous "
+                        f"int32 block_split_kvs of shape ({batch_size},) on the "
+                        "output device.")
+            # The per-request plan only distributes the split-KV workspace, so
+            # it applies only when that workspace is used.
+            if not use_workspace:
+                block_split_kvs = None
+            is_var_split_kv = block_split_kvs is not None
             # split_kv is a runtime Int32; only the workspace use is compiled in.
             cache_key = self.unique_id() + (
                 out_dtype,
@@ -12550,6 +12579,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 use_workspace,
                 is_persistent,
                 kv_bounds is not None,
+                is_var_split_kv,
             )
             if cache_key not in CuteDSLNVMlaDecodeBlackwellRunner.kernel_cache:
                 # A compile outside the tuning window stalls the serving loop
@@ -12574,10 +12604,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     self._SKIP_CORRECTION_THRESHOLD,
                     is_persistent,
                     self._IS_VAR_SEQ,
-                    self._IS_VAR_SPLIT_KV,
+                    is_var_split_kv,
                     num_heads=self.num_heads,
                     seq_len_q=seq_len_q,
-                    reducer_max_splits=32,
+                    # The variable split-KV reducer needs the generic capacity.
+                    reducer_max_splits=(MLA_DECODE_MAX_SPLITS
+                                        if is_var_split_kv else 32),
                     emit_softmax_stats=self.emit_softmax_stats,
                 )
                 q_latent_ct = cute.runtime.from_dlpack(
@@ -12613,8 +12645,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 kv_bounds_ct = (cute.runtime.from_dlpack(
                     kv_bounds, assumed_align=4).mark_layout_dynamic()
                                 if kv_bounds is not None else None)
-                # Variable split-KV (block_split_kvs) is not used on this path:
-                block_split_kvs_ct = None
+                block_split_kvs_ct = (cute.runtime.from_dlpack(
+                    block_split_kvs, assumed_align=4).mark_layout_dynamic()
+                                      if is_var_split_kv else None)
                 if has_fp8_input:
                     softmax_scale_ct = cute.runtime.from_dlpack(
                         softmax_scale).mark_layout_dynamic()
@@ -12682,7 +12715,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 cache_seqs,
                 kv_bounds,
                 None,  # cum_seq_lens_q: this path uses fixed query lengths
-                None,  # block_split_kvs: var-split path unused (is_var_split_kv False)
+                block_split_kvs,
                 softmax_scale,
                 output_scale,
                 stream,
@@ -12715,6 +12748,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         max_batch_size: int,
         softmax_stats: Optional[torch.Tensor],
         kv_bounds: Optional[torch.Tensor],
+        block_split_kvs: Optional[torch.Tensor] = None,
     ) -> None:
         """CuTe DSL FP8 MLA decode (Blackwell SM100/SM103/SM107).
 
@@ -12722,6 +12756,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
         is the BMM1 (softmax) and BMM2 (output) scale.
         kv_bounds: helix speculative verify groups -- per-token rank-local
         attention bounds of shape (B * seq_len_q,), int32.
+        block_split_kvs: optional per-request split-KV counts of shape (B,),
+        int32, planned on the device for the step's KV lengths.
         """
         if (sm_version := get_sm_version()) not in (100, 103, 107):
             raise ValueError(
@@ -12742,6 +12778,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             q_latent, q_rope, c_latent, c_rope, page_table, cache_seqs, o,
             workspace, softmax_stats, kv_bounds, softmax_scale, output_scale
         ]
+        if block_split_kvs is not None:
+            inputs.append(block_split_kvs)
         tuner = AutoTuner.get()
         _, best_tactic = tuner.choose_one(
             "trtllm::cute_dsl_mla_decode_fp8_blackwell",
@@ -12774,6 +12812,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         max_batch_size: int,
         softmax_stats: Optional[torch.Tensor],
         kv_bounds: Optional[torch.Tensor],
+        block_split_kvs: Optional[torch.Tensor] = None,
     ) -> None:
         return None
 
@@ -12800,11 +12839,14 @@ if IS_CUTLASS_DSL_AVAILABLE:
         max_batch_size: int,
         softmax_stats: Optional[torch.Tensor],
         kv_bounds: Optional[torch.Tensor],
+        block_split_kvs: Optional[torch.Tensor] = None,
     ) -> None:
         """CuTe DSL FP16/BF16 MLA decode (Blackwell SM100/SM103/SM107).
 
         kv_bounds: helix speculative verify groups — per-token rank-local
         attention bounds of shape (B * seq_len_q,), int32.
+        block_split_kvs: optional per-request split-KV counts of shape (B,),
+        int32, planned on the device for the step's KV lengths.
         """
         if (sm_version := get_sm_version()) not in (100, 103, 107):
             raise ValueError(
@@ -12842,6 +12884,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             q_latent, q_rope, c_latent, c_rope, page_table, cache_seqs, o,
             workspace, softmax_stats, kv_bounds
         ]
+        if block_split_kvs is not None:
+            inputs.append(block_split_kvs)
         tuner = AutoTuner.get()
         _, best_tactic = tuner.choose_one(
             "trtllm::cute_dsl_mla_decode_fp16_blackwell",
@@ -12879,6 +12923,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         max_batch_size: int,
         softmax_stats: Optional[torch.Tensor],
         kv_bounds: Optional[torch.Tensor],
+        block_split_kvs: Optional[torch.Tensor] = None,
     ) -> None:
         return None
 
