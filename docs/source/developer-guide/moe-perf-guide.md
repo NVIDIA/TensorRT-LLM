@@ -51,6 +51,8 @@ The parallelism scheme determines the communication volume and the computation e
 
 The parallelism scheme of MoE is expressed as a combination of `moe_ep_size` (experts partitioned across ranks) and `moe_tp_size` (every rank holds a shard of every expert), with `moe_ep_size * moe_tp_size = world_size`.
 
+The equations and recommendations in this guide assume `pp_size = 1` and `cp_size = 1`. Pipeline-parallel deployments are not covered; they must use the stage-local MoE group size instead of deployment-wide `world_size`.
+
 ![Expert parallel vs tensor parallel vs hybrid, 4 experts on 4 ranks](../media/moe-parallelism.png)
 
 | Scheme | Token-expert assignments per rank (balanced routing) | Per-rank GEMM `N` | Communication |
