@@ -68,11 +68,7 @@ from tensorrt_llm._torch.attention.backends.fmha.phased import get_spec_decoding
 from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._torch.models.modeling_utils import (
-    DecoderModel,
-    DecoderModelForCausalLM,
-    register_auto_model,
-)
+from tensorrt_llm._torch.models.modeling_utils import DecoderModel, DecoderModelForCausalLM
 
 from . import weights as _weights
 
@@ -661,7 +657,6 @@ class ModelingV2Core(DecoderModel):
         return x
 
 
-@register_auto_model("ModelingV2GptOss120bSm103Tp1")
 class ModelingV2GptOss120bSm103Tp1(DecoderModelForCausalLM[ModelingV2Core, PretrainedConfig]):
     def __init__(self, model_config: ModelConfig):
         cfg = model_config.pretrained_config

@@ -17,6 +17,7 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import (
     ResourceManager,
     ResourceManagerType,
 )
+from tensorrt_llm.bindings.internal.batch_manager import CacheType
 from tensorrt_llm.llmapi.llm_args import (
     ColdPageQuantizationCompressionConfig,
     KvCacheCompressionConfig,
@@ -95,6 +96,7 @@ def _v2_manager(*, is_draft: bool):
     from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 
     manager = KVCacheManagerV2.__new__(KVCacheManagerV2)
+    manager.kv_cache_type = CacheType.SELF
     manager.enable_block_reuse = False
     manager.kv_compression_manages_history = False
     manager.is_draft = is_draft
