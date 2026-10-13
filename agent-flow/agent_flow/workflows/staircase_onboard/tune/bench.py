@@ -497,7 +497,9 @@ def main() -> int:
             server.wait()
 
     rows = summarize(out_dir, concurrencies, world_size)
-    tree = args.tree or Path(os.environ.get("STAIRCASE_TREE", "") or Path.cwd())
+    # The tree the scheduler put first on the path (and whose import it checked)
+    # is the one measured; `--tree` names it only when the job ran without one.
+    tree = Path(os.environ["STAIRCASE_TREE"]) if os.environ.get("STAIRCASE_TREE") else (args.tree or Path.cwd())
     try:
         import importlib.metadata as md
 

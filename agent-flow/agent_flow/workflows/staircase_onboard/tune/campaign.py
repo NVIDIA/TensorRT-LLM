@@ -415,6 +415,13 @@ class Campaign:
             return
         st.kept_commits = git(best, "rev-list", "--reverse", f"{before}..HEAD").splitlines()
         st.status = "kept"
+        # Every other measurement in flight was stacked on the old best and would be
+        # re-measured anyway: stop it now and re-stack on the next pass.
+        for other in self.state.candidates.values():
+            if other.slug != st.slug and other.status == "e2e" and other.e2e_label:
+                if self.perf.cancel(other.e2e_label):
+                    self.log(f"[campaign] {other.slug}: cancelled its measurement on the old best")
+                    other.e2e_label = ""
         self.state.best_commit = git(best, "rev-parse", "HEAD")
         self.state.kept.append(st.slug)
         self.ledger.append("candidate_kept", slug=st.slug, commits=st.kept_commits, best=self.state.best_commit,

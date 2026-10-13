@@ -291,6 +291,17 @@ class SpoolRunner:
                 return True
         return False
 
+    def cancel(self, label: str) -> bool:
+        """Ask the session to stop a job of ours (the scheduler's sanctioned kill) and forget it."""
+        name = f"{self.prefix}-{label}"
+        entry = self.inflight.pop(name, None)
+        if entry is None:
+            return False
+        cancel_dir = Path(entry[0]) / "cancel"
+        cancel_dir.mkdir(parents=True, exist_ok=True)
+        (cancel_dir / name).touch()
+        return True
+
     def poll(self) -> list[tuple[str, str, int]]:
         done = []
         for name, (spool, label) in list(self.inflight.items()):

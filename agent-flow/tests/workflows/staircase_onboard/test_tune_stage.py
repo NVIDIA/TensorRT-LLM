@@ -40,6 +40,9 @@ class FakeRunner:
     def adopt(self, label):
         return False
 
+    def cancel(self, label):
+        return self.inflight.pop(f"{self.prefix}-{label}", None) is not None
+
     def free_spools(self):
         busy = {s for s, _ in self.inflight.values()}
         return [s for s in self.spools if s not in busy]
