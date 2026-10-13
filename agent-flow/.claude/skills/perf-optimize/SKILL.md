@@ -106,6 +106,10 @@ Run these checks; fix or ask only where noted.
      (`throughput_per_user` from decode iterations alone) — valid, but the
      end-to-end view (`output_tput_per_gpu`, the ctx:gen ratio) is ABSENT,
      not zero.
+     Code changes only: `approaches` defaults to `[code]` and `config` is
+     refused — the harness does not read the tuning overlay yet, so a config
+     candidate would be measured as the baseline.
+
    - **`disagg_sol:`** reads an established operating-point *design* (the
      `create-sweep` skill's measured sweep) and freezes each half on the point
      it selects. If the design is not established and `config_repo` is set, a

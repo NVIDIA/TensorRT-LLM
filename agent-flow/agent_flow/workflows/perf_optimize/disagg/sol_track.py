@@ -314,6 +314,33 @@ def build_source(sweep: Mapping[str, Any]) -> dict[str, Any] | None:
     return None
 
 
+#: The only approach a SOL-track campaign can apply today.
+SOL_APPROACHES: tuple[str, ...] = ("code",)
+
+#: Why `config` is refused rather than accepted and silently dropped.
+CONFIG_UNSUPPORTED = (
+    "'optimize.approaches' includes 'config', which a SOL-track campaign cannot "
+    "apply yet. The tuning overlay is written into the sweep under "
+    f"{sorted(TRACK_OVERLAY_KEYS.values())}, and neither the ibc-bench harness nor "
+    "the model config generators read those keys: a ctx-only run takes its server "
+    "options from the sweep's top-level `extra_llm_api`, and a gen run's worker "
+    "config is generated per row. So a config candidate would never reach the "
+    "workers, its measurement would come back at the baseline, and it would be "
+    "rejected as 'no gain' without having been tested. Use `approaches: [code]` "
+    "(the default for a SOL track) until the overlay is wired to what the harness reads."
+)
+
+
+def refuse_config(approaches: Any) -> None:
+    """Refuse `config` on a SOL track, for :data:`CONFIG_UNSUPPORTED`'s reason.
+
+    Refused, not filtered: a spec that asks for config tuning and gets a
+    code-only campaign would report on something other than what was asked.
+    """
+    if "config" in (approaches or []):
+        raise SolTrackError(CONFIG_UNSUPPORTED)
+
+
 def require_build_source(task_data: Mapping[str, Any], approaches: Any) -> None:
     """Refuse a source-changing campaign whose sweep installs nothing.
 
@@ -347,7 +374,8 @@ def require_build_source(task_data: Mapping[str, Any], approaches: Any) -> None:
             f"    trtllm_install:          # full C++ rebuild\n"
             f"      trtllm_repo: ...\n"
             f"      build_wheel: true\n"
-            f"or drop 'code' from approaches."
+            f"'code' is the only approach a SOL track supports, so the sweep has to "
+            f"name one of these for the campaign to measure anything."
         )
 
 

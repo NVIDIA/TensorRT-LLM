@@ -284,9 +284,12 @@ profile:
 # the track's. Leave `optimize.max_regression_pct` unset and every point can
 # veto an attempt, which is the gate a frozen-point campaign wants.
 #
-# The optimizer edits `<workspace>/tuning/extra_llm_api_options.yaml`, which is
-# a PARTIAL overlay deep-merged onto the worker config the sweep row generates
-# — so the row keeps the topology and the optimizer only carries what it tunes.
+# `optimize.approaches` is `[code]` on a SOL track, and `config` is REFUSED.
+# The tuning overlay is written into the sweep under `ctx_extra_llm_api` /
+# `gen_extra_llm_api`, keys the ibc-bench harness does not read yet, so a
+# config candidate would never reach the workers and would be rejected as
+# "no gain" untested. Changes reach the workers through the sweep's build
+# source (`trtllm_patch` / `trtllm_install`), which `code` requires.
 # sol_track:
 #   track: gen
 #   sweep: /path/to/campaign/sweep.yaml

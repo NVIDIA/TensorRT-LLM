@@ -1419,3 +1419,27 @@ def test_a_dry_run_on_a_single_track_spec_is_refused_not_ignored(tmp_path, capsy
     error = capsys.readouterr().err
     assert "staged disagg path only" in error
     assert "would start it for real" in error
+
+
+def test_a_staged_spec_asking_for_config_is_refused_before_any_work(tmp_path):
+    """Both halves are SOL tracks, so the refusal belongs at the top.
+
+    In each child it would surface only after the campaigns had started --
+    or after a design agent had been paid for.
+    """
+    calls: list[str] = []
+    d = _design(tmp_path)
+    spec = {
+        "optimize": {"approaches": ["config", "code"]},
+        FIELD: {"tracks": ["gen"], "design": {"design_dir": str(d), "prefer": "interactive"}},
+    }
+    with pytest.raises(disagg_sol.DisaggSolError, match="cannot apply yet"):
+        disagg_sol.supervise(
+            spec,
+            sweeps={"gen": tmp_path / "g.yaml"},
+            repos={"gen": tmp_path / "r"},
+            workspace_root=tmp_path / "ws",
+            label="t",
+            designer=calls.append,
+        )
+    assert calls == []

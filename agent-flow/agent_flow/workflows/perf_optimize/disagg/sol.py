@@ -49,6 +49,7 @@ from agent_flow.workflows.perf_optimize.disagg.bench_cli import (
     gen_only_points,
     operating_point,
 )
+from agent_flow.workflows.perf_optimize.disagg.sol_track import SolTrackError, refuse_config
 from agent_flow.workflows.perf_optimize.disagg.sweep_design import designer_instruction, load_yaml
 
 DISAGG_SOL_FIELD = "disagg_sol"
@@ -1151,6 +1152,15 @@ def supervise(
     design = design_dir(base)
     prefer = preference(base)
     wanted = tracks(base)
+    # Before anything is resolved, selected or designed: both halves are SOL
+    # tracks, and a SOL track cannot apply `config` yet. Refused here rather
+    # than in each child, where it would surface only after the campaigns had
+    # been started -- or after a design agent had been paid for.
+    optimize = base.get("optimize")
+    try:
+        refuse_config(optimize.get("approaches") if isinstance(optimize, Mapping) else None)
+    except SolTrackError as exc:
+        raise DisaggSolError(str(exc)) from exc
 
     # Resolved BEFORE the designer is considered, not after. A design costs
     # about an order of magnitude more than the campaigns it enables, so

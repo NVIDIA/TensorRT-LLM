@@ -99,6 +99,7 @@ from agent_flow.workflows.perf_optimize.disagg import (
 from agent_flow.workflows.perf_optimize.disagg.sol_track import (
     CTX_JSON_KEY,
     GEN_TRACK,
+    SOL_APPROACHES,
     SOL_TRACK_FIELD,
     SWEEP_KEY,
     TRACK_KEY,
@@ -110,6 +111,7 @@ from agent_flow.workflows.perf_optimize.disagg.sol_track import (
     ctx_json_path,
     has_sol_track,
     load_sweep,
+    refuse_config,
     require_build_source,
     sol_track_block,
     sweep_accept_rate,
@@ -653,10 +655,16 @@ def load_and_validate_task_yaml(
         # After the optimize block, because it is what names the
         # approaches -- and before any agent, because the failure it
         # prevents costs a full allocation and reads as a real result.
+        #
+        # A SOL track defaults to `code`, not to the aggregate default of
+        # both: `config` cannot reach its workers yet (see
+        # `sol_track.CONFIG_UNSUPPORTED`), so defaulting to it would refuse
+        # every spec that did not name its approaches.
+        if optimize.get("approaches") is None:
+            optimize["approaches"] = list(SOL_APPROACHES)
         try:
-            require_build_source(
-                data, optimize.get("approaches") or OPTIMIZE_DEFAULTS["approaches"]
-            )
+            refuse_config(optimize["approaches"])
+            require_build_source(data, optimize["approaches"])
         except SolTrackError as exc:
             errors.append(str(exc))
     # An explicitly-null value means "not set" everywhere in this

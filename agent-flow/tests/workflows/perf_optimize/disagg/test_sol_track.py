@@ -26,6 +26,7 @@ from agent_flow.workflows.perf_optimize.disagg.sol_track import SOL_TRACK_FIELD
 #: harness': [ctx, gen, tp, batch, max_num_tokens, attention_dp,
 #: gpu_mem_frac, mtp, eplb, concurrency_list].
 GEN_SWEEP = {
+    "trtllm_install": {"trtllm_repo": "/repo"},
     "benchmark_mode": "gen_only",
     "model_id": "deepseek-ai/DeepSeek-V4-Pro",
     "model_path": "/models/DeepSeek-V4-Pro",
@@ -41,6 +42,7 @@ GEN_SWEEP = {
 }
 
 CTX_SWEEP = {
+    "trtllm_install": {"trtllm_repo": "/repo"},
     "model": {"model_card": "deepseek-ai/DeepSeek-V4-Pro"},
     "benchmarks": [
         {"isl": 1024, "osl": 1, "max_batch": [16], "tp_size": [4], "ratio": [1], "mtp_range": [3]},
@@ -71,10 +73,10 @@ def _write_task(tmp_path, extra: dict | None = None) -> Path:
     data = {
         "checkpoint_path": str(tmp_path / "ckpt"),
         "trtllm_repo_path": str(tmp_path / "repo"),
-        # An upstream sweep carries no build source, so `config` is what a
-        # campaign against one can do. `code` needs a rung of the ladder
-        # and has its own tests.
-        "optimize": {"approaches": ["config"]},
+        # `code` is the only approach a SOL track supports (`config` is
+        # refused -- see sol_track.CONFIG_UNSUPPORTED), and it needs a rung of
+        # the ladder, which the fixture sweeps carry.
+        "optimize": {"approaches": ["code"]},
     }
     data.update(extra or {})
     return _write(tmp_path / "task.yaml", data)
@@ -265,7 +267,7 @@ def test_an_owner_who_names_another_metric_still_wins(tmp_path):
             tmp_path,
             {
                 SOL_TRACK_FIELD: _gen(tmp_path),
-                "optimize": {"target_metric": "mine", "approaches": ["config"]},
+                "optimize": {"target_metric": "mine", "approaches": ["code"]},
             },
         )
     )
@@ -1002,3 +1004,33 @@ def test_the_refusal_names_the_key_that_actually_clears_it(tmp_path):
     assert "options.accept_rate" not in message
     # And the fix, spelled: the shape the harness expects.
     assert "rate:" in message and "source:" in message
+
+
+# ------------------------------------------------------- config is not applied
+
+
+def test_a_sol_track_refuses_config_rather_than_drop_it(tmp_path):
+    """The overlay goes under keys no harness reads, so config never lands.
+
+    Accepting `config` would let a candidate be "measured" with the accepted
+    configuration and rejected as 'no gain' without having been tested --
+    found in validation, where the ctx analyzer noticed the harness ignores
+    `ctx_extra_llm_api` and declined to propose a config item at all.
+    """
+    with pytest.raises(task_schema.TaskSchemaError, match="cannot apply yet"):
+        task_schema.load_and_validate_task_yaml(
+            _write_task(
+                tmp_path,
+                {SOL_TRACK_FIELD: _gen(tmp_path), "optimize": {"approaches": ["config", "code"]}},
+            )
+        )
+
+
+def test_a_sol_track_that_names_no_approach_defaults_to_code(tmp_path):
+    """Not the aggregate default of both, which would now always be refused."""
+    path = _write_task(tmp_path, {SOL_TRACK_FIELD: _gen(tmp_path)})
+    data = yaml.safe_load(path.read_text())
+    data["optimize"].pop("approaches")
+    path.write_text(yaml.safe_dump(data), encoding="utf-8")
+    resolved = task_schema.load_and_validate_task_yaml(path)
+    assert resolved["optimize"]["approaches"] == ["code"]
