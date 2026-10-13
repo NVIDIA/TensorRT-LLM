@@ -31,11 +31,12 @@ pytestmark = pytest.mark.cpu_only
 
 
 @pytest.mark.parametrize("windows", [(None,), (64,), (64, None), (32, 64, None)])
-def test_v2_connector_requires_one_layer_group(
-    monkeypatch: pytest.MonkeyPatch, windows: tuple[int | None, ...]
+@pytest.mark.parametrize("capacity_only", [False, True])
+def test_v2_connector_registers_layer_groups(
+    monkeypatch: pytest.MonkeyPatch, windows: tuple[int | None, ...], capacity_only: bool
 ) -> None:
     executor = object.__new__(PyExecutor)
-    executor.kv_connector_manager = Mock(capacity_only=False)
+    executor.kv_connector_manager = Mock(capacity_only=capacity_only)
     executor.kv_cache_transceiver = None
     executor.dist = SimpleNamespace(pp_size=1, cp_size=1)
     executor.max_beam_width = 1
@@ -55,16 +56,57 @@ def test_v2_connector_requires_one_layer_group(
     )
 
     connector = executor.kv_connector_manager
-    if len(windows) > 1:
-        with pytest.raises(NotImplementedError, match="requires a single layer group"):
-            executor._maybe_init_kv_connector_manager()
-        connector.worker.register_kv_cache_layout.assert_not_called()
-        connector.wait_for_initialization.assert_not_called()
+    executor._maybe_init_kv_connector_manager()
+    connector.reject_flat_only_scheduler.assert_called_once_with(len(windows))
+    connector.worker.register_kv_cache_layout.assert_called_once_with(layout)
+    connector.warn_flat_scheduler_under_swa.assert_called_once_with(
+        windows[0] if len(windows) == 1 else None
+    )
+    connector.wait_for_initialization.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    "use_v2,connector_mode,num_groups,with_retention,rejected",
+    [
+        pytest.param(True, "transfer", 2, True, True, id="grouped-retention"),
+        pytest.param(True, "transfer", 3, True, True, id="three-group-retention"),
+        pytest.param(True, "transfer", 2, False, False, id="grouped-no-retention"),
+        pytest.param(True, "capacity", 2, True, False, id="capacity-retention"),
+        pytest.param(True, None, 2, True, False, id="native-grouped-retention"),
+        pytest.param(True, "transfer", 1, True, False, id="single-group-retention"),
+        pytest.param(False, "transfer", 1, True, False, id="v1-retention"),
+    ],
+)
+def test_connector_retention_request_validation(
+    use_v2: bool,
+    connector_mode: str | None,
+    num_groups: int,
+    with_retention: bool,
+    rejected: bool,
+) -> None:
+    executor = object.__new__(PyExecutor)
+    executor._is_kv_manager_v2 = use_v2
+    executor.kv_connector_manager = (
+        None if connector_mode is None else Mock(capacity_only=connector_mode == "capacity")
+    )
+    executor.kv_cache_manager = SimpleNamespace(num_pools=num_groups)
+    executor.kv_cache_transceiver = None
+    executor._configure_csa2_remote_tail = Mock()
+    executor._validate_token_id_range = Mock()
+    executor._validate_request_budget = Mock()
+    executor.sampler = Mock()
+    request = SimpleNamespace(
+        kv_cache_retention_config=KvCacheRetentionConfig([]) if with_retention else None,
+        py_disaggregated_params=None,
+        sampling_config=None,
+    )
+
+    if rejected:
+        with pytest.raises(ValueError, match="retention.*multiple layer groups"):
+            executor._validate_request(request)
     else:
-        executor._maybe_init_kv_connector_manager()
-        connector.worker.register_kv_cache_layout.assert_called_once_with(layout)
-        connector.warn_flat_scheduler_under_swa.assert_called_once_with(windows[0])
-        connector.wait_for_initialization.assert_called_once()
+        executor._validate_request(request)
+        executor.sampler.validate_request.assert_called_once_with(request)
 
 
 def test_single_group_priorities_follow_new_page_ordinals() -> None:

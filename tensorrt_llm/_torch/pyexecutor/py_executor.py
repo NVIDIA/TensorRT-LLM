@@ -1300,12 +1300,10 @@ class PyExecutor:
                     self._reject_connector_prefix_without_block_reuse(
                         self.kv_cache_manager)
                 layout = build_kv_cache_layout_v2(self.kv_cache_manager)
-                if len(layout.groups) != 1:
-                    raise NotImplementedError(
-                        "KV Cache Connector requires a single layer group. "
-                        "Retention priorities for multiple layer groups "
-                        "are not supported.")
-                window = layout.groups[0].window_size
+                self.kv_connector_manager.reject_flat_only_scheduler(
+                    len(layout.groups))
+                window = (layout.groups[0].window_size
+                          if len(layout.groups) == 1 else None)
                 self.kv_connector_manager.warn_flat_scheduler_under_swa(window)
                 self.kv_connector_manager.worker.register_kv_cache_layout(
                     layout)
@@ -6375,6 +6373,12 @@ class PyExecutor:
             if not 0 <= retention.decode_retention_priority <= 100:
                 raise ValueError(
                     "Decode retention priority must be between 0 and 100")
+            if (self._kv_connector_moves_kv
+                    and self.kv_cache_manager.num_pools > 1):
+                raise ValueError(
+                    "Per-request KV cache retention is not supported with "
+                    "a KV cache connector and multiple layer groups: "
+                    "the connector priority metadata supports only one group.")
         # Validate context-side pipelined-transfer constraints.
         disagg_params = request.py_disaggregated_params
         if (self.kv_cache_transceiver is not None
