@@ -84,7 +84,7 @@ worker_config:
       enable_block_reuse: false
       free_gpu_memory_fraction: 0.8
       host_cache_size: 0
-      mamba_ssm_cache_dtype: bfloat16
+      mamba_ssm_cache_dtype: float32
       mamba_state_config:
         additional_snapshot_offsets_from_end: [0]
       tokens_per_block: 64
@@ -136,7 +136,7 @@ worker_config:
       enable_block_reuse: true
       free_gpu_memory_fraction: 0.7
       host_cache_size: 171798691840
-      mamba_ssm_cache_dtype: bfloat16
+      mamba_ssm_cache_dtype: float32
       mamba_state_config:
         additional_snapshot_offsets_from_end: [0]
       tokens_per_block: 64
