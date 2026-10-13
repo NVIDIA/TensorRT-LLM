@@ -305,10 +305,10 @@ def test_prefill_compile_scopes_whole_model_forward(
     with torch_compiling(True):
         if raises:
             with pytest.raises(RuntimeError, match="epilogue failure"):
-                DecoderRunner.model_forward(engine, is_dummy=False, attn_metadata=Mock())
+                DecoderRunner._model_forward(engine, is_dummy=False, attn_metadata=Mock())
         else:
             assert (
-                DecoderRunner.model_forward(engine, is_dummy=False, attn_metadata=Mock()) == "done"
+                DecoderRunner._model_forward(engine, is_dummy=False, attn_metadata=Mock()) == "done"
             )
         assert is_torch_compiling()
     expected = eligible if prefill_only else True
@@ -419,7 +419,7 @@ def test_compiled_mxfp8_warmup_backend_selection(
             "get_per_request_prefill_cuda_graph_flag",
             lambda: batch.num_gen_requests == 0,
         )
-        return DecoderRunner.model_forward(engine, is_dummy=True, attn_metadata=batch)
+        return DecoderRunner._model_forward(engine, is_dummy=True, attn_metadata=batch)
 
     engine._forward_warmup.side_effect = forward
     with torch_compiling(compile_enabled):
@@ -595,10 +595,10 @@ def test_warmup_builders_resynchronize_stale_draft_buffers(
         max_total_draft_tokens=config.tokens_per_gen_step - 1,
         max_draft_loop_tokens=config.tokens_per_gen_step - 1,
     )
-    runner.get_runtime_tokens_per_gen_step = config.get_runtime_tokens_per_gen_step
+    runner._get_runtime_tokens_per_gen_step = config.get_runtime_tokens_per_gen_step
     requests = runner._dummy_requests
     requests._config = runner._config
-    requests.get_runtime_tokens_per_gen_step = runner.get_runtime_tokens_per_gen_step
+    requests.get_runtime_tokens_per_gen_step = runner._get_runtime_tokens_per_gen_step
     # Profiling a batch of two leaves K=2; every requested warmup shape below
     # differs from that value and must synchronize the requests.
     batch_size = 2

@@ -263,7 +263,7 @@ def _model_engine_with_runner(
     engine.kv_cache_manager_key = ResourceManagerType.KV_CACHE_MANAGER
     if runner is None:
         runner = object.__new__(DecoderRunner)
-        runner.model = engine.model
+        runner._model = engine.model
         runner._trtllm_gen_jit_warmup = False
     engine._runner = runner
     engine.enable_spec_decode = False
@@ -296,7 +296,7 @@ def test_model_engine_forward_delegates_to_resolved_runner() -> None:
 
 def test_no_kv_cache_runner_rejects_kv_manager_before_preparation() -> None:
     runner = _make_runner(PoolingRunner, _model(is_generation=False))
-    runner.prepare_inputs = Mock()
+    runner._prepare_inputs = Mock()
     resource_manager = Mock()
     resource_manager.get_resource_manager.return_value = object()
 
@@ -308,7 +308,7 @@ def test_no_kv_cache_runner_rejects_kv_manager_before_preparation() -> None:
             ScheduledInputs(batch=ScheduledRequests()), resource_manager=resource_manager
         )
 
-    runner.prepare_inputs.assert_not_called()
+    runner._prepare_inputs.assert_not_called()
 
 
 def test_model_engine_forward_encoder_delegates_scheduled_encoder_batch() -> None:
@@ -378,8 +378,8 @@ def test_concrete_runners_implement_no_kv_cache_forward_step(
 def test_no_kv_cache_runner_owns_and_reuses_attention_metadata() -> None:
     runner = _make_runner(PoolingRunner, _model(is_generation=False))
 
-    first = runner.setup_attn_metadata()
-    second = runner.setup_attn_metadata()
+    first = runner._setup_attn_metadata()
+    second = runner._setup_attn_metadata()
 
     assert first is second
     assert first.kv_cache_manager is None
@@ -405,7 +405,7 @@ def test_pooling_runner_owns_forward_output_processing(
         {"attn_metadata": attn_metadata, "input_ids": torch.tensor([1])},
         gather_ids=torch.tensor([2, 0]),
     )
-    monkeypatch.setattr(runner, "prepare_inputs", Mock(return_value=prepared))
+    monkeypatch.setattr(runner, "_prepare_inputs", Mock(return_value=prepared))
 
     outputs = runner.forward(
         ScheduledInputs(batch=ScheduledRequests()),
@@ -672,7 +672,7 @@ def test_no_kv_forward_enters_model_context():
 
     caller = Mock(side_effect=model_forward)
     runner = _make_runner(PoolingRunner, model, model_caller=caller)
-    runner.prepare_inputs = Mock(return_value=PreparedInputs({}))
+    runner._prepare_inputs = Mock(return_value=PreparedInputs({}))
     resources = SimpleNamespace(get_resource_manager=Mock(return_value=None))
 
     runner.forward(ScheduledInputs(batch=ScheduledRequests()), resource_manager=resources)
@@ -685,7 +685,7 @@ def test_no_kv_forward_preserves_model_output_dictionary_without_length_update()
     outputs = {"hidden_states": object()}
     caller = Mock(return_value=outputs)
     runner = _make_runner(PoolingRunner, _model(is_generation=False), model_caller=caller)
-    runner.prepare_inputs = Mock(return_value=PreparedInputs({}))
+    runner._prepare_inputs = Mock(return_value=PreparedInputs({}))
     inputs = ScheduledInputs(batch=ScheduledRequests(), runtime_draft_len=3)
     resources = SimpleNamespace(get_resource_manager=Mock(return_value=None))
 

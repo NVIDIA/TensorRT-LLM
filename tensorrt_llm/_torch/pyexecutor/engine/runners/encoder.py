@@ -809,7 +809,7 @@ class EncoderRunner(EncoderMixin, PackedModelRunner):
             return False
         return True
 
-    def prepare_inputs(self, batch: PackedInputs) -> EncoderPreparedInputs:
+    def _prepare_inputs(self, batch: PackedInputs) -> EncoderPreparedInputs:
         """Prepare a batch the caller already packed."""
         model_inputs = batch.model_inputs
         self._reject_unsupported_model_inputs(model_inputs)
@@ -1063,7 +1063,7 @@ class EncoderRunner(EncoderMixin, PackedModelRunner):
         inputs: PackedInputs,
     ) -> dict[str, Any]:
         """Execute packed inputs with their requested output options."""
-        prepared = self.prepare_inputs(inputs)
+        prepared = self._prepare_inputs(inputs)
         return self._execute_prepared(
             prepared,
             gather_context_logits=inputs.gather_context_logits,

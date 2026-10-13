@@ -183,10 +183,10 @@ class TestEagerWorkspaceEngine(unittest.TestCase):
             run=lambda _resource_manager: self.warmup._freeze_eager_workspace_floor()
         )
         self.engine._eager_workspace_reclaimer = None
-        self.engine.model = SimpleNamespace(
+        self.engine._model = SimpleNamespace(
             model_config=SimpleNamespace(extra_attrs={}), forward=Mock(return_value=42)
         )
-        self.engine._model_caller = ModelCaller(self.engine.model)
+        self.engine._model_caller = ModelCaller(self.engine._model)
         reclaimer_patch = patch(f"{_WARMUP_MODULE}.EagerWorkspaceReclaimer", autospec=True)
         self.reclaimer_class = reclaimer_patch.start()
         self.addCleanup(reclaimer_patch.stop)
@@ -205,7 +205,7 @@ class TestEagerWorkspaceEngine(unittest.TestCase):
                 return_value=False,
             ),
         ):
-            return self.engine.model_forward(is_dummy=is_dummy, attn_metadata=self.metadata)
+            return self.engine._model_forward(is_dummy=is_dummy, attn_metadata=self.metadata)
 
     def test_forward_scope_and_warmup_bypass(self) -> None:
         with patch.dict(os.environ, {"TRTLLM_RECLAIM_WORKSPACE": "0"}):
@@ -224,7 +224,7 @@ class TestEagerWorkspaceEngine(unittest.TestCase):
             scope.return_value.__enter__.assert_called_once()
             return 42
 
-        self.engine.model.forward.side_effect = forward
+        self.engine._model.forward.side_effect = forward
         self.assertEqual(self.call(), 42)
         scope.assert_called_once_with(self.metadata)
         scope.return_value.__exit__.assert_called_once_with(None, None, None)

@@ -86,7 +86,7 @@ class NoKVCacheRunner(ScheduledModelRunner):
         )
         self._attn_metadata: AttentionMetadata | None = None
 
-    def setup_attn_metadata(self) -> AttentionMetadata:
+    def _setup_attn_metadata(self) -> AttentionMetadata:
         if self._attn_metadata is not None:
             return self._attn_metadata
 
@@ -105,14 +105,14 @@ class NoKVCacheRunner(ScheduledModelRunner):
         self._attn_metadata.kv_block_ids_per_seq = None
         return self._attn_metadata
 
-    def prepare_inputs(
+    def _prepare_inputs(
         self,
         scheduled_requests: ScheduledRequests,
         *,
         resource_manager: ResourceManager,
     ) -> PreparedInputs:
         runner_config = self._config
-        attn_metadata = self.setup_attn_metadata()
+        attn_metadata = self._setup_attn_metadata()
 
         sequence_lengths = []
         input_ids = []
@@ -295,7 +295,7 @@ class NoKVCacheRunner(ScheduledModelRunner):
         del is_dummy
         batch = inputs.batch
         self._validate_resources(resource_manager)
-        prepared = self.prepare_inputs(batch, resource_manager=resource_manager)
+        prepared = self._prepare_inputs(batch, resource_manager=resource_manager)
         with MoeLoadBalancerIterContext(self._moe_load_balancer):
             return self._forward_step(
                 prepared.kwargs,

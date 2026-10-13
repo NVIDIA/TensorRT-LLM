@@ -110,7 +110,7 @@ class EncoderStage(EncoderMixin):
         metadata.prepare_encoder_only()
         return metadata
 
-    def prepare_inputs(
+    def _prepare_inputs(
         self,
         scheduled_requests: ScheduledRequests,
         *,
@@ -349,7 +349,7 @@ class EncoderStage(EncoderMixin):
         is_dummy: bool = False,
     ) -> dict[str, Any]:
         del is_dummy
-        prepared = self.prepare_inputs(
+        prepared = self._prepare_inputs(
             inputs.batch,
             resource_manager=resource_manager,
         )
@@ -1394,7 +1394,7 @@ class EncoderDecoderRunner(DecoderRunner):
     ) -> EncoderDecoderInputPreparer:
         return EncoderDecoderInputPreparer(
             **self._input_preparer_kwargs(mm_item_scheduler),
-            sparse_attention_config=self.sparse_attention_config,
+            sparse_attention_config=self._sparse_attention_config,
             attention_runtime_features=self._attention_runtime_features,
         )
 
