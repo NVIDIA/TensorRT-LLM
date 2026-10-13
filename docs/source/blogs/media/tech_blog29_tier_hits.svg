@@ -27,7 +27,7 @@
 <text x="255.0" y="283.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8.5" font-weight="500" fill="#4f5d75" text-anchor="middle">NVFP4 cold pages</text>
 <text x="215.0" y="302.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="600" fill="#76B900" text-anchor="middle">disk share 31% → 19%</text>
 <text x="215.0" y="316.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8.5" font-weight="500" fill="#4f5d75" text-anchor="middle">block hit rate 86.7% → 88.4%</text>
-<text x="215.0" y="329.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8.5" font-weight="500" fill="#4f5d75" text-anchor="middle">TTFT p90 39.8 s → 23.4 s</text>
+<text x="215.0" y="329.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="600" fill="#76B900" text-anchor="middle">TTFT p90 39.8 s → 23.4 s</text>
 <text x="215.0" y="342.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8.5" font-weight="500" fill="#4f5d75" text-anchor="middle">requests completed in the window 1,133 → 1,581</text>
 <text x="579.0" y="64.0" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="10" font-weight="600" fill="#2d3142" text-anchor="middle">Qwen3.5-397B-A17B</text>
 <text x="579.0" y="77.0" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="10" font-weight="600" fill="#2d3142" text-anchor="middle">4 GB300 · concurrency 128</text>
@@ -48,6 +48,6 @@
 <text x="619.0" y="283.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8.5" font-weight="500" fill="#4f5d75" text-anchor="middle">NVFP4 cold pages</text>
 <text x="579.0" y="302.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="600" fill="#76B900" text-anchor="middle">disk share 14% → 0%</text>
 <text x="579.0" y="316.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8.5" font-weight="500" fill="#4f5d75" text-anchor="middle">block hit rate 81.0% → 85.2%</text>
-<text x="579.0" y="329.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8.5" font-weight="500" fill="#4f5d75" text-anchor="middle">TTFT p90 33.8 s → 20.7 s</text>
+<text x="579.0" y="329.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="600" fill="#76B900" text-anchor="middle">TTFT p90 33.8 s → 20.7 s</text>
 <text x="579.0" y="342.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8.5" font-weight="500" fill="#4f5d75" text-anchor="middle">requests completed in the window 3,070 → 4,621</text>
 </svg>
