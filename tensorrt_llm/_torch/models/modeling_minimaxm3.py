@@ -30,6 +30,7 @@ from torch import nn
 from torch.nn.attention import SDPBackend, sdpa_kernel
 from transformers import PretrainedConfig
 
+from tensorrt_llm.bindings import DataType
 from tensorrt_llm.functional import AllReduceStrategy, PositionEmbeddingType
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
@@ -1129,12 +1130,9 @@ class MiniMaxM3Attention(Attention):
         self.is_sparse_attention_layer = bool(is_sparse_attention_layer)
         # Packed NVFP4 KV retains its existing path: native virtual pools do
         # not yet describe its independent block-scale page strides.
-        native_dense_cache = (
-            self.quant_config is None or not self.quant_config.quant_mode.has_fp4_kv_cache()
-        )
         if (
             not self.is_sparse_attention_layer
-            and native_dense_cache
+            and not self.main_kv_is_nvfp4
             and isinstance(self.attn, MiniMaxM3SparseRuntimeBackend)
         ):
             self._init_native_dense_attention(model_config)
@@ -2027,7 +2025,15 @@ class MiniMaxM3Attention(Attention):
         assert idx_q is None and idx_k is None
         if isinstance(self.attn, MiniMaxM3SparseRuntimeBackend):
             return self._sdpa_dense_attention_core(q, k, v, attn_metadata, output)
-        # The native fallback expects packed QKV for the current tokens only.
+        if (
+            attn_metadata.kv_cache_manager is not None
+            and attn_metadata.kv_cache_manager.dtype == DataType.NVFP4
+        ):
+            raise ValueError(
+                "MiniMax-M3 native dense attention requires a non-NVFP4 KV cache; "
+                "the model quantization config and KV cache manager disagree."
+            )
+        # The native backend expects packed QKV for the current tokens only.
         # Historical K/V stays in the paged cache and is never gathered here.
         qkv = torch.cat((q, k, v), dim=-1)
         self.attn.forward(

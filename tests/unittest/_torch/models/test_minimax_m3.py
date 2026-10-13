@@ -2760,3 +2760,76 @@ def test_minimax_m3_dense_backend_library_order(monkeypatch, libraries, availabl
         assert construct.call_args.kwargs["pos_embd_params"] is None
     else:
         construct.assert_not_called()
+
+    if not use_native:
+        return
+
+    from tensorrt_llm._torch.attention.backends.trtllm import (
+        TrtllmAttention,
+        TrtllmAttentionMetadata,
+    )
+    from tensorrt_llm.bindings import DataType
+
+    # Exercise the real native forward; only the final FMHA kernel is mocked.
+    backend = TrtllmAttention.__new__(TrtllmAttention)
+    backend.sparse_params = None
+    backend.is_mla_enable = False
+    backend.num_heads = layer.num_heads
+    backend.num_kv_heads = layer.num_key_value_heads
+    backend.head_dim = layer.head_dim
+    backend.layer_idx = 0
+    backend.local_layer_idx = 0
+    backend.kv_scale_orig_quant = None
+    backend.kv_scale_quant_orig = None
+    backend.print_skip_softmax_stat = False
+    backend._ensure_rope_table_size = lambda *args: None
+    kernel = Mock(supports_workspace_reclamation=True)
+    select = Mock(return_value=kernel)
+    backend._fmha_manager = SimpleNamespace(select=select)
+    layer.attn = backend
+    layer.is_sparse_attention_layer = False
+
+    metadata = TrtllmAttentionMetadata.__new__(TrtllmAttentionMetadata)
+    lengths = torch.tensor([2], dtype=torch.int32)
+    metadata._seq_lens = metadata._seq_lens_kv = lengths
+    metadata.kv_lens_runtime = metadata.kv_lens_cuda_runtime = lengths
+    metadata.prompt_lens_cuda_runtime = metadata.prompt_lens_cpu_runtime = lengths
+    metadata.host_request_types_runtime = torch.zeros(1, dtype=torch.int32)
+    metadata.cu_q_seqlens = metadata.cu_kv_seqlens = torch.tensor([0, 2], dtype=torch.int32)
+    metadata.num_contexts = 1
+    metadata.num_generations = 0
+    metadata.enable_flash_mla = False
+    metadata.spec_bl_tree_first_sparse_mask_offset_kv = None
+    metadata.spec_decoding_bl_tree_mask = None
+    metadata.max_context_q_len_override = None
+    metadata.kv_cache_manager = SimpleNamespace(
+        dtype=DataType.BF16, max_attention_window_vec=[128], max_seq_len=128
+    )
+    q = torch.randn(2, layer.num_heads * layer.head_dim)
+    k = torch.randn(2, layer.num_key_value_heads * layer.head_dim)
+    v = torch.randn_like(k)
+    output = torch.full_like(q, 19)
+
+    def check_forward(packed, unused_k, unused_v, meta, args):
+        assert meta is metadata
+        assert unused_k is unused_v is None
+        assert args.is_fused_qkv and args.update_kv_cache
+        assert args.output is output
+        torch.testing.assert_close(packed, torch.cat((q, k, v), dim=-1))
+        args.output.copy_(q)
+
+    kernel.forward.side_effect = check_forward
+    result = MiniMaxM3Attention._dispatch_attention_backend(
+        layer, q, k, v, None, None, metadata, output
+    )
+    assert result is output
+    torch.testing.assert_close(output, q)
+    kernel.forward.assert_called_once()
+    select.assert_called_once()
+
+    # Reject a mismatched manager before invoking native attention or writing output.
+    metadata.kv_cache_manager.dtype = DataType.NVFP4
+    with pytest.raises(ValueError, match="model quantization config and KV cache manager disagree"):
+        MiniMaxM3Attention._dispatch_attention_backend(layer, q, k, v, None, None, metadata, output)
+    kernel.forward.assert_called_once()
+    torch.testing.assert_close(output, q)

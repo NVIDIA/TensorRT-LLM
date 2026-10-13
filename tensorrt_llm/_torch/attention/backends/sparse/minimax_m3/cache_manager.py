@@ -256,8 +256,7 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
     would read the wrong pages. Each native attention layer gets its own
     virtual attention-op pool rooted at its K page, like
     ``DeepseekV4CacheManager`` does for SWA layers; see
-    :meth:`_prepare_page_table_tensor`. Can go once V2 keeps index-K in its
-    own pool.
+    :meth:`_prepare_page_table_tensor`.
     """
 
     _main_kv_mapper_kind = MapperKind.HND
@@ -372,6 +371,8 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         # Resolve the zero-copy index-K views eagerly. The V2 pool geometry
         # stays fixed for this manager's lifetime, but resolving it calls
         # nanobind methods that Dynamo cannot trace from the fused FP8 indexer.
+        # Index-K has one head, so HND and NHD share the same physical
+        # token order even when the main K/V cache has multiple heads.
         kv_layout = self._main_kv_view_layout
         self._index_k_buffers: dict[int, Optional[torch.Tensor]] = {}
         self._index_v_buffers: dict[int, torch.Tensor] = {}

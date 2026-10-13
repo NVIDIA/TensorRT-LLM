@@ -515,3 +515,12 @@ def test_sparse_view_writes_native_hnd_storage_without_copy(monkeypatch):
     touched[slots // 8, 0, :, slots % 8] = True
     assert torch.equal(storage[~touched], before[~touched])
     torch.testing.assert_close(nhd, hnd.transpose(2, 3))
+    # Index-K has one head even when main K/V has multiple heads. Its
+    # NHD/HND views must alias the untouched adjacent physical page.
+    index_hnd = storage[:, 2, :1]
+    manager._index_k_buffers = {0: index_hnd.transpose(1, 2)}
+    index_nhd = manager.get_index_k_buffer(0)
+    assert index_nhd.shape == (3, 8, 1, 16)
+    assert index_nhd.data_ptr() == index_hnd.data_ptr()
+    torch.testing.assert_close(manager.get_index_k_buffer(0, "HND"), index_hnd)
+    torch.testing.assert_close(index_hnd, before[:, 2, :1])
