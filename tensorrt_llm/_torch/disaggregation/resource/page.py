@@ -353,6 +353,11 @@ class MambaLayerGroup(LayerGroup):
 
     @classmethod
     def from_dict(cls, data: dict) -> "MambaLayerGroup":
+        if data.get("slot_major_layout", True) is not True:
+            raise ValueError(
+                "Python transceiver does not support the layer-major recurrent-state "
+                "layout of KV cache manager V1; use a V2 slot-major peer."
+            )
         return cls(
             pool_group_idx=int(data["pool_group_idx"]),
             local_layers=[LocalLayer.from_dict(x) for x in data["local_layers"]],
