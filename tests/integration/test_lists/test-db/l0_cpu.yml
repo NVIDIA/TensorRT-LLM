@@ -45,6 +45,7 @@ l0_cpu:
   - unittest/_torch/distributed
   - unittest/_torch/executor
   - unittest/test_startup.py
+  - unittest/test_unified_cache.py
   - unittest/_torch/disaggregation
   - unittest/_torch/peft
   - unittest/_torch/memory
@@ -118,6 +119,7 @@ l0_cpu:
   - unittest/_torch/visual_gen/test_tensor_payload.py
   - unittest/_torch/visual_gen/test_trtllm_serve_endpoints.py
   - unittest/_torch/visual_gen/test_utils.py
+  - unittest/_torch/visual_gen/test_vanilla_key_padding_mask.py
   - unittest/_torch/visual_gen/test_visual_gen_args.py
   - unittest/_torch/visual_gen/test_visual_gen_params.py
   - unittest/_torch/visual_gen/test_visual_gen_utils.py
