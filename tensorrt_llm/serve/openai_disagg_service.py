@@ -224,6 +224,10 @@ class OpenAIDisaggregatedService(OpenAIService):
                 key="disagg_responses_store_ignored",
             )
         request.store = False
+        # The generation worker must consume the prompt the context worker
+        # prefilled, so only the context response may supply prompt ids.
+        request.prompt_token_ids = None
+        request.prompt_token_ids_b64 = None
 
         return await self._send_disagg_request(request, hooks)
 

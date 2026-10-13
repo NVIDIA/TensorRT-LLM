@@ -456,6 +456,31 @@ async def test_a_relay_cut_mid_frame_terminates_that_frame_first():
     assert _event_data(seen[3])["sequence_number"] == 1
 
 
+@pytest.mark.parametrize(
+    "terminal_cut", [b"event: response.completed\n", b"event: response.failed\ndata: {"]
+)
+@pytest.mark.asyncio
+async def test_a_relay_cut_inside_its_terminal_frame_still_reports_the_error(terminal_cut):
+    frames = [b"event: response.created\ndata: {}\n\n", terminal_cut]
+    seen, raised = await _drive(frames, stream_error_event, RuntimeError("upstream cut"))
+    assert isinstance(raised, RuntimeError)
+    assert seen[:3] == [*frames, b"\n\n"]
+    assert _event_type(seen[3]) == "error"
+
+
+@pytest.mark.asyncio
+async def test_a_terminal_frame_split_across_chunks_completes_the_stream():
+    frames = [
+        b"event: response.created\ndata: {}\n\n",
+        b"event: response.completed\ndata: {",
+        b"}\n",
+        b"\n",
+    ]
+    seen, raised = await _drive(frames, _forbidden, RuntimeError("reset"))
+    assert seen == frames
+    assert isinstance(raised, RuntimeError)
+
+
 @pytest.mark.asyncio
 async def test_a_relay_that_never_started_reports_sequence_zero():
     seen, raised = await _drive([], stream_error_event, RuntimeError("no context worker"))

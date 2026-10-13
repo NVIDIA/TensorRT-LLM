@@ -503,6 +503,37 @@ def test_store_is_forwarded_off_and_an_explicit_request_for_it_is_logged(store, 
     assert mock_logger.warning_once.called is warned
 
 
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"prompt_token_ids": [9, 9, 9]},
+        {"prompt_token_ids_b64": "CQAAAA=="},
+        {"prompt_token_ids": [9, 9, 9], "prompt_token_ids_b64": "CQAAAA=="},
+    ],
+)
+def test_client_prompt_ids_are_dropped_before_dispatch(fields):
+    """Only the context response supplies the prompt the generation worker uses."""
+    sent = []
+
+    async def send(request, hooks):
+        sent.append(request)
+        return "relayed"
+
+    request = ResponsesRequest(model="m", input="hi", **fields)
+    asyncio.run(_service(_send_disagg_request=send).openai_responses(request))
+    assert (sent[0].prompt_token_ids, sent[0].prompt_token_ids_b64) == (None, None)
+
+
+def test_a_generation_first_worker_ignores_client_prompt_ids():
+    final = _responses_response(finish_reason="stop", status="completed")
+    service = _gen_first_service(ctx_response=_responses_response(), gen_response=final)
+
+    request = ResponsesRequest(model="m", input="hi", prompt_token_ids=[9, 9, 9])
+    asyncio.run(service.openai_responses(request))
+
+    _assert_generation_first_handoff(service)
+
+
 def test_previous_response_id_is_rejected_with_a_400():
     request = ResponsesRequest(model="m", input="hi", previous_response_id="resp_1")
     with pytest.raises(HTTPException) as raised:

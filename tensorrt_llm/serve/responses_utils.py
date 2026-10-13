@@ -3061,6 +3061,7 @@ async def guard_responses_stream(
     """
     events_sent = 0
     tail = None
+    in_terminal_frame = False
     completed = False
     try:
         async for chunk in stream:
@@ -3070,7 +3071,19 @@ async def guard_responses_stream(
                 text = tail + chunk
                 delimiter, markers = _sse_delimiter_and_markers(text)
                 events_sent += text.count(delimiter) - tail.count(delimiter)
-                completed = any(marker in text for marker in markers)
+                if in_terminal_frame:
+                    # A delimiter that ends the frame takes a byte of this chunk.
+                    frame_rest = max(len(tail) - len(delimiter) + 1, 0)
+                else:
+                    starts = [text.find(marker) for marker in markers]
+                    starts = [start for start in starts if start >= 0]
+                    if starts:
+                        in_terminal_frame = True
+                        frame_rest = min(starts) + len(delimiter)
+                # Only a whole terminal frame completes the stream; a client
+                # cut off inside it has not received the response.
+                if in_terminal_frame:
+                    completed = text.find(delimiter, frame_rest) >= 0
                 tail = text[-_SSE_TAIL_LENGTH:]
             yield chunk
     except Exception as exc:
