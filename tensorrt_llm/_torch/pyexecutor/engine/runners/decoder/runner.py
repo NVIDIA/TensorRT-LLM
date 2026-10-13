@@ -920,6 +920,14 @@ class DecoderRunner(ScheduledModelRunner):
             return
         if not isinstance(attn_meta, DSAtrtllmAttentionMetadata):
             return
+        from tensorrt_llm._torch import jit_prefetch_deep_gemm as jdg
+        from tensorrt_llm._torch.jit_prefetch import warmup_jit_coverage_enabled
+
+        if not warmup_jit_coverage_enabled() and jdg.supports_indexer():
+            # JIT prefetch builds this kernel's variants (one per next_n on
+            # SM100, where it has no batch-size template parameter) in CPU-only
+            # helpers; see jit_prefetch_deep_gemm.DsaIndexerProvider.
+            return
         try:
             from tensorrt_llm.deep_gemm import get_paged_mqa_logits_metadata
         except ImportError:
