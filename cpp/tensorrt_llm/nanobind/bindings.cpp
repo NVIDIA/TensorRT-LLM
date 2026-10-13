@@ -30,7 +30,7 @@
 #include <vector>
 
 #include "tensorrt_llm/batch_manager/peftCacheManagerConfig.h"
-#if TRTLLM_ENABLE_NCCL_PROFILING || ENABLE_NANOBIND_PROFILING
+#if defined(TORCH_CUDA)
 #include "tensorrt_llm/common/profiler.h"
 #endif
 #include "tensorrt_llm/common/quantization.h"
@@ -78,7 +78,7 @@ using OptVec = std::optional<std::vector<T>>;
 
 NB_MODULE(TRTLLM_NB_MODULE, m)
 {
-#if TRTLLM_ENABLE_NCCL_PROFILING || ENABLE_NANOBIND_PROFILING
+#if defined(TORCH_CUDA)
     // Nanobind translates startup configuration errors into Python import errors.
     tc::initializeProfiler();
 #endif

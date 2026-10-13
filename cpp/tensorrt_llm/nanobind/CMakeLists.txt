@@ -66,7 +66,7 @@ if(ENABLE_NANOBIND_PROFILING)
   target_compile_definitions(nanobind-static PRIVATE TLLM_NANOBIND_PROFILING)
   target_include_directories(
     nanobind-static PRIVATE ${PROJECT_SOURCE_DIR}/include ${TORCH_INCLUDE_DIRS})
-  # Reuse th_common's shared selector and scope implementation; do not embed a
+  # Reuse the shared core's selector and scope implementation; do not embed a
   # hidden second copy in the nanobind static library or Python module.
   target_link_libraries(nanobind-static PRIVATE th_common ${TORCH_LIBRARIES}
                                                 ${TORCH_PYTHON_LIB})

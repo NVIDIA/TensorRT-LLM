@@ -104,3 +104,45 @@ active encoding. These CPU markers do not promise per-replay Python events
 under CUDA graphs, native transport coverage, or cross-process clock
 synchronization. Actual Python/C++ transfer and multi-rank validation are
 separate from CPU contract tests.
+
+## Native CPU/GPU cache offload and restore
+
+With `kv` selected, PyTorch-enabled native builds emit `trtllm::kv_cache_offload`
+(GPU to host) and `trtllm::kv_cache_restore` (host to GPU) at the existing copy
+submission boundaries. The legacy manager emits one scope per pool copy; V2
+emits one scope per direct batched transfer. These scopes work independently of
+the NCCL and nanobind profiling build options. The existing native shared library
+owns the single cached selector and scope implementation; non-PyTorch builds
+omit these probes.
+
+The `TRTLLM1` payload identifies `kv.operation`, `kv.source_tier`,
+`kv.destination_tier`, `kv.manager_version` (`legacy` or `v2`), `kv.copy_count`,
+`kv.bytes_per_copy`, and aggregate `kv.payload_bytes`. Legacy pitched copies
+report row payload times layer count, excluding allocation pitches. Partial
+copies report the copied tokens; packed, scaled, and layer-first full-copy paths
+report the entire copied block even when a partial count was requested. Legacy
+metadata also includes local source/destination block IDs and pool block indices,
+pool index, requested/copied token counts, tokens per block, and layer count.
+These are local descriptors, not stable generation identities.
+
+`kv.cuda_stream_id` is the numeric CUDA stream ID, never a raw handle or address.
+It is queried only when an active observer requests metadata and omitted when
+unavailable; it is not assumed to equal a Chrome/CUPTI stream index. Integer
+fields that cannot be represented accurately as signed
+int64 are omitted; observational aggregate overflow does not change submission.
+The native boundary has no reliable request/rank identity, so none is invented.
+
+These CPU scopes measure enqueue work, not asynchronous completion. Correlate
+them with the profiler's ordinary CUDA runtime, memcpy, and kernel events;
+profiling adds no GPU event or synchronization. Disk transfers (including host
+staging), device reuse, host-to-host copies, and empty/zero-byte work are not
+labeled CPU/GPU offload. No metadata or stream query is performed for inactive
+observers or observers that do not request inputs. Copy calls, streams, ready/
+finish events, eviction, and fallback behavior are unchanged.
+The disabled legacy path still performs cheap fixed copy-eligibility and payload
+size checks, without allocating metadata or querying CUDA streams.
+
+The focused native `kvOffloadProfilerTest` target checks real CUDA roundtrips
+and callback payloads for V2 and legacy copy paths. Supplemental CPU boundary
+tests can validate submission annotations but are not CUDA-completion or
+supported-package validation.

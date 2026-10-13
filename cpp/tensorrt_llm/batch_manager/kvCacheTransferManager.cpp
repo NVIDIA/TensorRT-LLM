@@ -29,6 +29,10 @@
 #include "tensorrt_llm/runtime/cudaEvent.h"
 #include "tensorrt_llm/runtime/cudaStream.h"
 
+#if defined(TORCH_CUDA)
+#include "tensorrt_llm/batch_manager/kvCacheTransferProfiler.h"
+#endif
+
 namespace tr = tensorrt_llm::runtime;
 namespace tk = tensorrt_llm::kernels;
 namespace kvc = tensorrt_llm::executor::kv_cache;
@@ -120,6 +124,47 @@ void KVCacheTransferManager::copyBlock(BlockPtr const& src, BlockPtr const& dst,
         {
             auto const& pool = pools[poolIdx];
 
+#if defined(TORCH_CUDA)
+            common::RecordFunctionWithMetadata scope{common::ProfilerRegion::kKv};
+            auto startTransfer = [&](std::size_t bytes, int copiedTokens) noexcept
+            {
+                try
+                {
+                    auto const srcType = (src->isPrimary() ? pool.primaryPtr : pool.secondaryPtr)->getMemoryType();
+                    auto const dstType = (dst->isPrimary() ? pool.primaryPtr : pool.secondaryPtr)->getMemoryType();
+                    auto isHost = [](tr::MemoryType type) {
+                        return type == tr::MemoryType::kCPU || type == tr::MemoryType::kPINNED
+                            || type == tr::MemoryType::kPINNEDPOOL;
+                    };
+                    bool const offload = srcType == tr::MemoryType::kGPU && isHost(dstType);
+                    if (bytes == 0 || (!offload && !(isHost(srcType) && dstType == tr::MemoryType::kGPU)))
+                    {
+                        return;
+                    }
+                    scope.startWithLazyName([&]
+                        { return offload ? "trtllm::kv_cache_offload" : "trtllm::kv_cache_restore"; },
+                        [&](common::ProfilerMetadata& metadata)
+                        {
+                            detail::addKvTransferMetadata(metadata, offload, "legacy", bytes, 1,
+                                (isOffload ? mOffloadManager : mOnboardManager).getStream().get());
+                            metadata.add("kv.pool_index", static_cast<std::int64_t>(poolIdx));
+                            metadata.add("kv.source_block_id", src->getBlockId());
+                            metadata.add("kv.destination_block_id", dst->getBlockId());
+                            metadata.add("kv.source_block_index", src->getMemoryPoolBlockIndex());
+                            metadata.add("kv.destination_block_index", dst->getMemoryPoolBlockIndex());
+                            metadata.add("kv.requested_tokens", numTokensToCopy);
+                            metadata.add("kv.copied_tokens", copiedTokens);
+                            metadata.add("kv.tokens_per_block", pool.tokensPerBlock);
+                            metadata.add("kv.num_layers", pool.numLayers);
+                        });
+                }
+                catch (...)
+                {
+                    // An observational probe must not change copy submission.
+                }
+            };
+#endif
+
             // For layer-first layout pools, block data is non-contiguous across layers.
             // Pool shape: {numLayers, numBlocks, kvFactor, blockSize}. For a fixed block
             // index, per-layer slices are contiguous rows of (kvFactor * blockSize) elements,
@@ -151,6 +196,9 @@ void KVCacheTransferManager::copyBlock(BlockPtr const& src, BlockPtr const& dst,
                 auto* dstBase = static_cast<char*>(dstPool->data()) + dstBlockIdx * rowBytes;
 
                 auto stream = (isOffload ? mOffloadManager : mOnboardManager).getStream().get();
+#if defined(TORCH_CUDA)
+                startTransfer(rowBytes * static_cast<size_t>(pool.numLayers), pool.tokensPerBlock);
+#endif
                 TLLM_CUDA_CHECK(cudaMemcpy2DAsync(dstBase, dstLayerStrideBytes, srcBase, srcLayerStrideBytes, rowBytes,
                     static_cast<size_t>(pool.numLayers), cudaMemcpyDefault, stream));
                 continue;
@@ -169,6 +217,9 @@ void KVCacheTransferManager::copyBlock(BlockPtr const& src, BlockPtr const& dst,
             {
                 // For partial copy not implemented with these data types,
                 // just do a full copy.
+#if defined(TORCH_CUDA)
+                startTransfer(srcPtr->getSizeInBytes(), pool.tokensPerBlock);
+#endif
                 (isOffload ? mOffloadManager : mOnboardManager).copy(*srcPtr, *dstPtr);
             }
             else
@@ -177,6 +228,9 @@ void KVCacheTransferManager::copyBlock(BlockPtr const& src, BlockPtr const& dst,
                 if (numTokensToCopy >= tokensPerBlock)
                 {
                     // If requested tokens >= entire block, just do a full copy.
+#if defined(TORCH_CUDA)
+                    startTransfer(srcPtr->getSizeInBytes(), pool.tokensPerBlock);
+#endif
                     (isOffload ? mOffloadManager : mOnboardManager).copy(*srcPtr, *dstPtr);
                 }
                 else
@@ -191,6 +245,11 @@ void KVCacheTransferManager::copyBlock(BlockPtr const& src, BlockPtr const& dst,
                     TLLM_CHECK_WITH_INFO(
                         shape.nbDims == 4, "Expected KVCache block to have 4 dims, got %d", shape.nbDims);
 
+#if defined(TORCH_CUDA)
+                    startTransfer(srcPtr->getSizeInBytes() / static_cast<size_t>(tokensPerBlock)
+                            * static_cast<size_t>(numTokensToCopy),
+                        numTokensToCopy);
+#endif
                     tk::kvCacheBlockPartialCopy(*dstPtr, *srcPtr, numLayers, numHeads, tokensPerBlock, sizePerHead,
                         numTokensToCopy, kvFactor, stream);
                 }

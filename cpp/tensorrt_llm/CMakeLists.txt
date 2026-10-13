@@ -324,6 +324,12 @@ if(NOT WIN32)
 endif()
 
 if(BUILD_PYT)
+  # One shared selector and scope owner for core, Torch ops and bindings.
+  target_sources(${SHARED_TARGET} PRIVATE common/profiler.cpp)
+  target_link_libraries(${SHARED_TARGET} PRIVATE ${TORCH_LIBRARIES})
+  target_compile_definitions(
+    ${SHARED_TARGET}
+    PRIVATE TRTLLM_ENABLE_NCCL_PROFILING=$<BOOL:${ENABLE_NCCL_PROFILING}>)
   add_subdirectory(thop)
 endif()
 
