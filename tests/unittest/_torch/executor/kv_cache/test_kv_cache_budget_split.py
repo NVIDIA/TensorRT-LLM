@@ -76,6 +76,7 @@ def _make_creator(
     c._kv_cache_manager_cls.get_cache_size_per_token = Mock(
         return_value=(target_kv_per_token, target_kv_intercept)
     )
+    c._is_kv_cache_manager_v2 = False
 
     c._get_kv_size_per_token = Mock(
         return_value=CacheCost(
@@ -115,10 +116,12 @@ class TestSplitGpuBudgetForDraft:
         c._kv_cache_config.enable_block_reuse = False
         c._kv_cache_config.max_attention_window = [128, long_window]
         c._kv_cache_manager_cls = KVCacheManagerV2
+        c._is_kv_cache_manager_v2 = True
         c._max_seq_len = max_seq_len
         c._max_batch_size = max_batch_size
         c._max_num_tokens = 8192
         c._mapping = Mock(enable_attention_dp=False, tp_size=2)
+        c._mapping.has_cp_helix.return_value = False
         c._mapping.pp_layers.return_value = list(range(24))
         c._mapping.is_last_pp_rank.return_value = True
         c._speculative_config = SimpleNamespace(
@@ -218,6 +221,7 @@ class TestSplitGpuBudgetForDraft:
                 return KVCacheManagerV2.get_cache_size_per_token(model_config, *args, **kwargs)
 
         creator._kv_cache_config = target_kv_config
+        creator._llm_args = SimpleNamespace(sleep_config=None)
         creator._tokens_per_block = 64
         creator._max_seq_len = 16384
         creator._max_batch_size = 1
@@ -226,6 +230,7 @@ class TestSplitGpuBudgetForDraft:
         creator._kv_connector_manager = None
         creator._cache_transceiver_config = None
         creator._mapping = Mock(enable_attention_dp=False, tp_size=1)
+        creator._mapping.has_cp_helix.return_value = False
         creator._mapping.pp_layers.return_value = [0]
         creator._mapping.is_last_pp_rank.return_value = True
         creator._speculative_config = SimpleNamespace(
@@ -1068,6 +1073,7 @@ class TestExternalDrafterKvDtype:
     def _creator(self, mocker, draft_quant_config):
         class DraftModelConfig:
             quant_config = draft_quant_config
+            sparse_attention_config = None
             pretrained_config = SimpleNamespace(
                 num_hidden_layers=TestExternalDrafterKvDtype.DRAFT_LAYERS,
                 hidden_size=32,
@@ -1101,12 +1107,14 @@ class TestExternalDrafterKvDtype:
 
         c = object.__new__(KvCacheCreator)
         c._kv_cache_config = KvCacheConfig(dtype="fp8")
+        c._llm_args = SimpleNamespace(sleep_config=None)
         c._tokens_per_block = 64
         c._max_seq_len = 16384
         c._max_batch_size = 1
         # Read by _build_managers on the draft path (_util.py); the cost
         # assertions below are per-token, so the value only has to exist.
         c._max_num_tokens = 8192
+        c._max_beam_width = 1
         c._mapping = Mock(enable_attention_dp=True, tp_size=1)
         c._mapping.has_cp_helix.return_value = False
         c._mapping.pp_layers.return_value = list(range(self.DRAFT_LAYERS))
@@ -1120,6 +1128,7 @@ class TestExternalDrafterKvDtype:
         c._draft_config = draft_model_config
         c._kv_cache_manager_cls = ProbeKVCacheManager
         c._is_disagg = True
+        c._cache_transceiver_config = None
         c._is_encoder_decoder = Mock(return_value=False)
         c._should_create_separate_draft_kv_cache = Mock(return_value=True)
         c._get_num_draft_layers = Mock(return_value=self.DRAFT_LAYERS)
