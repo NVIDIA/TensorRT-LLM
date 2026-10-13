@@ -369,9 +369,12 @@ class Campaign:
                 st.status = "gate" if cmp.verdict == "WIN" else "reverted"
             if st.status == "gate":
                 busy = True
-                out = self.workdir / "gates" / st.slug
+                # Keyed by the tree gated: a candidate re-stacked on a new best is a
+                # different tree, and its earlier gate says nothing about this one.
+                tree_sha = git(Path(st.eval_tree or st.worktree), "rev-parse", "--short=10", "HEAD")
+                out = self.workdir / "gates" / f"{st.slug}-{tree_sha}"
                 result = out / "result.json"
-                job = f"gate-{st.slug}"
+                job = f"gate-{st.slug}-{tree_sha}"
                 if not result.exists() and f"{self.gates.prefix}-{job}" not in self.gates.inflight:
                     if job in finished:
                         st.status, st.reason = "reverted", f"accuracy gate did not produce a result; see {out}"

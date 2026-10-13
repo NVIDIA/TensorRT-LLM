@@ -88,9 +88,9 @@ Issued {time.strftime('%Y-%m-%d %H:%M %Z')} by the tune stage.
 Job pattern (never block; launch, then poll with short calls; job names start with `{job_prefix}-`):
 
 ```bash
-python3 PKG/substrate/spoolctl.py launch --spool <spool> --gpus 1 --wall 45m --tree {worktree} {job_prefix}-<what> \\
+python3 PKG/substrate/spoolctl.py --spool <spool> launch --gpus 1 --wall 45m --tree {worktree} {job_prefix}-<what> \\
   'source {ctx.env_script}; cd {worktree}/tests/unittest && python -m pytest -q -p no:cacheprovider <path>'
-python3 PKG/substrate/spoolctl.py status --spool <spool>; cat <spool>/done/{job_prefix}-<what>.rc; tail -n 60 <spool>/logs/{job_prefix}-<what>.log
+python3 PKG/substrate/spoolctl.py --spool <spool> status; cat <spool>/done/{job_prefix}-<what>.rc; tail -n 60 <spool>/logs/{job_prefix}-<what>.log
 ```
 
 Micro-bench: `python PKG/tune/microbench.py <case file> --out <json>` inside a job with `--tree {worktree}`.

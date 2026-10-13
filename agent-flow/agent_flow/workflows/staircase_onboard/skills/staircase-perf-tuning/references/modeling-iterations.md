@@ -56,10 +56,10 @@ launch, then poll:
 ```bash
 S=<dev spool>; PKG=<staircase_onboard package dir>
 # queue: 1 GPU, 30 min, run against the worktree (cwd + first PYTHONPATH entry)
-python3 $PKG/substrate/spoolctl.py launch --spool $S --gpus 1 --wall 30m --tree <wt> <name> \
+python3 $PKG/substrate/spoolctl.py --spool $S launch --gpus 1 --wall 30m --tree <wt> <name> \
   'source <env script>; cd <wt>/tests/unittest && python -m pytest -q -p no:cacheprovider <test path>'
 # poll (returns when done; keep each poll short)
-python3 $PKG/substrate/spoolctl.py status --spool $S
+python3 $PKG/substrate/spoolctl.py --spool $S status
 cat $S/done/<name>.rc 2>/dev/null; tail -n 40 $S/logs/<name>.log
 ```
 
