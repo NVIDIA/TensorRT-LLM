@@ -1335,6 +1335,15 @@ class DeepSeekSparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
         "False, and the FP4 paged-MQA-logits path; ignored otherwise. The "
         "self-sampling engine derives its bracket from the current row and "
         "does not use emission.")
+    gvr_deterministic_topk: bool = Field(
+        default=False,
+        description=
+        "Make the self-sampling GVR Top-K deterministic: the selected index "
+        "set is {score > tau} plus the smallest indices among the ties at tau, "
+        "and the output order is a fixed function of the input (decode and "
+        "prefill). Costs about 0.2-3 us per Top-K launch. Only takes effect "
+        "with enable_heuristic_topk=True and use_self_sampling_topk=True; "
+        "ignored otherwise.")
     indexer_k_dtype: Literal["fp8", "fp4"] = Field(
         default="fp8",
         description=
@@ -1478,6 +1487,7 @@ class DeepSeekSparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
             enable_heuristic_topk=self.enable_heuristic_topk,
             use_self_sampling_topk=self.use_self_sampling_topk,
             use_gvr_emission=self.use_gvr_emission,
+            gvr_deterministic_topk=self.gvr_deterministic_topk,
             indexer_k_dtype=self.indexer_k_dtype,
             is_full_indexer_layer=self._is_full_indexer_layer(
                 pretrained_config, kwargs.get("layer_idx")),
@@ -1512,6 +1522,7 @@ class DeepSeekSparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
             enable_heuristic_topk=self.enable_heuristic_topk,
             use_self_sampling_topk=self.use_self_sampling_topk,
             use_gvr_emission=self.use_gvr_emission,
+            gvr_deterministic_topk=self.gvr_deterministic_topk,
             use_cute_dsl_topk=self.use_cute_dsl_topk,
             use_cute_dsl_paged_mqa_logits=(self.use_cute_dsl_paged_mqa_logits),
             q_split_threshold=self.q_split_threshold,
@@ -1623,6 +1634,7 @@ class DeepSeekV4SparseAttentionConfig(DeepSeekSparseAttentionConfig):
             enable_heuristic_topk=self.enable_heuristic_topk,
             use_self_sampling_topk=self.use_self_sampling_topk,
             use_gvr_emission=self.use_gvr_emission,
+            gvr_deterministic_topk=self.gvr_deterministic_topk,
             indexer_k_dtype=self.indexer_k_dtype,
             compress_ratios=self.compress_ratios,
             window_size=self.window_size,
@@ -1651,6 +1663,7 @@ class DeepSeekV4SparseAttentionConfig(DeepSeekSparseAttentionConfig):
             enable_heuristic_topk=self.enable_heuristic_topk,
             use_self_sampling_topk=self.use_self_sampling_topk,
             use_gvr_emission=self.use_gvr_emission,
+            gvr_deterministic_topk=self.gvr_deterministic_topk,
             use_cute_dsl_topk=self.use_cute_dsl_topk,
             use_cute_dsl_paged_mqa_logits=(self.use_cute_dsl_paged_mqa_logits),
             q_split_threshold=self.q_split_threshold,
@@ -4731,10 +4744,11 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         description="Configuration for reusable Mamba state snapshots.")
 
     use_kv_cache_manager_v2: bool | Literal["auto"] = Field(
-        default="auto",
+        default=True,
         status="prototype",
         description=
-        "Whether to use the KV cache manager v2 (experimental). 'auto' uses "
+        "Whether to use the KV cache manager v2 (experimental). Defaults to "
+        "True. Set False to select V1 for models that support it. 'auto' uses "
         "the model-specific preference and falls back to False when the model "
         "does not declare one.")
 
@@ -5063,17 +5077,19 @@ class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
             "The communication backend type to use for the cache transceiver.")
 
     transceiver_runtime: Optional[Literal["CPP", "PYTHON", "auto"]] = Field(
-        default="auto",
+        default="PYTHON",
         description=
-        "The runtime implementation. 'auto' (default) adopts the model's "
-        "preferred runtime when it declares one; otherwise it selects the "
-        "Python transceiver, falling back to the C++ transceiver only when "
-        "this config itself rules it out (non-NIXL backend or a null "
-        "kv_transfer_timeout_ms) — any other incompatibility fails at "
+        "The runtime implementation. 'PYTHON' (default) selects the Python "
+        "transceiver, while 'CPP' selects the C++ transceiver and requires "
+        "kv_cache_config.use_kv_cache_manager_v2=False with a model that "
+        "supports V1. 'auto' adopts "
+        "the model's preferred runtime when it declares one; otherwise it "
+        "selects the Python transceiver, falling back to the C++ transceiver "
+        "only when this config itself rules it out (non-NIXL backend or a "
+        "null kv_transfer_timeout_ms) — any other incompatibility fails at "
         "transceiver creation. The fallback is decided independently on "
         "each server and is only logged, not surfaced, so keep context and "
-        "generation server configurations consistent. 'CPP' selects the C++ "
-        "transceiver, 'PYTHON' the Python transceiver. None is equivalent "
+        "generation server configurations consistent. None is equivalent "
         "to 'CPP'. 'auto' is resolved on the PyTorch backend's standard "
         "model-loading path.")
 
@@ -6637,6 +6653,17 @@ class TorchLlmArgs(BaseLlmArgs):
     @quant_config.setter
     def quant_config(self, value: QuantConfig):
         self._quant_config = value
+
+    modeling_v2: Literal["off", "auto", "require"] = Field(
+        default="off",
+        status="prototype",
+        description=
+        "Whether to build the model from a modeling_v2 target (experimental) "
+        "instead of the built-in implementation. 'off' never does. 'auto' "
+        "uses a target when one claims this deployment and falls back to the "
+        "built-in implementation otherwise. 'require' raises instead of "
+        "falling back.",
+        json_schema_extra={"type": "Literal['off', 'auto', 'require']"})
 
     # TODO: remove backend later
     backend: Literal["pytorch"] = Field(

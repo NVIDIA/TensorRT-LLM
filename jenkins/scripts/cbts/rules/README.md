@@ -308,13 +308,14 @@ collide with the upstream test of the same op. So unlike `SpecDecRule`'s
 carve-out is needed.
 
 Outward fallback: not needed, and by design rather than by accident.
-Nothing imports the subtree unless `TRTLLM_MODELING_V2` is set —
-`AutoModelForCausalLM._resolve_class` calls `modeling_v2_resolve`, which
-returns immediately when the switch is off, and the routing modules are
-imported lazily behind it. The one caller outside the subtree,
-`tensorrt_llm/_torch/models/modeling_auto.py`, is deliberately left
-unclaimed: a change to the shared resolver falls back to baseline, which
-is what it deserves.
+Nothing beyond the resolver module is imported unless `LLM(modeling_v2=...)`
+is on — the model loader calls `modeling_v2_resolve`, which returns
+immediately when the switch is off, and the routing modules are imported
+lazily behind it. The callers outside the subtree,
+`tensorrt_llm/_torch/pyexecutor/model_loader.py` (decides) and
+`tensorrt_llm/_torch/models/modeling_auto.py` (reads the decision off
+`ModelConfig`), are deliberately left unclaimed: a change to the shared
+resolver falls back to baseline, which is what it deserves.
 
 `sanity_relevant=False` — the subtree ships no user-facing entry point
 and is not imported by `trtllm-serve` or by `import tensorrt_llm`, so
