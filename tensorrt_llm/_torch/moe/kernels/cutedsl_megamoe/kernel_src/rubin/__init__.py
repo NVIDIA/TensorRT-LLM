@@ -1,2 +1,6 @@
-# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
+"""Rubin Local MegaMoE inference kernel."""
+
+from .block_scaled_swap_ab_local_mega_moe_kernel import BlockScaledSwapAbLocalMegaMoeKernel
+
+
+__all__ = ["BlockScaledSwapAbLocalMegaMoeKernel"]

@@ -1,6 +1,3 @@
-# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
-
 """Rubin TMA Gather4 load primitives used by Local MegaMoE."""
 
 import cutlass
@@ -9,6 +6,7 @@ from cutlass._mlir.dialects import cute_nvgpu as _cute_nvgpu_ir
 from cutlass._mlir.dialects import llvm
 from cutlass.cute.typing import AddressSpace
 from cutlass.cutlass_dsl import dsl_user_op
+
 
 _CTA_GROUP_2_MBAR_MASK = 0xFEFFFFFF
 
