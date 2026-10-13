@@ -16,6 +16,7 @@ for feature details.
 
 ```bash
 python quickstart_example.py
+python models/ltx23.py
 python models/glm_image.py
 
 # With engine config (quant, parallelism, etc.)
@@ -23,6 +24,12 @@ python models/glm_image.py
 python models/wan_t2v.py --visual_gen_args configs/wan2.2-t2v-fp4-1gpu.yaml
 python models/wan_i2v.py --visual_gen_args configs/wan2.2-i2v-fp4-1gpu.yaml --image /path/to/image.png
 python models/ltx2.py --visual_gen_args configs/ltx2-1gpu.yaml
+python models/ltx23.py --visual_gen_args configs/ltx23-t2v-bf16-1gpu.yaml
+python models/ltx23.py --visual_gen_args configs/ltx23-t2v-fp8-1gpu.yaml
+python models/ltx23.py --visual_gen_args configs/ltx23-t2v-fp4-1gpu.yaml
+python models/ltx23_retake.py --visual_gen_args configs/ltx23-retake-bf16-1gpu.yaml --source /path/to/retake_input.mp4
+python models/ltx23_retake.py --visual_gen_args configs/ltx23-retake-fp8-1gpu.yaml --source /path/to/retake_input.mp4
+python models/ltx23_retake.py --visual_gen_args configs/ltx23-retake-fp4-1gpu.yaml --source /path/to/retake_input.mp4
 # FP8 blockwise config: configs/minimax-h3-fp8-blockwise-1gpu.yaml.
 # 8-GPU Ulysses config: configs/minimax-h3-bf16-8gpu.yaml.
 python models/minimax_h3.py --model <approved-checkpoint> --visual_gen_args configs/minimax-h3-bf16-1gpu.yaml

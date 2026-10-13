@@ -33,6 +33,8 @@ l0_dgx_b200:
   - kv_cache/test_kv_cache_v2_scheduler.py::TestKVCacheV2DSv3Lite::test_mtp_chunked_draft_tokens
   - kv_cache/test_kv_cache_v2_scheduler.py::TestKVCacheV2DSv3Lite::test_mtp_eviction
   # ------------- VisualGen multi-GPU tests ---------------
+  - examples/visual_gen/test_visual_gen_ltx23.py::test_ltx23_example[bf16-2gpu] TIMEOUT (30)
+  - examples/visual_gen/test_visual_gen_ltx23.py::test_ltx23_retake_example[bf16-2gpu] TIMEOUT (30)
   - unittest/_torch/visual_gen/multi_gpu/test_ltx2_parallel_vae.py
   - unittest/_torch/visual_gen/multi_gpu/test_minimax_h3_parallel.py::test_h3_ulysses_and_parallel_vae
   - examples/visual_gen/test_visual_gen_multi_gpu.py::test_minimax_h3_ulysses_parallel_vae_lpips[2-2-VANILLA] TIMEOUT (30)
