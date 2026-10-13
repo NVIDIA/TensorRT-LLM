@@ -26,6 +26,9 @@ l0_cpu:
   # Kimi K3 disagg parity harness self-test (comparison logic only, no GPUs).
   - test_kimi_k3_specdec.py::test_kimi_k3_disagg_parity_selftest
   - examples/visual_gen/test_media_deps_install.py::test_install_ffmpeg_via_apt_installs_ffmpeg
+  # ModelExpress accuracy-canary guard (reference entries and worker argv, no GPUs):
+  # catches a pruned reference before the post-merge canary does.
+  - model_express/test_model_express_accuracy.py::test_mx_accuracy_cases_have_references
   - unittest/test_s3_output.py
   # Covers tests/unittest/_torch/attention/. Two sub-trees moved in here from elsewhere
   # under tests/unittest/_torch/ and have no entry of their own on any list, so this entry
