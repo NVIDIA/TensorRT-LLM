@@ -423,6 +423,11 @@ class Campaign:
                     self.log(f"[campaign] {other.slug}: cancelled its measurement on the old best")
                     other.e2e_label = ""
         self.state.best_commit = git(best, "rev-parse", "HEAD")
+        # The keep's own measurement is a measurement of the new best tree at the
+        # current config on its host: it is that host's control, for free.
+        kept = self._measurement(st.e2e_label)
+        if kept is not None and st.eval_config == self._config_key():
+            self.state.controls[self._control_key(str(kept.meta.get("hostname") or ""))] = st.e2e_label
         self.state.kept.append(st.slug)
         self.ledger.append("candidate_kept", slug=st.slug, commits=st.kept_commits, best=self.state.best_commit,
                            deltas=st.deltas, gate=st.gate)
