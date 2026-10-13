@@ -19,6 +19,7 @@ publisher, the reader and the guards that reject --report_addr where it cannot
 work are covered here instead.
 """
 
+import errno
 import os
 import socket
 import threading
@@ -31,7 +32,13 @@ import pytest
 import yaml
 from click.testing import CliRunner
 
-from tensorrt_llm.commands.serve import _publish_bound_address, disaggregated, launch_server
+import tensorrt_llm.commands.serve as serve_module
+from tensorrt_llm.commands.serve import (
+    _bind_failure,
+    _publish_bound_address,
+    disaggregated,
+    launch_server,
+)
 
 # The reader half lives with the integration helpers, so both halves of the
 # round trip are exercised together and a change to either side fails here.
@@ -224,3 +231,31 @@ def test_disaggregated_rejects_a_worker_fleet(
 
     assert result.exit_code != 0
     assert "single self-contained disaggregated server" in result.output
+
+
+def test_bind_failure_reports_an_unresolvable_host(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A failed name lookup never reached a port, so no port holder is diagnosed."""
+    diagnosed_ports = []
+    monkeypatch.setattr(serve_module, "_diagnose_port_in_use", diagnosed_ports.append)
+    error = socket.gaierror(socket.EAI_NONAME, "Name or service not known")
+
+    raised = _bind_failure("disaggregated server", "nvl72049-T03", 0, error)
+
+    assert isinstance(raised, RuntimeError)
+    assert str(raised) == (
+        f"Failed to bind socket to nvl72049-T03:0: cannot resolve host 'nvl72049-T03': {error}"
+    )
+    assert "Port holder" not in str(raised)
+    assert diagnosed_ports == []
+
+
+def test_bind_failure_names_the_port_holder(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(serve_module, "_diagnose_port_in_use", lambda port: f"pid=1 holds {port}")
+    error = OSError(errno.EADDRINUSE, "Address already in use")
+
+    raised = _bind_failure("server", "localhost", 8000, error)
+
+    assert isinstance(raised, RuntimeError)
+    assert str(raised) == (
+        f"Failed to bind socket to localhost:8000: {error}. Port holder(s): pid=1 holds 8000"
+    )

@@ -463,6 +463,27 @@ def _diagnose_port_in_use(port: int) -> str:
     return "; ".join(details)
 
 
+def _bind_failure(kind: str, host: str, port: int,
+                  error: OSError) -> RuntimeError:
+    """Log a failed listener bind and return the exception to raise.
+
+    A name-resolution failure (``socket.gaierror``) is an ``OSError`` too, but
+    no port was ever tried, so it is reported as such instead of being
+    diagnosed as a port conflict.
+    """
+    if isinstance(error, socket.gaierror):
+        reason = f"cannot resolve host {host!r}: {error}"
+        logger.error(f"Failed to bind {kind} socket to {host}:{port} "
+                     f"(pid={os.getpid()}): {reason}")
+        return RuntimeError(f"Failed to bind socket to {host}:{port}: {reason}")
+    holder = _diagnose_port_in_use(port)
+    logger.error(
+        f"Failed to bind {kind} socket to {host}:{port} (pid={os.getpid()}): "
+        f"{error}. Current port holder(s): {holder}")
+    return RuntimeError(f"Failed to bind socket to {host}:{port}: {error}. "
+                        f"Port holder(s): {holder}")
+
+
 class MultiFrontendMode(NamedTuple):
     """This process's role under multi-frontend serving (prototype)."""
     num_frontends: int
@@ -690,12 +711,7 @@ def launch_server(
             if port == 0:
                 port = s.getsockname()[1]
         except OSError as e:
-            holder = _diagnose_port_in_use(port)
-            logger.error(
-                f"Failed to bind server socket to {host}:{port} "
-                f"(pid={os.getpid()}): {e}. Current port holder(s): {holder}")
-            raise RuntimeError(f"Failed to bind socket to {host}:{port}: {e}. "
-                               f"Port holder(s): {holder}")
+            raise _bind_failure("server", host, port, e) from e
 
         # Only now is the address final, and the socket stays bound from here
         # until uvicorn takes it over, so no one can steal the port in between.
@@ -911,12 +927,7 @@ def launch_visual_gen_server(
         try:
             s.bind((host, port))
         except OSError as e:
-            holder = _diagnose_port_in_use(port)
-            logger.error(
-                f"Failed to bind VisualGen server socket to {host}:{port} "
-                f"(pid={os.getpid()}): {e}. Current port holder(s): {holder}")
-            raise RuntimeError(f"Failed to bind socket to {host}:{port}: {e}. "
-                               f"Port holder(s): {holder}")
+            raise _bind_failure("VisualGen server", host, port, e) from e
 
         logger.info(f"Initializing VisualGen ({model})")
 
@@ -2062,14 +2073,8 @@ def disaggregated(
             if disagg_cfg.port == 0:
                 disagg_cfg.port = s.getsockname()[1]
         except OSError as e:
-            holder = _diagnose_port_in_use(disagg_cfg.port)
-            logger.error(
-                f"Failed to bind disaggregated server socket to "
-                f"{disagg_cfg.hostname}:{disagg_cfg.port} (pid={os.getpid()}): "
-                f"{e}. Current port holder(s): {holder}")
-            raise RuntimeError(
-                f"Failed to bind socket to {disagg_cfg.hostname}:{disagg_cfg.port}: {e}. "
-                f"Port holder(s): {holder}")
+            raise _bind_failure("disaggregated server", disagg_cfg.hostname,
+                                disagg_cfg.port, e) from e
 
         _publish_bound_address(report_addr, disagg_cfg.hostname,
                                disagg_cfg.port)
@@ -2259,13 +2264,7 @@ def _serve_coordinator_and_fleet(disagg_cfg, config_file,
         coord_socket.bind((public_host, coord_port))
     except OSError as e:
         coord_socket.close()
-        holder = _diagnose_port_in_use(coord_port)
-        logger.error(f"Failed to bind coordinator socket to "
-                     f"{public_host}:{coord_port} (pid={os.getpid()}): {e}. "
-                     f"Current port holder(s): {holder}")
-        raise RuntimeError(
-            f"Failed to bind socket to {public_host}:{coord_port}: {e}. "
-            f"Port holder(s): {holder}")
+        raise _bind_failure("coordinator", public_host, coord_port, e) from e
 
     # 1. Launch the delegating fleet pointed at the implicit coordinator we start
     #    below (port-1 for TCP; UDS for the hot path). Workers hold
