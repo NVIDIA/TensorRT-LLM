@@ -55,6 +55,7 @@ trust it is complete.
 from __future__ import annotations
 
 import atexit
+import errno
 import itertools
 import json
 import os
@@ -168,8 +169,11 @@ class FileDispatchTurnExecutor(TurnExecutor):
                         self.root / ORCHESTRATOR_HEARTBEAT,
                         json.dumps({**record, "at": time.time()}) + "\n",
                     )
-                except OSError:
-                    return
+                except OSError as exc:
+                    # A full filesystem is transient (a shared quota); anything
+                    # else means the dispatch directory is gone.
+                    if exc.errno not in (errno.ENOSPC, errno.EDQUOT):
+                        return
                 if self._stop.wait(interval_s):
                     return
 

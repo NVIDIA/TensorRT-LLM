@@ -145,6 +145,29 @@ def test_the_orchestrator_heart_beats_and_says_when_it_exits(workspace):
     transport.close()
 
 
+def test_the_heartbeat_survives_a_full_filesystem(workspace, monkeypatch):
+    """A shared project quota filled for minutes; the beat thread died on EDQUOT and
+    the driver read a live orchestrator as exited."""
+    import errno
+
+    from agent_flow.runtime.turns import file_dispatch
+
+    real, fails = file_dispatch.FileDispatchTurnExecutor._write_atomic, {"n": 2}
+
+    def full(path, text):
+        if path.name == ORCHESTRATOR_HEARTBEAT and fails["n"]:
+            fails["n"] -= 1
+            raise OSError(errno.EDQUOT, "Disk quota exceeded")
+        return real(path, text)
+
+    monkeypatch.setattr(file_dispatch.FileDispatchTurnExecutor, "_write_atomic", staticmethod(full))
+    transport = ExternalAgentTransport(workspace, poll_s=0.01, heartbeat_s=0.02)
+    beat = workspace / "dispatch" / ORCHESTRATOR_HEARTBEAT
+    _wait_for(beat.exists)
+    assert fails["n"] == 0
+    transport.close()
+
+
 def test_a_relaunch_adopts_an_orphaned_turn_whose_decision_path_moved(workspace):
     """F030: run6 wrote turn 2 of 6 for the turn run5 had asked and nobody answered."""
     dispatch = workspace / "dispatch"
