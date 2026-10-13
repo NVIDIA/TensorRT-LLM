@@ -20,8 +20,8 @@ from abc import ABC, abstractmethod
 from collections import OrderedDict, defaultdict, deque
 from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import (TYPE_CHECKING, Dict, Iterable, List, Optional, Sequence,
-                    Set, Tuple, Union)
+from typing import (TYPE_CHECKING, Callable, Dict, Iterable, List, Optional,
+                    Sequence, Set, Tuple, Union)
 
 import torch
 
@@ -71,7 +71,7 @@ if TYPE_CHECKING:
         AttentionMetadata
     from tensorrt_llm.llmapi.llm_args import (DecodingBaseConfig,
                                               KvCacheCompressionConfig)
-    from tensorrt_llm.runtime.kv_cache_manager_v2 import CachePageInfo, _KVCache
+    from tensorrt_llm.runtime.kv_cache_manager_v2 import _KVCache
 
     from .kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 
@@ -2932,16 +2932,10 @@ class KVCacheCompressionManager(BaseResourceManager):
     ) -> None:
         """Apply optional page protection; the default leaves pages unchanged."""
 
-    def get_precision_reuse_limit(
-        self,
-        page_info: Sequence["CachePageInfo"],
-        *,
-        reused_length: int,
-        protected_length: int,
-        tokens_per_block: int,
-    ) -> int:
-        """Apply an optional precision requirement; the default keeps reuse unchanged."""
-        return reused_length
+    def create_precision_reuse_checker(
+        self, ) -> Callable[["_KVCache"], int | None] | None:
+        """Return an optional admission check, or leave ordinary reuse unchanged."""
+        return None
 
     def __init__(
         self,

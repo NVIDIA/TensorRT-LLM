@@ -2,7 +2,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Common runtime pipeline for cold-page quantization."""
 
-from typing import TYPE_CHECKING, Any, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Sequence
 
 from ...pyexecutor.resource_manager import DataType, KVCacheCompressionManager
 
@@ -92,6 +92,29 @@ class ColdPageQuantizationCompression(KVCacheCompressionManager):
             pages.extend(page for page in exited if page in shared and page not in restored)
         kv_cache.set_private_pages(pages)
         kv_cache.set_gpu_resident_pages(pages)
+
+    def create_precision_reuse_checker(
+        self,
+    ) -> Callable[["_KVCache"], int | None] | None:
+        """Check each claim against the same protected endpoint during admission."""
+        if not self.uses_gpu_page_protection:
+            return None
+        protected_length: int | None = None
+
+        def check_reuse(kv_cache: "_KVCache") -> int | None:
+            nonlocal protected_length
+            matched = kv_cache.num_committed_tokens
+            if protected_length is None:
+                protected_length = matched
+            limit = self.get_precision_reuse_limit(
+                kv_cache.get_page_info(),
+                reused_length=matched,
+                protected_length=protected_length,
+                tokens_per_block=kv_cache.tokens_per_block,
+            )
+            return limit if limit < matched else None
+
+        return check_reuse
 
     def get_precision_reuse_limit(
         self,

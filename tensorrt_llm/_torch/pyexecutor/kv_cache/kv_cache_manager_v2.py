@@ -3789,7 +3789,14 @@ class KVCacheManagerV2(BaseResourceManager):
             # matched, which is also the case where no branch point applies.
             num_lookup_tokens = None
             if kv_cache is None:
-                protected_length = None
+                provider = self._cold_page_codec_provider
+                reuse_checker = (
+                    provider.create_precision_reuse_checker()
+                    if provider is not None
+                    and self.enable_block_reuse
+                    and not req.is_disagg_generation_init_state
+                    else None
+                )
                 while True:
                     if self.enable_block_reuse:
                         # Empty (not None) for a zero limit: lookup is off, but
@@ -3812,24 +3819,10 @@ class KVCacheManagerV2(BaseResourceManager):
                     )
                     if kv_cache is None:
                         return None
-                    provider = self._cold_page_codec_provider
-                    if (
-                        provider is None
-                        or not provider.uses_gpu_page_protection
-                        or not self.enable_block_reuse
-                        or req.is_disagg_generation_init_state
-                    ):
+                    if reuse_checker is None:
                         break
-                    matched = kv_cache.num_committed_tokens
-                    if protected_length is None:
-                        protected_length = matched
-                    limit = provider.get_precision_reuse_limit(
-                        kv_cache.get_page_info(),
-                        reused_length=matched,
-                        protected_length=protected_length,
-                        tokens_per_block=self.tokens_per_block,
-                    )
-                    if limit < matched:
+                    limit = reuse_checker(kv_cache)
+                    if limit is not None:
                         self._discard_tentative_context_cache(req.py_request_id, kv_cache)
                         reuse_limit = limit
                         continue
@@ -3841,13 +3834,8 @@ class KVCacheManagerV2(BaseResourceManager):
                         return None
                     # Protection prevents later migration; re-read provenance after
                     # installing it to catch encoding between the first query and resume.
-                    limit = provider.get_precision_reuse_limit(
-                        kv_cache.get_page_info(),
-                        reused_length=matched,
-                        protected_length=protected_length,
-                        tokens_per_block=self.tokens_per_block,
-                    )
-                    if limit >= matched:
+                    limit = reuse_checker(kv_cache)
+                    if limit is None:
                         break
                     self._discard_tentative_context_cache(req.py_request_id, kv_cache)
                     reuse_limit = limit

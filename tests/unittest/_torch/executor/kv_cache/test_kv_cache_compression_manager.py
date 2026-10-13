@@ -148,12 +148,7 @@ class TestBaseABC:
         assert not m.uses_gpu_page_protection
         assert "gpu_resident_token_bounds" not in KVCacheCompressionManager.__dict__
         assert m.update_gpu_page_protection(MagicMock()) is None
-        assert (
-            m.get_precision_reuse_limit(
-                [], reused_length=256, protected_length=256, tokens_per_block=64
-            )
-            == 256
-        )
+        assert m.create_precision_reuse_checker() is None
         assert m.on_request_init(MagicMock()) is None
         assert m.on_context_step_end([MagicMock()]) is None
         assert m.on_generation_step_begin(MagicMock()) is None
@@ -234,6 +229,7 @@ def test_cold_page_base_supplies_first_last_n_without_iteration_hooks() -> None:
     assert protected.uses_gpu_page_protection
     cache = MagicMock()
     default.update_gpu_page_protection(cache)
+    assert default.create_precision_reuse_checker() is None
     cache.get_page_info.assert_not_called()
     assert protected.provides_cold_page_codec
     assert not protected.uses_iteration_lifecycle

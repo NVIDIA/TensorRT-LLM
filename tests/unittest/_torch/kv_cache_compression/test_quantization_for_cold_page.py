@@ -193,12 +193,47 @@ def test_common_first_last_ignores_sparse_and_sliding_window_pages():
     )
 
 
+@pytest.mark.parametrize("skip_rope_quantization", [False, True])
+def test_nvfp4_precision_reuse_checker_rechecks_page_history(skip_rope_quantization):
+    provider = Nvfp4ColdPageQuantizationCompression(
+        ColdPageQuantizationCompressionConfig(
+            first_n=64, last_n=64, skip_rope_quantization=skip_rope_quantization
+        ),
+        pretrained_config=SimpleNamespace(model_type="deepseek_v4"),
+    )
+    cache = MagicMock(num_committed_tokens=256, tokens_per_block=64)
+    pages = [
+        SimpleNamespace(
+            beam_index=0,
+            block_ordinal=block,
+            layer_group_id=2,
+            lossy_encode_count=0 if block in (0, 3) else 1,
+            is_sparse=False,
+            window_size=None,
+        )
+        for block in range(4)
+    ]
+    cache.get_page_info.return_value = pages
+    checker = provider.create_precision_reuse_checker()
+    assert checker is not None
+    assert checker(cache) is None
+    pages[3].lossy_encode_count = 1
+    assert checker(cache) == 192
+    assert cache.get_page_info.call_count == 2
+
+
+@pytest.mark.parametrize("skip_rope_quantization", [False, True])
 @pytest.mark.parametrize("encoded_before_pin", [False, True])
-def test_precision_reclaim_keeps_original_tail_endpoint(encoded_before_pin):
-    provider = ColdPageQuantizationCompression(ColdPageQuantizationCompressionConfig(last_n=64))
+def test_precision_reclaim_keeps_original_tail_endpoint(encoded_before_pin, skip_rope_quantization):
+    provider = Nvfp4ColdPageQuantizationCompression(
+        ColdPageQuantizationCompressionConfig(
+            last_n=64, skip_rope_quantization=skip_rope_quantization
+        ),
+        pretrained_config=SimpleNamespace(model_type="deepseek_v4"),
+    )
     caches = []
     for length in (320, 256):
-        cache = MagicMock(num_committed_tokens=length)
+        cache = MagicMock(num_committed_tokens=length, tokens_per_block=64)
         cache.get_page_info.return_value = [
             SimpleNamespace(
                 beam_index=0,
@@ -228,7 +263,7 @@ def test_precision_reclaim_keeps_original_tail_endpoint(encoded_before_pin):
     manager._create_kv_cache.side_effect = caches
     manager._context_reuse_tokens.side_effect = ([1] * 320, [1] * 256)
     manager._connector_may_serve.return_value = False
-    manager._resume_and_restore.return_value = True
+    manager._resume_context_cache.return_value = True
     req = SimpleNamespace(
         py_request_id=42,
         is_first_context_chunk=True,
