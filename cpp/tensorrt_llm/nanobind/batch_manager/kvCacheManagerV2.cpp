@@ -710,7 +710,9 @@ static kv::ReuseScope castReuseScope(nb::object reuseScope)
     }
     if (PyObject_HasAttrString(reuseScope.ptr(), "lora_id") && PyObject_HasAttrString(reuseScope.ptr(), "salt"))
     {
-        return {castOptionalIntAttr(reuseScope, "lora_id"), castOptionalIntAttr(reuseScope, "salt")};
+        auto const cacheSalt = nb::cast<std::optional<std::string>>(nb::getattr(reuseScope, "cache_salt", nb::none()));
+        return {castOptionalIntAttr(reuseScope, "lora_id"), castOptionalIntAttr(reuseScope, "salt"),
+            cacheSalt ? std::make_shared<std::string const>(*cacheSalt) : nullptr};
     }
     throw std::invalid_argument(
         "reuse_scope must be None, ReuseScope, an int lora_task_id, or an object with lora_id and salt");
@@ -1427,10 +1429,21 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
 
     // ---- ReuseScope --------------------------------------------------------
     nb::class_<kv::ReuseScope>(m, "ReuseScope")
-        .def(nb::init<std::optional<kv::LoraTaskIdType>, std::optional<std::uint64_t>>(),
-            nb::arg("lora_id").none() = std::nullopt, nb::arg("salt").none() = std::nullopt)
+        .def(
+            "__init__",
+            [](kv::ReuseScope* self, std::optional<kv::LoraTaskIdType> loraId, std::optional<std::uint64_t> salt,
+                std::optional<std::string> cacheSalt)
+            {
+                new (self) kv::ReuseScope{
+                    loraId, salt, cacheSalt ? std::make_shared<std::string const>(std::move(*cacheSalt)) : nullptr};
+            },
+            nb::arg("lora_id").none() = std::nullopt, nb::arg("salt").none() = std::nullopt, nb::kw_only(),
+            nb::arg("cache_salt").none() = std::nullopt)
         .def_ro("lora_id", &kv::ReuseScope::loraId)
         .def_ro("salt", &kv::ReuseScope::salt)
+        .def_prop_ro("cache_salt",
+            [](kv::ReuseScope const& self) -> std::optional<std::string>
+            { return self.cacheSalt ? std::optional<std::string>(*self.cacheSalt) : std::nullopt; })
         .def("__len__", [](kv::ReuseScope const&) { return 2; })
         .def(
             "__getitem__",

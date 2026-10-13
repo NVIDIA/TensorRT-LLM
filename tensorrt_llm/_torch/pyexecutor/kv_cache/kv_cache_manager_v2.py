@@ -6540,7 +6540,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 expected_prompt_length, self.tokens_per_block, self._swa_endpoint_rewind
             )
         kv_cache = self.impl.create_kv_cache(
-            ReuseScope(lora_id=lora_task_id, salt=salt_int),
+            ReuseScope(lora_id=lora_task_id, salt=salt_int, cache_salt=cache_salt),
             input_tokens,
             id=request_id,
             enable_request_stats=enable_request_stats,
@@ -6642,7 +6642,8 @@ class KVCacheManagerV2(BaseResourceManager):
             # cache hits the same radix-tree blocks.
             salt_int = self._derive_reuse_salt(req.cache_salt)
             kv_cache = self.impl.create_kv_cache(
-                ReuseScope(lora_id=req.lora_task_id, salt=salt_int), tokens
+                ReuseScope(lora_id=req.lora_task_id, salt=salt_int, cache_salt=req.cache_salt),
+                tokens,
             )
             try:
                 # Prefetch to the first tier below GPU (host if present,

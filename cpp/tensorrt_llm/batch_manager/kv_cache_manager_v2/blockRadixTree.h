@@ -32,6 +32,7 @@
 #include <iterator>
 #include <memory>
 #include <optional>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -53,6 +54,8 @@ struct ReuseScope
 {
     std::optional<LoraTaskIdType> loraId;
     std::optional<std::uint64_t> salt;
+    //! Original salt for event payloads; excluded from reuse identity and block-key hashing.
+    std::shared_ptr<std::string const> cacheSalt;
 
     bool operator==(ReuseScope const& other) const noexcept
     {
@@ -179,6 +182,8 @@ struct NodeBase
     BlockKey key;
     std::unordered_map<BlockKey, SharedPtr<Block>> next;
     EventSink* eventSink;
+    //! Shared event metadata remains valid after detachment without retaining ancestor nodes.
+    std::shared_ptr<std::string const> cacheSalt;
 
     virtual ~NodeBase();
 
@@ -195,9 +200,10 @@ struct NodeBase
     virtual LifeCycleId numLifeCycles() const noexcept = 0;
 
 protected:
-    NodeBase(BlockKey k, EventSink* sink)
+    NodeBase(BlockKey k, EventSink* sink, std::shared_ptr<std::string const> salt)
         : key(k)
         , eventSink(sink)
+        , cacheSalt(std::move(salt))
     {
     }
 };
