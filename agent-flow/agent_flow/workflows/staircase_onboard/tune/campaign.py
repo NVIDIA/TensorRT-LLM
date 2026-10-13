@@ -230,11 +230,16 @@ class Campaign:
         return spool
 
     def set_control(self, label_dir: Path) -> None:
-        """Adopt an existing measurement of the best tree at the current config as the control."""
+        """Adopt an existing measurement of the best tree at the current config as the control:
+        the fallback control, and its host's same-host control."""
         link = self.data / label_dir.name
         if not link.exists():
             link.symlink_to(label_dir.resolve(), target_is_directory=True)
-        self.state.control_label = label_dir.name
+        if not self.state.control_label:
+            self.state.control_label = label_dir.name
+        m = self._measurement(label_dir.name)
+        if m is not None:
+            self.state.controls.setdefault(self._control_key(str(m.meta.get("hostname") or "")), label_dir.name)
         self.state.save(self.state_path)
 
     # -- the loop ----------------------------------------------------------------------

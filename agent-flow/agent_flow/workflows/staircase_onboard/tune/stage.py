@@ -26,7 +26,7 @@ from typing import Any, Callable, Mapping, Sequence
 import yaml
 
 from ..substrate.spoolctl import SpoolError
-from .campaign import INFRA_RCS, Campaign, gate_command, read_decision
+from .campaign import INFRA_RCS, Campaign, gate_command, git, read_decision
 from .ladder import BenchSpec, Ladder, SpoolRunner, default_rungs, rungs_from_spec
 from .records import Measurement, NoiseFloor, PerfLedger, format_table
 from .requests import CampaignContext, render_rebase_request, render_request, turn_prompt
@@ -320,11 +320,18 @@ class TuneStage:
         worktrees = s.workdir / "worktrees"
         if not camp.state.best_tree:
             camp.state.best_tree = str(open_candidate(s.repo, worktrees, "best", "HEAD", prefix=self.branch_prefix))
+            camp.state.best_commit = git(Path(camp.state.best_tree), "rev-parse", "HEAD")
             camp.state.config_overlays = list(self.t.get("config_overlays") or [])
         if not camp.state.control_label:
-            ctrl = self._measure({"t-control": [*s.identity_configs, *map(Path, camp.state.config_overlays)]}, tree=camp.state.best_tree)
-            if ctrl.get("t-control"):
-                camp.set_control(self.data / "t-control")
+            # The ladder's last wave measured the best tree at the final overlay on
+            # each of its hosts: those are the campaign's first same-host controls.
+            # Other hosts get theirs lazily, behind the first measurement that needs
+            # one -- the tuner turns start now instead of after a control run.
+            lad = s.workdir / "ladder"
+            labels = json.loads((lad / "ladder_state.json").read_text()).get("control_labels") or [] if (lad / "ladder_state.json").exists() else []
+            for label in labels:
+                if (lad / "data" / label / "meta.json").exists():
+                    camp.set_control(lad / "data" / label)
         n_road = int(self.t.get("roadmaps", 1))
         roadmap = [r for r in self._roadmap(n_road, tried=list(camp.state.candidates) if n_road > 1 else ())
                    if r.get("slug") not in camp.state.candidates]
