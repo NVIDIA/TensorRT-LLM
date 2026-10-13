@@ -193,3 +193,22 @@ def test_probes_are_judged_against_their_own_host(tmp_path):
             break
     verdicts = {rs.name: rs.verdict for rs in ladder.state.rungs.values()}
     assert verdicts == {"noop-a": "NEUTRAL", "noop-b": "NEUTRAL"}, ladder.summary()
+
+
+def test_a_job_on_a_session_that_died_is_reported_lost(tmp_path):
+    """The Slurm job behind a spool ended (its watcher died): the measurement in
+    flight there is reported lost (rc 212) and set aside, not waited on forever."""
+    import time as _time
+
+    from agent_flow.workflows.staircase_onboard.substrate.scheduler import SpoolPaths
+    from agent_flow.workflows.staircase_onboard.tune.ladder import SpoolRunner
+
+    spool = tmp_path / "s1"
+    paths = SpoolPaths(spool)
+    paths.ensure()
+    (paths.watchers / "w.json").write_text(json.dumps({"alive_epoch": _time.time() - 3600}))
+    runner = SpoolRunner([str(spool)], prefix="camp")
+    (spool / "running" / "camp-e2e-x.sh").write_text("#!/bin/bash\n")
+    runner.inflight["camp-e2e-x"] = (str(spool), "e2e-x")
+    assert runner.poll() == [("e2e-x", str(spool), 212)]
+    assert not (spool / "running" / "camp-e2e-x.sh").exists() and not runner.inflight

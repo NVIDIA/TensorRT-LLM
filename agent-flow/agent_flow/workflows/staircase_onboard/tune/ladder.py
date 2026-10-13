@@ -307,10 +307,26 @@ class SpoolRunner:
         (cancel_dir / name).touch()
         return True
 
+    #: A session silent this long is gone (its Slurm job ended): its jobs died with it.
+    DEAD_SESSION_S = 600.0
+    RC_SESSION_LOST = 212  # the scheduler's RC_ORPHANED
+
     def poll(self) -> list[tuple[str, str, int]]:
         done = []
         for name, (spool, label) in list(self.inflight.items()):
             receipt = Path(spool) / "done" / f"{name}.rc"
+            age = self._spoolctl.watcher_age(spool)
+            if not receipt.exists() and age is not None and age > self.DEAD_SESSION_S:
+                # Nobody will write this receipt until a new session adopts the spool;
+                # set the job aside so that session does not run it again, and report
+                # it lost so the caller re-queues it on a live session.
+                for sub in ("pending", "running"):
+                    script = Path(spool) / sub / f"{name}.sh"
+                    if script.exists():
+                        script.rename(script.with_name(f"{script.name}.lost-{int(time.time())}"))
+                del self.inflight[name]
+                done.append((label, spool, self.RC_SESSION_LOST))
+                continue
             if receipt.exists():
                 try:
                     rc = int(receipt.read_text().strip() or "1")
