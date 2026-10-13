@@ -287,6 +287,13 @@ class Campaign:
             git(eval_tree, "cherry-pick", "--abort", check=False)
             git(eval_tree, "checkout", "-q", "-B", branch, head)
             git(eval_tree, "reset", "-q", "--hard", head)
+        elif (spare := self._spare_eval_tree(st.slug)) is not None:
+            # A finished candidate's checkout, renamed and moved to the new head:
+            # seconds, where a fresh worktree is a full checkout.
+            git(self.repo, "worktree", "move", str(spare), str(eval_tree))
+            git(eval_tree, "checkout", "-q", "-B", branch, head)
+            git(eval_tree, "reset", "-q", "--hard", head)
+            git(eval_tree, "clean", "-q", "-fd")
         else:
             add_worktree(self.repo, eval_tree, "-B", branch, str(eval_tree), head)
         link_native(self.repo, eval_tree)
@@ -300,6 +307,16 @@ class Campaign:
         st.eval_tree, st.eval_base = str(eval_tree), head
         self._label(st)
         return True
+
+    def _spare_eval_tree(self, slug: str) -> Path | None:
+        """The eval checkout of a candidate that is finished with it (kept, reverted, dropped)."""
+        for other in self.state.candidates.values():
+            if other.slug != slug and other.status in ("kept", "reverted", "dropped") and other.eval_tree:
+                tree = Path(other.eval_tree)
+                if (tree / ".git").exists() and f"{self.perf.prefix}-{other.e2e_label}" not in self.perf.inflight:
+                    other.eval_tree = ""
+                    return tree
+        return None
 
     def _config_key(self) -> str:
         return ",".join(self.state.config_overlays)

@@ -398,3 +398,46 @@ def test_a_batch_stacks_the_compatible_winners_with_the_largest_summed_gain(tmp_
     assert (best / "modeling.py").read_text() == "FAST = True\nBIG = True\n"
     formed = [json.loads(l) for l in (work / "perf_ledger.jsonl").read_text().splitlines() if '"batch_formed"' in l]
     assert formed[0]["excluded"] == ["big-one"]
+
+
+def test_a_finished_candidates_eval_checkout_is_reused(tmp_path):
+    """A fresh eval worktree is a full checkout (minutes on a network filesystem);
+    a reverted candidate's checkout is moved and re-pointed instead."""
+    from agent_flow.workflows.staircase_onboard.tune.campaign import Campaign
+    from agent_flow.workflows.staircase_onboard.tune.ladder import BenchSpec
+    from agent_flow.workflows.staircase_onboard.tune.records import NoiseFloor
+    from agent_flow.workflows.staircase_onboard.tune.worktree import open_candidate
+
+    repo = _repo(tmp_path)
+    identity = tmp_path / "identity.yaml"
+    identity.write_text(yaml.safe_dump({"modeling_v2": "require"}))
+    bench = BenchSpec(bench_py="b", model="m", env_script="e", isl=8192, osl=1024, concurrencies=[1, 128], tree=str(repo))
+    perf, gates = FakeRunner(["s1"], "camp", _effect), FakeRunner(["g1"], "campg", _effect)
+    work = tmp_path / "camp"
+    camp = Campaign(workdir=work, repo=repo, bench=bench, base_configs=[identity], perf_runner=perf, gate_runner=gates,
+                    gate_cmd=lambda tree, configs, out: f"python gate_accuracy.py --out {out}",
+                    noise=NoiseFloor(spread={"con1.tok_s_user": 0.001}), log=lambda m: None)
+    camp.state.best_tree = str(open_candidate(repo, work / "wt", "best", "HEAD"))
+    camp.state.best_commit = _git(Path(camp.state.best_tree), "rev-parse", "HEAD")
+
+    def submit(slug, text):
+        wt = open_candidate(repo, work / "wt", slug, "HEAD")
+        (wt / "modeling.py").write_text(text)
+        _git(wt, "commit", "-q", "-am", slug)
+        d = tmp_path / f"{slug}.yaml"
+        d.write_text(yaml.safe_dump({"decision": "CANDIDATE", "worktree": str(wt), "commits": [_git(wt, "rev-parse", "HEAD")]}))
+        return camp.submit_candidate(slug, d)
+
+    submit("no-gain", "FAST = False\nX = 1\n")
+    for _ in range(20):
+        if not camp.step():
+            break
+    assert camp.state.candidates["no-gain"].status == "reverted"
+    st = submit("fast-path", "FAST = True\n")
+    assert Path(st.eval_tree) == work / "wt" / "eval-fast-path"
+    assert not (work / "wt" / "eval-no-gain").exists()
+    assert (Path(st.eval_tree) / "modeling.py").read_text() == "FAST = True\n"
+    for _ in range(20):
+        if not camp.step():
+            break
+    assert camp.state.candidates["fast-path"].status == "kept"
