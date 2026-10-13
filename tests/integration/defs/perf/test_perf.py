@@ -1701,7 +1701,14 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             if isinstance(commands, PerfServeScriptTestCmds):
                 print_info("Stopping serve server")
                 commands.stop_server()
-            shutil.rmtree(self._get_engine_dir(), ignore_errors=True)
+            engine_dir = self._get_engine_dir()
+            if (self._config.model_name in DEEPSEEK_V41_MODELS
+                    and os.path.isdir(engine_dir)):
+                # Preserve raw results, prompts and config before workspace cleanup.
+                result_dir = os.path.join(output_dir, "detailed_results",
+                                          os.path.basename(engine_dir))
+                shutil.copytree(engine_dir, result_dir, dirs_exist_ok=True)
+            shutil.rmtree(engine_dir, ignore_errors=True)
 
         def add_myelin_time_pass_to(input_env):
             time_pass_flag = r" -time_pass=on"
