@@ -13,6 +13,24 @@
 # License for the specific language governing permissions and limitations under
 # the License.
 
+if(BUILD_PYT)
+  add_tllm_gtest(
+    kvOffloadProfilerTest
+    FULL_STACK
+    OWNER
+    batch-manager
+    SOURCES
+    kvOffloadProfilerTest.cpp
+    LINK_LIBRARIES
+    ${TORCH_LIBRARIES}
+    LABELS
+    "unit;batch-manager;gpu")
+  target_include_directories(
+    kvOffloadProfilerTest
+    PRIVATE ${PROJECT_SOURCE_DIR}/tensorrt_llm/batch_manager
+            ${PROJECT_SOURCE_DIR}/tensorrt_llm/common/sha256)
+endif()
+
 # Whole-archive keeps the poison listener's static registration in each test.
 add_library(tllm_kv_cache_test_support STATIC EXCLUDE_FROM_ALL
             kvCacheManagerV2PoisonCheck.cpp)

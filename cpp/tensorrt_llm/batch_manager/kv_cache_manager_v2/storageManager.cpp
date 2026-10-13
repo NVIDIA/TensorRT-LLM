@@ -28,6 +28,10 @@
 #include "kv_cache_manager_v2/utils/math.h"
 #include "tensorrt_llm/common/logger.h"
 
+#if defined(TORCH_CUDA)
+#include "tensorrt_llm/batch_manager/kvCacheTransferProfiler.h"
+#endif
+
 #include "tensorrt_llm/common/assert.h"
 #include <algorithm>
 #include <cmath>
@@ -725,6 +729,18 @@ void StorageManager::submitMigrationBatch(CacheLevel dstLevel, CacheLevel srcLev
 
     if (isGpuAccessibleMemory(coldTier))
     {
+#if defined(TORCH_CUDA)
+        common::RecordFunctionWithMetadata scope{common::ProfilerRegion::kKv};
+        if (coldTier == CacheTier::HOST_MEM)
+        {
+            scope.startWithLazyName([&] { return srcIsHot ? "trtllm::kv_cache_offload" : "trtllm::kv_cache_restore"; },
+                [&](common::ProfilerMetadata& metadata)
+                {
+                    ::tensorrt_llm::batch_manager::detail::addKvTransferMetadata(
+                        metadata, srcIsHot, "v2", coldPageBytes, numPages, stream);
+                });
+        }
+#endif
         MemAddress const coldBase = mLevels.at(coldLevel).storage->getBaseAddress(coldPgIdx, PoolIndex{0}, SlotId{0});
         bool const submitted = srcIsHot
             ? encodeBatch(reinterpret_cast<void*>(coldBase), pageIndices, numPages, stream)
