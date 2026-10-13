@@ -23,6 +23,7 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 import traceback
 import zipfile
 from dataclasses import dataclass
@@ -44,8 +45,8 @@ VISUAL_GEN_LPIPS_EVAL_SCRIPT = os.path.join(
     REPO_ROOT, "scripts", "visualgen_eval", "visual_gen_lpips_score_eval.py"
 )
 VISUAL_GEN_LPIPS_GOLDEN_DIR = os.path.join(os.path.dirname(__file__), "golden", "visual_gen_lpips")
-VISUAL_GEN_LPIPS_GOLDEN_MEDIA_ZIP = os.path.join(
-    VISUAL_GEN_LPIPS_GOLDEN_DIR, "visual_gen_lpips_golden_media.zip"
+VISUAL_GEN_LPIPS_GOLDEN_MEDIA_ZIP_TEMPLATE = os.path.join(
+    VISUAL_GEN_LPIPS_GOLDEN_DIR, "visual_gen_lpips_golden_media_{}.zip"
 )
 VISUAL_GEN_OUTPUT_VIDEO = "trtllm_output.mp4"
 
@@ -361,13 +362,33 @@ def _require_exists(path, label, is_dir=False):
         raise FileNotFoundError(f"{label} not found: {path}")
 
 
-def _extract_visual_gen_lpips_golden_media(tmp_path):
-    _require_exists(VISUAL_GEN_LPIPS_GOLDEN_MEDIA_ZIP, "VisualGen LPIPS golden media zip")
+def _golden_media_family(media_name):
+    if media_name.startswith("cosmos3_"):
+        return "cosmos3"
+    if media_name.startswith(("fastwan_", "wan21_", "wan22_")):
+        return "wan"
+    if media_name.startswith(("flux1_", "flux2_")):
+        return "flux"
+    if media_name.startswith("glm_image_"):
+        return "glm_image"
+    if media_name.startswith("hunyuan_"):
+        return "hunyuan"
+    if media_name.startswith("ltx2_"):
+        return "ltx2"
+    if media_name.startswith(("qwenimage_", "qwen_image_layered_")):
+        return "qwen_image"
+    raise ValueError(f"No VisualGen LPIPS golden media zip family for: {media_name}")
+
+
+def _extract_visual_gen_lpips_golden_media(tmp_path, media_name):
     extract_dir = tmp_path / "visual_gen_lpips_golden_media"
-    if extract_dir.exists():
+    if (extract_dir / media_name).exists():
         return extract_dir
 
-    with zipfile.ZipFile(VISUAL_GEN_LPIPS_GOLDEN_MEDIA_ZIP) as archive:
+    family = _golden_media_family(media_name)
+    archive_path = VISUAL_GEN_LPIPS_GOLDEN_MEDIA_ZIP_TEMPLATE.format(family)
+    _require_exists(archive_path, f"VisualGen LPIPS {family} golden media zip")
+    with zipfile.ZipFile(archive_path) as archive:
         for member in archive.namelist():
             if os.path.isabs(member) or ".." in member.split("/"):
                 raise ValueError(f"Unsafe golden media zip member: {member}")
@@ -376,7 +397,7 @@ def _extract_visual_gen_lpips_golden_media(tmp_path):
 
 
 def _golden_media_path(tmp_path, media_name, label):
-    path = _extract_visual_gen_lpips_golden_media(tmp_path) / media_name
+    path = _extract_visual_gen_lpips_golden_media(tmp_path, media_name) / media_name
     _require_exists(path, label)
     return path
 
@@ -407,6 +428,12 @@ def _cleanup_cuda():
     # torch.compile and unconditional @torch.compile helpers can lazily spawn
     # an Inductor worker pool whose daemon threads otherwise outlive the test.
     shutdown_compile_workers()
+    # shutdown_compile_workers() only asks the pool's health-check thread to
+    # stop; it wakes from its poll interval (2 s in torch 2.14) later. Wait for it so the
+    # thread-leak check does not catch a thread the test already shut down.
+    for thread in threading.enumerate():
+        if thread.name.startswith("InductorSubprocHealth"):
+            thread.join(timeout=10.0)
 
 
 @contextlib.contextmanager

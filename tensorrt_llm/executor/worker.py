@@ -68,6 +68,7 @@ class GenerationExecutorWorker(RpcWorkerMixin, BaseWorker):
             tokenizer=tokenizer,
             llm_args=llm_args,
         )
+        self.rpc_server = None
 
         if (self.llm_args is not None
                 and getattr(self.llm_args, "enable_resource_governor", False)):
@@ -119,6 +120,12 @@ class GenerationExecutorWorker(RpcWorkerMixin, BaseWorker):
             self.doing_shutdown = True
 
         logger_debug(f'Worker {mpi_rank()} shutdown...\n', "yellow")
+
+        # The server references this worker; a long-lived worker process would
+        # otherwise keep one server, its threads and sockets per LLM it hosted.
+        if self.rpc_server is not None:
+            self.rpc_server.shutdown()
+            self.rpc_server = None
 
         if self.engine is not None:
             if self.engine.can_enqueue_requests():
@@ -422,6 +429,11 @@ def worker_main(
     # Optionally disable GC (default: not disabled)
     if os.getenv("TRTLLM_WORKER_DISABLE_GC", "0") == "1":
         gc.disable()
+        # With automatic GC off, dynamo's post-compile gc.collect(1) walks every
+        # object allocated since the previous compile (seconds per recompile).
+        if "TORCH_DYNAMO_RUN_GC_AFTER_COMPILE" not in os.environ:
+            import torch._dynamo.config
+            torch._dynamo.config.run_gc_after_compile = False
 
     with worker:
         try:

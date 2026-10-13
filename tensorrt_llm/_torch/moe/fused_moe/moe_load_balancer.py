@@ -1022,6 +1022,7 @@ moe_model_arch_list = [
     'MixtralForCausalLM',
     'Llama4ForConditionalGeneration',
     'NemotronHForCausalLM',
+    'NemotronH_Omni_Reasoning_V3',
     'Qwen2MoeForCausalLM',
     'Qwen3MoeForCausalLM',
     'Qwen3_5MoeForCausalLM',

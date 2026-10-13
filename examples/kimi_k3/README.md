@@ -50,7 +50,7 @@ architectures may be added in a future release.
   that virtual environment are available. Packages installed only in the preparation
   container's base environment are not:
   repository-root `.venv-3.12` is the build environment created by `build_wheel.py`
-  (it contains Conan and pip, not PyTorch or Transformers), and `pip install
+  (it contains build-time packages installed by pip, not PyTorch or Transformers), and `pip install
   --no-deps -e .` installs `tensorrt_llm` alone. With an image that lacks the dependencies, every rank
   fails with a `ModuleNotFoundError` that does not name the image, such as
   `No module named 'transformers'`.

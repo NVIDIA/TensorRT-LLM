@@ -148,6 +148,8 @@ class FakeConnectorManager:
     """Records the calls the prefix path makes, in order."""
 
     def __init__(self, num_matched=0, load_async=False, add_sequence=True):
+        # Read by the manager to decide whether the prefix path runs at all.
+        self.capacity_only = False
         self.prefix_reservations_enabled = False
         self.reservations = {}
         self.reservation_requests = {}
@@ -262,11 +264,13 @@ def make_manager(connector, num_extra_kv_tokens=0, is_draft=False):
     manager.kv_cache_map = {}
     manager.enable_block_reuse = True
     manager.conversation_manager = None
+    manager._spec_recompute_tail = 0
     manager._has_cp_helix = False
     manager._allocated_draft_lens = {}
     manager._request_stats_enabled_ids = set()
     manager._fresh_pages_filled = {}
     manager._disagg_receive_ready = {}
+    manager._pending_preemption = {}
     manager._early_freed_index_requests = set()
     manager.impl = Mock()
     manager.index_mapper = Mock()
@@ -670,6 +674,25 @@ class TestExclusions:
         assert not serve(manager, req, FakeKvCache(committed=0, capacity=PROMPT_LEN))
 
         assert connector.queries == []
+
+    def test_a_capacity_only_connector_is_driven_by_no_phase(self):
+        """It serves nothing and holds no address, so every phase is empty.
+
+        `prepare_resources` is where the phases run, once per iteration, and
+        reporting an allocation costs a page index gather per context request.
+        """
+        connector = FakeConnectorManager(num_matched=64)
+        connector.capacity_only = True
+        manager = make_manager(connector)
+        req = FakeRequest()
+        manager.kv_cache_map[req.py_request_id] = FakeKvCache(committed=0, capacity=PROMPT_LEN)
+
+        manager.prepare_resources(scheduled(req))
+
+        assert connector.queries == []
+        assert connector.commits == []
+        assert connector.allocs == []
+        assert not req.py_connector_allocation_reported
 
 
 class TestAsyncLoad:

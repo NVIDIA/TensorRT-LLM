@@ -428,9 +428,8 @@ def is_port_available(port: int,
     [
         # Configuration for TinyLlama model
         # memory_requirement is in MiB (12 GB = 12288 MiB)
-        ModelConfig(model_dir="llama-models-v2/TinyLlama-1.1B-Chat-v1.0",
-                    tp_size=1,
-                    memory_requirement=12288),
+        ModelConfig(
+            model_dir="Qwen3/Qwen3-0.6B", tp_size=1, memory_requirement=12288),
         # Configuration for Qwen3.5-4B
         # memory_requirement is in MiB (12 GB = 12288 MiB)
         ModelConfig(model_dir="Qwen3.5-4B", tp_size=1,
