@@ -1594,13 +1594,22 @@ class Gemma4ForCausalLM(SpecDecOneEngineForCausalLM[Gemma4TextModel, Gemma4TextC
         )
 
     def _supports_variable_window_attention(self, attn_metadata: TrtllmAttentionMetadata) -> bool:
+        # Gemma4 sliding layers share head geometry and quantization settings.
         sliding_layer = next((layer for layer in self.model.layers if layer.is_sliding), None)
         if sliding_layer is None:
             return False
-        return sliding_layer.self_attn.attn._is_variable_window_kernel_available(
+        attention = sliding_layer.self_attn
+        backend = attention.attn
+        output_dtype = self.config.torch_dtype
+        if attention._use_quantize_output():
+            use_nvfp4_output = backend.use_nvfp4_output(
+                attn_metadata, PredefinedAttentionMask.CAUSAL
+            )
+            output_dtype = backend.get_quantize_output_dtype(use_nvfp4_output) or output_dtype
+        return backend._is_variable_window_kernel_available(
             dtype=self.config.torch_dtype,
-            tokens_per_block=attn_metadata.tokens_per_block,
-            use_paged_context_fmha=attn_metadata.use_paged_context_fmha,
+            output_dtype=output_dtype,
+            metadata=attn_metadata,
         )
 
     @torch.inference_mode()
@@ -1626,32 +1635,39 @@ class Gemma4ForCausalLM(SpecDecOneEngineForCausalLM[Gemma4TextModel, Gemma4TextC
         # applies multimodal bidirectionality only to sliding-window layers;
         # full-attention layers retain their normal causal mask.
         use_bidir = getattr(self.config, "use_bidirectional_attention", None)
-        if (
-            mm_token_type_ids is not None
-            and use_bidir == "vision"
-            and is_sm_100f()
-            and isinstance(attn_metadata, TrtllmAttentionMetadata)
-            and attn_metadata.num_contexts > 0
-            and self._supports_variable_window_attention(attn_metadata)
-        ):
-            (
-                local_variable_window_token_starts,
-                local_variable_window_token_ends,
-            ) = self.get_attention_variable_window(
-                mm_token_type_ids=mm_token_type_ids,
-                attn_metadata=attn_metadata,
-                effective_sliding_window=self.config.sliding_window,
-            )
-        elif (
+        needs_bidir = (
             mm_token_type_ids is not None
             and use_bidir == "vision"
             and attn_metadata.num_contexts > 0
-        ):
-            local_attention_mask_data = self.get_attention_mask(
-                mm_token_type_ids=mm_token_type_ids,
-                attn_metadata=attn_metadata,
-                effective_sliding_window=self.config.sliding_window,
+        )
+        if needs_bidir:
+            use_variable_window = (
+                is_sm_100f()
+                and isinstance(attn_metadata, TrtllmAttentionMetadata)
+                and not getattr(attn_metadata, "is_cuda_graph", False)
+                and not is_torch_compiling()
+                and self._supports_variable_window_attention(attn_metadata)
             )
+            if use_variable_window:
+                starts, ends = self.get_attention_variable_window(
+                    mm_token_type_ids=mm_token_type_ids,
+                    attn_metadata=attn_metadata,
+                    effective_sliding_window=self.config.sliding_window,
+                )
+                # A paged sliding cache cannot serve KV indices beyond its retained window.
+                window = self.config.sliding_window
+                use_variable_window = (
+                    window is None or not torch.any(ends - starts + 1 > window).item()
+                )
+                if use_variable_window:
+                    local_variable_window_token_starts = starts
+                    local_variable_window_token_ends = ends
+            if not use_variable_window:
+                local_attention_mask_data = self.get_attention_mask(
+                    mm_token_type_ids=mm_token_type_ids,
+                    attn_metadata=attn_metadata,
+                    effective_sliding_window=self.config.sliding_window,
+                )
 
         output = self.model(
             input_ids=input_ids,

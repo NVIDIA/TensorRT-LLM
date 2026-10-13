@@ -19,8 +19,6 @@
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/envUtils.h"
 
-#include <algorithm>
-
 TRTLLM_NAMESPACE_BEGIN
 
 namespace kernels
@@ -109,6 +107,7 @@ FmhaDispatcher::FmhaDispatcher(MHARunnerFixedParams fixedParams)
 
 bool FmhaDispatcher::isSupported()
 {
+    // A (1, 1) sliding probe needs more than two KV tokens to stay distinct from Dense.
     constexpr int32_t kWindowProbeKvSeqLen = 4;
 
     bool foundKernels = false;
@@ -133,23 +132,14 @@ bool FmhaDispatcher::isSupported()
         auto qkvLayout = AttentionInputLayoutToQkvLayout(mFixedParams.attentionInputLayout);
         // Create TllmGenFmhaRunnerParams based on MHARunnerFixedParams. Only fill necessary
         // attributes for kernel selection.
-        int32_t variableWindowBound = 0;
         TllmGenFmhaRunnerParams tllmRunnerParams;
         memset(&tllmRunnerParams, 0, sizeof(tllmRunnerParams));
         tllmRunnerParams.mLeftSlidingWindow = -1;
         tllmRunnerParams.mRightSlidingWindow = -1;
         tllmRunnerParams.mQkvLayout = qkvLayout;
-        if (mFixedParams.attentionMaskType == ContextAttentionMaskType::BIDIRECTIONAL_SLIDING_WINDOW)
-        {
-            tllmRunnerParams.mMaskType = TrtllmGenAttentionMaskType::SlidingOrChunkedCausal;
-            tllmRunnerParams.mLeftSlidingWindow = 1;
-            tllmRunnerParams.mRightSlidingWindow = 1;
-        }
-        else if (mFixedParams.attentionMaskType == ContextAttentionMaskType::VARIABLE_WINDOW)
+        if (mFixedParams.attentionMaskType == ContextAttentionMaskType::VARIABLE_WINDOW)
         {
             tllmRunnerParams.mMaskType = TrtllmGenAttentionMaskType::VariableWindow;
-            tllmRunnerParams.variableWindowTokenStartsPtr = &variableWindowBound;
-            tllmRunnerParams.variableWindowTokenEndsPtr = &variableWindowBound;
         }
         else
         {
@@ -168,7 +158,6 @@ bool FmhaDispatcher::isSupported()
         tllmRunnerParams.mHeadDimQkNope = mFixedParams.headSizeQkNope;
         tllmRunnerParams.mBatchSize = 1;
         tllmRunnerParams.mMaxSeqLenQ = 1;
-        // Keep the minimal (0, 0) and (1, 1) window probes distinct from Causal and Dense.
         tllmRunnerParams.mMaxSeqLenKv = kWindowProbeKvSeqLen;
         tllmRunnerParams.mMaxSeqLenCacheKv = kWindowProbeKvSeqLen;
         tllmRunnerParams.mSumOfSeqLensQ = 1;
@@ -199,15 +188,6 @@ bool FmhaDispatcher::isSupported()
         tllmRunnerParams.mUsesSpcompress = mFixedParams.useSpcompress;
 
         foundKernels = mTllmGenFMHARunner->isSupported(tllmRunnerParams);
-        if (foundKernels && mFixedParams.attentionMaskType == ContextAttentionMaskType::BIDIRECTIONAL_SLIDING_WINDOW
-            && !mFixedParams.useTllmGenSparseAttention)
-        {
-            // A bidirectional window that covers the sequence takes the Dense path at runtime.
-            tllmRunnerParams.mMaskType = TrtllmGenAttentionMaskType::Dense;
-            tllmRunnerParams.mLeftSlidingWindow = -1;
-            tllmRunnerParams.mRightSlidingWindow = -1;
-            foundKernels = mTllmGenFMHARunner->isSupported(tllmRunnerParams);
-        }
     }
     else
     {
@@ -276,6 +256,14 @@ void FmhaDispatcher::run(MHARunnerParams runnerParams)
 
         // Parameters to select kernels.
         tllmRunnerParams.mQkvLayout = qkvLayout;
+        if (mFixedParams.attentionMaskType == ContextAttentionMaskType::VARIABLE_WINDOW)
+        {
+            tllmRunnerParams.mMaskType = TrtllmGenAttentionMaskType::VariableWindow;
+        }
+        else
+        {
+            tllmRunnerParams.setAttentionMaskType(static_cast<std::int8_t>(mFixedParams.attentionMaskType));
+        }
         tllmRunnerParams.mKernelType = FmhaKernelType::Context;
         // Persistent scheduler by default for better performance; see contextTileScheduler().
         tllmRunnerParams.mTileScheduler = contextTileScheduler();
@@ -333,31 +321,12 @@ void FmhaDispatcher::run(MHARunnerParams runnerParams)
             = runnerParams.slidingWindowSize > 0 && runnerParams.kvSeqLen > runnerParams.slidingWindowSize;
         TLLM_CHECK_WITH_INFO(!(usesChunkedAttention && usesSlidingWindow),
             "Chunked attention size and sliding window size should not be used together.");
-        if (mFixedParams.attentionMaskType == ContextAttentionMaskType::VARIABLE_WINDOW)
-        {
-            tllmRunnerParams.mMaskType = TrtllmGenAttentionMaskType::VariableWindow;
-        }
-        else if (usesChunkedAttention)
+        if (mFixedParams.attentionMaskType != ContextAttentionMaskType::VARIABLE_WINDOW && usesChunkedAttention)
         {
             tllmRunnerParams.mMaskType = TrtllmGenAttentionMaskType::SlidingOrChunkedCausal;
             tllmRunnerParams.mChunkedAttentionSize = runnerParams.chunkedAttentionSize;
         }
-        else if (mFixedParams.attentionMaskType == ContextAttentionMaskType::BIDIRECTIONAL_SLIDING_WINDOW)
-        {
-            // Match legacy FMHA: the window extends this far on both sides of the query, inclusively.
-            auto const windowReach = runnerParams.slidingWindowSize / 2;
-            if (windowReach >= runnerParams.kvSeqLen - 1)
-            {
-                tllmRunnerParams.mMaskType = TrtllmGenAttentionMaskType::Dense;
-            }
-            else
-            {
-                tllmRunnerParams.mMaskType = TrtllmGenAttentionMaskType::SlidingOrChunkedCausal;
-                tllmRunnerParams.mLeftSlidingWindow = windowReach;
-                tllmRunnerParams.mRightSlidingWindow = windowReach;
-            }
-        }
-        else if (usesSlidingWindow)
+        else if (mFixedParams.attentionMaskType != ContextAttentionMaskType::VARIABLE_WINDOW && usesSlidingWindow)
         {
             tllmRunnerParams.mMaskType = TrtllmGenAttentionMaskType::SlidingOrChunkedCausal;
             tllmRunnerParams.mLeftSlidingWindow = runnerParams.slidingWindowSize - 1;
@@ -366,10 +335,6 @@ void FmhaDispatcher::run(MHARunnerParams runnerParams)
         else if (mFixedParams.attentionMaskType == ContextAttentionMaskType::SLIDING_OR_CHUNKED_CAUSAL)
         {
             tllmRunnerParams.mMaskType = TrtllmGenAttentionMaskType::Causal;
-        }
-        else
-        {
-            tllmRunnerParams.setAttentionMaskType(static_cast<std::int8_t>(mFixedParams.attentionMaskType));
         }
         tllmRunnerParams.mSumOfSeqLensQ = runnerParams.totalQSeqLen;
         tllmRunnerParams.mSumOfSeqLensKv = runnerParams.totalKvSeqLen;

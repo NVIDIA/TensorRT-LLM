@@ -5,6 +5,7 @@ from unittest import mock
 
 import pytest
 import torch
+import torch.nn.functional as F
 
 from tensorrt_llm._torch.attention.backends.fmha.fallback import FallbackFmha
 from tensorrt_llm._torch.attention.backends.interface import (
@@ -83,6 +84,25 @@ def test_variable_window_rejects_unsupported_kernel_configuration():
         _run_variable_window_attention(head_dim=64, bounds_device=torch.device("cuda:0"))
 
 
+@pytest.mark.skipif(get_sm_version() not in (100, 103), reason="requires SM100 or SM103")
+def test_variable_window_probe_rejects_invalid_head_size():
+    assert not torch.ops.trtllm.attention_supports_variable_window(
+        torch.bfloat16,
+        torch.bfloat16,
+        2,
+        1,
+        7,
+        None,
+        0,
+        1,
+        4,
+        4,
+        None,
+        False,
+        False,
+    )
+
+
 @pytest.mark.parametrize(
     ("include_starts", "include_ends"),
     [(True, False), (False, True)],
@@ -100,3 +120,54 @@ def test_variable_window_bounds_must_be_paired(include_starts, include_ends):
             include_ends=include_ends,
             force_fallback=True,
         )
+
+
+@pytest.mark.skipif(get_sm_version() not in (100, 103), reason="requires SM100 or SM103")
+def test_variable_window_attention_matches_dense_reference():
+    num_tokens = 7
+    num_heads = 2
+    head_dim = 128
+    attention = create_attention(
+        "TRTLLM", layer_idx=0, num_heads=num_heads, num_kv_heads=1, head_dim=head_dim
+    )
+    metadata = attention.Metadata(
+        max_num_requests=1,
+        max_num_tokens=num_tokens,
+        kv_cache_manager=None,
+        mapping=None,
+        runtime_features=None,
+    )
+    metadata.seq_lens = torch.tensor([num_tokens], dtype=torch.int32)
+    metadata.num_contexts = 1
+    metadata.request_ids = torch.tensor([0], dtype=torch.int32)
+    metadata.max_seq_len = num_tokens
+    metadata.prepare()
+
+    torch.manual_seed(7)
+    qkv = (
+        torch.randn(
+            num_tokens,
+            (num_heads + 2) * head_dim,
+            dtype=torch.bfloat16,
+            device="cuda:0",
+        )
+        * 0.2
+    )
+    starts = torch.tensor([0, 0, 0, 0, 2, 4, 4], dtype=torch.int32, device="cuda:0")
+    ends = torch.tensor([0, 3, 3, 3, 4, 6, 6], dtype=torch.int32, device="cuda:0")
+    forward_args = AttentionForwardArgs(
+        attention_input_type=AttentionInputType.context_only,
+        variable_window_token_starts=starts,
+        variable_window_token_ends=ends,
+    )
+    actual = attention.forward(qkv, None, None, metadata, forward_args=forward_args)
+
+    q, k, v = qkv.split((num_heads * head_dim, head_dim, head_dim), dim=-1)
+    q = q.reshape(num_tokens, num_heads, head_dim).transpose(0, 1).unsqueeze(0)
+    k = k.reshape(num_tokens, 1, head_dim).transpose(0, 1).expand(1, num_heads, -1, -1)
+    v = v.reshape(num_tokens, 1, head_dim).transpose(0, 1).expand(1, num_heads, -1, -1)
+    kv_positions = torch.arange(num_tokens, device="cuda:0")
+    dense_mask = (kv_positions >= starts[:, None]) & (kv_positions <= ends[:, None])
+    expected = F.scaled_dot_product_attention(q, k, v, attn_mask=dense_mask[None, None])
+    expected = expected.squeeze(0).transpose(0, 1).reshape(num_tokens, num_heads * head_dim)
+    torch.testing.assert_close(actual, expected, atol=0.05, rtol=0.02)

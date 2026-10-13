@@ -2101,7 +2101,6 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
                 fmhaParams.qPtr = attention_input;
                 fmhaParams.kPtr = params.k_ptr;
                 fmhaParams.vPtr = params.v_ptr;
-                fmhaParams.vStrideInBytes = params.v_stride_in_bytes;
             }
         }
         else if (useSageAttnSeparateQkv)
@@ -2916,7 +2915,7 @@ template KvCacheBuffers<KVLinearBuffer> tensorrt_llm::common::op::buildKvCacheBu
     int32_t, int32_t, int32_t, int32_t, int32_t, bool, void*, void*, void*, void*, KVBlockArray::DataType*, bool,
     int32_t, void*);
 
-int AttentionOp::initialize() noexcept
+int AttentionOp::initialize()
 {
     // use Ulysses for GPTAttentionPlugin
     if (mAttnTpSize < 0 || mAttnCpSize < 0)

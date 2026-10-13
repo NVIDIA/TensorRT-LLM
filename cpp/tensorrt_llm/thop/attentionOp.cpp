@@ -29,6 +29,7 @@
 #include "tensorrt_llm/thop/attentionOp.h"
 #include "tensorrt_llm/thop/thUtils.h"
 #include <cstdint>
+#include <exception>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -48,6 +49,14 @@ using tensorrt_llm::runtime::RequestType;
 
 namespace
 {
+
+bool usesFp8ContextFmha(tensorrt_llm::common::QuantMode const quantMode, bool const isFp8Output, bool const isFp4Output,
+    bool const usePagedContextFmha, bool const useSageAttention, bool const isMlaEnabled)
+{
+    // Non-MLA NVFP4 KV cache uses FP8 context FMHA kernels on SM100-family GPUs, regardless of output type.
+    return isFp8Output || isFp4Output || (quantMode.hasFp8KvCache() && usePagedContextFmha)
+        || (!isMlaEnabled && quantMode.hasFp4KvCache() && tensorrt_llm::common::isSM100Family()) || useSageAttention;
+}
 
 int64_t exportOffset(tensorrt_llm::common::op::WorkspaceSlice const& slice)
 {
@@ -1385,12 +1394,9 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     op->mRotaryEmbeddingLongMscale = rope_long_m_scale;
     op->mRotaryEmbeddingMaxPositions = rope_max_positions;
     op->mRotaryEmbeddingOriginalMaxPositions = rope_original_max_positions;
-    // Only the FP8 context FMHA kernels read an NVFP4 KV cache, whatever the output type; they do so on SM100-family
-    // GPUs only, so elsewhere an NVFP4 KV cache still fails the FP4 KV check in AttentionOp. MLA keeps its own NVFP4 KV
-    // handling (mUseNvfp4MlaKvCache, mFP8ContextMLA below) and must not pick this up.
-    op->mFP8ContextFMHA = is_fp8_out || is_fp4_out || (op->mKVCacheQuantMode.hasFp8KvCache() && use_paged_context_fmha)
-        || (!is_mla_enable && op->mKVCacheQuantMode.hasFp4KvCache() && tensorrt_llm::common::isSM100Family())
-        || use_sage_attn;
+    op->mFP8ContextFMHA
+        = usesFp8ContextFmha(
+            op->mKVCacheQuantMode, is_fp8_out, is_fp4_out, use_paged_context_fmha, use_sage_attn, is_mla_enable);
     // SageAttention block sizes and quantization mode.
     op->mSageAttnNumEltsPerBlkQ = static_cast<int>(sage_attn_num_elts_per_blk_q);
     op->mSageAttnNumEltsPerBlkK = static_cast<int>(sage_attn_num_elts_per_blk_k);
@@ -1723,27 +1729,41 @@ int64_t spec_dec_tree_custom_mask_capacity(
         static_cast<int32_t>(max_seq_len_q), static_cast<int32_t>(num_heads_q_per_kv));
 }
 
-bool attention_supports_variable_window(c10::ScalarType const dtype, int64_t const num_heads,
-    int64_t const num_kv_heads, int64_t const head_size, std::optional<int64_t> const tokens_per_block,
-    int64_t const quant_mode, bool const use_paged_context_fmha)
+bool attention_supports_variable_window(c10::ScalarType const dtype, c10::ScalarType const output_dtype,
+    int64_t const num_heads, int64_t const num_kv_heads, int64_t const head_size,
+    std::optional<int64_t> const tokens_per_block, int64_t const quant_mode, int64_t const max_num_requests,
+    int64_t const max_context_length, int64_t const max_seq_len, std::optional<int64_t> const attention_chunk_size,
+    bool const use_kv_cache, bool const use_paged_context_fmha)
 {
     auto const smVersion = tensorrt_llm::common::getSMVersion();
-    if (smVersion != 100 && smVersion != 103)
+    if ((smVersion != 100 && smVersion != 103) || (dtype != torch::kFloat16 && dtype != torch::kBFloat16)
+        || (output_dtype != dtype && output_dtype != torch::kFloat8_e4m3fn && output_dtype != torch::kUInt8)
+        || num_heads <= 0 || num_kv_heads <= 0 || head_size <= 0)
     {
         return false;
     }
 
     auto op = std::make_shared<AttentionOp>();
     op->mType = tensorrt_llm::runtime::TorchUtils::dataType(dtype);
+    op->mFMHAForceFP32Acc = dtype == torch::kBFloat16;
     op->mNumHeads = num_heads;
     op->mNumKVHeads = num_kv_heads;
     op->mHeadSize = head_size;
     op->mKVCacheQuantMode = tensorrt_llm::common::QuantMode(uint32_t(quant_mode));
-    op->mFP8ContextFMHA = op->mKVCacheQuantMode.hasFp8KvCache() || op->mKVCacheQuantMode.hasFp4KvCache();
-    op->mUseKVCache = true;
-    op->mPagedKVCache = true;
+    bool const isFp8Output = output_dtype == torch::kFloat8_e4m3fn;
+    bool const isFp4Output = output_dtype == torch::kUInt8;
+    op->mFP8ContextFMHA
+        = usesFp8ContextFmha(op->mKVCacheQuantMode, isFp8Output, isFp4Output, use_paged_context_fmha, false, false);
+    op->mFP8AttenOutput = isFp8Output;
+    op->mFuseFp4Quant = isFp4Output;
+    op->mUseKVCache = use_kv_cache;
+    op->mPagedKVCache = use_kv_cache;
     op->mTokensPerBlock = tokens_per_block.value_or(0);
     op->mPagedContextFMHA = use_paged_context_fmha;
+    op->mMaxNumRequests = max_num_requests;
+    op->mMaxContextLength = max_context_length;
+    op->mMaxSeqLen = max_seq_len;
+    op->mAttentionChunkSize = attention_chunk_size;
     op->mUseVariableWindow = true;
 
     auto cache_key = op->data();
@@ -1756,8 +1776,16 @@ bool attention_supports_variable_window(c10::ScalarType const dtype, int64_t con
         return it->second;
     }
 
-    op->initialize();
-    return op_cache.emplace(std::move(cache_key), op->supportsVariableWindow()).first->second;
+    bool supported = false;
+    try
+    {
+        supported = op->initialize() == 0 && op->supportsVariableWindow();
+    }
+    catch (std::exception const& e)
+    {
+        TLLM_LOG_DEBUG("Variable-window FMHA probe rejected the configuration: %s", e.what());
+    }
+    return op_cache.emplace(std::move(cache_key), supported).first->second;
 }
 
 KvCachePoolPointers buildKvCachePoolPointers(at::Tensor const& hostKvCachePoolPointers, int32_t poolIndex,

@@ -53,7 +53,7 @@ public:
     AttentionOp(){};
     ~AttentionOp() = default;
 
-    int initialize() noexcept;
+    int initialize();
     [[nodiscard]] size_t getFmhaMultiCtasKvScratchSize() const noexcept;
     [[nodiscard]] int getHeadSize(bool checkInit = true) const;
     [[nodiscard]] int getMaxNumSeqLenTile(int batch_beam_size = 1) const;

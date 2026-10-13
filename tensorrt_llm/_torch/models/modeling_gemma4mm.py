@@ -1211,7 +1211,10 @@ class Gemma4MultimodalModelBase(MultimodalModelMixin, PreTrainedModel):
         resource_manager=None,
         **forward_kwargs,
     ) -> Dict:
-        """Build Gemma4-specific language-model forward arguments."""
+        """Build Gemma4-specific language-model forward arguments.
+
+        Generation-only batches need no multimodal token-type ids for context masking.
+        """
         del position_ids, forward_kwargs
         mm_token_type_ids = None
         if (
