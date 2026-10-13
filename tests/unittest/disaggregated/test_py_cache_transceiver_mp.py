@@ -23,6 +23,8 @@ import torch.multiprocessing as mp
 os.environ["UCX_TLS"] = "^ib,gdr_copy"
 os.environ["TRTLLM_NIXL_NUM_THREADS"] = "1"
 
+from kv_cache_manager_v2_test_utils import allocate_request, initialize_cache, request_block_data
+
 import tensorrt_llm
 import tensorrt_llm.bindings
 from tensorrt_llm import DisaggregatedParams, Mapping, SamplingParams
@@ -31,37 +33,6 @@ from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestTyp
 from tensorrt_llm.bindings import DataType, LlmRequestState
 from tensorrt_llm.disaggregated_params import DisaggScheduleStyle
 from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig, KvCacheConfig
-
-
-def _initialize_cache(manager: KVCacheManagerV2, seed: int | None = None) -> None:
-    for layer_idx in manager.pp_layers:
-        buffer = manager.get_buffers(layer_idx, kv_layout="HND")
-        generator = (
-            torch.Generator(device=buffer.device).manual_seed(seed + layer_idx)
-            if seed is not None
-            else None
-        )
-        buffer.copy_(
-            torch.rand(buffer.shape, dtype=torch.float32, device=buffer.device, generator=generator)
-        )
-
-
-def _allocate_request(manager: KVCacheManagerV2, request: LlmRequest) -> None:
-    # These transport tests bypass the scheduler and supply complete KV pages.
-    cache = manager._create_kv_cache(request.py_request_id, None, None)
-    assert cache is not None
-    assert cache.resume(torch.cuda.current_stream().cuda_stream)
-    assert cache.resize(request.prompt_len, history_length=request.prompt_len)
-
-
-def _request_block_data(manager: KVCacheManagerV2, request: LlmRequest) -> torch.Tensor:
-    # Keep the existing [blocks, layers, K/V, flattened page] verification layout.
-    layers = []
-    for layer_idx in manager.pp_layers:
-        blocks = manager.get_batch_cache_indices([request.py_request_id], layer_idx)[0]
-        data = manager.get_buffers(layer_idx, kv_layout="HND")[blocks]
-        layers.append(data.reshape(data.shape[0], data.shape[1], -1))
-    return torch.stack(layers, dim=1)
 
 
 def broadcast_string(s: str | None, src: int, group: dist.ProcessGroup | None = None) -> str:
@@ -394,7 +365,7 @@ def worker_fn(
 
         # Initialize with random data
         # For MLA without DP, all TP ranks within ctx/gen must have the same data (use fixed seed)
-        _initialize_cache(kv_cache_manager, seed=42 if is_mla and not ctx_enable_dp else None)
+        initialize_cache(kv_cache_manager, seed=42 if is_mla and not ctx_enable_dp else None)
 
         # Create Distributed wrapper (ctx_group contains all ctx ranks)
         dist_wrapper = TorchDistributedWrapper(
@@ -457,7 +428,7 @@ def worker_fn(
         )
 
         # Initialize gen with random data (to verify transfer overwrites it)
-        _initialize_cache(kv_cache_manager)
+        initialize_cache(kv_cache_manager)
 
         # Create Distributed wrapper (gen_group contains all gen ranks)
         dist_wrapper = TorchDistributedWrapper(
@@ -612,7 +583,7 @@ def worker_fn(
         All ranks have all requests' block data (via V2 allocation), so gather is simple.
         In DP mode, merge_block_data knows which ranks have valid (transferred) data.
         """
-        block_data = _request_block_data(kv_cache_manager, request)
+        block_data = request_block_data(kv_cache_manager, request)
         block_data_cpu = block_data.cpu()
 
         ctx_block_datas = None
@@ -704,7 +675,7 @@ def worker_fn(
 
         # All ranks allocate KV pages so they have block data for verification
         # But only ranks that should_handle will submit to transceiver
-        _allocate_request(kv_cache_manager, request)
+        allocate_request(kv_cache_manager, request)
 
         if should_handle:
             my_requests.append((i, request))  # Store index and request for transfer

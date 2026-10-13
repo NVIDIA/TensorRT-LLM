@@ -30,6 +30,8 @@ os.environ["UCX_TLS"] = "^ib,gdr_copy"
 # https://nvbugs/6426834).
 os.environ["TRTLLM_NIXL_NUM_THREADS"] = "1"
 
+from kv_cache_manager_v2_test_utils import allocate_request, initialize_cache, request_block_data
+
 import tensorrt_llm
 import tensorrt_llm.bindings
 from tensorrt_llm import DisaggregatedParams, Mapping, SamplingParams
@@ -40,30 +42,6 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheM
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestType
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
-
-
-def _initialize_cache(manager: KVCacheManagerV2) -> None:
-    for layer_idx in manager.pp_layers:
-        buffer = manager.get_buffers(layer_idx, kv_layout="HND")
-        buffer.copy_(torch.rand(buffer.shape, dtype=torch.float32, device=buffer.device))
-
-
-def _allocate_request(manager: KVCacheManagerV2, request: LlmRequest) -> None:
-    # These transport tests bypass the scheduler and supply complete KV pages.
-    cache = manager._create_kv_cache(request.py_request_id, None, None)
-    assert cache is not None
-    assert cache.resume(torch.cuda.current_stream().cuda_stream)
-    assert cache.resize(request.prompt_len, history_length=request.prompt_len)
-
-
-def _request_block_data(manager: KVCacheManagerV2, request: LlmRequest) -> torch.Tensor:
-    # Keep the existing [blocks, layers, K/V, flattened page] verification layout.
-    layers = []
-    for layer_idx in manager.pp_layers:
-        blocks = manager.get_batch_cache_indices([request.py_request_id], layer_idx)[0]
-        data = manager.get_buffers(layer_idx, kv_layout="HND")[blocks]
-        layers.append(data.reshape(data.shape[0], data.shape[1], -1))
-    return torch.stack(layers, dim=1)
 
 
 def broadcast_string(s: str | None, src: int, group: dist.ProcessGroup | None = None) -> str:
@@ -233,7 +211,7 @@ def worker_fn(
         )
 
         # Initialize with random data
-        _initialize_cache(kv_cache_manager)
+        initialize_cache(kv_cache_manager)
 
         # Create TransferWorker
         transfer_worker = TransferWorker(
@@ -371,7 +349,7 @@ def worker_fn(
             ctx_request.py_disaggregated_params = DisaggregatedParams(disagg_request_id=unique_rid)
 
             # Add sequence to KVCacheManager
-            _allocate_request(kv_cache_manager, ctx_request)
+            allocate_request(kv_cache_manager, ctx_request)
 
             # Create sender session
             sender_session = transfer_worker.create_tx_session(ctx_request)
@@ -394,7 +372,7 @@ def worker_fn(
             assert sender_session.status == SessionStatus.TRANSFERRED
 
             # Get block data for verification
-            block_data = _request_block_data(kv_cache_manager, ctx_request)
+            block_data = request_block_data(kv_cache_manager, ctx_request)
 
         else:  # gen process
             # Create gen request
@@ -416,7 +394,7 @@ def worker_fn(
             )
 
             # Add sequence to KVCacheManager
-            _allocate_request(kv_cache_manager, gen_request)
+            allocate_request(kv_cache_manager, gen_request)
 
             # Create receiver session
             receiver_session = transfer_worker.create_rx_session(gen_request)
@@ -439,7 +417,7 @@ def worker_fn(
             assert receiver_session.status == SessionStatus.TRANSFERRED
 
             # Get block data for verification
-            block_data = _request_block_data(kv_cache_manager, gen_request)
+            block_data = request_block_data(kv_cache_manager, gen_request)
 
         # Synchronize before verification
         dist.barrier()
