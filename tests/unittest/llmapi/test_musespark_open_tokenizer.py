@@ -128,23 +128,25 @@ def test_musespark_open_end_of_message_survives_detokenization(tokenizer):
     assert tokenizer.decode(ids, skip_special_tokens=True) == ""
 
 
-def test_musespark_open_digit_tokenization_is_not_regex_fixed(tokenizer):
-    """``fix_mistral_regex`` has to stay off for this tokenizer.
+# Digit splitting from the shipped tokenizer files (transformers 5.5.4). The
+# wrapper must not alter the pre-tokenizer; this pins what "unaltered" means.
+DIGIT_TEXT = "12345 and 987 plus 1000000"
+DIGIT_IDS = [7235, 2127, 341, 220, 41834, 3449, 220, 1135, 1052, 28]
 
-    Its warning is a false positive here, and enabling it changes how digits
-    are split.
+
+def test_musespark_open_digit_tokenization_matches_the_stock_tokenizer(tokenizer):
+    """Digits split exactly as the stock tokenizer splits them.
+
+    This replaces a guard built on the ``fix_mistral_regex`` compatibility
+    switch: transformers >= 5.5 no longer has that switch (passing it is a
+    silently stored no-op), so "enabling it changes the split" can no longer
+    be observed. The contract that matters is unchanged: the wrapper does not
+    rewrite the pre-tokenizer, so its ids equal the stock tokenizer's and the
+    pinned reference.
     """
     from transformers import AutoTokenizer
 
-    text = "12345 and 987 plus 1000000"
-    ours = tokenizer.encode(text, add_special_tokens=False)
-    fixed = AutoTokenizer.from_pretrained(CHECKPOINT, fix_mistral_regex=True).encode(
-        text, add_special_tokens=False
-    )
-    assert ours != fixed, (
-        "fix_mistral_regex no longer changes digit tokenization; this guard "
-        "cannot detect the flag being turned on any more"
-    )
-    # And the untouched path is what the reference tokenizer produces.
-    plain = AutoTokenizer.from_pretrained(CHECKPOINT).encode(text, add_special_tokens=False)
+    ours = tokenizer.encode(DIGIT_TEXT, add_special_tokens=False)
+    assert ours == DIGIT_IDS
+    plain = AutoTokenizer.from_pretrained(CHECKPOINT).encode(DIGIT_TEXT, add_special_tokens=False)
     assert ours == plain

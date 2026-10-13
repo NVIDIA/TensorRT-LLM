@@ -29,9 +29,9 @@ this class ties off, all of which are silent failures otherwise:
   every reasoning block and non-final tool call, after which the model keeps
   going on its own.
 
-Nothing here rewrites the vocabulary or the pre-tokenizer: in particular the
-``fix_mistral_regex`` compatibility switch stays off, because enabling it
-changes how digits are split.
+Nothing here rewrites the vocabulary or the pre-tokenizer; digit splitting
+in particular is pinned to the stock tokenizer's output by
+``tests/unittest/llmapi/test_musespark_open_tokenizer.py``.
 """
 
 import json
