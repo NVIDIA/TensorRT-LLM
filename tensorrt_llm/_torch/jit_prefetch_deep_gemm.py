@@ -277,9 +277,7 @@ class FP8LinearDeepGemmProvider:
 
         shapes = set()
         for mod in model.modules():
-            if _Fp8BlockScaleWeightReadLinear and isinstance(
-                mod, _Fp8BlockScaleWeightReadLinear
-            ):
+            if _Fp8BlockScaleWeightReadLinear and isinstance(mod, _Fp8BlockScaleWeightReadLinear):
                 pass
             elif not isinstance(mod, Linear):
                 continue

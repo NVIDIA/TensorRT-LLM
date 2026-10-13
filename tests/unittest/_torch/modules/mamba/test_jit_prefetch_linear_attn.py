@@ -223,7 +223,12 @@ def test_provider_finds_real_gdn_and_kda_layers():
     p = la.LinearAttnProvider(model, max_num_tokens=256, chunk_size=64)
     assert sorted(type(s).__name__ for s in p.shapes) == ["_GdnShape", "_KdaShape"]
     gdn_shape = next(s for s in p.shapes if isinstance(s, la._GdnShape))
-    assert (gdn_shape.k_heads, gdn_shape.v_heads, gdn_shape.k_dim, gdn_shape.v_dim) == (4, 8, 64, 64)
+    assert (gdn_shape.k_heads, gdn_shape.v_heads, gdn_shape.k_dim, gdn_shape.v_dim) == (
+        4,
+        8,
+        64,
+        64,
+    )
     kda_shape = next(s for s in p.shapes if isinstance(s, la._KdaShape))
     assert (kda_shape.heads, kda_shape.head_dim) == (4, 128)
     batch = type("B", (), {"ctx_chunk_lens": [100], "gen_tokens": 0})()
