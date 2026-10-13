@@ -1538,7 +1538,7 @@ def test_prims_ts_fp8_decode_bf16_device_scales(
             seq_len_q=1,
             max_active_clusters=torch.cuda.get_device_properties(0).multi_processor_count,
         )
-        monkeypatch.setattr(decode, "_resolve_decode_launch_spec", lambda *args: spec)
+        monkeypatch.setattr(decode, "_resolve_decode_launch_spec", lambda *args, **kwargs: spec)
         wrapper = decode.BatchDecodePagedTSWrapper()
         wrapper.plan(
             q.device,
