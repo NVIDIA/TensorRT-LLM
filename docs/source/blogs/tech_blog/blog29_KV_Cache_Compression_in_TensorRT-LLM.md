@@ -257,7 +257,7 @@ The NVFP4 format alone brings a large reduction: a cold page costs 0.5625 bytes 
 </div>
 <p align="center"><sub><em>Figure 10: Measured size of one attention KV page off the GPU, uncompressed and as an NVFP4 cold page. FP8 pages shrink by 43.75%, BF16 pages by 71.9%; the GLM-5.2 MLA page shrinks a little less because its index buffer stays lossless.</em></sub></p>
 
-A smaller cold page means **more capacity in the host and disk tiers, and therefore a higher prefix-cache hit rate** when the working set does not fit. We show it first along the GLM-5.2 Pareto frontier, then through the hit rate.
+A smaller cold page means **more capacity in the host and disk tiers, and therefore a higher prefix-cache hit rate** when the working set does not fit. To show what that buys in practice, we take a large model on a complex agentic workload, GLM-5.2 serving AgentX traces across many GPU counts and concurrencies, and compare the serving Pareto frontier with and without NVFP4 cold pages; we then look at where the gain comes from.
 
 Put together, compression and the cold-page mechanism **move the serving frontier for agentic workloads**. Figure 11 takes the ten highest-throughput points of the GLM-5.2 frontier with NVFP4 and shows, for each, the same configuration with an uncompressed host cache. The gain is largest where the uncompressed tier misses most, **up to 84% more throughput per GPU and 4x the P90 interactivity**, and fades to nothing where it already reads most prefixes; averaged over the ten points it is **+21% throughput and +92% interactivity**.
 
