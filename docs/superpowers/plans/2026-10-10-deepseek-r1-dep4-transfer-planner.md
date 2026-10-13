@@ -82,27 +82,25 @@ transceiver logs), GSM8K within tolerance of 94.24, no `PeerIncompatibleError`.
 
 The target-overrides-`build_transfer_planner` binding was rejected in review: one planner
 must be able to serve several targets, including pairs such as ctx dep4 -> gen dep8 and
-targets from different cores. Implemented instead:
+targets from different cores. A `COVERS` matrix of target-id pairs, then of
+architecture-plus-topology pairs, followed and was dropped in turn: it encoded a topology
+nothing consumed and made coverage an enumeration. Implemented instead:
 
-- Planner moved to `modeling_v2/transfers/deepseek_mla_latent.py` as
-  `DeepseekMlaLatentTransferPlanner`, `planner_id = "modeling_v2.deepseek_mla_latent"`, with a
-  `COVERS` matrix of `(ctx target id, gen target id)` pairs; today only
-  `(deepseek_v3/r1_0528_nvfp4__sm_103__dep4, same)`. `describe()` publishes the own target id and
-  `check_peer` refuses any pair outside the matrix; the dp/tp/pp/cp checks are gone because the
-  target id already pins the topology, the layout checks (one pool, layer count,
-  `tokens_per_block`, `slot_bytes`) stay because the arithmetic depends on them.
-- `modeling_v2/transfers/__init__.py`: `PLANNERS`, `planner_for_target`, `bind_transfer_planner`;
-  `target_id_of` lives in `_router_index` so `AutoModelForCausalLM` can ask it cheaply.
-- `AutoModelForCausalLM.from_config` binds after construction; the target's `modeling.py` is back
-  to zero transfer-related lines.
-- Tests: `tests/unittest/_torch/modeling_v2/transfers/` (binding direction, lookup, duplicate
-  coverage, bind; planner parity/merge/targets/pair refusal/describe). 74 tests green with the
-  claims, routing and disaggregation planner suites.
-- Two-node re-gate with the new binding (ctx dep4 on nvl72d185-T13, gen dep4 on nvl72d185-T16,
-  same launcher): all four ranks log
-  `KV transfer planned by DeepseekMlaLatentTransferPlanner (planner_id='modeling_v2.deepseek_mla_latent')`,
-  no `PeerIncompatibleError`; GSM8K flexible-extract **95.07** against the 94.24 reference, PASSED.
-  Logs: `mv2-disagg/twonode/logs/run_20261011T084450Z`.
+- Planner at `disaggregation/planners/deepseek_mla_latent.py` as
+  `DeepseekMlaLatentTransferPlanner`, `planner_id = "trtllm.deepseek_mla_latent"`, with
+  `supports_deployment(architecture, mapping)`: `DeepseekV3ForCausalLM`, attention DP,
+  pp = cp = 1, any width. `check_peer` keeps the layout checks (one pool, layer count,
+  `tokens_per_block`, `slot_bytes`) because the arithmetic depends on them; `describe()` is
+  the base class's empty blob.
+- `disaggregation/planners/__init__.py`: `PLANNER_ENV_VAR = "TRTLLM_KV_TRANSFER_PLANNER"`,
+  `PLANNERS` (planner_id -> class), `bind_transfer_planner`. The user names the planner; the
+  framework never picks one.
+- `AutoModelForCausalLM.from_config` binds after construction for every model; the target's
+  `modeling.py` has zero transfer-related lines.
+- Tests: `tests/unittest/_torch/disaggregation/test_planner_binding.py` (supports_deployment,
+  PLANNERS keys, binding direction, unset/empty variable, named planner installed, unknown name,
+  unsupported deployment) and `test_deepseek_mla_latent_planner.py` (parity, merge, targets,
+  geometry refusal).
 
 ## Interface hardening (after review)
 
@@ -121,9 +119,13 @@ descriptions whole. `RecvReqInfo` moved from `native/transfer.py` to
 contract depends on. The sender's `KVSendTask` is deliberately not passed: it
 carries transfer progress, counters and timers.
 
-Still to do at rebase time, not here: honor `chunk.excluded_pool_views` in
-`DefaultTransferPlanner.plan` and fold `validate_bounded_replay_compatible` into
-`check_peer`; both land on the planner, not on `transfer.py`.
+Done at the rebase onto main: `DefaultTransferPlanner.plan` skips the
+`chunk.excluded_pool_views` main added (the DeepSeek planner returns an empty plan
+when its sole pool is excluded), and the `bounded_replay_on_generation` peer check
+main added to `PeerRegistrar` lives in `DefaultTransferPlanner.check_peer`; both
+sit on the planner, not on `transfer.py`. The disaggregated gates pass
+`modeling_v2: require` through each server's config, since main made the switch
+an `LLM` argument.
 
 Verified: 292 unit tests green (planner, chunked transfer, ownership regressions,
 unsubmitted session, peer, modeling_v2 transfers/claims/routing/target
