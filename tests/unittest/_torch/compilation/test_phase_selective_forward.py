@@ -89,7 +89,6 @@ def test_prefill_compiled_model_bypass_is_restored() -> None:
         pytest.param(False, True, "compiled", id="pcg-eligible-prefill"),
         pytest.param(False, False, "eager", id="pcg-ineligible-prefill"),
         pytest.param(True, True, "eager", id="ordinary-generation-capture"),
-        pytest.param(False, False, "eager", id="generation-graph-miss"),
     ],
 )
 def test_decoder_runner_selects_torch_compile_forward(
