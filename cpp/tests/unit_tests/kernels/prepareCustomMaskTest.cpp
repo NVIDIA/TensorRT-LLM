@@ -36,6 +36,8 @@ namespace
 {
 
 using tensorrt_llm::kernels::FmhaKernelType;
+using tensorrt_llm::kernels::getCustomMaskCapacityUpperBound;
+using tensorrt_llm::kernels::getCustomMaskSizeUpperBound;
 using tensorrt_llm::kernels::runPrepareCustomMask;
 using tensorrt_llm::kernels::TllmGenFmhaRunnerParams;
 using tensorrt_llm::runtime::BufferManager;
@@ -355,6 +357,67 @@ protected:
         }
     }
 
+    // Fills every tree bit and checks the SwapsMmaAb kernels write nothing past the C++ capacity bound.
+    void testSwapsMmaAbStaysWithinCapacity(int32_t batchSize, int32_t seqLenQ, int32_t maxSeqLenKv,
+        int32_t numHeadsQPerKv, int32_t tileSizeQ, int32_t numInstsKv)
+    {
+        int32_t const tileSizeKv = 128;
+        int32_t const stepQ = tileSizeQ;
+        int32_t const stepKv = tileSizeKv * numInstsKv;
+
+        std::mt19937 gen(7);
+        std::uniform_int_distribution<> seqLenKvDist(seqLenQ, maxSeqLenKv);
+        std::vector<int32_t> seqLensQ(batchSize, seqLenQ);
+        std::vector<int32_t> seqLensKv(batchSize);
+        std::vector<int32_t> firstSparseMaskOffsetsKv(batchSize);
+        std::vector<int32_t> cumSeqLensQ(batchSize + 1, 0);
+        for (int32_t i = 0; i < batchSize; ++i)
+        {
+            seqLensKv[i] = seqLenKvDist(gen);
+            firstSparseMaskOffsetsKv[i] = seqLensKv[i] - seqLenQ;
+            cumSeqLensQ[i + 1] = cumSeqLensQ[i] + seqLenQ;
+        }
+        std::vector<int32_t> packedMaskHost(batchSize * seqLenQ * ceilDiv(seqLenQ, 32), -1);
+
+        int64_t const capacity = getCustomMaskSizeUpperBound(FmhaKernelType::SwapsMmaAbForGeneration, batchSize,
+            seqLenQ, numHeadsQPerKv, stepQ, stepKv, tileSizeQ, tileSizeKv);
+        EXPECT_LE(capacity, getCustomMaskCapacityUpperBound(batchSize, seqLenQ, numHeadsQPerKv));
+        int64_t const guardSize = 4096;
+
+        auto seqLensQDevice = mBufferManager->copyFrom(seqLensQ, MemoryType::kGPU);
+        auto seqLensKvDevice = mBufferManager->copyFrom(seqLensKv, MemoryType::kGPU);
+        auto cumSeqLensQDevice = mBufferManager->copyFrom(cumSeqLensQ, MemoryType::kGPU);
+        auto firstSparseMaskOffsetsKvDevice = mBufferManager->copyFrom(firstSparseMaskOffsetsKv, MemoryType::kGPU);
+        auto packedMaskDevice = mBufferManager->copyFrom(packedMaskHost, MemoryType::kGPU);
+        auto customMaskOffsetsDevice = mBufferManager->gpu(batchSize, tensorrt_llm::DataType::kINT64);
+        auto customMaskDevice = mBufferManager->gpu(capacity + guardSize, tensorrt_llm::DataType::kINT32);
+        cudaMemsetAsync(
+            bufferCast<int32_t>(*customMaskDevice), 0, (capacity + guardSize) * sizeof(int32_t), mStream->get());
+
+        TllmGenFmhaRunnerParams runnerParams;
+        runnerParams.mBatchSize = batchSize;
+        runnerParams.mNumHeadsQPerKv = numHeadsQPerKv;
+        runnerParams.mMaxSeqLenQ = seqLenQ;
+        runnerParams.mMaxSeqLenKv = *std::max_element(seqLensKv.begin(), seqLensKv.end());
+        runnerParams.seqLensKvPtr = bufferCast<int32_t>(*seqLensKvDevice);
+        runnerParams.cumSeqLensQPtr = bufferCast<int32_t>(*cumSeqLensQDevice);
+        runnerParams.seqLensQPtr = bufferCast<int32_t>(*seqLensQDevice);
+        runnerParams.firstSparseMaskOffsetsKvPtr = bufferCast<int32_t>(*firstSparseMaskOffsetsKvDevice);
+        runnerParams.generalPackedCustoMaskPtr = bufferCast<int32_t>(*packedMaskDevice);
+        runnerParams.customMaskOffsetsPtr = bufferCast<int64_t>(*customMaskOffsetsDevice);
+        runnerParams.customMaskPtr = reinterpret_cast<uint32_t*>(bufferCast<int32_t>(*customMaskDevice));
+        runnerParams.customMaskCapacity = capacity;
+
+        runPrepareCustomMask(runnerParams, FmhaKernelType::SwapsMmaAbForGeneration, stepQ, stepKv, tileSizeQ,
+            tileSizeKv, mStream->get());
+        ASSERT_EQ(cudaStreamSynchronize(mStream->get()), cudaSuccess);
+
+        auto customMaskHost = mBufferManager->copyFrom(*customMaskDevice, MemoryType::kCPU);
+        auto* mask = reinterpret_cast<uint32_t*>(bufferCast<int32_t>(*customMaskHost));
+        EXPECT_TRUE(std::any_of(mask, mask + capacity, [](uint32_t word) { return word != 0; }));
+        EXPECT_TRUE(std::all_of(mask + capacity, mask + capacity + guardSize, [](uint32_t word) { return word == 0; }));
+    }
+
     std::shared_ptr<CudaStream> mStream;
     std::shared_ptr<BufferManager> mBufferManager;
 };
@@ -384,3 +447,23 @@ TEST_F(PrepareCustomMaskTest, LargeBatchParallelOffsetScan)
 }
 
 } // namespace
+
+TEST_F(PrepareCustomMaskTest, SwapsMmaAbStaysWithinCapacity)
+{
+    for (int32_t const seqLenQ : {13, 31, 60})
+    {
+        for (int32_t const numHeadsQPerKv : {2, 4, 8})
+        {
+            for (int32_t const tileSizeQ : {8, 16, 32})
+            {
+                for (int32_t const numInstsKv : {1, 2})
+                {
+                    SCOPED_TRACE(::testing::Message() << "seqLenQ " << seqLenQ << " numHeadsQPerKv " << numHeadsQPerKv
+                                                      << " tileSizeQ " << tileSizeQ << " numInstsKv " << numInstsKv);
+                    testSwapsMmaAbStaysWithinCapacity(
+                        /* batchSize */ 8, seqLenQ, /* maxSeqLenKv */ 1024, numHeadsQPerKv, tileSizeQ, numInstsKv);
+                }
+            }
+        }
+    }
+}
