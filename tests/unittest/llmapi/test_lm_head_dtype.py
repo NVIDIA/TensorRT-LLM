@@ -22,12 +22,14 @@ returned logits are not rounded, and greedy decoding still follows them.
 
 import json
 import os
+from types import SimpleNamespace
 
 import pytest
 import torch
 from utils.llm_data import llm_models_root
 
 from tensorrt_llm import LLM
+from tensorrt_llm._torch.pyexecutor.config_utils import resolve_hf_torch_dtype
 from tensorrt_llm.llmapi import KvCacheConfig
 from tensorrt_llm.sampling_params import SamplingParams
 
@@ -53,7 +55,8 @@ def test_lm_head_output_dtype_returned_logits(lm_head_output_dtype: str) -> None
     """Check context and decode precision through the public LLM API."""
     model_dir = _model_dir()
     with open(os.path.join(model_dir, "config.json")) as f:
-        model_dtype = getattr(torch, json.load(f)["torch_dtype"])
+        model_config = SimpleNamespace(**json.load(f))
+    model_dtype = resolve_hf_torch_dtype(model_config) or torch.bfloat16
 
     sampling_params = SamplingParams(
         max_tokens=8,
