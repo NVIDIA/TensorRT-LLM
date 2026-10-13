@@ -15,6 +15,7 @@ under a fake in the CPU tests exactly as it runs under the orchestrator.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -24,7 +25,7 @@ from typing import Any, Callable, Mapping, Sequence
 
 import yaml
 
-from .campaign import Campaign, gate_command, read_decision
+from .campaign import INFRA_RCS, Campaign, gate_command, read_decision
 from .ladder import BenchSpec, Ladder, SpoolRunner, default_rungs, rungs_from_spec
 from .records import Measurement, NoiseFloor, PerfLedger, format_table
 from .requests import CampaignContext, render_rebase_request, render_request, turn_prompt
@@ -153,7 +154,11 @@ class TuneStage:
         self.data = spec.workdir / "data"
         self.data.mkdir(exist_ok=True)
         self.ledger = PerfLedger(spec.workdir / "perf_ledger.jsonl")
-        self.runners = runner_factory or (lambda spools, prefix: SpoolRunner(spools, prefix=prefix))
+        factory = runner_factory or (lambda spools, prefix: SpoolRunner(spools, prefix=prefix))
+        # Job names carry the workspace: spools outlive a run, and a second run's
+        # "tune-t-baseline" must never adopt the first run's receipt.
+        run = hashlib.sha1(str(spec.workdir.resolve()).encode()).hexdigest()[:6]
+        self.runners = lambda spools, prefix: factory(spools, f"{prefix}{run}")
         self.perf = self.runners(spec.spools, "tune")
         self.t.setdefault("phase", "ground")
 
@@ -165,6 +170,7 @@ class TuneStage:
         for label in todo:
             self.perf.adopt(label)
         queued = {name.split("-", 1)[1] for name in self.perf.inflight}
+        retries: dict[str, int] = {}
         while todo:
             for label, configs in list(todo.items()):
                 if label in queued:
@@ -176,9 +182,15 @@ class TuneStage:
                 queued.add(label)
                 self.log(f"[tune] measuring {label} on {free[0]}")
             for label, _, rc in self.perf.poll():
-                todo.pop(label, None)
-                if rc != 0:
+                if rc != 0 and not (self.data / label / "meta.json").exists():
+                    # A session that died, a full filesystem: measure again before giving up.
+                    retries[label] = retries.get(label, 0) + 1
+                    if retries[label] <= (2 if rc in INFRA_RCS else 1):
+                        self.log(f"[tune] {label} failed rc={rc}; re-queued")
+                        queued.discard(label)
+                        continue
                     self.log(f"[tune] {label} failed rc={rc}")
+                todo.pop(label, None)
             if todo:
                 time.sleep(self.poll_s)
         out = {}

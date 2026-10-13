@@ -579,3 +579,36 @@ def test_a_relative_workspace_becomes_absolute_paths_in_job_scripts(tmp_path, mo
     assert spec.workdir == tmp_path / "ws" / "tune" and spec.repo == tmp_path
     assert spec.identity_configs == [tmp_path / "identity.yaml"] and spec.env_script == tmp_path / "env.sh"
     assert spec.spools == [str(tmp_path / "s1")]
+
+
+def test_ground_truth_survives_a_lost_baseline_run_and_another_runs_receipts(tmp_path):
+    """The baseline's first run dies with its session (rc 212): it is measured again,
+    not reported unmeasurable. Job names carry the run, so a receipt another workspace
+    left on the same spool is never adopted."""
+    task = {"trtllm_repo_path": str(_repo(tmp_path)), "checkpoint_path": "/ckpt",
+            "perf": {"identity_configs": [str(tmp_path / "identity.yaml")], "spools": ["s1"], "env_script": "/env.sh",
+                     "noise_repeats": 0, "reference": "none"}}
+    (tmp_path / "identity.yaml").write_text(yaml.safe_dump({"modeling_v2": "require"}))
+    spec = TuneSpec.from_task(task, tmp_path / "ws")
+
+    class LosesFirst(FakeRunner):
+        lost = False
+
+        def poll(self):
+            if not self.lost and self.inflight:
+                self.lost = True
+                name, (spool, label) = next(iter(self.inflight.items()))
+                del self.inflight[name]
+                return [(label, spool, 212)]
+            return super().poll()
+
+    prefixes = []
+
+    def factory(spools, prefix):
+        prefixes.append(prefix)
+        return LosesFirst(spools, prefix, _effect)
+
+    stage = TuneStage(spec, {}, dispatch=lambda *a: "", checkpoint=lambda: None, runner_factory=factory, poll_s=0,
+                      log=lambda m: None)
+    assert stage.ground() is True and (spec.workdir / "data" / "t-baseline" / "meta.json").exists()
+    assert prefixes[0].startswith("tune") and prefixes[0] != "tune"
