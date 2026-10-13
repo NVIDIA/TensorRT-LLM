@@ -660,6 +660,13 @@ class StaircaseOnboardWorkflow:
                 # environment, since every prompt and every gate carries it.
                 if not self._run_preflight(state, log):
                     return
+                if self.dry_run and state.stage == STAGE_TUNE:
+                    print_message(
+                        "[bold cyan]→ --dry-run: preflight passed; stopping before the "
+                        "tune stage measures anything.[/bold cyan]",
+                        log,
+                    )
+                    return
 
             if state.stage == STAGE_PLAN:
                 if not self._run_plan_phase(state, log):

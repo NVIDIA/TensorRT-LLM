@@ -1443,3 +1443,89 @@ def test_a_gate_may_have_its_own_launch_substrate():
 
     source = inspect.getsource(StaircaseOnboardWorkflow._gate_env)
     assert 'workload="gate"' in source, "the gate env ignores the workloads override"
+
+
+# ------------------------------------------------------------------ tune stage
+
+
+def _with_perf(task_file, **perf):
+    data = yaml.safe_load(task_file.read_text())
+    data["perf"] = {"workload": {"isl": 1024, "osl": 128, "concurrency": [1, 8]}, **perf}
+    task_file.write_text(yaml.safe_dump(data))
+    return task_file
+
+
+def test_the_tune_entry_starts_a_fresh_workspace_at_tune(tmp_path, task_file, monkeypatch):
+    """`staircase-onboard tune` on a target onboarded elsewhere: preflight, then the tune stage."""
+    import agent_flow.workflows.staircase_onboard.tune.stage as stage
+
+    seen = []
+    monkeypatch.setattr(stage, "run_tune_phase", lambda wf, state, log: seen.append(state.stage) or "tuned")
+    workflow = _workflow(tmp_path, entry_stage="tune")
+    calls = _install(monkeypatch, workflow, Script(None))
+    with workflow:
+        workflow.run(_with_perf(task_file))
+    state = load_state(tmp_path / "ws" / ".staircase_onboard_state.json")
+    assert seen == ["tune"] and state.done and state.verdict == "tuned"
+    assert [name for name, _ in calls] == []      # no onboarding role ran
+    assert state.tune.get("entry") == "standalone"
+
+
+def test_the_tune_entry_honors_dry_run(tmp_path, task_file, monkeypatch):
+    import agent_flow.workflows.staircase_onboard.tune.stage as stage
+
+    monkeypatch.setattr(stage, "run_tune_phase", lambda wf, state, log: pytest.fail("measured under --dry-run"))
+    workflow = _workflow(tmp_path, entry_stage="tune", dry_run=True)
+    _install(monkeypatch, workflow, Script(None))
+    with workflow:
+        workflow.run(_with_perf(task_file))
+    state = load_state(tmp_path / "ws" / ".staircase_onboard_state.json")
+    assert state.stage == "tune" and not state.done
+
+
+def test_perf_enabled_chains_tune_after_delivery(tmp_path, task_file, monkeypatch):
+    import agent_flow.workflows.staircase_onboard.tune.stage as stage
+
+    seen = []
+    monkeypatch.setattr(stage, "run_tune_phase", lambda wf, state, log: seen.append("tune") or "tuned")
+    workflow = _workflow(tmp_path)
+    script = Script(None)
+    calls = _install(monkeypatch, workflow, script)
+    original = workflow._run_plan_phase
+
+    def plan_then_write(state, log):
+        (tmp_path / "ws").mkdir(parents=True, exist_ok=True)
+        _write_vocabulary(tmp_path / "ws", [])
+        return original(state, log)
+
+    monkeypatch.setattr(workflow, "_run_plan_phase", plan_then_write)
+    with workflow:
+        workflow.run(_with_perf(task_file, enabled=True))
+    roles = [name for name, _ in calls]
+    assert roles == ["plan_drafter", "plan_reviewer", "assembler", "reviewer", "auditor"]
+    assert seen == ["tune"]
+    state = load_state(tmp_path / "ws" / ".staircase_onboard_state.json")
+    assert state.done and state.verdict == "tuned"
+
+
+def test_a_delivered_run_is_re_entered_at_tune(tmp_path, task_file, monkeypatch):
+    import agent_flow.workflows.staircase_onboard.tune.stage as stage
+    from agent_flow.workflows.staircase_onboard.state import WorkflowState, save_state
+
+    from agent_flow.workflows.staircase_onboard.task_schema import assembly_units
+
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    task = _with_perf(task_file)
+    units = list(assembly_units(yaml.safe_load(task.read_text())))
+    save_state(ws / ".staircase_onboard_state.json",
+               WorkflowState(task_path=str(ws / "task.yaml"), stage="deliver", done=True, verdict="delivered",
+                             units_done=units, tune={"phase": "done", "misses": 3, "kept": ["a"]}))
+    seen = []
+    monkeypatch.setattr(stage, "run_tune_phase", lambda wf, state, log: seen.append(dict(state.tune)) or "tuned")
+    workflow = _workflow(tmp_path, entry_stage="tune")
+    calls = _install(monkeypatch, workflow, Script(None))
+    with workflow:
+        workflow.run(task)
+    assert [name for name, _ in calls] == []
+    assert seen and seen[0]["misses"] == 0 and seen[0]["kept"] == ["a"] and seen[0]["phase"] == "campaign"

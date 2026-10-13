@@ -391,6 +391,8 @@ TOP_LEVEL_KEYS: tuple[str, ...] = (
     # Per-role backend, model and reasoning effort; see `roles.py`.
     AGENTS_FIELD,
     COMMIT_POLICY_FIELD,
+    # The tune stage (tune/stage.py). Closed keys, validated there.
+    "perf",
 )
 
 REMEDIATION_KEYS: tuple[str, ...] = (
@@ -2176,6 +2178,9 @@ def load_and_validate_task_yaml(path: str | Path) -> dict[str, Any]:
     # said it was done", which is a much longer trip back to the cause.
     _validate_remediation(data.get(REMEDIATION_FIELD), errors)
     validate_commit_policy_block(data.get(COMMIT_POLICY_FIELD), errors)
+    from .tune.stage import validate_perf_block
+
+    errors.extend(validate_perf_block(data))
     reject_unknown_keys(data, TOP_LEVEL_KEYS, errors)
     errors.extend(validate_agents(data, ROLES))
     errors.extend(validate_role_defaults(data))
