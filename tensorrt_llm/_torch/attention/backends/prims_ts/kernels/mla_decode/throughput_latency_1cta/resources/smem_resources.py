@@ -35,6 +35,8 @@ from cutlass.experimental.task_scheduling.resources import (
     producer_work,
 )
 
+from ...helpers.gather import gather4, gather4_cached_warp, select_gather_map
+
 from ...helpers.constants import (
     CP_ASYNC_CACHE_CA,
     PAGE_OFFSET_BYTES,
@@ -230,7 +232,11 @@ class SmemQResource(MlaResource):
             local_flat_query_row,
             batch_idx,
         )
-        if prims.elect_sync():
+        if prims.elect_sync() and (
+            self.cfg.load_num_warps == 1
+            or cute.arch.thread_idx()[0] // 32 - self.cfg.load_warp_idx
+            == qk_stage_idx % self.cfg.load_num_warps
+        ):
             smem_offset = Int32(q_stage_smem_element_offset(self.cfg, qk_stage_idx))
             prims.cp_async_bulk_tensor_shared_cta_global(
                 stage_base.data_ptr(smem_offset),
@@ -276,13 +282,14 @@ class SmemQResource(MlaResource):
                 dim_offset,
                 self.tma_desc_q_latent,
             )
-        self._load_q_stage(
-            stage_info,
-            stage_base,
-            latent_stages,
-            Int32(0),
-            self.tma_desc_q_rope,
-        )
+        if cutlass.const_expr(cfg.rope_dim > 0):
+            self._load_q_stage(
+                stage_info,
+                stage_base,
+                latent_stages,
+                Int32(0),
+                self.tma_desc_q_rope,
+            )
 
     @consumer_work(returns=("q_desc", "q_desc_rope"))
     @cute.jit
@@ -479,7 +486,15 @@ class SmemPageOffsetsResource(MlaResource):
         cache_slots = 2 if self.cfg.kernel_variant != "keeps_mma_ab" else 1
         return cutlass.Array(
             Int32,
-            max(1, cache_slots * self.cfg.pages_per_kv_tile),
+            max(
+                1,
+                cache_slots
+                * (
+                    self.cfg.sparse_cache_words
+                    if self.cfg.num_tokens_per_page == 1
+                    else self.cfg.pages_per_kv_tile
+                ),
+            ),
             space=cutlass.AddressSpace.rmem,
         )
 
@@ -506,7 +521,7 @@ class SmemPageOffsetsResource(MlaResource):
         cfg = self.cfg
         lane_idx = lane_idx_from_thread(cute.arch.thread_idx()[0])
         pages_per_tile = Int32(cfg.pages_per_kv_tile)
-        if lane_idx < pages_per_tile:
+        if cutlass.const_expr(cfg.sparse_direct):
             batch_idx = batch_idx_for_stage_cfg(self.batch_idx, cfg, stage_info)
             cta_idx_q = cta_idx_q_for_stage(self.cta_idx_q, stage_info)
             cta_idx_kv = cta_idx_kv_for_stage(self.cta_idx_kv, stage_info)
@@ -521,31 +536,70 @@ class SmemPageOffsetsResource(MlaResource):
                 cfg, stage_info, inst_id, is_v, section=section
             )
             tile_idx = global_kv_tile_idx(cfg, local_tile_idx, seq_len_kv, cta_idx_kv)
-            last_valid_page = cute.math.max(
-                (seq_len_kv + Int32(cfg.num_tokens_per_page - 1))
-                // Int32(cfg.num_tokens_per_page)
-                - Int32(1),
-                Int32(0),
-            )
-            logical_page_idx = cute.math.min(
-                tile_idx * pages_per_tile + lane_idx,
-                last_valid_page,
-            )
+            tile_start = tile_idx * pages_per_tile
+            routes = self.page_offsets.routes_for_tile(tile_start, batch_idx)
+            position = lane_idx * Int32(4)
             smem_offset = (
                 stage_info.stage_idx * Int32(cfg.page_offsets_entries_per_stage)
-                + lane_idx
+                + position
             )
-            page_offsets_batch = self.page_offsets[None, batch_idx]
-            page_offsets_flat = cute.flat_divide(page_offsets_batch, (1,))
-            gmem_ptr = page_offsets_flat[None, logical_page_idx].iterator.llvm_ptr
-            smem_ptr = cutlass.inttoptr(
-                self._smem_page_offsets.data_ptr(smem_offset).toint(cutlass.Int32),
-                3,
-                cutlass.Int32,
-            )
-            prims.cp_async_shared_global(
-                smem_ptr, gmem_ptr, PAGE_OFFSET_BYTES, CP_ASYNC_CACHE_CA
-            )
+            if cutlass.const_expr(cfg.tile_size_kv < 128):
+                if position < pages_per_tile:
+                    quad = routes.mapped_quad(tile_start + position)
+                    self._smem_page_offsets.data_ptr(smem_offset).store(
+                        quad.load(0, 4), alignment=16
+                    )
+            else:
+                quad = routes.mapped_quad(tile_start + position)
+                self._smem_page_offsets.data_ptr(smem_offset).store(
+                    quad.load(0, 4), alignment=16
+                )
+            cute.arch.fence_view_async_shared()
+            return
+        for fragment in cutlass.range_constexpr((cfg.pages_per_kv_tile + 31) // 32):
+            fragment_lane = lane_idx + Int32(fragment * 32)
+            if fragment_lane < pages_per_tile:
+                batch_idx = batch_idx_for_stage_cfg(self.batch_idx, cfg, stage_info)
+                cta_idx_q = cta_idx_q_for_stage(self.cta_idx_q, stage_info)
+                cta_idx_kv = cta_idx_kv_for_stage(self.cta_idx_kv, stage_info)
+                seq_len_kv = runtime_seq_len_kv_from_task_cache(
+                    cfg,
+                    decode_gen_task_cache(stage_info),
+                    cta_idx_q,
+                    self.cu_seqlens_q,
+                    batch_idx,
+                )
+                local_tile_idx = local_kv_tile_idx(
+                    cfg, stage_info, inst_id, is_v, section=section
+                )
+                tile_idx = global_kv_tile_idx(
+                    cfg, local_tile_idx, seq_len_kv, cta_idx_kv
+                )
+                last_valid_page = cute.math.max(
+                    (seq_len_kv + Int32(cfg.num_tokens_per_page - 1))
+                    // Int32(cfg.num_tokens_per_page)
+                    - Int32(1),
+                    Int32(0),
+                )
+                logical_page_idx = cute.math.min(
+                    tile_idx * pages_per_tile + fragment_lane,
+                    last_valid_page,
+                )
+                smem_offset = (
+                    stage_info.stage_idx * Int32(cfg.page_offsets_entries_per_stage)
+                    + fragment_lane
+                )
+                page_offsets_batch = self.page_offsets[None, batch_idx]
+                page_offsets_flat = cute.flat_divide(page_offsets_batch, (1,))
+                gmem_ptr = page_offsets_flat[None, logical_page_idx].iterator.llvm_ptr
+                smem_ptr = cutlass.inttoptr(
+                    self._smem_page_offsets.data_ptr(smem_offset).toint(cutlass.Int32),
+                    3,
+                    cutlass.Int32,
+                )
+                prims.cp_async_shared_global(
+                    smem_ptr, gmem_ptr, PAGE_OFFSET_BYTES, CP_ASYNC_CACHE_CA
+                )
 
     @producer_work
     @cute.jit
@@ -592,9 +646,88 @@ class SmemPageOffsetsResource(MlaResource):
         # The load task waits on the page-offset stage, snapshots the page ids
         # into registers, and keeps swaps K0/K1 live until their delayed V use.
         del stage_info
-        cache_base = cache_slot * self.cfg.pages_per_kv_tile
-        for page_frag in cutlass.range_constexpr(self.cfg.pages_per_kv_tile):
-            cached_page_ids[cache_base + page_frag] = self.page_id(page_frag)
+        if cutlass.const_expr(self.cfg.num_tokens_per_page == 1):
+            lane = lane_idx_from_thread(cute.arch.thread_idx()[0])
+            warp = cute.arch.thread_idx()[0] // 32 - self.cfg.load_warp_idx
+            groups_per_warp = self.cfg.tile_size_kv // (4 * self.cfg.load_num_warps)
+            for j in cutlass.range_constexpr(4):
+                cached_page_ids[cache_slot * self.cfg.sparse_cache_words + j] = Int32(
+                    0x7FFFFFFF
+                )
+            if lane < groups_per_warp:
+                quad = warp * groups_per_warp + lane
+                offset = (
+                    self.consumer_work_stage * self.cfg.page_offsets_entries_per_stage
+                    + quad * 4
+                )
+                values = self._smem_page_offsets.data_ptr(offset).load(
+                    count=4, alignment=16
+                )
+                for j in cutlass.range_constexpr(4):
+                    cached_page_ids[cache_slot * self.cfg.sparse_cache_words + j] = (
+                        values[j]
+                    )
+            base = cache_slot * self.cfg.sparse_cache_words
+            # Actual physical adjacency within one source is required. A
+            # full valid prefix can still contain random rows. Eight quads
+            # (32 rows) are needed for bulk; smaller issuer shares use gather4.
+            if cutlass.const_expr(groups_per_warp >= 8):
+                first = Int32(
+                    prims.shfl_sync(
+                        thread_mask=0xFFFFFFFF,
+                        val=cached_page_ids[base],
+                        offset=lane & Int32(-8),
+                        mask_and_clamp=0x1F,
+                        kind=prims.Shfl.IDX,
+                    )
+                )
+                contiguous = (first & Int32(0x7FFFFFFF)) != Int32(0x7FFFFFFF)
+                empty = cutlass.Boolean(True)
+                for j in cutlass.range_constexpr(4):
+                    raw = cached_page_ids[base + j]
+                    contiguous = contiguous and raw == first + (lane % 8) * 4 + j
+                    empty = empty and (raw & Int32(0x7FFFFFFF)) == Int32(0x7FFFFFFF)
+                cached_page_ids[base + 4] = Int32(
+                    cute.arch.vote_ballot_sync(contiguous)
+                )
+                cached_page_ids[base + 5] = Int32(cute.arch.vote_ballot_sync(empty))
+            else:
+                cached_page_ids[base + 4] = Int32(0)
+                cached_page_ids[base + 5] = Int32(0)
+
+        else:
+            cache_base = cache_slot * self.cfg.pages_per_kv_tile
+            for page_frag in cutlass.range_constexpr(self.cfg.pages_per_kv_tile):
+                cached_page_ids[cache_base + page_frag] = self.page_id(page_frag)
+        if cutlass.const_expr(self.cfg.cache_uniform_sparse_quads):
+            # Stage once per token tile, then reuse these uniform coordinates
+            # across all four head-dimension stages. Keep the raw lane cache
+            # for the contiguous/empty bulk path and source selection.
+            base = cache_slot * self.cfg.sparse_cache_words
+            bulk = (cached_page_ids[base + 4] & Int32(255)) == Int32(255)
+            empty = (cached_page_ids[base + 5] & Int32(255)) == Int32(255)
+            if self.cfg.load_num_warps == 8 or not (bulk or empty):
+                for owner in cutlass.range_constexpr(
+                    self.cfg.tile_size_kv // (4 * self.cfg.load_num_warps)
+                ):
+                    for j in cutlass.range_constexpr(4):
+                        raw = prims.shfl_sync(
+                            thread_mask=0xFFFFFFFF,
+                            val=cached_page_ids[base + j],
+                            offset=owner,
+                            mask_and_clamp=0x1F,
+                            kind=prims.Shfl.IDX,
+                        )
+                        row = raw & Int32(0x7FFFFFFF)
+                        row = row if row != Int32(0x7FFFFFFF) else Int32(-1)
+                        cached_page_ids[base + 6 + owner * 4 + j] = (
+                            cute.arch.make_warp_uniform(row)
+                        )
+            else:
+                # No gather reads these coordinates on a bulk/empty tile.
+                # Constants avoid carrying the previous tile's uniform cache.
+                for j in cutlass.range_constexpr(self.cfg.sparse_cache_words - 6):
+                    cached_page_ids[base + 6 + j] = Int32(0)
         return cached_page_ids
 
 
@@ -633,6 +766,7 @@ class SmemKvResource(MlaResource):
     tma_desc_c_latent: object = None
     tma_desc_c_rope: object = None
     tma_desc_v: object = None
+    tma_desc_bulk_extra: object = None
     c_rope_tensor: object = None
     page_offsets_kv: object = None
     page_offsets: object = None
@@ -800,7 +934,11 @@ class SmemKvResource(MlaResource):
             dim_offset = head_dim_cta_offset_v(cfg, cta_idx_head_dim_v) + Int32(
                 qk_stage_idx * cfg.head_dim_per_stage_v
             )
-            tma_desc = self.tma_desc_v
+            tma_desc = (
+                self.tma_desc_c_latent
+                if cfg.num_tokens_per_page == 1
+                else self.tma_desc_v
+            )
         else:
             active_width = cfg.qk_head_stage_width(qk_stage_idx)
             if cutlass.const_expr(
@@ -838,6 +976,101 @@ class SmemKvResource(MlaResource):
             and active_width == cfg.rope_dim
             and cfg.head_dim_per_stage_kv == 128
         )
+
+        # Each lane owns four adjacent index-list entries. Bulk TMA requires
+        # a verified 32-row physical run within one source; irregular rows
+        # use gather4. The separate empty-window path only zero-fills padding.
+        if cutlass.const_expr(cfg.num_tokens_per_page == 1):
+            warp = cute.arch.thread_idx()[0] // 32 - cfg.load_warp_idx
+            groups_per_warp = cfg.tile_size_kv // (4 * cfg.load_num_warps)
+            base = page_id_slot * cfg.sparse_cache_words
+            for chunk in cutlass.range_constexpr(
+                max(1, cfg.tile_size_kv // (32 * cfg.load_num_warps))
+            ):
+                mask = Int32(255) << Int32(chunk * 8)
+                contiguous = (cached_page_ids[base + 4] & mask) == mask
+                empty = (cached_page_ids[base + 5] & mask) == mask
+                first = Int32(
+                    prims.shfl_sync(
+                        thread_mask=0xFFFFFFFF,
+                        val=cached_page_ids[base],
+                        offset=chunk * 8,
+                        mask_and_clamp=0x1F,
+                        kind=prims.Shfl.IDX,
+                    )
+                )
+                if (contiguous or empty) and groups_per_warp >= 8:
+                    row = Int32(-32) if empty else first & Int32(0x7FFFFFFF)
+                    desc = select_gather_map(
+                        self.tma_desc_v, self.tma_desc_bulk_extra, first < 0
+                    )
+                    if prims.elect_sync():
+                        for part in cutlass.range_constexpr(
+                            cfg.head_dim_per_stage_kv // (128 // cfg.qkv_dtype_bytes)
+                        ):
+                            prims.cp_async_bulk_tensor_shared_cta_global(
+                                stage_base.data_ptr(
+                                    (warp * groups_per_warp + chunk * 8)
+                                    * 4
+                                    * inner_width
+                                    + part * cfg.tile_size_kv * inner_width
+                                ),
+                                cute.make_ptr(cutlass.Int8, desc),
+                                (dim_offset + part * inner_width, row),
+                                stage_info.barrier,
+                            )
+                elif cutlass.const_expr(cfg.cache_uniform_sparse_quads):
+                    desc = select_gather_map(tma_desc, self.tma_desc_c_rope, first < 0)
+                    gather4_cached_warp(
+                        stage_base.data_ptr(warp * groups_per_warp * 4 * inner_width),
+                        desc,
+                        dim_offset,
+                        cached_page_ids,
+                        stage_info.barrier,
+                        cache_start=base + 6,
+                        num_quads=min(8, groups_per_warp),
+                        num_slices=cfg.head_dim_per_stage_kv
+                        // (128 // cfg.qkv_dtype_bytes),
+                        quad_stride=4 * inner_width * cfg.qkv_dtype_bytes,
+                        slice_stride=cfg.tile_size_kv
+                        * inner_width
+                        * cfg.qkv_dtype_bytes,
+                        col_stride=inner_width,
+                    )
+                else:
+                    # Each active lane already owns a register-cached quad.
+                    # Issue disjoint TMA transactions directly from those
+                    # lanes, avoiding eight rounds of shuffles/election.
+                    lane = cute.arch.thread_idx()[0] % 32
+                    if lane >= chunk * 8 and lane < min(chunk * 8 + 8, groups_per_warp):
+                        group = warp * groups_per_warp + lane
+                        coords = cutlass.Array(
+                            Int32, 4, space=cutlass.AddressSpace.rmem
+                        )
+                        for j in cutlass.range_constexpr(4):
+                            raw = cached_page_ids[base + j]
+                            row = raw & Int32(0x7FFFFFFF)
+                            coords[j] = row if row != Int32(0x7FFFFFFF) else Int32(-1)
+                        desc = select_gather_map(
+                            tma_desc, self.tma_desc_c_rope, first < 0
+                        )
+                        for part in cutlass.range_constexpr(
+                            cfg.head_dim_per_stage_kv // (128 // cfg.qkv_dtype_bytes)
+                        ):
+                            gather4(
+                                stage_base.data_ptr(
+                                    group * 4 * inner_width
+                                    + part * cfg.tile_size_kv * inner_width
+                                ),
+                                desc,
+                                dim_offset + part * inner_width,
+                                coords[0],
+                                coords[1],
+                                coords[2],
+                                coords[3],
+                                stage_info.barrier,
+                            )
+            return
 
         if cutlass.const_expr(cfg.use_paged_kv == 1):
             if cutlass.const_expr(
@@ -1059,6 +1292,7 @@ class SmemKvResource(MlaResource):
         inst_id: int = 0,
         *,
         k_subtile_idx: cutlass.Constexpr[int] = 0,
+        reuse_k: cutlass.Constexpr[bool] = False,
     ):
         """Build a K or V SMEM descriptor for the current producer stage."""
         # Descriptor offsets mirror _init_smem_state, but are rebuilt against the
@@ -1070,22 +1304,30 @@ class SmemKvResource(MlaResource):
                 qkv_major_k_stride_bytes_for(self.cfg, self.cfg.head_dim_per_stage_kv)
             )
         if cutlass.const_expr(is_v):
+            stage_base = self._stage_base(stage_info)
+            if cutlass.const_expr(reuse_k):
+                # K waits advance independently of releases. Keep its payload
+                # live until the corresponding delayed PV has consumed it.
+                stage_base = self._smem_kv.subview(
+                    self.consumer_release_state.index
+                    * Int32(self.cfg.kv_smem_stage_elements)
+                )
             v_leading_byte_offset = (
                 Int32(0)
                 if self.cfg.head_dim_per_stage_v == TCGEN05_BF16_K_BLOCK_WIDTH
-                else Int32(TCGEN05_BF16_SECOND_K_BLOCK_OFFSET_BYTES)
+                else Int32(self.cfg.tile_size_kv * 128)
             )
             if cutlass.const_expr(self.cfg.is_fp8_qkv()):
                 v_leading_byte_offset = Int32(0)
             desc = cprims.Tcgen05SmemDesc.build(
-                self._stage_base(stage_info),
+                stage_base,
                 leading_byte_offset=v_leading_byte_offset,
                 stride_byte_offset=stride_byte_offset,
                 layout=qkv_smem_swizzle(self.cfg),
             )
             return desc
         else:
-            k_leading_byte_offset = Int32(TCGEN05_BF16_SECOND_K_BLOCK_OFFSET_BYTES)
+            k_leading_byte_offset = Int32(self.cfg.tile_size_kv * 128)
             if cutlass.const_expr(self.cfg.is_fp8_qkv()):
                 k_leading_byte_offset = Int32(self.cfg.kv_smem_tile_bytes)
                 qk_stage_idx = k_subtile_idx
@@ -1138,6 +1380,31 @@ class SmemKvResource(MlaResource):
         # PV MMA consumes this descriptor after V instance 0 is ready.
         del v_subtile_idx
         return self._set_desc(stage_info, 1, 0)
+
+    @consumer_work(returns=("v_desc_0",))
+    @cute.jit
+    def v_desc_reused(
+        self, stage_info: StageInfo, *, v_subtile_idx: cutlass.Constexpr[int]
+    ):
+        """Read delayed V from the unreleased K payload in the same SMEM slot."""
+        del v_subtile_idx
+        return self._set_desc(stage_info, 1, 0, reuse_k=True)
+
+    @consumer_work(returns=("v_desc_0",))
+    @cute.jit
+    def v_desc_reused_0(
+        self, stage_info: StageInfo, *, v_subtile_idx: cutlass.Constexpr[int]
+    ):
+        del v_subtile_idx
+        return self._set_desc(stage_info, 1, 0, reuse_k=True)
+
+    @consumer_work(returns=("v_desc_1",))
+    @cute.jit
+    def v_desc_reused_1(
+        self, stage_info: StageInfo, *, v_subtile_idx: cutlass.Constexpr[int]
+    ):
+        del v_subtile_idx
+        return self._set_desc(stage_info, 1, 1, reuse_k=True)
 
     @consumer_work(returns=("v_desc_1",))
     @cute.jit
