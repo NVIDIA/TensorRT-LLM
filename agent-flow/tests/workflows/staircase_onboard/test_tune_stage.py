@@ -74,7 +74,10 @@ class FakeRunner:
                     {"concurrency": 1, "tok_s_user": lat, "output_tok_s_gpu": lat, "mean_tpot_ms": 10, "mean_ttft_ms": 200},
                     {"concurrency": 128, "tok_s_user": thr / 128, "output_tok_s_gpu": thr, "mean_tpot_ms": 50, "mean_ttft_ms": 4000},
                 ]))
-                (d / "meta.json").write_text(json.dumps({"label": d.name, "modeling_v2": merged.get("modeling_v2", "require"), "tree": {}}))
+                status = Path(spool, "status.json")
+                host = json.loads(status.read_text())["host"] if status.exists() else ""
+                (d / "meta.json").write_text(json.dumps({"label": d.name, "modeling_v2": merged.get("modeling_v2", "require"),
+                                                         "tree": {}, "hostname": host}))
             del self.inflight[name]
             done.append((label, spool, 0))
         return done
@@ -443,6 +446,47 @@ def test_a_finished_candidates_eval_checkout_is_reused(tmp_path):
     assert Path(st.eval_tree) == work / "wt" / "eval-fast-path"
     assert not (work / "wt" / "eval-no-gain").exists()
     assert (Path(st.eval_tree) / "modeling.py").read_text() == "FAST = True\n"
+    for _ in range(20):
+        if not camp.step():
+            break
+    assert camp.state.candidates["fast-path"].status == "kept"
+
+
+def test_one_control_is_queued_per_waiting_measurement_not_per_host(tmp_path):
+    """A new best tree needs a same-host control before a candidate is judged. The
+    candidate is queued behind one control on one node; the other nodes stay free."""
+    from agent_flow.workflows.staircase_onboard.tune.campaign import Campaign
+    from agent_flow.workflows.staircase_onboard.tune.ladder import BenchSpec
+    from agent_flow.workflows.staircase_onboard.tune.records import NoiseFloor
+    from agent_flow.workflows.staircase_onboard.tune.worktree import open_candidate
+
+    repo = _repo(tmp_path)
+    identity = tmp_path / "identity.yaml"
+    identity.write_text(yaml.safe_dump({"modeling_v2": "require"}))
+    bench = BenchSpec(bench_py="b", model="m", env_script="e", isl=8192, osl=1024, concurrencies=[1, 128], tree=str(repo))
+    spools = []
+    for i in range(4):
+        sp = tmp_path / f"s{i}"
+        sp.mkdir()
+        (sp / "status.json").write_text(json.dumps({"host": f"node{i}"}))
+        spools.append(str(sp))
+    perf, gates = FakeRunner(spools, "camp", _effect), FakeRunner(["g1"], "campg", _effect)
+    work = tmp_path / "camp"
+    camp = Campaign(workdir=work, repo=repo, bench=bench, base_configs=[identity], perf_runner=perf, gate_runner=gates,
+                    gate_cmd=lambda tree, configs, out: f"python gate_accuracy.py --out {out}",
+                    noise=NoiseFloor(spread={"con1.tok_s_user": 0.001}), log=lambda m: None)
+    camp.state.best_tree = str(open_candidate(repo, work / "wt", "best", "HEAD"))
+    camp.state.best_commit = _git(Path(camp.state.best_tree), "rev-parse", "HEAD")
+    wt = open_candidate(repo, work / "wt", "fast-path", "HEAD")
+    (wt / "modeling.py").write_text("FAST = True\n")
+    _git(wt, "commit", "-q", "-am", "fast")
+    d = tmp_path / "fast-path.yaml"
+    d.write_text(yaml.safe_dump({"decision": "CANDIDATE", "worktree": str(wt), "commits": [_git(wt, "rev-parse", "HEAD")]}))
+    camp.submit_candidate("fast-path", d)
+    camp.step()
+    queued = [(sp, label) for sp, label in perf.inflight.values()]
+    assert sorted(label.split("-")[0] for _, label in queued) == ["ctl", "e2e"]
+    assert len({sp for sp, _ in queued}) == 1          # behind its control, on the same node
     for _ in range(20):
         if not camp.step():
             break

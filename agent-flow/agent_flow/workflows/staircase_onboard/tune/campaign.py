@@ -204,6 +204,22 @@ class Campaign:
             self.log(f"[campaign] control {label} queued on {spool}")
         return False
 
+    def _queue_measurement(self, label: str, tree: str) -> str | None:
+        """Queue ``label`` on a free spool whose host has a control; else on the first free
+        spool right behind that host's control (same node; the scheduler starts pending jobs
+        in name order, ``ctl-`` before ``e2e-``). A control is queued per measurement that
+        needs one, never on every host at once."""
+        free = self.perf.free_spools()
+        if not free:
+            return None
+        spool = next((sp for sp in free if self._control_for(self.spool_host(sp)) is not None), None)
+        if spool is None:
+            spool = free[0]
+            self._ensure_control(spool)
+        cmd = self.bench.command(label, self.data, self.configs())
+        self.perf.submit(spool, label, cmd, wall=self.bench.wall, tree=tree)
+        return spool
+
     def set_control(self, label_dir: Path) -> None:
         """Adopt an existing measurement of the best tree at the current config as the control."""
         link = self.data / label_dir.name
@@ -366,13 +382,9 @@ class Campaign:
                         # Not measured yet and the best tree moved: stack on it first.
                         if not self._stack(st):
                             continue
-                    for spool in self.perf.free_spools():
-                        if not self._ensure_control(spool):
-                            continue
-                        cmd = self.bench.command(st.e2e_label, self.data, self.configs())
-                        self.perf.submit(spool, st.e2e_label, cmd, wall=self.bench.wall, tree=st.eval_tree or st.worktree)
+                    spool = self._queue_measurement(st.e2e_label, st.eval_tree or st.worktree)
+                    if spool:
                         self.log(f"[campaign] e2e {st.slug} queued on {spool}")
-                        break
                     continue
                 if m is None:
                     continue
@@ -518,13 +530,9 @@ class Campaign:
             m = self._measurement(b["label"])
             if m is None:
                 if f"{self.perf.prefix}-{b['label']}" not in self.perf.inflight:
-                    for spool in self.perf.free_spools():
-                        if not self._ensure_control(spool):
-                            continue
-                        cmd = self.bench.command(b["label"], self.data, self.configs())
-                        self.perf.submit(spool, b["label"], cmd, wall=self.bench.wall, tree=b["tree"])
+                    spool = self._queue_measurement(b["label"], b["tree"])
+                    if spool:
                         self.log(f"[campaign] batch e2e queued on {spool}")
-                        break
                 return True
             ctrl = self._control_for(str(m.meta.get("hostname") or ""))
             if ctrl is None:
