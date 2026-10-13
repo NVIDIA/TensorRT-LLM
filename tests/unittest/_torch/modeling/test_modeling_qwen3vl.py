@@ -549,23 +549,38 @@ def test_qwen3_vision_patch_projection_matches_conv3d() -> None:
     assert deepstack == []
 
 
-def test_qwen3_vision_run_blocks_uses_encoder_graph() -> None:
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("deepstack_visual_indexes", "expected_features"), [([0], [3.0]), ([1, 0], [6.0, 4.0])]
+)
+def test_qwen3_vision_run_blocks_uses_encoder_graph(
+    deepstack_visual_indexes: list[int], expected_features: list[float]
+) -> None:
     class FakeGraphRunner:
         def __init__(self) -> None:
             self.calls = []
 
-        def maybe_run(self, **kwargs):
+        def maybe_run(self, **kwargs: object) -> dict[str, torch.Tensor]:
             self.calls.append(kwargs)
             return {
                 "hidden_states": torch.full((4, 8), 2.0),
                 "deepstack_0": torch.full((4, 8), 3.0),
+                "deepstack_1": torch.full((4, 8), 4.0),
             }
 
     vision = Qwen3VisionModel.__new__(Qwen3VisionModel)
     torch.nn.Module.__init__(vision)
     vision._blocks_graph_runner = FakeGraphRunner()
-    vision.deepstack_visual_indexes = [0]
-    vision.deepstack_merger_list = torch.nn.ModuleList([torch.nn.Identity()])
+    vision.deepstack_visual_indexes = deepstack_visual_indexes
+    vision._deepstack_layer_to_merger_idx = {
+        layer_idx: idx for idx, layer_idx in enumerate(deepstack_visual_indexes)
+    }
+    vision.deepstack_merger_list = torch.nn.ModuleList(
+        [torch.nn.Linear(8, 8, bias=False) for _ in deepstack_visual_indexes]
+    )
+    with torch.no_grad():
+        for idx, merger in enumerate(vision.deepstack_merger_list):
+            merger.weight.copy_(torch.eye(8) * (idx + 1))
     vision.merger = torch.nn.Identity()
     metadata = SimpleNamespace(seq_lens=torch.tensor([4]))
     hidden_states = torch.ones(4, 8)
@@ -576,8 +591,9 @@ def test_qwen3_vision_run_blocks_uses_encoder_graph() -> None:
     output, deepstack = vision._run_blocks(hidden_states, cos, sin, position_ids, metadata)
 
     assert torch.equal(output, torch.full((4, 8), 2.0))
-    assert len(deepstack) == 1
-    assert torch.equal(deepstack[0], torch.full((4, 8), 3.0))
+    assert len(deepstack) == len(expected_features)
+    for features, expected in zip(deepstack, expected_features):
+        assert torch.equal(features, torch.full((4, 8), expected))
     assert vision._blocks_graph_runner.calls == [
         {
             "seq_lengths": [4],
@@ -591,6 +607,7 @@ def test_qwen3_vision_run_blocks_uses_encoder_graph() -> None:
     ]
 
 
+@pytest.mark.cpu_only
 def test_qwen3_vision_run_blocks_preserves_eager_merger_order() -> None:
     events = []
 
@@ -599,7 +616,7 @@ def test_qwen3_vision_run_blocks_preserves_eager_merger_order() -> None:
             super().__init__()
             self.name = name
 
-        def forward(self, hidden_states, **kwargs):
+        def forward(self, hidden_states: torch.Tensor, **kwargs: object) -> torch.Tensor:
             events.append(self.name)
             return hidden_states
 
@@ -608,7 +625,7 @@ def test_qwen3_vision_run_blocks_preserves_eager_merger_order() -> None:
             super().__init__()
             self.name = name
 
-        def forward(self, hidden_states):
+        def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
             events.append(self.name)
             return hidden_states
 
@@ -634,11 +651,12 @@ def test_qwen3_vision_run_blocks_preserves_eager_merger_order() -> None:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("attn_backend", ["TRTLLM", "FLASHINFER"])
+@pytest.mark.parametrize("deepstack_visual_indexes", [[0], [1, 0]])
 def test_qwen3_vision_cuda_graph_replay_matches_eager(
-    monkeypatch: pytest.MonkeyPatch, attn_backend: str
+    monkeypatch: pytest.MonkeyPatch, attn_backend: str, deepstack_visual_indexes: list[int]
 ) -> None:
     config_dict = copy.deepcopy(QWEN3_VL_8B_CONFIG)
-    config_dict["vision_config"].update(depth=2, deepstack_visual_indexes=[0])
+    config_dict["vision_config"].update(depth=2, deepstack_visual_indexes=deepstack_visual_indexes)
     model_config = ModelConfig(
         pretrained_config=Qwen3VLConfig.from_dict(config_dict),
         attn_backend=attn_backend,
@@ -663,7 +681,7 @@ def test_qwen3_vision_cuda_graph_replay_matches_eager(
 
     vision.enable_blocks_cuda_graph()
 
-    def fail_eager_fallback(*args, **kwargs):
+    def fail_eager_fallback(*args: object, **kwargs: object) -> None:
         raise AssertionError("Qwen3-VL vision CUDA graph replay fell back to eager.")
 
     monkeypatch.setattr(vision, "_run_encoder_blocks", fail_eager_fallback)

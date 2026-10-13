@@ -300,6 +300,7 @@ def test_empty_buckets_rejected():
         )
 
 
+@pytest.mark.cpu_only
 def test_capture_all_processes_largest_bucket_first() -> None:
     runner = _make_logic_runner(
         buckets=[
