@@ -31,7 +31,8 @@ import tensorrt_llm.bindings
 from tensorrt_llm._torch.distributed.communicator import Distributed, ReduceOp
 from tensorrt_llm._torch.peft.lora.config import LoraConfig
 from tensorrt_llm._torch.peft.lora.manager import LoraManager, LoraModelConfig
-from tensorrt_llm._utils import (get_size_in_bytes, mpi_comm, mpi_disabled,
+from tensorrt_llm._utils import (TensorWrapper, convert_to_torch_tensor,
+                                 get_size_in_bytes, mpi_comm, mpi_disabled,
                                  prefer_pinned, torch_comm,
                                  torch_dtype_to_binding)
 from tensorrt_llm.bindings.internal.batch_manager import (
@@ -153,6 +154,9 @@ class BaseResourceManager(ABC):
 
     def add_dummy_requests(self, request_ids: List[int]):
         pass
+
+    def pick_ugpu(self, request_id: int) -> int | None:
+        return None
 
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
         pass
@@ -305,6 +309,7 @@ class KVCacheManager(BaseResourceManager):
         is_estimating_kv_cache: bool = False,
         execution_stream: Optional[torch.cuda.Stream] = None,
         linear_attention_metadata: Optional[LinearAttentionMetadata] = None,
+        is_disagg: bool = False,
         # Per-pool configuration list forwarded to the C++ ctor.  One entry
         # per pool the manager will host; each entry pins (window_size,
         # head_dim, dtype) for that pool.  None / empty = uniform shape
@@ -319,6 +324,10 @@ class KVCacheManager(BaseResourceManager):
         self.mapping = mapping
         self.dtype = dtype
         self.kv_cache_type = kv_cache_type
+        if dtype == DataType.NVFP4 and kv_cache_type == CacheTypeCpp.SELFKONLY:
+            raise ValueError(
+                "NVFP4 SELFKONLY cache storage requires "
+                "Fp4MlaKVCacheManagerV2; KVCacheManager V1 is not supported.")
         # Consumed by the disaggregation page-table builder to expose the DSA
         # indexer K cache pool as a REPLICATED pool view.
         self.enable_indexer_k_cache = enable_indexer_k_cache
@@ -416,6 +425,7 @@ class KVCacheManager(BaseResourceManager):
         self.tokens_per_block = tokens_per_block
         self.max_seq_len = max_seq_len
         self.max_batch_size = max_batch_size
+        self.is_disagg = is_disagg
         self.kv_factor = 1 if kv_cache_type == CacheTypeCpp.SELFKONLY else 2
         # Some speculative decoding methods need to use different kv lengths for the
         # draft/target layers. Add extra tokens to handle this issue.
@@ -436,6 +446,7 @@ class KVCacheManager(BaseResourceManager):
         self.max_draft_len = spec_config.max_draft_len if spec_config is not None else 0
         self.max_total_draft_tokens = (spec_config.tokens_per_gen_step -
                                        1) if spec_config is not None else 0
+
         self.linear_attention_metadata = linear_attention_metadata
 
         # Dynamic-tree draft manager reserves K*max_draft_len KV slots (the draft
@@ -1129,6 +1140,13 @@ class KVCacheManager(BaseResourceManager):
         return self.kv_connector_manager is None or self.kv_connector_manager.should_add_sequence(
             request)
 
+    def impl_add_sequence(self, req_id: int, token_num: int, beam_width: int,
+                          req: LlmRequest) -> None:
+        self.impl.add_sequence(req_id, token_num, beam_width, req)
+
+    def impl_add_token(self, req_id: int) -> None:
+        self.impl.add_token(req_id)
+
     def add_dummy_requests(
         self,
         request_ids: List[int],
@@ -1462,6 +1480,12 @@ class KVCacheManager(BaseResourceManager):
         # get head dim
         mla = hasattr(config,
                       "kv_lora_rank") and config.kv_lora_rank is not None
+        quant_config = model_config.quant_config
+        if (mla and quant_config is not None
+                and quant_config.quant_mode.has_fp4_kv_cache()):
+            raise ValueError(
+                "FP4 MLA cache sizing requires Fp4MlaKVCacheManagerV2; "
+                "KVCacheManager V1 is not supported.")
         if mla:
             head_dim = config.kv_lora_rank + config.qk_rope_head_dim
             kv_factor = 1
@@ -1478,7 +1502,6 @@ class KVCacheManager(BaseResourceManager):
         # K and V
         mem_per_token = kv_factor * num_attention_layers * head_dim
         # The data type bytes.
-        quant_config = model_config.quant_config
         if quant_config is not None and quant_config.quant_mode.has_fp8_kv_cache(
         ):
             mem_per_token *= 1
@@ -1798,17 +1821,24 @@ class KVCacheManager(BaseResourceManager):
         result = self.impl.get_primary_pool_data(layer_offset)
 
         pool = self.get_pool_for_layer(layer_offset)
+        layer_dtype = pool.dtype if pool else self.dtype
         layer_head_dim = pool.head_dim if pool else self.head_dim
 
         assert kv_layout in ["NHD",
                              "HND"], f"Unsupported kv_layout: {kv_layout}"
+
+        element_per_container = 1
+        if layer_dtype == DataType.NVFP4:
+            element_per_container = 2
+        effective_head_dim = layer_head_dim // element_per_container
+
         if kv_layout == "NHD":
             return result.reshape(
                 result.shape[0],
                 self.kv_factor,
                 self.tokens_per_block,
                 self.num_kv_heads_per_layer[layer_offset],
-                layer_head_dim,
+                effective_head_dim,
             )
         else:
             return result.reshape(
@@ -1816,8 +1846,80 @@ class KVCacheManager(BaseResourceManager):
                 self.kv_factor,
                 self.num_kv_heads_per_layer[layer_offset],
                 self.tokens_per_block,
-                layer_head_dim,
+                effective_head_dim,
             )
+
+    def get_block_scale_buffers(
+            self,
+            layer_idx: int,
+            kv_layout: str = "NHD") -> Optional[torch.Tensor]:
+        '''Slice the NVFP4 block-scale tensor for a specified layer.
+
+        The returned tensor uses raw uint8 storage for the FP8 E4M3 scale
+        bytes.  The logical layouts mirror ``get_buffers()`` except the last
+        dimension is ``head_dim // 16`` scale values per token.
+        '''
+        layer_offset = self.layer_offsets[layer_idx]
+        pool = self.get_pool_for_layer(layer_offset)
+        layer_dtype = pool.dtype if pool else self.dtype
+        layer_head_dim = pool.head_dim if pool else self.head_dim
+        if layer_dtype != DataType.NVFP4:
+            return None
+
+        assert kv_layout in ["NHD",
+                             "HND"], f"Unsupported kv_layout: {kv_layout}"
+
+        pool_id = int(self.kv_cache_pool_mapping[layer_offset][0].item())
+        pool_layer_idx = int(self.kv_cache_pool_mapping[layer_offset][1].item())
+        scale_pool_ptr = int(self.kv_cache_pool_pointers[pool_id][0][1].item())
+        if scale_pool_ptr == 0:
+            return None
+
+        num_layers_in_pool = int(
+            (self.kv_cache_pool_mapping[:, 0] == pool_id).sum().item())
+        num_kv_heads = self.num_kv_heads_per_layer[layer_offset]
+        scales_per_head = layer_head_dim // 16
+        block_size = self.kv_factor * self.tokens_per_block * num_kv_heads * scales_per_head
+        layer_offset_elements = pool_layer_idx * block_size
+
+        if kv_layout == "NHD":
+            shape = [
+                self.blocks_in_primary_pool,
+                self.kv_factor,
+                self.tokens_per_block,
+                num_kv_heads,
+                scales_per_head,
+            ]
+            strides = [
+                num_layers_in_pool * block_size,
+                self.tokens_per_block * num_kv_heads * scales_per_head,
+                num_kv_heads * scales_per_head,
+                scales_per_head,
+                1,
+            ]
+        else:
+            shape = [
+                self.blocks_in_primary_pool,
+                self.kv_factor,
+                num_kv_heads,
+                self.tokens_per_block,
+                scales_per_head,
+            ]
+            strides = [
+                num_layers_in_pool * block_size,
+                self.tokens_per_block * num_kv_heads * scales_per_head,
+                scales_per_head,
+                num_kv_heads * scales_per_head,
+                1,
+            ]
+
+        return convert_to_torch_tensor(
+            TensorWrapper(
+                scale_pool_ptr + layer_offset_elements,
+                torch.uint8,
+                shape,
+                strides,
+            ))
 
     def get_indexer_k_cache_pool_data(self, layer_idx: int) -> torch.Tensor:
         result = self.impl.get_indexer_k_cache_pool_data(layer_idx)

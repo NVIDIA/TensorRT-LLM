@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -70,7 +70,7 @@ torch::Tensor fp8_per_tensor_scale_moe_runner(torch::optional<torch::Tensor> con
 
     if (topk_ids.has_value() && topk_weights.has_value() && routing_logits.has_value())
     {
-        TLLM_LOG_WARNING(
+        TLLM_LOG_DEBUG(
             "When logits and (topk_ids and topk_weights) are both provided, we only use (topk_ids and topk_weights).");
     }
 

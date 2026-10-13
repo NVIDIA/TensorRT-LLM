@@ -84,7 +84,6 @@ class CommunicationFactory:
         num_slots: int,
         top_k: int,
         expert_size_per_partition: int,
-        payload_in_workspace: bool = False,
         alltoall_result_do_sum: bool = True,
         use_flashinfer: bool = False,
         hidden_size: Optional[int] = None,
@@ -109,7 +108,6 @@ class CommunicationFactory:
             num_slots: Total number of expert slots
             top_k: Number of experts per token
             expert_size_per_partition: Number of experts per partition (required for DeepEP)
-            payload_in_workspace: If True, final_hidden_states is already in workspace (for NVLinkOneSided)
             alltoall_result_do_sum: If True, sum the alltoall results (for NVLinkTwoSided)
             hidden_size: Actual MoE activation dimension (the A2A payload width).
                 For latent-MoE models this is moe_latent_size, not pretrained_config.hidden_size.
@@ -162,7 +160,6 @@ class CommunicationFactory:
                 num_slots,
                 top_k,
                 expert_size_per_partition,
-                payload_in_workspace,
                 alltoall_result_do_sum,
                 use_flashinfer,
                 hidden_size=hidden_size,
@@ -186,7 +183,6 @@ class CommunicationFactory:
                 num_slots,
                 top_k,
                 max_num_tokens,
-                payload_in_workspace,
                 hidden_size=hidden_size,
                 dtype=act_dtype,
                 num_experts=num_experts if enable_eplb else None,
@@ -315,7 +311,6 @@ class CommunicationFactory:
         num_slots: int,
         top_k: int,
         expert_size_per_partition: int,
-        payload_in_workspace: bool,
         alltoall_result_do_sum: bool,
         use_flashinfer: bool,
         hidden_size: Optional[int] = None,
@@ -379,7 +374,6 @@ class CommunicationFactory:
                 num_slots,
                 top_k,
                 max_num_tokens,
-                payload_in_workspace,
                 hidden_size=hidden_size,
                 dtype=act_dtype,
                 num_experts=num_experts if enable_eplb else None,

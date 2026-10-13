@@ -15,12 +15,14 @@
 # limitations under the License.
 """Tests comparing Compressor with RefCompressor."""
 
+import bisect
 import math
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 import pytest
 import torch
+import torch._dynamo
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -407,8 +409,7 @@ def _active_compressed_position_ids(
         metadata.new_comp_kv_lens_cuda,
         metadata.cu_new_comp_kv_cuda,
         compressed_mask,
-        batch_size,
-        {compress_ratio: total_slots},
+        torch.tensor([batch_size], dtype=torch.int32, device=DEVICE),
         [compress_ratio],
     )
 
@@ -449,6 +450,66 @@ def test_mixed_context_generation_position_ids_follow_compact_output():
     )
 
     assert actual_position_ids == [0, 4, 4, 4]
+
+
+def _reference_compressed_mask(new_comp: List[int], total_tokens: int) -> List[bool]:
+    """Per-token definition: a slot is valid iff its offset inside the owning
+    request is below that request's new_comp; slots past the compact prefix
+    are generation padding."""
+    cu = [0]
+    for count in new_comp:
+        cu.append(cu[-1] + count)
+    mask = []
+    for token in range(total_tokens):
+        seq = min(bisect.bisect_right(cu[1:], token), len(new_comp) - 1)
+        mask.append(token - cu[seq] < new_comp[seq])
+    return mask
+
+
+def test_compressed_mask_static_shapes_no_recompile():
+    """One compiled graph must serve every batch composition.
+
+    _compute_compressed_mask used to take batch_size and the per-ratio token
+    totals as Python ints; dynamo specializes ints on 0/1, so each
+    (batch_size, total[ratio]) combination recompiled until recompile_limit.
+    """
+    ratios = [1, 4, 128]
+    max_seqs, max_tokens = 8, 64
+    new_comp_bufs = {r: torch.empty(max_seqs, dtype=torch.int32, device=DEVICE) for r in ratios}
+    cu_bufs = {r: torch.empty(max_seqs + 1, dtype=torch.int32, device=DEVICE) for r in ratios}
+    mask_bufs = {r: torch.empty(max_tokens, dtype=torch.bool, device=DEVICE) for r in ratios}
+    batch_size_cuda = torch.empty(1, dtype=torch.int32, device=DEVICE)
+
+    def run(new_comp_by_ratio):
+        batch_size = len(new_comp_by_ratio[ratios[0]])
+        for r, new_comp in new_comp_by_ratio.items():
+            counts = torch.tensor(new_comp, dtype=torch.int32, device=DEVICE)
+            # Poison the tails: stale values there must not leak into the mask.
+            new_comp_bufs[r].fill_(3)
+            cu_bufs[r].fill_(1)
+            new_comp_bufs[r][:batch_size] = counts
+            cu_bufs[r][: batch_size + 1] = F.pad(torch.cumsum(counts, 0), (1, 0)).to(torch.int32)
+        batch_size_cuda.fill_(batch_size)
+        DeepseekV4TrtllmAttentionMetadata._compute_compressed_mask(
+            new_comp_bufs, cu_bufs, mask_bufs, batch_size_cuda, ratios
+        )
+        for r, new_comp in new_comp_by_ratio.items():
+            total = sum(new_comp) + 2  # two padded generation slots
+            assert mask_bufs[r][:total].tolist() == _reference_compressed_mask(new_comp, total)
+
+    cases = [
+        {1: [5, 2, 7], 4: [1, 0, 1], 128: [0, 0, 0]},
+        {1: [1], 4: [1], 128: [1]},
+        {1: [0], 4: [0], 128: [0]},
+        {1: [9], 4: [2], 128: [0]},
+        {1: [0, 1], 4: [1, 0], 128: [0, 0]},
+        {1: [3, 0, 0, 3], 4: [1, 1, 1, 1], 128: [0, 1, 0, 1]},
+        {1: list(range(max_seqs)), 4: [1] * max_seqs, 128: [0] * max_seqs},
+    ]
+    run(cases[0])
+    with torch._dynamo.config.patch(error_on_recompile=True):
+        for case in cases[1:]:
+            run(case)
 
 
 @pytest.mark.parametrize(
@@ -1780,9 +1841,15 @@ class _FakeCompressorCacheManager:
         self.compressed_block_sizes = {0: tokens_per_block}
         self.layer_offsets = {0: 0}
         self._buffer = torch.empty(1, tokens_per_block * head_dim, device=DEVICE, dtype=DTYPE)
+        self._scale_buffer = torch.empty(
+            1, tokens_per_block * (head_dim // 16), device=DEVICE, dtype=torch.float8_e4m3fn
+        )
 
     def get_buffers(self, layer_idx, attn_type):
         return self._buffer
+
+    def get_compress_scale_buffers(self, layer_idx):
+        return self._scale_buffer
 
 
 def _create_small_compressor(kv_cache_dtype: str, is_indexer: bool) -> Compressor:
@@ -1895,6 +1962,7 @@ def _run_compressor_with_fake_postprocess(monkeypatch, kv_cache_dtype: str, is_i
         nope_head_dim,
         rope_head_dim,
         kv_cache,
+        kv_cache_scale,
         num_comp_tokens,
         cu_new_comp_kv,
         start_pos,
@@ -1902,6 +1970,8 @@ def _run_compressor_with_fake_postprocess(monkeypatch, kv_cache_dtype: str, is_i
         compressed_mask,
         tokens_per_block,
         cache_dtype,
+        nvfp4_global_scale,
+        nvfp4_residual_dim,
         rotate_activation,
         quant_output,
         scale_output,
@@ -1910,6 +1980,9 @@ def _run_compressor_with_fake_postprocess(monkeypatch, kv_cache_dtype: str, is_i
         seen["quant_output"] = quant_output
         seen["scale_output"] = scale_output
         seen["cache_dtype"] = cache_dtype
+        seen["kv_cache_scale"] = kv_cache_scale
+        seen["nvfp4_global_scale"] = nvfp4_global_scale
+        seen["nvfp4_residual_dim"] = nvfp4_residual_dim
         if kv_out is not None:
             kv_out.fill_(0.5)
         if quant_output is not None:
@@ -1959,6 +2032,18 @@ def test_main_compressor_does_not_materialize_postprocess_output(monkeypatch):
     assert seen["kv_out"] is None
     assert seen["quant_output"] is None
     assert seen["scale_output"] is None
+    assert output[0].shape == (1, 128)
+    assert output[1] is None
+
+
+def test_main_nvfp4_compressor_uses_separate_scale_pool(monkeypatch):
+    output, seen = _run_compressor_with_fake_postprocess(
+        monkeypatch, kv_cache_dtype="nvfp4", is_indexer=False
+    )
+
+    assert seen["cache_dtype"] == int(KVCacheDtype.NVFP4_BLOCKWISE)
+    assert seen["kv_cache_scale"] is not None
+    assert seen["nvfp4_global_scale"] == 1.0
     assert output[0].shape == (1, 128)
     assert output[1] is None
 

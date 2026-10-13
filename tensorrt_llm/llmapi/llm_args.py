@@ -924,11 +924,30 @@ class DeepSeekSparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
         default=False,
         description=
         "Whether to enable Guess-Verify-Refine (GVR) Top-K for the DSA decode "
-        "indexer. GVR reuses previous-step Top-K indices as hints to reduce "
-        "threshold search iterations. Currently supported for index_topk ∈ "
-        "{512, 1024, 2048} on Blackwell (SM100+), with compress_ratio ∈ {1, 4} "
-        "(DSv3.2 + DSv4 indexers). Falls back to the production insertion/"
-        "radix Top-K path when prerequisites are not met.")
+        "indexer instead of the exact insertion/radix Top-K path. Currently "
+        "supported for index_topk ∈ {512, 1024, 2048} on Blackwell (SM100+), "
+        "with compress_ratio ∈ {1, 4} (DSv3.2 + DSv4 indexers). Falls back to "
+        "the production insertion/radix Top-K path when prerequisites are not "
+        "met. `use_self_sampling_topk` selects the GVR engine generation.")
+    use_self_sampling_topk: bool = Field(
+        default=True,
+        description=
+        "Select the GVR engine generation when enable_heuristic_topk is set: "
+        "True (default) runs the hint-free self-sampling engine, which derives "
+        "its search bracket from the current row and keeps no cross-step "
+        "state; False runs the temporal-hint engines, which reuse the "
+        "previous decode step's Top-K indices as hints. Ignored when "
+        "enable_heuristic_topk is False.")
+    use_gvr_emission: bool = Field(
+        default=False,
+        description=
+        "Enable the emission-assisted block-skip optimization for the "
+        "temporal-hint GVR engine. When set, the FP4 indexer epilogue emits "
+        "per-block max logits so the GVR Top-K can skip whole blocks. Only "
+        "takes effect with enable_heuristic_topk=True, use_self_sampling_topk="
+        "False, and the FP4 paged-MQA-logits path; ignored otherwise. The "
+        "self-sampling engine derives its bracket from the current row and "
+        "does not use emission.")
     indexer_k_dtype: Literal["fp8", "fp4"] = Field(
         default="fp8",
         description=
@@ -1070,6 +1089,8 @@ class DeepSeekSparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
             q_split_threshold=self.q_split_threshold,
             indexer_rope_interleave=self.indexer_rope_interleave,
             enable_heuristic_topk=self.enable_heuristic_topk,
+            use_self_sampling_topk=self.use_self_sampling_topk,
+            use_gvr_emission=self.use_gvr_emission,
             indexer_k_dtype=self.indexer_k_dtype,
             is_full_indexer_layer=self._is_full_indexer_layer(
                 pretrained_config, kwargs.get("layer_idx")),
@@ -1102,6 +1123,8 @@ class DeepSeekSparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
             index_head_dim=_value("index_head_dim", 128),
             enable_indexer_skip=self.skip_indexer_for_short_seqs,
             enable_heuristic_topk=self.enable_heuristic_topk,
+            use_self_sampling_topk=self.use_self_sampling_topk,
+            use_gvr_emission=self.use_gvr_emission,
             use_cute_dsl_topk=self.use_cute_dsl_topk,
             use_cute_dsl_paged_mqa_logits=(self.use_cute_dsl_paged_mqa_logits),
             q_split_threshold=self.q_split_threshold,
@@ -1189,6 +1212,8 @@ class DeepSeekV4SparseAttentionConfig(DeepSeekSparseAttentionConfig):
             q_split_threshold=self.q_split_threshold,
             indexer_rope_interleave=self.indexer_rope_interleave,
             enable_heuristic_topk=self.enable_heuristic_topk,
+            use_self_sampling_topk=self.use_self_sampling_topk,
+            use_gvr_emission=self.use_gvr_emission,
             indexer_k_dtype=self.indexer_k_dtype,
             compress_ratios=self.compress_ratios,
             window_size=self.window_size,
@@ -1214,6 +1239,8 @@ class DeepSeekV4SparseAttentionConfig(DeepSeekSparseAttentionConfig):
             index_head_dim=_value("index_head_dim", 128),
             enable_indexer_skip=self.skip_indexer_for_short_seqs,
             enable_heuristic_topk=self.enable_heuristic_topk,
+            use_self_sampling_topk=self.use_self_sampling_topk,
+            use_gvr_emission=self.use_gvr_emission,
             use_cute_dsl_topk=self.use_cute_dsl_topk,
             use_cute_dsl_paged_mqa_logits=(self.use_cute_dsl_paged_mqa_logits),
             q_split_threshold=self.q_split_threshold,
@@ -1228,6 +1255,9 @@ class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
     threshold_scale_factor: Optional[Union[float, Dict[str, float]]] = Field(
         default=None,
         description="The threshold scale factor for skip softmax attention.")
+    uses_spcompress: bool = Field(
+        default=False,
+        description="Whether to enable spcompress (context phase, SM107 only).")
     target_sparsity: Optional[Union[float, Dict[str, float]]] = Field(
         default=None,
         description="Target sparsity for prefill and/or decode phases. "
@@ -1313,7 +1343,8 @@ class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
             is not None else SkipSoftmaxScheduler.from_target_sparsity(
                 target_sparsity,
                 ckpt_sparse_attention_config=ckpt_sparse_attention_config))
-        return SkipSoftmaxParams(scheduler=scheduler)
+        return SkipSoftmaxParams(scheduler=scheduler,
+                                 uses_spcompress=self.uses_spcompress)
 
 
 class MoeLoadBalancerConfig(StrictBaseModel):
@@ -1420,7 +1451,7 @@ class MoeConfig(StrictBaseModel):
     backend: Literal[
         "AUTO", "CUTLASS", "CUTEDSL", "WIDEEP", "TRTLLM", "DEEPGEMM",
         "DENSEGEMM", "VANILLA", "TRITON", "MARLIN", "MEGAMOE_DEEPGEMM",
-        "MEGAMOE_CUTEDSL"] = Field(
+        "MEGAMOE_CUTEDSL", "CUTEDSL_FC12"] = Field(
             default='AUTO',
             description="MoE backend to use. "
             "AUTO selects default backend based on model. It currently doesn\'t always give the best choice for all scenarios. The capabilities of auto selection will be improved in future releases."
@@ -1770,6 +1801,22 @@ class DecodingBaseConfig(StrictBaseModel):
         "only generate one draft token. In this case, max_draft_len == max_total_draft_tokens. If it's a static or "
         "dynamic tree, each draft layer may generate more than one draft token. In this case, "
         "max_total_draft_tokens >= max_draft_len.")
+
+    kv_cache_dtype: str = Field(
+        default="auto",
+        description=
+        "Data type of the DRAFT model's own KV pool. 'auto' keeps the drafter "
+        "checkpoint's quantization metadata. Not inherited from "
+        "kv_cache_config.dtype, which describes the target pool. Ignored by a "
+        "draft that shares the target's pool.")
+
+    kv_cache_tokens_per_block: int = Field(
+        default=32,
+        description="Page size of the DRAFT model's own KV pool. Same default as "
+        "KvCacheConfig.tokens_per_block but independent of it: the target's "
+        "value is rewritten in place by its attention backend (FP4 MLA and "
+        "FlashMLA force their own). Ignored by a draft that shares the "
+        "target's pool.")
 
     speculative_model: Optional[Union[str, Path]] = Field(
         default=None,
@@ -2943,6 +2990,25 @@ class DSparkDecodingConfig(DecodingBaseConfig):
 
     decoding_type: Literal["DSpark"] = Field(default="DSpark")
 
+    attention_backend: Literal["AUTO", "VANILLA", "TRTLLM", "CUTEDSL"] = Field(
+        default="AUTO",
+        description=
+        "Attention backend for the block decode of a standalone DSpark drafter "
+        "(one shipped as its own checkpoint rather than inside the target's "
+        "mtp.* namespace). Ignored by the embedded DeepSeek-V4-Pro draft, which "
+        "uses its own captured-context attention. This is independent of the "
+        "backend used to construct the drafter's standard attention modules. "
+        "AUTO picks per drafter family and degrades when a kernel is "
+        "unavailable: TRTLLM for a GQA-backboned drafter, CUTEDSL for an "
+        "MLA-backboned one. TRTLLM requires FlashInfer and an NVIDIA Blackwell "
+        "GPU with SM100 or SM103; for a GQA backbone it uses generated FMHA "
+        "kernels with a private paged context cache, and for an MLA backbone "
+        "the absorbed-MLA paged decode plus a block-local fixup. VANILLA uses "
+        "FlashAttention with a contiguous cache on a GQA backbone and the eager "
+        "torch reference on an MLA one. CUTEDSL is MLA-only: one cute-dsl pass "
+        "over context and block that replaces the fixup; it does not degrade, "
+        "and a build that cannot run it raises with the reason.")
+
     @model_validator(mode="after")
     def set_max_total_draft_tokens(self):
         self.max_total_draft_tokens = self.max_draft_len
@@ -2959,6 +3025,62 @@ class DSparkDecodingConfig(DecodingBaseConfig):
 
     def supports_backend(self, backend: str) -> bool:
         return backend == "pytorch"
+
+    @functools.cached_property
+    def draft_is_embedded_in_target(self) -> bool:
+        """True for the embedded (DeepSeek-V4-Pro) flavour of the DSpark draft.
+
+        DSpark ships in two shapes, and they need different runtime plumbing:
+
+        - embedded: the draft is the ``mtp.*`` namespace of the *target*
+          checkpoint, built from full target decoder blocks, and served by
+          ``DSv4DSparkWorker`` with its own rolling captured-context window.
+        - standalone: the draft is its own checkpoint with a registry-resolved
+          backbone, served by ``DFlashWorker`` and its paged draft KV cache.
+
+        Both are ``decoding_type: DSpark``, so every dispatch that must tell
+        them apart -- draft-model builder, worker, spec metadata, and the
+        separate-draft-KV-cache decision -- reads this one flag instead of
+        re-deriving it. That is what keeps those decisions from drifting apart:
+        a builder and a worker that disagree produce a draft model whose
+        attributes the worker does not have.
+
+        The probe is the weight index rather than a config field because the
+        index is authoritative and cannot be left unset; ``model_type`` is the
+        fallback for a checkpoint whose index file is absent. Resolution is
+        memoized here and warmed during ``TorchLlmArgs`` validation, so the
+        filesystem probe happens once in the main process -- not per rank, and
+        never at forward or CUDA-graph-capture time.
+        """
+        ckpt_dir = self.speculative_model
+        if ckpt_dir is None:
+            return False
+        ckpt_dir = str(ckpt_dir)
+
+        for name in ("model.safetensors.index.json",
+                     "pytorch_model.bin.index.json"):
+            index = os.path.join(ckpt_dir, name)
+            if not os.path.isfile(index):
+                continue
+            try:
+                with open(index, encoding="utf-8") as f:
+                    weight_map = json.load(f).get("weight_map", {})
+            except (OSError, ValueError):
+                break
+            # An index that parsed is authoritative both ways. Falling through
+            # to model_type here would classify a standalone V4-shaped drafter
+            # as embedded, and that only surfaces much later, inside
+            # count_dspark_stages.
+            return any(re.match(r"^mtp\.\d+\.", key) for key in weight_map)
+
+        config_path = os.path.join(ckpt_dir, "config.json")
+        if os.path.isfile(config_path):
+            try:
+                with open(config_path, encoding="utf-8") as f:
+                    return json.load(f).get("model_type") == "deepseek_v4"
+            except (OSError, ValueError):
+                return False
+        return False
 
     @functools.cached_property
     def spec_dec_mode(self):
@@ -3807,6 +3929,18 @@ class MambaStateConfig(StrictBaseModel):
         "Offsets that do not resolve inside the prompt are ignored. These "
         "snapshots require KV cache manager V2.")
 
+    enable_branch_snapshot: bool = Field(
+        default=False,
+        status="prototype",
+        telemetry=True,
+        description=
+        "Snapshot the Mamba recurrent state where a request's content "
+        "diverges from the prefix cache, so that later requests sharing the "
+        "same prefix can reuse up to the fork instead of being truncated to "
+        "an earlier snapshot. If no periodic or additional snapshot point "
+        "applies to the prompt, the prompt end is snapshotted as a fallback. "
+        "Requires KV cache manager V2.")
+
 
 class BlockReuseConfig(StrictBaseModel):
     """Configuration for KV cache block reuse policies."""
@@ -4206,6 +4340,11 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
             raise ValueError(
                 "kv_cache_config.mamba_state_config additional snapshot "
                 "offsets require kv_cache_config.use_kv_cache_manager_v2=True.")
+        if (state_config.enable_branch_snapshot
+                and self.use_kv_cache_manager_v2 is False):
+            raise ValueError(
+                "kv_cache_config.mamba_state_config.enable_branch_snapshot "
+                "requires kv_cache_config.use_kv_cache_manager_v2=True.")
         return self
 
     @field_validator('max_attention_window')
@@ -4538,6 +4677,11 @@ class BaseLlmArgs(StrictBaseModel):
         default=False,
         description="Enable attention data parallel.",
         status="beta")
+
+    enable_ugpu: bool = Field(
+        default=False,
+        description="Enable uGPU execution for supported PyTorch backend ops.",
+        status="prototype")
 
     enable_lm_head_tp_in_adp: bool = Field(
         default=False,
@@ -5415,6 +5559,13 @@ class TorchLlmArgs(BaseLlmArgs):
         "Enable autotuner for all tunable ops. This flag is for debugging purposes only, and the performance may significantly degrade if set to false.",
         status="prototype")
 
+    use_lamport_sync: bool = Field(
+        default=False,
+        description=
+        "Enable Lamport synchronization for MoE kernels. When enabled, uses Lamport-sync kernel variants "
+        "that overlap communication with computation for improved performance on multi-GPU setups.",
+        status="prototype")
+
     enable_layerwise_nvtx_marker: bool = Field(
         default=False,
         description="If true, enable layerwise nvtx marker.",
@@ -5936,26 +6087,44 @@ class TorchLlmArgs(BaseLlmArgs):
                 if spec_cfg.speculative_model is None:
                     raise ValueError(
                         "DSpark requires speculative_config.speculative_model "
-                        "to point at the checkpoint directory containing the "
-                        "mtp.* draft weights (for DeepSeek-V4-Pro-DSpark this "
-                        "is the target checkpoint directory itself).")
+                        "to point at the drafter's checkpoint directory: a "
+                        "standalone DSpark drafter repository, or -- for the "
+                        "embedded DeepSeek-V4-Pro flavour, whose draft weights "
+                        "live in the mtp.* namespace -- the target checkpoint "
+                        "directory itself.")
+                # Warm the embedded-vs-standalone probe here, while we are in
+                # the main process and the checkpoint path is known local. The
+                # flag then travels with the config, so no rank repeats the
+                # filesystem read and nothing probes at forward time.
+                _ = spec_cfg.draft_is_embedded_in_target
                 # Resolve target_layer_ids / mask_token_id / block_size /
                 # markov_rank from the draft (or main) model config if not set.
-                # DSpark ships these as top-level ``dspark_*`` keys in the
-                # DeepSeek-V4-Pro config.json; also accept a nested
-                # ``dspark_config`` dict for forward compatibility.
+                # Three checkpoint spellings are in the wild for the same knobs
+                # and all are accepted here, because a key the reader misses is
+                # not an error -- it silently falls back to a default and the
+                # drafter degrades (a markov_rank read as 0 skips the Markov
+                # head entirely, costing acceptance with no warning):
+                #   - top-level ``dspark_*``  (DeepSeek-V4-Pro)
+                #   - nested ``dflash_config``  (SpecForge / RadixArk drafters)
+                #   - nested ``dspark_config``  (forward compatibility)
+                #   - plain top-level keys  (TorchSpec drafters)
                 draft_config_path = os.path.join(spec_cfg.speculative_model,
                                                  "config.json")
                 if os.path.exists(draft_config_path):
                     with open(draft_config_path) as f:
                         draft_cfg = json.load(f)
-                    dspark_cfg = draft_cfg.get("dspark_config", {})
+                    dspark_cfg = draft_cfg.get("dspark_config") or {}
+                    dflash_cfg = draft_cfg.get("dflash_config") or {}
 
                     def _dspark_get(key, top_level_key):
-                        value = dspark_cfg.get(key)
-                        if value is None:
-                            value = draft_cfg.get(top_level_key)
-                        return value
+                        for source, name in ((dspark_cfg, key), (dflash_cfg,
+                                                                 key),
+                                             (draft_cfg,
+                                              top_level_key), (draft_cfg, key)):
+                            value = source.get(name)
+                            if value is not None:
+                                return value
+                        return None
 
                     # The checkpoint's ``dspark_target_layer_ids`` is
                     # authoritative: it fixes both which target hidden states

@@ -265,6 +265,12 @@ inline MmaKind dtypeGetMmaKind(Dtype dtypeA, Dtype dtypeB)
 inline bool dtypeNeedsPadding(Dtype dtype, MmaKind mmaKind, [[maybe_unused]] int mmaK, [[maybe_unused]] bool isSparseA)
 {
     bool needsPadding = mmaKind == MmaKind::MxFp8Fp6Fp4 && dtype == Dtype::MxE2m1;
+#ifdef TLLM_RUBIN_FEATURES
+    if ((!isSparseA && mmaK >= 64) || (isSparseA && mmaK >= 128))
+    {
+        needsPadding = false;
+    }
+#endif // TLLM_RUBIN_FEATURES
     return needsPadding;
 }
 

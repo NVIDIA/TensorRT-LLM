@@ -20,7 +20,7 @@ from mpi4py.futures import MPIPoolExecutor
 from transformers.configuration_utils import PretrainedConfig
 from utils.util import (check_accuracy, skip_blackwell, skip_blackwell_geforce,
                         skip_neither_ada_nor_hopper_unittest, skip_no_hopper,
-                        skip_pre_blackwell, skip_pre_hopper)
+                        skip_pre_blackwell, skip_pre_hopper, skip_rubin)
 
 from tensorrt_llm._torch.autotuner import AutoTuner, autotune
 from tensorrt_llm._torch.model_config import ModelConfig
@@ -1193,7 +1193,8 @@ def test_fused_moe_fp8_blockwise_cute_dsl(dtype,
         dtype=dtype,
         model_config=ModelConfig(quant_config=quant_config),
         # Note: use deepgemm mm will cause accuracy error, so we use trtllmgen mm here
-        use_cute_dsl_blockscaling_mm=True,
+        use_cute_dsl_blockscaling_mm=False,
+        disable_deep_gemm=True,
     )
     ref_fused_moe.load_weights([weights])
     ref_fused_moe.cuda()
@@ -1711,6 +1712,7 @@ def run_fused_moe_nvfp4(dtype,
     "Deprecated: covered by tests/unittest/_torch/modules/moe/test_moe_backend.py and test_moe_module.py. Add new tests there."
 )
 @skip_pre_blackwell
+@skip_rubin  # skipped due to lacking rubin nvfp4 x fp8 support
 @pytest.mark.parametrize(
     "moe_backend",
     [pytest.param("TRTLLM", marks=skip_blackwell_geforce), "CUTLASS"])
@@ -2845,6 +2847,7 @@ class RefGatedMLPFusedMoE(nn.Module):
                  dtype: Optional[torch.dtype] = None,
                  model_config: ModelConfig = ModelConfig(),
                  use_cute_dsl_blockscaling_mm: bool = False,
+                 disable_deep_gemm: bool = False,
                  bias=False,
                  swiglu_alpha: Optional[float] = None,
                  swiglu_beta: Optional[float] = None,
@@ -2880,6 +2883,7 @@ class RefGatedMLPFusedMoE(nn.Module):
                 dtype=self.dtype,
                 config=model_config,
                 use_cute_dsl_blockscaling_mm=use_cute_dsl_blockscaling_mm,
+                disable_deep_gemm=disable_deep_gemm,
                 activation=custom_swiglu
                 if swiglu_alpha is not None else F.silu,
             ) for _ in range(self.num_experts)

@@ -7,11 +7,13 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
-from tensorrt_llm._utils import is_sm_100f
+from tensorrt_llm._utils import get_sm_version
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or not IS_CUTLASS_DSL_AVAILABLE or not is_sm_100f(),
-    reason="DSpark fused RMSNorm+RoPE requires an SM100-family CUDA GPU",
+    not torch.cuda.is_available()
+    or not IS_CUTLASS_DSL_AVAILABLE
+    or get_sm_version() not in (100, 103, 107),
+    reason="DSpark fused RMSNorm+RoPE requires an SM100, SM103, or SM107 CUDA GPU",
 )
 
 
@@ -32,6 +34,13 @@ def _make_inputs(
     angles = torch.randn(batch * seq, max(1, rope_dim // 2), device="cuda", dtype=torch.float32)
     freqs = torch.stack((torch.cos(angles), torch.sin(angles)), dim=-1)
     return x, weight, freqs
+
+
+def _with_row_padding(x: torch.Tensor, padding: int = 128) -> torch.Tensor:
+    storage = torch.empty((*x.shape[:-1], x.shape[-1] + padding), device=x.device, dtype=x.dtype)
+    padded = storage[..., : x.shape[-1]]
+    padded.copy_(x)
+    return padded
 
 
 def _reference(
@@ -108,7 +117,7 @@ def test_cute_dsl_dspark_rmsnorm_rope_rejects_invalid_inputs():
     )
 
     x, weight, freqs = _make_inputs(2, 5, 512, 64, 1)
-    with pytest.raises(ValueError, match="requires contiguous BF16"):
+    with pytest.raises(ValueError, match="requires regular row-strided BF16"):
         cute_dsl_dspark_rmsnorm_rope(x.float(), weight, freqs, 1, 64, 1e-6, True, True, False)
 
 
@@ -166,12 +175,42 @@ def test_fused_dspark_rmsnorm_rope_matches_reference(
     torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
 
 
+def test_fused_dspark_rmsnorm_rope_row_strided_matches_reference() -> None:
+    from tensorrt_llm._torch.custom_ops.dspark_rmsnorm_rope_custom_op import (
+        cute_dsl_dspark_rmsnorm_rope,
+        is_fused_dspark_rmsnorm_rope_supported,
+    )
+
+    x, weight, freqs = _make_inputs(2, 5, 512, 64, 1, seed=3)
+    x = _with_row_padding(x)
+    args = (1, 64, 1e-6, True, True, False)
+
+    assert not x.is_contiguous()
+    assert is_fused_dspark_rmsnorm_rope_supported(x, weight, freqs, 1, 64)
+    actual = cute_dsl_dspark_rmsnorm_rope(x, weight, freqs, *args)
+    expected = _reference(x, weight, freqs, *args)
+    torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+
+
+def test_fused_dspark_rmsnorm_rope_rejects_irregular_rows() -> None:
+    from tensorrt_llm._torch.custom_ops.dspark_rmsnorm_rope_custom_op import (
+        is_fused_dspark_rmsnorm_rope_supported,
+    )
+
+    x, weight, freqs = _make_inputs(2, 6, 512, 64, 1, seed=4)
+    x = _with_row_padding(x)[:, 1:]
+
+    assert x.stride(0) != x.stride(1) * x.shape[1]
+    assert not is_fused_dspark_rmsnorm_rope_supported(x, weight, freqs[:10], 1, 64)
+
+
 def test_fused_dspark_rmsnorm_rope_cuda_graph_replay():
     from tensorrt_llm._torch.custom_ops.dspark_rmsnorm_rope_custom_op import (
         cute_dsl_dspark_rmsnorm_rope,
     )
 
     x, weight, freqs = _make_inputs(2, 5, 512, 64, 24, seed=1)
+    x = _with_row_padding(x)
     args = (24, 64, 1e-6, False, True, False)
     cute_dsl_dspark_rmsnorm_rope(x, weight, freqs, *args)
 
@@ -194,8 +233,90 @@ def test_fused_dspark_rmsnorm_rope_compiles_once_across_batches():
     _compile_fused_dspark_rmsnorm_rope.cache_clear()
     for batch in (1, 3):
         inputs = _make_inputs(batch, 5, 512, 64, 1, seed=batch)
+        if batch == 3:
+            inputs = (_with_row_padding(inputs[0]), *inputs[1:])
         cute_dsl_dspark_rmsnorm_rope(*inputs, 1, 64, 1e-6, True, True, False)
 
     cache_info = _compile_fused_dspark_rmsnorm_rope.cache_info()
     assert cache_info.misses == 1
     assert cache_info.hits == 1
+
+
+@pytest.mark.parametrize("split_norm", [False, True])
+def test_fused_dspark_rmsnorm_rope_norm_dim(split_norm):
+    """norm_dim bounds the RMS reduction; the default must not move DSv4.
+
+    split_norm=False is the DSv4 regression gate (whole-row RMS, weight over the
+    whole row). split_norm=True is what DeepSeek-style MLA needs: normalize the
+    latent, leave k_pe raw.
+
+    Driven through ``_rmsnorm_rope_batched`` rather than the custom op, because
+    the plumbing under test is the dispatcher's -- it has to forward norm_dim to
+    the support predicate and to the kernel. The predicate is asserted first so
+    a fused path that silently stopped applying never reads as a pass; that is
+    what made the original home of this test (hw_agnostic, mapped to CPU and
+    H100 only) vacuous, since is_sm_100f() is false there.
+    """
+    from tensorrt_llm._torch.custom_ops.dspark_rmsnorm_rope_custom_op import (
+        is_fused_dspark_rmsnorm_rope_supported,
+    )
+    from tensorrt_llm._torch.models.modeling_dspark import _rmsnorm, _rmsnorm_rope_batched
+
+    torch.manual_seed(0)
+    hidden, rope_dim, rows = 576, 64, 16
+    nope = hidden - rope_dim
+    norm_dim = nope if split_norm else hidden
+    eps = 1e-5
+    x = torch.randn(1, rows, hidden, dtype=torch.bfloat16, device="cuda")
+    w = torch.randn(norm_dim, dtype=torch.bfloat16, device="cuda").abs() + 0.5
+    ang = torch.rand(1, rows, rope_dim // 2, device="cuda", dtype=torch.float32) * 6.28
+    freqs = torch.complex(ang.cos(), ang.sin())
+
+    freqs_real = torch.view_as_real(freqs).reshape(-1, freqs.shape[-1], 2)
+    assert is_fused_dspark_rmsnorm_rope_supported(x, w, freqs_real, 1, rope_dim, norm_dim)
+
+    got = _rmsnorm_rope_batched(x, w, eps, rope_dim, freqs, norm_dim=norm_dim)
+
+    head = x[..., :norm_dim]
+    normed = _rmsnorm(head, w, eps)
+    ref = torch.cat([normed, x[..., norm_dim:]], dim=-1) if split_norm else normed
+    xc = torch.view_as_complex(ref[..., nope:].float().unflatten(-1, (-1, 2)))
+    rot = torch.view_as_real(xc * freqs.view(1, rows, 1, rope_dim // 2).squeeze(2)).flatten(-2)
+    ref = torch.cat([ref[..., :nope], rot.to(ref.dtype)], dim=-1)
+
+    torch.testing.assert_close(got.float(), ref.float(), atol=2e-2, rtol=2e-2)
+
+
+def test_fused_dspark_rmsnorm_rope_accepts_no_weight() -> None:
+    """A gain-less call may pass None, and must match passing an ignored weight.
+
+    The kernel is compiled with apply_weight=False, so the weight operand is not
+    in its signature at all; None is the only thing a caller without a norm gain
+    should have to produce. Asserting equality against a real-but-ignored weight
+    is what catches a compile wrapper that silently starts applying it.
+    """
+    from tensorrt_llm._torch.custom_ops.dspark_rmsnorm_rope_custom_op import (
+        cute_dsl_dspark_rmsnorm_rope,
+        is_fused_dspark_rmsnorm_rope_supported,
+    )
+
+    x, weight, freqs = _make_inputs(2, 5, 512, 64, 1, seed=11)
+    args = (1, 64, 1e-6, False, True, False)
+
+    assert is_fused_dspark_rmsnorm_rope_supported(x, None, freqs, 1, 64)
+    without = cute_dsl_dspark_rmsnorm_rope(x, None, freqs, *args)
+    with_ignored = cute_dsl_dspark_rmsnorm_rope(x, weight, freqs, *args)
+    expected = _reference(x, weight, freqs, *args)
+
+    torch.testing.assert_close(without, with_ignored, rtol=0, atol=0)
+    torch.testing.assert_close(without, expected, rtol=2e-2, atol=2e-2)
+
+
+def test_fused_dspark_rmsnorm_rope_rejects_missing_weight() -> None:
+    from tensorrt_llm._torch.custom_ops.dspark_rmsnorm_rope_custom_op import (
+        cute_dsl_dspark_rmsnorm_rope,
+    )
+
+    x, _, freqs = _make_inputs(2, 5, 512, 64, 1, seed=12)
+    with pytest.raises(ValueError, match="needs a weight when apply_weight is set"):
+        cute_dsl_dspark_rmsnorm_rope(x, None, freqs, 1, 64, 1e-6, True, True, False)

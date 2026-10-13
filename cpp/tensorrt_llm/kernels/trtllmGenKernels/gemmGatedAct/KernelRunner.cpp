@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -22,6 +22,8 @@
 #include "trtllmGen_gatedAct_export/GemmGatedActInterface.h"
 #include "trtllmGen_gatedAct_export/GemmOptions.h"
 #include "trtllmGen_gatedAct_export/trtllm/gen/DtypeDecl.h"
+// Include after trtllm-gen export headers to avoid TLLM_LOG_* macro redefinition warnings
+#include "tensorrt_llm/common/cudaUtils.h"
 
 TRTLLM_NAMESPACE_BEGIN
 
@@ -29,6 +31,35 @@ namespace kernels
 {
 using namespace gemmGatedAct::gemmGatedAct;
 static GemmGatedActInterface::ModuleCache globalTrtllmGenGemmGatedActModuleCache;
+
+using SmVersion = gemmGatedAct::gemm::SmVersion;
+
+constexpr bool isSMCompatible(int gpuSM, SmVersion kernelSM)
+{
+    if (gpuSM == 107)
+    {
+        // SM107 (Rubin) can run SM100f family kernels and SM107a-specific kernels
+        return kernelSM == SmVersion::Sm107a || kernelSM == SmVersion::Sm100f;
+    }
+    else if (gpuSM == 103)
+    {
+        return kernelSM == SmVersion::Sm103a || kernelSM == SmVersion::Sm100f;
+    }
+    else if (gpuSM == 100)
+    {
+        return kernelSM == SmVersion::Sm100a || kernelSM == SmVersion::Sm100f;
+    }
+    else if (gpuSM == 90)
+    {
+        return kernelSM == SmVersion::Sm90a;
+    }
+    // Redirect SM100 family (major version 10) to family kernels
+    else if (tensorrt_llm::common::isSM100Family(gpuSM))
+    {
+        return kernelSM == SmVersion::Sm100f;
+    }
+    return true;
+}
 
 TrtllmGenGemmGatedActRunner::TrtllmGenGemmGatedActRunner(TrtllmGenGemmGatedActRunnerOptions const& options_)
     : mOptions(options_)
@@ -39,9 +70,18 @@ TrtllmGenGemmGatedActRunner::TrtllmGenGemmGatedActRunner(TrtllmGenGemmGatedActRu
 
     mPassingConfigIndices.clear();
 
+    int const gpuSM = tensorrt_llm::common::getSMVersion();
+
     for (size_t i = 0; i < gemm.getNumGemmConfigs(); ++i)
     {
-        auto const options = configs[i].mOptions;
+        auto const& config = configs[i];
+        auto const options = config.mOptions;
+
+        // Filter by SM compatibility first
+        if (!isSMCompatible(gpuSM, config.mSm))
+        {
+            continue;
+        }
 
         // When we include low-latency kernels we can set transposeMmaOutput via constructor
         if (options.mDtypeA == mOptions.eltType && options.mDtypeC == mOptions.outputType
@@ -61,6 +101,10 @@ size_t TrtllmGenGemmGatedActRunner::getWorkspaceSizeInBytes(int32_t m, int32_t n
     gemmData.mProblemDimensions.mM = mOptions.transposeMmaOutput ? n : m;
     gemmData.mProblemDimensions.mN = mOptions.transposeMmaOutput ? m : n;
     gemmData.mProblemDimensions.mK = k;
+    // Set valid dimensions to full range (same as M/N/K when no padding)
+    gemmData.mProblemDimensions.mValidM = mOptions.transposeMmaOutput ? n : m;
+    gemmData.mProblemDimensions.mValidN = mOptions.transposeMmaOutput ? m : n;
+    gemmData.mProblemDimensions.mValidK = k;
 
     selectGemmConfig(m, n, k);
 
@@ -90,6 +134,10 @@ void TrtllmGenGemmGatedActRunner::run(int32_t m, int32_t n, int32_t k, void cons
     gemmData.mProblemDimensions.mM = mOptions.transposeMmaOutput ? n : m;
     gemmData.mProblemDimensions.mN = mOptions.transposeMmaOutput ? m : n;
     gemmData.mProblemDimensions.mK = k;
+    // Set valid dimensions to full range (same as M/N/K when no padding)
+    gemmData.mProblemDimensions.mValidM = mOptions.transposeMmaOutput ? n : m;
+    gemmData.mProblemDimensions.mValidN = mOptions.transposeMmaOutput ? m : n;
+    gemmData.mProblemDimensions.mValidK = k;
 
     // Inputs
     gemmData.mInputBuffers.mPtrA = mOptions.transposeMmaOutput ? b : a;
@@ -129,6 +177,10 @@ void TrtllmGenGemmGatedActRunner::selectGemmConfig(int32_t m, int32_t n, int32_t
     gemmData.mProblemDimensions.mM = mOptions.transposeMmaOutput ? n : m;
     gemmData.mProblemDimensions.mN = mOptions.transposeMmaOutput ? m : n;
     gemmData.mProblemDimensions.mK = k;
+    // Set valid dimensions to full range (same as M/N/K when no padding)
+    gemmData.mProblemDimensions.mValidM = mOptions.transposeMmaOutput ? n : m;
+    gemmData.mProblemDimensions.mValidN = mOptions.transposeMmaOutput ? m : n;
+    gemmData.mProblemDimensions.mValidK = k;
 
     for (auto const& configIndex : mPassingConfigIndices)
     {

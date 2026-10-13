@@ -61,6 +61,18 @@ _PREFETCH_FALLBACK_LOGGED = threading.Event()
 _PREFETCH_FALLBACK_LOG_LOCK = threading.Lock()
 
 
+class _LazySafetensorsWeights(ConsumableWeightsDict):
+    """Keep lazy safetensors handles alive only while a load uses them."""
+
+    def __init__(self, weights: dict[str, Any], handles: list[Any]) -> None:
+        super().__init__(weights)
+        self._handles = handles
+
+    def clear(self) -> None:
+        super().clear()
+        self._handles.clear()
+
+
 @register_checkpoint_weight_loader("MX")
 @register_checkpoint_weight_loader("mistral")
 @register_checkpoint_weight_loader("mistral_large_3")
@@ -237,11 +249,6 @@ class HfWeightLoader(BaseWeightLoader):
             self._cache_loaded_weights(cache_key, weights)
         return weights
 
-    def cleanup(self) -> None:
-        # Drop lazy safetensors handles (if any) so the mmaps are released.
-        self._lazy_handles = []
-        super().cleanup()
-
     @staticmethod
     def _is_kimi_k3_checkpoint(checkpoint_dir: str) -> bool:
         """Kimi K3 checkpoints (~1.5 TB) must not be materialized in host RAM."""
@@ -288,12 +295,20 @@ class HfWeightLoader(BaseWeightLoader):
             handles.append(handle)
             for name in handle.keys():
                 weights[name] = handle.get_slice(name)
-        # Keep the file handles alive for as long as the loader lives; the
-        # slices reference them. Released in cleanup().
-        self._lazy_handles = handles
         logger.info(f"Lazily opened {len(weight_files)} safetensors files "
                     f"({len(weights)} tensors) from {checkpoint_dir}")
-        return ConsumableWeightsDict(weights)
+        # The slices need their file handles, but the checkpoint loader
+        # outlives this load through KV-cache construction. Keep ownership on
+        # the returned container so the mappings are released with the other
+        # transient source weights when ModelLoader.load() returns.
+        lazy_weights = _LazySafetensorsWeights(weights, handles)
+        # A lazy slice does not carry the file it came from, and a model that
+        # wants to re-open shards itself (Kimi K3 streams rank-local experts
+        # per shard file, precisely to avoid holding this mapping open) has no
+        # other reliable source: transformers no longer sets
+        # ``PretrainedConfig._name_or_path``.
+        lazy_weights.checkpoint_dir = checkpoint_dir
+        return lazy_weights
 
     def load_weights(self,
                      checkpoint_dir: str,

@@ -15,8 +15,9 @@ import torch
 from strenum import StrEnum
 
 import tensorrt_llm
+from tensorrt_llm._torch.modules.dwdp import dwdp_global_rank
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
-from tensorrt_llm._utils import get_sm_version, global_mpi_rank
+from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.llmapi.llm_args import (CapacitySchedulerPolicy,
                                           ContextChunkingPolicy,
                                           ExecutorMemoryType,
@@ -49,14 +50,17 @@ from .model_engine import PyTorchModelEngine
 from .model_loader import ModelLoader, _construct_checkpoint_loader
 from .py_executor import PyExecutor
 
-_MLA_KV_CACHE_REUSE_SUPPORTED_SM_VERSIONS = (90, 100, 103, 120, 121)
-_MLA_CHUNKED_PREFILL_SUPPORTED_SM_VERSIONS = (90, 100, 103, 120)
+_MLA_KV_CACHE_REUSE_SUPPORTED_SM_VERSIONS = (90, 100, 103, 107, 120, 121)
+_MLA_CHUNKED_PREFILL_SUPPORTED_SM_VERSIONS = (90, 100, 103, 107, 120)
 _MLA_KV_CACHE_REUSE_SUPPORTED_SM_VERSIONS_STR = "/".join(
     f"SM{sm_version}"
     for sm_version in _MLA_KV_CACHE_REUSE_SUPPORTED_SM_VERSIONS)
 _MLA_CHUNKED_PREFILL_SUPPORTED_SM_VERSIONS_STR = "/".join(
     f"SM{sm_version}"
     for sm_version in _MLA_CHUNKED_PREFILL_SUPPORTED_SM_VERSIONS)
+FLASH_MLA_TOKENS_PER_BLOCK = 64
+FP4_MLA_TOKENS_PER_BLOCK = 128
+FP4_MLA_QUANTIZATION_TILE_SIZE = 16
 
 
 class _ExecutorMemoryMonitor:
@@ -193,6 +197,81 @@ def _set_model_engines_cache_reuse(model_engines, cache_reuse: bool):
         if engine is None:
             continue
         engine.attn_runtime_features.cache_reuse = cache_reuse
+
+
+def _has_fp4_kv_cache(model_config, kv_cache_config) -> bool:
+    kv_cache_quant_algo = getattr(getattr(model_config, "quant_config", None),
+                                  "kv_cache_quant_algo", None)
+    fp4_quant_values = {
+        QuantAlgo.NVFP4,
+        getattr(QuantAlgo.NVFP4, "value", None),
+        "NVFP4",
+    }
+    kv_cache_dtype = getattr(kv_cache_config, "dtype", None)
+    return ((isinstance(kv_cache_dtype, str)
+             and kv_cache_dtype.lower() == "nvfp4")
+            or (isinstance(kv_cache_quant_algo, str)
+                and kv_cache_quant_algo.upper() == "NVFP4")
+            or kv_cache_quant_algo in fp4_quant_values)
+
+
+def _uses_fp4_mla_attention(model_config, kv_cache_config) -> bool:
+    sparse_attention_config = getattr(model_config, "sparse_attention_config",
+                                      None)
+    return (_has_fp4_kv_cache(model_config, kv_cache_config)
+            and getattr(model_config, "attn_backend", None) == "TRTLLM"
+            and sparse_attention_config is None)
+
+
+def _supports_mla_kv_cache_reuse_quantization(model_config,
+                                              kv_cache_config) -> bool:
+    kv_cache_quant_algo = getattr(getattr(model_config, "quant_config", None),
+                                  "kv_cache_quant_algo", None)
+    return (kv_cache_quant_algo is None
+            or kv_cache_quant_algo == QuantAlgo.NO_QUANT
+            or kv_cache_quant_algo == QuantAlgo.FP8
+            or _has_fp4_kv_cache(model_config, kv_cache_config))
+
+
+def _validate_fp4_mla_chunk_size(
+    model_config,
+    kv_cache_config,
+    *,
+    enable_chunked_prefill: bool,
+    max_num_tokens: int,
+) -> None:
+    """Require tile-aligned non-final chunks for dense FP4 MLA cache writes."""
+    if (enable_chunked_prefill
+            and _uses_fp4_mla_attention(model_config, kv_cache_config)
+            and max_num_tokens % FP4_MLA_QUANTIZATION_TILE_SIZE != 0):
+        raise ValueError(
+            "Dense NVFP4 MLA chunked prefill requires max_num_tokens to be "
+            f"a multiple of {FP4_MLA_QUANTIZATION_TILE_SIZE}, got "
+            f"{max_num_tokens}. Only the final chunk may contain a partial "
+            "FP4 quantization tile backed by the HP pool.")
+
+
+def _select_mla_tokens_per_block(config, model_config, kv_cache_config,
+                                 tokens_per_block: int) -> int:
+    if not is_mla(config):
+        return tokens_per_block
+
+    if _uses_fp4_mla_attention(model_config, kv_cache_config):
+        tokens_per_block = FP4_MLA_TOKENS_PER_BLOCK
+        logger.info(
+            f"Change tokens_per_block to: {tokens_per_block} for using FP4 MLA attention"
+        )
+        kv_cache_config.tokens_per_block = tokens_per_block
+        return tokens_per_block
+
+    if model_config.enable_flash_mla:
+        tokens_per_block = FLASH_MLA_TOKENS_PER_BLOCK
+        logger.info(
+            f"Change tokens_per_block to: {tokens_per_block} for using FlashMLA"
+        )
+        kv_cache_config.tokens_per_block = tokens_per_block
+
+    return tokens_per_block
 
 
 def _get_mapping(_mapping: Mapping) -> Mapping:
@@ -486,14 +565,12 @@ def create_py_executor(
     # about dwdp_size/dwdp_rank, so inject them here (before anything reads
     # mapping.dwdp_enabled / moe_ep_rank).
     #
-    # dwdp_rank MUST be derived from the global MPI rank, not mapping.rank:
-    # in disaggregated serving each context worker is its own TP=1 instance
-    # with mapping.rank=0, so `mapping.rank % dwdp_size` would make every
-    # worker think it is DWDP rank 0 (causing e.g. cuMemMap to self-import a
-    # peer handle and fail with CUDA_ERROR_NOT_SUPPORTED).
+    # dwdp_rank comes from dwdp_global_rank() (MPI rank, or TRTLLM_DWDP_RANK
+    # under plain trtllm-serve), never mapping.rank: disagg context workers
+    # are TP=1 with mapping.rank=0 and would all self-import as DWDP rank 0.
     if llm_args.dwdp_config is not None and llm_args.dwdp_config.dwdp_size > 1:
         dwdp_size = llm_args.dwdp_config.dwdp_size
-        dwdp_rank = global_mpi_rank() % dwdp_size
+        dwdp_rank = dwdp_global_rank() % dwdp_size
         mapping = Mapping(**{
             **mapping.to_dict(), "dwdp_size": dwdp_size,
             "dwdp_rank": dwdp_rank
@@ -521,10 +598,17 @@ def create_py_executor(
         if hasattr(spec_config, '_max_batch_size'):
             spec_config._max_batch_size = max_batch_size
 
-        # WAR for https://nvbugs/5807902
-        # Disable separate draft KV cache in disaggregated mode
-        # Enable separate pool for None DI + Non-KVBM and Aggregated + KVBM
-        if cache_transceiver_config is not None:
+        # WAR for https://nvbugs/5807902: Eagle3 crashes in disaggregated mode
+        # when the draft layers get their own KV cache manager (RMSNorm invalid
+        # argument). The root cause was never found and the bug closed
+        # will-not-fix, so the workaround stands -- but only for the mode it was
+        # reported on. It was originally a blanket disable, which also stranded
+        # external drafters on their private context arena; that arena is dense
+        # in max_seq_len and, with KV heads unsharded under attention DP, is
+        # what makes long-ISL disaggregated serving unservable.
+        is_eagle3 = (spec_config.spec_dec_mode.is_eagle3()
+                     or spec_config.spec_dec_mode.is_eagle3_one_model())
+        if cache_transceiver_config is not None and is_eagle3:
             spec_config._allow_separate_draft_kv_cache = False
 
     # chunk_unit_size may be changed to 64 when using flash mla
@@ -697,24 +781,10 @@ def create_py_executor(
     config = model_engine.model.model_config.pretrained_config
     max_num_seq_slots = getattr(model_engine, "max_num_seq_slots",
                                 max_batch_size * getattr(mapping, "pp_size", 1))
+    tokens_per_block = _select_mla_tokens_per_block(
+        config, model_engine.model.model_config, kv_cache_config,
+        tokens_per_block)
     if is_mla(config):
-        if model_engine.model.model_config.enable_flash_mla:
-            tokens_per_block = 64
-            # Propagate the override back to kv_cache_config so any consumer
-            # that later reads llm_args.kv_cache_config.tokens_per_block sees
-            # the effective value. KvCacheConnectorScheduler subclasses
-            # (LMCache, Dynamo KVBM) are instantiated further down via
-            # scheduler_cls(llm_args) and size their block pools from
-            # llm_args.kv_cache_config.tokens_per_block. Without this the
-            # connector's block size desynced from the KVCacheManager's
-            # actual tokens_per_block (user-set or default 32 vs. FlashMLA's
-            # forced 64), producing a frozen cache_block_ids view to the
-            # connector and silently-corrupted decode KV (#13320).
-            kv_cache_config.tokens_per_block = tokens_per_block
-            logger.info(
-                f"Change tokens_per_block to: {tokens_per_block} for using FlashMLA"
-            )
-
         sm_version = get_sm_version()
         if (kv_cache_config.enable_block_reuse and sm_version
                 not in _MLA_KV_CACHE_REUSE_SUPPORTED_SM_VERSIONS):
@@ -725,12 +795,13 @@ def create_py_executor(
             _set_model_engines_cache_reuse([model_engine, draft_model_engine],
                                            False)
 
-        kv_cache_quant_algo = model_engine.model.model_config.quant_config.kv_cache_quant_algo
-        if kv_cache_config.enable_block_reuse and not (
-                kv_cache_quant_algo is None or kv_cache_quant_algo
-                == QuantAlgo.NO_QUANT or kv_cache_quant_algo == QuantAlgo.FP8):
+        model_config = model_engine.model.model_config
+        kv_cache_quant_algo = model_config.quant_config.kv_cache_quant_algo
+        if (kv_cache_config.enable_block_reuse
+                and not _supports_mla_kv_cache_reuse_quantization(
+                    model_config, kv_cache_config)):
             logger.warning(
-                f"KV cache reuse for MLA can only be enabled without KV cache quantization or with FP8 quantization, "
+                f"KV cache reuse for MLA can only be enabled without KV cache quantization or with FP8/NVFP4 quantization, "
                 f"disable enable_block_reuse for KV cache quant algorithm: {kv_cache_quant_algo}"
             )
             kv_cache_config.enable_block_reuse = False
@@ -745,6 +816,13 @@ def create_py_executor(
             model_engine.attn_runtime_features.chunked_prefill = False
             if draft_model_engine is not None:
                 draft_model_engine.attn_runtime_features.chunked_prefill = False
+
+    _validate_fp4_mla_chunk_size(
+        model_engine.model.model_config,
+        kv_cache_config,
+        enable_chunked_prefill=enable_chunked_context,
+        max_num_tokens=max_num_tokens,
+    )
 
     # Set default value for cache_transceiver_config.max_tokens_in_buffer.
     # Placed after the FlashMLA tokens_per_block override and rounded up to a
@@ -898,11 +976,7 @@ def create_py_executor(
     estimating_kv_cache = False
     kv_cache_creator = None
 
-    # Create the execution stream for model forward operations
-    # for proper synchronization with KVCacheTransferManager's onboard/offload operations.
     execution_stream = torch.cuda.Stream()
-    logger.info(
-        f"[create_py_executor] Created execution_stream: {execution_stream}")
 
     if model_engine.model.model_config.is_generation:
         #NOTE: non-generation models do not have kv cache

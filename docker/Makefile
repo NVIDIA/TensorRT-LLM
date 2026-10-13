@@ -1,3 +1,17 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 # Default base image for the docker build as defined in Dockerfile.multi
 BASE_IMAGE         ?= $(shell grep '^ARG BASE_IMAGE=' Dockerfile.multi | grep -o '=.*' | tr -d '="')
 BASE_TAG           ?= $(shell grep '^ARG BASE_TAG=' Dockerfile.multi | grep -o '=.*' | tr -d '="')
@@ -38,7 +52,7 @@ DOCKER_BUILD_OPTS  ?= --pull --load
 DOCKER_BUILD_ARGS  ?=
 DOCKER_PROGRESS    ?= auto
 PLATFORM           ?= $(shell uname -m | grep -q 'aarch64' && echo "arm64" || echo "amd64")
-CUDA_ARCHS         ?= $(if $(filter arm64,$(PLATFORM)),'90-real;100-real;120-real',)
+CUDA_ARCHS         ?= $(if $(filter arm64,$(PLATFORM)),'90-real;100-real;103-real;107-real;120-real',)
 BUILD_WHEEL_OPTS   ?=
 BUILD_WHEEL_ARGS   ?= $(shell grep '^ARG BUILD_WHEEL_ARGS=' Dockerfile.multi | grep -o '=.*' | tr -d '="')$(if $(CUDA_ARCHS), --cuda_architectures $(CUDA_ARCHS))$(if $(BUILD_WHEEL_OPTS), $(BUILD_WHEEL_OPTS))
 BUILD_WHEEL_SCRIPT ?=
@@ -200,21 +214,21 @@ jenkins-rockylinux8_%: PYTHON_VERSION_TAG_ID = $(if $(findstring 3.12,${PYTHON_V
 jenkins-rockylinux8_%: IMAGE_WITH_TAG = $(shell . ../jenkins/current_image_tags.properties && echo $$LLM_ROCKYLINUX8_${PYTHON_VERSION_TAG_ID}_DOCKER_IMAGE)
 jenkins-rockylinux8_%: STAGE = tritondevel
 jenkins-rockylinux8_%: BASE_IMAGE = nvcr.io/nvidia/cuda
-jenkins-rockylinux8_%: BASE_TAG = 13.2.1-devel-rockylinux8
+jenkins-rockylinux8_%: BASE_TAG = 13.3.1-devel-rockylinux8
 
 rockylinux8_%: STAGE = tritondevel
 rockylinux8_%: BASE_IMAGE = nvcr.io/nvidia/cuda
-rockylinux8_%: BASE_TAG = 13.2.1-devel-rockylinux8
+rockylinux8_%: BASE_TAG = 13.3.1-devel-rockylinux8
 
 # For x86_64
 ubuntu22_%: STAGE = tritondevel
 ubuntu22_%: BASE_IMAGE = nvcr.io/nvidia/cuda
-ubuntu22_%: BASE_TAG = 13.2.1-devel-ubuntu22.04
+ubuntu22_%: BASE_TAG = 13.3.1-devel-ubuntu22.04
 
 # For x86_64 and aarch64
 ubuntu24_%: STAGE = tritondevel
 ubuntu24_%: BASE_IMAGE = nvcr.io/nvidia/cuda
-ubuntu24_%: BASE_TAG = 13.2.1-devel-ubuntu24.04
+ubuntu24_%: BASE_TAG = 13.3.1-devel-ubuntu24.04
 
 trtllm_%: STAGE = release
 trtllm_%: PUSH_TO_STAGING := 0

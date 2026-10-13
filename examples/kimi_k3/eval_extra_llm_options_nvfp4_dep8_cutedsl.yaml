@@ -1,0 +1,39 @@
+# Kimi K3 NVFP4 on DEP8 (2 nodes x 4 GPU), CuteDSL MoE backend.
+#
+# backend: CUTEDSL is required, not a preference -- AUTO resolves Kimi K3 to
+# TRTLLM, and trtllm-gen ships SiTu cubins for W4A8_MXFP4_MXFP8 only. On
+# SM100/SM103 this resolves to CuteDslFusedMoE, whose fused FC1 epilogue gained
+# SiTU support alongside SwiGLU and Relu2. The SiTU constants are read from the
+# checkpoint config (activation_situ_beta / activation_situ_linear_beta), not
+# set here.
+#
+# moe_config.max_num_tokens is a per-call chunking bound for CUTEDSL, the same
+# meaning it has for CUTLASS (CuteDslFusedMoE subclasses CutlassFusedMoE). Do
+# NOT carry this value over to a MEGAMOE_* backend, where it is instead the
+# SymmBuffer capacity.
+#
+# Accuracy is checked by the GSM8K and GPQA-Diamond eval jobs. Do not record
+# scores in this file. To reproduce an A/B, copy this file and change only
+# moe_config.backend back to CUTLASS; every other field must stay identical.
+# GPQA-D uses --temperature 1.0 --top_p 0.95 --max_output_length 65536
+# --apply_chat_template with max_seq_len 69632.
+tensor_parallel_size: 8
+enable_attention_dp: true
+moe_expert_parallel_size: 8
+max_batch_size: 8
+max_num_tokens: 8192
+max_seq_len: 8192
+trust_remote_code: true
+disable_overlap_scheduler: false
+enable_chunked_prefill: true
+cuda_graph_config:
+  enable_padding: true
+  max_batch_size: 8
+moe_config:
+  backend: CUTEDSL
+  max_num_tokens: 8192
+  use_low_precision_moe_combine: true
+kv_cache_config:
+  enable_block_reuse: false
+  free_gpu_memory_fraction: 0.25
+  tokens_per_block: 64

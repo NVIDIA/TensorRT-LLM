@@ -1,4 +1,18 @@
 #!/bin/bash
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 
 set -ex
 
@@ -71,9 +85,15 @@ cleanup() {
 
 init_ubuntu() {
   apt-get update
+  # git is not guaranteed to be in the base image, and is needed by `git config` below
+  apt-get install -y --no-install-recommends git
   # libibverbs-dev is installed but libmlx5.so is missing, reinstall the package
   apt remove -y ibverbs-providers libibverbs1
   apt-get --reinstall install -y libibverbs-dev
+  ARCH=$(uname -m)
+  LIB_PATH="/usr/lib/${ARCH}-linux-gnu"
+  ln -sf ${LIB_PATH}/libmlx5.so.1 ${LIB_PATH}/libmlx5.so
+  git config --global --add safe.directory /workspace/TensorRT-LLM/cpp/build/_deps/googletest-src
   apt-get install -y --no-install-recommends \
     libtool \
     autoconf \
@@ -105,23 +125,21 @@ init_ubuntu() {
   # and ubuntu22.04 (currently not used) shouldn't be affected.
   pip3 config set global.break-system-packages true
   pip3 install pip wheel
-  # WAR: pin setuptools<80; setuptools>=80 breaks `python setup_library.py develop`
-  # used by cutlass. Use --ignore-installed to avoid failing on system setuptools
-  # that lack a RECORD file (installed via apt without pip metadata).
-  pip3 install --ignore-installed "setuptools<80"
-  # WAR: uninstall dependencies that has vulnerability or need upgrading.
-  # pip and wheel are already installed to /usr/local/ above, so removing
-  # the apt packages leaves pip3 functional.
 
   echo 'export LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH' >> "${ENV}"
-  # Remove previous TRT installation
-  if [[ $(apt list --installed | grep libnvinfer) ]]; then
-    apt-get remove --purge -y libnvinfer*
+  # Rubin devel keeps TensorRT from the dlfw base image.
+  if [[ "${SKIP_TRT_UNINSTALL:-0}" == "1" || "${BASE_TAG:-}" == *rubin* ]]; then
+    echo "Keeping TensorRT from the base image (SKIP_TRT_UNINSTALL=${SKIP_TRT_UNINSTALL:-0}, BASE_TAG=${BASE_TAG:-unset})"
+  else
+    # Remove previous TRT installation
+    if [[ $(apt list --installed | grep libnvinfer) ]]; then
+      apt-get remove --purge -y libnvinfer*
+    fi
+    if [[ $(apt list --installed | grep tensorrt) ]]; then
+      apt-get remove --purge -y tensorrt*
+    fi
+    pip3 uninstall -y tensorrt
   fi
-  if [[ $(apt list --installed | grep tensorrt) ]]; then
-    apt-get remove --purge -y tensorrt*
-  fi
-  pip3 uninstall -y tensorrt
 }
 
 install_python_rockylinux() {

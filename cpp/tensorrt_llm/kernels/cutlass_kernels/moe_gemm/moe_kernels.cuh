@@ -75,6 +75,22 @@ struct SwigluBiasAdaptor
     }
 };
 
+struct SiTuAdaptor
+{
+    constexpr static bool IS_GLU = true;
+    float alpha = 1.0f;
+    float beta = 1.0f;
+    float limit = std::numeric_limits<float>::infinity();
+
+    template <class T>
+    __device__ T operator()(T const& gate, T const& linear) const
+    {
+        cutlass::epilogue::thread::Sigmoid<T> sigmoid{};
+        cutlass::epilogue::thread::Tanh<T> tanhFn{};
+        return tanhFn(gate * (1.0f / alpha)) * alpha * sigmoid(gate) * tanhFn(linear * (1.0f / beta)) * beta;
+    }
+};
+
 } // namespace kernels::cutlass_kernels
 
 TRTLLM_NAMESPACE_END

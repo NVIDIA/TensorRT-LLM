@@ -27,7 +27,6 @@
 #endif
 
 #include <ATen/cuda/EmptyTensor.h>
-#include <ATen/native/cuda/Resize.h>
 
 #include <cstddef>
 #include <cuda_fp16.h>

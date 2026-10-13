@@ -49,13 +49,44 @@ import torch
 
 from tensorrt_llm._torch.expert_statistic import ExpertStatistic
 from tensorrt_llm._torch.utils import EventType, Fp4QuantizedTensor
+from tensorrt_llm.logger import logger
 from tensorrt_llm.tools.layer_wise_benchmarks import get_calibrator
 
 from .communication import DeepEP, DeepEPLowLatency, NcclEP, NVLinkOneSided, NVLinkTwoSided
 from .communication.nvlink_two_sided_flashinfer import NVLinkTwoSidedFlashinfer
 from .fused_moe_cutlass import raise_moe_lora_multichunk_unsupported
+from .fused_moe_trtllm_gen import TRTLLMGenFusedMoE
 from .impl_contract import MoECommPlan, MoERunContext
 from .interface import FORCE_SEPARATED_ROUTING, MoESchedulerKind
+
+# One-shot marker for the scheduler-level gate in front of the Kimi K3 fused
+# route+quant path. Without it, a scheduler-side rejection is indistinguishable
+# from "the feature is not present": try_fused_kimi_route_quant() is simply
+# never called, so its own logging stays silent too.
+_K3_FUSED_ROUTE_QUANT_GATE_LOGGED = False
+
+
+def _log_k3_fused_route_quant_gate(moe, can_quantize_before_dispatch: bool) -> None:
+    """Report, once per process, why the scheduler did not offer the fused path."""
+    global _K3_FUSED_ROUTE_QUANT_GATE_LOGGED
+    if _K3_FUSED_ROUTE_QUANT_GATE_LOGGED:
+        return
+    _K3_FUSED_ROUTE_QUANT_GATE_LOGGED = True
+
+    if not can_quantize_before_dispatch:
+        reason = (
+            f"{type(moe.comm).__name__} does not support post-quant "
+            "dispatch, so quantization must happen after dispatch"
+        )
+    elif moe._using_load_balancer():
+        reason = "expert load balancer (EPLB) is active"
+    elif moe.apply_router_weight_on_input:
+        reason = "apply_router_weight_on_input is set"
+    else:
+        reason = "unknown (predicates re-evaluated as passing)"
+
+    logger.info(f"Kimi K3 fused route+MXFP8 quant NOT OFFERED by the scheduler: {reason}.")
+
 
 __all__ = [
     "MoEScheduler",
@@ -369,6 +400,23 @@ class ExternalCommMoEScheduler(MoEScheduler):
         # ========== Step 1: EPLB - Start wait GPU stage ==========
         moe._load_balancer_start_wait_gpu_stage(is_first_call)
 
+        # Async input quantization (backends providing quantize_input_async,
+        # currently CuteDSL NVFP4): quantize x on the MoE aux stream now so it
+        # overlaps routing (top-k) and the backend's moe_sort on the main
+        # stream -- at decode batch 8 these three latency-bound kernels
+        # otherwise serialize to ~25 us per layer. Only when nothing modifies
+        # x before quantization (no apply_router_weight_on_input) and no comm
+        # strategy decides the quantize/dispatch order.
+        async_quant = None
+        x_ready_event = None
+        if (
+            moe.comm is None
+            and not moe.apply_router_weight_on_input
+            and not isinstance(x, Fp4QuantizedTensor)
+            and hasattr(moe.backend, "quantize_input_async")
+        ):
+            async_quant = moe.backend.quantize_input_async(x)
+
         # ========== Step 2: Apply routing ==========
         # External dispatch (Step 5) sends per-token expert/scale payloads, so
         # routing must be precomputed whenever a comm strategy is active — even
@@ -380,11 +428,36 @@ class ExternalCommMoEScheduler(MoEScheduler):
             or moe.comm is not None
             or FORCE_SEPARATED_ROUTING
         )
+        # One evaluation, two consumers: the fused route+quant gate below and
+        # the quantize/dispatch ordering in Step 5. Computing it twice let the
+        # two drift, which is what the (unreachable) assert used to guard.
+        post_quant_dispatch_ok = moe.comm is None or moe.comm.supports_post_quant_dispatch()
+        used_fused_route_quant = False
         if requires_separated_routing:
-            # Separated routing: ConfigurableMoE calls routing_method
-            token_selected_experts, token_final_scales = moe.routing_method.apply(
-                router_logits, input_ids
-            )
+            if (
+                post_quant_dispatch_ok
+                and isinstance(moe.backend, TRTLLMGenFusedMoE)
+                and not moe._using_load_balancer()
+                and not moe.apply_router_weight_on_input
+            ):
+                fused_result = moe.backend.try_fused_kimi_route_quant(x, router_logits)
+            else:
+                fused_result = None
+                if not _K3_FUSED_ROUTE_QUANT_GATE_LOGGED and isinstance(
+                    moe.backend, TRTLLMGenFusedMoE
+                ):
+                    _log_k3_fused_route_quant_gate(moe, post_quant_dispatch_ok)
+
+            if fused_result is None:
+                # Separated routing: ConfigurableMoE calls routing_method.
+                token_selected_experts, token_final_scales = moe.routing_method.apply(
+                    router_logits, input_ids
+                )
+                if token_final_scales is not None and isinstance(moe.backend, TRTLLMGenFusedMoE):
+                    token_final_scales = token_final_scales.to(torch.bfloat16)
+            else:
+                token_selected_experts, token_final_scales, x, x_sf = fused_result
+                used_fused_route_quant = True
 
             token_selected_experts = token_selected_experts.to(torch.int32)
 
@@ -490,8 +563,6 @@ class ExternalCommMoEScheduler(MoEScheduler):
 
         # ========== Step 5: Quantization + dispatch (pre/post-quant adaptive ordering) ==========
         if moe.comm is not None:
-            supports_post_quant = moe.comm.supports_post_quant_dispatch()
-
             # Debug: optional dummy AllReduce to break load-balancing artifacts
             if moe.enable_dummy_allreduce:
                 moe.dummy_allreduce()
@@ -502,9 +573,10 @@ class ExternalCommMoEScheduler(MoEScheduler):
             if moe.backend.input_requirement.requires_sanitized_expert_ids:
                 dispatch_kwargs["enable_sanitize_expert_ids"] = True
 
-            if supports_post_quant:
+            if post_quant_dispatch_ok:
                 # Quantize -> Dispatch
-                x, x_sf = moe.backend.quantize_input(x)
+                if not used_fused_route_quant:
+                    x, x_sf = moe.backend.quantize_input(x)
 
                 # W4AFP8 + DeepEPLowLatency needs pre_quant_scale_1; other strategies
                 # absorb the kwarg via **kwargs so unconditional passing is safe.
@@ -536,8 +608,11 @@ class ExternalCommMoEScheduler(MoEScheduler):
                 )
                 x, x_sf = moe.backend.quantize_input(x, post_quant_comm=False)
         else:
-            # No comm: just quantize
-            x, x_sf = moe.backend.quantize_input(x, post_quant_comm=False)
+            # No comm: just quantize (or pick up the async result forked above)
+            if async_quant is not None:
+                x, x_sf, x_ready_event = async_quant
+            elif not used_fused_route_quant:
+                x, x_sf = moe.backend.quantize_input(x, post_quant_comm=False)
 
         # ========== Step 6: MoE computation ==========
         # If EPLB is enabled, token_selected_slots is slot ids; otherwise expert ids.
@@ -551,6 +626,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
             output_dtype=output_dtype,
             all_rank_num_tokens=all_rank_num_tokens,
             lora_params=lora_params,
+            x_ready_event=x_ready_event,
         )
         final_hidden_states = moe.backend.run_moe(
             ctx,
@@ -790,6 +866,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
         output_dtype: Optional[torch.dtype],
         all_rank_num_tokens: Optional[List[int]],
         lora_params: Optional[Dict],
+        x_ready_event: Optional[torch.cuda.Event] = None,
     ) -> MoERunContext:
         """The single ``run_moe`` argument set, identical for every backend.
 
@@ -803,6 +880,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
             token_final_scales=token_final_scales,
             x=x,
             x_sf=x_sf,
+            x_ready_event=x_ready_event,
             output_dtype=output_dtype,
             do_finalize=do_finalize,
             lora_params=lora_params if moe.backend.capabilities.supports_moe_lora else None,
@@ -954,15 +1032,22 @@ class FusedCommMoEScheduler(MoEScheduler):
         provided, e.g. dummy / single-rank forwards).
         """
         moe = self.moe
-        had_meta = all_rank_num_tokens is not None
+        had_meta = all_rank_num_tokens is not None and len(all_rank_num_tokens) > 1
         if had_meta:
             # Force plain Python int: downstream torch.Tensor.split and range()
             # reject torch 0-d tensor / numpy scalar elements, and the public
             # ``Optional[List[int]]`` type hint is not runtime-enforced.
             real_all_rank_num_tokens = [int(v) for v in all_rank_num_tokens]
+            if len(real_all_rank_num_tokens) != moe.mapping.moe_ep_size:
+                raise ValueError(
+                    "Fused-comm MoE token metadata must contain one count per EP rank; "
+                    f"got {len(real_all_rank_num_tokens)} counts for EP size "
+                    f"{moe.mapping.moe_ep_size}."
+                )
             ep_rank = moe.mapping.moe_ep_rank
         else:
-            real_all_rank_num_tokens = [int(x.shape[0])]
+            real_local = int(all_rank_num_tokens[0]) if all_rank_num_tokens else int(x.shape[0])
+            real_all_rank_num_tokens = [real_local]
             ep_rank = 0
         real_local = real_all_rank_num_tokens[ep_rank]
         assert real_local <= x.shape[0], (
@@ -1133,8 +1218,8 @@ class FusedCommMoEScheduler(MoEScheduler):
         moe._load_balancer_start_wait_gpu_stage(is_first_call)
 
         # ----- routing -----
-        # int32 matches the EPLB stats kernel contract used by the external-comm
-        # path; the fused-comm backend casts to int64 internally.
+        # int32 matches the EPLB stats kernel contract; fused-comm backends
+        # normalize it to their kernel ABI internally when needed.
         if num_tokens > 0:
             token_selected_experts, token_final_scales = moe.routing_method.apply(
                 router_logits_chunk_real, input_ids_chunk_real

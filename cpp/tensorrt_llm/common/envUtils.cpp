@@ -22,6 +22,7 @@
 #include "tensorrt_llm/common/stringUtils.h"
 #include <cstddef>
 #include <cstdlib>
+#include <exception>
 #include <mutex>
 #include <optional>
 #include <string>

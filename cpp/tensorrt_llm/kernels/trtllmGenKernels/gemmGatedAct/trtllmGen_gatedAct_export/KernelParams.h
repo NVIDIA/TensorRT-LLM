@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 1993-2025 NVIDIA CORPORATION &
+ * SPDX-FileCopyrightText: Copyright (c) 1993-2026 NVIDIA CORPORATION &
  * AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -19,6 +19,7 @@
 #include "trtllm/gen/CommonUtils.h"
 #include "trtllm/gen/DtypeDecl.h"
 #include "trtllm/gen/SfLayoutDecl.h"
+#include "trtllm/gen/SparsityDecl.h"
 
 #include "Enums.h"
 #include "TmaDescriptor.h"
@@ -32,164 +33,6 @@ namespace gemmGatedAct
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 namespace tg = trtllm::gen;
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
-#ifdef TLLM_ENABLE_CUDA
-CUtensorMap buildNdTmaDescriptor(tg::Dtype dtype, std::vector<uint64_t> const& shapes,
-    std::vector<uint64_t> const& strides, std::vector<int32_t> const& tileShapes, void* gmemAddr)
-{
-    CUtensorMap desc{};
-    // The data type.
-    CUtensorMapDataType tmaDataFormat{CU_TENSOR_MAP_DATA_TYPE_FLOAT32};
-    if (dtype == tg::Dtype::E4m3)
-    {
-        tmaDataFormat = CU_TENSOR_MAP_DATA_TYPE_UINT8;
-    }
-    else if (dtype == tg::Dtype::Fp16)
-    {
-        tmaDataFormat = CU_TENSOR_MAP_DATA_TYPE_FLOAT16;
-    }
-    else if (dtype == tg::Dtype::Bfloat16)
-    {
-        tmaDataFormat = CU_TENSOR_MAP_DATA_TYPE_BFLOAT16;
-    }
-    else if (dtype == tg::Dtype::E2m1)
-    {
-        tmaDataFormat = CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B;
-    }
-    else if (dtype == tg::Dtype::Fp32)
-    {
-        tmaDataFormat = CU_TENSOR_MAP_DATA_TYPE_FLOAT32;
-    }
-    else
-    {
-        std::cerr << "Unexpected dtype " << static_cast<int32_t>(dtype) << std::endl;
-        assert(false);
-    }
-
-    // The swizzle type.
-    CUtensorMapSwizzle swizzleType{CU_TENSOR_MAP_SWIZZLE_NONE};
-    int32_t fastestDimTileSizeBytes = (tileShapes[0] * tg::dtypeGetNumBits(dtype)) / /* bits */ 8;
-    if ((fastestDimTileSizeBytes % 128) == 0)
-    {
-        swizzleType = CU_TENSOR_MAP_SWIZZLE_128B;
-    }
-    else if ((fastestDimTileSizeBytes % 64) == 0)
-    {
-        swizzleType = CU_TENSOR_MAP_SWIZZLE_64B;
-    }
-    else if ((fastestDimTileSizeBytes % 32) == 0)
-    {
-        swizzleType = CU_TENSOR_MAP_SWIZZLE_32B;
-    }
-    else
-    {
-        std::cerr << "Unexpected fastestDimTileSizeBytes  " << fastestDimTileSizeBytes << std::endl;
-        assert(false);
-    }
-
-    // Check gmem address must be 16B-aligned
-    assert((reinterpret_cast<uint64_t>(gmemAddr) & 0b1111) == 0); //
-
-    // Check shape must be in range [1, 2^32]
-    int32_t dim = shapes.size();
-    // Expect 2 dimensions for regular gemm or 3 dimensions for blocked layout
-    assert(dim == 2 || dim == 3);
-    // Check shape range.
-    for (int32_t ii = 0; ii < dim; ++ii)
-    {
-        assert(shapes[ii] >= (uint64_t(1)));       // Size must be min 1
-        assert(shapes[ii] <= (uint64_t(1) << 32)); // Size must be max 2^32
-    }
-
-    // TMA descriptor does not store the zeroth stride and assumes it is 1.
-    assert(static_cast<int32_t>(strides.size()) == dim);
-    assert(strides[0] == 1);
-
-    // Build strides in bytes.
-    // cuTensorMapEncodeTiled ignores the stride of the first dimension (implicitly 1).
-    std::vector<uint64_t> stridesInBytes(dim - 1);
-    for (int32_t ii = 0; ii < dim - 1; ++ii)
-    {
-        stridesInBytes[ii] = (strides[ii + 1] * tg::dtypeGetNumBits(dtype)) / /* bits */ 8;
-    }
-
-    // Set the number of elements in the packed uint32_t element.
-    auto const numEltsPerUInt32 = 4 * /* bits */ 8 / tg::dtypeGetNumBits(dtype);
-    // The number of elements in 128B.
-    auto const numEltsIn128B = numEltsPerUInt32 /*4B*/ * 32;
-    // The number of tile K hidden size (per token) in each block of shared memory.
-    auto const numEltsInClampedFastestTileSize = std::min(numEltsIn128B, tileShapes[0]);
-
-    // Build box dim array. If tileShapes is smaller than dim, just fill with 1s.
-    assert(static_cast<int32_t>(tileShapes.size()) <= dim);
-    std::vector<uint32_t> boxDim(dim, 1);
-    boxDim[0] = numEltsInClampedFastestTileSize;
-    for (size_t ii = 1; ii < tileShapes.size(); ++ii)
-    {
-        if (tileShapes[ii] > 256)
-        {
-            std::cerr << "buildNdTmaDescriptor: boxDim too large " << tileShapes[ii] << std::endl;
-            assert(false);
-        }
-        else
-        {
-            boxDim[ii] = tileShapes[ii];
-        }
-    }
-
-    // Set tile strides to 0;
-    std::vector<uint32_t> tileStrides(dim, 1);
-
-    // Build the descriptor.
-    CUresult result = cuTensorMapEncodeTiled(&desc, tmaDataFormat,
-        /*tensorRank=*/dim, gmemAddr, shapes.data(), stridesInBytes.data(), boxDim.data(), tileStrides.data(),
-        /*interleave=*/CU_TENSOR_MAP_INTERLEAVE_NONE, swizzleType,
-        /*l2Promotion=*/CU_TENSOR_MAP_L2_PROMOTION_L2_128B,
-        /*oobFill=*/CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-
-    if (result != CUDA_SUCCESS)
-    {
-        std::cerr << "Error: Failed to initialize the TMA descriptor " << result << std::endl;
-
-        std::cerr << "tmaFormat: " << static_cast<int>(tmaDataFormat) << " dim: " << dim << " gmem: " << gmemAddr
-                  << std::endl;
-
-        std::cerr << "Shape: ";
-        for (int ii = 0; ii < dim; ++ii)
-        {
-            std::cerr << shapes[ii] << " ";
-        }
-        std::cerr << std::endl;
-
-        std::cerr << "Stride: ";
-        for (int ii = 0; ii < dim - 1; ++ii)
-        {
-            std::cerr << stridesInBytes[ii] << " ";
-        }
-        std::cerr << std::endl;
-
-        std::cerr << "tileShapes: ";
-        for (int ii = 0; ii < dim; ++ii)
-        {
-            std::cerr << boxDim[ii] << " ";
-        }
-        std::cerr << std::endl;
-
-        std::cerr << "tileStrides: ";
-        for (int ii = 0; ii < dim; ++ii)
-        {
-            std::cerr << tileStrides[ii] << " ";
-        }
-        std::cerr << std::endl;
-        std::cerr << "swizzleType: " << int(swizzleType) << std::endl;
-        assert(false);
-    }
-
-    return desc;
-}
-#endif // defined TLLM_ENABLE_CUDA
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -273,6 +116,29 @@ struct KernelParams
     // Dtype is set from options.mDtypeC.
     CUtensorMap tmaC;
 
+#ifdef TLLM_RUBIN_FEATURES
+#ifdef TLLM_TEST
+    // TMA descriptor for data invalidation, (when lamportProducer is true)
+    // Must be setup using gemm::buildNdTmaDescriptor with shapes and strides from
+    // makeTmaShapeStrideC.
+    //
+    // If transposeMmaOutput is false,
+    // Logical shape is [M, N / 2].
+    // Logical strides are [N / 2, 1].
+    // Tile box shape is [epilogueTileM, epilogueTileN / 2].
+    // Tile box strides are [epilogueTileN / 2, 1].
+    // Dtype is set from options.mDtypeC.
+    //
+    // If transposeMmaOutput is true,
+    // Logical shape is [N, M / 2].
+    // Logical strides are [M / 2, 1].
+    // Tile box shape is [epilogueTileN, epilogueTileM / 2].
+    // Tile box strides are [epilogueTileM / 2, 1].
+    // Dtype is set from options.mDtypeC.
+    CUtensorMap tmaInvalidate;
+#endif // TLLM_TEST
+#endif // TLLM_RUBIN_FEATURES
+
     // TMA descriptor for the block scaling factors for A, for MxFp{4,8} and NvFp4 formats.
     // Must be setup using gemm::buildSfTmaDescriptor with shapes and strides from
     // makeTmaShapeStrideSfAb.
@@ -307,6 +173,24 @@ struct KernelParams
     //
     // Dtype is Dtype::E4m3.
     CUtensorMap tmaSfB;
+
+    // TMA descriptor for the sparsity information of A, if structured sparsity is used.
+    // Must be setup using gemm::buildNdTmaDescriptor with shapes and strides from
+    // makeTmaShapeStrideSparsityInfoA.
+    //
+    // When sparsityA is Any_2_4:
+    //     2 elements are non-zero in any chunk of 4 elements.
+    //     A 4-bit index indicates the position of the non-zero elements.
+    //     The shape in UInt8 is: [M, K / 8] (two 4-bit indices packed into one UInt8)
+    //
+    // When sparsityA is Pairwise_4_8:
+    //     4 elements are non-zero in any chunk of 8 elements.
+    //     The zero and non-zero elements are grouped in pairs.
+    //     A 4-bit index indicates the position of the non-zero pairs.
+    //     The shape in UInt8 is: [M, K / 16] (two 4-bit indices packed into one UInt8)
+    //
+    // Dtype is Dtype::UInt8.
+    CUtensorMap tmaSparsityInfoA;
 
     // The output matrix C. The data type is controlled by options.mDtypeC.
     //
@@ -382,7 +266,7 @@ struct KernelParams
     // y = act(ptrScaleGate[0] * y1) * (ptrScaleC[0] * y2)
     //
     // The output tensor scaling factor for MxFp{4,8}, NvFp4 and DeepSeek FP8 quantization.
-    // TensorRT LLM API requires a scaling factor on the device.
+    // TensorRT-LLM API requires a scaling factor on the device.
     // Shape is [1].
     float const* ptrScaleC{nullptr};
     // The output gate scale for MxFp{4,8}, NvFp4 and DeepSeek FP8 quantization.
@@ -457,29 +341,48 @@ struct KernelParams
     template <class GemmOptions>
     static auto makeTmaShapeStrideAbc(GemmOptions const& options, MatrixType matrixType)
     {
+        // For sparse A, the k dimension in the TMA shapes is halved.
+        int const isSparse = matrixType == MatrixType::MatrixA && tg::isSparse(options.mSparsityA);
+
+        // The padded/valid dimensions.
+        int sizeM = options.mM;
+        int sizeN = options.mN;
+        int sizeK = options.mK >> isSparse;
+        int const tileM = options.mTileM;
+        int const tileN = options.mTileN;
+        int const tileK = options.mTileK >> isSparse;
+        int validM = options.mValidM;
+        int validN = options.mValidN;
+        int validK = options.mValidK >> isSparse;
+
         // The outer dimension.
-        auto numTokens
-            = (matrixType == MatrixType::MatrixA || matrixType == MatrixType::MatrixC) ? options.mM : options.mN;
+        auto numTokens = (matrixType == MatrixType::MatrixA || matrixType == MatrixType::MatrixC) ? sizeM : sizeN;
+        auto numTokensValid
+            = (matrixType == MatrixType::MatrixA || matrixType == MatrixType::MatrixC) ? validM : validN;
         // The outer dimension tile size.
         auto tileNumTokens = (matrixType == MatrixType::MatrixC) ? options.mEpilogueTileM
-            : (matrixType == MatrixType::MatrixA)                ? options.mTileM
-                                                                 : options.mTileN;
+            : (matrixType == MatrixType::MatrixA)                ? tileM
+                                                                 : tileN;
         // The inner dimension.
-        auto hiddenSize = (matrixType == MatrixType::MatrixC) ? options.mN / 2 : options.mK;
+        auto hiddenSize = (matrixType == MatrixType::MatrixC) ? sizeN / 2 : sizeK;
+        auto hiddenSizeValid = (matrixType == MatrixType::MatrixC) ? validN / 2 : validK;
         // The inner dimension tile size.
-        auto tileHiddenSize = (matrixType == MatrixType::MatrixC) ? options.mEpilogueTileN / 2 : options.mTileK;
+        auto tileHiddenSize = (matrixType == MatrixType::MatrixC) ? options.mEpilogueTileN / 2 : tileK;
         // Swap variables if transpose output
         if (matrixType == MatrixType::MatrixC && options.mTransposeMmaOutput)
         {
-            numTokens = options.mN;
-            hiddenSize = options.mM / 2;
+            numTokens = sizeN;
+            numTokensValid = validN;
+            hiddenSize = sizeM / 2;
+            hiddenSizeValid = validM / 2;
             tileNumTokens = options.mEpilogueTileN;
             tileHiddenSize = options.mEpilogueTileM / 2;
         }
         // The cute tensor shape for A/B: (numTokens, hiddenSize).
         // Note that TMA descriptor expects the first dimension's stride to be
         // 1, so swap the first two dimension so that the hiddenSize dimension comes first.
-        auto shape = std::vector<uint64_t>{static_cast<uint64_t>(hiddenSize), static_cast<uint64_t>(numTokens)};
+        auto shape
+            = std::vector<uint64_t>{static_cast<uint64_t>(hiddenSizeValid), static_cast<uint64_t>(numTokensValid)};
 
         // Assemble the stride (strideTokens, 1).
         // Swap the first two dimension as mentioned before.
@@ -503,7 +406,7 @@ struct KernelParams
             {
                 // Set shapes based on blocking layout
                 shape = {static_cast<uint64_t>(options.mBlockK), static_cast<uint64_t>(numTokens),
-                    static_cast<uint64_t>(options.mK / options.mBlockK)};
+                    static_cast<uint64_t>(sizeK / options.mBlockK)};
                 stride
                     = {1, static_cast<uint64_t>(options.mBlockK), static_cast<uint64_t>(numTokens * options.mBlockK)};
 
@@ -518,8 +421,8 @@ struct KernelParams
 
     // Create the TMA shape/stride for A/B block scaling factors.
     template <class GemmOptions>
-    static auto makeTmaShapeStrideSfAb(
-        GemmOptions const& options, MatrixType matrixType, tg::SfLayout layout, int sfReshapeFactor)
+    static auto makeTmaShapeStrideSfAb(GemmOptions const& options, MatrixType matrixType, tg::SfLayout layout,
+        int sfReshapeFactor, int32_t numEltsPerSf)
     {
         // The outer dimension.
         auto numTokens = matrixType == MatrixType::MatrixA ? options.mM : options.mN;
@@ -529,12 +432,6 @@ struct KernelParams
         auto numTokensPerTile = matrixType == MatrixType::MatrixA ? options.mTileM : options.mTileN;
         // The inner tile dimension.
         auto hiddenSizePerTile = options.mTileK;
-        // The dtype of the matrix.
-        tg::Dtype matrixDtype = matrixType == MatrixType::MatrixA ? options.mDtypeA : options.mDtypeB;
-        // Number of elements per scaling factor.
-        int32_t const numEltsPerSf = (matrixType == MatrixType::MatrixA && options.mSfBlockSizeA.has_value())
-            ? options.mSfBlockSizeA.value()
-            : (tg::dtypeIsBlockFmt(matrixDtype) ? tg::dtypeNumEltsPerSf(matrixDtype) : 32);
 
         switch (layout)
         {
@@ -567,6 +464,37 @@ struct KernelParams
 
             return std::make_tuple(shape, stride, tileShapes);
         }
+
+#ifdef TLLM_RUBIN_FEATURES
+        case tg::SfLayout::R128c16:
+        {
+            // The scaling factor tensor packs 128x16 tiles into contiguous 2048B blocks.
+            // The 2048B block maps to a 128x16B (128x128b) block in TMEM.
+            //
+            // Additionally, we have to meet constraints of TMA that the box dimensions are less
+            // than 256 and boxDim[0] is a multiple of 16B.
+            //
+            // The "logical" tensor is:      [outer,        inner / numEltsPerSf]
+            // The aforementioned format is: [⌈outer / 128⌉, inner / 16 * numEltsPerSf),    2048]
+            // The shape we use for TMA is:  [⌈outer / 128⌉, inner / 16 * numEltsPerSf), 8,  256]
+            auto shape
+                = std::vector<uint64_t>{256, 8, static_cast<uint64_t>(tg::ceilDiv(hiddenSize, numEltsPerSf * 16)),
+                    static_cast<uint64_t>(tg::ceilDiv(numTokens, 128))};
+
+            std::vector<uint64_t> stride(shape.size());
+            stride[0] = 1;
+            for (size_t i = 1; i < shape.size(); i++)
+            {
+                stride[i] = shape[i - 1] * stride[i - 1];
+            }
+
+            auto tileShapes = std::vector<uint32_t>{256, 8,
+                static_cast<uint32_t>(tg::ceilDiv(hiddenSizePerTile, numEltsPerSf * 16)),
+                static_cast<uint32_t>(tg::ceilDiv(numTokensPerTile, 128))};
+
+            return std::make_tuple(shape, stride, tileShapes);
+        }
+#endif // TLLM_RUBIN_FEATURES
 
         case tg::SfLayout::R8c4:
         {
@@ -626,48 +554,103 @@ struct KernelParams
         return std::make_tuple(std::vector<uint64_t>{}, std::vector<uint64_t>{}, std::vector<uint32_t>{});
     }
 
+    // Create the TMA shape/stride for the sparsity information of A.
+    template <class GemmOptions>
+    static auto makeTmaShapeStrideSparsityInfoA(GemmOptions const& options)
+    {
+        // Tensor dimensions.
+        auto outerDim = options.mM;
+        auto innerDim = tg::getNumBytesSparsityInfo(options.mSparsityA, options.mK);
+        // Tile dimensions.
+        auto tileOuterDim = options.mTileM;
+        auto tileInnerDim = tg::getNumBytesSparsityInfo(options.mSparsityA, options.mTileK);
+
+        auto shape = std::vector<uint64_t>{static_cast<uint64_t>(innerDim), static_cast<uint64_t>(outerDim)};
+
+        std::vector<uint64_t> stride(shape.size());
+        stride[0] = 1;
+        for (size_t i = 1; i < shape.size(); i++)
+        {
+            stride[i] = shape[i - 1] * stride[i - 1];
+        }
+
+        auto tileShapes = std::vector<int32_t>{static_cast<int32_t>(tileInnerDim), static_cast<int32_t>(tileOuterDim)};
+
+        return std::make_tuple(shape, stride, tileShapes);
+    }
+
     // Setup the kernel parameters.
     template <class GemmOptions_>
     static KernelParams setKernelParams(GemmOptions_ const& options, void const* ptrA, void const* ptrSfA,
         void const* ptrPerTokenSfA, void const* ptrB, void const* ptrSfB, void const* ptrPerTokenSfB,
-        void const* ptrBias, void* ptrC, float const* ptrScaleC, void* ptrSfC, float const* ptrScaleGate,
-        float const* ptrClampLimit, float const* ptrGatedActAlpha, float const* ptrGatedActBeta, float* rowMax,
-        uint32_t* rowMaxBars)
+        [[maybe_unused]] void const* ptrSparsityInfoA, void const* ptrBias, void* ptrC, float const* ptrScaleC,
+        void* ptrSfC,
+#ifdef TLLM_RUBIN_FEATURES
+#ifdef TLLM_TEST
+        void* ptrInvalidate,
+#endif // TLLM_TEST
+#endif // TLLM_RUBIN_FEATURES
+        float const* ptrScaleGate, float const* ptrClampLimit, float const* ptrGatedActAlpha,
+        float const* ptrGatedActBeta, float* rowMax, uint32_t* rowMaxBars)
     {
 
         // Create the return struct.
         KernelParams params;
 
+        // Is A using sparsity?
+        int32_t const isSparseA = tg::isSparse(options.mSparsityA);
+        // Do we pad A or B?
+        bool doPadA = tg::dtypeNeedsPadding(options.mDtypeA, options.mMmaKind, options.mMmaK, isSparseA);
+        bool doPadB = tg::dtypeNeedsPadding(options.mDtypeB, options.mMmaKind, options.mMmaK, isSparseA);
+
         // Shape/stride for gmem tensor A.
         auto [shapeA, strideA, tileShapeA] = makeTmaShapeStrideAbc(options, MatrixType::MatrixA);
         // Build tma descriptor for A.
         params.tmaA
-            = gemmGatedAct::buildNdTmaDescriptor(options.mDtypeA, shapeA, strideA, tileShapeA, const_cast<void*>(ptrA));
+            = gemm::buildNdTmaDescriptor(options.mDtypeA, shapeA, strideA, tileShapeA, const_cast<void*>(ptrA), doPadA,
+                /*doSwizzle=*/true);
 
         // Shape/stride for gmem tensor B.
         auto [shapeB, strideB, tileShapeB] = makeTmaShapeStrideAbc(options, MatrixType::MatrixB);
         // Build tma descriptor for B.
         params.tmaB
-            = gemmGatedAct::buildNdTmaDescriptor(options.mDtypeB, shapeB, strideB, tileShapeB, const_cast<void*>(ptrB));
+            = gemm::buildNdTmaDescriptor(options.mDtypeB, shapeB, strideB, tileShapeB, const_cast<void*>(ptrB), doPadB,
+                /*doSwizzle=*/true);
 
         if (options.mDtypeA == tg::Dtype::E2m1 || options.mDtypeA == tg::Dtype::MxE4m3)
         {
             tg::Dtype const dTypeSf = tg::dtypeGetBlockSfType(options.mDtypeA);
 
+            int32_t const numEltsPerSfA = options.mSfBlockSizeA;
+
             // Build TMA descriptor for gmem A block scaling factors.
-            auto [shapeSfA, strideSfA, tileShapesSfA]
-                = makeTmaShapeStrideSfAb(options, MatrixType::MatrixA, tg::SfLayout::R128c4, options.mSfReshapeFactor);
+            auto [shapeSfA, strideSfA, tileShapesSfA] = makeTmaShapeStrideSfAb(
+                options, MatrixType::MatrixA, options.mSfLayoutA, options.mSfReshapeFactor, numEltsPerSfA);
             params.tmaSfA
                 = gemm::buildSfTmaDescriptor(dTypeSf, shapeSfA, strideSfA, tileShapesSfA, const_cast<void*>(ptrSfA));
         }
         if (options.mDtypeB == tg::Dtype::E2m1 || options.mDtypeB == tg::Dtype::MxE4m3)
         {
             tg::Dtype const dTypeSf = tg::dtypeGetBlockSfType(options.mDtypeB);
+
+            int32_t const numEltsPerSfB = options.mSfBlockSizeB;
+
             // Build TMA descriptor for gmem B block scaling factors.
-            auto [shapeSfB, strideSfB, tileShapesSfB]
-                = makeTmaShapeStrideSfAb(options, MatrixType::MatrixB, options.mSfLayoutB, options.mSfReshapeFactor);
+            auto [shapeSfB, strideSfB, tileShapesSfB] = makeTmaShapeStrideSfAb(
+                options, MatrixType::MatrixB, options.mSfLayoutB, options.mSfReshapeFactor, numEltsPerSfB);
             params.tmaSfB
                 = gemm::buildSfTmaDescriptor(dTypeSf, shapeSfB, strideSfB, tileShapesSfB, const_cast<void*>(ptrSfB));
+        }
+
+        if (isSparseA)
+        {
+            // Build TMA descriptor for gmem A sparsity.
+            auto [shapeSparsityInfoA, strideSparsityInfoA, tileShapesSparsityInfoA]
+                = makeTmaShapeStrideSparsityInfoA(options);
+            params.tmaSparsityInfoA = gemm::buildNdTmaDescriptor(tg::Dtype::UInt8, shapeSparsityInfoA,
+                strideSparsityInfoA, tileShapesSparsityInfoA, const_cast<void*>(ptrSparsityInfoA),
+                /*doPad=*/false,
+                /*doSwizzle=*/true);
         }
 
         if (options.mUseTmaStore)
@@ -675,8 +658,20 @@ struct KernelParams
             // Shape/stride for gmem tensor C.
             auto [shapeC, strideC, tileShapeC] = makeTmaShapeStrideAbc(options, MatrixType::MatrixC);
             // Build tma descriptor for C.
-            params.tmaC = gemmGatedAct::buildNdTmaDescriptor(
-                options.mDtypeC, shapeC, strideC, tileShapeC, const_cast<void*>(ptrC));
+            params.tmaC
+                = gemm::buildNdTmaDescriptor(options.mDtypeC, shapeC, strideC, tileShapeC, const_cast<void*>(ptrC),
+                    /*doPad=*/false);
+#ifdef TLLM_RUBIN_FEATURES
+#ifdef TLLM_TEST
+            if (options.mLamportProducer)
+            {
+                // Build tma descriptor for invalidate.
+                params.tmaInvalidate = gemm::buildNdTmaDescriptor(options.mDtypeC, shapeC, strideC, tileShapeC,
+                    const_cast<void*>(ptrInvalidate),
+                    /*doPad=*/false);
+            }
+#endif // TLLM_TEST
+#endif // TLLM_RUBIN_FEATURES
         }
 
         params.ptrC = ptrC;

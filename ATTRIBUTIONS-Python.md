@@ -48450,7 +48450,7 @@ SOFTWARE.
 
 
 
-## polygraphy (0.49.26)
+## polygraphy (0.53.4)
 
 ### Licenses
 License: `Apache 2.0`
@@ -58023,7 +58023,7 @@ License: `None`
   - `Homepage`: https://github.com/google/sentencepiece
 
 
-## setuptools (79.0.1)
+## setuptools (81.0.0)
 
 ### Licenses
 License: `None`

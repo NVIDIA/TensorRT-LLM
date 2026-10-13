@@ -30,6 +30,7 @@ from ...peft.lora.validation import has_moe_lora_targets
 from ...utils import ActivationType
 from .fused_moe_cute_dsl import CuteDslFusedMoE
 from .fused_moe_cute_dsl_b12x import CuteDslB12xFusedMoE
+from .fused_moe_cute_dsl_fc12 import CuteDslFc12FusedMoE
 from .fused_moe_cutlass import CutlassFusedMoE
 from .fused_moe_deepgemm import DeepGemmFusedMoE
 from .fused_moe_densegemm import DenseGEMMFusedMoE
@@ -68,6 +69,7 @@ IMPL_PRIORITY: Tuple[Type, ...] = (
     MegaMoEDeepGemm,  # ahead of plain CuteDSL / DeepGEMM: better perf when eligible
     MegaMoECuteDsl,
     CuteDslFusedMoE,
+    CuteDslFc12FusedMoE,
     TRTLLMGenFusedMoE,
     DeepGemmFusedMoE,
     DenseGEMMFusedMoE,
@@ -89,6 +91,7 @@ BACKEND_FAMILY: Dict[str, FrozenSet[Type]] = {
     "TRITON": frozenset({TritonFusedMoE}),
     "MEGAMOE_DEEPGEMM": frozenset({MegaMoEDeepGemm}),
     "MEGAMOE_CUTEDSL": frozenset({MegaMoECuteDsl}),
+    "CUTEDSL_FC12": frozenset({CuteDslFc12FusedMoE}),
 }
 
 # Catch table drift at import time.

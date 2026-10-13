@@ -243,6 +243,18 @@ class CUDAGraphRunner:
                 or (self.enable_encoder_decoder_mixed_cuda_graph
                     and self._is_mixed_encoder_decoder_batch(batch)))
 
+    def _gather_adp_graph_batch_info(self, batch: ScheduledRequests,
+                                     can_run_cuda_graph: bool):
+        """Return ``[(can_run_cuda_graph, batch_size)]`` per TP rank.
+
+        One fixed-size exchange, entered by every rank unconditionally.
+        """
+        gathered = self.config.dist.tp_allgather_int64(
+            [bool(can_run_cuda_graph), batch.batch_size])
+        flags = gathered[:, 0].astype(bool).tolist()
+        sizes = gathered[:, 1].tolist()
+        return list(zip(flags, sizes))
+
     def _get_seq_len_mode(
         self,
         batch: ScheduledRequests,
@@ -455,8 +467,8 @@ class CUDAGraphRunner:
         can_run_cuda_graph = self._can_run_cuda_graph_batch(batch)
         batch_size = batch.batch_size
         if self.enabled and self.config.enable_attention_dp and self.config.mapping.tp_size > 1:
-            graph_batch_info = self.config.dist.tp_allgather(
-                [can_run_cuda_graph, batch_size])
+            graph_batch_info = self._gather_adp_graph_batch_info(
+                batch, can_run_cuda_graph)
             all_can_run_cuda_graph = all(rank_info[0]
                                          for rank_info in graph_batch_info)
             all_batch_sizes_equal = all(rank_info[1] == graph_batch_info[0][1]
@@ -553,6 +565,21 @@ class CUDAGraphRunner:
                 spec_metadata._force_non_greedy_for_capture = False
                 cleared += 1
         return cleared
+
+    def clear_capture_only_spec_state_after_capture_pass(self) -> Optional[int]:
+        """Clear capture-only state after the real, non-warmup capture pass.
+
+        The warmup-only pass creates and caches graph metadata that the real
+        capture pass reuses. Clearing its advanced-sampling override after the
+        warmup-only pass would make the real capture record the greedy sampler
+        under the advanced-sampling graph key.
+
+        Returns ``None`` during warmup-only, otherwise the number of cached
+        metadata objects cleared.
+        """
+        if self.is_warmup_only:
+            return None
+        return self.clear_capture_only_spec_state()
 
     def needs_capture(self, key: KeyType):
         return self._capture_allowed and key not in self.graph_outputs
@@ -760,8 +787,8 @@ class CUDAGraphRunner:
         new_batch_size = batch_size
 
         if self.enabled and self.config.enable_attention_dp and self.config.mapping.tp_size > 1:
-            graph_batch_info = self.config.dist.tp_allgather(
-                [can_run_cuda_graph, batch_size])
+            graph_batch_info = self._gather_adp_graph_batch_info(
+                batch, can_run_cuda_graph)
             all_can_run_cuda_graph = all(rank_info[0]
                                          for rank_info in graph_batch_info)
             if all_can_run_cuda_graph:

@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from __future__ import annotations
 
 import enum
@@ -15,6 +30,12 @@ from torch.nn.parameter import Parameter
 import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 from tensorrt_llm._torch.custom_ops.torch_custom_ops import BufferKind
 from tensorrt_llm._torch.peft.lora.layer import LoraLayer, add_lora_result
+from tensorrt_llm._torch.ugpu.layout import (make_bf16_linear_output_layout,
+                                             make_nvfp4_linear_output_layout)
+from tensorrt_llm._torch.ugpu.policy import (DISABLED_PLAN, LinearPartitionPlan,
+                                             UgpuExecutionPlanner, UgpuPolicy)
+from tensorrt_llm._torch.ugpu.runtime import UgpuRuntime
+from tensorrt_llm._torch.ugpu_utils import get_current_ugpu
 from tensorrt_llm._utils import is_device_integrated, mpi_disabled
 from tensorrt_llm.bindings import ipc_nvls_supported
 from tensorrt_llm.functional import (AllReduceFusionOp, AllReduceParams,
@@ -26,13 +47,28 @@ from tensorrt_llm.quantization.functional import \
 from tensorrt_llm.quantization.mode import QuantAlgo
 from tensorrt_llm.quantization.utils.fp8_utils import (
     per_token_quant_and_transform, resmooth_to_fp8_e8m0,
+    transform_k128_scales_to_cutedsl_mxfp8_layout,
     transform_sf_into_required_layout)
 
 from ..._utils import get_sm_version, is_sm_100f
 from ...models.modeling_utils import QuantConfig
+from ..cute_dsl_utils import (IS_CUTLASS_DSL_AVAILABLE,
+                              IS_CUTLASS_DSL_INTERNAL_AVAILABLE)
 from ..utils import (Fp4QuantizedTensor, get_model_extra_attrs,
                      is_nvfp4_marlin_supported_sm,
                      replace_parameter_and_save_metadata, unswizzle_sf)
+from .low_m_gemm import _MAX_M as _LOW_M_GEMM_MAX_M
+from .low_m_gemm import LOW_M_GEMM_ACTIVE, apply_low_m_gemm
+
+
+def _should_apply_low_m_gemm(input: torch.Tensor) -> bool:
+    """Fast pre-filter: check the global enable flag and M upper bound only."""
+    if not LOW_M_GEMM_ACTIVE:
+        return False
+    if input.ndim < 1:
+        return False
+    k = int(input.shape[-1])
+    return k > 0 and input.numel() <= _LOW_M_GEMM_MAX_M * k
 
 
 class WeightMode(str, enum.Enum):
@@ -117,6 +153,47 @@ def _uses_marlin_nvfp4_backend(module) -> bool:
             and hasattr(torch.ops.trtllm, "gptq_marlin_repack"))
 
 
+def _copy_to_new_cuda_allocation(tensor: torch.Tensor) -> torch.Tensor:
+    """Copy ``tensor`` into a fresh contiguous allocation on the current CUDA device.
+
+    The allocation follows the allocator selected by the surrounding context,
+    including ``torch.cuda.use_mem_pool``. Unlike ``contiguous().cuda()``, this
+    always allocates new storage when ``tensor`` is already contiguous and on
+    the current CUDA device.
+    """
+    copied = torch.empty_like(
+        tensor,
+        device="cuda",
+        memory_format=torch.contiguous_format,
+    )
+    copied.copy_(tensor)
+    return copied
+
+
+def split_indice_for_ugpu(tensor: torch.Tensor, indices=None):
+    current_ugpu = get_current_ugpu()
+    if current_ugpu is None:
+        return indices
+    if indices is None:
+        indices = [slice(d) for d in tensor.shape]
+    elif isinstance(indices, slice):
+        # safetensor path passes a single slice — wrap in a per-dim list
+        indices = [indices] + [slice(d) for d in tensor.shape[1:]]
+    elif isinstance(indices, tuple):
+        indices = list(indices)
+    # indices is now a mutable list[slice]
+    n_start = indices[0].start if indices[0].start is not None else 0
+    n_end = indices[0].stop if indices[0].stop is not None else tensor.shape[0]
+    width = n_end - n_start
+    ugpu_count = 2
+    slice_width = math.ceil(width / ugpu_count)
+    n_slice_start = current_ugpu * slice_width
+    n_slice_end = min((current_ugpu + 1) * slice_width, width)
+    n_slice = slice(n_start + n_slice_start, n_start + n_slice_end)
+    indices[0] = n_slice
+    return indices
+
+
 def load_weight_shard(
     weight,
     tensor_parallel_size: int = 1,
@@ -145,6 +222,7 @@ def load_weight_shard(
 
         def maybe_convert_to_torch_tensor(tensor: torch.Tensor,
                                           indices: list[slice] | None = None):
+            indices = split_indice_for_ugpu(tensor, indices)
             if indices is None:
                 # Avoid unnecessary copy
                 result = (tensor.to(device), [slice(d) for d in tensor.shape])
@@ -159,6 +237,7 @@ def load_weight_shard(
 
         def maybe_convert_to_torch_tensor(
             tensor, indices: Union[slice, tuple[slice]] = slice(None)):
+            indices = split_indice_for_ugpu(tensor, indices)
             return tensor[indices].to(device)
     else:
         raise ValueError(f'unsupported weight type: {type(weight)}')
@@ -380,10 +459,23 @@ class LinearMethodBase(ABC):
                        **kwargs):
         raise NotImplementedError
 
+    def quantize(self, module: Linear, input: torch.Tensor):
+        return input
+
     @abstractmethod
     def apply(self, module: Linear, input: torch.Tensor,
               bias: Optional[torch.Tensor], *args, **kwargs):
         raise NotImplementedError
+
+    def create_output_tensor(self, module: Linear,
+                             input: Union[torch.Tensor, Fp4QuantizedTensor,
+                                          tuple]):
+        n = module.out_features
+        output_tensor = torch.empty(input.shape[0],
+                                    n,
+                                    dtype=module.dtype or input.dtype,
+                                    device='cuda')
+        return output_tensor
 
     def apply_linear_allreduce(self, module: Linear, input: torch.Tensor,
                                bias: Optional[torch.Tensor], tp_rank: int,
@@ -516,11 +608,36 @@ class LinearMethodBase(ABC):
 
 
 class UnquantizedLinearMethod(LinearMethodBase):
+    """Linear method for unquantized (BF16 / FP16 / FP32) weights.
+
+    BF16 GEMM dispatch (priority order, Blackwell SM100/SM103)
+    ----------------------------------------------------------
+    1. **low-m GEMM** (``TRTLLM_LOW_M_GEMM_BACKEND=auto``, M ≤ 32)
+       CuTe-DSL low-m GEMM kernel for small-M decode batches on Blackwell.
+       Orthogonal to ``use_cute_dsl_bf16_gemm`` — must be enabled
+       independently via the env var.
+
+    2. **persistent GEMM** (``Linear(use_cute_dsl_bf16_gemm=True)``)
+       ``trtllm::cute_dsl_bf16_gemm_blackwell`` persistent CuTe-DSL kernel.
+
+    3. **cublas_mm** (``Linear(use_custom_cublas_mm=True)``)
+       ``trtllm::cublas_mm``; use when TP AllReduce fuse via NCCL
+       symmetric-memory window is needed (``output_buffer_kind=NCCL_WINDOW``).
+
+    4. **F.linear** (default)
+       PyTorch cuBLASLt; general-purpose fallback for all other cases.
+    """
 
     supports_nccl_symmetric_memory_window_output: ClassVar[bool] = True
 
     def create_weights(self, module: Linear, in_features: int,
                        out_features: int, bias: bool, dtype: torch.dtype):
+        if bias:
+            module.bias = Parameter(torch.empty((out_features), dtype=dtype),
+                                    requires_grad=False)
+        else:
+            module.register_parameter("bias", None)
+
         weight_shape = (out_features, in_features)
         module.weight = Parameter(torch.empty(weight_shape, dtype=dtype),
                                   requires_grad=False)
@@ -535,14 +652,20 @@ class UnquantizedLinearMethod(LinearMethodBase):
             module.inv_kv_scales = Parameter(torch.ones(3, dtype=torch.float32),
                                              requires_grad=False)
 
-        if bias:
-            module.bias = Parameter(torch.empty((out_features), dtype=dtype),
-                                    requires_grad=False)
-        else:
-            module.register_parameter("bias", None)
+        module.rebuild_tensor_metadata = {}
 
     def apply(self, module: Linear, input: torch.Tensor,
               bias: Optional[torch.Tensor]):
+        # The opt-in low-M dispatcher routes to the built-in CuTe-DSL low-m GEMM
+        # kernel and returns None to fall through to the normal GEMM path.
+        # Skip when use_custom_cublas_mm is set: that path may allocate output
+        # in an NCCL symmetric-memory window for TP all-reduce fusion, which
+        # the low-M dispatcher does not support.
+        if _should_apply_low_m_gemm(input) and not getattr(
+                module, "use_custom_cublas_mm", False):
+            output = apply_low_m_gemm(module, input, module.weight, bias)
+            if output is not None:
+                return output
         # CuTe DSL BF16 GEMM path for Blackwell
         if (module.use_cute_dsl_bf16_gemm and is_sm_100f()
                 and module.weight.dtype == torch.bfloat16):
@@ -554,7 +677,10 @@ class UnquantizedLinearMethod(LinearMethodBase):
                                  n,
                                  dtype=torch.bfloat16,
                                  device=input.device)
-            torch.ops.trtllm.cute_dsl_bf16_gemm_blackwell(
+            bf16_gemm_op = (torch.ops.trtllm.cute_dsl_bf16_gemm_rubin
+                            if get_sm_version() == 107 else
+                            torch.ops.trtllm.cute_dsl_bf16_gemm_blackwell)
+            bf16_gemm_op(
                 input_2d.contiguous(),
                 module.weight,
                 output,
@@ -718,7 +844,6 @@ class FP8QDQLinearMethod(UnquantizedLinearMethod):
                  if output_buffer_kind == int(BufferKind.NCCL_WINDOW)
                  and module.mapping is not None else None)
 
-        # This op does not support bias now.
         if module.enable_cuda_core and qinput.shape[0] <= 8:
             # use cuda core for small m dimension
             output = torch.ops.trtllm.cuda_scaled_mm(
@@ -1153,6 +1278,38 @@ class FP8BlockScalesLinearMethod(UnquantizedLinearMethod):
               bias: Optional[torch.Tensor]):
         # fp8_block_scaling_gemm does not support writing into an NCCL window
         # buffer; supports_nccl_symmetric_memory_window_output is False so the window path is bypassed.
+        if isinstance(input, tuple):
+            if len(input) != 2:
+                raise ValueError(
+                    "Pre-quantized FP8 input must contain activation and scale")
+            activation, activation_scale = input
+            sm_version = get_sm_version()
+            uses_cute_dsl_rubin = (activation_scale.dtype == torch.uint8
+                                   and sm_version == 107
+                                   and IS_CUTLASS_DSL_INTERNAL_AVAILABLE
+                                   and (module.use_cute_dsl_blockscaling_mm
+                                        or module.disable_deep_gemm))
+            if uses_cute_dsl_rubin:
+                output = torch.ops.trtllm.cute_dsl_mxfp8_gemm_rubin(
+                    activation, module.weight, activation_scale,
+                    module.weight_scale)
+            elif (activation_scale.dtype == torch.int32 and is_sm_100f()
+                  and not module.disable_deep_gemm):
+                output = torch.ops.trtllm.fp8_prequantized_swap_ab_gemm(
+                    activation,
+                    activation_scale,
+                    module.weight,
+                    module.weight_scale,
+                    disable_ue8m0_cast=True,
+                )
+            else:
+                raise RuntimeError(
+                    "Pre-quantized FP8 scale layout is incompatible with the "
+                    "selected block-scale GEMM backend")
+            if bias is not None:
+                output = output + bias
+            return output
+
         # Handle multi-dimensional inputs (e.g., 3D: batch, seq, hidden)
         # GEMM ops require 2D matrices
         original_shape = input.shape
@@ -1163,27 +1320,39 @@ class FP8BlockScalesLinearMethod(UnquantizedLinearMethod):
             input = input.to(torch.bfloat16) * module.input_scale
         assert input.dtype == torch.bfloat16
 
-        if is_sm_100f():
-            if module.use_cute_dsl_blockscaling_mm or module.disable_deep_gemm:
-                act_input_fp8, act_input_sf = torch.ops.trtllm.fp8_quantize_1x128(
-                    input)
-                output = torch.ops.trtllm.cute_dsl_fp8_gemm_blackwell(
+        sm_version = get_sm_version()
+        uses_cute_dsl = (module.use_cute_dsl_blockscaling_mm
+                         or module.disable_deep_gemm) and (
+                             sm_version in (100, 103) or
+                             (sm_version == 107
+                              and IS_CUTLASS_DSL_INTERNAL_AVAILABLE))
+        if uses_cute_dsl:
+            if sm_version == 107:
+                act_input_fp8, act_input_sf = \
+                    torch.ops.trtllm.fp8_quantize_1x128_packed_ue8m0(input)
+                output = torch.ops.trtllm.cute_dsl_mxfp8_gemm_rubin(
                     act_input_fp8, module.weight, act_input_sf,
                     module.weight_scale)
             else:
-                output = torch.ops.trtllm.fp8_swap_ab_gemm(
-                    input,
-                    module.weight,
-                    module.weight_scale,
-                    disable_ue8m0_cast=True,
-                )
-        elif get_sm_version() == 120:
-            act_input_fp8, act_input_sf = per_token_quant_and_transform(input)
-            output = torch.ops.trtllm.fp8_block_scaling_gemm(
-                act_input_fp8, module.weight, act_input_sf, module.weight_scale)
+                act_input_fp8, act_input_sf = \
+                    torch.ops.trtllm.fp8_quantize_1x128(input)
+                output = torch.ops.trtllm.cute_dsl_fp8_gemm_blackwell(
+                    act_input_fp8, module.weight, act_input_sf,
+                    module.weight_scale)
+        elif is_sm_100f() and not module.disable_deep_gemm:
+            output = torch.ops.trtllm.fp8_swap_ab_gemm(
+                input,
+                module.weight,
+                module.weight_scale,
+                disable_ue8m0_cast=True,
+            )
         else:
-            act_input_fp8, act_input_sf = torch.ops.trtllm.fp8_quantize_1x128(
-                input)
+            if sm_version == 120:
+                act_input_fp8, act_input_sf = per_token_quant_and_transform(
+                    input)
+            else:
+                act_input_fp8, act_input_sf = torch.ops.trtllm.fp8_quantize_1x128(
+                    input)
             output = torch.ops.trtllm.fp8_block_scaling_gemm(
                 act_input_fp8, module.weight, act_input_sf, module.weight_scale)
 
@@ -1305,10 +1474,32 @@ class FP8BlockScalesLinearMethod(UnquantizedLinearMethod):
 
     def transform_weights(self, module: Linear) -> None:
         super().transform_weights(module)
+        sm_version = get_sm_version()
+        # CuTe DSL FP8 GEMM consumes raw block scales. The other SM100-family
+        # path uses fp8_swap_ab_gemm and requires the e8m0 layout transform.
+        uses_cute_dsl = (module.use_cute_dsl_blockscaling_mm
+                         or module.disable_deep_gemm) and (
+                             sm_version in (100, 103) or
+                             (sm_version == 107
+                              and IS_CUTLASS_DSL_INTERNAL_AVAILABLE))
+        if uses_cute_dsl and sm_version == 107:
+            weight, weight_scale = resmooth_to_fp8_e8m0(module.weight,
+                                                        module.weight_scale)
+            transformed_scale = \
+                transform_k128_scales_to_cutedsl_mxfp8_layout(
+                    weight_scale, mn=weight.shape[0], k=weight.shape[1])
+            replace_parameter_and_save_metadata(
+                module, "weight", nn.Parameter(weight, requires_grad=False),
+                module.rebuild_tensor_metadata)
+            replace_parameter_and_save_metadata(
+                module, "weight_scale",
+                nn.Parameter(transformed_scale, requires_grad=False),
+                module.rebuild_tensor_metadata)
+            return
         use_deep_gemm_layout = (
             is_sm_100f()
             and not (module.use_cute_dsl_blockscaling_mm
-                     or module.disable_deep_gemm)) or get_sm_version() == 120
+                     or module.disable_deep_gemm)) or sm_version == 120
         use_indexer_q_cutedsl_layout = (use_deep_gemm_layout and getattr(
             module, "use_indexer_q_cutedsl_fusion", False))
         if use_deep_gemm_layout or use_indexer_q_cutedsl_layout:
@@ -1374,12 +1565,22 @@ class NVFP4LinearMethod(LinearMethodBase):
 
     def create_weights(self, module: Linear, in_features: int,
                        out_features: int, bias: bool, dtype: torch.dtype):
+        device = 'cuda' if get_current_ugpu() is not None else None
         module.scaling_vector_size = 16
         assert in_features % module.scaling_vector_size == 0, f"in_features {in_features} must be divisible by scaling_vector_size {module.scaling_vector_size}"
 
+        if bias:
+            module.bias = Parameter(torch.empty((out_features),
+                                                dtype=dtype,
+                                                device=device),
+                                    requires_grad=False)
+        else:
+            module.register_parameter("bias", None)
+
         # Quantized weights
         module.weight = Parameter(torch.empty([out_features, in_features // 2],
-                                              dtype=fp4_utils.float4_e2m1x2),
+                                              dtype=fp4_utils.float4_e2m1x2,
+                                              device=device),
                                   requires_grad=False)
 
         # FP8 per-block scaling factors. dtype must be aligned with SF_DTYPE
@@ -1387,18 +1588,23 @@ class NVFP4LinearMethod(LinearMethodBase):
         nrows = fp4_utils.pad_up(out_features, 128)
         ncols = fp4_utils.pad_up(in_features // module.scaling_vector_size, 4)
         module.weight_scale = Parameter(torch.empty(
-            [nrows * ncols], dtype=fp4_utils.float4_sf_dtype),
+            [nrows * ncols], dtype=fp4_utils.float4_sf_dtype, device=device),
                                         requires_grad=False)
 
         # FP32 per-tensor global scaling factor = 448*6/amax_input
-        module.input_scale = Parameter(torch.empty([1], dtype=torch.float32),
+        module.input_scale = Parameter(torch.empty([1],
+                                                   dtype=torch.float32,
+                                                   device=device),
                                        requires_grad=False)
         module.inv_input_scale = Parameter(torch.empty([1],
-                                                       dtype=torch.float32),
+                                                       dtype=torch.float32,
+                                                       device=device),
                                            requires_grad=False)
 
         # (amax_input * amax_weight) / (448*6 * 448*6)
-        module.alpha = Parameter(torch.empty([1], dtype=torch.float32),
+        module.alpha = Parameter(torch.empty([1],
+                                             dtype=torch.float32,
+                                             device=device),
                                  requires_grad=False)
 
         # Global weight scale: amax_weight / (448*6)
@@ -1407,21 +1613,45 @@ class NVFP4LinearMethod(LinearMethodBase):
                                           requires_grad=False)
 
         # K, V scales for NVFP4 KV cache
-        module.kv_scales = Parameter(torch.ones(3, dtype=torch.float32),
+        module.kv_scales = Parameter(torch.ones(3,
+                                                dtype=torch.float32,
+                                                device=device),
                                      requires_grad=False)
         # Inverse K, V scales for NVFP4 KV cache
-        module.inv_kv_scales = Parameter(torch.ones(3, dtype=torch.float32),
+        module.inv_kv_scales = Parameter(torch.ones(3,
+                                                    dtype=torch.float32,
+                                                    device=device),
                                          requires_grad=False)
 
         # NOTE: Not in all linear we have this tensor - pre_quant_scale is computed as an average and merged with the
         # LayerNorm for QKV and Gate/Up projection layers when possible. we can see the tensor only for o_proj and down_proj
         module.pre_quant_scale = None
 
-        if bias:
-            module.bias = Parameter(torch.empty((out_features), dtype=dtype),
-                                    requires_grad=False)
+    def create_output_tensor(self, module: Linear,
+                             input: Union[torch.Tensor, Fp4QuantizedTensor,
+                                          tuple]):
+        n = module.out_features
+        if isinstance(input, Fp4QuantizedTensor):
+            m = input.fp4_tensor.shape[0]
+        elif isinstance(input, tuple):
+            m = input[0].shape[0]
         else:
-            module.register_parameter("bias", None)
+            m = input.shape[0]
+        output_tensor = torch.empty(m,
+                                    n,
+                                    dtype=module.dtype or input.dtype,
+                                    device='cuda')
+        return output_tensor
+
+    def quantize(self, module: Linear, input: torch.Tensor):
+        if isinstance(input, Fp4QuantizedTensor):
+            return input
+        elif isinstance(input, tuple):
+            act_fp4, act_sf = input
+        else:
+            act_fp4, act_sf = torch.ops.trtllm.fp4_quantize(
+                input, module.input_scale, module.scaling_vector_size, False)
+        return Fp4QuantizedTensor(act_fp4, act_sf)
 
     def _input_prepare(self, module: Linear, input: torch.Tensor):
         """Quantize input tensor to FP4 format.
@@ -1478,8 +1708,14 @@ class NVFP4LinearMethod(LinearMethodBase):
                     input, input_scale, module.scaling_vector_size, False)
             return act_fp4, act_sf, alpha
 
-    def apply(self, module: Linear, input: torch.Tensor,
-              bias: Optional[torch.Tensor]):
+    def apply(
+        self,
+        module: Linear,
+        input: torch.Tensor,
+        bias: Optional[torch.Tensor],
+        output_tensor: Optional[torch.Tensor] = None,
+        partition_id: int = -1,
+    ):
         # Handle multi-dimensional inputs (e.g., 3D: batch, seq, hidden).
         # GEMM requires 2D. Fp4QuantizedTensor from fused LayerNorm paths may
         # arrive as 3D [B, S, D/8] — flatten fp4_tensor and restore after.
@@ -1523,22 +1759,41 @@ class NVFP4LinearMethod(LinearMethodBase):
                  and module.mapping is not None else None)
         # Fuse bias inside the GEMM op when N is unpadded and the output is a
         # plain buffer; otherwise fall back to post-op `out + bias` below.
-        fuse_bias_in_gemm = (bias is not None and not use_marlin
+        fuse_bias_in_gemm = (output_tensor is None and bias is not None
+                             and not use_marlin
                              and output_buffer_kind == int(BufferKind.DEFAULT)
                              and module.weight.shape[0] == module.out_features)
-        output = torch.ops.trtllm.nvfp4_gemm(
-            act_fp4,
-            module.weight,
-            act_sf,
-            module.weight_scale,
-            alpha,
-            module.dtype,
-            output_buffer_kind=output_buffer_kind,
-            allowed_backends=allowed_backends_str,
-            group=group,
-            bias=bias if fuse_bias_in_gemm else None)
+        # uGPU path: write directly into pre-allocated output.
+        if output_tensor is not None:
+            if partition_id < 0 or partition_id >= 2:
+                raise ValueError(
+                    "partition_id must be 0 or 1 when output_tensor is provided."
+                )
+            assert 'cutedsl' in module.nvfp4_allowed_backends
+            allowed_backends_str = 'cutedsl'
+            torch.ops.trtllm.nvfp4_gemm_inplace(act_fp4, module.weight, act_sf,
+                                                module.weight_scale, alpha,
+                                                module.dtype, False,
+                                                allowed_backends_str,
+                                                output_tensor, partition_id)
+            output = output_tensor[:, partition_id *
+                                   module.out_features:(partition_id + 1) *
+                                   module.out_features]
+        else:
+            output = torch.ops.trtllm.nvfp4_gemm(
+                act_fp4,
+                module.weight,
+                act_sf,
+                module.weight_scale,
+                alpha,
+                module.dtype,
+                output_buffer_kind=output_buffer_kind,
+                allowed_backends=allowed_backends_str,
+                group=group,
+                bias=bias if fuse_bias_in_gemm else None)
+
         # Take the dim of out_features if padded. Make sure the output is contiguous
-        if output.shape[-1] > module.out_features:
+        if output_tensor is None and output.shape[-1] > module.out_features:
             output = output[..., :module.out_features].contiguous()
 
         if original_shape is not None:
@@ -1903,7 +2158,7 @@ class NVFP4LinearMethod(LinearMethodBase):
         # interleaves in 64-row groups to match the kernel layout.
         #
         # Weight scales are similarly unswizzled, interleaved, and re-swizzled.
-        if not module.use_cute_dsl_blockscaling_mm:
+        if not module.can_use_cute_dsl_nvfp4_swiglu_blackwell():
             return
 
         group_size = 64
@@ -3347,6 +3602,7 @@ class Linear(nn.Module):
         allreduce_strategy: AllReduceStrategy = AllReduceStrategy.AUTO,
         force_dynamic_quantization: bool = False,
         use_cute_dsl_blockscaling_mm: bool = False,
+        use_cute_dsl_nvfp4_swiglu_blackwell: bool = False,
         disable_deep_gemm: bool = False,
         fused_weight_shard_indices_mapping: Optional[dict] = None,
         nvfp4_allowed_backends: Optional[List[str]] = None,
@@ -3354,9 +3610,14 @@ class Linear(nn.Module):
         override_tp_sharding: Optional[Union[tuple[int, int],
                                              Dict[str, tuple[int,
                                                              int]]]] = None,
+        ugpu_policy: Optional[UgpuPolicy] = None,
+        enable_ugpu_bf16_linear: bool = False,
     ):
         """
         Args:
+            use_cute_dsl_nvfp4_swiglu_blackwell: Allow this fused gate/up
+                projection to use the Blackwell-only NVFP4 GEMM + SwiGLU
+                kernel and its required interleaved weight layout.
             nvfp4_allowed_backends: List of backends to consider for NVFP4 GEMM auto-selection.
                 Default (via config): ['cutlass', 'cublaslt', 'cuda_core'] - excludes cutedsl for faster build.
                 Add 'cutedsl' for extreme performance at the cost of longer build time.
@@ -3381,6 +3642,8 @@ class Linear(nn.Module):
         self.gather_output = gather_output
         self.force_dynamic_quantization = force_dynamic_quantization
         self.use_cute_dsl_blockscaling_mm = use_cute_dsl_blockscaling_mm
+        self.use_cute_dsl_nvfp4_swiglu_blackwell = \
+            use_cute_dsl_nvfp4_swiglu_blackwell
         self.disable_deep_gemm = disable_deep_gemm
         self.fused_weight_shard_indices_mapping = fused_weight_shard_indices_mapping
         # Store NVFP4 GEMM allowed backends configuration
@@ -3391,9 +3654,9 @@ class Linear(nn.Module):
                 nvfp4_allowed_backends = model_attrs.get(
                     'nvfp4_gemm_allowed_backends')
         # Default: exclude cutedsl for faster build time
-        self.nvfp4_allowed_backends = nvfp4_allowed_backends or [
-            'cutlass', 'cublaslt', 'cuda_core'
-        ]
+        if nvfp4_allowed_backends is None:
+            nvfp4_allowed_backends = ['cutlass', 'cublaslt', 'cuda_core']
+        self.nvfp4_allowed_backends = list(nvfp4_allowed_backends)
 
         if self.tp_mode not in (TensorParallelMode.ROW,
                                 TensorParallelMode.COLUMN, None):
@@ -3469,28 +3732,11 @@ class Linear(nn.Module):
         self.reduce_output = reduce_output
         self.use_custom_cublas_mm = use_custom_cublas_mm
         self.use_cute_dsl_bf16_gemm = use_cute_dsl_bf16_gemm
+        self.enable_ugpu_bf16_linear = enable_ugpu_bf16_linear
         self.lora = lora
 
-        mpi_enabled = not mpi_disabled()
-        dtype_supported = self.dtype in (torch.float16, torch.bfloat16)
-        in_features_aligned = self.in_features % 128 == 0
-        out_features_aligned = self.out_features % 64 == 0
-        tp_valid = self.tp_mode is not None and self.tp_mode == TensorParallelMode.ROW and self.tp_size > 1
-        quant_valid = quant_config_has_nvfp4_activation_quantization(
-            self.quant_config)
-
-        device_supported = get_sm_version() >= 100
-        enable_gemm_allreduce_fusion_env = (os.environ.get(
-            "TRTLLM_GEMM_ALLREDUCE_FUSION_ENABLED", "0") == "1")
-
-        self.use_fused_gemm_allreduce = all([
-            self.reduce_output, mpi_enabled, dtype_supported,
-            in_features_aligned, out_features_aligned, tp_valid, quant_valid,
-            device_supported, enable_gemm_allreduce_fusion,
-            enable_gemm_allreduce_fusion_env
-        ])
-        if self.use_fused_gemm_allreduce:
-            self.use_fused_gemm_allreduce = ipc_nvls_supported()
+        self._enable_gemm_allreduce_fusion = enable_gemm_allreduce_fusion
+        self.use_fused_gemm_allreduce = False
 
         self.enable_cuda_core = False
         if torch.cuda.is_available():
@@ -3498,6 +3744,23 @@ class Linear(nn.Module):
                 torch.device('cuda:0'))
             # enable cuda core for sm89, sm120, and sm121
             self.enable_cuda_core = capability in ((8, 9), (12, 0), (12, 1))
+
+        # --- uGPU Policy/Layout/Runtime architecture ---
+        if ugpu_policy is None:
+            model_attrs = get_model_extra_attrs()
+            if model_attrs:
+                ugpu_policy = model_attrs.get("ugpu_policy")
+        self._ugpu_policy = (ugpu_policy
+                             if ugpu_policy is not None else UgpuPolicy())
+        # The final per-layer quantization config is applied after module
+        # construction. Plan at create_weights(), alongside quant_method and
+        # the final weight schema, so layerwise overrides cannot leave stale
+        # uGPU state behind.
+        self.partition_plan = DISABLED_PLAN
+        self._ugpu_runtime = None
+        self._ugpu_weight_shards = None
+        self._ugpu_added_cutedsl_backend = False
+        self._ugpu_planned_quant_config = None
 
         if not skip_create_weights_in_init:
             self.create_weights()
@@ -3679,7 +3942,89 @@ class Linear(nn.Module):
         slice_obj[split_dim] = slice(slice_start, slice_end)
         return maybe_convert_to_torch_tensor(weight, tuple(slice_obj))
 
+    def _refresh_fused_gemm_allreduce(self) -> None:
+        """Recompute the fused GEMM/all-reduce gate from final quantization."""
+        layer_quant_mode = getattr(self.quant_config, "layer_quant_mode", None)
+        quant_valid = (layer_quant_mode is not None
+                       and layer_quant_mode.has_nvfp4())
+        enabled = all([
+            self.reduce_output,
+            not mpi_disabled(),
+            self.dtype in (torch.float16, torch.bfloat16),
+            self.in_features % 128 == 0,
+            self.out_features % 64 == 0,
+            self.tp_mode == TensorParallelMode.ROW,
+            self.tp_size > 1,
+            quant_valid,
+            get_sm_version() >= 100,
+            self._enable_gemm_allreduce_fusion,
+            os.environ.get("TRTLLM_GEMM_ALLREDUCE_FUSION_ENABLED", "0") == "1",
+        ])
+        self.use_fused_gemm_allreduce = enabled and ipc_nvls_supported()
+
+    def _replan_ugpu(self) -> None:
+        """Plan uGPU execution from the final effective Linear config."""
+        if self._weights_created:
+            raise RuntimeError(
+                "Cannot replan uGPU Linear while its weight schema is live; "
+                "reset and recreate the module weights after changing "
+                "quantization.")
+        if self._ugpu_weight_shards is not None:
+            raise RuntimeError(
+                "Cannot replan uGPU Linear after localized weight shards were "
+                "created; reload the module weights before changing its "
+                "quantization or uGPU policy.")
+
+        planner = UgpuExecutionPlanner(self._ugpu_policy)
+        plan = planner.plan_linear(
+            self.in_features,
+            self.out_features,
+            self.quant_config,
+            self.weights_loading_config.weight_mode,
+            dtype=self.dtype,
+            use_cute_dsl_bf16_gemm=self.use_cute_dsl_bf16_gemm,
+            enable_ugpu_bf16_linear=self.enable_ugpu_bf16_linear,
+        )
+        if (plan.enabled and self.weights_loading_config.weight_mode
+                == WeightMode.FUSED_GATE_UP_LINEAR):
+            half_n = self.out_features // 2
+            expected_mapping = {
+                "gate": (0, half_n),
+                "up": (half_n, half_n),
+            }
+            if self.fused_weight_shard_indices_mapping != expected_mapping:
+                plan = LinearPartitionPlan(
+                    enabled=False,
+                    reason_if_disabled=(
+                        "uGPU fused gate/up Linear requires canonical "
+                        "[gate | up] shard mapping"),
+                )
+
+        if self._ugpu_added_cutedsl_backend:
+            self.nvfp4_allowed_backends.remove("cutedsl")
+            self._ugpu_added_cutedsl_backend = False
+        if (plan.enabled and plan.op_kind == "nvfp4_linear"
+                and "cutedsl" not in self.nvfp4_allowed_backends):
+            self.nvfp4_allowed_backends.append("cutedsl")
+            self._ugpu_added_cutedsl_backend = True
+
+        self.partition_plan = plan
+        self._ugpu_runtime = (UgpuRuntime(plan.num_partitions)
+                              if plan.enabled else None)
+        self._ugpu_planned_quant_config = self.quant_config
+        self._refresh_fused_gemm_allreduce()
+
     def create_weights(self):
+        if self._weights_created:
+            if self.quant_config is not self._ugpu_planned_quant_config:
+                raise RuntimeError(
+                    "Linear quant_config changed after weights were created; "
+                    "reset _weights_created and recreate the weight schema.")
+            return
+        self._replan_ugpu()
+        self.create_weights_impl()
+
+    def create_weights_impl(self):
         if self._weights_created:
             return
 
@@ -3728,6 +4073,19 @@ class Linear(nn.Module):
         assert self._weights_created
         return self.quant_config is not None and self.quant_config.layer_quant_mode.has_nvfp4(
         )
+
+    def can_use_cute_dsl_nvfp4_swiglu_blackwell(self) -> bool:
+        """Return whether this layer can use the Blackwell NVFP4 SwiGLU op.
+
+        Keep this predicate shared by weight transformation and forward
+        dispatch so a fallback backend never consumes the fused layout.
+        """
+        return (self.use_cute_dsl_nvfp4_swiglu_blackwell
+                and self.use_cute_dsl_blockscaling_mm
+                and IS_CUTLASS_DSL_AVAILABLE
+                and self.has_nvfp4_activation_quantization
+                and get_sm_version() in (100, 103) and not self.has_bias
+                and not self.partition_plan.enabled)
 
     @property
     def has_nvfp4_activation_quantization(self):
@@ -3781,12 +4139,138 @@ class Linear(nn.Module):
                      input,
                      bias,
                      lora_params: Optional[dict] | None = None,
-                     layer_idx: Optional[int] | None = None):
-        output = self.quant_method.apply(self, input, bias)
+                     layer_idx: Optional[int] | None = None,
+                     output_tensor: Optional[torch.Tensor] = None):
+        if self._ugpu_weight_shards is not None:
+            output = self._run_linear_ugpu(input, bias)
+        else:
+            output = self.quant_method.apply(self, input, bias)
+
         if self.lora is not None and bool(lora_params):
             lora_result = self.lora(input, lora_params, layer_idx)
             output = add_lora_result(output, lora_result)
         return output
+
+    def _run_linear_ugpu(self, input, bias):
+        if self.partition_plan.op_kind == "nvfp4_linear":
+            return self._run_nvfp4_linear_ugpu(input, bias)
+        if self.partition_plan.op_kind == "bf16_linear":
+            return self._run_bf16_linear_ugpu(input, bias)
+        raise RuntimeError(
+            f"Unsupported uGPU Linear operation: {self.partition_plan.op_kind}")
+
+    def _run_nvfp4_linear_ugpu(self, input, bias):
+        """Execute a partitioned linear across both uGPU partitions.
+
+        The composite CuTe DSL op tunes with both partitions active, then
+        launches the same tactic on both partition streams. Each kernel writes
+        directly into its slice of a shared, strided output buffer.
+
+        Args:
+            bias: Caller-controlled bias. None means skip bias (e.g. ROW
+                  parallel tp_rank > 0, or fused into allreduce).
+        """
+        shards = self._ugpu_weight_shards
+        layout = self.partition_plan.layout
+        assert layout is not None, "uGPU Linear requires partition layout metadata"
+        num_p = layout.num_partitions
+        assert num_p == 2, "uGPU Linear requires exactly two partitions"
+        n = layout.logical_axis_extent
+
+        # Handle multi-dimensional inputs (e.g., 3D: batch, seq, hidden)
+        original_shape = None
+        if isinstance(input, Fp4QuantizedTensor) and input.fp4_tensor.dim() > 2:
+            original_shape = input.fp4_tensor.shape
+            input = Fp4QuantizedTensor(
+                fp4_tensor=input.fp4_tensor.reshape(-1,
+                                                    input.fp4_tensor.shape[-1]),
+                scaling_factor=input.scaling_factor,
+                is_sf_swizzled=input.is_sf_swizzled,
+                unquantized_hidden_states=input.unquantized_hidden_states,
+            )
+        elif isinstance(input, tuple) and input[0].dim() > 2:
+            original_shape = input[0].shape
+            input = (
+                input[0].reshape(-1, input[0].shape[-1]),
+                input[1],
+            )
+        elif not isinstance(input,
+                            (tuple, Fp4QuantizedTensor)) and input.dim() > 2:
+            original_shape = input.shape
+            input = input.reshape(-1, input.shape[-1])
+
+        # Quantize input once (shared across partitions)
+        act_fp4, act_sf, alpha = self.quant_method._input_prepare(self, input)
+        m = act_fp4.shape[0]
+
+        # Each shard's N may be padded beyond out_features / num_partitions.
+        shard_n = layout.per_partition_axis_extent(padded=True)
+        assert shards[0]['weight'].size(0) == shard_n
+        full_n = layout.padded_axis_extent
+
+        # Output buffer: full_n to accommodate padding, truncated at the end
+        output = torch.empty(m, full_n, dtype=self.dtype, device=act_fp4.device)
+
+        torch.ops.trtllm.cute_dsl_nvfp4_gemm_ugpu_inplace_rubin(
+            act_fp4,
+            shards[0]['weight'],
+            shards[1]['weight'],
+            act_sf,
+            shards[0]['weight_scale'],
+            shards[1]['weight_scale'],
+            alpha,
+            self.dtype,
+            False,
+            True,
+            output,
+        )
+
+        # Truncate padded columns if needed
+        if full_n > n:
+            output = output[:, :n].contiguous()
+
+        if bias is not None:
+            output.add_(bias)
+
+        if original_shape is not None:
+            output = output.reshape(*original_shape[:-1], output.shape[-1])
+
+        return output
+
+    def _run_bf16_linear_ugpu(
+        self,
+        input: torch.Tensor,
+        bias: Optional[torch.Tensor],
+        *,
+        output_dtype: torch.dtype = torch.bfloat16,
+    ) -> torch.Tensor:
+        """Execute a BF16 Linear with output-N split across two uGPUs."""
+        shards = self._ugpu_weight_shards
+        layout = self.partition_plan.layout
+        assert shards is not None
+        assert layout is not None, "uGPU BF16 Linear requires layout metadata"
+        assert layout.num_partitions == 2
+        assert input.dtype == torch.bfloat16
+
+        original_shape = input.shape
+        input_2d = input.reshape(-1, input.shape[-1]).contiguous()
+        output = torch.empty(
+            input_2d.shape[0],
+            layout.logical_axis_extent,
+            dtype=output_dtype,
+            device=input.device,
+        )
+        if input_2d.shape[0] > 0:
+            torch.ops.trtllm.cute_dsl_bf16_gemm_ugpu_inplace_rubin(
+                input_2d,
+                shards[0]["weight"],
+                shards[1]["weight"],
+                output,
+                True,
+            )
+        if bias is not None:
+            output.add_(bias)
+        return output.reshape(*original_shape[:-1], output.shape[-1])
 
     def apply_linear_allreduce(self,
                                input,
@@ -3822,7 +4306,14 @@ class Linear(nn.Module):
         layer_idx: Optional[int] = None,
     ) -> torch.Tensor:
         if self.tp_mode == TensorParallelMode.ROW:
-            use_fused_gemm_allreduce = self.use_fused_gemm_allreduce and lora_params is None
+            use_ugpu = self.partition_plan.enabled
+            # The fused GEMM-allreduce and NCCL-window GEMM paths consume the
+            # module's full weight tensors. uGPU releases those tensors after
+            # creating localized shards, so ROW-TP must first run the
+            # shard-aware GEMM and then all-reduce its partial output.
+            use_fused_gemm_allreduce = (not use_ugpu
+                                        and self.use_fused_gemm_allreduce
+                                        and lora_params is None)
             if use_fused_gemm_allreduce and all_reduce_params is not None:
                 use_fused_gemm_allreduce = all_reduce_params.enable_allreduce and all_reduce_params.fusion_op == AllReduceFusionOp.NONE
 
@@ -3841,7 +4332,8 @@ class Linear(nn.Module):
                     # (ClassVar); a failed window allocation falls back gracefully
                     # inside the C++ allocate_output.
                     use_nccl_symmetric_memory_window = (
-                        self.all_reduce is not None and self.quant_method.
+                        not use_ugpu and self.all_reduce is not None
+                        and self.quant_method.
                         supports_nccl_symmetric_memory_window_output
                         and self.all_reduce.uses_nccl_symmetric_memory_window()
                         and not (self.lora is not None and lora_params))
@@ -3899,13 +4391,164 @@ class Linear(nn.Module):
         self._weights_transformed = True
 
     def post_load_weights(self) -> None:
+        if self._ugpu_weight_shards is not None:
+            return
         self.transform_weights()
+        if self._ugpu_runtime is not None:
+            shards = self._split_weights_for_ugpu()
+            self._ugpu_runtime.prepare_for_capture(self.partition_plan)
+            self._ugpu_weight_shards = shards
+            self._save_ugpu_reload_metadata()
+            # Free full weights — shards on localized memory are the source of
+            # truth now. Keep bias because forward() uses it to preserve the
+            # module's logical bias contract and to support fused allreduce bias.
+            self.weight = Parameter(self.weight.new_empty(0),
+                                    requires_grad=False)
+            if self.partition_plan.op_kind == "nvfp4_linear":
+                self.weight_scale = Parameter(self.weight_scale.new_empty(0),
+                                              requires_grad=False)
+
+    def _save_ugpu_reload_metadata(self) -> None:
+        """Keep only the original schemas needed to rebuild released weights."""
+        parameter_names = ["weight"]
+        if self.partition_plan.op_kind == "nvfp4_linear":
+            parameter_names.append("weight_scale")
+
+        for parameter_name in parameter_names:
+            metadata = self.rebuild_tensor_metadata.get(parameter_name)
+            if metadata is None:
+                meta_tensor = getattr(self, parameter_name).to("meta")
+            else:
+                meta_tensor = metadata["meta"]
+            # Do not retain metadata["param"]: it aliases the transformed full
+            # weight and would defeat releasing it after localization.
+            self.rebuild_tensor_metadata[parameter_name] = {"meta": meta_tensor}
+
+    def _split_weights_for_ugpu(self):
+        if self.partition_plan.op_kind == "nvfp4_linear":
+            return self._split_nvfp4_weights_for_ugpu()
+        if self.partition_plan.op_kind == "bf16_linear":
+            return self._split_bf16_weights_for_ugpu()
+        raise RuntimeError(
+            f"Unsupported uGPU Linear operation: {self.partition_plan.op_kind}")
+
+    def _split_nvfp4_weights_for_ugpu(self):
+        """Split full-N weights into per-partition shards on localized memory.
+
+        Called after normal load + post_load so weight/weight_scale are final
+        (including padding and interleaving).
+
+        Weight (dim=0 is N, may be padded): split along dim=0.
+        Weight_scale: unswizzle to 2D → split unpadded rows → re-swizzle each
+            partition (swizzle_sf handles per-partition padding internally).
+        """
+        num_p = self.partition_plan.num_partitions
+        layout = make_nvfp4_linear_output_layout(
+            self.out_features,
+            self.in_features,
+            num_p,
+            padded_out_features=self.weight.size(0),
+        )
+
+        # Validate padding split invariant: splitting the full weight evenly
+        # must not introduce per-partition padding gaps in the output layout.
+        layout_reason = layout.disabled_reason_for_padding_free_split()
+        assert layout_reason is None, layout_reason
+        assert self.partition_plan.layout == layout, (
+            f"Runtime layout {layout} does not match planner layout "
+            f"{self.partition_plan.layout}")
+        if (self.weights_loading_config.weight_mode ==
+                WeightMode.FUSED_GATE_UP_LINEAR):
+            half_n = self.out_features // 2
+            assert self.fused_weight_shard_indices_mapping == {
+                "gate": (0, half_n),
+                "up": (half_n, half_n),
+            }, ("uGPU fused gate/up Linear requires canonical [gate | up] "
+                "row layout")
+
+        # Unswizzle weight_scale to 2D, split unpadded N rows, re-swizzle.
+        # We split on unpadded rows because the swizzle pattern is not simply
+        # splittable; re-swizzle handles per-partition padding internally.
+        sv = self.scaling_vector_size
+        scale_rows = fp4_utils.pad_up(self.out_features, 128)
+        ws_unswizzled = unswizzle_sf(
+            self.weight_scale.data,
+            scale_rows,
+            self.in_features,
+            sv,
+        )
+
+        shards = []
+        for pid in range(num_p):
+            padded_slice = layout.partition_axis_slice(pid, padded=True)
+            logical_slice = layout.partition_axis_slice(pid, padded=False)
+            with self._ugpu_runtime.partition_weight_context(pid):
+                ws_part = ws_unswizzled[logical_slice].contiguous()
+                # The interleave op creates its output while the partition's
+                # localized memory pool is active.
+                ws_part_swizzled = torch.ops.trtllm.block_scale_interleave(
+                    ws_part.unsqueeze(0))
+                shard = {
+                    'weight':
+                    _copy_to_new_cuda_allocation(self.weight[padded_slice]),
+                    'weight_scale':
+                    ws_part_swizzled,
+                }
+                shards.append(shard)
+        return shards
+
+    def _split_bf16_weights_for_ugpu(self):
+        """Split BF16 output rows into fresh allocations in localized pools."""
+        assert self._ugpu_runtime is not None
+        assert self.weight.dtype == torch.bfloat16
+        layout = make_bf16_linear_output_layout(
+            self.out_features,
+            self.in_features,
+            self.partition_plan.num_partitions,
+        )
+        layout_reason = layout.disabled_reason_for_padding_free_split()
+        assert layout_reason is None, layout_reason
+        assert self.partition_plan.layout == layout, (
+            f"Runtime layout {layout} does not match planner layout "
+            f"{self.partition_plan.layout}")
+        assert tuple(self.weight.shape) == layout.logical_shape
+        if (self.weights_loading_config.weight_mode ==
+                WeightMode.FUSED_GATE_UP_LINEAR):
+            half_n = self.out_features // 2
+            assert self.fused_weight_shard_indices_mapping == {
+                "gate": (0, half_n),
+                "up": (half_n, half_n),
+            }, ("uGPU BF16 fused gate/up Linear requires canonical "
+                "[gate | up] row layout")
+
+        shards = []
+        for partition_id in range(layout.num_partitions):
+            weight_slice = layout.partition_axis_slice(partition_id,
+                                                       padded=False)
+            with self._ugpu_runtime.partition_weight_context(partition_id):
+                shards.append({
+                    "weight":
+                    _copy_to_new_cuda_allocation(self.weight[weight_slice])
+                })
+        return shards
 
     def pre_reload_weights(self):
         assert hasattr(
             self.quant_method, "pre_reload_weights"
         ), "pre_reload_weights is not supported for this quant method"
+        had_ugpu_shards = self._ugpu_weight_shards is not None
+        if had_ugpu_shards:
+            # Drop localized sources before allocating the full reload schema.
+            # post_load_weights() will rebuild the localized shards after the
+            # new weights have been loaded and transformed.
+            self._ugpu_weight_shards = None
         self.quant_method.pre_reload_weights(self)
+        if had_ugpu_shards:
+            # transform_weights() must treat the new full parameters as the
+            # first generation. In particular, padding transforms populate
+            # fresh reusable metadata instead of referencing released tensors.
+            self.rebuild_tensor_metadata = {}
+            self._weights_transformed = False
 
 
 def is_static_nvfp4_input_eligible(linear) -> bool:

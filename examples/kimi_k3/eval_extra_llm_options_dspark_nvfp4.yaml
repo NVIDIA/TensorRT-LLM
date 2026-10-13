@@ -1,0 +1,68 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# DSpark evaluation config for the NVFP4 export (nvidia/kimi-k3-nvfp4).
+# Pass with run_gsm8k_al_kimi_k3.sbatch --config.
+#
+# DFlash / DSpark speculative-decoding evaluation config. Identical to
+# eval_extra_llm_options.yaml except for the DFlash-specific keys, each
+# marked below: max_batch_size, max_num_tokens, cuda_graph_config,
+# disable_overlap_scheduler, enable_chunked_prefill, kv_cache_config's
+# free_gpu_memory_fraction, and speculative_config. Keep every other key in
+# sync with the base file when editing either.
+#
+# run_eval_kimi_k3.sbatch --dflash <drafter> rewrites the speculative_model
+# line below into a per-job copy; the placeholder here is never used
+# directly.
+tensor_parallel_size: 16
+enable_attention_dp: true
+moe_expert_parallel_size: 16
+# DFlash-specific: the drafter weights, the per-request hidden-state capture
+# buffer, and the drafter's own context-KV slots all come out of the same
+# budget, so the base file's batch 32 does not fit.
+max_batch_size: 8
+max_num_tokens: 4096
+max_seq_len: 8192
+trust_remote_code: true
+# DFlash-specific: the drafter runs between target steps, so the overlap
+# scheduler is off (same as the SA config).
+disable_overlap_scheduler: true
+# DFlash-specific: chunked prefill is off (the base config enables it) —
+# the hidden-state capture is taken from a single whole-sequence prefill.
+enable_chunked_prefill: false
+cuda_graph_config:
+  # Keep the CUDA-graph batch size equal to max_batch_size above.
+  max_batch_size: 8
+moe_config:
+  # The NVFP4 export needs this named. AUTO resolves Kimi K3 to
+  # trtllm-gen either way, but only this branch ships the NVFP4
+  # SiTu cubins for it, so pinning it keeps the intent readable.
+  backend: TRTLLM
+  # TRTLLM chunking bound. Kimi's MegaMoE path privately raises this to
+  # max_num_tokens * dp_size for per-rank SymmBuffer capacity.
+  max_num_tokens: 33024
+  use_low_precision_moe_combine: true
+kv_cache_config:
+  enable_block_reuse: false
+  # DFlash-specific: lowered from the base 0.25 to leave headroom for the
+  # drafter weights and capture buffer.
+  free_gpu_memory_fraction: 0.20
+  tokens_per_block: 64
+speculative_config:
+  decoding_type: DSpark
+  # Placeholder — substituted by run_eval_kimi_k3.sbatch --dflash.
+  speculative_model: /path/to/dflash-drafter
+  # RadixArk/Kimi-K3-DSpark: block_size 7 under the dspark shift_label
+  # convention, where block slot j predicts draft token j+1 and slot 0 (the
+  # anchor slot) predicts the first draft token. So K == block_size == 7,
+  # matching the model card's "1 current token + 7 draft tokens"
+  # (dflash_draft_slot_ids + test_slot_ids_shift_label_uses_anchor_slot).
+  # Do NOT read this off the spec_generate loop in the checkpoint's
+  # dflash.py: that is SpecForge's generic DFlash demo (slots 1..K, K =
+  # block_size - 1), not the dspark path.
+  max_draft_len: 7
+  # TRTLLM needs FlashInfer and SM100/SM103 (GB200 qualifies) but avoids the
+  # flash-attn package the VANILLA backend requires.
+  attention_backend: TRTLLM
+  # mask_token_id and target_layer_ids are left unset on purpose: they are
+  # read from the drafter checkpoint's dflash_config.

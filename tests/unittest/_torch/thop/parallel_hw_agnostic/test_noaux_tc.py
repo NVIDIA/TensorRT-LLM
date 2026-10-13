@@ -1,7 +1,47 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+from unittest.mock import Mock
+
 import pytest
 import torch
 
 from tensorrt_llm._torch.models.modeling_deepseekv3 import DeepseekV3Gate
+from tensorrt_llm._torch.modules.linear import Linear
+from tensorrt_llm._torch.ugpu.policy import UgpuPolicy
+
+
+def test_deepseek_gate_dispatches_ugpu_bf16_with_fp32_output() -> None:
+    policy = UgpuPolicy(enabled=False)
+    gate = DeepseekV3Gate(
+        hidden_size=128,
+        num_experts=16,
+        top_k=2,
+        n_group=1,
+        topk_group=1,
+        routed_scaling_factor=1.0,
+        dtype=torch.bfloat16,
+        use_cute_dsl_bf16_gemm=True,
+        ugpu_policy=policy,
+    )
+    hidden_states = torch.empty(2, 3, 128, dtype=torch.bfloat16)
+    expected = torch.empty(2, 3, 16, dtype=torch.float32)
+    run_ugpu = Mock(return_value=expected)
+    gate._run_bf16_linear_ugpu = run_ugpu
+    gate._ugpu_weight_shards = ({"weight": object()}, {"weight": object()})
+
+    output = gate(hidden_states)
+
+    assert isinstance(gate, Linear)
+    assert gate.enable_ugpu_bf16_linear
+    assert gate._ugpu_policy is policy
+    assert gate._skip_layerwise_quant_config
+    assert set(dict(gate.named_parameters())) == {
+        "weight",
+        "e_score_correction_bias",
+    }
+    assert output is expected
+    run_ugpu.assert_called_once_with(hidden_states, None, output_dtype=torch.float32)
 
 
 @pytest.mark.parametrize("seq_len", [1, 32, 8192])

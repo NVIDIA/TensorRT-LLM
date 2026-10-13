@@ -480,7 +480,13 @@ std::vector<SharedPtr<Block>> Block::clearStaleBlocksAfterPageUnlink(
     // curr when its last shared_ptr is dropped.
     Block* curr
         = pruneStart && pruneStart->type() == NodeBase::Type::kBLOCK ? static_cast<Block*>(pruneStart) : nullptr;
-    while (curr && curr->next.empty() && curr->storage.at(lcIdx) == nullptr)
+    // Only detach blocks with no live page in ANY life cycle: a childless tip
+    // that lost this life cycle's page may still hold live pages of other life
+    // cycles; detaching it would orphan the committed chain of an in-flight
+    // sequence.
+    while (curr && curr->next.empty() && curr->storage.at(lcIdx) == nullptr
+        && std::all_of(
+            curr->storage.begin(), curr->storage.end(), [](CommittedPage const* page) { return page == nullptr; }))
     {
         NodeBase* prevNode = curr->prev;
         BlockKey const currKey = curr->key;
@@ -860,24 +866,54 @@ std::vector<BlockRadixTree::MatchResult> BlockRadixTree::pruneMatch(
     return matched;
 }
 
+namespace
+{
+// Drop `backoff` tokens off the tail of a match, dropping whole blocks while the backoff
+// outruns them. Only the tail shrinks, so pruneMatch's "leading entries are full blocks"
+// invariant still holds.
+void backOffMatch(std::vector<BlockRadixTree::MatchResult>& matched, int backoff)
+{
+    while (backoff > 0 && !matched.empty())
+    {
+        auto& last = matched.back();
+        if (last.numMatchedTokens > backoff)
+        {
+            last.numMatchedTokens -= backoff;
+            return;
+        }
+        backoff -= last.numMatchedTokens;
+        matched.pop_back();
+    }
+}
+} // namespace
+
 BlockRadixTree::ReuseMatch BlockRadixTree::match(
-    ReuseScope const& reuseScope, TokenSpan tokens, bool knownNoDigest, bool enablePartialMatch) const
+    ReuseScope const& reuseScope, TokenSpan tokens, bool knownNoDigest, bool enablePartialMatch, int backoff) const
 {
     auto rawMatched = matchTokenPath(reuseScope, tokens, knownNoDigest, enablePartialMatch);
+    // Content-divergence depth is measured before page or recurrent-snapshot pruning.
+    int const numReusableTokensBeforePruning = numMatchedTokens(rawMatched, mTokensPerBlock);
     auto const ssmLcId = mLifeCycles.ssmLifeCycleId();
+    // Page requirements depend on the final endpoint. Back off before pruning
+    // so SWA coverage and recurrent snapshots are validated at that endpoint.
+    if (backoff > 0)
+    {
+        backOffMatch(rawMatched, backoff);
+    }
     // Diagnostic only: re-prune ignoring recurrent-snapshot availability to get
     // the prefix the attention pages alone support. Only hybrid models pay for
     // the second pass; without an SSM life cycle the two results are identical.
-    std::optional<int> attnOnlyTokens;
+    std::optional<int> numReusableTokensBeforeHybridPruning;
     if (ssmLcId.has_value())
     {
-        attnOnlyTokens = numMatchedTokens(pruneMatch(rawMatched, std::nullopt), mTokensPerBlock);
+        numReusableTokensBeforeHybridPruning = numMatchedTokens(pruneMatch(rawMatched, std::nullopt), mTokensPerBlock);
     }
-    auto const matched = pruneMatch(std::move(rawMatched), ssmLcId);
+    auto matched = pruneMatch(std::move(rawMatched), ssmLcId);
     ReuseMatch result{};
     result.numTokens = numMatchedTokens(matched, mTokensPerBlock);
     result.numLookupTokens = static_cast<int>(tokens.size());
-    result.numTokensBeforeHybridPruning = attnOnlyTokens.value_or(result.numTokens);
+    result.numReusableTokensBeforeHybridPruning = numReusableTokensBeforeHybridPruning.value_or(result.numTokens);
+    result.numReusableTokensBeforePruning = numReusableTokensBeforePruning;
     result.blocks.reserve(BlockOrdinal{static_cast<int>(matched.size())});
     for (auto const& match : matched)
     {

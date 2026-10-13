@@ -4,6 +4,8 @@ set -ex
 MOONCAKE_VERSION="v0.3.7.post2"
 MOONCAKE_REPO="https://github.com/kvcache-ai/Mooncake.git"
 MOONCAKE_INSTALL_PATH="/usr/local/Mooncake"
+# Must match the yalantinglibs version pinned in Mooncake's dependencies.sh
+YLT_VERSION="0.5.5"
 
 apt-get update
 
@@ -27,7 +29,7 @@ apt-get install -y --no-install-recommends \
 
 mkdir -p /third-party-source
 
-git clone --depth 1 https://github.com/alibaba/yalantinglibs.git
+git clone --depth 1 -b ${YLT_VERSION} https://github.com/alibaba/yalantinglibs.git
 tar -czf /third-party-source/yalantinglibs.tar.gz yalantinglibs
 cd yalantinglibs
 mkdir build && cd build

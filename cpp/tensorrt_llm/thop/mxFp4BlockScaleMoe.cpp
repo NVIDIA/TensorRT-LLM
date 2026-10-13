@@ -86,7 +86,7 @@ torch::Tensor dtype_mxe2m1_block_scale_moe_runner(torch::optional<torch::Tensor>
 
     if (topk_ids.has_value() && topk_weights.has_value() && routing_logits.has_value())
     {
-        TLLM_LOG_WARNING(
+        TLLM_LOG_DEBUG(
             "When logits and (topk_ids and topk_weights) are both provided, we only use (topk_ids and topk_weights).");
     }
 

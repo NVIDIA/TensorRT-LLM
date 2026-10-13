@@ -1101,6 +1101,11 @@ def query_free_gpu_memory() -> int:
     return free
 
 
+def get_current_device_id() -> int:
+    device_id = _unwrap(drv.cuCtxGetDevice())  # pyright: ignore
+    return int(device_id)
+
+
 class CudaStreamWrapper:
     "Just a wrapper to make it compatible with IsStreamT protocol. Does not own the stream."
 

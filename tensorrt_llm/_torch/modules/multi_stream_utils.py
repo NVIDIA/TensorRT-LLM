@@ -66,15 +66,23 @@ def maybe_execute_in_parallel(
     multi_stream = (do_multi_stream() and aux_stream is not None and
                     not (disable_on_compile and torch.compiler.is_compiling()))
 
+    # Skip Event operations during torch.compile tracing to avoid dynamo
+    # converting them to torch.ops.streams.record_event (which uses CPU Events)
+    is_compiling = torch.compiler.is_compiling()
+
     if multi_stream:
-        event0.record()
+        if not is_compiling:
+            event0.record()
         result0 = fn0()
 
         with torch.cuda.stream(aux_stream):
-            event0.wait()
+            if not is_compiling:
+                event0.wait()
             result1 = fn1()
-            event1.record()
-        event1.wait()
+            if not is_compiling:
+                event1.record()
+        if not is_compiling:
+            event1.wait()
     else:
         result0 = fn0()
         result1 = fn1()

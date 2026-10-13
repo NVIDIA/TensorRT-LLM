@@ -39,6 +39,13 @@ template <typename T>
 inline __device__ uint64_t createSmemDesc(T* smemPtr, uint32_t lo, uint32_t hi) {
   // Convert the SMEM address to uint32_t.
   uint32_t mask = 0x3ffffu;
+  // Blackwell: encoded on 14 bits: (x & 0x3ffff) >> 4
+  // Rubin:     encoded on 15 bits: (x & 0x7ffff) >> 4
+#ifdef TLLM_RUBIN_FEATURES
+#if __CUDA_HAS_ARCH_FAMILY_SPECIFIC(107)
+  mask = 0x7ffffu;
+#endif
+#endif // TLLM_RUBIN_FEATURES
   uint32_t smemAddr = (static_cast<uint32_t>(__cvta_generic_to_shared(smemPtr)) & mask) >> 4;
   // Force the compiler to go down the URF path.
   // In some rare cases, the compiler does not think smemAddr is uniform, and generates lots of
@@ -60,6 +67,14 @@ inline __device__ uint64_t
 createSmemDesc(T* smemPtr, T* smemPtrNextBuffer, uint32_t lo, uint32_t hi) {
   uint32_t maskFull = 0x3ffffu;
   uint32_t maskNoLsb = 0x3fff0u;
+  // Blackwell: encoded on 14 bits: (x & 0x3ffff) >> 4
+  // Rubin:     encoded on 15 bits: (x & 0x7ffff) >> 4
+#ifdef TLLM_RUBIN_FEATURES
+#if __CUDA_HAS_ARCH_FAMILY_SPECIFIC(107)
+  maskFull = 0x7ffffu;
+  maskNoLsb = 0x7fff0u;
+#endif
+#endif // TLLM_RUBIN_FEATURES
   uint32_t smemAddr = (static_cast<uint32_t>(__cvta_generic_to_shared(smemPtr)) & maskFull) >> 4;
   uint32_t smemNextBufferAddr =
     (static_cast<uint32_t>(__cvta_generic_to_shared(smemPtrNextBuffer)) & maskNoLsb) << (16 - 4);

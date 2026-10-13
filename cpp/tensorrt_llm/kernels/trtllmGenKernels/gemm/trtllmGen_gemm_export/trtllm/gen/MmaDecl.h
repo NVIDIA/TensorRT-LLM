@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 1993-2025 NVIDIA CORPORATION &
+ * SPDX-FileCopyrightText: Copyright (c) 1993-2026 NVIDIA CORPORATION &
  * AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -93,13 +93,40 @@ inline std::string mmaKindToString(MmaKind mmaKind)
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-// function to get the TMEM column stride per group (i.e., 64 K elements)
-inline int32_t getTmemColStridePerGroup(int32_t tileMn, int32_t mmaK)
+// Get the TMEM column stride per group.
+// A group is one or more MMA instructions that share the same TMEM columns.
+inline int32_t getTmemColStridePerGroup(int32_t mmaMn, int32_t mmaK, [[maybe_unused]] int32_t kGroupSize)
 {
-    // Calculate the stride of TMEM column for every 64 elements in the K dimension
-    int32_t div = 2 * ceilDiv(tileMn, 64);
-    return mmaK == 96 ? std::max(4, div) : div;
+    int32_t colStride = 2 * ceilDiv(mmaMn, 64);
+#ifdef TLLM_RUBIN_FEATURES
+    if (kGroupSize == 8)
+    {
+        // 4/8 columns for scales 0-3, 4/8 for 4-7.
+        // E.g. if we need 2 cols for scale vec 4X (incl. padding), we need 6 cols for scale vec 8X.
+        // Note: this is wasteful for small N. If this becomes a problem, we may want to hack it by
+        // interleaving groups to use every 2nd column (required alignment is 2 columns).
+        colStride += (mmaMn <= 128 ? 4 : 8);
+    }
+#endif // TLLM_RUBIN_FEATURES
+    if (mmaK == 96)
+    {
+        colStride = std::max(4, colStride);
+    }
+    return colStride;
 }
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+#ifdef TLLM_RUBIN_FEATURES
+inline int32_t getTmemColStridePerGroup(int32_t mmaMn, int32_t mmaK, int32_t kGroupSize, bool useUniqueSf)
+{
+    if (useUniqueSf)
+    {
+        return kGroupSize / 4;
+    }
+    return getTmemColStridePerGroup(mmaMn, mmaK, kGroupSize);
+}
+#endif // TLLM_RUBIN_FEATURES
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 

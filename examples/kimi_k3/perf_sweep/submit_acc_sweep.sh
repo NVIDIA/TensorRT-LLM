@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # Submit the Kimi K3 GSM8K ACCURACY runs for the three perf-sweep serving
-# recipes (see acc_sweep.sbatch; expect ~96.5 +/- 0.5 each):
+# recipes (see acc_sweep.sbatch):
 #   tep16  4 nodes  2:00        tep8  2 nodes  2:00
 #   dep16  4 nodes  2:00
 #

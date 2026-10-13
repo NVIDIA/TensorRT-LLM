@@ -31,6 +31,13 @@ endif()
 add_library(th_utils STATIC thUtils.cpp)
 set_property(TARGET th_utils PROPERTY POSITION_INDEPENDENT_CODE ON)
 set_property(TARGET th_utils PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+# Newer Torch headers (e.g. ATen/native/cuda/Resize.h) compare ArrayRef against
+# OptionalArrayRef in the reverse order, relying on C++20's automatic generation
+# of the reversed comparison operator. th_utils/th_common only contain host .cpp
+# sources, so scope the bump to these targets instead of the repo-wide C++17
+# standard.
+set_target_properties(th_utils PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED
+                                                          ON)
 # Declare the dependency on the main shared library explicitly so consumers
 # (e.g. thUtilsTest) place it after th_utils on the link line; this was
 # previously satisfied transitively via the removed TensorRT plugin target.
@@ -128,6 +135,7 @@ add_library(
   customMoeRoutingOp.cpp
   mamba2MTPSSMCacheOp.cpp
   selectiveScanOp.cpp
+  ugpuAllocator.cpp
   userbuffersFinalizeOp.cpp
   userbuffersTensor.cpp
   virtualMemoryAllocator.cpp
@@ -141,11 +149,17 @@ add_library(
   dsv3RopeOp.cpp
   fusedGemmAllreduceOp.cpp
   convertReqIndexToGlobalOp.cpp
+  nvfp4MlaKvCacheGatherOp.cpp
   trtllmGenQKVProcessOp.cpp
   inplaceSliceCopyOp.cpp
   mhcOp.cpp
-  compressorOp.cpp)
+  compressorOp.cpp
+  dwdpFabricGather.cu
+  dwdpFabricGatherTma.cu
+  dwdpFabricGatherOp.cpp)
 set_property(TARGET th_common PROPERTY POSITION_INDEPENDENT_CODE ON)
+set_target_properties(th_common PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED
+                                                           ON)
 target_link_libraries(
   th_common PRIVATE ${TORCH_LIBRARIES} th_utils ${Python3_LIBRARIES}
                     ${SHARED_TARGET} pg_utils)
@@ -174,7 +188,8 @@ endif()
 
 if(ENABLE_MULTI_DEVICE)
   target_include_directories(th_common PUBLIC ${MPI_C_INCLUDE_DIRS})
-  target_link_libraries(th_common PRIVATE ${MPI_C_LIBRARIES} ${NCCL_LIB})
+  target_link_libraries(th_common PRIVATE ${MPI_C_LIBRARIES} ${NCCL_LIB}
+                                          CUDA::nvml)
 endif()
 
 if(NOT WIN32)

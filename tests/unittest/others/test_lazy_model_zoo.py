@@ -179,6 +179,48 @@ def test_arch_index_matches_decorators():
     assert not wrong, f"index points at the wrong module: {wrong}"
 
 
+def _decorated_draft_model_registrations():
+    """AST-scan the modeling files for ``@register_draft_model`` decorators.
+
+    Source scan rather than a registry walk on purpose: the registry is only
+    populated by importing a provider, and a built-in builder that lost its
+    slot to an external registration would be missing from it entirely, so a
+    registry walk would pass while the index is stale.
+    """
+    mode_to_modules = {}
+    for path in sorted(_MODELS_DIR.glob("*.py")):
+        tree = ast.parse(path.read_text())
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            name = getattr(func, "id", None) or getattr(func, "attr", None)
+            if name != "register_draft_model" or not node.args:
+                continue
+            arg = node.args[0]
+            # ``register_draft_model(SpeculativeDecodingMode.DFLASH)``
+            if isinstance(arg, ast.Attribute):
+                mode_to_modules.setdefault(arg.attr, set()).add(path.stem)
+    return mode_to_modules
+
+
+def test_spec_mode_index_matches_decorators():
+    from tensorrt_llm._torch.models._arch_index import SPEC_MODE_TO_MODULE
+
+    mode_truth = _decorated_draft_model_registrations()
+
+    missing = set(mode_truth) - set(SPEC_MODE_TO_MODULE)
+    assert not missing, f"spec modes missing from _arch_index: {missing}"
+    stale = set(SPEC_MODE_TO_MODULE) - set(mode_truth)
+    assert not stale, f"stale spec modes in _arch_index: {stale}"
+    wrong = {
+        mode: (SPEC_MODE_TO_MODULE[mode], mode_truth[mode])
+        for mode in SPEC_MODE_TO_MODULE
+        if SPEC_MODE_TO_MODULE[mode] not in mode_truth[mode]
+    }
+    assert not wrong, f"index points at the wrong module: {wrong}"
+
+
 def test_class_index_matches_package_all():
     # MODEL_CLASS_TO_MODULE is the one table with no decorator to mirror: it
     # backs PEP 562 attribute access on the models package. Every name in the

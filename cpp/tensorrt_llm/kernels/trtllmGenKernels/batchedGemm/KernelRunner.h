@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2025, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -103,6 +103,10 @@ struct TrtllmGenBatchedGemmRunnerOptions
     bool transposeMmaOutput{false};
     int32_t tileSize{8};
     int32_t epilogueTileM{128};
+    bool lamportConsumerA{false};
+    bool lamportConsumerB{false};
+    bool lamportForceValid{false};
+    bool lamportProducer{false};
 };
 
 class TrtllmGenBatchedGemmRunner

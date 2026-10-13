@@ -117,9 +117,17 @@ class CutlassFusedMoE(MoE):
             "sm_constraint": ("in", {90, 120}),
             "dtypes": {torch.bfloat16},
         },
-        # NVFP4: SM in {100, 103, 120, 121}
+        # NVFP4: SM in {100, 103, 107, 120, 121}
+        # SM107 (Rubin) is served by the same SM100-family grouped-GEMM path.
+        # It was never listed here -- this entry is a new claim, not a restored
+        # one. The omission stayed invisible on branches whose resolution
+        # short-circuits an explicit CUTLASS request without calling
+        # can_implement; there Kimi-K3 NVFP4 ran anyway and scored GSM8K 96.2092
+        # (job 468774). Measured here, through resolve_moe_cls and this table:
+        # 96.6641 (job 470162, DEP16, 1319 questions, strict == flexible), with
+        # a passing quickstart first (job 470157).
         QuantAlgo.NVFP4: {
-            "sm_constraint": ("in", {100, 103, 120, 121}),
+            "sm_constraint": ("in", {100, 103, 107, 120, 121}),
             "dtypes": {torch.float16, torch.bfloat16, torch.float8_e4m3fn},
         },
         # W4A16_NVFP4: weights stay NVFP4 but are dequantized to the activation
@@ -284,6 +292,7 @@ class CutlassFusedMoE(MoE):
         swiglu_limit_scalar: Optional[float] = None,
         init_load_balancer: bool = True,
         activation_type: ActivationType = ActivationType.Swiglu,
+        ignore_weights: bool = False,
     ):
 
         super().__init__(
@@ -365,7 +374,7 @@ class CutlassFusedMoE(MoE):
         self.lora = self._maybe_make_lora_marker(model_config)
 
         self._weights_created = False
-        if not model_config.skip_create_weights_in_init:
+        if not model_config.skip_create_weights_in_init and not ignore_weights:
             self.create_weights()
 
     # ---- Routed-expert LoRA helpers ----
@@ -1173,3 +1182,9 @@ class CutlassFusedMoE(MoE):
             kargs["allow_partial_loading"] = allow_partial_loading
         self.quant_method.load_weights(self, weights, self.weight_loading_mode,
                                        **kargs)
+
+    def post_load_weights(self):
+        self.post_load_weights_impl()
+
+    def post_load_weights_impl(self):
+        self.quant_method.post_load_weights(self)

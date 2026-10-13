@@ -190,9 +190,32 @@ VENV=${TRTLLM_VENV:-$REPO/.venv-3.12}
 #   footprint and KV budget: drafter weights, capture buffer, and DFlash
 #   context-KV slots leave less headroom than the SA config assumes
 #   (0.25/8192 OOM'd in warmup on GB300).
-MAX_BATCH_SIZE=32
-MAX_NUM_TOKENS=8192
-KV_FRAC=0.25
+#
+# KV_FRAC is 0.35 because the V2 KV-cache manager needs more than 0.25 gives.
+# At 0.25 executor init dies outright: "The V2 Mamba GPU cache quota is too
+# small for live recurrent states and attention pages: got 13945790848 bytes,
+# need at least 15453388800 bytes". 0.30 clears that check but leaves so little
+# room that no request is ever scheduled -- the engine comes up, accepts all
+# requests and then produces nothing until the job hits its time limit. 0.35 is
+# the first value measured to run GSM8K to completion (Rubin/SM107, 16 GPU).
+#
+# These three are overridable like TP_SIZE / EVAL_CONFIG. The minimum quota the
+# V2 Mamba manager demands scales with the resident-sequence count, so a
+# heavier checkpoint (NVFP4 sits ~4.8 GiB/rank above MXFP4 at the same
+# topology) can be made to fit by lowering the batch, which lowers that
+# minimum, rather than by raising KV_FRAC, which is already at the highest
+# value measured to work. The mode blocks below still override them.
+MAX_BATCH_SIZE=${MAX_BATCH_SIZE:-32}
+MAX_NUM_TOKENS=${MAX_NUM_TOKENS:-8192}
+KV_FRAC=${KV_FRAC:-0.35}
+# GSM8K answers are short, so 8192 covers prompt + generation. Reasoning
+# benchmarks do not: GPQA-Diamond on Kimi K3 was measured with a 65536-token
+# generation budget, which needs max_seq_len raised to match.
+MAX_SEQ_LEN=${MAX_SEQ_LEN:-8192}
+# Which trtllm-eval subcommand to run, and its task-specific flags (e.g.
+# --dataset_path / --temperature / --max_output_length for gpqa_diamond).
+EVAL_TASK=${EVAL_TASK:-gsm8k}
+EVAL_TASK_ARGS=${EVAL_TASK_ARGS:-}
 KV_REUSE_ARG="--disable_kv_cache_reuse"
 case "$MODE" in
     sa)
@@ -219,7 +242,9 @@ case "$MODE" in
         SPEC_STATS_DEFAULT=1
         ;;
     *)
-        EVAL_CONFIG=$REPO/examples/kimi_k3/eval_extra_llm_options.yaml
+        # Honour an externally exported EVAL_CONFIG so alternative topologies
+        # (e.g. the NVFP4 DEP8 config) can reuse this script unchanged.
+        EVAL_CONFIG=${EVAL_CONFIG:-$REPO/examples/kimi_k3/eval_extra_llm_options.yaml}
         ;;
 esac
 
@@ -276,6 +301,22 @@ if [ -n "${EXTRA_MOUNTS:-}" ]; then
     MOUNTS+=",$EXTRA_MOUNTS"
 fi
 
+# Forward the K3 online FP8 MLP-cast switch only when the submitter set it.
+# Exporting an unset switch as an empty string would override its default-on
+# behavior.
+K3_FP8_SWITCHES="
+KIMI_K3_FP8_WEIGHT_READ_MOE_MLP
+"
+K3_SUBSWITCH_EXPORTS=""
+for _n in $K3_FP8_SWITCHES; do
+    if [ -n "${!_n+set}" ]; then
+        K3_SUBSWITCH_EXPORTS+="export $_n='${!_n}'; "
+    fi
+done
+# Flattened to one line: this is interpolated into the double-quoted bash -c
+# body below, where the multi-line form would break the `for` statement.
+K3_FP8_SWITCH_NAMES=$(echo $K3_FP8_SWITCHES)
+
 srun --mpi=pmix \
     --container-image="$CONTAINER_IMAGE" \
     --container-mount-home \
@@ -294,6 +335,14 @@ srun --mpi=pmix \
         # ranks during autotune JIT (stale file handles).
         export TRITON_CACHE_DIR=/tmp/triton-cache-rank\${SLURM_PROCID:-0}
         mkdir -p \"\$TRITON_CACHE_DIR\"
+
+        # DeepGEMM JIT writes compiled artifacts through a temporary file +
+        # rename. Sharing one cache across ranks lets two compilers race that
+        # rename (seen with the FP8 weight read on Rubin). Keep it
+        # node-local and per-rank, like the Triton cache above.
+        export DG_JIT_CACHE_DIR=/tmp/deep-gemm-rank\${SLURM_PROCID:-0}
+        mkdir -p \"\$DG_JIT_CACHE_DIR\"
+        echo \"[k3] DG_JIT_CACHE_DIR=\$DG_JIT_CACHE_DIR\"
 
         # Node-local flashinfer cache: the default (\$HOME) is shared NFS and
         # races across ranks during cubin download (stale file handles).
@@ -327,6 +376,18 @@ srun --mpi=pmix \
         # sa/dflash modes, off otherwise (explicit env still wins either way).
         export TLLM_EVAL_SPEC_STATS=\"\${TLLM_EVAL_SPEC_STATS:-$SPEC_STATS_DEFAULT}\"
 
+        # Kimi K3 weight/precision switches. Forwarded explicitly rather than
+        # relying on environment propagation into the container, so that a run
+        # either has the setting it was submitted with or fails visibly - a
+        # silently-unset precision flag would look like a clean A/B while
+        # actually re-running the same configuration twice.
+        # Precision switches (built by the submit shell above, so that only the
+        # ones actually set are exported), then echoed.
+        $K3_SUBSWITCH_EXPORTS
+        for n in $K3_FP8_SWITCH_NAMES; do
+            echo \"[k3] \$n=\${!n:-(default)}\"
+        done
+
         # Import tensorrt_llm from $REPO, not from wherever the venv's
         # in-place install points (for git-worktree submits those differ;
         # without this the job silently tests the main checkout's code).
@@ -336,7 +397,7 @@ srun --mpi=pmix \
             '$VENV/bin/trtllm-eval' \
             --model \"$MODEL\" \
             --backend pytorch \
-            --tp_size 16 \
+            --tp_size ${TP_SIZE:-16} \
             --max_batch_size $MAX_BATCH_SIZE \
             --max_seq_len $MAX_SEQ_LEN \
             --max_num_tokens $MAX_NUM_TOKENS \

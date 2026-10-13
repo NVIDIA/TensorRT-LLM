@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import ast
 import contextlib
 import copy
@@ -6,9 +9,12 @@ import fcntl
 import inspect
 import itertools
 import json
+import multiprocessing
 import os
+import tempfile
 import time
 from abc import ABC, abstractmethod
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
@@ -24,6 +30,8 @@ from tensorrt_llm.bindings.internal.runtime import (delay_kernel,
                                                     record_global_timer)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
+
+from .ugpu_utils import optional_ugpu_mem_pool
 
 # Unique tag to avoid collisions with other comms
 PP_COMM_TAG_AUTOTUNING = 30000
@@ -256,6 +264,21 @@ class TunableRunner(ABC):
             Any: The unique id of the runner, which can be converted to a string for the cache key.
         """
         return tuple(self.__dict__.values())
+
+    def should_profile_tactic_in_subprocess(
+        self,
+        custom_op: str,
+        inputs: List[torch.Tensor],
+        tactic: Any,
+        tuning_config: TuningConfig,
+        **kwargs,
+    ) -> bool:
+        """Whether this tactic is safe and useful to profile in a subprocess.
+
+        The default is False because most runners either do not need this or may
+        depend on state that cannot be reconstructed safely in a child process.
+        """
+        return False
 
 
 @contextlib.contextmanager
@@ -944,7 +967,7 @@ class AutoTuner:
         # Last captured choose_one() contexts
         self._last_capture: Optional['AutoTuner.TacticsCapture'] = None
 
-        # Dsitributed tuning state
+        # Distributed tuning state
         self._dist: Optional[Distributed] = None
         self._has_received_cache: bool = False
         self.mapping: Mapping = Mapping()
@@ -967,13 +990,14 @@ class AutoTuner:
         runner_tactic_comb_checkers: List[Callable] = []
 
         def __init__(self, autotuner):
+            self._autotuner = autotuner
             # State for captured contexts
             self._captured_contexts: List[Dict[str, Any]] = []
-            self._context_tactics_lists: Optional[List[List[Tuple[int,
-                                                                  Any]]]] = None
+            self._context_tactics_lists: Optional[List[List[Tuple[
+                int, Any, Tuple]]]] = None
             # State for replay mode
             self._replay_runner_tactic_list: Optional[List[Tuple[int,
-                                                                 int]]] = None
+                                                                 Any]]] = None
             self._replay_context_idx: int = 0
 
         def __iter__(self):
@@ -989,10 +1013,13 @@ class AutoTuner:
             # Generate cartesian product from context and tactics where all_configrations[i][ctx] = (runner, tactic)
             # Such that each element in all_configrations is a replay of multiple contexts of all possible replays
             for config in itertools.product(*self._context_tactics_lists):
-                # config is a tuple of (runner_idx, tactic) for each context
+                if not self._has_consistent_cache_key_tactics(config):
+                    continue
+
+                # config is a tuple of (runner_idx, tactic, cache_key) for each context
                 # Convert to (runner, tactic) format for user
                 runner_tactic_pairs = []
-                for ctx_idx, (runner_idx, tactic) in enumerate(config):
+                for ctx_idx, (runner_idx, tactic, _) in enumerate(config):
                     runners = self._captured_contexts[ctx_idx]['runners']
                     runner = runners[runner_idx]
                     runner_tactic_pairs.append((runner, tactic))
@@ -1003,6 +1030,18 @@ class AutoTuner:
                     continue
 
                 yield tuple(runner_tactic_pairs)
+
+        @staticmethod
+        def _has_consistent_cache_key_tactics(config):
+            """Match runtime cache behavior when replaying captured tactics."""
+            cache_key_tactics = {}
+            for _, tactic, cache_key in config:
+                if cache_key in cache_key_tactics:
+                    if cache_key_tactics[cache_key] != tactic:
+                        return False
+                else:
+                    cache_key_tactics[cache_key] = tactic
+            return True
 
         def _generate_context_tactics_lists(self):
             """Generate all valid tactic combinations."""
@@ -1017,17 +1056,22 @@ class AutoTuner:
             context_tactics_lists = []
 
             for context in self._captured_contexts:
+                custom_op = context['custom_op']
                 runners = context['runners']
+                tuning_config = context['tuning_config']
                 inputs = context['inputs']
                 kwargs = context.get('kwargs', {})
+                input_shapes = tuple(self._autotuner._get_input_sizes(inputs))
 
                 # Collect all valid (runner, tactic) combinations for this context
                 tactics_lists = []
                 for runner_idx, runner in enumerate(runners):
+                    cache_key = self._autotuner.profiling_cache.get_cache_key(
+                        custom_op, runner, input_shapes, tuning_config)
                     valid_tactics = runner.get_valid_tactics(
                         inputs, OptimizationProfile(), **kwargs)
                     for tactic in valid_tactics:
-                        tactics_lists.append((runner_idx, tactic))
+                        tactics_lists.append((runner_idx, tactic, cache_key))
                 context_tactics_lists.append(tactics_lists)
 
             return context_tactics_lists
@@ -1156,6 +1200,8 @@ class AutoTuner:
 
         # If it's tuning mode and cache hit, return the best runner and tactic to avoid redundant profiling.
         if self.is_tuning_mode and is_cache_hit:
+            self._prime_cached_tactics(custom_op, runners, tuning_config,
+                                       inputs, **kwargs)
             return (runners[best_runner_id], best_tactic)
 
         # PP rank does not have cache hit, so we try to receive the cache from the previous rank
@@ -1195,13 +1241,16 @@ class AutoTuner:
                 if not is_cache_hit:
                     # Initialize runner and tactic as None in case of no valid tactic or runners are found
                     with nvtx_range(f"{custom_op}, shape {p.get_opt_shapes()}"):
-                        best_runner_id, best_tactic, min_time, has_tuning_failure_occurred = self._profile_runners(
-                            custom_op, runners, tensors, p, tuning_config,
-                            **kwargs)
+                        with optional_ugpu_mem_pool():
+                            best_runner_id, best_tactic, min_time, has_tuning_failure_occurred = self._profile_runners(
+                                custom_op, runners, tensors, p, tuning_config,
+                                **kwargs)
                     new_tuning_failure_occurred = new_tuning_failure_occurred or has_tuning_failure_occurred
 
         self._maybe_sync_cache_data(tuning_config.distributed_tuning_strategy,
                                     custom_op)
+        self._prime_cached_tactics(custom_op, runners, tuning_config, inputs,
+                                   **kwargs)
 
         # If failed profiling tactics occurs, log the error.
         if new_tuning_failure_occurred:
@@ -1224,6 +1273,91 @@ class AutoTuner:
             custom_op] = self.stats.tuned_op_time_cost.get(
                 custom_op, 0) + tuning_end_time - tuning_start_time
         return (runners[runner_id], tactic)
+
+    def _prime_cached_tactics(
+        self,
+        custom_op: str,
+        runners: List[TunableRunner],
+        tuning_config: TuningConfig,
+        inputs: List[torch.Tensor],
+        **kwargs,
+    ) -> None:
+        """Run every cached winner once so JIT runners compile during warmup.
+
+        Cached winners may come from a previous process or another rank's
+        profiling shard, so this process may not have run them. Runners with
+        a class-level ``kernel_cache`` would otherwise compile lazily during
+        serving. Disable with
+        ``TLLM_AUTOTUNER_PRIME_CACHED_TACTICS=0``.
+        """
+        if os.environ.get("TLLM_AUTOTUNER_PRIME_CACHED_TACTICS", "1") != "1":
+            return
+        # Cache hits need not agree across ranks. Collective runners must
+        # not allocate profiling scratch or launch outside lockstep profiling.
+        if tuning_config.distributed_tuning_strategy == DistributedTuningStrategy.MERGE:
+            return
+        jit_classes = {
+            type(r)
+            for r in runners
+            if isinstance(getattr(type(r), "kernel_cache", None), dict)
+        }
+        if not jit_classes:
+            return
+        primed = getattr(self, "_primed_cached_tactics", None)
+        if primed is None:
+            primed = self._primed_cached_tactics = set()
+        before = {cls: len(cls.kernel_cache) for cls in jit_classes}
+        t0 = time.perf_counter()
+        n_launch = n_fail = 0
+        for p in self._optimization_profiles(tuning_config, inputs):
+            hit, runner_id, tactic, _ = self.profiling_cache.search_cache(
+                custom_op,
+                runners,
+                p.get_opt_shapes(),
+                tuning_config,
+                apply_map_to_tuning_buckets=False,
+            )
+            if not hit:
+                continue
+            runner = runners[runner_id]
+            if type(runner) not in jit_classes:
+                continue
+            key = (custom_op, type(runner).__name__, str(runner.unique_id()),
+                   str(tactic))
+            if key in primed:
+                continue
+            tensors = self._prepare_input_tensors(p, inputs)
+            if tuning_config.inputs_pre_hook is not None:
+                tensors = tuning_config.inputs_pre_hook(tensors)
+            try:
+                with nvtx_range(f"{custom_op} prime tactic {tactic}"), \
+                        optional_ugpu_mem_pool():
+                    if "do_preparation" in inspect.signature(
+                            runner.forward).parameters:
+                        runner(tensors,
+                               tactic=-1,
+                               do_preparation=True,
+                               **kwargs)
+                    runner(tensors, tactic=tactic, **kwargs)
+                primed.add(key)
+                n_launch += 1
+            except Exception as e:
+                n_fail += 1
+                try:
+                    torch.cuda.synchronize()
+                except Exception:
+                    pass
+                logger.warning(
+                    f"[Autotuner] Priming cached tactic failed for custom_op={custom_op}, "
+                    f"runner={type(runner).__name__}, tactic={tactic}, "
+                    f"shapes={p.get_opt_shapes()}. Error: {e}")
+        if n_launch or n_fail:
+            n_compiled = sum(
+                len(cls.kernel_cache) - before[cls] for cls in jit_classes)
+            logger.info(
+                f"[Autotuner] Primed {n_launch} cached tactics for {custom_op} "
+                f"({n_compiled} new JIT kernels, {n_fail} failures) in "
+                f"{time.perf_counter() - t0:.2f}s")
 
     def _profile_runners(
         self,
@@ -1323,7 +1457,13 @@ class AutoTuner:
                         **kwargs,
                     )
 
+                subprocess_tactics = self._get_subprocess_tactics(
+                    custom_op, runner, input_tensors, valid_tactics,
+                    tuning_config, **kwargs)
+
                 for tac in valid_tactics:
+                    if tac in subprocess_tactics:
+                        continue
                     try:
                         with nvtx_range(f"r{runner_id}, tactic {tac}"):
                             time_measured = self._profile_single_kernel(
@@ -1369,6 +1509,36 @@ class AutoTuner:
                         min_time = time_measured
                         best_runner_id, best_tactic = runner_id, tac
 
+                for tac, time_measured, error in self._profile_tactics_in_subprocesses(
+                        custom_op,
+                        runner,
+                        runner_id,
+                        input_tensors,
+                        subprocess_tactics,
+                        tuning_config,
+                        **kwargs,
+                ):
+                    if error is not None:
+                        shapes = self._get_input_sizes(input_tensors)
+                        logger.warning_once(
+                            f"[Autotuner] Failed when profiling runner={runner}, tactic={tac}, shapes={shapes} in subprocess. Error: {error}",
+                            key=(custom_op,
+                                 "warning_autotuning_subprocess_profile_failure"
+                                 ),
+                        )
+                        self.stats.failed_profiling_count[custom_op].add(
+                            self.profiling_cache.get_cache_key(
+                                custom_op,
+                                runner,
+                                profile.get_opt_shapes(),
+                                tuning_config,
+                                apply_map_to_tuning_buckets=False))
+                        has_tuning_failure_occurred = True
+
+                    if time_measured < min_time:
+                        min_time = time_measured
+                        best_runner_id, best_tactic = runner_id, tac
+
         if best_runner_id is not None:
             # At least one valid (runner, tactic) pair is found
             cache_key = self.profiling_cache.get_cache_key(
@@ -1397,6 +1567,196 @@ class AutoTuner:
             )
 
         return best_runner_id, best_tactic, min_time, has_tuning_failure_occurred
+
+    def _get_subprocess_tactics(
+        self,
+        custom_op: str,
+        runner: TunableRunner,
+        input_tensors: List[torch.Tensor],
+        valid_tactics: List[Any],
+        tuning_config: TuningConfig,
+        **kwargs,
+    ) -> List[Any]:
+        if not self._is_subprocess_profiling_enabled(tuning_config):
+            return []
+
+        subprocess_tactics = [
+            tactic for tactic in valid_tactics
+            if runner.should_profile_tactic_in_subprocess(
+                custom_op, input_tensors, tactic, tuning_config, **kwargs)
+        ]
+        min_tactics = int(os.getenv("TLLM_AUTOTUNER_MP_MIN_TACTICS", "2"))
+        if len(subprocess_tactics) < min_tactics:
+            return []
+
+        return subprocess_tactics
+
+    def _is_subprocess_profiling_enabled(self,
+                                         tuning_config: TuningConfig) -> bool:
+        if os.getenv("TLLM_AUTOTUNER_MULTIPROCESS", "1") != "1":
+            return False
+
+        if self._is_distributed():
+            logger.warning_once(
+                "[Autotuner] Multiprocess tactic profiling is disabled for distributed tuning.",
+                key=("autotuner", "warning_multiprocess_distributed"),
+            )
+            return False
+
+        supported_strategies = {
+            DistributedTuningStrategy.INDEPENDENT,
+            DistributedTuningStrategy.PARALLEL,
+        }
+        if tuning_config.distributed_tuning_strategy not in supported_strategies:
+            logger.warning_once(
+                "[Autotuner] Multiprocess tactic profiling currently supports only "
+                "INDEPENDENT and single-rank PARALLEL tuning.",
+                key=("autotuner", "warning_multiprocess_strategy"),
+            )
+            return False
+
+        return True
+
+    def _get_subprocess_worker_count(self, num_tactics: int) -> int:
+        workers = int(os.getenv("TLLM_AUTOTUNER_MP_WORKERS", "0"))
+        if workers <= 0:
+            workers = max(1, min(16, (os.cpu_count() or 1) // 2))
+        return max(1, min(workers, num_tactics))
+
+    def _get_subprocess_profile_lock_path(
+            self, device_index: Optional[int]) -> Optional[str]:
+        if os.getenv("TLLM_AUTOTUNER_MP_PROFILE_LOCK", "1") == "0":
+            return None
+
+        lock_path = os.getenv("TLLM_AUTOTUNER_MP_PROFILE_LOCK_PATH")
+        if lock_path:
+            return lock_path
+
+        device_suffix = "cpu" if device_index is None else str(device_index)
+        lock_filename = (
+            f"tllm_autotuner_mp_profile_{os.getuid()}_{device_suffix}.lock")
+        return str(Path(tempfile.gettempdir()) / lock_filename)
+
+    def _profile_tactics_in_subprocesses(
+        self,
+        custom_op: str,
+        runner: TunableRunner,
+        runner_id: int,
+        input_tensors: List[torch.Tensor],
+        tactics: List[Any],
+        tuning_config: TuningConfig,
+        **kwargs,
+    ) -> List[Tuple[Any, float, Optional[str]]]:
+        if not tactics:
+            return []
+
+        device_index = (torch.cuda.current_device()
+                        if torch.cuda.is_available() else None)
+        worker_count = self._get_subprocess_worker_count(len(tactics))
+        profile_lock_path = self._get_subprocess_profile_lock_path(device_index)
+        input_specs = [
+            _serialize_subprocess_tensor_spec(t) for t in input_tensors
+        ]
+        worker_config = {
+            "custom_op": custom_op,
+            "runner": runner,
+            "runner_id": runner_id,
+            "input_specs": input_specs,
+            "use_cold_l2_cache": tuning_config.use_cold_l2_cache,
+            "use_cuda_graph": tuning_config.use_cuda_graph,
+            "warmup": self.warmup,
+            "repeat": self.repeat,
+            "stream_delay_micro_secs": self.stream_delay_micro_secs,
+            "use_global_timer": self._use_global_timer,
+            "device_index": device_index,
+            "profile_lock_path": profile_lock_path,
+            "kwargs": kwargs,
+        }
+
+        self._debug_logger(
+            f"[Autotuner] Profiling {len(tactics)} tactics for runner={runner} "
+            f"with {worker_count} subprocess workers; "
+            f"profile_lock_path={profile_lock_path}.")
+
+        results: List[Optional[Tuple[Any, float,
+                                     Optional[str]]]] = [None] * len(tactics)
+
+        try:
+            ctx = multiprocessing.get_context("spawn")
+            process_failure_error = None
+            with ProcessPoolExecutor(max_workers=worker_count,
+                                     mp_context=ctx) as executor:
+                futures = {}
+                for idx, tactic in enumerate(tactics):
+                    future = executor.submit(
+                        _profile_tactic_in_subprocess,
+                        worker_config,
+                        tactic,
+                    )
+                    futures[future] = (idx, tactic)
+
+                for future in as_completed(futures):
+                    idx, tactic = futures[future]
+                    try:
+                        results[idx] = future.result()
+                    except Exception as e:
+                        process_failure_error = repr(e)
+                        results[idx] = (tactic, float('inf'),
+                                        process_failure_error)
+
+            if process_failure_error is not None and os.getenv(
+                    "TLLM_AUTOTUNER_MP_FALLBACK_LOCAL_ON_PROCESS_FAILURE",
+                    "1") != "0":
+                logger.warning_once(
+                    f"[Autotuner] Multiprocess profiling failed for custom_op={custom_op}; falling back to local profiling. Error: {process_failure_error}",
+                    key=(custom_op,
+                         "warning_autotuning_subprocess_fallback_local"),
+                )
+                return self._profile_tactics_locally_after_subprocess_failure(
+                    runner, input_tensors, tactics, tuning_config, **kwargs)
+        except Exception as e:
+            error = repr(e)
+            if os.getenv("TLLM_AUTOTUNER_MP_FALLBACK_LOCAL_ON_PROCESS_FAILURE",
+                         "1") != "0":
+                logger.warning_once(
+                    f"[Autotuner] Multiprocess profiling setup failed for custom_op={custom_op}; falling back to local profiling. Error: {error}",
+                    key=(custom_op,
+                         "warning_autotuning_subprocess_setup_fallback_local"),
+                )
+                return self._profile_tactics_locally_after_subprocess_failure(
+                    runner, input_tensors, tactics, tuning_config, **kwargs)
+            return [(tactic, float('inf'), error) for tactic in tactics]
+
+        return [
+            result if result is not None else
+            (tactic, float('inf'),
+             "Subprocess profiling did not return a result.")
+            for result, tactic in zip(results, tactics)
+        ]
+
+    def _profile_tactics_locally_after_subprocess_failure(
+        self,
+        runner: TunableRunner,
+        input_tensors: List[torch.Tensor],
+        tactics: List[Any],
+        tuning_config: TuningConfig,
+        **kwargs,
+    ) -> List[Tuple[Any, float, Optional[str]]]:
+        results = []
+        for tactic in tactics:
+            try:
+                time_measured = self._profile_single_kernel(
+                    runner=runner,
+                    inputs=input_tensors,
+                    tactic=tactic,
+                    tuning_config=tuning_config,
+                    use_cuda_graph=tuning_config.use_cuda_graph,
+                    **kwargs,
+                )
+                results.append((tactic, time_measured, None))
+            except Exception as e:
+                results.append((tactic, float('inf'), repr(e)))
+        return results
 
     def _get_input_sizes(self, inputs: List[torch.Tensor]) -> List[torch.Size]:
 
@@ -1960,6 +2320,17 @@ class AutoTuner:
             # each TP rank will only tune the tactics that are assigned to it
             tp_size = self.mapping.tp_size
             tp_rank = self.mapping.tp_rank
+            # Sharding a candidate list shorter than tp_size by idx % tp_size
+            # leaves the ranks with tp_rank >= len(all_valid_tactics) with an
+            # EMPTY shard. Those ranks then find no valid (runner, tactic) pair
+            # and emit a spurious "No valid runner/tactic was found" warning,
+            # while also diverging in tuning wall-time from the ranks that did
+            # get work (a per-rank desync hazard for the following collective).
+            # Parallelizing a sub-tp_size list saves almost nothing, so have
+            # every rank profile the full list instead; the subsequent
+            # _merge_cache_data allgather still keeps the min-time winner.
+            if len(all_valid_tactics) < tp_size:
+                return all_valid_tactics
             valid_tactics = []
             for idx, tactic in enumerate(all_valid_tactics):
                 if idx % tp_size == tp_rank:
@@ -2077,3 +2448,126 @@ class AutoTuner:
 
     def clean_pp_flag(self):
         self._has_received_cache = False
+
+
+def _serialize_subprocess_tensor_spec(input_obj: Any) -> Dict[str, Any]:
+    if not isinstance(input_obj, torch.Tensor):
+        return {"is_tensor": False}
+
+    return {
+        "is_tensor": True,
+        "shape": tuple(input_obj.shape),
+        "stride": tuple(input_obj.stride()),
+        "dtype": str(input_obj.dtype).replace("torch.", ""),
+        "device_type": input_obj.device.type,
+        "device_index": input_obj.device.index,
+    }
+
+
+def _dtype_from_subprocess_name(dtype_name: str) -> torch.dtype:
+    return getattr(torch, dtype_name)
+
+
+def _make_subprocess_tensor(spec: Dict[str, Any],
+                            default_device_index: Optional[int]) -> Any:
+    if not spec["is_tensor"]:
+        return None
+
+    dtype = _dtype_from_subprocess_name(spec["dtype"])
+    device_type = spec["device_type"]
+    device_index = spec["device_index"]
+    if device_type == "cuda":
+        device = torch.device(
+            "cuda",
+            default_device_index if device_index is None else device_index)
+    else:
+        device = torch.device(device_type)
+
+    shape = tuple(spec["shape"])
+    stride = tuple(spec["stride"])
+    tensor = torch.empty_strided(shape, stride, dtype=dtype, device=device)
+
+    if dtype == getattr(torch, "float4_e2m1fn_x2", None):
+        tensor.copy_((torch.rand(shape, device=device) * 10 - 5).to(
+            torch.uint8).view(dtype))
+    elif dtype.is_floating_point or getattr(dtype, "is_complex", False):
+        tensor.copy_((torch.rand(shape, device=device) * 10 - 5).to(dtype))
+    elif dtype == torch.bool:
+        tensor.copy_(torch.randint(0, 2, shape, device=device,
+                                   dtype=torch.bool))
+    else:
+        tensor.copy_(torch.randint(-5, 5, shape, device=device).to(dtype))
+
+    return tensor
+
+
+@contextlib.contextmanager
+def _subprocess_profile_lock(lock_path: Optional[str], exclusive: bool):
+    if lock_path is None:
+        yield
+        return
+
+    lock_dir = os.path.dirname(lock_path)
+    if lock_dir:
+        os.makedirs(lock_dir, exist_ok=True)
+    with open(lock_path, "w") as lock_file:
+        fcntl.flock(lock_file, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file, fcntl.LOCK_UN)
+
+
+def _profile_tactic_in_subprocess(
+        worker_config: Dict[str, Any],
+        tactic: Any) -> Tuple[Any, float, Optional[str]]:
+    os.environ["TLLM_AUTOTUNER_MULTIPROCESS"] = "0"
+
+    device_index = worker_config["device_index"]
+    if device_index is not None and torch.cuda.is_available():
+        torch.cuda.set_device(device_index)
+
+    runner = worker_config["runner"]
+    kwargs = worker_config["kwargs"]
+    lock_path = worker_config["profile_lock_path"]
+
+    try:
+        inputs = [
+            _make_subprocess_tensor(spec, device_index)
+            for spec in worker_config["input_specs"]
+        ]
+
+        # Compile and run one untimed warmup while holding a shared lock. Multiple
+        # workers can compile concurrently, but measured profiling windows take
+        # the same lock exclusively and therefore do not overlap with these
+        # untimed launches.
+        with _subprocess_profile_lock(lock_path, exclusive=False):
+            runner(inputs, tactic=tactic, **kwargs)
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+
+        worker_tuning_config = TuningConfig(
+            use_cold_l2_cache=worker_config["use_cold_l2_cache"],
+            use_cuda_graph=worker_config["use_cuda_graph"],
+            distributed_tuning_strategy=DistributedTuningStrategy.INDEPENDENT,
+        )
+        worker_tuner = AutoTuner(
+            warmup=0,
+            repeat=worker_config["repeat"],
+            stream_delay_micro_secs=worker_config["stream_delay_micro_secs"],
+        )
+        worker_tuner._use_global_timer = worker_config["use_global_timer"]
+
+        with _subprocess_profile_lock(lock_path, exclusive=True):
+            time_measured = worker_tuner._profile_single_kernel(
+                runner=runner,
+                inputs=inputs,
+                tactic=tactic,
+                tuning_config=worker_tuning_config,
+                use_cuda_graph=worker_config["use_cuda_graph"],
+                **kwargs,
+            )
+
+        return tactic, time_measured, None
+    except Exception as e:
+        return tactic, float('inf'), repr(e)

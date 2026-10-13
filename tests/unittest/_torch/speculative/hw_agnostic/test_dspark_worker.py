@@ -16,17 +16,22 @@
 
 Covers the framework-side logic that does NOT need the full draft model:
 ``DSparkSpecMetadata`` hidden-state capture (incl. the mHC hc-mean reduction)
-and ``DSparkWorker`` slot / rolling-KV-window management. The end-to-end block
+and ``DSv4DSparkWorker`` slot / rolling-KV-window management. The end-to-end block
 draft and acceptance path is covered by the DSpark test in
 ``integration/defs/accuracy/test_llm_api_pytorch.py``.
 """
 
 import types
+from unittest.mock import Mock
 
 import pytest
 import torch
 
-from tensorrt_llm._torch.speculative.dspark import DSparkSpecMetadata, DSparkWorker
+from tensorrt_llm._torch.speculative.dspark import (
+    DSparkSpecMetadata,
+    DSparkWorker,
+    DSv4DSparkWorker,
+)
 from tensorrt_llm._torch.speculative.interface import SpeculativeDecodingMode
 
 pytestmark = pytest.mark.skipif(
@@ -101,14 +106,21 @@ def _make_worker():
     )
     from tensorrt_llm.mapping import Mapping
 
-    return DSparkWorker(cfg, Mapping())
+    return DSv4DSparkWorker(cfg, Mapping())
 
 
 def _fake_draft_model(num_stages=3, window_size=128, head_dim=64):
     return types.SimpleNamespace(
         num_stages=num_stages,
         block_size=5,
-        _attn_params={"window_size": window_size, "head_dim": head_dim},
+        _attn_params={
+            "window_size": window_size,
+            "head_dim": head_dim,
+            "n_heads": 128,
+            "softmax_scale": 1.0,
+            "eps": 1e-6,
+        },
+        configure_generation_autotuner=Mock(),
     )
 
 
@@ -130,10 +142,23 @@ def test_worker_lazy_init_window_buffers():
     assert worker._batch_to_slot is not None
     assert worker._batch_to_slot.shape == (8,)
     assert worker._batch_to_slot.device.type == "cuda"
+    assert worker._batch_to_slot.tolist() == [worker._scratch_slot] * 8
     # idempotent
     buf_id = id(worker._kv_windows)
     worker._lazy_init(dm, meta)
     assert id(worker._kv_windows) == buf_id
+
+
+def test_worker_lazy_init_configures_generation_autotuner_once():
+    worker = _make_worker()
+    draft_model = _fake_draft_model()
+    draft_model.configure_generation_autotuner = Mock()
+    metadata = _make_metadata(max_num_requests=8)
+
+    worker._lazy_init(draft_model, metadata)
+    worker._lazy_init(draft_model, metadata)
+
+    draft_model.configure_generation_autotuner.assert_called_once_with(8)
 
 
 def test_worker_rejects_mismatched_block_size():
@@ -187,10 +212,19 @@ def test_seed_context_windows_preserves_state_across_prefill_chunks():
     class DraftModel:
         num_stages = 1
         block_size = 5
-        _attn_params = {"window_size": 8, "head_dim": 4}
+        _attn_params = {
+            "window_size": 8,
+            "head_dim": 4,
+            "n_heads": 128,
+            "softmax_scale": 1.0,
+            "eps": 1e-6,
+        }
 
         def __init__(self):
             self.written_positions = []
+
+        def configure_generation_autotuner(self, _max_batch):
+            pass
 
         def write_context_windows(self, hidden, positions, windows):
             self.written_positions.append(positions.clone())
@@ -368,13 +402,68 @@ def test_prepare_keeps_dummy_generation_requests_on_scratch_row():
     assert list(worker._free_slots) == [1, 2, 3]
 
 
+def test_prepare_keeps_small_real_request_slots_across_steps():
+    """Small real IDs are not mistaken for CUDA-graph warmup dummies."""
+    worker = _make_worker()
+    meta = _make_metadata(max_num_requests=4)
+    worker._lazy_init(_fake_draft_model(), meta)
+    meta._dspark_worker = worker
+    meta.request_ids = [1, 2]
+    meta.num_generations = 2
+    meta.prepare()
+
+    slots = worker._batch_to_slot[:2]
+    worker._ctx_len[slots] = torch.tensor([7, 8], device="cuda")
+    worker._valid_len[slots] = torch.tensor([1, 2], device="cuda")
+    worker._position_initialized[slots] = True
+
+    meta.prepare()
+    assert worker._ctx_len[slots].tolist() == [7, 8]
+    assert worker._valid_len[slots].tolist() == [1, 2]
+    assert worker._position_initialized[slots].tolist() == [True, True]
+
+
+def test_prepare_keeps_cuda_graph_slots_across_replays():
+    """Graph metadata must not reset rolling state before each replay."""
+    worker = _make_worker()
+    meta = _make_metadata(max_num_requests=4)
+    worker._lazy_init(_fake_draft_model(), meta)
+    meta._dspark_worker = worker
+    meta.request_ids = [0, 1, 2]
+    meta.num_generations = 3
+    meta.is_cuda_graph = True
+    meta.prepare()
+
+    slots = worker._batch_to_slot[:3]
+    assert len(set(slots.tolist())) == 3
+    assert all(slot != worker._scratch_slot for slot in slots.tolist())
+    worker._ctx_len[slots] = torch.tensor([7, 8, 9], device="cuda")
+    worker._valid_len[slots] = torch.tensor([1, 2, 3], device="cuda")
+    worker._position_initialized[slots] = True
+
+    meta.prepare()
+    slots = worker._batch_to_slot[:3]
+    assert worker._ctx_len[slots].tolist() == [7, 8, 9]
+    assert worker._valid_len[slots].tolist() == [1, 2, 3]
+    assert worker._position_initialized[slots].tolist() == [True, True, True]
+
+
 class _RecordingDraftModel:
     num_stages = 1
     block_size = 5
-    _attn_params = {"window_size": 8, "head_dim": 4}
+    _attn_params = {
+        "window_size": 8,
+        "head_dim": 4,
+        "n_heads": 128,
+        "softmax_scale": 1.0,
+        "eps": 1e-6,
+    }
 
     def __init__(self):
         self.forward_calls = []
+
+    def configure_generation_autotuner(self, _max_batch):
+        pass
 
     def write_context_windows_batched(self, *args):
         pass
@@ -416,6 +505,34 @@ def test_generation_state_cuda_graph_bootstrap_and_replay():
     graph.replay()
     assert worker._ctx_len[slots].tolist() == [4019, 92]
     assert worker._valid_len[slots].tolist() == [3, 5]
+
+
+def test_generation_state_resets_scratch_row_on_every_cuda_graph_replay():
+    """Graph replays must not advance the shared dummy slot indefinitely."""
+    worker = _make_worker()
+    worker._lazy_init(_fake_draft_model(window_size=8), _make_metadata(max_num_requests=2))
+    scratch = worker._scratch_slot
+    slots = torch.tensor([scratch], device="cuda", dtype=torch.long)
+    num_accepted = torch.tensor([1], device="cuda", dtype=torch.long)
+    input_positions = torch.tensor([4016], device="cuda", dtype=torch.long)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        worker._advance_generation_state(slots, num_accepted, input_positions)
+
+    graph.replay()
+    assert worker._ctx_len[scratch].item() == 4017
+    assert worker._valid_len[scratch].item() == 1
+
+    graph.replay()
+    assert worker._ctx_len[scratch].item() == 4017
+    assert worker._valid_len[scratch].item() == 1
+
+    num_accepted.fill_(2)
+    graph.replay()
+    # The new replay bootstraps from 4016, rather than adding to 4017.
+    assert worker._ctx_len[scratch].item() == 4018
+    assert worker._valid_len[scratch].item() == 2
 
 
 def test_disagg_position_bootstrap_uses_actual_positions_and_target_width():
@@ -735,3 +852,157 @@ def test_forward_guided_batch_masks_and_advances_matcher_per_step(monkeypatch):
     gen_draft = nd[num_contexts:]
     expected_gen = torch.stack([s[num_contexts:] for s in sampled_per_step], dim=1)
     assert torch.equal(gen_draft, expected_gen)
+
+
+# ---------------------------------------------------------------------------
+# Routing: decoding_type DSpark serves two deployment forms, and the worker,
+# the spec metadata and the draft-KV decision must all follow the same flag.
+# Mis-routing is not hypothetical: handing a standalone drafter to
+# DSv4DSparkWorker raises AttributeError on num_stages at lazy init.
+# ---------------------------------------------------------------------------
+
+
+def _routing_config(embedded):
+    return types.SimpleNamespace(
+        max_draft_len=5,
+        max_total_draft_tokens=5,
+        spec_dec_mode=SpeculativeDecodingMode.DSPARK,
+        draft_is_embedded_in_target=embedded,
+        attention_backend="TRTLLM",
+        confidence_threshold=0.5,
+        _use_shared_kv_cache=False,
+        _allow_separate_draft_kv_cache=True,
+    )
+
+
+@pytest.mark.parametrize(
+    "embedded,worker_cls,uses_separate_draft_kv",
+    [(True, DSv4DSparkWorker, False), (False, DSparkWorker, True)],
+    ids=["embedded", "standalone"],
+)
+def test_worker_and_draft_kv_follow_the_draft_form(embedded, worker_cls, uses_separate_draft_kv):
+    from tensorrt_llm._torch.speculative.interface import should_use_separate_draft_kv_cache
+    from tensorrt_llm._torch.speculative.utils import get_spec_worker
+    from tensorrt_llm.mapping import Mapping
+
+    spec_config = _routing_config(embedded)
+
+    worker = get_spec_worker(spec_config, None, Mapping())
+    assert type(worker) is worker_cls
+
+    # The embedded draft owns a rolling window and never reads the paged draft
+    # KV cache; the standalone one is DFlash lineage and does.
+    assert should_use_separate_draft_kv_cache(spec_config) is uses_separate_draft_kv
+
+
+def test_dspark_worker_policies_come_from_the_drafter():
+    """The two DSpark overrides must read the checkpoint, not hardcode dspark.
+
+    A DSpark drafter trained with the legacy DFlash slot layout, or shipped
+    without a Markov head, has to get the base-class behaviour. Hardcoding the
+    dspark answer here would pass every routing test while silently mis-slotting
+    such a drafter -- and mis-slotting costs acceptance without ever failing.
+    """
+    from tensorrt_llm._torch.speculative.dflash import DFlashWorker
+    from tensorrt_llm.mapping import Mapping
+
+    worker = DSparkWorker(_routing_config(False), Mapping())
+    legacy = types.SimpleNamespace(_dspark_shift_label=False, has_markov_head=False)
+
+    # shift_label off -> the base class' slots 1..K, not the dspark 0..K-1.
+    ids = worker._draft_slot_ids(legacy, num_gens=2, block_size=5, num_draft_tokens=3)
+    base_ids = DFlashWorker._draft_slot_ids(
+        worker, legacy, num_gens=2, block_size=5, num_draft_tokens=3
+    )
+    assert ids.tolist() == base_ids.tolist()
+
+    # No Markov head -> the backbone logits pass through untouched.
+    logits = torch.randn(2, 3, 8, device="cuda")
+    assert worker._refine_block_logits(legacy, logits, {}, None) is logits
+
+
+def test_lazy_init_publishes_the_runtime_position_ceiling():
+    """The RoPE table must be sized from the engine's bound, not model_config's."""
+    worker = _make_worker()
+    dm = _fake_draft_model()
+    dm.dspark_model = types.SimpleNamespace()
+    attn_metadata = types.SimpleNamespace(max_seq_len=4096)
+
+    worker._lazy_init(dm, _make_metadata(max_num_requests=2), attn_metadata)
+
+    # A full target verification accepts K+1 tokens, then DSpark indexes K
+    # block positions from that new start. The table length is max index + 1.
+    expected = 4096 + 5 + 1 + 5 + 1
+    assert dm._runtime_position_ceiling == expected
+    assert dm.dspark_model._runtime_position_ceiling == expected
+
+
+def test_freqs_table_prefers_the_runtime_ceiling_over_the_config_cap(mocker):
+    """The cache key has to carry the cap, not just the device.
+
+    Moving where the cap comes from without moving the key would let any table
+    built before the worker publishes the ceiling serve every later call -- the
+    undersized table, silently, for the life of the process.
+    """
+    from tensorrt_llm._torch.models.modeling_dspark import DSv4DSparkDraftModel
+
+    spy = mocker.patch(
+        "tensorrt_llm._torch.models.modeling_dspark.precompute_dspark_freqs_cis",
+        return_value=torch.zeros(1),
+    )
+    model = types.SimpleNamespace(
+        _freqs_cap=1000,
+        _runtime_position_ceiling=5000,
+        _attn_params={"rope_head_dim": 64},
+        _rope_theta=10000.0,
+        _freqs_table_cache={},
+    )
+    device = torch.device("cpu")
+
+    DSv4DSparkDraftModel._dspark_freqs_table(model, device)
+    assert spy.call_args.args[1] == 5000
+
+    # The cache key carries the cap, so a table built for one bound can never be
+    # served for the other.
+    del model._runtime_position_ceiling
+    DSv4DSparkDraftModel._dspark_freqs_table(model, device)
+    assert spy.call_args.args[1] == 1000
+    assert len(model._freqs_table_cache) == 2
+
+
+def test_prepare_resets_the_scratch_row_every_iteration():
+    """The throwaway row must not carry an absolute position between forwards.
+
+    It has no prefill to seed it and no completion to free it, so without this
+    reset ``_advance_generation_state``'s unconditional advance leaves its
+    position climbing across CUDA-graph shapes and iterations until it indexes
+    past the RoPE table.
+    """
+    from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDA_GRAPH_DUMMY_REQUEST_ID
+
+    worker = _make_worker()
+    meta = _make_metadata(max_num_requests=4)
+    worker._lazy_init(_fake_draft_model(), meta)
+    meta._dspark_worker = worker
+    scratch = worker._scratch_slot
+
+    # State a previous padding / ADP-idle forward left behind.
+    worker._ctx_len[scratch] = 4096
+    worker._valid_len[scratch] = 8
+    worker._position_initialized[scratch] = True
+
+    live = worker._assign_slot(100, reset=True)
+    worker._ctx_len[live] = 17
+    worker._valid_len[live] = 5
+    worker._position_initialized[live] = True
+
+    meta.request_ids = [100, CUDA_GRAPH_DUMMY_REQUEST_ID]
+    meta.prepare()
+
+    assert int(worker._ctx_len[scratch]) == 0
+    assert int(worker._valid_len[scratch]) == 0
+    assert not bool(worker._position_initialized[scratch])
+    # A live request's own state is bounded by its lifetime and must survive.
+    assert int(worker._ctx_len[live]) == 17
+    assert int(worker._valid_len[live]) == 5
+    assert bool(worker._position_initialized[live])

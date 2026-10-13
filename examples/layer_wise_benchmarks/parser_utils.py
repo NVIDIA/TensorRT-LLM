@@ -56,13 +56,25 @@ parser_keywords = [
         "CuteDSLGemm",
         ["cute_dsl_kernels", "blockscaled_gemm_persistent"],
     ),
+    # Rubin NVFP4 (BlockScaled) MoE grouped GEMM kernels
     (
-        "CuteDSLGroupedGemmSwiglu",
-        ["cute_dsl_kernels", "blockscaled_contiguous_grouped_gemm_swiglu_fusion"],
+        "CuteDSLGroupedGemmAct",
+        ["cute_dsl_kernels", "BlockScaled", "ActFusionKernel"],
     ),
     (
         "CuteDSLGroupedGemmFinalize",
-        ["cute_dsl_kernels", "blockscaled_contiguous_grouped_gemm_finalize_fusion"],
+        ["cute_dsl_kernels", "BlockScaled", "FinalizeFusionKernel"],
+    ),
+    # Rubin BF16/FP16 MoE grouped GEMM kernels (note: must come after BlockScaled
+    # entries above, since the NVFP4 kernel name also contains
+    # "ContiguousGatherGroupedGemmSwigluFusionKernel" as a substring)
+    (
+        "CuteDSLGroupedGemmSwigluBF16",
+        ["cute_dsl_kernels", "ContiguousGatherGroupedGemmSwigluFusionKernel"],
+    ),
+    (
+        "CuteDSLGroupedGemmFinalizeBF16",
+        ["cute_dsl_kernels", "ContiguousGroupedGemmFinalizeFusionKernel"],
     ),
     ("torchAdd", "at::native::CUDAFunctorOnSelf_add"),
     ("torchAdd", "CUDAFunctor_add"),

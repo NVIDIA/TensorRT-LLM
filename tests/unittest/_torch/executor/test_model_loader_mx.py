@@ -27,6 +27,7 @@ from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.modules.mla import MLA
 from tensorrt_llm._torch.pyexecutor import model_loader as model_loader_mod
 from tensorrt_llm._torch.pyexecutor.model_loader import ModelLoader
+from tensorrt_llm._torch.ugpu.policy import UgpuPolicy
 from tensorrt_llm._torch.weight_sharing import (
     ARTIFACT_IDENTITY_FORMAT_VERSION,
     LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1,
@@ -509,24 +510,59 @@ def test_default_profile_qualifies_real_tiny_llama_lifecycle(
 
 
 @pytest.mark.cpu_only
-def test_separate_draft_model_is_not_qualified_by_target_only_profile(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+@pytest.mark.parametrize(
+    (
+        "registry_speculative_mode",
+        "speculative_mode",
+        "loads_draft_weights",
+        "enable_ugpu",
+        "unsupported_feature",
+    ),
+    [
+        pytest.param(
+            "eagle3_one_model",
+            "eagle3_one_model",
+            True,
+            False,
+            PostTransformFeature.SEPARATE_DRAFT_MODEL,
+            id="separate-draft-model",
+        ),
+        pytest.param(
+            None,
+            None,
+            False,
+            True,
+            PostTransformFeature.UGPU_LOCALIZED_WEIGHTS,
+            id="ugpu-localized-weights",
+        ),
+    ],
+)
+def test_unsupported_feature_is_not_qualified_by_target_only_profile(
+    monkeypatch,
+    registry_speculative_mode,
+    speculative_mode,
+    loads_draft_weights,
+    enable_ugpu,
+    unsupported_feature,
+):
     monkeypatch.setattr(
         ModelLoader,
         "_POST_TRANSFORM_PROFILE_REGISTRY",
-        _tiny_profile_registry(speculative_mode="eagle3_one_model"),
+        _tiny_profile_registry(speculative_mode=registry_speculative_mode),
     )
+    model = _TinyModel([])
+    if enable_ugpu:
+        model.model_config.ugpu_policy = UgpuPolicy(enabled=True)
 
     decision = ModelLoader._qualify_post_transform_profile(
-        _TinyModel([]),
-        speculative_mode="eagle3_one_model",
-        loads_draft_weights=True,
+        model,
+        speculative_mode=speculative_mode,
+        loads_draft_weights=loads_draft_weights,
     )
 
     assert not decision.qualified
     assert decision.reason is PostTransformQualificationReason.FEATURE_NOT_SUPPORTED
-    assert decision.unsupported_features == frozenset({PostTransformFeature.SEPARATE_DRAFT_MODEL})
+    assert decision.unsupported_features == frozenset({unsupported_feature})
 
 
 @pytest.mark.cpu_only
@@ -577,11 +613,29 @@ def test_speculative_mode_name_is_canonical_and_fails_closed(
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "qualification_case",
+    ["unregistered-model", "ugpu-feature"],
+)
 def test_mx_post_transform_receiver_falls_back_for_unqualified_model(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+    monkeypatch,
+    qualification_case,
+):
     events = []
     loader = _make_loader(monkeypatch, events=events)
+    if qualification_case == "ugpu-feature":
+        monkeypatch.setattr(
+            ModelLoader,
+            "_POST_TRANSFORM_PROFILE_REGISTRY",
+            _tiny_profile_registry(),
+        )
+        model = _TinyModel(events)
+        model.model_config.ugpu_policy = UgpuPolicy(enabled=True)
+        monkeypatch.setattr(
+            model_loader_mod.AutoModelForCausalLM,
+            "from_config",
+            MagicMock(return_value=model),
+        )
     checkpoint_loader = _PostTransformMxLoader(post_transform=True)
 
     model, _ = loader.load("/ckpt", checkpoint_loader)

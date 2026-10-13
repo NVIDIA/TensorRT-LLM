@@ -27,7 +27,7 @@ graph-capturable.
 import pytest
 import torch
 
-from tensorrt_llm._torch.models.dspark.attention import (
+from tensorrt_llm._torch.models.modeling_dspark import (
     apply_dspark_rotary,
     apply_dspark_rotary_batched,
     dspark_attention_forward,
@@ -127,12 +127,14 @@ def _batched(g, persist=False):
     G = g["G"]
     start_pos = torch.tensor(g["start_positions"], dtype=torch.long)
     slots = torch.arange(G, dtype=torch.long)
+    valid_len = torch.clamp(start_pos + 1, max=g["window"])
     return dspark_attention_forward_batched(
         g["x"],
         g["main_x"],
         start_pos,
         g["kv_cache"].clone(),
         slots,
+        valid_len,
         persist=persist,
         **_attn_kwargs(g),
     )
@@ -160,8 +162,9 @@ def test_batched_attention_persist_writes_through_window():
     slots = torch.arange(G, dtype=torch.long)
     cache = g["kv_cache"].clone()
     before = cache.clone()
+    valid_len = torch.clamp(start_pos + 1, max=win)
     dspark_attention_forward_batched(
-        g["x"], g["main_x"], start_pos, cache, slots, persist=True, **_attn_kwargs(g)
+        g["x"], g["main_x"], start_pos, cache, slots, valid_len, persist=True, **_attn_kwargs(g)
     )
     # Exactly the start_pos%win row of each request changed.
     for i, sp in enumerate(g["start_positions"]):
@@ -184,7 +187,8 @@ def test_batched_topk_matches_scalar(start_positions):
     """Fixed-size masked batched topk == scalar topk per request (valid slots)."""
     window, block = 8, 3
     start_pos = torch.tensor(start_positions, dtype=torch.long)
-    batched = get_dspark_topk_idxs_batched(window, block, start_pos)
+    valid_len = torch.clamp(start_pos + 1, max=window)
+    batched = get_dspark_topk_idxs_batched(window, block, start_pos, valid_len)
     assert tuple(batched.shape) == (len(start_positions), block, window + block)
     for i, sp in enumerate(start_positions):
         scalar = get_dspark_topk_idxs(window, 1, block, int(sp))[0]  # [block, topk_i]
@@ -239,6 +243,7 @@ def test_batched_attention_cuda_graph_capture_replay():
     G = g["G"]
     start_pos = torch.tensor(g["start_positions"], dtype=torch.long, device=dev)
     slots = torch.arange(G, dtype=torch.long, device=dev)
+    valid_len = torch.clamp(start_pos + 1, max=g["window"])
     # Static input tensors the graph reads/writes.
     x = g["x"].to(dev)
     main_x = g["main_x"].to(dev)
@@ -247,7 +252,7 @@ def test_batched_attention_cuda_graph_capture_replay():
 
     def run(persist):
         return dspark_attention_forward_batched(
-            x, main_x, start_pos, cache, slots, persist=persist, **kw
+            x, main_x, start_pos, cache, slots, valid_len, persist=persist, **kw
         )
 
     eager = run(persist=False)

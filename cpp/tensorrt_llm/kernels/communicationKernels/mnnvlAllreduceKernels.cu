@@ -336,6 +336,7 @@ struct MnnvlAllReduceKernelParams
     uint32_t* bufferFlags;
     bool waitForResults;
     QuantizationSFLayout layout;
+    int sfLeadingDim = 0;
 };
 
 template <typename PackedType, typename T>
@@ -537,6 +538,80 @@ inline __device__ void quantizeEpilogue(PackedVec<PackedType, T> const& value,
                 = static_cast<__nv_fp8_e4m3>(static_cast<float>(value.elements[i]) * scale);
         }
         reinterpret_cast<PackedQuantizedType*>(params.quantOutPtr)[packedAccessIdx] = quantized;
+    }
+    else if constexpr (ar_fusion::GetQuantType<Pattern> == ar_fusion::QuantType::kFP8BlockScale)
+    {
+        // 1x128 UE8M0 block scale in deep_gemm's packed MN-major layout.
+        // 16 consecutive threads cover one 128-element block, which holds
+        // because loadStride == blockDim.x and blockChunkSize % 128 == 0.
+        static_assert(kELTS_PER_THREAD == 8, "FP8 block-scale quant expects eight elements per 16-byte access.");
+        constexpr int kQuantBlock = 128;
+        constexpr int kThreadsPerQuantBlock = kQuantBlock / kELTS_PER_THREAD;
+        float amax = 0.f;
+#pragma unroll
+        for (int i = 0; i < kELTS_PER_THREAD; ++i)
+        {
+            amax = fmaxf(amax, fabsf(cuda_cast<float, T>(value.elements[i])));
+        }
+#pragma unroll
+        for (int off = kThreadsPerQuantBlock / 2; off > 0; off >>= 1)
+        {
+            amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFFu, amax, off, kThreadsPerQuantBlock));
+        }
+        amax = fmaxf(amax, 1e-10f);
+
+        float rcp448;
+        asm volatile("rcp.approx.ftz.f32 %0, %1;\n" : "=f"(rcp448) : "f"(448.0f));
+        __nv_fp8_e8m0 ue8m0Scale;
+        ue8m0Scale.__x = __nv_cvt_float_to_e8m0(amax * rcp448, __NV_SATFINITE, cudaRoundPosInf);
+        constexpr float kFp32ExponentBias = 127.f;
+        float const quantScale
+            = (ue8m0Scale.__x == 0) ? 1.0f : exp2f(kFp32ExponentBias - static_cast<float>(ue8m0Scale.__x));
+
+        union StoreTrick
+        {
+            uint2 pack;
+            __nv_fp8_e4m3 v[kELTS_PER_THREAD];
+        };
+
+        StoreTrick storeTrick;
+#pragma unroll
+        for (int i = 0; i < kELTS_PER_THREAD; ++i)
+        {
+            storeTrick.v[i] = __nv_fp8_e4m3(cuda_cast<float, T>(value.elements[i]) * quantScale);
+        }
+        reinterpret_cast<uint2*>(params.quantOutPtr)[packedAccessIdx] = storeTrick.pack;
+
+        auto* sfBytes = reinterpret_cast<uint8_t*>(params.scaleOutPtr);
+        int const numSfK = params.tokenDim / kQuantBlock;
+        if (accessIdInToken % kThreadsPerQuantBlock == 0)
+        {
+            int const sfK = accessIdInToken / kThreadsPerQuantBlock;
+            sfBytes[(static_cast<size_t>(sfK / 4) * params.sfLeadingDim + token) * 4 + (sfK % 4)]
+                = static_cast<uint8_t>(ue8m0Scale.__x);
+        }
+        // Bytes no real store covers but the GEMM still reads: this row's tail
+        // of the last packed uint32, and the rows padded up to sfLeadingDim.
+        if (accessIdInToken == 0)
+        {
+            int const numPackedSfK = (numSfK + 3) / 4;
+            for (int sfK = numSfK; sfK < numPackedSfK * 4; ++sfK)
+            {
+                sfBytes[(static_cast<size_t>(sfK / 4) * params.sfLeadingDim + token) * 4 + (sfK % 4)] = 0;
+            }
+            if (token == 0)
+            {
+                for (int row = params.numTokens; row < params.sfLeadingDim; ++row)
+                {
+                    for (int p = 0; p < numPackedSfK; ++p)
+                    {
+                        reinterpret_cast<uint32_t*>(
+                            params.scaleOutPtr)[static_cast<size_t>(p) * params.sfLeadingDim + row]
+                            = 0u;
+                    }
+                }
+            }
+        }
     }
     else
     {
@@ -741,6 +816,11 @@ using detail::requiresTwoAccessScaleGroup;
 
 void oneshotAllreduceFusionOp(AllReduceFusionParams const& params)
 {
+    if (params.pattern == ar_fusion::AllReduceFusionPattern::kARRMSNormFP8BlockScale)
+    {
+        TLLM_CHECK_WITH_INFO(params.tokenDim % 128 == 0 && params.sfLeadingDim > 0,
+            "[MNNVL] FP8 block-scale quant needs tokenDim %% 128 == 0 and a scale leading dim");
+    }
 
     static int const kSMVersion = tensorrt_llm::common::getSMVersion();
     TLLM_CHECK_WITH_INFO(kSMVersion >= 90, "[MNNVL AllReduceOneShot] requires SM 90 or newer.");
@@ -823,6 +903,17 @@ void oneshotAllreduceFusionOp(AllReduceFusionParams const& params)
     {                                                                                                                  \
         LAUNCH_ALLREDUCE_KERNEL(WORLD_SIZE, T, ar_fusion::AllReduceFusionPattern::kARRMSNorm);                         \
     }                                                                                                                  \
+    else if (params.pattern == ar_fusion::AllReduceFusionPattern::kARRMSNormFP8BlockScale)                             \
+    {                                                                                                                  \
+        if constexpr (!std::is_same_v<T, float>)                                                                       \
+        {                                                                                                              \
+            LAUNCH_ALLREDUCE_KERNEL(WORLD_SIZE, T, ar_fusion::AllReduceFusionPattern::kARRMSNormFP8BlockScale);        \
+        }                                                                                                              \
+        else                                                                                                           \
+        {                                                                                                              \
+            TLLM_CHECK_WITH_INFO(false, "[MNNVL AllReduceOneShot] FP8 block-scale quant needs FP16/BF16 input.");      \
+        }                                                                                                              \
+    }                                                                                                                  \
     else                                                                                                               \
     {                                                                                                                  \
         TLLM_CHECK_WITH_INFO(false, "[MNNVL AllReduceOneShot] Unsupported fusion pattern.");                           \
@@ -841,7 +932,7 @@ void oneshotAllreduceFusionOp(AllReduceFusionParams const& params)
         MnnvlAllReduceKernelParams<T> kernelParams{output, residualOut, input, residualIn, gamma, ucPtrs,
             reinterpret_cast<T*>(params.bufferPtrLocal), mcPtr, params.quantOut, params.scaleOut, params.scaleFactor,
             numTokens, tokenDim, params.nRanks, params.rank, static_cast<float>(params.epsilon), params.bufferFlags,
-            false, params.layout};
+            false, params.layout, params.sfLeadingDim};
 
         switch (params.nRanks)
         {
@@ -1190,6 +1281,11 @@ __global__ __launch_bounds__(1024) void rmsNormLamport(MnnvlAllReduceKernelParam
 
 void twoshotAllreduceFusionOp(AllReduceFusionParams const& params)
 {
+    if (params.pattern == ar_fusion::AllReduceFusionPattern::kARRMSNormFP8BlockScale)
+    {
+        TLLM_CHECK_WITH_INFO(params.tokenDim % 128 == 0 && params.sfLeadingDim > 0,
+            "[MNNVL] FP8 block-scale quant needs tokenDim %% 128 == 0 and a scale leading dim");
+    }
     static int const kSMVersion = tensorrt_llm::common::getSMVersion();
     TLLM_CHECK_WITH_INFO(kSMVersion >= 90, "[MNNVL AllReduceTwoShot] requires SM 90 or newer.");
     int const numTokens = params.numTokens;
@@ -1232,7 +1328,7 @@ void twoshotAllreduceFusionOp(AllReduceFusionParams const& params)
             reinterpret_cast<T const*>(params.residualIn), reinterpret_cast<T const*>(params.gamma), ucPtrs,
             reinterpret_cast<T*>(params.bufferPtrLocal), mcastPtr, params.quantOut, params.scaleOut, params.scaleFactor,
             numTokens, tokenDim, params.nRanks, params.rank, static_cast<float>(params.epsilon), params.bufferFlags,
-            !params.rmsNormFusion, params.layout};
+            !params.rmsNormFusion, params.layout, params.sfLeadingDim};
         switch (params.nRanks)
         {
         case 2: LAUNCH_ALLREDUCE_KERNEL(2, T); return true;
@@ -1351,6 +1447,18 @@ void twoshotAllreduceFusionOp(AllReduceFusionParams const& params)
     {                                                                                                                  \
         RUN_RMSNORM_KERNEL(T, ar_fusion::AllReduceFusionPattern::kARRMSNorm, USE_CGA, LOADS_PER_THREAD);               \
     }                                                                                                                  \
+    else if (params.pattern == ar_fusion::AllReduceFusionPattern::kARRMSNormFP8BlockScale)                             \
+    {                                                                                                                  \
+        if constexpr (!std::is_same_v<T, float>)                                                                       \
+        {                                                                                                              \
+            RUN_RMSNORM_KERNEL(                                                                                        \
+                T, ar_fusion::AllReduceFusionPattern::kARRMSNormFP8BlockScale, USE_CGA, LOADS_PER_THREAD);             \
+        }                                                                                                              \
+        else                                                                                                           \
+        {                                                                                                              \
+            TLLM_CHECK_WITH_INFO(false, "[MNNVL AllReduceTwoShot] FP8 block-scale quant needs FP16/BF16 input.");      \
+        }                                                                                                              \
+    }                                                                                                                  \
     else                                                                                                               \
     {                                                                                                                  \
         TLLM_CHECK_WITH_INFO(false, "[MNNVL AllReduceTwoShot] Unsupported RMSNorm fusion pattern.");                   \
@@ -1366,7 +1474,7 @@ void twoshotAllreduceFusionOp(AllReduceFusionParams const& params)
                 reinterpret_cast<T**>(params.bufferPtrsDev), reinterpret_cast<T*>(params.bufferPtrLocal),
                 reinterpret_cast<T*>(params.multicastPtr), params.quantOut, params.scaleOut, params.scaleFactor,
                 numTokens, tokenDim, params.nRanks, params.rank, static_cast<float>(params.epsilon), params.bufferFlags,
-                false, params.layout};
+                false, params.layout, params.sfLeadingDim};
             if (rnUseCGA)
             {
                 DISPATCH_RMSNORM_PATTERN(T, true, 1);

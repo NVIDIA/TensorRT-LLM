@@ -19,6 +19,10 @@ file(GLOB_RECURSE SRC_CPP *.cpp)
 file(GLOB_RECURSE SRC_CU *.cu)
 
 add_library(trtllm_gen_fp8_block_scale_moe OBJECT ${SRC_CPP} ${SRC_CU})
+if(TLLM_RUBIN_FEATURES)
+  target_compile_definitions(trtllm_gen_fp8_block_scale_moe
+                             PUBLIC TLLM_RUBIN_FEATURES=1)
+endif()
 set_property(TARGET trtllm_gen_fp8_block_scale_moe
              PROPERTY POSITION_INDEPENDENT_CODE ON)
 set_property(TARGET trtllm_gen_fp8_block_scale_moe

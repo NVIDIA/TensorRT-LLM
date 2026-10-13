@@ -55,37 +55,28 @@ done
 
 # Per-mode batch shape and the tuned env. MAX_BATCH_SIZE is PER-RANK for
 # dep16 (attention DP), GLOBAL for the TEP modes.
-#   KIMI_K3_FP8_WEIGHT_READ=1  opt-in FP8 (lossy) read of the replicated
-#       BF16 weights — default OFF in the loader, so every mode sets it
-#       explicitly: all recipes below were tuned and measured with it on.
-#   KIMI_K3_FP8_WEIGHT_READ_KDA=0  keep the KDA q/k/v/g/o projections in
-#       BF16 within the enabled master (the most precision-sensitive slice).
-#   KIMI_K3_FP8_WEIGHT_READ_GATE_UP=1  FP8 shared-expert gate_up read at TEP
-#       (with the master on it defaults on only under attention DP): +8-9%
-#       with stream_interval >= 10.
+# Attention formats follow checkpoint quantization. BF16 shared/latent MLP
+# conversion is opt-in; KIMI_K3_FP8_WEIGHT_READ_MOE_MLP=1 enables it.
 #   TLLM_TRTLLMGEN_FORCE_SEPARATED_ROUTING=1  host-side routing; the in-cubin
 #       top-k tier register-spills at decode batch 5-64 (33 us/layer).
 case "$MODE" in
     dep16)
         TP_SIZE=16; MAX_BATCH_SIZE=64
         DEFAULT_CONCURRENCIES="16 32 64 128 256 512 1024"
-        MODE_ENV="KIMI_K3_FP8_WEIGHT_READ=1"
+        MODE_ENV=""
         ;;
     tep16)
         TP_SIZE=16; MAX_BATCH_SIZE=16
         DEFAULT_CONCURRENCIES="1 2 4 8 16"
-        MODE_ENV="KIMI_K3_FP8_WEIGHT_READ=1 KIMI_K3_FP8_WEIGHT_READ_KDA=0 KIMI_K3_FP8_WEIGHT_READ_GATE_UP=1"
-        # BF16 KDA read + FP8 gate_up at tp16 measured ~40% better
-        # tps/user at c1 than the base FP8 recipe, at equal-or-better
-        # GSM8K accuracy. Do NOT add the separated-routing env here: at
-        # tp16 it costs accuracy on its own and, combined with the FP8
-        # gate_up read, collapses GSM8K entirely; that pair is validated
-        # for tep8 only.
+        MODE_ENV=""
+        # Historical: the per-slice FP8 overrides were retired. Attention FP8 is
+        # now checkpoint-driven and gate_up follows attention DP, so this
+        # mode runs the plain stack. Do NOT add the separated-routing env here.
         ;;
     tep8)
         TP_SIZE=8; MAX_BATCH_SIZE=16
         DEFAULT_CONCURRENCIES="1 2 4 8 16"
-        MODE_ENV="KIMI_K3_FP8_WEIGHT_READ=1 KIMI_K3_FP8_WEIGHT_READ_GATE_UP=1 TLLM_TRTLLMGEN_FORCE_SEPARATED_ROUTING=1"
+        MODE_ENV="TLLM_TRTLLMGEN_FORCE_SEPARATED_ROUTING=1"
         ;;
     *) echo "error: unknown --mode: $MODE (dep16|tep16|tep8)" >&2; exit 2 ;;
 esac
@@ -101,15 +92,15 @@ REPO=${REPO_ARG:-$(cd "$SCRIPT_DIR/../../.." && pwd)}
 WORK_DIR=$SLURM_SUBMIT_DIR/kimi-k3-sweep-$MODE${TAG:+-$TAG}-$SLURM_JOB_ID
 mkdir -p "$WORK_DIR"
 
-# Tuned serving config per mode. stream_interval 10 removes the ~18 ms/token
-# host streaming floor (TPOT metric unaffected: (latency-TTFT)/(len-1)).
+# Tuned serving config per mode. stream_interval 10 removes the host
+# streaming floor from the user-visible stream (TPOT metric unaffected:
+# (latency-TTFT)/(len-1)).
 CONFIG_FILE=$WORK_DIR/serve_config.yaml
 case "$MODE" in
     dep16)
         # moe max_num_tokens 33024: fewer serialized A2A chunk rounds per
-        # prefill wave (TTFT -4-6%). use_low_precision_moe_combine: FP8 A2A
-        # combine payload, +3.6-4.6% at c64-128 (GSM8K 96.74). enable_padding:
-        # ADP graphs are all-or-nothing without it.
+        # prefill wave. use_low_precision_moe_combine: FP8 A2A combine payload.
+        # enable_padding: ADP graphs are all-or-nothing without it.
         cat > "$CONFIG_FILE" <<'EOF'
 enable_attention_dp: true
 moe_expert_parallel_size: 16

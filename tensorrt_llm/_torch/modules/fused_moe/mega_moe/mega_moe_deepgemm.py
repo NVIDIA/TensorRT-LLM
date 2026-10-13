@@ -256,8 +256,8 @@ class MegaMoEDeepGemm(MoE):
         layer_idx: Optional[int] = None,
         activation_type: ActivationType = ActivationType.Swiglu,
         init_load_balancer: bool = True,
-        # DG tunables. ``activation=None`` infers Kimi K3 SiTU from the
-        # pretrained config and otherwise defaults to SwiGLU.
+        # DG tunables. ``activation=None`` is SwiGLU. SiTU is never inferred
+        # from pretrained_config; pass activation='situ' and both betas.
         activation: Optional[str] = None,
         swiglu_limit_scalar: Optional[float] = None,
         fast_math: bool = True,
@@ -295,20 +295,17 @@ class MegaMoEDeepGemm(MoE):
         # Also gated in ``can_implement``, but that only covers the resolution
         # path; this catches direct construction.
         _assert_num_slots_divisible_by_ep(self.num_slots, self.ep_size)
-        activation, situ_beta, situ_linear_beta = self._resolve_activation_config(
-            model_config,
-            activation=activation,
-            situ_beta=situ_beta,
-            situ_linear_beta=situ_linear_beta,
-        )
+        # SiTU arrives already validated and translated by
+        # ``create_moe_backend``; never inferred from pretrained_config.
+        activation = (activation or "swiglu").lower()
         if activation == "situ" and swiglu_limit_scalar is not None:
             raise ValueError("MegaMoEDeepGemm SiTU does not support activation_clamp.")
         self.apply_router_weight_on_input = apply_router_weight_on_input
         self.activation = activation
         self.swiglu_limit_scalar = swiglu_limit_scalar
         self.fast_math = fast_math
-        self.situ_beta = situ_beta
-        self.situ_linear_beta = situ_linear_beta
+        self.situ_beta = None if situ_beta is None else float(situ_beta)
+        self.situ_linear_beta = None if situ_linear_beta is None else float(situ_linear_beta)
 
         # Buffer sizing. MoE layers execute serially per forward; a single
         # process-level pool sized to worst-case per-rank tokens serves all.
@@ -367,46 +364,6 @@ class MegaMoEDeepGemm(MoE):
         self.quant_method = None
         if not model_config.skip_create_weights_in_init:
             self.create_weights()
-
-    @staticmethod
-    def _resolve_activation_config(
-        model_config: ModelConfig,
-        *,
-        activation: Optional[str],
-        situ_beta: Optional[float],
-        situ_linear_beta: Optional[float],
-    ) -> Tuple[str, Optional[float], Optional[float]]:
-        pretrained_config = model_config.pretrained_config
-        text_config = getattr(pretrained_config, "text_config", None)
-        config_situ_beta = getattr(pretrained_config, "activation_situ_beta", None)
-        config_situ_linear_beta = getattr(pretrained_config, "activation_situ_linear_beta", None)
-        if config_situ_beta is None:
-            config_situ_beta = getattr(text_config, "activation_situ_beta", None)
-        if config_situ_linear_beta is None:
-            config_situ_linear_beta = getattr(text_config, "activation_situ_linear_beta", None)
-        if activation is None:
-            activation = "situ" if config_situ_beta is not None else "swiglu"
-        activation = activation.lower()
-        if activation not in ("swiglu", "situ"):
-            raise ValueError(
-                f"MegaMoEDeepGemm activation must be 'swiglu' or 'situ'; got {activation!r}."
-            )
-        if activation == "swiglu":
-            if situ_beta is not None or situ_linear_beta is not None:
-                raise ValueError("SiTU beta parameters require activation='situ'.")
-            return activation, None, None
-
-        situ_beta = config_situ_beta if situ_beta is None else situ_beta
-        situ_linear_beta = config_situ_linear_beta if situ_linear_beta is None else situ_linear_beta
-        if situ_beta is None or situ_linear_beta is None:
-            raise ValueError(
-                "MegaMoEDeepGemm SiTU requires activation_situ_beta and "
-                "activation_situ_linear_beta in the pretrained config, or "
-                "explicit situ_beta and situ_linear_beta arguments."
-            )
-        if situ_beta <= 0 or situ_linear_beta <= 0:
-            raise ValueError("MegaMoEDeepGemm SiTU beta parameters must be positive.")
-        return activation, float(situ_beta), float(situ_linear_beta)
 
     def _supports_load_balancer(self) -> bool:
         # The DeepGEMM mega kernel routes by `topk_idx` interpreted as slot id
@@ -469,13 +426,24 @@ class MegaMoEDeepGemm(MoE):
                 return (host, port)
             return None
 
-        # Respect pre-set launcher env vars (Slurm, Ray, torchrun).
-        if not all(os.environ.get(k) for k in ("MASTER_ADDR", "MASTER_PORT", "RANK", "WORLD_SIZE")):
+        # Respect launcher env vars only when they describe this MPI world.
+        # A disaggregated launcher may export its outer context/generation
+        # world into each server's independent model MPI world.
+        launcher_env_matches_mpi = False
+        if all(os.environ.get(k) for k in ("MASTER_ADDR", "MASTER_PORT", "RANK", "WORLD_SIZE")):
+            try:
+                launcher_env_matches_mpi = (
+                    int(os.environ["RANK"]) == rank and int(os.environ["WORLD_SIZE"]) == world_size
+                )
+            except ValueError:
+                pass
+
+        if not launcher_env_matches_mpi:
             host, port = comm.bcast(_pick_rendezvous(), root=0)
-            os.environ.setdefault("MASTER_ADDR", host)
-            os.environ.setdefault("MASTER_PORT", str(port))
-            os.environ.setdefault("RANK", str(rank))
-            os.environ.setdefault("WORLD_SIZE", str(world_size))
+            os.environ["MASTER_ADDR"] = host
+            os.environ["MASTER_PORT"] = str(port)
+            os.environ["RANK"] = str(rank)
+            os.environ["WORLD_SIZE"] = str(world_size)
         else:
             host = os.environ["MASTER_ADDR"]
             port = int(os.environ["MASTER_PORT"])

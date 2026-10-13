@@ -31,6 +31,7 @@ from transformers.utils import HF_MODULES_CACHE
 from tensorrt_llm._torch.pyexecutor.config_utils import (
     get_kimi_linear_num_attention_layers, get_qwen3_hybrid_num_attention_layers,
     is_kimi_linear, is_nemotron_hybrid, is_qwen3_hybrid, load_pretrained_config)
+from tensorrt_llm._torch.ugpu.policy import UgpuPolicy
 from tensorrt_llm._utils import (get_sm_version, is_sm_100f,
                                  torch_dtype_to_binding)
 from tensorrt_llm.bindings import LayerType as LayerTypeCpp
@@ -46,8 +47,8 @@ from tensorrt_llm.models.quant_config_utils import \
     update_quant_config_from_compressed_tensors
 from tensorrt_llm.quantization.mode import QuantAlgo
 from tensorrt_llm.quantization.modelopt_config import (
-    is_modelopt_quant_config, read_modelopt_quant_config,
-    warn_if_inline_diverges)
+    canonicalize_quant_algo, is_modelopt_quant_config,
+    read_modelopt_quant_config, warn_if_inline_diverges)
 
 if TYPE_CHECKING:
     from tensorrt_llm.bindings import ModelConfig as ModelConfigCpp
@@ -182,6 +183,11 @@ class ModelConfig(Generic[TConfig]):
     max_seq_len: Optional[int] = None
 
     moe_max_num_tokens: Optional[int] = None
+    # Set in __post_init__; a normal field, not init=False, so that
+    # dataclasses.replace() and copy.copy() carry it.
+    _moe_max_num_tokens_is_default: Optional[bool] = field(default=None,
+                                                           repr=False,
+                                                           compare=False)
     moe_load_balancer: Optional[MoeLoadBalancerConfig] = None
 
     attn_backend: str = 'TRTLLM'
@@ -190,6 +196,7 @@ class ModelConfig(Generic[TConfig]):
     moe_disable_finalize_fusion: bool = False
     # If true, use low precision combine in MoE operations (only for NVFP4 quantization)
     use_low_precision_moe_combine: bool = False
+    use_lamport_sync: bool = False
 
     # NVFP4 GEMM backend configuration - list of backends to consider for auto-selection
     # Default excludes 'cutedsl' for faster build time. Add 'cutedsl' for extreme perf.
@@ -216,6 +223,9 @@ class ModelConfig(Generic[TConfig]):
     use_cute_dsl_blockscaling_bmm: bool = False
     use_cute_dsl_bf16_bmm: bool = False
     use_cute_dsl_bf16_gemm: bool = False
+
+    # uGPU execution policy (controls partitioned linear/MoE execution)
+    ugpu_policy: UgpuPolicy = field(default_factory=UgpuPolicy)
 
     _frozen: bool = field(default=False, init=False, repr=False)
 
@@ -284,8 +294,25 @@ class ModelConfig(Generic[TConfig]):
 
         # Set default moe_max_num_tokens if not specified
         # The maximum number of tokens in MoE are multiplied by DP size when attention DP is enabled
+        # Record the provenance first: once filled in, a derived size is
+        # indistinguishable from one a deployment configured to the same number.
+        if self._moe_max_num_tokens_is_default is None:
+            self._moe_max_num_tokens_is_default = self.moe_max_num_tokens is None
         if self.moe_max_num_tokens is None:
             self.moe_max_num_tokens = self.max_num_tokens * self.mapping.dp_size
+
+        self.extra_attrs["ugpu_policy"] = self.ugpu_policy
+
+    def is_moe_max_num_tokens_default(self) -> bool:
+        """Whether ``moe_max_num_tokens`` was derived rather than configured.
+
+        A MoE backend with a conservative workspace cap uses this to clamp only
+        the derived size. A config rebuilt from another one's
+        ``moe_max_num_tokens`` -- the draft configs in
+        ``modeling_speculative.py`` -- reads as configured, which is safe: the
+        target's first MoE layer has already capped the forwarded size.
+        """
+        return bool(self._moe_max_num_tokens_is_default)
 
     @property
     def torch_dtype(self) -> torch.dtype:
@@ -454,9 +481,12 @@ class ModelConfig(Generic[TConfig]):
         quant_config = QuantConfig()
         layer_quant_config = None
 
-        quant_config.quant_algo = (QuantAlgo(json_quant_configs['quant_algo'])
-                                   if json_quant_configs.get('quant_algo')
-                                   is not None else None)
+        # ``canonicalize_quant_algo`` is applied again here (and per layer
+        # below) because the ``quant_cfg.json`` overlay merged in for
+        # MIXED_PRECISION bypasses ``read_modelopt_quant_config``.
+        quant_config.quant_algo = (
+            QuantAlgo(canonicalize_quant_algo(json_quant_configs['quant_algo']))
+            if json_quant_configs.get('quant_algo') is not None else None)
         quant_config.kv_cache_quant_algo = (
             QuantAlgo(json_quant_configs['kv_cache_quant_algo']) if
             json_quant_configs.get('kv_cache_quant_algo') is not None else None)
@@ -508,7 +538,8 @@ class ModelConfig(Generic[TConfig]):
                 layer_cfg = mixed_quant_configs[layer]
                 config = QuantConfig()
                 config.kv_cache_quant_algo = kv_cache_quant_algo
-                config.quant_algo = QuantAlgo(layer_cfg['quant_algo'])
+                config.quant_algo = QuantAlgo(
+                    canonicalize_quant_algo(layer_cfg['quant_algo']))
                 config.group_size = layer_cfg.get('group_size', None)
                 # AWQ-specific extras emitted by modelopt per-layer.
                 if 'has_zero_point' in layer_cfg:
@@ -918,6 +949,8 @@ class ModelConfig(Generic[TConfig]):
                 q_split_threshold = sparse_attention_config.q_split_threshold
                 indexer_rope_interleave = sparse_attention_config.indexer_rope_interleave
                 enable_heuristic_topk = sparse_attention_config.enable_heuristic_topk
+                use_self_sampling_topk = sparse_attention_config.use_self_sampling_topk
+                use_gvr_emission = sparse_attention_config.use_gvr_emission
                 indexer_k_dtype = sparse_attention_config.indexer_k_dtype
             else:
                 index_n_heads = pretrained_config.index_n_heads
@@ -931,6 +964,8 @@ class ModelConfig(Generic[TConfig]):
                 q_split_threshold = 8192
                 indexer_rope_interleave = False
                 enable_heuristic_topk = False
+                use_self_sampling_topk = True
+                use_gvr_emission = False
                 default_sparse_attention_config = DeepSeekV4SparseAttentionConfig(
                 )
                 indexer_k_dtype = default_sparse_attention_config.indexer_k_dtype
@@ -947,6 +982,8 @@ class ModelConfig(Generic[TConfig]):
             indexer_config['q_split_threshold'] = q_split_threshold
             indexer_config['indexer_rope_interleave'] = indexer_rope_interleave
             indexer_config['enable_heuristic_topk'] = enable_heuristic_topk
+            indexer_config['use_self_sampling_topk'] = use_self_sampling_topk
+            indexer_config['use_gvr_emission'] = use_gvr_emission
             indexer_config['indexer_k_dtype'] = indexer_k_dtype
             return indexer_config
 
@@ -984,6 +1021,8 @@ class ModelConfig(Generic[TConfig]):
                         use_cute_dsl_paged_mqa_logits = sparse_attention_config.use_cute_dsl_paged_mqa_logits
                         q_split_threshold = sparse_attention_config.q_split_threshold
                         enable_heuristic_topk = sparse_attention_config.enable_heuristic_topk
+                        use_self_sampling_topk = sparse_attention_config.use_self_sampling_topk
+                        use_gvr_emission = sparse_attention_config.use_gvr_emission
                         indexer_k_dtype = sparse_attention_config.indexer_k_dtype
                         index_share_for_mtp_iteration = sparse_attention_config.index_share_for_mtp_iteration
                     else:
@@ -996,6 +1035,8 @@ class ModelConfig(Generic[TConfig]):
                         use_cute_dsl_paged_mqa_logits = False
                         q_split_threshold = 8192
                         enable_heuristic_topk = False
+                        use_self_sampling_topk = True
+                        use_gvr_emission = False
                         indexer_k_dtype = "fp8"
                         index_share_for_mtp_iteration = None
                     kwargs[
@@ -1012,6 +1053,8 @@ class ModelConfig(Generic[TConfig]):
                             q_split_threshold=q_split_threshold,
                             indexer_rope_interleave=indexer_rope_interleave,
                             enable_heuristic_topk=enable_heuristic_topk,
+                            use_self_sampling_topk=use_self_sampling_topk,
+                            use_gvr_emission=use_gvr_emission,
                             indexer_k_dtype=indexer_k_dtype,
                             index_share_for_mtp_iteration=
                             index_share_for_mtp_iteration)

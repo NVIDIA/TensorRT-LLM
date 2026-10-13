@@ -19,7 +19,7 @@ import pytest
 import torch
 from parameterized import parameterized
 from utils.util import (skip_blackwell_geforce, skip_pre_blackwell_unittest,
-                        unittest_name_func)
+                        skip_rubin, unittest_name_func)
 
 import tensorrt_llm
 import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
@@ -95,6 +95,7 @@ class TestFunctional(unittest.TestCase):
         name_func=unittest_name_func,
     )
     @skip_pre_blackwell_unittest
+    @skip_rubin  # skipped due to lacking rubin nvfp4 x fp8 support
     @skip_blackwell_geforce
     def test_fp4_quantize_gemm_trtllmgen(self, m, n, k):
         a = torch.randn([m, k], dtype=torch.float32)
@@ -135,6 +136,7 @@ class TestFunctional(unittest.TestCase):
         name_func=unittest_name_func,
     )
     @skip_pre_blackwell_unittest
+    @skip_rubin  # skipped due to lacking rubin nvfp4 x fp8 support
     @skip_blackwell_geforce
     def test_fp4_fp8_gemm_trtllmgen(self, m, n, k):
         a = torch.randn([m, k], dtype=torch.float32)

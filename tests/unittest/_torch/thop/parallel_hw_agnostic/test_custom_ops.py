@@ -16,6 +16,7 @@
 import pytest
 import torch
 import torch._library.utils as library_utils
+from torch._subclasses.fake_tensor import FakeTensorMode
 
 import tensorrt_llm  # noqa: F401
 
@@ -131,3 +132,48 @@ def test_register_fake(custom_ops):
 
     names = ", ".join(op._name for op in ops_missing_fake_impl)
     assert len(ops_missing_fake_impl) == 0, f"Custom ops missing fake impl: {names}"
+
+
+def test_nvfp4_gemm_inplace_contract():
+    inplace_op = torch.ops.trtllm.nvfp4_gemm_inplace.default
+    schema = inplace_op._schema
+    assert [argument.name for argument in schema.arguments] == [
+        "act_fp4",
+        "weight",
+        "act_sf",
+        "weight_scale",
+        "alpha",
+        "output_dtype",
+        "to_userbuffers",
+        "allowed_backends",
+        "output_tensor",
+        "partition_id",
+    ]
+    assert {
+        argument.name
+        for argument in schema.arguments
+        if argument.alias_info is not None and argument.alias_info.is_write
+    } == {"output_tensor"}
+    assert len(schema.returns) == 0
+
+    with FakeTensorMode():
+        act_fp4 = torch.empty((2, 4), dtype=torch.uint8)
+        weight = torch.empty((8, 4), dtype=torch.uint8)
+        act_sf = torch.empty((2, 1), dtype=torch.float32)
+        weight_scale = torch.empty((8, 1), dtype=torch.float32)
+        alpha = torch.empty(1, dtype=torch.float32)
+        output_tensor = torch.empty((2, 16), dtype=torch.bfloat16)
+        result = inplace_op(
+            act_fp4,
+            weight,
+            act_sf,
+            weight_scale,
+            alpha,
+            torch.bfloat16,
+            False,
+            "cutedsl",
+            output_tensor,
+            0,
+        )
+
+    assert result is None

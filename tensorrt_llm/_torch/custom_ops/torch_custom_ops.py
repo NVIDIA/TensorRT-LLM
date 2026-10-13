@@ -14,7 +14,6 @@
 # limitations under the License.
 
 import enum
-import os
 import threading
 from dataclasses import replace
 from functools import lru_cache
@@ -36,7 +35,8 @@ from ..autotuner import (AutoTuner, ConstraintSpec, DistributedTuningStrategy,
                          DynamicTensorSpec, OptimizationProfile, TunableRunner,
                          TuningConfig)
 from ..cublaslt_utils import IS_CUBLASLT_AVAILABLE
-from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
+from ..cute_dsl_utils import (IS_CUTLASS_DSL_AVAILABLE,
+                              IS_CUTLASS_DSL_INTERNAL_AVAILABLE)
 from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE, get_env_enable_pdl
 from .fast_custom_op import fast_custom_op
 
@@ -45,14 +45,19 @@ if IS_FLASHINFER_AVAILABLE:
 
 from ..modules.multi_stream_utils import do_multi_stream
 from ..modules.swiglu import silu_and_mul_kernel
-from ..utils import (ActivationType, deep_gemm_gen_tuning_buckets,
+from ..utils import (ActivationType, deep_gemm_jit_warmup_buckets,
                      fp4_scale_infer_shape,
                      get_last_power_of_2_num_tokens_buckets,
-                     is_nvfp4_marlin_supported_sm, last_positive_power_of_2)
+                     is_nvfp4_marlin_supported_sm, last_positive_power_of_2,
+                     mxfp8_scale_infer_shape)
 
 if IS_CUTLASS_DSL_AVAILABLE:
     from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import \
         CuteDSLNVFP4BlackwellRunner
+
+if IS_CUTLASS_DSL_INTERNAL_AVAILABLE:
+    from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import \
+        CuteDSLNVFP4RubinLinear
 
 # BufferKind is bound from C++; see cpp/tensorrt_llm/thop/outputTensor.h (torch_ext::BufferKind).
 from tensorrt_llm.bindings.internal.thop import BufferKind
@@ -559,6 +564,15 @@ class FP4GemmRunner(TunableRunner):
         last_positive_power_of_2), ),
                                  constraint_specs=(ConstraintSpec(
                                      2, 0, fp4_scale_infer_shape), ))
+    mxfp8_tuning_config = TuningConfig(
+        dynamic_tensor_specs=(DynamicTensorSpec(
+            0,
+            0,
+            get_last_power_of_2_num_tokens_buckets,
+            last_positive_power_of_2,
+        ), ),
+        constraint_specs=(ConstraintSpec(2, 0, mxfp8_scale_infer_shape), ),
+    )
 
     def __init__(
         self,
@@ -1095,23 +1109,35 @@ class NVFP4GemmUnifiedRunner(TunableRunner):
         # Add CuteDSL tactics if available
         if self._is_backend_allowed("cutedsl"):
             if IS_CUTLASS_DSL_AVAILABLE:
-                # Check SM version first - CuteDSL NVFP4 only supports SM 100 (B200)
+                # Check SM version first - CuteDSL NVFP4 supports SM 100, 103 (Blackwell) and SM 107 (Rubin)
                 sm_version = get_sm_version()
-                if sm_version not in [100, 103]:
+                if sm_version in [100, 103]:
+                    # Blackwell: SM 100 (B200) or SM 103 (B300)
+                    cutedsl_runner = CuteDSLNVFP4BlackwellRunner(
+                        self.output_dtype, self.output_buffer_kind, self.group)
+                elif sm_version == 107 and IS_CUTLASS_DSL_INTERNAL_AVAILABLE:
+                    # Rubin: SM 107 (requires nvidia-cutlass-dsl-internal)
+                    assert self.output_buffer_kind != int(
+                        BufferKind.NCCL_WINDOW
+                    ), "CuteDSL Rubin backend does not support NCCL_WINDOW buffer kind."
+                    to_userbuffers = (int(self.output_buffer_kind) == int(
+                        BufferKind.USERBUFFERS))
+                    cutedsl_runner = CuteDSLNVFP4RubinLinear(
+                        self.output_dtype, to_userbuffers)
+                else:
+                    cutedsl_runner = None
                     if self._is_only_backend("cutedsl"):
                         # Explicitly forced CuteDSL but SM version not supported
                         raise ValueError(
-                            f"CuteDSL NVFP4 backend requires SM 100 (B200) or SM 103 (B300), but got SM {sm_version}. "
+                            f"CuteDSL NVFP4 backend requires SM 100 (B200), SM 103 (B300), or SM 107 (Rubin), but got SM {sm_version}. "
                             f"CuteDSL NVFP4 is not supported on this GPU architecture. "
                             "Please add other backends to allowed_backends.")
-                else:
+
+                if cutedsl_runner is not None:
                     # SM version OK, check if CuteDSL supports the current shape
-                    cutedsl_runner = CuteDSLNVFP4BlackwellRunner(
-                        self.output_dtype)
-                    # get_valid_tactics ranks/prunes with nvMatmulHeuristics
-                    # internally when TRTLLM_CUTEDSL_NVMMH_ENABLE=1 (no-op
-                    # otherwise), so the returned list already reflects any
-                    # opt-in pruning before it enters the unified tactic list.
+                    # get_valid_tactics ranks/prunes Blackwell tactics with
+                    # nvMatmulHeuristics when explicitly enabled; Rubin uses
+                    # its architecture-specific runner selected above.
                     cutedsl_tactics = cutedsl_runner.get_valid_tactics(
                         inputs, profile)
 
@@ -1137,6 +1163,49 @@ class NVFP4GemmUnifiedRunner(TunableRunner):
                 )
 
         return tactics
+
+    def _make_cutedsl_runner(self) -> Optional[TunableRunner]:
+        if not self._is_backend_allowed(
+                "cutedsl") or not IS_CUTLASS_DSL_AVAILABLE:
+            return None
+
+        sm_version = get_sm_version()
+        if sm_version in [100, 103]:
+            from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import \
+                CuteDSLNVFP4BlackwellRunner
+            return CuteDSLNVFP4BlackwellRunner(self.output_dtype,
+                                               self.output_buffer_kind,
+                                               self.group)
+        if sm_version == 107 and IS_CUTLASS_DSL_INTERNAL_AVAILABLE:
+            from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import \
+                CuteDSLNVFP4RubinLinear
+            assert self.output_buffer_kind != int(
+                BufferKind.NCCL_WINDOW
+            ), "CuteDSL Rubin backend does not support NCCL_WINDOW buffer kind."
+            to_userbuffers = (int(self.output_buffer_kind) == int(
+                BufferKind.USERBUFFERS))
+            return CuteDSLNVFP4RubinLinear(self.output_dtype, to_userbuffers)
+        return None
+
+    def should_profile_tactic_in_subprocess(
+        self,
+        custom_op: str,
+        inputs: List[torch.Tensor],
+        tactic,
+        tuning_config: TuningConfig,
+        **kwargs,
+    ) -> bool:
+        # get_valid_tactics wraps every backend tactic as
+        # (backend_name, backend_tactic); only delegate CuTe DSL tactics.
+        if not (isinstance(tactic, tuple) and len(tactic) == 2
+                and tactic[0] == "cutedsl"):
+            return False
+
+        cutedsl_runner = self._make_cutedsl_runner()
+        if cutedsl_runner is None:
+            return False
+        return cutedsl_runner.should_profile_tactic_in_subprocess(
+            custom_op, inputs, tactic[1], tuning_config, **kwargs)
 
     def forward(
         self,
@@ -1182,11 +1251,24 @@ class NVFP4GemmUnifiedRunner(TunableRunner):
                                                            tactic=sub_tactic,
                                                            bias=bias)
         elif backend == "cutedsl":
-            return CuteDSLNVFP4BlackwellRunner(self.output_dtype,
-                                               self.output_buffer_kind,
-                                               self.group)(inputs,
-                                                           tactic=sub_tactic,
-                                                           bias=bias)
+            # Dispatch to appropriate CuteDSL runner based on SM version
+            sm_version = get_sm_version()
+            if sm_version == 107 and IS_CUTLASS_DSL_INTERNAL_AVAILABLE:
+                # Rubin: SM 107 (requires nvidia-cutlass-dsl-internal)
+                assert self.output_buffer_kind != int(
+                    BufferKind.NCCL_WINDOW
+                ), "CuteDSL Rubin backend does not support NCCL_WINDOW buffer kind."
+                to_userbuffers = (int(self.output_buffer_kind) == int(
+                    BufferKind.USERBUFFERS))
+                return CuteDSLNVFP4RubinLinear(
+                    self.output_dtype, to_userbuffers)(inputs,
+                                                       tactic=sub_tactic,
+                                                       bias=bias)
+            else:
+                # Blackwell: SM 100, 103
+                return CuteDSLNVFP4BlackwellRunner(
+                    self.output_dtype, self.output_buffer_kind,
+                    self.group)(inputs, tactic=sub_tactic, bias=bias)
         elif backend == "marlin":
             return MarlinNVFP4Runner(self.output_buffer_kind,
                                      self.output_dtype)(inputs,
@@ -1195,7 +1277,16 @@ class NVFP4GemmUnifiedRunner(TunableRunner):
             raise ValueError(f"Invalid tactic: {tactic}")
 
 
-@fast_custom_op("trtllm::nvfp4_gemm", mutates_args=())
+@torch.library.custom_op(
+    "trtllm::nvfp4_gemm",
+    mutates_args=(),
+    schema=
+    "(Tensor act_fp4, Tensor weight, Tensor act_sf, Tensor weight_scale, Tensor alpha, "
+    "ScalarType output_dtype, int output_buffer_kind=0, "
+    'str allowed_backends="cutlass,cublaslt,cuda_core", '
+    "int[]? group=None, "
+    "Tensor? bias=None, "
+    "Tensor? output_tensor=None, SymInt partition_id=-1) -> Tensor?")
 def nvfp4_gemm(
     act_fp4: torch.Tensor,
     weight: torch.Tensor,
@@ -1207,6 +1298,8 @@ def nvfp4_gemm(
     allowed_backends: str = "cutlass,cublaslt,cuda_core",
     group: Optional[List[int]] = None,
     bias: Optional[torch.Tensor] = None,
+    output_tensor: Optional[torch.Tensor] = None,
+    partition_id: int = -1,
 ) -> torch.Tensor:
     """Unified NVFP4 GEMM with automatic backend selection.
 
@@ -1232,10 +1325,12 @@ def nvfp4_gemm(
         allowed_backends: Comma-separated list of backends to consider for auto-selection.
             Default: "cutlass,cublaslt,cuda_core" (excludes cutedsl for faster build)
             Add 'cutedsl' for extreme performance at the cost of longer build time.
-            Valid backends: 'cutlass', 'cublaslt', 'cutedsl', 'cuda_core', 'marlin'.
+            Valid backends: cutlass, cublaslt, cutedsl, cuda_core, marlin.
+        output_tensor: Deprecated. Use nvfp4_gemm_inplace for partitioned output.
+        partition_id: Must be -1 for this non-mutating op.
 
     Returns:
-        Output tensor [m, n] with dtype=output_dtype
+        Output tensor [m, n] with dtype=output_dtype.
 
     Raises:
         ValueError: If backend is invalid/unavailable
@@ -1260,6 +1355,13 @@ def nvfp4_gemm(
         raise ValueError(
             f"allowed_backends cannot be empty. "
             f"Valid backends are: {sorted(valid_individual_backends)}.")
+
+    if output_tensor is not None:
+        raise ValueError("output_tensor mode mutates its output and must use "
+                         "torch.ops.trtllm.nvfp4_gemm_inplace instead.")
+    elif partition_id != -1:
+        raise ValueError(
+            "partition_id must be -1 when output_tensor is not provided.")
 
     # Build runner with allowed backends
     runner = NVFP4GemmUnifiedRunner(output_buffer_kind,
@@ -1310,10 +1412,233 @@ def _(
     allowed_backends: str = "cutlass,cublaslt,cuda_core",
     group: Optional[List[int]] = None,
     bias: Optional[torch.Tensor] = None,
+    output_tensor: Optional[torch.Tensor] = None,
+    partition_id: int = -1,
 ) -> torch.Tensor:
     """Fake implementation for torch.compile support."""
+    if output_tensor is not None:
+        raise ValueError("output_tensor mode mutates its output and must use "
+                         "torch.ops.trtllm.nvfp4_gemm_inplace instead.")
+    elif partition_id != -1:
+        raise ValueError(
+            "partition_id must be -1 when output_tensor is not provided.")
     return act_fp4.new_empty((act_fp4.size(0), weight.size(0)),
                              dtype=output_dtype)
+
+
+@torch.library.custom_op(
+    "trtllm::nvfp4_gemm_inplace",
+    mutates_args=("output_tensor", ),
+    schema=
+    "(Tensor act_fp4, Tensor weight, Tensor act_sf, Tensor weight_scale, Tensor alpha, "
+    "ScalarType output_dtype, bool to_userbuffers, str allowed_backends, "
+    "Tensor(a!) output_tensor, SymInt partition_id) -> ()")
+def nvfp4_gemm_inplace(
+    act_fp4: torch.Tensor,
+    weight: torch.Tensor,
+    act_sf: torch.Tensor,
+    weight_scale: torch.Tensor,
+    alpha: torch.Tensor,
+    output_dtype: torch.dtype,
+    to_userbuffers: bool,
+    allowed_backends: str,
+    output_tensor: torch.Tensor,
+    partition_id: int,
+) -> None:
+    """NVFP4 GEMM variant that writes into a partition of output_tensor."""
+    backends_list = [
+        b.strip() for b in allowed_backends.split(',') if b.strip()
+    ]
+    if partition_id < 0 or partition_id >= 2:
+        raise ValueError(
+            "partition_id must be 0 or 1 when output_tensor is provided.")
+    invalid_inplace_backends = set(backends_list) - {"cutedsl"}
+    if invalid_inplace_backends:
+        raise ValueError(
+            f"output_tensor mode only supports cutedsl backend, got {backends_list}."
+        )
+    runner = NVFP4GemmInplaceUnifiedRunner(to_userbuffers, output_dtype,
+                                           backends_list)
+    tuner = AutoTuner.get()
+    try:
+        _, best_tactic = tuner.choose_one(
+            "trtllm::nvfp4_gemm::gemm_inplace",
+            [runner],
+            NVFP4GemmInplaceUnifiedRunner.tuning_config,
+            [act_fp4, weight, act_sf, weight_scale, alpha, output_tensor],
+            partition_id=partition_id,
+        )
+    except IndexError as e:
+        logger.error(
+            f"shapes: M={act_fp4.shape[0]}, K={act_fp4.shape[1]*2}, N={weight.shape[0]}"
+        )
+        raise RuntimeError(
+            f"AutoTuner failed to find a valid (runner, tactic) pair. "
+            f"Input shape: M={act_fp4.shape[0]}, K={act_fp4.shape[1]*2}, N={weight.shape[0]}"
+        ) from e
+
+    runner(
+        inputs=[act_fp4, weight, act_sf, weight_scale, alpha, output_tensor],
+        tactic=best_tactic,
+        partition_id=partition_id,
+    )
+
+
+@nvfp4_gemm_inplace.register_fake
+def _(
+    act_fp4: torch.Tensor,
+    weight: torch.Tensor,
+    act_sf: torch.Tensor,
+    weight_scale: torch.Tensor,
+    alpha: torch.Tensor,
+    output_dtype: torch.dtype,
+    to_userbuffers: bool,
+    allowed_backends: str,
+    output_tensor: torch.Tensor,
+    partition_id: int,
+) -> None:
+    return None
+
+
+class NVFP4GemmInplaceUnifiedRunner(TunableRunner):
+    """Unified runner for inplace NVFP4 GEMM operations with output_tensor.
+
+    This runner is specifically designed for uGPU mode where output_tensor is pre-allocated.
+    It has 6 inputs: [act_fp4, weight, act_sf, weight_scale, alpha, output_tensor]
+    """
+    runner_dict = dict()
+    # Tuning config for output_tensor mode includes 6 inputs.
+    tuning_config = TuningConfig(
+        dynamic_tensor_specs=(DynamicTensorSpec(
+            0, 0, get_last_power_of_2_num_tokens_buckets,
+            last_positive_power_of_2), ),
+        constraint_specs=(
+            ConstraintSpec(2, 0, fp4_scale_infer_shape),
+            # Constraint for output_tensor (index 5): dimension 0 should match input's m
+            # This is needed for uGPU mode where output_tensor is pre-allocated
+            ConstraintSpec(5, 0, lambda shapes: shapes[0][0]),
+        ))
+
+    def __init__(self, to_userbuffers: bool, output_dtype: torch.dtype,
+                 allowed_backends: List[str]):
+        super().__init__()
+        self.to_userbuffers = to_userbuffers
+        self.output_dtype = output_dtype
+        self.allowed_backends = allowed_backends
+
+    def unique_id(self):
+        """Include allowed_backends in cache key to avoid sharing cache across different backend configs."""
+        allowed_tuple = tuple(self.allowed_backends)
+        return (self.to_userbuffers, self.output_dtype, allowed_tuple)
+
+    def _is_backend_allowed(self, backend_name: str) -> bool:
+        """Check if a backend is allowed based on allowed_backends list."""
+        return backend_name in self.allowed_backends
+
+    def _is_only_backend(self, backend_name: str) -> bool:
+        """Check if this is the only backend in allowed_backends (explicitly forced)."""
+        return self.allowed_backends == [backend_name]
+
+    def get_valid_tactics(self, inputs: List[torch.Tensor],
+                          profile: OptimizationProfile,
+                          **kwargs) -> List[Tuple]:
+        # return valid nvfp4 gemm implementations from allowed_backends
+        tactics = []
+        act_fp4, weight, act_sf, weight_scale, alpha, output_tensor = inputs
+
+        # Add CuteDSL runner if available (only backend supported for inplace)
+        if self._is_backend_allowed("cutedsl"):
+            if IS_CUTLASS_DSL_AVAILABLE:
+                sm_version = get_sm_version()
+                if sm_version == 107 and IS_CUTLASS_DSL_INTERNAL_AVAILABLE:
+                    # Rubin: SM 107 (requires nvidia-cutlass-dsl-internal)
+                    cutedsl_runner = CuteDSLNVFP4RubinLinear(self.output_dtype)
+                elif sm_version == 107:
+                    cutedsl_runner = None
+                    if self._is_only_backend("cutedsl"):
+                        raise ValueError(
+                            "CuteDSL NVFP4 inplace backend on Rubin requires "
+                            "nvidia-cutlass-dsl-internal.")
+                else:
+                    cutedsl_runner = None
+                    if self._is_only_backend("cutedsl"):
+                        raise ValueError(
+                            f"CuteDSL NVFP4 inplace backend requires SM 107 (Rubin), but got SM {sm_version}. "
+                            f"uGPU inplace NVFP4 GEMM is not supported on this GPU architecture. "
+                            "Please add other backends to allowed_backends.")
+
+                if cutedsl_runner is not None:
+                    # SM version OK, check if CuteDSL supports the current shape.
+                    # Use full inputs so uGPU-specific tactic filtering is applied.
+                    cutedsl_tactics = cutedsl_runner.get_valid_tactics(
+                        inputs, profile)
+
+                    if cutedsl_tactics:
+                        tactics.append("cutedsl")
+                    elif self._is_only_backend("cutedsl"):
+                        m, n, k = inputs[0].shape[0], inputs[1].shape[
+                            0], inputs[0].shape[1] * 2
+                        raise ValueError(
+                            f"CuteDSL backend does not support the current shape:\n"
+                            f"  M={m}, N={n}, K={k}\n"
+                            f"CuteDSL requires 16-byte alignment for major (contiguous) dimensions:\n"
+                            f"  - K must be divisible by 32 (FP4 K-major layout): K%32={'0' if k % 32 == 0 else str(k%32)}\n"
+                            f"  - Or the combination of (M, N, K, tiling, cluster shape) is not supported\n"
+                            f"Please add other backends to allowed_backends.")
+            elif self._is_only_backend("cutedsl"):
+                raise ValueError(
+                    "CuteDSL backend is not available. "
+                    "Please check CuteDSL installation or add other backends to allowed_backends."
+                )
+
+        return tactics
+
+    def forward(
+        self,
+        inputs: List[torch.Tensor],
+        tactic: Union[str, int] = "cutedsl",
+        **kwargs,
+    ) -> None:
+        act_fp4, weight, act_sf, weight_scale, alpha, output_tensor = inputs
+
+        # Handle fallback tactic (-1) on cache miss
+        if tactic == -1:
+            from tensorrt_llm._torch.autotuner import OptimizationProfile
+            valid_tactics = self.get_valid_tactics(inputs,
+                                                   OptimizationProfile())
+            if valid_tactics:
+                tactic = valid_tactics[0]
+            else:
+                m, n, k = inputs[0].shape[0], inputs[1].shape[
+                    0], inputs[0].shape[1] * 2
+                raise ValueError(
+                    f"No valid backends available for the current shape:\n"
+                    f"  M={m}, N={n}, K={k}\n"
+                    f"  Allowed backends: {self.allowed_backends}")
+
+        if tactic == "cutedsl" or tactic == -1:
+            partition_id = kwargs.get("partition_id", -1)
+            if partition_id < 0 or partition_id >= 2:
+                raise ValueError(
+                    "partition_id must be 0 or 1 for inplace NVFP4 GEMM.")
+            sm_version = get_sm_version()
+            if sm_version == 107:
+                if not IS_CUTLASS_DSL_INTERNAL_AVAILABLE:
+                    raise ValueError(
+                        "CuteDSL NVFP4 inplace GEMM on Rubin requires "
+                        "nvidia-cutlass-dsl-internal.")
+                # Rubin: native inplace support via output_tensor parameter
+                torch.ops.trtllm.cute_dsl_nvfp4_gemm_inplace_rubin(
+                    act_fp4, weight, act_sf, weight_scale, alpha,
+                    self.output_dtype, self.to_userbuffers, True, output_tensor,
+                    partition_id)
+            else:
+                raise ValueError(
+                    f"CuteDSL NVFP4 inplace GEMM requires SM 107 (Rubin), but got SM {sm_version}."
+                )
+            return output_tensor
+        else:
+            raise ValueError(f"Invalid tactic for inplace GEMM: {tactic}")
 
 
 class FP8BatchedGemmRunner(TunableRunner):
@@ -1542,7 +1867,7 @@ def w4a8_mxfp4_fp8_gemm(
     _, best_tactic = tuner.choose_one(
         "trtllm::w4a8_mxfp4_fp8_gemm::gemm",
         [w4a8_mxfp4_fp8_gemm_runner],
-        FP4GemmRunner.tuning_config,
+        FP4GemmRunner.mxfp8_tuning_config,
         [act_fp8, weight, act_sf, weight_scale, alpha],
     )
 
@@ -1780,21 +2105,15 @@ def _(
     return input.new_empty((M, N), dtype=output_dtype)
 
 
-# deep_gemm_gen_tuning_buckets is imported from ..utils
-
-_USE_FUSED_FP8_QUANT_PACK = os.environ.get("TRTLLM_FUSED_FP8_QUANT_PACK",
-                                           "1") == "1"
-
-
 def _fp8_quantize_1x128_ue8m0(input: torch.Tensor, tactic: int):
     """Dispatch FP8 1x128 quantization to CUDA or Triton kernel.
 
-    When the CUDA path is selected on SM100 and ``TRTLLM_FUSED_FP8_QUANT_PACK=1``
-    is set, the fused ``fp8_quantize_1x128_packed_ue8m0`` op is used and the
-    follow-on ``get_mn_major_tma_aligned_packed_ue8m0_tensor`` call is skipped:
-    the new op writes packed-UE8M0 (int32) scales directly in the layout
-    deep_gemm expects, so deep_gemm's internal layout transform falls into the
-    pre-packed branch and skips its own pack kernel as well.
+    When the CUDA path is selected on SM100+, the fused
+    ``fp8_quantize_1x128_packed_ue8m0`` op is used and the follow-on
+    ``get_mn_major_tma_aligned_packed_ue8m0_tensor`` call is skipped: this caller
+    explicitly requests the legacy packed-UE8M0 (int32) layout deep_gemm expects,
+    so its internal layout transform falls into the pre-packed branch. The op's
+    default output layout is standard R128c4.
     """
     TACTIC_TRITON = 1
     if tactic == TACTIC_TRITON:
@@ -1802,8 +2121,10 @@ def _fp8_quantize_1x128_ue8m0(input: torch.Tensor, tactic: int):
         a_sf = deep_gemm.get_mn_major_tma_aligned_packed_ue8m0_tensor(
             a_sf.transpose(0, 1))
         return a, a_sf
-    if _USE_FUSED_FP8_QUANT_PACK and get_sm_version() >= 100:
-        a, a_sf = torch.ops.trtllm.fp8_quantize_1x128_packed_ue8m0(input)
+    if get_sm_version() >= 100:
+        # deep_gemm still consumes its legacy MN-major packed SF layout. The
+        # custom op defaults to standard R128c4 for new consumers.
+        a, a_sf = torch.ops.trtllm.fp8_quantize_1x128_packed_ue8m0(input, False)
         return a, a_sf
     a, a_sf = torch.ops.trtllm.fp8_quantize_1x128(input, use_ue8m0=True)
     a_sf = deep_gemm.get_mn_major_tma_aligned_packed_ue8m0_tensor(
@@ -1854,7 +2175,7 @@ class fp8SwapABGemmRunner(TunableRunner):
     # every process startup.
     tuning_config = TuningConfig(
         dynamic_tensor_specs=(DynamicTensorSpec(
-            0, 0, deep_gemm_gen_tuning_buckets), ),
+            0, 0, deep_gemm_jit_warmup_buckets), ),
         exclude_from_cache=True,
     )
 
@@ -1897,6 +2218,104 @@ class fp8SwapABGemmRunner(TunableRunner):
             disable_ue8m0_cast=self.disable_ue8m0_cast,
         )
         return output
+
+
+class Fp8PrequantizedSwapABGemmRunner(TunableRunner):
+    """Runs DeepGemm with pre-quantized FP8 activations and packed scales."""
+
+    tuning_config = TuningConfig(
+        dynamic_tensor_specs=(DynamicTensorSpec(
+            0, 0, deep_gemm_jit_warmup_buckets), ),
+        constraint_specs=(ConstraintSpec(
+            1, 0, lambda input_shapes: input_shapes[0][0]), ),
+        exclude_from_cache=True,
+    )
+
+    def __init__(self, output_dtype: torch.dtype,
+                 disable_ue8m0_cast: bool) -> None:
+        self.output_dtype = output_dtype
+        self.disable_ue8m0_cast = disable_ue8m0_cast
+
+    def unique_id(self):
+        return (
+            self.output_dtype,
+            self.disable_ue8m0_cast,
+        )
+
+    def get_valid_tactics(
+        self,
+        inputs: List[torch.Tensor],
+        profile: OptimizationProfile,
+    ) -> List[int]:
+        return [0]
+
+    def forward(
+        self,
+        inputs: List[torch.Tensor],
+        tactic: int = -1,
+    ) -> torch.Tensor:
+        del tactic
+        activation, activation_scale, weight, weight_scale = inputs
+        scale_m_aligned = fp4_utils.pad_up(activation_scale.size(0), 4)
+        if activation_scale.stride() != (1, scale_m_aligned):
+            # Dynamic autotuning recreates constrained integer tensors with a
+            # contiguous layout. Restore the MN-major packed-scale stride that
+            # the real quantizers return and DeepGemm requires.
+            normalized_scale = torch.empty_strided(
+                activation_scale.shape, (1, scale_m_aligned),
+                dtype=activation_scale.dtype,
+                device=activation_scale.device)
+            normalized_scale.copy_(activation_scale)
+            activation_scale = normalized_scale
+        output = torch.empty(
+            (activation.size(0), weight.size(0)),
+            device=activation.device,
+            dtype=self.output_dtype,
+        )
+        deep_gemm.fp8_gemm_nt(
+            (activation, activation_scale),
+            (weight, weight_scale),
+            output,
+            disable_ue8m0_cast=self.disable_ue8m0_cast,
+        )
+        return output
+
+
+@torch.library.custom_op("trtllm::fp8_prequantized_swap_ab_gemm",
+                         mutates_args=())
+def fp8_prequantized_swap_ab_gemm(
+    activation: torch.Tensor,
+    activation_scale: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    output_dtype: torch.dtype = torch.bfloat16,
+    disable_ue8m0_cast: bool = False,
+) -> torch.Tensor:
+    runner = Fp8PrequantizedSwapABGemmRunner(output_dtype, disable_ue8m0_cast)
+    _, best_tactic = AutoTuner.get().choose_one(
+        "trtllm::fp8_prequantized_swap_ab_gemm",
+        [runner],
+        Fp8PrequantizedSwapABGemmRunner.tuning_config,
+        [activation, activation_scale, weight, weight_scale],
+    )
+    return runner(
+        inputs=[activation, activation_scale, weight, weight_scale],
+        tactic=best_tactic,
+    )
+
+
+@fp8_prequantized_swap_ab_gemm.register_fake
+def _(
+    activation: torch.Tensor,
+    activation_scale: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    output_dtype: torch.dtype = torch.bfloat16,
+    disable_ue8m0_cast: bool = False,
+) -> torch.Tensor:
+    del activation_scale, weight_scale, disable_ue8m0_cast
+    return activation.new_empty((activation.size(0), weight.size(0)),
+                                dtype=output_dtype)
 
 
 @torch.library.custom_op("trtllm::fp8_swap_ab_gemm", mutates_args=())
@@ -1949,12 +2368,17 @@ def _(
     return input.new_empty((input.size(0), weight.size(0)), dtype=output_dtype)
 
 
-# The runner is used to trigger deepgemm jit during autotune.
+# The runner is used to trigger deepgemm jit during autotune. Only Hopper has
+# work to do: on SM100 this GEMM dispatches to TrtllmGenGemmRunner's prebuilt
+# cubins and compiles nothing.
 class Fp8BlockScalingGemmRunner(TunableRunner):
+    # Without exclude_from_cache, a warm disk cache short-circuits tuning and
+    # the JIT warmup never runs.
     tuning_config = TuningConfig(
         dynamic_tensor_specs=(DynamicTensorSpec(
-            0, 0, deep_gemm_gen_tuning_buckets), ),
+            0, 0, deep_gemm_jit_warmup_buckets), ),
         tune_max_num_tokens=4096,
+        exclude_from_cache=True,
     )
 
     def get_valid_tactics(

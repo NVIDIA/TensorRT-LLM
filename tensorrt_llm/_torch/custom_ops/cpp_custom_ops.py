@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 from typing import List, Optional, Tuple
 
 import torch
@@ -310,6 +313,17 @@ def _register_fake():
                                 dtype=scores_with_bias.dtype), scores.new_empty(
                                     shape, dtype=torch.int32)
 
+    @torch.library.register_fake("trtllm::kimi_k3_noaux_tc_mxfp8_quant")
+    def _(scores, bias, hidden_states, routed_scaling_factor):
+        num_tokens = scores.shape[0]
+        return (
+            scores.new_empty((num_tokens, 16), dtype=torch.int32),
+            scores.new_empty((num_tokens, 16), dtype=torch.bfloat16),
+            hidden_states.new_empty((num_tokens, 3584),
+                                    dtype=torch.float8_e4m3fn),
+            hidden_states.new_empty((num_tokens, 112), dtype=torch.uint8),
+        )
+
     @torch.library.register_fake("trtllm::inplace_slice_copy")
     def _(dest, src, dim1_start, dim1_end):
         pass
@@ -325,8 +339,6 @@ def _register_fake():
           indices,
           next_n,
           index_topk,
-          pre_idx=None,
-          heuristic_scratch=None,
           compress_ratio=1,
           radix_aux_indices=None,
           radix_aux_logits=None):
@@ -362,6 +374,7 @@ def _register_fake():
           lower_bound: float,
           scale: float,
           onorm_eps: float,
+          enable_pdl: bool = True,
           output: Optional[torch.Tensor] = None) -> torch.Tensor:
         # Mirror the CUDA impl: write into the caller-provided output when
         # given (schema returns Tensor(e!)), else allocate.
@@ -590,9 +603,13 @@ def _register_fake():
         top_k: int,
         num_experts: int,
         eplb_local_stats: Optional[torch.Tensor] = None,
+        use_cft_counted_writes: bool = False,
+        expert_id_payload_index: Optional[int] = None,
+        invalid_token_expert_id: Optional[int] = None,
         enable_rank_mask: bool = False,
         active_rank_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[List[torch.Tensor], int, torch.Tensor]:
+        del use_cft_counted_writes, expert_id_payload_index, invalid_token_expert_id, enable_rank_mask, active_rank_mask
         recv_tensors: List[torch.Tensor] = []
         for payload in input_payloads:
             elements_per_token = payload.shape[1]
@@ -620,7 +637,6 @@ def _register_fake():
         ep_size: int,
         top_k: int,
         combine_payload_offset: int,
-        payload_in_workspace: bool,
         use_low_precision: bool = False,
         enable_rank_mask: bool = False,
         active_rank_mask: Optional[torch.Tensor] = None,
@@ -815,15 +831,20 @@ def _register_fake():
         return packed, scale
 
     @torch.library.register_fake("trtllm::fp8_quantize_1x128_packed_ue8m0")
-    def _(input: torch.Tensor):
-        # Returns (fp8_e4m3 [m, k], packed_ue8m0_int32 [m, packed_sf_k])
-        # matching deep_gemm.get_mn_major_tma_aligned_packed_ue8m0_tensor's return shape.
+    def _(input: torch.Tensor, use_r128c4_layout: bool = True):
         m, k = input.shape[0], input.shape[1]
         num_n_blocks = (k + 127) // 128
         num_packed_sf_k = (num_n_blocks + 3) // 4
-        return torch.empty_like(input,
-                                dtype=torch.float8_e4m3fn), input.new_empty(
-                                    (m, num_packed_sf_k), dtype=torch.int32)
+        if use_r128c4_layout:
+            m_padded = (m + 127) // 128 * 128
+            sf_k_padded = ((k + 31) // 32 + 3) // 4 * 4
+            scale = input.new_empty((m_padded * sf_k_padded), dtype=torch.uint8)
+        else:
+            m_aligned = (m + 3) // 4 * 4
+            scale = input.new_empty_strided((m, num_packed_sf_k),
+                                            (1, m_aligned),
+                                            dtype=torch.int32)
+        return torch.empty_like(input, dtype=torch.float8_e4m3fn), scale
 
     @torch.library.register_fake("trtllm::fp8_quantize_1x128_cutedsl_ue8m0")
     def _(input: torch.Tensor):
@@ -833,6 +854,28 @@ def _register_fake():
         return torch.empty_like(input,
                                 dtype=torch.float8_e4m3fn), input.new_empty(
                                     (padded_m * sf_cols, ), dtype=torch.uint8)
+
+    @torch.library.register_fake(
+        "trtllm::silu_and_mul_fp8_quantize_1x128_packed_ue8m0")
+    def _(input: torch.Tensor,
+          swiglu_limit: Optional[float] = None,
+          use_r128c4_layout: bool = True):
+        del swiglu_limit
+        m, gate_up_k = input.shape
+        k = gate_up_k // 2
+        num_n_blocks = (k + 127) // 128
+        num_packed_sf_k = (num_n_blocks + 3) // 4
+        fp8_output = input.new_empty((m, k), dtype=torch.float8_e4m3fn)
+        if use_r128c4_layout:
+            m_padded = (m + 127) // 128 * 128
+            sf_k_padded = ((k + 31) // 32 + 3) // 4 * 4
+            scale = input.new_empty((m_padded * sf_k_padded), dtype=torch.uint8)
+        else:
+            m_aligned = (m + 3) // 4 * 4
+            scale = input.new_empty_strided((m, num_packed_sf_k),
+                                            (1, m_aligned),
+                                            dtype=torch.int32)
+        return fp8_output, scale
 
     @torch.library.register_fake("trtllm::causal_conv1d_fwd")
     def _(
@@ -1203,7 +1246,12 @@ def _register_fake():
         ]
 
     @torch.library.register_fake("trtllm::alltoall_helix_native")
-    def _(partial_o, softmax_stats, workspace, cp_rank, cp_size):
+    def _(partial_o,
+          softmax_stats,
+          workspace,
+          cp_rank,
+          cp_size,
+          zero_kv_mask=None):
         # Returns outputs with same shapes as inputs
         return partial_o.new_empty(partial_o.shape), softmax_stats.new_empty(
             softmax_stats.shape)
@@ -1572,6 +1620,32 @@ def _register_fake():
           token_indices: torch.Tensor, block_size: int, num_topk_tokens: int,
           stride_factor: int, layer_id: int) -> torch.Tensor:
         return torch.empty_like(token_indices)
+
+    @torch.library.register_fake("trtllm::nvfp4_mla_kv_cache_gather")
+    def _(host_pool_pointers: torch.Tensor, host_pool_mapping: torch.Tensor,
+          global_indices: torch.Tensor, output: torch.Tensor,
+          compact_indices: torch.Tensor, global_dequant_scale: torch.Tensor,
+          layer_idx: int, residual_dim: int, num_pool_tokens: int) -> None:
+        return None
+
+    @torch.library.register_fake(
+        "trtllm::nvfp4_mla_context_kv_cache_gather_direct")
+    def _(data_pool: torch.Tensor, scale_pool: torch.Tensor,
+          local_topk_indices: torch.Tensor, query_req_indices: torch.Tensor,
+          compressed_kv_lengths: torch.Tensor, global_indices: torch.Tensor,
+          output: torch.Tensor, global_dequant_scale: torch.Tensor,
+          residual_dim: int, max_kv_tokens: int, num_pool_tokens: int) -> None:
+        return None
+
+    @torch.library.register_fake("trtllm::nvfp4_mla_context_kv_cache_gather")
+    def _(host_pool_pointers: torch.Tensor, host_pool_mapping: torch.Tensor,
+          local_topk_indices: torch.Tensor, query_req_indices: torch.Tensor,
+          block_table: torch.Tensor, cu_kv_lengths: torch.Tensor,
+          output: torch.Tensor, compact_indices: torch.Tensor,
+          global_dequant_scale: torch.Tensor, layer_idx: int,
+          total_kv_tokens: int, tokens_per_block: int, page_stride: int,
+          layer_id: int, residual_dim: int, num_pool_tokens: int) -> None:
+        return None
 
     @torch.library.register_fake("trtllm::indexer_k_cache_gather_op")
     def _(k_cache: torch.Tensor, slot_mapping_fp8: torch.Tensor,

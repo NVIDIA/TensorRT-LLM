@@ -21,6 +21,8 @@
 #include "tensorrt_llm/thop/thUtils.h"
 #include <ATen/cuda/EmptyTensor.h>
 #include <ATen/ops/index_select.h>
+#include <map>
+#include <tuple>
 
 TRTLLM_NAMESPACE_BEGIN
 
@@ -81,7 +83,7 @@ std::vector<torch::Tensor> run_fp4_block_scale_moe_runner(torch::optional<torch:
 
     if (topk_ids.has_value() && topk_weights.has_value() && routing_logits.has_value())
     {
-        TLLM_LOG_WARNING(
+        TLLM_LOG_DEBUG(
             "When logits and (topk_ids and topk_weights) are both provided, we only use (topk_ids and topk_weights).");
     }
 
@@ -194,9 +196,12 @@ std::vector<torch::Tensor> run_fp4_block_scale_moe_runner(torch::optional<torch:
     auto routing_device = routing_logits.has_value() ? routing_logits.value().device() : topk_ids.value().device();
     at::Tensor num_tokens_per_expert
         = at::detail::empty_cuda({num_experts}, at::ScalarType::Int, routing_device, std::nullopt);
+    // The routing domain uses global expert IDs, but expert-parallel GEMMs only materialize rows for the experts owned
+    // by this rank. Padding intermediate buffers for every global expert over-allocates by up to the EP size, which can
+    // exhaust memory for large-token prefill shapes.
     int32_t max_num_padded_tokens
         = tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::Routing::getMaxPermutedPaddedCount(
-            args.num_tokens, top_k, num_experts, tile_tokens_dim);
+            args.num_tokens, top_k, local_num_experts, tile_tokens_dim);
     int32_t max_num_padded_tokens_gemm1
         = tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::Routing::maybeGetMinTokenCount(
             max_num_padded_tokens, args.intermediate_size, btg::dtypeGetNumBits(args.mDtypeElt));
@@ -258,7 +263,7 @@ std::vector<torch::Tensor> run_fp4_block_scale_moe_runner(torch::optional<torch:
         {max_num_padded_tokens_gemm2, args.hidden_size}, at::ScalarType::BFloat16, routing_device, std::nullopt);
 
     int32_t max_num_ctas = tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::Routing::getMaxNumCtasInBatchDim(
-        args.num_tokens, args.top_k, args.num_experts, tile_tokens_dim);
+        args.num_tokens, args.top_k, args.local_num_experts, tile_tokens_dim);
     at::Tensor cta_idx_xy_to_batch_idx
         = at::detail::empty_cuda({max_num_ctas}, at::ScalarType::Int, routing_device, std::nullopt);
     at::Tensor cta_idx_xy_to_mn_limit
@@ -503,39 +508,89 @@ std::vector<torch::Tensor> run_fp4_block_scale_moe_runner(torch::optional<torch:
 // use with the torch workflow autotuner class.
 class FP4BlockScaleMoeRunner : public torch::CustomClassHolder
 {
+private:
+    using RunnerType = tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::MoE::Runner;
+
 public:
     explicit FP4BlockScaleMoeRunner(int64_t actType)
         // Update this as new cubins come in
+        // sm100f cubins (non-Lamport, works on SM100 and SM107): tileN 8, 16, 32, 64, 128, 256
+        // sm107a cubins (Lamport, SM107 only): tileN 8, 16, 32
         : mSupportedTileN{8, 16, 32, 64, 128, 256}
+        , mLamportSupportedTileN{8, 16, 32}
+        , mActType{actType}
     {
-        for (int tileN : mSupportedTileN)
-        {
-            mRunners.emplace(tileN,
-                std::make_unique<RunnerType>(mDtypeAct, mDtypeWeights, mUseDeepSeekFp8, tileN,
-                    static_cast<tensorrt_llm::kernels::ActType>(actType)));
-        }
     }
 
-    [[nodiscard]] std::vector<std::vector<int64_t>> getValidConfigs(
-        int64_t topK, int64_t hiddenSize, int64_t intermediateSize, int64_t numLocalExperts, int64_t numTokens) const
+    // Lazily creates and caches runners keyed by (tileN, useLamport).
+    // Avoids upfront instantiation of all tileN x lamport combinations.
+    RunnerType& getRunner(int32_t tileN, bool useLamport = false)
     {
-        // returns (tileN, config)
-        std::vector<std::vector<int64_t>> tactics;
-        for (auto& [tileN, runner] : mRunners)
+        auto key = std::make_tuple(tileN, useLamport);
+        if (mRunners.find(key) == mRunners.end())
         {
-            auto chosen = computeSelectedTileN(mSupportedTileN, numTokens, topK, numLocalExperts);
+            TLLM_LOG_INFO("Creating new FP4BlockScaleMoe runner for tileN=%d, lamport=%d", tileN, useLamport);
+            mRunners.emplace(key,
+                std::make_unique<RunnerType>(mDtypeAct, mDtypeWeights, mUseDeepSeekFp8, tileN,
+                    static_cast<tensorrt_llm::kernels::ActType>(mActType), useLamport));
+        }
+        return *mRunners.at(key);
+    }
+
+    // Returns [[tileN, config, hasLs], ...]. hasLs checked only if useLamport=true.
+    [[nodiscard]] std::vector<std::vector<int64_t>> getValidConfigs(int64_t topK, int64_t hiddenSize,
+        int64_t intermediateSize, int64_t numLocalExperts, int64_t numTokens, bool useLamport)
+    {
+        auto chosen = computeSelectedTileN(mSupportedTileN, numTokens, topK, numLocalExperts);
+
+        // Step 1: Collect all non-Lamport (sm100f) tactics for supported tileN values.
+        std::vector<std::pair<int64_t, int64_t>> nonLsTactics;
+        for (int32_t tileN : mSupportedTileN)
+        {
             if (chosen.find(tileN) == chosen.end())
-            {
                 continue;
-            }
-            auto config_indices_per_runner
-                = runner->getValidConfigIndices(topK, hiddenSize, intermediateSize, numLocalExperts, numTokens);
-            for (auto cfg : config_indices_per_runner)
+            auto& runner = getRunner(tileN, /*useLamport=*/false);
+            for (auto cfg :
+                runner.getValidConfigIndices(topK, hiddenSize, intermediateSize, numLocalExperts, numTokens))
             {
-                tactics.push_back({tileN, cfg});
+                nonLsTactics.push_back({static_cast<int64_t>(tileN), cfg});
             }
         }
-        return tactics;
+
+        // Step 2: If Lamport requested, discover which (tileN, config) pairs also have
+        // Lamport-capable (sm107a) cubins. Only tileN in mLamportSupportedTileN are checked.
+        std::set<std::pair<int64_t, int64_t>> lsSet;
+        if (useLamport)
+        {
+            for (int32_t tileN : mLamportSupportedTileN)
+            {
+                if (chosen.find(tileN) == chosen.end())
+                    continue;
+                try
+                {
+                    auto& runner = getRunner(tileN, /*useLamport=*/true);
+                    for (auto cfg :
+                        runner.getValidConfigIndices(topK, hiddenSize, intermediateSize, numLocalExperts, numTokens))
+                    {
+                        lsSet.insert({static_cast<int64_t>(tileN), cfg});
+                    }
+                }
+                catch (std::exception const& e)
+                {
+                    TLLM_LOG_WARNING("Lamport runner creation failed for tileN=%d: %s", tileN, e.what());
+                }
+            }
+        }
+
+        // Step 3: Emit (tileN, config, hasLs) triples. hasLs=1 means a Lamport variant
+        // exists for this tactic; the Python autotuner uses this to decide Lamport dispatch.
+        std::vector<std::vector<int64_t>> result;
+        result.reserve(nonLsTactics.size());
+        for (auto const& [tileN, cfg] : nonLsTactics)
+        {
+            result.push_back({tileN, cfg, lsSet.count({tileN, cfg}) > 0 ? 1 : 0});
+        }
+        return result;
     }
 
     [[nodiscard]] std::vector<torch::Tensor> run(torch::optional<torch::Tensor> const& routing_logits,
@@ -551,7 +606,8 @@ public:
         int64_t const local_expert_offset, int64_t const local_num_experts,
         std::optional<double> const routed_scaling_factor, int64_t const routing_method_type, bool const do_finalize,
         std::vector<int64_t> moeConfigIndex, torch::optional<torch::Tensor> const& topk_weights,
-        torch::optional<torch::Tensor> const& topk_ids, torch::optional<torch::Tensor> const& output = torch::nullopt)
+        torch::optional<torch::Tensor> const& topk_ids, torch::optional<torch::Tensor> const& output = torch::nullopt,
+        bool use_lamport = false)
     {
         // moeConfigIndex corresponds to pair (tileN, config)
         auto [tileN, config] = std::tie(moeConfigIndex[0], moeConfigIndex[1]);
@@ -564,25 +620,30 @@ public:
             auto const hidden_size = 2 * hidden_states.sizes()[1];
 
             float const avg_tokens_per_expert = static_cast<float>(num_tokens * top_k) / local_num_experts;
-            tileN = std::clamp(nextPowerOfTwo(avg_tokens_per_expert), mSupportedTileN.front(), mSupportedTileN.back());
+            int32_t minTileN = mSupportedTileN.front();
+            // If Lamport is requested, cap at max Lamport-supported tile (no fallback to sm100f)
+            int32_t maxTileN = use_lamport ? mLamportSupportedTileN.back() : mSupportedTileN.back();
+            tileN = std::clamp(nextPowerOfTwo(avg_tokens_per_expert), minTileN, maxTileN);
 
-            config = mRunners[tileN]->getDefaultValidConfigIndex(
+            auto& runner = getRunner(tileN, use_lamport);
+            config = runner.getDefaultValidConfigIndex(
                 top_k, hidden_size, intermediate_size, local_num_experts, num_tokens);
         }
 
+        auto& runner = getRunner(tileN, use_lamport);
         return run_fp4_block_scale_moe_runner(routing_logits, routing_bias, hidden_states, hidden_states_scale,
             gemm1_weights, gemm1_weights_scale, gemm1_bias, gemm1_alpha, gemm1_beta, gemm1_clamp_limit, gemm2_weights,
             gemm2_weights_scale, gemm2_bias, output1_scales_scalar, output1_scales_gate_scalar, output2_scales_scalar,
             num_experts, top_k, n_group, topk_group, intermediate_size, local_expert_offset, local_num_experts,
-            routed_scaling_factor, tileN, routing_method_type, do_finalize, mDtypeElt, *mRunners[tileN], config,
-            topk_weights, topk_ids, output);
+            routed_scaling_factor, tileN, routing_method_type, do_finalize, mDtypeElt, runner, config, topk_weights,
+            topk_ids, output);
     }
 
 private:
-    using RunnerType = tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::MoE::Runner;
-
     std::vector<int32_t> const mSupportedTileN;
-    std::unordered_map<int32_t, std::unique_ptr<RunnerType>> mRunners;
+    std::vector<int32_t> const mLamportSupportedTileN;
+    int64_t mActType;
+    std::map<std::tuple<int32_t, bool>, std::unique_ptr<RunnerType>> mRunners;
 
     btg::Dtype mDtypeElt{btg::Dtype::E2m1};
     btg::Dtype mDtypeAct{btg::Dtype::E2m1};
@@ -623,7 +684,7 @@ public:
                 = runner->getValidConfigIndices(topK, hiddenSize, intermediateSize, numLocalExperts, numTokens);
             for (auto cfg : config_indices_per_runner)
             {
-                tactics.push_back({tileN, cfg});
+                tactics.push_back(std::vector<int64_t>{static_cast<int64_t>(tileN), cfg});
             }
         }
         return tactics;

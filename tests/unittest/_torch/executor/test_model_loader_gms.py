@@ -15,6 +15,7 @@ from torch import nn
 from tensorrt_llm._torch import memory as memory_mod
 from tensorrt_llm._torch.pyexecutor import model_loader as model_loader_mod
 from tensorrt_llm._torch.pyexecutor.model_loader import ModelLoader
+from tensorrt_llm._torch.ugpu.policy import UgpuPolicy
 from tensorrt_llm._torch.weight_sharing import (
     ARTIFACT_IDENTITY_FORMAT_VERSION,
     LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1,
@@ -325,6 +326,26 @@ def test_gms_load_branch(monkeypatch, is_rw, expected_events):
         checkpoint_loader.load_weights.assert_not_called()
         loader._call_load_weights.assert_not_called()
         backend.materialize_module.assert_called_once_with(model)
+
+
+def test_gms_rejects_ugpu_localized_weights_before_model_init(monkeypatch):
+    events = []
+    loader = _make_loader(monkeypatch, events=events)
+    loader._load_and_validate_config.return_value = SimpleNamespace(
+        mapping=SimpleNamespace(),
+        ugpu_policy=UgpuPolicy(enabled=True),
+    )
+    checkpoint_loader = MagicMock(name="checkpoint_loader")
+    checkpoint_loader.checkpoint_format = "HF"
+
+    with pytest.raises(
+        ValueError,
+        match="LoadFormat.GMS is incompatible with uGPU localized weights",
+    ):
+        loader.load("/ckpt", checkpoint_loader)
+
+    model_loader_mod.AutoModelForCausalLM.from_config.assert_not_called()
+    checkpoint_loader.load_weights.assert_not_called()
 
 
 def test_gms_ro_materializes_between_alias_setup_and_cache_state(monkeypatch):

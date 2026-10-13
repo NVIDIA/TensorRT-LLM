@@ -2106,7 +2106,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         #        total. The 'sample' below should generally be avoided
         #        by retaining the draft_probs during drafting (TRTLLM-7772).
         draft_sampling_strategy = (
-            ("greedy", None)
+            GREEDY
             if request.py_draft_use_greedy_sampling
             else _request_strategy(request, vocab_size=2**31)
         )

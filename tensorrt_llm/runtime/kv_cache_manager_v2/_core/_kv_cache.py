@@ -238,7 +238,8 @@ class _KVCache:
         "_blocks",
         "_base_page_indices",
         "_committed_tokens",
-        "_num_tokens_before_hybrid_pruning",
+        "_num_reusable_tokens_before_hybrid_pruning",
+        "_num_reusable_tokens_before_pruning",
         "_num_committed_blocks",
         "_finish_event",
         "_tokens_per_block",
@@ -275,7 +276,8 @@ class _KVCache:
     _base_page_indices: TypedIndexList[BeamIndex, TypedIndexList[LifeCycleId, IndexSeq]]
     _committed_tokens: list[TokenIdExt]
     # Internal diagnostic captured from the reuse match: see ReuseMatch.
-    _num_tokens_before_hybrid_pruning: int
+    _num_reusable_tokens_before_hybrid_pruning: int
+    _num_reusable_tokens_before_pruning: int
     # Sometimes we can't commit a block because all its tokens are already covered by another block in
     # the radix tree. But it's unsafe to just use the other block because: 1. the data may have numeric
     # difference, 2. if our block is a partial block, we can't write to memory of the other blocks.
@@ -329,12 +331,15 @@ class _KVCache:
         self._commit_state = self.CommitState.ALLOWED
         self._blocks = cast(TypedIndexList, [])
         self._base_page_indices = make_typed(
-            lambda _: make_typed(lambda _: array.array("i"), self.manager._storage.num_life_cycles),
+            lambda _: make_typed(lambda _: array.array("q"), self.manager._storage.num_life_cycles),
             self.beam_width,
         )
         self._committed_tokens = []
-        self._num_tokens_before_hybrid_pruning = (
-            reuse_match.num_tokens_before_hybrid_pruning if reuse_match is not None else 0
+        self._num_reusable_tokens_before_hybrid_pruning = (
+            reuse_match.num_reusable_tokens_before_hybrid_pruning if reuse_match is not None else 0
+        )
+        self._num_reusable_tokens_before_pruning = (
+            reuse_match.num_reusable_tokens_before_pruning if reuse_match is not None else 0
         )
         self._num_committed_blocks = BlockOrdinal(0)
         self._finish_event = None
@@ -380,11 +385,14 @@ class _KVCache:
         old_indices = self._base_page_indices[beam_idx][layer_group_id]
         new_indices: IndexSeq
         if buf is None:
-            new_indices = array.array("i", old_indices[:length])
+            new_indices = array.array("q", old_indices[:length])
         else:
             assert buf.ndim == 1 and buf.format == "i" and len(buf) >= length
-            buf[:length] = old_indices[:length]
-            buf[length:] = array.array("i", [BAD_PAGE_INDEX]) * (len(buf) - length)
+            # old_indices is array("q") (int64) but buf is int32 memoryview.
+            # Cast via an intermediate array matching buf's format.
+            fmt = buf.format
+            buf[:length] = array.array(fmt, old_indices[:length])
+            buf[length:] = array.array(fmt, [BAD_PAGE_INDEX]) * (len(buf) - length)
             new_indices = buf
         self._base_page_indices[beam_idx][layer_group_id] = new_indices
 
@@ -601,10 +609,18 @@ class _KVCache:
             manager._avg_sqr_history_length.update(self._avg_history_length.value**2)
             manager._num_sampled_kv_caches += 1
             manager._try_update_target_ratios()
-        with self._record_event():
+        record_finish_event = self._cuda_stream is not None
+        if record_finish_event:
+            with self._record_event():
+                self._clear_blocks()
+                self._ssm_blocks = None
+        else:
+            # Fresh/suspended caches may be closed before any CUDA stream is assigned.
+            self._ssm_blocks = None
             self._clear_blocks()
         self._status = self.Status.CLOSED
         manager._living_kv_caches.remove(self.__rawref__)
+        manager._num_closed_kv_caches += 1
 
     def __del__(self) -> None:
         self.close()
@@ -808,7 +824,7 @@ class _KVCache:
                     if type(indices) is array.array:
                         del indices[new_num_blocks:]
                     else:
-                        indices[new_num_blocks:] = array.array("i", [BAD_PAGE_INDEX]) * (
+                        indices[new_num_blocks:] = array.array(indices.format, [BAD_PAGE_INDEX]) * (
                             len(indices) - new_num_blocks
                         )
 
@@ -853,8 +869,9 @@ class _KVCache:
                 try:
                     new_slots = storage.new_gpu_slots(
                         make_typed(lambda lc: max(0, net_alloc_counts[lc]), num_life_cycles),
-                        self._record_migrated_slots,
-                        self._record_dropped_pages,
+                        ugpu_id=self.ugpu_id,
+                        migration_recorder=self._record_migrated_slots,
+                        drop_recorder=self._record_dropped_pages,
                     )
                 except OutOfPagesError:
                     self._recover_excess_scratch_slots(excess_scratch_slots)
@@ -1083,9 +1100,13 @@ class _KVCache:
     def num_committed_tokens(self) -> int:
         return len(self._committed_tokens)
 
-    def _get_num_tokens_before_hybrid_pruning(self) -> int:
+    def _get_num_reusable_tokens_before_hybrid_pruning(self) -> int:
         """Return the pre-hybrid-pruning prefix for internal diagnostics."""
-        return self._num_tokens_before_hybrid_pruning
+        return self._num_reusable_tokens_before_hybrid_pruning
+
+    def _get_num_reusable_tokens_before_pruning(self) -> int:
+        """Return the raw token-path walk depth, before any pruning."""
+        return self._num_reusable_tokens_before_pruning
 
     @property
     def committed_tokens(self) -> list[TokenIdExt]:
@@ -1116,7 +1137,11 @@ class _KVCache:
         # preceding conversation plan intact if this turn no longer has a
         # complete reusable endpoint. All PP ranks use the same lookup so
         # attention-only ranks include the final partial SWA block too.
-        match = self.manager._match_reuse(self.reuse_scope, self._committed_tokens)
+        match = self.manager._radix_tree.match(
+            self.reuse_scope,
+            self._committed_tokens,
+            self.manager.enable_partial_match,
+        )
         if match.num_tokens != self.num_committed_tokens or not match.blocks:
             return None
 
@@ -1229,7 +1254,10 @@ class _KVCache:
         if any(c > 0 for c in num_slots):
             try:
                 tmp_slots = storage.new_gpu_slots(
-                    num_slots, self._record_migrated_slots, self._record_dropped_pages
+                    num_slots,
+                    ugpu_id=self.ugpu_id,
+                    migration_recorder=self._record_migrated_slots,
+                    drop_recorder=self._record_dropped_pages,
                 )
             except OutOfPagesError:
                 return False
@@ -1457,6 +1485,11 @@ class _KVCache:
     def tokens_per_block(self) -> int:
         return self._tokens_per_block
 
+    @property
+    def ugpu_id(self) -> int | None:
+        """The uGPU this KV cache is pinned to, or None if non-localized."""
+        return self._reuse_scope.ugpu_id
+
     def _page(
         self, block_ordinal: BlockOrdinal, beam_index: BeamIndex, life_cycle: LifeCycleId
     ) -> BlockPage:
@@ -1494,7 +1527,7 @@ class _KVCache:
         pg_idx = storage.get_pool_group_index(lc_idx)
         for lvl in typed_range(src_page.cache_level, storage.num_cache_levels):
             try:
-                new_slot = storage.new_slots_for_pool_group(lvl, pg_idx, 1)[0]
+                new_slot = storage.new_slots_for_pool_group(lvl, pg_idx, 1, ugpu_id=self.ugpu_id)[0]
             except OutOfPagesError:
                 continue
             cuda_stream = self.cuda_stream

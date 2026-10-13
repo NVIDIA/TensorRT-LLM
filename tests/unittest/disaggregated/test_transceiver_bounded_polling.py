@@ -21,7 +21,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Optional
-from unittest.mock import Mock
+from unittest.mock import Mock, call
 
 import pytest
 
@@ -38,6 +38,8 @@ from tensorrt_llm.bindings import LlmRequestState
 
 @dataclass
 class _FakeRequest:
+    py_request_id: Optional[int] = None
+    py_disaggregated_params: Optional[object] = None
     state: Optional[LlmRequestState] = None
 
 
@@ -58,12 +60,14 @@ class _FakeSession:
         status: SessionStatus = SessionStatus.READY,
         is_completed: bool = False,
         has_failed: bool = False,
+        has_transferring_tasks: bool = False,
     ) -> None:
         self._rid = rid
         self._wait_result = wait_result
         self._status = status
         self._is_completed = is_completed
         self._has_failed = has_failed
+        self._has_transferring_tasks = has_transferring_tasks
         self.blocking_calls: list[bool] = []
         self.closed = False
         self.aux_slot: Optional[int] = 0
@@ -85,6 +89,9 @@ class _FakeSession:
 
     def has_failed(self) -> bool:
         return self._has_failed
+
+    def has_transferring_tasks(self) -> bool:
+        return self._has_transferring_tasks
 
     def close(self) -> None:
         self.closed = True
@@ -140,10 +147,13 @@ def _make_transceiver(
     transceiver._ctx_need_pp_sync = False
     transceiver._transfer_worker = _FakeTransferWorker()
     transceiver._ctx_consensus = lambda local_ids: list(local_ids)
-    transceiver._ctx_consensus_outcome = lambda _to_process, cancelled, failed, completed: (
-        cancelled,
-        failed,
-        completed,
+    transceiver._ctx_consensus_outcome = (
+        lambda _to_process, cancelled, failed, completed, timed_out, _busy: (
+            cancelled,
+            failed,
+            completed,
+            timed_out,
+        )
     )
     return transceiver
 
@@ -359,27 +369,27 @@ def test_gen_transfer_status_enters_consensus_when_sync_required() -> None:
 
 
 def test_consensus_outcome_uses_single_batched_allgather() -> None:
-    # The cancelled/failed/completed id lists are exchanged with ONE allgather
-    # (packed as a list-of-lists) instead of three; verify a single call and that
-    # union (cancelled/failed) + intersection (completed) semantics are preserved.
+    # Exchange every outcome list with one allgather and preserve union
+    # (cancelled/failed/busy) plus intersection (completed) semantics.
     transceiver = object.__new__(KvCacheTransceiverV2)
     calls: list = []
 
     def fake_allgather(payload):
         calls.append(payload)
-        # rank0 = this rank's [cancelled, failed, completed]; rank1 = a peer rank.
-        return [payload, [[], [99], [7, 8]]]
+        # rank0 = this rank's [cancelled, failed, completed, busy]; rank1 = a peer rank.
+        return [payload, [[], [99], [7, 8], []]]
 
     to_process = [1, 2, 7, 8, 99]
-    new_cancelled, new_failed, new_completed = transceiver._consensus_outcome(
-        to_process, [1], [2], [7], fake_allgather, True
+    new_cancelled, new_failed, new_completed, new_busy = transceiver._consensus_outcome(
+        to_process, [1], [2], [7, 8], [8], fake_allgather, True
     )
 
-    assert len(calls) == 1  # batched: a single allgather, not three
-    assert calls[0] == [[1], [2], [7]]
+    assert len(calls) == 1
+    assert calls[0] == [[1], [2], [7, 8], [8]]
     assert new_cancelled == [1]  # union of cancelled across ranks
     assert new_failed == [2, 99]  # union of failed across ranks
-    assert new_completed == [7]  # intersection only (8 is completed on the peer only)
+    assert new_completed == [7]  # 8 is complete everywhere but remains busy locally
+    assert new_busy == [8]
 
 
 def test_ctx_tp_consensus_does_not_complete_when_peer_times_out() -> None:
@@ -1002,3 +1012,65 @@ def test_prepare_context_requests_skips_consensus_when_nothing_waiting() -> None
 
     transceiver.prepare_context_requests([])
     transceiver._ctx_consensus.assert_not_called()
+
+
+def test_first_postprocess_failure_does_not_skip_later_completed_request() -> None:
+    rids = [41, 42]
+    sessions = {
+        rid: _FakeSession(
+            rid,
+            WaitResult.COMPLETED,
+            is_completed=True,
+        )
+        for rid in rids
+    }
+    requests = {
+        rid: _FakeRequest(
+            py_request_id=rid,
+            state=LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS,
+        )
+        for rid in rids
+    }
+
+    transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver._ever_had_recv_session = True
+    transceiver._gen_need_sync = False
+    transceiver._gen_allgather = Mock()
+    transceiver._recv_sessions = dict(sessions)
+    transceiver._recv_reqs = dict(requests)
+    transceiver._gen_consensus = Mock(return_value=rids)
+    transceiver._gen_consensus_outcome = Mock(
+        side_effect=lambda _to_process, cancelled, failed, completed, _busy: (
+            cancelled,
+            failed,
+            completed,
+        )
+    )
+    transceiver._need_aux_transfer = Mock(return_value=False)
+    transceiver._assert_disagg_history_declared = Mock()
+    transceiver._rebuild_fp4_mla_disagg_imported_cache = Mock()
+    transceiver._dist = Mock()
+    transceiver._dist.rank = 0
+
+    def rebuild(req):
+        if req.py_request_id == 41:
+            raise RuntimeError("first rebuild failed")
+
+    transceiver._rebuild_fp4_mla_disagg_imported_cache.side_effect = rebuild
+
+    completed, failed, cancelled = transceiver.check_gen_transfer_status(at_least_request_num=0)
+
+    assert completed == [42]
+    assert failed == [41]
+    assert cancelled == []
+    assert requests[41].state == LlmRequestState.DISAGG_TRANS_ERROR
+    assert requests[42].state == LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
+    assert transceiver._assert_disagg_history_declared.call_args_list == [
+        call(requests[41]),
+        call(requests[42]),
+    ]
+    assert transceiver._rebuild_fp4_mla_disagg_imported_cache.call_args_list == [
+        call(requests[41]),
+        call(requests[42]),
+    ]
+    assert all(session.closed for session in sessions.values())

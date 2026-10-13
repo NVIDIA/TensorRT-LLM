@@ -149,6 +149,12 @@ struct BatchedGemmData
         //      The "logical" shape is: [paddedM, K / P].
         //      The R128c4 layout is: [paddedM / 128, K / P / 4, 512].
         //      The shape we use for TMA is: [paddedM / 128, K / P / 4, 2, 256].
+        //    If the layout is R128c16,
+        //      M must be a multiple of 128.
+        //      K must be a multiple of 16 * P, where P is the scaling block size.
+        //      The "logical" shape is: [paddedM, K / P].
+        //      The R128c16 layout is: [paddedM / 128, K / P / 16, 2048].
+        //      The shape we use for TMA is: [paddedM / 128, K / P / 16, 8, 256].
         //  Where paddedM is M if (routeAct == true && batchM), or
         //  sum(divUpMul(M[bi], tileM) for bi in B) if batchM,
         //  otherwise divUpMul(M, tileM) * B.
@@ -565,6 +571,27 @@ struct BatchedGemmData
         // The rightmost dimension is contiguous in memory.
         // The dtype is Dtype::Float32.
         void* mPtrSfC{nullptr};
+
+#ifdef TLLM_RUBIN_FEATURES
+#ifdef TLLM_TEST
+        // The buffer to invalidate prior to triggering the secondary kernel.
+        // The data type which is used to determine the invalid value is controlled by options.mDtypeC.
+        //
+        // If batchM:
+        //    Logical shape is [sum(divUpMul(M[bi], tileM) for bi in B), N].
+        //    Logical strides are [N, 1].
+        //
+        // If batchN:
+        //    Logical shape is [sum(divUpMul(N[bi], tileN) for bi in B), M].
+        //    Logical strides are [M, 1].
+        void* mPtrInvalidation{nullptr};
+
+        // The scaling factors for testing data invalidation, for MxFp{4,8} and NvFp4 formats.
+        //
+        // This has the same logical shape and layout as mPtrSfC.
+        void* mPtrSfInvalidation{nullptr};
+#endif // TLLM_TEST
+#endif // TLLM_RUBIN_FEATURES
     };
 
     ProblemDimensions mProblemDimensions;
@@ -682,6 +709,11 @@ public:
             batchedGemmData.mInputBuffers.mPtrScaleC, batchedGemmData.mInputBuffers.mPtrScaleAct,
             batchedGemmData.mInputBuffers.mPtrScaleGate, batchedGemmData.mInputBuffers.mPtrClampLimit,
             batchedGemmData.mInputBuffers.mPtrGatedActAlpha, batchedGemmData.mInputBuffers.mPtrGatedActBeta,
+#ifdef TLLM_RUBIN_FEATURES
+#ifdef TLLM_TEST
+            batchedGemmData.mOutputBuffers.mPtrInvalidation, batchedGemmData.mOutputBuffers.mPtrSfInvalidation,
+#endif // TLLM_TEST
+#endif // TLLM_RUBIN_FEATURES
             batchedGemmData.mInputBuffers.mPtrRouteMap, dPtrRowMax, dPtrRowMaxBars,
             batchedGemmData.mProblemDimensions.mRank, batchedGemmData.mProblemDimensions.mWorldSize,
             batchedGemmData.mInputBuffers.mPtrMulticastCompletionBarUc,
@@ -767,7 +799,11 @@ public:
         // Whether PDL can safely be enabled
         bool const pdlSafe = batchedGemmConfig.mOptions.mGridWaitForPrimaryRouting
             || batchedGemmConfig.mOptions.mGridWaitForPrimaryEarlyExit
-            || batchedGemmConfig.mOptions.mGridWaitForPrimaryA || batchedGemmConfig.mOptions.mGridWaitForPrimaryB;
+            || batchedGemmConfig.mOptions.mGridWaitForPrimaryA || batchedGemmConfig.mOptions.mGridWaitForPrimaryB
+#ifdef TLLM_RUBIN_FEATURES
+            || batchedGemmConfig.mOptions.mLamportConsumerA || batchedGemmConfig.mOptions.mLamportConsumerB
+#endif // TLLM_RUBIN_FEATURES
+            ;
 
         // Run the kernel.
         auto result = trtllm::gen::launchKernel((void*) &kernelParams, cudaStream, batchedGemmConfig.mSharedMemSize,
@@ -958,14 +994,9 @@ public:
         auto options = getOptionsFromConfigAndData(config, data);
 
         // Check options without modifications.
-        //
-        // NOTE(TRT-LLM local fix over producer output a2ad0544-dirty): the generator
-        // inserted the `worldSize` parameter into checkAndUpdateBatchedGemmOptions
-        // without updating this call, so the literal `false` bound positionally to
-        // `worldSize` (=0) and `updateOptions` silently took its default `true`.
-        // Pass both arguments explicitly. Report upstream before the next re-export.
         return checkAndUpdateBatchedGemmOptions(options, config.mSm,
-            /* worldSize */ 1, /* updateOptions */ false);
+            /* worldSize */ 1,
+            /* updateOptions */ false);
     }
 
     //////////////////////////////////////////////////////////////////////////////////////////////////

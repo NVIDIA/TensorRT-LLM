@@ -102,17 +102,7 @@ sbatch examples/kimi_k3/run_eval_kimi_k3.sbatch \
 This job writes progress and results to
 `kimi-k3-eval-<job-id>.log`. If no local dataset path is configured,
 `trtllm-eval` downloads GSM8K from the Hugging Face Hub. The completed log
-contains a results table with the normalized GSM8K exact-match scores. With
-the tested checkpoint and the settings in this example, users should expect
-approximately:
-
-| Filter | Exact match |
-| :-- | --: |
-| Flexible extract | 96.51 |
-| Strict match | 96.44 |
-
-The expected average accuracy is approximately 96.47. Small differences are
-possible with different checkpoint or dependency revisions.
+contains a results table with the normalized GSM8K exact-match scores.
 
 To evaluate with suffix-automaton (SA) speculative decoding, add `--sa`:
 
@@ -143,12 +133,12 @@ examples/kimi_k3/perf_sweep/submit_perf_sweep.sh \
 ```
 
 All jobs of a comparison batch are submitted together on purpose: a weight
-load overlapping another job's measurement window depresses DEP16 c>=128
-points by ~30%. Use `--jobs "tep16 tep8 dep16-lo dep16-hi"` to select a
+load overlapping another job's measurement window depresses later points.
+Use `--jobs "tep16 tep8 dep16-lo dep16-hi"` to select a
 subset and `--dry-run` to inspect the sbatch commands.
 
 Guard the same three recipes with the GSM8K accuracy sweep whenever the
-serving configs or kernels change (expect ~96.5 +/- 0.5 per recipe):
+serving configs or kernels change:
 
 ```bash
 examples/kimi_k3/perf_sweep/submit_acc_sweep.sh \
@@ -221,4 +211,9 @@ decoding requires the default cache manager, which cannot reuse blocks.
   and the TEP16/TEP8 latency recipes are unaffected. Tracked as
   TRTLLM-14904.
 - FP8 KV cache (`kv_cache_config.dtype: fp8`) is not yet supported.
+- The MLA generation backend defaults to trtllm-gen on this branch. Upstream
+  defaults to cute-dsl, but the FlashInfer / CuTe-DSL pair shipped here cannot
+  initialize that kernel — see `_KIMI_K3_MLA_GEN_BACKEND_DEFAULT` in
+  `tensorrt_llm/_torch/modules/kimi_k3_mla/kimi_k3_mla_attention.py`. Set
+  `TLLM_K3_MLA_GEN_BACKEND=cute-dsl` to opt back in where the builds agree.
 - Speculative decoding: suffix-automaton speculation is supported for aggregated serving (`speculative_config: {decoding_type: SA}` in the extra LLM API options). For evaluation, use `eval_extra_llm_options_sa.yaml` (the `--sa` flag of the GSM8K job): that configuration runs with the overlap scheduler off, `max_batch_size` 8, and a matching CUDA-graph `max_batch_size`. Combining speculation with disaggregated serving is not yet supported.

@@ -806,7 +806,8 @@ class LmEvalEvaluator(Evaluator):
                  output_path: Optional[str] = None,
                  output_dir: Optional[str] = None,
                  post_process_fn: Optional[Callable[[str], str]] = None,
-                 preserve_caller_max_tokens: bool = False):
+                 preserve_caller_max_tokens: bool = False,
+                 num_fewshot: Optional[int] = None):
         try:
             import lm_eval
         except ImportError as e:
@@ -861,6 +862,23 @@ class LmEvalEvaluator(Evaluator):
                 else:
                     # NOTE: Few-shot random seed
                     task_obj.set_fewshot_seed(seed=random_seed)
+                    # Caller override of the task yaml's shot count. lm-eval's own
+                    # simple_evaluate does exactly this; trtllm-eval never
+                    # plumbed it, so a 0-shot (chat-style) evaluation of a task
+                    # whose yaml pins 5 shots was previously unreachable.
+                    if num_fewshot is not None:
+                        task_obj.set_config(key="num_fewshot",
+                                            value=num_fewshot)
+                        logger.info(f"num_fewshot overridden to {num_fewshot} "
+                                    f"(task yaml default kept otherwise)")
+                    if os.environ.get("TRTLLM_LM_EVAL_PLAIN_PROMPT") == "1":
+                        task_obj.set_config(key="doc_to_text",
+                                            value="{{question}}")
+                        _gk = dict(task_obj.config.generation_kwargs or {})
+                        _gk.pop("until", None)
+                        task_obj.set_config(key="generation_kwargs", value=_gk)
+                        logger.info(
+                            f"[scratch] plain prompt, generation_kwargs={_gk}")
                     adjusted_task_dict[task_name] = task_obj
 
                     # NOTE: Shuffle dataset
@@ -1026,6 +1044,7 @@ class LmEvalEvaluator(Evaluator):
             random_seed=kwargs.pop("random_seed", 0),
             apply_chat_template=kwargs.pop("apply_chat_template", False),
             fewshot_as_multiturn=kwargs.pop("fewshot_as_multiturn", False),
+            num_fewshot=kwargs.pop("num_fewshot", None),
             system_prompt=kwargs.pop("system_prompt", None),
             is_multimodal=kwargs.pop("is_multimodal", False),
             chat_template_kwargs=kwargs.pop("chat_template_kwargs", None),
@@ -1101,6 +1120,12 @@ class GSM8K(LmEvalEvaluator):
                   is_flag=True,
                   default=False,
                   help="Apply fewshot as multiturn.")
+    @click.option(
+        "--num_fewshot",
+        type=int,
+        default=None,
+        help="Override the task yaml's shot count. Use 0 with "
+        "--apply_chat_template for a single-question chat evaluation.")
     @click.option("--system_prompt",
                   type=str,
                   default=None,

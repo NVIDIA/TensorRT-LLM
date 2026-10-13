@@ -17,7 +17,8 @@
 This module owns three concerns and delegates the rest:
   * Lifecycle / global singleton (``__enter__`` / ``__exit__`` +
     ``set_global_dwdp_manager`` / ``get_global_dwdp_manager``)
-  * DWDP MPI sub-communicator creation (``_create_dwdp_comm``)
+  * DWDP group creation (``_create_dwdp_comm``): MPI sub-communicator or
+    store rendezvous
   * Layer index registration (SSOT: ``add_layer`` → ``_registered_layers``)
     plus runtime entry points that forward to ``DWDPWeightManager``
     (``prefetch_first_layers``, ``wait_and_bind``,
@@ -37,8 +38,13 @@ import torch.nn as nn
 from mpi4py.MPI import COMM_WORLD
 
 from tensorrt_llm._torch.distributed import MPIDist
-from tensorrt_llm._torch.modules.dwdp import DWDPWeightManager, setup_dwdp
-from tensorrt_llm._utils import global_mpi_rank
+from tensorrt_llm._torch.modules.dwdp import (
+    DWDPWeightManager,
+    StoreDwdpGroup,
+    dwdp_global_rank,
+    setup_dwdp,
+    store_rendezvous_enabled,
+)
 from tensorrt_llm.llmapi.llm_args import DwdpConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
@@ -75,8 +81,16 @@ class DwdpManager:
         dist: object,
         mapping: Mapping,
     ) -> None:
-        if not isinstance(dist, MPIDist):
-            raise RuntimeError("DWDP requires MPI backend (MPIDist)")
+        # Plain `trtllm-serve` workers have size-1 MPI worlds, so the group
+        # rendezvous over a TCPStore instead -- see modules.dwdp.rendezvous.
+        self._store_rendezvous = store_rendezvous_enabled()
+        if not self._store_rendezvous and not isinstance(dist, MPIDist):
+            raise RuntimeError(
+                "DWDP requires the MPI backend (MPIDist), or a store "
+                "rendezvous: set TRTLLM_DWDP_RANK and "
+                "TRTLLM_DWDP_MASTER_ADDR when launching the context "
+                "workers with plain trtllm-serve"
+            )
         if not mapping.dwdp_enabled:
             raise RuntimeError(
                 f"DwdpManager requires mapping.dwdp_enabled (dwdp_size > 1); "
@@ -91,7 +105,7 @@ class DwdpManager:
         # is how it was treated up through commit `1fbc0d49`.
         if config.num_groups <= 0:
             raise ValueError(f"DwdpConfig.num_groups must be positive, got {config.num_groups}")
-        self.rank = global_mpi_rank()
+        self.rank = dwdp_global_rank()
         group_id = self.rank // mapping.dwdp_size
         if group_id >= config.num_groups:
             raise ValueError(
@@ -103,8 +117,10 @@ class DwdpManager:
                 f"ranks, or num_groups in the YAML is set too small."
             )
         expected_min_world = config.num_groups * mapping.dwdp_size
-        actual_world = COMM_WORLD.Get_size()
-        if actual_world < expected_min_world:
+        # A store-rendezvous worker's COMM_WORLD is size 1 and says nothing about
+        # the launch; a short launch surfaces as the first allgather timing out.
+        actual_world = 0 if self._store_rendezvous else COMM_WORLD.Get_size()
+        if actual_world and actual_world < expected_min_world:
             raise ValueError(
                 f"DwdpConfig declares {config.num_groups} groups × dwdp_size "
                 f"{mapping.dwdp_size} = {expected_min_world} CTX workers, but "
@@ -147,12 +163,18 @@ class DwdpManager:
     # ------------------------------------------------------------------
 
     def _create_dwdp_comm(self):
-        """Create an MPI sub-communicator scoped to this rank's DWDP group.
+        """Create the group handle scoped to this rank's DWDP group.
 
         With num_groups=2, dwdp_size=4:
             Group 0: ranks [0, 1, 2, 3]
             Group 1: ranks [4, 5, 6, 7]
+
+        Returns an MPI sub-communicator or a ``StoreDwdpGroup``; both expose
+        ``allgather`` / ``Barrier`` / ``Free``.
         """
+        if self._store_rendezvous:
+            return StoreDwdpGroup.from_env(global_rank=self.rank, dwdp_size=self.dwdp_size)
+
         group_id = self.rank // self.dwdp_size
         group_start = group_id * self.dwdp_size
         ranks = list(range(group_start, group_start + self.dwdp_size))

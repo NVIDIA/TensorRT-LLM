@@ -22,8 +22,6 @@
 #include "tensorrt_llm/runtime/torchUtils.h"
 #include "tensorrt_llm/thop/thUtils.h"
 
-#include <ATen/native/cuda/Resize.h>
-
 namespace th = torch;
 namespace tl = tensorrt_llm;
 namespace tk = tensorrt_llm::kernels;
@@ -138,9 +136,13 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
         = torch::empty({num_moe_inputs}, torch::dtype(torch::kInt32).device(torch::kCUDA).requires_grad(false));
     auto permuted_token_selected_experts_tensor
         = torch::empty({num_moe_inputs}, torch::dtype(torch::kInt32).device(torch::kCUDA).requires_grad(false));
-    auto permuted_data_tensor = torch::empty({num_moe_inputs, hidden_size}, input.options().requires_grad(false));
+    // Skipping the expand leaves these two unwritten, so size them to zero
+    // rather than to the expanded token count: at experts_per_token * num_rows
+    // rows they dominate this operator's allocation.
+    int64_t const num_expanded_rows = skip_data_expand ? 0 : num_moe_inputs;
+    auto permuted_data_tensor = torch::empty({num_expanded_rows, hidden_size}, input.options().requires_grad(false));
     auto permuted_token_final_scales_tensor
-        = torch::empty({num_moe_inputs}, torch::dtype(torch::kFloat32).device(torch::kCUDA).requires_grad(false));
+        = torch::empty({num_expanded_rows}, torch::dtype(torch::kFloat32).device(torch::kCUDA).requires_grad(false));
     auto expert_first_token_offset_tensor = torch::empty(
         {num_experts_per_node + 1}, torch::dtype(torch::kInt64).device(torch::kCUDA).requires_grad(false));
     auto unpermuted_row_to_permuted_row_tensor = torch::empty({static_cast<int64_t>(experts_per_token * num_rows)},

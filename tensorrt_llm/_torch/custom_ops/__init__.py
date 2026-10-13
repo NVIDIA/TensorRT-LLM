@@ -15,7 +15,8 @@
 import torch
 
 from ..cuda_tile_utils import IS_CUDA_TILE_AVAILABLE
-from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
+from ..cute_dsl_utils import (IS_CUTLASS_DSL_AVAILABLE,
+                              IS_CUTLASS_DSL_INTERNAL_AVAILABLE)
 from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
 from .cpp_custom_ops import _register_fake
 from .torch_custom_ops import BufferKind, bmm_out
@@ -94,4 +95,17 @@ if IS_CUDA_TILE_AVAILABLE:
     __all__ += [
         'cuda_tile_rms_norm',
         'cuda_tile_rms_norm_fuse_residual_',
+    ]
+
+if IS_CUTLASS_DSL_INTERNAL_AVAILABLE:
+    from .cute_dsl_custom_ops import (
+        cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_rubin,
+        cute_dsl_nvfp4_gemm_rubin,
+        cute_dsl_nvfp4_grouped_gemm_finalize_inplace_rubin,
+        cute_dsl_nvfp4_grouped_gemm_finalize_rubin)
+    __all__ += [
+        'cute_dsl_nvfp4_gemm_rubin',
+        'cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_rubin',
+        'cute_dsl_nvfp4_grouped_gemm_finalize_inplace_rubin',
+        'cute_dsl_nvfp4_grouped_gemm_finalize_rubin',
     ]

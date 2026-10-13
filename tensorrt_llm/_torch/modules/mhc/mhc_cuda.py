@@ -539,7 +539,8 @@ def _fused_hc_mma_ks_supported(hidden_size: int, ks: int) -> bool:
     Phase 4 layer_input has a scalar-vec tail (H_VEC_END logic in
     fused_tf32_pmap_gemm.cuh) so `hidden % (warps_per_tok * warp * bf16_vec)
     == 0` is no longer required; only `hidden % bf16_vec == 0` plus
-    `h_tiles % ks == 0` remain.
+    `h_tiles % ks == 0` remain, except for the measured H=7168 KS=53/106
+    exact-wave Rubin tactics.
     """
     if hidden_size not in _FUSED_HC_MMA_SUPPORTED_HIDDEN_SIZES:
         return False
@@ -550,7 +551,9 @@ def _fused_hc_mma_ks_supported(hidden_size: int, ks: int) -> bool:
     if hidden_size % block_k != 0:
         return False
     h_tiles = hidden_size // block_k
-    if h_tiles % ks != 0:
+    even_split = ks > 0 and h_tiles % ks == 0
+    rubin_exact_split = hidden_size == 7168 and ks in (53, 106)
+    if not (even_split or rubin_exact_split):
         return False
     return hidden_size % bf16_vec == 0
 
@@ -576,15 +579,12 @@ _FUSED_HC_HALF_FMA_TN_KS = (
     (12, 1),
     (24, 1),
 )
-# Tactics for the half-fused MMA path: (num_k_splits,). Matches Path D
-# (pickFhcAllInOne) so the autotuner can compare half-fused vs all-in-one at
-# the same ks across the full range. Includes high-KS divisors of HIDDEN/64
-# for hidden=7168 (h_tiles=112): 7, 14, 28, 56, 112. _fused_hc_mma_ks_supported
-# filters per (hidden, ks) — entries that don't divide h_tiles drop out.
-_FUSED_HC_HALF_MMA_KS = (1, 2, 4, 7, 8, 14, 16, 28, 32, 56, 64, 112)
+# Tactics for both MMA paths. KS=53/106 are exact-wave shapes that launch
+# exactly 212 CTAs for H=7168, M=256/128 on Rubin.
+_FUSED_HC_HALF_MMA_KS = (1, 2, 4, 7, 8, 14, 16, 28, 32, 53, 56, 64, 106, 112)
 # Tactics for Path D (all-in-one MMA): (num_k_splits,). No bigfuse_bs — the
 # bigfuse runs inline inside the single kernel and uses fixed parameters.
-_FUSED_HC_ALL_MMA_KS = (1, 2, 4, 7, 8, 14, 16, 28, 32, 56, 64, 112)
+_FUSED_HC_ALL_MMA_KS = (1, 2, 4, 7, 8, 14, 16, 28, 32, 53, 56, 64, 106, 112)
 # Tactics for Path F (all-in-one FMA): (tile_n, num_k_splits, tile_m).
 # Must stay in sync with the C++ pickFhcFmaAllInOne() table.
 _FUSED_HC_ALL_FMA_TN_KS_TM = tuple(
@@ -611,15 +611,20 @@ def _fused_hc_mma_ks_options(hidden_size: int) -> tuple[int, ...]:
     return tuple(ks for ks in _FUSED_HC_HALF_MMA_KS if _fused_hc_mma_ks_supported(hidden_size, ks))
 
 
-def _fused_hc_target_mma_ks(hidden_size: int, M: int) -> int | None:
+def _fused_hc_target_mma_ks(
+    hidden_size: int, M: int, sm_count: int = 128, is_rubin: bool = False
+) -> int | None:
     """Pick the measured splitK ridge for the MMA fused_hc paths."""
     valid = _fused_hc_mma_ks_options(hidden_size)
     if not valid:
         return None
     m_tiles = max(1, (M + 63) // 64)
-    target = max(1, 128 // m_tiles)
-    candidates = tuple(ks for ks in valid if ks <= target)
-    return candidates[-1] if candidates else valid[0]
+    # Small/mid-M targets one full device wave. Large prefill has enough work
+    # per CTA to benefit from roughly five Rubin waves (full sweep: KS=8 at
+    # M=8192 and KS=4 at M=16384). Pick the closest compiled split count so
+    # H=7168, M=128/256 lands on the exact 212-CTA KS=106/53 instances.
+    target_ctas = sm_count * (5 if is_rubin and M >= 8192 else 1)
+    return min(valid, key=lambda ks: (abs(m_tiles * ks - target_ctas), -ks))
 
 
 def _fused_hc_mma_bigfuse_bs_options(M: int) -> tuple[int, ...]:
@@ -840,13 +845,16 @@ class MhcFusedHcRunner(TunableRunner):
                     add(("fused_half_fma", tn, ks, bs, 1))
 
         if mma_ok and M >= 32:
-            ks = _fused_hc_target_mma_ks(self.hidden_size, M)
+            props = torch.cuda.get_device_properties(inputs[0].device)
+            is_rubin = props.major == 10 and props.minor == 7
+            ks = _fused_hc_target_mma_ks(self.hidden_size, M, props.multi_processor_count, is_rubin)
             if ks is not None:
                 m_tiles = (M + 63) // 64
-                if m_tiles * ks <= 148 * 4:
+                max_grid_ctas = props.multi_processor_count * (5 if is_rubin else 4)
+                if m_tiles * ks <= max_grid_ctas:
                     for bs in _fused_hc_mma_bigfuse_bs_options(M):
                         add(("fused_half_mma", 0, ks, bs, 1))
-                    if M >= 64:
+                    if M >= 64 and ks in _FUSED_HC_ALL_MMA_KS:
                         add(("fused_all_mma", 0, ks, 0, 1))
 
         if not mma_ok and M > 32:

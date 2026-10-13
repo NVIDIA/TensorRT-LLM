@@ -14,6 +14,8 @@
  * limitations under the License.
  */
 
+#include <algorithm>
+#include <cstring>
 #include <optional>
 #include <set>
 #include <unistd.h>
@@ -45,7 +47,12 @@ using tensorrt_llm::common::fmtstr;
 
 constexpr bool isSMCompatible(int gpuSM, SmVersion kernelSM)
 {
-    if (gpuSM == 103)
+    if (gpuSM == 107)
+    {
+        // SM107 (Rubin) can run SM100f family kernels or SM107a-specific kernels
+        return kernelSM == SmVersion::Sm100f || kernelSM == SmVersion::Sm107a;
+    }
+    else if (gpuSM == 103)
     {
         return kernelSM == SmVersion::Sm100f || kernelSM == SmVersion::Sm103a;
     }
@@ -56,6 +63,11 @@ constexpr bool isSMCompatible(int gpuSM, SmVersion kernelSM)
     else if (gpuSM == 90)
     {
         return kernelSM == SmVersion::Sm90a;
+    }
+    // Redirect SM100 family (major version 10) to family kernels
+    else if (tensorrt_llm::common::isSM100Family(gpuSM))
+    {
+        return kernelSM == SmVersion::Sm100f;
     }
 
     TLLM_THROW("Unexpected gpuSM %d", gpuSM);
@@ -78,7 +90,7 @@ static batchedGemm::gemmGatedAct::ActType toGemmGatedActType(ActType actType)
     TLLM_THROW("ActType %d has no fused gated kernel mapping", static_cast<int>(actType));
 }
 
-static inline bool skipQuirks(BatchedGemmConfig const& config)
+static inline bool skipQuirks(BatchedGemmConfig const& config, int gpuSM)
 {
     // Skip kernels that are known to hang/crash. Keep a record here for future reference.
     auto const& options = config.mOptions;
@@ -93,7 +105,71 @@ static inline bool skipQuirks(BatchedGemmConfig const& config)
     bool const hang_schedS_tmaOob_tileN64
         = options.mTileScheduler == TileScheduler::Static && options.mUseTmaOobOpt && options.mTileN == 64;
 
-    return hang_c2x1_bM || hang_schedS_tmaOob_tileN64;
+    // Bfloat16_MxE2m1MxE4m3 splitK2 (cga 1x1x2) MoE FC2 cubins intermittently
+    // emit corrupted output rows under concurrent serving load (non-finite /
+    // garbage-magnitude values with bit-identical clean inputs; reproduced on
+    // GB300 TEP16 small-M decode batches, and confirmed both ways by tactic
+    // A/B). Two payloads were caught in-situ, e.g.:
+    // bmm_Bfloat16_MxE2m1MxE4m3_Fp32_Ab32_Bb32_t128x8x256u2_s6_et128x8_m128x8x32_c1x1x2_rM_splitK2_TN_transOut_schPd2x1x2x3_biasFp32M_bN_rgTma_clmp_dynB_sm100f
+    // bmm_Bfloat16_MxE2m1MxE4m3_Fp32_Ab32_Bb32_t128x8x512_s3_et128x8_m128x8x32_c1x1x2_rM_splitK2_TN_transOut_schPd2x1x2x3_biasFp32M_bN_rgTma_clmp_dynB_sm100f
+    // Filtering only those two by hash moved the failure to the remaining
+    // siblings (identical signature with the re-tuned tactic selection), so
+    // all 8 splitK cubins of this dtype combination are skipped by name:
+    // they share the cross-CTA split-K reduction scheme. The kernels are
+    // workload-implicated, not proven intrinsically corrupt. NOTE: a fixed
+    // cubin rebuild keeps the same kernel name, so this filter must be
+    // removed manually once repaired payloads ship.
+    bool const corrupt_splitk_fc2 = config.mFunctionName != nullptr
+        && strstr(config.mFunctionName, "Bfloat16_MxE2m1MxE4m3") != nullptr
+        && strstr(config.mFunctionName, "splitK") != nullptr;
+
+    // FC1 flavor of the same MxE2m1MxE4m3 splitK family. The filter above
+    // catches only FC2 (bf16 output); the gated FC1 emits the fp8
+    // intermediate, so its output dtype is MxE4m3 and its kernel names start
+    // bmm_MxE4m3_MxE2m1MxE4m3_..._splitK2 - they escaped the FC2 filter.
+    // Instrumented Kimi K3 disagg GEN decode runs (M=2-4 microbatches)
+    // reproduced the identical single-rank whole-local-output corruption with
+    // these FC1 splitK2 cubins dispatched at the failing shapes, after all
+    // transfer/reuse/quant/routing suspects were eliminated by direct
+    // experiment. Same cross-CTA split-K reduction scheme, same skip
+    // rationale, same removal note as the FC2 family above.
+    bool const corrupt_splitk_fc1 = config.mFunctionName != nullptr
+        && strstr(config.mFunctionName, "MxE4m3_MxE2m1MxE4m3") != nullptr
+        && strstr(config.mFunctionName, "splitK") != nullptr;
+
+    // SM100f GEMM2 token tiles fault when launched through family compatibility on SM107.
+    // Keep fused GEMM1 (siTuGlu etc.) on sm100f. Native SM107a replacements exist for MXFP4
+    // FC2 (MxE2m1×MxE4m3); skip those sm100f unfused tiles so the regenerated cubins win.
+    // NVFP4 FC2 (E2m1×E2m1, fusedAct=0) from #17940 is sm100f-only — skipping it leaves
+    // tile-8 K3 init with "No kernel found". Allow that dtype through family compatibility.
+    bool const nvfp4UnfusedFc2 = options.mDtypeA == Dtype::E2m1 && options.mDtypeB == Dtype::E2m1;
+    bool const incompatible_sm107_family_kernel = gpuSM == 107 && config.mSm == ::batchedGemm::gemm::SmVersion::Sm100f
+        && !options.mFusedAct && !nvfp4UnfusedFc2;
+
+    // The native SM107a BF16-output tile-8 dynamic-persistent variant can illegal-address while initializing
+    // Kimi-K3 GEMM2 (for example B=56, MNK=16x3584x3072). Its static sibling is safe. Keep other persistent
+    // variants because the native static catalog does not cover every requested tile.
+    auto const tileSize
+        = options.mTransposeMmaOutput ? options.mTileN * options.mClusterDimY : options.mTileM * options.mClusterDimX;
+    bool const incompatible_sm107_bf16_tile8_dynamic_persistent = gpuSM == 107
+        && config.mSm == ::batchedGemm::gemm::SmVersion::Sm107a && options.mDtypeC == Dtype::Bfloat16 && tileSize == 8
+        && options.mTileScheduler == TileScheduler::Persistent;
+
+    // Prefer the least aggressive native tile-64 GEMM2 variant on Rubin. The 256-K, 2x-unrolled variant
+    // illegal-addresses for Kimi-K3's B=56, MNK=16x3584x3072 initialization problem.
+    bool const incompatible_sm107_bf16_tile64_variant = gpuSM == 107
+        && config.mSm == ::batchedGemm::gemm::SmVersion::Sm107a && options.mDtypeC == Dtype::Bfloat16 && tileSize == 64
+        && (options.mMmaTileK != 128 || options.mUseUnrollLoop2xForMma);
+
+    // For tile 16, use the single-CTA, non-unrolled static variant.
+    bool const incompatible_sm107_bf16_tile16_variant = gpuSM == 107
+        && config.mSm == ::batchedGemm::gemm::SmVersion::Sm107a && options.mDtypeC == Dtype::Bfloat16 && tileSize == 16
+        && (options.mClusterDimX != 1 || options.mUseUnrollLoop2xForMma
+            || options.mTileScheduler != TileScheduler::Static);
+
+    return hang_c2x1_bM || hang_schedS_tmaOob_tileN64 || corrupt_splitk_fc2 || corrupt_splitk_fc1
+        || incompatible_sm107_family_kernel || incompatible_sm107_bf16_tile8_dynamic_persistent
+        || incompatible_sm107_bf16_tile64_variant || incompatible_sm107_bf16_tile16_variant;
 }
 
 void setProblemDimensions(BatchedGemmData& gemmData, bool transposeMmaOutput, int32_t m, int32_t n, int32_t k,
@@ -169,14 +245,7 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(TrtllmGenBatchedGemmRunne
             // NoSwap: A is activation, B is weight.
             : (options.mDtypeA == mOptions.dtypeA && options.mDtypeB == mOptions.dtypeB);
 
-        if (!acceptIf(!skipQuirks(config), "skipQuirks: known hanging kernel"))
-        {
-            continue;
-        }
-
-        // The host runner does not wire the multicast completion barrier pointers; reject any
-        // future metadata that enables C multicast instead of launching with null barriers.
-        if (!acceptIf(!options.mUseCMultiCast, "mUseCMultiCast is not supported by the host runner"))
+        if (!acceptIf(!skipQuirks(config, gpuSM), "skipQuirks: known hanging or incompatible kernel"))
         {
             continue;
         }
@@ -235,31 +304,9 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(TrtllmGenBatchedGemmRunne
             continue;
         }
 
-        auto sm = configs[i].mSm;
-        if (sm != SmVersion::Sm100f)
-        {
-            int smVersion = tensorrt_llm::common::getSMVersion();
-            if (smVersion == 100)
-            {
-                if (!acceptIf(sm == SmVersion::Sm100a,
-                        fmtstr("SM version 100 requires Sm100a (kernel has: %d)", static_cast<int>(sm))))
-                {
-                    continue;
-                }
-            }
-            else if (smVersion == 103)
-            {
-                if (!acceptIf(sm == SmVersion::Sm103a,
-                        fmtstr("SM version 103 requires Sm103a (kernel has: %d)", static_cast<int>(sm))))
-                {
-                    continue;
-                }
-            }
-        }
-
         if (options.mUseDeepSeekFp8)
         {
-            if (!acceptIf(options.mUseShuffledMatrix == false, "useShuffledMatrixA should be false for DeepSeek Fp8"))
+            if (!acceptIf(options.mUseShuffledMatrix == false, "useShuffledMatrix should be false for DeepSeek Fp8"))
             {
                 continue;
             }
@@ -284,6 +331,31 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(TrtllmGenBatchedGemmRunne
         if (!acceptIf(options.mEpilogueTileM == mOptions.epilogueTileM,
                 fmtstr("epilogueTileM mismatch (kernel: %d, expected: %d)", options.mEpilogueTileM,
                     mOptions.epilogueTileM)))
+        {
+            continue;
+        }
+
+        if (!acceptIf(options.mLamportConsumerA == mOptions.lamportConsumerA,
+                fmtstr("lamportConsumerA mismatch (kernel: %d, expected: %d)", options.mLamportConsumerA,
+                    mOptions.lamportConsumerA)))
+        {
+            continue;
+        }
+        if (!acceptIf(options.mLamportConsumerB == mOptions.lamportConsumerB,
+                fmtstr("lamportConsumerB mismatch (kernel: %d, expected: %d)", options.mLamportConsumerB,
+                    mOptions.lamportConsumerB)))
+        {
+            continue;
+        }
+        if (!acceptIf(options.mLamportForceValid == mOptions.lamportForceValid,
+                fmtstr("lamportForceValid mismatch (kernel: %d, expected: %d)", options.mLamportForceValid,
+                    mOptions.lamportForceValid)))
+        {
+            continue;
+        }
+        if (!acceptIf(options.mLamportProducer == mOptions.lamportProducer,
+                fmtstr("lamportProducer mismatch (kernel: %d, expected: %d)", options.mLamportProducer,
+                    mOptions.lamportProducer)))
         {
             continue;
         }
@@ -445,7 +517,7 @@ void TrtllmGenBatchedGemmRunner::run(int32_t m, int32_t n, int32_t k, int32_t va
     bmm.runInitBeforeWorldSync(config, gemmData, static_cast<void*>(stream));
 
     auto const err = bmm.run(config, workspace, gemmData, static_cast<void*>(stream), multiProcessorCount,
-        tensorrt_llm::common::getEnvEnablePDL(), nullptr, globalTrtllmGenBatchedGemmModuleCache);
+        tensorrt_llm::common::getEnvEnablePDL(), nullptr, std::ref(globalTrtllmGenBatchedGemmModuleCache));
 
     CUresult cuErr = static_cast<CUresult>(err);
     char const* cuErrStr = nullptr;
@@ -520,6 +592,7 @@ std::vector<int64_t> TrtllmGenBatchedGemmRunner::getValidConfigIndices(int32_t m
     auto const configs = bmm.getBatchedGemmConfigs();
 
     int32_t multiProcessorCount = tensorrt_llm::common::getMultiProcessorCount();
+    int32_t gpuSM = tensorrt_llm::common::getSMVersion();
 
     BatchedGemmData gemmData{};
 
@@ -531,11 +604,18 @@ std::vector<int64_t> TrtllmGenBatchedGemmRunner::getValidConfigIndices(int32_t m
     setProblemDimensions(gemmData, /* transposeMmaOutput = */ false, m, n, k, batchedTokens, numTokens, numBatches,
         maxNumCtasInBatchDim, validM, validN, validK);
     auto cmpFunc = [&configs, &bmm, &multiProcessorCount, &m, &n, &k, &batchedTokens, &numTokens, &numBatches,
-                       &maxNumCtasInBatchDim, &validM, &validN, &validK](int64_t idx0, int64_t idx1)
+                       &maxNumCtasInBatchDim, &validM, &validN, &validK, gpuSM](int64_t idx0, int64_t idx1)
     {
         auto const& optionsA = configs[idx0].mOptions;
         auto const& optionsB = configs[idx1].mOptions;
         int32_t sizeK = k;
+
+        // Prefer native Rubin kernels over SM100f family-compatible fallbacks. Both pass the compatibility filter,
+        // but SM100f Kimi-K3 BMM kernels can fault when launched on SM107.
+        if (gpuSM == 107 && configs[idx0].mSm != configs[idx1].mSm)
+        {
+            return configs[idx0].mSm == SmVersion::Sm107a;
+        }
 
         if (optionsA.mTransposeMmaOutput != optionsB.mTransposeMmaOutput)
         {

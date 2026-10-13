@@ -19,7 +19,7 @@ the transfer phase, preventing exhaustion when transfers are slow and multiple
 iterations of requests accumulate in-flight.
 """
 
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, call
 
 import pytest
 import torch
@@ -253,6 +253,46 @@ class TestIndexMapperSlotReuse:
         torch.testing.assert_close(destination[:, :4, 0], expected)
         assert torch.count_nonzero(destination[:, :, 1] != -1) == 0
         assert torch.count_nonzero(destination[:, 4, 0] != -1) == 0
+
+    def test_release_detaches_page_index_views_before_slot_reuse(self):
+        from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
+        from tensorrt_llm.bindings.internal.batch_manager.kv_cache_manager_v2_utils import (
+            IndexMapper,
+        )
+
+        manager = object.__new__(KVCacheManagerV2)
+        manager.max_beam_width = 2
+        manager.num_pools = 3
+        index_mapper = IndexMapper(max_batch_size=1, max_beam_width=2)
+        index_mapper.add_new_sequence(1)
+        events = []
+        manager.index_mapper = MagicMock(wraps=index_mapper)
+        manager.index_mapper.remove_sequence.side_effect = lambda request_id: (
+            events.append(("remove", request_id)),
+            index_mapper.remove_sequence(request_id),
+        )[1]
+        manager._early_freed_index_requests = set()
+        kv_cache = MagicMock()
+        kv_cache.set_base_page_index_buf.side_effect = (
+            lambda beam_idx, pool_idx, value: events.append(("detach", beam_idx, pool_idx, value))
+        )
+        manager.kv_cache_map = {1: kv_cache}
+
+        manager.release_index_slot(1)
+
+        expected_calls = [
+            call(beam_idx, pool_idx, None)
+            for beam_idx in range(manager.max_beam_width)
+            for pool_idx in range(manager.num_pools)
+        ]
+        assert kv_cache.set_base_page_index_buf.call_args_list == expected_calls
+        assert events == [
+            ("detach", beam_idx, pool_idx, None)
+            for beam_idx in range(manager.max_beam_width)
+            for pool_idx in range(manager.num_pools)
+        ] + [("remove", 1)]
+        assert not _has_sequence(index_mapper, 1)
+        assert manager._early_freed_index_requests == {1}
 
 
 class TestFreeResourcesDoubleReleaseSafety:

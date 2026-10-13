@@ -21,7 +21,6 @@
 #include "tensorrt_llm/thop/thUtils.h"
 
 #include <ATen/cuda/EmptyTensor.h>
-#include <ATen/native/cuda/Resize.h>
 
 #include <cuda_fp16.h>
 
@@ -194,7 +193,7 @@ public:
     {
 
         auto const smVersion = tensorrt_llm::common::getSMVersion();
-        if (smVersion != tensorrt_llm::kernels::kSM_100)
+        if (smVersion != tensorrt_llm::kernels::kSM_100 && smVersion != tensorrt_llm::kernels::kSM_107)
         {
             TLLM_THROW("Unsupported or unimplemented compute capability for fp8 batched gemm: %i", smVersion);
         }

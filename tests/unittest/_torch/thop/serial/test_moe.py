@@ -29,7 +29,7 @@ sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 
 from enum import Enum
 
-from utils.util import getSMVersion
+from utils.util import getSMVersion, skip_rubin
 
 from tensorrt_llm._torch.autotuner import AutoTuner, autotune
 from tensorrt_llm._torch.modules.fused_moe import RoutingMethodType
@@ -64,6 +64,23 @@ def test_mxe4m3_mxe2m1_situ_runner_has_valid_configs(num_tokens):
         ActType.SiTu.value, True)
     tactics = runner.get_valid_configs(2, 512, 256, 8, num_tokens, 512, 256)
     assert tactics, f"No valid SiTu tactic for num_tokens={num_tokens}"
+
+
+@pytest.mark.skipif(
+    getSMVersion() not in (100, 103, 107),
+    reason="The SiTu kernel supports SM100/SM103 and family-compatible SM107. "
+    "Current SM is %d." % getSMVersion(),
+)
+@pytest.mark.parametrize("num_tokens", [1, 8, 512])
+def test_e2m1_e2m1_situ_runner_has_valid_configs(num_tokens):
+    """NVFP4 twin of the MXFP4 check above.
+
+    Numerics for this path live in
+    tests/unittest/_torch/modules/moe/test_nvfp4_situ_moe.py.
+    """
+    runner = torch.classes.trtllm.FP4BlockScaleMoERunner(ActType.SiTu.value)
+    tactics = runner.get_valid_configs(2, 512, 256, 8, num_tokens, True)
+    assert tactics, f"No valid NVFP4 SiTu tactic for num_tokens={num_tokens}"
 
 
 class moe_args:
@@ -1150,8 +1167,12 @@ class TestMoeFp4:
                 id="RoutingRenormalize_large_experts"),
         ],
     )
+    @pytest.mark.parametrize("use_lamport", [False, True],
+                             ids=["non_lamport", "lamport"])
     def test_autotune(self, num_tokens, hidden_size, intermediate_size,
-                      act_type, routing_info):
+                      act_type, routing_info, use_lamport):
+        if use_lamport and getSMVersion() != 107:
+            pytest.skip("Lamport sync requires SM107 (Rubin)")
 
         self.run_moe_fp4_test(num_tokens,
                               hidden_size,
@@ -1159,7 +1180,8 @@ class TestMoeFp4:
                               routing_info,
                               use_autotune=True,
                               use_topk_as_input=False,
-                              act_type=act_type)
+                              act_type=act_type,
+                              use_lamport=use_lamport)
 
     @pytest.mark.parametrize("num_tokens", [1])
     @pytest.mark.parametrize("hidden_size", [1024])
@@ -1180,6 +1202,7 @@ class TestMoeFp4:
                 id="RoutingDSlite"),
         ],
     )
+    @skip_rubin  # FP8 x FP4 not supported on Rubin
     def test_autotune_fp8_fp4(self, num_tokens, hidden_size, intermediate_size,
                               routing_info):
 
@@ -1247,15 +1270,21 @@ class TestMoeFp4:
     )
     @pytest.mark.parametrize("use_topk_as_input", [False, True],
                              ids=["use_score_as_input", "use_topk_as_input"])
+    @pytest.mark.parametrize("use_lamport", [False, True],
+                             ids=["non_lamport", "lamport"])
     def test_no_autotune(self, num_tokens, hidden_size, intermediate_size,
-                         act_type, routing_info, use_topk_as_input):
+                         act_type, routing_info, use_topk_as_input,
+                         use_lamport):
+        if use_lamport and getSMVersion() != 107:
+            pytest.skip("Lamport sync requires SM107 (Rubin)")
         self.run_moe_fp4_test(num_tokens,
                               hidden_size,
                               intermediate_size,
                               routing_info,
                               use_autotune=False,
                               use_topk_as_input=use_topk_as_input,
-                              act_type=act_type)
+                              act_type=act_type,
+                              use_lamport=use_lamport)
 
     @pytest.mark.parametrize("num_tokens", [1])
     @pytest.mark.parametrize("hidden_size", [512])
@@ -1316,6 +1345,7 @@ class TestMoeFp4:
     )
     @pytest.mark.parametrize("use_topk_as_input", [False, True],
                              ids=["use_score_as_input", "use_topk_as_input"])
+    @skip_rubin  # FP8 x FP4 not supported on Rubin
     def test_no_autotune_fp8_fp4(self, num_tokens, hidden_size,
                                  intermediate_size, routing_info,
                                  use_topk_as_input):
@@ -1368,7 +1398,8 @@ class TestMoeFp4:
                          swiglu_alpha: float = None,
                          swiglu_beta: float = None,
                          swiglu_limit: float = None,
-                         act_type: ActType = ActType.SwiGlu) -> None:
+                         act_type: ActType = ActType.SwiGlu,
+                         use_lamport: bool = False) -> None:
 
         torch.random.manual_seed(0)
 
@@ -1386,7 +1417,7 @@ class TestMoeFp4:
         tile_tokens_dim = (num_tokens * top_k) // num_experts
         # And pad the number of tokens to the next power of 2.
         tile_tokens_dim = next_positive_power_of_2(tile_tokens_dim)
-        # At least padded to 8 tokens per CTA tile
+        # At least padded to 8 tokens per CTA tile.
         tile_tokens_dim = min(max(tile_tokens_dim, 8), 64)
         padding = tile_tokens_dim
         if padding >= 256:
@@ -1719,7 +1750,8 @@ class TestMoeFp4:
                 do_finalize=True,
                 topk_ids=topk_ids,
                 topk_weights=topk_weights,
-                act_type=act_type.value)
+                act_type=act_type.value,
+                use_lamport=use_lamport)
         torch.cuda.synchronize()
         output_dequant_actual = output[0].to(torch.float)
 

@@ -1,9 +1,15 @@
 #! /bin/bash
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 set -u
 set -e
 set -x
 
 role=${1}
+server_role=GENERATION
+if [ "${role}" = "CTX" ]; then
+    server_role=CONTEXT
+fi
 instance_id=${2}
 model_path=${3}
 port=${4}
@@ -95,4 +101,4 @@ fi
 ${nsys_prefix} trtllm-llmapi-launch ${numa_bind_cmd} \
     ${trtllm_serve_cmd} ${model_path} \
         --host $(hostname) --port ${port} \
-        --config ${config_file}
+        --server_role ${server_role} --config ${config_file}

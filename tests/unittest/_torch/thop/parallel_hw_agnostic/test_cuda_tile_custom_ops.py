@@ -18,6 +18,7 @@ import os
 import pytest
 import torch
 import torch.nn.functional as F
+from utils.util import skip_rubin
 
 import tensorrt_llm  # noqa: F401
 from tensorrt_llm._torch.cuda_tile_utils import IS_CUDA_TILE_AVAILABLE
@@ -98,6 +99,7 @@ def reference_rms_norm(
         return hidden_states
 
 
+@skip_rubin
 @pytest.mark.parametrize(
     "M,N",
     [
@@ -155,6 +157,7 @@ def test_cuda_tile_rms_norm(M, N, use_gemma, static_persistent, gather, dtype):
     )
 
 
+@skip_rubin
 @pytest.mark.parametrize(
     "M,N",
     [
@@ -235,6 +238,7 @@ def test_cuda_tile_rms_norm_fuse_residual(M, N, use_gemma, static_persistent, ga
     )
 
 
+@skip_rubin
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_cuda_tile_rms_norm_fuse_residual_inplace(dtype):
     """Test that fuse_residual operator truly modifies tensors in-place."""
@@ -265,6 +269,7 @@ def test_cuda_tile_rms_norm_fuse_residual_inplace(dtype):
     assert residual.data_ptr() == residual_data_ptr, "residual tensor was not modified in-place"
 
 
+@skip_rubin
 def test_cuda_tile_rms_norm_fuse_residual_requires_contiguous():
     """Test that fuse_residual operator requires contiguous tensors."""
     eps = 1e-5

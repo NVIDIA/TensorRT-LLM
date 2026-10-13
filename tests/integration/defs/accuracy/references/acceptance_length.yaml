@@ -22,6 +22,13 @@ TestLlama3_1_8BInstruct::test_pard:
 TestDeepSeekV4ProDSpark::test_gsm8k_dep8_megamoe_deepgemm:
   ref_al: 4.448784989234082
   min_al: 4.226345739772378
+# Not a copy of the DeepGEMM row above: that one is measured on the FP8 export,
+# this backend is the only one that serves the NVFP4 export, and the two differ
+# in both the MoE numerics and the checkpoint. The baseline was established
+# on the same NVFP4 export before moving the aggregate guard to one-node DEP4.
+TestDeepSeekV4ProDSpark::test_gsm8k_dep4_megamoe_cutedsl:
+  ref_al: 4.433448078026391
+  min_al: 4.211775674125072
 TestLlama3_1_8BInstruct::test_ngram:
   ref_al: 1.3434705770970525
   min_al: 1.2762970482421998
@@ -31,3 +38,8 @@ TestLlama3_1_8BInstruct::test_suffix_automaton:
 TestLlama3_1_8BInstruct::test_draft_target_dynamic_draft_len:
   ref_al: 3.243380267550134
   min_al: 3.0812112541726275
+# Baseline established on the full 1,319-sample stock workload after accuracy
+# passed for the K3 DSpark TEP8 configuration.
+TestKimiK3::test_gsm8k_tep8_dspark:
+  ref_al: 4.356080931788769
+  min_al: 4.13827688519933

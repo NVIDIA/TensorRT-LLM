@@ -15,8 +15,8 @@
 # Multi-stage Dockerfile
 ARG BASE_IMAGE=nvcr.io/nvidia/pytorch
 ARG TRITON_IMAGE=nvcr.io/nvidia/tritonserver
-ARG BASE_TAG=26.05-py3
-ARG TRITON_BASE_TAG=26.05-py3
+ARG BASE_TAG=26.08-py3
+ARG TRITON_BASE_TAG=26.08-py3
 ARG DEVEL_IMAGE=devel
 
 FROM ${BASE_IMAGE}:${BASE_TAG} AS base
@@ -50,6 +50,8 @@ ARG CUDNN_VER
 ARG NCCL_VER
 ARG CUBLAS_VER
 ARG TORCH_INSTALL_TYPE="skip"
+# Redeclare so rubin BASE_TAG is in scope for this stage
+ARG BASE_TAG
 RUN --mount=type=bind,source=docker/common,target=/opt/docker/common \
     --mount=type=cache,target=/root/.cache/pip \
     --mount=type=cache,target=/var/cache/apt,sharing=locked \
@@ -61,15 +63,25 @@ RUN --mount=type=bind,source=docker/common,target=/opt/docker/common \
     CUDA_VER=${CUDA_VER} CUDNN_VER=${CUDNN_VER} \
     NCCL_VER=${NCCL_VER} CUBLAS_VER=${CUBLAS_VER} \
     TORCH_INSTALL_TYPE=${TORCH_INSTALL_TYPE} \
+    BASE_TAG=${BASE_TAG} \
     bash /opt/docker/common/install.sh --base --cmake --ccache --cuda_toolkit \
          --cuda_libs --polygraphy --mpi4py --pytorch
 
 # Install constraints after install.sh so cleanup() doesn't delete the file mid-RUN
 COPY constraints.txt /tmp/constraints.txt
+ARG GITHUB_MIRROR=""
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip3 uninstall -y tornado black nbconvert pillow nvidia-cutlass-dsl nvidia-cutlass-dsl-libs-base numpy wandb || true && \
-    # Remove any leftover namespace dirs or dist-info that pip missed
-    rm -rf $(python3 -c "import site; print(site.getsitepackages()[0])")/nvidia_cutlass_dsl* && \
+    if [ -n "$GITHUB_MIRROR" ]; then \
+      export PIP_INDEX_URL="https://urm.nvidia.com/artifactory/api/pypi/pypi-remote/simple"; \
+    fi && \
+    # Keep numpy: the base image's scipy and pandas import it, and constraints no longer pins it. \
+    pip3 uninstall -y tornado black nbconvert pillow wandb && \
+    # Preserve the internal compiler overlay used by the Rubin bring-up targets. \
+    if ! python3 -m pip show nvidia-cutlass-dsl-internal >/dev/null 2>&1; then \
+      pip3 uninstall -y nvidia-cutlass-dsl nvidia-cutlass-dsl-libs-base \
+          nvidia-cutlass-dsl-libs-core nvidia-cutlass-dsl-libs-cu12 nvidia-cutlass-dsl-libs-cu13 && \
+      rm -rf $(python3 -c "import site; print(site.getsitepackages()[0])")/nvidia_cutlass_dsl*; \
+    fi && \
     pip3 install -r /tmp/constraints.txt && \
     rm /tmp/constraints.txt
 
@@ -82,16 +94,22 @@ RUN --mount=type=bind,source=docker/common,target=/opt/docker/common \
     GITHUB_MIRROR=${GITHUB_MIRROR} bash /opt/docker/common/install_ucx.sh && \
     GITHUB_MIRROR=${GITHUB_MIRROR} bash /opt/docker/common/install_nixl.sh && \
     bash /opt/docker/common/install_etcd.sh && \
-    GITHUB_MIRROR=${GITHUB_MIRROR} bash /opt/docker/common/install_fa4.sh && \
     rm -rf /root/.cache/uv/archive-v0 && \
     # WAR against https://github.com/advisories/GHSA-58pv-8j8x-9vj2
     rm -rf /usr/local/lib/python3.12/dist-packages/setuptools/_vendor/jaraco.context-5.3.0.dist-info && \
     # WAR against https://github.com/advisories/GHSA-8rrh-rw8j-w5fx
     rm -rf /usr/local/lib/python3.12/dist-packages/setuptools/_vendor/wheel-*.dist-info
 
-# Generate OSS attribution file for devel image
 ARG TRT_LLM_VER
 ARG TARGETARCH
+
+# Allow MPI/PRTE to run as root inside the container
+ENV OMPI_ALLOW_RUN_AS_ROOT=1 \
+    OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1 \
+    PRTE_ALLOW_RUN_AS_ROOT=1 \
+    PRTE_ALLOW_RUN_AS_ROOT_CONFIRM=1
+
+# Generate OSS attribution file for devel image
 RUN --mount=type=bind,source=scripts/generate_container_oss_attribution.sh,target=/tmp/gen_attribution.sh \
     bash /tmp/gen_attribution.sh "devel" "${TRT_LLM_VER}" "${TARGETARCH}"
 
@@ -132,21 +150,23 @@ ARG GITHUB_MIRROR=""
 ARG BUILD_WHEEL_ARGS="--clean"
 ARG BUILD_WHEEL_SCRIPT="scripts/build_wheel.py"
 RUN --mount=type=cache,target=/root/.cache/pip --mount=type=cache,target=${CCACHE_DIR} \
-    if [ -n "$GITHUB_MIRROR" ]; then \
-      export PIP_INDEX_URL="https://urm.nvidia.com/artifactory/api/pypi/pypi-remote/simple"; \
-    fi && \
-    GITHUB_MIRROR=$GITHUB_MIRROR python3 ${BUILD_WHEEL_SCRIPT} ${BUILD_WHEEL_ARGS}
+    GITHUB_MIRROR=$GITHUB_MIRROR \
+    PIP_INDEX_URL=${GITHUB_MIRROR:+https://urm.nvidia.com/artifactory/api/pypi/pypi-remote/simple} \
+    python3 ${BUILD_WHEEL_SCRIPT} ${BUILD_WHEEL_ARGS}
 
 FROM ${DEVEL_IMAGE} AS release
 
-WORKDIR /app/tensorrt_llm
+ENV OMPI_ALLOW_RUN_AS_ROOT=1 \
+    OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1 \
+    PRTE_ALLOW_RUN_AS_ROOT=1 \
+    PRTE_ALLOW_RUN_AS_ROOT_CONFIRM=1
+
 ARG GITHUB_MIRROR=""
+WORKDIR /app/tensorrt_llm
 RUN --mount=type=cache,target=/root/.cache/pip --mount=type=bind,from=wheel,source=/src/tensorrt_llm/build,target=/tmp/wheel \
-    if [ -n "$GITHUB_MIRROR" ]; then \
-      export PIP_INDEX_URL="https://urm.nvidia.com/artifactory/api/pypi/pypi-remote/simple"; \
-    fi && \
     TRTLLM_WHEEL=$(find /tmp/wheel -maxdepth 1 -name 'tensorrt_llm*.whl' -print -quit) && \
     test -n "${TRTLLM_WHEEL}" && \
+    PIP_INDEX_URL=${GITHUB_MIRROR:+https://urm.nvidia.com/artifactory/api/pypi/pypi-remote/simple} \
     pip install "${TRTLLM_WHEEL}[mx]"
 
 RUN --mount=type=bind,source=README.md,target=/mnt/ctx/README.md \
@@ -185,9 +205,21 @@ ENV TRT_LLM_GIT_COMMIT=${GIT_COMMIT} \
 RUN --mount=type=bind,source=scripts/generate_container_oss_attribution.sh,target=/mnt/gen_attribution.sh \
     bash /mnt/gen_attribution.sh "release" "${TRT_LLM_VER}" "${TARGETARCH}"
 
+FROM wheel AS tritonbuild
+
+WORKDIR /src/tensorrt_llm
+RUN pip install /src/tensorrt_llm/build/tensorrt_llm*.whl
+COPY ./triton_backend/ ./triton_backend/
+ARG TRITON_BASE_TAG
+RUN bash ./triton_backend/inflight_batcher_llm/scripts/build.sh -s "r${TRITON_BASE_TAG%-py3}"
+
+
 FROM release AS tritonrelease
 
 WORKDIR /app/tensorrt_llm
 COPY ./triton_backend/all_models ./triton_backend/all_models
 COPY ./triton_backend/scripts ./triton_backend/scripts
 COPY ./triton_backend/tools ./triton_backend/tools
+COPY ./triton_backend/inflight_batcher_llm/scripts ./triton_backend/inflight_batcher_llm/scripts
+COPY ./triton_backend/inflight_batcher_llm/client ./triton_backend/inflight_batcher_llm/client
+COPY --from=tritonbuild /opt/tritonserver/backends/tensorrtllm /opt/tritonserver/backends/tensorrtllm

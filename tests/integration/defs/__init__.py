@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -19,4 +19,7 @@
 # But if the import happens lazily after the test starts, pytest will think you leaked
 # the thread. We thus do the import here to prevent thread leak issues cropping up when messing
 # with the import statements in tests.
-from torch._inductor import lowering  # NOQA
+try:
+    from torch._inductor import lowering  # NOQA
+except ModuleNotFoundError:
+    pass

@@ -58,6 +58,7 @@ def make_gen_request(
     req.is_generation_in_progress_state = True
     req.is_first_context_chunk = is_first_context_chunk
     req.py_encoder_output_ready_event = None
+    req.py_multimodal_data = None
     return req
 
 
@@ -163,15 +164,23 @@ def make_kv_cache_manager(
     resize_context_fn=None,
     prepare_disagg_gen_init_fn=None,
     try_allocate_generation_fn=None,
+    can_evict=False,
 ):
     mgr = Mock()
     mgr.tokens_per_block = tokens_per_block
+    mgr.can_evict = can_evict
+    mgr._has_cp_helix = False
     mgr.kv_cache_map = _KVCacheMap()
     mgr.prepare_context.side_effect = prepare_context_fn or (lambda req: True)
     mgr.resize_context.side_effect = resize_context_fn or (lambda req, n: True)
     mgr.prepare_disagg_gen_init.side_effect = prepare_disagg_gen_init_fn or (lambda req: True)
     mgr.try_allocate_generation.side_effect = try_allocate_generation_fn or (lambda req: True)
-    mgr.suspend_request.return_value = None
+
+    def suspend_request(req):
+        if can_evict:
+            mgr.kv_cache_map[req.py_request_id].is_active = False
+
+    mgr.suspend_request.side_effect = suspend_request
     mgr.is_request_active.side_effect = lambda req_id: mgr.kv_cache_map[req_id].is_active
     return mgr
 
@@ -194,6 +203,7 @@ def make_scheduler(
     no_schedule_after_state: LlmRequestState | None = None,
     cross_kv_cache_manager: Mock | None = None,
     enable_prefix_aware_scheduling: bool = True,
+    enable_recompute_pause: bool = True,
 ) -> object:
     """Create KVCacheV2Scheduler, patching isinstance check for mock mgr."""
     from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import KVCacheV2Scheduler
@@ -218,6 +228,7 @@ def make_scheduler(
             peft_cache_manager=peft_cache_manager,
             scheduler_capacity=scheduler_capacity,
             enable_prefix_aware_scheduling=enable_prefix_aware_scheduling,
+            enable_recompute_pause=enable_recompute_pause,
             **kwargs,
         )
 
@@ -504,6 +515,203 @@ class TestKVCacheFailuresGen:
         assert ids(out.generation_requests) == [0]
         # gen99 evicted as victim for gen1; gen1 self-evicts after
         assert set(ids(out.paused_requests)) == {1, 99}
+
+    def test_secondary_tier_recompute_pause_retries_immediately(self):
+        """Full teardown is retried without conservatively waiting one pass."""
+        call_count = [0]
+
+        def alloc_fn(req):
+            call_count[0] += 1
+            # gen0 succeeds, then gen1 succeeds only on the immediate retry
+            # after its ordinary victim is upgraded to full recompute teardown.
+            return call_count[0] in (1, 4)
+
+        mgr = make_kv_cache_manager(try_allocate_generation_fn=alloc_fn, can_evict=True)
+        sched = make_scheduler(mgr, max_num_tokens=100)
+        victim = make_gen_request(99)
+        reqs = [make_gen_request(0), make_gen_request(1), victim]
+        out = sched.schedule_request(reqs, set())
+        assert ids(out.generation_requests) == [0, 1]
+        assert ids(out.paused_requests) == []
+        assert ids(out.recompute_paused_requests) == [99]
+        assert call_count[0] == 4
+        mgr.free_resources.assert_called_once_with(victim)
+
+    def test_recompute_pause_gate_stops_destructive_fallback(self):
+        """Disabling recompute pause keeps ordinary suspension as the last fallback."""
+        call_count = [0]
+
+        def alloc_fn(req):
+            call_count[0] += 1
+            return call_count[0] == 1
+
+        mgr = make_kv_cache_manager(try_allocate_generation_fn=alloc_fn, can_evict=True)
+        sched = make_scheduler(
+            mgr,
+            max_num_tokens=100,
+            enable_recompute_pause=False,
+        )
+        victim = make_gen_request(99)
+
+        out = sched.schedule_request(
+            [make_gen_request(0), make_gen_request(1), victim],
+            set(),
+        )
+
+        assert ids(out.generation_requests) == [0]
+        assert set(ids(out.paused_requests)) == {1, 99}
+        assert out.recompute_paused_requests == []
+        assert call_count[0] == 3
+        mgr.free_resources.assert_not_called()
+
+    def test_recompute_pause_skips_multimodal_victim(self):
+        """Released MM inputs cannot be reconstructed by destructive pause."""
+        freed_request_ids = set()
+
+        def alloc_fn(req):
+            return 1 in freed_request_ids
+
+        mgr = make_kv_cache_manager(try_allocate_generation_fn=alloc_fn)
+        mgr.free_resources.side_effect = lambda req: freed_request_ids.add(req.request_id)
+        sched = make_scheduler(mgr, max_num_tokens=100)
+        current = make_gen_request(0)
+        victim = make_gen_request(1)
+        # Post-prefill cleanup has already removed the Python payload and
+        # encoder state but preserves the dict as the durable MM identity.
+        victim.py_multimodal_data = {}
+        mgr.kv_cache_map[victim.py_request_id].is_active = False
+
+        out = sched.schedule_request([current, victim], set())
+
+        assert out.generation_requests == []
+        assert ids(out.paused_requests) == [0]
+        assert out.recompute_paused_requests == []
+        mgr.free_resources.assert_not_called()
+
+    def test_recompute_pause_skips_generation_to_complete_victim(self):
+        """A finalizing request cannot be replayed by destructive pause."""
+        mgr = make_kv_cache_manager(try_allocate_generation_fn=lambda req: False)
+        sched = make_scheduler(mgr, max_num_tokens=100)
+        current = make_gen_request(0)
+        current.is_generation_to_complete_state = False
+        victim = make_gen_request(1)
+        victim.state_value = GEN_TO_COMPLETE
+        victim.is_generation_to_complete_state = True
+        mgr.kv_cache_map[victim.py_request_id].is_active = False
+
+        out = sched.schedule_request([current, victim], set())
+
+        assert out.generation_requests == []
+        assert ids(out.paused_requests) == [0]
+        assert out.recompute_paused_requests == []
+        mgr.free_resources.assert_not_called()
+
+    def test_recompute_frontier_survives_ordinary_frontier_shrink(self):
+        """Recompute still sees a suspended tail after ordinary eviction skips it."""
+        attempts = {}
+        freed_request_ids = set()
+
+        def alloc_fn(req):
+            request_id = req.request_id
+            attempts[request_id] = attempts.get(request_id, 0) + 1
+            if request_id == 0:
+                return attempts[request_id] == 2
+            if request_id == 1:
+                return 3 in freed_request_ids
+            raise AssertionError(f"Evicted request {request_id} was revisited")
+
+        mgr = make_kv_cache_manager(
+            try_allocate_generation_fn=alloc_fn,
+            can_evict=True,
+        )
+        mgr.free_resources.side_effect = lambda req: freed_request_ids.add(req.request_id)
+        sched = make_scheduler(mgr, max_num_tokens=100)
+
+        current = make_gen_request(0)
+        next_request = make_gen_request(1)
+        active_victim = make_gen_request(2)
+        suspended_tail = make_gen_request(3)
+        mgr.kv_cache_map[suspended_tail.py_request_id].is_active = False
+
+        out = sched.schedule_request(
+            [current, next_request, active_victim, suspended_tail],
+            set(),
+        )
+
+        assert ids(out.generation_requests) == [0, 1]
+        assert ids(out.paused_requests) == [2]
+        assert ids(out.recompute_paused_requests) == [3]
+        mgr.suspend_request.assert_called_once_with(active_victim)
+        mgr.free_resources.assert_called_once_with(suspended_tail)
+
+    def test_recompute_frontier_falls_back_to_evicted_victim(self):
+        """Secondary-tier fallback sees an evicted victim outside the frontier."""
+        from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import _RecomputePauseState
+
+        victim = make_gen_request(0)
+        current = make_gen_request(1)
+        mgr = make_kv_cache_manager(
+            try_allocate_generation_fn=lambda req: True,
+            can_evict=True,
+        )
+        mgr.kv_cache_map[victim.py_request_id].is_active = False
+        sched = make_scheduler(mgr, max_num_tokens=100)
+        evicted = [victim]
+        recompute_paused = []
+        recompute_pause_state = _RecomputePauseState(frontier=1)
+
+        req_it_end, success = sched._try_recompute_pause_for_gen(
+            current,
+            [victim, current],
+            req_it=1,
+            req_it_end=1,
+            recompute_pause_state=recompute_pause_state,
+            evicted=evicted,
+            recompute_paused=recompute_paused,
+            inflight_request_ids=set(),
+        )
+
+        assert success
+        assert req_it_end == 1
+        assert evicted == []
+        assert recompute_paused == [victim]
+        assert recompute_pause_state.frontier == 0
+        assert recompute_pause_state.victim_indices == {0}
+        mgr.free_resources.assert_called_once_with(victim)
+        mgr.try_allocate_generation.assert_called_once_with(current)
+
+    def test_recompute_pause_does_not_shrink_scheduling_range(self):
+        """Only the recompute victim is skipped; later work stays eligible."""
+        freed_request_ids = set()
+
+        def alloc_fn(req):
+            if req.request_id != 0:
+                raise AssertionError(f"Recompute victim {req.request_id} was revisited")
+            return 1 in freed_request_ids
+
+        mgr = make_kv_cache_manager(try_allocate_generation_fn=alloc_fn)
+        mgr.free_resources.side_effect = lambda req: freed_request_ids.add(req.request_id)
+        sched = make_scheduler(mgr, max_num_tokens=100)
+
+        current = make_gen_request(0)
+        suspended_victim = make_gen_request(1)
+        trailing_context = make_ctx_request(2, context_remaining_length=10)
+        mgr.kv_cache_map[suspended_victim.py_request_id].is_active = False
+
+        out = sched.schedule_request(
+            [current, suspended_victim, trailing_context],
+            set(),
+        )
+
+        assert ids(out.generation_requests) == [0]
+        assert ids(out.paused_requests) == []
+        assert ids(out.recompute_paused_requests) == [1]
+        assert ids(out.context_requests) == [2]
+        assert [call.args[0].request_id for call in mgr.try_allocate_generation.call_args_list] == [
+            0,
+            0,
+        ]
+        mgr.free_resources.assert_called_once_with(suspended_victim)
 
     def test_multiple_evictions_needed(self):
         """gen fails, 2 victims needed to free enough space."""
@@ -1926,6 +2134,7 @@ class TestSchedulerOutput:
         assert len(out.context_requests) == 1
         assert len(out.generation_requests) == 1
         assert len(out.fitting_disagg_gen_init_requests) == 1
+        assert out.recompute_paused_requests == []
         assert out.num_fitting_requests == 2
 
     def test_num_fitting_requests(self):
@@ -2056,6 +2265,20 @@ class TestMixedOrdering:
         # → req0 self-evicts. All 3 are paused.
         assert len(out.generation_requests) == 0
         assert set(ids(out.paused_requests)) == {0, 1, 2}
+
+    def test_secondary_tier_recompute_pause_multiple_victims(self):
+        """Evicted victims are recompute-paused before self-evict when eviction is supported."""
+
+        def selective_gen_alloc(req):
+            return req.request_id != 0
+
+        mgr = make_kv_cache_manager(try_allocate_generation_fn=selective_gen_alloc, can_evict=True)
+        sched = make_scheduler(mgr, max_num_tokens=1000)
+        reqs = [make_gen_request(0), make_gen_request(1), make_gen_request(2)]
+        out = sched.schedule_request(reqs, set())
+        assert len(out.generation_requests) == 0
+        assert ids(out.paused_requests) == [0]
+        assert set(ids(out.recompute_paused_requests)) == {1, 2}
 
 
 # ===========================================================================
@@ -2582,3 +2805,167 @@ class TestMultimodalAwareChunkingV2:
         out = sched.schedule_request([req], set())
         assert ids(out.context_requests) == []
         assert resize_calls == []  # SKIP path: no commit to KV cache
+
+
+class TestEqualCostChunking:
+    """Chunks capped by (kv_cost_offset + kv_start) * n.
+
+    The budget is B = (kv_cost_offset + kv_depth_threshold) * max_num_tokens.
+    """
+
+    ENV = {"TLLM_V2_CTX_COST_KV_OFFSET": "140000", "TLLM_V2_CTX_COST_KV_DEPTH_THRESHOLD": "64000"}
+
+    def _make(self, env=None, max_num_tokens=8192):
+        mgr = make_kv_cache_manager(tokens_per_block=64)
+        with patch.dict("os.environ", env or {}):
+            return make_scheduler(mgr, max_num_tokens=max_num_tokens, ctx_chunk_config=(None, 64))
+
+    def _deep_req(self, request_id, kv_start):
+        req = make_ctx_request(
+            request_id,
+            context_remaining_length=2_000_000,
+            is_first_context_chunk=False,
+            is_last_context_chunk=False,
+        )
+        req.context_current_position = kv_start
+        return req
+
+    def test_disabled_without_env(self):
+        req = self._deep_req(0, kv_start=500_000)
+        self._make().schedule_request([req], set())
+        assert req.context_chunk_size == 8192
+
+    def test_shallow_request_unaffected(self):
+        req = self._deep_req(0, kv_start=32_000)
+        self._make(self.ENV).schedule_request([req], set())
+        assert req.context_chunk_size == 8192  # token cap binds below kv_depth_threshold
+
+    def test_deep_request_shrinks_per_formula(self):
+        req = self._deep_req(0, kv_start=500_000)
+        self._make(self.ENV).schedule_request([req], set())
+        # B = 204000 * 8192; affordable = B // 640_000 = 2611 -> 64-aligned 2560
+        assert req.context_chunk_size == 2560
+
+    def test_leftover_cost_backfills_next_request(self):
+        deep, shallow = self._deep_req(0, 500_000), self._deep_req(1, 0)
+        out = self._make(self.ENV).schedule_request([deep, shallow], set())
+        assert ids(out.context_requests) == [0, 1]
+        assert deep.context_chunk_size == 2560
+        # leftover 32_768_000 // 140_000 = 234 -> 64-aligned 192
+        assert shallow.context_chunk_size == 192
+
+    def test_head_of_line_floor(self):
+        env = {"TLLM_V2_CTX_COST_KV_OFFSET": "100", "TLLM_V2_CTX_COST_KV_DEPTH_THRESHOLD": "100"}
+        req = self._deep_req(0, kv_start=10_000)
+        self._make(env, max_num_tokens=1024).schedule_request([req], set())
+        # affordable = 204_800 // 10_100 = 20 < floor -> floored to max_num_tokens // 4
+        assert req.context_chunk_size == 256
+
+    def test_per_chunk_depth_term_scales_with_prefix(self):
+        """TLLM_V2_CTX_COST_PER_CHUNK_DEPTH_TOKENS: every chunk also costs R * kv_depth and the
+        budget grows by R * kv_depth_threshold, so a request at the threshold still gets
+        a full chunk, a deep request pays a bigger fixed share than a shallow one, and a
+        zero-depth backfill pays nothing extra."""
+        env = dict(self.ENV, TLLM_V2_CTX_COST_PER_CHUNK_DEPTH_TOKENS="500")
+        at_threshold = self._deep_req(0, kv_start=64_000)
+        self._make(env).schedule_request([at_threshold], set())
+        assert at_threshold.context_chunk_size == 8192
+
+        deep, shallow = self._deep_req(0, 500_000), self._deep_req(1, 0)
+        out = self._make(env).schedule_request([deep, shallow], set())
+        assert ids(out.context_requests) == [0, 1]
+        # B = 204000 * 8192 + 500 * 64000 = 1_703_168_000
+        # deep: (B - 500 * 500_000) // 640_000 = 2270 -> 64-aligned 2240
+        assert deep.context_chunk_size == 2240
+        # leftover 1_703_168_000 - (640_000 * 2240 + 250_000_000) = 19_568_000; depth term
+        # at kv 0 is 0 -> 19_568_000 // 140_000 = 139 -> 128
+        assert shallow.context_chunk_size == 128
+
+        # A depth term the leftover cannot pay skips the backfill instead of over-committing.
+        env = dict(self.ENV, TLLM_V2_CTX_COST_PER_CHUNK_DEPTH_TOKENS="1000")
+        deep, shallow = self._deep_req(0, 500_000), self._deep_req(1, 0)
+        out = self._make(env).schedule_request([deep, shallow], set())
+        # B = 204000 * 8192 + 1000 * 64000 = 1_735_168_000; deep: (B - 500_000_000) // 640_000 = 1929,
+        # below the head-of-line floor max_num_tokens // 4 = 2048 -> the first request gets 2048
+        assert deep.context_chunk_size == 2048
+        # leftover 1_735_168_000 - (640_000 * 2048 + 500_000_000) < 0 -> the backfill is skipped
+        assert ids(out.context_requests) == [0]
+
+
+class TestLongContextDemotion:
+    """TLLM_V2_CTX_DEMOTE_UNCACHED_TOKENS: a request whose router estimate of
+    uncached prefill exceeds the threshold goes to the tail of the iteration's
+    context order, from its first chunk on."""
+
+    ENV = {"TLLM_V2_CTX_DEMOTE_UNCACHED_TOKENS": "1024"}
+
+    def _make(self, env=None, max_num_tokens=1024):
+        with patch.dict("os.environ", env or {"TLLM_V2_CTX_DEMOTE_UNCACHED_TOKENS": "0"}):
+            return make_scheduler(
+                make_kv_cache_manager(tokens_per_block=64),
+                max_num_tokens=max_num_tokens,
+                ctx_chunk_config=(None, 64),
+            )
+
+    def _req(self, request_id, remaining, estimate=None, kv_start=0):
+        """`estimate`: the router's py_uncached_prefill_tokens (None = not
+        published). kv_start > 0: prepare_context already ran, so `remaining`
+        is the exact post-reuse remainder."""
+        req = make_ctx_request(request_id, context_remaining_length=remaining)
+        req.context_current_position = kv_start
+        req.py_uncached_prefill_tokens = estimate
+        return req
+
+    def test_disabled_without_env(self):
+        long_req, short = self._req(0, 10_000, estimate=10_000), self._req(1, 256, estimate=256)
+        out = self._make().schedule_request([long_req, short], set())
+        assert ids(out.context_requests) == [0]
+        assert long_req.context_chunk_size == 1024
+
+    def test_estimated_long_request_waits_behind_short_ones_from_its_first_chunk(self):
+        long_req, short = self._req(0, 10_000, estimate=10_000), self._req(1, 256, estimate=256)
+        out = self._make(self.ENV).schedule_request([long_req, short], set())
+        assert ids(out.context_requests) == [1, 0]
+        assert short.context_chunk_size == 256
+        assert long_req.context_chunk_size == 768  # leftover, not a full first chunk
+        # Only long requests left: the head of the long queue takes everything.
+        first, second = self._req(0, 10_000, estimate=10_000), self._req(1, 10_000, estimate=10_000)
+        out = self._make(self.ENV).schedule_request([first, second], set())
+        assert ids(out.context_requests) == [0]
+        assert first.context_chunk_size == 1024
+
+    def test_request_without_estimate_is_never_demoted(self):
+        """No router estimate: plain FCFS, whether fresh or already mid-prefill."""
+        fresh_long, short = self._req(0, 10_000), self._req(1, 256, estimate=256)
+        out = self._make(self.ENV).schedule_request([fresh_long, short], set())
+        assert ids(out.context_requests) == [0]
+        mid_long = self._req(0, 10_000, kv_start=64)
+        out = self._make(self.ENV).schedule_request([mid_long, short], set())
+        assert ids(out.context_requests) == [0]
+
+    def test_exact_remainder_releases_the_tail(self):
+        """Mid-prefill the exact remainder is known: a demoted request with no
+        more than the threshold left is not demoted any further."""
+        tail = self._req(0, 512, estimate=10_000, kv_start=9_600)
+        short = self._req(1, 256, estimate=256)
+        out = self._make(self.ENV).schedule_request([tail, short], set())
+        assert ids(out.context_requests) == [0, 1]
+        still_long = self._req(0, 5_000, estimate=10_000, kv_start=5_000)
+        out = self._make(self.ENV).schedule_request([still_long, short], set())
+        assert ids(out.context_requests) == [1, 0]
+
+    def test_aging_bound_lets_a_demoted_request_through(self):
+        sched = self._make(dict(self.ENV, TLLM_V2_CTX_DEMOTE_MAX_ITERS="2"))
+        long_req = self._req(0, 10_000, estimate=10_000)
+        # At the threshold (`> T` is false): never demoted, leaves 64 tokens.
+        hog = self._req(1, 960, estimate=960)
+        for _ in range(2):
+            out = sched.schedule_request([long_req, hog], set())
+            assert ids(out.context_requests) == [1, 0]
+            assert long_req.context_chunk_size == 64  # crumbs do not reset the count
+        out = sched.schedule_request([long_req, hog], set())
+        assert ids(out.context_requests) == [0]  # let through in arrival order
+        assert long_req.context_chunk_size == 1024
+        assert sched._ctx_demote_skips == {}  # served: count restarts
+        sched.schedule_request([hog], set())
+        assert sched._ctx_demote_skips == {}  # finished requests leave no entry

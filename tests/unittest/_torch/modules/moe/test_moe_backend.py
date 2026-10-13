@@ -14,9 +14,11 @@
 # limitations under the License.
 """MoE backend unit tests."""
 
-import importlib
 import itertools
 import logging
+import os
+import sys
+from collections.abc import Callable
 from types import SimpleNamespace
 from typing import List, Optional, Tuple
 from unittest.mock import MagicMock
@@ -39,16 +41,23 @@ from _torch.modules.moe.moe_test_utils import (
 from _torch.modules.moe.quantize_utils import get_test_quant_params
 from transformers.configuration_utils import PretrainedConfig
 
-from tensorrt_llm._torch.autotuner import AutoTuner, autotune
+from tensorrt_llm._torch.autotuner import AutoTuner, OptimizationProfile, autotune
 from tensorrt_llm._torch.custom_ops.trtllm_gen_custom_ops import _select_explicit_fallback_tactic
+from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_INTERNAL_AVAILABLE
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.modules.fused_moe import (
     DeepSeekV3MoeRoutingMethod,
     RenormalizeMoeRoutingMethod,
 )
 from tensorrt_llm._torch.modules.fused_moe.create_moe import create_moe_backend
+from tensorrt_llm._torch.modules.fused_moe.fused_moe_cute_dsl import CuteDslFusedMoE
+from tensorrt_llm._torch.modules.fused_moe.fused_moe_cute_dsl_fc12 import (
+    CuteDslFc12FusedMoE,
+    CuteDslFc12FusedMoENvfp4Runner,
+)
 from tensorrt_llm._torch.modules.fused_moe.fused_moe_cutlass import CutlassFusedMoE
 from tensorrt_llm._torch.modules.fused_moe.fused_moe_marlin import MarlinFusedMoE
+from tensorrt_llm._torch.modules.fused_moe.fused_moe_trtllm_gen import TRTLLMGenFusedMoE
 from tensorrt_llm._torch.modules.fused_moe.impl_contract import (
     MoECommPlan,
     MoEDeployment,
@@ -68,6 +77,7 @@ from tensorrt_llm._torch.modules.fused_moe.interface import (
 )
 from tensorrt_llm._torch.modules.fused_moe.mega_moe import MegaMoECuteDsl, MegaMoEDeepGemm
 from tensorrt_llm._torch.modules.fused_moe.moe_resolution import impl_class_for, resolve_moe_impl
+from tensorrt_llm._torch.modules.fused_moe.moe_scheduler import FusedCommMoEScheduler
 from tensorrt_llm._torch.modules.fused_moe.quantization import (
     FusedMoEMethodBase,
     NVFP4FusedMoEMethod,
@@ -76,7 +86,14 @@ from tensorrt_llm._torch.modules.fused_moe.quantization import (
     W4A8MXFP4MXFP8MegaMoEDeepGemmMethod,
     W4A16NVFP4CutlassFusedMoEMethod,
 )
-from tensorrt_llm._torch.utils import ActivationType, is_gated_activation
+from tensorrt_llm._torch.ugpu.policy import UgpuPolicy
+from tensorrt_llm._torch.ugpu_utils import is_ugpu_enabled
+from tensorrt_llm._torch.utils import (
+    ActivationType,
+    ActType_TrtllmGen,
+    MxFp8QuantizedTensor,
+    is_gated_activation,
+)
 from tensorrt_llm._utils import get_sm_version, mpi_rank
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
@@ -87,6 +104,50 @@ _MEGAMOE_BACKEND_TYPES = {
     MoeBackendType.MEGAMOE_DEEPGEMM,
     MoeBackendType.MEGAMOE_CUTEDSL,
 }
+
+
+def test_fused_comm_scheduler_accepts_singleton_non_dp_token_metadata():
+    mapping = SimpleNamespace(moe_ep_rank=3, moe_ep_size=4)
+    scheduler = FusedCommMoEScheduler(SimpleNamespace(mapping=mapping))
+    x = torch.randn(6, 8)
+    router_logits = torch.randn(6, 4)
+
+    x_real, router_logits_real, _, all_rank_num_tokens, ep_rank, had_meta = (
+        scheduler._strip_adp_padding(x, router_logits, None, [6])
+    )
+
+    assert x_real.shape == x.shape
+    assert router_logits_real.shape == router_logits.shape
+    assert all_rank_num_tokens == [6]
+    assert ep_rank == 0
+    assert not had_meta
+
+
+def test_fused_comm_scheduler_indexes_full_ep_token_metadata():
+    mapping = SimpleNamespace(moe_ep_rank=3, moe_ep_size=4)
+    scheduler = FusedCommMoEScheduler(SimpleNamespace(mapping=mapping))
+    x = torch.randn(6, 8)
+    router_logits = torch.randn(6, 4)
+
+    x_real, router_logits_real, _, all_rank_num_tokens, ep_rank, had_meta = (
+        scheduler._strip_adp_padding(x, router_logits, None, [6, 5, 4, 3])
+    )
+
+    assert x_real.shape[0] == 3
+    assert router_logits_real.shape[0] == 3
+    assert all_rank_num_tokens == [6, 5, 4, 3]
+    assert ep_rank == 3
+    assert had_meta
+
+
+def test_fused_comm_scheduler_rejects_partial_ep_token_metadata():
+    mapping = SimpleNamespace(moe_ep_rank=1, moe_ep_size=4)
+    scheduler = FusedCommMoEScheduler(SimpleNamespace(mapping=mapping))
+    x = torch.randn(6, 8)
+    router_logits = torch.randn(6, 4)
+
+    with pytest.raises(ValueError, match="got 2 counts for EP size 4"):
+        scheduler._strip_adp_padding(x, router_logits, None, [6, 5])
 
 
 def test_import_deep_gemm_rejects_pre_situ_mega_moe_api(monkeypatch):
@@ -127,6 +188,12 @@ def test_fp8_block_scale_moe_fallback_tactic_is_explicit_and_deterministic():
 
     with pytest.raises(RuntimeError, match="no valid fallback tactic"):
         _select_explicit_fallback_tactic([])
+
+
+def test_trtllm_gen_honors_separated_routing_requirement():
+    backend = SimpleNamespace(routing_method=SimpleNamespace(requires_separated_routing=True))
+
+    assert TRTLLMGenFusedMoE._requires_separated_routing(backend)
 
 
 def _ensure_single_proc_dist_for_megamoe(backend_type: MoeBackendType, rank: int) -> None:
@@ -179,6 +246,25 @@ def should_skip_gptoss(
     return None
 
 
+def test_kimi_fused_route_quant_skips_prequantized_input(monkeypatch) -> None:
+    """An upstream fused down projection owns quantization on this path."""
+    monkeypatch.delenv("TLLM_K3_DISABLE_FUSED_ROUTE_QUANT", raising=False)
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.modules.fused_moe.fused_moe_trtllm_gen.get_sm_version",
+        MagicMock(side_effect=AssertionError("SM probe must be short-circuited")),
+    )
+    backend = TRTLLMGenFusedMoE.__new__(TRTLLMGenFusedMoE)
+    hidden_states = MxFp8QuantizedTensor(
+        fp8_tensor=torch.empty(1, 3584, dtype=torch.float8_e4m3fn),
+        scaling_factor=torch.empty(1, 112, dtype=torch.uint8),
+    )
+
+    assert (
+        backend.try_fused_kimi_route_quant(hidden_states, torch.empty(1, 896, dtype=torch.float32))
+        is None
+    )
+
+
 def create_test_backend(
     backend_type: MoeBackendType,
     routing_method: RenormalizeMoeRoutingMethod,
@@ -195,9 +281,13 @@ def create_test_backend(
     weight_loading_mode: MoEWeightLoadingMode = MoEWeightLoadingMode.VANILLA,
     activation_type: ActivationType = ActivationType.Swiglu,
     n_shared_experts: int = 0,
+    ugpu_policy: Optional[UgpuPolicy] = None,
+    use_lamport_sync: bool = False,
 ) -> MoE:
     """Create a MoE backend for testing."""
     backend_cls = get_backend_class(backend_type)
+    if ugpu_policy is None:
+        ugpu_policy = UgpuPolicy(enabled=False)
 
     pretrained_config = PretrainedConfig()
     pretrained_config.num_experts = num_experts
@@ -221,6 +311,8 @@ def create_test_backend(
         quant_config=quant_config,
         mapping=mapping,
         moe_backend=moe_backend_value,
+        ugpu_policy=ugpu_policy,
+        use_lamport_sync=use_lamport_sync,
     )
     if n_shared_experts > 0:
         # The shared-expert-fusion gate runs after the eager create_weights()
@@ -457,6 +549,76 @@ def test_megamoe_cutedsl_post_load_weights_uses_staged_hooks():
     assert moe._weights_transformed is True
 
 
+def test_megamoe_cutedsl_mpi_bootstrap_binds_local_cuda_device(monkeypatch):
+    import tensorrt_llm._utils as utils
+
+    moe = MegaMoECuteDsl.__new__(MegaMoECuteDsl)
+    moe.ep_size = 8
+    mpi_comm = MagicMock()
+    mpi_comm.bcast.return_value = ("127.0.0.1", "29500")
+    local_mpi_comm = MagicMock()
+    local_mpi_comm.Get_rank.return_value = 5
+    init_process_group = MagicMock()
+    set_device = MagicMock()
+
+    monkeypatch.setattr(dist, "is_available", lambda: True)
+    monkeypatch.setattr(dist, "is_initialized", lambda: False)
+    monkeypatch.setattr(dist, "init_process_group", init_process_group)
+    monkeypatch.setattr(utils, "mpi_world_size", lambda: 8)
+    monkeypatch.setattr(utils, "mpi_rank", lambda: 3)
+    monkeypatch.setattr(utils, "mpi_comm", lambda: mpi_comm)
+    monkeypatch.setattr(utils, "local_mpi_comm", lambda: local_mpi_comm)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 4)
+    monkeypatch.setattr(torch.cuda, "set_device", set_device)
+
+    monkeypatch.setenv("MASTER_ADDR", "127.0.0.1")
+    monkeypatch.setenv("MASTER_PORT", "29500")
+    moe._maybe_init_torch_dist_under_mpi()
+
+    set_device.assert_called_once_with(1)
+    init_process_group.assert_called_once_with(
+        backend="cuda:nccl,cpu:gloo",
+        rank=3,
+        world_size=8,
+        device_id=torch.device("cuda", 1),
+    )
+
+
+def test_megamoe_deepgemm_mpi_bootstrap_replaces_outer_launcher_world(monkeypatch):
+    mpi_comm = MagicMock()
+    mpi_comm.Get_rank.return_value = 2
+    mpi_comm.Get_size.return_value = 4
+    mpi_comm.bcast.return_value = ("model-host", 29501)
+    local_mpi_comm = MagicMock()
+    local_mpi_comm.Get_rank.return_value = 2
+    mpi_comm.Split_type.return_value = local_mpi_comm
+    mpi = SimpleNamespace(COMM_WORLD=mpi_comm, COMM_TYPE_SHARED=1)
+    init_process_group = MagicMock()
+
+    monkeypatch.setitem(sys.modules, "mpi4py", SimpleNamespace(MPI=mpi))
+    monkeypatch.setattr(dist, "init_process_group", init_process_group)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setenv("MASTER_ADDR", "outer-host")
+    monkeypatch.setenv("MASTER_PORT", "29400")
+    monkeypatch.setenv("RANK", "1")
+    monkeypatch.setenv("WORLD_SIZE", "2")
+
+    MegaMoEDeepGemm._maybe_init_dist_from_mpi()
+
+    mpi_comm.bcast.assert_called_once_with(None, root=0)
+    assert os.environ["MASTER_ADDR"] == "model-host"
+    assert os.environ["MASTER_PORT"] == "29501"
+    assert os.environ["RANK"] == "2"
+    assert os.environ["WORLD_SIZE"] == "4"
+    init_process_group.assert_called_once_with(
+        backend="nccl",
+        rank=2,
+        world_size=4,
+        device_id=None,
+    )
+
+
 def test_megamoe_load_weights_invalidates_cached_deepgemm_views():
     method = W4A8MXFP4MXFP8MegaMoEDeepGemmMethod()
     hidden_size = 128
@@ -575,69 +737,254 @@ def test_megamoe_deepgemm_cache_derived_state_allocates_symm_buffer():
     quant_method.cache_derived_state.assert_called_once_with(moe)
 
 
-def test_megamoe_deepgemm_infers_kimi_situ_from_pretrained_config():
-    model_config = ModelConfig(
-        pretrained_config=SimpleNamespace(
-            text_config=SimpleNamespace(
-                activation_situ_beta=4.0,
-                activation_situ_linear_beta=25.0,
-            )
-        )
+def _megamoe_model_config(**kwargs) -> ModelConfig:
+    return ModelConfig(
+        mapping=Mapping(world_size=1, rank=0, tp_size=1, moe_tp_size=1, moe_ep_size=1),
+        moe_backend=MoeBackendType.MEGAMOE_CUTEDSL.value,
+        skip_create_weights_in_init=True,
+        **kwargs,
     )
 
-    activation, situ_beta, situ_linear_beta = MegaMoEDeepGemm._resolve_activation_config(
-        model_config,
-        activation=None,
-        situ_beta=None,
-        situ_linear_beta=None,
-    )
 
-    assert activation == "situ"
-    assert situ_beta == 4.0
-    assert situ_linear_beta == 25.0
-
-
-def test_megamoe_deepgemm_defaults_to_swiglu_without_situ_config():
-    model_config = ModelConfig(pretrained_config=SimpleNamespace())
-
-    activation, situ_beta, situ_linear_beta = MegaMoEDeepGemm._resolve_activation_config(
-        model_config,
-        activation=None,
-        situ_beta=None,
-        situ_linear_beta=None,
-    )
-
-    assert activation == "swiglu"
-    assert situ_beta is None
-    assert situ_linear_beta is None
-
-
-def test_create_moe_forwards_megamoe_activation_options(monkeypatch):
-    create_moe_module = importlib.import_module("tensorrt_llm._torch.modules.fused_moe.create_moe")
-    configurable_moe = MagicMock(return_value=object())
-    monkeypatch.setattr(create_moe_module, "ConfigurableMoE", configurable_moe)
-    monkeypatch.setattr(
-        create_moe_module,
-        "resolve_moe_cls",
-        MagicMock(return_value=MegaMoEDeepGemm),
-    )
-
-    result = create_moe_module.create_moe(
-        routing_method=MagicMock(),
+def _make_megamoe_cutedsl(model_config: ModelConfig, **kwargs) -> MegaMoECuteDsl:
+    return MegaMoECuteDsl(
+        routing_method=RenormalizeMoeRoutingMethod(top_k=2),
         num_experts=8,
         hidden_size=512,
         intermediate_size=512,
         dtype=torch.bfloat16,
-        model_config=ModelConfig(),
+        model_config=model_config,
+        init_load_balancer=False,
+        **kwargs,
+    )
+
+
+def _create_megamoe_backend(**kwargs):
+    """Drive the real factory so the SiTU fan-out and its guards are exercised."""
+    return create_moe_backend(
+        moe_cls=MegaMoEDeepGemm,
+        routing_method=RenormalizeMoeRoutingMethod(top_k=2),
+        num_experts=8,
+        hidden_size=512,
+        intermediate_size=512,
+        dtype=torch.bfloat16,
+        reduce_results=True,
+        model_config=_megamoe_model_config(),
+        init_load_balancer=False,
+        **kwargs,
+    )
+
+
+def test_megamoe_uses_explicit_situ_args():
+    moe = _make_megamoe_cutedsl(
+        _megamoe_model_config(),
         activation="situ",
         situ_beta=4.0,
         situ_linear_beta=25.0,
     )
 
-    assert result is configurable_moe.return_value
-    assert configurable_moe.call_args.kwargs["activation"] == "situ"
-    assert configurable_moe.call_args.kwargs["situ_beta"] == 4.0
-    assert configurable_moe.call_args.kwargs["situ_linear_beta"] == 25.0
+    assert moe.activation == "situ"
+    assert moe.situ_beta == 4.0
+    assert moe.situ_linear_beta == 25.0
+
+
+def test_megamoe_defaults_to_swiglu_without_explicit_activation():
+    moe = _make_megamoe_cutedsl(_megamoe_model_config())
+
+    assert moe.activation == "swiglu"
+    assert moe.situ_beta is None
+    assert moe.situ_linear_beta is None
+
+
+def test_megamoe_does_not_infer_situ_from_pretrained_config():
+    # The checkpoint config carries the HF SiTU fields, but no backend may read
+    # them: SiTU only arrives through explicit constructor arguments.
+    pretrained_config = PretrainedConfig(
+        hidden_act="situ",
+        activation_situ_beta=4.0,
+        activation_situ_linear_beta=25.0,
+    )
+    moe = _make_megamoe_cutedsl(_megamoe_model_config(pretrained_config=pretrained_config))
+
+    assert moe.activation == "swiglu"
+    assert moe.situ_beta is None
+    assert moe.situ_linear_beta is None
+
+
+def test_situ_requires_both_betas():
+    with pytest.raises(ValueError, match="requires explicit situ_beta"):
+        _create_megamoe_backend(activation="situ", situ_beta=4.0, situ_linear_beta=None)
+
+
+def test_situ_betas_must_be_positive():
+    with pytest.raises(ValueError, match="must be positive"):
+        _create_megamoe_backend(activation="situ", situ_beta=4.0, situ_linear_beta=-1.0)
+
+
+def test_situ_betas_without_situ_activation_are_rejected():
+    with pytest.raises(ValueError, match="require activation='situ'"):
+        _create_megamoe_backend(situ_beta=4.0, situ_linear_beta=25.0)
+
+
+def test_situ_fanout_builds_cutlass_per_expert_tensors():
+    """CUTLASS reads per-expert alpha/beta tensors; the fan-out must build them
+    with the gate-side constant in alpha and the linear-side one in beta, and
+    with one entry per expert on this rank. A swap stays fluent at runtime, so
+    assert the values rather than relying on generated text."""
+    num_experts = 8
+    model_config = ModelConfig(
+        mapping=Mapping(world_size=1, rank=0, tp_size=1, moe_tp_size=1, moe_ep_size=1),
+        moe_backend=MoeBackendType.CUTLASS.value,
+        skip_create_weights_in_init=True,
+    )
+    moe = create_moe_backend(
+        moe_cls=CutlassFusedMoE,
+        routing_method=RenormalizeMoeRoutingMethod(top_k=2),
+        num_experts=num_experts,
+        hidden_size=512,
+        intermediate_size=512,
+        dtype=torch.bfloat16,
+        reduce_results=True,
+        model_config=model_config,
+        init_load_balancer=False,
+        activation="situ",
+        situ_beta=4.0,
+        situ_linear_beta=25.0,
+    )
+
+    assert moe.activation_type == ActivationType.SiTu
+    assert moe.swiglu_alpha.shape == (num_experts,)
+    assert moe.swiglu_beta.shape == (num_experts,)
+    assert torch.all(moe.swiglu_alpha == 4.0)
+    assert torch.all(moe.swiglu_beta == 25.0)
+
+
+def test_situ_fanout_gives_trtllm_gen_its_own_enum_and_scalars():
+    """TRTLLM-Gen takes a backend-local enum plus scalars; cubin alpha is the
+    gate-side constant and cubin beta the linear-side one.
+
+    Quantized because the backend only has fused SiTu cubins for NVFP4 and
+    W4A8_MXFP4_MXFP8 and rejects SiTu otherwise.
+    """
+    model_config = _megamoe_model_config()
+    model_config.quant_config = QuantConfig(quant_algo=QuantAlgo.NVFP4)
+    moe = create_moe_backend(
+        moe_cls=TRTLLMGenFusedMoE,
+        routing_method=RenormalizeMoeRoutingMethod(top_k=2),
+        num_experts=8,
+        hidden_size=512,
+        intermediate_size=512,
+        dtype=torch.bfloat16,
+        reduce_results=True,
+        model_config=model_config,
+        init_load_balancer=False,
+        activation="situ",
+        situ_beta=4.0,
+        situ_linear_beta=25.0,
+    )
+
+    assert moe.trtllm_gen_activation_type == ActType_TrtllmGen.SiTu
+    assert moe.trtllm_gen_activation_alpha == 4.0
+    assert moe.trtllm_gen_activation_beta == 25.0
+
+
+@pytest.mark.parametrize("moe_cls", [CuteDslFusedMoE, CuteDslFc12FusedMoE])
+def test_situ_fanout_gives_cutedsl_the_activation_type_enum(moe_cls):
+    """CuteDSL takes ActivationType.SiTu plus scalars, not the string.
+
+    CuteDslFc12FusedMoE is covered here rather than trusted by inheritance: it
+    is a subclass, but the fan-out dispatches on an explicit ``moe_cls in
+    (...)`` tuple, so a subclass that nobody added to that tuple falls through
+    to the ``else`` and raises instead of being served.
+    """
+    moe = create_moe_backend(
+        moe_cls=moe_cls,
+        routing_method=RenormalizeMoeRoutingMethod(top_k=2),
+        num_experts=8,
+        hidden_size=512,
+        intermediate_size=512,
+        dtype=torch.bfloat16,
+        reduce_results=True,
+        model_config=_megamoe_model_config(),
+        init_load_balancer=False,
+        activation="situ",
+        situ_beta=4.0,
+        situ_linear_beta=25.0,
+    )
+
+    assert moe.activation_type == ActivationType.SiTu
+    assert moe.situ_beta == 4.0
+    assert moe.situ_linear_beta == 25.0
+
+
+def test_situ_fanout_rejects_swiglu_clamp_on_cutedsl_fc12():
+    """SiTU and a SwiGLU clamp are mutually exclusive on CuteDSL, including FC12."""
+    with pytest.raises(ValueError, match="does not support a SwiGLU clamp"):
+        create_moe_backend(
+            moe_cls=CuteDslFc12FusedMoE,
+            routing_method=RenormalizeMoeRoutingMethod(top_k=2),
+            num_experts=8,
+            hidden_size=512,
+            intermediate_size=512,
+            dtype=torch.bfloat16,
+            reduce_results=True,
+            model_config=_megamoe_model_config(),
+            init_load_balancer=False,
+            activation="situ",
+            situ_beta=4.0,
+            situ_linear_beta=25.0,
+            swiglu_limit_scalar=7.0,
+        )
+
+
+def test_cutedsl_fc12_relu2_degrades_to_cutlass():
+    """Relu2 is not gated; fused FC12 would otherwise compile as SwiGLU."""
+    cfg = ModelConfig(
+        moe_backend="CUTEDSL_FC12",
+        quant_config=QuantConfig(quant_algo=QuantAlgo.NVFP4),
+    )
+    report = resolve_moe_impl(cfg, activation_type=ActivationType.Relu2)
+    assert impl_class_for(report) is CutlassFusedMoE
+    assert report.degraded
+    assert report.degraded_from.reason is MoERejectReason.ACTIVATION_UNSUPPORTED
+
+
+def test_cutedsl_fc12_outer_runner_unique_id_includes_situ():
+    """Outer AutoTuner key must not share a tile-size tactic across activations."""
+
+    def _forward(*args, **kwargs):
+        raise AssertionError("not launched")
+
+    common = dict(
+        forward_impl=_forward,
+        num_experts=8,
+        top_k=2,
+        num_local_experts=8,
+        local_expert_offset=0,
+    )
+    swiglu = CuteDslFc12FusedMoENvfp4Runner(
+        **common,
+        workload_identity=(int(ActivationType.Swiglu), None, None),
+    )
+    situ = CuteDslFc12FusedMoENvfp4Runner(
+        **common,
+        workload_identity=(int(ActivationType.SiTu), 4.0, 25.0),
+    )
+    assert swiglu.unique_id() != situ.unique_id()
+
+    # The side effect this change actually shipped, asserted next to the change
+    # that caused it. Giving FC12 a non-None workload_identity used to open the
+    # uGPU inner-tactic priming branch, which calls forward_impl with
+    # overlap_moe_output_memset -- a kwarg the fused single-op impl has no
+    # parameter for. _forward raises if reached, so this is red on the pre-fix
+    # code, and it needs no GPU because the failure is at kwarg binding.
+    # getattr: on the pre-fix code this attribute is absent, and asserting it
+    # directly would fail here with AttributeError -- red, but for the wrong
+    # reason, and without ever reaching the priming call that reproduces the
+    # actual TypeError.
+    assert getattr(situ, "prime_inner_tactics", False) is False
+    inputs = [torch.empty(0) for _ in range(5)]
+    assert situ(inputs, tactic=-1, do_preparation=True) is inputs[4]
 
 
 def test_megamoe_init_rejects_uneven_num_slots_with_value_error():
@@ -721,10 +1068,24 @@ def test_megamoe_cutedsl_tuning_mode_forces_top_maxt_bucket(
 def test_megamoe_cutedsl_tactic_autotune_defaults_off(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # Standard serving must not pay for the 36-tactic sweep by default.
+    # Standard serving must not pay for the curated tactic sweep by default.
     monkeypatch.delenv("MEGAMOE_TACTIC_AUTOTUNE", raising=False)
     moe = _make_megamoe_cutedsl_for_ctor_test()
     assert moe.tactic_autotune is False
+
+
+_MEGAMOE_LOCAL_TMA_STAGE2_TACTIC = (
+    [256, 256, 256],
+    [2, 1, 1],
+    None,
+    ("grouped", 512),
+    "grid_stride",
+    "reuse_dispatch_warps",
+    True,
+    2,
+    4,
+    (1, 1),
+)
 
 
 def test_enumerate_megamoe_candidate_tactics_curated_space() -> None:
@@ -732,16 +1093,210 @@ def test_enumerate_megamoe_candidate_tactics_curated_space() -> None:
 
     decode = megamoe_op.enumerate_megamoe_candidate_tactics(1024)
     prefill = megamoe_op.enumerate_megamoe_candidate_tactics(16384)
-    assert len(decode) == len(prefill) == 36
+    assert len(decode) == 36
+    assert len(prefill) == 40
+    assert all(len(tactic) == 10 for tactic in decode + prefill)
     assert {t[-1] for t in decode} == {(1, 1)}
     assert {t[-1] for t in prefill} == {(2, 4)}
-    # The deterministic fallback stays inside the curated axes.
+
     for num_tokens in (64, 4096, 16384):
         megamoe_op.validate_megamoe_tactic(megamoe_op.default_megamoe_tactic(num_tokens))
-    invalid_tactic = list(megamoe_op.default_megamoe_tactic(64))
-    invalid_tactic[2] = 511
-    with pytest.raises(ValueError, match=r"group_hint must be an int >= 512"):
-        megamoe_op.validate_megamoe_tactic(tuple(invalid_tactic))
+
+
+@pytest.mark.parametrize(
+    ("sm", "eligible"),
+    [(100, True), (103, True), (107, True), (101, False), (109, False)],
+)
+def test_megamoe_cutedsl_sm_support(
+    monkeypatch: pytest.MonkeyPatch, sm: int, eligible: bool
+) -> None:
+    from tensorrt_llm._torch.custom_ops import cute_dsl_megamoe_custom_op
+    from tensorrt_llm._torch.modules.fused_moe.mega_moe import mega_moe_cute_dsl
+
+    monkeypatch.setattr(mega_moe_cute_dsl, "get_sm_version", lambda: sm)
+    monkeypatch.setattr(
+        mega_moe_cute_dsl,
+        "is_megamoe_cute_dsl_runtime_available",
+        lambda: (True, None),
+    )
+    monkeypatch.setattr(cute_dsl_megamoe_custom_op, "IS_MEGAMOE_OP_AVAILABLE", True)
+
+    verdict, reason = MegaMoECuteDsl.can_implement(
+        QuantAlgo.NVFP4,
+        dtype_activation=torch.bfloat16,
+        hidden_size=256,
+        intermediate_size=256,
+    )
+
+    assert verdict is eligible
+    if not eligible:
+        assert "requires SM100, SM103, or SM107" in reason
+
+
+@pytest.fixture(scope="module")
+def _run_megamoe_prologue_helper() -> Callable[[int, bool], torch.Tensor]:
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7):
+        pytest.skip("The scheduler helper regression requires an SM107 CUDA GPU")
+
+    from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
+
+    if not IS_CUTLASS_DSL_AVAILABLE:
+        pytest.skip("cutlass-dsl is not available")
+
+    import cuda.bindings.driver as cuda
+    import cutlass.cute as cute
+    import cutlass.utils as utils
+    from cutlass.cute.runtime import from_dlpack
+    from cutlass.cutlass_dsl import Boolean, Int32
+    from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
+
+    from tensorrt_llm._torch.cute_dsl_kernels.cutedsl_megamoe.api import ImplDesc, ProblemDesc
+    from tensorrt_llm._torch.cute_dsl_kernels.cutedsl_megamoe.helpers.device_workspace import (
+        DeviceWorkspace,
+    )
+    from tensorrt_llm._torch.cute_dsl_kernels.cutedsl_megamoe.helpers.smem_workspace import (
+        SmemWorkspace,
+    )
+    from tensorrt_llm._torch.cute_dsl_kernels.cutedsl_megamoe.kernel_src.schedulers.fc12_mapping import (
+        BlockPhase,
+        map_phase_interleaved_fc12_work_id,
+        resolve_phase_interleaved_fc1_claim_target,
+    )
+    from tensorrt_llm._torch.cute_dsl_kernels.cutedsl_megamoe.kernel_src.schedulers.fc12_scheduler import (
+        PhaseInterleavedFc12Scheduler,
+    )
+
+    class PrologueProbe:
+        def __init__(self) -> None:
+            self.scheduler = PhaseInterleavedFc12Scheduler(
+                ProblemDesc(dict(expert_count=1, intermediate_gateup_size=128, hidden_size=128)),
+                ImplDesc(
+                    dict(
+                        num_scheduler_consumer_threads=32,
+                        mma_tiler_mnk=(128, 128, 64),
+                        cluster_shape_mn=(1, 1),
+                        use_2cta_instrs=False,
+                        hint=1,
+                        token_padding_block=128,
+                        sf_padding_block=128,
+                        work_id_mode="atomic_counter",
+                        is_swap_ab=False,
+                        launch_cluster_count=3,
+                    )
+                ),
+            )
+            assert self.scheduler.minimum_global_fc1_claims == 3
+            self.smem = SmemWorkspace()
+            self.device = DeviceWorkspace()
+            self.scheduler.register_smem_regions(self.smem)
+            self.scheduler.register_device_workspace(self.device)
+            self.smem.finalize()
+            self.device.finalize()
+            alignment = self.smem.base_alignment
+            self.smem_launch_bytes = (
+                (self.smem.total_bytes + alignment - 1) // alignment * alignment
+            )
+            assert self.smem_launch_bytes >= self.smem.storage_class().size_in_bytes()
+
+        @cute.jit
+        def __call__(
+            self,
+            counts: cute.Tensor,
+            workspace: cute.Tensor,
+            exhausted: cute.Tensor,
+            output: cute.Tensor,
+            stream: cuda.CUstream,
+        ) -> None:
+            self.kernel(counts, workspace, exhausted, output).launch(
+                grid=(1, 1, 1), block=(32, 1, 1), smem=self.smem_launch_bytes, stream=stream
+            )
+
+        @cute.kernel
+        def kernel(
+            self,
+            counts: cute.Tensor,
+            workspace: cute.Tensor,
+            exhausted: cute.Tensor,
+            output: cute.Tensor,
+        ) -> None:
+            storage = utils.SmemAllocator().allocate(self.smem.storage_class())
+            self.device.assign_device_members(workspace.iterator)
+            self.scheduler.assign_device_members(
+                expert_token_sizes=counts,
+                expert_token_prefix_sum=None,
+                actual_expert_shape=None,
+                block_idx=cute.arch.block_idx(),
+                smem_workspace=self.smem,
+                smem_base=storage.buffer.data_ptr(),
+                device_workspace=self.device,
+            )
+            pipeline_init_arrive(cluster_shape_mn=(1, 1), is_relaxed=True)
+            pipeline_init_wait(cluster_shape_mn=(1, 1))
+            worker = self.scheduler._work_id_worker
+            state = self.scheduler._task_mapping_state
+            _, fc1_valid, state = map_phase_interleaved_fc12_work_id(
+                Int32(0), Int32(BlockPhase.Linear1), (Int32(0), Int32(0), Int32(0)), state
+            )
+            _, fc2_valid, state = map_phase_interleaved_fc12_work_id(
+                Int32(0), Int32(BlockPhase.Linear2), (Int32(0), Int32(0), Int32(0)), state
+            )
+            target, short_stream = resolve_phase_interleaved_fc1_claim_target(
+                Int32(self.scheduler.minimum_global_fc1_claims), state
+            )
+            input_exhausted = Boolean(exhausted[0])
+            pointer = worker.get_atomic_counter_pointer(Int32(0))
+            result = self.scheduler._wait_for_fc1_prologue_claims(input_exhausted, worker, state)
+            tid, _, _ = cute.arch.thread_idx()
+            output[tid, 0] = Int32(result)
+            output[tid, 1] = cute.arch.load(pointer, Int32, sem="acquire", scope="gpu")
+            output[tid, 2] = target
+            output[tid, 3] = Int32(short_stream)
+            output[tid, 4] = Int32(fc1_valid)
+            output[tid, 5] = Int32(fc2_valid)
+
+    probe = PrologueProbe()
+    counts = torch.tensor([1], device="cuda", dtype=torch.int32)
+    workspace = torch.zeros(probe.device.total_bytes("local"), device="cuda", dtype=torch.uint8)
+    exhausted = torch.zeros(1, device="cuda", dtype=torch.int32)
+    output = torch.full((32, 6), -1, device="cuda", dtype=torch.int32)
+    tensors = tuple(
+        from_dlpack(t, assumed_align=16) for t in (counts, workspace, exhausted, output)
+    )
+    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    compiled = cute.compile(probe, *tensors, stream)
+    counter_index = probe.device.offset(probe.scheduler._work_id_worker.work_id_counter_region) // 4
+
+    def run(counter: int, input_exhausted: bool) -> torch.Tensor:
+        workspace.zero_()
+        workspace.view(torch.int32)[counter_index] = counter
+        workspace.view(torch.int32)[counter_index + 1] = 1
+        exhausted.fill_(int(input_exhausted))
+        output.fill_(-1)
+        compiled(*tensors, stream)
+        torch.cuda.synchronize()
+        return output.cpu()
+
+    return run
+
+
+@pytest.mark.parametrize(
+    "counter,input_exhausted",
+    [(1, False), (3, False), (2, True)],
+    ids=["slow-peek", "fast-peek", "already-exhausted"],
+)
+def test_fc1_prologue_wait_preserves_exhaustion(
+    _run_megamoe_prologue_helper: Callable[[int, bool], torch.Tensor],
+    counter: int,
+    input_exhausted: bool,
+) -> None:
+    # One observer warp represents a three-cluster snapshot with one real FC1
+    # tile. Counter 1 precedes peer arrivals; counter 3 includes two invalid peer
+    # claims. Already-exhausted controls include an invalid local claim.
+    actual = _run_megamoe_prologue_helper(counter, input_exhausted)
+    expected = torch.tensor(
+        [int(input_exhausted), counter, 1, 1, 1, 1], dtype=torch.int32
+    ).expand_as(actual)
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
 
 def run_backend_moe(
@@ -763,7 +1318,7 @@ def run_backend_moe(
     - TRTLLM: token_final_scales=bfloat16, optionally router_logits
     - CUTEDSL: token_final_scales=float32
     - DEEPGEMM: workspace, token_final_scales=float32
-    - MegaMoE backends: token_selected_experts=int64, output_dtype
+    - MegaMoE backends: backend-specific token_selected_experts, output_dtype
 
     Args:
         trtllm_use_router_logits: If True, TRTLLM backend uses router_logits for routing.
@@ -796,7 +1351,12 @@ def run_backend_moe(
         m_max = fp8_utils.align(x_quantized.shape[0], 128)
         workspace = backend.get_workspace(m_max, 128)
     elif backend_type in _MEGAMOE_BACKEND_TYPES:
-        args["token_selected_experts"] = token_selected_experts.to(torch.int64)
+        topk_dtype = (
+            torch.int32
+            if backend_type == MoeBackendType.MEGAMOE_CUTEDSL and get_sm_version() == 107
+            else torch.int64
+        )
+        args["token_selected_experts"] = token_selected_experts.to(topk_dtype)
         args["output_dtype"] = dtype
 
     # Mirror what each scheduler hands the backend: ExternalCommMoEScheduler
@@ -904,6 +1464,73 @@ CI_SWIGLU_COMBOS = [
 SWIGLU_COMBOS = CI_SWIGLU_COMBOS if IS_CI_MODE else LOCAL_SWIGLU_COMBOS
 
 
+def should_skip_ugpu_param(
+    backend_type: MoeBackendType,
+    quant_algo: Optional[QuantAlgo],
+    activation_type: ActivationType,
+    swiglu_gptoss_style: bool,
+) -> Optional[str]:
+    """Return a static skip reason for uGPU MoE backend params."""
+    if backend_type != MoeBackendType.CUTEDSL:
+        return "uGPU MoE backend test only supports CuteDSL"
+    if quant_algo not in (QuantAlgo.NVFP4, None):
+        return "uGPU MoE backend test only supports NVFP4 or BF16"
+    if activation_type != ActivationType.Swiglu:
+        return "uGPU MoE backend test only supports SwiGLU"
+    if swiglu_gptoss_style:
+        return "uGPU MoE backend test does not cover GPT-OSS SwiGLU style"
+    return None
+
+
+def should_skip_ugpu_runtime(enable_ugpu: bool) -> Optional[str]:
+    """Return a runtime skip reason for uGPU MoE backend params."""
+    if not enable_ugpu:
+        return None
+    if not torch.cuda.is_available():
+        return "CUDA is not available"
+    sm_version = get_sm_version()
+    if sm_version != 107:
+        return f"Rubin (SM 107) required, got SM {sm_version}"
+    if not IS_CUTLASS_DSL_INTERNAL_AVAILABLE:
+        return "internal CuteDSL Rubin kernels are not available"
+    is_ugpu_enabled.cache_clear()
+    if not is_ugpu_enabled():
+        return "uGPU is not enabled/supported on this system"
+    return None
+
+
+def test_ci_acceleration_keeps_only_ugpu_cutedsl_bf16(monkeypatch: pytest.MonkeyPatch):
+    from _torch.modules.moe import moe_test_utils
+
+    monkeypatch.setattr(moe_test_utils, "IS_CI_MODE", True)
+    model_config = MoeModelConfig(60, 4, 2048, 1408)
+    common_kwargs = {
+        "backend_type": MoeBackendType.CUTEDSL,
+        "quant_algo": None,
+        "model_config": model_config,
+        "routing_method_cls": RenormalizeMoeRoutingMethod,
+        "activation_type": ActivationType.Swiglu,
+    }
+
+    assert should_skip_to_accelerate_ci(dtype=torch.bfloat16, **common_kwargs) is not None
+    assert (
+        should_skip_to_accelerate_ci(
+            dtype=torch.bfloat16,
+            enable_ugpu=True,
+            **common_kwargs,
+        )
+        is None
+    )
+    assert (
+        should_skip_to_accelerate_ci(
+            dtype=torch.float16,
+            enable_ugpu=True,
+            **common_kwargs,
+        )
+        is not None
+    )
+
+
 def generate_test_params() -> List:
     """
     Generate test parameter combinations, filtering out unsupported configurations.
@@ -948,8 +1575,40 @@ def generate_test_params() -> List:
             swiglu_alpha,
             swiglu_beta,
             swiglu_limit,
+            False,
         )
         params.append(create_test_param(param_values, test_id))
+
+        if quant_algo in (QuantAlgo.NVFP4, None):
+            swiglu_gptoss_style = (
+                swiglu_alpha != 1 or swiglu_beta != 0 or swiglu_limit != float("inf")
+            )
+            ugpu_skip_reason = should_skip_ugpu_param(
+                backend_type,
+                quant_algo,
+                ActivationType.Swiglu,
+                swiglu_gptoss_style,
+            )
+            ugpu_param_values = (
+                dtype,
+                backend_type,
+                quant_algo,
+                seq_len,
+                model_config,
+                routing_method_cls,
+                ActivationType.Swiglu,
+                swiglu_alpha,
+                swiglu_beta,
+                swiglu_limit,
+                True,
+            )
+            params.append(
+                create_test_param(
+                    ugpu_param_values,
+                    f"ugpu=enabled-{test_id}",
+                    ugpu_skip_reason,
+                )
+            )
 
     return params
 
@@ -1002,6 +1661,7 @@ def generate_element_wise_test_params() -> List:
                 None,
                 None,
                 None,
+                False,
             )
             params.append(create_test_param(param_values, test_id))
     return params
@@ -1071,7 +1731,8 @@ TEST_PARAMS += generate_element_wise_test_params()
 # =============================================================================
 @pytest.mark.parametrize(
     "dtype_activation,backend_type,quant_algo,seq_len,model_config,"
-    "routing_method_cls,activation_type,swiglu_alpha,swiglu_beta,swiglu_limit",
+    "routing_method_cls,activation_type,swiglu_alpha,swiglu_beta,swiglu_limit,"
+    "enable_ugpu",
     TEST_PARAMS,
 )
 def test_moe_backend(
@@ -1086,6 +1747,8 @@ def test_moe_backend(
     swiglu_beta: Optional[float],
     swiglu_limit: Optional[float],
     monkeypatch: pytest.MonkeyPatch,
+    enable_ugpu: bool,
+    tmp_path,
 ):
     """
     Test MoE backend with autotune to capture all tactics.
@@ -1112,6 +1775,11 @@ def test_moe_backend(
         # Default values: alpha=1, beta=0, limit=inf
         swiglu_gptoss_style = swiglu_alpha != 1 or swiglu_beta != 0 or swiglu_limit != float("inf")
 
+    ugpu_runtime_skip = should_skip_ugpu_runtime(enable_ugpu)
+    if ugpu_runtime_skip:
+        pytest.skip(ugpu_runtime_skip)
+    ugpu_policy = UgpuPolicy(enabled=enable_ugpu)
+
     ci_skip = should_skip_to_accelerate_ci(
         backend_type=backend_type,
         quant_algo=quant_algo,
@@ -1121,6 +1789,7 @@ def test_moe_backend(
         seq_len=seq_len,
         swiglu_gptoss_style=swiglu_gptoss_style,
         activation_type=activation_type,
+        enable_ugpu=enable_ugpu,
     )
     if ci_skip:
         pytest.skip(ci_skip)
@@ -1130,6 +1799,24 @@ def test_moe_backend(
     top_k = model_config.top_k
     hidden_size = model_config.hidden_size
     intermediate_size = model_config.intermediate_size
+
+    local_tma_selector = None
+    if (
+        backend_type == MoeBackendType.MEGAMOE_CUTEDSL
+        and dtype_activation == torch.bfloat16
+        and quant_algo == QuantAlgo.NVFP4
+        and seq_len == 8
+        and (num_experts, top_k, hidden_size, intermediate_size) == (8, 1, 512, 512)
+        and routing_method_cls is RenormalizeMoeRoutingMethod
+        and activation_type == ActivationType.Swiglu
+        and not swiglu_gptoss_style
+    ):
+        from tensorrt_llm._torch.custom_ops import cute_dsl_megamoe_custom_op as megamoe_op
+
+        monkeypatch.setenv("MEGAMOE_TACTIC_AUTOTUNE", "0")
+        monkeypatch.setenv("MEGAMOE_COMBINE_FORMAT", "bf16")
+        local_tma_selector = MagicMock(return_value=_MEGAMOE_LOCAL_TMA_STAGE2_TACTIC)
+        monkeypatch.setattr(megamoe_op, "default_megamoe_tactic", local_tma_selector)
 
     skip_if_insufficient_gpu_memory(num_experts, hidden_size, intermediate_size, dtype_activation)
 
@@ -1205,6 +1892,7 @@ def test_moe_backend(
             swiglu_limit=swiglu_tensors["swiglu_limit"] if swiglu_tensors else None,
             weight_loading_mode=weight_loading_mode,
             activation_type=activation_type,
+            ugpu_policy=ugpu_policy,
         )
 
         # W4A8_MXFP4_MXFP8 / W4A8_MXFP4_FP8 require backend-layout-aware
@@ -1225,6 +1913,9 @@ def test_moe_backend(
         backend.load_weights([weights])
         backend.post_load_weights()
         backend.cuda()
+        if enable_ugpu:
+            assert backend._ugpu_runtime is not None
+            assert backend._ugpu_weight_shards is not None
 
         # Create reference
         if ref_cls is not None:
@@ -1238,6 +1929,8 @@ def test_moe_backend(
 
         # Clear autotuner cache before autotune phase
         AutoTuner.get().clear_cache()
+        if enable_ugpu:
+            AutoTuner.get().reset_statistics()
 
         # Get reference output first
         with torch.inference_mode():
@@ -1266,8 +1959,26 @@ def test_moe_backend(
 
         # Autotune phase: tune kernels to find best tactics
         # Use cache_path to speed up subsequent runs by reusing tuning results
-        with torch.inference_mode(), autotune(cache_path="/tmp/moe_autotuner_cache.json"):
+        cache_path = (
+            str(tmp_path / "moe_autotuner_cache.json")
+            if enable_ugpu
+            else "/tmp/moe_autotuner_cache.json"
+        )
+        with torch.inference_mode(), autotune(cache_path=cache_path):
             _ = run_moe()
+        if enable_ugpu:
+            quant_name = "nvfp4" if quant_algo == QuantAlgo.NVFP4 else "bf16"
+            expected_tuning_ops = (
+                f"CuteDslFusedMoE::run_moe_{quant_name}::ugpu_end_to_end",
+                f"trtllm::cute_dsl_{quant_name}_gather_grouped_gemm_"
+                f"{'act_fusion' if quant_algo == QuantAlgo.NVFP4 else 'swiglu'}"
+                "_rubin::ugpu_concurrent",
+                f"trtllm::cute_dsl_{quant_name}_grouped_gemm_finalize_"
+                "inplace_rubin::ugpu_concurrent",
+            )
+            for op_name in expected_tuning_ops:
+                assert autotuner.stats.tuned_op_profiled_configs.get(op_name, 0) > 0
+                assert not autotuner.stats.failed_profiling_count.get(op_name, set())
 
         # flashinfer has no capture and replay mechanisms, so we skip test_all_kernels
         use_flashinfer = getattr(backend, "use_flashinfer", False)
@@ -1277,6 +1988,40 @@ def test_moe_backend(
             # Capture phase: record which tactics are used (requires actual execution)
             with AutoTuner.get().capture() as all_tactics, torch.inference_mode():
                 _ = run_moe()
+
+            # Replaying every outer tile is deliberately exhaustive and would
+            # multiply the inner FC tactic replay for every matrix member. One
+            # representative production shape per uGPU path covers that
+            # outer-tile contract; all matrix members still validate their
+            # tuned/failed statistics and replay the tactics selected for their
+            # own shape below.
+            representative_outer_tile_replay = (
+                enable_ugpu
+                and quant_algo in (QuantAlgo.NVFP4, None)
+                and seq_len == 1
+                and (num_experts, top_k, hidden_size, intermediate_size) == (60, 4, 2048, 1408)
+            )
+            if representative_outer_tile_replay:
+                # The regular Cartesian replay contains inner FC tactics only
+                # for the selected outer tile. Exercise every outer tile
+                # directly after tuning, when all corresponding FC caches have
+                # been prepared, so a non-winning tile cannot silently regress.
+                outer_context = all_tactics._captured_contexts[0]
+                outer_runner = outer_context["runners"][0]
+                outer_tactics = outer_runner.get_valid_tactics(
+                    outer_context["inputs"], OptimizationProfile()
+                )
+                expected_outer_tactics = (
+                    {128, 256, 512} if quant_algo == QuantAlgo.NVFP4 else {64, 128, 256}
+                )
+                assert set(outer_tactics) == expected_outer_tactics
+                for outer_tactic in outer_tactics:
+                    # Direct runner replay reuses the captured inplace output;
+                    # reset it to the fresh-output baseline used by run_moe().
+                    with torch.inference_mode():
+                        outer_context["inputs"][-1].zero_()
+                        output = outer_runner(outer_context["inputs"], tactic=outer_tactic)
+                    ref_fused_moe.check_accuracy(output, ref_output)
 
             # Replay phase: test each tactic for correctness
             # Set fail_fast=True to stop on first failure, False to run all and report summary
@@ -1295,6 +2040,9 @@ def test_moe_backend(
             with torch.inference_mode():
                 output = run_moe()
                 ref_fused_moe.check_accuracy(output, ref_output)
+
+        if local_tma_selector is not None:
+            assert any(call.args[0] > 0 for call in local_tma_selector.call_args_list)
 
 
 # ============================================================================
@@ -1805,3 +2553,95 @@ def test_trtllm_fp8_block_scales_fuse_shared_expert_layout(monkeypatch: pytest.M
                 backend.w2_weight_scaling_factor.data[slot],
                 down.weight_scale.data[:, scale_rows],
             )
+
+
+@pytest.mark.parametrize("num_tokens", [1, 1024])
+def test_moe_backend_trtllm_nvfp4_lamport(num_tokens: int):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required")
+    sm_version = get_sm_version()
+    if sm_version != 107:
+        pytest.skip(f"Lamport sync requires SM107 (Rubin), got SM{sm_version}")
+
+    dtype_activation = torch.bfloat16
+    backend_type = MoeBackendType.TRTLLM
+    quant_algo = QuantAlgo.NVFP4
+    activation_type = ActivationType.Relu2
+
+    num_experts = 2048
+    top_k = 32
+    hidden_size = 1024
+    intermediate_size = 1024
+
+    skip_if_insufficient_gpu_memory(num_experts, hidden_size, intermediate_size, dtype_activation)
+
+    mapping = Mapping()
+    mapping.rank = mpi_rank()
+
+    with torch.device(f"cuda:{mapping.rank}"):
+        torch.manual_seed(0)
+        torch.cuda.manual_seed(0)
+
+        AutoTuner.get().setup_distributed_state(mapping)
+
+        routing_method = RenormalizeMoeRoutingMethod(top_k=top_k)
+        x = torch.randn((num_tokens, hidden_size), dtype=dtype_activation, device="cuda")
+        router_logits = torch.randn(
+            (num_tokens, num_experts), dtype=dtype_activation, device="cuda"
+        )
+
+        quantize_util_cls, quant_config, quant_kwargs = get_test_quant_params(
+            quant_algo, x, backend_type
+        )
+        quantize_util = quantize_util_cls(
+            num_experts=num_experts,
+            dtype=dtype_activation,
+            intermediate_size=intermediate_size,
+            hidden_size=hidden_size,
+            quant_config=quant_config,
+            bias=False,
+            swiglu_gptoss_style=False,
+            swiglu_alpha=None,
+            swiglu_beta=None,
+            swiglu_limit=None,
+            activation_type=activation_type,
+        )
+        weights = quantize_util.create_weights(**quant_kwargs)
+
+        backend = create_test_backend(
+            backend_type=backend_type,
+            routing_method=routing_method,
+            num_experts=num_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            dtype=dtype_activation,
+            quant_config=quant_config,
+            mapping=mapping,
+            activation_type=activation_type,
+            use_lamport_sync=True,
+        )
+        backend.load_weights([weights])
+        backend.post_load_weights()
+        backend.cuda()
+
+        ref_fused_moe = quantize_util.create_ref_module(routing_method)
+        ref_fused_moe.load_weights([weights])
+        ref_fused_moe.cuda()
+
+        with torch.inference_mode():
+            ref_output = ref_fused_moe.forward(x, router_logits)
+
+            token_selected_experts, token_final_scales = routing_method.apply(router_logits)
+            x_quantized, x_sf = backend.quantize_input(x, post_quant_comm=False)
+            output = run_backend_moe(
+                backend,
+                backend_type,
+                x_quantized,
+                x_sf,
+                token_selected_experts,
+                token_final_scales,
+                dtype_activation,
+                router_logits,
+            )
+
+            ref_fused_moe.check_accuracy(output, ref_output)

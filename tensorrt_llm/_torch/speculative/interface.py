@@ -117,11 +117,49 @@ def should_use_separate_draft_kv_cache(spec_config) -> bool:
         return False
     if spec_config._use_shared_kv_cache:
         return False
-    # DSpark owns a dedicated rolling-window cache in DSparkWorker. Its draft
-    # model does not read the paged draft KV cache managed by attention metadata.
-    if spec_config.spec_dec_mode.is_dspark():
+    # The embedded DSpark draft owns a dedicated rolling-window cache in
+    # DSv4DSparkWorker and never reads the paged draft KV cache that attention
+    # metadata manages. A standalone DSpark drafter runs on DSparkWorker
+    # (DFlash lineage), which does read it, so it keeps the default -- hence a
+    # form check, not a mode check
+    # (see DSparkDecodingConfig.draft_is_embedded_in_target).
+    if (spec_config.spec_dec_mode.is_dspark()
+            and spec_config.draft_is_embedded_in_target):
         return False
     return spec_config._allow_separate_draft_kv_cache
+
+
+def draft_prompt_lookahead(spec_config) -> Optional[int]:
+    """Prompt tokens past position ``i`` that a one-model draft consumes at ``i``:
+    Eagle reads the shift-by-1 input ids, vanilla MTP chains ``D`` layers.
+
+    Read by the context-chunk tail token (``_prepare_context_input_ids``) and by a
+    separate draft pool's ``reuse_match_backoff``. ``None`` = span not established.
+    """
+    if spec_config is None:
+        return None
+    spec_mode = spec_config.spec_dec_mode
+    if not spec_mode.use_one_engine():
+        # Two-model drafting runs the draft as its own engine over its own
+        # request view, so nothing here is shifted against the target prompt.
+        return None
+    if spec_mode.is_pard():
+        # PARDWorker feeds the drafter input_ids[:num_ctx_tokens] verbatim, so
+        # its draft state at i is a function of tokens [0, i] like the target's.
+        return 0
+    if spec_mode.is_dflash() or spec_mode.is_dspark():
+        # precompute_context_kv(projected_hidden, positions) writes the drafter's
+        # OWN post-norm post-RoPE K/V, one entry per context token, and the
+        # target hidden at i already depends on exactly tokens [0, i]. Same
+        # dependency face as the target's own KV, so raw-prompt keys describe it
+        # and no chunk-tail lookahead token is needed. The paged pool then makes
+        # a matched prefix addressable again (dflash.py _store_prefill_context).
+        return 0
+    # A shift-by-1 (Eagle) or D-chained (vanilla MTP) span additionally needs the
+    # context-chunk lookahead token, whose plumbing this branch does not carry;
+    # keying those modes without it would attach draft KV a chunked prefill never
+    # produced. DraftTargetOneModel's span is unvalidated upstream.
+    return None
 
 
 def prepare_attn_metadata_for_draft_replay(attn_metadata,
@@ -365,6 +403,10 @@ class SpeculativeDecodingMode(IntEnum):
 
     def is_eagle3_one_model(self):
         return self == SpeculativeDecodingMode.EAGLE3_ONE_MODEL
+
+    def is_eagle_one_model(self):
+        """Whether MTP-Eagle or EAGLE3 uses the unified one-model worker."""
+        return self.is_mtp_eagle_one_model() or self.is_eagle3_one_model()
 
     def is_pard(self):
         return self == SpeculativeDecodingMode.PARD
@@ -1770,6 +1812,43 @@ class SpecWorkerBase(nn.Module, ABC):
         from ..distributed.ops import allgather
         return allgather(logits, self.mapping, dim=-1)
 
+    @staticmethod
+    def _zero_padding_rows(logits: torch.Tensor, spec_metadata,
+                           num_contexts: int, batch_size: int,
+                           rows_per_request: int) -> torch.Tensor:
+        """Zero the logits rows belonging to CUDA-graph padding requests.
+
+        A padding request decodes from an uninitialized KV/hidden state, so its
+        logits can be non-finite and its probs degenerate. flashinfer's
+        ``chain_speculative_sampling`` then rejects at a position whose
+        ``relu(target - draft)`` residual has no mass, where it reads an
+        uninitialized shared-memory slot and emits an out-of-range token id.
+        Zeroed logits give a uniform -- and therefore legal -- distribution.
+
+        Padding requests are the ones ``populate_sampling_params_for_one_model``
+        routed to ``dummy_slot_row`` (``py_seq_slot is None``), so this needs no
+        extra host-side state. Shapes are static: CUDA-graph safe. No-op while
+        ``dummy_slot_row`` is still 0, which is a live request's row rather than
+        a padding marker.
+
+        Args:
+            logits: ``[(batch_size - num_contexts) * rows_per_request, vocab]``;
+                returned unchanged if the row count does not match.
+            rows_per_request: logits rows each request contributes.
+        Returns:
+            ``logits`` with the padding requests' rows zeroed.
+        """
+        slot_ids = getattr(spec_metadata, "batch_slot_ids", None)
+        dummy_slot_row = getattr(spec_metadata, "dummy_slot_row", 0)
+        num_gens = batch_size - num_contexts
+        if (slot_ids is None or dummy_slot_row <= 0 or num_gens <= 0
+                or logits.shape[0] != num_gens * rows_per_request):
+            return logits
+        is_padding = slot_ids[num_contexts:batch_size] == dummy_slot_row
+        if rows_per_request > 1:
+            is_padding = is_padding.repeat_interleave(rows_per_request)
+        return logits.masked_fill(is_padding.unsqueeze(-1), 0.0)
+
     def advanced_sample_draft(self,
                               logits: torch.Tensor,
                               spec_metadata: "SpecMetadata",
@@ -1800,6 +1879,10 @@ class SpecWorkerBase(nn.Module, ABC):
                                                    step_offset=1 +
                                                    (draft_step or 0))
         if spec_metadata.use_rejection_sampling and draft_step is not None:
+            # The proposal stored below is read back by next iteration's
+            # rejection kernel, so a padding row must not poison it either.
+            logits = self._zero_padding_rows(logits, spec_metadata, 0,
+                                             batch_size, 1)
             draft_tokens, probs = (
                 sampling_batch_spec_dec_one_model_for_rejection(logits,
                                                                 temperatures,
@@ -1974,6 +2057,9 @@ class SpecWorkerBase(nn.Module, ABC):
                 spec_metadata.top_ks[gen_start:gen_end],
                 spec_metadata.top_ps[gen_start:gen_end])
 
+            gen_logits = self._zero_padding_rows(gen_logits, spec_metadata,
+                                                 num_contexts, batch_size,
+                                                 runtime_draft_len + 1)
             target_probs_flat = compute_probs_from_logits(
                 gen_logits, temperatures, top_ks, top_ps)
             target_probs = target_probs_flat.reshape(num_gens,
@@ -2243,6 +2329,8 @@ class SpecWorkerBase(nn.Module, ABC):
                                                    step_offset=1)
 
         if getattr(spec_metadata, "use_rejection_sampling", False):
+            flat_logits = self._zero_padding_rows(flat_logits, spec_metadata,
+                                                  num_contexts, batch_size, K)
             flat_tokens, flat_probs = (
                 sampling_batch_spec_dec_one_model_for_rejection(flat_logits,
                                                                 temps,
@@ -2407,7 +2495,8 @@ class SpecWorkerBase(nn.Module, ABC):
                                    accepted_tokens, num_contexts):
         """
         Prepare context input IDs for draft model forward.
-        Shifts input IDs left by 1 and places the first accepted token at gather positions.
+        Shifts input IDs left by 1 (``draft_prompt_lookahead == 1``), leaving one
+        hole per request at the chunk's last position.
 
         Args:
             input_ids: Original input IDs tensor
@@ -2441,7 +2530,10 @@ class SpecWorkerBase(nn.Module, ABC):
         return None
 
     @contextmanager
-    def draft_kv_cache_context(self, attn_metadata, draft_kv_cache_manager):
+    def draft_kv_cache_context(self,
+                               attn_metadata,
+                               draft_kv_cache_manager,
+                               enable_draft_ugpu_forkjoin: bool = False):
         """
         Select draft attention metadata for one-engine speculative decoding.
 
@@ -2451,14 +2543,12 @@ class SpecWorkerBase(nn.Module, ABC):
         tables and kernel wrappers are manager-specific.
         """
 
-        # draft_kv_cache_manager is None if using two-engine speculative decoding or not enabling separate draft KV cache.
-        if draft_kv_cache_manager is None:
-            yield attn_metadata
-            return
-
         from ..attention_backend.flashinfer import FlashInferAttentionMetadata
         if isinstance(attn_metadata, FlashInferAttentionMetadata):
-            yield attn_metadata.get_draft_metadata(draft_kv_cache_manager)
+            draft_metadata = (
+                attn_metadata if draft_kv_cache_manager is None else
+                attn_metadata.get_draft_metadata(draft_kv_cache_manager))
+            yield draft_metadata
             return
 
         if not isinstance(attn_metadata, TrtllmAttentionMetadata):
@@ -2467,13 +2557,37 @@ class SpecWorkerBase(nn.Module, ABC):
 
         saved_state = prepare_attn_metadata_for_draft_replay(
             attn_metadata, draft_kv_cache_manager)
-        if saved_state is None:
-            yield attn_metadata
-            return
+        saved_ugpu_attrs = []
+
+        def patch_ugpu_metadata(name, value):
+            saved_ugpu_attrs.append((name, getattr(attn_metadata, name)))
+            setattr(attn_metadata, name, value)
+
+        using_separate_draft_cache = saved_state is not None
+        draft_manager_supports_ugpu_forkjoin = getattr(draft_kv_cache_manager,
+                                                       "fork_join_attn", False)
 
         try:
+            if attn_metadata.ugpu_enabled:
+                if not enable_draft_ugpu_forkjoin:
+                    patch_ugpu_metadata("ugpu_enabled", False)
+                elif using_separate_draft_cache:
+                    if draft_manager_supports_ugpu_forkjoin:
+                        draft_ugpu_block_offsets = (
+                            attn_metadata.draft_ugpu_kv_cache_block_offsets)
+                        if draft_ugpu_block_offsets is None:
+                            raise RuntimeError(
+                                "uGPU fork-join is enabled for the draft KV "
+                                "cache, but draft_ugpu_kv_cache_block_offsets "
+                                "was not prepared.")
+                        patch_ugpu_metadata("ugpu_kv_cache_block_offsets",
+                                            draft_ugpu_block_offsets)
+                    else:
+                        patch_ugpu_metadata("ugpu_enabled", False)
             yield attn_metadata
         finally:
+            for name, value in reversed(saved_ugpu_attrs):
+                setattr(attn_metadata, name, value)
             restore_attn_metadata_after_draft_replay(attn_metadata, saved_state)
 
     def _sample_tokens_for_batch(

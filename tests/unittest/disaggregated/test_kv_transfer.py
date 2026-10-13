@@ -1603,5 +1603,22 @@ def test_incompatible_peer_fails_only_affected_requests():
                 worker.shutdown()
 
 
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("prompt_len", [863, 1030, 1401])
+def test_helix_windowed_blocks_route_to_last_page_owner(prompt_len):
+    """The windowed HP tail ring must reach the rank owning the last page."""
+    tpb, cp_size, window = 128, 8, 16
+    total_blocks = (prompt_len + tpb - 1) // tpb
+    ordinals = np.arange(max(0, (prompt_len + 1 - window) // tpb), total_blocks)
+    src = ordinals * 1000 + 7
+    got = [
+        transfer_mod.Sender._helix_windowed_block_ids(src, total_blocks, 1, r, cp_size)
+        for r in range(cp_size)
+    ]
+    assert got[(total_blocks - 1) % cp_size].tolist() == [int(src[-1])]
+    for r in range(cp_size):
+        assert got[r].tolist() == [int(b) for o, b in zip(ordinals, src) if o % cp_size == r]
+
+
 if __name__ == "__main__":
     test_transfer_worker_v1(1, 1, False, 1, 1, False, False)

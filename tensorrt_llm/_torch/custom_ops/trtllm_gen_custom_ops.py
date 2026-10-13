@@ -461,7 +461,8 @@ class FP4BlockScaleMoERunner(TunableRunner):
                  do_finalize: bool,
                  act_type: int,
                  tune_max_num_tokens: int = 8192,
-                 use_dp: bool = False):
+                 use_dp: bool = False,
+                 use_lamport: bool = False):
 
         self.num_experts = num_experts
         self.top_k = top_k
@@ -474,6 +475,7 @@ class FP4BlockScaleMoERunner(TunableRunner):
         self.routing_method_type = routing_method_type
         self.do_finalize = do_finalize
         self.act_type = act_type
+        self.use_lamport = use_lamport
 
         self.tuning_config = FP4BlockScaleMoERunner.get_tuning_config(
             self.num_experts // self.local_num_experts,
@@ -487,7 +489,7 @@ class FP4BlockScaleMoERunner(TunableRunner):
                 self.act_type)
 
     def get_runner(self):
-        instance_key = (self.act_type, )
+        instance_key = (self.act_type, self.use_lamport)
         if instance_key not in FP4BlockScaleMoERunner.runner_dict:
             FP4BlockScaleMoERunner.runner_dict[
                 instance_key] = torch.classes.trtllm.FP4BlockScaleMoERunner(
@@ -497,13 +499,23 @@ class FP4BlockScaleMoERunner(TunableRunner):
     def forward(
         self,
         inputs: List[torch.Tensor],
-        tactic: List[int] = [-1, -1],
+        tactic: List[int] = [-1, -1, 0],
         output: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         assert isinstance(tactic, list)
 
         args = FP4BlockScaleMoEInputs(*inputs)
         kernel_runner = self.get_runner()
+
+        # Tactic: [tileN, config, has_ls]. Use lamport if available and requested.
+        if tactic[0] == -1 or tactic[1] == -1:
+            use_lamport_for_run = self.use_lamport
+        else:
+            has_lamport = len(tactic) > 2 and tactic[2] == 1
+            use_lamport_for_run = has_lamport and self.use_lamport and not AutoTuner.get(
+            ).is_tuning_mode
+
+        kernel_tactic = tactic[:2]
 
         return kernel_runner.run_moe(
             args.routing_logits, args.routing_bias, args.hidden_states,
@@ -516,7 +528,8 @@ class FP4BlockScaleMoERunner(TunableRunner):
             self.n_group, self.topk_group, self.intermediate_size,
             self.local_expert_offset, self.local_num_experts,
             self.routed_scaling_factor, self.routing_method_type,
-            self.do_finalize, tactic, args.topk_weights, args.topk_ids, output)
+            self.do_finalize, kernel_tactic, args.topk_weights, args.topk_ids,
+            output, use_lamport_for_run)
 
     def get_valid_tactics(self, inputs: List[torch.Tensor],
                           profile: OptimizationProfile,
@@ -532,12 +545,14 @@ class FP4BlockScaleMoERunner(TunableRunner):
 
         kernel_runner = self.get_runner()
 
+        # Returns (tileN, config, has_ls) tuples. has_ls checked only if use_lamport=True.
         tactics = kernel_runner.get_valid_configs(
             self.top_k,
             hidden_size,
             self.intermediate_size,
             self.local_num_experts,
             num_tokens,
+            self.use_lamport,
         )
 
         return tactics
@@ -679,7 +694,8 @@ def fp4_block_scale_moe_runner(routing_logits: Optional[torch.Tensor],
                                topk_ids: Optional[torch.Tensor] = None,
                                output: Optional[torch.Tensor] = None,
                                tune_max_num_tokens: int = 8192,
-                               use_dp: bool = False) -> List[torch.Tensor]:
+                               use_dp: bool = False,
+                               use_lamport: bool = False) -> List[torch.Tensor]:
 
     tuner = AutoTuner.get()
     kernel_runner = FP4BlockScaleMoERunner(
@@ -696,6 +712,7 @@ def fp4_block_scale_moe_runner(routing_logits: Optional[torch.Tensor],
         act_type,
         tune_max_num_tokens=tune_max_num_tokens,
         use_dp=use_dp,
+        use_lamport=use_lamport,
     )
 
     # Prepare dummy topk tensors and hook for AutoTuner profiling
@@ -823,7 +840,8 @@ def _(routing_logits,
       topk_ids: Optional[torch.Tensor] = None,
       output: Optional[torch.Tensor] = None,
       tune_max_num_tokens: int = 8192,
-      use_dp: bool = False) -> List[torch.Tensor]:
+      use_dp: bool = False,
+      use_lamport: bool = False) -> List[torch.Tensor]:
     if do_finalize:
         num_tokens = hidden_states.shape[0]
         hidden_size = hidden_states.shape[1] * 2

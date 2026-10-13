@@ -596,7 +596,6 @@ class ConfigurableMoE(MoE):
             num_slots=self.num_slots,
             top_k=self.routing_method.experts_per_token,
             expert_size_per_partition=self.expert_size_per_partition,
-            payload_in_workspace=False,  # ConfigurableMoE does not use workspace output for now
             # Currently the TRTLLMGEN reduce sum internally.
             # Keep updated with more supported backends.
             alltoall_result_do_sum=True,

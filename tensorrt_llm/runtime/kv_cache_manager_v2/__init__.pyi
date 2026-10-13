@@ -123,6 +123,7 @@ class CacheTierConfig(Protocol):
 @dataclass(slots=True)
 class GpuCacheTierConfig:
     quota: int
+    enable_ugpu: bool = False
     @property
     def tier(self) -> CacheTier: ...
     def assert_valid(self) -> None: ...
@@ -185,6 +186,9 @@ class KVCacheManagerConfig:
     layers: list[LayerConfig]
     max_util_for_resume: float = ...
     enable_partial_reuse: bool = True
+    # Tokens trimmed off the tail of every prefix match; nonzero only for a pool
+    # that also holds state reading that many tokens ahead of each position.
+    reuse_match_backoff: int = 0
     constraints: list[BatchDesc] = ...
     typical_step: BatchDesc | None = None
     initial_pool_ratio: list[float] | None = None

@@ -19,6 +19,7 @@ import numpy as np
 
 from tensorrt_llm import logger
 from tensorrt_llm._torch.disaggregation.base.region import (
+    KVRegionSpec,
     MemRegionGroup,
     RegionMapperBase,
     SpecRegion,
@@ -126,6 +127,10 @@ class ReplicatedMapper(IntactMapper):
     overlap happens through the per-layer offsets, and fan-in routing (one
     owning sender per destination) is decided upstream by
     ``PeerRegistrar.should_send_pool``.
+
+    Sliding-window replicas may use different ring sizes. In that case only
+    the common live suffix is copied, and each logical token is placed in the
+    slot selected by its destination ring.
     """
 
     def __init__(
@@ -134,14 +139,133 @@ class ReplicatedMapper(IntactMapper):
         dst_layer_offsets: Sequence[int] | np.ndarray,
         self_bytes_per_layer: int,
         peer_bytes_per_layer: int,
+        *,
+        self_window_size: int | None = None,
+        peer_window_size: int | None = None,
     ) -> None:
-        super().__init__(
-            src_layer_offsets,
-            dst_layer_offsets,
-            self_bytes_per_layer,
-            peer_bytes_per_layer,
-            mapper_name="Replicated",
+        self._ring_geometry: tuple[int, int, int] | None = None
+        if self_bytes_per_layer == peer_bytes_per_layer:
+            super().__init__(
+                src_layer_offsets,
+                dst_layer_offsets,
+                self_bytes_per_layer,
+                peer_bytes_per_layer,
+                mapper_name="Replicated",
+            )
+            return
+
+        if self_window_size is None or peer_window_size is None:
+            raise ValueError(
+                "Replicated cache region size mismatch: "
+                f"local={self_bytes_per_layer}, peer={peer_bytes_per_layer}"
+            )
+        if self_window_size <= 0 or peer_window_size <= 0:
+            raise ValueError(
+                "Replicated ring window sizes must be positive: "
+                f"local={self_window_size}, peer={peer_window_size}"
+            )
+        if (
+            self_bytes_per_layer % self_window_size != 0
+            or peer_bytes_per_layer % peer_window_size != 0
+        ):
+            raise ValueError(
+                "Replicated ring regions must contain a whole number of tokens: "
+                f"local={self_bytes_per_layer}/{self_window_size}, "
+                f"peer={peer_bytes_per_layer}/{peer_window_size}"
+            )
+
+        bytes_per_token = self_bytes_per_layer // self_window_size
+        peer_bytes_per_token = peer_bytes_per_layer // peer_window_size
+        if bytes_per_token != peer_bytes_per_token:
+            raise ValueError(
+                "Replicated ring bytes per token mismatch: "
+                f"local={bytes_per_token}, peer={peer_bytes_per_token}"
+            )
+
+        src = np.asarray(src_layer_offsets, dtype=np.int64)
+        dst = np.asarray(dst_layer_offsets, dtype=np.int64)
+        if src.size == 0 or src.size != dst.size:
+            raise ValueError(
+                "Replicated layer offsets must be non-empty and equal-length: "
+                f"src={src.size}, dst={dst.size}"
+            )
+        self._src_layer_offsets = src
+        self._dst_layer_offsets = dst
+        self._ring_geometry = (
+            self_window_size,
+            peer_window_size,
+            bytes_per_token,
         )
+
+    @nvtx_range("ReplicatedMapper.map")
+    def map(
+        self, src_regions: SpecRegion, dst_regions: SpecRegion
+    ) -> SpecRegionPair | list[SpecRegionPair]:
+        if self._ring_geometry is None:
+            return super().map(src_regions, dst_regions)
+
+        src_group = src_regions.memory
+        dst_group = dst_regions.memory
+        if not isinstance(src_group, MemRegionGroup) or not isinstance(dst_group, MemRegionGroup):
+            raise TypeError("Replicated ring mapping requires grouped memory regions")
+        if src_group.ptrs.size != dst_group.ptrs.size:
+            raise ValueError(
+                f"Number of regions of src({src_group.ptrs.size}) and "
+                f"dst({dst_group.ptrs.size}) must match"
+            )
+        if not isinstance(src_regions.spec, KVRegionSpec) or not isinstance(
+            dst_regions.spec, KVRegionSpec
+        ):
+            raise ValueError("Replicated ring mapping requires KV token ranges")
+        src_tokens = src_regions.spec.tokens
+        dst_tokens = dst_regions.spec.tokens
+        if src_tokens is None or dst_tokens is None or src_tokens != dst_tokens:
+            raise ValueError("Replicated ring source and destination token ranges must match")
+
+        src_window, dst_window, bytes_per_token = self._ring_geometry
+        token_end = src_tokens.end + 1
+        token = max(src_tokens.start, token_end - min(src_window, dst_window))
+        runs: list[tuple[int, int, int]] = []
+        while token < token_end:
+            src_slot = token % src_window
+            dst_slot = token % dst_window
+            run_tokens = min(
+                token_end - token,
+                src_window - src_slot,
+                dst_window - dst_slot,
+            )
+            runs.append(
+                (
+                    src_slot * bytes_per_token,
+                    dst_slot * bytes_per_token,
+                    run_tokens * bytes_per_token,
+                )
+            )
+            token += run_tokens
+
+        pairs = [
+            SpecRegionPair(
+                src=SpecRegion(
+                    memory=MemRegionGroup(
+                        ptrs=src_group.ptrs + src_layer_offset + src_run_offset,
+                        bytes_per_region=run_bytes,
+                    ),
+                    spec=src_regions.spec,
+                ),
+                dst=SpecRegion(
+                    memory=MemRegionGroup(
+                        ptrs=dst_group.ptrs + dst_layer_offset + dst_run_offset,
+                        bytes_per_region=run_bytes,
+                    ),
+                    spec=dst_regions.spec,
+                ),
+            )
+            for src_layer_offset, dst_layer_offset in zip(
+                self._src_layer_offsets, self._dst_layer_offsets
+            )
+            for src_run_offset, dst_run_offset, run_bytes in runs
+        ]
+        return pairs[0] if len(pairs) == 1 else pairs
 
 
 class HNDHeadMismatchMapper(RegionMapperBase):
@@ -545,10 +669,20 @@ class AttentionPolicy:
         return not (
             self._mismatch("is_mla", a.is_mla, b.is_mla)
             or self._fail_if(
-                self._ri.cp_size != 1 or peer_ri.cp_size != 1,
-                "cp_size must be 1 for both ranks",
+                self._ri.cp_size != 1 and peer_ri.cp_size != 1,
+                "cp_size must be 1 on at least one side (helix pairs a cp=1 "
+                "context instance with a cp=N generation instance)",
                 local=self._ri.cp_size,
                 peer=peer_ri.cp_size,
+            )
+            or self._fail_if(
+                (self._ri.cp_size != 1 or peer_ri.cp_size != 1)
+                and a.tokens_per_block != b.tokens_per_block,
+                "helix block-interleaved transfer requires equal "
+                "tokens_per_block on both sides (block boundaries must "
+                "coincide for [cp_rank::cp_size] ownership)",
+                local=a.tokens_per_block,
+                peer=b.tokens_per_block,
             )
             or self._mismatch("element_bytes", a.element_bytes, b.element_bytes)
             or self._fail_if(
@@ -608,6 +742,8 @@ class AttentionPolicy:
         peer_bytes_per_layer: int,
         self_buffers_per_layer: int = 1,
         peer_buffers_per_layer: int = 1,
+        self_window_size: int | None = None,
+        peer_window_size: int | None = None,
     ) -> RegionMapperBase:
         """Pick the mapper for one view pair.
 
@@ -631,6 +767,8 @@ class AttentionPolicy:
                 peer_layer_offsets,
                 self_bytes_per_layer,
                 peer_bytes_per_layer,
+                self_window_size=self_window_size,
+                peer_window_size=peer_window_size,
             )
 
         head_match, _ = self.head_match(peer_ri)

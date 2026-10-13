@@ -8,6 +8,7 @@ import time
 from datetime import timedelta
 from pathlib import Path
 
+import cuda.bindings.driver as drv
 import numpy as np
 import pytest
 import torch
@@ -601,3 +602,58 @@ def test_ReqIdsSet_pickle():
     ids2.insert(1)
     ids2.insert(2)
     assert ids1 == ids2
+
+
+def test_UgpuLocalizationHandle():
+    """Test UgpuLocalizationHandle bindings."""
+    if not hasattr(_tb.internal.runtime, 'UgpuLocalizationHandle'):
+        pytest.skip(
+            "UgpuLocalizationHandle binding not available (requires recompilation)"
+        )
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is not available")
+
+    # Test construction
+    handle = _tb.internal.runtime.UgpuLocalizationHandle()
+    assert handle is not None
+
+    # Test supports_ugpu_localization
+    supports_ugpu = handle.supports_ugpu_localization()
+    assert isinstance(supports_ugpu, bool)
+
+    # Skip UGPU-specific tests if UGPU localization is not supported
+    if not supports_ugpu:
+        pytest.skip("UGPU localization is not supported on this system")
+
+    # Test ugpu_malloc and ugpu_free
+    ugpu_id = 0
+    size = 1024  # 1 KB
+    ptr = handle.ugpu_malloc(size, ugpu_id)
+    assert isinstance(ptr, int)
+    assert ptr != 0
+
+    # Free the allocated memory
+    handle.ugpu_free(ptr)
+
+    # Test create UGPU-localized generic allocation handle for virtual memory.
+    # cuMemCreate requires the size to be a multiple of the allocation
+    # granularity (2 MiB on current GPUs); matches production usage in
+    # tensorrt_llm/runtime/kv_cache_manager_v2/_cuda_virt_mem.py.
+    alloc_size = 2 << 20
+    alloc_handle = handle.create_ugpu_localized_allocation_handle(
+        alloc_size,
+        ugpu_id,
+        int(drv.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_NONE),
+        False,
+    )
+    assert isinstance(alloc_handle, int)
+    assert alloc_handle != 0
+    err = drv.cuMemRelease(drv.CUmemGenericAllocationHandle(alloc_handle))
+    if isinstance(err, tuple):
+        err = err[0]
+    assert err == drv.CUresult.CUDA_SUCCESS
+
+    # Test create_ugpu_localized_stream
+    stream_ptr = handle.create_ugpu_localized_stream(ugpu_id)
+    assert isinstance(stream_ptr, int)
+    assert stream_ptr != 0

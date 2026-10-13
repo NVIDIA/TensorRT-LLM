@@ -79,6 +79,7 @@ class PostTransformFeature(str, Enum):
     """Optional lifecycle features that require explicit qualification."""
 
     SEPARATE_DRAFT_MODEL = "separate_draft_model"
+    UGPU_LOCALIZED_WEIGHTS = "ugpu_localized_weights"
 
 
 class PostTransformQualificationReason(str, Enum):

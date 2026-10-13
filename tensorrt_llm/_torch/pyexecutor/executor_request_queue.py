@@ -22,6 +22,7 @@ class RequestQueueItem:
     request: Optional[ExecutorRequest] = None
     _ = dataclasses.KW_ONLY
     child_req_ids: Optional[list] = None
+    ugpu_id: Optional[int] = None
     is_canceled_request: bool = False
     query: Optional[list] = None  # only used in `StarAttention`
     # Only meaningful for control requests. True = drain active/waiting

@@ -137,8 +137,8 @@ struct ActivationParams
     explicit ActivationParams(ActivationType activation_type)
         : activation_type(activation_type)
     {
-        TLLM_CHECK_WITH_INFO(activation_type != ActivationType::SwigluBias,
-            "SwigluBias is not supported in ActivationParams without swiglu_alpha and swiglu_beta");
+        TLLM_CHECK_WITH_INFO(activation_type != ActivationType::SwigluBias && activation_type != ActivationType::SiTu,
+            "SwigluBias and SiTu are not supported in ActivationParams without alpha and beta");
     }
 
     ActivationParams(

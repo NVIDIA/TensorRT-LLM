@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """
 Attention Data Parallelism (ADP) abstractions.
 
@@ -19,6 +22,7 @@ from __future__ import annotations
 
 import heapq
 import math
+import os
 import random
 from abc import ABC, abstractmethod
 from collections import OrderedDict, namedtuple
@@ -99,6 +103,7 @@ class RankState:
     rank: int
     num_active_requests: int = 0
     num_active_tokens: int = 0
+    has_inflight_transfer: int = 0
     iter_stats: RankIterStatsPayload = field(default_factory=RankIterStatsPayload)
 
     def copy_iter_stats_from(self, iter_stats_payload: RankIterStatsPayload | None) -> None:
@@ -112,6 +117,7 @@ class RankState:
             self.rank,
             self.num_active_requests,
             self.num_active_tokens,
+            self.has_inflight_transfer,
             *self.iter_stats.serialize(),
         ]
 
@@ -119,9 +125,16 @@ class RankState:
     def deserialize(cls, data: list[int]) -> RankState:
         """Deserialize from a flat list received via allgather."""
         values = list(data)
-        rank_state_prefix_field_count = 3
+        legacy_prefix_field_count = 3
+        rank_state_prefix_field_count = 4
+        iter_stats_field_count = len(fields(RankIterStatsPayload))
+        # Accept the previous full payload shape so rolling unit fixtures and
+        # persisted diagnostics remain readable. Runtime ranks always run the
+        # same binary and emit the new shape below.
+        if len(values) == legacy_prefix_field_count + iter_stats_field_count:
+            values.insert(legacy_prefix_field_count, 0)
         rank_state_fields = fields(cls)[:rank_state_prefix_field_count]
-        max_field_count = rank_state_prefix_field_count + len(fields(RankIterStatsPayload))
+        max_field_count = rank_state_prefix_field_count + iter_stats_field_count
         if len(values) < 1:
             raise ValueError("RankState payload is missing required field rank")
         if len(values) > max_field_count:
@@ -140,6 +153,7 @@ class RankState:
             rank=rank_values[0],
             num_active_requests=rank_values[1],
             num_active_tokens=rank_values[2],
+            has_inflight_transfer=rank_values[3],
             iter_stats=RankIterStatsPayload.deserialize(values[rank_state_prefix_field_count:]),
         )
 
@@ -163,8 +177,21 @@ class ADPRouter(ABC):
 
     needs_prefix_matches: bool = False
 
-    def __init__(self, dist: Distributed):
+    def __init__(
+        self,
+        dist: Distributed,
+        kv_cache_manager=None,
+        async_transfer_manager=None,
+    ):
         self.dist = dist
+        self.kv_cache_manager = kv_cache_manager
+        self.async_transfer_manager = async_transfer_manager
+
+    def _has_inflight_transfer(self) -> int:
+        return int(
+            self.async_transfer_manager is not None
+            and self.async_transfer_manager.has_any_inflight_requests()
+        )
 
     @classmethod
     def create(
@@ -181,8 +208,7 @@ class ADPRouter(ABC):
             kv_cache_manager: KV cache manager instance (may be None).
             attention_dp_config: AttentionDpConfig instance (may be None).
             async_transfer_manager: PyExecutor's AsyncTransferManager, used by
-                KVCacheAwareADPRouter to account for KV-transfer-in-progress
-                requests in per-rank load.  Ignored by DefaultADPRouter.
+                the routers to account for KV-transfer-in-progress requests.
 
         Returns:
             A KVCacheAwareADPRouter if config requests it and the
@@ -221,7 +247,11 @@ class ADPRouter(ABC):
                 account_for_in_transfer=attention_dp_config.kv_cache_routing_account_for_in_transfer,
             )
 
-        return DefaultADPRouter(dist=dist)
+        return DefaultADPRouter(
+            dist=dist,
+            kv_cache_manager=kv_cache_manager,
+            async_transfer_manager=async_transfer_manager,
+        )
 
     @abstractmethod
     def create_rank_state(
@@ -365,6 +395,7 @@ class DefaultADPRouter(ADPRouter):
             rank=self.dist.tp_rank,
             num_active_requests=len(active_requests),
             num_active_tokens=num_active_tokens,
+            has_inflight_transfer=self._has_inflight_transfer(),
         )
 
     def route_requests(
@@ -514,7 +545,11 @@ class KVCacheAwareADPRouter(ADPRouter):
         async_transfer_manager=None,
         account_for_in_transfer: bool = False,
     ):
-        super().__init__(dist)
+        super().__init__(
+            dist,
+            kv_cache_manager=kv_cache_manager,
+            async_transfer_manager=async_transfer_manager,
+        )
         self.kv_cache_manager = kv_cache_manager
         self.load_balance_weight = load_balance_weight
         self.match_rate_threshold = match_rate_threshold
@@ -564,6 +599,7 @@ class KVCacheAwareADPRouter(ADPRouter):
             rank=self.dist.tp_rank,
             num_active_requests=n_active_for_state,
             num_active_tokens=num_active_tokens,
+            has_inflight_transfer=self._has_inflight_transfer(),
         )
 
     def gather_prefix_matches(
@@ -818,6 +854,16 @@ class ConversationAwareADPRouter(ADPRouter):
     ):
         super().__init__(dist)
         self._conv_to_rank: "OrderedDict[str, int]" = OrderedDict()
+        # Uncached-prefill estimate for the V2 scheduler's long-prefill
+        # demotion: within a conversation the prompt only grows and the
+        # previous turn's prompt is what the cache holds, so uncached ~=
+        # prompt_len - previous prompt_len; an unseen conversation is an
+        # opener (uncached == prompt_len). One int per conversation, evicted
+        # with _conv_to_rank. Published only while demotion is enabled.
+        self._publish_uncached_estimate_enabled = (
+            int(os.environ.get("TLLM_V2_CTX_DEMOTE_UNCACHED_TOKENS", "0")) > 0
+        )
+        self._conv_last_prompt: "OrderedDict[str, int]" = OrderedDict()
         self._max_sessions = max(1, int(max_sessions))
         self._fair_share_multiplier = max(1.0, float(fair_share_multiplier))
         self._new_conv_placement = (
@@ -855,7 +901,22 @@ class ConversationAwareADPRouter(ADPRouter):
         self._conv_to_rank[conv_id] = rank
         self._conv_to_rank.move_to_end(conv_id)
         while len(self._conv_to_rank) > self._max_sessions:
-            self._conv_to_rank.popitem(last=False)
+            evicted, _ = self._conv_to_rank.popitem(last=False)
+            self._conv_last_prompt.pop(evicted, None)
+
+    def _publish_uncached_estimate(self, req_item, conv_id: "str | None") -> None:
+        """Estimate the request's uncached prefill from the conversation's
+        previous prompt length and publish it on the request (see __init__)."""
+        if not self._publish_uncached_estimate_enabled or req_item.request is None:
+            return
+        prompt = _num_input_tokens(req_item.request)
+        prev = self._conv_last_prompt.get(conv_id) if conv_id is not None else None
+        req_item.request.py_uncached_prefill_tokens = (
+            prompt if prev is None else max(prompt - prev, 0)
+        )
+        if conv_id is not None:
+            self._conv_last_prompt[conv_id] = prompt
+            self._conv_last_prompt.move_to_end(conv_id)
 
     def _assign_new_conversation_explicit_dp_ranks(
         self,
@@ -886,6 +947,7 @@ class ConversationAwareADPRouter(ADPRouter):
                 and all_ranks_num_active_requests[target_dp_rank] < max_num_active_requests
             ):
                 all_ranks_num_active_requests[target_dp_rank] += 1
+                self._publish_uncached_estimate(req_item, conv_id)
                 all_ranks_new_requests[target_dp_rank].append(req_item)
                 if conv_id is not None:
                     self._record_target_rank(conv_id, target_dp_rank)
@@ -922,13 +984,16 @@ class ConversationAwareADPRouter(ADPRouter):
             max_num_active_requests,
         )
 
-        # 2) Loose soft cap for spreading new conversations across ranks; sticky
-        #    returns may exceed it (hard cap), so it is re-bumped after the loop.
+        # 2) Soft cap for spreading new conversations across ranks, clamped to
+        #    the per-rank seq-slot capacity: every placement path must respect
+        #    max_num_active_requests or a rank can be routed more requests than
+        #    it has slots (matches the Default and prefix routers).
         expected_num_active_requests = self._expected_num_active_requests(
             all_ranks_num_active_requests,
             len(remaining_unscheduled),
             tp_size,
             multiplier=self._fair_share_multiplier,
+            hard_cap=max_num_active_requests,
         )
 
         def _least_loaded(soft_cap: int) -> int:
@@ -977,6 +1042,7 @@ class ConversationAwareADPRouter(ADPRouter):
                     # Bind this new conversation to its first-turn rank.
                     self._record_target_rank(conv_id, rank)
 
+            self._publish_uncached_estimate(req_item, conv_id)
             all_ranks_new_requests[rank].append(req_item)
             all_ranks_num_active_requests[rank] += 1
 

@@ -259,6 +259,33 @@ class TestWarmupCleanup(unittest.TestCase):
             calls.count("empty_cache"), 0, f"Helix CP should skip all warmup cleanup; got {calls}"
         )
 
+    def test_duplicate_autotuner_warmup_shape_is_skipped(self):
+        model_engine, resource_manager = _build_engine_and_resource_manager()
+        kv_cache_manager = resource_manager.get_resource_manager(
+            ResourceManagerType.KV_CACHE_MANAGER
+        )
+        token_num_upper_bound = min(
+            model_engine.max_num_tokens,
+            model_engine.batch_size * (model_engine.max_seq_len - 1),
+        )
+        num_tokens = kv_cache_manager.get_num_available_tokens(
+            token_num_upper_bound=token_num_upper_bound,
+            max_num_draft_tokens=model_engine.original_max_draft_len,
+        )
+        model_engine._completed_autotuner_warmup_num_tokens = num_tokens
+
+        with (
+            patch.object(model_engine, "_create_warmup_request") as create_request,
+            _capture_tllm_logs() as logs,
+        ):
+            model_engine._run_autotuner_warmup(resource_manager)
+
+        create_request.assert_not_called()
+        self.assertTrue(
+            any("Skipping duplicate autotuner warmup" in record for record in logs),
+            logs,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -31,6 +31,7 @@ from ._common import (
     CacheTier,
     LayerId,
     MemAddress,
+    PageIndex,
     PageStatus,
 )
 from ._config import (
@@ -38,10 +39,12 @@ from ._config import (
     CacheTierConfig,
     DataRole,
     DiskCacheTierConfig,
+    GpuCacheTierConfig,
     KVCacheDesc,
     SwaScratchReuseConfig,
 )
 from ._copy_engine import CopyTask, batched_copy
+from ._cuda_virt_mem import is_device_localization_supported
 from ._event_manager import KVCacheEventDiff
 from ._eviction_controller import EvictablePage, PerLevelEvictionController
 from ._exceptions import LogicError, OutOfPagesError
@@ -57,10 +60,12 @@ from ._storage._config import BufferAttr, BufferId, LayerAttr, SlotDesc, Storage
 from ._storage._core import (
     DiskCacheLevelStorage,
     GpuCacheLevelStorage,
+    GpuPoolGroup,
     HostCacheLevelStorage,
     PoolGroupBase,
     PoolGroupIndex,
     PoolIndex,
+    PoolIndex0,
     Slot,
     SlotId,
 )
@@ -74,6 +79,7 @@ from ._utils import (
     div_up,
     filled_array2d,
     filled_list,
+    get_current_device_id,
     get_uniform_attribute,
     intersect,
     make_typed,
@@ -140,10 +146,16 @@ class CacheLevelManager:
     ) -> CacheLevelStorage:
         match config.tier:
             case CacheTier.GPU_MEM:
+                assert isinstance(config, GpuCacheTierConfig)
                 granularity = CacheLevelManager.cache_tier_granularity(
                     CacheTier.GPU_MEM, config.quota
                 )
-                return GpuCacheLevelStorage(slot_size_lists, slot_count_list, granularity)
+                localized = config.enable_ugpu and is_device_localization_supported(
+                    get_current_device_id()
+                )
+                return GpuCacheLevelStorage(
+                    slot_size_lists, slot_count_list, granularity, localized=localized
+                )
             case CacheTier.HOST_MEM:
                 return HostCacheLevelStorage(slot_size_lists, slot_count_list)
             case CacheTier.DISK:
@@ -316,15 +328,23 @@ class StorageManager:
     def new_gpu_slots(
         self,
         num_slots: TypedIndexList[LifeCycleId, int],
+        ugpu_id: int | None = None,
         migration_recorder: MigrationRecorder | None = None,
         drop_recorder: DropRecorder | None = None,
     ) -> TypedIndexList[LifeCycleId, list[Slot]]:
-        return self.new_slots(GPU_LEVEL, num_slots, migration_recorder, drop_recorder)
+        return self.new_slots(
+            GPU_LEVEL,
+            num_slots,
+            ugpu_id=ugpu_id,
+            migration_recorder=migration_recorder,
+            drop_recorder=drop_recorder,
+        )
 
     def new_slots(
         self,
         level: CacheLevel,
         num_slots: TypedIndexList[LifeCycleId, int],
+        ugpu_id: int | None = None,
         migration_recorder: MigrationRecorder | None = None,
         drop_recorder: DropRecorder | None = None,
     ) -> TypedIndexList[LifeCycleId, list[Slot]]:
@@ -335,26 +355,44 @@ class StorageManager:
                 raise LogicError("StorageManager.new_slots: slot count must be non-negative")
             pg_num_slots[lc2pg[lc]] += num_slots[lc]
         storage = self._levels[level].storage
-        if any(
-            pg_num_slots[pg] > storage.get_num_free_slots(pg)
-            for pg in typed_range(self.num_pool_groups)
-        ):
-            self.prepare_free_slots(level, pg_num_slots, migration_recorder, drop_recorder)
-        assert all(
-            pg_num_slots[pg] <= storage.get_num_free_slots(pg)
-            for pg in typed_range(self.num_pool_groups)
+        localized_gpu_storage = isinstance(storage, GpuCacheLevelStorage) and storage.num_ugpus > 1
+        assert level != GPU_LEVEL or not localized_gpu_storage or ugpu_id is not None, (
+            "ugpu_id must be provided when gpu storage supports localization"
         )
+
+        def free_slots(pg: PoolGroupIndex) -> int:
+            if ugpu_id is not None:
+                return storage.get_num_free_slots(pg, ugpu_id)
+            return storage.get_num_free_slots(pg)
+
+        if any(pg_num_slots[pg] > free_slots(pg) for pg in typed_range(self.num_pool_groups)):
+            self.prepare_free_slots(
+                level,
+                pg_num_slots,
+                ugpu_id=ugpu_id,
+                migration_recorder=migration_recorder,
+                drop_recorder=drop_recorder,
+            )
+        assert all(pg_num_slots[pg] <= free_slots(pg) for pg in typed_range(self.num_pool_groups))
         ret = filled_list(list[Slot](), self.num_life_cycles)
         try:
             for life_cycle in typed_range(self.num_life_cycles):
                 pg_idx = lc2pg[life_cycle]
-                ret[life_cycle] = storage.allocate_multiple(pg_idx, num_slots[life_cycle])
+                if ugpu_id is not None:
+                    ret[life_cycle] = storage.allocate_multiple(
+                        pg_idx, num_slots[life_cycle], ugpu_id
+                    )
+                else:
+                    ret[life_cycle] = storage.allocate_multiple(pg_idx, num_slots[life_cycle])
         except Exception:
             warnings.warn("Exception not expected here. Please report a bug.")
             for lc, slots in typed_enumerate(ret):
                 pg_idx = lc2pg[lc]
                 for s in slots:
-                    storage.release(pg_idx, s)
+                    if ugpu_id is not None:
+                        storage.release(pg_idx, s, ugpu_id)
+                    else:
+                        storage.release(pg_idx, s)
             raise
         return ret
 
@@ -363,6 +401,7 @@ class StorageManager:
         level: CacheLevel,
         pg_idx: PoolGroupIndex,
         num_slots: int,
+        ugpu_id: int | None = None,
         migration_recorder: MigrationRecorder | None = None,
         drop_recorder: DropRecorder | None = None,
     ) -> list[Slot]:
@@ -371,12 +410,30 @@ class StorageManager:
                 "StorageManager.new_slots_for_pool_group: slot count must be non-negative"
             )
         storage = self._levels[level].storage
-        if num_slots > storage.get_num_free_slots(pg_idx):
+        localized_gpu_storage = isinstance(storage, GpuCacheLevelStorage) and storage.num_ugpus > 1
+        assert level != GPU_LEVEL or not localized_gpu_storage or ugpu_id is not None, (
+            "ugpu_id must be provided when gpu storage supports localization"
+        )
+
+        def free_slots() -> int:
+            if ugpu_id is not None:
+                return storage.get_num_free_slots(pg_idx, ugpu_id)
+            return storage.get_num_free_slots(pg_idx)
+
+        if num_slots > free_slots():
             num_slots_list = filled_list(0, self.num_pool_groups)
             num_slots_list[pg_idx] = num_slots
-            self.prepare_free_slots(level, num_slots_list, migration_recorder, drop_recorder)
-        assert num_slots <= storage.get_num_free_slots(pg_idx)
+            self.prepare_free_slots(
+                level,
+                num_slots_list,
+                ugpu_id=ugpu_id,
+                migration_recorder=migration_recorder,
+                drop_recorder=drop_recorder,
+            )
+        assert num_slots <= free_slots()
         try:
+            if ugpu_id is not None:
+                return storage.allocate_multiple(pg_idx, num_slots, ugpu_id)
             return storage.allocate_multiple(pg_idx, num_slots)
         except Exception:
             warnings.warn("Exception not expected here. Please report a bug.")
@@ -425,6 +482,7 @@ class StorageManager:
         self,
         level: CacheLevel,
         requirements: TypedIndexList[PoolGroupIndex, int],
+        ugpu_id: int | None = None,
         migration_recorder: MigrationRecorder | None = None,
         drop_recorder: DropRecorder | None = None,
     ) -> None:
@@ -432,7 +490,14 @@ class StorageManager:
         for pg in typed_range(self.num_pool_groups):
             goals[level, pg] = requirements[pg]
         fallen_pages = make_typed(lambda _: list[Page](), self.num_pool_groups)
-        self._prepare_free_slots(goals, level, fallen_pages, migration_recorder, drop_recorder)
+        self._prepare_free_slots(
+            goals,
+            level,
+            fallen_pages,
+            ugpu_id=ugpu_id,
+            migration_recorder=migration_recorder,
+            drop_recorder=drop_recorder,
+        )
 
     def force_evict(
         self,
@@ -466,6 +531,7 @@ class StorageManager:
         goals: Array2D[CacheLevel, PoolGroupIndex, int],
         lvl_id: CacheLevel,
         fallen_pages: TypedIndexList[PoolGroupIndex, list[Page]],
+        ugpu_id: int | None = None,
         migration_recorder: MigrationRecorder | None = None,
         drop_recorder: DropRecorder | None = None,
     ) -> None:
@@ -475,13 +541,29 @@ class StorageManager:
         ), "Fallen pages must come from upper cache levels"
         storage = self._levels[lvl_id].storage
         ctrl = self._levels[lvl_id].controller
+        localized_gpu_storage = isinstance(storage, GpuCacheLevelStorage) and storage.num_ugpus > 1
+        if localized_gpu_storage:
+            assert ugpu_id is not None, (
+                "ugpu_id must be provided when gpu storage supports localization"
+            )
+
+        def page_matches_target_ugpu(page: EvictablePage) -> bool:
+            return not localized_gpu_storage or page.ugpu_id == ugpu_id
+
+        page_filter = page_matches_target_ugpu if localized_gpu_storage else None
+
+        def get_free_slots(pg: PoolGroupIndex, ugpu_id: int | None = None) -> int:
+            if localized_gpu_storage:
+                return storage.get_num_free_slots(pg, ugpu_id)
+            return storage.get_num_free_slots(pg)
+
         num_to_evict = filled_list(0, self.num_pool_groups)
         held_pages = make_typed(lambda _: list[Page](), self.num_pool_groups)
         for pg_idx in typed_range(self.num_pool_groups):
             goal = goals[lvl_id, pg_idx]
             fallen = len(fallen_pages[pg_idx])
-            old_free_cnt = storage.get_num_free_slots(pg_idx)
-            evictable_cnt = ctrl.num_evictable_pages(pg_idx)
+            old_free_cnt = get_free_slots(pg_idx, ugpu_id)
+            evictable_cnt = ctrl.num_evictable_pages(pg_idx, page_filter)
             num_to_evict[pg_idx] = max(0, min(goal + fallen - old_free_cnt, evictable_cnt))
             fallen_held_cnt = 0  # fallen held pages we must accept in the current level.
             if self.is_last_level(lvl_id):
@@ -498,12 +580,12 @@ class StorageManager:
                 raise OutOfPagesError(
                     "Impossible to meet the goal ({goal} free slots) for group {pg_idx}"
                 )
-        evicted = ctrl.evict(num_to_evict)
+        evicted = ctrl.evict(num_to_evict, page_filter)
         accepted_pages = make_typed(lambda _: list[Page](), self.num_pool_groups)
         is_last_level = self.is_last_level(lvl_id)
         if is_last_level:
             for pg_idx in typed_range(self.num_pool_groups):
-                old_free_cnt = storage.get_num_free_slots(pg_idx)
+                old_free_cnt = get_free_slots(pg_idx, ugpu_id)
                 num_evicted = len(evicted[pg_idx])
                 assert NDEBUG or all(p.status == PageStatus.DROPPABLE for p in evicted[pg_idx])
                 if not NDEBUG:
@@ -515,7 +597,7 @@ class StorageManager:
                 evicted[pg_idx].clear()
                 if not NDEBUG:
                     assert all(p() is None for p in dbg_rawrefs)  # pyright: ignore
-                new_free_cnt = storage.get_num_free_slots(pg_idx)
+                new_free_cnt = get_free_slots(pg_idx, ugpu_id)
                 # GC of some pages may trigger removal of radix tree blocks and some other pages.
                 assert new_free_cnt >= num_evicted + old_free_cnt
                 assert len(held_pages[pg_idx]) <= new_free_cnt
@@ -531,7 +613,7 @@ class StorageManager:
         else:
             assert all(len(g) == 0 for g in held_pages)
             for pg_idx in typed_range(self.num_pool_groups):
-                old_free_cnt = storage.get_num_free_slots(pg_idx)
+                old_free_cnt = get_free_slots(pg_idx, ugpu_id)
                 e = evicted[pg_idx]
                 num_evicted = len(e)
                 fallen_pages[pg_idx][:0] = cast(list[Page], e)
@@ -547,8 +629,9 @@ class StorageManager:
                 goals,
                 CacheLevel(lvl_id + 1),
                 fallen_pages,
-                migration_recorder,
-                drop_recorder,
+                ugpu_id=ugpu_id,
+                migration_recorder=migration_recorder,
+                drop_recorder=drop_recorder,
             )
         assert all(len(f) == 0 for f in fallen_pages)
         # migrate pages
@@ -584,7 +667,24 @@ class StorageManager:
         migration_recorder: MigrationRecorder | None = None,
         defrag: bool = False,  # we are doing defragmentation
     ) -> Sequence[Slot] | None:
-        "Free slots must be prepared before calling this function."
+        """Free slots must be prepared before calling this function.
+
+        Supported migration patterns:
+
+        - Cross-tier migration (e.g. GPU → Host): the destination is always a
+          different tier (Host/Disk), so dst_pool_group operations use the
+          default ugpu_id=0 — correct because Host/Disk pools are not
+          uGPU-aware.
+        - Same-level defragmentation: moves slots within the same tier and
+          same uGPU to eliminate fragmentation after a shrink.
+
+        Not supported:
+
+        - Same-level cross-uGPU migration (moving data between uGPUs within
+          the GPU tier).  If added, dst_pool_group operations
+          (.num_free_slots, .allocate_multiple, .slot_address) would need an
+          explicit target ugpu_id.
+        """
         assert defrag or dst_level != src_level, (
             "dst_level and src_level must be different unless performing defragmentation"
         )
@@ -592,7 +692,11 @@ class StorageManager:
         num_pools = self.num_pools(pool_group_index)
         src_pool_group = self._pool_group(src_level, pool_group_index)
         dst_pool_group = self._pool_group(dst_level, pool_group_index)
-        if dst_pool_group.num_free_slots < num_slots:
+        if isinstance(dst_pool_group, GpuPoolGroup):
+            dst_num_free_slots = dst_pool_group.num_free_slots()
+        else:
+            dst_num_free_slots = dst_pool_group.num_free_slots
+        if dst_num_free_slots < num_slots:
             raise OutOfPagesError("Not enough free slots")
         dst_slots = dst_pool_group.allocate_multiple(num_slots)
         try:
@@ -605,7 +709,10 @@ class StorageManager:
                 assert defrag or src.node_ref is None
                 prior_events.update((dst.ready_event, src.ready_event))
                 dst_addresses = dst_pool_group.slot_address(dst.slot_id)
-                src_addresses = src_pool_group.slot_address(src.slot_id)
+                if isinstance(src_pool_group, GpuPoolGroup):
+                    src_addresses = src_pool_group.slot_address(src.slot_id, src.ugpu_id)
+                else:
+                    src_addresses = src_pool_group.slot_address(src.slot_id)
                 for pool_idx in typed_range(num_pools):
                     tasks_per_pool[pool_idx].append(
                         CopyTask(dst_addresses[pool_idx], src_addresses[pool_idx])
@@ -635,7 +742,10 @@ class StorageManager:
                     scheduled_for_eviction = src.scheduled_for_eviction
                     if scheduled_for_eviction:
                         self.exclude_from_eviction(src)
-                    src_pool_group.release(src)
+                    if isinstance(src_pool_group, GpuPoolGroup):
+                        src_pool_group.release(src, src.ugpu_id)
+                    else:
+                        src_pool_group.release(src)
                     src.set_slot(dst)
                     src.cache_level = dst_level
                     if emit_cache_level_updates:
@@ -692,13 +802,28 @@ class StorageManager:
         return self._slot_desc_list[pool_group_index].slot_size_list
 
     def num_slots(
-        self, pool_group_index: PoolGroupIndex, cache_level: CacheLevel = GPU_LEVEL
+        self,
+        pool_group_index: PoolGroupIndex,
+        cache_level: CacheLevel = GPU_LEVEL,
+        ugpu_id: int | None = None,
     ) -> int:
-        return self._levels[cache_level].storage.num_slots(pool_group_index)
+        storage = self._levels[cache_level].storage
+        assert (
+            cache_level != GPU_LEVEL
+            or not (isinstance(storage, GpuCacheLevelStorage) and storage.num_ugpus > 1)
+            or ugpu_id is not None
+        ), "ugpu_id must be provided when gpu storage supports localization"
+        if isinstance(storage, GpuCacheLevelStorage) and storage.num_ugpus > 1:
+            return storage.num_slots(pool_group_index, ugpu_id)
+        return storage.num_slots(pool_group_index)
 
     def release_slot(self, life_cycle: LifeCycleId, cache_level: CacheLevel, slot: Slot) -> None:
         pg_idx = self.get_pool_group_index(life_cycle)
-        self._levels[cache_level].storage.release(pg_idx, slot)
+        storage = self._levels[cache_level].storage
+        if slot.ugpu_id is not None:
+            storage.release(pg_idx, slot, slot.ugpu_id)
+        else:
+            storage.release(pg_idx, slot)
 
     def schedule_for_eviction(self, page: EvictablePage) -> None:
         if self.is_evictable(page):
@@ -721,7 +846,30 @@ class StorageManager:
     def slot_address(
         self, level: CacheLevel, pg_idx: PoolGroupIndex, slot_id: SlotId, pool_idx: PoolIndex
     ) -> Address:
-        return self._levels[level].storage.slot_address(pg_idx, pool_idx, slot_id)
+        storage = self._levels[level].storage
+        if isinstance(storage, GpuCacheLevelStorage) and storage.num_ugpus > 1:
+            ugpu_id = storage._pool_groups[pg_idx].get_ugpu_id(slot_id)
+            return storage.slot_address(pg_idx, pool_idx, slot_id, ugpu_id)
+        return storage.slot_address(pg_idx, pool_idx, slot_id)
+
+    def get_page_indices_for_slot(self, life_cycle: LifeCycleId, slot_id: SlotId) -> PageIndex:
+        scale = self._slot_to_page_indices[life_cycle][PoolIndex0]
+        return PageIndex(scale * int(self._base_page_index_for_slot(life_cycle, slot_id)))
+
+    def _base_page_index_for_slot(self, life_cycle: LifeCycleId, slot_id: SlotId) -> PageIndex:
+        storage = self._levels[GPU_LEVEL].storage
+        if not (isinstance(storage, GpuCacheLevelStorage) and storage.num_ugpus > 1):
+            return PageIndex(int(slot_id))
+
+        pg_idx = self.get_pool_group_index(life_cycle)
+        pool_group = storage._pool_groups[pg_idx]
+        ugpu_id = pool_group.get_ugpu_id(slot_id)
+        local_idx = pool_group.get_local_slot_index(slot_id, ugpu_id)
+
+        # Shared-pool-pointer execution keeps the canonical uGPU0 pool base and
+        # encodes the uGPU displacement in the same canonical slot-id space
+        # used by the localized allocators.
+        return PageIndex(local_idx + ugpu_id * pool_group._slot_id_offset)
 
     def get_statistics(
         self, level: CacheLevel = GPU_LEVEL
@@ -733,9 +881,13 @@ class StorageManager:
         for pg_idx in typed_range(self.num_pool_groups):
             pg = self._pool_group(level, pg_idx)
             evictable_cnt = self._levels[level].controller.num_evictable_pages(pg_idx)
-            ret[pg_idx] = StorageStatistics(
-                pg.slot_size, pg.num_slots, pg.num_free_slots, evictable_cnt
-            )
+            if isinstance(pg, GpuPoolGroup):
+                total = sum(pg.num_slots(uid) for uid in range(pg.num_ugpus))
+                free = sum(pg.num_free_slots(uid) for uid in range(pg.num_ugpus))
+            else:
+                total = pg.num_slots
+                free = pg.num_free_slots
+            ret[pg_idx] = StorageStatistics(pg.slot_size, total, free, evictable_cnt)
         return ret
 
     def get_utilization(
@@ -766,15 +918,23 @@ class StorageManager:
             p.cache_level == level and lc2pg[p.life_cycle] == pg_idx for p in persistent_pages
         ), "Not enough slots"
         pool_group = self._levels[level].storage._pool_groups[pg_idx]
-        assert new_num_slots < pool_group.num_slots, "Not required for expansion of pools"
-        allocator = pool_group._slot_allocator
+        if isinstance(pool_group, GpuPoolGroup):
+            current_num_slots = pool_group.num_slots(0)
+            allocator = pool_group._slot_allocators[0]
+        else:
+            current_num_slots = pool_group.num_slots
+            allocator = pool_group._slot_allocator
+        assert new_num_slots < current_num_slots, "Not required for expansion of pools"
         # Fast path: when no slot id has ever been issued in the to-be-removed
         # range [new_num_slots, _capacity), there is nothing to migrate.
         # _num_active_slots is a monotone high-water mark of issued ids.
         if allocator._num_active_slots <= new_num_slots:
             allocator.prepare_for_shrink(new_num_slots)
             allocator.finish_shrink()
-            pool_group.resize_pools(new_num_slots)
+            if isinstance(pool_group, GpuPoolGroup):
+                pool_group.resize_pools(new_num_slots, 0)
+            else:
+                pool_group.resize_pools(new_num_slots)
             return
         ctrl = self._levels[level].controller
         # pages with overflow slots and their indices in the eviction queue.
@@ -815,15 +975,24 @@ class StorageManager:
             == allocator._num_active_slots - allocator._target_capacity
         )
         allocator.finish_shrink()
-        pool_group.resize_pools(new_num_slots)
+        if isinstance(pool_group, GpuPoolGroup):
+            pool_group.resize_pools(new_num_slots, 0)
+        else:
+            pool_group.resize_pools(new_num_slots)
 
     def expand_pool_group(
         self, level: CacheLevel, pg_idx: PoolGroupIndex, new_num_slots: int
     ) -> None:
         pool_group = self._levels[level].storage._pool_groups[pg_idx]
-        assert new_num_slots > pool_group.num_slots
-        pool_group.resize_pools(new_num_slots)
-        pool_group._slot_allocator.expand(new_num_slots)
+        if isinstance(pool_group, GpuPoolGroup):
+            current_num_slots = pool_group.num_slots(0)
+            assert new_num_slots > current_num_slots
+            pool_group.resize_pools(new_num_slots, 0)
+            pool_group._slot_allocators[0].expand(new_num_slots)
+        else:
+            assert new_num_slots > pool_group.num_slots
+            pool_group.resize_pools(new_num_slots)
+            pool_group._slot_allocator.expand(new_num_slots)
 
     def adjust_cache_level(
         self,
@@ -1033,12 +1202,23 @@ class StorageManager:
         """Compute slot counts for a cache level from its tier config and ratio.
 
         Applies min_slots constraints (always at least 1 per life cycle).
+
+        Sizing at the floors is deliberate -- a declared constraint batch has to
+        stay resumable -- but it allocates past the configured budget, so say so.
         """
         granularity = CacheLevelManager.cache_tier_granularity(tier_config.tier, tier_config.quota)
-        quota = max(
-            self._min_quota_for_level(slot_size_lists, granularity),
-            round_up(tier_config.quota, granularity),
-        )
+        configured = round_up(tier_config.quota, granularity)
+        min_quota = self._min_quota_for_level(slot_size_lists, granularity)
+        if min_quota > configured:
+            warnings.warn(
+                f"KV cache constraint floors need {min_quota} bytes at cache tier "
+                f"{tier_config.tier}, more than the configured quota of {configured} bytes. "
+                f"The level is sized at {min_quota} bytes so the declared batch stays "
+                f"resumable, which is {min_quota / configured:.2f}x the configured budget. "
+                f"Lower max_batch_size or raise the KV cache quota if that is not acceptable.",
+                stacklevel=2,
+            )
+        quota = max(min_quota, configured)
         return CacheLevelStorage.ratio_to_slot_count_list(
             quota, slot_size_lists, ratio, granularity, self._min_slots
         )

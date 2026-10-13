@@ -51,8 +51,7 @@ cache_transceiver_config:
   # Fabric-VMM bounce buffer, needed for cross-node transfers on NVLink
   # domains: V2 sends pool-to-pool by default, but the KV pool is a
   # plain (non-fabric) allocation, so inter-node cuda_ipc/MNNVL is
-  # impossible and UCX falls back to ~0.4 GB/s host-staged tcp. 512 MiB
-  # measured at ~455 GB/s/GPU. Engages automatically for payloads above
+  # impossible and UCX falls back to host-staged tcp. Engages automatically for payloads above
   # TRTLLM_KV_CACHE_BOUNCE_MIN_BYTES (default 2 MiB) — always true for
   # K3's ~433 MiB per-request recurrent state; no env override needed.
   #

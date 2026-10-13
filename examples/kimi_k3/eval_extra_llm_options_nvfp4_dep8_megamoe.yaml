@@ -1,0 +1,44 @@
+# Kimi K3 NVFP4 on DEP8 with the MegaMoE CuteDSL backend (2 nodes x 4 GPU).
+#
+# DEP8 aggregated MegaMoE. It holds the MoE backend as the single difference
+# from the CUTLASS DEP8 config (eval_extra_llm_options_nvfp4_dep8.yaml) and
+# lowers max_batch_size. Do not record scores or job ids in this file.
+#
+# max_batch_size 8, not 32: at EP8 the V2 Mamba manager's minimum KV quota
+# scales with resident sequences, and aggregated DEP8 measured need=14.39 GiB
+# at batch 32 against a ~6-7 GiB quota. 8 is also what the DEP16 MegaMoE eval
+# config and the DEP8 disagg gen worker use, which keeps this comparable to
+# both.
+#
+# moe_config.max_num_tokens is deliberately ABSENT. For CUTLASS it is a
+# per-call chunking bound and the DEP8 CUTLASS config's 131072 is harmless; for
+# MEGAMOE_* the same key is the SymmBuffer capacity, further divided by ep_size
+# under attention-DP. Carrying it over would over-provision the generation
+# SymmBuffer ~32x and eat the KV cache.
+#
+# MegaMoE uses MNNVL symmetric memory, so both nodes must sit in ONE NVL72
+# domain: pin them with sbatch -w to a single nvl72dNNN rack or the rendezvous
+# fails with "invalid resource handle".
+#
+# Requires the construction-time FP8 KDA path selected from the checkpoint's
+# FP8 datatype; allocating those weights as BF16 would OOM DEP8 before reading
+# a single weight.
+tensor_parallel_size: 8
+enable_attention_dp: true
+moe_expert_parallel_size: 8
+max_batch_size: 8
+max_num_tokens: 8192
+max_seq_len: 8192
+trust_remote_code: true
+disable_overlap_scheduler: false
+enable_chunked_prefill: true
+cuda_graph_config:
+  enable_padding: true
+  max_batch_size: 8
+moe_config:
+  backend: MEGAMOE_CUTEDSL
+  use_low_precision_moe_combine: true
+kv_cache_config:
+  enable_block_reuse: false
+  free_gpu_memory_fraction: 0.25
+  tokens_per_block: 64

@@ -31,10 +31,10 @@ namespace kernels
 
 #define NumThreadsPerCta 512
 
-template <int32_t TileSizePerCtaQ, int32_t HeadDimPerCta, bool IsE4m3Bmm, typename DtypeO, typename DtypePartialO>
+template <int32_t TileSizePerCtaQ, int32_t HeadDimPerCta, typename DtypeO, typename DtypePartialO>
 __global__ void __launch_bounds__(NumThreadsPerCta, 2) fmhaReductionKernel(fmha::KernelParams const params,
-    bool isTokenSparse, bool groupsTokensHeadsQ, bool supportsVarSparseMlaTopKLens, int32_t numCtasForReduction,
-    int32_t numCtasForAllHeads, int32_t headDimV, int32_t numHeadDimCtasV)
+    bool isTokenSparse, bool groupsTokensHeadsQ, bool supportsVarSparseMlaTopKLens, float softmaxPScale,
+    int32_t numCtasForReduction, int32_t numCtasForAllHeads, int32_t headDimV, int32_t numHeadDimCtasV)
 {
 
     // clang-format off
@@ -245,9 +245,8 @@ __global__ void __launch_bounds__(NumThreadsPerCta, 2) fmhaReductionKernel(fmha:
         if (attentionSinksPtr != nullptr)
         {
             float attentionSinkVal = exp2f(attentionSinksPtr[localHeadIdxO] * M_LOG2E - maxVal * softmaxScaleLog2);
-            // Multiply the attention sink value by 448.f if the MMA data type is e4m3 as the sum value
-            // has also included the 448.f quantization scale.
-            sumVal += IsE4m3Bmm ? attentionSinkVal * 448.f : attentionSinkVal;
+            // Multiply the attention sink value by the quantization scale included in the sum value.
+            sumVal += attentionSinkVal * softmaxPScale;
         }
 
         // Stores the final softmax stats values to global memory if needed (Helix attention, which
@@ -256,8 +255,8 @@ __global__ void __launch_bounds__(NumThreadsPerCta, 2) fmhaReductionKernel(fmha:
         {
             // The softmaxScale.
             float softmaxScale = (softmaxScaleLog2 * (1.f / M_LOG2E));
-            // The sumScale to unscale the 448.f quantization scale from P.
-            float sumScale = IsE4m3Bmm ? (1.f / 448.f) : 1.f;
+            // The sumScale to unscale the softmaxPScale quantization scale from P.
+            float sumScale = 1.f / softmaxPScale;
             // The final max and sum values.
             float2 stats{maxVal * softmaxScale, sumVal * sumScale};
             // Store the final max and sum values to global memory.
@@ -265,9 +264,9 @@ __global__ void __launch_bounds__(NumThreadsPerCta, 2) fmhaReductionKernel(fmha:
         }
 
         // The final normalized scale.
-        // If the output data type is e4m3, make sure that sumVal is divided by the quantization scale
-        // (448.f), so 1.0f / (sumVal / 448.f) = 448.f / sumVal.
-        float normalizedScale{IsE4m3Bmm ? (448.f / sumVal) : (1.0f / sumVal)};
+        // Make sure that sumVal is divided by the quantization scale, so
+        // 1.0f / (sumVal / softmaxPScale) = softmaxPScale / sumVal.
+        float normalizedScale{softmaxPScale / sumVal};
         float2 normalizedScale2{normalizedScale, normalizedScale};
 
         // Apply the normalized scale to the reduced O values.
@@ -297,15 +296,15 @@ __global__ void __launch_bounds__(NumThreadsPerCta, 2) fmhaReductionKernel(fmha:
     {                                                                                                                  \
         if (kernelMeta.mDataTypeO == DATA_TYPE_E4M3)                                                                   \
         {                                                                                                              \
-            kernel = &fmhaReductionKernel<TileSizePerCtaQ, HeadDimPerCta, true, __nv_fp8_e4m3, half>;                  \
+            kernel = &fmhaReductionKernel<TileSizePerCtaQ, HeadDimPerCta, __nv_fp8_e4m3, half>;                        \
         }                                                                                                              \
         else if (kernelMeta.mDataTypeO == DATA_TYPE_FP16)                                                              \
         {                                                                                                              \
-            kernel = &fmhaReductionKernel<TileSizePerCtaQ, HeadDimPerCta, true, half, half>;                           \
+            kernel = &fmhaReductionKernel<TileSizePerCtaQ, HeadDimPerCta, half, half>;                                 \
         }                                                                                                              \
         else if (kernelMeta.mDataTypeO == DATA_TYPE_BF16)                                                              \
         {                                                                                                              \
-            kernel = &fmhaReductionKernel<TileSizePerCtaQ, HeadDimPerCta, true, __nv_bfloat16, __nv_bfloat16>;         \
+            kernel = &fmhaReductionKernel<TileSizePerCtaQ, HeadDimPerCta, __nv_bfloat16, __nv_bfloat16>;               \
         }                                                                                                              \
         else                                                                                                           \
         {                                                                                                              \
@@ -317,11 +316,11 @@ __global__ void __launch_bounds__(NumThreadsPerCta, 2) fmhaReductionKernel(fmha:
         TLLM_CHECK_WITH_INFO(kernelMeta.mDataTypeQ == kernelMeta.mDataTypeO, "Not implemented");                       \
         if (kernelMeta.mDataTypeQ == DATA_TYPE_FP16)                                                                   \
         {                                                                                                              \
-            kernel = &fmhaReductionKernel<TileSizePerCtaQ, HeadDimPerCta, false, half, half>;                          \
+            kernel = &fmhaReductionKernel<TileSizePerCtaQ, HeadDimPerCta, half, half>;                                 \
         }                                                                                                              \
         else if (kernelMeta.mDataTypeQ == DATA_TYPE_BF16)                                                              \
         {                                                                                                              \
-            kernel = &fmhaReductionKernel<TileSizePerCtaQ, HeadDimPerCta, false, __nv_bfloat16, __nv_bfloat16>;        \
+            kernel = &fmhaReductionKernel<TileSizePerCtaQ, HeadDimPerCta, __nv_bfloat16, __nv_bfloat16>;               \
         }                                                                                                              \
         else                                                                                                           \
         {                                                                                                              \
@@ -346,7 +345,7 @@ __global__ void __launch_bounds__(NumThreadsPerCta, 2) fmhaReductionKernel(fmha:
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 void runFmhaReduction(TllmGenFmhaKernelMetaInfo const& kernelMeta, fmha::KernelParams const& params,
-    int32_t multiProcessorCount, cudaStream_t stream)
+    float softmaxPScale, int32_t multiProcessorCount, cudaStream_t stream)
 {
 
     // Skip the kernel if not using the separate reduction kernel.
@@ -414,7 +413,7 @@ void runFmhaReduction(TllmGenFmhaKernelMetaInfo const& kernelMeta, fmha::KernelP
     config.numAttrs = 1;
 
     // Select the kernel function pointer.
-    void (*kernel)(fmha::KernelParams const, bool, bool, bool, int32_t, int32_t, int32_t, int32_t) = nullptr;
+    void (*kernel)(fmha::KernelParams const, bool, bool, bool, float, int32_t, int32_t, int32_t, int32_t) = nullptr;
     if (headDimPerCtaV == 64)
     {
         SELECT_FMHA_REDUCTION_KERNEL_WITH_HEAD_DIM_PER_CTA(64);
@@ -435,9 +434,10 @@ void runFmhaReduction(TllmGenFmhaKernelMetaInfo const& kernelMeta, fmha::KernelP
     // Launch the kernel.
     bool const hasVarSparseMlaTopKLens = isDynamicTokenSparse(static_cast<SparseType>(kernelMeta.mSparseAttn))
         && params.ptrSparseMlaTopKLens != nullptr;
-    TLLM_CUDA_CHECK(cudaLaunchKernelEx(&config, kernel, params,
-        isTokenSparse(static_cast<SparseType>(kernelMeta.mSparseAttn)), kernelMeta.mGroupsTokensHeadsQ,
-        hasVarSparseMlaTopKLens, numCtasForReduction, numCtasForAllHeads, kernelMeta.mHeadDimV, numHeadDimCtasV));
+    TLLM_CUDA_CHECK(
+        cudaLaunchKernelEx(&config, kernel, params, isTokenSparse(static_cast<SparseType>(kernelMeta.mSparseAttn)),
+            kernelMeta.mGroupsTokensHeadsQ, hasVarSparseMlaTopKLens, softmaxPScale, numCtasForReduction,
+            numCtasForAllHeads, kernelMeta.mHeadDimV, numHeadDimCtasV));
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

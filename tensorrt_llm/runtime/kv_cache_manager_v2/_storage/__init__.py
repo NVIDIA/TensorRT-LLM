@@ -14,7 +14,7 @@
 # limitations under the License.
 
 from ._config import BufferId
-from ._core import CacheLevelStorage
+from ._core import CacheLevelStorage, GpuCacheLevelStorage
 
 # These are re-exported for external use
-__all__ = ["CacheLevelStorage", "BufferId"]
+__all__ = ["CacheLevelStorage", "GpuCacheLevelStorage", "BufferId"]

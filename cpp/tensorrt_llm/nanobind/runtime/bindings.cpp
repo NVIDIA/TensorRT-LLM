@@ -41,6 +41,7 @@
 #include "tensorrt_llm/runtime/mcastGPUBuffer.h"
 #include "tensorrt_llm/runtime/speculativeDecodingMode.h"
 #include "tensorrt_llm/runtime/torchView.h"
+#include "tensorrt_llm/runtime/ugpu/ugpu_utils.h"
 #include "tensorrt_llm/runtime/virtualMemory.h"
 
 #include <ATen/ATen.h>
@@ -53,6 +54,7 @@
 #include <nanobind/stl/bind_vector.h>
 #include <nanobind/stl/filesystem.h>
 #include <nanobind/stl/optional.h>
+#include <nanobind/stl/pair.h>
 #include <nanobind/stl/shared_ptr.h>
 #include <nanobind/stl/unique_ptr.h>
 #include <nanobind/trampoline.h>
@@ -343,6 +345,101 @@ void initBindings(nb::module_& m)
         .value("UB", tensorrt_llm::kernels::AllReduceStrategyType::UB)
         .value("ONESHOT", tensorrt_llm::kernels::AllReduceStrategyType::ONESHOT)
         .value("TWOSHOT", tensorrt_llm::kernels::AllReduceStrategyType::TWOSHOT);
+
+    // UGPU Localization Handle bindings
+    nb::class_<tensorrt_llm::ugpu::UgpuLocalizationHandle>(m, "UgpuLocalizationHandle")
+        .def(nb::init<>(), nb::call_guard<nb::gil_scoped_release>())
+        .def("supports_ugpu_localization", &tensorrt_llm::ugpu::UgpuLocalizationHandle::supportsUgpuLocalization,
+            nb::call_guard<nb::gil_scoped_release>())
+        .def("supports_ugpu_memory_localization",
+            &tensorrt_llm::ugpu::UgpuLocalizationHandle::supportsUgpuMemoryLocalization,
+            nb::call_guard<nb::gil_scoped_release>())
+        .def("supports_ugpu_compute_localization",
+            &tensorrt_llm::ugpu::UgpuLocalizationHandle::supportsUgpuComputeLocalization,
+            nb::call_guard<nb::gil_scoped_release>())
+        .def(
+            "ugpu_malloc",
+            [](tensorrt_llm::ugpu::UgpuLocalizationHandle& self, size_t size, int ugpuId) -> uintptr_t
+            {
+                void* ptr = nullptr;
+                self.ugpuMalloc(&ptr, size, ugpuId);
+                return reinterpret_cast<uintptr_t>(ptr);
+            },
+            nb::arg("size"), nb::arg("ugpu_id"), "Allocate UGPU localized memory and return pointer as integer address",
+            nb::call_guard<nb::gil_scoped_release>())
+        .def(
+            "ugpu_free",
+            [](tensorrt_llm::ugpu::UgpuLocalizationHandle& self, uintptr_t ptr)
+            { self.ugpuFree(reinterpret_cast<void*>(ptr)); },
+            nb::arg("ptr"), "Free UGPU localized memory from integer address", nb::call_guard<nb::gil_scoped_release>())
+        .def(
+            "create_ugpu_localized_allocation_handle",
+            [](tensorrt_llm::ugpu::UgpuLocalizationHandle& self, size_t size, int ugpuId,
+                unsigned int requestedHandleTypes, bool gpuDirectRDMACapable,
+                std::optional<unsigned int> usage) -> uintptr_t
+            {
+                CUmemGenericAllocationHandle const handle = usage.has_value()
+                    ? self.createUgpuLocalizedAllocationHandle(
+                        size, ugpuId, requestedHandleTypes, gpuDirectRDMACapable, *usage)
+                    : self.createUgpuLocalizedAllocationHandle(
+                        size, ugpuId, requestedHandleTypes, gpuDirectRDMACapable);
+                return static_cast<uintptr_t>(handle);
+            },
+            nb::arg("size"), nb::arg("ugpu_id"), nb::arg("requested_handle_types"), nb::arg("gpu_direct_rdma_capable"),
+            nb::arg("usage") = nb::none(),
+            "Create UGPU localized generic allocation handle and return it as an integer",
+            nb::call_guard<nb::gil_scoped_release>())
+        .def(
+            "try_create_ugpu_localized_allocation_handle",
+            [](tensorrt_llm::ugpu::UgpuLocalizationHandle& self, size_t size, int ugpuId,
+                unsigned int requestedHandleTypes, bool gpuDirectRDMACapable,
+                unsigned int usage) -> std::pair<int, uintptr_t>
+            {
+                CUmemGenericAllocationHandle handle{};
+                CUresult const result = self.tryCreateUgpuLocalizedAllocationHandle(
+                    &handle, size, ugpuId, requestedHandleTypes, gpuDirectRDMACapable, usage);
+                return {static_cast<int>(result), static_cast<uintptr_t>(handle)};
+            },
+            nb::arg("size"), nb::arg("ugpu_id"), nb::arg("requested_handle_types"), nb::arg("gpu_direct_rdma_capable"),
+            nb::arg("usage"), "Try to create a localized allocation and return (CUresult, handle)",
+            nb::call_guard<nb::gil_scoped_release>())
+        .def("get_ugpu_localized_allocation_granularity",
+            &tensorrt_llm::ugpu::UgpuLocalizationHandle::getUgpuLocalizedAllocationGranularity, nb::arg("ugpu_id"),
+            nb::arg("requested_handle_types"), nb::arg("gpu_direct_rdma_capable"), nb::arg("usage"),
+            "Get minimum allocation granularity for a localized VMM allocation",
+            nb::call_guard<nb::gil_scoped_release>())
+        .def(
+            "try_get_ugpu_localized_allocation_granularity",
+            [](tensorrt_llm::ugpu::UgpuLocalizationHandle& self, int ugpuId, unsigned int requestedHandleTypes,
+                bool gpuDirectRDMACapable, unsigned int usage) -> std::pair<int, size_t>
+            {
+                size_t granularity{};
+                CUresult const result = self.tryGetUgpuLocalizedAllocationGranularity(
+                    &granularity, ugpuId, requestedHandleTypes, gpuDirectRDMACapable, usage);
+                return {static_cast<int>(result), granularity};
+            },
+            nb::arg("ugpu_id"), nb::arg("requested_handle_types"), nb::arg("gpu_direct_rdma_capable"), nb::arg("usage"),
+            "Try to get localized VMM granularity and return (CUresult, granularity)",
+            nb::call_guard<nb::gil_scoped_release>())
+        .def(
+            "create_ugpu_localized_stream",
+            [](tensorrt_llm::ugpu::UgpuLocalizationHandle& self, int ugpuId) -> uintptr_t
+            {
+                CUstream stream = self.createUgpuLocalizedStream(ugpuId);
+                return reinterpret_cast<uintptr_t>(stream);
+            },
+            nb::arg("ugpu_id"),
+            "Get a process-lifetime cached UGPU localized stream as an integer address; callers must not destroy it",
+            nb::call_guard<nb::gil_scoped_release>())
+        .def("get_ugpu_compute_sm_counts", &tensorrt_llm::ugpu::UgpuLocalizationHandle::getUgpuComputeSmCounts,
+            nb::arg("ugpu_id"), "Get (localized partition SM count, full-device SM count), or (0, 0) when unavailable",
+            nb::call_guard<nb::gil_scoped_release>())
+        .def(
+            "get_reserved_remainder_stream",
+            [](tensorrt_llm::ugpu::UgpuLocalizationHandle& self) -> uintptr_t
+            { return reinterpret_cast<uintptr_t>(self.getReservedRemainderStream()); },
+            "Get the borrowed process-lifetime remainder Green Context stream, or 0 when unavailable",
+            nb::call_guard<nb::gil_scoped_release>());
 
     // Initialize MoeLoadBalancer bindings
     initMoeBindings(m);

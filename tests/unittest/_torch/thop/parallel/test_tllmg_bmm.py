@@ -182,9 +182,9 @@ def quant_fp8(x_fp32: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
 
 
 @pytest.mark.skipif(
-    getSMVersion() not in [100],
+    getSMVersion() not in [100, 107],
     reason=
-    "The kernel is only supported with compute capability 100. Current compute capability is %d."
+    "The kernel is only supported with compute capability 100 or 107. Current compute capability is %d."
     % getSMVersion(),
 )
 @pytest.mark.parametrize(

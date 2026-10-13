@@ -802,8 +802,13 @@ void launchCoopBlockKernel(Data const& data, uint32_t numThreadsHist, void* stre
 //
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+// launchDynBlockKernel launches min(max(tokens*32, MaxExperts), 1024) threads, i.e. 1024 for the
+// 1024-expert tier now reachable from the post-topK path. Without a bound the 1024-expert
+// instantiation compiled to 89 regs/thread -> 89*1024 > 64K -> cudaLaunchKernelEx "too many
+// resources requested for launch". The <=576-expert tiers already use <=62 regs, so the bound only
+// affects the large tiers.
 template <typename KernelParams>
-__global__ void routingIndicesDynBlockKernel(KernelParams params)
+__global__ void __launch_bounds__(1024) routingIndicesDynBlockKernel(KernelParams params)
 {
     using OutputT = typename KernelParams::OutputT;
     using InputT = typename KernelParams::InputT;
@@ -1324,6 +1329,20 @@ void launchClusterKernelForBlockDim(Data const& data, void* stream)
 
 void launchClusterKernel(Data const& data, void* stream)
 {
+    // Post-topK (mPtrScores == nullptr) only permutes: the cluster kernel is thread-per-expanded-index
+    // there, so the 512-thread variant is not bound by the warp-per-token limit below (capacity
+    // NumBlocksPerCluster * 512 = 4096 tokens). Measured on B200 (896 experts/top-16, E=1024 tier),
+    // same GPU: 512 threads (2 experts/thread) 4.3/4.6/4.8/5.1/5.4/6.1 us at 17/32/64/224/512/1024
+    // tokens vs 256 threads (4 experts/thread) 5.2/5.7/6.2 us at 16/32/64 and 1024 threads
+    // (1 expert/thread) ~5.9 us at 224-512. At 4096 tokens the 512-thread variant degrades to ~9.8 us
+    // (16 expanded indices per thread), so beyond 1024 tokens keep the 1024-thread launch.
+    static constexpr int PostTopKClusterBlockDim512MaxNumTokens = 1024;
+    if (data.mPtrScores == nullptr && data.mNumTokens <= PostTopKClusterBlockDim512MaxNumTokens)
+    {
+        launchClusterKernelForBlockDim<ClusterBlockDim512>(data, stream);
+        return;
+    }
+
     // Each warp owns one token, so the reduced-thread cluster variants have lower token capacity.
     // Use them only where the requested token count fits; otherwise keep the original 1024-thread launch.
     if (data.mNumTokens <= MaxNumTokensClusterScores256)
@@ -1635,6 +1654,17 @@ bool prefersCoopBlockKernel(RoutingPreprocessType preprocessType, RoutingPostpro
         && dispatchedMaxExperts <= CoopBlockKernelMaxNumExperts;
 }
 
+bool coopLaunchDisabled()
+{
+    // Read once into a function-static, so the variable must be set before the first call.
+    static bool const disabled = []
+    {
+        char const* env = std::getenv("TLLM_ROUTING_DISABLE_COOP_LAUNCH");
+        return env != nullptr && env[0] == '1';
+    }();
+    return disabled;
+}
+
 void run(Data const& data, void* stream)
 {
     TLLM_CHECK_WITH_INFO(data.mPtrTopKPacked != nullptr || data.mPtrScores != nullptr || data.mPtrTopKIds != nullptr,
@@ -1726,7 +1756,8 @@ void run(Data const& data, void* stream)
 
         launchHistogramScoresKernel(data, maxNumBlocks, numThreadsHist, stream);
 
-        bool const canUseCoop = (smMajor >= 9) && (data.mNumExperts <= 1024) && (data.mPtrPermutedIdxSize != nullptr);
+        bool const canUseCoop = !coopLaunchDisabled() && (smMajor >= 9) && (data.mNumExperts <= 1024)
+            && (data.mPtrPermutedIdxSize != nullptr);
         bool useCoop = false;
         int numBlocksCoop = 0;
 

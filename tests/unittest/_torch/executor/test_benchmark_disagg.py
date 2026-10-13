@@ -101,12 +101,15 @@ class MockBenchmarkExecutor:
         self._benchmark_fill_phase_active = self.is_benchmark_disagg
         self._sync_disagg_transfer_made_progress = False
         self._benchmark_sync_progress_global = False
+        self._benchmark_local_terminal_no_fit = False
+        self._benchmark_has_insufficient_kv_global = False
         self._fill_admit_cap = 0
         self.enable_attention_dp = enable_attention_dp
         self.max_num_active_requests = max_num_active_requests
         self.num_fetch_requests = num_fetch_requests
         self.is_warmup = is_warmup
         self.active_requests = active_requests if active_requests is not None else []
+        self._handle_errors = Mock()
 
         self.dist = Mock()
         self.dist.rank = rank
@@ -282,13 +285,18 @@ class TestFillCompleteADP:
     @pytest.mark.parametrize(
         "allgather_result, expected",
         [
-            pytest.param([(1, False)] * 4, True, id="all_ranks_ready"),
+            pytest.param([(1, False, 1, False)] * 4, True, id="all_ranks_ready"),
             pytest.param(
-                [(1, False), (1, False), (0, False), (1, False)],
+                [
+                    (1, False, 1, False),
+                    (1, False, 1, False),
+                    (0, False, 1, False),
+                    (1, False, 1, False),
+                ],
                 False,
                 id="one_rank_blocked",
             ),
-            pytest.param([(0, False)] * 4, False, id="all_ranks_blocked"),
+            pytest.param([(0, False, 1, False)] * 4, False, id="all_ranks_blocked"),
         ],
     )
     def test_global_gate(self, allgather_result, expected):
@@ -314,9 +322,9 @@ class TestFillCompleteADP:
             num_fetch_requests=4,
             active_requests=reqs,
         )
-        ex.dist.tp_allgather.return_value = [(1, False), (1, False)]
+        ex.dist.tp_allgather.return_value = [(1, False, 1, False), (1, False, 1, False)]
         ex._is_benchmark_disagg_fill_complete(ScheduledRequests())
-        ex.dist.tp_allgather.assert_called_once_with((1, False))
+        ex.dist.tp_allgather.assert_called_once_with((1, False, 1, False))
 
     def test_single_rank_skips_model_parallel_allgather(self):
         """A singleton group returns local status without a collective."""
@@ -355,7 +363,7 @@ class TestFillCompleteADPRouterImbalance:
             num_fetch_requests=8192,
             active_requests=reqs,
         )
-        ex.dist.tp_allgather.return_value = [(1, False)] * 32
+        ex.dist.tp_allgather.return_value = [(1, False, 1, False)] * 32
         assert ex._is_benchmark_disagg_fill_complete(ScheduledRequests()) is True
 
     def test_gate_blocked_when_overflow_requests_in_init(self):
@@ -369,7 +377,7 @@ class TestFillCompleteADPRouterImbalance:
             num_fetch_requests=8192,
             active_requests=reqs,
         )
-        ex.dist.tp_allgather.return_value = [(0, False)] + [(1, False)] * 31
+        ex.dist.tp_allgather.return_value = [(0, False, 1, False)] + [(1, False, 1, False)] * 31
         assert ex._is_benchmark_disagg_fill_complete(ScheduledRequests()) is False
 
     def test_gate_blocked_when_sync_transfer_failed(self):
@@ -478,13 +486,13 @@ class TestCheckBenchmarkDisaggGate:
             num_fetch_requests=4,
             active_requests=reqs,
         )
-        ex.dist.tp_allgather.return_value = [(0, False), (0, True)]
+        ex.dist.tp_allgather.return_value = [(0, False, 1, False), (0, True, 1, False)]
 
         can_forward, should_retry = ex._check_benchmark_disagg_gate(ScheduledRequests(), False)
 
         assert can_forward is False
         assert should_retry is True
-        ex.dist.tp_allgather.assert_called_once_with((0, False))
+        ex.dist.tp_allgather.assert_called_once_with((0, False, 1, False))
         mock_time.sleep.assert_not_called()
 
     @pytest.mark.parametrize(
@@ -517,8 +525,8 @@ class TestCheckBenchmarkDisaggGate:
         )
         ex.dist.cp_size = cp_size
         ex.dist.world_size = tp_size * cp_size
-        all_rank_status = [(1, False)] * (tp_size * cp_size)
-        all_rank_status[-1] = (0, False)
+        all_rank_status = [(1, False, 1, False)] * (tp_size * cp_size)
+        all_rank_status[-1] = (0, False, 1, False)
         gather = getattr(ex.dist, gather_name)
         gather.return_value = all_rank_status
 
@@ -528,7 +536,7 @@ class TestCheckBenchmarkDisaggGate:
         assert can_forward is False
         assert should_retry is True
         assert ex._benchmark_fill_phase_active is True
-        gather.assert_called_once_with((1, False))
+        gather.assert_called_once_with((1, False, 1, False))
         if gather_name == "tp_cp_allgather":
             ex.dist.tp_allgather.assert_not_called()
         mock_time.sleep.assert_called_once_with(0.1)
@@ -731,6 +739,10 @@ class TestPrepareAndScheduleBatchNoBlock:
         ex.kv_cache_manager = Mock()
         ex.is_benchmark_disagg = True
         ex._benchmark_fill_phase_active = True
+        ex._benchmark_local_terminal_no_fit = False
+        ex._benchmark_has_insufficient_kv_global = False
+        ex._benchmark_sync_progress_global = False
+        ex._sync_disagg_transfer_made_progress = False
         ex._fill_admit_cap = 0
         ex.enable_attention_dp = False
         ex.num_fetch_requests = 0
@@ -1092,18 +1104,7 @@ class TestADPRouterPerRankCap:
 
 
 class TestFailFastDuringBenchmarkFill:
-    """Verify that the insufficient-KV fail-fast distinguishes healthy fill
-    progress from a stalled fill.
-
-    During healthy fill, the scheduler can fit at least one INIT request for
-    KV transfer.  If all benchmark requests have been fetched and the scheduler
-    cannot fit any INIT request, the fill gate can never open and we should
-    return an explicit error instead of hanging.
-
-    This covers the CI regression where the fill-phase guard suppressed the
-    fail-fast forever and
-    `test_disaggregated_benchmark_gen_only_insufficient_kv` timed out.
-    """
+    """Verify rank-safe insufficient-KV fail-fast during benchmark fill."""
 
     def _make_executor(
         self,
@@ -1113,14 +1114,18 @@ class TestFailFastDuringBenchmarkFill:
         num_fetch_requests=8,
         fitting_init_requests=None,
     ):
-        """Build a minimal PyExecutor stub for _prepare_and_schedule_batch."""
+        """Build a minimal PyExecutor stub for scheduling and fill gating."""
         from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 
         ex = object.__new__(PyExecutor)
         ex.benchmark_req_queues_size = 8
-        ex.kv_cache_transceiver = Mock()
+        ex.kv_cache_transceiver = _make_transceiver(transfer_complete=False)
         ex.is_benchmark_disagg = True
         ex._benchmark_fill_phase_active = fill_phase_active
+        ex._benchmark_local_terminal_no_fit = False
+        ex._benchmark_has_insufficient_kv_global = False
+        ex._benchmark_sync_progress_global = False
+        ex._sync_disagg_transfer_made_progress = False
         ex._fill_admit_cap = 0
         ex.enable_attention_dp = False
         ex.num_fetch_requests = num_fetch_requests
@@ -1154,32 +1159,34 @@ class TestFailFastDuringBenchmarkFill:
         if fitting_init_requests is None:
             fitting_init_requests = []
         ex._schedule = Mock(return_value=(scheduled, fitting_init_requests, 0))
-
         return ex
 
-    def test_stalled_fill_phase_kills_after_all_requests_fetched(self):
-        """A fill phase with no fitting INIT requests is a deadlock."""
+    def _prepare_and_check_gate(self, ex):
+        result, _ = ex._prepare_and_schedule_batch()
+        assert result is not None
+        return ex._check_benchmark_disagg_gate(result, False)
+
+    def test_stalled_fill_fails_at_shared_gate(self):
+        """The fail-fast vote is merged into the shared fill-gate gather."""
         ex = self._make_executor(fill_phase_active=True)
 
         result, _ = ex._prepare_and_schedule_batch()
 
-        assert result is None, (
-            "Fail-fast SHOULD fire during a stalled fill phase — "
-            "otherwise the fill gate never opens"
-        )
+        assert result is not None
+        ex.dist.tp_allgather.assert_not_called()
+        can_forward, should_retry = ex._check_benchmark_disagg_gate(result, False)
+        assert (can_forward, should_retry) == (False, False)
+        assert ex._benchmark_has_insufficient_kv_global is True
         ex._handle_errors.assert_called_once()
 
-    def test_healthy_fill_phase_does_not_kill(self):
-        """During healthy fill, a fitting INIT request means progress exists."""
+    def test_healthy_fill_does_not_fail(self):
         fitting_req = _make_active_request(in_init=True)
         ex = self._make_executor(fill_phase_active=True, fitting_init_requests=[fitting_req])
 
-        result, _ = ex._prepare_and_schedule_batch()
+        can_forward, should_retry = self._prepare_and_check_gate(ex)
 
-        assert result is not None, (
-            "Fail-fast should NOT fire while the scheduler can still fit an "
-            "INIT request for KV transfer"
-        )
+        assert (can_forward, should_retry) == (False, True)
+        assert ex._benchmark_local_terminal_no_fit is False
         ex._handle_errors.assert_not_called()
 
     def test_partial_transfer_admission_uses_only_admitted_requests(self) -> None:
@@ -1199,24 +1206,17 @@ class TestFailFastDuringBenchmarkFill:
         ex._check_disagg_transfer_progress_when_idle.assert_called_once_with(
             0, [admitted_req], False, False, is_idle=True
         )
-        ex._handle_errors.assert_not_called()
+        ex.dist.tp_allgather.assert_not_called()
 
-    def test_fill_with_no_init_requests_does_not_kill(self):
-        """The final fill iteration is ready for the gate, not terminal."""
+    def test_fill_with_no_init_requests_does_not_fail(self):
         ex = self._make_executor(fill_phase_active=True, num_init_requests=0)
 
-        result, _ = ex._prepare_and_schedule_batch()
+        can_forward, should_retry = self._prepare_and_check_gate(ex)
 
-        assert result is not None
+        assert (can_forward, should_retry) == (True, False)
         ex._handle_errors.assert_not_called()
 
-    def test_transfer_admission_backpressure_does_not_kill(self, monkeypatch):
-        """NVBug 6438658: admission backpressure is not KV exhaustion.
-
-        Args:
-            monkeypatch: Pytest fixture used to select asynchronous transfer
-                behavior.
-        """
+    def test_transfer_admission_backpressure_does_not_fail(self, monkeypatch):
         monkeypatch.delenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY", raising=False)
         monkeypatch.delenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP", raising=False)
         fitting_req = _make_active_request(in_init=True)
@@ -1225,14 +1225,11 @@ class TestFailFastDuringBenchmarkFill:
 
         result, _ = ex._prepare_and_schedule_batch()
 
-        assert result is not None, (
-            "Fail-fast should NOT fire when the scheduler fit an INIT request "
-            "that transfer admission temporarily deferred"
-        )
-        ex._apply_disagg_transfer_admission.assert_called_once_with([fitting_req])
+        assert result is not None
+        assert ex._benchmark_local_terminal_no_fit is False
+        ex.dist.tp_allgather.assert_not_called()
         ex._prepare_disagg_gen_init.assert_called_once_with([])
         ex._check_disagg_gen_cache_transfer_status.assert_called_once_with(1)
-        ex._check_disagg_ctx_cache_transfer_status.assert_not_called()
         ex._handle_errors.assert_not_called()
 
     @pytest.mark.parametrize(
@@ -1243,89 +1240,83 @@ class TestFailFastDuringBenchmarkFill:
             pytest.param(True, 2, 2, "tp_cp_allgather", id="attention_dp_with_cp"),
         ],
     )
-    def test_model_parallel_peer_terminal_no_fit_kills_all_ranks(
+    def test_model_parallel_peer_terminal_no_fit_fails_all_ranks(
         self, enable_attention_dp, tp_size, cp_size, gather_name
     ):
-        """A terminal peer makes every model-parallel rank fail together.
-
-        Args:
-            enable_attention_dp: Whether to simulate attention data parallelism.
-            tp_size: Tensor-parallel group size.
-            cp_size: Context-parallel group size.
-            gather_name: Expected model-parallel allgather method.
-        """
         fitting_req = _make_active_request(in_init=True)
         ex = self._make_executor(fill_phase_active=True, fitting_init_requests=[fitting_req])
         ex.enable_attention_dp = enable_attention_dp
         ex.dist.tp_size = tp_size
         ex.dist.cp_size = cp_size
         ex.dist.world_size = tp_size * cp_size
-        all_rank_status = [(True, False)] * (tp_size * cp_size)
-        all_rank_status[-1] = (True, True)
+        all_rank_status = [(0, False, 1, False)] * (tp_size * cp_size)
+        all_rank_status[-1] = (0, False, 1, True)
         gather = getattr(ex.dist, gather_name)
         gather.return_value = all_rank_status
         ex._apply_disagg_transfer_admission = Mock(return_value=([], True))
         ex._check_disagg_transfer_progress_when_idle = Mock()
 
         result, _ = ex._prepare_and_schedule_batch()
+        assert result is not None
+        gather.assert_not_called()
 
-        assert result is None
-        gather.assert_called_once_with((True, False))
+        can_forward, should_retry = ex._check_benchmark_disagg_gate(result, False)
+
+        assert (can_forward, should_retry) == (False, False)
+        gather.assert_called_once_with((0, False, 1, False))
         if gather_name == "tp_cp_allgather":
             ex.dist.tp_allgather.assert_not_called()
         ex._handle_errors.assert_called_once()
-        assert "one or more requests" in ex._handle_errors.call_args.args[0]
 
-    def test_attention_dp_backpressure_without_terminal_peer_does_not_kill(self):
-        """Admission backpressure stays non-terminal on every rank."""
+    def test_attention_dp_backpressure_without_terminal_peer_does_not_fail(self):
         fitting_req = _make_active_request(in_init=True)
         ex = self._make_executor(fill_phase_active=True, fitting_init_requests=[fitting_req])
         ex.enable_attention_dp = True
         ex.dist.tp_size = 2
         ex.dist.world_size = 2
         ex.dist.tp_allgather.return_value = [
-            (True, False),
-            (True, False),
+            (0, False, 1, False),
+            (0, False, 1, False),
         ]
         ex._apply_disagg_transfer_admission = Mock(return_value=([], True))
         ex._check_disagg_transfer_progress_when_idle = Mock()
 
         result, _ = ex._prepare_and_schedule_batch()
-
         assert result is not None
-        ex.dist.tp_allgather.assert_called_once_with((True, False))
+        ex.dist.tp_allgather.assert_not_called()
+
+        can_forward, should_retry = ex._check_benchmark_disagg_gate(result, False)
+
+        assert (can_forward, should_retry) == (False, True)
+        ex.dist.tp_allgather.assert_called_once_with((0, False, 1, False))
         ex._handle_errors.assert_not_called()
 
     def test_model_parallel_waits_until_all_ranks_have_fetched(self):
-        """A terminal rank cannot fail peers that are still fetching."""
         ex = self._make_executor(fill_phase_active=True)
         ex.dist.tp_size = 2
         ex.dist.world_size = 2
         ex.dist.tp_allgather.return_value = [
-            (True, True),
-            (False, False),
+            (0, False, 1, True),
+            (0, False, 0, False),
         ]
         ex._check_disagg_transfer_progress_when_idle = Mock()
 
         result, _ = ex._prepare_and_schedule_batch()
+        can_forward, should_retry = ex._check_benchmark_disagg_gate(result, False)
 
-        assert result is not None
-        ex.dist.tp_allgather.assert_called_once_with((True, True))
+        assert (can_forward, should_retry) == (False, True)
+        ex.dist.tp_allgather.assert_called_once_with((0, False, 1, True))
         ex._handle_errors.assert_not_called()
 
-    def test_mid_fetch_does_not_kill(self):
-        """Before all benchmark requests are fetched, keep filling."""
+    def test_mid_fetch_does_not_fail(self):
         ex = self._make_executor(fill_phase_active=True, num_fetch_requests=4)
 
-        result, _ = ex._prepare_and_schedule_batch()
+        can_forward, should_retry = self._prepare_and_check_gate(ex)
 
-        assert result is not None, (
-            "Fail-fast should NOT fire before the full benchmark queue has been fetched"
-        )
+        assert (can_forward, should_retry) == (False, True)
         ex._handle_errors.assert_not_called()
 
     def test_post_fill_skips_fail_fast_vote(self):
-        """Decode iterations must not pay for the fill-only collective."""
         ex = self._make_executor(fill_phase_active=False)
         ex.enable_attention_dp = True
         ex.dist.tp_size = 2
@@ -1335,36 +1326,32 @@ class TestFailFastDuringBenchmarkFill:
         result, _ = ex._prepare_and_schedule_batch()
 
         assert result is not None
+        assert ex._benchmark_local_terminal_no_fit is False
         ex.dist.tp_allgather.assert_not_called()
         ex._handle_errors.assert_not_called()
 
     @pytest.mark.parametrize(
-        "fill_active, is_warmup, expected_alive",
+        "fill_active, is_warmup, expected_failure",
         [
-            pytest.param(True, False, False, id="stalled_fill_kills"),
-            pytest.param(False, False, True, id="post_fill_suppresses"),
-            pytest.param(False, True, True, id="warmup_suppresses"),
-            pytest.param(True, True, True, id="both_suppress"),
+            pytest.param(True, False, True, id="stalled_fill_fails"),
+            pytest.param(False, False, False, id="post_fill_suppresses"),
+            pytest.param(False, True, False, id="warmup_suppresses"),
+            pytest.param(True, True, False, id="both_suppress"),
         ],
     )
-    def test_suppression_matrix(self, fill_active, is_warmup, expected_alive):
-        """Parametrized test covering all (fill_phase, warmup) combinations."""
+    def test_suppression_matrix(self, fill_active, is_warmup, expected_failure):
         ex = self._make_executor(fill_phase_active=fill_active)
         ex._is_warmup = is_warmup
 
         result, _ = ex._prepare_and_schedule_batch()
+        if fill_active and not is_warmup:
+            ex._check_benchmark_disagg_gate(result, False)
 
-        if expected_alive:
-            assert result is not None, (
-                f"fill_active={fill_active}, warmup={is_warmup}: should NOT kill requests"
-            )
-            ex._handle_errors.assert_not_called()
-        else:
-            assert result is None, (
-                f"fill_active={fill_active}, warmup={is_warmup}: "
-                "SHOULD kill requests (genuine KV insufficiency)"
-            )
+        assert ex._benchmark_has_insufficient_kv_global is expected_failure
+        if expected_failure:
             ex._handle_errors.assert_called_once()
+        else:
+            ex._handle_errors.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -1407,7 +1394,7 @@ class TestFillPhaseEndToEnd:
         ex.max_num_active_requests = self.MAX_BATCH_SIZE
         ex.dist = Mock(rank=0, tp_size=self.TP_SIZE)
         ex.dist.tp_allreduce.return_value = 0
-        ex.dist.tp_allgather.return_value = [(0, False)] * self.TP_SIZE
+        ex.dist.tp_allgather.return_value = [(0, False, 0, False)] * self.TP_SIZE
         ex.is_shutdown = False
         ex._is_warmup = False
         ex.enable_iter_perf_stats = False
@@ -1465,7 +1452,7 @@ class TestFillPhaseEndToEnd:
         ready_reqs = [_make_active_request() for _ in range(5)]
         ex.active_requests = init_reqs + ready_reqs
 
-        ex.dist.tp_allgather = Mock(return_value=[(0, False), (1, False)])
+        ex.dist.tp_allgather = Mock(return_value=[(0, False, 1, False), (1, False, 1, False)])
         assert not ex._is_benchmark_disagg_fill_complete(batch), (
             "Gate should not open: 3 requests still in INIT"
         )
@@ -1473,7 +1460,7 @@ class TestFillPhaseEndToEnd:
         # Phase 2b: Healthy fill keeps making progress, so fail-fast must not
         # fire even though some active requests remain in INIT.
         ex._schedule = Mock(return_value=(ScheduledRequests(), [init_reqs[0]], 0))
-        ex.dist.tp_allgather = Mock(return_value=[(True, False), (True, False)])
+        ex.dist.tp_allgather = Mock(return_value=[(0, False, 1, False), (0, False, 1, False)])
         result, _ = ex._prepare_and_schedule_batch()
         assert result is not None, (
             "Fail-fast must not kill requests while the scheduler can still fit INIT requests"
@@ -1483,7 +1470,7 @@ class TestFillPhaseEndToEnd:
         for req in init_reqs:
             req.is_disagg_generation_init_state = False
         ex.kv_cache_transceiver.check_gen_transfer_complete.return_value = True
-        ex.dist.tp_allgather = Mock(return_value=[(1, False), (1, False)])
+        ex.dist.tp_allgather = Mock(return_value=[(1, False, 1, False), (1, False, 1, False)])
 
         assert ex._is_benchmark_disagg_fill_complete(batch), (
             "Gate should open: all requests past transfer, transceiver complete"

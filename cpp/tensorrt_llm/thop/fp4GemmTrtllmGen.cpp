@@ -19,7 +19,6 @@
 #include "tensorrt_llm/thop/thUtils.h"
 
 #include <ATen/cuda/EmptyTensor.h>
-#include <ATen/native/cuda/Resize.h>
 
 #include <cuda_fp16.h>
 

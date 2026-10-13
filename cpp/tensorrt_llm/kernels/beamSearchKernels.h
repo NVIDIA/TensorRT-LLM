@@ -27,8 +27,12 @@ TRTLLM_NAMESPACE_BEGIN
 
 namespace kernels
 {
-static size_t constexpr kMaxBeamWidth = 1024;           // Max beam width supported in TRT-LLM now
-static size_t constexpr kMaxBeamWidthForV1 = 8;         // Max beam width for V1 workflow (V2 for larger)
+static size_t constexpr kMaxBeamWidth = 1024; // Max beam width supported in TRT-LLM now
+// V1 beam-search three-stage top-K kernels are broken on sm_107 (Rubin) — they return small
+// constant indices (0 / beam_width) instead of the real argmax, leading to all-zero generated
+// tokens (NVBug 6067124). Force V2 (Air-TopK) for all beam widths until the V1 kernels are
+// fixed and re-validated on Rubin.
+static size_t constexpr kMaxBeamWidthForV1 = 0;         // Max beam width for V1 workflow (V2 for larger)
 static size_t constexpr kMaxBeamWidthArrayLength = 8;   // Max length of beam width array of a request
 static size_t constexpr kThreadForSmallBeamWidth = 256; // Max count of thread for stage 1 in V1 workflow
 static size_t constexpr kMaxVPartStage1 = 128;          // Max vocab part count for stage 1 in V1 workflow

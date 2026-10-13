@@ -224,6 +224,15 @@ class CuteDslB12xFusedMoE(CuteDslFusedMoE):
     ) -> torch.Tensor:
         plan = require_comm_plan(self, ctx)
         x = ctx.x
+        # Join the async input quantization: the scheduler forks the inherited
+        # ``quantize_input_async`` (which runs the polymorphic
+        # ``self.quantize_input`` on the MoE aux stream). On the
+        # prefill-via-CUTLASS route that is a real FP4 quant kernel and
+        # ``CutlassFusedMoE.run_moe`` below never joins the event; on the b12x
+        # decode route ``quantize_input`` is a pass-through, so the wait is a
+        # no-op.
+        if ctx.x_ready_event is not None:
+            ctx.x_ready_event.wait()
         if self._route_to_cutlass(x):
             # ``CutlassFusedMoE.run_moe`` forwards ``output_dtype`` straight
             # into the C++ ``trtllm::fused_moe`` op, which requires a concrete

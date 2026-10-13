@@ -145,25 +145,6 @@ common-files: &common_files |
         tensorrt_llm/_torch/cute_dsl_kernels/blackwell/custom_pipeline.py |
         tensorrt_llm/_torch/cute_dsl_kernels/blackwell/dense_blockscaled_gemm_persistent.py |
         tensorrt_llm/_torch/cute_dsl_kernels/blackwell/utils.py |
-        tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/__init__.py |
-        tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/blocked_scale.py |
-        tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/contract.py |
-        tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/custom_ext.py |
-        tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/dynamic_mainloop.py |
-        tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/epilogue_refactor.py |
-        tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/fc1_fc2_fuse_sched.py |
-        tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/grid_sync.py |
-        tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/iket_compat.py |
-        tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/kernel_fc12.py |
-        tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/megamoe_constants.py |
-        tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/megamoe_kernel.py |
-        tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/moe_persistent_scheduler.py |
-        tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/moe_utils.py |
-        tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/ptx_helpers.py |
-        tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/sf_swizzle.py |
-        tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/sym_buffer.py |
-        tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/token_comm.py |
-        tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/topk_reduce.py |
         tensorrt_llm/_torch/cute_dsl_utils.py |
         tensorrt_llm/_torch/debug/__init__.py |
         tensorrt_llm/_torch/debug/debug_hook.py |
@@ -919,25 +900,6 @@ legacy-files: &legacy_files |
         tensorrt_llm/_torch/cute_dsl_kernels/blackwell/custom_pipeline.py |
         tensorrt_llm/_torch/cute_dsl_kernels/blackwell/dense_blockscaled_gemm_persistent.py |
         tensorrt_llm/_torch/cute_dsl_kernels/blackwell/utils.py |
-        tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/__init__.py |
-        tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/blocked_scale.py |
-        tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/contract.py |
-        tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/custom_ext.py |
-        tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/dynamic_mainloop.py |
-        tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/epilogue_refactor.py |
-        tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/fc1_fc2_fuse_sched.py |
-        tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/grid_sync.py |
-        tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/iket_compat.py |
-        tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/kernel_fc12.py |
-        tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/megamoe_constants.py |
-        tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/megamoe_kernel.py |
-        tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/moe_persistent_scheduler.py |
-        tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/moe_utils.py |
-        tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/ptx_helpers.py |
-        tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/sf_swizzle.py |
-        tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/sym_buffer.py |
-        tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/token_comm.py |
-        tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/topk_reduce.py |
         tensorrt_llm/_torch/cute_dsl_utils.py |
         tensorrt_llm/_torch/debug/__init__.py |
         tensorrt_llm/_torch/debug/debug_hook.py |
@@ -1579,6 +1541,8 @@ repos:
     rev: v6.0.0
     hooks:
     -   id: check-added-large-files
+        exclude: |
+            (?x)^(.*cubin.cpp | .*cubin.h | .*cubin.tar.zst | .*KernelMetaInfo\.h)$
     -   id: check-merge-conflict
     -   id: check-symlinks
     -   id: detect-private-key
@@ -1616,6 +1580,9 @@ repos:
     hooks:
     -   id: clang-format
         types_or: [c++, c, cuda]
+        exclude: |
+            (?x)^(.*cubin.cpp$ | .*_cubin.h | .*KernelMetaInfo\.h)$
+        require_serial: true
 -   repo: https://github.com/cheshirekow/cmake-format-precommit
     rev: v0.6.10
     hooks:
@@ -1627,7 +1594,7 @@ repos:
         additional_dependencies:
         - tomli
         # add ignore words list
-        args: ["-L", "Mor,ans,thirdparty,subtiles,PARD,pard,indx,therefrom", "--skip", "ATTRIBUTIONS-*.md,*.svg", "--skip", "security_scanning/*", "--skip", "tensorrt_llm/_torch/visual_gen/jit_kernels/*"]
+        args: ["-L", "Mor,ans,thirdparty,subtiles,PARD,pard,indx,therefrom", "--skip", "ATTRIBUTIONS-*.md,*.svg", "--skip", "security_scanning/*", "--skip", "tensorrt_llm/_torch/visual_gen/jit_kernels/*", "--skip", "tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/*"]
         exclude: 'scripts/attribution/data/cas/.*$'
 -   repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.9.4

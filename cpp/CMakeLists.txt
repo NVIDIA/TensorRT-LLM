@@ -581,18 +581,14 @@ print(os.path.dirname(torch.__file__),end='');"
   set(CMAKE_CUDA_ARCHITECTURES_BACKUP ${CMAKE_CUDA_ARCHITECTURES})
   find_package(Torch REQUIRED)
   set(CMAKE_CUDA_ARCHITECTURES ${CMAKE_CUDA_ARCHITECTURES_BACKUP})
-  message(
-    STATUS
-      "Removing Torch generated placeholder CUDA architecture flags: -gencode arch=compute_80,code=sm_80."
-  )
-  string(REPLACE "-gencode arch=compute_80,code=sm_80 " "" CMAKE_CUDA_FLAGS_NEW
+  # Remove Torch-generated -gencode flags to avoid conflicts with CMake's native
+  # CMAKE_CUDA_ARCHITECTURES handling
+  foreach(CUDA_ARCH IN LISTS CMAKE_CUDA_ARCHITECTURES_ORIG)
+    string(REPLACE "-gencode arch=compute_${CUDA_ARCH},code=sm_${CUDA_ARCH} "
+                   "" CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS}")
+  endforeach()
+  string(REPLACE "-gencode arch=compute_80,code=sm_80 " "" CMAKE_CUDA_FLAGS
                  "${CMAKE_CUDA_FLAGS}")
-  if("${CMAKE_CUDA_FLAGS_NEW}" STREQUAL "${CMAKE_CUDA_FLAGS}")
-    message(
-      FATAL_ERROR
-        "Torch didn't generate expected placeholder CUDA architecture flags.")
-  endif()
-  set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS_NEW}")
 
   add_compile_definitions(TORCH_CUDA=1)
 

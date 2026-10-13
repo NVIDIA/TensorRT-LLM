@@ -1,17 +1,16 @@
 # Kimi K3 disaggregated serving (ctx/gen split)
 
 Configuration pair + deployment wiring for running Kimi K3 with separate
-context (prefill) and generation (decode) servers. Status: **validated
-end-to-end on hardware** (GB300 NVL72, 1 ctx + 1 gen, DEP16 both sides,
-GSM8K accuracy parity with aggregated serving) — see the caveats section
-for constraints.
+context (prefill) and generation (decode) servers. Status: validated
+end-to-end on GB300 NVL72 (1 ctx + 1 gen, DEP16 both sides). See the caveats
+section for constraints.
 
 ## Files
 
 | File | Purpose |
 |---|---|
 | `ctx_config.yaml` | Context-server extra LLM-API options (DEP16, overlap scheduler off, no spec decode) |
-| `gen_config_no_sa.yaml` | Generation-server options, no speculative decoding (CUDA graphs ON by default: GSM8K 96.89, 765/2138 tok/s @c64/c256 vs aggregated 643/1972; null `cuda_graph_config` for token-parity debugging). A suffix-automaton (SA) speculative-decoding variant lands together with K3 SA support. |
+| `gen_config_no_sa.yaml` | Generation-server options, no speculative decoding (CUDA graphs ON by default; null `cuda_graph_config` for token-parity debugging). A suffix-automaton (SA) speculative-decoding variant lands together with K3 SA support. |
 | `disagg_proxy_config.yaml` | `trtllm-serve disaggregated` proxy config (1 ctx + 1 gen) |
 | `benchmark_kimi_k3_dep16.yaml` | Config for the SLURM benchmark harness (`examples/disaggregated/slurm/benchmark/submit.py`) |
 
@@ -24,12 +23,15 @@ for constraints.
   K3's replicated KDA state and is rejected at peer registration — do
   not deviate. Hetero DEP with attention-DP on both sides is believed
   correct but unvalidated.
-- **Ctx sizing = DEP16**: DEP16 is the smallest verified fit
-  (~193 GiB weights/rank on GB300). A DEP8 ctx is estimated at
-  ~273 GiB/rank for weights alone (extrapolating the 1.5 TB checkpoint:
-  replicated share ~113 GiB + experts/8), leaving no activation headroom
-  on GB300 (288 GiB) and not fitting GB200 (186 GiB). Treat DEP8-ctx as
-  ruled out on GB200 and an open (likely negative) question on GB300.
+- **Ctx sizing**: DEP8 works on GB300 (1 ctx + 1 gen, both DEP8;
+  `benchmark_kimi_k3_dep8.yaml`). DEP16 remains the safer default.
+  - FP8-resident attention keeps the replicated KDA projections at FP8 on
+    device instead of expanding them to BF16 and is on by default. DEP8
+    additionally needs a `max_batch_size` low enough for the V2 Mamba minimum
+    (which scales with resident sequences), and an explicit
+    `moe_config.max_num_tokens` on the TRTLLM worker.
+  - **GB200 is still ruled out** for this weight footprint. DEP16 remains the
+    safer default.
 - **`transceiver_runtime: PYTHON` is mandatory**: `auto` resolves to the
   C++ transceiver, which throws at construction for K3's
   `MixedMambaHybridCacheManager`.
@@ -44,7 +46,7 @@ for constraints.
   pool-to-pool path cannot use inter-node cuda_ipc on MNNVL (the KV pool
   is a plain, non-fabric allocation) and falls back to ~0.4 GB/s
   host-staged tcp; the fabric-VMM bounce buffer restores cuda_ipc/MNNVL
-  eligibility (measured ~455 GB/s/GPU). Bounce engages automatically for payloads above `TRTLLM_KV_CACHE_BOUNCE_MIN_BYTES` (default 2 MiB) — always true for K3's ~433 MiB per-request state.
+  eligibility. Bounce engages automatically for payloads above `TRTLLM_KV_CACHE_BOUNCE_MIN_BYTES` (default 2 MiB) — always true for K3's per-request state.
   The region must fit ONE request's full payload: fixed 433 MiB KDA
   state + ~27 KB/token MLA latent (649 MiB at 8k ISL). A
   512 MiB value makes every 8k transfer fall back to the per-fragment
@@ -145,8 +147,7 @@ python3 examples/disaggregated/slurm/benchmark/submit.py \
 5. **Transfer payload**: each request moves a fixed 433.4 MiB (~454.5 MB)
    KDA state blob ctx → gen in addition to the MLA latent KV
    (~27 KB/token).
-   Within an NVL72 domain this is ~0.9 ms/request (measured; not a
-   bottleneck), but off-fabric paths would pay 11–23 ms — keep ctx and
+   Within an NVL72 domain the transfer is not the bottleneck. Keep ctx and
    gen inside one NVL72 domain.
 6. **Bounce-buffer sizing cliff (silent).** Size `kv_cache_bounce_size_mb`
    to the largest single request's full KV payload (fixed KDA state plus

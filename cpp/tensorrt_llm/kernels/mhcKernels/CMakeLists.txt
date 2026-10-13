@@ -36,3 +36,14 @@ if(BUILD_DEEP_GEMM)
     PRIVATE ${CMAKE_BINARY_DIR}/_deps/deepgemm-src/deep_gemm/include)
   target_compile_definitions(mhcKernels_src PRIVATE TRTLLM_MHC_ENABLE_FUSED_HC)
 endif()
+
+# The tcgen05 TF32 MMA fused-HC kernels (fused_tf32_pmap_gemm.cuh) use SM100
+# cute primitives (SM100_MMA_TF32_TS, SM100_TMEM_LOAD/STORE) that must be
+# emitted from the SM100 *family* binary. Building these for the exact target
+# (e.g. sm_107f under a `-a 107` build) produces a cubin whose tcgen05 MMA fails
+# to launch on Rubin (cudaErrorLaunchFailure). Pin this object library to the
+# SM100 family target (100f) so the tcgen05 instructions are compiled from
+# compute_100 and the resulting sm_100f cubin loads on all SM100-family GPUs
+# including sm107 (Rubin). The FMA fallback kernels in this library are plain
+# CUDA-core code and run correctly from the same 100f binary.
+set_cuda_architectures(mhcKernels_src 100f)

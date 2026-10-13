@@ -93,30 +93,56 @@ struct BatchedGemmOptions : public gemmGatedAct::GemmGatedActOptions
     };
 
     BatchedGemmOptions() = default;
-
     // FIXME We create explicit constructor with all options to WAR stubgen issue in TRT-LLM.
     BatchedGemmOptions(gemm::AllReduceAlgo allReduceAlgo, tg::Dtype biasDtype, gemm::BiasType biasType, int blockK,
         bool clcFastDrain, int clusterDimX, int clusterDimY, int clusterDimZ, gemm::CtaSwizzleType ctaSwizzleType,
         tg::Dtype dtypeAcc, tg::Dtype dtypeA, tg::Dtype dtypeB, tg::Dtype dtypeC, tg::Dtype dtypeMmaA,
         tg::Dtype dtypeMmaB, tg::Dtype dtypeSfC, gemm::EltwiseActType eltwiseActType, bool enablesEarlyExit,
-        bool enablesDelayedEarlyExit, int epilogueLdtmDps, int epilogueLdtmBits, int epilogueTileM, int epilogueTileN,
-        int fallbackClusterDimX, int fallbackClusterDimY, int fallbackClusterDimZ,
-        gemm::FusedBiasShuffleMode fusedBiasShuffleMode, bool fuseLoadSfTask, bool fuseUtccpWithUtcmma,
-        bool gridTriggerSecondaryA, bool gridTriggerSecondaryB, bool gridWaitForPrimaryEarlyExit,
-        bool gridWaitForPrimaryA, bool gridWaitForPrimaryB, bool hoistLoadTaskInit, bool hoistMmaTaskTryWaits, int k,
-        gemm::KernelTraits kernelTraits, gemm::MatrixLayout layoutA, gemm::MatrixLayout layoutB, int m, int mmaK,
-        tg::MmaKind mmaKind, int mmaM, int mmaN, int mmaTileK, bool mockAllReduce, int n, int numEpilogueWarps,
-        int numRegsCastAWarps, int numRegsCopySfLdsSttm, int numRegsCopySparsityInfo, int numRegsPerThreadEpilogueWarp,
-        int numRegsPerThreadNonEpilogueWarp, int numSlicesForSplitK, int numStagesA, int numStagesB, int numStagesMma,
-        int numStagesMmaWithinWorkTile, int numStagesMmaAcrossWorkTile, int numStagesSmemSfA, int numStagesSmemSfB,
+        bool enablesDelayedEarlyExit,
+#ifndef TLLM_PUBLIC_RELEASE
+        bool enablesGlobalPtxKnobs,
+#endif // TLLM_PUBLIC_RELEASE
+        int epilogueLdtmDps, int epilogueLdtmBits, int epilogueTileM, int epilogueTileN, int fallbackClusterDimX,
+        int fallbackClusterDimY, int fallbackClusterDimZ, gemm::FusedBiasShuffleMode fusedBiasShuffleMode,
+        bool fuseLoadSfTask, bool fuseUtccpWithUtcmma, bool gridTriggerSecondaryA, bool gridTriggerSecondaryB,
+        bool gridWaitForPrimaryEarlyExit, bool gridWaitForPrimaryA, bool gridWaitForPrimaryB, bool hoistLoadTaskInit,
+        bool hoistMmaTaskTryWaits, int k, gemm::KernelTraits kernelTraits,
+#ifdef TLLM_RUBIN_FEATURES
+        bool lamportConsumerA, bool lamportConsumerB, bool lamportForceValid, bool lamportProducer,
+#ifdef TLLM_TEST
+        bool lamportSeparateInvalidation,
+#endif // TLLM_TEST
+#endif // TLLM_RUBIN_FEATURES
+        gemm::MatrixLayout layoutA, gemm::MatrixLayout layoutB, int m, int mmaK, tg::MmaKind mmaKind, int mmaM,
+        int mmaN, int mmaTileK, bool mockAllReduce, int n, int numEpilogueWarps, int numRegsCastAWarps,
+        int numRegsCopySfLdsSttm, int numRegsCopySparsityInfo, int numRegsPerThreadEpilogueWarp,
+        int numRegsPerThreadNonEpilogueWarp, int numSlicesForSplitK,
+#ifndef TLLM_PUBLIC_RELEASE
+        int numSlicesForSliceK,
+#endif // TLLM_PUBLIC_RELEASE
+        int numStagesA, int numStagesB, int numStagesMma, int numStagesMmaWithinWorkTile,
+        int numStagesMmaAcrossWorkTile, int numStagesSmemSfA, int numStagesSmemSfB,
+#ifndef TLLM_PUBLIC_RELEASE
+        int numStagesTmemA,
+#endif // TLLM_PUBLIC_RELEASE
         int numStagesTmemSfA, int numStagesTmemSfB, int numStagesWorkId, bool outputDebugTensors, bool patchF2fp,
+#ifdef TLLM_RUBIN_FEATURES
+        bool patchPzo,
+#endif // TLLM_RUBIN_FEATURES
         tg::Dtype perTokenSfDtype, gemm::SchedHostTask schedHostTask, int32_t sfBlockSizeA, int32_t sfBlockSizeB,
         int32_t sfBlockSizeC, tg::SfLayout sfLayoutA, tg::SfLayout sfLayoutB, tg::SfLayout sfLayoutC,
-        int32_t sfReshapeFactor, tg::Sparsity sparsityA, gemm::SplitK splitK, int tileK, int tileM, int tileN,
-        gemm::TileScheduler tileScheduler, bool transposeMmaOutput, bool useCustomizedMma3xNvFp4,
-        bool useCustomMmaSchedule, bool useDeepSeekFp8, bool useFlexibleClusterDims,
-        bool useHoistTryWaitForCustomMmaSchedule, bool useMaxTmemOverlap, bool usePerTokenSfA, bool usePerTokenSfB,
-        bool useShuffledMatrix, bool useTmaStore, bool useTwoTmaLoadWarps, bool useTwoMmaWarps,
+        int32_t sfReshapeFactor,
+#ifndef TLLM_PUBLIC_RELEASE
+        bool sliceK,
+#endif // TLLM_PUBLIC_RELEASE
+        tg::Sparsity sparsityA, gemm::SplitK splitK, int tileK, int tileM, int tileN, gemm::TileScheduler tileScheduler,
+        bool transposeMmaOutput, bool useCustomizedMma3xNvFp4, bool useCustomMmaSchedule, bool useDeepSeekFp8,
+        bool useFlexibleClusterDims, bool useHoistTryWaitForCustomMmaSchedule, bool useMaxTmemOverlap,
+        bool usePerTokenSfA, bool usePerTokenSfB, bool useShuffledMatrix, bool useTmaStore, bool useTwoTmaLoadWarps,
+        bool useTwoMmaWarps,
+#ifdef TLLM_RUBIN_FEATURES
+        bool useUniqueSfA,
+#endif // TLLM_RUBIN_FEATURES
         bool useUnrollLoop2xForMma, int validM, int validN, int validK, int worldSize,
         // GemmGatedActOptions
         gemmGatedAct::ActType actType, bool clampBeforeAct,
@@ -130,21 +156,48 @@ struct BatchedGemmOptions : public gemmGatedAct::GemmGatedActOptions
         : gemmGatedAct::GemmGatedActOptions(
             gemm::GemmOptions(allReduceAlgo, biasDtype, biasType, blockK, clcFastDrain, clusterDimX, clusterDimY,
                 clusterDimZ, ctaSwizzleType, dtypeAcc, dtypeA, dtypeB, dtypeC, dtypeMmaA, dtypeMmaB, dtypeSfC,
-                eltwiseActType, enablesEarlyExit, enablesDelayedEarlyExit, epilogueLdtmDps, epilogueLdtmBits,
-                epilogueTileM, epilogueTileN, fallbackClusterDimX, fallbackClusterDimY, fallbackClusterDimZ,
-                fusedBiasShuffleMode, fuseLoadSfTask, fuseUtccpWithUtcmma, gridTriggerSecondaryA, gridTriggerSecondaryB,
-                gridWaitForPrimaryEarlyExit, gridWaitForPrimaryA, gridWaitForPrimaryB, hoistLoadTaskInit,
-                hoistMmaTaskTryWaits, k, kernelTraits, layoutA, layoutB, m, mmaK, mmaKind, mmaM, mmaN, mmaTileK,
-                mockAllReduce, n, numEpilogueWarps, numRegsCastAWarps, numRegsCopySfLdsSttm, numRegsCopySparsityInfo,
-                numRegsPerThreadEpilogueWarp, numRegsPerThreadNonEpilogueWarp, numSlicesForSplitK, numStagesA,
-                numStagesB, numStagesMma, numStagesMmaWithinWorkTile, numStagesMmaAcrossWorkTile, numStagesSmemSfA,
-                numStagesSmemSfB, numStagesTmemSfA, numStagesTmemSfB, numStagesWorkId, outputDebugTensors, patchF2fp,
+                eltwiseActType, enablesEarlyExit, enablesDelayedEarlyExit,
+#ifndef TLLM_PUBLIC_RELEASE
+                enablesGlobalPtxKnobs,
+#endif // TLLM_PUBLIC_RELEASE
+                epilogueLdtmDps, epilogueLdtmBits, epilogueTileM, epilogueTileN, fallbackClusterDimX,
+                fallbackClusterDimY, fallbackClusterDimZ, fusedBiasShuffleMode, fuseLoadSfTask, fuseUtccpWithUtcmma,
+                gridTriggerSecondaryA, gridTriggerSecondaryB, gridWaitForPrimaryEarlyExit, gridWaitForPrimaryA,
+                gridWaitForPrimaryB, hoistLoadTaskInit, hoistMmaTaskTryWaits, k, kernelTraits,
+#ifdef TLLM_RUBIN_FEATURES
+                lamportConsumerA, lamportConsumerB, lamportForceValid, lamportProducer,
+#ifdef TLLM_TEST
+                lamportSeparateInvalidation,
+#endif // TLLM_TEST
+#endif // TLLM_RUBIN_FEATURES
+                layoutA, layoutB, m, mmaK, mmaKind, mmaM, mmaN, mmaTileK, mockAllReduce, n, numEpilogueWarps,
+                numRegsCastAWarps, numRegsCopySfLdsSttm, numRegsCopySparsityInfo, numRegsPerThreadEpilogueWarp,
+                numRegsPerThreadNonEpilogueWarp, numSlicesForSplitK,
+#ifndef TLLM_PUBLIC_RELEASE
+                numSlicesForSliceK,
+#endif // TLLM_PUBLIC_RELEASE
+                numStagesA, numStagesB, numStagesMma, numStagesMmaWithinWorkTile, numStagesMmaAcrossWorkTile,
+                numStagesSmemSfA, numStagesSmemSfB,
+#ifndef TLLM_PUBLIC_RELEASE
+                numStagesTmemA,
+#endif // TLLM_PUBLIC_RELEASE
+                numStagesTmemSfA, numStagesTmemSfB, numStagesWorkId, outputDebugTensors, patchF2fp,
+#ifdef TLLM_RUBIN_FEATURES
+                patchPzo,
+#endif // TLLM_RUBIN_FEATURES
                 perTokenSfDtype, schedHostTask, sfBlockSizeA, sfBlockSizeB, sfBlockSizeC, sfLayoutA, sfLayoutB,
-                sfLayoutC, sfReshapeFactor, sparsityA, splitK, tileK, tileM, tileN, tileScheduler, transposeMmaOutput,
-                useCustomizedMma3xNvFp4, useCustomMmaSchedule, useDeepSeekFp8, useFlexibleClusterDims,
-                useHoistTryWaitForCustomMmaSchedule, useMaxTmemOverlap, usePerTokenSfA, usePerTokenSfB,
-                useShuffledMatrix, useTmaStore, useTwoTmaLoadWarps, useTwoMmaWarps, useUnrollLoop2xForMma, validM,
-                validN, validK, worldSize),
+                sfLayoutC, sfReshapeFactor,
+#ifndef TLLM_PUBLIC_RELEASE
+                sliceK,
+#endif // TLLM_PUBLIC_RELEASE
+                sparsityA, splitK, tileK, tileM, tileN, tileScheduler, transposeMmaOutput, useCustomizedMma3xNvFp4,
+                useCustomMmaSchedule, useDeepSeekFp8, useFlexibleClusterDims, useHoistTryWaitForCustomMmaSchedule,
+                useMaxTmemOverlap, usePerTokenSfA, usePerTokenSfB, useShuffledMatrix, useTmaStore, useTwoTmaLoadWarps,
+                useTwoMmaWarps,
+#ifdef TLLM_RUBIN_FEATURES
+                useUniqueSfA,
+#endif // TLLM_RUBIN_FEATURES
+                useUnrollLoop2xForMma, validM, validN, validK, worldSize),
             actType, clampBeforeAct)
         , mBatchedM(batchedM)
         , mBatchedN(batchedN)
@@ -255,6 +308,24 @@ inline bool checkAndUpdateBatchedGemmOptions(
             "FusedBiasShuffleMode::ReorderAndShuffle is only supported for fused-act/"
             "gated-act paths");
         isValid = gemm::checkAndUpdateGemmOptions(options, cudaArch, worldSize, updateOptions);
+    }
+    // A fused A/SfA or B/SfB load task has a single loop step. The regular data loader advances by
+    // TileK, while the scaling-factor loader advances by MmaTileK. If those differ, fusing the tasks
+    // produces mismatched pipeline stages and the MMA consumer can wait forever.
+    if (options.mFuseLoadSfTask && options.mTileK != options.mMmaTileK)
+    {
+        if (updateOptions)
+        {
+            TLLM_LOG_WARNING("Disabling fuseLoadSfTask because TileK (", options.mTileK, ") differs from MmaTileK (",
+                options.mMmaTileK, "). Fused data/SF load tasks require identical loop steps.");
+            options.mFuseLoadSfTask = false;
+        }
+        else
+        {
+            TLLM_CHECK_ERROR(
+                false, "fuseLoadSfTask requires TileK == MmaTileK, found ", options.mTileK, " and ", options.mMmaTileK);
+            return false;
+        }
     }
     if (options.mUseCMultiCast)
     {
@@ -427,6 +498,9 @@ inline bool checkAndUpdateBatchedGemmOptions(
         if (!batchM || doesRouteImplUseNoRoute(options.mRouteImpl))
         {
             bool isSupportedSfLayoutA = options.mSfLayoutA == tg::SfLayout::R128c4;
+#ifdef TLLM_RUBIN_FEATURES
+            isSupportedSfLayoutA = isSupportedSfLayoutA || options.mSfLayoutA == tg::SfLayout::R128c16;
+#endif // TLLM_RUBIN_FEATURES
             TLLM_CHECK_ERROR(isSupportedSfLayoutA, "options.mSfLayoutA has to be R128cX when not batch M or not routed",
                 tg::sfLayoutToString(options.mSfLayoutA));
         }
@@ -456,6 +530,22 @@ inline bool checkAndUpdateBatchedGemmOptions(
         TLLM_CHECK_ERROR(
             options.mK % options.mTileK == 0, "K must be a multiple of tileK when using Ldg based SF routing");
     }
+
+#ifdef TLLM_RUBIN_FEATURES
+    if (options.mLamportConsumerA || options.mLamportConsumerB)
+    {
+        TLLM_CHECK_ERROR(
+            doesRouteImplUseNoRoute(options.mRouteImpl), "RouteAct is not supported with Lamport consumer");
+        // Add tests for this if there is a use-case.
+        TLLM_CHECK_ERROR(!batchM, "Lamport consumer has only been tested with Batch N");
+    }
+    if (options.mLamportForceValid)
+    {
+        // The Tma oob opt will leave some values untouched, but Lamport needs to guarantee all values
+        // are valid to avoid deadlocks.
+        TLLM_CHECK_ERROR(!options.mUseTmaOobOpt, "Lamport force valid does not support Tma oob opt");
+    }
+#endif // TLLM_RUBIN_FEATURES
 
     // Check if all elements in mBatchedM or mBatchedN are the same (uniform tokens per batch) and
     // set mIsUniformNumTokensPerBatch and mBatchStride.

@@ -1,4 +1,6 @@
 {
+    "_comment": "GemmGatedAct kernel config for ALL architectures (100f, 100a, 103a, 107a)",
+    "_note": "Rubin (107a) uses 2x mmaK compared to Blackwell (100f/100a/103a) for FP8 and FP4 kernels",
     "templates": {
         "GemmGatedActFp4LowLatency": {
             "dtypeA": "e2m1",
@@ -6,7 +8,6 @@
             "dtypeC": "e2m1",
             "mmaM": 128,
             "mmaN": 8,
-            "mmaK": 64,
             "tileM": 128,
             "tileN": 8,
             "tileK": 256,
@@ -21,7 +22,7 @@
             "clusterDimZ": 4,
             "sliceK": false,
             "transposeMmaOutput": true,
-            "useShuffledMatrixA": true,
+            "useShuffledMatrix": true,
             "useDeepSeekFp8": false,
             "useTmaStore": true,
             "useCustomMmaSchedule": true,
@@ -36,7 +37,6 @@
             "dtypeC": "e4m3",
             "mmaM": 128,
             "mmaN": 8,
-            "mmaK": 32,
             "tileM": 128,
             "tileN": 8,
             "tileK": 256,
@@ -51,7 +51,7 @@
             "clusterDimZ": 1,
             "sliceK": false,
             "transposeMmaOutput": true,
-            "useShuffledMatrixA": true,
+            "useShuffledMatrix": true,
             "useDeepSeekFp8": false,
             "useTmaStore": true,
             "useCustomMmaSchedule": true,
@@ -64,7 +64,6 @@
             "dtypeC": "e4m3",
             "mmaM": 128,
             "mmaN": 128,
-            "mmaK": 32,
             "tileM": 128,
             "tileN": 128,
             "tileK": 256,
@@ -79,7 +78,7 @@
             "clusterDimZ": 1,
             "sliceK": false,
             "transposeMmaOutput": false,
-            "useShuffledMatrixA": false,
+            "useShuffledMatrix": false,
             "useDeepSeekFp8": false,
             "useTmaStore": true,
             "useCustomMmaSchedule": true,
@@ -89,17 +88,32 @@
     },
     "configs": [
         {
+            "_comment": "FP4 Low Latency - All arches (mmaK=64 for Blackwell, mmaK=128 for Rubin)",
             "_template": "GemmGatedActFp4LowLatency",
-            "dtypeC": ["e2m1", "bf16", "fp16", "fp32"]
+            "dtypeC": ["e2m1", "bf16", "fp16", "fp32"],
+            "mmaK,smVersion": [
+                [64, "100f"],
+                [128, "107a"]
+            ]
         },
         {
+            "_comment": "FP8 Low Latency - All arches (mmaK=32 for Blackwell, mmaK=64 for Rubin)",
             "_template": "GemmGatedActFp8LowLatency",
             "dtypeC": ["e4m3", "bf16", "fp16"],
-            "clusterDimZ,numSlicesForSplitK": [[1, 1], [4, 4]]
+            "clusterDimZ,numSlicesForSplitK": [[1, 1], [4, 4]],
+            "mmaK,smVersion": [
+                [32, "100f"],
+                [64, "107a"]
+            ]
         },
         {
+            "_comment": "FP8 Throughput - All arches (mmaK=32 for Blackwell, mmaK=64 for Rubin)",
             "_template": "GemmGatedActFp8Throughput",
-            "dtypeC": ["e4m3", "bf16", "fp16"]
+            "dtypeC": ["e4m3", "bf16", "fp16"],
+            "mmaK,smVersion": [
+                [32, "100f"],
+                [64, "107a"]
+            ]
         }
     ]
 }

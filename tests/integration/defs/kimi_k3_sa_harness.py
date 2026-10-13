@@ -33,11 +33,9 @@ Environment:
                                checkpoint copy (skips output-quality
                                assertions)
   KIMI_K3_MOE_BACKEND          moe_config.backend passed to the LLM
-                               (default AUTO). Currently a no-op for
-                               Kimi K3: KimiK3MoERuntime pins the routed
-                               MoE backend to TRTLLM regardless; parity
-                               holds because the baseline and spec runs
-                               share the same backend
+                               (default AUTO). For the W4A8 MXFP4
+                               checkpoint, use MEGAMOE_DEEPGEMM on Rubin;
+                               TRTLLM-Gen has no matching Rubin cubin
   KIMI_K3_SPEC_MODE            'off' (default) or 'sa' (suffix
                                automaton, one-engine)
   KIMI_K3_SPEC_DRAFT_LEN       SA max_draft_len (default 2)
@@ -147,13 +145,14 @@ def _build_llm(ckpt: str, tp: int, spec_mode: str, adp: bool):
     return LLM(
         model=ckpt,
         tensor_parallel_size=tp,
+        # Match the known-good K3 configuration. TRTLLM is the dispatcher;
+        # on Rubin it selects the CuTe DSL MLA FMHA for K3's 96 heads.
+        attn_backend="TRTLLM",
         enable_attention_dp=adp,
         moe_expert_parallel_size=tp if adp else None,
         trust_remote_code=True,  # tiktoken tokenizer ships with the ckpt
-        # Currently a no-op for Kimi K3: KimiK3MoERuntime pins the routed
-        # MoE backend to TRTLLM regardless of moe_config.backend. Kept as
-        # a passthrough for checkpoints that honor it; parity is
-        # unaffected because the baseline and spec runs share the backend.
+        # Keep the backend explicit for the packed W4A8 MXFP4 checkpoint:
+        # TRTLLM-Gen has no matching Rubin cubin.
         moe_config=MoeConfig(backend=os.environ.get("KIMI_K3_MOE_BACKEND", "AUTO")),
         max_batch_size=int(os.environ.get("KIMI_K3_MAX_BATCH_SIZE", "8")),
         max_seq_len=int(os.environ.get("KIMI_K3_MAX_SEQ_LEN", "4096")),
@@ -183,9 +182,8 @@ def _build_llm(ckpt: str, tp: int, spec_mode: str, adp: bool):
         kv_cache_config=KvCacheConfig(
             enable_block_reuse=False,
             free_gpu_memory_fraction=float(os.environ.get("KIMI_K3_FREE_GPU_FRACTION", "0.25")),
-            # tokens_per_block=64 keeps the MLA (576, 512) generation path
-            # on the flashinfer trtllm-gen kernel (32 falls back to a C++
-            # path requiring num_heads % 64 == 0; K3 has 96 query heads).
+            # K3's known-good Rubin configuration uses 64-token pages for
+            # the CuTe DSL MLA decode path.
             tokens_per_block=64,
         ),
     )

@@ -28,6 +28,9 @@ environment variable as follows:
 | 1                               | Affinity is unconditionally auto-configured.                                                                                 |
 | 0 or any other value            | Affinity remains as configured by the user and/or environment                                                                |
 
+The affinity is applied to every thread of the worker process, including
+threads created before the configuration point (for example by MPI or
+communication libraries).
 
 ## Other environmental considerations
 

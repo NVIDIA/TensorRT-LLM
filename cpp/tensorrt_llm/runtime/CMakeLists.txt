@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION &
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION &
 # AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may not
@@ -15,6 +15,7 @@
 include(FetchContent)
 
 set(SRCS
+    ugpu/ugpu_utils.cpp
     utils/mpiUtils.cpp
     utils/numpyUtils.cpp
     utils/runtimeUtils.cpp
@@ -77,6 +78,7 @@ set_property(TARGET runtime_src PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 add_cuda_architectures(runtime_src 89)
 
 target_include_directories(runtime_src PRIVATE ${MPI_C_INCLUDE_DIRS})
+target_link_libraries(runtime_src PUBLIC ${CUDA_NVML_LIB})
 
 if(ENABLE_MULTI_DEVICE)
   target_link_libraries(runtime_src PUBLIC ${NCCL_LIB})

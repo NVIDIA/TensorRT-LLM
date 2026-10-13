@@ -159,6 +159,10 @@ enum class SchedHostTask
     LoadSfA,
     // The persistent scheduler is fused with the task loading scaling factors for B.
     LoadSfB,
+#ifdef TLLM_RUBIN_FEATURES
+    // The persistent scheduler is fused with the invalidate task.
+    Invalidate,
+#endif // TLLM_RUBIN_FEATURES
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

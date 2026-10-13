@@ -16,7 +16,7 @@
 import inspect
 import os
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 from torch import nn
@@ -29,7 +29,7 @@ from ...custom_ops.trtllm_gen_custom_ops import \
     fp4_block_scale_fake_output_without_finalize
 from ...model_config import ModelConfig
 from ...utils import (ActivationType, ActType_TrtllmGen, AuxStreamType,
-                      Fp4QuantizedTensor)
+                      Fp4QuantizedTensor, MxFp8QuantizedTensor)
 from ..gated_mlp import GatedMLP
 from .impl_contract import (MoEDeployment, MoEEligibility, MoEInputRequirement,
                             MoEProblem, MoERejectReason, MoERunContext,
@@ -58,6 +58,16 @@ class RoutingParams:
     n_group: Optional[int]
     topk_group: Optional[int]
     routed_scaling_factor: Optional[float]
+
+
+# Read once at import, not per call. os._Environ has no own .get, so
+# MutableMapping.get raises and catches a KeyError on every lookup when the
+# variable is unset (the default) -- 679 ns/call measured, which is 62 us per
+# decode step across K3's 92 routed MoE layers. Workers receive their
+# environment at launch, so nothing needs a live re-read. Mirrors
+# FORCE_SEPARATED_ROUTING in moe_scheduler.py.
+_K3_DISABLE_FUSED_ROUTE_QUANT = os.environ.get(
+    "TLLM_K3_DISABLE_FUSED_ROUTE_QUANT", "0") == "1"
 
 
 class TRTLLMGenFusedMoE(MoE):
@@ -112,6 +122,15 @@ class TRTLLMGenFusedMoE(MoE):
         QuantAlgo.W4A8_MXFP4_MXFP8,
     }
 
+    # One-shot process-global markers for the Kimi K3 fused route+quant path.
+    # Set on the class (not the instance) so the 92 routed-MoE layers emit one
+    # line between them, not 92. Guarding on these keeps the steady-state cost
+    # of the self-proof at one attribute load; the message and the failure
+    # reason are only ever built once. Under CUDA-graph replay this whole
+    # function is not executed at all, so the cost there is exactly zero.
+    _k3_route_quant_logged_on = False
+    _k3_route_quant_logged_off = False
+
     # Quantization algorithms that support full swiglu_gptoss_style.
     # FP8_BLOCK_SCALES supports the DSV4-style uniform swiglu_limit_scalar
     # through the DeepSeek FP8 separate-activation path, but not bias or
@@ -129,6 +148,16 @@ class TRTLLMGenFusedMoE(MoE):
         ActivationType.Relu2,
     }
 
+    # Quantization algorithms with fused SiTu FC1 cubins in the TRTLLM-Gen
+    # batched-GEMM kernel drop. NVFP4 feeds the group-16 `Bmm_E2m1_E2m1E2m1_...
+    # _siTuGlu_*` kernels; W4A8_MXFP4_MXFP8 the group-32
+    # `Bmm_MxE4m3_MxE2m1MxE4m3_..._siTuGlu_*` ones. There is no standalone
+    # SiTu activation kernel, so anything without a fused cubin is rejected.
+    _SITU_SUPPORTED_QUANT_ALGOS = {
+        QuantAlgo.NVFP4,
+        QuantAlgo.W4A8_MXFP4_MXFP8,
+    }
+
     @classmethod
     def can_implement(cls, p: MoEProblem, d: MoEDeployment) -> MoEEligibility:
         """TRTLLM-Gen kernels: SM100/SM103, bfloat16 activations.
@@ -140,11 +169,11 @@ class TRTLLMGenFusedMoE(MoE):
         sm_version = d.env.sm
         quant_algo = p.quant_algo
 
-        # TRTLLMGenFusedMoE requires SM in {100, 103}
-        if sm_version not in {100, 103}:
+        # TRTLLMGenFusedMoE requires SM in {100, 103, 107}
+        if sm_version not in {100, 103, 107}:
             return _reject(
                 MoERejectReason.SM_UNSUPPORTED,
-                f"TRTLLMGenFusedMoE requires SM100 or SM103, got SM{sm_version}"
+                f"TRTLLMGenFusedMoE requires SM100, SM103 or SM107, got SM{sm_version}"
             )
 
         # forward_impl asserts x.dtype == torch.bfloat16
@@ -273,6 +302,7 @@ class TRTLLMGenFusedMoE(MoE):
 
         # Cached for autotune profile sizing (forward path passes
         # tune_max_num_tokens to the MoE op).
+        self.model_config = model_config
         self.max_num_tokens = model_config.max_num_tokens
 
         # Eligibility (SM / smart_router / BF16 FlashInfer dep) is owned by
@@ -370,24 +400,28 @@ class TRTLLMGenFusedMoE(MoE):
             raise ValueError(
                 "TRTLLM-Gen SiTu requires bfloat16 activations, got "
                 f"{self.dtype}.")
-        if get_sm_version() not in {100, 103}:
-            raise ValueError("TRTLLM-Gen SiTu requires SM100 or SM103, got "
-                             f"SM{get_sm_version()}.")
-        if (self.quant_config is None
-                or self.quant_config.quant_algo != QuantAlgo.W4A8_MXFP4_MXFP8):
-            quant_algo = (None if self.quant_config is None else
-                          self.quant_config.quant_algo)
+        if get_sm_version() not in {100, 103, 107}:
             raise ValueError(
-                "TRTLLM-Gen SiTu requires W4A8_MXFP4_MXFP8 quantization, "
+                "TRTLLM-Gen SiTu requires SM100, SM103, or SM107, got "
+                f"SM{get_sm_version()}.")
+        quant_algo = (None if self.quant_config is None else
+                      self.quant_config.quant_algo)
+        if quant_algo not in self._SITU_SUPPORTED_QUANT_ALGOS:
+            supported = ", ".join(
+                sorted(algo.name for algo in self._SITU_SUPPORTED_QUANT_ALGOS))
+            raise ValueError(
+                f"TRTLLM-Gen SiTu requires one of {supported} quantization, "
                 f"got {quant_algo}.")
         if self.tp_size > 1:
             # Intra-expert MoE TP: w1/w3 column-shard and w2 row-shard along
-            # the intermediate dim (the stock MXFP4 quant-method loaders slice
-            # the group-32 packed bytes and scales per rank). Require the
+            # the intermediate dim (the stock MXFP4/NVFP4 quant-method loaders
+            # slice the packed bytes and scales per rank). Require the
             # per-rank shard to stay a whole multiple of the quant method's
             # weight alignment so per-shard scale groups and the padded
             # weight buffers line up without fractional groups.
-            alignment = W4A8MXFP4MXFP8TRTLLMGenFusedMoEMethod.weight_alignment
+            alignment = (NVFP4TRTLLMGenFusedMoEMethod.weight_alignment
+                         if quant_algo == QuantAlgo.NVFP4 else
+                         W4A8MXFP4MXFP8TRTLLMGenFusedMoEMethod.weight_alignment)
             if (self.intermediate_size % self.tp_size != 0
                     or self.intermediate_size_per_partition % alignment != 0):
                 raise ValueError(
@@ -435,6 +469,13 @@ class TRTLLMGenFusedMoE(MoE):
     def _requires_separated_routing(self) -> bool:
         """BF16 FlashInfer uses separated routing, except DeepSeekV3 which uses
         the fused kernel (its separated variant has accuracy issues)."""
+        # Routing methods the C++ kernels can't route natively (e.g. DeepSeek-V4
+        # sqrtsoftplus + hash gating) must be routed in Python. They report
+        # routing_method_type=DeepSeekV3 for compatibility, so feeding their raw
+        # logits to the fused kernel picks the DSv3 routing kernel, which derefs
+        # a null routing bias on DSV4 hash-gated layers (illegal memory access).
+        if self.routing_method.requires_separated_routing:
+            return True
         if not (self.use_flashinfer and self._is_unquantized_path()):
             return False
         return not isinstance(self.routing_method, DeepSeekV3MoeRoutingMethod)
@@ -557,13 +598,15 @@ class TRTLLMGenFusedMoE(MoE):
             if not isinstance(self.op_backend, TRTLLMOpBackend):
                 raise ValueError(
                     "TRTLLM-Gen SiTu requires the native TRTLLM op backend.")
-            if not self.has_w4a8_mxfp4_mxfp8:
+            if not (self.has_nvfp4 or self.has_w4a8_mxfp4_mxfp8):
+                raise ValueError("TRTLLM-Gen SiTu requires the NVFP4 or "
+                                 "W4A8_MXFP4_MXFP8 path.")
+            expected_scaling_vector_size = 16 if self.has_nvfp4 else 32
+            if self.scaling_vector_size != expected_scaling_vector_size:
                 raise ValueError(
-                    "TRTLLM-Gen SiTu requires the W4A8_MXFP4_MXFP8 path.")
-            if self.scaling_vector_size != 32:
-                raise ValueError(
-                    "TRTLLM-Gen SiTu requires MXFP4 scaling vector size 32, "
-                    f"got {self.scaling_vector_size}.")
+                    "TRTLLM-Gen SiTu requires scaling vector size "
+                    f"{expected_scaling_vector_size} for this quantization "
+                    f"mode, got {self.scaling_vector_size}.")
             # For SiTu these hold the backend-local activation parameters
             # (populated by create_weights, which runs before this check).
             for name in ("swiglu_alpha", "swiglu_beta"):
@@ -581,10 +624,19 @@ class TRTLLMGenFusedMoE(MoE):
             if self.quant_config.layer_quant_mode.has_fp8_block_scales():
                 return DeepSeekFP8BlockScalesFusedMoEMethod()
             elif self.quant_config.layer_quant_mode.has_nvfp4():
-                return NVFP4TRTLLMGenFusedMoEMethod(
-                ) if self.swiglu_alpha is not None or self.activation_type in [
-                    ActivationType.Relu2, ActivationType.Silu
-                ] else NVFP4TRTLLMGenFusedMoEBaseMethod()
+                # ``is_situ_activation`` (not ``swiglu_alpha is not None``):
+                # SiTu fills the swiglu_alpha/swiglu_beta slots from
+                # create_weights, i.e. after this runs, so keying off the
+                # tensor would make the selected method depend on *when*
+                # _get_quant_method is called. Like the SwiGLU-alpha and
+                # element-wise cases, SiTu needs the padded method's
+                # alignment handling.
+                needs_padded_method = (
+                    self.swiglu_alpha is not None or self.is_situ_activation
+                    or self.activation_type
+                    in [ActivationType.Relu2, ActivationType.Silu])
+                return (NVFP4TRTLLMGenFusedMoEMethod() if needs_padded_method
+                        else NVFP4TRTLLMGenFusedMoEBaseMethod())
             elif self.quant_config.layer_quant_mode.has_w4a16_mxfp4():
                 return W4A16MXFP4TRTLLMGenFusedMoEMethod()
             elif self.quant_config.layer_quant_mode.has_w4a8_nvfp4_fp8():
@@ -620,6 +672,28 @@ class TRTLLMGenFusedMoE(MoE):
         # swiglu_alpha only on the nvfp4 branch (SiTu requires
         # W4A8_MXFP4_MXFP8) and has already run above; _check_configs runs
         # after this point and its swiglu gate admits w4a8_mxfp4_mxfp8.
+        if self.is_situ_activation:
+            self.swiglu_alpha = nn.Parameter(torch.full(
+                (self.expert_size_per_partition, ),
+                float(self.trtllm_gen_activation_alpha),
+                dtype=torch.float32),
+                                             requires_grad=False)
+            self.swiglu_beta = nn.Parameter(torch.full(
+                (self.expert_size_per_partition, ),
+                float(self.trtllm_gen_activation_beta),
+                dtype=torch.float32),
+                                            requires_grad=False)
+
+        # SiTu reuses the swiglu_alpha/swiglu_beta storage: SiTu and SwiGLU are
+        # mutually exclusive (constructor-provided SwiGLU parameters are
+        # rejected by _validate_backend_local_activation) and feed the same
+        # gemm1_alpha/gemm1_beta op slots. Safe with respect to the
+        # `swiglu_alpha is not None` gates: create_moe.py checks the
+        # constructor kwargs (None for SiTu); _get_quant_method's nvfp4 branch
+        # keys off is_situ_activation rather than swiglu_alpha, so it returns
+        # the same method before and after this point; _check_configs runs
+        # after this point and its swiglu gate admits both nvfp4 and
+        # w4a8_mxfp4_mxfp8.
         if self.is_situ_activation:
             self.swiglu_alpha = nn.Parameter(torch.full(
                 (self.expert_size_per_partition, ),
@@ -672,6 +746,119 @@ class TRTLLMGenFusedMoE(MoE):
             kargs["allow_partial_loading"] = allow_partial_loading
         self.quant_method.load_weights(self, weights, self.weight_loading_mode,
                                        **kargs)
+
+    def try_fused_kimi_route_quant(
+        self,
+        x: Union[torch.Tensor, MxFp8QuantizedTensor],
+        router_logits: torch.Tensor,
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor,
+                        torch.Tensor]]:
+        """Fuse Kimi K3 no-aux routing and MXFP8 input quantization.
+
+        This launch-overhead optimization is deliberately specialized to the
+        K3 decode shape. Returning ``None`` keeps every other model, shape,
+        architecture, and op backend on the existing unfused path.
+        """
+        # get_sm_version() is deliberately last: it touches the CUDA driver,
+        # while everything before it is a dict lookup or an isinstance. Tests
+        # that stub the SM probe must be able to reach the cheap rejections
+        # without the probe running at all.
+        if (_K3_DISABLE_FUSED_ROUTE_QUANT or isinstance(x, MxFp8QuantizedTensor)
+                or not self.has_w4a8_mxfp4_mxfp8
+                or not isinstance(self.op_backend, TRTLLMOpBackend) or
+                not isinstance(self.routing_method, DeepSeekV3MoeRoutingMethod)
+                or not 100 <= get_sm_version() < 110):
+            if not TRTLLMGenFusedMoE._k3_route_quant_logged_off:
+                self._log_k3_route_quant_declined(x, router_logits)
+            return None
+
+        routing = self.routing_method.routing_impl
+        bias = self.routing_method.e_score_correction_bias
+        if (not routing.is_fused or routing.n_group != 1
+                or routing.topk_group != 1 or routing.top_k != 16
+                or router_logits.ndim != 2 or router_logits.shape[1] != 896
+                or router_logits.dtype != torch.float32
+                or not router_logits.is_contiguous()
+                or bias.dtype != torch.float32 or not bias.is_contiguous()
+                or x.ndim != 2 or x.shape != (router_logits.shape[0], 3584)
+                or not 0 < x.shape[0] <= 64 or x.dtype != torch.bfloat16
+                or not x.is_contiguous()):
+            if not TRTLLMGenFusedMoE._k3_route_quant_logged_off:
+                self._log_k3_route_quant_declined(x, router_logits)
+            return None
+
+        if not TRTLLMGenFusedMoE._k3_route_quant_logged_on:
+            TRTLLMGenFusedMoE._k3_route_quant_logged_on = True
+            logger.info(
+                "Kimi K3 fused route+MXFP8 quant ENABLED "
+                f"(SM{get_sm_version()}, num_tokens={x.shape[0]}); "
+                "expect kimi_k3_noaux_tc_mxfp8_quant_kernel to replace the "
+                "deepseek_v3_topk_kernel + MXFP8-quantize pair. "
+                "Set TLLM_K3_DISABLE_FUSED_ROUTE_QUANT=1 to fall back.")
+
+        return torch.ops.trtllm.kimi_k3_noaux_tc_mxfp8_quant(
+            router_logits, bias, x, routing.routed_scaling_factor)
+
+    def _log_k3_route_quant_declined(self, x, router_logits) -> None:
+        """Report, once per process, why the fused route+quant path bailed out.
+
+        The predicates are re-walked here rather than in the hot ``or`` chains
+        so that the reason string costs nothing on the steady-state path: this
+        body runs at most once, and only after the fast chain has already
+        decided to decline.
+        """
+        if TRTLLMGenFusedMoE._k3_route_quant_logged_off:
+            return
+        TRTLLMGenFusedMoE._k3_route_quant_logged_off = True
+
+        # Same order as the fast chain, so the reported reason is the one that
+        # actually fired.
+        if _K3_DISABLE_FUSED_ROUTE_QUANT:
+            reason = "TLLM_K3_DISABLE_FUSED_ROUTE_QUANT=1"
+        elif isinstance(x, MxFp8QuantizedTensor):
+            # The K3 fused latent-down MXFP8 epilogue already quantized x.
+            # Only reachable when the MoE has no communication object.
+            reason = "input is already MxFp8QuantizedTensor (pre-quantized handoff)"
+        elif not self.has_w4a8_mxfp4_mxfp8:
+            reason = "quant algo is not W4A8_MXFP4_MXFP8"
+        elif not isinstance(self.op_backend, TRTLLMOpBackend):
+            reason = f"op backend is {type(self.op_backend).__name__}, not TRTLLMOpBackend"
+        elif not isinstance(self.routing_method, DeepSeekV3MoeRoutingMethod):
+            reason = f"routing method is {type(self.routing_method).__name__}"
+        elif not 100 <= get_sm_version() < 110:
+            reason = f"SM{get_sm_version()} outside [100, 110)"
+        else:
+            routing = self.routing_method.routing_impl
+            bias = self.routing_method.e_score_correction_bias
+            checks = (
+                (not routing.is_fused, "routing_impl.is_fused is False"),
+                (routing.n_group != 1, f"n_group={routing.n_group} != 1"),
+                (routing.topk_group
+                 != 1, f"topk_group={routing.topk_group} != 1"),
+                (routing.top_k != 16, f"top_k={routing.top_k} != 16"),
+                (router_logits.ndim != 2 or router_logits.shape[1] != 896,
+                 f"router_logits shape {tuple(router_logits.shape)} is not [M, 896]"
+                 ),
+                (router_logits.dtype != torch.float32,
+                 f"router_logits dtype {router_logits.dtype} != float32"),
+                (not router_logits.is_contiguous(),
+                 "router_logits is not contiguous"),
+                (bias.dtype != torch.float32,
+                 f"e_score_correction_bias dtype {bias.dtype} != float32"),
+                (not bias.is_contiguous(),
+                 "e_score_correction_bias is not contiguous"),
+                (x.ndim != 2 or x.shape != (router_logits.shape[0], 3584),
+                 f"x shape {tuple(x.shape)} is not [M, 3584]"),
+                (not 0 < x.shape[0] <= 64,
+                 f"num_tokens={x.shape[0]} outside (0, 64]"),
+                (x.dtype != torch.bfloat16, f"x dtype {x.dtype} != bfloat16"),
+                (not x.is_contiguous(), "x is not contiguous"),
+            )
+            reason = next((msg for failed, msg in checks if failed),
+                          "unknown (predicates re-evaluated as passing)")
+
+        logger.info(f"Kimi K3 fused route+MXFP8 quant DISABLED: {reason}. "
+                    "Falling back to separate routing + MXFP8 quantization.")
 
     def quantize_input(self, x, post_quant_comm: bool = True):
         """Quantize inputs prior to post-communication (alltoall/allgather) or before MoE computation.
@@ -916,6 +1103,7 @@ class TRTLLMGenFusedMoE(MoE):
                 output=moe_output,
                 tune_max_num_tokens=self.max_num_tokens,
                 use_dp=self.use_dp,
+                use_lamport=self.model_config.use_lamport_sync,
             )
             # When output is provided, use it directly as the result
             final_hidden_states = moe_output if moe_output is not None else result

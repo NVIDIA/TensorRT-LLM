@@ -13,6 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 import torch
@@ -21,6 +23,7 @@ from tensorrt_llm._torch.disaggregation.base.region import MemRegionGroup, SpecR
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import (
     KVRegionExtractorV1,
     _build_v2_mamba_state_pool,
+    _get_pool_num_slots,
     build_page_table,
     build_page_table_from_manager,
 )
@@ -68,6 +71,17 @@ class DummyRankInfo:
     @property
     def kv_factor(self) -> int:
         return 2 if not self.is_mla else 1
+
+
+@pytest.mark.parametrize("num_slots", [17, lambda: 17])
+def test_get_pool_num_slots_supports_property_and_method(num_slots):
+    class Pool:
+        pass
+
+    pool = Pool()
+    pool.num_slots = num_slots
+
+    assert _get_pool_num_slots(pool) == 17
 
 
 @pytest.mark.cuda
@@ -421,6 +435,16 @@ def test_v1_dsa_indexer_replicated_transfer_across_pp(
             gen.shutdown()
 
 
+def test_build_page_table_from_manager_rejects_localized_kv_cache() -> None:
+    manager = SimpleNamespace(
+        num_ugpus=2,
+        impl=SimpleNamespace(layer_grouping=[]),
+    )
+
+    with pytest.raises(NotImplementedError, match="enable_ugpu=True"):
+        build_page_table_from_manager(manager)
+
+
 @pytest.mark.cpu_only
 def test_layer_group_meta_serialization():
     import numpy as np
@@ -602,6 +626,35 @@ def test_v2_builder_splits_mixed_kind_pool_into_per_class_views():
     assert idx_view.bytes_per_layer == 128
     idx_starts, _ = get_layer_byte_ranges(idx_view)
     assert idx_starts == {0: 256}
+
+
+def test_v2_builder_filters_derived_roles_and_uses_manager_layer_ids():
+    """A specialized manager can rebuild derived roles after transfer."""
+    attrs = {
+        (0, Role.KEY): SimpleNamespace(life_cycle_id=0, pool_index=0, offset=0, size=128),
+        (0, Role.MLA_V_PACKED): SimpleNamespace(
+            life_cycle_id=0, pool_index=0, offset=128, size=128
+        ),
+        (1, Role.KEY): SimpleNamespace(life_cycle_id=0, pool_index=0, offset=256, size=128),
+        (1, Role.MLA_V_PACKED): SimpleNamespace(
+            life_cycle_id=0, pool_index=0, offset=384, size=128
+        ),
+    }
+    manager = _make_fake_v2_manager(
+        attrs,
+        {Role.ALL: MapperKind.NHD},
+        slot_bytes_list=(512,),
+    )
+    manager.get_disagg_transfer_roles = lambda: frozenset({Role.KEY})
+    manager.get_disagg_global_layer_ids = lambda _group_id: [20, 21]
+
+    layer_group = build_page_table_from_manager(manager).layer_groups[0]
+
+    assert [layer.global_layer_id for layer in layer_group.local_layers] == [20, 21]
+    assert len(layer_group.pool_views) == 1
+    view = layer_group.pool_views[0]
+    assert view.pool_role == frozenset({"key"})
+    assert get_layer_byte_ranges(view) == ({0: 0, 1: 256}, 128)
 
 
 def test_v2_builder_validates_role_mapper_declaration():

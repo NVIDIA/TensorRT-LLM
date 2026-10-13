@@ -928,6 +928,55 @@ def test_KvCacheConfig_requires_v2_for_additional_snapshot_offsets(
     assert getattr(config.mamba_state_config, field) == offsets
 
 
+def test_MambaStateConfig_branch_snapshot_defaults_off():
+    assert MambaStateConfig().enable_branch_snapshot is False
+    assert MambaStateConfig(
+        enable_branch_snapshot=True).enable_branch_snapshot is True
+
+
+def test_KvCacheConfig_requires_v2_for_branch_snapshots():
+    state_config = MambaStateConfig(enable_branch_snapshot=True)
+
+    with pytest.raises(ValidationError, match="use_kv_cache_manager_v2=True"):
+        KvCacheConfig(
+            mamba_state_config=state_config,
+            use_kv_cache_manager_v2=False,
+        )
+
+    config = KvCacheConfig(
+        mamba_state_config=state_config,
+        use_kv_cache_manager_v2=True,
+    )
+    assert config.mamba_state_config.enable_branch_snapshot is True
+
+
+def test_KvCacheConfig_keeps_branch_snapshots_under_per_conversation():
+    """per_conversation zeroes the periodic interval but not this flag."""
+    config = KvCacheConfig(
+        block_reuse_config=BlockReuseConfig(policy="per_conversation"),
+        mamba_state_config=MambaStateConfig(
+            periodic_snapshot_interval=64,
+            enable_branch_snapshot=True,
+        ),
+    )
+
+    assert config.mamba_state_config.periodic_snapshot_interval == 0
+    assert config.mamba_state_config.enable_branch_snapshot is True
+
+
+@pytest.mark.parametrize("interval", [0, 64])
+@pytest.mark.parametrize("enable_branch_snapshot", [False, True])
+def test_MambaStateConfig_branch_snapshot_is_orthogonal_to_periodic_interval(
+        interval, enable_branch_snapshot):
+    state_config = MambaStateConfig(
+        periodic_snapshot_interval=interval,
+        enable_branch_snapshot=enable_branch_snapshot,
+    )
+
+    assert state_config.periodic_snapshot_interval == interval
+    assert state_config.enable_branch_snapshot is enable_branch_snapshot
+
+
 @pytest.mark.cpu_only
 def test_KvCacheConfig_migrates_deprecated_mamba_interval(monkeypatch):
     warnings_seen = []
@@ -2154,30 +2203,39 @@ class TestPiecewiseCudaGraphCaptureDefaults:
         from tensorrt_llm._torch.pyexecutor.model_engine import \
             PyTorchModelEngine
 
-        class FakeDist:
+        class NoExchangeDist:
+            """Fails on any collective.
 
-            def __init__(self, decisions):
-                self.decisions = decisions
+            The all-rank decision is derived from the already-gathered
+            per-rank counts, so no further exchange may be issued.
+            """
 
-            def tp_allgather(self, value):
-                del value
-                return self.decisions
+            def __getattr__(self, name):
+                raise AssertionError(f"unexpected collective {name}")
 
         engine = object.__new__(PyTorchModelEngine)
         engine.enable_attention_dp = True
         engine.prefill_cuda_graph_backend = PrefillCudaGraphBackend.BREAKABLE
         engine._prefill_cuda_graph_num_tokens = [128, 256, 512]
-        engine._get_all_rank_ctx_requests = lambda _: [0, 1, 0, 0]
+        engine.dist = NoExchangeDist()
 
+        # A peer rank holds the only context request: every rank pads.
+        engine._get_all_rank_ctx_requests = lambda _: [0, 1, 0, 0]
         all_rank_num_tokens = [1, 129, 1, 1]
-        engine.dist = FakeDist([True, True, True, True])
         assert engine._get_padding_params(1, 0,
                                           all_rank_num_tokens) == (256, True,
                                                                    [256] * 4)
 
-        engine.dist = FakeDist([True, False, True, True])
+        # No rank has a context request: nobody runs the prefill graph.
+        engine._get_all_rank_ctx_requests = lambda _: [0, 0, 0, 0]
         assert engine._get_padding_params(
             1, 0, all_rank_num_tokens) == (1, False, all_rank_num_tokens)
+
+        # A peer exceeds the largest captured size: nobody runs it either.
+        engine._get_all_rank_ctx_requests = lambda _: [0, 1, 0, 0]
+        too_long = [1, 513, 1, 1]
+        assert engine._get_padding_params(1, 0,
+                                          too_long) == (1, False, too_long)
 
     def test_torch_compile_config_does_not_populate_legacy_capture_buckets(
             self):
@@ -2779,6 +2837,13 @@ class TestServeDefaults:
 
         assert llm_args.get("max_batch_size") == 128
         assert llm_args.get("tensor_parallel_size") == 4
+
+    def test_serve_enable_ugpu_flag(self):
+        llm_args, _ = get_llm_args(model=llama_model_path,
+                                   backend="pytorch",
+                                   enable_ugpu=True)
+
+        assert llm_args["enable_ugpu"] is True
 
     def test_serve_video_pruning_rate_maps_to_multimodal_config(self):
         llm_args, _ = get_llm_args(

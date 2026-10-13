@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,9 +13,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 import pickle
 import sys
 import traceback
+from unittest.mock import patch
 
 import cloudpickle
 import pytest
@@ -25,6 +27,8 @@ from mpi4py import MPI
 import tensorrt_llm as tllm
 from tensorrt_llm._mnnvl_utils import MnnvlMemory
 from tensorrt_llm._torch.distributed import MoeAlltoAll
+from tensorrt_llm._torch.modules.fused_moe.communication.nvlink_one_sided import \
+    FORCE_CFT_ENV
 from tensorrt_llm.mapping import Mapping
 
 cloudpickle.register_pickle_by_value(sys.modules[__name__])
@@ -33,6 +37,9 @@ MPI.pickle.__init__(
     cloudpickle.loads,
     pickle.HIGHEST_PROTOCOL,
 )
+
+_CFT_COUNTER_STRIDE_BYTES = 256
+_CFT_COUNTER_STRIDE_U64 = _CFT_COUNTER_STRIDE_BYTES // 8
 
 
 @pytest.fixture(autouse=True)
@@ -191,16 +198,17 @@ def make_nvfp4_payloads(
     return payloads, 2
 
 
-def make_bfloat16_payloads(
+def make_floating_point_payloads(
         local_num_tokens: int, hidden_size: int, top_k: int, rank: int,
-        token_selected_experts: torch.Tensor) -> tuple[list, int]:
-    """Create bfloat16 test payloads matching nvfp4 structure but without scaling factors."""
+        token_selected_experts: torch.Tensor,
+        payload_dtype: torch.dtype) -> tuple[list, int]:
+    """Create floating-point test payloads matching NVFP4 structure without scaling factors."""
     payloads = []
 
-    # Payload 0: Hidden states (bfloat16)
+    # Payload 0: hidden states
     hidden_states = torch.randn(local_num_tokens,
                                 hidden_size,
-                                dtype=torch.bfloat16,
+                                dtype=payload_dtype,
                                 device='cuda')
     # Add rank-specific pattern for verification
     hidden_states += rank
@@ -209,10 +217,10 @@ def make_bfloat16_payloads(
     # Payload 1: token_selected_experts
     payloads.append(token_selected_experts)
 
-    # Payload 2: token_final_scales (bfloat16) - similar to nvfp4's payload 4
+    # Payload 2: token_final_scales
     token_final_scales = torch.rand(local_num_tokens,
                                     top_k,
-                                    dtype=torch.bfloat16,
+                                    dtype=payload_dtype,
                                     device='cuda')
 
     # Optional: Construct the data that is easier to debug
@@ -224,10 +232,25 @@ def make_bfloat16_payloads(
     return payloads, 1
 
 
-def run_moe_a2a_dispatch_single_rank(ep_size, all_num_tokens, top_k,
-                                     workspace_size_per_rank, num_experts,
-                                     hidden_size, invalid_token_expert_id,
-                                     enable_eplb):
+def read_cft_dispatch_counters(moe_a2a: MoeAlltoAll, rank: int,
+                               ep_size: int) -> torch.Tensor:
+    counter_offset = moe_a2a.metainfo[MoeAlltoAll._METAINFO_INDEX[
+        "DISPATCH_COUNTED_WRITE_COUNTERS_OFFSET_INDEX"]].item()
+    counters = moe_a2a.workspace[rank, counter_offset:counter_offset +
+                                 ep_size * _CFT_COUNTER_STRIDE_BYTES].view(
+                                     torch.int64)
+    return counters[::_CFT_COUNTER_STRIDE_U64][:ep_size].cpu()
+
+
+def run_moe_a2a_dispatch_single_rank(ep_size,
+                                     all_num_tokens,
+                                     top_k,
+                                     workspace_size_per_rank,
+                                     num_experts,
+                                     hidden_size,
+                                     invalid_token_expert_id,
+                                     enable_eplb,
+                                     can_use_cft_counted_writes=False):
     """Worker function for MPIPoolExecutor."""
     rank = tllm.mpi_rank()
     torch.cuda.set_device(rank)
@@ -253,6 +276,7 @@ def run_moe_a2a_dispatch_single_rank(ep_size, all_num_tokens, top_k,
             num_slots=num_experts,
             workspace_size_per_rank=workspace_size_per_rank,
             num_experts=eplb_stats_num_experts,
+            can_use_cft_counted_writes=can_use_cft_counted_writes,
         )
 
         # Get the number of tokens for this specific rank (same as single-GPU)
@@ -263,12 +287,29 @@ def run_moe_a2a_dispatch_single_rank(ep_size, all_num_tokens, top_k,
             rank_local_tokens, num_experts, top_k)
         payloads, expert_id_payload_index = make_nvfp4_payloads(
             rank_local_tokens, hidden_size, top_k, rank, token_selected_experts)
+        payload_bytes_per_token = [
+            payload.shape[1] * payload.element_size() for payload in payloads
+        ]
+        actual_cft_dispatch = (
+            can_use_cft_counted_writes
+            and moe_a2a.use_cft_for_dispatch(max_num_tokens)
+            and all(bytes_per_token % 16 == 0
+                    for bytes_per_token in payload_bytes_per_token))
 
         eplb_local_stats = None
         if enable_eplb:
             eplb_local_stats = (torch.arange(
                 eplb_stats_num_experts, dtype=torch.int32, device="cuda") +
                                 rank * 1000)
+
+        # CFT counted writes require LE initialization before first dispatch
+        if can_use_cft_counted_writes:
+            moe_a2a.cft_initialize()
+        cft_counters_before = (read_cft_dispatch_counters(
+            moe_a2a, rank, ep_size) if actual_cft_dispatch else None)
+        if actual_cft_dispatch:
+            # All ranks must snapshot their baseline before any peer can issue counted writes.
+            tllm.mpi_barrier()
 
         recv_tensors = moe_a2a.dispatch(
             token_selected_experts,
@@ -278,21 +319,23 @@ def run_moe_a2a_dispatch_single_rank(ep_size, all_num_tokens, top_k,
             expert_id_payload_index=expert_id_payload_index,
             eplb_local_stats=eplb_local_stats)
 
-        # Verify completion flags after dispatch
-        completion_flags_offset = moe_a2a.metainfo[MoeAlltoAll._METAINFO_INDEX[
-            "DISPATCH_COMPLETION_FLAGS_OFFSET_INDEX"]].item()
-        completion_flags = moe_a2a.workspace[
-            rank, completion_flags_offset:completion_flags_offset +
-            ep_size * 4].view(torch.int32).cpu()
-        flag_val_offset = moe_a2a.metainfo[
-            MoeAlltoAll._METAINFO_INDEX["FLAG_VAL_OFFSET_INDEX"]].item()
-        expected_flag_val = moe_a2a.workspace[rank,
-                                              flag_val_offset:flag_val_offset +
-                                              4].view(torch.int32).cpu()
+        # Verify completion flags after dispatch unless the counted-write path actually ran.
+        if not actual_cft_dispatch:
+            completion_flags_offset = moe_a2a.metainfo[
+                MoeAlltoAll._METAINFO_INDEX[
+                    "DISPATCH_COMPLETION_FLAGS_OFFSET_INDEX"]].item()
+            completion_flags = moe_a2a.workspace[
+                rank, completion_flags_offset:completion_flags_offset +
+                ep_size * 4].view(torch.int32).cpu()
+            flag_val_offset = moe_a2a.metainfo[
+                MoeAlltoAll._METAINFO_INDEX["FLAG_VAL_OFFSET_INDEX"]].item()
+            expected_flag_val = moe_a2a.workspace[
+                rank,
+                flag_val_offset:flag_val_offset + 4].view(torch.int32).cpu()
 
-        assert torch.all(completion_flags == expected_flag_val), (
-            f"Rank {rank} completion flags: {completion_flags}, expected flag val: {expected_flag_val}"
-        )
+            assert torch.all(completion_flags == expected_flag_val), (
+                f"Rank {rank} completion flags: {completion_flags}, expected flag val: {expected_flag_val}"
+            )
 
         # Read counters and compact routing tensors from workspace
         send_counters_offset = moe_a2a.metainfo[
@@ -307,6 +350,13 @@ def run_moe_a2a_dispatch_single_rank(ep_size, all_num_tokens, top_k,
         send_counters = moe_a2a.workspace[
             rank, send_counters_offset:send_counters_offset + ep_size * 4].view(
                 torch.int32).cpu()
+        flag_val_offset = moe_a2a.metainfo[
+            MoeAlltoAll._METAINFO_INDEX["FLAG_VAL_OFFSET_INDEX"]].item()
+        dispatch_flag = moe_a2a.workspace[rank,
+                                          flag_val_offset:flag_val_offset +
+                                          4].view(torch.int32).item()
+        recv_counters_parity = (dispatch_flag >> 1) & 1
+        recv_counters_offset += recv_counters_parity * ep_size * 4
         recv_counters = moe_a2a.workspace[
             rank, recv_counters_offset:recv_counters_offset + ep_size * 4].view(
                 torch.int32).cpu()
@@ -318,6 +368,23 @@ def run_moe_a2a_dispatch_single_rank(ep_size, all_num_tokens, top_k,
             rank, topk_send_indices_offset:topk_send_indices_offset +
             max_num_tokens * top_k * 4].view(torch.int32).view(
                 max_num_tokens, top_k).cpu()
+        assert torch.all(recv_counters >= 0), (
+            f"Rank {rank} recv_counters contain pending sentinel values: "
+            f"{recv_counters}")
+        if actual_cft_dispatch:
+            cft_counters_after = read_cft_dispatch_counters(
+                moe_a2a, rank, ep_size)
+            cft_counter_delta = cft_counters_after - cft_counters_before
+            expected_payload_bytes_per_token = sum(payload_bytes_per_token)
+            for peer_rank in range(ep_size):
+                if peer_rank == rank:
+                    continue
+                expected_bytes = (recv_counters[peer_rank].item() *
+                                  expected_payload_bytes_per_token)
+                actual_bytes = cft_counter_delta[peer_rank].item()
+                assert actual_bytes >= expected_bytes, (
+                    f"Rank {rank} CFT dispatch counter from rank {peer_rank}: "
+                    f"delta={actual_bytes}, expected at least {expected_bytes}")
 
         # Return results to be collected (move to CPU for MPI transfer)
         eplb_gathered_stats = moe_a2a._state.eplb_gathered_stats
@@ -496,33 +563,30 @@ class TestMoEAlltoAll:
         enabled=False
     )  # MPI pool executors have known thread cleanup timing issues
     @pytest.mark.parametrize(
-        "mpi_pool_executor,all_num_tokens,top_k,enable_eplb",
+        "mpi_pool_executor,all_num_tokens,top_k,enable_eplb,hidden_size,can_use_cft_counted_writes",
         [
-            # (num_workers, all_num_tokens, top_k)
-            # Basic configurations
-            (4, [32, 32, 32, 32], 2, False
-             ),  # Four ranks with uniform distribution
-            (4, [16, 32, 64, 48
-                 ], 2, False),  # Four ranks with non-uniform distribution
-            (2, [100, 50], 2, False),  # Two ranks with different loads
-            (8, [10, 20, 30, 40, 50, 60, 70, 80
-                 ], 2, False),  # Eight ranks with increasing load
-
-            # Different top_k values
-            (4, [32, 32, 32, 32], 4, False),  # Four ranks with top_k = 4
-            (4, [32, 32, 32, 32], 8, False),  # Four ranks with top_k = 8
-
-            # Edge cases
-            (4, [1, 1, 1, 1], 2, False
-             ),  # Four ranks with single token per rank
-
-            # EPLB stats path
-            (4, [32, 32, 32, 32], 2, True),
+            (4, [32, 32, 32, 32], 2, False, 1024, False),
+            (4, [16, 32, 64, 48], 2, False, 1024, False),
+            (2, [100, 50], 2, False, 1024, False),
+            (8, [10, 20, 30, 40, 50, 60, 70, 80], 2, False, 1024, False),
+            (4, [32, 32, 32, 32], 4, False, 1024, False),
+            (4, [32, 32, 32, 32], 8, False, 1024, False),
+            (4, [1, 1, 1, 1], 2, False, 1024, False),
+            (4, [32, 32, 32, 32], 2, True, 1024, False),  # EPLB
+            (4, [2, 2, 2, 2], 2, False, 7168, False),  # DSR1-like hidden
+            (4, [64, 64, 64, 64], 2, False, 7168, False),  # larger batch + DSR1
+            (8, [64, 64, 64, 64, 64, 64, 64, 64
+                 ], 2, False, 7168, False),  # 8-GPU
+            (4, [32, 32, 32, 32
+                 ], 2, False, 1024, True),  # CFT request with fallback
+            (4, [32, 32, 32, 32], 8, False, 1024, True),  # CFT counted writes
+            (4, [1, 1, 1, 1
+                 ], 8, False, 1024, True),  # CFT counted writes, small batch
         ],
         indirect=["mpi_pool_executor"])
     def test_dispatch(self, mpi_pool_executor, all_num_tokens, top_k,
-                      enable_eplb):
-        """Test MoE A2A dispatch with MNNVL across multiple GPUs"""
+                      enable_eplb, hidden_size, can_use_cft_counted_writes):
+        """Test MoE A2A dispatch with MNNVL across multiple GPUs."""
 
         try:
             MnnvlMemory.initialize()
@@ -537,27 +601,18 @@ class TestMoEAlltoAll:
         assert torch.cuda.device_count(
         ) >= ep_size, f"Need at least {ep_size} GPUs, found {torch.cuda.device_count()}"
 
-        hidden_size = 1024
         num_experts = 32
-
-        # Large enough workspace
         workspace_size_per_rank = 512 * 1024 * 1024
-
         invalid_token_expert_id = -1
 
-        # Run dispatch on workers - each worker executes the same logic as single-GPU
-        # but on separate GPUs with MNNVL memory instead of regular CUDA memory
         results = mpi_pool_executor.map(
             run_moe_a2a_dispatch_single_rank,
             *zip(*[(ep_size, all_num_tokens, top_k, workspace_size_per_rank,
                     num_experts, hidden_size, invalid_token_expert_id,
-                    enable_eplb)] * ep_size),
+                    enable_eplb, can_use_cft_counted_writes)] * ep_size),
         )
 
-        # Collect results from all ranks (same as single-GPU collecting from emulated ranks)
         all_results = list(results)
-
-        # Extract results in same format as single-GPU test
         all_token_selected_experts = [r[0] for r in all_results]
         all_payloads = [r[1] for r in all_results]
         all_recv_tensors = [r[2] for r in all_results]
@@ -574,7 +629,6 @@ class TestMoEAlltoAll:
                    for i in all_expert_id_payload_index
                    ), "all_expert_id_payload_index should be the same"
 
-        # Verify dispatch results with content verification
         verify_dispatch(all_token_selected_experts, all_payloads,
                         all_recv_tensors, all_send_counters,
                         all_topk_send_indices, all_topk_target_ranks,
@@ -592,6 +646,7 @@ class TestMoEAlltoAll:
                     expected_stats), (f"Rank {rank} gathered_stats mismatch")
 
     @pytest.mark.threadleak(enabled=False)
+    @pytest.mark.parametrize("can_use_cft_counted_writes", [False, True])
     @pytest.mark.parametrize(
         "mpi_pool_executor,all_num_tokens,top_k,payload_in_workspace,use_fp8_combine",
         [
@@ -623,7 +678,8 @@ class TestMoEAlltoAll:
         ],
         indirect=["mpi_pool_executor"])
     def test_combine(self, mpi_pool_executor, all_num_tokens, top_k,
-                     payload_in_workspace, use_fp8_combine):
+                     payload_in_workspace, use_fp8_combine,
+                     can_use_cft_counted_writes):
         """Test MoE A2A combine with MNNVL across multiple GPUs.
 
         When use_fp8_combine=True, runs two back-to-back rounds (BF16 reference then FP8)
@@ -656,7 +712,8 @@ class TestMoEAlltoAll:
             run_moe_a2a_dispatch_moe_combine_single_rank,
             *zip(*[(ep_size, all_num_tokens, top_k, workspace_size_per_rank,
                     num_experts, hidden_size, invalid_token_expert_id,
-                    payload_in_workspace, use_fp8_combine)] * ep_size),
+                    payload_in_workspace, use_fp8_combine,
+                    can_use_cft_counted_writes)] * ep_size),
         )
 
         try:
@@ -670,6 +727,56 @@ class TestMoEAlltoAll:
         else:
             verify_combine(all_results, ep_size, rtol=0.1, atol=0.5)
 
+    @pytest.mark.threadleak(enabled=False)
+    @pytest.mark.parametrize(
+        "mpi_pool_executor,hidden_size,payload_dtype,expected_cft_combine,check_zero_runtime",
+        [
+            (4, 8, torch.bfloat16, False, True),
+            (4, 8, torch.float16, False, False),
+            (4, 16, torch.float16, True, False),
+            (4, 16, torch.float32, True, False),
+        ],
+        indirect=["mpi_pool_executor"],
+    )
+    def test_low_precision_combine_wire_alignment_and_output_dtype(
+            self, mpi_pool_executor, hidden_size, payload_dtype,
+            expected_cft_combine, check_zero_runtime):
+        """Verify FP8 wire alignment and payload-dtype output for fence and CFT combine."""
+        try:
+            MnnvlMemory.initialize()
+            assert MnnvlMemory.supports_mnnvl()
+        except Exception:
+            pytest.skip("MNNVL not supported on this system")
+
+        ep_size = mpi_pool_executor.num_workers
+        if ep_size > torch.cuda.device_count():
+            pytest.skip(
+                f"Need at least {ep_size} GPUs to run this test, but only {torch.cuda.device_count()} are available"
+            )
+
+        all_num_tokens = [16] * ep_size
+        worker_args = (
+            ep_size,
+            all_num_tokens,
+            2,
+            512 * 1024 * 1024,
+            32,
+            hidden_size,
+            -1,
+            False,
+            True,
+            True,
+            payload_dtype,
+            expected_cft_combine,
+            check_zero_runtime,
+        )
+        results = mpi_pool_executor.map(
+            run_moe_a2a_dispatch_moe_combine_single_rank,
+            *zip(*[worker_args] * ep_size),
+        )
+        all_results = list(results)
+        verify_combine(all_results, ep_size, rtol=0.13, atol=1.0)
+
 
 def run_moe_a2a_dispatch_moe_combine_single_rank(
         ep_size,
@@ -680,13 +787,19 @@ def run_moe_a2a_dispatch_moe_combine_single_rank(
         hidden_size,
         invalid_token_expert_id,
         payload_in_workspace=False,
-        use_low_precision_combine=False):
+        use_low_precision_combine=False,
+        can_use_cft_counted_writes=False,
+        payload_dtype=torch.bfloat16,
+        expected_cft_combine=None,
+        check_zero_runtime=False):
     """Worker function for dispatch and combine test.
 
     Runs one dispatch+combine round and returns
     (token_selected_experts, payloads, combined_output, rank_experts) for
     ground-truth verification via verify_combine.
     """
+    from tensorrt_llm._torch.distributed import MoeAlltoAll as WorkerMoeAlltoAll
+
     rank = tllm.mpi_rank()
     torch.cuda.set_device(rank)
     device = torch.cuda.current_device()
@@ -699,25 +812,34 @@ def run_moe_a2a_dispatch_moe_combine_single_rank(
                           moe_ep_size=ep_size,
                           world_size=ep_size)
 
-        moe_a2a = MoeAlltoAll(
-            mapping=mapping,
-            max_num_tokens=max_num_tokens,
-            top_k=top_k,
-            num_slots=num_experts,
-            workspace_size_per_rank=workspace_size_per_rank,
-        )
+        def create_moe_a2a():
+            return WorkerMoeAlltoAll(
+                mapping=mapping,
+                max_num_tokens=max_num_tokens,
+                top_k=top_k,
+                num_slots=num_experts,
+                workspace_size_per_rank=workspace_size_per_rank,
+                can_use_cft_counted_writes=can_use_cft_counted_writes,
+            )
+
+        if expected_cft_combine is not None:
+            with patch.dict(os.environ, {FORCE_CFT_ENV: "1"}):
+                moe_a2a = create_moe_a2a()
+        else:
+            moe_a2a = create_moe_a2a()
 
         token_selected_experts = generate_token_selected_experts(
             rank_local_tokens, num_experts, top_k)
-        payloads, expert_id_payload_index = make_bfloat16_payloads(
-            rank_local_tokens, hidden_size, top_k, rank, token_selected_experts)
+        payloads, expert_id_payload_index = make_floating_point_payloads(
+            rank_local_tokens, hidden_size, top_k, rank, token_selected_experts,
+            payload_dtype)
 
         num_experts_per_rank = num_experts // ep_size
         rank_experts = create_experts_per_rank(num_experts_per_rank,
                                                hidden_size,
                                                rank,
                                                device,
-                                               dtype=torch.bfloat16)
+                                               dtype=payload_dtype)
 
         def dispatch_and_fake_moe():
             """Run one dispatch round and return fake-MoE output [ep_size, max_tokens, hidden]."""
@@ -743,12 +865,11 @@ def run_moe_a2a_dispatch_moe_combine_single_rank(
             """Call combine, optionally staging moe_out via workspace buffer."""
             if payload_in_workspace:
                 ws = moe_a2a.get_combine_payload_tensor_in_workspace(
-                    max_num_tokens, hidden_size, torch.bfloat16)
+                    max_num_tokens, hidden_size, payload_dtype)
                 ws.copy_(moe_out.view(-1, hidden_size))
                 return moe_a2a.combine(
                     ws.view(ep_size, max_num_tokens, hidden_size),
                     max_num_tokens,
-                    payload_in_workspace=True,
                     use_low_precision_combine=use_low_precision,
                 )
             return moe_a2a.combine(moe_out,
@@ -756,23 +877,75 @@ def run_moe_a2a_dispatch_moe_combine_single_rank(
                                    use_low_precision_combine=use_low_precision)
 
         moe_out = dispatch_and_fake_moe()
+        if check_zero_runtime:
+            combine_payload_offset = moe_a2a._state.combine_payload_offset
+            assert combine_payload_offset is not None
+            zero_runtime_payload = moe_out.new_empty((ep_size, 0, hidden_size))
+            with pytest.raises(
+                    RuntimeError,
+                    match="runtimeMaxTokensPerRank must be positive"):
+
+                def combine(*args, **kwargs):
+                    return torch.ops.trtllm.moe_a2a_combine(*args, **kwargs)
+
+                combine(
+                    zero_runtime_payload,
+                    0,
+                    moe_a2a.workspace,
+                    moe_a2a.metainfo,
+                    0,
+                    rank,
+                    ep_size,
+                    top_k,
+                    int(combine_payload_offset),
+                    use_low_precision=False,
+                    use_cft_counted_writes=False,
+                    enable_rank_mask=False,
+                    active_rank_mask=None,
+                )
+        completion_flags_offset = moe_a2a.metainfo[
+            WorkerMoeAlltoAll.
+            _METAINFO_INDEX["COMBINE_COMPLETION_FLAGS_OFFSET_INDEX"]].item()
+        completion_flags_before = moe_a2a.workspace[
+            rank, completion_flags_offset:completion_flags_offset +
+            ep_size * 4].view(torch.int32).cpu().clone()
+
         combined_output = _combine(moe_out,
                                    use_low_precision=use_low_precision_combine)
+        assert combined_output.dtype == payload_dtype
 
-        # Verify completion flags after combine
-        completion_flags_offset = moe_a2a.metainfo[MoeAlltoAll._METAINFO_INDEX[
-            "COMBINE_COMPLETION_FLAGS_OFFSET_INDEX"]].item()
-        completion_flags = moe_a2a.workspace[
+        requested_cft_combine = moe_a2a.use_cft_for_combine(max_num_tokens)
+        payload_element_size = torch.empty((),
+                                           dtype=payload_dtype).element_size()
+        wire_bytes_per_token = hidden_size * (1 if use_low_precision_combine
+                                              else payload_element_size)
+        cft_eligible = requested_cft_combine and wire_bytes_per_token % 16 == 0
+        if expected_cft_combine is not None:
+            assert requested_cft_combine
+            assert cft_eligible is expected_cft_combine
+
+        completion_flags_after = moe_a2a.workspace[
             rank, completion_flags_offset:completion_flags_offset +
             ep_size * 4].view(torch.int32).cpu()
         flag_val_offset = moe_a2a.metainfo[
-            MoeAlltoAll._METAINFO_INDEX["FLAG_VAL_OFFSET_INDEX"]].item()
+            WorkerMoeAlltoAll._METAINFO_INDEX["FLAG_VAL_OFFSET_INDEX"]].item()
         expected_flag_val = moe_a2a.workspace[rank,
                                               flag_val_offset:flag_val_offset +
                                               4].view(torch.int32).cpu()
-        assert torch.all(completion_flags == expected_flag_val), (
-            f"Rank {rank} completion flags: {completion_flags}, expected flag val: {expected_flag_val}"
-        )
+
+        # Completion flags are written only by fence combine. Their unchanged
+        # value positively distinguishes an eligible CFT launch from fallback.
+        if cft_eligible:
+            assert torch.equal(
+                completion_flags_after, completion_flags_before
+            ), (f"Rank {rank} CFT combine changed completion flags: "
+                f"before={completion_flags_before}, after={completion_flags_after}"
+                )
+            assert not torch.all(completion_flags_before == expected_flag_val)
+        else:
+            assert torch.all(completion_flags_after == expected_flag_val), (
+                f"Rank {rank} completion flags: {completion_flags_after}, expected flag val: {expected_flag_val}"
+            )
 
         return (
             token_selected_experts.cpu(),

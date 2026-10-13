@@ -17,7 +17,12 @@ import numpy as np
 import pytest
 
 import tensorrt_llm._torch.disaggregation.native.peer as peer_module
-from tensorrt_llm._torch.disaggregation.base.region import MemRegionGroup, SpecRegion
+from tensorrt_llm._torch.disaggregation.base.region import (
+    IndexRange,
+    KVRegionSpec,
+    MemRegionGroup,
+    SpecRegion,
+)
 from tensorrt_llm._torch.disaggregation.native.auxiliary import (
     AuxBufferMeta,
     build_aux_transfer_layout,
@@ -780,6 +785,37 @@ def test_replicated_mapper_ignores_kv_head_mismatch():
     assert isinstance(mapper, ReplicatedMapper)
 
 
+def test_peer_registrar_builds_mapper_for_different_replicated_ring_sizes():
+    self_pt = make_page_table(block_bytes=[32], global_layer_ids=[0])
+    peer_pt = make_page_table(block_bytes=[46], global_layer_ids=[0])
+    for page_table, window_size in ((self_pt, 16), (peer_pt, 23)):
+        layer_group = page_table.layer_groups[0]
+        layer_group.sliding_window_size = window_size
+        layer_group.pool_views[0].mapper_kind = MapperKind.REPLICATED
+
+    self_ri = make_rankinfo(instance_name="local", page_table=self_pt)
+    peer_ri = make_rankinfo(instance_name="peer", page_table=peer_pt)
+    mapper = _make_peer_registrar(self_ri).get_kv_map(peer_ri, (0, 0), (0, 0))
+    token_spec = KVRegionSpec(tokens=IndexRange(0, 6))
+
+    pair = mapper.map(
+        SpecRegion(
+            memory=MemRegionGroup(ptrs=np.array([1000]), bytes_per_region=32),
+            spec=token_spec,
+        ),
+        SpecRegion(
+            memory=MemRegionGroup(ptrs=np.array([2000]), bytes_per_region=46),
+            spec=token_spec,
+        ),
+    )
+
+    assert isinstance(mapper, ReplicatedMapper)
+    assert not isinstance(pair, list)
+    assert pair.src.memory.ptrs.tolist() == [1000]
+    assert pair.dst.memory.ptrs.tolist() == [2000]
+    assert pair.src.memory.bytes_per_region == 14
+
+
 @pytest.mark.parametrize("peer_dp_rank", [0, 1, 3, 7])
 def test_replicated_pool_owner_rotates_by_destination_dp_rank(peer_dp_rank):
     """Exactly one owner per fan-in group, rotated by destination DP rank.
@@ -905,6 +941,76 @@ def test_replicated_mapper_selects_partial_layer_range():
     assert pair.dst.memory.ptrs.tolist() == [2128]
     assert pair.src.memory.bytes_per_region == 256
     assert pair.dst.memory.bytes_per_region == 256
+
+
+def test_replicated_mapper_remaps_different_ring_sizes_by_token_position():
+    mapper = ReplicatedMapper(
+        src_layer_offsets=[0, 32],
+        dst_layer_offsets=[0, 46],
+        self_bytes_per_layer=32,
+        peer_bytes_per_layer=46,
+        self_window_size=16,
+        peer_window_size=23,
+    )
+    token_spec = KVRegionSpec(tokens=IndexRange(0, 2032))
+
+    pairs = mapper.map(
+        SpecRegion(
+            memory=MemRegionGroup(ptrs=np.array([1000]), bytes_per_region=64),
+            spec=token_spec,
+        ),
+        SpecRegion(
+            memory=MemRegionGroup(ptrs=np.array([2000]), bytes_per_region=92),
+            spec=token_spec,
+        ),
+    )
+
+    assert isinstance(pairs, list)
+    assert [pair.src.memory.ptrs.tolist() for pair in pairs] == [
+        [1002],
+        [1016],
+        [1000],
+        [1034],
+        [1048],
+        [1032],
+    ]
+    assert [pair.dst.memory.ptrs.tolist() for pair in pairs] == [
+        [2032],
+        [2000],
+        [2016],
+        [2078],
+        [2046],
+        [2062],
+    ]
+    assert [pair.src.memory.bytes_per_region for pair in pairs] == [14, 16, 2] * 2
+
+
+def test_replicated_mapper_remaps_only_tokens_in_short_slice():
+    mapper = ReplicatedMapper(
+        src_layer_offsets=[0],
+        dst_layer_offsets=[0],
+        self_bytes_per_layer=32,
+        peer_bytes_per_layer=46,
+        self_window_size=16,
+        peer_window_size=23,
+    )
+    token_spec = KVRegionSpec(tokens=IndexRange(0, 6))
+
+    pair = mapper.map(
+        SpecRegion(
+            memory=MemRegionGroup(ptrs=np.array([1000]), bytes_per_region=32),
+            spec=token_spec,
+        ),
+        SpecRegion(
+            memory=MemRegionGroup(ptrs=np.array([2000]), bytes_per_region=46),
+            spec=token_spec,
+        ),
+    )
+
+    assert not isinstance(pair, list)
+    assert pair.src.memory.ptrs.tolist() == [1000]
+    assert pair.dst.memory.ptrs.tolist() == [2000]
+    assert pair.src.memory.bytes_per_region == 14
 
 
 def test_intact_mapper_splits_non_contiguous_runs():

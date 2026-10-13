@@ -7,6 +7,8 @@ cpython/3.12.3:
   license: 6b70c6504cc6568717ab251175a8699d
 cpython/3.12.3-1ubuntu0.10:
   license: 372bbae375b8828b3a20ea23c46c7ada
+cpython/3.12.3-1ubuntu0.13:
+  license: ca56ff80381c00551629a93a910ac5f5
 cpython/3.12.3-1ubuntu0.9:
   license: 372bbae375b8828b3a20ea23c46c7ada
 cublas/13.2.0.9-1:
@@ -20,6 +22,10 @@ cutlass/v4.3.0:
   copyright: 501a1dd5925b22dbe66ce8f195440dec
   license: 0d49472f2c1269d573d79e5603778a9f
   source: https://github.com/NVIDIA/cutlass/tree/v4.3.0
+cutlass/v4.4.2:
+  copyright: aa8578535b24304362e63f0e170d8e60
+  license: 1078b45037d7c56c5c2af36977a4d08e
+  source: https://github.com/NVIDIA/cutlass/tree/v4.4.2
 deep_ep/5be51b228a7c82dbdb213ea58e77bffd12b38af8:
   license: 452b3ef002dc6ec283fb723f0dd84997
   source: https://github.com/deepseek-ai/DeepEP/tree/5be51b228a7c82dbdb213ea58e77bffd12b38af8
@@ -74,6 +80,10 @@ rdma-core/48.0-1.el8:
   license: eec97e837a0d52da36561c007217addc
 rdma-core/50.0-2ubuntu0.2:
   license: 4c30c6f2038e5bb7fa56d509956f4187
+rdma-core/59.1-1:
+  license: 4c30c6f2038e5bb7fa56d509956f4187
+rdma-core/63.0-1:
+  license: fca6fdeb110f959640a5b0bc70508a56
 robin-map/v1.4.0:
   license: 4b2ffa3f44ee005bc77967654efc7ef4
 tensorrt/10.14.1:

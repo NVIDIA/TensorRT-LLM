@@ -32,6 +32,11 @@ AARCH64_TRIPLE = "aarch64-linux-gnu"
 
 LLM_DOCKER_IMAGE = env.dockerImage
 
+// RubinBringup CUDA13.4 images - architecture-specific
+// x86_64 version
+LLM_DOCKER_IMAGE_RUBIN_X86_64 = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:pytorch-rubin-py3-x86_64-ubuntu24.04-trt10.16.1.11-20260627-upgraded"
+// aarch64 version
+LLM_DOCKER_IMAGE_RUBIN_AARCH64 = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:pytorch-rubin-py3-sbsa-ubuntu24.04-trt10.16.1.11-20260627-upgraded"
 // Always use x86_64 image for agent
 AGENT_IMAGE = env.dockerImage.replace("aarch64", "x86_64").replace("sbsa", "x86_64")
 
@@ -63,6 +68,15 @@ def CONFIG_LINUX_X86_64_SINGLE_DEVICE = "linux_x86_64_SingleDevice"
 def CONFIG_LINUX_X86_64_LLVM = "linux_x86_64_LLVM"
 
 @Field
+def CONFIG_LINUX_X86_64_RUBIN_BRINGUP = "linux_x86_64_RubinBringup"
+
+@Field
+def CONFIG_LINUX_X86_64_RUBIN_BRINGUP_CUDA13_4 = "linux_x86_64_RubinBringupCUDA13_4"
+
+@Field
+def CONFIG_LINUX_AARCH64_RUBIN_BRINGUP_CUDA13_4 = "linux_aarch64_RubinBringupCUDA13_4"
+
+@Field
 def CONFIG_LINUX_AARCH64 = "linux_aarch64"
 
 @Field
@@ -87,6 +101,22 @@ def BUILD_CONFIGS = [
     (WHEEL_EXTRA_ARGS) : "--extra-cmake-vars ENABLE_MULTI_DEVICE=1 --extra-cmake-vars WARNING_IS_ERROR=ON --extra-cmake-vars ENABLE_BOLT_COMPATIBLE=ON --micro_benchmarks -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_CUDA_HOST_COMPILER=clang -DCMAKE_LINKER_TYPE=LLD",
     (TARNAME) : "llvm-TensorRT-LLM.tar.gz",
     (WHEEL_ARCHS): "80-real;86-real;89-real;90-real;100-real;103-real;120-real",
+  ],
+  (CONFIG_LINUX_X86_64_RUBIN_BRINGUP) : [
+    (WHEEL_EXTRA_ARGS) : "--nvrtc_dynamic_linking --extra-cmake-vars WARNING_IS_ERROR=ON --extra-cmake-vars CMAKE_CXX_FLAGS=-DTRTLLM_FAKE_RUBIN=1",
+    (TARNAME) : "RubinBringup-TensorRT-LLM.tar.gz",
+    (WHEEL_ARCHS): "100-real",
+  ],
+  (CONFIG_LINUX_X86_64_RUBIN_BRINGUP_CUDA13_4) : [
+    (WHEEL_EXTRA_ARGS) : "--nvrtc_dynamic_linking --extra-cmake-vars WARNING_IS_ERROR=ON",
+    (TARNAME) : "RubinBringup-TensorRT-LLM-CUDA13.4.tar.gz",
+    (WHEEL_ARCHS): "100-real;107-real",
+  ],
+  (CONFIG_LINUX_AARCH64_RUBIN_BRINGUP_CUDA13_4) : [
+    (WHEEL_EXTRA_ARGS) : "--nvrtc_dynamic_linking --extra-cmake-vars WARNING_IS_ERROR=ON",
+    (TARNAME) : "RubinBringup-TensorRT-LLM-VR200-CUDA13.4.tar.gz",
+    (WHEEL_ARCHS): "100-real;107-real",
+    (BUILD_JOBS_FOR_CONFIG): "8",
   ],
   (CONFIG_LINUX_AARCH64): [
     (WHEEL_EXTRA_ARGS) : "--extra-cmake-vars WARNING_IS_ERROR=ON --extra-cmake-vars NIXL_ROOT=/opt/nvidia/nvda_nixl --extra-cmake-vars MOONCAKE_ROOT=/usr/local/Mooncake --extra-cmake-vars ENABLE_BOLT_COMPATIBLE=ON",
@@ -542,11 +572,8 @@ def launchStages(pipeline, cpu_arch, enableFailFast, globalVars)
         globalVars[ACTION_INFO] = trtllm_utils.setupPipelineDescription(pipeline, globalVars[ACTION_INFO])
     }
 
-    def wheelDockerImage = env.wheelDockerImagePy310
-    if (!wheelDockerImage && cpu_arch == AARCH64_TRIPLE) {
-        wheelDockerImage = env.dockerImage
-    }
-
+    // Select the architecture-matched Rubin bringup image while retaining the standard builds.
+    def LLM_DOCKER_IMAGE_RUBIN = cpu_arch == AARCH64_TRIPLE ? LLM_DOCKER_IMAGE_RUBIN_AARCH64 : LLM_DOCKER_IMAGE_RUBIN_X86_64
     def versionOverride = globalVars[TRTLLM_VERSION_OVERRIDE] ?: ""
     buildConfigs = [
         "Build TRT-LLM": [LLM_DOCKER_IMAGE] + prepareLLMBuild(
@@ -558,6 +585,11 @@ def launchStages(pipeline, cpu_arch, enableFailFast, globalVars)
             pipeline,
             cpu_arch == AARCH64_TRIPLE ?
                 CONFIG_LINUX_AARCH64_LLVM : CONFIG_LINUX_X86_64_LLVM,
+            versionOverride),
+        "Build TRT-LLM RubinBringup CUDA13.4": [LLM_DOCKER_IMAGE_RUBIN] + prepareLLMBuild(
+            pipeline,
+            cpu_arch == AARCH64_TRIPLE ?
+                CONFIG_LINUX_AARCH64_RUBIN_BRINGUP_CUDA13_4 : CONFIG_LINUX_X86_64_RUBIN_BRINGUP_CUDA13_4,
             versionOverride),
     ]
 
@@ -601,7 +633,7 @@ def launchStages(pipeline, cpu_arch, enableFailFast, globalVars)
                     stage(key) {
                         stage("[${key}] Run") {
                             echoNodeAndGpuInfo(pipeline, key)
-                            buildWheelInContainer(pipeline, [], X86_64_TRIPLE, false, false, "cp312", "-a '90-real' -b Debug --micro_benchmarks")
+                            buildWheelInContainer(pipeline, [], X86_64_TRIPLE, false, false, "cp312", "-a '90-real;100-real' -b Debug --benchmarks --micro_benchmarks")
                         }
                     }
                 })

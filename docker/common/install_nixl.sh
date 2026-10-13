@@ -1,4 +1,19 @@
 #!/bin/bash
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+
 set -ex
 
 GITHUB_URL="https://github.com"
@@ -49,4 +64,21 @@ cd ../..
 rm -rf nixl*  # Remove NIXL source tree to save space
 export LD_LIBRARY_PATH=$OLD_LD_LIBRARY_PATH
 
+# Consumers import `nixl`, but the build above installs the backend as
+# `nixl_cu13`. Install the dispatching shim with --no-deps: the backend it would
+# otherwise pull from PyPI bundles a second UCX, which segfaults alongside the
+# one torch already links.
+pip3 install --no-deps "nixl==${NIXL_VERSION#v}"
+
 echo "export LD_LIBRARY_PATH=/opt/nvidia/nvda_nixl/lib/${ARCH_NAME}:/opt/nvidia/nvda_nixl/lib64:\$LD_LIBRARY_PATH" >> "${ENV}"
+# ninja installs the bindings outside site-packages, so the shim needs PYTHONPATH. This takes
+# precedence over the PyPI backend that requirements-dev.txt installs into the test
+# environments, so keep that pin in step with NIXL_VERSION above -- otherwise the wheel is
+# installed and silently never used.
+# Prepend only once: ${ENV} is sourced again by every nested shell.
+cat >> "${ENV}" <<'EOF'
+case ":${PYTHONPATH:-}:" in
+  *":/opt/nvidia/nvda_nixl/lib/python3/dist-packages:"*) ;;
+  *) export PYTHONPATH="/opt/nvidia/nvda_nixl/lib/python3/dist-packages${PYTHONPATH:+:${PYTHONPATH}}" ;;
+esac
+EOF

@@ -6,10 +6,31 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from tensorrt_llm._torch.attention_backend.fmha.cute_dsl_mla import CuteDslMlaFmha
 from tensorrt_llm._torch.attention_backend.fmha.flashinfer_trtllm_gen import (
     FlashInferTrtllmGenFmha,
     _get_multi_ctas_kv_counter_size,
 )
+from tensorrt_llm._torch.attention_backend.interface import AttentionForwardArgs, AttentionInputType
+from tensorrt_llm._torch.autotuner import AutoTuner
+from tensorrt_llm._torch.pyexecutor.resource_manager import DataType
+
+
+class _AttentionStub:
+    def __init__(
+        self,
+        *,
+        is_mla_enable: bool,
+        has_fp8_kv_cache: bool,
+        flashinfer_mla_backend: str = "trtllm-gen",
+    ) -> None:
+        self.is_mla_enable = is_mla_enable
+        self.has_fp8_kv_cache = has_fp8_kv_cache
+        self.flashinfer_mla_backend = flashinfer_mla_backend
+        self.mla_backend_policy = None
+        self.kv_lora_rank = 512 if is_mla_enable else None
+        self.head_dim = 576
+        self.v_head_dim = 512 if is_mla_enable else None
 
 
 def _get_total_num_blocks(manager: SimpleNamespace, kv_factor: int = 2) -> int:
@@ -34,6 +55,23 @@ def test_flashinfer_preserves_legacy_pool_scaling() -> None:
         num_local_layers=36,
     )
     assert _get_total_num_blocks(manager, kv_factor=2) == 1024 * 36 * 2
+
+
+def test_flashinfer_uses_layer_specific_v2_pool_properties() -> None:
+    manager = SimpleNamespace(
+        dtype=DataType.NVFP4,
+        impl=SimpleNamespace(get_page_index_upper_bound=lambda *_: 99),
+        get_kv_cache_num_blocks=lambda layer_idx: 1234 + layer_idx,
+        get_kv_cache_dtype=lambda layer_idx: (DataType.BF16 if layer_idx == 7 else DataType.NVFP4),
+    )
+    fmha = object.__new__(FlashInferTrtllmGenFmha)
+    fmha.attn = SimpleNamespace(layer_idx=7)
+
+    assert fmha._get_total_num_blocks(SimpleNamespace(kv_cache_manager=manager)) == 1241
+    assert (
+        fmha._get_kv_cache_dtype(SimpleNamespace(kv_cache_manager=manager), layer_idx=7)
+        == DataType.BF16
+    )
 
 
 def test_multi_ctas_kv_counter_size_covers_beam_expanded_batch() -> None:
@@ -96,3 +134,170 @@ def test_prepare_workspace_sizes_counter_for_max_num_sequences(
             forward_args=SimpleNamespace(),
             workspace=SimpleNamespace(),
         )
+
+
+def test_flashinfer_cute_dsl_mla_backend_accepts_fp8_kv_cache() -> None:
+    attn = _AttentionStub(
+        is_mla_enable=True,
+        has_fp8_kv_cache=True,
+        flashinfer_mla_backend="cute-dsl",
+    )
+
+    fmha = FlashInferTrtllmGenFmha(attn)
+
+    assert fmha._mla_backend == "cute-dsl"
+    assert fmha._get_effective_mla_backend(SimpleNamespace(), 1) == "cute-dsl"
+
+
+def test_flashinfer_trtllm_gen_mla_backend_accepts_fp8_kv_cache() -> None:
+    attn = _AttentionStub(
+        is_mla_enable=True,
+        has_fp8_kv_cache=True,
+        flashinfer_mla_backend="trtllm-gen",
+    )
+
+    fmha = FlashInferTrtllmGenFmha(attn)
+
+    assert fmha._mla_backend == "trtllm-gen"
+
+
+def _cute_dsl_mla_helix_support(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    seq_len_q: int = 1,
+    softmax_stats: torch.Tensor | None,
+) -> tuple[bool, str]:
+    batch_size, num_heads = 2, 96
+    q = torch.empty(
+        (batch_size * seq_len_q, num_heads * (512 + 64)),
+        dtype=torch.bfloat16,
+    )
+    output = torch.empty(
+        (batch_size * seq_len_q, num_heads * 512),
+        dtype=torch.bfloat16,
+    )
+    attn = SimpleNamespace(
+        num_heads=num_heads,
+        has_fp8_kv_cache=False,
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+        layer_idx=0,
+    )
+    metadata = SimpleNamespace(
+        num_contexts=0,
+        num_generations=batch_size,
+        beam_width=1,
+        is_spec_dec_tree=False,
+        is_spec_dec_dynamic_tree=False,
+        helix_position_offsets=torch.zeros(batch_size, dtype=torch.int32),
+        kv_cache_manager=SimpleNamespace(
+            get_buffers=lambda _layer_idx: torch.empty(0, dtype=torch.bfloat16)
+        ),
+        tokens_per_block=64,
+    )
+    forward_args = AttentionForwardArgs(
+        output=output,
+        attention_input_type=AttentionInputType.generation_only,
+        softmax_stats_tensor=softmax_stats,
+    )
+
+    monkeypatch.setattr(
+        AutoTuner,
+        "get",
+        classmethod(lambda _cls: SimpleNamespace(is_tuning_mode=False)),
+    )
+    monkeypatch.setattr(
+        CuteDslMlaFmha,
+        "_kernel_can_implement",
+        staticmethod(lambda *_args: (True, "")),
+    )
+    fmha = object.__new__(CuteDslMlaFmha)
+    return fmha._is_supported_with_reason(q, attn, metadata, forward_args)
+
+
+def test_cute_dsl_mla_accepts_single_token_helix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stats = torch.empty((2, 96, 2), dtype=torch.float32)
+
+    supported, reason = _cute_dsl_mla_helix_support(monkeypatch, softmax_stats=stats)
+
+    assert supported, reason
+
+
+@pytest.mark.parametrize(
+    ("seq_len_q", "softmax_stats", "reason"),
+    [
+        (2, torch.empty((4, 96, 2), dtype=torch.float32), "single-token decode"),
+        (1, None, "requires softmax_stats_tensor"),
+        (1, torch.empty((2, 95, 2), dtype=torch.float32), "shape"),
+        (1, torch.empty((2, 96, 2), dtype=torch.bfloat16), "float32"),
+    ],
+)
+def test_cute_dsl_mla_rejects_invalid_helix_contract(
+    monkeypatch: pytest.MonkeyPatch,
+    seq_len_q: int,
+    softmax_stats: torch.Tensor | None,
+    reason: str,
+) -> None:
+    supported, actual_reason = _cute_dsl_mla_helix_support(
+        monkeypatch,
+        seq_len_q=seq_len_q,
+        softmax_stats=softmax_stats,
+    )
+
+    assert not supported
+    assert reason in actual_reason
+
+
+def _make_fmha(requested_backend: str, mla_backend_policy) -> FlashInferTrtllmGenFmha:
+    fmha = object.__new__(FlashInferTrtllmGenFmha)
+    fmha._mla_backend = requested_backend
+    # ``Fmha.attn`` is a read-only property that dereferences ``_attn_ref``
+    # (normally a weakref to the owning TrtllmAttention). SimpleNamespace is
+    # not weak-referenceable, so stand in with a closure of the same shape.
+    attn = SimpleNamespace(mla_backend_policy=mla_backend_policy)
+    fmha._attn_ref = lambda: attn
+    return fmha
+
+
+@pytest.mark.parametrize("requested_backend", ["cute-dsl", "trtllm-gen"])
+@pytest.mark.parametrize(
+    ("num_contexts", "num_generations", "num_tokens"),
+    [
+        (0, 4, 4),  # generation-only, one token per request
+        (1, 3, 4),  # mixed context/generation batch
+        (0, 4, 8),  # multi-token generation (speculative verification)
+    ],
+)
+def test_flashinfer_mla_backend_default_matches_static_selection(
+    requested_backend: str,
+    num_contexts: int,
+    num_generations: int,
+    num_tokens: int,
+) -> None:
+    """Without an installed policy the static backend is used for every batch
+    composition, matching the behavior before the policy hook existed."""
+    fmha = _make_fmha(requested_backend, mla_backend_policy=None)
+
+    assert (
+        fmha._get_effective_mla_backend(
+            SimpleNamespace(num_contexts=num_contexts, num_generations=num_generations),
+            num_tokens,
+        )
+        == requested_backend
+    )
+
+
+def test_flashinfer_mla_backend_policy_hook_is_consulted() -> None:
+    calls = []
+
+    def policy(requested_backend: str, meta, num_tokens: int) -> str:
+        calls.append((requested_backend, meta, num_tokens))
+        return "trtllm-gen"
+
+    fmha = _make_fmha("cute-dsl", mla_backend_policy=policy)
+    meta = SimpleNamespace(num_contexts=0, num_generations=4)
+
+    assert fmha._get_effective_mla_backend(meta, 4) == "trtllm-gen"
+    assert calls == [("cute-dsl", meta, 4)]

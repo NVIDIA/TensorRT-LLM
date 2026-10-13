@@ -21,6 +21,7 @@ import struct
 import threading
 import time
 import weakref
+from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING, List, Optional, Union
@@ -44,6 +45,7 @@ from tensorrt_llm._torch.disaggregation.base.agent import (
     TransferOp,
     TransferRequest,
 )
+from tensorrt_llm._torch.disaggregation.base.region import IndexRange, KVRegionSpec
 from tensorrt_llm._torch.disaggregation.base.transfer import (
     KVSlice,
     ReceiverBase,
@@ -92,6 +94,49 @@ _FALLBACK_TX_WAIT_SLICE_S = 1.0
 _FALLBACK_TX_OVERALL_TIMEOUT_S = 60.0
 
 
+class _AgentOperationGate:
+    """Reader/writer gate for NIXL transfers and remote-metadata updates."""
+
+    def __init__(self):
+        self._condition = threading.Condition()
+        self._active_transfers = 0
+        self._metadata_active = False
+        self._metadata_waiters = 0
+
+    @contextmanager
+    def transfer(self):
+        with self._condition:
+            # Prefer a waiting metadata update so a continuous transfer stream
+            # cannot starve first-use peer registration.
+            while self._metadata_active or self._metadata_waiters > 0:
+                self._condition.wait()
+            self._active_transfers += 1
+        try:
+            yield
+        finally:
+            with self._condition:
+                self._active_transfers -= 1
+                if self._active_transfers == 0:
+                    self._condition.notify_all()
+
+    @contextmanager
+    def metadata(self):
+        with self._condition:
+            self._metadata_waiters += 1
+            try:
+                while self._metadata_active or self._active_transfers > 0:
+                    self._condition.wait()
+                self._metadata_active = True
+            finally:
+                self._metadata_waiters -= 1
+        try:
+            yield
+        finally:
+            with self._condition:
+                self._metadata_active = False
+                self._condition.notify_all()
+
+
 @dataclass
 class RecvReqInfo:
     sender_req_id: int
@@ -107,6 +152,7 @@ class RecvReqInfo:
     aux_slot: Optional[int] = None
     mamba_state_index: Optional[int] = None
     slice_id: Optional[int] = None
+    need_aux: bool = False
     bounce_dst_base: Optional[int] = None
 
     def to_bytes(self) -> bytes:
@@ -123,6 +169,7 @@ class RecvReqInfo:
                 "aux_slot": self.aux_slot,
                 "mamba_state_index": self.mamba_state_index,
                 "slice_id": self.slice_id,
+                "need_aux": self.need_aux,
                 "bounce_dst_base": self.bounce_dst_base,
             }
         )
@@ -164,6 +211,9 @@ class WriteMeta:
     is_last_slice: bool = False
     meta_type: WriteMetaType = WriteMetaType.KV
     bounce_dst_base: Optional[int] = None
+    # Set by Sender._enqueue while the work item owns the Tx session's
+    # queued-or-active lifetime reservation. Worker completion releases it.
+    owner_session: Optional["TxSession"] = None
 
 
 class MessageType:
@@ -226,6 +276,126 @@ def _make_kv_result_msg(
     if tail:
         msg += tail
     return msg
+
+
+@dataclass
+class _QueuedMessage:
+    endpoint: str
+    message: list[bytes]
+    initial_attempt: bool = True
+
+
+class _ReliableMessageOutbox:
+    """Single-threaded, at-least-once delivery for terminal control messages.
+
+    All ZMQ DEALER creation/use/destruction stays on the outbox thread. New
+    messages get a small burst of immediate reconnect attempts; persistent
+    failures are requeued at the tail so one unavailable endpoint cannot starve
+    other sessions. A successful ZMQ send is considered reliably queued.
+    """
+
+    _IMMEDIATE_ATTEMPTS = 2
+    _RETRY_INTERVAL_S = 0.05
+
+    def __init__(self, owner_name: str, *, start: bool = True):
+        self._owner_name = owner_name
+        self._queue: queue.Queue[Optional[_QueuedMessage]] = queue.Queue()
+        self._stop = threading.Event()
+        self._state_lock = threading.Lock()
+        self._dealers: dict[str, ZMQMessenger] = {}
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._started = False
+        if start:
+            self.start()
+
+    def start(self) -> None:
+        with self._state_lock:
+            if self._started:
+                return
+            if self._stop.is_set():
+                raise RuntimeError(f"{self._owner_name} message outbox is stopped")
+            self._started = True
+            self._thread.start()
+
+    def submit(self, endpoint: str, message: list[bytes]) -> bool:
+        if not endpoint:
+            raise ValueError(f"{self._owner_name}: peer endpoint is empty")
+        with self._state_lock:
+            if self._stop.is_set():
+                logger.error(
+                    f"Cannot queue reliable message for endpoint {endpoint}: "
+                    f"{self._owner_name} outbox is shutting down"
+                )
+                return False
+            # Copy the multipart list so callers may safely reuse their object.
+            self._queue.put(_QueuedMessage(endpoint, list(message)))
+            return True
+
+    def _get_or_connect_dealer(self, endpoint: str) -> ZMQMessenger:
+        if endpoint not in self._dealers:
+            self._dealers[endpoint] = ZMQMessenger(mode="DEALER", endpoint=endpoint)
+        return self._dealers[endpoint]
+
+    def _drop_dealer(self, endpoint: str) -> None:
+        dealer = self._dealers.pop(endpoint, None)
+        if dealer is None:
+            return
+        try:
+            dealer.stop()
+        except Exception as exc:
+            logger.warning(
+                f"{self._owner_name} outbox failed to close dealer for endpoint {endpoint}: {exc}"
+            )
+
+    def _try_send(self, pending: _QueuedMessage) -> bool:
+        attempts = self._IMMEDIATE_ATTEMPTS if pending.initial_attempt else 1
+        for attempt in range(1, attempts + 1):
+            try:
+                self._get_or_connect_dealer(pending.endpoint).send(pending.message)
+                return True
+            except Exception as exc:
+                self._drop_dealer(pending.endpoint)
+                logger.warning(
+                    f"{self._owner_name} reliable send failed for endpoint "
+                    f"{pending.endpoint} (attempt {attempt}/{attempts}): {exc}"
+                )
+        return False
+
+    def process_once(self) -> bool:
+        """Process one queued item; return False for the shutdown sentinel."""
+        pending = self._queue.get()
+        if pending is None:
+            return False
+        if not self._try_send(pending):
+            pending.initial_attempt = False
+            if not self._stop.is_set():
+                self._queue.put(pending)
+            self._stop.wait(self._RETRY_INTERVAL_S)
+        return True
+
+    def _run(self) -> None:
+        try:
+            while self.process_once():
+                pass
+        finally:
+            for endpoint in list(self._dealers):
+                self._drop_dealer(endpoint)
+
+    def shutdown(self, timeout: float = 5.0) -> None:
+        with self._state_lock:
+            if self._stop.is_set():
+                return
+            self._stop.set()
+            if not self._started:
+                return
+            # FIFO ordering gives every already-queued message one final send
+            # attempt before the sentinel terminates the worker.
+            self._queue.put(None)
+        self._thread.join(timeout=timeout)
+        if self._thread.is_alive():
+            logger.warning(
+                f"{self._owner_name} reliable-message outbox did not terminate within {timeout:g}s"
+            )
 
 
 class SendTaskBase:
@@ -298,6 +468,9 @@ class Sender(SenderBase):
     # RecvReqInfo that never gets consumed.  Entries older than this
     # are evicted during periodic sweeps.
     _STALE_REQ_INFO_TTL_S = 120.0
+    # Bound synchronous worker retries before handing delivery to the shared
+    # reliable outbox.
+    _AGENT_RESULT_IMMEDIATE_ATTEMPTS = 2
 
     def __init__(
         self,
@@ -316,17 +489,31 @@ class Sender(SenderBase):
         self._dealers = {}  # used by listener thread only (single-threaded path)
         self._thread_local = threading.local()  # per-thread DEALER cache for worker threads
         self._sessions = {}  # unique_rid -> TxSession
-        self._sessions_lock = threading.Lock()  # Protects _sessions and _pre_cancelled_rids
+        self._sessions_lock = threading.Lock()  # Protects sessions and cancel tombstones
         self._pre_cancelled_rids: set[int] = set()
+        self._pre_cancelled_timestamps: dict[int, float] = {}
+        # A pre-cancelled sender may receive duplicate/late REQUEST_DATA.
+        # Remember the terminal replies already emitted so each receiver-side
+        # peer reservation is resolved at most once by this path.
+        self._cancel_failed_result_keys: set[tuple[int, str, int, int, bool]] = set()
         self._shutdown = False
         self._instance_rank = self._registrar.self_rank_info.instance_rank
         # Guards concurrent add() from the listener thread.
         self._loaded_remote_agents: set[str] = set()
         self._loaded_remote_agents_lock = threading.Lock()
+        # NIXL remote-metadata mutation is not safe while getXferStatus() is
+        # polling an active request.  The C++ wrapper's shared lock covers
+        # submit_transfer_requests(), but the returned status outlives that
+        # lock.  Serialize lazy peer loads with the complete submit+wait
+        # interval so a first request from another peer cannot invalidate an
+        # unrelated transfer already in flight.
+        self._agent_operation_gate = _AgentOperationGate()
         self._num_threads = KV_TRANSFER_NUM_THREADS
         self._send_task_queues: List[queue.Queue] = [
             queue.Queue() for _ in range(self._num_threads)
         ]
+        # Agent results and CANCEL_SESSION share one reliable, fair outbox.
+        self._reliable_message_outbox = _ReliableMessageOutbox("Sender")
         self._worker_threads: List[threading.Thread] = [
             threading.Thread(target=self._process_task_queue, args=(i,), daemon=True)
             for i in range(self._num_threads)
@@ -343,6 +530,25 @@ class Sender(SenderBase):
     @property
     def endpoint(self):
         return self._messenger.endpoint
+
+    def _load_remote_agent_serialized(self, name: str, agent_desc: bytes) -> None:
+        with self._agent_operation_gate.metadata():
+            self._agent.load_remote_agent(name, agent_desc)
+
+    def _submit_and_wait_agent_transfer(self, request: TransferRequest):
+        with self._agent_operation_gate.transfer():
+            status = self._agent.submit_transfer_requests(request)
+            try:
+                completed = status.wait()
+                last_status = None
+                if not completed:
+                    last_status = getattr(status, "last_status_str", lambda: "<no detail>")()
+            finally:
+                # The pybind status destructor calls releaseXferReq().  Drop
+                # the final local reference before releasing the reader gate,
+                # so a lazy remote-metadata load cannot race that NIXL call.
+                del status
+        return completed, last_status
 
     def _add_req_info(self, unique_rid: int, instance_rank: int, req_info: RecvReqInfo):
         with self._peer_requests_lock:
@@ -375,27 +581,38 @@ class Sender(SenderBase):
             self._peer_requests_timestamps.pop(unique_rid, None)
 
     def sweep_stale_req_infos(self):
-        """Evict RecvReqInfo entries that have no matching TxSession and exceed the TTL.
+        """Evict stale request infos and cancel tombstones with no TxSession.
 
         Called opportunistically from the listener thread when a new REQUEST_DATA
         arrives. With gen-first ADP broadcast, non-assigned DP ranks accumulate
         entries that are never consumed; this sweep prevents unbounded growth.
         """
         now = time.monotonic()
-        with self._peer_requests_lock:
-            stale_rids = [
+        with self._sessions_lock, self._peer_requests_lock:
+            stale_req_rids = [
                 rid
                 for rid, ts in self._peer_requests_timestamps.items()
                 if now - ts > self._STALE_REQ_INFO_TTL_S
             ]
-        if not stale_rids:
-            return
-        for rid in stale_rids:
-            with self._sessions_lock, self._peer_requests_lock:
+            stale_cancel_rids = [
+                rid
+                for rid, ts in self._pre_cancelled_timestamps.items()
+                if now - ts > self._STALE_REQ_INFO_TTL_S
+            ]
+            for rid in stale_req_rids:
                 if rid not in self._sessions and rid in self._peer_requests:
                     self._peer_requests.pop(rid, None)
                     self._peer_requests_timestamps.pop(rid, None)
                     logger.debug(f"Swept stale RecvReqInfo for rid={rid}")
+            for rid in stale_cancel_rids:
+                if rid in self._sessions:
+                    continue
+                self._pre_cancelled_rids.discard(rid)
+                self._pre_cancelled_timestamps.pop(rid, None)
+                self._cancel_failed_result_keys = {
+                    key for key in self._cancel_failed_result_keys if key[0] != rid
+                }
+                logger.debug(f"Swept stale pre-cancel tombstone for rid={rid}")
 
     def setup_session(self, tx_session: "TxSession"):
         unique_rid = tx_session.disagg_request_id
@@ -404,7 +621,6 @@ class Sender(SenderBase):
             self._sessions[unique_rid] = weakref.ref(tx_session)
             if unique_rid in self._pre_cancelled_rids:
                 pre_cancel = True
-                self._pre_cancelled_rids.discard(unique_rid)
         if pre_cancel:
             tx_session.cancel()
             return
@@ -436,7 +652,23 @@ class Sender(SenderBase):
         # - Same peer's slices stay ordered on one thread (is_last_slice correctness)
         # - Different peers can run on different threads (better load balancing)
         thread_idx = hash((write_meta.unique_rid, write_meta.peer_rank)) % self._num_threads
-        self._send_task_queues[thread_idx].put(write_meta)
+        with self._sessions_lock:
+            session = self._get_session(write_meta.unique_rid)
+        if session is not None:
+            with session.lock:
+                # A terminal/closed session no longer exposes source buffers.
+                # Still enqueue the metadata so the worker sends FAILED and
+                # resolves the receiver's already-dispatched peer reservation.
+                if session._terminal_status is None and not session._closed:
+                    session._begin_nixl_op_locked()
+                    write_meta.owner_session = session
+        try:
+            self._send_task_queues[thread_idx].put(write_meta)
+        except Exception:
+            if write_meta.owner_session is not None:
+                write_meta.owner_session._finish_nixl_op()
+                write_meta.owner_session = None
+            raise
 
     def _get_or_connect_thread_dealer(self, endpoint: Optional[str]) -> ZMQMessenger:
         """Get or create a per-thread DEALER socket via threading.local().
@@ -451,6 +683,53 @@ class Sender(SenderBase):
         if endpoint not in dealers:
             dealers[endpoint] = ZMQMessenger(mode="DEALER", endpoint=endpoint)
         return dealers[endpoint]
+
+    def _drop_thread_dealer(self, endpoint: str) -> None:
+        """Discard the current thread's failed socket before reconnecting."""
+        dealers = getattr(self._thread_local, "dealers", None)
+        if not dealers:
+            return
+        dealer = dealers.pop(endpoint, None)
+        if dealer is None:
+            return
+        try:
+            dealer.stop()
+        except Exception as exc:
+            logger.warning(f"Failed to close agent-result dealer for endpoint {endpoint}: {exc}")
+
+    def _try_send_agent_result(
+        self,
+        endpoint: str,
+        message: list[bytes],
+        *,
+        attempts: int,
+    ) -> bool:
+        """Try an agent-result send, rebuilding the thread-local socket on error."""
+        for attempt in range(1, attempts + 1):
+            try:
+                self._get_or_connect_thread_dealer(endpoint).send(message)
+                return True
+            except Exception as exc:
+                self._drop_thread_dealer(endpoint)
+                logger.warning(
+                    f"Agent-result send failed for endpoint {endpoint} "
+                    f"(attempt {attempt}/{attempts}): {exc}"
+                )
+        return False
+
+    def _send_agent_result(self, endpoint: str, message: list[bytes]) -> bool:
+        """Send on the worker fast path, queueing only transport failures.
+
+        Delivery is at-least-once. Receiver result processing is idempotent, so
+        retrying after an ambiguous transport failure is safe.
+        """
+        if self._try_send_agent_result(
+            endpoint,
+            message,
+            attempts=self._AGENT_RESULT_IMMEDIATE_ATTEMPTS,
+        ):
+            return True
+        return self._reliable_message_outbox.submit(endpoint, message)
 
     def _process_task_queue(self, thread_idx: int):
         device_id = self._device_id
@@ -477,6 +756,10 @@ class Sender(SenderBase):
                         f"unique_rid={write_meta.unique_rid}: {e}"
                     )
                     write_meta.task.fail(e)
+                finally:
+                    if write_meta.owner_session is not None:
+                        write_meta.owner_session._finish_nixl_op()
+                        write_meta.owner_session = None
         finally:
             # Clean up this thread's DEALER sockets. threading.local storage
             # is only accessible from the owning thread, so shutdown must
@@ -538,6 +821,7 @@ class Sender(SenderBase):
             f"WriteMeta ptr/size mismatch for unique_rid={write_meta.unique_rid}"
         )
 
+        assert write_meta.slice_id is not None
         with self._sessions_lock:
             session = self._get_session(write_meta.unique_rid)
         if session is None:
@@ -546,8 +830,20 @@ class Sender(SenderBase):
             )
             logger.error(msg)
             write_meta.task.fail(RuntimeError(msg))
+            # REQUEST_DATA was already accepted by this sender. Resolve the
+            # receiver reservation even though cancellation/cleanup removed
+            # the source session before this queued item reached a worker.
+            self._send_agent_result(
+                write_meta.peer_endpoint,
+                _make_kv_result_msg(
+                    self._instance_rank,
+                    write_meta.unique_rid,
+                    write_meta.slice_id,
+                    write_meta.is_last_slice,
+                    AgentResult.FAILED,
+                ),
+            )
             return
-        assert write_meta.slice_id is not None
         task = session.kv_tasks[write_meta.slice_id]
         timer = task._perf_timer
         if timer:
@@ -555,6 +851,7 @@ class Sender(SenderBase):
         # Hold session.lock to serialize the INIT→TRANSFERRING transition with
         # cancel(): prevents cancel_request() from freeing KV pages while a
         # worker is about to write into them.
+        active_nixl_op = write_meta.src_ptrs.size > 0
         with session.lock:
             status = session.status
             if status in (SessionStatus.ERROR, SessionStatus.CANCELLED):
@@ -573,14 +870,15 @@ class Sender(SenderBase):
             task.fail(
                 RuntimeError(f"session {write_meta.unique_rid} {status.value}, transfer aborted")
             )
-            self._get_or_connect_dealer(write_meta.peer_endpoint).send(
+            self._send_agent_result(
+                write_meta.peer_endpoint,
                 _make_kv_result_msg(
                     self._instance_rank,
                     write_meta.unique_rid,
                     write_meta.slice_id,
                     True,  # is_last_slice — ensures receiver resolves its task future
                     AgentResult.FAILED,
-                )
+                ),
             )
             return
 
@@ -588,38 +886,18 @@ class Sender(SenderBase):
 
         agent_result = AgentResult.SUCCESS
         send_slot_id = None
-        if write_meta.src_ptrs.size > 0:
-            try:
+        try:
+            if active_nixl_op:
                 request, send_slot_id = build_send_request(
                     self._bounce,
                     write_meta,
                     lambda: Sender._make_agent_request(write_meta, device_id=self._device_id),
                 )
-            except Exception as e:
-                # Don't let a gather fault escape: without a result the receiver would hang and its
-                # region leak. Tell the receiver it failed and fail the local task instead.
-                logger.error(
-                    f"_deliver_kv_to_agent: failed to build the KV send request for "
-                    f"{write_meta.unique_rid} slice={write_meta.slice_id}: {e}"
-                )
-                task.fail(RuntimeError(f"build_send_request failed: {e}"))
-                self._get_or_connect_dealer(write_meta.peer_endpoint).send(
-                    _make_kv_result_msg(
-                        self._instance_rank,
-                        write_meta.unique_rid,
-                        write_meta.slice_id,
-                        True,  # is_last_slice — ensures receiver resolves its task future
-                        AgentResult.FAILED,
-                    )
-                )
-                return
-            if timer:
-                timer.record_transfer_start(write_meta.peer_rank)
-            try:
-                status = self._agent.submit_transfer_requests(request)
-                if not status.wait():
+                if timer:
+                    timer.record_transfer_start(write_meta.peer_rank)
+                completed, last_status = self._submit_and_wait_agent_transfer(request)
+                if not completed:
                     agent_result = AgentResult.FAILED
-                    last_status = getattr(status, "last_status_str", lambda: "<no detail>")()
                     agent_name = getattr(self._agent, "name", "<?>")
                     detail = (
                         f"KV transfer agent failed: "
@@ -635,11 +913,23 @@ class Sender(SenderBase):
                     )
                     logger.error(detail)
                     task.fail(RuntimeError(detail))
-            finally:
-                if send_slot_id is not None:
-                    self._bounce.release_send(send_slot_id)
-        if timer:
-            timer.record_transfer_end(write_meta.peer_rank)
+        except Exception as exc:
+            agent_result = AgentResult.FAILED
+            task.fail(exc)
+            logger.error(
+                f"KV transfer raised for rid={write_meta.unique_rid}, "
+                f"peer_rank={write_meta.peer_rank}: {exc}"
+            )
+        finally:
+            if send_slot_id is not None:
+                self._bounce.release_send(send_slot_id)
+            if timer:
+                try:
+                    timer.record_transfer_end(write_meta.peer_rank)
+                except Exception as exc:
+                    logger.warning(
+                        f"Failed to record KV transfer end for rid={write_meta.unique_rid}: {exc}"
+                    )
 
         ## TODO: just last slice need to send task state?
         tail = (
@@ -657,7 +947,7 @@ class Sender(SenderBase):
             transfer_size=transfer_size,
             tail=tail,
         )
-        self._get_or_connect_thread_dealer(write_meta.peer_endpoint).send(result_msg)
+        self._send_agent_result(write_meta.peer_endpoint, result_msg)
 
         if timer:
             timer.record_task_end(write_meta.peer_rank)
@@ -695,6 +985,15 @@ class Sender(SenderBase):
             msg = f"_deliver_aux_to_agent: TxSession {write_meta.unique_rid} not found or already GC'd"
             logger.error(msg)
             write_meta.task.fail(RuntimeError(msg))
+            self._send_agent_result(
+                write_meta.peer_endpoint,
+                [
+                    MessageType.AUX_AGENT_RESULT,
+                    str(self._instance_rank).encode("ascii"),
+                    str(write_meta.unique_rid).encode("ascii"),
+                    AgentResult.FAILED.value.encode("ascii"),
+                ],
+            )
             return
         aux_task = session.aux_task
         assert aux_task is not None, f"aux_task is None for session {write_meta.unique_rid}"
@@ -702,24 +1001,66 @@ class Sender(SenderBase):
         if timer:
             timer.record_push_end(write_meta.peer_rank)
 
-        agent_result = AgentResult.SUCCESS
-        if write_meta.src_ptrs.size > 0:
-            request = Sender._make_agent_request(write_meta, device_id=self._device_id)
-            if timer:
-                timer.record_transfer_start(write_meta.peer_rank)
-            if not self._agent.submit_transfer_requests(request).wait():
-                agent_result = AgentResult.FAILED
-                session.set_exception("aux transfer agent request failed")
-            if timer:
-                timer.record_transfer_end(write_meta.peer_rank)
+        active_nixl_op = write_meta.src_ptrs.size > 0
+        with session.lock:
+            status = session.status
+            if status in (SessionStatus.ERROR, SessionStatus.CANCELLED):
+                should_abort = True
+            else:
+                aux_task.status = TaskStatus.TRANSFERRING
+                should_abort = False
 
-        self._get_or_connect_thread_dealer(write_meta.peer_endpoint).send(
+        if should_abort:
+            aux_task.fail(
+                RuntimeError(
+                    f"session {write_meta.unique_rid} {status.value}, aux transfer aborted"
+                )
+            )
+            self._send_agent_result(
+                write_meta.peer_endpoint,
+                [
+                    MessageType.AUX_AGENT_RESULT,
+                    str(self._instance_rank).encode("ascii"),
+                    str(write_meta.unique_rid).encode("ascii"),
+                    AgentResult.FAILED.value.encode("ascii"),
+                ],
+            )
+            return
+
+        agent_result = AgentResult.SUCCESS
+        try:
+            if active_nixl_op:
+                request = Sender._make_agent_request(write_meta, device_id=self._device_id)
+                if timer:
+                    timer.record_transfer_start(write_meta.peer_rank)
+                completed, _ = self._submit_and_wait_agent_transfer(request)
+                if not completed:
+                    agent_result = AgentResult.FAILED
+                    session.set_exception("aux transfer agent request failed")
+        except Exception as exc:
+            agent_result = AgentResult.FAILED
+            aux_task.fail(exc)
+            logger.error(
+                f"Aux transfer raised for rid={write_meta.unique_rid}, "
+                f"peer_rank={write_meta.peer_rank}: {exc}"
+            )
+        finally:
+            if timer:
+                try:
+                    timer.record_transfer_end(write_meta.peer_rank)
+                except Exception as exc:
+                    logger.warning(
+                        f"Failed to record aux transfer end for rid={write_meta.unique_rid}: {exc}"
+                    )
+
+        self._send_agent_result(
+            write_meta.peer_endpoint,
             [
                 MessageType.AUX_AGENT_RESULT,
                 str(self._instance_rank).encode("ascii"),
                 str(write_meta.unique_rid).encode("ascii"),
                 agent_result.value.encode("ascii"),
-            ]
+            ],
         )
 
         if timer:
@@ -749,12 +1090,15 @@ class Sender(SenderBase):
         src_token_start: int,
         dst_token_start: int,
         tokens_per_block: int,
+        minimum_token_start: int = 0,
     ) -> tuple[np.ndarray, np.ndarray]:
         """Align src/dst block arrays using explicit token-start positions.
 
         Both src_token_start and dst_token_start must be block-aligned
         (multiples of tokens_per_block), which is always true for prefix-cache
-        boundaries in current KV cache managers.
+        boundaries in current KV cache managers. minimum_token_start applies a
+        shared lower bound, such as an SWA stale boundary, and trims both arrays
+        instead of relabeling their first blocks.
 
         Returns the (src, dst) sub-arrays that cover the shared token overlap.
         Returns a pair of empty arrays when there is no overlap (i.e. this
@@ -767,7 +1111,7 @@ class Sender(SenderBase):
           4. Chunked context (each slice has its own token_range)  → correct
              overlap even when the slice is entirely before dst_token_start
         """
-        overlap_start = max(src_token_start, dst_token_start)
+        overlap_start = max(src_token_start, dst_token_start, minimum_token_start)
         src_skip = (overlap_start - src_token_start) // tokens_per_block
         dst_skip = (overlap_start - dst_token_start) // tokens_per_block
         n_transfer = min(src_block_ids.size - src_skip, dst_block_ids.size - dst_skip)
@@ -784,6 +1128,24 @@ class Sender(SenderBase):
         if beam_width <= 1 or block_ids.size <= total_blocks:
             return block_ids.size
         return max(0, block_ids.size - (beam_width - 1))
+
+    @staticmethod
+    def _helix_windowed_block_ids(
+        src_block_ids: np.ndarray,
+        total_blocks: int,
+        beam_width: int,
+        cp_rank: int,
+        cp_size: int,
+    ) -> np.ndarray:
+        """Select the blocks of a windowed (suffix) list owned by one Helix rank.
+
+        The list covers global ordinals ``[total_blocks - k, total_blocks)``;
+        rank ``cp_rank`` owns every ordinal congruent to it modulo ``cp_size``.
+        """
+        k = Sender._beam0_block_count(src_block_ids, total_blocks, beam_width)
+        first_ordinal = total_blocks - k
+        keep = [i for i in range(k) if (first_ordinal + i) % cp_size == cp_rank]
+        return src_block_ids[keep]
 
     @staticmethod
     def _trim_receiver_window_head(
@@ -849,19 +1211,45 @@ class Sender(SenderBase):
                 continue
             src_block_ids = src_block_ids_per_groups[self_lg]
             dst_block_ids = dst_block_ids_per_groups[peer_lg]
-
             tpb = extractor.page_table.tokens_per_block
             token_range = task._slice.token_range
             lg_info = extractor.page_table.layer_groups[self_lg]
             window_size = getattr(lg_info, "sliding_window_size", None)
+            if peer_ri.cp_size > 1 and self._registrar.self_rank_info.cp_size == 1:
+                # Helix: the receiver owns global blocks [cp_rank::cp_size]
+                # (same protocol as partition_context_for_helix); block reuse
+                # is rejected under helix. Windowed lists are a suffix of the
+                # global ordinals, so route them by ordinal, not by position.
+                if window_size is None:
+                    src_block_ids = src_block_ids[peer_ri.cp_rank :: peer_ri.cp_size]
+                else:
+                    slice_end = token_range.end if token_range is not None else 0
+                    src_block_ids = Sender._helix_windowed_block_ids(
+                        src_block_ids,
+                        total_blocks=(slice_end + tpb - 1) // tpb,
+                        beam_width=task._beam_width,
+                        cp_rank=peer_ri.cp_rank,
+                        cp_size=peer_ri.cp_size,
+                    )
 
-            peer_lg_info = peer_extractor.page_table.layer_groups[peer_lg]
-            dst_block_ids = Sender._trim_receiver_window_head(
-                src_block_ids,
-                dst_block_ids,
-                peer_window_size=getattr(peer_lg_info, "sliding_window_size", None),
-                beam_width=task._beam_width,
-            )
+            # Non-windowed lists are both trimmed to ceil(prompt_len / tpb) in
+            # _create_kv_slice, so dst must not exceed src. A smaller dst
+            # (generation prefix-cache reuse) is handled via dst_start below.
+            block_diff = dst_block_ids.size - src_block_ids.size
+            if block_diff > 0:
+                # A windowed receiver keeps a larger window when only it runs
+                # speculative decoding, so its suffix starts earlier. Drop the
+                # extra head: dst_start is derived from len(dst), so trimming
+                # the tail instead would shift every block by block_diff.
+                peer_lg_info = peer_extractor.page_table.layer_groups[peer_lg]
+                peer_window = getattr(peer_lg_info, "sliding_window_size", None)
+                if peer_window is not None and task._beam_width <= 1:
+                    dst_block_ids = dst_block_ids[block_diff:]
+                else:
+                    raise ValueError(
+                        f"src/dst block count mismatch: {src_block_ids.size} vs "
+                        f"{dst_block_ids.size} (dst must not exceed src)"
+                    )
 
             # Block lists are the suffix of [..., slice_end); cached prefix
             # is implicit in their size. token_start = (total_blocks - n) * tpb.
@@ -883,8 +1271,7 @@ class Sender(SenderBase):
             )
             src_start = (total_blocks - src_beam0_blocks) * tpb
             dst_start = (total_blocks - dst_beam0_blocks) * tpb
-            if req_info.dst_start_token is not None:
-                dst_start = max(dst_start, req_info.dst_start_token)
+            minimum_start = req_info.dst_start_token or 0
             if window_size is not None:
                 # SWA stale_end uses the request prompt_len (not slice_end —
                 # they differ for non-final slices). prompt_len must be plumbed
@@ -895,20 +1282,24 @@ class Sender(SenderBase):
                     "set TxSession(prompt_len=request.prompt_len)."
                 )
                 stale_end = max(0, (task._prompt_len + 1 - window_size) // tpb)
-                src_start = max(stale_end * tpb, src_start)
-                dst_start = max(stale_end * tpb, dst_start)
+                minimum_start = max(minimum_start, stale_end * tpb)
             src_block_ids, dst_block_ids = Sender._align_kv_blocks(
                 src_block_ids,
                 dst_block_ids,
                 src_token_start=src_start,
                 dst_token_start=dst_start,
                 tokens_per_block=tpb,
+                minimum_token_start=minimum_start,
             )
 
             src_region = extractor.extract(src_block_ids, layer_group_id=self_lg, pool_idx=self_pi)
             dst_region = peer_extractor.extract(
                 dst_block_ids, layer_group_id=peer_lg, pool_idx=peer_pi
             )
+            if token_range is not None:
+                token_spec = KVRegionSpec(tokens=IndexRange(token_range.start, token_range.end - 1))
+                src_region = src_region._replace(spec=token_spec)
+                dst_region = dst_region._replace(spec=token_spec)
             mapper = self._registrar.get_kv_map(peer_ri, (self_lg, self_pi), (peer_lg, peer_pi))
             region_pair = mapper.map(src_region, dst_region)
             region_pairs = region_pair if isinstance(region_pair, list) else [region_pair]
@@ -1023,16 +1414,33 @@ class Sender(SenderBase):
         # critical section small.  When not provided, we fetch it here (legacy / standalone path).
         if req_info_snapshot is None:
             req_info_snapshot = dict(self._get_req_info(task._unique_rid) or {})
-        for info in req_info_snapshot.values():
-            if task._perf_timer is not None:
-                task._perf_timer.record_task_start(info.instance_rank)
-            if isinstance(task, KVSendTask):
-                trans_meta = self._build_kv_write_meta(task, info)
-            else:
-                trans_meta = self._build_aux_write_meta(task, info)
-            if task._perf_timer is not None:
-                task._perf_timer.record_push_start(trans_meta.peer_rank)
-            self._enqueue(trans_meta)
+        req_infos = list(req_info_snapshot.values())
+        for info_idx, info in enumerate(req_infos):
+            try:
+                if task._perf_timer is not None:
+                    task._perf_timer.record_task_start(info.instance_rank)
+                if isinstance(task, KVSendTask):
+                    trans_meta = self._build_kv_write_meta(task, info)
+                else:
+                    trans_meta = self._build_aux_write_meta(task, info)
+                if task._perf_timer is not None:
+                    task._perf_timer.record_push_start(trans_meta.peer_rank)
+                self._enqueue(trans_meta)
+            except Exception as exc:
+                task.fail(exc)
+                # The receiver reserved one peer transfer before publishing
+                # every RecvReqInfo in this snapshot.  Entries before info_idx
+                # already own an enqueued WriteMeta and will report their own
+                # terminal result.  This entry and every later one have not
+                # been dispatched, so resolve each reservation exactly once
+                # before propagating the build/enqueue failure.
+                for undispatched_info in req_infos[info_idx:]:
+                    self._send_failed_result_to_receiver(
+                        undispatched_info,
+                        slice_id=(task.slice_id if isinstance(task, KVSendTask) else None),
+                        aux=isinstance(task, AuxSendTask),
+                    )
+                raise
 
     def _start_listener(self):
         def handle_message(messages: list[bytes]):
@@ -1073,10 +1481,7 @@ class Sender(SenderBase):
 
         agent_name = ri.instance_name + str(ri.instance_rank)
         logger.debug(f"Loading remote transfer agent descriptor for peer '{agent_name}'")
-        self._agent.load_remote_agent(
-            ri.instance_name + str(ri.instance_rank),
-            ri.transfer_engine_info,
-        )
+        self._load_remote_agent_serialized(agent_name, ri.transfer_engine_info)
         with self._loaded_remote_agents_lock:
             self._loaded_remote_agents.add(agent_name)
         logger.debug(
@@ -1086,61 +1491,192 @@ class Sender(SenderBase):
     def _handle_cancel_session(self, message: list[bytes]):
         unique_rid = int(message[1])
         session = None
+        pre_cancel_infos: list[RecvReqInfo] = []
         with self._sessions_lock:
+            self._pre_cancelled_rids.add(unique_rid)
+            self._pre_cancelled_timestamps[unique_rid] = time.monotonic()
             session_ref = self._sessions.get(unique_rid)
             if session_ref is None:
-                self._pre_cancelled_rids.add(unique_rid)
+                with self._peer_requests_lock:
+                    req_info_map = self._peer_requests.pop(unique_rid, None)
+                    self._peer_requests_timestamps.pop(unique_rid, None)
+                    if req_info_map:
+                        pre_cancel_infos = list(req_info_map.values())
             else:
                 session = session_ref()
                 if session is None:
-                    self._pre_cancelled_rids.add(unique_rid)
+                    with self._peer_requests_lock:
+                        req_info_map = self._peer_requests.pop(unique_rid, None)
+                        self._peer_requests_timestamps.pop(unique_rid, None)
+                        if req_info_map:
+                            pre_cancel_infos = list(req_info_map.values())
         if session is not None:
             session.cancel()
+            with session.lock:
+                need_kv_result = not session.kv_tasks
+                need_aux_result = session._need_aux and session.aux_task is None
+            if need_kv_result or need_aux_result:
+                # cancel() has made future send()/send_aux() calls fail, so no
+                # worker can be created for the missing task type.  Remove the
+                # saved requests and resolve those reservations directly.
+                with self._peer_requests_lock:
+                    req_info_map = self._peer_requests.pop(unique_rid, None)
+                    self._peer_requests_timestamps.pop(unique_rid, None)
+                    direct_infos = list(req_info_map.values()) if req_info_map else []
+                for info in direct_infos:
+                    self._send_pre_cancel_failed_results(
+                        info,
+                        send_kv=need_kv_result,
+                        send_aux=need_aux_result,
+                    )
+        else:
+            # These REQUEST_DATA messages were accepted, but no TxSession will
+            # ever enqueue a worker result on this (possibly non-selected ADP)
+            # rank.  Explicitly resolve the receiver's per-peer reservations.
+            for info in pre_cancel_infos:
+                self._send_pre_cancel_failed_results(info)
 
     @nvtx_range("_respond_with_kv")
     def _respond_with_kv(self, _send_id: bytes, message: list[bytes]):
         # _sessions_lock prevents a race between session lookup and req_info save.
         # session.lock serializes _enqueue calls from both paths.
+        self.sweep_stale_req_infos()
         info: RecvReqInfo = RecvReqInfo.from_bytes(message[1])
+        pre_cancelled = False
         with self._sessions_lock:
             session = self._get_session(info.unique_rid)
             if session is None:
-                self._save_peer_req_info(info)
-                return
+                pre_cancelled = info.unique_rid in self._pre_cancelled_rids
+                if not pre_cancelled:
+                    self._save_peer_req_info(info)
+                    return
+        if pre_cancelled:
+            # CANCEL_SESSION may race ahead of REQUEST_DATA.  Do not retain a
+            # request that can never acquire a source session; acknowledge it
+            # exactly once instead.
+            self._send_pre_cancel_failed_results(info)
+            return
         with session.lock:
-            self._save_peer_req_info(info)
-            tasks = list(session.kv_tasks)
-            # No tasks: no worker will send KV_AGENT_RESULT FAILED to the receiver.
-            # Send it directly to unblock the receiver's TRANSFERRING task future;
-            # CANCEL_SESSION alone would leave it stuck indefinitely.
-            if not tasks and session.status in (SessionStatus.ERROR, SessionStatus.CANCELLED):
-                self._send_failed_result_to_receiver(info)
-                return
+            terminal = session.status in (
+                SessionStatus.ERROR,
+                SessionStatus.CANCELLED,
+            )
+            if terminal:
+                with self._peer_requests_lock:
+                    existing = self._peer_requests.get(info.unique_rid, {}).get(info.instance_rank)
+                    already_known = existing is not None and existing.slice_id == info.slice_id
+                tasks = list(session.kv_tasks)
+                aux_task_exists = session.aux_task is not None
+            else:
+                self._save_peer_req_info(info)
+                tasks = list(session.kv_tasks)
+                already_known = False
+                aux_task_exists = False
+        if terminal:
+            # Do not enqueue duplicate work into a cancelled/error session.
+            # A previously known request with an existing task already has a
+            # queued/active worker which will report its own terminal result;
+            # otherwise this late request needs a direct per-peer reply.
+            self._send_pre_cancel_failed_results(
+                info,
+                send_kv=not already_known or not tasks,
+                send_aux=(info.need_aux and (not already_known or not aux_task_exists)),
+            )
+            return
         for task in tasks:
-            if task._perf_timer is not None:
-                task._perf_timer.record_task_start(info.instance_rank)
-            trans_meta = self._build_kv_write_meta(task, info)
-            if task._perf_timer is not None:
-                task._perf_timer.record_push_start(trans_meta.peer_rank)
-            self._enqueue(trans_meta)
+            try:
+                if task._perf_timer is not None:
+                    task._perf_timer.record_task_start(info.instance_rank)
+                trans_meta = self._build_kv_write_meta(task, info)
+                if task._perf_timer is not None:
+                    task._perf_timer.record_push_start(trans_meta.peer_rank)
+                self._enqueue(trans_meta)
+            except Exception as exc:
+                task.fail(exc)
+                session.set_exception(str(exc))
+                self._send_failed_result_to_receiver(info, slice_id=task.slice_id)
+                raise
 
-    def _send_failed_result_to_receiver(self, info: RecvReqInfo):
+    def _cancel_failed_result_key(
+        self, info: RecvReqInfo, *, aux: bool
+    ) -> tuple[int, str, int, int, bool]:
+        slice_id = -1 if aux else (info.slice_id if info.slice_id is not None else 0)
+        return (
+            info.unique_rid,
+            info.instance_name,
+            info.instance_rank,
+            slice_id,
+            aux,
+        )
+
+    def _send_pre_cancel_failed_result_once(self, info: RecvReqInfo, *, aux: bool) -> bool:
+        key = self._cancel_failed_result_key(info, aux=aux)
+        with self._peer_requests_lock:
+            if key in self._cancel_failed_result_keys:
+                return True
+            self._cancel_failed_result_keys.add(key)
+        sent = self._send_failed_result_to_receiver(
+            info,
+            slice_id=info.slice_id,
+            aux=aux,
+        )
+        if not sent:
+            # A later duplicate CANCEL/REQUEST_DATA may retry a transport
+            # failure; successful sends remain idempotent.
+            with self._peer_requests_lock:
+                self._cancel_failed_result_keys.discard(key)
+        return sent
+
+    def _send_pre_cancel_failed_results(
+        self,
+        info: RecvReqInfo,
+        *,
+        send_kv: bool = True,
+        send_aux: Optional[bool] = None,
+    ) -> bool:
+        if send_aux is None:
+            send_aux = info.need_aux
+        sent = True
+        if send_kv:
+            sent = self._send_pre_cancel_failed_result_once(info, aux=False)
+        if send_aux:
+            sent = self._send_pre_cancel_failed_result_once(info, aux=True) and sent
+        return sent
+
+    def _send_failed_result_to_receiver(
+        self,
+        info: RecvReqInfo,
+        slice_id: Optional[int] = None,
+        aux: bool = False,
+    ) -> bool:
         try:
             peer_ri = self._registrar.get_peer_rank_info(info.instance_name, info.instance_rank)
-            slice_id = info.slice_id if info.slice_id is not None else 0
-            self._get_or_connect_dealer(peer_ri.self_endpoint).send(
-                _make_kv_result_msg(
+            if aux:
+                message = [
+                    MessageType.AUX_AGENT_RESULT,
+                    str(self._instance_rank).encode("ascii"),
+                    str(info.unique_rid).encode("ascii"),
+                    AgentResult.FAILED.value.encode("ascii"),
+                ]
+            else:
+                resolved_slice_id = (
+                    slice_id
+                    if slice_id is not None
+                    else (info.slice_id if info.slice_id is not None else 0)
+                )
+                message = _make_kv_result_msg(
                     self._instance_rank,
                     info.unique_rid,
-                    slice_id,
+                    resolved_slice_id,
                     True,  # is_last_slice
                     AgentResult.FAILED,
                 )
-            )
+            return self._send_agent_result(peer_ri.self_endpoint, message)
         except Exception as e:
             logger.warning(
                 f"_respond_with_kv: failed to abort receiver for rid={info.unique_rid}: {e}"
             )
+            return False
 
     def _get_or_connect_dealer(self, endpoint: Optional[str]):
         if endpoint is None:
@@ -1188,43 +1724,65 @@ class Sender(SenderBase):
                 peer_ri = self._registrar.get_peer_rank_info(
                     req_info.instance_name, req_info.instance_rank
                 )
-                self._get_or_connect_dealer(peer_ri.self_endpoint).send(
-                    [MessageType.CANCEL_SESSION, str(unique_rid).encode("ascii")]
+                message = [MessageType.CANCEL_SESSION, str(unique_rid).encode("ascii")]
+                outbox = getattr(self, "_reliable_message_outbox", None)
+                accepted = (
+                    outbox.submit(peer_ri.self_endpoint, message)
+                    if outbox is not None
+                    else self._send_agent_result(peer_ri.self_endpoint, message)
                 )
+                if not accepted:
+                    logger.error(f"send_cancel_to_receivers: outbox rejected rid={unique_rid}")
             except Exception as e:
                 logger.warning(f"send_cancel_to_receivers: failed for rid={unique_rid}: {e}")
 
     def shutdown(self):
-        if self._shutdown:
+        if getattr(self, "_shutdown", False):
             return
         self._shutdown = True
 
         # Quiesce listener before invalidate to avoid set/map mutation races.
-        self._messenger.stop()
+        messenger = getattr(self, "_messenger", None)
+        if messenger is not None:
+            messenger.stop()
 
-        for q in self._send_task_queues:
+        for q in getattr(self, "_send_task_queues", []):
             q.put(None)
-        for t in self._worker_threads:
+        for t in getattr(self, "_worker_threads", []):
             t.join(timeout=5)
 
+        # Workers cannot enqueue any more terminal results after joining. Let
+        # the shared result/cancel outbox make one final attempt for every
+        # queued message, then stop.
+        reliable_outbox = getattr(self, "_reliable_message_outbox", None)
+        if reliable_outbox is not None:
+            reliable_outbox.shutdown()
+
         # Snapshot under lock as defense in depth.
-        with self._loaded_remote_agents_lock:
-            loaded_agents = list(self._loaded_remote_agents)
-            self._loaded_remote_agents.clear()
+        loaded_agents: list[str] = []
+        loaded_remote_agents_lock = getattr(self, "_loaded_remote_agents_lock", None)
+        if loaded_remote_agents_lock is not None:
+            with loaded_remote_agents_lock:
+                loaded_remote_agents = getattr(self, "_loaded_remote_agents", set())
+                loaded_agents = list(loaded_remote_agents)
+                loaded_remote_agents.clear()
         # Invalidate all loaded remote agents to release fabric/POSIX FD resources.
+        agent = getattr(self, "_agent", None)
         for agent_name in loaded_agents:
             try:
-                self._agent.invalidate_remote_agent(agent_name)
+                if agent is not None:
+                    agent.invalidate_remote_agent(agent_name)
             except Exception as e:
                 logger.warning(
                     f"Failed to invalidate remote agent '{agent_name}' during shutdown: {e}"
                 )
-        for dealer in self._dealers.values():
+        dealers = getattr(self, "_dealers", {})
+        for dealer in dealers.values():
             try:
                 dealer.stop()
             except Exception as e:
                 logger.warning(f"Failed to stop dealer during Sender shutdown: {e}")
-        self._dealers.clear()
+        dealers.clear()
 
     def __del__(self):
         try:
@@ -1267,6 +1825,13 @@ class TxSession(TxSessionBase):
         self.kv_tasks = []
         self.aux_task = None
         self.lock = threading.Lock()
+        # TaskStatus is a logical aggregate status and cannot represent
+        # concurrent writes to multiple peers: one failed peer may set ERROR
+        # while another peer still owns the registered source addresses.
+        # Track queued-or-active peer writes independently under ``self.lock``
+        # so cancellation cannot unregister source addresses before a queued
+        # worker either finishes NIXL or reports FAILED to the receiver.
+        self._active_nixl_ops = 0
 
         self._exception: Optional[Exception] = None
         self._closed = False
@@ -1308,6 +1873,14 @@ class TxSession(TxSessionBase):
         if self.transfer_start_time is None:
             self.transfer_start_time = tensorrt_llm.bindings.global_steady_clock_now()
         with self.lock:
+            if self._terminal_status in (
+                SessionStatus.ERROR,
+                SessionStatus.CANCELLED,
+            ):
+                raise RuntimeError(
+                    f"TxSession {self.disagg_request_id} is "
+                    f"{self._terminal_status.value}; refusing new KV work"
+                )
             if not self.kv_tasks:
                 overall_timeout_s = self._overall_timeout_s
                 if overall_timeout_s is None or overall_timeout_s <= 0:
@@ -1320,7 +1893,6 @@ class TxSession(TxSessionBase):
                 params,
                 slice_id,
                 prompt_len=self._base_args.prompt_len,
-                beam_width=self._base_args.beam_width,
             )
             task._unique_rid = self.disagg_request_id
             self.kv_tasks.append(task)
@@ -1329,6 +1901,19 @@ class TxSession(TxSessionBase):
 
     def send_aux(self) -> AuxSendTask:
         with self.lock:
+            if self._terminal_status in (
+                SessionStatus.ERROR,
+                SessionStatus.CANCELLED,
+            ):
+                raise RuntimeError(
+                    f"TxSession {self.disagg_request_id} is "
+                    f"{self._terminal_status.value}; refusing new aux work"
+                )
+            if not self._need_aux:
+                raise RuntimeError(
+                    "Aux transfer requires GENERATION_FIRST scheduling so the "
+                    "receiver reserves its destination buffer before dispatch"
+                )
             params = self._base_args.params
             task = AuxSendTask(params, self.aux_slot)
             task._unique_rid = self.disagg_request_id
@@ -1380,11 +1965,23 @@ class TxSession(TxSessionBase):
         self._sender.send_cancel_to_receivers(self.disagg_request_id)
 
     def has_transferring_tasks(self) -> bool:
-        """True if any KV task is currently mid-write (TRANSFERRING).
+        """True while queued/active peer work still owns session buffers.
 
         cancel_request() must return False while this is True.
         """
-        return any(t.status == TaskStatus.TRANSFERRING for t in self.kv_tasks)
+        with self.lock:
+            return self._active_nixl_ops > 0
+
+    def _begin_nixl_op_locked(self) -> None:
+        """Reserve source-address lifetime; caller must hold ``self.lock``."""
+        self._active_nixl_ops += 1
+
+    def _finish_nixl_op(self) -> None:
+        with self.lock:
+            if self._active_nixl_ops <= 0:
+                logger.error(f"TxSession {self.disagg_request_id} NIXL operation counter underflow")
+                return
+            self._active_nixl_ops -= 1
 
     def wait_complete(self, blocking: bool = True) -> Optional[WaitResult]:
         """Poll or block until KV (and optionally aux) transfer finishes.
@@ -1546,6 +2143,14 @@ class KVRecvTask:
         self.status = TaskStatus.INIT
         self.expected_transfers = 0
         self.last_slice_count = 0
+        # Peers for which REQUEST_DATA was successfully dispatched but no
+        # KV_AGENT_RESULT has been received yet.  This deliberately tracks
+        # actual dispatches rather than expected topology peers so a partial
+        # dispatch failure cannot leave a phantom active write forever.
+        self.pending_peer_ranks: set[int] = set()
+        self.resolved_peer_ranks: set[int] = set()
+        self.aux_reserved_peer_ranks: set[int] = set()
+        self.is_broadcast_dispatch = False
 
         self._unique_rid = unique_rid
         self._kv_slice = kv_slice
@@ -1607,6 +2212,7 @@ class Receiver(ReceiverBase):
         self._sessions_lock = threading.Lock()  # Protects _sessions and _pre_cancelled_rids
         self._pre_cancelled_rids: set[int] = set()
         self._shutdown = False
+        self._reliable_message_outbox = _ReliableMessageOutbox("Receiver")
 
         self._start_listener()
         logger.info(f"Receiver init with endpoint: {self._messenger.endpoint}")
@@ -1619,13 +2225,21 @@ class Receiver(ReceiverBase):
         if getattr(self, "_shutdown", False):
             return
         self._shutdown = True
-        for dealer in self._dealers.values():
+        # Quiesce listener callbacks before putting the outbox sentinel behind
+        # all already-accepted CANCEL_SESSION messages.
+        messenger = getattr(self, "_messenger", None)
+        if messenger is not None:
+            messenger.stop()
+        reliable_outbox = getattr(self, "_reliable_message_outbox", None)
+        if reliable_outbox is not None:
+            reliable_outbox.shutdown()
+        dealers = getattr(self, "_dealers", {})
+        for dealer in dealers.values():
             try:
                 dealer.stop()
             except Exception as e:
                 logger.warning(f"Failed to stop dealer during Receiver shutdown: {e}")
-        self._dealers.clear()
-        self._messenger.stop()
+        dealers.clear()
 
     def clear_session(self, unique_rid: int):
         with self._sessions_lock:
@@ -1679,6 +2293,7 @@ class Receiver(ReceiverBase):
             aux_slot=task._aux_slot,
             mamba_state_index=task._kv_slice.mamba_state_index,
             slice_id=task.slice_id,
+            need_aux=(task._params.schedule_style == DisaggScheduleStyle.GENERATION_FIRST),
         )
 
     @staticmethod
@@ -1775,12 +2390,18 @@ class Receiver(ReceiverBase):
             task.expected_transfers = len(peer_overlap.ranks)
         else:
             task.expected_transfers = len(dp0_overlap.ranks)
+            task.is_broadcast_dispatch = True
         # TP fan-in splits ONE region equally, so allow it only for a uniform writer set:
         # _fanin_bounce_safe() (TP-by-head / even-PP), and never under ADP broadcast (sender_dp_rank
         # None), where the real writer count exceeds expected_transfers and would overflow the slot.
         topo_overlap = peer_overlap if sender_dp_rank is not None else dp0_overlap
+        # Helix writers contribute unequal shares (one KV owner, one state
+        # sender, the rest empty), so the fan-in equal split would overflow
+        # into neighboring reservations; use the per-fragment path.
+        cp_involved = self._registrar.self_rank_info.cp_size > 1 or peer_infos.cp_size > 1
         allow_bounce = task.expected_transfers == 1 or (
             sender_dp_rank is not None
+            and not cp_involved
             and self._fanin_bounce_safe(
                 topo_overlap,
                 peer_infos,
@@ -1793,14 +2414,15 @@ class Receiver(ReceiverBase):
         extra_bytes = 0
         if receiver_req.mamba_state_index is not None:
             if peer_infos.page_table is None:
-                allow_bounce = False  # cannot size the sender's recurrent-state payload
+                allow_bounce = False  # cannot size the recurrent-state payload
             else:
-                extra_bytes = MambaPolicy.payload_bytes(
+                # Receiver-local sizing: RankInfoServer runs on ctx rank 0
+                # only, so a sender-side simulation under-reserves for every
+                # receiver whose paired sender is not rank 0.
+                extra_bytes = MambaPolicy.receiver_payload_bytes(
                     sender_page_table=peer_infos.page_table,
                     receiver_page_table=self._registrar.self_extractor.page_table,
                     dst_slot=receiver_req.mamba_state_index,
-                    sender_ri=peer_infos,
-                    receiver_ri=self._registrar.self_rank_info,
                 )
         bounced = allow_bounce and self._bounce.reserve(
             receiver_req, task.expected_transfers, extra_bytes=extra_bytes
@@ -1811,22 +2433,39 @@ class Receiver(ReceiverBase):
                 f"dispatch_task: RxSession {task._unique_rid} not found; "
                 "session may have been closed before dispatch"
             )
-        session.mark_transferring(task.slice_id)
-        # Cache sender endpoints so cancel() can send CANCEL_SESSION to them.
-        session._sender_endpoints.update(
-            peer_infos.sender_endpoints[rank] for rank in peer_overlap.ranks
-        )
         # Fan-in: each sender gets its own sub-region base (writers must not overwrite); else serialize once.
         fanin_bounce = bounced and task.expected_transfers > 1
         key = (receiver_req.unique_rid, receiver_req.slice_id)
         receiver_req_bytes = None if fanin_bounce else receiver_req.to_bytes()
+        successful_dispatches = 0
         for i, rank in enumerate(peer_overlap.ranks):
+            endpoint = peer_infos.sender_endpoints[rank]
+            if not session.begin_peer_transfer(task.slice_id, rank, endpoint):
+                exc = RuntimeError(
+                    f"dispatch_task: RxSession {task._unique_rid} was cancelled "
+                    f"before dispatch to peer_rank={rank}"
+                )
+                task.fail(exc)
+                raise exc
             if task._perf_timer is not None:
                 task._perf_timer.record_task_start(rank)
             if fanin_bounce:
                 receiver_req.bounce_dst_base = self._bounce.writer_base(key, i)
                 receiver_req_bytes = receiver_req.to_bytes()
-            self._request_sender_data(peer_infos.sender_endpoints[rank], receiver_req_bytes)
+            try:
+                self._request_sender_data(endpoint, receiver_req_bytes)
+            except Exception as exc:
+                # The synchronous send did not complete, so this peer cannot
+                # own the destination. Keep only earlier successful peer
+                # reservations alive for the async cancellation/drain path.
+                session.abort_peer_transfer(task.slice_id, rank)
+                task.fail(exc)
+                logger.error(
+                    f"Receiver.dispatch_task failed for rid={task._unique_rid}, "
+                    f"peer_rank={rank}, successful_dispatches={successful_dispatches}: {exc}"
+                )
+                raise
+            successful_dispatches += 1
         return
 
     @staticmethod
@@ -1906,9 +2545,12 @@ class Receiver(ReceiverBase):
         """Notify all senders involved in this session to cancel."""
         for endpoint in sender_endpoints:
             try:
-                self._get_or_connect_dealer(endpoint).send(
-                    [MessageType.CANCEL_SESSION, str(unique_rid).encode("ascii")]
+                accepted = self._reliable_message_outbox.submit(
+                    endpoint,
+                    [MessageType.CANCEL_SESSION, str(unique_rid).encode("ascii")],
                 )
+                if not accepted:
+                    logger.error(f"send_cancel_to_senders: outbox rejected rid={unique_rid}")
             except Exception as e:
                 logger.warning(f"send_cancel_to_senders: failed for rid={unique_rid}: {e}")
 
@@ -2044,8 +2686,17 @@ class RxSession(RxSessionBase):
         self._kv_tasks: list[KVRecvTask] = []
         self._aux_count = 0
         self._aux_status: TaskStatus = TaskStatus.INIT
+        self._pending_aux_peer_ranks: set[int] = set()
+        self._resolved_aux_peer_ranks: set[int] = set()
         self._sender_endpoints: set[str] = set()
+        # Error-triggered ADP cancellation is endpoint-idempotent. Sender
+        # notifications are claimed under ``lock`` and sent after releasing it.
+        self._failure_cancelled_sender_endpoints: set[str] = set()
         self.lock = threading.Lock()
+        # See TxSession._active_nixl_ops.  On the receiver side each
+        # successfully dispatched peer request conservatively owns one
+        # destination operation until its agent-result message arrives.
+        self._active_nixl_ops = 0
         self._receiver.setup_session(self)
 
     @property
@@ -2076,9 +2727,90 @@ class RxSession(RxSessionBase):
                 return SessionStatus.TRANSFERRING
         return SessionStatus.INIT
 
-    def mark_transferring(self, slice_id: int):
+    def begin_peer_transfer(self, slice_id: int, peer_rank: int, sender_endpoint: str) -> bool:
+        """Reserve destination lifetime before dispatching REQUEST_DATA.
+
+        Returns False when cancellation/error won the race, in which case the
+        caller must not contact the sender.
+        """
         with self.lock:
-            self._kv_tasks[slice_id].status = TaskStatus.TRANSFERRING
+            if self._terminal_status in (SessionStatus.ERROR, SessionStatus.CANCELLED):
+                return False
+            task = self._kv_tasks[slice_id]
+            if peer_rank in task.pending_peer_ranks:
+                raise RuntimeError(
+                    f"duplicate peer dispatch for request {self.request_id}, "
+                    f"slice={slice_id}, peer_rank={peer_rank}"
+                )
+            task.pending_peer_ranks.add(peer_rank)
+            reserve_aux = (
+                self._need_aux
+                and peer_rank not in self._pending_aux_peer_ranks
+                and peer_rank not in self._resolved_aux_peer_ranks
+            )
+            if reserve_aux:
+                self._pending_aux_peer_ranks.add(peer_rank)
+                task.aux_reserved_peer_ranks.add(peer_rank)
+            task.status = TaskStatus.TRANSFERRING
+            self._sender_endpoints.add(sender_endpoint)
+            self._active_nixl_ops += 1 + int(reserve_aux)
+            return True
+
+    def abort_peer_transfer(self, slice_id: int, peer_rank: int) -> None:
+        """Undo a reservation whose REQUEST_DATA send raised synchronously."""
+        with self.lock:
+            task = self._kv_tasks[slice_id]
+            if peer_rank not in task.pending_peer_ranks:
+                return
+            task.pending_peer_ranks.remove(peer_rank)
+            op_count = 1
+            if peer_rank in task.aux_reserved_peer_ranks:
+                task.aux_reserved_peer_ranks.remove(peer_rank)
+                if peer_rank in self._pending_aux_peer_ranks:
+                    self._pending_aux_peer_ranks.remove(peer_rank)
+                    op_count += 1
+            if self._active_nixl_ops < op_count:
+                logger.error(f"RxSession {self.disagg_request_id} NIXL operation counter underflow")
+                return
+            self._active_nixl_ops -= op_count
+
+    def _discard_broadcast_kv_phantoms_locked(self, task: KVRecvTask) -> None:
+        """Drop non-selected ADP broadcast peers after all real responders reply."""
+        if (
+            not task.is_broadcast_dispatch
+            or self._terminal_status in (SessionStatus.ERROR, SessionStatus.CANCELLED)
+            or len(task.resolved_peer_ranks) < task.expected_transfers
+        ):
+            return
+        phantom_count = len(task.pending_peer_ranks)
+        if phantom_count == 0:
+            return
+        task.pending_peer_ranks.clear()
+        self._active_nixl_ops = max(0, self._active_nixl_ops - phantom_count)
+
+    def _discard_broadcast_aux_phantoms_locked(self, task: KVRecvTask) -> None:
+        if (
+            not task.is_broadcast_dispatch
+            or self._terminal_status in (SessionStatus.ERROR, SessionStatus.CANCELLED)
+            or len(self._resolved_aux_peer_ranks) < task.expected_transfers
+        ):
+            return
+        phantom_count = len(self._pending_aux_peer_ranks)
+        if phantom_count == 0:
+            return
+        phantom_ranks = set(self._pending_aux_peer_ranks)
+        self._pending_aux_peer_ranks.clear()
+        for kv_task in self._kv_tasks:
+            kv_task.aux_reserved_peer_ranks.difference_update(phantom_ranks)
+        self._active_nixl_ops = max(0, self._active_nixl_ops - phantom_count)
+
+    def _claim_broadcast_failure_cancel_locked(self, task: KVRecvTask) -> set[str]:
+        """Claim sender endpoints that still need ERROR-path cancellation."""
+        if not task.is_broadcast_dispatch or self._terminal_status != SessionStatus.ERROR:
+            return set()
+        endpoints = self._sender_endpoints.difference(self._failure_cancelled_sender_endpoints)
+        self._failure_cancelled_sender_endpoints.update(endpoints)
+        return endpoints
 
     def receive(self, slice: KVSlice) -> None:
         if self.transfer_start_time is None:
@@ -2106,6 +2838,7 @@ class RxSession(RxSessionBase):
         src_base=None,
         transfer_size: int = 0,
     ):
+        cancel_endpoints: set[str] = set()
         with self.lock:
             self.kv_cache_size_bytes += transfer_size
             assert sender_slice_id < len(self._kv_tasks), (
@@ -2114,127 +2847,158 @@ class RxSession(RxSessionBase):
                 f"Sender/receiver slice count mismatch."
             )
             task = self._kv_tasks[sender_slice_id]
-            if status == AgentResult.SUCCESS:
-                from .bounce import scatter_write_result
+            if peer_rank not in task.pending_peer_ranks:
+                kind = "duplicate" if peer_rank in task.resolved_peer_ranks else "unexpected"
+                logger.warning(
+                    f"RxSession {self.request_id} ignoring {kind} KV result for "
+                    f"slice={sender_slice_id}, peer_rank={peer_rank}"
+                )
+                return
+            try:
+                if status == AgentResult.SUCCESS:
+                    from .bounce import scatter_write_result
 
-                on_done = None
-                if is_last_slice:
-                    task.last_slice_count += 1
-                    if task.last_slice_count == task.expected_transfers:
-                        # Completing message: defer task.complete()+perf until the scatter has actually
-                        # landed. scatter_write_result fires this inline for the non-bounced path, or on
-                        # the scatter worker (after cudaStreamSynchronize) for the bounced path, so the
-                        # gen consumer never observes completion before the KV is scattered into place.
-                        request_id = self.request_id
-                        ri = self._receiver._registrar.self_rank_info
-                        instance_name, instance_rank = ri.instance_name, ri.instance_rank
+                    on_done = None
+                    if is_last_slice:
+                        task.last_slice_count += 1
+                        if task.last_slice_count == task.expected_transfers:
+                            request_id = self.request_id
 
-                        def on_done(
-                            success,
-                            task=task,
-                            peer_rank=peer_rank,
-                            sender_slice_id=sender_slice_id,
-                            request_id=request_id,
-                            instance_name=instance_name,
-                            instance_rank=instance_rank,
-                        ):
-                            # Runs on the scatter worker thread for the bounced path. Touches only this
-                            # task's own status/_event/_perf_timer (no RxSession.lock, no shared session
-                            # state), so it is lock-free. complete() sets status before _event, keeping
-                            # wait_complete's status-first poll correct.
-                            if not success:
-                                task.fail(
-                                    RuntimeError(
-                                        f"KV bounce scatter failed for request {request_id} "
-                                        f"slice={sender_slice_id}"
+                            def on_done(
+                                success,
+                                task=task,
+                                peer_rank=peer_rank,
+                                sender_slice_id=sender_slice_id,
+                                request_id=request_id,
+                            ):
+                                if not success:
+                                    task.fail(
+                                        RuntimeError(
+                                            f"KV bounce scatter failed for request {request_id} "
+                                            f"slice={sender_slice_id}"
+                                        )
                                     )
+                                    return
+                                if task.status == TaskStatus.ERROR:
+                                    return
+                                task.complete()
+                                # Transfer end for perf/time-sync is valid only
+                                # after the bounce data has landed in the real KV pool.
+                                if all(t.status == TaskStatus.TRANSFERRED for t in self._kv_tasks):
+                                    self.transfer_end_time = (
+                                        tensorrt_llm.bindings.global_steady_clock_now()
+                                    )
+                                logger.debug(
+                                    f"KV transfer complete for request {request_id} "
+                                    f"slice={sender_slice_id}"
                                 )
-                                return
-                            if task.status == TaskStatus.ERROR:
-                                return  # a concurrent FAILED writer already failed it; don't un-fail
-                            try:
                                 if task._perf_timer is not None:
                                     task._perf_timer.record_task_end(peer_rank)
-                                task.print_perf_info(peer_rank, instance_name, instance_rank)
-                            except Exception as e:  # perf is best-effort; never block completion
-                                logger.warning(
-                                    f"KV transfer perf logging failed for request {request_id} "
-                                    f"slice={sender_slice_id}: {e}"
-                                )
-                            task.complete()
-                            # Transfer end for perf/time-sync: only meaningful once every slice has
-                            # landed. Plain attribute write (atomic under the GIL); on_done must stay
-                            # lock-free, and consumers only read it after wait_complete succeeds.
-                            if all(t.status == TaskStatus.TRANSFERRED for t in self._kv_tasks):
-                                self.transfer_end_time = (
-                                    tensorrt_llm.bindings.global_steady_clock_now()
-                                )
-                            logger.debug(
-                                f"KV transfer complete for request {request_id} "
-                                f"slice={sender_slice_id}"
-                            )
+                                ri = self._receiver._registrar.self_rank_info
+                                task.print_perf_info(peer_rank, ri.instance_name, ri.instance_rank)
 
-                scatter_write_result(
-                    self._receiver._bounce,
-                    (self.disagg_request_id, task.slice_id),
-                    peer_rank,
-                    dst_ptrs,
-                    sizes,
-                    src_base,
-                    on_done,
-                )
-            elif status == AgentResult.FAILED:
-                detail = (
-                    f"KV transfer failed for request {self.request_id} slice={sender_slice_id} "
-                    f"peer_rank={peer_rank} is_last_slice={is_last_slice} "
-                    f"(reported by remote agent; see sender-side log for nixl_status)"
-                )
-                logger.error(detail)
-                # Drain-before-release: record this writer FAILED; the owner frees the shared region
-                # only once every fan-in writer is terminal (freeing now could race a sibling's RMA).
-                self._receiver._bounce.record_failure(
-                    (self.disagg_request_id, task.slice_id), peer_rank
-                )
-                task.fail(RuntimeError(detail))
-                if self._terminal_status is None:  # Don't overwrite CANCELLED with ERROR
-                    self._terminal_status = SessionStatus.ERROR
-            else:
-                raise ValueError(
-                    f"Session {self.request_id} received unknown task status: {status.value}"
-                )
+                    scatter_write_result(
+                        self._receiver._bounce,
+                        (self.disagg_request_id, task.slice_id),
+                        peer_rank,
+                        dst_ptrs,
+                        sizes,
+                        src_base,
+                        on_done,
+                    )
+                elif status == AgentResult.FAILED:
+                    detail = (
+                        f"KV transfer failed for request {self.request_id} slice={sender_slice_id} "
+                        f"peer_rank={peer_rank} is_last_slice={is_last_slice} "
+                        f"(reported by remote agent; see sender-side log for nixl_status)"
+                    )
+                    logger.error(detail)
+                    task.fail(RuntimeError(detail))
+                    if self._terminal_status is None:  # Don't overwrite CANCELLED with ERROR
+                        self._terminal_status = SessionStatus.ERROR
+                else:
+                    raise ValueError(
+                        f"Session {self.request_id} received unknown task status: {status.value}"
+                    )
+            finally:
+                # A result is sent only after the remote submit/wait path has
+                # stopped using our destination. Resolve this peer exactly
+                # once even when result processing itself raises.
+                task.pending_peer_ranks.remove(peer_rank)
+                task.resolved_peer_ranks.add(peer_rank)
+                if self._active_nixl_ops <= 0:
+                    logger.error(
+                        f"RxSession {self.disagg_request_id} NIXL operation counter underflow"
+                    )
+                else:
+                    self._active_nixl_ops -= 1
+                self._discard_broadcast_kv_phantoms_locked(task)
+                cancel_endpoints = self._claim_broadcast_failure_cancel_locked(task)
+        if cancel_endpoints:
+            # Never perform messaging I/O while holding the session lock.
+            self._receiver.send_cancel_to_senders(self.disagg_request_id, cancel_endpoints)
 
-    def process_aux_agent_result(self, _peer_rank: int, status: AgentResult):
+    def process_aux_agent_result(self, peer_rank: int, status: AgentResult):
         # Aux is session-level (not per-slice); expected_transfers is identical
         # across all kv_tasks, so any task provides the right count.
+        cancel_endpoints: set[str] = set()
         with self.lock:
+            if peer_rank not in self._pending_aux_peer_ranks:
+                kind = "duplicate" if peer_rank in self._resolved_aux_peer_ranks else "unexpected"
+                logger.warning(
+                    f"RxSession {self.request_id} ignoring {kind} aux result "
+                    f"from peer_rank={peer_rank}"
+                )
+                return
             if not self._kv_tasks:
                 logger.warning(
                     f"Aux result received before any KV tasks for request {self.request_id}"
                 )
+                self._pending_aux_peer_ranks.remove(peer_rank)
+                self._resolved_aux_peer_ranks.add(peer_rank)
+                if self._active_nixl_ops > 0:
+                    self._active_nixl_ops -= 1
                 return
             task = self._kv_tasks[0]
-            if status == AgentResult.SUCCESS:
-                self._aux_count += 1
+            try:
+                if status == AgentResult.SUCCESS:
+                    self._aux_count += 1
 
-                if self._aux_count == task.expected_transfers:
-                    self._aux_status = TaskStatus.TRANSFERRED
-                elif self._aux_count > task.expected_transfers:
+                    if self._aux_count == task.expected_transfers:
+                        self._aux_status = TaskStatus.TRANSFERRED
+                    elif self._aux_count > task.expected_transfers:
+                        self._aux_status = TaskStatus.ERROR
+                        self._exception = RuntimeError(
+                            f"Session {self.request_id} received too many aux transfers"
+                        )
+                        if self._terminal_status is None:
+                            self._terminal_status = SessionStatus.ERROR
+                        logger.error(str(self._exception))
+                elif status == AgentResult.FAILED:
                     self._aux_status = TaskStatus.ERROR
-                    self._exception = RuntimeError(
-                        f"Session {self.request_id} received too many aux transfers"
-                    )
+                    self._exception = RuntimeError(f"Session {self.request_id} aux transfer failed")
                     if self._terminal_status is None:
                         self._terminal_status = SessionStatus.ERROR
-                    logger.error(str(self._exception))
-            elif status == AgentResult.FAILED:
-                self._aux_status = TaskStatus.ERROR
-                self._exception = RuntimeError(f"Session {self.request_id} aux transfer failed")
-                if self._terminal_status is None:
-                    self._terminal_status = SessionStatus.ERROR
-            else:
-                raise ValueError(
-                    f"Session {self.request_id} received unknown aux send status: {status}"
-                )
+                else:
+                    raise ValueError(
+                        f"Session {self.request_id} received unknown aux send status: {status}"
+                    )
+            finally:
+                self._pending_aux_peer_ranks.remove(peer_rank)
+                self._resolved_aux_peer_ranks.add(peer_rank)
+                for kv_task in self._kv_tasks:
+                    kv_task.aux_reserved_peer_ranks.discard(peer_rank)
+                if self._active_nixl_ops <= 0:
+                    logger.error(
+                        f"RxSession {self.disagg_request_id} NIXL operation counter underflow"
+                    )
+                else:
+                    self._active_nixl_ops -= 1
+                self._discard_broadcast_aux_phantoms_locked(task)
+                cancel_endpoints = self._claim_broadcast_failure_cancel_locked(task)
+        if cancel_endpoints:
+            # Never perform messaging I/O while holding the session lock.
+            self._receiver.send_cancel_to_senders(self.disagg_request_id, cancel_endpoints)
 
     @property
     def exception(self) -> Optional[Exception]:
@@ -2280,28 +3044,31 @@ class RxSession(RxSessionBase):
         with self.lock:
             if self._terminal_status == SessionStatus.CANCELLED:
                 return
-            self._terminal_status = SessionStatus.CANCELLED
-            exc = RuntimeError(f"RxSession {self.disagg_request_id} cancelled")
-            for task in self._kv_tasks:
-                rid_slice = (self.disagg_request_id, task.slice_id)
-                if task.status == TaskStatus.INIT:
-                    # INIT = reserved but no write in flight, so freeing its bounce reservation here
-                    # is safe.
-                    self._receiver._bounce.release_idle_reservation(rid_slice)
-                    task.fail(exc)
-                elif task.status == TaskStatus.TRANSFERRING:
-                    # A write may still be mid-flight, so quarantine the region rather than freeing
-                    # it; this keeps a cancelled transfer from leaking. No-op when bounce is off.
-                    self._receiver._bounce.orphan_reservation(rid_slice)
+            if self._terminal_status == SessionStatus.ERROR:
+                # Preserve the diagnostically useful ERROR while still
+                # notifying any endpoints not covered by failure fan-out.
+                endpoints = self._sender_endpoints.difference(
+                    self._failure_cancelled_sender_endpoints
+                )
+                self._failure_cancelled_sender_endpoints.update(endpoints)
+            else:
+                self._terminal_status = SessionStatus.CANCELLED
+                exc = RuntimeError(f"RxSession {self.disagg_request_id} cancelled")
+                for task in self._kv_tasks:
+                    if task.status == TaskStatus.INIT:
+                        task.fail(exc)
+                endpoints = set(self._sender_endpoints)
         # Send outside the lock to avoid holding it during I/O.
-        self._receiver.send_cancel_to_senders(self.disagg_request_id, self._sender_endpoints)
+        if endpoints:
+            self._receiver.send_cancel_to_senders(self.disagg_request_id, endpoints)
 
     def has_transferring_tasks(self) -> bool:
-        """True if any KV task is currently mid-write (TRANSFERRING).
+        """True while any dispatched peer may still own destination buffers.
 
         cancel_request() must return False while this is True.
         """
-        return any(t.status == TaskStatus.TRANSFERRING for t in self._kv_tasks)
+        with self.lock:
+            return self._active_nixl_ops > 0
 
     def wait_complete(self, blocking: bool = False) -> Optional[WaitResult]:
         """Poll or block until transfer completes.

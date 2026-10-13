@@ -2284,6 +2284,8 @@ void doGatedActivation(ActivationOutputType* output, GemmOutputType const* gemm_
         ? &doGatedActivationKernel<ActivationOutputType, GemmOutputType, GLUAdaptor<cutlass::epilogue::thread::GELU>>
         : activation_type == ActivationType::SwigluBias
         ? &doGatedActivationKernel<ActivationOutputType, GemmOutputType, SwigluBiasAdaptor>
+        : activation_type == ActivationType::SiTu
+        ? &doGatedActivationKernel<ActivationOutputType, GemmOutputType, SiTuAdaptor>
         : nullptr;
     TLLM_CHECK_WITH_INFO(fn != nullptr, "Invalid activation type");
     fn<<<blocks, threads, 0, stream>>>(output, gemm_result, expert_first_token_offset, inter_size, num_experts_per_node,
@@ -2809,6 +2811,9 @@ void doActivation(T* output, GemmOutputType const* gemm_result, float const* fp8
                 case ActivationType::SwigluBias:
                     return &doActivationKernel<T, GemmOutputType, ScaleBiasType, SwigluBiasAdaptor,
                         decltype(block_scaling_type)::value, num_rows_per_cta_v, false, kWriteFp8>;
+                case ActivationType::SiTu:
+                    return &doActivationKernel<T, GemmOutputType, ScaleBiasType, SiTuAdaptor,
+                        decltype(block_scaling_type)::value, num_rows_per_cta_v, false, kWriteFp8>;
                 case ActivationType::Relu2:
                     return &doActivationKernel<T, GemmOutputType, ScaleBiasType,
                         IdentityAdaptor<cutlass::epilogue::thread::Relu2>, decltype(block_scaling_type)::value,
@@ -2963,6 +2968,8 @@ void doActivationDynamic(T* output, GemmOutputType const* gemm_result, float con
                 case ActivationType::SwigluBias:
                     return &doActivationKernel<T, GemmOutputType, ScaleBiasType, SwigluBiasAdaptor, NVFP4_TYPE, kRows,
                         true>;
+                case ActivationType::SiTu:
+                    return &doActivationKernel<T, GemmOutputType, ScaleBiasType, SiTuAdaptor, NVFP4_TYPE, kRows, true>;
                 case ActivationType::Relu2:
                     return &doActivationKernel<T, GemmOutputType, ScaleBiasType,
                         IdentityAdaptor<cutlass::epilogue::thread::Relu2>, NVFP4_TYPE, kRows, true>;

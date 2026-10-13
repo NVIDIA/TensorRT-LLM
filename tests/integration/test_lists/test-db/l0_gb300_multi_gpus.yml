@@ -38,16 +38,29 @@ l0_gb300_multi_gpus:
   # Kimi K3 speculative decoding: exact kernel-level verify parity (random
   # weights, no checkpoint) + truncated-model e2e SA logits parity
   # (auto-skips when the Kimi K3 checkpoint is not staged).
-  - unittest/_torch/modeling -k "kimi_kda_verify"
+  - unittest/_torch/modules/kimi_kda/test_kimi_kda_verify_parity.py
   # Fused KDA multi-token verify (trtllm::kda_mtp_decode): kernel-level
   # parity vs CPU golden + FLA sequential, and runtime-level fused-vs-
   # sequential two-round replay parity.
-  - unittest/_torch/modeling -k "kda_mtp_decode_cute_parity"
-  - unittest/_torch/modeling -k "kimi_kda_fused_verify"
+  - unittest/_torch/modules/kimi_kda/test_kda_mtp_decode_cute_parity.py
+  - unittest/_torch/modules/kimi_kda/test_kimi_kda_fused_verify_parity.py
+  # Plain-decode conv-state tiers: the decode kernel's in-place pool roll
+  # must match the staged Triton pass and the ATen sequence exactly.
+  - unittest/_torch/modules/kimi_kda/test_kimi_kda_decode_conv_tiers.py
+  - test_kimi_k3_specdec.py::test_kimi_k3_sa_specdec_logits_parity TIMEOUT (30)
   # Kimi K3 op parity tests (random weights, no checkpoint; SM100/SM103).
   - unittest/_torch/modules/kimi_kda/test_kda_prefill_op.py
   - unittest/_torch/modules/kimi_kda/test_kda_decode_op.py
+  # KDA prefill scratch must stay bounded: _get_buffers is keyed on the
+  # unquantized per-iteration context token count, so a cache entry that
+  # outlives its LRU eviction strands ~1 GiB per distinct shape and OOMs a
+  # long context run ~40 min in. Memory-only assertions; no kernels.
+  - unittest/_torch/modules/kimi_kda/test_kda_buf_cache_bounded.py
   - unittest/_torch/modules/kimi_k3_attn_res/test_attn_res_op.py
+  # Fused attn-res epilogue (selection + trailing RMSNorm, optionally the
+  # preceding residual add) against the unfused reference, across the token
+  # counts the fused path is taken for.
+  - unittest/_torch/modules/kimi_k3_attn_res/test_attn_res_rmsnorm_op.py
   # Kimi K3 MoE routing shape on the TRTLLM backend (random weights, no
   # checkpoint; the case moved out of the skipped TestMoeFp4 class).
   - unittest/_torch/modules/moe/test_moe_backend.py -k "kimi_k3_shape"

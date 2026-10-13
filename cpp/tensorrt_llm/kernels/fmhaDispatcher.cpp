@@ -147,6 +147,7 @@ bool FmhaDispatcher::isSupported()
             // Generation-style kernels on long KV can pick MultiCtasKv cubins
             tllmRunnerParams.mMultiCtasKvMode = true;
         }
+        tllmRunnerParams.mUsesSpcompress = mFixedParams.useSpcompress;
 
         foundKernels = mTllmGenFMHARunner->isSupported(tllmRunnerParams);
     }
@@ -285,6 +286,7 @@ void FmhaDispatcher::run(MHARunnerParams runnerParams)
                 = reinterpret_cast<int const*>(runnerParams.sparse_params.sparse_attn_indices);
             if (useDynamicSparseMLA)
             {
+                tllmRunnerParams.mSkipCorrThreshold = kDsv4SkipCorrThreshold;
                 TLLM_CHECK_WITH_INFO(runnerParams.sparse_params.sliding_window_kv_cache_pool != nullptr,
                     "SWA KV pool must be set for dynamic sparse MLA.");
                 // Dynamic sparse MLA always has an SWA pool. The compressed pool is optional; when it
@@ -303,6 +305,7 @@ void FmhaDispatcher::run(MHARunnerParams runnerParams)
             tllmRunnerParams.multiCtasKvScratchPtr = runnerParams.multiCtasKvScratchPtr;
             tllmRunnerParams.multiCtasKvCounterPtr = runnerParams.multiCtasKvCounterPtr;
         }
+        tllmRunnerParams.mUsesSpcompress = mFixedParams.useSpcompress;
 
         mTllmGenFMHARunner->run(tllmRunnerParams);
     }

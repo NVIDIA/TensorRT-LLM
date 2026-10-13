@@ -47,6 +47,11 @@ enum class CudaArch
     Sm100f,
     // Blackwell Ultra
     Sm103a,
+#ifdef TLLM_RUBIN_FEATURES
+    // Rubin
+    Sm105a,
+    Sm107a,
+#endif // TLLM_RUBIN_FEATURES
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -56,8 +61,23 @@ inline bool isArchHopper(CudaArch cudaArch)
     return cudaArch == CudaArch::Sm90a;
 }
 
+#ifdef TLLM_RUBIN_FEATURES
+inline bool isArchRubin(CudaArch cudaArch)
+{
+    // Note: when compiling with a Blackwell target compatible with Rubin such as 100f,
+    // no Rubin-specific features shall be used.
+    return cudaArch == CudaArch::Sm105a || cudaArch == CudaArch::Sm107a;
+}
+#endif // TLLM_RUBIN_FEATURES
+
 inline bool isArchBlackwell(CudaArch cudaArch)
 {
+#ifdef TLLM_RUBIN_FEATURES
+    if (isArchRubin(cudaArch))
+    {
+        return true;
+    }
+#endif // TLLM_RUBIN_FEATURES
     return cudaArch == CudaArch::Sm100a || cudaArch == CudaArch::Sm100f || cudaArch == CudaArch::Sm103a;
 }
 
@@ -76,6 +96,10 @@ inline std::string cudaArchToString(CudaArch cudaArch, bool isFull = true)
     case CudaArch::Sm100a: return isFull ? "100a" : "100";
     case CudaArch::Sm100f: return isFull ? "100f" : "100";
     case CudaArch::Sm103a: return isFull ? "103a" : "103";
+#ifdef TLLM_RUBIN_FEATURES
+    case CudaArch::Sm105a: return isFull ? "105a" : "105";
+    case CudaArch::Sm107a: return isFull ? "107a" : "107";
+#endif // TLLM_RUBIN_FEATURES
     default: assert(false); return "";
     }
 }
@@ -99,6 +123,16 @@ inline CudaArch stringToCudaArch(std::string const& str)
     else if (str == "103a")
     {
         return CudaArch::Sm103a;
+#ifdef TLLM_RUBIN_FEATURES
+    }
+    else if (str == "105a")
+    {
+        return CudaArch::Sm105a;
+    }
+    else if (str == "107a")
+    {
+        return CudaArch::Sm107a;
+#endif // TLLM_RUBIN_FEATURES
     }
     else
     {

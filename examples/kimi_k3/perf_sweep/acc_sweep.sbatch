@@ -5,8 +5,7 @@
 # Kimi K3 ACCURACY sweep (GSM8K) for the serving recipes measured by
 # perf_sweep.sbatch: same per-mode yaml, same env, same tp/batch/token CLI
 # flags (keep the mode blocks below in sync with perf_sweep.sbatch by hand).
-# One in-process trtllm-eval run per job; expect ~96.5 +/- 0.5 on the full
-# 1319-question set.
+# One in-process trtllm-eval run per job on the full 1319-question set.
 #
 # Usage:
 #   sbatch [--nodes=N ...] acc_sweep.sbatch \
@@ -46,21 +45,18 @@ done
 case "$MODE" in
     dep16)
         TP_SIZE=16; MAX_BATCH_SIZE=64
-        MODE_ENV="KIMI_K3_FP8_WEIGHT_READ=1"
+        MODE_ENV=""
         ;;
     tep16)
         TP_SIZE=16; MAX_BATCH_SIZE=16
-        MODE_ENV="KIMI_K3_FP8_WEIGHT_READ=1 KIMI_K3_FP8_WEIGHT_READ_KDA=0 KIMI_K3_FP8_WEIGHT_READ_GATE_UP=1"
-        # BF16 KDA read + FP8 gate_up at tp16 measured ~40% better
-        # tps/user at c1 than the base FP8 recipe, at equal-or-better
-        # GSM8K accuracy. Do NOT add the separated-routing env here: at
-        # tp16 it costs accuracy on its own and, combined with the FP8
-        # gate_up read, collapses GSM8K entirely; that pair is validated
-        # for tep8 only.
+        MODE_ENV=""
+        # Historical: the per-slice FP8 overrides were retired. Attention FP8 is
+        # now checkpoint-driven and gate_up follows attention DP, so this
+        # mode runs the plain stack. Do NOT add the separated-routing env here.
         ;;
     tep8)
         TP_SIZE=8; MAX_BATCH_SIZE=16
-        MODE_ENV="KIMI_K3_FP8_WEIGHT_READ=1 KIMI_K3_FP8_WEIGHT_READ_GATE_UP=1 TLLM_TRTLLMGEN_FORCE_SEPARATED_ROUTING=1"
+        MODE_ENV="TLLM_TRTLLMGEN_FORCE_SEPARATED_ROUTING=1"
         ;;
     *) echo "error: unknown --mode: $MODE (dep16|tep16|tep8)" >&2; exit 2 ;;
 esac

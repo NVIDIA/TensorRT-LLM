@@ -44,6 +44,7 @@ class CacheTierConfig(Protocol):
 @dataclass(slots=True)
 class GpuCacheTierConfig:
     quota: int  # in bytes
+    enable_ugpu: bool = False
 
     @property
     def tier(self) -> CacheTier:
@@ -51,6 +52,7 @@ class GpuCacheTierConfig:
 
     def assert_valid(self) -> None:
         assert self.quota > 0, "Quota must be positive"
+        assert isinstance(self.enable_ugpu, bool), "enable_ugpu must be a bool"
 
 
 @dataclass(slots=True)
@@ -198,6 +200,18 @@ class KVCacheManagerConfig:
     enable_partial_reuse: bool = True
     """
     If True, we will try to reuse tokens from partially matched blocks.
+    """
+
+    reuse_match_backoff: int = 0
+    """
+    Tokens dropped from the tail of every prefix match.
+
+    For a pool whose KV at position i is a function of tokens [0, i] this is 0: a
+    match of m tokens proves all m are reusable. Set it to D when the pool also
+    holds state that reads D tokens ahead -- one-model speculative decoding draft
+    layers -- where a match of m only describes the first m - D positions.
+
+    Applied inside the match so a single tree walk yields the usable depth.
     """
 
     constraints: list[BatchDesc] = field(default_factory=list)

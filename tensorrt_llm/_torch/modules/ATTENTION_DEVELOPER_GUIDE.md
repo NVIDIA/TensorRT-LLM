@@ -135,13 +135,14 @@ statically checkable without runtime signature inspection.
 
 Ordinary sparse variants use `attention_output_hidden_size` and the shared
 output allocation. DeepSeek-V4's fused epilogue instead uses the optional
-output-preparation hook to create one token-major O-LoRA output tensor. Its
-context- and generation-phase helpers allocate the private FP8 attention and
-scale buffers, then write the O-LoRA result into the corresponding token range.
-The shared MLA custom-op contract exposes exactly one mutable output tensor;
-`_create_outputs()` keeps that tensor in a single-entry list through forward
-and output projection. Phase-specific scratch buffers remain inside the
-DeepSeek-V4 algorithm module and do not widen the generic hook facade.
+output-preparation hook to create one token-major O-LoRA-sized output tensor.
+Its context- and generation-phase helpers allocate the private FP8 attention
+and scale buffers, run both O-LoRA projections, and write the final hidden
+states into the leading columns of that tensor. The shared MLA custom-op
+contract exposes exactly one mutable output tensor; `_create_outputs()` keeps
+that tensor in a single-entry list through forward and output projection.
+Phase-specific scratch buffers remain inside the DeepSeek-V4 algorithm module
+and do not widen the generic hook facade.
 
 Sparse prediction inputs stay out of shared MLA APIs. Algorithm modules wrap
 their module-to-backend inputs in a `SparseBackendForwardArgs` subclass and
@@ -206,6 +207,9 @@ The core contract is:
   - `support_mla()`
 - `runtime_workspace_bytes_per_token(model_config, mapping)` — the memory-accounting
   contract (default `0`); see below
+- `runtime_workspace_is_chunked_prefill_bounded(model_config)` — whether
+  chunked prefill limits that workspace to the current KV chunk (default
+  `True`)
 
 `**kwargs` is only a temporary compatibility path. It is merged into
 `AttentionForwardArgs`, rejects unknown fields, and must not be mixed with
@@ -221,10 +225,15 @@ maximum is under-reserved and can OOM mid-forward. If a backend stages such a
 buffer, declare its per-token cost via
 `runtime_workspace_bytes_per_token(model_config, mapping)` (default `0`): the
 estimator reserves it from the KV budget and the scheduler caps the driving sum.
-Keep the declared cost identical to the runtime allocation's (single source of
-truth). The one instance today is the fp8 context-MLA K/V dequant workspace,
-sized by summed attended KV length (`total_kv_len`) — which KV-cache reuse
-decouples from `max_num_tokens` (`TrtllmAttention.runtime_workspace_bytes_per_token`).
+Keep the declared cost identical to the runtime allocation's when possible, or
+use a documented conservative upper bound. The current instances are the fp8
+context-MLA K/V dequant workspace and
+the NVFP4 DSA and DeepSeek-V4 context gather workspaces. They are sized by
+summed attended KV length (`total_kv_len`), which cached prefixes can decouple
+from `max_num_tokens` (`TrtllmAttention.runtime_workspace_bytes_per_token`).
+NVFP4 sparse MLA reads the complete attended prefix even with chunked prefill,
+so it also returns `False` from
+`runtime_workspace_is_chunked_prefill_bounded`.
 
 ### 2.4 Capability reference
 
@@ -300,22 +309,24 @@ The main differences across backends:
 #### 3.2.2 `TRTLLM` internal FMHA libraries
 
 `TrtllmAttention` dispatches attention through an ordered list of internal FMHA
-libraries. `CuteDslMlaFmha` integrates Blackwell CuTe DSL MLA decode kernels,
+libraries. `Fp4MlaFmha` owns FP4 MLA context and decode dispatch,
+`CuteDslMlaFmha` integrates Blackwell CuTe DSL MLA decode kernels,
 `FlashInferTrtllmGenFmha` integrates trtllm-gen kernels from FlashInfer into
 the `TRTLLM` backend, and `FallbackFmha` calls the regular `thop.attention`
 runtime path. These are not separate attention backends.
 
 `TLLM_FMHA_LIBS` controls the ordered list. Unset means
-`cute_dsl_mla,msa_sparse_gqa,flashinfer_trtllm_gen,fallback`; use `TLLM_FMHA_LIBS=fallback`
-or `TLLM_FMHA_LIBS=-cute_dsl_mla,-msa_sparse_gqa,-flashinfer_trtllm_gen` to force the fallback
-path. Each FMHA library exposes `is_available()` for module/static environment
-checks and `is_supported()` for per-forward request checks.
+`fp4_mla,cute_dsl_mla,msa_sparse_gqa,flashinfer_trtllm_gen,fallback`; use
+`TLLM_FMHA_LIBS=fallback` or `TLLM_FMHA_LIBS=-flashinfer_trtllm_gen` to force
+the fallback path. Each FMHA library exposes `is_available()` for module/static
+environment checks and `is_supported()` for per-forward request checks.
 
 The FMHA package is split by role:
 
 - `fmha/interface.py` defines the `Fmha` runtime contract.
 - `fmha/phased.py` defines `PhasedFmha`, which handles mixed context/generation
   requests and dispatches them to phase-specific hooks.
+- `fmha/fp4_mla.py` implements FP4 MLA context and no-dequant decode.
 - `fmha/cute_dsl_mla.py` implements the CuTe DSL MLA decode FMHA library.
 - `fmha/flashinfer_trtllm_gen.py` implements the FlashInfer trtllm-gen FMHA
   library.
@@ -327,6 +338,16 @@ entry points. Use `Fmha` directly for libraries that already own the full
 request shape.
 
 #### 3.2.3 MLA cached-context semantics
+
+For Kimi K3 with NVFP4 KV cache enabled, the last two MLA layers in the global
+`linear_attn_config.full_attn_layers` schedule use BF16 KV cache by default.
+The model, cache allocation, and memory estimator share this policy; KDA state
+is unaffected. `TLLM_KIMI_K3_BF16_KV_LAYERS` overrides the default with a
+comma-separated list of zero-based global MLA layer IDs. Set it to an empty
+string to use NVFP4 for every MLA layer. The default does not apply to other
+KV-cache dtypes or model families.
+The existing FP4 cache layout requires at least one NVFP4 MLA layer on each
+PP rank; a stage containing only BF16 fallback MLA layers is not supported.
 
 MLA cached state is not regular dense K and V. The paged cache stores
 latent-cache state rather than separate K and V planes. Backend ops handle

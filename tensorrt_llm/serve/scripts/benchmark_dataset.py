@@ -288,8 +288,16 @@ class BenchmarkDataset(ABC):
         Args:
             requests (List[SampleRequest]): The current list of sampled
             requests.  num_requests (int): The target number of requests.
+
+        Raises:
+            ValueError: If the sampled list is empty and num_requests > 0,
+            since there is nothing to oversample from.
         """
         if len(requests) < num_requests:
+            if not requests:
+                raise ValueError(
+                    f"Cannot oversample an empty dataset to {num_requests} requests"
+                )
             additional = random.choices(requests,
                                         k=num_requests - len(requests))
             requests.extend(additional)
@@ -720,10 +728,19 @@ class CustomDataset(BenchmarkDataset):
                 self.data.append(json.loads(line))
         random.shuffle(self.data)
 
-    def sample(self, tokenizer: PreTrainedTokenizerBase,
-               num_requests: int) -> list[SampleRequest]:
+    def sample(self,
+               tokenizer: PreTrainedTokenizerBase,
+               num_requests: int,
+               output_len: Optional[int] = None,
+               **kwargs) -> list[SampleRequest]:
         """
         Optimized version using batch tokenization for better performance.
+
+        If output_len is provided, it overrides the per-sample "max_tokens"
+        from the dataset, which then becomes optional.
+
+        If the file holds fewer than num_requests lines, the samples are
+        oversampled to reach num_requests.
         """
         # Collect all prompts and metadata
         prompts = []
@@ -734,7 +751,8 @@ class CustomDataset(BenchmarkDataset):
             if len(prompts) >= num_requests:
                 break
             prompt = entry["input"]["messages"][1]["content"]
-            max_tokens = entry["input"]["max_tokens"]
+            max_tokens = entry["input"][
+                "max_tokens"] if output_len is None else output_len
             prompts.append(prompt)
             max_tokens_list.append(max_tokens)
             if "num_tokens" in entry["input"] and isinstance(
@@ -761,6 +779,7 @@ class CustomDataset(BenchmarkDataset):
                     expected_output_len=max_tokens,
                 ))
 
+        self.maybe_oversample_requests(samples, num_requests)
         return samples
 
 

@@ -127,6 +127,29 @@ struct KernelParams
     // Dtype is set from options.mDtypeC.
     CUtensorMap tmaC[1];
 
+#ifdef TLLM_RUBIN_FEATURES
+#ifdef TLLM_TEST
+    // TMA descriptor for data invalidation, (when lamportProducer and separate buffer are true)
+    // Must be setup using gemm::buildNdTmaDescriptor with shapes and strides from
+    // makeTmaShapeStrideAbc.
+    //
+    // If batchM:
+    //    Logical shape is [sum(divUpMul(M[bi], tileM) for bi in B), N].
+    //    Logical strides are [N, 1].
+    //    Tile box shape is [epilogueTileM, epilogueTileN].
+    //    Tile box strides are [epilogueTileN, 1].
+    //
+    // If batchN:
+    //    Logical shape is [sum(divUpMul(N[bi], tileN) for bi in B), M].
+    //    Logical strides are [M, 1].
+    //    Tile box shape is [epilogueTileN, epilogueTileM].
+    //    Tile box strides are [epilogueTileM, 1].
+    //
+    // Dtype is set from options.mDtypeC.
+    CUtensorMap tmaInvalidate[1];
+#endif // TLLM_TEST
+#endif // TLLM_RUBIN_FEATURES
+
     // TMA descriptor for the block scaling factors for A, for MxFp{4,8} and NvFp4 formats.
     // Must be setup using gemm::buildSfTmaDescriptor with shapes and strides from
     // makeTmaShapeStrideSfAb.
@@ -444,6 +467,15 @@ struct KernelParams
     // The rightmost dimension is contiguous in memory.
     // The dtype is Dtype::Float32.
     void* ptrSfC{nullptr};
+
+#ifdef TLLM_RUBIN_FEATURES
+#ifdef TLLM_TEST
+    // The scaling factors for testing data invalidation, for MxFp{4,8} and NvFp4 formats.
+    //
+    // The logical shape and layout is the same as ptrSfC.
+    void* ptrSfInvalidate;
+#endif // TLLM_TEST
+#endif // TLLM_RUBIN_FEATURES
 
     //////////////////////////////////////////////////////////////////////////////////////////////////
     //

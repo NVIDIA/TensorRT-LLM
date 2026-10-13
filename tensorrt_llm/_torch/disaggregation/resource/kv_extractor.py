@@ -261,10 +261,17 @@ def _build_layer_group_for_v2_mamba(
 
 def build_page_table(kv_cache_manager: KVCacheManager) -> KVCachePageTable:
     """Build a KVCachePageTable from a KVCacheManager (V1)."""
-    if kv_cache_manager.dtype == DataType.NVFP4:
-        raise NotImplementedError("NVFP4 quantization not supported")
+    if kv_cache_manager.dtype == DataType.NVFP4 and kv_cache_manager.kv_factor != 1:
+        # FP4 MLA is key-only and has a dedicated physical layout below.
+        # General MHA/GQA NVFP4 still needs role-aware physical byte sizes in
+        # HeadMismatchMapper; treating a logical FP4 element as one byte would
+        # overrun both the packed KV and block-scale fragments.
+        raise NotImplementedError(
+            "NVFP4 disaggregated transfer is currently supported only for MLA"
+        )
 
     tokens_per_block = kv_cache_manager.tokens_per_block
+    is_nvfp4 = kv_cache_manager.dtype == DataType.NVFP4
 
     # Group local layers by their window size (layer group)
     window_size_to_local_layer_ids = kv_cache_manager._get_window_size_to_layers()
@@ -285,9 +292,18 @@ def build_page_table(kv_cache_manager: KVCacheManager) -> KVCachePageTable:
         local_layer_ids = window_size_to_local_layer_ids[window_size]
         first_local_layer = local_layer_ids[0]
 
-        # Get pool base address via pool_mapping -> pool_pointers
+        # Get pool base address via pool_mapping -> pool_pointers. NVFP4 V1
+        # exposes the main packed pool and its block-scale pool in the final
+        # dimension: [pool, primary/secondary, main/scale].
         pool_id = int(kv_cache_manager.kv_cache_pool_mapping[first_local_layer][0].item())
-        base_addr = int(kv_cache_manager.kv_cache_pool_pointers[pool_id][0].item())
+        primary_pool_ptrs = kv_cache_manager.kv_cache_pool_pointers[pool_id][0]
+        if is_nvfp4:
+            base_addr = int(primary_pool_ptrs[0].item())
+            block_scale_base_addr = int(primary_pool_ptrs[1].item())
+            if block_scale_base_addr == 0:
+                raise ValueError("NVFP4 KV cache block-scale pool is not allocated")
+        else:
+            base_addr = int(primary_pool_ptrs.item())
 
         # Get num_blocks from per-layer pool view: shape = (numBlocks, kvFactor, blockSize)
         pool_layer_view = kv_cache_manager.impl.get_primary_pool_data(first_local_layer)
@@ -297,7 +313,14 @@ def build_page_table(kv_cache_manager: KVCacheManager) -> KVCachePageTable:
         kv_factor = kv_cache_manager.kv_factor
         is_key_only = kv_factor == 1
 
-        elements_per_buffer = tokens_per_block * num_kv_heads * kv_cache_manager.head_dim
+        # The MLA NVFP4 cache stores an additional contiguous K-residual tail.
+        # The main pool is physically uint8 with two FP4 elements per byte,
+        # while RankInfo keeps the model's logical head dimension.
+        physical_head_dim = kv_cache_manager.head_dim
+        if is_nvfp4:
+            physical_head_dim += int(getattr(kv_cache_manager, "fp4_mla_k_residual_dim", 0) or 0)
+
+        elements_per_buffer = tokens_per_block * num_kv_heads * physical_head_dim
         buffer_size = get_size_in_bytes(elements_per_buffer, kv_cache_manager.dtype)
         stride = buffer_size * kv_factor
         slot_bytes = stride * len(local_layer_ids)
@@ -324,6 +347,43 @@ def build_page_table(kv_cache_manager: KVCacheManager) -> KVCachePageTable:
         )
         physical_pools = [kv_physical]
         pool_views = [kv_view]
+
+        if is_nvfp4:
+            if physical_head_dim % 16 != 0:
+                raise ValueError(
+                    "NVFP4 physical head dimension must be divisible by the "
+                    f"quantization block size 16, got {physical_head_dim}"
+                )
+            scales_per_buffer = tokens_per_block * num_kv_heads * physical_head_dim // 16
+            scale_stride = scales_per_buffer * kv_factor
+            scale_slot_bytes = scale_stride * len(local_layer_ids)
+            scale_entries = []
+            scale_role_names: set[str] = {"key_block_quant"}
+            if not is_key_only:
+                scale_role_names.add("value_block_quant")
+            for i, lid in enumerate(local_layer_ids):
+                base_offset = i * scale_stride
+                scale_entries.append((lid, base_offset, scales_per_buffer))
+                if not is_key_only:
+                    scale_entries.append((lid, base_offset + scales_per_buffer, scales_per_buffer))
+
+            scale_pool_idx = len(physical_pools)
+            physical_pools.append(
+                PhysicalPool(
+                    base_address=block_scale_base_addr,
+                    slot_bytes=scale_slot_bytes,
+                    num_slots=num_blocks,
+                )
+            )
+            pool_views.append(
+                PoolView(
+                    pool_idx=scale_pool_idx,
+                    buffer_entries=np.array(scale_entries, dtype=BUFFER_ENTRY_DTYPE),
+                    pool_role=frozenset(scale_role_names),
+                    mapper_kind=MapperKind.INDEXED,
+                    bytes_per_layer=scale_stride,
+                )
+            )
 
         # Indexer K cache support. The DSA indexer K cache is identical on
         # every TP rank (single index head), so its view is REPLICATED. With a
@@ -429,6 +489,10 @@ def _compute_global_layer_ids(manager, lg_idx: int) -> List[int]:
     """
     local_layer_ids = manager.impl.layer_grouping[lg_idx]
 
+    get_global_layer_ids = getattr(manager, "get_disagg_global_layer_ids", None)
+    if callable(get_global_layer_ids):
+        return list(get_global_layer_ids(lg_idx))
+
     if not hasattr(manager, "_layer_attn_to_layer_id"):
         # Standard: local_layer_id is index into pp_layers
         return [manager.pp_layers[lid] for lid in local_layer_ids]
@@ -451,6 +515,12 @@ def _compute_global_layer_ids(manager, lg_idx: int) -> List[int]:
     return [inverse[lid][0] * num_attn_types + inverse[lid][1] for lid in local_layer_ids]
 
 
+def _get_pool_num_slots(pool) -> int:
+    """Return a pool's slot count across legacy and current storage APIs."""
+    num_slots = pool.num_slots
+    return int(num_slots() if callable(num_slots) else num_slots)
+
+
 def _build_page_table_v2(manager) -> KVCachePageTable:
     """Build a KVCachePageTable from a KVCacheManagerV2.
 
@@ -466,6 +536,12 @@ def _build_page_table_v2(manager) -> KVCachePageTable:
     by layer_group_id while ``pool_group_idx`` points at the shared
     physical pool group entry, so per-window transfer logic keeps working.
     """
+    if manager.num_ugpus > 1:
+        raise NotImplementedError(
+            "Disaggregated KV transfer does not support enable_ugpu=True: "
+            "the page-table registration currently covers only one locality domain"
+        )
+
     config = manager.impl.init_config
     pool_group_descs = manager.impl.pool_group_descs
 
@@ -495,6 +571,12 @@ def _build_page_table_v2(manager) -> KVCachePageTable:
                 f"got it for role {role!s}"
             )
     default_mapper_kind = role_mapper_kinds[Role.ALL]
+    get_transfer_roles = getattr(manager, "get_disagg_transfer_roles", None)
+    transfer_roles = get_transfer_roles() if callable(get_transfer_roles) else None
+    if transfer_roles is not None:
+        transfer_roles = frozenset(transfer_roles)
+        if not all(isinstance(role, str) for role in transfer_roles):
+            raise ValueError("Disaggregation transfer roles must contain DataRole strings")
 
     def _window_size_for_layer(internal_layer_id: int):
         if internal_layer_id < len(config.layers):
@@ -541,7 +623,9 @@ def _build_page_table_v2(manager) -> KVCachePageTable:
             layer_group_id = int(variant.layer_group_id)
             all_internal_layer_ids = list(manager.impl.layer_grouping[layer_group_id])
             if isinstance(manager, MambaHybridCacheManagerV2) and any(
-                manager._is_local_mamba_layer(int(layer_id)) for layer_id in all_internal_layer_ids
+                int(layer_id) < manager.num_local_layers
+                and manager._is_local_mamba_layer(int(layer_id))
+                for layer_id in all_internal_layer_ids
             ):
                 layer_groups_by_id[layer_group_id] = _build_layer_group_for_v2_mamba(
                     manager, storage_pg_to_list_idx[storage_pg_idx]
@@ -574,6 +658,9 @@ def _build_page_table_v2(manager) -> KVCachePageTable:
                 single_buffer_size = int(coalesced_buffer.single_buffer_size)
                 offset = 0
                 for buffer_id in coalesced_buffer.buffer_ids:
+                    if transfer_roles is not None and buffer_id.role not in transfer_roles:
+                        offset += single_buffer_size
+                        continue
                     kind = role_mapper_kinds.get(buffer_id.role, default_mapper_kind)
                     bucket_key = (pool_idx, kind)
                     bucket_entries[bucket_key].append(

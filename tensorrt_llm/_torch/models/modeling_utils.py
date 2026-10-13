@@ -8,8 +8,8 @@ import math
 import os
 import time
 from dataclasses import dataclass
-from typing import (Any, Dict, Generic, List, Literal, Optional, Tuple, Type,
-                    TypeVar, Union)
+from typing import (Any, Callable, Dict, Generic, List, Literal, Optional,
+                    Tuple, Type, TypeVar, Union)
 
 import torch
 from torch import nn
@@ -33,7 +33,8 @@ from ..modules.linear import Linear, TensorParallelMode, WeightMode
 from ..modules.logits_processor import LogitsProcessor
 from ..modules.rms_norm import RMSNorm
 from ..speculative import SpecMetadata
-from ._arch_index import MODEL_ARCH_TO_MODULE, is_builtin_zoo_module
+from ._arch_index import (MODEL_ARCH_TO_MODULE, SPEC_MODE_TO_MODULE,
+                          is_builtin_zoo_module)
 
 
 @contextlib.contextmanager
@@ -380,6 +381,8 @@ class DecoderModelForCausalLM(nn.Module,
                               Generic[TModel, TConfig],
                               metaclass=PostInitCaller):
 
+    mamba_metadata_cls: type | None = None
+
     @staticmethod
     def _checkpoint_has_lm_head_scale(config: ModelConfig[TConfig]) -> bool:
         """Whether the checkpoint stores a quantized lm_head (a weight scale).
@@ -547,6 +550,8 @@ class DecoderModelForCausalLM(nn.Module,
                             module.quant_config = q
                             break
                 elif isinstance(module, Linear):
+                    if getattr(module, "_skip_layerwise_quant_config", False):
+                        continue
                     weight_mode = module.weights_loading_config.weight_mode
                     prefix_name = '.'.join(name.split('.')[:-1])
                     if weight_mode == WeightMode.FUSED_GATE_UP_LINEAR:
@@ -861,6 +866,7 @@ class DecoderModelForCausalLM(nn.Module,
 
 
 MODEL_CLASS_MAPPING = {}
+DRAFT_MODEL_BUILDER_MAPPING = {}
 MODEL_CLASS_VISION_ENCODER_MAPPING = {}
 MODEL_CLASS_MAPPER_MAPPING = {}
 MODEL_CLASS_CHECKPOINT_WEIGHT_LOADER_DEFAULT_MAPPING = {}
@@ -961,6 +967,120 @@ def get_registered_model_class(model_arch: str) -> Optional[Type[nn.Module]]:
     if model_arch not in MODEL_CLASS_MAPPING:
         _ensure_model_registered(model_arch)
     return MODEL_CLASS_MAPPING.get(model_arch)
+
+
+def _is_builtin_draft_model_builder(builder) -> bool:
+    return is_builtin_zoo_module(getattr(builder, "__module__", ""))
+
+
+# Speculative-decoding modes each decorated builder declared via
+# ``register_draft_model``, kept per function (``__dict__``, never inherited).
+# Recorded even when the builder loses its ``DRAFT_MODEL_BUILDER_MAPPING`` slot
+# to an external registration, so a builder can be mapped back to its modes
+# without scanning the mapping by identity (which would silently skip exactly
+# those overridden built-ins).
+_REGISTERED_SPEC_MODES_ATTR = "_registered_spec_modes"
+
+
+def register_draft_model(mode):
+    """Register the draft-model builder for a speculative-decoding mode.
+
+    The builder is a plain function
+    ``(model_config, draft_config, lm_head, model) -> nn.Module`` that owns
+    everything its mode needs to construct its draft model, so the generic
+    dispatcher never has to import a concrete draft implementation. Stack the
+    decorator to serve several modes with one builder (vanilla MTP and
+    MTP_EAGLE_ONE_MODEL share theirs, mirroring
+    ``SpeculativeDecodingMode.is_mtp_one_model()``).
+
+    Same registration priority as ``register_auto_model``: built-in builders
+    only fill empty slots and never overwrite, because under lazy loading a
+    built-in module may run its decorators *after* an external registration
+    (e.g. a drafter supplied through ``--custom_module_dirs``) and must not
+    clobber it. External registrations always overwrite.
+
+    The builder belongs in the ``modeling_*.py`` that defines the draft model,
+    never in the factory file, and needs an ``SPEC_MODE_TO_MODULE`` row in
+    ``_arch_index.py`` so it can be found without importing the zoo -- see the
+    "Adding a speculative decoding mode" notes there. Example (DSpark, whose
+    stage count is only knowable from the checkpoint)::
+
+        @register_draft_model(SpeculativeDecodingMode.DSPARK)
+        def _build_dspark_draft(model_config, draft_config, lm_head, model):
+            num_stages = count_dspark_stages(
+                model_config.spec_config.speculative_model)
+            validate_dspark_eplb_layer_base(model_config, draft_config)
+            return DSv4DSparkForCausalLM(
+                draft_config,
+                getattr(model, "aux_stream_dict", None),
+                num_stages=num_stages,
+                block_size=model_config.spec_config.block_size,
+            )
+
+    Args:
+        mode: the ``SpeculativeDecodingMode`` member this builder serves.
+
+    Returns:
+        The decorator binding a builder function to ``mode``.
+    """
+
+    def decorator(builder):
+        modes = builder.__dict__.get(_REGISTERED_SPEC_MODES_ATTR)
+        if modes is None:
+            modes = set()
+            setattr(builder, _REGISTERED_SPEC_MODES_ATTR, modes)
+        modes.add(mode)
+
+        existing = DRAFT_MODEL_BUILDER_MAPPING.get(mode)
+        if (existing is not None and existing is not builder
+                and _is_builtin_draft_model_builder(builder)):
+            logger.info(
+                f"Keeping existing draft-model builder "
+                f"{existing.__module__}.{existing.__qualname__} for "
+                f"speculative decoding mode {mode.name}; built-in "
+                f"{builder.__module__}.{builder.__qualname__} not registered.")
+            return builder
+        DRAFT_MODEL_BUILDER_MAPPING[mode] = builder
+        return builder
+
+    return decorator
+
+
+def _ensure_draft_model_registered(mode) -> None:
+    """Import the module providing ``mode``'s builder, if not yet loaded.
+
+    Mirrors ``_ensure_model_registered``: builders register as an import side
+    effect, and the model zoo is imported lazily, so this turns a mode into
+    "the decorator has run". Modes missing from the static index are left to
+    the caller's normal unsupported-mode handling.
+    """
+    module_name = SPEC_MODE_TO_MODULE.get(mode.name)
+    if module_name is None:
+        return
+    full_name = f"tensorrt_llm._torch.models.{module_name}"
+    try:
+        importlib.import_module(full_name)
+    except ModuleNotFoundError as e:
+        # Only swallow "the providing module itself is missing" (stale index
+        # entry); a missing dependency *inside* the module is a real error and
+        # must not be masked as "unsupported speculative decoding mode".
+        if e.name != full_name:
+            raise
+        logger.warning(f"Lazy import of {module_name} for speculative "
+                       f"decoding mode {mode.name} failed: {e!r}")
+
+
+def get_registered_draft_model_builder(mode) -> Optional[Callable]:
+    """Resolve ``mode`` to its registered draft-model builder, or ``None``.
+
+    The single entry point for builder lookups: the model zoo is imported
+    lazily, so this resolves the providing module on demand before reading the
+    registry. Do not read ``DRAFT_MODEL_BUILDER_MAPPING`` directly — a raw
+    ``.get()`` silently misses every not-yet-imported provider.
+    """
+    if mode not in DRAFT_MODEL_BUILDER_MAPPING:
+        _ensure_draft_model_registered(mode)
+    return DRAFT_MODEL_BUILDER_MAPPING.get(mode)
 
 
 def get_registered_vision_encoder(
@@ -1170,6 +1290,48 @@ def filter_weights(prefix, weights: Dict):
     return result
 
 
+def _get_load_weights_num_workers() -> Optional[int]:
+    """Return the per-rank module-loading worker limit, or None for the default.
+
+    Weight loading runs one ThreadPoolExecutor per rank, which without an
+    explicit limit defaults to as many as 32 workers (CPython's
+    ``min(32, cpu_count + 4)``; the count is the machine's, not the rank's
+    share of it). The limit is per rank, so four ranks on a node can have four
+    times that many module loads in flight. Each one holds its own host-side
+    working set while it stages and transforms a module's weights, and every
+    rank's is charged to the same host-memory cgroup -- which is how a large
+    checkpoint exhausts host memory while the GPUs are nowhere near full.
+
+    ``TLLM_LOAD_WEIGHTS_NUM_WORKERS`` bounds that overlap. Unset or blank keeps
+    the executor default; a positive integer trades loading parallelism for
+    host-memory headroom; anything else raises, so a typo cannot look like it
+    took effect. ``TRT_LLM_DISABLE_LOAD_WEIGHTS_IN_PARALLEL`` takes precedence
+    and skips the pool entirely -- this variable is the range in between.
+
+    Set it when ranks share a constrained cgroup. Tune it against node
+    ``memory.peak`` and the slowest rank's init time, not per-process RSS,
+    which does not see shared page cache. ``4`` measured well on a four-rank
+    node but is a starting point, not a default; retune per checkpoint and
+    topology.
+    """
+    env_name = "TLLM_LOAD_WEIGHTS_NUM_WORKERS"
+    value = os.environ.get(env_name)
+    if value is None or not value.strip():
+        return None
+
+    try:
+        num_workers = int(value)
+    except ValueError as error:
+        raise ValueError(
+            f"{env_name} must be a positive integer, got {value!r}") from error
+    if num_workers <= 0:
+        raise ValueError(
+            f"{env_name} must be a positive integer, got {value!r}")
+    logger.info(
+        f"Limiting concurrent module weight loading to {num_workers} workers")
+    return num_workers
+
+
 def run_concurrently(func,
                      args_list,
                      reduce_func=None,
@@ -1206,6 +1368,17 @@ def run_concurrently(func,
                 raise
 
 
+#: Modules stored unfused in a checkpoint and fused in the module tree, mapped
+#: to the components they are built from. This is the table the mapper-less
+#: load path below uses; HfWeightMapper.map_weights installs the same pairs for
+#: the mapper path. Anything reasoning about what a checkpoint must provide has
+#: to read one of the two rather than keep a third copy.
+FUSED_MODULE_COMPONENTS = {
+    'qkv_proj': ['q_proj', 'k_proj', 'v_proj'],
+    'gate_up_proj': ['gate_proj', 'up_proj'],
+}
+
+
 def _load_weights_impl(model: Union[nn.Module, DecoderModelForCausalLM],
                        weights: Dict,
                        skip_modules: List[str] = [],
@@ -1232,10 +1405,7 @@ def _load_weights_impl(model: Union[nn.Module, DecoderModelForCausalLM],
         model.config, 'num_key_value_heads'
     ) and model.config.num_key_value_heads is not None else model.config.num_attention_heads
 
-    params_map = {
-        'qkv_proj': ['q_proj', 'k_proj', 'v_proj'],
-        'gate_up_proj': ['gate_proj', 'up_proj']
-    }
+    params_map = dict(FUSED_MODULE_COMPONENTS)
     device_id = local_mpi_rank()
 
     def load_single_module(name, module):
@@ -1368,7 +1538,10 @@ def _load_weights_impl(model: Union[nn.Module, DecoderModelForCausalLM],
             for name, module in model.named_modules(remove_duplicate=False)
             if name not in serial_load_modules
         ]
-        run_concurrently(load_single_module, args_list, pbar=pbar)
+        run_concurrently(load_single_module,
+                         args_list,
+                         pbar=pbar,
+                         num_workers=_get_load_weights_num_workers())
 
 
 def _load_weights_impl_v2(model: Union[nn.Module, DecoderModelForCausalLM],
@@ -1493,4 +1666,7 @@ def _load_weights_impl_v2(model: Union[nn.Module, DecoderModelForCausalLM],
             for name, module in model.named_modules(remove_duplicate=False)
             if name not in serial_load_modules
         ]
-        run_concurrently(load_single_module, args_list, pbar=pbar)
+        run_concurrently(load_single_module,
+                         args_list,
+                         pbar=pbar,
+                         num_workers=_get_load_weights_num_workers())

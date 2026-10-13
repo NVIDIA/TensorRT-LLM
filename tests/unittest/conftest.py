@@ -389,8 +389,11 @@ def mpi_pool_executor(request):
     """
     num_workers = request.param
     with MPIPoolExecutor(num_workers) as executor:
-        # make the number of workers visible to tests
-        setattr(executor, "num_workers", num_workers)
+        num_workers_attr = getattr(type(executor), "num_workers", None)
+        if not isinstance(num_workers_attr,
+                          property) or num_workers_attr.fset is not None:
+            # Older mpi4py versions did not expose num_workers.
+            setattr(executor, "num_workers", num_workers)
         yield executor
 
 

@@ -234,8 +234,9 @@ def replace_env_in_file(log_dir, file_path, env_var):
     with open(file_path, 'r', encoding='utf-8') as f:
         config_content = f.read()
 
+    file_content = config_content
     for env_name, env_value in env_var.items():
-        file_content = config_content.replace(env_name, env_value)
+        file_content = file_content.replace(env_name, env_value)
 
     tmp_dir = os.path.join(log_dir, "lm_eval_configs")
     os.makedirs(tmp_dir, exist_ok=True)

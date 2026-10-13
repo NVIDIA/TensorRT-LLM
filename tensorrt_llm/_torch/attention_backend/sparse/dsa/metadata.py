@@ -16,6 +16,7 @@ from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from tensorrt_llm._torch.utils import maybe_compile
 from tensorrt_llm._utils import get_sm_version, prefer_pinned
 from tensorrt_llm.deep_gemm import get_paged_mqa_logits_metadata
+from tensorrt_llm.logger import logger
 
 from .cache_manager import is_dsa_cache_manager
 from .indexer import (
@@ -27,7 +28,7 @@ from .indexer import (
     _pick_dsl_expand,
     _select_indexer_compress_ratio,
 )
-from .params import DSAMetadataParams
+from .params import DSAMetadataParams, use_self_sampling_gvr
 
 ModelConfig = tensorrt_llm.bindings.ModelConfig
 
@@ -106,6 +107,11 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
     # Number of compressed KV tokens for context requests
     num_ctx_kv_tokens: int = 0
     gen_indexer_kv_lens_cuda_runtime: Optional[torch.Tensor] = None
+    # Temporal-GVR prior state: allocated only when the two-level dispatch
+    # selects the temporal engine (the self-sampling engine keeps no
+    # cross-step state).
+    needs_gvr_prior: bool = field(default=False, init=False)
+    gvr_prior_indices: Optional[torch.Tensor] = field(default=None, init=False)
 
     def __init__(self, *args, **kwargs):
         """Initialize DSA metadata with SM count and indexer chunk size."""
@@ -125,11 +131,14 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self._pool_cache_valid = False
         self._cached_kv_mgr_id = 0
         self._cached_pool_view = None
+        self._cached_num_pool_tokens = 0
         self._cached_tokens_per_block = 0
         self._cached_block_table_ctx = None
         self._cached_block_table_gen = None
         self._cached_req_idx_ctx = None
         self._cached_req_idx_gen = None
+        self.num_ctx_mla_kv_tokens = 0
+        self.nvfp4_mla_context_fp8_scratch = None
         super().__init__(*args, **kwargs)
         sparse_metadata_params = self.sparse_metadata_params
         if not isinstance(sparse_metadata_params, DSAMetadataParams):
@@ -157,6 +166,9 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self.indexer_head_dim = sparse_metadata_params.index_head_dim
         self.indexer_quant_block_size = 128
         self.enable_indexer_skip = sparse_metadata_params.enable_indexer_skip
+        self.enable_gvr_topk = (
+            sparse_metadata_params.enable_heuristic_topk and get_sm_version() >= 100
+        )
         self.use_cute_dsl_topk = (
             sparse_metadata_params.use_cute_dsl_topk and IS_CUTLASS_DSL_AVAILABLE
         )
@@ -175,9 +187,27 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         if hasattr(self.kv_cache_manager, "compressed_block_sizes"):
             tpb = tpb // _effective_compress_ratio_divisor(self._indexer_compress_ratio)
         self._tokens_per_block = tpb
+        # Mirror the indexer's two-level GVR decision. The representative
+        # compress ratio matches every live indexer: the DeepSeek-V4 backend
+        # only builds indexers on cr=4 layers and plain DSA uses cr=1.
+        self.use_self_sampling_topk = use_self_sampling_gvr(
+            enable_heuristic_topk=self.enable_gvr_topk,
+            use_self_sampling_topk=sparse_metadata_params.use_self_sampling_topk,
+            index_topk=self.num_sparse_topk,
+            compress_ratio=self._indexer_compress_ratio,
+            is_cute_dsl_available=IS_CUTLASS_DSL_AVAILABLE,
+            sm_version=get_sm_version(),
+        )
+        self.needs_gvr_prior = (
+            self.enable_gvr_topk
+            and IS_CUTLASS_DSL_AVAILABLE
+            and get_sm_version() in (100, 103)
+            and not self.use_self_sampling_topk
+        )
 
         self.create_buffers_for_mla_rope_append(capture_graph=capture_graph)
         self.create_buffers_for_indexer(capture_graph=capture_graph)
+        self._create_nvfp4_mla_generation_buffers(capture_graph=capture_graph)
 
     def prepare(self):
         super().prepare()
@@ -246,7 +276,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         and plain (no cute_dsl_topk) decode uses the C++ op. Called once from
         ``ModelEngine.warmup``.
         """
-        if not self.use_cute_dsl_topk or self.enable_heuristic_topk:
+        if not self.use_cute_dsl_topk or self.enable_gvr_topk:
             return
         if self.kv_cache_manager is None:
             return
@@ -277,7 +307,86 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             num_sms=self.num_sms,
         )
 
-    def on_update_kv_lens(self):
+    def warmup_selfsampling_topk(
+        self, next_n: int, batch_sizes: Optional[List[int]] = None
+    ) -> None:
+        """Pre-compile the self-sampling GVR varlen engine during warmup.
+
+        Mirrors ``warmup_cute_dsl_radix_topk``. The varlen launcher is keyed
+        by the exact row count AND the logits row stride: rows cover the
+        small eager batches plus every configured CUDA-graph batch size, and
+        the stride mirrors what the active paged-MQA producer emits, so the
+        warmed keys are the ones dispatch actually looks up. Batches outside
+        this set still compile lazily on first touch. The helper enumerates
+        one representative row per distinct engine compile key, so large
+        batch lists warm in bounded time and memory. No-op unless the
+        two-level dispatch (enable_heuristic_topk + use_self_sampling_topk)
+        selects the self-sampling engine.
+        """
+        # same two-level dispatch and hardware gates as the indexer __init__:
+        # never compile these kernels on unsupported stacks during warmup
+        if not IS_CUTLASS_DSL_AVAILABLE or get_sm_version() not in (100, 103, 107):
+            return
+        if not self.enable_gvr_topk or self.kv_cache_manager is None:
+            return
+        if not self.use_self_sampling_topk:
+            return
+        top_k = self.sparse_mla_topk
+        if not top_k or int(top_k) not in (512, 1024, 2048):
+            return
+        cr = int(self._indexer_compress_ratio) if self._indexer_compress_ratio else 1
+        if cr not in (1, 4):
+            return
+        try:
+            from ....cute_dsl_kernels.blackwell.top_k import (
+                gvr_topk_decode_self_sampling_host as _ss_host,
+            )
+        except ImportError:
+            return
+        nn = int(next_n)
+        # warm the small row counts eager mixed batches commonly produce;
+        # larger eager row counts lazy-JIT on first touch, and CUDA-graph
+        # geometries are covered through ``batch_sizes`` below
+        eager_warm_rows = 32
+        rows = set(range(nn, eager_warm_rows + 1, nn)) or {nn}
+        for bs in batch_sizes or ():
+            rows.add(int(bs) * nn)
+        msl_c = int(self.get_indexer_max_seq_len())
+        if self.sparse_metadata_params.use_cute_dsl_paged_mqa_logits:
+            # mirror the DSL paged-MQA arena stride (rows round up to 256
+            # elements). A drift here only degrades warmup to unused keys —
+            # dispatch still lazy-JITs the true key outside capture.
+            row_stride = (msl_c + 255) // 256 * 256
+        else:
+            # DeepGEMM emits exact-width rows; a non-float4 width falls
+            # through at the dispatch format gate, so there is nothing to warm
+            row_stride = msl_c
+            if row_stride % 4:
+                return
+        # helper takes max_seq_len in kv-token space (get_indexer_max_seq_len
+        # is compressed — same multiply-back as the dispatch seam). The
+        # hint-free bit must mirror the TopK module's launch mode: the
+        # launcher key includes it, so warming the wrong arm leaves capture
+        # uncompiled.
+        try:
+            _ss_host.warmup_varlen(
+                int(top_k),
+                msl_c * cr,
+                compress_ratio=cr,
+                next_n=int(next_n),
+                num_rows_list=tuple(sorted(rows)),
+                row_stride=row_stride,
+                hint_free=True,
+            )
+        except torch.cuda.OutOfMemoryError:
+            # warmup is best-effort: the dispatch works without it (engines
+            # JIT lazily outside capture), so do not fail engine init
+            logger.warning(
+                "self-sampling GVR warmup ran out of memory; varlen engines "
+                "will JIT-compile lazily on first touch instead."
+            )
+
+    def on_update_kv_lens(self) -> None:
         # After changing the kv_lens/kv_lens_cuda, we may need to update other metadatas.
         # Especially for the changes in the _preprocess_inputs() of model_engine.py.
         #
@@ -399,11 +508,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
     def _compute_kv_lens_row_reorder(self):
         """Prepare longest-job-first row order for GVR top-k."""
         next_n = 1 + self.max_draft_tokens
-        if (
-            self.enable_heuristic_topk
-            and self.use_cute_dsl_topk
-            and self.num_generations * next_n >= 2 * self.num_sms
-        ):
+        if self.needs_gvr_prior and self.num_generations * next_n >= 2 * self.num_sms:
             gen_kv_lens = self.kv_lens_cuda[self.num_contexts : self.num_seqs]
             order = torch.argsort(gen_kv_lens, descending=True).to(torch.int32)
             self.kv_lens_row_reorder_buffer[: self.num_generations].copy_(order)
@@ -504,6 +609,38 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             (_radix_max_gen_tokens, _radix_max_blocks_per_row, self.num_sparse_topk),
             cache_name="radix_aux_logits",
             dtype=torch.float32,
+            capture_graph=capture_graph,
+        )
+
+    def _create_nvfp4_mla_generation_buffers(self, capture_graph=False):
+        """Allocate stable NVFP4 gather outputs for all MTP generation rows."""
+        self.nvfp4_mla_fp8_scratch = None
+        self.nvfp4_mla_compact_indices = None
+        if getattr(self.kv_cache_manager, "dtype", None) != tensorrt_llm.bindings.DataType.NVFP4:
+            return
+
+        # MTP verifies the current token and max_draft_tokens draft tokens for
+        # every generation request. Each query row has its own TopK selection,
+        # so the dequantized FP8 rows and compact offsets must cover the full
+        # verification window. The buffers have stable addresses for CUDA
+        # graphs and are reused sequentially by every attention layer.
+        max_gen_tokens = self.max_num_sequences * (1 + self.max_draft_tokens)
+        self.nvfp4_mla_fp8_scratch = self.get_empty(
+            self.cuda_graph_buffers,
+            (
+                max_gen_tokens,
+                self.num_sparse_topk,
+                self.kv_cache_manager.head_dim,
+            ),
+            cache_name="nvfp4_mla_fp8_scratch",
+            dtype=torch.float8_e4m3fn,
+            capture_graph=capture_graph,
+        )
+        self.nvfp4_mla_compact_indices = self.get_empty(
+            self.cuda_graph_buffers,
+            (max_gen_tokens, self.num_sparse_topk),
+            cache_name="nvfp4_mla_compact_indices",
+            dtype=torch.int32,
             capture_graph=capture_graph,
         )
 
@@ -702,51 +839,23 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                 device="cpu",
                 pin_memory=prefer_pinned(),
             )
-        # Per-layer persistent buffers for heuristic TopK pre_idx.
-        # Indexed by [local_layer_idx, generation_position, :].
-        # The graph captures reads/writes on these stable-address buffers;
-        # each replay's write becomes the next replay's read (feedback loop).
-        self.enable_heuristic_topk = (
-            sparse_metadata_params.enable_heuristic_topk and get_sm_version() >= 100
-        )
-        if self.enable_heuristic_topk:
+        if self.needs_gvr_prior:
             num_local_layers = self.kv_cache_manager.num_local_layers
-            self.heuristic_prev_topk = self.get_empty(
+            self.gvr_prior_indices = self.get_empty(
                 self.cuda_graph_buffers,
                 (num_local_layers, self.max_num_sequences, self.num_sparse_topk),
                 cache_name="heuristic_prev_topk",
                 dtype=torch.int32,
                 capture_graph=capture_graph,
             )
-            # Zero-initialize so the first decode step's pre_idx (kernel
-            # adds +1 offset) points to index 1 — a valid but benign candidate.
-            # Without this, uninitialized memory produces random hint indices.
-            self.heuristic_prev_topk.zero_()
-            # The C++ top-k path needs a stable scratch address.
-            if not self.use_cute_dsl_topk:
-                max_gen_tokens = self.max_num_sequences * (1 + self.max_draft_tokens)
-                self.heuristic_scratch_values = self.get_empty(
-                    self.cuda_graph_buffers,
-                    (max_gen_tokens, self.num_sparse_topk),
-                    cache_name="heuristic_scratch_values",
-                    dtype=torch.float32,
-                    capture_graph=capture_graph,
-                )
-            # GVR row order also needs a stable address for CUDA graphs.
-            if self.use_cute_dsl_topk:
-                self.kv_lens_row_reorder_buffer = self.get_empty(
-                    self.cuda_graph_buffers,
-                    (self.max_num_sequences,),
-                    cache_name="kv_lens_row_reorder_buffer",
-                    dtype=torch.int32,
-                    capture_graph=capture_graph,
-                )
-
-        # Persistent scratch for the Radix-split-work indexer path. Re-created
-        # in update_spec_dec_param when max_draft_tokens changes so it stays
-        # large enough for the MTP generation-row count.
-        self._create_radix_aux_buffers(capture_graph=capture_graph)
-
+            self.gvr_prior_indices.zero_()
+            self.kv_lens_row_reorder_buffer = self.get_empty(
+                self.cuda_graph_buffers,
+                (self.max_num_sequences,),
+                cache_name="kv_lens_row_reorder_buffer",
+                dtype=torch.int32,
+                capture_graph=capture_graph,
+            )
         # Create expanded buffers for MTP support
         self.create_expanded_buffers(capture_graph=capture_graph)
 
@@ -849,21 +958,17 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         )
         self.max_draft_tokens = max_draft_len
         capture_graph = self.is_cuda_graph
+        max_gen_tokens = self.max_num_sequences * (1 + self.max_draft_tokens)
+        if (
+            self.nvfp4_mla_fp8_scratch is not None
+            and self.nvfp4_mla_fp8_scratch.shape[0] != max_gen_tokens
+        ):
+            self._create_nvfp4_mla_generation_buffers(capture_graph=capture_graph)
         if self.kv_lens_cuda_2d.shape[1] != 1 + self.max_draft_tokens:
             self._create_kv_lens_2d_buffer(capture_graph=capture_graph)
         init_shape = self.kv_lens_expanded_host.shape[0]
         if self.max_num_sequences * (1 + self.max_draft_tokens) != init_shape:
             self.create_expanded_buffers(capture_graph=capture_graph)
-            # Resize heuristic scratch buffer for new max_draft_tokens.
-            if self.enable_heuristic_topk and not self.use_cute_dsl_topk:
-                max_gen_tokens = self.max_num_sequences * (1 + self.max_draft_tokens)
-                self.heuristic_scratch_values = self.get_empty(
-                    self.cuda_graph_buffers,
-                    (max_gen_tokens, self.num_sparse_topk),
-                    cache_name="heuristic_scratch_values",
-                    dtype=torch.float32,
-                    capture_graph=capture_graph,
-                )
             # The Radix-split-work scratch (radix_aux_*) is sized the same way
             # (num_seqs * (1 + max_draft_tokens) rows) and is allocated
             # unconditionally, so it must be resized here too -- otherwise the
@@ -910,6 +1015,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         _ensure_pool_view_cached() recomputes them for the new batch.
         """
         self._pool_cache_valid = False
+        self.nvfp4_mla_context_fp8_scratch = None
 
     def _ensure_pool_view_cached(self):
         """Compute and cache values used by
@@ -929,9 +1035,17 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
 
         pool = self.kv_cache_manager.get_unique_primary_pool()
         kv_cache_manager = self.kv_cache_manager
+        num_blocks, num_layers = pool.shape[:2]
         self._cached_tokens_per_block = kv_cache_manager.tokens_per_block
         head_dim = kv_cache_manager.head_dim
-        self._cached_pool_view = pool.squeeze(2).view(-1, 1, head_dim)
+        self._cached_num_pool_tokens = num_blocks * num_layers * self._cached_tokens_per_block
+        if kv_cache_manager.dtype == tensorrt_llm.bindings.DataType.NVFP4:
+            # FP4 packs two values per byte and therefore cannot use the
+            # ordinary [token, head_dim] view. Its gather op reads the raw
+            # data/scale pools through their stable host pointers instead.
+            self._cached_pool_view = None
+        else:
+            self._cached_pool_view = pool.squeeze(2).view(-1, 1, head_dim)
         self._cached_block_table_ctx = self.block_table[: self.num_contexts]
         self._cached_block_table_gen = self.block_table[self.num_contexts : self.num_seqs]
         self._cached_req_idx_ctx = self.req_idx_per_token[: self.num_ctx_tokens]
@@ -1151,6 +1265,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
     def prepare_for_mla_rope_append(self, cached_token_lens: torch.Tensor, kv_lens: torch.Tensor):
         if self.num_contexts > 0:
             self.num_ctx_cached_tokens = cached_token_lens[: self.num_contexts].sum().item()
+            self.num_ctx_mla_kv_tokens = kv_lens[: self.num_contexts].sum().item()
             self.max_ctx_kv_len = kv_lens[: self.num_contexts].max().item()
             self.max_ctx_seq_len = self.seq_lens[: self.num_contexts].max().item()
             # context cached token indptr
@@ -1175,6 +1290,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             )
         else:
             self.num_ctx_cached_tokens = 0
+            self.num_ctx_mla_kv_tokens = 0
             self.max_ctx_kv_len = 0
             self.max_ctx_seq_len = 0
 

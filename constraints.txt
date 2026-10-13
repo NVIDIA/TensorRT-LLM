@@ -1,10 +1,9 @@
-# These vulnerabilities were inherited from the base image (pytorch:25.12-py3) and should be removed when the base image
-# is updated.
-# Upgrade base image nvidia-cutlass-dsl 4.3.5 to 4.4.2
-nvidia-cutlass-dsl>=4.4.2
-# The `nvidia-cutlass-dsl` package does not pin numpy at all, which can be problematic in certain CI
-# stages.
-numpy>=2.0.0,<2.4 # numba 0.63.1 requires numpy<2.4
+# setup.py appends these constraints to wheel install_requires, so every entry
+# must also be a valid TensorRT-LLM runtime dependency outside the base image.
+# Runtime dependencies belong in requirements.txt; only base-image vulnerability
+# fixes belong here, so that a pin has exactly one home.
+# The vulnerabilities were inherited from the base image
+# (pytorch:25.12-py3) and can be removed after the base image is updated.
 # WAR against https://github.com/advisories/GHSA-qcq2-496w-v96p
 mistune>=3.3.0
 # WAR against https://github.com/advisories/GHSA-rch3-82jr-f9w9

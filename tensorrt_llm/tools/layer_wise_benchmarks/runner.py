@@ -37,7 +37,13 @@ from tensorrt_llm._torch.pyexecutor.model_loader import (
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._torch.utils import get_model_extra_attrs, model_extra_attrs
 from tensorrt_llm._utils import local_mpi_size, mpi_rank, mpi_world_size, torch_dtype_to_binding
-from tensorrt_llm.llmapi.llm_args import KvCacheConfig, MoeConfig, TorchLlmArgs
+from tensorrt_llm.llmapi.llm_args import (
+    KvCacheConfig,
+    MoeConfig,
+    MTPDecodingConfig,
+    Nvfp4GemmConfig,
+    TorchLlmArgs,
+)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
@@ -55,6 +61,13 @@ def ceil_div(a, b):
 
 def round_up(a, b):
     return ceil_div(a, b) * b
+
+
+def get_nvfp4_gemm_allowed_backends():
+    backends = os.getenv("TRTLLM_LAYERWISE_NVFP4_GEMM_ALLOWED_BACKENDS")
+    if not backends:
+        return ["cutedsl", "cutlass", "cublaslt", "cuda_core"]
+    return [backend.strip() for backend in backends.split(",") if backend.strip()]
 
 
 def get_balanced_selection_impl_default(
@@ -399,14 +412,35 @@ class Runner:
         mamba_ssm_cache_dtype: str,
         use_low_precision_moe_combine: bool,
         use_cuda_graph: bool,
+        num_mtp_layers: Optional[int] = None,
+        use_cute_dsl_bf16_gemm: bool = False,
+        use_cute_dsl_bf16_bmm: bool = False,
     ):
         super().__init__()
 
         checkpoint_loader = _construct_checkpoint_loader("pytorch", None, "HF")
+        spec_config = (
+            MTPDecodingConfig(
+                num_nextn_predict_layers=num_mtp_layers,
+                use_mtp_vanilla=True,
+            )
+            if num_mtp_layers
+            else None
+        )
         # Please refer to `tensorrt_llm/_torch/pyexecutor/model_loader.py` for effective args
         llm_args = TorchLlmArgs(
             model=pretrained_model_name_or_path,
             load_format=load_format,
+            # Must agree with `mapping`, which the loader takes separately:
+            # to_mapping() derives world_size from tp*pp*cp, so the 1-GPU defaults
+            # reject every rank above 0.
+            tensor_parallel_size=mapping.tp_size,
+            pipeline_parallel_size=mapping.pp_size,
+            context_parallel_size=mapping.cp_size,
+            moe_expert_parallel_size=mapping.moe_ep_size,
+            moe_cluster_parallel_size=mapping.moe_cluster_size,
+            enable_attention_dp=mapping.enable_attention_dp,
+            gpus_per_node=mapping.gpus_per_node,
             **{} if use_cuda_graph else {"cuda_graph_config": None},
             moe_config=MoeConfig(
                 backend=moe_backend,
@@ -418,11 +452,21 @@ class Runner:
             kv_cache_config=KvCacheConfig(
                 dtype=kv_cache_dtype, mamba_ssm_cache_dtype=mamba_ssm_cache_dtype
             ),
+            nvfp4_gemm_config=Nvfp4GemmConfig(
+                allowed_backends=get_nvfp4_gemm_allowed_backends(),
+            ),
+            use_cute_dsl_bf16_gemm=use_cute_dsl_bf16_gemm,
+            use_cute_dsl_bf16_bmm=use_cute_dsl_bf16_bmm,
+        )
+        # Serving applies these in py_executor_creator; the harness builds llm_args
+        # by hand, so without this every model default is off here only.
+        llm_args = ModelLoader.load_config_and_apply_defaults(
+            pretrained_model_name_or_path, llm_args, checkpoint_loader
         )
         model_loader = ModelLoader(
             llm_args=llm_args,
             mapping=mapping,
-            spec_config=None,
+            spec_config=spec_config,
             sparse_attention_config=None,
             max_num_tokens=max_num_tokens,
             max_seq_len=max_seq_len,
@@ -433,17 +477,40 @@ class Runner:
                 checkpoint_dir=pretrained_model_name_or_path, checkpoint_loader=checkpoint_loader
             )
 
+        num_hidden_layers = model.model_config.pretrained_config.num_hidden_layers
+
         def forward(position_ids, hidden_states, attn_metadata, residual, **kwargs):
             # TODO: to be more general, we should call DecoderModel.forward
+            input_ids = kwargs.pop("input_ids", None)
             for layer_idx in layer_indices:
                 layer = model.model.layers[layer_idx]
-                residual_fusion = "residual" in inspect.signature(layer.forward).parameters
-                if residual_fusion:
-                    hidden_states, residual = layer(
-                        position_ids, hidden_states, attn_metadata, residual, **kwargs
+                if layer_idx >= num_hidden_layers:
+                    # MTP layer: needs input_ids, embed_tokens, and all_rank_num_tokens
+                    hidden_states = layer(
+                        input_ids,
+                        position_ids,
+                        hidden_states,
+                        model.model.embed_tokens,
+                        attn_metadata,
+                        all_rank_num_tokens=attn_metadata.all_rank_num_tokens,
+                        **kwargs,
                     )
+                    residual = hidden_states
                 else:
-                    hidden_states = layer(position_ids, hidden_states, attn_metadata, **kwargs)
+                    params = inspect.signature(layer.forward).parameters
+                    layer_kwargs = dict(kwargs)
+                    # Hashed MoE gates route on token ids, so plain decoder layers
+                    # need input_ids too, not just the MTP layers above.
+                    if "input_ids" in params:
+                        layer_kwargs["input_ids"] = input_ids
+                    if "residual" in params:
+                        hidden_states, residual = layer(
+                            position_ids, hidden_states, attn_metadata, residual, **layer_kwargs
+                        )
+                    else:
+                        hidden_states = layer(
+                            position_ids, hidden_states, attn_metadata, **layer_kwargs
+                        )
             return hidden_states, residual
 
         model.forward = forward
@@ -524,19 +591,25 @@ class Runner:
             ):
                 skip_forward(module)
             num_hidden_layers = model.model_config.pretrained_config.num_hidden_layers
-            if hasattr(model.model, "embed_tokens"):
+            has_mtp_layers = any(idx >= num_hidden_layers for idx in layer_indices)
+            if hasattr(model.model, "embed_tokens") and not has_mtp_layers:
                 skip_forward(model.model.embed_tokens)
-            for layer_idx in range(num_hidden_layers):
+            total_layers = len(model.model.layers)
+            for layer_idx in range(total_layers):
                 layer = model.model.layers[layer_idx]
                 if layer_idx not in layer_indices:
-                    # keep next layer's input_layernorm's weights for fusion
-                    skip_forward(
-                        layer,
-                        ignore_modules=[layer.input_layernorm]
-                        if layer_idx - 1 in layer_indices
-                        and hasattr(model.model.layers[layer_idx - 1], "next_layer_layernorm")
-                        else None,
-                    )
+                    if layer_idx < num_hidden_layers:
+                        # keep next layer's input_layernorm's weights for fusion
+                        skip_forward(
+                            layer,
+                            ignore_modules=[layer.input_layernorm]
+                            if layer_idx - 1 in layer_indices
+                            and hasattr(model.model.layers[layer_idx - 1], "next_layer_layernorm")
+                            else None,
+                        )
+                    else:
+                        # MTP layers beyond num_hidden_layers
+                        skip_forward(layer)
             if hasattr(model.model, "norm"):
                 skip_forward(
                     model.model.norm,
@@ -641,13 +714,14 @@ class Runner:
         )
         kwargs = {}
 
-        # DeepSeek-V4 (multi-head hyper-connection) decoder layers take the initial residual
-        # as ``hc_state`` shaped ``[num_tokens, hc_mult, hidden_size]`` (not a 2D hidden-states
-        # tensor), and their MoE routing requires ``input_ids``. Both are absent from the
-        # generic single-layer harness, so synthesize them when the model exposes ``hc_mult``.
+        # DeepSeek-V4 MHC layers use a 3D initial state and require input IDs.
         hc_mult = getattr(pretrained_config, "hc_mult", None)
         if hc_mult is not None:
             hidden_states = hidden_states.unsqueeze(1).expand(-1, hc_mult, -1).contiguous()
+
+        # MTP layers also need input IDs for their embedding lookup.
+        num_hidden_layers = pretrained_config.num_hidden_layers
+        if hc_mult is not None or any(idx >= num_hidden_layers for idx in self.layer_indices):
             kwargs["input_ids"] = torch.randint(
                 0,
                 pretrained_config.vocab_size,
@@ -713,6 +787,8 @@ class Runner:
                     moe_modules.append(layer.mixer.experts)
             elif layer.__class__.__name__ in ["GatedMLP"]:
                 pass
+            elif not hasattr(layer.mlp, "experts"):
+                pass
             else:
                 moe_modules.append(layer.mlp.experts)
 
@@ -773,6 +849,7 @@ class Runner:
         kv_cache_dtype,
         mamba_ssm_cache_dtype,
         layer_indices,
+        num_mtp_layers=None,
     ):
         # Please refer to `tensorrt_llm/_torch/pyexecutor/py_executor_creator.py` for `tokens_per_block`
         model_config = ModelConfig.from_pretrained(pretrained_model_name_or_path)
@@ -794,7 +871,8 @@ class Runner:
             None: torch_dtype_to_binding(config.torch_dtype),
         }[model_config.quant_config.kv_cache_quant_algo]
         if is_mla(config):
-            layer_mask = [i in layer_indices for i in range(config.num_hidden_layers)]
+            total_layers = config.num_hidden_layers + (num_mtp_layers or 0)
+            layer_mask = [i in layer_indices for i in range(total_layers)]
             num_layers = sum(layer_mask)
             kv_cache_manager = kv_cache_manager_cls(
                 kv_cache_config,

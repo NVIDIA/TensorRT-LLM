@@ -1,0 +1,30 @@
+version: 0.0.1
+# VR200 = Vera Rubin NVL72 (Vera aarch64 CPU + Rubin GPU).
+l0_vr200:
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 1
+        lte: 1
+    wildcards:
+      linux_distribution_name: ubuntu*
+      cpu: aarch64
+    terms:
+      stage: post_merge
+      backend: pytorch
+      compute_capability: "10.7"
+  tests:
+  - unittest/_torch/modules/moe/test_moe_backend.py::test_fc1_prologue_wait_preserves_exhaustion
+  # ------------- PyTorch tests ---------------
+  # One test per KPI model, newest model generations first. NVFP4 preferred as
+  # the primary Rubin precision.
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4_mla_gsm8k
+  - accuracy/test_llm_api_pytorch.py::TestQwen3_6_35B_A3B::test_nvfp4[TRTLLM]
+  - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_1gpu[v1_kv_cache-True-True-cutlass-auto]
+  - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8B::test_nvfp4
+  # K3 CTX fusion, shared BF16 MXFP8 GEMM, and dispatch regressions.
+  - unittest/_torch/thop/test_k3_ctx_fp8_output.py
+  - unittest/_torch/thop/parallel/test_fp8_block_scale_gemm.py::test_cute_dsl_mxfp8_gemm_rubin_k128_replicated_scales
+  - unittest/_torch/attention/test_fp4_mla.py::test_fp4_mla_context_gather_rejects_unsupported_rope_dim
+  - unittest/_torch/attention/test_fp4_mla.py::test_mla_strided_context_projection_optional_bias
+  - unittest/_torch/attention/test_fp4_mla.py::test_mla_fp4_helix_generation_reaches_fused_cache_update

@@ -19,7 +19,7 @@ file(GLOB_RECURSE SRC_CPP *.cpp)
 file(GLOB_RECURSE SRC_CU *.cu)
 
 add_library(trtllm_gen_gemm_gated_act OBJECT)
-filter_source_cuda_architectures(SOURCE_LIST SRC_CPP ARCHS 100f)
+filter_source_cuda_architectures(SOURCE_LIST SRC_CPP ARCHS 100 103 107 100f)
 
 target_sources(trtllm_gen_gemm_gated_act PRIVATE ${SRC_CPP} ${SRC_CU})
 target_compile_definitions(trtllm_gen_gemm_gated_act
@@ -29,10 +29,17 @@ set_property(TARGET trtllm_gen_gemm_gated_act PROPERTY POSITION_INDEPENDENT_CODE
 set_property(TARGET trtllm_gen_gemm_gated_act
              PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 
+# Always define TLLM_RUBIN_FEATURES to enable SM107 (Rubin) support in the code.
+# This is required because the generated KernelMetaInfo.h includes Lamport
+# fields in all kernel entries (including SM100), which requires the GemmOptions
+# struct to have those fields defined. Rubin-specific features have runtime
+# guards.
+target_compile_definitions(trtllm_gen_gemm_gated_act PUBLIC TLLM_RUBIN_FEATURES)
+
 # Embed cubins via INCBIN.
 include(tllm_cubin_archive)
 tllm_add_cubin_archive_sources(
   trtllm_gen_gemm_gated_act
   "${CMAKE_CURRENT_SOURCE_DIR}/trtllmGen_gatedAct_export/cubins"
-  NAMESPACE gemmGatedAct tensorrt_llm kernels
-  ARCHS 100f)
+  NAMESPACE gemmGatedAct tensorrt_llm ${TRTLLM_ABI_NAMESPACE} kernels
+  ARCHS 100 103 107 100f)

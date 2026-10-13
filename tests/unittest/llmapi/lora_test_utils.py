@@ -11,7 +11,6 @@ from utils.llm_data import llm_models_root
 from utils.util import duplicate_list_to_length, flatten_list, similar
 
 from tensorrt_llm import SamplingParams
-from tensorrt_llm._torch.peft.lora.config import LoraConfig
 from tensorrt_llm._torch.peft.lora.cuda_graph_lora_params import \
     CudaGraphLoraParams
 from tensorrt_llm._torch.peft.lora.layer import (GroupedGemmParamsInput,
@@ -162,7 +161,6 @@ def create_mock_nemo_lora_checkpoint(
     Returns:
         Path to the created .nemo file
     """
-
     # Validate parameters
     if hidden_size % num_attention_heads != 0:
         raise ValueError(f"hidden_size ({hidden_size}) must be divisible by "

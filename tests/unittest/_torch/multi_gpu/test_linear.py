@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import pickle
 import sys
 import traceback
@@ -12,8 +27,13 @@ from utils.util import skip_pre_blackwell
 import tensorrt_llm
 import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 from tensorrt_llm._torch.autotuner import autotune
+from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_INTERNAL_AVAILABLE
 from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
-from tensorrt_llm.functional import AllReduceFusionOp, AllReduceParams
+from tensorrt_llm._torch.ugpu.policy import UgpuPolicy
+from tensorrt_llm._torch.ugpu_utils import is_ugpu_enabled
+from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm.functional import (AllReduceFusionOp, AllReduceParams,
+                                     AllReduceStrategy)
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.math_utils import pad_up
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
@@ -186,6 +206,55 @@ def row_linear_forward(x, hidden_size, dtype, tensor_parallel_size,
 
 
 @torch.inference_mode
+def bf16_row_linear_ugpu_forward(x, hidden_size, dtype, tensor_parallel_size,
+                                 tensor_parallel_rank, weights):
+    x = x.cuda()
+    output_size = weights[0].shape[0]
+    local_hidden_size = hidden_size // tensor_parallel_size
+
+    linear = Linear(
+        in_features=hidden_size,
+        out_features=output_size,
+        bias=False,
+        dtype=dtype,
+        mapping=Mapping(
+            world_size=tensor_parallel_size,
+            tp_size=tensor_parallel_size,
+            rank=tensor_parallel_rank,
+        ),
+        tensor_parallel_mode=TensorParallelMode.ROW,
+        allreduce_strategy=AllReduceStrategy.AUTO,
+        use_cute_dsl_bf16_gemm=True,
+        enable_ugpu_bf16_linear=True,
+        ugpu_policy=UgpuPolicy(enabled=True),
+    )
+    linear.load_weights([{"weight": weights[0]}])
+    linear.cuda()
+    linear.post_load_weights()
+
+    assert linear.partition_plan.enabled
+    assert linear.partition_plan.op_kind == "bf16_linear"
+    assert linear._ugpu_weight_shards is not None
+    assert len(linear._ugpu_weight_shards) == 2
+    assert linear.weight.numel() == 0
+    assert linear._ugpu_weight_shards[0]["weight"].shape == (
+        output_size // 2,
+        local_hidden_size,
+    )
+    # ROW-TP must not select a path that reads the released full weight even if
+    # a fused GEMM/all-reduce capability flag is set.
+    linear.use_fused_gemm_allreduce = True
+
+    input_shard = torch.chunk(x, tensor_parallel_size,
+                              dim=-1)[tensor_parallel_rank].contiguous()
+    with autotune():
+        output = linear(input_shard, all_reduce_params=AllReduceParams())
+    expected = x.float() @ weights[0].cuda().t().float()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(output.float(), expected, rtol=1e-2, atol=2.0)
+
+
+@torch.inference_mode
 def row_linear_norm_fusion_forward(x, hidden_size, dtype, tensor_parallel_size,
                                    tensor_parallel_rank, weights):
 
@@ -344,10 +413,20 @@ def check_accuracy(a, b, atol, rtol, percent):
 
 
 @torch.inference_mode
-def fp4_row_linear_allreduce(tp_size, local_rank, seq_len, output_size,
-                             hidden_size, dtype, output_ref, x_sf_global,
-                             w_sf_global, x_fp4s, w_fp4, x_sf_blocks,
-                             w_sf_block_unswizzled):
+def fp4_row_linear_allreduce(tp_size,
+                             local_rank,
+                             seq_len,
+                             output_size,
+                             hidden_size,
+                             dtype,
+                             output_ref,
+                             x_sf_global,
+                             w_sf_global,
+                             x_fp4s,
+                             w_fp4,
+                             x_sf_blocks,
+                             w_sf_block_unswizzled,
+                             use_ugpu=False):
     output_ref = output_ref.cuda()
     x_sf_global = x_sf_global.cuda()
     w_sf_global = w_sf_global.cuda()
@@ -369,6 +448,8 @@ def fp4_row_linear_allreduce(tp_size, local_rank, seq_len, output_size,
             rank=local_rank,
         ),
         tensor_parallel_mode=TensorParallelMode.ROW,
+        allreduce_strategy=AllReduceStrategy.AUTO,
+        ugpu_policy=UgpuPolicy(enabled=use_ugpu),
     )
 
     l0.load_weights([{
@@ -383,32 +464,116 @@ def fp4_row_linear_allreduce(tp_size, local_rank, seq_len, output_size,
     }])
 
     l0.cuda()
+    if use_ugpu:
+        l0.post_load_weights()
+        assert l0.partition_plan.enabled
+        assert l0._ugpu_weight_shards is not None
+        assert len(l0._ugpu_weight_shards) == 2
+        assert l0.weight.numel() == 0
+        assert l0.weight_scale.numel() == 0
+        assert l0.all_reduce.strategy == AllReduceStrategy.AUTO
+        assert l0.all_reduce.uses_nccl_symmetric_memory_window()
+        # Guarantee that this regression exercises the routing guard even when
+        # fused GEMM-allreduce is unavailable in a particular test environment.
+        l0.use_fused_gemm_allreduce = True
+
     # TODO: parameters['weight']' size mismatch at index 0
     # l0 = torch.compile(l0)
     with torch.inference_mode(), autotune():
-        output = l0.forward((x_fp4, x_sf_block))
+        if use_ugpu:
+            output = l0.forward((x_fp4, x_sf_block),
+                                all_reduce_params=AllReduceParams())
+        else:
+            output = l0.forward((x_fp4, x_sf_block))
 
     torch.cuda.synchronize()
-    check_accuracy(output, output_ref, atol=0.05, rtol=0.05, percent=0.99)
+    atol = 0.15 if use_ugpu else 0.05
+    check_accuracy(output, output_ref, atol=atol, rtol=0.05, percent=0.99)
 
 
-def fp4_row_linear_allreduce_run_single_rank(func, tp_size, seq_len,
-                                             output_size, hidden_size, dtype,
-                                             output_ref, x_sf_global,
-                                             w_sf_global, x_fp4s, w_fp4,
+def fp4_row_linear_allreduce_run_single_rank(func,
+                                             tp_size,
+                                             seq_len,
+                                             output_size,
+                                             hidden_size,
+                                             dtype,
+                                             output_ref,
+                                             x_sf_global,
+                                             w_sf_global,
+                                             x_fp4s,
+                                             w_fp4,
                                              x_sf_blocks,
-                                             w_sf_block_unswizzled):
+                                             w_sf_block_unswizzled,
+                                             use_ugpu=False):
     local_rank = tensorrt_llm.mpi_rank()
     torch.cuda.set_device(local_rank)
 
     try:
         func(tp_size, local_rank, seq_len, output_size, hidden_size, dtype,
              output_ref, x_sf_global, w_sf_global, x_fp4s, w_fp4, x_sf_blocks,
-             w_sf_block_unswizzled)
+             w_sf_block_unswizzled, use_ugpu)
     except Exception as e:
         print(f"Error: {e}")
         raise
     return True
+
+
+def _prepare_fp4_row_linear_allreduce_case(
+    seq_len: int,
+    output_size: int,
+    hidden_size: int,
+    dtype: torch.dtype,
+    tp_size: int,
+    sample_device: str,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[torch.Tensor],
+           torch.Tensor, list[torch.Tensor], torch.Tensor]:
+    scaling_vector_size = 16
+    x = torch.randn((seq_len, hidden_size), dtype=dtype,
+                    device=sample_device).cuda()
+    weight = torch.randn((output_size, hidden_size),
+                         dtype=dtype,
+                         device=sample_device).cuda()
+
+    x_sf_global = (448 * 6) / x.abs().max().float()
+    x_fp4, x_sf_block = torch.ops.trtllm.fp4_quantize(x, x_sf_global,
+                                                      scaling_vector_size,
+                                                      False)
+    weight_sf_global = (448 * 6) / weight.abs().max().float()
+    weight_fp4, weight_sf_block = torch.ops.trtllm.fp4_quantize(
+        weight, weight_sf_global, scaling_vector_size, False)
+    weight_sf_unswizzled = torch.ops.trtllm.block_scale_interleave_reverse(
+        weight_sf_block.cpu().view(pad_up(output_size, 128), -1))
+
+    with torch.inference_mode():
+        alpha_ref = 1.0 / (weight_sf_global * x_sf_global)
+        output_ref = torch.ops.trtllm.fp4_gemm(
+            x_fp4,
+            weight_fp4,
+            x_sf_block,
+            weight_sf_block,
+            alpha_ref,
+            fp4_utils.FP4GemmType.W4A4_NVFP4_NVFP4,
+            dtype,
+        )
+
+    input_fp4_shards = []
+    input_sf_shards = []
+    for input_shard in torch.chunk(x, tp_size, dim=-1):
+        input_fp4, input_sf = torch.ops.trtllm.fp4_quantize(
+            input_shard.contiguous(), x_sf_global, scaling_vector_size, False)
+        input_fp4_shards.append(input_fp4.cpu())
+        input_sf_shards.append(input_sf.cpu())
+
+    torch.cuda.synchronize()
+    return (
+        output_ref.cpu(),
+        x_sf_global.cpu(),
+        weight_sf_global.cpu(),
+        input_fp4_shards,
+        weight_fp4.cpu(),
+        input_sf_shards,
+        weight_sf_unswizzled.cpu(),
+    )
 
 
 @skip_pre_blackwell
@@ -427,51 +592,100 @@ def test_fp4_row_linear_allreduce(seq_len, output_size, hidden_size, dtype,
     monkeypatch.setenv("TRTLLM_GEMM_ALLREDUCE_FUSION_ENABLED", "1")
     torch.manual_seed(42)
     tp_size = mpi_pool_executor.num_workers
+    case_inputs = _prepare_fp4_row_linear_allreduce_case(seq_len,
+                                                         output_size,
+                                                         hidden_size,
+                                                         dtype,
+                                                         tp_size,
+                                                         sample_device="cpu")
+    rank_args = (fp4_row_linear_allreduce, tp_size, seq_len, output_size,
+                 hidden_size, dtype, *case_inputs)
 
-    x = torch.randn((seq_len, hidden_size), dtype=dtype).cuda()
-    w = torch.randn((output_size, hidden_size), dtype=dtype).cuda()
-
-    scaling_vector_size = 16
-    x_sf_global = (448 * 6) / x.abs().max().float()
-    x_fp4, x_sf_block = torch.ops.trtllm.fp4_quantize(x, x_sf_global,
-                                                      scaling_vector_size,
-                                                      False)
-    w_sf_global = (448 * 6) / w.abs().max().float()
-    w_fp4, w_sf_block = torch.ops.trtllm.fp4_quantize(w, w_sf_global,
-                                                      scaling_vector_size,
-                                                      False)
-    w_sf_block_unswizzled = (torch.ops.trtllm.block_scale_interleave_reverse(
-        w_sf_block.cpu().view(pad_up(output_size, 128), -1)))
-
-    with torch.inference_mode():
-        alpha_ref = 1.0 / (w_sf_global * x_sf_global)
-        output_ref = torch.ops.trtllm.fp4_gemm(
-            x_fp4, w_fp4, x_sf_block, w_sf_block, alpha_ref,
-            fp4_utils.FP4GemmType.W4A4_NVFP4_NVFP4, dtype)
-
-    torch.cuda.synchronize()
-
-    xs = [x.contiguous().cuda() for x in torch.chunk(x, tp_size, dim=-1)]
-    x_fp4s = []
-    x_sf_blocks = []
-    for i in range(tp_size):
-        _fp4, _sf_block = torch.ops.trtllm.fp4_quantize(xs[i], x_sf_global,
-                                                        scaling_vector_size,
-                                                        False)
-        x_fp4s.append(_fp4.cpu())
-        x_sf_blocks.append(_sf_block.cpu())
-
-    output_ref = output_ref.cpu()
-    x_sf_global = x_sf_global.cpu()
-    w_sf_global = w_sf_global.cpu()
-    w_fp4 = w_fp4.cpu()
-    w_sf_block_unswizzled = w_sf_block_unswizzled.cpu()
-
-    results = mpi_pool_executor.map(
-        fp4_row_linear_allreduce_run_single_rank,
-        *zip(*[(fp4_row_linear_allreduce, tp_size, seq_len, output_size,
-                hidden_size, dtype, output_ref, x_sf_global, w_sf_global,
-                x_fp4s, w_fp4, x_sf_blocks, w_sf_block_unswizzled)] * tp_size))
+    results = mpi_pool_executor.map(fp4_row_linear_allreduce_run_single_rank,
+                                    *zip(*[rank_args] * tp_size))
 
     for r in results:
         assert r is True
+
+
+@pytest.mark.skipif(
+    get_sm_version() != 107,
+    reason="This test is only supported on Rubin (SM 107) GPUs",
+)
+@pytest.mark.skipif(
+    not IS_CUTLASS_DSL_INTERNAL_AVAILABLE,
+    reason="Rubin CuTe DSL internal package is not available",
+)
+@pytest.mark.skipif(torch.cuda.device_count() < 2,
+                    reason="needs 2 GPUs to run this test")
+@pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
+def test_fp4_row_linear_allreduce_ugpu_freed_weights(mpi_pool_executor,
+                                                     monkeypatch):
+    is_ugpu_enabled.cache_clear()
+    if not is_ugpu_enabled():
+        pytest.skip("uGPU localization is not enabled/supported on this system")
+
+    monkeypatch.setenv("TRTLLM_GEMM_ALLREDUCE_FUSION_ENABLED", "1")
+    monkeypatch.setenv("TLLM_NCCL_SYMMETRIC_ZERO_COPY", "1")
+    torch.manual_seed(42)
+
+    seq_len = 1
+    output_size = 1536
+    hidden_size = 4224
+    dtype = torch.bfloat16
+    tp_size = mpi_pool_executor.num_workers
+    case_inputs = _prepare_fp4_row_linear_allreduce_case(seq_len,
+                                                         output_size,
+                                                         hidden_size,
+                                                         dtype,
+                                                         tp_size,
+                                                         sample_device="cuda")
+    rank_args = (fp4_row_linear_allreduce, tp_size, seq_len, output_size,
+                 hidden_size, dtype, *case_inputs, True)
+    results = mpi_pool_executor.map(
+        fp4_row_linear_allreduce_run_single_rank,
+        *zip(*[rank_args] * tp_size),
+    )
+
+    for result in results:
+        assert result is True
+
+
+@pytest.mark.skipif(
+    get_sm_version() != 107,
+    reason="This test is only supported on Rubin (SM 107) GPUs",
+)
+@pytest.mark.skipif(
+    not IS_CUTLASS_DSL_INTERNAL_AVAILABLE,
+    reason="Rubin CuTe DSL internal package is not available",
+)
+@pytest.mark.skipif(torch.cuda.device_count() < 2,
+                    reason="needs 2 GPUs to run this test")
+@pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
+def test_bf16_row_linear_allreduce_ugpu_freed_weights(mpi_pool_executor):
+    is_ugpu_enabled.cache_clear()
+    if not is_ugpu_enabled():
+        pytest.skip("uGPU localization is not enabled/supported on this system")
+
+    tensor_parallel_size = mpi_pool_executor.num_workers
+    torch.manual_seed(107)
+    seq_len = 1
+    hidden_size = 512
+    output_size = 256
+    dtype = torch.bfloat16
+    x = torch.randn((seq_len, hidden_size), dtype=dtype)
+    weight = torch.randn((output_size, hidden_size), dtype=dtype)
+
+    results = mpi_pool_executor.map(
+        run_single_rank,
+        *zip(*[(
+            tensor_parallel_size,
+            bf16_row_linear_ugpu_forward,
+            x,
+            [weight],
+            hidden_size,
+            dtype,
+        )] * tensor_parallel_size),
+    )
+    for result in results:
+        assert result is True

@@ -32,8 +32,19 @@ foreach(CUDA_ARCH IN LISTS CMAKE_CUDA_ARCHITECTURES)
       list(APPEND DEEP_EP_CUDA_ARCHITECTURES
            "${CUDA_ARCH_MAJOR}${CUDA_ARCH_MINOR}a${CUDA_ARCH_POSTFIX}")
     else()
-      list(APPEND DEEP_EP_CUDA_ARCHITECTURES
-           "${CUDA_ARCH_MAJOR}${CUDA_ARCH_MINOR}${CUDA_ARCH_POSTFIX}")
+      # Preserve the architecture suffix (a/f) from the input Extract suffix
+      # from the CUDA_ARCH (e.g., "107f-real" -> "f")
+      string(REGEX MATCH "^[1-9][0-9]*[0-9]([af])" ARCH_SUFFIX_MATCH
+                   ${CUDA_ARCH})
+      if(CMAKE_MATCH_1)
+        set(ARCH_SUFFIX ${CMAKE_MATCH_1})
+      else()
+        set(ARCH_SUFFIX "")
+      endif()
+      list(
+        APPEND DEEP_EP_CUDA_ARCHITECTURES
+        "${CUDA_ARCH_MAJOR}${CUDA_ARCH_MINOR}${ARCH_SUFFIX}${CUDA_ARCH_POSTFIX}"
+      )
     endif()
   endif()
 endforeach()
@@ -153,6 +164,7 @@ ExternalProject_Add(
     -DCMAKE_CUDA_ARCHITECTURES:STRING=${DEEP_EP_CUDA_ARCHITECTURES}
     -DCMAKE_CUDA_HOST_COMPILER:STRING=${CMAKE_CUDA_HOST_COMPILER}
     -DCMAKE_CUDA_COMPILER_LAUNCHER:STRING=${CMAKE_CUDA_COMPILER_LAUNCHER}
+    -DMLX5_lib:FILEPATH=${MLX5_lib}
     -DNVSHMEM_BUILD_EXAMPLES:BOOL=0
     -DNVSHMEM_BUILD_PACKAGES:BOOL=0
     -DNVSHMEM_BUILD_TESTS:BOOL=0

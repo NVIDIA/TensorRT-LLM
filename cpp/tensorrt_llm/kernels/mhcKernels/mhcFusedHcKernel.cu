@@ -128,9 +128,9 @@ static bool isSupportedFhcHiddenRuntime(int hidden_size)
     return hidden_size == static_cast<int>(FHC_HIDDEN_FLASH) || hidden_size == static_cast<int>(FHC_HIDDEN_PRO);
 }
 
-// Validate the tcgen05 MMA fused-HC compile-time shape contract. Hidden must
-// be divisible into BLOCK_K tiles, kNumSplits must evenly divide those tiles,
-// and the hidden dimension must be a multiple of BF16_VEC_LI (per-thread vector
+// Validate the tcgen05 all-in-one fused-HC compile-time shape contract. Hidden
+// must be divisible into BLOCK_K tiles, KS must evenly divide those tiles, and
+// the hidden dimension must be a multiple of BF16_VEC_LI (per-thread vector
 // load granularity in the Phase 4 layer_input loop). The (Hidden % team-stride)
 // alignment is no longer required: the layer_input loop has a scalar-vec tail
 // that handles the residue after the vectorized main loop. Keep this in sync
@@ -144,7 +144,28 @@ static constexpr bool isSupportedFhcMmaKS()
     constexpr uint32_t hTilesPerHc = Hidden / FHC_BLOCK_K;
     constexpr uint32_t bf16VecLi = 8;
 
-    return Hidden % FHC_BLOCK_K == 0 && hTilesPerHc % KS == 0 && Hidden % bf16VecLi == 0;
+    constexpr bool evenSplit = hTilesPerHc % KS == 0;
+    constexpr bool rubinExactSplit = Hidden == FHC_HIDDEN_PRO && (KS == 53 || KS == 106);
+
+    return Hidden % FHC_BLOCK_K == 0 && KS <= hTilesPerHc && (evenSplit || rubinExactSplit) && Hidden % bf16VecLi == 0;
+}
+
+// The half-MMA kernel can distribute remainder tiles over its first splits.
+// Keep the uneven support surface limited to the two measured exact-wave
+// H=7168 shapes for 212-SM Rubin.
+template <uint32_t Hidden, uint32_t KS>
+static constexpr bool isSupportedFhcHalfMmaKS()
+{
+    static_assert(isSupportedFhcHidden<Hidden>(), "Unsupported fused-HC hidden size");
+    static_assert(KS > 0, "kNumSplits must be positive");
+
+    constexpr uint32_t hTilesPerHc = Hidden / FHC_BLOCK_K;
+    constexpr uint32_t bf16VecLi = 8;
+
+    constexpr bool evenSplit = hTilesPerHc % KS == 0;
+    constexpr bool rubinExactSplit = Hidden == FHC_HIDDEN_PRO && (KS == 53 || KS == 106);
+
+    return Hidden % FHC_BLOCK_K == 0 && KS <= hTilesPerHc && (evenSplit || rubinExactSplit) && Hidden % bf16VecLi == 0;
 }
 
 static CUtensorMap makeTma2D(void* base, CUtensorMapDataType dtype, uint64_t gmemInner, uint64_t gmemOuter,
@@ -172,9 +193,10 @@ static CUtensorMap makeTma2D(void* base, CUtensorMapDataType dtype, uint64_t gme
 // ---- TMA descriptor cache --------------------------------------------------
 //
 // cuTensorMapEncodeTiled is a host-side call that takes ~1-2 µs per descriptor.
-// Each fused_hc launch builds 4 descriptors (residual_in, x_in, W,
-// residual_cur), so the per-call descriptor build is 4-8 µs — 25-50% of total
-// wall time at small M (M ≤ 64).
+// On a cache miss, the half-MMA path builds 6 descriptors (residual_in, x_in,
+// W, residual_cur, post_mix, comb_mix) and the all-in-one path builds 4. The
+// per-call encode cost is material at small M, so hits stay entirely host-side
+// and each launcher resolves the current device only once.
 //
 // Cache scope: per-host-thread (`thread_local`). Same host thread launching to
 // multiple CUDA streams shares one cache (descriptor content depends only on
@@ -195,7 +217,7 @@ static CUtensorMap makeTma2D(void* base, CUtensorMapDataType dtype, uint64_t gme
 // fresh `base` pointers as public outputs are allocated, so the unbounded
 // version would grow across shape transitions. 128 entries × ~256 B = ~32 KB
 // per host thread — fits in L1, sized to cover the working set of any single
-// model (~4-8 distinct shapes × 4 descriptors each = O(20) live, with
+// model (~4-8 distinct shapes × up to 6 descriptors each = O(30) live, with
 // headroom for shape transitions).
 namespace
 {
@@ -248,11 +270,10 @@ struct TmaDescCache
 };
 
 CUtensorMap getCachedTma2D(void* base, CUtensorMapDataType dtype, uint64_t gmemInner, uint64_t gmemOuter,
-    uint32_t smemInner, uint32_t smemOuter, uint64_t gmemOuterStrideBytes, uint32_t swizzleBytes, uint32_t elemBytes)
+    uint32_t smemInner, uint32_t smemOuter, uint64_t gmemOuterStrideBytes, uint32_t swizzleBytes, uint32_t elemBytes,
+    int device_id)
 {
     static thread_local TmaDescCache cache;
-    int device_id = 0;
-    cudaGetDevice(&device_id);
     TmaDescKey const key{base, gmemInner, gmemOuter, smemInner, smemOuter, gmemOuterStrideBytes, swizzleBytes,
         elemBytes, dtype, device_id};
     auto it = cache.index.find(key);
@@ -288,20 +309,20 @@ static constexpr uint32_t fhcSmemSize()
     constexpr uint32_t SMEM_COMB = FHC_BLOCK_M * FHC_HC_MULT * FHC_HC_MULT * sizeof(float);
     constexpr uint32_t SMEM_RC = FHC_HC_MULT * FHC_BLOCK_M * FHC_BLOCK_K * sizeof(__nv_bfloat16);
     constexpr uint32_t kNumCast = 4;
-    constexpr uint32_t barriers = 2 * FHC_N_B_STAGES + 2 * FHC_N_INPUT_STG + 2 * kNumCast + 1;
+    constexpr uint32_t barriers = 2 * FHC_N_B_STAGES + 2 * FHC_N_INPUT_STG + 2 * kNumCast + 2;
     // 4 bytes for the tmem ptr word + 32 bytes padding for alignment headroom.
     return SMEM_CD + FHC_N_B_STAGES * SMEM_B + FHC_N_INPUT_STG * (SMEM_RES_ISTG + SMEM_X_ISTG) + SMEM_POST + SMEM_COMB
         + SMEM_RC + barriers * 8 + 4 + 32;
 }
 
-using FusedRoutFn = void (*)(
-    uint32_t, CUtensorMap, CUtensorMap, CUtensorMap, CUtensorMap, float*, float const*, float const*, float*);
+using FusedRoutFn = void (*)(uint32_t, CUtensorMap, CUtensorMap, CUtensorMap, CUtensorMap, CUtensorMap, CUtensorMap,
+    float const*, float const*, float*, float*);
 
 template <uint32_t Hidden, uint32_t KS>
 static FusedRoutFn fhcInstance()
 {
     static_assert(isSupportedFhcHidden<Hidden>(), "Unsupported fused-HC hidden size");
-    static_assert(isSupportedFhcMmaKS<Hidden, KS>(), "Unsupported fused-HC MMA kNumSplits for hidden size");
+    static_assert(isSupportedFhcHalfMmaKS<Hidden, KS>(), "Unsupported fused-HC half-MMA kNumSplits for hidden size");
     return &fused_mhc::fused_tf32_pmap_gemm_rout_atomic_impl<FHC_SHAPE_N, Hidden, FHC_HC_MULT, FHC_BLOCK_M, FHC_BLOCK_N,
         FHC_BLOCK_K, FHC_SWIZZLE_CD, FHC_N_B_STAGES, FHC_N_INPUT_STG, FHC_NUM_MMA_TH, FHC_NUM_PMAP_TH, KS,
         /*kEarlyRelease=*/false>;
@@ -310,7 +331,7 @@ static FusedRoutFn fhcInstance()
 template <uint32_t Hidden, uint32_t KS>
 static FusedRoutFn fhcInstanceIfSupported()
 {
-    if constexpr (isSupportedFhcMmaKS<Hidden, KS>())
+    if constexpr (isSupportedFhcHalfMmaKS<Hidden, KS>())
     {
         return fhcInstance<Hidden, KS>();
     }
@@ -335,8 +356,10 @@ static FusedRoutFn pickFhc(uint32_t ks)
     case 16: return fhcInstanceIfSupported<Hidden, 16>();
     case 28: return fhcInstanceIfSupported<Hidden, 28>();
     case 32: return fhcInstanceIfSupported<Hidden, 32>();
+    case 53: return fhcInstanceIfSupported<Hidden, 53>();
     case 56: return fhcInstanceIfSupported<Hidden, 56>();
     case 64: return fhcInstanceIfSupported<Hidden, 64>();
+    case 106: return fhcInstanceIfSupported<Hidden, 106>();
     case 112: return fhcInstanceIfSupported<Hidden, 112>();
     default: TLLM_CHECK_WITH_INFO(false, "mhcFusedHcLaunch: unsupported kNumSplits=%u", ks); return nullptr;
     }
@@ -393,6 +416,8 @@ static void mhcFusedHcLaunchImpl(__nv_bfloat16 const* x_prev, __nv_bfloat16 cons
     constexpr uint32_t SHAPE_K = FHC_HC_MULT * Hidden;
 
     uint32_t const m_u = static_cast<uint32_t>(M);
+    int device_id = 0;
+    TLLM_CUDA_CHECK(cudaGetDevice(&device_id));
     uint32_t const ks = (num_k_splits > 0) ? static_cast<uint32_t>(num_k_splits) : pickKSplits(M);
     int const bs = (bigfuse_block_size > 0) ? bigfuse_block_size : selectBigFuseBS(M);
 
@@ -408,19 +433,27 @@ static void mhcFusedHcLaunchImpl(__nv_bfloat16 const* x_prev, __nv_bfloat16 cons
     // ---- Build TMA descriptors (cached by ptr+shape) ----
     CUtensorMap desc_res = getCachedTma2D(const_cast<__nv_bfloat16*>(residual_prev), CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
         SHAPE_K, m_u, FHC_BLOCK_K, FHC_BLOCK_M, static_cast<uint64_t>(SHAPE_K) * sizeof(__nv_bfloat16),
-        /*swizzleBytes=*/128, sizeof(__nv_bfloat16));
+        /*swizzleBytes=*/128, sizeof(__nv_bfloat16), device_id);
 
     CUtensorMap desc_x = getCachedTma2D(const_cast<__nv_bfloat16*>(x_prev), CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, Hidden,
         m_u, FHC_BLOCK_K, FHC_BLOCK_M, static_cast<uint64_t>(Hidden) * sizeof(__nv_bfloat16),
-        /*swizzleBytes=*/128, sizeof(__nv_bfloat16));
+        /*swizzleBytes=*/128, sizeof(__nv_bfloat16), device_id);
 
     CUtensorMap desc_b = getCachedTma2D(const_cast<float*>(w_t), CU_TENSOR_MAP_DATA_TYPE_TFLOAT32, SHAPE_K, FHC_SHAPE_N,
         FHC_BLOCK_K, FHC_BLOCK_N, static_cast<uint64_t>(SHAPE_K) * sizeof(float),
-        /*swizzleBytes=*/128, sizeof(float));
+        /*swizzleBytes=*/128, sizeof(float), device_id);
 
     CUtensorMap desc_res_out = getCachedTma2D(residual_cur, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, SHAPE_K, m_u, FHC_BLOCK_K,
         /*smemOuter=*/16, static_cast<uint64_t>(SHAPE_K) * sizeof(__nv_bfloat16),
-        /*swizzleBytes=*/128, sizeof(__nv_bfloat16));
+        /*swizzleBytes=*/128, sizeof(__nv_bfloat16), device_id);
+
+    CUtensorMap desc_post = getCachedTma2D(const_cast<float*>(post_mix_prev), CU_TENSOR_MAP_DATA_TYPE_FLOAT32,
+        FHC_HC_MULT, m_u, FHC_HC_MULT, FHC_BLOCK_M, static_cast<uint64_t>(FHC_HC_MULT) * sizeof(float),
+        /*swizzleBytes=*/0, sizeof(float), device_id);
+
+    CUtensorMap desc_comb = getCachedTma2D(const_cast<float*>(comb_mix_prev), CU_TENSOR_MAP_DATA_TYPE_FLOAT32,
+        FHC_HC_MULT * FHC_HC_MULT, m_u, FHC_HC_MULT * FHC_HC_MULT, FHC_BLOCK_M,
+        static_cast<uint64_t>(FHC_HC_MULT * FHC_HC_MULT) * sizeof(float), /*swizzleBytes=*/0, sizeof(float), device_id);
 
     // ---- Step 1: fused post-mapping + TF32 GEMM + sqrsum + residual_out ----
     constexpr uint32_t fused_smem = fhcSmemSize();
@@ -431,8 +464,8 @@ static void mhcFusedHcLaunchImpl(__nv_bfloat16 const* x_prev, __nv_bfloat16 cons
     uint32_t const m_tiles = (m_u + FHC_BLOCK_M - 1) / FHC_BLOCK_M;
     dim3 const grid(m_tiles * ks);
     dim3 const block(FHC_NUM_MMA_TH + FHC_NUM_PMAP_TH);
-    fa<<<grid, block, fused_smem, stream>>>(
-        m_u, desc_res, desc_x, desc_b, desc_res_out, y_acc_workspace, post_mix_prev, comb_mix_prev, r_acc_workspace);
+    fa<<<grid, block, fused_smem, stream>>>(m_u, desc_res, desc_x, desc_b, desc_res_out, desc_post, desc_comb,
+        post_mix_prev, comb_mix_prev, y_acc_workspace, r_acc_workspace);
 
     // ---- Step 2: big-fuse postlogue (RMS + sigmoid + Sinkhorn + pre-apply) ----
     // Delegate to mhcBigFuseLaunch (defined in mhcKernels.cu) to avoid
@@ -576,8 +609,8 @@ static constexpr uint32_t fhcAllInOneSmemSize()
     return fhcSmemSize();
 }
 
-using FusedAllInOneFn = void (*)(uint32_t, CUtensorMap, CUtensorMap, CUtensorMap, CUtensorMap, __nv_bfloat16 const*,
-    __nv_bfloat16*, float*, float*, int*, float const*, float const*, float const*, float const*, float*, float*,
+using FusedAllInOneFn = void (*)(uint32_t, CUtensorMap, CUtensorMap, CUtensorMap, CUtensorMap, CUtensorMap, CUtensorMap,
+    __nv_bfloat16 const*, __nv_bfloat16*, float*, float*, int*, float const*, float const*, float*, float*,
     __nv_bfloat16 const*, float, float, float, float, float, uint32_t);
 
 template <uint32_t Hidden, uint32_t KS, bool kFuseNorm>
@@ -619,8 +652,10 @@ static FusedAllInOneFn pickFhcAllInOne(uint32_t ks)
     case 16: return fhcAllInOneInstanceIfSupported<Hidden, 16, kFuseNorm>();
     case 28: return fhcAllInOneInstanceIfSupported<Hidden, 28, kFuseNorm>();
     case 32: return fhcAllInOneInstanceIfSupported<Hidden, 32, kFuseNorm>();
+    case 53: return fhcAllInOneInstanceIfSupported<Hidden, 53, kFuseNorm>();
     case 56: return fhcAllInOneInstanceIfSupported<Hidden, 56, kFuseNorm>();
     case 64: return fhcAllInOneInstanceIfSupported<Hidden, 64, kFuseNorm>();
+    case 106: return fhcAllInOneInstanceIfSupported<Hidden, 106, kFuseNorm>();
     case 112: return fhcAllInOneInstanceIfSupported<Hidden, 112, kFuseNorm>();
     default: TLLM_CHECK_WITH_INFO(false, "mhcFusedHcAllInOneLaunch: unsupported kNumSplits=%u", ks); return nullptr;
     }
@@ -647,6 +682,8 @@ static void mhcFusedHcAllInOneLaunchImpl(__nv_bfloat16 const* x_prev, __nv_bfloa
     constexpr uint32_t SHAPE_K = FHC_HC_MULT * Hidden;
 
     uint32_t const m_u = static_cast<uint32_t>(M);
+    int device_id = 0;
+    TLLM_CUDA_CHECK(cudaGetDevice(&device_id));
     uint32_t const ks = (num_k_splits > 0) ? static_cast<uint32_t>(num_k_splits) : 1u;
     uint32_t const m_tiles = (m_u + FHC_BLOCK_M - 1) / FHC_BLOCK_M;
 
@@ -663,19 +700,27 @@ static void mhcFusedHcAllInOneLaunchImpl(__nv_bfloat16 const* x_prev, __nv_bfloa
     // ---- Build TMA descriptors (cached by ptr+shape) ----
     CUtensorMap desc_res = getCachedTma2D(const_cast<__nv_bfloat16*>(residual_prev), CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
         SHAPE_K, m_u, FHC_BLOCK_K, FHC_BLOCK_M, static_cast<uint64_t>(SHAPE_K) * sizeof(__nv_bfloat16),
-        /*swizzleBytes=*/128, sizeof(__nv_bfloat16));
+        /*swizzleBytes=*/128, sizeof(__nv_bfloat16), device_id);
 
     CUtensorMap desc_x = getCachedTma2D(const_cast<__nv_bfloat16*>(x_prev), CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, Hidden,
         m_u, FHC_BLOCK_K, FHC_BLOCK_M, static_cast<uint64_t>(Hidden) * sizeof(__nv_bfloat16),
-        /*swizzleBytes=*/128, sizeof(__nv_bfloat16));
+        /*swizzleBytes=*/128, sizeof(__nv_bfloat16), device_id);
 
     CUtensorMap desc_b = getCachedTma2D(const_cast<float*>(w_t), CU_TENSOR_MAP_DATA_TYPE_TFLOAT32, SHAPE_K, FHC_SHAPE_N,
         FHC_BLOCK_K, FHC_BLOCK_N, static_cast<uint64_t>(SHAPE_K) * sizeof(float),
-        /*swizzleBytes=*/128, sizeof(float));
+        /*swizzleBytes=*/128, sizeof(float), device_id);
 
     CUtensorMap desc_res_out = getCachedTma2D(residual_cur, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, SHAPE_K, m_u, FHC_BLOCK_K,
         /*smemOuter=*/16, static_cast<uint64_t>(SHAPE_K) * sizeof(__nv_bfloat16),
-        /*swizzleBytes=*/128, sizeof(__nv_bfloat16));
+        /*swizzleBytes=*/128, sizeof(__nv_bfloat16), device_id);
+
+    CUtensorMap desc_post = getCachedTma2D(const_cast<float*>(post_mix_prev), CU_TENSOR_MAP_DATA_TYPE_FLOAT32,
+        FHC_HC_MULT, m_u, FHC_HC_MULT, FHC_BLOCK_M, static_cast<uint64_t>(FHC_HC_MULT) * sizeof(float),
+        /*swizzleBytes=*/0, sizeof(float), device_id);
+
+    CUtensorMap desc_comb = getCachedTma2D(const_cast<float*>(comb_mix_prev), CU_TENSOR_MAP_DATA_TYPE_FLOAT32,
+        FHC_HC_MULT * FHC_HC_MULT, m_u, FHC_HC_MULT * FHC_HC_MULT, FHC_BLOCK_M,
+        static_cast<uint64_t>(FHC_HC_MULT * FHC_HC_MULT) * sizeof(float), /*swizzleBytes=*/0, sizeof(float), device_id);
 
     // ---- Launch the single all-in-one kernel ----
     // Dispatch on `norm_weight != nullptr` to a kFuseNorm=true instance that
@@ -689,8 +734,8 @@ static void mhcFusedHcAllInOneLaunchImpl(__nv_bfloat16 const* x_prev, __nv_bfloa
 
     dim3 const grid(m_tiles * ks);
     dim3 const block(FHC_NUM_MMA_TH + FHC_NUM_PMAP_TH);
-    fa<<<grid, block, fused_smem, stream>>>(m_u, desc_res, desc_x, desc_b, desc_res_out, residual_cur, layer_input_cur,
-        y_acc_workspace, r_acc_workspace, done_counter_workspace, post_mix_prev, comb_mix_prev, hc_scale, hc_base,
+    fa<<<grid, block, fused_smem, stream>>>(m_u, desc_res, desc_x, desc_b, desc_res_out, desc_post, desc_comb,
+        residual_cur, layer_input_cur, y_acc_workspace, r_acc_workspace, done_counter_workspace, hc_scale, hc_base,
         post_mix_cur, comb_mix_cur, norm_weight, norm_eps, rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value,
         static_cast<uint32_t>(sinkhorn_repeat));
 }

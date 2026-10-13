@@ -49,6 +49,31 @@ _THOP_LITERALS: dict = {}
 class FallbackFmha(Fmha):
     """Fallback FMHA implementation using the fused TRT-LLM thop attention op."""
 
+    def is_supported(
+        self,
+        q: torch.Tensor,
+        k: Optional[torch.Tensor],
+        v: Optional[torch.Tensor],
+        metadata: "TrtllmAttentionMetadata",
+        forward_args: AttentionForwardArgs,
+    ) -> bool:
+        # Helix speculative verify groups carry per-token KV ownership (a
+        # group may straddle a page boundary onto two CP ranks) that the
+        # fused thop attention path cannot express: its spec-dec mask and the
+        # per-sequence helix_is_inactive_rank gate both assume the group's
+        # new KV entries are the trailing slots of one rank's kv_len. Running
+        # it would be silently wrong, so reject — with no remaining FMHA
+        # library, dispatch raises loudly instead.
+        if (
+            metadata.helix_position_offsets is not None
+            and getattr(metadata, "_helix_spec_tokens_valid", False)
+            and metadata.num_generations > 0
+            and q.shape[0] > metadata.num_seqs
+        ):
+            return False
+        attn = self.attn
+        return not attn.uses_fp4_mla_attention
+
     def forward(
         self,
         q: torch.Tensor,
@@ -58,7 +83,6 @@ class FallbackFmha(Fmha):
         forward_args: AttentionForwardArgs,
     ) -> None:
         attn = self.attn
-
         # Every kwarg sources from ``attn`` / ``metadata`` / ``forward_args``
         # (with ``forward_args.sparse_runtime_params`` for sparse inputs),
         # or a literal allowlisted in ``_THOP_LITERALS``.
@@ -171,6 +195,7 @@ class FallbackFmha(Fmha):
             v_head_dim=attn.v_head_dim,
             rope_append=attn.rope_append,
             attention_chunk_size=attn.attention_chunk_size,
+            uses_spcompress=forward_args.sparse_runtime_params.uses_spcompress,
             skip_softmax_stat=attn.skip_softmax_stat,
             # --- Sparse runtime parameters ---
             sparse_kv_indices=forward_args.sparse_runtime_params.sparse_kv_indices,

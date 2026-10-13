@@ -47,6 +47,7 @@ try:
 except ImportError:
     logger = logging.getLogger(__name__)
 
+from . import fabric_gather
 from .specs import PeerRanges, lookup_owner
 from .weight_buffer import WeightBuffer
 
@@ -57,6 +58,15 @@ from .weight_buffer import WeightBuffer
 # single-link contention.  Ported from the IPC-era DWDP contention
 # optimization (PR #12974) to the VA-based pipeline.
 MEMCPY_BATCH_SLICE_BYTES = 1 << 21
+
+# One ``cudaMemcpyBatchAsync`` batch: parallel destination-pointer,
+# source-pointer and size lists, always of equal length.
+_CopyBatch = Tuple[List[int], List[int], List[int]]
+
+# Launch arguments for one layer's ``trtllm::dwdp_fabric_gather``: device-resident
+# destination, source, 16-byte-line-count and group-boundary tensors, plus the
+# number of blocks each group gets.
+_GatherPlan = Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int]
 
 
 class DWDPWeightManager:
@@ -88,6 +98,8 @@ class DWDPWeightManager:
         "_transport",
         "_use_batched_prefetch",
         "_batched_copy_plans",
+        "_use_gather",
+        "_gather_plans",
     )
 
     def __init__(
@@ -180,14 +192,31 @@ class DWDPWeightManager:
         # src_ptrs, sizes)`` tuple per layer to avoid host-side rebuild on
         # every prefetch.
         self._use_batched_prefetch = contention_opt
-        self._batched_copy_plans: Dict[int, Tuple[List[int], List[int], List[int]]] = {}
+        self._batched_copy_plans: Dict[int, _CopyBatch] = {}
+
+        # SM gather: the same per-peer plan, pulled by a kernel instead of the copy
+        # engine (see ``fabric_gather``).  Opt-in; off if the op is not registered.
+        # Layers whose descriptors are not 16-byte aligned cache None and fall back
+        # to the copy engine.
+        self._use_gather = fabric_gather.is_enabled() and fabric_gather.gather_op() is not None
+        if self._use_gather:
+            # Reserve the gather's SMs in the persistent CuTeDSL grids and pin the
+            # dense GEMM to the CLC scheduler unless the user set them explicitly.
+            fabric_gather.apply_compute_side_defaults()
+        if fabric_gather.is_enabled() and not self._use_gather:
+            logger.warning(
+                "[DWDPWeightManager] Fabric gather requested but trtllm::dwdp_fabric_gather is "
+                "not registered; falling back to the copy-engine prefetch"
+            )
+        self._gather_plans: Dict[int, Optional[_GatherPlan]] = {}
 
         logger.info(
             f"[DWDPWeightManager] Initialized: rank={dwdp_rank}/{dwdp_size}, "
             f"moe_layers={len(self._moe_layer_indices)}, "
             f"weights={self._weight_names}, "
             f"experts_per_rank={self._experts_per_rank}, "
-            f"contention_opt={contention_opt}"
+            f"contention_opt={contention_opt}, "
+            f"gather={self._use_gather}"
         )
 
     @property
@@ -257,12 +286,11 @@ class DWDPWeightManager:
         remote slices. Finally, records a prefetch_event so the compute stream
         can wait for the copy to complete.
 
-        Two implementations dispatch on ``self._use_batched_prefetch`` (set
-        from ``DwdpConfig.contention_opt``): the default per-slice path
-        issues one ``torch.Tensor.copy_`` per peer chunk, while the batched
-        path collapses all chunks into a single ``cudaMemcpyBatchAsync``
-        call whose sub-slices round-robin across peers in 2 MiB chunks to
-        limit single-NVLink-link contention.
+        Three transports share the per-peer plan: the default per-slice path
+        (one ``torch.Tensor.copy_`` per chunk), ``DwdpConfig.contention_opt``
+        (one ``cudaMemcpyBatchAsync`` per layer, 2 MiB sub-slices interleaved
+        across peers to limit single-link contention) and
+        ``TRTLLM_DWDP_PREFETCH_GATHER`` (one SM kernel per layer; see ``fabric_gather``).
 
         This method returns immediately — all GPU work is enqueued on
         copy_stream and does not block the CPU.
@@ -285,7 +313,9 @@ class DWDPWeightManager:
             # before overwriting it with new P2P data.
             self._copy_stream.wait_event(self._consume_events[buf_idx])
 
-            if self._use_batched_prefetch:
+            if self._use_gather:
+                self._prefetch_layer_gather(layer_idx)
+            elif self._use_batched_prefetch:
                 self._prefetch_layer_batched(layer_idx)
             else:
                 self._prefetch_layer_per_slice(layer_idx)
@@ -329,22 +359,11 @@ class DWDPWeightManager:
                     dst_offset += n
                     cursor = chunk_end
 
-    def _build_batched_prefetch_copy_plan(
-        self, layer_idx: int
-    ) -> Tuple[List[int], List[int], List[int]]:
-        """Build a per-layer ``cudaMemcpyBatchAsync`` plan.
-
-        Strategy: collect every ``(dst_ptr, src_ptr, size_bytes)`` triple
-        from the same per-slice / per-peer walk used by
-        ``_prefetch_layer_per_slice``, then split each peer's contiguous
-        chunks into ``MEMCPY_BATCH_SLICE_BYTES`` (2 MiB) sub-slices and
-        interleave them across peers in round-robin order.  Interleaving
-        is what limits single-NVLink-link contention — at any moment the
-        in-flight memcpys touch every peer link rather than saturating one.
+    def _build_peer_descriptor_groups(self, layer_idx: int) -> List[List[Tuple[int, int, int]]]:
+        """Build a per-layer copy plan, grouped by peer.
 
         Returns:
-            Three parallel lists ``(dst_ptrs, src_ptrs, sizes)`` of the
-            same length, suitable for ``cudaMemcpyBatchAsync``.
+            Coalesced ``(dst_ptr, src_ptr, size_bytes)`` descriptors per non-empty peer, ascending.
         """
         # Step 1: collect per-peer ``(dst_ptr, src_ptr, total_size)`` triples.
         peer_triples: Dict[int, List[Tuple[int, int, int]]] = {}
@@ -373,25 +392,55 @@ class DWDPWeightManager:
                     dst_offset += n
                     cursor = chunk_end
 
-        # Step 2: split each per-peer triple into 2 MiB sub-slices.
-        peer_subslices: Dict[int, List[Tuple[int, int, int]]] = {}
+        # Step 2: merge triples adjacent in both address spaces (only fragmented
+        # remote slices produce more than one triple per peer and weight).
+        coalesced: Dict[int, List[Tuple[int, int, int]]] = {}
         for peer, triples in peer_triples.items():
+            merged: List[Tuple[int, int, int]] = []
+            for dst_ptr, src_ptr, size in sorted(triples, key=lambda t: (t[0], t[1])):
+                if merged:
+                    prev_dst, prev_src, prev_size = merged[-1]
+                    if prev_dst + prev_size == dst_ptr and prev_src + prev_size == src_ptr:
+                        merged[-1] = (prev_dst, prev_src, prev_size + size)
+                        continue
+                merged.append((dst_ptr, src_ptr, size))
+            coalesced[peer] = merged
+
+        # Step 3: one descriptor group per peer, peers ascending.
+        return [coalesced[peer] for peer in sorted(coalesced) if coalesced[peer]]
+
+    def _build_batched_prefetch_copy_plan(self, layer_idx: int) -> _CopyBatch:
+        """Build a per-layer ``cudaMemcpyBatchAsync`` plan.
+
+        Strategy: take the per-peer descriptor groups, split each peer's
+        contiguous chunks into ``MEMCPY_BATCH_SLICE_BYTES`` (2 MiB) sub-slices
+        and interleave them across peers in round-robin order.  Interleaving
+        is what limits single-NVLink-link contention — at any moment the
+        in-flight memcpys touch every peer link rather than saturating one.
+
+        Returns:
+            Three parallel lists ``(dst_ptrs, src_ptrs, sizes)`` of the
+            same length, suitable for ``cudaMemcpyBatchAsync``.
+        """
+        # Step 1: split each peer's descriptors into 2 MiB sub-slices.
+        peer_subslices: List[List[Tuple[int, int, int]]] = []
+        for group in self._build_peer_descriptor_groups(layer_idx):
             sub_list: List[Tuple[int, int, int]] = []
-            for dst_ptr, src_ptr, total in triples:
+            for dst_ptr, src_ptr, total in group:
                 offset = 0
                 while offset < total:
                     sz = min(MEMCPY_BATCH_SLICE_BYTES, total - offset)
                     sub_list.append((dst_ptr + offset, src_ptr + offset, sz))
                     offset += sz
-            peer_subslices[peer] = sub_list
+            peer_subslices.append(sub_list)
 
-        # Step 3: round-robin across peers.  At each round, take the next
+        # Step 2: round-robin across peers.  At each round, take the next
         # sub-slice from every peer that still has one, then advance.
         # Peers naturally drop out as their sub-slice lists exhaust.
         dst_ptrs: List[int] = []
         src_ptrs: List[int] = []
         sizes: List[int] = []
-        cursors = {peer: 0 for peer in peer_subslices}
+        cursors = {peer: 0 for peer in range(len(peer_subslices))}
         while cursors:
             for peer in list(cursors):
                 idx = cursors[peer]
@@ -438,6 +487,35 @@ class DWDPWeightManager:
                 f"cudaMemcpyBatchAsync failed for DWDP prefetch (layer="
                 f"{layer_idx}, copies={len(dst_ptrs)}): {err}"
             )
+
+    def _build_gather_plan(self, layer_idx: int) -> Optional[_GatherPlan]:
+        """Build the gather launch arguments, or None if the layer is empty or not 16-byte aligned."""
+        groups = self._build_peer_descriptor_groups(layer_idx)
+        if not groups:
+            return None
+        return fabric_gather.build_plan(groups, self._copy_stream.device)
+
+    def _prefetch_layer_gather(self, layer_idx: int) -> None:
+        """SM-gather prefetch: one kernel per layer; misaligned layers fall back to the copy engine."""
+        if layer_idx in self._gather_plans:
+            plan = self._gather_plans[layer_idx]
+        else:
+            plan = self._build_gather_plan(layer_idx)
+            self._gather_plans[layer_idx] = plan
+            if plan is None:
+                logger.warning(
+                    f"[DWDPWeightManager] Layer {layer_idx} is not 16-byte aligned; "
+                    f"using the copy-engine prefetch for it"
+                )
+
+        if plan is None:
+            self._prefetch_layer_batched(layer_idx)
+            return
+
+        dst_ptrs, src_ptrs, lines, row_starts, blocks = plan
+        fabric_gather.gather_op()(
+            dst_ptrs, src_ptrs, lines, row_starts, blocks, fabric_gather.THREADS
+        )
 
     def wait_and_bind(self, backend_module: torch.nn.Module, layer_idx: int) -> None:
         """Wait for prefetch completion and bind weight tensors to the module.

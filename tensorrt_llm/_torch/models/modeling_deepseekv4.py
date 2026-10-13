@@ -45,6 +45,7 @@ from transformers import PretrainedConfig
 
 import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 from tensorrt_llm._ipc_utils import can_access_peer
+from tensorrt_llm._torch.models.checkpoints.base_weight_loader import ConsumableWeightsDict
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.functional import PositionEmbeddingType, RotaryScalingType
 from tensorrt_llm.mapping import Mapping
@@ -61,6 +62,7 @@ from ..distributed import (
     MoEAllReduceParams,
     allgather,
 )
+from ..mmap_utils import pageout_file_backed_regions
 from ..model_config import ModelConfig
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
@@ -575,11 +577,12 @@ class DeepseekV4WeightLoader:
         # presence of any top-level "layers." key; HF-style checkpoints use
         # "model.layers." and skip this branch.
         if any(k == "embed.weight" or k.startswith("layers.") for k in weights):
-            weights = _remap_deepseek_v4_checkpoint_keys(
+            remapped_weights = _remap_deepseek_v4_checkpoint_keys(
                 weights,
                 num_hidden_layers=self.config.num_hidden_layers,
                 kv_lora_rank=self.config.kv_lora_rank,
             )
+            weights = ConsumableWeightsDict.take_ownership(weights, remapped_weights)
             # Synthesize defaults (with correct shape pulled from the model)
             # for parameters the model has but the V4 checkpoint omits. We do
             # this in one place vs scattering zero-fills through the per-
@@ -777,8 +780,8 @@ class DeepseekV4WeightLoader:
                 if o_a_proj_scale is not None:
                     o_a_proj_scale = split_matrix_tp(o_a_proj_scale, tp_size, tp_rank, 0)
 
-            # Skip the BF16 dequant when the destination is FP8 (the cute_dsl
-            # FP8 BMM path on SM100 consumes the native FP8 weight directly).
+            # Skip BF16 dequant when the architecture-specific CuTe DSL BMM
+            # consumes the native FP8 weight directly.
             if o_a_proj_scale is not None and module.o_a_proj.dtype != torch.float8_e4m3fn:
                 o_a_proj = weight_dequant(
                     o_a_proj.reshape(-1, o_a_proj.shape[-1]).contiguous().cuda(),
@@ -836,6 +839,21 @@ class DeepseekV4WeightLoader:
         params_map = {"gate_up_proj": ["gate_proj", "up_proj"]}
         all_named_modules = dict(self.model.named_modules())
 
+        can_mark_consumed = isinstance(weights, ConsumableWeightsDict)
+        ckpt_num_nextn_predict_layers = getattr(
+            self.config, "_ckpt_num_nextn_predict_layers", None
+        ) or getattr(self.config, "num_nextn_predict_layers", None)
+        model_nextn_predict_layers = getattr(self.config, "num_nextn_predict_layers", None) or 0
+        has_shared_mtp_weights = (
+            model_nextn_predict_layers > (ckpt_num_nextn_predict_layers or 0) > 0
+        )
+        pageout_eplb_weights = getattr(self.model_config, "moe_load_balancer", None) is not None
+
+        def pageout_previous_moe_layer() -> None:
+            """Release file-backed pages after the previous MoE layer load."""
+            torch.cuda.synchronize()
+            pageout_file_backed_regions(".safetensors", mode="dontneed")
+
         def load_flat_hc_weights(module, names: List[str]) -> bool:
             """Load mHC / HCHead from flat ckpt keys: ``<stem>_{fn,base,scale}``.
 
@@ -860,6 +878,12 @@ class DeepseekV4WeightLoader:
         for name, module in tqdm(all_named_modules.items(), desc="Loading weights"):
             if name.startswith("draft_model"):
                 continue
+            if pageout_eplb_weights and name.endswith("experts.backend"):
+                # Static EPLB permutes experts across the checkpoint, causing
+                # every EP rank to fault pages from many safetensors shards.
+                # Bound the resident file cache at one MoE layer instead of
+                # allowing it to accumulate for the entire checkpoint.
+                pageout_previous_moe_layer()
             names = name.split(".")
             parent_module_name = ".".join(names[:-1])
 
@@ -879,13 +903,16 @@ class DeepseekV4WeightLoader:
             elif any(skip_module in name for skip_module in skip_modules):
                 continue
             else:
+                is_shared_mtp_layer = False
                 if "model.layers" in name and int(names[2]) >= self.config.num_hidden_layers:
+                    is_shared_mtp_layer = has_shared_mtp_weights
                     mtp_layer_idx = int(names[2]) - self.config.num_hidden_layers
                     names[2] = str(
                         mtp_layer_idx % self.config.num_nextn_predict_layers
                         + self.config.num_hidden_layers
                     )
                     name = ".".join(names)
+                mark_consumed = can_mark_consumed and not is_shared_mtp_layer
                 if names[-1] == "kv_b_proj":
                     # TODO: remove weight_dequant after enabling fp8_bmm
                     dequant_kv_b_proj = (
@@ -945,6 +972,8 @@ class DeepseekV4WeightLoader:
                                 .view(*attn_module.v_b_proj_dequant.shape)
                                 .to(attn_module.v_b_proj_dequant.dtype)
                             )
+                    if mark_consumed:
+                        weights.mark_consumed(name)
                 elif names[-1] == "kv_a_proj_with_mqa":
                     nvfp4_fused_a = (
                         self.model_config.get_quant_config().layer_quant_mode.has_nvfp4()
@@ -1077,6 +1106,11 @@ class DeepseekV4WeightLoader:
                         # For DeepseekV32: kv_a_proj_with_mqa is oversized
                         # to include indexer k weights, which is filled in post_load_weights.
                         module.weight.data[0 : fused_a.shape[0]].copy_(fused_a)
+                    if mark_consumed:
+                        parent_prefix = ".".join(names[:-1])
+                        weights.mark_consumed(f"{parent_prefix}.kv_a_proj_with_mqa")
+                        if not is_lite:
+                            weights.mark_consumed(f"{parent_prefix}.q_a_proj")
                 elif names[-1] in params_map:
                     module_weights = []
                     for new_name in params_map[names[-1]]:
@@ -1084,6 +1118,9 @@ class DeepseekV4WeightLoader:
                             filter_weights(".".join(names[:-1] + [new_name]), weights)
                         )
                     module.load_weights(weights=module_weights)
+                    if mark_consumed:
+                        for src_name in params_map[names[-1]]:
+                            weights.mark_consumed(".".join(names[:-1] + [src_name]))
                 elif names[-1] == "experts":
                     module_weights = filter_weights(name, weights)
                     module_weights = rename_moe_weight(
@@ -1095,6 +1132,8 @@ class DeepseekV4WeightLoader:
                         },
                     )
                     module.load_weights(weights=[module_weights])
+                    if mark_consumed:
+                        weights.mark_consumed(name)
                 elif names[-1] == "backend" and is_moe_weight_owner(module):
                     # Special case: ConfigurableMoE.backend (TRTLLMGenFusedMoE)
                     # Currently saved MoE weights don't include 'backend' in their names.
@@ -1113,6 +1152,8 @@ class DeepseekV4WeightLoader:
                         },
                     )
                     module.load_weights(weights=[module_weights])
+                    if mark_consumed:
+                        weights.mark_consumed(parent_name)
                 elif names[-1] == "self_attn":
                     if f"{name}.o_a_proj" in weights:
                         load_o_a_proj(name, module)
@@ -1362,6 +1403,7 @@ class DeepseekV4Attention(MLA):
             o_lora_rank=config.o_lora_rank,
             mapping_with_cp=mapping_with_cp,
             reduce_output=reduce_output,
+            enable_ugpu_bf16_linear=True,
         )
 
 
@@ -1597,6 +1639,7 @@ class DeepseekV4MoE(nn.Module):
             config=model_config,
             overridden_tp_size=shared_tp_size,
             reduce_output=False,
+            use_cute_dsl_blockscaling_mm=model_config.use_cute_dsl_blockscaling_mm,
             swiglu_limit=swiglu_limit,
         )
 
@@ -2265,6 +2308,7 @@ class DeepseekV4MTP(DeepseekV4DecoderLayer):
                 dtype=config.torch_dtype,
                 quant_config=model_config.get_quant_config(),
                 skip_create_weights_in_init=model_config.skip_create_weights_in_init,
+                use_cute_dsl_blockscaling_mm=model_config.use_cute_dsl_blockscaling_mm,
             )
             self.h_proj = Linear(
                 config.hidden_size,
@@ -2273,6 +2317,7 @@ class DeepseekV4MTP(DeepseekV4DecoderLayer):
                 dtype=config.torch_dtype,
                 quant_config=model_config.get_quant_config(),
                 skip_create_weights_in_init=model_config.skip_create_weights_in_init,
+                use_cute_dsl_blockscaling_mm=model_config.use_cute_dsl_blockscaling_mm,
             )
         else:
             self.e_proj = Linear(
@@ -2285,6 +2330,7 @@ class DeepseekV4MTP(DeepseekV4DecoderLayer):
                 reduce_output=True,
                 quant_config=model_config.get_quant_config(),
                 skip_create_weights_in_init=model_config.skip_create_weights_in_init,
+                use_cute_dsl_blockscaling_mm=model_config.use_cute_dsl_blockscaling_mm,
             )
             self.h_proj = Linear(
                 config.hidden_size,
@@ -2296,6 +2342,7 @@ class DeepseekV4MTP(DeepseekV4DecoderLayer):
                 reduce_output=True,
                 quant_config=model_config.get_quant_config(),
                 skip_create_weights_in_init=model_config.skip_create_weights_in_init,
+                use_cute_dsl_blockscaling_mm=model_config.use_cute_dsl_blockscaling_mm,
             )
 
         self.shared_head = DeepseekV4MTPHead(model_config)
@@ -2550,7 +2597,8 @@ class DeepseekV4ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV4Model, Pretrai
             "kv_cache_config": {
                 "tokens_per_block": 128,
                 "enable_swa_scratch_reuse": True,
-            }
+            },
+            "use_cute_dsl_blockscaling_mm": get_sm_version() == 107,
         }
 
     @classmethod

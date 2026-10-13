@@ -63,6 +63,7 @@ X86_64_DOCKER_IMAGE = LLM_DOCKER_IMAGE.replace("aarch64", "x86_64").replace("sbs
 LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE = env.wheelDockerImagePy310
 LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE = env.wheelDockerImagePy312
 LLM_WHEEL_DOCKER_IMAGE = env.wheelDockerImage
+LLM_RUBIN_DOCKER_IMAGE = env.rubinDockerImage
 
 // K8s secret in namespace sw-tensorrt for pulling from artifactory.nvidia.com
 ARTIFACTORY_IMAGE_PULL_SECRET = "trtllm-artifactory"
@@ -71,10 +72,9 @@ ARTIFACTORY_DOCKER_HOST = "artifactory.nvidia.com"
 ARTIFACTORY_CREDENTIALS_ID = "trtllm-artifactory-credentials"
 
 // DLFW torch image
-DLFW_IMAGE = "urm.nvidia.com/docker/nvidia/pytorch:26.05-py3"
+DLFW_IMAGE = "urm.nvidia.com/docker/nvidia/pytorch:26.08-py3"
 
 MODEL_EXPRESS_VERSION = "0.4.1"
-MODEL_EXPRESS_NIXL_VERSION = "1.3.1"
 MODEL_EXPRESS_SERVER_IMAGE = "urm.nvidia.com/docker/nvidia/ai-dynamo/modelexpress-server:${MODEL_EXPRESS_VERSION}"
 MODEL_EXPRESS_REDIS_IMAGE = "urm.nvidia.com/docker/redis:7-alpine"
 
@@ -103,12 +103,20 @@ def LLVM_CONFIG = "LLVM"
 def LINUX_AARCH64_CONFIG = "linux_aarch64"
 
 @Field
+def RUBIN_BRINGUP_CUDA13_4_CONFIG = "RubinBringupCUDA13_4"
+
+@Field
+def RUBIN_BRINGUP_CUDA13_4_AARCH64_CONFIG = "RubinBringupCUDA13_4_aarch64"
+
+@Field
 def BUILD_CONFIGS = [
   // Vanilla TARNAME is used for packaging in runLLMPackage
   (VANILLA_CONFIG) : [(TARNAME) : "TensorRT-LLM.tar.gz"],
   (SINGLE_DEVICE_CONFIG) : [(TARNAME) : "single-device-TensorRT-LLM.tar.gz"],
   (LLVM_CONFIG) : [(TARNAME) : "llvm-TensorRT-LLM.tar.gz"],
   (LINUX_AARCH64_CONFIG) : [(TARNAME) : "TensorRT-LLM-GH200.tar.gz"],
+  (RUBIN_BRINGUP_CUDA13_4_CONFIG) : [(TARNAME) : "RubinBringup-TensorRT-LLM-CUDA13.4.tar.gz"],
+  (RUBIN_BRINGUP_CUDA13_4_AARCH64_CONFIG) : [(TARNAME) : "RubinBringup-TensorRT-LLM-VR200-CUDA13.4.tar.gz"],
 ]
 
 // TODO: Move common variables to an unified location
@@ -139,7 +147,7 @@ RELEASE_SCRIPT_COMMIT = env.releaseScriptCommit ? env.releaseScriptCommit.trim()
 REQUIRED_OPEN_DRIVER_TYPES = ["b100-ts2", "rtx-5080", "rtx-5090", "rtx-pro-6000", "rtx-pro-6000d"]
 
 // GPU types that don't support dynamic driver flashing
-REQUIRED_NO_DRIVER_TYPES = ["dgx-h100", "dgx-h200", "gh200", "gb10x"]
+REQUIRED_NO_DRIVER_TYPES = ["dgx-h100", "dgx-h200", "gh200", "gb10x", "gr100-ts1"]
 
 // Maximum SLURM infra-failure retries (total attempts = SLURM_INFRA_RETRY_MAX + 1).
 // Recognised failure patterns are tagged with scope=SLURM or BOTH in the
@@ -1065,6 +1073,7 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
 
     def slurmJobID = null
     def dockerArgs = null
+    def dockerImage = stageName.contains("VR200-PyTorch-Post-Merge-1") ? LLM_RUBIN_DOCKER_IMAGE : X86_64_DOCKER_IMAGE
 
     try {
         // Run ssh command to start node in desired cluster via SLURM
@@ -1115,11 +1124,12 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
                     }
                 }
 
-                def mounts = getMountListForSlurmTest(cluster, false).join(",")
-                def imageForSlurm = LLM_DOCKER_IMAGE
+                def mounts = getMountListForSlurmTest(cluster, false, stageName).join(",")
+                def imageForSlurm = dockerImage
                 if (cluster.containerRuntime.toString() == "ENROOT") {
-                    imageForSlurm = LLM_DOCKER_IMAGE
+                    imageForSlurm = dockerImage
                         .replace("${ARTIFACTORY_DOCKER_HOST}/", "${ARTIFACTORY_DOCKER_HOST}#")
+                        .replace("urm.nvidia.com/", "urm.nvidia.com#")
                 }
                 def slurmCommand = SlurmConfig.generateCommand(cluster, partition, nodeSecret, nodeName, Jenkins.instance.rootUrl, imageForSlurm, mounts)
                 def clusterExcludes = placementContext?.excludedSlurmNodeListsByCluster?.get(partition.clusterName)
@@ -1325,7 +1335,9 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
                                 dockerArgs += " --device=/dev/gdrdrv:/dev/gdrdrv"
                             }
                         }
-                        if (fileExists('/home/scratch.trt_llm_data_ci')) {
+                        if (stageName.contains("VR200") && fileExists('/mnt/cifs/home/scratch.trt_llm_data')) {
+                            dockerArgs += " -v /mnt/cifs/home/scratch.trt_llm_data:/scratch.trt_llm_data:ro "
+                        } else if (fileExists('/home/scratch.trt_llm_data_ci')) {
                             dockerArgs += " -v /home/scratch.trt_llm_data_ci:/scratch.trt_llm_data:ro "
                         } else if (fileExists('/home/scratch.trt_llm_data')) {
                             dockerArgs += " -v /home/scratch.trt_llm_data:/scratch.trt_llm_data:ro "
@@ -1368,7 +1380,7 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
         echo "${stageName} Slurm partition timeout: ${partition.time}"
         def partitionTimeout = partition?.time ? partition.time : SlurmConfig.DEFAULT_TIMEOUT_SHORT
         if (cluster.containerRuntime.toString() == "DOCKER") {
-            slurmRunner = runInDockerOnNodeMultiStage(LLM_DOCKER_IMAGE, nodeName, dockerArgs, partitionTimeout, true)
+            slurmRunner = runInDockerOnNodeMultiStage(dockerImage, nodeName, dockerArgs, partitionTimeout, true)
         } else if (cluster.containerRuntime.toString() == "ENROOT") {
             slurmRunner = runInEnrootOnNode(nodeName, partitionTimeout)
         } else {
@@ -1625,7 +1637,7 @@ def getPytestBaseCommandLine(
     return testCmdLine as String[]
 }
 
-def getMountListForSlurmTest(SlurmCluster cluster, boolean useSbatch = false)
+def getMountListForSlurmTest(SlurmCluster cluster, boolean useSbatch = false, String stageName = "")
 {
     def mounts = []
 
@@ -1902,12 +1914,13 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 ).join(" ")
 
                 // Generate Job Launch Script
-                def container = LLM_DOCKER_IMAGE
+                def container = stageName.contains("VR200-PyTorch-Post-Merge-1") ? LLM_RUBIN_DOCKER_IMAGE : X86_64_DOCKER_IMAGE
                 if (cluster.containerRuntime.toString() == "ENROOT") {
-                    container = LLM_DOCKER_IMAGE
+                    container = container
                         .replace("${ARTIFACTORY_DOCKER_HOST}/", "${ARTIFACTORY_DOCKER_HOST}#")
+                        .replace("urm.nvidia.com/", "urm.nvidia.com#")
                 }
-                def mounts = getMountListForSlurmTest(cluster, true).join(",")
+                def mounts = getMountListForSlurmTest(cluster, true, stageName).join(",")
                 String[] taskArgs = getNodeArgs(nodeCount, gpuCount, disaggMultiNodeMode)
                 if (taskArgs == null) {
                     error "Invalid Slurm test stage name is set"
@@ -3125,6 +3138,9 @@ def getStartingPortForHost(String hostNodeName, String stageName = "") {
  * Gets the HOST_NODE_NAME from the current environment.
  * Falls back to hostname if HOST_NODE_NAME is not set.
  *
+ * The name must stay distinct per pod: getStartingPortForHost() hands out a
+ * private port section per name.
+ *
  * @return The host node name
  */
 def getHostNodeName() {
@@ -3748,7 +3764,7 @@ def launchTestListCheck(pipeline)
             def llmPath = sh (script: "realpath .", returnStdout: true).trim()
             def llmSrc = "${llmPath}/TensorRT-LLM/src"
             trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install -r ${llmSrc}/requirements-dev.txt")
-            sh "NVIDIA_TRITON_SERVER_VERSION=26.05 LLM_ROOT=${llmSrc} LLM_BACKEND_ROOT=${llmSrc}/triton_backend python3 ${llmSrc}/scripts/check_test_list.py --l0 --qa --waive"
+            sh "NVIDIA_TRITON_SERVER_VERSION=26.08 LLM_ROOT=${llmSrc} LLM_BACKEND_ROOT=${llmSrc}/triton_backend python3 ${llmSrc}/scripts/check_test_list.py --l0 --qa --waive"
         } catch (InterruptedException e) {
             throw e
         } catch (Exception e) {
@@ -4567,6 +4583,8 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         // setup HF_HOME to cache model and datasets
         // init the huggingface cache from nfs, since the nfs is read-only, and HF_HOME needs to be writable, otherwise it will fail at creating file lock
         sh "mkdir -p ${HF_HOME} && ls -alh ${HF_HOME}"
+        // ensure rsync is available, some container images don't ship it by default
+        trtllm_utils.llmExecStepWithRetry(pipeline, script: "command -v rsync || (apt-get update && apt-get install -y rsync)")
         trtllm_utils.llmExecStepWithRetry(pipeline, script: "rsync -r ${MODEL_CACHE_DIR}/hugging-face-cache/ ${HF_HOME}/ && ls -lh ${HF_HOME}")
         sh "df -h"
 
@@ -4589,6 +4607,17 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
             if (env.alternativeTRT) {
                 sh "cd ${llmSrc} && sed -i 's#tensorrt~=.*\$#tensorrt#g' requirements.txt && cat requirements.txt"
             }
+            // Preserve the internal Cutlass DSL overlay when the base image provides it.
+            // Removing the shared namespace replaces its patched compiler files with the
+            // public package and breaks FlashInfer CuTe RMSNorm on SM107.
+            trtllm_utils.llmExecStepWithRetry(pipeline, script: '''
+                if python3 -m pip show nvidia-cutlass-dsl-internal >/dev/null 2>&1; then
+                    echo "Preserving the base image's nvidia-cutlass-dsl-internal overlay"
+                else
+                    pip3 uninstall -y nvidia-cutlass-dsl nvidia-cutlass-dsl-libs-base || true
+                    rm -rf $(python3 -c "import site; print(site.getsitepackages()[0])")/nvidia_cutlass_dsl*
+                fi
+            ''')
             trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmSrc} && pip3 install -r requirements-dev.txt")
             // Gateway adapters are opt-in extras excluded from requirements.txt;
             // each gateway declares its pins in a dedicated
@@ -4607,22 +4636,29 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
             trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install opencv-python-headless")
             if (stageName.contains("-Ray-")) {
                 trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install ray[default]==2.55.1")
-                trtllm_utils.llmExecStepWithRetry(pipeline, script: """
-                    mambaArch=\$(uname -m)
-                    pip3 install --no-deps \
-                        "https://github.com/Dao-AILab/causal-conv1d/releases/download/v1.6.2/causal_conv1d-1.6.1%2Bcu13torch26.04cxx11abiTRUE-cp312-cp312-linux_\${mambaArch}.whl" \
-                        "https://github.com/state-spaces/mamba/releases/download/v2.3.0/mamba_ssm-2.3.0%2Bcu13torch26.01cxx11abiTRUE-cp312-cp312-linux_\${mambaArch}.whl"
-                """)
+                // TODO(dlfw-26.08): reinstate causal-conv1d and mamba-ssm once
+                // upstream publishes wheels built against this base image's torch.
+                // They used to be installed here, from
+                //   causal-conv1d v1.6.2  causal_conv1d-1.6.1+cu13torch26.04cxx11abiTRUE
+                //   mamba v2.3.0          mamba_ssm-2.3.0+cu13torch26.01cxx11abiTRUE
+                // but the newest builds upstream offers target torch 26.07 and 26.04,
+                // so on DLFW 26.08 the extension loads with an undefined c10 symbol,
+                // materialize_cow_storage(StorageImpl&). A broken install is worse
+                // than none: transformers gates its causal_conv1d import on a
+                // package-metadata probe, which a broken install still passes, so
+                // modeling_qwen3_5_moe raises at import and every test collected from
+                // a module that imports it dies as a collection error. Absent, the
+                // gate says no and the model falls back to its Python path -- slower,
+                // and it OOMs on Nemotron-H, which is why
+                // test_llm_update_weights_nemotron_h is waived under nvbugs/6729495.
             }
             if (!skipInstallWheel) {
                 trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmPath} && pip3 install --force-reinstall --no-deps TensorRT-LLM/tensorrt_llm-*.whl")
             }
             if (stageName.contains("-ModelExpress-")) {
+                // The wheel goes in with --no-deps above, so its `mx` extra never
+                // applies. nixl comes from the image (install_nixl.sh).
                 trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install modelexpress==${MODEL_EXPRESS_VERSION}")
-                // ModelExpress 0.4.1 imports nixl._api, while requirements-dev.txt
-                // installs only the nixl-cu13 backend. Install the matching
-                // namespace shim without pulling the unused CUDA 12 backend.
-                trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install --no-deps nixl==${MODEL_EXPRESS_NIXL_VERSION}")
             }
         }
 
@@ -4939,7 +4975,20 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
 def runLLMTestlistOnPlatform(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, skipInstallWheel=false, cpver="cp312", postTag="", boolean isFinalAttempt=true, Map retryContext=null, boolean useClusterDurations=false)
 {
     cacheErrorAndUploadResult(stageName, {
-        runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, skipInstallWheel, cpver, postTag, useClusterDurations)
+        // PMIx builds a singleton ID, singleton.{hostname}.{pid}, that must fit a
+        // 50-byte buffer; our 63-character pod names overflow it and every
+        // MpiPoolSession spawn fails. PMIX_HOSTNAME replaces only the name PMIx
+        // sees, so the pod keeps its own for logging and for port sectioning in
+        // getHostNodeName(). Kept out of runLLMTestlistOnPlatformImpl: the SLURM
+        // path runs that on the compute node, where one shared name would break
+        // locality. The ALLOW_RUN_AS_ROOT pair now comes from the image
+        // (Dockerfile.multi); only the bare-metal sanity stages still set it.
+        def testEnv = [
+            "PMIX_HOSTNAME=mpi-node0",
+        ]
+        withEnv(testEnv) {
+            runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, skipInstallWheel, cpver, postTag, useClusterDurations)
+        }
     }, {
         if (testFilter[(DEBUG_MODE)]) {
             try {
@@ -5684,16 +5733,23 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         "RTXPro6000D-PyTorch-Post-Merge-1": ["rtx-pro-6000d", "l0_rtx_pro_6000", 1, 1],
         "RTXPro6000D-4_GPUs-PyTorch-Post-Merge-1": ["rtx-pro-6000d-x4", "l0_rtx_pro_6000", 1, 2, 4],
         "RTXPro6000D-4_GPUs-PyTorch-Post-Merge-2": ["rtx-pro-6000d-x4", "l0_rtx_pro_6000", 2, 2, 4],
+        // GR100 (gr100-ts1) single-GPU post-merge stage on a Blossom k8s pod.
+        "GR100-PyTorch-Post-Merge-1": ["gr100-ts1", "l0_gr100", 1, 1],
     ]
 
     x86TestConfigs = cbtsResizeSplits(x86TestConfigs)
-    parallelJobs = x86TestConfigs.collectEntries{key, values -> [key, [createKubernetesPodConfig(LLM_DOCKER_IMAGE, values[0], "amd64", values[4] ?: 1, key.contains("-Perf-"), values.size() > 5 ? values[5] : false), { attemptTag, isFinalAttempt, retryContext = null ->
+    parallelJobs = x86TestConfigs.collectEntries{key, values ->
+        def dockerImage = key.contains("GR100-PyTorch-Post-Merge-1") ? LLM_RUBIN_DOCKER_IMAGE : X86_64_DOCKER_IMAGE
+        [key, [createKubernetesPodConfig(dockerImage, values[0], "amd64", values[4] ?: 1, key.contains("-Perf-"), values.size() > 5 ? values[5] : false), { attemptTag, isFinalAttempt, retryContext = null ->
         def config = VANILLA_CONFIG
         if (key.contains("single-device")) {
             config = SINGLE_DEVICE_CONFIG
         }
         if (key.contains("llvm")) {
             config = LLVM_CONFIG
+        }
+        if (key.contains("GR100")) {
+            config = RUBIN_BRINGUP_CUDA13_4_CONFIG
         }
         runLLMTestlistOnPlatform(pipeline, values[0], values[1], config, key.contains("-Perf-"), key, values[2], values[3], false, "cp312", attemptTag, isFinalAttempt, retryContext)
     }]]}
@@ -5751,7 +5807,12 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         "DGX_B200-8_GPUs-PyTorch-4": ["auto:dgx-b200-flex", "l0_dgx_b200", 4, 4, 8, 1, true],
         "DGX_B200-8_GPUs-PyTorch-Ray-1": ["auto:dgx-b200-flex", "l0_dgx_b200", 1, 1, 8, 1, true],
         "DGX_B200-8_GPUs-AutoDeploy-Post-Merge-1": ["auto:dgx-b200-flex", "l0_dgx_b200", 1, 1, 8, 1, true],
-        "DGX_B200-4_GPUs-Verl-Post-Merge-1": ["auto:dgx-b200-flex", "l0_verl", 1, 1, 4, 1, true],
+        // Disabled while https://nvbugs/6759612 is open. The verl_setup fixture clones verl and
+        // pip-installs it; verl hard-pins numpy<2.0.0, which is mutually exclusive with the
+        // numpy>=2.0.0 TensorRT-LLM asks for, so the install downgrades numpy out from under
+        // the interpreter. Importing tensorrt_llm then fails and every test in the stage goes
+        // with it, which makes the whole stage noise rather than signal.
+        // "DGX_B200-4_GPUs-Verl-Post-Merge-1": ["auto:dgx-b200-flex", "l0_verl", 1, 1, 4, 1, true],
         "B300-PyTorch-1": ["auto:dgx-b300-flex", "l0_b300", 1, 2, 1, 1, true],
         "B300-PyTorch-2": ["auto:dgx-b300-flex", "l0_b300", 2, 2, 1, 1, true],
         "B300-PyTorch-Post-Merge-1": ["auto:dgx-b300-flex", "l0_b300", 1, 1, 1, 1, true],
@@ -5839,6 +5900,8 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         "GB200-4_GPUs-PyTorch-Post-Merge-1": ["auto:gb200-x4", "l0_gb200_multi_gpus", 1, 1, 4, 1, false, true],
         "GB10-PyTorch-Post-Merge-1": ["gb10x-single", "l0_gb10", 1, 1],
         "GB300-4_GPUs-PyTorch-1": ["auto:gb300-x4", "l0_gb300", 1, 1, 4, 1, true, false],
+        // VR200 = Vera Rubin NVL72 (Vera aarch64 CPU + Rubin GPU), single GPU on dlcluster preprod CI partition.
+        "VR200-PyTorch-Post-Merge-1": ["auto:vr200-x1", "l0_vr200", 1, 1],
         "GB300-4_GPUs-PyTorch-Post-Merge-1": ["auto:gb300-x4", "l0_gb300_multi_gpus", 1, 3, 4, 1, true, false],
         "GB300-4_GPUs-PyTorch-Post-Merge-2": ["auto:gb300-x4", "l0_gb300_multi_gpus", 2, 3, 4, 1, true, false],
         "GB300-4_GPUs-PyTorch-Post-Merge-3": ["auto:gb300-x4", "l0_gb300_multi_gpus", 3, 3, 4, 1, true, false],
@@ -6094,7 +6157,9 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         // singleAttempt:true disables the outer K8s pod retry; see the x86
         // SLURM closure above for the full rationale (cap nested retry budget
         // so consistently-timing-out tests don't burn ~36h on retry cascades).
-        parallelSlurmJobs = SBSASlurmTestConfigs.collectEntries{key, values -> [key, [createKubernetesPodConfig(X86_64_DOCKER_IMAGE, "slurm", "amd64"), { attemptTag, isFinalAttempt, retryContext = null ->
+        parallelSlurmJobs = SBSASlurmTestConfigs.collectEntries{key, values ->
+            def dockerImage = key.contains("VR200-PyTorch-Post-Merge-1") ? LLM_RUBIN_DOCKER_IMAGE : X86_64_DOCKER_IMAGE
+            [key, [createKubernetesPodConfig(dockerImage, "slurm", "amd64"), { attemptTag, isFinalAttempt, retryContext = null ->
             // attemptTag is threaded into runLLMTestlistOnSlurm as the outer
             // dispatcher pod's tag so the inner SLURM retry's postTag can't
             // collide with a previous dispatcher pod's upload. See the x86
@@ -6105,6 +6170,9 @@ def launchTestJobs(pipeline, testFilter, globalVars)
             }
             if (key.contains("llvm")) {
                 config = LLVM_CONFIG
+            }
+            if (key.contains("VR200-PyTorch-Post-Merge-1")) {
+                config = RUBIN_BRINGUP_CUDA13_4_AARCH64_CONFIG
             }
             runLLMTestlistOnSlurm(pipeline, values[0], values[1], config, key.contains("-Perf-"), key, values[2], values[3], values[4] ?: 1, values[5] ?: 1, values[6] ?: false, false, "cp312", attemptTag, values[7] ?: false, retryContext?.infraRetryMax)
         }, [singleAttempt: true, slurmDispatcher: true]]]}
@@ -6323,10 +6391,17 @@ def launchTestJobs(pipeline, testFilter, globalVars)
                             trtllm_utils.llmExecStepWithRetry(pipeline, script: "[ -f /etc/pip/constraint.txt ] && : > /etc/pip/constraint.txt || true")
                             // Remove the python3-pygments pip package because the dlfw image already includes a Debian pygments package, which conflicts with the pip-installed version.
                             trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get remove -y python3-pygments")
-                            // Remove stale nvidia-cutlass-dsl from the base image to prevent namespace
-                            // directory corruption when pip upgrades to the version required by tensorrt_llm.
-                            trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 uninstall -y nvidia-cutlass-dsl nvidia-cutlass-dsl-libs-base || true")
-                            trtllm_utils.llmExecStepWithRetry(pipeline, script: 'rm -rf $(python3 -c "import site; print(site.getsitepackages()[0])")/nvidia_cutlass_dsl*')
+                            // Preserve the internal Cutlass DSL overlay when the base image provides it.
+                            // Removing the shared namespace replaces its patched compiler files with the
+                            // public package and breaks FlashInfer CuTe RMSNorm on SM107.
+                            trtllm_utils.llmExecStepWithRetry(pipeline, script: '''
+                                if python3 -m pip show nvidia-cutlass-dsl-internal >/dev/null 2>&1; then
+                                    echo "Preserving the base image's nvidia-cutlass-dsl-internal overlay"
+                                else
+                                    pip3 uninstall -y nvidia-cutlass-dsl nvidia-cutlass-dsl-libs-base || true
+                                    rm -rf $(python3 -c "import site; print(site.getsitepackages()[0])")/nvidia_cutlass_dsl*
+                                fi
+                            ''')
                         }
                         trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update && apt-get install -y python3-pip git rsync curl wget")
                         trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, true, true)
@@ -6338,17 +6413,36 @@ def launchTestJobs(pipeline, testFilter, globalVars)
                             def platform = cpu_arch == X86_64_TRIPLE ? "x86_64" : "sbsa"
                             trtllm_utils.llmExecStepWithRetry(pipeline, script: "wget https://developer.download.nvidia.com/compute/cuda/repos/${ubuntu_version}/${platform}/cuda-keyring_1.1-1_all.deb")
                             trtllm_utils.llmExecStepWithRetry(pipeline, script: "dpkg -i cuda-keyring_1.1-1_all.deb")
-                            trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update && apt-get install -y cuda-toolkit-13-2")
+                            // Match the CUDA the DLFW base image builds the wheel with.
+                            trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update && apt-get install -y cuda-toolkit-13-4")
                         }
-                        // Extra PyTorch CUDA 13.2 install for all bare-metal environments (Default PyTorch is for CUDA 12.8)
+                        // Extra CUDA 13 PyTorch install for all bare-metal environments (Default PyTorch is for CUDA 12.8)
                         if (values[6]) {
-                            echo "###### Extra PyTorch CUDA 13.2 install Start ######"
+                            echo "###### Extra CUDA 13 PyTorch install Start ######"
+                            // cu130 is PyTorch's only CUDA 13 channel; it runs on the toolkit above
+                            // through CUDA minor version compatibility.
                             // Use internal mirror instead of https://download.pytorch.org/whl/cu130 for better network stability.
-                            // PyTorch CUDA 13.0 package and torchvision package can be installed as expected.
-                            trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install torch==2.12.0+cu130 torchvision==0.27.0+cu130 --extra-index-url https://urm.nvidia.com/artifactory/api/pypi/pytorch-cu128-remote/simple --extra-index-url https://download.pytorch.org/whl/cu130")
+                            // This must stay equal to what requirements.txt resolves to from the public
+                            // index, which is the highest public torch its ceiling admits: the wheel under
+                            // test is linked against that libtorch, and a mismatch fails the import with an
+                            // undefined c10 symbol rather than anything that names a version.
+                            trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install torch==2.13.0+cu130 torchvision==0.28.0+cu130 --extra-index-url https://urm.nvidia.com/artifactory/api/pypi/pytorch-cu128-remote/simple --extra-index-url https://download.pytorch.org/whl/cu130")
                         }
 
-                        def libEnv = []
+                        // A stock image, so nothing here went through Dockerfile.multi or
+                        // install_base.sh: what a singleton MPI_Comm_spawn needs has to be
+                        // redone by hand, or checkPipInstall's quickstart hangs in
+                        // MpiPoolSession until the timeout. PRRTE will not fork its DVM as
+                        // root without these (Open MPI 4 only checked that in mpirun), and
+                        // PMIX_HOSTNAME is the hostname-too-long-for-MPI one -- see
+                        // runLLMTestlistOnPlatform.
+                        def libEnv = [
+                            "OMPI_ALLOW_RUN_AS_ROOT=1",
+                            "OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1",
+                            "PRTE_ALLOW_RUN_AS_ROOT=1",
+                            "PRTE_ALLOW_RUN_AS_ROOT_CONFIRM=1",
+                            "PMIX_HOSTNAME=mpi-node0",
+                        ]
                         if (env.alternativeTRT) {
                             stage("Replace TensorRT") {
                                 trtllm_utils.replaceWithAlternativeTRT(env.alternativeTRT, cpver)
@@ -6574,6 +6668,8 @@ def launchTestJobs(pipeline, testFilter, globalVars)
             echo "CBTS [${cbts.scope}]: empty stage set after filtering"
         }
     }
+    // Specific for the Rubin bring-up feature branch
+    parallelJobsFiltered = parallelJobsFiltered.findAll { key, values -> ((key.contains("B200_PCIe") || key.contains("H100_PCIe-PyTorch-Ray") || key.contains("H100_PCIe-AutoDseploy")) && !key.contains("Post-Merge") && !key.contains("PackageSanityCheck")) || key.contains("GR100") || key.contains("VR200") }
 
     if (globalVars[RUN_MODE] == "nightly_release") {
         parallelJobsFiltered = sanityCheckJobs

@@ -42,9 +42,12 @@ from ..attention_backend.interface import (
 )
 from ..attention_backend.sparse.hooks import get_sparse_mla_hooks
 from ..attention_backend.utils import create_attention
+from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE, IS_CUTLASS_DSL_INTERNAL_AVAILABLE
 from ..distributed import AllReduceParams
 from ..model_config import ModelConfig
 from ..pyexecutor.breakable_cuda_graph import eager_on_graph
+from ..ugpu.policy import UgpuExecutionPlanner, UgpuPolicy
+from ..ugpu.runtime import UgpuRuntime
 from ..utils import (
     AuxStreamType,
     Fp4QuantizedTensor,
@@ -165,6 +168,32 @@ def mla_custom_op_inplace(
 maybe_bcg_mla_custom_op_inplace = eager_on_graph(mla_custom_op_inplace)
 
 
+def _is_cute_dsl_fp8_bmm_available(sm_version: Optional[int] = None) -> bool:
+    if sm_version is None:
+        sm_version = get_sm_version()
+    if sm_version == 107:
+        return IS_CUTLASS_DSL_INTERNAL_AVAILABLE
+    return sm_version in (100, 103) and IS_CUTLASS_DSL_AVAILABLE
+
+
+def _cute_dsl_fp8_bmm_out(
+    mat1_fp8: torch.Tensor,
+    mat2_fp8: torch.Tensor,
+    mat1_scale: torch.Tensor,
+    mat2_scale: torch.Tensor,
+    out: torch.Tensor,
+) -> None:
+    sm_version = get_sm_version()
+    if sm_version == 107:
+        torch.ops.trtllm.cute_dsl_fp8_bmm_rubin(mat1_fp8, mat2_fp8, mat1_scale, mat2_scale, out)
+    elif sm_version in (100, 103):
+        torch.ops.trtllm.cute_dsl_fp8_bmm_blackwell(mat1_fp8, mat2_fp8, mat1_scale, mat2_scale, out)
+    else:
+        raise NotImplementedError(
+            f"CuTe DSL FP8 block-scaled BMM is not available on SM{sm_version}"
+        )
+
+
 def fp8_block_scaling_bmm_out(
     mat1: torch.Tensor,
     mat2_fp8: torch.Tensor,
@@ -192,9 +221,7 @@ def fp8_block_scaling_bmm_out(
     elif is_sm_100f(sm_version):
         if use_cute_dsl_blockscaling_bmm:
             mat1_fp8, mat1_scale = torch.ops.trtllm.fp8_batched_quantize_1x128_permute102(mat1)
-            torch.ops.trtllm.cute_dsl_fp8_bmm_blackwell(
-                mat1_fp8, mat2_fp8, mat1_scale, mat2_scale, out
-            )
+            _cute_dsl_fp8_bmm_out(mat1_fp8, mat2_fp8, mat1_scale, mat2_scale, out)
             mat1_scale = None
         else:
             torch.bmm(mat1.transpose(0, 1), mat2_dequant.transpose(1, 2), out=out)
@@ -229,7 +256,9 @@ class MLA(nn.Module):
         o_lora_rank: int = 1024,
         fuse_qkv_a_proj: bool = True,
         rms_norm_eps: Optional[float] = None,
-    ):
+        enable_ugpu_bf16_linear: bool = False,
+        flashinfer_mla_backend: Optional[str] = None,
+    ) -> None:
         """
         Initialize the MLA module.
 
@@ -260,6 +289,10 @@ class MLA(nn.Module):
             rms_norm_eps (Optional[float]): Override the RMSNorm epsilon from
                 the pretrained config. If neither source provides a value
                 (e.g. config.pretrained_config is None), falls back to 1e-6.
+            enable_ugpu_bf16_linear (bool): Enable localized BF16 MLA projections.
+            flashinfer_mla_backend (Optional[str]): Generation backend for the
+                FlashInfer/TRTLLM-Gen MLA dispatcher. ``None`` preserves the
+                attention backend default.
         """
         super().__init__()
         self.layer_idx = layer_idx
@@ -399,6 +432,12 @@ class MLA(nn.Module):
         self.use_cute_dsl_blockscaling_bmm = config.use_cute_dsl_blockscaling_bmm
         self.use_cute_dsl_bf16_bmm = config.use_cute_dsl_bf16_bmm
         self.use_cute_dsl_bf16_gemm = config.use_cute_dsl_bf16_gemm
+        ugpu_policy = config.extra_attrs.get("ugpu_policy")
+        self._ugpu_policy = ugpu_policy if ugpu_policy is not None else UgpuPolicy()
+        self.enable_ugpu_bf16_linear = enable_ugpu_bf16_linear
+        self._ugpu_runtime: Optional[UgpuRuntime] = None
+        self._ugpu_k_b_proj_trans_shards: Optional[tuple[torch.Tensor, torch.Tensor]] = None
+        self._ugpu_v_b_proj_shards: Optional[tuple[torch.Tensor, torch.Tensor]] = None
 
         if not self.is_lite:
             kv_a_out_features = self.kv_lora_rank + self.qk_rope_head_dim
@@ -448,6 +487,8 @@ class MLA(nn.Module):
                 force_dynamic_quantization=config.force_dynamic_quantization,
                 use_cute_dsl_blockscaling_mm=self.use_cute_dsl_blockscaling_mm,
                 use_cute_dsl_bf16_gemm=self.use_cute_dsl_bf16_gemm,
+                enable_ugpu_bf16_linear=enable_ugpu_bf16_linear,
+                ugpu_policy=self._ugpu_policy,
             )
         else:
             self.kv_a_proj_with_mqa = Linear(
@@ -476,6 +517,8 @@ class MLA(nn.Module):
                 force_dynamic_quantization=config.force_dynamic_quantization,
                 use_cute_dsl_blockscaling_mm=self.use_cute_dsl_blockscaling_mm,
                 use_cute_dsl_bf16_gemm=self.use_cute_dsl_bf16_gemm,
+                enable_ugpu_bf16_linear=enable_ugpu_bf16_linear,
+                ugpu_policy=self._ugpu_policy,
             )
             self.q_b_proj = self.q_proj
 
@@ -526,6 +569,8 @@ class MLA(nn.Module):
                 force_dynamic_quantization=config.force_dynamic_quantization,
                 use_cute_dsl_blockscaling_mm=self.use_cute_dsl_blockscaling_mm,
                 use_cute_dsl_bf16_gemm=self.use_cute_dsl_bf16_gemm,
+                enable_ugpu_bf16_linear=enable_ugpu_bf16_linear,
+                ugpu_policy=self._ugpu_policy,
             )
             self.v_b_proj = nn.Parameter(
                 torch.empty(
@@ -557,6 +602,7 @@ class MLA(nn.Module):
             dtype=dtype,
             aux_stream=mqa_aux_stream,
             rope_append=True,
+            flashinfer_mla_backend=flashinfer_mla_backend,
         )
         if self.mqa is None:
             raise RuntimeError("MLA requires a non-null MQA attention backend")
@@ -607,6 +653,8 @@ class MLA(nn.Module):
                 force_dynamic_quantization=config.force_dynamic_quantization,
                 use_cute_dsl_blockscaling_mm=self.use_cute_dsl_blockscaling_mm,
                 use_cute_dsl_bf16_gemm=self.use_cute_dsl_bf16_gemm,
+                enable_ugpu_bf16_linear=enable_ugpu_bf16_linear,
+                ugpu_policy=self._ugpu_policy,
             )
             self.attention_output_hidden_size = self.o_proj.in_features
 
@@ -711,7 +759,17 @@ class MLA(nn.Module):
         else:
             self.k_b_proj_trans_scale = None
             self.v_b_proj_scale = None
+        self._ugpu_k_b_proj_trans_shards = None
+        self._ugpu_v_b_proj_shards = None
+        self._kvbproj_head_weights_cache = None
         self._weights_transformed = False
+
+    def _bind_v_b_proj_weight(self, weight: torch.Tensor) -> None:
+        """Bind the V absorption weight without retaining a released full weight."""
+        plan = self.kv_b_proj.partition_plan
+        if plan.enabled and plan.op_kind == "bf16_linear":
+            weight = weight.clone(memory_format=torch.contiguous_format)
+        self.v_b_proj = nn.Parameter(weight, requires_grad=False)
 
     def apply_rope(
         self,
@@ -754,14 +812,30 @@ class MLA(nn.Module):
             kv_lora_rank = partial_o.shape[-1] // self.num_heads_tp
             assert self.kv_lora_rank == kv_lora_rank
 
-            # MLA processes only the generation token slice here, so build the
-            # mask from the generation sequence range [num_contexts, num_seqs).
-            zero_kv_mask = _helix_zero_kv_mask(
-                attn_metadata,
-                partial_o.shape[0],
-                seq_start=attn_metadata.num_contexts,
-                num_seqs=attn_metadata.num_generations,
-            )
+            helix_kv_bounds = getattr(attn_metadata, "helix_kv_bounds", None)
+            if helix_kv_bounds is not None and getattr(
+                attn_metadata, "_helix_spec_tokens_valid", False
+            ):
+                # Speculative verify groups: KV ownership is per-TOKEN. A rank
+                # owning only the tail page of a group has zero visible KV for
+                # the group's leading tokens while its per-sequence kv_len is
+                # nonzero, so the per-sequence mask above misses those rows.
+                # Their decode rows are fully masked with a finite sentinel,
+                # making partial_o an average over (possibly uninitialized)
+                # pool values; the combine multiplies by corr = 0 and
+                # 0 * NaN would poison the token on every CP rank — sanitize
+                # by the per-token bound instead.
+                zero_kv_mask = helix_kv_bounds[: partial_o.shape[0]] == 0
+            else:
+                # MLA processes only the generation token slice here, so build
+                # the mask from [num_contexts, num_seqs). Skip this expansion
+                # when the more precise per-token bounds above are valid.
+                zero_kv_mask = _helix_zero_kv_mask(
+                    attn_metadata,
+                    partial_o.shape[0],
+                    seq_start=attn_metadata.num_contexts,
+                    num_seqs=attn_metadata.num_generations,
+                )
             return _helix_post_process(
                 partial_o,
                 softmax_stats,
@@ -986,6 +1060,49 @@ class MLA(nn.Module):
                 latent_cache=latent_cache_gen,
             )
 
+    def _use_kvbproj_strided_out(self) -> bool:
+        """Whether context KV expansion can write directly into strided outputs.
+
+        This requires an SM100-family GPU and an unquantized BF16 kv_b_proj
+        without bias. Other configurations retain the wide-GEMM path.
+        """
+        if not is_sm_100f():
+            return False
+        w = getattr(self.kv_b_proj, "weight", None)
+        expected_shape = (
+            self.num_heads_tp * (self.qk_nope_head_dim + self.v_head_dim),
+            self.kv_lora_rank,
+        )
+        expected_numel = math.prod(expected_shape)
+        return (
+            w is not None
+            and w.dtype == torch.bfloat16
+            and tuple(w.shape) == expected_shape
+            and w.numel() == expected_numel
+            and getattr(self.kv_b_proj, "bias", None) is None
+        )
+
+    def _get_kvbproj_head_weights(self):
+        """Return cached per-head [H, N, K] views of kv_b_proj.weight."""
+        cached = getattr(self, "_kvbproj_head_weights_cache", None)
+        weight = self.kv_b_proj.weight
+        if cached is not None and cached[0] is weight:
+            return cached[1], cached[2]
+
+        nope_rows = self.num_heads_tp * self.qk_nope_head_dim
+        weight_k = weight[:nope_rows].view(
+            self.num_heads_tp,
+            self.qk_nope_head_dim,
+            self.kv_lora_rank,
+        )
+        weight_v = weight[nope_rows:].view(
+            self.num_heads_tp,
+            self.v_head_dim,
+            self.kv_lora_rank,
+        )
+        self._kvbproj_head_weights_cache = (weight, weight_k, weight_v)
+        return weight_k, weight_v
+
     def forward_context_default(
         self,
         q: torch.Tensor,
@@ -997,20 +1114,54 @@ class MLA(nn.Module):
         latent_cache: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Dense MHA context path: expand KV via kv_b_proj and run attention."""
-        kv = self.kv_b_proj(compressed_kv)
-        k_nope, v = kv.split(
-            [
-                self.num_heads_tp * self.qk_nope_head_dim,
-                self.num_heads_tp * self.v_head_dim,
-            ],
-            -1,
-        )
-
         k = torch.empty_like(q).view(-1, self.num_heads_tp, self.qk_head_dim)
-        maybe_compiled_copy_(
-            k[..., : self.qk_nope_head_dim],
-            k_nope.view(-1, self.num_heads_tp, self.qk_nope_head_dim),
-        )
+        if self._use_kvbproj_strided_out():
+            num_tokens = compressed_kv.shape[0]
+            weight_k, weight_v = self._get_kvbproj_head_weights()
+            compressed_kv_batched = compressed_kv.unsqueeze(0).expand(
+                self.num_heads_tp,
+                num_tokens,
+                self.kv_lora_rank,
+            )
+
+            k_nope_out = k[..., : self.qk_nope_head_dim].transpose(0, 1)
+            nope_cols = self.num_heads_tp * self.qk_nope_head_dim
+            v_cols = self.num_heads_tp * self.v_head_dim
+            kv_buffer = torch.empty(
+                num_tokens,
+                nope_cols + v_cols,
+                dtype=q.dtype,
+                device=q.device,
+            )
+            v = kv_buffer[:, nope_cols:]
+            v_out = v.unflatten(
+                -1,
+                (self.num_heads_tp, self.v_head_dim),
+            ).transpose(0, 1)
+
+            torch.ops.trtllm.bmm_out(
+                compressed_kv_batched,
+                weight_k.transpose(1, 2),
+                k_nope_out,
+            )
+            torch.ops.trtllm.bmm_out(
+                compressed_kv_batched,
+                weight_v.transpose(1, 2),
+                v_out,
+            )
+        else:
+            kv = self.kv_b_proj(compressed_kv)
+            k_nope, v = kv.split(
+                [
+                    self.num_heads_tp * self.qk_nope_head_dim,
+                    self.num_heads_tp * self.v_head_dim,
+                ],
+                -1,
+            )
+            maybe_compiled_copy_(
+                k[..., : self.qk_nope_head_dim],
+                k_nope.view(-1, self.num_heads_tp, self.qk_nope_head_dim),
+            )
         # When rope_fusion=True (apply_rotary_emb=False), the rope portion
         # of k is left uninitialized here; the fused attention kernel
         # handles k_pe RoPE via latent_cache instead.
@@ -1100,6 +1251,137 @@ class MLA(nn.Module):
             ),
         )
 
+        return attn_output
+
+    def forward_context_with_chunked_prefill_fp4(
+        self,
+        q: torch.Tensor,
+        compressed_kv: torch.Tensor,
+        latent_cache: torch.Tensor,
+        attn_metadata: TrtllmAttentionMetadata,
+        output: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run dense FP4 MLA chunked prefill through FP8 context partitions."""
+        trtllm_attention = cast(TrtllmAttention, self.mha)
+        if latent_cache is None:
+            raise RuntimeError("FP4 MLA chunked prefill requires latent_cache.")
+
+        # Match the FP8 KV path: fuse Q/K RoPE with cache append, then consume
+        # the rotated current K directly from latent_cache.
+        trtllm_attention.append_fp4_mla_context_cache(q, latent_cache, attn_metadata)
+        current_k_pe = latent_cache.reshape(
+            -1,
+            self.kv_lora_rank + self.qk_rope_head_dim,
+        )[:, self.kv_lora_rank :]
+
+        self.softmax_stats_tensor = torch.empty(
+            (attn_metadata.num_ctx_tokens, self.num_heads_tp, 2),
+            dtype=torch.float,
+            device=q.device,
+        )
+        self.temp_softmax_stats_tensor = torch.empty_like(self.softmax_stats_tensor)
+        attn_output = output
+        temp_attn_output = q.new_empty(
+            (q.size(0), self.num_heads_tp * self.v_head_dim),
+        )
+
+        def expand_kv(
+            partition_compressed_kv: torch.Tensor,
+            partition_k_pe: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            partition_kv = self.kv_b_proj(partition_compressed_kv)
+            partition_k_nope, partition_v = partition_kv.split(
+                [
+                    self.num_heads_tp * self.qk_nope_head_dim,
+                    self.num_heads_tp * self.v_head_dim,
+                ],
+                -1,
+            )
+            partition_k_nope = partition_k_nope.view(
+                -1,
+                self.num_heads_tp,
+                self.qk_nope_head_dim,
+            )
+            partition_k_pe = partition_k_pe.view(-1, 1, self.qk_rope_head_dim)
+            partition_k = maybe_compiled_cat(
+                (
+                    partition_k_nope,
+                    partition_k_pe.expand(-1, self.num_heads_tp, -1),
+                ),
+                dim=-1,
+            )
+            return partition_k.view(-1, self.num_heads_tp * self.qk_head_dim), partition_v
+
+        def run_partition(
+            partition_k: torch.Tensor,
+            partition_v: torch.Tensor,
+            attention_mask: PredefinedAttentionMask,
+            kv_lens_cuda: torch.Tensor,
+            kv_lens_cpu: torch.Tensor,
+            merge_op: torch.Tensor,
+        ) -> None:
+            trtllm_attention.forward_fp4_mla_context_partition(
+                q,
+                partition_k,
+                partition_v,
+                attn_metadata,
+                AttentionForwardArgs(
+                    attention_input_type=AttentionInputType.context_only,
+                    latent_cache=None,
+                    out_scale=self.out_scale,
+                    attention_mask=attention_mask,
+                    softmax_stats_tensor=self.temp_softmax_stats_tensor,
+                    chunked_prefill_buffer_batch_size=(
+                        attn_metadata.runtime_features.chunked_prefill_buffer_batch_size
+                    ),
+                    output=temp_attn_output,
+                ),
+                kv_lens_cuda=kv_lens_cuda,
+                kv_lens_cpu=kv_lens_cpu,
+            )
+            trtllm_attention.merge_attention_for_mla(
+                attn_output,
+                temp_attn_output,
+                self.softmax_stats_tensor,
+                self.temp_softmax_stats_tensor,
+                merge_op,
+                attn_metadata,
+            )
+
+        for loop_idx in range(attn_metadata.chunked_loop_num):
+            total_chunked_tokens = int(
+                attn_metadata.host_cu_chunked_seq_len[
+                    loop_idx,
+                    attn_metadata.num_contexts,
+                ]
+            )
+            chunked_compressed_kv, chunked_k_pe = trtllm_attention.load_chunked_kv_cache_for_mla(
+                metadata=attn_metadata,
+                num_ctx_cached_tokens=total_chunked_tokens,
+                cu_chunked_seq_len=attn_metadata.cu_chunked_seq_len[loop_idx],
+                chunked_global_offset=attn_metadata.chunked_global_offset[loop_idx],
+                chunked_max_seq_len=int(attn_metadata.max_chunk_len_per_loop[loop_idx]),
+                out_dtype=q.dtype,
+            )
+            chunked_k, chunked_v = expand_kv(chunked_compressed_kv, chunked_k_pe)
+            run_partition(
+                chunked_k,
+                chunked_v,
+                PredefinedAttentionMask.FULL,
+                attn_metadata.chunked_seq_len[loop_idx],
+                attn_metadata.host_chunked_seq_len[loop_idx],
+                attn_metadata.merge_op_tensor[loop_idx],
+            )
+
+        current_k, current_v = expand_kv(compressed_kv, current_k_pe)
+        run_partition(
+            current_k,
+            current_v,
+            PredefinedAttentionMask.CAUSAL,
+            attn_metadata.prompt_lens_cuda_runtime,
+            attn_metadata.prompt_lens_cpu_runtime,
+            attn_metadata.merge_op_tensor[attn_metadata.chunked_loop_num],
+        )
         return attn_output
 
     def forward_context_with_chunked_prefill(
@@ -1373,6 +1655,14 @@ class MLA(nn.Module):
                 trtllm_attention.is_chunked_prefill_for_mla_context(attn_metadata)
                 and get_sm_version() >= 100
             ):
+                if trtllm_attention.uses_fp4_mla_attention:
+                    return self.forward_context_with_chunked_prefill_fp4(
+                        q,
+                        compressed_kv,
+                        latent_cache,
+                        attn_metadata,
+                        output,
+                    )
                 return self.forward_context_with_chunked_prefill(
                     q, compressed_kv, latent_cache, attn_metadata, output
                 )
@@ -1384,12 +1674,117 @@ class MLA(nn.Module):
             q, compressed_kv, k_pe, position_ids, attn_metadata, output, latent_cache
         )
 
-    def _bmm_bf16_out(self, a, b_no_transpose, b_transposed, output):
-        """BMM with optional CuTe DSL bf16 acceleration on Blackwell."""
-        if self.use_cute_dsl_bf16_bmm and is_sm_100f():
-            torch.ops.trtllm.cute_dsl_bf16_bmm_blackwell(a, b_no_transpose, output)
+    def _bmm_bf16_out(
+        self,
+        a: torch.Tensor,
+        b_no_transpose: torch.Tensor,
+        b_transposed: torch.Tensor,
+        output: torch.Tensor,
+        ugpu_weight_shards: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+    ) -> None:
+        """BMM with optional CuTe DSL bf16 acceleration on Blackwell/Rubin."""
+        if not self.use_cute_dsl_bf16_bmm:
+            torch.ops.trtllm.bmm_out(a, b_transposed, output)
+            return
+
+        sm_version = get_sm_version()
+        if sm_version == 107 and ugpu_weight_shards is not None:
+            weight_0, weight_1 = ugpu_weight_shards
+            torch.ops.trtllm.cute_dsl_bf16_bmm_ugpu_inplace_rubin(a, weight_0, weight_1, output)
+        elif is_sm_100f(sm_version):
+            bf16_bmm_op = (
+                torch.ops.trtllm.cute_dsl_bf16_bmm_rubin
+                if sm_version == 107
+                else torch.ops.trtllm.cute_dsl_bf16_bmm_blackwell
+            )
+            bf16_bmm_op(a, b_no_transpose, output)
         else:
             torch.ops.trtllm.bmm_out(a, b_transposed, output)
+
+    def _has_full_absorption_weights(self) -> bool:
+        if getattr(self, "kv_lora_rank", None) != 512 or getattr(self, "v_head_dim", None) != 128:
+            return False
+        # The Rubin BF16 BMM requires its K dimension to be 16-byte aligned.
+        # qk_nope_head_dim is K for the absorbed K projection.
+        if getattr(self, "qk_nope_head_dim", 0) % 8 != 0:
+            return False
+
+        k_weight = getattr(self, "k_b_proj_trans", None)
+        v_weight = getattr(self, "v_b_proj", None)
+        if not isinstance(k_weight, torch.Tensor) or not isinstance(v_weight, torch.Tensor):
+            return False
+        if k_weight.is_meta or v_weight.is_meta:
+            return False
+
+        expected_k_shape = (
+            self.num_heads_tp,
+            self.kv_lora_rank,
+            self.qk_nope_head_dim,
+        )
+        expected_v_shape = (
+            self.num_heads_tp_cp,
+            self.v_head_dim,
+            self.kv_lora_rank,
+        )
+        return (
+            k_weight.dtype == v_weight.dtype
+            and tuple(k_weight.shape) == expected_k_shape
+            and tuple(v_weight.shape) == expected_v_shape
+            and k_weight.numel() == math.prod(expected_k_shape)
+            and v_weight.numel() == math.prod(expected_v_shape)
+        )
+
+    def _copy_absorption_weight_shards(
+        self, weight: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        assert self._ugpu_runtime is not None
+        num_partitions = self._ugpu_runtime.num_partitions
+        assert weight.shape[1] % num_partitions == 0
+
+        shard_n = weight.shape[1] // num_partitions
+        shards = []
+        for partition_id in range(num_partitions):
+            weight_slice = weight[
+                :,
+                partition_id * shard_n : (partition_id + 1) * shard_n,
+                :,
+            ]
+            with self._ugpu_runtime.partition_weight_context(partition_id):
+                shard = torch.empty_like(
+                    weight_slice,
+                    memory_format=torch.contiguous_format,
+                )
+                shard.copy_(weight_slice)
+            shards.append(shard)
+        assert len(shards) == 2
+        return shards[0], shards[1]
+
+    def _rebuild_ugpu_bf16_bmm_weight_shards(self) -> None:
+        """Rebuild localized BF16 absorption weights from the full parameters."""
+        self._ugpu_k_b_proj_trans_shards = None
+        self._ugpu_v_b_proj_shards = None
+
+        if getattr(self, "is_deepseek_v4", False) or not self._has_full_absorption_weights():
+            return
+
+        ugpu_policy = getattr(self, "_ugpu_policy", None)
+        if ugpu_policy is None:
+            return
+        plan = UgpuExecutionPlanner(ugpu_policy).plan_bf16_bmm(
+            dtype=self.k_b_proj_trans.dtype,
+            use_cute_dsl_bf16_bmm=getattr(self, "use_cute_dsl_bf16_bmm", False),
+        )
+        if not plan.enabled:
+            return
+
+        if getattr(self, "_ugpu_runtime", None) is None:
+            self._ugpu_runtime = UgpuRuntime(plan.num_partitions)
+
+        k_shards = self._copy_absorption_weight_shards(self.k_b_proj_trans)
+        v_shards = self._copy_absorption_weight_shards(self.v_b_proj)
+        self._ugpu_runtime.prepare_for_capture(plan)
+        self._ugpu_k_b_proj_trans_shards = k_shards
+        self._ugpu_v_b_proj_shards = v_shards
 
     def forward_absorption_generation(
         self,
@@ -1414,14 +1809,14 @@ class MLA(nn.Module):
         cu_q_seqlens = torch.empty(num_seqs + 1, dtype=torch.int32, device=q.device)
         cu_kv_seqlens = torch.empty(num_seqs + 1, dtype=torch.int32, device=q.device)
         fmha_scheduler_counter = torch.empty(1, dtype=torch.uint32, device=q.device)
-        has_fp8_kv_cache = (
-            self.mqa.has_fp8_kv_cache if hasattr(self.mqa, "has_fp8_kv_cache") else False
+        use_fp8_mla = getattr(self.mqa, "has_fp8_kv_cache", False) or getattr(
+            self.mqa, "has_fp4_kv_cache", False
         )
 
         mla_bmm1_scale = None
         mla_bmm2_scale = None
         quant_q_buffer = None
-        if has_fp8_kv_cache:
+        if use_fp8_mla:
             mla_bmm1_scale = torch.empty(2, dtype=torch.float32, device=q.device)
             mla_bmm2_scale = torch.empty(1, dtype=torch.float32, device=q.device)
             quant_q_buffer = torch.empty(
@@ -1442,6 +1837,22 @@ class MLA(nn.Module):
                 dtype=q.dtype,
                 device=q.device,
             )
+
+            fp4_mla = isinstance(self.mqa, TrtllmAttention) and self.mqa.uses_fp4_mla_attention
+            if fp4_mla and latent_cache is None:
+                raise RuntimeError(
+                    "FP4 MLA generation requires fused Q quantization, RoPE, "
+                    "and cache update on the TRT-LLM backend, which needs a "
+                    "latent cache to append into."
+                )
+            # The absorption weight dtype is deliberately not constrained here.
+            # It follows kv_b_proj: an FP8 block-scaled checkpoint yields
+            # float8_e4m3fn, anything else the module dtype. Both have a BMM
+            # below that writes q_nope into the same fused_q slice, and an
+            # unsupported dtype is rejected there. Requiring bfloat16 at this
+            # point rejected every FP8-attention Kimi K3 checkpoint outright.
+            fuse_fp4_q_quant = fp4_mla
+            fp4_rope_kwargs = {"fuse_fp4_q_quant": True} if fuse_fp4_q_quant else {}
 
             def _mla_gen_rope():
                 if self.apply_rotary_emb:
@@ -1469,9 +1880,10 @@ class MLA(nn.Module):
                         mla_bmm1_scale,
                         mla_bmm2_scale,
                         quant_q_buffer,
+                        **fp4_rope_kwargs,
                     )
 
-            rope_stream = self.aux_stream if not has_fp8_kv_cache else None
+            rope_stream = self.aux_stream if not use_fp8_mla else None
             if self.k_b_proj_trans.dtype == torch.bfloat16:
                 # [num_heads, num_tokens, self.qk_nope_head_dim]
                 q_nope_t = q_nope.transpose(0, 1)
@@ -1487,6 +1899,7 @@ class MLA(nn.Module):
                         self.k_b_proj_trans,
                         self.k_b_proj_trans.transpose(1, 2),
                         q_nope_out,
+                        self._ugpu_k_b_proj_trans_shards,
                     ),
                     _mla_gen_rope,
                     self.ln_events[0],
@@ -1566,6 +1979,7 @@ class MLA(nn.Module):
                 self.v_b_proj,
                 self.v_b_proj.transpose(1, 2),
                 attn_output.transpose(0, 1),
+                self._ugpu_v_b_proj_shards,
             )
         elif self.v_b_proj.dtype == torch.float8_e4m3fn:
             fp8_block_scaling_bmm_out(
@@ -1593,6 +2007,7 @@ class MLA(nn.Module):
         **kwargs,
     ) -> torch.Tensor:
         num_tokens = q.shape[0]
+        q_rope_applied = kwargs.pop("q_rope_applied", False)
 
         q_nope, q_pe = q.view([-1, self.num_heads_tp, self.qk_head_dim]).split(
             [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
@@ -1625,6 +2040,7 @@ class MLA(nn.Module):
                     self.k_b_proj_trans,
                     self.k_b_proj_trans.transpose(1, 2),
                     q_nope_out,
+                    self._ugpu_k_b_proj_trans_shards,
                 )
             elif self.k_b_proj_trans.dtype == torch.float8_e4m3fn:
                 # [num_heads, num_tokens, self.kv_lora_rank]
@@ -1643,7 +2059,7 @@ class MLA(nn.Module):
                     f"Missing bmm impl for dtype: {self.k_b_proj_trans.dtype}."
                 )
 
-            if self.apply_rotary_emb:
+            if self.apply_rotary_emb or q_rope_applied:
                 fused_q[..., self.kv_lora_rank :] = q_pe
             fused_q = fused_q.view(
                 [
@@ -1688,6 +2104,7 @@ class MLA(nn.Module):
                 self.v_b_proj,
                 self.v_b_proj.transpose(1, 2),
                 attn_output.transpose(0, 1),
+                self._ugpu_v_b_proj_shards,
             )
         elif self.v_b_proj.dtype == torch.float8_e4m3fn:
             fp8_block_scaling_bmm_out(
@@ -1867,7 +2284,10 @@ class MLA(nn.Module):
         self._weights_transformed = True
 
     def cache_derived_state(self) -> None:
+        self._kvbproj_head_weights_cache = None
+        self._rebuild_ugpu_bf16_bmm_weight_shards()
         self._weights_transformed = True
 
     def post_load_weights(self) -> None:
         self.transform_weights()
+        self.cache_derived_state()

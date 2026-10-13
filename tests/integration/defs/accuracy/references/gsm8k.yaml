@@ -173,6 +173,14 @@ deepseek-ai/DeepSeek-V4-Pro:
   - quant_algo: FP8_BLOCK_SCALES
     spec_dec_algo: DSpark
     accuracy: 95.9
+  # Aggregate DEP4 DSpark path against the NVFP4 export
+  # (nvidia/deepseek-v4-pro-nvfp4-dspark). MIXED_PRECISION is what the
+  # checkpoint's hf_quant_config declares: NVFP4 routed experts, everything
+  # else left alone. Floor kept level with the FP8 row; a prior full
+  # 1319-sample DEP8 run scored 96.21, and DEP4 uses the same model numerics.
+  - quant_algo: MIXED_PRECISION
+    spec_dec_algo: DSpark
+    accuracy: 95.9
 Qwen3/Qwen3-4B:
   - spec_dec_algo: Eagle
     accuracy: 85.823
@@ -281,6 +289,32 @@ moonshotai/Kimi-K2.5:
     accuracy: 93.06
   - quant_algo: NVFP4
     accuracy: 93.06
+moonshotai/Kimi-K3:
+  # Full GSM8K DEP8 aggregate path: TP=8, EP=8, attention DP, TRTLLM-Gen
+  # MoE, CUDA graphs, chunked prefill, and FP8 KV. The native
+  # compressed-tensors checkpoint is exposed through llm.args as
+  # W4A16_MXFP4. The DEP16 bring-up measured 96.55 on all 1,319 samples,
+  # versus 96.5125 with BF16 KV; the threshold allows ordinary run-to-run
+  # variation.
+  - quant_algo: W4A16_MXFP4
+    kv_cache_quant_algo: FP8
+    accuracy: 96.0
+  # Same threshold as the non-speculative row above: speculative decoding is
+  # lossless, so DSpark must not move the score. Measured 97.0-97.5 on a
+  # 200-sample TEP8 subset while bringing up the drafter's paged KV path.
+  - quant_algo: MIXED_PRECISION
+    spec_dec_algo: DSpark
+    accuracy: 96.0
+  # NVFP4 KV, which is what selects the FP4 MLA path; the rows above run FP8
+  # or BF16 KV and never reach it. Measured 95.944 on all 1,319 samples at
+  # tp16, against 96.55 for FP8 KV above. NVFP4 is the lossier cache, so a
+  # ~0.6 point cost, about eight questions, is the format's price rather than
+  # a regression, and the bar has to be set per KV format instead of inherited
+  # from the FP8 row. The 0.55 margin below the measurement matches the one
+  # that row allows for run-to-run variation.
+  - quant_algo: MIXED_PRECISION
+    kv_cache_quant_algo: NVFP4
+    accuracy: 95.4
 nvidia/Llama-3_3-Nemotron-Super-49B-v1:
   - accuracy: 92.57
   - quant_algo: FP8
@@ -512,6 +546,9 @@ zai-org/GLM-5.2:
   - quant_algo: NVFP4
     kv_cache_quant_algo: FP8
     spec_dec_algo: MTP
+    accuracy: 90
+  - quant_algo: NVFP4
+    kv_cache_quant_algo: NVFP4
     accuracy: 90
 # Step-3.7-Flash text decoder (MoE) GSM8K, full 1319-sample split, TP4/EP4 with
 # TRTLLM attention + MoE backends. FP8 measured on the FP8 block-scale

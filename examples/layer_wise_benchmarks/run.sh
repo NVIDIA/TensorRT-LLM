@@ -22,7 +22,7 @@ GPU_METRICS=${GPU_METRICS:-0}
 if [ "$PROFILE" -eq 1 ]; then
     PROFILE_CMD=(
         nsys profile
-        -t cuda,nvtx
+        -t "${NSYS_TRACE:-cuda,nvtx}"
         --cpuctxsw none --cuda-event-trace false
         --cuda-graph-trace node
         -c cudaProfilerApi --capture-range-end stop

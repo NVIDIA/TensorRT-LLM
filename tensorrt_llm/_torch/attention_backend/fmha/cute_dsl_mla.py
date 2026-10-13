@@ -26,6 +26,7 @@ from tensorrt_llm._torch.attention_backend.interface import (
 )
 from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm.bindings import DataType
 from tensorrt_llm.logger import logger
 
 from .phased import FmhaParams, PhasedFmha
@@ -36,11 +37,45 @@ if TYPE_CHECKING:
         TrtllmAttentionMetadata,
     )
 
-_LOG2_E = math.log2(math.e)
-
 
 class CuteDslMlaFmha(PhasedFmha):
     """Blackwell CuTe DSL FMHA library for decode-only MLA."""
+
+    @staticmethod
+    def _get_fp8_scales(
+        q: torch.Tensor,
+        fwd: AttentionForwardArgs,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        softmax_scale = fwd.mla_bmm1_scale
+        output_scale = fwd.mla_bmm2_scale
+        if softmax_scale is None or output_scale is None:
+            raise RuntimeError(
+                "CuTe DSL FP8 MLA decode requires mla_bmm1_scale and mla_bmm2_scale device tensors."
+            )
+        for name, scale in (
+            ("mla_bmm1_scale", softmax_scale),
+            ("mla_bmm2_scale", output_scale),
+        ):
+            if scale.dtype != torch.float32 or scale.numel() < 1:
+                raise RuntimeError(f"{name} must contain at least one float32 value.")
+            if scale.device != q.device:
+                raise RuntimeError(f"{name} must be on {q.device}, got {scale.device}.")
+        return softmax_scale, output_scale
+
+    @staticmethod
+    def _is_fp8_cute_dsl_selected(
+        attn: "TrtllmAttention",
+        meta: "TrtllmAttentionMetadata",
+        num_tokens: int,
+        kernel_dtype: Optional[torch.dtype],
+    ) -> bool:
+        if kernel_dtype != torch.float8_e4m3fn:
+            return False
+        backend = attn.flashinfer_mla_backend
+        policy = attn.mla_backend_policy
+        if policy is not None:
+            backend = policy(backend, meta, num_tokens)
+        return backend == "cute-dsl"
 
     @classmethod
     def is_available(cls, attn: "TrtllmAttention") -> bool:
@@ -48,9 +83,15 @@ class CuteDslMlaFmha(PhasedFmha):
             logger.debug("CuTe DSL MLA FMHA is unavailable: nvidia-cutlass-dsl is not installed.")
             return False
 
+        # SM107 (Rubin VR200) additionally requires the tcgen05 arch branches
+        # inside mla_decode_fp{16,8}.py to cover it; widening this gate alone
+        # makes the kernel run but emit all-NaN (the softmax row_max LdRed atom
+        # falls through to the wrong branch).
         sm = get_sm_version()
-        if sm not in (100, 103):
-            logger.debug(f"CuTe DSL MLA FMHA is unavailable: requires SM100 or SM103, got SM{sm}.")
+        if sm not in (100, 103, 107):
+            logger.debug(
+                f"CuTe DSL MLA FMHA is unavailable: requires SM100, SM103 or SM107, got SM{sm}."
+            )
             return False
 
         if not attn.is_mla_enable:
@@ -97,6 +138,25 @@ class CuteDslMlaFmha(PhasedFmha):
         if q.dtype in (torch.float16, torch.bfloat16):
             return q.dtype
         return None
+
+    @staticmethod
+    def _supports_mixed_batch(
+        attn: "TrtllmAttention",
+        meta: "TrtllmAttentionMetadata",
+    ) -> bool:
+        if meta.num_contexts == 0:
+            return True
+
+        kv_cache_manager = meta.kv_cache_manager
+        if kv_cache_manager is None or getattr(kv_cache_manager, "dtype", None) != DataType.NVFP4:
+            return False
+        layer_offsets = getattr(kv_cache_manager, "layer_offsets", {})
+        get_kv_cache_dtype = getattr(kv_cache_manager, "get_kv_cache_dtype", None)
+        return (
+            callable(get_kv_cache_dtype)
+            and attn.layer_idx in layer_offsets
+            and get_kv_cache_dtype(attn.layer_idx) == DataType.BF16
+        )
 
     @staticmethod
     def _to_cutlass_dtype(dtype: torch.dtype):
@@ -200,6 +260,15 @@ class CuteDslMlaFmha(PhasedFmha):
             metadata,
             forward_args,
         )
+        if supported and metadata.num_contexts > 0 and self.attn.num_heads != 96:
+            logger.info_once(
+                "CuTe DSL MLA FMHA selected for an NVFP4-manager BF16 fallback "
+                f"layer in a mixed batch: layer={self.attn.layer_idx}, "
+                f"num_contexts={metadata.num_contexts}, "
+                f"num_generations={metadata.num_generations}, "
+                f"q_shape={tuple(q.shape)}.",
+                key=f"cute_dsl_mla_mixed_bf16_layer:{self.attn.layer_idx}",
+            )
         if not supported:
             logger.debug(f"CuTe DSL MLA FMHA does not support request: {reason}")
         return supported
@@ -218,16 +287,20 @@ class CuteDslMlaFmha(PhasedFmha):
         critical batch size (``_PERF_MIN_BATCH_FP8``); everything else falls
         back to the next FMHA library.
 
-        bf16/fp16 KV: only num_heads == 16 is admitted.
+        bf16/fp16 KV: admit the measured Kimi K3 DEP/TEP head counts and the
+        existing 16-head path.
 
         ``batch_size=None`` evaluates only the batch-size-independent
         conditions (dtype, num_heads, seq_len_q) and skips the batch floor."""
+        _BF16_FP16_PERF_FAVORABLE_HEAD_COUNTS = (6, 12, 16, 96)
         if kernel_dtype != torch.float8_e4m3fn:
-            if num_heads == 16:
+            if num_heads in _BF16_FP16_PERF_FAVORABLE_HEAD_COUNTS:
                 return True, ""
             return False, (
-                f"CuTe DSL MLA decode on {kernel_dtype} KV is only a perf win "
-                f"for num_heads=16, got num_heads={num_heads}."
+                f"CuTe DSL MLA decode on {kernel_dtype} KV is only enabled "
+                "for num_heads in "
+                f"{list(_BF16_FP16_PERF_FAVORABLE_HEAD_COUNTS)}, "
+                f"got num_heads={num_heads}."
             )
         # Minimum per-rank decode batch size at which the CuteDSL kernel beats
         # the default TRTLLM path on the FP8-KV path, keyed by
@@ -264,12 +337,13 @@ class CuteDslMlaFmha(PhasedFmha):
     ) -> tuple[bool, str]:
         if fwd.attention_input_type != AttentionInputType.generation_only:
             return False, "CuTe DSL MLA FMHA only supports generation-only attention."
-        # It is to disable mix-batch(context request + generation request) for now.
-        # TODO: Eliminate high host overhead of cutedsl mla to enable mix-batch.
-        if meta.num_contexts != 0 or meta.num_generations <= 0:
+        # Keep the general mixed-batch performance gate, except when an
+        # NVFP4 manager exposes this layer through its BF16 fallback pool.
+        # TRTLLM-Gen cannot consume that combination with 128-token pages,
+        # while the CuTeDSL path below already slices all generation inputs
+        # and page tables past meta.num_contexts.
+        if meta.num_generations <= 0 or not self._supports_mixed_batch(attn, meta):
             return False, "CuTe DSL MLA FMHA only supports decode-only batches."
-        if meta.helix_position_offsets is not None:
-            return False, "CuTe DSL MLA FMHA does not support Helix parallelism."
         if meta.beam_width != 1:
             return False, f"Beam search is not supported, got beam_width={meta.beam_width}."
         # Linear-chain MTP / spec-decode (seq_len_q > 1) IS supported: the
@@ -286,25 +360,47 @@ class CuteDslMlaFmha(PhasedFmha):
             return False, "CuTe DSL MLA FMHA does not support custom/tree speculative masks."
         seq_len_q = q.shape[0] // meta.num_generations
         batch_size = meta.num_generations
+        if meta.helix_position_offsets is not None:
+            if seq_len_q != 1 and not getattr(meta, "_helix_spec_tokens_valid", False):
+                # Multi-token decode under helix needs the per-token bound /
+                # write-slot buffers of the speculative verify-group path.
+                return False, "CuTe DSL MLA FMHA only supports single-token decode with Helix."
+            softmax_stats = fwd.softmax_stats_tensor
+            if softmax_stats is None:
+                return False, "CuTe DSL MLA FMHA requires softmax_stats_tensor with Helix."
+            expected_stats_shape = (q.shape[0], attn.num_heads, 2)
+            if softmax_stats.shape != expected_stats_shape:
+                return False, (
+                    "CuTe DSL MLA FMHA requires Helix softmax stats with shape "
+                    f"{expected_stats_shape}, got {tuple(softmax_stats.shape)}."
+                )
+            if softmax_stats.dtype != torch.float32 or not softmax_stats.is_contiguous():
+                return False, (
+                    "CuTe DSL MLA FMHA requires contiguous float32 Helix softmax stats, "
+                    f"got dtype={softmax_stats.dtype}, contiguous={softmax_stats.is_contiguous()}."
+                )
+        kernel_dtype = self._get_kernel_dtype(attn, q)
 
         from tensorrt_llm._torch.autotuner import AutoTuner
 
-        # Perf gate (NOT a correctness limit).
-        favorable, reason = self._is_perf_favorable(
-            attn.num_heads,
-            None if AutoTuner.get().is_tuning_mode else batch_size,
-            seq_len_q,
-            self._get_kernel_dtype(attn, q),
-        )
-        if not favorable:
-            return False, reason
+        # Perf gate (NOT a correctness limit). An explicit CuTe-DSL choice
+        # uses this native wrapper as the FP8 correctness path because the
+        # FlashInfer public CuTe-DSL wrapper cannot consume device scales.
+        if not self._is_fp8_cute_dsl_selected(attn, meta, q.shape[0], kernel_dtype):
+            favorable, reason = self._is_perf_favorable(
+                attn.num_heads,
+                None if AutoTuner.get().is_tuning_mode else batch_size,
+                seq_len_q,
+                kernel_dtype,
+            )
+            if not favorable:
+                return False, reason
         if meta.kv_cache_manager is None:
             return False, "KV cache manager is required."
         if fwd.output is None:
             return False, "output is required."
 
         # The kernel type is the input dtype
-        kernel_dtype = self._get_kernel_dtype(attn, q)
         if kernel_dtype is None:
             return (
                 False,
@@ -413,6 +509,12 @@ class CuteDslMlaFmha(PhasedFmha):
         pool_idx = int(pool_mapping[local_layer_idx, 0])
         page_table_layer = block_offsets[pool_idx, :, 0, :]
         cache_seqs_base = params.sequence_lengths.to(torch.int32)
+        if cache_seqs_base.data_ptr() % 16 != 0:
+            # Mixed context/generation batches can expose an aligned buffer
+            # through an int32 slice whose storage offset is not 16-byte aligned.
+            # CuTe DSL requires the runtime pointer itself to preserve the
+            # alignment assumed when compiling the kernel.
+            cache_seqs_base = cache_seqs_base.clone()
         page_table = page_table_layer[meta.num_contexts :].transpose(0, 1).to(torch.int32)
         if layers_in_pool > 1:
             page_table = page_table + layer_in_pool
@@ -437,18 +539,7 @@ class CuteDslMlaFmha(PhasedFmha):
         softmax_scale = float(1.0 / (math.sqrt(qk_nope_head_dim + d_rope) * attn.q_scaling))
         output_scale = 1.0
         if kernel_dtype == torch.float8_e4m3fn:
-            cached = getattr(self, "_cute_dsl_fp8_scale", None)
-            if cached is None:
-                if torch.cuda.is_current_stream_capturing():
-                    raise RuntimeError(
-                        "CuTe DSL MLA FMHA: fp8 decode scale was not cached for "
-                        f"layer {attn.layer_idx} before CUDA graph capture."
-                    )
-                softmax_scale = float(params.fwd.mla_bmm1_scale[1].item()) / _LOG2_E
-                output_scale = float(params.fwd.mla_bmm2_scale[0].item())
-                self._cute_dsl_fp8_scale = (softmax_scale, output_scale)
-            else:
-                softmax_scale, output_scale = cached
+            softmax_scale, output_scale = self._get_fp8_scales(q, params.fwd)
 
         output_view = output.view(batch_size, seq_len_q, num_heads, d_latent)
 
@@ -473,6 +564,18 @@ class CuteDslMlaFmha(PhasedFmha):
             output_scale,
             # Max batch size for the AutoTuner to profile.
             int(meta.max_num_requests),
+            params.fwd.softmax_stats_tensor,
+            # Helix speculative verify groups: per-token rank-local bounds
+            # (filled by recompute_helix_spec_buffers). None on the
+            # single-token helix path and outside helix.
+            (
+                meta.helix_kv_bounds[:num_tokens]
+                if (
+                    meta.helix_position_offsets is not None
+                    and getattr(meta, "_helix_spec_tokens_valid", False)
+                )
+                else None
+            ),
         )
 
     def run_mla_generation(

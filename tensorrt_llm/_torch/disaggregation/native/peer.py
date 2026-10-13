@@ -376,6 +376,8 @@ class PeerRegistrar:
             peer_bytes_per_layer=peer_bytes_per_layer,
             self_buffers_per_layer=self_buffers_per_layer,
             peer_buffers_per_layer=peer_buffers_per_layer,
+            self_window_size=getattr(self_lg, "sliding_window_size", None),
+            peer_window_size=getattr(peer_lg, "sliding_window_size", None),
         )
 
         self._kv_map_cache[cache_key] = mapper
@@ -465,9 +467,14 @@ class PeerRegistrar:
 
         ranks: List[int] = []
         for pp in range(peer_start_pp, peer_end_pp):
-            for cp in range(peer_start_cp, peer_end_cp):
-                for tp in range(peer_start_tp, peer_end_tp):
-                    ranks.append(pp * peer_ri.tp_size * peer_ri.cp_size + cp * peer_ri.tp_size + tp)
+            for tp in range(peer_start_tp, peer_end_tp):
+                for cp in range(peer_start_cp, peer_end_cp):
+                    # CP-minor flat rank (ppRank*(TP*CP) + tpRank*CP +
+                    # cpRank), matching Mapping and the C++ transceiver; a
+                    # TP-minor formula mis-routes when tp > 1 and cp > 1.
+                    # Loop nesting mirrors the layout so ranks come out in
+                    # ascending order.
+                    ranks.append(pp * peer_ri.tp_size * peer_ri.cp_size + tp * peer_ri.cp_size + cp)
 
         dup_head, peer_dup_head = self._attention_policy.duplicate_head_factors(peer_ri)
 

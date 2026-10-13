@@ -100,6 +100,28 @@ def _validate_disagg_inflight_cancel_config(
         f"layerwise={layerwise!r}, try_zcopy={try_zcopy!r}.")
 
 
+def _validate_fp4_mla_disagg_transceiver(
+        kv_cache_manager: KVCacheManager,
+        cache_transceiver_config: CacheTransceiverConfig) -> None:
+    # FP4 MLA uses V2 native roles and therefore requires the role-aware page
+    # table implemented by the Python NIXL transceiver.
+    is_fp4_mla_v2 = callable(
+        getattr(kv_cache_manager, "get_fp4_mla_page_table_spec", None))
+    if (getattr(kv_cache_manager, "is_disagg", False) is not True
+            or not is_fp4_mla_v2):
+        return
+
+    runtime = cache_transceiver_config.transceiver_runtime or "CPP"
+    backend = cache_transceiver_config.backend
+    if runtime != "PYTHON" or backend != "NIXL":
+        raise ValueError(
+            "FP4 MLA disaggregated serving requires "
+            "cache_transceiver_config.backend='NIXL' and "
+            "cache_transceiver_config.transceiver_runtime='PYTHON' so the "
+            "high-precision MLA KV tail is transferred correctly; got "
+            f"backend={backend!r}, transceiver_runtime={runtime!r}.")
+
+
 def mapping_to_world_config(mapping: Mapping) -> WorldConfig:
 
     return WorldConfig(tensor_parallelism=mapping.tp_size,
@@ -148,6 +170,9 @@ def create_kv_cache_transceiver(
                 f"{env_var}=1 is set, but it's recommended to set cache_transceiver_config.backend in yaml config"
             )
         cache_transceiver_config.backend = backend
+
+    _validate_fp4_mla_disagg_transceiver(kv_cache_manager,
+                                         cache_transceiver_config)
 
     if cache_transceiver_config.backend == "MPI":
         logger.warning(

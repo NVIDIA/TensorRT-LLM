@@ -21,12 +21,53 @@ from tensorrt_llm._torch.pyexecutor import py_executor_creator
 from tensorrt_llm._torch.pyexecutor.py_executor_creator import (
     _MLA_CHUNKED_PREFILL_SUPPORTED_SM_VERSIONS,
     _MLA_KV_CACHE_REUSE_SUPPORTED_SM_VERSIONS,
+    _validate_fp4_mla_chunk_size,
 )
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
 from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig, ContextChunkingPolicy
 from tensorrt_llm.quantization import QuantAlgo
 
 pytestmark = pytest.mark.cpu_only
+
+
+@pytest.mark.parametrize(
+    ("enable_chunked_prefill", "max_num_tokens"),
+    [(True, 4096), (False, 4097)],
+)
+def test_dense_fp4_mla_accepts_aligned_or_disabled_chunking(
+    enable_chunked_prefill: bool,
+    max_num_tokens: int,
+) -> None:
+    model_config = SimpleNamespace(
+        attn_backend="TRTLLM",
+        sparse_attention_config=None,
+        quant_config=None,
+    )
+    kv_cache_config = SimpleNamespace(dtype="nvfp4")
+
+    _validate_fp4_mla_chunk_size(
+        model_config,
+        kv_cache_config,
+        enable_chunked_prefill=enable_chunked_prefill,
+        max_num_tokens=max_num_tokens,
+    )
+
+
+def test_dense_fp4_mla_rejects_unaligned_chunk_size() -> None:
+    model_config = SimpleNamespace(
+        attn_backend="TRTLLM",
+        sparse_attention_config=None,
+        quant_config=None,
+    )
+    kv_cache_config = SimpleNamespace(dtype="nvfp4")
+
+    with pytest.raises(ValueError, match="multiple of 16"):
+        _validate_fp4_mla_chunk_size(
+            model_config,
+            kv_cache_config,
+            enable_chunked_prefill=True,
+            max_num_tokens=4097,
+        )
 
 
 class _DummyCalibrator:
@@ -126,6 +167,8 @@ class _DummyModelEngine:
         *,
         attn_runtime_features,
         kv_cache_quant_algo,
+        attn_backend="TRTLLM",
+        sparse_attention_config=None,
         enable_flash_mla=False,
         max_seq_len=128,
     ):
@@ -134,6 +177,8 @@ class _DummyModelEngine:
         Args:
             attn_runtime_features: AttentionRuntimeFeatures instance.
             kv_cache_quant_algo: Quantization algorithm for KV cache.
+            attn_backend: Attention backend configured for the model.
+            sparse_attention_config: Optional sparse attention configuration.
             enable_flash_mla: Whether to emulate the FlashMLA block-size override.
             max_seq_len: Effective sequence length reported by the model engine.
         """
@@ -146,6 +191,8 @@ class _DummyModelEngine:
             model_config=SimpleNamespace(
                 enable_flash_mla=enable_flash_mla,
                 is_generation=True,
+                attn_backend=attn_backend,
+                sparse_attention_config=sparse_attention_config,
                 pretrained_config=SimpleNamespace(),
                 quant_config=SimpleNamespace(kv_cache_quant_algo=kv_cache_quant_algo),
             ),
@@ -162,6 +209,7 @@ def _make_llm_args():
     kv_cache_config = SimpleNamespace(
         enable_block_reuse=True,
         enable_partial_reuse=False,
+        dtype=None,
         tokens_per_block=32,
         max_attention_window=None,
         mamba_state_config=SimpleNamespace(
@@ -218,6 +266,8 @@ def _run_create_py_executor(
     model_max_seq_len=128,
     enable_chunked_prefill=False,
     is_hybrid_linear_model=False,
+    kv_cache_dtype=None,
+    sparse_attention_config=None,
     ctx_chunk_configs=None,
 ):
     """Execute create_py_executor with mocked dependencies and return MLA runtime flags.
@@ -236,6 +286,8 @@ def _run_create_py_executor(
         model_max_seq_len: Effective sequence length reported by the model engine.
         enable_chunked_prefill: Whether to request MLA chunked prefill support.
         is_hybrid_linear_model: Whether to emulate a hybrid linear model.
+        kv_cache_dtype: Optional explicit KV cache data type.
+        sparse_attention_config: Optional sparse attention configuration.
         ctx_chunk_configs: Optional list that receives the executor chunk config.
 
     Returns:
@@ -246,6 +298,7 @@ def _run_create_py_executor(
     llm_args.attn_backend = attn_backend
     llm_args.cache_transceiver_config = cache_transceiver_config
     llm_args.enable_chunked_prefill = enable_chunked_prefill
+    llm_args.kv_cache_config.dtype = kv_cache_dtype
     fake_mapping = SimpleNamespace(
         rank=0,
         tp_size=1,
@@ -298,6 +351,8 @@ def _run_create_py_executor(
         return _DummyModelEngine(
             attn_runtime_features=kwargs["attn_runtime_features"],
             kv_cache_quant_algo=kv_cache_quant_algo,
+            attn_backend=attn_backend,
+            sparse_attention_config=sparse_attention_config,
             enable_flash_mla=enable_flash_mla,
             max_seq_len=model_max_seq_len,
         )
@@ -370,6 +425,27 @@ def test_mla_unsupported_kv_quant_fallback_syncs_cache_reuse(monkeypatch):
 
     assert kv_cache_reuse is False
     assert runtime_cache_reuse is False
+
+
+@pytest.mark.parametrize(
+    "sparse_attention_config",
+    [
+        pytest.param(None, id="dense"),
+        pytest.param(SimpleNamespace(algorithm="dsa"), id="dsa"),
+    ],
+)
+def test_mla_nvfp4_preserves_cache_reuse(monkeypatch, sparse_attention_config):
+    """Verify dense and sparse MLA NVFP4 caches preserve block reuse."""
+    kv_cache_reuse, runtime_cache_reuse, _ = _run_create_py_executor(
+        monkeypatch,
+        sm_version=107,
+        kv_cache_quant_algo=QuantAlgo.NVFP4,
+        kv_cache_dtype="nvfp4",
+        sparse_attention_config=sparse_attention_config,
+    )
+
+    assert kv_cache_reuse is True
+    assert runtime_cache_reuse is True
 
 
 @pytest.mark.parametrize("sm_version", _MLA_KV_CACHE_REUSE_SUPPORTED_SM_VERSIONS)

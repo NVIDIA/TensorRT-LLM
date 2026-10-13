@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 1993-2025 NVIDIA CORPORATION &
+ * SPDX-FileCopyrightText: Copyright (c) 1993-2026 NVIDIA CORPORATION &
  * AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -18,13 +18,18 @@
 
 #include <numeric>
 #include <optional>
+#include <unordered_map>
 
 #include "GemmGatedActOptions.h"
 #include "KernelParams.h"
 #include "trtllm/gen/CudaKernelLauncher.h"
 
 #ifdef TLLM_GEN_EXPORT_INTERFACE
+#ifdef TLLM_GEN_EXPORT_FLASHINFER
+#include "flashinferMetaInfo.h"
+#else
 #include "KernelMetaInfo.h"
+#endif // TLLM_GEN_EXPORT_FLASHINFER
 #endif // TLLM_GEN_EXPORT_INTERFACE
 
 namespace gemmGatedAct
@@ -46,13 +51,18 @@ struct GemmGatedActData
         // The M dimension.
         // It is the total number of tokens if A is the activation matrix.
         // It is the total number of output channels multiplied by 2 if A is the weight matrix.
+        // ValidM/N/K by default assumes to be full range of M/N/K respectively. If we pad M/N/K due to
+        // alignment of other constraints, then we can specify ValidM/N/K to indicate the valid range.
         int32_t mM{0};
+        int32_t mValidM{0};
         // The N dimension.
         // It is the total number of tokens if B is the activation matrix.
         // It is the total number of output channels multiplied by 2 if B is the weight matrix.
         int32_t mN{0};
+        int32_t mValidN{0};
         // The K dimension. It is the hidden dimension of the input matrices.
         int32_t mK{0};
+        int32_t mValidK{0};
         // The rank id of the current device in the multi-gpu space.
         int32_t mRank{0};
         // The number of devices in tensor-parallel group.
@@ -146,6 +156,22 @@ struct GemmGatedActData
         // The shape is [N]
         void const* mPtrPerTokenSfB{nullptr};
 
+        // The sparsity information of A, if structured sparsity is used.
+        //
+        // When sparsityA is Any_2_4:
+        //     2 elements are non-zero in any chunk of 4 elements.
+        //     A 4-bit index indicates the position of the non-zero elements.
+        //     The shape in UInt8 is: [M, K / 8]
+        //
+        // When sparsityA is Pairwise_4_8:
+        //     4 elements are non-zero in any chunk of 8 elements.
+        //     The zero and non-zero elements are grouped in pairs.
+        //     A 4-bit index indicates the position of the non-zero pairs.
+        //     The shape in UInt8 is: [M, K / 16]
+        //
+        // If sparsityA is Dense, this should be set to nullptr.
+        void const* mPtrSparsityInfoA{nullptr};
+
         // The bias applied after the GEMM and before the activation function.
         // The bias is applied before the global scaling factor. I.e.
         // C = act(A * B + bias') * scaleC
@@ -161,21 +187,44 @@ struct GemmGatedActData
         // The dtype is float32.
         void const* mPtrBias{nullptr};
 
-        // The output tensor scaling factor for MxFp{4,8}, Fp8, NvFp4 and DeepSeek FP8 quantization.
-        // TensorRT LLM API requires a scaling factor on the device.
+        // The output tensor scaling factor for Fp8 (not DeepSeek FP8) and NvFp4 quantization.
+        // TensorRT-LLM API requires a scaling factor on the device.
+        // scaleC = dequantA * dequantB * quantC,
+        // where dequantA is global dequantization scaling factor of A
+        //    if dtypeA is FP8, it transforms the range from [-448, 448] to [-amaxA, amaxA]
+        //    if dtypeA is NvFp4, it transforms the range from [-448 * 6, 448 * 6] to [-amaxA, amaxA],
+        //    otherwise it is 1.
+        // dequantB is defined similarly to dequantA.
+        // quantC is the quantization scaling factor of C.
+        //    if dtypeC is FP8, it transforms the range from [-amaxC, amaxC] to [-448, 448]
+        //    if dtypeC is NvFp4, it transforms the range from [-amaxC, amaxC] to [-448 * 6, 448 * 6],
+        //    otherwise it is 1.
         // Shape is [1].
         void const* mPtrScaleC{nullptr};
-        // The output gate scale for MxFp{4,8}, NvFp4 and DeepSeek FP8 quantization.
-        // TensorRT LLM API requires a scaling factor on the device.
+        // The output gate scale for Fp8 (not DeepSeek FP8) and NvFp4 quantization.
+        // TensorRT-LLM API requires a scaling factor on the device.
+        // scaleGate = dequantA * dequantB,
+        // where dequantA is global dequantization scaling factor of A
+        //    if dtypeA is FP8, it transforms the range from [-448, 448] to [-amaxA, amaxA]
+        //    if dtypeA is NvFp4, it transforms the range from [-448 * 6, 448 * 6] to [-amaxA, amaxA],
+        //    otherwise it is 1.
+        // dequantB is defined similarly to dequantA.
         // Shape is [1].
         void const* mPtrScaleGate{nullptr};
-        // The alpha for SwiGlu or GeGlu.
+        // The alpha for SwiGlu GeGlu.
+        // The formula for SwiGlu (for GeGlu, replace sigmoid with phi):
+        //
+        //   out_glu  = x_glu * torch.sigmoid(alpha * x_glu) * (x_linear + beta)
         // Alpha is 1.f if nullptr.
         // Shape is [1].
         void const* mPtrGatedActAlpha{nullptr};
         // The beta for SwiGlu or GeGlu.
         // Beta is 0.f if nullptr.
         // Shape is [1].
+        //
+        // The beta is added before applying the global scaling factor. I.e.
+        // x_linear = (x_linear + beta') * scaleC
+        // Thus, the beta' = beta / (dequantA * dequantB), where the beta is the original beta.
         void const* mPtrGatedActBeta{nullptr};
         // The clamp limit before the activation.
         // Clamp limit is FLT_MAX if nullptr.
@@ -203,7 +252,7 @@ struct GemmGatedActData
         // beta' = beta / dqAb
         // out = scaleC * (x1 + beta') * x0
         //
-        // Note this assumes that scaleAb == scaleGate which is true in TRT-LLM MoE use-case
+        // Note this assumes that dequantScaleAb == scaleGate which is true in TRT-LLM MoE use-case
         //
         void const* mPtrClampLimit{nullptr};
     };
@@ -233,6 +282,17 @@ struct GemmGatedActData
         //
         // Otherwise should be set to nullptr.
         void* mPtrSfC{nullptr};
+
+#ifdef TLLM_RUBIN_FEATURES
+#ifdef TLLM_TEST
+        // The buffer to invalidate prior to triggering the secondary kernel.
+        //
+        // The data type which is used to determine the invalid value is controlled by options.mDtypeC.
+        //
+        // The shape is [N * M / 2].
+        void* mPtrInvalidation{nullptr};
+#endif // TLLM_TEST
+#endif // TLLM_RUBIN_FEATURES
     };
 
     ProblemDimensions mProblemDimensions;
@@ -251,298 +311,310 @@ class GemmGatedActInterface
 public:
     using ModuleCache = std::unordered_map<std::string, std::tuple<CUmodule, CUfunction>>;
 
-    GemmGatedActInterface() {}
+    GemmGatedActInterface(bool const exportsCubin = false, int32_t const numRotations = 1)
+        : mExportsCubin(exportsCubin)
+        , mNumRotations(numRotations)
+    {
+    }
+
+#ifndef TLLM_GEN_EXPORT_INTERFACE
+    // Generates and compiles the kernel using either nvcc or nvrtc.
+    GemmGatedActConfig generateAndCompileKernel(GemmGatedActConfig const& gemmGatedActConfig) const;
+#endif
 
     // Launch the cubin from the provided config. It calls all necessary memsets for internal buffers.
     // Provided config must be validated with isValidConfig before the call.
     int32_t run(GemmGatedActConfig const& config, void* workspace, GemmGatedActData const& data, void* cudaStream,
         int32_t multiProcessorCount, bool usePdl = true,
-        std::optional<std::reference_wrapper<ModuleCache>> moduleCache = std::nullopt) const;
-
-    // Initializes the buffers before the world sync. Must be called before run.
-    int32_t runInitBeforeWorldSync(
-        GemmGatedActConfig const& config, GemmGatedActData const& data, void* cudaStream) const;
-
-    // Returns the size of the workspace buffers in bytes
-    size_t getWorkspaceSizeInBytes(GemmGatedActConfig const& config, GemmGatedActData const& data) const;
-
-    // Returns the list of all available cubin configurations
-    GemmGatedActConfig const* getGemmConfigs() const;
-
-    // Returns the number of available cubin configurations
-    size_t getNumGemmConfigs() const;
-
-    // Returns true if the configuration of the cubin can be executed for the given params.
-    bool isValidConfig(GemmGatedActConfig const& config, GemmGatedActData const& data) const;
-
-private:
-    // Aligns the pointer to the alignment
-    template <typename Dtype>
-    inline Dtype* alignPtr(Dtype* ptr, int64_t alignment) const;
-
-    // Creates GemmGatedActOptions from kernel and data.
-    GemmGatedActOptions getOptionsFromConfigAndData(
-        GemmGatedActConfig const& config, GemmGatedActData const& data) const;
-
-    // Returns the size of the workspace buffers in bytes
-    std::vector<size_t> getWorkspaceSizesInBytes(GemmGatedActConfig const& config, GemmGatedActData const& data) const;
-
-    // Returns the size padded to the alignment
-    size_t getSizePaddedToAlignment(size_t size, size_t alignment) const;
-};
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
-template <typename Dtype>
-inline Dtype* GemmGatedActInterface::alignPtr(Dtype* ptr, int64_t alignment) const
-{
-    assert((alignment & (alignment - 1)) == 0 && "Alignment must be a power of 2");
-    return reinterpret_cast<Dtype*>((reinterpret_cast<uintptr_t>(ptr) + alignment - 1) & ~(alignment - 1));
-}
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
-GemmGatedActConfig const* GemmGatedActInterface::getGemmConfigs() const
-{
-#ifdef TLLM_GEN_EXPORT_INTERFACE
-    return tensorrt_llm::kernels::tllmGenGemmGatedActList;
-#else
-    return nullptr;
-#endif
-}
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
-size_t GemmGatedActInterface::getNumGemmConfigs() const
-{
-#ifdef TLLM_GEN_EXPORT_INTERFACE
-    return sizeof(tensorrt_llm::kernels::tllmGenGemmGatedActList)
-        / sizeof(tensorrt_llm::kernels::tllmGenGemmGatedActList[0]);
-#else
-    return 0;
-#endif
-}
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
-GemmGatedActOptions GemmGatedActInterface::getOptionsFromConfigAndData(
-    GemmGatedActConfig const& config, GemmGatedActData const& data) const
-{
-    // Create options from config and data.
-    GemmGatedActOptions options;
-    options = config.mOptions;
-    options.mM = data.mProblemDimensions.mM;
-    options.mN = data.mProblemDimensions.mN;
-    options.mK = data.mProblemDimensions.mK;
-    return options;
-}
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
-size_t GemmGatedActInterface::getSizePaddedToAlignment(size_t size, size_t alignment) const
-{
-    assert((alignment & (alignment - 1)) == 0);
-    return (size + alignment - 1) & ~(alignment - 1);
-}
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
-size_t GemmGatedActInterface::getWorkspaceSizeInBytes(
-    GemmGatedActConfig const& config, GemmGatedActData const& data) const
-{
-    auto workspaceSizes = getWorkspaceSizesInBytes(config, data);
-    auto size = std::accumulate(workspaceSizes.begin(), workspaceSizes.end(), 0);
-    // Additional 1023 bytes to align the pointer to 1024
-    return size > 0 ? size + 1023 : 0;
-}
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
-std::vector<size_t> GemmGatedActInterface::getWorkspaceSizesInBytes(
-    GemmGatedActConfig const& config, GemmGatedActData const& data) const
-{
-    // Get options from config.
-    auto& options = config.mOptions;
-
-    // The number of tiles in the M dimension.
-    int32_t numTilesM = gemm::divUp(data.mProblemDimensions.mM, options.mTileM);
-    // The number of tiles in the N dimension.
-    int32_t numTilesN = gemm::divUp(data.mProblemDimensions.mN, options.mTileN);
-
-    std::vector<size_t> workspaceSizes;
-
-    int64_t numBytesRowMax{0}, numBytesRowMaxBars{0};
-    if (options.mUseDeepSeekFp8)
+        std::optional<std::reference_wrapper<ModuleCache>> moduleCache = std::nullopt) const
     {
+        // Get options from config and data.
+        auto options = getOptionsFromConfigAndData(config, data);
 
-        // The number of bytes for intermediate row max results.
-        // numElts = M * N
-        // numDqSfsC = numElts / 128
-        // ctasPerTileN128 = 2
-        // numBytesRowMax = ctasPerTileN128 * numDqSfsC
-        numBytesRowMax = 2 * options.mM * options.mN / 128 * sizeof(float);
-        // The number of bytes for the row max completion barriers.
-        numBytesRowMaxBars = numTilesM * numTilesN / 2 * sizeof(uint32_t);
+        auto workspaceSizes = getWorkspaceSizesInBytes(config, data);
+        void* dRowMax{nullptr};
+        void* dRowMaxBars{nullptr};
 
-        // TODO: do we need to pad to 1024?
-        workspaceSizes.push_back(getSizePaddedToAlignment(numBytesRowMax, 1024));
-        workspaceSizes.push_back(getSizePaddedToAlignment(numBytesRowMaxBars, 1024));
-    }
-
-    return workspaceSizes;
-}
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
-bool GemmGatedActInterface::isValidConfig(GemmGatedActConfig const& config, GemmGatedActData const& data) const
-{
-    // Get options from config and data.
-    auto options = getOptionsFromConfigAndData(config, data);
-
-    // Is Blackwell?
-    bool isBlackwell = gemm::isSmVersionBlackwell(config.mSm);
-
-    // Check options without modifications.
-    return checkAndUpdateGemmGatedActOptions(options, isBlackwell,
-        /* updateOptions */ false);
-}
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
-int32_t GemmGatedActInterface::run(GemmGatedActConfig const& config, void* workspace, GemmGatedActData const& data,
-    void* cudaStream, int32_t multiProcessorCount, bool usePdl,
-    std::optional<std::reference_wrapper<ModuleCache>> moduleCache) const
-{
-    // Might be used.
-    (void) usePdl;
-    (void) moduleCache;
-    // Get options from config and data.
-    auto options = getOptionsFromConfigAndData(config, data);
-
-    auto workspaceSizes = getWorkspaceSizesInBytes(config, data);
-    void* dRowMax{nullptr};
-    void* dRowMaxBars{nullptr};
-
-    // Set the completion barriers to 0 if needed.
-    if (options.mUseDeepSeekFp8)
-    {
-        dRowMax = alignPtr(reinterpret_cast<char*>(workspace), 1024);
-        dRowMaxBars = reinterpret_cast<uint32_t*>(alignPtr(reinterpret_cast<char*>(dRowMax) + workspaceSizes[0], 1024));
-        auto err
-            = cudaMemsetAsync((void*) dRowMaxBars, 0x00, workspaceSizes[1], reinterpret_cast<cudaStream_t>(cudaStream));
-        if (err != cudaSuccess)
+        // Set the completion barriers to 0 if needed.
+        if (options.mUseDeepSeekFp8)
         {
-            return 1;
+            dRowMax = alignPtr(reinterpret_cast<char*>(workspace), 1024);
+            dRowMaxBars
+                = reinterpret_cast<uint32_t*>(alignPtr(reinterpret_cast<char*>(dRowMax) + workspaceSizes[0], 1024));
+            auto err = cudaMemsetAsync(
+                (void*) dRowMaxBars, 0x00, workspaceSizes[1], reinterpret_cast<cudaStream_t>(cudaStream));
+            if (err != cudaSuccess)
+            {
+                return 1;
+            }
         }
-    }
 
-    // The number of tiles in the M dimension.
-    int numTilesM = gemm::divUp(options.mM, options.mTileM);
-    // The number of tiles in the N dimension.
-    int numTilesN = gemm::divUp(options.mN, options.mTileN);
+        // The number of tiles in the M dimension.
+        int numTilesM = gemm::divUp(options.mM, options.mTileM);
+        // The number of tiles in the N dimension.
+        int numTilesN = gemm::divUp(options.mN, options.mTileN);
 
-    // Create kernel params.
-    auto kernelParams = gemmGatedAct::KernelParams::setKernelParams(options, data.mInputBuffers.mPtrA,
-        data.mInputBuffers.mPtrSfA, data.mInputBuffers.mPtrPerTokenSfA, data.mInputBuffers.mPtrB,
-        data.mInputBuffers.mPtrSfB, data.mInputBuffers.mPtrPerTokenSfB, data.mInputBuffers.mPtrBias,
-        data.mOutputBuffers.mPtrC, reinterpret_cast<float const*>(data.mInputBuffers.mPtrScaleC),
-        data.mOutputBuffers.mPtrSfC, reinterpret_cast<float const*>(data.mInputBuffers.mPtrScaleGate),
-        reinterpret_cast<float const*>(data.mInputBuffers.mPtrClampLimit),
-        reinterpret_cast<float const*>(data.mInputBuffers.mPtrGatedActAlpha),
-        reinterpret_cast<float const*>(data.mInputBuffers.mPtrGatedActBeta), reinterpret_cast<float*>(dRowMax),
-        reinterpret_cast<uint32_t*>(dRowMaxBars));
+        // Create kernel params.
+        auto kernelParams = gemmGatedAct::KernelParams::setKernelParams(options, data.mInputBuffers.mPtrA,
+            data.mInputBuffers.mPtrSfA, data.mInputBuffers.mPtrPerTokenSfA, data.mInputBuffers.mPtrB,
+            data.mInputBuffers.mPtrSfB, data.mInputBuffers.mPtrPerTokenSfB, data.mInputBuffers.mPtrSparsityInfoA,
+            data.mInputBuffers.mPtrBias, data.mOutputBuffers.mPtrC,
+            reinterpret_cast<float const*>(data.mInputBuffers.mPtrScaleC), data.mOutputBuffers.mPtrSfC,
+#ifdef TLLM_RUBIN_FEATURES
+#ifdef TLLM_TEST
+            data.mOutputBuffers.mPtrInvalidation,
+#endif // TLLM_TEST
+#endif // TLLM_RUBIN_FEATURES
+            reinterpret_cast<float const*>(data.mInputBuffers.mPtrScaleGate),
+            reinterpret_cast<float const*>(data.mInputBuffers.mPtrClampLimit),
+            reinterpret_cast<float const*>(data.mInputBuffers.mPtrGatedActAlpha),
+            reinterpret_cast<float const*>(data.mInputBuffers.mPtrGatedActBeta), reinterpret_cast<float*>(dRowMax),
+            reinterpret_cast<uint32_t*>(dRowMaxBars));
 
-    // The size of the grid.
-    std::vector<int32_t> grid{numTilesM, numTilesN, options.mNumSlicesForSplitK};
+        // The size of the grid.
+        std::vector<int32_t> grid{numTilesM, numTilesN, options.mNumSlicesForSplitK};
 
-    // When split-k is enabled and to guarantee the forward progress, we must ensure that the number
-    // of tiles is less than number of SMs. This way, at least one CTA in the grid can make forward.
-    if (options.mUseDeepSeekFp8)
-    {
-        if (grid[0] * grid[1] >= multiProcessorCount)
+        // When split-k is enabled and to guarantee the forward progress, we must ensure that the number
+        // of tiles is less than number of SMs. This way, at least one CTA in the grid can make forward.
+        if (options.mUseDeepSeekFp8)
         {
-            // The number of MN tiles in Split-K (grid[0] * grid[1]) must be less than the number of SMs.
-            return 2;
+            if (grid[0] * grid[1] >= multiProcessorCount)
+            {
+                // The number of MN tiles in Split-K (grid[0] * grid[1]) must be less than the number of
+                // SMs.
+                return 2;
+            }
         }
-    }
 
-#ifdef TLLM_GEN_EXPORT_INTERFACE
-    CUmodule cuModule;
-    CUfunction cuFunction;
-
-    if (moduleCache.has_value())
-    {
-        ModuleCache& moduleCacheRef = moduleCache.value().get();
-
-        // Modules are associated with a specific context, so the context is included in the key
-        CUcontext ctx;
-        unsigned long long ctxId;
-        cuCtxGetCurrent(&ctx);
-        cuCtxGetId(ctx, &ctxId);
-
-        // Reinterpret the ctxId as a string to avoid needing a custom hash or converting it to a
-        // string in decimal representation.
-        std::string const ctxName
-            = std::string(reinterpret_cast<char*>(&ctxId), sizeof(unsigned long long) / sizeof(char));
-        std::string const funcName = std::string(config.mFunctionName);
-        auto const moduleKey = ctxName + funcName;
-        auto module = moduleCacheRef.find(moduleKey);
-
-        // Use cache if module is found, otherwise load and insert into cache
-        if (module != moduleCacheRef.end())
+        GemmGatedActConfig gemmGatedActConfig = config;
+#ifndef TLLM_GEN_EXPORT_INTERFACE
+        if (gemmGatedActConfig.mData == nullptr)
         {
-            cuFunction = std::get<1>(module->second);
+            gemmGatedActConfig = generateAndCompileKernel(gemmGatedActConfig);
+        }
+#endif
+
+        if (gemmGatedActConfig.mData != nullptr)
+        {
+            CUmodule cuModule;
+            CUfunction cuFunction;
+
+            if (moduleCache.has_value())
+            {
+                ModuleCache& moduleCacheRef = moduleCache.value().get();
+
+                // Modules are associated with a specific context, so the context is included in the key
+                CUcontext ctx;
+                unsigned long long ctxId;
+                cuCtxGetCurrent(&ctx);
+                cuCtxGetId(ctx, &ctxId);
+
+                // Reinterpret the ctxId as a string to avoid needing a custom hash or converting it to a
+                // string in decimal representation.
+                std::string const ctxName
+                    = std::string(reinterpret_cast<char*>(&ctxId), sizeof(unsigned long long) / sizeof(char));
+                std::string const funcName = std::string(gemmGatedActConfig.mFunctionName);
+                auto const moduleKey = ctxName + funcName;
+                auto module = moduleCacheRef.find(moduleKey);
+
+                // Use cache if module is found, otherwise load and insert into cache
+                if (module != moduleCacheRef.end())
+                {
+                    cuFunction = std::get<1>(module->second);
+                }
+                else
+                {
+                    cuModuleLoadData(&cuModule, gemmGatedActConfig.mData);
+                    cuModuleGetFunction(&cuFunction, cuModule, gemmGatedActConfig.mFunctionName);
+                    moduleCacheRef.insert(std::make_pair(moduleKey, std::make_tuple(cuModule, cuFunction)));
+                }
+            }
+            else
+            {
+                cuModuleLoadData(&cuModule, gemmGatedActConfig.mData);
+                cuModuleGetFunction(&cuFunction, cuModule, gemmGatedActConfig.mFunctionName);
+            }
+
+            // Prepare the grid/block.
+            dim3 block3{static_cast<uint32_t>(gemmGatedActConfig.mNumThreadsPerCTA), static_cast<uint32_t>(1),
+                static_cast<uint32_t>(1)};
+            dim3 grid3{(grid.size() > 0 ? static_cast<uint32_t>(grid[0]) : 1u),
+                (grid.size() > 1 ? static_cast<uint32_t>(grid[1]) : 1u),
+                (grid.size() > 2 ? static_cast<uint32_t>(grid[2]) : 1u)};
+            // Prepare the cluster size.
+            dim3 cluster3{static_cast<uint32_t>(options.mClusterDimX), static_cast<uint32_t>(options.mClusterDimY),
+                static_cast<uint32_t>(options.mClusterDimZ)};
+
+            // Run the kernel.
+            auto result = trtllm::gen::launchKernel((void*) &kernelParams, cudaStream,
+                gemmGatedActConfig.mSharedMemSize, cuFunction, block3, grid3, cluster3,
+                usePdl
+                    && (gemmGatedActConfig.mOptions.mGridWaitForPrimaryEarlyExit
+                        | gemmGatedActConfig.mOptions.mGridWaitForPrimaryA
+                        | gemmGatedActConfig.mOptions.mGridWaitForPrimaryB));
+            if (result != CUDA_SUCCESS)
+            {
+                return result;
+            }
+            // If a module cache has not been given, unload the module to avoid leaking
+            if (!moduleCache.has_value())
+            {
+                cuModuleUnload(cuModule);
+            }
         }
         else
         {
-            cuModuleLoadData(&cuModule, config.mData);
-            cuModuleGetFunction(&cuFunction, cuModule, config.mFunctionName);
-            moduleCacheRef.insert(std::make_pair(moduleKey, std::make_tuple(cuModule, cuFunction)));
-        }
-    }
-    else
-    {
-        cuModuleLoadData(&cuModule, config.mData);
-        cuModuleGetFunction(&cuFunction, cuModule, config.mFunctionName);
-    }
-
-    // Prepare the grid/block.
-    dim3 block3{static_cast<uint32_t>(config.mNumThreadsPerCTA), static_cast<uint32_t>(1), static_cast<uint32_t>(1)};
-    dim3 grid3{(grid.size() > 0 ? static_cast<uint32_t>(grid[0]) : 1u),
-        (grid.size() > 1 ? static_cast<uint32_t>(grid[1]) : 1u),
-        (grid.size() > 2 ? static_cast<uint32_t>(grid[2]) : 1u)};
-    // Prepare the cluster size.
-    dim3 cluster3{static_cast<uint32_t>(options.mClusterDimX), static_cast<uint32_t>(options.mClusterDimY),
-        static_cast<uint32_t>(options.mClusterDimZ)};
-
-    // Run the kernel.
-    auto result = trtllm::gen::launchKernel((void*) &kernelParams, cudaStream, config.mSharedMemSize, cuFunction,
-        block3, grid3, cluster3,
-        usePdl
-            && (config.mOptions.mGridWaitForPrimaryEarlyExit | config.mOptions.mGridWaitForPrimaryA
-                | config.mOptions.mGridWaitForPrimaryB));
-    if (result != CUDA_SUCCESS)
-    {
-        return -1;
-    }
-    // If a module cache has not been given, unload the module to avoid leaking
-    if (!moduleCache.has_value())
-    {
-        cuModuleUnload(cuModule);
-    }
-#else
-    config.mCudaRunner->run((void*) &kernelParams, (void*) cudaStream, grid);
+#ifndef TLLM_GEN_EXPORT_INTERFACE
+            TLLM_CHECK_ERROR(gemmGatedActConfig.mCudaRunner != nullptr, "CudaRunner is not set");
+            gemmGatedActConfig.mCudaRunner->run((void*) &kernelParams, (void*) cudaStream, grid,
+                /* cluster */ {},
+                /* instanceId */ gemmGatedActConfig.mInstanceIdx);
 #endif
+        }
 
-    return 0;
-}
+        return 0;
+    }
 
-////////////////////////////////////////////////////////////////////////////////////////////////////
+    // Initializes the buffers before the world sync. Must be called before run.
+    int32_t runInitBeforeWorldSync(
+        GemmGatedActConfig const& /* config */, GemmGatedActData const& /* data */, void* /* cudaStream */) const
+    {
+        return 0;
+    }
 
-int32_t GemmGatedActInterface::runInitBeforeWorldSync(GemmGatedActConfig const&, GemmGatedActData const&, void*) const
-{
-    return 0;
-}
+    ////////////////////////////////////////////////////////////////////////////////////////////////////
+
+    // Returns the size of the workspace buffers in bytes
+    size_t getWorkspaceSizeInBytes(GemmGatedActConfig const& config, GemmGatedActData const& data) const
+    {
+        auto workspaceSizes = getWorkspaceSizesInBytes(config, data);
+        auto size = std::accumulate(workspaceSizes.begin(), workspaceSizes.end(), 0);
+        // Additional 1023 bytes to align the pointer to 1024
+        return size > 0 ? size + 1023 : 0;
+    }
+
+    ////////////////////////////////////////////////////////////////////////////////////////////////////
+
+    // Returns the list of all available cubin configurations
+    GemmGatedActConfig const* getGemmConfigs() const
+    {
+#ifdef TLLM_GEN_EXPORT_INTERFACE
+        return tensorrt_llm::kernels::tllmGenGemmGatedActList;
+#else
+        return nullptr;
+#endif
+    }
+
+    ////////////////////////////////////////////////////////////////////////////////////////////////////
+
+    // Returns the number of available cubin configurations
+    size_t getNumGemmConfigs() const
+    {
+#ifdef TLLM_GEN_EXPORT_INTERFACE
+        return sizeof(tensorrt_llm::kernels::tllmGenGemmGatedActList)
+            / sizeof(tensorrt_llm::kernels::tllmGenGemmGatedActList[0]);
+#else
+        return 0;
+#endif
+    }
+
+    ////////////////////////////////////////////////////////////////////////////////////////////////////
+
+    // Creates GemmGatedActOptions from kernel and data.
+    GemmGatedActOptions getOptionsFromConfigAndData(
+        GemmGatedActConfig const& config, GemmGatedActData const& data) const
+    {
+        // Create options from config and data.
+        GemmGatedActOptions options;
+        options = config.mOptions;
+        options.mM = data.mProblemDimensions.mM;
+        options.mN = data.mProblemDimensions.mN;
+        options.mK = data.mProblemDimensions.mK;
+        options.mValidM = data.mProblemDimensions.mValidM;
+        options.mValidN = data.mProblemDimensions.mValidN;
+        options.mValidK = data.mProblemDimensions.mValidK;
+        return options;
+    }
+
+    ////////////////////////////////////////////////////////////////////////////////////////////////////
+
+    // Returns true if the configuration of the cubin can be executed for the given params.
+    bool isValidConfig(GemmGatedActConfig const& config, GemmGatedActData const& data) const
+    {
+        // Get options from config and data.
+        auto options = getOptionsFromConfigAndData(config, data);
+
+        // Check options without modifications.
+        return checkAndUpdateGemmGatedActOptions(options, config.mSm,
+            /* updateOptions */ false);
+    }
+
+    ////////////////////////////////////////////////////////////////////////////////////////////////////
+
+private:
+    ////////////////////////////////////////////////////////////////////////////////////////////////////
+
+    // Aligns the pointer to the alignment
+    template <typename Dtype>
+    inline Dtype* alignPtr(Dtype* ptr, int64_t alignment) const
+    {
+        assert((alignment & (alignment - 1)) == 0 && "Alignment must be a power of 2");
+        return reinterpret_cast<Dtype*>((reinterpret_cast<uintptr_t>(ptr) + alignment - 1) & ~(alignment - 1));
+    }
+
+    ////////////////////////////////////////////////////////////////////////////////////////////////////
+
+    // Returns the size of the workspace buffers in bytes
+    std::vector<size_t> getWorkspaceSizesInBytes(GemmGatedActConfig const& config, GemmGatedActData const& data) const
+    {
+        // Get options from config.
+        auto& options = config.mOptions;
+
+        // The number of tiles in the M dimension.
+        int32_t numTilesM = gemm::divUp(data.mProblemDimensions.mM, options.mTileM);
+        // The number of tiles in the N dimension.
+        int32_t numTilesN = gemm::divUp(data.mProblemDimensions.mN, options.mTileN);
+
+        std::vector<size_t> workspaceSizes;
+
+        int64_t numBytesRowMax{0}, numBytesRowMaxBars{0};
+        if (options.mUseDeepSeekFp8)
+        {
+
+            // The number of bytes for intermediate row max results.
+            // numElts = M * N
+            // numDqSfsC = numElts / 128
+            // ctasPerTileN128 = 2
+            // numBytesRowMax = ctasPerTileN128 * numDqSfsC
+            numBytesRowMax = 2 * options.mM * options.mN / 128 * sizeof(float);
+            // The number of bytes for the row max completion barriers.
+            numBytesRowMaxBars = numTilesM * numTilesN / 2 * sizeof(uint32_t);
+
+            // TODO: do we need to pad to 1024?
+            workspaceSizes.push_back(getSizePaddedToAlignment(numBytesRowMax, 1024));
+            workspaceSizes.push_back(getSizePaddedToAlignment(numBytesRowMaxBars, 1024));
+        }
+
+        return workspaceSizes;
+    }
+
+    ////////////////////////////////////////////////////////////////////////////////////////////////////
+
+    // Returns the size padded to the alignment
+    size_t getSizePaddedToAlignment(size_t size, size_t alignment) const
+    {
+        assert((alignment & (alignment - 1)) == 0);
+        return (size + alignment - 1) & ~(alignment - 1);
+    }
+
+    ////////////////////////////////////////////////////////////////////////////////////////////////////
+
+private:
+    // Whether to export the cubin file.
+    bool mExportsCubin;
+    // The number of rotations.
+    int32_t mNumRotations;
+};
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 

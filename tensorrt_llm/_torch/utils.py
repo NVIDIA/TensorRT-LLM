@@ -3,6 +3,7 @@
 
 import contextlib
 import functools
+import math
 import os
 import threading
 from dataclasses import dataclass
@@ -61,14 +62,12 @@ class ActivationType(IntEnum):
     Geglu = 6
     SwigluBias = 7
     Relu2 = 8
+    SiTu = 9
 
 
-# TRTLLM-Gen-local activation encoding, kept separate from the shared
-# ActivationType above ON PURPOSE: ActivationType mirrors the cutlass enum in
-# common.h and drives cutlass MoE kernels, whereas SiTu exists only in the
-# trtllm-gen batched-GEMM kernels. Adding SiTu to the shared ActivationType
-# would force a matching cutlass enum member that no cutlass kernel implements.
-# So SiTu stays here (TRTLLM-15177 item 1.2(a): decided keep-backend-local).
+# TRTLLM-Gen keeps a backend-local activation encoding separate from the
+# shared CUTLASS ActivationType above. SiTu is implemented by both backends,
+# but its enum value and runtime contract remain backend-specific.
 # Keep this in sync with the ActType enum in
 # cpp/tensorrt_llm/kernels/trtllmGenKernels/batchedGemm/KernelRunner.h
 class ActType_TrtllmGen(IntEnum):
@@ -88,7 +87,8 @@ class ActType_TrtllmGen(IntEnum):
 # And make sure it aligned with cpp/tensorrt_llm/kernels/cutlass_kernels/include/moe_gemm_kernels.h::isGatedActivation function.
 def is_gated_activation(activation_type: ActivationType) -> bool:
     return activation_type in [
-        ActivationType.Swiglu, ActivationType.SwigluBias, ActivationType.Geglu
+        ActivationType.Swiglu, ActivationType.SwigluBias, ActivationType.Geglu,
+        ActivationType.SiTu
     ]
 
 
@@ -199,6 +199,43 @@ class Fp4QuantizedTensor:
     @property
     def shape(self):
         return self.fp4_tensor.shape
+
+
+@dataclass
+class MxFp8QuantizedTensor:
+    """MXFP8 activation and its per-1x32 UE8M0 scaling factors.
+
+    This internal carrier lets a producer fuse activation quantization into
+    an upstream kernel while preserving the existing ConfigurableMoE
+    dispatch contract. Scaling factors are expected to be two-dimensional
+    and row-major when ``is_sf_swizzled`` is false.
+    """
+
+    fp8_tensor: torch.Tensor
+    scaling_factor: torch.Tensor
+    is_sf_swizzled: bool = False
+
+    @property
+    def shape(self):
+        return self.fp8_tensor.shape
+
+    @property
+    def dtype(self):
+        return self.fp8_tensor.dtype
+
+    def numel(self):
+        return self.fp8_tensor.numel()
+
+    def split(self, split_size_or_sections, dim=0):
+        if dim != 0:
+            raise ValueError(
+                "MxFp8QuantizedTensor can only be split along the token dimension"
+            )
+        fp8_chunks = self.fp8_tensor.split(split_size_or_sections, dim=dim)
+        sf_chunks = self.scaling_factor.split(split_size_or_sections, dim=dim)
+        return tuple(
+            MxFp8QuantizedTensor(fp8_chunk, sf_chunk, self.is_sf_swizzled)
+            for fp8_chunk, sf_chunk in zip(fp8_chunks, sf_chunks))
 
 
 def compute_swizzled_sf_shape(row: int, col: int):
@@ -353,21 +390,69 @@ def deep_gemm_gen_tuning_buckets(x: int):
     return buckets
 
 
-def fp4_scale_infer_shape(input_shapes: List[List[int]]):
-    """Calculate the dimensions of the fp4 scale tensor.
+def deep_gemm_jit_warmup_buckets(max_m: int):
+    """M grid for the DeepGemm runners that exist only to drive JIT warmup.
+
+    DeepGemm picks its tile layout from a heuristic over M and compiles one
+    kernel per selected layout. A layout no bucket selects gets compiled
+    mid-inference instead, and DeepGemm forks nvcc while holding the GIL, so
+    that compile stalls every rank of the attention-DP group.
+
+    Step 16 is exactly the right spacing, and it is needed over the whole
+    range. In ``deepgemm/csrc/jit_kernels/heuristics/sm100.hpp`` the selection
+    depends on M only through ``ceil_div(m, block_m)``, and every candidate
+    ``block_m`` is a multiple of 16, so the choice is constant on each window
+    ``[16j + 1, 16j + 16]``: one sample per window misses nothing, and anything
+    coarser skips whole windows.
+
+    A coarse high-M band is *not* safe -- ``compare`` tie-breaks on
+    ``last_wave_util = num_blocks % num_sms``, which keeps oscillating. At
+    148 SMs and ``n=128, k=512``, ``M in [2305, 2368]`` selects a layout of its
+    own (``block_m=16``: one wave, best last-wave utilization) that a step-128
+    grid steps over, sampling 2304 and 2432.
     """
-    out_shape, scale_shape = fp4_utils.get_fp4_shape(input_shapes[0],
-                                                     sf_vec_size=16)
-    return scale_shape * 2
+    # A worker whose M never leaves the low band -- a disagg GEN worker runs at
+    # batch x MTP tokens -- must not be pulled up to the 4096 floor. Measured
+    # cost of doing so: +283 s of GEN autotune, +1096 tuning-cache entries.
+    if max_m < 128:
+        return tuple(range(8, 128, 8))
+    max_m = max(min(max_m, 8192), 4096)
+    low = range(8, 128, 8)
+    dense = range(128, max_m, 16)
+    return tuple(low) + tuple(dense) + (max_m, )
+
+
+def fp4_scale_infer_shape(input_shapes: List[List[int]]):
+    """Calculate the swizzled scale size for a packed FP4 input tensor."""
+    unpacked_shape = list(input_shapes[0])
+    unpacked_shape[-1] *= 2
+    _, scale_shape = fp4_utils.get_fp4_shape(unpacked_shape, sf_vec_size=16)
+    return scale_shape
+
+
+def mxfp8_scale_infer_shape(input_shapes: List[List[int]]):
+    """Calculate the number of bytes in an R128c4 MXFP8 scale tensor."""
+    input_shape = input_shapes[0]
+    m = math.prod(input_shape[:-1])
+    k = input_shape[-1]
+    return pad_up(m, 128) * pad_up(ceil_div(k, 32), 4)
 
 
 def fp4_unswizzled_scale_infer_shape(input_shapes: List[List[int]]):
-    """Calculate the dimensions of the fp4 scale tensor.
-    """
-    out_shape, scale_shape = fp4_utils.get_fp4_shape(input_shapes[0],
-                                                     sf_vec_size=16,
-                                                     is_swizzled_layout=False)
-    return scale_shape * 2
+    """Calculate the linear scale size for a packed FP4 input tensor."""
+    unpacked_shape = list(input_shapes[0])
+    unpacked_shape[-1] *= 2
+    _, scale_shape = fp4_utils.get_fp4_shape(
+        unpacked_shape,
+        sf_vec_size=16,
+        is_swizzled_layout=False,
+    )
+    return scale_shape
+
+
+def infer_output_m_shape(input_shapes: List[List[int]]):
+    """Infer the M dimension of the output tensor from the first input tensor."""
+    return input_shapes[0][0]
 
 
 def fp8_scale_infer_shape(input_shapes: List[List[int]]):

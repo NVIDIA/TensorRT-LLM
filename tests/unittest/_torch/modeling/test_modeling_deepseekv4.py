@@ -4,10 +4,11 @@
 import inspect
 import json
 import struct
+import types
 import weakref
 from copy import deepcopy
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
@@ -44,6 +45,7 @@ from tensorrt_llm._torch.models.modeling_deepseekv4 import (
     DeepseekV4ForCausalLM,
     DeepseekV4Gate,
     DeepseekV4MTP,
+    DeepseekV4WeightLoader,
     _copy_deepseek_v4_fused_a_weight_scale,
     _deepseek_v4_pos_embd_params,
     _normalize_deepseek_v4_nvfp4_mixed_precision_config,
@@ -155,15 +157,67 @@ def test_deepseek_v4_fused_hc_default_enabled(monkeypatch):
     assert _resolve_enable_fused_hc(config) is False
 
 
-def test_deepseek_v4_kv_cache_defaults_and_v2_preference():
-    defaults = DeepseekV4ForCausalLM.get_model_defaults(None)
+def test_entry_boundary_always_fuses_norm():
+    normed_layer_input = torch.randn(2, 3)
+    fused_output = (object(), object(), object(), normed_layer_input)
+    fused_hc = Mock(return_value=fused_output)
+    input_layernorm = Mock(return_value=normed_layer_input)
+    input_layernorm.weight = torch.ones(3)
+    input_layernorm.variance_epsilon = 1e-6
+    layer = types.SimpleNamespace(
+        is_first_layer=False,
+        hc_attn=types.SimpleNamespace(fused_hc=fused_hc),
+        input_layernorm=input_layernorm,
+    )
+    hc_state = types.SimpleNamespace(
+        is_deferred=True,
+        x_prev=torch.randn(2, 3),
+        residual=torch.randn(2, 3),
+        post_mix=torch.randn(2, 1),
+        comb_mix=torch.randn(2, 1),
+    )
+
+    actual = DeepseekV4DecoderLayer._entry_boundary(layer, hc_state, None, False)
+
+    for actual_item, expected_item in zip(actual[:3], fused_output[:3]):
+        assert actual_item is expected_item
+    assert actual[3] is normed_layer_input
+    fused_kwargs = fused_hc.call_args.kwargs
+    input_layernorm.assert_not_called()
+    assert fused_kwargs["norm_weight"] is input_layernorm.weight
+    assert fused_kwargs["norm_eps"] == input_layernorm.variance_epsilon
+
+
+@pytest.mark.parametrize("sm_version,expected_cute_dsl", [(100, False), (107, True)])
+def test_deepseek_v4_model_defaults(monkeypatch, sm_version, expected_cute_dsl):
+    class LlmArgs:
+        pass
+
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.models.modeling_deepseekv4.get_sm_version", lambda: sm_version
+    )
+    defaults = DeepseekV4ForCausalLM.get_model_defaults(LlmArgs())
 
     assert defaults == {
         "kv_cache_config": {
             "tokens_per_block": 128,
             "enable_swa_scratch_reuse": True,
-        }
+        },
+        "use_cute_dsl_blockscaling_mm": expected_cute_dsl,
     }
+    assert DeepseekV4ForCausalLM.get_preferred_kv_cache_manager_version() == "V2"
+
+
+def test_deepseek_v4_kv_cache_defaults_and_v2_preference(monkeypatch):
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.models.modeling_deepseekv4.get_sm_version", lambda: 100
+    )
+    defaults = DeepseekV4ForCausalLM.get_model_defaults(None)
+    assert defaults["kv_cache_config"] == {
+        "tokens_per_block": 128,
+        "enable_swa_scratch_reuse": True,
+    }
+    assert defaults["use_cute_dsl_blockscaling_mm"] is False
     assert DeepseekV4ForCausalLM.get_preferred_kv_cache_manager_version() == "V2"
 
 
@@ -189,6 +243,50 @@ def test_deepseek_v4_weight_remap_for_fp8_routed_experts():
 
     assert "model.layers.0.mlp.experts.0.w1.weight_scale_inv" in remapped
     assert "model.layers.0.mlp.experts.0.w1.weight_scale" not in remapped
+
+
+def test_deepseek_v4_eplb_weight_loader_pages_out_each_moe_layer(monkeypatch):
+    model = torch.nn.Module()
+    model.model = torch.nn.Module()
+    model.model.layers = torch.nn.ModuleList([torch.nn.Module()])
+    layer = model.model.layers[0]
+    layer.foo = torch.nn.Module()
+    layer.foo.weight = torch.nn.Parameter(torch.zeros(2))
+    layer.mlp = torch.nn.Module()
+    layer.mlp.experts = torch.nn.Module()
+    layer.mlp.experts.backend = torch.nn.Module()
+    model.config = SimpleNamespace(
+        q_lora_rank=1,
+        num_attention_heads=1,
+        qk_nope_head_dim=1,
+        v_head_dim=1,
+        kv_lora_rank=1,
+        num_hidden_layers=1,
+        num_nextn_predict_layers=0,
+    )
+    model.model_config = SimpleNamespace(
+        mapping=SimpleNamespace(
+            tp_rank=0,
+            tp_size=1,
+            cp_rank=0,
+            cp_size=1,
+            enable_attention_dp=False,
+        ),
+        moe_load_balancer=object(),
+    )
+    weights = {"model.layers.0.foo.weight": torch.tensor([1.0, 2.0])}
+    synchronize_calls = []
+    pageout_calls = []
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: synchronize_calls.append(None))
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.models.modeling_deepseekv4.pageout_file_backed_regions",
+        lambda path_substring, mode: pageout_calls.append((path_substring, mode)),
+    )
+
+    DeepseekV4WeightLoader(model)._load_weights_impl(weights)
+
+    assert len(synchronize_calls) == 1
+    assert pageout_calls == [(".safetensors", "dontneed")]
 
 
 def test_deepseek_v4_fused_a_weight_scale_rebuilds_fp8_shape():
@@ -609,6 +707,7 @@ def test_deepseek_v4_mtp_projection_uses_fp8_quant_config(monkeypatch):
         pretrained_config=config,
         mapping=Mapping(world_size=4, rank=2, tp_size=4),
         quant_config=quant_config,
+        use_cute_dsl_blockscaling_mm=True,
     )
 
     mtp_layer = DeepseekV4MTP(
@@ -627,6 +726,8 @@ def test_deepseek_v4_mtp_projection_uses_fp8_quant_config(monkeypatch):
     assert mtp_layer.h_proj.out_features == config.hidden_size
     assert mtp_layer.e_proj.reduce_output is True
     assert mtp_layer.h_proj.reduce_output is True
+    assert mtp_layer.e_proj.use_cute_dsl_blockscaling_mm is True
+    assert mtp_layer.h_proj.use_cute_dsl_blockscaling_mm is True
     assert mtp_layer.e_proj.weight.dtype is torch.float8_e4m3fn
     assert mtp_layer.h_proj.weight.dtype is torch.float8_e4m3fn
     assert hasattr(mtp_layer.e_proj, "weight_scale")

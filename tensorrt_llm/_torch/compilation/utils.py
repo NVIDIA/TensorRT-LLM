@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import contextlib
 from typing import Callable, List, Optional, Union
 
@@ -6,6 +21,7 @@ from torch.fx import Node
 from torch.fx.experimental.symbolic_shapes import ShapeEnv
 
 from ..cuda_tile_utils import IS_CUDA_TILE_AVAILABLE
+from ..cute_dsl_utils import IS_CUTLASS_DSL_INTERNAL_AVAILABLE
 
 
 def get_symint_val(i: Union[torch.SymInt | int]):
@@ -67,15 +83,15 @@ def inplace_info():
     inplace_map = {
         torch.ops.trtllm.flashinfer_fused_add_rmsnorm.default: {
             1: "input",
-            2: "residual"
+            2: "residual",
         },
         torch.ops.trtllm.flashinfer_fused_add_rmsnorm_quant.default: {
             1: "out",
-            2: "residual"
+            2: "residual",
         },
         torch.ops.trtllm.deepseek_v4_q_norm_fused_fp8.default: {
             1: "quant_q_out",
-            2: "q_pe_out"
+            2: "q_pe_out",
         },
         torch.ops.trtllm.fused_qk_norm_rope.default: {
             1: "qkv"
@@ -92,7 +108,7 @@ def inplace_info():
         torch.ops.trtllm.flashinfer_apply_rope_with_cos_sin_cache_inplace.default:
         {
             1: "query",
-            2: "key"
+            2: "key",
         },
         torch.ops.trtllm.logits_bitmask.default: {
             1: "logits"
@@ -103,11 +119,14 @@ def inplace_info():
         torch.ops.trtllm.moe_output_memset_inplace.default: {
             1: "input"
         },
+        torch.ops.trtllm.nvfp4_gemm_inplace.default: {
+            1: "output_tensor"
+        },
         torch.ops.trtllm.megamoe_prepare.default: {
             1: "x_out",
             2: "x_sf_out",
             3: "topk_idx_out",
-            4: "topk_weights_out"
+            4: "topk_weights_out",
         },
         torch.ops.trtllm.cute_dsl_nvfp4_grouped_gemm_finalize_inplace_blackwell.default:
         {
@@ -131,23 +150,23 @@ def inplace_info():
         torch.ops.trtllm.compressor_paged_kv_compress.default: {
             1: "paged_kv",
             2: "paged_score",
-            3: "output"
+            3: "output",
         },
         torch.ops.trtllm.compressor_prefill_reduction.default: {
             1: "paged_kv",
             2: "paged_score",
-            3: "output"
+            3: "output",
         },
         torch.ops.trtllm.compressor_postprocess_scatter.default: {
             1: "kv_out",
             2: "kv_cache",
             3: "quant_output",
-            4: "scale_output"
+            4: "scale_output",
         },
         torch.ops.trtllm.mhc_big_fuse.default: {
             1: "post_mix",
             2: "comb_mix",
-            3: "layer_input"
+            3: "layer_input",
         },
         torch.ops.trtllm.mhc_gemm_sqrsum_fma.default: {
             1: "y",
@@ -166,7 +185,7 @@ def inplace_info():
             4: "layer_input_cur",
             5: "y_acc_workspace",
             6: "r_acc_workspace",
-            7: "done_counter_workspace"
+            7: "done_counter_workspace",
         },
         torch.ops.trtllm.inplace_slice_copy.default: {
             1: "dest"
@@ -174,16 +193,26 @@ def inplace_info():
         torch.ops.trtllm.verify_dynamic_tree_rejection_out_op.default: {
             5: "acceptIndex",
             6: "acceptTokenNum",
-            7: "acceptToken"
-        }
+            7: "acceptToken",
+        },
     }
     optional_inplace_infos = {
         "attn_custom_op_inplace": {
             1: "output",
             2: "output_sf"
         },
+        # Must list EVERY name in the op's mutates_args. remove_copy_pass drops
+        # all underscore-prefixed kwargs (which is where auto_functionalize
+        # hoists mutable args) and restores only the names declared here, so an
+        # omitted one is silently absent from the rewritten call. DSv4 epilogue
+        # fusion added dsv4_output/dsv4_output_sf to mutates_args without
+        # updating this map, which surfaced as
+        # "mla_custom_op_inplace() is missing value for argument 'dsv4_output'"
+        # under torch_compile on 4xVR200 (nvbugs/6474888).
         "mla_custom_op_inplace": {
-            1: "output"
+            1: "output",
+            2: "dsv4_output",
+            3: "dsv4_output_sf"
         },
         "mla_dsa_attn_inplace": {
             1: "output"
@@ -237,6 +266,32 @@ def inplace_info():
         inplace_map[
             torch.ops.trtllm.cuda_tile_rms_norm_fuse_residual_.default] = {
                 1: "x",
-                2: "residual"
+                2: "residual",
+            }
+    if IS_CUTLASS_DSL_INTERNAL_AVAILABLE:
+        inplace_map[torch.ops.trtllm.cute_dsl_fp8_bmm_rubin.default] = {
+            1: "output"
+        }
+        inplace_map[torch.ops.trtllm.cute_dsl_bf16_bmm_rubin.default] = {
+            1: "output"
+        }
+        inplace_map[torch.ops.trtllm.cute_dsl_bf16_gemm_rubin.default] = {
+            1: "output"
+        }
+        inplace_map[
+            torch.ops.trtllm.cute_dsl_bf16_bmm_ugpu_inplace_rubin.default] = {
+                1: "output"
+            }
+        inplace_map[
+            torch.ops.trtllm.cute_dsl_bf16_gemm_ugpu_inplace_rubin.default] = {
+                1: "output"
+            }
+        inplace_map[
+            torch.ops.trtllm.cute_dsl_nvfp4_gemm_inplace_rubin.default] = {
+                1: "output_tensor"
+            }
+        inplace_map[
+            torch.ops.trtllm.cute_dsl_nvfp4_gemm_ugpu_inplace_rubin.default] = {
+                1: "output_tensor"
             }
     return inplace_map

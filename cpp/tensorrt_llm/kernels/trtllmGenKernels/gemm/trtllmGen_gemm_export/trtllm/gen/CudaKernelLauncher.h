@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 1993-2025 NVIDIA CORPORATION &
+ * SPDX-FileCopyrightText: Copyright (c) 1993-2026 NVIDIA CORPORATION &
  * AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -33,13 +33,25 @@ namespace gen
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 #ifdef TLLM_ENABLE_CUDA
-inline CUresult launchKernel(void* kernelParams, void* cudaStream, int32_t smemSize, CUfunction kernel, dim3 block3,
-    dim3 grid3, dim3 cluster3, bool enablesPdl)
+inline CUresult launchKernelFlexibleCgaSizes(void* kernelParams, void* cudaStream, int32_t smemSize, CUfunction kernel,
+    dim3 block3, dim3 grid3, dim3 cluster3, dim3 fallbackCluster3, bool enablesPdl)
 {
     // Make sure we can launch with that much shared memory.
+    // Note: those function-level settings are actually ignored as we use per-launch attributes.
     if (smemSize > 48 * 1024)
     {
-        CUresult result = cuFuncSetAttribute(kernel, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, smemSize);
+        CUresult result;
+#if defined(TLLM_RUBIN_FEATURES) && defined(CUDA_VERSION) && CUDA_VERSION >= 13030
+        // Note: the full 328 kiB smem carveout reduces the L1 cache size to 8 kB.
+        // Due to the risk of performance regression, users must explicitly opt-in to use this feature.
+        if (smemSize + 1024 > 228 * 1024)
+        {
+            result = cuFuncSetAttribute(
+                kernel, CU_FUNC_ATTRIBUTE_SHARED_MEMORY_MODE, CU_SHARED_MEMORY_MODE_ALLOW_OVERSIZED_SHARED_MEMORY);
+        }
+        else
+#endif
+            result = cuFuncSetAttribute(kernel, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, smemSize);
         if (result != CUDA_SUCCESS)
         {
             return result;
@@ -58,7 +70,103 @@ inline CUresult launchKernel(void* kernelParams, void* cudaStream, int32_t smemS
     launchConfig.hStream = reinterpret_cast<CUstream>(cudaStream);
     launchConfig.sharedMemBytes = smemSize;
 
+#if defined(TLLM_RUBIN_FEATURES) && defined(CUDA_VERSION) && CUDA_VERSION >= 13030
+    CUlaunchAttribute launchAttrs[5];
+#else
+    CUlaunchAttribute launchAttrs[4];
+#endif
+    launchAttrs[0].id = CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION;
+    launchAttrs[0].value.clusterDim.x = fallbackCluster3.x;
+    launchAttrs[0].value.clusterDim.y = fallbackCluster3.y;
+    launchAttrs[0].value.clusterDim.z = fallbackCluster3.z;
+    launchAttrs[1].id = CU_LAUNCH_ATTRIBUTE_CLUSTER_SCHEDULING_POLICY_PREFERENCE;
+    launchAttrs[1].value.clusterSchedulingPolicyPreference
+        = (clusterDim > 1) ? CU_CLUSTER_SCHEDULING_POLICY_SPREAD : CU_CLUSTER_SCHEDULING_POLICY_DEFAULT;
+    launchAttrs[2].id = CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION;
+    launchAttrs[2].value.programmaticStreamSerializationAllowed = enablesPdl;
+    launchAttrs[3].id = CU_LAUNCH_ATTRIBUTE_PREFERRED_CLUSTER_DIMENSION;
+    launchAttrs[3].value.preferredClusterDim.x = cluster3.x;
+    launchAttrs[3].value.preferredClusterDim.y = cluster3.y;
+    launchAttrs[3].value.preferredClusterDim.z = cluster3.z;
+    launchConfig.attrs = launchAttrs;
+    launchConfig.numAttrs = 4;
+#if defined(TLLM_RUBIN_FEATURES) && defined(CUDA_VERSION) && CUDA_VERSION >= 13030
+    if (smemSize + 1024 > 228 * 1024)
+    {
+        launchAttrs[4].id = CU_LAUNCH_ATTRIBUTE_SHARED_MEMORY_MODE;
+        launchAttrs[4].value.sharedMemoryMode = CU_SHARED_MEMORY_MODE_ALLOW_OVERSIZED_SHARED_MEMORY;
+        launchConfig.numAttrs = 5;
+    }
+#endif
+
+    // Add setting for non-portable cluster size.
+    {
+        CUresult result = cuFuncSetAttribute(kernel, CU_FUNC_ATTRIBUTE_NON_PORTABLE_CLUSTER_SIZE_ALLOWED,
+            1 // Enable non-portable cluster sizes
+        );
+        if (result != CUDA_SUCCESS)
+        {
+            return result;
+        }
+    }
+
+    // Launch the kernel.
+    return cuLaunchKernelEx(&launchConfig, kernel, &kernelParams, nullptr);
+}
+
+inline CUresult launchKernel(void* kernelParams, void* cudaStream, int32_t smemSize, CUfunction kernel, dim3 block3,
+    dim3 grid3, dim3 cluster3, bool enablesPdl
+#ifdef TLLM_TEST
+    ,
+    void* dependencyEvent = nullptr
+#endif // TLLM_TEST
+)
+{
+    // Make sure we can launch with that much shared memory.
+    // Note: those function-level settings are actually ignored as we use per-launch attributes.
+    if (smemSize > 48 * 1024)
+    {
+        CUresult result;
+#if defined(TLLM_RUBIN_FEATURES) && defined(CUDA_VERSION) && CUDA_VERSION >= 13030
+        // Note: the full 328 kiB smem carveout reduces the L1 cache size to 8 kB.
+        // Due to the risk of performance regression, users must explicitly opt-in to use this feature.
+        if (smemSize + 1024 > 228 * 1024)
+        {
+            result = cuFuncSetAttribute(
+                kernel, CU_FUNC_ATTRIBUTE_SHARED_MEMORY_MODE, CU_SHARED_MEMORY_MODE_ALLOW_OVERSIZED_SHARED_MEMORY);
+        }
+        else
+#endif
+            result = cuFuncSetAttribute(kernel, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, smemSize);
+        if (result != CUDA_SUCCESS)
+        {
+            return result;
+        }
+    }
+
+    auto clusterDim = cluster3.x * cluster3.y * cluster3.z;
+
+    CUlaunchConfig launchConfig;
+    launchConfig.blockDimX = block3.x;
+    launchConfig.blockDimY = block3.y;
+    launchConfig.blockDimZ = block3.z;
+    launchConfig.gridDimX = grid3.x;
+    launchConfig.gridDimY = grid3.y;
+    launchConfig.gridDimZ = grid3.z;
+    launchConfig.hStream = reinterpret_cast<CUstream>(cudaStream);
+    launchConfig.sharedMemBytes = smemSize;
+
+#if defined(TLLM_RUBIN_FEATURES) && defined(CUDA_VERSION) && CUDA_VERSION >= 13030 && defined(TLLM_TEST)
+    CUlaunchAttribute launchAttrs[5];
+#elif defined(TLLM_RUBIN_FEATURES) && defined(CUDA_VERSION) && CUDA_VERSION >= 13030
+    CUlaunchAttribute launchAttrs[4];
+#else
+#if defined(TLLM_TEST)
+    CUlaunchAttribute launchAttrs[4];
+#else
     CUlaunchAttribute launchAttrs[3];
+#endif // TLLM_TEST
+#endif
     launchAttrs[0].id = CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION;
     launchAttrs[0].value.clusterDim.x = cluster3.x;
     launchAttrs[0].value.clusterDim.y = cluster3.y;
@@ -68,8 +176,25 @@ inline CUresult launchKernel(void* kernelParams, void* cudaStream, int32_t smemS
         = (clusterDim > 1) ? CU_CLUSTER_SCHEDULING_POLICY_SPREAD : CU_CLUSTER_SCHEDULING_POLICY_DEFAULT;
     launchAttrs[2].id = CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION;
     launchAttrs[2].value.programmaticStreamSerializationAllowed = enablesPdl;
-    launchConfig.attrs = launchAttrs;
     launchConfig.numAttrs = 3;
+#if defined(TLLM_RUBIN_FEATURES) && defined(CUDA_VERSION) && CUDA_VERSION >= 13030
+    if (smemSize + 1024 > 228 * 1024)
+    {
+        launchAttrs[3].id = CU_LAUNCH_ATTRIBUTE_SHARED_MEMORY_MODE;
+        launchAttrs[3].value.sharedMemoryMode = CU_SHARED_MEMORY_MODE_ALLOW_OVERSIZED_SHARED_MEMORY;
+        launchConfig.numAttrs = 4;
+    }
+#endif
+#ifdef TLLM_TEST
+    if (dependencyEvent)
+    {
+        launchAttrs[launchConfig.numAttrs].id = CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_EVENT;
+        launchAttrs[launchConfig.numAttrs].value.programmaticEvent.triggerAtBlockStart = 1;
+        launchAttrs[launchConfig.numAttrs].value.programmaticEvent.event = reinterpret_cast<CUevent>(dependencyEvent);
+        launchConfig.numAttrs++;
+    }
+#endif // TLLM_TEST
+    launchConfig.attrs = launchAttrs;
 
     // Add setting for non-portable cluster size.
     if (clusterDim > 8)

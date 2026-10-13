@@ -16,6 +16,7 @@
 import importlib
 import os
 import pickle  # nosec B403
+import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -251,7 +252,20 @@ class TransformersTokenizer(TokenizerBase):
             )
             return (TransformersTokenizer, (self.tokenizer, ))
 
+    def _requires_pt_from_kimi_tokenizer(self, text, args, kwargs) -> bool:
+        return (os.environ.get("K3_TOKENIZER_FASTPATH") == "1"
+                and isinstance(text, str) and not args and kwargs == {
+                    "return_tensors": "pt"
+                } and type(self.tokenizer).__name__ == "TikTokenTokenizer" and
+                type(self.tokenizer).__module__.endswith(".tokenization_kimi"))
+
     def __call__(self, text: str, *args, **kwargs) -> Any:
+        if self._requires_pt_from_kimi_tokenizer(text, args, kwargs):
+            return self.tokenizer.prepare_for_model(self.encode(
+                text, add_special_tokens=False),
+                                                    add_special_tokens=True,
+                                                    return_tensors="pt",
+                                                    prepend_batch_axis=True)
         return self.tokenizer(text, *args, **kwargs)
 
     @property
@@ -266,7 +280,38 @@ class TransformersTokenizer(TokenizerBase):
     def name_or_path(self) -> str:
         return self.tokenizer.name_or_path
 
+    def _can_run_kimi_fast_encode(self, text, args, kwargs) -> bool:
+        tok = self.tokenizer
+        return (os.environ.get("K3_TOKENIZER_FASTPATH") == "1"
+                and isinstance(text, str)
+                and type(tok).__name__ == "TikTokenTokenizer"
+                and type(tok).__module__.endswith(".tokenization_kimi")
+                and not args and kwargs == {
+                    "add_special_tokens": False
+                } and not getattr(tok, "do_lower_case", False)
+                and not getattr(tok, "split_special_tokens", False)
+                and all(not (v.lstrip or v.rstrip or v.single_word)
+                        for v in tok.added_tokens_decoder.values()))
+
     def encode(self, text: str, *args, **kwargs) -> List[int]:
+        tok = self.tokenizer
+        if self._can_run_kimi_fast_encode(text, args, kwargs):
+            # Keep HF's added-token boundaries; native encode on the entire
+            # string can assign different IDs to marker strings. The guards
+            # above leave unsupported normalization/AddedToken options to HF.
+            added = tok.get_added_vocab()
+            if not added:
+                return tok.encode(text, *args, **kwargs)
+            pattern = "(" + "|".join(
+                re.escape(s)
+                for s in sorted(added, key=len, reverse=True)) + ")"
+            result = []
+            for piece in re.split(pattern, text):
+                if piece in added:
+                    result.append(added[piece])
+                elif piece:
+                    result.extend(tok.encode(piece))
+            return result
         return self.tokenizer.encode(text, *args, **kwargs)
 
     def decode(self, token_ids: List[int], *args, **kwargs) -> str:

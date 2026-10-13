@@ -1,0 +1,21 @@
+--- a/triton/backends/nvidia/compiler.py
++++ b/triton/backends/nvidia/compiler.py
+@@ -98,7 +98,7 @@ def file_hash(path):
+
+ def sm_arch_from_capability(capability: int):
+     # TODO: Handle non-"a" sms
+-    suffix = "a" if capability >= 90 else ""
++    suffix = "f" if capability >= 90 else ""
+     return f"sm_{capability}{suffix}"
+
+
+--- a/triton/backends/nvidia/driver.py
++++ b/triton/backends/nvidia/driver.py
+@@ -725,6 +725,8 @@ class CudaDriver(GPUDriver):
+         device = self.get_current_device()
+         capability = self.get_device_capability(device)
+         capability = capability[0] * 10 + capability[1]
++        if 100 < capability < 110 and capability != 103:
++            capability = 100
+         warp_size = 32
+         return GPUTarget("cuda", capability, warp_size)

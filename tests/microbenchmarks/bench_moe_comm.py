@@ -1248,7 +1248,6 @@ def _run_benchmark_worker_under_current_mpi(
                 num_slots,
                 top_k,
                 experts_per_rank,
-                payload_in_workspace=False,
                 alltoall_result_do_sum=True,
                 use_flashinfer=False,
             )

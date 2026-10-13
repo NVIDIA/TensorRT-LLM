@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -375,8 +375,8 @@ void* HostAccessibleDeviceAllocator::allocate(size_t memorySize)
         TLLM_CHECK_WITH_INFO(
             mAllowManagedFallback, "HostAccessibleDeviceAllocator is not supported on the current system.");
         TLLM_CUDA_CHECK(cudaMallocManaged(&devPtr, memorySize));
-        TLLM_CUDA_CHECK(cudaMemAdvise(
-            devPtr, memorySize, cudaMemAdviseSetPreferredLocation, {cudaMemLocationTypeDevice, currentDevId}));
+        TLLM_CUDA_CHECK(cudaMemAdvise(devPtr, memorySize, cudaMemAdviseSetPreferredLocation,
+            cudaMemLocation{cudaMemLocationTypeDevice, {currentDevId}}));
         hostPtr = devPtr;
     }
     recordAllocation(devPtr, memorySize, hostPtr, memDesc);

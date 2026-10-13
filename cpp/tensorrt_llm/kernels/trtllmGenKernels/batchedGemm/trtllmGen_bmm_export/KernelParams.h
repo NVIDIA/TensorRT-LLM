@@ -232,7 +232,7 @@ static auto makeTmaShapeStrideAbc(GemmOptions const& options, int sizeM, int siz
 
 // Create the TMA shape/stride for A/B block scaling factors.
 static auto makeTmaShapeStrideSfAb(int mM, int mN, int mK, MatrixType matrixType, int tileM, int tileN, int tileK,
-    tg::SfLayout layout, int sfReshapeFactor, int32_t const numEltsPerSf)
+    tg::SfLayout layout, int sfReshapeFactor, const int32_t numEltsPerSf)
 {
 
     // The outer dimension.
@@ -250,6 +250,7 @@ static auto makeTmaShapeStrideSfAb(int mM, int mN, int mK, MatrixType matrixType
     {
         // The scaling factor tensor packs 128x4 tiles into contiguous 512B blocks.
         // The 512B block maps to a 32x16B (32x128b) block in TMEM.
+        // See https://nvbugspro.nvidia.com/bug/4165523
         //
         // Additionally, we have to meet constraints of TMA that the box dimensions are less
         // than 256 and boxDim[0] is a multiple of 16B.
@@ -273,6 +274,36 @@ static auto makeTmaShapeStrideSfAb(int mM, int mN, int mK, MatrixType matrixType
 
         return std::make_tuple(shape, stride, tileShapes);
     }
+
+#ifdef TLLM_RUBIN_FEATURES
+    case tg::SfLayout::R128c16:
+    {
+        // The scaling factor tensor packs 128x16 tiles into contiguous 2048B blocks.
+        // The 2048B block maps to a 128x16B (128x128b) block in TMEM.
+        //
+        // Additionally, we have to meet constraints of TMA that the box dimensions are less
+        // than 256 and boxDim[0] is a multiple of 16B.
+        //
+        // The "logical" tensor is:      [outer,       inner / numEltsPerSf]
+        // The aforementioned format is: [outer / 128, inner / numEltsPerSf / 16,    2048]
+        // The shape we use for TMA is:  [outer / 128, inner / numEltsPerSf / 16, 8,  256]
+        auto shape = std::vector<uint64_t>{256, 8, static_cast<uint64_t>(ceilDiv(hiddenSize, numEltsPerSf * 16)),
+            static_cast<uint64_t>(ceilDiv(numTokens, 128))};
+
+        std::vector<uint64_t> stride(shape.size());
+        stride[0] = 1;
+        for (size_t i = 1; i < shape.size(); i++)
+        {
+            stride[i] = shape[i - 1] * stride[i - 1];
+        }
+
+        auto tileShapes
+            = std::vector<uint32_t>{256, 8, static_cast<uint32_t>(ceilDiv(hiddenSizePerTile, numEltsPerSf * 16)),
+                static_cast<uint32_t>(ceilDiv(numTokensPerTile, 128))};
+
+        return std::make_tuple(shape, stride, tileShapes);
+    }
+#endif // TLLM_RUBIN_FEATURES
 
     case tg::SfLayout::R8c4:
     {
@@ -363,9 +394,15 @@ static KernelParams setKernelParams(GemmOptions_ const& options, bool const batc
     void* ptrC, void const* dSfA, void const* dSfB, void const* ptrPerTokenSfA, void const* ptrPerTokenSfB,
     [[maybe_unused]] void const* ptrSparsityInfoA, void const* ptrBias, int32_t const* ptrPermutedIdxToBiasRowIdx,
     void* dSfC, float const* ptrScaleC, float const* ptrScaleAct, float const* ptrScaleGate, float const* ptrClampLimit,
-    float const* ptrGatedActAlpha, float const* ptrGatedActBeta, int32_t const* routeMap, float* rowMax,
-    uint32_t* rowMaxBars, int rank, int worldSize, uint32_t* ptrMulticastCompletionBarUc,
-    uint32_t* ptrMulticastCompletionBarMc, int32_t const* permutedIdxToExpandedIdx, void const* expertWeightsPtr,
+    float const* ptrGatedActAlpha, float const* ptrGatedActBeta,
+#ifdef TLLM_RUBIN_FEATURES
+#ifdef TLLM_TEST
+    void* ptrInvalidate, void* ptrSfInvalidate,
+#endif // TLLM_TEST
+#endif // TLLM_RUBIN_FEATURES
+    int32_t const* routeMap, float* rowMax, uint32_t* rowMaxBars, int rank, int worldSize,
+    uint32_t* ptrMulticastCompletionBarUc, uint32_t* ptrMulticastCompletionBarMc,
+    int32_t const* permutedIdxToExpandedIdx, void const* expertWeightsPtr,
     int32_t const* ptrNumNonExitingCtas = nullptr, int32_t const* ptrTotalNumPaddedTokens = nullptr,
     int32_t const* ptrCtaIdxXyToBatchIdx = nullptr, int32_t const* ptrCtaIdxXyToMnLimit = nullptr,
     int32_t const maxNumCtas = KernelParams::MaxNumCtas, uint32_t* ptrDynamicTileCounter = nullptr)
@@ -478,6 +515,12 @@ static KernelParams setKernelParams(GemmOptions_ const& options, bool const batc
     params.ptrSfB = dSfB;
     params.ptrSfC = dSfC;
 
+#ifdef TLLM_RUBIN_FEATURES
+#ifdef TLLM_TEST
+    params.ptrSfInvalidate = ptrSfInvalidate;
+#endif // TLLM_TEST
+#endif // TLLM_RUBIN_FEATURES
+
     // Do we pad A or B?
     bool doPadA = tg::dtypeNeedsPadding(options.mDtypeA, options.mMmaKind, options.mMmaK, isSparseA);
     bool doPadB = tg::dtypeNeedsPadding(options.mDtypeB, options.mMmaKind, options.mMmaK, isSparseA);
@@ -545,7 +588,7 @@ static KernelParams setKernelParams(GemmOptions_ const& options, bool const batc
 
             // Build TMA descriptor for gmem A block scaling factors.
             auto [shapeSfA, strideSfA, tileShapesSfA] = makeTmaShapeStrideSfAb(options.mM * options.mNumBatches,
-                options.mN, options.mK, MatrixType::MatrixA, options.mTileM, options.mTileN, options.mTileK,
+                options.mN, options.mK, MatrixType::MatrixA, options.mTileM, options.mTileN, options.mMmaTileK,
                 options.mSfLayoutA, options.mSfReshapeFactor, numEltsPerSfA);
             params.tmaSfA[0]
                 = gemm::buildSfTmaDescriptor(dTypeSfA, shapeSfA, strideSfA, tileShapesSfA, const_cast<void*>(dSfA));
@@ -584,7 +627,7 @@ static KernelParams setKernelParams(GemmOptions_ const& options, bool const batc
                 numSfsInValidK = ceilDiv(numSfsInValidK, 16) * 16;
 
                 auto [shapeSfB, strideSfB, tileShapesSfB] = makeTmaShapeStrideAbc(options, options.mM,
-                    options.mNumTokens, numSfsInK, options.mTileM, 1 /* tileN */, options.mTileK / numEltsPerSfB,
+                    options.mNumTokens, numSfsInK, options.mTileM, 1 /* tileN */, options.mMmaTileK / numEltsPerSfB,
                     MatrixType::MatrixB, options.mValidM, options.mNumTokens, numSfsInValidK);
                 params.tmaSfB[0]
                     = gemm::buildNdTmaDescriptor(dTypeSf, shapeSfB, strideSfB, tileShapesSfB, const_cast<void*>(dSfB),
@@ -601,8 +644,8 @@ static KernelParams setKernelParams(GemmOptions_ const& options, bool const batc
 
                 // Build TMA descriptor for gmem B block scaling factors.
                 auto [shapeSfB, strideSfB, tileShapesSfB] = makeTmaShapeStrideSfAb(options.mM, inputNumTokensSfB,
-                    options.mK, MatrixType::MatrixB, options.mTileM, options.mTileN, options.mTileK, options.mSfLayoutB,
-                    options.mSfReshapeFactor, numEltsPerSfB);
+                    options.mK, MatrixType::MatrixB, options.mTileM, options.mTileN, options.mMmaTileK,
+                    options.mSfLayoutB, options.mSfReshapeFactor, numEltsPerSfB);
                 params.tmaSfB[0]
                     = gemm::buildSfTmaDescriptor(dTypeSf, shapeSfB, strideSfB, tileShapesSfB, const_cast<void*>(dSfB));
             }
@@ -621,6 +664,18 @@ static KernelParams setKernelParams(GemmOptions_ const& options, bool const batc
             // Build tma descriptor for C.
             params.tmaC[0] = gemm::buildNdTmaDescriptor(options.mDtypeC, shapeC, strideC, tileShapeC, ptrC,
                 /*doPad=*/false);
+
+#ifdef TLLM_RUBIN_FEATURES
+#ifdef TLLM_TEST
+            if (ptrInvalidate)
+            {
+                // Build tma descriptor for invalidate..
+                params.tmaInvalidate[0]
+                    = gemm::buildNdTmaDescriptor(options.mDtypeC, shapeC, strideC, tileShapeC, ptrInvalidate,
+                        /*doPad=*/false);
+            }
+#endif // TLLM_TEST
+#endif // TLLM_RUBIN_FEATURES
         }
         else
         {
@@ -685,7 +740,7 @@ static KernelParams setKernelParams(GemmOptions_ const& options, bool const batc
                 numSfsInValidK = ceilDiv(numSfsInValidK, 16) * 16;
 
                 auto [shapeSfA, strideSfA, tileShapesSfA] = makeTmaShapeStrideAbc(options, options.mNumTokens,
-                    options.mN, numSfsInK, 1 /* tileM */, options.mTileN, options.mTileK / numEltsPerSfA,
+                    options.mN, numSfsInK, 1 /* tileM */, options.mTileN, options.mMmaTileK / numEltsPerSfA,
                     MatrixType::MatrixA, options.mNumTokens, options.mValidN, numSfsInValidK);
                 params.tmaSfA[0]
                     = gemm::buildNdTmaDescriptor(dTypeSf, shapeSfA, strideSfA, tileShapesSfA, const_cast<void*>(dSfA),

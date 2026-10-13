@@ -1,31 +1,40 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import os
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
-from utils.util import skip_pre_hopper
 
-from tensorrt_llm._torch.modules.linear import Linear
+from tensorrt_llm._torch.modules.linear import FP8QDQLinearMethod, Linear
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
 
-@skip_pre_hopper
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 9,
+    reason="FP8 correctness requires Hopper or newer",
+)
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_fp8_linear(dtype):
-    SEQ_LEN = 10
+@pytest.mark.parametrize("seq_len", [1, 8, 9, 64])
+def test_fp8_linear(dtype, seq_len):
+    SEQ_LEN = seq_len
     HIDDEN_SIZE = 128
+    OUTPUT_SIZE = 256
     torch.manual_seed(0)
     x = torch.randn((SEQ_LEN, HIDDEN_SIZE), dtype=dtype).cuda()
     x_fp8, x_scale = torch.ops.tensorrt_llm.quantize_e4m3_per_tensor(x)
     x_fp8 = x_fp8.view(torch.float8_e4m3fn)
     x_scale = x_scale.float().squeeze()
-    w = torch.randn((HIDDEN_SIZE, HIDDEN_SIZE), dtype=dtype).cuda()
+    w = torch.randn((OUTPUT_SIZE, HIDDEN_SIZE), dtype=dtype).cuda()
     w_fp8, w_scale = torch.ops.tensorrt_llm.quantize_e4m3_per_tensor(w)
     w_fp8 = w_fp8.view(torch.float8_e4m3fn)
     w_scale = w_scale.float().squeeze()
 
     qc = QuantConfig(quant_algo=QuantAlgo.FP8)
     l0 = Linear(in_features=HIDDEN_SIZE,
-                out_features=HIDDEN_SIZE,
+                out_features=OUTPUT_SIZE,
                 bias=False,
                 dtype=dtype,
                 quant_config=qc)
@@ -75,5 +84,45 @@ def test_fp8_linear(dtype):
     torch.testing.assert_close(output, ref_output)
 
 
-if __name__ == '__main__':
-    test_fp8_linear(torch.float16)
+@pytest.mark.parametrize("seq_len", [1, 8, 9, 64])
+@pytest.mark.parametrize("enable_cuda_core", [False, True])
+@pytest.mark.parametrize("batched", [False, True])
+def test_fp8_linear_dispatch(monkeypatch, seq_len, enable_cuda_core, batched):
+    """Exercise the real apply method without launching CUDA kernels."""
+    shape = (1, seq_len, 128) if batched else (seq_len, 128)
+    inputs = torch.zeros(shape).to(torch.float8_e4m3fn)
+    module = SimpleNamespace(
+        weight=torch.zeros((256, 128)).to(torch.float8_e4m3fn),
+        weight_scale=torch.tensor(0.5),
+        input_scale=torch.tensor(0.25),
+        force_dynamic_quantization=False,
+        dtype=torch.bfloat16,
+        enable_cuda_core=enable_cuda_core,
+        all_reduce=None,
+    )
+    expected = torch.zeros((seq_len, 256), dtype=module.dtype)
+    cuda_mm = Mock(return_value=expected)
+    cublas_mm = Mock(return_value=expected)
+    monkeypatch.setattr(torch.ops.trtllm, "cuda_scaled_mm", cuda_mm)
+    monkeypatch.setattr(torch.ops.trtllm, "cublas_scaled_mm", cublas_mm)
+
+    output = FP8QDQLinearMethod().apply(module, inputs, bias=None)
+
+    selected, unused = ((cuda_mm,
+                         cublas_mm) if enable_cuda_core and seq_len <= 8 else
+                        (cublas_mm, cuda_mm))
+    selected.assert_called_once()
+    unused.assert_not_called()
+    args, kwargs = selected.call_args
+    assert args[0].shape == (seq_len, 128)
+    assert args[0].data_ptr() == inputs.data_ptr()
+    assert args[1].shape == (128, 256)
+    assert args[1].data_ptr() == module.weight.data_ptr()
+    assert args[1].stride() == module.weight.t().stride()
+    assert kwargs["scale_a"] is module.input_scale
+    assert kwargs["scale_b"] is module.weight_scale
+    assert kwargs["out_dtype"] == module.dtype
+    assert kwargs["bias"] is None
+    assert kwargs["group"] is None
+    assert output.shape == (*shape[:-1], 256)
+    assert output.data_ptr() == expected.data_ptr()

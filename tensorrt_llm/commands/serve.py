@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import asyncio
 import atexit
 import contextlib
@@ -134,8 +137,7 @@ def _signal_handler_cleanup_child(signum, frame):
 
 
 def is_non_default_or_required(param_name, value, backend, explicit_cli_keys):
-    """
-    Check if a parameter should be explicitly included in llm_args.
+    """Check if a parameter should be explicitly included in llm_args.
 
     Returns True if parameter is either:
     1. Always required (core params that must be present), OR
@@ -222,6 +224,7 @@ def get_llm_args(
         otlp_traces_endpoint: Optional[str] = None,
         enable_chunked_prefill: bool = False,
         enable_attention_dp: bool = False,
+        enable_ugpu: bool = False,
         video_pruning_rate: Optional[float] = None,
         telemetry: bool = True,
         agent_percentage: float = 0.0,
@@ -296,6 +299,8 @@ def get_llm_args(
         enable_chunked_prefill,
         "enable_attention_dp":
         enable_attention_dp,
+        "enable_ugpu":
+        enable_ugpu,
         "revision":
         revision,
         "reasoning_parser":
@@ -599,6 +604,17 @@ def launch_server(
 
     backend = llm_args["backend"]
     model = served_model_name or llm_args["model"]
+
+    if isinstance(server_role, str):
+        server_role = ServerRole[server_role.upper()]
+    # MPI workers may predate this launcher process. Send the role through
+    # worker_main's explicit overrides instead of relying on env inheritance.
+    # Clear inherited CTX roles for generation and unspecified-role servers.
+    llm_args["env_overrides"] = {
+        **(llm_args.get("env_overrides") or {}),
+        "TRTLLM_DISAGG_ROLE":
+        (server_role.name.lower() if server_role is not None else ""),
+    }
 
     multi_frontend = _init_multi_frontend_mode(llm_args, multi_frontend_enabled)
     # Same hazard the disaggregated fleet guard covers: _spawn_attached_frontends
@@ -1162,6 +1178,12 @@ def launch_visual_gen_server(
                   default=False,
                   help="Enable attention data parallel.",
                   status="beta")
+@stability_option(
+    "--enable_ugpu",
+    is_flag=True,
+    default=False,
+    help="Enable uGPU execution for supported PyTorch backend ops.",
+    status="prototype")
 @stability_option("--media_io_kwargs",
                   type=str,
                   default=None,
@@ -1271,14 +1293,14 @@ def serve(model: str, tokenizer: Optional[str], custom_tokenizer: Optional[str],
           server_role: Optional[str],
           fail_fast_on_attention_window_too_large: bool,
           otlp_traces_endpoint: Optional[str], enable_chunked_prefill: bool,
-          enable_attention_dp: bool, disagg_cluster_uri: Optional[str],
-          media_io_kwargs: Optional[str], agent_percentage: float,
-          agent_types: Optional[str], video_pruning_rate: Optional[float],
-          telemetry: bool, custom_module_dirs: list[Path],
-          chat_template: Optional[str], allow_request_chat_template: bool,
-          middleware: tuple[str, ...], grpc: bool, enable_visual_gen: bool,
-          served_model_name: Optional[str], visual_gen_args: Optional[str],
-          report_addr: Optional[str]):
+          enable_attention_dp: bool, enable_ugpu: bool,
+          disagg_cluster_uri: Optional[str], media_io_kwargs: Optional[str],
+          agent_percentage: float, agent_types: Optional[str],
+          video_pruning_rate: Optional[float], telemetry: bool,
+          custom_module_dirs: list[Path], chat_template: Optional[str],
+          allow_request_chat_template: bool, middleware: tuple[str, ...],
+          grpc: bool, enable_visual_gen: bool, served_model_name: Optional[str],
+          visual_gen_args: Optional[str], report_addr: Optional[str]):
     """Running an OpenAI API compatible server
 
     MODEL: model name | HF checkpoint path | TensorRT engine path
@@ -1377,6 +1399,7 @@ def serve(model: str, tokenizer: Optional[str], custom_tokenizer: Optional[str],
             otlp_traces_endpoint=otlp_traces_endpoint,
             enable_chunked_prefill=enable_chunked_prefill,
             enable_attention_dp=enable_attention_dp,
+            enable_ugpu=enable_ugpu,
             video_pruning_rate=video_pruning_rate,
             telemetry=telemetry,
             agent_percentage=agent_percentage,
@@ -1864,7 +1887,6 @@ def disaggregated(
     report_addr: Optional[str],
 ):
     """Running server in disaggregated mode"""
-
     logger.set_level(log_level)
     set_prometheus_multiproc_dir()
 
@@ -2102,6 +2124,7 @@ def _serve_coordinator_and_fleet(disagg_cfg, config_file,
     from tensorrt_llm.serve.disagg_coordinator import DisaggCoordinatorService
 
     public_host, public_port = disagg_cfg.hostname, disagg_cfg.port
+    coordinator_bind_host = disagg_cfg.effective_coordinator_bind_host
     coord_port = int(
         os.environ.get(DisaggWorkerEnvs.TLLM_DISAGG_COORDINATOR_PORT,
                        public_port - 1))
@@ -2141,13 +2164,13 @@ def _serve_coordinator_and_fleet(disagg_cfg, config_file,
         _client_factory,
         metadata_config=metadata_server_cfg,
         server_start_timeout_secs=server_start_timeout)
-    logger.info(f"Coordinator serving on {public_host}:{coord_port} "
-                f"(uds={coord_uds}) (fleet on public port {public_port})")
+    logger.info(f"Coordinator serving on {coordinator_bind_host}:{coord_port} "
+                f"(uds={coord_uds}) (fleet on {public_host}:{public_port})")
 
     async def _serve_and_monitor():
         server_task = asyncio.create_task(
             CoordinatorServer(coordinator)(
-                public_host,
+                coordinator_bind_host,
                 coord_port,
                 uds=coord_uds,
                 keep_alive_timeout=disagg_cfg.server_keep_alive_timeout))
@@ -2304,7 +2327,6 @@ def set_cuda_device():
                   status="beta")
 def disaggregated_mpi_worker(config_file: Optional[str], log_level: str):
     """Launching disaggregated MPI worker"""
-
     from tensorrt_llm._utils import mpi_rank
     if os.environ.get(DisaggLauncherEnvs.
                       TLLM_DISAGG_RUN_REMOTE_MPI_SESSION_CLIENT) != "1":
@@ -2400,10 +2422,10 @@ def _launch_disaggregated_server(disagg_config_file: str, llm_args: dict):
     disagg_config = parse_disagg_config_file(disagg_config_file)
     server_cfg = disagg_config.server_configs[int(instance_idx)]
 
-    # Set disagg role for telemetry (server_cfg.type is 'ctx' or 'gen')
-    role_map = {"ctx": "context", "gen": "generation"}
-    os.environ[DisaggLauncherEnvs.TLLM_DISAGG_ROLE] = role_map.get(
-        server_cfg.type, "")
+    server_role = {
+        "ctx": ServerRole.CONTEXT,
+        "gen": ServerRole.GENERATION
+    }[server_cfg.type]
 
     logger.info(
         f"rank {mpi_rank()} for index {instance_idx} launch the disagg server")
@@ -2422,6 +2444,7 @@ def _launch_disaggregated_server(disagg_config_file: str, llm_args: dict):
     launch_server(host=server_cfg.hostname,
                   port=server_cfg.port,
                   llm_args=llm_args,
+                  server_role=server_role,
                   **launch_kwargs)
 
 
@@ -2525,7 +2548,7 @@ def _launch_disaggregated_leader(sub_comm, instance_idx: int, config_file: str,
                             f"Child process {_child_p_global.pid} failed to be killed even after 30s."
                         )
             assert _child_p_global.poll(
-            ) is not None, f"the subprocess should be terminated"
+            ) is not None, "the subprocess should be terminated"
 
     # Check if the process was launched and assert it's terminated
     if _child_p_global and hasattr(_child_p_global,

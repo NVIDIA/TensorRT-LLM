@@ -446,7 +446,7 @@ class TestKdaReplaySeedOnDisaggTransfer(unittest.TestCase):
     window seeded from the (transferred) conv pool, draft tail columns and
     pending-draft scratch cleared, other slots untouched."""
 
-    L, SLOTS, D, W, M, NHEADS = 2, 4, 6, 4, 2, 3  # committed = W - 1 = 3
+    L, SLOTS, D, W, M, NHEADS = 2, 4, 6, 4, 2, 3
 
     def _make_manager(self, use_kda_replay=True):
         from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import PythonMambaCacheManager
@@ -459,11 +459,11 @@ class TestKdaReplaySeedOnDisaggTransfer(unittest.TestCase):
 
         cache = _FakeSpecState()
         torch.manual_seed(0)
-        cache.conv = torch.randn(L, SLOTS, 3 * D, W)
+        cache.conv = torch.randn(L, SLOTS, 3 * D, committed)
         cache.kda_conv_q = torch.full((L, SLOTS, D, committed + M), 7.0)
         cache.kda_conv_k = torch.full((L, SLOTS, D, committed + M), 7.0)
         cache.kda_conv_v = torch.full((L, SLOTS, D, committed + M), 7.0)
-        cache.kda_qkg_cache = torch.full((L, SLOTS, M, 3, D), 7.0)
+        cache.kda_kg_cache = torch.full((L, SLOTS, M, 2, D), 7.0)
         cache.kda_v_cache = torch.full((L, SLOTS, M, D), 7.0)
         cache.kda_beta_cache = torch.full((L, SLOTS, M, NH), 7.0)
         cache.prev_num_accepted_tokens = torch.full((SLOTS,), 5, dtype=torch.int32)
@@ -488,10 +488,10 @@ class TestKdaReplaySeedOnDisaggTransfer(unittest.TestCase):
                 (cache.kda_conv_v, 2 * d, 3 * d),
             ):
                 torch.testing.assert_close(
-                    kda[:, slot, :, :committed], conv_before[:, slot, lo:hi, 1:].to(kda.dtype)
+                    kda[:, slot, :, :committed], conv_before[:, slot, lo:hi].to(kda.dtype)
                 )
                 assert (kda[:, slot, :, committed:] == 0).all()
-            assert (cache.kda_qkg_cache[:, slot] == 0).all()
+            assert (cache.kda_kg_cache[:, slot] == 0).all()
             assert (cache.kda_v_cache[:, slot] == 0).all()
             assert (cache.kda_beta_cache[:, slot] == 0).all()
             assert cache.prev_num_accepted_tokens[slot] == 0
@@ -500,7 +500,7 @@ class TestKdaReplaySeedOnDisaggTransfer(unittest.TestCase):
         # Untouched slots keep their contents.
         for slot in (0, 2):
             assert (cache.kda_conv_q[:, slot] == 7.0).all()
-            assert (cache.kda_qkg_cache[:, slot] == 7.0).all()
+            assert (cache.kda_kg_cache[:, slot] == 7.0).all()
             assert cache.prev_num_accepted_tokens[slot] == 5
 
     def test_noop_without_kda_replay_or_unknown_ids(self):

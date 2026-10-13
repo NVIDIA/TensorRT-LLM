@@ -545,14 +545,31 @@ def test_mhc_fused_hc_mma_tactic_filter_hidden_sizes():
         for hidden_size in (4096, 7168, 8192)
     }
 
-    # After P0 (Path D KS=112 enable + scalar-vec tail in Phase 4), the
-    # support trait reduces to `hidden % bf16_vec == 0` and `h_tiles % ks == 0`,
-    # so any KS in the table that divides HIDDEN/BLOCK_K is supported.
-    # h_tiles(4096) = 64 → KS divisors of 64; h_tiles(7168) = 112 → divisors
-    # of 112; hidden=8192 is not in the supported-hidden allowlist.
+    # Preserve the evenly-divided support set and add only the two measured
+    # H=7168 exact-wave Rubin tactics.
     assert supported_by_hidden_size[4096] == {1, 2, 4, 8, 16, 32, 64}
-    assert supported_by_hidden_size[7168] == {1, 2, 4, 7, 8, 14, 16, 28, 56, 112}
+    assert supported_by_hidden_size[7168] == {1, 2, 4, 7, 8, 14, 16, 28, 53, 56, 106, 112}
     assert supported_by_hidden_size[8192] == set()
+
+
+def test_mhc_fused_hc_rubin_target_mma_ks():
+    from tensorrt_llm._torch.modules.mhc.mhc_cuda import _fused_hc_target_mma_ks
+
+    expected = {
+        32: 112,
+        64: 112,
+        128: 106,
+        256: 53,
+        8192: 8,
+        16384: 4,
+    }
+    assert {
+        m: _fused_hc_target_mma_ks(7168, m, sm_count=212, is_rubin=True) for m in expected
+    } == expected
+
+    # The corresponding grids must fit the Rubin five-wave autotune guard.
+    max_grid_ctas = 212 * 5
+    assert all(((m + 63) // 64) * ks <= max_grid_ctas for m, ks in expected.items())
 
 
 @pytest.mark.parametrize("n", [128, 2048])

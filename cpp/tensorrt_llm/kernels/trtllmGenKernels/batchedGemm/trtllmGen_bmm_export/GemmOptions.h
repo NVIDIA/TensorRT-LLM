@@ -125,28 +125,54 @@ struct GemmOptions
 #endif
 
     GemmOptions() = default;
-
     GemmOptions(AllReduceAlgo allReduceAlgo, tg::Dtype biasDtype, BiasType biasType, int blockK, bool clcFastDrain,
         int clusterDimX, int clusterDimY, int clusterDimZ, CtaSwizzleType ctaSwizzleType, tg::Dtype dtypeAcc,
         tg::Dtype dtypeA, tg::Dtype dtypeB, tg::Dtype dtypeC, tg::Dtype dtypeMmaA, tg::Dtype dtypeMmaB,
         tg::Dtype dtypeSfC, EltwiseActType eltwiseActType, bool enablesEarlyExit, bool enablesDelayedEarlyExit,
+#ifndef TLLM_PUBLIC_RELEASE
+        bool enablesGlobalPtxKnobs,
+#endif // TLLM_PUBLIC_RELEASE
         int epilogueLdtmDps, int epilogueLdtmBits, int epilogueTileM, int epilogueTileN, int fallbackClusterDimX,
         int fallbackClusterDimY, int fallbackClusterDimZ, FusedBiasShuffleMode fusedBiasShuffleMode,
         bool fuseLoadSfTask, bool fuseUtccpWithUtcmma, bool gridTriggerSecondaryA, bool gridTriggerSecondaryB,
         bool gridWaitForPrimaryEarlyExit, bool gridWaitForPrimaryA, bool gridWaitForPrimaryB, bool hoistLoadTaskInit,
-        bool hoistMmaTaskTryWaits, int k, KernelTraits kernelTraits, MatrixLayout layoutA, MatrixLayout layoutB, int m,
-        int mmaK, tg::MmaKind mmaKind, int mmaM, int mmaN, int mmaTileK, bool mockAllReduce, int n,
-        int numEpilogueWarps, int numRegsCastAWarps, int numRegsCopySfLdsSttm, int numRegsCopySparsityInfo,
-        int numRegsPerThreadEpilogueWarp, int numRegsPerThreadNonEpilogueWarp, int numSlicesForSplitK, int numStagesA,
-        int numStagesB, int numStagesMma, int numStagesMmaWithinWorkTile, int numStagesMmaAcrossWorkTile,
-        int numStagesSmemSfA, int numStagesSmemSfB, int numStagesTmemSfA, int numStagesTmemSfB, int numStagesWorkId,
-        bool outputDebugTensors, bool patchF2fp, tg::Dtype perTokenSfDtype, SchedHostTask schedHostTask,
-        int32_t sfBlockSizeA, int32_t sfBlockSizeB, int32_t sfBlockSizeC, tg::SfLayout sfLayoutA,
-        tg::SfLayout sfLayoutB, tg::SfLayout sfLayoutC, int sfReshapeFactor, tg::Sparsity sparsityA, SplitK splitK,
-        int tileK, int tileM, int tileN, TileScheduler tileScheduler, bool transposeMmaOutput,
-        bool useCustomizedMma3xNvFp4, bool useCustomMmaSchedule, bool useDeepSeekFp8, bool useFlexibleClusterDims,
-        bool useHoistTryWaitForCustomMmaSchedule, bool useMaxTmemOverlap, bool usePerTokenSfA, bool usePerTokenSfB,
-        bool useShuffledMatrix, bool useTmaStore, bool useTwoTmaLoadWarps, bool useTwoMmaWarps,
+        bool hoistMmaTaskTryWaits, int k, KernelTraits kernelTraits,
+#ifdef TLLM_RUBIN_FEATURES
+        bool lamportConsumerA, bool lamportConsumerB, bool lamportForceValid, bool lamportProducer,
+#ifdef TLLM_TEST
+        bool lamportSeparateInvalidation,
+#endif // TLLM_TEST
+#endif // TLLM_RUBIN_FEATURES
+        MatrixLayout layoutA, MatrixLayout layoutB, int m, int mmaK, tg::MmaKind mmaKind, int mmaM, int mmaN,
+        int mmaTileK, bool mockAllReduce, int n, int numEpilogueWarps, int numRegsCastAWarps, int numRegsCopySfLdsSttm,
+        int numRegsCopySparsityInfo, int numRegsPerThreadEpilogueWarp, int numRegsPerThreadNonEpilogueWarp,
+        int numSlicesForSplitK,
+#ifndef TLLM_PUBLIC_RELEASE
+        int numSlicesForSliceK,
+#endif // TLLM_PUBLIC_RELEASE
+        int numStagesA, int numStagesB, int numStagesMma, int numStagesMmaWithinWorkTile,
+        int numStagesMmaAcrossWorkTile, int numStagesSmemSfA, int numStagesSmemSfB,
+#ifndef TLLM_PUBLIC_RELEASE
+        int numStagesTmemA,
+#endif // TLLM_PUBLIC_RELEASE
+        int numStagesTmemSfA, int numStagesTmemSfB, int numStagesWorkId, bool outputDebugTensors, bool patchF2fp,
+#ifdef TLLM_RUBIN_FEATURES
+        bool patchPzo,
+#endif // TLLM_RUBIN_FEATURES
+        tg::Dtype perTokenSfDtype, SchedHostTask schedHostTask, int32_t sfBlockSizeA, int32_t sfBlockSizeB,
+        int32_t sfBlockSizeC, tg::SfLayout sfLayoutA, tg::SfLayout sfLayoutB, tg::SfLayout sfLayoutC,
+        int sfReshapeFactor,
+#ifndef TLLM_PUBLIC_RELEASE
+        bool sliceK,
+#endif // TLLM_PUBLIC_RELEASE
+        tg::Sparsity sparsityA, SplitK splitK, int tileK, int tileM, int tileN, TileScheduler tileScheduler,
+        bool transposeMmaOutput, bool useCustomizedMma3xNvFp4, bool useCustomMmaSchedule, bool useDeepSeekFp8,
+        bool useFlexibleClusterDims, bool useHoistTryWaitForCustomMmaSchedule, bool useMaxTmemOverlap,
+        bool usePerTokenSfA, bool usePerTokenSfB, bool useShuffledMatrix, bool useTmaStore, bool useTwoTmaLoadWarps,
+        bool useTwoMmaWarps,
+#ifdef TLLM_RUBIN_FEATURES
+        bool useUniqueSfA,
+#endif // TLLM_RUBIN_FEATURES
         bool useUnrollLoop2xForMma, int validM, int validN, int validK, int worldSize)
         : mAllReduceAlgo{allReduceAlgo}
         , mBiasDtype{biasDtype}
@@ -167,6 +193,9 @@ struct GemmOptions
         , mEltwiseActType{eltwiseActType}
         , mEnablesEarlyExit{enablesEarlyExit}
         , mEnablesDelayedEarlyExit{enablesDelayedEarlyExit}
+#ifndef TLLM_PUBLIC_RELEASE
+        , mEnablesGlobalPtxKnobs{enablesGlobalPtxKnobs}
+#endif // TLLM_PUBLIC_RELEASE
         , mEpilogueLdtmDps{epilogueLdtmDps}
         , mEpilogueLdtmBits{epilogueLdtmBits}
         , mEpilogueTileM{epilogueTileM}
@@ -186,6 +215,15 @@ struct GemmOptions
         , mHoistMmaTaskTryWaits{hoistMmaTaskTryWaits}
         , mK{k}
         , mKernelTraits{kernelTraits}
+#ifdef TLLM_RUBIN_FEATURES
+        , mLamportConsumerA(lamportConsumerA)
+        , mLamportConsumerB(lamportConsumerB)
+        , mLamportForceValid(lamportForceValid)
+        , mLamportProducer(lamportProducer)
+#ifdef TLLM_TEST
+        , mLamportSeparateInvalidation(lamportSeparateInvalidation)
+#endif // TLLM_TEST
+#endif // TLLM_RUBIN_FEATURES
         , mLayoutA{layoutA}
         , mLayoutB{layoutB}
         , mM{m}
@@ -203,6 +241,9 @@ struct GemmOptions
         , mNumRegsPerThreadEpilogueWarp(numRegsPerThreadEpilogueWarp)
         , mNumRegsPerThreadNonEpilogueWarp(numRegsPerThreadNonEpilogueWarp)
         , mNumSlicesForSplitK{numSlicesForSplitK}
+#ifndef TLLM_PUBLIC_RELEASE
+        , mNumSlicesForSliceK{numSlicesForSliceK}
+#endif // TLLM_PUBLIC_RELEASE
         , mNumStagesA{numStagesA}
         , mNumStagesB{numStagesB}
         , mNumStagesMma{numStagesMma}
@@ -210,11 +251,17 @@ struct GemmOptions
         , mNumStagesMmaAcrossWorkTile{numStagesMmaAcrossWorkTile}
         , mNumStagesSmemSfA{numStagesSmemSfA}
         , mNumStagesSmemSfB{numStagesSmemSfB}
+#ifndef TLLM_PUBLIC_RELEASE
+        , mNumStagesTmemA{numStagesTmemA}
+#endif // TLLM_PUBLIC_RELEASE
         , mNumStagesTmemSfA{numStagesTmemSfA}
         , mNumStagesTmemSfB{numStagesTmemSfB}
         , mNumStagesWorkId{numStagesWorkId}
         , mOutputDebugTensors{outputDebugTensors}
         , mPatchF2fp{patchF2fp}
+#ifdef TLLM_RUBIN_FEATURES
+        , mPatchPzo{patchPzo}
+#endif // TLLM_RUBIN_FEATURES
         , mPerTokenSfDtype{perTokenSfDtype}
         , mSchedHostTask{schedHostTask}
         , mSfBlockSizeA{sfBlockSizeA}
@@ -224,6 +271,9 @@ struct GemmOptions
         , mSfLayoutB{sfLayoutB}
         , mSfLayoutC{sfLayoutC}
         , mSfReshapeFactor{sfReshapeFactor}
+#ifndef TLLM_PUBLIC_RELEASE
+        , mSliceK{sliceK}
+#endif // TLLM_PUBLIC_RELEASE
         , mSparsityA{sparsityA}
         , mSplitK{splitK}
         , mTileK{tileK}
@@ -243,6 +293,9 @@ struct GemmOptions
         , mUseTmaStore{useTmaStore}
         , mUseTwoTmaLoadWarps{useTwoTmaLoadWarps}
         , mUseTwoMmaWarps{useTwoMmaWarps}
+#ifdef TLLM_RUBIN_FEATURES
+        , mUseUniqueSfA{useUniqueSfA}
+#endif // TLLM_RUBIN_FEATURES
         , mUseUnrollLoop2xForMma{useUnrollLoop2xForMma}
         , mValidM{validM}
         , mValidN{validN}
@@ -250,7 +303,6 @@ struct GemmOptions
         , mWorldSize{worldSize}
     {
     }
-
     // The all-reduce algorithm.
     AllReduceAlgo mAllReduceAlgo{AllReduceAlgo::None};
     // The data type of bias in global memory.
@@ -292,6 +344,10 @@ struct GemmOptions
     // Whether to enable delayed early exit to overlap
     // numNonExitingCtas loading with the other instructions.
     bool mEnablesDelayedEarlyExit{false};
+#ifndef TLLM_PUBLIC_RELEASE
+    // Whether to enable the global PTX knobs for guiding the compiler optimizations.
+    bool mEnablesGlobalPtxKnobs{true};
+#endif // TLLM_PUBLIC_RELEASE
     // The epilogue supports multiple LDTM shapes, although not every shape is applicable in every
     // case. In particular:
     // - On Hopper: must be 16dp256bit.
@@ -321,6 +377,11 @@ struct GemmOptions
     bool mFuseLoadSfTask{false};
     // Whether fuse UTCCP with UTC*MMA.
     bool mFuseUtccpWithUtcmma{false};
+#ifndef TLLM_PUBLIC_RELEASE
+    // Hybrid SliceK: K-tile folding factor (32/mTMA for mTMA < 32, else 1).
+    // Computed in validation from mHybridTileHidden.
+    int mFundamentalKtileUnit{1};
+#endif // TLLM_PUBLIC_RELEASE
     // Whether load task A triggers the next grid.
     bool mGridTriggerSecondaryA{false};
     // Whether load task B triggers the next grid.
@@ -335,10 +396,43 @@ struct GemmOptions
     bool mHoistLoadTaskInit{true};
     // Whether to hoist the mbarrier try_waits (e.g., mma.prodAcq, smemAb.consWait) in the MMA task.
     bool mHoistMmaTaskTryWaits{false};
+#ifndef TLLM_PUBLIC_RELEASE
+    // Hidden/output dimension for Hybrid SliceK (M if transpose, N if not).
+    // Computed in validation based on transpose mode.
+    int32_t mHybridHiddenDim{0};
+    // Token batch dimension for Hybrid SliceK (N if transpose, M if not).
+    // Computed in validation based on transpose mode.
+    int32_t mHybridNumTokens{0};
+    // "Hybrid" SliceK: for mTMA >= 32, uses progressively sparser lane masks (standard
+    // approach). For mTMA < 32, switches to a hybrid strategy that folds K-slices into
+    // the M-dimension (FundamentalKtileUnit) to maintain a fixed 0x11111111 lane mask,
+    // avoiding the wasted TC lanes of ever-sparser masks. Supports M_tma tiles 4-128.
+    bool mHybridSliceK{false};
+    // Tile size for hidden dimension in Hybrid SliceK (mTMA).
+    // tileM if transpose, tileN if not. Computed in validation.
+    int32_t mHybridTileHidden{0};
+    // Tile size for token dimension in Hybrid SliceK (maxBS).
+    // tileN if transpose, tileM if not. Computed in validation.
+    int32_t mHybridTileTokens{0};
+#endif // TLLM_PUBLIC_RELEASE
     // The K dimension of GEMM.
     int mK{16 * 16};
     // Traits of the kernel.
     KernelTraits mKernelTraits{};
+#ifdef TLLM_RUBIN_FEATURES
+    // Whether the load task A uses a Lamport pipeline.
+    bool mLamportConsumerA{false};
+    // Whether the load task B uses a Lamport pipeline.
+    bool mLamportConsumerB{false};
+    // Whether the kernel forces the output to be valid values (not -0.0 for FP and NAN for UE8m0).
+    bool mLamportForceValid{false};
+    // Whether the kernel is a Lamport producer (invalidates output buffer prior to writing results).
+    bool mLamportProducer{false};
+#ifdef TLLM_TEST
+    // Whether the Lamport Producer kernel invalidates a separate buffer (used for testing only).
+    bool mLamportSeparateInvalidation{false};
+#endif // TLLM_TEST
+#endif // TLLM_RUBIN_FEATURES
     // Layout of A matrix
     MatrixLayout mLayoutA{MatrixLayout::MajorK};
     // Layout of B matrix
@@ -377,6 +471,10 @@ struct GemmOptions
     // Partial results are accumulated afterwards using either GMEM or DSMEM (in CGA)
     // to exchange the data between CTAs.
     int mNumSlicesForSplitK{1};
+#ifndef TLLM_PUBLIC_RELEASE
+    // Number of slices for slice-K along K dimension.
+    int mNumSlicesForSliceK{1};
+#endif // TLLM_PUBLIC_RELEASE
     // The depth of the pipeline for A.
     int mNumStagesA{0};
     // The depth of the pipeline for B.
@@ -392,6 +490,12 @@ struct GemmOptions
     int mNumStagesSmemSfA{0};
     // The depth of the pipeline for the SF of B in SMEM.
     int mNumStagesSmemSfB{0};
+#ifndef TLLM_PUBLIC_RELEASE
+    // The depth of the TMEM operand staging pipeline (Hybrid SliceK only).
+    // 0 means follow mNumStagesA (coupled SMEM/TMEM staging).
+    // Valid values: 1-6 (must be <= mNumStagesA).
+    int mNumStagesTmemA{0};
+#endif // TLLM_PUBLIC_RELEASE
     // The depth of the pipeline for the SF of A in TMEM.
     int mNumStagesTmemSfA{0};
     // The depth of the pipeline for the SF of B in TMEM.
@@ -402,11 +506,20 @@ struct GemmOptions
     bool mOutputDebugTensors{false};
     // Patch float conversions.
     bool mPatchF2fp{false};
+#ifdef TLLM_RUBIN_FEATURES
+    // Patch conversions with PZO modifier to force positive zeros.
+    bool mPatchPzo{false};
+#endif // TLLM_RUBIN_FEATURES
     // The dtype of scale factors when using per-token scaling.
     // When not provided, it will be Fp32 if usePerTokenSfA and usePerTokenSfB else Bfloat16.
     tg::Dtype mPerTokenSfDtype{tg::Dtype::Void};
     // Which host task the persistent scheduler is fused with (Self = dedicated scheduler task).
     SchedHostTask mSchedHostTask{SchedHostTask::Self};
+#ifndef TLLM_PUBLIC_RELEASE
+    // Hybrid SliceK: number of K-slice iterations per MMA (128/mTMA for mTMA > 32, else 4).
+    // Computed in validation from mHybridTileHidden.
+    int mReRunTimes{1};
+#endif // TLLM_PUBLIC_RELEASE
     // Block size of A, for block-scaled types.
     int mSfBlockSizeA{-1};
     // Block size of B, for block-scaled types.
@@ -425,6 +538,10 @@ struct GemmOptions
     // But it reduces the number of L2 requests under the hood and potentially improves perf.
     // Applies to layout 8x4 only.
     int mSfReshapeFactor{1};
+#ifndef TLLM_PUBLIC_RELEASE
+    // Slice-K implementation to use TileM dimension for TileK.
+    bool mSliceK{false};
+#endif // TLLM_PUBLIC_RELEASE
     // Sparsity of A.
     tg::Sparsity mSparsityA{tg::Sparsity::Dense};
     // The location of the exchange for split-K (it's None when split-K is disabled).
@@ -466,6 +583,10 @@ struct GemmOptions
     bool mUseTwoTmaLoadWarps{false};
     // Use two different warps for MMA tasks. Applicable only to DeepSeek FP8.
     bool mUseTwoMmaWarps{false};
+#if TLLM_RUBIN_FEATURES
+    // Use unique scaling factors for A.
+    bool mUseUniqueSfA{false};
+#endif
     // Whether to unroll the loop by 2x.
     bool mUseUnrollLoop2xForMma{true};
     // The valid range of M/N/K dimension of GEMM without padding values.
@@ -592,6 +713,9 @@ inline std::string toString(SchedHostTask e)
     case SchedHostTask::LoadB: return "LoadB";
     case SchedHostTask::LoadSfA: return "LoadSfA";
     case SchedHostTask::LoadSfB: return "LoadSfB";
+#ifdef TLLM_RUBIN_FEATURES
+    case SchedHostTask::Invalidate: return "Invalidate";
+#endif // TLLM_RUBIN_FEATURES
     default: return std::to_string(static_cast<int32_t>(e));
     }
 }
@@ -644,6 +768,9 @@ inline std::string dumpOptions(GemmOptions const& options, bool dumpRuntimeParam
        << "," << std::endl;
     ss << "mEnablesEarlyExit=" << options.mEnablesEarlyExit << "," << std::endl;
     ss << "mEnablesDelayedEarlyExit=" << options.mEnablesDelayedEarlyExit << "," << std::endl;
+#ifndef TLLM_PUBLIC_RELEASE
+    ss << "mEnablesGlobalPtxKnobs=" << options.mEnablesGlobalPtxKnobs << "," << std::endl;
+#endif // TLLM_PUBLIC_RELEASE
     ss << "mEpilogueLdtmDps=" << options.mEpilogueLdtmDps << "," << std::endl;
     ss << "mEpilogueLdtmBits=" << options.mEpilogueLdtmBits << "," << std::endl;
     ss << "mEpilogueTileM=" << options.mEpilogueTileM << "," << std::endl;
@@ -669,6 +796,21 @@ inline std::string dumpOptions(GemmOptions const& options, bool dumpRuntimeParam
     }
     ss << "mKernelTraits={}"
        << "," << std::endl;
+#if TLLM_RUBIN_FEATURES
+    // Add the internal filter to log. For public releases, it will be filtered out prior to being
+    // written to MetaInfo.h header.
+    ss << "\
+  " << std::endl;
+    ss << "mLamportConsumerA=" << options.mLamportConsumerA << "," << std::endl;
+    ss << "mLamportConsumerB=" << options.mLamportConsumerB << "," << std::endl;
+    ss << "mLamportForceValid=" << options.mLamportForceValid << "," << std::endl;
+    ss << "mLamportProducer=" << options.mLamportProducer << "," << std::endl;
+#ifdef TLLM_TEST
+    ss << "mLamportSeparateInvalidation=" << options.mLamportSeparateInvalidation << "," << std::endl;
+#endif // TLLM_TEST
+    ss << "\
+  " << std::endl;
+#endif
     ss << "mLayoutA=gemm::MatrixLayout(" << static_cast<int32_t>(options.mLayoutA) << ")"
        << "," << std::endl;
     ss << "mLayoutB=gemm::MatrixLayout(" << static_cast<int32_t>(options.mLayoutB) << ")"
@@ -696,6 +838,9 @@ inline std::string dumpOptions(GemmOptions const& options, bool dumpRuntimeParam
     ss << "mNumRegsPerThreadEpilogueWarp=" << options.mNumRegsPerThreadEpilogueWarp << "," << std::endl;
     ss << "mNumRegsPerThreadNonEpilogueWarp=" << options.mNumRegsPerThreadNonEpilogueWarp << "," << std::endl;
     ss << "mNumSlicesForSplitK=" << options.mNumSlicesForSplitK << "," << std::endl;
+#ifndef TLLM_PUBLIC_RELEASE
+    ss << "mNumSlicesForSliceK=" << options.mNumSlicesForSliceK << "," << std::endl;
+#endif // TLLM_PUBLIC_RELEASE
     ss << "mNumStagesA=" << options.mNumStagesA << "," << std::endl;
     ss << "mNumStagesB=" << options.mNumStagesB << "," << std::endl;
     ss << "mNumStagesMma=" << options.mNumStagesMma << "," << std::endl;
@@ -703,11 +848,21 @@ inline std::string dumpOptions(GemmOptions const& options, bool dumpRuntimeParam
     ss << "mNumStagesMmaAcrossWorkTile=" << options.mNumStagesMmaAcrossWorkTile << "," << std::endl;
     ss << "mNumStagesSmemSfA=" << options.mNumStagesSmemSfA << "," << std::endl;
     ss << "mNumStagesSmemSfB=" << options.mNumStagesSmemSfB << "," << std::endl;
+#ifndef TLLM_PUBLIC_RELEASE
+    ss << "mNumStagesTmemA=" << options.mNumStagesTmemA << "," << std::endl;
+#endif // TLLM_PUBLIC_RELEASE
     ss << "mNumStagesTmemSfA=" << options.mNumStagesTmemSfA << "," << std::endl;
     ss << "mNumStagesTmemSfB=" << options.mNumStagesTmemSfB << "," << std::endl;
     ss << "mNumStagesWorkId=" << options.mNumStagesWorkId << "," << std::endl;
     ss << "mOutputDebugTensors=" << options.mOutputDebugTensors << "," << std::endl;
     ss << "mPatchF2fp=" << options.mPatchF2fp << "," << std::endl;
+#ifdef TLLM_RUBIN_FEATURES
+    ss << "\
+  " << std::endl;
+    ss << "mPatchPzo=" << options.mPatchPzo << "," << std::endl;
+    ss << "\
+  " << std::endl;
+#endif // TLLM_RUBIN_FEATURES
     ss << "mPerTokenSfDtype="
        << "trtllm::gen::Dtype(" << static_cast<int32_t>(options.mPerTokenSfDtype) << ")"
        << "," << std::endl;
@@ -727,6 +882,9 @@ inline std::string dumpOptions(GemmOptions const& options, bool dumpRuntimeParam
        << "trtllm::gen::SfLayout(" << static_cast<int32_t>(options.mSfLayoutC) << ")"
        << "," << std::endl;
     ss << "mSfReshapeFactor=" << options.mSfReshapeFactor << "," << std::endl;
+#ifndef TLLM_PUBLIC_RELEASE
+    ss << "mSliceK=" << options.mSliceK << "," << std::endl;
+#endif // TLLM_PUBLIC_RELEASE
     ss << "mSparsityA="
        << "trtllm::gen::Sparsity(" << static_cast<int32_t>(options.mSparsityA) << ")"
        << "," << std::endl;
@@ -752,6 +910,13 @@ inline std::string dumpOptions(GemmOptions const& options, bool dumpRuntimeParam
     ss << "mUseTmaStore=" << options.mUseTmaStore << "," << std::endl;
     ss << "mUseTwoTmaLoadWarps=" << options.mUseTwoTmaLoadWarps << "," << std::endl;
     ss << "mUseTwoMmaWarps=" << options.mUseTwoMmaWarps << "," << std::endl;
+#ifdef TLLM_RUBIN_FEATURES
+    ss << "\
+  " << std::endl;
+    ss << "mUseUniqueSfA=" << options.mUseUniqueSfA << "," << std::endl;
+    ss << "\
+  " << std::endl;
+#endif // TLLM_RUBIN_FEATURES
     ss << "mUseUnrollLoop2xForMma=" << options.mUseUnrollLoop2xForMma << "," << std::endl;
     if (dumpRuntimeParams)
     {
@@ -967,6 +1132,13 @@ inline bool checkAndUpdateGemmOptions(
     options.mPatchF2fp = false;
 #endif // TLLM_PUBLIC_RELEASE
 
+#ifdef TLLM_RUBIN_FEATURES
+    if (options.mPatchPzo)
+    {
+        TLLM_CHECK_ERROR(cudaArch == tg::CudaArch::Sm107a, "PatchPzo is only supported on sm_107a.");
+    }
+#endif // TLLM_RUBIN_FEATURES
+
     // FIXME: We do not support different dtypes for A and B when not on Blackwell.
     if (!isBlackwell)
     {
@@ -1141,11 +1313,19 @@ inline bool checkAndUpdateGemmOptions(
     {
         bool isSupported_2_4
             = (options.mMmaKind == tg::MmaKind::Fp8Fp6Fp4 || options.mMmaKind == tg::MmaKind::MxFp8Fp6Fp4);
+#ifdef TLLM_RUBIN_FEATURES
+        // On Rubin, 2:4 sparsity is also supported for MxFp4NvFp4.
+        isSupported_2_4 |= (cudaArch == tg::CudaArch::Sm107a && options.mMmaKind == tg::MmaKind::MxFp4NvFp4);
+#endif
         TLLM_CHECK_ERROR(isSupported_2_4, "2:4 sparsity is not supported for MMA kind ",
             tg::mmaKindToString(options.mMmaKind), " on target ", tg::cudaArchToString(cudaArch));
         break;
     }
     case tg::Sparsity::Pairwise_4_8:
+        // Due to deprecation in Rubin, we only allow this sparsity mode on 100a, 103a.
+        // PTX ISA also forbids mma.sp with kind mxf4nvf4 on 100f for that reason.
+        TLLM_CHECK_ERROR(cudaArch == tg::CudaArch::Sm100a || cudaArch == tg::CudaArch::Sm103a,
+            "Pairwise 4:8 sparsity is only supported on sm_100a and sm_103a.");
         TLLM_CHECK_ERROR(options.mMmaKind == tg::MmaKind::MxFp4NvFp4,
             "Pairwise 4:8 sparsity is only supported for MMA kind MxFp4NvFp4.");
         break;
@@ -1164,11 +1344,30 @@ inline bool checkAndUpdateGemmOptions(
             "The sparsity information for one tile row must be a multiple of 16B. Use larger tileK.");
         TLLM_CHECK_ERROR(options.mDtypeA == options.mDtypeMmaA, "Sparsity is not supported with on-the-fly upcasting.");
         TLLM_CHECK_ERROR(!options.mUseDeepSeekFp8, "Sparsity is not supported with DeepSeek Fp8.");
+#ifndef TLLM_PUBLIC_RELEASE
+        TLLM_CHECK_ERROR(!options.mSliceK, "Sparsity is not supported with slice-k.");
+#endif // TLLM_PUBLIC_RELEASE
+#ifdef TLLM_RUBIN_FEATURES
+        // Note: we could probably support Lamport + sparsity, but it is not necessary if we use
+        // sparsity only for weights, and Lamport for activations.
+        TLLM_CHECK_ERROR(!options.mLamportConsumerA, "Sparsity is not supported with Lamport consumer.");
+#endif
     }
 
     if (options.mMmaKind == tg::MmaKind::Fp8Fp6Fp4)
     {
         int mmaK = isSparseA ? 64 : 32;
+#ifdef TLLM_RUBIN_FEATURES
+        if (options.mMmaK == (isSparseA ? 128 : 64))
+        {
+            TLLM_CHECK_ERROR(cudaArch == tg::CudaArch::Sm107a,
+                "MmaK == 64 (/128 sparse) is only supported on SM 107a for ", tg::mmaKindToString(options.mMmaKind));
+            TLLM_CHECK_ERROR(options.mMmaM % 128 == 0,
+                "MmaM must be a multiple of 128 for MmaK == 64 (/128 sparse) and ",
+                tg::mmaKindToString(options.mMmaKind), ". Got mmaM == ", options.mMmaM);
+            mmaK = isSparseA ? 128 : 64;
+        }
+#endif // TLLM_RUBIN_FEATURES
 
         if (options.mMmaK != mmaK)
         {
@@ -1214,7 +1413,12 @@ inline bool checkAndUpdateGemmOptions(
     }
 
     // Constraints for NvFp4, MxFp8, and MxFp4.
-    if ((options.mMmaKind == tg::MmaKind::MxFp4NvFp4 || options.mMmaKind == tg::MmaKind::MxFp8Fp6Fp4
+    if (
+#ifndef TLLM_PUBLIC_RELEASE
+        // Skip this constraint for Hybrid SliceK, which uses lane-masked MMA and supports small tiles.
+        !options.mHybridSliceK &&
+#endif // TLLM_PUBLIC_RELEASE
+        (options.mMmaKind == tg::MmaKind::MxFp4NvFp4 || options.mMmaKind == tg::MmaKind::MxFp8Fp6Fp4
             || options.mDtypeC == tg::Dtype::MxE4m3)
         && options.mMmaM != 128)
     {
@@ -1261,11 +1465,43 @@ inline bool checkAndUpdateGemmOptions(
         if (options.mMmaKind == tg::MmaKind::MxFp4NvFp4)
         {
             mmaK = isSparseA ? 128 : 64;
+#ifdef TLLM_RUBIN_FEATURES
+            if (options.mMmaK == 128 && !isSparseA)
+            {
+                TLLM_CHECK_ERROR(cudaArch == tg::CudaArch::Sm107a,
+                    "MmaK == 128 dense is only supported on SM 107a for ", tg::mmaKindToString(options.mMmaKind));
+                // The SF layout for k=128 depends on whether mmaN is <= or > 128. To keep it simple in smem
+                // -> tmem data movement, we don't want to have multiple possible layouts for the same tileN
+                // (i.e. we keep that code agnostic of mmaN for now).
+                TLLM_CHECK_ERROR(
+                    options.mTileN == options.mMmaN, "When mmaK == 128 dense, TileN must be equal to MmaN.");
+                mmaK = 128;
+            }
+#endif // TLLM_RUBIN_FEATURES
             if (options.mMmaK == 96 && !isSparseA)
             {
                 mmaK = 96;
             }
+            // mmaK == 192 with sparsity is introduced in Rubin.
+            if (options.mMmaK == 192 && isSparseA)
+            {
+#ifdef TLLM_RUBIN_FEATURES
+                TLLM_CHECK_ERROR(cudaArch == tg::CudaArch::Sm107a,
+                    "MmaK == 192 sparse is only supported on SM 107a for ", tg::mmaKindToString(options.mMmaKind));
+#endif // TLLM_RUBIN_FEATURES
+                mmaK = 192;
+                TLLM_CHECK_ERROR(options.mTileK == 768, "When mmaK == 192 sparse, only tileK == 768 is supported");
+                TLLM_CHECK_ERROR(options.mTileN <= 128, "When mmaK == 192 sparse, only tileN <= 128 is supported");
+            }
         }
+#ifdef TLLM_RUBIN_FEATURES
+        if (options.mMmaKind == tg::MmaKind::MxFp8Fp6Fp4 && options.mMmaK == (isSparseA ? 128 : 64))
+        {
+            TLLM_CHECK_ERROR(cudaArch == tg::CudaArch::Sm107a,
+                "MmaK == 64 (/128 sparse) is only supported on SM 107a for ", tg::mmaKindToString(options.mMmaKind));
+            mmaK = isSparseA ? 128 : 64;
+        }
+#endif // TLLM_RUBIN_FEATURES
         if (options.mMmaK != mmaK)
         {
             int newTileK = mmaK * divUp(options.mTileK, mmaK);
@@ -1390,9 +1626,26 @@ inline bool checkAndUpdateGemmOptions(
         GEMM_UPDATE_OR_ERROR(options.mSfBlockSizeC, -1);
     }
 
+#ifdef TLLM_RUBIN_FEATURES
+    if (options.mUseUniqueSfA)
+    {
+        TLLM_CHECK_ERROR(options.mSfLayoutA == tg::SfLayout::R128c16, "useUniqueSfA requires sfLayoutA 128x16.");
+    }
+    if (options.mSfLayoutA == tg::SfLayout::R128c16)
+    {
+        TLLM_CHECK_ERROR(options.mUseUniqueSfA, "sfLayoutA 128x16 is only supported with useUniqueSfA.");
+    }
+#endif
+
     if (tg::dtypeIsBlockFmt(options.mDtypeA))
     {
         int sfATileK = 4;
+#ifdef TLLM_RUBIN_FEATURES
+        if (options.mSfLayoutA == tg::SfLayout::R128c16)
+        {
+            sfATileK = 16;
+        }
+#endif
         int numEltsPerSfA = options.mSfBlockSizeA;
         TLLM_CHECK_ERROR(options.mTileK % (sfATileK * numEltsPerSfA) == 0, "TileK (", options.mTileK,
             ") must be a multiple of ", (sfATileK * numEltsPerSfA), " for numEltsPerSfA=", numEltsPerSfA,
@@ -1433,6 +1686,14 @@ inline bool checkAndUpdateGemmOptions(
         {
             padMultiplierB = 2;
         }
+#ifdef TLLM_RUBIN_FEATURES
+        // No padding with 2x mmaK.
+        if ((!isSparseA && options.mMmaK == 64) || (isSparseA && options.mMmaK == 128))
+        {
+            padMultiplierA = 1;
+            padMultiplierB = 1;
+        }
+#endif // TLLM_RUBIN_FEATURES
     }
     TLLM_CHECK_ERROR((padMultiplierA * tg::dtypeGetNumBits(options.mDtypeA) * options.mK / 8) % 16 == 0,
         "K dimension of A must be aligned to 16 bytes.");
@@ -1572,8 +1833,23 @@ inline bool checkAndUpdateGemmOptions(
             "M/validM must be a multiple of shuffle block size (", shuffleBlockSize, ") when useShuffledMatrix");
     }
 
+#ifndef TLLM_PUBLIC_RELEASE
+    if (!options.mSliceK && !options.mHybridSliceK)
+    {
+        TLLM_CHECK_ERROR(options.mMmaM / (options.mClusterDimX > 1 ? 2 : 1) <= options.mEpilogueTileM,
+            "EpilogueTileM must be larger or equal than mmaM.");
+    }
+    else if (options.mSliceK)
+    {
+        // FIXME: this is not necessary limitation. Simply fixing num repeats in TmemSliceKA should be
+        // enough.
+        TLLM_CHECK_ERROR(
+            (options.mTileN & (options.mTileN - 1)) == 0, "For Slice-K TileN is required to be a power of 2");
+    }
+#else
     TLLM_CHECK_ERROR(options.mMmaM / (options.mClusterDimX > 1 ? 2 : 1) <= options.mEpilogueTileM,
         "EpilogueTileM must be larger or equal than mmaM.");
+#endif // TLLM_PUBLIC_RELEASE
 
     if (options.mClusterDimX >= 2)
     {
@@ -1707,8 +1983,12 @@ inline bool checkAndUpdateGemmOptions(
             "EpilogueLdtmDps must be 32 when using shuffled matrix and non-transposed mma output");
         TLLM_CHECK_ERROR(
             options.mUseTmaStore, "TMA store is required when using shuffled matrix and non-transposed mma output");
-        // When doing unshuffle in the epilogue, one fragment of epilogue tile must have at least one
-        // shuffle block.
+#ifndef TLLM_PUBLIC_RELEASE
+        TLLM_CHECK_ERROR(
+            !options.mSliceK, "Slice-K is not supported when using shuffled matrix and non-transposed mma output");
+#endif // TLLM_PUBLIC_RELEASE
+       // When doing unshuffle in the epilogue, one fragment of epilogue tile must have at least one
+       // shuffle block.
         auto minEpilogueTileN = getShuffleBlockSize(options.mEpilogueTileM);
         TLLM_CHECK_ERROR_FMT(options.mEpilogueTileN >= minEpilogueTileN,
             "EpilogueTileN (%d) must be a larger than the shuffle block size (%d) "
@@ -1824,6 +2104,225 @@ inline bool checkAndUpdateGemmOptions(
     TLLM_CHECK_ERROR(
         options.mNumEpilogueWarps == 4 || options.mNumEpilogueWarps == 8, "mNumEpilogueWarps has to be either 4 or 8.");
 
+#ifndef TLLM_PUBLIC_RELEASE
+    if (options.mSliceK)
+    {
+        TLLM_CHECK_ERROR(isBlackwell, "Slice-K is not supported on Hopper");
+
+        TLLM_CHECK_ERROR(!options.mUseDeepSeekFp8, "DeepSeek Fp8 GEMM is not supported for slice-K");
+        TLLM_CHECK_ERROR(options.mUseTwoTmaLoadWarps, "Slice-K requires two warp load for A and B");
+        TLLM_CHECK_ERROR(options.mTransposeMmaOutput, "Slice-K requires transpose mma output");
+        TLLM_CHECK_ERROR(options.mUseShuffledMatrix, "Slice-K requires shuffled matrix");
+        TLLM_CHECK_ERROR(options.mTileK % 128 == 0, "Slice-K requires TileK be a multiple of 128");
+        TLLM_CHECK_ERROR(options.mMmaM == 128, "Slice-K requires MmaM == 128");
+        TLLM_CHECK_ERROR(options.mTileN == options.mEpilogueTileN, "TileN must be equal to EpilogueTileN for slice-K");
+
+        TLLM_LOG_WARNING("Overwriting TileM and EpilogueTileM to 32 for slice-K");
+        if (options.mTileM != 32 || options.mEpilogueTileM != 32)
+        {
+            if (updateOptions)
+            {
+                // FIXME: it is possible to remove this restriction.
+                options.mTileM = 32;
+                options.mEpilogueTileM = 32;
+            }
+            else
+            {
+                return false;
+            }
+        }
+        TLLM_CHECK_ERROR(options.mDtypeA == tg::Dtype::E4m3 && options.mDtypeB == tg::Dtype::E4m3,
+            "Slice-K requires e4m3 input dtype");
+
+        if (options.mNumSlicesForSliceK != 4)
+        {
+            if (updateOptions)
+            {
+                options.mNumSlicesForSliceK = 4;
+            }
+            else
+            {
+                return false;
+            }
+        }
+        TLLM_CHECK_ERROR((options.mTileK / options.mMmaK) % options.mNumSlicesForSliceK == 0, "TileK (", options.mTileK,
+            ") / MmaK (", options.mMmaK, ") must be a multiple of mNumSlicesForSliceK (", options.mNumSlicesForSliceK,
+            ")");
+    }
+
+    // Hybrid SliceK validation and semantic parameter computation
+    // Both transpose modes produce final output [tokens, hidden]:
+    // - transpose=true:  m=hidden, n=tokens, GEMM C=[hidden,tokens], then transpose to
+    // [tokens,hidden]
+    // - transpose=false: m=tokens, n=hidden, GEMM C=[tokens,hidden], direct output
+    if (options.mHybridSliceK)
+    {
+        TLLM_CHECK_ERROR(isBlackwell, "Hybrid SliceK is only supported on Blackwell");
+        TLLM_CHECK_ERROR(!options.mSliceK, "Cannot use both SliceK and HybridSliceK");
+        TLLM_CHECK_ERROR(options.mDtypeA == tg::Dtype::E4m3 && options.mDtypeB == tg::Dtype::E4m3,
+            "Hybrid SliceK phase 1 requires FP8 (E4m3) input dtype");
+        TLLM_CHECK_ERROR(options.mTileK % 128 == 0, "Hybrid SliceK requires TileK to be a multiple of 128");
+        TLLM_CHECK_ERROR(options.mMmaM == 128, "Hybrid SliceK requires MmaM == 128");
+        // TODO: 2-CTA MMA support requires fixing TMA coordinate generation in SmemHybridSliceKAb
+        // to properly handle loadHalfTileB and OOB optimizations when transpose=false.
+        TLLM_CHECK_ERROR(options.mClusterDimX == 1, "Hybrid SliceK does not yet support 2-CTA MMA (clusterDimX > 1)");
+        // TODO: CGA split-K support requires implementing DSMEM epilogue path.
+        TLLM_CHECK_ERROR(options.mNumSlicesForSplitK <= 1,
+            "Hybrid SliceK does not yet support CGA split-K (numSlicesForSplitK > 1)");
+
+        // Compute semantic parameters based on transpose mode
+        // mHybridTileHidden = mTMA = tile size for hidden dimension (weight rows)
+        // mHybridTileTokens = maxBS = tile size for token dimension (activation batch)
+        if (updateOptions)
+        {
+            if (options.mTransposeMmaOutput)
+            {
+                // transpose=true: m=hidden, n=tokens
+                // ctaIdxM → hidden tiles, ctaIdxN → token tiles
+                options.mHybridNumTokens = options.mN;
+                options.mHybridHiddenDim = options.mM;
+                options.mHybridTileTokens = options.mTileN; // maxBS (N-direction = tokens)
+                options.mHybridTileHidden = options.mTileM; // mTMA (M-direction = hidden)
+            }
+            else
+            {
+                // transpose=false: m=tokens, n=hidden
+                // ctaIdxM → token tiles, ctaIdxN → hidden tiles
+                options.mHybridNumTokens = options.mM;
+                options.mHybridHiddenDim = options.mN;
+                options.mHybridTileTokens = options.mTileM; // maxBS (M-direction = tokens)
+                options.mHybridTileHidden = options.mTileN; // mTMA (N-direction = hidden)
+            }
+        }
+
+        // Validate mTMA (hidden tile) range: 4-128
+        TLLM_CHECK_ERROR(options.mHybridTileHidden >= 4 && options.mHybridTileHidden <= 128,
+            "Hybrid SliceK supports mTMA (hidden tile) from 4 to 128, got ", options.mHybridTileHidden);
+
+        // Compute derived parameters based on mHybridTileHidden (mTMA)
+        if (updateOptions)
+        {
+            // Hybrid SliceK pipeline staging defaults (only apply if user didn't override):
+            // - mNumStagesA/B (SmemStage): defaults to 4, valid range 2-8
+            // - mNumStagesTmemA: defaults to follow mNumStagesA, valid values 1-6
+            // - MMA accum is not staged (NumStagesMma = 1)
+            int const defaultNumStages = 2; // GemmOptions default
+            if (options.mNumStagesA == defaultNumStages)
+            {
+                options.mNumStagesA = 4; // Hybrid SliceK default
+                options.mNumStagesB = 4; // Hybrid SliceK default
+            }
+            // mNumStagesTmemA: if not set (0), default to mNumStagesA (coupled mode)
+            if (options.mNumStagesTmemA == 0)
+            {
+                options.mNumStagesTmemA = std::min(options.mNumStagesA, 6);
+            }
+            // Validate stage configurations
+            TLLM_CHECK_ERROR(options.mNumStagesA >= 2 && options.mNumStagesA <= 8,
+                "Hybrid SliceK requires numStages in range [2, 8], got ", options.mNumStagesA);
+            TLLM_CHECK_ERROR(options.mNumStagesTmemA <= 6,
+                "Hybrid SliceK requires numStagesTmemA <= 6, got numStagesTmemA=", options.mNumStagesTmemA);
+
+            // MMA staging: Hybrid SliceK requires single-stage MMA (accumulator not staged)
+            options.mNumStagesMma = 1;
+            options.mNumStagesMmaWithinWorkTile = 1;
+            options.mNumStagesMmaAcrossWorkTile = 1;
+
+            // FundamentalKtileUnit: 32/mTMA for mTMA < 32, else 1
+            options.mFundamentalKtileUnit = (options.mHybridTileHidden < 32) ? (32 / options.mHybridTileHidden) : 1;
+            // ReRunTimes: (128/mTMA) for mTMA > 32, else 4
+            options.mReRunTimes = (options.mHybridTileHidden > 32) ? (128 / options.mHybridTileHidden) : 4;
+
+            // Auto-correct tileK to satisfy: (tileK / 128) % FundamentalKtileUnit == 0
+            // Minimum valid tileK = 128 * FundamentalKtileUnit
+            // For mTMA <= 8:  FundamentalKtileUnit = 4, minTileK = 512
+            // For mTMA <= 16: FundamentalKtileUnit = 2, minTileK = 256
+            // For mTMA > 16:  FundamentalKtileUnit = 1, minTileK = 128
+            int const minTileK = 128 * options.mFundamentalKtileUnit;
+            int const kTile128BNum = options.mTileK / 128;
+            if (options.mTileK < minTileK || kTile128BNum % options.mFundamentalKtileUnit != 0)
+            {
+                int const newTileK = std::max(minTileK, divUpMul(options.mTileK, minTileK));
+                TLLM_LOG_WARNING("Hybrid SliceK: Adjusting TileK from ", options.mTileK, " to ", newTileK,
+                    " (FundamentalKtileUnit=", options.mFundamentalKtileUnit, ", minTileK=", minTileK, ")");
+                options.mTileK = newTileK;
+                // Keep mMmaTileK in sync (it was set to the old mTileK earlier).
+                options.mMmaTileK = newTileK;
+            }
+        }
+        else
+        {
+            // Validate stage configurations for Hybrid SliceK
+            TLLM_CHECK_ERROR(options.mNumStagesA >= 2 && options.mNumStagesA <= 8,
+                "Hybrid SliceK requires numStages in range [2, 8], got ", options.mNumStagesA);
+            TLLM_CHECK_ERROR(options.mNumStagesTmemA > 0 && options.mNumStagesTmemA <= 6,
+                "Hybrid SliceK requires numStagesTmemA in range [1, 6]");
+            TLLM_CHECK_ERROR(options.mNumStagesMma == 1, "Hybrid SliceK requires numStagesMma == 1 (no MMA staging)");
+            TLLM_CHECK_ERROR(options.mNumStagesMmaWithinWorkTile == 1 && options.mNumStagesMmaAcrossWorkTile == 1,
+                "Hybrid SliceK requires numStagesMmaWithinWorkTile == 1 and "
+                "numStagesMmaAcrossWorkTile == 1");
+            // Validate derived parameters using mHybridTileHidden
+            int const expectedFundamental = (options.mHybridTileHidden < 32) ? (32 / options.mHybridTileHidden) : 1;
+            int const expectedReRunTimes = (options.mHybridTileHidden > 32) ? (128 / options.mHybridTileHidden) : 4;
+            TLLM_CHECK_ERROR(options.mFundamentalKtileUnit == expectedFundamental,
+                "Hybrid SliceK requires FundamentalKtileUnit == ", expectedFundamental, " (got ",
+                options.mFundamentalKtileUnit, ")");
+            TLLM_CHECK_ERROR(options.mReRunTimes == expectedReRunTimes,
+                "Hybrid SliceK requires ReRunTimes == ", expectedReRunTimes, " (got ", options.mReRunTimes, ")");
+
+            // Validate tileK constraint: (tileK / 128) % FundamentalKtileUnit == 0
+            int const minTileK = 128 * expectedFundamental;
+            int const kTile128BNum = options.mTileK / 128;
+            TLLM_CHECK_ERROR(options.mTileK >= minTileK && kTile128BNum % expectedFundamental == 0,
+                "Hybrid SliceK requires TileK >= ", minTileK,
+                " and (TileK/128) divisible by FundamentalKtileUnit=", expectedFundamental,
+                " (got TileK=", options.mTileK, ")");
+        }
+
+        // Hybrid SliceK epilogue constraints:
+        // EpilogueTileM must equal TileM and EpilogueTileN must equal TileN
+        if (options.mEpilogueTileM != options.mTileM || options.mEpilogueTileN != options.mTileN)
+        {
+            TLLM_LOG_WARNING(
+                "Hybrid SliceK requires EpilogueTileM == TileM and EpilogueTileN == TileN. "
+                "Overwriting epilogue tiles to match main tiles.");
+            if (updateOptions)
+            {
+                options.mEpilogueTileM = options.mTileM;
+                options.mEpilogueTileN = options.mTileN;
+            }
+            else
+            {
+                return false;
+            }
+        }
+
+        // Hybrid SliceK LDTM configuration adjustment for small epilogueTileN:
+        // Default 16dp256b LDTM needs numTmemCols >= 8 (i.e., epilogueTileN >= 8 for Fp32).
+        // For smaller tiles, switch to 32dp32b which only needs numTmemCols >= 1.
+        // Note: Hybrid SliceK uses custom epilogue (hybridSliceKEpilogueStore) that bypasses LDTM,
+        // but GmemC resource creation still triggers TmemLdstInst initialization that would SIGFPE.
+        int const minEpilogueTileNFor16dp256b = 8; // 16dp256b needs 8 TMEM cols per repeat
+        if (options.mEpilogueTileN < minEpilogueTileNFor16dp256b)
+        {
+            if (updateOptions)
+            {
+                // Switch to 32dp32b configuration which works with any epilogueTileN >= 1
+                options.mEpilogueLdtmDps = 32;
+                options.mEpilogueLdtmBits = 32;
+            }
+            else
+            {
+                // In non-update mode, check if current LDTM config is compatible
+                if (options.mEpilogueLdtmDps == 16 && options.mEpilogueLdtmBits == 256)
+                {
+                    return false; // Incompatible configuration
+                }
+            }
+        }
+    }
+#endif // TLLM_PUBLIC_RELEASE
+
     // Number of iterations in K dimension after padding.
     // Note the perCtaK in each CTA in the splitK group are padded to the same number of iterations.
     // E.g., K = 512, TileK = 128, numSlicesForSplitK = 3. Then the padded K is
@@ -1900,7 +2399,10 @@ inline bool checkAndUpdateGemmOptions(
         }
         else
         {
-            TLLM_CHECK_ERROR(false, "Persistent scheduler and !UseCustomMmaSchedule is not supported.");
+            TLLM_CHECK_ERROR(false,
+                "Persistent scheduler and !UseCustomMmaSchedule is not supported."
+                "This avoids race between TMEM consumer (epilogue) and producer (mma). "
+                "DsFp8 reads early from TMEM before releasing TMEM so it is not affected.)");
         }
     }
 
@@ -2064,6 +2566,9 @@ inline bool checkAndUpdateGemmOptions(
     {
         TLLM_CHECK_ERROR(options.mUseTmaStore, "mUseMaxTmemOverlap only works with TMA store");
         TLLM_CHECK_ERROR(options.mNumSlicesForSplitK == 1, "mUseMaxTmemOverlap does not work with splitK");
+#ifndef TLLM_PUBLIC_RELEASE
+        TLLM_CHECK_ERROR(options.mNumSlicesForSliceK == 1, "mUseMaxTmemOverlap does not work with sliceK");
+#endif // TLLM_PUBLIC_RELEASE
         TLLM_CHECK_ERROR(!options.mUseDeepSeekFp8, "mUseMaxTmemOverlap does not work with mUseDeepSeekFp8");
     }
 
@@ -2072,6 +2577,10 @@ inline bool checkAndUpdateGemmOptions(
         TLLM_CHECK_ERROR(options.mUseTmaStore, "Using more than 4 warps for epilogue only works with TMA store");
         TLLM_CHECK_ERROR(
             options.mNumSlicesForSplitK == 1, "Using more than 4 warps for epilogue does not work with splitK");
+#ifndef TLLM_PUBLIC_RELEASE
+        TLLM_CHECK_ERROR(
+            options.mNumSlicesForSliceK == 1, "Using more than 4 warps for epilogue does not work with sliceK");
+#endif // TLLM_PUBLIC_RELEASE
         TLLM_CHECK_ERROR(
             !options.mUseDeepSeekFp8, "Using more than 4 warps for epilogue does not work with mUseDeepSeekFp8");
 
@@ -2080,21 +2589,89 @@ inline bool checkAndUpdateGemmOptions(
             "TileN must be a multiple of EpilogueTileN * numEpilogueWrpGrps");
     }
 
+#ifdef TLLM_RUBIN_FEATURES
+    if (options.mLamportConsumerA)
+    {
+        // TODO This should be easy to enable, just need to modify the consumer arrival count.
+        TLLM_CHECK_ERROR(options.mDtypeA == options.mDtypeMmaA, "Lamport pipeline does not support casting");
+        TLLM_CHECK_ERROR(!options.mUseDeepSeekFp8, "Lamport Consumer does not support DeepSeek FP8 format");
+        TLLM_CHECK_ERROR(padMultiplierA == 1,
+            "Lamport consumer does not support bit padding for dtypeA=", tg::dtypeToString(options.mDtypeA));
+    }
+    if (options.mLamportConsumerB)
+    {
+        TLLM_CHECK_ERROR(options.mDtypeB == options.mDtypeMmaB, "Lamport pipeline does not support casting");
+        TLLM_CHECK_ERROR(!options.mUseDeepSeekFp8, "Lamport Consumer does not support DeepSeek FP8 format");
+        TLLM_CHECK_ERROR(padMultiplierB == 1,
+            "Lamport consumer does not support bit padding for dtypeB=", tg::dtypeToString(options.mDtypeB));
+    }
+    if (options.mLamportConsumerA || options.mLamportConsumerB)
+    {
+        TLLM_CHECK_ERROR(
+            options.mUseTwoTmaLoadWarps, "Separate load warps must be used when Lamport pipeline is enabled");
+
+        TLLM_CHECK_ERROR(!options.mGridWaitForPrimaryEarlyExit, "Lamport consumer should not wait for primary");
+
+        // TODO Need to test this, might need to modify the consumer arrival count.
+        TLLM_CHECK_ERROR(!options.mSliceK, "SliceK is not compatible with Lamport pipeline");
+
+        // TODO Update the Lamport pipeline to use CGA barriers. Note, the SplitK implementation does
+        // not use CGA barriers within the DMA pipelines, so that feature is enabled.
+        TLLM_CHECK_ERROR(options.mClusterDimX == 1 && options.mClusterDimY == 1,
+            "Lamport pipeline does not support 2 CTA mode or features requiring CGA "
+            "barriers in DMA pipeline");
+    }
+    if (options.mLamportForceValid)
+    {
+        TLLM_CHECK_ERROR(options.mDtypeC != tg::Dtype::Fp32, "LamportForceValid is not implemented for Fp32 output");
+        TLLM_CHECK_ERROR(!options.mUseDeepSeekFp8, "LamportForceValid is not implemented for DeepSeekFp8");
+    }
+    if (options.mLamportProducer)
+    {
+        TLLM_CHECK_ERROR(options.mUseTmaStore, "Lamport producer requires Tma store");
+        TLLM_CHECK_ERROR(options.mLamportForceValid, "Lamport producer should always force valid values");
+        TLLM_CHECK_ERROR(!options.mGridTriggerSecondaryA, "Lamport producer cannot trigger secondary in A");
+        TLLM_CHECK_ERROR(!options.mGridTriggerSecondaryB, "Lamport producer cannot trigger secondary in B");
+        TLLM_CHECK_ERROR(!options.mUseDeepSeekFp8, "Lamport producer is not implemented for DeepSeekFp8");
+    }
+#ifdef TLLM_TEST
+    if (options.mLamportSeparateInvalidation)
+    {
+        TLLM_CHECK_ERROR(options.mLamportProducer, "LamportSeparateInvalidation requires LamportProducer");
+    }
+#endif // TLLM_TEST
+#endif // TLLM_RUBIN_FEATURES
+
     if (updateOptions)
     {
         // Init kernel traits.
+#ifndef TLLM_PUBLIC_RELEASE
+        // For Hybrid SliceK, swap tileM/tileN so KernelTraits sees LoadA=Weight(tileN) and
+        // LoadB=Activation(tileM).
+        int32_t const tileMForTraits = options.mHybridSliceK ? options.mTileN : options.mTileM;
+        int32_t const tileNForTraits = options.mHybridSliceK ? options.mTileM : options.mTileN;
+#else
         int32_t const tileMForTraits = options.mTileM;
         int32_t const tileNForTraits = options.mTileN;
+#endif // TLLM_PUBLIC_RELEASE
         options.mKernelTraits = KernelTraits(options.mDtypeA, options.mDtypeB, options.mDtypeC, options.mDtypeAcc,
             options.mDtypeMmaA, options.mDtypeMmaB, options.mMmaKind, options.mSparsityA, options.mMmaK, tileMForTraits,
             tileNForTraits, options.mTileK, options.mMmaTileK, options.mEpilogueTileM, options.mEpilogueTileN,
             options.mSfBlockSizeA, options.mSfBlockSizeB, options.mNumStagesA, options.mNumStagesB,
             options.mNumStagesMma, options.mNumStagesTmemSfA, options.mNumStagesTmemSfB, options.mNumSlicesForSplitK,
+#ifndef TLLM_PUBLIC_RELEASE
+            options.mNumSlicesForSliceK,
+#endif // TLLM_PUBLIC_RELEASE
             options.mSplitK, options.mUseTmaStore, options.mTransposeMmaOutput, options.mAllReduceAlgo,
             options.mFuseUtccpWithUtcmma, options.mUseMaxTmemOverlap, options.mUseCustomizedMma3xNvFp4,
             options.mNumEpilogueWarps, isPersistentScheduler(options.mTileScheduler), options.mUseDeepSeekFp8,
             options.mUsePerTokenSfA, options.mUsePerTokenSfB,
-            /* useTwoCtas*/ options.mClusterDimX >= 2, options.mBiasType, options.mFusedBiasShuffleMode);
+            /* useTwoCtas*/ options.mClusterDimX >= 2, options.mBiasType, options.mFusedBiasShuffleMode
+#ifdef TLLM_RUBIN_FEATURES
+            ,
+            options.mLamportProducer, options.mUseUniqueSfA
+#endif // TLLM_RUBIN_FEATURES
+        );
     }
 
     return true;
@@ -2148,8 +2725,8 @@ inline CUresult loadCubinData(CUmodule* module, Config const& config)
     // Trtllm links the cubin into the executable while Flashinfer loads the cubin from storage.
 #ifdef TLLM_GEN_EXPORT_FLASHINFER
 #ifdef TLLM_GEN_GEMM_CUBIN_PATH
-    static std::string const tllm_gen_gemm_cubin_path = std::string(TLLM_GEN_GEMM_CUBIN_PATH);
-    std::string const sha256 = config.mHash ? config.mHash : "";
+    static const std::string tllm_gen_gemm_cubin_path = std::string(TLLM_GEN_GEMM_CUBIN_PATH);
+    const std::string sha256 = config.mHash ? config.mHash : "";
     std::string fileName = config.mFunctionName;
     if (!fileName.empty())
     {

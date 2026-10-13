@@ -68,10 +68,9 @@ environment:
   #   worker_env_var below; start_worker.sh re-exports it as UCX_TLS
   #   after the clear. Note that list excludes RDMA/verbs.
   # - pairs with the workers'
-  #   kv_cache_bounce_size_mb (fabric-VMM bounce; measured
-  #   ~455 GB/s/GPU). The default gate of 96 blocks would silently skip
+  #   kv_cache_bounce_size_mb (fabric-VMM bounce). The default gate of 96 blocks would silently skip
   #   bounce for requests under 6144 tokens at tokens_per_block=64,
-  #   falling back to ~0.4 GB/s host-staged tcp.
+  #   falling back to host-staged tcp.
   # - pyxis/enroot reset image-defined PATH at container start, so the
   #   in-place venv is injected via TRTLLM_PATH_PREPEND /
   #   TRTLLM_PYTHONPATH_PREPEND, which the harness scripts apply inside
@@ -105,8 +104,7 @@ worker_config:
       max_tokens_in_buffer: 8448
       # Fabric-VMM bounce: needed for cross-node V2 transfers on clusters
       # where inter-node cuda_ipc requires fabric allocations (else
-      # ~0.4 GB/s host-staged tcp); measured ~455 GB/s/GPU with
-      # (worker_env_var above).
+      # host-staged tcp).
       # 1024 fits one full request payload (433 MiB KDA state + ~27 KB/token
       # MLA latent = 649 MiB at 8k ISL); at 512 every 8k transfer falls back
       # to the per-fragment tcp path.

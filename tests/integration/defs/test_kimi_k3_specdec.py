@@ -11,9 +11,9 @@ logits; see the harness docstring).
 
 Requirements: 4 GPUs and the Kimi K3 checkpoint (env KIMI_K3_CKPT or
 <LLM_MODELS_ROOT>/Kimi-K3). Skips cleanly when the
-checkpoint is absent. The MoE backend defaults to VANILLA (the reference
-dequant path — the bit-parity oracle; slow but fine at 4 layers) so the
-test has no fused-kernel dependency and runs on any arch.
+checkpoint is absent. The MoE backend uses MegaMoEDeepGemm for the
+checkpoint's W4A8 MXFP4 routed experts, which is the fused backend supported
+on Rubin.
 """
 
 import os
@@ -58,10 +58,9 @@ def test_kimi_k3_sa_specdec_logits_parity():
             # ~50 trajectories make the aggregate divergence statistics
             # meaningful; loading dominates runtime so this is nearly free.
             "KIMI_K3_SPEC_NUM_PROMPTS": "48",
-            # No KIMI_K3_MOE_BACKEND override: KimiK3MoERuntime pins the
-            # routed MoE backend to TRTLLM regardless of moe_config.backend,
-            # so a VANILLA default here would not take effect. Parity holds
-            # because the baseline and spec runs share the same backend.
+            # K3's packed checkpoint is W4A8 MXFP4. TRTLLM-Gen has no Rubin
+            # cubin for this path; MegaMoEDeepGemm supports the layout.
+            "KIMI_K3_MOE_BACKEND": "MEGAMOE_DEEPGEMM",
         }
     )
     script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kimi_k3_sa_harness.py")

@@ -173,6 +173,9 @@ inline bool isTokenSparse(SparseType sparseType)
     return sparseType == SparseType::StaticTokenSparse || sparseType == SparseType::DynamicTokenSparse;
 }
 
+// The threshold-enabled E4M3 P scale is 1.75, and 1.75 * 2^8 equals the E4M3 maximum of 448.
+inline constexpr float kDsv4SkipCorrThreshold = 8.0F;
+
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 enum class TileScheduler
@@ -354,10 +357,16 @@ struct TllmGenFmhaRunnerParams
     int mSfStartTokenIdx;
     // Skip softmax threshold scale factor.
     float mSkipSoftmaxThresholdScaleFactor;
+    // Skip correction when the running row max increase does not exceed this threshold.
+    float mSkipCorrThreshold{0.0F};
     // Sparse attention type.
     SparseType mSparseAttention;
     // The top k value for sparse attention.
     int mSparseTopK;
+    // Whether to use spcompress (context phase, SM107 only).
+    bool mUsesSpcompress = false;
+    // Whether to use fp16 softmax or not.
+    bool mFp16Softmax = false;
     // The cuda stream.
     cudaStream_t stream;
     // The layer index.
@@ -387,7 +396,7 @@ struct TllmGenFmhaRunnerParams
         case 2: // tensorrt_llm::kernels::ContextAttentionMaskType::SLIDING_OR_CHUNKED_CAUSAL
             mMaskType = TrtllmGenAttentionMaskType::SlidingOrChunkedCausal;
             break;
-        case 4: // tensorrt_llm::kernels::ContextAttentionMaskType::CUSTOM_MASK
+        case 3: // tensorrt_llm::kernels::ContextAttentionMaskType::CUSTOM_MASK
             mMaskType = TrtllmGenAttentionMaskType::Custom;
             break;
         default:
@@ -429,6 +438,10 @@ struct TllmGenSelectKernelParams
     bool mUses2CtaMma;
     // Skips softmax or not.
     bool mSkipsSoftmaxWhenPossible;
+    // Use FP16 softmax or not.
+    bool mFp16Softmax;
+    // Use spcompress or not (context phase, SM107 only).
+    bool mUsesSpcompress;
 
     // The constructor.
     TllmGenSelectKernelParams(TllmGenFmhaRunnerParams params)
@@ -445,7 +458,9 @@ struct TllmGenSelectKernelParams
         , mTileSizeQ(128)
         , mTileSizeKv(128)
         , mUses2CtaMma(false)
-        , mSkipsSoftmaxWhenPossible(params.mSkipSoftmaxThresholdScaleFactor != 0.0f){};
+        , mSkipsSoftmaxWhenPossible(params.mSkipSoftmaxThresholdScaleFactor != 0.0f)
+        , mFp16Softmax(params.mFp16Softmax)
+        , mUsesSpcompress(params.mUsesSpcompress){};
 };
 
 } // namespace kernels

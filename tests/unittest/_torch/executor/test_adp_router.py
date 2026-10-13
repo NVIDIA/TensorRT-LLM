@@ -1179,6 +1179,21 @@ class TestConversationAwareADPRouter:
         for i in range(4):
             assert pos2[100 + i] == home[convs[i]]
 
+    def test_uncached_prefill_estimate_published_while_demotion_is_on(self, monkeypatch):
+        """Opener: the whole prompt; a later turn: its growth since the previous turn."""
+        monkeypatch.setenv("TLLM_V2_CTX_DEMOTE_UNCACHED_TOKENS", "1024")
+        router = self._router(tp_size=2)
+        opener = _make_conv_request_item(0, "A", num_tokens=5000)
+        self._route(router, self._states(2), [opener])
+        assert opener.request.py_uncached_prefill_tokens == 5000
+        turn2 = _make_conv_request_item(1, "A", num_tokens=5300)
+        self._route(router, self._states(2), [turn2])
+        assert turn2.request.py_uncached_prefill_tokens == 300
+        monkeypatch.delenv("TLLM_V2_CTX_DEMOTE_UNCACHED_TOKENS")
+        off = _make_conv_request_item(2, "B", num_tokens=5000)
+        self._route(self._router(tp_size=2), self._states(2), [off])
+        assert not isinstance(off.request.py_uncached_prefill_tokens, int)
+
     def test_no_conversation_id_falls_back_and_is_not_recorded(self):
         router = self._router(tp_size=4)
         items = [_make_conv_request_item(i, None) for i in range(8)]

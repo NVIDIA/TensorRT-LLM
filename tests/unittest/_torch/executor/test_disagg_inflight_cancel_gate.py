@@ -17,6 +17,7 @@ import sys
 from types import SimpleNamespace
 from unittest.mock import Mock, call
 
+import numpy as np
 import pytest
 
 from tensorrt_llm._torch.pyexecutor import kv_cache_transceiver as transceiver_module
@@ -66,13 +67,15 @@ def _make_response_handler_stub(active_requests, tp_allgather_result):
     executor.dist = SimpleNamespace(
         rank=0,
         world_size=2,
-        tp_allgather=Mock(return_value=tp_allgather_result),
+        tp_allgather_int64=Mock(
+            return_value=np.array([[int(flag)] for flag in tp_allgather_result])
+        ),
     )
     executor._enqueue_responses = Mock()
     executor._terminate_request = Mock()
     executor._handle_errors = Mock()
     executor._timeout_cleanup_order = Mock()
-    executor._timeout_cleanup_order.attach_mock(executor.dist.tp_allgather, "vote")
+    executor._timeout_cleanup_order.attach_mock(executor.dist.tp_allgather_int64, "vote")
     executor._timeout_cleanup_order.attach_mock(executor._handle_errors, "handle")
     return executor
 
@@ -112,14 +115,14 @@ def test_flag_unset_generation_timeout_uses_rank_uniform_cleanup():
 
     executor.kv_cache_transceiver.cancel_request.assert_called_once_with(request)
     assert executor.active_requests == []
-    executor.dist.tp_allgather.assert_called_once_with(True)
+    executor.dist.tp_allgather_int64.assert_called_once_with([True])
     executor._handle_errors.assert_called_once_with(
         error_msg="Request timed out (KV transfer)",
         requests=[request],
         charge_budget=False,
     )
     assert executor._timeout_cleanup_order.mock_calls == [
-        call.vote(True),
+        call.vote([True]),
         call.handle(
             error_msg="Request timed out (KV transfer)",
             requests=[request],
@@ -135,14 +138,14 @@ def test_flag_unset_generation_timeout_peer_enters_cleanup():
     PyExecutor._handle_kv_transfer_timeouts_synced(executor)
 
     executor.kv_cache_transceiver.cancel_request.assert_not_called()
-    executor.dist.tp_allgather.assert_called_once_with(False)
+    executor.dist.tp_allgather_int64.assert_called_once_with([False])
     executor._handle_errors.assert_called_once_with(
         error_msg="Request timed out (KV transfer)",
         requests=[],
         charge_budget=False,
     )
     assert executor._timeout_cleanup_order.mock_calls == [
-        call.vote(False),
+        call.vote([False]),
         call.handle(
             error_msg="Request timed out (KV transfer)",
             requests=[],

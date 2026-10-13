@@ -17,7 +17,7 @@
 # hidden states, accept the previous block with standard verification, draft a
 # new block in one backbone forward), adapted to DSpark's draft model which
 # produces the whole block (and its confidence-truncated length) inside a single
-# ``DSparkDraftModel.forward`` rather than via mask-token cross-attention.
+# ``DSv4DSparkDraftModel.forward`` rather than via mask-token cross-attention.
 
 from collections import deque
 from dataclasses import dataclass
@@ -30,10 +30,23 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
 from ..pyexecutor.llm_request import ATTENTION_DP_DUMMY_REQUEST_ID
+from .dflash import DFlashWorker, dflash_draft_slot_ids
 from .interface import SpecMetadata, SpecWorkerBase
 
 if TYPE_CHECKING:
     from ...llmapi.llm_args import DSparkDecodingConfig
+
+
+def _dspark_position_ceiling(max_ctx: int, block_size: int, max_draft_len: int) -> int:
+    """Return the number of RoPE entries needed by the DSv4 block drafter.
+
+    A target verification can accept the target token plus every draft token,
+    so ``start_pos`` advances by ``max_draft_len + 1``. The block drafter then
+    indexes ``block_size`` positions beginning at that start. With ``old``
+    bounded by ``max_ctx``, the largest index is
+    ``max_ctx + max_draft_len + 1 + block_size``; the length is one greater.
+    """
+    return int(max_ctx) + int(max_draft_len) + int(block_size) + 2
 
 
 @dataclass
@@ -44,7 +57,7 @@ class DSparkSpecMetadata(SpecMetadata):
     the target forward pass. DSpark captures the *mean over the multi-head
     (mHC) residual streams* at each captured layer (handled by the target-side
     capture hook), concatenated across layers, and feeds them to the draft
-    model's ``main_proj`` + ``main_norm`` (inside ``DSparkDraftModel.forward``)
+    model's ``main_proj`` + ``main_norm`` (inside ``DSv4DSparkDraftModel.forward``)
     as the captured-context attention input (``main_x``).
 
     Mirrors :class:`DFlashSpecMetadata`; the only DSpark-specific detail is that
@@ -123,8 +136,10 @@ class DSparkSpecMetadata(SpecMetadata):
             # without this, all concurrent gen requests fall through to the shared
             # scratch row below and corrupt each other's draft window at batch
             # size > 1 (GitHub #16767). Context-prefix entries are left to
-            # ``_seed_context_windows``; the ADP-idle (id 0) and CUDA-graph
-            # padding dummies are kept on the scratch row.
+            # ``_seed_context_windows``. CUDA-graph capture dummies and real
+            # generation requests acquire a persistent slot only once; prepare()
+            # runs before every replay, so it must never reset a live slot.
+            # ADP-idle (id 0) and high-ID CUDA-graph padding dummies use scratch.
             num_contexts = max(0, len(self.request_ids) - self.num_generations)
             for rid in self.request_ids[num_contexts:]:
                 if (
@@ -138,6 +153,14 @@ class DSparkSpecMetadata(SpecMetadata):
             # dedicated throwaway scratch row so they cannot overwrite a live
             # request's rolling window (they previously aliased to slot 0).
             scratch = worker._scratch_slot
+            # Reset every iteration. The scratch row has no prefill to seed it
+            # and no completion to free it, so _advance_generation_state's
+            # unconditional advance would leave its ABSOLUTE position climbing
+            # across graph shapes and iterations until it indexes past the RoPE
+            # table. A real slot is bounded instead by its request's lifetime.
+            worker._ctx_len[scratch] = 0
+            worker._valid_len[scratch] = 0
+            worker._position_initialized[scratch] = False
             mapping = torch.tensor(
                 [worker._req_to_slot.get(rid, scratch) for rid in self.request_ids],
                 dtype=torch.long,
@@ -184,11 +207,11 @@ class DSparkSpecMetadata(SpecMetadata):
         ]
 
 
-class DSparkWorker(SpecWorkerBase):
+class DSv4DSparkWorker(SpecWorkerBase):
     """Worker for DSpark speculative decoding.
 
     DSpark drafts a whole block of ``block_size`` tokens in one backbone forward
-    (``DSparkDraftModel.forward``): it projects the captured target-layer hidden
+    (``DSv4DSparkDraftModel.forward``): it projects the captured target-layer hidden
     states (``main_proj`` + ``main_norm``) into the draft's captured-context
     attention, runs the ``num_stages`` DSpark blocks over a rolling captured
     window, refines the per-position logits with the Markov head, and predicts a
@@ -205,9 +228,17 @@ class DSparkWorker(SpecWorkerBase):
     The rolling window is kept consistent across the whole decode: it is seeded
     from the prompt's captured context at prefill and back-filled with the
     intermediate accepted tokens of a multi-accept step (both via
-    ``DSparkDraftModel.write_context_windows``), in addition to the per-step bonus
+    ``DSv4DSparkDraftModel.write_context_windows``), in addition to the per-step bonus
     write done by the generation path. These affect draft acceptance rate only,
     not correctness, which the standard target verify guarantees.
+
+    Naming: workers are classified by *deployment form*, not by draft
+    backbone (see :class:`DSparkWorker`). This one is form-specific
+    because it owns a rolling captured-context window and drives the draft
+    through attributes only an embedded DeepSeek-V4-Pro draft has --
+    ``num_stages``, ``_attn_params``, ``write_context_windows``,
+    ``write_context_windows_batched`` and ``forward_batched``. A standalone
+    drafter has none of them and is served by :class:`DSparkWorker`.
 
     Reference: DeepSeek DeepSpec (https://github.com/deepseek-ai/DeepSpec).
     """
@@ -245,14 +276,14 @@ class DSparkWorker(SpecWorkerBase):
         self._scratch_slot = 0
 
         # The generation draft path is the batched, host-sync-free
-        # ``_draft_gen_block_batched`` + ``DSparkDraftModel.forward_batched`` +
+        # ``_draft_gen_block_batched`` + ``DSv4DSparkDraftModel.forward_batched`` +
         # ``dspark_attention_forward_batched``: it is correct in eager mode AND safe
         # to capture into the target's CUDA graph (DSpark is a one-engine drafter —
         # its worker forward runs inside that graph, so the draft path MUST be
         # capture-safe whenever ``cuda_graph_config`` is set).
 
         logger.info(
-            f"DSparkWorker initialized with "
+            f"DSv4DSparkWorker initialized with "
             f"use_separate_draft_kv_cache={use_separate_draft_kv_cache}"
         )
 
@@ -260,7 +291,7 @@ class DSparkWorker(SpecWorkerBase):
     def max_draft_len(self) -> int:
         return self.spec_config.max_draft_len
 
-    def _lazy_init(self, draft_model, spec_metadata) -> None:
+    def _lazy_init(self, draft_model, spec_metadata, attn_metadata=None) -> None:
         block_size = int(draft_model.block_size)
         if block_size != self.max_draft_len:
             raise ValueError(
@@ -270,7 +301,26 @@ class DSparkWorker(SpecWorkerBase):
 
         if self._win_inited:
             return
+        # Published before the RoPE table is built, which happens lazily on the
+        # first forward. The engine's max_seq_len is what positions actually
+        # reach and is strictly above model_config's whenever spec decoding is
+        # on, so the config-derived cap undersizes the table. Unlike DFlash,
+        # the DSv4 block path can advance by a fully accepted block and then
+        # index another full block, so it needs the DSpark-specific bound.
+        max_ctx = getattr(attn_metadata, "max_seq_len", None)
+        if max_ctx is not None:
+            ceiling = _dspark_position_ceiling(max_ctx, block_size, self.max_draft_len)
+            draft_model._runtime_position_ceiling = ceiling
+            # The worker owns the DSv4 wrapper, while the RoPE-table cache lives
+            # on its inner ``dspark_model``. Publish to both so the value that
+            # sizes the table is the runtime bound rather than the construction
+            # fallback.
+            inner_model = getattr(draft_model, "dspark_model", None)
+            if inner_model is not None:
+                inner_model._runtime_position_ceiling = ceiling
         max_batch = spec_metadata.max_num_requests
+        draft_model.configure_generation_autotuner(max_batch)
+
         num_stages = draft_model.num_stages
         self._win = int(draft_model._attn_params["window_size"])
         head_dim = int(draft_model._attn_params["head_dim"])
@@ -304,15 +354,47 @@ class DSparkWorker(SpecWorkerBase):
         self._ctx_len = torch.zeros(num_rows, dtype=torch.long, device="cuda")
         self._valid_len = torch.zeros(num_rows, dtype=torch.long, device="cuda")
         self._position_initialized = torch.zeros(num_rows, dtype=torch.bool, device="cuda")
-        self._batch_to_slot = torch.zeros(max_batch, dtype=torch.long, device="cuda")
+        self._batch_to_slot = torch.full(
+            (max_batch,), self._scratch_slot, dtype=torch.long, device="cuda"
+        )
         self._free_slots = deque(range(max_batch))
         self._req_to_slot = {}
-        self._win_inited = True
         logger.info(
             f"DSpark: allocated rolling KV windows "
             f"[{num_rows}, {num_stages}, {self._win}, {head_dim}] "
             f"({max_batch} request slots + 1 scratch row)"
         )
+
+        # Pre-compile one dynamic-batch CuteDSL attention kernel. Serving
+        # never pads or compiles, so eager drain has neither
+        # per-step host work nor a first-seen-batch JIT stall. The helper owns
+        # the support policy and no-ops for unsupported deployments.
+        from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
+
+        if IS_CUTLASS_DSL_AVAILABLE:
+            from ..custom_ops.dspark_attention_custom_op import precompile_dspark_attention
+
+            output_groups = None
+            stages = getattr(getattr(draft_model, "dspark_model", draft_model), "mtp_layers", ())
+            if (
+                stages
+                and "n_groups" in draft_model._attn_params
+                and all(stage._dspark_attn["use_fused_output_projection"] for stage in stages)
+            ):
+                output_groups = int(draft_model._attn_params["n_groups"])
+            precompile_dspark_attention(
+                block_size,
+                int(draft_model._attn_params["n_heads"]),
+                self._kv_windows[:, 0],
+                float(draft_model._attn_params["softmax_scale"]),
+                eps=float(draft_model._attn_params["eps"]),
+                output_groups=output_groups,
+            )
+
+        # Publish the initialized state only after every required kernel has
+        # compiled successfully. A compile failure must not leave a worker
+        # that later enters serving with an incomplete precompiled table.
+        self._win_inited = True
 
     def _assign_slot(self, req_id: int, reset: bool) -> int:
         """Get (or refresh) the slot for a request; reset clears its window."""
@@ -386,6 +468,17 @@ class DSparkWorker(SpecWorkerBase):
         input_positions: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Bootstrap and advance per-slot decode state without host synchronization."""
+        # ``prepare()`` runs before graph creation, not before every replay. A
+        # CUDA-graph padding / ADP-idle request therefore reuses this one
+        # scratch row across all capture shapes. It has no persistent request
+        # state: reset it in the captured forward so its absolute position
+        # always bootstraps from ``input_positions`` rather than accumulating
+        # until a RoPE-table gather goes out of range. The row is never assigned
+        # to a live request, so this cannot reset user-visible state.
+        scratch = self._scratch_slot
+        self._ctx_len[scratch].zero_()
+        self._valid_len[scratch].zero_()
+        self._position_initialized[scratch].zero_()
         old = torch.where(self._position_initialized[slots], self._ctx_len[slots], input_positions)
         start_pos = old + num_accepted_tokens
         self._ctx_len[slots] = start_pos
@@ -414,7 +507,7 @@ class DSparkWorker(SpecWorkerBase):
         (``nacc``, the bonus, ``main_hidden``, ``start_pos``, the multi-accept
         back-fill) are gathered as tensors, slots come from the host-built
         ``_batch_to_slot`` mirror, and the backbone runs once via
-        ``DSparkDraftModel.forward_batched``. Returns the per-position corrected
+        ``DSv4DSparkDraftModel.forward_batched``. Returns the per-position corrected
         block logits ``[num_gens, K, vocab]`` (or ``None`` when there is nothing to
         draft); the worker feeds them to ``SpecWorkerBase.sample_draft_tokens``.
         Confidence truncation stays disabled — the full block is proposed.
@@ -541,7 +634,7 @@ class DSparkWorker(SpecWorkerBase):
         raw_logits = logits
         K = self.max_draft_len
 
-        self._lazy_init(draft_model, spec_metadata)
+        self._lazy_init(draft_model, spec_metadata, attn_metadata)
         # Backref so DSparkSpecMetadata.prepare() can maintain the host slot map
         # and mirror it into _batch_to_slot for the CUDA-graph-safe gen path.
         spec_metadata._dspark_worker = self
@@ -696,3 +789,146 @@ class DSparkWorker(SpecWorkerBase):
             "next_draft_tokens": next_draft_tokens,
             "next_new_tokens": next_new_tokens,
         }
+
+
+class DSparkWorker(DFlashWorker):
+    """Worker for a *standalone* DSpark drafter (DFlash lineage).
+
+    DSpark is DFlash plus two extra heads, so the drafting plumbing is
+    inherited wholesale from :class:`DFlashWorker` -- paged context K/V,
+    slot management, the mask-token block forward -- and only the two
+    head-driven policies are overridden here: the block-output slot
+    convention (``shift_label``) and the Markov intra-block logit bias.
+
+    Mirrors the model side, where ``GQADSparkForCausalLM`` extends
+    ``DFlashForCausalLM`` with the same two heads.
+
+    Naming: this is the unqualified DSpark worker because a separately
+    shipped drafter is the ordinary case; :class:`DSv4DSparkWorker` carries
+    the qualifier because a draft embedded in the target checkpoint is the
+    special one. Workers are classified by *deployment form*, never by draft
+    backbone -- so there is no ``Qwen3DSparkWorker``. Note the name meant the
+    embedded worker before this split; both the rebind and the rename to
+    ``DSv4DSparkWorker`` land in one commit so the swap reads as a unit.
+
+    A worker is agnostic to the draft backbone: everything backbone-shaped is
+    supplied by the draft model, which reports its own shapes
+    (``_num_attn_layers``, ``_num_heads``, ``_num_kv_heads``, ``_head_dim``)
+    and owns the operators (``_build_fused_kv_buffers``,
+    ``precompute_context_kv``, ``dflash_forward``,
+    ``apply_markov_chain_logits``, ``project_target_hidden``). The worker only
+    allocates against the reported shapes and sequences the calls. An MLA
+    drafter therefore reuses this class unchanged; its differences (fused-QKV
+    assumptions, a 576-latent K/V layout) land in its own draft-model
+    subclass. Naming workers by backbone would produce N classes with
+    identical bodies.
+
+    Deployment form is the axis the runtime state actually splits on: paged
+    draft K/V here, a worker-owned rolling window in
+    :class:`DSv4DSparkWorker`.
+    """
+
+    def set_draft_model(self, draft_model) -> None:
+        """Reject an unsupported vocab mapping here rather than mid-decode.
+
+        ``d2t`` is model-static, so a config mistake should surface at load and
+        not as a ``NotImplementedError`` raised per decode step, possibly during
+        CUDA-graph capture.
+        """
+        super().set_draft_model(draft_model)
+        if self._d2t is not None and getattr(draft_model, "has_markov_head", False):
+            raise NotImplementedError(
+                "DSpark Markov head requires a shared draft/target vocab "
+                "(d2t vocab mapping is not supported); drafter "
+                f"{type(draft_model).__name__} declares one."
+            )
+
+    def _draft_slot_ids(
+        self, draft_model, num_gens: int, block_size: int, num_draft_tokens: int
+    ) -> torch.Tensor:
+        """Block-output slots under the dspark ``shift_label`` convention.
+
+        The drafter checkpoint declares the convention, so it is read off the
+        draft model rather than assumed: a DSpark drafter trained with the
+        legacy DFlash slot layout keeps the base class' slots 1..K.
+        """
+        shift_label = getattr(draft_model, "_dspark_shift_label", False)
+        return dflash_draft_slot_ids(
+            num_gens, block_size, num_draft_tokens, shift_label, device="cuda"
+        )
+
+    def _refine_block_logits(
+        self,
+        draft_model,
+        gen_logits: torch.Tensor,
+        inputs: dict,
+        spec_metadata,
+    ) -> torch.Tensor:
+        """Add the greedy-chained Markov intra-block bias to the block logits.
+
+        A DSpark drafter checkpoint may omit the Markov head (``markov_rank``
+        0), which loads as a drafter without one; that case falls through to
+        the unmodified backbone logits.
+        """
+        if not getattr(draft_model, "has_markov_head", False):
+            return gen_logits
+        return self._apply_dspark_markov_bias(
+            draft_model, gen_logits, inputs["first_prev_tokens"], spec_metadata
+        )
+
+    def _apply_dspark_markov_bias(
+        self,
+        draft_model,
+        gen_logits: torch.Tensor,
+        first_prev_tokens: torch.Tensor,
+        spec_metadata,
+    ) -> torch.Tensor:
+        """Apply the dspark vanilla-Markov intra-block bias to block logits.
+
+        Reference (DeepSpec VanillaMarkov.sample_block_tokens, temperature 0):
+        step i adds bias = markov_w2 @ markov_w1[prev_i] to the shared-lm_head
+        logits, where prev_0 is the anchor (last accepted) token and prev_{i>0}
+        is the greedy token from step i-1's biased logits. Greedy per-position
+        argmax of the returned logits therefore reproduces the reference
+        sampled chain; the rejection-sampling path samples from the same
+        biased distributions (proposal conditioned on the greedy chain).
+
+        Handles a TP vocab-sharded draft lm_head by slicing markov_w2's rows
+        to this rank's contiguous shard and chaining through the TP-aware
+        global argmax.
+        """
+        # The d2t guard lives in set_draft_model: it is model-static, so raising
+        # it here would surface a load-time config error per decode step.
+        # Unlike the d2t guard this one cannot move to set_draft_model: it
+        # keys on the runtime logits width, and reproducing that at init would
+        # duplicate the draft head's sharding rules. A standalone drafter
+        # borrows the target lm_head, whose gather_output defaults to True, so
+        # the logits normally arrive full-vocab and this branch is skipped.
+        full_vocab = draft_model.markov_w2.shape[0]
+        shard = gen_logits.shape[-1]
+        vocab_slice = None
+        if shard != full_vocab:
+            mapping = self.mapping
+            if (
+                mapping is None
+                or getattr(mapping, "enable_attention_dp", False)
+                or shard * mapping.tp_size != full_vocab
+            ):
+                raise NotImplementedError(
+                    f"DSpark Markov head: draft logits width {shard} does not "
+                    f"match the drafter vocab {full_vocab} and is not a plain "
+                    "TP column shard of it."
+                )
+            vocab_slice = slice(mapping.tp_rank * shard, (mapping.tp_rank + 1) * shard)
+
+        def argmax_fn(step_logits):
+            # Full-vocab token ids (TP-aware when sharded); tokens stay in
+            # draft-vocab space, which is what markov_w1 indexes.
+            return self.greedy_sample_draft_with_tp_gather(step_logits, spec_metadata).long()
+
+        return draft_model.apply_markov_chain_logits(
+            gen_logits,
+            first_prev_tokens,
+            argmax_fn=argmax_fn,
+            vocab_slice=vocab_slice,
+        )

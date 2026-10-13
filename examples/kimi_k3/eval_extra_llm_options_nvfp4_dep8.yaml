@@ -1,0 +1,30 @@
+# Kimi K3 NVFP4 on DEP8 (2 nodes x 4 GPU).
+# Derived from eval_extra_llm_options.yaml; kept separate so the shared
+# DEP16 template stays untouched.
+#
+# backend: CUTLASS is required, not a preference -- AUTO resolves Kimi K3 to
+# TRTLLM, and trtllm-gen ships SiTu cubins for W4A8_MXFP4_MXFP8 only.
+#
+# moe_config.max_num_tokens stays at the inherited value: for CUTLASS it is a
+# per-call chunking bound. Do NOT carry it over to MEGAMOE_* backends, where
+# it is the SymmBuffer capacity and this value over-provisions it 32x.
+tensor_parallel_size: 8
+enable_attention_dp: true
+moe_expert_parallel_size: 8
+max_batch_size: 32
+max_num_tokens: 8192
+max_seq_len: 8192
+trust_remote_code: true
+disable_overlap_scheduler: false
+enable_chunked_prefill: true
+cuda_graph_config:
+  enable_padding: true
+  max_batch_size: 32
+moe_config:
+  backend: CUTLASS
+  max_num_tokens: 131072
+  use_low_precision_moe_combine: true
+kv_cache_config:
+  enable_block_reuse: false
+  free_gpu_memory_fraction: 0.25
+  tokens_per_block: 64

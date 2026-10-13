@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 1993-2025 NVIDIA CORPORATION &
+ * SPDX-FileCopyrightText: Copyright (c) 1993-2026 NVIDIA CORPORATION &
  * AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,6 +15,8 @@
  * limitations under the License.
  */
 #pragma once
+
+#include <cuda.h>
 
 // NOTE: keep this code dependency free. It has to be included by the device code and has to be
 // compilable with NVRTC.
@@ -105,6 +107,29 @@ struct KernelParams
     //    Dtype is set from options.mDtypeC.
     CUtensorMap tmaC;
 
+#ifdef TLLM_RUBIN_FEATURES
+#ifdef TLLM_TEST
+    // TMA descriptor for testing data invalidation, (when lamportProducer is true)
+    // Must be setup using gemm::buildNdTmaDescriptor with shapes and strides from
+    // makeTmaShapeStrideC.
+    //
+    // If transposeMmaOutput is false,
+    //    Logical shape is [M, N].
+    //    Logical strides are [N, 1].
+    //    Tile box shape is [epilogueTileM, epilogueTileN].
+    //    Tile box strides are [epilogueTileN, 1].
+    //    Dtype is set from options.mDtypeC.
+    //
+    // If transposeMmaOutput is true,
+    //    Logical shape is [N, M].
+    //    Logical strides are [M, 1].
+    //    Tile box shape is [epilogueTileN, epilogueTileM].
+    //    Tile box strides are [epilogueTileM, 1].
+    //    Dtype is set from options.mDtypeC.
+    CUtensorMap tmaInvalidate;
+#endif // TLLM_TEST
+#endif // TLLM_RUBIN_FEATURES
+
     // TMA descriptor for the block scaling factors for A, for MxFp{4,8} and NvFp4 formats.
     // Must be setup using gemm::buildSfTmaDescriptor with shapes and strides from
     // makeTmaShapeStrideSfAb.
@@ -119,7 +144,7 @@ struct KernelParams
     // Dtype is Dtype::E4m3 for NvFp4, Dtype::UE8m0 for Mx formats.
     CUtensorMap tmaSfA;
 
-    // TMA descriptor for the block scaling factors for B, for MxFp{4,8} and NvFp4 formats.
+    // TMA descriptor for the block scaling factors for B, for MxFp{4,8}, MxInt4 and NvFp4 formats.
     // Must be setup using gemm::buildSfTmaDescriptor with shapes and strides from
     // makeTmaShapeStrideSfAb.
     // The layout of scaling factors for B is controlled by options.mSfLayoutB.
@@ -138,8 +163,26 @@ struct KernelParams
     //    The shape we use for TMA is: [⌈N / 8⌉, K / P / 4 / r, r * 32]
     //    where r = min(tileK / P / 4, 8)
     //
-    // Dtype is Dtype::E4m3 for NvFp4, Dtype::UE8m0 for Mx formats.
+    // Dtype is Dtype::E4m3 for NvFp4, Dtype::UE8m0 for MxFp{4,8} formats, Dtype::Bfloat16 for MxInt4.
     CUtensorMap tmaSfB;
+
+    // TMA descriptor for the sparsity information of A, if structured sparsity is used.
+    // Must be setup using gemm::buildNdTmaDescriptor with shapes and strides from
+    // makeTmaShapeStrideSparsityInfoA.
+    //
+    // When sparsityA is Any_2_4:
+    //     2 elements are non-zero in any chunk of 4 elements.
+    //     A 4-bit index indicates the position of the non-zero elements.
+    //     The shape in UInt8 is: [M, K / 8]
+    //
+    // When sparsityA is Pairwise_4_8:
+    //     4 elements are non-zero in any chunk of 8 elements.
+    //     The zero and non-zero elements are grouped in pairs.
+    //     A 4-bit index indicates the position of the non-zero pairs.
+    //     The shape in UInt8 is: [M, K / 16]
+    //
+    // Dtype is Dtype::UInt8.
+    CUtensorMap tmaSparsityInfoA;
 
     // The output matrix C. The data type is controlled by options.mDtypeC.
     //
@@ -223,10 +266,31 @@ struct KernelParams
     //    The layout is controlled by options.mSfLayoutC (either R128c4 or R8c4).
     void* ptrSfC;
 
+#ifdef TLLM_RUBIN_FEATURES
+#ifdef TLLM_TEST
+    // The scaling factors for testing data invalidation, for MxFp{4,8} and NvFp4 formats.
+    //
+    // For MxFp{4,8} and NvFp4 formats:
+    //    If transposeMmaOutput is false, shape is [M, N / 16].
+    //    Otherwise, shape is [N, M / 16].
+    //    The layout is controlled by options.mSfLayoutC (either R128c4 or R8c4).
+    void* ptrSfInvalidate;
+#endif // TLLM_TEST
+#endif // TLLM_RUBIN_FEATURES
+
     // The output tensor scaling factor for MxFp{4,8}, Fp8, NvFp4 and DeepSeek FP8 quantization.
     // TensorRT-LLM API requires a scaling factor on the device.
+    // Without non-linear activation, it is typically defined as quantScaleC * dequantScaleAb.
+    // With non-linear activation, it is typically defined as quantScaleC only.
     // Shape is [1].
     float const* ptrScaleC;
+
+    // The pre-activation scaling factor for MxFp{4,8}, Fp8, NvFp4 and DeepSeek FP8 quantization.
+    // Only used with non-linear activation functions (e.g., GELU, Relu2).
+    // Without non-linear activation, this is ignored by the kernel.
+    // With non-linear activation, it is typically defined as dequantScaleAb.
+    // Shape is [1].
+    float const* ptrScaleAct;
 
     // The M dimension.
     // It is the total number of tokens if A is the activation matrix.

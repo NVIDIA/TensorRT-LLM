@@ -40,10 +40,12 @@ from ..models.modeling_utils import (DecoderModelForCausalLM, MetaInitMode,
                                      get_registered_model_class, timing)
 from ..modules.fused_moe.moe_load_balancer import (
     MoeLoadBalancer, maybe_create_moe_load_balancer)
+from ..modules.low_m_gemm import LOW_M_GEMM_ACTIVE, prepare_low_m_gemm
+from ..ugpu.policy import UgpuPolicy
 from ..virtual_memory import RestoreMode
 from ..virtual_memory import scope as virtual_memory_scope
-from .config_utils import (is_hybrid_linear, resolve_hf_torch_dtype,
-                           resolve_ssm_cache_dtype)
+from .config_utils import (is_hybrid_linear, resolve_auto_ssm_cache_dtype,
+                           validate_kimi_kda_state_dtype)
 
 _KV_CACHE_MAP = {
     "fp8": QuantAlgo.FP8.value,
@@ -89,12 +91,13 @@ def validate_and_set_mamba_ssm_cache_dtype(
         mamba_ssm_stochastic_rounding: bool = False,
         mamba_ssm_philox_rounds: int = 10) -> None:
     if mamba_ssm_cache_dtype == "auto":
-        mamba_ssm_cache_dtype = (
-            resolve_ssm_cache_dtype(config.pretrained_config)
-            or resolve_hf_torch_dtype(config.pretrained_config)
-            or config.torch_dtype)
+        mamba_ssm_cache_dtype = resolve_auto_ssm_cache_dtype(
+            config.pretrained_config, config.torch_dtype)
     else:
         mamba_ssm_cache_dtype = str_dtype_to_torch(mamba_ssm_cache_dtype)
+    validate_kimi_kda_state_dtype(config.pretrained_config,
+                                  mamba_ssm_cache_dtype,
+                                  mamba_ssm_stochastic_rounding)
 
     config.quant_config.mamba_ssm_cache_dtype = mamba_ssm_cache_dtype
     config.quant_config.mamba_ssm_stochastic_rounding = mamba_ssm_stochastic_rounding
@@ -558,6 +561,14 @@ class ModelLoader:
         post_transform_config_identity = PostTransformConfigIdentity.from_model_config(
             config)
         load_format = self.llm_args.load_format
+        ugpu_policy = getattr(config, "ugpu_policy", None)
+        if (load_format == LoadFormat.GMS
+                and getattr(ugpu_policy, "enabled", False)):
+            raise ValueError(
+                "LoadFormat.GMS is incompatible with uGPU localized weights. "
+                "GMS shares registered parameters, while uGPU execution "
+                "releases those parameters after creating partition-local "
+                "weight shards.")
 
         with timing("Model init total"), maybe_create_moe_load_balancer(
                 config, self.mapping) as moe_load_balancer:
@@ -1028,6 +1039,8 @@ class ModelLoader:
             # perturb NVLink barrier synchronization in multi-rank DG init.
             torch.cuda.empty_cache()
 
+        if LOW_M_GEMM_ACTIVE:
+            prepare_low_m_gemm(model)
         return model, moe_load_balancer
 
     def _check_gms_source_identity(self, gms_backend) -> None:
@@ -1153,6 +1166,9 @@ class ModelLoader:
         enabled_features = set()
         if loads_draft_weights:
             enabled_features.add(PostTransformFeature.SEPARATE_DRAFT_MODEL)
+        ugpu_policy = getattr(model.model_config, "ugpu_policy", None)
+        if getattr(ugpu_policy, "enabled", False):
+            enabled_features.add(PostTransformFeature.UGPU_LOCALIZED_WEIGHTS)
         return cls._post_transform_profile_registry().qualify(
             root_model_class=type(model),
             architecture=config_identity.architecture,
@@ -1418,11 +1434,13 @@ class ModelLoader:
             use_cute_dsl_blockscaling_mm,
             use_cute_dsl_blockscaling_bmm=self.llm_args.
             use_cute_dsl_blockscaling_bmm,
+            use_cute_dsl_bf16_bmm=self.llm_args.use_cute_dsl_bf16_bmm,
+            use_cute_dsl_bf16_gemm=self.llm_args.use_cute_dsl_bf16_gemm,
             video_pruning_rate=self.llm_args.multimodal_config.
             video_pruning_rate,
             multimodal_config=self.llm_args.multimodal_config,
-            use_cute_dsl_bf16_bmm=self.llm_args.use_cute_dsl_bf16_bmm,
-            use_cute_dsl_bf16_gemm=self.llm_args.use_cute_dsl_bf16_gemm,
+            use_lamport_sync=self.llm_args.use_lamport_sync,
+            ugpu_policy=UgpuPolicy(enabled=self.llm_args.enable_ugpu),
         )
 
         # Only pass model_kwargs if it's explicitly set (not None)
@@ -1461,6 +1479,7 @@ class ModelLoader:
                 f"Could not read allreduce pre-allocation config from "
                 f"{type(config.pretrained_config).__name__}: {e}. "
                 f"AllReduce pre-allocation will be skipped.")
+        config.extra_attrs['ugpu_policy'] = config.ugpu_policy
 
         validate_encoder_decoder_tp_scope(config)
         validate_encoder_decoder_kv_cache_config(config,

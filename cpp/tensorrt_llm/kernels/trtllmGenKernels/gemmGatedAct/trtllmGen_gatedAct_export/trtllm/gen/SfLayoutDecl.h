@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 1993-2025 NVIDIA CORPORATION &
+ * SPDX-FileCopyrightText: Copyright (c) 1993-2026 NVIDIA CORPORATION &
  * AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -68,10 +68,16 @@ enum class SfLayout
     // |  ... |  ... |  ... |  ... |  ... |  ... |  ... |  ... | ... |   ... |
     // | 31,0 | 31,1 | 31,2 | 31,3 | 63,0 | 63,1 | 63,2 | 63,3 | ... | 127,3 |
     // See https://nvbugspro.nvidia.com/bug/4165523
-    //
     // I.e., the SF buffer is a tensor [⌈m/128⌉, ⌈n/b/4⌉, 32, 4, 4]
     // The SF for the element (i, j) is stored at (i/128, j/b/4, i%32, (i%128)/32, (j/b)%4).
     R128c4,
+
+#ifdef TLLM_RUBIN_FEATURES
+    // A tile of 128x16 is stored contiguously.
+    // I.e., the SF buffer is a tensor [⌈m/128⌉, ⌈n/b/16⌉, 128, 16]
+    // The SF for the element (i, j) is stored at (i/128, j/16, i%128, j%16).
+    R128c16,
+#endif
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -84,8 +90,22 @@ inline std::string sfLayoutToString(SfLayout layout)
     case SfLayout::R8c4: return "8x4";
     case SfLayout::R8c16: return "8x16";
     case SfLayout::R128c4: return "128x4";
+#ifdef TLLM_RUBIN_FEATURES
+    case SfLayout::R128c16: return "128x16";
+#endif // TLLM_RUBIN_FEATURES
     default: assert(false); return "Unsupported layout";
     }
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+inline bool sfLayoutCanUseUtccp(SfLayout layout)
+{
+    return (layout == SfLayout::R128c4)
+#ifdef TLLM_RUBIN_FEATURES
+        || (layout == SfLayout::R128c16)
+#endif
+        ;
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

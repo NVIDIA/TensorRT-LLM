@@ -379,6 +379,7 @@ class SkipSoftmaxScheduler:
         *,
         runtime_params: Optional[SparseRuntimeParams] = None,
         timestep: Any = None,
+        uses_spcompress: bool = False,
     ) -> SparseRuntimeParams:
         """Return runtime parameters with skip-softmax thresholds."""
         if runtime_params is None:
@@ -394,11 +395,13 @@ class SkipSoftmaxScheduler:
                 runtime_params,
                 threshold_scale_factor_prefill=0.0,
                 threshold_scale_factor_decode=0.0,
+                uses_spcompress=uses_spcompress,
             )
         return replace(
             runtime_params,
             threshold_scale_factor_prefill=self.threshold_scale_factor_prefill,
             threshold_scale_factor_decode=self.threshold_scale_factor_decode,
+            uses_spcompress=uses_spcompress,
         )
 
 
@@ -408,3 +411,4 @@ class SkipSoftmaxParams(SparseParams):
 
     algorithm: Literal["skip_softmax"] = field(init=False, default="skip_softmax")
     scheduler: SkipSoftmaxScheduler = field(default_factory=SkipSoftmaxScheduler)
+    uses_spcompress: bool = False

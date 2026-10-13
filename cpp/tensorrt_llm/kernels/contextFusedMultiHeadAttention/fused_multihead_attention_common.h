@@ -145,6 +145,8 @@ struct MHARunnerFixedParams
     int sageBlockSizeV = 0;
     // Use sparse MLA ?
     bool useSparseMLA = false;
+    // Use spcompress (context phase, SM107 only) ?
+    bool useSpcompress = false;
     // Use sparse attention in trtllm-gen ?
     bool useTllmGenSparseAttention = false;
     // Fuse DSv4 inverse RoPE and FP8 output quantization in trtllm-gen.

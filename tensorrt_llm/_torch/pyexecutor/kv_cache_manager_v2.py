@@ -39,6 +39,7 @@ from tensorrt_llm.bindings.internal.batch_manager.kv_cache_manager_v2_utils impo
 )
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.runtime.kv_cache_hash import get_effective_kv_cache_event_hash_algo
+from tensorrt_llm.runtime.kv_cache_manager_v2 import _BACKEND as KV_CACHE_MANAGER_V2_BACKEND
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     _KV_CACHE_ITERATION_STATS_DELTA_FIELDS,
     BAD_PAGE_INDEX,
@@ -122,6 +123,58 @@ KV_CACHE_ITERATION_STATS_POOL_GROUP_FIELDS = tuple(
 )
 
 
+def _create_gpu_cache_tier_config(quota: int, enable_ugpu: bool) -> GpuCacheTierConfig:
+    if KV_CACHE_MANAGER_V2_BACKEND == "cpp":
+        if enable_ugpu:
+            logger.warning_once(
+                "uGPU KV-cache localization is not supported by the C++ KV cache manager V2; "
+                "disabling it.",
+                key="disable_ugpu_for_cpp_kv_cache_manager_v2",
+            )
+        return GpuCacheTierConfig(quota=quota)
+    return GpuCacheTierConfig(quota=quota, enable_ugpu=enable_ugpu)
+
+
+def _get_num_ugpus(impl) -> int:
+    """Return the effective uGPU count supported by the selected backend."""
+    if KV_CACHE_MANAGER_V2_BACKEND == "cpp":
+        return 1
+    return impl.num_ugpus
+
+
+def _get_kv_cache_ugpu_id(kv_cache) -> int | None:
+    """Return the cache-local uGPU id supported by the selected backend."""
+    if KV_CACHE_MANAGER_V2_BACKEND == "cpp":
+        return None
+    return kv_cache.ugpu_id
+
+
+def _create_backend_kv_cache(
+    impl,
+    lora_task_id: int | None,
+    salt: int | None,
+    input_tokens: Sequence[TokenIdExt] | None,
+    request_id: int,
+    expected_prompt_length: int | None,
+    ugpu_id: int | None,
+):
+    if KV_CACHE_MANAGER_V2_BACKEND == "cpp":
+        assert ugpu_id is None, "The C++ KV cache manager V2 does not support uGPU localization"
+        return impl.create_kv_cache(
+            ReuseScope(lora_id=lora_task_id, salt=salt),
+            input_tokens,
+            id=request_id,
+            expected_prompt_length=expected_prompt_length,
+        )
+    return impl.create_kv_cache(
+        ReuseScope(lora_id=lora_task_id, salt=salt, ugpu_id=ugpu_id),
+        input_tokens,
+        id=request_id,
+        expected_prompt_length=expected_prompt_length,
+        ugpu_id=ugpu_id,
+    )
+
+
 class Role:
     KEY = DataRole("key")
     VALUE = DataRole("value")
@@ -133,6 +186,9 @@ class Role:
     # _build_base_config, so allocation, free, slot reuse, and prefix reuse
     # share the lifecycle of the main K/V buffers for the same layer.
     INDEX_KEY = DataRole("index_key")
+    MLA_V_SCALE = DataRole("mla_v_scale")
+    MLA_V_PACKED = DataRole("mla_v_packed")
+    MLA_HP_TAIL = DataRole("mla_hp_tail")
     ALL = DataRole("all")
 
 
@@ -327,6 +383,30 @@ def _estimate_swa_cache_size(
                     scratch_keys.add(scratch_key)
                     size_per_token += layer_size
     return size_per_token, size_per_request
+
+
+def _extend_swa_windows_for_reuse(
+    attention_windows: Sequence[Optional[int]],
+    reuse_match_backoff: int,
+    max_seq_len: Optional[int],
+) -> List[Optional[int]]:
+    """Extend physical SWA retention to cover a backed-off reuse match."""
+    if reuse_match_backoff <= 0:
+        return list(attention_windows)
+
+    retention_windows: List[Optional[int]] = []
+    for window_size in attention_windows:
+        if window_size is None or window_size <= 0:
+            retention_windows.append(window_size)
+            continue
+
+        retention_window = int(window_size) + reuse_match_backoff
+        retention_windows.append(
+            None
+            if max_seq_len is not None and retention_window >= int(max_seq_len)
+            else retention_window
+        )
+    return retention_windows
 
 
 def _get_static_cache_size_layer_components(
@@ -766,7 +846,19 @@ def _copy_swa_block_offsets_with_scratch_compiled(
     output.copy_(converted.permute(0, 2, 1, 3))
 
 
+def _rewind_context_cursor(req: LlmRequest, reuse: int) -> None:
+    """Pull a context cursor back to a shallower prefix. ``setPrepopulatedPromptLen``
+    only moves forward, so leave the forward case to it -- it re-floors chunk size too.
+    """
+    if reuse < req.context_current_position:
+        req.context_current_position = reuse
+
+
 class KVCacheManagerV2(BaseResourceManager):
+    # Read by KvCacheCreator: a subclass that overrides the context
+    # commit/history protocol opts out of generic reuse-match backoff.
+    _supports_reuse_match_backoff = True
+
     def __init__(
         self,
         kv_cache_config: KvCacheConfig,
@@ -795,6 +887,8 @@ class KVCacheManagerV2(BaseResourceManager):
         enable_stats: bool = False,
         num_reserved_index_slots: int = 1,
         is_estimating_kv_cache: bool = False,
+        enable_ugpu: bool = False,
+        joint_kv_cache_reuse: bool = False,
         **kwargs,
     ) -> None:
         self.mapping = mapping
@@ -842,11 +936,39 @@ class KVCacheManagerV2(BaseResourceManager):
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
         self.tokens_per_block = tokens_per_block
+        # Helix super-block ledger: bookkeeping runs in GLOBAL tokens, one
+        # ledger block = cp_size physical pages (one per rank), while
+        # self.tokens_per_block stays the PHYSICAL kernel page size.
+        self._has_cp_helix = mapping.has_cp_helix()
+        self._helix_cp_rank = mapping.cp_rank if self._has_cp_helix else 0
+        self._helix_cp_size = mapping.cp_size if self._has_cp_helix else 1
+        self._ledger_tokens_per_block = tokens_per_block * self._helix_cp_size
+        if self._has_cp_helix:
+            if kv_cache_config.enable_block_reuse:
+                raise ValueError(
+                    "KVCacheManagerV2 does not support block reuse with "
+                    "helix context parallelism: a ledger block's bytes span "
+                    "all CP ranks, so publishing it requires a group-wide "
+                    "protocol. Set kv_cache_config.enable_block_reuse=False."
+                )
+            if is_draft:
+                raise ValueError(
+                    "KVCacheManagerV2 does not support a draft cache "
+                    "manager with helix context parallelism."
+                )
+            if mapping.enable_attention_dp:
+                raise ValueError(
+                    "KVCacheManagerV2 does not support attention-DP with "
+                    "helix context parallelism: disagg transfer-completion "
+                    "consensus is skipped under attention-DP, so the "
+                    "scheduler's request view would not be rank-invariant "
+                    "across the CP group."
+                )
         self.max_seq_len = max_seq_len
         self.max_batch_size = max_batch_size
         self.max_num_tokens = max_num_tokens
         self.kv_factor = 1 if kv_cache_type == CacheTypeCpp.SELFKONLY else 2
-        from ..speculative import get_num_extra_kv_tokens
+        from ..speculative import draft_prompt_lookahead, get_num_extra_kv_tokens
 
         self.num_extra_kv_tokens = get_num_extra_kv_tokens(spec_config)
         # Mirror V1: expose max_draft_len so the native disagg AuxBuffer
@@ -855,7 +977,15 @@ class KVCacheManagerV2(BaseResourceManager):
         self.max_total_draft_tokens = (
             spec_config.max_total_draft_tokens if spec_config is not None else 0
         )
-
+        # KvCacheCreator owns the pairing decision; never re-derive it here, or
+        # the two predicates drift apart and so do the two pools.
+        self.enable_joint_kv_cache_reuse = joint_kv_cache_reuse
+        # A draft manager only publishes to its radix tree when it is paired.
+        self._can_publish_block_reuse = joint_kv_cache_reuse or not self.is_draft
+        # Unsupported adapters keep their main-like reuse endpoint.
+        self.reuse_match_backoff = draft_prompt_lookahead(spec_config) or 0
+        if not self._supports_reuse_match_backoff:
+            self.reuse_match_backoff = 0
         # Mirror V1's KV reserve sizing (see V1 __init__ for rationale).
         self._kv_reserve_draft_tokens = self.max_total_draft_tokens
         if (
@@ -897,6 +1027,15 @@ class KVCacheManagerV2(BaseResourceManager):
 
         else:
             self.max_attention_window_vec = [None]
+
+        # A D-token match backoff needs D more physical SWA history at the
+        # committed endpoint so commit_min_snapshot still covers the rewind.
+        if kv_cache_config.enable_block_reuse and self.reuse_match_backoff:
+            self.max_attention_window_vec = _extend_swa_windows_for_reuse(
+                self.max_attention_window_vec,
+                self.reuse_match_backoff,
+                max_seq_len,
+            )
 
         event_window_size = max(
             self.max_seq_len if window_size is None else int(window_size)
@@ -1015,15 +1154,16 @@ class KVCacheManagerV2(BaseResourceManager):
 
         logger.info(f"KV cache manager v2 device quota set to {quota / (1 << 30)}GiB")
 
-        cache_tiers: List[CacheTierConfig] = [GpuCacheTierConfig(quota=int(quota))]
+        cache_tiers: List[CacheTierConfig] = [
+            _create_gpu_cache_tier_config(int(quota), enable_ugpu)
+        ]
         if kv_cache_config.host_cache_size is not None and kv_cache_config.host_cache_size >= 0:
             host_quota = kv_cache_config.host_cache_size
         else:
             # The V2 MAX_UTILIZATION scheduler relies on suspend/resume to
-            # evict and later restore KV cache pages.  Without a host tier,
-            # suspended pages have nowhere to be offloaded and resume()
-            # always fails, causing a scheduling deadlock where no
-            # generation request can ever make progress.
+            # evict and later restore KV cache pages. Without a secondary
+            # tier, suspended held pages cannot migrate out of GPU, so
+            # suspension cannot free capacity and scheduling can deadlock.
             #
             # Automatically provision a host tier matching the GPU quota so
             # suspend/resume works out of the box.  Cap at available host
@@ -1082,37 +1222,46 @@ class KVCacheManagerV2(BaseResourceManager):
             cache_tiers=cache_tiers,
         )
         config = self._build_cache_config(config)
+        has_host_cache_tier = any(
+            isinstance(tier, HostCacheTierConfig) for tier in config.cache_tiers
+        )
 
         self.kv_cache_manager_py_config = config
 
         try:
             self.impl = KVCacheManagerPy(config, event_manager=self.event_manager)
         except (CuError, KVCacheOutOfMemoryError):
-            if len(cache_tiers) > 1:
+            if has_host_cache_tier:
                 logger.warning(
                     "Failed to initialize KV cache manager with host cache "
                     "tier (cuMemHostRegister may have failed). "
                     "Retrying without host cache tier."
                 )
-                cache_tiers_gpu_only = [t for t in cache_tiers if isinstance(t, GpuCacheTierConfig)]
-                config = replace(config, cache_tiers=cache_tiers_gpu_only)
-                cache_tiers = cache_tiers_gpu_only
+                cache_tiers_without_host = [
+                    tier for tier in config.cache_tiers if not isinstance(tier, HostCacheTierConfig)
+                ]
+                config = replace(config, cache_tiers=cache_tiers_without_host)
                 self.kv_cache_manager_py_config = config
                 self.impl = KVCacheManagerPy(config, event_manager=self.event_manager)
             else:
                 raise
+        self.can_evict = len(config.cache_tiers) > 1
         if self.event_manager is not None:
             self.event_manager.set_layer_group_window_sizes(
                 self._get_event_window_sizes_by_layer_group()
             )
             self.event_manager.add_created_event(
-                self._get_event_num_blocks_per_cache_level(cache_tiers, tokens_per_block),
+                self._get_event_num_blocks_per_cache_level(config.cache_tiers, tokens_per_block),
                 self._get_event_layer_group_ids(),
             )
 
         # Both backends build layer_grouping on demand, and the layer order
         # within a group is not part of its contract. Cache a stable physical-
         # layout representative for each role from the public pool descriptors.
+
+        # Cache the fork-join attention flag at construction time so the
+        # manager's per-uGPU metadata invariants stay stable for its lifetime.
+        self._fork_join_attn = self.num_ugpus > 1 and enable_ugpu
         self.num_pools = len(self.impl.layer_grouping)
         self._pool_layer_ids_by_role: Dict[Tuple[int, DataRole], LayerId] = {}
         for pool_group in self.impl.pool_group_descs:
@@ -1146,6 +1295,16 @@ class KVCacheManagerV2(BaseResourceManager):
         # unbounded capacity growth.
         self._allocated_draft_lens: dict[int, int] = {}
 
+        # Overlap-scheduler slack (the extra draft_len in
+        # _required_gen_capacity's 1 + 2 * draft_len growth) granted to each
+        # request and not yet reclaimed.  The sampler's py_rewind_len only
+        # covers the rejected part of the recurring 1 + draft_len growth, so
+        # update_resources must additionally trim this slack — otherwise it
+        # compounds, leaking draft_len tokens of capacity per generation
+        # iteration until the request's block count overruns
+        # max_blocks_per_seq ("User-provided base page indices is too short").
+        self._pending_overlap_slack: dict[int, int] = {}
+
         # Defensive cap for get_num_available_tokens: when host cache is
         # enabled, clamp_max_seq_len_for_mem may return a value that spans
         # both GPU and host tiers.  Storing the explicit max_tokens (if set)
@@ -1175,7 +1334,9 @@ class KVCacheManagerV2(BaseResourceManager):
         max_seq_capacity = (
             self.max_seq_len + self.num_extra_kv_tokens + self._kv_reserve_draft_tokens + 1
         )
-        self.max_blocks_per_seq = (max_seq_capacity + tokens_per_block - 1) // tokens_per_block
+        self.max_blocks_per_seq = (
+            max_seq_capacity + self._ledger_tokens_per_block - 1
+        ) // self._ledger_tokens_per_block
         if self.max_blocks_per_seq % 4 != 0:
             self.max_blocks_per_seq = ((self.max_blocks_per_seq + 3) // 4) * 4
 
@@ -1185,7 +1346,7 @@ class KVCacheManagerV2(BaseResourceManager):
         enable_conversation_manager = (
             self.enable_block_reuse
             and self.block_reuse_policy == BlockReusePolicy.PER_CONVERSATION
-            and not self.is_draft
+            and self._can_publish_block_reuse
         )
         self.conversation_manager = (
             ConversationManager(block_reuse_config.max_num_turns)
@@ -1448,7 +1609,22 @@ class KVCacheManagerV2(BaseResourceManager):
             )
         return layer_sizes, attention_windows
 
+    def _get_generation_request_capacity(self) -> int:
+        """Return the resident generation requests used for SWA sizing."""
+        return self.max_batch_size
+
     def _get_max_tokens_from_quota(self, quota: int) -> float:
+        """Rank-local byte quota -> token capacity (GLOBAL tokens under helix)."""
+        tokens = self._get_max_tokens_from_quota_impl(quota)
+        if self._has_cp_helix and not math.isinf(tokens):
+            # Floor to whole physical pages before scaling: a ledger block
+            # allocates one full page on every CP rank, so a partial
+            # trailing page in the rank-local budget is never usable.
+            tokens = int(tokens) // self.tokens_per_block * self.tokens_per_block
+            tokens *= self._helix_cp_size
+        return tokens
+
+    def _get_max_tokens_from_quota_impl(self, quota: int) -> float:
         layer_sizes, attention_windows = self._get_runtime_cache_size_layer_components()
         full_attn_size_per_token = _estimate_full_attn_size_per_token(
             layer_sizes, attention_windows
@@ -1466,7 +1642,7 @@ class KVCacheManagerV2(BaseResourceManager):
         ) = _estimate_swa_cache_size(
             layer_sizes, attention_windows, self.tokens_per_block, context=False, scratch=False
         )
-        size_per_batch = self.max_batch_size * generation_swa_size_per_request
+        size_per_batch = self._get_generation_request_capacity() * generation_swa_size_per_request
         if quota < size_per_batch:
             return 0
         context_size_per_token = full_attn_size_per_token + context_swa_size_per_token
@@ -1482,6 +1658,16 @@ class KVCacheManagerV2(BaseResourceManager):
         return self.max_num_tokens + (quota - context_limit_quota) / generation_size_per_token
 
     def _get_quota_from_max_tokens(self, max_tokens: int) -> int:
+        """Token capacity (GLOBAL tokens under helix) -> rank-local byte quota."""
+        if self._has_cp_helix:
+            # Round up to whole ledger blocks first: allocation is page-
+            # granular on every rank, so a request of N global tokens costs
+            # ceil(N / ledger_tpb) full physical pages per rank.
+            blocks = -(-int(max_tokens) // self._ledger_tokens_per_block)
+            max_tokens = blocks * self.tokens_per_block
+        return self._get_quota_from_max_tokens_impl(max_tokens)
+
+    def _get_quota_from_max_tokens_impl(self, max_tokens: int) -> int:
         layer_sizes, attention_windows = self._get_runtime_cache_size_layer_components()
         full_attn_size_per_token = _estimate_full_attn_size_per_token(
             layer_sizes, attention_windows
@@ -1507,7 +1693,7 @@ class KVCacheManagerV2(BaseResourceManager):
         generation_quota = (
             max_tokens * full_attn_size_per_token
             + generation_tokens * generation_swa_size_per_token
-            + self.max_batch_size * generation_swa_size_per_request
+            + self._get_generation_request_capacity() * generation_swa_size_per_request
         )
         context_extra_quota = context_tokens * context_swa_size_per_token
         return int(generation_quota + context_extra_quota)
@@ -1556,6 +1742,60 @@ class KVCacheManagerV2(BaseResourceManager):
                             )
         return f"role={role!s}, pool_group_id=?, layer_group_id=?"
 
+    def _format_kv_cache_pool_group_sizes(self) -> list[str]:
+        """Describe how many slots each pool group actually got.
+
+        The aggregate KV utilization reported per iteration cannot answer
+        "which pool group is the binding constraint", because it sums every
+        pool group: a run can sit at 13% aggregate while one small pool group
+        is at its admission ceiling and refusing to activate requests. The
+        per-group slot count is what makes that case legible, and comparing it
+        against ``max_batch_size`` is what makes it actionable -- a pool group
+        sized at roughly one slot per declared request has no room for the
+        per-request slot count to vary, which windowed life cycles do as their
+        window slides across block boundaries.
+
+        Read through ``_introspection`` so the numbers are the same under
+        either the Python or the C++ backend.
+        """
+        try:
+            stats = _introspection.storage_statistics(self.impl, GPU_LEVEL)
+        except (AttributeError, RuntimeError) as exc:
+            # Introspection is a debugging aid, never a correctness
+            # dependency: a manager that cannot report its own layout must
+            # still start.
+            logger.debug(f"KV cache pool group sizes unavailable: {exc}")
+            return []
+
+        def flat_sizes(value) -> list[int]:
+            """Per-pool byte sizes, whatever shape the backend reported them in.
+
+            `slot_size` is a scalar under one backend and a list under another,
+            and wrapping a list in another list made `sum()` raise
+            ``TypeError: unsupported operand type(s) for +: 'int' and 'list'``
+            -- which is how a debugging aid took the startup log line with it.
+            """
+            if isinstance(value, int):
+                return [value]
+            sizes: list[int] = []
+            for item in value:
+                sizes.extend(flat_sizes(item))
+            return sizes
+
+        entries = []
+        for pool_group_id, stat in enumerate(stats):
+            reported = getattr(stat, "slot_sizes", None)
+            if reported is None:
+                reported = stat.slot_size
+            slot_sizes = flat_sizes(reported)
+            entries.append(
+                f"pool_group_id={pool_group_id}, "
+                f"num_slots={stat.total}, "
+                f"slot_size={slot_sizes}, "
+                f"bytes={stat.total * sum(slot_sizes)}"
+            )
+        return entries
+
     def _log_kv_cache_pool_lifecycle_mapping(self) -> None:
         entries = OrderedDict()
         for layer in self.kv_cache_manager_py_config.layers:
@@ -1569,6 +1809,9 @@ class KVCacheManagerV2(BaseResourceManager):
 
         logger.info(f"{type(self).__name__} role-to-pool/lifecycle mapping:")
         for entry in entries:
+            logger.info(entry)
+
+        for entry in self._format_kv_cache_pool_group_sizes():
             logger.info(entry)
 
     def _prepare_swa_scratch_copy_tensors(self, index_mapper_capacity: int) -> None:
@@ -1807,7 +2050,9 @@ class KVCacheManagerV2(BaseResourceManager):
 
             if typical_seq_len is not None:
                 # Model one context request and enough generation requests to fill
-                # max_batch_size without over-provisioning windowed cache pools.
+                # the resident request capacity without over-provisioning windowed
+                # cache pools.
+                generation_request_capacity = self._get_generation_request_capacity()
                 context_capacity = (
                     self.max_num_tokens if self.max_num_tokens is not None else typical_seq_len
                 ) + self.num_extra_kv_tokens
@@ -1820,11 +2065,11 @@ class KVCacheManagerV2(BaseResourceManager):
                             history_length=generation_history_length,
                         )
                     ]
-                    * (self.max_batch_size - 1)
+                    * (generation_request_capacity - 1)
                 )
 
                 # CUDA graph generation warmup uses one request at max_seq_len and
-                # enough minimal decode requests to fill max_batch_size.
+                # enough minimal decode requests to fill the resident capacity.
                 min_decode_capacity = 1 + self.max_draft_len + self.num_extra_kv_tokens
                 constraints.append(
                     BatchDesc(
@@ -1835,10 +2080,9 @@ class KVCacheManagerV2(BaseResourceManager):
                             )
                         ]
                         + [KVCacheDesc(capacity=min_decode_capacity, history_length=0)]
-                        * (self.max_batch_size - 1)
+                        * (generation_request_capacity - 1)
                     )
                 )
-
                 # General and chunked-prefill warmup uses one fresh context request
                 # at the per-iteration token budget.
                 if self.max_num_tokens is not None:
@@ -1853,17 +2097,14 @@ class KVCacheManagerV2(BaseResourceManager):
                         )
                     )
 
-        buffer_type = [Role.KEY]
-        if self.kv_cache_type != CacheTypeCpp.SELFKONLY:
-            buffer_type.append(Role.VALUE)
         if kv_cache_config.dtype == "nvfp4":
             for layer_idx, hd in enumerate(self.head_dim_per_layer):
+                buffer_roles = self._get_buffer_roles_for_layer(layer_idx)
+                if Role.KEY_BLOCK_SCALE not in buffer_roles:
+                    continue
                 assert hd % 2 == 0, (
                     f"head_dim must be divisible by 2 for nvfp4 kv cache, but layer {layer_idx} has head_dim={hd}"
                 )
-            buffer_type.append(Role.KEY_BLOCK_SCALE)
-            if self.kv_cache_type != CacheTypeCpp.SELFKONLY:
-                buffer_type.append(Role.VALUE_BLOCK_SCALE)
 
         # Subclasses (e.g. MiniMax-M3 sparse cache) can register additional
         # per-layer BufferConfig entries — for example a sparse index-K
@@ -1878,16 +2119,17 @@ class KVCacheManagerV2(BaseResourceManager):
 
         layer_configs: List[AttentionLayerConfig] = []
         for layer_id in typed_range(LayerId(self.num_local_layers)):
+            buffer_roles = self._get_buffer_roles_for_layer(layer_id)
             buffers = [
                 BufferConfig(
                     role=role,
                     size=self.get_layer_bytes_per_token(local_layer_idx=layer_id, data_role=role)
                     * tokens_per_block,
                 )
-                for role in buffer_type
+                for role in buffer_roles
             ]
             for extra in extra_buffers_per_layer.get(int(layer_id), ()):
-                assert extra.role not in buffer_type, (
+                assert extra.role not in buffer_roles, (
                     f"extra buffer role {extra.role!r} for layer "
                     f"{int(layer_id)} duplicates a standard K/V/scale role"
                 )
@@ -1904,13 +2146,19 @@ class KVCacheManagerV2(BaseResourceManager):
             )
 
         return KVCacheManagerConfigPy(
-            tokens_per_block=tokens_per_block,
+            # Used by the backend only for token<->block arithmetic and
+            # radix hashing; BufferConfig.size above stays the physical page.
+            tokens_per_block=self._ledger_tokens_per_block,
             cache_tiers=cache_tiers,
             layers=layer_configs,
             typical_step=typical_step,
             constraints=constraints,
             max_util_for_resume=kv_cache_config.max_util_for_resume,
             enable_partial_reuse=kv_cache_config.enable_partial_reuse,
+            # Keep the lookahead evidence and its backoff in the same tree match.
+            # A paired scheduler caps the claim by retaining D evidence past the
+            # common usable depth, so this still trims exactly once.
+            reuse_match_backoff=self.reuse_match_backoff,
             enable_stats=self.enable_stats,
             swa_scratch_reuse=scratch_reuse_config,
             commit_min_snapshot=(
@@ -1923,6 +2171,18 @@ class KVCacheManagerV2(BaseResourceManager):
     def _build_cache_config(self, config: KVCacheManagerConfigPy) -> KVCacheManagerConfigPy:
         """Customize the general cache config for a specialized cache manager."""
         return config
+
+    def _get_buffer_roles_for_layer(self, local_layer_idx: int) -> List[DataRole]:
+        """Return the standard cache roles allocated for one local layer."""
+        del local_layer_idx
+        buffer_roles = [Role.KEY]
+        if self.kv_cache_type != CacheTypeCpp.SELFKONLY:
+            buffer_roles.append(Role.VALUE)
+        if self.dtype == DataType.NVFP4:
+            buffer_roles.append(Role.KEY_BLOCK_SCALE)
+            if self.kv_cache_type != CacheTypeCpp.SELFKONLY:
+                buffer_roles.append(Role.VALUE_BLOCK_SCALE)
+        return buffer_roles
 
     def _get_typical_seq_len(self, kv_cache_config: KvCacheConfig) -> int | None:
         """Return the configured typical sequence length, if any."""
@@ -1977,6 +2237,15 @@ class KVCacheManagerV2(BaseResourceManager):
         """
         return {Role.ALL: MapperKind.INDEXED, Role.INDEX_KEY: MapperKind.REPLICATED}
 
+    def get_disagg_transfer_roles(self) -> Optional[frozenset[DataRole]]:
+        """Return the native roles included in disaggregated transfer.
+
+        ``None`` preserves the default policy and transfers every registered
+        role. Specialized managers may omit deterministic derived roles that
+        are rebuilt on the receiver after canonical cache data arrives.
+        """
+        return None
+
     @property
     def blocks_in_primary_pool(self) -> int:
         """
@@ -1999,7 +2268,7 @@ class KVCacheManagerV2(BaseResourceManager):
         assert kv_layout in ["NHD", "HND"], f"Unsupported kv_layout: {kv_layout}"
 
         element_per_container = 1
-        dtype = self.dtype
+        dtype = self.get_kv_cache_dtype(layer_idx)
         if dtype == DataType.NVFP4:
             element_per_container = 2
             dtype = torch.int8
@@ -2029,6 +2298,11 @@ class KVCacheManagerV2(BaseResourceManager):
                 shape,
             )
         )
+
+    def get_kv_cache_dtype(self, layer_idx: Optional[int] = None) -> DataType:
+        """Return the storage dtype for a layer, or the manager default."""
+        del layer_idx
+        return self.dtype
 
     def get_index_k_buffer(
         self,
@@ -2153,6 +2427,17 @@ class KVCacheManagerV2(BaseResourceManager):
     def get_num_available_tokens(
         self, *, token_num_upper_bound: int, batch_size: int = 1, max_num_draft_tokens: int = 0
     ) -> int:
+        """Clamp ``token_num_upper_bound`` to the allocatable token capacity.
+
+        Unit note: under helix the backend runs on the ledger
+        ``tokens_per_block``, so the returned capacity (like
+        ``token_num_upper_bound`` and ``max_seq_len``) is in GLOBAL ledger
+        tokens - the coordinate request lengths are expressed in. Callers
+        that additionally bound the result by per-forward budgets (e.g.
+        ``max_num_tokens``) stay consistent because a helix context forward
+        replicates all tokens on every rank, so both bounds constrain the
+        same request-length variable.
+        """
         extra_tokens = self.num_extra_kv_tokens + max_num_draft_tokens
         # Token num upper bound is the maximum number of tokens that can be allocated in the kv cache manager.
         # We need to add extra tokens to the token num upper bound to account for the extra tokens.
@@ -2180,6 +2465,111 @@ class KVCacheManagerV2(BaseResourceManager):
             ]
         )
         return max_num_pages // self.kv_factor
+
+    def _get_buffer_views_for_invalid_value_check(
+        self, layer_idx: int, kv_layout: str = "NHD"
+    ) -> list[torch.Tensor]:
+        """Return contiguous tensor views covering the mapped KV pages to scan."""
+        if self.num_ugpus <= 1:
+            return [self.get_buffers(layer_idx, kv_layout=kv_layout).flatten(0, 1)]
+
+        layer_offset = self.layer_offsets[layer_idx]
+        storage = self.impl._storage
+        lc_id = storage._layer_to_life_cycle_ids[LayerId(layer_offset)]
+        attr = storage.get_buffer_attr(LayerId(layer_offset), Role.KEY)
+        pg_idx = storage.get_pool_group_index(lc_id)
+        gpu_storage = storage._levels[GPU_LEVEL].storage
+        pool_group = gpu_storage._pool_groups[pg_idx]
+        slot_size = pool_group.slot_size[attr.pool_index]
+        element_per_container = 1
+        dtype = self.dtype
+        if dtype == DataType.NVFP4:
+            element_per_container = 2
+            dtype = torch.int8
+
+        views: list[torch.Tensor] = []
+        for ugpu_id in range(self.num_ugpus):
+            local_page_upper_bound = (
+                exact_div(slot_size, attr.size) * pool_group.num_slots(ugpu_id)
+                - exact_div(attr.offset, attr.size)
+            ) * attr.expansion
+            if kv_layout == "NHD":
+                shape = [
+                    local_page_upper_bound // self.kv_factor,
+                    self.kv_factor,
+                    self.tokens_per_block,
+                    self.num_kv_heads_per_layer[layer_offset],
+                    self.head_dim // element_per_container,
+                ]
+            else:
+                shape = [
+                    local_page_upper_bound // self.kv_factor,
+                    self.kv_factor,
+                    self.num_kv_heads_per_layer[layer_offset],
+                    self.tokens_per_block,
+                    self.head_dim // element_per_container,
+                ]
+            addr_key = (
+                int(gpu_storage.slot_address(pg_idx, attr.pool_index, 0, ugpu_id)) + attr.offset
+            )
+            views.append(
+                convert_to_torch_tensor(TensorWrapper(addr_key, dtype, shape)).flatten(0, 1)
+            )
+        return views
+
+    @property
+    def num_ugpus(self) -> int:
+        """Number of uGPUs. Returns 1 for non-localized configurations."""
+        return _get_num_ugpus(self.impl)
+
+    def get_per_ugpu_free_slots(self) -> list[int]:
+        """Free slot count per uGPU, summed across all pool groups."""
+        return self.impl.get_per_ugpu_free_slots()
+
+    def pick_ugpu(self, request_id: int) -> int | None:
+        """Default uGPU placement for newly-created requests."""
+        if self.num_ugpus <= 1:
+            return None
+        return request_id % self.num_ugpus
+
+    def _request_ugpu_id(self, req: LlmRequest) -> int | None:
+        """Return the request-owned uGPU id after validating the invariant."""
+        ugpu_id = getattr(req, "py_ugpu_id", None)
+        if self.num_ugpus <= 1:
+            assert ugpu_id is None or ugpu_id == 0, (
+                "Non-localized requests must not use a nonzero ugpu_id"
+            )
+            return None
+
+        assert ugpu_id is not None, (
+            f"Request {req.py_request_id} must carry py_ugpu_id before localized KV-cache placement"
+        )
+        assert 0 <= ugpu_id < self.num_ugpus, (
+            f"ugpu_id must be in [0, {self.num_ugpus}), got {ugpu_id}"
+        )
+        return ugpu_id
+
+    def get_ugpu(self, request_id: int) -> int:
+        """Return the uGPU index assigned to an allocated request."""
+        if self.num_ugpus <= 1:
+            return 0
+        kv_cache = self.kv_cache_map.get(request_id)
+        assert kv_cache is not None, (
+            f"get_ugpu: request {request_id} has no allocated KV cache "
+            f"(num_ugpus={self.num_ugpus}, "
+            f"kv_cache_map size={len(self.kv_cache_map)})"
+        )
+        assert _get_kv_cache_ugpu_id(kv_cache) is not None, (
+            f"get_ugpu: request {request_id} has no concrete ugpu_id "
+            f"(num_ugpus={self.num_ugpus}, "
+            f"kv_cache_map size={len(self.kv_cache_map)})"
+        )
+        return _get_kv_cache_ugpu_id(kv_cache)
+
+    @property
+    def fork_join_attn(self) -> bool:
+        """Whether to drive single-forward fork-join attention."""
+        return self._fork_join_attn
 
     def commit_scheduled_kv_cache_stats(self, scheduled_batch: ScheduledRequests) -> None:
         if self.is_draft or not self.enable_stats:
@@ -2227,12 +2617,63 @@ class KVCacheManagerV2(BaseResourceManager):
                 draft_len = self.max_total_draft_tokens
         return draft_len
 
+    def _helix_local_len(self, global_len: int) -> int:
+        """Tokens of the first ``global_len`` owned by this CP rank
+        (continuation round-robin: page b lives on rank b %% cp)."""
+        phys = self.tokens_per_block
+        full, rem = divmod(global_len, self._ledger_tokens_per_block)
+        return full * phys + min(max(rem - self._helix_cp_rank * phys, 0), phys)
+
+    def _set_helix_rank_fields(self, req: LlmRequest) -> None:
+        """Derive the per-rank helix fields from the global position.
+
+        The decode-step index is manager-owned (committed in
+        ``try_allocate_generation`` on successful resize) rather than derived
+        from ``py_decoding_iter``: the sampler advances that counter after
+        scheduling under the overlap loop, so a schedule-time read is one
+        step behind and would repeat the first decode position, overwriting
+        the first generated token's KV. Multi-token verify groups advance
+        py_helix_decode_group_index per committed group, so this formula
+        stays exact under DSpark speculation.
+        """
+        step = req.py_helix_decode_group_index + 1
+        pos = req.total_input_len_cp + step - 1
+        owner = (pos // self.tokens_per_block) % self._helix_cp_size
+        active = owner == self._helix_cp_rank
+        req.py_helix_is_inactive_rank = not active
+        # Convention shared with model_engine: the active rank's seqlen
+        # includes the in-flight token (past_seen = seqlen - 1 there).
+        req.seqlen_this_rank_cp = self._helix_local_len(pos) + (1 if active else 0)
+
     def _required_gen_capacity(self, req: LlmRequest, current_capacity: int) -> int:
         """Compute generation KV cache capacity for a request.
 
-        Grows *current_capacity* by 1 + draft tokens.
+        Grows *current_capacity* by 1 + draft tokens, plus another draft_len
+        of slack for one-model speculative decoding: under the overlap
+        scheduler the device-side KV position runs one verification round
+        ahead of host bookkeeping (up to draft_len accepted-but-uncommitted
+        tokens), and the MTP draft layers then append draft KV beyond that
+        position. Without the slack, the draft KV append can address a block
+        ordinal the host has not allocated yet whenever the overrun crosses a
+        tokens_per_block boundary — an illegal memory access in the MLA rope
+        generation kernel (observed with DSV4 DEP+MTP3 at 128k, where the
+        first window-slide boundary crossing after prefill faults).
+
+        The slack must stay a *constant* offset over the request's lifetime:
+        py_rewind_len only rewinds the rejected part of the recurring
+        1 + draft_len growth, so every call site records the extra draft_len
+        in _pending_overlap_slack and update_resources trims it back.
         """
-        return current_capacity + 1 + self._effective_draft_len(req)
+        return current_capacity + 1 + 2 * self._generation_draft_slots(req)
+
+    def _generation_draft_slots(self, req: LlmRequest) -> int:
+        """Physical draft width reserved for one iteration. Dynamic-tree draft pools
+        reserve wider than target pools; each reclaims its own in ``update_resources``.
+        """
+        slots = self._effective_draft_len(req)
+        if self.is_draft:
+            slots = max(slots, self._kv_reserve_draft_tokens)
+        return slots
 
     def try_allocate_generation(self, req: LlmRequest) -> bool:
         """Try to allocate one additional KV cache slot for a generation request.
@@ -2249,9 +2690,24 @@ class KVCacheManagerV2(BaseResourceManager):
                 return False
             self._restore_page_index_bufs(req.py_request_id, kv_cache)
 
-        draft_len = self._effective_draft_len(req)
-        self._allocated_draft_lens[req.py_request_id] = draft_len
-        return kv_cache.resize(self._required_gen_capacity(req, kv_cache.capacity))
+        request_id = req.py_request_id
+        draft_slots = self._generation_draft_slots(req)
+        self._allocated_draft_lens.pop(request_id, None)
+        is_helix_req = self._has_cp_helix and not req.is_dummy_request
+        if is_helix_req:
+            self._set_helix_rank_fields(req)
+        if not kv_cache.resize(self._required_gen_capacity(req, kv_cache.capacity)):
+            return False
+        if is_helix_req:
+            # Commit only on success so a same-pass retry recomputes the
+            # same step instead of skipping one.
+            req.py_helix_decode_group_index += 1
+        self._allocated_draft_lens[request_id] = draft_slots
+        if draft_slots > 0:
+            self._pending_overlap_slack[request_id] = (
+                self._pending_overlap_slack.get(request_id, 0) + draft_slots
+            )
+        return True
 
     def revert_allocate_generation(self, req: LlmRequest) -> None:
         """Undo the capacity growth from try_allocate_generation.
@@ -2263,18 +2719,31 @@ class KVCacheManagerV2(BaseResourceManager):
         so it does not accumulate across iterations and overflow the
         host page-index buffer.
 
-        Mirror the effective draft length used in _required_gen_capacity
-        so disagg-gen-trans-complete revert stays symmetric.
+        Keyed on ``_allocated_draft_lens``: no entry means no growth to give back.
+        Recording the width keeps the paired target/draft reverts in step.
         """
-        kv_cache = self.kv_cache_map.get(req.py_request_id)
+        request_id = req.py_request_id
+        draft_slots = self._allocated_draft_lens.pop(request_id, None)
+        if draft_slots is None:
+            return
+        kv_cache = self.kv_cache_map.get(request_id)
         if kv_cache is None or not kv_cache.is_active:
             return
-        draft_len = self._allocated_draft_lens.pop(
-            req.py_request_id, self._effective_draft_len(req)
-        )
-        reverted_cap = kv_cache.capacity - 1 - draft_len
+        if self._has_cp_helix and not req.is_dummy_request and req.py_helix_decode_group_index > 0:
+            # The forward pass for this step is skipped; give the step back.
+            req.py_helix_decode_group_index -= 1
+        # Mirror the 1 + 2 * draft_slots growth in _required_gen_capacity.
+        reverted_cap = kv_cache.capacity - 1 - 2 * draft_slots
         if reverted_cap < 0:
             return
+        # The reverted growth included draft_slots of overlap slack; deduct it
+        # so update_resources does not trim slack that no longer exists.
+        if draft_slots > 0:
+            remaining = self._pending_overlap_slack.get(request_id, 0) - draft_slots
+            if remaining > 0:
+                self._pending_overlap_slack[request_id] = remaining
+            else:
+                self._pending_overlap_slack.pop(request_id, None)
         if not kv_cache.resize(reverted_cap):
             raise RuntimeError(
                 f"Failed to revert KV cache capacity for request "
@@ -2282,20 +2751,31 @@ class KVCacheManagerV2(BaseResourceManager):
                 f"{reverted_cap}"
             )
 
-    def revert_allocate_context(self, req: LlmRequest) -> None:
-        """Undo the capacity growth from this iteration's context resize."""
+    def revert_allocate_context(self, req: LlmRequest) -> bool:
+        """Undo this iteration's context resize. False means the cache was dropped,
+        not shrunk (history outran pre-resize capacity); the caller drops any draft pool.
+        """
         pre_cap = getattr(req, "py_ctx_pre_resize_cap", None)
         if pre_cap is None:
-            return
+            return True
         req.py_ctx_pre_resize_cap = None
         kv_cache = self.kv_cache_map.get(req.py_request_id)
         if kv_cache is None or not kv_cache.is_active:
-            return
+            return True
         if pre_cap >= kv_cache.capacity:
-            return
+            return True
         if kv_cache.history_length > pre_cap:
             self.free_resources(req)
-            return
+            # The setter asserts prepopulated < promptLen; a Helix CP rank that
+            # holds none of the prompt has promptLen 0 and nothing to reset.
+            if req.prompt_len > 0 and req.prepopulated_prompt_len > 0:
+                req.set_prepopulated_prompt_len(0, self.tokens_per_block)
+            # setPrepopulatedPromptLen only moves forward, so rewind the same
+            # fields LlmRequest::pause() resets for a recompute pause.
+            req.context_current_position = 0
+            req.context_chunk_size = req.prompt_len
+            req.estimated_reusable_tokens = 0
+            return False
         history_length = min(kv_cache.history_length, pre_cap)
         if not kv_cache.resize(pre_cap, history_length):
             raise RuntimeError(
@@ -2305,6 +2785,7 @@ class KVCacheManagerV2(BaseResourceManager):
             )
         if pre_cap > 0:
             kv_cache.suspend()
+        return True
 
     def _restore_page_index_bufs(self, request_id: int, kv_cache) -> None:
         """Re-connect host page-index buffers after resume().
@@ -2336,68 +2817,125 @@ class KVCacheManagerV2(BaseResourceManager):
         self._restore_page_index_bufs(req_id, kv_cache)
         return True
 
-    def prepare_context(self, req: LlmRequest) -> bool:
-        """Create _KVCache, handle block reuse, and resume. Does NOT resize.
-
-        For first chunk: creates _KVCache (with block reuse lookup if enabled),
-        sets context_current_position, and resumes from suspended state.
-        For subsequent chunks: verifies existing cache is active.
-        Returns True on success, False if preparation failed.
+    def _context_reuse_tokens(
+        self, req: LlmRequest, reuse_limit: int | None = None
+    ) -> Sequence[TokenIdExt]:
+        """Radix-tree evidence for one context prefix. Raw prompt, so block hashes
+        stay comparable with KV cache events, the cache-aware router and disagg peers.
         """
-        assert not req.is_disagg_generation_init_state, (
-            f"req {req.py_request_id}: use prepare_disagg_gen_init"
+        all_tokens = self._reuse_token_source(req)
+        # The target must recompute the last prompt token, but a one-model draft
+        # also reads D prompt tokens ahead. Include those tokens as match evidence;
+        # the core drops D before claiming in both reuse protocols.
+        reuse_end = min(
+            len(all_tokens),
+            max(len(all_tokens) - 1, 0) + self.reuse_match_backoff,
         )
-        return self._prepare_context_impl(req)
+        if reuse_limit is not None:
+            # ``reuse_limit`` caps the claimed depth, not the evidence. Retain
+            # the D following tokens that prove the draft KV at that depth.
+            evidence_limit = 0 if reuse_limit <= 0 else reuse_limit + self.reuse_match_backoff
+            reuse_end = min(reuse_end, evidence_limit)
+        return self._augment_tokens_for_block_reuse(all_tokens, req, end=reuse_end)
 
-    def _prepare_context_impl(self, req: LlmRequest) -> bool:
+    def _record_branch_snapshot_point(
+        self, req: LlmRequest, kv_cache: _KVCache, num_lookup_tokens: Optional[int]
+    ) -> None:
+        """Hook for recurrent-state managers; attention-only caches have no snapshots."""
+
+    def probe_context_reuse(self, req: LlmRequest) -> int | None:
+        """Reusable prefix depth for this pool, without claiming pages.
+
+        The lookup includes this pool's prompt lookahead as evidence, and the core
+        applies ``reuse_match_backoff`` in the same match. A paired caller takes
+        the common usable depth. ``None``: nothing to probe -- reuse is off, or the
+        request already holds a settled cache claim.
+        """
+        if not self.enable_block_reuse or req.py_request_id in self.kv_cache_map:
+            return None
+        return self.impl.probe_reuse(
+            ReuseScope(lora_id=req.lora_task_id, salt=self._derive_reuse_salt(req.cache_salt)),
+            self._context_reuse_tokens(req),
+        )
+
+    def prepare_context_cache(self, req: LlmRequest, reuse_limit: int | None = None) -> int | None:
+        """Create/resume a context cache without touching request cursors. ``reuse_limit``
+        caps the claimed depth while retaining its lookahead evidence; the returned
+        match lets the scheduler check both pools agree.
+        """
         if req.is_first_context_chunk:
             if self.conversation_manager is not None:
                 self.conversation_manager.prepare_request(req)
             kv_cache = self.kv_cache_map.get(req.py_request_id)
+            # Stays None when the cache was resumed rather than freshly
+            # matched, which is also the case where no branch point applies.
+            num_lookup_tokens = None
             if kv_cache is None:
-                all_tokens = self._reuse_token_source(req)
-                # Last token cannot be recovered, so we don't include it in
-                # the input tokens to look up for the block that can be reused.
                 if self.enable_block_reuse:
-                    tokens = self._augment_tokens_for_block_reuse(
-                        all_tokens, req, end=len(all_tokens) - 1
-                    )
+                    # Empty (not None) for a zero limit: lookup is off, but
+                    # newly computed blocks may still be committed.
+                    tokens = self._context_reuse_tokens(req, reuse_limit)
                 else:
                     tokens = None
+                ugpu_id = self._request_ugpu_id(req)
+                # Taken from the augmented sequence rather than derived as
+                # prompt_len - 1, because augmentation can change the length
+                # for multimodal requests.
+                num_lookup_tokens = len(tokens) if tokens is not None else None
                 kv_cache = self._create_kv_cache(
                     req.py_request_id,
                     req.lora_task_id,
                     tokens,
                     cache_salt=req.cache_salt,
                     is_dummy=req.is_dummy,
-                    expected_prompt_length=req.prompt_len - 1,
+                    expected_prompt_length=(
+                        req.total_input_len_cp if self._has_cp_helix else req.prompt_len
+                    )
+                    - 1,
+                    ugpu_id=ugpu_id,
                 )
                 if kv_cache is None:
-                    return False
+                    return None
+                assert _get_kv_cache_ugpu_id(kv_cache) == ugpu_id
                 kv_cache.cuda_stream = self._stream.cuda_stream
 
             if not self.enable_block_reuse:
                 kv_cache.stop_committing()
             else:
-                req.context_current_position = kv_cache.num_committed_tokens
-                req.set_prepopulated_prompt_len(
-                    kv_cache.num_committed_tokens, self.tokens_per_block
-                )
+                self._record_branch_snapshot_point(req, kv_cache, num_lookup_tokens)
 
             if req.is_disagg_generation_init_state:
                 # Disagg generation receives prompt KV from the context worker;
                 # scratch blocks are only valid for local prefill chunks.
                 kv_cache.enable_swa_scratch_reuse = False
-            return self._resume_and_restore(req.py_request_id, kv_cache)
-        else:
-            # Subsequent chunk: cache must exist from first chunk.
-            # It may be suspended (e.g., evicted between chunks), so
-            # _resume_and_restore handles reactivation.
-            kv_cache = self.kv_cache_map.get(req.py_request_id)
-            assert kv_cache is not None, (
-                f"KV cache missing for non-first context chunk, request {req.py_request_id}"
-            )
-            return self._resume_and_restore(req.py_request_id, kv_cache)
+            if not self._resume_and_restore(req.py_request_id, kv_cache):
+                return None
+            return kv_cache.num_committed_tokens
+
+        # Subsequent chunk: cache must exist from first chunk. It may be
+        # suspended (e.g. evicted between chunks), so resume it here.
+        kv_cache = self.kv_cache_map.get(req.py_request_id)
+        assert kv_cache is not None, (
+            f"KV cache missing for non-first context chunk, request {req.py_request_id}"
+        )
+        if not self._resume_and_restore(req.py_request_id, kv_cache):
+            return None
+        return kv_cache.num_committed_tokens
+
+    def prepare_context(self, req: LlmRequest) -> bool:
+        """Create _KVCache, handle block reuse, and resume. Does NOT resize."""
+        assert not req.is_disagg_generation_init_state, (
+            f"req {req.py_request_id}: use prepare_disagg_gen_init"
+        )
+        reused = self.prepare_context_cache(req)
+        if reused is None:
+            return False
+        # First chunk only: num_committed_tokens holds at the initial prefix
+        # until context end, so reapplying later would rewind the cursor.
+        if req.is_first_context_chunk and self.enable_block_reuse:
+            _rewind_context_cursor(req, reused)
+            req.set_prepopulated_prompt_len(reused, self.tokens_per_block)
+        return True
 
     def resize_context(self, req: LlmRequest, num_tokens: int) -> bool:
         """Resize KV cache to cover context_current_position + num_tokens.
@@ -2408,6 +2946,13 @@ class KVCacheManagerV2(BaseResourceManager):
         assert not req.is_disagg_generation_init_state, (
             f"req {req.py_request_id}: use prepare_disagg_gen_init"
         )
+        if self._has_cp_helix and not req.is_dummy_request:
+            raise ValueError(
+                "resize_context is not helix-aware: its rank-local chunk "
+                "target would under-size the global ledger. Helix requests "
+                "are disagg-generation-only and must never take the context "
+                "path."
+            )
         kv_cache = self.kv_cache_map.get(req.py_request_id)
         if kv_cache is None:
             return False
@@ -2424,6 +2969,18 @@ class KVCacheManagerV2(BaseResourceManager):
         req.py_ctx_pre_resize_cap = pre_cap if capacity > pre_cap else None
         return True
 
+    def try_allocate_draft_context(self, req: LlmRequest, num_tokens: int) -> bool:
+        """Resize a draft context cache during admission. Joint reuse shares one
+        cursor; the draft manager owns only its radix tree and capacity.
+        """
+        assert self.is_draft
+        kv_cache = self.kv_cache_map.get(req.py_request_id)
+        if kv_cache is None or not self._resume_and_restore(req.py_request_id, kv_cache):
+            return False
+
+        target = req.context_current_position + num_tokens + self.num_extra_kv_tokens
+        return kv_cache.resize(max(kv_cache.capacity, target))
+
     def prepare_disagg_gen_init(self, req: LlmRequest) -> bool:
         """Prepare KV cache for a disagg generation init request.
 
@@ -2432,8 +2989,12 @@ class KVCacheManagerV2(BaseResourceManager):
         success, False if preparation or resize failed (cache is suspended
         on resize failure).
         """
-        if not self._prepare_context_impl(req):
+        reused = self.prepare_context_cache(req)
+        if reused is None:
             return False
+        if self.enable_block_reuse:
+            _rewind_context_cursor(req, reused)
+            req.set_prepopulated_prompt_len(reused, self.tokens_per_block)
 
         kv_cache = self.kv_cache_map.get(req.py_request_id)
         if kv_cache is None:
@@ -2441,11 +3002,14 @@ class KVCacheManagerV2(BaseResourceManager):
 
         # prompt_len is the full incoming prompt length, robust to block
         # reuse (which may leave a non-zero context_current_position).
-        target = req.prompt_len + get_draft_token_length(req) + self.num_extra_kv_tokens
+        # Helix requests carry the rank-local strided slice in prompt_len;
+        # the global ledger sizes off the full prompt instead.
+        prompt_len = req.total_input_len_cp if self._has_cp_helix else req.prompt_len
+        target = prompt_len + get_draft_token_length(req) + self.num_extra_kv_tokens
         capacity = max(kv_cache.capacity, target)
         pre_cap = kv_cache.capacity
 
-        success = kv_cache.resize(capacity, req.prompt_len)
+        success = kv_cache.resize(capacity, prompt_len)
         if not success:
             if req.is_first_context_chunk:
                 kv_cache.suspend()
@@ -2476,13 +3040,20 @@ class KVCacheManagerV2(BaseResourceManager):
         The delta is computed from ``_allocated_draft_lens`` (recorded by
         ``try_allocate_generation``) vs the current draft length (post-padding).
         """
-        allocated = self._allocated_draft_lens.pop(request.py_request_id, None)
+        allocated = self._allocated_draft_lens.get(request.py_request_id)
         if allocated is None:
             return
         current_draft_len = get_draft_token_length(request)
-        delta = current_draft_len - allocated
+        # Growth is 1 + 2 * draft_len (see _required_gen_capacity), so the
+        # padding delta scales by 2 as well.
+        delta = 2 * (current_draft_len - allocated)
         if delta <= 0:
             return
+        # Half of the delta tops up the overlap slack; record it so
+        # update_resources reclaims the full slack for this iteration.
+        self._pending_overlap_slack[request.py_request_id] = self._pending_overlap_slack.get(
+            request.py_request_id, 0
+        ) + (current_draft_len - allocated)
         kv_cache = self.kv_cache_map[request.py_request_id]
         new_capacity = kv_cache.capacity + delta
         success = kv_cache.resize(new_capacity)
@@ -2492,9 +3063,10 @@ class KVCacheManagerV2(BaseResourceManager):
                 f"{request.py_request_id} by {delta} tokens "
                 f"(target capacity {new_capacity})"
             )
+        self._allocated_draft_lens[request.py_request_id] = current_draft_len
 
     def suspend_request(self, req: LlmRequest) -> None:
-        """Suspend a request's KV cache (move to host tier)."""
+        """Suspend a request's KV cache, allowing pages to migrate to a secondary tier."""
         kv_cache = self.kv_cache_map.get(req.py_request_id)
         if kv_cache is not None and kv_cache.is_active:
             kv_cache.suspend()
@@ -2516,44 +3088,97 @@ class KVCacheManagerV2(BaseResourceManager):
     @nvtx_range("prepare_resources_kv_cache_manager_v2")
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
         if self.is_draft:
-            # Draft V2 manager: mirror the main manager by creating/resizing
-            # KV caches for scheduled requests (the main V2 scheduler does not
-            # know about the draft manager).
+            # Mirror the main manager. Under one-model spec decoding the
+            # scheduler may already have created the context cache.
             self._prepare_draft_resources(scheduled_batch)
             return
+
+    def _mirror_draft_kv_cache(self, req: LlmRequest):
+        """The draft manager's entry for ``req``, created on first sight.
+
+        Mirrors what the target manager does in ``_prepare_context_impl``:
+        create when missing rather than fail, passing ``is_dummy`` through. The
+        draft mirror never looks up block reuse (``tokens=None``) and never
+        commits, so this cannot share the target's implementation.
+
+        Reached from both the context and the generation loop, because not
+        every generation request passed through context on this worker:
+        attention DP injects its idle placeholder straight as a generation
+        request when a rank has no real work (ATTENTION_DP_DUMMY_REQUEST_ID,
+        see py_executor._adp_dummy_is_gen), and a disaggregated generation
+        worker receives prompt KV rather than prefilling it.
+
+        Returns None when the IndexMapper is saturated. The caller must treat
+        that as fatal: the request stays in the scheduled batch, so skipping it
+        only defers the failure to copy_batch_block_offsets(), which asserts in
+        C++ on the unmapped request ID. Slots are released early on a
+        context-only worker (release_index_slot), so saturation here means the
+        draft mirror is out of sync with the target, not merely busy.
+        """
+        kv_cache = self.kv_cache_map.get(req.py_request_id)
+        if kv_cache is not None:
+            return kv_cache
+        ugpu_id = self._request_ugpu_id(req)
+        kv_cache = self._create_kv_cache(
+            req.py_request_id,
+            req.lora_task_id,
+            None,
+            cache_salt=req.cache_salt,
+            is_dummy=req.is_dummy,
+            ugpu_id=ugpu_id,
+        )
+        if kv_cache is None:
+            return None
+        assert _get_kv_cache_ugpu_id(kv_cache) == ugpu_id
+        kv_cache.stop_committing()
+        return kv_cache
+
+    def _draft_pool_diagnostic(self) -> str:
+        """Draft-pool occupancy, for the resize-failure messages below.
+
+        The draft manager mirrors the target's tokens but is sized from its own
+        byte budget, and the capacity scheduler admits on the TARGET pool alone
+        (`scheduler_v2` touches `draft_kv_cache_manager` only to suspend/free).
+        A draft pool smaller in tokens than the target therefore cannot
+        backpressure -- it can only raise, and the raise kills every rank. When
+        that happens the first question is always "how big was the draft pool
+        and how full was it", so answer it in the message rather than leaving
+        it to post-hoc arithmetic over the budget-split log line.
+
+        Best-effort: never let a diagnostic mask the failure it describes.
+        """
+        try:
+            live = sum(c.capacity for c in self.kv_cache_map.values())
+            return (
+                f" [draft pool: {len(self.kv_cache_map)} live caches holding "
+                f"{live} tokens, gpu_max_tokens={self._gpu_max_tokens}]"
+            )
+        except Exception:  # noqa: BLE001 - diagnostic only
+            return ""
 
     def _prepare_draft_resources(self, scheduled_batch: ScheduledRequests):
         """Create/resize KV caches in the draft V2 manager for scheduled requests.
 
-        The main V2 scheduler only manages the primary KV cache manager.
-        The draft manager must mirror context/generation allocations so that
-        its IndexMapper contains the correct request IDs for
-        copy_batch_block_offsets().
+        The main V2 scheduler manages capacity in the primary KV cache
+        manager. The draft manager mirrors scheduled requests so that its
+        IndexMapper contains the correct request IDs. With block reuse, the
+        scheduler pre-creates context caches to coordinate the reusable prefix.
         """
-        with request_context(True, scheduled_batch):
+        # Joint V2 reuse deliberately shares the target request progress. A
+        # separate draft engine still uses the legacy draft request view.
+        with request_context(not self.enable_joint_kv_cache_reuse, scheduled_batch):
             for req in scheduled_batch.context_requests:
-                kv_cache = self.kv_cache_map.get(req.py_request_id)
+                kv_cache = self._mirror_draft_kv_cache(req)
                 if kv_cache is None:
-                    kv_cache = self._create_kv_cache(
-                        req.py_request_id,
-                        req.lora_task_id,
-                        None,
-                        cache_salt=req.cache_salt,
-                        is_dummy=req.is_dummy,
+                    raise RuntimeError(
+                        f"Draft KV cache mirror exhausted its IndexMapper on "
+                        f"context request {req.py_request_id}"
                     )
-                    if kv_cache is None:
-                        # Saturated IndexMapper (e.g. slots held by disagg
-                        # generation transfers in flight): skip mirroring this
-                        # request for now; it is retried next iteration once
-                        # slots free up, before the request runs any spec-dec
-                        # forward that needs the mirror.
-                        continue
-                    kv_cache.stop_committing()
                 if not self._resume_and_restore(req.py_request_id, kv_cache):
                     raise RuntimeError(
                         f"Failed to resume draft KV cache for request {req.py_request_id}"
                     )
-                draft_len = get_draft_token_length(req)
+                draft_len = get_draft_token_length(req) if req.is_last_context_chunk else 0
                 capacity = (
                     req.context_current_position
                     + req.context_chunk_size
@@ -2564,28 +3189,35 @@ class KVCacheManagerV2(BaseResourceManager):
                     raise RuntimeError(
                         f"Draft KV cache context resize failed for request "
                         f"{req.py_request_id}: could not resize to {capacity} tokens"
+                        f"{self._draft_pool_diagnostic()}"
                     )
 
             for req in scheduled_batch.generation_requests:
-                kv_cache = self.kv_cache_map.get(req.py_request_id)
+                kv_cache = self._mirror_draft_kv_cache(req)
                 if kv_cache is None:
                     raise RuntimeError(
-                        f"Missing draft KV cache for generation request {req.py_request_id}"
+                        f"Draft KV cache mirror exhausted its IndexMapper on "
+                        f"generation request {req.py_request_id}"
                     )
                 if not self._resume_and_restore(req.py_request_id, kv_cache):
                     raise RuntimeError(
                         f"Failed to resume draft KV cache for request {req.py_request_id}"
                     )
+                # A paired scheduler already grew both pools atomically; the
+                # recorded width says so, so do not charge this step twice.
+                if req.py_request_id in self._allocated_draft_lens:
+                    continue
                 new_cap = self._required_gen_capacity(req, kv_cache.capacity)
-                # Pad the resize up to _kv_reserve_draft_tokens (see __init__);
-                # no-op when reserve == draft_token_length.
-                reserve_slack = self._kv_reserve_draft_tokens - get_draft_token_length(req)
-                if reserve_slack > 0:
-                    new_cap += reserve_slack
                 if not kv_cache.resize(new_cap):
                     raise RuntimeError(
                         f"Draft KV cache generation resize failed for request "
                         f"{req.py_request_id}: could not resize to {new_cap} tokens"
+                        f"{self._draft_pool_diagnostic()}"
+                    )
+                slack = self._effective_draft_len(req)
+                if slack > 0:
+                    self._pending_overlap_slack[req.py_request_id] = (
+                        self._pending_overlap_slack.get(req.py_request_id, 0) + slack
                     )
 
     def _reuse_token_source(self, req: LlmRequest) -> Sequence[int]:
@@ -3127,7 +3759,13 @@ class KVCacheManagerV2(BaseResourceManager):
         encoder_output_lens: Optional[List[int]] = None,
         num_extra_decoding_steps: int = 0,
         draft_kv_cache_manager: Optional["BaseResourceManager"] = None,
+        ugpu_ids: Optional[List[int | None]] = None,
     ):
+        if ugpu_ids is not None:
+            assert len(ugpu_ids) == len(request_ids), (
+                "ugpu_ids must have the same length as request_ids"
+            )
+
         _kv_draft = (
             kv_reserve_draft_tokens if kv_reserve_draft_tokens is not None else max_num_draft_tokens
         )
@@ -3156,6 +3794,10 @@ class KVCacheManagerV2(BaseResourceManager):
             # a non-zero number to skip illegal memory access issue in MLA kernel
             # during warmup.
             token_num = token_nums[i] if token_nums is not None else 1 + max_num_draft_tokens
+            if self._has_cp_helix:
+                # Keep the frozen dummy fields self-consistent (the active
+                # rank's past_seen = seqlen - 1 must stay >= 1).
+                token_num = max(token_num, 2)
             # token_num - 1 is the past history length in generation.
             history_hint = max(0, token_num - 1) if is_gen else None
             encoder_output_len = encoder_output_lens[i] if encoder_output_lens is not None else None
@@ -3164,6 +3806,9 @@ class KVCacheManagerV2(BaseResourceManager):
             )
             # Using 1 instead of 0 prevents NaN during warmup in e.g. Deepseek
             input_tokens = [1 for _ in range(token_num)]
+            request_ugpu_id = (
+                self.pick_ugpu(req_id) if ugpu_ids is None or ugpu_ids[i] is None else ugpu_ids[i]
+            )
             req = LlmRequest(
                 request_id=req_id,
                 max_new_tokens=1,
@@ -3171,6 +3816,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 sampling_config=SamplingConfig(sampling_params._get_sampling_config()),
                 is_streaming=False,
                 encoder_input_tokens=encoder_input_tokens,
+                ugpu_id=request_ugpu_id,
                 encoder_output_len=encoder_output_len,
             )
             req.is_dummy_request = True
@@ -3180,17 +3826,33 @@ class KVCacheManagerV2(BaseResourceManager):
                 # writes to the radix tree, so the choice of branch does not
                 # affect committed state. ``cache_salt`` is left defaulted
                 # to None to avoid coupling synthetic data to any salted branch.
+                ugpu_id = self._request_ugpu_id(req)
                 kv_cache = self._create_kv_cache(
-                    req.py_request_id, req.lora_task_id, input_tokens, is_dummy=req.is_dummy
+                    req.py_request_id,
+                    req.lora_task_id,
+                    input_tokens,
+                    is_dummy=req.is_dummy,
+                    ugpu_id=ugpu_id,
                 )
                 # Saturated IndexMapper (e.g. disagg gen trans in progress)
                 # returns None; retry next iter.
                 if kv_cache is None:
+                    logger.warning_once(
+                        f"Unable to create KV cache for dummy request "
+                        f"{req.py_request_id}; IndexMapper capacity is "
+                        f"temporarily exhausted",
+                        key="dummy_kv_cache_create_failed",
+                    )
                     release_resources(req)
                     return None
+                assert _get_kv_cache_ugpu_id(kv_cache) == ugpu_id
                 assert kv_cache.num_committed_tokens == 0
                 success = kv_cache.resume(self._stream.cuda_stream)
                 if not success:
+                    logger.warning_once(
+                        f"Unable to resume KV cache for dummy request {req.py_request_id}",
+                        key="dummy_kv_cache_resume_failed",
+                    )
                     release_resources(req)
                     return None
                 kv_cache.stop_committing()
@@ -3201,24 +3863,52 @@ class KVCacheManagerV2(BaseResourceManager):
                 # optimization and match the solver's pool budget.
                 success = kv_cache.resize(dummy_capacity, history_length=history_hint)
                 if not success:
+                    logger.warning_once(
+                        f"Unable to resize KV cache for dummy request "
+                        f"{req.py_request_id} to capacity {dummy_capacity} "
+                        f"(history_length={history_hint})",
+                        key="dummy_kv_cache_resize_failed",
+                    )
                     release_resources(req)
                     return None
                 draft_kv_cache = None
                 if draft_kv_cache_manager is not None:
+                    ugpu_id = self._request_ugpu_id(req)
                     draft_kv_cache = draft_kv_cache_manager._create_kv_cache(
-                        req.py_request_id, req.lora_task_id, input_tokens, is_dummy=req.is_dummy
+                        req.py_request_id,
+                        req.lora_task_id,
+                        input_tokens,
+                        is_dummy=req.is_dummy,
+                        ugpu_id=ugpu_id,
                     )
                     # Dummy path: see comment above, no salt.
                     if draft_kv_cache is None:
+                        logger.warning_once(
+                            f"Unable to create draft KV cache for dummy "
+                            f"request {req.py_request_id}",
+                            key="dummy_draft_kv_cache_create_failed",
+                        )
                         release_resources(req)
                         return None
+                    assert _get_kv_cache_ugpu_id(draft_kv_cache) == ugpu_id
                     success = draft_kv_cache.resume(draft_kv_cache_manager._stream.cuda_stream)
                     if not success:
+                        logger.warning_once(
+                            f"Unable to resume draft KV cache for dummy "
+                            f"request {req.py_request_id}",
+                            key="dummy_draft_kv_cache_resume_failed",
+                        )
                         release_resources(req, free_draft_resources=True)
                         return None
                     draft_kv_cache.stop_committing()
                     success = draft_kv_cache.resize(dummy_capacity)
                     if not success:
+                        logger.warning_once(
+                            f"Unable to resize draft KV cache for dummy "
+                            f"request {req.py_request_id} to capacity "
+                            f"{dummy_capacity}",
+                            key="dummy_draft_kv_cache_resize_failed",
+                        )
                         release_resources(req, free_draft_resources=True)
                         return None
 
@@ -3227,15 +3917,41 @@ class KVCacheManagerV2(BaseResourceManager):
                 req.prompt_len = token_num - 1
                 req.py_prompt_len = req.prompt_len
                 req.py_draft_tokens = [1] * max_num_draft_tokens
+                if self._has_cp_helix:
+                    # Frozen fields (V1 parity): dummies never pass the
+                    # per-step derivation — last CP rank active, shared
+                    # synthetic global length.
+                    if self._helix_cp_rank == self._helix_cp_size - 1:
+                        req.py_helix_is_inactive_rank = False
+                        req.prompt_len = token_num - 1
+                    else:
+                        req.py_helix_is_inactive_rank = True
+                        req.prompt_len = token_num
+                    req.py_prompt_len = req.prompt_len
+                    req.seqlen_this_rank_cp = req.prompt_len
+                    req.total_input_len_cp = token_num * self._helix_cp_size - 1
+                    req.py_decoding_iter = 1
                 if prepare_resource:
                     new_capacity = kv_cache.capacity + _kv_draft + 1
                     success = kv_cache.resize(new_capacity, history_length=history_hint)
                     if not success:
+                        logger.warning_once(
+                            f"Unable to extend generation dummy request "
+                            f"{req.py_request_id} to capacity {new_capacity} "
+                            f"(history_length={history_hint})",
+                            key="generation_dummy_kv_cache_resize_failed",
+                        )
                         release_resources(req, free_draft_resources=draft_kv_cache is not None)
                         return None
                     if draft_kv_cache is not None:
                         success = draft_kv_cache.resize(new_capacity)
                         if not success:
+                            logger.warning_once(
+                                f"Unable to extend generation draft dummy "
+                                f"request {req.py_request_id} to capacity "
+                                f"{new_capacity}",
+                                key="generation_dummy_draft_kv_cache_resize_failed",
+                            )
                             release_resources(req, free_draft_resources=True)
                             return None
 
@@ -3247,7 +3963,9 @@ class KVCacheManagerV2(BaseResourceManager):
 
     def try_commit_blocks(self, request: LlmRequest) -> None:
         should_block_reuse = (
-            self.enable_block_reuse and not self.is_draft and not request.is_dummy_request
+            self.enable_block_reuse
+            and self._can_publish_block_reuse
+            and not request.is_dummy_request
         )
         if not should_block_reuse:
             return
@@ -3256,12 +3974,13 @@ class KVCacheManagerV2(BaseResourceManager):
         if kv_cache is None:
             return
 
-        if request.context_current_position > kv_cache.num_committed_tokens:
+        commit_end = request.context_current_position
+        if commit_end > kv_cache.num_committed_tokens:
             tokens = self._augment_tokens_for_block_reuse(
                 self._reuse_token_source(request),
                 request,
                 start=kv_cache.num_committed_tokens,
-                end=request.context_current_position,
+                end=commit_end,
             )
             # TODO: On a disaggregated prefill server, pass is_end=True for
             # the last context chunk to improve performance.
@@ -3278,6 +3997,10 @@ class KVCacheManagerV2(BaseResourceManager):
         the KV cache blocks are still being transferred via NIXL/UCX.
         """
         kv_cache = self.kv_cache_map.get(request_id)
+        if self.is_draft and (kv_cache is None or request_id in self._early_freed_index_requests):
+            # The draft mirror only holds a slot for requests it actually
+            # mirrored, and the target may release the same request twice.
+            return
         if kv_cache is not None:
             for i in range(self.max_beam_width):
                 for pool_idx in range(self.num_pools):
@@ -3289,6 +4012,7 @@ class KVCacheManagerV2(BaseResourceManager):
         if self.conversation_manager is not None:
             self.conversation_manager.finish_request(request)
         self._allocated_draft_lens.pop(request.py_request_id, None)
+        self._pending_overlap_slack.pop(request.py_request_id, None)
         kv_cache = self.kv_cache_map.pop(request.py_request_id, None)
         if kv_cache is None:
             self.impl.clear_stats_excluded(request.py_request_id)
@@ -3496,12 +4220,11 @@ class KVCacheManagerV2(BaseResourceManager):
             pool_id = self.layer_to_pool_mapping_dict[layer_offset]
             if pool_id in pool_handled:
                 continue
-            buffer = self.get_buffers(layer_id)
-            if buffer is None:
-                continue
-            yield buffer
+            for buffer in self._get_buffer_views_for_invalid_value_check(layer_id):
+                yield buffer
             pool_handled.add(pool_id)
 
+    @torch.inference_mode()
     def check_invalid_values_in_kv_cache(self, fill_with_zero: bool = False) -> bool:
         some_checks_unavailable = False
         has_invalid_values = torch.tensor(
@@ -3509,14 +4232,16 @@ class KVCacheManagerV2(BaseResourceManager):
         )
 
         for buffer in self._iter_cache_buffers_for_invalid_check():
-            # process in chunks of 256 pages to avoid OoM
-            for i in range(0, buffer.shape[0], 256):
-                buffer_slice = buffer[i : i + 256]
-                try:
-                    has_invalid_values.logical_or_(torch.isnan(buffer_slice).any())
-                    has_invalid_values.logical_or_(torch.isinf(buffer_slice).any())
-                except NotImplementedError:
-                    some_checks_unavailable = True
+            if torch.is_floating_point(buffer) or torch.is_complex(buffer):
+                # Process page-major physical views in bounded chunks. Packed
+                # integer cache data cannot contain NaN or Inf.
+                for i in range(0, buffer.shape[0], 256):
+                    buffer_slice = buffer[i : i + 256]
+                    try:
+                        has_invalid_values.logical_or_(torch.isnan(buffer_slice).any())
+                        has_invalid_values.logical_or_(torch.isinf(buffer_slice).any())
+                    except NotImplementedError:
+                        some_checks_unavailable = True
             if fill_with_zero:
                 buffer.zero_()
         torch.cuda.synchronize()
@@ -3551,8 +4276,9 @@ class KVCacheManagerV2(BaseResourceManager):
         return 0
 
     # TODO: refactor get_cache_size_per_token and get_cache_bytes_per_token to use the same logic
-    @staticmethod
+    @classmethod
     def get_cache_size_per_token(
+        cls,
         model_config: ModelConfigPython,
         mapping: Mapping,
         num_layers: Optional[int] = None,
@@ -3561,6 +4287,23 @@ class KVCacheManagerV2(BaseResourceManager):
         layer_sizes, attention_windows = _get_static_cache_size_layer_components(
             model_config, mapping, num_layers=num_layers, **kwargs
         )
+        # Upstream takes these as named parameters; here they ride **kwargs.
+        kv_cache_config = kwargs.get("kv_cache_config")
+        reuse_backoff_enabled = (
+            kv_cache_config is not None
+            and kv_cache_config.enable_block_reuse
+            and cls._supports_reuse_match_backoff
+        )
+        if reuse_backoff_enabled:
+            from ..speculative import draft_prompt_lookahead
+
+            # Mirror the runtime W+D retention window before page rounding.
+            backoff = draft_prompt_lookahead(kwargs.get("spec_config")) or 0
+            attention_windows = _extend_swa_windows_for_reuse(
+                attention_windows,
+                backoff,
+                kwargs.get("max_seq_len"),
+            )
         full_attn_size_per_token = _estimate_full_attn_size_per_token(
             layer_sizes, attention_windows
         )
@@ -3593,26 +4336,21 @@ class KVCacheManagerV2(BaseResourceManager):
             kv_cache = self.kv_cache_map[req.py_request_id]
             # In the overlap scheduler, iteration N+1's eviction may
             # suspend a ctx request's KV cache while iteration N's
-            # update still needs to process it.  Skip the resize — the
-            # request will be resumed by the scheduler on the next
-            # iteration.
+            # update still needs to process it. The request will be resumed by
+            # the scheduler next iteration.
             if not kv_cache.is_active:
                 continue
             should_block_reuse = (
-                self.enable_block_reuse and not self.is_draft and not req.is_dummy_request
+                self.enable_block_reuse
+                and self._can_publish_block_reuse
+                and not req.is_dummy_request
             )
             is_all_reusable = self.block_reuse_policy == BlockReusePolicy.ALL_REUSABLE
             should_resize = not should_block_reuse or not is_all_reusable
             should_commit = is_all_reusable or req.context_remaining_length == 0
 
             if should_resize:
-                success = kv_cache.resize(None, req.context_current_position)
-                if not success:
-                    raise ValueError(
-                        "Failed to resize history length of KV cache for request "
-                        f"{req.py_request_id} to {req.context_current_position} tokens "
-                        "at context update"
-                    )
+                self._resize_context_history(req, kv_cache, req.context_current_position)
             if should_commit:
                 self.try_commit_blocks(req)
             if req.context_remaining_length == 0:
@@ -3622,6 +4360,14 @@ class KVCacheManagerV2(BaseResourceManager):
                 # the context/generation boundary so generation uses normal KV
                 # pages before the first generation allocation.
                 kv_cache.enable_swa_scratch_reuse = False
+
+    def _resize_context_history(self, req: LlmRequest, kv_cache, history_length: int) -> None:
+        """Advance a context cache's history marker, or raise."""
+        if not kv_cache.resize(None, history_length):
+            raise ValueError(
+                "Failed to resize history length of KV cache for request "
+                f"{req.py_request_id} to {history_length} tokens at context update"
+            )
 
     def update_resources(
         self,
@@ -3646,22 +4392,36 @@ class KVCacheManagerV2(BaseResourceManager):
             # will be resumed by the scheduler on the next iteration.
             if not kv_cache.is_active:
                 continue
-            rewind_len = req.py_rewind_len
-            if self.is_draft:
-                runtime_draft_len = req.py_rewind_len + req.py_num_accepted_draft_tokens
-                # Dynamic-tree draft managers reserve K * max_draft_len slots,
-                # which can exceed the tree's runtime draft width. Reclaim that
-                # reserve slack together with rejected draft tokens; otherwise
-                # it accumulates in the draft KV cache after every generation
-                # step. Target managers do not allocate this reserve slack.
-                rewind_len += max(self._kv_reserve_draft_tokens - runtime_draft_len, 0)
+            accepted_draft_len = req.py_num_accepted_draft_tokens
+            runtime_draft_len = req.py_rewind_len + accepted_draft_len
+            # No entry: this manager did not grow through the scheduler (e.g.
+            # disagg), so fall back to _generation_draft_slots' width.
+            allocated_draft_slots = self._allocated_draft_lens.get(
+                req.py_request_id,
+                max(runtime_draft_len, self._kv_reserve_draft_tokens)
+                if self.is_draft
+                else runtime_draft_len,
+            )
+            # Reclaim every reserved slot that was not occupied by an accepted
+            # draft token.
+            rewind_len = max(allocated_draft_slots - accepted_draft_len, 0)
+            # _required_gen_capacity grows by 1 + 2 * slots; rewind_len gives
+            # back the unused half of the first slots term, this the second.
+            overlap_slack = self._pending_overlap_slack.pop(req.py_request_id, 0)
             new_capacity = (
                 None
                 if req.state in (LlmRequestState.GENERATION_COMPLETE, LlmRequestState.CONTEXT_INIT)
-                else kv_cache.capacity - rewind_len
+                else max(
+                    kv_cache.capacity - rewind_len - overlap_slack,
+                    req.max_beam_num_tokens - 1,
+                )
             )
             history_length = (
-                None if self.kv_compression_manages_history else req.max_beam_num_tokens - 1
+                None
+                # Reuse (history's consumer) is disabled under helix, and
+                # max_beam_num_tokens mixes rank-local and global counts.
+                if self.kv_compression_manages_history or self._has_cp_helix
+                else req.max_beam_num_tokens - 1
             )
             success = kv_cache.resize(new_capacity, history_length)
             if not success:
@@ -3670,6 +4430,7 @@ class KVCacheManagerV2(BaseResourceManager):
                     f"to capacity {new_capacity} and history length "
                     f"{history_length} tokens at generation update"
                 )
+            self._allocated_draft_lens.pop(req.py_request_id, None)
 
     def copy_batch_block_offsets(
         self,
@@ -3699,7 +4460,7 @@ class KVCacheManagerV2(BaseResourceManager):
             copy_idx,
             self.index_scales,
             self.kv_offset,
-            self._stream.cuda_stream,
+            torch.cuda.current_stream().cuda_stream,
         )
 
     @staticmethod
@@ -3725,10 +4486,20 @@ class KVCacheManagerV2(BaseResourceManager):
         cache_salt: str | None = None,
         is_dummy: bool = False,
         expected_prompt_length: int | None = None,
+        ugpu_id: int | None = None,
     ):
         assert request_id not in self.kv_cache_map, (
             f"KV cache for request {request_id} already exists"
         )
+        if self.num_ugpus > 1:
+            assert ugpu_id is not None, (
+                "Localized KV cache managers require a concrete ugpu_id for KV-cache creation"
+            )
+            assert 0 <= ugpu_id < self.num_ugpus, (
+                f"ugpu_id must be in [0, {self.num_ugpus}), got {ugpu_id}"
+            )
+        else:
+            assert ugpu_id is None, "Non-localized KV cache managers require ugpu_id=None"
         if self.index_mapper.num_free_slots() == 0:
             logger.warning(
                 "No free IndexMapper slots for request %s "
@@ -3740,11 +4511,14 @@ class KVCacheManagerV2(BaseResourceManager):
             )
             return None
         salt_int = self._derive_reuse_salt(cache_salt)
-        kv_cache = self.impl.create_kv_cache(
-            ReuseScope(lora_id=lora_task_id, salt=salt_int),
+        kv_cache = _create_backend_kv_cache(
+            self.impl,
+            lora_task_id,
+            salt_int,
             input_tokens,
-            id=request_id,
-            expected_prompt_length=expected_prompt_length,
+            request_id,
+            expected_prompt_length,
+            ugpu_id,
         )
         self.kv_cache_map[request_id] = kv_cache
         if is_dummy:
@@ -3773,7 +4547,7 @@ class KVCacheManagerV2(BaseResourceManager):
         """
         if not self.enable_block_reuse:
             return 0
-        if not input_tokens:
+        if len(input_tokens) == 0:
             return 0
         salt_int = self._derive_reuse_salt(cache_salt)
         return self.impl.probe_reuse(
@@ -3794,8 +4568,7 @@ class KVCacheManagerV2(BaseResourceManager):
         # is NOT registered in kv_cache_map / IndexMapper.
         success = True
         for req in requests:
-            all_tokens = self._reuse_token_source(req)
-            tokens = self._augment_tokens_for_block_reuse(all_tokens, req, end=len(all_tokens) - 1)
+            tokens = self._context_reuse_tokens(req)
             # Use the same salt derivation as _create_kv_cache so the transient
             # cache hits the same radix-tree blocks.
             salt_int = self._derive_reuse_salt(req.cache_salt)

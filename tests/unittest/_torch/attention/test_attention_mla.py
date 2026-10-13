@@ -1,16 +1,22 @@
 import math
 import random
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import List
 
 import pytest
 import torch
 
 import tensorrt_llm
+from tensorrt_llm._torch.attention_backend.fmha.cute_dsl_mla import \
+    CuteDslMlaFmha
+from tensorrt_llm._torch.attention_backend.fmha.flashinfer_trtllm_gen import \
+    FlashInferTrtllmGenFmha
 from tensorrt_llm._torch.attention_backend.interface import (
     AttentionInputType, MLAParams, PositionalEmbeddingParams, RopeParams)
 from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
+from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import (LlmRequest,
@@ -383,6 +389,105 @@ accuracy_dict = {
 }
 
 
+def test_fp8_mla_scales_remain_tensors() -> None:
+    q = torch.empty(1)
+    bmm1_scale = torch.tensor([0.25, 0.25 * 1.442695], dtype=torch.float32)
+    bmm2_scale = torch.tensor([4.0], dtype=torch.float32)
+
+    actual_bmm1_scale, actual_bmm2_scale = CuteDslMlaFmha._get_fp8_scales(
+        q,
+        SimpleNamespace(
+            mla_bmm1_scale=bmm1_scale,
+            mla_bmm2_scale=bmm2_scale,
+        ),
+    )
+
+    assert actual_bmm1_scale is bmm1_scale
+    assert actual_bmm2_scale is bmm2_scale
+
+
+@pytest.mark.parametrize(
+    ("num_contexts", "num_generations", "num_tokens"),
+    [
+        (0, 4, 4),
+        (1, 3, 4),
+        (0, 4, 8),
+    ],
+    ids=["generation-only", "mixed-batch", "speculative-multi-token"],
+)
+def test_fp8_cute_dsl_dispatch_without_fallback_policy(
+    num_contexts: int,
+    num_generations: int,
+    num_tokens: int,
+) -> None:
+    """FP8 keeps the required CuTe-DSL backend for every batch shape."""
+    metadata = SimpleNamespace(
+        num_contexts=num_contexts,
+        num_generations=num_generations,
+    )
+    attn = SimpleNamespace(
+        flashinfer_mla_backend="cute-dsl",
+        mla_backend_policy=None,
+    )
+    fmha = object.__new__(FlashInferTrtllmGenFmha)
+    fmha._mla_backend = "cute-dsl"
+    fmha._attn_ref = lambda: attn
+
+    assert fmha._get_effective_mla_backend(metadata, num_tokens) == "cute-dsl"
+    assert CuteDslMlaFmha._is_fp8_cute_dsl_selected(
+        attn,
+        metadata,
+        num_tokens=num_tokens,
+        kernel_dtype=torch.float8_e4m3fn,
+    )
+
+
+def test_fp8_cute_dsl_respects_per_batch_backend_policy() -> None:
+    metadata = SimpleNamespace(num_contexts=0, num_generations=1)
+    attn = SimpleNamespace(
+        flashinfer_mla_backend="cute-dsl",
+        mla_backend_policy=lambda _backend, _metadata, _num_tokens:
+        "trtllm-gen",
+    )
+
+    assert not CuteDslMlaFmha._is_fp8_cute_dsl_selected(
+        attn,
+        metadata,
+        num_tokens=2,
+        kernel_dtype=torch.float8_e4m3fn,
+    )
+
+
+def test_fp8_h96_decode_does_not_bypass_backend_selection() -> None:
+    favorable, reason = CuteDslMlaFmha._is_perf_favorable(
+        num_heads=96,
+        batch_size=1,
+        seq_len_q=1,
+        kernel_dtype=torch.float8_e4m3fn,
+    )
+
+    assert not favorable
+    assert "not a perf win" in reason
+
+
+@pytest.mark.skipif(
+    not IS_CUTLASS_DSL_AVAILABLE,
+    reason="nvidia-cutlass-dsl is not installed",
+)
+def test_fp8_mla_custom_op_accepts_tensor_scales() -> None:
+    # Import registers the CuTe DSL custom ops when the package is available.
+    import tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops  # noqa: F401
+
+    schema = torch.ops.trtllm.cute_dsl_mla_decode_fp8_blackwell.default._schema
+    argument_types = {
+        argument.name: str(argument.type)
+        for argument in schema.arguments
+    }
+
+    assert argument_types["softmax_scale"] == "Tensor"
+    assert argument_types["output_scale"] == "Tensor"
+
+
 @pytest.mark.parametrize(
     "sm_version,expected_path",
     [
@@ -516,6 +621,98 @@ def test_attention_mla(scenario: Scenario, context_sequence_lengths: List[int],
                           v2_kv_cache)
 
 
+@pytest.mark.parametrize(
+    ("mla_backend", "num_heads", "fmha_cls"),
+    [
+        ("cute-dsl", 96, CuteDslMlaFmha),
+        ("trtllm-gen", 128, FlashInferTrtllmGenFmha),
+    ],
+    ids=["cute-dsl-h96", "trtllm-gen-h128"],
+)
+def test_attention_mla_fp8_decode_backend(
+    monkeypatch: pytest.MonkeyPatch,
+    mla_backend: str,
+    num_heads: int,
+    fmha_cls,
+):
+    """Exercise FP8 MLA decode through each supported FMHA backend."""
+    if not torch.cuda.is_available() or cuda_capability not in ((10, 0),
+                                                                (10, 3),
+                                                                (10, 7)):
+        pytest.skip("FP8 MLA decode requires SM100, SM103, or SM107")
+
+    monkeypatch.setenv(
+        "TLLM_FMHA_LIBS",
+        "cute_dsl_mla,flashinfer_trtllm_gen,fallback",
+    )
+    if mla_backend == "cute-dsl":
+        # Prove the explicit selection bypasses the perf-only gate instead of
+        # reaching FlashInfer's public CuTe-DSL wrapper or the fallback.
+        monkeypatch.setattr(
+            CuteDslMlaFmha,
+            "_is_perf_favorable",
+            staticmethod(lambda *_args: (False, "forced unfavorable")),
+        )
+    backend_calls = 0
+    run_mla_generation = fmha_cls.run_mla_generation
+
+    def track_backend_generation(self, params):
+        nonlocal backend_calls
+        backend_calls += 1
+        return run_mla_generation(self, params)
+
+    monkeypatch.setattr(fmha_cls, "run_mla_generation",
+                        track_backend_generation)
+    scenario = Scenario(
+        kv_cache_dtype=torch.float8_e4m3fn,
+        num_heads=num_heads,
+        num_kv_heads=num_heads,
+        num_layers=1,
+        kv_cache_tokens_per_block=32,
+    )
+    rope_config = RopeConfig(
+        hidden_size=scenario.hidden_size,
+        num_attention_heads=scenario.num_heads,
+        rope_scaling={
+            "beta_fast": scenario.rope_beta_fast,
+            "beta_slow": scenario.rope_beta_slow,
+            "factor": scenario.rope_factor,
+            "mscale": scenario.rope_mscale,
+            "mscale_all_dim": scenario.rope_mscale_all_dim,
+            "original_max_position_embeddings":
+            scenario.rope_original_max_position_embeddings,
+            "type": scenario.rope_type,
+        },
+        max_position_embeddings=scenario.max_position_embeddings,
+        rope_theta=scenario.rope_theta,
+        qk_rope_head_dim=scenario.qk_rope_head_dim,
+        model_type=scenario.model_type,
+    )
+
+    _run_test_for_backend(
+        "TRTLLM",
+        scenario.num_heads,
+        scenario.num_kv_heads,
+        scenario.num_layers,
+        scenario.q_lora_rank,
+        scenario.kv_lora_rank,
+        scenario.qk_nope_head_dim,
+        scenario.qk_rope_head_dim,
+        scenario.v_head_dim,
+        rope_config,
+        scenario.kv_cache_tokens_per_block,
+        torch.device("cuda"),
+        scenario.dtype,
+        scenario.kv_cache_dtype,
+        [10, 12, 5],
+        1,
+        2,
+        True,
+        flashinfer_mla_backend=mla_backend,
+    )
+    assert backend_calls == 2
+
+
 # FlashInfer MLA test: BF16 only, fewer combos since it's slower
 flashinfer_scenarios = [
     Scenario(kv_cache_dtype=torch.bfloat16,
@@ -591,13 +788,25 @@ def test_attention_mla_flashinfer(scenario: Scenario,
                           v2_kv_cache)
 
 
-def _run_test_for_backend(backend_name, num_heads, num_kv_heads, num_layers,
-                          q_lora_rank, kv_lora_rank, qk_nope_head_dim,
-                          qk_rope_head_dim, v_head_dim, rope_config,
-                          kv_cache_tokens_per_block, device, dtype,
-                          kv_cache_dtype, context_sequence_lengths,
-                          generation_seq_len_q, num_generation_steps,
-                          v2_kv_cache):
+def _run_test_for_backend(backend_name,
+                          num_heads,
+                          num_kv_heads,
+                          num_layers,
+                          q_lora_rank,
+                          kv_lora_rank,
+                          qk_nope_head_dim,
+                          qk_rope_head_dim,
+                          v_head_dim,
+                          rope_config,
+                          kv_cache_tokens_per_block,
+                          device,
+                          dtype,
+                          kv_cache_dtype,
+                          context_sequence_lengths,
+                          generation_seq_len_q,
+                          num_generation_steps,
+                          v2_kv_cache,
+                          flashinfer_mla_backend="trtllm-gen"):
     AttentionCls = get_attention_backend(backend_name)
     qk_head_dim = qk_nope_head_dim + qk_rope_head_dim
 
@@ -750,6 +959,9 @@ def _run_test_for_backend(backend_name, num_heads, num_kv_heads, num_layers,
     quant_config = None
     if kv_cache_dtype == torch.float8_e4m3fn:
         quant_config = QuantConfig(kv_cache_quant_algo=QuantAlgo.FP8.value)
+    mla_backend_kwargs = ({
+        "flashinfer_mla_backend": flashinfer_mla_backend
+    } if backend_name == "TRTLLM" else {})
     ctx_layers = [
         AttentionCls(
             layer_idx=layer_idx,
@@ -760,6 +972,7 @@ def _run_test_for_backend(backend_name, num_heads, num_kv_heads, num_layers,
             q_scaling=q_scaling,
             pos_embd_params=pos_embd_params,
             mla_params=mla_params,
+            **mla_backend_kwargs,
         ) for layer_idx in range(num_layers)
     ]
     gen_layers = [
@@ -772,6 +985,7 @@ def _run_test_for_backend(backend_name, num_heads, num_kv_heads, num_layers,
             q_scaling=q_scaling,
             pos_embd_params=pos_embd_params,
             mla_params=mla_params,
+            **mla_backend_kwargs,
         ) for layer_idx in range(num_layers)
     ]
 

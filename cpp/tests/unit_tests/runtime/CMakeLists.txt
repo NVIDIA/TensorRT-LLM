@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2023-2025 NVIDIA CORPORATION &
+# SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION &
 # AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may not
@@ -36,6 +36,8 @@ add_gtest(samplingTest samplingTest.cpp)
 add_gtest(sanitizerTest sanitizerTest.cpp)
 add_gtest(tllmBuffersTest tllmBuffersTest.cpp)
 add_gtest(transposeKVKernelTest transposeKVKernelTest.cpp)
+add_gtest(ugpuLocalizationTest ugpuLocalizationTest.cu)
+add_gtest(ugpuPublicConfigTest ugpuPublicConfigTest.cpp)
 add_gtest(utilsTest utilsTest.cpp)
 add_gtest(virtualMemoryTest virtualMemoryTest.cpp)
 add_gtest(workerPoolTest workerPoolTest.cpp)

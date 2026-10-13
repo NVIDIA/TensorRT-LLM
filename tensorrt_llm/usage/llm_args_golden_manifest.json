@@ -847,6 +847,13 @@
     },
     {
       "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "kv_cache_config.mamba_state_config.enable_branch_snapshot"
+    },
+    {
+      "allowed_values": [],
       "annotation": "<class 'int'>",
       "converter": "",
       "kind": "value",
@@ -1781,6 +1788,20 @@
       "converter": "",
       "kind": "value",
       "path": "sparse_attention_config.use_cute_dsl_topk"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "sparse_attention_config.use_gvr_emission"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "sparse_attention_config.use_self_sampling_topk"
     },
     {
       "allowed_values": [],
