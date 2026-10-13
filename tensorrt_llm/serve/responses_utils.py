@@ -76,6 +76,7 @@ from tensorrt_llm.serve.openai_protocol import (ChatCompletionMessageParam,
                                                 UCompletionRequest,
                                                 UCompletionResponse)
 from tensorrt_llm.serve.responses_web_search import is_web_search_tool
+from tensorrt_llm.serve.serving_extensions import normalize_reasoning_effort
 from tensorrt_llm.serve.tool_parser.base_tool_parser import (
     BaseToolParser, warn_if_tool_call_unparsed)
 from tensorrt_llm.serve.tool_parser.core_types import ToolCallItem
@@ -1273,13 +1274,15 @@ async def _create_input_tokens(
     # injected keys the template does not reference, so the serve's own
     # injection cannot turn into a guard rejection; kwargs the client sent
     # are forwarded untouched and stay subject to the guard.
+    model_type = resolve_top_level_model_type(model_config)
     chat_template_kwargs = reasoning_chat_template_kwargs(
         request,
         template_source=template_source,
+        model_type=model_type,
     )
 
     token_task = async_apply_chat_template(
-        model_type=resolve_top_level_model_type(model_config),
+        model_type=model_type,
         tokenizer=tokenizer,
         processor=processor,
         conversation=conversation,
@@ -1388,8 +1391,8 @@ async def request_preprocess(
 
 # TODO(JunyiXu-nv): move to use the same function in postprocess_handlers after multiple post processors are supported
 def reasoning_chat_template_kwargs(request,
-                                   template_source: Optional[str] = None
-                                   ) -> dict:
+                                   template_source: Optional[str] = None,
+                                   model_type: Optional[str] = None) -> dict:
     """Chat-template kwargs implied by a request's reasoning configuration.
 
     Both the prompt and the reasoning parser need these. DeepSeek-V4's
@@ -1422,7 +1425,13 @@ def reasoning_chat_template_kwargs(request,
     effort = getattr(reasoning, "effort",
                      None) if reasoning is not None else None
     if isinstance(effort, str) and effort:
-        kwargs.setdefault("reasoning_effort", effort)
+        if "reasoning_effort" not in kwargs:
+            # Serve-derived, so it goes through the model's normalizer
+            # (identity unless the model registers one); a client-written
+            # kwarg stays verbatim. None means "leave the template default".
+            normalized = normalize_reasoning_effort(effort, model_type)
+            if normalized is not None:
+                kwargs["reasoning_effort"] = normalized
         kwargs.setdefault("thinking", True)
     if template_source is not None:
         injected = [key for key in kwargs if key not in client_keys]

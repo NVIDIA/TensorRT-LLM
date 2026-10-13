@@ -15,7 +15,7 @@
 """CPU-only unit tests for the MuseSpark serving extensions.
 
 Covers the request-schema acceptance of the extended reasoning-effort scale
-(`minimal`/`xhigh`), the routing of a request-level `reasoning_effort`
+(up to `xhigh`), the routing of a request-level `reasoning_effort`
 into the chat-template kwargs for musespark_open_omni deployments, whose chat
 template reads the effort from its kwargs only, and the Responses-API
 reasoning routing, which must not inject template-only kwargs the active
@@ -28,6 +28,8 @@ import pytest
 from pydantic import ValidationError
 
 from tensorrt_llm.inputs.chat_template_guard import validate_chat_template_kwargs
+from tensorrt_llm.serve.anthropic_adapter import convert_anthropic_request
+from tensorrt_llm.serve.anthropic_protocol import AnthropicMessagesRequest
 from tensorrt_llm.serve.harmony_adapter import maybe_transform_reasoning_effort
 from tensorrt_llm.serve.openai_protocol import ChatCompletionRequest, ResponsesRequest
 from tensorrt_llm.serve.responses_utils import reasoning_chat_template_kwargs
@@ -39,7 +41,26 @@ pytestmark = pytest.mark.cpu_only
 
 USER_MSG = {"role": "user", "content": "hello"}
 
-MUSESPARK_EFFORTS = ["minimal", "low", "medium", "high", "xhigh"]
+# The serve-side effort contract, restated independently of the constant in
+# tensorrt_llm/serve/extensions/musespark.py (importing the table under test
+# could not catch a wrong table): API value -> level handed to the template.
+# The floor-intent values (`none`, legacy `minimal`) map to `low` explicitly
+# rather than falling through to a high template default. A contract change
+# edits this table and the one in musespark.py, nothing else.
+EFFORT_CONTRACT = {
+    "low": "low",
+    "medium": "medium",
+    "high": "high",
+    "xhigh": "xhigh",
+    "max": "xhigh",
+    "none": "low",
+    "minimal": "low",
+}
+# The template's own levels (identity rows) and the protocol aliases.
+MUSESPARK_EFFORTS = [k for k, v in EFFORT_CONTRACT.items() if k == v]
+EFFORT_ALIASES = [(k, v) for k, v in EFFORT_CONTRACT.items() if k != v]
+# Every effort the request schema accepts.
+API_EFFORTS = list(EFFORT_CONTRACT)
 
 
 def make_request(**kwargs) -> ChatCompletionRequest:
@@ -51,7 +72,7 @@ def make_request(**kwargs) -> ChatCompletionRequest:
 class TestReasoningEffortSchema:
     """The request schema accepts every effort the templates support."""
 
-    @pytest.mark.parametrize("effort", ["minimal", "low", "medium", "high", "xhigh", "max", "none"])
+    @pytest.mark.parametrize("effort", API_EFFORTS)
     def test_all_supported_efforts_accepted(self, effort: str) -> None:
         req = make_request(reasoning_effort=effort)
         assert req.reasoning_effort == effort
@@ -96,10 +117,15 @@ class TestMuseSparkEffortRouting:
         req = self.apply(reasoning_effort=None)
         assert req.chat_template_kwargs is None
 
-    @pytest.mark.parametrize("effort", ["max", "none"])
-    def test_efforts_without_musespark_equivalent_left_to_template(self, effort: str) -> None:
+    @pytest.mark.parametrize(("effort", "expected"), EFFORT_ALIASES)
+    def test_protocol_aliases_map_to_nearest_musespark_level(
+        self, effort: str, expected: str
+    ) -> None:
+        # The template rejects anything outside its own levels, so the
+        # protocol values it lacks map to the nearest level instead of
+        # falling through to the template default.
         req = self.apply(reasoning_effort=effort)
-        assert req.chat_template_kwargs is None
+        assert self.kwargs_of(req)["reasoning_effort"] == expected
 
     def test_client_chat_template_kwargs_win(self) -> None:
         req = self.apply(reasoning_effort="xhigh", chat_template_kwargs={"reasoning_effort": "low"})
@@ -108,6 +134,76 @@ class TestMuseSparkEffortRouting:
     def test_other_client_kwargs_preserved(self) -> None:
         req = self.apply(reasoning_effort="xhigh", chat_template_kwargs={"foo": "bar"})
         assert self.kwargs_of(req) == {"reasoning_effort": "xhigh", "foo": "bar"}
+
+    # An adapter that derives the kwarg from an API field (the Anthropic
+    # adapter with output_config.effort) lists it in
+    # injected_chat_template_kwargs; those are normalized, client-written
+    # kwargs are not.
+    @pytest.mark.parametrize(
+        ("injected", "expected"),
+        EFFORT_ALIASES + [("HIGH", "high"), ("xhigh", "xhigh")],
+    )
+    def test_injected_kwarg_normalized(self, injected: str, expected: str) -> None:
+        req = self.apply(
+            chat_template_kwargs={"reasoning_effort": injected, "enable_thinking": True},
+            injected_chat_template_kwargs=["enable_thinking", "reasoning_effort"],
+        )
+        assert self.kwargs_of(req) == {"reasoning_effort": expected, "enable_thinking": True}
+
+    def test_injected_unknown_effort_dropped_to_template_default(self) -> None:
+        req = self.apply(
+            chat_template_kwargs={"reasoning_effort": "ultra", "enable_thinking": True},
+            injected_chat_template_kwargs=["enable_thinking", "reasoning_effort"],
+        )
+        assert self.kwargs_of(req) == {"enable_thinking": True}
+
+    def test_client_written_kwarg_not_normalized(self) -> None:
+        # Not listed as injected, so it is the client's literal value and is
+        # forwarded verbatim (the template then rejects it with a 400).
+        req = self.apply(chat_template_kwargs={"reasoning_effort": "HIGH"})
+        assert self.kwargs_of(req) == {"reasoning_effort": "HIGH"}
+
+    def test_injected_kwarg_untouched_for_other_models(self) -> None:
+        req = self.apply(
+            model_type="llama",
+            chat_template_kwargs={"reasoning_effort": "max"},
+            injected_chat_template_kwargs=["reasoning_effort"],
+        )
+        assert self.kwargs_of(req) == {"reasoning_effort": "max"}
+
+
+class TestAnthropicEffortReachesMuseSparkTemplate:
+    """The Anthropic path end to end.
+
+    output_config.effort is forwarded by the model-agnostic adapter as an
+    injected kwarg, and the MuseSpark extension normalizes it on the resulting
+    chat request. Before this, Anthropic's own top tier `max` reached the
+    template verbatim.
+    """
+
+    def convert(self, effort: str, model_type: str = "musespark_open_omni") -> dict:
+        request = AnthropicMessagesRequest(
+            model="musespark_open",
+            max_tokens=64,
+            messages=[{"role": "user", "content": "hi"}],
+            output_config={"effort": effort},
+        )
+        chat = convert_anthropic_request(request)
+        assert "reasoning_effort" in (chat.injected_chat_template_kwargs or [])
+        apply_model_chat_extensions(chat, model_type)
+        return chat.chat_template_kwargs or {}
+
+    @pytest.mark.parametrize(
+        ("effort", "expected"), [("max", "xhigh"), ("high", "high"), ("Low", "low")]
+    )
+    def test_effort_normalized_for_musespark(self, effort: str, expected: str) -> None:
+        assert self.convert(effort)["reasoning_effort"] == expected
+
+    def test_unknown_effort_left_to_template_default(self) -> None:
+        assert "reasoning_effort" not in self.convert("ultra")
+
+    def test_other_models_get_the_verbatim_value(self) -> None:
+        assert self.convert("max", model_type="llama")["reasoning_effort"] == "max"
 
 
 # A template in the MuseSpark style: it reads the effort level from its
@@ -213,6 +309,37 @@ class TestResponsesReasoningKwargsInjection:
         req = make_responses_request()
         assert reasoning_chat_template_kwargs(req, template_source=TEMPLATE_EFFORT_ONLY) == {}
 
+    @pytest.mark.parametrize(
+        ("effort", "expected"), [("none", EFFORT_CONTRACT["none"]), ("high", "high")]
+    )
+    def test_musespark_model_type_normalizes_injected_effort(self, effort: str, expected: str):
+        # The derived effort goes through the model's normalizer: OpenAI's
+        # `none` has no MuseSpark level and maps to the floor instead of
+        # reaching the template, which would reject it with a 400.
+        req = make_responses_request(reasoning={"effort": effort})
+        kwargs = reasoning_chat_template_kwargs(
+            req, template_source=TEMPLATE_EFFORT_ONLY, model_type="musespark_open_omni"
+        )
+        assert kwargs == {"reasoning_effort": expected, "thinking": True}
+        validate_chat_template_kwargs(TEMPLATE_EFFORT_ONLY, kwargs)
+
+    def test_unknown_model_type_forwards_effort_verbatim(self):
+        req = make_responses_request(reasoning={"effort": "none"})
+        kwargs = reasoning_chat_template_kwargs(
+            req, template_source=TEMPLATE_EFFORT_ONLY, model_type="llama"
+        )
+        assert kwargs == {"reasoning_effort": "none", "thinking": True}
+
+    def test_client_effort_kwarg_wins_over_derived_and_is_not_normalized(self):
+        req = SimpleNamespace(
+            chat_template_kwargs={"reasoning_effort": "HIGH"},
+            reasoning=SimpleNamespace(effort="none"),
+        )
+        kwargs = reasoning_chat_template_kwargs(
+            req, template_source=TEMPLATE_EFFORT_ONLY, model_type="musespark_open_omni"
+        )
+        assert kwargs == {"reasoning_effort": "HIGH", "thinking": True}
+
 
 class TestHarmonyTransformCoversExtendedScale:
     """No KeyError from `maybe_transform_reasoning_effort` on accepted efforts.
@@ -221,7 +348,7 @@ class TestHarmonyTransformCoversExtendedScale:
     nearest harmony level.
     """
 
-    @pytest.mark.parametrize("effort", ["minimal", "low", "medium", "high", "xhigh", "max", "none"])
+    @pytest.mark.parametrize("effort", API_EFFORTS)
     def test_no_keyerror_for_any_accepted_effort(self, effort: str) -> None:
         maybe_transform_reasoning_effort(effort)
 

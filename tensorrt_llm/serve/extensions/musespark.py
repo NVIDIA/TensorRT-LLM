@@ -14,23 +14,53 @@
 # limitations under the License.
 """Serving extension for MuseSpark checkpoints (``model_type == "musespark_open_omni"``).
 
-Routes a request-level ``reasoning_effort`` to the MuseSpark chat template.
+Routes a request-level ``reasoning_effort`` to the MuseSpark chat template and
+normalizes every serve-derived effort onto the levels the template accepts.
 Structured-output placement is the generic path: the constraint applies as a
 raw grammar from the first generated token, with no model-specific trigger.
 """
 
+from typing import Optional
+
 from tensorrt_llm.serve.openai_protocol import ChatCompletionRequest
 from tensorrt_llm.serve.serving_extensions import ServingExtension, register_serving_extension
 
-#: Efforts the MuseSpark chat template understands. The template reads
-#: `reasoning_effort` from its chat-template kwargs only; `max` and `none`
-#: have no MuseSpark equivalent and leave the template default in place.
-_MUSESPARK_EFFORTS = ("minimal", "low", "medium", "high", "xhigh")
+#: The serve-side effort contract: API value (lower-cased) -> template level.
+#: The chat template rejects values outside its own set with a 400, so the
+#: table emits only accepted levels; values absent from it are dropped so the
+#: template's own default applies. The non-identity rows map protocol efforts
+#: the template lacks: `max` is Anthropic's top tier, while `none` and the
+#: legacy `minimal` ask for the least reasoning and pin the floor explicitly
+#: rather than falling through to a high template default.
+_MUSESPARK_EFFORT_NORMALIZATION = {
+    "low": "low",
+    "medium": "medium",
+    "high": "high",
+    "xhigh": "xhigh",
+    "max": "xhigh",
+    "none": "low",
+    "minimal": "low",
+}
+
+
+def normalize_musespark_effort(effort) -> Optional[str]:
+    """Map an API-level effort (str or enum) onto a MuseSpark level, or None.
+
+    Lower-cases and looks up the normalization table; anything outside it is
+    dropped (None) so the template default applies instead of a 400.
+    """
+    value = getattr(effort, "value", effort)
+    if not isinstance(value, str):
+        return None
+    return _MUSESPARK_EFFORT_NORMALIZATION.get(value.lower())
 
 
 @register_serving_extension(model_types=("musespark_open_omni",))
 class MuseSparkServingExtension(ServingExtension):
     """Request-field to chat-template-kwarg derivation for MuseSpark."""
+
+    def normalize_reasoning_effort(self, effort: str) -> Optional[str]:
+        return normalize_musespark_effort(effort)
 
     def apply_chat_extensions(self, request: ChatCompletionRequest) -> None:
         """Route a request-level ``reasoning_effort`` to the template kwargs.
@@ -43,13 +73,27 @@ class MuseSparkServingExtension(ServingExtension):
         client-supplied ``chat_template_kwargs.reasoning_effort`` wins over
         the derived value, and the pydantic default (the field defaults to
         LOW) is never derived — only an effort the client explicitly set.
+
+        A ``reasoning_effort`` kwarg the serve itself injected (the Anthropic
+        adapter forwards ``output_config.effort`` this way and lists it in
+        ``injected_chat_template_kwargs``) is normalized in place; a kwarg
+        the client wrote is forwarded untouched.
         """
+        kwargs = request.chat_template_kwargs
+        injected = request.injected_chat_template_kwargs or ()
+        if kwargs and "reasoning_effort" in kwargs and "reasoning_effort" in injected:
+            kwargs = dict(kwargs)
+            normalized = normalize_musespark_effort(kwargs["reasoning_effort"])
+            if normalized is None:
+                del kwargs["reasoning_effort"]
+            else:
+                kwargs["reasoning_effort"] = normalized
+            request.chat_template_kwargs = kwargs
+
         if "reasoning_effort" not in request.model_fields_set or request.reasoning_effort is None:
             return
-        effort = getattr(request.reasoning_effort, "value", request.reasoning_effort).lower()
-        if effort not in _MUSESPARK_EFFORTS:
-            # `max`/`none` (Kimi-style) have no MuseSpark equivalent; leave
-            # the template default rather than guessing a mapping.
+        effort = normalize_musespark_effort(request.reasoning_effort)
+        if effort is None:
             return
         request.chat_template_kwargs = {
             "reasoning_effort": effort,
