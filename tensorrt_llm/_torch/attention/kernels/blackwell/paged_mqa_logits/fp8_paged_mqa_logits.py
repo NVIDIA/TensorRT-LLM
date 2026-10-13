@@ -1408,7 +1408,7 @@ class FP8MQALogitsKernel:
                 # changes the loop-region captures, while an undefined name
                 # is dropped harmlessly.
                 if cutlass.const_expr(self.use_flat_logits_view):
-                    logits_stride0 = cutlass.Int32(mLogits.layout.stride[0])
+                    logits_stride0 = cutlass.Int64(mLogits.layout.stride[0])
                     # Sized by the pitched span (rows * stride0), not the
                     # visible width: stores also cover the aligned padding
                     # past max_context_len (the host allocates the full pitch).
@@ -1416,7 +1416,7 @@ class FP8MQALogitsKernel:
                         mLogits.iterator,
                         cute.make_layout(cute.size(mLogits, mode=[0]) * logits_stride0),
                     )
-                    out_row_off = cutlass.Int32(0)
+                    out_row_off = cutlass.Int64(0)
                 else:
                     mLogits_2d = mLogits
 
@@ -1435,7 +1435,9 @@ class FP8MQALogitsKernel:
                         q_pipeline.consumer_wait(q_cons_state)
                         q_stage_local = q_cons_state.index
                         if cutlass.const_expr(self.use_flat_logits_view):
-                            out_row_off = self._atom_out_row_base(q_idx) * logits_stride0
+                            out_row_off = (
+                                cutlass.Int64(self._atom_out_row_base(q_idx)) * logits_stride0
+                            )
                         # Preload first NUM_W_IN_REG weights per slot
                         for t_i in cutlass.range_constexpr(next_n):
                             for w_j in cutlass.range_constexpr(NUM_W_IN_REG):
@@ -1707,7 +1709,7 @@ class FP8MQALogitsKernel:
                 # changes the loop-region captures, while an undefined name
                 # is dropped harmlessly.
                 if cutlass.const_expr(self.use_flat_logits_view):
-                    logits_stride0 = cutlass.Int32(mLogits.layout.stride[0])
+                    logits_stride0 = cutlass.Int64(mLogits.layout.stride[0])
                     # Sized by the pitched span (rows * stride0), not the
                     # visible width: stores also cover the aligned padding
                     # past max_context_len (the host allocates the full pitch).
@@ -1715,7 +1717,7 @@ class FP8MQALogitsKernel:
                         mLogits.iterator,
                         cute.make_layout(cute.size(mLogits, mode=[0]) * logits_stride0),
                     )
-                    out_row_off = cutlass.Int32(0)
+                    out_row_off = cutlass.Int64(0)
                 else:
                     mLogits_2d = mLogits
 
@@ -1734,7 +1736,9 @@ class FP8MQALogitsKernel:
                         q_pipeline.consumer_wait(q_cons_state)
                         q_stage_local = q_cons_state.index
                         if cutlass.const_expr(self.use_flat_logits_view):
-                            out_row_off = self._atom_out_row_base(q_idx) * logits_stride0
+                            out_row_off = (
+                                cutlass.Int64(self._atom_out_row_base(q_idx)) * logits_stride0
+                            )
                         # Preload first NUM_W_IN_REG weights per slot
                         for t_i in cutlass.range_constexpr(next_n):
                             for w_j in cutlass.range_constexpr(NUM_W_IN_REG):
