@@ -133,6 +133,18 @@ def test_minimax_disagg_role_mapper_kinds(
         Role.ALL: expected_main_mapper,
         Role.INDEX_KEY: MapperKind.REPLICATED,
     }
+    if implementation == "triton":
+        fp8_manager = MiniMaxM3KVCacheManagerV2(
+            num_layers=0,
+            dtype=DataType.FP8,
+            sparse_layer_ids=[],
+            disable_index_value_layer_ids=[],
+            sparse_attention_config=SimpleNamespace(
+                implementation="triton", indexer_kv_dtype="bf16"
+            ),
+        )
+        assert fp8_manager.get_disagg_role_mapper_kinds()[Role.ALL] == MapperKind.NHD
+        assert fp8_manager._dense_native_layer_ids == ()
 
 
 def test_minimax_disagg_rejects_unmanaged_index_value(monkeypatch) -> None:

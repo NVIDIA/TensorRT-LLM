@@ -247,7 +247,7 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         omitted.
       * ``sparse_index_dim`` — width of the index-K/V vectors.
 
-    Dense Triton-path layers and shared Eagle3 draft layers run the
+    Unquantized dense Triton-path layers and shared Eagle3 draft layers run the
     generic TRTLLM attention op, which needs a uniform
     per-layer stride inside a pool. M3's pool is not uniform: here an index-K
     page is as large as a K or V page, so V2 packs K, V and index-K of all
@@ -290,7 +290,7 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         num_layers = kwargs.get("num_layers")
         implementation = getattr(sparse_attention_config, "implementation", "triton")
         self._main_kv_view_layout = "HND" if implementation == "msa" else "NHD"
-        native_dense_cache = kwargs.get("dtype") != DataType.NVFP4
+        native_dense_cache = kwargs.get("dtype") not in (DataType.FP8, DataType.NVFP4)
         if implementation == "triton" and not native_dense_cache:
             self._main_kv_mapper_kind = MapperKind.NHD
 

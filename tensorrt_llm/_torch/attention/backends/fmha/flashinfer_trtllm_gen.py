@@ -392,7 +392,8 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         self._multi_ctas_kv_counter_buffer: Optional[torch.Tensor] = None
 
     @classmethod
-    def _is_available(cls, attn: "TrtllmAttention") -> bool:
+    def is_environment_available(cls) -> bool:
+        """Check dependencies and architecture before constructing an attention layer."""
         if not IS_FLASHINFER_AVAILABLE:
             logger.debug("FlashInfer TRTLLM-Gen FMHA is unavailable: flashinfer is not installed.")
             return False
@@ -410,6 +411,13 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             logger.debug(
                 f"FlashInfer TRTLLM-Gen FMHA is unavailable: requires SM100 or SM103, got SM{sm}."
             )
+            return False
+
+        return True
+
+    @classmethod
+    def _is_available(cls, attn: "TrtllmAttention") -> bool:
+        if not cls.is_environment_available():
             return False
 
         has_skip_softmax = isinstance(attn.sparse_params, SkipSoftmaxParams)

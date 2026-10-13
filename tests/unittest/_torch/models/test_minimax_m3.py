@@ -2737,6 +2737,11 @@ def test_minimax_m3_dense_backend_library_order(monkeypatch, libraries, availabl
     monkeypatch.setattr(model_module, "TrtllmAttention", construct)
     monkeypatch.setattr(
         model_module.FlashInferTrtllmGenFmha,
+        "is_environment_available",
+        classmethod(lambda cls: available),
+    )
+    monkeypatch.setattr(
+        model_module.FlashInferTrtllmGenFmha,
         "is_available",
         classmethod(lambda cls, attn: available),
     )
@@ -2749,13 +2754,15 @@ def test_minimax_m3_dense_backend_library_order(monkeypatch, libraries, availabl
         quant_config=None,
         q_scaling=1.0,
         support_fused_qkv=False,
+        main_kv_is_fp8=False,
+        main_kv_is_nvfp4=False,
     )
     MiniMaxM3Attention._init_native_dense_attention(
         layer, SimpleNamespace(skip_create_weights_in_init=True)
     )
     assert layer.attn is (native if use_native else legacy)
     assert layer.support_fused_qkv is use_native
-    if libraries == "flashinfer_trtllm_gen,fallback":
+    if libraries == "flashinfer_trtllm_gen,fallback" and available:
         construct.assert_called_once()
         assert construct.call_args.kwargs["pos_embd_params"] is None
     else:
@@ -2763,6 +2770,18 @@ def test_minimax_m3_dense_backend_library_order(monkeypatch, libraries, availabl
 
     if not use_native:
         return
+
+    # Quantized caches retain SDPA even when the native library is available.
+    for fp8, nvfp4 in ((True, False), (False, True)):
+        layer.attn = legacy
+        layer.main_kv_is_fp8, layer.main_kv_is_nvfp4 = fp8, nvfp4
+        construct.reset_mock()
+        MiniMaxM3Attention._init_native_dense_attention(
+            layer, SimpleNamespace(skip_create_weights_in_init=True)
+        )
+        assert layer.attn is legacy
+        construct.assert_not_called()
+    layer.main_kv_is_fp8 = layer.main_kv_is_nvfp4 = False
 
     from tensorrt_llm._torch.attention.backends.trtllm import (
         TrtllmAttention,
@@ -2828,8 +2847,13 @@ def test_minimax_m3_dense_backend_library_order(monkeypatch, libraries, availabl
     select.assert_called_once()
 
     # Reject a mismatched manager before invoking native attention or writing output.
-    metadata.kv_cache_manager.dtype = DataType.NVFP4
-    with pytest.raises(ValueError, match="model quantization config and KV cache manager disagree"):
-        MiniMaxM3Attention._dispatch_attention_backend(layer, q, k, v, None, None, metadata, output)
+    for dtype in (DataType.FP8, DataType.NVFP4):
+        metadata.kv_cache_manager.dtype = dtype
+        with pytest.raises(
+            ValueError, match="model quantization config and KV cache manager disagree"
+        ):
+            MiniMaxM3Attention._dispatch_attention_backend(
+                layer, q, k, v, None, None, metadata, output
+            )
     kernel.forward.assert_called_once()
     torch.testing.assert_close(output, q)

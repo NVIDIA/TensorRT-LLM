@@ -1128,12 +1128,8 @@ class MiniMaxM3Attention(Attention):
         self.ln_events = [torch.cuda.Event(), torch.cuda.Event()]
 
         self.is_sparse_attention_layer = bool(is_sparse_attention_layer)
-        # Packed NVFP4 KV retains its existing path: native virtual pools do
-        # not yet describe its independent block-scale page strides.
-        if (
-            not self.is_sparse_attention_layer
-            and not self.main_kv_is_nvfp4
-            and isinstance(self.attn, MiniMaxM3SparseRuntimeBackend)
+        if not self.is_sparse_attention_layer and isinstance(
+            self.attn, MiniMaxM3SparseRuntimeBackend
         ):
             self._init_native_dense_attention(model_config)
         self.disable_index_value = bool(disable_index_value)
@@ -1222,7 +1218,11 @@ class MiniMaxM3Attention(Attention):
             )
 
     def _init_native_dense_attention(self, model_config: ModelConfig) -> None:
-        """Use native dense attention only when TRTLLM-Gen precedes C++ fallback."""
+        """Use native attention for unquantized KV when TRTLLM-Gen is preferred."""
+        # FP8 native FMHA also quantizes Q; SDPA preserves the activation dtype.
+        # NVFP4 requires independent block-scale strides in its virtual pools.
+        if self.main_kv_is_fp8 or self.main_kv_is_nvfp4:
+            return
         enabled_libs = get_enabled_fmha_lib_classes()
         if FlashInferTrtllmGenFmha not in enabled_libs:
             return
@@ -1230,6 +1230,8 @@ class MiniMaxM3Attention(Attention):
             FlashInferTrtllmGenFmha
         ):
             # A fallback-first policy cannot serve P128 cached prefill safely.
+            return
+        if not FlashInferTrtllmGenFmha.is_environment_available():
             return
         # Q/K norm and partial RoPE run in the model before backend dispatch.
         native_attn = TrtllmAttention(
@@ -1804,17 +1806,8 @@ class MiniMaxM3Attention(Attention):
         k_view = k.view(num_tokens, self.num_key_value_heads, self.head_dim)
         v_view = v.view(num_tokens, self.num_key_value_heads, self.head_dim)
 
-        # 4. Paged-block main K/V pool. Keep the multi-dim view (do not
-        # reshape) so writes propagate to the underlying pool storage:
-        # ``kv_pool[:, 0]`` is a non-contiguous view (its dim-0 stride
-        # is 2× the contiguous stride because dim 1 separates K from
-        # V), so reshaping to ``[-1, num_kv_heads, head_dim]`` silently
-        # forks a copy. Writing to the copy and then discarding it is
-        # exactly the bug that drove dense layer-0 decode attention to
-        # near-zero output: the next forward call would read zeros for
-        # the prefilled positions because the pool was never updated.
-        # Pass the 4-D view directly; the helpers below address slots
-        # via ``(page, within)`` fancy indexing.
+        # Preserve the strided pool view so writes update the backing cache.
+        # Flattening it can allocate a copy; the helpers address (page, slot).
         kv_pool = kv_cache_manager.get_buffers(self.layer_idx)
         k_cache_view = kv_pool[:, 0]
         v_cache_view = kv_pool[:, 1]
@@ -1864,13 +1857,8 @@ class MiniMaxM3Attention(Attention):
             v_cache_view, m3_meta.req_to_token, m3_meta.slot_ids, max_k
         )
 
-        # GQA via repeat_interleave on the KV head axis: each KV head is
-        # shared by ``num_heads / num_kv_heads`` Q heads. SDPA does not
-        # support GQA natively pre-PyTorch-2.4 on every backend, so we
-        # expand K/V to match Q's head count. The expansion is O(num_q *
-        # num_kv) memory; for the M3 geometry (Q=8, KV=1 per TP=8 rank)
-        # it adds ~7x KV memory transiently — acceptable for the smoke
-        # decode.
+        # SDPA expands KV heads to query heads for prefill. Decode processes
+        # one KV head at a time to bound the temporary GQA expansion.
         if self.num_heads % max(self.num_key_value_heads, 1) != 0:
             raise RuntimeError(
                 f"Dense GQA expects num_heads ({self.num_heads}) divisible "
@@ -2009,8 +1997,8 @@ class MiniMaxM3Attention(Attention):
 
         MSA handles both dense and sparse layers. The Triton configuration
         uses MiniMaxM3SparseRuntimeBackend for sparse layers and
-        TrtllmAttention for dense layers when TRTLLM-Gen is available. NVFP4
-        KV cache retains SDPA until native block-scale strides are supported.
+        TrtllmAttention for unquantized dense layers when TRTLLM-Gen is available.
+        FP8 and NVFP4 KV caches retain the SDPA dense path.
 
         * MSA → :meth:`_msa_attention_core`
         * Triton sparse → :meth:`_triton_sparse_attention_core`
@@ -2025,15 +2013,16 @@ class MiniMaxM3Attention(Attention):
         assert idx_q is None and idx_k is None
         if isinstance(self.attn, MiniMaxM3SparseRuntimeBackend):
             return self._sdpa_dense_attention_core(q, k, v, attn_metadata, output)
-        if (
-            attn_metadata.kv_cache_manager is not None
-            and attn_metadata.kv_cache_manager.dtype == DataType.NVFP4
+        if attn_metadata.kv_cache_manager is not None and attn_metadata.kv_cache_manager.dtype in (
+            DataType.FP8,
+            DataType.NVFP4,
         ):
             raise ValueError(
-                "MiniMax-M3 native dense attention requires a non-NVFP4 KV cache; "
+                "MiniMax-M3 native dense attention requires an unquantized KV cache; "
                 "the model quantization config and KV cache manager disagree."
             )
-        # The native backend expects packed QKV for the current tokens only.
+        # TRTLLM-Gen self-attention requires packed QKV when updating the cache.
+        # Pack only current tokens; separate K/V inputs are not supported.
         # Historical K/V stays in the paged cache and is never gathered here.
         qkv = torch.cat((q, k, v), dim=-1)
         self.attn.forward(
