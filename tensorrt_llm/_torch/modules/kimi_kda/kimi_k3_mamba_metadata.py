@@ -99,9 +99,9 @@ class KimiK3MambaMetadata(Mamba2Metadata):
             dtype=torch.int32,
             pin_memory=prefer_pinned(),
         )
-        device_inputs = self._prev_count_staging[:num_generations]
-        device_inputs.copy_(staging, non_blocking=True)
-        host_counts, slots = device_inputs.unbind(dim=1)
+        replay_counts_and_slots = self._prev_count_staging[:num_generations]
+        replay_counts_and_slots.copy_(staging, non_blocking=True)
+        host_counts, slots = replay_counts_and_slots.unbind(dim=1)
         counts = self.prev_num_accepted_tokens[:num_generations]
         if any(slot is not None for slot in previous_slots):
             assert previous_new_tokens_lens is not None
