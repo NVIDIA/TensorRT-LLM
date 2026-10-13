@@ -38,10 +38,16 @@ environment, and all of them were the environment.
 ## The pipeline
 
 ```
-preflight  ->  plan  ->  smith x N (concurrent)  ->  assemble x M (serial)  ->  deliver
-  Python     capped         one per                   one per unit             Python
-   only      1 round      catalog entry             core, then features       + 1 turn
+preflight  ->  plan  ->  smith x N (concurrent)  ->  assemble x M (serial)  ->  deliver  [->  tune]
+  Python     capped         one per                   one per unit             Python     optional:
+   only      1 round      catalog entry             core, then features       + 1 turn   perf.enabled
 ```
+
+`tune` is the performance stage. It runs after delivery when `task.yaml` has
+`perf.enabled: true`, or on its own against an already-onboarded target with
+`staircase-onboard tune --task task.yaml --workspace W` (see
+[The tune stage](#the-tune-stage)). It never sits between assemble and
+deliver: perf is not a release gate, and a failed tune never blocks delivery.
 
 | stage | who | what it produces |
 |---|---|---|
@@ -455,12 +461,14 @@ retry fails too, the run closes `smith-blocked:<unit>`.
 | `--agent-transport` | `inprocess` | how a role turn is delivered. `external` writes it to `<workspace>/dispatch/` and waits — see below |
 | `--agent-turn-timeout` | per role | seconds one externally-dispatched turn may take, for every role. Without it each role has its own bound: assembler 16 h, smith and auditor 6 h, plan drafter and reviewer 4 h, plan reviewer and runner 3 h |
 | `--overlap-units` | off | start the next unit's assembler in its own worktree once the current unit is `UNIT_READY` — see below |
+| `--stage` | — | `tune`: start at (or re-enter a delivered run at) the performance stage. Same as the `tune` subcommand |
 | `--clean` | off | wipe the checkpoint and managed files |
 
 Subcommands and tools that are not a run:
 
 | command | does |
 |---|---|
+| `staircase-onboard perf {ladder,campaign,table} ...` | perf tooling outside a run: drive the config ladder, inspect a campaign, print a curve table -- see [The tune stage](#the-tune-stage) |
 | `staircase-onboard premerge <step>` | the pre-merge pack — see [Commits and the pre-merge pack](#commits-and-the-pre-merge-pack) |
 | `staircase-onboard gate <name> --task task.yaml [--unit U] [--member M] [--tree T]` | one gate or witness (`boot`, `accuracy`, `acceptance`, `scheduler-equivalence`, `launch`, `witness`) run standalone, exactly as the orchestrator runs it |
 | `staircase-onboard session {render,status,requests,submission,allocate,ack,watchdog} ...` | compute sessions: entry scripts, status, hand-over requests — see [Execution substrate](#execution-substrate) |
@@ -660,11 +668,87 @@ orchestrator does not own.
 Every refusal, redaction and instruction is logged to
 `<workspace>/embargo/attempts.jsonl`.
 
+## The tune stage
+
+Onboarding makes a target *correct*; `tune` makes it *fast* without making it
+less correct. Perf is measured, never a release gate -- but every kept change
+passes the accuracy gate, and every number traces to a label dir.
+
+```bash
+staircase-onboard tune --task task.yaml --workspace W        # standalone, or re-enter a delivered run
+# chained: perf.enabled: true in task.yaml -> deliver, then tune, closes `tuned`
+staircase-onboard perf ladder run --spec tune.yaml           # tooling: the ladder alone
+staircase-onboard perf campaign status --spec tune.yaml      #          candidates and verdicts
+staircase-onboard perf table --baseline A A B C              #          a curve table of label dirs
+```
+
+Three layers, cheapest first (`tune/`):
+
+| layer | who | what moves | judged by |
+|---|---|---|---|
+| **ground truth** | Python | baseline (`modeling_v2: require`), stock reference (`"off"`), identity repeats = the noise floor | -- |
+| **config ladder** (`ladder.py`) | Python | runtime knobs and the target's own env switches, one rung per whole-node job, in parallel across sessions; winners stacked and re-measured | the keep rule |
+| **campaign** (`campaign.py`, `stage.py`) | `tuner` turns | the forward: fusion, ordering, overlap, kernel source; one candidate = one worktree = one hypothesis | e2e A/B + accuracy gate, in Python |
+
+- **The keep rule** (`records.compare`): a WIN is at least `max(min_gain,
+  noise_factor x spread)` better on some headline metric (tok/s/user at the
+  lowest concurrency, tok/s/GPU at the highest) and no worse than
+  `max(1%, noise_factor x spread)` on any. The spread is measured, not
+  assumed: identical-config repeats in the ground-truth phase.
+- **The ladder is Python** for the reason preflight is: a rung needs no
+  judgement once it is written down. Module knobs (`moe_config`,
+  `attn_backend`, `use_cute_dsl_*`, `nvfp4_gemm_config`) are skipped for a
+  target -- it pins its kernels through the catalog, so they never reach it.
+  A task adds rungs for the target's own switches (`perf.ladder.extra_rungs`).
+- **The tuner claims, the orchestrator measures.** A tuner turn implements
+  one hypothesis in `W/tune/worktrees/<slug>` (branch `tune/<slug>`, native
+  build linked in), proves it at the entry level (cells, GPU test) and in a
+  micro-benchmark (`tune/microbench.py`, CUDA-graph and eager timings with
+  per-layer weight rotation), and answers `CANDIDATE`. Python then measures
+  the worktree end to end (`#spool: tree=`), applies the keep rule, runs
+  `gate_accuracy.py` (which forces `modeling_v2: require` into the LLM-API
+  yaml), and cherry-picks a keep onto `tune/best`.
+- **The roadmap** comes from a first tuner turn (profile + code reading ->
+  `W/tune/roadmap.yaml`), or from the operator. Candidates run
+  `perf.campaign.max_parallel_tuners` at a time; the stage stops after
+  `max_consecutive_misses` misses or `max_iterations` candidates.
+- **Kernel sourcing for perf** adds two tiers to the onboarding ladder:
+  FlashInfer *as installed* (a newer FlashInfer's kernel is an upgrade
+  candidate, not a source) and Triton / CuTe DSL / CUDA written by the run.
+  When several sources serve one op, all are micro-benchmarked and the
+  alternatives are recorded in `kernel_choices.json`.
+- **Profiling** goes through the substrate: `bench.py --nsys` with
+  TensorRT-LLM's capture flags (`-c cudaProfilerApi --capture-range-end=stop
+  --cuda-graph-trace node --gpu-metrics-devices=none`, window from
+  `TLLM_PROFILE_START_STOP`).
+
+The `perf:` block (validated by `tune/stage.py:validate_perf_block`; excluded
+from the evidence spec, so adding it never stales a delivered verdict):
+
+```yaml
+perf:
+  enabled: true                     # chain after deliver
+  identity_configs: [gate.yaml]     # LLM-API yaml(s): gate runtime settings + workload capacity
+  workload: {isl: 8192, osl: 1024, concurrency: [1, 128]}
+  reference: stock                  # stock = modeling_v2: "off", same configs; or none
+  spools: [<whole-node perf sessions>]
+  dev_spools: [<1-GPU sessions for tuner jobs>]
+  env_script: <sourced by every perf job>
+  noise_repeats: 2
+  ladder: {min_gain: 0.01, noise_factor: 3.0, extra_rungs: [{name, overlay, why}]}
+  campaign: {max_parallel_tuners: 4, max_iterations: 12, max_consecutive_misses: 3,
+             accuracy: {task: gsm8k, anchor: 96.36}}
+  source_embargo: [<the checkpoint's in-tree implementation, its kernels and ops>]
+```
+
+Skill: `skills/staircase-perf-tuning/` (campaign discipline, the candidate
+protocol, kernel sourcing, graph safety; `references/nsys.md`,
+`references/modeling-iterations.md`).
+
 ## What this workflow does not do
 
-- **Performance.** Perf is measured, never gated, and it is not part of
-  onboarding. A target whose two gates are green is deliverable; the tuning
-  campaign is separate work.
+- **Performance as a release gate.** Perf is measured, never gated: a target
+  whose gates are green is deliverable whether or not `tune` ran.
 - **Isolation of the model zoo.** Staircase denied every agent read access to
   TensorRT-LLM's per-model definitions. That blanket hook is **not** ported:
   the zoo is an ordinary read. What carries the duty instead is the

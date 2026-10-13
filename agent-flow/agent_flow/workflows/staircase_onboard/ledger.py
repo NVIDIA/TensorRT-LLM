@@ -89,7 +89,7 @@ DEFAULT_NATIVE_GLOBS: tuple[str, ...] = ("tensorrt_llm/libs/*.so", "tensorrt_llm
 #: ``trtllm_repo_path``: the code is compared by content, so the same code in
 #: another checkout is the same evidence, and different code is caught anyway.
 SPEC_EXCLUDED_KEYS: frozenset[str] = frozenset(
-    {"remediation", "source_embargo", "agents", "trtllm_repo_path"}
+    {"remediation", "source_embargo", "agents", "trtllm_repo_path", "perf"}
 )
 #: The ``environment`` keys that change what a gate measures. The rest
 #: (partition, spool, mounts, time limits) only change where it runs.

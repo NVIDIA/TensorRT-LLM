@@ -73,6 +73,7 @@ from .state import (
     STAGE_PLAN,
     STAGE_PREFLIGHT,
     STAGE_SMITH,
+    STAGE_TUNE,
     STATE_FILENAME,
     load_state,
 )
@@ -100,7 +101,7 @@ OPEN_STATUSES = frozenset(
     {"PENDING", "IN PROGRESS", "OPEN", "NOT STARTED", "RUNNING", "QUEUED", "PARTIAL", "BLOCKED"}
 )
 
-_STAGES = (STAGE_PREFLIGHT, STAGE_PLAN, STAGE_SMITH, STAGE_ASSEMBLE, STAGE_DELIVER)
+_STAGES = (STAGE_PREFLIGHT, STAGE_PLAN, STAGE_SMITH, STAGE_ASSEMBLE, STAGE_DELIVER, STAGE_TUNE)
 _GENERATED = re.compile(
     r"<!-- BEGIN GENERATED: (?P<name>[a-z-]+) -->\n.*?<!-- END GENERATED: (?P=name) -->",
     re.S,
@@ -286,13 +287,16 @@ def _stage_rows(state: Mapping[str, Any]) -> list[dict[str, str]]:
     done = bool(state.get("done"))
     verdict = str(state.get("verdict") or "")
     position = _STAGES.index(current) if current in _STAGES else 0
+    # The tune stage is optional: a run that never entered it shows no row for
+    # it, so a delivered onboarding still ends on DELIVERED.
+    stages = _STAGES if (current == STAGE_TUNE or state.get("tune")) else _STAGES[:-1]
     rows = []
-    for index, stage in enumerate(_STAGES):
+    for index, stage in enumerate(stages):
         if index < position:
             status = STATUS_DONE
         elif index > position:
             status = STATUS_NOT_STARTED
-        elif done and verdict == "delivered":
+        elif done and (verdict == "delivered" or verdict.startswith("tuned")):
             status = STATUS_DELIVERED
         elif done:
             status = STATUS_BLOCKED

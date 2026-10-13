@@ -53,7 +53,8 @@ from .remediation import CERTIFICATION_GAP_KEY, normalize_certification_gap_reco
 PLAN_STAGE = "plan_stage"
 BUILD_STAGE = "build_stage"
 DELIVER_STAGE = "deliver_stage"
-_STAGES = (PLAN_STAGE, BUILD_STAGE, DELIVER_STAGE)
+TUNE_STAGE = "tune_stage"
+_STAGES = (PLAN_STAGE, BUILD_STAGE, DELIVER_STAGE, TUNE_STAGE)
 
 _STAGE_BY_AGENT = {
     "plan_drafter": PLAN_STAGE,
@@ -62,11 +63,23 @@ _STAGE_BY_AGENT = {
     "assembler": BUILD_STAGE,
     "reviewer": BUILD_STAGE,
     "auditor": DELIVER_STAGE,
+    "tuner": TUNE_STAGE,
 }
 
 # Decision vocabularies. Each is closed on purpose — see the module
 # docstring. ``BLOCKED`` variants carry a reason so the orchestrator's
 # triage does not have to read the summary.
+# The tuner claims, the orchestrator measures: a CANDIDATE is measured end to
+# end and gated by Python (tune/campaign.py), never kept on the tuner's word.
+TUNER_DECISIONS = (
+    "CANDIDATE",
+    "DROPPED",
+    "NEED_SMITH",
+    "NEED_RUNTIME",
+    "NEED_REBUILD",
+    "BLOCKED",
+    "STOP",
+)
 PLAN_DRAFTER_DECISIONS = ("DRAFT_READY", "CEILING")
 PLAN_REVIEWER_DECISIONS = ("APPROVE", "REJECT")
 SMITH_DECISIONS = ("LANDED", "FAILED_RECEIPT", "MACRO", "BLOCKED")
@@ -321,6 +334,7 @@ DECISIONS_BY_AGENT: dict[str, tuple[str, ...]] = {
     "assembler": ASSEMBLER_DECISIONS,
     "reviewer": REVIEWER_DECISIONS,
     "auditor": AUDITOR_DECISIONS,
+    "tuner": TUNER_DECISIONS,
 }
 
 EXTRA_KEYS_BY_AGENT: dict[str, tuple[str, ...]] = {
@@ -344,6 +358,9 @@ EXTRA_KEYS_BY_AGENT: dict[str, tuple[str, ...]] = {
     # live only in `summary` ends the run, which is exactly what it used to
     # do. See remediation.py.
     "auditor": ("uncovered", CERTIFICATION_GAP_KEY),
+    # The orchestrator re-reads the candidate's own decision file for the rest
+    # (micro-bench table, projection); these are what progress.yaml keeps.
+    "tuner": ("slug", "kind", "worktree", "branch", "commits", "projection"),
 }
 
 #: Keys an uncovered row may carry. `entry`, `arch` and `axis` are required:

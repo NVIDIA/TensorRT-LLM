@@ -170,6 +170,14 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "default.",
     )
     parser.add_argument(
+        "--stage",
+        choices=["", "tune"],
+        default="",
+        help="Start at a later stage. `tune` runs the performance stage (ground truth, "
+        "config ladder, tuner candidates) on an already-onboarded target, or re-enters a "
+        "delivered run at it. Same as the `tune` subcommand. Needs a `perf:` block.",
+    )
+    parser.add_argument(
         "--agent-turn-timeout",
         type=int,
         default=None,
@@ -285,8 +293,17 @@ def _driver(argv: list[str]) -> int:
     return driver_main(argv)
 
 
+def _perf(argv: list[str]) -> int:
+    """Perf tooling outside a run: the config ladder, the campaign, curve tables."""
+    from .tune.cli import main as perf_main
+
+    return perf_main(argv)
+
+
 SUBCOMMANDS = {
     "premerge": _premerge,
+    # Perf tooling: `perf ladder|campaign|table ...` (see tune/cli.py).
+    "perf": _perf,
     "gate": _gate,
     # Compute sessions: render entry scripts, status, hand-over, watchdog.
     "session": _session,
@@ -300,6 +317,11 @@ def main(argv: list[str] | None = None) -> None:
     argv = list(sys.argv[1:] if argv is None else argv)
     if argv and argv[0] in SUBCOMMANDS:
         sys.exit(SUBCOMMANDS[argv[0]](argv[1:]))
+    if argv and argv[0] == "tune":
+        # `staircase-onboard tune --task T --workspace W` == `--stage tune`: the
+        # performance stage on an already-onboarded target, or a re-entry of a
+        # delivered run.
+        argv = [*argv[1:], "--stage", "tune"]
     args = _parse_args(argv)
 
     # Validate at the CLI boundary: an invalid spec must abort before any
@@ -380,6 +402,7 @@ def main(argv: list[str] | None = None) -> None:
         skip_substrate_gate=args.skip_substrate_gate,
         agent_transport=transport,
         overlap_units=args.overlap_units,
+        entry_stage=args.stage,
     ) as workflow:
         workflow.run(args.task)
 

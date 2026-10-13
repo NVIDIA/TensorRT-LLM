@@ -114,6 +114,7 @@ from .state import (
     STAGE_PLAN,
     STAGE_PREFLIGHT,
     STAGE_SMITH,
+    STAGE_TUNE,
     STATE_FILENAME,
     WorkflowState,
     is_remediable,
@@ -307,8 +308,11 @@ class StaircaseOnboardWorkflow:
         shell_runner: Any | None = None,
         agent_transport: Any | None = None,
         overlap_units: bool = False,
+        entry_stage: str = "",
     ) -> None:
         self.workspace = Path(workspace)
+        # `staircase-onboard tune`: start (or re-enter) at the tune stage.
+        self.entry_stage = entry_stage
         self.task_path = self.workspace / "task.yaml"
         self.plan_path = self.workspace / "plan.md"
         self.vocabulary_path = self.workspace / "vocabulary.yaml"
@@ -679,6 +683,22 @@ class StaircaseOnboardWorkflow:
             if state.stage == STAGE_DELIVER:
                 if not self._run_deliver_phase(state, log):
                     return
+                if self._tune_requested():
+                    # Delivery stays a recorded milestone; tuning never gates it.
+                    self.journal.event("delivered", "entering the tune stage (perf.enabled)")
+                    state.stage = STAGE_TUNE
+                    self._checkpoint(state)
+
+            if state.stage == STAGE_TUNE:
+                from .tune.stage import run_tune_phase
+
+                verdict = run_tune_phase(self, state, log)
+                if verdict is None:
+                    return
+                state.done = True
+                self._checkpoint(state)
+                self._close_run(state, log, verdict=verdict)
+                return
 
             state.done = True
             self._checkpoint(state)
@@ -2711,6 +2731,15 @@ class StaircaseOnboardWorkflow:
                 # nothing.
                 units = assembly_units(self.task_data)
                 state.unit_index = units.index(added[0])
+            elif state.done and self.entry_stage == STAGE_TUNE and (
+                state.verdict == "delivered" or state.verdict.startswith("tune")
+            ):
+                # An explicit `tune` is the operator's decision to spend more:
+                # re-enter at tune, keep the campaign's history, reset its misses.
+                state.done, state.verdict, state.stage = False, "", STAGE_TUNE
+                state.tune = {**state.tune, "misses": 0, "entry": "re-entered"}
+                if state.tune.get("phase") == "done":
+                    state.tune["phase"] = "campaign"
             elif state.done:
                 print_message(
                     "[bold green]✔ this run already completed; pass --clean to start "
@@ -2733,6 +2762,12 @@ class StaircaseOnboardWorkflow:
                 encoding="utf-8",
             )
         state = WorkflowState(task_path=str(self.task_path))
+        if self.entry_stage == STAGE_TUNE:
+            # Standalone: a target onboarded elsewhere. Preflight still runs
+            # (environment, prompts, skills, commit helper); the stage then
+            # measures and tunes the target the task names.
+            state.stage = STAGE_TUNE
+            state.tune = {"entry": "standalone"}
         self._checkpoint(state)
         return state
 
@@ -2821,6 +2856,10 @@ class StaircaseOnboardWorkflow:
             f"from the file this run was given[/bold cyan]",
             log,
         )
+
+    def _tune_requested(self) -> bool:
+        perf = self.task_data.get("perf") or {}
+        return bool(perf.get("enabled")) or self.entry_stage == STAGE_TUNE
 
     def _checkpoint(self, state: WorkflowState) -> None:
         save_state(self.state_path, state)

@@ -26,6 +26,7 @@ from .plan_drafter import SYSTEM_PROMPT as PLAN_DRAFTER_SYSTEM_PROMPT
 from .plan_reviewer import SYSTEM_PROMPT as PLAN_REVIEWER_SYSTEM_PROMPT
 from .reviewer import SYSTEM_PROMPT as REVIEWER_SYSTEM_PROMPT
 from .runner import SYSTEM_PROMPT as RUNNER_SYSTEM_PROMPT
+from .tuner import SYSTEM_PROMPT as TUNER_SYSTEM_PROMPT
 from .smith import SYSTEM_PROMPT as SMITH_SYSTEM_PROMPT
 
 if TYPE_CHECKING:  # pragma: no cover - import cycle guard for type checkers only
@@ -64,6 +65,8 @@ class PromptBundle:
     # orchestrator cannot reach. Listed here because every turn needs a system
     # prompt, not because it is a seventh judgement.
     runner: str = RUNNER_SYSTEM_PROMPT
+    # The tune stage's performance engineer: one candidate per turn.
+    tuner: str = TUNER_SYSTEM_PROMPT
 
     def with_extensions(
         self,
@@ -75,6 +78,7 @@ class PromptBundle:
         reviewer: str = "",
         auditor: str = "",
         runner: str = "",
+        tuner: str = "",
     ) -> "PromptBundle":
         """Return a new bundle with each non-empty extension appended.
 
@@ -96,6 +100,7 @@ class PromptBundle:
             reviewer=_append(self.reviewer, reviewer),
             auditor=_append(self.auditor, auditor),
             runner=_append(self.runner, runner),
+            tuner=_append(self.tuner, tuner),
         )
 
     def replace(self, **changes: str) -> "PromptBundle":
@@ -122,6 +127,7 @@ def _for_every_role(prompts: PromptBundle, block: str) -> PromptBundle:
         reviewer=block,
         auditor=block,
         runner=block,
+        tuner=block,
     )
 
 
@@ -133,6 +139,7 @@ DEFAULT_PROMPTS = PromptBundle(
     reviewer=REVIEWER_SYSTEM_PROMPT,
     auditor=AUDITOR_SYSTEM_PROMPT,
     runner=RUNNER_SYSTEM_PROMPT,
+    tuner=TUNER_SYSTEM_PROMPT,
 )
 
 

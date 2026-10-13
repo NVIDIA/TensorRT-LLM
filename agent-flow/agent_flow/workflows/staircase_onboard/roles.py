@@ -31,6 +31,7 @@ ROLES: tuple[str, ...] = (
     "reviewer",
     "auditor",
     "runner",
+    "tuner",
 )
 
 #: The backend a role runs on when the ``agents`` block does not choose one.

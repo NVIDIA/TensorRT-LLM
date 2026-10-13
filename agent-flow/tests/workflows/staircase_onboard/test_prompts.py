@@ -61,6 +61,7 @@ def test_the_bundle_has_exactly_the_roles_the_workflow_dispatches():
         "reviewer",
         "auditor",
         "runner",
+        "tuner",
     )
 
 

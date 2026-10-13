@@ -55,6 +55,10 @@ STAGE_PLAN = "plan"
 STAGE_SMITH = "smith"
 STAGE_ASSEMBLE = "assemble"
 STAGE_DELIVER = "deliver"
+# The performance stage: after delivery when `perf.enabled`, or the entry stage
+# of `staircase-onboard tune` on an already-onboarded target. Perf is measured,
+# never a release gate, so it never sits between assemble and deliver.
+STAGE_TUNE = "tune"
 
 _VALID_STAGES = (
     STAGE_PREFLIGHT,
@@ -62,6 +66,7 @@ _VALID_STAGES = (
     STAGE_SMITH,
     STAGE_ASSEMBLE,
     STAGE_DELIVER,
+    STAGE_TUNE,
 )
 
 # Queue-item lifecycle. ``running`` is persisted rather than kept in
@@ -202,6 +207,9 @@ class WorkflowState:
     # that forgets it re-dispatches work it already did. See
     # ``remediation.RemediationState``.
     remediation: dict[str, Any] = field(default_factory=dict)
+    # The tune stage's checkpoint: entry, baseline/reference labels, ladder and
+    # campaign progress (see tune/stage.py). Empty until the stage runs.
+    tune: dict[str, Any] = field(default_factory=dict)
 
     # The metric staircase exists to drive down: how many times the run
     # stopped for a human decision. Carried in the checkpoint so it
@@ -272,6 +280,8 @@ def load_state(path: Path) -> WorkflowState:
         # Absent in checkpoints written before the remediation cycle existed.
         # An empty queue is the correct reading of those: no round has run.
         remediation=dict(data.get("remediation") or {}),
+        # Absent before the tune stage existed: no campaign has run.
+        tune=dict(data.get("tune") or {}),
     )
 
 

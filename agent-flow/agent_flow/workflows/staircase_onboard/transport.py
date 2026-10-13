@@ -46,6 +46,8 @@ DEFAULT_ROLE_TURN_TIMEOUTS: dict[str, float] = {
     "reviewer": 4 * 3600.0,
     "auditor": 6 * 3600.0,
     "runner": 3 * 3600.0,
+    # One candidate: implement, test on GPU, micro-bench -- hours of spool jobs.
+    "tuner": 8 * 3600.0,
 }
 
 #: How often the orchestrator tells the driver it is alive.
