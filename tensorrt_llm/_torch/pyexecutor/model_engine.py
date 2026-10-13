@@ -52,7 +52,8 @@ from .engine.lora import make_lora_model_config
 from .engine.model_call import ModelCaller
 from .engine.multimodal import (MultimodalItemScheduler, is_multimodal,
                                 mm_encoder_cache_enabled,
-                                setup_mm_encoder_attn_metadata)
+                                setup_mm_encoder_attn_metadata,
+                                setup_mm_encoder_cuda_graphs)
 from .engine.runners import resolve_runner_type
 from .engine.runners.common import (make_scheduled_inputs,
                                     resolve_mrope_position_deltas_cache,
@@ -562,6 +563,10 @@ class PyTorchModelEngine(ModelEngine):
                 torch._dynamo.config.cache_size_limit = 16
             else:
                 set_torch_compiling(False)
+
+            # Capture local encoders after their metadata is sized and before
+            # KV-cache estimation, so graph memory is included in the profile.
+            setup_mm_encoder_cuda_graphs(self.model)
         except Exception as e:
             import traceback
             traceback.print_exception(Exception, e, e.__traceback__)
