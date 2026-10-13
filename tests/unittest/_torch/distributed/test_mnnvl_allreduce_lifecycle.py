@@ -124,6 +124,7 @@ def _patch_workspace_dependencies(monkeypatch: pytest.MonkeyPatch) -> _FakeWorld
     monkeypatch.setattr(MNNVLAllReduce, "_allreduce_mnnvl_workspace_locks", {})
     monkeypatch.setattr(ops_module, "mpi_comm", lambda: world)
     monkeypatch.setattr(ops_module.torch, "device", lambda *args, **kwargs: cpu_device)
+    monkeypatch.setattr(ops_module.torch.cuda, "is_current_stream_capturing", lambda: False)
     monkeypatch.setattr(ops_module, "_initialize_allreduce_mnnvl_protocol", lambda workspace: None)
     return world
 
