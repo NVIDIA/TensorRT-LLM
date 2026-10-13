@@ -3212,6 +3212,7 @@ class OpenAIServer(_VideoRoutesMixin):
                 processor=self.processor if not self.use_harmony else None,
                 reasoning_parser=self.generator.args.reasoning_parser
                 if not self.use_harmony else "gpt_oss",
+                multimodal_server_config=self.multimodal_server_config,
             )
 
             streaming_processor = None

@@ -45,6 +45,8 @@ from tensorrt_llm._utils import \
     get_steady_clock_now_in_seconds  # noqa: F401  (re-export)
 from tensorrt_llm._utils import AdjustedSteadyClock
 from tensorrt_llm.executor import GenerationResult
+from tensorrt_llm.inputs import PromptInputs, prompt_inputs
+from tensorrt_llm.inputs.multimodal import MultimodalServerConfig
 from tensorrt_llm.inputs.utils import async_apply_chat_template
 from tensorrt_llm.llmapi import SamplingParams
 from tensorrt_llm.llmapi.llm import RequestOutput
@@ -55,7 +57,8 @@ from tensorrt_llm.llmapi.thinking_budget import \
     add_thinking_budget_logits_processor
 from tensorrt_llm.llmapi.tokenizer import TokenizerBase, TransformersTokenizer
 from tensorrt_llm.logger import logger
-from tensorrt_llm.serve.chat_utils import (parse_chat_messages_coroutines,
+from tensorrt_llm.serve.chat_utils import (VALID_MESSAGE_CONTENT_MM_PART_TYPES,
+                                           parse_chat_messages_coroutines,
                                            resolve_top_level_model_type)
 from tensorrt_llm.serve.openai_protocol import (ChatCompletionMessageParam,
                                                 ChatCompletionToolsParam,
@@ -713,6 +716,72 @@ def _qualified_tool_name(item: dict) -> str:
     return f"{namespace}.{name}" if namespace else name
 
 
+# Media parts already in chat form; the chat parser loads them itself.
+_CHAT_MEDIA_PART_TYPES = VALID_MESSAGE_CONTENT_MM_PART_TYPES - {"text"}
+
+
+def _content_text(content: list) -> str:
+    """Join the text of every content part; a part without text adds nothing."""
+    texts = []
+    for part in content:
+        text = part.get("text") if isinstance(part, dict) else getattr(
+            part, "text", None)
+        if text:
+            texts.append(text)
+    return "".join(texts)
+
+
+def _input_image_to_chat_part(part: dict) -> dict[str, Any]:
+    """Turn a Responses ``input_image`` part into a chat ``image_url`` part.
+
+    The Responses API carries the URL as a plain string; the object form of
+    the chat API is accepted as well. An image given only by ``file_id`` is
+    rejected, because this server has no Files API to resolve it from.
+    """
+    image_url = part.get("image_url")
+    if isinstance(image_url, dict):
+        image_url = image_url.get("url")
+    if not image_url:
+        raise ValueError("input_image requires an image_url; images referenced "
+                         "by file_id are not supported")
+    chat_image = {"url": image_url}
+    if part.get("detail"):
+        chat_image["detail"] = part["detail"]
+    return {"type": "image_url", "image_url": chat_image}
+
+
+def _input_content_to_chat_content(
+        content: list) -> Union[str, list[dict[str, Any]]]:
+    """Convert the content parts of a Responses message to chat content.
+
+    Text-only content becomes a single string. Content that carries media
+    becomes an ordered list of chat parts, so the chat parser loads every
+    image and places it where the client put it. Content this server cannot
+    serve is rejected rather than dropped, since a model that never sees it
+    still answers as if it had.
+    """
+    chat_parts: list[dict[str, Any]] = []
+    has_media = False
+    for part in content:
+        if not isinstance(part, dict):
+            part = {"text": getattr(part, "text", None)}
+        part_type = part.get("type")
+        if part_type == "input_image":
+            chat_parts.append(_input_image_to_chat_part(part))
+            has_media = True
+        elif part_type in _CHAT_MEDIA_PART_TYPES:
+            chat_parts.append(part)
+            has_media = True
+        elif part_type == "input_file":
+            raise ValueError("input_file content is not supported; send the "
+                             "file's text as input_text instead")
+        elif part.get("text"):
+            chat_parts.append({"type": "text", "text": part["text"]})
+    if not has_media:
+        return "".join(part["text"] for part in chat_parts)
+    return chat_parts
+
+
 def _response_output_item_to_chat_completion_message(
     item: Union[dict, ResponseInputOutputItem]
 ) -> Optional[ChatCompletionMessageParam]:
@@ -723,28 +792,28 @@ def _response_output_item_to_chat_completion_message(
 
     match item_type:
         case "":
-            if "role" in item:
-                return item
-            else:
+            if "role" not in item:
                 raise ValueError(f"Invalid input message item: {item}")
+            # A message without a type carries Responses content parts
+            # (input_text, input_image), which the chat parser does not read.
+            if isinstance(item.get("content"), list):
+                return {
+                    **item, "content":
+                    _input_content_to_chat_content(item["content"])
+                }
+            return item
         case "message" | "reasoning":
             content = item.get("content") or []
             if not content:
                 raise ValueError(
                     f"Input item of type {item_type!r} has empty or missing 'content'"
                 )
-            # Join every text part. Taking content[0] silently dropped the rest
-            # of a multi-part message.
-            parts = []
-            for part in content:
-                text = part.get("text") if isinstance(part, dict) else getattr(
-                    part, "text", None)
-                if text:
-                    parts.append(text)
-            text = "".join(parts)
             if item_type == "reasoning":
                 # Reasoning is always the assistant's.
-                return {"role": "assistant", "reasoning": text}
+                return {
+                    "role": "assistant",
+                    "reasoning": _content_text(content)
+                }
             # Honour the item's own role. Hardcoding "assistant" here turned
             # the caller's user turn into an assistant turn, so the model was
             # asked to continue its own message with no user message in the
@@ -753,7 +822,10 @@ def _response_output_item_to_chat_completion_message(
             # structured input items (Codex CLI, the OpenAI SDK) always set a
             # role; a plain string input never reaches this function.
             role = item.get("role") or "assistant"
-            return {"role": role, "content": text}
+            return {
+                "role": role,
+                "content": _input_content_to_chat_content(content)
+            }
         case "function_call":
             # An assistant message carrying tool_calls, which is how the chat
             # completions path represents a call and what chat templates
@@ -1071,13 +1143,18 @@ async def _create_input_tokens(
     tokenizer: Union[TransformersTokenizer, TokenizerBase],
     model_config: PretrainedConfig,
     processor: AutoProcessor,
-) -> Tuple[list[int], Optional[dict[str, list[Any]]]]:
-    """
-    Create input tokens for the model. Also return the mm data if the model is multimodal.
+    multimodal_server_config: Optional[MultimodalServerConfig] = None,
+) -> PromptInputs:
+    """Create the model input for a Responses request.
+
+    Text-only input is rendered straight to token ids. Input that carries
+    media is rendered to a text prompt and returned together with its
+    multimodal data, the form the chat completions route submits: the model's
+    input processor expands each media placeholder into the tokens the media
+    occupies, which pre-tokenized input would skip.
 
     Returns:
-        Tuple[list[int], Optional[dict[str, list[Any]]]]: Input tokens and mm data.
-
+        PromptInputs: The token ids, or a prompt dict with the multimodal data.
     """
     messages = await _create_input_messages(
         request=request,
@@ -1088,8 +1165,9 @@ async def _create_input_tokens(
         await conversation_store.store_messages(request.request_id, messages,
                                                 request.previous_response_id)
 
-    conversation, mm_coroutines, mm_placeholder_counts, _ = parse_chat_messages_coroutines(
-        messages, model_config)
+    conversation, mm_coroutines, mm_placeholder_counts, mm_item_order = parse_chat_messages_coroutines(
+        messages, model_config, multimodal_server_config)
+    has_media = any(message.get("media") for message in conversation)
     tools_dict = [
         tool.model_dump()
         for tool in _get_chat_completion_function_tools(request.tools)
@@ -1109,7 +1187,7 @@ async def _create_input_tokens(
     # which expects the thinking-mode framing - leaves it in the visible text.
     chat_template_kwargs = reasoning_chat_template_kwargs(request)
 
-    token_task = async_apply_chat_template(
+    prompt_task = async_apply_chat_template(
         model_type=resolve_top_level_model_type(model_config),
         tokenizer=tokenizer,
         processor=processor,
@@ -1118,15 +1196,27 @@ async def _create_input_tokens(
         tools=tools_dict,
         mm_placeholder_counts=mm_placeholder_counts,
         chat_template_kwargs=chat_template_kwargs or None,
-        enable_tokenize=True,
+        enable_tokenize=not has_media,
         injected_chat_template_kwargs=reasoning_injected_chat_template_keys(
             request),
     )
-    token_ids, (mm_data,
-                _mm_embeddings) = await asyncio.gather(token_task,
-                                                       mm_coroutines)
+    prompt, (mm_data,
+             mm_embeddings) = await asyncio.gather(prompt_task, mm_coroutines)
+    if not has_media:
+        return prompt
 
-    return token_ids, mm_data
+    if mm_data and mm_embeddings:
+        raise ValueError(
+            "Passing 'multi_modal_data' and 'multi_modal_embeddings' at the "
+            "same time is not supported.")
+    inputs = prompt_inputs(prompt)
+    if mm_data:
+        inputs["multi_modal_data"] = mm_data
+        if mm_item_order:
+            inputs["mm_item_order"] = mm_item_order
+    if mm_embeddings:
+        inputs["multi_modal_embeddings"] = mm_embeddings
+    return inputs
 
 
 async def _create_input_tokens_harmony(
@@ -1160,7 +1250,8 @@ async def request_preprocess(
     model_config: Optional[PretrainedConfig] = None,
     processor: Optional[AutoProcessor] = None,
     reasoning_parser: Optional[str] = None,
-) -> tuple[list[int], SamplingParams]:
+    multimodal_server_config: Optional[MultimodalServerConfig] = None,
+) -> tuple[PromptInputs, SamplingParams]:
 
     sampling_params = request.to_sampling_params(
         default_sampling_params={
@@ -1195,7 +1286,7 @@ async def request_preprocess(
         )
 
     else:
-        input_tokens, _ = await _create_input_tokens(
+        input_tokens = await _create_input_tokens(
             request=request,
             prev_response=prev_response,
             prev_msgs=prev_msgs,
@@ -1204,11 +1295,16 @@ async def request_preprocess(
             tokenizer=tokenizer,
             model_config=model_config,
             processor=processor,
+            multimodal_server_config=multimodal_server_config,
         )
 
-    _responses_debug_log("======= Complete Inputs to model =======")
-    _responses_debug_log(_decode_tokens(input_tokens, tokenizer))
-    _responses_debug_log("========================================")
+    if ENABLE_RESPONSES_DEBUG_MSG:
+        # A multimodal prompt is submitted as text; token ids are decoded.
+        prompt_text = (input_tokens.get("prompt") if isinstance(
+            input_tokens, dict) else _decode_tokens(input_tokens, tokenizer))
+        _responses_debug_log("======= Complete Inputs to model =======")
+        _responses_debug_log(prompt_text)
+        _responses_debug_log("========================================")
     add_thinking_budget_logits_processor(
         sampling_params,
         reasoning_parser=reasoning_parser,

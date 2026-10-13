@@ -393,3 +393,93 @@ def test_meaningful_values_survive_the_null_scrub():
     )
     assert request.temperature == 0.25
     assert request.tool_choice == "none"
+
+
+# ---------------------------------------------------------------------------
+# Multimodal content
+# ---------------------------------------------------------------------------
+
+_IMAGE_URL = "data:image/png;base64,iVBORw0KGgo="
+_QUESTION = {"type": "input_text", "text": "What is in this image?"}
+
+
+def _user_item(*parts, typed=True):
+    item = {"role": "user", "content": list(parts)}
+    if typed:
+        item["type"] = "message"
+    return item
+
+
+@pytest.mark.parametrize("typed", [True, False], ids=["message", "untyped"])
+def test_input_image_becomes_a_chat_image_part(typed):
+    """The image has to reach the chat parser, where the client placed it.
+
+    Keeping only the text parts left the model answering about an image it
+    never received.
+    """
+    image = {"type": "input_image", "image_url": _IMAGE_URL, "detail": "auto"}
+    msg = _response_output_item_to_chat_completion_message(
+        _user_item(_QUESTION, image, typed=typed)
+    )
+    assert msg == {
+        "role": "user",
+        "content": [
+            {"type": "text", "text": "What is in this image?"},
+            {"type": "image_url", "image_url": {"url": _IMAGE_URL, "detail": "auto"}},
+        ],
+    }
+
+
+def test_untyped_text_message_becomes_a_string():
+    """input_text parts are not chat parts; passed through, the chat parser rejects them."""
+    msg = _response_output_item_to_chat_completion_message(
+        _user_item(
+            {"type": "input_text", "text": "hello "},
+            {"type": "input_text", "text": "there"},
+            typed=False,
+        )
+    )
+    assert msg == {"role": "user", "content": "hello there"}
+
+
+def test_input_image_accepts_the_chat_url_object():
+    image = {"type": "input_image", "image_url": {"url": _IMAGE_URL}}
+    msg = _response_output_item_to_chat_completion_message(_user_item(_QUESTION, image))
+    assert msg["content"][1] == {"type": "image_url", "image_url": {"url": _IMAGE_URL}}
+
+
+def test_chat_style_media_parts_pass_through():
+    image = {"type": "image_url", "image_url": {"url": _IMAGE_URL}}
+    msg = _response_output_item_to_chat_completion_message(
+        _user_item({"type": "text", "text": "Describe it."}, image, typed=False)
+    )
+    assert msg["content"] == [{"type": "text", "text": "Describe it."}, image]
+
+
+def test_input_image_without_a_url_is_rejected():
+    """A file_id cannot be resolved here, and dropping the image is worse than failing."""
+    image = {"type": "input_image", "file_id": "file-123", "detail": "auto"}
+    with pytest.raises(ValueError, match="file_id"):
+        _response_output_item_to_chat_completion_message(_user_item(_QUESTION, image))
+
+
+def test_input_file_is_rejected():
+    document = {"type": "input_file", "filename": "spec.pdf", "file_data": "JVBERi0="}
+    with pytest.raises(ValueError, match="input_file"):
+        _response_output_item_to_chat_completion_message(_user_item(_QUESTION, document))
+
+
+@pytest.mark.parametrize("image_part", [{"detail": "auto"}, {}], ids=["detail", "no-detail"])
+def test_image_request_reaches_the_chat_messages(image_part):
+    """The OpenAI SDK sends an untyped user item; the image must survive validation."""
+    image = {"type": "input_image", "image_url": _IMAGE_URL, **image_part}
+    messages = _messages({"input": [_user_item(_QUESTION, image, typed=False)]})
+    assert messages == [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "What is in this image?"},
+                {"type": "image_url", "image_url": {"url": _IMAGE_URL, **image_part}},
+            ],
+        }
+    ]
