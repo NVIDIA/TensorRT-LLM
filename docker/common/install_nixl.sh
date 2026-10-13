@@ -6,8 +6,8 @@ source "$(dirname "${BASH_SOURCE[0]}")/github_auth.sh"
 
 GITHUB_URL="https://github.com"
 UCX_INSTALL_PATH="/usr/local/ucx/"
+# Default prefix for AWS EFA bundled with NGC PyTorch images.
 LIBFABRIC_INSTALL_PATH="/opt/amazon/efa"
-# Use bundled EFA only when its development files are available.
 if [[ ! -f "${LIBFABRIC_INSTALL_PATH}/include/rdma/fabric.h" ||
       ! -f "${LIBFABRIC_INSTALL_PATH}/lib/libfabric.so" ]]; then
     LIBFABRIC_INSTALL_PATH=""

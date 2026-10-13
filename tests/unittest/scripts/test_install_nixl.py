@@ -27,7 +27,8 @@ def test_libfabric_path_requires_efa_development_files(
             dependency.parent.mkdir(parents=True, exist_ok=True)
             dependency.touch()
 
-    # Relocate the installation prefix without needing /opt write access.
+    # NGC PyTorch images bundle AWS EFA under /opt/amazon/efa.
+    # Relocate that prefix so the test does not need /opt write access.
     installer = tmp_path / "install_nixl.sh"
     installer.write_text(INSTALL_NIXL.read_text().replace("/opt/amazon/efa", str(efa_path)))
     (tmp_path / "github_auth.sh").write_text(":\n")

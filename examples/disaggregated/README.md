@@ -42,7 +42,7 @@ If an unsupported backend is specified, NIXL will automatically fall back to UCX
 
 ### LIBFABRIC Backend Setup
 
-**Note:** Containers built from DLFW base images with AWS EFA development files at `/opt/amazon/efa` build the NIXL-LIBFABRIC plugin against that installation by default (see `docker/common/install_nixl.sh`). With these containers on EFA-enabled instances, no extra library installation is needed — set `TRTLLM_NIXL_KVCACHE_BACKEND=LIBFABRIC`. Other base images fall back to system libfabric detection and may not include the plugin. Use the installation options below if the plugin is missing or you need a custom libfabric installation.
+**Note:** Containers built from NGC PyTorch base images with AWS EFA development files at `/opt/amazon/efa` build the NIXL-LIBFABRIC plugin against that installation by default (see `docker/common/install_nixl.sh`). With these containers on EFA-enabled instances, no extra library installation is needed — set `TRTLLM_NIXL_KVCACHE_BACKEND=LIBFABRIC`. Other base images fall back to system libfabric detection and may not include the plugin. Use the installation options below if the plugin is missing or you need a custom libfabric installation.
 
 #### Prerequisites
 
@@ -51,7 +51,7 @@ If an unsupported backend is specified, NIXL will automatically fall back to UCX
 **Required Dependencies:**
 
 **Libfabric**
-- Bundled in DLFW base images with AWS EFA at `/opt/amazon/efa`. No extra library installation is needed when using these containers on EFA-enabled instances.
+- Bundled in NGC PyTorch base images with AWS EFA at `/opt/amazon/efa`. No extra library installation is needed when using these containers on EFA-enabled instances.
 - For a custom libfabric installation, see [https://ofiwg.github.io/libfabric/](https://ofiwg.github.io/libfabric/)
 - **Minimum required version:** v1.21.0
 - For EFA-enabled AWS instances using a non-bundled version, install through the [AWS EFA installer](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/efa-start.html) (recommend using the latest version)
