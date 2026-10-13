@@ -732,8 +732,305 @@ def route_streaming(
     return _main(256, 4, 8, False)
 
 
-# (rows, npad, k, n_env, next_n, cr, packed device profile) -> compiled launcher
+def _bf16_halve_u(plan: dict) -> dict:
+    """bf16 streaming arms read 8-element 16B vectors, so one vector covers
+    what two fp32 float4s did: halve the per-thread vector batch U (tuple slot
+    1) to keep per-tile ELEMENT coverage — and the 32-bit classify mask —
+    identical while halving the load-instruction count."""
+    tpl = list(plan["tpl"])
+    tpl[1] = max(int(tpl[1]) // 2, 1)
+    plan["tpl"] = tuple(tpl)
+    return plan
+
+
+def _gvr_main_gate(blk: int, kpt: int, split: bool = True) -> tuple[int, int]:
+    """(SCPB, CMPB) constexpr mirror of GvrMainKernel.__init__.
+    Kept here so a route rung can check what it does to the
+    in-kernel degeneracy gate before changing BLK/KPT."""
+    kbig = kpt >= 2 and kpt * blk >= 2048
+    scpb = (8192 if split else 16384) if blk >= 1024 else 8192 if kbig else 4096
+    cmpb = (4096 if kbig else 2048) if blk >= 1024 else 1024
+    return (scpb, cmpb)
+
+
+def _degen_gate_ok(blk_old: int, kpt_old: int, blk_new: int, kpt_new: int) -> bool:
+    """True iff moving (blk_old, kpt_old) -> (blk_new, kpt_new) does not shrink
+    either half of the degeneracy gate."""
+    s_o, c_o = _gvr_main_gate(blk_old, kpt_old)
+    s_n, c_n = _gvr_main_gate(blk_new, kpt_new)
+    return s_n >= s_o and c_n >= c_o
+
+
+def _route_bf16(
+    b: int, n: int, npad: int, k: int, num_sms: int = 148, sm_version: int = 100
+) -> dict[str, object]:
+    """bf16 dispatch table. route() is a pure function of shape, so the fp32
+    table is the correct starting point; bf16-specific re-tunes (16B-vector U
+    halving, register-family capacity fitting, bin-count halving) are applied
+    to the returned copy only."""
+    plan = route(b, n, npad, k, num_sms, sm_version)
+    if plan["kernel"] in ("reg", "regimg") and k == 512 and (n <= 1280) and (b > 148):
+        plan["tpl"] = (256, 1, 8, 1, True, True, False, 512)
+        plan["block"] = 256
+    pk16 = npad <= 65536 and n <= 65536 and (b > 15)
+    if plan["kernel"] == "main" and (not plan["tpl"][5]) and (b > 148):
+        n4q = n >> 2
+        if 1024 < n4q <= 1152:
+            CMP = n if n < 2560 else 2560
+            QC = QUADC
+            CURE = not (n < 2 * k and b > 148)
+            DEGE = n <= 3 * k or n <= 4 * k + 64
+            if DEGE and CMP < n:
+                CMP = n
+            vptx = 4
+            while vptx > 1 and (512 * (vptx // 2) >= n4q or 512 * (vptx // 2) * 4 + 512 >= n):
+                vptx //= 2
+            if DEGE:
+                tpl = (512, vptx, 4, 1, CURE, True, False, 512)
+            else:
+                kpt = 1 if k <= 512 else 2
+                tpl = (512, vptx, 4, kpt, CURE, False, False, 512)
+            if b > 296 and 2 * vptx <= 4 and (k <= 1024):
+                tpl = (256, 2 * vptx, 8) + tuple(tpl[3:])
+            return {
+                "kernel": "reg",
+                "tpl": tpl,
+                "rt": {"n": n, "npad": npad, "k": k, "CMP": CMP, "IMGOFF": 2 * NB, "QC": QC},
+                "grid": (b, 1),
+                "cluster": 1,
+                "block": tpl[0],
+                "smem": (tpl[7] + (CMP if pk16 else 2 * CMP)) * 4,
+                "pk16": pk16,
+                "ws": False,
+            }
+    if (
+        plan["kernel"] == "main"
+        and b <= 148
+        and (1024 * 4 * 4 + 1024 >= n)
+        and (n >> 2 > 1152)
+        and (not (b <= 2 and k > BLKC and (2 * BLKC * 8 + BLKC >= n)))
+    ):
+        n4q = n >> 2
+        CMP = n if n < 2560 else 2560
+        QC = QUADC
+        CURE = not (n < 2 * k and b > 148)
+        DEGE = n <= 3 * k or n <= 4 * k + 64
+        if DEGE and CMP < n:
+            CMP = n
+        kpt = 1 if k <= 1024 else 2
+        vptx = 4
+        while vptx > 1 and (1024 * (vptx // 2) >= n4q or 1024 * (vptx // 2) * 4 + 1024 >= n):
+            vptx //= 2
+        tpl = (1024, vptx, 1, kpt, CURE, DEGE, False, 1024)
+        return {
+            "kernel": "reg",
+            "tpl": tpl,
+            "rt": {"n": n, "npad": npad, "k": k, "CMP": CMP, "IMGOFF": 2 * NB, "QC": QC},
+            "grid": (b, 1),
+            "cluster": 1,
+            "block": tpl[0],
+            "smem": (tpl[7] + (CMP if pk16 else 2 * CMP)) * 4,
+            "pk16": pk16,
+            "ws": False,
+        }
+    if plan["kernel"] == "main" and plan["tpl"][5] and (b <= 32) and (k <= 2 * BLKC):
+        av = 148 // (b if b > 0 else 1)
+        amax = 1
+        while amax << 1 <= av and amax < 16:
+            amax <<= 1
+        vsel = 0
+        cs = 0
+        g4_skip = False
+        if amax >= 2 and (not g4_skip):
+            for v in (1, 2):
+                c = 1
+                while c * BLKC * v * 8 + BLKC < n:
+                    c <<= 1
+                if c == 8 and b > 15:
+                    continue
+                if c == 16 and (b < 2 or b > 8 or v < 2 or (k < 1024)):
+                    continue
+                if c >= 16 and n >= 131072 and (b >= 8):
+                    continue
+                if c <= amax:
+                    vsel = v
+                    cs = c
+                    break
+        if vsel and cs >= 2:
+            return {
+                "kernel": "reg_clus",
+                "tpl": (BLKC, vsel, cs),
+                "rt": {"n": n, "npad": npad, "k": k},
+                "grid": (cs, b),
+                "cluster": cs,
+                "block": BLKC,
+                "smem": (3 * NB + 2 * CMPC) * 4,
+                "ws": False,
+            }
+    if plan["kernel"] in ("main", "clus"):
+        plan = _bf16_halve_u(plan)
+    elif plan["kernel"] == "reg_clus":
+        av = 148 // (b if b > 0 else 1)
+        amax = 1
+        while amax << 1 <= av and amax < 8:
+            amax <<= 1
+        vsel = 0
+        cs = 0
+        if amax >= 2:
+            for v in (1, 2, 4):
+                c = 1
+                while c * BLKC * v * 8 + BLKC < n:
+                    c <<= 1
+                if c == 8 and b > 15:
+                    continue
+                if c <= amax:
+                    vsel = v
+                    cs = c
+                    break
+        if vsel and cs >= 2:
+            plan["tpl"] = (BLKC, vsel, cs)
+            plan["grid"] = (cs, b)
+            plan["cluster"] = cs
+        else:
+            plan = _bf16_halve_u(plan)
+    elif plan["kernel"] in ("reg", "regimg"):
+        tpl = list(plan["tpl"])
+        n4r = n >> 2
+        while tpl[1] > 1 and (
+            tpl[0] * (tpl[1] // 2) >= n4r or tpl[0] * (tpl[1] // 2) * 4 + tpl[0] >= n
+        ):
+            tpl[1] //= 2
+        target_nbh = 512 if tpl[0] == 512 else 1024
+        if tpl[7] > target_nbh:
+            tpl[7] = target_nbh
+        if b > 296 and k <= 1024 and (tpl[0] == 512) and (tpl[2] == 4) and (tpl[1] <= 2):
+            tpl[0] = 256
+            tpl[1] *= 2
+            tpl[2] = 8
+            if tpl[1] <= 2 and k > 512:
+                tpl[7] = 256
+            plan["block"] = 256
+        plan["tpl"] = tuple(tpl)
+        if pk16 and plan["kernel"] == "reg":
+            plan["smem"] = (tpl[7] + plan["rt"]["CMP"]) * 4
+            plan["pk16"] = True
+        else:
+            plan["smem"] = (tpl[7] + 2 * plan["rt"]["CMP"]) * 4
+    return plan
+
+
+def _route_streaming_bf16(
+    b: int, n: int, npad: int, k: int, force_main: bool = False
+) -> dict[str, object]:
+    """bf16 twin of route_streaming (see _route_bf16).
+
+    Split-aware vector-width pick: the fp32 table derives the split count R so
+    each CTA's chunk (~n/R) fills one fp32 tile of BLK*U*4 elements. When
+    U == 1 the 16-byte bf16 tile cannot shrink with U and spans BLK*8 -- a
+    ~BLK*4 chunk then idles half the threads and halves the outstanding-load
+    parallelism exactly in the latency-bound deep-split regime. Route those
+    plans to the 8-byte-vector engine (fp32 tile geometry, all threads
+    active); keep the 16-byte engine when the chunk actually fills >= 3/4 of
+    the wider tile (fewer load instructions at full thread activity)."""
+    plan = route_streaming(b, n, npad, k, force_main=force_main)
+    if plan["kernel"] in ("main", "clus"):
+        tpl = plan["tpl"]
+        if (
+            plan["kernel"] == "main"
+            and tpl[5]
+            and (int(tpl[0]) == 1024)
+            and (int(tpl[1]) == 1)
+            and (n >= 65536)
+            and (k <= 2048)
+        ):
+            r512 = ((n >> 2) + 511) // 512
+            kpt = 1 if k <= 512 else 2 if k <= 1024 else 4
+            g1_ok = k < 1024 or _degen_gate_ok(int(tpl[0]), int(tpl[4]), 512, kpt)
+            if r512 > int(plan["rt"]["R"]) and b * r512 <= 148 and g1_ok:
+                tpl = (512, 1, 1, tpl[3], kpt, True, tpl[6])
+                plan["tpl"] = tpl
+                plan["grid"] = (r512, b)
+                plan["block"] = 512
+                plan["rt"]["R"] = r512
+                plan["rt"]["Q"] = ((n >> 2) + r512 - 1) // r512
+        if (
+            plan["kernel"] == "main"
+            and tpl[5]
+            and (b <= 32)
+            and (k <= 1024)
+            and (int(tpl[1]) == 1)
+            and ("rt" in plan)
+            and (int(plan["rt"].get("R", 1)) > 1)
+            and (b * int(plan["rt"].get("R", 1)) >= 148)
+            and ((n + int(plan["rt"]["R"]) - 1) // int(plan["rt"]["R"]) < 6144)
+        ):
+            r1_8 = max(148 // b, 1)
+            r2_8 = max(((n >> 3) + 1023) // 1024, 1)
+            r_n8 = max(min(r1_8, r2_8), 1)
+            if r_n8 > 1 and r_n8 != int(plan["rt"]["R"]):
+                q8 = ((n >> 3) + r_n8 - 1) // r_n8
+                per8 = q8 >> 10
+                u8 = 8 if per8 >= 8 else 4 if per8 >= 4 else 2 if per8 >= 2 else 1
+                if u8 > 4:
+                    u8 = 4
+                kpt8 = 1 if k <= 1024 else 2 if k <= 2048 else 4 if k <= 4096 else 8
+                tshg8 = b > 15 and k <= 1024 and (n >> 2 <= 32768)
+                plan["tpl"] = (1024, u8, 1, tpl[3], kpt8, True, tshg8)
+                plan["rt"]["R"] = r_n8
+                plan["rt"]["Q"] = ((n >> 2) + r_n8 - 1) // r_n8
+                plan["grid"] = (r_n8, b)
+                return plan
+        if (
+            plan["kernel"] == "main"
+            and tpl[5]
+            and (int(tpl[1]) == 1)
+            and (n >= 16384)
+            and ("rt" in plan)
+            and (int(plan["rt"].get("R", 1)) > 1)
+            and (b * int(plan["rt"].get("R", 1)) < 148)
+        ):
+            r_const = int(plan["rt"]["R"])
+            chunk = (n + r_const - 1) // r_const
+            if chunk < int(tpl[0]) * 8 * 3 // 4:
+                plan["vec4"] = True
+                return plan
+        if plan["kernel"] == "main" and (not tpl[5]) and (int(tpl[1]) == 4):
+            blk = int(tpl[0])
+            rolls_full = -(-n // (blk * 4 * 8))
+            rolls_half = -(-n // (blk * 2 * 8))
+            if rolls_full < rolls_half:
+                return plan
+        if plan["kernel"] == "main" and tpl[5] and (int(tpl[1]) == 4) and ("rt" in plan):
+            r_c = int(plan["rt"].get("R", 1))
+            chunk = (n + r_c - 1) // r_c
+            rolls_full_s = -(-chunk // (int(tpl[0]) * 4 * 8))
+            rolls_half_s = -(-chunk // (int(tpl[0]) * 2 * 8))
+            if rolls_full_s < rolls_half_s:
+                return plan
+        plan = _bf16_halve_u(plan)
+        tpl = plan["tpl"]
+        if plan["kernel"] == "main" and tpl[5] and (int(tpl[0]) == 1024) and (int(tpl[1]) < 4):
+            r_const = int(plan["rt"]["R"])
+            r_pow2 = 1 << r_const.bit_length() - 1
+            u_const = int(tpl[1])
+            u_pow2 = min(2 * u_const, 4)
+            chunk_now = (n + r_const - 1) // r_const
+            chunk_pow2 = (n + r_pow2 - 1) // r_pow2
+            rolls_now = (chunk_now + 1024 * u_const * 8 - 1) // (1024 * u_const * 8)
+            rolls_pow2 = (chunk_pow2 + 1024 * u_pow2 * 8 - 1) // (1024 * u_pow2 * 8)
+            if r_pow2 < r_const and b * r_pow2 >= 128 and (rolls_pow2 < rolls_now):
+                plan["tpl"] = (tpl[0], u_pow2) + tuple(tpl[2:])
+                plan["rt"]["R"] = r_pow2
+                plan["rt"]["Q"] = ((n >> 2) + r_pow2 - 1) // r_pow2
+                plan["grid"] = (r_pow2, b)
+    return plan
+
+
+# Dtype-isolated launch caches preserve the original FP32 key and hot lookup.
+# BF16 additionally keys by device because its cold compilation uses that device.
 _VARLEN_CACHE = {}
+_VARLEN_CACHE_BF16: dict[tuple[int, ...], tuple] = {}
+_BF16_COMPILE_LOCK = threading.RLock()
 
 # ---- prefill launcher cache ------------------------------------------------
 # Prefill forces R==1 (route_streaming gives R>1 only for b<=74). The compiled
@@ -818,55 +1115,96 @@ def _varlen_launcher(
     cr: int,
     num_sms: int = 148,
     sm_version: int = 100,
+    *,
+    dtype: torch.dtype = torch.float32,
+    device_index: int | None = None,
 ) -> tuple:
-    """Capture-time varlen plan + compiled launcher.  The gvr_main port is
-    the universally correct fallback; specialist family tiers below.  Every
-    choice here is a function of capture-stable quantities only — mirroring
-    the in-tree runner's pick_tuning(graph_capture=...) discipline."""
+    """Build a capture-stable launcher from the shared dtype kernel templates.
+
+    FP32 keeps its original routes, tuning scalars and cache key. BF16 uses
+    the same family selection and ABI assembly with its packed-load routes,
+    refinement parameters and near-K complement specialization. All choices
+    depend only on the capture-stable geometry and dtype.
+    """
+    if dtype not in (torch.float32, torch.bfloat16):
+        raise RuntimeError(f"decode launcher requires float32 or bfloat16, got {dtype}")
+    bf16 = dtype is torch.bfloat16
     profile = _pack_device_profile(num_sms, sm_version)
-    key = (num_rows, npad, k, n_env, next_n, cr, profile)
-    hit = _VARLEN_CACHE.get(key)
+    if bf16:
+        if device_index is None:
+            raise RuntimeError("BF16 launcher requires a device index")
+        key = (num_rows, npad, k, n_env, next_n, cr, device_index, profile)
+        cache = _VARLEN_CACHE_BF16
+    else:
+        key = (num_rows, npad, k, n_env, next_n, cr, profile)
+        cache = _VARLEN_CACHE
+    hit = cache.get(key)
     if hit is not None:
         return hit
-    # Two envelopes: the kernel gets the PHYSICAL bound (never past the row
-    # stride, so a row whose kv length exceeds the logits width clamps and
-    # takes the short path instead of reading into the next row); the router
-    # gets the k+1 floor it needs to pick a non-degenerate family.
+    # The device envelope never exceeds the physical row stride. The router
+    # needs a k+1 floor to select a family even when every row is short.
     n_kernel = min(n_env, npad)
     n_route = max(n_kernel, k + 1)
     cr_shift = 0 if cr == 1 else 2
     dev = _device()
-    # ---- route() parity, family tier 1: clustered register-resident --------
-    # Admit reg_clus exactly where the free route picks it; its whole
-    # admission window (n4 <= 32768) fits capture-frozen envelopes. The
-    # choice is a pure function of this cache key, so CUDA-graph replay
-    # safety is unchanged; per-row n / short-row handling lives in-kernel.
-    plan_free = route(num_rows, n_route, npad, k, num_sms, sm_version)
+    dtype_options = {"dtype": "bf16"} if bf16 else {}
+    if bf16 and k in (512, 1024, 2048) and 0 < n_kernel - k <= 3:
+        fn = dev.get_compiled_complement(k, n_kernel, next_n, cr_shift, **dtype_options)
+        lc = ("complement", fn, n_kernel)
+        cache[key] = lc
+        return lc
+    route_fn = _route_bf16 if bf16 else route
+    plan_free = route_fn(num_rows, n_route, npad, k, num_sms, sm_version)
     if plan_free["kernel"] == "reg_clus":
+        cluster_options = dict(dtype_options)
+        if bf16:
+            cluster_options["nbh"] = (
+                512 if k > 1024 or (k in (512, 1024) and n_env >= 65536) else 1024
+            )
+            cluster_options["quadc"] = (
+                96 if k > 1024 and num_rows > 1 and plan_free["tpl"][2] >= 8 else 384
+            )
+            if (
+                num_rows == 1
+                and next_n == 1
+                and cr == 1
+                and k == 2048
+                and 65536 <= n_kernel <= 132096
+                and tuple(plan_free["tpl"]) in ((1024, 1, 8), (1024, 2, 8))
+            ):
+                cluster_options["hybrid"] = True
+                cluster_options["oneq_enabled"] = True
         fn = dev.get_compiled__regclus(
             tuple(plan_free["tpl"]),
             varlen=True,
             next_n=next_n,
             cr_shift=cr_shift,
             hint_free=True,
+            **cluster_options,
         )
         lc = ("reg_clus", fn, n_kernel)
-        _VARLEN_CACHE[key] = lc
-        return lc
-    # ---- route() parity, family tier 2: register-resident (+img flavor) ----
-    # Same admission rule as tier 1: exactly where the free route picks
-    # reg/regimg (the whole small/mid-N band across all row counts). CMP/QC/
-    # smem are envelope-derived launch constants -- in-kernel they are pure
-    # capacity clamps (CMP), a fast-path threshold (QC) and the launch smem
-    # size, all safe upper bounds for every per-row n <= envelope; per-row n
-    # / short-row handling lives in-kernel.
-    if plan_free["kernel"] in ("reg", "regimg"):
+    elif plan_free["kernel"] in ("reg", "regimg"):
+        reg_options = dict(dtype_options)
+        if bf16:
+            reg_options["pk16"] = bool(plan_free.get("pk16", False))
+            if k == 2048 and num_rows <= 148 and n_kernel > 2048:
+                reg_options["binproof"] = True
+                if plan_free["kernel"] == "reg" and plan_free["tpl"][4]:
+                    tpl = list(plan_free["tpl"])
+                    old_bins = tpl[7]
+                    if old_bins < 1024:
+                        tpl[7] = 1024
+                        plan_free["tpl"] = tuple(tpl)
+                        plan_free["smem"] += 4 * (1024 - old_bins)
+            if n_kernel <= 2048:
+                reg_options["packed_prefetch"] = False
         fn = dev.get_compiled__reg(
             tuple(plan_free["tpl"]),
             varlen=True,
             next_n=next_n,
             cr_shift=cr_shift,
             hint_free=True,
+            **reg_options,
         )
         rt_f = plan_free["rt"]
         lc = (
@@ -874,16 +1212,7 @@ def _varlen_launcher(
             fn,
             (n_kernel, rt_f["CMP"], rt_f["QC"], dev.STATIC_BYTES + plan_free["smem"]),
         )
-        _VARLEN_CACHE[key] = lc
-        return lc
-    # ---- route() parity, family tier 3: cluster split (clus) ---------------
-    # Same admission rule: exactly where the free route picks clus (the
-    # large-N mid-rows band). SCAP/CMP are launch-stable (pure functions of
-    # rows/CS/k — never of n) so the envelope values are the per-row values;
-    # the sampling-ladder scalars (SMP/TGT/Q/SS2/TGT2) are dead launch slots,
-    # re-derived per row in-kernel by the route_dynamic clus mirror.
-    # Per-row n / short-row handling in-kernel.
-    if plan_free["kernel"] == "clus":
+    elif plan_free["kernel"] == "clus":
         rt_f = plan_free["rt"]
         fn = dev.get_compiled__clus(
             tuple(plan_free["tpl"]),
@@ -893,44 +1222,58 @@ def _varlen_launcher(
             next_n=next_n,
             cr_shift=cr_shift,
             hint_free=True,
+            **dtype_options,
         )
-        lc = (
-            "clus",
-            fn,
-            (n_kernel, npad, k, rt_f["SCAP"], rt_f["CMP"], 0, 0, 0, 0, 0),
+        lc = ("clus", fn, (n_kernel, npad, k, rt_f["SCAP"], rt_f["CMP"], 0, 0, 0, 0, 0))
+    else:
+        streaming_fn = _route_streaming_bf16 if bf16 else route_streaming
+        plan = streaming_fn(num_rows, n_route, npad, k, force_main=True)
+        tpl = tuple(plan["tpl"])
+        rt = plan["rt"]
+        r_const = rt["R"]
+        main_options = dict(dtype_options)
+        if bf16:
+            if plan.get("vec4"):
+                main_options["vector_elems"] = 4
+            else:
+                main_options["v16"] = not tpl[5] and int(tpl[0]) < 512 and npad <= 65536
+                main_options["dense"] = k == 2048
+        # TSHG is dead under varlen; normalize it out of the compile key.
+        fn = dev.get_compiled(
+            tpl[:6] + (False,) + (next_n, cr_shift, r_const),
+            hint_free=True,
+            **main_options,
         )
-        _VARLEN_CACHE[key] = lc
-        return lc
-    plan = route_streaming(num_rows, n_route, npad, k, force_main=True)
-    tpl = tuple(plan["tpl"])  # (BLK, U, MINB, SNB, KPT, SPLIT, TSHG)
-    rt = plan["rt"]
-    r_const = rt["R"]
-    # TSHG (tpl[6]) is dead under varlen (the ctor compiles the TSH
-    # machinery in whenever SPLIT); normalize it out of the compile key so
-    # row counts differing only in that slot share one engine
-    fn = dev.get_compiled(tpl[:6] + (False,) + (next_n, cr_shift, r_const), hint_free=True)
-    big = num_rows * r_const <= 148
-    aim_base = (
-        ((4 * k if k >= 1024 else 2 * k) if r_const == 1 else 2 * k)
-        if big
-        else ((11 * k) // 8 if k >= 1024 else (3 * k) // 2)
-    )
-    sfac = (
-        (32 if r_const == 2 else (48 if k > 1024 else 16))
-        if r_const > 1
-        else (64 if k >= 1024 else 32)
-    )
-    amin = 3 * k if r_const == 2 else (7 * k) // 2
-    sd_en = 1 if (k > 1024 and not big) else 0
-    # TSH-floor staging: gate on SPLIT and K only. Gating additionally on
-    # num_rows > 15 would strand small batches in SPLIT-main without the
-    # staged floor (a distribution-dependent tail regression); the kernel
-    # gates TSH per row at runtime anyway.
-    tsh_en = 1 if (tpl[5] and k <= 1024) else 0
-    pre = (0, npad, k, rt["SCAP_"], rt["CMP_"], r_const, 0, 0, 0, 0, 0)
-    tail = (aim_base, sfac, amin, sd_en, tsh_en)
-    lc = ("main", fn, pre, tail)
-    _VARLEN_CACHE[key] = lc
+        big = num_rows * r_const <= 148
+        if bf16:
+            if r_const > 2 and k > 1024:
+                split_aim = 13 * k // 8 if num_rows > 8 else 7 * k // 4
+                split_sfac = 48
+            else:
+                split_aim = 2 * k if k > 1024 or r_const == 2 else 7 * k // 2
+                split_sfac = 32 if r_const == 2 else 48 if k > 1024 else 16
+            unsplit_aim = 3 * k // 2 if k >= 1024 and (k == 1024 or n_env >= 131072) else 2 * k
+            amin = 3 * k if r_const == 2 else split_aim
+            tsh_en = 1 if tpl[5] else 0
+        else:
+            split_aim = 2 * k
+            split_sfac = 32 if r_const == 2 else 48 if k > 1024 else 16
+            unsplit_aim = 4 * k if k >= 1024 else 2 * k
+            amin = 3 * k if r_const == 2 else 7 * k // 2
+            tsh_en = 1 if tpl[5] and k <= 1024 else 0
+        aim_base = (
+            (unsplit_aim if r_const == 1 else split_aim)
+            if big
+            else 11 * k // 8
+            if k >= 1024
+            else 3 * k // 2
+        )
+        sfac = split_sfac if r_const > 1 else 64 if k >= 1024 else 32
+        sd_en = 1 if k > 1024 and not big else 0
+        pre = (0, npad, k, rt["SCAP_"], rt["CMP_"], r_const, 0, 0, 0, 0, 0)
+        tail = (aim_base, sfac, amin, sd_en, tsh_en)
+        lc = ("main", fn, pre, tail)
+    cache[key] = lc
     return lc
 
 
@@ -1466,6 +1809,10 @@ def run_varlen(
     host reads.  Without ``max_seq_len`` the envelope comes from ONE
     ``kv_lens.max()`` host read (documented sync, refused under capture).
 
+    Both dtypes use the shared kernel templates with dtype-specific tuning. BF16 logits
+    require a row stride divisible by eight and a 16-byte aligned base; optional
+    values remain FP32. Input conversion, if needed, belongs to the caller.
+
     KNOWN LIMITATION: on rows containing NaN logits the selected index SET
     can differ from ``heuristicTopKDecode.cu`` (both kernels order NaNs
     implementation-specifically). Finite inputs — including +/-inf and
@@ -1477,10 +1824,18 @@ def run_varlen(
     function of the capture-stable launcher key.
     """
     if logits.dtype is not torch.float32:
-        raise RuntimeError(
-            f"logits must be float32 (got {logits.dtype}); bf16/fp16 paths "
-            "are a follow-up — see the PR roadmap"
-        )
+        if logits.dtype is torch.bfloat16:
+            return _run_varlen_bf16(
+                logits,
+                kv_lens,
+                indices,
+                next_n=next_n,
+                compress_ratio=compress_ratio,
+                values=values,
+                max_seq_len=max_seq_len,
+                workspace=workspace,
+            )
+        raise RuntimeError(f"logits must be float32 or bfloat16 (got {logits.dtype})")
     if not (isinstance(kv_lens, _TENSOR) and kv_lens.is_cuda):
         raise RuntimeError("kv_lens must be a CUDA tensor")
     if kv_lens.dtype is not _I32:
@@ -1606,6 +1961,159 @@ def run_varlen(
     elif lc[0] == "clus":
         # compiled ABI: (logits, pre_idx, kv_lens, out, n_env, npad, k,
         #                SCAP, CMP, dead DYN x5)
+        lc[1](lg, pre_arg, kv_lens, idx, *lc[2])
+    else:
+        _, fn, pre, tail = lc
+        fn(lg, pre_arg, idx, ws, *pre, kv_lens, *tail)
+    if vals is not None:
+        idx64 = idx.to(torch.int64)
+        vals.copy_(lg.gather(1, idx64.clamp_min(0)))
+        vals.masked_fill_(idx < 0, torch.finfo(_F32).min)
+    return
+
+
+def _run_varlen_bf16(
+    logits: torch.Tensor,
+    kv_lens: torch.Tensor,
+    indices: torch.Tensor,
+    next_n: int = 1,
+    compress_ratio: int = 1,
+    values: torch.Tensor | None = None,
+    max_seq_len: int | None = None,
+    workspace: torch.Tensor | None = None,
+) -> None:
+    """BF16 entry specialization preserving the FP32 hot path in ``run_varlen``.
+
+    Same per-row varlen contract;
+    bfloat16 logits read directly by the device code and widened only in
+    registers. Optional values are CUDA float32, with the same flattened
+    output view and -FLT_MAX padding as FP32 decode. Supplying
+    max_seq_len avoids device-to-host reads; use the exact uncompressed
+    envelope, not the padded storage width, to preserve dispatch."""
+    if logits.dtype is not torch.bfloat16:
+        raise RuntimeError(f"logits must be bfloat16 (got {logits.dtype}); fp32 -> run_varlen")
+    if not (isinstance(kv_lens, _TENSOR) and kv_lens.is_cuda):
+        raise RuntimeError("kv_lens must be a CUDA tensor")
+    if kv_lens.dtype is not _I32:
+        raise RuntimeError("kv_lens must be int32")
+    if kv_lens.dim() != 1:
+        raise RuntimeError("kv_lens must be 1-D")
+    nn = _index(next_n)
+    cr = _index(compress_ratio)
+    if nn < 1:
+        raise RuntimeError(f"next_n must be >= 1, got {nn}")
+    if cr not in (1, 4):
+        raise RuntimeError(f"compress_ratio must be 1 (DSv3.2) or 4 (DSv4), got {cr}")
+    if len(logits.shape) != 2:
+        raise RuntimeError("logits must be 2-D")
+    num_rows = logits.shape[0]
+    if num_rows == 0:
+        return
+    if not logits.is_cuda:
+        raise RuntimeError("logits must be CUDA")
+    if num_rows % nn:
+        raise RuntimeError(f"num_rows {num_rows} not divisible by next_n {nn}")
+    batch = num_rows // nn
+    if kv_lens.shape[0] != batch:
+        raise RuntimeError(f"kv_lens length {kv_lens.shape[0]} != num_rows/next_n = {batch}")
+    if kv_lens.device != logits.device or indices.device != logits.device:
+        raise RuntimeError("logits, kv_lens and indices must be on the same CUDA device")
+    if values is not None and values.device != logits.device:
+        raise RuntimeError("values must be on the same CUDA device as logits")
+    d = logits.get_device()
+    if not 0 <= d < _GVR_MAX_DEV:
+        raise RuntimeError(f"device index out of range: {d}")
+    if workspace is not None:
+        validate_run_ws(workspace, logits)
+        ws = kernel_view(workspace)
+    else:
+        ws = _ws_hot.get(d)
+        if ws is None:
+            ws = default_workspace(logits)
+    if not (logits.is_cuda and indices.is_cuda):
+        raise RuntimeError("all tensors must be CUDA")
+    if indices.dtype is not _I32:
+        raise RuntimeError("indices must be int32")
+    if len(indices.shape) != 2 or indices.shape[0] != num_rows:
+        raise RuntimeError(
+            f"indices must be [num_rows={num_rows}, >=k], got {tuple(indices.shape)}"
+        )
+    k = indices.shape[1]
+    if not (indices.is_contiguous() and kv_lens.is_contiguous()):
+        raise RuntimeError("indices/kv_lens must be contiguous")
+    if logits.stride(1) != 1:
+        raise RuntimeError("logits inner stride must be 1")
+    npad = logits.stride(0) if num_rows > 1 else logits.shape[1]
+    lg = logits
+    if not logits.is_contiguous():
+        need = logits.storage_offset() + num_rows * npad
+        if logits.untyped_storage().size() // 2 < need:
+            raise RuntimeError("logits view storage too small to widen to its row stride")
+        lg = logits.as_strided((num_rows, npad), (npad, 1), logits.storage_offset())
+    if npad & 7:
+        raise RuntimeError(f"npad (logits row stride) must be a multiple of 8, got {npad}")
+    if lg.data_ptr() & 15:
+        raise RuntimeError("logits base must be 16-byte aligned")
+    if values is not None:
+        if not values.is_cuda or values.dtype is not _F32:
+            raise RuntimeError("values must be CUDA float32")
+        if (
+            len(values.shape) != 2
+            or values.shape[0] != num_rows
+            or values.shape[1] < k
+            or (not values.is_contiguous())
+        ):
+            raise RuntimeError(
+                f"values must be contiguous [num_rows={num_rows}, >=k], got {tuple(values.shape)}"
+            )
+    cshift = 0 if cr == 1 else 2
+    if max_seq_len is not None:
+        n_env = int(max_seq_len) >> cshift
+    else:
+        if _is_capturing():
+            raise RuntimeError(
+                "run_varlen_bf16 without max_seq_len reads kv_lens.max() on host; "
+                "pass max_seq_len (a capture-stable engine constant)"
+            )
+        n_env = int(kv_lens.max().item()) >> cshift
+        n_env = 1 << max(n_env - 1, 1).bit_length()
+    n_env = min(max(n_env, 1), npad)
+    profile = _device_profile_key(d)
+    key = (num_rows, npad, k, n_env, nn, cr, d, profile)
+    lc = _VARLEN_CACHE_BF16.get(key)
+    if lc is None:
+        if _is_capturing():
+            raise RuntimeError(
+                "varlen launcher not compiled for this shape — warm up before CUDA graph capture"
+            )
+        # Serialize cold compilation across BF16 families. Shared-memory layouts
+        # are instance constants; warmed launches never take the lock.
+        with _BF16_COMPILE_LOCK, torch.cuda.device(d):
+            num_sms, sm_version = _unpack_device_profile(profile)
+            lc = _varlen_launcher(
+                num_rows,
+                npad,
+                k,
+                n_env,
+                nn,
+                cr,
+                num_sms,
+                sm_version,
+                dtype=torch.bfloat16,
+                device_index=d,
+            )
+    idx = indices
+    if idx.shape[1] != k:
+        idx = idx.reshape(-1)[: num_rows * k].view(num_rows, k)
+    vals = values
+    if vals is not None and vals.shape[1] != k:
+        vals = vals.reshape(-1)[: num_rows * k].view(num_rows, k)
+    pre_arg = idx
+    if lc[0] in ("reg_clus", "complement"):
+        lc[1](lg, pre_arg, kv_lens, idx, lc[2])
+    elif lc[0] == "reg":
+        lc[1](lg, pre_arg, kv_lens, idx, *lc[2])
+    elif lc[0] == "clus":
         lc[1](lg, pre_arg, kv_lens, idx, *lc[2])
     else:
         _, fn, pre, tail = lc
@@ -1764,6 +2272,7 @@ __all__ = [
 # CUDA-graph capture warmup naturally compiles the captured batch sizes;
 # this covers the eager/first-touch path (num_rows defaults to (1,)).
 _VARLEN_WARMUP_DONE: set = set()
+_VARLEN_WARMUP_DONE_BF16: set = set()
 _VARLEN_WARMUP_LOCK = threading.Lock()
 
 
@@ -1774,6 +2283,8 @@ def warmup_varlen(
     next_n: int = 1,
     num_rows_list: Sequence[int] = (1,),
     row_stride: int | None = None,
+    *,
+    dtype: torch.dtype = torch.float32,
 ) -> None:
     """TESTING/INIT ONLY — compile the varlen engine's envelope tuples.
 
@@ -1791,85 +2302,114 @@ def warmup_varlen(
     the same way.
 
     """
+    if dtype not in (torch.float32, torch.bfloat16):
+        raise RuntimeError(f"decode warmup requires float32 or bfloat16, got {dtype}")
+    bf16 = dtype is torch.bfloat16
     dev = torch.cuda.current_device()
     profile = _device_profile_key(dev)
     num_sms, sm_version = _unpack_device_profile(profile)
-    nn = max(1, int(next_n))
-    # round each request down to a next_n multiple (min next_n) and dedup
-    req_rows = sorted({max(int(r) - int(r) % nn, nn) for r in num_rows_list})
-    if not req_rows:
-        return
-    # BAND-AWARE enumeration: the engine compile key depends on the plan's
-    # constexpr tuple (+ r_const family axis), NOT on the exact row count, so
-    # warming ONE representative row per distinct engine key covers every row
-    # count up to the largest request. Representatives are the first row of
-    # each band, which keeps the warmup allocation bounded (~a few hundred
-    # rows) even when CUDA-graph batch lists reach thousands of rows.
-    n_env_c = max(1, int(max_seq_len) // int(compress_ratio))
-    npad_c = (n_env_c + 63) // 64 * 64 if row_stride is None else int(row_stride)
-    seen_keys = set()
-    rows_list = []
-    r = nn
-    r_max = req_rows[-1]
-    while r <= r_max:
-        plan_free = route(
-            r,
-            max(min(n_env_c, npad_c), int(top_k) + 1),
-            npad_c,
-            int(top_k),
-            num_sms,
-            sm_version,
-        )
-        if plan_free["kernel"] == "reg_clus":
-            ekey = ("reg_clus", tuple(plan_free["tpl"]))
-        elif plan_free["kernel"] in ("reg", "regimg"):
-            ekey = ("reg", tuple(plan_free["tpl"]))
-        else:
-            p = route_streaming(
+    if bf16:
+        k = operator.index(top_k)
+        nn = operator.index(next_n)
+        cr = operator.index(compress_ratio)
+        envelope = operator.index(max_seq_len)
+        if nn < 1 or cr not in (1, 4):
+            raise RuntimeError("next_n must be positive and compress_ratio must be 1 or 4")
+        if k < 1 or envelope < 0:
+            raise RuntimeError("top_k must be positive and max_seq_len must be nonnegative")
+        req_rows = sorted({max(operator.index(r) // nn * nn, nn) for r in num_rows_list})
+        if not req_rows:
+            return
+        n_env = max(envelope // cr, 1)
+        npad = (n_env + 63) // 64 * 64 if row_stride is None else operator.index(row_stride)
+        if npad < n_env or npad % 8:
+            raise RuntimeError(f"row_stride must be a multiple of 8 >= {n_env}, got {npad}")
+        rows_list = []
+        warmup_keys = []
+        with _VARLEN_WARMUP_LOCK:
+            for rows in req_rows:
+                key = (rows, npad, k, n_env, nn, cr, dev, profile)
+                if key in _VARLEN_WARMUP_DONE_BF16 and key in _VARLEN_CACHE_BF16 and dev in _ws_hot:
+                    continue
+                rows_list.append(rows)
+                warmup_keys.append(key)
+        bands_done = not rows_list
+    else:
+        nn = max(1, int(next_n))
+        # round each request down to a next_n multiple (min next_n) and dedup
+        req_rows = sorted({max(int(r) - int(r) % nn, nn) for r in num_rows_list})
+        if not req_rows:
+            return
+        # BAND-AWARE enumeration: the engine compile key depends on the plan's
+        # constexpr tuple (+ r_const family axis), NOT on the exact row count, so
+        # warming ONE representative row per distinct engine key covers every row
+        # count up to the largest request. Representatives are the first row of
+        # each band, which keeps the warmup allocation bounded (~a few hundred
+        # rows) even when CUDA-graph batch lists reach thousands of rows.
+        n_env_c = max(1, int(max_seq_len) // int(compress_ratio))
+        npad_c = (n_env_c + 63) // 64 * 64 if row_stride is None else int(row_stride)
+        seen_keys = set()
+        rows_list = []
+        r = nn
+        r_max = req_rows[-1]
+        while r <= r_max:
+            plan_free = route(
                 r,
                 max(min(n_env_c, npad_c), int(top_k) + 1),
                 npad_c,
                 int(top_k),
-                force_main=True,
+                num_sms,
+                sm_version,
             )
-            ekey = ("main", tuple(p["tpl"][:6]), p["rt"]["R"])
-        if ekey not in seen_keys:
-            seen_keys.add(ekey)
-            rows_list.append(r)
-        r += nn
-    if not rows_list:
-        return
-    n_env = max(1, int(max_seq_len) // int(compress_ratio))
-    if row_stride is None:
-        npad = (n_env + 63) // 64 * 64
-    else:
-        npad = int(row_stride)
-        if npad < n_env or npad % 4:
-            raise RuntimeError(
-                f"row_stride must be a float4-multiple >= n_env={n_env}, got {row_stride}"
-            )
-    key = (
-        dev,
-        int(top_k),
-        int(max_seq_len),
-        int(compress_ratio),
-        nn,
-        tuple(rows_list),
-        npad,
-        profile,
-    )
-    # The done key covers the GPU band launches only (one per engine compile
-    # key). The exact-row launcher population below is keyed by the requested
-    # row counts, which the band key does not see, so it always runs: a later
-    # call with a new row count inside an already-warmed band must still
-    # create that row count's entry, or capture at it raises not-compiled.
-    with _VARLEN_WARMUP_LOCK:
-        bands_done = key in _VARLEN_WARMUP_DONE
+            if plan_free["kernel"] == "reg_clus":
+                ekey = ("reg_clus", tuple(plan_free["tpl"]))
+            elif plan_free["kernel"] in ("reg", "regimg"):
+                ekey = ("reg", tuple(plan_free["tpl"]))
+            else:
+                p = route_streaming(
+                    r,
+                    max(min(n_env_c, npad_c), int(top_k) + 1),
+                    npad_c,
+                    int(top_k),
+                    force_main=True,
+                )
+                ekey = ("main", tuple(p["tpl"][:6]), p["rt"]["R"])
+            if ekey not in seen_keys:
+                seen_keys.add(ekey)
+                rows_list.append(r)
+            r += nn
+        if not rows_list:
+            return
+        n_env = max(1, int(max_seq_len) // int(compress_ratio))
+        if row_stride is None:
+            npad = (n_env + 63) // 64 * 64
+        else:
+            npad = int(row_stride)
+            if npad < n_env or npad % 4:
+                raise RuntimeError(
+                    f"row_stride must be a float4-multiple >= n_env={n_env}, got {row_stride}"
+                )
+        key = (
+            dev,
+            int(top_k),
+            int(max_seq_len),
+            int(compress_ratio),
+            nn,
+            tuple(rows_list),
+            npad,
+            profile,
+        )
+        # The done key covers the GPU band launches only (one per engine compile
+        # key). The exact-row launcher population below is keyed by the requested
+        # row counts, which the band key does not see, so it always runs: a later
+        # call with a new row count inside an already-warmed band must still
+        # create that row count's entry, or capture at it raises not-compiled.
+        with _VARLEN_WARMUP_LOCK:
+            bands_done = key in _VARLEN_WARMUP_DONE
     if not bands_done:
         rows_max = rows_list[-1]
-        # one allocation at the largest geometry; smaller row counts run on
-        # contiguous prefix views (compile keys depend on shapes only)
-        logits = torch.zeros((rows_max, npad), dtype=torch.float32, device=dev)
+        # Both dtypes share one arena; shorter geometries use contiguous views.
+        logits = torch.zeros((rows_max, npad), dtype=dtype, device=dev)
         kv_lens = torch.full((rows_max // nn,), int(max_seq_len), dtype=torch.int32, device=dev)
         out = torch.empty((rows_max, int(top_k)), dtype=torch.int32, device=dev)
         for rows in rows_list:
@@ -1884,10 +2424,12 @@ def warmup_varlen(
             )
         del logits, kv_lens, out
         torch.cuda.synchronize()
-    # band launches compiled every ENGINE; now populate the per-row-count
-    # LAUNCHER cache entries for the exact requested row counts (pure host
-    # work, zero allocation/launch — engines hit the compile cache), so a
-    # CUDA-graph capture at any requested geometry finds its key immediately.
+    if bf16:
+        with _VARLEN_WARMUP_LOCK:
+            _VARLEN_WARMUP_DONE_BF16.update(warmup_keys)
+        return
+    # Band launches compile every FP32 engine. Populate exact requested rows
+    # without additional launches so subsequent capture finds each cache key.
     n_env_l = min(max(int(max_seq_len) >> (0 if int(compress_ratio) == 1 else 2), 1), npad)
     for r in req_rows:
         _varlen_launcher(
