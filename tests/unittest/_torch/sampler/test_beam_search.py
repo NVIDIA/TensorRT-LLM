@@ -2352,8 +2352,9 @@ def test_assemble_final_beams_matches_reference(seed, with_log_probs):
     """The vectorized final-beam assembly reproduces the per-beam loop.
 
     Random pools mix finished entries of varying length, unused (-inf) pool
-    slots and live beams, including the under-filled case where fewer finite
-    candidates exist than output beams so some rows must stay padded.
+    slots and live beams (some harvested to -inf), including the under-filled
+    case where fewer finite candidates exist than output beams so some rows
+    must stay padded.
     """
     gen = torch.Generator().manual_seed(seed)
     pool_width = int(torch.randint(1, 6, (1, ), generator=gen))
@@ -2373,6 +2374,7 @@ def test_assemble_final_beams_matches_reference(seed, with_log_probs):
     active_path = torch.randint(0, 1000, (active_width, num_generated),
                                 generator=gen).to(torch.int32)
     active_cum = torch.randn(active_width, generator=gen)
+    active_cum[torch.rand(active_width, generator=gen) < 0.5] = float("-inf")
     all_normed = torch.cat([cba_normed, active_cum])
     order = torch.argsort(all_normed, descending=True)[:num_beams]
     width = max(num_generated, int(cba_lengths.max().item()))
