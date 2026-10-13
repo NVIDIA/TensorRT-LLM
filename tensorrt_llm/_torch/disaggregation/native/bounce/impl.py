@@ -170,8 +170,13 @@ class VmmBounceTransport(BounceTransport):
         for d in self._reg_descs:
             self._agent.register_memory(d)
 
-        self._send_stream = self._new_stream()
-        self._send_stream_lock = threading.Lock()
+        # One gather stream per sender thread, created on first use. The gather host-waits for its
+        # piece's pages_ready_event, so a stream shared across threads (under a lock) would hold
+        # every other thread's gather behind one request's wait; per-thread streams let the
+        # transceiver's sender threads wait independently (TRTLLM_KV_TRANSFER_NUM_THREADS).
+        self._send_streams = threading.local()
+        self._send_streams_all: list = []
+        self._send_streams_lock = threading.Lock()
 
         self._init_recv_state()
         self._start_scatter_worker(name)
@@ -198,6 +203,21 @@ class VmmBounceTransport(BounceTransport):
         )
         self._scatter_thread.start()
 
+    @property
+    def _send_stream(self):
+        """The calling sender thread's gather stream."""
+        stream = getattr(self._send_streams, "stream", None)
+        if stream is None:
+            stream = self._new_stream()
+            self._send_streams.stream = stream
+            with self._send_streams_lock:
+                self._send_streams_all.append(stream)
+        return stream
+
+    @_send_stream.setter
+    def _send_stream(self, stream) -> None:
+        self._send_streams.stream = stream
+
     def _new_stream(self):
         # Non-blocking: a plain cudaStreamCreate() stream synchronises with the legacy default
         # stream, and the executor keeps that stream ordered behind its execution stream, so a copy
@@ -209,23 +229,22 @@ class VmmBounceTransport(BounceTransport):
     def _gather_blocking(
         self, src_addr: int, write_meta, total: int, pages_ready_event=None
     ) -> None:
-        """Gather the scattered fragments into the send region and block until done. The whole gather
-        runs under the stream lock so a second sender thread can't overwrite the shared staging buffer
-        mid-copy and corrupt this region; only the fast gather serializes, the writes stay parallel.
-        The copy is ordered after ``pages_ready_event``, the executor's mark that the source pages
-        hold their final content, instead of after everything the engine had in flight."""
+        """Gather the scattered fragments into the send region and block until done. Each sender
+        thread gathers on its own stream with its own staging buffers (gather_scatter keys them by
+        stream), so no lock is needed and a thread waiting for its piece's pages does not hold up
+        the others. The copy is ordered after ``pages_ready_event``, the executor's mark that the
+        source pages hold their final content, instead of after everything the engine had in
+        flight."""
         plan = Plan(write_meta.src_ptrs, write_meta.dst_ptrs, write_meta.sizes, total)
-        with self._send_stream_lock:
-            _stream_wait_event(self._send_stream, pages_ready_event)
-            gather_contiguous(
-                src_addr, plan.src_ptrs, plan.sizes, plan.offsets, stream=self._send_stream
-            )
-            event = CUASSERT(cudart.cudaEventCreate())[0]
-            try:
-                CUASSERT(cudart.cudaEventRecord(event, self._send_stream))
-                CUASSERT(cudart.cudaEventSynchronize(event))
-            finally:
-                CUASSERT(cudart.cudaEventDestroy(event))
+        stream = self._send_stream
+        _stream_wait_event(stream, pages_ready_event)
+        gather_contiguous(src_addr, plan.src_ptrs, plan.sizes, plan.offsets, stream=stream)
+        event = CUASSERT(cudart.cudaEventCreate())[0]
+        try:
+            CUASSERT(cudart.cudaEventRecord(event, stream))
+            CUASSERT(cudart.cudaEventSynchronize(event))
+        finally:
+            CUASSERT(cudart.cudaEventDestroy(event))
 
     def _make_write(self, src_addr: int, write_meta, total: int):
         # one coalesced descriptor spanning the whole region

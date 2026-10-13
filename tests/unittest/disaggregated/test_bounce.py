@@ -1219,6 +1219,25 @@ class TestCopyStreamOrdering:
         assert btr.VmmBounceTransport._new_stream(SimpleNamespace()) == 42
         assert flags == [btr.cudart.cudaStreamNonBlocking]
 
+    def test_each_sender_thread_gets_its_own_gather_stream(self, monkeypatch):
+        t = _make_transport(monkeypatch, block_bytes_per_group=[100])
+        counter = iter(range(100, 200))
+        monkeypatch.setattr(btr.VmmBounceTransport, "_new_stream", lambda self: next(counter))
+        seen = {}
+
+        def grab(name):
+            seen[name] = (t._send_stream, t._send_stream)  # second access reuses the first
+
+        workers = [threading.Thread(target=grab, args=(i,)) for i in range(3)]
+        for w in workers:
+            w.start()
+        for w in workers:
+            w.join()
+        assert all(a == b for a, b in seen.values())
+        assert len({a for a, _ in seen.values()}) == 3  # one stream per thread
+        assert sorted(t._send_streams_all) == sorted(a for a, _ in seen.values())
+        assert t._send_stream not in {a for a, _ in seen.values()}  # this thread gets its own
+
     def test_event_handle_accepts_torch_events_and_raw_handles(self):
         assert btr._event_handle(None) is None
         assert btr._event_handle(SimpleNamespace(cuda_event=0)) is None  # never recorded
