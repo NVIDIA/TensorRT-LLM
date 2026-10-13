@@ -113,9 +113,24 @@ def _license_docs_to_entries(docs: list, scan_type: str, license_info: dict | No
     return entries
 
 
+def _vuln_docs_to_entries(docs, scan_type):
+    return [
+        {
+            "scan_type": scan_type,
+            "package_name": doc.get("s_package_name") or "unknown",
+            "package_version": doc.get("s_package_version") or "N/A",
+            "severity": doc.get("s_severity") or "Unknown",
+            "cve": doc.get("s_cve") or "N/A",
+            "fix_version": doc.get("s_package_fix_version") or "N/A",
+        }
+        for doc in docs
+    ]
+
+
 def process_result():
     RISKY_DEPENDENCIES = []
     detected_licenses = []
+    detected_vulnerabilities = []
     preapproved_candidates = []
 
     if not args.skip_source_code:
@@ -123,6 +138,7 @@ def process_result():
             os.path.join(args.report_directory, "source_code/vulns.json"),
             **SUBMIT_KWARG,
         )
+        detected_vulnerabilities.extend(_vuln_docs_to_entries(source_vulns, "source_code"))
         if args.scan_mode != "release" and len(source_vulns) > 0:
             RISKY_DEPENDENCIES.append(f"{len(source_vulns)} new source code vulnerability")
 
@@ -163,6 +179,12 @@ def process_result():
             os.path.join(args.report_directory, "base_arm64/vulns.json"),
             "arm64",
             **SUBMIT_KWARG,
+        )
+        detected_vulnerabilities.extend(
+            _vuln_docs_to_entries(amd64_container_vulns, "container_amd64")
+        )
+        detected_vulnerabilities.extend(
+            _vuln_docs_to_entries(arm64_container_vulns, "container_arm64")
         )
         count_container_vulns = len(amd64_container_vulns) + len(arm64_container_vulns)
         if args.scan_mode != "release" and count_container_vulns > 0:
@@ -211,6 +233,7 @@ def process_result():
             "detail": detail,
             "risks": RISKY_DEPENDENCIES,
             "detected_licenses": detected_licenses,
+            "detected_vulnerabilities": detected_vulnerabilities,
             "dashboard_url": get_dashboard_url(args.build_number, args.ref),
         }
         if args.scan_mode == "release" and detected_licenses:

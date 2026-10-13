@@ -603,6 +603,29 @@ def processScanResults(ref) {
                             currentBuild.description = "⚠️ Non-permissive licenses detected — click 'Console Output' to review"
                         }
                     }
+                    if (result.detected_vulnerabilities && params.scanMode == "monitor") {
+                        def vulnCols = [
+                            [title: 'SCAN TYPE',       key: 'scan_type'],
+                            [title: 'PACKAGE NAME',    key: 'package_name'],
+                            [title: 'PACKAGE VERSION', key: 'package_version'],
+                            [title: 'SEVERITY',        key: 'severity'],
+                            [title: 'CVE',             key: 'cve'],
+                            [title: 'FIX VERSION',     key: 'fix_version'],
+                        ]
+                        def vulnWidths = vulnCols.collect { col ->
+                            Math.max(col.title.length(),
+                                     (result.detected_vulnerabilities.collect { it[col.key].toString().length() }.max() ?: 0))
+                        }
+                        def vulnSep = "+" + vulnWidths.collect { '-' * (it + 2) }.join('+') + "+"
+                        def vulnRows = [vulnSep,
+                                        "| " + vulnCols.indices.collect { vulnCols[it].title.padRight(vulnWidths[it]) }.join(' | ') + " |",
+                                        vulnSep]
+                        result.detected_vulnerabilities.each { entry ->
+                            vulnRows << "| " + vulnCols.indices.collect { entry[vulnCols[it].key].toString().padRight(vulnWidths[it]) }.join(' | ') + " |"
+                        }
+                        vulnRows << vulnSep
+                        echo "New vulnerabilities detected:\n${vulnRows.join('\n')}"
+                    }
                     if (result.dashboard_url) {
                         echo "Dashboard: ${result.dashboard_url}"
                     }
