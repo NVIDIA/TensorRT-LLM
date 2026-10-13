@@ -1703,7 +1703,15 @@ class ResponsesRequest(OpenAIBaseModel):
         return value
 
     def relayed_prompt_token_ids(self) -> Optional[List[int]]:
-        """The prompt the orchestrator relayed from the context worker, if any."""
+        """The prompt the orchestrator relayed from the context worker, if any.
+
+        Only a generation-only handoff carries one. On any other request the
+        fields are ignored, so the prompt is rendered from the request and the
+        response echoes what was actually prefilled.
+        """
+        params = self.disaggregated_params
+        if params is None or params.request_type != "generation_only":
+            return None
         if self.prompt_token_ids is not None:
             return self.prompt_token_ids
         if not self.prompt_token_ids_b64:
@@ -1863,6 +1871,13 @@ StreamingResponsesResponse: TypeAlias = Union[
     ResponseCodeInterpreterCallCompletedEvent,
 ]
 
+_RESPONSES_HANDOFF_FIELDS = (
+    "disaggregated_params",
+    "prompt_token_ids",
+    "prompt_token_ids_b64",
+    "finish_reason",
+)
+
 
 class ResponsesResponse(OpenAIBaseModel):
     id: str = Field(default_factory=lambda: f"resp_{str(uuid.uuid4().hex)}")
@@ -1901,6 +1916,17 @@ class ResponsesResponse(OpenAIBaseModel):
     prompt_token_ids: Optional[List[int]] = None
     prompt_token_ids_b64: Optional[str] = None
     finish_reason: Optional[str] = None
+
+    @model_serializer(mode="wrap")
+    def _omit_absent_handoff(self, handler: Any) -> Any:
+        # The handoff fields are unset on every response a client sees, so they
+        # are left out rather than serialized as null in each body and event.
+        data = handler(self)
+        if isinstance(data, dict):
+            for key in _RESPONSES_HANDOFF_FIELDS:
+                if data.get(key, ...) is None:
+                    data.pop(key)
+        return data
 
     @classmethod
     def from_request(

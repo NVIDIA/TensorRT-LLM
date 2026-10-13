@@ -28,6 +28,7 @@ import aiohttp
 import numpy as np
 import pytest
 from fastapi import HTTPException
+from openai.types.responses import ResponseCreatedEvent
 from pydantic import ValidationError
 
 from tensorrt_llm.serve.openai_disagg_server import OpenAIDisaggServer
@@ -134,6 +135,41 @@ def test_a_finished_context_response_goes_to_the_client_without_the_handoff(
         assert handoff == (None, None, None, None)
 
 
+_HANDOFF_KEYS = {
+    "disaggregated_params",
+    "prompt_token_ids",
+    "prompt_token_ids_b64",
+    "finish_reason",
+}
+
+
+def test_a_response_without_the_handoff_serializes_without_its_keys():
+    """Bodies, stream events and stored copies carry no null handoff keys."""
+    response = _responses_response(finish_reason="stop")
+    _service()._need_gen(response)  # a finished context response drops the handoff
+
+    assert not _HANDOFF_KEYS & response.model_dump(by_alias=True).keys()
+    assert not _HANDOFF_KEYS & json.loads(response.model_dump_json(by_alias=True)).keys()
+    # The stream wraps a dump of the response, as get_initial_responses does.
+    created = ResponseCreatedEvent(
+        type="response.created", sequence_number=0, response=response.model_dump(by_alias=True)
+    )
+    assert not _HANDOFF_KEYS & json.loads(created.model_dump_json(by_alias=True))["response"].keys()
+
+    async def frames():
+        return [frame async for frame in responses_done_generator(response)]
+
+    for frame in asyncio.run(frames()):
+        event = json.loads(frame.decode().split("data: ", 1)[1])
+        assert not _HANDOFF_KEYS & event["response"].keys()
+
+
+def test_a_context_response_still_carries_its_handoff():
+    body = _responses_response(finish_reason="length").model_dump(by_alias=True)
+    assert _HANDOFF_KEYS <= body.keys()
+    assert ResponsesResponse(**body).disaggregated_params.ctx_request_id == 7
+
+
 @pytest.mark.parametrize(
     "finish_reason, status",
     [("not_finished", "incomplete"), ("length", "incomplete"), ("stop", "completed")],
@@ -163,9 +199,26 @@ def test_an_unknown_finish_reason_names_itself():
     ],
 )
 def test_the_generation_worker_uses_the_relayed_prompt(fields, expected):
-    request = ResponsesRequest(model="m", input="hi", **fields)
+    request = ResponsesRequest(
+        model="m",
+        input="hi",
+        disaggregated_params=DisaggregatedParams(request_type="generation_only"),
+        **fields,
+    )
     assert request.relayed_prompt_token_ids() == expected
     assert request.prompt_token_ids == fields.get("prompt_token_ids")
+
+
+@pytest.mark.parametrize("request_type", [None, "context_only", "context_and_generation"])
+@pytest.mark.parametrize("field", ["prompt_token_ids", "prompt_token_ids_b64"])
+def test_prompt_ids_outside_a_generation_handoff_are_ignored(request_type, field):
+    """A request that is not a generation-only handoff renders its own prompt."""
+    value = [1, 2, 3]
+    if field == "prompt_token_ids_b64":
+        value = base64.b64encode(np.asarray(value, dtype=np.int32).tobytes()).decode("ascii")
+    params = None if request_type is None else DisaggregatedParams(request_type=request_type)
+    request = ResponsesRequest(model="m", input="hi", disaggregated_params=params, **{field: value})
+    assert request.relayed_prompt_token_ids() is None
 
 
 @pytest.mark.parametrize(
@@ -309,9 +362,9 @@ def test_a_context_worker_with_postprocessing_workers_returns_the_prompt(monkeyp
 
     if as_b64:
         ids = np.frombuffer(base64.b64decode(body["prompt_token_ids_b64"]), dtype=np.int32)
-        assert (ids.tolist(), body["prompt_token_ids"]) == ([5, 6, 7], None)
+        assert (ids.tolist(), "prompt_token_ids" in body) == ([5, 6, 7], False)
     else:
-        assert (body["prompt_token_ids"], body["prompt_token_ids_b64"]) == ([5, 6, 7], None)
+        assert (body["prompt_token_ids"], "prompt_token_ids_b64" in body) == ([5, 6, 7], False)
 
 
 # ---------------------------------------------------------------------------
