@@ -414,6 +414,10 @@ def _parse_assistant_message_content(message: Dict[str, Any],
             # The strict parse path delivers tool_calls as a single-use Pydantic `ValidatorIterator`
             # of already-validated OpenAI tool calls, so only materialize and normalize arguments.
             tool_calls = list(tool_calls)
+            # Put the list back: the iterator is spent now, and the router forwards this same
+            # request (or counts its tokens) after rendering it. A validation error still
+            # surfaces from the `list()` above, so the raw-body fallback is unchanged.
+            message["tool_calls"] = tool_calls
             result["tool_calls"] = [
                 _normalize_tool_call_arguments(index, item, lenient_json)
                 for index, item in enumerate(tool_calls)

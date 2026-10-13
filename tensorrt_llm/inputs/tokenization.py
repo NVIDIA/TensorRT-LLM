@@ -21,7 +21,10 @@ a prompt tokenizes to the same ids no matter which of them produced it.
 
 from __future__ import annotations
 
-from typing import Any, List, Optional
+import copy
+import threading
+import weakref
+from typing import Any, List, Optional, Tuple
 
 from .._utils import nvtx_range_debug
 from .prefix_token_cache import PrefixTokenCache
@@ -47,6 +50,35 @@ TIKTOKEN_ALLOWED_SPECIAL_TOKENS = {
     "<|call|>",
     "<|reserved_200013|>",
 }
+
+
+# A fast tokenizer changes its own state to truncate (``enable_truncation``) and a later plain
+# call resets it, which fails with "Already borrowed" when another thread is encoding. Truncating
+# encodes therefore run on a private copy of the tokenizer, one at a time, so the shared
+# tokenizer is never modified.
+_TRUNCATING_COPIES: "weakref.WeakKeyDictionary[Any, Tuple[Any, threading.Lock]]" = (
+    weakref.WeakKeyDictionary()
+)
+_TRUNCATING_COPIES_LOCK = threading.Lock()
+
+
+def _truncating_copy(tokenizer: Any) -> Optional[Tuple[Any, threading.Lock]]:
+    """The private copy and its lock for a fast tokenizer, ``None`` for any other kind."""
+    if not hasattr(getattr(tokenizer, "tokenizer", tokenizer), "backend_tokenizer"):
+        return None
+    with _TRUNCATING_COPIES_LOCK:
+        private = _TRUNCATING_COPIES.get(tokenizer)
+        if private is None:
+            private = _TRUNCATING_COPIES[tokenizer] = (copy.deepcopy(tokenizer), threading.Lock())
+    return private
+
+
+def _encode(tokenizer: Any, prompt: str, add_special_tokens: bool, kwargs: dict) -> List[int]:
+    try:
+        return tokenizer.encode(prompt, add_special_tokens=add_special_tokens, **kwargs)
+    except TypeError:
+        # Tiktoken path
+        return tokenizer.encode(prompt, allowed_special=TIKTOKEN_ALLOWED_SPECIAL_TOKENS)
 
 
 def tokenize_prompt(
@@ -75,11 +107,13 @@ def tokenize_prompt(
         with nvtx_range_debug("tokenize prompt"), nvtx_range_debug("prefix cache"):
             return prefix_token_cache.encode(tokenizer, prompt)
     kwargs = {}
+    private = None
     if truncate_prompt_tokens is not None:
         kwargs = dict(truncation=True, max_length=truncate_prompt_tokens)
+        private = _truncating_copy(tokenizer)
     with nvtx_range_debug("tokenize prompt"):
-        try:
-            return tokenizer.encode(prompt, add_special_tokens=add_special_tokens, **kwargs)
-        except Exception:
-            # Tiktoken path
-            return tokenizer.encode(prompt, allowed_special=TIKTOKEN_ALLOWED_SPECIAL_TOKENS)
+        if private is not None:
+            private_tokenizer, lock = private
+            with lock:
+                return _encode(private_tokenizer, prompt, add_special_tokens, kwargs)
+        return _encode(tokenizer, prompt, add_special_tokens, kwargs)

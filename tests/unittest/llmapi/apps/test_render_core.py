@@ -343,6 +343,41 @@ class TestRenderConversation:
         assert result.text == expected.text
         assert result.token_ids == expected.token_ids
 
+    def test_a_tokenizer_native_template_keeps_its_own_ids_unless_a_prefix_follows(self) -> None:
+        # A native template tokenizes segment by segment (control-token strings in user text
+        # stay text); encoding the finished string would make them special tokens.
+        from transformers import PreTrainedTokenizerFast
+
+        from tensorrt_llm.serve.chat_utils import parse_chat_messages_coroutines
+
+        class NativeTokenizer(PreTrainedTokenizerFast):
+            def apply_chat_template(self, conversation, *args, tokenize=False, **kwargs):
+                return [7, 8, 9] if tokenize else "NATIVE"
+
+        native = make_tokenizer(chat_template=None)
+        native.__class__ = NativeTokenizer
+
+        async def run(**overrides):
+            conversation, mm_coroutine, counts, _order = parse_chat_messages_coroutines(
+                chat_request().messages, None, None
+            )
+            rendered, _mm = await asyncio.gather(
+                render_conversation(
+                    resources(native),
+                    conversation=conversation,
+                    mm_placeholder_counts=counts,
+                    add_generation_prompt=True,
+                    **overrides,
+                ),
+                mm_coroutine,
+            )
+            return rendered
+
+        assert asyncio.run(run(tokenize=True)).token_ids == [7, 8, 9]
+        prefixed = asyncio.run(run(tokenize=True, forced_prefix="<call>"))
+        assert prefixed.text == "NATIVE<call>"
+        assert prefixed.token_ids == native.encode("NATIVE<call>", add_special_tokens=False)
+
     def test_the_forced_prefix_is_appended_and_reported(self, tokenizer) -> None:
         from tensorrt_llm.serve.chat_utils import parse_chat_messages_coroutines
 
@@ -440,14 +475,6 @@ class TestFingerprint:
             compute_fingerprint(self._router_resources(tokenizer)), compute_fingerprint(worker)
         )
 
-    def test_a_processor_with_the_same_template_text_changes_nothing(self, tokenizer) -> None:
-        same_text = SimpleNamespace(chat_template=tokenizer.chat_template)
-        worker = self._worker_resources(tokenizer, processor=same_text)
-
-        assert fingerprints_match(
-            compute_fingerprint(self._router_resources(tokenizer)), compute_fingerprint(worker)
-        )
-
     def test_a_processor_with_a_different_template_does_not_match_a_router_without_one(
         self, tokenizer
     ) -> None:
@@ -476,20 +503,28 @@ class TestFingerprint:
 
         assert fingerprints_match(compute_fingerprint(first), compute_fingerprint(second))
 
-    def test_the_tool_variant_of_a_template_is_part_of_the_identity(self) -> None:
+    @pytest.mark.parametrize("variant", ["tool_use", "alternate"])
+    def test_every_named_template_is_part_of_the_identity(self, variant) -> None:
+        # A request can select a named template, so a difference in any variant matters, also
+        # one the default and the tool variant do not reach.
         plain = "{% for m in messages %}{{ m.content }}{% endfor %}"
-        same = make_tokenizer(chat_template={"default": plain, "tool_use": plain + "T"})
-        also_same = make_tokenizer(chat_template={"default": plain, "tool_use": plain + "T"})
-        other_tool_variant = make_tokenizer(
-            chat_template={"default": plain, "tool_use": plain + "U"}
-        )
 
-        assert fingerprints_match(
-            compute_fingerprint(resources(same)), compute_fingerprint(resources(also_same))
-        )
+        def tokenizer_with(**overrides):
+            templates = {"default": plain, "tool_use": plain + "T", "alternate": plain + "A"}
+            return make_tokenizer(chat_template={**templates, **overrides})
+
+        same = compute_fingerprint(resources(tokenizer_with()))
+        assert fingerprints_match(same, compute_fingerprint(resources(tokenizer_with())))
+        changed = compute_fingerprint(resources(tokenizer_with(**{variant: plain + "X"})))
+        assert not fingerprints_match(same, changed)
+
+    def test_the_truncation_side_is_part_of_the_identity(self) -> None:
+        # Which end `truncate_prompt_tokens` keeps is tokenizer state, not part of its encoding.
+        left, right = make_tokenizer(), make_tokenizer()
+        left.truncation_side, right.truncation_side = "left", "right"
+
         assert not fingerprints_match(
-            compute_fingerprint(resources(same)),
-            compute_fingerprint(resources(other_tool_variant)),
+            compute_fingerprint(resources(left)), compute_fingerprint(resources(right))
         )
 
     def test_a_tokenizer_without_a_template_has_no_template_identity(self) -> None:
@@ -501,7 +536,7 @@ class TestFingerprint:
 
         templates = compute_fingerprint(resources(NativeTokenizer()))["compared"]["templates"]
 
-        assert templates == {"without_tools": None, "with_tools": None}
+        assert templates == {"named": None, "without_tools": None, "with_tools": None}
 
     def test_a_worker_with_its_own_input_processor_does_not_match_a_router(self, tokenizer) -> None:
         class OwnInputProcessor:

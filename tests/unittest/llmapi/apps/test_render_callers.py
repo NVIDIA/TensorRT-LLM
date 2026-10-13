@@ -270,6 +270,45 @@ class TestRouterWriteBack:
         assert ids
         assert request.prompt_token_ids is None
 
+    def test_a_request_the_router_rendered_but_did_not_write_back_keeps_its_tool_calls(
+        self, router
+    ) -> None:
+        # `tool_calls` validates into a single-use iterator that rendering would drain, and the
+        # worker renders the history itself when the ids are not written back.
+        call = {"id": "c1", "type": "function", "function": {"name": "f", "arguments": "{}"}}
+        request = chat_request(
+            messages=[
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": None, "tool_calls": [call]},
+                {"role": "tool", "tool_call_id": "c1", "content": "ok"},
+            ]
+        )
+
+        router._tokenize(request)  # no worker reported a fingerprint: nothing is written back
+
+        assert request.prompt_token_ids is None
+        sent = request.model_dump(mode="json", exclude_unset=True)["messages"][1]
+        assert [item["id"] for item in sent["tool_calls"]] == ["c1"]
+
+    def test_a_harmony_router_renders_without_loading_a_tokenizer(self) -> None:
+        # Harmony renders ids itself. A client that sends the served name, with no tokenizer
+        # directory configured, must not make the router try to load a tokenizer for it.
+        from tensorrt_llm.serve.router import KvCacheAwareRouter
+
+        harmony_router = KvCacheAwareRouter(
+            server_role=None,
+            servers=["server1"],
+            use_tokens=False,
+            max_batch_size=32,
+            tokens_per_block=32,
+            use_harmony=True,
+        )
+        with mock.patch.object(harmony_router, "_get_tokenizer", side_effect=AssertionError):
+            res = harmony_router._render_resources("gpt-oss-20b")
+            fingerprint = res.fingerprint()
+
+        assert res.use_harmony and fingerprint["compared"]["use_harmony"]
+
     def test_a_request_that_is_already_pre_tokenized_is_left_alone(self, router, tokenizer) -> None:
         self._trust(router, tokenizer)
         request = chat_request(prompt_token_ids=[4, 5, 6])
