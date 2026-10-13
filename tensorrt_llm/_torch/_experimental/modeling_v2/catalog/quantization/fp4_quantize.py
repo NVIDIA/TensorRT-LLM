@@ -47,10 +47,14 @@ class Fp4Quantize(OpWrapper):
 
     ARCHS = frozenset({Arch.SM_103})
 
-    # deepseek-r1 is the only caller and reaches this op from both layouts: the
-    # swizzled one feeding nvfp4_gemm in the dense and shared-expert MLPs, the
-    # linear one feeding the routed-expert path. Widths are its hidden size and
-    # its intermediate.
+    # deepseek-r1 reaches this op from both layouts: the swizzled one feeding
+    # nvfp4_gemm in the dense and shared-expert MLPs, the linear one feeding the
+    # routed-expert path, at its hidden size and its intermediate. qwen3.8
+    # (qwen4_exp) calls it only for its routed experts: linear scales at hidden
+    # 2560. A linear buffer has no row padding, so at a row count that is not a
+    # multiple of 128 it is shorter than the swizzled one; at a multiple of 128
+    # the two are the same length and only the cells' byte order tells them
+    # apart.
     CELLS: tuple[Cell, ...] = (
         Cell(
             why="decode, hidden 7168, swizzled scales -- the dense MLP's input",
@@ -71,6 +75,18 @@ class Fp4Quantize(OpWrapper):
         Cell(
             why="a row count that is not a multiple of the swizzle's 128-row tile",
             spec=dict(shape=(37, 7168), dtype=torch.bfloat16, vec=16, swizzled=True),
+        ),
+        Cell(
+            why="qwen3.8 decode: 1 token, hidden 2560, linear -- its routed-expert input",
+            spec=dict(shape=(1, 2560), dtype=torch.bfloat16, vec=16, swizzled=False),
+        ),
+        Cell(
+            why="qwen3.8, 7 rows at hidden 2560, linear: several rows, no row padding",
+            spec=dict(shape=(7, 2560), dtype=torch.bfloat16, vec=16, swizzled=False),
+        ),
+        Cell(
+            why="qwen3.8 prefill at max_num_tokens 8192, hidden 2560, linear",
+            spec=dict(shape=(8192, 2560), dtype=torch.bfloat16, vec=16, swizzled=False),
         ),
     )
 

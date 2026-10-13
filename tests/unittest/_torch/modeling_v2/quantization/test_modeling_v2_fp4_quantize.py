@@ -93,6 +93,18 @@ def test_the_quantization_round_trips() -> None:
     assert torch.all(err <= block_amax * 0.5 + 1e-6)
 
 
+def test_the_two_layouts_differ_at_equal_length() -> None:
+    """At a multiple of 128 rows the linear and swizzled buffers are the same
+    length, so a consumer handed the wrong one accepts it. The linear cells'
+    exact scale gate is what tells them apart -- this shows it can."""
+    x, gs, _, _ = _build(dict(shape=(128, 2560), dtype=torch.bfloat16, vec=16, swizzled=False), 0)
+    _, linear = op(x, gs, 16, False, False)
+    _, swizzled = op(x, gs, 16, False, True)
+    assert linear.numel() == swizzled.numel() == 128 * 2560 // 16
+    assert not torch.equal(linear, swizzled)
+    assert torch.equal(linear, op.reference(x, gs, 16, False, False)[1])
+
+
 def test_guard_refuses_a_per_token_global_scale() -> None:
     """Element 0 is applied to every row and the rest are ignored."""
     x = torch.randn(8, 128, dtype=torch.bfloat16, device="cuda")

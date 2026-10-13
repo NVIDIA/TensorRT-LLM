@@ -99,8 +99,9 @@ class Fp4BlockScaleMoeRunner(OpWrapper):
     The caller owns top-k: `topk_ids` carries global expert ids and
     `topk_weights` the combine weights, neither renormalized here. This rank
     answers for `[local_expert_offset, local_expert_offset + local_num_experts)`
-    and contributes zero for every other id, so an expert-parallel split is four
-    calls whose outputs sum -- which is what the dep4 target does.
+    and contributes zero for every other id, so an expert-parallel split is N
+    calls whose outputs sum -- which is what the deepseek dep4 target does;
+    qwen4_exp makes one call over its whole expert stack.
 
     With `do_finalize=True` the result is a one-element list holding the
     combined `[T, H]` bf16 rows, or an empty tensor when `output` was given.
@@ -116,6 +117,22 @@ class Fp4BlockScaleMoeRunner(OpWrapper):
     # single-rank one.
     _R1 = dict(hidden=7168, intermediate=2048, num_experts=256, top_k=8)
 
+    # qwen4_exp's (Qwen3.8-Flash-Next) routed geometry: many small experts, a
+    # top_k past 8, an intermediate width of 640, all 512 experts local. Its
+    # router renormalizes the top-10 softmax weights to sum to 1 before the
+    # call (`routing="renormalized"`, a test axis rather than an op argument;
+    # the R1 cells draw uniform [0, 1) weights). Nothing is padded:
+    # H % 256, 2I % 128, H/16 % 4 and I/16 % 4 are all zero.
+    _QWEN4_EXP = dict(
+        hidden=2560,
+        intermediate=640,
+        num_experts=512,
+        top_k=10,
+        local_expert_offset=0,
+        local_num_experts=512,
+        routing="renormalized",
+    )
+
     CELLS: tuple[Cell, ...] = (
         Cell(
             why="dep4's own call: the 64-wide expert window at offset 0, R1 geometry",
@@ -129,6 +146,25 @@ class Fp4BlockScaleMoeRunner(OpWrapper):
             why="the single-rank shape: all 256 experts local, and one token, the decode row count",
             spec=dict(tokens=1, local_expert_offset=0, local_num_experts=256, **_R1),
         ),
+        Cell(
+            why="qwen4_exp decode: one token over 512 experts, top-10 renormalized, H 2560 / I 640",
+            spec=dict(tokens=1, **_QWEN4_EXP),
+        ),
+        Cell(
+            why="qwen4_exp at 4 rows: the last count the pre-routed path's static-block "
+            "permutation kernel takes",
+            spec=dict(tokens=4, **_QWEN4_EXP),
+        ),
+        Cell(
+            why="qwen4_exp at 5 rows: the first count on the single-cluster permutation "
+            "kernel (the dynamic-block one stops at 256 experts)",
+            spec=dict(tokens=5, **_QWEN4_EXP),
+        ),
+        Cell(
+            why="qwen4_exp prefill: 8192 rows, the single-cluster kernel's cap and the top "
+            "of the certified column",
+            spec=dict(tokens=8192, **_QWEN4_EXP),
+        ),
     )
 
     note = """
@@ -137,12 +173,29 @@ class Fp4BlockScaleMoeRunner(OpWrapper):
     `topk_group` and `routed_scaling_factor` are inert -- they are passed
     because the signature takes them, not because they do anything here.
 
+    That holds at 512 experts / top-10 too, where it would matter if it were
+    read: which `(num_experts, top_k)` pairs the routing kernels are compiled
+    for is a per-policy tier list, and a pair with no tier is a logged error,
+    not a raise. The pre-routed path substitutes its own preprocess/postprocess
+    pair before dispatch, and `routing_method_type` 0, 2, 4, 5, 6 were measured
+    bitwise identical to 1 there. It picks its permutation kernel by row count
+    instead: a static-block kernel up to 4 rows, a dynamic-block one up to 16
+    rows only at <= 256 experts, a single-cluster one up to 8192 rows.
+
     `act_type` 0 (SwiGlu) only. `gemm1_bias`, `gemm1_alpha`, `gemm1_beta`,
-    `gemm1_clamp_limit` and `gemm2_bias` are `None`.
+    `gemm1_clamp_limit` and `gemm2_bias` are `None`. `hidden_states_scale` is
+    the linear (unswizzled) e4m3 block-scale layout, one scale per 16 elements
+    of each row.
+
+    At 512 experts only the whole stack is certified: no expert-parallel window
+    of it, `do_finalize=False` or a caller-supplied `output` was measured there.
 
     `tune_max_num_tokens` is an autotuner bucket hint and was measured inert;
     it is not a token count. `T` is `hidden_states.shape[0]`, and 8192 is the
-    top of the certified column.
+    top of the certified column. A warm autotuner cache was measured bitwise
+    inert against a cold one at the R1 stack, its windows and the 512-expert
+    stack; `local_num_experts` separates the tuner's cache entries, so each
+    layout warms its own.
 
     The caller owns the weight layout entirely: FC1 and FC2 weights are
     pre-shuffled and their scales additionally 128x4 swizzled. Nothing here

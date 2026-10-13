@@ -17,15 +17,22 @@ class FusedQkNormRope(OpWrapper):
 
     The v heads are not touched. `qkv` is one `[num_tokens, (Hq + Hk + Hv) *
     head_dim]` buffer, which is the layout the fused projection already
-    produces, so nothing is split or copied.
+    produces, so nothing is split or copied. The norm is `rmsnorm(x) * w`, or
+    the Gemma form `rmsnorm(x) * (1 + w)` with `use_gemma`; it covers the whole
+    head, the rotation only its first `rotary_dim` dims. With `use_mrope`,
+    `position_ids` is `[3, T]` and rotary pair `j` takes its position from row 1
+    when `j % 3 == 1 and j < 3 * mrope_section1`, from row 2 when
+    `j % 3 == 2 and j < 3 * mrope_section2`, from row 0 otherwise -- the
+    interleaved mRoPE layout. The caller owns the QKV projection before the
+    call and the KV-cache append and attention after it.
     """
 
     ARCHS = frozenset({Arch.SM_103})
 
-    # gpt-oss-120b is the only caller, and it asks for the RoPE half only:
-    # `is_qk_norm=False`, neox pairing, and YaRN-blended frequencies. 64 query
-    # heads, 8 key and 8 value, head_dim 64, all of which the cells carry
-    # because the op reads them as scalars rather than deriving them.
+    # gpt-oss-120b asks for the RoPE half only: `is_qk_norm=False`, neox
+    # pairing, and YaRN-blended frequencies. 64 query heads, 8 key and 8 value,
+    # head_dim 64, all of which the cells carry because the op reads them as
+    # scalars rather than deriving them.
     _GPT_OSS = dict(
         num_heads_q=64,
         num_heads_k=8,
@@ -43,6 +50,30 @@ class FusedQkNormRope(OpWrapper):
         attention_factor=1.0,
     )
 
+    # qwen4_exp (Qwen3.8-Flash-Next) runs Gemma QK norm and an unscaled rope
+    # on the first 64 dims (32 pairs), base 1e7, at two geometries. Its
+    # mrope_section is [11, 11, 10], passed as sections 11 / 11. Positions are
+    # drawn uniformly below `max_position` (a test axis, not an op argument):
+    # the kernel's fast sincos loses phase as `position * freq` grows, so the
+    # position range is part of what a cell certifies.
+    _QWEN_ROPE = dict(
+        rotary_dim=64,
+        base=1e7,
+        is_neox=True,
+        is_qk_norm=True,
+        use_gemma=True,
+        max_position=32768,
+    )
+    _QWEN_MROPE = dict(use_mrope=True, mrope_section1=11, mrope_section2=11, **_QWEN_ROPE)
+    # Main attention (trunk and MTP): 24 query heads, 2 kv, head_dim 256.
+    _QWEN_MAIN = dict(num_heads_q=24, num_heads_k=2, num_heads_v=2, head_dim=256, **_QWEN_MROPE)
+    # The QSA index plane's query rope: 4 index heads plus the one k and one v
+    # slot of its scratch layout, over index_head_dim 128 (== 2 * rotary_dim,
+    # so the partial factor is not reapplied).
+    _QWEN_INDEX_HEADS = dict(num_heads_q=4, num_heads_k=1, num_heads_v=1, head_dim=128)
+    _QWEN_INDEX_MROPE = dict(**_QWEN_INDEX_HEADS, **_QWEN_MROPE)
+    _QWEN_INDEX_PLAIN = dict(**_QWEN_INDEX_HEADS, **_QWEN_ROPE)
+
     CELLS: tuple[Cell, ...] = (
         Cell(why="decode: one token", spec=dict(tokens=1, **_GPT_OSS)),
         Cell(why="prefill-shaped batch", spec=dict(tokens=2048, **_GPT_OSS)),
@@ -50,19 +81,94 @@ class FusedQkNormRope(OpWrapper):
             why="a token count that is not a multiple of any tile",
             spec=dict(tokens=37, **_GPT_OSS),
         ),
+        Cell(
+            why="qwen4_exp main rope, decode: one token, Gemma norm and interleaved mRoPE "
+            "with three distinct position rows",
+            spec=dict(tokens=1, **_QWEN_MAIN),
+        ),
+        Cell(
+            why="qwen4_exp main rope, 19 tokens: the size its wiring and saturation tests run at",
+            spec=dict(tokens=19, **_QWEN_MAIN),
+        ),
+        Cell(
+            why="qwen4_exp main rope, 8192-token prefill: the Gemma one-ulp tail, under "
+            "GEMMA_PREFILL_ATOL",
+            spec=dict(tokens=8192, gemma_prefill_band=True, **_QWEN_MAIN),
+        ),
+        Cell(
+            why="qwen4_exp index rope (mRoPE), 1 token: one k and one v head, the "
+            "narrowest layout; 5 warps of an 8-warp block",
+            spec=dict(tokens=1, **_QWEN_INDEX_MROPE),
+        ),
+        Cell(
+            why="qwen4_exp index rope (mRoPE), 2 tokens: the second token's heads "
+            "straddle a block boundary",
+            spec=dict(tokens=2, **_QWEN_INDEX_MROPE),
+        ),
+        Cell(
+            why="qwen4_exp index rope (mRoPE), 5 tokens: the last block runs one warp",
+            spec=dict(tokens=5, **_QWEN_INDEX_MROPE),
+        ),
+        Cell(
+            why="qwen4_exp index rope (mRoPE), 17 tokens: one past a power of two",
+            spec=dict(tokens=17, **_QWEN_INDEX_MROPE),
+        ),
+        Cell(
+            why="qwen4_exp index rope (mRoPE), 19 tokens: the size its wiring and "
+            "saturation tests run at",
+            spec=dict(tokens=19, **_QWEN_INDEX_MROPE),
+        ),
+        Cell(
+            why="qwen4_exp index rope (mRoPE), 33 tokens: one past a power of two",
+            spec=dict(tokens=33, **_QWEN_INDEX_MROPE),
+        ),
+        Cell(
+            why="qwen4_exp index rope (mRoPE), 65 tokens: one past a power of two",
+            spec=dict(tokens=65, **_QWEN_INDEX_MROPE),
+        ),
+        Cell(
+            why="qwen4_exp index rope (mRoPE), 8192-token prefill: the index site sees the "
+            "whole packed batch; under GEMMA_PREFILL_ATOL",
+            spec=dict(tokens=8192, gemma_prefill_band=True, **_QWEN_INDEX_MROPE),
+        ),
+        Cell(
+            why="qwen4_exp index rope (plain), decode: the form the index plane runs "
+            "today, row 0 alone as a flat [T] position_ids",
+            spec=dict(tokens=1, **_QWEN_INDEX_PLAIN),
+        ),
+        Cell(
+            why="qwen4_exp index rope (plain), 19 tokens: an odd count across blocks",
+            spec=dict(tokens=19, **_QWEN_INDEX_PLAIN),
+        ),
+        Cell(
+            why="qwen4_exp index rope (plain), 8192-token prefill: under GEMMA_PREFILL_ATOL",
+            spec=dict(tokens=8192, gemma_prefill_band=True, **_QWEN_INDEX_PLAIN),
+        ),
     )
 
     note = """
-    Three of this op's paths are uncertified because no shipped target reaches
-    them, and the first is the one its own name advertises:
+    Certified by caller: gpt-oss runs `is_qk_norm=False` with YaRN; qwen4_exp
+    runs `is_qk_norm=True, use_gemma=True`, unscaled, with and without
+    interleaved mRoPE. Uncertified because no shipped target reaches them:
+    `is_qk_norm=True` with `use_gemma=False` (the plain-weight norm the op's
+    name advertises), `is_neox=False`, YaRN together with the norm or with
+    mRoPE. A target that wants one adds the cell rather than assuming the path
+    works because the argument exists.
 
-      * `is_qk_norm=True` -- gpt-oss passes False, so the norm half runs in
-        `reference` but never against the kernel;
-      * `is_neox=False`, the interleaved pairing;
-      * `use_mrope`, `use_gemma`.
+    mRoPE preconditions. `position_ids` is a contiguous int32 `[3, T]`; the op
+    rejects a strided view loudly, so an engine's `[3, 1, max_num_tokens]`
+    position buffer has to be copied, not only reshaped. A HuggingFace
+    `mrope_section` `[s0, s1, s2]` summing to `rotary_dim / 2` is passed as
+    `mrope_section1 = s1`, `mrope_section2 = s2`; `s0` is implied. Only the
+    interleaved layout exists here -- the contiguous-section variant is a
+    different operator, measured ~500x out when wired in its place. Sections
+    saturate: at 32 pairs `mrope_section2` 10, 11 and 12 are bit-identical (the
+    largest `j % 3 == 2` below 32 is 29), while `mrope_section1` 10 moves pair
+    31 back to row 0. Three equal rows reduce bitwise to the plain
+    `use_mrope=False` call on that row, so a text batch cannot see a wrong
+    split; an image span is where one shows.
 
-    Adding a target that wants any of them means adding the cell, not assuming
-    the path works because the argument exists.
+    Metadata consumed: none.
     """
 
     def __call__(
