@@ -4252,13 +4252,6 @@ class BatchDecodePagedTSWrapper:
                     raise ValueError(
                         f"{name} must be a float32 tensor of shape (1,) on {state.device}"
                     )
-                if validate:
-                    _validate_tensor_does_not_overlap_inputs(
-                        scale,
-                        name,
-                        ("out", runtime.out),
-                        ("workspace_buffer", state.workspace_buffer),
-                    )
             runtime = replace(
                 runtime, bmm1_scale=bmm1_scale_device, bmm2_scale=bmm2_scale_device
             )
