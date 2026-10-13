@@ -1048,7 +1048,7 @@ TensorRT LLM 1.0 brings 2 major changes: the PyTorch-based architecture is now s
 - Supported phi 3 vision multimodal.
 
 ### Fixed Issues
-- Fixed brokens outputs for the cases when batch size is larger than 1. (#1539)
+- Fixed broken outputs for the cases when batch size is larger than 1. (#1539)
 - Fixed `top_k` type in `executor.py`, thanks to the contribution from @vonjackustc in #1329.
 - Fixed stop and bad word list pointer offset in Python runtime, thanks to the contribution from @fjosw in #1486.
 - Fixed some typos for Whisper model, thanks to the contribution from @Pzzzzz5142 in #1328.
