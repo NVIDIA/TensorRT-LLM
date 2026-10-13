@@ -48,7 +48,7 @@ TensorRT-LLM **VisualGen** provides a unified inference stack for diffusion mode
 | `nvidia/Cosmos3-Edge` | Text-to-Image, Text-to-Video, Image-to-Video (Nemotron-dense backbone, 480p-native) |
 | `hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_t2v` | Text-to-Video |
 | `hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-720p_t2v` | Text-to-Video |
-| `MiniMaxAI/MiniMax-H3` | Text-to-Video (with Audio), First/Last-Frame-to-Video (with Audio) |
+| `MiniMaxAI/MiniMax-H3` | Text-to-Video, First/Last-Frame-to-Video, Reference-to-Video (all with Audio) |
 | `zai-org/GLM-Image` | Text-to-Image |
 
 
@@ -164,28 +164,98 @@ The same fields carry references over `trtllm-serve`; see [`examples/visual_gen/
 
 ## MiniMax-H3 Notes
 
-MiniMax-H3 parallel VAE uses independent spatial tiles via
-`parallel_config.parallel_vae_size`, with size from 1 through the world size (`tp_size * ulysses_size`).
+MiniMax-H3 generates video with stereo audio from text (T2VA), first/last frames
+(FL2VA), or reference media (Ref2VA). Text conditions the generation; the model
+does not generate output text. Ref2VA requires `transformer_ref/` weights and
+`pipeline_config: {workflow: ref2va}`. Pass references with role `reference`;
+audio references require an image or video reference. See the
+[Ref2VA example](../../../examples/visual_gen/README.md#minimax-h3-reference-to-video-and-audio)
+for input limits and ordering.
+
+### Parallelism and attention backends
+
+Tensor parallelism (`parallel_config.tp_size`) shards the DiT attention heads
+and gated MLP weights. The text encoder, AdaLN modulation, and media input/output
+projections remain replicated, so total memory per GPU does not fall in direct
+proportion to TP size. Pure TP keeps the complete packed token sequence on each
+rank; it does not shard the sequence dimension.
+
+Ulysses (`parallel_config.ulysses_size`) shards the sequence and can be combined
+with TP. The world size is `tp_size * ulysses_size`; CFG, ring, and Attention2D
+parallelism are not supported. Parallel VAE distributes independent spatial
+tiles using `parallel_config.parallel_vae_size`, from 1 through world size.
 Tile geometry and blending follow the loaded Diffusers VAE.
 
-Tensor parallelism shards the DiT attention and gated MLP weights via
-`parallel_config.tp_size`. The text encoder, AdaLN modulation, and media
-input/output projections remain replicated. TP can be combined with Ulysses;
-Ulysses requires VANILLA or FA4 attention. CFG, ring, and Attention2D parallelism
-are not supported. See the
-[2-GPU TP config](../../../examples/visual_gen/configs/minimax-h3-bf16-tp2.yaml).
+| Configuration | Attention backend | Restrictions and validation |
+|---|---|---|
+| Single GPU | `VANILLA`, `FA4`, `TRTLLM` | `TRTLLM` is restricted to SM100/SM103; FA4 and TRTLLM full-model generation were validated on B200. |
+| Pure TP | `VANILLA`, `FA4`, `TRTLLM` | TP=2 output parity was tested with VANILLA and FA4; full-model TP=2 was measured with FA4. TRTLLM is allowed on SM100/SM103 but its TP combination has not been validated here. |
+| Ulysses, including TP + Ulysses | `VANILLA`, `FA4` | TRTLLM lacks the packed-row padding-mask support required by this path. |
 
-- Text-to-video (T2VA), first/last-frame-to-video (FL2VA), and reference-to-video
-  with audio (Ref2VA) are supported on one GPU. Enable Ref2VA with
-  `pipeline_config: {workflow: ref2va}`; it requires `transformer_ref/` weights.
-  Pass image, video, and audio inputs through the existing reference slots with
-  role `reference`. Audio requires an image or video reference. See the
-  [Ref2VA example](../../../examples/visual_gen/README.md#minimax-h3-reference-to-video-and-audio)
-  for input limits, ordering, and media dependencies.
-- MiniMax-H3 currently restricts TRTLLM attention to SM100 or SM103. This is a
-  model-specific restriction, not a general VisualGen backend requirement.
-- The published [MiniMax-H3 checkpoint license](https://huggingface.co/MiniMaxAI/MiniMax-H3/blob/main/LICENSE)
-  restricts use by territory. Obtain legal approval before downloading or running the weights.
+The SM100/SM103 restriction is specific to H3's TRTLLM attention path; it is not
+a general VisualGen backend restriction. CUDA graphs, CPU offloading, TeaCache,
+and Cache-DiT are not supported for H3. Keep `cuda_graph_config.enable: false`.
+
+Use the [2-GPU TP config](../../../examples/visual_gen/configs/minimax-h3-bf16-tp2.yaml)
+for tensor parallelism. For single-GPU TRTLLM attention on SM100/SM103, omit
+`parallel_config` and use:
+
+```yaml
+attention_config:
+  backend: TRTLLM
+cuda_graph_config:
+  enable: false
+torch_compile_config:
+  enable: false
+compilation_config:
+  skip_warmup: true
+```
+
+Pass this YAML through `--visual_gen_args` to the existing
+[H3 example](../../../examples/visual_gen/models/minimax_h3.py) or `trtllm-serve`.
+
+### Measured B200 example
+
+The following measurements were collected on 2026-10-12 with TensorRT-LLM
+1.4.0rc0 (commit `b2f25b646c`), PyTorch 2.14.0a0 (nv26.09), BF16 weights,
+eager execution, and no CUDA graphs. The workload is the
+[H3 example](../../../examples/visual_gen/models/minimax_h3.py)'s default prompt,
+seed 42, 544x960 resolution, 124 frames at 24 fps, and 28 scheduler points
+(27 denoising steps). Latency is the mean of three generations after one warmup;
+model loading and media saving are excluded. Memory is the peak PyTorch
+allocation during measured generation, not total device memory.
+
+| GPUs | Backend | TP | Mean generation latency | Peak allocated memory per GPU |
+|---|---|---|---|---|
+| 1 B200 | FA4 | 1 | 40.25 s | 138.2 GiB |
+| 2 B200 | FA4 | 2 | 23.89 s | 118.3 / 117.9 GiB |
+| 1 B200 | TRTLLM | 1 | 42.38 s | 138.3 GiB |
+
+For this workload, TP=2 was 1.68x faster and saved about 20 GiB per GPU. DiT
+parameter storage fell from 61.7 to 43.1 GiB per GPU. Compared with the FA4
+single-GPU output, TP=2 measured 0.0427 mean video LPIPS and 0.0349 audio
+log-STFT distance; single-GPU TRTLLM measured 0.0220 and 0.0284 respectively.
+These measurements cover one text-only prompt; they do not establish quality
+or performance for every workflow, resolution, or backend combination. TP=4
+and TP=2 with Ulysses=2 were not exercised in this two-GPU validation.
+
+Each denoising step in this example processes a long, joint attention sequence:
+
+| Modality | DiT input token rows | DiT output token rows |
+|---|---|---|
+| Video | 18,870 | 18,870 |
+| Audio | 414 | 414 |
+| Text | 39 | 0 |
+
+The packed sequence contains 19,323 tokens. Video rows are 37 latent frames
+with a 17x30 spatial patch grid; audio rows are 207 latent time steps across
+two channels. Text length varies with the prompt, and reference media adds
+conditioning rows. With text-only user input, the video/audio DiT inputs are
+noisy latents, not supplied media. Decoding produces 124 video frames and
+165,600 audio samples per channel at 32 kHz for this example.
+
+The published [MiniMax-H3 checkpoint license](https://huggingface.co/MiniMaxAI/MiniMax-H3/blob/main/LICENSE)
+restricts use by territory. Obtain legal approval before downloading or running the weights.
 
 ## Optimizations
 
@@ -394,7 +464,7 @@ CPU offloading stages move selected Wan and Cosmos3 T2V pipeline components betw
 
 ### Multi-GPU Parallelism
 
-Configured under `VisualGenArgs.parallel_config`. Modes can be combined:
+Configured under `VisualGenArgs.parallel_config`. Supported combinations depend on the model; see the feature matrix and [MiniMax-H3 restrictions](#parallelism-and-attention-backends).
 
 - **CFG Parallelism** (`cfg_size: 2`): Splits positive/negative guidance prompts across GPUs. FLUX uses embedded guidance without a separate negative prompt path; CFG parallelism is not applicable to FLUX or the distilled FastWan 2.2 model.
 - **Ulysses Parallelism** (`ulysses_size: N`): Splits the sequence dimension across GPUs for longer sequences.
