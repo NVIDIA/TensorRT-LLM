@@ -15,18 +15,20 @@
 
 import gc
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import MagicMock, Mock
 from weakref import WeakSet
 
 import pytest
 import torch
 
-import tensorrt_llm._mnnvl_utils as mnnvl
+import tensorrt_llm._torch.distributed.mnnvl_memory as mnnvl
 import tensorrt_llm._torch.moe.fused_moe.communication.nvlink_one_sided as one_sided_module
 from tensorrt_llm._torch.mnnvl_alltoall_workspace import _MnnvlAlltoAllWorkspaceLifecycle
-from tensorrt_llm._torch.moe.fused_moe.communication.moe_alltoall import MoeAlltoAll
 from tensorrt_llm._torch.moe.fused_moe.communication.nvlink_one_sided import NVLinkOneSided
-from tensorrt_llm._torch.moe.fused_moe.communication.nvlink_two_sided import NVLinkTwoSided
+from tensorrt_llm._torch.moe.fused_moe.communication.nvlink_two_sided import (
+    MnnvlMoe,
+    NVLinkTwoSided,
+)
 
 
 class _Client:
@@ -480,9 +482,9 @@ def test_two_sided_checkpoint_prepare_rejects_active_shared_owner(
     instances = WeakSet()
     monkeypatch.setattr(NVLinkTwoSided, "_INSTANCES", instances)
     checkpoint_prepare = Mock()
-    monkeypatch.setattr(mnnvl.MnnvlMoe, "checkpoint_prepare", checkpoint_prepare)
+    monkeypatch.setattr(MnnvlMoe, "checkpoint_prepare", checkpoint_prepare)
     monkeypatch.setattr(
-        mnnvl.MnnvlMoe,
+        MnnvlMoe,
         "moe_workspace",
         Mock(comm=_FakeComm()),
     )
@@ -508,15 +510,15 @@ def test_two_sided_repeated_checkpoint_prepare_skips_shared_preflight(
     instances = WeakSet()
     monkeypatch.setattr(NVLinkTwoSided, "_INSTANCES", instances)
     checkpoint_prepare = Mock()
-    monkeypatch.setattr(mnnvl.MnnvlMoe, "checkpoint_prepare", checkpoint_prepare)
+    monkeypatch.setattr(MnnvlMoe, "checkpoint_prepare", checkpoint_prepare)
     comm = _FakeComm()
     monkeypatch.setattr(
-        mnnvl.MnnvlMoe,
+        MnnvlMoe,
         "moe_workspace",
         Mock(mapped=False, comm=comm),
     )
     monkeypatch.setattr(
-        mnnvl.MnnvlMoe,
+        MnnvlMoe,
         "moe_prepare_workspace",
         Mock(mapped=False),
     )
@@ -537,14 +539,14 @@ def test_two_sided_checkpoint_prepare_rejects_uninitialized_communicator(
     instances = WeakSet()
     monkeypatch.setattr(NVLinkTwoSided, "_INSTANCES", instances)
     checkpoint_prepare = Mock()
-    monkeypatch.setattr(mnnvl.MnnvlMoe, "checkpoint_prepare", checkpoint_prepare)
+    monkeypatch.setattr(MnnvlMoe, "checkpoint_prepare", checkpoint_prepare)
     monkeypatch.setattr(
-        mnnvl.MnnvlMoe,
+        MnnvlMoe,
         "moe_workspace",
         Mock(mapped=True, comm=None),
     )
     monkeypatch.setattr(
-        mnnvl.MnnvlMoe,
+        MnnvlMoe,
         "moe_prepare_workspace",
         Mock(mapped=True),
     )
@@ -577,9 +579,9 @@ def test_two_sided_checkpoint_prepare_timeout_fails_closed(
     )
     main_workspace = Mock(mapped=True, comm=comm)
     prepare_workspace = Mock(mapped=True)
-    monkeypatch.setattr(mnnvl.MnnvlMoe, "moe_workspace", main_workspace)
+    monkeypatch.setattr(MnnvlMoe, "moe_workspace", main_workspace)
     monkeypatch.setattr(
-        mnnvl.MnnvlMoe,
+        MnnvlMoe,
         "moe_prepare_workspace",
         prepare_workspace,
     )
@@ -603,14 +605,14 @@ def test_two_sided_checkpoint_restore_resets_all_shared_owners(
     instances = WeakSet()
     monkeypatch.setattr(NVLinkTwoSided, "_INSTANCES", instances)
     checkpoint_restore = Mock()
-    monkeypatch.setattr(mnnvl.MnnvlMoe, "checkpoint_restore", checkpoint_restore)
+    monkeypatch.setattr(MnnvlMoe, "checkpoint_restore", checkpoint_restore)
     monkeypatch.setattr(
-        mnnvl.MnnvlMoe,
+        MnnvlMoe,
         "moe_workspace",
         Mock(mapped=False),
     )
     monkeypatch.setattr(
-        mnnvl.MnnvlMoe,
+        MnnvlMoe,
         "moe_prepare_workspace",
         Mock(mapped=False),
     )
@@ -634,14 +636,14 @@ def test_two_sided_checkpoint_restore_noop_preserves_shared_owner_state(
     instances = WeakSet()
     monkeypatch.setattr(NVLinkTwoSided, "_INSTANCES", instances)
     checkpoint_restore = Mock()
-    monkeypatch.setattr(mnnvl.MnnvlMoe, "checkpoint_restore", checkpoint_restore)
+    monkeypatch.setattr(MnnvlMoe, "checkpoint_restore", checkpoint_restore)
     monkeypatch.setattr(
-        mnnvl.MnnvlMoe,
+        MnnvlMoe,
         "moe_workspace",
         Mock(mapped=True),
     )
     monkeypatch.setattr(
-        mnnvl.MnnvlMoe,
+        MnnvlMoe,
         "moe_prepare_workspace",
         Mock(mapped=True),
     )
@@ -659,11 +661,8 @@ def test_two_sided_checkpoint_restore_noop_preserves_shared_owner_state(
     assert second._dispatch_state
 
 
-@pytest.mark.parametrize("wrapper_type", [MoeAlltoAll, NVLinkOneSided])
-def test_frontend_checkpoint_delegates_to_shared_lifecycle(
-    wrapper_type: type[MoeAlltoAll] | type[NVLinkOneSided],
-) -> None:
-    wrapper = wrapper_type.__new__(wrapper_type)
+def test_frontend_checkpoint_delegates_to_shared_lifecycle() -> None:
+    wrapper = NVLinkOneSided.__new__(NVLinkOneSided)
     wrapper.can_use_cft_counted_writes = False
     wrapper._workspace_lifecycle = Mock()
     comm = Mock()
@@ -676,69 +675,18 @@ def test_frontend_checkpoint_delegates_to_shared_lifecycle(
     assert wrapper._workspace_lifecycle.checkpoint_restore.call_args.args[0] is comm
 
 
-@pytest.mark.parametrize("wrapper_type", [MoeAlltoAll, NVLinkOneSided])
-def test_frontend_destroy_unregisters_from_shared_lifecycle(
-    wrapper_type: type[MoeAlltoAll] | type[NVLinkOneSided],
-) -> None:
-    wrapper = wrapper_type.__new__(wrapper_type)
+def test_frontend_destroy_unregisters_from_shared_lifecycle() -> None:
+    wrapper = NVLinkOneSided.__new__(NVLinkOneSided)
     wrapper._destroyed = False
     wrapper._workspace_registered = True
     lifecycle = Mock()
     wrapper._workspace_lifecycle = lifecycle
-    if wrapper_type is NVLinkOneSided:
-        wrapper._workspace_key = None
+    wrapper._workspace_key = None
 
     wrapper.destroy()
     wrapper.destroy()
 
     lifecycle.unregister.assert_called_once_with(wrapper)
-
-
-def test_moe_alltoall_aborted_registration_does_not_unregister(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    lifecycle = Mock()
-    lifecycle.register.side_effect = RuntimeError("registration failed")
-    monkeypatch.setattr(MoeAlltoAll, "_WORKSPACES", {})
-    monkeypatch.setattr(MoeAlltoAll, "_init_constants", Mock())
-    monkeypatch.setattr(
-        MoeAlltoAll,
-        "_METAINFO_INDEX",
-        {
-            "FLAG_VAL_OFFSET_INDEX": 0,
-            "DISPATCH_COMPLETION_FLAGS_OFFSET_INDEX": 0,
-            "COMBINE_COMPLETION_FLAGS_OFFSET_INDEX": 0,
-        },
-    )
-    monkeypatch.setattr(mnnvl.MnnvlMemory, "initialize", Mock())
-    memory = Mock()
-    memory.as_torch_strided_tensor.return_value = torch.zeros(1, dtype=torch.uint8)
-    monkeypatch.setattr(
-        "tensorrt_llm._torch.moe.fused_moe.communication.moe_alltoall.MnnvlMemory",
-        Mock(return_value=memory),
-    )
-    monkeypatch.setattr(
-        _MnnvlAlltoAllWorkspaceLifecycle,
-        "get_or_create",
-        Mock(return_value=lifecycle),
-    )
-    monkeypatch.setattr(
-        torch.ops.trtllm,
-        "moe_a2a_initialize",
-        Mock(return_value=torch.tensor([1])),
-    )
-    mapping = SimpleNamespace(moe_ep_size=2, moe_ep_rank=0)
-
-    with pytest.raises(RuntimeError, match="registration failed"):
-        MoeAlltoAll(
-            mapping=mapping,
-            max_num_tokens=1,
-            top_k=1,
-            num_slots=2,
-            workspace_size_per_rank=1,
-        )
-
-    lifecycle.unregister.assert_not_called()
 
 
 def test_one_sided_checkpoint_rejects_destroyed_workspace(
@@ -753,6 +701,7 @@ def test_one_sided_checkpoint_rejects_destroyed_workspace(
     wrapper._workspace_lifecycle = Mock()
     wrapper._workspace_key = ("test",)
     wrapper._workspace_registered = True
+    wrapper._workspace_state = {}
     wrapper.destroy()
 
     with pytest.raises(RuntimeError, match="workspace has been destroyed"):
@@ -850,6 +799,7 @@ def test_one_sided_failed_registration_does_not_publish_new_workspace(
     monkeypatch.setattr(NVLinkOneSided, "DISPATCH_COMPLETION_FLAGS_OFFSET_INDEX", 0)
     monkeypatch.setattr(NVLinkOneSided, "COMBINE_COMPLETION_FLAGS_OFFSET_INDEX", 0)
     monkeypatch.setattr(one_sided_module, "MnnvlMemory", _Memory)
+    monkeypatch.setattr(one_sided_module, "CftMnnvlMemory", _Memory)
     monkeypatch.setattr(
         _MnnvlAlltoAllWorkspaceLifecycle,
         "get_or_create",
@@ -879,3 +829,173 @@ def test_one_sided_failed_registration_does_not_publish_new_workspace(
     assert NVLinkOneSided._WORKSPACE_REFCOUNTS == {}
     assert NVLinkOneSided._WORKSPACE is None
     lifecycle.unregister.assert_not_called()
+
+
+def test_second_cft_layout_falls_back_to_fence(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A workspace that cannot own the endpoints builds in fence mode instead of aborting.
+
+    CFT binds logical endpoints to one workspace per process. Models whose layers
+    differ in top-k allocate distinct workspaces, so every later layout must fall
+    back rather than fail construction.
+    """
+
+    class _Memory:
+        mapped = True
+
+        @staticmethod
+        def initialize() -> None:
+            pass
+
+        def __init__(self, mapping: object, size: int) -> None:
+            self.comm = _FakeComm()
+            self.local_mem_handle = 0
+
+        def as_torch_strided_tensor(self, dtype: torch.dtype) -> torch.Tensor:
+            return torch.zeros(2, 64, dtype=torch.uint8)
+
+    monkeypatch.setattr(NVLinkOneSided, "_WORKSPACES", {})
+    monkeypatch.setattr(NVLinkOneSided, "_WORKSPACE_REFCOUNTS", {})
+    monkeypatch.setattr(NVLinkOneSided, "_WORKSPACE", None)
+    monkeypatch.setattr(NVLinkOneSided, "_CFT_OWNER_SHAPE", None)
+    monkeypatch.setattr(NVLinkOneSided, "is_platform_supported", Mock(return_value=True))
+    monkeypatch.setattr(NVLinkOneSided, "_init_constants", Mock())
+    monkeypatch.setattr(NVLinkOneSided, "FLAG_VAL_OFFSET_INDEX", 0)
+    monkeypatch.setattr(NVLinkOneSided, "DISPATCH_COMPLETION_FLAGS_OFFSET_INDEX", 0)
+    monkeypatch.setattr(NVLinkOneSided, "COMBINE_COMPLETION_FLAGS_OFFSET_INDEX", 0)
+    monkeypatch.setattr(one_sided_module, "MnnvlMemory", _Memory)
+    monkeypatch.setattr(one_sided_module, "CftMnnvlMemory", _Memory)
+    monkeypatch.setattr(one_sided_module, "select_cft_counted_writes", Mock(return_value=True))
+    monkeypatch.setattr(
+        _MnnvlAlltoAllWorkspaceLifecycle, "get_or_create", Mock(return_value=Mock())
+    )
+    monkeypatch.setattr(
+        torch.ops.trtllm, "moe_a2a_initialize", Mock(return_value=torch.tensor([1]))
+    )
+    monkeypatch.setattr(torch.ops.trtllm, "moe_a2a_cft_initialize", Mock())
+
+    def build(top_k: int) -> NVLinkOneSided:
+        mapping = SimpleNamespace(
+            world_size=2,
+            moe_ep_size=2,
+            moe_ep_rank=0,
+            has_cp_helix=Mock(return_value=False),
+        )
+        return NVLinkOneSided(mapping=mapping, num_slots=8, top_k=top_k, max_num_tokens_per_rank=1)
+
+    first = build(top_k=2)
+    assert first.can_use_cft_counted_writes, "the first workspace should own the endpoints"
+
+    # Same layout: reuses the bound workspace, so CFT must not be given up.
+    assert build(top_k=2).can_use_cft_counted_writes
+
+    # Distinct layouts: a different workspace cannot own the endpoints.
+    for top_k in (4, 6):
+        other = build(top_k=top_k)
+        assert not other.can_use_cft_counted_writes, (
+            f"top_k={top_k} allocates its own workspace and must fall back to fence"
+        )
+        assert other._workspace_key != first._workspace_key
+
+
+# Ported from tests/unittest/_torch/moe/test_moe_a2a_cft.py, added upstream in
+# NVIDIA/TensorRT-LLM#19183. That file was retired here by bafb66d154; these two
+# cover _release_workspace teardown, which nothing else on this branch asserts.
+def test_destroy_releases_cft_manager_before_workspace_allocation(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    workspace_key = ("cft-workspace",)
+    workspace = object()
+    mnnvl_mem = object()
+    workspace_state = {
+        "cft_initialized": True,
+        "workspace": workspace,
+        "ep_rank": 3,
+        "mnnvl_mem": mnnvl_mem,
+    }
+    monkeypatch.setattr(NVLinkOneSided, "_WORKSPACES", {workspace_key: workspace_state})
+    monkeypatch.setattr(NVLinkOneSided, "_WORKSPACE_REFCOUNTS", {workspace_key: 1})
+    monkeypatch.setattr(NVLinkOneSided, "_WORKSPACE", workspace_state)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+
+    release_cft_manager = MagicMock()
+
+    def verify_workspace_is_alive(workspace_arg: object, ep_rank: int) -> None:
+        assert workspace_arg is workspace
+        assert ep_rank == 3
+        assert NVLinkOneSided._WORKSPACES[workspace_key]["mnnvl_mem"] is mnnvl_mem
+
+    release_cft_manager.side_effect = verify_workspace_is_alive
+    monkeypatch.setattr(torch.ops.trtllm, "moe_a2a_cft_release", release_cft_manager, raising=False)
+
+    comm = NVLinkOneSided.__new__(NVLinkOneSided)
+    comm._destroyed = False
+    comm._workspace_key = workspace_key
+    comm._workspace_state = workspace_state
+    comm._workspace_lifecycle = None
+    comm._workspace_registered = True
+    comm.mnnvl_mem = mnnvl_mem
+    comm.workspace = workspace
+    comm._dispatch_state = {"phase": "idle"}
+
+    comm.destroy()
+    # Teardown is rank-coordinated and may be reached twice (explicit destroy
+    # plus a later sweep). The second call must be inert: releasing the CFT
+    # endpoint twice would destroy an endpoint this communicator no longer
+    # owns, and the workspace state has already been cleared.
+    comm.destroy()
+
+    release_cft_manager.assert_called_once_with(workspace, 3)
+    assert workspace_key not in NVLinkOneSided._WORKSPACES
+    assert workspace_key not in NVLinkOneSided._WORKSPACE_REFCOUNTS
+    assert NVLinkOneSided._WORKSPACE is None
+    assert workspace_state == {}
+    assert comm.mnnvl_mem is None
+    assert comm.workspace is None
+
+
+def test_destroy_drops_workspace_when_cft_release_fails(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A failed CFT release must not leave a reusable workspace behind.
+
+    ``destroy`` decrements the refcount and unregisters the lifecycle before
+    calling ``_release_workspace``, so nothing retries. If the release raised
+    and the entry survived in ``_WORKSPACES``, the next communicator built on
+    the same key would adopt an allocation whose endpoint state is unknown.
+    """
+    workspace_key = ("cft-workspace-failing",)
+    workspace = object()
+    mnnvl_mem = object()
+    workspace_state = {
+        "cft_initialized": True,
+        "workspace": workspace,
+        "ep_rank": 3,
+        "mnnvl_mem": mnnvl_mem,
+    }
+    monkeypatch.setattr(NVLinkOneSided, "_WORKSPACES", {workspace_key: workspace_state})
+    monkeypatch.setattr(NVLinkOneSided, "_WORKSPACE_REFCOUNTS", {workspace_key: 1})
+    monkeypatch.setattr(NVLinkOneSided, "_WORKSPACE", workspace_state)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+
+    release_cft_manager = MagicMock(side_effect=RuntimeError("cft release failed"))
+    monkeypatch.setattr(torch.ops.trtllm, "moe_a2a_cft_release", release_cft_manager, raising=False)
+
+    comm = NVLinkOneSided.__new__(NVLinkOneSided)
+    comm._destroyed = False
+    comm._workspace_key = workspace_key
+    comm._workspace_state = workspace_state
+    comm._workspace_lifecycle = None
+    comm._workspace_registered = True
+    comm.mnnvl_mem = mnnvl_mem
+    comm.workspace = workspace
+    comm._dispatch_state = {"phase": "idle"}
+
+    # The failure is reported rather than swallowed.
+    with pytest.raises(RuntimeError, match="cft release failed"):
+        comm.destroy()
+
+    release_cft_manager.assert_called_once_with(workspace, 3)
+    # ...but the workspace is gone either way, so nothing can adopt it.
+    assert workspace_key not in NVLinkOneSided._WORKSPACES
+    assert NVLinkOneSided._WORKSPACE is None
+    assert workspace_state == {}

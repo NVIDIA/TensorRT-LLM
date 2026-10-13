@@ -142,6 +142,8 @@ def main():
         ep = meta.get("ep_size", "?")
         backend = meta.get("backend", "?")
         print(f"[{tag}] {lbl}  (ep={ep}, backend={backend})")
+        if meta.get("warning"):
+            print(f"[{tag}] WARNING: {meta['warning']}")
     print(f"Stat: {args.stat}, Rank: {args.rank}")
     print()
 
@@ -158,8 +160,11 @@ def main():
         sub_parts.append(f"{'B (us)':>{kernel_col_width}}")
         sub_parts.append(f"{'(A/B)':>{kernel_col_width}}")
 
-    # Also show total dispatch and total combine
-    for total_name in ["total_dispatch", "total_combine"]:
+    phase_metrics = [
+        ("dispatch_us", "dispatch"),
+        ("combine_us", "combine"),
+    ]
+    for _, total_name in phase_metrics:
         header_parts.append(f"{total_name:>{kernel_col_width}}")
         header_parts.append(f"{total_name:>{kernel_col_width}}")
         header_parts.append(f"{'speedup':>{kernel_col_width}}")
@@ -197,8 +202,7 @@ def main():
                 row.append(f"{'N/A':>{kernel_col_width}}")
                 row.append(f"{'N/A':>{kernel_col_width}}")
 
-        # Total dispatch and total combine
-        for key in ["dispatch_us", "combine_us"]:
+        for key, _ in phase_metrics:
             ta = ra.get(key, {}).get(args.rank)
             tb = rb.get(key, {}).get(args.rank)
             if ta and tb:
