@@ -42,7 +42,8 @@ from tensorrt_llm.functional import AllReduceStrategy
 from tensorrt_llm.llmapi.llm_args import (CSA2SparseAttentionConfig,
                                           DeepSeekSparseAttentionConfig,
                                           DeepSeekV4SparseAttentionConfig,
-                                          KvCacheConfig, MoeLoadBalancerConfig,
+                                          KvCacheConfig,
+                                          MoeLoadBalancerConfigType,
                                           MultimodalConfig)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
@@ -281,7 +282,7 @@ class ModelConfig(Generic[TConfig]):
     _moe_max_num_tokens_is_default: Optional[bool] = field(default=None,
                                                            repr=False,
                                                            compare=False)
-    moe_load_balancer: Optional[MoeLoadBalancerConfig] = None
+    moe_load_balancer: Optional[MoeLoadBalancerConfigType] = None
 
     attn_backend: str = 'TRTLLM'
     # Effective threshold requested for trtllm-gen MLA skip-correction. Zero
