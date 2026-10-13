@@ -34,16 +34,18 @@ def get_all_rank_num_tokens(
 ) -> list[int] | None:
     if enable_attention_dp:
         assert dist is not None, "attention DP requires a distributed communicator"
-        num_tokens = attn_metadata.num_tokens
+        counts = attn_metadata.get_adp_token_counts()
         if mapping.has_cp_helix():
             # With CP, attention uses reduce-scatter to divide tokens
             # among CP ranks. Report the post-RS token count.
             # Use tp_cp_allgather so MoE (which sees the repurposed
             # mapping where tp_size = original tp * cp) can index
             # with its tp_rank.
-            num_tokens = math.ceil(num_tokens / mapping.cp_size)
-            return dist.tp_cp_allgather_int64([num_tokens])[:, 0].tolist()
-        return dist.tp_allgather_int64([num_tokens])[:, 0].tolist()
+            counts = [math.ceil(count / mapping.cp_size) for count in counts]
+            gathered = dist.tp_cp_allgather_int64(counts)
+        else:
+            gathered = dist.tp_allgather_int64(counts)
+        return attn_metadata.set_adp_token_counts(gathered.T.tolist())
     return None
 
 
@@ -241,11 +243,20 @@ def set_moe_a2a_warmup(in_warmup: bool) -> None:
 
     No-op when the op is unavailable (older bindings).
     """
+    from tensorrt_llm._torch.moe.fused_moe.communication.nvlink_one_sided import (
+        NVLinkOneSided,
+        get_timeout_seconds,
+    )
+
+    timeout_sec = get_timeout_seconds(in_warmup)
     try:
-        torch.ops.trtllm.moe_a2a_set_warmup(in_warmup)
-        logger.info(f"moe_a2a completion-flag budget: in_warmup={in_warmup}")
+        NVLinkOneSided.set_timeout(timeout_sec)
+        logger.info(
+            f"moe_a2a completion-flag budget: in_warmup={in_warmup}, "
+            f"timeout={timeout_sec} s (nominal, at an assumed 2 GHz clock64 rate)"
+        )
     except (AttributeError, RuntimeError) as e:
         logger.warning(
-            f"moe_a2a_set_warmup unavailable, the all-to-all timeout "
+            f"moe_a2a_set_timeout unavailable, the all-to-all timeout "
             f"budget was not switched: {type(e).__name__}: {e}"
         )

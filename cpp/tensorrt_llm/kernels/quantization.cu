@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2019-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -136,6 +136,11 @@ template <typename T, int SF_VEC_SIZE>
 void invokeFP4Quantization(int b, int m, int n, T const* input, float const* SFScale, int64_t* output, int32_t* SFOuput,
     bool useUE8M0, QuantizationSFLayout layout, int multiProcessorCount, cudaStream_t stream)
 {
+    if (b == 0 || m == 0 || n == 0)
+    {
+        return;
+    }
+
 #ifdef ENABLE_FP8
     if constexpr (std::is_same_v<T, __nv_fp8_e4m3>)
     {
@@ -196,6 +201,11 @@ void invokeMxFP8Quantization(int b, int m, int n, int padded_n, T const* input, 
     static_assert(SF_VEC_SIZE == 32 || SF_VEC_SIZE == 128, "MXFP8 quantization supports SF vector sizes 32 and 128.");
     static_assert(SF_OUTPUT_VEC_SIZE == 32 || SF_OUTPUT_VEC_SIZE == SF_VEC_SIZE,
         "MXFP8 output SF vector size must be 32 or match the quantization SF vector size.");
+
+    if (b == 0 || m == 0 || n == 0)
+    {
+        return;
+    }
 
     // Grid, Block size.
     // Each thread converts 8 values.

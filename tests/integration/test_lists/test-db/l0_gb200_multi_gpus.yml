@@ -1,3 +1,6 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 version: 0.0.1
 l0_gb200_multi_gpus:
 - condition:
@@ -17,6 +20,25 @@ l0_gb200_multi_gpus:
   - unittest/_torch/moe/multi_gpu/test_moe_a2a_workspace.py TIMEOUT (10)
   - unittest/_torch/modules/test_engram.py
   - unittest/_torch/modules/test_mhc.py
+  # ------------- DeepSeek-V4.1 model, Engram and DSpark ---------------
+  - unittest/_torch/modeling/test_modeling_deepseekv41.py
+  - unittest/_torch/modules/test_engram_decode_hash.py
+  - unittest/_torch/modules/test_engram_history_uploads.py
+  - unittest/_torch/modules/test_engram_replay.py
+  - unittest/_torch/speculative/hw_agnostic/test_dspark_v41.py
+  # CSA2 kernel, indexer, chunked prefill and prefix-cache parity on Grace Blackwell.
+  - unittest/_torch/attention/sparse/csa2/test_kernel.py::test_packed_attention_parity
+  - unittest/_torch/attention/sparse/csa2/test_kernel.py::test_native_fp8_staging_exact_bytes
+  - unittest/_torch/attention/sparse/csa2/test_indexer.py::test_native_paged_owner_indexer_and_graph
+  - unittest/_torch/attention/sparse/csa2/test_module.py::test_native_chunked_compression
+  - unittest/_torch/attention/sparse/csa2/test_cache_manager.py::test_prefix_reuse_preserves_combined_records
+  - unittest/_torch/attention/sparse/csa2/test_cache_manager.py::test_partial_page_copy_on_write_and_state
+  # Synthetic weights cover Engram head/row shards and TP/EP shared-expert collectives.
+  - unittest/_torch/multi_gpu/test_engram_sharding.py::test_engram_shard_roundtrip -k "world:4"
+  - unittest/_torch/moe/test_deepseek_v41_shared_moe.py
+  # Two-rank cases include uneven/empty attention-DP batches and bounded CSA2 replay.
+  - unittest/_torch/multi_gpu/test_deepseek_v41_attention_dp.py::test_attention_dp_engram[world2-row-sharded]
+  - unittest/_torch/multi_gpu/test_deepseek_v41_attention_dp.py::test_attention_dp_decoder_bounded_replay[world2]
   # ---- curated pre-merge smoke set: diversify moe_backend across CUTLASS/TRTLLM/CUTEDSL ----
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4_4gpus[moe_backend=CUTLASS-mtp_nextn=0-tp4-fp8kv=True-attention_dp=True-cuda_graph=True-overlap_scheduler=True-low_precision_combine=False-torch_compile=False]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4_4gpus[moe_backend=TRTLLM-mtp_nextn=0-ep4-fp8kv=True-attention_dp=True-cuda_graph=True-overlap_scheduler=True-low_precision_combine=False-torch_compile=False]

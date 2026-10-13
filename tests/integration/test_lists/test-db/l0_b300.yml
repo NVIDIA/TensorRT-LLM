@@ -1,3 +1,6 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 version: 0.0.1
 l0_b300:
 - condition:
@@ -15,6 +18,13 @@ l0_b300:
       stage: pre_merge
       backend: pytorch
   tests:
+  # ------------- DeepSeek-V4.1 model, Engram and DSpark ---------------
+  - unittest/_torch/modeling/test_modeling_deepseekv41.py
+  - unittest/_torch/modules/test_engram_decode_hash.py
+  - unittest/_torch/modules/test_engram_history_uploads.py
+  - unittest/_torch/modules/test_engram_replay.py
+  - unittest/_torch/speculative/hw_agnostic/test_dspark_v41.py
+  - unittest/_torch/modules/test_mhc.py::test_fused_hc_lagged_matches_eager_composition
   # Covers tests/unittest/_torch/attention/. Two sub-trees moved in here from elsewhere
   # under tests/unittest/_torch/ and have no entry of their own on any list, so this entry
   # is what picks them up:

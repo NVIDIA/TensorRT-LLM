@@ -394,14 +394,6 @@ class BaseLLM:
                     f"Unknown backend: {backend!r}. Supported backends are "
                     "'pytorch'.")
 
-            # TRTLLM_MODELING_V2=require promises the run measured a modeling_v2
-            # target. Only the pytorch backend reaches the resolver that could
-            # select one, so on any other backend the promise would be broken
-            # silently -- the one failure that mode exists to prevent.
-            from .._torch._experimental.modeling_v2 import \
-                assert_backend_can_route
-            assert_backend_can_route(backend)
-
             # check the kwargs and raise ValueError directly
             valid_keys = set(
                 list(llm_args_cls.model_fields.keys()) +
@@ -436,6 +428,18 @@ class BaseLLM:
         finally:
             logger.set_level(log_level)  # restore the log level
 
+        # Before the ranks these args go to are spawned and before the usage
+        # report reads them, so that one description of the deployment reaches
+        # both. Imported behind the check so that no other deployment loads
+        # this connector's package, which pulls in its worker and scheduler.
+        # The registry names every preset's module without importing any of
+        # them, and tolerates an absent connector config.
+        from .._torch.pyexecutor.connectors.registry import uses_connector
+        if uses_connector(self.args.kv_connector_config, "mooncake-store"):
+            from .._torch.pyexecutor.connectors.mooncake_store.settings import \
+                apply_effective_settings
+            apply_effective_settings(self.args)
+
         logger_debug(f"LLM.args.mpi_session: {self.args.mpi_session}\n",
                      "yellow")
         self.mpi_session = self.args.mpi_session
@@ -454,9 +458,9 @@ class BaseLLM:
 
         # Attached serving frontends connect to an already-running worker:
         # they must not spawn an MPI session (see GenerationExecutor.create).
-        is_attached_frontend = os.getenv(
+        self._is_attached_frontend = os.getenv(
             "TLLM_EXECUTOR_ATTACH_INFO") is not None
-        if self.args.parallel_config.is_multi_gpu and not is_attached_frontend:
+        if self.args.parallel_config.is_multi_gpu and not self._is_attached_frontend:
             if os.getenv("RAY_LOCAL_WORLD_SIZE") is None and get_device_count(
             ) < self.args.parallel_config.world_size_per_node:
                 raise RuntimeError(
@@ -1622,8 +1626,10 @@ class BaseLLM:
                 "(Router Replay): routes are not captured otherwise.")
 
     def _build_model(self):
-        model_loader = CachedModelLoader(self.args,
-                                         mpi_session=self.mpi_session)
+        model_loader = CachedModelLoader(
+            self.args,
+            mpi_session=self.mpi_session,
+            is_attached_frontend=self._is_attached_frontend)
         self._hf_model_dir = model_loader()
 
     def _try_load_tokenizer(self) -> Optional[TokenizerBase]:

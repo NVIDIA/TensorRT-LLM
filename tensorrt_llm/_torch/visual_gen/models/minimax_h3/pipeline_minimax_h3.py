@@ -23,7 +23,7 @@ from typing import Any, Optional
 
 import numpy as np
 import torch
-from diffusers import AutoencoderKLMiniMaxH3, AutoencoderKLMiniMaxH3Audio, MiniMaxH3Scheduler
+from diffusers import AutoencoderKLMiniMaxH3Audio, MiniMaxH3Scheduler
 from diffusers.utils.torch_utils import randn_tensor
 from PIL import Image, ImageOps
 from transformers import Qwen2TokenizerFast, Qwen3VLForConditionalGeneration, Qwen3VLProcessor
@@ -66,8 +66,25 @@ from .packing import (
     unpatchify_video_tokens,
     video_latent_num_frames,
 )
+from .parallel_vae import TiledAutoencoderKLMiniMaxH3
 from .ref2va import load_references, prepare_references, validate_reference_order
 from .transformer_minimax_h3 import MiniMaxH3Transformer3DModel
+
+
+def _prepare_vae_decoder(vae: TiledAutoencoderKLMiniMaxH3) -> None:
+    """Lossless decode-path preparation for the fp16-autocast decode in ``MiniMaxH3Pipeline._decode_video``.
+
+    * Every ``nn.Linear`` of the ViT decoder is converted to fp16 in place: autocast casts weight and bias to fp16
+      on every call, so converting once gives the same bits under autocast (norm weights and the ``scale1``/``scale2``
+      gains stay fp32, as autocast leaves them). The decoder must therefore keep running under the fp16 autocast of
+      ``_decode_video``; a decode outside it would run fp16 instead of the reference fp32 math.
+    * One tile is decoded eagerly to measure the decoder's memory footprint, so the VAE can size its batched tile
+      decode from the memory free at decode time (``TiledAutoencoderKLMiniMaxH3.calibrate_tile_decode_memory``).
+    """
+    for module in vae.decoder.modules():
+        if isinstance(module, torch.nn.Linear):
+            module.to(torch.float16)
+    vae.calibrate_tile_decode_memory()
 
 
 def _component_skipped(
@@ -154,8 +171,23 @@ class MiniMaxH3Pipeline(BasePipeline):
         return torch.Generator().manual_seed(seed)
 
     def __init__(self, pipeline_config: DiffusionPipelineConfig) -> None:
-        if pipeline_config.mapping.world_size != 1:
-            raise NotImplementedError("MiniMax-H3 initial support is single-GPU only.")
+        vgm = pipeline_config.visual_gen_mapping
+        world_size = vgm.world_size if vgm is not None else pipeline_config.mapping.world_size
+        if world_size != 1:
+            is_pure_ulysses = vgm is not None and vgm.ulysses_size == world_size
+            if not is_pure_ulysses:
+                raise NotImplementedError(
+                    "MiniMax-H3 multi-GPU support is currently limited to pure "
+                    "Ulysses sequence parallelism: cfg_size=1, tp_size=1, "
+                    "ring_size=1, attn2d_size=(1, 1), and "
+                    "ulysses_size=world_size."
+                )
+            if pipeline_config.attention.backend not in ("VANILLA", "FA4"):
+                raise NotImplementedError(
+                    "MiniMax-H3 Ulysses requires VANILLA or FA4 attention. "
+                    "Other attention backends do not support the required "
+                    "packed-row padding mask."
+                )
         if (
             pipeline_config.attention.backend == "TRTLLM"
             and torch.cuda.get_device_capability() not in ((10, 0), (10, 3))
@@ -179,10 +211,33 @@ class MiniMaxH3Pipeline(BasePipeline):
                 "CUDA graphs are not yet supported for MiniMax-H3's packed layout inputs."
             )
         self.workflow = pipeline_config.extra_attrs.get("workflow", "fl2va")
+        vae_size = pipeline_config.parallel.parallel_vae_size
+        if not 1 <= vae_size <= world_size:
+            raise ValueError(
+                "MiniMax-H3 parallel_vae_size must be between 1 and ulysses_size=world_size."
+            )
         self.audio_vae = None
         self.audio_scheduler = None
         self.processor = None
         super().__init__(pipeline_config)
+
+    def setup_parallel_vae(self) -> None:
+        """Use the shared VAE group for independent spatial tile decoding."""
+        size = self.pipeline_config.parallel.parallel_vae_size
+        self._parallel_vae_enabled = size > 1 and self.vae is not None
+        if not self._parallel_vae_enabled:
+            return
+        vgm = self.pipeline_config.visual_gen_mapping
+        if vgm is None:
+            raise RuntimeError("MiniMax-H3 parallel VAE requires a VisualGen mapping.")
+        if self.rank not in vgm.vae_ranks:
+            return
+        if vgm.vae_group is None:
+            raise RuntimeError("MiniMax-H3 parallel VAE requires a VAE group.")
+        if torch.distributed.get_world_size(vgm.vae_group) != size:
+            raise RuntimeError("MiniMax-H3 VAE group size does not match parallel_vae_size.")
+        self.vae.configure_parallel(group=vgm.vae_group)
+        logger.info(f"MiniMax-H3 spatial VAE tile decode ranks={size}")
 
     @property
     def default_generation_params(self) -> dict:
@@ -307,7 +362,7 @@ class MiniMaxH3Pipeline(BasePipeline):
             ).to(device)
             self.text_encoder.eval()
         if not _component_skipped(skip_components, PipelineComponent.VAE):
-            self.vae = AutoencoderKLMiniMaxH3.from_pretrained(
+            self.vae = TiledAutoencoderKLMiniMaxH3.from_pretrained(
                 checkpoint_dir,
                 subfolder=PipelineComponent.VAE,
                 torch_dtype=torch.float32,
@@ -337,6 +392,24 @@ class MiniMaxH3Pipeline(BasePipeline):
             self.scheduler.set_shift(self.VIDEO_SCHEDULER_SHIFT)
         if self.audio_scheduler is not None:
             self.audio_scheduler.set_shift(self.AUDIO_SCHEDULER_SHIFT)
+        if self.vae is not None and self.device.type == "cuda":
+            _prepare_vae_decoder(self.vae)
+
+    def torch_compile(self) -> None:
+        super().torch_compile()
+        # The ViT VAE decoder is 36 identical blocks run once per clip; compile them like the transformer blocks.
+        if self.vae is not None:
+            tc_config = self.pipeline_config.torch_compile
+            blocks = self.vae.decoder.transformer_blocks
+            logger.info(
+                f"torch.compile: vae.decoder.transformer_blocks ({len(blocks)} blocks, mode=default)"
+            )
+            self.vae.decoder.transformer_blocks = torch.nn.ModuleList(
+                torch.compile(
+                    block, mode="default", dynamic=None, fullgraph=tc_config.enable_fullgraph
+                )
+                for block in blocks
+            )
 
     def _load_request_keyframes(
         self,
@@ -898,14 +971,19 @@ class MiniMaxH3Pipeline(BasePipeline):
         latents = torch.cat((condition_prefix, generated_latents), dim=1)[0]
         audio_latents = extra_latents["audio"][0]
         timer.mark_post_start()
-        video = self._decode_video(
+        video, audio = self.decode_latents(
             latents,
-            layout.num_condition_video_rows,
-            num_latent_frames,
-            latent_height,
-            latent_width,
+            decode_fn=lambda rows: self._decode_video(
+                rows,
+                layout.num_condition_video_rows,
+                num_latent_frames,
+                latent_height,
+                latent_width,
+            ),
+            extra_latents={
+                "audio": (audio_latents, lambda rows: self._decode_audio(rows, num_audio_latents))
+            },
         )
-        audio = self._decode_audio(audio_latents, num_audio_latents)
         timer.mark_end()
         logger.info(f"MiniMax-H3 inference completed in {time.time() - pipeline_start:.2f}s")
         return timer.fill(
