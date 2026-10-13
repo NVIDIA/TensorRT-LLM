@@ -2035,13 +2035,41 @@ def test_vbws_rejects_decreasing_beam_width_array(beam_width_array: list[int],
             validate(request)
 
 
-def test_beam_group_key_ignores_row_stride():
-    """Requests differing only in row_stride share a beam-search step."""
-    params = _beam_params(early_stopping=BeamSearchEarlyStop.TRUE)
-    assert params.group_key == (params.beam_width_in, params.beam_width_out,
-                                BeamSearchEarlyStop.TRUE)
-    other = params._replace(row_stride=params.row_stride + 1)
-    assert other.group_key == params.group_key
+@force_ampere
+def test_beam_groups_split_context_and_generation_rows():
+    """A context and a generation request with the same beam widths are sampled
+    in separate steps.
+
+    Under different beam width arrays the two can share (beam_width_in,
+    beam_width_out), while the forward lays out one logits row for the context
+    request and max_beam_width rows for the generation one.
+    """
+    max_beam_width = 2
+    sampler = TorchSampler(
+        TorchSampler.Args(max_seq_len=16,
+                          max_draft_len=0,
+                          max_num_sequences=2,
+                          max_beam_width=max_beam_width,
+                          max_total_draft_tokens=0))
+    context = _vbws_request([2, 2], max_beam_width=max_beam_width)
+    generation = _vbws_request([1, 2], max_beam_width=max_beam_width)
+    generation.py_seq_slot = 1
+    generation.state = LlmRequestState.GENERATION_IN_PROGRESS
+    _set_vbws_iteration(generation, 1)
+    batch = [context, generation]
+    context_params, generation_params = (BeamSearchParams.from_request(r)
+                                         for r in batch)
+    assert context_params[:2] == generation_params[:2] == (1, 2)
+    assert (context_params.row_stride, generation_params.row_stride) == (1, 2)
+
+    sampler._slot_params.admit(
+        batch, torch.tensor([0, 1], dtype=torch.int64, device="cuda"))
+    groups = sampler._group_requests(batch, [0, 1])
+    assert [g.req_indices for g in groups] == [[0], [1]]
+    for group in groups:
+        BeamSearchStep.from_params(group.beam_params,
+                                   torch.device("cuda"),
+                                   return_probs=False)
 
 
 def test_vbws_uniform_array_matches_fixed_width():

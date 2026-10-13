@@ -1070,9 +1070,14 @@ class BeamSearchParams(NamedTuple):
         )
 
     @property
-    def group_key(self) -> tuple[int, int, BeamSearchEarlyStop]:
-        """What requests sampled in one beam-search step must share."""
-        return self.beam_width_in, self.beam_width_out, self.early_stopping
+    def group_key(self) -> tuple[int, int, int, BeamSearchEarlyStop]:
+        """What requests sampled in one beam-search step must share.
+
+        ``row_stride`` is part of it: a context request (one logits row) and a
+        generation request (``py_beam_width`` rows) can have the same beam
+        widths under different beam width arrays.
+        """
+        return self.beam_width_in, self.beam_width_out, self.row_stride, self.early_stopping
 
 
 class BeamSearchStep:
@@ -1108,11 +1113,7 @@ class BeamSearchStep:
         cls, params: list[BeamSearchParams], device: torch.device, *, return_probs: bool
     ) -> "BeamSearchStep":
         (group_key,) = set(p.group_key for p in params)
-        beam_width_in, beam_width_out, early_stopping = group_key
-        # row_stride is not part of the group key. It is unique because
-        # admission pins every request to max_beam_width; unpacking fails loudly
-        # should narrower requests ever be admitted.
-        (row_stride,) = set(p.row_stride for p in params)
+        beam_width_in, beam_width_out, row_stride, early_stopping = group_key
 
         def _to_device(values: list[float]) -> torch.Tensor:
             return torch.tensor(values, dtype=torch.float32, pin_memory=prefer_pinned()).to(

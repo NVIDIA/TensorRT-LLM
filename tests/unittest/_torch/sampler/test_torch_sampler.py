@@ -2275,7 +2275,10 @@ class TestBatchedSampling:
         ) -> tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
             assert return_probs not in fused_calls
             fused_calls.append(return_probs)
-            return sample_fused_orig(logits, slots_per_row, return_probs=return_probs)
+            tokens, probs, temperature = sample_fused_orig(
+                logits, slots_per_row, return_probs=return_probs
+            )
+            return tokens, probs, temperature
 
         patch_ctx.setattr(sampler, "_sample_fused", _sample_fused)
 
