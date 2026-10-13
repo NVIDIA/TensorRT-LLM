@@ -38,8 +38,8 @@ from tensorrt_llm._torch._experimental.modeling_v2 import MODELING_V2_VALIDATE_E
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig, MTPDecodingConfig
 
-from ..conftest import llm_models_root
-from .accuracy_core import (
+from ...conftest import llm_models_root
+from ..accuracy_core import (
     GSM8K,
     LlmapiAccuracyTestHarness,
     assert_acceptance_length,

@@ -33,8 +33,8 @@ from tensorrt_llm import LLM
 from tensorrt_llm._torch._experimental.modeling_v2 import MODELING_V2_VALIDATE_ENV
 from tensorrt_llm._utils import get_sm_version
 
-from ..conftest import llm_models_root
-from .accuracy_core import GSM8K, LlmapiAccuracyTestHarness
+from ...conftest import llm_models_root
+from ..accuracy_core import GSM8K, LlmapiAccuracyTestHarness
 
 # The targets assert their own SM at construction: certification is per GPU
 # architecture, and a receipt from another one says nothing here.

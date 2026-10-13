@@ -2,11 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """GPU test for the chunk_gated_delta_rule entry.
 
-Every indexed in-place cell is preceded by a throwaway warm-up at the same
-autotune key: the first such call in a process is a known defect (see the
-entry's note), asserted by the cold-call tests at the bottom rather than
-tripped over by the cells. Those that need a process of their own re-run this
-file as a child: `python <this file> <mode>`.
+The first indexed in-place call per autotune key in a process must be as correct as a
+warm one: the state kernel's autotuner restores the indexed state its benchmark launches
+write. "First call in the process" is a property of the process, so the cold-call tests
+re-run this file as a child: `python <this file> <mode>`.
 """
 
 import os
@@ -118,29 +117,6 @@ def _pool(num_slots: int, seed: int, num_v_heads: int = NUM_V_HEADS) -> torch.Te
     return torch.randn(shape, generator=gen, device=DEV) * 0.1
 
 
-def _prime_indexed_state_kernel(num_k_heads=NUM_K_HEADS, num_v_heads=NUM_V_HEADS) -> None:
-    """The certified warm-up: one throwaway indexed call on a 1-slot scratch
-    pool, at the key every indexed cell uses (H, K, V and every dtype)."""
-    q, k, v, g, beta, cu_seqlens = _operands(
-        (64,), seed=999_983, num_k_heads=num_k_heads, num_v_heads=num_v_heads
-    )
-    op(
-        q,
-        k,
-        v,
-        g,
-        beta,
-        None,
-        _pool(1, seed=999_984, num_v_heads=num_v_heads),
-        torch.zeros(1, dtype=torch.int32, device=DEV),
-        True,
-        False,
-        cu_seqlens,
-        False,
-        None,
-    )
-
-
 def _gate_output(o: torch.Tensor, ref: tuple) -> None:
     """`_compare`, on `o` alone."""
     _compare((o, None, None), (ref[0], None, None))
@@ -198,8 +174,6 @@ def _build(spec, seed):
 @pytest.mark.parametrize("cell", op.CELLS, ids=[c.why[:44] for c in op.CELLS])
 def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — pytest resolves the fixture by this name
     spec = cell.spec
-    if spec["initial"] == "indexed":
-        _prime_indexed_state_kernel()
     certifying(op)
     args, wide = _build(spec, seed=zlib.crc32(cell.why.encode()) % 2**31)
     pool = args[6]
@@ -309,31 +283,9 @@ def test_gate_discriminates_wrong_variants() -> None:
             _gate_output(wrong[0], ref)
 
 
-def test_first_indexed_call_for_a_key_deviates_from_the_reference() -> None:
-    """The cold call, asserted wrong: the defect is the product.
-
-    A head geometry (5 key / 20 value heads) nothing else here uses, so this is
-    the first indexed call at its key. Measured: output 1.7e-2 off on a
-    reference magnitude of 6.1e-2, against 4.2e-4 warm. The state is asserted
-    right -- this gate domain decays the corrupted initial state away by the
-    end of the sequence (1.7e-3 against the 2e-2 gate). A `DID NOT RAISE` means
-    the autotuner stopped corrupting `h0`: update the entry's note.
-    """
-    q, k, v, g, beta, cu = _operands((96,), seed=83, num_k_heads=5, num_v_heads=20)
-    pool = _pool(4, seed=831, num_v_heads=20)
-    indices = torch.tensor([1], dtype=torch.int32, device=DEV)
-    args = (q, k, v, g, beta, None, pool, indices, True, False, cu, False, None)
-    ref = op.reference(*args)
-    o, _ = op(*args)
-    with pytest.raises(AssertionError, match="Tensor-likes are not close"):
-        _gate_output(o, ref)
-    _gate_pool(pool, ref)
-
-
 # ---------------------------------------------------------------------------
-# The cold call at this checkpoint's geometry. "First indexed call in the
-# process" is a property of the process, and the cells above have warmed this
-# key by the time pytest reaches these, so each runs in a fresh interpreter.
+# The cold call. The cells above have already benchmarked these autotune keys by
+# the time pytest reaches these, so each runs in a fresh interpreter.
 
 CHILD_TIMEOUT_S = 420
 #: The GDN prefill call shape, packed varlen, state by slot index.
@@ -364,78 +316,44 @@ def _checkpoint_case(seed: int = 101):
     return (q, k, v, g, beta, None, pool, indices, True, False, cu, False, buf)
 
 
-def _report(tag: str, o, pool, ref) -> None:
-    print(
-        f"{tag}: max|o - ref| = {(o.float() - ref[0].float()).abs().max().item():.3e}; "
-        f"max|pool - ref| = {(pool - ref[2]).abs().max().item():.3e}"
-    )
-
-
 def _child_cold_call() -> None:
     autotuner = _state_kernel_autotuner()
     assert not autotuner.cache, "the child must be the first indexed call in its process"
     args = _checkpoint_case()
     ref = op.reference(*args)
     o, _ = op(*args)
-    print("autotune keys after the call:", list(autotuner.cache))
-    _report("cold", o, args[6], ref)
-    with pytest.raises(AssertionError, match="Tensor-likes are not close"):
-        _gate_output(o, ref)
+    assert len(autotuner.cache) == 1, "the call must have benchmarked exactly one key"
+    _gate_output(o, ref)
     _gate_pool(args[6], ref)
 
 
-def _child_warmup_then_first_real_call() -> None:
+def _child_cold_call_odd_heads() -> None:
+    """A head geometry (5 key / 20 value heads) nothing else uses."""
     autotuner = _state_kernel_autotuner()
-    _prime_indexed_state_kernel()
-    primed = set(autotuner.cache)
-    assert len(primed) == 1, f"one warm-up, one autotune key; got {primed}"
-    args = _checkpoint_case()
-    pool_before = args[6].clone()
+    assert not autotuner.cache, "the child must be the first indexed call in its process"
+    q, k, v, g, beta, cu = _operands((96,), seed=83, num_k_heads=5, num_v_heads=20)
+    pool = _pool(4, seed=831, num_v_heads=20)
+    indices = torch.tensor([1], dtype=torch.int32, device=DEV)
+    args = (q, k, v, g, beta, None, pool, indices, True, False, cu, False, None)
     ref = op.reference(*args)
     o, _ = op(*args)
-    assert set(autotuner.cache) == primed, "the real call re-benchmarked: warm-up missed its key"
-    _report("first real call after a scratch warm-up", o, args[6], ref)
-    _compare((o, None, args[6]), (ref[0], None, ref[2]))
-    assert torch.equal(args[6][[1, 3]], pool_before[[1, 3]]), "unnamed slots written"
-
-
-def _child_warmup_key_controls() -> None:
-    """Which warm-ups consume the real call's benchmark; asserted on the
-    autotuner's cache, so it keeps its meaning once the kernel is fixed."""
-    autotuner = _state_kernel_autotuner()
-    assert not autotuner.cache
-    idx = torch.zeros(1, dtype=torch.int32, device=DEV)
-    # (a) a different value-head count.
-    q, k, v, g, beta, cu = _operands((64,), seed=201, num_k_heads=8, num_v_heads=32)
-    op(q, k, v, g, beta, None, _pool(1, 202, 32), idx, True, False, cu, False, None)
-    # (b) int32 cu_seqlens.
-    q, k, v, g, beta, cu = _operands((64,), seed=203)
-    op(q, k, v, g, beta, None, _pool(1, 204), idx, True, False, cu.int(), False, None)
-    # (c) the positional path.
-    q, k, v, g, beta, cu = _operands((64,), seed=205)
-    op(q, k, v, g, beta, None, _pool(1, 206), None, False, True, cu, False, None)
-    missed = set(autotuner.cache)
-    print("keys after the three mismatched warm-ups:", list(missed))
-    assert len(missed) == 3, f"each mismatched warm-up owns a key of its own; got {missed}"
-    # (d) the matching one, differing from the real call in T and Hg only.
-    _prime_indexed_state_kernel(num_k_heads=8)
-    matched = set(autotuner.cache) - missed
-    assert len(matched) == 1, f"the matching warm-up must add exactly one key; got {matched}"
-    op(*_checkpoint_case(seed=207))
-    assert set(autotuner.cache) == missed | matched, "the real call hit a key no warm-up reached"
+    assert len(autotuner.cache) == 1, "the call must have benchmarked exactly one key"
+    _gate_output(o, ref)
+    _gate_pool(pool, ref)
 
 
 _CHILD_MODES = {
     "cold-call": _child_cold_call,
-    "warmup-then-real": _child_warmup_then_first_real_call,
-    "warmup-key-controls": _child_warmup_key_controls,
+    "cold-call-odd-heads": _child_cold_call_odd_heads,
 }
 
 
 def _run_child(mode: str) -> None:
     # `_validating` lives four directories up; the child has no pytest to
     # resolve `__extra_import_path__` for it.
-    env = dict(os.environ, PYTHONPATH=str(Path(__file__).resolve().parents[4]))
+    root = str(Path(__file__).resolve().parents[4])
+    existing = os.environ.get("PYTHONPATH")
+    env = dict(os.environ, PYTHONPATH=root if not existing else os.pathsep.join([root, existing]))
     proc = subprocess.run(
         [sys.executable, __file__, mode],
         capture_output=True,
@@ -451,23 +369,14 @@ def _run_child(mode: str) -> None:
 
 
 def test_cold_indexed_call_at_this_checkpoints_geometry() -> None:
-    """The first indexed call of a process at 16 / 48 heads, K = V = 128, in
-    the mixer's shape (256 + 96 packed, by slot, into `output=`): output
-    measured 4.034e-02 off against the 2e-3 gate (reference max 7.5e-02),
-    asserted wrong; the state stays inside its gate in this gate domain."""
+    """The first indexed call of a process at 16 / 48 heads, K = V = 128, in the
+    mixer's shape (256 + 96 packed, by slot, into `output=`), matches the reference."""
     _run_child("cold-call")
 
 
-def test_scratch_warmup_makes_the_first_real_call_correct() -> None:
-    """One throwaway call on a 1-slot scratch pool, then the process's first
-    real call is correct: 4.883e-04 / 2.595e-03 on the same operands."""
-    _run_child("warmup-then-real")
-
-
-def test_only_a_key_matching_warmup_consumes_the_benchmark() -> None:
-    """A different `H`, int32 `cu_seqlens`, or the positional path each
-    benchmark a key of their own; `T` and `Hg` are not in the key."""
-    _run_child("warmup-key-controls")
+def test_cold_indexed_call_at_an_unused_head_geometry() -> None:
+    """The same at 5 / 20 heads, an autotune key nothing else here touches."""
+    _run_child("cold-call-odd-heads")
 
 
 if __name__ == "__main__":
