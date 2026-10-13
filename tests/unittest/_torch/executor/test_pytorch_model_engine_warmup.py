@@ -314,6 +314,8 @@ def test_prefill_compile_scopes_whole_model_forward(
     engine = SimpleNamespace(
         _model_caller=ModelCaller(model, prefill_compile_only=prefill_only),
         _eager_workspace_reclaimer=None,
+        _moe_workspace_reclaimer=None,
+        _is_warmup=False,
     )
     monkeypatch.setattr(model_call_module, "get_model_extra_attrs", lambda: {})
     monkeypatch.setattr(
@@ -392,6 +394,8 @@ def test_compiled_mxfp8_warmup_backend_selection(
         _agree_warmup_flag=lambda flag: flag,
         _torch_compile_backend=None,
         _eager_workspace_reclaimer=None,
+        _moe_workspace_reclaimer=None,
+        _is_warmup=False,
         is_warmup=True,
         cuda_graph_runner=SimpleNamespace(enabled=True),
         model=SimpleNamespace(
@@ -977,11 +981,18 @@ class TestWarmupCleanup(unittest.TestCase):
     def test_decoder_runner_warmup_sampling_and_kv_cache_cleanup(self) -> None:
         """Verify sampling warmup coverage and KV-cache cleanup timing within total warmup."""
         runner = object.__new__(DecoderRunner)
+        runner._is_warmup = False
+        runner._moe_workspace_reclaimer = None
+        runner._eager_workspace_reclaim_supported = False
+        runner.mapping = SimpleNamespace(cp_size=1)
         runner._warmup_timer = _WarmupTimer(rank=0)
         runner.kv_cache_manager_key = ResourceManagerType.KV_CACHE_MANAGER
         runner.model = SimpleNamespace(config=SimpleNamespace(vocab_size=128))
         runner._config = SimpleNamespace(
-            dtype=torch.float16, cuda_graph_batch_sizes=[1, 4], enable_in_graph_sampling=False
+            dtype=torch.float16,
+            cuda_graph_batch_sizes=[1, 4],
+            enable_in_graph_sampling=False,
+            is_spec_decode=False,
         )
         model_engine = object.__new__(PyTorchModelEngine)
         model_engine._metrics = runner._metrics = {}
