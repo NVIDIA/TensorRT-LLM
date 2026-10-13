@@ -8,9 +8,11 @@ import torch
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.kimi_k3_noaux_tc_mxfp8_quant import (
     kimi_k3_noaux_tc_mxfp8_quant,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.noaux_tc_op import noaux_tc_op
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.quantization.mxfp8_quantize import (
-    mxfp8_quantize,
+from tensorrt_llm._torch._experimental.modeling_v2.models.deepseek_v3.r1_0528_nvfp4__sm_103__dep4.ops.moe import (
+    noaux_tc_op as noaux_tc,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.gpt_oss.gpt_oss_120b__sm_103__tp1.ops.quantization import (
+    mxfp8_quantize as mxfp8,
 )
 
 assert torch.cuda.is_available(), "kimi_k3_noaux_tc_mxfp8_quant requires a CUDA device"
@@ -45,7 +47,7 @@ def _check(logits, bias, hidden, routed_scaling_factor):
     assert sf.shape == (num_tokens, SF_COLS) and sf.dtype == torch.uint8
     assert all(t.is_contiguous() and t.device == logits.device for t in (ids, weights, data, sf))
 
-    ref_weights, ref_ids = noaux_tc_op(logits, bias, 1, 1, TOPK, routed_scaling_factor)
+    ref_weights, ref_ids = noaux_tc.noaux_tc_op(logits, bias, 1, 1, TOPK, routed_scaling_factor)
     assert torch.equal(ids, ref_ids)
     # The kernel rounds each weight once, fp64 -> bf16; noaux_tc_op rounds fp64 -> fp32. Rounding that
     # fp32 to bf16 differs only where the fp32 value sits exactly on a bf16 midpoint (or where the two
@@ -56,7 +58,7 @@ def _check(logits, bias, hidden, routed_scaling_factor):
     mismatched = int((weights != ref_bf16).sum())
     assert mismatched <= 1 + weights.numel() // 1000, (num_tokens, mismatched)
 
-    ref_data, ref_sf = mxfp8_quantize(hidden, False, 512)
+    ref_data, ref_sf = mxfp8.mxfp8_quantize(hidden, False, 512)
     assert torch.equal(data.view(torch.uint8), ref_data.view(torch.uint8))
     assert torch.equal(sf, ref_sf.view(num_tokens, SF_COLS))
     return ids, weights, data, sf

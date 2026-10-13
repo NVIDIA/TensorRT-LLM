@@ -35,6 +35,7 @@ the DeepSeek tree, and a target's modeling code is imported only on the
 from __future__ import annotations
 
 import enum
+import os
 from importlib import import_module
 from typing import TYPE_CHECKING, Optional, Tuple
 
@@ -52,6 +53,32 @@ MODELING_V2_ROUTERS = {
     "DeepseekV3ForCausalLM": "models.deepseek_v3.routing",
     "KimiK3ForConditionalGeneration": "models.kimi_k3_vl.routing",
 }
+
+
+#: Turns the step contract check on. Off by default, so a served engine runs
+#: the forward and nothing else: the checks describe facts fixed at engine
+#: construction, and a check that can only ever hold is a check whose failure
+#: mode is its own bug taking down a working deployment.
+#:
+#: An environment variable rather than an LLM arg while modeling_v2 is
+#: experimental; it has to reach the ranks, so a test passes it through
+#: ``env_overrides``. When this stops being experimental it belongs in the
+#: LLM args, where a caller can set it per engine rather than per process.
+MODELING_V2_VALIDATE_ENV = "TRTLLM_MODELING_V2_VALIDATE"
+
+
+def step_contract_enabled() -> bool:
+    """Whether targets should check their step contract on the first forward.
+
+    Read once per model instance at construction rather than per forward: the
+    answer cannot change within a process, and the forward is the hot path.
+    """
+    return os.environ.get(MODELING_V2_VALIDATE_ENV, "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
 
 
 class ModelingV2Mode(str, enum.Enum):

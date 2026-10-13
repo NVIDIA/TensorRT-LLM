@@ -58,8 +58,6 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.k3_head_gemv imp
     k3_head_gemv,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.k3_embed_norm import k3_embed_norm
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.torch.concat import concat
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.torch.split import split
 
 # The kernels' support predicates: metadata reads only.
 from tensorrt_llm._torch.cute_dsl_kernels.k3_ctm_gemv import op as _ctm_op
@@ -357,7 +355,7 @@ class K3DecodeGemvs:
         if not gather or len(group) == 1:
             return local
         gathered = allgather(local, None, group)
-        return concat(list(split(gathered, rows.shape[0], dim=0)), dim=-1)
+        return torch.cat(torch.split(gathered, rows.shape[0], dim=0), dim=-1)
 
     def dense_mlp(
         self,

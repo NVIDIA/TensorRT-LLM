@@ -69,8 +69,8 @@ from mpi4py.futures import MPIPoolExecutor
 from transformers.configuration_utils import PretrainedConfig
 
 import tensorrt_llm.bindings.internal.runtime as _tbr
-from tensorrt_llm._mnnvl_utils import MnnvlMemory
 from tensorrt_llm._torch.autotuner import AutoTuner, autotune
+from tensorrt_llm._torch.distributed.mnnvl_memory import MnnvlMemory
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.moe.fused_moe import (
     DEFAULT_MOE_ACTIVATION,
@@ -801,7 +801,7 @@ def _test_moe_worker_impl(
 # thread is spawned lazily on first submit and persists by design, so the
 # multi-GPU tests disable pytest-threadleak via @pytest.mark.threadleak(
 # enabled=False) (same convention as the conftest mpi_pool_executor users
-# test_moe_a2a / test_autotuner), rather than excluding it in pytest.ini.
+# test_nvlink_one_sided / test_autotuner), rather than excluding it in pytest.ini.
 # ---------------------------------------------------------------------------
 
 
@@ -863,7 +863,7 @@ def moe_multi_gpu_executor():
     pool's manager thread is spawned lazily on first submit and persists by
     design, so the multi-GPU tests disable pytest-threadleak via
     @pytest.mark.threadleak(enabled=False) (same convention as the other
-    mpi_pool_executor users, test_moe_a2a / test_autotuner). world_size is 4.
+    mpi_pool_executor users, test_nvlink_one_sided / test_autotuner). world_size is 4.
     """
     world_size = 4
     with MPIPoolExecutor(

@@ -157,14 +157,14 @@ l0_b200:
   - unittest/_torch/modeling_v2/norm/test_modeling_v2_rms_norm_gated_token_major.py
   - unittest/_torch/modeling_v2/activation/test_modeling_v2_situ_and_mul.py
   - unittest/_torch/modeling_v2/moe/test_modeling_v2_kimi_k3_noaux_tc_mxfp8_quant.py
-  - unittest/_torch/modeling_v2/moe/test_modeling_v2_noaux_tc_op.py::test_kimi_k3_config
-  - unittest/_torch/modeling_v2/quantization/test_modeling_v2_mxfp8_quantize.py::test_kimi_k3_routed_hidden
-  - unittest/_torch/modeling_v2/moe/test_modeling_v2_mxe4m3_mxe2m1_block_scale_moe_runner.py
+  - unittest/_torch/modeling_v2/models/deepseek_v3/r1_0528_nvfp4__sm_103__dep4/moe/test_modeling_v2_noaux_tc_op.py::test_kimi_k3_config
+  - unittest/_torch/modeling_v2/models/gpt_oss/gpt_oss_120b__sm_103__tp1/quantization/test_modeling_v2_mxfp8_quantize.py::test_kimi_k3_routed_hidden
+  - unittest/_torch/modeling_v2/models/gpt_oss/gpt_oss_120b__sm_103__tp1/moe/test_modeling_v2_mxe4m3_mxe2m1_block_scale_moe_runner.py
   - unittest/_torch/modeling_v2/attention/test_modeling_v2_thop_attention.py::test_kimi_k3_mla_context_bf16_page64
   - unittest/_torch/modeling_v2/attention/test_modeling_v2_thop_attention.py::test_kimi_k3_mla_generation_bf16_page64
-  - unittest/_torch/modeling_v2/attention/test_modeling_v2_mla_rope_generation.py
-  - unittest/_torch/modeling_v2/attention/test_modeling_v2_mla_rope_append_paged_kv_assign_q.py
-  - unittest/_torch/modeling_v2/attention/test_modeling_v2_load_paged_kv_cache_for_mla.py
+  - unittest/_torch/modeling_v2/models/deepseek_v3/r1_0528_nvfp4__sm_103__dep4/attention/test_modeling_v2_mla_rope_generation.py
+  - unittest/_torch/modeling_v2/models/deepseek_v3/r1_0528_nvfp4__sm_103__dep4/attention/test_modeling_v2_mla_rope_append_paged_kv_assign_q.py
+  - unittest/_torch/modeling_v2/models/deepseek_v3/r1_0528_nvfp4__sm_103__dep4/attention/test_modeling_v2_load_paged_kv_cache_for_mla.py
   # CuTe MTP verify kernel parity (trtllm::kda_mtp_decode).
   - unittest/_torch/modules/kimi_kda/test_kda_mtp_decode_cute_parity.py
   - unittest/_torch/modules/kimi_k3_attn_res/test_attn_res_op.py
@@ -322,7 +322,7 @@ l0_b200:
   - unittest/_torch/cute_dsl_kernels/kimi_k3/test_k3_drafter_attn.py
   - unittest/_torch/modeling_v2/attention/test_modeling_v2_k3_drafter_attn.py
   - unittest/_torch/modeling_v2/attention/test_modeling_v2_k3_drafter_attn_qknorm.py
-  - unittest/_torch/modeling_v2/attention/test_modeling_v2_fused_qk_norm_rope.py
+  - unittest/_torch/modeling_v2/models/gpt_oss/gpt_oss_120b__sm_103__tp1/attention/test_modeling_v2_fused_qk_norm_rope.py
   # Kimi K3 DSpark decode kernels (CuTe DSL, SM 100), one GPU: the acceptance against vocabulary-sharded target
   # logits and the drafter's context K / V. Their multi-rank tests are in l0_gb200_multi_gpus.yml.
   - unittest/_torch/cute_dsl_kernels/kimi_k3/test_k3_spec_accept.py
@@ -475,6 +475,7 @@ l0_b200:
   - unittest/_torch/visual_gen/test_glm_image_transformer.py
   - unittest/_torch/visual_gen/test_glm_image_pipeline.py
   - unittest/_torch/visual_gen/test_minimax_h3_transformer.py
+  - unittest/_torch/visual_gen/test_minimax_h3_vae_decode.py
   - examples/visual_gen/test_minimax_h3_e2e.py::test_minimax_h3_public_visual_gen_api_smoke TIMEOUT (30)
   - examples/visual_gen/test_minimax_h3_e2e.py::test_minimax_h3_diffusers_lpips_and_audio_reference[t2va] TIMEOUT (30)
   - examples/visual_gen/test_minimax_h3_e2e.py::test_minimax_h3_diffusers_lpips_and_audio_reference[fl2va] TIMEOUT (30)
