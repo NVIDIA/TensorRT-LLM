@@ -77,6 +77,49 @@ def get_model_yaml_config(model_label: str,
     # Pattern-based configurations for models matching specific substrings
     # This allows for flexible configuration of models based on naming patterns
     pattern_configs = [
+        {
+            'patterns': ['deepseek_v41_flash_nvfp4'],
+            'config': {
+                'gpus_per_node': 4,
+                'attn_backend': 'TRTLLM',
+                'enable_attention_dp': True,
+                'allreduce_strategy': 'NCCL',
+                'moe_config': {
+                    'backend': 'TRTLLM'
+                },
+                'custom_tokenizer': 'deepseek_v41',
+                'trust_remote_code': True,
+                'max_seq_len': 9344,
+                'enable_chunked_prefill': True,
+                'disable_overlap_scheduler': False,
+                'enable_iter_perf_stats': True,
+                'cuda_graph_config': {
+                    'enable_padding': True,
+                    'batch_sizes': [1, 2, 4, 8, 16, 32],
+                },
+                'kv_cache_config': {
+                    'dtype': 'fp8',
+                    'tokens_per_block': 128,
+                    'max_tokens': 262144,
+                    'enable_block_reuse': False,
+                    'enable_swa_scratch_reuse': False,
+                },
+                'sparse_attention_config': {
+                    'algorithm': 'csa2'
+                },
+                'speculative_config': None,
+            }
+        },
+        {
+            'patterns': ['deepseek_v41_flash_nvfp4_dspark'],
+            'config': {
+                'speculative_config': {
+                    'decoding_type': 'DSpark',
+                    'max_draft_len': 5,
+                    'block_size': 5,
+                },
+            }
+        },
         # MAX NVFP4 TP8/MTP3 follows accuracy PR #18071.
         {
             'patterns': ['qwen3.8_max_fp4_mtp-serve-pytorch'],
