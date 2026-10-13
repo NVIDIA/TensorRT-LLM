@@ -11,7 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
 """Beam search for ``TorchSampler``.
 
 The candidate-selection, beam-expansion and candidate-beams-array (CBA) logic:
@@ -1609,6 +1608,9 @@ class BeamSearchHandler:
             )
             if cba_group is None:
                 return None
+            # The copies above are non-blocking; wait for them to finish before reading
+            # them.
+            torch.cuda.current_stream().synchronize()
             inner = _prepare_beam_history_cba(request, cba_group=cba_group)
             return inner() if inner is not None else None
 
