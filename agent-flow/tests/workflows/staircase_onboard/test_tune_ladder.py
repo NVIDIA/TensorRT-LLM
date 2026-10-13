@@ -235,3 +235,20 @@ def test_only_near_miss_neutral_rungs_are_probed_again(tmp_path):
     probes = [l for l in runner.submitted if "control" not in l and "combine" not in l]
     assert sum("stream-interval-4" in l for l in probes) == 2, probes
     assert sum("gc-gen0-100k" in l for l in probes) == 1, probes
+
+
+def test_a_probe_that_finished_while_no_process_watched_is_judged_on_resume(tmp_path):
+    """The orchestrator restarts after a probe finished but before it polled it: the
+    rung's measurement is on disk, so the resumed ladder judges it instead of waiting."""
+    rungs = [r for r in default_rungs() if r.name in ("cg-padding", "in-graph-sampling")]
+    ladder, runner = _ladder(tmp_path, rungs)
+    ladder.step()  # controls queued
+    ladder.step()  # controls measured, probes queued
+    runner.poll()  # the probes finish; nobody calls ladder.step() before the restart
+    assert {rs.status for rs in ladder.state.rungs.values()} == {"running"}
+    again, runner2 = _ladder(tmp_path, rungs)
+    for _ in range(50):
+        if not again.step():
+            break
+    assert set(again.state.kept) == {"cg-padding", "in-graph-sampling"}
+    assert not any(l.startswith("w00-cg-padding") for l in runner2.submitted)  # not measured twice

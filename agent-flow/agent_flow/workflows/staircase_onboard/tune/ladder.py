@@ -447,6 +447,10 @@ class Ladder:
         labels = list(st.control_labels) + [rs.label for rs in st.rungs.values() if rs.status == "running"]
         if st.combine_label:
             labels.append(st.combine_label)
+        for rs in st.rungs.values():
+            # Finished while no process watched it: its measurement is on disk.
+            if rs.status == "running" and rs.label and self._measurement(rs.label):
+                rs.status = "measured"
         for label in labels:
             if label and not self._measurement(label) and not self.runner.adopt(label):
                 self.log(f"[ladder] resume: {label} has no measurement and no job; it will be re-queued")
