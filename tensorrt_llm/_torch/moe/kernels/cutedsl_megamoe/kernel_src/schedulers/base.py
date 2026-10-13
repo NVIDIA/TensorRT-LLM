@@ -1,6 +1,3 @@
-# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
-
 """Scheduler façade and architecture-independent work-tile transport."""
 
 from abc import ABC, abstractmethod
@@ -14,6 +11,7 @@ from cutlass.cutlass_dsl import extract_mlir_values, new_from_mlir_values
 from ...api import ImplDesc, KernelComponent, ProblemDesc
 from ...helpers.device_workspace import DeviceWorkspace
 from ...helpers.smem_workspace import SmemWorkspace
+
 
 WorkIdAcquisitionMode = Literal["grid_stride", "atomic_counter", "cluster_launch_control"]
 
@@ -55,9 +53,7 @@ class SchedulerConsumer:
         self._pipeline = scheduler_pipeline
         self._smem_buffer = smem_buffer
         self._work_tile_type = work_tile_type
-        self._consumer_state = pipeline.make_pipeline_state(
-            pipeline.PipelineUserType.Consumer, num_stages
-        )
+        self._consumer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, num_stages)
 
     def __extract_mlir_values__(self) -> list:
         return extract_mlir_values(self._consumer_state)
@@ -122,9 +118,7 @@ class SchedulerBase(KernelComponent):
             )
         work_tile_type = self.work_tile_type
         work_tile_field_count = work_tile_type.storage_field_count
-        smem_workspace.register_mbarrier(
-            self.pipeline_mbarriers_region, self.num_scheduler_stages * 2
-        )
+        smem_workspace.register_mbarrier(self.pipeline_mbarriers_region, self.num_scheduler_stages * 2)
         smem_workspace.register_tensor(
             self.work_tiles_region,
             work_tile_type.storage_dtype,
@@ -138,16 +132,12 @@ class SchedulerBase(KernelComponent):
         pass
 
     @cute.jit
-    def create_scheduler_pipelines(
-        self, smem_workspace: SmemWorkspace, smem_base: cute.Pointer
-    ) -> None:
+    def create_scheduler_pipelines(self, smem_workspace: SmemWorkspace, smem_base: cute.Pointer) -> None:
         """Create CTA-lifetime scheduler pipelines and transport state."""
         self._pipeline = pipeline.PipelineAsync.create(
             num_stages=self.num_scheduler_stages,
             producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 32),
-            consumer_group=pipeline.CooperativeGroup(
-                pipeline.Agent.Thread, self.num_scheduler_consumer_threads
-            ),
+            consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, self.num_scheduler_consumer_threads),
             barrier_storage=smem_workspace.ptr(self.pipeline_mbarriers_region, smem_base),
             defer_sync=True,
         )
@@ -168,13 +158,9 @@ class SchedulerBase(KernelComponent):
     @cute.jit
     def publish_work(self, work_tile: SchedulerWorkTileBase) -> None:
         """Publish one work tile through the common transport pipeline."""
-        copy_atom = cute.make_copy_atom(
-            cute.nvgpu.CopyUniversalOp(), work_tile.storage_dtype, num_bits_per_copy=128
-        )
+        copy_atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), work_tile.storage_dtype, num_bits_per_copy=128)
         self._pipeline.producer_acquire(self._producer_state)
-        cute.copy(
-            copy_atom, work_tile.to_rmem(), self._smem_buffer[(None, self._producer_state.index)]
-        )
+        cute.copy(copy_atom, work_tile.to_rmem(), self._smem_buffer[(None, self._producer_state.index)])
         cute.arch.fence_proxy("async.shared", space="cta")
         self._pipeline.producer_commit(self._producer_state)
         self._producer_state.advance()
@@ -202,9 +188,7 @@ class SchedulerBase(KernelComponent):
         return result
 
     @abstractmethod
-    def get_grid_shape(
-        self, *, max_active_clusters: Optional[int] = None, problem_desc: Any = None
-    ):
+    def get_grid_shape(self, *, max_active_clusters: Optional[int] = None, problem_desc: Any = None):
         """Return the launch grid from static scheduler policy."""
         ...
 

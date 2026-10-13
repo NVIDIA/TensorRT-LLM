@@ -1,7 +1,5 @@
-# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
-
 """Specification-defined numeric constants shared across kernel components."""
+
 
 Log2E = 1.4426950408889634
 Fp32Max = 3.40282346638528859812e38

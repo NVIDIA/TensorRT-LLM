@@ -1,6 +1,3 @@
-# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
-
 """Lane- and warp-distributed GPU release-counter batching."""
 
 import dataclasses
@@ -24,22 +21,15 @@ class GpuReleaseFlagBatchTracker:
     thread_idx: Int32
 
     @cute.jit
-    def _make(
-        self, flag_address: Int64, accumulated_flags: Int32, phase: Int32
-    ) -> "GpuReleaseFlagBatchTracker":
+    def _make(self, flag_address: Int64, accumulated_flags: Int32, phase: Int32) -> "GpuReleaseFlagBatchTracker":
         return type(self)(
-            flag_address=flag_address,
-            accumulated_flags=accumulated_flags,
-            phase=phase,
-            thread_idx=self.thread_idx,
+            flag_address=flag_address, accumulated_flags=accumulated_flags, phase=phase, thread_idx=self.thread_idx
         )
 
     @cute.jit
     def fire(self) -> None:
         if self.flag_address != Int64(0):
-            pointer = cute.make_ptr(
-                cutlass.Int32, self.flag_address, AddressSpace.gmem, assumed_align=4
-            )
+            pointer = cute.make_ptr(cutlass.Int32, self.flag_address, AddressSpace.gmem, assumed_align=4)
             red_add_release_gpu_s32(pointer, Int32(1))
 
     @cute.jit
@@ -51,12 +41,8 @@ class GpuReleaseFlagBatchTracker:
                 lane_address = Int64(0)
                 if self.thread_idx == Int32(0):
                     lane_address = flag_address
-                self._make(
-                    flag_address=lane_address, accumulated_flags=Int32(1), phase=self.phase
-                ).fire()
-            return self._make(
-                flag_address=Int64(0), accumulated_flags=Int32(0), phase=Int32(next_phase)
-            )
+                self._make(flag_address=lane_address, accumulated_flags=Int32(1), phase=self.phase).fire()
+            return self._make(flag_address=Int64(0), accumulated_flags=Int32(0), phase=Int32(next_phase))
 
         current_address = self.flag_address
         accumulated_flags = self.accumulated_flags
@@ -66,19 +52,11 @@ class GpuReleaseFlagBatchTracker:
 
         if accumulated_flags == Int32(flush_threshold) or next_phase != self.phase:
             if cutlass.const_expr(not no_fire):
-                self._make(
-                    flag_address=current_address,
-                    accumulated_flags=accumulated_flags,
-                    phase=self.phase,
-                ).fire()
+                self._make(flag_address=current_address, accumulated_flags=accumulated_flags, phase=self.phase).fire()
             accumulated_flags = Int32(0)
             current_address = Int64(0)
 
-        return self._make(
-            flag_address=current_address,
-            accumulated_flags=accumulated_flags,
-            phase=Int32(next_phase),
-        )
+        return self._make(flag_address=current_address, accumulated_flags=accumulated_flags, phase=Int32(next_phase))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -91,22 +69,15 @@ class GpuAsyncReleaseFlagBatchTracker:
     warp_idx: Int32
 
     @cute.jit
-    def _make(
-        self, flag_address: Int64, accumulated_flags: Int32, phase: Int32
-    ) -> "GpuAsyncReleaseFlagBatchTracker":
+    def _make(self, flag_address: Int64, accumulated_flags: Int32, phase: Int32) -> "GpuAsyncReleaseFlagBatchTracker":
         return type(self)(
-            flag_address=flag_address,
-            accumulated_flags=accumulated_flags,
-            phase=phase,
-            warp_idx=self.warp_idx,
+            flag_address=flag_address, accumulated_flags=accumulated_flags, phase=phase, warp_idx=self.warp_idx
         )
 
     @cute.jit
     def fire(self) -> None:
         if self.flag_address != Int64(0):
-            pointer = cute.make_ptr(
-                cutlass.Int32, self.flag_address, AddressSpace.gmem, assumed_align=4
-            )
+            pointer = cute.make_ptr(cutlass.Int32, self.flag_address, AddressSpace.gmem, assumed_align=4)
             with cute.arch.elect_one():
                 red_async_add_release_gpu_s32(pointer, Int32(1))
 
@@ -119,12 +90,8 @@ class GpuAsyncReleaseFlagBatchTracker:
                 warp_address = Int64(0)
                 if self.warp_idx == Int32(0):
                     warp_address = flag_address
-                self._make(
-                    flag_address=warp_address, accumulated_flags=Int32(1), phase=self.phase
-                ).fire()
-            return self._make(
-                flag_address=Int64(0), accumulated_flags=Int32(0), phase=Int32(next_phase)
-            )
+                self._make(flag_address=warp_address, accumulated_flags=Int32(1), phase=self.phase).fire()
+            return self._make(flag_address=Int64(0), accumulated_flags=Int32(0), phase=Int32(next_phase))
 
         current_address = self.flag_address
         accumulated_flags = self.accumulated_flags
@@ -134,29 +101,16 @@ class GpuAsyncReleaseFlagBatchTracker:
 
         if accumulated_flags == Int32(flush_threshold) or next_phase != self.phase:
             if cutlass.const_expr(not no_fire):
-                self._make(
-                    flag_address=current_address,
-                    accumulated_flags=accumulated_flags,
-                    phase=self.phase,
-                ).fire()
+                self._make(flag_address=current_address, accumulated_flags=accumulated_flags, phase=self.phase).fire()
             accumulated_flags = Int32(0)
             current_address = Int64(0)
 
-        return self._make(
-            flag_address=current_address,
-            accumulated_flags=accumulated_flags,
-            phase=Int32(next_phase),
-        )
+        return self._make(flag_address=current_address, accumulated_flags=accumulated_flags, phase=Int32(next_phase))
 
 
 @cute.jit
 def make_flag_batch_tracker(
-    use_async: bool,
-    *,
-    flag_address: Int64,
-    accumulated_flags: Int32,
-    phase: Int32,
-    thread_idx: Int32,
+    use_async: bool, *, flag_address: Int64, accumulated_flags: Int32, phase: Int32, thread_idx: Int32
 ) -> Union[GpuReleaseFlagBatchTracker, GpuAsyncReleaseFlagBatchTracker]:
     """Construct a lane-batched synchronous or warp-batched asynchronous tracker.
 
@@ -172,15 +126,8 @@ def make_flag_batch_tracker(
             warp_idx=cute.arch.make_warp_uniform(thread_idx // Int32(32)),
         )
     return GpuReleaseFlagBatchTracker(
-        flag_address=flag_address,
-        accumulated_flags=accumulated_flags,
-        phase=phase,
-        thread_idx=thread_idx,
+        flag_address=flag_address, accumulated_flags=accumulated_flags, phase=phase, thread_idx=thread_idx
     )
 
 
-__all__ = [
-    "GpuAsyncReleaseFlagBatchTracker",
-    "GpuReleaseFlagBatchTracker",
-    "make_flag_batch_tracker",
-]
+__all__ = ["GpuAsyncReleaseFlagBatchTracker", "GpuReleaseFlagBatchTracker", "make_flag_batch_tracker"]

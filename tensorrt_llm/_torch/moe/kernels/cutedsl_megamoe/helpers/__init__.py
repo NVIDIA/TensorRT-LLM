@@ -1,2 +1,22 @@
-# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
+"""Blackwell kernel implementations."""
+
+from .inference import (
+    BlockScaledSwapAbFc12Extension,
+    BlockScaledSwapAbFc12Kernel,
+    BlockScaledSwapAbFc12Mainloop,
+    BlockScaledSwapAbMegaMoeKernel,
+    GatedActEpilogueArgs,
+    SwapABGatedActEpilogue,
+    TensorRole,
+)
+
+
+__all__ = [
+    "BlockScaledSwapAbFc12Extension",
+    "BlockScaledSwapAbFc12Kernel",
+    "BlockScaledSwapAbFc12Mainloop",
+    "BlockScaledSwapAbMegaMoeKernel",
+    "GatedActEpilogueArgs",
+    "SwapABGatedActEpilogue",
+    "TensorRole",
+]
