@@ -33,13 +33,15 @@ from tensorrt_llm._utils import (CUASSERT, customized_gc_thresholds,
                                  global_mpi_size, is_trace_enabled, mpi_comm,
                                  mpi_disabled, nvtx_range,
                                  set_thread_local_mpi_comm, trace_func)
-from tensorrt_llm.bindings import executor as executor_bindings
+# yapf: disable
 from tensorrt_llm.bindings.executor import (DisServingRequestStats,
                                             FinishReason, InflightBatchingStats,
                                             IterationStats, KvCacheStats,
-                                            RequestStage, RequestStats,
-                                            RequestType, SpecDecodingStats,
+                                            KvCacheTransferMode, RequestStage,
+                                            RequestStats, RequestType,
+                                            SpecDecodingStats,
                                             StaticBatchingStats)
+# yapf: enable
 from tensorrt_llm.bindings.internal.batch_manager import (LlmRequestType,
                                                           ReqIdsSet)
 from tensorrt_llm.executor.request import TruncateKVCacheRequest
@@ -6365,7 +6367,7 @@ class PyExecutor:
         self._configure_csa2_remote_tail(request)
         retention = request.kv_cache_retention_config
         if self._is_kv_manager_v2 and retention is not None:
-            if retention.transfer_mode != executor_bindings.KvCacheTransferMode.DRAM:
+            if retention.transfer_mode != KvCacheTransferMode.DRAM:
                 raise ValueError(
                     "KVCacheManagerV2 does not support per-request GDS/POSIX "
                     "transfer_mode or directory; configure the manager's cache tiers instead."
