@@ -1721,10 +1721,9 @@ class DecoderRunner(ScheduledModelRunner):
         # alignment variant of a class the runtime never instantiates.
         from tensorrt_llm._torch.jit_prefetch import warmup_jit_coverage_enabled
 
+        jit_coverage = warmup_jit_coverage_enabled()
         metadata_cls = resolve_mamba_metadata_cls(self.model)
-        chunk_alignment = (
-            metadata_cls.prefill_chunk_alignment if warmup_jit_coverage_enabled() else None
-        )
+        chunk_alignment = metadata_cls.prefill_chunk_alignment if jit_coverage else None
 
         # (num_tokens, num_gen_requests, least_requests, force_initstates,
         #  chunk_aligned)
@@ -1732,6 +1731,12 @@ class DecoderRunner(ScheduledModelRunner):
             (capped_num_tokens, 0, False, False, False),
             (capped_num_tokens, 0, False, True, True),
         ]
+        if not jit_coverage:
+            # JIT prefetch compiles the multi-sequence variants the first pass
+            # exists for. The HAS_INITSTATES pass stays: its kernels are
+            # autotuned on new keys (initial states, chunk indices), and that
+            # benchmark has to run on the GPU.
+            mamba_warmup_shapes = mamba_warmup_shapes[1:]
 
         autotuner_enabled = self._config.enable_autotuner
         cache_path = os.environ.get("TLLM_AUTOTUNER_CACHE_PATH", None)
