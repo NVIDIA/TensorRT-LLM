@@ -62,10 +62,12 @@ def create_kv_cache_manager():
     )
 
 
-def create_llm(tensor_parallel_size=1):
+def create_llm(tensor_parallel_size=1, kv_cache_config=None):
+    if kv_cache_config is None:
+        kv_cache_config = global_kvcache_config
     return LLM(model=llama_model_path,
                tensor_parallel_size=tensor_parallel_size,
-               kv_cache_config=global_kvcache_config,
+               kv_cache_config=kv_cache_config,
                enable_autotuner=False)
 
 
@@ -971,130 +973,139 @@ def test_kv_cache_event_async_api():
         asyncio.run(main())
 
 
-def check_events(llm,
-                 requests,
-                 sampling_params,
-                 scheduling_params=None,
-                 attention_dp_rank=None):
+def check_v2_events(llm: LLM,
+                    sampling_params: SamplingParams,
+                    all_created_events: list[dict],
+                    scheduling_params: SchedulingParams | None = None,
+                    attention_dp_rank: int | None = None) -> None:
 
-    _ = llm.generate(requests[0],
-                     sampling_params=sampling_params,
-                     scheduling_params=scheduling_params)
-    time.sleep(1)
-    events = llm.get_kv_cache_events(5)
-    # Created or stored event
-    total_stored_blocks = 0
-    if attention_dp_rank is None:
-        event = events.pop(0)  # created event
-        assert event["event_id"] == 0
-        assert event["data"]["type"] == "created"
-        while events:
-            event = events.pop(0)
-            if event:
-                assert event["data"]["type"] == "stored"
-                assert event["event_id"] > 0
-                total_stored_blocks += len(event["data"]["blocks"])
-    else:
-        while events:
-            event = events.pop(0)
-            if not event:
-                continue
-            assert "attention_dp_rank" in event
-            if event["attention_dp_rank"] == attention_dp_rank:
-                assert event["data"]["type"] in ["created", "stored"]
-                if event["data"]["type"] == "created":
-                    assert event["event_id"] == 0
-                if event["data"]["type"] == "stored":
-                    assert event["event_id"] > 0
-                    total_stored_blocks += len(event["data"]["blocks"])
+    def events_for_rank(events: list[dict]) -> list[dict]:
+        events = [event for event in events if event]
+        if attention_dp_rank is None:
+            return events
+        assert all("attention_dp_rank" in event for event in events)
+        return [
+            event for event in events
+            if event["attention_dp_rank"] == attention_dp_rank
+        ]
 
-    assert total_stored_blocks == 5  # Should have 5 blocks in total
+    tokens_per_block = llm.get_kv_cache_capacity()["tokensPerBlock"]
+    prompt_length = 127
+    blocks_per_request = (prompt_length + tokens_per_block -
+                          1) // tokens_per_block
+    num_requests = 1
+    cached_blocks = {}
+    last_event_id = 0
+    num_offloaded_blocks = 0
+    num_removed_blocks = 0
 
-    _ = llm.generate(requests[1],
-                     sampling_params=sampling_params,
-                     scheduling_params=scheduling_params)
-    time.sleep(1)
-    events2 = llm.get_kv_cache_events(5)
+    request_index = 0
+    while request_index < num_requests:
+        prompt = list(range(request_index, request_index + prompt_length))
+        output = llm.generate(prompt,
+                              sampling_params=sampling_params,
+                              scheduling_params=scheduling_params)
+        assert len(output.outputs[0].token_ids) == sampling_params.max_tokens
+        time.sleep(1)
+        events = [event for event in llm.get_kv_cache_events(5) if event]
+        if request_index == 0:
+            # Created events become visible after the first executor iteration.
+            # Retain all ranks' events when validating attention DP sequentially.
+            all_created_events.extend(event for event in events
+                                      if event["data"]["type"] == "created")
+            created_events = events_for_rank(all_created_events)
+            assert len(created_events) == 1
+            created = created_events[0]
+            assert created["event_id"] == 0
+            assert created["hash_algo"] == KV_CACHE_HASH_ALGO_V1
+            tier_blocks = created["data"]["num_blocks_per_cache_level"]
+            assert len(tier_blocks) == 2
+            assert all(blocks > 0 for blocks in tier_blocks)
+            # Distinct prefixes must exhaust both the GPU and host tier.
+            num_requests = sum(tier_blocks) // blocks_per_request + 2
+            events = [
+                event for event in events if event["data"]["type"] != "created"
+            ]
+        events = events_for_rank(events)
+        stored_blocks = []
+        for event in events:
+            assert event["event_id"] == last_event_id + 1
+            last_event_id = event["event_id"]
+            assert event["hash_algo"] == KV_CACHE_HASH_ALGO_V1
+            data = event["data"]
+            if data["type"] == "stored":
+                assert data["blocks"]
+                stored_blocks.extend(data["blocks"])
+                for block in data["blocks"]:
+                    block_hash = block["block_hash"]
+                    assert block_hash not in cached_blocks
+                    assert block["cache_level"] == 0
+                    cached_blocks[block_hash] = 0
+            elif data["type"] == "updated":
+                block_hash = data["block_hash"]
+                assert cached_blocks[block_hash] == 0
+                assert data["cache_level"] == {
+                    "type": "event_diff",
+                    "old_value": 0,
+                    "new_value": 1,
+                }
+                cached_blocks[block_hash] = 1
+                num_offloaded_blocks += 1
+            else:
+                assert data["type"] == "removed"
+                assert data["block_hashes"]
+                for block_hash in data["block_hashes"]:
+                    assert block_hash in cached_blocks
+                    del cached_blocks[block_hash]
+                    num_removed_blocks += 1
 
-    total_stored_blocks = 0
-    has_removed_event = False
-    while events2:
-        event = events2.pop(0)
-        if event and (attention_dp_rank is None
-                      or event.get("attention_dp_rank") == attention_dp_rank):
-            if event["data"]["type"] == "removed":
-                has_removed_event = True
-                assert event["data"]["block_hashes"]
-            # stored events
-            elif event["data"]["type"] == "stored":
-                total_stored_blocks += len(event["data"]["blocks"])
+        # V2 publishes the prompt, including its partial tail, but no decode tokens.
+        assert [[token["token_id"] for token in block["tokens"]]
+                for block in stored_blocks] == [
+                    prompt[start:start + tokens_per_block]
+                    for start in range(0, prompt_length, tokens_per_block)
+                ]
+        if request_index == 0:
+            assert num_offloaded_blocks == 0
+            assert num_removed_blocks == 0
+        request_index += 1
 
-    assert total_stored_blocks == 5  # Should have 5 blocks in total
-    assert has_removed_event
-
-    _ = llm.generate(requests[2],
-                     sampling_params=sampling_params,
-                     scheduling_params=scheduling_params)
-    time.sleep(1)
-    events3 = llm.get_kv_cache_events(5)
-
-    total_stored_blocks = 0
-    has_removed_event = False
-    while events3:
-        event = events3.pop(0)
-        if event and (attention_dp_rank is None
-                      or event.get("attention_dp_rank") == attention_dp_rank):
-
-            if event["data"]["type"] == "removed":
-                has_removed_event = True
-                assert event["data"]["block_hashes"]
-            elif event["data"]["type"] == "stored":
-                total_stored_blocks += len(event["data"]["blocks"])
-
-    assert total_stored_blocks == 5  # Should have 5 blocks in total
-    assert has_removed_event
-
-    # no more events after request is finished
+    assert num_offloaded_blocks > 0
+    assert num_removed_blocks > 0
     assert not llm.get_kv_cache_events(5)
 
 
 def test_llm_kv_events_api():
-    with create_llm() as llm:
+    tiered_config = global_kvcache_config.model_copy(
+        update={"host_cache_size": 32 * 1024 * 1024})
+    with create_llm(kv_cache_config=tiered_config) as llm:
         sampling_params = SamplingParams(max_tokens=6,
                                          temperature=0.01,
                                          ignore_eos=True)
 
-        requests = []
-        for i in range(3):
-            input_tokens = list(range(127 + i))[i:]
-            requests.append(input_tokens)
-
-        check_events(llm, requests, sampling_params)
+        check_v2_events(llm, sampling_params, [])
 
 
 @skip_single_gpu
 @pytest.mark.threadleak(enabled=False)
 def test_llm_api_attention_dp_kv_events():
-
+    tiered_config = global_kvcache_config.model_copy(
+        update={"host_cache_size": 32 * 1024 * 1024})
     llm = LLM(model=llama_model_path,
               tensor_parallel_size=2,
               enable_attention_dp=True,
               enable_lm_head_tp_in_adp=True,
-              kv_cache_config=global_kvcache_config,
+              kv_cache_config=tiered_config,
               enable_autotuner=False)
 
     sampling_params = SamplingParams(max_tokens=6,
                                      temperature=0.01,
                                      ignore_eos=True)
 
+    created_events = []
     for attention_dp_rank in range(2):
-        requests = []
-        for i in range(3):
-            input_tokens = list(range(127 + i))[i:]
-            requests.append(input_tokens)
-
         scheduling_params = SchedulingParams(
             attention_dp_rank=attention_dp_rank, attention_dp_relax=False)
 
-        check_events(llm, requests, sampling_params, scheduling_params,
-                     attention_dp_rank)
+        check_v2_events(llm, sampling_params, created_events, scheduling_params,
+                        attention_dp_rank)
