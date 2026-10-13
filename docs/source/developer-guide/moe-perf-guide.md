@@ -164,14 +164,14 @@ The *Backend Capability Matrix* and *Quantization Support* tables: [`MOE_DEVELOP
 ### Terminology
 
 - **`world_size`**: number of ranks (GPUs) the model is served on.
-- **NVLink domain**: the set of GPUs reachable over NVLink. GB300 (NVL72) forms one domain of up to 72 GPUs and B300 forms one domain per 8-GPU node, so `world_size > 8` means EP crosses the domain and falls back to the slower network.
+- **NVLink domain**: the set of GPUs reachable over NVLink. GB300 (NVL72) forms one domain of up to 72 GPUs, so EP crosses the domain only when `world_size > 72`. B300 forms one domain per 8-GPU node, so EP crosses the domain when `world_size > 8` and falls back to the slower network.
 - **prefill / decode**: prefill processes the whole prompt at once (large GEMM `M`, compute bound), decode produces one token per request per step (small `M`, communication and memory bound). The two phases usually need different configurations.
 
 ## Recommended Configuration
 
 To provide recommended MoE configurations, we use the following two derived variables.
 
-- `activated_tokens_per_rank = num_tokens * top_k / world_size`
+- `activated_tokens_per_rank = num_tokens * top_k / world_size` (pure EP, `moe_tp_size = 1`)
   This is the total number of token-expert assignments processed by one rank, summed across its local experts. The per-rank workload is not determined by batch size alone: it also depends on `top_k` and `world_size`. Folding both in provides a unified threshold for the actual per-rank workload across models and batch sizes.
 
 - `dispatch_KB = activated_tokens_per_rank * hidden_size * bytes_per_elem / 1024`
@@ -207,7 +207,7 @@ Backend
        │
        └─ attention DP
               │
-              ├─ GB300 with world_size < 72, or B300 with world_size <= 8
+              ├─ GB300 with world_size <= 72, or B300 with world_size <= 8
               │  (EP within one NVLink domain)
               │      │
               │      ├─ NVFP4
@@ -254,7 +254,7 @@ Communication
 
 > **Notes**
 > - The tree is an empirical summary from `bench_moe` sweeps on TensorRT-LLM `v1.3.0rc26` (`21dc97fbc8`, 2026-09-13).
-> - Coverage: GB300 / B300, typical workloads of key models (DeepSeek-V4-Pro, GLM-5, Kimi-K2, Kimi-K3, Qwen3.8) on the MoE Perf Dashboard, module-level `bench_moe` with perfect routing and `--use_low_precision_moe_combine`.
+> - Coverage: GB300 / B300, typical workloads of key models (DeepSeek-V4-Pro, GLM-5, Kimi-K2, Kimi-K3, Qwen3.8) on the MoE Perf Dashboard, module-level `bench_moe` with perfect routing and `--use_low_precision_moe_combine`. GB300 is covered only through `world_size <= 72`; larger GB300 deployments (EP crossing the NVLink domain) were not benchmarked.
 > - Perfect routing assigns tokens evenly across experts. Relative rankings of backends and communication strategies hold under this configuration, but a real router can be skewed, so absolute latency can differ from what the deployment sees.
 > - The decision tree is a fit to those sweeps, and may not be optimal for a specific workload. Meanwhile, results can become outdated as kernels and autotuning change. To push performance further, test the options yourself with `bench_moe`, as described in *Tuning a Specific Workload*.
 
