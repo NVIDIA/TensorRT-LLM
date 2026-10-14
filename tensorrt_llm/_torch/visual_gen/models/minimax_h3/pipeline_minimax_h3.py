@@ -238,6 +238,15 @@ class MiniMaxH3Pipeline(BasePipeline):
                     "packed-row padding mask."
                 )
         self._text_encoder_tp_group = None
+        if (
+            self._uses_tensor_parallel_text_encoder
+            and self.text_encoder_tp_size < world_size
+            and not mpi_disabled()
+        ):
+            raise RuntimeError(
+                "MiniMax-H3 subset text_encoder_tp_size requires TLLM_DISABLE_MPI=1 "
+                "so Qwen text encoder TP uses a torch process group instead of MPI collectives."
+            )
         if self._uses_tensor_parallel_text_encoder and dist.is_initialized():
             text_encoder_tp_ranks = list(range(self.text_encoder_tp_size))
             rank = int(getattr(pipeline_config.mapping, "rank", 0))
@@ -459,11 +468,6 @@ class MiniMaxH3Pipeline(BasePipeline):
                 "MiniMax-H3 tensor-parallel text encoder is loaded only on "
                 f"ranks < {self.text_encoder_tp_size}; rank {self.rank} "
                 "must receive broadcast prompt embeddings."
-            )
-        if self.text_encoder_tp_size < self.world_size and not mpi_disabled():
-            raise RuntimeError(
-                "MiniMax-H3 subset text_encoder_tp_size requires TLLM_DISABLE_MPI=1 "
-                "so Qwen text encoder TP uses a torch process group instead of MPI collectives."
             )
         text_encoder_mapping = _MiniMaxH3TextEncoderMapping(
             world_size=self.text_encoder_tp_size,

@@ -25,6 +25,8 @@ import torch
 from diffusers import MiniMaxH3Scheduler
 from PIL import Image
 
+from tensorrt_llm._torch.attention.attention import _inherit_process_group_attrs
+from tensorrt_llm._torch.device_mesh import DeviceMeshTopologyImpl
 from tensorrt_llm._torch.visual_gen.config import (
     DiffusionPipelineConfig,
     discover_pipeline_components,
@@ -38,6 +40,7 @@ from tensorrt_llm._torch.visual_gen.models.minimax_h3.packing import (
 from tensorrt_llm._torch.visual_gen.models.minimax_h3.pipeline_minimax_h3 import MiniMaxH3Pipeline
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
 from tensorrt_llm._torch.visual_gen.pipeline_registry import AutoPipeline, PipelineComponent
+from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.visual_gen.args import ParallelConfig, TorchCompileConfig, VisualGenArgs
 
 pytestmark = pytest.mark.cpu_only
@@ -501,6 +504,7 @@ def test_text_encoder_residency_skips_non_owner_rank(
 def test_subset_tensor_parallel_text_encoder_loads_on_participant_rank(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(h3_pipeline, "mpi_disabled", lambda: True)
     monkeypatch.setattr(
         h3_pipeline.BasePipeline,
         "__init__",
@@ -619,6 +623,7 @@ def test_tensor_parallel_text_encoder_loader_prefetch_matches_rank_residency(
 def test_subset_tensor_parallel_text_encoder_skips_nonparticipant_rank(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(h3_pipeline, "mpi_disabled", lambda: True)
     monkeypatch.setattr(
         h3_pipeline.BasePipeline,
         "__init__",
@@ -652,6 +657,53 @@ def test_subset_tensor_parallel_text_encoder_skips_nonparticipant_rank(
     )
 
     assert pipeline.text_encoder is None
+
+
+@pytest.mark.parametrize("rank", range(4))
+def test_subset_text_encoder_tp_rejects_mpi_before_group_creation(
+    monkeypatch: pytest.MonkeyPatch, rank: int
+) -> None:
+    monkeypatch.setattr(h3_pipeline, "mpi_disabled", lambda: False)
+    monkeypatch.setattr(h3_pipeline.dist, "is_initialized", lambda: True)
+
+    def unexpected_group_creation(*args, **kwargs):
+        pytest.fail("Unsupported MPI subset must fail before creating a process group")
+
+    monkeypatch.setattr(h3_pipeline.dist, "new_group", unexpected_group_creation)
+    config = SimpleNamespace(
+        mapping=SimpleNamespace(world_size=4, tp_size=1, rank=rank),
+        visual_gen_mapping=SimpleNamespace(world_size=4, ulysses_size=4),
+        parallel=ParallelConfig(ulysses_size=4, text_encoder_tp_size=2),
+        attention=SimpleNamespace(backend="VANILLA"),
+    )
+    with pytest.raises(RuntimeError, match="TLLM_DISABLE_MPI=1"):
+        MiniMaxH3Pipeline(config)
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+@pytest.mark.parametrize("mesh_initialized", [False, True])
+def test_text_encoder_attention_mapping_preserves_explicit_tp_group(
+    monkeypatch: pytest.MonkeyPatch, rank: int, mesh_initialized: bool
+) -> None:
+    monkeypatch.setenv("TLLM_DISABLE_MPI", "1")
+    monkeypatch.setattr(
+        DeviceMeshTopologyImpl, "device_mesh", object() if mesh_initialized else None
+    )
+    group = SimpleNamespace(rank=lambda: rank)
+
+    def unexpected_mesh_access(*args, **kwargs):
+        pytest.fail("Explicit encoder group must bypass the VisualGen device mesh")
+
+    monkeypatch.setattr(DeviceMeshTopologyImpl, "build_mesh", unexpected_mesh_access)
+    monkeypatch.setattr(DeviceMeshTopologyImpl, "_get_mesh_dim_by_name", unexpected_mesh_access)
+    monkeypatch.setattr(
+        DeviceMeshTopologyImpl, "_get_group_ranks", lambda self, pg: [0, 1] if pg is group else []
+    )
+    source = SimpleNamespace(_tp_group_pg=group, _use_torch_distributed_allreduce=True)
+    mapping = _inherit_process_group_attrs(Mapping(world_size=2, rank=rank, tp_size=2), source)
+    assert mapping.tp_group_pg is group
+    assert mapping.tp_rank == rank
+    assert mapping.tp_group == [0, 1]
 
 
 def test_tensor_parallel_text_encoder_encode_does_not_require_hf_config() -> None:
