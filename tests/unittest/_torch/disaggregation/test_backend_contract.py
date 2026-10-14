@@ -439,15 +439,14 @@ def test_the_import_scan_sees_every_kind_of_import(tmp_path):
 
 
 def test_lender_layout_and_arrays_fit_the_contract_with_explicit_field_mapping():
-    """The lender's staging/block vocabulary needs a holder-side projection to generic rows.
+    """Canonical lender rows and their holder-side projection satisfy the generic contract.
 
-    This test uses a structural fixture to check the mapping, not a production holder adapter.
-    The raw lender view and groups do not implement the generic address/mask member names.
+    The structural projection preserves group identity, array aliases and absent placements.
     """
     if importlib.util.find_spec(LENDER_MODULE) is None:
         pytest.skip("the KV cache lender is not part of this tree")
     sharing = importlib.import_module(LENDER_MODULE)
-    region = sharing.StagingRegion("pool", 4096, 512, 64, 8, (7, 2))
+    region = sharing.MemoryRegion("pool", 4096, 512, 64, 8, (7, 2))
     object_keys = np.zeros((2, 54), dtype=np.uint8)
     placed = sharing.LayerGroupBlocks(7, np.array([3, 9]), object_keys, np.array([4096, 4352]), 0)
     lease_view = sharing.LeaseView((placed, sharing.LayerGroupBlocks(2, np.array([0]))))
@@ -457,18 +456,20 @@ def test_lender_layout_and_arrays_fit_the_contract_with_explicit_field_mapping()
                 blocks.layer_group_index,
                 len(blocks),
                 blocks.object_keys,
-                blocks.staging_addresses,
+                blocks.addresses,
                 blocks.region_index,
             )
             for blocks in lease_view.groups
         )
     )
     assert isinstance(region, SlotRegion)
+    assert isinstance(lease_view, View)
+    assert all(isinstance(group, LayerGroupRows) for group in lease_view.groups)
     assert isinstance(view, View)
     assert all(isinstance(group, LayerGroupRows) for group in view.groups)
     assert [group.layer_group_index for group in view.groups] == [7, 2]
     assert view.groups[0].object_keys is placed.object_keys
-    assert view.groups[0].addresses is placed.staging_addresses
+    assert view.groups[0].addresses is placed.addresses
     assert view.groups[1].addresses is view.groups[1].region_index is None
     outcome = Outcome.for_view(view, view.row_masks(fill_value=True))
     outcome.check_mask_shapes(view)
