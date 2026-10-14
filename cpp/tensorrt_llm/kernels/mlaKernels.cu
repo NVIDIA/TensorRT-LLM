@@ -635,8 +635,8 @@ __global__ void applyMLARopeAndAssignQKVKernelGeneration(T* qkv_output, T* q_pe,
     int* seqKVOffsets, int q_pe_ld, int q_pe_stride, KvCacheDataType cache_type, float* bmm1_scale, float* bmm2_scale,
     float const* quant_scale_o, float const* quant_scale_q, float const* quant_scale_kv, float const* dequant_scale_q,
     float const* dequant_scale_kv, float host_bmm1_scale, int32_t const* helix_position_offsets,
-    bool const* helix_is_inactive_rank, bool precomputed_cu_seqlens = false, bool precomputed_fmha_scheduler = false,
-    bool q_rope_applied = false)
+    bool const* helix_is_inactive_rank, int32_t const* helix_local_slots = nullptr, bool precomputed_cu_seqlens = false,
+    bool precomputed_fmha_scheduler = false, bool q_rope_applied = false)
 {
     // Constants.
     using VecT = typename VecType<T>::Type;
@@ -755,10 +755,18 @@ __global__ void applyMLARopeAndAssignQKVKernelGeneration(T* qkv_output, T* q_pe,
             {
                 if (head_idx == head_num)
                 {
-                    // If helix parallelism is being used, only write to KV cache if current rank is active.
-                    if (helix_is_inactive_rank == nullptr || !helix_is_inactive_rank[batch_idx])
+                    // If helix parallelism is being used, only write to KV cache if this rank owns
+                    // the token's global position. With speculative verify groups the per-token slot
+                    // table decides -- a 1 + draft_len group can straddle a ledger-page boundary and
+                    // split ownership between two ranks -- otherwise the per-sequence flag does.
+                    bool const helix_write = helix_local_slots != nullptr
+                        ? helix_local_slots[global_token_idx] >= 0
+                        : (helix_is_inactive_rank == nullptr || !helix_is_inactive_rank[batch_idx]);
+                    if (helix_write)
                     {
-                        auto const token_kv_idx = kv_cache_lengths[batch_idx] - seq_len + local_token_idx;
+                        auto const token_kv_idx = helix_local_slots != nullptr
+                            ? helix_local_slots[global_token_idx]
+                            : kv_cache_lengths[batch_idx] - seq_len + local_token_idx;
 
                         {
                             auto kDst = reinterpret_cast<T*>(kv_cache.getKBlockPtr(batch_idx, token_kv_idx));
@@ -846,10 +854,17 @@ __global__ void applyMLARopeAndAssignQKVKernelGeneration(T* qkv_output, T* q_pe,
                     }
                 }
 
-                // If helix parallelism is being used, only write to KV cache if current rank is active.
-                if (helix_is_inactive_rank == nullptr || !helix_is_inactive_rank[batch_idx])
+                // If helix parallelism is being used, only write to KV cache if this rank owns the
+                // token's global position (per-token slots for speculative verify groups, the
+                // per-sequence flag otherwise; see the Q/K branch above).
+                bool const helix_write = helix_local_slots != nullptr
+                    ? helix_local_slots[global_token_idx] >= 0
+                    : (helix_is_inactive_rank == nullptr || !helix_is_inactive_rank[batch_idx]);
+                if (helix_write)
                 {
-                    auto const token_kv_idx = kv_cache_lengths[batch_idx] - seq_len + local_token_idx;
+                    auto const token_kv_idx = helix_local_slots != nullptr
+                        ? helix_local_slots[global_token_idx]
+                        : kv_cache_lengths[batch_idx] - seq_len + local_token_idx;
                     auto const src_kv_global_offset = static_cast<size_t>(global_token_idx) * (c_k + ROPE_DIM);
 
                     {
@@ -1961,8 +1976,8 @@ void invokeMLARopeGeneration(MlaParams<T>& params, KVCacheBuffer kv_cache_buffer
         params.cache_seq_lens, params.cu_kv_seqlens, params.q_pe_ld, params.q_pe_stride, params.cache_type,
         params.bmm1_scale, params.bmm2_scale, params.quant_scale_o, quant_scale_q_eff, params.quant_scale_kv,
         params.dequant_scale_q, params.dequant_scale_kv, params.host_bmm1_scale, params.helix_position_offsets,
-        params.helix_is_inactive_rank, params.precomputed_cu_seqlens, params.precomputed_fmha_scheduler,
-        params.q_rope_applied);
+        params.helix_is_inactive_rank, params.helix_local_slots, params.precomputed_cu_seqlens,
+        params.precomputed_fmha_scheduler, params.q_rope_applied);
 }
 
 template <typename T, typename KVCacheBuffer>

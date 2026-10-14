@@ -574,4 +574,110 @@ TEST(BlockScaleMoeActivationBackingTest, PadsActivationUsingItsOwnRowWidth)
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+namespace
+{
+
+// Worst case over every way `numRouted` expanded tokens can be spread across `numLocalExperts`
+// experts. `f` receives the resulting CTA count and padded token count for each distribution.
+template <typename Fn>
+void forEachLocalRouting(int32_t numRouted, int32_t numLocalExperts, int32_t tile, Fn&& f)
+{
+    std::vector<int32_t> counts(numLocalExperts, 0);
+    auto recurse = [&](auto&& self, int32_t expert, int32_t remaining) -> void
+    {
+        if (expert == numLocalExperts)
+        {
+            int32_t ctas = 0;
+            for (auto const count : counts)
+            {
+                ctas += (count + tile - 1) / tile;
+            }
+            f(ctas, ctas * tile);
+            return;
+        }
+        for (int32_t take = 0; take <= remaining; ++take)
+        {
+            counts[expert] = take;
+            self(self, expert + 1, remaining - take);
+        }
+        counts[expert] = 0;
+    };
+    // Tokens routed to a remote expert produce no rows on this rank, so leaving part of
+    // `numRouted` unassigned covers those cases too.
+    recurse(recurse, 0, numRouted);
+}
+
+} // namespace
+
+// The FP4 block-scale op sizes its permute and CTA buffers from `local_num_experts`, because the
+// routing kernels only emit rows for experts owned by the rank. This pins the arithmetic behind
+// that: over every routing of `numTokens * topK` expanded tokens onto the rank's experts --
+// including the fully skewed ones, where every token lands on a single local expert -- the CTA
+// count never exceeds `getMaxNumCtasInBatchDim` evaluated with the local expert count, and the
+// padded token count never exceeds `getMaxPermutedPaddedCount`. This is host-side arithmetic; it
+// does not launch the routing kernel or observe an allocation.
+TEST(BlockScaleMoeRoutingCapacityTest, LocalExpertCountBoundsPermuteAndCtaBuffers)
+{
+    namespace Routing = tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::Routing;
+
+    for (int32_t const tile : {8, 16})
+    {
+        for (int32_t const numTokens : {1, 2, 3, 5, 8, 12})
+        {
+            for (int32_t const topK : {1, 2})
+            {
+                for (int32_t const numLocalExperts : {1, 2, 3, 5})
+                {
+                    auto const numRouted = numTokens * topK;
+                    auto const maxCtas = Routing::getMaxNumCtasInBatchDim(numTokens, topK, numLocalExperts, tile);
+                    auto const maxPadded = Routing::getMaxPermutedPaddedCount(numTokens, topK, numLocalExperts, tile);
+
+                    int32_t worstCtas = 0;
+                    int32_t worstPadded = 0;
+                    forEachLocalRouting(numRouted, numLocalExperts, tile,
+                        [&](int32_t ctas, int32_t padded)
+                        {
+                            worstCtas = std::max(worstCtas, ctas);
+                            worstPadded = std::max(worstPadded, padded);
+                        });
+
+                    EXPECT_LE(worstCtas, maxCtas) << "tile=" << tile << " numTokens=" << numTokens << " topK=" << topK
+                                                  << " numLocalExperts=" << numLocalExperts;
+                    EXPECT_LE(worstPadded, maxPadded) << "tile=" << tile << " numTokens=" << numTokens
+                                                      << " topK=" << topK << " numLocalExperts=" << numLocalExperts;
+                    // The bound is attained, so it cannot be tightened further without breaking a
+                    // reachable routing.
+                    EXPECT_EQ(worstCtas, maxCtas) << "tile=" << tile << " numTokens=" << numTokens << " topK=" << topK
+                                                  << " numLocalExperts=" << numLocalExperts;
+                }
+            }
+        }
+    }
+}
+
+// Sizing from the local count only ever shrinks the allocation relative to the global count, so the
+// change cannot enlarge any buffer.
+TEST(BlockScaleMoeRoutingCapacityTest, LocalExpertCountNeverExceedsGlobalExpertCount)
+{
+    namespace Routing = tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::Routing;
+
+    constexpr int32_t kNumExperts = 128;
+    for (int32_t const tile : {8, 32, 64})
+    {
+        for (int32_t const numTokens : {1, 3, 64, 1024})
+        {
+            for (int32_t const epSize : {1, 2, 4, 8, 64})
+            {
+                auto const numLocalExperts = kNumExperts / epSize;
+                EXPECT_LE(Routing::getMaxNumCtasInBatchDim(numTokens, 8, numLocalExperts, tile),
+                    Routing::getMaxNumCtasInBatchDim(numTokens, 8, kNumExperts, tile));
+                EXPECT_LE(Routing::getMaxPermutedPaddedCount(numTokens, 8, numLocalExperts, tile),
+                    Routing::getMaxPermutedPaddedCount(numTokens, 8, kNumExperts, tile));
+            }
+        }
+    }
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
 } // namespace tensorrt_llm::tests::kernels::blockscalemoe

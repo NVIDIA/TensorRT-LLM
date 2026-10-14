@@ -500,7 +500,7 @@ def test_failure_meta_uses_new_contract_keys_and_versions():
     meta = rc._failure_meta(args_class="X")
     assert meta["capture_version"] == "2"
     assert meta["api_contract_version"] == "0.2.0"
-    assert meta["field_policy_version"] == "3"
+    assert meta["field_policy_version"] == "4"
     assert meta["excluded_field_count"] == 0  # renamed from the old marked-count key
     assert meta["payload_truncated"] is False
     assert meta["sequence_truncated"] is False
@@ -720,6 +720,7 @@ def test_collect_llm_api_config_captures_max_total_draft_tokens_for_every_arm():
 def test_collect_llm_api_config_captures_sparse_algorithm_for_every_arm():
     """Every reachable sparse algorithm Literal is captured from its active model arm."""
     from tensorrt_llm.llmapi.llm_args import (
+        CSA2SparseAttentionConfig,
         DeepSeekSparseAttentionConfig,
         DeepSeekV4SparseAttentionConfig,
         MiniMaxM3SparseAttentionConfig,
@@ -733,6 +734,7 @@ def test_collect_llm_api_config_captures_sparse_algorithm_for_every_arm():
         QSASparseAttentionConfig(),
         DeepSeekSparseAttentionConfig(),
         DeepSeekV4SparseAttentionConfig(),
+        CSA2SparseAttentionConfig(),
         RocketSparseAttentionConfig(),
         SkipSoftmaxAttentionConfig(),
         MiniMaxM3SparseAttentionConfig(),
@@ -788,7 +790,7 @@ def test_background_reporter_keeps_initial_report_when_config_capture_fails(
 
     assert usage_lib.apply_usage_session_config()
 
-    monkeypatch.setattr(usage_lib, "_MAX_HEARTBEATS", 0)
+    monkeypatch.setattr(usage_lib._HEARTBEAT_STOP, "wait", lambda timeout: True)
     monkeypatch.setattr(usage_lib, "_get_trtllm_version", lambda: "0.0.0-test")
     monkeypatch.setattr(
         usage_lib,

@@ -6,12 +6,13 @@ This deployment guide provides step-by-step instructions for running the MiniMax
 
 MiniMax-M3 is a Mixture-of-Experts (MoE) model that uses MiniMax block-sparse attention. The first few layers use dense attention with a dense MLP, while the remaining layers combine a sparse attention path (an index-K block selector followed by sparse grouped-query attention) with MoE (top-4 of 128 routed experts plus one shared expert). In TensorRT LLM it is served through the `MiniMaxM3SparseForConditionalGeneration` architecture (text, image, and video) and the text-only `MiniMaxM3SparseForCausalLM` architecture.
 
-TensorRT LLM supports two precisions for MiniMax-M3:
+TensorRT LLM supports three checkpoint weight formats for MiniMax-M3:
 
 * **BF16** — the official upstream checkpoint from MiniMaxAI.
-* **MXFP8** — an NVIDIA-published checkpoint that quantizes the MoE/Linear weights to MXFP8 while keeping activations and the KV cache in BF16. The weights occupy ~half the memory of BF16, which is the recommended choice for throughput-oriented deployments and is the default for this guide.
+* **MXFP8** — weights are stored in MXFP8. The curated configuration uses BF16 KV cache and is the default for this guide.
+* **Mixed MXFP8/NVFP4** — MXFP8 base layers with NVFP4 routed experts. FP8 or NVFP4 KV cache is selected separately at runtime.
 
-The block-sparse attention path does **not** currently support KV cache reuse or Multi-Token Prediction (MTP) in this release.
+The block-sparse attention path requires KV cache reuse to be disabled. The MSA backend supports linear Eagle3 with one shared GQA draft layer; see [Feature Support Notes](#feature-support-notes) for its constraints.
 
 This guide deploys MiniMax-M3 on **8x NVIDIA GB200 GPUs across 2 nodes** (4 GPUs per node) using Slurm and the `trtllm-llmapi-launch` multi-node launcher, with the MoE experts distributed via expert parallelism. The attention layers can run with either Tensor-Expert Parallelism (TEP) or Data-Expert Parallelism (DEP); see [Recommended Performance Settings](#recommended-performance-settings).
 
@@ -29,11 +30,11 @@ The guide is intended for developers and practitioners seeking high-throughput o
 
 ## Models
 
-Two checkpoints are supported. Both are loaded through the same `MiniMaxM3SparseForConditionalGeneration` / `MiniMaxM3SparseForCausalLM` architectures and share the same chat template and serving CLI; the only difference is the on-disk weight format.
+MiniMax-M3 checkpoints use the `MiniMaxM3SparseForConditionalGeneration` / `MiniMaxM3SparseForCausalLM` architectures. Checkpoint weight precision and runtime KV-cache precision are separate choices.
 
 ### MXFP8 (recommended for throughput)
 
-* [MiniMaxAI/MiniMax-M3-MXFP8](https://huggingface.co/MiniMaxAI/MiniMax-M3-MXFP8) — MiniMaxAI-published MXFP8-quantized checkpoint. Weights are stored in MXFP8 (block size 1×32); activations and the KV cache stay in BF16.
+* [MiniMaxAI/MiniMax-M3-MXFP8](https://huggingface.co/MiniMaxAI/MiniMax-M3-MXFP8) — MiniMaxAI-published MXFP8-quantized checkpoint. Weights are stored in MXFP8 (block size 1×32). The curated configuration uses BF16 KV cache; quantized KV cache is selected separately.
 
 ```bash
 git lfs install
@@ -49,19 +50,53 @@ git lfs install
 git clone https://huggingface.co/MiniMaxAI/MiniMax-M3 /models/MiniMax-M3
 ```
 
-Both checkpoints ship their own chat template (`chat_template.jinja`), which is passed explicitly to the server (see [Launch the TensorRT LLM Server](#launch-the-tensorrt-llm-server)).
+### Mixed MXFP8/NVFP4
+
+The `MiniMax-M3-NVFP4` checkpoint uses MXFP8 base layers and NVFP4 routed experts
+(`MIXED_PRECISION`). Its name describes weight precision; set
+`kv_cache_config.dtype` explicitly to select FP8 or NVFP4 KV cache.
+
+Use the checkpoint's chat template (`chat_template.jinja`) when launching the
+server (see [Launch the TensorRT LLM Server](#launch-the-tensorrt-llm-server)).
 
 ## Feature Support Notes
 
 * **Block-sparse attention is required.** MiniMax-M3 runs on the block-sparse attention backend, which must be selected via `sparse_attention_config.algorithm: minimax_m3` in the YAML configuration. There is no dense fallback for the sparse layers.
-* **Supported precisions: BF16 and MXFP8.** No additional FP8/NVFP4 serving paths are supported at this time. MXFP8 quantizes only the weights; activations and the KV cache stay in BF16, so the curated YAML is identical for both checkpoints. The default MoE backend is used.
+* **Weight and KV precision.** BF16, MXFP8, and mixed MXFP8/NVFP4 checkpoints are supported. On SM100/SM103, the MSA backend supports FP8 and NVFP4 KV cache. NVFP4 storage is used in sparse target layers; dense target layers and the shared Eagle3 draft layer use FP8. The curated BF16-KV YAML remains a separate starting configuration.
 * **KV cache reuse must be disabled.** KV cache reuse is not supported on the sparse-attention path, so set `kv_cache_config.enable_block_reuse: false`.
-* **MTP is not supported** on the sparse-attention path in this release.
+* **Eagle3.** The MSA path supports one shared GQA draft layer with linear Eagle3 drafting. Other MTP and tree-drafting configurations are unsupported. Keep NVFP4 KV and piecewise CUDA graph qualification separate: the existing PCG accuracy cases use FP8 KV.
 * **`max_seq_len` must be capped for CUDA graphs.** The dense GQA expansion in the first few attention layers and the per-Q FP32 expansion in the sparse decode kernel allocate temporary tensors whose size grows linearly with the warmup decode's `max_k`. If `max_seq_len` is left at the checkpoint default, that `max_k` follows `max_position_embeddings` (1M for MXFP8, 512K for BF16) and the resulting gigabyte-scale single-allocation request exceeds the caching allocator's CUDA-graph-safe path, so capture fails with `cudaErrorStreamCaptureUnsupported` / OOM. The curated YAML therefore sets `max_seq_len` to a small value just above ISL+OSL (`2068` for the 1k/1k benchmark) so CUDA graphs can capture cleanly. Raise it for longer-context workloads, but expect a corresponding cut in `max_batch_size`.
 * **Parallelism.** MoE experts run with expert parallelism. The attention layers support both Tensor-Expert Parallelism (TEP) and Data-Expert Parallelism (DEP, via `enable_attention_dp: true`). The overlap scheduler is enabled by default.
 * **Multimodal.** `MiniMaxM3SparseForConditionalGeneration` supports text, image, and video inputs. The text decoder is also usable standalone (text-only) via the `MiniMaxM3SparseForCausalLM` architecture.
 
 ## Deployment Steps
+
+### NVFP4 KV-cache configuration
+
+For an SM100/SM103 deployment with a compatible checkpoint, use these overrides:
+
+```yaml
+kv_cache_config:
+  dtype: nvfp4
+  enable_block_reuse: false
+sparse_attention_config:
+  algorithm: minimax_m3
+  implementation: msa
+  indexer_kv_dtype: fp8
+  fuse_qkv_index_projection: true
+```
+
+NVFP4 prefill uses MSA kernels, while decode uses TensorRT LLM's Triton sparse
+kernels inside the MSA backend. The legacy `implementation: triton` backend
+rejects NVFP4 KV and recommends MSA for its supported configurations too.
+Both SM100 and SM103 support NVFP4; GB300-measured decode tuning applies only
+to SM103. MSA requires 128-token sparse pages and the packaged `fmha_sm100`
+dependency. The indexer stays FP8 in this configuration.
+
+For mixed MXFP8/NVFP4 weights, select `moe_config.backend: CUTLASS` as in the
+accuracy tests. KV-cache quantization does not choose the MoE weight backend.
+Full weight reload refreshes the quantization and aligned prefill scale buffers
+in place so CUDA-graph replay retains valid addresses.
 
 MiniMax-M3 is deployed across 2 nodes (8x GB200 total) using Slurm with the pyxis/enroot container plugin. The model weights and the configuration file must live on a **shared filesystem** visible to both nodes.
 

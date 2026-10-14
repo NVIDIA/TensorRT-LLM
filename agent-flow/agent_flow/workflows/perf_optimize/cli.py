@@ -4,10 +4,13 @@ import argparse
 import sys
 from pathlib import Path
 
+from agent_flow.agent_runtime import resolve_agent_config
+from agent_flow.prompts import dump_prompt_bundle
 from agent_flow.workflows.perf_analyze.sol_methodology import resolve_sol_methodology
+from agent_flow.workflows.perf_analyze.task_schema import casebook_enabled
 
 from .disagg import has_disagg
-from .prompts import build_perf_optimize_prompts
+from .prompts import PROMPTS_DIRNAME, build_perf_optimize_prompts
 from .state import STATE_FILENAME
 from .task_schema import (
     TaskSchemaError,
@@ -46,7 +49,8 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Path to the task.yaml spec. Requires `checkpoint_path` and "
         "`trtllm_repo_path`; optional top-level `extra_llm_api_options` "
         "path, optional `benchmark` / `profile` / `optimize` / `accuracy` "
-        "blocks, an optional `slurm-environment` block, and an optional "
+        "blocks, an optional `agents` block for per-role backend/model routing, "
+        "an optional `slurm-environment` block, and an optional "
         "`sol` block (all fields optional: `enabled` gates the one-shot "
         "SOL projector stage — on by default — and `gpu` names the GPU "
         "part for the SOL skill's peaks calculator). "
@@ -63,7 +67,9 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=Path("workspace/perf-optimize"),
         help="Workspace directory for shared state (task.yaml, roadmap.yaml, "
         "sol_projection.md, baseline/, tuning/, rounds/, "
-        "optimization_report.md/.html, progress.yaml) and run artifacts.",
+        "optimization_report.md/.html, progress.yaml, prompts/) and run "
+        "artifacts. Each launch snapshots every role's composed system "
+        "prompt to prompts/<role>.md.",
     )
     parser.add_argument(
         "--clean",
@@ -109,10 +115,12 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> None:
     args = _parse_args(argv)
+    resume = not args.clean and (args.workspace / STATE_FILENAME).is_file()
+    task_path = args.workspace / "task.yaml" if resume else args.task
     try:
         task_data = load_and_validate_task_yaml(
-            args.task,
-            max_rounds_override=args.max_rounds,
+            task_path,
+            max_rounds_override=None if resume else args.max_rounds,
         )
     except TaskSchemaError as exc:
         print(f"error: {exc}", file=sys.stderr)
@@ -126,7 +134,8 @@ def main(argv: list[str] | None = None) -> None:
     # Resolve the projector's methodology skill once, before the run, so
     # it is told to load a skill this session actually has. Skipped (free)
     # when the stage is off.
-    methodology = resolve_sol_methodology(sol_enabled(task_data))
+    projector_backend = resolve_agent_config(task_data, "projector").backend
+    methodology = resolve_sol_methodology(sol_enabled(task_data), backend_kind=projector_backend)
     note = methodology.console_note()
     if note:
         print(note, file=sys.stderr)
@@ -139,6 +148,7 @@ def main(argv: list[str] | None = None) -> None:
         kernel_coverage=kernel_coverage(task_data),
         sol_methodology=methodology.name,
         include_disagg=has_disagg(task_data),
+        include_casebook=casebook_enabled(task_data),
     )
     with PerfOptimizeWorkflow(
         workspace=args.workspace,
@@ -148,6 +158,8 @@ def main(argv: list[str] | None = None) -> None:
         reuse_analysis=args.reuse_analysis,
         sol_methodology=methodology,
     ) as workflow:
+        prompt_dir = args.workspace / PROMPTS_DIRNAME
+        dump_prompt_bundle(prompts, prompt_dir)
         workflow.run(args.task)
 
 

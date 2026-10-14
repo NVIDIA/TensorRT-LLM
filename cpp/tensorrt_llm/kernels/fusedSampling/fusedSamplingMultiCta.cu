@@ -349,11 +349,8 @@ __global__ void smallBatchSplitFinalizeKernel(FusedSamplingParams params)
         {
             if (tid == 0)
             {
-                int const rngIdx = params.perRowRng ? row : 0;
-                uint64_t const seed = params.seed != nullptr ? params.seed[rngIdx] : 0ull;
-                uint64_t const offset = params.offset != nullptr ? params.offset[rngIdx] : 0ull;
                 curandStatePhilox4_32_10_t state;
-                curand_init(seed, static_cast<uint64_t>(row), offset, &state);
+                initRowRng(params, row, &state);
                 sTarget = curand_uniform(&state) * keptMass;
                 sToken = -1;
             }
@@ -414,11 +411,8 @@ __global__ void smallBatchSplitFinalizeKernel(FusedSamplingParams params)
             {
                 totalProbMass += sMass[split];
             }
-            int const rngIdx = params.perRowRng ? row : 0;
-            uint64_t const seed = params.seed != nullptr ? params.seed[rngIdx] : 0ull;
-            uint64_t const offset = params.offset != nullptr ? params.offset[rngIdx] : 0ull;
             curandStatePhilox4_32_10_t state;
-            curand_init(seed, static_cast<uint64_t>(row), offset, &state);
+            initRowRng(params, row, &state);
             float const target = curand_uniform(&state) * totalProbMass;
 
             float massBefore = 0.0f;

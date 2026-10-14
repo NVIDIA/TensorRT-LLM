@@ -54,6 +54,18 @@ def test_resolution_prefers_the_internal_skill(monkeypatch):
     assert methodology.console_note() is None
 
 
+def test_resolution_probes_the_projector_backend(monkeypatch):
+    seen = []
+
+    def resolve(candidates, backend_kinds=("claude-code",)):
+        seen.append(tuple(backend_kinds))
+        return _QUALIFIED_SOL, True
+
+    monkeypatch.setattr("agent_flow.utils.resolve_first_available_skill", resolve)
+    resolve_sol_methodology(backend_kind="codex")
+    assert seen == [("codex",)]
+
+
 def test_resolution_falls_back_to_perf_analysis(monkeypatch):
     """The open-source-toolkit case: internal skills stripped, the rest kept."""
     _stub_probes(

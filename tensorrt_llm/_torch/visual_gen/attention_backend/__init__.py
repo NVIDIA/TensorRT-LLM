@@ -21,16 +21,7 @@ simplified metadata that doesn't require KV caching.
 """
 
 from .cudnn import CuDNNAttention
-from .cute_dsl import (
-    VSA_TILE_SIZE,
-    CuTeDSLAttention,
-    SolAttention,
-    VSAAttention,
-    VSAMetadata,
-    VSAMetadataBuilder,
-    get_vsa_forward_context,
-    set_vsa_forward_context,
-)
+from .cute_dsl import CuTeDSLAttention
 from .flash_attn4 import FlashAttn4Attention
 from .flashinfer import FlashInferAttention
 from .interface import AttentionBackend, AttentionTensorLayout
@@ -40,7 +31,6 @@ from .utils import create_attention, get_visual_gen_attention_backend
 from .vanilla import VanillaAttention
 
 __all__ = [
-    "VSA_TILE_SIZE",
     "Attention2DAttention",
     "AttentionBackend",
     "AttentionTensorLayout",
@@ -49,17 +39,11 @@ __all__ = [
     "FlashAttn4Attention",
     "FlashInferAttention",
     "RingAttention",
-    "SolAttention",
     "TrtllmAttention",
     "TrtllmAttentionMetadata",
     "UlyssesAttention",
-    "VSAAttention",
-    "VSAMetadata",
-    "VSAMetadataBuilder",
     "VanillaAttention",
     "create_attention",
     "get_visual_gen_attention_backend",
-    "get_vsa_forward_context",
-    "set_vsa_forward_context",
     "wrap_parallel_attention",
 ]

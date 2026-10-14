@@ -42,7 +42,7 @@ pytestmark = pytest.mark.cpu_only
 
 
 def _get_create_py_executor_source() -> str:
-    return inspect.getsource(py_executor_creator.create_py_executor)
+    return inspect.getsource(py_executor_creator._create_py_executor)
 
 
 def test_flash_mla_branch_overrides_local_tokens_per_block():

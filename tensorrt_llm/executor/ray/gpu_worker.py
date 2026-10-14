@@ -15,7 +15,6 @@
 import gc
 import importlib
 import os
-import tempfile
 from functools import wraps
 from pathlib import Path
 from queue import Queue
@@ -27,7 +26,8 @@ import torch
 from tensorrt_llm._torch.utils import get_device_uuid
 from tensorrt_llm._torch.virtual_memory import (materialize_with_tag,
                                                 release_with_tag)
-from tensorrt_llm.executor.ray.utils import control_action_decorator
+from tensorrt_llm.executor.ray.utils import (_configure_deep_gemm_cache,
+                                             control_action_decorator)
 
 from ... import TorchLlmArgs
 from ...llmapi.llm_args import BaseLlmArgs, ExecutorMemoryType
@@ -73,9 +73,7 @@ class RayWorkerWrapper:
         self.gpu = int(ray.get_gpu_ids()[0])
         self.local_gpu = self.physical_to_local_id(self.gpu)
 
-        # Per-worker DeepGemm JIT cache to avoid rename race across co-located workers
-        os.environ["DG_JIT_CACHE_DIR"] = os.path.join(
-            tempfile.gettempdir(), f"deep_gemm_rank{rank}_gpu{self.gpu}")
+        _configure_deep_gemm_cache(rank, self.gpu)
 
         torch.cuda.set_device(self.local_gpu)
 

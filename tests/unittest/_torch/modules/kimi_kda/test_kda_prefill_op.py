@@ -4,6 +4,7 @@
 
 from collections.abc import Mapping
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 import torch
@@ -49,15 +50,18 @@ pytestmark = pytest.mark.skipif(
 def _make_kda(
     expected_prefill_kernel_path: str = "optimized",
     source_state_dict: Mapping[str, torch.Tensor] | None = None,
+    *,
+    num_heads: int = NUM_HEADS,
+    use_full_rank_gate: bool = True,
 ) -> KimiKDALinearAttention:
     cfg = SimpleNamespace(
         hidden_size=HIDDEN_SIZE,
         rms_norm_eps=1e-5,
         linear_attn_config={
-            "num_heads": NUM_HEADS,
+            "num_heads": num_heads,
             "head_dim": HEAD_DIM,
             "short_conv_kernel_size": CONV_KERNEL_SIZE,
-            "use_full_rank_gate": True,
+            "use_full_rank_gate": use_full_rank_gate,
             "gate_lower_bound": -5.0,
         },
     )
@@ -72,13 +76,18 @@ def _make_kda(
     return kda
 
 
-def _make_reference(source_state_dict: Mapping[str, torch.Tensor]) -> KimiKDAReference:
+def _make_reference(
+    source_state_dict: Mapping[str, torch.Tensor],
+    *,
+    num_heads: int = NUM_HEADS,
+    use_full_rank_gate: bool = True,
+) -> KimiKDAReference:
     reference = KimiKDAReference(
         hidden_size=HIDDEN_SIZE,
-        num_heads=NUM_HEADS,
+        num_heads=num_heads,
         head_dim=HEAD_DIM,
         conv_kernel_size=CONV_KERNEL_SIZE,
-        use_full_rank_gate=True,
+        use_full_rank_gate=use_full_rank_gate,
         gate_lower_bound=-5.0,
         rms_norm_eps=1e-5,
         dtype=torch.bfloat16,
@@ -103,7 +112,7 @@ def _run_production_prefill(
     else:
         batch_size = cu_seqlens.numel() - 1
 
-    projection_size = NUM_HEADS * HEAD_DIM
+    projection_size = attention.proj_size
     if conv_pool is None:
         conv_pool = torch.zeros(
             batch_size,
@@ -115,7 +124,7 @@ def _run_production_prefill(
     if state_pool is None:
         state_pool = torch.zeros(
             batch_size,
-            NUM_HEADS,
+            attention.num_heads,
             HEAD_DIM,
             HEAD_DIM,
             dtype=torch.float32,
@@ -130,6 +139,7 @@ def _run_production_prefill(
         use_initial_states=use_initial_states,
         has_initial_states=has_initial_states,
         state_indices=slot_indices.to(torch.int32),
+        # causal_conv1d wants int32 offsets, unlike the int64 cu_seqlens above.
         query_start_loc=cu_seqlens.to(torch.int32),
     )
     core = attention.forward_prefill(
@@ -156,22 +166,26 @@ def _assert_close(actual: torch.Tensor, expected: torch.Tensor) -> None:
     assert relative_l2 < 3e-2
 
 
+@pytest.mark.parametrize("token_major", [False, True], ids=["channel_major", "token_major"])
 @pytest.mark.parametrize("sequence_length", [1, 127, 256])
 @torch.no_grad()
-def test_fused_kda_post_conv_matches_reference(sequence_length: int) -> None:
-    """Packed convolution output is normalized and transposed correctly."""
+def test_fused_kda_post_conv_matches_reference(sequence_length: int, token_major: bool) -> None:
+    """Packed convolution output is normalized and transposed correctly.
+
+    Token-major input is the transposed view of ``[T, 3P]`` rows.
+    """
     torch.manual_seed(1)
     num_heads, head_dim = 8, 128
     projection_size = num_heads * head_dim
-    packed = torch.randn(
-        3 * projection_size,
-        sequence_length,
-        dtype=torch.bfloat16,
-        device="cuda",
-    )
+    shape = (3 * projection_size, sequence_length)
+    if token_major:
+        shape = shape[::-1]
+    packed = torch.randn(shape, dtype=torch.bfloat16, device="cuda")
+    if token_major:
+        packed = packed.t()
 
     actual_q, actual_k, actual_v = fused_kda_post_conv(packed, num_heads, head_dim)
-    unpacked = packed.view(3, projection_size, sequence_length)
+    unpacked = packed.reshape(3, projection_size, sequence_length)
     expected_q = unpacked[0].transpose(0, 1).reshape(1, sequence_length, num_heads, head_dim)
     expected_k = unpacked[1].transpose(0, 1).reshape(1, sequence_length, num_heads, head_dim)
     expected_v = unpacked[2].transpose(0, 1).reshape(1, sequence_length, num_heads, head_dim)
@@ -186,6 +200,68 @@ def test_fused_kda_post_conv_matches_reference(sequence_length: int) -> None:
     torch.testing.assert_close(actual_q, expected_q.to(packed.dtype), rtol=1e-2, atol=1e-2)
     torch.testing.assert_close(actual_k, expected_k.to(packed.dtype), rtol=1e-2, atol=1e-2)
     assert torch.equal(actual_v, expected_v)
+
+
+@torch.no_grad()
+def test_fused_kda_post_conv_rejects_layout_without_unit_stride() -> None:
+    """Input with no unit stride along tokens or features is rejected."""
+    projection_size = 2 * 128
+    packed = torch.randn(3 * projection_size, 8, 2, dtype=torch.bfloat16, device="cuda")[..., 0]
+    with pytest.raises(ValueError, match="unit stride"):
+        fused_kda_post_conv(packed, 2, 128)
+
+
+@torch.no_grad()
+@pytest.mark.parametrize(
+    ("num_tokens", "dtype", "channel_major"),
+    [
+        (256, torch.bfloat16, True),
+        (301, torch.bfloat16, False),
+        (300, torch.bfloat16, False),
+        (300, torch.float32, True),
+    ],
+    ids=["bf16-aligned", "bf16-odd", "bf16-even-unaligned", "fp32-aligned"],
+)
+def test_project_packed_conv_input_layout(
+    num_tokens: int, dtype: torch.dtype, channel_major: bool
+) -> None:
+    """The transposed GEMM is used only when its output rows are 16-byte aligned.
+
+    Other token counts keep the token-major GEMM and return its transposed view,
+    so the alignment rule follows the element size rather than a token count.
+    """
+    torch.manual_seed(3)
+    # Only the projection layout is checked, so two heads keep the weights small.
+    kda = _make_kda(num_heads=2).to(dtype)
+    kda.finalize_decode_weights()
+    assert kda._qkvg_proj_weight is not None
+    x2d = torch.randn(num_tokens, HIDDEN_SIZE, dtype=dtype, device="cuda") * 0.05
+
+    packed_conv, _ = kda._project_packed_conv_input(x2d.unsqueeze(0), x2d)
+
+    assert packed_conv.shape == (3 * kda.proj_size, num_tokens)
+    assert packed_conv.stride(1 if channel_major else 0) == 1
+    expected = torch.nn.functional.linear(
+        x2d.float(), kda._qkvg_proj_weight[: 3 * kda.proj_size].float()
+    ).t()
+    torch.testing.assert_close(packed_conv.float(), expected, rtol=2e-2, atol=2e-2)
+
+
+@torch.no_grad()
+def test_prefill_output_matches_across_projection_layouts() -> None:
+    """Aligned and unaligned token counts produce the same prefill output.
+
+    The odd-length request is the aligned one plus one trailing token, so its
+    shared prefix must match the aligned request token for token.
+    """
+    torch.manual_seed(4)
+    kda = _make_kda()
+    hidden_states = torch.randn(1, 257, HIDDEN_SIZE, dtype=torch.bfloat16, device="cuda") * 0.05
+
+    aligned = _run_production_prefill(kda, hidden_states[:, :256].contiguous())
+    unaligned = _run_production_prefill(kda, hidden_states)
+
+    torch.testing.assert_close(unaligned[:, :256], aligned, rtol=2e-2, atol=2e-2)
 
 
 @torch.no_grad()
@@ -320,10 +396,17 @@ def test_copy_kda_replay_conv_window_preserves_slot_padding() -> None:
 
 
 @torch.no_grad()
-def test_optimized_prefill_matches_fla_reference() -> None:
+@pytest.mark.parametrize(
+    ("num_heads", "use_full_rank_gate"),
+    [(NUM_HEADS, True), (16, False), (64, False)],
+    ids=["full-rank", "low-rank-h16", "low-rank-h64"],
+)
+def test_optimized_prefill_matches_fla_reference(num_heads: int, use_full_rank_gate: bool) -> None:
     torch.manual_seed(0)
-    optimized = _make_kda()
-    reference = _make_reference(optimized.state_dict())
+    optimized = _make_kda(num_heads=num_heads, use_full_rank_gate=use_full_rank_gate)
+    reference = _make_reference(
+        optimized.state_dict(), num_heads=num_heads, use_full_rank_gate=use_full_rank_gate
+    )
 
     # Keep B=2 across a T transition: eqlen mBeta/mAqk/mAkk batch strides
     # depend on T and therefore require distinct compiled kernel variants.
@@ -475,11 +558,48 @@ def test_fused_prefill_beta_sigmoid_matches_unfused_kernel(
 
 @torch.no_grad()
 def test_kda_mixer_empty_prefill():
-    """The production mixer handles an empty token payload without raising."""
+    """An empty token payload still publishes the conv state for its slot."""
     optimized = _make_kda()
     hidden_states = torch.empty(1, 0, HIDDEN_SIZE, dtype=torch.bfloat16, device="cuda")
-    out = _run_production_prefill(optimized, hidden_states)
+    # Seed the pool with a sentinel: the output shape alone would still match if the
+    # zero-token state write-back were skipped, so only the pool can catch that.
+    conv_pool = torch.full(
+        (1, 3 * NUM_HEADS * HEAD_DIM, CONV_KERNEL_SIZE - 1),
+        7.0,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    out = _run_production_prefill(optimized, hidden_states, conv_pool=conv_pool)
     assert out.shape == (1, 0, HIDDEN_SIZE)
+    # Without an initial state a zero-token sequence leaves an all-zero causal window.
+    assert torch.equal(conv_pool, torch.zeros_like(conv_pool))
+
+
+@torch.no_grad()
+def test_kda_mixer_empty_prefill_preserves_initial_conv_state():
+    """A zero-token payload carrying an initial state leaves that state untouched."""
+    optimized = _make_kda()
+    hidden_states = torch.empty(1, 0, HIDDEN_SIZE, dtype=torch.bfloat16, device="cuda")
+    conv_seed = (
+        torch.randn(
+            1,
+            3 * NUM_HEADS * HEAD_DIM,
+            CONV_KERNEL_SIZE - 1,
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        * 0.05
+    )
+    conv_pool = conv_seed.clone()
+    out = _run_production_prefill(
+        optimized,
+        hidden_states,
+        conv_pool=conv_pool,
+        has_initial_states=torch.ones(1, dtype=torch.bool, device="cuda"),
+    )
+    assert out.shape == (1, 0, HIDDEN_SIZE)
+    # No token shifts into the window, so the write-back must republish it verbatim.
+    assert torch.equal(conv_pool, conv_seed)
 
 
 @torch.no_grad()
@@ -590,23 +710,31 @@ def test_kda_prefill_op_partial_final_chunk_large_batch():
 @torch.no_grad()
 @pytest.mark.parametrize(
     "sequence_lengths",
-    ([30], [65], [6, 12], [1, 2, 3], [64, 64, 63], [6, 12, 20, 25]),
+    ([1], [30], [65], [6, 12], [64, 64], [1, 2, 3], [64, 64, 63], [6, 12, 20, 25]),
     ids=(
+        # The only shape taking the sentinel-padded, forced-VARLEN_PURE branch.
+        "single-token",
         "one-chunk",
         "two-chunk-single-seq",
         "two-chunk-varlen",
+        # All-aligned, so the tile guard alone bounds the kernel's stores.
+        "two-chunk-varlen-aligned",
         "three-short-seqs",
         "three-chunk-boundary",
-        "four-chunk-optimized-boundary",
+        "four-chunk",
     ),
 )
-def test_kda_prefill_small_varlen_dispatch_matches_fla_reference(sequence_lengths):
-    """Cover every small-varlen fallback chunk count and the optimized boundary.
+def test_kda_prefill_small_varlen_stays_on_optimized_op(
+    monkeypatch: pytest.MonkeyPatch,
+    sequence_lengths: list[int],
+) -> None:
+    """The optimized op owns every small varlen chunk count, not just NT >= 4.
 
-    The persistent K123 scheduler needs at least four total chunks. The
-    one-, two-, and three-chunk configurations must use FLA; the final case
-    has exactly four chunks and verifies the optimized boundary.
+    Routing these short-prompt shapes to FLA instead would make a real serving
+    run pay FLA's cold Triton autotune on its first short context.
     """
+    import fla.ops.kda
+
     optimized = _make_kda()
     reference = _make_reference(optimized.state_dict())
     cumulative_lengths = torch.tensor(
@@ -624,7 +752,17 @@ def test_kda_prefill_small_varlen_dispatch_matches_fla_reference(sequence_length
         )
         * 0.05
     )
+
+    # The FLA fallback resolves ``chunk_kda`` at call time, so this counts it;
+    # the reference binds it at import time and is unaffected.
+    fla_spy = MagicMock(side_effect=fla.ops.kda.chunk_kda)
+    monkeypatch.setattr(fla.ops.kda, "chunk_kda", fla_spy)
     actual = _run_production_prefill(optimized, hidden_states, cumulative_lengths)
+    assert fla_spy.call_count == 0, (
+        f"prefill fell back to FLA for sequence lengths {sequence_lengths}; "
+        "the optimized op must handle every varlen chunk count"
+    )
+
     expected = reference.forward_prefill(hidden_states, cu_seqlens=cumulative_lengths)
     _assert_close(actual, expected)
 
@@ -715,6 +853,94 @@ def test_kda_prefill_state_pool_matches_fallback_with_mixed_initial_states(
         fallback_state.index_select(0, slot_indices),
         optimized_state.index_select(0, slot_indices),
     )
+
+
+@torch.no_grad()
+def test_token_major_prefill_matches_channel_major_with_initial_states(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The token-major projection layout carries continuation state like channel-major.
+
+    An unaligned token count takes the token-major projection and the
+    channel-last convolution. Forcing the same projection channel-major must
+    give the same outputs and pool updates for mixed initial states,
+    permuted slots and an unused slot.
+    """
+    torch.manual_seed(5)
+    kda = _make_kda()
+    sequence_lengths = [64, 64, 64, 63]
+    assert sum(sequence_lengths) * torch.bfloat16.itemsize % 16 != 0
+    cumulative_lengths = torch.tensor(
+        [0, *torch.tensor(sequence_lengths).cumsum(0).tolist()],
+        dtype=torch.long,
+        device="cuda",
+    )
+    hidden_states = (
+        torch.randn(1, sum(sequence_lengths), HIDDEN_SIZE, dtype=torch.bfloat16, device="cuda")
+        * 0.05
+    )
+    slots = 5
+    slot_indices = torch.tensor([3, 0, 4, 1], dtype=torch.int32, device="cuda")
+    has_initial_states = torch.tensor([True, False, True, False], device="cuda")
+    conv_seed = (
+        torch.randn(
+            slots,
+            3 * kda.proj_size,
+            CONV_KERNEL_SIZE - 1,
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        * 0.05
+    )
+    state_seed = (
+        torch.randn(slots, NUM_HEADS, HEAD_DIM, HEAD_DIM, dtype=torch.float32, device="cuda") * 0.05
+    )
+
+    def run():
+        """Prefill from fresh copies of the seeded pools; return output and pools."""
+        conv_pool, state_pool = conv_seed.clone(), state_seed.clone()
+        output = _run_production_prefill(
+            kda,
+            hidden_states,
+            cumulative_lengths,
+            conv_pool=conv_pool,
+            state_pool=state_pool,
+            slot_indices=slot_indices,
+            has_initial_states=has_initial_states,
+        )
+        return output, conv_pool, state_pool
+
+    project = KimiKDALinearAttention._project_packed_conv_input
+    layouts = []
+
+    def recording_project(self, x, x2d):
+        """Record whether the projection came back token-major."""
+        packed_conv, onorm_g = project(self, x, x2d)
+        layouts.append(packed_conv.stride(0) == 1)
+        return packed_conv, onorm_g
+
+    monkeypatch.setattr(KimiKDALinearAttention, "_project_packed_conv_input", recording_project)
+    token_major = run()
+    assert layouts == [True]
+
+    def channel_major_project(self, x, x2d):
+        """Force the channel-major layout regardless of alignment."""
+        packed_conv, onorm_g = project(self, x, x2d)
+        return packed_conv.contiguous(), onorm_g
+
+    monkeypatch.setattr(KimiKDALinearAttention, "_project_packed_conv_input", channel_major_project)
+    channel_major = run()
+
+    _assert_close(token_major[0], channel_major[0])
+    # Convolution states are copied verbatim out of the projection.
+    torch.testing.assert_close(token_major[1], channel_major[1], rtol=0, atol=0)
+    _assert_close(
+        token_major[2].index_select(0, slot_indices),
+        channel_major[2].index_select(0, slot_indices),
+    )
+    unused_slot = 2
+    assert torch.equal(token_major[1][unused_slot], conv_seed[unused_slot])
+    assert torch.equal(token_major[2][unused_slot], state_seed[unused_slot])
 
 
 @torch.no_grad()

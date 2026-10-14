@@ -398,11 +398,14 @@ def _convert_tool_choice(
 
 
 # Chat-template kwargs that turn off pruning of earlier-turn reasoning. The
-# name differs per model family but the meaning is identical, and a template
-# that does not know a key simply ignores it, so both are always sent
-# together:
+# name differs per model family but the meaning is identical, and the adapter
+# cannot know which one the template reads, so both are always sent together:
 #   * `clear_thinking`  - GLM-family Jinja templates
 #   * `drop_thinking`   - DeepSeek-V4 (`DeepseekV4Tokenizer.apply_chat_template`)
+# The unused-kwargs guard would reject the one the template does not read, so
+# `convert_anthropic_request` lists every adapter-derived key in
+# `injected_chat_template_kwargs`; the guard exempts those and the template
+# ignores the key it does not know, as before.
 _KEEP_ALL_THINKING_KWARGS = {"clear_thinking": False, "drop_thinking": False}
 
 
@@ -516,6 +519,10 @@ def convert_anthropic_request(request: AnthropicMessagesRequest) -> ChatCompleti
 
     if chat_template_kwargs:
         chat_request["chat_template_kwargs"] = chat_template_kwargs
+        # The Anthropic API has no chat_template_kwargs of its own: every key
+        # here was derived from an API-level field, so none of them is a
+        # caller mistake for the unused-kwargs guard to reject.
+        chat_request["injected_chat_template_kwargs"] = sorted(chat_template_kwargs)
     if request.stream:
         chat_request["stream_options"] = {
             "include_usage": True,

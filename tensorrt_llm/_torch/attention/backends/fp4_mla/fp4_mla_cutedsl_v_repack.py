@@ -4,9 +4,6 @@
 
 """CuTeDSL helpers for repacking the paged FP4 MLA V cache."""
 
-import contextlib
-import os
-import sys
 from collections.abc import Callable
 from dataclasses import dataclass
 
@@ -14,106 +11,15 @@ import cuda.bindings.driver as cuda
 import cutlass as ctm
 import cutlass.cute as cute
 import torch
-from cutlass.base_dsl.dsl import BaseDSL
 from cutlass.cute.runtime import make_ptr
 from cutlass.experimental import cuda as cuda_exp
 from cutlass.experimental import primitives
 
+from .cute_dsl_utils import _compile_cutedsl, _current_cu_stream
+
 PREPARED_BUFFER_ALIGNMENT_BYTES = 32
 TRTLLM_PAGE_SIZE = 128
 SMEM_P4_V_N_PER_CTA = 128
-
-_CUTEDSL_VERBOSE_COMPILE_ENV = "TRTLLM_CUTEDSL_VERBOSE_COMPILE"
-_PYIR_STDOUT_LINES = frozenset(
-    {
-        "Enabling PyIR, it was False",
-        "Enabling PyIR, it is now True",
-        "Disabling PyIR, it was True",
-        "Disabling PyIR, it is now False",
-    }
-)
-
-
-class _PyIRStdoutFilter:
-    """Drop only CuTeDSL PyIR state transitions from a text stream."""
-
-    def __init__(self, output):
-        self._output = output
-        self._pending = ""
-
-    def write(self, text):
-        lines = (self._pending + text).split("\n")
-        self._pending = lines.pop()
-        for line in lines:
-            if line.rstrip("\r") not in _PYIR_STDOUT_LINES:
-                self._output.write(f"{line}\n")
-        return len(text)
-
-    def flush(self):
-        self._output.flush()
-
-    def finish(self):
-        if self._pending and self._pending.rstrip("\r") not in _PYIR_STDOUT_LINES:
-            self._output.write(self._pending)
-        self._pending = ""
-        self._output.flush()
-
-    def __getattr__(self, name):
-        return getattr(self._output, name)
-
-
-def _compile_cutedsl(*args, **kwargs):
-    """Compile with PyIR while suppressing only its state-transition lines."""
-    verbose = os.getenv(_CUTEDSL_VERBOSE_COMPILE_ENV, "").strip().lower()
-    if verbose in {"1", "true", "yes", "on"}:
-        with BaseDSL.enable_pyir():
-            return cute.compile(*args, **kwargs)
-
-    stdout_filter = _PyIRStdoutFilter(sys.stdout)
-    try:
-        with contextlib.redirect_stdout(stdout_filter), BaseDSL.enable_pyir():
-            return cute.compile(*args, **kwargs)
-    finally:
-        stdout_filter.finish()
-
-
-_EXPLICIT_TORCH_STREAM: torch.cuda.Stream | None = None
-
-
-@contextlib.contextmanager
-def _launch_stream():
-    """Yield the CUDA driver stream these kernels should launch on.
-
-    cuda2ctl capture cannot reliably query the default null stream, so SMART
-    wrappers can ask for an explicit one through DKG_MLA_EXPLICIT_STREAM. The
-    substitution must be bracketed rather than assigned: the caller's stream
-    already carries the RoPE, Q quantization and KV-cache writes these kernels
-    read, and it is also the stream their consumers read the output from.
-    Entering waits on the caller's work, leaving publishes ours back to it, and
-    ``torch.cuda.stream`` restores the thread's current stream on the way out.
-    A bare ``set_stream`` does none of the three.
-
-    Switching the current stream is illegal while a CUDA graph is capturing, so
-    the knob is ignored under capture and the caller's stream is used as-is.
-    """
-    entry_stream = torch.cuda.current_stream()
-    if os.environ.get("DKG_MLA_EXPLICIT_STREAM") != "1" or torch.cuda.is_current_stream_capturing():
-        yield cuda.CUstream(entry_stream.cuda_stream)
-        return
-
-    global _EXPLICIT_TORCH_STREAM
-    if _EXPLICIT_TORCH_STREAM is None:
-        _EXPLICIT_TORCH_STREAM = torch.cuda.Stream()
-    start_event = torch.cuda.Event()
-    done_event = torch.cuda.Event()
-    start_event.record(entry_stream)
-    with torch.cuda.stream(_EXPLICIT_TORCH_STREAM):
-        _EXPLICIT_TORCH_STREAM.wait_event(start_event)
-        try:
-            yield cuda.CUstream(_EXPLICIT_TORCH_STREAM.cuda_stream)
-        finally:
-            done_event.record(_EXPLICIT_TORCH_STREAM)
-    entry_stream.wait_event(done_event)
 
 
 @dataclass(frozen=True)
@@ -801,44 +707,44 @@ def fp4_mla_repack_v_cache(
     )
     if resolve_generation_pages and not use_tma_fast_path:
         raise ValueError("generation-aware V repack requires the PAGE128/BLOCKV128 TMA path")
-    with _launch_stream() as stream:
-        repack_fn = _compile_fp4_mla_v_repack(
-            v_packed.data_ptr(),
-            kv_cache.data_ptr(),
-            page_ids_data_ptr,
-            page_indptr_data_ptr,
-            kv_lens_data_ptr,
-            generation_lens_data_ptr,
-            page_size,
-            v_head_dim,
-            use_page_ids,
-            resolve_generation_pages,
-            max_touched_pages,
-            block_v,
-            use_tma_fast_path,
-            stream,
-        )
-        ptrs = _make_v_repack_ptrs(
-            v_packed.data_ptr(),
-            kv_cache.data_ptr(),
-            page_ids_data_ptr,
-            page_indptr_data_ptr,
-            kv_lens_data_ptr,
-            generation_lens_data_ptr,
-        )
-        repack_fn(
-            *ptrs,
-            stream,
-            ctm.Int32(layout.num_pages),
-            ctm.Int64(layout.stride_page),
-            ctm.Int64(layout.stride_token),
-            ctm.Int64(layout.stride_packed_dim),
-            ctm.Int64(v_packed.stride(0)),
-            ctm.Int64(v_packed.stride(1)),
-            ctm.Int64(page_ids_stride),
-            ctm.Int32(num_page_ids),
-            ctm.Int32(num_generation_sequences),
-        )
+    stream = _current_cu_stream()
+    repack_fn = _compile_fp4_mla_v_repack(
+        v_packed.data_ptr(),
+        kv_cache.data_ptr(),
+        page_ids_data_ptr,
+        page_indptr_data_ptr,
+        kv_lens_data_ptr,
+        generation_lens_data_ptr,
+        page_size,
+        v_head_dim,
+        use_page_ids,
+        resolve_generation_pages,
+        max_touched_pages,
+        block_v,
+        use_tma_fast_path,
+        stream,
+    )
+    ptrs = _make_v_repack_ptrs(
+        v_packed.data_ptr(),
+        kv_cache.data_ptr(),
+        page_ids_data_ptr,
+        page_indptr_data_ptr,
+        kv_lens_data_ptr,
+        generation_lens_data_ptr,
+    )
+    repack_fn(
+        *ptrs,
+        stream,
+        ctm.Int32(layout.num_pages),
+        ctm.Int64(layout.stride_page),
+        ctm.Int64(layout.stride_token),
+        ctm.Int64(layout.stride_packed_dim),
+        ctm.Int64(v_packed.stride(0)),
+        ctm.Int64(v_packed.stride(1)),
+        ctm.Int64(page_ids_stride),
+        ctm.Int32(num_page_ids),
+        ctm.Int32(num_generation_sequences),
+    )
 
 
 def fp4_mla_repack_v_cache_reference(

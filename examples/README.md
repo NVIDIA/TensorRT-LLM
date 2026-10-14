@@ -32,7 +32,6 @@ Full documentation: https://nvidia.github.io/TensorRT-LLM/quick-start-guide.html
 | [`kv_cache_compression/`](kv_cache_compression/) | KV cache compression examples, including NVFP4 cold-page quantization and TriAttention |
 | [`apps/`](apps/) | Application examples (chat, FastAPI server) |
 | [`configs/`](configs/) | Pre-tuned serving configurations — [curated](configs/curated/) quick-starts and a [comprehensive database](configs/database/) |
-| [`auto_deploy/`](auto_deploy/) | AutoDeploy (beta) development examples, cookbooks, and model registry |
 | [`serve/`](serve/) | `trtllm-serve` deployment guides and examples |
 | [`quantization/`](quantization/) | Quantization workflows with NVIDIA Model Optimizer |
 
@@ -50,16 +49,6 @@ trtllm-serve "deepseek-ai/DeepSeek-R1-0528" \
 For model-specific walkthroughs and an interactive recipe selector, see the
 [Model Recipes](https://nvidia.github.io/TensorRT-LLM/deployment-guide/index.html)
 deployment guide.
-
-## AutoDeploy (Beta)
-
-The [AutoDeploy](https://nvidia.github.io/TensorRT-LLM/features/auto_deploy/auto-deploy.html)
-backend automatically translates HuggingFace models into optimized inference graphs.
-It is accessed through the same `trtllm-serve`, `trtllm-bench`, and LLM API entry
-points as the default PyTorch backend.
-
-See [`auto_deploy/`](auto_deploy/) for development examples, Jupyter cookbooks,
-and a registry of 90+ validated models.
 
 ## Legacy Engine-Build Workflow
 

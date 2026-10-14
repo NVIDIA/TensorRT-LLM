@@ -25,7 +25,7 @@ A block "belongs to VG" iff any of its `tests:` entries lives under a
 dedicated `visual_gen/` test path or is the VisualGen perf-sanity entry.
 
 Outward-facing fallback:
-Unlike AutoDeploy, VG is imported eagerly (module-level) by non-VG
+VisualGen is imported eagerly (module-level) by non-VG
 code: `commands/serve.py`, `commands/utils.py`, and
 `serve/openai_server.py` import `VisualGenArgs` / `ParallelConfig` /
 `VisualGen` / `VisualGenParams` and `tensorrt_llm.media.*` at top level.
@@ -43,6 +43,7 @@ from blocks import Stage, YAMLIndex, _entry_target
 
 from ._helpers import is_perf_stem, resolve_affected_stages, stages_by_yaml_stem
 from .base import PRInputs, Rule, RuleResult
+from .docs_rule import is_docs_path
 
 # VG source-path prefixes the rule may claim, mirroring the VisualGen
 # section of `.github/CODEOWNERS`. Tests under tests/** are left to
@@ -77,9 +78,9 @@ _VG_ENTRY_PATTERNS: tuple[str, ...] = (
 def _is_vg_claim(path: str) -> bool:
     """Decide whether VisualGenRule claims `path`.
 
-    `*.md` files are excluded so docs-only PRs (e.g.
-    `examples/visual_gen/README.md`) don't force VG stages —
-    `OutOfScopeRule` claims them as noop instead. Image suffixes are
+    Documentation files are excluded so docs-only PRs (e.g.
+    `examples/visual_gen/README.md`) don't force VG stages; `DocsRule`
+    routes them to the docs build instead. Image suffixes are
     intentionally NOT excluded: VG ships reference images that are
     loaded as test fixtures (e.g. `examples/visual_gen/cat_piano.png`
     referenced by `tests/unittest/_torch/visual_gen/`), so edits to
@@ -87,7 +88,7 @@ def _is_vg_claim(path: str) -> bool:
     """
     if not path.startswith(_VG_SRC_PREFIXES):
         return False
-    if path.endswith(".md"):
+    if is_docs_path(path):
         return False
     return True
 

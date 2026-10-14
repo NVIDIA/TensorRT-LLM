@@ -7,7 +7,6 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from torch.profiler import ProfilerActivity, profile
 
 pytest.importorskip("fla")
 
@@ -28,8 +27,6 @@ NUM_HEADS = 96
 HEAD_DIM = 128
 CONV_KERNEL_SIZE = 4
 HIDDEN_SIZE = 7168
-SUPPORTED_HEADS = (1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 96)
-COMPACT_WORK_THRESHOLD = 144
 
 
 def _has_supported_gpu() -> bool:
@@ -49,14 +46,17 @@ pytestmark = pytest.mark.skipif(
 
 
 def _make_attention_pair(
-    *, finalize_decode_weights: bool = True
+    *,
+    finalize_decode_weights: bool = True,
+    num_heads: int = NUM_HEADS,
+    use_full_rank_gate: bool = True,
 ) -> tuple[KimiKDALinearAttention, KimiKDAReference]:
     common = {
         "hidden_size": HIDDEN_SIZE,
-        "num_heads": NUM_HEADS,
+        "num_heads": num_heads,
         "head_dim": HEAD_DIM,
         "conv_kernel_size": CONV_KERNEL_SIZE,
-        "use_full_rank_gate": True,
+        "use_full_rank_gate": use_full_rank_gate,
         "gate_lower_bound": -5.0,
         "rms_norm_eps": 1e-5,
         "dtype": torch.bfloat16,
@@ -65,7 +65,7 @@ def _make_attention_pair(
         hidden_size=HIDDEN_SIZE,
         rms_norm_eps=common["rms_norm_eps"],
         linear_attn_config={
-            "num_heads": NUM_HEADS,
+            "num_heads": num_heads,
             "head_dim": HEAD_DIM,
             "short_conv_kernel_size": CONV_KERNEL_SIZE,
             "use_full_rank_gate": common["use_full_rank_gate"],
@@ -84,8 +84,10 @@ def _make_attention_pair(
     return optimized, reference
 
 
-def _make_cache(batch_size: int = BATCH_SIZE) -> KimiKDATestCachedState:
-    projection_size = NUM_HEADS * HEAD_DIM
+def _make_cache(
+    batch_size: int = BATCH_SIZE, *, num_heads: int = NUM_HEADS
+) -> KimiKDATestCachedState:
+    projection_size = num_heads * HEAD_DIM
     return KimiKDATestCachedState(
         conv_state_q=(
             torch.randn(
@@ -120,7 +122,7 @@ def _make_cache(batch_size: int = BATCH_SIZE) -> KimiKDATestCachedState:
         recurrent_state=(
             torch.randn(
                 batch_size,
-                NUM_HEADS,
+                num_heads,
                 HEAD_DIM,
                 HEAD_DIM,
                 dtype=torch.float32,
@@ -143,7 +145,7 @@ def _run_production_decode(
     include_metadata: bool = True,
 ) -> tuple[torch.Tensor, KimiKDATestCachedState]:
     batch_size = hidden_states.shape[0]
-    projection_size = NUM_HEADS * HEAD_DIM
+    projection_size = attention.proj_size
     if slot_indices is None:
         slot_indices = torch.arange(batch_size, device="cuda", dtype=torch.long)
     if conv_pool is None:
@@ -206,10 +208,36 @@ def _assert_close(actual: torch.Tensor, expected: torch.Tensor) -> None:
 
 
 @torch.no_grad()
+@pytest.mark.parametrize("num_heads", [16, 64])
+def test_low_rank_gate_projections_match_unfused_linears(num_heads: int) -> None:
+    """Check each gate before nonlinearities can hide projection-layout errors."""
+    torch.manual_seed(31)
+    optimized, reference = _make_attention_pair(num_heads=num_heads, use_full_rank_gate=False)
+    hidden = torch.randn(2, 5, HIDDEN_SIZE, device="cuda", dtype=torch.bfloat16)
+    beta, forget_gate, output_gate = optimized._project_gate_inputs(hidden)
+    expected = (
+        reference.b_proj(hidden),
+        reference.f_b_proj(reference.f_a_proj(hidden)),
+        reference.g_b_proj(reference.g_a_proj(hidden)),
+    )
+    for actual, wanted in zip((beta, forget_gate, output_gate), expected):
+        torch.testing.assert_close(actual, wanted, rtol=0.02, atol=0.002)
+
+
+@torch.no_grad()
 @pytest.mark.parametrize("batch_size", [1, BATCH_SIZE])
-def test_optimized_decode_matches_fla_reference(batch_size: int) -> None:
+@pytest.mark.parametrize(
+    ("num_heads", "use_full_rank_gate"),
+    [(NUM_HEADS, True), (16, False), (64, False)],
+    ids=["full-rank", "low-rank-h16", "low-rank-h64"],
+)
+def test_optimized_decode_matches_fla_reference(
+    batch_size: int, num_heads: int, use_full_rank_gate: bool
+) -> None:
     torch.manual_seed(0)
-    optimized, reference = _make_attention_pair()
+    optimized, reference = _make_attention_pair(
+        num_heads=num_heads, use_full_rank_gate=use_full_rank_gate
+    )
     hidden_states = (
         torch.randn(
             batch_size,
@@ -220,11 +248,15 @@ def test_optimized_decode_matches_fla_reference(batch_size: int) -> None:
         )
         * 0.05
     )
-    initial_cache = _make_cache(batch_size)
+    initial_cache = _make_cache(batch_size, num_heads=num_heads)
 
     actual_output, actual_cache = _run_production_decode(
-        optimized, hidden_states, copy.deepcopy(initial_cache)
+        optimized,
+        hidden_states,
+        copy.deepcopy(initial_cache),
+        ssm_state_indices=torch.arange(batch_size, device="cuda", dtype=torch.int32),
     )
+    assert optimized._o_dense is not None, "decode must exercise the fused kernel"
     expected_output, expected_cache = reference.forward_decode(
         hidden_states, copy.deepcopy(initial_cache)
     )
@@ -474,7 +506,6 @@ def _make_direct_decode_args(
             device=device,
         ),
         "ssm_state_indices": indices,
-        "cu_seqlens": torch.arange(batch_size + 1, dtype=torch.int32, device=device),
         "lower_bound": -5.0,
     }
 
@@ -563,74 +594,32 @@ def test_decode_reads_row_strided_projection_slices(num_heads: int) -> None:
     torch.testing.assert_close(strided_conv_pool[0], initial_conv_pool[0], rtol=0, atol=0)
 
 
-def _profile_decode_backend(kwargs: dict) -> str:
-    _kda_decode.run_kda_decode_fusion_cuda(**kwargs)
-    torch.cuda.synchronize()
-    with profile(activities=[ProfilerActivity.CUDA]) as prof:
-        _kda_decode.run_kda_decode_fusion_cuda(**kwargs)
-        torch.cuda.synchronize()
-
-    kernel_names = [
-        event.key
-        for event in prof.key_averages()
-        if event.device_type == torch.autograd.DeviceType.CUDA
-    ]
-    has_compact = any("kda_decode_fusion_compact_heads_kernel" in name for name in kernel_names)
-    has_many = any("kda_decode_fusion_many_heads_kernel" in name for name in kernel_names)
-    assert has_compact != has_many, kernel_names
-    return "compact" if has_compact else "many"
-
-
-@torch.no_grad()
-@pytest.mark.parametrize("num_heads", SUPPORTED_HEADS)
-def test_sm103_selector_dispatches_each_supported_head_at_boundary(num_heads: int) -> None:
-    if torch.cuda.get_device_capability(0) != (10, 3):
-        pytest.skip("compact-head selector sweep is tuned only for SM103")
-
-    compact_batch = COMPACT_WORK_THRESHOLD // num_heads
-    compact_args = _make_direct_decode_args(
-        compact_batch,
-        num_heads,
-        indexed_state=False,
-    )
-    many_args = _make_direct_decode_args(
-        compact_batch + 1,
-        num_heads,
-        indexed_state=False,
-    )
-    assert _profile_decode_backend(compact_args) == "compact"
-    assert _profile_decode_backend(many_args) == "many"
-
-
-@torch.no_grad()
-def test_selector_preserves_legacy_compact_heads_off_sm103() -> None:
-    if torch.cuda.get_device_capability(0) == (10, 3):
-        pytest.skip("non-SM103 fallback requires a different Blackwell target")
-    # Off SM103 the H==2 legacy rule dispatches the compact kernel; the
-    # SM103-only selector must not change that.
-    args = _make_direct_decode_args(1, 2, indexed_state=False)
-    assert _profile_decode_backend(args) == "compact"
-
-
 @torch.no_grad()
 @pytest.mark.parametrize(
-    ("batch_size", "indexed_state", "expected_backend"),
-    [(1, False, "compact"), (2, True, "many")],
+    ("num_heads", "batch_size", "indexed_state"),
+    [
+        (2, 1, False),
+        (96, 1, True),
+        (64, 1, False),
+        (64, 2, True),
+        (64, 3, True),
+    ],
 )
-def test_sm103_selector_is_cuda_graph_safe(
+def test_kda_decode_is_cuda_graph_safe(
+    num_heads: int,
     batch_size: int,
     indexed_state: bool,
-    expected_backend: str,
 ) -> None:
-    if torch.cuda.get_device_capability(0) != (10, 3):
-        pytest.skip("compact-head selector sweep is tuned only for SM103")
-
     args = _make_direct_decode_args(
         batch_size,
-        96,
+        num_heads,
         indexed_state=indexed_state,
     )
-    assert _profile_decode_backend(args) == expected_backend
+    expected_args = {
+        name: value.clone() if isinstance(value, torch.Tensor) else value
+        for name, value in args.items()
+    }
+    expected_output = _kda_decode.run_kda_decode_fusion_cuda(**expected_args)
 
     graph = torch.cuda.CUDAGraph()
     torch.cuda.synchronize()
@@ -639,4 +628,5 @@ def test_sm103_selector_is_cuda_graph_safe(
     graph.replay()
     torch.cuda.synchronize()
     assert captured_output is args["out"]
-    assert torch.isfinite(captured_output).all()
+    torch.testing.assert_close(captured_output, expected_output, rtol=0, atol=0)
+    torch.testing.assert_close(args["state"], expected_args["state"], rtol=0, atol=0)

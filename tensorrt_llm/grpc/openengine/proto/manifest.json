@@ -1,0 +1,20 @@
+{
+  "schema_revision": 1,
+  "minimum_client_revision": 1,
+  "bsr": {
+    "module": "buf.build/openengine/openengine",
+    "release": "768a93c7b44e40f28c692ad0b471a8f2"
+  },
+  "generator": {
+    "grpcio": "1.67.1",
+    "grpcio_tools": "1.67.1",
+    "protobuf": "5.27.2",
+    "setuptools": "84.0.0",
+    "protobuf_gencode": "5.27.2",
+    "grpc_gencode": "1.67.1"
+  },
+  "runtime_floors": {
+    "protobuf": "6.30.2",
+    "grpcio": "1.67.1"
+  }
+}

@@ -13,7 +13,7 @@ module.
 import sys
 import weakref
 from types import ModuleType, SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, create_autospec
 
 import pytest
 import torch
@@ -24,6 +24,7 @@ from tensorrt_llm._torch.attention.backends.sparse.minimax_m3 import (
 )
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.msa_scatter import (
     fused_write_layer_caches,
+    fused_write_layer_caches_nvfp4,
 )
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.msa_utils import (
     MSA_REQUIRED_TOPK,
@@ -31,6 +32,9 @@ from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.msa_utils 
 )
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.paged_cache import (
     write_kv_slots,
+)
+from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.triton_sparse_decode import (
+    minimax_m3_sparse_attn_decode,
 )
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.msa_backend import (
     MiniMaxM3MsaSparseAttentionMetadata,
@@ -40,6 +44,57 @@ from tensorrt_llm._torch.attention.backends.sparse.registry import _resolve_mini
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.llmapi.llm_args import MiniMaxM3SparseAttentionConfig
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("empty_state", ["empty_batch", "no_requests", "no_lengths"])
+def test_msa_metadata_clears_padded_cache_slot_tail(
+    monkeypatch: pytest.MonkeyPatch, empty_state: str
+) -> None:
+    """A smaller replay must not reuse the previous step's live cache slots."""
+    from tensorrt_llm._torch.attention.backends.sparse.minimax_m3 import msa_backend
+
+    monkeypatch.setattr(msa_backend, "maybe_pin_memory", lambda tensor: tensor)
+    metadata_cls = MiniMaxM3MsaSparseAttention.Metadata
+    metadata = metadata_cls.__new__(metadata_cls)
+    metadata._msa_buffers_ready = True
+    metadata.request_ids = [0]
+    metadata.kv_cache_manager = SimpleNamespace(
+        tokens_per_block=4,
+        get_buffers=lambda layer_idx: torch.empty(1),
+        get_block_ids_per_seq=lambda request_ids: torch.tensor([[3]], dtype=torch.int32),
+    )
+    metadata.msa_out_cache_loc = torch.full((4,), 99, dtype=torch.int32)
+    metadata.msa_block_table = torch.zeros((1, 1), dtype=torch.int32)
+    metadata.msa_seq_lens_cuda = torch.zeros(1, dtype=torch.int32)
+    metadata.msa_subpage_block_table = None
+    metadata._msa_runs_no_fmha = lambda: True
+    metadata._msa_kv_lens_may_change = lambda: False
+    original_ptr = metadata.msa_out_cache_loc.data_ptr()
+
+    for count in (4, 2, 0, 1):
+        metadata._msa_qo_lens_cpu = torch.tensor([count], dtype=torch.int32)
+        metadata._msa_kv_lens_cpu = metadata._msa_qo_lens_cpu.clone()
+        metadata._msa_qo_offset_cpu = torch.zeros(1, dtype=torch.int32)
+        # What the base seq_lens setter would derive; the cache writers read the
+        # live count off it.
+        metadata._num_tokens = count
+        metadata._build_msa_fields()
+        assert metadata.msa_out_cache_loc.tolist() == list(range(12, 12 + count)) + [-1] * (
+            4 - count
+        )
+        assert metadata.msa_out_cache_loc.data_ptr() == original_ptr
+        assert metadata._msa_fields_ready
+
+    if empty_state == "empty_batch":
+        metadata.request_ids = []
+        metadata._msa_qo_lens_cpu = torch.empty(0, dtype=torch.int32)
+    elif empty_state == "no_requests":
+        metadata.request_ids = None
+    else:
+        metadata._msa_qo_lens_cpu = None
+    metadata._build_msa_fields()
+    assert metadata.msa_out_cache_loc.tolist() == [-1] * 4
 
 
 def test_msa_package_availability_installs_cutlass_compatibility_aliases(monkeypatch):
@@ -190,6 +245,38 @@ def test_cache_manager_honors_executor_sparse_attention_config(
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize("capability", [(8, 0), (9, 0), (12, 0)])
+def test_nvfp4_sparse_decode_rejects_unsupported_device(
+    monkeypatch: pytest.MonkeyPatch, capability: tuple[int, int]
+) -> None:
+    """Unsupported devices fail before NVFP4 quantization or Triton compilation."""
+    get_capability = Mock(spec_set=torch.cuda.get_device_capability, return_value=capability)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", get_capability)
+    q = torch.empty((1, 8, 128), dtype=torch.bfloat16)
+    kv = torch.empty((1, 1, 128, 64), dtype=torch.uint8)
+    block_scale = torch.empty((1, 1, 128, 8), dtype=torch.uint8)
+    global_scale = torch.ones(1)
+
+    with pytest.raises(NotImplementedError, match="NVFP4 sparse decode requires SM100/SM103"):
+        minimax_m3_sparse_attn_decode(
+            q,
+            kv,
+            kv,
+            torch.zeros((1, 1, 1), dtype=torch.int32),
+            torch.zeros((1, 1), dtype=torch.int32),
+            torch.ones(1, dtype=torch.int32),
+            sm_scale=128**-0.5,
+            output=torch.empty_like(q),
+            decode_query_len=1,
+            k_block_scale=block_scale,
+            v_block_scale=block_scale,
+            k_global_scale=global_scale,
+            v_global_scale=global_scale,
+        )
+    get_capability.assert_called_once_with(q.device)
+
+
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("indexer_kv_dtype", ["bf16", "fp8"])
 @pytest.mark.parametrize("implementation", ["msa", "triton"])
 def test_index_k_views_are_fullgraph_safe(
@@ -201,6 +288,7 @@ def test_index_k_views_are_fullgraph_safe(
 
     def fake_base_init(self: KVCacheManagerV2, *args: object, **kwargs: object) -> None:
         self.is_disagg = False
+        self.dtype = DataType.BF16
         # Dense layer 0 and draft layer 60 have no INDEX_KEY; sparse layer 5
         # is non-local. Two local sparse layers share an interleaved pool.
         self.layer_offsets = {0: 0, 3: 1, 4: 2, 60: 3}
@@ -322,7 +410,7 @@ def _buffer_metadata(**manager_fields):
     metadata.kv_cache_manager = SimpleNamespace(
         max_blocks_per_seq=MAX_BLOCKS_PER_SEQ,
         tokens_per_block=128,
-        get_index_k_buffer=lambda layer_idx, kv_layout=None: None,
+        get_index_k_buffer=lambda layer_idx: None,
         **manager_fields,
     )
     metadata.is_cuda_graph = True
@@ -354,6 +442,39 @@ def test_msa_buffers_include_graph_stable_block_table():
         True,
     )
     assert requested["msa_seq_lens_cuda"] == ((MAX_NUM_SEQUENCES,), torch.int32, True)
+
+
+@pytest.mark.cpu_only
+def test_msa_buffers_stage_local_cache_views(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Stage zero-copy cache views only for sparse layers on the local rank."""
+    from tensorrt_llm._torch.attention.backends.sparse.minimax_m3 import msa_backend
+
+    metadata = _buffer_metadata(sparse_layer_ids=[3, 4], layer_offsets={3: 0})
+    main_cache = torch.zeros(2, 2, 1, 128, 128)
+    index_cache = torch.zeros(2, 1, 128, 128)
+    manager = metadata.kv_cache_manager
+    manager.get_buffers = Mock(return_value=main_cache)
+    manager.get_index_k_buffer = create_autospec(
+        MiniMaxM3KVCacheManagerV2, instance=True, spec_set=True
+    ).get_index_k_buffer
+    manager.get_index_k_buffer.return_value = index_cache
+    monkeypatch.setattr(
+        metadata,
+        "get_empty",
+        lambda buffers, shape, **kwargs: torch.empty(shape, dtype=kwargs["dtype"]),
+    )
+    # No native pool in this CPU test; only zero-copy cache-view staging is under test.
+    monkeypatch.setattr(msa_backend, "uniform_subpages_per_slot", lambda manager: 0)
+    metadata._create_msa_buffers()
+    manager.get_buffers.assert_called_once_with(3, kv_layout="HND")
+    manager.get_index_k_buffer.assert_called_once_with(3)
+    assert set(metadata.msa_layer_cache_tensors) == {3}
+    main, index = metadata.msa_layer_cache_tensors[3]
+    assert main is main_cache and index is index_cache
+    main.fill_(2)
+    index.fill_(3)
+    torch.testing.assert_close(main_cache, torch.full_like(main_cache, 2))
+    torch.testing.assert_close(index_cache, torch.full_like(index_cache, 3))
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -567,6 +688,8 @@ def test_msa_index_k_uses_hnd_cache_view_and_writer():
     metadata.kv_cache_manager = manager
     metadata.msa_out_cache_loc = torch.tensor([2, page_size + 5], dtype=torch.int32)
     values = torch.arange(2 * head_dim, dtype=torch.float32).reshape(2, 1, head_dim)
+    metadata._msa_fields_ready = True
+    metadata._num_tokens = 2
 
     returned = metadata.msa_idx_k_cache(3)
     metadata.msa_write_idx_k(3, values)
@@ -691,6 +814,7 @@ def test_msa_indexer_enforces_real_fp8_and_bf16_handoff_states() -> None:
                 self.cache,
                 self.msa_out_cache_loc,
                 idx_k,
+                int(idx_k.shape[0]),
                 layout="HND",
             )
 
@@ -1106,6 +1230,97 @@ def test_the_decode_span_of_a_mixed_step_is_its_generation_suffix():
     # The trtllm-gen scheduling bound must come from the span's own rows: the
     # 4096-token context row here would inflate a whole-batch maximum by 100x.
     assert metadata.msa_max_kv_len == 40
+
+
+def test_the_triton_sparse_decode_rejects_a_q_that_outruns_the_batch():
+    """The guard has to be reached, not merely available.
+
+    Eleven speculative decode requests of 4 query tokens each, padded by a
+    piecewise CUDA graph out to 512: the kernel would read 512 page table rows
+    out of a batch that has 11. It reads its shapes before touching a device,
+    so the refusal happens at the call and needs no GPU.
+    """
+    batch, query_len, total_q, num_heads, head_dim = 11, 4, 512, 4, 128
+    q = torch.empty(total_q, num_heads, head_dim)
+    paged = torch.empty(1, 1, 128, head_dim)
+    with pytest.raises(
+        ValueError, match=r"Triton sparse decode: total_q \(512\) must be batch \(11\)"
+    ):
+        minimax_m3_sparse_attn_decode(
+            q,
+            paged,
+            paged,
+            torch.zeros(1, total_q, 64, dtype=torch.int64),
+            torch.zeros(batch, 4, dtype=torch.int32),
+            torch.zeros(batch, dtype=torch.int32),
+            sm_scale=head_dim**-0.5,
+            output=torch.empty_like(q),
+            decode_query_len=query_len,
+        )
+
+
+def test_the_trtllm_gen_dense_decode_rejects_a_q_that_outruns_the_batch():
+    """The same padded q against the dense kernel, which had no such guard.
+
+    It is handed no cache manager: its multi-CTA counters are sized off the
+    batch, so it has to decline before consulting one.
+    """
+    pytest.importorskip("flashinfer")
+    from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.trtllm_gen_dense_decode import (
+        minimax_m3_trtllm_gen_dense_decode,
+    )
+
+    batch, query_len, total_q, num_heads, head_dim = 11, 4, 512, 4, 128
+    q = torch.empty(total_q, num_heads, head_dim)
+    with pytest.raises(
+        ValueError, match=r"trtllm-gen dense decode: total_q \(512\) must be batch \(11\)"
+    ):
+        minimax_m3_trtllm_gen_dense_decode(
+            q,
+            None,
+            0,
+            torch.zeros(batch, 4, dtype=torch.int32),
+            torch.zeros(batch, dtype=torch.int32),
+            sm_scale=head_dim**-0.5,
+            output=torch.empty_like(q),
+            decode_query_len=query_len,
+            max_seq_len=1024,
+            max_num_requests=batch,
+        )
+
+
+def test_the_eager_writer_drops_the_sentinel_tail_it_is_handed():
+    """The padded rows of a step must reach no page at all, the wrap target of a
+    surviving -1 included."""
+    num_pages, page_size, head_dim = 4, 8, 16
+    cache = torch.zeros(num_pages, 1, page_size, head_dim, dtype=torch.bfloat16)
+    # Two live tokens, then the -1 tail a capture bucket pads the step out to.
+    out_cache_loc = torch.tensor([2, page_size + 5, -1, -1], dtype=torch.int32)
+    values = torch.arange(4 * head_dim, dtype=torch.float32).reshape(4, 1, head_dim)
+
+    write_kv_slots(cache, out_cache_loc, values, 2, layout="HND")
+
+    torch.testing.assert_close(cache[0, 0, 2], values[0, 0].to(torch.bfloat16))
+    torch.testing.assert_close(cache[1, 0, 5], values[1, 0].to(torch.bfloat16))
+    # The page a wrapped -1 would have hit.
+    assert not cache[num_pages - 1].any()
+
+
+def test_the_eager_writer_refuses_a_live_count_it_has_no_rows_for():
+    """A count past the rows supplied is a caller bug, not a short write."""
+    cache = torch.zeros(4, 1, 8, 16, dtype=torch.bfloat16)
+    out_cache_loc = torch.tensor([2, 5], dtype=torch.int32)
+    values = torch.zeros(2, 1, 16)
+
+    with pytest.raises(ValueError, match=r"num_live_tokens=3 exceeds the rows supplied"):
+        write_kv_slots(cache, out_cache_loc, values, 3, layout="HND")
+
+    with pytest.raises(ValueError, match="must be non-negative"):
+        write_kv_slots(cache, out_cache_loc, values, -1, layout="HND")
+
+    # A step that scheduled nothing writes nothing rather than erroring.
+    write_kv_slots(cache, out_cache_loc, values, 0, layout="HND")
+    assert not cache.any()
 
 
 def test_a_pure_prefill_step_has_no_decode_span():
@@ -1580,7 +1795,8 @@ def _kv_lens_update_metadata(
     return metadata
 
 
-def test_on_update_kv_lens_rederives_lengths_slots_and_counts(monkeypatch):
+@pytest.mark.parametrize("nvfp4", [False, True])
+def test_on_update_kv_lens_rederives_lengths_slots_and_counts(monkeypatch, nvfp4):
     """Request 0 loses one rejected draft token (staged 9 -> corrected 8), request 1
     is unchanged. The per-request length the decode kernels read, the write
     slots and the per-token valid-block counts must all follow.
@@ -1589,7 +1805,17 @@ def test_on_update_kv_lens_rederives_lengths_slots_and_counts(monkeypatch):
         monkeypatch, qo_lens=(2, 3), kv_staged=(9, 12), kv_corrected=(8, 12), page_size=4
     )
 
+    if nvfp4:
+        # Both rows are in the context prefix when extend_ctx is active.
+        metadata.num_contexts = 2
+        metadata.msa_cu_kv_lens = torch.tensor([0, 9, 21, -1], dtype=torch.int32)
+        metadata.msa_cu_q_lens = torch.tensor([0, 2, 5], dtype=torch.int32)
+
     metadata.on_update_kv_lens()
+    metadata.on_update_kv_lens()  # Corrections must be idempotent.
+    if nvfp4:
+        assert metadata.msa_cu_kv_lens.tolist() == [0, 8, 20, -1]
+        assert metadata.msa_cu_q_lens.tolist() == [0, 2, 5]
 
     # One length per request, in the buffer every decode kernel reads.
     assert metadata.msa_seq_lens_cuda.tolist() == [8, 12]
@@ -1705,14 +1931,16 @@ def test_fused_scatter_matches_reference(src_dtype, cache_dtype, with_idx):
 
     # Paged HND caches carved from a pool with a coalescing axis, so the
     # views are non-contiguous like production get_buffers(...) output.
+    # Guard pages make an accidental negative-slot write observable without
+    # accessing memory outside the allocation.
     pool = torch.zeros(
-        num_pages, 2, num_kv_heads, tokens_per_block, head_dim, dtype=cache_dtype, device=device
+        num_pages + 2, 2, num_kv_heads, tokens_per_block, head_dim, dtype=cache_dtype, device=device
     )
-    k_cache, v_cache = pool[:, 0], pool[:, 1]
+    k_cache, v_cache = pool[1:-1, 0], pool[1:-1, 1]
     idx_pool = torch.zeros(
-        num_pages, 2, 1, tokens_per_block, head_dim, dtype=torch.bfloat16, device=device
+        num_pages + 2, 2, 1, tokens_per_block, head_dim, dtype=torch.bfloat16, device=device
     )
-    idx_cache = idx_pool[:, 0]
+    idx_cache = idx_pool[1:-1, 0]
 
     # Strided sources: rows sliced out of a wider fused-projection tensor.
     # randn has no fp8 variant, so generate bf16 and cast the whole buffer, as
@@ -1726,18 +1954,37 @@ def test_fused_scatter_matches_reference(src_dtype, cache_dtype, with_idx):
     v = qkv[:, inner : 2 * inner]
 
     slots = torch.randperm(num_pages * tokens_per_block, device=device)[:num_tokens].to(torch.int32)
+    # Padding rows must leave both the KV and index pools untouched, including
+    # the FP8 scatter path. Compare the complete pools to catch stray writes.
+    slots[0] = -1
+    valid = slots >= 0
 
     ref_pool = pool.clone()
     ref_idx_pool = idx_pool.clone()
+    # The sentinel sits at the head here rather than in a tail, so the
+    # reference masks it out and states the surviving row count.
+    num_live_slots = int(valid.sum())
     write_kv_slots(
-        ref_pool[:, 0], slots, k.reshape(num_tokens, num_kv_heads, head_dim), layout="HND"
+        ref_pool[1:-1, 0],
+        slots[valid],
+        k.reshape(num_tokens, num_kv_heads, head_dim)[valid],
+        num_live_slots,
+        layout="HND",
     )
     write_kv_slots(
-        ref_pool[:, 1], slots, v.reshape(num_tokens, num_kv_heads, head_dim), layout="HND"
+        ref_pool[1:-1, 1],
+        slots[valid],
+        v.reshape(num_tokens, num_kv_heads, head_dim)[valid],
+        num_live_slots,
+        layout="HND",
     )
     if with_idx:
         write_kv_slots(
-            ref_idx_pool[:, 0], slots, idx_k.reshape(num_tokens, 1, head_dim), layout="HND"
+            ref_idx_pool[1:-1, 0],
+            slots[valid],
+            idx_k.reshape(num_tokens, 1, head_dim)[valid],
+            num_live_slots,
+            layout="HND",
         )
 
     assert fused_write_layer_caches(
@@ -1748,13 +1995,16 @@ def test_fused_scatter_matches_reference(src_dtype, cache_dtype, with_idx):
     torch.testing.assert_close(idx_pool, ref_idx_pool)
 
 
-@pytest.mark.parametrize("sparse", [True, False])
-def test_msa_attention_core_owns_the_cache_write(sparse):
+@pytest.mark.parametrize("nvfp4", [True, False])
+@pytest.mark.parametrize("sparse,indexer_dtype", [(True, "fp8"), (True, "bf16"), (False, "fp8")])
+def test_msa_attention_core_owns_the_cache_write(
+    sparse: bool, indexer_dtype: str, nvfp4: bool
+) -> None:
     """The model layer's MSA core must write the caches exactly once and in
     the right place: write_layer_caches runs before run_indexer (whose proxy
     pass reads the index-K cache), run_indexer is told index-K is already
-    resident, and forward() receives k=v=None so no FMHA phase writes K/V
-    again."""
+    resident (with no live index-K for FP8), and forward() receives k=v=None
+    so no FMHA phase writes K/V again."""
     from tensorrt_llm._torch.models.modeling_minimaxm3 import MiniMaxM3Attention
 
     num_tokens, width = 3, 128
@@ -1763,9 +2013,10 @@ def test_msa_attention_core_owns_the_cache_write(sparse):
 
     class FakeBackend:
         layer_idx = 7
+        indexer_kv_dtype = indexer_dtype
 
-        def write_layer_caches(self, k, v, idx_k, metadata):
-            events.append(("write", k, v, idx_k, metadata))
+        def write_layer_caches(self, k, v, idx_k, metadata, *, kv_scale_orig_quant=None):
+            events.append(("write", k, v, idx_k, metadata, kv_scale_orig_quant))
 
         def run_indexer(self, idx_q, idx_k, metadata, *, idx_k_prewritten=False):
             events.append(("indexer", idx_q, idx_k, metadata, idx_k_prewritten))
@@ -1774,7 +2025,14 @@ def test_msa_attention_core_owns_the_cache_write(sparse):
         def forward(self, q, k, v, metadata, forward_args=None):
             events.append(("forward", q, k, v, metadata, forward_args))
 
-    layer = SimpleNamespace(is_sparse_attention_layer=sparse, attn=FakeBackend())
+    scales = torch.tensor([1.0, 0.5, 0.25])
+    inverse_scales = scales.reciprocal()
+    layer = SimpleNamespace(
+        is_sparse_attention_layer=sparse,
+        main_kv_is_nvfp4=nvfp4,
+        qkv_proj=SimpleNamespace(kv_scales=scales, inv_kv_scales=inverse_scales),
+        attn=FakeBackend(),
+    )
     q, k, v = (torch.zeros(num_tokens, width) for _ in range(3))
     idx_q = torch.zeros(num_tokens, width) if sparse else None
     idx_k = torch.zeros(num_tokens, width) if sparse else None
@@ -1788,20 +2046,138 @@ def test_msa_attention_core_owns_the_cache_write(sparse):
     if sparse:
         assert names == ["write", "indexer", "forward"]
         _, indexer_q, indexer_k, indexer_metadata, prewritten = events[1]
-        assert indexer_q is idx_q and indexer_k is idx_k and indexer_metadata is metadata
+        assert indexer_q is idx_q and indexer_metadata is metadata
+        if indexer_dtype == "fp8":
+            assert indexer_k is None
+        else:
+            assert indexer_k is idx_k
         assert prewritten is True
     else:
         assert names == ["write", "forward"]
 
-    _, written_k, written_v, written_idx_k, write_metadata = events[0]
+    _, written_k, written_v, written_idx_k, write_metadata, write_scale = events[0]
     assert written_k is k and written_v is v and write_metadata is metadata
     assert written_idx_k is idx_k
+    assert write_scale is (inverse_scales if nvfp4 else None)
 
     _, forward_q, forward_k, forward_v, forward_metadata, forward_args = events[-1]
     assert forward_q is q and forward_metadata is metadata
     assert forward_k is None and forward_v is None
     assert forward_args.output is output
+    assert forward_args.kv_scale_quant_orig is (scales if nvfp4 else None)
+    assert forward_args.kv_scale_orig_quant is (inverse_scales if nvfp4 else None)
     if sparse:
         assert forward_args.sparse_backend_args.topk_indices is topk_indices
     else:
         assert forward_args.sparse_backend_args is None
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_nvfp4_scatter_writes_physical_p32_data_and_scale_layouts():
+    from tensorrt_llm._utils import get_sm_version
+
+    if get_sm_version() not in (100, 103):
+        pytest.skip("NVFP4 quantization requires Blackwell")
+    torch.manual_seed(13)
+    num_slots, pages_per_role, num_heads = 2, 4, 1
+    physical_page, head_dim = 32, 128
+    packed_dim, scale_cols = head_dim // 2, head_dim // 16
+    shape = (num_slots, pages_per_role, num_heads, physical_page, packed_dim)
+    scale_shape = (num_slots, pages_per_role, num_heads, physical_page, scale_cols)
+    # Guard slots on either side make an invalid-row write observable without
+    # touching another allocation, even if the kernel's write mask regresses.
+    k_backing = torch.zeros((num_slots + 2, *shape[1:]), dtype=torch.uint8, device="cuda")
+    v_backing = torch.zeros_like(k_backing)
+    ksf_backing = torch.zeros((num_slots + 2, *scale_shape[1:]), dtype=torch.uint8, device="cuda")
+    vsf_backing = torch.zeros_like(ksf_backing)
+    k_cache, v_cache = k_backing[1:-1], v_backing[1:-1]
+    k_scale_cache, v_scale_cache = ksf_backing[1:-1], vsf_backing[1:-1]
+    slots = torch.tensor([0, 31, 32, 127, 128, -1], dtype=torch.int32, device="cuda")
+    k = torch.randn(slots.numel(), head_dim, dtype=torch.bfloat16, device="cuda")
+    v = torch.randn_like(k)
+    inv_scales = torch.ones(3, dtype=torch.float32, device="cuda")
+
+    # The kernel flattens token-row scale offsets, so an exact shape and
+    # contiguous columns are insufficient when rows contain hidden padding.
+    padded_k_scale_cache = torch.zeros(
+        (*scale_shape[:-1], scale_cols + 1), dtype=torch.uint8, device="cuda"
+    )[..., :scale_cols]
+    padded_v_scale_cache = torch.zeros(
+        (*scale_shape[:-1], scale_cols + 1), dtype=torch.uint8, device="cuda"
+    )[..., :scale_cols]
+    assert padded_k_scale_cache.stride(-1) == 1
+    assert padded_k_scale_cache.stride(-2) == scale_cols + 1
+    assert padded_v_scale_cache.stride(-2) == scale_cols + 1
+    assert not fused_write_layer_caches_nvfp4(
+        k_cache,
+        v_cache,
+        padded_k_scale_cache,
+        v_scale_cache,
+        None,
+        slots,
+        k,
+        v,
+        None,
+        inv_scales,
+    )
+    assert not fused_write_layer_caches_nvfp4(
+        k_cache,
+        v_cache,
+        k_scale_cache,
+        padded_v_scale_cache,
+        None,
+        slots,
+        k,
+        v,
+        None,
+        inv_scales,
+    )
+
+    wrote = fused_write_layer_caches_nvfp4(
+        k_cache,
+        v_cache,
+        k_scale_cache,
+        v_scale_cache,
+        None,
+        slots,
+        k,
+        v,
+        None,
+        inv_scales,
+    )
+    assert wrote
+    expected_k, expected_ksf = torch.ops.trtllm.fp4_quantize(
+        k.view(slots.numel(), 1, head_dim), inv_scales[1:2], 16, False, False
+    )
+    expected_v, expected_vsf = torch.ops.trtllm.fp4_quantize(
+        v.view(slots.numel(), 1, head_dim), inv_scales[2:3], 16, False, False
+    )
+    expected_k = expected_k.view(torch.uint8)
+    expected_v = expected_v.view(torch.uint8)
+    expected_ksf = expected_ksf.view(slots.numel(), 1, scale_cols)
+    expected_vsf = expected_vsf.view(slots.numel(), 1, scale_cols)
+
+    expected_k_pool = torch.zeros_like(k_cache)
+    expected_v_pool = torch.zeros_like(v_cache)
+    expected_ksf_pool = torch.zeros_like(k_scale_cache)
+    expected_vsf_pool = torch.zeros_like(v_scale_cache)
+    for row, slot in enumerate(slots.tolist()):
+        if slot < 0:
+            continue
+        logical_page, logical_within = divmod(slot, 128)
+        subpage, within = divmod(logical_within, physical_page)
+        expected_k_pool[logical_page, subpage, 0, within] = expected_k[row, 0]
+        expected_v_pool[logical_page, subpage, 0, within] = expected_v[row, 0]
+        expected_ksf_pool[logical_page, subpage, 0, within] = expected_ksf[row, 0]
+        v_region = expected_vsf_pool[logical_page, subpage, 0].view(-1)
+        offsets = torch.arange(scale_cols, device="cuda") * 4
+        offsets += (within // 4) * (4 * scale_cols) + within % 4
+        v_region[offsets] = expected_vsf[row, 0]
+
+    assert torch.equal(k_cache, expected_k_pool)
+    assert torch.equal(v_cache, expected_v_pool)
+    assert torch.equal(k_scale_cache, expected_ksf_pool)
+    assert torch.equal(v_scale_cache, expected_vsf_pool)
+    for backing in (k_backing, v_backing, ksf_backing, vsf_backing):
+        assert torch.count_nonzero(backing[0]).item() == 0
+        assert torch.count_nonzero(backing[-1]).item() == 0

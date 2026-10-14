@@ -50,7 +50,7 @@ def gen_port(test_ports: list[int]):
 
 @pytest.fixture
 def model_name():
-    model_path = os.path.join(llm_models_root(), "llama-models-v2/TinyLlama-1.1B-Chat-v1.0")
+    model_path = os.path.join(llm_models_root(), "Qwen3/Qwen3-0.6B")
     assert os.path.exists(model_path), f"Model path {model_path} does not exist"
     return model_path
 
@@ -186,7 +186,11 @@ async def send_request(
         else:
             assert completion.id is not None
             message = completion.choices[0].text
-        assert message.startswith("2.")
+        # Qwen3-0.6B (migrated from TinyLlama) answers "2" without a
+        # trailing period and continues generating past the one-word
+        # instruction instead of stopping; only the numeric answer itself
+        # is a stable thing to assert on here.
+        assert message.startswith("2")
 
 
 def check_historgram(metrics_dict: dict, count: int, range: tuple[float, float]):
