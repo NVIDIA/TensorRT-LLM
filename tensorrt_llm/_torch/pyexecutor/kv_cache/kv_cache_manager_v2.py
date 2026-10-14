@@ -548,8 +548,14 @@ def _get_generation_kv_capacity(spec_config, *, is_draft: bool) -> tuple[int, in
         draft_loop_tokens = spec_config.dynamic_tree_max_topK * spec_config.max_draft_len
         reserve = max(reserve, draft_loop_tokens)
     dynamic_reserve = reserve - spec_config.max_total_draft_tokens
+    # Match _generation_draft_slots: overlap reserves another verification
+    # window beyond the ordinary draft width. Runtime quotas, static profiling
+    # and max_blocks_per_seq all consume this shared upper bound.
     headroom = (
-        get_num_extra_kv_tokens(spec_config) + spec_config.tokens_per_gen_step + dynamic_reserve
+        get_num_extra_kv_tokens(spec_config)
+        + spec_config.tokens_per_gen_step
+        + dynamic_reserve
+        + spec_config.max_total_draft_tokens
     )
     return reserve, headroom
 
@@ -3545,7 +3551,11 @@ class KVCacheManagerV2(BaseResourceManager):
     def _required_gen_capacity(self, req: LlmRequest, current_capacity: int) -> int:
         """Compute generation KV cache capacity for a request.
 
-        Grows *current_capacity* by 1 + draft tokens.
+        Grow by one token, the draft width, and one verification round of slack.
+
+        Under overlap, device-side KV positions can lead host bookkeeping by
+        the accepted draft width. Reserve that slack before appending draft KV,
+        and record the full width so update_resources reclaims unused slots.
         """
         return current_capacity + BASE_GENERATION_TOKEN_COUNT + self._generation_draft_slots(req)
 
@@ -3553,10 +3563,9 @@ class KVCacheManagerV2(BaseResourceManager):
         """Physical draft width reserved for one iteration. Dynamic-tree draft pools
         reserve wider than target pools; each reclaims its own in ``update_resources``.
         """
-        slots = self._effective_draft_len(req)
-        if self.is_draft:
-            slots = max(slots, self._kv_reserve_draft_tokens)
-        return slots
+        draft_len = self._effective_draft_len(req)
+        slots = max(draft_len, self._kv_reserve_draft_tokens) if self.is_draft else draft_len
+        return slots + draft_len
 
     def try_allocate_generation(self, req: LlmRequest) -> bool:
         """Try to allocate one additional KV cache slot for a generation request.
@@ -4053,7 +4062,7 @@ class KVCacheManagerV2(BaseResourceManager):
         allocated = self._allocated_draft_lens.get(request.py_request_id)
         if allocated is None:
             return
-        current_draft_len = get_draft_token_length(request)
+        current_draft_len = self._generation_draft_slots(request)
         delta = current_draft_len - allocated
         if delta <= 0:
             return
@@ -4745,6 +4754,7 @@ class KVCacheManagerV2(BaseResourceManager):
                         f"{req.py_request_id}: could not resize to {new_cap} tokens"
                         f"{self._draft_pool_diagnostic()}"
                     )
+                self._allocated_draft_lens[req.py_request_id] = self._generation_draft_slots(req)
 
     def _reuse_token_source(self, req: LlmRequest) -> Sequence[int]:
         """Beam-0 tokens for block reuse, in the form the active backend consumes.
@@ -6445,7 +6455,7 @@ class KVCacheManagerV2(BaseResourceManager):
             accepted_draft_len = req.py_num_accepted_draft_tokens
             runtime_draft_len = req.py_rewind_len + accepted_draft_len
             # No entry: this manager did not grow through the scheduler (e.g.
-            # disagg), so fall back to _generation_draft_slots' width.
+            # disagg), so fall back to the runtime draft width.
             allocated_draft_slots = self._allocated_draft_lens.get(
                 req.py_request_id,
                 max(runtime_draft_len, self._kv_reserve_draft_tokens)
@@ -6460,6 +6470,9 @@ class KVCacheManagerV2(BaseResourceManager):
                 if req.state in (LlmRequestState.GENERATION_COMPLETE, LlmRequestState.CONTEXT_INIT)
                 else kv_cache.capacity - rewind_len
             )
+            # Host token counts are global under helix, while capacity is local.
+            if new_capacity is not None and not self._has_cp_helix:
+                new_capacity = max(new_capacity, req.max_beam_num_tokens - 1)
             history_length = (
                 None
                 # Reuse (history's consumer) is disabled under helix, and
