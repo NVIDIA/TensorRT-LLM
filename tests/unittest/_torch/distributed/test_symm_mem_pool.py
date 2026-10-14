@@ -19,6 +19,10 @@ port). The GPU protocol (rendezvous, peer views, signals) is covered by the toke
 multi-GPU tests that use the pool.
 """
 
+import time
+from datetime import timedelta
+from types import SimpleNamespace
+
 import pytest
 import torch
 import torch.distributed as dist
@@ -245,7 +249,8 @@ if __name__ == "__main__":
 
 def _fake_allocate(self, layout):
     """Stand-in for ``_allocate`` on a CPU gloo group: records the state a real allocation sets."""
-    self._buf, self._handle, self._base_offset, self._layout = object(), object(), 0, layout
+    handle = SimpleNamespace(buffer_size=layout.nbytes, offset=0)
+    self._buf, self._handle, self._base_offset, self._layout = object(), handle, 0, layout
     self._peer_buffers.clear()
     self.generation += 1
 
@@ -384,3 +389,59 @@ def test_probe_declines_with_the_agreed_reason_and_releases(gloo_world, monkeypa
     ok, reason = probe_symmetric_memory(gloo_world, "cpu")
     assert ok is False and "marker push failed" in reason
     assert frees == [True]  # the normal path releases with the fence: every rank agreed and is here
+
+
+# =============================================================================
+# Phase alignment across two gloo ranks: one rank fails locally, nobody hangs (review of #20308)
+# =============================================================================
+
+
+def _divergent_worker(rank: int, world_size: int, init_file: str, phase: str) -> None:
+    dist.init_process_group(
+        "gloo",
+        init_method=f"file://{init_file}",
+        rank=rank,
+        world_size=world_size,
+        timeout=timedelta(seconds=60),  # a hang fails the test instead of blocking the suite
+    )
+    try:
+        symm_mem_pool._local_preconditions = lambda group, device: []
+        SymmMemPool._allocate = _fake_allocate
+        symm_mem_pool.torch.cuda.synchronize = lambda device=None: None
+        scratch = torch.zeros(64, dtype=torch.uint8)
+
+        def fake_view(self, *args, **kwargs):
+            return scratch[: symm_mem_pool._MARKER_BYTES]
+
+        def injected(self, *args, **kwargs):
+            raise RuntimeError("injected")
+
+        failing = rank == world_size - 1
+        SymmMemPool.peer_region = injected if failing and phase == "push" else fake_view
+        SymmMemPool.region = injected if failing and phase == "read" else fake_view
+        pool = SymmMemPool(dist.group.WORLD, "cpu")
+        pool._allocate(PoolLayout(world_size, 1, pool.align, pool.align))
+        ok, reason = pool._check_addressing()  # must return on BOTH ranks, never raise or hang
+        assert ok is False, (rank, reason)
+        assert f"rank {world_size - 1}: marker {phase} failed: RuntimeError: injected" in reason, (
+            reason
+        )
+        verdicts: list = [None] * world_size
+        dist.all_gather_object(verdicts, (ok, reason))
+        assert len(set(verdicts)) == 1, verdicts  # the same agreed verdict on every rank
+        dist.barrier()  # both ranks arrive here: no rank was left inside the check's collectives
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("phase", ["push", "read"])
+def test_check_addressing_one_rank_fails_locally_both_ranks_agree(tmp_path, phase):
+    init_file = str(tmp_path / f"rendezvous_{phase}")
+    ctx = mp.spawn(_divergent_worker, args=(2, init_file, phase), nprocs=2, join=False)
+    # ProcessContext.join(timeout) returns as soon as one process exits; loop until all have
+    # (a worker exception is re-raised by join), bounded so a hang fails the test.
+    deadline = time.monotonic() + 180
+    while not ctx.join(timeout=5):
+        assert time.monotonic() < deadline, (
+            "the two-rank addressing check did not finish within 180 s"
+        )
