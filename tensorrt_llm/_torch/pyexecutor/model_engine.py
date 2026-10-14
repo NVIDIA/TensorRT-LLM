@@ -1120,6 +1120,14 @@ class PyTorchModelEngine(ModelEngine):
             norm_provider = jcd.FlashInferNormProvider(self.model)
             if norm_provider:
                 prefetcher.enable_flashinfer_norm(norm_provider)
+            topk_provider = jcd.TopKProvider(self.model,
+                                             max_num_tokens=self.max_num_tokens,
+                                             max_seq_len=self.max_seq_len)
+            if topk_provider:
+                spec_cfg = getattr(self, "spec_config", None)
+                draft = getattr(spec_cfg, "max_draft_len", 0) or 0
+                prefetcher.enable_cute_dsl_topk(topk_provider,
+                                                next_ns=sorted({1, 1 + draft}))
         from ..modules.mamba.jit_prefetch_linear_attn import LinearAttnProvider
         la_provider = LinearAttnProvider(
             self.model,

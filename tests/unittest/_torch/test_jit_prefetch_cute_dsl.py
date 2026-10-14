@@ -211,6 +211,68 @@ def test_flashinfer_norm_export_is_what_flashinfer_runs(tmp_path, contiguous):
         assert torch.equal(a, b)
 
 
+def test_topk_export_is_what_the_op_runs(tmp_path):
+    """Radix top-k variants enumerated by TopKProvider, compiled by the
+    helper and loaded through the wrapped runners, give the same indices as
+    an in-process compile, for decode batches of several row bands and
+    widths, and the runners compile nothing themselves."""
+    from tensorrt_llm._torch.custom_ops import cute_dsl_custom_ops as ops
+    from tensorrt_llm._torch.modules.top_k import TopK, TopKImplementation
+
+    top_k, max_cols = 512, 4096
+    model = torch.nn.Module()
+    model.top_k = TopK(top_k, decode_implementation=TopKImplementation.CUTE_DSL_RADIX)
+    provider = jcd.TopKProvider(model, max_num_tokens=200, max_seq_len=max_cols)
+    specs = provider.enumerate_specs((1,))
+    assert specs, "no top-k variants enumerated"
+    out_dir = str(tmp_path / "aot")
+    replies = _helper_build(out_dir, specs)
+    assert all(r["ok"] for r in replies), [r for r in replies if not r["ok"]][:3]
+
+    g = torch.Generator(device="cuda").manual_seed(0)
+    cases = [(1, 600), (8, 1000), (40, 4096), (160, 2049)]
+
+    def run():
+        outs = []
+        for rows, cols in cases:
+            scores = torch.randn(rows, cols, generator=g, device="cuda")
+            lens = torch.full((rows,), cols, dtype=torch.int32, device="cuda")
+            out = torch.empty(rows, top_k, dtype=torch.int32, device="cuda")
+            torch.ops.trtllm.cute_dsl_indexer_topk_decode(scores, lens, out, top_k, 1)
+            outs.append(out.sort(dim=1).values)
+        torch.cuda.synchronize()
+        return outs
+
+    runners = {name: getattr(ops, name) for name in jcd.TOPK_RUNNERS}
+    saved = {name: r.__dict__["_compile"] for name, r in runners.items()}
+    caches = {name: dict(r.kernel_cache) for name, r in runners.items()}
+    try:
+        for r in runners.values():
+            r.kernel_cache.clear()
+        g.manual_seed(0)
+        ref = run()
+        for r in runners.values():
+            r.kernel_cache.clear()
+        loads = []
+
+        def loader(spec):
+            fn = jcd.load(spec, out_dir)
+            loads.append(fn is not None)
+            return fn
+
+        assert jcd.install_topk_loader(loader)
+        g.manual_seed(0)
+        got = run()
+    finally:
+        for name, r in runners.items():
+            setattr(r, "_compile", saved[name])
+            r.kernel_cache.clear()
+            r.kernel_cache.update(caches[name])
+    assert loads and all(loads), f"some variants were not prefetched: {loads}"
+    for a, b in zip(got, ref):
+        assert torch.equal(a, b)
+
+
 def test_provider_plans_the_variant_the_op_keys_on():
     p = jcd.KdaPrefillProvider(torch.nn.Module())
     p.cfgs = [(H, True, True)]

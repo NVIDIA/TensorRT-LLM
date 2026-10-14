@@ -837,6 +837,21 @@ class JitPrefetcher:
         self._event(f"CuTe DSL prefetch: {len(kda_provider.cfgs)} KDA config(s)")
         return True
 
+    def enable_cute_dsl_topk(self, topk_provider, next_ns=(1,)) -> bool:
+        """Compile the radix top-k variants the model's TopK modules can reach
+        in the CuTe DSL helpers, and have the runners load them."""
+        from . import jit_prefetch_cute_dsl as jcd
+
+        if not topk_provider or not self._start_cute_dsl_helpers():
+            return False
+        if not jcd.install_topk_loader(self._cute_dsl_load):
+            return False
+        specs = topk_provider.enumerate_specs(next_ns)
+        for spec in specs:
+            self._submit(spec, spec, "cute_dsl", _PRIO_BATCH, kind=jcd.KIND)
+        self._event(f"CuTe DSL top-k prefetch: {len(specs)} variant(s)")
+        return True
+
     def enable_flashinfer_norm(self, norm_provider) -> bool:
         """Compile FlashInfer's CuTe DSL norm variants in the CuTe DSL helpers
         and have FlashInfer's compiled-kernel getters load them."""

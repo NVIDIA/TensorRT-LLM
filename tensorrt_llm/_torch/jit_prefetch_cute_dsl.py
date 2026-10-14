@@ -275,9 +275,64 @@ def _build_fi_norm(s: Dict[str, Any]):
     return kernel_obj, args, "--enable-tvm-ffi"
 
 
+# Radix top-k runners in custom_ops.cute_dsl_custom_ops whose ``_compile``
+# builds the kernel from fake tensors and its cache key alone (TVM-FFI).
+_TOPK = "cute_dsl_topk"
+TOPK_RUNNERS = (
+    "CuteDSLTopKDecodeSingleCTARunner",
+    "CuteDSLTopKDecodeRadixFilterSPMultiCTARunner",
+    "CuteDSLTopKPrefillSingleCTARunner",
+    "CuteDSLTopKDecodeSinglePassMultiCTARunner",
+    "CuteDSLTopKDecodeSinglePassMultiCTAClusterRunner",
+)
+
+
+def topk_spec(runner: str, key: tuple) -> str:
+    """Spec for one radix top-k runner's ``_compile(*key)``. The key holds
+    cutlass dtypes, ints, bools and strings."""
+    return json.dumps({"kernel": _TOPK, "runner": runner, "key": _encode(key)}, sort_keys=True)
+
+
+def _encode(v: Any) -> Any:
+    if isinstance(v, (bool, int, float, str)) or v is None:
+        return v
+    if isinstance(v, (tuple, list)):
+        return {"tuple": [_encode(x) for x in v]}
+    name = getattr(v, "__name__", None)
+    import cutlass
+
+    if name is not None and getattr(cutlass, name, None) is v:
+        return {"cutlass": name}
+    raise TypeError(f"cannot encode top-k key element {v!r}")
+
+
+def _decode(v: Any) -> Any:
+    if isinstance(v, dict):
+        if "tuple" in v:
+            return tuple(_decode(x) for x in v["tuple"])
+        import cutlass
+
+        return getattr(cutlass, v["cutlass"])
+    return v
+
+
+def _build_topk(s: Dict[str, Any]):
+    """Return the compiled top-k kernel (``_compile`` builds it from fake
+    tensors; the helper exports it)."""
+    from .custom_ops import cute_dsl_custom_ops as ops
+
+    runner = getattr(ops, s["runner"])
+    key = _decode(s["key"])
+    runner._compile(*key)
+    cached = runner.kernel_cache[key]
+    return cached[0] if isinstance(cached, tuple) else cached
+
+
 _BUILDERS = {_K123: _build_k123, _FI_NORM: _build_fi_norm}
+# Builders that return an already compiled kernel instead of (fn, args, options).
+_PRECOMPILED = {_TOPK: _build_topk}
 # Kernels compiled with TVM-FFI are loaded as TVM-FFI functions.
-_TVM_FFI = {_FI_NORM}
+_TVM_FFI = {_FI_NORM, _TOPK}
 
 
 def build(spec: str, gpu_arch: str, out_dir: str) -> bool:
@@ -306,9 +361,14 @@ def _compile_export(spec: str, gpu_arch: str, out_dir: str, key: str, final: str
     import cutlass.cute as cute
 
     s = json.loads(spec)
-    fn, args, options = _BUILDERS[s["kernel"]](s)
-    options = f"{options} --gpu-arch {gpu_arch}".strip()
-    compiled = cute.compile(fn, *args, options=options)
+    if s["kernel"] in _PRECOMPILED:
+        # The kernel's own compile path (its options include the TVM-FFI
+        # flag); the target arch comes from CUTE_DSL_ARCH in the helper.
+        compiled = _PRECOMPILED[s["kernel"]](s)
+    else:
+        fn, args, options = _BUILDERS[s["kernel"]](s)
+        options = f"{options} --gpu-arch {gpu_arch}".strip()
+        compiled = cute.compile(fn, *args, options=options)
     tmp_name = f".{key}.{os.getpid()}"
     if s["kernel"] in _TVM_FFI:
         compiled.export_to_c(
@@ -472,6 +532,166 @@ class FlashInferNormProvider:
 
     def enumerate_specs(self) -> List[str]:
         return list(self.specs)
+
+
+def install_topk_loader(loader: Callable[[str], Optional[Callable]]) -> List[str]:
+    """Route the radix top-k runners' ``_compile`` through ``loader``.
+
+    ``loader(spec)`` returns a helper-exported kernel, which is stored in the
+    runner's ``kernel_cache`` under the key ``_compile`` would have used, or
+    None to compile as before. Returns the names of the wrapped runners.
+    """
+    from .custom_ops import cute_dsl_custom_ops as ops
+
+    wrapped = []
+    for name in TOPK_RUNNERS:
+        runner = getattr(ops, name, None)
+        orig = runner.__dict__.get("_compile") if runner is not None else None
+        if orig is None or getattr(orig, "_jitp_wrapped", False):
+            continue
+        inner = orig.__func__
+
+        def make(inner=inner, name=name):
+            def _compile(cls, *key):
+                capture = _KeyCapture.active()
+                if capture is not None:
+                    capture.append((name, key))
+                    raise _KeyCaptured()
+                if key in cls.kernel_cache:
+                    return
+                try:
+                    spec = topk_spec(name, key)
+                except TypeError:
+                    spec = None
+                fn = loader(spec) if spec is not None else None
+                if fn is not None:
+                    cls.kernel_cache[key] = fn
+                    return
+                inner(cls, *key)
+
+            _compile._jitp_wrapped = True
+            return classmethod(_compile)
+
+        setattr(runner, "_compile", make())
+        wrapped.append(name)
+    return wrapped
+
+
+class _KeyCaptured(Exception):
+    """Raised by a wrapped top-k ``_compile`` under ``_KeyCapture``."""
+
+
+class _KeyCapture:
+    """Within the context, the wrapped top-k ``_compile``s record their key
+    and return without compiling (the forward that follows fails on the
+    missing cache entry, which the planner expects)."""
+
+    _local = __import__("threading").local()
+
+    def __enter__(self) -> List[Tuple[str, tuple]]:
+        self._local.keys = []
+        return self._local.keys
+
+    def __exit__(self, *exc):
+        self._local.keys = None
+        return False
+
+    @classmethod
+    def active(cls) -> Optional[List[Tuple[str, tuple]]]:
+        return getattr(cls._local, "keys", None)
+
+
+class TopKProvider:
+    """Every radix top-k variant the model's ``TopK`` modules can reach.
+
+    A ``TopK`` with a CuTe DSL radix implementation compiles one kernel per
+    key of the runner the dispatch picks: the score width bucket
+    (``next_pow2`` of the score columns), and in decode the row count's band
+    (single CTA, radix select, or a multi-CTA cluster size), plus the
+    engine-fixed top_k / next_n / dtype. The provider replays the real
+    dispatch (``torch.ops.trtllm.cute_dsl_indexer_topk_decode`` /
+    ``..._prefill_blackwell``) on ``meta`` scores for every width bucket up to
+    the longest score row and every row band up to the token budget, with the
+    runners' compiles capturing their key instead of compiling.
+    """
+
+    def __init__(self, model, max_num_tokens: int, max_seq_len: int):
+        import torch
+
+        from .modules.top_k import TopK, TopKImplementation
+
+        self.cfgs = set()
+        radix = TopKImplementation.CUTE_DSL_RADIX
+        for mod in model.modules() if model is not None else ():
+            if not isinstance(mod, TopK):
+                continue
+            for phase, impl in (
+                ("prefill", mod.prefill_implementation),
+                ("decode", mod.decode_implementation),
+            ):
+                if impl == radix:
+                    self.cfgs.add((phase, int(mod.top_k)))
+        self.max_rows = max(1, int(max_num_tokens))
+        self.max_cols = max(1, int(max_seq_len))
+        self.dtype = torch.float32
+
+    def __bool__(self):
+        return bool(self.cfgs)
+
+    def _widths(self) -> List[int]:
+        out, w = [], 16
+        while w < 2 * self.max_cols:
+            out.append(w)
+            w *= 2
+        return out
+
+    def _rows(self, next_n: int) -> List[int]:
+        # One row count per band of the decode dispatch (cluster sizes change
+        # at 4 / 8 / 32 / 64 / SM count rows) and around the SM count.
+        cands = {1, 2, 4, 5, 8, 9, 16, 32, 33, 64, 65, 128, 148, 152, 153, 160, 256, 512, 4096}
+        rows = sorted(r for r in cands if r <= self.max_rows)
+        return [max(next_n, r - r % next_n) for r in rows]
+
+    def enumerate_specs(self, next_ns=(1,)) -> List[str]:
+        import torch
+
+        from .custom_ops import cute_dsl_custom_ops as ops
+        from .modules.top_k import _CUTE_DSL_PREFILL_COPY_BITS
+
+        # The ops' Python bodies (CustomOpDef._init_fn): calling the ops on
+        # meta tensors would dispatch to their fake implementations.
+        decode = getattr(ops.cute_dsl_indexer_topk_decode, "_init_fn", None)
+        prefill = getattr(ops.cute_dsl_indexer_topk_prefill_blackwell, "_init_fn", None)
+        specs = []
+        meta = torch.device("meta")
+        for phase, top_k in sorted(self.cfgs):
+            body = prefill if phase == "prefill" else decode
+            if body is None:
+                continue
+            for cols in self._widths():
+                if cols < top_k:
+                    continue
+                if phase == "prefill":
+                    batches = [(1, 1)]
+                else:
+                    batches = [(r, n) for n in next_ns for r in self._rows(n)]
+                for rows, next_n in batches:
+                    scores = torch.empty(rows, cols, dtype=self.dtype, device=meta)
+                    out = torch.empty(rows, top_k, dtype=torch.int32, device=meta)
+                    with _KeyCapture() as keys:
+                        try:
+                            if phase == "prefill":
+                                bounds = torch.empty(rows, dtype=torch.int32, device=meta)
+                                body(scores, bounds, bounds, out, top_k,
+                                     _CUTE_DSL_PREFILL_COPY_BITS)  # fmt: skip
+                            else:
+                                lens = torch.empty(rows // next_n, dtype=torch.int32, device=meta)
+                                body(scores, lens, out, top_k, next_n)
+                        except _KeyCaptured:
+                            pass
+                    for runner, key in keys:
+                        specs.append(topk_spec(runner, key))
+        return sorted(set(specs))
 
 
 def _flashinfer_norm_uses_cute_dsl() -> bool:
