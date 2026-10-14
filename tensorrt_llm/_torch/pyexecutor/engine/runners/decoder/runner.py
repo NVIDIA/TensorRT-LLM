@@ -293,6 +293,14 @@ class PrefillCompiledModel(torch.nn.Module):
             return getattr(super().__getattr__("eager_model"), name)
 
 
+def _gather_into(source: torch.Tensor, indices: torch.Tensor, destination: torch.Tensor) -> None:
+    """Gather rows into an existing buffer, preserving copy_ dtype conversion."""
+    if source.dtype == destination.dtype:
+        torch.index_select(source, 0, indices, out=destination)
+    else:
+        destination.copy_(torch.index_select(source, 0, indices), non_blocking=True)
+
+
 class DecoderRunner(ScheduledModelRunner):
     """Run scheduled decoder generation with its own buffers, graphs and metadata."""
 
@@ -4041,26 +4049,26 @@ class DecoderRunner(ScheduledModelRunner):
                 previous_slots = previous_seq_slots_device()
                 # previous input ids
                 previous_batch_tokens = previous_batch_len * runtime_tokens_per_gen_step
-                new_tokens = new_tokens_device.transpose(0, 1)[
-                    previous_slots, :runtime_tokens_per_gen_step
-                ].flatten()
-                self.input_ids_cuda[num_tokens : num_tokens + previous_batch_tokens].copy_(
-                    new_tokens, non_blocking=True
+                tokens_source = new_tokens_device.transpose(0, 1)[:, :runtime_tokens_per_gen_step]
+                _gather_into(
+                    tokens_source,
+                    previous_slots,
+                    self.input_ids_cuda[num_tokens : num_tokens + previous_batch_tokens].view(
+                        previous_batch_len, *tokens_source.shape[1:]
+                    ),
                 )
 
                 # previous draft tokens
                 previous_batch_draft_tokens = previous_batch_len * runtime_draft_token_buffer_width
                 if runtime_draft_token_buffer_width > 0:
-                    self.draft_tokens_cuda[
-                        num_draft_tokens : num_draft_tokens + previous_batch_draft_tokens
-                    ].copy_(
-                        next_draft_tokens_device[
-                            previous_slots, :runtime_draft_token_buffer_width
-                        ].flatten(),
-                        non_blocking=True,
+                    _gather_into(
+                        next_draft_tokens_device[:, :runtime_draft_token_buffer_width],
+                        previous_slots,
+                        self.draft_tokens_cuda[
+                            num_draft_tokens : num_draft_tokens + previous_batch_draft_tokens
+                        ].view(previous_batch_len, runtime_draft_token_buffer_width),
                     )
                 # prepare data for the preprocess inputs
-                kv_len_offsets_device = new_tokens_lens_device - runtime_tokens_per_gen_step
                 previous_pos_indices_host = torch.tensor(
                     previous_pos_indices, dtype=torch.int, pin_memory=prefer_pinned()
                 )
@@ -4084,23 +4092,32 @@ class DecoderRunner(ScheduledModelRunner):
                 #       Already set to '0' during initialization.
                 #   For 2) 'requests that already have previous batch': enable overlap scheduler.
                 #       Set their previous_pos_id_offsets and previous_kv_lens_offsets according to
-                #       new_tokens_lens_device and kv_len_offsets_device.
+                #       new_tokens_lens_device and the runtime token count.
                 #   For 3) 'dummy requests': pad dummy requests for CUDA graph or attention dp.
                 #       Already set to '0' during initialization.
 
                 num_extend_reqeust_wo_dummy = len(extend_requests) - len(extend_dummy_requests)
-                self.previous_pos_id_offsets_cuda[
-                    (num_extend_reqeust_wo_dummy - previous_batch_len)
-                    * runtime_tokens_per_gen_step : num_extend_reqeust_wo_dummy
-                    * runtime_tokens_per_gen_step
-                ].copy_(
-                    new_tokens_lens_device[self.previous_pos_indices_cuda[0:previous_batch_tokens]],
-                    non_blocking=True,
+                _gather_into(
+                    new_tokens_lens_device,
+                    self.previous_pos_indices_cuda[:previous_batch_tokens],
+                    self.previous_pos_id_offsets_cuda[
+                        (num_extend_reqeust_wo_dummy - previous_batch_len)
+                        * runtime_tokens_per_gen_step : num_extend_reqeust_wo_dummy
+                        * runtime_tokens_per_gen_step
+                    ],
                 )
 
-                self.previous_kv_lens_offsets_cuda[
+                kv_offsets = self.previous_kv_lens_offsets_cuda[
                     num_extend_reqeust_wo_dummy - previous_batch_len : num_extend_reqeust_wo_dummy
-                ].copy_(kv_len_offsets_device[previous_slots], non_blocking=True)
+                ]
+                if new_tokens_lens_device.dtype == kv_offsets.dtype:
+                    _gather_into(new_tokens_lens_device, previous_slots, kv_offsets)
+                    kv_offsets.sub_(runtime_tokens_per_gen_step)
+                else:
+                    kv_offsets.copy_(
+                        new_tokens_lens_device[previous_slots] - runtime_tokens_per_gen_step,
+                        non_blocking=True,
+                    )
 
         elif new_tokens_device is not None:
             seq_slots_device = previous_seq_slots_device()
