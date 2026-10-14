@@ -30,6 +30,7 @@ import com.nvidia.bloom.ContainerRuntime
 import com.nvidia.bloom.FailureEvidenceCollector
 import com.nvidia.bloom.SshAuthMethod
 import org.jenkinsci.plugins.workflow.cps.CpsThread
+import org.jenkinsci.plugins.workflow.steps.FlowInterruptedException
 import org.jsoup.Jsoup
 import org.jenkinsci.plugins.pipeline.modeldefinition.Utils as jUtils
 import trtllm.FailureClassifier
@@ -347,6 +348,7 @@ def collectSlurmJobLogEvidence(def pipeline, Map remote, String remoteLogPath) {
             returnStdout: true,
             retryOnFail: false,
             noNVDFEvent: true,
+            timeout: 300,
         )?.trim()
         def match = FailureEvidenceCollector.matchQueries(candidateText, queries)
         return [
@@ -356,6 +358,15 @@ def collectSlurmJobLogEvidence(def pipeline, Map remote, String remoteLogPath) {
             matchedTerms: match.matchedTerms,
             matchedMessage: match.matchedMessage,
         ]
+    } catch (FlowInterruptedException interruptedError) {
+        // A bounded evidence scan is best-effort. Utils.exec marks its timeout
+        // as a non-actual interruption; user aborts must keep propagating.
+        if (interruptedError.isActualInterruption()) {
+            throw interruptedError
+        }
+        pipeline.echo("Ignorable warning: timed out collecting failure evidence from ${remoteLogPath} on " +
+            "${remote.host} after 5 minutes")
+        return [source: "SLURM_JOB_LOG", collectionStatus: "COLLECTION_ERROR"]
     } catch (InterruptedException interruptedError) {
         throw interruptedError
     } catch (Exception collectionError) {
