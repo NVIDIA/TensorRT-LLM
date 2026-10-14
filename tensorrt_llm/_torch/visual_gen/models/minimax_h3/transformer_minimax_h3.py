@@ -35,13 +35,15 @@ from tensorrt_llm._torch.models.hf_parameter_utils import get_parameter_device
 from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
 from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
+from tensorrt_llm._torch.visual_gen.attention.attention import Attention, QKVMode
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm._torch.visual_gen.models.modeling import BaseDiffusionModel
-from tensorrt_llm._torch.visual_gen.modules.attention import Attention, QKVMode
 from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeightLoader
 from tensorrt_llm._torch.visual_gen.utils import SequenceSharder
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
+
+from .fused_adaln import h3_adaln_supported, h3_gate_res_norm_mod, h3_norm_mod
 
 MINIMAX_H3_MODALITY_NUM = 3
 
@@ -232,9 +234,17 @@ class MiniMaxH3AdaLayerNormModulation(nn.Module):
             reduce_output=False,
         )
 
-    def forward(self, temb: torch.Tensor) -> tuple[torch.Tensor, ...]:
+    def table(self, temb: torch.Tensor) -> torch.Tensor:
+        """Return the modulation table ``[n_t * 3, 6 * hidden_size]``.
+
+        One row per ``(timestep, modality)`` pair; the six column blocks are
+        shift, scale and gate for attention, then shift, scale and gate for the MLP.
+        """
         temb = self.linear(F.silu(temb).to(self.linear.dtype))
-        return temb.view(-1, 6 * self.hidden_size).chunk(6, dim=-1)
+        return temb.view(-1, 6 * self.hidden_size)
+
+    def forward(self, temb: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        return self.table(temb).chunk(6, dim=-1)
 
 
 class MiniMaxH3AdaLayerNormOut(nn.Module):
@@ -451,6 +461,8 @@ class MiniMaxH3TransformerBlock(nn.Module):
             hidden_size=hidden_size,
             model_config=model_config,
         )
+        # Fused RMSNorm + gathered modulation (and the gated residual before norm2).
+        self._fused_adaln = h3_adaln_supported(hidden_size, model_config.torch_dtype)
 
     def forward(
         self,
@@ -461,6 +473,10 @@ class MiniMaxH3TransformerBlock(nn.Module):
         key_padding_mask: Optional[torch.Tensor] = None,
         timestep: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if self._fused_adaln and hidden_states.dtype == torch.bfloat16:
+            return self._forward_fused_adaln(
+                hidden_states, temb, adaln_indices, rotary_emb, key_padding_mask, timestep
+            )
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaln_proj(temb)
 
         residual = hidden_states
@@ -484,6 +500,38 @@ class MiniMaxH3TransformerBlock(nn.Module):
             norm_hidden_states.reshape(-1, norm_hidden_states.shape[-1])
         ).reshape_as(norm_hidden_states)
         return residual + gate_mlp.index_select(0, adaln_indices) * ff_output
+
+    def _forward_fused_adaln(
+        self,
+        hidden_states: torch.Tensor,
+        temb: torch.Tensor,
+        adaln_indices: torch.Tensor,
+        rotary_emb: tuple[torch.Tensor, torch.Tensor],
+        key_padding_mask: Optional[torch.Tensor],
+        timestep: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        hidden_size = hidden_states.shape[-1]
+        mod = self.adaln_proj.table(temb)
+        norm_hidden_states = h3_norm_mod(
+            hidden_states, self.norm1.weight, mod, adaln_indices, self.norm1.variance_epsilon, 1, 0
+        )
+        attn_output = self.attn(norm_hidden_states, rotary_emb, key_padding_mask, timestep)
+        hidden_states, norm_hidden_states = h3_gate_res_norm_mod(
+            hidden_states,
+            attn_output,
+            self.norm2.weight,
+            mod,
+            adaln_indices,
+            self.norm2.variance_epsilon,
+            2,
+            4,
+            3,
+        )
+        ff_output = self.ff(
+            norm_hidden_states.reshape(-1, norm_hidden_states.shape[-1])
+        ).reshape_as(norm_hidden_states)
+        gate_mlp = mod[:, 5 * hidden_size : 6 * hidden_size]
+        return hidden_states + gate_mlp.index_select(0, adaln_indices) * ff_output
 
 
 class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
@@ -715,16 +763,12 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
 
     def _validate_layout(
         self,
-        position_ids: torch.Tensor,
+        sequence_length: int,
         token_tags: torch.Tensor,
         timestep_indices: torch.Tensor,
         timestep: torch.Tensor,
     ) -> None:
-        if position_ids.ndim != 2 or position_ids.shape[-1] != 3:
-            raise ValueError(
-                f"position_ids must have shape [sequence_length, 3], got {list(position_ids.shape)}."
-            )
-        sequence_length = position_ids.shape[0]
+        """Range-check the packed layout; the fused AdaLN kernels gather ``mod[idx]`` without bounds checks."""
         if token_tags.shape != (sequence_length,) or timestep_indices.shape != (sequence_length,):
             raise ValueError(
                 "token_tags and timestep_indices must match the packed sequence length."
@@ -766,10 +810,12 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
                 raise ValueError("position_ids is required when static_context is not provided.")
             sequence_length = static_context.sequence_length
         else:
+            if position_ids.ndim != 2 or position_ids.shape[-1] != 3:
+                raise ValueError(
+                    f"position_ids must have shape [sequence_length, 3], got {list(position_ids.shape)}."
+                )
             sequence_length = position_ids.shape[0]
-            self._validate_layout(
-                position_ids, token_tags, timestep_indices, conditioning_timesteps
-            )
+        self._validate_layout(sequence_length, token_tags, timestep_indices, conditioning_timesteps)
 
         if static_context is None:
             if encoder_hidden_states is None or position_ids is None:
@@ -779,10 +825,6 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
             static_context = self.prepare_static_context(
                 encoder_hidden_states,
                 position_ids,
-            )
-        elif token_tags.shape != (sequence_length,) or timestep_indices.shape != (sequence_length,):
-            raise ValueError(
-                "token_tags and timestep_indices must match the cached packed sequence length."
             )
 
         if static_context.sequence_length != sequence_length:

@@ -63,7 +63,7 @@ After a recipe meets the quality target, benchmark its end-to-end throughput wit
 | `k_block_size` | int ≥ 0 | `0` | K tokens per SageAttention quantization block. `0` outside SageAttention. |
 | `v_block_size` | int ≥ 0 | `0` | V block size on the hidden dimension. `0` = one tensor-wide V scale; `1` = one scale per channel. Keep `0` if `v_dtype` defines its own scaling format (e.g., `mxfp8` or `nvfp4`) |
 
-Routing (`tensorrt_llm/_torch/visual_gen/attention_backend/utils.py`) forwards the validated `quant_attention_config` into the backend constructor: `TrtllmAttention` for `TRTLLM`, `CuDNNAttention` for `CUDNN`, `FlashInferAttention` for `FLASHINFER`, and the dense `CuTeDSLAttention` FMHA backend for `CUTEDSL`.
+Routing (`tensorrt_llm/_torch/visual_gen/attention/backends/utils.py`) forwards the validated `quant_attention_config` into the backend constructor: `TrtllmAttention` for `TRTLLM`, `CuDNNAttention` for `CUDNN`, `FlashInferAttention` for `FLASHINFER`, and the dense `CuTeDSLAttention` FMHA backend for `CUTEDSL`.
 
 ## QK16PV8 Attention Kernels in the CUTEDSL Backend
 
