@@ -67,8 +67,24 @@ add_th_common_family(
   IndexerKCacheScatterOp.cpp
   IndexerTopKOp.cpp
   sparseKvCacheCompactOp.cpp
+  minimaxM3AttnC1Op.cpp
+  minimaxM3AttnMegaOp.cpp
+  minimaxM3DraftStepOp.cpp
   minimaxM3Fp8IndexerOp.cpp
+  minimaxM3FusedDecodeAttnOp.cpp
+  minimaxM3McAllreduceNormOp.cpp
+  minimaxM3MsaKvUpdateOp.cpp
+  minimaxM3Mxfp8LowMGemmOp.cpp
+  minimaxM3ProducerPwOp.cpp
+  minimaxM3RouterGemvOp.cpp
+  minimaxM3SampledAcceptOp.cpp
   minimaxM3SelectBlocksOp.cpp
+  minimaxM3SelectLongOp.cpp
+  minimaxM3ShardAcceptOp.cpp
+  minimaxM3SparseDecodeLcOp.cpp
+  minimaxM3SpecTailOp.cpp
+  minimaxM3TargetHeadOp.cpp
+  stepInputsScatterOp.cpp
   mlaRopeInplaceOp.cpp
   relativeAttentionBiasOp.cpp
   dsv3RopeOp.cpp

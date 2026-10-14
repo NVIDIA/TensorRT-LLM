@@ -27,6 +27,7 @@ from ..speculative.interface import SpecMetadata
 from ..speculative.spec_sampler_base import SampleStateTensorsSpec
 from ..speculative.utils import get_draft_kv_cache_manager
 from ..utils import make_weak_ref, piecewise_cuda_graph
+from . import step_inputs
 from .llm_request import LlmRequest, get_draft_token_length
 from .resource_manager import (BaseResourceManager, ResourceManager,
                                ResourceManagerType)
@@ -149,6 +150,15 @@ class CUDAGraphRunnerConfig:
     kv_cache_manager_key: Any
     dynamic_draft_len_mapping: Optional[Dict[int, int]] = None
     sparse_attention_config: Optional[BaseSparseAttentionConfig] = None
+    # Total sequence length at or below which a generation batch replays the
+    # short-sequence graph family; None captures one family. Derived from the
+    # sparse attention config when it asks for the split, else from the model's
+    # runtime hooks.
+    short_long_seq_len_threshold: Optional[int] = None
+    # Give the graph metadata a buffer pool of its own instead of the
+    # process-wide one, so no other engine writes its metadata buffers (an
+    # engine that skips unchanged uploads into them relies on that).
+    private_metadata_buffers: bool = False
     enable_encoder_decoder_mixed_cuda_graph: bool = False
     enable_in_graph_sampling: bool = False
 
@@ -162,6 +172,8 @@ class CUDAGraphRunner:
     multiple graphs, keyed by batch shape and execution-path specializations.
     """
     WARMUP_STEPS = 1
+    # CUDAGraphRunnerConfig.short_long_seq_len_threshold, when the config set one.
+    _configured_seq_len_threshold: Optional[int] = None
 
     def __init__(self, config: CUDAGraphRunnerConfig):
         self.config = config
@@ -174,6 +186,7 @@ class CUDAGraphRunner:
         self.max_beam_width = config.max_beam_width
         self.spec_config = config.spec_config
         self.sparse_config = config.sparse_attention_config
+        self._configured_seq_len_threshold = config.short_long_seq_len_threshold
         self.is_encoder_decoder = config.is_encoder_decoder
         self.enable_encoder_decoder_mixed_cuda_graph = (
             config.enable_encoder_decoder_mixed_cuda_graph)
@@ -203,7 +216,9 @@ class CUDAGraphRunner:
         self.shared_static_tensors: Dict[str, torch.Tensor] = {}
         if self.enabled:
             self._create_shared_static_tensors()
-        self.cuda_graph_meta_buffers = get_memory_buffers()
+        self.cuda_graph_meta_buffers = (Buffers()
+                                        if config.private_metadata_buffers else
+                                        get_memory_buffers())
 
         # On-the-fly capture is disabled by default to prevent workspace
         # tensor reallocation from invalidating addresses baked into existing
@@ -301,6 +316,20 @@ class CUDAGraphRunner:
         tiers = gathered[:, 2].tolist()
         return list(zip(flags, sizes, tiers))
 
+    @property
+    def short_long_seq_len_threshold(self) -> Optional[int]:
+        """The total sequence length splitting the short and long graph families, or None for one family.
+
+        The runner config's value when it set one, else the sparse attention
+        config's when that asks for the split.
+        """
+        if self._configured_seq_len_threshold is not None:
+            return self._configured_seq_len_threshold
+        if (isinstance(self.sparse_config, SeqLenAwareSparseAttentionConfig)
+                and self.sparse_config.needs_separate_short_long_cuda_graphs()):
+            return self.sparse_config.seq_len_threshold
+        return None
+
     def _get_seq_len_mode(
         self,
         batch: ScheduledRequests,
@@ -313,8 +342,7 @@ class CUDAGraphRunner:
         that the model engine temporarily placed in the generation list. It is
         empty for the existing generation-only path.
         """
-        if (isinstance(self.sparse_config, SeqLenAwareSparseAttentionConfig)
-                and self.sparse_config.needs_separate_short_long_cuda_graphs()):
+        if self.short_long_seq_len_threshold is not None:
             # Some sparse attention algorithms need to use different forward paths for short and long sequences.
             # For example, the DSA can skip the MQA and Top-K in the indexer for short sequences to reduce the
             # computational overhead. To support this feature, we need to capture separate CUDA graphs for short
@@ -356,7 +384,7 @@ class CUDAGraphRunner:
             from ..speculative import get_num_extra_kv_tokens
             num_extra_kv_tokens = get_num_extra_kv_tokens(self.spec_config)
             max_seq_len = max(total_seq_lens)
-            if max_seq_len <= self.sparse_config.seq_len_threshold - num_extra_kv_tokens:
+            if max_seq_len <= self.short_long_seq_len_threshold - num_extra_kv_tokens:
                 short_seq_len_mode = True
             else:
                 short_seq_len_mode = False
@@ -816,7 +844,7 @@ class CUDAGraphRunner:
                 f"replay() got {seqlen} tokens for key {key}, but the graph "
                 f"was captured for {expected_num_tokens} tokens. A shorter "
                 "input_ids leaves the tail of the static input buffer stale.")
-        static_tensors["input_ids"][:seqlen].copy_(input_ids)
+        step_inputs.copy_(static_tensors["input_ids"][:seqlen], input_ids)
 
         position_ids = current_inputs["position_ids"]
         if self.config.use_mrope:
@@ -863,7 +891,8 @@ class CUDAGraphRunner:
                     f"for key {key}, but expected {expected_position_ids_shape}. "
                     "torch.Tensor.copy_() silently broadcasts mismatched shapes, "
                     "which would corrupt the static input buffer.")
-            static_tensors["position_ids"][:, :seqlen].copy_(position_ids)
+            step_inputs.copy_(static_tensors["position_ids"][:, :seqlen],
+                              position_ids)
 
         num_encoder_tokens = key.num_encoder_tokens
         if num_encoder_tokens:
@@ -887,6 +916,9 @@ class CUDAGraphRunner:
                 encoder_hidden_states)
             static_encoder_hidden_states[actual_num_encoder_tokens:].zero_()
 
+        # Issue the step's packed input copies (no-op without an open pack) before
+        # anything below reads the static inputs on the device.
+        step_inputs.flush()
         if self._pre_replay_hooks:
             hook_tensors = static_tensors
             if position_id_offsets is not None:

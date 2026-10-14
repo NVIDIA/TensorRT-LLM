@@ -31,7 +31,11 @@ import torch
 from pydantic import ValidationError
 from transformers import PretrainedConfig
 
-from tensorrt_llm._torch._experimental.modeling_v2._router_index import modeling_v2_resolve
+from tensorrt_llm._torch._experimental.modeling_v2._router_index import (
+    ModelingV2Mode,
+    modeling_v2_resolve,
+    resolved_mode,
+)
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_auto import AutoModelForCausalLM
 from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig, NGramDecodingConfig, TorchLlmArgs
@@ -140,6 +144,14 @@ def test_gpt_oss_tp1_matches(mode):
 def test_r1_dep4_matches(mode):
     config = _model_config(_r1_config(), **_DEP4)
     assert _qualified(modeling_v2_resolve(config, _llm_args(mode))) == _R1_TARGET
+
+
+@pytest.mark.parametrize("mode", ["auto", "require"])
+def test_the_target_reads_the_mode_it_was_resolved_under(mode):
+    """A target raises instead of falling back under require, so it has to know which mode built it."""
+    config = _model_config(_gpt_oss_config())
+    target = modeling_v2_resolve(config, _llm_args(mode))
+    assert resolved_mode(target) is ModelingV2Mode(mode)
 
 
 def test_resolve_class_reads_the_decision_off_the_config():

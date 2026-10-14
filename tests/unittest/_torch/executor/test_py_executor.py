@@ -102,6 +102,7 @@ def test_forward_step_carries_context_logits_request_to_runner(request_flags, ex
         iter_counter=0,
         sampler=Mock(get_cache_indirection=Mock(return_value=cache_indirection)),
         execution_stream=Mock(),
+        _loop_on_execution_stream=False,
         _iter_adp_dummy_ctx_tokens=0,
         _iter_adp_dummy_gen_tokens=0,
         _compute_adp_dummy_tokens=PyExecutor._compute_adp_dummy_tokens,

@@ -39,6 +39,21 @@ if TYPE_CHECKING:
     from ..sparse.minimax_m3.kernels.trtllm_gen_dense_decode import DenseDecodeWorkspaceLayout
 
 
+def dense_decode_max_seq_len(attn, max_seq_len: int, num_requests: int) -> int:
+    """The max_seq_len trtllm-gen dense decode is handed for a step of ``num_requests`` requests.
+
+    A model may cap it per request count through its attention module's
+    ``dense_decode_max_seq_len_by_batch`` ({requests: max_seq_len}). The value
+    only sizes the kernel's multi-CTA KV split: every CTA still covers its share
+    of each request's actual length, so a cap changes the result only by the
+    split-merge order. The request count is fixed per CUDA graph, so the choice
+    is graph-safe.
+    """
+    caps = getattr(attn, "dense_decode_max_seq_len_by_batch", None)
+    cap = caps.get(num_requests) if caps else None
+    return max_seq_len if cap is None else min(max_seq_len, int(cap))
+
+
 class MsaDecodeFmha(PhasedFmha):
     """MiniMax-M3 generation attention on the Triton and trtllm-gen kernels.
 
@@ -261,7 +276,9 @@ class MsaDecodeFmha(PhasedFmha):
             sm_scale=(head_dim**-0.5) / float(attn.q_scaling),
             output=params.output.view(num_tokens, attn.num_heads, head_dim),
             decode_query_len=params.input_seq_length,
-            max_seq_len=int(metadata.msa_max_kv_len),
+            max_seq_len=dense_decode_max_seq_len(
+                attn, int(metadata.msa_max_kv_len), int(seq_lens.shape[0])
+            ),
             max_num_requests=int(metadata.max_num_requests),
             staged_subpage_table=staged_table,
             staged_subpages_per_slot=staged_factor,
@@ -270,4 +287,4 @@ class MsaDecodeFmha(PhasedFmha):
         )
 
 
-__all__ = ["MsaDecodeFmha"]
+__all__ = ["MsaDecodeFmha", "dense_decode_max_seq_len"]
