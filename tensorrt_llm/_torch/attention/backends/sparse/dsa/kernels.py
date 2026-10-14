@@ -387,6 +387,11 @@ def _fused_dsa_decode_metadata_kernel(
     tl.store(slot_scale_ptr + g, scale, mask=mask_j)
 
 
+# Launch parameters of the last fused_dsa_decode_metadata call that do not
+# depend on the batch (see jit_prefetch.DsaDecodeMetadataProvider).
+FUSED_DSA_DECODE_TEMPLATE: dict = {}
+
+
 def fused_dsa_decode_metadata(
     seq_lens: torch.Tensor,  # int32 [num_seqs]
     kv_lens: torch.Tensor,  # int32 [num_seqs]
@@ -445,6 +450,18 @@ def fused_dsa_decode_metadata(
     block_t = triton.next_power_of_2(max_query_len)
     block_s = triton.next_power_of_2(num_seqs)
     grid = (num_seqs + 1,)
+    # Everything but num_seqs / num_tokens is fixed per engine: keep it so the
+    # JIT prefetcher can compile the other BLOCK_S variants (one per power of
+    # two of the batch size) without knowing the metadata object.
+    FUSED_DSA_DECODE_TEMPLATE.update(
+        max_blocks=max_blocks,
+        block_offsets_stride=(block_offsets.stride(0), block_offsets.stride(1)),
+        max_query_len=max_query_len,
+        tokens_per_block=tokens_per_block,
+        index_head_dim=index_head_dim,
+        quant_block_size=quant_block_size,
+        data_bytes_per_token=data_bytes_per_token,
+    )
 
     _fused_dsa_decode_metadata_kernel[grid](
         seq_lens,

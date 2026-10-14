@@ -7,6 +7,7 @@ import os
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from contextlib import contextmanager
+from types import SimpleNamespace
 from typing import (Any, Callable, Dict, Hashable, Iterator, List, Optional,
                     Tuple, Type, Union)
 
@@ -17,7 +18,7 @@ import tensorrt_llm.bindings.internal.userbuffers as ub
 from tensorrt_llm._torch.peft.lora.config import LoraConfig
 from tensorrt_llm._torch.peft.lora.manager import LoraModelConfig
 from tensorrt_llm._torch.pyexecutor.warmup_timer import _WarmupTimer
-from tensorrt_llm._utils import release_gc
+from tensorrt_llm._utils import get_sm_version, release_gc
 from tensorrt_llm.inputs.registry import (BaseMultimodalInputProcessor,
                                           create_input_processor)
 from tensorrt_llm.llmapi.llm_args import (CudaGraphConfig, DecodingBaseConfig,
@@ -1054,6 +1055,126 @@ class PyTorchModelEngine(ModelEngine):
             "scheduled warmup requires a resource manager")
         assert isinstance(self._runner, ScheduledModelRunner)
         self._runner.warmup(resource_manager)
+        self._init_jit_prefetch()
+
+    def _init_jit_prefetch(self) -> None:
+        """Start JIT prefetch / JIT stats after warmup (env-gated, see
+        ``tensorrt_llm/_torch/jit_prefetch.py``)."""
+        from ..jit_prefetch import (JitPrefetcher, prefetch_enabled,
+                                    providers_enabled)
+        prefetcher = JitPrefetcher.init(rank=self.mapping.rank)
+        self._jit_prefetcher = prefetcher
+        if prefetcher is not None and get_sm_version() in (100, 103):
+            prefetcher.observe_deep_gemm()
+        if prefetcher is None or not prefetch_enabled():
+            return
+        if not providers_enabled():
+            prefetcher.wait_ready()
+            return
+        from .. import jit_prefetch_deep_gemm as jdg
+        if jdg.supported():
+            # MLA with a cached prefix runs kv_b_proj over up to chunk_size x
+            # chunked_prefill_buffer_batch_size cached tokens per loop, more
+            # than max_num_tokens rows.
+            rf = self.attn_runtime_features
+            max_m = self.max_num_tokens
+            if rf.chunked_prefill and rf.cache_reuse:
+                max_m = max(
+                    max_m,
+                    int(rf.chunk_size or 0) *
+                    int(rf.chunked_prefill_buffer_batch_size or 1))
+            dg_provider = jdg.FP8LinearDeepGemmProvider(self.model,
+                                                        max_num_tokens=max_m)
+            dg_moe = jdg.DeepGemmMoEProvider(self.model)
+            from ..attention.backends.sparse.dsa import indexer as dsa_indexer
+            has_dsa = (bool(dsa_indexer.DG_INDEXER_VARIANTS)
+                       and jdg.supports_indexer())
+            from ..moe.fused_moe.mega_moe import mega_moe_deepgemm as mmd
+            has_mega = bool(
+                mmd.MEGA_MOE_LAYER_CONFIGS) and jdg.supports_mega_moe()
+            if dg_provider or dg_moe or has_dsa or has_mega:
+                prefetcher.enable_deep_gemm(dg_provider, dg_moe)
+            if has_dsa:
+                spec_cfg = getattr(self, "spec_config", None)
+                max_draft = getattr(spec_cfg, "max_draft_len", 0) or 0
+                from tensorrt_llm import deep_gemm as _dg
+                self._jit_dsa_provider = jdg.DsaIndexerProvider(
+                    max_draft, _dg.get_num_sms())
+                prefetcher.add_deep_gemm_specs(
+                    self._jit_dsa_provider.pending_specs(), "dsa_indexer")
+            if has_mega:
+                prefetcher.add_deep_gemm_specs(
+                    jdg.MegaMoEProvider().pending_specs(), "mega_moe")
+        from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
+        if IS_CUTLASS_DSL_AVAILABLE and get_sm_version() in (100, 103):
+            from .. import jit_prefetch_cute_dsl as jcd
+            kda_provider = jcd.KdaPrefillProvider(self.model)
+            if kda_provider:
+                prefetcher.enable_cute_dsl(kda_provider)
+        from ..modules.mamba.jit_prefetch_linear_attn import LinearAttnProvider
+        la_provider = LinearAttnProvider(
+            self.model,
+            max_num_tokens=self.max_num_tokens,
+            chunk_size=getattr(self.attn_metadata, "mamba_chunk_size", 0)
+            if getattr(self, "attn_metadata", None) is not None else 0)
+        if la_provider and prefetcher.register("linear_attn", la_provider):
+            logger.info(f"[JIT prefetch] GDN/KDA provider: "
+                        f"{len(la_provider.shapes)} distinct layer shape(s)")
+        from ..attention.backends.sparse.dsa import kernels as dsa_kernels
+        if dsa_kernels.FUSED_DSA_DECODE_TEMPLATE:
+            from ..attention.backends.sparse.dsa.jit_prefetch import \
+                DsaDecodeMetadataProvider
+            prefetcher.register("dsa_decode_metadata",
+                                DsaDecodeMetadataProvider(self.batch_size))
+        from ..modules.mamba.jit_prefetch import MambaSSDProvider
+        provider = MambaSSDProvider(self.model,
+                                    max_num_tokens=self.max_num_tokens,
+                                    max_batch_size=self.batch_size)
+        if provider and prefetcher.register("mamba_ssd", provider):
+            logger.info(f"[JIT prefetch] Mamba SSD provider: "
+                        f"{len(provider.shapes)} distinct layer shape(s)")
+        # Helpers were started when the prefetcher was created; make sure
+        # their start-up is paid here, inside warmup, not by a request.
+        prefetcher.wait_ready()
+        prefetcher.start_background()
+
+    def _plan_jit_prefetch(self, scheduled_requests: ScheduledRequests,
+                           resource_manager: ResourceManager) -> None:
+        prefetcher = getattr(self, "_jit_prefetcher", None)
+        if prefetcher is None or self.is_warmup:
+            return
+        prefetcher.bind_executor_thread()
+        if not prefetcher.prefetch:
+            return
+        from .. import jit_prefetch_deep_gemm as jdg
+        prefetcher.plan_deep_gemm(jdg.batch_tokens(scheduled_requests))
+        ctx = scheduled_requests.context_requests
+        gen = scheduled_requests.generation_requests
+        gen_tokens = sum(1 + len(getattr(r, "py_draft_tokens", None) or [])
+                         for r in gen)
+        # A generation-only batch at a captured size replays a CUDA graph and
+        # compiles nothing; eager ones (above the largest graph, or graphs
+        # disabled) are planned like any other batch.
+        if not ctx and self._jit_prefetch_gen_in_graph(len(gen)):
+            return
+        # The same facts _prepare_tp_inputs and Mamba2Metadata.prepare derive
+        # later: per-request chunk length and whether any request has a cached
+        # prefix (num_cached_tokens_per_seq > 0 -> HAS_INITSTATES).
+        lens = [r.context_chunk_size for r in ctx]
+        if lens:
+            prefetcher.plan_cute_dsl(lens)
+        any_cached = any(r.context_current_position -
+                         r.py_num_compressed_tokens > 0 for r in ctx)
+        prefetcher.plan(
+            SimpleNamespace(ctx_chunk_lens=lens,
+                            any_ctx_cached=any_cached,
+                            gen_tokens=gen_tokens))
+
+    def _jit_prefetch_gen_in_graph(self, num_gen: int) -> bool:
+        runner = getattr(self, "cuda_graph_runner", None)
+        sizes = getattr(runner, "supported_batch_sizes", None) or []
+        return bool(getattr(runner, "enabled", False)) and num_gen <= max(
+            sizes, default=0)
 
     ### Helper methods promoted from the original warmup method ###
 

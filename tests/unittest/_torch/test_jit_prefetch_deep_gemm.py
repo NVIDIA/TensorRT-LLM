@@ -1,0 +1,305 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""The CPU-only DeepGEMM helper builds exactly the cubin the real op loads.
+
+Each case runs in a fresh subprocess (DeepGEMM keeps an in-process runtime
+cache): the helper compiles one (M, N, K) into an empty ``DG_JIT_CACHE_DIR``,
+then the real ``trtllm::fp8_swap_ab_gemm`` runs the same shape against that
+cache; it must not add a cache entry.
+"""
+
+import json
+import os
+import subprocess
+import sys
+import textwrap
+
+import pytest
+import torch
+
+from tensorrt_llm._torch import jit_prefetch_deep_gemm as jdg
+
+pytestmark = pytest.mark.skipif(not jdg.supported(), reason="needs SM100 and the patched DeepGEMM")
+
+_HELPER = os.path.join(os.path.dirname(os.path.abspath(jdg.__file__)), "jit_prefetch_dg_helper.py")
+
+_REAL = textwrap.dedent("""
+    import sys, torch
+    import tensorrt_llm  # noqa: F401  (registers trtllm ops)
+    from tensorrt_llm.quantization.utils.fp8_utils import (
+        resmooth_to_fp8_e8m0, transform_sf_into_required_layout)
+    m, n, k = map(int, sys.argv[1:4])
+    x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+    w = torch.randn(n, k, device="cuda").to(torch.float8_e4m3fn)
+    ws = torch.ones((n + 127) // 128, (k + 127) // 128, device="cuda")
+    # The layout FP8BlockScalesLinearMethod gives the weight on SM100.
+    w, ws = resmooth_to_fp8_e8m0(w, ws)
+    ws = transform_sf_into_required_layout(ws, mn=n, k=k,
+                                           recipe=(1, 128, 128), is_sfa=False)
+    torch.ops.trtllm.fp8_swap_ab_gemm(x, w, ws, disable_ue8m0_cast=True)
+    torch.cuda.synchronize()
+""")
+
+
+_REAL_MOE = textwrap.dedent("""
+    import sys, torch
+    from tensorrt_llm import deep_gemm
+    from tensorrt_llm.quantization.utils.fp8_utils import transform_sf_into_required_layout
+    g, m, n, k, expected_m = map(int, sys.argv[1:6])
+    a = torch.randn(g, m, k, device="cuda").to(torch.float8_e4m3fn)
+    b = torch.randn(g, n, k, device="cuda").to(torch.float8_e4m3fn)
+    # Packed UE8M0 scales, as DeepGemmFusedMoE passes them: FP32 scales would
+    # make DeepGEMM JIT a separate SF-packing kernel the MoE path never runs.
+    sfa = transform_sf_into_required_layout(
+        torch.ones(g, m, (k + 127) // 128, device="cuda"), mn=m, k=k,
+        recipe=(1, 128, 128), num_groups=g, is_sfa=True)
+    sfb = transform_sf_into_required_layout(
+        torch.ones(g, (n + 127) // 128, (k + 127) // 128, device="cuda"), mn=n, k=k,
+        recipe=(1, 128, 128), num_groups=g, is_sfa=False)
+    d = torch.empty(g, m, n, device="cuda", dtype=torch.bfloat16)
+    masked_m = torch.full((g,), min(m, expected_m), device="cuda", dtype=torch.int32)
+    deep_gemm.m_grouped_fp8_gemm_nt_masked((a, sfa), (b, sfb), d, masked_m, expected_m,
+                                           disable_ue8m0_cast=True)
+    torch.cuda.synchronize()
+""")
+
+
+def _entries(cache):
+    """Committed kernel entries of a DeepGEMM JIT disk cache."""
+    root = os.path.join(cache, "cache")
+    if not os.path.isdir(root):
+        return set()
+    return {e for e in os.listdir(root) if os.path.exists(os.path.join(root, e, ".committed"))}
+
+
+def _helper_compile(cache, specs):
+    env = dict(os.environ, DG_JIT_CACHE_DIR=cache, CUDA_VISIBLE_DEVICES="", PYTHONNOUSERSITE="1")
+    inp = "".join(json.dumps({"tag": i, "spec": s}) + "\n" for i, s in enumerate(specs))
+    out = subprocess.run(
+        [sys.executable, "-u", _HELPER, jdg.package_dir(), *(str(x) for x in jdg.target())],
+        input=inp,
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=900,
+        check=True,
+    ).stdout.splitlines()
+    assert json.loads(out[0]) == {"ready": True}
+    return [json.loads(line) for line in out[1:]]
+
+
+# Small, ragged and large M; N/K of DeepSeek-V3 FP8 projections.
+@pytest.mark.parametrize("m", [1, 17, 139, 2305])
+@pytest.mark.parametrize("n,k", [(2112, 7168), (7168, 2048)])
+def test_helper_cubin_is_what_the_real_op_loads(tmp_path, m, n, k):
+    cache = str(tmp_path / "dg")
+    (r,) = _helper_compile(cache, [jdg.spec_for(m, n, k)])
+    assert r["ok"] and r["built"], r
+    built = _entries(cache)
+    assert len(built) == 1, built
+
+    # A second request for the same variant is a cache hit in the helper.
+    (r2,) = _helper_compile(cache, [jdg.spec_for(m, n, k)])
+    assert r2["ok"] and not r2["built"], r2
+
+    env = dict(os.environ, DG_JIT_CACHE_DIR=cache)
+    subprocess.run(
+        [sys.executable, "-c", _REAL, str(m), str(n), str(k)], env=env, check=True, timeout=900
+    )
+    assert _entries(cache) == built, "real op compiled a different variant"
+
+
+def test_provider_finds_kimi_fp8_weight_read_linears():
+    """Kimi K3's attention and shared-expert FP8 projections are not
+    ``Linear`` modules but run the same swap-AB GEMM."""
+    from tensorrt_llm._torch.models.modeling_kimi_linear import _Fp8BlockScaleWeightReadLinear
+
+    n, k = 512, 256
+    w = torch.zeros(n, k, device="cuda").to(torch.float8_e4m3fn)
+    ws = torch.ones(n // 128, k // 128, device="cuda")
+    model = torch.nn.ModuleList([_Fp8BlockScaleWeightReadLinear(w, ws, n)])
+    p = jdg.FP8LinearDeepGemmProvider(model, max_num_tokens=64)
+    assert p.shapes == [(n, k)]
+    assert p.plan_tokens(17) == [jdg.spec_for(17, n, k)]
+
+
+def test_provider_enumeration_windows():
+    p = jdg.FP8LinearDeepGemmProvider(torch.nn.Module(), max_num_tokens=100)
+    p.shapes = [(128, 512)]
+    ms = [json.loads(s)["m"] for s in p.enumerate_specs()]
+    assert ms[:16] == list(range(1, 17))
+    # One M per 16-row window up to max_num_tokens, which is included.
+    assert ms[16:] == [32, 48, 64, 80, 96, 100]
+    assert p.plan_tokens(37) and not p.plan_tokens(37)
+
+
+# A DeepSeek-V3-like expert slice (G experts per rank, gate+up / down), at
+# batch sizes far apart: one helper compile must serve all of them.
+@pytest.mark.parametrize("g,n,k", [(32, 4096, 7168), (32, 7168, 2048)])
+def test_moe_helper_cubin_serves_every_batch(tmp_path, g, n, k):
+    cache = str(tmp_path / "dg")
+    (r,) = _helper_compile(cache, [jdg.moe_spec_for(g, 128, n, k, 1)])
+    assert r["ok"] and r["built"], r
+    built = _entries(cache)
+    assert len(built) == 1, built
+
+    env = dict(os.environ, DG_JIT_CACHE_DIR=cache)
+    for m, expected_m in ((128, 3), (256, 40), (1024, 600)):
+        subprocess.run(
+            [sys.executable, "-c", _REAL_MOE, str(g), str(m), str(n), str(k), str(expected_m)],
+            env=env,
+            check=True,
+            timeout=900,
+        )
+        assert _entries(cache) == built, f"real op compiled another variant at m={m}"
+
+
+_REAL_INDEXER = textwrap.dedent("""
+    import sys, torch
+    from tensorrt_llm import deep_gemm
+    kind, next_n, heads, dim, block_kv = sys.argv[1], *map(int, sys.argv[2:6])
+    if kind == "mqa":
+        T, Tkv = 256, 4096
+        q = torch.randn(T, heads, dim, device="cuda").to(torch.float8_e4m3fn)
+        kv = torch.randn(Tkv, dim, device="cuda").to(torch.float8_e4m3fn)
+        kv_sf = torch.ones(Tkv, device="cuda")
+        w = torch.randn(T, heads, device="cuda")
+        ks = torch.zeros(T, dtype=torch.int, device="cuda")
+        ke = torch.full((T,), Tkv, dtype=torch.int, device="cuda")
+        deep_gemm.fp8_mqa_logits(q, (kv, kv_sf), w, ks, ke, clean_logits=False)
+    else:
+        B, ctx = 8, 1000
+        nblk = (ctx + block_kv - 1) // block_kv
+        q = torch.randn(B, next_n, heads, dim, device="cuda").to(torch.float8_e4m3fn)
+        kv = torch.zeros(B * nblk, block_kv, 1, dim + 4, dtype=torch.uint8, device="cuda")
+        w = torch.randn(B * next_n, heads, device="cuda")
+        lens = torch.full((B, next_n), ctx, dtype=torch.int, device="cuda")
+        table = torch.arange(B * nblk, dtype=torch.int, device="cuda").view(B, nblk)
+        sched = deep_gemm.get_paged_mqa_logits_metadata(lens, 64, deep_gemm.get_num_sms())
+        deep_gemm.fp8_paged_mqa_logits(q, kv, w, lens, table, sched, nblk * block_kv)
+    torch.cuda.synchronize()
+""")
+
+
+def _indexer_specs(kind, next_n, heads, dim, block_kv, num_sms):
+    if kind == "mqa":
+        return [json.dumps(dict(op="mqa_logits", num_heads=heads, head_dim=dim, is_fp4=False,
+                                is_mx_sf=False, compressed=False, clean_logits=False, logits="float32",
+                                weights="float32"), sort_keys=True)]  # fmt: skip
+    return [
+        json.dumps(
+            dict(
+                op="paged_mqa_logits",
+                next_n=next_n,
+                num_heads=heads,
+                head_dim=dim,
+                block_kv=block_kv,
+                is_fp4=False,
+                is_mx_sf=False,
+                is_varlen=False,
+                logits="float32",
+                weights="float32",
+            ),
+            sort_keys=True,
+        ),  # fmt: skip
+        json.dumps(
+            dict(op="paged_mqa_logits_metadata", next_n=next_n, is_varlen=False, num_sms=num_sms),
+            sort_keys=True,
+        ),  # fmt: skip
+    ]
+
+
+# DSA indexer shapes (64 index heads x 128 dims, 64-token indexer K pages):
+# prefill logits, then paged decode at next_n = 1 and the MTP verify width.
+@pytest.mark.skipif(not jdg.supports_indexer(), reason="needs the DSA compile-only entries")
+@pytest.mark.parametrize("kind,next_n", [("mqa", 1), ("paged", 1), ("paged", 4)])
+def test_indexer_helper_cubins_are_what_the_real_ops_load(tmp_path, kind, next_n):
+    heads, dim, block_kv = 64, 128, 64
+    cache = str(tmp_path / "dg")
+    specs = _indexer_specs(kind, next_n, heads, dim, block_kv, jdg.target()[2])
+    results = _helper_compile(cache, specs)
+    assert all(r["ok"] and r["built"] for r in results), results
+    built = _entries(cache)
+    assert len(built) == len(specs), built
+    env = dict(os.environ, DG_JIT_CACHE_DIR=cache)
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            _REAL_INDEXER,
+            kind,
+            str(next_n),
+            str(heads),
+            str(dim),
+            str(block_kv),
+        ],
+        env=env,
+        check=True,
+        timeout=900,
+    )
+    assert _entries(cache) == built, f"real op compiled {sorted(_entries(cache) - built)}"
+
+
+_GPU_MEGA = textwrap.dedent("""
+    import sys, json
+    from tensorrt_llm import deep_gemm
+    s = json.loads(sys.argv[1])
+    built = deep_gemm.compile_only_fp8_fp4_mega_moe(
+        s["num_ranks"], s["num_experts"], s["max_tokens"], s["topk"], s["num_tokens"],
+        s["hidden"], s["inter"], 0, s["activation"], s["clamp"], s["fast_math"],
+        s["situ_beta"], s["situ_linear_beta"], s["mma_type"])
+    print("BUILT", built)
+""")
+
+
+# MegaMoE has no separate real-op path to reach here without a symmetric
+# memory group, so the check is that a GPU process (arch, SM count and memory
+# sizes read from the device, not DJ_COMPILE_TARGET) resolves every variant to
+# the entry the GPU-less helper built: its compile-only call finds it cached.
+@pytest.mark.skipif(not jdg.supports_mega_moe(), reason="needs the MegaMoE compile-only entry")
+def test_mega_moe_helper_builds_every_band(tmp_path):
+    from tensorrt_llm import deep_gemm, deep_gemm_cpp_tllm
+
+    p = jdg.MegaMoEProvider()
+    # SymmBuffer aligns the per-rank token capacity; the layer records that.
+    max_tok = 512
+    max_tok += -max_tok % deep_gemm_cpp_tllm.get_token_alignment_for_mega_moe("fp8xfp4")
+    counts = p.band_token_counts(num_ranks=8, num_experts=256, max_tokens=max_tok, topk=8)
+
+    def block_m(n):
+        return deep_gemm.get_block_m_for_mega_moe(8, 256, max_tok, n, 8, "fp8xfp4")
+
+    # One token count per BLOCK_M, and every count in range picks one of them.
+    picked = [block_m(n) for n in counts]
+    assert len(set(picked)) == len(picked) > 1, (counts, picked)
+    assert {block_m(n) for n in range(max_tok + 1)} == set(picked)
+    specs = [
+        json.dumps(dict(op="mega_moe", num_ranks=8, num_experts=256, max_tokens=max_tok, topk=8,
+                        num_tokens=n, hidden=7168, inter=2048, activation="swiglu", clamp=None,
+                        fast_math=True, situ_beta=None, situ_linear_beta=None,
+                        mma_type="fp8xfp4"), sort_keys=True)
+        for n in counts
+    ]  # fmt: skip
+    cache = str(tmp_path / "dg")
+    results = _helper_compile(cache, specs)
+    assert all(r["ok"] and r["built"] for r in results), results
+    built = _entries(cache)
+    assert len(built) == len(specs), sorted(built)
+    env = dict(os.environ, DG_JIT_CACHE_DIR=cache)
+    for spec in specs:
+        out = subprocess.run([sys.executable, "-c", _GPU_MEGA, spec], env=env, check=True,
+                             capture_output=True, text=True, timeout=900).stdout  # fmt: skip
+        assert "BUILT False" in out, out
+    assert _entries(cache) == built
