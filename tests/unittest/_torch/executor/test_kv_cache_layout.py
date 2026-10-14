@@ -26,6 +26,7 @@ from tensorrt_llm._torch.pyexecutor.connectors.kv_cache_layout import (
     KvCacheLayout,
     KvCacheRegion,
     build_kv_cache_layout_v2,
+    combine_kv_cache_layouts,
     valid_page_slots,
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
@@ -267,6 +268,33 @@ class TestKvCacheRegionArithmetic(unittest.TestCase):
             layout.group(7)
         with self.assertRaises(KeyError):
             layout.group_of_layer(99)
+
+    def test_combined_layout_remaps_draft_groups_without_moving_regions(self):
+        target = self._pool_layout(num_layers=2)
+        draft_region = KvCacheRegion(
+            base=0xA000,
+            size=128,
+            stride=256,
+            num_slots=4,
+            buffers=(KvCacheBufferRef(layer_id=2, role="index_key"),),
+        )
+        draft = KvCacheLayout(
+            tokens_per_block=target.tokens_per_block,
+            groups=(KvCacheLayerGroupLayout(0, (2,), None, (draft_region,)),),
+            dtype=target.dtype,
+        )
+
+        combined = combine_kv_cache_layouts((target, draft))
+
+        self.assertEqual([group.layer_group_id for group in combined.groups], [0, 1])
+        self.assertEqual(combined.groups[1].layer_ids, (2,))
+        self.assertIs(combined.groups[1].regions[0], draft_region)
+        self.assertEqual(combined.groups[1].regions[0].address_of(3), 0xA000 + 3 * 256)
+
+    def test_combined_layout_rejects_overlapping_global_layers(self):
+        layout = self._pool_layout(num_layers=2)
+        with self.assertRaisesRegex(ValueError, "same global layer"):
+            combine_kv_cache_layouts((layout, layout))
 
 
 class TestValidPageSlots(unittest.TestCase):

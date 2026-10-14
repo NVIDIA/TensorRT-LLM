@@ -16,8 +16,8 @@
 
 Every rejection here is a configuration whose failure mode is a wrong answer
 rather than a slow one: KV replayed without all of the state it was computed
-with. Beam search, attention data parallelism and Mamba caches are rejected for
-all connectors in `py_executor`, so they are not repeated here.
+with. Beam search and Mamba caches are rejected in `py_executor`. Attention DP
+uses one complete attention cache per owner and a shared content namespace.
 
 Checks run at construction, before any request is admitted, so a bad deployment
 fails at startup instead of after the first cache hit.
@@ -121,8 +121,6 @@ def validate_node_budget(
     """
     from tensorrt_llm._utils import local_mpi_size
 
-    from .staging import MAX_STAGING_BUFFER_BYTES
-
     if ranks_on_node is None:
         try:
             ranks_on_node = max(1, local_mpi_size())
@@ -134,7 +132,10 @@ def validate_node_budget(
     # DRAM, so it belongs in the sum even when no segment is mounted. One pool
     # per direction, and a capacity-only rank opens neither.
     directions = int(config.role.loads) + int(config.role.saves)
-    staging_claim = ranks_on_node * directions * MAX_STAGING_BUFFER_BYTES
+    # Async workers share one extra load-direction budget, in addition to
+    # the synchronous fallback and save pools. Capacity roles allocate none.
+    directions += int(config.async_load and config.role.loads)
+    staging_claim = ranks_on_node * directions * config.staging_buffer_bytes
 
     claimed = segment_claim + staging_claim
     if claimed <= 0:

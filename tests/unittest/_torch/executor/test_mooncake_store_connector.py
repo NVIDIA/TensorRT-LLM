@@ -28,7 +28,8 @@ import contextlib
 import json
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -47,6 +48,7 @@ from tensorrt_llm._torch.pyexecutor.connectors.kv_cache_layout import (
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store import staging as staging_module
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store import worker as worker_module
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.addressing import PageAddressing
+from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.config import MooncakeStoreConnectorConfig
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.keys import BlockHashChain
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.metadata import (
     PageTransfer,
@@ -58,6 +60,7 @@ from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.scheduler import (
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.worker import (
     MooncakeStoreConnectorWorker,
 )
+from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig
 from tensorrt_llm.runtime.kv_cache_manager_v2 import BAD_PAGE_INDEX
 
 pytestmark = pytest.mark.cpu_only
@@ -164,9 +167,12 @@ def set_pool_setting(store_config, **settings):
     store_config.write_text(json.dumps(raw))
 
 
-def make_llm_args(*, run_dir: str | None = None) -> SimpleNamespace:
+def make_llm_args(*, run_dir: str | None = None, enable_attention_dp: bool = False,
+                  speculative_config: MTPDecodingConfig | None = None) -> SimpleNamespace:
     return SimpleNamespace(
         model="/models/test-model",
+        enable_attention_dp=enable_attention_dp,
+        speculative_config=speculative_config,
         kv_cache_config=SimpleNamespace(tokens_per_block=TOKENS_PER_BLOCK),
         tensor_parallel_size=1,
         pipeline_parallel_size=1,
@@ -202,6 +208,7 @@ def make_worker(
     *,
     layout: KvCacheLayout | None = None,
     run_dir: str | None = None,
+    enable_attention_dp: bool = False,
 ) -> Iterator[MooncakeStoreConnectorWorker]:
     """Build a worker and shut it down before the test call phase ends.
 
@@ -209,7 +216,7 @@ def make_worker(
     pytest-threadleak snapshots threads around the call phase only, so
     fixture teardown would run too late to keep it quiet.
     """
-    worker = MooncakeStoreConnectorWorker(make_llm_args(run_dir=run_dir))
+    worker = MooncakeStoreConnectorWorker(make_llm_args(run_dir=run_dir, enable_attention_dp=enable_attention_dp))
     fake_store.workers.append(worker)
     if layout is not None:
         worker.register_kv_cache_layout(layout)
@@ -324,12 +331,15 @@ def test_worker_prefix_hit_stops_at_the_first_gap(store_config, fake_store):
         assert worker.count_prefix_hit(hashes) == 1
 
 
-def test_worker_load_raises_when_a_page_is_missing(store_config, fake_store):
+def test_worker_load_reports_the_request_when_a_page_is_missing(store_config, fake_store):
+    """A single-rank worker hands a request whose page is gone back to the executor."""
     with make_worker(fake_store, layout=make_layout()) as worker:
         transfers = RequestTransfers(7, [PageTransfer(b"\x00" * 16, 0, 1)])
         worker.bind_connector_meta(SimpleNamespace(loads=[transfers], saves=[]))
-        with pytest.raises(RuntimeError, match="already"):
-            worker.start_load_kv(None)
+        worker.start_load_kv(None)
+        assert worker.take_failed_load_requests() == {7}
+        # Cleared on return: the next iteration starts clean.
+        assert worker.take_failed_load_requests() == set()
 
 
 def test_worker_reports_a_request_finished_once_its_saves_drain(store_config, fake_store):
@@ -382,19 +392,17 @@ def test_a_save_that_raises_is_dropped_and_its_request_still_retires(
 
 
 @contextlib.contextmanager
-def make_staged_worker(fake_store, store_config, *, layout, budget=None):
-    """A worker configured to pass pages through pinned host slots.
-
-    `budget` patches the pinned-memory ceiling rather than setting a field:
-    the allocation follows from the layout and the transfer batch now, so the
-    ceiling is the only thing left that can bind.
-    """
-    set_pool_setting(store_config, stage_through_host=True)
-    with contextlib.ExitStack() as stack:
-        if budget is not None:
-            patch = stack.enter_context(pytest.MonkeyPatch.context())
-            patch.setattr(worker_module, "MAX_STAGING_BUFFER_BYTES", budget)
-        worker = stack.enter_context(make_worker(fake_store, layout=layout))
+def make_staged_worker(
+    fake_store, store_config, *, layout, budget=None, enable_attention_dp=False
+):
+    """A worker using the configured bounded host staging pools."""
+    options = {"stage_through_host": True}
+    if budget is not None:
+        options["staging_buffer_bytes"] = budget
+    set_pool_setting(store_config, **options)
+    with make_worker(
+        fake_store, layout=layout, enable_attention_dp=enable_attention_dp
+    ) as worker:
         yield worker
 
 
@@ -512,8 +520,8 @@ def test_staging_does_not_scatter_a_failed_load(store_config, fake_store, staged
         worker.bind_connector_meta(
             SimpleNamespace(loads=[RequestTransfers(7, [PageTransfer(block_hash, 0, 1)])], saves=[])
         )
-        with pytest.raises(RuntimeError, match="failed to load"):
-            worker.start_load_kv(None)
+        worker.start_load_kv(None)
+        assert worker.take_failed_load_requests() == {7}
 
         # A failed read leaves the slot holding whatever it held before, and
         # copying that onto the page would put unrelated bytes where the
@@ -645,21 +653,38 @@ class FakeWorker:
         return min(self.hit_blocks, len(block_hashes))
 
 
-def make_scheduler(store_config, hit_blocks=0):
-    scheduler = MooncakeStoreConnectorScheduler(make_llm_args())
+def make_scheduler(
+    store_config: Path,
+    hit_blocks: int = 0,
+    speculative_config: MTPDecodingConfig | None = None,
+) -> MooncakeStoreConnectorScheduler:
+    scheduler = MooncakeStoreConnectorScheduler(
+        make_llm_args(speculative_config=speculative_config)
+    )
     scheduler._worker = FakeWorker(hit_blocks)
     return scheduler
 
 
-def request_data(request_id, new_tokens, page_indices):
+def request_data(
+    request_id: int,
+    new_tokens: Sequence[int],
+    page_indices: Sequence[int],
+    layer_group_id: int = 0,
+    *,
+    computed_position: int = 0,
+    num_scheduled_tokens: int | None = None,
+) -> RequestData:
+    by_layer_group = [[] for _ in range(layer_group_id + 1)]
+    by_layer_group[layer_group_id] = list(page_indices)
     return RequestData(
         request_id=request_id,
         new_tokens=list(new_tokens),
         new_block_ids=list(page_indices),
-        computed_position=0,
-        num_scheduled_tokens=len(new_tokens),
-        # One entry per layer group, indexed by layer group id.
-        new_block_ids_by_layer_group=[list(page_indices)],
+        computed_position=computed_position,
+        num_scheduled_tokens=(
+            len(new_tokens) if num_scheduled_tokens is None else num_scheduled_tokens
+        ),
+        new_block_ids_by_layer_group=by_layer_group,
     )
 
 
@@ -717,7 +742,7 @@ def test_scheduler_does_not_resave_blocks_across_iterations(store_config):
     # A generation step completes one more block; only that block is saved.
     more_tokens = list(range(2 * TOKENS_PER_BLOCK, 3 * TOKENS_PER_BLOCK))
     second = scheduler.build_connector_meta(
-        SchedulerOutput(cached_requests=[request_data(1, more_tokens, [6])])
+        SchedulerOutput(cached_requests=[request_data(1, more_tokens, [6], computed_position=2 * TOKENS_PER_BLOCK)])
     )
     assert [page.page_index for page in second.saves[0].pages] == [6]
 
@@ -899,3 +924,648 @@ def test_scheduler_bypasses_multimodal_requests_it_cannot_identify(store_config)
     assert metadata.saves == []
     # Nothing was handed to a save thread, so nothing pins its pages either.
     assert scheduler.request_finished(request, [7, 8, 9]) is False
+
+
+@pytest.mark.parametrize("lookahead", [1, TOKENS_PER_BLOCK + 1])
+def test_hash_chain_requires_lookahead_and_matches_incremental_extension(lookahead: int) -> None:
+    tokens = list(range(4 * TOKENS_PER_BLOCK + lookahead))
+    chain = BlockHashChain(TOKENS_PER_BLOCK, prompt_lookahead=lookahead)
+    assert chain.extend(tokens[: TOKENS_PER_BLOCK + lookahead - 1]) == []
+    assert len(chain.extend(tokens[: TOKENS_PER_BLOCK + lookahead])) == 1
+    for end in range(TOKENS_PER_BLOCK + lookahead + 1, len(tokens) + 1):
+        chain.extend(tokens[:end])
+    assert len(chain.hashes) == 4
+    assert chain.hashes == BlockHashChain(TOKENS_PER_BLOCK, prompt_lookahead=lookahead).extend(
+        tokens
+    )
+
+    divergent = list(tokens)
+    divergent[TOKENS_PER_BLOCK + lookahead - 1] += 1000
+    assert (
+        chain.hashes[0]
+        != BlockHashChain(TOKENS_PER_BLOCK, prompt_lookahead=lookahead).extend(divergent)[0]
+    )
+
+
+def test_hash_chain_rejects_negative_lookahead() -> None:
+    with pytest.raises(ValueError, match="prompt_lookahead"):
+        BlockHashChain(TOKENS_PER_BLOCK, prompt_lookahead=-1)
+
+
+def test_scheduler_publishes_only_computed_full_blocks(store_config: Path) -> None:
+    scheduler = make_scheduler(store_config)
+    tokens = list(range(3 * TOKENS_PER_BLOCK + 1))
+    scheduler.get_num_new_matched_tokens(make_request(1, tokens), 0)
+    data = request_data(1, tokens, [4, 5, 6, 7], num_scheduled_tokens=TOKENS_PER_BLOCK - 1)
+    first = scheduler.build_connector_meta(SchedulerOutput(new_requests=[data]))
+    assert first.saves == []
+
+    # Full prompt hashes and every capacity page were reported up front, but
+    # no page may be published until its final token has actually been computed.
+    for ordinal in range(3):
+        computed = TOKENS_PER_BLOCK - 1 if ordinal == 0 else ordinal * TOKENS_PER_BLOCK
+        scheduled = 1 if ordinal == 0 else TOKENS_PER_BLOCK
+        data = request_data(1, [], [], computed_position=computed, num_scheduled_tokens=scheduled)
+        metadata = scheduler.build_connector_meta(SchedulerOutput(cached_requests=[data]))
+        assert [page.page_index for page in metadata.saves[0].pages] == [4 + ordinal]
+
+
+@pytest.mark.parametrize("local_blocks", [0, 1])
+@pytest.mark.parametrize("use_mtp", [False, True])
+def test_scheduler_saves_computed_tail_after_restore(
+    store_config: Path, local_blocks: int, use_mtp: bool
+) -> None:
+    config = MTPDecodingConfig(max_draft_len=1) if use_mtp else None
+    scheduler = make_scheduler(store_config, hit_blocks=2, speculative_config=config)
+    tokens = list(range(6 * TOKENS_PER_BLOCK + 1))
+    scheduler.get_num_new_matched_tokens(make_request(1, tokens), local_blocks * TOKENS_PER_BLOCK)
+    # The scheduler subtracts connector restores from computed_position.
+    # Full prompt hashes and capacity pages are available ahead of computation.
+    data = request_data(
+        1,
+        tokens,
+        list(range(10, 17)),
+        computed_position=local_blocks * TOKENS_PER_BLOCK,
+        num_scheduled_tokens=TOKENS_PER_BLOCK + 1,
+    )
+    metadata = scheduler.build_connector_meta(SchedulerOutput(new_requests=[data]))
+    tail_block = local_blocks + 2
+    assert [page.page_index for page in metadata.loads[0].pages] == [
+        10 + local_blocks,
+        11 + local_blocks,
+    ]
+    assert [page.page_index for page in metadata.saves[0].pages] == [10 + tail_block]
+
+    # A later chunk includes the restored prefix in its position. Count the
+    # restore only once, and wait for this partial page to become complete.
+    data = request_data(
+        1,
+        [],
+        [],
+        computed_position=(tail_block + 1) * TOKENS_PER_BLOCK + 1,
+        num_scheduled_tokens=TOKENS_PER_BLOCK - 1,
+    )
+    metadata = scheduler.build_connector_meta(SchedulerOutput(cached_requests=[data]))
+    assert metadata.loads == []
+    assert [page.page_index for page in metadata.saves[0].pages] == [11 + tail_block]
+
+
+def test_scheduler_mtp_keys_require_matching_lookahead(store_config: Path) -> None:
+    tokens = list(range(3 * TOKENS_PER_BLOCK))
+    other_tokens = list(tokens)
+    other_tokens[TOKENS_PER_BLOCK] += 1000
+    config = MTPDecodingConfig(max_draft_len=1)
+    scheduler = make_scheduler(store_config, hit_blocks=99, speculative_config=config)
+    scheduler.get_num_new_matched_tokens(make_request(1, tokens), 0)
+    scheduler.get_num_new_matched_tokens(make_request(2, other_tokens), 0)
+    first, other = scheduler._worker.queries
+    assert first == list(BlockHashChain(TOKENS_PER_BLOCK, prompt_lookahead=1).extend(tokens))
+    assert first[0] != other[0]
+    assert first[0] != BlockHashChain(TOKENS_PER_BLOCK).extend(tokens)[0]
+
+    metadata = scheduler.build_connector_meta(
+        SchedulerOutput(new_requests=[request_data(2, other_tokens, [4, 5, 6])])
+    )
+    assert len(metadata.loads[0].pages) == 2
+    assert metadata.saves == []  # The final block lacks the draft's following token.
+
+
+def test_scheduler_cancel_load_truncates_the_offer(store_config):
+    scheduler = make_scheduler(store_config, hit_blocks=3)
+    tokens = list(range(6 * TOKENS_PER_BLOCK))
+    request = make_request(1, tokens)
+    scheduler.get_num_new_matched_tokens(request, 0)
+
+    # The runtime will not consume anything from block 1 onwards.
+    scheduler.cancel_load(request, TOKENS_PER_BLOCK, 6 * TOKENS_PER_BLOCK)
+    metadata = scheduler.build_connector_meta(
+        SchedulerOutput(new_requests=[request_data(1, tokens, list(range(10, 16)))])
+    )
+    assert [page.page_index for page in metadata.loads[0].pages] == [10]
+
+
+@pytest.mark.parametrize(
+    "cancel_ranges,expected_pages",
+    [
+        ([(4, 8)], [12, 13, 14]),
+        ([(4, 12)], [13, 14]),
+        ([(4, 8), (16, 20)], [12, 13]),
+        ([(16, 20), (4, 8)], [12, 13]),
+        ([(4, 20)], []),
+        ([(0, 24)], []),
+        ([(0, 4), (20, 24)], [11, 12, 13, 14]),
+        ([(8, 8)], [11, 12, 13, 14]),
+        ([(4, 5)], [12, 13, 14]),
+        ([(19, 24)], [11, 12, 13]),
+    ],
+)
+def test_scheduler_cancel_load_preserves_uncanceled_range(
+    store_config: Path,
+    cancel_ranges: list[tuple[int, int]],
+    expected_pages: list[int],
+) -> None:
+    """Cancel from either end of a nonzero-offset offer without losing its remainder."""
+    scheduler = make_scheduler(store_config, hit_blocks=4)
+    tokens = list(range(6 * TOKENS_PER_BLOCK))
+    request = make_request(1, tokens)
+    assert scheduler.get_num_new_matched_tokens(request, TOKENS_PER_BLOCK) == (16, False)
+    for start, end in cancel_ranges:
+        scheduler.cancel_load(request, start, end)
+    metadata = scheduler.build_connector_meta(
+        SchedulerOutput(new_requests=[request_data(1, tokens, list(range(10, 16)))])
+    )
+    assert [page.page_index for load in metadata.loads for page in load.pages] == expected_pages
+    # A consumed offer must not be issued again on the next iteration.
+    next_metadata = scheduler.build_connector_meta(
+        SchedulerOutput(cached_requests=[request_data(1, [], [])])
+    )
+    assert next_metadata.loads == []
+
+
+def test_scheduler_rejects_cancellation_that_splits_an_offer(store_config: Path) -> None:
+    scheduler = make_scheduler(store_config, hit_blocks=4)
+    tokens = list(range(6 * TOKENS_PER_BLOCK))
+    request = make_request(1, tokens)
+    scheduler.get_num_new_matched_tokens(request, 0)
+    with pytest.raises(ValueError, match="beginning or end"):
+        scheduler.cancel_load(request, TOKENS_PER_BLOCK, 2 * TOKENS_PER_BLOCK)
+
+
+def test_mooncake_declares_adp_support() -> None:
+    assert MooncakeStoreConnectorScheduler.supports_attention_dp
+    assert MooncakeStoreConnectorWorker.supports_attention_dp
+
+
+def test_worker_load_raises_when_a_page_is_missing_under_tensor_parallelism(
+    store_config, fake_store, monkeypatch
+):
+    """TP ranks hold shards of one page and cannot restart a request alone."""
+    monkeypatch.setattr(worker_module, "mpi_world_size", lambda: 2)
+    with make_worker(fake_store, layout=make_layout()) as worker:
+        transfers = RequestTransfers(7, [PageTransfer(b"\x00" * 16, 0, 1)])
+        worker.bind_connector_meta(SimpleNamespace(loads=[transfers], saves=[]))
+        with pytest.raises(RuntimeError, match="already"):
+            worker.start_load_kv(None)
+
+
+def test_worker_load_skips_the_rest_of_a_failed_request_and_keeps_the_others(
+    store_config, fake_store
+):
+    """Only the request that lost a page restarts; its later pages are not fetched."""
+    with make_worker(fake_store, layout=make_layout(), enable_attention_dp=True) as worker:
+        present, missing, later = (bytes([1]) * 16, bytes([2]) * 16, bytes([3]) * 16)
+        for block_hash in (present, later):
+            fake_store.objects.add(worker._namespaces[0].key(block_hash))
+        worker._batch_size = 2
+        loads = [
+            RequestTransfers(7, [PageTransfer(present, 0, 1)]),
+            RequestTransfers(8, [PageTransfer(missing, 0, 2), PageTransfer(later, 0, 3)]),
+        ]
+        worker.bind_connector_meta(SimpleNamespace(loads=loads, saves=[]))
+        worker.start_load_kv(None)
+        assert worker.take_failed_load_requests() == {8}
+        fetched = [key for keys, _addresses, _sizes in fake_store.get_calls for key in keys]
+        assert worker._namespaces[0].key(later) not in fetched
+        assert worker._namespaces[0].key(present) in fetched
+
+
+def test_staging_scatters_only_the_pages_that_landed(store_config, fake_store, staged_copies):
+    """In a mixed batch the filled slots reach their pages, the failed one does not."""
+    layout = make_layout()
+    with make_staged_worker(fake_store, store_config, layout=layout) as worker:
+        good, bad = bytes([0x0A]) * 16, bytes([0x0B]) * 16
+        fake_store.objects.add(worker._namespaces[0].key(good))
+        fake_store.objects.add(worker._namespaces[0].key(bad))
+        fake_store.fail_gets_for.add(worker._namespaces[0].key(bad))
+        loads = [
+            RequestTransfers(7, [PageTransfer(good, 0, 1)]),
+            RequestTransfers(8, [PageTransfer(bad, 0, 2)]),
+        ]
+        worker.bind_connector_meta(SimpleNamespace(loads=loads, saves=[]))
+        worker.start_load_kv(None)
+        assert worker.take_failed_load_requests() == {8}
+        good_addresses, _sizes = worker._addressing.buffers(0, 1)
+        assert [dst for dst, _src, _size in staged_copies] == list(good_addresses)
+
+
+def test_worker_failed_load_drops_that_requests_saves_from_the_pass(store_config, fake_store):
+    """A mixed batch: the request that lost a page must not publish its scheduled tail.
+
+    `build_connector_meta` bound the saves of every scheduled request before the
+    load ran. The failed request leaves the batch without computing anything, so
+    only the surviving request's saves may reach `wait_for_save`.
+    """
+    with make_worker(fake_store, layout=make_layout(), enable_attention_dp=True) as worker:
+        present, missing = bytes([1]) * 16, bytes([2]) * 16
+        tail_ok, tail_failed = bytes([3]) * 16, bytes([4]) * 16
+        fake_store.objects.add(worker._namespaces[0].key(present))
+        loads = [
+            RequestTransfers(7, [PageTransfer(present, 0, 1)]),
+            RequestTransfers(8, [PageTransfer(missing, 0, 2)]),
+        ]
+        saves = [
+            RequestTransfers(7, [PageTransfer(tail_ok, 0, 3)]),
+            RequestTransfers(8, [PageTransfer(tail_failed, 0, 4)]),
+        ]
+        metadata = SimpleNamespace(loads=loads, saves=saves)
+        worker.bind_connector_meta(metadata)
+        worker.start_load_kv(None)
+        assert worker.take_failed_load_requests() == {8}
+        # What `wait_for_save` will hand to the save thread after the pass:
+        assert [transfers.request_id for transfers in worker.get_connector_meta().saves] == [7]
+        assert metadata.saves is worker.get_connector_meta().saves  # edited in place
+        assert 8 not in worker._outstanding_saves
+        # Dropping a request that has nothing bound leaves the survivor alone.
+        assert worker.drop_bound_saves([9]) == 0
+        assert [transfers.request_id for transfers in metadata.saves] == [7]
+
+
+def test_worker_drops_bound_saves_of_a_restarted_request_even_when_it_was_the_whole_batch(
+    store_config, fake_store
+):
+    """An attention-DP owner whose only request failed runs a dummy forward: no saves at all."""
+    with make_worker(fake_store, layout=make_layout(), enable_attention_dp=True) as worker:
+        missing, tail = bytes([2]) * 16, bytes([4]) * 16
+        metadata = SimpleNamespace(
+            loads=[RequestTransfers(8, [PageTransfer(missing, 0, 2)])],
+            saves=[RequestTransfers(8, [PageTransfer(tail, 0, 4)])],
+        )
+        worker.bind_connector_meta(metadata)
+        worker.start_load_kv(None)
+        assert worker.take_failed_load_requests() == {8}
+        assert metadata.saves == []
+        # With nothing bound to save, the post-pass handoff is a no-op.
+        worker.wait_for_save(None)
+        assert worker._save_queue.empty()
+        assert not worker._outstanding_saves
+        # A second drop is harmless, as is dropping an unknown request.
+        assert worker.drop_bound_saves([8, 9]) == 0
+
+
+def set_store_options(store_config: Path, **options) -> None:
+    """Update keys of the rendered client config."""
+    raw = json.loads(store_config.read_text())
+    raw.update(options)
+    store_config.write_text(json.dumps(raw))
+
+
+def enable_async_load(store_config: Path, workers: int | None = None) -> None:
+    """Turn on `async_load` in the rendered client config."""
+    options = {"async_load": True}
+    if workers is not None:
+        options["async_load_workers"] = workers
+    set_store_options(store_config, **options)
+
+
+def wait_async_idle(worker: MooncakeStoreConnectorWorker, timeout: float = 5.0) -> None:
+    """Block until the load thread has drained every queued request."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        with worker._load_lock:
+            if not worker._async_pending:
+                return
+        time.sleep(0.005)
+    raise AssertionError("the asynchronous load did not finish in time")
+
+
+def test_config_async_load_defaults_off_and_reads_the_json(store_config):
+    assert MooncakeStoreConnectorConfig.from_file(str(store_config)).async_load is False
+    enable_async_load(store_config)
+    assert MooncakeStoreConnectorConfig.from_file(str(store_config)).async_load is True
+
+
+def test_worker_has_no_load_thread_by_default(store_config, fake_store):
+    with make_worker(fake_store, layout=make_layout()) as worker:
+        assert worker._load_threads == []
+        assert worker._async_stagings == []
+        with pytest.raises(RuntimeError, match="not enabled"):
+            worker.start_async_load(1, RequestTransfers(1, []))
+        # Without asynchronous offers a parked id is echoed straight back.
+        assert worker.get_finished([], [5]) == ([], [5])
+
+
+def test_worker_rejects_async_load_under_tensor_parallelism(store_config, fake_store, monkeypatch):
+    enable_async_load(store_config)
+    monkeypatch.setattr(worker_module, "mpi_world_size", lambda: 2)
+    with pytest.raises(NotImplementedError, match="attention DP"):
+        MooncakeStoreConnectorWorker(make_llm_args())
+
+
+def test_worker_async_load_is_reported_once_the_runtime_announces_it(store_config, fake_store):
+    """A landed load waits for the runtime to say it parked the request."""
+    enable_async_load(store_config)
+    layout = make_layout()
+    with make_worker(fake_store, layout=layout, enable_attention_dp=True) as worker:
+        assert len(worker._load_threads) == 1
+        block_hash = b"\x05" * 16
+        fake_store.objects.add(worker._namespaces[0].key(block_hash))
+
+        worker.start_async_load(7, RequestTransfers(7, [PageTransfer(block_hash, 0, 2)]))
+        wait_async_idle(worker)
+
+        # Landed, but not announced: nothing to report yet.
+        assert worker.get_finished([], []) == ([], [])
+        assert worker.get_finished([], [7]) == ([], [7])
+        assert worker.take_failed_async_load_requests() == set()
+        # Reported once only.
+        assert worker.get_finished([], []) == ([], [])
+
+        (keys, addresses, sizes) = fake_store.get_calls[0]
+        expected_addresses, expected_sizes = PageAddressing(layout).buffers(0, 2)
+        assert keys == [worker._namespaces[0].key(block_hash)]
+        assert addresses == [expected_addresses]
+        assert sizes == [expected_sizes]
+
+
+def test_worker_async_load_announced_first_waits_for_the_pages(store_config, fake_store):
+    """The runtime is never told a load finished while its bytes are in flight."""
+    enable_async_load(store_config)
+    with make_worker(fake_store, layout=make_layout(), enable_attention_dp=True) as worker:
+        block_hash = b"\x06" * 16
+        fake_store.objects.add(worker._namespaces[0].key(block_hash))
+        gate = threading.Event()
+        original = fake_store.batch_get_into_multi_buffers
+
+        def gated(*args, **kwargs):
+            assert gate.wait(5.0)
+            return original(*args, **kwargs)
+
+        fake_store.batch_get_into_multi_buffers = gated
+        worker.start_async_load(7, RequestTransfers(7, [PageTransfer(block_hash, 0, 1)]))
+        assert worker.get_finished([], [7]) == ([], [])
+        gate.set()
+        wait_async_idle(worker)
+        assert worker.get_finished([], []) == ([], [7])
+        assert worker.take_failed_async_load_requests() == set()
+
+
+def test_worker_async_load_failure_is_handed_to_the_executor(store_config, fake_store):
+    """A missing page still releases the parked request, marked for a restart."""
+    enable_async_load(store_config)
+    with make_worker(fake_store, layout=make_layout(), enable_attention_dp=True) as worker:
+        present, missing, later = (bytes([1]) * 16, bytes([2]) * 16, bytes([3]) * 16)
+        for block_hash in (present, later):
+            fake_store.objects.add(worker._namespaces[0].key(block_hash))
+        # One page per store call, so the page after the missing one is a
+        # separate batch the loader can skip.
+        worker._async_batch_size = 1
+        transfers = RequestTransfers(
+            8,
+            [PageTransfer(present, 0, 1), PageTransfer(missing, 0, 2), PageTransfer(later, 0, 3)],
+        )
+        worker.start_async_load(8, transfers)
+        wait_async_idle(worker)
+
+        assert worker.get_finished([], [8]) == ([], [8])
+        assert worker.take_failed_async_load_requests() == {8}
+        # Cleared on return.
+        assert worker.take_failed_async_load_requests() == set()
+        # The pages after the missing one were not fetched: the request restarts.
+        fetched = [key for keys, _addresses, _sizes in fake_store.get_calls for key in keys]
+        assert worker._namespaces[0].key(later) not in fetched
+
+
+def test_worker_async_load_with_nothing_to_load_completes_at_once(store_config, fake_store):
+    enable_async_load(store_config)
+    with make_worker(fake_store, layout=make_layout(), enable_attention_dp=True) as worker:
+        worker.start_async_load(9, RequestTransfers(9, []))
+        assert worker.get_finished([], [9]) == ([], [9])
+        assert worker.take_failed_async_load_requests() == set()
+        assert fake_store.get_calls == []
+
+
+def test_worker_restarts_a_parked_request_it_was_never_handed(store_config, fake_store):
+    """An announced request with no load behind it must not stay parked."""
+    enable_async_load(store_config)
+    with make_worker(fake_store, layout=make_layout(), enable_attention_dp=True) as worker:
+        assert worker.get_finished([], [11]) == ([], [11])
+        assert worker.take_failed_async_load_requests() == {11}
+
+
+class FakeAsyncWorker(FakeWorker):
+    """A lookup service that also records the loads handed to the load thread."""
+
+    def __init__(self, hit_blocks=0):
+        super().__init__(hit_blocks)
+        self.async_loads = []
+        self.failed_async_loads = []
+
+    def start_async_load(self, request_id, transfers):
+        self.async_loads.append((request_id, transfers))
+
+    def fail_async_load(self, request_id):
+        self.failed_async_loads.append(request_id)
+
+
+def make_async_scheduler(store_config: Path, hit_blocks: int) -> MooncakeStoreConnectorScheduler:
+    enable_async_load(store_config)
+    scheduler = MooncakeStoreConnectorScheduler(make_llm_args(enable_attention_dp=True))
+    scheduler._worker = FakeAsyncWorker(hit_blocks)
+    return scheduler
+
+
+def test_scheduler_offers_asynchronously_when_enabled(store_config):
+    scheduler = make_async_scheduler(store_config, hit_blocks=2)
+    request = make_request(1, list(range(5 * TOKENS_PER_BLOCK)))
+    assert scheduler.get_num_new_matched_tokens(request, 0) == (2 * TOKENS_PER_BLOCK, True)
+    # A miss is never asynchronous: there would be nothing to wait for.
+    scheduler._worker.hit_blocks = 0
+    request = make_request(2, list(range(5 * TOKENS_PER_BLOCK)))
+    assert scheduler.get_num_new_matched_tokens(request, 0) == (0, False)
+
+
+def test_scheduler_rejects_async_load_under_tensor_parallelism(store_config):
+    enable_async_load(store_config)
+    llm_args = make_llm_args()
+    llm_args.tensor_parallel_size = 2
+    with pytest.raises(NotImplementedError, match="attention DP"):
+        MooncakeStoreConnectorScheduler(llm_args)
+
+
+def test_scheduler_starts_the_async_load_when_the_pages_are_reported(store_config):
+    """The offer goes to the load thread with the pages the runtime reserved."""
+    scheduler = make_async_scheduler(store_config, hit_blocks=2)
+    tokens = list(range(5 * TOKENS_PER_BLOCK))
+    request = make_request(1, tokens)
+    assert scheduler.get_num_new_matched_tokens(request, 0) == (2 * TOKENS_PER_BLOCK, True)
+
+    scheduler.update_state_after_alloc_by_layer_group(request, [[10, 11, 12, 13, 14]])
+
+    ((request_id, transfers),) = scheduler._worker.async_loads
+    state = scheduler._requests[1]
+    assert request_id == 1
+    assert [(page.layer_group_id, page.page_index) for page in transfers.pages] == [
+        (0, 10),
+        (0, 11),
+    ]
+    assert [page.block_hash for page in transfers.pages] == list(state.chain.hashes[:2])
+
+    # The offer is consumed: the request comes back as a new scheduler-output
+    # entry once its load landed, issues no synchronous load, and does not
+    # write the stored blocks back.
+    output = SchedulerOutput(
+        new_requests=[
+            request_data(
+                1,
+                tokens,
+                [10, 11, 12, 13, 14],
+                computed_position=2 * TOKENS_PER_BLOCK,
+                num_scheduled_tokens=3 * TOKENS_PER_BLOCK,
+            )
+        ]
+    )
+    metadata = scheduler.build_connector_meta(output)
+    assert metadata.loads == []
+    assert [page.page_index for page in metadata.saves[0].pages] == [12, 13, 14]
+    # Handed over once only.
+    assert len(scheduler._worker.async_loads) == 1
+
+
+def test_scheduler_async_load_stops_at_the_pages_the_runtime_reserved(store_config):
+    scheduler = make_async_scheduler(store_config, hit_blocks=3)
+    request = make_request(1, list(range(6 * TOKENS_PER_BLOCK)))
+    scheduler.get_num_new_matched_tokens(request, 0)
+    # An accepted three-block offer cannot complete with only two destinations.
+    scheduler.update_state_after_alloc_by_layer_group(request, [[20, 21]])
+    assert scheduler._worker.async_loads == []
+    assert scheduler._worker.failed_async_loads == [request.request_id]
+
+
+def test_scheduler_async_flat_alloc_is_a_single_group(store_config):
+    scheduler = make_async_scheduler(store_config, hit_blocks=1)
+    request = make_request(1, list(range(4 * TOKENS_PER_BLOCK)))
+    scheduler.get_num_new_matched_tokens(request, 0)
+    scheduler.update_state_after_alloc(request, [30, 31, 32, 33])
+    ((_request_id, transfers),) = scheduler._worker.async_loads
+    assert [(page.layer_group_id, page.page_index) for page in transfers.pages] == [(0, 30)]
+
+
+def test_scheduler_alloc_hooks_stay_no_ops_for_synchronous_loads(store_config):
+    scheduler = make_scheduler(store_config, hit_blocks=2)
+    tokens = list(range(5 * TOKENS_PER_BLOCK))
+    request = make_request(1, tokens)
+    scheduler.get_num_new_matched_tokens(request, 0)
+    # The synchronous worker has no `start_async_load`; the hooks must not reach for it.
+    scheduler.update_state_after_alloc_by_layer_group(request, [[10, 11, 12, 13, 14]])
+    scheduler.update_state_after_alloc(request, [10, 11, 12, 13, 14])
+    output = SchedulerOutput(new_requests=[request_data(1, tokens, [10, 11, 12, 13, 14])])
+    metadata = scheduler.build_connector_meta(output)
+    assert [page.page_index for page in metadata.loads[0].pages] == [10, 11]
+
+
+def test_config_async_load_workers_defaults_to_one_and_rejects_zero(store_config):
+    assert MooncakeStoreConnectorConfig.from_file(str(store_config)).async_load_workers == 1
+    set_store_options(store_config, async_load_workers=3)
+    assert MooncakeStoreConnectorConfig.from_file(str(store_config)).async_load_workers == 3
+    set_store_options(store_config, async_load_workers=0)
+    with pytest.raises(ValueError, match="async_load_workers"):
+        MooncakeStoreConnectorConfig.from_file(str(store_config))
+
+
+def test_worker_pool_default_is_one_worker_with_the_full_staging(
+    store_config, fake_store, staged_copies
+):
+    """N=1 keeps the previous behaviour: one thread, one pool, the sync slot count."""
+    enable_async_load(store_config)
+    layout = make_layout(regions_per_group=2)
+    page_bytes = PageAddressing(layout).bytes_per_page(0)
+    with make_staged_worker(
+        fake_store, store_config, layout=layout, budget=8 * page_bytes, enable_attention_dp=True
+    ) as worker:
+        assert len(worker._load_threads) == 1
+        assert len(worker._async_stagings) == 1
+        assert worker._async_stagings[0].num_slots == worker._load_staging.num_slots
+        assert worker._async_batch_size == worker._batch_size
+
+
+def test_worker_pool_splits_the_staging_budget_without_exceeding_it(
+    store_config, fake_store, staged_copies
+):
+    layout = make_layout(regions_per_group=2)
+    page_bytes = PageAddressing(layout).bytes_per_page(0)
+    # 512 pages of budget across 4 workers -> 128 slots each, batch narrowed to 128.
+    enable_async_load(store_config, workers=4)
+    set_store_options(store_config, transfer_batch_size=256)
+    with make_staged_worker(
+        fake_store, store_config, layout=layout, budget=512 * page_bytes, enable_attention_dp=True
+    ) as worker:
+        assert [pool.num_slots for pool in worker._async_stagings] == [128] * 4
+        assert worker._async_batch_size == 128
+        # The synchronous path keeps the whole budget.
+        assert worker._batch_size == 256
+    fake_store.registered.clear()
+    # 8 pages of budget across 2 workers stays at 4 slots each.
+    enable_async_load(store_config, workers=2)
+    set_store_options(store_config, transfer_batch_size=16)
+    with make_staged_worker(
+        fake_store, store_config, layout=layout, budget=8 * page_bytes, enable_attention_dp=True
+    ) as worker:
+        assert [pool.num_slots for pool in worker._async_stagings] == [4, 4]
+        assert worker._async_batch_size == 4
+
+
+def test_worker_pool_loads_two_requests_concurrently(store_config, fake_store):
+    """Two workers transfer at the same time; each request is handled once."""
+    enable_async_load(store_config, workers=2)
+    with make_worker(fake_store, layout=make_layout(), enable_attention_dp=True) as worker:
+        assert len(worker._load_threads) == 2
+        hashes = [bytes([0x21]) * 16, bytes([0x22]) * 16]
+        for block_hash in hashes:
+            fake_store.objects.add(worker._namespaces[0].key(block_hash))
+        # Both workers must be inside the store call at once, or this times out.
+        rendezvous = threading.Barrier(2, timeout=5.0)
+        original = fake_store.batch_get_into_multi_buffers
+
+        def meet_then_get(*args, **kwargs):
+            rendezvous.wait()
+            return original(*args, **kwargs)
+
+        fake_store.batch_get_into_multi_buffers = meet_then_get
+        worker.start_async_load(7, RequestTransfers(7, [PageTransfer(hashes[0], 0, 1)]))
+        worker.start_async_load(8, RequestTransfers(8, [PageTransfer(hashes[1], 0, 2)]))
+        wait_async_idle(worker)
+
+        _saving, finished = worker.get_finished([], [7, 8])
+        assert sorted(finished) == [7, 8]
+        assert worker.take_failed_async_load_requests() == set()
+        fetched = [key for keys, _addresses, _sizes in fake_store.get_calls for key in keys]
+        assert sorted(fetched) == sorted(worker._namespaces[0].key(h) for h in hashes)
+
+
+def test_worker_pool_keeps_failure_and_success_apart(store_config, fake_store):
+    enable_async_load(store_config, workers=2)
+    with make_worker(fake_store, layout=make_layout(), enable_attention_dp=True) as worker:
+        good, bad = bytes([0x31]) * 16, bytes([0x32]) * 16
+        fake_store.objects.add(worker._namespaces[0].key(good))
+        for request_id, block_hash, page in ((7, good, 1), (8, bad, 2), (9, good, 3)):
+            worker.start_async_load(
+                request_id, RequestTransfers(request_id, [PageTransfer(block_hash, 0, page)])
+            )
+        wait_async_idle(worker)
+        _saving, finished = worker.get_finished([], [7, 8, 9])
+        assert sorted(finished) == [7, 8, 9]
+        assert worker.take_failed_async_load_requests() == {8}
+
+
+def test_worker_pool_stats_line_summarises_the_interval(store_config, fake_store, monkeypatch):
+    enable_async_load(store_config, workers=2)
+    with make_worker(fake_store, layout=make_layout(), enable_attention_dp=True) as worker:
+        # Idle and nothing completed: no line, even when forced.
+        assert worker._maybe_log_async_stats(force=True) is None
+
+        good, bad = bytes([0x41]) * 16, bytes([0x42]) * 16
+        fake_store.objects.add(worker._namespaces[0].key(good))
+        worker.start_async_load(7, RequestTransfers(7, [PageTransfer(good, 0, 1)]))
+        worker.start_async_load(8, RequestTransfers(8, [PageTransfer(bad, 0, 2)]))
+        wait_async_idle(worker)
+
+        lines = []
+        monkeypatch.setattr(worker_module.logger, "info", lambda message: lines.append(message))
+        # Not due yet: the interval gates the line.
+        assert worker._maybe_log_async_stats() is None
+        line = worker._maybe_log_async_stats(force=True)
+        assert line is not None and lines == [line]
+        assert line.startswith("mooncake-store async-load stats: rank 0 workers 2 ")
+        assert "completed=2" in line and "failed_pages=1" in line and "queue=0 active=0" in line
+        # The counters reset after a line.
+        assert "completed=0" in worker._format_async_stats()

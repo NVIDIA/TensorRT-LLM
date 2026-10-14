@@ -16,7 +16,7 @@
 import enum
 import os
 from collections import Counter
-from typing import Callable, Optional
+from typing import TYPE_CHECKING, Callable, Optional
 
 from tensorrt_llm.llmapi.llm_args import CapacitySchedulerPolicy, ContextChunkingPolicy
 from tensorrt_llm.logger import logger
@@ -37,6 +37,10 @@ from .scheduler import (
     _is_forced_context_chunk_boundary,
     drop_decoder_context_requests_waiting_for_encoder_output,
 )
+
+
+if TYPE_CHECKING:
+    from ..kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 
 
 class ScheduleAction(enum.Enum):
@@ -239,6 +243,38 @@ class KVCacheV2Scheduler(RequestScheduler):
             self.chunking_policy = ctx_chunk_config[0]
             self.chunk_unit_size = ctx_chunk_config[1]
 
+        # Only owner-local, reservation-bounded loads may bypass compute admission.
+        kv_cache_manager._scheduler_async_load_admission = False
+        self.num_async_loads_admitted = 0
+        if os.environ.get("TRTLLM_MOONCAKE_EARLY_ADMISSION", "0") == "1":
+            connector = kv_cache_manager.kv_connector_manager
+            conditions = {
+                "max_utilization": self.policy == CapacitySchedulerPolicy.MAX_UTILIZATION,
+                "chunked": self.chunking_enabled,
+                "prefix_aware": enable_prefix_aware_scheduling,
+                "no_separate_draft": draft_kv_cache_manager is None,
+                "no_cross_cache": cross_kv_cache_manager is None,
+                "no_peft": peft_cache_manager is None,
+                "no_helix_cp": not self.has_cp_helix,
+                "pp1_cp1": (
+                    kv_cache_manager.mapping.pp_size == 1
+                    and kv_cache_manager.mapping.cp_size == 1
+                ),
+                "completion_reservations": bool(kv_cache_manager._disagg_completion_pool_counts),
+                "async_connector_capability": (
+                    connector is not None
+                    and connector.supports_scheduler_async_load
+                    and connector.scheduler_async_load_capacity > 0
+                    and not connector.prefix_reservations_enabled
+                ),
+            }
+            kv_cache_manager._scheduler_async_load_admission = all(conditions.values())
+            logger.info(
+                "Mooncake early async admission: "
+                f"enabled={kv_cache_manager._scheduler_async_load_admission}, "
+                f"disabled_by={[name for name, enabled in conditions.items() if not enabled]}"
+            )
+
         # State value caches for fast comparison.
         # Default range [CONTEXT_INIT, GENERATION_TO_COMPLETE) matches C++
         # MicroBatchScheduler. For encoder-decoder models, caller should pass
@@ -366,6 +402,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         disagg_candidates: RequestList = []
         scheduled_beam_width = 0
         has_chunking = False
+        self.num_async_loads_admitted = 0
 
         budget = BudgetTracker(
             self.max_num_tokens,
@@ -630,6 +667,14 @@ class KVCacheV2Scheduler(RequestScheduler):
                     break
                 if action is ScheduleAction.SKIP:
                     continue
+                if (
+                    self.kv_cache_manager._scheduler_async_load_admission
+                    and self.kv_cache_manager.try_admit_async_connector_load(req)
+                ):
+                    self.num_async_loads_admitted += 1
+                    # The load keeps its pages and full-prompt reservation but
+                    # spends no compute budget or prefix-contributor slot.
+                    continue
                 has_chunking = has_chunking or chunking_flag
                 scheduled_ctx.append(req)
                 if len(scheduled_ctx) == 1:
@@ -657,6 +702,7 @@ class KVCacheV2Scheduler(RequestScheduler):
             or evicted
             or recompute_paused
             or deferred_behind_contributor
+            or self.num_async_loads_admitted
         )
         if (
             self.remote_tail_phase is None
@@ -933,6 +979,10 @@ class KVCacheV2Scheduler(RequestScheduler):
         # V2 resizes KV cache directly in the scheduler (no separate
         # prepareResources for main cache), so include draft tokens.
         req.context_chunk_size = context_tokens
+        if not self.kv_cache_manager.reserve_context_completion(req):
+            # An admitted request owns this headroom. Let it finish instead of
+            # preempting it to make room for another prompt.
+            return ScheduleAction.SKIP, 0, False
         if not self._try_allocate_context(req, context_tokens + draft_len):
             # Out of pages. Give up one started request so this one can
             # proceed, and retry next iteration: a failed resize leaves a
@@ -1071,6 +1121,10 @@ class KVCacheV2Scheduler(RequestScheduler):
 
         # V2 resizes KV cache directly in the scheduler, so include
         # draft tokens for last chunk.
+        if not self.kv_cache_manager.reserve_context_completion(req):
+            # An admitted request owns this headroom. Let it finish instead of
+            # preempting it to make room for another prompt.
+            return ScheduleAction.SKIP, 0, False
         if not self._try_allocate_context(req, resize_tokens):
             # Out of pages, as in _try_schedule_context_full.
             if preempt_for_pages(req):
@@ -1615,6 +1669,11 @@ class KVCacheV2Scheduler(RequestScheduler):
         if not self.enable_recompute_pause:
             return False
 
+        if self.kv_cache_manager.has_pending_preemption():
+            # One victim at a time, or a full pool would preempt the whole
+            # batch while the first release is still draining.
+            return False
+
         # Newest first, so the requests closest to completing keep their
         # pages and the pool drains instead of thrashing.
         for i in range(len(requests_list) - 1, -1, -1):
@@ -1835,6 +1894,12 @@ class KVCacheV2Scheduler(RequestScheduler):
         connector = self.kv_cache_manager.kv_connector_manager
         return connector is not None and connector.has_pending_load(req)
 
+    def _connector_peer_kv_cache_managers(self) -> tuple["KVCacheManagerV2", ...]:
+        """Other V2 pools whose pages share the connector request lifetime."""
+        if self.draft_kv_cache_manager is None:
+            return ()
+        return (self.draft_kv_cache_manager,)
+
     def _is_evictable(self, req: LlmRequest, inflight_request_ids: set[int]) -> bool:
         """A started request whose KV cache is still active on GPU.
 
@@ -1884,7 +1949,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         victim, so one drains at a time and the next pass finds those pages
         instead of a second request having given up its cache for nothing.
         """
-        if not self.kv_cache_manager.preempt_request(req):
+        if not self._preempt_request(req):
             logger.debug(
                 f"[V2Scheduler] Preemption of request {req.py_request_id} "
                 "deferred until its connector saves retire"
@@ -1936,6 +2001,12 @@ class KVCacheV2Scheduler(RequestScheduler):
                 return req_it_end, True
 
         return req_it_end, False
+    def _preempt_request(self, req: LlmRequest) -> bool:
+        """Preempt target KV and include a separate draft pool when present."""
+        peers = self._connector_peer_kv_cache_managers()
+        if peers:
+            return self.kv_cache_manager.preempt_request(req, peers)
+        return self.kv_cache_manager.preempt_request(req)
 
     def _try_recompute_pause_for_gen(
         self,
