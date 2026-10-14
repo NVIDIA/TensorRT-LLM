@@ -332,6 +332,12 @@ def print_summary(rows: list[dict]) -> None:
         )
 
 
+def warmup_shape(concurrencies: list[int], concurrency: int = 0, prompts: int = 0) -> tuple[int, int]:
+    """Warmup concurrency and prompt count; 0 means the largest point and twice its prompts."""
+    con = concurrency or max(concurrencies or [16])
+    return con, prompts or 2 * con
+
+
 def num_prompts_for(concurrency: int, rounds: int | None, fixed: dict[int, int]) -> int:
     if concurrency in fixed:
         return fixed[concurrency]
@@ -363,8 +369,11 @@ def main() -> int:
     parser.add_argument("--concurrency", default="1,128", help="comma-separated points")
     parser.add_argument("--rounds", type=int, default=None, help="requests per point = concurrency x rounds")
     parser.add_argument("--num-prompts", default="", help="per-point override, e.g. 1:16,128:512")
-    parser.add_argument("--warmup-prompts", type=int, default=16)
-    parser.add_argument("--warmup-concurrency", type=int, default=16)
+    # 0 = the largest point and twice its prompts: a warmup below the largest point leaves its batch
+    # shapes (JIT kernels, autotuner tactics, mixed-step caches) to be built inside the first measured
+    # window on a fresh session -- con128 read 1.5-2.2% low there while con1 matched to 0.1%.
+    parser.add_argument("--warmup-prompts", type=int, default=0)
+    parser.add_argument("--warmup-concurrency", type=int, default=0)
     parser.add_argument("--warmup-osl", type=int, default=64)
     parser.add_argument("--tree", type=Path, default=None, help="checkout the measurement runs on (identity only)")
     parser.add_argument("--nsys", default=None, metavar="PREFIX", help="profile the server under nsys")
@@ -378,6 +387,7 @@ def main() -> int:
     args = parser.parse_args()
 
     concurrencies = [int(c) for c in args.concurrency.split(",") if c]
+    args.warmup_concurrency, args.warmup_prompts = warmup_shape(concurrencies, args.warmup_concurrency, args.warmup_prompts)
     fixed = {}
     for item in filter(None, args.num_prompts.split(",")):
         con, _, n = item.partition(":")
