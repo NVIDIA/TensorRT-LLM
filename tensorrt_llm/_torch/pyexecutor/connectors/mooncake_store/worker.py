@@ -19,8 +19,9 @@ between that pool and its own GPU KV cache. It is also the only place that
 knows how a page is addressed and how a key is spelled, which is why the
 leader, colocated with rank 0's worker, asks it to run prefix lookups.
 
-Loads are synchronous: the runtime has already told the scheduler those tokens
-are computed, so a failed load is a wrong answer rather than a slow one.
+Loads are synchronous. A failed load restarts the owning context request on
+attention-DP or single-rank workers before it can read incomplete KV. Tensor
+parallel workers keep the failure fatal because a restart needs rank agreement.
 
 Saves are asynchronous and gated on a CUDA event, since the pages are complete
 only once the forward pass that wrote them has retired and blocking the
@@ -41,7 +42,7 @@ import threading
 import traceback
 from collections import defaultdict
 from queue import Queue
-from typing import Dict, List, Optional, Sequence, Set, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 import torch
 
@@ -163,6 +164,8 @@ def _stream_handle(stream: Optional[torch.cuda.Stream]) -> int:
 class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
     """Moves KV pages between this rank's GPU cache and the Mooncake pool."""
 
+    supports_attention_dp = True
+
     def __init__(self, llm_args: TorchLlmArgs):
         super().__init__(llm_args)
 
@@ -175,6 +178,9 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
         self._run_dir = pool.run_dir if pool is not None else None
         self._rank = mpi_rank()
         self._world_size = mpi_world_size()
+        enable_attention_dp = getattr(llm_args, "enable_attention_dp", False)
+        self._attention_rank = 0 if enable_attention_dp else self._rank
+        self._attention_world_size = 1 if enable_attention_dp else self._world_size
         self._model_key = self._config.resolve_model_key(llm_args.model)
 
         self._addressing: Optional[PageAddressing] = None
@@ -220,6 +226,9 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
         # Requests the runtime has told us are done producing KV. Their pages
         # stay pinned until we report them back through `get_finished`.
         self._closed_requests: Set[int] = set()
+        # Only an owner of whole pages can restart a request locally.
+        self._recover_failed_loads = bool(enable_attention_dp) or self._world_size == 1
+        self._failed_load_requests: Set[int] = set()
         # Why the save thread never reached its transfer loop, read back by
         # `register_kv_cache_layout`. A failure inside the loop is dropped
         # there instead.
@@ -300,11 +309,11 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
         for layer_group_id in addressing.layer_group_ids:
             bytes_per_page = addressing.bytes_per_page(layer_group_id)
             self._namespaces[layer_group_id] = self._namespace(
-                self._rank, layer_group_id, bytes_per_page
+                self._attention_rank, layer_group_id, bytes_per_page
             )
             self._peer_namespaces[layer_group_id] = tuple(
                 self._namespace(rank, layer_group_id, bytes_per_page)
-                for rank in range(self._world_size)
+                for rank in range(self._attention_world_size)
             )
 
         if self._config.role.saves:
@@ -374,7 +383,7 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
             namespace=self._config.namespace,
             model_key=self._model_key,
             rank=rank,
-            world_size=self._world_size,
+            world_size=self._attention_world_size,
             layer_group_id=layer_group_id,
             tokens_per_block=self._addressing.tokens_per_block,
             bytes_per_page=bytes_per_page,
@@ -447,49 +456,78 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
         metadata: Optional[MooncakeStoreMetadata] = self.get_connector_meta()
         if metadata is None or not metadata.loads:
             return
+        self._reraise_save_error()
 
         keys, addresses, sizes, total_pages = self._resolve(metadata.loads)
         if not keys:
             return
+        # `_resolve` emits one key per page in transfer order, so this is the
+        # owning request of every key.
+        owners = [entry.request_id for entry in metadata.loads for _ in entry.pages]
 
         staging = self._load_staging
         handle = _stream_handle(stream) if staging is not None else 0
+        failed_requests: Set[int] = set()
+        first_failure: Optional[str] = None
+        num_failed_pages = 0
 
-        for batch in zip(
-            _batched(keys, self._batch_size),
-            _batched(addresses, self._batch_size),
-            _batched(sizes, self._batch_size),
-        ):
-            batch_keys, batch_addresses, batch_sizes = batch
+        for start in range(0, len(keys), self._batch_size):
+            # Pages of a request that already lost one are not loaded: the
+            # request is restarted below and recomputes all of them.
+            indices = [
+                i
+                for i in range(start, min(start + self._batch_size, len(keys)))
+                if owners[i] not in failed_requests
+            ]
+            if not indices:
+                continue
+            batch_keys = [keys[i] for i in indices]
+            batch_addresses = [addresses[i] for i in indices]
+            batch_sizes = [sizes[i] for i in indices]
             if staging is None:
                 target_addresses, target_sizes = list(batch_addresses), list(batch_sizes)
             else:
                 target_addresses, target_sizes = describe_batch_for_get(staging, batch_sizes)
             results = self._store.batch_get_into_multi_buffers(
-                list(batch_keys), target_addresses, target_sizes
+                batch_keys, target_addresses, target_sizes
             )
-            failed = [
-                key
-                for key, result in zip(batch_keys, results)
-                if not isinstance(result, int) or result < 0
-            ]
-            if failed or len(results) != len(batch_keys):
-                # The runtime already counted these tokens as computed, so a
-                # partial load would leave the forward pass reading
-                # uninitialized KV and silently producing wrong tokens.
-                raise RuntimeError(
-                    f"mooncake-store failed to load {len(failed) or len(batch_keys)} of "
-                    f"{len(batch_keys)} pages; the affected KV slots were already "
-                    f"reported as computed. First failure: {failed[:1]}"
-                )
-            if staging is not None:
-                # Only reached once every page in the batch landed, so no slot
-                # holding a failed read is copied over a device page.
-                unstage_batch_after_get(staging, batch_addresses, batch_sizes, handle)
+            if len(results) != len(batch_keys):
+                results = [-1] * len(batch_keys)
+            ok = [j for j, result in enumerate(results) if isinstance(result, int) and result >= 0]
+            if len(ok) != len(batch_keys):
+                for j in range(len(batch_keys)):
+                    if j not in ok:
+                        failed_requests.add(owners[indices[j]])
+                        num_failed_pages += 1
+                        if first_failure is None:
+                            first_failure = batch_keys[j]
+                if not self._recover_failed_loads:
+                    # The runtime already counted these tokens as computed, so a
+                    # partial load leaves the forward pass reading uninitialized
+                    # KV and silently producing wrong tokens. Fail loudly instead.
+                    raise RuntimeError(
+                        f"mooncake-store failed to load {len(batch_keys) - len(ok)} of "
+                        f"{len(batch_keys)} pages; the affected KV slots were already "
+                        f"reported as computed. First failure: {first_failure!r}"
+                    )
+            if staging is not None and ok:
+                # Only slots that were filled are scattered, so a failed read is
+                # never copied over a device page.
+                unstage_batch_after_get(staging, batch_addresses, batch_sizes, handle, only=ok)
                 # The next batch reuses the slots and the forward pass reads
                 # these pages, so the scatter has to complete before either.
                 _sync_stream(handle)
 
+        if failed_requests:
+            # The executor takes these requests out of the batch and restarts
+            # them from local reuse; see `take_failed_load_requests`.
+            self.drop_bound_saves(failed_requests)
+            self._failed_load_requests.update(failed_requests)
+            logger.warning(
+                f"mooncake-store rank {self._rank} failed to load {num_failed_pages} page(s) "
+                f"for {len(failed_requests)} request(s); they are restarted without the "
+                f"offered prefix. First failure: {first_failure!r}"
+            )
         logger.debug(f"mooncake-store rank {self._rank} loaded {total_pages} pages")
 
     def wait_for_layer_load(self, layer_idx: int, stream: torch.cuda.Stream):
@@ -727,3 +765,40 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
             self.shutdown()
         except Exception:  # noqa: S110 - interpreter teardown, nothing left to report to
             pass
+
+
+    def take_failed_load_requests(self) -> Set[int]:
+        """Requests whose pages could not all be loaded in the last `start_load_kv`.
+
+        The executor drops their allocation and lets the scheduler admit them
+        again; the store is asked afresh and the lost pages are simply
+        recomputed. Cleared on return.
+        """
+        failed, self._failed_load_requests = self._failed_load_requests, set()
+        return failed
+
+
+    def drop_bound_saves(self, request_ids: Iterable[int]) -> int:
+        """Remove these requests' saves from the metadata bound for this pass.
+
+        For a request taken out of the batch after `build_connector_meta` ran
+        (a failed prefix load, a restart): its scheduled tail is never
+        computed, so none of it may be published. Edits the bound metadata in
+        place, which is the object `wait_for_save` reads. Returns the number of
+        save entries removed.
+        """
+        metadata: Optional[MooncakeStoreMetadata] = self.get_connector_meta()
+        if metadata is None or not metadata.saves:
+            return 0
+        drop = set(request_ids)
+        saves = metadata.saves
+        kept = [transfers for transfers in saves if transfers.request_id not in drop]
+        removed = len(saves) - len(kept)
+        if removed:
+            dropped_ids = sorted({transfers.request_id for transfers in saves} & drop)
+            saves[:] = kept
+            logger.debug(
+                f"mooncake-store rank {self._rank} dropped the saves of requests "
+                f"{dropped_ids} ({removed} entr{'y' if removed == 1 else 'ies'}) from this pass"
+            )
+        return removed

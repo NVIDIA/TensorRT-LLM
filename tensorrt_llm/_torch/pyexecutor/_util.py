@@ -2912,6 +2912,26 @@ class KvCacheCreator:
                 kv_cache_config_override=draft_build_kv_cache_config,
                 cold_page_codec_provider=cold_page_codec_provider)
 
+        if (not estimating_kv_cache and self._is_disagg
+                and self._kv_connector_manager is None
+                and self._speculative_config is not None
+                and self._speculative_config.spec_dec_mode.is_mtp_one_model()):
+            # The cache transceiver transfers only the target pool. Connector
+            # layouts can explicitly transfer paired target and draft pools.
+            if draft_kv_cache_manager is not None:
+                raise RuntimeError(
+                    "Disaggregated MTP with a cache transceiver requires the "
+                    "MTP layers in the target KV pool.")
+            if self._mapping.is_last_pp_rank():
+                mtp_layer = self._model_engine.model.model_config.pretrained_config.num_hidden_layers
+                layer_map = getattr(kv_cache_manager, "layer_offsets", None)
+                local_layers = (list(layer_map) if layer_map is not None else
+                                list(getattr(kv_cache_manager, "pp_layers", [])))
+                if local_layers and mtp_layer not in local_layers:
+                    raise RuntimeError(
+                        f"Disaggregated MTP layer {mtp_layer} is missing from "
+                        f"the target KV pool (local layers: {local_layers}).")
+
         # Encoder-decoder cross-attention pool
         cross_kv_cache_manager = None
         if cross_kv_cache_config is not None:

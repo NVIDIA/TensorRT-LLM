@@ -20,6 +20,7 @@ from unittest.mock import MagicMock
 import cloudpickle
 import mpi4py
 import pytest
+from mpi4py.futures import MPIPoolExecutor
 
 from tensorrt_llm import mpi_rank
 from tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector import (
@@ -60,7 +61,7 @@ def test_connector_manager_get_finished_allgather(mpi_pool_executor):
 
         manager = KvCacheConnectorManager(worker, scheduler=scheduler)
 
-        req = MagicMock()
+        req = MagicMock(is_dummy_request=False)
 
         req.request_id = 42
 
@@ -113,7 +114,7 @@ def test_connector_manager_num_matched_tokens(mpi_pool_executor):
 
         manager = KvCacheConnectorManager(worker, scheduler=scheduler)
 
-        req = MagicMock()
+        req = MagicMock(is_dummy_request=False)
 
         req.request_id = 42
         req.is_generation_only_request = False
@@ -143,11 +144,11 @@ def test_connector_manager_take_scheduled_requests(mpi_pool_executor):
 
         scheduled_requests = ScheduledRequests()
 
-        req0 = MagicMock()
+        req0 = MagicMock(is_dummy_request=False)
         req0.request_id = 0
         req0.is_generation_only_request = False
 
-        req1 = MagicMock()
+        req1 = MagicMock(is_dummy_request=False)
         req1.request_id = 1
         req1.is_generation_only_request = False
 
@@ -342,7 +343,7 @@ def test_scheduler_output_num_scheduled_tokens_with_mtp():
     kv_cache_manager.commit_and_get_block_hashes.return_value = []
 
     # Create a mock request in generation state with draft tokens
-    req = MagicMock()
+    req = MagicMock(is_dummy_request=False)
     req.request_id = 42
     req.state = LlmRequestState.GENERATION_IN_PROGRESS
     req.get_tokens.return_value = [1, 2, 3, 4, 5]  # 5 tokens already generated
@@ -381,7 +382,7 @@ def test_scheduler_output_block_hashes_read_through():
     # one full block whose hash has just been committed by the manager.
     kv_cache_manager.commit_and_get_block_hashes.side_effect = [[], [12345]]
 
-    req = MagicMock()
+    req = MagicMock(is_dummy_request=False)
     req.request_id = 42
     req.state = LlmRequestState.GENERATION_IN_PROGRESS
     req.py_draft_tokens = []

@@ -16,7 +16,7 @@ The KV Cache Connector is designed to support a variety of advanced serving scen
 
 The connector architecture is split into two main components:
 
-* **Scheduler (Leader)**: Responsible for orchestration. It decides *what* needs to be loaded or saved and builds metadata instructions. It runs only on the leader rank (rank 0).
+* **Scheduler (Leader)**: Responsible for orchestration. It decides *what* needs to be loaded or saved and builds metadata instructions. It runs on the leader rank (rank 0), or once per request-owning rank when both connector classes declare `supports_attention_dp = True`.
 * **Worker**: Responsible for execution. It receives metadata from the scheduler and performs the actual data transfers (loading/saving) on the KV cache tensors. It runs on all ranks.
 
 ### API Reference
@@ -193,7 +193,7 @@ following configuration limits at bring-up.
 
 | Configuration | Mechanism |
 |---|---|
-| Speculative decoding | Rejected draft tokens shrink a request's page list, and the freed slot goes to whichever request allocates next. The connector is never told the tail block moved. |
+| Speculative generation | Rejected draft tokens shrink a request's page list, and the freed slot goes to whichever request allocates next. The connector is never told the tail block moved. |
 | A capacity scheduler policy other than `GUARANTEED_NO_EVICT` with KV cache manager V1 | V1 does not reset the connector block delta when a request is destroyed and replayed. V2 resets that state and permits replay; an active connector load retains its allocation until completion. |
 | A host or disk cache tier | Tier eviction reassigns the GPU slot. See [KV cache tiers are GPU-only under a connector](#kv-cache-tiers-are-gpu-only-under-a-connector). |
 
@@ -487,7 +487,7 @@ settings. A `capacity` server keeps both as configured.
 Checked at startup, before any request is admitted, because each one's failure mode is KV replayed
 without all of the state it was computed with — a wrong answer rather than a slow one.
 
-Beyond beam search, attention data parallelism, speculative decoding and Mamba/hybrid models, which
+Beyond beam search, speculative generation and Mamba/hybrid models, which
 are rejected for [every connector](#a-page-slot-must-not-be-reassigned-underneath-the-connector),
 this one also rejects KV cache manager V1, context parallelism, pipeline parallelism,
 sliding-window attention, and `sparse_attention_config` with an index-V cache unless
@@ -500,3 +500,17 @@ Every page passes through a pinned host buffer. `stage_through_host` defaults to
 only supported value today, so `false` is ignored with a warning; registering the KV pools with
 Mooncake instead is planned for a later release. Staging costs a copy each way and needs no
 GPUDirect RDMA. A `capacity` server stages nothing, holding no KV in the pool.
+
+### Attention DP and MTP context reuse
+
+The Mooncake connector supports attention data parallelism with PP=1 and CP=1. Each owner schedules, transfers, and completes its own requests. Owners hold complete attention KV pages and share a single attention-shard namespace; ordinary tensor-parallel lookup still requires every shard.
+
+MTP reuse is supported for EAGLE-style context-only requests with KV cache manager V2, a unified target/draft pool, and a configured cache transceiver. Every layout group must be present before a prefix is offered. Separate target/draft pools are rejected until joint completion reservations and atomic paired allocation are supported. Vanilla MTP is rejected because its internal chunk boundaries do not yet produce draft KV equivalent to unchunked prefill. Speculative generation remains unsupported because rejection can invalidate append-only page deltas.
+
+The content hash includes the draft prompt lookahead and only completed full blocks are published. Local reuse is aligned to whole blocks after draft backoff. Completion reservations protect admitted context work. The key format is versioned; entries written with the previous format are cold misses. Cache salts, multimodal content identities, LoRA bypass, and the explicit `model_key` requirement continue to apply.
+
+These features use the existing `kv_connector_config.mooncake_store` pool/role interface; no old benchmark configuration fields are required.
+
+### Evicted-prefix recovery
+
+A Mooncake page may disappear between lookup and load. An attention-DP owner or a single-rank worker restarts the affected context request before forward execution, releases its target/draft allocations, and repeats lookup from local reuse. Only successfully loaded staging slots are copied to GPU memory. Saves belonging to the failed request are removed from the bound pass before its pages are released. Other requests in the batch continue. Tensor-parallel load failures remain fatal because shards cannot restart independently.
