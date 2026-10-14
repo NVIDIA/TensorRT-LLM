@@ -203,6 +203,7 @@ class DecoderCudaGraphs:
         dynamic_draft_len_mapping: dict[int, int] | None,
         lora: LoraParamBuilder,
         forward_warmup: ForwardWarmup,
+        torch_compile_bypass: Callable[[], contextlib.AbstractContextManager[None]],
         context_promotion_supported: bool,
     ) -> None:
         self.cuda_graph_runner = cuda_graph_runner
@@ -220,6 +221,7 @@ class DecoderCudaGraphs:
         self._dynamic_draft_len_mapping = dynamic_draft_len_mapping
         self._lora = lora
         self._forward_warmup = forward_warmup
+        self._torch_compile_bypass = torch_compile_bypass
         # Promoted context rows carry no per-sequence extra model inputs.
         self._context_promotion_supported = context_promotion_supported
         self._force_lora_graph_for_capture: bool | None = None
@@ -537,9 +539,14 @@ class DecoderCudaGraphs:
         else:
             needs_capture = self.cuda_graph_runner.needs_capture(key)
             if needs_capture:
+
+                def capture_model(model_inputs: dict[str, Any]) -> Any:
+                    with self._torch_compile_bypass():
+                        return run_model(model_inputs)
+
                 capture_outputs = self.cuda_graph_runner.capture(
                     key,
-                    run_model,
+                    capture_model,
                     inputs,
                     enable_spec_decode=enable_spec_decode,
                     postprocess_fn=postprocess_inputs,

@@ -256,7 +256,7 @@ class SOLCuTeDSLAttention(AttentionBackend):
         """Whether the sparse kernel applies to this particular call.
 
         Everything false here is delegated (see ``_delegate``). Deciding it from the
-        tensors, per call, is deliberate, and it is why ``modules/attention.py``
+        tensors, per call, is deliberate, and it is why ``attention/attention.py``
         has no ``SEPARATE_QKV`` rule for SOL: ``qkv_mode`` describes how
         Q/K/V are *projected*, not whether K/V come from another sequence, so a
         construction-time rule keyed on it mistakes self-attention for

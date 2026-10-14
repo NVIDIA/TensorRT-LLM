@@ -247,6 +247,7 @@ class DecoderWarmup:
         graphs: DecoderCudaGraphs,
         inputs: DecoderInputPreparer,
         forward_warmup: ForwardWarmup,
+        torch_compile_bypass: Callable[[], contextlib.AbstractContextManager[None]],
         context_warmups_supported: bool,
         eager_workspace_reclaimable: bool,
     ) -> None:
@@ -265,6 +266,7 @@ class DecoderWarmup:
         self._graphs = graphs
         self._inputs = inputs
         self._forward_warmup = forward_warmup
+        self._torch_compile_bypass = torch_compile_bypass
         # Warmups that synthesize context batches.
         self._context_warmups_supported = context_warmups_supported
         self._eager_workspace_reclaimable = eager_workspace_reclaimable
@@ -386,8 +388,11 @@ class DecoderWarmup:
             self._prewarm_cute_dsl_indexer_q()
         log_mem_snapshot("warmup/after_cute_dsl_indexer_q")
         if self._context_warmups_supported:
-            with self._warmup_timer.phase(
-                "attention_jit", metrics=self._metrics, metric_name="attention_warmup_seconds"
+            with (
+                self._warmup_timer.phase(
+                    "attention_jit", metrics=self._metrics, metric_name="attention_warmup_seconds"
+                ),
+                self._torch_compile_bypass(),
             ):
                 self._run_attention_warmup(resource_manager, can_run_general_warmup)
 
@@ -415,8 +420,11 @@ class DecoderWarmup:
         # Helix CP is decode-only and runs into issues with the
         # autotuner warmup's context requests.
         if self._context_warmups_supported and not self.mapping.has_cp_helix():
-            with self._warmup_timer.phase(
-                "autotuner", metrics=self._metrics, metric_name="autotuner_warmup_seconds"
+            with (
+                self._warmup_timer.phase(
+                    "autotuner", metrics=self._metrics, metric_name="autotuner_warmup_seconds"
+                ),
+                self._torch_compile_bypass(),
             ):
                 self._run_autotuner_warmup(resource_manager)
             log_mem_snapshot("warmup/after_autotuner")
@@ -425,8 +433,11 @@ class DecoderWarmup:
             # since MambaHybridCacheManager skips _general_warmup and the
             # default autotuner shape is single-seq / no-initstates. Safe
             # no-op for non-Mamba models.
-            with self._warmup_timer.phase(
-                "mamba_hybrid", metrics=self._metrics, metric_name="mamba_hybrid_warmup_seconds"
+            with (
+                self._warmup_timer.phase(
+                    "mamba_hybrid", metrics=self._metrics, metric_name="mamba_hybrid_warmup_seconds"
+                ),
+                self._torch_compile_bypass(),
             ):
                 self._run_mamba_hybrid_warmup(resource_manager)
             log_mem_snapshot("warmup/after_mamba_hybrid")
@@ -466,10 +477,13 @@ class DecoderWarmup:
         if can_run_general_warmup:
             # Pre-populate the memory pool with max-shape allocations to reduce
             # fragmentation at runtime.
-            with self._warmup_timer.phase(
-                "memory_pool_prepop",
-                metrics=self._metrics,
-                metric_name="memory_pool_prepopulation_seconds",
+            with (
+                self._warmup_timer.phase(
+                    "memory_pool_prepop",
+                    metrics=self._metrics,
+                    metric_name="memory_pool_prepopulation_seconds",
+                ),
+                self._torch_compile_bypass(),
             ):
                 warmup_requests_configs = self._get_max_shape_warmup_requests(resource_manager)
                 self._general_warmup(resource_manager, warmup_requests_configs)

@@ -35,6 +35,8 @@ from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.inputs import (
     _get_context_prompt_lookahead_token)
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.metadata import \
     DecoderMetadata
+from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner import \
+    PrefillCompiledModel
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.warmup import \
     DecoderWarmup
 from tensorrt_llm._torch.pyexecutor.engine.runners.interface import \
@@ -347,6 +349,7 @@ def _make_forward_only_engine(
     decoder.kv_cache_manager_key = ResourceManagerType.KV_CACHE_MANAGER
     engine.enable_spec_decode = False
     decoder._config = SimpleNamespace(
+        compile_only_piecewise_graphs=False,
         disable_overlap_scheduler=True,
         is_spec_decode=False,
         max_beam_width=1,
@@ -429,6 +432,7 @@ def _make_forward_only_engine(
         dynamic_draft_len_mapping=None,
         lora=decoder._lora,
         forward_warmup=decoder._forward_warmup,
+        torch_compile_bypass=decoder._bypass_torch_compile,
         context_promotion_supported=True,
     )
 
@@ -445,6 +449,52 @@ def _make_forward_only_engine(
 
     resource_manager.get_resource_manager.side_effect = get_resource_manager
     return engine, runner, resource_manager, semantic_attn_metadata, outputs
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize(
+    "ordinary_capture,eligible",
+    [(False, True), (False, False), (True, True), (True, False)],
+)
+def test_decoder_forward_routes_compile_bypass(enabled: bool,
+                                               ordinary_capture: bool,
+                                               eligible: bool) -> None:
+    """Exercise both the regular forward and ordinary-graph capture callbacks."""
+    key = KeyType(batch_size=1, draft_len=0,
+                  is_first_draft=False) if ordinary_capture else None
+    engine, graph_runner, resources, _, outputs = _make_forward_only_engine(key)
+    eager = torch.nn.Identity()
+    compiled = torch.nn.Identity()
+    eager.forward = Mock(return_value=outputs)
+    compiled.forward = Mock(return_value=outputs)
+    wrapper = PrefillCompiledModel(eager, compiled)
+    engine._runner._config.compile_only_piecewise_graphs = enabled
+    engine._runner.model.model = wrapper
+    engine._runner._forward_step.side_effect = lambda *args, **kwargs: wrapper()
+    graph_runner.needs_capture.return_value = ordinary_capture
+    graph_runner.is_warmup_only = ordinary_capture
+    graph_runner.capture.side_effect = lambda key, forward, inputs, **kwargs: forward(
+        inputs)
+    batch = ScheduledRequests()
+    batch.generation_requests = [_make_request_stub(1)]
+
+    with patch(
+            "tensorrt_llm._torch.pyexecutor.model_engine.torch.cuda.Event",
+            return_value=Mock()
+    ), patch(
+            "tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner.get_per_request_prefill_cuda_graph_flag",
+            return_value=eligible,
+    ):
+        result = engine.forward(batch, resources)
+
+    assert result["logits"] is outputs["logits"]
+    expected_compiled = eligible and not (enabled and ordinary_capture)
+    selected = compiled.forward if expected_compiled else eager.forward
+    other = eager.forward if expected_compiled else compiled.forward
+    selected.assert_called_once_with()
+    other.assert_not_called()
+    assert not wrapper._bypass_active
 
 
 def create_model_engine_and_kvcache(
@@ -2072,6 +2122,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
             dynamic_draft_len_mapping=None,
             lora=None,
             forward_warmup=None,
+            torch_compile_bypass=nullcontext,
             context_promotion_supported=True,
         )
 

@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Synthetic warmup respects an encoder-only cache's actual request phases."""
 
+import contextlib
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -78,6 +79,7 @@ def _cuda_graphs(requests: DummyRequestFactory, warmup_only: bool) -> DecoderCud
         dynamic_draft_len_mapping=None,
         lora=SimpleNamespace(cuda_graph_manager=None),
         forward_warmup=None,
+        torch_compile_bypass=contextlib.nullcontext,
         context_promotion_supported=True,
     )
 
