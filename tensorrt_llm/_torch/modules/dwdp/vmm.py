@@ -201,7 +201,7 @@ def peer_handle_type() -> cuda.CUmemAllocationHandleType:
     ``CUDA_ERROR_NOT_PERMITTED`` (800), so we use
     ``CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR`` and exchange the FDs
     between sibling MPI workers via ``pidfd_open`` / ``pidfd_getfd``
-    (mirrors ``MnnvlMemory.get_allocation_prop`` in ``_mnnvl_utils.py``).
+    (mirrors ``MnnvlMemory.get_allocation_prop`` in ``mnnvl_memory.py``).
     """
     arch = platform.machine().lower()
     if "aarch64" in arch:

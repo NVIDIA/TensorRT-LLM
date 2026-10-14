@@ -136,7 +136,7 @@ def test_v41_remap_rejects_orphan_draft_scale():
 
 
 @pytest.mark.parametrize("v41", [False, True])
-def test_dspark_confidence_and_lm_head_use_variant_correct_hidden_states(v41):
+def test_dspark_confidence_uses_prenorm_and_lm_head_uses_normalized_hidden_states(v41):
     cls = DSv41DSparkDraftModel if v41 else modeling_dspark.DSv4DSparkDraftModel
     model = cls.__new__(cls)
     nn.Module.__init__(model)
@@ -154,16 +154,17 @@ def test_dspark_confidence_and_lm_head_use_variant_correct_hidden_states(v41):
             confidence_head=confidence,
         )
     ]
-    _, num_proposed, logits = model.forward_head(
+    draft_tokens, confidence_scores, logits = model.forward_head(
         torch.empty(1, 2, 4, 2),
         torch.tensor([1]),
         pre_mix=torch.empty(1, 2, 4, 1),
-        confidence_threshold=0.5,
+        return_confidence=True,
         return_logits=True,
     )
     torch.testing.assert_close(logits, normalized)
-    assert num_proposed.tolist() == [2]
-    assert confidence.call_args.args[0] is (collapsed if v41 else normalized)
+    assert draft_tokens.shape == (1, 2)
+    torch.testing.assert_close(confidence_scores, torch.full((1, 2), 10.0))
+    assert confidence.call_args.args[0] is collapsed
 
 
 def _draft_routing(bias, *, hashed=False, table=None, top_k=3):

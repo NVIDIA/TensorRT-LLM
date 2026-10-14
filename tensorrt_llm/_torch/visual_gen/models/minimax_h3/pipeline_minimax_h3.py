@@ -71,6 +71,22 @@ from .ref2va import load_references, prepare_references, validate_reference_orde
 from .transformer_minimax_h3 import MiniMaxH3Transformer3DModel
 
 
+def _prepare_vae_decoder(vae: TiledAutoencoderKLMiniMaxH3) -> None:
+    """Lossless decode-path preparation for the fp16-autocast decode in ``MiniMaxH3Pipeline._decode_video``.
+
+    * Every ``nn.Linear`` of the ViT decoder is converted to fp16 in place: autocast casts weight and bias to fp16
+      on every call, so converting once gives the same bits under autocast (norm weights and the ``scale1``/``scale2``
+      gains stay fp32, as autocast leaves them). The decoder must therefore keep running under the fp16 autocast of
+      ``_decode_video``; a decode outside it would run fp16 instead of the reference fp32 math.
+    * One tile is decoded eagerly to measure the decoder's memory footprint, so the VAE can size its batched tile
+      decode from the memory free at decode time (``TiledAutoencoderKLMiniMaxH3.calibrate_tile_decode_memory``).
+    """
+    for module in vae.decoder.modules():
+        if isinstance(module, torch.nn.Linear):
+            module.to(torch.float16)
+    vae.calibrate_tile_decode_memory()
+
+
 def _component_skipped(
     skip_components: list[str | PipelineComponent],
     component: PipelineComponent,
@@ -376,6 +392,24 @@ class MiniMaxH3Pipeline(BasePipeline):
             self.scheduler.set_shift(self.VIDEO_SCHEDULER_SHIFT)
         if self.audio_scheduler is not None:
             self.audio_scheduler.set_shift(self.AUDIO_SCHEDULER_SHIFT)
+        if self.vae is not None and self.device.type == "cuda":
+            _prepare_vae_decoder(self.vae)
+
+    def torch_compile(self) -> None:
+        super().torch_compile()
+        # The ViT VAE decoder is 36 identical blocks run once per clip; compile them like the transformer blocks.
+        if self.vae is not None:
+            tc_config = self.pipeline_config.torch_compile
+            blocks = self.vae.decoder.transformer_blocks
+            logger.info(
+                f"torch.compile: vae.decoder.transformer_blocks ({len(blocks)} blocks, mode=default)"
+            )
+            self.vae.decoder.transformer_blocks = torch.nn.ModuleList(
+                torch.compile(
+                    block, mode="default", dynamic=None, fullgraph=tc_config.enable_fullgraph
+                )
+                for block in blocks
+            )
 
     def _load_request_keyframes(
         self,
