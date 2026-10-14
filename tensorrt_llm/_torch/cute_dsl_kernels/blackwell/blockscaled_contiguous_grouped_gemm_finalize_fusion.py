@@ -204,6 +204,8 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         mma_tiler_mn: Tuple[int, int],
         cluster_shape_mn: Tuple[int, int],
         raster_along_m: bool = False,
+        use_expert_counts: bool = False,
+        num_local_experts: int = 0,
     ):
         """Initializes the configuration for a Blackwell blockscaled dense GEMM kernel.
 
@@ -228,6 +230,11 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         self.use_2cta_instrs = mma_tiler_mn[0] == 256
         self.cluster_shape_mn = cluster_shape_mn
         self.raster_along_m = raster_along_m
+        self.use_expert_counts = use_expert_counts
+        self.num_local_experts = num_local_experts
+        self.num_tile_info_fields = 6 if self.use_expert_counts else 5
+        if self.use_expert_counts:
+            assert self.num_local_experts > 0
         # K dimension is deferred in _setup_attributes
         self.mma_tiler = (*mma_tiler_mn, 1)
 
@@ -455,6 +462,43 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         self.num_tmem_alloc_cols = 512
 
     @cute.jit
+    def _expert_count_tile_info(
+        self,
+        expert_counts: cute.Tensor,
+        tile_idx: cutlass.Int32,
+        expert_capacity: cutlass.Int32,
+    ):
+        """Resolve a compact tile directly from expert-major receive counts."""
+        tile_size = cutlass.Int32(self.mma_tiler[0])
+        num_valid_tiles = cutlass.Int32(0)
+        expert_idx = cutlass.Int32(-1)
+        expert_tile_start = cutlass.Int32(0)
+        expert_count = cutlass.Int32(0)
+        for candidate_expert in cutlass.range_constexpr(self.num_local_experts):
+            count = cutlass.min(
+                cutlass.max(expert_counts[candidate_expert], cutlass.Int32(0)),
+                expert_capacity,
+            )
+            num_expert_tiles = (count + tile_size - 1) // tile_size
+            is_target = (tile_idx >= num_valid_tiles) and (
+                tile_idx < num_valid_tiles + num_expert_tiles
+            )
+            if is_target:
+                expert_idx = cutlass.Int32(candidate_expert)
+                expert_tile_start = num_valid_tiles
+                expert_count = count
+            num_valid_tiles += num_expert_tiles
+
+        row_in_expert = (tile_idx - expert_tile_start) * tile_size
+        rows_in_tile = cutlass.min(
+            tile_size,
+            cutlass.max(expert_count - row_in_expert, cutlass.Int32(0)),
+        )
+        mn_limit = tile_idx * tile_size + rows_in_tile
+        expanded_row_start = expert_idx * expert_capacity + row_in_expert
+        return num_valid_tiles, expert_idx, mn_limit, expanded_row_start
+
+    @cute.jit
     def __call__(
         self,
         a: cute.Tensor,
@@ -466,6 +510,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         num_non_exiting_tiles: cute.Tensor,
         tile_idx_to_mn_limit: cute.Tensor,
         alpha: Union[cute.Tensor, Tuple[cute.Tensor, ...]],
+        expert_capacity: cutlass.Int32,
         max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
         permuted_idx_to_expanded_idx: cute.Tensor,
@@ -694,9 +739,11 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         # Define shared storage for kernel
         @cute.struct
         class SharedStorage:
-            # (bidx, bidy, bidz, valid, mn_limit)
+            # (bidx, bidy, expert, valid, mn_limit, expanded_row_start)
             sInfo: cute.struct.Align[
-                cute.struct.MemRange[cutlass.Int32, 5 * self.num_tile_stage],
+                cute.struct.MemRange[
+                    cutlass.Int32, self.num_tile_info_fields * self.num_tile_stage
+                ],
                 # 1 byte alignment
                 1,
             ]
@@ -765,6 +812,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
             alpha_tuple,
             permuted_idx_to_expanded_idx,
             token_final_scales,
+            expert_capacity,
             self.cluster_layout_vmnk,
             self.cluster_layout_sfb_vmnk,
             self.a_smem_layout_staged,
@@ -850,6 +898,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         alpha_tuple: Tuple[cute.Tensor, ...],
         permuted_idx_to_expanded_idx: cute.Tensor,
         token_final_scales: cute.Tensor,
+        expert_capacity: cutlass.Int32,
         cluster_layout_vmnk: cute.Layout,
         cluster_layout_sfb_vmnk: cute.Layout,
         a_smem_layout_staged: cute.ComposedLayout,
@@ -993,8 +1042,11 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
 
         sC = storage.sC.get_tensor(c_smem_layout_staged)
 
-        # (bidx, bidy, bidz, valid)
-        info_layout = cute.make_layout((5, self.num_tile_stage), stride=(1, 5))
+        # (bidx, bidy, expert, valid, mn_limit, expanded_row_start)
+        info_layout = cute.make_layout(
+            (self.num_tile_info_fields, self.num_tile_stage),
+            stride=(1, self.num_tile_info_fields),
+        )
         sInfo = storage.sInfo.get_tensor(info_layout)
 
         # Per-row finalize metadata staged by the meta loader warp: (row, stage)
@@ -1192,17 +1244,34 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                 pipeline.PipelineUserType.Producer, self.num_tile_stage
             )
 
-            num_valid_tiles = num_non_exiting_tiles[0]
+            if cutlass.const_expr(self.use_expert_counts):
+                num_valid_tiles, _, _, _ = self._expert_count_tile_info(
+                    tile_idx_to_expert_idx, cutlass.Int32(0), expert_capacity
+                )
+            else:
+                num_valid_tiles = num_non_exiting_tiles[0]
 
             if cutlass.const_expr(self.raster_along_m):
                 while work_tile.is_valid_tile:
                     cur_tile_coord = work_tile.tile_idx
                     mma_tile_coord_m = cur_tile_coord[0] // cute.size(tiled_mma.thr_id.shape)
-                    expert_idx = tile_idx_to_expert_idx[mma_tile_coord_m]
                     tile_idx = mma_tile_coord_m
                     if tile_idx < num_valid_tiles:
                         tile_info_pipeline.producer_acquire(tile_info_producer_state)
-                        mn_limit = tile_idx_to_mn_limit[tile_idx]
+                        expanded_row_start = cutlass.Int32(-1)
+                        if cutlass.const_expr(self.use_expert_counts):
+                            _, expert_idx, mn_limit, expanded_mma_row_start = (
+                                self._expert_count_tile_info(
+                                    tile_idx_to_expert_idx, mma_tile_coord_m, expert_capacity
+                                )
+                            )
+                            expanded_row_start = (
+                                expanded_mma_row_start
+                                + mma_tile_coord_v * self.cta_tile_shape_mnk[0]
+                            )
+                        else:
+                            expert_idx = tile_idx_to_expert_idx[mma_tile_coord_m]
+                            mn_limit = tile_idx_to_mn_limit[tile_idx]
                         with cute.arch.elect_one():
                             sInfo[(0, tile_info_producer_state.index)] = cur_tile_coord[0]
                             sInfo[(1, tile_info_producer_state.index)] = cur_tile_coord[1]
@@ -1211,6 +1280,8 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                                 work_tile.is_valid_tile
                             )
                             sInfo[(4, tile_info_producer_state.index)] = mn_limit
+                            if cutlass.const_expr(self.use_expert_counts):
+                                sInfo[(5, tile_info_producer_state.index)] = expanded_row_start
                             # fence view async shared
                         cute.arch.fence_proxy(
                             "async.shared",
@@ -1228,11 +1299,23 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                 while work_tile.is_valid_tile and is_continue:
                     cur_tile_coord = work_tile.tile_idx
                     mma_tile_coord_m = cur_tile_coord[0] // cute.size(tiled_mma.thr_id.shape)
-                    expert_idx = tile_idx_to_expert_idx[mma_tile_coord_m]
                     tile_idx = mma_tile_coord_m
                     if tile_idx < num_valid_tiles:
                         tile_info_pipeline.producer_acquire(tile_info_producer_state)
-                        mn_limit = tile_idx_to_mn_limit[tile_idx]
+                        expanded_row_start = cutlass.Int32(-1)
+                        if cutlass.const_expr(self.use_expert_counts):
+                            _, expert_idx, mn_limit, expanded_mma_row_start = (
+                                self._expert_count_tile_info(
+                                    tile_idx_to_expert_idx, mma_tile_coord_m, expert_capacity
+                                )
+                            )
+                            expanded_row_start = (
+                                expanded_mma_row_start
+                                + mma_tile_coord_v * self.cta_tile_shape_mnk[0]
+                            )
+                        else:
+                            expert_idx = tile_idx_to_expert_idx[mma_tile_coord_m]
+                            mn_limit = tile_idx_to_mn_limit[tile_idx]
                         with cute.arch.elect_one():
                             sInfo[(0, tile_info_producer_state.index)] = cur_tile_coord[0]
                             sInfo[(1, tile_info_producer_state.index)] = cur_tile_coord[1]
@@ -1241,6 +1324,8 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                                 work_tile.is_valid_tile
                             )
                             sInfo[(4, tile_info_producer_state.index)] = mn_limit
+                            if cutlass.const_expr(self.use_expert_counts):
+                                sInfo[(5, tile_info_producer_state.index)] = expanded_row_start
                             # fence view async shared
                         cute.arch.fence_proxy(
                             "async.shared",
@@ -1264,6 +1349,8 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                 sInfo[(2, tile_info_producer_state.index)] = -1
                 sInfo[(3, tile_info_producer_state.index)] = cutlass.Int32(0)
                 sInfo[(4, tile_info_producer_state.index)] = cutlass.Int32(0)
+                if cutlass.const_expr(self.use_expert_counts):
+                    sInfo[(5, tile_info_producer_state.index)] = cutlass.Int32(-1)
             cute.arch.fence_proxy(
                 "async.shared",
                 space="cta",
@@ -1286,7 +1373,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
             )
 
             # Get the first tile info from pipeline (scheduler has filtered out tiles >= num_non_exiting_tiles)
-            tile_info = cute.make_rmem_tensor((5,), cutlass.Int32)
+            tile_info = cute.make_rmem_tensor((self.num_tile_info_fields,), cutlass.Int32)
             tile_info_pipeline.consumer_wait(tile_info_consumer_state)
             tile_info[0] = sInfo[(0, tile_info_consumer_state.index)]
             tile_info[1] = sInfo[(1, tile_info_consumer_state.index)]
@@ -1652,12 +1739,14 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
             meta_producer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer, self.num_meta_stage
             )
-            tile_info = cute.make_rmem_tensor((5,), cutlass.Int32)
+            tile_info = cute.make_rmem_tensor((self.num_tile_info_fields,), cutlass.Int32)
             tile_info_pipeline.consumer_wait(tile_info_consumer_state)
             tile_info[0] = sInfo[(0, tile_info_consumer_state.index)]
             tile_info[2] = sInfo[(2, tile_info_consumer_state.index)]
             tile_info[3] = sInfo[(3, tile_info_consumer_state.index)]
             tile_info[4] = sInfo[(4, tile_info_consumer_state.index)]
+            if cutlass.const_expr(self.use_expert_counts):
+                tile_info[5] = sInfo[(5, tile_info_consumer_state.index)]
             is_valid_tile = tile_info[3] == 1
             cute.arch.fence_proxy("async.shared", space="cta")
             tile_info_pipeline.consumer_release(tile_info_consumer_state)
@@ -1683,7 +1772,10 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                 ):
                     r = meta_lane + j * self.threads_per_warp
                     permuted_row = tile_m_start + r
-                    expanded_idx = permuted_idx_to_expanded_idx[permuted_row]
+                    if cutlass.const_expr(self.use_expert_counts):
+                        expanded_idx = tile_info[5] + r
+                    else:
+                        expanded_idx = permuted_idx_to_expanded_idx[permuted_row]
                     # max(., 0) keeps topk_idx in-bounds for padding rows (-1);
                     # the is_valid gate keeps token_idx in-bounds (padding rows
                     # may hold out-of-range garbage, not just -1).
@@ -1704,6 +1796,8 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                 tile_info[2] = sInfo[(2, tile_info_consumer_state.index)]
                 tile_info[3] = sInfo[(3, tile_info_consumer_state.index)]
                 tile_info[4] = sInfo[(4, tile_info_consumer_state.index)]
+                if cutlass.const_expr(self.use_expert_counts):
+                    tile_info[5] = sInfo[(5, tile_info_consumer_state.index)]
                 is_valid_tile = tile_info[3] == 1
                 cute.arch.fence_proxy("async.shared", space="cta")
                 tile_info_pipeline.consumer_release(tile_info_consumer_state)
@@ -2460,6 +2554,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         l: cutlass.Int64,  # noqa: E741
         num_tokens: cutlass.Int64,
         top_k: cutlass.Int64,
+        expert_capacity: cutlass.Int32,
         tile_size: cutlass.Constexpr,
         scaling_vector_size: cutlass.Constexpr,
         max_active_clusters: cutlass.Constexpr,
@@ -2528,6 +2623,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
             num_non_exiting_tiles,
             tile_idx_to_mn_limit,
             alpha,
+            expert_capacity,
             max_active_clusters=max_active_clusters,
             stream=stream,
             permuted_idx_to_expanded_idx=permuted_idx_to_expanded_idx,

@@ -127,13 +127,17 @@ public:
 
     // ---- KvCache creation -------------------------------------------------
 
-    // Create a new KvCache. Returned cache is SUSPENDED; call activate() with a stream.
+    // Create a new KvCache. Returned cache is SUSPENDED; call resume() with a stream.
     // input_tokens:         optional sequence to match against existing cached blocks.
     // priorityCb:           optional priority override per block.
-    // expectedPromptLength: token count marking the prefill->generation boundary; once
-    //                       historyLength reaches it, later capacity growth is recorded as
-    //                       generation-phase allocation stats (defaults to inputTokens.size()).
-    //                       Stats-only: no effect on allocation, reuse, or correctness.
+    // expectedPromptLength: full prompt token count marking the prefill->generation boundary.
+    //                       Beam expansion shares blocks entirely before this boundary and
+    //                       copies the writable tail into each additional beam. For beam search,
+    //                       pass the actual prompt length if inputTokens is absent or shortened
+    //                       for reuse matching. Defaults to non-empty inputTokens.size(); without
+    //                       either value, beam expansion uses a zero shared-prefix boundary.
+    //                       Once historyLength reaches it, later capacity growth is also recorded
+    //                       as generation-phase allocation stats.
     // textOnly:             per-sequence override of the text-only (digest-free) guarantee;
     //                       nullopt inherits the manager config default.
     // enableRequestStats:   collect request-local allocation and reuse statistics even when
@@ -151,6 +155,11 @@ public:
         ReuseScope const& reuseScope, TokenSpan inputTokens, bool knownNoDigest = false) const;
     int probeReuse(ReuseScope reuseScope = {}, TokenSpan inputTokens = {}, bool knownNoDigest = false) const;
 
+    // Read-only, advisory key of the first full block past the reusable prefix.
+    // Uses the same fresh, window-aware match as probeReuse without acquiring pages.
+    std::optional<BlockKey> probeFirstNewBlockKey(
+        ReuseScope reuseScope = {}, TokenSpan inputTokens = {}, bool knownNoDigest = false) const;
+
     // ---- Memory pool queries -----------------------------------------------
 
     // Base address of the memory pool. When indexMode is PER_LAYER, returns pool group base
@@ -160,6 +169,9 @@ public:
 
     int getPageStride(LayerId layerId, DataRole role) const;
     size_t getPageIndexUpperBound(LayerId layerId, DataRole role) const;
+
+    // Whether this buffer belongs to a sparse-attention lifecycle. Unknown buffers throw.
+    bool isSparse(LayerId layerId, DataRole role) const;
 
     // Scale factor: base_page_index * scale → kernel page index.
     int getPageIndexScale(LayerId layerId, DataRole role) const;
@@ -177,6 +189,10 @@ public:
 
     int tokensPerBlock() const noexcept;
     bool enablePartialMatch() const noexcept;
+
+    // Partial commit is independent of partial matching so beam search can
+    // retain full-block reuse without publishing a writable prompt tail.
+    bool enablePartialCommit() const noexcept;
 
     bool commitMinSnapshot() const noexcept
     {
@@ -232,13 +248,27 @@ public:
 
     // ---- Statistics -------------------------------------------------------
 
+    // Independent per-pool values sampled together under the shared API lock.
+    TypedVec<PoolGroupIndex, StorageStatistics> getStorageStatistics(CacheLevel cacheLevel = kHotLevel) const;
+    // Pool-group numbering is level-specific; cold grouping can differ from the hot layout.
+    TypedVec<LifeCycleId, PoolGroupIndex> getLifeCyclePoolGroupIndices(CacheLevel cacheLevel = kHotLevel) const;
+
+    // Internal commit* and recordDiskPrefetchBlocks helpers require the caller's exclusive API lock.
     void commitStats(KVCacheStatsDelta const& stats, IterationStatsByLifeCycle const& iterationStatsByLifeCycle = {});
     KVCacheStatsDelta getCommittedStats() const;
     IterationStatsByLifeCycle getAndResetIterationStats();
     PeakBlockStatsByPoolGroup getAndResetIterationPeakBlockStats(CacheLevel cacheLevel);
+    // Drain every level at once. The peaks are already tracked as one per-level record, so a
+    // caller that wants all of them should not take that record apart one level at a time.
+    PeakBlockStatsByCacheLevel getAndResetIterationPeakBlockStatsByLevel();
 
     void commitSsmSnapshotIterationStats(SsmSnapshotIterationStatsByLifeCycle const& statsByLifeCycle);
     SsmSnapshotIterationStatsByLifeCycle getAndResetSsmSnapshotIterationStats();
+
+    // Per-cache-level split of the reuse block counts, committed alongside the scalar
+    // iteration stats so both views cover exactly the same requests.
+    void commitReusedBlocksByLevel(ReusedBlocksByLevelByLifeCycle const& byLifeCycle);
+    ReusedBlocksByLevelByLifeCycle getAndResetIterationReusedBlocksByLevel();
 
     // Count one ACTIVE->SUSPENDED transition for the current iteration window.
     void recordRequestSuspended();
@@ -247,6 +277,19 @@ public:
     // counts; a freshly-created cache is activated by its first resume(), but
     // that is an admission, not a recovery, and is not counted.
     void recordRequestResumed();
+    // Add the blocks a prefetch call actually migrated off disk in the current iteration window.
+    // Independent of reuse-hit attribution, which asks where matched tokens lived rather than
+    // what a prefetch moved.
+    void recordDiskPrefetchBlocks(int64_t numBlocks);
+    // Return the number of disk-prefetched blocks since the last drain and reset it.
+    int64_t getAndResetIterationDiskPrefetchBlocks();
+    // Accumulate a request's initial current-residency cached-token attribution, indexed by cache
+    // level, into the current iteration window. Committed alongside the scalar iteration stats so
+    // both views cover exactly the same requests.
+    void commitCachedTokensByLevel(CountsByLevel const& counts);
+    // Return the per-cache-level cached-token counts accumulated since the last drain and reset
+    // them.
+    CountsByLevel getAndResetIterationCachedTokensByLevel();
     // Return {suspended, resumed} counts since the last drain and reset them.
     // Both counters track the same population, so the running
     // (suspended - resumed) total is the number of requests still parked in
@@ -310,6 +353,16 @@ public:
     void updateAvgSqrHistoryLength(double v)
     {
         mAvgSqrHistoryLength.update(v);
+    }
+
+    void updateAvgBeamWidth(double v)
+    {
+        mAvgBeamWidth.update(v);
+    }
+
+    void updateAvgPromptLength(double v)
+    {
+        mAvgPromptLength.update(v);
     }
 
     void incrementNumSampledKvCaches()
@@ -387,6 +440,10 @@ private:
     MovingAverage mAvgReusedLength;
     MovingAverage mAvgSqrCapacity;
     MovingAverage mAvgSqrHistoryLength;
+    // Beam search replicates only the blocks past the prompt tail, so the tuner
+    // needs both the typical beam width and where that tail sits.
+    MovingAverage mAvgBeamWidth;
+    MovingAverage mAvgPromptLength;
 
     TypedVec<PoolGroupIndex, float> mTargetRatioListHot;
     TypedVec<PoolGroupIndex, float> mTargetRatioListCold;
@@ -399,11 +456,14 @@ private:
     KVCacheStatsDelta mCommittedStats;
     IterationStatsByLifeCycle mIterationStatsByLifeCycle;
     SsmSnapshotIterationStatsByLifeCycle mSsmSnapshotIterationStatsByLifeCycle;
+    ReusedBlocksByLevelByLifeCycle mIterReusedBlocksByLevel;
     PeakBlockStatsByCacheLevel mIterationPeakNumBlocksByCacheLevel;
     std::unordered_set<RequestIdType> mDirtyStatsKvCacheIds;
     std::unordered_set<RequestIdType> mStatsExcludedKvCacheIds;
     int64_t mIterSuspendedRequests{0};
     int64_t mIterResumedRequests{0};
+    int64_t mIterDiskPrefetchBlocks{0};
+    CountsByLevel mIterCachedTokensByLevel;
 };
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

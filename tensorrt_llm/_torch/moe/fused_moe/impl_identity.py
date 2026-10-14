@@ -171,12 +171,10 @@ class MoEImplRegistry:
         self._token_to_field: Dict[str, str] = {}
 
     def _check_tokens_disjoint(self, identity: MoEImplId) -> None:
-        # ``claimed`` holds the tokens this identity used for its own earlier
-        # fields. Without it only previously registered ids are in scope, so an
-        # identity reusing one token twice would register fine and then be
-        # unaddressable: the later field wins the token below, so parse_query
-        # hands both segments to that field and refuses the identity's own
-        # canonical string.
+        # Tokens this identity already used for its own earlier fields. Without
+        # them an identity reusing one token twice registers fine and is then
+        # unaddressable: the later field wins the token, so ``parse_query``
+        # refuses the identity's own canonical string.
         claimed: Dict[str, str] = {}
         for name in _ID_FIELDS:
             token = getattr(identity, name)
@@ -221,8 +219,8 @@ class MoEImplRegistry:
     def suggest(self, token: str) -> Tuple[str, ...]:
         """Nearest known tokens, in descending similarity, for a typo message.
 
-        Empty when nothing is close, which includes the case that matters most
-        during the migration: a registry too sparse to hold a neighbour.
+        Empty when nothing is close, including when the registry is still too
+        sparse to hold a neighbour.
         """
         return tuple(difflib.get_close_matches(token, self._token_to_field, n=3))
 
@@ -257,9 +255,8 @@ class MoEImplRegistry:
             name = self._token_to_field.get(token)
             if name is None:
                 near = self.suggest(token)
-                # Near misses while the registry has neighbours to compare
-                # against; the full vocabulary only while it is small enough
-                # for that to be a listing rather than noise.
+                # Near misses once the registry has neighbours to offer; the
+                # full vocabulary only while it is small enough to be readable.
                 hint = (
                     f"Closest known values: {list(near)}"
                     if near
@@ -285,10 +282,10 @@ class MoEImplRegistry:
         return len(self._store)
 
 
-# Created empty; each leaf registers itself at import time as it migrates, so
-# the registry is partial for as long as the migration runs. A pin that names
-# nothing registered fails hard rather than falling back, which is what keeps a
-# partial registry from answering with a kernel the caller did not ask for.
+# Created empty; each impl registers itself at import time, so the registry is
+# partial while the migration runs. A pin naming nothing registered fails hard
+# rather than falling back, so a partial registry cannot answer with a kernel
+# the caller did not ask for.
 MOE_IMPL_REGISTRY = MoEImplRegistry()
 
 

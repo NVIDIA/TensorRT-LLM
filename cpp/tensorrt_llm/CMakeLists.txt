@@ -140,7 +140,14 @@ if(NOT INTERNAL_CUTLASS_KERNELS_PATH)
   endif()
 endif()
 
+find_package(Threads REQUIRED)
 add_subdirectory(common)
+
+add_library(ipc_nvls_memory_src STATIC runtime/ipcNvlsMemory.cu)
+set_target_properties(
+  ipc_nvls_memory_src PROPERTIES POSITION_INDEPENDENT_CODE ON
+                                 CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+
 add_subdirectory(kernels)
 add_subdirectory(runtime)
 
@@ -163,7 +170,6 @@ endif()
 
 add_subdirectory(executor)
 
-find_package(Threads REQUIRED)
 target_link_libraries(${BATCH_MANAGER_TARGET} INTERFACE Threads::Threads)
 target_link_libraries(${EXECUTOR_TARGET} INTERFACE Threads::Threads)
 
@@ -198,6 +204,7 @@ set(TRTLLM_LINK_LIBS
     cute_dsl_src
     runtime_src
     compressorKernels_src
+    fusedSamplingKernels_src
     mhcKernels_src
     userbuffers_src
     ${DECODER_SHARED_TARGET_0}
@@ -247,17 +254,41 @@ add_library(${SHARED_TARGET} SHARED)
 
 set_target_properties(
   ${SHARED_TARGET}
-  PROPERTIES CXX_STANDARD "17" CXX_STANDARD_REQUIRED "YES" CXX_EXTENSIONS "NO"
+  PROPERTIES CXX_STANDARD "20" CXX_STANDARD_REQUIRED "YES" CXX_EXTENSIONS "NO"
              LINK_FLAGS "${AS_NEEDED_FLAG} ${UNDEFINED_FLAG}")
+
+# Keep statically linked NVRTC symbols local so they cannot be interposed by a
+# dynamic NVRTC loaded elsewhere in the process.
+if(NOT WIN32 AND NOT NVRTC_DYNAMIC_LINKING)
+  target_link_options(
+    ${SHARED_TARGET} PRIVATE
+    "LINKER:--exclude-libs,$<TARGET_FILE_NAME:${NVRTC_LIB}>"
+    "LINKER:--exclude-libs,$<TARGET_FILE_NAME:${NVRTC_BUILTINS_LIB}>")
+endif()
 
 target_link_libraries(${SHARED_TARGET} PUBLIC ${TRTLLM_LINK_LIBS})
 
 target_link_libraries(
   ${SHARED_TARGET}
-  PRIVATE $<LINK_LIBRARY:WHOLE_ARCHIVE,${BATCH_MANAGER_TARGET}>
-          $<LINK_LIBRARY:WHOLE_ARCHIVE,${EXECUTOR_TARGET}>
-          $<LINK_LIBRARY:WHOLE_ARCHIVE,fp8_blockscale_gemm_src>
-          $<LINK_LIBRARY:WHOLE_ARCHIVE,${INTERNAL_CUTLASS_KERNELS_TARGET}>)
+  PRIVATE
+    $<LINK_LIBRARY:WHOLE_ARCHIVE,tllm_common_error,tllm_common_logging,tllm_common_cuda,tllm_executor_types,tllm_executor_serialization,tllm_runtime_memory,tllm_runtime_buffers,tllm_runtime_distributed>
+    $<LINK_LIBRARY:WHOLE_ARCHIVE,${BATCH_MANAGER_TARGET}>
+    $<LINK_LIBRARY:WHOLE_ARCHIVE,${EXECUTOR_TARGET}>
+    $<LINK_LIBRARY:WHOLE_ARCHIVE,fp8_blockscale_gemm_src>
+    $<LINK_LIBRARY:WHOLE_ARCHIVE,${INTERNAL_CUTLASS_KERNELS_TARGET}>)
+
+# Components also link each other normally; retain all component exports here.
+set_property(TARGET ${SHARED_TARGET}
+             PROPERTY LINK_LIBRARY_OVERRIDE_tllm_common_error WHOLE_ARCHIVE)
+set_property(TARGET ${SHARED_TARGET}
+             PROPERTY LINK_LIBRARY_OVERRIDE_tllm_common_logging WHOLE_ARCHIVE)
+set_property(TARGET ${SHARED_TARGET}
+             PROPERTY LINK_LIBRARY_OVERRIDE_tllm_executor_types WHOLE_ARCHIVE)
+
+foreach(component tllm_common_cuda tllm_runtime_memory)
+  set_property(TARGET ${SHARED_TARGET}
+               PROPERTY LINK_LIBRARY_OVERRIDE_${component} WHOLE_ARCHIVE)
+endforeach()
 
 # Link kernel_src and cutlass_src. static internal cutlass lib overridden.
 target_link_libraries(${SHARED_TARGET} PUBLIC kernels_src cutlass_src)
@@ -298,6 +329,10 @@ add_subdirectory(nanobind)
 
 if(BUILD_DEEP_EP)
   add_subdirectory(deep_ep)
+endif()
+
+if(BUILD_PYT AND BUILD_NCCL_EXTENSIONS)
+  add_subdirectory(nccl_extensions)
 endif()
 
 if(BUILD_DEEP_GEMM)

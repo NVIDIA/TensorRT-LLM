@@ -22,7 +22,8 @@ from tensorrt_llm._torch.models.modeling_speculative import (
     RNNHead,
     VanillaMarkov,
     build_markov_head,
-    confident_prefix_length,
+    dspark_markov_step_bias,
+    markov_prev_embeddings,
 )
 
 VOCAB, RANK, HID, B, BLK = 257, 16, 32, 3, 5
@@ -93,18 +94,56 @@ def test_build_markov_head_rank_zero_returns_none():
     )
 
 
-def test_confidence_head_and_prefix_truncation():
-    head = DSparkConfidenceHead(hidden_size=HID)
-    conf = head(torch.randn(B, BLK, HID))
-    assert conf.shape == (B, BLK)
-    # threshold 0 disables truncation.
-    assert confident_prefix_length(conf, block_size=BLK, threshold=0.0) == BLK
-    # First sub-threshold position truncates the prefix.
-    logits = torch.tensor([[10.0, 10.0, -10.0, 10.0, 10.0]])
-    assert confident_prefix_length(logits, block_size=BLK, threshold=0.5) == 2
-    # All-confident -> full block.
-    logits_hi = torch.full((1, BLK), 10.0)
-    assert confident_prefix_length(logits_hi, block_size=BLK, threshold=0.5) == BLK
+def test_confidence_head_emits_raw_logits_and_applies_sts():
+    head = DSparkConfidenceHead(hidden_size=HID, block_size=BLK)
+    logits = head(torch.randn(B, BLK, HID))
+    assert logits.shape == (B, BLK)
+    assert logits.dtype == torch.float32
+
+    temperatures = torch.tensor([1.0, 2.0, 4.0, 1.0, 1.0])
+    head.load_sts_temperatures(temperatures)
+    raw = torch.full((1, BLK), 4.0)
+    assert torch.allclose(head.apply_sts(raw), torch.sigmoid(raw / temperatures))
+
+
+@pytest.mark.parametrize(
+    ("temperatures", "message"),
+    [
+        (torch.ones(BLK + 1), "one per block position"),
+        (torch.zeros(BLK), "strictly positive"),
+    ],
+)
+def test_confidence_head_rejects_invalid_sts_tables(temperatures, message):
+    head = DSparkConfidenceHead(hidden_size=HID, block_size=BLK)
+    with pytest.raises(ValueError, match=message):
+        head.load_sts_temperatures(temperatures)
+
+
+def test_confidence_head_updates_sts_in_place():
+    head = DSparkConfidenceHead(hidden_size=HID, block_size=BLK)
+    storage = head.sts_temperatures
+
+    head.load_sts_temperatures(torch.full((BLK,), 2.0))
+
+    assert head.sts_temperatures is storage
+    assert "sts_temperatures" not in head.state_dict()
+
+
+def test_confidence_head_loads_checkpoint_weights_strictly():
+    head = DSparkConfidenceHead(hidden_size=HID, block_size=BLK)
+    weight = torch.randn(1, HID)
+    head.load_weights([{"proj.weight": weight}])
+    assert torch.equal(head.proj.weight, weight)
+
+    with pytest.raises(ValueError, match="bias=True"):
+        head.load_weights([{"proj.weight": weight, "proj.bias": torch.zeros(1)}])
+    with pytest.raises(ValueError, match="missing key"):
+        head.load_weights([{}])
+
+    biased = DSparkConfidenceHead(hidden_size=HID, block_size=BLK, bias=True)
+    bias = torch.randn(1)
+    biased.load_weights([{"proj.weight": weight, "proj.bias": bias}])
+    assert torch.equal(biased.proj.bias, bias)
 
 
 def test_confidence_head_with_markov_concat_dim():
@@ -115,3 +154,33 @@ def test_confidence_head_with_markov_concat_dim():
     assert out.shape == (B, BLK)
     with pytest.raises(AssertionError):
         head(hid)  # with_markov requires prev_embeddings
+
+
+# The anchor is a rejection-sampled token id, which can be -1 or out of vocab;
+# an unmasked lookup raises IndexError on CPU and asserts device-side on CUDA.
+@pytest.mark.parametrize("bad_token", [-1, VOCAB])
+def test_markov_bias_is_zero_for_out_of_vocab_anchor(bad_token):
+    torch.manual_seed(3)
+    w1, w2 = torch.randn(VOCAB, RANK), torch.randn(VOCAB, RANK)
+    prev = torch.tensor([0, bad_token], dtype=torch.long)
+
+    emb = markov_prev_embeddings(prev, w1)
+    assert torch.equal(emb[0], w1[0])
+    assert torch.all(emb[1] == 0.0)
+    assert torch.all(dspark_markov_step_bias(prev, w1, w2)[1] == 0.0)
+
+
+def test_markov_head_tolerates_out_of_vocab_anchor():
+    # Same guard reached through the module's get_prev_embeddings, which the
+    # gated/RNN heads also use.
+    torch.manual_seed(4)
+    head = VanillaMarkov(vocab_size=VOCAB, markov_rank=RANK).eval()
+    base = torch.randn(2, BLK, VOCAB)
+    first = torch.tensor([-1, 0], dtype=torch.long)
+    with torch.no_grad():
+        _, corrected = head.sample_block_tokens(
+            base, first_prev_token_ids=first, hidden_states=None, temperature=0.0
+        )
+    # Invalid anchor -> no step-0 bias; the valid neighbour still gets one.
+    assert torch.allclose(corrected[0, 0], base[0, 0], atol=1e-5)
+    assert not torch.allclose(corrected[1, 0], base[1, 0], atol=1e-5)

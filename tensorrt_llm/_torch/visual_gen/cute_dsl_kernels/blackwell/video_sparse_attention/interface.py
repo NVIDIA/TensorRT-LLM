@@ -17,7 +17,7 @@ Torch entry point for the CuTe DSL block-sparse attention forward.
 
 Blackwell (sm_100) fast path for VSA's fine stage. The kernel JIT-compiles
 on first call and is cached per process; the caller
-(CuTeDSLAttention._forward_vsa) falls back to dense SDPA when the
+(VSACuTeDSLAttention) falls back to dense SDPA when the
 device/dtype/head_dim envelope is not met.
 """
 

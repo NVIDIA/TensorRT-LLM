@@ -152,6 +152,10 @@ Use the escape hatch when you would rather have peer ranks reach their own
 timeouts — for example when attaching a debugger to a surviving rank, or when a
 harness collects per-rank state that a job-wide abort would destroy.
 
+Set `TLLM_HANG_DIAGNOSTICS=1` to enable additional PyExecutor diagnostics. It
+is disabled by default and remains silent unless initialization or execution
+hangs, then dumps worker stacks and the latest available executor state.
+
 ## DeepGEMM Barrier Timeout
 
 The DeepGEMM MegaMoE kernels synchronize expert-parallel ranks with in-kernel

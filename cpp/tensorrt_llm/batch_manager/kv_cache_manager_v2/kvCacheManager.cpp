@@ -227,6 +227,29 @@ int KvCacheManager::probeReuse(ReuseScope reuseScope, TokenSpan inputTokens, boo
     return matchReuse(reuseScope, inputTokens, knownNoDigest).numTokens;
 }
 
+std::optional<BlockKey> KvCacheManager::probeFirstNewBlockKey(
+    ReuseScope reuseScope, TokenSpan inputTokens, bool knownNoDigest) const
+{
+    // The matched Block* remain protected until the key has been copied out.
+    // Call matchReuse directly: probeReuse would nest shared-lock acquisitions.
+    auto const apiLock = lockShared();
+    auto const match = matchReuse(reuseScope, inputTokens, knownNoDigest);
+    int const blockSize = tokensPerBlock();
+    int const blockIndex = match.numTokens / blockSize;
+    size_t const begin = static_cast<size_t>(blockIndex) * static_cast<size_t>(blockSize);
+    if (begin + static_cast<size_t>(blockSize) > static_cast<size_t>(inputTokens.size()))
+    {
+        return std::nullopt;
+    }
+
+    // Derive the boundary from the final, pruned match, not the raw token path.
+    // A partial match can end in a block with a different suffix, so only the
+    // preceding fully matched block supplies the query's exact prefix key.
+    BlockKey const previousKey
+        = blockIndex == 0 ? RootBlock::makeKey(reuseScope) : match.blocks[BlockOrdinal{blockIndex - 1}]->key;
+    return Block::makeKey(previousKey, inputTokens.begin() + begin, static_cast<size_t>(blockSize), knownNoDigest);
+}
+
 // ---- Memory pool queries --------------------------------------------------
 
 MemAddress KvCacheManager::getMemPoolBaseAddress(
@@ -275,6 +298,13 @@ int KvCacheManager::getPageIndexScale(LayerId layerId, DataRole role) const
 {
     auto const& attr = mStorage->getBufferAttr(layerId, role);
     return mStorage->mSlotToPageIndices.at(attr.lifeCycleId).at(attr.poolIndex);
+}
+
+bool KvCacheManager::isSparse(LayerId layerId, DataRole role) const
+{
+    auto const& attr = mStorage->getBufferAttr(layerId, role);
+    auto const* attn = std::get_if<AttnLifeCycle>(&mLifeCycles[attr.lifeCycleId]);
+    return attn && attn->isSparse;
 }
 
 PageIndexConverter KvCacheManager::getPageIndexConverter(LayerId layerId, DataRole role) const
@@ -386,6 +416,11 @@ int KvCacheManager::tokensPerBlock() const noexcept
 bool KvCacheManager::enablePartialMatch() const noexcept
 {
     return mConfig.enablePartialReuse;
+}
+
+bool KvCacheManager::enablePartialCommit() const noexcept
+{
+    return mConfig.enablePartialCommit;
 }
 
 int KvCacheManager::numLayers() const noexcept
@@ -521,6 +556,49 @@ SsmSnapshotIterationStatsByLifeCycle KvCacheManager::getAndResetSsmSnapshotItera
     return stats;
 }
 
+TypedVec<PoolGroupIndex, StorageStatistics> KvCacheManager::getStorageStatistics(CacheLevel cacheLevel) const
+{
+    auto const apiLock = lockShared();
+    TypedVec<PoolGroupIndex, StorageStatistics> result;
+    PoolGroupIndex const numPoolGroups = mStorage->numPoolGroups(cacheLevel);
+    result.reserve(numPoolGroups);
+    for (PoolGroupIndex poolGroup{0}; poolGroup < numPoolGroups; ++poolGroup)
+    {
+        result.push_back(mStorage->getStatistics(cacheLevel, poolGroup));
+    }
+    return result;
+}
+
+TypedVec<LifeCycleId, PoolGroupIndex> KvCacheManager::getLifeCyclePoolGroupIndices(CacheLevel cacheLevel) const
+{
+    TypedVec<LifeCycleId, PoolGroupIndex> result;
+    result.reserve(mLifeCycles.size());
+    for (LifeCycleId lifeCycle{0}; lifeCycle < mLifeCycles.size(); ++lifeCycle)
+    {
+        result.push_back(mStorage->getPoolGroupIndex(cacheLevel, lifeCycle));
+    }
+    return result;
+}
+
+void KvCacheManager::commitReusedBlocksByLevel(ReusedBlocksByLevelByLifeCycle const& byLifeCycle)
+{
+    for (auto const& [lifeCycle, byLevel] : byLifeCycle)
+    {
+        if (!byLevel.empty())
+        {
+            mIterReusedBlocksByLevel[lifeCycle].add(byLevel);
+        }
+    }
+}
+
+ReusedBlocksByLevelByLifeCycle KvCacheManager::getAndResetIterationReusedBlocksByLevel()
+{
+    auto const apiLock = lockExclusive();
+    ReusedBlocksByLevelByLifeCycle byLifeCycle;
+    byLifeCycle.swap(mIterReusedBlocksByLevel);
+    return byLifeCycle;
+}
+
 void KvCacheManager::recordRequestSuspended()
 {
     auto const apiLock = lockExclusive();
@@ -539,6 +617,42 @@ void KvCacheManager::recordRequestResumed()
         return;
     }
     ++mIterResumedRequests;
+}
+
+void KvCacheManager::recordDiskPrefetchBlocks(int64_t numBlocks)
+{
+    TLLM_CHECK_DEBUG(numBlocks >= 0);
+    if (!mConfig.enableStats)
+    {
+        return;
+    }
+    mIterDiskPrefetchBlocks += numBlocks;
+}
+
+int64_t KvCacheManager::getAndResetIterationDiskPrefetchBlocks()
+{
+    auto const apiLock = lockExclusive();
+    auto const numBlocks = mIterDiskPrefetchBlocks;
+    mIterDiskPrefetchBlocks = 0;
+    return numBlocks;
+}
+
+void KvCacheManager::commitCachedTokensByLevel(CountsByLevel const& counts)
+{
+    TLLM_CHECK_DEBUG(std::all_of(counts.begin(), counts.end(), [](int64_t count) { return count >= 0; }));
+    if (!mConfig.enableStats)
+    {
+        return;
+    }
+    addCountsByLevel(mIterCachedTokensByLevel, counts);
+}
+
+CountsByLevel KvCacheManager::getAndResetIterationCachedTokensByLevel()
+{
+    auto const apiLock = lockExclusive();
+    CountsByLevel counts;
+    std::swap(counts, mIterCachedTokensByLevel);
+    return counts;
 }
 
 std::pair<int64_t, int64_t> KvCacheManager::getAndResetIterationSuspendResumeStats()
@@ -610,6 +724,15 @@ PeakBlockStatsByPoolGroup KvCacheManager::getAndResetIterationPeakBlockStats(Cac
     _updateIterationPeakNumBlocks();
     PeakBlockStatsByPoolGroup peak = mIterationPeakNumBlocksByCacheLevel.at(cacheLevel);
     _resetIterationPeakNumBlocks(cacheLevel);
+    return peak;
+}
+
+PeakBlockStatsByCacheLevel KvCacheManager::getAndResetIterationPeakBlockStatsByLevel()
+{
+    auto const apiLock = lockExclusive();
+    _updateIterationPeakNumBlocks();
+    PeakBlockStatsByCacheLevel peak = mIterationPeakNumBlocksByCacheLevel;
+    _resetIterationPeakNumBlocks();
     return peak;
 }
 
@@ -848,14 +971,20 @@ void KvCacheManager::tryUpdateTargetRatios()
     int avgReusedLength = static_cast<int>(std::round(mAvgReusedLength.value()));
     int avgCapacity = static_cast<int>(std::round(std::sqrt(mAvgSqrCapacity.value())));
     int avgHistoryLength = static_cast<int>(std::round(std::sqrt(mAvgSqrHistoryLength.value())));
+    int avgBeamWidth = std::max(1, static_cast<int>(std::round(mAvgBeamWidth.value())));
+    int avgPromptLength = std::max(0, static_cast<int>(std::round(mAvgPromptLength.value())));
     if (avgCapacity > 0)
     {
-        auto const lifeCycleRatio = mStorage->ratioFromLength(kHotLevel, tokensPerBlock, avgHistoryLength, avgCapacity);
+        auto const lifeCycleRatio = mStorage->ratioFromLength(
+            kHotLevel, tokensPerBlock, avgHistoryLength, avgCapacity, avgBeamWidth, avgPromptLength);
         mTargetRatioListHot = mStorage->constrainPoolGroupRatio(mStorage->toPoolGroupRatio(kHotLevel, lifeCycleRatio));
     }
     if (avgReusedLength > 0)
     {
         CacheLevel const coldLevel = mStorage->numCacheLevels() > CacheLevel{1} ? CacheLevel{1} : kHotLevel;
+        // The cold tiers hold committed pages, which are canonicalized to beam 0
+        // (_commitBlock() truncates the other beams away), so they never carry a
+        // beam factor no matter how wide the requests that produced them were.
         auto const lifeCycleRatio
             = mStorage->ratioFromLength(coldLevel, tokensPerBlock, avgReusedLength, avgReusedLength);
         mTargetRatioListCold = mStorage->toPoolGroupRatio(coldLevel, lifeCycleRatio);

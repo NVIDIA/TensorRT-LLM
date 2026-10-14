@@ -1,3 +1,17 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import ast
 import contextlib
 import copy
@@ -924,6 +938,7 @@ class AutoTuner:
         self.warmup = warmup
         self.stream_delay_micro_secs = stream_delay_micro_secs
         self.profiling_cache = AutoTunerProfilingCache()
+        self._primed_cached_tactics: set[tuple[str, str, str, str]] = set()
         self.is_tuning_mode = False
         self.skip_dynamic_tuning_buckets = False
 
@@ -1168,6 +1183,8 @@ class AutoTuner:
 
         # If it's tuning mode and cache hit, return the best runner and tactic to avoid redundant profiling.
         if self.is_tuning_mode and is_cache_hit:
+            self._prime_cached_tactics(custom_op, runners, tuning_config,
+                                       inputs, **kwargs)
             return (runners[best_runner_id], best_tactic)
 
         # PP rank does not have cache hit, so we try to receive the cache from the previous rank
@@ -1214,6 +1231,8 @@ class AutoTuner:
 
         self._maybe_sync_cache_data(tuning_config.distributed_tuning_strategy,
                                     custom_op)
+        self._prime_cached_tactics(custom_op, runners, tuning_config, inputs,
+                                   **kwargs)
 
         # If failed profiling tactics occurs, log the error.
         if new_tuning_failure_occurred:
@@ -1236,6 +1255,68 @@ class AutoTuner:
             custom_op] = self.stats.tuned_op_time_cost.get(
                 custom_op, 0) + tuning_end_time - tuning_start_time
         return (runners[runner_id], tactic)
+
+    def _prime_cached_tactics(
+        self,
+        custom_op: str,
+        runners: List[TunableRunner],
+        tuning_config: TuningConfig,
+        inputs: List[torch.Tensor],
+        **kwargs,
+    ) -> None:
+        """Compile cached winners in this process during tuning, not inference."""
+        if os.environ.get("TLLM_AUTOTUNER_PRIME_CACHED_TACTICS", "1") != "1":
+            return
+        # Cache hits may differ across ranks; collective runners must stay
+        # inside lockstep profiling, including profiling scratch allocation.
+        if tuning_config.distributed_tuning_strategy == DistributedTuningStrategy.MERGE:
+            return
+        jit_classes = {
+            type(r)
+            for r in runners
+            if isinstance(getattr(type(r), "kernel_cache", None), dict)
+        }
+        if not jit_classes:
+            return
+        for profile in self._optimization_profiles(tuning_config, inputs):
+            hit, runner_id, tactic, _ = self.profiling_cache.search_cache(
+                custom_op,
+                runners,
+                profile.get_opt_shapes(),
+                tuning_config,
+                apply_map_to_tuning_buckets=False,
+            )
+            if not hit:
+                continue
+            runner = runners[runner_id]
+            if type(runner) not in jit_classes:
+                continue
+            key = (custom_op, type(runner).__name__, str(runner.unique_id()),
+                   str(tactic))
+            if key in self._primed_cached_tactics:
+                continue
+            tensors = self._prepare_input_tensors(profile, inputs)
+            if tuning_config.inputs_pre_hook is not None:
+                tensors = tuning_config.inputs_pre_hook(tensors)
+            try:
+                with nvtx_range(f"{custom_op} prime tactic {tactic}"):
+                    if "do_preparation" in inspect.signature(
+                            runner.forward).parameters:
+                        runner(tensors,
+                               tactic=-1,
+                               do_preparation=True,
+                               **kwargs)
+                    runner(tensors, tactic=tactic, **kwargs)
+                self._primed_cached_tactics.add(key)
+            except Exception as e:
+                try:
+                    torch.cuda.synchronize()
+                except RuntimeError:
+                    pass
+                logger.warning(
+                    f"[Autotuner] Priming cached tactic failed for custom_op={custom_op}, "
+                    f"runner={type(runner).__name__}, tactic={tactic}, "
+                    f"shapes={profile.get_opt_shapes()}. Error: {e}")
 
     def _profile_runners(
         self,
@@ -1321,6 +1402,17 @@ class AutoTuner:
                         tuning_config,
                         apply_map_to_tuning_buckets=False))
                 has_tuning_failure_occurred = True
+            # The shortcut's candidate is recorded like the timed path's, so a
+            # run's log lists every pair either way: 0.000 is the documented
+            # recorded-without-profiling marker, a failure shows as inf. Same
+            # placement rationale as the timed path: after the handler, so a
+            # formatting error is never recorded as a tactic failure.
+            self._debug_logger(
+                f"[Autotuner] Candidate: custom_op={custom_op}, "
+                f"runner={runner}, tactic={tac}, "
+                f"shapes={profile.get_opt_shapes()}, "
+                f"time={(0.0 if best_runner_id is not None else float('inf')):.3f}ms"
+            )
         else:
             for runner_id, runner, runner_arg_names, all_valid_tactics in candidates:
                 valid_tactics = self._maybe_parallelize_tactics(
@@ -1377,6 +1469,11 @@ class AutoTuner:
                         # or some runtime error occurs during profiling.
                         time_measured = float('inf')
                         has_tuning_failure_occurred = True
+                    self._debug_logger(
+                        f"[Autotuner] Candidate: custom_op={custom_op}, "
+                        f"runner={runner}, tactic={tac}, "
+                        f"shapes={profile.get_opt_shapes()}, "
+                        f"time={time_measured:.3f}ms")
                     if time_measured < min_time:
                         min_time = time_measured
                         best_runner_id, best_tactic = runner_id, tac
@@ -1393,7 +1490,7 @@ class AutoTuner:
             self._debug_logger(
                 f"[Autotuner] Profiling runner={runners[best_runner_id]}, tactic={best_tactic} for cache_key={cache_key}."
             )
-            logger.debug(
+            self._debug_logger(
                 f"[Autotuner] Selected: custom_op={custom_op}, runner={runners[best_runner_id]}, "
                 f"tactic={best_tactic}, time={min_time:.3f}ms, fine_grained=OFF (disabled during tuning)"
             )

@@ -495,7 +495,8 @@ def _run(args: argparse.Namespace, artifact_dir: str) -> int:
         _log(f"removing export from a previous run: {export_path}")
         os.remove(export_path)
     _log("running: " + " ".join(cmd))
-    completed = subprocess.run(cmd, timeout=_env_int("AGENTX_DURATION", 3600) + 600)
+    grace = _env_int("AGENTX_TIMEOUT_GRACE", 900)
+    completed = subprocess.run(cmd, timeout=_env_int("AGENTX_DURATION", 3600) + grace)
 
     if not os.path.exists(export_path):
         # No export at all means aiperf died before writing results; its exit

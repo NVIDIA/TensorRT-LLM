@@ -263,19 +263,11 @@ class DeepgemmCudaW4a8Mxfp4Mxfp8Impl(MoEImplBase):
     """``deepgemm.cuda.mega_moe.w4a8_mxfp4_mxfp8``.
 
     DeepGEMM fused ``fp8_fp4_mega_moe``: MXFP4 weights, MXFP8 activations,
-    SM100/SM103. One class carries the identity and the whole contract:
-    construction, the MPI/process-group setup, the symmetric-buffer
-    allocation, the weight lifecycle, eligibility, quantization, and
-    ``run_moe``. That is the shape ``MOE_DEVELOPER_GUIDE.md`` asks for while
-    a backend supports a single quantization format -- an abstract parent
-    would carry no identity, implement nothing, and have one subclass.
+    SM100/SM103/SM107. One class carries the identity and the whole contract, which
+    is the shape ``MOE_DEVELOPER_GUIDE.md`` asks for while a backend serves a
+    single quantization format.
 
-    The kernel segment is absent from the name because the ``quant`` segment
-    already separates this one from the grouped-GEMM implementation, with which
-    it shares provider and technique.
-
-    ``MegaMoEDeepGemm`` below is an alias onto this class, so the
-    pre-identity name still resolves for the call sites that use it.
+    ``MegaMoEDeepGemm`` below is an alias onto this class.
     """
 
     descriptor = MoEImplDescriptor(
@@ -287,15 +279,13 @@ class DeepgemmCudaW4a8Mxfp4Mxfp8Impl(MoEImplBase):
         # Static and dynamic EPLB both work: see ``_supports_load_balancer``
         # below for why slot-id routing and DG-tensor migration are safe here.
         capabilities=MoEStaticCapability(supports_eplb=True),
-        doc="DeepGEMM fused fp8_fp4_mega_moe: MXFP4 weights, MXFP8 activations, SM100/SM103.",
+        doc="DeepGEMM fused fp8_fp4_mega_moe: MXFP4 weights, MXFP8 activations, SM100/SM103/SM107.",
     )
 
-    # Taken off the descriptor rather than restated. The scheduler reads these
-    # three attributes and the registry publishes the descriptor; a second
-    # literal would let what is published and what is executed drift apart.
-    # ``input_requirement`` keeps the descriptor default because this backend
-    # prepares its own inputs: ``quantize_input`` emits the FP8 + packed-UE8M0
-    # pair the kernel reads, and ``run_moe`` casts the routing slots itself.
+    # Taken off the descriptor, not restated: the scheduler reads these three
+    # attributes and the registry publishes the descriptor, so a second literal
+    # would let the two drift apart. ``input_requirement`` keeps the descriptor
+    # default because this backend prepares its own inputs.
     scheduler_kind = descriptor.scheduler_kind
 
     capabilities = descriptor.capabilities
@@ -334,7 +324,7 @@ class DeepgemmCudaW4a8Mxfp4Mxfp8Impl(MoEImplBase):
         if not is_sm_100f(d.env.sm):
             return _reject(
                 MoERejectReason.SM_UNSUPPORTED,
-                f"MegaMoEDeepGemm requires SM100 family (SM100 or SM103) "
+                f"MegaMoEDeepGemm requires SM100 family (SM100, SM103 or SM107) "
                 f"for DeepGEMM's fp8_fp4_mega_moe kernel; got SM{d.env.sm}",
             )
         if p.dtype_act not in cls._SUPPORTED_ACTIVATION_DTYPES:
@@ -353,19 +343,48 @@ class DeepgemmCudaW4a8Mxfp4Mxfp8Impl(MoEImplBase):
                 MoERejectReason.QUANT_UNSUPPORTED,
                 f"MegaMoEDeepGemm supports W4A8_MXFP4_MXFP8 only, got {p.quant_algo}",
             )
-        # TMA requires packed-UE8M0 scale-factor rows to be 16-byte aligned (K % 512 == 0).
+        # The 16-byte-aligned thing is the per-token scale-factor *record* in the
+        # symmetric dispatch buffer, not the weight SF row. DeepGEMM sizes those
+        # records as `Data(hidden / 32)` and `Data(intermediate_hidden / 32)`
+        # (`deep_gemm/include/deep_gemm/layout/mega_moe.cuh`, the `Buffer`
+        # layout), and `Data`'s constructor asserts `num_bytes % 16 == 0`.
+        #
+        # The two widths are not symmetric, which is why only `hidden_size` is
+        # held at 512 here:
+        #   * `input_sf_buffer` is the one SF buffer whose per-token record size
+        #     is an addressing stride -- `Buffer::get_data_buffer(token_idx)`
+        #     advances by it in `sm100_fp8_fp4_mega_moe.cuh`. One UE8M0 byte per
+        #     32 channels then makes `hidden % 512 == 0` a real requirement.
+        #   * `l2_sf_buffer` / `shared_l2_sf_buffer` are only ever taken as a
+        #     bare `get_base_ptr()` and indexed MN-major by the kernel, so their
+        #     record size only sizes the buffer. Both totals are 16-byte
+        #     multiples regardless of `intermediate_hidden % 512`, so requiring
+        #     TMA alignment on those records rejected valid shapes -- notably
+        #     DeepSeek-V4.1's `moe_intermediate_size = 2304`.
+        # `3rdparty/patches/deepgemm_mega_moe_intermediate_sf_alignment.patch`
+        # drops the two redundant asserts, leaving DeepGEMM's own host check
+        # (`intermediate_hidden % 128 == 0` in `csrc/apis/mega.hpp`) as the real
+        # constraint. Keep the guard below in sync with that patch: without it,
+        # a K that clears 128 but not 512 aborts inside
+        # `get_symm_buffer_size_for_mega_moe` before any GEMM runs.
+        #
+        # Do not relax `hidden_size` by reading the weight path either: the
+        # weight and activation SF *matrices* are MN-major, so their 16-byte
+        # alignment sits on MN (`check_sf_layout`'s
+        # `stride(-1) == get_tma_aligned_size(mn, ...)`). Those are a different
+        # tensor from the dispatch-buffer records.
         if p.hidden_size is not None and p.hidden_size % 512 != 0:
             return _reject(
                 MoERejectReason.SHAPE_UNALIGNED,
                 f"MegaMoEDeepGemm requires hidden_size % 512 == 0 "
-                f"(DeepGEMM TMA-aligned packed-UE8M0 SF row); "
+                f"(TMA-aligned packed-UE8M0 SF record in DeepGEMM's dispatch buffer); "
                 f"got hidden_size={p.hidden_size}",
             )
-        if p.intermediate_size is not None and p.intermediate_size % 512 != 0:
+        if p.intermediate_size is not None and p.intermediate_size % 128 != 0:
             return _reject(
                 MoERejectReason.SHAPE_UNALIGNED,
-                f"MegaMoEDeepGemm requires intermediate_size % 512 == 0 "
-                f"(DeepGEMM TMA-aligned packed-UE8M0 SF row); "
+                f"MegaMoEDeepGemm requires intermediate_size % 128 == 0 "
+                f"(DeepGEMM's `mega.hpp` host check); "
                 f"got intermediate_size={p.intermediate_size}",
             )
         if p.activation_type not in cls.activation_support.kinds:
@@ -602,16 +621,33 @@ class DeepgemmCudaW4a8Mxfp4Mxfp8Impl(MoEImplBase):
                 return (host, port)
             return None
 
-        # Respect pre-set launcher env vars (Slurm, Ray, torchrun).
-        if not all(os.environ.get(k) for k in ("MASTER_ADDR", "MASTER_PORT", "RANK", "WORLD_SIZE")):
+        # Respect launcher env vars only when they describe this MPI world.
+        # A disaggregated launcher may export its outer context/generation
+        # world into each server's independent model MPI world.
+        launcher_env_matches_mpi = False
+        launcher_port = None
+        if all(os.environ.get(k) for k in ("MASTER_ADDR", "MASTER_PORT", "RANK", "WORLD_SIZE")):
+            try:
+                # Parse the port here too: accepting the launcher env on
+                # RANK/WORLD_SIZE alone and only converting MASTER_PORT later
+                # turns a non-numeric port into an uncaught ValueError instead
+                # of falling back to the MPI rendezvous.
+                launcher_port = int(os.environ["MASTER_PORT"])
+                launcher_env_matches_mpi = (
+                    int(os.environ["RANK"]) == rank and int(os.environ["WORLD_SIZE"]) == world_size
+                )
+            except ValueError:
+                launcher_env_matches_mpi = False
+
+        if not launcher_env_matches_mpi:
             host, port = comm.bcast(_pick_rendezvous(), root=0)
-            os.environ.setdefault("MASTER_ADDR", host)
-            os.environ.setdefault("MASTER_PORT", str(port))
-            os.environ.setdefault("RANK", str(rank))
-            os.environ.setdefault("WORLD_SIZE", str(world_size))
+            os.environ["MASTER_ADDR"] = host
+            os.environ["MASTER_PORT"] = str(port)
+            os.environ["RANK"] = str(rank)
+            os.environ["WORLD_SIZE"] = str(world_size)
         else:
             host = os.environ["MASTER_ADDR"]
-            port = int(os.environ["MASTER_PORT"])
+            port = launcher_port
 
         device_id = None
         if torch.cuda.is_available() and torch.cuda.device_count() > 0:
@@ -901,8 +937,5 @@ class DeepgemmCudaW4a8Mxfp4Mxfp8Impl(MoEImplBase):
         return y.to(output_dtype)
 
 
-# The pre-identity name, kept as an alias rather than a base class: the
-# ``moe_backend="MEGAMOE_DEEPGEMM"`` call sites, the ``issubclass`` dispatch
-# in ``create_moe.py``, and the comments across the MoE tree that still say
-# ``MegaMoEDeepGemm`` all mean the class above.
+# An alias, not a base class, so there is no second class to keep in step.
 MegaMoEDeepGemm = DeepgemmCudaW4a8Mxfp4Mxfp8Impl

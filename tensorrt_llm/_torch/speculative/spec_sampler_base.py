@@ -73,12 +73,15 @@ UNSUPPORTED_TOP_P_DECAY_MSG = (
     "speculative decoding."
 )
 UNSUPPORTED_MIN_P_MSG = (
-    "min_p is not supported with one-model speculative decoding. "
-    "Drop min_p from the request, or disable speculative decoding."
+    "min_p requires 'advanced_sampling_mode: full' in the speculative decoding "
+    "config when using one-model speculative decoding. Restore that default, "
+    "drop min_p from the request, or disable speculative decoding."
 )
 
 
-def one_model_sampling_rejection_reason(sampling_params: Optional[SamplingParams]) -> Optional[str]:
+def one_model_sampling_rejection_reason(
+    sampling_params: Optional[SamplingParams], *, fused_sampling: bool = False
+) -> Optional[str]:
     """Why ``sampling_params`` cannot be served by the one-model speculative path.
 
     ``SpecSampler.validate_request`` is the authoritative check, but it runs on
@@ -113,8 +116,10 @@ def one_model_sampling_rejection_reason(sampling_params: Optional[SamplingParams
     # mean one thing here and another in the sampler.
     if SamplingParams.params_imply_top_p_decay_active(sampling_params.top_p_decay):
         return UNSUPPORTED_TOP_P_DECAY_MSG
+    # The one filter whose support depends on the deploy config rather than on
+    # sampling_params, so the caller has to supply it.
     min_p = sampling_params.min_p
-    if min_p and min_p > 0.0:
+    if min_p and min_p > 0.0 and not fused_sampling:
         return UNSUPPORTED_MIN_P_MSG
     return None
 
@@ -125,6 +130,9 @@ class SampleStateTensorsSpec(SampleStateTensors):
 
     new_tokens_lens: torch.Tensor
     next_draft_tokens: torch.Tensor
+    # Actual token windows, aligned with SampleStateSpec.requests, when the
+    # worker selects verification lengths on device.
+    verify_lens: Optional[torch.Tensor] = None
 
 
 @dataclass(kw_only=True)
@@ -165,15 +173,10 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
     def validate_request(self, request: LlmRequest) -> None:
         """Reject sampling parameters the one-model speculative path cannot honor.
 
-        The one-model sampling kernels take only temperature/top_k/top_p (see
-        SpecMetadata.populate_sampling_params_for_one_model); min_p has no
-        buffer there, so it would be silently dropped and the request would
-        decode from a different distribution than the user asked for. Threading
-        it through costs measurable throughput on the rejection path, so reject
-        instead. This sampler also does not return context logits, generation
-        logits, or log probabilities. Raised from validate_request (request
-        admission), so only the offending request fails rather than the whole
-        executor step.
+        The fused backend supports min_p; other one-model sampling backends do
+        not. This sampler also does not return context logits, generation logits,
+        or log probabilities. Raised during request admission, so only the
+        offending request fails rather than the whole executor step.
         """
         requested_outputs = (
             ("return_context_logits / prompt_logprobs", request.py_return_context_logits),
@@ -191,9 +194,8 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         sampling_config = request.sampling_config
         if sampling_config is None:
             return
-        # min_p lives on the C++ SamplingConfig as an optional scalar.
         min_p = sampling_config.min_p
-        if min_p and min_p > 0.0:
+        if min_p and min_p > 0.0 and not self._fused_sampling:
             raise ValueError(UNSUPPORTED_MIN_P_MSG)
         self._validate_unsupported_logits_processors(request)
         # The occurrence penalties need a [slots, vocab_size] workspace that is only
@@ -216,9 +218,9 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         if not self._penalty_supported:
             raise ValueError(
                 "repetition_penalty / presence_penalty / frequency_penalty are not "
-                "supported with tree speculative decoding (eagle_choices / dynamic "
-                "tree) yet. Drop the penalties, use a linear speculation mode, or "
-                "disable speculative decoding."
+                "supported with tree speculative decoding (dynamic tree) yet. Drop "
+                "the penalties, use a linear speculation mode, or disable "
+                "speculative decoding."
             )
 
     @staticmethod
@@ -263,27 +265,25 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         self,
         args: TorchSampler.Args,
         *,
-        accepted_path_len: Optional[int] = None,
         enable_penalty: bool = False,
         penalty_supported: bool = True,
+        fused_sampling: bool = False,
     ):
         """
         Initialize the speculative sampler.
 
         Args:
             args: TorchSampler.Args with max_num_sequences, max_seq_len, etc.
-            accepted_path_len: Upper bound on the number of tokens a single step
-                can accept, used to size new_tokens. Defaults to
-                ``args.max_draft_len + 1``; see the store comment below for the
-                one mode that has to override it.
             enable_penalty: whether the deploy enabled the occurrence penalties.
                 Only used to decide whether a request asking for them is admitted;
                 the penalties themselves are applied inside the worker.
             penalty_supported: whether this speculation mode's row layout is one
                 the penalties can map (linear modes yes, tree modes not yet).
+            fused_sampling: whether the configured sampler supports min_p.
         """
         self._enable_penalty = enable_penalty
         self._penalty_supported = penalty_supported
+        self._fused_sampling = fused_sampling
         self._async_worker_init(args.enable_async_worker)
         self.mapping = None
         self.max_seq_len = args.max_seq_len
@@ -298,23 +298,12 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         assert self.max_beam_width == 1, "beam width must be 1 for speculative decoding"
 
         # new_tokens holds the accepted tokens only, so it is sized to how many
-        # a step can accept rather than to the wire width. Normally that is
-        # max_draft_len + 1: the drafter advances max_draft_len times, and the
-        # golden token the target always accepts adds one. Verified against
-        # Eagle3 dynamic tree (K=6, T=60), MTP dynamic tree, PARD (T=2K-1) and
-        # the linear modes -- none exceed it.
-        #
-        # The exception is the deprecated eagle_choices static tree. There the
-        # one-model drafter ignores the tree and runs _forward_draft_loop, a
-        # linear loop over runtime_draft_len == max_total_draft_tokens, so a
-        # step can accept up to max_total_draft_tokens + 1 tokens even though
-        # max_draft_len only describes the depth of a tree that is never built.
-        # (Tree-aware acceptance lives in TorchSampler, i.e. the two-model
-        # path.) get_spec_decoder passes the wire width for that mode; both it
-        # and this workaround go away with the feature in release 1.4.
-        self.max_accepted_path_len = (
-            accepted_path_len if accepted_path_len is not None else args.max_draft_len + 1
-        )
+        # a step can accept rather than to the wire width: max_draft_len + 1,
+        # because the drafter advances max_draft_len times and the golden token
+        # the target always accepts adds one. Verified against Eagle3 dynamic
+        # tree (K=6, T=60), MTP dynamic tree, PARD (T=2K-1) and the linear
+        # modes -- none exceed it.
+        self.max_accepted_path_len = args.max_draft_len + 1
         self.store = self.Store(
             new_tokens=int_tensor((self.max_accepted_path_len, seq_slots, self.max_beam_width)),
             next_new_tokens=int_tensor(
@@ -352,9 +341,29 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         state.sampler_event.synchronize()
         new_tokens = state.host.new_tokens.tolist()
         new_tokens_lens_list = state.host.new_tokens_lens.tolist()
+        token_windows = (
+            state.host.verify_lens.tolist() if state.host.verify_lens is not None else None
+        )
         next_draft_tokens_list = state.host.next_draft_tokens.tolist()
         beam_idx = DEFAULT_BEAM_IDX
         runtime_draft_len = getattr(state, "runtime_draft_len", self.draft_len)
+
+        if token_windows is not None:
+            for request_index, request in enumerate(state.requests):
+                if request.state == LlmRequestState.GENERATION_COMPLETE:
+                    continue
+                token_window = token_windows[request_index]
+                num_new_tokens = new_tokens_lens_list[request.py_seq_slot]
+                max_new_tokens = min(token_window, self.max_accepted_path_len)
+                if state.draft_lens is not None:
+                    max_new_tokens = min(max_new_tokens, state.draft_lens[request_index] + 1)
+                if not 1 <= token_window <= runtime_draft_len + 1 or not (
+                    1 <= num_new_tokens <= max_new_tokens
+                ):
+                    raise ValueError(
+                        "executed verify_lens must be positive and new_tokens_lens must fit "
+                        "the executed window, original proposals, and token storage"
+                    )
 
         for req_idx, req in enumerate(state.requests):
             if req.state == LlmRequestState.GENERATION_COMPLETE:
@@ -379,16 +388,18 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
             # replaces py_draft_tokens with the next step's buffer, so its
             # length must not be used as the denominator (0 for the request's
             # prefill step, where nothing was verified).
-            req.py_num_draft_tokens_verified = (
-                state.draft_lens[req_idx] if state.draft_lens is not None else 0
+            verified_len = (
+                token_windows[req_idx] - 1 if token_windows is not None else runtime_draft_len
             )
-            req.py_rewind_len = runtime_draft_len - req.py_num_accepted_draft_tokens
+            drafted_len = state.draft_lens[req_idx] if state.draft_lens is not None else 0
+            req.py_num_draft_tokens_verified = min(drafted_len, verified_len)
+            req.py_rewind_len = verified_len - req.py_num_accepted_draft_tokens
             self._request_common_handling(req, next_draft_tokens_list, runtime_draft_len)
 
     def sample_async(
         self,
         scheduled_requests: ScheduledRequests,
-        outputs: dict[str, torch.Tensor],
+        outputs: dict[str, torch.Tensor | bool],
         num_context_logits_prefix_sum: list[int],
     ) -> SampleStateSpec:
         """
@@ -402,6 +413,10 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
                 - new_tokens_lens: [batch] number of accepted tokens
                 - next_draft_tokens: [batch, max_draft_len] draft tokens for next iter
                 - next_new_tokens: [batch, max_draft_len + 1] input for next iter
+                - verify_lens: optional int32 [output rows] executed token windows
+                - verify_lens_in_output_order: required True with verify_lens
+                - native_uniform_verify: optional boolean declaring uniform windows
+                - host_policy_windows_snapshot: legacy True is rejected
             num_context_logits_prefix_sum: Prefix sum of context logits (unused)
 
         Returns:
@@ -437,6 +452,42 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         ]
         o_next_new_tokens = outputs["next_new_tokens"][num_skip : num_skip + num_sampling_requests]
         runtime_draft_len = o_next_draft_tokens.shape[1]
+
+        o_verify_lens = outputs.get("verify_lens")
+        native_uniform = outputs.get("native_uniform_verify", False)
+        host_snapshot = outputs.get("host_policy_windows_snapshot", False)
+        output_order = outputs.get("verify_lens_in_output_order", False)
+        if any(
+            type(marker) is not bool for marker in (native_uniform, host_snapshot, output_order)
+        ):
+            raise ValueError("verification-window markers must be boolean")
+        if host_snapshot:
+            raise ValueError("legacy ragged producers must publish executed output-row verify_lens")
+        if native_uniform and (o_verify_lens is not None or output_order):
+            raise ValueError("native-uniform verification cannot also publish ragged windows")
+        if output_order != (o_verify_lens is not None):
+            raise ValueError("verify_lens requires an explicit output-row layout declaration")
+        if o_verify_lens is None:
+            if not native_uniform and any(
+                getattr(r, "py_verify_len", None) is not None for r in sampling_requests
+            ):
+                raise ValueError("ragged producers must publish executed output-row verify_lens")
+        else:
+            output_rows = outputs["new_tokens_lens"].shape[0]
+            if (
+                not isinstance(o_verify_lens, torch.Tensor)
+                or o_verify_lens.dim() != 1
+                or o_verify_lens.dtype != torch.int32
+                or o_verify_lens.device != outputs["new_tokens_lens"].device
+                or o_verify_lens.shape[0] != output_rows
+                or output_rows < num_skip + num_sampling_requests
+                or any(
+                    outputs[name].shape[0] != output_rows
+                    for name in ("new_tokens", "next_draft_tokens", "next_new_tokens")
+                )
+            ):
+                raise ValueError("verify_lens must contain one int32 token window per output row")
+            o_verify_lens = o_verify_lens[num_skip : num_skip + num_sampling_requests]
 
         # Pad or truncate to match fixed-size store buffers for index_copy_.
         # The worker output width tracks runtime_draft_len, which dynamic draft
@@ -480,6 +531,7 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
             new_tokens=self._copy_to_host(self.store.new_tokens),
             new_tokens_lens=self._copy_to_host(self.store.new_tokens_lens),
             next_draft_tokens=self._copy_to_host(self.store.next_draft_tokens),
+            verify_lens=(self._copy_to_host(o_verify_lens) if o_verify_lens is not None else None),
         )
         sampler_event = self._record_sampler_event()
 

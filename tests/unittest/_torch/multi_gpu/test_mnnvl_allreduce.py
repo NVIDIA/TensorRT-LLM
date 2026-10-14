@@ -26,9 +26,9 @@ from mpi4py import MPI
 from utils.util import skip_pre_blackwell
 
 import tensorrt_llm
-from tensorrt_llm._mnnvl_utils import MnnvlMemory
 from tensorrt_llm._torch.distributed import (AllReduce, AllReduceFusionOp,
                                              AllReduceParams)
+from tensorrt_llm._torch.distributed.mnnvl_memory import MnnvlMemory
 from tensorrt_llm._torch.distributed.ops import MNNVLAllReduce
 from tensorrt_llm.functional import AllReduceStrategy
 from tensorrt_llm.mapping import Mapping
@@ -286,7 +286,7 @@ def mnnvl_checkpoint_graph_forward(tensor_parallel_size: int,
             fresh_comm = MPI.COMM_WORLD.Split(0, tensor_parallel_rank)
             allreduce.mnnvl_allreduce.checkpoint_restore(fresh_comm)
             fresh_comm.Free()
-            allreduce.mnnvl_allreduce.checkpoint_restore(workspace["mpi_comm"])
+            allreduce.mnnvl_allreduce.checkpoint_restore(workspace["comm"])
             assert workspace["handle"].is_mapped()
             assert workspace["uc_buffer"].data_ptr() == uc_address
             assert workspace["handle"].get_mc_buffer((1, ), torch.float32,

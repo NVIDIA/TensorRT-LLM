@@ -44,6 +44,7 @@ class _StatsRequest:
     tokens: list[int]
     context_remaining_length: int
     py_request_id: int = field(init=False)
+    py_beam_width: int = 1
     lora_task_id: int | None = None
     cache_salt: str | None = None
     cache_salt_id: int | None = None
@@ -62,6 +63,7 @@ class _StatsRequest:
     draft_tokens: list[int] = field(default_factory=list)
     state: LlmRequestState = LlmRequestState.GENERATION_IN_PROGRESS
     context_current_position: int = 0
+    py_connector_served_position: int = 0
     context_chunk_size: int = 0
     expect_snapshot_points: list[int] = field(default_factory=list)
     prepopulated_prompt: tuple[int, int] | None = None

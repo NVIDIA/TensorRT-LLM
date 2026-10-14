@@ -33,6 +33,7 @@ from diffusers import WanImageToVideoPipeline as HFWanImageToVideoPipeline
 from diffusers import WanPipeline as HFWanPipeline
 from PIL import Image
 from utils.llm_data import get_checkpoint
+from utils.util import skip_pre_blackwell
 
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
 from tensorrt_llm.visual_gen.args import (
@@ -274,6 +275,7 @@ def _assert_pipeline_matches_hf(
 # ============================================================================
 
 
+@skip_pre_blackwell
 @pytest.mark.integration
 @pytest.mark.wan_t2v
 class TestWan22TI2V5B_T2V_PipelineCorrectness:
@@ -292,6 +294,7 @@ class TestWan22TI2V5B_T2V_PipelineCorrectness:
         )
 
 
+@skip_pre_blackwell
 @pytest.mark.integration
 @pytest.mark.wan_i2v
 class TestWan22TI2V5B_I2V_PipelineCorrectness:
@@ -315,6 +318,7 @@ class TestWan22TI2V5B_I2V_PipelineCorrectness:
 # =============================================================================
 
 
+@skip_pre_blackwell
 class TestWan22TI2V5BBatchGeneration:
     """Batch generation tests for Wan 2.2 TI2V-5B (single-stage, T2V and I2V modes)."""
 
@@ -407,6 +411,7 @@ class TestWan22TI2V5BBatchGeneration:
 # =============================================================================
 
 
+@skip_pre_blackwell
 @pytest.mark.integration
 @pytest.mark.wan_t2v
 @pytest.mark.wan_i2v

@@ -46,6 +46,7 @@ add_compile_definitions(TRTLLM_ABI_NAMESPACE=${TRTLLM_ABI_NAMESPACE})
 option(BUILD_PYT "Build in PyTorch TorchScript class mode" ON)
 option(BUILD_TESTS "Build Google tests" ON)
 option(BUILD_DEEP_EP "Build the Deep EP module" ON)
+option(BUILD_NCCL_EXTENSIONS "Build the nccl-extensions Python wheel" ON)
 option(BUILD_DEEP_GEMM "Build the DeepGEMM module" ON)
 option(BUILD_FLASH_MLA "Build the FlashMLA module" ON)
 option(BUILD_MICRO_BENCHMARKS "Build C++ micro benchmarks" OFF)
@@ -173,14 +174,14 @@ if(NOT TRTLLM_VERSION_H_INCLUDE_DIR STREQUAL
   include_directories(BEFORE "${TRTLLM_VERSION_H_INCLUDE_DIR}")
 endif()
 
-# Generated FMHA sources (see contextFusedMultiHeadAttention/CMakeLists.txt for
-# the full definition and default). fmha_cubin.h is included transitively by
-# headers used across several targets, so when generation is redirected out of
-# the source tree the directory must be on every target's include path, not just
-# the FMHA target's.
-if(DEFINED TRTLLM_FMHA_GEN_DIR AND NOT "${TRTLLM_FMHA_GEN_DIR}" STREQUAL "")
-  include_directories("${TRTLLM_FMHA_GEN_DIR}")
-endif()
+# Directory holding the generated FMHA sources (fmha_v2_cu/*.cu and
+# cubin/fmha_cubin.{h,cpp}). fmha_cubin.h is included transitively by headers
+# used across several targets, so the directory must be on every target's
+# include path, not just the FMHA target's.
+set(TRTLLM_FMHA_GEN_DIR
+    "${CMAKE_CURRENT_SOURCE_DIR}/tensorrt_llm/kernels/contextFusedMultiHeadAttention"
+    CACHE PATH "Directory containing generated FMHA sources")
+include_directories("${TRTLLM_FMHA_GEN_DIR}")
 
 setup_cuda_compiler()
 
@@ -236,7 +237,13 @@ else()
   list(APPEND CUDA_TOOLKIT_COMPONENTS nvrtc_static nvrtc_builtins_static)
 endif()
 
-find_package(CUDAToolkit 11.2 REQUIRED COMPONENTS ${CUDA_TOOLKIT_COMPONENTS})
+# TRT-LLM currently validates CUDA 13.x toolkits. Require CUDA major version 13
+# or newer to align with that coverage.
+find_package(CUDAToolkit 13.0 REQUIRED COMPONENTS ${CUDA_TOOLKIT_COMPONENTS})
+
+if(NOT WIN32)
+  find_package(NUMA REQUIRED)
+endif()
 
 set(CMAKE_CUDA_RUNTIME_LIBRARY Static)
 
@@ -346,11 +353,15 @@ if(ENABLE_MULTI_DEVICE)
   add_definitions("-DOMPI_SKIP_MPICXX")
 endif()
 
-# C++17
-set(CMAKE_CXX_STANDARD 17)
+# C++20 is required by the PyTorch headers starting with torch 2.14.
+set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_CUDA_STANDARD ${CMAKE_CXX_STANDARD})
+set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+# C++20 makes CMake scan the sources for module imports, which needs a scanner
+# the build images do not ship. Nothing here uses modules, so skip the scan.
+set(CMAKE_CXX_SCAN_FOR_MODULES OFF)
 
 if(UNIX)
   set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -g -O0 -fno-inline")
@@ -432,6 +443,18 @@ if(ENABLE_BOLT_COMPATIBLE AND NOT WIN32)
   add_compile_options(-fno-plt)
   # Linker flags - applies to shared, module, and executable targets
   add_link_options(-Wl,--emit-relocs)
+  # Ubuntu's aarch64 GCC turns on -mfix-cortex-a53-843419 by default, which
+  # makes the linker rewrite some loads as a branch to a veneer that performs
+  # the load and jumps back. BOLT reads that branch as a tail call, so when it
+  # relocates the function it patches the veneer's return site with an x16
+  # trampoline and destroys a live x16. Grace is not a Cortex-A53, so the
+  # workaround only costs us correctness here. Note there is no
+  # -Wl,--no-fix-cortex-a53-843419: GNU ld rejects it, the driver flag is the
+  # only way to stop the option being passed.
+  if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64" AND CMAKE_CXX_COMPILER_ID
+                                                        STREQUAL "GNU")
+    add_link_options(-mno-fix-cortex-a53-843419)
+  endif()
   # Disable stripping - required for BOLT (affects pybind11 POST_BUILD strip)
   set(CMAKE_STRIP
       ""
@@ -482,10 +505,10 @@ endif()
 
 if((WIN32))
   if((MSVC_VERSION GREATER_EQUAL 1914))
-    # MSVC does not apply the correct __cplusplus version per the C++ standard
-    # by default. This is required for compiling CUTLASS 3.0 kernels on windows
-    # with C++-17 constexpr enabled. The 2017 15.7 MSVC adds /Zc:__cplusplus to
-    # set __cplusplus to 201703 with std=c++17. See
+    # MSVC does not report the correct __cplusplus version per the C++ standard
+    # by default, which the CUTLASS kernels rely on to enable their constexpr
+    # paths. /Zc:__cplusplus makes it follow the standard it is compiling
+    # against. See
     # https://learn.microsoft.com/en-us/cpp/build/reference/zc-cplusplus for
     # more info.
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /Zc:__cplusplus")
