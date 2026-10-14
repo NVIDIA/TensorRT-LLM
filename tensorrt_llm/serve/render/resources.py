@@ -147,11 +147,14 @@ class RenderResources:
         fingerprint of these resources only matches a server that has none of
         those either; otherwise the caller must not trust ids it renders.
         """
+        use_harmony = harmony_enabled_for(model_type) if use_harmony is None else use_harmony
         return cls(
             tokenizer=tokenizer,
             model_type=model_type,
-            extension=get_serving_extension(model_type),
-            use_harmony=harmony_enabled_for(model_type) if use_harmony is None else use_harmony,
+            # Harmony is rendered by the gpt-oss extension, also when ``use_harmony`` is set
+            # explicitly for a checkpoint whose model type could not be resolved.
+            extension=get_serving_extension("gpt_oss" if use_harmony else model_type),
+            use_harmony=use_harmony,
             # The router does not police request-level templates; the worker
             # rejects a disallowed one when the request reaches it.
             allow_request_chat_template=True,

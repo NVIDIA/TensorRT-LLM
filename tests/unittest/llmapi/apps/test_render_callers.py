@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
@@ -28,8 +29,8 @@ from .render_helpers import (
     SERVER_TEMPLATE,
     WEATHER_TOOL,
     chat_request,
-    make_tokenizer,
     fallback_processor,
+    make_tokenizer,
     resources,
 )
 
@@ -317,6 +318,35 @@ class TestRouterWriteBack:
 
         assert res.use_harmony and fingerprint["compared"]["use_harmony"]
 
+    def test_an_explicit_use_harmony_renders_without_a_resolvable_model_type(
+        self, monkeypatch
+    ) -> None:
+        # No checkpoint path, so no model type: the operator sets use_harmony, as the router's
+        # warning says. The request must render through Harmony, not fail in the template path.
+        from utils.llm_data import llm_datasets_root
+
+        from tensorrt_llm.serve.chat_tokenization import tokenize_harmony_chat_request
+        from tensorrt_llm.serve.router import KvCacheAwareRouter
+
+        vocab = Path(llm_datasets_root()) / "tiktoken_vocab"
+        if not vocab.is_dir():
+            pytest.skip("the Harmony vocabulary is not available")
+        monkeypatch.setenv("TIKTOKEN_RS_CACHE_DIR", str(vocab))
+        monkeypatch.setenv("TIKTOKEN_ENCODINGS_BASE", str(vocab))
+        router = KvCacheAwareRouter(
+            server_role=None,
+            servers=["server1"],
+            use_tokens=False,
+            max_batch_size=32,
+            tokens_per_block=32,
+            use_harmony=True,
+        )
+        request = chat_request()
+
+        rendered = render_chat(request, router._render_resources("gpt-oss-20b"), tokenize=True)
+
+        assert rendered.token_ids == tokenize_harmony_chat_request(chat_request())
+
     def test_a_request_that_is_already_pre_tokenized_is_left_alone(self, router, tokenizer) -> None:
         self._trust(router, tokenizer)
         request = chat_request(prompt_token_ids=[4, 5, 6])
@@ -401,7 +431,7 @@ class TestCoordinatorFrontendWriteBack:
 
 
 class TestCountTokens:
-    def _client(self, tokenizer, chat_template=None):
+    def _client(self, tokenizer, chat_template=None, use_harmony=False):
         from fastapi import FastAPI
         from fastapi.testclient import TestClient
 
@@ -412,6 +442,9 @@ class TestCountTokens:
         server.model = "m"
         server.tokenizer = tokenizer
         server.chat_template = chat_template
+        if use_harmony:
+            server.use_harmony = True
+            server.model_config = SimpleNamespace(model_type="gpt_oss")
         app.add_api_route(
             "/v1/messages/count_tokens", server.anthropic_count_tokens, methods=["POST"]
         )
@@ -428,6 +461,36 @@ class TestCountTokens:
             resources(tokenizer),
         ).token_ids
         assert response.json() == {"input_tokens": len(executed)}
+
+    def test_a_harmony_server_counts_the_harmony_prompt(self, tokenizer, harmony_vocab) -> None:
+        from tensorrt_llm.serve.chat_tokenization import tokenize_harmony_chat_request
+
+        client = self._client(tokenizer, use_harmony=True)
+
+        response = client.post("/v1/messages/count_tokens", json=self.BODY)
+
+        assert response.status_code == 200, response.text
+        expected = tokenize_harmony_chat_request(
+            chat_request(messages=[{"role": "user", "content": "hello world"}])
+        )
+        assert response.json() == {"input_tokens": len(expected)}
+
+    def test_a_harmony_server_estimates_what_harmony_cannot_convert(
+        self, tokenizer, harmony_vocab
+    ) -> None:
+        # A tool without a description is rejected by Harmony; the count falls back to the
+        # template estimate instead of failing the call.
+        body = {
+            **self.BODY,
+            "tools": [{"name": "f", "input_schema": {"type": "object", "properties": {}}}],
+        }
+
+        response = self._client(tokenizer, use_harmony=True).post(
+            "/v1/messages/count_tokens", json=body
+        )
+
+        assert response.status_code == 200, response.text
+        assert response.json()["input_tokens"] > 0
 
     def test_the_server_template_is_part_of_the_count(self, tokenizer) -> None:
         plain = self._client(tokenizer).post("/v1/messages/count_tokens", json=self.BODY).json()

@@ -12,6 +12,7 @@ from unittest import mock
 import aiohttp
 import msgpack
 import pytest
+from llmapi.apps.render_helpers import use_harmony_vocab
 
 from tensorrt_llm.llmapi.disagg_utils import RouterConfig
 from tensorrt_llm.runtime.kv_cache_hash import (get_cache_salt_id,
@@ -2010,8 +2011,13 @@ def test_router_model_type_uses_checkpoint_config(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_gpt_oss_router_tokens_match_chat_harmony_server_input() -> None:
+async def test_gpt_oss_router_tokens_match_chat_harmony_server_input(
+        monkeypatch: pytest.MonkeyPatch) -> None:
     """KV-cache routing must hash the same Harmony tokens used by the server."""
+    use_harmony_vocab(monkeypatch)
+    from tensorrt_llm.serve.chat_tokenization import \
+        tokenize_harmony_chat_request
+    from tensorrt_llm.serve.harmony_adapter import get_harmony_adapter
     from tensorrt_llm.serve.openai_server import OpenAIServer
 
     router = KvCacheAwareRouter(server_role=None,
@@ -2021,10 +2027,7 @@ async def test_gpt_oss_router_tokens_match_chat_harmony_server_input() -> None:
                                 tokens_per_block=32,
                                 model_path="/models/gpt-oss-checkpoint")
     router_tokenizer = _mock_tokenizer(token_ids=[900, 901, 902])
-    harmony_tokens = [100, 101, 102, 103]
-    harmony_adapter = mock.MagicMock()
-    harmony_adapter.openai_to_harmony_tokens.return_value = harmony_tokens
-    harmony_adapter.get_stop_tokens.return_value = [42]
+    harmony_adapter = get_harmony_adapter()
     promise = mock.MagicMock()
     promise.prompt_token_ids = []
 
@@ -2045,6 +2048,7 @@ async def test_gpt_oss_router_tokens_match_chat_harmony_server_input() -> None:
     )
     router_request = copy.deepcopy(request)
     server_request = copy.deepcopy(request)
+    harmony_tokens = tokenize_harmony_chat_request(copy.deepcopy(request))
 
     server = OpenAIServer.__new__(OpenAIServer)
     server.allow_request_chat_template = False
@@ -2058,15 +2062,12 @@ async def test_gpt_oss_router_tokens_match_chat_harmony_server_input() -> None:
     server.tokenizer = SimpleNamespace(tokenizer=SimpleNamespace(
         vocab_size=1000))
 
-    with mock.patch.object(
-            router, "_get_tokenizer",
-            return_value=router_tokenizer), mock.patch(
-                "tensorrt_llm.serve.harmony_adapter."
-                "get_harmony_adapter",
-                return_value=harmony_adapter), mock.patch(
-                    "tensorrt_llm.serve.router_utils."
-                    "resolve_model_type_from_config",
-                    return_value="gpt_oss") as resolve_model_type:
+    with mock.patch.object(router,
+                           "_get_tokenizer",
+                           return_value=router_tokenizer), mock.patch(
+                               "tensorrt_llm.serve.router_utils."
+                               "resolve_model_type_from_config",
+                               return_value="gpt_oss") as resolve_model_type:
         # Tokens are forwarded only to workers that report the router's
         # rendering fingerprint.
         router._server_info = {
@@ -2082,9 +2083,7 @@ async def test_gpt_oss_router_tokens_match_chat_harmony_server_input() -> None:
         "inputs"]
     assert router_token_ids == server_token_ids
     assert router_request.prompt_token_ids == harmony_tokens
-    first_call, second_call = harmony_adapter.openai_to_harmony_tokens.call_args_list
-    assert first_call.args == second_call.args
-    assert first_call.kwargs == second_call.kwargs
+    assert server_token_ids == harmony_tokens
     resolve_model_type.assert_called_once_with("/models/gpt-oss-checkpoint")
     router_tokenizer.apply_chat_template.assert_not_called()
 
