@@ -506,7 +506,7 @@ void KvCache::activate()
 }
 
 bool KvCache::resume(std::optional<CUstream> stream, std::optional<bool> isDecoding,
-    std::optional<std::vector<LifeCycleId>> optionalReuseGroups, bool checkUtilization)
+    std::optional<std::vector<LifeCycleId>> optionalReuseGroups)
 {
     KVCM2_API_GUARD();
     TLLM_CHECK(mStatus == Status::SUSPENDED);
@@ -535,15 +535,11 @@ bool KvCache::resume(std::optional<CUstream> stream, std::optional<bool> isDecod
     }
 
     // Check utilization against threshold.
-    if (checkUtilization)
+    auto const utilizations = mManager->storage().getUtilization(kHotLevel);
+    float const utilization = utilizations.empty() ? 0.f : *std::max_element(utilizations.begin(), utilizations.end());
+    if (utilization > mManager->config().maxUtilForResume)
     {
-        auto const utilizations = mManager->storage().getUtilization(kHotLevel);
-        float const utilization
-            = utilizations.empty() ? 0.f : *std::max_element(utilizations.begin(), utilizations.end());
-        if (utilization > mManager->config().maxUtilForResume)
-        {
-            return false;
-        }
+        return false;
     }
 
     auto& storageMgr = mManager->storage();

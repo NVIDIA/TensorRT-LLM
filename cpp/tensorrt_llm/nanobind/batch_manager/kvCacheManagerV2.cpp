@@ -1917,7 +1917,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def(
             "resume",
             [](kv::KvCache& self, nb::object stream, std::optional<bool> isDecoding,
-                std::optional<std::vector<int>> groups, bool checkUtilization)
+                std::optional<std::vector<int>> groups)
             {
                 std::optional<CUstream> optStream;
                 if (!stream.is_none())
@@ -1932,10 +1932,10 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                     }
                 }
                 nb::gil_scoped_release rel;
-                return self.resume(optStream, isDecoding, std::move(selected), checkUtilization);
+                return self.resume(optStream, isDecoding, std::move(selected));
             },
             nb::arg("cuda_stream") = nb::none(), nb::arg("is_decoding") = nb::none(),
-            nb::arg("optional_reuse_groups") = nb::none(), nb::arg("check_utilization") = true)
+            nb::arg("optional_reuse_groups") = nb::none())
         .def("enter_decode", &kv::KvCache::enterDecode, nb::call_guard<nb::gil_scoped_release>())
         .def_prop_ro("is_decoding", &kv::KvCache::isDecoding)
         .def_prop_ro("expected_prompt_length", &kv::KvCache::expectedPromptLength)

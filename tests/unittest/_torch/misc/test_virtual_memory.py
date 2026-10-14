@@ -375,67 +375,6 @@ def test_kv_sleep_preserves_held_pages_under_cold_tier_pressure(
         mgr.shutdown()
 
 
-@pytest.mark.parametrize("restore_mode", [
-    virtual_memory.RestoreMode.NONE,
-    virtual_memory.RestoreMode.MEMSET,
-    virtual_memory.RestoreMode.CPU,
-    virtual_memory.RestoreMode.PINNED,
-])
-def test_kv_sleep_restores_caches_above_admission_threshold(restore_mode):
-    from tensorrt_llm.runtime.kv_cache_manager_v2 import ReuseScope
-
-    mgr = KVCacheManagerV2(
-        kv_cache_config=KvCacheConfig(
-            max_gpu_total_bytes=16 << 20,
-            host_cache_size=16 << 20,
-            max_util_for_resume=0.5,
-        ),
-        kv_cache_type=CacheType.SELF,
-        num_layers=1,
-        num_kv_heads=128,
-        head_dim=1024,
-        tokens_per_block=4,
-        max_seq_len=32,
-        max_batch_size=3,
-        mapping=Mapping(world_size=1, tp_size=1, rank=0),
-        dtype=tensorrt_llm.bindings.DataType.HALF,
-    )
-    try:
-        mgr.add_dummy_requests([123, 1, 2], token_nums=[4, 4, 4], is_gen=True)
-        capacities = {123: 8, 1: 12, 2: 12}
-        for req_id, capacity in capacities.items():
-            assert mgr.kv_cache_map[req_id].resize(capacity)
-        assert sum(stat.total
-                   for stat in mgr.impl.get_storage_statistics()) == 8
-        torch.cuda.synchronize()
-
-        # In any order, the first two caches exceed the admission threshold.
-        mgr.release_memory(restore_mode)
-        mgr.materialize_memory()
-        for req_id, capacity in capacities.items():
-            cache = mgr.kv_cache_map[req_id]
-            assert cache.is_active
-            assert cache.capacity == capacity
-
-        probe = mgr.impl.create_kv_cache(ReuseScope())
-        try:
-            # Normal admission still observes the utilization threshold.
-            assert not probe.resume(mgr._stream.cuda_stream)
-            resident = mgr.kv_cache_map[123]
-            resident.suspend()
-            assert probe.resume(check_utilization=False)
-            assert probe.resize(4)
-            probe.suspend()
-            assert resident.resume(check_utilization=False)
-            # Eight occupied slots leave no room for the held probe page.
-            assert not probe.resume(check_utilization=False)
-            assert not probe.is_active
-        finally:
-            probe.close()
-    finally:
-        mgr.shutdown()
-
-
 def test_cuda_graph(process_gpu_memory_info_available):
 
     def work(input: torch.Tensor) -> torch.Tensor:

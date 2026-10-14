@@ -6829,9 +6829,7 @@ class KVCacheManagerV2(BaseResourceManager):
             )
             self.kv_cache_map[req_id] = cache
             cache.enable_swa_scratch_reuse = state.enable_swa_scratch_reuse
-            if not cache.resume(
-                self._stream.cuda_stream, is_decoding=state.is_decoding, check_utilization=False
-            ):
+            if not cache.resume(self._stream.cuda_stream, is_decoding=state.is_decoding):
                 raise RuntimeError(f"Could not recreate KV cache for request {req_id}")
             cache.stop_committing()
             if not cache.resize(state.capacity, history_length=state.history_length):
@@ -6842,7 +6840,7 @@ class KVCacheManagerV2(BaseResourceManager):
             self._restore_page_index_bufs(req_id, cache)
         for req_id in self._sleeping_active_caches:
             cache = self.kv_cache_map[req_id]
-            if not cache.resume(self._stream.cuda_stream, check_utilization=False):
+            if not cache.resume(self._stream.cuda_stream):
                 raise RuntimeError(f"Could not resume KV cache for request {req_id}")
             self._restore_page_index_bufs(req_id, cache)
         if _GUARD_PAGE_REQUEST_ID in self.kv_cache_map:

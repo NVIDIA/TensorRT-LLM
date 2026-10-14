@@ -644,7 +644,6 @@ class _KVCache:
         cuda_stream: CudaStream | None = None,
         is_decoding: bool | None = None,
         optional_reuse_groups: Sequence[LayerGroupId] | None = None,
-        check_utilization: bool = True,
     ) -> bool: ...
     def enter_decode(self) -> bool: ...
     @property
