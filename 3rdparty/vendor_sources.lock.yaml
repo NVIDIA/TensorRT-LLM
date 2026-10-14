@@ -2,7 +2,7 @@ schema_version: 1
 vendors:
   flashinfer-prims-ts:
     url: https://github.com/harrisonzhy/flashinfer.git
-    branch: harrisonzhy/trtllm-prims-ts-dev_perf-bringup-20261012
+    branch: harrisonzhy/trtllm-prims-ts-dev_perf-bringup
     commit: ae312f7cc1723b06fda5168105ade0f328ee47d8
     source: flashinfer/attention/prims_ts
     destination: tensorrt_llm/_torch/attention/backends/prims_ts
