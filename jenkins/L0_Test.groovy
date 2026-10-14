@@ -171,6 +171,12 @@ SLURM_JOB_LOG_EVIDENCE_QUERY_IDS = [
     "nvlink-fabric-failure",
 ]
 
+PYTEST_TIMEOUT_EVIDENCE_QUERIES = [
+    [id: "pytest-timeout", allOf: ["TRTLLM_PYTEST_TIMEOUT "]],
+    [id: "pytest-timeout-attempt", allOf: ["TRTLLM_PYTEST_ATTEMPT "]],
+]
+PYTEST_TIMEOUT_EVIDENCE_LIMIT = 128
+
 // Maximum K8s infra-failure retries (total attempts = K8S_INFRA_RETRY_MAX + 1).
 // Kept distinct from SLURM_INFRA_RETRY_MAX so the two paths can be tuned
 // independently as production telemetry comes in. Patterns tagged scope=K8S
@@ -370,10 +376,6 @@ def collectSlurmJobLogEvidence(def pipeline, Map remote, String remoteLogPath) {
     }
 }
 
-def pytestTimeoutEvidenceQueries() {
-    return [[id: "pytest-timeout", allOf: ["TRTLLM_PYTEST_TIMEOUT "]]]
-}
-
 def timeoutEvidenceFile(String stageName) {
     String safeStageName = stageName.replaceAll(/[^A-Za-z0-9_.-]/, "_")
     String workspaceTmp = env.WORKSPACE_TMP ?: "${WORKSPACE}@tmp"
@@ -390,6 +392,24 @@ def clearTimeoutEvidence(String stageName) {
         throw interruptedError
     } catch (Exception cleanupError) {
         echo "Ignorable warning: could not remove timeout evidence for ${stageName}: ${cleanupError.message}"
+    }
+}
+
+def retainUnfinishedTimeoutEvidence(String stageName, String llmSrc) {
+    String evidenceFile = timeoutEvidenceFile(stageName)
+    if (!fileExists(evidenceFile)) {
+        return
+    }
+
+    String unfinishedTestFile = "${WORKSPACE}/${stageName}/unfinished_test.txt"
+    String helper = "${llmSrc}/jenkins/scripts/pytest_timeout_evidence.py"
+    int status = sh(
+        script: "python3 '${helper}' --evidence-file '${evidenceFile}' " +
+            "--unfinished-test-file '${unfinishedTestFile}'",
+        returnStatus: true,
+    )
+    if (status != 0) {
+        echo "Ignorable warning: could not scope timeout evidence before rerunning ${stageName}"
     }
 }
 
@@ -418,7 +438,7 @@ def recordTimeoutEvidenceLines(String stageName, Map evidence) {
 def collectOriginatingStepTimeoutEvidence(def pipeline, Throwable error, String stageName) {
     try {
         Map evidence = FailureEvidenceCollector.collectOriginatingStepMatchingLines(
-            pipeline, error, pytestTimeoutEvidenceQueries(), 128)
+            pipeline, error, PYTEST_TIMEOUT_EVIDENCE_QUERIES, PYTEST_TIMEOUT_EVIDENCE_LIMIT)
         recordTimeoutEvidenceLines(stageName, evidence)
     } catch (InterruptedException interruptedError) {
         throw interruptedError
@@ -430,9 +450,14 @@ def collectOriginatingStepTimeoutEvidence(def pipeline, Throwable error, String 
 
 def collectSlurmTimeoutEvidence(def pipeline, Map remote, String remoteLogPath, String stageName) {
     try {
-        String evidenceMarker = pytestTimeoutEvidenceQueries()[0].allOf[0]
+        def grepPatterns = PYTEST_TIMEOUT_EVIDENCE_QUERIES.collectMany {
+            (it.allOf ?: []) + (it.anyOf ?: [])
+        }.unique().collect {
+            "-e '" + it.replace("'", "'\"'\"'") + "'"
+        }.join(" ")
         String scanLog = "if [ -f '${remoteLogPath}' ]; then " +
-            "grep -aFi -m 128 -- '${evidenceMarker}' '${remoteLogPath}' 2>/dev/null || true; fi"
+            "grep -aF -m ${PYTEST_TIMEOUT_EVIDENCE_LIMIT} ${grepPatterns} " +
+            "-- '${remoteLogPath}' 2>/dev/null || true; fi"
         String candidateText = Utils.exec(
             pipeline,
             script: Utils.sshUserCmd(remote, Utils.bashWrappedRemoteCmd(scanLog)),
@@ -441,7 +466,7 @@ def collectSlurmTimeoutEvidence(def pipeline, Map remote, String remoteLogPath, 
             noNVDFEvent: true,
         ) ?: ""
         List<Map<String, Object>> matches = FailureEvidenceCollector.matchQueryLines(
-            candidateText, pytestTimeoutEvidenceQueries(), 128)
+            candidateText, PYTEST_TIMEOUT_EVIDENCE_QUERIES, PYTEST_TIMEOUT_EVIDENCE_LIMIT)
         Map evidence = [
             source: "SLURM_JOB_LOG",
             collectionStatus: matches.isEmpty() ? "NO_MATCH" : "MATCHED",
@@ -460,10 +485,12 @@ def collectSlurmTimeoutEvidence(def pipeline, Map remote, String remoteLogPath, 
 // the locally-staged result XMLs when the same stageName is uploaded more than
 // once in a build (e.g. SLURM infra-failure retries). First attempt passes "".
 def uploadResults(def pipeline, SlurmCluster cluster, String clusterName, String nodeName, String stageName, String postTag="", boolean suppressTestReporting=false) {
+    boolean localResultDirectoryMissing = false
     pipeline.stage('Submit Test Result') {
         sh "ls -al ${stageName}/ || true"
         if (!fileExists(stageName)) {
             echo "No local test-result directory for ${stageName}; skipping upload."
+            localResultDirectoryMissing = true
             return
         }
 
@@ -532,6 +559,10 @@ def uploadResults(def pipeline, SlurmCluster cluster, String clusterName, String
                 }
             }
         }
+    }
+
+    if (localResultDirectoryMissing) {
+        return
     }
 
     // For a reportable attempt, rename local results*.xml with postTag so
@@ -1608,18 +1639,20 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
             captureSlurmJobNodeList(pipeline, cluster, partition.clusterName, slurmJobID, placementContext, stageName)
         } finally {
             stage("Clean Up Slurm Resource") {
-                // Retry transient cleanup failures before leaving recovery to the sweep.
-                retry(3) {
+                // A pending stage failure should be reported promptly. Otherwise,
+                // retry transient cleanup failures before leaving recovery to the sweep.
+                int cleanupAttempts = primaryError == null ? 3 : 1
+                retry(cleanupAttempts) {
                     try {
                         cleanUpNodeResources(pipeline, cluster, partition.clusterName, nodeName, slurmJobID)
                     } catch (InterruptedException e) {
                         throw e
                     } catch (Exception e) {
-                        // retry(3) retries any exception. Keep the cleanup failure typed
+                        // Keep the cleanup failure typed
                         // so its cause and scope survive if all attempts fail; the outer
                         // preservePrimaryFailure then retains any original stage failure.
                         throw new InfraFailure(
-                            "Error during clean up SLURM resources: ${e.getMessage()} and retrying.",
+                            "Error during clean up SLURM resources: ${e.getMessage()}.",
                             e, InfraFailure.TRANSIENT, InfraFailure.SLURM, "<typed:slurm-cleanup-failure>")
                     }
                 }
@@ -2903,18 +2936,20 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
         } finally {
             try {
                 stage("Clean Up Slurm Resource") {
-                    // Retry transient cleanup failures before leaving recovery to the sweep.
-                    retry(3) {
+                    // A pending stage failure should be reported promptly. Otherwise,
+                    // retry transient cleanup failures before leaving recovery to the sweep.
+                    int cleanupAttempts = primaryError == null ? 3 : 1
+                    retry(cleanupAttempts) {
                         try {
                             cleanUpSlurmResources(pipeline, cluster, partition.clusterName, jobUID)
                         } catch (InterruptedException e) {
                             throw e
                         } catch (Exception e) {
-                            // retry(3) retries any exception. Keep the cleanup failure typed
+                            // Keep the cleanup failure typed
                             // so its cause and scope survive if all attempts fail; the outer
                             // preservePrimaryFailure then retains any original stage failure.
                             throw new InfraFailure(
-                                "Error during clean up SLURM resources: ${e.getMessage()} and retrying.",
+                                "Error during clean up SLURM resources: ${e.getMessage()}.",
                                 e, InfraFailure.TRANSIENT, InfraFailure.SLURM, "<typed:slurm-cleanup-failure>")
                         }
                     }
@@ -4392,10 +4427,7 @@ def generateTimeoutTestResultXml(pipeline, stageName) {
     def outputFilePath = "${curPath}/${stageName}/results-timeout.xml"
     def timeoutEvidencePath = timeoutEvidenceFile(stageName)
     sh """python3 ${scriptPath} --stage-name '${stageName}' --test-file-path 'unfinished_test.txt' --timeout-evidence-file '${timeoutEvidencePath}' --output-file '${outputFilePath}'"""
-    if (fileExists(outputFilePath)) {
-        return true
-    }
-    return false
+    return fileExists(outputFilePath)
 }
 
 def generateStageFailTestResultXml(stageName, subName, failureLog, resultPath) {
@@ -4822,6 +4854,12 @@ def rerunFailedTests(pipeline, stageName, llmSrc, testCmdLine, resultFileName="r
         def rerunProgressUrl = "https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/test-results/${rerunProgressTar}"
         def rerunDoneFile = "${WORKSPACE}/.rerun${times}-done-${stageName}"
         sh "rm -f ${rerunDoneFile}"
+        // A completed signal-mode timeout can be eligible for rerun. Remove its
+        // marker before the new invocation so a later OOM/agent loss with the
+        // same nodeid is classified as terminated_unexpectedly, not timeout.
+        // Records for genuinely unfinished tests remain; test_rerun.py places
+        // those tests in rerun_0.txt and does not execute them again.
+        retainUnfinishedTimeoutEvidence(stageName, llmSrc)
         try {
             withCredentials([usernamePassword(
                     credentialsId: 'urm-artifactory-creds',

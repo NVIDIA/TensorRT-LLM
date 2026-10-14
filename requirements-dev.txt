@@ -45,7 +45,7 @@ pytest-csv
 pytest-env
 pytest-forked
 pytest-xdist
-pytest-timeout
+pytest-timeout==2.4.0
 pytest-split
 pytest-mock
 pytest-threadleak

@@ -93,13 +93,7 @@ def generate_timeout_xml(
     num_tests = len(testList)
     timeout_count = sum(test in confirmed_timeout_tests for test in testList)
     terminated_unexpectedly_count = num_tests - timeout_count
-    durations = {
-        test: test_timeouts.get(test, _FALLBACK_TEST_TIME_SECONDS)
-        if test in confirmed_timeout_tests
-        else _FALLBACK_TEST_TIME_SECONDS
-        for test in testList
-    }
-    total_time = sum(durations.values())
+    total_time = sum(test_timeouts.get(test, _FALLBACK_TEST_TIME_SECONDS) for test in testList)
     # Escape stage_name for XML safety
     stage_name_escaped = escape(stage_name, quote=True)
     xmlContent = (
@@ -113,6 +107,7 @@ def generate_timeout_xml(
 
     for test in testList:
         classname, name, file = parse_xml_classname_name_file_from_testname(test, stage_name)
+        duration = test_timeouts.get(test, _FALLBACK_TEST_TIME_SECONDS)
         # Escape all XML attribute values
         classname_escaped = escape(classname, quote=True)
         name_escaped = escape(name, quote=True)
@@ -125,7 +120,7 @@ def generate_timeout_xml(
             )
         xmlContent += (
             f'<testcase classname="{classname_escaped}" name="{name_escaped}" '
-            f'file="{file_escaped}" time="{durations[test]:.2f}">\n'
+            f'file="{file_escaped}" time="{duration:.2f}">\n'
             f"        {error_block}\n"
             f"</testcase>\n"
         )
@@ -172,7 +167,7 @@ def main():
         print(f"Error reading {full_path}: {e}")
         return
 
-    if len(timeoutTests) == 0:
+    if not timeoutTests:
         print(f"No timeout tests found in {full_path}, skipping timeout XML generation")
         try:
             os.remove(outputFilePath)
@@ -181,11 +176,10 @@ def main():
         return
 
     test_timeouts = load_timeout_evidence(args.timeout_evidence_file, timeoutTests)
-    confirmed_timeout_tests = set(test_timeouts)
     print(
         f"Timeout classification summary for {stageName}: {len(timeoutTests)} unfinished, "
-        f"{len(confirmed_timeout_tests)} pytest_timeout, "
-        f"{len(timeoutTests) - len(confirmed_timeout_tests)} terminated_unexpectedly"
+        f"{len(test_timeouts)} pytest_timeout, "
+        f"{len(timeoutTests) - len(test_timeouts)} terminated_unexpectedly"
     )
     generate_timeout_xml(
         stageName,

@@ -46,31 +46,42 @@ except ImportError:
     Item = None  # type: ignore
 
 _TIMEOUT_EVIDENCE_MARKER = "TRTLLM_PYTEST_TIMEOUT "
+_TIMEOUT_ATTEMPT_MARKER = "TRTLLM_PYTEST_ATTEMPT "
 _TIMEOUT_EVIDENCE_PLUGIN_NAME = "trtllm_pytest_timeout_evidence"
 
 
-def _emit_timeout_evidence(item, settings) -> None:
-    """Emit an unbuffered record immediately before pytest-timeout terminates."""
+def _emit_timeout_record(marker, payload) -> None:
+    """Emit one unbuffered structured record."""
     try:
-        payload = json.dumps(
-            {
-                "nodeid": item.nodeid,
-                "timeout": float(settings.timeout),
-            },
-            separators=(",", ":"),
-        )
-        os.write(2, f"{_TIMEOUT_EVIDENCE_MARKER}{payload}\n".encode("utf-8"))
-    except (AttributeError, OSError, TypeError, UnicodeError, ValueError):
+        record = json.dumps(payload, separators=(",", ":"))
+        os.write(2, f"{marker}{record}\n".encode("utf-8"))
+    except (OSError, TypeError, UnicodeError, ValueError):
         # Timeout handling must proceed even if diagnostic output is unavailable.
         pass
+
+
+def _emit_timeout_event(marker, item, attempt, timeout=None) -> None:
+    """Emit one timeout or attempt event for an exact pytest nodeid."""
+    payload = {"nodeid": item.nodeid, "attempt": attempt}
+    if timeout is not None:
+        payload["timeout"] = float(timeout)
+    _emit_timeout_record(marker, payload)
 
 
 class _PytestTimeoutEvidencePlugin:
     """Preserve pytest-timeout behavior while adding exact nodeid evidence."""
 
+    def __init__(self):
+        self._attempts = {}
+
     @pytest.hookimpl(optionalhook=True, tryfirst=True)
     def pytest_timeout_set_timer(self, item, settings):
         import pytest_timeout
+
+        attempt = self._attempts.get(item.nodeid, 0) + 1
+        self._attempts[item.nodeid] = attempt
+        if attempt > 1:
+            _emit_timeout_event(_TIMEOUT_ATTEMPT_MARKER, item, attempt)
 
         timeout_method = settings.method
         if (timeout_method == "signal"
@@ -87,7 +98,8 @@ class _PytestTimeoutEvidencePlugin:
                 __tracebackhide__ = True
                 if timeout_is_suppressed():
                     return
-                _emit_timeout_evidence(item, settings)
+                _emit_timeout_event(_TIMEOUT_EVIDENCE_MARKER, item, attempt,
+                                    settings.timeout)
                 pytest_timeout.timeout_sigalrm(item, settings)
 
             def cancel():
@@ -102,7 +114,8 @@ class _PytestTimeoutEvidencePlugin:
             def expire():
                 if timeout_is_suppressed():
                     return
-                _emit_timeout_evidence(item, settings)
+                _emit_timeout_event(_TIMEOUT_EVIDENCE_MARKER, item, attempt,
+                                    settings.timeout)
                 pytest_timeout.timeout_timer(item, settings)
 
             timer = threading.Timer(settings.timeout, expire)
