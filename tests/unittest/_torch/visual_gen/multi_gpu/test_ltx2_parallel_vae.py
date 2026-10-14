@@ -42,7 +42,7 @@ def _cleanup_mpi_env():
 # Distributed helpers
 # ---------------------------------------------------------------------------
 def _init_worker(rank: int, world_size: int, port: int):
-    os.environ["MASTER_ADDR"] = "localhost"
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = str(port)
     os.environ["RANK"] = str(rank)
     os.environ["WORLD_SIZE"] = str(world_size)
