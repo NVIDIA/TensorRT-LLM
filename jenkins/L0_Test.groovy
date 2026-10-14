@@ -335,7 +335,9 @@ def collectSlurmJobLogEvidence(def pipeline, Map remote, String remoteLogPath) {
     def queries = FailureClassifier.failureEvidenceQueries(InfraFailure.SLURM).findAll {
         SLURM_JOB_LOG_EVIDENCE_QUERY_IDS.contains(it.id)
     }
-    def grepPatterns = queries.collectMany { it.anyOf }.collect {
+    def queryTerms = queries.collectMany { it.anyOf ?: [] }
+    if (!queryTerms) return [source: "SLURM_JOB_LOG", collectionStatus: "NO_MATCH"]
+    def grepPatterns = queryTerms.collect {
         "-e '" + it.replace("'", "'\"'\"'") + "'"
     }.join(" ")
     try {
