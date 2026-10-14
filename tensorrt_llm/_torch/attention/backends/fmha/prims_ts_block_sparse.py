@@ -47,10 +47,7 @@ if TYPE_CHECKING:
         BlockSparsePagedTSWrapper,
         BlockSparseTSWrapper,
     )
-    from tensorrt_llm._torch.attention.backends.trtllm import (
-        TrtllmAttention,
-        TrtllmAttentionMetadata,
-    )
+    from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 
 from tensorrt_llm._torch.attention.backends.prims_ts import (
     BlockSparsePagedTSWrapper as _BlockSparsePagedTSWrapper,
@@ -190,30 +187,9 @@ def _uniform_seq_len_q(
 class PrimsTSBlockSparseFmha(PrimsTSFmha):
     """Contiguous context and fixed-Q paged generation block-sparse FMHA."""
 
+    PLAN_CACHE_KEY = "prims_ts_block_sparse"
+
     supports_block_sparse_inputs = True
-
-    def __init__(self, attn: "TrtllmAttention") -> None:
-        super().__init__(attn)
-        self._contiguous_wrappers: dict[_BlockSparsePlanKey, "BlockSparseTSWrapper"] = {}
-        self._paged_wrappers: dict[_BlockSparsePlanKey, "BlockSparsePagedTSWrapper"] = {}
-
-    def bind_plan_cache(self, cache_state: dict[str, object]) -> None:
-        """Share planned wrappers with every adapter bound to ``cache_state``.
-
-        Attention layers that execute serially, such as the blocks of one
-        diffusion transformer, see identical static profiles. Binding them to
-        one model-scoped container plans each profile once and allocates its
-        route workspace once. Call before the first forward.
-        """
-
-        self._contiguous_wrappers = cast(
-            dict[_BlockSparsePlanKey, "BlockSparseTSWrapper"],
-            cache_state.setdefault("contiguous_wrappers", {}),
-        )
-        self._paged_wrappers = cast(
-            dict[_BlockSparsePlanKey, "BlockSparsePagedTSWrapper"],
-            cache_state.setdefault("paged_wrappers", {}),
-        )
 
     def _is_supported(
         self,
@@ -331,8 +307,15 @@ class PrimsTSBlockSparseFmha(PrimsTSFmha):
     def _get_or_plan_wrapper(
         self,
         key: _BlockSparsePlanKey,
+        metadata: "TrtllmAttentionMetadata",
     ) -> "BlockSparseTSWrapper | BlockSparsePagedTSWrapper":
-        cache = self._paged_wrappers if key.page_size is not None else self._contiguous_wrappers
+        """Return the planned wrapper for ``key`` from the metadata's plan cache.
+
+        The cache lives on the attention metadata, like the FlashInfer wrappers
+        and the MSA plans, so every layer that runs with one metadata object
+        reuses a plan and its graph-stable route workspace.
+        """
+        cache = metadata.fmha_plan_caches.setdefault(self.PLAN_CACHE_KEY, {})
         wrapper = cache.get(key)
         if wrapper is None:
             wrapper = key.plan()
@@ -516,7 +499,7 @@ class PrimsTSBlockSparseFmha(PrimsTSFmha):
             page_size=page_size,
             mask_type=self._get_prims_mask_type(forward_args),
         )
-        wrapper = cast("BlockSparsePagedTSWrapper", self._get_or_plan_wrapper(key))
+        wrapper = cast("BlockSparsePagedTSWrapper", self._get_or_plan_wrapper(key, metadata))
         wrapper.run(
             query,
             (k_cache, v_cache),
@@ -534,6 +517,7 @@ class PrimsTSBlockSparseFmha(PrimsTSFmha):
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
+        metadata: "TrtllmAttentionMetadata",
         forward_args: AttentionForwardArgs,
     ) -> None:
         inputs = _get_block_sparse_inputs(forward_args)
@@ -552,7 +536,7 @@ class PrimsTSBlockSparseFmha(PrimsTSFmha):
             page_size=None,
             mask_type=self._get_prims_mask_type(forward_args),
         )
-        wrapper = cast("BlockSparseTSWrapper", self._get_or_plan_wrapper(key))
+        wrapper = cast("BlockSparseTSWrapper", self._get_or_plan_wrapper(key, metadata))
         wrapper.run(
             query,
             key_states,
@@ -577,6 +561,6 @@ class PrimsTSBlockSparseFmha(PrimsTSFmha):
     ) -> None:
         if metadata.kv_cache_manager is None:
             assert k is not None and v is not None
-            self._forward_contiguous(q, k, v, forward_args)
+            self._forward_contiguous(q, k, v, metadata, forward_args)
             return
         super().forward(q, k, v, metadata, forward_args)

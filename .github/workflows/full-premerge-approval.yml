@@ -112,7 +112,6 @@ jobs:
                     reviewThreads(first: 100) {
                       nodes {
                         isResolved
-                        isOutdated
                       }
                       pageInfo {
                         hasNextPage
@@ -150,7 +149,7 @@ jobs:
               );
               const hasUnresolvedConversation =
                 (pullRequest.reviewThreads?.nodes ?? []).some(
-                  (thread) => !thread.isResolved && !thread.isOutdated
+                  (thread) => !thread.isResolved
                 );
               const opinionsComplete =
                 pullRequest.latestOpinionatedReviews?.pageInfo?.hasNextPage === false;

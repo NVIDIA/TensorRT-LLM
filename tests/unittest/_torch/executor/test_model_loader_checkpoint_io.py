@@ -67,6 +67,92 @@ def test_hf_subclasses_keep_polymorphic_load_weights(
     )
 
 
+@pytest.mark.parametrize("policy", ["native", "rank_striped_read_ahead"])
+@pytest.mark.parametrize("session", [False, True])
+def test_context_only_loading_keeps_unused_checkpoint_tensors_lazy(
+    monkeypatch: pytest.MonkeyPatch, policy: str, session: bool
+) -> None:
+    loader = HfCheckpointLoader(weight_loader=HfWeightLoader(checkpoint_io_policy=policy))
+    lazy_weights = {"layers.0.weight": object(), "layers.39.weight": object()}
+    lazy_load = MagicMock(return_value=lazy_weights)
+    eager_load = MagicMock(side_effect=AssertionError("must not read unused decoder tensors"))
+    reader_session = MagicMock(side_effect=AssertionError("must not prefetch decoder tensors"))
+    monkeypatch.setattr(loader.weight_loader, "_load_lazy_safetensors", lazy_load)
+    monkeypatch.setattr(loader.weight_loader, "_load_weights_native", eager_load)
+    monkeypatch.setattr(loader.weight_loader, "open_weight_session", reader_session)
+    model = SimpleNamespace(model=SimpleNamespace(disagg_context_only=True))
+    options = dict(mapping=Mapping(), model=model, use_consolidated=True)
+
+    if session:
+        with loader.open_weight_session("/checkpoint", **options) as weights:
+            assert weights is lazy_weights
+    else:
+        assert loader.load_weights("/checkpoint", **options) is lazy_weights
+
+    lazy_load.assert_called_once_with("/checkpoint", True)
+    eager_load.assert_not_called()
+    reader_session.assert_not_called()
+    status = loader.weight_loader.last_checkpoint_io_status
+    assert status.requested == policy
+    assert status.selected == status.effective == "native"
+    assert not status.activated
+    if policy != "native":
+        assert "context-only" in status.fallback_reason
+
+
+@pytest.mark.parametrize("context_only", [False, None])
+def test_full_model_loading_retains_existing_checkpoint_reader(
+    monkeypatch: pytest.MonkeyPatch, context_only: bool | None
+) -> None:
+    loader = HfCheckpointLoader()
+    expected = {"decoder.weight": object()}
+    eager_load = MagicMock(return_value=expected)
+    lazy_load = MagicMock(side_effect=AssertionError("must keep normal checkpoint loading"))
+    monkeypatch.setattr(loader.weight_loader, "_load_weights_native", eager_load)
+    monkeypatch.setattr(loader.weight_loader, "_load_lazy_safetensors", lazy_load)
+    body = SimpleNamespace()
+    if context_only is not None:
+        body.disagg_context_only = context_only
+    model = SimpleNamespace(model=body)
+    mapping = Mapping()
+
+    with loader.open_weight_session("/checkpoint", mapping=mapping, model=model) as weights:
+        assert weights is expected
+
+    eager_load.assert_called_once_with("/checkpoint", mapping, False, model=model)
+    lazy_load.assert_not_called()
+
+
+@pytest.mark.parametrize("custom_wrapper", [False, True])
+def test_context_only_flag_preserves_custom_checkpoint_loader(
+    monkeypatch: pytest.MonkeyPatch, custom_wrapper: bool
+) -> None:
+    class _CustomCheckpointLoader(HfCheckpointLoader):
+        pass
+
+    class _CustomWeightLoader(HfWeightLoader):
+        pass
+
+    loader = (
+        _CustomCheckpointLoader()
+        if custom_wrapper
+        else HfCheckpointLoader(weight_loader=_CustomWeightLoader())
+    )
+    expected = {"custom.weight": object()}
+    custom_load = MagicMock(return_value=expected)
+    lazy_load = MagicMock(side_effect=AssertionError("must not replace a custom loader"))
+    monkeypatch.setattr(loader.weight_loader, "load_weights", custom_load)
+    monkeypatch.setattr(loader.weight_loader, "_load_lazy_safetensors", lazy_load)
+    model = SimpleNamespace(model=SimpleNamespace(disagg_context_only=True))
+    mapping = Mapping()
+
+    with loader.open_weight_session("/checkpoint", mapping=mapping, model=model) as weights:
+        assert weights is expected
+
+    custom_load.assert_called_once_with("/checkpoint", mapping=mapping, model=model)
+    lazy_load.assert_not_called()
+
+
 @pytest.mark.parametrize("requested", ["auto", "rank_striped_read_ahead"])
 def test_construct_checkpoint_loader_selects_rank_striped_for_builtin_hf(
     requested: Literal["auto", "rank_striped_read_ahead"],
@@ -399,15 +485,13 @@ def test_shadow_plan_is_advisory_and_preserves_materialization_order(
     events = []
     checkpoint_loader = _SessionCheckpointLoader(events)
     checkpoint_loader.build_checkpoint_catalog = MagicMock(
-        side_effect=lambda *_args, **_kwargs: (events.append("catalog") or catalog)
+        side_effect=lambda *_args, **_kwargs: events.append("catalog") or catalog
     )
     weight_mapper = SimpleNamespace(
-        build_weight_load_plan=MagicMock(
-            side_effect=lambda _catalog: (events.append("plan") or plan)
-        )
+        build_weight_load_plan=MagicMock(side_effect=lambda _catalog: events.append("plan") or plan)
     )
     checkpoint_loader.get_initialized_weight_mapper = MagicMock(
-        side_effect=lambda *_args: (events.append("mapper_init") or weight_mapper)
+        side_effect=lambda *_args: events.append("mapper_init") or weight_mapper
     )
     model = MagicMock()
     loader = ModelLoader.__new__(ModelLoader)
@@ -486,7 +570,7 @@ def test_draft_session_spans_mapper_and_materialization(
         demands=(WeightDemand("all", ("draft.weight",), (0,)),),
     )
     checkpoint_loader.build_checkpoint_catalog = MagicMock(
-        side_effect=lambda *_args, **_kwargs: (events.append("catalog") or catalog)
+        side_effect=lambda *_args, **_kwargs: events.append("catalog") or catalog
     )
     model = MagicMock()
     model.draft_config = SimpleNamespace(
@@ -501,9 +585,7 @@ def test_draft_session_spans_mapper_and_materialization(
     )
     draft_mapper = MagicMock()
     draft_mapper.init_model_and_config.side_effect = lambda *_args: events.append("mapper_init")
-    draft_mapper.build_weight_load_plan.side_effect = lambda _catalog: (
-        events.append("plan") or plan
-    )
+    draft_mapper.build_weight_load_plan.side_effect = lambda _catalog: events.append("plan") or plan
     monkeypatch.setattr(
         model_loader_module.AutoCheckpointMapper, "get", MagicMock(return_value=draft_mapper)
     )
@@ -539,7 +621,7 @@ def test_mtp_draft_session_reuses_target_mapper_during_materialization(
         demands=(WeightDemand("all", ("draft.weight",), (0,)),),
     )
     checkpoint_loader.build_checkpoint_catalog = MagicMock(
-        side_effect=lambda *_args, **_kwargs: (events.append("catalog") or catalog)
+        side_effect=lambda *_args, **_kwargs: events.append("catalog") or catalog
     )
     model = MagicMock()
     model.draft_config = None
@@ -548,9 +630,7 @@ def test_mtp_draft_session_reuses_target_mapper_during_materialization(
     loader.spec_config = SimpleNamespace(speculative_model="/draft")
     loader.mapping = object()
     loader.weight_mapper = SimpleNamespace(
-        build_weight_load_plan=MagicMock(
-            side_effect=lambda _catalog: (events.append("plan") or plan)
-        )
+        build_weight_load_plan=MagicMock(side_effect=lambda _catalog: events.append("plan") or plan)
     )
     loader._call_load_weights = MagicMock(
         side_effect=lambda *_args, **_kwargs: events.append("materialize")

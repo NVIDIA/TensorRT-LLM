@@ -41,7 +41,7 @@ from ...distributed.ops import AllReduce
 from ...modules.gated_mlp import GatedMLP
 from ...modules.linear import Linear, TensorParallelMode
 from ...modules.mlp import MLP
-from ..modules.attention import Attention, QKVMode
+from ..attention.attention import Attention, QKVMode
 from ..modules.rms_norm import RMSNormTPAware
 
 if TYPE_CHECKING:

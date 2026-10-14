@@ -1527,7 +1527,7 @@ void preallocateNCCLWindowBuffer(
     {
         for (int64_t i = 0; i < buffersPerSize; ++i)
         {
-            auto buffer = allocator.requestBuffer(comm, bufferSize);
+            auto buffer = allocator.requestBuffer(comm, bufferSize, at::cuda::getCurrentCUDAStream().stream());
             if (!buffer.isValid())
             {
                 break;

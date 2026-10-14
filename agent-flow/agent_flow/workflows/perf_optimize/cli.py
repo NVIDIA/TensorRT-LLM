@@ -5,11 +5,12 @@ import sys
 from pathlib import Path
 
 from agent_flow.agent_runtime import resolve_agent_config
+from agent_flow.prompts import dump_prompt_bundle
 from agent_flow.workflows.perf_analyze.sol_methodology import resolve_sol_methodology
 from agent_flow.workflows.perf_analyze.task_schema import casebook_enabled
 
 from .disagg import has_disagg
-from .prompts import build_perf_optimize_prompts
+from .prompts import PROMPTS_DIRNAME, build_perf_optimize_prompts
 from .state import STATE_FILENAME
 from .task_schema import (
     TaskSchemaError,
@@ -66,7 +67,9 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=Path("workspace/perf-optimize"),
         help="Workspace directory for shared state (task.yaml, roadmap.yaml, "
         "sol_projection.md, baseline/, tuning/, rounds/, "
-        "optimization_report.md/.html, progress.yaml) and run artifacts.",
+        "optimization_report.md/.html, progress.yaml, prompts/) and run "
+        "artifacts. Each launch snapshots every role's composed system "
+        "prompt to prompts/<role>.md.",
     )
     parser.add_argument(
         "--clean",
@@ -155,6 +158,8 @@ def main(argv: list[str] | None = None) -> None:
         reuse_analysis=args.reuse_analysis,
         sol_methodology=methodology,
     ) as workflow:
+        prompt_dir = args.workspace / PROMPTS_DIRNAME
+        dump_prompt_bundle(prompts, prompt_dir)
         workflow.run(args.task)
 
 

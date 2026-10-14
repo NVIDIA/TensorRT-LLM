@@ -30,6 +30,7 @@ import pytest
 
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
+from tensorrt_llm.bindings.internal.batch_manager import CacheType
 
 
 def _mgr(cp_rank: int, cp_size: int, phys: int) -> SimpleNamespace:
@@ -222,6 +223,7 @@ def test_update_resources_leaves_history_untouched_under_helix() -> None:
         # is_draft=True skips the module-level draft-token relocation call;
         # with zero reserve tokens the rewind math is unchanged.
         is_draft=True,
+        kv_cache_type=CacheType.SELF,
         _kv_reserve_draft_tokens=0,
         # No scheduler ran, so nothing recorded a generation allocation; the
         # rewind falls back to the reserve width.
@@ -229,6 +231,8 @@ def test_update_resources_leaves_history_untouched_under_helix() -> None:
         kv_cache_map={7: kv},
         kv_compression_manages_history=False,
         _has_cp_helix=True,
+        # No lender attached, so a resize has no one to tell.
+        _sharing=None,
     )
     batch = SimpleNamespace(generation_requests=[req])
     KVCacheManagerV2.update_resources(mgr, batch)

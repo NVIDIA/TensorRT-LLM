@@ -5,8 +5,9 @@ import sys
 from pathlib import Path
 
 from agent_flow.agent_runtime import resolve_agent_config
+from agent_flow.prompts import dump_prompt_bundle
 
-from .prompts import build_perf_analyze_prompts
+from .prompts import PROMPTS_DIRNAME, build_perf_analyze_prompts
 from .sol_methodology import resolve_sol_methodology
 from .state import STATE_FILENAME
 from .task_schema import (
@@ -46,8 +47,10 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=Path("workspace/perf-analyze"),
         help="Workspace directory for shared state files (task.yaml, "
         "benchmark_results.md, sol_projection.md, profile_findings.md, "
-        "performance_report.md/.html, progress.yaml) and run artifacts "
-        "(serve.log, result JSON, *.nsys-rep, *.ncu-rep).",
+        "performance_report.md/.html, progress.yaml, prompts/) and run "
+        "artifacts (serve.log, result JSON, *.nsys-rep, *.ncu-rep). Each "
+        "launch snapshots every role's composed system prompt to "
+        "prompts/<role>.md.",
     )
     parser.add_argument(
         "--clean",
@@ -94,6 +97,8 @@ def main(argv: list[str] | None = None) -> None:
         prompts=prompts,
         sol_methodology=methodology,
     ) as workflow:
+        prompt_dir = args.workspace / PROMPTS_DIRNAME
+        dump_prompt_bundle(prompts, prompt_dir)
         workflow.run(args.task)
 
 

@@ -1007,7 +1007,7 @@ class TestFluxBatchGeneration:
 def _setup_distributed(rank, world_size, master_port, backend="nccl"):
     """Initialize distributed process group for multi-GPU tests."""
     os.environ["TLLM_DISABLE_MPI"] = "1"
-    os.environ["MASTER_ADDR"] = "localhost"
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = str(master_port)
     os.environ["RANK"] = str(rank)
     os.environ["WORLD_SIZE"] = str(world_size)

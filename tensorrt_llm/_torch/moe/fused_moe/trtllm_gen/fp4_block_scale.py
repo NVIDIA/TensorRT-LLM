@@ -196,6 +196,15 @@ class TRTLLMGenNvfp4Base(TRTLLMGenFp4BlockScaleBase):
     """NVFP4 weights and activations, group-16 block scales."""
 
     supports_gptoss_style = True
+
+    def supports_unfinalized_output(self) -> bool:
+        """Both providers' NVFP4 runners honor ``do_finalize=False``.
+
+        Declared here rather than on the family base: the MXFP4 siblings call
+        runners without a ``do_finalize`` parameter, which finalize regardless.
+        """
+        return True
+
     # Group size of the ``Bmm_E2m1_E2m1E2m1_..._siTuGlu_*`` cubins. Whether a
     # leaf may reach them is ``supports_situ``, declared per leaf because only
     # the native op backend calls them.

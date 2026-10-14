@@ -17,6 +17,7 @@ from typing import Any, Dict, List, NamedTuple, Optional, Tuple, TypeVar
 
 import zmq
 
+from tensorrt_llm._bootstrap import _UNIFIED_CACHE_ENV_VARS
 from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
 from tensorrt_llm.logger import logger
 
@@ -549,14 +550,20 @@ class MpiPoolSession(MpiSession):
         env = {
             key: value
             for key, value in os.environ.items()
-            if key.startswith("TRTLLM") or key.startswith("TLLM") or key in (
-                "FLASHINFER_WORKSPACE_BASE", "FLASHINFER_CUBIN_DIR",
-                "MASTER_ADDR", "MASTER_PORT")
+            if key.startswith("TRTLLM") or key.startswith("TLLM") or key in
+            _UNIFIED_CACHE_ENV_VARS or key in ("FLASHINFER_CUBIN_DIR",
+                                               "MASTER_ADDR", "MASTER_PORT")
         }
         workspace_managed = env.get(_FLASHINFER_WORKSPACE_MANAGED_ENV) == "1"
         env.update(self._env_overrides)
         explicit_workspace_override = (_FLASHINFER_WORKSPACE_ENV
                                        in self._env_overrides)
+        workspace_root = _FLASHINFER_WORKSPACE_ROOT
+        if cache_root := env.get("TRTLLM_CACHE_DIR"):
+            workspace_root = os.path.join(os.path.expanduser(cache_root),
+                                          "flashinfer")
+            workspace_managed |= env.get(
+                _FLASHINFER_WORKSPACE_ENV) == workspace_root
         isolate_workspace = (
             (self.n_workers > 1 or workspace_managed)
             and env.get("TRTLLM_FLASHINFER_WORKSPACE_PER_PROCESS", "1") != "0"
@@ -564,12 +571,17 @@ class MpiPoolSession(MpiSession):
                  (workspace_managed and not explicit_workspace_override)))
         if isolate_workspace:
             env.pop(_FLASHINFER_WORKSPACE_ENV, None)
+            if cache_root:
+                logger.warning_once(
+                    "TRTLLM_CACHE_DIR keeps FlashInfer isolation enabled; "
+                    "set TRTLLM_FLASHINFER_WORKSPACE_PER_PROCESS=0 for better "
+                    "cache reuse at the risk of concurrent writes.",
+                    key="flashinfer_unified_cache_isolation")
         elif explicit_workspace_override:
             # The override is user-owned, including in any further nested pool.
             env.pop(_FLASHINFER_WORKSPACE_MANAGED_ENV, None)
-        python_args = ([
-            "-c", _FLASHINFER_WORKER_BOOTSTRAP, _FLASHINFER_WORKSPACE_ROOT
-        ] if isolate_workspace else None)
+        python_args = (["-c", _FLASHINFER_WORKER_BOOTSTRAP, workspace_root]
+                       if isolate_workspace else None)
         self.mpi_pool = MPIPoolExecutor(max_workers=self.n_workers,
                                         path=sys.path,
                                         env=env,
@@ -700,6 +712,8 @@ class RemoteTask(NamedTuple):
     args: Tuple[Any, ...]
     kwargs: Dict[str, Any]
     sync: bool = False  # if True, the result will be sent back to the client
+    # Submitting client's sys.path, applied on every rank by task_wrapper.
+    sys_path: Tuple[str, ...] = ()
 
 
 class RemoteWorkerDeath(NamedTuple):
@@ -781,7 +795,8 @@ class RemoteMpiCommSessionClient(MpiSession):
         logger_debug(
             f"RemoteMpiCommSessionClient [rank{global_mpi_rank()}] sending task {task} to {self.addr}\n",
             "yellow")
-        self.queue.put(RemoteTask(task, args, kwargs, sync=sync))
+        self.queue.put(
+            RemoteTask(task, args, kwargs, sync=sync, sys_path=tuple(sys.path)))
         return []
 
     SYNC_IDLE_INTERVAL = 8
@@ -883,7 +898,17 @@ class RemoteMpiCommSessionServer():
                     n_workers=n_workers)
 
     @staticmethod
-    def task_wrapper(task: Callable[..., T], *args, **kwargs) -> T:
+    def task_wrapper(client_sys_path: Tuple[str, ...], task: Callable[..., T],
+                     /, *args, **kwargs) -> T:
+        # Adopt the client's sys.path before the task runs, so objects it later
+        # unpickles -- per-request payloads such as a caller-defined logits
+        # processor -- can resolve their classes on this rank. Appending keeps
+        # this process's own environment ahead of the client's; relative entries
+        # are dropped because they would resolve against this process's working
+        # directory rather than the client's.
+        for path in client_sys_path:
+            if os.path.isabs(path) and path not in sys.path:
+                sys.path.append(path)
         logger_debug(
             f"MpiCommSession rank{mpi_rank()} with world_size {mpi_world_size()}\n",
             "green")
@@ -959,8 +984,8 @@ class RemoteMpiCommSessionServer():
                     f"RemoteMpiCommSessionServer [rank{global_mpi_rank()}] received task [{message.task}] from {self.addr}\n",
                     "green")
                 futures = self.session.submit(
-                    RemoteMpiCommSessionServer.task_wrapper, message.task,
-                    *message.args, **message.kwargs)
+                    RemoteMpiCommSessionServer.task_wrapper, message.sys_path,
+                    message.task, *message.args, **message.kwargs)
                 self.num_results = self.session.n_workers
                 assert len(futures) == self.num_results == mpi_world_size()
                 # Store futures to wait for them before the next task
