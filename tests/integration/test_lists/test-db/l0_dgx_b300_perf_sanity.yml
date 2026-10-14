@@ -1,0 +1,24 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+version: 0.0.1
+l0_dgx_b300_perf_sanity:
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 4
+        lte: 4
+    wildcards:
+      gpu:
+      - '*b300*'
+      linux_distribution_name: ubuntu*
+      cpu: x86_64
+    terms:
+      stage: post_merge
+      backend: pytorch
+  tests:
+  # aggr config
+  # minimax-m3-fp4 eagle3-gqa agentx
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-b300_minimax_m3_fp4_agentx_blackwell-minimax_m3_fp4_tp4_eagle3_mtp7_con1_agentx] TIMEOUT (150)
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-b300_minimax_m3_fp4_agentx_blackwell-minimax_m3_fp4_tp2_eagle3_mtp3_con20_agentx] TIMEOUT (150)
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-b300_minimax_m3_fp4_agentx_blackwell-minimax_m3_fp4_tp2_eagle3_mtp3_con45_agentx] TIMEOUT (150)
