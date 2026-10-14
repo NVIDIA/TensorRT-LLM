@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import contextlib
 import fcntl
+import shutil
 import subprocess
 import time
 from pathlib import Path
@@ -62,6 +63,15 @@ def add_worktree(repo: Path, tree: Path, *args: str) -> None:
     _git(tree, "reset", "--hard", "-q")
 
 
+def _complete(tree: Path) -> bool:
+    """Whether ``tree`` is a fully created worktree (an index exists, no 'initializing' lock)."""
+    gitdir = _git(tree, "rev-parse", "--absolute-git-dir", check=False)
+    if not gitdir or not Path(gitdir, "index").exists():
+        return False
+    lock = Path(gitdir, "locked")
+    return not (lock.exists() and "initializing" in lock.read_text(errors="replace"))
+
+
 def open_candidate(repo: Path, root: Path, slug: str, base: str = "HEAD", prefix: str = "tune") -> Path:
     """Create (or reuse) ``root/<slug>`` on branch ``<prefix>/<slug>`` from ``base``.
 
@@ -69,7 +79,14 @@ def open_candidate(repo: Path, root: Path, slug: str, base: str = "HEAD", prefix
     ``tune/best`` (git refuses a branch checked out by another worktree)."""
     tree = root / slug
     if tree.exists():
-        return tree
+        if _complete(tree):
+            return tree
+        # A worktree add that was killed part way (an orchestrator stopped mid-checkout): git
+        # left it locked "initializing" without an index. Rebuild it rather than hand it out.
+        _git(repo, "worktree", "unlock", str(tree), check=False)
+        _git(repo, "worktree", "remove", "--force", str(tree), check=False)
+        _git(repo, "worktree", "prune", check=False)
+        shutil.rmtree(tree, ignore_errors=True)
     root.mkdir(parents=True, exist_ok=True)
     branch = f"{prefix}/{slug}"
     exists = _git(repo, "rev-parse", "--verify", "--quiet", branch, check=False)
