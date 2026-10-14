@@ -296,6 +296,24 @@ class ThopAttention(OpWrapper):
             "12544-row frame is the longest segment",
             spec=dict(_QWEN4_VISION, seg_lens=(12544, 9600)),
         ),
+        # A video call is one frame per frame group, at most 32768 rows per call.
+        Cell(
+            why="video: 384 frame groups of 64 rows (8x8 patches), the untiled "
+            "kernel's longest frame",
+            spec=dict(_QWEN4_VISION, seg_lens=(64,) * 384),
+        ),
+        Cell(
+            why="video: 256 frame groups of 128 rows, the 32768-row ceiling",
+            spec=dict(_QWEN4_VISION, seg_lens=(128,) * 256),
+        ),
+        Cell(
+            why="video: 2 frame groups of 16384 rows (128x128), the longest frame at the ceiling",
+            spec=dict(_QWEN4_VISION, seg_lens=(16384, 16384)),
+        ),
+        Cell(
+            why="video: 8192 frame groups of 2x2 patches, the most a 32768-row call can carry",
+            spec=dict(_QWEN4_VISION, seg_lens=(4,) * 8192),
+        ),
         Cell(
             why="fp8 pool packed prefill, GQA 24q/4kv d256: the FMHA reads the "
             "bf16 q rows, not the pool",
@@ -442,7 +460,12 @@ class ThopAttention(OpWrapper):
     with `update_kv_cache=True` -- False is rejected ("KV cache update cannot
     be disabled now"). One context sequence per frame; mask_type 0 confines a
     frame to itself. `tokens_per_block` and `use_paged_context_fmha` are
-    bitwise inert there. Passing only some of the three None is unmeasured.
+    bitwise inert there. Passing only some of the three None is unmeasured. An
+    image is one frame and a video one frame per frame group; the cells run up to
+    8192 frames and 32768 rows per call at 16/16/72 under the padding mask.
+    `FusedMHARunnerV2` picks a different fmha_v2 kernel for a call whose longest
+    frame is at most 64 rows than for a longer one, so a frame's last bits can
+    move with the other frames it shares a call with, within `reference`'s band.
     head_size 72 exists in the context phase only: a generation call raises
     "unsupported head_size 72", and the process stays usable.
 

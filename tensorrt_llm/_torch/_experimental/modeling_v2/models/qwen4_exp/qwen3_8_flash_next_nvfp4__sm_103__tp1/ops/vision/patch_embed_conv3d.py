@@ -62,6 +62,12 @@ class PatchEmbedConv3d(OpWrapper):
         )
         + (
             Cell(
+                why="video call ceiling: 8192 tokens x merge 2x2 = 32768 patches bf16",
+                spec=dict(num_patches=32768, dtype=torch.bfloat16),
+            ),
+        )
+        + (
+            Cell(
                 why="explicit [N, C, kt, kh, kw] rows",
                 spec=dict(num_patches=64, dtype=torch.bfloat16, layout="five_d"),
             ),
@@ -103,7 +109,8 @@ class PatchEmbedConv3d(OpWrapper):
     note = """
     Metadata consumed: none. `pixel_values` is not mutated. All three operands
     share one dtype and device -- torch raises "... should be the same"
-    otherwise. Several images are just more rows; there is no batch axis.
+    otherwise. Several images, and a video's frame groups, are just more rows;
+    there is no batch axis.
 
     fp32 runs in TF32 unless the caller sets `torch.backends.cudnn.allow_tf32 =
     False` (global state the caller owns): measured 5.84e-4 from an exact fp32
@@ -114,7 +121,12 @@ class PatchEmbedConv3d(OpWrapper):
     `[1152, 1536]` reshape of the filter is a view of the same bytes. Not timed.
     CUDA-graph capturable; the output is a fresh allocation.
 
-    Not certified: float8 operands; patch counts past 4096.
+    Not batch-invariant: cuDNN picks its kernel by row count, so a row's last bits
+    depend on how many rows share the call. Check rows against `reference`, never
+    against a call of a different size.
+
+    Not certified: float8 operands; patch counts between the 4096- and 32768-row
+    cells, and past 32768.
     """
 
     def __call__(

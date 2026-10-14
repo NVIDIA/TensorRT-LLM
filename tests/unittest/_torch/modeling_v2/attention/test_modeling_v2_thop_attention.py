@@ -183,8 +183,9 @@ exercised:
    real 48-layer manager's identity rows, and a bitwise A/B of a single-layer
    pool against mapping row 47.
 13. The no-KV-cache (encoder-only) mode qwen4_exp's vision tower runs: all
-   three cache-addressing tensors None, one context sequence per frame, MHA
-   16/16 at head_size 72 and 128, the merged-segment rival, the cache
+   three cache-addressing tensors None, one context sequence per frame (an
+   image, or one frame group of a video), MHA 16/16 at head_size 72 and 128,
+   the merged-segment rival, the cache
    arguments that are inert there, the workspace high-water mark over the
    mmmu serving shapes, and the two boundaries (update_kv_cache=False is
    rejected; head_size 72 has no generation phase).
