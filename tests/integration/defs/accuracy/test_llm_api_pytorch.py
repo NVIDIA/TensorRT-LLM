@@ -7489,6 +7489,7 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
             overlap_scheduler=True,
             fuse_qkv_index_projection=fuse_qkv_index_projection,
             eval_mode="default",
+            kv_dtype="nvfp4",
             piecewise=True)
 
     def _run_nvfp4_eagle3(self,
