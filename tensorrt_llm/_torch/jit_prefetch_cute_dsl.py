@@ -47,6 +47,7 @@ executor's device and answered by a shim (``device_props`` /
 # annotations of the ``@cute.jit`` wrapper below at trace time and resolves
 # string annotations against module globals, where ``cutlass`` is not bound.
 import hashlib
+import inspect
 import json
 import os
 import types
@@ -598,13 +599,17 @@ def _wrap_topk_runners() -> List[str]:
     wrapped = []
     for name in TOPK_RUNNERS:
         runner = getattr(ops, name, None)
-        orig = runner.__dict__.get("_compile") if runner is not None else None
-        if orig is None:
+        if runner is None:
             continue
-        if getattr(orig.__func__, "_jitp_wrapped", False):
+        # A runner that inherits _compile gets its own wrapper: the spec names
+        # the runner whose kernel_cache (and kernel class) the key belongs to.
+        orig = inspect.getattr_static(runner, "_compile", None)
+        if not isinstance(orig, classmethod):
+            continue
+        if getattr(orig.__func__, "_jitp_wrapped", False) and "_compile" in runner.__dict__:
             wrapped.append(name)
             continue
-        inner = orig.__func__
+        inner = getattr(orig.__func__, "_jitp_inner", orig.__func__)
 
         def make(inner=inner, name=name):
             def _compile(cls, *key):
@@ -627,6 +632,7 @@ def _wrap_topk_runners() -> List[str]:
                 inner(cls, *key)
 
             _compile._jitp_wrapped = True
+            _compile._jitp_inner = inner
             return classmethod(_compile)
 
         setattr(runner, "_compile", make())

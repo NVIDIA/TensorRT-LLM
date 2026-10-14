@@ -244,7 +244,8 @@ def test_topk_export_is_what_the_op_runs(tmp_path):
         return outs
 
     runners = {name: getattr(ops, name) for name in jcd.TOPK_RUNNERS}
-    saved = {name: r.__dict__["_compile"] for name, r in runners.items()}
+    # A runner may inherit _compile; restore exactly what each class held.
+    saved = {name: r.__dict__.get("_compile") for name, r in runners.items()}
     caches = {name: dict(r.kernel_cache) for name, r in runners.items()}
     try:
         for r in runners.values():
@@ -265,7 +266,11 @@ def test_topk_export_is_what_the_op_runs(tmp_path):
         got = run()
     finally:
         for name, r in runners.items():
-            setattr(r, "_compile", saved[name])
+            if saved[name] is None:
+                if "_compile" in r.__dict__:
+                    delattr(r, "_compile")
+            else:
+                setattr(r, "_compile", saved[name])
             r.kernel_cache.clear()
             r.kernel_cache.update(caches[name])
     assert loads and all(loads), f"some variants were not prefetched: {loads}"
