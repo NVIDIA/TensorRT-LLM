@@ -1557,11 +1557,13 @@ def get_node_address() -> str:
 
     An IP rather than the hostname, so neither binding it nor dialing a published
     address needs DNS. get_local_ip() returns loopback when it finds no routable
-    interface, which no other node can dial, so the hostname is used instead.
+    interface, and its hostname-lookup fallback can return a link-local address;
+    other nodes cannot dial either, so the hostname is used instead.
     """
     hostname = socket.gethostname()
     ip = get_local_ip()
-    if ipaddress.ip_address(ip).is_loopback:
+    address = ipaddress.ip_address(ip)
+    if address.is_loopback or address.is_link_local:
         print_warning(f"No routable IP found on {hostname}; using the hostname instead")
         return hostname
     print_info(f"Using {ip} as the server address of {hostname}")
