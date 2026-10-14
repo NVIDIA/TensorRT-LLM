@@ -348,9 +348,9 @@ def get_or_scale_allreduce_mnnvl_workspace(
     with workspace_lock:
         return _mark_if_capturing(
             _get_or_scale_allreduce_mnnvl_workspace(mapping,
-                                                   dtype,
-                                                   buffer_size_bytes,
-                                                   transport=transport))
+                                                    dtype,
+                                                    buffer_size_bytes,
+                                                    transport=transport))
 
 
 def _mark_if_capturing(workspace: _MnnvlWorkspace) -> _MnnvlWorkspace:

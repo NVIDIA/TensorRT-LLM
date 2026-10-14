@@ -76,7 +76,6 @@ add_library(
   cudaProfilerUtils.cpp
   envUtils.cpp
   ipUtils.cpp
-  mcastDevMemUtils.cpp
   ncclUtils.cpp
   opUtils.cpp
   safetensors.cpp
