@@ -1219,6 +1219,7 @@ class Indexer(nn.Module):
             metadata.kv_lens_cuda_runtime[num_contexts : num_contexts + num_generations]
         )
         metadata.gen_indexer_kv_lens_cuda_runtime = gen_seq_lens
+        metadata.mtp_sched_metadata_stale = False
         if not metadata.use_expanded_buffers_for_mtp:
             scheduler_context_lens = metadata.update_indexer_kv_lens_2d(gen_seq_lens)
             scheduler_metadata_buffer = get_paged_mqa_logits_metadata(
@@ -1775,6 +1776,16 @@ class Indexer(nn.Module):
                 metadata.shared_topk_indices[:num_generations, :]
             )
         elif has_decode and not metadata.skip_indexer_for_gen_reqs:
+            if metadata.mtp_sched_metadata_stale:
+                # A full TopK computation must never consume a schedule left
+                # stale by an index-reusing draft step.
+                raise RuntimeError(
+                    "DSA indexer: MQA-logits scheduler metadata is stale "
+                    "(skipped by the MTP tail trim) but this pass computes TopK "
+                    f"(in_mtp_draft_loop={metadata.in_mtp_draft_loop}, "
+                    f"indexer_skip_topk={metadata.indexer_skip_topk}, "
+                    f"mtp_index_share={self.mtp_index_share})"
+                )
             # Get decode lengths per request (from seq_lens) for validation
             gen_seq_lens = metadata.seq_lens[num_contexts : num_contexts + num_generations]
             if not metadata.is_ragged_verify:
