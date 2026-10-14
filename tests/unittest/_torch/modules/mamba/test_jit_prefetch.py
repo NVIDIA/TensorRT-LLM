@@ -277,6 +277,8 @@ def test_deep_gemm_compile_counted_once_per_shape(monkeypatch):
     monkeypatch.delenv("TLLM_JIT_PREFETCH", raising=False)
     monkeypatch.setattr(jdg, "done_observer", None)
     monkeypatch.setattr(jdg, "launch_observer", None)
+    # DeepGEMM without the compile record: host time is the only signal.
+    monkeypatch.setattr(jp.JitPrefetcher, "_deep_gemm_module", staticmethod(lambda: None))
     p = jp.JitPrefetcher(rank=0)
     p.bind_executor_thread()
     p.observe_deep_gemm()
@@ -289,3 +291,37 @@ def test_deep_gemm_compile_counted_once_per_shape(monkeypatch):
     assert p.stats.dg_executor_compiles == 2
     # Each one is reported, whatever the logger's level.
     assert sum("DeepGEMM compile on executor" in e for e in p.stats.events) == 2
+
+
+@pytest.mark.usefixtures("restore_triton_hooks")
+def test_deep_gemm_slow_launch_without_compile_not_counted(monkeypatch):
+    """With DeepJIT's record of disk-cache misses, a slow first launch that
+    compiled nothing (it waited on the GPU or loaded a helper-built cubin) is
+    not an executor compile; one that did compile is, with its kernel name."""
+    from tensorrt_llm._torch import jit_prefetch as jp
+    from tensorrt_llm._torch import jit_prefetch_deep_gemm as jdg
+
+    compiled = []
+
+    def take_compiled_kernel_names():
+        names = list(compiled)
+        compiled.clear()
+        return names
+
+    module = types.SimpleNamespace(take_compiled_kernel_names=take_compiled_kernel_names)
+    monkeypatch.setenv("TLLM_JIT_STATS", "1")
+    monkeypatch.delenv("TLLM_JIT_PREFETCH", raising=False)
+    monkeypatch.setattr(jdg, "done_observer", None)
+    monkeypatch.setattr(jdg, "launch_observer", None)
+    monkeypatch.setattr(jp.JitPrefetcher, "_deep_gemm_module", staticmethod(lambda: module))
+    p = jp.JitPrefetcher(rank=0)
+    p.bind_executor_thread()
+    p.observe_deep_gemm()
+    slow = jdg.COMPILE_HOST_S + 0.1
+    jdg.done_observer(316, 4608, 5120, slow)  # slow, nothing compiled
+    compiled.append("sm100_fp8_fp4_gemm_1d1d")
+    jdg.done_observer(413, 4608, 5120, slow)
+    assert p.stats.dg_executor_compiles == 1
+    assert p.stats.dg_process_compiles == 1
+    events = [e for e in p.stats.events if "DeepGEMM compile on executor" in e]
+    assert len(events) == 1 and "m=413" in events[0] and "sm100_fp8_fp4_gemm_1d1d" in events[0]

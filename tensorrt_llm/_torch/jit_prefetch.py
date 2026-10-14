@@ -487,6 +487,11 @@ class JitPrefetcher:
         # host stall (e.g. the caching allocator releasing blocks near its
         # memory limit), not a compile.
         seen_shapes: set = set()
+        # With the patched DeepJIT, its own record of disk-cache misses says
+        # whether this launch compiled: a slow first launch that compiled
+        # nothing (it waited on the GPU, or loaded a helper-built cubin) is
+        # not counted. Without it, host time is the only signal.
+        take = getattr(self._deep_gemm_module(), "take_compiled_kernel_names", None)
 
         def _done(m, n, k, dt):
             shape = (m, n, k)
@@ -496,11 +501,18 @@ class JitPrefetcher:
                 return
             if threading.get_ident() != self._executor_thread:
                 return
+            names = ""
+            if take is not None:
+                compiled = take()
+                if not compiled:
+                    return
+                self.stats.dg_process_compiles += len(compiled)
+                names = " " + ",".join(sorted(set(compiled)))
             self.stats.dg_executor_compiles += 1
             self.stats.dg_executor_compile_s += dt
             # The MoE masked grouped GEMM reports m = -num_groups.
             what = f"moe g={-m}" if m < 0 else f"m={m}"
-            self._event(f"DeepGEMM compile on executor {what} n={n} k={k} {dt:.3f}s")
+            self._event(f"DeepGEMM compile on executor {what} n={n} k={k} {dt:.3f}s{names}")
 
         jdg.done_observer = _done
         if jdg.launch_observer is None:
