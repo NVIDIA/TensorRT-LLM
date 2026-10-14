@@ -54,7 +54,7 @@ def _cleanup_mpi_env():
 
 
 def init_distributed_worker(rank: int, world_size: int, backend: str = "nccl", port: int = 29500):
-    os.environ["MASTER_ADDR"] = "localhost"
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = str(port)
     os.environ["RANK"] = str(rank)
     os.environ["WORLD_SIZE"] = str(world_size)
@@ -318,7 +318,7 @@ class TestWanAsyncUlysses:
 
 
 def test_forward_async_uses_tp_local_heads_for_qkv_gates_and_output() -> None:
-    from tensorrt_llm._torch.visual_gen.modules.attention import Attention
+    from tensorrt_llm._torch.visual_gen.attention.attention import Attention
 
     class _CaptureAsyncAttention(torch.nn.Module):
         def forward_async(

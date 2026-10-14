@@ -42,6 +42,8 @@ from tensorrt_llm.models.modeling_utils import QuantAlgo
 from tensorrt_llm.quantization.utils.fp4_utils import float4_e2m1x2
 
 from ...llmapi.llm_args import LoadFormat
+from .._experimental.modeling_v2 import modeling_v2_resolve
+from ..locality_domain.policy import LocalityDomainPolicy
 from ..model_config import ModelConfig
 from ..models import AutoModelForCausalLM
 from ..models.checkpoints.base_checkpoint_loader import BaseCheckpointLoader
@@ -249,6 +251,15 @@ def validate_encoder_decoder_kv_cache_config(model_config: ModelConfig,
             raise ValueError(
                 "Encoder-decoder models require kv_cache_config.cross_kv_cache_fraction to be set."
             )
+        if (kv_cache_config.use_kv_cache_manager_v2 is True
+                and kv_cache_config.enable_block_reuse):
+            # Both self- and cross-attention K/V depend on the full encoder
+            # input, which is not part of V2's prefix reuse identity.
+            logger.warning(
+                "Disabling KV cache block reuse for encoder-decoder models "
+                "with KV cache manager V2: reuse requires the full encoder "
+                "input identity.")
+            kv_cache_config.enable_block_reuse = False
         return
 
     if kv_cache_config.cross_kv_cache_fraction is not None:
@@ -934,6 +945,14 @@ class ModelLoader:
         post_transform_config_identity = PostTransformConfigIdentity.from_model_config(
             config)
         load_format = self.llm_args.load_format
+        locality_domain_policy = getattr(config, "locality_domain_policy", None)
+        if (load_format == LoadFormat.GMS
+                and getattr(locality_domain_policy, "enabled", False)):
+            raise ValueError(
+                "LoadFormat.GMS is incompatible with locality domain localized weights. "
+                "GMS shares registered parameters, while locality domain execution "
+                "releases those parameters after creating partition-local "
+                "weight shards.")
         self._startup_metadata = _checkpoint_startup_metadata(
             checkpoint_loader, load_format)
 
@@ -1602,6 +1621,11 @@ class ModelLoader:
         enabled_features = set()
         if loads_draft_weights:
             enabled_features.add(PostTransformFeature.SEPARATE_DRAFT_MODEL)
+        locality_domain_policy = getattr(model.model_config,
+                                         "locality_domain_policy", None)
+        if getattr(locality_domain_policy, "enabled", False):
+            enabled_features.add(
+                PostTransformFeature.LOCALITY_DOMAIN_LOCALIZED_WEIGHTS)
         return cls._post_transform_profile_registry().qualify(
             root_model_class=type(model),
             architecture=config_identity.architecture,
@@ -1922,6 +1946,8 @@ class ModelLoader:
             multimodal_config=self.llm_args.multimodal_config,
             use_cute_dsl_bf16_bmm=self.llm_args.use_cute_dsl_bf16_bmm,
             use_cute_dsl_bf16_gemm=self.llm_args.use_cute_dsl_bf16_gemm,
+            locality_domain_policy=LocalityDomainPolicy(
+                enabled=self.llm_args.enable_locality_domains),
         )
 
         # Only pass model_kwargs if it's explicitly set (not None)
@@ -1929,6 +1955,14 @@ class ModelLoader:
             load_config_kwargs['model_kwargs'] = self.llm_args.model_kwargs
 
         config = checkpoint_loader.load_config(**load_config_kwargs)
+
+        # Decided here, after `load_config_and_apply_defaults` resolved the
+        # built-in class and applied its model defaults to `llm_args`: a
+        # modeling_v2 target reads the arguments as the engine will run with
+        # them and never overrides those defaults.
+        config = replace(config,
+                         modeling_v2_target=modeling_v2_resolve(
+                             config, self.llm_args))
 
         if uses_mtp_head_checkpoint(self.spec_config):
             # `load_config_and_apply_defaults` already ran this, but against a

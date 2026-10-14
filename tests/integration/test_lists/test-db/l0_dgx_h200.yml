@@ -32,7 +32,7 @@ l0_dgx_h200:
   - disaggregated/test_disaggregated.py::test_disaggregated_qwen3_32b_fp8[Qwen3/Qwen3-32B-FP8]
   - disaggregated/test_disaggregated.py::test_disaggregated_mixed_stress_test[req120-conc64-qwen3_32b_fp8_mixed_stress]
   - unittest/llmapi/test_llm_pytorch.py::test_nemotron_nas_lora
-  - accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_gen_only_spec_dec
+  - accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_symmetric
 - condition:
     ranges:
       system_gpu_count:
@@ -111,5 +111,6 @@ l0_dgx_h200:
   - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B_Instruct_2507::test_skip_softmax_attention_4gpus[target_sparsity_0.9-fp8kv=False]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B_Instruct_2507::test_skip_softmax_attention_4gpus[target_sparsity_0.9-fp8kv=True]
   - unittest/llmapi/test_llm_kv_cache_events.py::test_llm_api_attention_dp_kv_events
+  - unittest/_torch/modeling/test_modeling_gpt_oss.py::test_gpt_oss_xqa_kernel_selection
   - llmapi/test_llm_examples.py::test_llmapi_example_distributed_tp2
   - unittest/llmapi/apps/_test_openai_multi_gpu.py -m "part0"

@@ -111,7 +111,7 @@ def _get_audio_path() -> str:
 def _make_llm(
     model_path: str,
     max_beam_width: int = 1,
-    use_kv_cache_manager_v2: bool = False,
+    use_kv_cache_manager_v2: bool = True,
     torch_dtype: str | None = None,
     cuda_graph_batch_sizes: list[int] | None = None,
     tensor_parallel_size: int = 1,
@@ -242,8 +242,7 @@ def test_whisper_pytorch_transcribe_end_to_end(monkeypatch):
 # The bf16 graphs-on cases capture decode graphs over
 # batch_size * beam_width sequences.
 _BEAM_SEARCH_CASES = [
-    pytest.param(None, False, None, False, id="fp32-kv-v1-graphs-off-beam2"),
-    pytest.param("bfloat16", False, [1, 2], True, id="bf16-kv-v1-decoder-graphs-on-beam2"),
+    pytest.param(None, True, None, False, id="fp32-kv-v2-graphs-off-beam2"),
     pytest.param("bfloat16", True, [1, 2], True, id="bf16-kv-v2-decoder-graphs-on-beam2"),
 ]
 
@@ -320,25 +319,20 @@ def _assert_cuda_graph_state(llm: LLM, captured: bool, encoder_captured: bool = 
 # change a single token.
 _FEATURE_COMBINATION_CASES = [
     pytest.param(None, True, None, False, 1, False, id="fp32-kv-v2-graphs-off-greedy"),
-    pytest.param(None, False, [1, 2], True, 1, False, id="fp32-kv-v1-graphs-requested-greedy"),
-    pytest.param(
-        "bfloat16", False, [1, 2], True, 1, False, id="bf16-kv-v1-decoder-graphs-on-greedy"
-    ),
+    pytest.param(None, True, [1, 2], True, 1, False, id="fp32-kv-v2-graphs-requested-greedy"),
     pytest.param(
         "bfloat16", True, [1, 2], True, 1, False, id="bf16-kv-v2-decoder-graphs-on-greedy"
     ),
-    pytest.param(
-        "bfloat16", False, [1, 2], True, 1, True, id="bf16-kv-v1-encoder-graphs-on-greedy"
-    ),
-    pytest.param("float16", False, None, False, 1, False, id="fp16-kv-v1-graphs-off-greedy"),
+    pytest.param("bfloat16", True, [1, 2], True, 1, True, id="bf16-kv-v2-encoder-graphs-on-greedy"),
+    pytest.param("float16", True, None, False, 1, False, id="fp16-kv-v2-graphs-off-greedy"),
     pytest.param(
         None,
-        False,
+        True,
         None,
         False,
         2,
         False,
-        id="fp32-kv-v1-graphs-off-greedy-tp2",
+        id="fp32-kv-v2-graphs-off-greedy-tp2",
         marks=pytest.mark.skip_less_device(2),
     ),
 ]

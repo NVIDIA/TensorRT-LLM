@@ -16,6 +16,9 @@ if TYPE_CHECKING:
 # function: they pull in ``trtllm`` and ``resource_manager``, which import
 # ``interface`` and would otherwise form an import cycle when this package is
 # loaded.
+# The cycle runs through ``backends`` alone: the ``tensorrt_llm._torch.attention``
+# package root resolves its exports lazily and takes no part in it, so these
+# imports have to stay local regardless of how the package root exports names.
 
 
 def get_sparse_attn_kv_cache_manager(

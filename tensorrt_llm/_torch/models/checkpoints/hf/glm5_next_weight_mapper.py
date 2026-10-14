@@ -125,17 +125,17 @@ def audit_glm5_next_checkpoint(
 
 
 def glm5_next_is_quantized(model_config: ModelConfig[PretrainedConfig]) -> bool:
-    """Read block-FP8 construction from ModelConfig, rejecting other quantization modes.
+    """Read supported checkpoint quantization from ModelConfig.
 
     Unquantized modules are also supported for component construction.
     """
     quant = model_config.quant_config
     if quant is None or quant.quant_algo is None:
         return False
-    if quant.quant_algo != QuantAlgo.FP8_BLOCK_SCALES:
+    if quant.quant_algo not in (QuantAlgo.FP8_BLOCK_SCALES, QuantAlgo.NVFP4):
         raise ValueError(
-            "glm5_next supports only the published FP8_BLOCK_SCALES checkpoint "
-            f"form or unquantized bf16 modules; got quant_algo={quant.quant_algo}"
+            "glm5_next supports FP8_BLOCK_SCALES and NVFP4 checkpoints "
+            f"or unquantized bf16 modules; got quant_algo={quant.quant_algo}"
         )
     return True
 
