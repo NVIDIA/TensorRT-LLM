@@ -145,7 +145,9 @@ class DeepseekV41Attention(CSA2Attention):
             eps=config.rms_norm_eps,
             mapping=model_config.mapping,
             sparse_params=params,
-            projection_quantization="mxfp8",
+            projection_quantization=(
+                "mxfp8" if torch.cuda.get_device_capability() in ((10, 0), (10, 3)) else "bf16"
+            ),
             aux_stream=(aux_stream_dict or {}).get(AuxStreamType.MlaCompressor),
             allreduce_strategy=model_config.allreduce_strategy,
             kv_cache_dtype=model_config.extra_attrs.get("kv_cache_dtype", "auto"),

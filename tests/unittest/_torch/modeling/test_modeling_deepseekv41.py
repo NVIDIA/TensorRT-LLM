@@ -2973,6 +2973,16 @@ def test_v41_attention_topology_has_no_per_head_query_norm() -> None:
     assert not issubclass(DeepseekV41Attention, DeepseekV4Attention)
 
 
+@requires_cuda
+def test_attention_uses_native_mxfp8_projections_only_on_sm100_and_sm103():
+    model_config, _ = _tiny_v41_model_config()
+    attention = DeepseekV41Attention(model_config, layer_idx=0)
+    native = torch.cuda.get_device_capability() in ((10, 0), (10, 3))
+    assert attention.projection_quantization == ("mxfp8" if native else "bf16")
+    del attention
+    torch.cuda.empty_cache()
+
+
 @skip_pre_blackwell
 @pytest.mark.parametrize("strategy", ["AUTO", "NCCL"])
 def test_attention_adapter_preserves_model_allreduce_strategy(strategy):
