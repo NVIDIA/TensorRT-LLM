@@ -220,6 +220,47 @@ def test_edge_text_config_keeps_legacy_torch_dtype():
     assert cfg.dtype == torch.float16
 
 
+def test_edge_rope_parameters_keep_checkpoint_keys():
+    cfg = Cosmos3EdgeTextConfig(
+        rope_parameters={
+            "rope_type": "yarn",
+            "rope_theta": 1e8,
+            "factor": 2.0,
+            "original_max_position_embeddings": 32768,
+        }
+    )
+    assert cfg.rope_parameters["rope_type"] == "yarn"
+    assert cfg.rope_parameters["factor"] == 2.0
+    assert cfg.rope_parameters["original_max_position_embeddings"] == 32768
+    assert cfg.rope_parameters["type"] == "mrope"
+    assert cfg.rope_parameters["mrope_interleaved"] is True
+
+
+def test_edge_rope_parameters_reject_unknown_type():
+    with pytest.raises(ValueError, match="not supported"):
+        Cosmos3EdgeTextConfig(rope_parameters={"rope_type": "custom_rope"})
+
+
+def test_edge_vision_merge_must_match_projector():
+    with pytest.raises(ValueError, match="spatial_merge_size"):
+        Cosmos3EdgeConfig(
+            vision_config={"spatial_merge_size": 4},
+            projector_config={"spatial_merge_size": 2},
+        )
+
+
+def test_edge_from_dict_returns_unused_kwargs():
+    config, unused = Cosmos3EdgeConfig.from_dict(
+        {"model_type": "cosmos3_edge", "text_config": {"torch_dtype": "float16"}},
+        return_unused_kwargs=True,
+        _name_or_path="/tmp/cosmos3-edge",
+        not_a_config_field="kept",
+    )
+    assert config.text_config.dtype == torch.float16
+    assert config._name_or_path == "/tmp/cosmos3-edge"
+    assert unused["not_a_config_field"] == "kept"
+
+
 def test_edge_attn_implementation_reaches_sub_configs():
     cfg = Cosmos3EdgeConfig(attn_implementation="sdpa")
     assert cfg.text_config._attn_implementation == "sdpa"

@@ -10,14 +10,17 @@ interleaved multimodal RoPE. Generator experts are not constructed.
 """
 
 import os
+import re
 from typing import Any, Dict, List, Optional, Tuple
 
+import safetensors.torch
 import torch
 import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
 
-from tensorrt_llm.functional import PositionEmbeddingType
+from tensorrt_llm._torch.configs.cosmos3_edge import _as_torch_dtype
+from tensorrt_llm.functional import PositionEmbeddingType, RotaryScalingType
 from tensorrt_llm.mapping import Mapping
 
 from ...inputs import (
@@ -75,13 +78,38 @@ _VISION_NORM_EPS = 1e-6
 
 def _config_dtype(config: PretrainedConfig) -> torch.dtype:
     value = getattr(config, "dtype", None)
-    if not isinstance(value, torch.dtype):
+    if not isinstance(value, (torch.dtype, str)):
         value = getattr(config, "torch_dtype", None)
-    if isinstance(value, str):
-        value = getattr(torch, value.replace("torch.", ""))
-    if not isinstance(value, torch.dtype):
-        return torch.bfloat16
-    return value
+    if value is None:
+        raise ValueError(f"{type(config).__name__} is missing dtype.")
+    return _as_torch_dtype(value)
+
+
+def _cpu_int_rows(tensor: torch.Tensor) -> torch.Tensor:
+    if tensor.device.type == "cpu" and tensor.dtype == torch.int64:
+        return tensor
+    return tensor.detach().to(device="cpu", dtype=torch.int64)
+
+
+_VISION_KEY_RENAMES = (
+    (re.compile(r"(.*)\.self_attn\.out_proj\.(.*)"), r"\1.self_attn.o_proj.\2"),
+    (re.compile(r"(.*)\.mlp\.fc1\.(.*)"), r"\1.mlp.up_proj.\2"),
+    (re.compile(r"(.*)\.mlp\.fc2\.(.*)"), r"\1.mlp.down_proj.\2"),
+)
+
+
+def _rename_vision_module_keys(weights: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    """Rename SigLIP2 module names. Keys that already use the module names stay put."""
+    renamed = {}
+    for key, value in weights.items():
+        new_key = key
+        for pattern, replacement in _VISION_KEY_RENAMES:
+            updated = pattern.sub(replacement, key)
+            if updated != key:
+                new_key = updated
+                break
+        renamed[new_key] = value
+    return renamed
 
 
 def resize_positional_embeddings_packed(
@@ -96,8 +124,7 @@ def resize_positional_embeddings_packed(
     ``align_corners=False`` and ``antialias=True``, which is the SigLIP2 rule
     rather than Qwen3-VL's ``(n - 1) / (h - 1)`` grid.
     """
-    if spatial_shapes.device.type != "cpu":
-        spatial_shapes = spatial_shapes.cpu()
+    spatial_shapes = _cpu_int_rows(spatial_shapes)
     embed_dim = positional_embeddings.shape[-1]
     source_dtype = positional_embeddings.dtype
     total_tokens = int(sum(lengths))
@@ -109,21 +136,41 @@ def resize_positional_embeddings_packed(
     pos_4d = positional_embeddings.permute(2, 0, 1).unsqueeze(0)
     if pos_4d.device.type == "cpu":
         pos_4d = pos_4d.to(torch.float32)
-    offset = 0
-    for index, length in enumerate(lengths):
-        if length <= 0:
-            continue
-        height, width = (int(v) for v in spatial_shapes[index].tolist())
-        resized = F.interpolate(
-            pos_4d,
-            size=(height, width),
-            mode="bilinear",
-            align_corners=False,
-            antialias=True,
+    rows = spatial_shapes.tolist()
+    if len(rows) != len(lengths):
+        raise ValueError(
+            f"spatial_shapes has {len(rows)} rows but lengths has {len(lengths)} entries."
         )
-        resized = resized.reshape(embed_dim, height * width).transpose(0, 1).to(source_dtype)
-        packed[offset : offset + length] = resized
+    resized_by_shape: Dict[Tuple[int, int], torch.Tensor] = {}
+    offset = 0
+    index = 0
+    while index < len(rows):
+        height, width = int(rows[index][0]), int(rows[index][1])
+        run = 1
+        while (
+            index + run < len(rows)
+            and int(rows[index + run][0]) == height
+            and int(rows[index + run][1]) == width
+        ):
+            run += 1
+        key = (height, width)
+        if key not in resized_by_shape:
+            resized = F.interpolate(
+                pos_4d,
+                size=(height, width),
+                mode="bilinear",
+                align_corners=False,
+                antialias=True,
+            )
+            resized_by_shape[key] = (
+                resized.reshape(embed_dim, height * width).transpose(0, 1).to(source_dtype)
+            )
+        frame = resized_by_shape[key]
+        block = frame.repeat(run, 1) if run > 1 else frame
+        length = int(sum(lengths[index : index + run]))
+        packed[offset : offset + length] = block
         offset += length
+        index += run
     return packed
 
 
@@ -136,7 +183,7 @@ def merge_spatial_patches(
     merged: List[torch.Tensor] = []
     current = 0
     hidden_size = image_embeds.shape[-1]
-    grids = grid_thw.detach().to(device="cpu", dtype=torch.int64)
+    grids = _cpu_int_rows(grid_thw).tolist()
     for grid in grids:
         frames, height, width = (int(v) for v in grid.tolist())
         if height % merge_size != 0 or width % merge_size != 0:
@@ -158,8 +205,8 @@ def merge_spatial_patches(
             merge_size,
             hidden_size,
         )
-        media = media.permute(0, 1, 3, 2, 4, 5).contiguous()
-        merged.append(media.view(-1, merge_size * merge_size * hidden_size))
+        media = media.permute(0, 1, 3, 2, 4, 5).reshape(-1, merge_size * merge_size * hidden_size)
+        merged.append(media)
     if current != image_embeds.shape[0]:
         raise ValueError(
             "image_embeds contains more patches than grid_thw describes: "
@@ -167,6 +214,8 @@ def merge_spatial_patches(
         )
     if not merged:
         return image_embeds.new_empty((0, merge_size * merge_size * hidden_size))
+    if len(merged) == 1:
+        return merged[0]
     return torch.cat(merged, dim=0)
 
 
@@ -174,11 +223,6 @@ class Cosmos3EdgeVisionAttention(Qwen2_5_VLVisionAttention):
     """Packed full attention for SigLIP2. Positions are added as embeddings, not RoPE."""
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig], layer_idx: int):
-        text_config = model_config.pretrained_config.text_config
-        model_config.pretrained_config.max_position_embeddings = text_config.max_position_embeddings
-        vision_config = model_config.pretrained_config.vision_config
-        vision_config.torch_dtype = _config_dtype(text_config)
-        vision_config.num_heads = vision_config.num_attention_heads
         super().__init__(
             model_config,
             layer_idx=layer_idx,
@@ -203,7 +247,7 @@ class Cosmos3EdgeVisionBlock(nn.Module):
     def __init__(self, model_config: ModelConfig[PretrainedConfig], layer_idx: int):
         super().__init__()
         config = model_config.pretrained_config.vision_config
-        dtype = _config_dtype(model_config.pretrained_config.text_config)
+        dtype = _config_dtype(config)
         eps = getattr(config, "layer_norm_eps", _VISION_NORM_EPS)
         self.layer_norm1 = LayerNorm(hidden_size=config.hidden_size, eps=eps, dtype=dtype)
         self.layer_norm2 = LayerNorm(hidden_size=config.hidden_size, eps=eps, dtype=dtype)
@@ -231,9 +275,7 @@ class Cosmos3EdgeSiglip(nn.Module, MultimodalEncoderMixin):
         super().__init__()
         self.model_config = model_config
         self.config = model_config.pretrained_config.vision_config
-        text_dtype = _config_dtype(model_config.pretrained_config.text_config)
-        self.config.torch_dtype = text_dtype
-        self.config.num_heads = self.config.num_attention_heads
+        text_dtype = _config_dtype(self.config)
         patch_dim = self.config.num_channels * self.config.patch_size * self.config.patch_size
         self.embeddings = nn.Module()
         self.embeddings.patch_embedding = nn.Linear(patch_dim, self.config.hidden_size, bias=True)
@@ -289,20 +331,27 @@ class Cosmos3EdgeSiglip(nn.Module, MultimodalEncoderMixin):
     def get_encoder_attention_metadata_capacity(self, max_num_tokens: int) -> Dict[str, int]:
         return {"attention": max(1, max_num_tokens // self.spatial_merge_unit)}
 
-    def _spatial_shapes(self, grid_thw: torch.Tensor) -> Tuple[torch.Tensor, List[int]]:
-        grid_cpu = grid_thw.detach().to(device="cpu", dtype=torch.int64)
+    def _spatial_shapes(
+        self, grid_thw: torch.Tensor, grid_cpu: Optional[torch.Tensor] = None
+    ) -> Tuple[torch.Tensor, List[int]]:
+        grid_cpu = _cpu_int_rows(grid_thw if grid_cpu is None else grid_cpu)
         shapes = torch.repeat_interleave(grid_cpu[:, 1:], grid_cpu[:, 0], dim=0)
         lengths = (shapes[:, 0] * shapes[:, 1]).tolist()
         return shapes, [int(length) for length in lengths]
 
-    def embed(self, pixel_values: torch.Tensor, grid_thw: torch.Tensor) -> torch.Tensor:
+    def embed(
+        self,
+        pixel_values: torch.Tensor,
+        grid_thw: torch.Tensor,
+        grid_cpu: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         if pixel_values.dim() == 3:
             if pixel_values.shape[0] != 1:
                 raise ValueError(
                     f"Packed pixel_values batch must be 1, got {tuple(pixel_values.shape)}."
                 )
             pixel_values = pixel_values[0]
-        shapes, lengths = self._spatial_shapes(grid_thw)
+        shapes, lengths = self._spatial_shapes(grid_thw, grid_cpu=grid_cpu)
         if sum(lengths) != pixel_values.shape[0]:
             raise ValueError(
                 "Packed pixel_values token count does not match grid_thw: "
@@ -314,17 +363,23 @@ class Cosmos3EdgeSiglip(nn.Module, MultimodalEncoderMixin):
         positional = self.embeddings.position_embedding.weight.reshape(grid, grid, -1)
         return hidden + resize_positional_embeddings_packed(positional, shapes, lengths)
 
-    def forward(self, pixel_values: torch.Tensor, grid_thw: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        pixel_values: torch.Tensor,
+        grid_thw: torch.Tensor,
+        grid_cpu: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         if self.attn_metadata is None:
             raise RuntimeError(
                 "Vision encoder AttentionMetadata is not initialized. "
                 "It must be set up before the encoder forward runs."
             )
-        _, lengths = self._spatial_shapes(grid_thw)
+        grid_cpu = _cpu_int_rows(grid_thw if grid_cpu is None else grid_cpu)
+        _, lengths = self._spatial_shapes(grid_thw, grid_cpu=grid_cpu)
         self.attn_metadata = _prepare_qwen_vl_vision_attn_metadata(
             lengths, self.attn_metadata, max_seq_len=self._fixed_max_seq_len
         )
-        hidden = self.embed(pixel_values, grid_thw)
+        hidden = self.embed(pixel_values, grid_thw, grid_cpu=grid_cpu)
         for block in self.encoder.layers:
             hidden = block(hidden, self.attn_metadata)
         return self.post_layernorm(hidden)
@@ -333,15 +388,19 @@ class Cosmos3EdgeSiglip(nn.Module, MultimodalEncoderMixin):
 class Cosmos3EdgeVisionEncoder(nn.Module):
     """SigLIP2 encoder plus the Edge projector. Returns language-model embeddings."""
 
-    def __init__(self, model_config: ModelConfig[PretrainedConfig]):
+    def __init__(
+        self,
+        model_config: ModelConfig[PretrainedConfig],
+        model_class: type = Cosmos3EdgeSiglip,
+    ):
         super().__init__()
         self.model_config = model_config
         self.model_config.quant_config = QuantConfig()
         pretrained = model_config.pretrained_config
         self.config = pretrained.vision_config
-        text_dtype = _config_dtype(pretrained.text_config)
+        encoder_dtype = _config_dtype(self.config)
         self.visual = MultimodalModelMixin._cast_multimodal_encoder_dtype(
-            Cosmos3EdgeSiglip(model_config), text_dtype
+            model_class(model_config), encoder_dtype
         )
         projector = pretrained.projector_config
         self.projector = Qwen3VLVisionPatchMerger(
@@ -351,27 +410,38 @@ class Cosmos3EdgeVisionEncoder(nn.Module):
             norm_eps=_VISION_NORM_EPS,
         )
         self.projector = MultimodalModelMixin._cast_multimodal_encoder_dtype(
-            self.projector, text_dtype
+            self.projector, encoder_dtype
         )
         self.spatial_merge_size = int(projector.spatial_merge_size)
+        self._vision_encoder_path = None
+        if getattr(pretrained, "_name_or_path", None):
+            _, _, self._vision_encoder_path = _get_cosmos3_model_paths(pretrained)
+
+    @property
+    def llm_checkpoint_dir(self) -> str:
+        """Directory whose safetensors are the SigLIP2 tower and projector."""
+        if not self._vision_encoder_path:
+            raise ValueError(
+                "Cosmos3EdgeVisionEncoder requires pretrained_config._name_or_path "
+                "to locate vision_encoder/."
+            )
+        return self._vision_encoder_path
 
     def setup_attn_metadata(self, max_num_tokens: int, attention_metadata_capacity=None) -> None:
         self.visual.setup_attn_metadata(max_num_tokens, attention_metadata_capacity)
 
     def load_weights(self, weights: Dict[str, torch.Tensor], allow_partial_loading: bool = False):
-        visual_weights = filter_weights("model.visual", weights)
+        visual_weights = _rename_vision_module_keys(filter_weights("model.visual", weights))
         projector_weights = filter_weights("model.projector", weights)
         combined = {f"visual.{name}": value for name, value in visual_weights.items()}
         combined.update({f"projector.{name}": value for name, value in projector_weights.items()})
-        # The stock loader fuses q/k/v using this config. Vision attention is MHA.
-        self.config.num_attention_heads = self.config.num_heads
-        self.config.num_key_value_heads = self.config.num_heads
         _load_weights_impl(self, combined, allow_partial_loading=allow_partial_loading)
 
     @torch.inference_mode()
     def encode_batched(self, pixel_values: torch.Tensor, grid_thw: torch.Tensor) -> torch.Tensor:
-        hidden = self.visual(pixel_values, grid_thw)
-        merged = merge_spatial_patches(hidden, grid_thw, merge_size=self.spatial_merge_size)
+        grid_cpu = _cpu_int_rows(grid_thw)
+        hidden = self.visual(pixel_values, grid_thw, grid_cpu=grid_cpu)
+        merged = merge_spatial_patches(hidden, grid_cpu, merge_size=self.spatial_merge_size)
         merged = merged.view(-1, self.spatial_merge_size**2, hidden.shape[-1])
         return self.projector(merged)
 
@@ -409,9 +479,15 @@ class Cosmos3EdgeAttention(Attention):
             pos_type = rope_scaling["rope_type"]
         else:
             raise ValueError("rope_scaling must have type or rope_type field")
+        rope = RopeParams.from_config(config)
+        # ``type`` selects interleaved mRoPE positions. Scaling is ``rope_type``
+        # (default, yarn, linear, ...); from_config would read ``type`` first.
+        rope.scale_type = RotaryScalingType.from_string(rope_scaling.get("rope_type", "default"))
+        if "factor" in rope_scaling:
+            rope.scale = rope_scaling["factor"]
         pos_embd_params = PositionalEmbeddingParams(
             type=PositionEmbeddingType.from_string(pos_type),
-            rope=RopeParams.from_config(config),
+            rope=rope,
             mrope_section=rope_scaling.get("mrope_section", None),
             mrope_interleaved=rope_scaling.get("mrope_interleaved", False),
         )
@@ -639,15 +715,13 @@ class Cosmos3EdgeModel(Qwen3VLModelBase):
         return self.llm_path
 
     def load_weights(self, weights: Dict[str, torch.Tensor], weight_mapper: BaseWeightMapper):
-        vision_weights_file = os.path.join(self._vision_encoder_path, "model.safetensors")
-        if not os.path.isfile(vision_weights_file):
-            raise FileNotFoundError(
-                f"Cosmos3-Edge vision encoder weights not found at {vision_weights_file}."
-            )
-        import safetensors.torch
-
-        weights = dict(weights)
-        weights.update(safetensors.torch.load_file(vision_weights_file))
+        if self.mm_encoder is not None:
+            vision_weights_file = os.path.join(self._vision_encoder_path, "model.safetensors")
+            if not os.path.isfile(vision_weights_file):
+                raise FileNotFoundError(
+                    f"Cosmos3-Edge vision encoder weights not found at {vision_weights_file}."
+                )
+            weights.update(safetensors.torch.load_file(vision_weights_file))
         if not isinstance(weight_mapper, Cosmos3EdgeHfWeightMapper):
             weight_mapper = Cosmos3EdgeHfWeightMapper()
         weights = weight_mapper.preprocess_weights(weights)

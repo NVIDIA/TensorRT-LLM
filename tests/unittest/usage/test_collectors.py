@@ -163,7 +163,6 @@ class TestModelInfo:
         "architecture",
         [
             "LlamaForCausalLM",
-            "Cosmos3EdgeForCausalLM",
             "Cosmos3EdgeForConditionalGeneration",
         ],
     )

@@ -147,6 +147,11 @@ class TestCosmos3Edge(_qwen3vl.TestQwen3VL):
             model.model_config.mapping,
         )
         model.load_weights(weights, weight_mapper)
+        for module in model.modules():
+            if hasattr(module, "post_load_weights") and not getattr(
+                module, "_weights_removed", False
+            ):
+                module.post_load_weights()
 
     def setup_scenario(self, scenario: _TestQwen3VLScenario):
         # Bypass TestQwen3VL.setup_scenario: with skip_hf_inference the dummy

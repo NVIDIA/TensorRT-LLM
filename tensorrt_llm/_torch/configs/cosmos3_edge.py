@@ -4,10 +4,10 @@
 # Local config for cosmos3_edge checkpoints. Registered with AutoConfig only
 # when the installed transformers does not provide the model type natively.
 
-import os
-
 import torch
 from transformers.configuration_utils import PreTrainedConfig
+
+from .cosmos3 import _with_checkpoint_name
 
 _DTYPE_NAMES = {
     "bfloat16": torch.bfloat16,
@@ -20,6 +20,7 @@ _DTYPE_NAMES = {
 
 
 def _as_torch_dtype(value) -> torch.dtype:
+    """Resolve a checkpoint dtype. Missing or unknown values raise."""
     if isinstance(value, torch.dtype):
         return value
     if isinstance(value, str):
@@ -27,7 +28,47 @@ def _as_torch_dtype(value) -> torch.dtype:
         if key not in _DTYPE_NAMES:
             raise ValueError(f"Unsupported dtype string: {value}")
         return _DTYPE_NAMES[key]
-    return torch.bfloat16
+    raise TypeError(f"Unsupported dtype value: {value!r}")
+
+
+_SUPPORTED_ROPE_TYPES = {"default", "linear", "dynamic", "longrope", "llama3", "yarn", "mrope"}
+
+
+def _edge_rope_parameters(rope_parameters, rope_theta: float) -> dict:
+    """Keep checkpoint RoPE keys and add the interleaved mRoPE fields."""
+    incoming = dict(rope_parameters or {})
+    rope_type = incoming.get("rope_type", "default")
+    if rope_type not in _SUPPORTED_ROPE_TYPES:
+        raise ValueError(
+            f"Cosmos3-Edge text RoPE type {rope_type!r} is not supported. "
+            f"Supported types: {sorted(_SUPPORTED_ROPE_TYPES)}."
+        )
+    position_type = incoming.get("type")
+    if position_type not in (None, "mrope"):
+        raise ValueError(
+            "Cosmos3-Edge text position type "
+            f"{position_type!r} is not supported. This Reasoner uses interleaved mRoPE."
+        )
+    if incoming.get("mrope_interleaved", True) is not True:
+        raise ValueError("Cosmos3-Edge Reasoner requires mrope_interleaved=True.")
+    incoming["rope_type"] = rope_type
+    incoming["rope_theta"] = float(incoming.get("rope_theta", rope_theta))
+    incoming["mrope_section"] = list(incoming.get("mrope_section") or [24, 20, 20])
+    incoming["mrope_interleaved"] = True
+    incoming["type"] = "mrope"
+    return incoming
+
+
+def _use_or_match(config, name: str, expected):
+    """Keep a vision field when it matches, and fill it only when the checkpoint omits it."""
+    current = getattr(config, name, None)
+    if current is None:
+        setattr(config, name, expected)
+        return
+    if int(current) != int(expected):
+        raise ValueError(
+            f"Cosmos3-Edge vision_config.{name}={current} does not match the projector value {expected}."
+        )
 
 
 class Cosmos3EdgeTextConfig(PreTrainedConfig):
@@ -68,17 +109,12 @@ class Cosmos3EdgeTextConfig(PreTrainedConfig):
         resolved_dtype = _as_torch_dtype(
             dtype or kwargs.pop("dtype", None) or legacy_torch_dtype or "bfloat16"
         )
-        rope_parameters = dict(rope_parameters or {})
-        section = list(rope_parameters.get("mrope_section") or [24, 20, 20])
-        theta = float(rope_parameters.get("rope_theta", rope_theta))
-        rope_parameters = {
-            "rope_type": rope_parameters.get("rope_type", "default"),
-            "rope_theta": theta,
-            "mrope_section": section,
-        }
+        rope_parameters = _edge_rope_parameters(rope_parameters, rope_theta)
+        theta = float(rope_parameters["rope_theta"])
         super().__init__(
             tie_word_embeddings=tie_word_embeddings,
             dtype=resolved_dtype,
+            max_position_embeddings=max_position_embeddings,
             rope_parameters=rope_parameters,
             rope_theta=theta,
             **kwargs,
@@ -97,12 +133,10 @@ class Cosmos3EdgeTextConfig(PreTrainedConfig):
         self.mlp_bias = mlp_bias
         self.rope_theta = theta
         self.dtype = resolved_dtype
-        # ``rope_scaling`` is an alias of ``rope_parameters``. Keep the mRoPE
-        # fields on that dict so Qwen3VLModelBase can set ``type`` in place.
-        self.rope_parameters["mrope_section"] = section
-        self.rope_parameters["mrope_interleaved"] = True
-        self.rope_parameters["type"] = "mrope"
-        self.rope_parameters["rope_theta"] = theta
+        # Validation can drop keys that are not in the default RoPE schema.
+        # Put the checkpoint dict back, including scaling fields such as ``factor``.
+        for key, value in rope_parameters.items():
+            self.rope_parameters[key] = value
 
 
 class Cosmos3EdgeVisionConfig(PreTrainedConfig):
@@ -122,9 +156,18 @@ class Cosmos3EdgeVisionConfig(PreTrainedConfig):
         hidden_act: str = "gelu_pytorch_tanh",
         layer_norm_eps: float = 1e-6,
         attention_dropout: float = 0.0,
+        spatial_merge_size: int | None = None,
+        temporal_patch_size: int | None = None,
+        out_hidden_size: int | None = None,
+        dtype: str | torch.dtype | None = None,
         **kwargs,
     ):
         kwargs.pop("model_type", None)
+        legacy_torch_dtype = kwargs.pop("torch_dtype", None)
+        raw_dtype = dtype or kwargs.pop("dtype", None) or legacy_torch_dtype
+        resolved_dtype = None if raw_dtype is None else _as_torch_dtype(raw_dtype)
+        if resolved_dtype is not None:
+            kwargs["dtype"] = resolved_dtype
         super().__init__(**kwargs)
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
@@ -139,6 +182,15 @@ class Cosmos3EdgeVisionConfig(PreTrainedConfig):
         self.hidden_act = hidden_act
         self.layer_norm_eps = layer_norm_eps
         self.attention_dropout = attention_dropout
+        if spatial_merge_size is not None:
+            self.spatial_merge_size = spatial_merge_size
+        if temporal_patch_size is not None:
+            self.temporal_patch_size = temporal_patch_size
+        if out_hidden_size is not None:
+            self.out_hidden_size = out_hidden_size
+        if resolved_dtype is not None:
+            self.dtype = resolved_dtype
+            self.torch_dtype = resolved_dtype
 
 
 class Cosmos3EdgeProjectorConfig(PreTrainedConfig):
@@ -220,13 +272,27 @@ class Cosmos3EdgeConfig(PreTrainedConfig):
             Cosmos3EdgeProjectorConfig, projector_config, attn_implementation
         )
 
-        # Qwen3-VL processing and the patch merger read these from the vision
-        # config. The Edge checkpoint stores the merge width on the projector.
-        self.vision_config.spatial_merge_size = self.projector_config.spatial_merge_size
-        self.vision_config.temporal_patch_size = 1
-        self.vision_config.out_hidden_size = self.projector_config.out_hidden_size
-        self.vision_config.num_heads = self.vision_config.num_attention_heads
-        self.vision_config.num_key_value_heads = self.vision_config.num_attention_heads
+        # Processing and the patch merger read these from the vision config.
+        # The checkpoint stores the merge width on both sub-configs; keep a
+        # vision value that matches, and fill one only when it is absent.
+        _use_or_match(
+            self.vision_config, "spatial_merge_size", self.projector_config.spatial_merge_size
+        )
+        _use_or_match(self.vision_config, "out_hidden_size", self.projector_config.out_hidden_size)
+        temporal_patch_size = getattr(self.vision_config, "temporal_patch_size", None)
+        if temporal_patch_size is None:
+            self.vision_config.temporal_patch_size = 1
+        elif int(temporal_patch_size) != 1:
+            raise ValueError(
+                f"Cosmos3-Edge vision temporal_patch_size must be 1, got {temporal_patch_size}."
+            )
+        vision_dtype = getattr(self.vision_config, "dtype", None)
+        if not isinstance(vision_dtype, torch.dtype):
+            vision_dtype = self.text_config.dtype
+        self.vision_config.dtype = vision_dtype
+        self.vision_config.torch_dtype = vision_dtype
+        # Qwen vision attention reads this from the parent before the text config.
+        self.max_position_embeddings = self.text_config.max_position_embeddings
 
         self.image_token_id = image_token_id
         self.video_token_id = video_token_id
@@ -238,15 +304,15 @@ class Cosmos3EdgeConfig(PreTrainedConfig):
     def from_dict(cls, config_dict, **kwargs):
         config = super().from_dict(config_dict, **kwargs)
         name_or_path = kwargs.get("_name_or_path") or kwargs.get("name_or_path")
-        if name_or_path and (
-            not getattr(config, "_name_or_path", None) or len(str(config._name_or_path)) < 2
-        ):
-            config._name_or_path = os.fspath(name_or_path)
-        return config
+        return _with_checkpoint_name(
+            config, name_or_path, bool(kwargs.get("return_unused_kwargs", False))
+        )
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
         config = super().from_pretrained(pretrained_model_name_or_path, **kwargs)
-        if not getattr(config, "_name_or_path", None) or len(str(config._name_or_path)) < 2:
-            config._name_or_path = os.fspath(pretrained_model_name_or_path)
-        return config
+        return _with_checkpoint_name(
+            config,
+            pretrained_model_name_or_path,
+            bool(kwargs.get("return_unused_kwargs", False)),
+        )
