@@ -261,9 +261,10 @@ their activation points.
 
 ### Sleep and Wakeup with V2
 
-When `sleep_config` is enabled with KV cache manager V2, the host cache tier must
-have a quota at least as large as the GPU cache quota for each KV manager on
-each rank, including draft managers. Set `kv_cache_config.host_cache_size`
+When `sleep_config` is enabled with KV cache manager V2, a host cache tier below
+all GPU cache levels must have a quota at least as large as their combined GPU
+cache quota for each KV manager on each rank, including draft managers.
+Set `kv_cache_config.host_cache_size`
 accordingly; speculative decoding splits this budget between the target and
 draft managers. Automatic host sizing uses the minimum across ranks and may
 choose a smaller quota because of available host memory or pinned-memory limits.
@@ -287,7 +288,10 @@ those pages in the configured tiers fails the sleep operation.
 Sleep drains user requests before changing memory. Internal padding requests
 retain their request identities and metadata buffers, while their page indices
 are refreshed on wakeup. GPU pool virtual addresses remain reserved throughout
-sleep. Sleeping registered V2 KV memory used by a cache transceiver is unsupported.
+sleep. Both hot and cold GPU pools release their physical backing and recover
+their capacities on wakeup. Encoded cold pages retain their representation when
+moved from GPU to host. Sleeping registered V2 KV memory used by a cache
+transceiver is unsupported.
 
 ### Partial Reuse
 

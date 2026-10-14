@@ -15,6 +15,10 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.bindings.internal.batch_manager import CacheType
 from tensorrt_llm.llmapi import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.runtime.kv_cache_manager_v2 import (CacheLevel,
+                                                      GpuCacheTierConfig,
+                                                      HostCacheTierConfig,
+                                                      KVCacheManagerConfig)
 
 
 @pytest.fixture(scope="function", autouse=True)
@@ -174,14 +178,31 @@ def test_restore():
     del pool
 
 
+class _KVCacheManagerV2WithColdGpu(KVCacheManagerV2):
+
+    def _build_cache_config(
+            self, config: KVCacheManagerConfig) -> KVCacheManagerConfig:
+        config = super()._build_cache_config(config)
+        gpu_quota = config.cache_tiers[0].quota
+        config.cache_tiers = [
+            config.cache_tiers[0],
+            GpuCacheTierConfig(quota=gpu_quota),
+            HostCacheTierConfig(quota=2 * gpu_quota),
+        ]
+        return config
+
+
 @pytest.mark.parametrize("manager_cls,restore_mode", [
     (KVCacheManager, virtual_memory.RestoreMode.NONE),
-    *[(KVCacheManagerV2, mode) for mode in
+    *[(manager_cls, mode)
+      for manager_cls in (KVCacheManagerV2, _KVCacheManagerV2WithColdGpu)
+      for mode in
       (virtual_memory.RestoreMode.NONE, virtual_memory.RestoreMode.MEMSET,
        virtual_memory.RestoreMode.CPU, virtual_memory.RestoreMode.PINNED)],
 ])
 def test_kv_cache_manager(process_gpu_memory_info_available, manager_cls,
                           restore_mode):
+    is_v2 = issubclass(manager_cls, KVCacheManagerV2)
     kv_cache_params = {
         "kv_cache_config": KvCacheConfig(max_tokens=1024),
         "kv_cache_type": CacheType.SELF,
@@ -194,12 +215,12 @@ def test_kv_cache_manager(process_gpu_memory_info_available, manager_cls,
         "mapping": Mapping(world_size=1, tp_size=1, rank=0),
         "dtype": tensorrt_llm.bindings.DataType.FP8,
     }
-    if manager_cls is KVCacheManagerV2:
+    if is_v2:
         # Exercise the static device-side page-index conversion tables too.
         kv_cache_params["head_dim"] = [64, 32] * 4
 
     mgr = manager_cls(**kv_cache_params)
-    if manager_cls is KVCacheManagerV2:
+    if is_v2:
         # Warm one-time process-wide native page migration resources.
         mgr.add_dummy_requests([123], token_nums=[128], is_gen=True)
         mgr.release_memory(restore_mode)
@@ -222,16 +243,29 @@ def test_kv_cache_manager(process_gpu_memory_info_available, manager_cls,
         device='meta')
 
     alloc_size = cache_size.nelement()
-    if manager_cls is KVCacheManagerV2:
+    if is_v2:
         alloc_size = alloc_size * 3 // 4
 
     with virtual_memory.scope(tag, restore_mode) as pool:
         mgr = manager_cls(**kv_cache_params)
         assert isinstance(mgr, manager_cls)
-        if manager_cls is KVCacheManagerV2:
+        if is_v2:
             assert mgr._use_per_layer_page_tables
             metadata = mgr._device_attention_op_scales
             expected_metadata = metadata.cpu()
+            gpu_levels = [
+                CacheLevel(level)
+                for level, tier in enumerate(mgr.impl.init_config.cache_tiers)
+                if isinstance(tier, GpuCacheTierConfig)
+            ]
+            gpu_capacities = [[
+                stat.total for stat in mgr.impl.get_storage_statistics(level)
+            ] for level in gpu_levels]
+            gpu_pool_bytes = sum(
+                stat.total * sum(stat.slot_sizes) for level in gpu_levels
+                for stat in mgr.impl.get_storage_statistics(level))
+            assert gpu_pool_bytes >= alloc_size * len(gpu_levels)
+            alloc_size = gpu_pool_bytes
         memory_usage_materialized = get_current_process_gpu_memory()
         if process_gpu_memory_info_available:
             assert memory_usage_materialized >= memory_usage_begin + alloc_size
@@ -239,7 +273,7 @@ def test_kv_cache_manager(process_gpu_memory_info_available, manager_cls,
     buffers = mgr.get_buffers(0)
     pointers = [buffer.data_ptr() for buffer in buffers]
     resource = None
-    if manager_cls is KVCacheManagerV2:
+    if is_v2:
         from types import SimpleNamespace
 
         resource = SimpleNamespace(
@@ -254,13 +288,13 @@ def test_kv_cache_manager(process_gpu_memory_info_available, manager_cls,
         for buffer in buffers:
             buffer.fill_(cycle + 1)
         torch.cuda.synchronize()
-        if manager_cls is KVCacheManagerV2:
+        if is_v2:
             old_cache = mgr.kv_cache_map[dummy.py_request_id]
         assert virtual_memory.release_with_tag(tag, resource=resource) > 0
-        if manager_cls is KVCacheManagerV2:
+        if is_v2:
             assert mgr.index_mapper.get_index(dummy.py_request_id) == index
-            assert all(stat.total == 0
-                       for stat in mgr.impl.get_storage_statistics())
+            assert all(stat.total == 0 for level in gpu_levels
+                       for stat in mgr.impl.get_storage_statistics(level))
         memory_usage_released = get_current_process_gpu_memory()
         if process_gpu_memory_info_available:
             assert memory_usage_materialized - memory_usage_released >= alloc_size
@@ -270,7 +304,10 @@ def test_kv_cache_manager(process_gpu_memory_info_available, manager_cls,
         if process_gpu_memory_info_available:
             assert memory_usage_rematerialized - memory_usage_released >= alloc_size
         assert [buffer.data_ptr() for buffer in mgr.get_buffers(0)] == pointers
-        if manager_cls is KVCacheManagerV2:
+        if is_v2:
+            assert [[
+                stat.total for stat in mgr.impl.get_storage_statistics(level)
+            ] for level in gpu_levels] == gpu_capacities
             assert torch.equal(metadata.cpu(), expected_metadata)
             assert mgr.index_mapper.get_index(dummy.py_request_id) == index
             cache = mgr.kv_cache_map[dummy.py_request_id]
@@ -281,7 +318,7 @@ def test_kv_cache_manager(process_gpu_memory_info_available, manager_cls,
                                           virtual_memory.RestoreMode.PINNED))
         if restore_mode != virtual_memory.RestoreMode.NONE:
             expected = 0 if restore_mode == virtual_memory.RestoreMode.MEMSET else cycle + 1
-            if manager_cls is KVCacheManagerV2 and restore_mode != virtual_memory.RestoreMode.MEMSET:
+            if is_v2 and restore_mode != virtual_memory.RestoreMode.MEMSET:
                 pages = mgr.get_batch_cache_indices([dummy.py_request_id],
                                                     layer_idx=0)[0]
                 assert pages
@@ -293,13 +330,13 @@ def test_kv_cache_manager(process_gpu_memory_info_available, manager_cls,
                     assert torch.all(buffer.cpu().float() == expected)
 
     del buffer, buffers
-    if manager_cls is KVCacheManagerV2:
+    if is_v2:
         del metadata, expected_metadata
     # Destruction must also be valid while the physical pages are released.
     virtual_memory.release_with_tag(tag, resource=resource)
 
     mgr.shutdown()
-    if manager_cls is KVCacheManagerV2:
+    if is_v2:
         del cache, old_cache, dummy, resource
     del mgr
     del pool

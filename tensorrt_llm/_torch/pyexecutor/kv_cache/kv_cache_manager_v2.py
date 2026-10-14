@@ -6765,16 +6765,17 @@ class KVCacheManagerV2(BaseResourceManager):
         return success
 
     def validate_sleep_config(self) -> None:
-        """Require a host tier at least as large as the configured GPU cache."""
+        """Require host capacity below the GPU levels to hold their combined quota."""
         tiers = self.impl.init_config.cache_tiers
-        if (
-            len(tiers) < 2
-            or not isinstance(tiers[1], HostCacheTierConfig)
-            or tiers[1].quota < tiers[0].quota
+        gpu_levels = [i for i, tier in enumerate(tiers) if isinstance(tier, GpuCacheTierConfig)]
+        gpu_quota = sum(tiers[i].quota for i in gpu_levels)
+        if not any(
+            isinstance(tier, HostCacheTierConfig) and tier.quota >= gpu_quota
+            for tier in tiers[gpu_levels[-1] + 1 :]
         ):
             raise ValueError(
-                "KVCacheManagerV2 sleep requires a host tier with host_cache_size "
-                "at least as large as the GPU cache quota"
+                "KVCacheManagerV2 sleep requires a host tier below all GPU levels with "
+                "host_cache_size at least as large as the combined GPU cache quota"
             )
 
     def release_memory(self, mode: RestoreMode) -> None:

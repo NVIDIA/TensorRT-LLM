@@ -1709,27 +1709,40 @@ void StorageManager::expandPoolGroup(CacheLevel level, PoolGroupIndex pgIdx, Slo
 void StorageManager::releaseGpuMemory()
 {
     TLLM_CHECK_WITH_INFO(!mSleepingGpuSlots.has_value(), "GPU cache memory is already released");
-    auto& hot = mLevels.at(kHotLevel);
-    auto const slotCounts = hot.storage->slotCountList();
-    TypedVec<PoolGroupIndex, SlotCount> evictCounts(slotCounts.size(), 0);
-    for (PoolGroupIndex pgIdx{0}; pgIdx < slotCounts.size(); ++pgIdx)
+    TypedVec<CacheLevel, TypedVec<PoolGroupIndex, SlotCount>> slotCounts(numCacheLevels());
+    // Eviction only moves toward colder levels. Visit in that order so pages
+    // entering a cold GPU pool are also moved off the device before unmapping.
+    for (CacheLevel level{0}; level < numCacheLevels(); ++level)
     {
-        evictCounts[pgIdx] = hot.controller.numEvictablePages(pgIdx);
-    }
-    forceEvict(kHotLevel, evictCounts);
-    for (PoolGroupIndex pgIdx{0}; pgIdx < slotCounts.size(); ++pgIdx)
-    {
-        TLLM_CHECK_WITH_INFO(poolGroup(kHotLevel, pgIdx).slotAllocator().numOccupiedSlots() == 0,
-            "GPU cache memory still has held pages; configure sufficient host cache capacity");
+        auto& lvl = mLevels.at(level);
+        if (lvl.cacheTier != CacheTier::GPU_MEM)
+        {
+            continue;
+        }
+        slotCounts[level] = lvl.storage->slotCountList();
+        TypedVec<PoolGroupIndex, SlotCount> evictCounts(slotCounts[level].size(), 0);
+        for (PoolGroupIndex pgIdx{0}; pgIdx < evictCounts.size(); ++pgIdx)
+        {
+            evictCounts[pgIdx] = lvl.controller.numEvictablePages(pgIdx);
+        }
+        forceEvict(level, evictCounts);
+        for (PoolGroupIndex pgIdx{0}; pgIdx < evictCounts.size(); ++pgIdx)
+        {
+            TLLM_CHECK_WITH_INFO(poolGroup(level, pgIdx).slotAllocator().numOccupiedSlots() == 0,
+                "GPU cache memory still has held pages; configure sufficient host cache capacity");
+        }
     }
     // Complete codec copies before any source buffer is unmapped.
     cuCheck(cuCtxSynchronize());
     mSleepingGpuSlots = slotCounts;
-    for (PoolGroupIndex pgIdx{0}; pgIdx < slotCounts.size(); ++pgIdx)
+    for (CacheLevel level{0}; level < slotCounts.size(); ++level)
     {
-        if (slotCounts[pgIdx] != 0)
+        for (PoolGroupIndex pgIdx{0}; pgIdx < slotCounts[level].size(); ++pgIdx)
         {
-            shrinkPoolGroup(kHotLevel, pgIdx, 0, {});
+            if (slotCounts[level][pgIdx] != 0)
+            {
+                shrinkPoolGroup(level, pgIdx, 0, {});
+            }
         }
     }
     mGpuPhysMemAllocator->clear();
@@ -1739,19 +1752,23 @@ void StorageManager::materializeGpuMemory(bool zero)
 {
     TLLM_CHECK_WITH_INFO(mSleepingGpuSlots.has_value(), "GPU cache memory is not released");
     auto const& slotCounts = *mSleepingGpuSlots;
-    for (PoolGroupIndex pgIdx{0}; pgIdx < slotCounts.size(); ++pgIdx)
+    for (CacheLevel level{0}; level < slotCounts.size(); ++level)
     {
-        if (slotCounts[pgIdx] != 0)
+        for (PoolGroupIndex pgIdx{0}; pgIdx < slotCounts[level].size(); ++pgIdx)
         {
-            expandPoolGroup(kHotLevel, pgIdx, slotCounts[pgIdx]);
-        }
-        if (zero)
-        {
-            auto const& sizes = slotSize(kHotLevel, pgIdx);
-            for (PoolIndex poolIdx{0}; poolIdx < sizes.size(); ++poolIdx)
+            if (slotCounts[level][pgIdx] != 0)
             {
-                cuCheck(cuMemsetD8(static_cast<CUdeviceptr>(getMemPoolBaseAddress(pgIdx, poolIdx)), 0,
-                    slotCountToSizeT(slotCounts[pgIdx]) * sizes[poolIdx]));
+                expandPoolGroup(level, pgIdx, slotCounts[level][pgIdx]);
+            }
+            if (zero)
+            {
+                auto const& sizes = slotSize(level, pgIdx);
+                for (PoolIndex poolIdx{0}; poolIdx < sizes.size(); ++poolIdx)
+                {
+                    cuCheck(cuMemsetD8(
+                        static_cast<CUdeviceptr>(mLevels.at(level).storage->getBaseAddress(pgIdx, poolIdx, SlotId{0})),
+                        0, slotCountToSizeT(slotCounts[level][pgIdx]) * sizes[poolIdx]));
+                }
             }
         }
     }

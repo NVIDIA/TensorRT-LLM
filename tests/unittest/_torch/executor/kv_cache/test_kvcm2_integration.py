@@ -3129,17 +3129,36 @@ def test_fresh_fill_preserves_kv_across_block_onboard(
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("host_quota", [None, 8 << 20, 16 << 20, 32 << 20])
-def test_sleep_requires_host_capacity_covering_gpu(host_quota: int | None) -> None:
+@pytest.mark.parametrize("cold_gpu", [False, True])
+def test_sleep_requires_host_capacity_covering_gpu(host_quota: int | None, cold_gpu: bool) -> None:
     manager = object.__new__(KVCacheManagerV2)
     tiers = [GpuCacheTierConfig(quota=16 << 20)]
+    if cold_gpu:
+        tiers.append(GpuCacheTierConfig(quota=16 << 20))
+    gpu_quota = sum(tier.quota for tier in tiers)
     if host_quota is not None:
         tiers.append(HostCacheTierConfig(quota=host_quota))
     manager.impl = Mock(init_config=SimpleNamespace(cache_tiers=tiers))
-    if host_quota is None or host_quota < tiers[0].quota:
+    if host_quota is None or host_quota < gpu_quota:
         with pytest.raises(ValueError, match="host_cache_size"):
             manager.validate_sleep_config()
     else:
         manager.validate_sleep_config()
+
+
+@pytest.mark.cpu_only
+def test_sleep_requires_host_below_last_gpu() -> None:
+    manager = object.__new__(KVCacheManagerV2)
+    tiers = [
+        GpuCacheTierConfig(quota=16 << 20),
+        HostCacheTierConfig(quota=32 << 20),
+        GpuCacheTierConfig(quota=16 << 20),
+    ]
+    manager.impl = Mock(init_config=SimpleNamespace(cache_tiers=tiers))
+    with pytest.raises(ValueError, match="below all GPU levels"):
+        manager.validate_sleep_config()
+    tiers.append(HostCacheTierConfig(quota=32 << 20))
+    manager.validate_sleep_config()
 
 
 class _GuardKVCache:
