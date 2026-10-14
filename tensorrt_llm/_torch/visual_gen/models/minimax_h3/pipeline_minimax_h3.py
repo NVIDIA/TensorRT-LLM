@@ -18,7 +18,8 @@
 """TRT-LLM VisualGen pipeline for MiniMax-H3 FL2VA checkpoints."""
 
 import time
-from contextlib import nullcontext
+from collections.abc import Iterator
+from contextlib import contextmanager, nullcontext
 from io import BytesIO
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -64,7 +65,7 @@ from .packing import (
 from .transformer_minimax_h3 import MiniMaxH3Transformer3DModel
 
 if TYPE_CHECKING:
-    from ...sleep import PipelineSleepManager
+    from ...sleep import PipelineSleepManager, SleepRestoreMode
 
 
 def _component_skipped(
@@ -178,6 +179,32 @@ class MiniMaxH3Pipeline(BasePipeline):
         self.processor = None
         self._sleep_manager: Optional["PipelineSleepManager"] = None
         super().__init__(pipeline_config)
+
+    @contextmanager
+    def _sleep_loading_context(
+        self, restore_mode: "SleepRestoreMode", *, device: torch.device
+    ) -> Iterator[None]:
+        """Back persistent H3 allocations while keeping warmup outside the pool."""
+        config = self.pipeline_config
+        if self.mapping.world_size != 1 or config.parallel.n_workers != 1:
+            raise ValueError("MiniMax-H3 sleep loading currently requires a single GPU")
+        if config.cpu_offload_config.enable or config.cuda_graph.enable:
+            raise ValueError(
+                "MiniMax-H3 sleep cannot be combined with CPU offloading or CUDA graphs"
+            )
+        if config.cache is not None or config.runtime_lora is not None:
+            raise ValueError(
+                "MiniMax-H3 sleep does not yet support cache acceleration or runtime LoRA"
+            )
+        if self._sleep_manager is not None:
+            raise RuntimeError("Pipeline sleep was already enabled during loading")
+
+        from ...sleep import PipelineSleepManager
+
+        manager = PipelineSleepManager(restore_mode, device)
+        with manager.loading():
+            yield
+        self._sleep_manager = manager
 
     def sleep(self) -> None:
         """Reject new generation and wait for the active call before releasing GPU memory."""

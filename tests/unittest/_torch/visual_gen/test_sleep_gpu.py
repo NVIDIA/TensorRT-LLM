@@ -19,9 +19,16 @@ def test_sleep_preserves_values_addresses_and_unrelated_allocations(mode: str) -
     with manager.loading():
         tensor = torch.full((8 * 1024 * 1024,), 42, dtype=torch.int32, device="cuda")
     pointer = tensor.data_ptr()
+    tensor_bytes = tensor.numel() * tensor.element_size()
     for value in (42, 19, 63):
         tensor.fill_(value)
+        torch.cuda.synchronize()
+        # Cached unrelated blocks must not satisfy the memory-release check.
+        torch.cuda.empty_cache()
+        free_before_sleep = torch.cuda.mem_get_info()[0]
         manager.sleep()
+        released_bytes = torch.cuda.mem_get_info()[0] - free_before_sleep
+        assert released_bytes >= tensor_bytes // 2, "Sleep did not release tensor GPU memory"
         assert manager.is_sleeping
         assert bool((unrelated == 17).all())
         with pytest.raises(RuntimeError, match="asleep"):

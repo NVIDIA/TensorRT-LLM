@@ -32,7 +32,8 @@ Dynamic Quantization:
 
 import os
 import time
-from typing import TYPE_CHECKING, List, Literal, Optional, Union, cast
+from contextlib import ExitStack
+from typing import TYPE_CHECKING, List, Optional, Union
 
 import torch
 import torch.distributed as dist
@@ -52,6 +53,7 @@ from .pipeline_registry import PIPELINE_REGISTRY, PipelineComponent
 
 if TYPE_CHECKING:
     from .models import BasePipeline
+    from .sleep import SleepRestoreMode
 
 
 class PipelineLoader:
@@ -201,38 +203,28 @@ class PipelineLoader:
         skip_warmup: bool = False,
         skip_components: Optional[List[Union[str, PipelineComponent]]] = None,
         *,
-        sleep_restore_mode: Literal["CPU", "PINNED"] | None = None,
+        sleep_restore_mode: "SleepRestoreMode | None" = None,
     ) -> "BasePipeline":
         """Load a pipeline, optionally backing its persistent GPU state in host RAM.
 
-        ``sleep_restore_mode`` is an internal, single-GPU MiniMax-H3 prototype.
-        Sleep rejects new generation and waits for the active call to finish.
-        Sleep/wake transitions are serialized per instance; callers remain
-        responsible for external request queues.
-        Warmup allocations remain outside the persistent allocation pool.
+        Sleep support and configuration checks belong to the resolved pipeline.
+        Its loading context captures persistent allocations before weights are
+        materialized; warmup runs after that context exits. Ordinary loading
+        does not enter the sleep loading context.
         """
         if sleep_restore_mode is None:
             return self._load(checkpoint_dir, skip_warmup, skip_components)
 
-        if self.args.parallel_config.n_workers != 1:
-            raise ValueError("Pipeline sleep currently requires a single GPU")
-        if self.args.cpu_offload_config.enable or self.args.cuda_graph_config.enable:
-            raise ValueError("Pipeline sleep cannot be combined with CPU offloading or CUDA graphs")
-        if self.args.cache_config is not None or self.args.runtime_lora_config is not None:
-            raise ValueError(
-                "Pipeline sleep does not yet support cache acceleration or runtime LoRA"
+        with ExitStack() as loading_stack:
+            # Constructor capability checks must use the loader's target GPU.
+            loading_stack.enter_context(torch.cuda.device(self.device))
+            pipeline = self._load(
+                checkpoint_dir,
+                True,
+                skip_components,
+                sleep_restore_mode=sleep_restore_mode,
+                loading_stack=loading_stack,
             )
-
-        from .models.minimax_h3.pipeline_minimax_h3 import MiniMaxH3Pipeline
-        from .sleep import PipelineSleepManager
-
-        manager = PipelineSleepManager(sleep_restore_mode, self.device)
-        with manager.loading():
-            pipeline = cast(
-                MiniMaxH3Pipeline,
-                self._load(checkpoint_dir, True, skip_components, sleep_enabled=True),
-            )
-        pipeline._sleep_manager = manager
         if not skip_warmup:
             pipeline.warmup()
         return pipeline
@@ -243,7 +235,8 @@ class PipelineLoader:
         skip_warmup: bool,
         skip_components: Optional[List[Union[str, PipelineComponent]]],
         *,
-        sleep_enabled: bool = False,
+        sleep_restore_mode: "SleepRestoreMode | None" = None,
+        loading_stack: ExitStack | None = None,
     ) -> "BasePipeline":
         """
         Load a diffusion pipeline with optional dynamic quantization.
@@ -339,11 +332,12 @@ class PipelineLoader:
         with MetaInitMode():
             pipeline = AutoPipeline.from_config(config, checkpoint_dir)
 
-        if sleep_enabled:
-            from .models.minimax_h3.pipeline_minimax_h3 import MiniMaxH3Pipeline
-
-            if not isinstance(pipeline, MiniMaxH3Pipeline):
-                raise ValueError("Pipeline sleep is currently supported only for MiniMax-H3")
+        if sleep_restore_mode is not None:
+            if loading_stack is None:
+                raise RuntimeError("Sleep loading requires a loading context stack")
+            loading_stack.enter_context(
+                pipeline._sleep_loading_context(sleep_restore_mode, device=self.device)
+            )
 
         # Convert meta tensors to their runtime devices. Offloaded submodules
         # stay on CPU until they are explicitly staged.

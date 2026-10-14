@@ -13,9 +13,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from threading import Event
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -220,6 +220,47 @@ def test_generation_callback_cannot_deadlock_transition(
     allocation_backend.restore.assert_not_called()
 
 
+@pytest.mark.parametrize("operation", ["sleep", "wake_up"])
+def test_generation_callback_rejected_while_sleep_drains(
+    allocation_backend: SimpleNamespace, monkeypatch: pytest.MonkeyPatch, operation: str
+) -> None:
+    manager = PipelineSleepManager("CPU", torch.device("cuda:0"))
+    with manager.loading():
+        pass
+    entered, allow_callback, draining = Event(), Event(), Event()
+    wait_for = manager._condition.wait_for
+
+    def wait_for_generation(predicate: Callable[[], bool]) -> bool:
+        draining.set()
+        assert wait_for(predicate, timeout=10), "Sleep could not drain callback generation"
+        return True
+
+    monkeypatch.setattr(manager._condition, "wait_for", wait_for_generation)
+
+    def generate() -> None:
+        with manager.generation():
+            entered.set()
+            assert allow_callback.wait(10)
+            with pytest.raises(RuntimeError, match="inside an active generation"):
+                getattr(manager, operation)()
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        generation = executor.submit(generate)
+        try:
+            assert entered.wait(10)
+            sleeping = executor.submit(manager.sleep)
+            assert draining.wait(10)
+            assert not sleeping.done()
+            allocation_backend.release.assert_not_called()
+        finally:
+            allow_callback.set()
+        generation.result(timeout=15)
+        sleeping.result(timeout=15)
+    assert manager.is_sleeping
+    allocation_backend.release.assert_called_once()
+    allocation_backend.restore.assert_not_called()
+
+
 def test_overlapping_generation_rejected_and_managers_independent(
     allocation_backend: SimpleNamespace,
 ) -> None:
@@ -273,16 +314,24 @@ def test_transitions_are_serialized(
         assert finish.wait(10)
         return 2
 
-    def second_transition() -> None:
-        second_entered.set()
-        getattr(manager, second_operation)()
+    transition_lock = manager._transition_lock
 
+    class ObservedTransitionLock:
+        def __enter__(self) -> None:
+            if entered.is_set():
+                second_entered.set()
+            transition_lock.acquire()
+
+        def __exit__(self, *_args) -> None:
+            transition_lock.release()
+
+    manager._transition_lock = ObservedTransitionLock()
     backend.side_effect = transition
     with ThreadPoolExecutor(max_workers=2) as executor:
         first = executor.submit(getattr(manager, first_operation))
         try:
             assert entered.wait(10)
-            second = executor.submit(second_transition)
+            second = executor.submit(getattr(manager, second_operation))
             assert second_entered.wait(10)
             assert not first.done()
             assert not second.done()
@@ -326,18 +375,49 @@ def test_loader_default_path_does_not_capture(allocation_backend: SimpleNamespac
     allocation_backend.scope.assert_not_called()
 
 
-def test_loader_warmup_is_outside_persistent_pool(allocation_backend: SimpleNamespace) -> None:
-    loader = PipelineLoader.__new__(PipelineLoader)
-    loader.args = SimpleNamespace(
-        parallel_config=SimpleNamespace(n_workers=1),
-        cpu_offload_config=SimpleNamespace(enable=False),
-        cuda_graph_config=SimpleNamespace(enable=False),
-        cache_config=None,
-        runtime_lora_config=None,
+@pytest.fixture
+def h3_loader(monkeypatch: pytest.MonkeyPatch) -> tuple:
+    from tensorrt_llm._torch.visual_gen import pipeline_loader as loader_module
+    from tensorrt_llm._torch.visual_gen.config import DiffusionPipelineConfig
+    from tensorrt_llm._torch.visual_gen.models.minimax_h3.pipeline_minimax_h3 import (
+        MiniMaxH3Pipeline,
     )
-    loader.device = torch.device("cuda:0")
-    pipeline = SimpleNamespace(warmup=MagicMock())
-    loader._load = MagicMock(return_value=pipeline)
+    from tensorrt_llm.visual_gen.args import VisualGenArgs
+
+    config = DiffusionPipelineConfig(torch_compile={"enable": False})
+    pipeline = MiniMaxH3Pipeline.__new__(MiniMaxH3Pipeline)
+    torch.nn.Module.__init__(pipeline)
+    pipeline.pipeline_config = config
+    pipeline.mapping = config.mapping
+    pipeline._device = torch.device("cuda:0")
+    pipeline._sleep_manager = None
+    pipeline.transformer = None
+    for name in (
+        "load_weights",
+        "load_standard_components",
+        "post_load_weights",
+        "_setup_runtime_lora",
+        "initialize_offload_pipeline",
+        "warmup",
+    ):
+        setattr(pipeline, name, MagicMock())
+    pipeline.load_transformer_weights = MagicMock(return_value={})
+    loader = PipelineLoader(VisualGenArgs(model="checkpoint"), device="cuda:0")
+    monkeypatch.setattr(loader, "_resolve_checkpoint_dir", lambda path: path)
+    monkeypatch.setattr(loader, "_resolve_pipeline_config", lambda path: {})
+    monkeypatch.setattr(loader, "_setup_visual_gen_mapping", lambda config: None)
+    monkeypatch.setattr(DiffusionPipelineConfig, "from_pretrained", lambda *args, **kwargs: config)
+    monkeypatch.setattr(loader_module.AutoPipeline, "from_config", lambda *args: pipeline)
+    monkeypatch.setattr(loader, "_get_load_time_cpu_offload_modules", lambda pipeline: [])
+    monkeypatch.setattr(loader, "_materialize_meta_tensors", MagicMock())
+    return loader, pipeline
+
+
+@pytest.mark.parametrize("skip_warmup", [False, True])
+def test_loader_warmup_is_outside_persistent_pool(
+    allocation_backend: SimpleNamespace, h3_loader: tuple, skip_warmup: bool
+) -> None:
+    loader, pipeline = h3_loader
     events = []
 
     class AllocationScope:
@@ -349,55 +429,234 @@ def test_loader_warmup_is_outside_persistent_pool(allocation_backend: SimpleName
             events.append("exit")
 
     allocation_backend.scope.side_effect = lambda *_args: AllocationScope()
-    pipeline.warmup.side_effect = lambda: events.append("warmup")
-    assert loader.load("checkpoint", sleep_restore_mode="PINNED") is pipeline
-    loader._load.assert_called_once_with("checkpoint", True, None, sleep_enabled=True)
-    assert events == ["enter", "exit", "warmup"]
+
+    def loaded_stage(name: str) -> Callable:
+        def record(*_args, **_kwargs) -> None:
+            assert events[0] == "enter" and "exit" not in events
+            events.append(name)
+
+        return record
+
+    loader._materialize_meta_tensors.side_effect = loaded_stage("materialize")
+    pipeline.load_weights.side_effect = loaded_stage("weights")
+    pipeline.load_standard_components.side_effect = loaded_stage("components")
+    pipeline.post_load_weights.side_effect = loaded_stage("post_load")
+
+    def warmup() -> None:
+        pipeline._sleep_manager.ensure_awake()
+        events.append("warmup")
+
+    pipeline.warmup.side_effect = warmup
+    assert (
+        loader.load("checkpoint", skip_warmup=skip_warmup, sleep_restore_mode="PINNED") is pipeline
+    )
+    assert events == ["enter", "materialize", "weights", "components", "post_load", "exit"] + (
+        [] if skip_warmup else ["warmup"]
+    )
     pipeline._sleep_manager.ensure_awake()
 
 
-@pytest.mark.parametrize("feature", ["multi_gpu", "cpu_offload", "cuda_graph", "cache", "lora"])
-def test_loader_rejects_unsupported_combinations_before_capture(
-    allocation_backend: SimpleNamespace, feature: str
+@pytest.mark.parametrize("failure_stage", [None, "construction", "components"])
+def test_sleep_loading_selects_loader_device_and_restores_previous_device(
+    allocation_backend: SimpleNamespace,
+    h3_loader: tuple,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_stage: str | None,
 ) -> None:
-    loader = PipelineLoader.__new__(PipelineLoader)
-    loader.args = SimpleNamespace(
-        parallel_config=SimpleNamespace(n_workers=2 if feature == "multi_gpu" else 1),
-        cpu_offload_config=SimpleNamespace(enable=feature == "cpu_offload"),
-        cuda_graph_config=SimpleNamespace(enable=feature == "cuda_graph"),
-        cache_config=object() if feature == "cache" else None,
-        runtime_lora_config=object() if feature == "lora" else None,
-    )
-    loader._load = MagicMock()
-    with pytest.raises(ValueError):
+    from tensorrt_llm._torch.visual_gen import pipeline_loader as loader_module
+
+    loader, pipeline = h3_loader
+    loader.device = torch.device("cuda:3")
+    pipeline._device = torch.device("cuda")
+    current_device = 0
+    events = []
+
+    @contextmanager
+    def device_context(device: torch.device) -> Iterator[None]:
+        nonlocal current_device
+        previous_device = current_device
+        current_device = device.index
+        try:
+            yield
+        finally:
+            current_device = previous_device
+
+    monkeypatch.setattr(torch.cuda, "device", device_context)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: current_device)
+
+    def construct(*_args) -> object:
+        assert torch.cuda.current_device() == 3
+        allocation_backend.scope.assert_not_called()
+        events.append("construction")
+        if failure_stage == "construction":
+            raise ValueError("construction failed")
+        return pipeline
+
+    def components(*_args, **_kwargs) -> None:
+        assert torch.cuda.current_device() == 3
+        events.append("components")
+        if failure_stage == "components":
+            raise ValueError("components failed")
+
+    def warmup() -> None:
+        assert torch.cuda.current_device() == 0
+        pipeline._sleep_manager.ensure_awake()
+        events.append("warmup")
+
+    monkeypatch.setattr(loader_module.AutoPipeline, "from_config", construct)
+    pipeline.load_standard_components.side_effect = components
+    pipeline.warmup.side_effect = warmup
+    if failure_stage is None:
+        assert loader.load(sleep_restore_mode="CPU") is pipeline
+        assert events == ["construction", "components", "warmup"]
+        allocation_backend.scope.assert_called_once()
+    else:
+        with pytest.raises(ValueError, match=f"{failure_stage} failed"):
+            loader.load(sleep_restore_mode="CPU")
+        assert pipeline._sleep_manager is None
+        pipeline.warmup.assert_not_called()
+    assert torch.cuda.current_device() == 0
+
+
+@pytest.mark.parametrize(
+    "feature, message",
+    [
+        ("multi_gpu", "requires a single GPU"),
+        ("parallel_config", "requires a single GPU"),
+        ("cpu_offload", "cannot be combined with CPU offloading or CUDA graphs"),
+        ("cuda_graph", "cannot be combined with CPU offloading or CUDA graphs"),
+        ("cache", "does not yet support cache acceleration or runtime LoRA"),
+        ("lora", "does not yet support cache acceleration or runtime LoRA"),
+    ],
+)
+def test_h3_rejects_unsupported_combinations_before_capture(
+    allocation_backend: SimpleNamespace, h3_loader: tuple, feature: str, message: str
+) -> None:
+    loader, pipeline = h3_loader
+    config = pipeline.pipeline_config
+    if feature == "multi_gpu":
+        pipeline.mapping = SimpleNamespace(world_size=2)
+    elif feature == "parallel_config":
+        config.parallel.tp_size = 2
+    elif feature == "cpu_offload":
+        config.cpu_offload_config.enable = True
+    elif feature == "cuda_graph":
+        config.cuda_graph.enable = True
+    elif feature == "cache":
+        config.cache = object()
+    else:
+        config.runtime_lora = object()
+    with pytest.raises(ValueError, match=message):
         loader.load("checkpoint", sleep_restore_mode="PINNED")
-    loader._load.assert_not_called()
+    loader._materialize_meta_tensors.assert_not_called()
+    pipeline.load_transformer_weights.assert_not_called()
     allocation_backend.scope.assert_not_called()
 
 
 def test_loader_rejects_other_models_before_materializing(
-    allocation_backend: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+    allocation_backend: SimpleNamespace, h3_loader: tuple, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from tensorrt_llm._torch.visual_gen import pipeline_loader as loader_module
-    from tensorrt_llm._torch.visual_gen.config import DiffusionPipelineConfig
-    from tensorrt_llm.visual_gen.args import VisualGenArgs
+    from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline
 
-    config = DiffusionPipelineConfig()
-    loader = PipelineLoader(VisualGenArgs(model="checkpoint"))
-    monkeypatch.setattr(loader, "_resolve_checkpoint_dir", lambda path: path)
-    monkeypatch.setattr(loader, "_resolve_pipeline_config", lambda path: {})
-    monkeypatch.setattr(loader, "_setup_visual_gen_mapping", lambda config: None)
-    monkeypatch.setattr(DiffusionPipelineConfig, "from_pretrained", lambda *args, **kwargs: config)
+    loader, _ = h3_loader
+    pipeline = BasePipeline.__new__(BasePipeline)
+    torch.nn.Module.__init__(pipeline)
     monkeypatch.setattr(
         loader_module.AutoPipeline,
         "from_config",
-        lambda *args: SimpleNamespace(),
+        lambda *args: pipeline,
     )
-    materialize = MagicMock()
-    monkeypatch.setattr(loader, "_materialize_meta_tensors", materialize)
-    with pytest.raises(ValueError, match="only for MiniMax-H3"):
+    with pytest.raises(
+        ValueError, match="Pipeline sleep is currently not supported for this model"
+    ):
         loader.load(sleep_restore_mode="CPU")
-    materialize.assert_not_called()
+    loader._materialize_meta_tensors.assert_not_called()
+    allocation_backend.scope.assert_not_called()
+
+
+def test_loader_uses_model_hook_without_h3_dependency(
+    allocation_backend: SimpleNamespace, h3_loader: tuple, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from tensorrt_llm._torch.visual_gen import pipeline_loader as loader_module
+    from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline
+
+    loader, original = h3_loader
+    events = []
+
+    class OtherSleepPipeline(BasePipeline):
+        @contextmanager
+        def _sleep_loading_context(self, restore_mode, *, device):
+            assert restore_mode == "CPU"
+            assert device == loader.device
+            events.append("enter")
+            try:
+                yield
+            finally:
+                events.append("exit")
+
+    pipeline = OtherSleepPipeline.__new__(OtherSleepPipeline)
+    torch.nn.Module.__init__(pipeline)
+    for name in (
+        "load_transformer_weights",
+        "load_weights",
+        "load_standard_components",
+        "post_load_weights",
+        "_setup_runtime_lora",
+        "initialize_offload_pipeline",
+        "warmup",
+    ):
+        setattr(pipeline, name, getattr(original, name))
+    pipeline.transformer = None
+    monkeypatch.setattr(loader_module.AutoPipeline, "from_config", lambda *args: pipeline)
+    loader._materialize_meta_tensors.side_effect = lambda *_args: events.append("materialize")
+    pipeline.warmup.side_effect = lambda: events.append("warmup")
+    assert loader.load(sleep_restore_mode="CPU") is pipeline
+    assert events == ["enter", "materialize", "exit", "warmup"]
+    allocation_backend.scope.assert_not_called()
+
+
+@pytest.mark.parametrize("explicit_none", [False, True])
+def test_default_loading_bypasses_model_sleep_hook(
+    allocation_backend: SimpleNamespace,
+    h3_loader: tuple,
+    explicit_none: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loader, pipeline = h3_loader
+    device_context = MagicMock(side_effect=AssertionError("Sleep device context entered"))
+    monkeypatch.setattr(torch.cuda, "device", device_context)
+    pipeline._sleep_loading_context = MagicMock(side_effect=AssertionError("Sleep hook called"))
+    options = {"sleep_restore_mode": None} if explicit_none else {}
+    assert loader.load(skip_warmup=True, **options) is pipeline
+    pipeline._sleep_loading_context.assert_not_called()
+    loader._materialize_meta_tensors.assert_called_once()
+    pipeline.load_standard_components.assert_called_once()
+    assert pipeline._sleep_manager is None
+    allocation_backend.scope.assert_not_called()
+    device_context.assert_not_called()
+
+
+def test_loader_failure_exits_capture_without_enabling_sleep(
+    allocation_backend: SimpleNamespace, h3_loader: tuple
+) -> None:
+    loader, pipeline = h3_loader
+    exited = []
+
+    @contextmanager
+    def scope(*_args):
+        try:
+            yield allocation_backend.pool
+        finally:
+            exited.append(True)
+
+    allocation_backend.scope.side_effect = scope
+    pipeline.load_standard_components.side_effect = ValueError("component load failed")
+    with pytest.raises(ValueError, match="component load failed"):
+        loader.load(sleep_restore_mode="PINNED")
+    assert exited == [True]
+    assert pipeline._sleep_manager is None
+    pipeline.warmup.assert_not_called()
 
 
 def test_sleeping_h3_rejects_forward_before_cuda_work() -> None:

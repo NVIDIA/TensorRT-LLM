@@ -18,12 +18,14 @@
 from collections.abc import Iterator
 from contextlib import contextmanager
 from threading import Condition, Lock, get_ident
-from typing import Literal
+from typing import Literal, TypeAlias
 from uuid import uuid4
 
 import torch
 
 from tensorrt_llm._torch import virtual_memory
+
+SleepRestoreMode: TypeAlias = Literal["CPU", "PINNED"]
 
 
 class PipelineSleepManager:
@@ -34,7 +36,7 @@ class PipelineSleepManager:
     not drain an external scheduler or preserve a terminated process.
     """
 
-    def __init__(self, restore_mode: Literal["CPU", "PINNED"], device: torch.device) -> None:
+    def __init__(self, restore_mode: SleepRestoreMode, device: torch.device) -> None:
         if restore_mode not in ("CPU", "PINNED"):
             raise ValueError("Pipeline sleep requires CPU or PINNED memory backing")
         self._mode = virtual_memory.RestoreMode[restore_mode]

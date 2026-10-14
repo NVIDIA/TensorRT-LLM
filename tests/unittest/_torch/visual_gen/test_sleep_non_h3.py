@@ -147,7 +147,9 @@ def test_non_h3_sleep_rejected_before_weight_loading(
     loader = PipelineLoader(VisualGenArgs(model=str(checkpoint)))
     materialize = Mock(side_effect=AssertionError("Unsupported sleep request materialized tensors"))
     monkeypatch.setattr(loader, "_materialize_meta_tensors", materialize)
-    with pytest.raises(ValueError, match="only for MiniMax-H3"):
+    with pytest.raises(
+        ValueError, match="Pipeline sleep is currently not supported for this model"
+    ):
         loader.load(sleep_restore_mode="PINNED")
     materialize.assert_not_called()
     load_weights.assert_not_called()
