@@ -548,8 +548,14 @@ def _get_generation_kv_capacity(spec_config, *, is_draft: bool) -> tuple[int, in
         draft_loop_tokens = spec_config.dynamic_tree_max_topK * spec_config.max_draft_len
         reserve = max(reserve, draft_loop_tokens)
     dynamic_reserve = reserve - spec_config.max_total_draft_tokens
+    # Match _generation_draft_slots: overlap reserves another verification
+    # window beyond the ordinary draft width. Runtime quotas, static profiling
+    # and max_blocks_per_seq all consume this shared upper bound.
     headroom = (
-        get_num_extra_kv_tokens(spec_config) + spec_config.tokens_per_gen_step + dynamic_reserve
+        get_num_extra_kv_tokens(spec_config)
+        + spec_config.tokens_per_gen_step
+        + dynamic_reserve
+        + spec_config.max_total_draft_tokens
     )
     return reserve, headroom
 
