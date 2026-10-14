@@ -242,7 +242,7 @@ def test_main_posts_case_skip_rate_to_opensearch(
     decision_path = tmp_path / "decision.json"
     decision_path.write_text(
         '{"scope": "testsonly", "affected_stages": [], '
-        '"shadow_selection_artifact_path": "repo/build/cbts/cbts_shadow_selection.tar.gz"}'
+        '"shadow_selection_artifact_path": "repo/build/cbts/cbts_test_db.tar.gz"}'
     )
 
     # `main` is now a click.Command; call the undecorated callback directly, which
@@ -266,5 +266,5 @@ def test_main_posts_case_skip_rate_to_opensearch(
     assert posted_documents[0]["b_cbts_applied"] is cbts_applied
     assert posted_documents[0]["b_coverage_pilot_eligible"] is coverage_pilot_eligible
     assert posted_documents[0]["s_shadow_selection_artifact_path"] == (
-        "repo/build/cbts/cbts_shadow_selection.tar.gz"
+        "repo/build/cbts/cbts_test_db.tar.gz"
     )
