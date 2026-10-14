@@ -726,6 +726,10 @@ class PyExecutor:
         # responses and flushing them at a synchronised point in the executor
         # loop avoids the mismatch.
         self._pending_transfer_responses: List[Tuple[int, LlmResponse]] = []
+        # Failed requests whose KV blocks an unpinned transfer still touches,
+        # keyed by id(request): freed only after the transceiver lets go (see
+        # _sweep_transfer_held_failures).
+        self._transfer_held_failures: Dict[int, Tuple[LlmRequest, str]] = {}
         # Requests with a buffered terminal response are terminated only after
         # the synchronized flush has published that response.  This preserves
         # queue-backed client delivery while retaining normal termination as
@@ -2993,6 +2997,7 @@ class PyExecutor:
                 self.disagg.prepare_context_schedulable(new_requests)
                 self.disagg.poll_gen_transfers()
                 self._activate_completed_remote_tails()
+                self._sweep_transfer_held_failures()
 
                 iter_stats = self._init_iter_stats_if_sampled(len(new_requests))
 
@@ -4135,6 +4140,9 @@ class PyExecutor:
         self.disagg.poll_gen_transfers()
         self._activate_completed_remote_tails()
         self.disagg.check_transfer_timeouts()
+        # After the polls so a transfer that completed this iteration releases
+        # its parked failure before scheduling can admit the request.
+        self._sweep_transfer_held_failures()
 
         iter_stats = self._init_iter_stats_if_sampled(len(new_requests))
 
@@ -8557,6 +8565,12 @@ class PyExecutor:
         budget exhausted), **all** active requests are failed and a shutdown
         is enqueued.  Otherwise only the requests in *requests* are failed.
 
+        On the non-fatal (survivable) path, a request whose KV blocks are
+        still read or written by an unpinned transfer is not failed here:
+        its failure is parked and applied by
+        ``_sweep_transfer_held_failures`` once the transfer releases the
+        blocks (see ``_transfer_owns_request_blocks``).
+
         When ``charge_budget`` is False, the error is treated as a
         per-request failure unless the executor was already marked fatal by
         the caller. The error budget is not consumed. Use this for
@@ -8610,6 +8624,10 @@ class PyExecutor:
             logger.error(
                 f"Fatal error detected, initiating shutdown: {error_msg}")
             requests = None
+            # Failures parked for in-flight transfers no longer wait: the
+            # executor exits instead of reusing their blocks, and they must
+            # be failed with everything else.
+            self._transfer_held_failures.clear()
 
             # Drain waiting_queue so that queued-but-not-yet-activated
             # requests don't get picked up on the next iteration.
@@ -8662,6 +8680,44 @@ class PyExecutor:
 
         failed_requests = (list(self.active_requests)
                            if requests is None else requests)
+        if not is_fatal:
+            # Async work enqueued before the failure -- the model engine's
+            # input H2D copy in particular -- can still be reading the failed
+            # requests' host-side buffers, and the frees below rewrite host
+            # page metadata in place. Wait for the copy before releasing
+            # anything. Skipped on the fatal path: the executor exits instead
+            # of reusing resources, and a wedged device must not block the
+            # teardown.
+            try:
+                self._wait_for_model_engine_input_copy()
+            except Exception as copy_wait_error:
+                logger.warning("Input-copy wait before error cleanup failed: "
+                               f"{copy_wait_error}")
+
+            # A KV transfer that still reads or writes a request's blocks
+            # without holding a pin (a generation-side receive, a pipelined
+            # chunk before the final send) makes freeing unsafe: the blocks
+            # would be reallocated while the fabric touches them. Park those
+            # failures; _sweep_transfer_held_failures fails them once the
+            # transfer lets go. Pinned sends (in the async transfer manager)
+            # fail now and have only their free deferred by
+            # _terminate_request.
+            held_requests = [
+                request for request in failed_requests
+                if self._transfer_owns_request_blocks(request)
+            ]
+            if held_requests:
+                held_ids = {id(request) for request in held_requests}
+                failed_requests = [
+                    request for request in failed_requests
+                    if id(request) not in held_ids
+                ]
+                for request in held_requests:
+                    self._transfer_held_failures[id(request)] = (request,
+                                                                 error_msg)
+                logger.warning(
+                    f"Deferring failure of {len(held_requests)} request(s) "
+                    "whose KV blocks a transfer still owns")
         for request in failed_requests:
             req_id = request.py_request_id
             request.state = LlmRequestState.GENERATION_COMPLETE
@@ -8680,11 +8736,21 @@ class PyExecutor:
                 error_msg=error_msg,
                 client_id=request.py_client_id)
         if requests is None:
-            self.active_requests.clear()
+            if self._transfer_held_failures:
+                held_ids = {
+                    id(request)
+                    for request, _ in self._transfer_held_failures.values()
+                }
+                self.active_requests = [
+                    request for request in self.active_requests
+                    if id(request) in held_ids
+                ]
+            else:
+                self.active_requests.clear()
         else:
             self.active_requests = [
                 request for request in self.active_requests
-                if request not in requests
+                if request not in failed_requests
             ]
         defer_termination = False
         publish_immediately = False
@@ -8752,9 +8818,14 @@ class PyExecutor:
             connector.release_unstarted_prefix_loads(request)
             if connector.defer_load_termination(request):
                 return
+        if self._is_kv_manager_v2 or self.kv_cache_transceiver is not None:
             transfers = getattr(self, "async_transfer_manager", None)
-            if (self._is_kv_manager_v2 and transfers is not None and
-                    request.py_request_id in transfers.requests_in_transfer()):
+            if (transfers is not None and request.py_request_id
+                    in transfers.requests_in_transfer()):
+                # A transfer still holds a claim on this request's blocks.
+                # end_transfer pops the claim and the release path re-enters
+                # _terminate_request once the last owner lets go; freeing here
+                # would race the fabric and then double-free on that re-entry.
                 return
         # Dummy requests don't participate in disagg KV cache transfers,
         # so they must bypass the PP termination handler to avoid stale
@@ -8820,6 +8891,52 @@ class PyExecutor:
             return True
         return (self.kv_cache_transceiver is not None
                 and self.kv_cache_transceiver.has_inflight_transfer(request))
+
+    def _transfer_owns_request_blocks(self, request) -> bool:
+        """Whether a KV transfer still touches this request's blocks unpinned.
+
+        Context sends that reached ``start_transfer`` pinned their blocks (the
+        async transfer manager holds the claim), so failing the request now is
+        safe. Everything else in transmission -- a generation-side receive, a
+        pipelined chunk before the final send -- has the fabric reading or
+        writing unpinned blocks, so freeing must wait for the transfer.
+        """
+        if self.kv_cache_transceiver is None:
+            return False
+        try:
+            if not self._is_request_in_transmission(request):
+                return False
+        except Exception:
+            # Non-LlmRequest objects (e.g. the disagg coordinator's
+            # TransferRequest) can flow through _handle_errors; they own no
+            # KV blocks of their own.
+            return False
+        transfers = getattr(self, "async_transfer_manager", None)
+        return not (transfers is not None and getattr(
+            request, "py_request_id", None) in transfers.requests_in_transfer())
+
+    def _sweep_transfer_held_failures(self) -> None:
+        """Fail parked requests once no transfer owns their blocks.
+
+        Runs after the disagg polls and before scheduling so a request whose
+        transfer completed this iteration is failed before it can be admitted
+        to a batch.
+        """
+        if not self._transfer_held_failures:
+            return
+        for key, (request,
+                  error_msg) in list(self._transfer_held_failures.items()):
+            if request not in self.active_requests:
+                # Another path (transfer-error consensus, cancellation,
+                # shutdown) already finished this request.
+                del self._transfer_held_failures[key]
+                continue
+            if self._transfer_owns_request_blocks(request):
+                continue
+            del self._transfer_held_failures[key]
+            self._handle_errors(error_msg,
+                                requests=[request],
+                                charge_budget=False)
 
     def _try_cancel_request(self, request) -> bool:
         """Check if a request can be canceled and attempt cancellation if needed.
