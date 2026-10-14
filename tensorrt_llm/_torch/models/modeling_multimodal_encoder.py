@@ -27,7 +27,8 @@ from ..attention.backends.interface import AttentionMetadata
 from .modeling_multimodal_utils import multiscale_forward
 
 if TYPE_CHECKING:
-    from ...llmapi.llm_args import MultimodalEncoderCudaGraphConfig
+    from ...llmapi.llm_args import (MultimodalConfig,
+                                    MultimodalEncoderCudaGraphConfig)
     from .multimodal_encoder_graph import MultimodalEncoderGraphRunner
 
 # Legacy fallback for encoders that do not yet opt into atomic-item scheduling
@@ -47,7 +48,17 @@ _ENCODER_FALLBACK_MAX_NUM_REQUESTS = 8192
 def prepare_encoder_attn_metadata(seq_lens: list[int],
                                   attn_metadata: AttentionMetadata, *,
                                   max_seq_len: int) -> AttentionMetadata:
-    """Refresh packed no-KV encoder lengths while preserving captured buffers."""
+    """Refresh packed no-KV encoder lengths while preserving captured buffers.
+
+    Args:
+        seq_lens: Nonempty list of nonnegative lengths for independent attention segments,
+            including the isolated padding segment when using a padded graph.
+        attn_metadata: Initialized encoder metadata. Captured length buffers are updated in place.
+        max_seq_len: Positive, stable per-segment capacity, at least the largest live length.
+
+    Returns:
+        The supplied metadata, prepared for context-only attention without a KV cache.
+    """
     seq_lens = [int(seq_len) for seq_len in seq_lens]
     if not seq_lens:
         raise ValueError("Encoder attention requires at least one segment")
@@ -132,8 +143,27 @@ class MultimodalEncoderMixin:
     """
     metadata_cls: Type[AttentionMetadata]
     attn_metadata: Optional[AttentionMetadata] = None
+    encoder_cuda_graph_modality: str | None = None
     _encoder_cuda_graph_config: "MultimodalEncoderCudaGraphConfig | None" = None
     _blocks_graph_runner: "MultimodalEncoderGraphRunner | None" = None
+
+    def configure_encoder_cuda_graph(
+            self, multimodal_config: "MultimodalConfig | None") -> None:
+        """Select this tower's configuration without rejecting other towers' modalities.
+
+        Subclasses declare ``encoder_cuda_graph_modality`` when their graph factory is supported.
+        The engine validates the requested keys against all local encoder capabilities before
+        capturing any graphs. Explicit configs for standalone encoders remain supported.
+
+        Args:
+            multimodal_config: Model-wide configuration shared by its encoder towers.
+        """
+        graph_configs = (multimodal_config.encoder_cuda_graph
+                         if multimodal_config is not None else None)
+        self._encoder_cuda_graph_config = (
+            graph_configs.get(self.encoder_cuda_graph_modality)
+            if graph_configs is not None
+            and self.encoder_cuda_graph_modality is not None else None)
 
     def _build_blocks_graph_runner(
         self, config: "MultimodalEncoderCudaGraphConfig"

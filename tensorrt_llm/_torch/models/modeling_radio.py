@@ -565,6 +565,8 @@ class VisionTransformer(nn.Module, MultimodalEncoderMixin):
     Modified from https://github.com/huggingface/pytorch-image-models/blob/main/timm/models/vision_transformer.py.
     """
 
+    encoder_cuda_graph_modality = "vision"
+
     def __init__(
         self,
         img_size: int = 224,
@@ -927,7 +929,8 @@ class VisionTransformer(nn.Module, MultimodalEncoderMixin):
         return x
 
 
-class _VisionEncoderMetadataProvider(EncoderMetadataProvider):
+class _VisionEncoderMetadataProvider(EncoderMetadataProvider[AttentionMetadata]
+                                     ):
     """Bridges the multimodal encoder graph runner to the model's eager metadata path.
 
     `build` returns a fresh `AttentionMetadata` with `is_cuda_graph=True`; that flag flips

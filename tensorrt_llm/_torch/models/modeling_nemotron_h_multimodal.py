@@ -283,18 +283,9 @@ class DynamicResolutionParams:
 def _get_vision_encoder_cuda_graph_config(
     mm_config: Optional["MultimodalConfig"],
 ) -> Optional["MultimodalEncoderCudaGraphConfig"]:
+    """Select the vision tower's graph config from the model-wide modality mapping."""
     if mm_config is None or mm_config.encoder_cuda_graph is None:
         return None
-
-    # TODO: Add support for audio encoder CUDA graphs.
-    supported_modalities = {"vision"}
-    unknown_modalities = set(mm_config.encoder_cuda_graph) - supported_modalities
-    if unknown_modalities:
-        raise ValueError(
-            f"Unsupported multimodal encoder CUDA graph modalities: {sorted(unknown_modalities)}. "
-            f"Supported modalities: {sorted(supported_modalities)}."
-        )
-
     return mm_config.encoder_cuda_graph.get("vision")
 
 

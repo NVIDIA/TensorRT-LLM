@@ -816,6 +816,8 @@ def _triton_pos_embed_interpolate(
 
 
 class Qwen3VisionModel(torch.nn.Module, MultimodalEncoderMixin):
+    encoder_cuda_graph_modality = "vision"
+
     def __init__(self, model_config: ModelConfig[PretrainedConfig]):
         super().__init__()
         self.model_config = model_config
@@ -891,16 +893,7 @@ class Qwen3VisionModel(torch.nn.Module, MultimodalEncoderMixin):
         self._fixed_max_seq_len = self.model_config.max_num_tokens
         self._blocks_graph_runner: MultimodalEncoderGraphRunner | None = None
 
-        mm_config = self.model_config.multimodal_config
-        self._encoder_cuda_graph_config: "MultimodalEncoderCudaGraphConfig | None" = None
-        if mm_config is not None and mm_config.encoder_cuda_graph is not None:
-            unknown_modalities = set(mm_config.encoder_cuda_graph) - {"vision"}
-            if unknown_modalities:
-                raise ValueError(
-                    "Unsupported Qwen3-VL encoder CUDA graph modalities: "
-                    f"{sorted(unknown_modalities)}. Supported modalities: ['vision']."
-                )
-            self._encoder_cuda_graph_config = mm_config.encoder_cuda_graph.get("vision")
+        self.configure_encoder_cuda_graph(self.model_config.multimodal_config)
 
         # Vision block's `rope_position_ids` scratch. Registered empty here;
         # `setup_attn_metadata` allocates it as an `arange` (see there).
@@ -1255,7 +1248,7 @@ class Qwen3VisionModel(torch.nn.Module, MultimodalEncoderMixin):
         return self._run_blocks(hidden_states, cos, sin, rope_position_ids, self.attn_metadata)
 
 
-class _Qwen3VisionEncoderMetadataProvider(EncoderMetadataProvider):
+class _Qwen3VisionEncoderMetadataProvider(EncoderMetadataProvider[AttentionMetadata]):
     """Own fixed-address attention metadata for Qwen3-VL graph buckets."""
 
     def __init__(self, vision: Qwen3VisionModel) -> None:
