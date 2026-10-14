@@ -1266,6 +1266,8 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
                             script: Utils.sshUserCmd(remote, scriptPreparePathNode),
                             numRetries: 3
                         )
+                    } catch (InterruptedException e) {
+                        throw e
                     } catch (Exception e) {
                         echo "[Prepare Container] Non-fatal failure: ${e.message}. GPU agent job will fall back to base sqsh + full install."
                     }
@@ -2577,6 +2579,8 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     scriptInstallPathNode,
                     scriptFatBuildPathNode,
                     scriptFatBuildSbatchPathNode,
+                    scriptFatBuildBodyPathNode,
+                    scriptPrepareBodyPathNode,
                     scriptBashUtilsPathNode,
                     scriptLaunchPathNode,
                     scriptPreparePathNode,
@@ -2734,6 +2738,8 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                         script: Utils.sshUserCmd(remote, scriptPreparePathNode),
                         numRetries: 3
                     )
+                } catch (InterruptedException e) {
+                    throw e
                 } catch (Exception e) {
                     echo "[Prepare Container] Non-fatal failure: ${e.message}. GPU job will fall back to base sqsh + full install."
                 }
