@@ -131,6 +131,15 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "find out whether this host can host this run.",
     )
     parser.add_argument(
+        "--wait-for-spool",
+        type=float,
+        default=0.0,
+        metavar="MINUTES",
+        help="With a session_spool environment, wait up to MINUTES for the "
+        "spool to appear (its compute session is still importing the image) "
+        "instead of failing validation at once.",
+    )
+    parser.add_argument(
         "--skip-substrate-gate",
         action="store_true",
         help="Skip preflight's substrate gate — the cold start that proves "
@@ -313,6 +322,28 @@ SUBCOMMANDS = {
 }
 
 
+def _wait_for_spool(task: Path, timeout_s: float, poll_s: float = 15.0) -> bool:
+    """Wait for a session_spool environment's spool directory; validation still owns the verdict."""
+    import time
+
+    import yaml
+
+    try:
+        env = (yaml.safe_load(task.read_text()) or {}).get("environment") or {}
+    except (OSError, yaml.YAMLError):
+        return False
+    spool = env.get("spool") if env.get("kind") == "session_spool" else None
+    if not isinstance(spool, str) or Path(spool).is_dir():
+        return True
+    print(f"→ waiting up to {timeout_s / 60:g} min for the spool {spool} (its session is starting)")
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        time.sleep(poll_s)
+        if Path(spool).is_dir():
+            return True
+    return False
+
+
 def main(argv: list[str] | None = None) -> None:
     """Run the staircase-onboard workflow as a CLI."""
     argv = list(sys.argv[1:] if argv is None else argv)
@@ -324,6 +355,8 @@ def main(argv: list[str] | None = None) -> None:
         # delivered run.
         argv = [*argv[1:], "--stage", "tune"]
     args = _parse_args(argv)
+    if args.wait_for_spool > 0:
+        _wait_for_spool(Path(args.task), args.wait_for_spool * 60)
 
     # Validate at the CLI boundary: an invalid spec must abort before any
     # agent is constructed, and the message must list every problem at
