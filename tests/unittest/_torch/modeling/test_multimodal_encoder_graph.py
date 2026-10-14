@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import contextlib
 from dataclasses import dataclass
-from typing import Callable, Dict, List, Optional, Sequence
+from typing import Callable, Dict, List, Mapping, Optional, Sequence
 from unittest import mock
 
 import pytest
@@ -19,6 +19,7 @@ import torch
 
 import tensorrt_llm._torch.models.multimodal_encoder_graph as encoder_graph_module
 from tensorrt_llm._torch.models.multimodal_encoder_graph import (
+    EncoderGraphIOAdapter,
     EncoderGraphKey,
     EncoderGraphTensorSpec,
     MultimodalEncoderGraphRunner,
@@ -91,6 +92,68 @@ class _NoopMetadataProvider:
 
     def refresh_in_place(self, metadata, padded_seq_lengths: Sequence[int]) -> None:
         return None
+
+
+class _BatchedFramesIOAdapter(EncoderGraphIOAdapter):
+    """Test layout with a batch/time axis, validity masks, and downsampled outputs."""
+
+    def allocate_inputs(
+        self, key: EncoderGraphKey, device: torch.device
+    ) -> dict[str, torch.Tensor]:
+        frames = key.total_tokens // key.num_contexts
+        return {
+            "features": torch.zeros(key.num_contexts, frames, 2, device=device),
+            "mask": torch.zeros(key.num_contexts, frames, dtype=torch.bool, device=device),
+        }
+
+    def copy_inputs(
+        self,
+        static_inputs: Mapping[str, torch.Tensor],
+        inputs: Mapping[str, torch.Tensor],
+        seq_lengths: Sequence[int],
+    ) -> None:
+        for name, dst in static_inputs.items():
+            dst.zero_()
+            src = inputs[name]
+            dst[:, : src.shape[1]].copy_(src)
+
+    def collect_outputs(
+        self, outputs: Mapping[str, torch.Tensor], seq_lengths: Sequence[int]
+    ) -> dict[str, torch.Tensor]:
+        output_frames = (max(seq_lengths) + 1) // 2
+        return {name: tensor[:, :output_frames] for name, tensor in outputs.items()}
+
+    def can_replay(self, bucket: EncoderGraphKey, seq_lengths: Sequence[int]) -> bool:
+        return max(seq_lengths) <= bucket.total_tokens // bucket.num_contexts
+
+    def graph_key(self, bucket: EncoderGraphKey, *, enable_padding: bool) -> EncoderGraphKey:
+        return bucket
+
+    def padded_seq_lengths(
+        self, seq_lengths: Sequence[int], *, bucket: EncoderGraphKey, enable_padding: bool
+    ) -> list[int]:
+        return list(seq_lengths)
+
+    def capture_seq_lengths(self, bucket: EncoderGraphKey, key: EncoderGraphKey) -> list[int]:
+        return [key.total_tokens // key.num_contexts] * key.num_contexts
+
+
+def _batched_frames_encoder(
+    inputs: Mapping[str, torch.Tensor], metadata: _ToyMetadata
+) -> dict[str, torch.Tensor]:
+    mask = inputs["mask"][:, ::2]
+    bias = metadata.seq_lens_cuda.sum().to(inputs["features"].dtype)
+    features = (inputs["features"][:, ::2] + bias) * mask.unsqueeze(-1)
+    return {"features": features, "mask": mask}
+
+
+def _make_batched_frames_runner(device: torch.device) -> MultimodalEncoderGraphRunner[_ToyMetadata]:
+    return MultimodalEncoderGraphRunner(
+        encoder_fn=_batched_frames_encoder,
+        metadata_provider=_ToyMetadataProvider(device),
+        io_adapter=_BatchedFramesIOAdapter(),
+        config=MultimodalEncoderCudaGraphConfig(buckets=[(8, 2), (12, 2)]),
+    )
 
 
 def _make_toy_encoder_fn(scale: float):
@@ -201,7 +264,7 @@ def test_select_bucket(enable_padding, real_contexts, real_tokens, expected_buck
 def test_padded_seq_lengths_appends_dummy_context():
     runner = _make_logic_runner()
     bucket = EncoderGraphKey(num_contexts=1, total_tokens=512)
-    padded = runner._padded_seq_lengths([300], bucket=bucket, real_tokens=300)
+    padded = runner._padded_seq_lengths([300], bucket=bucket)
     # Slack (512 - 300) plus the runner's 1-token padding reservation.
     assert padded == [300, 213]
 
@@ -211,14 +274,14 @@ def test_padded_seq_lengths_reserves_one_token_on_exact_fit():
     # backend rejects empty contexts.
     runner = _make_logic_runner()
     bucket = EncoderGraphKey(num_contexts=1, total_tokens=512)
-    padded = runner._padded_seq_lengths([512], bucket=bucket, real_tokens=512)
+    padded = runner._padded_seq_lengths([512], bucket=bucket)
     assert padded == [512, 1]
 
 
 def test_padded_seq_lengths_no_dummy_when_padding_disabled():
     runner = _make_logic_runner(enable_padding=False)
     bucket = EncoderGraphKey(num_contexts=1, total_tokens=512)
-    padded = runner._padded_seq_lengths([512], bucket=bucket, real_tokens=512)
+    padded = runner._padded_seq_lengths([512], bucket=bucket)
     assert padded == [512]
 
 
@@ -483,6 +546,63 @@ def test_capture_scopes_warmup_and_captured_encoder_calls(monkeypatch):
     assert all(inputs is static_inputs for inputs in scoped_inputs)
 
 
+@pytest.mark.cpu_only
+def test_custom_io_adapter_updates_masks_and_collects_downsampled_outputs() -> None:
+    device = torch.device("cpu")
+    runner = _make_batched_frames_runner(device)
+    bucket = EncoderGraphKey(total_tokens=8, num_contexts=2)
+    key = runner._padded_key_for_bucket(bucket)
+    assert key == bucket
+    assert runner._dummy_padded_seq_lengths(bucket, key) == [4, 4]
+
+    static_inputs = runner._io_adapter.allocate_inputs(key, device)
+    metadata = runner._metadata_provider.build(key)
+    outputs = _batched_frames_encoder(static_inputs, metadata)
+    graph = mock.Mock()
+
+    def replay() -> None:
+        for name, tensor in _batched_frames_encoder(static_inputs, metadata).items():
+            outputs[name].copy_(tensor)
+
+    graph.replay.side_effect = replay
+    runner._captured[key] = _CapturedGraph(
+        graph=graph,
+        inputs=static_inputs,
+        metadata=metadata,
+        outputs=outputs,
+        metadata_tensor_ptrs=runner._snapshot_metadata_tensor_ptrs(
+            metadata, runner._metadata_provider.graph_critical_attrs
+        ),
+    )
+    input_ptrs = {name: tensor.data_ptr() for name, tensor in static_inputs.items()}
+    for lengths, frames in [([4, 2], 4), ([1, 2], 2)]:
+        features = torch.arange(2 * frames * 2, dtype=torch.float32).reshape(2, frames, 2)
+        mask = torch.arange(frames).unsqueeze(0) < torch.tensor(lengths).unsqueeze(1)
+        result = runner.maybe_run(seq_lengths=lengths, inputs={"features": features, "mask": mask})
+        assert result is not None
+        expected = torch.zeros(2, (max(lengths) + 1) // 2, 2)
+        for batch_idx, length in enumerate(lengths):
+            for frame_idx in range(0, length, 2):
+                expected[batch_idx, frame_idx // 2] = features[batch_idx, frame_idx] + sum(lengths)
+        torch.testing.assert_close(result["features"], expected)
+        torch.testing.assert_close(result["mask"], mask[:, ::2])
+        assert {name: tensor.data_ptr() for name, tensor in static_inputs.items()} == input_ptrs
+        assert metadata.seq_lens_cuda.tolist() == lengths
+
+    assert not static_inputs["mask"][:, 2:].any()
+    assert not static_inputs["features"][:, 2:].any()
+    assert graph.replay.call_count == 2
+
+
+@pytest.mark.cpu_only
+def test_custom_layout_skips_bucket_whose_time_axis_is_too_small() -> None:
+    runner = _make_batched_frames_runner(torch.device("cpu"))
+    lengths = [5, 1]
+    assert runner._select_bucket(2, sum(lengths), lengths) == EncoderGraphKey(12, 2)
+    runner._buckets = [EncoderGraphKey(8, 2)]
+    assert runner.maybe_run(seq_lengths=lengths, inputs={}) is None
+
+
 pytestmark_cuda = pytest.mark.skipif(
     not torch.cuda.is_available(),
     reason="MultimodalEncoderGraphRunner requires CUDA",
@@ -494,6 +614,26 @@ def cuda_device():
     if not torch.cuda.is_available():
         pytest.skip("CUDA not available")
     return torch.device("cuda")
+
+
+@pytestmark_cuda
+def test_cuda_custom_io_adapter_replays_masked_downsampled_outputs(cuda_device) -> None:
+    runner = _make_batched_frames_runner(cuda_device)
+    runner.capture_all(cuda_device)
+    for lengths, frames in [([4, 2], 4), ([3, 1], 3), ([1, 2], 2)]:
+        features = torch.arange(2 * frames * 2, dtype=torch.float32).reshape(2, frames, 2)
+        mask = torch.arange(frames).unsqueeze(0) < torch.tensor(lengths).unsqueeze(1)
+        result = runner.maybe_run(
+            seq_lengths=lengths,
+            inputs={"features": features.to(cuda_device), "mask": mask.to(cuda_device)},
+        )
+        assert result is not None
+        expected = torch.zeros(2, (max(lengths) + 1) // 2, 2)
+        for batch_idx, length in enumerate(lengths):
+            for frame_idx in range(0, length, 2):
+                expected[batch_idx, frame_idx // 2] = features[batch_idx, frame_idx] + sum(lengths)
+        torch.testing.assert_close(result["features"].cpu(), expected, rtol=0, atol=0)
+        torch.testing.assert_close(result["mask"].cpu(), mask[:, ::2])
 
 
 @pytest.fixture

@@ -112,6 +112,58 @@ def test_encoder_graph_capture_follows_metadata_setup_and_runs_once() -> None:
     model.disabled.runner.capture_all.assert_not_called()
 
 
+def test_encoder_graph_configs_are_selected_per_tower_and_validated_together() -> None:
+    class Encoder(torch.nn.Module, MultimodalEncoderMixin):
+        def __init__(self, modality: str, mm_config: MultimodalConfig) -> None:
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.ones(1))
+            self.encoder_cuda_graph_modality = modality
+            self.configure_encoder_cuda_graph(mm_config)
+            self.runner = Mock()
+
+        def _build_blocks_graph_runner(self, config: MultimodalEncoderCudaGraphConfig) -> Mock:
+            assert config is self._encoder_cuda_graph_config
+            return self.runner
+
+    vision_config = MultimodalEncoderCudaGraphConfig(buckets=[(256, 1)])
+    audio_config = MultimodalEncoderCudaGraphConfig(buckets=[(1024, 1)])
+    mm_config = MultimodalConfig(
+        encoder_cuda_graph={"vision": vision_config, "audio": audio_config}
+    )
+    model = torch.nn.Module()
+    model.vision = Encoder("vision", mm_config)
+    model.audio = Encoder("audio", mm_config)
+    assert model.vision._encoder_cuda_graph_config is vision_config
+    assert model.audio._encoder_cuda_graph_config is audio_config
+
+    setup_mm_encoder_cuda_graphs(model, mm_config.encoder_cuda_graph)
+    setup_mm_encoder_cuda_graphs(model, mm_config.encoder_cuda_graph)
+    model.vision.runner.capture_all.assert_called_once_with(torch.device("cpu"))
+    model.audio.runner.capture_all.assert_called_once_with(torch.device("cpu"))
+
+
+def test_unsupported_encoder_graph_modality_fails_before_any_capture() -> None:
+    class VisionEncoder(torch.nn.Module, MultimodalEncoderMixin):
+        encoder_cuda_graph_modality = "vision"
+
+        def enable_blocks_cuda_graph(self) -> None:
+            raise AssertionError("Validation must happen before graph capture")
+
+    model = torch.nn.Module()
+    model.encoder = VisionEncoder()
+    graph_configs = {"audio": MultimodalEncoderCudaGraphConfig(buckets=[(1024, 1)])}
+    with pytest.raises(ValueError, match="Unsupported.*audio.*Supported.*vision"):
+        setup_mm_encoder_cuda_graphs(model, graph_configs)
+
+
+def test_encoder_graph_modality_validation_allows_delegated_encoders() -> None:
+    model = torch.nn.Module()
+    model.mm_encoder = None
+    setup_mm_encoder_cuda_graphs(
+        model, {"audio": MultimodalEncoderCudaGraphConfig(buckets=[(1024, 1)])}
+    )
+
+
 def _bind_items(mm_item_scheduler: MultimodalItemScheduler, request, *, row_bytes: int = 8) -> None:
     state = request.py_mm_encoder_state
     for item_idx, rows in enumerate(state.embedding_lengths):

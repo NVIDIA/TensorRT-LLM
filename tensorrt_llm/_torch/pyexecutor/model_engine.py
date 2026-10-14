@@ -542,7 +542,10 @@ class PyTorchModelEngine(ModelEngine):
 
             # Capture local encoders after their metadata is sized and before
             # KV-cache estimation, so graph memory is included in the profile.
-            setup_mm_encoder_cuda_graphs(self.model)
+            mm_config = self.llm_args.multimodal_config
+            setup_mm_encoder_cuda_graphs(
+                self.model,
+                mm_config.encoder_cuda_graph if mm_config is not None else None)
         except Exception as e:
             import traceback
             traceback.print_exception(Exception, e, e.__traceback__)

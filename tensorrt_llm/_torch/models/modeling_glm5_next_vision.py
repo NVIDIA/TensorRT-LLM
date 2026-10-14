@@ -95,21 +95,6 @@ if TYPE_CHECKING:
 _VISION_WEIGHT_PREFIX = "model.visual"
 
 
-def _image_encoder_cuda_graph_config(
-    model_config: ModelConfig[PretrainedConfig],
-) -> Optional["MultimodalEncoderCudaGraphConfig"]:
-    mm_config = model_config.multimodal_config
-    if mm_config is None or mm_config.encoder_cuda_graph is None:
-        return None
-    unknown = set(mm_config.encoder_cuda_graph) - {"image"}
-    if unknown:
-        raise ValueError(
-            "glm5_next: unsupported multimodal encoder CUDA graph modalities "
-            f"{sorted(unknown)}; only 'image' is supported"
-        )
-    return mm_config.encoder_cuda_graph.get("image")
-
-
 def _text_dtype(model_config: ModelConfig[PretrainedConfig]) -> torch.dtype:
     text_config = unwrap_glm5_next_text_config(model_config.pretrained_config)
     dtype = getattr(text_config, "dtype", None)
@@ -382,6 +367,8 @@ class Glm5NextVisionModel(nn.Module, MultimodalEncoderMixin):
     """The GLM vision tower: patch embed → 24 blocks → post-norm →
     downsample → projector. Context-only, ``kv_cache_manager=None``."""
 
+    encoder_cuda_graph_modality = "image"
+
     def __init__(self, model_config: ModelConfig[PretrainedConfig]) -> None:
         super().__init__()
         _require_trtllm_vision_backend(model_config, type(self).__name__)
@@ -442,7 +429,7 @@ class Glm5NextVisionModel(nn.Module, MultimodalEncoderMixin):
         # Optional CUDA-graph replay of the block stack (see
         # `enable_blocks_cuda_graph`); opted in through
         # `multimodal_config.encoder_cuda_graph["image"]`.
-        self._encoder_cuda_graph_config = _image_encoder_cuda_graph_config(model_config)
+        self.configure_encoder_cuda_graph(model_config.multimodal_config)
         self._blocks_graph_runner: Optional[MultimodalEncoderGraphRunner] = None
 
     @property
@@ -612,7 +599,7 @@ class Glm5NextVisionModel(nn.Module, MultimodalEncoderMixin):
         return self.merger(hidden_states)
 
 
-class _Glm5NextVisionGraphMetadataProvider(EncoderMetadataProvider):
+class _Glm5NextVisionGraphMetadataProvider(EncoderMetadataProvider[AttentionMetadata]):
     """Graph-owned TRTLLM metadata for the block-stack runner.
 
     Per bucket one metadata instance with ``is_cuda_graph=True`` so the
