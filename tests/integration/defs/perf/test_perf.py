@@ -1707,7 +1707,12 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                 # Preserve raw results, prompts and config before workspace cleanup.
                 result_dir = os.path.join(output_dir, "detailed_results",
                                           os.path.basename(engine_dir))
-                shutil.copytree(engine_dir, result_dir, dirs_exist_ok=True)
+                try:
+                    shutil.copytree(engine_dir, result_dir, dirs_exist_ok=True)
+                except OSError as error:
+                    print_warning(
+                        f"Failed to preserve detailed results in {result_dir}: {error}"
+                    )
             shutil.rmtree(engine_dir, ignore_errors=True)
 
         def add_myelin_time_pass_to(input_env):
