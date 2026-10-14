@@ -114,9 +114,10 @@ builds for other Python versions or platforms.
 ### Install in an NGC PyTorch container
 
 Query the appropriate index and replace `<version-from-the-list>` with the desired version.
-Download the wheel from that index before installing it to avoid selecting a PyPI wheel with the same version.
 
 #### Install a regular release
+
+Download the wheel from that index before installing it to avoid selecting a PyPI wheel with the same version.
 
 ```bash
 pip3 index versions tensorrt_llm --pre \
@@ -135,11 +136,8 @@ pip3 install "$TRTLLM_WHEEL_DIR"/tensorrt_llm-*.whl
 pip3 index versions tensorrt_llm --pre \
     --index-url https://pypi.nvidia.com/trtllm_ngcpytorch_nightly/
 
-TRTLLM_WHEEL_DIR=$(mktemp -d)
-pip3 download --no-deps "tensorrt_llm==<version-from-the-list>" \
-    --index-url https://pypi.nvidia.com/trtllm_ngcpytorch_nightly/ \
-    --dest "$TRTLLM_WHEEL_DIR"
-pip3 install "$TRTLLM_WHEEL_DIR"/tensorrt_llm-*.whl
+pip3 install "tensorrt_llm==<version-from-the-list>" \
+    --extra-index-url https://pypi.nvidia.com/trtllm_ngcpytorch_nightly/
 ```
 
 ### Sanity check
