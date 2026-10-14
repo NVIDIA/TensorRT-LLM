@@ -2492,9 +2492,11 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     // `|| true` so a missing file (submission never wrote it) yields
                     // an empty string and reaches the typed throw below, instead of a
                     // generic "script returned exit code 1" the classifier can't act on.
+                    // No `2>/dev/null`: under a csh login shell it would send stdout to
+                    // /dev/null and always return an empty job ID.
                     slurmJobId = Utils.exec(
                         pipeline,
-                        script: Utils.sshUserCmd(remote, "\"cat ${jobWorkspace}/slurm_job_id.txt 2>/dev/null || true\""),
+                        script: Utils.sshUserCmd(remote, "\"cat ${jobWorkspace}/slurm_job_id.txt || true\""),
                         returnStdout: true,
                         numRetries: 3
                     ).trim()
@@ -2659,7 +2661,11 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 def scpXmlCmd = scpFromRemoteCmd(remote, "${remoteWorkspaceTrk}/results*.xml", "${stageName}/")
                 def scpUnfinishedCmd = scpFromRemoteCmd(remote, "${remoteWorkspaceTrk}/unfinished_test.txt", "${stageName}/")
                 def sshRefreshCacheCmd = Utils.sshUserCmd(remote, "\"ls '${remoteWorkspaceTrk}/' > /dev/null 2>&1; ls -la '${remoteWorkspaceTrk}/results.xml' > /dev/null 2>&1 || true\"")
-                def sshListPerfCmd = Utils.sshUserCmd(remote, "\"find '${remoteWorkspaceTrk}' -maxdepth 1 -type d \\( -name 'aggr*' -o -name 'disagg*' \\) -print 2>/dev/null || true\"")
+                // The sh blocks below paste this command between single quotes, which strips any
+                // quotes inside it, and the remote side runs it under svc_tensorrt's login shell,
+                // which is csh on some clusters (oci-jhb, oci-aga). Keep the remote part free of
+                // quotes, globs and fd redirects, and filter the aggr*/disagg* folders locally.
+                def sshListPerfCmd = Utils.sshUserCmd(remote, "\"find ${remoteWorkspaceTrk} -mindepth 1 -maxdepth 1 -type d\"") + " | grep -e /aggr -e /disagg"
                 def scpPerfTemplate = scpFromRemoteCmd(remote, "PERF_FOLDER_PLACEHOLDER", "${stageName}/")
                 sh "rm -f ${pytestDoneFile}"
                 withCredentials([usernamePassword(
