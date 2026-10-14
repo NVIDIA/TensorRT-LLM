@@ -26,7 +26,7 @@ from diffusers.utils.torch_utils import randn_tensor
 from diffusers.video_processor import VideoProcessor
 from transformers import AutoTokenizer, UMT5EncoderModel
 
-from tensorrt_llm._torch.visual_gen.attention_backend.sparse.vsa import (
+from tensorrt_llm._torch.visual_gen.attention.backends.sparse.vsa import (
     VSAMetadataBuilder,
     set_vsa_forward_context,
 )

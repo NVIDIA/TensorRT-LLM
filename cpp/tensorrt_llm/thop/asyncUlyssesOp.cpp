@@ -18,7 +18,7 @@
 // Async Ulysses A2A — PyTorch _SymmetricMemory CUDA-IPC backend.
 //
 // Pipeline (paired with UlyssesAttention.forward_async in
-// tensorrt_llm/_torch/visual_gen/attention_backend/parallel.py):
+// tensorrt_llm/_torch/visual_gen/attention/backends/parallel.py):
 //
 //   recv, send_h = ulysses_a2a_async_prepare(input, pg)   # default stream
 //   ev.record()

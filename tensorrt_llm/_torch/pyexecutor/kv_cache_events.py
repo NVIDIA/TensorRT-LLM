@@ -32,7 +32,7 @@ from abc import ABC, abstractmethod
 from collections import deque
 from itertools import count
 from queue import Queue
-from typing import Any, Optional
+from typing import Any, Iterator, Optional
 
 import msgspec
 import zmq
@@ -163,6 +163,7 @@ class ZmqEventPublisher(EventPublisher):
     """
 
     SHUTDOWN_TIMEOUT = 1.0
+    REPLAY_BATCHES_PER_TICK = 64
     END_SEQ = (-1).to_bytes(8, "big", signed=True)
 
     def __init__(
@@ -181,6 +182,8 @@ class ZmqEventPublisher(EventPublisher):
         self._ctx = zmq.Context.instance()
         self._pub: Optional[zmq.Socket] = None
         self._replay: Optional[zmq.Socket] = None
+        self._replay_client_id: bytes | None = None
+        self._replay_entries: Iterator[tuple[int, bytes]] | None = None
         self._rank = data_parallel_rank
         self._endpoint = self.offset_endpoint_port(endpoint, self._rank)
         self._replay_endpoint = self.offset_endpoint_port(replay_endpoint, self._rank)
@@ -293,6 +296,8 @@ class ZmqEventPublisher(EventPublisher):
 
         if self._replay_endpoint is not None:
             self._replay = self._ctx.socket(zmq.ROUTER)
+            self._replay.setsockopt(zmq.SNDHWM, self._hwm)
+            self._replay.setsockopt(zmq.SNDTIMEO, 0)
             self._replay.bind(self._replay_endpoint)
 
     def _publisher_thread(self) -> None:
@@ -300,16 +305,23 @@ class ZmqEventPublisher(EventPublisher):
         assert self._pub is not None
         try:
             while self._running or not self._event_queue.empty():
-                if self._replay is not None and self._replay.poll(0):
+                if self._replay is not None:
                     try:
-                        self._service_replay()
+                        if self._replay_entries is None and self._replay.poll(0):
+                            self._start_replay()
+                        if self._replay_entries is not None:
+                            self._service_replay_chunk()
                     except Exception:
+                        self._replay_entries = None
+                        self._replay_client_id = None
                         logger.error(
                             "Failed to service streaming KV event replay request\n"
                             f"{traceback.format_exc()}"
                         )
                 try:
-                    item = self._event_queue.get(timeout=0.1)
+                    item = self._event_queue.get(
+                        timeout=0 if self._replay_entries is not None else 0.1
+                    )
                 except queue.Empty:
                     continue
                 if item is None:
@@ -342,7 +354,7 @@ class ZmqEventPublisher(EventPublisher):
             if self._replay is not None:
                 self._replay.close(linger=0)
 
-    def _service_replay(self) -> None:
+    def _start_replay(self) -> None:
         assert self._replay is not None
         frame = self._replay.recv_multipart()
         if len(frame) != 3:
@@ -350,18 +362,45 @@ class ZmqEventPublisher(EventPublisher):
             return
         client_id, _, start_seq_bytes = frame
         start_seq = int.from_bytes(start_seq_bytes, "big")
-        for seq, payload in self._buffer:
-            if seq >= start_seq:
+        self._replay_client_id = client_id
+        self._replay_entries = iter(
+            tuple((seq, payload) for seq, payload in self._buffer if seq >= start_seq)
+        )
+
+    def _service_replay_chunk(self) -> None:
+        assert self._replay is not None
+        assert self._replay_client_id is not None
+        assert self._replay_entries is not None
+        for _ in range(self.REPLAY_BATCHES_PER_TICK):
+            try:
+                seq, payload = next(self._replay_entries)
+            except StopIteration:
+                try:
+                    self._replay.send_multipart(
+                        (self._replay_client_id, b"", b"", self.END_SEQ, b""),
+                        flags=zmq.DONTWAIT,
+                    )
+                except zmq.Again:
+                    logger.warning("Dropping KV event replay end marker: replay client is slow")
+                self._replay_entries = None
+                self._replay_client_id = None
+                return
+            try:
                 self._replay.send_multipart(
                     (
-                        client_id,
+                        self._replay_client_id,
                         b"",
                         self._topic_bytes,
                         seq.to_bytes(8, "big"),
                         payload,
-                    )
+                    ),
+                    flags=zmq.DONTWAIT,
                 )
-        self._replay.send_multipart((client_id, b"", b"", self.END_SEQ, b""))
+            except zmq.Again:
+                logger.warning("Dropping KV event replay: replay client is slow")
+                self._replay_entries = None
+                self._replay_client_id = None
+                return
 
     @staticmethod
     def offset_endpoint_port(endpoint: str | None, data_parallel_rank: int) -> str | None:
@@ -606,6 +645,20 @@ class StreamingKVCacheEventManager:
     def start(self) -> None:
         """Bind the publisher's sockets and start its background thread."""
         self._publisher.start()
+
+    def get_source_descriptor(self) -> dict[str, str | int] | None:
+        """Describe a live ZMQ publisher for OpenEngine node discovery."""
+        publisher = self._publisher
+        if not isinstance(publisher, ZmqEventPublisher):
+            return None
+        thread = publisher._thread
+        if not publisher._running or thread is None or not thread.is_alive():
+            return None
+        return {
+            "rank": self._rank,
+            "endpoint": publisher._endpoint,
+            "replay_endpoint": publisher._replay_endpoint or "",
+        }
 
     def set_layer_group_window_sizes(self, window_sizes: dict[int, int]) -> None:
         target_ids = [
