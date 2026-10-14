@@ -30,6 +30,7 @@ from typing import Any, Optional
 import aiohttp
 import numpy as np
 import pytest
+import requests
 import yaml
 from defs.common import get_free_port_in_ci as get_free_port
 from defs.common import (get_ucx_tls, parse_gsm8k_output,
@@ -415,6 +416,8 @@ def get_test_config(test_desc, example_dir, test_root):
         f"{test_configs_root}/disagg_config_ctxtp1_gentp4_qwen3_32b_fp8.yaml",
         "gpt_oss_120b_harmony":
         f"{test_configs_root}/disagg_config_ctxtp2_gentp2_gptoss_tllm.yaml",
+        "gpt_oss_20b_kv_cache_aware":
+        f"{test_configs_root}/disagg_config_gptoss_20b_kv_cache_aware.yaml",
         "cancel_stress_test":
         f"{test_configs_root}/disagg_config_cancel_stress_test.yaml",
         "qwen3_8b":
@@ -456,6 +459,15 @@ ClientTestSet = namedtuple('ClientTestSet', [
 def get_client_test_set(test_desc):
     """Get the set of client tests to run for a given test description."""
     if test_desc == "tool_calls":
+        return ClientTestSet(completion=False,
+                             completion_streaming=False,
+                             chat=True,
+                             chat_streaming=False,
+                             verify_completion=False,
+                             verify_streaming_completion=False,
+                             verify_chat=False,
+                             verify_streaming_chat=False)
+    if test_desc == "gpt_oss_20b_kv_cache_aware":
         return ClientTestSet(completion=False,
                              completion_streaming=False,
                              chat=True,
@@ -2921,6 +2933,50 @@ def test_disaggregated_gpt_oss_120b_harmony(disaggregated_test_root,
                            env=env,
                            model_path=model_dir,
                            cwd=llm_venv.get_working_directory(),
+                           server_start_timeout=600)
+
+
+@skip_pre_hopper
+@pytest.mark.skip_less_device(2)
+@pytest.mark.parametrize("model_path", ['gpt_oss/gpt-oss-20b'])
+def test_disaggregated_gpt_oss_20b_kv_cache_aware(disaggregated_test_root,
+                                                  disaggregated_example_root,
+                                                  llm_venv, model_path):
+    """gpt-oss (Harmony) behind kv_cache_aware routers serves a chat request."""
+    model_dir = f"{llm_models_root()}/{model_path}"
+    setup_model_symlink(llm_venv, model_dir, model_path)
+
+    env = llm_venv._new_env.copy()
+    tiktoken_vocab = os.path.join(llm_models_root(), "datasets",
+                                  "tiktoken_vocab")
+    env["TIKTOKEN_RS_CACHE_DIR"] = tiktoken_vocab
+    env["TIKTOKEN_ENCODINGS_BASE"] = tiktoken_vocab
+
+    def chat_and_fingerprints(server_url: str) -> None:
+        reply = requests.post(f"{server_url}/v1/chat/completions",
+                              json={
+                                  "model": model_dir,
+                                  "messages": [{
+                                      "role": "user",
+                                      "content": "Say hi in three words."
+                                  }],
+                                  "max_tokens": 32,
+                                  "temperature": 0
+                              },
+                              timeout=120)
+        assert reply.status_code == 200, reply.text
+        message = reply.json()["choices"][0]["message"]
+        assert message.get("content") or message.get("reasoning_content")
+        info = requests.get(f"{server_url}/cluster_info", timeout=30).json()
+        for role in ("context", "generation"):
+            assert info["render_fingerprints"][role], role
+
+    run_disaggregated_test(disaggregated_example_root,
+                           "gpt_oss_20b_kv_cache_aware",
+                           env=env,
+                           model_path=model_dir,
+                           cwd=llm_venv.get_working_directory(),
+                           post_client_test=chat_and_fingerprints,
                            server_start_timeout=600)
 
 
