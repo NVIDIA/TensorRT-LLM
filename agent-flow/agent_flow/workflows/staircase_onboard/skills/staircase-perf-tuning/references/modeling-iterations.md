@@ -51,6 +51,12 @@ streams), hoist per-step invariants out of the layer loop (computed once per for
 copies that only make a tensor contiguous when the consumer accepts strides. Prove independence
 from the data flow, not from the stream labels.
 
+Benchmark an overlap at the scope it competes in: a whole decoder layer under CUDA-graph replay,
+with every other user of the side stream (a MoE branch, a shared expert) in it. A block-only bench
+won -5.1% and -2.7% for two side-stream GEMMs that moved e2e by +0.47% and -0.3%. The work moved to
+the side stream should use few, wide CTAs (cuBLAS tiles); a GEMV that launches thousands of small CTAs
+fills every SM and delays the latency-bound chain it was meant to run beside.
+
 ## Worktree, GPU jobs and tests
 
 You work in the worktree you were given (`<wt>`), on its `tune/<slug>` branch. GPU work goes

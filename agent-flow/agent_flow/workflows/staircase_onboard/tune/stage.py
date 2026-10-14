@@ -228,6 +228,10 @@ class TuneStage:
             return False
         # The noise floor is a same-host quantity (hosts differ by more than a run repeats): the
         # repeats follow the baseline onto its session instead of spreading across sessions.
+        if s.noise_repeats < 2:
+            # Two samples once read 0.32% at con128 where the same host ranged 1.2% over the run.
+            self.log(f"[tune] noise_repeats={s.noise_repeats}: the noise floor rests on {s.noise_repeats + 1} samples "
+                     "and under-estimates the same-host range; con128 changes under ~2% are not resolvable")
         repeats = {f"t-baseline-r{i}": s.identity_configs for i in range(1, s.noise_repeats + 1)}
         got.update(self._measure(repeats, on=(self.t.get("measured_on") or {}).get("t-baseline")))
         repeats = [m for k, m in got.items() if k.startswith("t-baseline") and m]
