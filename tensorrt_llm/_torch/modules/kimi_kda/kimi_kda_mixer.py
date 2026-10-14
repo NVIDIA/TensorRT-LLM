@@ -78,6 +78,16 @@ def _meta_safe_cast_dtype(module: nn.Module, dtype: torch.dtype) -> None:
         param.data = _cast(param)
 
 
+def kda_verify_cu_seqlens(pending: torch.Tensor, num_steps: int) -> torch.Tensor:
+    """Fused-verify token offsets: request ``n`` starts at ``n * num_steps - pending[n]``."""
+    num_generations = pending.shape[0]
+    cu_seqlens = torch.arange(
+        0, (num_generations + 1) * num_steps, num_steps, dtype=torch.int32, device=pending.device
+    )
+    cu_seqlens[:num_generations].sub_(pending)
+    return cu_seqlens
+
+
 def _stage_state_rows(ssm_pool: torch.Tensor, slot_indices: torch.Tensor) -> torch.Tensor:
     """Dense fp32 copy of the addressed recurrent-state rows.
 
@@ -507,6 +517,10 @@ class KimiKDALinearAttention(nn.Module):
                 assert decode_rows % num_decodes == 0, (
                     f"ragged generation batch: {decode_rows} tokens for {num_decodes} requests"
                 )
+                # Offsets shared by every KDA layer of this forward, when the
+                # model precomputed them (see KimiK3MambaMetadata).
+                verify_offsets = getattr(mamba_metadata, "kda_verify_offsets", None)
+                verify_kwargs = {} if verify_offsets is None else {"verify_offsets": verify_offsets}
                 verify_core = self.forward_verify(
                     hidden_states[num_ctx_tokens:num_tokens],
                     decode_rows // num_decodes,
@@ -515,6 +529,7 @@ class KimiKDALinearAttention(nn.Module):
                     ssm_pool,
                     generation_state_indices,
                     output=(output[num_ctx_tokens:num_tokens] if output is not None else None),
+                    **verify_kwargs,
                 )
                 if output is None:
                     cores.append(verify_core)
@@ -1084,6 +1099,7 @@ class KimiKDALinearAttention(nn.Module):
         ssm_pool,
         slot_indices,
         output: Optional[torch.Tensor] = None,
+        verify_offsets: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> torch.Tensor:
         """Speculative verification: advance each request ``num_steps``
         tokens (1 golden + ``num_steps - 1`` padded drafts).
@@ -1109,7 +1125,13 @@ class KimiKDALinearAttention(nn.Module):
                 "were not allocated so there is no fallback"
             )
             return self.forward_verify_fused(
-                x2d, num_steps, layer_cache, ssm_pool, slot_indices, output=output
+                x2d,
+                num_steps,
+                layer_cache,
+                ssm_pool,
+                slot_indices,
+                output=output,
+                verify_offsets=verify_offsets,
             )
         return self.forward_verify_sequential(
             x2d,
@@ -1122,7 +1144,7 @@ class KimiKDALinearAttention(nn.Module):
         )
 
     def _project_verify_inputs(
-        self, x: torch.Tensor, num_rows: int
+        self, x: torch.Tensor, num_rows: int, contiguous: bool = True
     ) -> Optional[
         tuple[
             torch.Tensor,
@@ -1133,7 +1155,11 @@ class KimiKDALinearAttention(nn.Module):
             Optional[torch.Tensor],
         ]
     ]:
-        """Project fused QKVG and [f_a | b] inputs for target verification."""
+        """Project fused QKVG and [f_a | b] inputs for target verification.
+
+        With ``contiguous=False``, q/k/v stay strided views of the fused
+        projection for consumers that accept per-token strides.
+        """
         qkvg_weight = self._qkvg_proj_weight
         fused_qkvg = self.qkvg_proj
         if qkvg_weight is None and fused_qkvg is None:
@@ -1165,7 +1191,9 @@ class KimiKDALinearAttention(nn.Module):
             forget_gate = self.f_b_proj(self.f_a_proj(x))
 
         d = self.proj_size
-        q_proj, k_proj, v_proj = (part.contiguous() for part in qkvg[..., : 3 * d].split(d, dim=-1))
+        q_proj, k_proj, v_proj = qkvg[..., : 3 * d].split(d, dim=-1)
+        if contiguous:
+            q_proj, k_proj, v_proj = q_proj.contiguous(), k_proj.contiguous(), v_proj.contiguous()
         qkvg_split_sizes = self.qkvg_split_sizes
         has_onorm_gate = self.use_full_rank_gate and (
             qkvg_weight is not None or (qkvg_split_sizes is not None and len(qkvg_split_sizes) == 4)
@@ -1186,6 +1214,7 @@ class KimiKDALinearAttention(nn.Module):
         ssm_pool,
         slot_indices,
         output: Optional[torch.Tensor] = None,
+        verify_offsets: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> torch.Tensor:
         """Fused multi-token verify via ``trtllm::kda_mtp_decode``.
 
@@ -1204,7 +1233,8 @@ class KimiKDALinearAttention(nn.Module):
         x = x2d.view(num_generations, num_steps, -1)  # [B, T, hidden]
         T_total = num_generations * num_steps
 
-        projections = self._project_verify_inputs(x, T_total)
+        # kda_mtp_decode reads q/k/v/beta through dynamic token strides.
+        projections = self._project_verify_inputs(x, T_total, contiguous=False)
         if projections is None:
             q_proj = self.q_proj(x)
             k_proj = self.k_proj(x)
@@ -1220,18 +1250,19 @@ class KimiKDALinearAttention(nn.Module):
         # Raw gate / beta: the kernel applies dt_bias, A_log, the
         # lower-bound sigmoid gate, and the beta sigmoid itself.
         g = forget_gate.view(1, T_total, H, K)
-        beta = beta_proj.contiguous().view(1, T_total, H)
+        beta = beta_proj.view(1, T_total, H)
 
         w_q, w_k, w_v = self._get_mtp_conv_weights()
         lower_bound = self.gate_lower_bound
 
-        pending = layer_cache.prev_num_accepted_tokens[
-            slot_indices
-        ]  # accepted drafts of the previous round, per req
-        cu_seqlens = torch.arange(
-            0, (num_generations + 1) * num_steps, num_steps, dtype=torch.int32, device=x2d.device
-        )
-        cu_seqlens[:num_generations].sub_(pending)
+        if verify_offsets is not None and verify_offsets[1].shape[0] == num_generations + 1:
+            # Precomputed once for all KDA layers of this forward.
+            pending, cu_seqlens = verify_offsets
+        else:
+            pending = layer_cache.prev_num_accepted_tokens[
+                slot_indices
+            ]  # accepted drafts of the previous round, per req
+            cu_seqlens = kda_verify_cu_seqlens(pending, num_steps)
 
         out = self._dispatch.mtp_verify(
             x_q=x_q,

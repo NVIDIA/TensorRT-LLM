@@ -52,7 +52,7 @@ from ..model_config import ModelConfig
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.gated_mlp import GatedMLP
-from ..modules.kimi_kda.kimi_kda_mixer import KimiKDALinearAttention
+from ..modules.kimi_kda.kimi_kda_mixer import KimiKDALinearAttention, kda_verify_cu_seqlens
 from ..modules.layer_norm import LayerNorm
 from ..modules.linear import Linear, TensorParallelMode
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
@@ -1909,6 +1909,7 @@ class Glm5NextModel(DecoderModel):
         streams = self.expand_streams(inputs_embeds)
         if runtime_ctx is None:
             runtime_ctx = build_glm5_next_runtime_context(attn_metadata)
+        self._prepare_kda_verify_offsets(attn_metadata, runtime_ctx)
         # Only the decoder stack: under one-model MTP the speculative base
         # class appends the draft layer(s) to ``self.layers`` (so the
         # checkpoint's ``model.layers.45.*`` names resolve), and those run in
@@ -1926,6 +1927,40 @@ class Glm5NextModel(DecoderModel):
                 runtime_ctx=runtime_ctx,
             )
         return self.collapse_streams(streams)
+
+    def _prepare_kda_verify_offsets(
+        self, attn_metadata: AttentionMetadata, runtime_ctx: Glm5NextRuntimeContext
+    ) -> None:
+        """Compute fused KDA verification offsets once for all local KDA layers.
+
+        Accepted-draft counts are shared across layers, so the per-request token
+        offsets are identical for every KDA layer of this forward.
+        """
+        mamba_metadata = attn_metadata.mamba_metadata
+        mamba_metadata.kda_verify_offsets = None
+        steps = runtime_ctx.gen_tokens_per_request
+        if steps <= 1 or runtime_ctx.num_generations == 0:
+            return
+        kda_layer = next(
+            (
+                i
+                for i in range(self.schedule.num_layers)
+                if self.schedule.attention[i] == LINEAR_ATTENTION
+                and not getattr(self.layers[i], "_weights_removed", False)
+            ),
+            None,
+        )
+        if kda_layer is None:
+            return
+        layer_cache = attn_metadata.kv_cache_manager.mamba_layer_cache(kda_layer)
+        if layer_cache is None or not layer_cache.has_kda_replay_caches:
+            return
+        slots = mamba_metadata.generation_state_indices
+        if slots is None:
+            start = runtime_ctx.num_contexts
+            slots = mamba_metadata.state_indices[start : start + runtime_ctx.num_generations]
+        pending = layer_cache.prev_num_accepted_tokens[slots]
+        mamba_metadata.kda_verify_offsets = (pending, kda_verify_cu_seqlens(pending, steps))
 
     def _fused_hc_ok(self) -> bool:
         """Whether every decoder layer is local (no PP pruning) for the fused loop."""

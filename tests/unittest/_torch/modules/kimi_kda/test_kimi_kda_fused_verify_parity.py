@@ -216,6 +216,7 @@ def _rep(name, a, b):
 def test_fused_vs_sequential_two_rounds(
     num_heads, use_full_rank_gate, checkpoint_fp8, large_state_stride
 ):
+    from tensorrt_llm._torch.modules.kimi_kda.kimi_kda_mixer import kda_verify_cu_seqlens
     from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream
 
     torch.manual_seed(0)
@@ -304,6 +305,8 @@ def test_fused_vs_sequential_two_rounds(
         )
     )
     core2_fused = x2.new_empty(B * T, num_heads, K)
+    # Offsets precomputed once per forward, as a model shares them across layers.
+    pending = cache_fused.prev_num_accepted_tokens[slot_indices]
     with with_multi_stream(True):
         result2_fused = rt_fused.forward_verify(
             x2,
@@ -313,6 +316,7 @@ def test_fused_vs_sequential_two_rounds(
             ssm_pool_fused,
             slot_indices,
             output=core2_fused,
+            verify_offsets=(pending, kda_verify_cu_seqlens(pending, T)),
         )
     assert result2_fused is core2_fused
     out2_fused = rt_fused._project_output(core2_fused)
