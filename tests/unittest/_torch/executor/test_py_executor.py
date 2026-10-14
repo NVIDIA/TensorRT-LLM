@@ -15,7 +15,7 @@ to PyExecutor, including:
 import threading
 import time
 import types
-from unittest.mock import MagicMock, Mock, patch
+from unittest.mock import MagicMock, Mock, call, patch
 
 import numpy as np
 import pytest
@@ -58,6 +58,48 @@ from tensorrt_llm.llmapi.llm_args import EncodeCudaGraphConfig, MTPDecodingConfi
 from tensorrt_llm.runtime.kv_cache_manager_v2 import OutOfPagesError
 
 pytestmark = pytest.mark.cpu_only
+
+
+@pytest.mark.parametrize(
+    ("shutdown_method", "releases_model_owned_graphs"),
+    [
+        ("shutdown", True),
+        ("shutdown_for_kv_cache_estimation", False),
+    ],
+)
+def test_shutdown_graph_lifecycle(shutdown_method, releases_model_owned_graphs):
+    engine = Mock()
+    executor = object.__new__(PyExecutor)
+    executor.executor_request_queue = Mock()
+    executor.shutdown_event = Mock()
+    executor.hang_detector = Mock()
+    executor.hang_detector.detected.return_value = False
+    executor.worker_thread = Mock()
+    executor.dist = types.SimpleNamespace(pp_size=1)
+    executor._shutdown_sleep_wakeup_listeners = Mock()
+    executor.encoder_launch_executor = None
+    executor.kv_connector_manager = None
+    executor.model_engine = engine
+    executor.draft_model_engine = None
+    executor.resource_manager = types.SimpleNamespace(resource_managers={})
+    executor.virtual_memory_pools = None
+    executor.sampler = object()
+    executor.dwdp_manager = None
+    executor._profile_manager = Mock()
+
+    with patch("torch.cuda.is_available", return_value=False):
+        getattr(executor, shutdown_method)()
+
+    executor.executor_request_queue.enqueue_shutdown_request.assert_called_once()
+    executor._profile_manager.cleanup.assert_called_once()
+    engine._release_cuda_graphs.assert_called_once()
+    if releases_model_owned_graphs:
+        assert engine.method_calls[:2] == [
+            call._release_model_owned_cuda_graphs(),
+            call._release_cuda_graphs(),
+        ]
+    else:
+        engine._release_model_owned_cuda_graphs.assert_not_called()
 
 
 class _InflightRequestIds:
@@ -1006,6 +1048,45 @@ class TestIdleDisaggLoopPacing:
         executor.disagg.pace_idle()
 
         assert sleep.called is expect_sleep
+
+
+class TestDeferUnreadyGenReceivesGate:
+    """The coordinator defers unready receives only where the admission fence
+    can still be queued behind an in-flight forward and nothing else orders
+    the receive after it."""
+
+    @staticmethod
+    def _build(*, kv_manager_v2: bool, overlap: bool, pp_size: int, kv_connector: bool):
+        executor = object.__new__(PyExecutor)
+        executor.kv_cache_transceiver = Mock()
+        executor._is_kv_manager_v2 = kv_manager_v2
+        executor.disable_overlap_scheduler = not overlap
+        executor.dist = Mock(rank=0, tp_size=1, world_size=pp_size, pp_size=pp_size)
+        executor.kv_connector_manager = Mock() if kv_connector else None
+        return executor._build_disagg_coordinator()
+
+    @pytest.mark.parametrize("kv_connector", [False, True], ids=["no_connector", "connector"])
+    @pytest.mark.parametrize("pp_size", [1, 2], ids=["pp1", "pp2"])
+    @pytest.mark.parametrize("overlap", [True, False], ids=["overlap", "no_overlap"])
+    @pytest.mark.parametrize("kv_manager_v2", [True, False], ids=["v2", "v1"])
+    def test_defers_only_with_v2_overlap_pp1_and_no_connector(
+        self, kv_manager_v2: bool, overlap: bool, pp_size: int, kv_connector: bool
+    ) -> None:
+        coordinator = self._build(
+            kv_manager_v2=kv_manager_v2, overlap=overlap, pp_size=pp_size, kv_connector=kv_connector
+        )
+
+        assert isinstance(coordinator, DisaggTransferCoordinator)
+        expected = kv_manager_v2 and overlap and pp_size == 1 and not kv_connector
+        assert coordinator._defer_unready_gen_receives is expected
+
+    def test_unset_executor_attributes_keep_the_blocking_fence(self) -> None:
+        """An executor assembled without the scheduler and cache-manager
+        attributes falls back to the blocking fence."""
+        executor = object.__new__(PyExecutor)
+        executor.kv_cache_transceiver = Mock()
+
+        assert executor._build_disagg_coordinator()._defer_unready_gen_receives is False
 
 
 class TestDisaggTransferAdmissionPP:

@@ -1108,44 +1108,46 @@ sanitizer = ["nvidia-cuda-sanitizer-api (==13.0.85.*) ; sys_platform == \"linux\
 
 [[package]]
 name = "datasets"
-version = "3.1.0"
+version = "5.1.0"
 description = "HuggingFace community-driven open-source library of datasets"
 optional = false
-python-versions = ">=3.8.0"
+python-versions = ">=3.10.0"
 groups = ["main"]
 files = [
-    {file = "datasets-3.1.0-py3-none-any.whl", hash = "sha256:dc8808a6d17838fe05e13b39aa7ac3ea0fd0806ed7004eaf4d4eb2c2a356bc61"},
-    {file = "datasets-3.1.0.tar.gz", hash = "sha256:c92cac049e0f9f85b0dd63739c68e564c657b1624bc2b66b1e13489062832e27"},
+    {file = "datasets-5.1.0-py3-none-any.whl", hash = "sha256:86fd08b280485aab82894d2c81842c4151d93b575efea0054315104cb7bc3cec"},
+    {file = "datasets-5.1.0.tar.gz", hash = "sha256:1561347daa8841b51351ef2ad1647b4ee4af406852c0f7bd1df587ac1ca7888e"},
 ]
 
 [package.dependencies]
-aiohttp = "*"
-dill = ">=0.3.0,<0.3.9"
+dill = ">=0.3.0,<0.4.2"
 filelock = "*"
-fsspec = {version = ">=2023.1.0,<=2024.9.0", extras = ["http"]}
-huggingface-hub = ">=0.23.0"
-multiprocess = "<0.70.17"
+fsspec = {version = ">=2023.1.0,<=2026.7.0", extras = ["http"]}
+huggingface-hub = ">=1.31.0,<3.0"
+multiprocess = "<0.70.20"
 numpy = ">=1.17"
 packaging = "*"
 pandas = "*"
-pyarrow = ">=15.0.0"
+pyarrow = ">=24.0.0"
 pyyaml = ">=5.1"
-requests = ">=2.32.2"
 tqdm = ">=4.66.3"
 xxhash = "*"
 
 [package.extras]
-audio = ["librosa", "soundfile (>=0.12.1)", "soxr (>=0.4.0) ; python_version >= \"3.9\""]
+audio = ["torch (>=2.8.0)", "torchcodec (>=0.6.0)"]
 benchmarks = ["tensorflow (==2.12.0)", "torch (==2.0.1)", "transformers (==4.30.1)"]
-dev = ["Pillow (>=9.4.0)", "absl-py", "decorator", "decord (==0.6.0)", "elasticsearch (<8.0.0)", "faiss-cpu (>=1.8.0.post1)", "jax (>=0.3.14) ; sys_platform != \"win32\"", "jaxlib (>=0.3.14) ; sys_platform != \"win32\"", "joblib (<1.3.0)", "joblibspark", "librosa", "lz4", "moto[server]", "polars[timezone] (>=0.20.0)", "protobuf (<4.0.0)", "py7zr", "pyspark (>=3.4)", "pytest", "pytest-datadir", "pytest-xdist", "rarfile (>=4.0)", "ruff (>=0.3.0)", "s3fs", "s3fs (>=2021.11.1)", "soundfile (>=0.12.1)", "soxr (>=0.4.0) ; python_version >= \"3.9\"", "sqlalchemy", "tensorflow (>=2.16.0) ; python_version >= \"3.10\"", "tensorflow (>=2.6.0)", "tensorflow (>=2.6.0) ; python_version < \"3.10\"", "tiktoken", "torch", "torch (>=2.0.0)", "torchdata", "transformers", "transformers (>=4.42.0)", "zstandard"]
-docs = ["s3fs", "tensorflow (>=2.6.0)", "torch", "transformers"]
+bio = ["biopython (>=1.80)"]
+dev = ["Pillow (>=9.4.0)", "absl-py", "aiohttp", "biopython (>=1.80)", "decorator", "elasticsearch (>=7.17.12,<8.0.0)", "faiss-cpu (>=1.8.0.post1)", "h5py", "jax (>=0.3.14) ; sys_platform != \"win32\"", "jaxlib (>=0.3.14) ; sys_platform != \"win32\"", "joblib (<1.3.0)", "joblibspark ; python_version < \"3.14\"", "lz4 ; python_version < \"3.14\"", "moto[server]", "nibabel (>=5.3.1)", "numba (>=0.56.4) ; python_version < \"3.14\"", "polars[timezone] (>=0.20.0)", "protobuf (<4.0.0) ; python_version < \"3.14\"", "py7zr", "pyiceberg[pyarrow,sql-sqlite]", "pylance", "pyspark (>=3.4)", "pytest", "pytest-datadir", "pytest-xdist", "rarfile (>=4.0)", "ruff (>=0.3.0)", "sqlalchemy", "teich (==0.1.5)", "tensorflow (>=2.16.0) ; python_version >= \"3.10\" and sys_platform != \"win32\" and python_version < \"3.14\"", "tensorflow (>=2.6.0)", "tensorflow (>=2.6.0) ; python_version < \"3.10\" and sys_platform != \"win32\"", "tiktoken", "tomli (>=1.1.0) ; python_version < \"3.11\"", "torch", "torch (>=2.8.0)", "torchcodec (>=0.7.0) ; python_version < \"3.14\"", "torchdata", "transformers", "transformers (>=4.42.0)", "trimesh (>=4.10.0)", "vortex-data ; python_version >= \"3.11\" and sys_platform != \"win32\"", "zstandard"]
+docs = ["tensorflow (>=2.6.0)", "torch", "transformers"]
+iceberg = ["pyiceberg (>=0.7.0)"]
 jax = ["jax (>=0.3.14)", "jaxlib (>=0.3.14)"]
+mesh = ["trimesh (>=4.10.0)"]
+nibabel = ["ipyniivue (==2.4.2)", "nibabel (>=5.3.2)"]
+pdfs = ["pdfplumber (>=0.11.4)"]
 quality = ["ruff (>=0.3.0)"]
-s3 = ["s3fs"]
 tensorflow = ["tensorflow (>=2.6.0)"]
 tensorflow-gpu = ["tensorflow (>=2.6.0)"]
-tests = ["Pillow (>=9.4.0)", "absl-py", "decorator", "decord (==0.6.0)", "elasticsearch (<8.0.0)", "faiss-cpu (>=1.8.0.post1)", "jax (>=0.3.14) ; sys_platform != \"win32\"", "jaxlib (>=0.3.14) ; sys_platform != \"win32\"", "joblib (<1.3.0)", "joblibspark", "librosa", "lz4", "moto[server]", "polars[timezone] (>=0.20.0)", "protobuf (<4.0.0)", "py7zr", "pyspark (>=3.4)", "pytest", "pytest-datadir", "pytest-xdist", "rarfile (>=4.0)", "s3fs (>=2021.11.1)", "soundfile (>=0.12.1)", "soxr (>=0.4.0) ; python_version >= \"3.9\"", "sqlalchemy", "tensorflow (>=2.16.0) ; python_version >= \"3.10\"", "tensorflow (>=2.6.0) ; python_version < \"3.10\"", "tiktoken", "torch (>=2.0.0)", "torchdata", "transformers (>=4.42.0)", "zstandard"]
-tests-numpy2 = ["Pillow (>=9.4.0)", "absl-py", "decorator", "decord (==0.6.0)", "elasticsearch (<8.0.0)", "jax (>=0.3.14) ; sys_platform != \"win32\"", "jaxlib (>=0.3.14) ; sys_platform != \"win32\"", "joblib (<1.3.0)", "joblibspark", "lz4", "moto[server]", "polars[timezone] (>=0.20.0)", "protobuf (<4.0.0)", "py7zr", "pyspark (>=3.4)", "pytest", "pytest-datadir", "pytest-xdist", "rarfile (>=4.0)", "s3fs (>=2021.11.1)", "soundfile (>=0.12.1)", "soxr (>=0.4.0) ; python_version >= \"3.9\"", "sqlalchemy", "tiktoken", "torch (>=2.0.0)", "torchdata", "transformers (>=4.42.0)", "zstandard"]
+tests = ["Pillow (>=9.4.0)", "absl-py", "aiohttp", "biopython (>=1.80)", "decorator", "elasticsearch (>=7.17.12,<8.0.0)", "faiss-cpu (>=1.8.0.post1)", "h5py", "jax (>=0.3.14) ; sys_platform != \"win32\"", "jaxlib (>=0.3.14) ; sys_platform != \"win32\"", "joblib (<1.3.0)", "joblibspark ; python_version < \"3.14\"", "lz4 ; python_version < \"3.14\"", "moto[server]", "nibabel (>=5.3.1)", "numba (>=0.56.4) ; python_version < \"3.14\"", "polars[timezone] (>=0.20.0)", "protobuf (<4.0.0) ; python_version < \"3.14\"", "py7zr", "pyiceberg[pyarrow,sql-sqlite]", "pylance", "pyspark (>=3.4)", "pytest", "pytest-datadir", "pytest-xdist", "rarfile (>=4.0)", "sqlalchemy", "teich (==0.1.5)", "tensorflow (>=2.16.0) ; python_version >= \"3.10\" and sys_platform != \"win32\" and python_version < \"3.14\"", "tensorflow (>=2.6.0) ; python_version < \"3.10\" and sys_platform != \"win32\"", "tiktoken", "tomli (>=1.1.0) ; python_version < \"3.11\"", "torch (>=2.8.0)", "torchcodec (>=0.7.0) ; python_version < \"3.14\"", "torchdata", "transformers (>=4.42.0)", "trimesh (>=4.10.0)", "vortex-data ; python_version >= \"3.11\" and sys_platform != \"win32\"", "zstandard"]
+tests-numpy2 = ["Pillow (>=9.4.0)", "absl-py", "aiohttp", "biopython (>=1.80)", "decorator", "elasticsearch (>=7.17.12,<8.0.0)", "h5py", "jax (>=0.3.14) ; sys_platform != \"win32\"", "jaxlib (>=0.3.14) ; sys_platform != \"win32\"", "joblib (<1.3.0)", "joblibspark ; python_version < \"3.14\"", "lz4 ; python_version < \"3.14\"", "moto[server]", "nibabel (>=5.3.1)", "numba (>=0.56.4) ; python_version < \"3.14\"", "polars[timezone] (>=0.20.0)", "protobuf (<4.0.0) ; python_version < \"3.14\"", "py7zr", "pyiceberg[pyarrow,sql-sqlite]", "pylance", "pyspark (>=3.4)", "pytest", "pytest-datadir", "pytest-xdist", "rarfile (>=4.0)", "sqlalchemy", "teich (==0.1.5)", "tiktoken", "tomli (>=1.1.0) ; python_version < \"3.11\"", "torch (>=2.8.0)", "torchcodec (>=0.7.0) ; python_version < \"3.14\"", "torchdata", "transformers (>=4.42.0)", "trimesh (>=4.10.0)", "vortex-data ; python_version >= \"3.11\" and sys_platform != \"win32\"", "zstandard"]
 torch = ["torch"]
 vision = ["Pillow (>=9.4.0)"]
 
@@ -1189,14 +1191,14 @@ training = ["Jinja2", "accelerate (>=0.31.0)", "datasets", "peft (>=0.17.0)", "p
 
 [[package]]
 name = "dill"
-version = "0.3.8"
+version = "0.4.1"
 description = "serialize all of Python"
 optional = false
-python-versions = ">=3.8"
+python-versions = ">=3.9"
 groups = ["main"]
 files = [
-    {file = "dill-0.3.8-py3-none-any.whl", hash = "sha256:c36ca9ffb54365bdd2f8eb3eff7d2a21237f8452b57ace88b1ac615b7e815bd7"},
-    {file = "dill-0.3.8.tar.gz", hash = "sha256:3ebe3c479ad625c4553aca177444d89b486b1d84982eeacded644afc0cf797ca"},
+    {file = "dill-0.4.1-py3-none-any.whl", hash = "sha256:1e1ce33e978ae97fcfcff5638477032b801c46c7c65cf717f95fbc2248f79a9d"},
+    {file = "dill-0.4.1.tar.gz", hash = "sha256:423092df4182177d4d8ba8290c8a5b640c66ab35ec7da59ccfa00f6fa3eea5fa"},
 ]
 
 [package.extras]
@@ -1528,14 +1530,14 @@ files = [
 
 [[package]]
 name = "fsspec"
-version = "2024.9.0"
+version = "2026.7.0"
 description = "File-system specification"
 optional = false
-python-versions = ">=3.8"
+python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "fsspec-2024.9.0-py3-none-any.whl", hash = "sha256:a0947d552d8a6efa72cc2c730b12c41d043509156966cca4fb157b0f2a0c574b"},
-    {file = "fsspec-2024.9.0.tar.gz", hash = "sha256:4b0afb90c2f21832df142f292649035d80b421f60a9e1c027802e5a0da2b04e8"},
+    {file = "fsspec-2026.7.0-py3-none-any.whl", hash = "sha256:b57ddbafedfaef7018c1ecab32aa200a9d7ca26b77965f64e48b70061249d279"},
+    {file = "fsspec-2026.7.0.tar.gz", hash = "sha256:c803c40f4cf860b49dea58ee3e1c33cb9c790520e233537e1340049f89b82a88"},
 ]
 
 [package.dependencies]
@@ -1546,27 +1548,27 @@ abfs = ["adlfs"]
 adl = ["adlfs"]
 arrow = ["pyarrow (>=1)"]
 dask = ["dask", "distributed"]
-dev = ["pre-commit", "ruff"]
+dev = ["pre-commit", "ruff (>=0.5)"]
 doc = ["numpydoc", "sphinx", "sphinx-design", "sphinx-rtd-theme", "yarl"]
 dropbox = ["dropbox", "dropboxdrivefs", "requests"]
-full = ["adlfs", "aiohttp (!=4.0.0a0,!=4.0.0a1)", "dask", "distributed", "dropbox", "dropboxdrivefs", "fusepy", "gcsfs", "libarchive-c", "ocifs", "panel", "paramiko", "pyarrow (>=1)", "pygit2", "requests", "s3fs", "smbprotocol", "tqdm"]
+full = ["adlfs", "aiohttp (!=4.0.0a0,!=4.0.0a1)", "dask", "distributed", "dropbox", "dropboxdrivefs", "fusepy", "gcsfs (>=2026.4.0)", "libarchive-c", "ocifs", "panel", "paramiko", "pyarrow (>=1)", "pygit2", "requests", "s3fs (>=2026.6.0)", "smbprotocol", "tqdm"]
 fuse = ["fusepy"]
-gcs = ["gcsfs"]
+gcs = ["gcsfs (>=2026.4.0)"]
 git = ["pygit2"]
 github = ["requests"]
-gs = ["gcsfs"]
+gs = ["gcsfs (>=2026.4.0)"]
 gui = ["panel"]
 hdfs = ["pyarrow (>=1)"]
 http = ["aiohttp (!=4.0.0a0,!=4.0.0a1)"]
 libarchive = ["libarchive-c"]
 oci = ["ocifs"]
-s3 = ["s3fs"]
+s3 = ["s3fs (>=2026.6.0)"]
 sftp = ["paramiko"]
 smb = ["smbprotocol"]
 ssh = ["paramiko"]
 test = ["aiohttp (!=4.0.0a0,!=4.0.0a1)", "numpy", "pytest", "pytest-asyncio (!=0.22.0)", "pytest-benchmark", "pytest-cov", "pytest-mock", "pytest-recording", "pytest-rerunfailures", "requests"]
-test-downstream = ["aiobotocore (>=2.5.4,<3.0.0)", "dask-expr", "dask[dataframe,test]", "moto[server] (>4,<5)", "pytest-timeout", "xarray"]
-test-full = ["adlfs", "aiohttp (!=4.0.0a0,!=4.0.0a1)", "cloudpickle", "dask", "distributed", "dropbox", "dropboxdrivefs", "fastparquet", "fusepy", "gcsfs", "jinja2", "kerchunk", "libarchive-c", "lz4", "notebook", "numpy", "ocifs", "pandas", "panel", "paramiko", "pyarrow", "pyarrow (>=1)", "pyftpdlib", "pygit2", "pytest", "pytest-asyncio (!=0.22.0)", "pytest-benchmark", "pytest-cov", "pytest-mock", "pytest-recording", "pytest-rerunfailures", "python-snappy", "requests", "smbprotocol", "tqdm", "urllib3", "zarr", "zstandard"]
+test-downstream = ["aiobotocore (>=2.5.4,<3.0.0)", "dask[dataframe,test]", "moto[server] (>4,<5)", "pytest-timeout", "xarray"]
+test-full = ["adlfs", "aiohttp (!=4.0.0a0,!=4.0.0a1)", "backports-zstd ; python_version < \"3.14\"", "cloudpickle", "dask", "distributed", "dropbox", "dropboxdrivefs", "fastparquet", "fusepy", "gcsfs (>=2026.4.0)", "jinja2", "kerchunk", "libarchive-c", "lz4", "notebook", "numpy", "ocifs", "pandas (<3.0.0)", "panel", "paramiko", "pyarrow (>=1)", "pyftpdlib", "pygit2", "pytest", "pytest-asyncio (!=0.22.0)", "pytest-benchmark", "pytest-cov", "pytest-mock", "pytest-recording", "pytest-rerunfailures", "python-snappy", "requests", "s3fs (>=2026.6.0)", "smbprotocol", "tqdm", "urllib3", "zarr (<3.2.0)", "zstandard ; python_version < \"3.14\""]
 tqdm = ["tqdm"]
 
 [[package]]
@@ -3137,28 +3139,32 @@ typing-extensions = {version = ">=4.1.0", markers = "python_version < \"3.11\""}
 
 [[package]]
 name = "multiprocess"
-version = "0.70.16"
+version = "0.70.19"
 description = "better multiprocessing and multithreading in Python"
 optional = false
-python-versions = ">=3.8"
+python-versions = ">=3.9"
 groups = ["main"]
 files = [
-    {file = "multiprocess-0.70.16-pp310-pypy310_pp73-macosx_10_13_x86_64.whl", hash = "sha256:476887be10e2f59ff183c006af746cb6f1fd0eadcfd4ef49e605cbe2659920ee"},
-    {file = "multiprocess-0.70.16-pp310-pypy310_pp73-manylinux_2_28_x86_64.whl", hash = "sha256:d951bed82c8f73929ac82c61f01a7b5ce8f3e5ef40f5b52553b4f547ce2b08ec"},
-    {file = "multiprocess-0.70.16-pp38-pypy38_pp73-macosx_10_9_x86_64.whl", hash = "sha256:37b55f71c07e2d741374998c043b9520b626a8dddc8b3129222ca4f1a06ef67a"},
-    {file = "multiprocess-0.70.16-pp38-pypy38_pp73-manylinux_2_28_x86_64.whl", hash = "sha256:ba8c31889abf4511c7308a8c52bb4a30b9d590e7f58523302ba00237702ca054"},
-    {file = "multiprocess-0.70.16-pp39-pypy39_pp73-macosx_10_13_x86_64.whl", hash = "sha256:0dfd078c306e08d46d7a8d06fb120313d87aa43af60d66da43ffff40b44d2f41"},
-    {file = "multiprocess-0.70.16-pp39-pypy39_pp73-manylinux_2_28_x86_64.whl", hash = "sha256:e7b9d0f307cd9bd50851afaac0dba2cb6c44449efff697df7c7645f7d3f2be3a"},
-    {file = "multiprocess-0.70.16-py310-none-any.whl", hash = "sha256:c4a9944c67bd49f823687463660a2d6daae94c289adff97e0f9d696ba6371d02"},
-    {file = "multiprocess-0.70.16-py311-none-any.whl", hash = "sha256:af4cabb0dac72abfb1e794fa7855c325fd2b55a10a44628a3c1ad3311c04127a"},
-    {file = "multiprocess-0.70.16-py312-none-any.whl", hash = "sha256:fc0544c531920dde3b00c29863377f87e1632601092ea2daca74e4beb40faa2e"},
-    {file = "multiprocess-0.70.16-py38-none-any.whl", hash = "sha256:a71d82033454891091a226dfc319d0cfa8019a4e888ef9ca910372a446de4435"},
-    {file = "multiprocess-0.70.16-py39-none-any.whl", hash = "sha256:a0bafd3ae1b732eac64be2e72038231c1ba97724b60b09400d68f229fcc2fbf3"},
-    {file = "multiprocess-0.70.16.tar.gz", hash = "sha256:161af703d4652a0e1410be6abccecde4a7ddffd19341be0a7011b94aeb171ac1"},
+    {file = "multiprocess-0.70.19-pp310-pypy310_pp73-macosx_10_15_x86_64.whl", hash = "sha256:02e5c35d7d6cd2bdc89c1858867f7bde4012837411023a4696c148c1bdd7c80e"},
+    {file = "multiprocess-0.70.19-pp310-pypy310_pp73-macosx_11_0_arm64.whl", hash = "sha256:79576c02d1207ec405b00cabf2c643c36070800cca433860e14539df7818b2aa"},
+    {file = "multiprocess-0.70.19-pp310-pypy310_pp73-manylinux_2_28_x86_64.whl", hash = "sha256:c6b6d78d43a03b68014ca1f0b7937d965393a670c5de7c29026beb2258f2f896"},
+    {file = "multiprocess-0.70.19-pp311-pypy311_pp73-macosx_10_15_x86_64.whl", hash = "sha256:1bbf1b69af1cf64cd05f65337d9215b88079ec819cd0ea7bac4dab84e162efe7"},
+    {file = "multiprocess-0.70.19-pp311-pypy311_pp73-macosx_11_0_arm64.whl", hash = "sha256:5be9ec7f0c1c49a4f4a6fd20d5dda4aeabc2d39a50f4ad53720f1cd02b3a7c2e"},
+    {file = "multiprocess-0.70.19-pp311-pypy311_pp73-manylinux_2_28_x86_64.whl", hash = "sha256:1c3dce098845a0db43b32a0b76a228ca059a668071cfeaa0f40c36c0b1585d45"},
+    {file = "multiprocess-0.70.19-pp39-pypy39_pp73-macosx_10_13_arm64.whl", hash = "sha256:e5e7dc3e3e1732e88c07aaec17eeb9917f9ed1107d9e60d5ab985cdc14bac43a"},
+    {file = "multiprocess-0.70.19-pp39-pypy39_pp73-macosx_10_13_x86_64.whl", hash = "sha256:e6c0674d34b8adac22533f6786576b3de4e396aaeda9e0c15378af9b8ada2702"},
+    {file = "multiprocess-0.70.19-pp39-pypy39_pp73-manylinux_2_28_x86_64.whl", hash = "sha256:d6db91ca6391eebc139c352f34578cea382df6bfa03d3b4146ed12b18b01cc14"},
+    {file = "multiprocess-0.70.19-py310-none-any.whl", hash = "sha256:97404393419dcb2a8385910864eedf47a3cadf82c66345b44f036420eb0b5d87"},
+    {file = "multiprocess-0.70.19-py311-none-any.whl", hash = "sha256:928851ae7973aea4ce0eaf330bbdafb2e01398a91518d5c8818802845564f45c"},
+    {file = "multiprocess-0.70.19-py312-none-any.whl", hash = "sha256:3a56c0e85dd5025161bac5ce138dcac1e49174c7d8e74596537e729fd5c53c28"},
+    {file = "multiprocess-0.70.19-py313-none-any.whl", hash = "sha256:8d5eb4ec5017ba2fab4e34a747c6d2c2b6fecfe9e7236e77988db91580ada952"},
+    {file = "multiprocess-0.70.19-py314-none-any.whl", hash = "sha256:e8cc7fbdff15c0613f0a1f1f8744bef961b0a164c0ca29bdff53e9d2d93c5e5f"},
+    {file = "multiprocess-0.70.19-py39-none-any.whl", hash = "sha256:0d4b4397ed669d371c81dcd1ef33fd384a44d6c3de1bd0ca7ac06d837720d3c5"},
+    {file = "multiprocess-0.70.19.tar.gz", hash = "sha256:952021e0e6c55a4a9fe4cd787895b86e239a40e76802a789d6305398d3975897"},
 ]
 
 [package.dependencies]
-dill = ">=0.3.8"
+dill = ">=0.4.1"
 
 [[package]]
 name = "narwhals"
@@ -6629,15 +6635,15 @@ files = [
 
 [[package]]
 name = "truststore"
-version = "0.10.4"
+version = "0.10.5"
 description = "Verify certificates using native system trust stores"
 optional = false
 python-versions = ">=3.10"
 groups = ["main"]
 markers = "sys_platform != \"emscripten\""
 files = [
-    {file = "truststore-0.10.4-py3-none-any.whl", hash = "sha256:adaeaecf1cbb5f4de3b1959b42d41f6fab57b2b1666adb59e89cb0b53361d981"},
-    {file = "truststore-0.10.4.tar.gz", hash = "sha256:9d91bd436463ad5e4ee4aba766628dd6cd7010cf3e2461756b3303710eebc301"},
+    {file = "truststore-0.10.5-py3-none-any.whl", hash = "sha256:9aaaedaefaf06d8b206278cf8b5012bc897f485a874503501e12d776df78951c"},
+    {file = "truststore-0.10.5.tar.gz", hash = "sha256:30d36967ccaded5cbb38d602c433f53600036c79d502f4533a49b60a03bbefcd"},
 ]
 
 [[package]]
@@ -7296,4 +7302,4 @@ type = ["pytest-mypy (>=1.0.1) ; platform_python_implementation != \"PyPy\""]
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.10,<3.13"
-content-hash = "044af84af0c2e6a023d6631391ba662ec15d0fa76dac5fa7422c6dedcb130d74"
+content-hash = "ad48332c853f32487b0fbb74ccb9b2892bc1a6865cfb3aff74d4a193f6af131b"

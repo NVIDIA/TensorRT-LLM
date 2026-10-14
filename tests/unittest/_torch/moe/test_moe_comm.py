@@ -83,6 +83,7 @@ from tensorrt_llm._torch.moe.fused_moe.nccl_ep_utils import (
     is_nccl_ep_installed,
     nccl_ep_supports_version,
 )
+from tensorrt_llm._torch.nccl_window_tensor_scope import nccl_window_tensor_scope
 from tensorrt_llm.deep_ep.buffer import Buffer
 from tensorrt_llm.mapping import Mapping
 
@@ -1165,63 +1166,67 @@ def _worker_full_pipeline(config: CommTestConfig) -> dict:
         comm = _get_worker_comm(mapping, config)
 
         worker_inputs = _prepare_worker_inputs(rank, config)
-        dispatch_outputs = _run_worker_dispatch(comm, worker_inputs, config)
+        # Keep dispatch buffers alive through combine and the CPU result copies.
+        with nccl_window_tensor_scope(worker_inputs.hs):
+            dispatch_outputs = _run_worker_dispatch(comm, worker_inputs, config)
 
-        # ----- decode routing + dequant + MoE + combine -----
-        # Decode source info from raw dispatch output (before dequant) so we
-        # know which original (src_rank, token_idx) each dispatched row maps to.
-        # Using recv_hs.dtype and recv_hs.shape[1] ensures correct byte layout
-        # regardless of quant format (bf16, fp8, nvfp4, w4afp8-as-bf16).
-        recv_source_info = decode_source_info(
-            dispatch_outputs.recv_hs,
-            dispatch_outputs.recv_hs.dtype,
-            dispatch_outputs.recv_hs.shape[1],
-        )
+            # ----- decode routing + dequant + MoE + combine -----
+            # Decode source info from raw dispatch output (before dequant) so we
+            # know which original (src_rank, token_idx) each dispatched row maps to.
+            # Using recv_hs.dtype and recv_hs.shape[1] ensures correct byte layout
+            # regardless of quant format (bf16, fp8, nvfp4, w4afp8-as-bf16).
+            recv_source_info = decode_source_info(
+                dispatch_outputs.recv_hs,
+                dispatch_outputs.recv_hs.dtype,
+                dispatch_outputs.recv_hs.shape[1],
+            )
 
-        recv_hs_bf16 = _to_bf16(
-            dispatch_outputs.recv_hs,
-            dispatch_outputs.recv_sf,
-            worker_inputs.global_scale,
-            config.quant_mode,
-        )
+            recv_hs_bf16 = _to_bf16(
+                dispatch_outputs.recv_hs,
+                dispatch_outputs.recv_sf,
+                worker_inputs.global_scale,
+                config.quant_mode,
+            )
 
-        # Use ceil/floor partitioning so the slot range is correct for both
-        # uniform and non-divisible EP (num_experts % ep_size != 0).
-        _, local_slot_start, local_slot_end = _compute_ep_partition(
-            config.num_experts, config.ep_size, rank
-        )
-        # Run a minimal local-expert compute step before combine(). This keeps
-        # the test aligned with the real MoE pipeline, where combine() consumes
-        # per-rank expert outputs rather than raw dispatch payloads.
-        moe_output = simple_moe(
-            recv_hs_bf16,
-            dispatch_outputs.recv_slots,
-            dispatch_outputs.recv_scales,
-            local_slot_start,
-            local_slot_end,
-        )
+            # Use ceil/floor partitioning so the slot range is correct for both
+            # uniform and non-divisible EP (num_experts % ep_size != 0).
+            _, local_slot_start, local_slot_end = _compute_ep_partition(
+                config.num_experts, config.ep_size, rank
+            )
+            # Run a minimal local-expert compute step before combine(). This keeps
+            # the test aligned with the real MoE pipeline, where combine() consumes
+            # per-rank expert outputs rather than raw dispatch payloads.
+            moe_output = simple_moe(
+                recv_hs_bf16,
+                dispatch_outputs.recv_slots,
+                dispatch_outputs.recv_scales,
+                local_slot_start,
+                local_slot_end,
+            )
 
-        combined = comm.combine(
-            moe_output,
-            all_rank_max_num_tokens=max(config.all_num_tokens),
-        )
+            combined = comm.combine(
+                moe_output,
+                all_rank_max_num_tokens=max(config.all_num_tokens),
+            )
 
-        # Save recv_hs_bf16 for DeepEPLL combine reference (weighted reduce
-        # needs raw dispatched hidden_states, not accumulated moe_output).
-        saved_recv_hs_bf16 = recv_hs_bf16.clone() if config.comm_type == COMM_DEEP_EP_LL else None
-        moe_output_for_ref = _prepare_moe_output_for_combine_reference(moe_output, config)
+            # Save recv_hs_bf16 for DeepEPLL combine reference (weighted reduce
+            # needs raw dispatched hidden_states, not accumulated moe_output).
+            saved_recv_hs_bf16 = (
+                recv_hs_bf16.clone() if config.comm_type == COMM_DEEP_EP_LL else None
+            )
+            moe_output_for_ref = _prepare_moe_output_for_combine_reference(moe_output, config)
 
-        return _build_worker_result(
-            rank,
-            worker_inputs,
-            dispatch_outputs,
-            combined,
-            moe_output,
-            recv_source_info,
-            config,
-            recv_hs_bf16=saved_recv_hs_bf16,
-            moe_output_for_ref=moe_output_for_ref,
-        )
+            return _build_worker_result(
+                rank,
+                worker_inputs,
+                dispatch_outputs,
+                combined,
+                moe_output,
+                recv_source_info,
+                config,
+                recv_hs_bf16=saved_recv_hs_bf16,
+                moe_output_for_ref=moe_output_for_ref,
+            )
     except Exception:
         _destroy_cached_worker_comm()
         traceback.print_exc()
@@ -1279,44 +1284,45 @@ def _worker_nccl_ep_cuda_graph_replay(config: CommTestConfig) -> dict:
             experts_per_rank=experts_per_rank,
         )
 
-        # Initialize the context and handle eagerly. Capture is intentionally
-        # rejected before this point, matching production graph setup.
-        comm.dispatch(
-            hidden_states,
-            None,
-            local_routes,
-            weights,
-            all_rank_num_tokens,
-        )
-        torch.cuda.synchronize()
-
-        static_routes = local_routes.clone()
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            recv_hs, _, recv_slots, _ = comm.dispatch(
+        with nccl_window_tensor_scope(hidden_states):
+            # Initialize the context and handle eagerly. Capture is intentionally
+            # rejected before this point, matching production graph setup.
+            comm.dispatch(
                 hidden_states,
                 None,
-                static_routes,
+                local_routes,
                 weights,
                 all_rank_num_tokens,
             )
-        torch.cuda.synchronize()
-
-        def replay_and_check(expected_sender: int) -> dict:
-            graph.replay()
             torch.cuda.synchronize()
-            valid = recv_slots[:, 0] >= 0
-            received = recv_hs[valid, 0].to(torch.float32).round().to(torch.int64)
-            return {
-                "valid_count": int(valid.sum().item()),
-                "sender_matches": bool(torch.all(received == expected_sender + 1).item()),
-            }
 
-        static_routes.copy_(local_routes)
-        local_result = replay_and_check(rank)
-        static_routes.copy_(peer_routes)
-        peer_result = replay_and_check(peer_rank)
-        return {"rank": rank, "local": local_result, "peer": peer_result}
+            static_routes = local_routes.clone()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                recv_hs, _, recv_slots, _ = comm.dispatch(
+                    hidden_states,
+                    None,
+                    static_routes,
+                    weights,
+                    all_rank_num_tokens,
+                )
+            torch.cuda.synchronize()
+
+            def replay_and_check(expected_sender: int) -> dict:
+                graph.replay()
+                torch.cuda.synchronize()
+                valid = recv_slots[:, 0] >= 0
+                received = recv_hs[valid, 0].to(torch.float32).round().to(torch.int64)
+                return {
+                    "valid_count": int(valid.sum().item()),
+                    "sender_matches": bool(torch.all(received == expected_sender + 1).item()),
+                }
+
+            static_routes.copy_(local_routes)
+            local_result = replay_and_check(rank)
+            static_routes.copy_(peer_routes)
+            peer_result = replay_and_check(peer_rank)
+            return {"rank": rank, "local": local_result, "peer": peer_result}
     except Exception:
         traceback.print_exc()
         raise

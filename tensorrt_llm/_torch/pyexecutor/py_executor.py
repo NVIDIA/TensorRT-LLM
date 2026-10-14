@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import atexit
 import dataclasses
 import datetime
 import math
@@ -102,7 +103,8 @@ from .llm_request import (ATTENTION_DP_DUMMY_REQUEST_ID,
                           is_multimodal_encoder_ready)
 from .model_engine import ModelEngine
 from .perf_metrics_manager import PerfMetricsManager
-from .pp_utils import PPCommTag
+from .pp_utils import (MpiProgressPump, PPCommTag, get_with_mpi_progress,
+                       make_mpi_progress_exit_hook, make_mpi_progress_pump)
 from .profiling import PROFILE_START_STOP_ENV_VAR_NAME, PyExecutorProfileManager
 from .profiling import load_iteration_indexes as _load_iteration_indexes
 from .request_utils import (RequestBroadcaster, attach_py_objects_to_requests,
@@ -1039,6 +1041,13 @@ class PyExecutor:
         self.worker_started = False
         self.worker_lock = threading.Lock()
         self._broadcast_mpi_comm = None
+        # Idle-time MPI progress pump for the sample-state relay thread, built
+        # by start_worker(); see pp_utils.make_mpi_progress_pump. The stop
+        # Event retires the pump and the quiesced Event acknowledges that the
+        # relay thread will issue no further MPI call.
+        self._pp_mpi_progress: Optional[MpiProgressPump] = None
+        self._pp_mpi_progress_stop = threading.Event()
+        self._pp_mpi_progress_quiesced = threading.Event()
         # Secondary MPI communicator and listener thread for multi-rank
         # sleep/wakeup control messages.  Both are None until start_worker()
         # calls Dup() (a collective) on the main thread.
@@ -1430,6 +1439,28 @@ class PyExecutor:
                         "Create new MPI comm for broadcast sample state thread to avoid deadlock."
                     )
                     self._broadcast_mpi_comm = mpi_comm().Dup()
+                    # Build the idle-time MPI progress pump on the main thread
+                    # and hand it the relay thread's own communicator, never
+                    # the executor thread's.
+                    assert self._broadcast_mpi_comm is not None
+                    assert self._broadcast_mpi_comm is not mpi_comm()
+                    # Fresh Events rather than clear(): an executor may be
+                    # started again after shutdown(), and a flag left set by
+                    # the previous run would disarm the new pump.
+                    self._pp_mpi_progress_stop = threading.Event()
+                    self._pp_mpi_progress_quiesced = threading.Event()
+                    self._pp_mpi_progress = make_mpi_progress_pump(
+                        self._broadcast_mpi_comm, self._pp_mpi_progress_stop,
+                        self._pp_mpi_progress_quiesced)
+                    if self._pp_mpi_progress is not None:
+                        # Retire the pump before MPI_Finalize on exit paths
+                        # that never reach shutdown(). The hook must not hold
+                        # a reference to self.
+                        atexit.register(
+                            make_mpi_progress_exit_hook(
+                                self._pp_mpi_progress_stop,
+                                self._pp_mpi_progress_quiesced,
+                                self._pp_mpi_progress[1]))
                     broadcast_sample_state_loop = self._broadcast_sample_state_loop
                     if is_trace_enabled("TLLM_TRACE_EXECUTOR_LOOP"):
                         broadcast_sample_state_loop = trace_func(
@@ -1700,8 +1731,18 @@ class PyExecutor:
         self.executor_request_queue.enqueue_cancel_request(id)
 
     def shutdown(self):
-        """
-        Signals the server to shutdown.
+        """Shut down the terminal executor and all CUDA graphs it owns."""
+        self._shutdown(release_model_owned_graphs=True)
+
+    def shutdown_for_kv_cache_estimation(self):
+        """Shut down a temporary profiling executor whose model is reused."""
+        self._shutdown(release_model_owned_graphs=False)
+
+    def _shutdown(self, *, release_model_owned_graphs: bool):
+        """Shared shutdown implementation for explicit executor lifecycles.
+
+        Model-owned graphs are terminal model resources, unlike executor-owned
+        graphs that may reference the resource managers torn down below.
         """
         self.executor_request_queue.enqueue_shutdown_request()
         self.shutdown_event.wait()
@@ -1718,11 +1759,20 @@ class PyExecutor:
             # Since the whole process will shutdown after this `shutdown` call,
             # All threads and memory pools will be freed properly.
             logger.error("Hang detected, shutting down immediately.")
+            # Stop the relay thread from probing while the hang detector
+            # aborts MPI. A probe already in flight is not interrupted.
+            self._pp_mpi_progress_stop.set()
             return
         self.worker_thread.join()
         if self.dist.pp_size > 1:
+            # The worker thread has exited, so no PP traffic needs progress.
+            self._pp_mpi_progress_stop.set()
             self.executed_batch_queue.put(None)
             self.broadcast_sample_state_handler.join()
+            # The relay thread exits through the sentinel without another
+            # pump tick, so acknowledge the quiesce here; otherwise the exit
+            # hook would wait out its full timeout.
+            self._pp_mpi_progress_quiesced.set()
         # Signal non-rank-0 sleep/wakeup listener threads to exit.  This runs
         # after the worker thread has joined, which guarantees that the non-rank-0
         # executor loops have already processed the shutdown broadcast and are
@@ -1743,6 +1793,11 @@ class PyExecutor:
         # for the now-freed memory regions.
         for engine in (self.model_engine, self.draft_model_engine):
             if engine is not None and hasattr(engine, '_release_cuda_graphs'):
+                if release_model_owned_graphs:
+                    release_model_graphs = getattr(
+                        engine, '_release_model_owned_cuda_graphs', None)
+                    if release_model_graphs is not None:
+                        release_model_graphs()
                 engine._release_cuda_graphs()
         # Ensure graph destruction has fully completed on device before
         # resource managers start freeing GPU-backed workspaces.
@@ -1752,9 +1807,9 @@ class PyExecutor:
             if manager:
                 manager.shutdown()
         # Note: do NOT call engine.cleanup() here. PyExecutor.shutdown() is
-        # also invoked mid-init by configure_kv_cache_capacity() in
-        # tensorrt_llm/_torch/pyexecutor/_util.py — the warmup pass calls
-        # shutdown() and then immediately reads model_engine.model.model_config
+        # paired with shutdown_for_kv_cache_estimation() mid-init in
+        # configure_kv_cache_capacity(); that path immediately reads
+        # model_engine.model.model_config
         # to compute kv_cache_max_memory. cleanup() would set
         # model_engine.model = None, breaking that read with
         # `'NoneType' object has no attribute 'model_config'`.
@@ -3109,7 +3164,9 @@ class PyExecutor:
         set_thread_local_mpi_comm(broadcast_mpi_comm)
         try:
             while True:
-                executed_batch = self.executed_batch_queue.get()
+                executed_batch = get_with_mpi_progress(
+                    self.executed_batch_queue, self._pp_mpi_progress,
+                    self._pp_mpi_progress_stop)
                 if executed_batch is None:
                     break
                 self._ring_broadcast_sample_state(executed_batch)
@@ -3691,6 +3748,15 @@ class PyExecutor:
         transceiver = getattr(self, "kv_cache_transceiver", None)
         if transceiver is None:
             return NoopDisaggCoordinator()
+        is_kv_manager_v2 = getattr(self, "_is_kv_manager_v2", False)
+        # Only the overlap loop admits while the previous forward is still
+        # queued on the execution stream that records the admission fence. A
+        # KV connector is reported after that fence, so it keeps the wait.
+        defer_unready_gen_receives = (
+            is_kv_manager_v2
+            and not getattr(self, "disable_overlap_scheduler", True)
+            and self._dist_size(getattr(self, "dist", None), "pp_size") == 1
+            and getattr(self, "kv_connector_manager", None) is None)
         return DisaggTransferCoordinator(
             transceiver=transceiver,
             transfer_manager=getattr(self, "async_transfer_manager", None),
@@ -3705,7 +3771,8 @@ class PyExecutor:
                 self, "force_terminate_ctx_for_partial_reuse", False),
             admission_controller=getattr(
                 self, "_disagg_transfer_admission_controller", None),
-            is_kv_manager_v2=getattr(self, "_is_kv_manager_v2", False))
+            is_kv_manager_v2=is_kv_manager_v2,
+            defer_unready_gen_receives=defer_unready_gen_receives)
 
     @staticmethod
     def _dist_size(dist, name: str) -> int:
