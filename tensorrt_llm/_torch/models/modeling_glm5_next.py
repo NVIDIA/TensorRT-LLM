@@ -1508,10 +1508,12 @@ class Glm5NextSparseAttention(nn.Module):
 
 
 class Glm5NextGate(DeepseekV3Gate):
-    """DeepSeek noaux_tc routing with FP32 weights, logits and correction bias.
+    """DeepSeek noaux_tc routing with FP32 logits and correction bias.
 
-    Preserve small inter-expert score differences when adding the correction bias;
-    rounding it to BF16 can change expert selection.
+    The checkpoint router weight is BF16, so the base BF16 GEMM with FP32 output
+    forms the same products as FP32 math. Preserve small inter-expert score
+    differences when adding the correction bias; rounding it to BF16 can change
+    expert selection.
     """
 
     def __init__(self, config: PretrainedConfig, moe_backend: str = "CUTLASS") -> None:
@@ -1524,22 +1526,17 @@ class Glm5NextGate(DeepseekV3Gate):
             n_group=int(getattr(config, "n_group", 1) or 1),
             topk_group=int(getattr(config, "topk_group", 1) or 1),
             routed_scaling_factor=float(config.routed_scaling_factor),
-            dtype=torch.float32,
+            dtype=torch.bfloat16,
             fuse_routing_kernel=True,
             apply_routing=False,
             moe_backend=moe_backend,
         )
-        self.hidden_size = int(config.hidden_size)
         self.norm_topk_prob = bool(config.norm_topk_prob)
         # FP32 regardless of the MoE backend (the base class picks bf16 for
         # TRTLLM); the fused routing kernels consume the FP32 tensor directly.
         self.e_score_correction_bias = nn.Parameter(
             torch.empty(int(config.n_routed_experts), dtype=torch.float32), requires_grad=False
         )
-
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        flat = hidden_states.reshape(-1, self.hidden_size)
-        return torch.nn.functional.linear(flat.float(), self.weight)
 
 
 class Glm5NextMoE(nn.Module):
