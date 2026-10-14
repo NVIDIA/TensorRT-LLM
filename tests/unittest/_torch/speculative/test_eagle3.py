@@ -1296,11 +1296,14 @@ def test_eagle3_lora(use_cuda_graph: bool):
 
 @pytest.mark.parametrize("disable_overlap_scheduler", [False])
 @pytest.mark.parametrize("use_cuda_graph", [True])
-# dl3_k4_dt12_bs1 runs the Blackwell SwapsMmaAb tree-mask kernel with a mask buffer sized for one request.
+# dl3_k4_dt12_bs1 covers one request against a mask buffer sized for one request on the Blackwell SwapsMmaAb kernel.
 @pytest.mark.parametrize(
     "max_draft_len,dynamic_tree_max_topK,max_total_draft_tokens,max_batch_size,kv_cache_max_tokens",
-    [(6, 10, 30, 4, 2048), (3, 4, 12, 1, 4096)],
-    ids=["dl6_k10_dt30", "dl3_k4_dt12_bs1"])
+    [
+        pytest.param(6, 10, 30, 4, 2048, id="dl6_k10_dt30"),
+        pytest.param(
+            3, 4, 12, 1, 4096, id="dl3_k4_dt12_bs1", marks=skip_pre_blackwell),
+    ])
 @pytest.mark.high_cuda_memory
 @with_mocked_hf_download_for_single_gpu
 def test_llama_eagle3_dynamic_tree(

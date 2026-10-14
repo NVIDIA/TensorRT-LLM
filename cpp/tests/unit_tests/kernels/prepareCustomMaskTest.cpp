@@ -296,12 +296,18 @@ protected:
         int64_t totalMaskSize = static_cast<int64_t>(batchSize) * maxNumTilesQ * maxNumCustomMaskTilesKv * numInstsQ
             * numInstsKv * (tileSizeQ * tileSizeKvPadded) / 32;
 
+        int32_t const stepQ = tileSizeQ * numInstsQ;
+        int32_t const stepKv = tileSizeKv * numInstsKv;
+        int64_t const maskCapacity = std::max(totalMaskSize,
+            getCustomMaskSizeUpperBound(FmhaKernelType::KeepsMmaAbForGeneration, batchSize, uniformSeqLenQ,
+                numHeadsQPerKv, stepQ, stepKv, tileSizeQ, tileSizeKv));
+
         auto customMaskOffsetsDevice = mBufferManager->gpu(batchSize, tensorrt_llm::DataType::kINT64);
-        auto customMaskDevice = mBufferManager->gpu(totalMaskSize, tensorrt_llm::DataType::kINT32);
+        auto customMaskDevice = mBufferManager->gpu(maskCapacity, tensorrt_llm::DataType::kINT32);
 
         // Clear GPU buffers to ensure no stale data from previous tests
         cudaMemsetAsync(bufferCast<int64_t>(*customMaskOffsetsDevice), 0, batchSize * sizeof(int64_t), mStream->get());
-        cudaMemsetAsync(bufferCast<int32_t>(*customMaskDevice), 0, totalMaskSize * sizeof(int32_t), mStream->get());
+        cudaMemsetAsync(bufferCast<int32_t>(*customMaskDevice), 0, maskCapacity * sizeof(int32_t), mStream->get());
         cudaStreamSynchronize(mStream->get());
 
         TllmGenFmhaRunnerParams runnerParams;
@@ -316,9 +322,8 @@ protected:
         runnerParams.generalPackedCustoMaskPtr = bufferCast<int32_t>(*inputPackedMaskDevice);
         runnerParams.customMaskOffsetsPtr = bufferCast<int64_t>(*customMaskOffsetsDevice);
         runnerParams.customMaskPtr = reinterpret_cast<uint32_t*>(bufferCast<int32_t>(*customMaskDevice));
+        runnerParams.customMaskCapacity = maskCapacity;
 
-        int32_t const stepQ = tileSizeQ * numInstsQ;
-        int32_t const stepKv = tileSizeKv * numInstsKv;
         runPrepareCustomMask(runnerParams, FmhaKernelType::KeepsMmaAbForGeneration, stepQ, stepKv, tileSizeQ,
             tileSizeKv, mStream->get());
         cudaError_t cudaErr = cudaStreamSynchronize(mStream->get());
@@ -446,8 +451,6 @@ TEST_F(PrepareCustomMaskTest, LargeBatchParallelOffsetScan)
         /* numHeadsQPerKv */ 4);
 }
 
-} // namespace
-
 TEST_F(PrepareCustomMaskTest, SwapsMmaAbStaysWithinCapacity)
 {
     for (int32_t const seqLenQ : {13, 31, 60})
@@ -490,3 +493,5 @@ TEST(PrepareCustomMaskCapacityTest, RejectsUndersizedBuffer)
                      tileSizeQ, tileSizeKv, /* stream */ nullptr),
         tensorrt_llm::common::TllmException);
 }
+
+} // namespace

@@ -84,8 +84,10 @@ int64_t getCustomMaskSizeUpperBound(FmhaKernelType kernelType, int32_t batchSize
 
 int64_t getCustomMaskCapacityUpperBound(int32_t maxBatchSize, int32_t maxSeqLenQ, int32_t numHeadsQPerKv)
 {
-    // Tile shapes of the generation custom-mask kernels; runPrepareCustomMask checks the one actually selected.
-    int32_t const tileSizeKv = 128;
+    // Tile shapes the generation custom-mask kernel selection can pick: KeepsMmaAb stepQ {128, 256}, SwapsMmaAb
+    // tileSizeQ {8, 16, 32} with one Q instance, stepKv {128, 256}. Keep these in sync with that selection;
+    // runPrepareCustomMask rejects a selected shape whose mask does not fit the buffer.
+    int32_t const kTileSizeKv = 128;
     int64_t capacity = 0;
     for (int32_t const stepKv : {128, 256})
     {
@@ -95,14 +97,14 @@ int64_t getCustomMaskCapacityUpperBound(int32_t maxBatchSize, int32_t maxSeqLenQ
             {
                 capacity = std::max(capacity,
                     getCustomMaskSizeUpperBound(FmhaKernelType::KeepsMmaAbForGeneration, maxBatchSize, maxSeqLenQ,
-                        numHeadsQPerKv, stepQ, stepKv, 128, tileSizeKv));
+                        numHeadsQPerKv, stepQ, stepKv, 128, kTileSizeKv));
             }
         }
         for (int32_t const tileSizeQ : {8, 16, 32})
         {
             capacity = std::max(capacity,
                 getCustomMaskSizeUpperBound(FmhaKernelType::SwapsMmaAbForGeneration, maxBatchSize, maxSeqLenQ,
-                    numHeadsQPerKv, tileSizeQ, stepKv, tileSizeQ, tileSizeKv));
+                    numHeadsQPerKv, tileSizeQ, stepKv, tileSizeQ, kTileSizeKv));
         }
     }
     return capacity;
@@ -563,17 +565,14 @@ void launchComputeCustomMaskOffsetsKernelForSwapsMmaAb(TllmGenFmhaRunnerParams c
 void runPrepareCustomMask(TllmGenFmhaRunnerParams const& runnerParams, FmhaKernelType kernelType, int32_t stepQ,
     int32_t stepKv, int32_t tileSizeQ, int32_t tileSizeKv, cudaStream_t stream)
 {
-    if (runnerParams.customMaskCapacity > 0)
-    {
-        int64_t const required = getCustomMaskSizeUpperBound(kernelType, runnerParams.mBatchSize,
-            runnerParams.mMaxSeqLenQ, runnerParams.mNumHeadsQPerKv, stepQ, stepKv, tileSizeQ, tileSizeKv);
-        TLLM_CHECK_WITH_INFO(required <= runnerParams.customMaskCapacity,
-            "Custom mask buffer holds %ld uint32 but kernel type %d (stepQ %d, stepKv %d, tileSizeQ %d) may write %ld "
-            "for batch %d, maxSeqLenQ %d, numHeadsQPerKv %d.",
-            static_cast<long>(runnerParams.customMaskCapacity), static_cast<int>(kernelType), stepQ, stepKv, tileSizeQ,
-            static_cast<long>(required), runnerParams.mBatchSize, runnerParams.mMaxSeqLenQ,
-            runnerParams.mNumHeadsQPerKv);
-    }
+    TLLM_CHECK_WITH_INFO(runnerParams.customMaskCapacity > 0, "Custom mask capacity must be set.");
+    int64_t const required = getCustomMaskSizeUpperBound(kernelType, runnerParams.mBatchSize, runnerParams.mMaxSeqLenQ,
+        runnerParams.mNumHeadsQPerKv, stepQ, stepKv, tileSizeQ, tileSizeKv);
+    TLLM_CHECK_WITH_INFO(required <= runnerParams.customMaskCapacity,
+        "Custom mask buffer holds %ld uint32 but kernel type %d (stepQ %d, stepKv %d, tileSizeQ %d) may write %ld "
+        "for batch %d, maxSeqLenQ %d, numHeadsQPerKv %d.",
+        static_cast<long>(runnerParams.customMaskCapacity), static_cast<int>(kernelType), stepQ, stepKv, tileSizeQ,
+        static_cast<long>(required), runnerParams.mBatchSize, runnerParams.mMaxSeqLenQ, runnerParams.mNumHeadsQPerKv);
     if (isKeepsMmaAbForGenerationKernel(static_cast<FmhaKernelType>(kernelType)))
     {
         int cta_tile_size = stepQ * stepKv;
