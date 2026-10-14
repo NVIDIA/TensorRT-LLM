@@ -19,9 +19,9 @@ for what it does and does not record.
 Tier 2 is evaluated for every eligible CBTS run (`/bot run` and
 `/bot run --post-merge`). Coverage decisions for authors outside
 `CBTS_COVERAGE_PILOT_USERS` are shadow-only: their candidate scope, stages,
-case counts, and skip rate are reported, but the narrowed test DB is not
-uploaded and the baseline filter chain remains active. Tier 1 decisions
-continue to apply to all users.
+case counts, and skip rate are reported, and the baseline filter chain remains
+active. The candidate decision and narrowed test DB are saved as an artifact.
+Tier 1 decisions continue to apply to all users.
 
 ## Consumption layers
 
@@ -269,9 +269,11 @@ travels between jobs.
 
 Shadow coverage decisions return to the baseline before this upload step, so
 neither Layer 2 stage filtering nor Layer 3 test-db narrowing can affect the
-run. OpenSearch records `b_cbts_applied` and
-`b_coverage_pilot_eligible`; `s_scope=coverage` with
-`b_cbts_applied=false` identifies a successful shadow candidate.
+run. They upload `cbts/cbts_shadow_selection.tar.gz`, containing the final
+`cbts_shadow_decision.json` and, when present, the narrowed `cbts_test_db/`.
+OpenSearch records the artifact path in `s_shadow_selection_artifact_path` after
+a successful upload. `s_scope=coverage` with `b_cbts_applied=false` identifies
+a successful shadow candidate.
 
 ## Split-resize heuristic (Layer 2.5)
 
