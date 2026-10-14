@@ -566,7 +566,7 @@ public:
     //! Converts a Fortran communicator handle (mpi4py: `comm.py2f()`) into an MPI_Comm.
     [[nodiscard]] static MPI_Comm commFromFortranHandle(int64_t fortranHandle);
 
-    //! Stops and joins the thread. Idempotent.
+    //! Stops and joins the thread. Idempotent and safe to call from several threads at once.
     void stop();
 
     [[nodiscard]] bool isRunning() const;
@@ -584,6 +584,8 @@ private:
     std::mutex mMutex;
     std::condition_variable mCondVar;
     bool mShouldStop{false};
+    //! Serializes the join in stop(); run() holds mMutex, so the join cannot use it.
+    std::mutex mJoinMutex;
     std::thread mThread;
 };
 

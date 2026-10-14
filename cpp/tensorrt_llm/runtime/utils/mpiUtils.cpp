@@ -739,6 +739,7 @@ void MpiProgressThread::stop()
         mShouldStop = true;
     }
     mCondVar.notify_all();
+    std::lock_guard<std::mutex> joinLock(mJoinMutex);
     if (mThread.joinable())
     {
         mThread.join();
