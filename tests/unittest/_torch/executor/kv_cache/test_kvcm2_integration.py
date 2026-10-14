@@ -312,6 +312,7 @@ def _make_cache_config_for_test(
     assert len(max_attention_window_vec) == len(pp_layers)
 
     cache_manager = object.__new__(KVCacheManagerV2)
+    cache_manager.layer_specs = None
     cache_manager.max_beam_width = 1
     cache_manager.kv_cache_type = kv_cache_type
     cache_manager.dtype = dtype

@@ -997,6 +997,7 @@ def test_creator_uses_v2_affine_cache_cost():
 
 def test_v2_quota_from_max_tokens_models_context_swa_scratch():
     manager = object.__new__(KVCacheManagerV2)
+    manager.layer_specs = None
     manager._has_cp_helix = False
     manager.num_local_layers = 3
     manager.pp_layers = [4, 5, 6]
