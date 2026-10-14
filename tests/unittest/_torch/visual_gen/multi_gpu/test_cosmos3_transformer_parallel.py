@@ -44,10 +44,10 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 # attn2d tests fail loudly when the kernels are missing on their Blackwell runner —
 # a build/dependency problem, not a reason to skip.
 try:
-    from tensorrt_llm._torch.visual_gen.attention_backend.flash_attn4 import (
+    from tensorrt_llm._torch.visual_gen.attention.backends.flash_attn4 import (
         _flash_attn_fwd as _fa4_fwd,
     )
-    from tensorrt_llm._torch.visual_gen.attention_backend.parallel import (
+    from tensorrt_llm._torch.visual_gen.attention.backends.parallel import (
         _flash_attn_combine as _fa_combine,
     )
 
@@ -680,7 +680,7 @@ def _logic_cosmos3_ulysses_vs_single_gpu(rank, world_size):
     text_seed = _cfg_text_seed(rank, tp_size=1, ulysses_size=world_size, cfg_size=1)
 
     ref_out = _forward(ref_model, device, text_seed)
-    from tensorrt_llm._torch.visual_gen.attention_backend import parallel as parallel_attention
+    from tensorrt_llm._torch.visual_gen.attention.backends import parallel as parallel_attention
 
     original_prefix_helper = parallel_attention._run_attention_with_replicated_kv
 

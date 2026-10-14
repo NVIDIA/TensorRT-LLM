@@ -44,8 +44,8 @@ def _disable_mpi() -> Iterator[None]:
 with _disable_mpi():
     from tensorrt_llm._torch.attention.backends.interface import PredefinedAttentionMask
     from tensorrt_llm._torch.distributed import all_to_all_4d, all_to_all_5d
-    from tensorrt_llm._torch.visual_gen.attention_backend import UlyssesAttention, VanillaAttention
-    from tensorrt_llm._torch.visual_gen.attention_backend.interface import (
+    from tensorrt_llm._torch.visual_gen.attention.backends import UlyssesAttention, VanillaAttention
+    from tensorrt_llm._torch.visual_gen.attention.backends.interface import (
         AttentionBackend,
         AttentionTensorLayout,
     )
@@ -116,7 +116,7 @@ def run_test_in_distributed(world_size: int, test_fn: Callable, use_cuda: bool =
 
 
 def test_forward_async_redistributes_vsa_gates(monkeypatch: pytest.MonkeyPatch) -> None:
-    import tensorrt_llm._torch.visual_gen.attention_backend.parallel as parallel_backend
+    import tensorrt_llm._torch.visual_gen.attention.backends.parallel as parallel_backend
 
     class _CaptureBackend:
         preferred_layout = AttentionTensorLayout.NHD

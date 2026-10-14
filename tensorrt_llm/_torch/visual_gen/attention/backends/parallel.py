@@ -29,11 +29,11 @@ import torch.distributed as dist
 import torch.nn.functional as F
 
 if TYPE_CHECKING:
-    from ..mapping import VisualGenMapping
+    from ...mapping import VisualGenMapping
 
 from tensorrt_llm._torch.distributed import all_to_all_4d, all_to_all_5d
 
-from ...attention.backends.interface import PredefinedAttentionMask
+from ....attention.backends.interface import PredefinedAttentionMask
 from .flash_attn4 import _install_cutlass_dsl_compatibility
 from .interface import AttentionBackend, AttentionTensorLayout
 

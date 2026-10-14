@@ -24,9 +24,9 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.visual_gen.args import QuantAttentionConfig
 
-from .....attention.backends.fmha.prims_ts_block_sparse import PrimsTSBlockSparseFmha
-from .....attention.backends.interface import PredefinedAttentionMask
-from .....attention.backends.sparse.params import SparseBackendForwardArgs
+from ......attention.backends.fmha.prims_ts_block_sparse import PrimsTSBlockSparseFmha
+from ......attention.backends.interface import PredefinedAttentionMask
+from ......attention.backends.sparse.params import SparseBackendForwardArgs
 from ...cute_dsl import CuTeDSLAttention
 from ...trtllm import TrtllmAttention
 from .metadata import VSA_BLOCK_SIZE, VSAMetadata

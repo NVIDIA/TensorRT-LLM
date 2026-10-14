@@ -27,16 +27,16 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.visual_gen.args import QuantAttentionConfig
 
-from ...attention.backends.interface import (
+from ....attention.backends.interface import (
     AttentionForwardArgs,
     AttentionRuntimeFeatures,
     PredefinedAttentionMask,
 )
-from ...attention.backends.sparse.params import SparseBackendForwardArgs, SparseParams
-from ...attention.backends.sparse.timestep_phase import graph_phase_for_timestep
-from ...attention.backends.trtllm import TrtllmAttention as BaseTrtllmAttention
-from ...attention.backends.trtllm import TrtllmAttentionMetadata as BaseTrtllmAttentionMetadata
-from ..cuda_graph_runner import resolved_extra_key
+from ....attention.backends.sparse.params import SparseBackendForwardArgs, SparseParams
+from ....attention.backends.sparse.timestep_phase import graph_phase_for_timestep
+from ....attention.backends.trtllm import TrtllmAttention as BaseTrtllmAttention
+from ....attention.backends.trtllm import TrtllmAttentionMetadata as BaseTrtllmAttentionMetadata
+from ...cuda_graph_runner import resolved_extra_key
 from .interface import AttentionBackend, AttentionTensorLayout
 
 
