@@ -6407,12 +6407,64 @@ def runKubernetesPodWithInfraRetry(Map opts = [:], pipeline, podSpec, containerN
     }
 }
 
+// Cluster pins live in the job's Artifactory folder (shared across its builds), keyed by (commit, frontend platform) so that
+// re-runs of the same commit land on the same cluster (and its durations/caches).
+def clusterPinUrl(String platform) {
+    def safePlatform = platform.replaceAll('[^a-zA-Z0-9._-]', '_')
+    return "${URM_ARTIFACTORY_BASE}/sw-tensorrt-generic/llm-artifacts/${JOB_NAME}/cluster-pins/${env.gitlabCommit}/${safePlatform}"
+}
+
+def readClusterPin(String platform) {
+    try {
+        withCredentials([usernamePassword(
+                credentialsId: 'urm-artifactory-creds',
+                usernameVariable: 'ART_USER',
+                passwordVariable: 'ART_PASS')]) {
+            def pinned = sh(
+                script: "curl -fsS --max-time 30 -u \"\$ART_USER:\$ART_PASS\" '${clusterPinUrl(platform)}' 2>/dev/null || true",
+                returnStdout: true).trim()
+            return pinned ?: null
+        }
+    } catch (Exception e) {
+        echo "Failed to read cluster pin for ${platform}: ${e.toString()}"
+        return null
+    }
+}
+
+def writeClusterPin(String platform, String backendPlatform) {
+    try {
+        withCredentials([usernamePassword(
+                credentialsId: 'urm-artifactory-creds',
+                usernameVariable: 'ART_USER',
+                passwordVariable: 'ART_PASS')]) {
+            sh "printf '%s' '${backendPlatform}' | curl -fsS --max-time 30 -u \"\$ART_USER:\$ART_PASS\" -X PUT --data-binary @- '${clusterPinUrl(platform)}' > /dev/null"
+        }
+    } catch (Exception e) {
+        echo "Failed to write cluster pin for ${platform}: ${e.toString()}"
+    }
+}
+
 def pinStageClusterPlatform(String platform) {
     if (!platform.startsWith("auto:")) {
         return platform
     }
+    if (env.gitlabCommit) {
+        def cached = readClusterPin(platform)
+        if (cached) {
+            try {
+                SlurmConfig.resolvePlatform(cached)
+                echo "Reusing cached pin ${platform} -> ${cached} for commit ${env.gitlabCommit}"
+                return cached
+            } catch (Exception e) {
+                echo "Cached pin '${cached}' for ${platform} is no longer valid (${e.toString()}); re-selecting"
+            }
+        }
+    }
     def backendPlatform = SlurmConfig.frontendPlatforms[platform].selectItem()
     echo "Pinned ${platform} -> ${backendPlatform} for all shards of the group"
+    if (env.gitlabCommit) {
+        writeClusterPin(platform, backendPlatform)
+    }
     return backendPlatform
 }
 
