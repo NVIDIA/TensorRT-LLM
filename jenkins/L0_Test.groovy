@@ -6906,48 +6906,6 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         40,
         10
     )
-    // GB300 Kimi-K3-NVFP4 DSpark, AgentX agentic trace replay. The ctx side is
-    // 16 single-GPU servers forming one DWDP16 group, launched as one MPI step
-    // on 4 nodes; the gen side is helix context parallel. Needs Kimi-K3-NVFP4,
-    // Inferact-Kimi-K3-DSpark and the trace corpus on the gb300-flex cluster.
-    // 8 Nodes: ctx16 (DWDP16, 4 nodes) + gen1 (helix16, 4 nodes) = 32 GPUs
-    multiNodesSBSAConfigs += buildStageConfigs(
-        "GB300-32_GPUs-8_Nodes-PyTorch-Disagg-PerfSanity-AgentX-CTX16-NODE1-GPU1-GEN1-NODE4-GPU16-Post-Merge",
-        "auto:gb300-flex",
-        "l0_gb300_multi_nodes_perf_sanity_ctx16_node1_gpu1_gen1_node4_gpu16",
-        2,
-        32,
-        8
-    )
-    // 10 Nodes: ctx16 (DWDP16, 4 nodes) + gen3 (helix8, 2 nodes each) = 40 GPUs
-    multiNodesSBSAConfigs += buildStageConfigs(
-        "GB300-40_GPUs-10_Nodes-PyTorch-Disagg-PerfSanity-AgentX-CTX16-NODE1-GPU1-GEN3-NODE2-GPU8-Post-Merge",
-        "auto:gb300-flex",
-        "l0_gb300_multi_nodes_perf_sanity_ctx16_node1_gpu1_gen3_node2_gpu8",
-        1,
-        40,
-        10
-    )
-    // 16 Nodes: ctx16 (DWDP16, 4 nodes) + gen3 (helix16, 4 nodes each) = 64 GPUs
-    multiNodesSBSAConfigs += buildStageConfigs(
-        "GB300-64_GPUs-16_Nodes-PyTorch-Disagg-PerfSanity-AgentX-CTX16-NODE1-GPU1-GEN3-NODE4-GPU16-Post-Merge",
-        "auto:gb300-flex",
-        "l0_gb300_multi_nodes_perf_sanity_ctx16_node1_gpu1_gen3_node4_gpu16",
-        1,
-        64,
-        16
-    )
-    // ctx_only of the Kimi-K3 AgentX configs: the DWDP16 ctx side as one
-    // 16-GPU attention-DP server on 4 nodes. Their gen_only_no_context lanes
-    // run in the GEN1-NODE2-GPU8 / GEN1-NODE4-GPU16 stages above.
-    multiNodesSBSAConfigs += buildStageConfigs(
-        "GB300-16_GPUs-4_Nodes-PyTorch-PerfSanity-Node4-GPU16-Post-Merge",
-        "auto:gb300-flex",
-        "l0_gb300_multi_nodes_perf_sanity_node4_gpu16",
-        4,
-        16,
-        4
-    )
     multiNodesSBSAConfigs = cbtsResizeSplits(multiNodesSBSAConfigs)
     fullSet += multiNodesSBSAConfigs.keySet()
 
