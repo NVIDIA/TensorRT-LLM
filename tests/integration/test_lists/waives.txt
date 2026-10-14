@@ -94,7 +94,6 @@ full:CPU/unittest/serve/test_no_object_new.py::test_no_new_object_new_sites SKIP
 full:DGX_B200/accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16[mtp_nextn=2-attention_dp=True-cuda_graph=True-overlap_scheduler=True-torch_compile=False-enable_chunked_prefill=False-v2_kv_cache=True] SKIP (https://nvbugs/6633268)
 full:DGX_B200/unittest/tools/test_layer_wise_benchmarks.py::test_performance_alignment[1] SKIP (https://nvbugs/6669275)
 full:DGX_H100/disaggregated/test_disaggregated.py::test_disaggregated_context_first_bf16_ownership SKIP (https://nvbugs/7051902)
-full:DGX_H100/unittest/_torch/ray_orchestrator/multi_gpu/test_accuracy_with_allreduce_strategy.py::test_accuracy_with_allreduce_strategy[NCCL-Qwen3/Qwen3-8B] SKIP (https://nvbugs/6908275)
 full:DGX_H100/unittest/disaggregated/test_kv_transfer_mp.py::test_context_first_bf16_owned_transfer SKIP (https://nvbugs/7051902)
 full:DGX_H100/unittest/disaggregated/test_transfer_lifecycle_gpu.py::test_context_first_bf16_lifecycle_gpu SKIP (https://nvbugs/7051902)
 full:GB200/accuracy/test_disaggregated_serving.py::TestQwen3_5_4B::test_mismatched_block_reuse SKIP (https://nvbugs/7023115)
