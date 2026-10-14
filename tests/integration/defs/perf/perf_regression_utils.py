@@ -325,7 +325,9 @@ def prepare_regressive_test_cases(
 
     Uses baseline/threshold fields from latest_baseline_threshold_dict when
     available, otherwise falls back to calculating baseline from history data.
-    metric_history_floors_ms is forwarded to calculate_baseline_metrics.
+    A metric listed in metric_history_floors_ms ignores any stored baseline and
+    always takes the floor-filtered calculation (see calculate_baseline_metrics);
+    its threshold is still read from latest_baseline_threshold_dict.
 
     Returns the set of pre-merge cmd_idx whose regression must not fail the
     stage because the latest post-merge record for the same case is itself
@@ -379,6 +381,11 @@ def prepare_regressive_test_cases(
             # then fall back to calculating from history data
             baseline_key = f"d_baseline_{metric_suffix}"
             baseline_value = baseline_threshold.get(baseline_key) if baseline_threshold else None
+            # A stored baseline carries no record of which history produced it, so
+            # it cannot be trusted to respect a floor; a floored metric always
+            # recomputes its baseline from the floor-filtered history.
+            if metric_history_floors_ms and metric in metric_history_floors_ms:
+                baseline_value = None
             if baseline_value is None or baseline_value <= 0:
                 if fallback_baseline is None:
                     history_list = history_data_dict.get(cmd_idx, [])

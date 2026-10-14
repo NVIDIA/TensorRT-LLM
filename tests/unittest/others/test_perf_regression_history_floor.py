@@ -238,6 +238,55 @@ def test_prepare_regressive_test_cases_applies_the_floor():
     assert verdict({STEP: FLOOR, MEDIAN: FLOOR}) is False
 
 
+def test_stored_baseline_cannot_bypass_the_floor():
+    """A d_baseline_* inherited from history says nothing about which rows produced it.
+
+    A floored metric must ignore it and recompute from the floored history; an unfloored
+    metric keeps using it.
+    """
+    old, new = _two_wave_history()
+    history = [dict(r, **{MEDIAN: r[STEP]}) for r in old + new]
+    stored = {
+        f"d_baseline_{STEP[2:]}": 31.6,
+        f"d_baseline_{MEDIAN[2:]}": 31.5,
+        f"d_baseline_{THROUGHPUT[2:]}": 600000.0,
+    }
+
+    def run(floors):
+        data = {
+            0: {
+                "b_is_post_merge": True,
+                STEP: 98.5,
+                MEDIAN: 98.4,
+                THROUGHPUT: 517000.0,
+                "s_test_case_name": "c",
+            }
+        }
+        pru.prepare_regressive_test_cases(
+            {0: history[-1]},
+            {0: dict(stored)},
+            {0: history},
+            data,
+            [THROUGHPUT],
+            [STEP, MEDIAN],
+            [STEP, MEDIAN, THROUGHPUT],
+            metric_history_floors_ms=floors,
+        )
+        info = {
+            line.split(":")[0].strip(): float(line.split("baseline=")[1].split()[0])
+            for line in data[0]["s_regression_info"].splitlines()
+            if "baseline=" in line
+        }
+        return info
+
+    unfloored = run(None)
+    assert unfloored[STEP] == pytest.approx(31.6)
+    floored = run({STEP: FLOOR, MEDIAN: FLOOR})
+    assert floored[STEP] == pytest.approx(98.5)
+    assert floored[MEDIAN] == pytest.approx(98.5)
+    assert floored[THROUGHPUT] == pytest.approx(600000.0)
+
+
 def test_process_and_upload_test_results_forwards_the_floor(monkeypatch):
     """The real pipeline, with only its OpenSearch seams replaced, honours the floor."""
     old, new = _two_wave_history()
