@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -27,6 +27,7 @@ import trace
 import traceback
 import weakref
 from contextlib import contextmanager
+from ctypes import byref
 from enum import EnumMeta
 from functools import lru_cache, partial, wraps
 from pathlib import Path
@@ -1237,8 +1238,8 @@ def confidential_compute_enabled() -> bool:
         # Hopper and newer supports a more nuanced query of confidential
         # compute settings
         cc_settings = pynvml.c_nvmlSystemConfComputeSettings_v1_t()
-        if (pynvml.nvmlSystemGetConfComputeSettings(cc_settings) ==
-                pynvml.NVML_SUCCESS):
+        if (pynvml.nvmlSystemGetConfComputeSettings(
+                byref(cc_settings)) == pynvml.NVML_SUCCESS):
             cc_enabled = (cc_settings.ccFeature
                           == pynvml.NVML_CC_SYSTEM_FEATURE_ENABLED
                           or cc_settings.multiGpuMode
