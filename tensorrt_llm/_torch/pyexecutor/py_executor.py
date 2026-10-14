@@ -7711,16 +7711,23 @@ class PyExecutor:
                     f"num_schedulable_requests={num_schedulable_requests}")
         return True
 
-    def _update_adp_dummy_role(self, candidates: List[LlmRequest]) -> None:
+    def _update_adp_dummy_role(
+            self, candidates: List[Union[LlmRequest,
+                                         RequestQueueItem]]) -> None:
         if not self.enable_attention_dp or self.kv_cache_transceiver is None:
             return
         has_ctx = False
         has_gen = False
-        for req in candidates:
+        for candidate in candidates:
+            req = (candidate.request
+                   if isinstance(candidate, RequestQueueItem) else candidate)
             rt = getattr(req, "llm_request_type", None)
-            if rt == LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY:
+            request_type = getattr(req, "request_type", None)
+            if (rt == LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY
+                    or request_type == RequestType.REQUEST_TYPE_CONTEXT_ONLY):
                 has_ctx = True
-            elif rt == LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY:
+            elif (rt == LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY
+                  or request_type == RequestType.REQUEST_TYPE_GENERATION_ONLY):
                 has_gen = True
         # Prefer the CTX role when both types are present this iteration so the
         # dummy follows the same request lifecycle as ranks doing real context
