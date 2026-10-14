@@ -68,7 +68,7 @@ set_target_properties(
                               CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 add_cuda_architectures(tllm_common_cuda 89)
 
-add_library(tllm_common_environment STATIC envUtils.cpp)
+add_library(tllm_common_environment STATIC envUtils.cpp ipUtils.cpp)
 add_library(tllm::common_environment ALIAS tllm_common_environment)
 target_link_libraries(tllm_common_environment PUBLIC tllm::common_cuda)
 set_target_properties(tllm_common_environment
@@ -80,7 +80,6 @@ add_library(
   cublasMMWrapper.cpp
   cudaFp8Utils.cu
   cudaProfilerUtils.cpp
-  ipUtils.cpp
   mcastDevMemUtils.cpp
   ncclUtils.cpp
   opUtils.cpp

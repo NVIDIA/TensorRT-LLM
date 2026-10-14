@@ -128,6 +128,15 @@ add_tllm_gtest(
   "unit;batch-manager;gpu"
   REQUIRES_GPU)
 
+# GDS partial-copy cases load the NIXL wrapper at runtime.
+if(TARGET tensorrt_llm_nixl_wrapper)
+  add_dependencies(kvCacheManagerTest tensorrt_llm_nixl_wrapper)
+  set_property(
+    TARGET kvCacheManagerTest
+    APPEND
+    PROPERTY BUILD_RPATH "$<TARGET_FILE_DIR:tensorrt_llm_nixl_wrapper>")
+endif()
+
 add_tllm_gtest(
   kvCacheManagerFabricMemoryTest
   OWNER
