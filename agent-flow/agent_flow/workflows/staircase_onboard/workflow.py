@@ -630,6 +630,10 @@ class StaircaseOnboardWorkflow:
         destination.mkdir(parents=True, exist_ok=True)
         for skill_dir in sorted(p for p in source.iterdir() if p.is_dir()):
             target = destination / skill_dir.name
+            if _same_tree(skill_dir, target):
+                # A resumed run: the copy is current, and the directory may be read-only
+                # to this process (a sandbox protects `.claude/skills`).
+                continue
             shutil.rmtree(target, ignore_errors=True)
             shutil.copytree(skill_dir, target)
         return destination
@@ -3563,3 +3567,14 @@ if __name__ == "__main__":
     from .cli import main
 
     main()
+
+
+def _same_tree(a: Path, b: Path) -> bool:
+    """Whether directory ``b`` holds exactly ``a``'s files with the same bytes."""
+    import filecmp
+
+    if not b.is_dir():
+        return False
+    files_a = sorted(p.relative_to(a) for p in a.rglob("*") if p.is_file() and "__pycache__" not in p.parts)
+    files_b = sorted(p.relative_to(b) for p in b.rglob("*") if p.is_file() and "__pycache__" not in p.parts)
+    return files_a == files_b and all(filecmp.cmp(a / f, b / f, shallow=False) for f in files_a)
