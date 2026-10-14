@@ -1493,6 +1493,7 @@ def test_draft_manager_keeps_shared_progress_across_context_and_generation() -> 
 def _make_publishing_manager(policy: BlockReusePolicy) -> KVCacheManagerV2:
     """A manager wired just far enough to run the publish/history bookkeeping."""
     manager = object.__new__(KVCacheManagerV2)
+    manager.kv_cache_type = CacheType.SELFKONLY
     manager.enable_block_reuse = True
     manager.is_draft = False
     manager._can_publish_block_reuse = True
@@ -1780,6 +1781,41 @@ def test_generation_dummy_uses_available_capacity(draft_len: int) -> None:
             manager.free_resources(request)
         assert not manager.kv_cache_map
     finally:
+        manager.shutdown()
+
+
+def test_generation_dummy_does_not_reuse_real_request_prefix() -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    torch.cuda.init()
+    manager = KVCacheManagerV2(
+        KvCacheConfig(enable_block_reuse=True, max_gpu_total_bytes=4 << 20),
+        CacheType.SELF,
+        num_layers=2,
+        num_kv_heads=2,
+        head_dim=128,
+        tokens_per_block=32,
+        max_seq_len=2048,
+        max_batch_size=2,
+        max_num_tokens=128,
+        mapping=Mapping(),
+        dtype=DataType.HALF,
+    )
+    tokens = [1] * 32
+    seed = manager.impl.create_kv_cache(ReuseScope(), tokens)
+    dummy = None
+    try:
+        assert seed.resume(manager._stream.cuda_stream)
+        assert seed.resize(len(tokens))
+        seed.commit(tokens, is_end=True)
+        seed.close()
+
+        dummy = manager.add_dummy_requests([1000], token_nums=[33], is_gen=True)
+        assert dummy is not None
+        assert manager.kv_cache_map[dummy[0].py_request_id].num_committed_tokens == 0
+    finally:
+        if dummy is not None:
+            manager.free_resources(dummy[0])
         manager.shutdown()
 
 

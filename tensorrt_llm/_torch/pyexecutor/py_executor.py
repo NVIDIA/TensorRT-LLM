@@ -96,6 +96,7 @@ from .hang_diagnostics import create_executor_hang_diagnostics
 from .kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from .kv_cache.mamba_cache_manager import (BaseMambaCacheManager,
                                            MixedMambaHybridCacheManager)
+from .kv_cache_load import KvLoadTracker, aggregate_load
 from .kv_cache_stats import append_kv_cache_iteration_stats
 from .llm_request import (ATTENTION_DP_DUMMY_REQUEST_ID, ExecutorRequest,
                           LlmRequest, LlmRequestState, LlmResponse,
@@ -118,7 +119,8 @@ from .sampler import (AsyncWorkerMixin, Sampler, SamplerEvent, SampleState,
 from .scheduler import (RequestScheduler, ScheduledRequests,
                         SerializableSchedulerOutput, WaitingQueue,
                         create_waiting_queue)
-from .scheduler.adp_router import ADPRouter, RankState, count_retiring_requests
+from .scheduler.adp_router import (ADPRouter, RankIterStatsPayload, RankState,
+                                   count_retiring_requests)
 from .scheduler.scheduler import RemoteTailPhase
 from .scheduler.scheduler_v2 import KVCacheV2Scheduler
 
@@ -128,6 +130,7 @@ if TYPE_CHECKING:
     from ..moe.fused_moe.communication.base import CheckpointableCommunication
 
 _UNBOUNDED_STATS_MAX_LEN = -1
+_V2_RETENTION_IGNORED_LOG_KEY = "kv_cache_manager_v2_retention_config_ignored"
 
 
 class _ADPForwardIntent(IntEnum):
@@ -659,6 +662,27 @@ class PyExecutor:
         self.enable_kv_cache_events = self.kv_cache_manager is not None and (
             self.kv_cache_manager.event_buffer_max_size > 0 or getattr(
                 self.kv_cache_manager, "streaming_kv_events_enabled", False))
+        # Event routing also needs the sum of actual per-rank capacities after
+        # pool rebalance. Keep sampling internal unless GetLoad was enabled.
+        routing_load_enabled = (getattr(
+            self.llm_args, "_enable_routing_load", False) or getattr(
+                self.kv_cache_manager, "streaming_kv_events_enabled", False))
+        self._kv_load_tracker = KvLoadTracker(
+            self.kv_cache_manager,
+            int(self.dist.tp_rank) if self.enable_attention_dp else 0,
+            routing_load_enabled)
+        self._kv_cache_capacity = self._read_kv_cache_capacity()
+        self._openengine_discovery = {}
+        self._openengine_node_server = None
+        if self._kv_load_tracker.enabled:
+            initial_sample = self._kv_load_tracker.sample(
+                self._kv_cache_capacity, force=True)
+            if self.enable_attention_dp:
+                rank_loads = self.dist.tp_allgather(initial_sample)
+                if self.dist.rank == 0 and all(rank_loads):
+                    self._kv_load_tracker.snapshot = aggregate_load(rank_loads)
+            elif initial_sample:
+                self._kv_load_tracker.record_local(initial_sample)
         self.enable_kv_cache_reuse = self.kv_cache_manager is not None and self.kv_cache_manager.enable_block_reuse
         # Router Replay (R3): SharedRouteCache bound, derived once from the KV
         # pool token capacity on the first non-warmup step (0 = block reuse off,
@@ -1099,6 +1123,8 @@ class PyExecutor:
 
         self.dwdp_manager = dwdp_manager
 
+        self._validate_moe_a2a_checkpoint_support()
+
         if start_worker:
             self.start_worker()
 
@@ -1446,6 +1472,10 @@ class PyExecutor:
                 error_delivered=self._event_loop_error_delivered,
             ) if crashed else None
             try:
+                node_server = getattr(self, "_openengine_node_server", None)
+                if node_server is not None:
+                    node_server.close()
+                    self._openengine_node_server = None
                 self._executor_loop_cleanup()
             finally:
                 if crashed:
@@ -1484,6 +1514,36 @@ class PyExecutor:
         self.model_engine.is_warmup = value
         if self.draft_model_engine is not None:
             self.draft_model_engine.is_warmup = value
+
+    def _validate_moe_a2a_checkpoint_support(self) -> None:
+        """Reject sleep/wakeup up front when a MoE resource cannot checkpoint.
+
+        The MNNVL all-reduce workspaces checkpoint through their own path in
+        distributed/ops.py and are not covered here. Without this the conflict
+        only surfaces at the first sleep request, once the engine is already
+        serving.
+        """
+        if getattr(self.llm_args, "sleep_config", None) is None:
+            return
+
+        from tensorrt_llm._torch.moe.fused_moe.communication.base import \
+            CheckpointBlockable
+
+        blockers = []
+        for resource in self._mnnvl_checkpoint_resources(
+                list(ExecutorMemoryType)):
+            if not isinstance(resource, CheckpointBlockable):
+                continue
+            reason = resource.checkpoint_blocked_reason()
+            if reason is not None:
+                blockers.append(reason)
+
+        if blockers:
+            raise ValueError(
+                "sleep_config was requested, but the engine holds a resource that "
+                "cannot be checkpointed: " + "; ".join(sorted(set(blockers))) +
+                ". "
+                "Remove sleep_config to keep the current configuration.")
 
     def start_worker(self):
         with self.worker_lock:
@@ -1804,6 +1864,10 @@ class PyExecutor:
         """
         Signals the server to shutdown.
         """
+        node_server = getattr(self, "_openengine_node_server", None)
+        if node_server is not None:
+            node_server.close()
+            self._openengine_node_server = None
         self.executor_request_queue.enqueue_shutdown_request()
         self.shutdown_event.wait()
         # Tear down any profile window an HTTP caller left open (i.e.
@@ -1917,6 +1981,13 @@ class PyExecutor:
     def fail_sleep_wakeup_transition(self) -> None:
         self.executor_request_queue.fail_sleep_wakeup_transition()
 
+    def get_memory_status(self) -> dict[str, object]:
+        state, parked_tags = self.executor_request_queue.get_memory_status()
+        return {
+            "state": state.value,
+            "parked_tags": sorted(parked_tags),
+        }
+
     def get_request_admission_state(self) -> RequestAdmissionState:
         return self.executor_request_queue.get_admission_state()
 
@@ -1937,21 +2008,28 @@ class PyExecutor:
             self.stats = []
         return latest_stats
 
-    def get_kv_cache_capacity(self) -> dict:
+    def _read_kv_cache_capacity(self) -> dict:
         kv_cache_manager = self.resource_manager.resource_managers.get(
             ResourceManagerType.KV_CACHE_MANAGER)
         if kv_cache_manager is None:
             return {}
 
-        kv_stats = kv_cache_manager.get_kv_cache_stats()
-        max_num_blocks = getattr(kv_stats, "max_num_blocks", 0)
-        tokens_per_block = getattr(kv_stats, "tokens_per_block", 0)
-
+        block_counts = getattr(type(kv_cache_manager),
+                               "get_primary_block_counts", None)
+        if callable(block_counts):
+            _, max_num_blocks = block_counts(kv_cache_manager)
+            tokens_per_block = kv_cache_manager.tokens_per_block
+        else:
+            kv_stats = kv_cache_manager.get_kv_cache_stats()
+            max_num_blocks = getattr(kv_stats, "max_num_blocks", 0)
+            tokens_per_block = getattr(kv_stats, "tokens_per_block", 0)
         if not max_num_blocks:
             max_num_blocks = getattr(kv_cache_manager, "blocks_in_primary_pool",
                                      0)
         if not max_num_blocks:
-            max_num_blocks = kv_cache_manager.get_max_resource_count()
+            resource_count = kv_cache_manager.get_max_resource_count()
+            max_num_blocks = (resource_count
+                              if isinstance(resource_count, int) else 0)
         if not tokens_per_block:
             tokens_per_block = getattr(kv_cache_manager, "tokens_per_block", 0)
 
@@ -1960,11 +2038,31 @@ class PyExecutor:
 
         max_num_blocks = int(max_num_blocks)
         tokens_per_block = int(tokens_per_block)
-        return {
+        capacity = {
             "maxNumBlocks": max_num_blocks,
             "tokensPerBlock": tokens_per_block,
             "maxNumTokens": max_num_blocks * tokens_per_block,
         }
+        if getattr(kv_cache_manager, "streaming_kv_events_enabled",
+                   False) is True:
+            capacity["kvEventsEnabled"] = True
+        return capacity
+
+    def get_kv_cache_capacity(self) -> dict:
+        """Return the latest scheduler-owned primary KV capacity."""
+        return self._kv_cache_capacity.copy()
+
+    def get_openengine_discovery(self) -> dict:
+        """Return immutable-at-startup OpenEngine node and publisher discovery."""
+        return self._openengine_discovery
+
+    def get_kv_cache_load(self) -> dict:
+        """Return the scheduler-owned KV load snapshot.
+
+        Control-plane callers can execute on RPC threads. They must never query
+        the single-threaded cache manager directly.
+        """
+        return self._kv_load_tracker.snapshot
 
     def get_latest_kv_cache_events(self):
         kv_cache_manager = self.resource_manager.resource_managers.get(
@@ -3471,6 +3569,7 @@ class PyExecutor:
                             elif target_action == _SleepWakeupAction.SLEEP:
                                 self._run_mnnvl_checkpoint_resources(
                                     target_action, tags)
+                                self.invalidate_v1_prefix_cache_for_sleep(tags)
                                 release_with_tag(*tags)
                                 torch.cuda.synchronize()
                                 gc.collect()
@@ -3874,11 +3973,15 @@ class PyExecutor:
                     self.draft_kv_cache_manager.revert_allocate_generation(req)
 
     def _update_v2_context_resources(self, scheduled_batch) -> None:
-        """Commit one context frontier to target and draft caches."""
+        """Update self, draft, and cross caches after a context forward."""
         self.kv_cache_manager.update_context_resources(scheduled_batch)
         if self.enable_joint_kv_cache_reuse:
             self.draft_kv_cache_manager.update_context_resources(
                 scheduled_batch)
+        cross_kv_cache_manager = self.resource_manager.get_resource_manager(
+            ResourceManagerType.CROSS_KV_CACHE_MANAGER)
+        if cross_kv_cache_manager is not None:
+            cross_kv_cache_manager.update_context_resources(scheduled_batch)
 
     def _finalize_adp_dummy_allocation(self, can_queue: bool) -> None:
         """Commit or roll back this iteration's tentative ADP dummy.
@@ -3972,6 +4075,15 @@ class PyExecutor:
         transceiver = getattr(self, "kv_cache_transceiver", None)
         if transceiver is None:
             return NoopDisaggCoordinator()
+        is_kv_manager_v2 = getattr(self, "_is_kv_manager_v2", False)
+        # Only the overlap loop admits while the previous forward is still
+        # queued on the execution stream that records the admission fence. A
+        # KV connector is reported after that fence, so it keeps the wait.
+        defer_unready_gen_receives = (
+            is_kv_manager_v2
+            and not getattr(self, "disable_overlap_scheduler", True)
+            and self._dist_size(getattr(self, "dist", None), "pp_size") == 1
+            and getattr(self, "kv_connector_manager", None) is None)
         return DisaggTransferCoordinator(
             transceiver=transceiver,
             transfer_manager=getattr(self, "async_transfer_manager", None),
@@ -3986,7 +4098,8 @@ class PyExecutor:
                 self, "force_terminate_ctx_for_partial_reuse", False),
             admission_controller=getattr(
                 self, "_disagg_transfer_admission_controller", None),
-            is_kv_manager_v2=getattr(self, "_is_kv_manager_v2", False))
+            is_kv_manager_v2=is_kv_manager_v2,
+            defer_unready_gen_receives=defer_unready_gen_receives)
 
     @staticmethod
     def _dist_size(dist, name: str) -> int:
@@ -5312,6 +5425,9 @@ class PyExecutor:
         if not remote_tail_adp:
             self._resume_padding_dummies_after_rebalance(mgr, paused_dummies)
 
+        # Rebalancing can change the number of primary blocks.
+        self._kv_cache_capacity = self._read_kv_cache_capacity()
+
     def _start_pp_rebalance_drain(self) -> None:
         """Begin emptying the microbatch ring ahead of a PP rebalance.
 
@@ -6135,6 +6251,15 @@ class PyExecutor:
 
     def _validate_request(self, request: LlmRequest):
         self._configure_csa2_remote_tail(request)
+        if (isinstance(self.kv_cache_manager, KVCacheManagerV2)
+                and request.kv_cache_retention_config is not None):
+            logger.warning_once(
+                "KvCacheRetentionConfig has no effect with KV cache manager V2; "
+                "retention priorities and durations are ignored. Set "
+                "kv_cache_config.use_kv_cache_manager_v2=False to use retention "
+                "with KV cache manager V1.",
+                key=_V2_RETENTION_IGNORED_LOG_KEY)
+
         # Validate context-side pipelined-transfer constraints.
         disagg_params = request.py_disaggregated_params
         if (self.kv_cache_transceiver is not None
@@ -6424,6 +6549,10 @@ class PyExecutor:
             active_requests: List[LlmRequest]) -> List[LlmRequest]:
         """Fetch new requests and return LlmRequests ready for execution."""
         # 1. Gather rank states and calculate total_num_active_requests
+        load_sample = self._kv_load_tracker.begin_step(active_requests,
+                                                       self.enable_attention_dp,
+                                                       self._kv_cache_capacity)
+
         if self.enable_attention_dp:
             # NOTE: gather_all_rank_states is called here (before step 3)
             # because _pop_from_waiting_queue needs all_ranks_num_active_requests
@@ -6438,18 +6567,31 @@ class PyExecutor:
             # clear stats once every rank is aligned.
             iter_stats_payload = (self._adp_iter_stats.next_payload()
                                   if self.enable_iter_perf_stats else None)
+            if load_sample:
+                if iter_stats_payload is None:
+                    iter_stats_payload = RankIterStatsPayload()
+                iter_stats_payload.kv_used_blocks = load_sample["usedKvBlocks"]
+                iter_stats_payload.kv_total_blocks = load_sample[
+                    "totalKvBlocks"]
+                iter_stats_payload.kv_load_timestamp_ns = load_sample[
+                    "timestampUnixNanos"]
             if getattr(self, "_enable_remote_tail_adp", False):
                 context_ids, generation_ids = self._snapshot_remote_tail_phase_work(
                     active_requests)
                 all_rank_states = self.adp_router.gather_all_rank_states(
                     active_requests,
                     iter_stats_payload=iter_stats_payload,
-                    forward_work=(len(context_ids), len(generation_ids)))
+                    forward_work=(len(context_ids), len(generation_ids)),
+                    include_kv_cache_load=self._kv_load_tracker.enabled)
                 self._select_remote_tail_phase(all_rank_states, context_ids,
                                                generation_ids)
             else:
                 all_rank_states = self.adp_router.gather_all_rank_states(
-                    active_requests, iter_stats_payload=iter_stats_payload)
+                    active_requests,
+                    iter_stats_payload=iter_stats_payload,
+                    include_kv_cache_load=self._kv_load_tracker.enabled)
+            if self._kv_load_tracker.enabled and self.dist.rank == 0:
+                self._kv_load_tracker.record_rank_states(all_rank_states)
             if self.enable_iter_perf_stats:
                 for record in self._adp_iter_stats.finalize(
                         all_rank_states, is_rank0=self.dist.rank == 0):
@@ -6513,6 +6655,8 @@ class PyExecutor:
             new_requests = new_requests_cur_rank
 
         # 7. Merge requests
+        if self._kv_load_tracker.enabled and new_requests:
+            self._kv_load_tracker.idle_sampled = False
         return merge_requests(new_requests,
                               cp_config=self.dist.cp_config,
                               cp_rank=self.dist.cp_rank,
@@ -9209,6 +9353,27 @@ class PyExecutor:
                                 "route_capture", None)
         if route_capture is not None:
             route_capture.clear_shared()
+
+    def validate_sleep_tags(self, tags: List[ExecutorMemoryType]) -> None:
+        """Reject runtime-memory tags unsupported by the active KV manager."""
+        if (self._is_kv_manager_v2 and ExecutorMemoryType.KV_CACHE in tags):
+            raise ValueError(
+                "KV_CACHE sleep is not supported with KVCacheManagerV2 because "
+                "its main pools are not managed by tagged virtual memory.")
+
+    def invalidate_v1_prefix_cache_for_sleep(
+            self, tags: List[ExecutorMemoryType]) -> None:
+        """Invalidate V1 reuse metadata before destructive KV-cache sleep."""
+        if (self._is_kv_manager_v2 or not self.enable_kv_cache_reuse
+                or ExecutorMemoryType.KV_CACHE not in tags):
+            return
+
+        from tensorrt_llm._torch.virtual_memory import RestoreMode
+
+        restore_mode = self.llm_args.sleep_config.restore_modes[
+            ExecutorMemoryType.KV_CACHE]
+        if restore_mode in (RestoreMode.NONE, RestoreMode.MEMSET):
+            self.reset_prefix_cache()
 
     def invalidate_multimodal_encoder_cache(self) -> None:
         """Clear weight-derived MM outputs after request lifetimes quiesce."""

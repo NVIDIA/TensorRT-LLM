@@ -118,6 +118,64 @@ class Glm5NextCacheManager(MambaHybridCacheManagerV2):
         return self._kda_replay is not None
 
     @override
+    def _build_cache_config(self, config):
+        if (
+            self._kda_replay is not None
+            and self.local_num_mamba_layers > 0
+            and self.kv_cache_config.enable_kv_pool_rebalance
+        ):
+            raise ValueError(
+                "KDA replay caches are sized once from the SSM pool's slot count, "
+                "and a rebalance can grow that pool past them: set "
+                "kv_cache_config.enable_kv_pool_rebalance=False."
+            )
+        return super()._build_cache_config(config)
+
+    @override
+    def suspend_request(self, request) -> None:
+        if self._kda_replay is not None:
+            self._kda_replay.prepare_suspend(self, request)
+        super().suspend_request(request)
+
+    @override
+    def _setup_state_indices(self, requests, num_contexts: int = 0) -> None:
+        super()._setup_state_indices(requests, num_contexts)
+        if self._kda_replay is not None and self.local_num_mamba_layers > 0:
+            self._kda_replay.seed_resumed_requests(self, requests, num_contexts)
+
+    @override
+    def prepare_resources(self, scheduled_batch) -> None:
+        super().prepare_resources(scheduled_batch)
+        replay = self._kda_replay
+        if replay is None or self.local_num_mamba_layers == 0:
+            return
+        replay.unseeded_requests.update(
+            request.py_request_id
+            for request in scheduled_batch.context_requests
+            if request.is_disagg_generation_init_state
+        )
+        if getattr(self.spec_config, "decoding_type", None) == "NGram":
+            replay.acceptance_pending.update(
+                request.py_request_id
+                for request in scheduled_batch.generation_requests
+                if not request.is_dummy
+            )
+
+    @override
+    def revert_allocate_generation(self, request) -> None:
+        if self._kda_replay is not None:
+            self._kda_replay.acceptance_pending.discard(request.py_request_id)
+        super().revert_allocate_generation(request)
+
+    @override
+    def free_resources(self, request, pin_on_release: bool = False) -> None:
+        if self._kda_replay is not None:
+            self._kda_replay.suspended_requests.discard(request.py_request_id)
+            self._kda_replay.acceptance_pending.discard(request.py_request_id)
+            self._kda_replay.unseeded_requests.discard(request.py_request_id)
+        super().free_resources(request, pin_on_release)
+
+    @override
     def _extra_scratch_bytes_per_slot(self) -> int:
         if self._kda_replay is None:
             return 0
@@ -160,6 +218,9 @@ class Glm5NextCacheManager(MambaHybridCacheManagerV2):
         if replay.prev_num_accepted_tokens is None:
             return
         generation_requests = scheduled_batch.generation_requests
+        replay.acceptance_pending.difference_update(
+            request.py_request_id for request in generation_requests
+        )
         drafted_requests = [
             request
             for request in generation_requests
@@ -202,6 +263,7 @@ class Glm5NextCacheManager(MambaHybridCacheManagerV2):
         replay = self._kda_replay
         if replay is None or replay.prev_num_accepted_tokens is None:
             return
+        replay.unseeded_requests.difference_update(request_ids)
         slots = sorted(
             {
                 self._request_id_to_state_index[request_id]

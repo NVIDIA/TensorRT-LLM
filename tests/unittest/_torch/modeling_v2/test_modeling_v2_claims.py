@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""The routing tables and the targets they name must not drift apart.
+"""The routing modules and the target directories they import must not drift apart.
 
 Everything here is read off disk as text -- no target module is imported, so
 this runs anywhere, including a CI machine with no GPU and no built
@@ -17,6 +17,7 @@ gate records are for.
 
 from __future__ import annotations
 
+import ast
 import re
 from pathlib import Path
 
@@ -30,6 +31,8 @@ from tensorrt_llm._torch._experimental.modeling_v2._router_index import (
 
 # The package, not this file: these paths address the tree under test, and this
 # test lives in tests/ while that tree lives in tensorrt_llm/.
+pytestmark = pytest.mark.cpu_only
+
 _ROOT = Path(_modeling_v2.__file__).resolve().parent
 _ARCHS = sorted(MODELING_V2_ROUTERS)
 
@@ -37,6 +40,19 @@ _ARCHS = sorted(MODELING_V2_ROUTERS)
 def _module_path(dotted: str) -> Path:
     """Resolve a package-relative dotted module name to its file."""
     return _ROOT / (dotted.replace(".", "/") + ".py")
+
+
+# ``route`` hands back the class itself, imported from the target directory
+# right where it is returned. That import line is the one place a family's
+# routing module names its targets, so it is what these tests read.
+_TARGET_IMPORT = re.compile(r"^\s*from \.(\w+)\.modeling import (\w+)$", re.MULTILINE)
+
+
+def _routed_targets(arch: str):
+    """(target directory, class name) for every target ``route`` can return."""
+    source = _module_path(MODELING_V2_ROUTERS[arch]).read_text()
+    family_dir = _module_path(MODELING_V2_ROUTERS[arch]).parent
+    return [(family_dir / target, name) for target, name in _TARGET_IMPORT.findall(source)]
 
 
 def test_every_routed_architecture_has_an_importable_routing_module():
@@ -55,120 +71,36 @@ def test_no_routing_module_is_orphaned():
 
 
 @pytest.mark.parametrize("arch", _ARCHS)
-def test_targets_table_and_target_modules_agree(arch):
-    """Every name the tree can return must have a module that registers it."""
-    routing = routing_module(arch)
-    produced = set(routing._TARGETS.values())
-    declared = set(routing.TARGET_MODULES)
-    assert produced == declared, (
-        f"{arch}: _TARGETS yields {sorted(produced - declared)} with no "
-        f"TARGET_MODULES entry; TARGET_MODULES declares "
-        f"{sorted(declared - produced)} the tree cannot return"
+def test_no_target_directory_is_orphaned(arch):
+    """A target directory ``route`` never imports from is dead code: nothing
+    else can reach it."""
+    family_dir = _module_path(MODELING_V2_ROUTERS[arch]).parent
+    on_disk = {p.parent for p in family_dir.glob("*/modeling.py")}
+    routed = {target_dir for target_dir, _ in _routed_targets(arch)}
+    assert on_disk == routed, (
+        f"{arch}: target directories route() never imports: "
+        f"{sorted(p.name for p in on_disk - routed)}; imports with no directory: "
+        f"{sorted(p.name for p in routed - on_disk)}"
     )
 
 
 @pytest.mark.parametrize("arch", _ARCHS)
-def test_each_target_module_registers_its_own_name(arch):
-    """The synthetic name is only a registry key -- the module must fill it.
-
-    Nothing else can: the built-in static index does not carry modeling_v2
-    names, so a target whose decorator says something different resolves to
-    None and the engine reports an unknown architecture.
-    """
-    routing = routing_module(arch)
-    for name, dotted in routing.TARGET_MODULES.items():
-        path = _module_path(dotted)
-        assert path.is_file(), f"{arch}: {name} -> missing {path}"
-        source = path.read_text()
-        assert f'@register_auto_model("{name}")' in source, (
-            f"{arch}: {path.relative_to(_ROOT)} does not register {name!r}"
-        )
-
-
-@pytest.mark.parametrize("arch", _ARCHS)
 def test_target_identity_matches_its_path(arch):
-    """Identity is the directory name: <checkpoint>__<gpu arch>__<parallel>.
-
-    The class name encodes the same triple, and the routing module's ``_SM``
-    has to be the arch segment those targets actually live under -- a target
-    moved to a new SM without its routing constant following is the one drift
-    that would still route, and route wrong.
-    """
-    routing = routing_module(arch)
-    major, minor = routing._SM
-    expected_segment = f"sm_{major}{minor}"
-
-    for name, dotted in routing.TARGET_MODULES.items():
-        parts = dotted.split(".")
-        assert parts[-1] == "modeling", dotted
-        segments = parts[-2].split("__")
+    """Identity is the directory name: <checkpoint>__<gpu arch>__<parallel>,
+    and the class name encodes the same triple."""
+    for target_dir, name in _routed_targets(arch):
+        segments = target_dir.name.split("__")
         assert len(segments) == 3, (
-            f"{arch}: {parts[-2]!r} is not a <checkpoint>__<sm>__<parallel> directory name"
-        )
-        checkpoint, sm_segment, parallel = segments
-
-        assert sm_segment == expected_segment, (
-            f"{arch}: {name} lives under {sm_segment} but its routing module "
-            f"only ever matches {expected_segment}"
+            f"{arch}: {target_dir.name!r} is not a <checkpoint>__<sm>__<parallel> directory name"
         )
 
         def camel(segment: str) -> str:
             return "".join(w.capitalize() for w in segment.split("_"))
 
-        for segment in (checkpoint, sm_segment, parallel):
+        for segment in segments:
             assert camel(segment).lower() in name.lower(), (
                 f"{arch}: {name} does not carry path segment {segment!r}"
             )
-
-        assert (checkpoint, parallel) in routing._TARGETS, (
-            f"{arch}: no _TARGETS entry keyed ({checkpoint!r}, {parallel!r})"
-        )
-        assert routing._TARGETS[(checkpoint, parallel)] == name
-
-
-@pytest.mark.parametrize("arch", _ARCHS)
-def test_checkpoint_fingerprints_are_distinct(arch):
-    """Two checkpoints sharing a fingerprint would route to one target."""
-    routing = routing_module(arch)
-    names = list(routing._CHECKPOINTS.values())
-    assert len(names) == len(set(names)), f"{arch}: duplicate checkpoint names in _CHECKPOINTS"
-    assert set(names) == {c for c, _ in routing._TARGETS}, (
-        f"{arch}: _CHECKPOINTS and _TARGETS name different checkpoints"
-    )
-
-
-# Context fields a routing tree may not branch on yet, and what has to happen
-# before it can. Both would otherwise decide silently on a value that is not
-# the deployment's -- the failure ``require`` exists to prevent. Delete a row
-# once its prerequisite is met.
-_UNREADABLE_CONTEXT_FIELDS = {
-    "is_disagg": (
-        "no caller sets it, so it reads False in every deployment, "
-        "disaggregated or not; plumb it onto ModelConfig first"
-    ),
-    "spec_config": (
-        "explain.py has no flag for a speculative config, so it would report "
-        "the wrong target for every drafting configuration; give explain a "
-        "way to name one first"
-    ),
-}
-
-
-@pytest.mark.parametrize("arch", _ARCHS)
-@pytest.mark.parametrize("field", sorted(_UNREADABLE_CONTEXT_FIELDS))
-def test_no_routing_module_reads_an_unplumbed_dimension(arch, field):
-    """A routing tree may only read what both the engine and explain can fill.
-
-    ``explain`` replays the same tree to answer "why did I not get the target
-    I expected". A criterion it cannot evaluate makes that answer wrong on
-    exactly the configurations someone would ask about -- so the set of
-    readable fields is bounded by the weaker of the two callers, not the
-    engine alone.
-    """
-    source = _module_path(MODELING_V2_ROUTERS[arch]).read_text()
-    assert field not in source, (
-        f"{arch}: routing reads ctx.{field}, but {_UNREADABLE_CONTEXT_FIELDS[field]}"
-    )
 
 
 def test_every_target_ships_both_products():
@@ -186,9 +118,7 @@ def test_every_target_ships_both_products():
     rather than by a reader.
     """
     for arch in _ARCHS:
-        routing = routing_module(arch)
-        for name, dotted in routing.TARGET_MODULES.items():
-            target_dir = _module_path(dotted).parent
+        for target_dir, name in _routed_targets(arch):
             for product in ("modeling.py", "weights.py"):
                 assert (target_dir / product).is_file(), f"{name}: missing {product}"
 
@@ -201,9 +131,7 @@ def test_targets_do_not_share_files():
     the abstraction this package exists to avoid.
     """
     for arch in _ARCHS:
-        routing = routing_module(arch)
-        for name, dotted in routing.TARGET_MODULES.items():
-            target_dir = _module_path(dotted).parent
+        for target_dir, name in _routed_targets(arch):
             for source_file in target_dir.glob("*.py"):
                 text = source_file.read_text()
                 for match in re.finditer(r"^from (\.+)([\w.]*) import", text, re.MULTILINE):
@@ -215,3 +143,238 @@ def test_targets_do_not_share_files():
                         f"directory for {tail!r}; targets may import the "
                         f"catalog and nothing else"
                     )
+
+
+def test_every_entry_with_cells_has_a_test_that_drives_them():
+    """A cell list nothing executes is worse than no cell list.
+
+    It reads as coverage. `mla_rope_append_paged_kv_assign_q` shipped three
+    cells with no driver for exactly one commit, and nothing went red -- the
+    entry's own test had been wired to the entry's `compare` and not to its
+    `CELLS`, so the suite passed and the three configurations had never run.
+
+    Checked by reading rather than importing, like the rest of this file: an
+    entry declares `Cell(` in its source, and some test under this tree has to
+    name both the entry and `.CELLS`. That is weaker than proving the cells were
+    driven, and it is what a check that runs anywhere can say.
+    """
+    tests = list(Path(__file__).resolve().parent.rglob("*.py"))
+    sources = {t: t.read_text() for t in tests}
+
+    undriven = []
+    for entry in sorted(_entry_files()):
+        if "Cell(" not in entry.read_text():
+            continue
+        if not any(entry.stem in src and ".CELLS" in src for src in sources.values()):
+            undriven.append(str(entry.relative_to(_ROOT)))
+
+    assert not undriven, (
+        f"{len(undriven)} entry(ies) declare cells that no test drives: "
+        f"{', '.join(undriven)}. Parametrize the entry's test off its CELLS."
+    )
+
+
+# The phase a step runs at is resolved once, at the dispatcher, and a target is
+# what runs after that resolution. These two gates are what keep that true:
+# without them a later edit can put `if md.num_contexts:` back inside a decode
+# body and nothing goes red.
+_PHASE_FIELDS = ("num_contexts", "num_ctx_tokens")
+
+
+def _core_modules() -> list[Path]:
+    """Every target module ``route`` can reach."""
+    return [
+        target_dir / "modeling.py" for arch in _ARCHS for target_dir, _ in _routed_targets(arch)
+    ]
+
+
+def test_a_decode_target_never_reads_the_phase_back():
+    """Decode is routed to only when there are no context rows. Reading the
+    count back inside it is not a redundancy, it is the design being violated:
+    the value is a per-capture constant, so a branch on it inside a captured
+    graph is frozen at whatever the capturing batch happened to carry.
+
+    Prefill is deliberately exempt -- it holds the mixed batch and genuinely
+    needs `num_ctx_tokens` to split it. The asymmetry is the design, not an
+    oversight.
+
+    Scoped to the `DecodeTarget` class node rather than inverted over the
+    whole module: that inversion existed only while a decode body could be
+    inherited from a shared base, where `DecodeTarget`'s own node held just
+    the literal-args `step_args` call and a gate keyed on the class name saw
+    nothing of the forward that actually ran. Every target in this tree is
+    now a complete, independent class -- `DecodeTarget.forward` is not
+    inherited from anywhere -- so the class node is once again the target's
+    whole body, and the direct form catches a violation planted anywhere in
+    it.
+
+    Read by parsing rather than by importing, like everything else in this
+    file: no GPU, no built extensions.
+    """
+    offenders = []
+    for path in _core_modules():
+        if not path.is_file():
+            continue
+        tree = ast.parse(path.read_text())
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.ClassDef) or node.name != "DecodeTarget":
+                continue
+            for inner in ast.walk(node):
+                if isinstance(inner, ast.Attribute) and inner.attr in _PHASE_FIELDS:
+                    offenders.append(f"{path.relative_to(_ROOT)}:{inner.lineno} .{inner.attr}")
+    assert not offenders, "a decode target reads the phase it was routed on: " + ", ".join(
+        offenders
+    )
+
+
+def test_decode_step_args_state_the_zero_rather_than_reading_it():
+    """The one place the two gpt_oss targets actually differ.
+
+    Decode's routing already guarantees no context rows, so it says so instead
+    of reading the field back. That is what makes the source gate in
+    test_modeling_v2_claims.py meaningful on this target rather than vacuous.
+    """
+    source = (_ROOT / "models/gpt_oss/gpt_oss_120b__sm_103__tp1/modeling.py").read_text()
+    decode = next(
+        n
+        for n in ast.walk(ast.parse(source))
+        if isinstance(n, ast.ClassDef) and n.name == "DecodeTarget"
+    )
+    literals = {
+        kw.arg: kw.value.value
+        for call in ast.walk(decode)
+        if isinstance(call, ast.Call)
+        for kw in call.keywords
+        if kw.arg in ("num_contexts", "num_ctx_tokens") and isinstance(kw.value, ast.Constant)
+    }
+    assert literals == {"num_contexts": 0, "num_ctx_tokens": 0}
+
+
+def test_every_core_ships_both_targets():
+    """A core with one target routes half its steps into a KeyError.
+
+    Names, not a table: the gate above finds the decode body by class name, so
+    the name is load-bearing and is pinned here rather than left to convention.
+    """
+    missing = []
+    for path in _core_modules():
+        if not path.is_file():
+            continue
+        classes = {
+            n.name for n in ast.walk(ast.parse(path.read_text())) if isinstance(n, ast.ClassDef)
+        }
+        for required in ("PrefillTarget", "DecodeTarget"):
+            if required not in classes:
+                missing.append(f"{path.relative_to(_ROOT)}: {required}")
+    assert not missing, "core modules missing a target class: " + ", ".join(missing)
+
+
+# An entry computes a pure function of its arguments. These two gates are what
+# keep that true; without them an entry can quietly start reading instance
+# state, and CELLS stops covering what the target actually runs.
+
+
+def _entry_files() -> list[Path]:
+    """Every entry module: the shared catalog and each target's own ``ops/``."""
+    shared = (_ROOT / "catalog").glob("*/*.py")
+    owned = (_ROOT / "models").glob("*/*/ops/*/*.py")
+    return sorted(p for p in (*shared, *owned) if p.name != "__init__.py")
+
+
+def _catalog_entries() -> list[tuple[Path, ast.ClassDef]]:
+    """Every OpWrapper subclass, shared or owned, as (path, class node)."""
+    found = []
+    for path in _entry_files():
+        for node in ast.walk(ast.parse(path.read_text())):
+            if isinstance(node, ast.ClassDef) and any(
+                isinstance(b, ast.Name) and b.id == "OpWrapper" for b in node.bases
+            ):
+                found.append((path, node))
+    return found
+
+
+def test_call_reads_no_instance_state():
+    """`__call__` takes every argument explicitly.
+
+    The moment it reads any attribute of `self`, the arguments a cell drives it
+    with stop being the whole input -- and `CELLS` silently narrows to whatever
+    that instance happened to hold.
+    """
+    offenders = []
+    for path, cls in _catalog_entries():
+        for node in cls.body:
+            if not isinstance(node, ast.FunctionDef) or node.name != "__call__":
+                continue
+            for inner in ast.walk(node):
+                if (
+                    isinstance(inner, ast.Attribute)
+                    and isinstance(inner.value, ast.Name)
+                    and inner.value.id == "self"
+                ):
+                    offenders.append(f"{path.relative_to(_ROOT)}:{inner.lineno} self.{inner.attr}")
+    assert not offenders, (
+        "__call__ must take every argument explicitly; these read instance state: "
+        + ", ".join(offenders)
+    )
+
+
+def test_is_valid_accepts_everything_call_accepts():
+    """`is_valid` must accept every argument `__call__` accepts.
+
+    Not parameter-for-parameter mirroring -- an earlier version of this gate
+    demanded that, and it was wrong: it demanded a property the tree does not
+    have and does not need. `is_valid` may narrow to only the parameters it
+    actually inspects, as long as it also carries a `**kwargs` absorber.
+    `validating()` forwards the call's full argument set to `is_valid`
+    verbatim, so the absorber is what keeps that forward from
+    raising `TypeError` on the arguments the guard does not name --
+    `thop_attention.is_valid` checks three of `__call__`'s ~115 parameters
+    and absorbs the rest in `**unused_kwargs`; that is not a gap the gate
+    missed, it is the mechanism the tree chose so a 115-parameter signature
+    does not have to be restated to be validated. An entry with no `is_valid`
+    of its own inherits the base class's `(*args, **kwargs)` no-op, which
+    already accepts everything, so it is exempt from this check the same way.
+
+    `reference` is not checked here at all, and was wrong to check before.
+    It is driven by a cell's own explicit argument list, never by the forward
+    that reaches `is_valid`, so it never receives an argument it did
+    not declare -- there is nothing for it to absorb and nothing to mirror.
+    `thop_attention.reference` takes 16 of `__call__`'s ~115 parameters on
+    purpose: a 115-parameter reference implementation would be unmaintainable,
+    and the cell driving it only ever supplies those 16. Eight entries narrow
+    `reference` this way; all eight are correct.
+
+    The `self`-is-first-parameter check is kept as-is: an entry once shipped
+    `__call__` and `is_valid` both missing `self`, and a mirror check that
+    assumed the first parameter was `self` dropped a real argument from both
+    and reported a match.
+    """
+    problems = []
+    for path, cls in _catalog_entries():
+        funcs = {
+            n.name: n
+            for n in cls.body
+            if isinstance(n, ast.FunctionDef) and n.name in ("__call__", "reference", "is_valid")
+        }
+        call = funcs.get("__call__")
+        if call is None:
+            continue
+        for name, fn in funcs.items():
+            params = [a.arg for a in fn.args.args]
+            if not params or params[0] != "self":
+                problems.append(
+                    f"{path.relative_to(_ROOT)}: {cls.name}.{name} first param is not self"
+                )
+
+        is_valid = funcs.get("is_valid")
+        if is_valid is None or is_valid.args.kwarg is not None:
+            continue  # inherits the base no-op, or absorbs the remainder itself
+        call_names = {a.arg for a in call.args.args + call.args.kwonlyargs} - {"self"}
+        valid_names = {a.arg for a in is_valid.args.args + is_valid.args.kwonlyargs} - {"self"}
+        missing = sorted(call_names - valid_names)
+        if missing:
+            problems.append(
+                f"{path.relative_to(_ROOT)}: {cls.name}.is_valid does not accept "
+                f"{missing} that __call__ accepts, and has no ** absorber"
+            )
+    assert not problems, "; ".join(problems)

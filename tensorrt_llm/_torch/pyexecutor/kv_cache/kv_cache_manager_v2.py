@@ -4034,6 +4034,15 @@ class KVCacheManagerV2(BaseResourceManager):
         self._disagg_receive_ready[req.py_request_id] = ready
         return True
 
+    def take_disagg_receive_ready(self, req: LlmRequest) -> torch.cuda.Event | None:
+        """Hand over the readiness event recorded at ``req``'s disagg admission.
+
+        The caller then owns the ordering guarantee: the receive destination
+        may be published only after the event completes. ``prepare_resources``
+        does not wait on a taken event.
+        """
+        return self._disagg_receive_ready.pop(req.py_request_id, None)
+
     def get_history_length(self, req: LlmRequest) -> int | None:
         """Return the cache's current history_length, or None if no cache.
 
@@ -5287,6 +5296,14 @@ class KVCacheManagerV2(BaseResourceManager):
 
         return kv_cache_stats
 
+    def get_primary_block_counts(self) -> tuple[int, int]:
+        """Return used and total primary-tier blocks for routing-load sampling."""
+        stats = self._get_storage_statistics(GPU_LEVEL)
+        return (
+            sum(pool.total - pool.available for pool in stats),
+            sum(pool.total for pool in stats),
+        )
+
     def flush_iteration_events(self):
         event_manager = self.event_manager
         if event_manager is not None:
@@ -5522,10 +5539,8 @@ class KVCacheManagerV2(BaseResourceManager):
             req.paged_kv_block_ids = []
             if prepare_resource:
                 expected_prompt_length = token_num - 1 if is_gen else token_num
-                # Dummy/warmup request. ``stop_committing()`` below blocks all
-                # writes to the radix tree, so the choice of branch does not
-                # affect committed state. ``cache_salt`` is left defaulted
-                # to None to avoid coupling synthetic data to any salted branch.
+                # Dummy/warmup request. Its reuse scope must be separate from
+                # real requests because a real prefix may already be cached.
                 kv_cache = self._create_kv_cache(
                     req.py_request_id,
                     req.lora_task_id,
@@ -5562,7 +5577,7 @@ class KVCacheManagerV2(BaseResourceManager):
                         is_dummy=req.is_dummy,
                         expected_prompt_length=expected_prompt_length,
                     )
-                    # Dummy path: see comment above, no salt.
+                    # Dummy path: use the same isolated reuse scope.
                     if draft_kv_cache is None:
                         release_resources(req)
                         return None
@@ -6362,6 +6377,12 @@ class KVCacheManagerV2(BaseResourceManager):
             # the scheduler next iteration.
             if not kv_cache.is_active:
                 continue
+            if self.kv_cache_type == CacheTypeCpp.CROSS:
+                # The first decoder context writes the entire encoder K/V,
+                # independently of the decoder's context chunk boundaries.
+                self._resize_context_history(req, kv_cache, req.encoder_output_len)
+                kv_cache.enable_swa_scratch_reuse = False
+                continue
             should_block_reuse = (
                 self.enable_block_reuse
                 and self._can_publish_block_reuse
@@ -6397,6 +6418,9 @@ class KVCacheManagerV2(BaseResourceManager):
         attn_metadata: "AttentionMetadata" = None,
         kv_cache_dtype_byte_size: float = None,
     ):
+        if self.kv_cache_type == CacheTypeCpp.CROSS:
+            # Encoder K/V remains fixed throughout decoder generation.
+            return
         if not self.is_draft:
             _update_kv_cache_draft_token_location(
                 self, scheduled_batch, attn_metadata, kv_cache_dtype_byte_size
@@ -6539,7 +6563,10 @@ class KVCacheManagerV2(BaseResourceManager):
                 self.index_mapper.size(),
             )
             return None
-        salt_int = self._derive_reuse_salt(cache_salt)
+        # Synthetic requests use repeated token 1, which can match a real
+        # request's prefix before stop_committing() is called. Salt 0 gives
+        # them a separate reuse scope from ordinary unsalted requests.
+        salt_int = 0 if is_dummy else self._derive_reuse_salt(cache_salt)
         enable_request_stats = enable_request_stats and not is_dummy and not self.is_draft
         priority_kwargs = {}
         if (

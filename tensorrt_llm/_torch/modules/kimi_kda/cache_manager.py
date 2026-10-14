@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import sys
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 
 import torch
@@ -296,6 +297,10 @@ class KDAReplayState:
     ) -> None:
         self._stochastic_rounding = stochastic_rounding
         self.num_speculative_tokens = num_speculative_tokens
+        self.suspended_requests: set[int] = set()
+        self.acceptance_pending: set[int] = set()
+        self.unseeded_requests: set[int] = set()
+        self._ssm_states: tuple[torch.Tensor, ...] = ()
         self._conv_states: tuple[torch.Tensor, ...] = ()
         self._committed_window = 0
         self.prev_num_accepted_tokens: torch.Tensor | None = None
@@ -403,6 +408,7 @@ class KDAReplayState:
             + context.mapping.rank * 1_009
         )
         self._conv_section_dims = context.conv_section_dims
+        self._ssm_states = tuple(ssm_states)
         self._conv_states = tuple(conv_states)
         self._committed_window = context.conv_state_shape[1] if conv_states else 0
         states = ssm_states
@@ -576,6 +582,82 @@ class KDAReplayState:
             accepted = torch.where(is_dummy_request, current, accepted)
         self.prev_num_accepted_tokens[slots] = accepted
 
+    @staticmethod
+    @contextmanager
+    def on_cache_stream(stream):
+        """Order replay commits and seeding against V2 page migration."""
+        current = torch.cuda.current_stream()
+        stream.wait_stream(current)
+        with torch.cuda.stream(stream):
+            yield
+        current.wait_stream(stream)
+
+    def prepare_suspend(self, manager: MambaHybridCacheManagerV2, request) -> None:
+        """Commit pending drafts and conv history before releasing a request's slot."""
+        request_id = request.py_request_id
+        cache = manager.kv_cache_map.get(request_id)
+        slot = manager._request_id_to_state_index.get(request_id, -1)
+        if slot < 0 or cache is None or not cache.is_active:
+            return
+        if request_id in self.acceptance_pending:
+            raise RuntimeError(
+                f"Request {request_id} is being suspended before update_resources "
+                "recorded the acceptance of its last verify, so its pending KDA drafts are unknown"
+            )
+        if request_id in self.unseeded_requests:
+            self.unseeded_requests.remove(request_id)
+        else:
+            with self.on_cache_stream(manager._stream):
+                self.commit_pending_drafts(slot)
+        del manager._request_id_to_state_index[request_id]
+        self.suspended_requests.add(request_id)
+
+    def commit_pending_drafts(self, slot: int) -> None:
+        """Fold accepted drafts and the replay conv window into the persistent states."""
+        from ._kda_kernels import commit_kda_pending_drafts
+
+        assert self.prev_num_accepted_tokens is not None
+        slots = torch.full(
+            (1,), slot, dtype=torch.int32, device=self.prev_num_accepted_tokens.device
+        )
+        num_accepted = self.prev_num_accepted_tokens.index_select(0, slots)
+        state_tok = getattr(self, "kda_state_tok", None)
+        for layer, (ssm_states, conv_states) in enumerate(zip(self._ssm_states, self._conv_states)):
+            commit_kda_pending_drafts(
+                ssm_states,
+                conv_states,
+                self.kda_conv_q[layer],
+                self.kda_conv_k[layer],
+                self.kda_conv_v[layer],
+                self.kda_qkg_cache[layer],
+                self.kda_v_cache[layer],
+                self.kda_beta_cache[layer],
+                slots,
+                num_accepted,
+                state_tok=state_tok[layer] if state_tok is not None else None,
+            )
+        self.prev_num_accepted_tokens[slot] = 0
+
+    def seed_resumed_requests(
+        self, manager: MambaHybridCacheManagerV2, requests, num_contexts: int
+    ) -> None:
+        """Rebuild replay history from the V2 state restored for resumed generation."""
+        self.suspended_requests.difference_update(
+            request.py_request_id for request in requests[:num_contexts]
+        )
+        slots = []
+        for request in requests[num_contexts:]:
+            if request.py_request_id in self.suspended_requests:
+                self.suspended_requests.remove(request.py_request_id)
+                slots.append(manager._request_id_to_state_index[request.py_request_id])
+        if slots:
+            with self.on_cache_stream(manager._stream):
+                self.seed_transferred_slots(
+                    torch.tensor(
+                        slots, dtype=torch.long, device=self.prev_num_accepted_tokens.device
+                    )
+                )
+
     def _layer_replay_buffers(self) -> tuple[torch.Tensor, ...]:
         buffers = (
             self.kda_conv_q,
@@ -590,7 +672,11 @@ class KDAReplayState:
         return tuple(buffer for buffer in buffers if buffer is not None)
 
     def shutdown(self) -> None:
+        self._ssm_states = ()
         self._conv_states = ()
+        self.suspended_requests.clear()
+        self.acceptance_pending.clear()
+        self.unseeded_requests.clear()
         self.prev_num_accepted_tokens = None
         self.kda_conv_q = None
         self.kda_conv_k = None
@@ -676,6 +762,64 @@ class KimiK3HybridCacheManager(MambaHybridCacheManagerV2):
         return self._kda_replay is not None
 
     @override
+    def _build_cache_config(self, config):
+        if (
+            self._kda_replay is not None
+            and self.local_num_mamba_layers > 0
+            and self.kv_cache_config.enable_kv_pool_rebalance
+        ):
+            raise ValueError(
+                "KDA replay caches are sized once from the SSM pool's slot count, "
+                "and a rebalance can grow that pool past them: set "
+                "kv_cache_config.enable_kv_pool_rebalance=False."
+            )
+        return super()._build_cache_config(config)
+
+    @override
+    def suspend_request(self, request) -> None:
+        if self._kda_replay is not None:
+            self._kda_replay.prepare_suspend(self, request)
+        super().suspend_request(request)
+
+    @override
+    def _setup_state_indices(self, requests, num_contexts: int = 0) -> None:
+        super()._setup_state_indices(requests, num_contexts)
+        if self._kda_replay is not None and self.local_num_mamba_layers > 0:
+            self._kda_replay.seed_resumed_requests(self, requests, num_contexts)
+
+    @override
+    def prepare_resources(self, scheduled_batch) -> None:
+        super().prepare_resources(scheduled_batch)
+        replay = self._kda_replay
+        if replay is None or self.local_num_mamba_layers == 0:
+            return
+        replay.unseeded_requests.update(
+            request.py_request_id
+            for request in scheduled_batch.context_requests
+            if request.is_disagg_generation_init_state
+        )
+        if getattr(self.spec_config, "decoding_type", None) == "NGram":
+            replay.acceptance_pending.update(
+                request.py_request_id
+                for request in scheduled_batch.generation_requests
+                if not request.is_dummy
+            )
+
+    @override
+    def revert_allocate_generation(self, request) -> None:
+        if self._kda_replay is not None:
+            self._kda_replay.acceptance_pending.discard(request.py_request_id)
+        super().revert_allocate_generation(request)
+
+    @override
+    def free_resources(self, request, pin_on_release: bool = False) -> None:
+        if self._kda_replay is not None:
+            self._kda_replay.suspended_requests.discard(request.py_request_id)
+            self._kda_replay.acceptance_pending.discard(request.py_request_id)
+            self._kda_replay.unseeded_requests.discard(request.py_request_id)
+        super().free_resources(request, pin_on_release)
+
+    @override
     def _extra_scratch_bytes_per_slot(self) -> int:
         if self._kda_replay is None:
             return 0
@@ -718,6 +862,9 @@ class KimiK3HybridCacheManager(MambaHybridCacheManagerV2):
         if replay.prev_num_accepted_tokens is None:
             return
         generation_requests = scheduled_batch.generation_requests
+        replay.acceptance_pending.difference_update(
+            request.py_request_id for request in generation_requests
+        )
         drafted_requests = [
             request
             for request in generation_requests
@@ -760,6 +907,7 @@ class KimiK3HybridCacheManager(MambaHybridCacheManagerV2):
         replay = self._kda_replay
         if replay is None or replay.prev_num_accepted_tokens is None:
             return
+        replay.unseeded_requests.difference_update(request_ids)
         slots = sorted(
             {
                 self._request_id_to_state_index[request_id]

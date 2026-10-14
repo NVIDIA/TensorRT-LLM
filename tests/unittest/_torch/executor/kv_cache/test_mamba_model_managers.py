@@ -72,9 +72,8 @@ def test_model_managers_inherit_the_common_lifecycle(manager_cls):
     assert manager_cls.__bases__ == (MambaHybridCacheManagerV2,)
     for method in (
         "try_commit_blocks",
-        "prepare_resources",
-        "_setup_state_indices",
-        "free_resources",
+        "_get_quota_from_max_tokens",
+        "_setup_state_pool",
     ):
         assert getattr(manager_cls, method) is getattr(MambaHybridCacheManagerV2, method)
 

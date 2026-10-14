@@ -24,7 +24,7 @@ from pydantic import field_validator
 from tensorrt_llm.llmapi.utils import StrictBaseModel
 
 if TYPE_CHECKING:
-    from tensorrt_llm._torch.visual_gen.attention_backend.sparse.sol.params import SolParams
+    from tensorrt_llm._torch.visual_gen.attention.backends.sparse.sol.params import SolParams
 
 
 class BaseSparseAttentionConfig(StrictBaseModel):
@@ -257,7 +257,7 @@ class SolAttentionConfig(BaseSparseAttentionConfig):
       dense attention and are counted; GQA/MQA raises at construction.
 
     Context parallelism (cp_size > 1) is rejected for both backends in
-    visual_gen/modules/attention.py.
+    visual_gen/attention/attention.py.
     """
 
     algorithm: Literal["sol_attn"] = "sol_attn"
@@ -314,7 +314,7 @@ class SolAttentionConfig(BaseSparseAttentionConfig):
     def to_sparse_params(self, **kwargs: Any) -> "SolParams":
         """Lower the public recipe into the SOL parameters shared by both backends."""
         del kwargs
-        from tensorrt_llm._torch.visual_gen.attention_backend.sparse.sol.params import SolParams
+        from tensorrt_llm._torch.visual_gen.attention.backends.sparse.sol.params import SolParams
 
         return SolParams(
             tau=self.tau,

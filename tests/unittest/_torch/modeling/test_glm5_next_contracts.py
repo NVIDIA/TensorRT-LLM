@@ -233,6 +233,11 @@ def test_mixed_processor_matches_separate_inputs(tensor_images):
             )
 
 
+def _materialize_meta(module: torch.nn.Module) -> None:
+    """Allocate meta tensors on CUDA as ModelLoader does after MetaInitMode construction."""
+    module._apply(lambda t: torch.empty_like(t, device="cuda") if t.is_meta else t)
+
+
 def _config():
     config = PretrainedConfig(
         model_type="glm5_next",
@@ -417,6 +422,303 @@ def test_checkpoint_routes_vision_and_optional_mtp_separately():
     for invalid in (-1, 2):
         with pytest.raises(ValueError, match=f"cannot load {invalid} MTP layers"):
             audit_glm5_next_checkpoint(keys, config, num_mtp_layers=invalid)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_nvfp4_loader_preserves_calibrated_scales():
+    from tensorrt_llm._torch.models.modeling_utils import MetaInitMode
+    from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
+    from tensorrt_llm._utils import get_sm_version
+    from tensorrt_llm.models.modeling_utils import QuantConfig
+    from tensorrt_llm.quantization.mode import QuantAlgo
+
+    if get_sm_version() not in (100, 103):
+        pytest.skip("NVFP4 comparison requires SM100/103")
+    config = ModelConfig(quant_config=QuantConfig(quant_algo=QuantAlgo.NVFP4, group_size=16))
+
+    def build():
+        return GatedMLP(
+            hidden_size=128,
+            intermediate_size=256,
+            bias=False,
+            dtype=torch.bfloat16,
+            config=config,
+            swiglu_limit=7.0,
+        )
+
+    with torch.device("cuda"):
+        reference = build()
+        # The model loader path: meta construction, then uninitialized allocation.
+        with MetaInitMode():
+            actual = build()
+    _materialize_meta(actual)
+    generator = torch.Generator().manual_seed(19136)
+    groups = {}
+    for name, rows, cols in (
+        ("gate_proj", 256, 128),
+        ("up_proj", 256, 128),
+        ("down_proj", 128, 256),
+    ):
+        groups[name] = {
+            "weight": torch.randint(
+                0, 256, (rows, cols // 2), dtype=torch.uint8, generator=generator
+            ),
+            "weight_scale": torch.ones(rows, cols // 16, dtype=torch.float8_e4m3fn),
+            "input_scale": torch.tensor(0.01),
+            "weight_scale_2": torch.tensor(0.02),
+        }
+    reference.gate_up_proj.load_weights([groups["gate_proj"], groups["up_proj"]])
+    reference.down_proj.load_weights([groups["down_proj"]])
+    weights = {
+        f"{name}.{label}": tensor
+        for name, group in groups.items()
+        for label, tensor in group.items()
+    }
+    Glm5NextForCausalLM._fill_module(
+        None, actual, "dense", "", [(key, key) for key in weights], weights, torch.device("cuda")
+    )
+    for name in ("gate_up_proj", "down_proj"):
+        loaded, expected = getattr(actual, name), getattr(reference, name)
+        for scale in ("input_scale", "weight_scale_2", "alpha"):
+            torch.testing.assert_close(getattr(loaded, scale), getattr(expected, scale))
+            assert torch.all(getattr(loaded, scale) > 0)
+        # No KV scales in the checkpoint: they keep their construction value.
+        for scale in ("kv_scales", "inv_kv_scales"):
+            torch.testing.assert_close(
+                getattr(loaded, scale), torch.ones_like(getattr(loaded, scale))
+            )
+    x = torch.randn(8, 128, generator=generator, dtype=torch.bfloat16).cuda()
+    torch.testing.assert_close(actual(x), reference(x), atol=0, rtol=0)
+
+
+@pytest.mark.cpu_only
+def test_checkpoint_lazy_scalar_materialization(tmp_path) -> None:
+    from safetensors import safe_open
+    from safetensors.torch import save_file
+
+    expected = {
+        "weight": torch.arange(6, dtype=torch.float32).reshape(2, 3),
+        "input_scale": torch.tensor(0.01),
+    }
+    path = tmp_path / "scalar.safetensors"
+    save_file(expected, path)
+    module = torch.nn.Module()
+    for name, tensor in expected.items():
+        module.register_parameter(
+            name, torch.nn.Parameter(torch.empty_like(tensor), requires_grad=False)
+        )
+    with safe_open(path, framework="pt") as checkpoint:
+        weights = {key: checkpoint.get_slice(key) for key in checkpoint.keys()}
+        Glm5NextForCausalLM._fill_module(
+            None,
+            module,
+            "scalar",
+            "",
+            [(key, key) for key in weights],
+            weights,
+            torch.device("cpu"),
+        )
+    for name, tensor in expected.items():
+        torch.testing.assert_close(getattr(module, name), tensor, rtol=0, atol=0)
+
+
+@pytest.mark.cpu_only
+def test_nvfp4_moe_loader_collects_local_expert_tensors() -> None:
+    from tensorrt_llm.models.modeling_utils import QuantConfig
+    from tensorrt_llm.quantization.mode import QuantAlgo
+
+    owner = torch.nn.Module()
+    owner.mlp = torch.nn.Module()
+    owner.mlp.experts = experts = torch.nn.Module()
+    # This EP rank owns experts 0 and 2 of 4.
+    experts.initial_local_expert_ids = [0, 2]
+    experts.quant_config = QuantConfig(quant_algo=QuantAlgo.NVFP4, group_size=16)
+    experts.load_weights = Mock()
+    labels = ("weight", "weight_scale", "weight_scale_2", "input_scale")
+    prefix = "model.layers.3."
+    weights = {
+        f"{prefix}mlp.experts.{expert}.{proj}.{label}": torch.tensor(float(expert))
+        for expert in range(4)
+        for proj in ("gate_proj", "up_proj", "down_proj")
+        for label in labels
+    }
+    entries = [(key, key) for key in weights]
+    Glm5NextForCausalLM._fill_module(None, owner, 3, prefix, entries, weights, torch.device("cpu"))
+    (loaded,), _ = experts.load_weights.call_args
+    proj_to_w = {"gate_proj": "w1", "up_proj": "w3", "down_proj": "w2"}
+    expected = {
+        f"{expert}.{proj_to_w[proj]}.{label}": weights[
+            f"{prefix}mlp.experts.{expert}.{proj}.{label}"
+        ]
+        for expert in (0, 2)
+        for proj in proj_to_w
+        for label in labels
+    }
+    assert loaded == [expected]
+
+    # A missing expert tensor fails with the collected and expected counts.
+    del weights[f"{prefix}mlp.experts.2.down_proj.input_scale"]
+    entries = [(key, key) for key in weights]
+    with pytest.raises(ValueError, match="collected 23 expert tensors, expected 24"):
+        Glm5NextForCausalLM._fill_module(
+            None, owner, 3, prefix, entries, weights, torch.device("cpu")
+        )
+
+
+@pytest.mark.cpu_only
+def test_nvfp4_excluded_layer_keeps_experts_unquantized(monkeypatch) -> None:
+    import importlib
+
+    from tensorrt_llm._torch.models.modeling_glm5_next import Glm5NextMoE
+    from tensorrt_llm._torch.modules import linear
+    from tensorrt_llm.models.modeling_utils import QuantConfig
+    from tensorrt_llm.quantization.mode import QuantAlgo
+
+    # The package re-exports the create_moe function under the submodule's name.
+    create_moe_module = importlib.import_module("tensorrt_llm._torch.moe.fused_moe.create_moe")
+    monkeypatch.setattr(linear, "get_sm_version", lambda: 100)
+    expert_quant = {}
+
+    def fake_create_moe(*, layer_idx, override_quant_config, **_):
+        expert_quant[layer_idx] = override_quant_config
+        return torch.nn.Module()
+
+    monkeypatch.setattr(create_moe_module, "create_moe", fake_create_moe)
+    text = PretrainedConfig(
+        hidden_size=128,
+        moe_intermediate_size=256,
+        n_routed_experts=4,
+        n_shared_experts=1,
+        num_experts_per_tok=2,
+        n_group=1,
+        topk_group=1,
+        routed_scaling_factor=1.0,
+        norm_topk_prob=True,
+        swiglu_limit=10.0,
+    )
+    # Layer 1 is excluded with the text-runtime name the model rewrites
+    # checkpoint exclusions to.
+    config = ModelConfig(
+        pretrained_config=text,
+        moe_backend="CUTLASS",
+        quant_config=QuantConfig(
+            quant_algo=QuantAlgo.NVFP4, group_size=16, exclude_modules=["model.layers.1.*"]
+        ),
+    )
+    for layer_idx in (0, 1):
+        Glm5NextMoE(text, config, layer_idx)
+    assert expert_quant[0].quant_algo == QuantAlgo.NVFP4
+    assert expert_quant[1].quant_algo is None
+
+
+@pytest.mark.cpu_only
+def test_text_quant_config_renames_checkpoint_exclusions() -> None:
+    from tensorrt_llm._torch.models.modeling_glm5_next import glm5_next_text_quant_config
+    from tensorrt_llm.models.modeling_utils import QuantConfig
+    from tensorrt_llm.quantization.mode import QuantAlgo
+
+    checkpoint_exclusions = [
+        "lm_head",
+        "model.language_model.layers.3.self_attn*",
+        "model.language_model.layers.45*",
+        "model.visual*",
+    ]
+    config = ModelConfig(
+        quant_config=QuantConfig(
+            quant_algo=QuantAlgo.NVFP4, group_size=16, exclude_modules=list(checkpoint_exclusions)
+        )
+    )
+    quant = glm5_next_text_quant_config(config).quant_config
+    assert quant.exclude_modules == [
+        "lm_head",
+        "model.layers.3.self_attn*",
+        "model.layers.45*",
+        "model.visual*",
+    ]
+    assert config.quant_config.exclude_modules == checkpoint_exclusions
+    unquantized = ModelConfig(quant_config=QuantConfig())
+    assert glm5_next_text_quant_config(unquantized) is unquantized
+
+
+class _ReplicatedFusionOwner(torch.nn.Module):
+    """An owner whose ``fused`` Linear concatenates two checkpoint projections."""
+
+    FUSED_LINEARS = (("fused", ("first", "second")),)
+
+
+@pytest.mark.cpu_only
+def test_nvfp4_replicated_fusion_is_rejected(monkeypatch) -> None:
+    from tensorrt_llm._torch.modules import linear
+    from tensorrt_llm.models.modeling_utils import QuantConfig
+    from tensorrt_llm.quantization.mode import QuantAlgo
+
+    monkeypatch.setattr(linear, "get_sm_version", lambda: 100)
+    owner = _ReplicatedFusionOwner()
+    owner.fused = linear.Linear(
+        128,
+        256,
+        bias=False,
+        dtype=torch.bfloat16,
+        quant_config=QuantConfig(quant_algo=QuantAlgo.NVFP4, group_size=16),
+        skip_create_weights_in_init=True,
+        reduce_output=False,
+    )
+    weights = {}
+    for name in ("first", "second"):
+        weights[f"{name}.weight"] = torch.zeros(128, 64, dtype=torch.uint8)
+        weights[f"{name}.weight_scale"] = torch.ones(128, 8, dtype=torch.float8_e4m3fn)
+        weights[f"{name}.weight_scale_2"] = torch.tensor(0.02)
+        weights[f"{name}.input_scale"] = torch.tensor(0.01)
+    with patch.object(owner.fused, "load_weights") as load:
+        with pytest.raises(ValueError, match="cannot fuse NVFP4 projections into 'fused'"):
+            Glm5NextForCausalLM._fill_module(
+                None,
+                owner,
+                "replicated",
+                "",
+                [(key, key) for key in weights],
+                weights,
+                torch.device("cpu"),
+            )
+        load.assert_not_called()
+
+
+@pytest.mark.cpu_only
+def test_nvfp4_loader_rejects_missing_scales(monkeypatch) -> None:
+    from tensorrt_llm._torch.modules import linear
+    from tensorrt_llm.models.modeling_utils import QuantConfig
+    from tensorrt_llm.quantization.mode import QuantAlgo
+
+    monkeypatch.setattr(linear, "get_sm_version", lambda: 100)
+    projection = linear.Linear(
+        128,
+        128,
+        bias=False,
+        dtype=torch.bfloat16,
+        quant_config=QuantConfig(quant_algo=QuantAlgo.NVFP4, group_size=16),
+        skip_create_weights_in_init=True,
+        reduce_output=False,
+    )
+    weights = {
+        "weight": torch.zeros(128, 64, dtype=torch.uint8),
+        "weight_scale": torch.ones(128, 8, dtype=torch.float8_e4m3fn),
+        "weight_scale_2": torch.tensor(0.02),
+        "input_scale": torch.tensor(0.01),
+    }
+    missing = "weight_scale_2"
+    del weights[missing]
+    with patch.object(projection, "load_weights") as load:
+        with pytest.raises(ValueError, match=f"NVFP4 projection .*missing.*{missing}"):
+            Glm5NextForCausalLM._fill_module(
+                None,
+                projection,
+                "projection",
+                "",
+                [(key, key) for key in weights],
+                weights,
+                torch.device("cpu"),
+            )
+        load.assert_not_called()
 
 
 @pytest.mark.cpu_only
