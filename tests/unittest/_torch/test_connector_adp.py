@@ -26,6 +26,7 @@ from tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector import (
     SchedulerOutput,
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+from tensorrt_llm._torch.pyexecutor.kv_cache_load import KvLoadTracker
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.llmapi.llm_args import KvCacheConnectorConfig
@@ -83,6 +84,8 @@ def _configure_recovery_controls(executor: "PyExecutor") -> None:
     executor.enable_attention_dp = True
     executor.kv_connector_manager = None
     executor._is_kv_manager_v2 = False
+    executor._kv_load_tracker = KvLoadTracker(None, rank=0, enabled=False)
+    executor._kv_cache_capacity = {}
     executor._kv_connector_failed = False
     executor._kv_connector_has_pending = False
     executor.active_requests = []
