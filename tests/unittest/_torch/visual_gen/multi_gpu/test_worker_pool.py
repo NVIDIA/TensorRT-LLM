@@ -16,6 +16,7 @@ import signal
 import subprocess
 import sys
 import time
+from pathlib import Path
 
 import pytest
 import torch.distributed as dist
@@ -278,7 +279,11 @@ while not all(os.path.exists({p!r} + f".{{r}}") for r in range(2)):
 print("READY", flush=True)
 signal.pause()
 """
-    env = dict(os.environ, PYTHONPATH=os.pathsep.join(sys.path))
+    # Only what the owner needs: the package root (multi_gpu) and tests/ (test_common).
+    # Handing it the whole sys.path can make defs.common importable, which drags the
+    # full library import into the owner before it prints READY.
+    here = Path(__file__).resolve()
+    env = dict(os.environ, PYTHONPATH=os.pathsep.join([str(here.parents[1]), str(here.parents[4])]))
     owner = subprocess.Popen(
         [sys.executable, "-c", script], env=env, stdout=subprocess.PIPE, bufsize=0
     )
