@@ -1,8 +1,11 @@
 #!/bin/bash
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 set -ex
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Authenticate the github.com clone below; no-op when no token is available.
-source "$(dirname "${BASH_SOURCE[0]}")/github_auth.sh"
+source "${SCRIPT_DIR}/github_auth.sh"
 
 GITHUB_URL="https://github.com"
 UCX_INSTALL_PATH="/usr/local/ucx/"
@@ -40,6 +43,7 @@ pip3 install meson ninja pybind11 setuptools
 
 git clone --depth 1 -b ${NIXL_VERSION} ${NIXL_REPO}
 cd nixl
+git apply "${SCRIPT_DIR}/patches/nixl-v1.4.0-cuda-vmm-context.patch"
 
 CUDA_SO_PATH=$(find "/usr/local" -name "libcuda.so.1" 2>/dev/null | head -n1)
 
