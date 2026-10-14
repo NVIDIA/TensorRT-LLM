@@ -654,6 +654,73 @@ def test_subset_tensor_parallel_text_encoder_skips_nonparticipant_rank(
     assert pipeline.text_encoder is None
 
 
+def test_tensor_parallel_text_encoder_encode_does_not_require_hf_config() -> None:
+    pipeline = _SyntheticMiniMaxH3Pipeline()
+    pipeline.pipeline_config.torch_dtype = torch.float32
+    pipeline.text_encoder_tp_size = 2
+    calls = []
+
+    class FakeTensorParallelTextEncoder:
+        def encode(self, input_ids: torch.Tensor) -> torch.Tensor:
+            calls.append(input_ids.clone())
+            return torch.ones(1, input_ids.numel(), 4)
+
+    pipeline.text_encoder = FakeTensorParallelTextEncoder()
+
+    encoded = pipeline._encode_text_tokens([11, 12], {})
+
+    assert encoded.shape == (1, 2, 4)
+    assert torch.equal(calls[0], torch.tensor([[11, 12]]))
+
+
+def test_tensor_parallel_text_encoder_rejects_qwen_vision_inputs() -> None:
+    pipeline = _SyntheticMiniMaxH3Pipeline()
+    pipeline.pipeline_config.torch_dtype = torch.float32
+    pipeline.text_encoder_tp_size = 2
+    pipeline.text_encoder = SimpleNamespace(encode=lambda input_ids: torch.ones(1, 1, 4))
+
+    with pytest.raises(NotImplementedError, match="vision inputs"):
+        pipeline._encode_text_tokens([11], {"pixel_values": torch.zeros(1)})
+
+
+def test_ref2va_text_encoding_uses_broadcast_on_non_owner_rank(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pipeline = _SyntheticMiniMaxH3Pipeline()
+    pipeline.pipeline_config.torch_dtype = torch.float32
+    pipeline.text_encoder_tp_size = 1
+    sentinel = torch.full((1, 2, 4), 3.0)
+    calls = []
+
+    monkeypatch.setattr(MiniMaxH3Pipeline, "rank", property(lambda self: 1))
+    monkeypatch.setattr(MiniMaxH3Pipeline, "world_size", property(lambda self: 2))
+    monkeypatch.setattr(
+        pipeline,
+        "_encode_text_tokens",
+        lambda token_ids, vision_inputs: calls.append((token_ids, vision_inputs)),
+    )
+
+    def broadcast(tensor: torch.Tensor | None, *, dtype: torch.dtype) -> torch.Tensor:
+        calls.append(("broadcast", tensor, dtype))
+        return sentinel
+
+    monkeypatch.setattr(pipeline, "_broadcast_tensor_from_rank0", broadcast)
+
+    encoded = pipeline._encode_reference_text_tokens([11, 12], {})
+
+    assert encoded is sentinel
+    assert calls == [("broadcast", None, torch.float32)]
+
+
+def test_ref2va_tensor_parallel_text_encoder_rejects_vision_inputs() -> None:
+    pipeline = _SyntheticMiniMaxH3Pipeline()
+    pipeline.pipeline_config.torch_dtype = torch.float32
+    pipeline.text_encoder_tp_size = 2
+
+    with pytest.raises(NotImplementedError, match="Ref2VA"):
+        pipeline._encode_reference_text_tokens([11], {"pixel_values": torch.zeros(1)})
+
+
 def test_minimax_rejects_dit_tensor_parallelism() -> None:
     config = SimpleNamespace(
         mapping=SimpleNamespace(world_size=2, tp_size=2),

@@ -417,9 +417,11 @@ class ParallelConfig(StrictBaseModel):
         ge=1,
         status="prototype",
         description=(
-            "Text encoder tensor-parallel group size. MiniMax-H3 shards "
-            "its Qwen3-VL text encoder across ranks "
-            "[0, text_encoder_tp_size), then rank 0 broadcasts prompt "
+            "Text encoder tensor-parallel group size. Currently MiniMax-H3 "
+            "only: text-only prompts shard the Qwen3-VL text encoder across "
+            "ranks [0, text_encoder_tp_size), while Ref2VA or FL2VA requests "
+            "with Qwen vision inputs must use text_encoder_tp_size=1. "
+            "The rank 0 worker broadcasts prompt "
             "embeddings to the remaining ranks."
         ),
     )
