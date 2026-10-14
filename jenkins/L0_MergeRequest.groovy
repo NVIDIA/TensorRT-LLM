@@ -2285,6 +2285,10 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
     def releaseTargets = globalVars[RELEASE_TARGET] ?: []
     def wheelSelected = releaseTargets.contains("wheel")
     def containerSelected = releaseTargets.contains("container")
+    def imageTriggerType = runMode == "nightly_release" ? "nightly-release" :
+        (env.JOB_NAME ==~ /.*PostMerge.*/ ? "post-merge" : "pre-merge")
+    // Filled after stage selection, before any of these closures run.
+    def buildStageWheelPlan = [:]
     stages = [
         "Release-Check": {
             script {
@@ -2359,6 +2363,10 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
         },
         "x86_64-Linux": {
             script {
+                if (!buildStageWheelPlan.x86_64) {
+                    echo "x86_64 build job is not scheduled to produce a build-stage wheel"
+                    return
+                }
                 // CBTS deliberately does NOT short-circuit at the arch / Build
                 // layer. Build normally runs so a wheel exists for sanity checks
                 // and post-merge consumers; case-level narrowing happens later
@@ -2550,7 +2558,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
         },
         "SBSA-Linux": {
             script {
-                if (testFilter[(ONLY_ONE_GROUP_CHANGED)] == "Docs") {
+                if (!buildStageWheelPlan.sbsa) {
                     echo "SBSA build job is skipped due to Jenkins configuration or conditional pipeline run"
                     return
                 }
@@ -2784,9 +2792,8 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                         def additionalParameters = [
                             'branch': branch,
                             'action': "push",
-                            'triggerType': runMode == "nightly_release" ?
-                                "nightly-release" :
-                                (env.JOB_NAME ==~ /.*PostMerge.*/ ? "post-merge" : "pre-merge"),
+                            'triggerType': imageTriggerType,
+                            'buildStageWheelPlan': writeJSON(returnText: true, json: buildStageWheelPlan),
                             'runSanityCheck': env.JOB_NAME ==~ /.*PostMerge.*/,
                             'defaultTag': defaultTag,
                             'program_version_name': env.NSPECT_RELEASE_VERSION,
@@ -2808,8 +2815,9 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                             // this build starts, so depending on them would serialize
                             // every release behind a multi-hour GPU job. Inert on
                             // x86_64 (no promoted bundle) and whenever the wheel is
-                            // built from source rather than downloaded.
-                            'boltOptimizeWheel': true,
+                            // built from source rather than downloaded. Pre-merge
+                            // staging without a producer builds an unoptimized wheel.
+                            'boltOptimizeWheel': imageTriggerType != "pre-merge" || buildStageWheelPlan.sbsa,
                         ]
                         if (runMode == "nightly_release") {
                             additionalParameters += [
@@ -2861,20 +2869,19 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                             'action': "push",
                             'triggerType': runMode == "nightly_release" ?
                                 "nightly-release" : "post-merge",
+                            'buildStageWheelPlan': writeJSON(returnText: true, json: buildStageWheelPlan),
                             'runSanityCheck': runMode == "nightly_release",
                             'defaultTag': defaultTag,
                             'buildInternalRelease': false,
                             'buildCiImage': false,
                             'artifactPath': ARTIFACT_PATH,
                             'uploadPath': UPLOAD_PATH,
-                            // Must match Build-Docker-Images above: this path pushes the
-                            // same tags, so the scanned+registered image has to be the
-                            // BOLTed canonical one rather than a plain build, built on
-                            // the BOLT-optimized wheel rather than the first tarball to
-                            // appear.
+                            // Match the profile and wheel policy of Build-Docker-Images.
+                            // Keep the trigger above for the PLC registry routing;
+                            // wheel BOLT follows the actual parent build context.
                             'boltOverlayEnabled': true,
                             'boltProfilesRequired': true,
-                            'boltOptimizeWheel': true,
+                            'boltOptimizeWheel': imageTriggerType != "pre-merge" || buildStageWheelPlan.sbsa,
                         ]
                         if (runMode == "nightly_release") {
                             additionalParameters += [
@@ -2978,6 +2985,14 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
             echo "Will run job to build ngc containers and running in-pipeline scanning for them"
         }
     }
+
+    // Reused builds also produce packages here: Build.groovy copies cached
+    // artifacts to this run's UPLOAD_PATH, rebuilding if the copy fails.
+    buildStageWheelPlan = [
+        x86_64: stages.containsKey("x86_64-Linux"),
+        sbsa: stages.containsKey("SBSA-Linux") && testFilter[ONLY_ONE_GROUP_CHANGED] != "Docs",
+    ]
+    echo "Build-stage wheel plan for ${UPLOAD_PATH}: ${buildStageWheelPlan}"
 
     parallelJobs = stages.collectEntries{key, value -> [key, {
         script {
