@@ -23,7 +23,7 @@ def createKubernetesPodConfig()
                   nvidia.com/node_type: builder
                   kubernetes.io/os: linux"""
     def image = "artifactory.pdx.nvidia.com/docker-remote/ubuntu:24.04"
-    def jnlpImage = "artifactory.pdx.nvidia.com/sw-ipp-blossom-sre-docker-local/lambda/custom_jnlp_images_amd_linux:jdk17"
+    def jnlpImage = "artifactory.nvidia.com/sw-ipp-blossom-sre-docker-local/lambda/custom_jnlp_images_amd_linux:jdk17"
     // release mode requires a longer pod lifetime to survive the manual license review window
     def scannerSleepSeconds = (params?.scanMode == 'release') ? '345600' : '7200'
     def podConfig = [
