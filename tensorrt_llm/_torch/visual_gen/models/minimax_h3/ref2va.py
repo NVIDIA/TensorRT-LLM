@@ -353,7 +353,7 @@ def prepare_references(
     ids, tags = _build_presentation(
         pipeline.tokenizer, prompt, references, image_counts, video_counts, timestamps
     )
-    prompt_embeds = pipeline._encode_text_tokens(ids, vision)
+    prompt_embeds = pipeline._encode_reference_text_tokens(ids, vision)
     visual_latents, audio_latents = [], []
     audio_mean = torch.tensor(pipeline.audio_vae.config.latents_mean).view(1, 1, -1)
     audio_std = torch.tensor(pipeline.audio_vae.config.latents_std).view(1, 1, -1)
