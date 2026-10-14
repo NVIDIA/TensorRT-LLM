@@ -14,8 +14,8 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager, nullcontext
 from enum import IntEnum
 from queue import Queue
-from typing import (TYPE_CHECKING, Dict, Iterable, Iterator, List, Literal,
-                    Optional, Tuple, Union)
+from typing import (TYPE_CHECKING, Callable, Dict, Iterable, Iterator, List,
+                    Literal, Optional, Tuple, Union)
 
 import torch
 from strenum import StrEnum
@@ -193,9 +193,10 @@ PROFILE_LOG_RANKS_ENV_VAR_NAME = "TLLM_PROFILE_LOG_RANKS"
 _UNBOUNDED_PAUSE_MAX_INPUT_LEN = 0x7fffffff
 
 # Period of the native MPI progress thread that pipeline-parallel ranks run;
-# a value <= 0 disables the thread.
+# a value <= 0 disables the thread, and a value above the maximum is malformed.
 PP_MPI_PROGRESS_INTERVAL_US_ENV_VAR_NAME = "TLLM_PP_MPI_PROGRESS_INTERVAL_US"
 DEFAULT_PP_MPI_PROGRESS_INTERVAL_US = 5000
+MAX_PP_MPI_PROGRESS_INTERVAL_US = 1_000_000
 
 
 def _resolve_pp_mpi_progress_interval_us() -> int:
@@ -203,12 +204,17 @@ def _resolve_pp_mpi_progress_interval_us() -> int:
     if raw is None:
         return DEFAULT_PP_MPI_PROGRESS_INTERVAL_US
     try:
-        return int(raw)
+        interval_us = int(raw)
     except ValueError:
+        interval_us = None
+    if interval_us is None or interval_us > MAX_PP_MPI_PROGRESS_INTERVAL_US:
         logger.error(
             f"Ignoring malformed {PP_MPI_PROGRESS_INTERVAL_US_ENV_VAR_NAME}="
-            f"{raw!r}; using {DEFAULT_PP_MPI_PROGRESS_INTERVAL_US} us.")
+            f"{raw!r} (expected an integer up to "
+            f"{MAX_PP_MPI_PROGRESS_INTERVAL_US}); using "
+            f"{DEFAULT_PP_MPI_PROGRESS_INTERVAL_US} us.")
         return DEFAULT_PP_MPI_PROGRESS_INTERVAL_US
+    return interval_us
 
 
 class _SleepWakeupTag(IntEnum):
@@ -1069,6 +1075,9 @@ class PyExecutor:
         self._pp_mpi_progress_stop = threading.Event()
         self._pp_mpi_progress_quiesced = threading.Event()
         self._mpi_progress_thread: Optional["MpiProgressThread"] = None
+        # The callable registered with atexit for that thread, kept so that
+        # shutdown can unregister it.
+        self._mpi_progress_thread_exit_hook: Optional[Callable[[], None]] = None
         # Secondary MPI communicator and listener thread for multi-rank
         # sleep/wakeup control messages.  Both are None until start_worker()
         # calls Dup() (a collective) on the main thread.
@@ -1514,8 +1523,7 @@ class PyExecutor:
                         )
                         self._sleep_wakeup_listener_thread.start()
                 if self.dist.pp_size > 1 and not self._disable_mpi:
-                    self._mpi_progress_thread = self._start_mpi_progress_thread(
-                    )
+                    self._start_mpi_progress_thread()
                 self.worker_thread = threading.Thread(
                     target=self._event_loop_wrapper, daemon=True)
                 self.worker_thread.start()
@@ -1754,7 +1762,7 @@ class PyExecutor:
         """
         self.executor_request_queue.enqueue_cancel_request(id)
 
-    def _start_mpi_progress_thread(self) -> Optional["MpiProgressThread"]:
+    def _start_mpi_progress_thread(self) -> None:
         """Start a native thread that keeps this rank's MPI sends moving.
 
         Pipeline-parallel ranks post their schedule and sample-state messages
@@ -1766,14 +1774,15 @@ class PyExecutor:
         receives the message, and the pipeline deadlocks. The thread issues a
         non-matching MPI_Iprobe every interval without taking the GIL.
 
-        Returns the thread, or None when it is disabled or unavailable.
+        Leaves ``_mpi_progress_thread`` None when the thread is disabled or
+        unavailable.
         """
         interval_us = _resolve_pp_mpi_progress_interval_us()
         if interval_us <= 0:
             logger.error(
                 f"{PP_MPI_PROGRESS_INTERVAL_US_ENV_VAR_NAME}={interval_us}: the "
                 f"pipeline-parallel MPI progress thread is disabled.")
-            return None
+            return
         from mpi4py import MPI
 
         from tensorrt_llm.bindings import MpiProgressThread
@@ -1784,15 +1793,18 @@ class PyExecutor:
                 "pipeline-parallel MPI progress thread stays off. A rank that "
                 "blocks in a GIL-holding native call while one of its sends "
                 "is in flight can then deadlock the pipeline.")
-            return None
+            return
         thread = MpiProgressThread(mpi_comm().py2f(), interval_us,
                                    int(PPCommTag.MPI_PROGRESS_PROBE))
         # Must stop before MPI_Finalize. mpi4py finalizes MPI from a
-        # Py_AtExit hook, which runs after all atexit handlers.
-        atexit.register(thread.stop)
+        # Py_AtExit hook, which runs after all atexit handlers. Keep the
+        # registered callable: each `thread.stop` access creates a new bound
+        # method, which atexit.unregister would not match.
+        self._mpi_progress_thread = thread
+        self._mpi_progress_thread_exit_hook = thread.stop
+        atexit.register(self._mpi_progress_thread_exit_hook)
         logger.info(f"Started the pipeline-parallel MPI progress thread "
                     f"(interval {interval_us} us).")
-        return thread
 
     def _stop_mpi_progress_thread(self) -> None:
         """Stop the native MPI progress thread if it runs.
@@ -1802,7 +1814,9 @@ class PyExecutor:
         """
         if self._mpi_progress_thread is not None:
             self._mpi_progress_thread.stop()
+            atexit.unregister(self._mpi_progress_thread_exit_hook)
             self._mpi_progress_thread = None
+            self._mpi_progress_thread_exit_hook = None
 
     def shutdown(self):
         """Shut down the terminal executor and all CUDA graphs it owns."""
