@@ -414,6 +414,7 @@ def device_props() -> Dict[str, Any]:
         "minor": p.minor,
         "multi_processor_count": p.multi_processor_count,
         "shared_memory_per_block_optin": p.shared_memory_per_block_optin,
+        "shared_memory_per_multiprocessor": p.shared_memory_per_multiprocessor,
         "name": p.name,
     }
     try:  # the radix top-k cluster kernels clamp their cluster size to this
@@ -423,6 +424,34 @@ def device_props() -> Dict[str, Any]:
     except Exception:  # noqa: BLE001 - CuTe DSL missing, or the query failed
         pass
     return props
+
+
+def _shim_cute_dsl_device_attributes(props: Dict[str, Any]) -> None:
+    """Answer CuTe DSL's own driver queries made while compiling (the shared
+    memory per SM, for kernels with a minimum blocks-per-SM hint) from
+    ``props``; any other attribute raises as it would without a GPU."""
+    try:
+        from cutlass.base_dsl.runtime import cuda as cuda_helpers
+    except ImportError:
+        return
+    attrs = cuda_helpers.cuda.CUdevice_attribute
+    known = {
+        attrs.CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR: props["major"],
+        attrs.CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR: props["minor"],
+        attrs.CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT: props["multi_processor_count"],
+    }
+    if "shared_memory_per_multiprocessor" in props:
+        known[attrs.CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_MULTIPROCESSOR] = props[
+            "shared_memory_per_multiprocessor"
+        ]
+    orig = cuda_helpers.get_device_attribute
+
+    def get_device_attribute(attribute, device_id: int = 0):
+        if attribute in known:
+            return known[attribute]
+        return orig(attribute, device_id)
+
+    cuda_helpers.get_device_attribute = get_device_attribute
 
 
 def install_device_shim(props: Dict[str, Any]) -> None:
@@ -435,6 +464,7 @@ def install_device_shim(props: Dict[str, Any]) -> None:
     torch.cuda.get_device_properties = lambda device=None: ns
     torch.cuda.current_device = lambda: 0
     torch.cuda.get_device_capability = lambda device=None: (props["major"], props["minor"])
+    _shim_cute_dsl_device_attributes(props)
     if "max_cluster_size" in props:
         try:
             from .custom_ops import cute_dsl_custom_ops as ops
