@@ -17,10 +17,10 @@
 
 // Round-trip tests for copyHostToDevice / copyDeviceToHost in kvCacheManagerV2Utils.cu.
 //
-// A call of at most hostCopyDmaMaxTasks() tasks of at least hostCopyDmaMinBytes() each takes the copy-engine path
-// (cuMemcpy{HtoD,DtoH}Async); smaller tasks or larger batches take the batched copy kernel. Both knobs are read once
-// per process, so instead of changing the environment variables mid-process the tests pick sizes and task counts on
-// both sides of the defaults and reach both branches that way.
+// A call whose tasks are at least hostCopyDmaMinBytes() each takes the copy-engine path (one cuMemcpyBatchAsync, or
+// one cuMemcpy{HtoD,DtoH}Async per task on the NULL stream, which the batched call does not accept); smaller tasks take
+// the batched copy kernel. The knob is read once per process, so instead of changing the environment variable
+// mid-process the tests pick sizes on both sides of the default and reach both branches that way.
 
 #include "tensorrt_llm/batch_manager/kvCacheManagerV2Utils.h"
 #include "tensorrt_llm/batch_manager/kv_cache_manager_v2/utils/hostMem.h"
@@ -56,7 +56,6 @@ constexpr size_t kAttentionPageBytes = 884736;
 constexpr size_t kConvStateBytes = 15261696;
 constexpr size_t kSsmStateBytes = 217055232;
 constexpr size_t kDefaultThreshold = size_t{4} << 20; // kvCacheManagerV2Utils.cu default
-constexpr size_t kDefaultMaxTasks = 8;                // kvCacheManagerV2Utils.cu default
 
 struct CudaDeleter
 {
@@ -141,17 +140,6 @@ size_t expectedThresholdFromEnv()
         return kDefaultThreshold;
     }
     return *parsed < 0 ? std::numeric_limits<size_t>::max() : static_cast<size_t>(*parsed);
-}
-
-// What hostCopyDmaMaxTasks() must return for the environment this process started with.
-size_t expectedMaxTasksFromEnv()
-{
-    auto const parsed = integerEnv("TLLM_KV_CACHE_MANAGER_V2_HOST_COPY_DMA_MAX_TASKS");
-    if (!parsed.has_value())
-    {
-        return kDefaultMaxTasks;
-    }
-    return *parsed <= 0 ? std::numeric_limits<size_t>::max() : static_cast<size_t>(*parsed);
 }
 
 void fillPattern(unsigned char* bytes, size_t numBytes, unsigned char seed)
@@ -240,17 +228,12 @@ protected:
 TEST_F(KvCacheManagerV2HostCopyTest, ThresholdFollowsEnvironment)
 {
     EXPECT_EQ(hostCopyDmaMinBytes(), expectedThresholdFromEnv());
-    EXPECT_EQ(hostCopyDmaMaxTasks(), expectedMaxTasksFromEnv());
     bool const chunked = HostMem::shouldUseChunkedRegistration();
     for (size_t numBytes :
         {size_t{16}, kAttentionPageBytes, kDefaultThreshold - 1, kDefaultThreshold, kConvStateBytes, kSsmStateBytes})
     {
-        for (size_t numTasks : {size_t{1}, size_t{2}, kDefaultMaxTasks, kDefaultMaxTasks + 1, size_t{140}})
-        {
-            bool const expected = !chunked && numBytes >= hostCopyDmaMinBytes() && numTasks <= hostCopyDmaMaxTasks();
-            EXPECT_EQ(useCopyEngineForHostCopy(numBytes, numTasks), expected)
-                << "numBytes=" << numBytes << " numTasks=" << numTasks;
-        }
+        bool const expected = !chunked && numBytes >= hostCopyDmaMinBytes();
+        EXPECT_EQ(useCopyEngineForHostCopy(numBytes), expected) << "numBytes=" << numBytes;
     }
 }
 
@@ -280,14 +263,13 @@ TEST_P(HostCopyRoundTripTest, HostToDeviceToHost)
 }
 
 // 300 tasks > 256 covers the kernel path's multi-launch remainder; the state pages take the copy-engine path at
-// the default threshold. (kDefaultThreshold, 8) is the last call on the copy-engine path at the default task
-// limit, (kDefaultThreshold, 9) and (kConvStateBytes, 12) are large-task batches that the task limit keeps on the
-// kernel.
+// the default threshold. (kDefaultThreshold, 8), (kDefaultThreshold, 9) and (kConvStateBytes, 12) are batches of
+// several large tasks that travel in one cuMemcpyBatchAsync.
 INSTANTIATE_TEST_SUITE_P(Shapes, HostCopyRoundTripTest,
     testing::Values(std::make_pair(kAttentionPageBytes, size_t{1}), std::make_pair(kAttentionPageBytes, size_t{140}),
         std::make_pair(kAttentionPageBytes, size_t{300}), std::make_pair(size_t{16}, size_t{300}),
         std::make_pair(kConvStateBytes, size_t{1}), std::make_pair(kSsmStateBytes, size_t{1}),
-        std::make_pair(kDefaultThreshold, kDefaultMaxTasks), std::make_pair(kDefaultThreshold, kDefaultMaxTasks + 1),
+        std::make_pair(kDefaultThreshold, size_t{8}), std::make_pair(kDefaultThreshold, size_t{9}),
         std::make_pair(kConvStateBytes, size_t{12})));
 
 // The kernel requires numBytes % 16 == 0 and rejects anything else with TLLM_CHECK before enqueuing work; the
@@ -298,7 +280,7 @@ TEST_F(KvCacheManagerV2HostCopyTest, NonMultipleOf16)
     size_t const numTasks = 3;
     // Rejected before any CUDA work: the addresses are never dereferenced, so they need not be real.
     size_t const kernelBytes = 24;
-    ASSERT_FALSE(useCopyEngineForHostCopy(kernelBytes, numTasks));
+    ASSERT_FALSE(useCopyEngineForHostCopy(kernelBytes));
     std::vector<MMTask> const tasks(numTasks, MMTask{MemAddress{0x1000}, MemAddress{0x2000}});
     EXPECT_THROW(copyHostToDevice(tasks, static_cast<ssize_t>(kernelBytes), reinterpret_cast<CUstream>(mStream)),
         tensorrt_llm::common::TllmException);
@@ -306,7 +288,7 @@ TEST_F(KvCacheManagerV2HostCopyTest, NonMultipleOf16)
         tensorrt_llm::common::TllmException);
 
     size_t const copyEngineBytes = kDefaultThreshold + 8;
-    if (useCopyEngineForHostCopy(copyEngineBytes, numTasks))
+    if (useCopyEngineForHostCopy(copyEngineBytes))
     {
         roundTrip(copyEngineBytes, numTasks, mStream);
     }
@@ -318,11 +300,13 @@ TEST_F(KvCacheManagerV2HostCopyTest, NonMultipleOf16)
     }
 }
 
-// cuMemcpy{HtoD,DtoH}Async are legal on the NULL stream; the kernel launch is too. Both branches must accept it.
+// The kernel launch is legal on the NULL stream; the copy-engine path falls back to one cuMemcpy{HtoD,DtoH}Async per
+// task there, because cuMemcpyBatchAsync does not accept the legacy NULL stream. Both must round-trip.
 TEST_F(KvCacheManagerV2HostCopyTest, NullStreamAccepted)
 {
     roundTrip(kAttentionPageBytes, 4, nullptr);
     roundTrip(kConvStateBytes, 1, nullptr);
+    roundTrip(kConvStateBytes, 3, nullptr);
 }
 
 // Work queued earlier on the stream must be visible to the copy, and a second stream waiting on an event recorded
@@ -428,7 +412,7 @@ TEST_F(KvCacheManagerV2HostCopyTest, StateSlotBandwidthInfo)
                 copyDeviceToHost(deviceToHost, static_cast<ssize_t>(numBytes), reinterpret_cast<CUstream>(mStream)),
                 CUDA_SUCCESS);
         });
-    bool const copyEngine = useCopyEngineForHostCopy(numBytes, 1);
+    bool const copyEngine = useCopyEngineForHostCopy(numBytes);
     std::cout << "StateSlotBandwidthInfo: " << numBytes << " B page, path=" << (copyEngine ? "copy-engine" : "kernel")
               << ", host->device " << h2d << " GB/s, device->host " << d2h << " GB/s" << std::endl;
     RecordProperty("path", copyEngine ? "copy-engine" : "kernel");

@@ -14,12 +14,11 @@
 # limitations under the License.
 """Round trips through the KVCacheManagerV2 host<->GPU copy helpers on both sides of the copy-engine policy.
 
-copy_host_to_device / copy_device_to_host (kvCacheManagerV2Utils.cu) send a call of at most
-TLLM_KV_CACHE_MANAGER_V2_HOST_COPY_DMA_MAX_TASKS tasks (default 8) of at least
-TLLM_KV_CACHE_MANAGER_V2_HOST_COPY_DMA_MIN_BYTES each (default 4 MiB) to the copy engines and every
-other call to the batched copy kernel; use_copy_engine_for_host_copy() reports the decision for a
-shape. Both knobs are read once per process, so the shapes below sit on both sides of the defaults
-instead of toggling the environment variables. Needs one GPU.
+copy_host_to_device / copy_device_to_host (kvCacheManagerV2Utils.cu) send a call whose tasks are at
+least TLLM_KV_CACHE_MANAGER_V2_HOST_COPY_DMA_MIN_BYTES each (default 4 MiB) to the copy engines, as one
+cuMemcpyBatchAsync, and every other call to the batched copy kernel; use_copy_engine_for_host_copy()
+reports the decision for a task size. The knob is read once per process, so the shapes below sit on
+both sides of the default instead of toggling the environment variable. Needs one GPU.
 """
 
 from random import randbytes
@@ -38,11 +37,11 @@ MemToMemTask = copy_helpers.MemToMemTask
 
 DEFAULT_DMA_MIN_BYTES = 4 << 20
 
-# (num_bytes, num_tasks). Kernel path at the defaults: 884,736 B attention pages, one request's
-# onboard batch of 140 and 300 (more than the 256 tasks of one launch), 300 x 16 B, and
-# 12 x 15,261,696 B (large tasks that the task limit keeps on the kernel). Copy-engine path: one
-# 15,261,696 B conv-state page, one 217,055,232 B SSM-state page, and 3 x (4 MiB + 8 B), a size that
-# is not a multiple of 16 and that only the copy engines accept.
+# (num_bytes, num_tasks). Kernel path at the default: 884,736 B attention pages, one request's
+# onboard batch of 140 and 300 (more than the 256 tasks of one launch), and 300 x 16 B. Copy-engine
+# path: one 15,261,696 B conv-state page, 12 of them in one batched call, one 217,055,232 B SSM-state
+# page, and 3 x (4 MiB + 8 B), a size that is not a multiple of 16 and that only the copy engines
+# accept.
 SHAPES = [
     (884_736, 140),
     (884_736, 300),
@@ -78,16 +77,14 @@ def _check(result: int) -> None:
     assert result == 0, f"copy helper returned CUresult {result}"
 
 
-def test_policy_follows_the_documented_defaults() -> None:
-    """Below the size threshold or above the task limit the kernel is used; the predicate says which."""
+def test_policy_follows_the_documented_default() -> None:
+    """Below the size threshold the kernel is used; the predicate says which path a size takes."""
     selected = copy_helpers.use_copy_engine_for_host_copy
-    assert not selected(884_736, 1)
-    assert not selected(DEFAULT_DMA_MIN_BYTES - 1, 1)
-    # Large tasks, but more of them than the default task limit allows.
-    assert not selected(15_261_696, 12)
-    # The two state pages of one request, one task each, take the copy engines unless this host
-    # registers pinned memory in chunks, in which case the predicate is false for every shape.
-    assert selected(15_261_696, 1) == selected(217_055_232, 1)
+    assert not selected(884_736)
+    assert not selected(DEFAULT_DMA_MIN_BYTES - 1)
+    # The two state pages of one request take the copy engines unless this host registers pinned
+    # memory in chunks, in which case the predicate is false for every size.
+    assert selected(DEFAULT_DMA_MIN_BYTES) == selected(15_261_696) == selected(217_055_232)
 
 
 @pytest.mark.parametrize(("num_bytes", "num_tasks"), SHAPES)
@@ -103,7 +100,7 @@ def test_round_trip(num_bytes: int, num_tasks: int) -> None:
     host_to_device = _tasks(dev, src, num_bytes, num_tasks)
     device_to_host = _tasks(dst, dev, num_bytes, num_tasks)
 
-    if num_bytes % 16 != 0 and not copy_helpers.use_copy_engine_for_host_copy(num_bytes, num_tasks):
+    if num_bytes % 16 != 0 and not copy_helpers.use_copy_engine_for_host_copy(num_bytes):
         # The kernel path requires a multiple of 16 and rejects the call before enqueuing anything.
         with pytest.raises(Exception, match="multiple of 16"):
             copy_helpers.copy_host_to_device(host_to_device, num_bytes, stream.cuda_stream)
@@ -119,7 +116,7 @@ def test_round_trip(num_bytes: int, num_tasks: int) -> None:
 def test_kernel_path_rejects_a_size_that_is_not_a_multiple_of_16() -> None:
     """A size below the threshold always takes the kernel, whose check throws before any CUDA work."""
     num_bytes = 24
-    assert not copy_helpers.use_copy_engine_for_host_copy(num_bytes, 3)
+    assert not copy_helpers.use_copy_engine_for_host_copy(num_bytes)
     # Rejected before the addresses are used, so they need not be real.
     tasks = [MemToMemTask(dst=0x1000, src=0x2000)] * 3
     for helper in (copy_helpers.copy_host_to_device, copy_helpers.copy_device_to_host):
