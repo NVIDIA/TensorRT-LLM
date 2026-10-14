@@ -5475,6 +5475,8 @@ class PyExecutor:
             self.previous_batch.scheduled_requests.all_requests())
         self._flush_pending_transfer_responses()
         self._process_previous_batch()
+        if self.enable_kv_cache_events:
+            self._add_kv_cache_events()
         self.perf_manager.compute_batch_gpu_times(
             self.previous_batch.scheduled_requests.all_requests())
         self.previous_batch = None
@@ -6003,6 +6005,12 @@ class PyExecutor:
                 else:
                     self._enqueue_responses([])
 
+                # KV-cache event flushing performs an attention-DP allgather.
+                # Keep it outside the rank-divergent previous-batch branch so
+                # every rank enters the collective in the same order.
+                if self.enable_kv_cache_events:
+                    self._add_kv_cache_events()
+
                 # Drain buffers from the (per-rank-divergent)
                 # _process_previous_batch above; rank-symmetric companion to
                 # the _enqueue_responses([]) call in the else branch.
@@ -6171,8 +6179,6 @@ class PyExecutor:
             attn_metadata,
             kv_cache_dtype_byte_size,
             skip_kv_cache_manager=self._is_kv_manager_v2)
-        if self.enable_kv_cache_events:
-            self._add_kv_cache_events()
 
         if self.enable_iter_perf_stats:
             self._process_iter_stats(finished_requests, self.active_requests,
