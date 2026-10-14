@@ -152,9 +152,11 @@ def test_accuracy_with_allreduce_strategy(
     # Fix attention dispatch for the cross-backend comparison while retaining
     # the selected all-reduce strategy in each fresh Ray worker.
     monkeypatch.setenv("FORCE_ATTENTION_KERNEL_DETERMINISTIC", "1")
-    kv_cache_config = KvCacheConfig(enable_block_reuse=False, free_gpu_memory_fraction=0.6)
-    if allreduce_strategy == "NCCL":
-        kv_cache_config.use_kv_cache_manager_v2 = True
+    kv_cache_config = KvCacheConfig(
+        enable_block_reuse=False,
+        free_gpu_memory_fraction=0.6,
+        use_kv_cache_manager_v2=True,
+    )
     llm = LLM(
         model=model_dir,
         backend="pytorch",
