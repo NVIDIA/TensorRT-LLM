@@ -39,6 +39,7 @@ from ..models.checkpoints.base_checkpoint_loader import BaseCheckpointLoader
 from ..models.modeling_multimodal_mixin import MultimodalModelMixin
 from ..models.modeling_utils import DecoderModelForCausalLM, timing_metric
 from ..moe.expert_statistic import ExpertStatistic
+from ..moe.fused_moe.moe_comm_timeout_guard import set_moe_comm_warmup
 from ..moe.fused_moe.moe_load_balancer import MoeLoadBalancer
 from ..route_capture import ROUTE_CAPTURE_ATTR, RouteCapture
 from ..speculative import SpecMetadata, update_spec_config_from_loaded_model
@@ -55,8 +56,7 @@ from .engine.multimodal import (MultimodalItemScheduler, is_multimodal,
                                 setup_mm_encoder_attn_metadata)
 from .engine.runners import resolve_runner_type
 from .engine.runners.common import (make_scheduled_inputs,
-                                    resolve_mrope_position_deltas_cache,
-                                    set_moe_a2a_warmup)
+                                    resolve_mrope_position_deltas_cache)
 from .engine.runners.decoder import DecoderRunner, DecoderRunnerConfig
 from .engine.runners.encoder import EncoderRunner, EncoderRunnerConfig
 from .engine.runners.encoder_decoder import (EncoderDecoderRunner,
@@ -914,9 +914,9 @@ class PyTorchModelEngine(ModelEngine):
         self._is_warmup = value
 
         # This setter is the one choke point every warmup transition passes
-        # through, including PyExecutor's, so select the MoE all-to-all budget
-        # here rather than in set_warmup_flag().
-        set_moe_a2a_warmup(value)
+        # through, including PyExecutor's, so switch the MoE communication
+        # timeouts here rather than in set_warmup_flag().
+        set_moe_comm_warmup(value)
 
         self.moe_load_balancer_iter_info = (not value, not value)
 
