@@ -29,8 +29,11 @@ from tensorrt_llm._torch.pyexecutor.engine.multimodal import \
     setup_mm_encoder_attn_metadata
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import DecoderRunner
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner import (
-    _get_context_prompt_lookahead_token, _make_single_token_context_graph_batch)
+    PrefillCompiledModel, _get_context_prompt_lookahead_token,
+    _make_single_token_context_graph_batch)
 from tensorrt_llm._torch.pyexecutor.engine.runners.pooling import PoolingRunner
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import \
+    KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
 from tensorrt_llm.llmapi.llm_args import (DecodingBaseConfig,
@@ -39,24 +42,23 @@ from tensorrt_llm.llmapi.llm_args import (DecodingBaseConfig,
                                           TorchLlmArgs)
 
 # isort: off
-from tensorrt_llm._torch.pyexecutor.resource_manager import (KVCacheManager,
-                                                             ResourceManager,
-                                                             ResourceManagerType
-                                                             )
+from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager, ResourceManagerType
 # isort: on
 from utils.util import skip_pre_blackwell_unittest, skip_ray
 
 from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
+from tensorrt_llm._torch.attention.backends.trtllm import \
+    TrtllmAttentionMetadata
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._torch.speculative.interface import \
     INVALID_PROMPT_LOOKAHEAD_TOKEN
 from tensorrt_llm._torch.speculative.spec_sampler_base import \
     SampleStateTensorsSpec
-from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.inputs.registry import (BaseMultimodalDummyInputsBuilder,
                                           BaseMultimodalInputProcessor)
 from tensorrt_llm.llmapi import (CudaGraphConfig, SADecodingConfig,
                                  SamplingParams)
+from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.mapping import CpType, Mapping
 
 
@@ -205,6 +207,18 @@ class DummyModelEngine(PyTorchModelEngine):
                          spec_config=spec_config)
 
 
+def _prepare_kv_cache_resources(manager: KVCacheManagerV2,
+                                batch: ScheduledRequests) -> None:
+    # These model-engine tests bypass the scheduler, which owns V2 allocation.
+    for request in batch.context_requests:
+        assert manager.prepare_context(request)
+        assert manager.resize_context(
+            request, request.prompt_len - request.context_current_position)
+    for request in batch.generation_requests:
+        assert manager.try_allocate_generation(request)
+    manager.prepare_resources(batch)
+
+
 def _create_request(num_tokens, req_id: int):
     sampling_params = SamplingParams()
     kwargs = {
@@ -302,6 +316,7 @@ def _make_forward_only_engine(
     decoder.kv_cache_manager_key = ResourceManagerType.KV_CACHE_MANAGER
     engine.enable_spec_decode = False
     decoder._config = SimpleNamespace(
+        compile_only_piecewise_graphs=False,
         disable_overlap_scheduler=True,
         is_spec_decode=False,
         max_beam_width=1,
@@ -383,11 +398,57 @@ def _make_forward_only_engine(
     return engine, runner, resource_manager, semantic_attn_metadata, outputs
 
 
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize(
+    "ordinary_capture,eligible",
+    [(False, True), (False, False), (True, True), (True, False)],
+)
+def test_decoder_forward_routes_compile_bypass(enabled: bool,
+                                               ordinary_capture: bool,
+                                               eligible: bool) -> None:
+    """Exercise both the regular forward and ordinary-graph capture callbacks."""
+    key = KeyType(batch_size=1, draft_len=0,
+                  is_first_draft=False) if ordinary_capture else None
+    engine, graph_runner, resources, _, outputs = _make_forward_only_engine(key)
+    eager = torch.nn.Identity()
+    compiled = torch.nn.Identity()
+    eager.forward = Mock(return_value=outputs)
+    compiled.forward = Mock(return_value=outputs)
+    wrapper = PrefillCompiledModel(eager, compiled)
+    engine._runner._config.compile_only_piecewise_graphs = enabled
+    engine._runner.model.model = wrapper
+    engine._runner._forward_step.side_effect = lambda *args, **kwargs: wrapper()
+    graph_runner.needs_capture.return_value = ordinary_capture
+    graph_runner.is_warmup_only = ordinary_capture
+    graph_runner.capture.side_effect = lambda key, forward, inputs, **kwargs: forward(
+        inputs)
+    batch = ScheduledRequests()
+    batch.generation_requests = [_make_request_stub(1)]
+
+    with patch(
+            "tensorrt_llm._torch.pyexecutor.model_engine.torch.cuda.Event",
+            return_value=Mock()
+    ), patch(
+            "tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner.get_per_request_prefill_cuda_graph_flag",
+            return_value=eligible,
+    ):
+        result = engine.forward(batch, resources)
+
+    assert result["logits"] is outputs["logits"]
+    expected_compiled = eligible and not (enabled and ordinary_capture)
+    selected = compiled.forward if expected_compiled else eager.forward
+    other = eager.forward if expected_compiled else compiled.forward
+    selected.assert_called_once_with()
+    other.assert_not_called()
+    assert not wrapper._bypass_active
+
+
 def create_model_engine_and_kvcache(
     llm_args: TorchLlmArgs | None = None,
     execution_stream: torch.cuda.Stream | None = None,
     spec_config: DecodingBaseConfig | None = None,
-) -> tuple[PyTorchModelEngine, KVCacheManager]:
+) -> tuple[PyTorchModelEngine, KVCacheManagerV2]:
     tokens_per_block = 1
     max_tokens = 258  # Atleast 1 more than the max seq len
     num_layers = 1
@@ -413,7 +474,7 @@ def create_model_engine_and_kvcache(
 
     kv_cache_config = KvCacheConfig(max_tokens=max_tokens)
     mapping = Mapping(world_size=1, tp_size=1, rank=0)
-    kv_cache_manager = KVCacheManager(
+    kv_cache_manager = KVCacheManagerV2(
         kv_cache_config,
         tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
         num_layers=num_layers,
@@ -1957,6 +2018,9 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         resource_manager = ResourceManager(
             {ResourceManagerType.KV_CACHE_MANAGER: kv_cache_manager})
 
+        def free_blocks() -> int:
+            return kv_cache_manager.get_kv_cache_stats().free_num_blocks
+
         batch_sizes_and_seqlens = [
             (5, 1),
             (13, 1),
@@ -1969,17 +2033,16 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
             batch = ScheduledRequests()
             batch.context_requests_last_chunk = requests
 
-            pages_before = kv_cache_manager.get_num_free_blocks()
+            pages_before = free_blocks()
             with model_engine.cuda_graph_runner.pad_batch(
                     batch, resource_manager) as padded_batch:
                 # No padding for prefill
                 self.assertIs(batch, padded_batch)
-            self.assertEqual(kv_cache_manager.get_num_free_blocks(),
-                             pages_before)
+            self.assertEqual(free_blocks(), pages_before)
 
             batch = ScheduledRequests()
             batch.generation_requests = requests
-            pages_before = kv_cache_manager.get_num_free_blocks()
+            pages_before = free_blocks()
             new_dummy_block = 1 if not model_engine.cuda_graph_runner.padding_dummy_requests else 0
             with model_engine.cuda_graph_runner.pad_batch(
                     batch, resource_manager) as padded_batch:
@@ -1993,9 +2056,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
                     # The seqlen check makes sure we don't exceed the KV cache memory
                     # budget.
                     self.assertIs(batch, padded_batch)
-            self.assertEqual(
-                kv_cache_manager.get_num_free_blocks() + new_dummy_block,
-                pages_before)
+            self.assertEqual(free_blocks() + new_dummy_block, pages_before)
 
         kv_cache_manager.shutdown()
 
@@ -2100,7 +2161,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         # Prefill run
         batch = ScheduledRequests()
         batch.context_requests_last_chunk = requests
-        kv_cache_manager.prepare_resources(batch)
+        _prepare_kv_cache_resources(kv_cache_manager, batch)
         model_engine.forward(batch, resource_manager)
 
         expected_prefill_pos_ids = torch.arange(0,
@@ -2118,7 +2179,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         # Generation run
         batch = ScheduledRequests()
         batch.generation_requests = requests
-        kv_cache_manager.prepare_resources(batch)
+        _prepare_kv_cache_resources(kv_cache_manager, batch)
 
         model_engine.forward(batch, resource_manager)
         expected_gen_pos_id = torch.tensor([prompt_len],
@@ -2286,7 +2347,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
 
         batch = ScheduledRequests()
         batch.context_requests_last_chunk = requests
-        kv_cache_manager.prepare_resources(batch)
+        _prepare_kv_cache_resources(kv_cache_manager, batch)
         model_engine.forward(batch, resource_manager)
 
         expected_prefill_pos_ids = torch.arange(0,
@@ -2329,7 +2390,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
 
         batch = ScheduledRequests()
         batch.context_requests_last_chunk = requests
-        kv_cache_manager.prepare_resources(batch)
+        _prepare_kv_cache_resources(kv_cache_manager, batch)
         model_engine.forward(batch, resource_manager)
 
         mock_callable.assert_called_once()
@@ -2348,7 +2409,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
 
         batch = ScheduledRequests()
         batch.context_requests_last_chunk = requests
-        kv_cache_manager.prepare_resources(batch)
+        _prepare_kv_cache_resources(kv_cache_manager, batch)
         model_engine.forward(batch, resource_manager)
 
         mock_callable.assert_called_once()
@@ -2367,7 +2428,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
 
         batch = ScheduledRequests()
         batch.context_requests_last_chunk = requests
-        kv_cache_manager.prepare_resources(batch)
+        _prepare_kv_cache_resources(kv_cache_manager, batch)
         model_engine.forward(batch, resource_manager)
 
     def test_foward_pass_callable_backward_compat(self):
@@ -2384,7 +2445,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
 
         batch = ScheduledRequests()
         batch.context_requests_last_chunk = requests
-        kv_cache_manager.prepare_resources(batch)
+        _prepare_kv_cache_resources(kv_cache_manager, batch)
         model_engine.forward(batch, resource_manager)
 
     @skip_ray
@@ -2427,8 +2488,9 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         scheduled_requests.generation_requests = gen_requests
 
         # Create KV cache manager for attention metadata.
-        kv_cache_config = KvCacheConfig(max_tokens=512)
-        kv_cache_manager = KVCacheManager(
+        kv_cache_config = KvCacheConfig(max_tokens=512,
+                                        enable_block_reuse=False)
+        kv_cache_manager = KVCacheManagerV2(
             kv_cache_config,
             tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
             num_layers=1,
@@ -2440,9 +2502,12 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
             mapping=mapping,
             dtype=tensorrt_llm.bindings.DataType.HALF,
         )
-        attn_metadata = AttentionMetadata(max_num_requests=4,
-                                          max_num_tokens=512,
-                                          kv_cache_manager=kv_cache_manager)
+        kv_cache_manager.add_dummy_requests([1, 2], prompt_lens, is_gen=True)
+        attn_metadata = TrtllmAttentionMetadata(
+            max_num_requests=4,
+            max_num_tokens=512,
+            kv_cache_manager=kv_cache_manager,
+            mapping=mapping)
         attn_metadata.is_cuda_graph = False
 
         # Initialize model engine buffers.
@@ -2510,7 +2575,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
 
         mapping = Mapping(world_size=1, tp_size=1, rank=0)
         kv_cache_config = KvCacheConfig(max_tokens=32)
-        kv_cache_manager = KVCacheManager(
+        kv_cache_manager = KVCacheManagerV2(
             kv_cache_config,
             tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
             num_layers=1,
@@ -2605,7 +2670,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
 
         mapping = Mapping(world_size=1, tp_size=1, rank=0)
         kv_cache_config = KvCacheConfig(max_tokens=max_num_tokens)
-        kv_cache_manager = KVCacheManager(
+        kv_cache_manager = KVCacheManagerV2(
             kv_cache_config,
             tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
             num_layers=1,
@@ -2959,7 +3024,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         kv_cache_manager.shutdown()
 
     def test_kv_cache_manager_with_execution_stream(self) -> None:
-        """Test that KVCacheManager uses the provided execution_stream.
+        """Test that KVCacheManagerV2 uses the provided execution_stream.
         """
         # Create a dedicated execution stream
         execution_stream = torch.cuda.Stream()
@@ -2967,10 +3032,10 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         model_engine, kv_cache_manager = create_model_engine_and_kvcache(
             execution_stream=execution_stream)
 
-        # Verify the KVCacheManager uses the provided execution stream
+        # Verify the KVCacheManagerV2 uses the provided execution stream
         self.assertEqual(
             kv_cache_manager._stream.cuda_stream, execution_stream.cuda_stream,
-            "KVCacheManager should use the provided execution_stream")
+            "KVCacheManagerV2 should use the provided execution_stream")
 
         resource_manager = ResourceManager(
             {ResourceManagerType.KV_CACHE_MANAGER: kv_cache_manager})
@@ -2980,14 +3045,14 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
 
         batch = ScheduledRequests()
         batch.context_requests_last_chunk = requests
-        kv_cache_manager.prepare_resources(batch)
+        _prepare_kv_cache_resources(kv_cache_manager, batch)
         with torch.cuda.stream(execution_stream):
             model_engine.forward(batch, resource_manager)
 
         # Verify the stream is still the same after forward pass
         self.assertEqual(
             kv_cache_manager._stream.cuda_stream, execution_stream.cuda_stream,
-            "KVCacheManager should still use the provided execution_stream after forward"
+            "KVCacheManagerV2 should still use the provided execution_stream after forward"
         )
 
         kv_cache_manager.shutdown()

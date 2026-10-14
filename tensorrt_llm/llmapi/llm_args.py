@@ -1335,6 +1335,15 @@ class DeepSeekSparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
         "False, and the FP4 paged-MQA-logits path; ignored otherwise. The "
         "self-sampling engine derives its bracket from the current row and "
         "does not use emission.")
+    gvr_deterministic_topk: bool = Field(
+        default=False,
+        description=
+        "Make the self-sampling GVR Top-K deterministic: the selected index "
+        "set is {score > tau} plus the smallest indices among the ties at tau, "
+        "and the output order is a fixed function of the input (decode and "
+        "prefill). Costs about 0.2-3 us per Top-K launch. Only takes effect "
+        "with enable_heuristic_topk=True and use_self_sampling_topk=True; "
+        "ignored otherwise.")
     indexer_k_dtype: Literal["fp8", "fp4"] = Field(
         default="fp8",
         description=
@@ -1478,6 +1487,7 @@ class DeepSeekSparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
             enable_heuristic_topk=self.enable_heuristic_topk,
             use_self_sampling_topk=self.use_self_sampling_topk,
             use_gvr_emission=self.use_gvr_emission,
+            gvr_deterministic_topk=self.gvr_deterministic_topk,
             indexer_k_dtype=self.indexer_k_dtype,
             is_full_indexer_layer=self._is_full_indexer_layer(
                 pretrained_config, kwargs.get("layer_idx")),
@@ -1512,6 +1522,7 @@ class DeepSeekSparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
             enable_heuristic_topk=self.enable_heuristic_topk,
             use_self_sampling_topk=self.use_self_sampling_topk,
             use_gvr_emission=self.use_gvr_emission,
+            gvr_deterministic_topk=self.gvr_deterministic_topk,
             use_cute_dsl_topk=self.use_cute_dsl_topk,
             use_cute_dsl_paged_mqa_logits=(self.use_cute_dsl_paged_mqa_logits),
             q_split_threshold=self.q_split_threshold,
@@ -1623,6 +1634,7 @@ class DeepSeekV4SparseAttentionConfig(DeepSeekSparseAttentionConfig):
             enable_heuristic_topk=self.enable_heuristic_topk,
             use_self_sampling_topk=self.use_self_sampling_topk,
             use_gvr_emission=self.use_gvr_emission,
+            gvr_deterministic_topk=self.gvr_deterministic_topk,
             indexer_k_dtype=self.indexer_k_dtype,
             compress_ratios=self.compress_ratios,
             window_size=self.window_size,
@@ -1651,6 +1663,7 @@ class DeepSeekV4SparseAttentionConfig(DeepSeekSparseAttentionConfig):
             enable_heuristic_topk=self.enable_heuristic_topk,
             use_self_sampling_topk=self.use_self_sampling_topk,
             use_gvr_emission=self.use_gvr_emission,
+            gvr_deterministic_topk=self.gvr_deterministic_topk,
             use_cute_dsl_topk=self.use_cute_dsl_topk,
             use_cute_dsl_paged_mqa_logits=(self.use_cute_dsl_paged_mqa_logits),
             q_split_threshold=self.q_split_threshold,
@@ -3564,14 +3577,16 @@ class DSparkDecodingConfig(DecodingBaseConfig):
     layers as cross-attention context and drafts a whole block in a single
     backbone forward, but it additionally refines the per-position draft logits
     with a lightweight sequential head (a low-rank Markov head, optionally an RNN
-    head) and predicts an acceptance-confidence per position to truncate the
-    proposed prefix.
+    head). A confidence head can score each draft position for verification
+    scheduling without truncating the proposed block. This configuration selects
+    native full-block drafting and does not expose confidence-scheduling or
+    calibration controls.
 
     Key features:
     - Target-dependent: captures hidden states from ``target_layer_ids``.
     - Semi-parallel: one block backbone forward + cheap sequential head refine.
-    - Confidence head: truncates the proposed draft length (NOT the accept rule;
-      acceptance stays standard target verification, preserving greedy parity).
+    - Full-block proposals: confidence scoring does not change the draft tokens
+      or the standard target-verification acceptance rule.
 
     Reference: DeepSeek DeepSpec (https://github.com/deepseek-ai/DeepSpec).
     """
@@ -3606,14 +3621,6 @@ class DSparkDecodingConfig(DecodingBaseConfig):
         "Type of the sequential refinement head used within a block. If None, "
         "read from the draft model config (dspark_markov_head_type), "
         "defaulting to \"vanilla\".")
-
-    # NOTE: confidence-based dynamic drafting (the draft model's confidence head
-    # that truncates the proposed block) is NOT enabled in this PR. The user-facing
-    # ``enable_confidence_head`` / ``confidence_threshold`` knobs are intentionally
-    # omitted and will be added when the feature is actually wired into the
-    # speculative scheduling/verification path. The confidence head module and its
-    # internal plumbing remain as scaffolding (see DSparkConfidenceHead /
-    # dspark_propose).
 
     decoding_type: Literal["DSpark"] = Field(default="DSpark")
 
@@ -3893,6 +3900,22 @@ class ExecutorMemoryType(StrEnum):
     MODEL_ENGINE_DRAFT = "draft_model"
     MODEL_WEIGHTS_MAIN = "model_weights"
     MODEL_WEIGHTS_DRAFT = "draft_model_weights"
+
+
+class RuntimeMemoryStatus(StrictBaseModel):
+    """Status of runtime memory managed by sleep and wakeup."""
+
+    state: Literal["running", "parking", "parked", "waking", "failed"] = Field(
+        description="Current runtime-memory admission state.")
+    parked_tags: list[ExecutorMemoryType] = Field(
+        default_factory=list,
+        description=
+        "Memory tags that remain released, sorted lexicographically by value.")
+
+    @field_validator("parked_tags")
+    @classmethod
+    def sort_parked_tags(cls, parked_tags):
+        return sorted(parked_tags, key=lambda tag: tag.value)
 
 
 @dataclass
@@ -5407,6 +5430,12 @@ class BaseLlmArgs(StrictBaseModel):
     """Base class for the LLM arguments. It contains all the common arguments."""
     model_config = ConfigDict(arbitrary_types_allowed=True, extra="forbid")
 
+    # Internal serving policy, carried with the pickled args to every worker.
+    # Deliberately absent from the public LLM configuration/telemetry schema.
+    _enable_routing_load: bool = PrivateAttr(default=False)
+    _openengine_discovery: dict[str, str | int] | None = PrivateAttr(
+        default=None)
+
     # Explicit arguments
     model: Union[str, Path] = Field(
         description=
@@ -6082,6 +6111,15 @@ class TorchCompileConfig(StrictBaseModel):
     enable_fullgraph: bool = Field(
         default=True,
         description="Enable full graph compilation in torch.compile.")
+
+    compile_only_piecewise_graphs: bool = Field(
+        default=False,
+        description="Compile only forwards eligible for piecewise prefill "
+        "CUDA graphs, while generation-only forwards, prefill graph misses, "
+        "and auxiliary kernel warmup forwards remain eager. Enabling this "
+        "will speed up startup, but might lead to degraded performance or "
+        "inconsistent output in specific configurations.",
+        status="prototype")
 
     enable_inductor: bool = Field(
         default=False, description="Enable inductor backend in torch.compile.")
@@ -6878,6 +6916,13 @@ class TorchLlmArgs(BaseLlmArgs):
                     "prefill_capture_num_tokens")
             if not buckets_are_explicit and legacy_buckets is not None:
                 self.prefill_capture_num_tokens = list(legacy_buckets)
+
+        if (compile_config is not None
+                and compile_config.compile_only_piecewise_graphs):
+            if self.prefill_cuda_graph_backend != PrefillCudaGraphBackend.PIECEWISE:
+                raise ValueError(
+                    "torch_compile_config.compile_only_piecewise_graphs requires "
+                    "prefill_cuda_graph_backend='piecewise'")
 
         if self.prefill_cuda_graph_backend != PrefillCudaGraphBackend.DISABLED:
             if self.prefill_capture_num_tokens is None:
