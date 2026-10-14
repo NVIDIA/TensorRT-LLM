@@ -316,11 +316,7 @@ class PrimsTSFmha(PhasedFmha):
         feature_reason = get_attention_feature_unsupported_reason(meta, fwd)
         if feature_reason is not None:
             return False, feature_reason
-        if (
-            fwd.sage_attn_num_elts_per_blk_q > 0
-            or fwd.sage_attn_num_elts_per_blk_k > 0
-            or fwd.sage_attn_num_elts_per_blk_v > 0
-        ):
+        if fwd.sage_attn_qk_dtype is not None:
             return False, "SageAttention is not supported."
         if meta.kv_cache_manager is None:
             return self._is_supported_without_kv_cache(q, k, v, attn, meta, fwd)

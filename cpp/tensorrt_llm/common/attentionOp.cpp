@@ -1959,7 +1959,8 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
             // otherwise surface as an empty scale buffer deep inside invokeSageQuant().
             TLLM_CHECK_WITH_INFO(q_max_n_blk > 0 && k_max_n_blk > 0,
                 "No SageQuant kernel on sm_%d for block sizes (q, k, v) = (%d, %d, %d) with qk_int8=%s. SM90 "
-                "requires (2, 16, 1) together with INT8 Q/K; SM100 requires q/k block sizes of 1, 4 or 16.",
+                "requires (2, 16, 1) together with INT8 Q/K; other architectures require q/k block sizes of 1, 4, 16, "
+                "or 32.",
                 mSM, mSageAttnNumEltsPerBlkQ, mSageAttnNumEltsPerBlkK, mSageAttnNumEltsPerBlkV,
                 mSageAttnQkInt8 ? "true" : "false");
             TLLM_CHECK_WITH_INFO(!params.kv_scale_quant_orig,
