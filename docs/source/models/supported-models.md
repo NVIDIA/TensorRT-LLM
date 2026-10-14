@@ -292,3 +292,8 @@ For full documentation, see the [Visual Generation](./visual-generation.md) page
 | **Qwen-Image-Layered** | Yes | No | No | No | No | No | Yes | Yes | Yes | No | No | No |
 | **Qwen-Image-Edit-2511** | Yes | Yes | No | Yes | Yes | No | Yes | Yes | Yes | No | No | No |
 | **Cosmos3** | Yes | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | No | No | Yes |
+
+MiniMax-H3 tensor parallelism is limited to the Qwen3-VL text encoder through
+`parallel_config.text_encoder_tp_size`. It supports text-only prompt encoding
+and does not enable DiT tensor parallelism (`tp_size`) for MiniMax-H3. FL2VA
+keyframes and Ref2VA image or video references must use `text_encoder_tp_size: 1`.
