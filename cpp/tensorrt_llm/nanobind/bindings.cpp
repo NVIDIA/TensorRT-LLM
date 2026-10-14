@@ -30,6 +30,7 @@
 #include <vector>
 
 #include "tensorrt_llm/batch_manager/peftCacheManagerConfig.h"
+#include "tensorrt_llm/common/cudaArchitectures.h"
 #include "tensorrt_llm/common/quantization.h"
 #include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/nanobind/batch_manager/algorithms.h"
@@ -149,6 +150,25 @@ NB_MODULE(TRTLLM_NB_MODULE, m)
 
     auto buildInfo = m.def_submodule("BuildInfo");
     buildInfo.attr("ENABLE_MULTI_DEVICE") = nb::int_(ENABLE_MULTI_DEVICE);
+    auto const toTuple = [](std::vector<int> const& architectures)
+    {
+        nb::list list;
+        for (int const sm : architectures)
+        {
+            list.append(sm);
+        }
+        return nb::tuple(list);
+    };
+    buildInfo.attr("CUDA_ARCHITECTURES") = toTuple(tensorrt_llm::common::getBuiltCudaArchitectures());
+    buildInfo.attr("SUPPORTED_CUDA_ARCHITECTURES") = toTuple(tensorrt_llm::common::getSupportedCudaArchitectures());
+    buildInfo.def("is_cuda_architecture_built", &tensorrt_llm::common::isCudaArchitectureBuilt, nb::arg("sm_version"),
+        "Whether a GPU of SM version `sm_version` (e.g. 90) is one this build was configured for.");
+    buildInfo.def("is_cuda_architecture_supported", &tensorrt_llm::common::isCudaArchitectureSupported,
+        nb::arg("sm_version"),
+        "Whether a GPU of SM version `sm_version` (e.g. 90) is one TensorRT-LLM provides optimized kernels for.");
+    buildInfo.def("check_cuda_architecture_supported", &tensorrt_llm::common::checkCudaArchitectureSupported,
+        nb::arg("device"),
+        "Raises if the GPU `device` is not one of the CUDA architectures this build was configured for.");
 
     nb::class_<tb::PeftCacheManagerConfig>(m, "PeftCacheManagerConfig")
         .def(nb::init<SizeType32, SizeType32, SizeType32, SizeType32, SizeType32, SizeType32, SizeType32, SizeType32,
