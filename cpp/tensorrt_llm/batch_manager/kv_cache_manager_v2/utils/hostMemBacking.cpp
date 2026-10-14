@@ -182,12 +182,17 @@ public:
 
     void destroy() noexcept override
     {
-        if (mAddr != 0)
+        if (mAddr == 0)
         {
-            hostMunmap(mAddr, mSize);
-            mAddr = 0;
-            mSize = 0;
+            return;
         }
+        // Skipped once KVCM2 is poisoned, as on the VMM backing: teardown then also skips the waits
+        // that let this range's CUDA consumers finish, and unmapping under one corrupts whatever is
+        // mapped there next. The range is kept instead, which costs a tier in a process whose cache
+        // is already permanently unusable.
+        KVCM2_POISON_ON_EXCEPT([&] { hostMunmap(mAddr, mSize); });
+        mAddr = 0;
+        mSize = 0;
     }
 
     [[nodiscard]] size_t commitGranularity() const noexcept override
@@ -292,12 +297,16 @@ public:
     {
         TLLM_CHECK_DEBUG(offset % mGranularity == 0 && size % mGranularity == 0);
         auto chunk = mChunks.lower_bound(offset);
-        while (chunk != mChunks.end() && chunk->first < offset + size)
-        {
-            cuMemUnmap(static_cast<CUdeviceptr>(mAddr + chunk->first), chunk->second.size);
-            cuMemRelease(chunk->second.handle);
-            chunk = mChunks.erase(chunk);
-        }
+        KVCM2_POISON_ON_EXCEPT(
+            [&]
+            {
+                while (chunk != mChunks.end() && chunk->first < offset + size)
+                {
+                    cuCheck(cuMemUnmap(static_cast<CUdeviceptr>(mAddr + chunk->first), chunk->second.size));
+                    cuCheck(cuMemRelease(chunk->second.handle));
+                    chunk = mChunks.erase(chunk);
+                }
+            });
     }
 
     void destroy() noexcept override
@@ -306,13 +315,17 @@ public:
         {
             return;
         }
-        for (auto const& [offset, chunk] : mChunks)
-        {
-            cuMemUnmap(static_cast<CUdeviceptr>(mAddr + offset), chunk.size);
-            cuMemRelease(chunk.handle);
-        }
-        mChunks.clear();
-        cuMemAddressFree(static_cast<CUdeviceptr>(mAddr), mSize);
+        KVCM2_POISON_ON_EXCEPT(
+            [&]
+            {
+                for (auto const& [offset, chunk] : mChunks)
+                {
+                    cuCheck(cuMemUnmap(static_cast<CUdeviceptr>(mAddr + offset), chunk.size));
+                    cuCheck(cuMemRelease(chunk.handle));
+                }
+                mChunks.clear();
+                cuCheck(cuMemAddressFree(static_cast<CUdeviceptr>(mAddr), mSize));
+            });
         mAddr = 0;
         mSize = 0;
     }

@@ -16,13 +16,17 @@
  */
 
 #include "tensorrt_llm/batch_manager/kv_cache_manager_v2/utils/hostMemBacking.h"
+#include "tensorrt_llm/batch_manager/kv_cache_manager_v2/utils/poison.h"
 
+#include <cuda.h>
 #include <cuda_runtime_api.h>
 #include <gtest/gtest.h>
 
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <fstream>
+#include <string>
 #include <vector>
 
 namespace
@@ -86,6 +90,77 @@ TEST_P(HostMemBackingTest, GranularityIsUsable)
     size_t const granularity = mBacking->commitGranularity();
     EXPECT_GT(granularity, 0U);
     EXPECT_EQ(granularity & (granularity - 1), 0U) << "granularity must be a power of two";
+}
+
+//! Whether the backing still holds the memory at `addr`.
+//!
+//! The probe has to match the backing. munmap really removes the VMA, so
+//! /proc/self/maps answers for mmap; the VMM backing carves its range out of a
+//! driver reservation that stays listed there either way, so the driver has to be
+//! asked instead -- cuMemRetainAllocationHandle succeeds only while the address is
+//! mapped to an allocation, which is exactly what destroy() undoes.
+bool backingHoldsMemory(HostMemBackingKind kind, MemAddress addr)
+{
+    if (kind == HostMemBackingKind::kVmm)
+    {
+        CUmemGenericAllocationHandle handle{};
+        if (cuMemRetainAllocationHandle(&handle, reinterpret_cast<void*>(addr)) != CUDA_SUCCESS)
+        {
+            return false;
+        }
+        cuMemRelease(handle);
+        return true;
+    }
+    std::ifstream maps("/proc/self/maps");
+    std::string line;
+    while (std::getline(maps, line))
+    {
+        auto const dash = line.find('-');
+        if (dash == std::string::npos)
+        {
+            continue;
+        }
+        auto const space = line.find(' ', dash);
+        auto const begin = std::stoull(line.substr(0, dash), nullptr, 16);
+        auto const end = std::stoull(line.substr(dash + 1, space - dash - 1), nullptr, 16);
+        if (addr >= begin && addr < end)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+//! The ordinary path must give the memory back. Also the control for the case
+//! below: without it, retention there would pass whether or not anything is ever
+//! released.
+TEST_P(HostMemBackingTest, DestroyReleasesTheMemory)
+{
+    MemAddress const base = mBacking->reserve(mTotalSize);
+    ASSERT_NE(base, 0U);
+    mBacking->commit(0, mChunkSize);
+    ASSERT_TRUE(backingHoldsMemory(GetParam(), base)) << "nothing was held to begin with";
+
+    mBacking->destroy();
+    EXPECT_FALSE(backingHoldsMemory(GetParam(), base)) << "the memory outlived an ordinary destroy()";
+}
+
+//! Teardown under poison skips the waits that let this range's CUDA consumers
+//! finish, so the memory has to outlive destroy() rather than be released under
+//! one. Deliberately strands it, which costs a tier only in a process whose cache
+//! is already permanently unusable.
+TEST_P(HostMemBackingTest, DestroyUnderPoisonKeepsTheMemory)
+{
+    MemAddress const base = mBacking->reserve(mTotalSize);
+    ASSERT_NE(base, 0U);
+    mBacking->commit(0, mChunkSize);
+    ASSERT_TRUE(backingHoldsMemory(GetParam(), base)) << "nothing was held to begin with";
+
+    Poison::set("DestroyUnderPoisonKeepsTheMemory", "simulated invariant violation");
+    ASSERT_TRUE(Poison::poisoned());
+    mBacking->destroy();
+    EXPECT_TRUE(backingHoldsMemory(GetParam(), base)) << "the memory was released while KVCM2 was poisoned";
+    EXPECT_TRUE(takePoison().has_value());
 }
 
 //! Offsets handed to commit() are multiples of the granularity, so the base has

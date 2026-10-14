@@ -299,6 +299,9 @@ HostMem::~HostMem()
     // Joined outside the poison guard: once KVCM2 is poisoned the guard skips destroy(), and a
     // joinable mFillWorker would then terminate the process when the member is destroyed.
     joinFill();
+    // Guarded so a failure here reaches the latch rather than escaping a destructor. Whether the
+    // range itself survives a poisoned teardown is the backing's decision, not this one: its
+    // destructor runs with the member whether or not the guard skipped the call above.
     KVCM2_POISON_ON_EXCEPT([this]() { destroy(); });
 }
 
