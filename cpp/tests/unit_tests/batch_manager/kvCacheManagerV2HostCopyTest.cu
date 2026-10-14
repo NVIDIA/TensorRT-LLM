@@ -167,7 +167,7 @@ void roundTrip(size_t numBytes, size_t numTasks, cudaStream_t stream)
     HostMem src(roundUpToHostMemAlignment(total));
     HostMem dst(roundUpToHostMemAlignment(total));
     CudaAllocation device = allocateCuda(total);
-    ASSERT_NE(device, nullptr);
+    ASSERT_NE(device.get(), nullptr);
 
     // Drain the stream before the buffers above go away, also when an assertion below returns early.
     struct DrainOnExit
@@ -321,8 +321,8 @@ TEST_F(KvCacheManagerV2HostCopyTest, StreamOrderingThroughEvents)
         HostMem host(roundUpToHostMemAlignment(numBytes));
         CudaAllocation device = allocateCuda(numBytes);
         CudaAllocation deviceCheck = allocateCuda(numBytes);
-        ASSERT_NE(device, nullptr);
-        ASSERT_NE(deviceCheck, nullptr);
+        ASSERT_NE(device.get(), nullptr);
+        ASSERT_NE(deviceCheck.get(), nullptr);
         auto* hostBytes = reinterpret_cast<unsigned char*>(host.address());
         std::memset(hostBytes, 0, numBytes);
 
@@ -368,7 +368,7 @@ TEST_F(KvCacheManagerV2HostCopyTest, StateSlotBandwidthInfo)
     size_t const numBytes = kSsmStateBytes;
     HostMem host(roundUpToHostMemAlignment(numBytes));
     CudaAllocation device = allocateCuda(numBytes);
-    ASSERT_NE(device, nullptr);
+    ASSERT_NE(device.get(), nullptr);
     std::memset(reinterpret_cast<void*>(host.address()), 0x3C, numBytes);
     std::vector<MMTask> hostToDevice{MMTask{reinterpret_cast<MemAddress>(device.get()), host.address()}};
     std::vector<MMTask> deviceToHost{MMTask{host.address(), reinterpret_cast<MemAddress>(device.get())}};

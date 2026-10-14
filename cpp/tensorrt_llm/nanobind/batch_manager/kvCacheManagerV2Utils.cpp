@@ -136,44 +136,34 @@ void KVCacheManagerV2UtilsBindings::initBindings(nb::module_& module)
         "Whether copy_host_to_device / copy_device_to_host send a call with num_bytes per task to the copy engines "
         "(True) or to the batched copy kernel (False) in this process; the kernel requires num_bytes to be a multiple "
         "of 16");
+
+    module.def(
+        "copy_device_to_device",
+        [](std::vector<Task<MemAddress, MemAddress>> const& tasks, ssize_t numBytes, uintptr_t stream) -> int
+        { return copyDeviceToDevice(tasks, numBytes, reinterpret_cast<CUstream>(stream)); },
+        nb::arg("tasks"), nb::arg("num_bytes"), nb::arg("stream"), nb::call_guard<nb::gil_scoped_release>(),
+        "Copy data from device to device using CUDA kernels");
+
+    module.def(
+        "copy_batch_block_offsets_to_device",
+        [](at::Tensor input, at::Tensor output, at::Tensor copyIndex, at::Tensor indexScales, at::Tensor kvOffset,
+            uintptr_t stream)
+        {
+            auto _input = from_torch(input);
+            auto _output = from_torch(output);
+            auto _copyIndex = from_torch(copyIndex);
+            auto _indexScales = from_torch(indexScales);
+            auto _kvOffset = from_torch(kvOffset);
+            TLLM_CHECK_WITH_INFO(_input.has_value(), "Invalid input tensor.");
+            TLLM_CHECK_WITH_INFO(_output.has_value(), "Invalid output tensor.");
+            TLLM_CHECK_WITH_INFO(_copyIndex.has_value(), "Invalid copy index tensor.");
+            TLLM_CHECK_WITH_INFO(_indexScales.has_value(), "Invalid index scales tensor.");
+            TLLM_CHECK_WITH_INFO(_kvOffset.has_value(), "Invalid kv offset tensor.");
+            copyBatchBlockOffsetsToDevice(*(_input.value()), *(_output.value()), *(_copyIndex.value()),
+                *(_indexScales.value()), *(_kvOffset.value()), reinterpret_cast<CUstream>(stream));
+        },
+        nb::arg("input"), nb::arg("output"), nb::arg("copy_index"), nb::arg("index_scales"), nb::arg("kv_offset"),
+        nb::arg("stream"), nb::call_guard<nb::gil_scoped_release>(), "Copy batch block indices to device");
 }
 
-                   ,
-        nb::arg("num_bytes"), nb::arg("num_tasks"),
-        "Whether copy_host_to_device / copy_device_to_host send a call of num_tasks tasks of num_bytes each to the "
-        "copy "
-        "engines (True) or to the batched copy kernel (False) in this process; the kernel requires num_bytes to be a "
-        "multiple of 16");
-
-                   module.def(
-                       "copy_device_to_device",
-                       [](std::vector<Task<MemAddress, MemAddress>> const& tasks, ssize_t numBytes,
-                           uintptr_t stream) -> int
-                       { return copyDeviceToDevice(tasks, numBytes, reinterpret_cast<CUstream>(stream)); },
-                       nb::arg("tasks"), nb::arg("num_bytes"), nb::arg("stream"),
-                       nb::call_guard<nb::gil_scoped_release>(), "Copy data from device to device using CUDA kernels");
-
-                   module.def(
-                       "copy_batch_block_offsets_to_device",
-                       [](at::Tensor input, at::Tensor output, at::Tensor copyIndex, at::Tensor indexScales,
-                           at::Tensor kvOffset, uintptr_t stream)
-                       {
-                           auto _input = from_torch(input);
-                           auto _output = from_torch(output);
-                           auto _copyIndex = from_torch(copyIndex);
-                           auto _indexScales = from_torch(indexScales);
-                           auto _kvOffset = from_torch(kvOffset);
-                           TLLM_CHECK_WITH_INFO(_input.has_value(), "Invalid input tensor.");
-                           TLLM_CHECK_WITH_INFO(_output.has_value(), "Invalid output tensor.");
-                           TLLM_CHECK_WITH_INFO(_copyIndex.has_value(), "Invalid copy index tensor.");
-                           TLLM_CHECK_WITH_INFO(_indexScales.has_value(), "Invalid index scales tensor.");
-                           TLLM_CHECK_WITH_INFO(_kvOffset.has_value(), "Invalid kv offset tensor.");
-                           copyBatchBlockOffsetsToDevice(*(_input.value()), *(_output.value()), *(_copyIndex.value()),
-                               *(_indexScales.value()), *(_kvOffset.value()), reinterpret_cast<CUstream>(stream));
-                       },
-                       nb::arg("input"), nb::arg("output"), nb::arg("copy_index"), nb::arg("index_scales"),
-                       nb::arg("kv_offset"), nb::arg("stream"), nb::call_guard<nb::gil_scoped_release>(),
-                       "Copy batch block indices to device");
-                   }
-
-                   } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
+} // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
