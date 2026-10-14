@@ -21,6 +21,7 @@ from blocks import Stage, YAMLIndex, _entry_target
 
 from ._helpers import resolve_affected_stages, stages_by_yaml_stem
 from .base import PRInputs, Rule, RuleResult
+from .docs_rule import is_docs_path
 
 _OPENENGINE_SOURCE_PREFIX = "tensorrt_llm/grpc/openengine/"
 _OPENENGINE_TEST_PREFIX = "unittest/grpc/openengine/"
@@ -28,7 +29,7 @@ _OPENENGINE_TEST_PREFIX = "unittest/grpc/openengine/"
 
 def _is_openengine_claim(path: str) -> bool:
     """Return whether an OpenEngine source path needs its focused unit test."""
-    return path.startswith(_OPENENGINE_SOURCE_PREFIX) and not path.endswith(".md")
+    return path.startswith(_OPENENGINE_SOURCE_PREFIX) and not is_docs_path(path)
 
 
 class OpenEngineRule(Rule):

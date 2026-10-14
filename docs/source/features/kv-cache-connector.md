@@ -29,12 +29,21 @@ These methods run on the leader process and drive the connector's behavior.
 
 * **`build_connector_meta(self, scheduler_output: SchedulerOutput) -> object`**
   * **Description**: The core orchestration method. Called during the scheduling phase. It examines the current requests and decides which blocks need to be loaded from or saved to the external store.
-  * **Arguments**: `scheduler_output` contains information about new requests, blocks allocated, current request states, and the cumulative `RequestData.block_hashes` chain. `block_hashes` is read directly from each KV cache block's stored hash, which the KV cache manager commits as soon as a block becomes full -- the value matches the hash that KV cache events will subsequently emit for the same block. The chain only covers beam 0; the executor rejects `kv_connector_config` at startup when `max_beam_width > 1`, so connectors may assume beam-width-1 inputs.
+  * **Arguments**: `scheduler_output` contains information about new requests, blocks allocated, current request states, and the cumulative `RequestData.block_hashes` chain. `block_hashes` is read directly from each KV cache block's stored hash, which the KV cache manager commits as soon as a block becomes full, so the value matches the hash that KV cache events will subsequently emit for the same block. The chain only covers beam 0; the executor rejects `kv_connector_config` at startup when `max_beam_width > 1`, so connectors may assume beam-width-1 inputs.
   * **Returns**: An arbitrary metadata object (picklable) that describes the tasks for the workers. This object is broadcasted to all workers.
 
 * **`get_num_new_matched_tokens(self, request: LlmRequest, num_computed_tokens: int) -> tuple[int, bool]`**
-  * **Description**: Called when a new request arrives. It checks to see if any KV cache can be loaded from an external KV store.
+  * **Description**: Queries external KV after the compute batch is selected on the legacy path. Connectors that implement the complete reservation protocol use `reserve_prefix` during admission when prefix-aware scheduling and KV cache manager V2 are enabled.
   * **Returns**: A tuple `(num_tokens, is_async)`. `num_tokens` is the number of tokens found in the external cache. `is_async` indicates if the loading will happen asynchronously (background) or requires blocking.
+
+* **`reserve_prefix(self, request: LlmRequest, num_computed_tokens: int, reservation_id: int) -> tuple[int, bool]`**
+  * **Description**: Reserves an additional contiguous prefix beginning at `num_computed_tokens` during batch construction. A positive answer protects that source range against mutation and eviction. The query must start no KV transmission or destination writes.
+  * **Returns**: `(additional_tokens, is_async)`. The runtime may accept a shorter, block-aligned range and keeps at least the final prompt token for local computation. `is_async=True` parks an accepted request until all workers finish its load.
+  * **Identity**: The runtime assigns a fresh `reservation_id` to each attempt. Keep reservation state by this identity, including when the same request is retried.
+
+* **`release_prefix_reservation(self, request: LlmRequest, reservation_id: int, start: int, end: int) -> None`**
+  * **Description**: Releases the named reservation's protection for the absolute half-open token interval `[start, end)`. The runtime releases rejected or clipped portions before transmission and the accepted portion after all workers report completion. Overlapping reservations must keep their own protection.
+  * **Lifetime**: This callback never asks the connector to interrupt an active transfer. Client cancellation after dispatch drains the load before releasing its source and destination resources.
 
 * **`request_finished(self, request: LlmRequest, cache_block_ids: list[int]) -> bool`**
   * **Description**: Called when a request completes generation.
@@ -54,6 +63,10 @@ These methods run on the leader process and drive the connector's behavior.
     ```
 
     Both example connectors walk `new_requests` only, so neither one demonstrates this.
+
+* **`request_reset(self, request: LlmRequest)`**
+  * **Description**: Optional, with a no-op default. The request's allocation has been released and it will run again from the start, unlike `request_finished`, which ends it. Any per-request state held in page indices now describes pages another request may own, so it must be dropped or rebuilt here.
+  * **When it fires**: on `KVCacheManagerV2`, from `free_resources`, which is the path a rollback or a failed admission takes. Direct preemption calls `request_finished` instead, so a connector keying state by request id sees exactly one of the two.
 
 * **`update_state_after_alloc_by_layer_group(self, request: LlmRequest, block_ids_by_layer_group: list[list[int]])`**
 * **`request_finished_by_layer_group(self, request: LlmRequest, cache_block_ids_by_layer_group: list[list[int]]) -> bool`**
@@ -175,13 +188,13 @@ KV pool; the scheduler's exhaustion error says so directly when a connector is a
 
 The connector holds page indices across iterations, and `RequestData` reports only the pages appended
 since the last call. Anything that hands a slot the connector already knows about to a different
-request therefore goes unreported and corrupts the next transfer against it. Three configurations do
-that, and each is rejected at bring-up.
+request therefore requires resetting the connector state before replay. The runtime applies the
+following configuration limits at bring-up.
 
 | Configuration | Mechanism |
 |---|---|
 | Speculative decoding | Rejected draft tokens shrink a request's page list, and the freed slot goes to whichever request allocates next. The connector is never told the tail block moved. |
-| A capacity scheduler policy other than `GUARANTEED_NO_EVICT` | A destroyed-and-replayed request comes back on different pages, and the connector's per-request block delta is then measured against pages that were freed with it. |
+| A capacity scheduler policy other than `GUARANTEED_NO_EVICT` with KV cache manager V1 | V1 does not reset the connector block delta when a request is destroyed and replayed. V2 resets that state and permits replay; an active connector load retains its allocation until completion. |
 | A host or disk cache tier | Tier eviction reassigns the GPU slot. See [KV cache tiers are GPU-only under a connector](#kv-cache-tiers-are-gpu-only-under-a-connector). |
 
 The exact set the runtime refuses depends on your cache configuration; the bring-up error is
@@ -238,16 +251,60 @@ Variable sliding-window attention is the case where that stops working, because 
 
 A model whose layers all share one sliding window stays a single layer group, so the flat callbacks still apply and such a connector is not refused. What differs is that the callbacks cover the **live window only**. Blocks the window has passed report `-1` (`BAD_PAGE_INDEX`) in place — the list stays aligned to block ordinals, so entry `i` still describes tokens `[i * tokens_per_block, (i+1) * tokens_per_block)`, but the up-front blocks carry no page and are not available to load into or save from. Filter with `valid_page_slots`, described in [Blocks with no page](#blocks-with-no-page); without it a `-1` resolves to the last page slot of the pool. A warning naming the window size is logged at start-up when a flat-only connector is attached to such a model.
 
-`get_num_new_matched_tokens` is asked once the batch for the upcoming forward pass is final. A request that is asked is therefore a request that runs, and the connector can take ownership of remote blocks in the query and release it in `request_finished`.
+##### Reserving a prefix during admission
 
-Two things are worth knowing when tuning a deployment.
+For connector implementers, scheduler participation requires three optional methods together:
+`reserve_prefix` and `release_prefix_reservation` on the scheduler, and
+`get_finished_prefix_loads` on the worker. Bring-up rejects a partial implementation. KV cache
+manager V2 enables this protocol when `SchedulerConfig.enable_prefix_aware_scheduling=True`.
+Connectors using the existing methods retain the final-batch query path.
 
-* **The runtime may honour less than you offer.** With chunked prefill the cache is allocated per context chunk, which is what bounds its memory, so an offer reaching past the current chunk requires the runtime to grow the allocation and that can fail under pressure. The runtime then serves the part it can cover and computes the rest locally. The amount actually served is what `RequestData.computed_position` reflects; the unserved remainder needs no action from the connector beyond its usual `request_finished` cleanup.
-* **The query is not part of the scheduler's budget.** The scheduler sizes a request's chunk as if the connector will serve nothing, so a served prefix reduces the work in the forward pass but does not free budget for another request in the same iteration.
+The scheduler charges compute tokens after the local and reserved external prefix. The complete
+prefix still needs destination KV pages, so a token-budget hit can remain limited by KV capacity.
+After the final admission checks, `SchedulerOutput.prefix_loads` authorizes the exact loads:
 
-Specify `enable_block_reuse=True` alongside the connector for any of this to run; see [Block reuse alongside the connector](#block-reuse-alongside-the-connector).
+| `PrefixLoad` field | Meaning |
+|---|---|
+| `reservation_id` | The identity supplied to `reserve_prefix`, also returned on completion. |
+| `request_id` | The request owning the allocation. |
+| `start`, `end` | Absolute half-open token interval to load. |
+| `is_async` | Whether the request waits outside the compute batch. |
+| `block_ids_by_layer_group` | Complete destination page lists, indexed by group and block ordinal. Filter entries through `valid_page_slots`. |
+| `tokens`, `cache_salt` | Request tokens and cache-key isolation salt. |
 
-`get_num_new_matched_tokens` is called **at most once per KV allocation**. This is the precise form of the "once per request" rule: if a request's KV cache is destroyed and the request is replayed -- which `MAX_UTILIZATION` does under memory pressure -- the replay asks again, because the pages the first answer described are gone.
+Build transfers from this collection. A confirmed async load appears here even when it is absent
+from `new_requests` and `cached_requests`, and even when the compute batch is empty. Those two
+lists continue to describe computation and its token/block deltas. The reservation itself supplies
+no permission to write destination memory.
+
+| Event | Connector and runtime behavior |
+|---|---|
+| Candidate queried | Connector protects the promised source; no transmission starts. |
+| Candidate rejected or offer shortened | Runtime releases the unused source interval. A later attempt gets a new reservation identity. |
+| Accepted load dispatched | Connector starts only the confirmed interval; runtime retains its destination allocation. |
+| Client cancels during transmission | Runtime keeps the allocation while the connector completes the load. |
+| Every worker completes | Runtime releases the source reservation, resumes a live request, or finalizes a cancelled request and frees its allocation. |
+
+Each worker reports completion after its destination writes and source reads finish. Reports are
+sent to the leader without a collective. Once every worker has reported, an ordered control item
+retires the load on all ranks before scheduling. This releases the source reservation and allows
+an async request to rejoin the compute batch, or a cancelled request to release its allocation.
+The runtime continues polling when no forward pass is scheduled. A transfer that never completes
+retains its resources; elapsed time alone cannot make pages safe to reuse.
+
+For a load admitted with computation, `wait_for_layer_load` establishes the dependency on that
+worker's transfer stream. Inference does not wait for the retirement control item.
+
+##### Legacy final-batch queries
+
+`get_num_new_matched_tokens` is called at most once per KV allocation after batch selection.
+Its offer can reduce computation for that request, but does not free token budget for another
+request in the same iteration. With chunked prefill, allocation growth can limit the served prefix;
+`RequestData.computed_position` reflects the load interval that the runtime honors.
+
+Destroying an allocation clears its connector state, so replay queries again. Specify
+`enable_block_reuse=True` alongside the connector; see
+[Block reuse alongside the connector](#block-reuse-alongside-the-connector).
 
 **Deployment note.** Under a connector, a workload that was token-bound becomes KV-bound: the connector removes forward-pass tokens but its prefix still occupies GPU pages. Lowering `max_num_tokens` to hand memory back to the KV pool is usually the right adjustment, the opposite of the guidance for a connector-free deployment.
 
@@ -280,6 +337,16 @@ These methods run on all workers (GPU processes) and interact with the actual GP
   * **Description**: Polled by the runtime to check the status of asynchronous operations.
   * **Returns**: Two lists of request IDs: those that have finished saving, and those that have finished loading.
 
+* **`get_finished_prefix_loads(self) -> list[int]`**
+  * **Description**: Reports locally completed reservation identities for loads dispatched through `SchedulerOutput.prefix_loads`, including synchronous loads. Completion means this worker has finished all reads and writes and established the required CUDA stream visibility. This method must not wait for other workers. The runtime collects reports asynchronously and distributes retirement decisions before scheduling; parked async requests resume and shared resources are released only after every worker has reported.
+  * **Compatibility**: Legacy request-ID load and save completions continue through `get_finished`.
+
+* **`shutdown(self)`**
+  * **Description**: Optional, with a no-op default. Releases whatever the worker holds — store handles, registered buffers, background threads. Called once, after the executor's worker thread has joined, so no transfer can start afterwards; implementations must be idempotent. Without it a worker's resources live as long as the process, so engines built back to back in one session accumulate them.
+
+* **`capacity_only(self) -> bool`** (property)
+  * **Description**: Optional, `False` by default. Declares a worker that contributes resources to an external store but transfers no KV of its own — for example a rank that lends host memory to a shared pool other engines read and write. Must be the same on every rank; the runtime gathers it at startup and rejects a deployment whose ranks disagree. Such a worker is never asked for a lookup, a save, a prefix reservation, or a completion, and the runtime keeps its own connector bookkeeping — page-index gathers, scheduler output, the per-layer hooks — off the forward path entirely.
+
 ## Example Implementation
 
 The file `examples/llm-api/llm_kv_cache_connector.py` provides a reference implementation of a **Persistent KV Cache**.
@@ -287,17 +354,19 @@ The file `examples/llm-api/llm_kv_cache_connector.py` provides a reference imple
 ### Overview
 
 This example implements a file-system based KV cache.
-1. **Save**: When a request finishes or needs to be swapped out, its KV blocks are saved to disk as `.pt` files.
+1. **Save**: After prefill, complete computed KV blocks are saved to disk as immutable `.pt` files.
 2. **Load**: When a new request arrives with the same prompt prefix, the connector identifies the cached files and loads them back into GPU memory, skipping re-computation.
 
 ### Implementation Details
 
-* **Metadata**: The example defines a `PersistentKvCacheConnectorMetadata` dataclass containing lists of `(file_path, block_id)` tuples for both loading and saving. This simple structure allows the Scheduler to tell the Worker exactly which file corresponds to which GPU block index.
+* **Metadata**: `PersistentKvCacheConnectorMetadata` carries `(file_path, block_id)` load/save targets and accepted reservation identities. The worker returns those identities after the copies finish.
 
-* **Hashing Strategy**: The `PersistentKvCacheConnectorLeader` hashes the token sequence of a block to generate a unique filename (e.g., `hash_value.pt`). This acts as the lookup key.
+* **Source protection**: Saves publish complete files atomically and never overwrite an existing inode. `reserve_prefix` creates private hard links to these immutable files without reading KV data. Releasing a range removes only its reservation links, so another reservation keeps its source available. External cache management must preserve this immutability: remove or replace a path rather than writing into a published file.
+
+* **Hashing Strategy**: `PersistentKvCacheConnectorLeader` hashes the entire token prefix through each block, together with `cache_salt`, using SHA-256. This distinguishes identical blocks reached through different preceding tokens and remains stable across Python processes. Use separate cache directories for different models and KV layouts.
 
 * **Worker Logic**:
-  * `start_load_kv`: Iterates through the load list provided in the metadata, loads the `.pt` file to CPU, and copies it to the specific `block_id` in the GPU tensor.
+  * `start_load_kv`: Reads only accepted load targets, copies their `.pt` data to GPU with blocking copies, and records their reservation identities for `get_finished_prefix_loads`.
   * `wait_for_save`: Performs the reverse. It copies data from the GPU `block_id` to CPU and saves it to disk using `torch.save`.
 
 ### Limitations & Patterns
@@ -305,7 +374,7 @@ This example implements a file-system based KV cache.
 This example illustrates the API mechanics but has several limitations that make it unsuitable for high-performance production use without modification:
 
 1. **Blocking I/O**: The example uses `torch.load` and `torch.save` synchronously. In a real implementation, these should be offloaded to a background thread or asynchronous I/O handler to avoid stalling the GPU.
-2. **Simplified Block Matching**: The `get_num_new_matched_tokens` implementation in the example only matches full blocks. It does not handle partial cache hits.
+2. **Simplified Block Matching**: The example matches and loads complete blocks, requires one layer group, and saves only the first context chunk. It does not demonstrate chunked-prefill persistence.
 3. **FileSystem Latency**: Storing one file per block can create high filesystem overhead.
 
 ### Usage
@@ -323,3 +392,111 @@ The script demonstrates:
 3. Creating a new LLM instance with the same connector config.
 4. Generating text for the same prompt (Second run).
 5. Asserting that the outputs match, proving the state was correctly restored from the disk cache.
+
+## Mooncake store
+
+`connector: mooncake-store` is a connector shipped with TensorRT-LLM. It backs the KV cache with a
+[Mooncake](https://github.com/kvcache-ai/Mooncake) store: a pool of host memory, lent by the
+participating ranks and addressed by content, that every server joining it can read and write. A
+prefix computed by one engine is therefore replayable by another, which block reuse alone cannot do
+because it never leaves the instance that computed it.
+
+The Python bindings it needs come from `mooncake-transfer-engine-cuda13`, pinned in
+`requirements.txt` and installed with TensorRT-LLM.
+
+### Starting the pool
+
+The pool's own settings — its master's address, the transport, the key namespace — are properties of
+the pool rather than of any engine in it, so a master publishes them once as a manifest and each
+server names that file:
+
+```bash
+# Once per deployment, before any server starts.
+trtllm-serve mooncake_master --pool_file /shared/pool.json --run_dir /shared/run
+
+# Afterwards, on any node: capacity the pool actually had, and where blocks landed.
+trtllm-serve mooncake_pool_report --run_dir /shared/run
+```
+
+Each server then renders its own Mooncake client config from the manifest and exports
+`MOONCAKE_CONFIG_PATH` for the ranks it spawns. A deployment that provisions the pool itself sets
+that variable instead, and an inherited value wins over the `mooncake_store` block.
+
+### Configuring a server
+
+```yaml
+kv_cache_config:
+  use_kv_cache_manager_v2: true
+  enable_block_reuse: true
+
+kv_connector_config:
+  connector: mooncake-store
+  mooncake_store:
+    pool: file:///shared/pool.json   # the manifest, or a master's host:port
+    role: both
+    segment_size: 32GiB              # host memory each rank lends
+    model_key: qwen2-1.5b-instruct   # what the pool keys this checkpoint by
+```
+
+`examples/llm-api/configs/trtllm_mooncake_store_connector_extra.yaml` is this file ready to pass to
+`trtllm-serve --extra_llm_api_options`. `KvCacheConnectorConfig.mooncake_store` documents every
+field; two are worth calling out. `model_key` has no default, because two engines that disagree
+about it read each other's pages as their own and a model path is a poor identity — `org-a/model`
+and `org-b/model` share a directory name while meaning different weights. `segment_size` is per
+rank against a per-node memory limit, so a node's demand is `ranks_on_node × segment_size` and is
+checked against available memory at startup.
+
+### Roles
+
+Capacity and traffic are separate: every role lends the memory its config asks for, and the role
+says only what the engine then does with the pool.
+
+| `role` | Reads the pool | Writes the pool | Typical use |
+|---|---|---|---|
+| `both` | yes | yes | An aggregated server, or a context server in a disaggregated deployment |
+| `producer` | no | yes | A server that fills the pool for others |
+| `consumer` | yes | no | A server that only replays what others stored |
+| `capacity` | no | no | A generation server: it lends memory and moves no KV |
+
+`capacity` is the right role for a disaggregated generation server. Generated tokens are rarely a
+reused prefix, and prompt KV reaches decode over the cache transceiver rather than through the
+pool, so decode-side traffic would cost bandwidth for no hits. Because such a rank registers no
+page addresses with the pool, it is also exempt from everything that exists to protect them: it
+keeps its own host and disk cache tiers, including the host tier
+[`MAX_UTILIZATION` suspends pages into](#kv-cache-tiers-are-gpu-only-under-a-connector), and pays
+no per-request or per-layer connector cost.
+
+### Settings this connector overrides
+
+For a role that transfers KV, the pool *is* the deployment's offload tier, so the server's own
+tiers would claim a second share of the same node's DRAM and their page migrations would invalidate
+the addresses registered with the pool. Two settings are therefore overridden, with a log line
+naming each, rather than rejected:
+
+| Setting | Effective value | Why |
+|---|---|---|
+| `kv_cache_config.host_cache_size`, `kv_cache_config.disk_cache_size` | `0` | Put the memory into `mooncake_store.segment_size`, where every server on the node can reuse what any of them stored. |
+| `kv_cache_config.enable_partial_reuse` | `False` | The connector addresses whole blocks, so a partial match leaves the matched length off a block boundary and the lookup is declined — trading part of one block for every stored block of the remaining prefix. |
+
+Both are settled in the `LLM` constructor, before the ranks are spawned and before the usage report
+reads the arguments, so `trtllm-serve`, `trtllm-bench` and a direct `LLM(...)` all see the same
+settings. A `capacity` server keeps both as configured.
+
+### Restrictions
+
+Checked at startup, before any request is admitted, because each one's failure mode is KV replayed
+without all of the state it was computed with — a wrong answer rather than a slow one.
+
+Beyond beam search, attention data parallelism, speculative decoding and Mamba/hybrid models, which
+are rejected for [every connector](#a-page-slot-must-not-be-reassigned-underneath-the-connector),
+this one also rejects KV cache manager V1, context parallelism, pipeline parallelism,
+sliding-window attention, and `sparse_attention_config` with an index-V cache unless
+`sparse_disable_index_value=True`; it bypasses individual requests that carry a LoRA adapter or
+multimodal content without hashes, leaving the rest of the deployment served.
+
+### How pages reach the pool
+
+Every page passes through a pinned host buffer. `stage_through_host` defaults to `true` and is the
+only supported value today, so `false` is ignored with a warning; registering the KV pools with
+Mooncake instead is planned for a later release. Staging costs a copy each way and needs no
+GPUDirect RDMA. A `capacity` server stages nothing, holding no KV in the pool.

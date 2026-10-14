@@ -42,10 +42,10 @@ from tensorrt_llm.visual_gen.args import (
 )
 
 try:
-    from tensorrt_llm._torch.visual_gen.attention_backend.flash_attn4 import (
+    from tensorrt_llm._torch.visual_gen.attention.backends.flash_attn4 import (
         _flash_attn_fwd as _fa4_fwd,
     )
-    from tensorrt_llm._torch.visual_gen.attention_backend.parallel import (
+    from tensorrt_llm._torch.visual_gen.attention.backends.parallel import (
         _flash_attn_combine as _fa_combine,
     )
 
@@ -88,7 +88,7 @@ COS_SIM_THRESHOLD = 0.97
 
 
 def init_distributed_worker(rank: int, world_size: int, backend: str = "nccl", port: int = 29500):
-    os.environ["MASTER_ADDR"] = "localhost"
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = str(port)
     os.environ["RANK"] = str(rank)
     os.environ["WORLD_SIZE"] = str(world_size)
@@ -395,8 +395,11 @@ class TestWanPipelineParallel:
 
     def test_cfg2_attn2d2x1_ulysses2_pvae8(self):
         """world=8, cfg=2, ulysses=2, attn2d=2×1, async_ulysses, parallel_vae=8 vs HF reference."""
-        if not _ATTN2D_AVAILABLE:
-            pytest.skip("FA4 / flash_attn_combine JIT kernels not available")
+        if torch.cuda.device_count() < 8:
+            pytest.skip(f"Test requires 8 GPUs, only {torch.cuda.device_count()} available")
+        assert _ATTN2D_AVAILABLE, (
+            "FA4 / flash_attn_combine JIT kernels not available; expected on the Blackwell CI runner"
+        )
         run_test_in_distributed(
             world_size=8,
             test_fn=_logic_wan_cfg2_attn2d2x1_ulysses2_pvae8,

@@ -13,6 +13,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pytest
+import torch
 
 from tensorrt_llm._torch.pyexecutor.executor_request_queue import RequestQueueItem
 from tensorrt_llm._torch.pyexecutor.request_utils import (
@@ -133,6 +134,100 @@ def test_executor_request_to_llm_request_adopts_context_phase_draft_tokens() -> 
     assert llm_request.draft_tokens == draft_tokens
     assert llm_request.py_draft_tokens == draft_tokens
     assert llm_request.context_phase_params.draft_tokens == draft_tokens
+
+
+def test_executor_request_to_llm_request_owns_end_id_in_python() -> None:
+    executor_request = trtllm.Request(
+        input_token_ids=[1, 2, 3],
+        max_tokens=10,
+        sampling_config=trtllm.SamplingConfig(num_return_sequences=2),
+        end_id=7,
+    )
+
+    llm_request = executor_request_to_llm_request(
+        42,
+        executor_request,
+        child_req_ids=[43],
+        exclude_last_generation_logits=False,
+    )
+
+    assert llm_request.py_end_id == 7
+    assert llm_request.child_requests[0].py_end_id == 7
+
+
+def test_executor_request_to_llm_request_owns_position_ids_in_python() -> None:
+    position_ids = [4, 7, 9]
+    executor_request = trtllm.Request(
+        input_token_ids=[1, 2, 3],
+        max_tokens=10,
+        sampling_config=trtllm.SamplingConfig(num_return_sequences=2),
+    )
+
+    llm_request = executor_request_to_llm_request(
+        42,
+        executor_request,
+        child_req_ids=[43],
+        exclude_last_generation_logits=False,
+        position_ids=position_ids,
+    )
+
+    assert llm_request.py_position_ids == position_ids
+    assert llm_request.child_requests[0].py_position_ids == position_ids
+    assert llm_request.child_requests[0].py_position_ids is not llm_request.py_position_ids
+
+
+def test_executor_request_to_llm_request_owns_guided_decoding_params_in_python() -> None:
+    params = trtllm.GuidedDecodingParams(trtllm.GuidedDecodingParams.GuideType.REGEX, guide=r"\d+")
+    executor_request = trtllm.Request(
+        input_token_ids=[1, 2, 3],
+        max_tokens=10,
+        sampling_config=trtllm.SamplingConfig(num_return_sequences=2),
+        guided_decoding_params=params,
+    )
+
+    llm_request = executor_request_to_llm_request(
+        42,
+        executor_request,
+        child_req_ids=[43],
+        exclude_last_generation_logits=False,
+    )
+
+    assert llm_request.py_guided_decoding_params.guide == params.guide
+    child_params = llm_request.child_requests[0].py_guided_decoding_params
+    assert child_params.guide == params.guide
+    assert child_params is not llm_request.py_guided_decoding_params
+
+
+def test_executor_request_to_llm_request_owns_mrope_data_in_python() -> None:
+    rotary_cos_sin = torch.arange(8, dtype=torch.float32).reshape(2, 4)
+    position_deltas = torch.tensor([-3], dtype=torch.int32)
+    position_ids = torch.arange(9, dtype=torch.int32).reshape(3, 1, 3)
+    executor_request = trtllm.Request(
+        input_token_ids=[1, 2, 3],
+        max_tokens=10,
+        sampling_config=trtllm.SamplingConfig(num_return_sequences=2),
+        mrope_config=trtllm.MropeConfig(rotary_cos_sin, position_deltas),
+    )
+    executor_request.py_multimodal_data = {"mrope_config": {"mrope_position_ids": position_ids}}
+
+    llm_request = executor_request_to_llm_request(
+        42,
+        executor_request,
+        child_req_ids=[43],
+        exclude_last_generation_logits=False,
+    )
+
+    mrope_config = llm_request.py_multimodal_data["mrope_config"]
+    assert mrope_config["mrope_position_ids"] is position_ids
+    torch.testing.assert_close(mrope_config["mrope_rotary_cos_sin"], rotary_cos_sin)
+    torch.testing.assert_close(mrope_config["mrope_position_deltas"], position_deltas)
+    child_config = llm_request.child_requests[0].py_multimodal_data["mrope_config"]
+    torch.testing.assert_close(child_config["mrope_rotary_cos_sin"], rotary_cos_sin)
+    assert child_config["mrope_rotary_cos_sin"].data_ptr() != rotary_cos_sin.data_ptr()
+    torch.testing.assert_close(child_config["mrope_position_deltas"], position_deltas)
+    assert child_config["mrope_position_deltas"].data_ptr() != position_deltas.data_ptr()
+    torch.testing.assert_close(child_config["mrope_position_ids"], position_ids)
+    assert child_config["mrope_position_ids"].data_ptr() != position_ids.data_ptr()
 
 
 def test_merge_helix_requests_with_padding():

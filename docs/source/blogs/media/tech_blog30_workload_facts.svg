@@ -1,0 +1,36 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="322" viewBox="0 0 1000 322" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif">
+<rect width="1000" height="322" fill="#f5f5f5"/>
+<rect x="16" y="16" width="230" height="124" rx="6" fill="#ffffff" stroke="#bfc0c0" stroke-width="1"/>
+<text x="28" y="46" font-size="22" font-weight="600" fill="#2d3142">Scale</text>
+<text x="28" y="80" font-size="30" font-weight="700" fill="#76B900">6.12B</text>
+<text x="28" y="102" font-size="12.5" fill="#4f5d75">requests served in one</text>
+<text x="28" y="117" font-size="12.5" fill="#4f5d75">production year</text>
+<rect x="262" y="16" width="230" height="124" rx="6" fill="#ffffff" stroke="#bfc0c0" stroke-width="1"/>
+<text x="274" y="46" font-size="22" font-weight="600" fill="#2d3142">Prompt-heavy</text>
+<text x="274" y="80" font-size="30" font-weight="700" fill="#76B900">14×</text>
+<text x="274" y="102" font-size="12.5" fill="#4f5d75">more input tokens than output</text>
+<text x="274" y="117" font-size="12.5" fill="#4f5d75">tokens</text>
+<rect x="508" y="16" width="230" height="124" rx="6" fill="#ffffff" stroke="#bfc0c0" stroke-width="1"/>
+<text x="520" y="46" font-size="22" font-weight="600" fill="#2d3142">Shorter outputs</text>
+<text x="520" y="80" font-size="30" font-weight="700" fill="#76B900">&lt;100</text>
+<text x="520" y="102" font-size="12.5" fill="#4f5d75">median output tokens, down</text>
+<text x="520" y="117" font-size="12.5" fill="#4f5d75">from a few hundred</text>
+<rect x="754" y="16" width="230" height="124" rx="6" fill="#ffffff" stroke="#bfc0c0" stroke-width="1"/>
+<text x="766" y="46" font-size="22" font-weight="600" fill="#2d3142">KV footprint</text>
+<text x="766" y="80" font-size="30" font-weight="700" fill="#76B900">27 GB</text>
+<text x="766" y="102" font-size="12.5" fill="#4f5d75">of KV state for one 100K-token</text>
+<text x="766" y="117" font-size="12.5" fill="#4f5d75">context</text>
+<text x="16" y="180" font-size="22" font-weight="600" fill="#2d3142">Reuse Opportunity</text>
+<rect x="16" y="194" width="312" height="112" rx="6" fill="#ffffff" stroke="#bfc0c0" stroke-width="1"/>
+<text x="28" y="232" font-size="30" font-weight="700" fill="#76B900">99%</text>
+<text x="28" y="258" font-size="16" fill="#2d3142">of repeat requests arrive within 15</text>
+<text x="28" y="278" font-size="16" fill="#2d3142">minutes of the previous one</text>
+<rect x="344" y="194" width="312" height="112" rx="6" fill="#ffffff" stroke="#bfc0c0" stroke-width="1"/>
+<text x="356" y="232" font-size="30" font-weight="700" fill="#76B900">50%</text>
+<text x="356" y="258" font-size="16" fill="#2d3142">of repeat requests come back</text>
+<text x="356" y="278" font-size="16" fill="#2d3142">within 0.1 seconds</text>
+<rect x="672" y="194" width="312" height="112" rx="6" fill="#ffffff" stroke="#bfc0c0" stroke-width="1"/>
+<text x="684" y="232" font-size="30" font-weight="700" fill="#76B900">96.5%</text>
+<text x="684" y="258" font-size="16" fill="#2d3142">of the prompt tokens in agentic</text>
+<text x="684" y="278" font-size="16" fill="#2d3142">coding jobs are reusable prefix</text>
+</svg>

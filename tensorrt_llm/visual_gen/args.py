@@ -95,6 +95,14 @@ class QuantAttentionConfig(StrictBaseModel):
             "V quantization block size on the hidden dimension; 0 uses one tensor-wide V scale."
         ),
     )
+    smooth_k: bool = Field(
+        False,
+        status="prototype",
+        description=(
+            "Subtract the per-channel K mean before quantizing K, which narrows the range the "
+            "quantized type has to cover. SageAttention only."
+        ),
+    )
 
 
 # Discriminated union of sparse attention configs.
@@ -126,22 +134,31 @@ class AttentionConfig(StrictBaseModel):
         status="prototype",
         description=(
             "Sparse attention recipe. Discriminated by algorithm: "
-            "skip_softmax (TRTLLM / CUTEDSL backends), vsa (CUTEDSL backend), "
-            "or sol_attn (CUTEDSL backend)."
+            "skip_softmax (TRTLLM / CUTEDSL backends), vsa (CUTEDSL / TRTLLM backends), "
+            "or sol_attn (TRTLLM / CUTEDSL backends)."
         ),
     )
 
     @model_validator(mode="after")
     def _validate_quant_attention_config(self) -> "AttentionConfig":
-        # Recipe tuple: (qk_dtype, v_dtype, (q_block, k_block, v_block)).
+        # SAGE supports different recipes for different architectures.
         SAGE_RECIPES = {
-            ("int8", "fp8", (1, 1, 1)),
-            ("int8", "fp8", (1, 4, 1)),
-            ("int8", "fp8", (1, 16, 1)),
-            ("fp8", "fp8", (1, 1, 1)),
-            ("fp8", "fp8", (1, 4, 1)),
+            90: {
+                ("int8", "fp8", (2, 16, 1)),
+            },
+            100: {
+                ("int8", "fp8", (1, 1, 1)),
+                ("int8", "fp8", (1, 4, 1)),
+                ("int8", "fp8", (1, 16, 1)),
+                ("fp8", "fp8", (1, 1, 1)),
+                ("fp8", "fp8", (1, 4, 1)),
+            },
+            103: {
+                ("fp8", "fp8", (1, 1, 1)),
+                ("fp8", "fp8", (1, 4, 1)),
+            },
         }
-        # cuDNN fused SDPA quantizes both GEMMs with the same element format.
+        # Other recipes verify the hardware at corresponding backend implementations.
         CUDNN_RECIPES = {
             ("fp8", "fp8", (0, 0, 0)),
             ("mxfp8", "mxfp8", (0, 0, 0)),
@@ -169,20 +186,18 @@ class AttentionConfig(StrictBaseModel):
             (q_config.q_block_size, q_config.k_block_size, q_config.v_block_size),
         )
         if self.backend == "TRTLLM":
-            if recipe in SAGE_RECIPES:
-                # int8 Q/K SAGE has a compiled cubin only on SM100.
-                if q_config.qk_dtype == "int8" and get_sm_version() != 100:
-                    raise ValueError(
-                        f"int8 Q/K SAGE quantized attention (backend='TRTLLM', "
-                        f"qk_dtype='int8', v_dtype='{q_config.v_dtype}') only supports sm_100."
-                    )
-            else:
+            recipes = SAGE_RECIPES.get(get_sm_version(), set())
+            if recipe not in recipes:
                 raise ValueError(
                     f"Unsupported quant_attention_config={self.quant_attention_config!r} "
-                    f"for backend='TRTLLM'. Supported SAGE recipes "
-                    f"(qk_dtype, v_dtype, (q_block, k_block, v_block)): "
-                    f"{sorted(SAGE_RECIPES)}."
+                    f"for backend='TRTLLM'. Supported SAGE recipes on this device: "
+                    f"{sorted(recipes)}."
                 )
+        elif q_config.smooth_k:
+            raise ValueError(
+                f"smooth_k is a SageAttention option and requires backend='TRTLLM', got "
+                f"backend='{self.backend}'."
+            )
         elif self.backend == "CUTEDSL":
             if recipe not in CUTEDSL_RECIPES:
                 raise ValueError(
@@ -224,8 +239,8 @@ class AttentionConfig(StrictBaseModel):
         algo = self.sparse_attention_config.algorithm
         supported_backends = {
             "skip_softmax": ("TRTLLM", "CUTEDSL"),
-            "vsa": ("CUTEDSL",),
-            "sol_attn": ("CUTEDSL",),
+            "vsa": ("CUTEDSL", "TRTLLM"),
+            "sol_attn": ("TRTLLM", "CUTEDSL"),
         }.get(algo)
         if supported_backends is None:
             return self
@@ -240,25 +255,19 @@ class AttentionConfig(StrictBaseModel):
         return self
 
     @model_validator(mode="after")
-    def _validate_cutedsl_quant_sparse_mutex(self) -> "AttentionConfig":
-        # VSA and Sol-Attn each replace the dense CuTeDSL path and cannot
-        # compose with quantized attention: create_attention swaps in their own
-        # backend class, which never consumes quant_attention_config, so the
-        # request would be silently ignored. SkipSoftmax is part of the dense
-        # path itself and can compose.
-        _replaces_dense_path = ("vsa", "sol_attn")
-        if (
-            self.backend == "CUTEDSL"
-            and self.quant_attention_config is not None
-            and self.sparse_attention_config is not None
-            and self.sparse_attention_config.algorithm in _replaces_dense_path
-        ):
-            raise ValueError(
-                f"CUTEDSL backend: quant_attention_config and "
-                f"'{self.sparse_attention_config.algorithm}' sparse_attention_config "
-                "are mutually exclusive (the CuTeDSLAttention dispatcher selects "
-                "either the dense path or that sparse path, not both)."
-            )
+    def _validate_quant_sparse_mutex(self) -> "AttentionConfig":
+        if self.quant_attention_config is None or self.sparse_attention_config is None:
+            return self
+
+        # VSA and SOL replace the dense attention path on every backend that
+        # serves them and never consume quant_attention_config, so accepting a
+        # quantization recipe would silently ignore user configuration.
+        # SkipSoftmax is part of the dense path itself and can compose.
+        algorithm = self.sparse_attention_config.algorithm
+        if algorithm == "vsa":
+            raise ValueError("VSA and quant_attention_config are mutually exclusive.")
+        if algorithm == "sol_attn":
+            raise ValueError("SOL and quant_attention_config are mutually exclusive.")
         return self
 
 
@@ -848,6 +857,7 @@ __all__ = [
     "QuantAttentionConfig",
     "SparseAttentionConfig",
     "SkipSoftmaxAttentionConfig",
+    "SolAttentionConfig",
     "VideoSparseAttentionConfig",
     "SolAttentionConfig",
     "AttentionConfig",

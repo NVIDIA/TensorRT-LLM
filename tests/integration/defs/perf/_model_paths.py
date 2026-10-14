@@ -79,6 +79,10 @@ MODEL_PATH_DICT = {
     "deepseek_v4_pro_dspark": "DeepSeek-V4-Pro-DSpark",
     # NVFP4 routed experts (MIXED_PRECISION); the -DSpark entry above is FP8.
     "deepseek_v4_pro_nvfp4_dspark": "DeepSeek-V4-Pro-nvfp4-DSpark",
+    # DeepSeek V4.1 Flash (CSA2 sparse attention, MXFP4 routed experts). The
+    # DSpark draft stages are embedded in this checkpoint, so it is also the
+    # `speculative_model` of the DSpark perf-sanity cases.
+    "deepseek_v41_flash": "DeepSeek-V4.1-Flash",
     # GLM-5 FP8 (MoE)
     "glm_5_fp8": "GLM-5-FP8",
     # GLM-5.2 NVFP4 (MoE, MLA + DSA on the DeepSeek-V3.2 code path)
@@ -93,7 +97,6 @@ MODEL_PATH_DICT = {
     # Keys below are sanity-side aliases; some point to the same weights as
     # entries above but are kept under sanity's historical naming.
     "deepseek_v32_fp4": "DeepSeek-V3.2-Exp-FP4-v2",
-    "k2_thinking_fp4": "Kimi-K2-Thinking-NVFP4",
     "k25_thinking_fp4": "Kimi-K2.5-NVFP4",
     "super_nvfp4": "NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4",
     "super_fp8": "NVIDIA-Nemotron-3-Super-120B-A12B-FP8",

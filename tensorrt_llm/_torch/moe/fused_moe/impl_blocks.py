@@ -72,6 +72,18 @@ class MoEExecutionContractMixin:
         """
         return False
 
+    def supports_unfinalized_output(self) -> bool:
+        """Whether ``run_moe(do_finalize=False)`` returns the unfinalized triple.
+
+        ``True`` means the kernel honors ``do_finalize=False`` and hands back
+        ``(gemm2_output, expert_weights, expanded_idx_to_permuted_idx)`` for
+        the caller to finalize. The default is ``False``: most kernels either
+        assert ``do_finalize`` or finalize regardless, and a registered
+        ``ConfigurableMoE.unfinalized_combine_fn`` must be rejected at
+        construction rather than fed a dense tensor at runtime.
+        """
+        return False
+
     @property
     def uses_locality_domain(self) -> bool:
         """True when this impl runs partitioned across locality domains."""
