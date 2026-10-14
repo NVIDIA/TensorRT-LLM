@@ -88,6 +88,34 @@ def format_duration(seconds):
 # ---------------------------------------------------------------------------
 # Test list rendering: shard split and regular/isolated separation
 # ---------------------------------------------------------------------------
+# Same markers, in the same order, as kVALID_TEST_LIST_MARKERS in
+# tests/integration/defs/test_list_parser.py.
+_TEST_LIST_MARKERS = ("XFAIL", "SKIP", "UNSTABLE", "TIMEOUT")
+
+
+def _test_list_name(line):
+    """Return the test name of a test list line, without its trailing marker."""
+    for marker in _TEST_LIST_MARKERS:
+        name, sep, _ = line.partition(f" {marker}")
+        if sep:
+            return name.strip()
+    return line.strip()
+
+
+def _find_test_list_line(test_name, lines):
+    """Return the line in ``lines`` that ``test_name`` was collected from.
+
+    An exact name match wins. A substring match is only a fallback, because a
+    test name can be a substring of an unrelated line, e.g. a unittest file
+    that another line excludes with ``--ignore=<file>``.
+    """
+    name = _test_list_name(test_name)
+    exact = next((line for line in lines if _test_list_name(line) == name), None)
+    if exact is not None:
+        return exact
+    return next((line for line in lines if test_name in line), None)
+
+
 def render_test_list(
     test_db_list, working_dir, splits, group, perf_mode, durations_path=None, pytest_targets=None
 ):
@@ -112,7 +140,7 @@ def render_test_list(
     original_lines = Path(test_db_list).read_text().splitlines()
 
     cleaned_lines = []
-    isolation_tests = set()
+    isolation_tests = []
 
     for line in original_lines:
         stripped = line.strip()
@@ -126,7 +154,7 @@ def render_test_list(
                 cleaned = cleaned.replace(",ISOLATION", "").strip()
             else:
                 cleaned = cleaned.replace(" ISOLATION", "").strip()
-            isolation_tests.add(cleaned)
+            isolation_tests.append(cleaned)
             cleaned_lines.append(cleaned)
         else:
             cleaned_lines.append(stripped)
@@ -233,14 +261,15 @@ def render_test_list(
                 end = trimmed.rindex("]")
                 trimmed = trimmed[start:end]
 
-            # Check if this test is in the isolation set
-            isolation_match = next((t for t in isolation_tests if trimmed in t), None)
-            if isolation_match:
-                isolate_tests.append(isolation_match)
+            # Every isolation test is also in cleaned_lines, so resolve the line
+            # first and then check whether it needs isolation.
+            cleaned_match = _find_test_list_line(trimmed, cleaned_lines)
+            if cleaned_match is None:
+                continue
+            if cleaned_match in isolation_tests:
+                isolate_tests.append(cleaned_match)
             else:
-                cleaned_match = next((t for t in cleaned_lines if trimmed in t), None)
-                if cleaned_match:
-                    regular_tests.append(cleaned_match)
+                regular_tests.append(cleaned_match)
 
     # Write regular and isolate list files
     regular_file = str(test_db_path.with_stem(test_db_path.stem + "_regular"))
