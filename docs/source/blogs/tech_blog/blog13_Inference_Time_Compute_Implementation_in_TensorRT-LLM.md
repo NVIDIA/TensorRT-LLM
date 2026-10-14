@@ -200,12 +200,12 @@ is a certainty-based, training-free approach to accelerate Chain-of-Thought (CoT
 #### Motivation of Dynasor-CoT
 LLM reasoning is highly token-inefficient, often requiring far more tokens to achieve the same accuracy as non-reasoning models. A major source of this inefficiency is that reasoning models tend to **self-doubt**; they often reach the correct answer early but then engage in extended verification behaviors like double-checking and reassessment.
 
-For instance, Figure 2 compares a traditional Qwen-7B model with a reasoning-focused, Deepseek-distilled Qwen-7B model on a simple question. While the traditional model reaches its answer in 180 tokens, the reasoning model expends 1,000 tokens on iterative verification, despite having already found the correct answer at token 340. This represents a significant waste of tokens for diminishing returns on accuracy.
+For instance, Figure 2 compares a traditional Qwen-7B model with a reasoning-focused, DeepSeek-distilled Qwen-7B model on a simple question. While the traditional model reaches its answer in 180 tokens, the reasoning model expends 1,000 tokens on iterative verification, despite having already found the correct answer at token 340. This represents a significant waste of tokens for diminishing returns on accuracy.
 
 <div align="center">
     <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog13_dynasor_hesitation.png" alt="Motivation" width="900px">
 </div>
-<p align="center"><sub><em>Figure 2. An example answer from reasoning model (Deepseek-distilled Qwen-2.5 7B) vs traditional model (Qwen-2.5 7B) on one of the problem in MATH500 dataset.</em></sub></p>
+<p align="center"><sub><em>Figure 2. An example answer from reasoning model (DeepSeek-distilled Qwen-2.5 7B) vs traditional model (Qwen-2.5 7B) on one of the problem in MATH500 dataset.</em></sub></p>
 
 #### The "Probe" technique
 Dynasor-CoT uses a **"Probe-In-The-Middle"** (or "probe" for short) technique, which prompts reasoning models to output early-stage results during intermediate steps of reasoning. Imagine you're in a math exam working on a hard problem. When time is up, you're forced to write down your final answer, regardless of how confident you are.
