@@ -31,8 +31,8 @@ from ..speculative.spec_sampler_base import SampleStateTensorsSpec
 from ..speculative.utils import get_draft_kv_cache_manager
 from ..utils import make_weak_ref, piecewise_cuda_graph
 from .llm_request import LlmRequest, get_draft_token_length
-from .resource_manager import (BaseResourceManager, ResourceManager,
-                               ResourceManagerType)
+from .resource_manager import (BaseResourceManager, NoFreeSlotsError,
+                               ResourceManager, ResourceManagerType)
 from .sampler import SampleStateTensors
 from .sampler.sampler_common import SampleType
 from .scheduler import ScheduledRequests
@@ -49,6 +49,32 @@ _STRICT_BUFFER_CHECK = _strict_buffer_check_enabled()
 
 # A large prime number used for dummy request IDs to avoid collisions
 CUDA_GRAPH_DUMMY_REQUEST_ID = (1 << 64) - 1
+
+
+def cuda_graph_dummy_request_id(runtime_draft_len: int, *, variant: int,
+                                max_draft_len: int) -> int:
+    """Return the disjoint padding-dummy ID for a draft/window variant."""
+    runtime_draft_len = int(runtime_draft_len)
+    variant = int(variant)
+    max_draft_len = int(max_draft_len)
+    if (variant not in (0, 1) or max_draft_len < 0 or runtime_draft_len < 0
+            or runtime_draft_len > max_draft_len):
+        raise ValueError("invalid CUDA padding dummy identity: "
+                         f"draft_len={runtime_draft_len}, variant={variant}, "
+                         f"max_draft_len={max_draft_len}")
+    return (CUDA_GRAPH_DUMMY_REQUEST_ID - variant * (max_draft_len + 1) -
+            runtime_draft_len)
+
+
+def _padding_dummy_draft_token_capacity(
+        spec_config: Optional[DecodingBaseConfig],
+        allocated_draft_tokens: int) -> int:
+    """Keep DSpark's physical-K bound without restricting tree speculation."""
+    if getattr(spec_config, "decoding_type", None) == "DSpark":
+        return int(spec_config.max_draft_len)
+    return int(allocated_draft_tokens)
+
+
 # Gen dummies get prompt_len = token_num - 1. Before capturing enc-dec decode
 # graphs, EncoderDecoderCudaGraphs.prepare_capture_batch temporarily runs each
 # dummy generation request as a one-token context chunk to write its cross-KV
@@ -59,6 +85,45 @@ ENC_DEC_CUDA_GRAPH_DUMMY_TOKEN_NUM = 2
 def get_mrope_dummy_seq_slot(max_num_tokens: int, pp_size: int) -> int:
     """Cache slot index reserved for MRoPE dummy/no-delta requests."""
     return max_num_tokens * pp_size
+
+
+@dataclass(frozen=True)
+class ADPShapeAgreement:
+    """One DSpark policy collective's queue and graph-shape agreement.
+
+    The object is local process state, so ``batch_identity`` is intentionally
+    the Python identity on this rank. The collective-derived fields are equal
+    across ranks. Only a finalized exact-policy agreement may suppress the
+    later graph-shape and padding collectives.
+    """
+
+    iteration: int
+    batch_identity: int
+    local_batch_size: int
+    peer_batch_sizes: Tuple[int, ...]
+    all_can_graph: bool
+    widest_batch_size: int
+    graph_batch_size: int
+    draft_len: int
+    padding_ready: bool
+    ragged_bucket: Optional[int] = None
+    reuse_graph_shape: bool = False
+
+    @property
+    def can_queue(self) -> bool:
+        return bool(self.peer_batch_sizes) and all(self.peer_batch_sizes)
+
+    @property
+    def can_queue_this_rank(self) -> bool:
+        return self.local_batch_size > 0
+
+    def matches(self, batch: ScheduledRequests, iteration: int, *,
+                padded: bool) -> bool:
+        expected_size = (self.graph_batch_size
+                         if padded else self.local_batch_size)
+        return (self.iteration == int(iteration)
+                and self.batch_identity == id(batch)
+                and batch.batch_size == expected_size)
 
 
 class KeyType(NamedTuple):
@@ -78,6 +143,9 @@ class KeyType(NamedTuple):
     num_encoder_tokens: int = 0
     peft_cache_data_type: Optional[torch.dtype] = None
     use_lora_graph: bool = False
+    # Total submitted verifier tokens for a ragged generation graph. ``None``
+    # retains the existing uniform graph family.
+    ragged_verify_bucket: Optional[int] = None
 
 
 def _save_spec_decode_capture_state(
@@ -451,7 +519,8 @@ class CUDAGraphRunner:
                        context_query_len=context_query_len,
                        num_encoder_tokens=num_encoder_tokens,
                        peft_cache_data_type=peft_cache_data_type,
-                       use_lora_graph=use_lora_graph)
+                       use_lora_graph=use_lora_graph,
+                       ragged_verify_bucket=self._ragged_verify_bucket(batch))
 
     def set_capture_sample_type(self,
                                 sample_type: Optional[SampleType]) -> None:
@@ -528,6 +597,32 @@ class CUDAGraphRunner:
         return min(compatible_keys,
                    key=lambda captured_key: captured_key.num_encoder_tokens)
 
+    def _ragged_verify_bucket(self, batch: ScheduledRequests) -> Optional[int]:
+        """Optional token bucket supplied by a specialized graph runner."""
+        return None
+
+    def _agree_graph_shape(
+        self, batch: ScheduledRequests, can_run_cuda_graph: bool,
+        promoted_context_request_ids: frozenset[int]
+    ) -> Tuple[bool, Optional[SampleType]]:
+        """Agree on graph eligibility, rows and sampling tier across ADP ranks."""
+        if not (self.enabled and self.config.enable_attention_dp
+                and self.config.mapping.tp_size > 1):
+            return True, None
+        local_sample_type = self._resolve_sample_type(
+            batch, promoted_context_request_ids)
+        graph_batch_info = self._gather_adp_graph_batch_info(
+            batch, can_run_cuda_graph, local_sample_type)
+        all_can_graph = all(rank_info[0] for rank_info in graph_batch_info)
+        all_batch_sizes_equal = all(rank_info[1] == graph_batch_info[0][1]
+                                    for rank_info in graph_batch_info)
+        if not all_can_graph or not all_batch_sizes_equal:
+            return False, None
+        forced_sample_type = (local_sample_type if all(
+            rank_info[2] == graph_batch_info[0][2]
+            for rank_info in graph_batch_info) else SampleType.FULL)
+        return True, forced_sample_type
+
     @staticmethod
     def _get_mrope_position_delta(request: Any) -> Optional[Any]:
         mrope_position_delta = getattr(request, "py_mrope_position_delta", None)
@@ -591,28 +686,10 @@ class CUDAGraphRunner:
         is_mixed_encoder_decoder = self._is_mixed_encoder_decoder_batch(batch)
         can_run_cuda_graph = self._can_run_cuda_graph_batch(batch)
         batch_size = batch.batch_size
-        # The sampling tier joins the graph key, so it has to agree across the
-        # attention-DP ranks or they would replay different graphs -- the same
-        # reason can_run_cuda_graph and batch_size are all-gathered here. Ranks
-        # see different batches (an idle one resolves FULL), so fall back to
-        # FULL for the whole group unless every rank picked the same tier.
-        forced_sample_type: Optional[SampleType] = None
-        if self.enabled and self.config.enable_attention_dp and self.config.mapping.tp_size > 1:
-            local_sample_type = self._resolve_sample_type(
-                batch, promoted_context_request_ids)
-            graph_batch_info = self._gather_adp_graph_batch_info(
-                batch, can_run_cuda_graph, local_sample_type)
-            all_can_run_cuda_graph = all(rank_info[0]
-                                         for rank_info in graph_batch_info)
-            all_batch_sizes_equal = all(rank_info[1] == graph_batch_info[0][1]
-                                        for rank_info in graph_batch_info)
-
-            if not all_can_run_cuda_graph or not all_batch_sizes_equal:
-                return None, None, None
-
-            forced_sample_type = (local_sample_type if all(
-                rank_info[2] == graph_batch_info[0][2]
-                for rank_info in graph_batch_info) else SampleType.FULL)
+        shapes_agree, forced_sample_type = self._agree_graph_shape(
+            batch, can_run_cuda_graph, promoted_context_request_ids)
+        if not shapes_agree:
+            return None, None, None
 
         if not self.enabled or not can_run_cuda_graph:
             return None, None, None
@@ -1020,6 +1097,25 @@ class CUDAGraphRunner:
             self._assert_graph_tensor_ptrs_stable(
                 stored_meta["spec_metadata"], stored_meta["spec_metadata_ptrs"])
 
+    def will_pad_to(self, padded_bs: int, num_requests: int) -> bool:
+        """Whether a batch of ``num_requests`` can actually reach ``padded_bs``.
+
+        Mirrors the SIZE guards in :meth:`_get_padded_batch` only; the
+        resource-dependent bails (dummy KV capacity, encoder-decoder state)
+        are deliberately not predicted. The ragged fit sizes its bucket grid
+        from the padded row count, so a wrong yes strands the fitted total in
+        no captured bucket.
+        """
+        if padded_bs <= 0 or num_requests <= 0:
+            return False
+        if padded_bs not in self.supported_batch_sizes:
+            return False
+        if padded_bs == num_requests:
+            return True  # already at a captured size, nothing to add
+        # _get_padded_batch bails when padding_size + batch_size exceeds the
+        # configured batch size; that sum is just padded_bs.
+        return padded_bs <= self.config.batch_size
+
     def _get_padded_batch(self, batch: ScheduledRequests,
                           resource_manager: ResourceManager,
                           runtime_draft_len: int) -> int:
@@ -1046,20 +1142,7 @@ class CUDAGraphRunner:
         """
         can_run_cuda_graph = self._can_run_cuda_graph_batch(batch)
         batch_size = batch.batch_size
-        new_batch_size = batch_size
-
-        if self.enabled and self.config.enable_attention_dp and self.config.mapping.tp_size > 1:
-            # Padding only agrees on eligibility and batch size; the tier slot
-            # is unused here. It is still sent so both per-iteration exchanges
-            # share one fixed-size payload, and a constant keeps this path from
-            # resolving a tier for a batch it is about to change.
-            graph_batch_info = self._gather_adp_graph_batch_info(
-                batch, can_run_cuda_graph, SampleType.FULL)
-            all_can_run_cuda_graph = all(rank_info[0]
-                                         for rank_info in graph_batch_info)
-            if all_can_run_cuda_graph:
-                new_batch_size = max(rank_info[1]
-                                     for rank_info in graph_batch_info)
+        new_batch_size = self._get_padding_batch_size(batch, can_run_cuda_graph)
 
         if (not self.enabled or not self.padding_enabled
                 or not can_run_cuda_graph
@@ -1072,6 +1155,7 @@ class CUDAGraphRunner:
         # otherwise this reduces to plain batch-size rounding.
         padded_batch_size = self._round_up_batch_size_with_draft_len(
             new_batch_size, runtime_draft_len)
+        self._validate_padding_batch_size(batch, padded_batch_size)
 
         if batch_size == padded_batch_size:
             return 0
@@ -1096,12 +1180,56 @@ class CUDAGraphRunner:
                 key=f"cuda_graph_padding_dummy_fallback_{runtime_draft_len}")
             return 0
 
+        return self._append_padding_requests(batch, resource_manager,
+                                             runtime_draft_len,
+                                             padding_dummy_request,
+                                             padding_size)
+
+    def _get_padding_batch_size(self, batch: ScheduledRequests,
+                                can_run_cuda_graph: bool) -> int:
+        new_batch_size = batch.batch_size
+        if (self.enabled and self.config.enable_attention_dp
+                and self.config.mapping.tp_size > 1):
+            graph_batch_info = self._gather_adp_graph_batch_info(
+                batch, can_run_cuda_graph, SampleType.FULL)
+            if all(rank_info[0] for rank_info in graph_batch_info):
+                new_batch_size = max(rank_info[1]
+                                     for rank_info in graph_batch_info)
+        return new_batch_size
+
+    def _validate_padding_batch_size(self, batch: ScheduledRequests,
+                                     padded_batch_size: int) -> None:
+        """Validate a specialized runner's pre-agreed padding shape."""
+
+    def _append_padding_requests(self, batch: ScheduledRequests,
+                                 resource_manager: ResourceManager,
+                                 runtime_draft_len: int,
+                                 padding_dummy_request: LlmRequest,
+                                 padding_size: int) -> int:
         batch.generation_requests.extend([padding_dummy_request] * padding_size)
         return padding_size
 
-    def _get_or_create_padding_dummy(
-            self, resource_manager: ResourceManager,
-            runtime_draft_len: int) -> Optional[LlmRequest]:
+    def _padding_dummy_cache(self, variant: int) -> Dict[int, LlmRequest]:
+        if variant != 0:
+            raise ValueError(
+                f"unsupported CUDA padding dummy variant {variant}")
+        return self.padding_dummy_requests
+
+    def _padding_dummy_caches(self) -> Tuple[Dict[int, LlmRequest], ...]:
+        return (self.padding_dummy_requests, )
+
+    def reset_padding_dummies(self) -> None:
+        """Drop cached request objects when their resource manager changes."""
+        self.padding_dummy_requests = {}
+
+    def _on_padding_dummy_release(self) -> None:
+        """Invalidate specialized padding agreements after resource release."""
+
+    def _get_or_create_padding_dummy(self,
+                                     resource_manager: ResourceManager,
+                                     runtime_draft_len: int,
+                                     *,
+                                     variant: int = 0) -> Optional[LlmRequest]:
         """Returns the padding dummy request for the given draft length,
         allocating it from the KV cache manager on first use.
 
@@ -1109,8 +1237,9 @@ class CUDAGraphRunner:
         (e.g. saturated cache); the batch cannot be padded until a retry
         succeeds.
         """
-        if runtime_draft_len in self.padding_dummy_requests:
-            return self.padding_dummy_requests[runtime_draft_len]
+        cache = self._padding_dummy_cache(variant)
+        if runtime_draft_len in cache:
+            return cache[runtime_draft_len]
 
         kv_cache_manager = resource_manager.get_resource_manager(
             self.config.kv_cache_manager_key)
@@ -1133,8 +1262,10 @@ class CUDAGraphRunner:
         draft_kv_cache_manager = get_draft_kv_cache_manager(
             self.spec_config, resource_manager)
 
-        # Use unique dummy request ID per draft length
-        dummy_request_id = CUDA_GRAPH_DUMMY_REQUEST_ID - runtime_draft_len
+        max_draft_len = _padding_dummy_draft_token_capacity(
+            self.spec_config, runtime_draft_token_buffer_width)
+        dummy_request_id = cuda_graph_dummy_request_id(
+            runtime_draft_len, variant=variant, max_draft_len=max_draft_len)
         dummy_request = kv_cache_manager.add_dummy_requests(
             [dummy_request_id],
             token_nums=[ENC_DEC_CUDA_GRAPH_DUMMY_TOKEN_NUM]
@@ -1151,17 +1282,43 @@ class CUDAGraphRunner:
             return None
         dummy_request = dummy_request[0]
         dummy_request.is_cuda_graph_dummy = True
-        if self.is_encoder_decoder:
-            if not self._add_cross_dummy_request(
-                    dummy_request, resource_manager, dummy_encoder_output_len,
-                    draft_kv_cache_manager):
-                return None
+        registered_managers: List[BaseResourceManager] = [kv_cache_manager]
+        if (draft_kv_cache_manager is not None
+                and draft_kv_cache_manager is not kv_cache_manager):
+            registered_managers.append(draft_kv_cache_manager)
 
-        spec_res_mgr = resource_manager.get_resource_manager(
-            ResourceManagerType.SPEC_RESOURCE_MANAGER)
-        if spec_res_mgr:
-            spec_res_mgr.add_dummy_requests([dummy_request_id])
-        self.padding_dummy_requests[runtime_draft_len] = dummy_request
+        def rollback() -> None:
+            for manager in reversed(registered_managers):
+                manager.free_resources(dummy_request)
+
+        try:
+            if self.is_encoder_decoder:
+                cross_kv_cache_manager = resource_manager.get_resource_manager(
+                    ResourceManagerType.CROSS_KV_CACHE_MANAGER)
+                if (cross_kv_cache_manager is None
+                        or not self._add_cross_dummy_request(
+                            dummy_request, resource_manager,
+                            dummy_encoder_output_len, draft_kv_cache_manager)):
+                    rollback()
+                    return None
+                if not any(cross_kv_cache_manager is manager
+                           for manager in registered_managers):
+                    registered_managers.append(cross_kv_cache_manager)
+
+            spec_res_mgr = resource_manager.get_resource_manager(
+                ResourceManagerType.SPEC_RESOURCE_MANAGER)
+            if spec_res_mgr:
+                spec_res_mgr.add_dummy_requests([dummy_request_id])
+                if not any(spec_res_mgr is manager
+                           for manager in registered_managers):
+                    registered_managers.append(spec_res_mgr)
+        except NoFreeSlotsError:
+            rollback()
+            return None
+        except Exception:
+            rollback()
+            raise
+        cache[runtime_draft_len] = dummy_request
         return dummy_request
 
     def _padding_dummy_managers(
@@ -1198,20 +1355,27 @@ class CUDAGraphRunner:
         manager that allocated part of it, and drops it from the runner so a
         later padded step re-creates it.
 
-        One dummy request ID is spread across up to four managers -- the main
-        KV cache manager, the one-model draft KV cache manager, the
+        Each dummy request ID is spread across up to four managers --
+        the main KV cache manager, the one-model draft KV cache manager, the
         speculative resource manager slot and the encoder-decoder cross-KV
-        cache manager.  Releasing only the main one leaves the others holding
-        the ID, and re-creation reuses the same
-        ``CUDA_GRAPH_DUMMY_REQUEST_ID - runtime_draft_len``.
+        cache manager. Releasing only the main one leaves the others holding
+        the ID; re-creation deterministically reuses the same variant ID.
 
         Returns True if a dummy was held for that draft length.
         """
-        dummy_request = self.padding_dummy_requests.pop(runtime_draft_len, None)
-        if dummy_request is None:
+        dummy_requests = [
+            cache.pop(runtime_draft_len, None)
+            for cache in self._padding_dummy_caches()
+        ]
+        dummy_requests = [
+            request for request in dummy_requests if request is not None
+        ]
+        if not dummy_requests:
             return False
-        for manager in self._padding_dummy_managers(resource_manager):
-            manager.free_resources(dummy_request)
+        self._on_padding_dummy_release()
+        for dummy_request in dummy_requests:
+            for manager in self._padding_dummy_managers(resource_manager):
+                manager.free_resources(dummy_request)
         return True
 
     def _can_pad_any_batch(self, runtime_draft_len: int) -> bool:
@@ -1270,6 +1434,12 @@ class CUDAGraphRunner:
                 logger.info(
                     "Pre-allocated the CUDA graph padding dummy request "
                     f"(draft_len={draft_len}) at warmup.")
+            self._preallocate_extra_padding_dummy(resource_manager, draft_len)
+
+    def _preallocate_extra_padding_dummy(self,
+                                         resource_manager: ResourceManager,
+                                         draft_len: int) -> None:
+        """Reserve any additional padding variants required by a subclass."""
 
     def _add_cross_dummy_request(
             self, dummy_request: LlmRequest, resource_manager: ResourceManager,
@@ -1293,11 +1463,6 @@ class CUDAGraphRunner:
         if cross_dummy_requests is not None:
             return True
 
-        kv_cache_manager = resource_manager.get_resource_manager(
-            self.config.kv_cache_manager_key)
-        kv_cache_manager.free_resources(dummy_request)
-        if draft_kv_cache_manager is not None:
-            draft_kv_cache_manager.free_resources(dummy_request)
         return False
 
     @staticmethod
@@ -1368,12 +1533,207 @@ class CUDAGraphRunner:
         self.graph_outputs.clear()
         self.graph_metadata.clear()
         self._pre_replay_position_ids = None
-        self.padding_dummy_requests = {}
+        self.reset_padding_dummies()
         del self.memory_pool
         self.memory_pool = None
         if release_nccl_window_owners and graph_pool is not None:
             release_nccl_window_graph_owner(graph_pool)
         torch.cuda.empty_cache()
+
+
+class DSparkCUDAGraphRunner(CUDAGraphRunner):
+    """Ragged verification graph policy for confidence-enabled DSpark."""
+
+    def __init__(self, config: CUDAGraphRunnerConfig) -> None:
+        super().__init__(config)
+        # Zero-real exact cells use low/high rows to represent V=G*q+r.
+        self.ragged_pad_verify_len = 0
+        self.ragged_zero_real_high_rows = 0
+        # The decoder publishes the fitted bucket before graph lookup.
+        self.agreed_ragged_bucket: Optional[int] = None
+        self.adp_shape_agreement: Optional[ADPShapeAgreement] = None
+        self.secondary_padding_dummy_requests: Dict[int, LlmRequest] = {}
+
+    def _ragged_verify_bucket(self, batch: ScheduledRequests) -> Optional[int]:
+        """Return the agreed token bucket only when every row has a window."""
+        # A window-less batch must not replay stale token-major row maps.
+        if any(
+                getattr(request, "py_verify_len", None) is None
+                for request in batch.generation_requests):
+            return None
+        # Use the globally fitted bucket, never a rank-local window sum.
+        return self.agreed_ragged_bucket
+
+    @staticmethod
+    def _local_draft_len(batch: ScheduledRequests) -> int:
+        """Report malformed batches' maximum so the shape gate declines them."""
+        return max((len(request.py_draft_tokens)
+                    for request in batch.generation_requests),
+                   default=0)
+
+    def _agree_graph_shape(
+        self, batch: ScheduledRequests, can_run_cuda_graph: bool,
+        promoted_context_request_ids: frozenset[int]
+    ) -> Tuple[bool, Optional[SampleType]]:
+        agreement = self.adp_shape_agreement
+        # The policy agreement covers shape, not the in-graph sampling tier.
+        reuse_agreement = bool(
+            agreement is not None and agreement.reuse_graph_shape
+            and not self.enable_in_graph_sampling
+            and agreement.matches(batch, agreement.iteration, padded=True))
+        if reuse_agreement:
+            if (not can_run_cuda_graph
+                    or batch.batch_size != agreement.graph_batch_size or
+                    self._ragged_verify_bucket(batch) != agreement.ragged_bucket
+                    or self._local_draft_len(batch) != agreement.draft_len):
+                raise RuntimeError(
+                    "DSpark cached ADP graph-shape agreement no longer "
+                    "matches the local replay key")
+        adp_graph_agreement = (self.enabled and self.config.enable_attention_dp
+                               and self.config.mapping.tp_size > 1)
+        local_sample_type = self._resolve_sample_type(
+            batch,
+            promoted_context_request_ids) if adp_graph_agreement else None
+        if not adp_graph_agreement or reuse_agreement:
+            return True, None
+
+        # Replay freezes all_rank_num_tokens. Compare every rank-local shape
+        # component before launch; -1 denotes a non-applicable field.
+        local_bucket = self._ragged_verify_bucket(
+            batch) if can_run_cuda_graph else None
+        peer_shapes = self.config.dist.tp_allgather_int64([
+            can_run_cuda_graph,
+            batch.batch_size,
+            -1 if local_bucket is None else int(local_bucket),
+            self._local_draft_len(batch) if can_run_cuda_graph else -1,
+            local_sample_type.value,
+        ]).tolist()
+        if (not all(peer[0] for peer in peer_shapes)
+                or not all(peer[1:4] == peer_shapes[0][1:4]
+                           for peer in peer_shapes)):
+            return False, None
+        forced_sample_type = (local_sample_type if all(
+            peer[4] == peer_shapes[0][4]
+            for peer in peer_shapes) else SampleType.FULL)
+        return True, forced_sample_type
+
+    def _get_num_tokens_for_key(self, key: KeyType) -> int:
+        if key.ragged_verify_bucket is not None:
+            if key.num_contexts:
+                raise ValueError(
+                    "Ragged verifier graphs do not support mixed context batches."
+                )
+            return int(key.ragged_verify_bucket)
+        return super()._get_num_tokens_for_key(key)
+
+    def _reusable_padding_agreement(
+            self, batch: ScheduledRequests) -> Optional[ADPShapeAgreement]:
+        agreement = self.adp_shape_agreement
+        if (agreement is not None and agreement.reuse_graph_shape and
+                agreement.matches(batch, agreement.iteration, padded=False)):
+            return agreement
+        return None
+
+    def _get_padding_batch_size(self, batch: ScheduledRequests,
+                                can_run_cuda_graph: bool) -> int:
+        agreement = self._reusable_padding_agreement(batch)
+        if agreement is None:
+            return super()._get_padding_batch_size(batch, can_run_cuda_graph)
+        if not can_run_cuda_graph or not agreement.padding_ready:
+            raise RuntimeError(
+                "DSpark cached ADP padding agreement lost a local "
+                "eligibility invariant")
+        return agreement.widest_batch_size
+
+    def _validate_padding_batch_size(self, batch: ScheduledRequests,
+                                     padded_batch_size: int) -> None:
+        agreement = self._reusable_padding_agreement(batch)
+        if (agreement is not None
+                and padded_batch_size != agreement.graph_batch_size):
+            raise RuntimeError(
+                "DSpark cached ADP padding agreement selected a different "
+                "graph batch size")
+
+    def _append_padding_requests(self, batch: ScheduledRequests,
+                                 resource_manager: ResourceManager,
+                                 runtime_draft_len: int,
+                                 padding_dummy_request: LlmRequest,
+                                 padding_size: int) -> int:
+        # The ragged fit chooses windows before cached dummies are appended.
+        secondary_padding_dummy = None
+        high_padding_rows = 0
+        if self.ragged_zero_real_high_rows:
+            if (batch.batch_size != 1
+                    or not batch.generation_requests[0].is_attention_dp_dummy
+                    or self.ragged_zero_real_high_rows
+                    > batch.batch_size + padding_size):
+                raise RuntimeError(
+                    "DSpark zero-real heterogeneous padding lost its single "
+                    "scheduled attention-DP dummy invariant")
+            high_padding_rows = self.ragged_zero_real_high_rows - 1
+            if high_padding_rows > 0:
+                secondary_padding_dummy = self._get_or_create_padding_dummy(
+                    resource_manager, runtime_draft_len, variant=1)
+                if secondary_padding_dummy is None:
+                    logger.warning_once(
+                        "Failed to allocate the secondary DSpark CUDA graph "
+                        "padding dummy; falling back to native verification.",
+                        key=("dspark_secondary_padding_dummy_fallback_"
+                             f"{runtime_draft_len}"))
+                    return 0
+        ragged = any(
+            getattr(request, "py_verify_len", None) is not None
+            for request in batch.generation_requests)
+        padding_dummy_request.py_verify_len = (self.ragged_pad_verify_len
+                                               if ragged else None)
+        if secondary_padding_dummy is not None:
+            secondary_padding_dummy.py_verify_len = (
+                self.ragged_pad_verify_len + 1 if ragged else None)
+        low_padding_rows = padding_size - high_padding_rows
+        if low_padding_rows < 0:
+            raise RuntimeError(
+                "DSpark zero-real high-row count exceeds CUDA padding rows")
+        if high_padding_rows:
+            batch.generation_requests.extend([secondary_padding_dummy] *
+                                             high_padding_rows)
+        batch.generation_requests.extend([padding_dummy_request] *
+                                         low_padding_rows)
+        return padding_size
+
+    def _padding_dummy_cache(self, variant: int) -> Dict[int, LlmRequest]:
+        if variant == 1:
+            return self.secondary_padding_dummy_requests
+        return super()._padding_dummy_cache(variant)
+
+    def _padding_dummy_caches(self) -> Tuple[Dict[int, LlmRequest], ...]:
+        return super()._padding_dummy_caches() + (
+            self.secondary_padding_dummy_requests, )
+
+    def reset_padding_dummies(self) -> None:
+        super().reset_padding_dummies()
+        self.secondary_padding_dummy_requests = {}
+        self.ragged_zero_real_high_rows = 0
+        self.adp_shape_agreement = None
+
+    def _on_padding_dummy_release(self) -> None:
+        # Releasing a dummy invalidates the agreement that certified it.
+        self.adp_shape_agreement = None
+
+    def _preallocate_extra_padding_dummy(self,
+                                         resource_manager: ResourceManager,
+                                         draft_len: int) -> None:
+        if not getattr(self.spec_config, "confidence_sps_table_path", None):
+            return
+        if self._get_or_create_padding_dummy(resource_manager,
+                                             draft_len,
+                                             variant=1) is None:
+            logger.warning("Could not pre-allocate the secondary DSpark CUDA "
+                           "graph padding dummy "
+                           f"(draft_len={draft_len}); non-divisible zero-real "
+                           "exact cells will remain native.")
+        else:
+            logger.info("Pre-allocated the secondary DSpark CUDA graph "
+                        f"padding dummy (draft_len={draft_len}).")
 
 
 EncoderKeyType: TypeAlias = Tuple[int, int, int]
