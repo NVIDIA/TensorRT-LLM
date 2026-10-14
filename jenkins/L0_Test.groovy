@@ -6843,7 +6843,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         "GB300-8_GPUs-2_Nodes-PyTorch-PerfSanity-GEN1-NODE2-GPU8-Post-Merge",
         "auto:gb300-flex",
         "l0_gb300_multi_nodes_perf_sanity_gen1_node2_gpu8",
-        5,
+        6,
         8,
         2
     )
@@ -6852,7 +6852,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         "GB300-16_GPUs-4_Nodes-PyTorch-PerfSanity-GEN1-NODE4-GPU16-Post-Merge",
         "auto:gb300-flex",
         "l0_gb300_multi_nodes_perf_sanity_gen1_node4_gpu16",
-        2,
+        5,
         16,
         4
     )
@@ -6939,6 +6939,17 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         1,
         64,
         16
+    )
+    // ctx_only of the Kimi-K3 AgentX configs: the DWDP16 ctx side as one
+    // 16-GPU attention-DP server on 4 nodes. Their gen_only_no_context lanes
+    // run in the GEN1-NODE2-GPU8 / GEN1-NODE4-GPU16 stages above.
+    multiNodesSBSAConfigs += buildStageConfigs(
+        "GB300-16_GPUs-4_Nodes-PyTorch-PerfSanity-Node4-GPU16-Post-Merge",
+        "auto:gb300-flex",
+        "l0_gb300_multi_nodes_perf_sanity_node4_gpu16",
+        4,
+        16,
+        4
     )
     multiNodesSBSAConfigs = cbtsResizeSplits(multiNodesSBSAConfigs)
     fullSet += multiNodesSBSAConfigs.keySet()
