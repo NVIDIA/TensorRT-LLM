@@ -5407,7 +5407,7 @@ def _cell_mla_context(cell) -> None:
         atol=FP8_MLA_ATOL,
         msg=lambda m: f"op.reference disagrees with _fp8_no_append_reference\n{m}",
     )
-    _compare(out, ref)
+    torch.testing.assert_close(out, ref, rtol=FP8_MLA_RTOL, atol=FP8_MLA_ATOL)
 
 
 @pytest.mark.parametrize("cell", op.CELLS, ids=[c.why[:44] for c in op.CELLS])
