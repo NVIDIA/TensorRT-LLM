@@ -867,6 +867,7 @@ class Glm5NextLinearAttention(KimiKDALinearAttention):
         dtype: torch.dtype = torch.bfloat16,
         mapping: Mapping | None = None,
         allreduce_strategy: AllReduceStrategy = AllReduceStrategy.ONESHOT,
+        aux_stream: torch.cuda.Stream | None = None,
     ) -> None:
         del dtype  # the shared mixer is bf16 (fp32 gate parameters and pools)
         # The checkpoint's ``linear_attn_config`` does not name the gate rank:
@@ -879,7 +880,13 @@ class Glm5NextLinearAttention(KimiKDALinearAttention):
         # The mixer's own row-parallel o_proj AllReduce (fixed strategy; the
         # size-aware Glm5NextAllReduce used elsewhere is a perf option, not a
         # correctness requirement, and AUTO's autotuner raced at TP4 decode).
-        super().__init__(config, layer_idx, mapping=mapping, allreduce_strategy=allreduce_strategy)
+        super().__init__(
+            config,
+            layer_idx,
+            mapping=mapping,
+            allreduce_strategy=allreduce_strategy,
+            aux_stream=aux_stream,
+        )
         # Preserve checkpoint FP32 gate parameters. MetaInitMode rejects detach
         # on meta tensors, so create empty FP32 parameters on that branch.
         for name in ("A_log", "dt_bias"):
@@ -1740,6 +1747,7 @@ class Glm5NextDecoderLayer(DecoderLayer):
         model_config: ModelConfig,
         dtype: torch.dtype = torch.bfloat16,
         aux_stream: torch.cuda.Stream | None = None,
+        attention_aux_stream: torch.cuda.Stream | None = None,
     ) -> None:
         super().__init__()
         self.layer_idx = layer_idx
@@ -1755,6 +1763,7 @@ class Glm5NextDecoderLayer(DecoderLayer):
                 dtype=dtype,
                 mapping=mapping,
                 allreduce_strategy=model_config.allreduce_strategy,
+                aux_stream=attention_aux_stream,
             )
         else:
             self.self_attn = Glm5NextSparseAttention(
@@ -1855,8 +1864,11 @@ class Glm5NextModel(DecoderModel):
 
         # Decoder and draft layers execute serially and share this side stream.
         self.aux_stream_dict = {}
-        if not model_config.mapping.enable_attention_dp and torch.cuda.is_available():
-            self.aux_stream_dict[AuxStreamType.MoeShared] = torch.cuda.Stream()
+        if torch.cuda.is_available():
+            # KDA overlaps its small gate projections with the QKV projection.
+            self.aux_stream_dict[AuxStreamType.Attention] = torch.cuda.Stream()
+            if not model_config.mapping.enable_attention_dp:
+                self.aux_stream_dict[AuxStreamType.MoeShared] = torch.cuda.Stream()
 
         self.embed_tokens = Embedding(int(config.vocab_size), int(config.hidden_size), dtype=dtype)
         self.layers = nn.ModuleList(
@@ -1868,6 +1880,7 @@ class Glm5NextModel(DecoderModel):
                     model_config,
                     dtype=dtype,
                     aux_stream=self.aux_stream_dict.get(AuxStreamType.MoeShared),
+                    attention_aux_stream=self.aux_stream_dict.get(AuxStreamType.Attention),
                 )
                 for i in range(schedule.num_layers)
             ]
@@ -1903,16 +1916,10 @@ class Glm5NextModel(DecoderModel):
         # class appends the draft layer(s) to ``self.layers`` (so the
         # checkpoint's ``model.layers.45.*`` names resolve), and those run in
         # the speculative worker's draft loop, not here.
-        # Generation-only batches take the fused hyper-connection loop. Prefill
-        # (and mixed) batches keep the per-layer path so the engine's warmup /
-        # KV-cache sizing pass measures the same activation peak that mixed
-        # context+generation iterations reach in production (a lower
-        # pure-prefill peak over-allocates the KV cache and OOMs later).
-        if (
-            runtime_ctx.num_contexts == 0
-            and runtime_ctx.num_generations > 0
-            and self._fused_hc_ok()
-        ):
+        # Every batch phase takes the fused hyper-connection loop, so the
+        # engine's warmup / KV-cache sizing pass measures the same activation
+        # peak that mixed context+generation iterations reach in production.
+        if self._fused_hc_ok():
             return self.collapse_streams(self._forward_single_phase_fused_hc(streams, runtime_ctx))
         for layer_idx in range(self.schedule.num_layers):
             streams = self.layers[layer_idx](
@@ -1944,8 +1951,8 @@ class Glm5NextModel(DecoderModel):
         RMSNorm; ``mHC.fused_hc`` (the in-tree DeepSeek-V4 boundary op) runs
         the three as one kernel, so a layer costs 2 fused boundaries instead
         of 4 mappings + 2 norms. The math matches the per-layer forward; the
-        first pre-mapping and last post-mapping stay unfused. Only generation-only batches use it
-        (see :meth:`forward`).
+        first pre-mapping and last post-mapping stay unfused. Pipeline-parallel
+        ranks keep the per-layer path (see :meth:`_fused_hc_ok`).
         """
         num_layers = self.schedule.num_layers
         first = self.layers[0]
