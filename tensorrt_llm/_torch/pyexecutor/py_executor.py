@@ -893,9 +893,6 @@ class PyExecutor:
                     "Speculative decoding with CUDA graph is not supported "
                     "for encoder-decoder models.")
 
-        if self.llm_args is not None and self.llm_args.sleep_config is not None:
-            self.validate_sleep_config()
-
         # Synchronize all ranks before warmup. This prevents a PP
         # communication deadlock when ranks on the last PP stage are delayed
         # by heavy initialisation (e.g. guided-decoder / llguidance tokenizer
@@ -2080,23 +2077,23 @@ class PyExecutor:
                 managers.append(manager)
         return managers
 
-    def validate_sleep_config(self) -> None:
+    def validate_sleep_config(self, tags: list[ExecutorMemoryType]) -> None:
+        """Validate this rank before committing a KV-preserving release."""
+        if not self._is_kv_manager_v2 or ExecutorMemoryType.KV_CACHE not in tags:
+            return
+        mode = self.llm_args.sleep_config.restore_modes[
+            ExecutorMemoryType.KV_CACHE]
         errors = []
         for manager in self._kv_memory_resources():
             if manager.is_estimating_kv_cache:
                 continue
             try:
-                manager.validate_sleep_config()
+                manager.validate_sleep_config(mode)
             except ValueError as error:
                 errors.append(str(error))
-        rank_errors = self.dist.allgather(errors)
-        failures = [
-            f"rank {rank}: {error}" for rank, errors in enumerate(rank_errors)
-            for error in errors
-        ]
-        if failures:
+        if errors:
             raise ValueError("Invalid sleep configuration: " +
-                             "; ".join(failures))
+                             "; ".join(errors))
 
     def release_memory(self, tags: tuple[str, ...]) -> None:
         """Release native KV pools before the runtime releases tagged auxiliary buffers."""
@@ -3721,6 +3718,8 @@ class PyExecutor:
                         else:
                             torch.cuda.synchronize()
                             if action == _SleepWakeupAction.PREPARE:
+                                if target_action == _SleepWakeupAction.SLEEP:
+                                    self.validate_sleep_config(tags)
                                 # Prepared means this rank is quiesced and
                                 # ready to commit, but VMM state is unchanged.
                                 has_mnnvl_resources = (

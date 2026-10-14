@@ -155,6 +155,8 @@ public:
     }
 
     Slot allocate();
+    //! Acquire a specific free slot, preserving its outstanding reuse fence.
+    Slot allocateAt(SlotId slotId);
     std::vector<Slot> allocateMultiple(SlotCount numSlots);
     void release(Slot slot);
 

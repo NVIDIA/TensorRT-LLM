@@ -145,13 +145,16 @@ def test_llm_sleep_discard_weights(process_gpu_memory_info_available):
     """
     llama_model_path = str(llm_models_root() / "Qwen3/Qwen3-0.6B")
     kv_cache_config = KvCacheConfig(
-        enable_block_reuse=False, max_tokens=16384, use_kv_cache_manager_v2=True
+        enable_block_reuse=False,
+        max_tokens=16384,
+        use_kv_cache_manager_v2=True,
+        host_cache_size=0,
     )
 
     sleep_config = SleepConfig(
         restore_modes={
             ExecutorMemoryType.MODEL_WEIGHTS_MAIN: "NONE",
-            ExecutorMemoryType.KV_CACHE: "NONE",
+            ExecutorMemoryType.KV_CACHE: "CPU",
         }
     )
 
@@ -232,6 +235,7 @@ def test_sleep_validates_registrations_before_closing_admission(
     stub.get_memory_status = Mock(return_value={"state": "running", "parked_tags": []})
     stub.control_action = Mock(return_value=nullcontext())
     stub.invalidate_v1_prefix_cache_for_sleep = Mock()
+    stub.validate_sleep_config = Mock()
     tags = [ExecutorMemoryType(tag)]
     if entrypoint == "mpi":
         run = stub.begin_sleep_transition
@@ -250,6 +254,7 @@ def test_sleep_validates_registrations_before_closing_admission(
         mutation.assert_not_called()
     else:
         with (
+            patch("tensorrt_llm.executor.ray.gpu_worker.logger", Mock(), create=True),
             patch("tensorrt_llm.executor.ray.gpu_worker.release_with_tag"),
             patch("torch.cuda.synchronize"),
             patch("torch.cuda.empty_cache"),

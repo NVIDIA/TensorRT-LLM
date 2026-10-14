@@ -39,6 +39,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager, ResourceManagerType
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
+from tensorrt_llm._torch.virtual_memory import RestoreMode
 from tensorrt_llm.bindings import DataType, SamplingConfig
 from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
 from tensorrt_llm.bindings.internal.batch_manager import CacheType, LinearCacheType
@@ -358,7 +359,6 @@ def _make_manager_for_cache_tier_test(
     joint_reuse: bool = False,
     mapping: Mapping | None = None,
     vocab_size: int | None = 16,
-    enable_sleep: bool = False,
 ) -> tuple[KVCacheManagerV2, Mock]:
     impl_constructor = Mock(side_effect=impl_side_effect)
     if mapping is None:
@@ -430,7 +430,6 @@ def _make_manager_for_cache_tier_test(
             vocab_size=vocab_size,
             execution_stream=Mock(),
             cold_page_codec_provider=cold_page_codec_provider,
-            enable_sleep=enable_sleep,
         )
     return manager, impl_constructor
 
@@ -3131,21 +3130,19 @@ def test_fresh_fill_preserves_kv_across_block_onboard(
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize(
-    "enable_sleep,host_cache_size,mem_available,memlock_limit,integrated,expected_host_quota",
+    "host_cache_size,mem_available,memlock_limit,integrated,expected_host_quota",
     [
-        (False, None, 128 << 20, float("inf"), False, 16 << 20),
-        (True, None, 128 << 20, float("inf"), False, 17 << 20),
-        (True, -1, 128 << 20, float("inf"), False, 17 << 20),
-        (True, 8 << 20, 128 << 20, float("inf"), False, 8 << 20),
-        (True, 0, 128 << 20, float("inf"), False, 0),
-        (True, None, 32 << 20, float("inf"), False, 16 << 20),
-        (True, None, 128 << 20, 20 << 20, False, 16 << 20),
-        (True, None, 33 << 20, float("inf"), True, 8 << 20),
-        (True, None, 17 << 20, float("inf"), True, 0),
+        (None, 128 << 20, float("inf"), False, 16 << 20),
+        (-1, 128 << 20, float("inf"), False, 16 << 20),
+        (8 << 20, 128 << 20, float("inf"), False, 8 << 20),
+        (0, 128 << 20, float("inf"), False, 0),
+        (None, 32 << 20, float("inf"), False, 16 << 20),
+        (None, 128 << 20, 20 << 20, False, 16 << 20),
+        (None, 33 << 20, float("inf"), True, 17 << 19),
+        (None, 17 << 20, float("inf"), True, 1 << 19),
     ],
 )
-def test_sleep_auto_host_capacity_includes_cold_gpu(
-    enable_sleep: bool,
+def test_sleep_uses_normal_auto_host_capacity(
     host_cache_size: int | None,
     mem_available: int,
     memlock_limit: float,
@@ -3162,7 +3159,6 @@ def test_sleep_auto_host_capacity_includes_cold_gpu(
             KvCacheConfig(max_gpu_total_bytes=16 << 20, host_cache_size=host_cache_size),
             [Mock()],
             add_secondary_gpu_tier=True,
-            enable_sleep=enable_sleep,
         )
 
     tiers = impl_constructor.call_args.args[0].cache_tiers
@@ -3174,17 +3170,22 @@ def test_sleep_auto_host_capacity_includes_cold_gpu(
         [expected_host_quota] if expected_host_quota else []
     )
     manager.impl.init_config = SimpleNamespace(cache_tiers=tiers)
-    if expected_host_quota < 17 << 20:
+    for mode in (RestoreMode.NONE, RestoreMode.MEMSET):
+        manager.validate_sleep_config(mode)
+    for mode in (RestoreMode.CPU, RestoreMode.PINNED):
         with pytest.raises(ValueError, match="shortfall:"):
-            manager.validate_sleep_config()
-    else:
-        manager.validate_sleep_config()
+            manager.validate_sleep_config(mode)
 
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("host_quota", [None, 8 << 20, 16 << 20, 32 << 20])
 @pytest.mark.parametrize("cold_gpu", [False, True])
-def test_sleep_requires_host_capacity_covering_gpu(host_quota: int | None, cold_gpu: bool) -> None:
+@pytest.mark.parametrize(
+    "mode", [RestoreMode.NONE, RestoreMode.MEMSET, RestoreMode.CPU, RestoreMode.PINNED]
+)
+def test_sleep_requires_host_capacity_covering_gpu(
+    host_quota: int | None, cold_gpu: bool, mode: RestoreMode
+) -> None:
     manager = object.__new__(KVCacheManagerV2)
     tiers = [GpuCacheTierConfig(quota=16 << 20)]
     if cold_gpu:
@@ -3193,16 +3194,18 @@ def test_sleep_requires_host_capacity_covering_gpu(host_quota: int | None, cold_
     if host_quota is not None:
         tiers.append(HostCacheTierConfig(quota=host_quota))
     manager.impl = Mock(init_config=SimpleNamespace(cache_tiers=tiers))
-    if host_quota is None or host_quota < gpu_quota:
+    if mode in (RestoreMode.CPU, RestoreMode.PINNED) and (
+        host_quota is None or host_quota < gpu_quota
+    ):
         with pytest.raises(ValueError, match="host_cache_size") as exc_info:
-            manager.validate_sleep_config()
+            manager.validate_sleep_config(mode)
         available = host_quota or 0
         assert f"Required: {gpu_quota} bytes" in str(exc_info.value)
         assert f"largest eligible host tier: {available} bytes" in str(exc_info.value)
         assert f"shortfall: {gpu_quota - available} bytes" in str(exc_info.value)
         assert f"host_cache_size to at least {gpu_quota} bytes" in str(exc_info.value)
     else:
-        manager.validate_sleep_config()
+        manager.validate_sleep_config(mode)
 
 
 @pytest.mark.cpu_only
@@ -3215,13 +3218,13 @@ def test_sleep_requires_host_below_last_gpu() -> None:
     ]
     manager.impl = Mock(init_config=SimpleNamespace(cache_tiers=tiers))
     with pytest.raises(ValueError, match="below all GPU levels") as exc_info:
-        manager.validate_sleep_config()
+        manager.validate_sleep_config(RestoreMode.CPU)
     assert "largest eligible host tier: 0 bytes" in str(exc_info.value)
     tiers.extend([HostCacheTierConfig(quota=16 << 20), HostCacheTierConfig(quota=16 << 20)])
     with pytest.raises(ValueError, match="shortfall: 16777216 bytes"):
-        manager.validate_sleep_config()
+        manager.validate_sleep_config(RestoreMode.CPU)
     tiers.append(HostCacheTierConfig(quota=32 << 20))
-    manager.validate_sleep_config()
+    manager.validate_sleep_config(RestoreMode.CPU)
 
 
 class _GuardKVCache:
@@ -3285,6 +3288,8 @@ def _make_guard_manager(
     manager.kv_cache_map = {}
     manager.index_mapper = Mock()
     manager.impl = Mock()
+    if kv_cache is not None:
+        manager.impl.release_gpu_memory.side_effect = lambda **kwargs: kv_cache.suspend()
 
     def create_kv_cache(request_id: int, *args: object, **kwargs: object) -> object | None:
         del args, kwargs
@@ -3323,7 +3328,20 @@ def test_reserve_guard_page_fills_and_publishes_the_page(
     manager.impl.release_gpu_memory.assert_called_once_with(discard=True)
     manager.index_mapper.remove_sequence.assert_not_called()
     buffer.fill_(1)
+    kv_cache.resume = Mock(wraps=kv_cache.resume)
+    manager._restore_page_index_bufs.side_effect = [
+        RuntimeError("injected metadata rebind failure"),
+        None,
+    ]
+    with pytest.raises(RuntimeError, match="injected metadata rebind failure"):
+        manager.materialize_memory()
+    assert kv_cache.is_active
+    assert manager._sleep_restore_mode == RestoreMode.NONE
     manager.materialize_memory()
+    kv_cache.resume.assert_called_once()
+    assert manager._restore_page_index_bufs.call_count == 2
+    assert manager._sleep_restore_mode is None
+    assert not manager._sleeping_active_caches
     assert torch.isnan(buffer[3]).all()
     assert torch.equal(buffer[2], torch.ones(2))
     assert manager.guard_page_indices() == frozenset({3})

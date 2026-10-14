@@ -219,8 +219,10 @@ def test_kv_cache_manager(process_gpu_memory_info_available, manager_cls,
     if is_v2:
         # Exercise the static device-side page-index conversion tables too.
         kv_cache_params["head_dim"] = [64, 32] * 4
-        kv_cache_params["enable_sleep"] = True
         kv_cache_params["max_beam_width"] = 2
+        kv_cache_params["kv_cache_config"].host_cache_size = (
+            0 if restore_mode == virtual_memory.RestoreMode.NONE else 8 << 20
+            if restore_mode == virtual_memory.RestoreMode.MEMSET else 1 << 30)
 
     mgr = manager_cls(**kv_cache_params)
     if is_v2:
@@ -264,6 +266,10 @@ def test_kv_cache_manager(process_gpu_memory_info_available, manager_cls,
             gpu_capacities = [[
                 stat.total for stat in mgr.impl.get_storage_statistics(level)
             ] for level in gpu_levels]
+            all_capacities = [[
+                stat.total
+                for stat in mgr.impl.get_storage_statistics(CacheLevel(level))
+            ] for level in range(len(mgr.impl.init_config.cache_tiers))]
             gpu_pool_bytes = sum(
                 stat.total * sum(stat.slot_sizes) for level in gpu_levels
                 for stat in mgr.impl.get_storage_statistics(level))
@@ -290,6 +296,16 @@ def test_kv_cache_manager(process_gpu_memory_info_available, manager_cls,
                                        is_gen=True,
                                        max_beam_width=2)[0]
         index = mgr.index_mapper.get_index(dummy.py_request_id)
+        original_indices = [
+            list(mgr.kv_cache_map[dummy.py_request_id].get_base_page_indices(
+                lg, beam)) for lg in range(len(mgr.impl.layer_grouping))
+            for beam in range(2)
+        ]
+        original_page_addresses = [
+            mgr.get_buffers(0)[page].data_ptr()
+            for page in mgr.get_batch_cache_indices([dummy.py_request_id],
+                                                    layer_idx=0)[0]
+        ]
     for cycle in range(2):
         for buffer in buffers:
             buffer.fill_(cycle + 1)
@@ -306,6 +322,12 @@ def test_kv_cache_manager(process_gpu_memory_info_available, manager_cls,
             assert not old_cache.is_active
             assert all(stat.total == 0 for level in gpu_levels
                        for stat in mgr.impl.get_storage_statistics(level))
+            if restore_mode in (virtual_memory.RestoreMode.NONE,
+                                virtual_memory.RestoreMode.MEMSET):
+                assert all(stat.total == 0
+                           for level in range(len(all_capacities))
+                           for stat in mgr.impl.get_storage_statistics(
+                               CacheLevel(level)))
         memory_usage_released = get_current_process_gpu_memory()
         if process_gpu_memory_info_available:
             assert memory_usage_materialized - memory_usage_released >= alloc_size
@@ -319,11 +341,25 @@ def test_kv_cache_manager(process_gpu_memory_info_available, manager_cls,
             assert [[
                 stat.total for stat in mgr.impl.get_storage_statistics(level)
             ] for level in gpu_levels] == gpu_capacities
+            assert [[
+                stat.total
+                for stat in mgr.impl.get_storage_statistics(CacheLevel(level))
+            ] for level in range(len(all_capacities))] == all_capacities
             assert torch.equal(metadata.cpu(), expected_metadata)
             assert mgr.index_mapper.get_index(dummy.py_request_id) == index
             cache = mgr.kv_cache_map[dummy.py_request_id]
             assert cache.is_active
             assert cache is old_cache
+            assert [
+                list(cache.get_base_page_indices(lg, beam))
+                for lg in range(len(mgr.impl.layer_grouping))
+                for beam in range(2)
+            ] == original_indices
+            assert [
+                mgr.get_buffers(0)[page].data_ptr()
+                for page in mgr.get_batch_cache_indices([dummy.py_request_id],
+                                                        layer_idx=0)[0]
+            ] == original_page_addresses
             assert (cache.capacity, cache.history_length, cache.beam_width,
                     cache.is_decoding) == old_shape
             # Shared prompt blocks use beam 0 via cache indirection; the writable tail has both beams.
@@ -429,7 +465,11 @@ def test_kv_sleep_preserves_held_pages_under_cold_tier_pressure(
         mgr.shutdown()
 
 
-def test_cuda_graph(process_gpu_memory_info_available):
+@pytest.mark.parametrize(
+    "restore_mode",
+    [virtual_memory.RestoreMode.CPU, virtual_memory.RestoreMode.MEMSET])
+def test_cuda_graph(process_gpu_memory_info_available, restore_mode):
+    from types import SimpleNamespace
 
     def work(input: torch.Tensor) -> torch.Tensor:
         intermediate = input + input
@@ -439,9 +479,31 @@ def test_cuda_graph(process_gpu_memory_info_available):
     g = torch.cuda.CUDAGraph()
     tag = "cuda_graph"
 
-    with virtual_memory.scope(tag) as pool:
-        static_input = torch.ones(1024, dtype=torch.float32, device='cuda')
-        static_output = torch.zeros(1024, dtype=torch.float32, device='cuda')
+    with virtual_memory.scope(tag, restore_mode) as pool:
+        manager = KVCacheManagerV2(
+            kv_cache_config=KvCacheConfig(max_gpu_total_bytes=4 << 20,
+                                          host_cache_size=8 << 20),
+            kv_cache_type=CacheType.SELF,
+            num_layers=1,
+            num_kv_heads=4,
+            head_dim=64,
+            tokens_per_block=4,
+            max_seq_len=16,
+            max_batch_size=1,
+            mapping=Mapping(world_size=1, tp_size=1, rank=0),
+            dtype=tensorrt_llm.bindings.DataType.FLOAT,
+        )
+        dummy = manager.add_dummy_requests([123], token_nums=[4],
+                                           is_gen=True)[0]
+        page = manager.get_batch_cache_indices([dummy.py_request_id],
+                                               layer_idx=0)[0][0]
+        static_input = manager.get_buffers(0)[page].view(-1)[:1024]
+        input_address = static_input.data_ptr()
+        static_output = torch.zeros_like(static_input)
+        resource = SimpleNamespace(
+            release_memory=lambda tags: manager.release_memory(restore_mode),
+            materialize_memory=lambda tags: manager.materialize_memory(),
+        )
 
         with torch.cuda.graph(g):
             static_output.copy_(work(static_input))
@@ -455,14 +517,17 @@ def test_cuda_graph(process_gpu_memory_info_available):
     memory_usage_before = get_current_process_gpu_memory()
 
     torch.cuda.synchronize()
-    virtual_memory.release_with_tag(tag)
+    virtual_memory.release_with_tag(tag, resource=resource)
 
     memory_usage_released = get_current_process_gpu_memory()
     if process_gpu_memory_info_available:
         assert memory_usage_released < memory_usage_before
 
     torch.cuda.synchronize()
-    virtual_memory.materialize_with_tag(tag)
+    virtual_memory.materialize_with_tag(tag, resource=resource)
+    restored_page = manager.get_batch_cache_indices([dummy.py_request_id],
+                                                    layer_idx=0)[0][0]
+    assert manager.get_buffers(0)[restored_page].data_ptr() == input_address
 
     torch.fill_(static_input, 1.0)
     torch.fill_(static_output, 0.0)
@@ -472,3 +537,4 @@ def test_cuda_graph(process_gpu_memory_info_available):
     assert static_output[0].item() == 3.0
 
     del static_input, static_output, g, pool
+    manager.shutdown()

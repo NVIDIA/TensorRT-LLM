@@ -186,6 +186,12 @@ bool HostMem::shouldUseChunkedRegistration()
 HostMem::HostMem(size_t size)
     : mUseThp(hostUseThp())
 {
+    allocate(size);
+}
+
+void HostMem::allocate(size_t size)
+{
+    TLLM_CHECK_DEBUG(mAddr == 0 && mSize == 0 && mNumRegisteredChunks == 0);
     if (size == 0)
     {
         return;
@@ -220,6 +226,24 @@ HostMem::~HostMem()
 
 void HostMem::resize(size_t newSize)
 {
+    if (newSize == mSize)
+    {
+        if (mSize != 0 && mNumRegisteredChunks == 0)
+        {
+            registerToCuda();
+        }
+        return;
+    }
+    if (newSize == 0)
+    {
+        destroy();
+        return;
+    }
+    if (mSize == 0)
+    {
+        allocate(newSize);
+        return;
+    }
     unregisterFromCuda();
     try
     {
@@ -313,13 +337,21 @@ void HostMem::registerToCuda()
     static bool chunked = shouldUseChunkedRegistration();
 
     size_t chunkSize = (chunked && mSize > kChunkSize) ? kChunkSize : mSize;
-    for (size_t offset = 0; offset < mSize; offset += chunkSize)
+    try
     {
-        size_t sz = std::min(chunkSize, mSize - offset);
-        CUresult res = cuMemHostRegister(
-            reinterpret_cast<void*>(mAddr + offset), sz, CU_MEMHOSTREGISTER_PORTABLE | CU_MEMHOSTREGISTER_DEVICEMAP);
-        cuCheck(res);
-        ++mNumRegisteredChunks;
+        for (size_t offset = 0; offset < mSize; offset += chunkSize)
+        {
+            size_t sz = std::min(chunkSize, mSize - offset);
+            CUresult res = cuMemHostRegister(reinterpret_cast<void*>(mAddr + offset), sz,
+                CU_MEMHOSTREGISTER_PORTABLE | CU_MEMHOSTREGISTER_DEVICEMAP);
+            cuCheck(res);
+            ++mNumRegisteredChunks;
+        }
+    }
+    catch (...)
+    {
+        unregisterFromCuda();
+        throw;
     }
 }
 

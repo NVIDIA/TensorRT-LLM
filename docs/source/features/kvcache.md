@@ -261,22 +261,24 @@ their activation points.
 
 ### Sleep and Wakeup with V2
 
-When `sleep_config` is enabled with KV cache manager V2, a host cache tier below
+When releasing V2 KV cache with `CPU` or `PINNED` preservation, a host cache tier below
 all GPU cache levels must have a quota at least as large as their combined GPU
 cache quota for each KV manager on each rank, including draft managers.
 Set `kv_cache_config.host_cache_size`
 accordingly; speculative decoding splits this budget between the target and
 draft managers. Automatic host sizing uses the minimum across ranks and may
 choose a smaller quota because of available host memory or pinned-memory limits.
-All ranks reject an insufficient quota during initialization, before the final
-executor's warmup.
+All participating ranks validate this capacity before any rank starts releasing
+memory. Weights-only release and KV `NONE`/`MEMSET` release do not require this
+backup capacity; ordinary host-tier sizing and sparse-attention requirements
+still apply.
 
 The `kv_cache` entry in `sleep_config.restore_modes` controls the KV data policy:
 
 | Mode | Sleep | Wakeup |
 | --- | --- | --- |
 | `CPU`, `PINNED` | Suspend internal requests and evict GPU pages through the configured host and optional disk tiers. Reusable pages may be dropped under capacity pressure. | Restore GPU pool capacity and resume internal requests. Reusable pages return to GPU on demand. |
-| `NONE` | Discard KV contents and reusable prefixes while retaining native cache objects and their logical state. | Materialize the retained caches' pages with uninitialized KV storage. |
+| `NONE` | Discard KV contents and reusable prefixes, release GPU and HOST pool backing, and retain native cache objects and their logical state. | Restore pool capacities and materialize the retained caches' pages with unspecified KV contents. |
 | `MEMSET` | Discard KV contents and reusable prefixes as for `NONE`. | Zero the restored GPU pools and materialized host pages, then resume the retained caches. |
 
 V2 uses its existing pinned host tier for both `CPU` and `PINNED`; these modes
@@ -286,11 +288,14 @@ held by suspended internal requests cannot be dropped; an inability to place
 those pages in the configured tiers fails the sleep operation.
 
 Sleep drains user requests before changing memory. Internal padding requests
-retain their native cache identities, logical state, and metadata buffers, while their page indices
-are refreshed on wakeup. GPU pool virtual addresses remain reserved throughout
+retain their native cache identities, logical state, and metadata buffers. Wakeup
+restores their original GPU page slots, including SSM state and SWA scratch slots,
+before resuming them. GPU pool virtual addresses remain reserved throughout
 sleep. Both hot and cold GPU pools release their physical backing and recover
 their capacities on wakeup. Encoded cold pages retain their representation when
-moved from GPU to host. Sleeping registered V2 KV memory used by a cache
+moved from GPU to host. Discard modes also release HOST pool mappings without
+migrating their contents to disk; independent disk staging buffers are retained.
+HOST mappings may change address and are restored before cache pages. Sleeping registered V2 KV memory used by a cache
 transceiver is unsupported.
 
 ### Partial Reuse

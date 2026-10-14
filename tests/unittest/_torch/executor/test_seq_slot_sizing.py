@@ -804,7 +804,7 @@ def test_kv_cache_manager_receives_the_overlap_scheduler_flag(
         creator._create_kv_cache_manager(model_engine)
 
     assert create.call_args.kwargs["disable_overlap_scheduler"] is disable_overlap_scheduler
-    assert create.call_args.kwargs["enable_sleep"] is enable_sleep
+    assert "enable_sleep" not in create.call_args.kwargs
 
 
 def _fake_req(request_id, *, init_state=False, transmission_complete=False):

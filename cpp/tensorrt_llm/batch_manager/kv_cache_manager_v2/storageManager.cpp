@@ -739,17 +739,34 @@ void StorageManager::releaseSlot(LifeCycleId lc, CacheLevel level, Slot slot)
     mLevels.at(level).storage->release(pg, std::move(slot));
 }
 
-void StorageManager::zeroHostSlotData(LifeCycleId lc, CacheLevel level, Slot const& slot)
+void StorageManager::initializeColdSlot(LifeCycleId lc, CacheLevel level, SlotId slotId)
 {
-    TLLM_CHECK_WITH_INFO(cacheTier(level) == CacheTier::HOST_MEM, "Zeroing a host slot requires host storage");
-    slot.readyEvent.synchronize();
-    PoolGroupIndex const pg = getPoolGroupIndex(level, lc);
-    auto const sizes = slotSize(level, pg);
-    for (PoolIndex pool{0}; pool < sizes.size(); ++pool)
+    TLLM_CHECK(level != kHotLevel);
+    PoolGroupIndex const hotGroup = getPoolGroupIndex(kHotLevel, lc);
+    auto source = poolGroup(kHotLevel, hotGroup).allocate();
+    auto releaseSource = FuncGuard([&]() { releaseSlot(lc, kHotLevel, std::move(source)); });
+    auto destination = allocateSlotAt(lc, level, slotId);
+    auto releaseDestination = FuncGuard([&]() { releaseSlot(lc, level, std::move(destination)); });
+    TemporaryCudaStream stream({source.readyEvent.handle(), destination.readyEvent.handle()});
+    auto finish = FuncGuard(
+        [&]()
+        {
+            auto event = stream.takeFinishEvent();
+            source.readyEvent = event;
+            destination.readyEvent = event;
+        });
     {
-        auto const address = std::get<MemAddress>(slotAddress(level, pg, slot.slotId(), pool));
-        std::fill_n(reinterpret_cast<std::byte*>(address), sizes[pool], std::byte{0});
+        auto scope = stream.enter();
+        auto const sizes = slotSize(kHotLevel, hotGroup);
+        for (PoolIndex pool{0}; pool < sizes.size(); ++pool)
+        {
+            auto const address = std::get<MemAddress>(slotAddress(kHotLevel, hotGroup, source.slotId(), pool));
+            cuCheck(cuMemsetD8Async(static_cast<CUdeviceptr>(address), 0, sizes[pool], stream.get()));
+        }
+        copySlotData(lc, level, kHotLevel, destination.slotId(), source.slotId(), stream.get());
     }
+    finish.run();
+    destination.readyEvent.synchronize();
 }
 
 // ---------------------------------------------------------------------------
@@ -1133,7 +1150,7 @@ LayerGroupId StorageManager::getMigrationBatchingLayerGroupId(
 
 std::optional<std::vector<Slot>> StorageManager::_batchedMigrate(CacheLevel dstLevel, CacheLevel srcLevel,
     std::vector<SharedPtr<Page>> const& srcPages, bool updateSrc, MigrationRecorder const& migrationRecorder,
-    bool defrag)
+    bool defrag, std::vector<Slot>* reservedSlots)
 {
     TLLM_CHECK_DEBUG(defrag || dstLevel != srcLevel);
     if (srcPages.empty())
@@ -1165,10 +1182,10 @@ std::optional<std::vector<Slot>> StorageManager::_batchedMigrate(CacheLevel dstL
     auto& srcPoolGroup = poolGroup(srcLevel, srcPgIdx);
     auto& dstPoolGroup = poolGroup(dstLevel, dstPgIdx);
 
-    if (dstPoolGroup.numFreeSlots() < numSlots)
+    if (!reservedSlots && dstPoolGroup.numFreeSlots() < numSlots)
         throw OutOfPagesError("Not enough free slots for migration");
 
-    auto dstSlots = dstPoolGroup.allocateMultiple(numSlots);
+    auto dstSlots = reservedSlots ? std::move(*reservedSlots) : dstPoolGroup.allocateMultiple(numSlots);
     // A15: allocated slot count must match the request.
     TLLM_CHECK_DEBUG_WITH_INFO(slotCountValueFromSize(dstSlots.size()) == numSlots, "dst_slots size mismatch");
     try
@@ -1255,8 +1272,76 @@ std::optional<std::vector<Slot>> StorageManager::_batchedMigrate(CacheLevel dstL
     catch (...)
     {
         for (auto& s : dstSlots)
-            dstPoolGroup.release(std::move(s));
+        {
+            if (s.hasValidSlot())
+            {
+                dstPoolGroup.release(std::move(s));
+            }
+        }
         throw;
+    }
+}
+
+Slot StorageManager::allocateSlotAt(LifeCycleId lifeCycle, CacheLevel level, SlotId slotId)
+{
+    return poolGroup(level, getPoolGroupIndex(level, lifeCycle)).slotAllocator().allocateAt(slotId);
+}
+
+void StorageManager::restorePageLocations(std::vector<PageLocation> const& locations)
+{
+    std::map<std::tuple<CacheLevel, CacheLevel, LayerGroupId>, std::vector<PageLocation const*>> groups;
+    auto reschedule = FuncGuard(
+        [&]()
+        {
+            for (auto const& location : locations)
+            {
+                auto& page = *location.page;
+                if (!page.scheduledForEviction() && isEvictable(page))
+                {
+                    scheduleForEviction(page);
+                }
+            }
+        });
+    for (auto const& location : locations)
+    {
+        auto& page = *location.page;
+        if (page.scheduledForEviction())
+        {
+            excludeFromEviction(page);
+        }
+        if (page.cacheLevel != location.level || page.slotId() != location.slotId)
+        {
+            groups[{location.level, page.cacheLevel,
+                       getMigrationBatchingLayerGroupId(location.level, page.cacheLevel, page.lifeCycle)}]
+                .push_back(&location);
+        }
+    }
+    for (auto& [key, group] : groups)
+    {
+        auto const [dstLevel, srcLevel, layerGroup] = key;
+        std::sort(group.begin(), group.end(),
+            [](auto const* left, auto const* right) { return left->slotId < right->slotId; });
+        std::vector<SharedPtr<Page>> pages;
+        std::vector<Slot> slots;
+        pages.reserve(group.size());
+        slots.reserve(group.size());
+        auto releaseSlots = FuncGuard(
+            [&]()
+            {
+                for (auto& slot : slots)
+                {
+                    if (slot.hasValidSlot())
+                    {
+                        poolGroup(dstLevel, getPoolGroupIndex(dstLevel, layerGroup)).release(std::move(slot));
+                    }
+                }
+            });
+        for (auto const* location : group)
+        {
+            pages.push_back(location->page);
+            slots.push_back(allocateSlotAt(location->page->lifeCycle, dstLevel, location->slotId));
+        }
+        _batchedMigrate(dstLevel, srcLevel, pages, /*updateSrc=*/true, {}, /*defrag=*/false, &slots);
     }
 }
 
@@ -1719,73 +1804,96 @@ void StorageManager::expandPoolGroup(CacheLevel level, PoolGroupIndex pgIdx, Slo
     pg.slotAllocator().expand(newNumSlots);
 }
 
-void StorageManager::releaseGpuMemory()
+void StorageManager::releaseMemory(bool discard)
 {
-    TLLM_CHECK_WITH_INFO(!mSleepingGpuSlots.has_value(), "GPU cache memory is already released");
+    TLLM_CHECK_WITH_INFO(!mSleepingPoolSlots.has_value(), "Cache memory is already released");
     TypedVec<CacheLevel, TypedVec<PoolGroupIndex, SlotCount>> slotCounts(numCacheLevels());
     // Eviction only moves toward colder levels. Visit in that order so pages
     // entering a cold GPU pool are also moved off the device before unmapping.
     for (CacheLevel level{0}; level < numCacheLevels(); ++level)
     {
         auto& lvl = mLevels.at(level);
-        if (lvl.cacheTier != CacheTier::GPU_MEM)
+        if (lvl.cacheTier != CacheTier::GPU_MEM && !(discard && lvl.cacheTier == CacheTier::HOST_MEM))
         {
             continue;
         }
         slotCounts[level] = lvl.storage->slotCountList();
-        TypedVec<PoolGroupIndex, SlotCount> evictCounts(slotCounts[level].size(), 0);
-        for (PoolGroupIndex pgIdx{0}; pgIdx < evictCounts.size(); ++pgIdx)
+        if (!discard)
         {
-            evictCounts[pgIdx] = lvl.controller.numEvictablePages(pgIdx);
+            TypedVec<PoolGroupIndex, SlotCount> evictCounts(slotCounts[level].size(), 0);
+            for (PoolGroupIndex pgIdx{0}; pgIdx < evictCounts.size(); ++pgIdx)
+            {
+                evictCounts[pgIdx] = lvl.controller.numEvictablePages(pgIdx);
+            }
+            forceEvict(level, evictCounts);
         }
-        forceEvict(level, evictCounts);
-        for (PoolGroupIndex pgIdx{0}; pgIdx < evictCounts.size(); ++pgIdx)
+        for (PoolGroupIndex pgIdx{0}; pgIdx < slotCounts[level].size(); ++pgIdx)
         {
             TLLM_CHECK_WITH_INFO(poolGroup(level, pgIdx).slotAllocator().numOccupiedSlots() == 0,
-                "GPU cache memory still has held pages; configure sufficient host cache capacity");
+                "Cache memory still has held pages; discard them or provide sufficient offload capacity");
         }
     }
     // Complete codec copies before any source buffer is unmapped.
     cuCheck(cuCtxSynchronize());
-    mSleepingGpuSlots = slotCounts;
+    mSleepingPoolSlots = slotCounts;
     for (CacheLevel level{0}; level < slotCounts.size(); ++level)
     {
         for (PoolGroupIndex pgIdx{0}; pgIdx < slotCounts[level].size(); ++pgIdx)
         {
             if (slotCounts[level][pgIdx] != 0)
             {
-                shrinkPoolGroup(level, pgIdx, 0, {});
+                auto& pg = poolGroup(level, pgIdx);
+                auto& allocator = pg.slotAllocator();
+                allocator.prepareForShrink(0);
+                TLLM_CHECK(allocator.finishShrink());
+                pg.resizePools(0);
             }
         }
     }
     mGpuPhysMemAllocator->clear();
 }
 
-void StorageManager::materializeGpuMemory(bool zero)
+void StorageManager::materializeMemory(bool zero)
 {
-    TLLM_CHECK_WITH_INFO(mSleepingGpuSlots.has_value(), "GPU cache memory is not released");
-    auto const& slotCounts = *mSleepingGpuSlots;
-    for (CacheLevel level{0}; level < slotCounts.size(); ++level)
+    TLLM_CHECK_WITH_INFO(mSleepingPoolSlots.has_value(), "Cache memory is not released");
+    auto const& slotCounts = *mSleepingPoolSlots;
+    for (auto const tier : {CacheTier::HOST_MEM, CacheTier::GPU_MEM})
     {
-        for (PoolGroupIndex pgIdx{0}; pgIdx < slotCounts[level].size(); ++pgIdx)
+        for (CacheLevel level{0}; level < slotCounts.size(); ++level)
         {
-            if (slotCounts[level][pgIdx] != 0)
+            if (mLevels.at(level).cacheTier != tier)
             {
-                expandPoolGroup(level, pgIdx, slotCounts[level][pgIdx]);
+                continue;
             }
-            if (zero)
+            for (PoolGroupIndex pgIdx{0}; pgIdx < slotCounts[level].size(); ++pgIdx)
             {
-                auto const& sizes = slotSize(level, pgIdx);
-                for (PoolIndex poolIdx{0}; poolIdx < sizes.size(); ++poolIdx)
+                auto const capacity = slotCounts[level][pgIdx];
+                // Completed groups survive a retry; individual pools also keep successful allocations.
+                if (poolGroup(level, pgIdx).numSlots() < capacity)
                 {
-                    cuCheck(cuMemsetD8(
-                        static_cast<CUdeviceptr>(mLevels.at(level).storage->getBaseAddress(pgIdx, poolIdx, SlotId{0})),
-                        0, slotCountToSizeT(slotCounts[level][pgIdx]) * sizes[poolIdx]));
+                    expandPoolGroup(level, pgIdx, capacity);
+                }
+                // Fresh anonymous HOST mappings are zero-initialized. Repeat GPU zeroing on retry
+                // because an earlier attempt may have failed after expansion but before initialization.
+                if (zero && tier == CacheTier::GPU_MEM && capacity != 0)
+                {
+                    auto const& sizes = slotSize(level, pgIdx);
+                    for (PoolIndex poolIdx{0}; poolIdx < sizes.size(); ++poolIdx)
+                    {
+                        cuCheck(cuMemsetD8(static_cast<CUdeviceptr>(
+                                               mLevels.at(level).storage->getBaseAddress(pgIdx, poolIdx, SlotId{0})),
+                            0, slotCountToSizeT(capacity) * sizes[poolIdx]));
+                    }
                 }
             }
         }
     }
-    mSleepingGpuSlots.reset();
+    if (zero)
+    {
+        // Pool memset must finish before nonblocking codec streams initialize retained cold pages.
+        cuCheck(cuCtxSynchronize());
+    }
+    mSleepingPoolSlots.reset();
 }
 
 // ---------------------------------------------------------------------------

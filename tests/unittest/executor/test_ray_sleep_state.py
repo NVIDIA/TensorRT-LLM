@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from typing import Iterator
@@ -24,6 +25,7 @@ from tensorrt_llm._torch.pyexecutor.executor_request_queue import (
     ExecutorRequestQueue,
     RequestAdmissionState,
 )
+from tensorrt_llm.executor.ray.executor import RayExecutor
 from tensorrt_llm.executor.ray.gpu_worker import RayGPUWorker
 from tensorrt_llm.llmapi.llm_args import ExecutorMemoryType
 
@@ -117,16 +119,19 @@ def test_ray_worker_fails_closed_after_mutation(method, operation):
 
 
 @pytest.mark.parametrize(
-    "method, operation",
+    "method, operation, capacity_failure",
     [
-        ("sleep", "release_with_tag"),
-        ("wakeup", "materialize_with_tag"),
+        ("sleep", "release_with_tag", False),
+        ("sleep", "release_with_tag", True),
+        ("wakeup", "materialize_with_tag", False),
     ],
 )
-def test_ray_worker_aborts_transition_before_mutation(method, operation):
+def test_ray_worker_aborts_transition_before_mutation(method, operation, capacity_failure):
     state = "running" if method == "sleep" else "parked"
     parked_tags = [] if method == "sleep" else ["model"]
     worker = _make_worker(state, parked_tags)
+    if capacity_failure:
+        worker.engine.validate_sleep_config.side_effect = RuntimeError("pre-mutation failure")
 
     with (
         patch("tensorrt_llm.executor.ray.gpu_worker.TorchLlmArgs", _Args),
@@ -134,7 +139,7 @@ def test_ray_worker_aborts_transition_before_mutation(method, operation):
         patch(f"tensorrt_llm.executor.ray.gpu_worker.{operation}") as mutate_memory,
         patch(
             "tensorrt_llm.executor.ray.gpu_worker.torch.cuda.synchronize",
-            side_effect=RuntimeError("pre-mutation failure"),
+            side_effect=None if capacity_failure else RuntimeError("pre-mutation failure"),
         ),
         patch("tensorrt_llm.executor.ray.gpu_worker.gc.collect"),
         patch("tensorrt_llm.executor.ray.gpu_worker.torch.cuda.empty_cache"),
@@ -213,3 +218,83 @@ def test_ray_sleep_aborts_transition_when_drain_fails() -> None:
     worker.engine.complete_sleep_transition.assert_not_called()
     worker.engine.fail_sleep_wakeup_transition.assert_not_called()
     release.assert_not_called()
+
+
+@pytest.mark.parametrize("parked", [False, True])
+def test_ray_sleep_preflight_is_read_only(parked):
+    worker = _make_worker("parked" if parked else "running", ["kv_cache"] if parked else [])
+    worker.engine.validate_sleep_config.side_effect = ValueError("host quota is too small")
+    with patch("tensorrt_llm.executor.ray.gpu_worker.TorchLlmArgs", _Args):
+        if parked:
+            worker.validate_sleep(["kv_cache"])
+            worker.engine.validate_sleep_config.assert_not_called()
+        else:
+            with pytest.raises(ValueError, match="host quota is too small"):
+                worker.validate_sleep(["kv_cache"])
+    worker.engine.begin_sleep_transition.assert_not_called()
+    worker.engine.control_action.assert_not_called()
+
+
+@pytest.mark.parametrize("reject", [False, True])
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_ray_collective_validates_all_ranks_before_sleep(reject, asynchronous):
+    executor = object.__new__(RayExecutor)
+    executor.doing_shutdown = True
+    executor.workers = [MagicMock(), MagicMock()]
+    events = []
+
+    def dispatch(rank, method, result):
+        def remote(*args, **kwargs):
+            assert args == (["kv_cache"],)
+            assert kwargs == {}
+            events.append((rank, method))
+            return result
+
+        return remote
+
+    async def run_async():
+        loop = asyncio.get_running_loop()
+        preflight = [loop.create_future(), loop.create_future()]
+        for rank, worker in enumerate(executor.workers):
+            worker.validate_sleep.remote.side_effect = dispatch(rank, "validate", preflight[rank])
+            done = loop.create_future()
+            done.set_result(None)
+            worker.sleep.remote.side_effect = dispatch(rank, "sleep", done)
+        with patch("tensorrt_llm.executor.ray.executor.ray.get") as blocking_get:
+            task = asyncio.create_task(executor.collective_rpc_async("sleep", args=(["kv_cache"],)))
+            await asyncio.sleep(0)
+            assert events == [(0, "validate"), (1, "validate")]
+            assert not task.done()
+            preflight[0].set_result(None)
+            if reject:
+                preflight[1].set_exception(ValueError("host quota is too small"))
+                with pytest.raises(ValueError, match="host quota is too small"):
+                    await task
+            else:
+                preflight[1].set_result(None)
+                assert await task == [None, None]
+            blocking_get.assert_not_called()
+
+    if asynchronous:
+        asyncio.run(run_async())
+    else:
+        for rank, worker in enumerate(executor.workers):
+            worker.validate_sleep.remote.side_effect = dispatch(rank, "validate", rank)
+            worker.sleep.remote.side_effect = dispatch(rank, "sleep", rank + 2)
+
+        def get(refs):
+            if refs == [0, 1]:
+                assert events == [(0, "validate"), (1, "validate")]
+                if reject:
+                    raise ValueError("host quota is too small")
+            return [None, None]
+
+        with patch("tensorrt_llm.executor.ray.executor.ray.get", side_effect=get):
+            if reject:
+                with pytest.raises(ValueError, match="host quota is too small"):
+                    executor.collective_rpc("sleep", args=(["kv_cache"],))
+            else:
+                assert executor.collective_rpc("sleep", args=(["kv_cache"],)) == [None, None]
+    assert events == (
+        [(0, "validate"), (1, "validate")] + ([] if reject else [(0, "sleep"), (1, "sleep")])
+    )

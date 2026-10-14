@@ -106,11 +106,14 @@ first. New operations are also rejected during transitional and failed states.
 Release affects allocations captured by the TensorRT-LLM virtual-memory allocator
 and registered with a requested tag, plus native KV-cache manager V2 pools under
 the `KV_CACHE` tag. V2 keeps cache objects and logical state while releasing their
-physical GPU storage. `NONE` and `MEMSET` discard KV contents and reusable prefixes; `CPU` and
+physical GPU storage. `NONE` and `MEMSET` discard KV contents and reusable prefixes
+and release HOST pool backing; `CPU` and
 `PINNED` preserve live request pages through the configured cache tiers, while
-reusable pages may be dropped under capacity pressure. Sleep-enabled V2 requires a host tier
+reusable pages may be dropped under capacity pressure. Only KV release in `CPU`
+or `PINNED` mode requires a host tier
 below all GPU levels with capacity at least equal to their combined GPU quota;
-insufficient capacity fails initialization. See [V2 sleep and wakeup](kvcache.md#sleep-and-wakeup-with-v2).
+all ranks validate this capacity before release begins. Weights-only release and
+KV discard modes do not require backup capacity. See [V2 sleep and wakeup](kvcache.md#sleep-and-wakeup-with-v2).
 
 | `ExecutorMemoryType` | Tag value | Contents |
 | --- | --- | --- |
@@ -355,7 +358,9 @@ addresses, and restores or initializes contents according to `SleepConfig`.
 Native V2 KV pools use the cache manager's own storage lifecycle. Preserving
 modes migrate live pages through its cache tiers; destructive modes retain the
 native cache objects with unmaterialized pages. Wakeup restores pool capacity
-and page storage without reconstructing logical request state in Python.
+and the original GPU page and scratch slots without reconstructing logical
+request state in Python. Together with reserved GPU virtual addresses, this
+keeps active padding requests' KV and SSM addresses stable across sleep/wakeup.
 
 Principal implementation locations are:
 

@@ -646,6 +646,11 @@ class BaseWorker(GenerationExecutor):
         if validator is not None:
             validator(tags)
 
+    def _validate_sleep_config(self, tags: list[ExecutorMemoryType]) -> None:
+        validator = getattr(self.engine, "validate_sleep_config", None)
+        if validator is not None:
+            validator(tags)
+
     def _invalidate_v1_prefix_cache_for_sleep(
             self, tags: list[ExecutorMemoryType]) -> None:
         invalidator = getattr(self.engine,
@@ -862,6 +867,9 @@ class BaseWorker(GenerationExecutor):
                         ack.get("has_mnnvl_resources", False)
                         for ack in prepare_acks)
 
+                if not errors and action == _SleepWakeupAction.SLEEP:
+                    self._validate_sleep_config(tags)
+
                 if not errors:
                     # MNNVL resource hooks contain subgroup handle exchange,
                     # so peers must enter COMMIT before rank 0 executes them.
@@ -1044,6 +1052,7 @@ class BaseWorker(GenerationExecutor):
                 with self.engine._sleep_wakeup_lock, self.engine.control_action(
                 ):
                     torch.cuda.synchronize()
+                    self._validate_sleep_config(tags)
                     local_mutation_started = True
                     self._invalidate_v1_prefix_cache_for_sleep(tags)
                     release_with_tag(*tags, resource=self.engine)

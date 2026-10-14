@@ -114,4 +114,36 @@ TEST(KvCacheManagerV2SlotAllocatorTest, RejectsSlotIdsOutsideThePool)
     EXPECT_FALSE(allocator.isValidSlotId(SlotId{8}));
 }
 
+TEST(KvCacheManagerV2SlotAllocatorTest, RestoreExactSlotsWithHolesAndRecycle)
+{
+    SlotAllocator allocator{8};
+    auto high = allocator.allocateAt(SlotId{6});
+    auto low = allocator.allocateAt(SlotId{2});
+    EXPECT_EQ(allocator.numOccupiedSlots(), 2);
+    EXPECT_EQ(allocator.numFreeSlots(), 6);
+    EXPECT_THROW(allocator.allocateAt(SlotId{6}), LogicError);
+    EXPECT_THROW(allocator.allocateAt(SlotId{-1}), LogicError);
+    EXPECT_THROW(allocator.allocateAt(SlotId{8}), LogicError);
+    allocator.release(std::move(low));
+    low = allocator.allocateAt(SlotId{2});
+    EXPECT_EQ(low.slotId(), SlotId{2});
+    auto others = allocator.allocateMultiple(6);
+    std::vector<SlotId> ids;
+    for (auto const& slot : others)
+    {
+        ids.push_back(slot.slotId());
+    }
+    std::sort(ids.begin(), ids.end());
+    EXPECT_EQ(ids, (std::vector<SlotId>{SlotId{0}, SlotId{1}, SlotId{3}, SlotId{4}, SlotId{5}, SlotId{7}}));
+    releaseSlots(allocator, others);
+    allocator.release(std::move(high));
+    allocator.release(std::move(low));
+    allocator.prepareForShrink(0);
+    EXPECT_TRUE(allocator.finishShrink());
+    allocator.expand(8);
+    auto restored = allocator.allocateAt(SlotId{6});
+    EXPECT_EQ(restored.slotId(), SlotId{6});
+    allocator.release(std::move(restored));
+}
+
 } // namespace

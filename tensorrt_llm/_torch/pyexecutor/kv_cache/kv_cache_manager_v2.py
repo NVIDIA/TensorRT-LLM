@@ -1297,7 +1297,6 @@ class KVCacheManagerV2(BaseResourceManager):
         cold_page_codec_provider: Optional[object] = None,
         joint_kv_cache_reuse: bool = False,
         max_cuda_graph_batch_size: Optional[int] = None,
-        enable_sleep: bool = False,
         **kwargs,
     ) -> None:
         self.mapping = mapping
@@ -1628,7 +1627,6 @@ class KVCacheManagerV2(BaseResourceManager):
         logger.info(f"KV cache manager v2 device quota set to {quota / (1 << 30)}GiB")
 
         cache_tiers: List[CacheTierConfig] = [GpuCacheTierConfig(quota=int(quota))]
-        auto_host_quota = None
         # A capacity-only connector registers nothing for migration to
         # invalidate, so it keeps the tier the scheduler spills to. The
         # rejection of non-GPU tiers in `PyExecutor` exempts it to match.
@@ -1693,8 +1691,6 @@ class KVCacheManagerV2(BaseResourceManager):
             # Reduce the rank-local auto quota to the fleet minimum; see
             # _sync_host_tier_quota for why divergence wedges collectives.
             host_quota = _sync_host_tier_quota(host_quota, mapping)
-            if host_quota > 0:
-                auto_host_quota = host_quota
         if host_quota > 0:
             cache_tiers.append(HostCacheTierConfig(quota=int(host_quota)))
             logger.info(
@@ -1719,34 +1715,6 @@ class KVCacheManagerV2(BaseResourceManager):
             cache_tiers=cache_tiers,
         )
         config = self._build_cache_config(config)
-        if enable_sleep and auto_host_quota is not None:
-            # Sleep evacuates cold GPU pools too. Size the automatic host tier
-            # from the final GPU layout, preserving subclass quota overrides.
-            # Native tier configs are copied by value, so compare quotas.
-            gpu_quota = sum(
-                tier.quota for tier in config.cache_tiers if isinstance(tier, GpuCacheTierConfig)
-            )
-            host_quota = _compute_auto_host_tier_quota(
-                gpu_quota,
-                local_ranks,
-                mem_available,
-                memlock_limit,
-                shares_device_memory=is_device_integrated(),
-            )
-            host_quota = _sync_host_tier_quota(host_quota, mapping)
-            sleep_tiers = []
-            for tier in config.cache_tiers:
-                if isinstance(tier, HostCacheTierConfig) and tier.quota == auto_host_quota:
-                    if host_quota > 0:
-                        sleep_tiers.append(HostCacheTierConfig(quota=int(host_quota)))
-                else:
-                    sleep_tiers.append(tier)
-            config.cache_tiers = sleep_tiers
-            logger.info(
-                f"KV cache manager v2 sleep auto host cache quota set to "
-                f"{host_quota / (1 << 30):.2f}GiB for {gpu_quota / (1 << 30):.2f}GiB "
-                "combined GPU cache quota"
-            )
         config = self._remove_zero_size_buffers(config)
         has_host_cache_tier = any(
             isinstance(tier, HostCacheTierConfig) for tier in config.cache_tiers
@@ -6782,8 +6750,10 @@ class KVCacheManagerV2(BaseResourceManager):
                 kv_cache.close()
         return success
 
-    def validate_sleep_config(self) -> None:
-        """Require host capacity below the GPU levels to hold their combined quota."""
+    def validate_sleep_config(self, mode: RestoreMode) -> None:
+        """Check backup capacity only when KV contents must survive release."""
+        if mode in (RestoreMode.NONE, RestoreMode.MEMSET):
+            return
         tiers = self.impl.init_config.cache_tiers
         gpu_levels = [i for i, tier in enumerate(tiers) if isinstance(tier, GpuCacheTierConfig)]
         gpu_quota = sum(tiers[i].quota for i in gpu_levels)
@@ -6798,7 +6768,7 @@ class KVCacheManagerV2(BaseResourceManager):
         if host_quota < gpu_quota:
             shortfall = gpu_quota - host_quota
             raise ValueError(
-                "KVCacheManagerV2 sleep requires a host tier below all GPU levels with "
+                "KVCacheManagerV2 CPU/PINNED sleep requires a host tier below all GPU levels with "
                 "capacity at least as large as the combined hot and cold GPU cache quota. "
                 f"Required: {gpu_quota} bytes ({gpu_quota / (1 << 20):.2f} MiB); "
                 f"largest eligible host tier: {host_quota} bytes ({host_quota / (1 << 20):.2f} MiB); "
@@ -6808,10 +6778,10 @@ class KVCacheManagerV2(BaseResourceManager):
             )
 
     def release_memory(self, mode: RestoreMode) -> None:
-        """Release GPU backing with the executor drained and its CUDA work complete."""
+        """Release GPU backing, plus HOST backing for discarded KV, after draining."""
         if self._sleep_restore_mode is not None:
             return
-        self.validate_sleep_config()
+        self.validate_sleep_config(mode)
         discard = mode in (RestoreMode.NONE, RestoreMode.MEMSET)
         if discard and any(
             not self.impl.is_stats_excluded(req_id) or cache.num_committed_tokens != 0
@@ -6824,7 +6794,6 @@ class KVCacheManagerV2(BaseResourceManager):
         for req_id, cache in self.kv_cache_map.items():
             if cache.is_active:
                 self._sleeping_active_caches.add(req_id)
-                cache.suspend()
         self.impl.release_gpu_memory(discard=discard)
         if discard:
             self._fresh_pages_filled.clear()
@@ -6832,14 +6801,14 @@ class KVCacheManagerV2(BaseResourceManager):
                 self.conversation_manager.clear()
 
     def materialize_memory(self) -> None:
-        """Restore GPU backing and reconnect surviving requests to their cache pages."""
+        """Restore pool backing and reconnect surviving requests to their cache pages."""
         mode = self._sleep_restore_mode
         if mode is None:
             return
         self.impl.materialize_gpu_memory(zero=mode == RestoreMode.MEMSET)
         for req_id in self._sleeping_active_caches:
             cache = self.kv_cache_map[req_id]
-            if not cache.resume(self._stream.cuda_stream):
+            if not cache.is_active and not cache.resume(self._stream.cuda_stream):
                 raise RuntimeError(f"Could not resume KV cache for request {req_id}")
             self._restore_page_index_bufs(req_id, cache)
         if _GUARD_PAGE_REQUEST_ID in self.kv_cache_map:

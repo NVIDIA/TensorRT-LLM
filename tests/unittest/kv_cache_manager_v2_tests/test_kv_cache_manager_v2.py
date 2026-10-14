@@ -668,14 +668,23 @@ class TestNoBatching(TestKVCacheManagerV2):
         stream_holder.take_finish_event().synchronize()
         self.assertEqual(cache.get_page_storage_snapshot(sparse_group).base_page_indices, [])
 
-    @parameterized.expand([("none", False), ("memset", True)])
-    def test_discard_sleep_preserves_native_cache_state(self, _name: str, zero: bool) -> None:
+    @parameterized.expand(
+        [("none", False, True), ("memset", True, True), ("preserve", False, False)]
+    )
+    def test_discard_sleep_preserves_native_cache_state(
+        self, _name: str, zero: bool, discard: bool
+    ) -> None:
+        from unittest.mock import patch
+
         import torch
 
         self.manager = KVCacheManager(
             KVCacheManagerConfig(
                 tokens_per_block=4,
-                cache_tiers=[GpuCacheTierConfig(4 << 20), HostCacheTierConfig(8 << 20)],
+                cache_tiers=[
+                    GpuCacheTierConfig(4 << 20),
+                    HostCacheTierConfig((2 if discard else 6) << 20),
+                ],
                 layers=[
                     AttentionLayerConfig(0, [BufferConfig("key", 4096, is_sparse=True)]),
                     AttentionLayerConfig(1, [BufferConfig("key", 4096)], sliding_window_size=4),
@@ -697,6 +706,7 @@ class TestNoBatching(TestKVCacheManagerV2):
 
         cache = self.manager.create_kv_cache(id=1, custom_priority_callback=priority)
         never_resumed = self.manager.create_kv_cache(id=2)
+        hole = self.manager.create_kv_cache(id=3)
         self.manager.mark_stats_excluded(1)
         self.manager.mark_stats_excluded(2)
         sparse = self.manager.get_layer_group_id(0)
@@ -706,6 +716,8 @@ class TestNoBatching(TestKVCacheManagerV2):
         stream = torch.cuda.Stream()
         with torch.cuda.stream(stream):
             try:
+                self.assertTrue(hole.resume(stream.cuda_stream))
+                self.assertTrue(hole.resize(4, 0))
                 self.assertTrue(cache.resume(stream.cuda_stream))
                 cache.stop_committing()
                 self.assertTrue(cache.resize(8, 0))
@@ -713,21 +725,37 @@ class TestNoBatching(TestKVCacheManagerV2):
                 self.assertTrue(cache.enter_decode())
                 self.assertIsNotNone(cache.get_scratch_desc(swa))
                 self.assertTrue(cache.has_scratch_slots)
+                hole.close()
                 batch.add(cache)
                 batch.publish(stream.cuda_stream)
                 table = torch.from_dlpack(batch.page_table(sparse))
                 table_address = table.data_ptr()
                 swa_valid = [i != BAD_PAGE_INDEX for i in cache.get_base_page_indices(swa)]
+                original_indices = [list(cache.get_base_page_indices(lg)) for lg in (sparse, swa)]
+                original_scratch = list(cache.get_scratch_desc(swa).slot_ids)
+                original_ssm = cache.get_ssm_block_base_index(ssm)
+                gpu_addresses = [
+                    pool.base_address
+                    for group in self.manager.pool_group_descs
+                    for pool in group.pools
+                ]
+                capacities = [
+                    [stat.total for stat in self.manager.get_storage_statistics(CacheLevel(level))]
+                    for level in range(2)
+                ]
 
                 for cycle in range(2):
                     batch.record_read(stream.cuda_stream)
                     stream.synchronize()
-                    cache.suspend()
-                    self.manager.release_gpu_memory(discard=True)
-                    self.assertEqual(cache.status, _KVCache.Status.UNMATERIALIZED)
+                    self.manager.release_gpu_memory(discard=discard)
+                    self.assertEqual(
+                        cache.status,
+                        _KVCache.Status.UNMATERIALIZED if discard else _KVCache.Status.SUSPENDED,
+                    )
                     self.assertEqual((cache.capacity, cache.history_length), (16, 8))
-                    with self.assertRaisesRegex(LogicError, "Cannot prefetch"):
-                        cache.prefetch(GPU_LEVEL)
+                    if discard:
+                        with self.assertRaisesRegex(LogicError, "Cannot prefetch"):
+                            cache.prefetch(GPU_LEVEL)
                     self.assertEqual(cache.page_storage_row, 0)
                     self.assertTrue(cache.is_decoding)
                     self.assertTrue(cache.enable_swa_scratch_reuse)
@@ -735,10 +763,23 @@ class TestNoBatching(TestKVCacheManagerV2):
                         list(cache.get_base_page_indices(sparse)), [BAD_PAGE_INDEX] * 4
                     )
                     self.assertTrue(
-                        all(stat.total == 0 for stat in self.manager.get_storage_statistics())
+                        all(
+                            stat.total == 0
+                            for level in range(2 if discard else 1)
+                            for stat in self.manager.get_storage_statistics(CacheLevel(level))
+                        )
                     )
 
-                    if cycle == 0:
+                    if cycle == 0 and discard:
+                        with patch.dict(
+                            "os.environ", {"TLLM_KV_CACHE_MANAGER_V2_PREFAULT_THREADS": "invalid"}
+                        ):
+                            with self.assertRaises(ValueError):
+                                self.manager.materialize_gpu_memory(zero=zero)
+                        self.assertEqual(cache.status, _KVCache.Status.UNMATERIALIZED)
+                        self.assertTrue(
+                            all(stat.total == 0 for stat in self.manager.get_storage_statistics())
+                        )
                         remaining = 1
                         with self.assertRaisesRegex(
                             RuntimeError, "injected page materialization failure"
@@ -754,14 +795,42 @@ class TestNoBatching(TestKVCacheManagerV2):
                         )
                         remaining = None
                     self.manager.materialize_gpu_memory(zero=zero)
+                    self.assertEqual(
+                        [
+                            [
+                                stat.total
+                                for stat in self.manager.get_storage_statistics(CacheLevel(level))
+                            ]
+                            for level in range(2)
+                        ],
+                        capacities,
+                    )
                     self.assertEqual(never_resumed.status, _KVCache.Status.SUSPENDED)
                     self.assertFalse(cache.is_active)
+                    if cycle == 0:
+                        # Materialization leaves caches suspended, including reserved scratch slots.
+                        self.manager.release_gpu_memory(discard=discard)
+                        self.manager.materialize_gpu_memory(zero=zero)
                     self.assertTrue(cache.resume())
                     self.assertEqual(
                         cache.get_page_storage_snapshot(sparse).cache_levels, [1, 1, 0, 0]
                     )
                     self.assertIsNotNone(cache.get_scratch_desc(swa))
                     self.assertTrue(cache.has_scratch_slots)
+                    self.assertEqual(
+                        [list(cache.get_base_page_indices(lg)) for lg in (sparse, swa)],
+                        original_indices,
+                    )
+                    self.assertEqual(list(cache.get_scratch_desc(swa).slot_ids), original_scratch)
+                    self.assertEqual(cache.get_ssm_block_base_index(ssm), original_ssm)
+                    self.assertEqual(
+                        [
+                            pool.base_address
+                            for group in self.manager.pool_group_descs
+                            for pool in group.pools
+                        ],
+                        gpu_addresses,
+                    )
                     self.assertEqual(
                         [i != BAD_PAGE_INDEX for i in cache.get_base_page_indices(swa)], swa_valid
                     )
@@ -775,16 +844,17 @@ class TestNoBatching(TestKVCacheManagerV2):
 
                 batch.record_read(stream.cuda_stream)
                 stream.synchronize()
-                cache.suspend()
-                self.manager.release_gpu_memory(discard=True)
+                self.manager.release_gpu_memory(discard=discard)
                 cache.close()
                 never_resumed.close()
+                hole.close()
             finally:
                 remaining = None
                 stream.synchronize()
                 batch.close()
                 cache.close()
                 never_resumed.close()
+                hole.close()
 
     class Request(NamedTuple):
         id: int
@@ -890,7 +960,9 @@ class TestNoBatching(TestKVCacheManagerV2):
 
             if sleep:
                 # Preserve held pages from both the encoded GPU pool and the hot pool.
-                second.kv_cache.suspend()
+                original_indices = [
+                    list(second.kv_cache.get_base_page_indices(lg)) for lg in expected_cold_pages
+                ]
                 capacities = [
                     [stat.total for stat in self.manager.get_storage_statistics(CacheLevel(level))]
                     for level in range(len(self.cfg.cache_tiers))
@@ -936,6 +1008,13 @@ class TestNoBatching(TestKVCacheManagerV2):
                 with TemporaryCudaStream([]) as stream_holder:
                     stream = cast(CudaStream, stream_holder.handle)
                     self.assertTrue(second.kv_cache.resume(stream))
+                    self.assertEqual(
+                        [
+                            list(second.kv_cache.get_base_page_indices(lg))
+                            for lg in expected_cold_pages
+                        ],
+                        original_indices,
+                    )
                     self.run_request(second, self.cfg.tokens_per_block, True)
                 stream_holder.take_finish_event().synchronize()
                 self.manager.get_and_reset_iteration_stats()

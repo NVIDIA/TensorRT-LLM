@@ -159,8 +159,8 @@ public:
     // Release a slot back to its pool.
     void releaseSlot(LifeCycleId lc, CacheLevel level, Slot slot);
 
-    //! Zero a host slot after its prior users have completed.
-    void zeroHostSlotData(LifeCycleId lc, CacheLevel level, Slot const& slot);
+    //! Initialize a discarded cold slot with the codec's representation of a zero hot page.
+    void initializeColdSlot(LifeCycleId lc, CacheLevel level, SlotId slotId);
 
     // ---- Eviction ----------------------------------------------------------
 
@@ -323,11 +323,28 @@ public:
     // Pool-group slot count (number of pages).
     SlotCount numSlots(PoolGroupIndex pgIdx, CacheLevel level = kHotLevel) const;
 
-    //! Evict GPU-resident pages and release their backing, retaining virtual addresses and capacities for wakeup.
-    void releaseGpuMemory();
+    //! Release GPU backing, or empty GPU and HOST pools when discarding. Retain GPU virtual addresses.
+    void releaseMemory(bool discard);
 
-    //! Restore the saved GPU pool capacities, optionally initializing all backing bytes to zero.
-    void materializeGpuMemory(bool zero);
+    //! Restore saved HOST and GPU pool capacities, optionally zeroing GPU backing.
+    void materializeMemory(bool zero);
+
+    bool hasSavedPoolCapacities() const noexcept
+    {
+        return mSleepingPoolSlots.has_value();
+    }
+
+    struct PageLocation
+    {
+        SharedPtr<Page> page;
+        CacheLevel level;
+        SlotId slotId;
+    };
+
+    //! Restore retained GPU pages to their original slots through the normal codec/copy path.
+    void restorePageLocations(std::vector<PageLocation> const& locations);
+
+    Slot allocateSlotAt(LifeCycleId lifeCycle, CacheLevel level, SlotId slotId);
 
     // Layer-to-lifecycle mapping (for KvCacheManager queries).
     std::unordered_map<LayerId, LifeCycleId> const& layerToLifeCycleIds() const noexcept
@@ -396,7 +413,7 @@ private:
 
     std::optional<std::vector<Slot>> _batchedMigrate(CacheLevel dstLevel, CacheLevel srcLevel,
         std::vector<SharedPtr<Page>> const& srcPages, bool updateSrc, MigrationRecorder const& migrationRecorder = {},
-        bool defrag = false);
+        bool defrag = false, std::vector<Slot>* reservedSlots = nullptr);
     void _migrateLockedSparsePages(CUstream stream, CacheLevel dstLevel, std::vector<SharedPtr<Page>> const& pages,
         KvCache const* offloadingCache, MigrationRecorder const& migrationRecorder, DropRecorder const& dropRecorder);
     [[nodiscard]] LayerGroupId getMigrationBatchingLayerGroupId(
@@ -466,7 +483,7 @@ private:
     // All GPU cache levels borrow this allocator. It must outlive mLevels.
     std::unique_ptr<PooledPhysMemAllocator> mGpuPhysMemAllocator;
     TypedVec<CacheLevel, CacheLevelManager> mLevels;
-    std::optional<TypedVec<CacheLevel, TypedVec<PoolGroupIndex, SlotCount>>> mSleepingGpuSlots;
+    std::optional<TypedVec<CacheLevel, TypedVec<PoolGroupIndex, SlotCount>>> mSleepingPoolSlots;
 
     static constexpr size_t kDefaultPageStagingBytes = 64u << 20u;
     static constexpr size_t kPageStagingDepth = 3;

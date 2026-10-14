@@ -115,6 +115,16 @@ types/config/exceptions
   The manager permits discard only for stats-excluded caches with no committed
   tokens, after user requests have drained. Reusable blocks are invalidated in
   the same native transition. Ordinary suspend/resume preserves page contents.
+  Discard releases both GPU and HOST pool backing without migrating discarded
+  pages. HOST mappings may move on restore; GPU virtual addresses remain fixed.
+  Storage restores HOST pools before materializing cache pages and retains saved
+  capacities until every pool has been restored, allowing allocation retries.
+  The manager captures GPU page locations and scratch slot order before suspending
+  active caches. Wakeup reacquires those exact slots before any cache resumes;
+  preserving modes use the existing codec migration path to restore page contents.
+  Pool VA plus slot offset, including SSM and scratch, therefore stays stable for
+  active padding requests across sleep. These are native resource locations,
+  not a second copy of request state.
 
 `commit()` finalizes full blocks. Its `isEnd=true` form is a terminal-memory
 contract: later writes to the request's KV memory are invalid, because final

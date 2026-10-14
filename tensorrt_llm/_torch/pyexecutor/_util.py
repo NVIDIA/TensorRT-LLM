@@ -1989,7 +1989,6 @@ class KvCacheCreator:
             self._llm_args.kv_cache_config.kv_events_config,
             cold_page_codec_provider=cold_page_codec_provider,
             joint_kv_cache_reuse=self._joint_kv_cache_reuse,
-            enable_sleep=self._llm_args.sleep_config is not None,
         )
 
         if not self._skip_est:
@@ -2279,7 +2278,6 @@ class KvCacheCreator:
             disable_overlap_scheduler=self._disable_overlap_scheduler,
             cold_page_codec_provider=cold_page_codec_provider,
             joint_kv_cache_reuse=self._joint_kv_cache_reuse,
-            enable_sleep=self._llm_args.sleep_config is not None,
         )
 
     def _get_target_and_draft_cache_costs(
@@ -2780,7 +2778,6 @@ class KvCacheCreator:
             disable_overlap_scheduler=self._disable_overlap_scheduler,
             kv_cache_type=tensorrt_llm.bindings.internal.batch_manager.
             CacheType.CROSS,
-            enable_sleep=self._llm_args.sleep_config is not None,
         )
 
     def _needs_gpu_kv_cache_budget_split(
@@ -3103,8 +3100,7 @@ def _create_kv_cache_manager(
         cold_page_codec_provider: Optional[object] = None,
         kv_events_config: Optional[KVEventsConfig] = None,
         joint_kv_cache_reuse: bool = False,
-        max_cuda_graph_batch_size: Optional[int] = None,
-        enable_sleep: bool = False) -> KVCacheManager:
+        max_cuda_graph_batch_size: Optional[int] = None) -> KVCacheManager:
     """
     Returns:
         A KVCacheManager instance for the given model engine or model config
@@ -3272,7 +3268,6 @@ def _create_kv_cache_manager(
             model_engine._max_cuda_graph_batch_size
             if model_engine is not None else max_cuda_graph_batch_size)
         manager_extra_kwargs["enable_stats"] = enable_kv_cache_stats
-        manager_extra_kwargs["enable_sleep"] = enable_sleep
         manager_extra_kwargs["max_copy_beam_width"] = max_copy_beam_width
         manager_extra_kwargs[
             "cold_page_codec_provider"] = cold_page_codec_provider

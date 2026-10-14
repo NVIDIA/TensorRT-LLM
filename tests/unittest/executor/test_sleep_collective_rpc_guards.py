@@ -65,6 +65,7 @@ def _make_worker(backend="pytorch", world_size=1, sleep_config=_SLEEP_CONFIG_DEF
         abort_wakeup_transition=MagicMock(),
         fail_sleep_wakeup_transition=MagicMock(),
         validate_sleep_tags=MagicMock(),
+        validate_sleep_config=MagicMock(),
         invalidate_v1_prefix_cache_for_sleep=MagicMock(),
     )
     return w
@@ -1260,30 +1261,43 @@ class TestMultiRankSendFailureRecovery:
         worker.engine.fail_sleep_wakeup_transition.assert_called_once_with()
         hard_kill.assert_called_once_with()
 
-    def test_precommit_local_failure_remains_recoverable(self):
+    @pytest.mark.parametrize("capacity_failure", [False, True])
+    def test_precommit_local_failure_remains_recoverable(self, capacity_failure):
         """A failure before local mutation aborts peers without fail-stopping."""
         from unittest.mock import Mock, patch
 
         from tensorrt_llm.llmapi.llm_args import ExecutorMemoryType
 
-        worker, _ = _make_proto_worker(
+        worker, recv_calls = _make_proto_worker(
             [{"status": "ok"}, {"status": "ok"}],
             world_size=2,
         )
         fail_stop = Mock()
         worker._fail_stop_divergent_sleep_wakeup = fail_stop
+        worker.engine.validate_sleep_config = Mock(
+            side_effect=ValueError("host quota is too small") if capacity_failure else None
+        )
+        worker.engine._has_mnnvl_checkpoint_resources = Mock(return_value=capacity_failure)
 
         with (
-            patch("tensorrt_llm._torch.virtual_memory.release_with_tag"),
+            patch("tensorrt_llm._torch.virtual_memory.release_with_tag") as release,
             patch("tensorrt_llm._torch.virtual_memory.materialize_with_tag"),
-            patch("torch.cuda.synchronize", side_effect=RuntimeError("sync failed")),
+            patch(
+                "torch.cuda.synchronize",
+                side_effect=None if capacity_failure else RuntimeError("sync failed"),
+            ),
             patch("gc.collect"),
             patch("torch.cuda.empty_cache"),
         ):
-            with pytest.raises(RuntimeError, match="sync failed"):
+            with pytest.raises(
+                RuntimeError, match="host quota is too small" if capacity_failure else "sync failed"
+            ):
                 worker._multi_rank_sleep_wakeup("sleep", [ExecutorMemoryType.KV_CACHE])
 
         fail_stop.assert_not_called()
+        release.assert_not_called()
+        assert recv_calls == [1, 1]
+        assert worker.engine._sleep_wakeup_comm.phase_by_source[1] == "abort"
 
 
 class TestListenerUncaughtExceptionSendsErrorAck:
@@ -1362,7 +1376,8 @@ class TestListenerUncaughtExceptionSendsErrorAck:
 class TestListenerAbortAndShutdown:
     """Listener control messages must unblock cleanly and ACK rank-0."""
 
-    def test_prepare_does_not_execute_vmm_or_release_control(self):
+    @pytest.mark.parametrize("capacity_failure", [False, True])
+    def test_prepare_does_not_execute_vmm_or_release_control(self, capacity_failure):
         """Prepare quiesces the peer but leaves VMM and control_action_done untouched."""
         import threading
         from unittest.mock import patch
@@ -1400,6 +1415,9 @@ class TestListenerAbortAndShutdown:
         executor.control_request_barrier.set()
         executor.control_action_done = threading.Event()
         executor._active_control_id = op_id
+        executor.validate_sleep_config = MagicMock(
+            side_effect=ValueError("host quota is too small") if capacity_failure else None
+        )
 
         with (
             patch("torch.cuda.set_device"),
@@ -1415,6 +1433,13 @@ class TestListenerAbortAndShutdown:
                 pass
 
         release.assert_not_called()
+        executor.validate_sleep_config.assert_called_once()
+        if capacity_failure:
+            assert sent_acks[0]["status"] == "error"
+            assert sent_acks[0]["phase"] == _SleepWakeupAction.PREPARE
+            assert "host quota is too small" in sent_acks[0]["error"]
+            assert executor.control_action_done.is_set()
+            return
         assert executor.control_request_barrier.is_set()
         assert not executor.control_action_done.is_set()
         assert sent_acks == [
