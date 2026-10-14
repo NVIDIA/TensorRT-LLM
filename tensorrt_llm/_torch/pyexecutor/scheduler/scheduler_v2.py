@@ -16,7 +16,7 @@
 import enum
 import os
 from collections import Counter
-from typing import Callable, Optional
+from typing import TYPE_CHECKING, Callable, Optional
 
 from tensorrt_llm.llmapi.llm_args import CapacitySchedulerPolicy, ContextChunkingPolicy
 from tensorrt_llm.logger import logger
@@ -37,6 +37,10 @@ from .scheduler import (
     _is_forced_context_chunk_boundary,
     drop_decoder_context_requests_waiting_for_encoder_output,
 )
+
+
+if TYPE_CHECKING:
+    from ..kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 
 
 class ScheduleAction(enum.Enum):
@@ -1847,6 +1851,7 @@ class KVCacheV2Scheduler(RequestScheduler):
     def _has_pending_connector_load(self, req: LlmRequest) -> bool:
         connector = self.kv_cache_manager.kv_connector_manager
         return connector is not None and connector.has_pending_load(req)
+
     def _connector_peer_kv_cache_managers(self) -> tuple["KVCacheManagerV2", ...]:
         """Other V2 pools whose pages share the connector request lifetime."""
         if self.draft_kv_cache_manager is None:

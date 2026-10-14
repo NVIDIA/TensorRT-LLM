@@ -650,6 +650,14 @@ class PyExecutor:
             ResourceManagerType.KV_CACHE_MANAGER)
         self.draft_kv_cache_manager = self.resource_manager.resource_managers.get(
             ResourceManagerType.DRAFT_KV_CACHE_MANAGER)
+        if (kv_connector_manager is not None
+                and not kv_connector_manager.capacity_only
+                and kv_connector_manager.speculative_prefill_only
+                and self.draft_kv_cache_manager is not None):
+            raise NotImplementedError(
+                "Mooncake MTP context reuse currently requires a unified target/draft "
+                "KV pool. Separate pools need joint completion reservations and "
+                "atomic paired allocation before they can be safely reused.")
         self._is_kv_manager_v2 = isinstance(self.kv_cache_manager,
                                             KVCacheManagerV2)
         self.enable_joint_kv_cache_reuse = (

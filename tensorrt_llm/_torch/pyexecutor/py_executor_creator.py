@@ -1032,6 +1032,13 @@ def _create_py_executor(
             and cache_transceiver_config is not None
             and cache_transceiver_config.backend is not None)
 
+        if speculative_prefill_only:
+            if spec_config.spec_dec_mode.is_mtp_vanilla():
+                raise NotImplementedError(
+                    "Mooncake MTP context reuse requires EAGLE-style MTP. "
+                    "Vanilla MTP chunk boundaries do not yet produce equivalent draft KV."
+                )
+
         # Rejected draft tokens shrink a request's page list, and the freed slot
         # goes to whichever request allocates next. The connector is only told
         # about pages appended since the last report, so it would keep
