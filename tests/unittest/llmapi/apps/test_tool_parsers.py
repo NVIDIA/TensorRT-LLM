@@ -1359,10 +1359,9 @@ class TestQwen3CoderToolParser(BaseToolParserTestClass):
             },
             "param6": [1, 2, 3],
             "param7": None,
-            "param8": {
-                "arg1": 3,
-                "arg2": [1, 2]
-            }
+            # An unknown type is decoded as JSON only; a Python literal is
+            # not JSON, so the text is kept.
+            "param8": "{'arg1': 3, 'arg2': [1, 2]}",
         }
 
     def test_parse_anyof_parameter_type_conversion(self, parser):
@@ -1527,6 +1526,192 @@ class TestQwen3CoderToolParser(BaseToolParserTestClass):
         assert result.calls[0].name == "execute_bash"
         assert json.loads(result.calls[0].parameters) == {
             "command": "pwd && ls"
+        }
+
+    @pytest.mark.parametrize(
+        "schema,raw,expected",
+        [
+            # Booleans accept 1/0 and surrounding whitespace; any other text
+            # is kept as written instead of turning into false.
+            ({
+                "type": "boolean"
+            }, "1", True),
+            ({
+                "type": "boolean"
+            }, " False ", False),
+            ({
+                "type": "boolean"
+            }, "yes", "yes"),
+            # Every type a schema allows is tried, null first.
+            ({
+                "type": ["integer", "null"]
+            }, "null", None),
+            ({
+                "type": ["integer", "null"]
+            }, "7", 7),
+            ({
+                "anyOf": [{
+                    "type": "integer"
+                }, {
+                    "type": "string"
+                }]
+            }, "12", 12),
+            ({
+                "type": ["number", "string"]
+            }, "abc", "abc"),
+            ({
+                "enum": [1, 2, 3]
+            }, "2", 2),
+            # A string parameter keeps null and numerals as text.
+            ({
+                "type": "string"
+            }, "null", "null"),
+            ({
+                "type": "string"
+            }, "42", "42"),
+            # A non-finite number is not valid JSON, so the text is kept.
+            ({
+                "type": "number"
+            }, "inf", "inf"),
+            ({
+                "type": "number"
+            }, "5.0", 5),
+            # Objects are decoded as JSON only, not as Python literals.
+            ({
+                "type": "object"
+            }, "{'a': 1}", "{'a': 1}"),
+        ],
+    )
+    def test_parameter_value_typing(self, parser, schema, raw, expected):
+        """Values are typed by their schema the way vLLM's Qwen3 parser types them."""
+        tool = ChatCompletionToolsParam(
+            type="function",
+            function=FunctionDefinition(
+                name="f",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "p": schema
+                    }
+                },
+            ),
+        )
+        text = ("<tool_call>\n<function=f>\n"
+                f"<parameter=p>\n{raw}\n</parameter>\n"
+                "</function>\n</tool_call>")
+
+        result = parser.detect_and_parse(text, [tool])
+
+        value = json.loads(result.calls[0].parameters)["p"]
+        assert value == expected
+        assert type(value) is type(expected)
+
+    def test_string_values_are_kept_verbatim(self, parser):
+        """Only the newline the template puts on each side of a value is removed.
+
+        Indentation, trailing spaces and literal HTML entities belong to the
+        value, as they do in the code a coding model writes.
+        """
+        tool = ChatCompletionToolsParam(
+            type="function",
+            function=FunctionDefinition(
+                name="write",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "content": {
+                            "type": "string"
+                        }
+                    },
+                },
+            ),
+        )
+        content = "    if a &lt; b:\n        return a  "
+        text = ("<tool_call>\n<function=write>\n"
+                f"<parameter=content>\n{content}\n</parameter>\n"
+                "</function>\n</tool_call>")
+
+        result = parser.detect_and_parse(text, [tool])
+
+        assert json.loads(result.calls[0].parameters) == {"content": content}
+
+    def test_values_stay_strings_without_a_schema(self, parser):
+        """Without a schema to type them by, values are kept as written."""
+        text = ("<tool_call>\n<function=search>\n"
+                "<parameter=limit>10</parameter>\n"
+                "<parameter=label>null</parameter>\n"
+                "</function>\n</tool_call>")
+
+        result = parser.detect_and_parse(text, [])
+
+        assert json.loads(result.calls[0].parameters) == {
+            "limit": "10",
+            "label": "null",
+        }
+
+    def test_streaming_matches_detect_and_parse(self, parser):
+        """Streamed arguments equal the whole-text parse, key order included.
+
+        The second delta completes several parameters at once, and they must be
+        streamed in the order the model wrote them.
+        """
+        tool = ChatCompletionToolsParam(
+            type="function",
+            function=FunctionDefinition(
+                name="f",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "first": {
+                            "type": "string"
+                        },
+                        "count": {
+                            "type": "integer"
+                        },
+                        "ratio": {
+                            "type": "number"
+                        },
+                        "flag": {
+                            "type": "boolean"
+                        },
+                        "label": {
+                            "type": ["string", "null"]
+                        },
+                        "items": {
+                            "type": "array"
+                        },
+                    },
+                },
+            ),
+        )
+        body = ("<parameter=first>\nx\n</parameter>\n"
+                "<parameter=count>\n3\n</parameter>\n"
+                "<parameter=ratio>\n0.5\n</parameter>\n"
+                "<parameter=flag>\n1\n</parameter>\n"
+                "<parameter=label>\nnull\n</parameter>\n"
+                "<parameter=items>\n[1, 2]\n</parameter>\n")
+        split = body.index("<parameter=count>")
+        deltas = [
+            "<tool_call>",
+            "\n<function=f>\n" + body[:split],
+            body[split:] + "</function>\n",
+            "</tool_call>",
+        ]
+
+        streamed = ""
+        for delta in deltas:
+            for call in parser.parse_streaming_increment(delta, [tool]).calls:
+                streamed += call.parameters or ""
+        whole = Qwen3CoderToolParser().detect_and_parse("".join(deltas), [tool])
+
+        assert streamed == whole.calls[0].parameters
+        assert json.loads(streamed) == {
+            "first": "x",
+            "count": 3,
+            "ratio": 0.5,
+            "flag": True,
+            "label": None,
+            "items": [1, 2],
         }
 
 
