@@ -340,8 +340,8 @@ TEST_F(PeftCacheManagerTest, putToCapacity)
             if (last)
             {
                 EXPECT_THAT([&]() { mPeftManager->addRequestPeft(llmRequest); },
-                    testing::Throws<std::runtime_error>(testing::Property(&std::runtime_error::what,
-                        testing::HasSubstr("There are not enough pages in done tasks to evict"))));
+                    testing::Throws<std::runtime_error>(testing::Property(
+                        &std::runtime_error::what, testing::HasSubstr("PEFT Cache is full. Could not store taskId="))));
                 break;
             }
             reqTable.insert_or_assign(llmRequest->mRequestId, llmRequest);
