@@ -261,7 +261,7 @@ class Campaign:
         st.commits = [str(c) for c in data.get("commits") or []]
         self.ledger.append("tuner_decision", slug=slug, decision=st.decision, candidate_kind=data.get("kind"),
                            hypothesis=data.get("hypothesis"), microbench=data.get("microbench"),
-                           projection=data.get("projection"))
+                           projection=data.get("projection"), sources=data.get("sources"))
         if st.decision != "CANDIDATE":
             st.status = {"DROPPED": "dropped", "BLOCKED": "blocked"}.get(st.decision, st.decision.lower())
             self.state.save(self.state_path)

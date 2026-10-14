@@ -136,7 +136,8 @@ def test_the_stage_runs_ground_ladder_campaign_and_wrap(tmp_path):
         if what == "fast-path":
             (wt / "modeling.py").write_text("FAST = True\n")
             _git(wt, "commit", "-q", "-am", "fast path")
-            decision = {"decision": "CANDIDATE", "worktree": str(wt), "commits": [_git(wt, "rev-parse", "HEAD")]}
+            decision = {"decision": "CANDIDATE", "worktree": str(wt), "commits": [_git(wt, "rev-parse", "HEAD")],
+                        "sources": [{"source": "flashinfer", "ref": "flashinfer.fused_x", "outcome": "used"}]}
         else:
             decision = {"decision": "DROPPED", "worktree": str(wt), "microbench": {"table": "slower"}}
         (out / "decision.yaml").write_text(yaml.safe_dump(decision))
@@ -146,6 +147,9 @@ def test_the_stage_runs_ground_ladder_campaign_and_wrap(tmp_path):
     stage = TuneStage(spec, state, dispatch=dispatch, checkpoint=lambda: None,
                       runner_factory=lambda spools, prefix: FakeRunner(spools, prefix, _effect), poll_s=0, log=lambda m: None)
     assert stage.run() == "tuned"
+    records = [json.loads(line) for line in (spec.workdir / "perf_ledger.jsonl").read_text().splitlines()]
+    used = [r["sources"] for r in records if r["kind"] == "tuner_decision" and r.get("slug") == "fast-path"]
+    assert used and used[0][0]["source"] == "flashinfer"  # the ledger keeps where each candidate came from
     assert state["phase"] == "done"
     assert state["ladder_kept"] == ["cg-padding"]
     assert state["kept"] == ["fast-path"]
@@ -823,3 +827,21 @@ def test_a_tuner_request_names_its_sources(tmp_path):
     req = render_request(stage._context("(none)"), slug="x", worktree=tmp_path / "wt", base="HEAD", hypothesis="h",
                          deliverables="d", job_prefix="x").read_text()
     assert "surface.md" in req and "kernel_choices.json" in req and "--grep='perf'" in req and "/engines/vllm" in req
+
+
+def test_the_roadmap_request_names_its_sources(tmp_path):
+    """The roadmap turn, where hypotheses are formed, sees the same sources as a candidate turn and must
+    say per item where the idea came from."""
+    repo = _repo(tmp_path)
+    task = {"trtllm_repo_path": str(repo), "checkpoint_path": "/ckpt",
+            "perf": {"identity_configs": [str(tmp_path / "identity.yaml")], "spools": ["s1"], "env_script": "/env.sh",
+                     "sister_engines": ["/engines/sglang"]}}
+    spec = TuneSpec.from_task(task, tmp_path / "ws", target="tensorrt_llm/_torch/_experimental/modeling_v2/models/f/t/")
+    spec.workdir.mkdir(parents=True)
+    (tmp_path / "ws" / "surface.md").write_text("## FlashInfer API\n")
+    stage = TuneStage(spec, {}, dispatch=lambda *a: "", checkpoint=lambda: None,
+                      runner_factory=lambda spools, prefix: FakeRunner(spools, prefix, _effect), poll_s=0, log=lambda m: None)
+    assert stage._roadmap(1) == []
+    req = (spec.workdir / "roadmap-request.md").read_text()
+    assert "surface.md" in req and "kernel_choices.json" in req and "--grep='perf'" in req and "/engines/sglang" in req
+    assert "sources}" in req and "repo-prior-art" in req

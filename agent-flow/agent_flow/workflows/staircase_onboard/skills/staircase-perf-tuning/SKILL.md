@@ -129,8 +129,10 @@ run is mixed (prefill) steps, which a decode-only profile hides. Flags and extra
 
 ## Where hypotheses come from
 
-Look in this order; each source has a place in the stage, and a candidate names its source in the
-decision file.
+Look in this order; each source has a place in the stage. Roadmap items and decision files carry a
+`sources` list (`{source, ref, outcome}` with `source` one of `profile`, `code-reading`, `flashinfer`,
+`repo-prior-art`, `sister-engine`, `kernel-choices`); the campaign ledger keeps it per candidate, so the
+next campaign can see which sources paid off.
 
 | source | how | where it lives in the stage |
 |---|---|---|

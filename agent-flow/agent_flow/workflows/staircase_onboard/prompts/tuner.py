@@ -77,6 +77,7 @@ microbench: {{result: <json path>, table: |
   <markdown rows: case, impl, graph us, eager us, speedup>}}
 projection: {{con_lo: "<+x% tok/s/user, with arithmetic>", con_hi: "<+y% tok/s/GPU, with arithmetic>"}}
 kernel_choices: [<op names you appended to kernel_choices.json>]
+sources: [{{source: flashinfer | repo-prior-art | sister-engine | kernel-choices | profile | code-reading, ref: <callable, commit, file or profile>, outcome: used | raced-lost | not-applicable}}]
 risks: <numerics, capture safety, shapes outside the cells>
 notes: <anything the next turn should know, incl. rejected alternatives>
 ```

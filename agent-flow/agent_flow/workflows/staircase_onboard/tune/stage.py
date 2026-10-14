@@ -281,6 +281,12 @@ class TuneStage:
         ]
         return "\n".join(lines)
 
+    def _sisters_line(self) -> str:
+        if not self.spec.sister_engines:
+            return ""
+        return ("\n- Other engines that implement this model (strategies, not code): "
+                + ", ".join(f"`{e}`" for e in self.spec.sister_engines) + ".")
+
     def _standings(self) -> str:
         ms = [Measurement.load(self.data / l) for l in (self.t.get("baseline"), self.t.get("reference")) if l and (self.data / l / "meta.json").exists()]
         return format_table(ms, ms[0] if ms else None) if ms else "(no measurement yet)"
@@ -310,10 +316,12 @@ class TuneStage:
             request.write_text(
                 f"# Tuner request: {what}\n\nProfile the target at the campaign config (nsys through the substrate, "
                 f"see the skill's references/nsys.md), read the forward, and write `{path}`: a YAML list of "
-                "`{slug, kind, hypothesis, evidence, expected, modeling_edits}` ranked by the exclusive time each "
-                "can remove. Then write the decision file `" + str(self.spec.workdir / f"{what}-decision.yaml")
+                "`{slug, kind, hypothesis, evidence, expected, modeling_edits, sources}` ranked by the exclusive time each "
+                "can remove; `sources` names where the idea and its kernel options come from (`profile`, `code-reading`, "
+                "`flashinfer`, `repo-prior-art`, `sister-engine`, `kernel-choices`, each with a reference). Then write the "
+                "decision file `" + str(self.spec.workdir / f"{what}-decision.yaml")
                 + "` with `decision: CANDIDATE` (roadmap ready) or `STOP`." + again
-                + "\n\n## Standings\n\n" + self._standings() + "\n"
+                + "\n\n## Standings\n\n" + self._standings() + "\n\n" + self._sources_note() + self._sisters_line() + "\n"
             )
             self.dispatch("tuner", what, turn_prompt(PACKAGE, request))
         if not path.exists():
