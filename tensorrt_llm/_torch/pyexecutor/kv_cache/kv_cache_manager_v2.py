@@ -1249,6 +1249,7 @@ class KVCacheManagerV2(BaseResourceManager):
     # Read by KvCacheCreator: a subclass that overrides the context
     # commit/history protocol opts out of generic reuse-match backoff.
     _supports_reuse_match_backoff = True
+    _scheduler_async_load_admission: bool = False
     # A subclass whose pools are not all addressed at `tokens_per_block` token
     # granularity opts out of *partial*-block reuse. Full-block reuse stays on.
     #
@@ -4460,27 +4461,7 @@ class KVCacheManagerV2(BaseResourceManager):
             return
         served_any = False
         for request in scheduled_batch.context_requests:
-            # An allocation is asked about and reported exactly once, and it
-            # takes all three guards. The first two describe a fresh allocation
-            # -- a request whose asynchronous load has completed re-enters on
-            # its first chunk with the same pages and nothing left to load.
-            # `should_add_sequence` only goes false once that load *completes*,
-            # so a batch dropped between here and the forward pass brings every
-            # context request back with both predicates still true; the memo is
-            # what stops `update_state_after_alloc` reporting the same pages
-            # twice.
-            if not request.is_first_context_chunk:
-                continue
-            if not self.kv_connector_manager.should_add_sequence(request):
-                continue
-            if request.py_connector_allocation_reported:
-                continue
-            served_any |= self._apply_connector_matched_prefix(request)
-            request.py_connector_allocation_reported = True
-            # Draft pages do not exist until their manager prepares this batch.
-            # Defer the allocation callback, which may start background writes,
-            # until report_batch_to_connector can describe every layout group.
-            self._connector_pending_allocations[request.py_request_id] = request
+            served_any |= self._run_request_kv_connector_hooks(request)
 
         if served_any:
             # A served prefix can carry a request past its last chunk boundary,
@@ -4488,6 +4469,53 @@ class KVCacheManagerV2(BaseResourceManager):
             # `context_requests_last_chunk`. `build_scheduler_output` walks
             # those two lists, so the split has to be rebuilt before it runs.
             scheduled_batch.reset_context_requests()
+
+    def _run_request_kv_connector_hooks(self, request: LlmRequest) -> bool:
+        """Query a fresh allocation once and defer its page notification."""
+        manager = self.kv_connector_manager
+        if (
+            not request.is_first_context_chunk
+            or not manager.should_add_sequence(request)
+            or request.py_connector_allocation_reported
+        ):
+            return False
+        served = self._apply_connector_matched_prefix(request)
+        request.py_connector_allocation_reported = True
+        self._connector_pending_allocations[request.py_request_id] = request
+        return served
+
+    def _notify_connector_allocation(
+        self,
+        request: LlmRequest,
+        additional_managers: Sequence["KVCacheManagerV2"] = (),
+    ) -> None:
+        """Publish every destination group on its allocation producer stream."""
+        by_group = self.get_page_indices_by_layer_group(request)
+        for manager in additional_managers:
+            by_group.extend(manager.get_page_indices_by_layer_group(request))
+        flat = by_group[0] if len(by_group) == 1 else []
+        # Async workers record destination readiness on the current stream.
+        with torch.cuda.stream(self._stream):
+            self.kv_connector_manager.update_state_after_alloc(request, flat, by_group)
+
+    def try_admit_async_connector_load(self, request: LlmRequest) -> bool:
+        """Park a reserved prefix load without spending a forward token or slot."""
+        if (
+            not self._scheduler_async_load_admission
+            or not request.is_context_only_request
+            or request.is_dummy_request
+        ):
+            return False
+        manager = self.kv_connector_manager
+        if manager.get_num_pending_loads() >= manager.scheduler_async_load_capacity:
+            return False
+        self._run_request_kv_connector_hooks(request)
+        if request.request_id not in manager.new_async_requests.loading:
+            return False
+        # The early path has no separate draft pool; all groups are allocated.
+        if self._connector_pending_allocations.pop(request.py_request_id, None) is not None:
+            self._notify_connector_allocation(request)
+        return manager.park_request_for_async_load(request)
 
     def report_batch_to_connector(
         self,
@@ -4516,15 +4544,7 @@ class KVCacheManagerV2(BaseResourceManager):
             for request in scheduled_batch.context_requests:
                 if pending.pop(request.py_request_id, None) is None:
                     continue
-                by_group = self.get_page_indices_by_layer_group(request)
-                for manager in additional_managers:
-                    by_group.extend(manager.get_page_indices_by_layer_group(request))
-                flat = by_group[0] if len(by_group) == 1 else []
-                # Page allocation/COW belongs to the manager's execution stream,
-                # which need not be the caller's current stream. Async loaders
-                # record their destination-readiness event on this producer.
-                with torch.cuda.stream(self._stream):
-                    self.kv_connector_manager.update_state_after_alloc(request, flat, by_group)
+                self._notify_connector_allocation(request, additional_managers)
             self.kv_connector_manager.build_scheduler_output(
                 scheduled_batch, self, additional_managers
             )

@@ -243,6 +243,38 @@ class KVCacheV2Scheduler(RequestScheduler):
             self.chunking_policy = ctx_chunk_config[0]
             self.chunk_unit_size = ctx_chunk_config[1]
 
+        # Only owner-local, reservation-bounded loads may bypass compute admission.
+        kv_cache_manager._scheduler_async_load_admission = False
+        self.num_async_loads_admitted = 0
+        if os.environ.get("TRTLLM_MOONCAKE_EARLY_ADMISSION", "0") == "1":
+            connector = kv_cache_manager.kv_connector_manager
+            conditions = {
+                "max_utilization": self.policy == CapacitySchedulerPolicy.MAX_UTILIZATION,
+                "chunked": self.chunking_enabled,
+                "prefix_aware": enable_prefix_aware_scheduling,
+                "no_separate_draft": draft_kv_cache_manager is None,
+                "no_cross_cache": cross_kv_cache_manager is None,
+                "no_peft": peft_cache_manager is None,
+                "no_helix_cp": not self.has_cp_helix,
+                "pp1_cp1": (
+                    kv_cache_manager.mapping.pp_size == 1
+                    and kv_cache_manager.mapping.cp_size == 1
+                ),
+                "completion_reservations": bool(kv_cache_manager._disagg_completion_pool_counts),
+                "async_connector_capability": (
+                    connector is not None
+                    and connector.supports_scheduler_async_load
+                    and connector.scheduler_async_load_capacity > 0
+                    and not connector.prefix_reservations_enabled
+                ),
+            }
+            kv_cache_manager._scheduler_async_load_admission = all(conditions.values())
+            logger.info(
+                "Mooncake early async admission: "
+                f"enabled={kv_cache_manager._scheduler_async_load_admission}, "
+                f"disabled_by={[name for name, enabled in conditions.items() if not enabled]}"
+            )
+
         # State value caches for fast comparison.
         # Default range [CONTEXT_INIT, GENERATION_TO_COMPLETE) matches C++
         # MicroBatchScheduler. For encoder-decoder models, caller should pass
@@ -370,6 +402,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         disagg_candidates: RequestList = []
         scheduled_beam_width = 0
         has_chunking = False
+        self.num_async_loads_admitted = 0
 
         budget = BudgetTracker(
             self.max_num_tokens,
@@ -634,6 +667,14 @@ class KVCacheV2Scheduler(RequestScheduler):
                     break
                 if action is ScheduleAction.SKIP:
                     continue
+                if (
+                    self.kv_cache_manager._scheduler_async_load_admission
+                    and self.kv_cache_manager.try_admit_async_connector_load(req)
+                ):
+                    self.num_async_loads_admitted += 1
+                    # The load keeps its pages and full-prompt reservation but
+                    # spends no compute budget or prefix-contributor slot.
+                    continue
                 has_chunking = has_chunking or chunking_flag
                 scheduled_ctx.append(req)
                 if len(scheduled_ctx) == 1:
@@ -661,6 +702,7 @@ class KVCacheV2Scheduler(RequestScheduler):
             or evicted
             or recompute_paused
             or deferred_behind_contributor
+            or self.num_async_loads_admitted
         )
         if (
             self.remote_tail_phase is None

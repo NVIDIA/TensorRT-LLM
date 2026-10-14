@@ -350,6 +350,9 @@ class KvCacheConnectorScheduler(ABC):
     # ADP creates one adapter per rank. Adapters may connect to the same
     # logical storage pool; their request and allocation state stays local.
     supports_attention_dp: bool = False
+    # Early admission requires owner-local lookup and post-allocation DMA.
+    supports_scheduler_async_load: bool = False
+    scheduler_async_load_capacity: int = 0
 
     def __init__(self, llm_args: TorchLlmArgs):
         self._llm_args = llm_args
@@ -775,6 +778,12 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         #: because this disables most of the per-request path, which is too
         #: much to infer from a merely truthy value.
         self.capacity_only = worker.capacity_only is True
+        self.supports_scheduler_async_load = (
+            scheduler is not None and scheduler.supports_scheduler_async_load
+        )
+        self.scheduler_async_load_capacity = (
+            scheduler.scheduler_async_load_capacity if scheduler is not None else 0
+        )
         # Read by the KV cache manager to decide whether the prefix query runs
         # in the scheduling pass or once the batch is final. Carried here rather
         # than read from llm_args so the cache manager needs only this object.
@@ -1313,6 +1322,28 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
                 self.local_finished_async_requests,
             )
         )
+
+    def get_num_pending_loads(self) -> int:
+        """Count loading requests until their DMA ownership has been retired."""
+        return sum(
+            len(requests.loading)
+            for requests in (
+                self.new_async_requests,
+                self.pending_async_requests,
+                self.local_finished_async_requests,
+            )
+        )
+
+    def park_request_for_async_load(self, request: LlmRequest) -> bool:
+        """Retain an early loader's allocation outside the forward batch."""
+        if request.request_id not in self.new_async_requests.loading:
+            return False
+        request.state = LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
+        self.new_async_requests.loading[request.request_id] = request
+        # A load-only pass need not publish a scheduler output. Consume this
+        # request's prefix delta so its resumed forward does not subtract it twice.
+        self.scheduler_output_manager.external_loads.pop(request.request_id, None)
+        return True
 
     def _validate_speculative_prefill_request(self, request: LlmRequest) -> None:
         """Keep MTP's append-only connector page lists on context-only work."""

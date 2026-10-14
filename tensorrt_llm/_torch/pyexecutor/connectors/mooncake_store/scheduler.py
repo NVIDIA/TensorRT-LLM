@@ -155,6 +155,10 @@ class MooncakeStoreConnectorScheduler(KvCacheConnectorScheduler):
                 "its own process, which under tensor parallelism only rank 0 has."
             )
 
+        self.supports_scheduler_async_load = self._async_load
+        self.scheduler_async_load_capacity = (
+            int(self._config.async_load_workers) if self._async_load else 0
+        )
 
         logger.warning(
             f"mooncake-store leader ready (role={self._config.role.value}, "
