@@ -107,7 +107,7 @@ class _LSEVanillaAttention(nn.Module):
 
 
 def _init_worker(rank: int, world_size: int, backend: str, port: int):
-    os.environ["MASTER_ADDR"] = "localhost"
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = str(port)
     if backend == "nccl" and torch.cuda.is_available():
         torch.cuda.set_device(rank % torch.cuda.device_count())

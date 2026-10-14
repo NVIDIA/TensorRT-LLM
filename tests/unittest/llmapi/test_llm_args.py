@@ -1001,6 +1001,7 @@ class TestKvCacheManagerV2AutoResolution:
                                                       cache_transceiver_config):
         llm_args = TorchLlmArgs(
             model="/tmp/dummy_model",
+            kv_cache_config=KvCacheConfig(use_kv_cache_manager_v2="auto"),
             cache_transceiver_config=cache_transceiver_config)
 
         assert _resolve_kv_cache_manager_v2_auto(llm_args,
@@ -1015,6 +1016,7 @@ class TestKvCacheManagerV2AutoResolution:
         """A required V2 is refused on the demotion arm, never demoted."""
         llm_args = TorchLlmArgs(
             model="/tmp/dummy_model",
+            kv_cache_config=KvCacheConfig(use_kv_cache_manager_v2="auto"),
             cache_transceiver_config=CacheTransceiverConfig(
                 backend=backend, transceiver_runtime=runtime),
         )

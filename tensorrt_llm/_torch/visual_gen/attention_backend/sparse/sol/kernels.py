@@ -655,6 +655,7 @@ def visual_gen_sol_predictor(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Return ``(exact_block_bits, k_summary, v_summary)`` for compact BSHD ``q``, ``k`` and ``v``.
 
+    K/V summaries are block means over the tokens present, including a partial final block.
     The outputs are fresh tensors of this call. Inside CUDA Graph capture they come from the graph
     pool and stay valid for every replay; under torch.compile the operator is opaque and shapes come
     from the fake implementation.
@@ -668,7 +669,7 @@ def visual_gen_sol_predictor(
     v_summary = torch.empty(summary_shape, dtype=v.dtype, device=v.device)
     block_pool(q, q_centroid, block_size=block_size, reduce="mean")
     block_pool(k, k_summary, block_size=block_size, reduce="mean")
-    block_pool(v, v_summary, block_size=block_size, reduce="sum")
+    block_pool(v, v_summary, block_size=block_size, reduce="mean")
     threshold = block_thresholds(
         q_centroid, k_summary, tau=tau, sm_scale=sm_scale, thresh_type=thresh_type
     )
