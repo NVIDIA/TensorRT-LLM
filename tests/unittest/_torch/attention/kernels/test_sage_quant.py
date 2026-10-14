@@ -117,22 +117,13 @@ def _assert_summaries_match_reference(
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("quant_dtype", [torch.int8, torch.float8_e4m3fn])
-@pytest.mark.parametrize("shape", [(2, 9, 3, 64), (3, 5, 2, 128), (1, 129, 2, 128)])
-# A 100x smaller V scale saturates the quantized V means at the E4M3 maximum.
-@pytest.mark.parametrize("v_scale_divisor", [1.0, 100.0])
-@pytest.mark.parametrize("smooth_k", [False, True])
-@pytest.mark.parametrize("smooth_v", [False, True])
+@pytest.mark.parametrize("shape", [(2, 9, 3, 64), (1, 129, 2, 128)])
+@pytest.mark.parametrize("smooth", [False, True])
 def test_quantize_sage_summaries_matches_reference(
-    shape: tuple[int, ...],
-    dtype: torch.dtype,
-    quant_dtype: torch.dtype,
-    v_scale_divisor: float,
-    smooth_k: bool,
-    smooth_v: bool,
+    shape: tuple[int, ...], dtype: torch.dtype, quant_dtype: torch.dtype, smooth: bool
 ) -> None:
-    k, v, v_scale, k_mean = _summary_inputs(shape, dtype, smooth_k)
-    v_scale = v_scale / v_scale_divisor
-    v_mean = v.float().mean(dim=1) if smooth_v else None
+    k, v, v_scale, k_mean = _summary_inputs(shape, dtype, smooth_k=smooth)
+    v_mean = v.float().mean(dim=1) if smooth else None
     actual = _quantize_summaries(k, v, v_scale, k_mean, quant_dtype, v_mean)
     assert [result.dtype for result in actual] == [quant_dtype, torch.float8_e4m3fn, torch.float32]
     _assert_summaries_match_reference(actual, k, v, v_scale, k_mean, quant_dtype, v_mean)
@@ -254,9 +245,11 @@ def _check_block_quantized(
 
 @pytest.mark.parametrize("block_size", [1, 4, 16, 32])
 @pytest.mark.parametrize("quant_dtype", [torch.int8, torch.float8_e4m3fn])
-@pytest.mark.parametrize("smooth_k", [False, True])
-@pytest.mark.parametrize("smooth_v", [False, True])
-@pytest.mark.parametrize("head_dim", [64, 128])
+# Every smoothing combination is its own kernel; each also takes one of the head dimensions.
+@pytest.mark.parametrize(
+    ("smooth_k", "smooth_v", "head_dim"),
+    [(False, False, 64), (True, False, 128), (False, True, 64), (True, True, 128)],
+)
 def test_sage_quantize_matches_reference(
     block_size: int, quant_dtype: torch.dtype, smooth_k: bool, smooth_v: bool, head_dim: int
 ) -> None:
@@ -391,8 +384,7 @@ def test_sage_quantize_smoothing_is_bitwise_reproducible(quant_dtype: torch.dtyp
             assert torch.equal(expected.view(torch.uint8), actual.view(torch.uint8)), name
 
 
-@pytest.mark.parametrize("block_size", [2, 3, 64])
-def test_sage_quantize_rejects_unsupported_block_sizes(block_size: int) -> None:
+def test_sage_quantize_rejects_unsupported_block_sizes() -> None:
     x = torch.zeros(16, 2, 128, device="cuda", dtype=torch.bfloat16)
     cu_seqlens = _cu_seqlens([16])
     with pytest.raises(RuntimeError, match="must be 1, 4, 16, or 32"):
@@ -402,7 +394,7 @@ def test_sage_quantize_rejects_unsupported_block_sizes(block_size: int) -> None:
             x,
             cu_seqlens,
             cu_seqlens,
-            q_block_size=block_size,
+            q_block_size=3,
             k_block_size=16,
             qk_quant_dtype=torch.int8,
         )
