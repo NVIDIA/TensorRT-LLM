@@ -750,6 +750,31 @@ class TestGemma4Assistant(unittest.TestCase):
 
         torch.testing.assert_close(actual, expected)
 
+    def test_assistant_preserves_target_kv_cache_layer_specs(self) -> None:
+        target_config = _make_heterogeneous_model_config(
+            num_q_heads=[8] * GEMMA4_SMALL_CONFIG["num_hidden_layers"]
+        )
+        target = Gemma4ForCausalLM(target_config)
+        target_specs = target_config.kv_cache_layer_specs
+        self.assertIsNotNone(target_specs)
+        registry = {}
+        target_config.extra_attrs["shared_registry"] = registry
+
+        assistant_config = _make_assistant_model_config()
+        assistant_config.extra_attrs = target_config.extra_attrs
+        assistant_specs = _get_gemma4_kv_cache_layer_specs(
+            assistant_config.pretrained_config.text_config
+        )
+        self.assertNotEqual(len(target_specs), len(assistant_specs))
+        self.assertNotEqual(target_specs[0].num_q_heads, assistant_specs[0].num_q_heads)
+
+        assistant = Gemma4AssistantForCausalLM(assistant_config)
+
+        self.assertIs(assistant.model.model_config.extra_attrs, target_config.extra_attrs)
+        self.assertIs(target.model_config.kv_cache_layer_specs, target_specs)
+        self.assertIs(assistant.model.model_config.kv_cache_layer_specs, target_specs)
+        self.assertIs(assistant.model.model_config.extra_attrs["shared_registry"], registry)
+
     def test_assistant_uses_target_kv_sources(self):
         model_config = _make_assistant_model_config()
         model_config.extra_attrs["_speculative_position_headroom"] = 2 * 4
