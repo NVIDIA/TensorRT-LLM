@@ -22,6 +22,7 @@ from typing import Dict, List, Optional, Protocol, Tuple, TypedDict, Union
 import torch
 from torch import nn
 
+from tensorrt_llm._ipc_utils import can_access_peer
 from tensorrt_llm._torch.distributed.allreduce_helper import \
     CustomAllReduceHelper
 from tensorrt_llm._torch.distributed.mnnvl_memory import (HelixCpMnnvlMemory,
@@ -1137,6 +1138,24 @@ class AllReduce(nn.Module):
                     )
                     self.mnnvl_allreduce = None
 
+        self._pre_moe_fp4_linear_limits = None
+        if (os.environ.get("TRTLLM_PRE_MOE_FP4_LINEAR_FUSION", "0") == "1"
+                and self.strategy in (AllReduceStrategy.AUTO,
+                                      AllReduceStrategy.MIN_LATENCY)
+                and self.mapping.tp_size in (2, 4, 8, 16)
+                and not self.mapping.is_multi_node()
+                and not self.mapping.enable_attention_dp
+                and self.workspace is not None
+                and os.environ.get("FORCE_DETERMINISTIC", "0") != "1"
+                and os.environ.get("FORCE_ALL_REDUCE_DETERMINISTIC", "0") != "1"
+                and can_access_peer(self.mapping)):
+            properties = torch.cuda.get_device_properties(self.workspace.device)
+            if properties.major >= 10:
+                self._pre_moe_fp4_linear_limits = (
+                    properties.major, properties.multi_processor_count,
+                    CustomAllReduceHelper.max_workspace_size_auto(
+                        self.mapping.tp_size, support_deterministic=False))
+
     def uses_nccl_symmetric_memory_window(self) -> bool:
         """Return True if this allreduce can use an NCCL window output buffer.
 
@@ -1160,6 +1179,51 @@ class AllReduce(nn.Module):
         return (int(BufferKind.NCCL_WINDOW)
                 if self.uses_nccl_symmetric_memory_window() else int(
                     BufferKind.DEFAULT))
+
+    def pre_moe_fp4_linear(self, input: torch.Tensor, residual: torch.Tensor,
+                          norm_weight: torch.Tensor, scale: torch.Tensor,
+                          eps: float) -> Optional[Tuple[torch.Tensor, ...]]:
+        """Return norm/residual, packed FP4 and LINEAR scales, or native fallback.
+
+        Input/residual are contiguous CUDA FP16/BF16 [tokens, hidden]; the
+        norm weight has [hidden] elements and scale is one CUDA FP32 value.
+        """
+        if self._pre_moe_fp4_linear_limits is None or input.ndim != 2:
+            return None
+        major, sm_count, workspace_bytes = self._pre_moe_fp4_linear_limits
+        tokens, hidden = input.shape
+        ranks = self.mapping.tp_size
+        if (tokens <= 0 or hidden <= 0 or hidden % 16 != 0
+                or input.numel() > (2**31 - 1) // ranks
+                or input.numel() * 2 > workspace_bytes
+                or input.dtype not in (torch.float16, torch.bfloat16)
+                or not input.is_cuda or not input.is_contiguous()
+                or input.device != self.workspace.device
+                or residual.shape != input.shape or residual.dtype != input.dtype
+                or residual.device != input.device or not residual.is_contiguous()
+                or norm_weight.shape != (hidden,) or norm_weight.dtype != input.dtype
+                or norm_weight.device != input.device or not norm_weight.is_contiguous()
+                or scale.numel() != 1 or scale.dtype != torch.float32
+                or scale.device != input.device or not scale.is_contiguous()):
+            return None
+        # Match the native MIN_LATENCY partition, including two-shot for large M.
+        clusters = tokens if tokens <= 128 or hidden < ranks else (tokens + ranks - 1) // ranks
+        cluster_size = 8 if major < 12 else 1
+        threads_per_token = hidden // 8
+        while threads_per_token % cluster_size and cluster_size > 1:
+            cluster_size //= 2
+        threads = threads_per_token // cluster_size
+        while threads < 128 and cluster_size >= 2:
+            threads *= 2
+            cluster_size //= 2
+        while clusters * cluster_size > sm_count and cluster_size > 1 and threads <= 512:
+            threads *= 2
+            cluster_size //= 2
+        if threads < 32 or threads > 1024 or threads % 32:
+            return None
+        return tuple(torch.ops.trtllm.pre_moe_allreduce_rmsnorm_fp4_linear(
+            input, residual, norm_weight, scale, self.workspace,
+            self.mapping.tp_rank, eps))
 
     def forward(
         self,

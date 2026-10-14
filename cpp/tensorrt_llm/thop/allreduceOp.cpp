@@ -56,10 +56,12 @@
 #include <nvml.h>
 #include <torch/extension.h>
 
+#include <c10/cuda/CUDAGuard.h>
 #include <c10/util/SmallVector.h>
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -2250,6 +2252,99 @@ torch::Tensor minimax_allreduce_rms(torch::Tensor const& input, torch::Tensor co
     return rms_norm_out;
 }
 
+// Routed MoE consumes LINEAR FP4 scales; its router/shared experts need norm_out.
+std::vector<torch::Tensor> preMoeAllreduceRmsnormFp4Linear(torch::Tensor const& input,
+    torch::Tensor const& residual, torch::Tensor const& normWeight, torch::Tensor const& scale,
+    torch::Tensor workspace, int64_t rank, double eps)
+{
+    TORCH_CHECK(input.is_cuda() && input.is_contiguous() && input.dim() == 2
+            && (input.scalar_type() == torch::kBFloat16 || input.scalar_type() == torch::kFloat16),
+        "PRE_MOE LINEAR fusion requires contiguous CUDA BF16/FP16 [tokens, hidden]");
+    auto const device = input.device();
+    c10::cuda::CUDAGuard const deviceGuard(device);
+    TORCH_CHECK(workspace.device() == device && workspace.scalar_type() == torch::kInt64
+            && workspace.dim() == 1 && workspace.is_contiguous() && workspace.numel() >= 8
+            && (workspace.numel() - 2) % 3 == 0,
+        "PRE_MOE requires a native fusion workspace (3 * TP + 2 pointers)");
+    auto const nranks = (workspace.numel() - 2) / 3;
+    TORCH_CHECK((nranks == 2 || nranks == 4 || nranks == 8 || nranks == 16) && rank >= 0 && rank < nranks,
+        "Unsupported PRE_MOE rank group");
+    auto const tokens = input.size(0);
+    auto const hidden = input.size(1);
+    TORCH_CHECK(tokens > 0 && hidden > 0 && hidden % 16 == 0
+            && input.numel() <= std::numeric_limits<int>::max() / nranks,
+        "PRE_MOE shape exceeds native vector/index limits");
+    TORCH_CHECK(input.nbytes() <= tensorrt_llm::utils::customAllReduceUtils::getMaxRequiredWorkspaceSize(nranks),
+        "PRE_MOE input exceeds the configured fusion workspace capacity");
+    TORCH_CHECK(residual.device() == device && residual.scalar_type() == input.scalar_type()
+            && residual.sizes() == input.sizes() && residual.is_contiguous(),
+        "PRE_MOE residual must match the input");
+    TORCH_CHECK(normWeight.device() == device && normWeight.scalar_type() == input.scalar_type()
+            && normWeight.dim() == 1 && normWeight.numel() == hidden && normWeight.is_contiguous(),
+        "PRE_MOE norm weight must match the hidden dimension and input dtype/device");
+    TORCH_CHECK(scale.device() == device && scale.scalar_type() == torch::kFloat32 && scale.numel() == 1
+            && scale.is_contiguous(), "PRE_MOE scale must be one contiguous CUDA FP32 value");
+    TORCH_CHECK(reinterpret_cast<uintptr_t>(input.data_ptr()) % 16 == 0
+            && reinterpret_cast<uintptr_t>(residual.data_ptr()) % 16 == 0
+            && reinterpret_cast<uintptr_t>(normWeight.data_ptr()) % 16 == 0,
+        "PRE_MOE vector inputs must be 16-byte aligned");
+    TORCH_CHECK(std::isfinite(eps) && eps >= 0. && eps <= std::numeric_limits<float>::max(),
+        "Invalid PRE_MOE RMSNorm epsilon");
+    cudaDeviceProp properties;
+    TLLM_CUDA_CHECK(cudaGetDeviceProperties(&properties, input.get_device()));
+    TORCH_CHECK(properties.major >= 10, "PRE_MOE FP4 conversion requires SM100 or newer");
+    // Mirror the native partition and one-shot/two-shot policy. Reduction and
+    // scale shuffles require complete warps.
+    bool const oneshot = tokens <= tensorrt_llm::kernels::ar_fusion::kOneShotMaxToken || hidden < nranks;
+    auto const clusters = oneshot ? tokens : (tokens + nranks - 1) / nranks;
+    int clusterSize = properties.major < 12 ? 8 : 1;
+    int const threadsPerToken = hidden / 8;
+    while (threadsPerToken % clusterSize != 0 && clusterSize > 1)
+    {
+        clusterSize /= 2;
+    }
+    int threads = threadsPerToken / clusterSize;
+    while (threads < 128 && clusterSize >= 2)
+    {
+        threads *= 2;
+        clusterSize /= 2;
+    }
+    while (clusters * clusterSize > properties.multiProcessorCount && clusterSize > 1 && threads <= 512)
+    {
+        threads *= 2;
+        clusterSize /= 2;
+    }
+    TORCH_CHECK(threads >= 32 && threads <= 1024 && threads % 32 == 0,
+        "PRE_MOE native launch must contain complete warps within the CUDA block limit");
+    auto normOut = torch::empty_like(input);
+    auto residualOut = torch::empty_like(residual);
+    auto quantOut = torch::empty({tokens, hidden / 2}, input.options().dtype(torch::kUInt8));
+    auto scaleOut = torch::empty({tokens, hidden / 16}, input.options().dtype(torch::kUInt8));
+    tensorrt_llm::kernels::ar_fusion::AllReduceFusionParams params{};
+    params.nranks = static_cast<int>(nranks);
+    params.rank = static_cast<int>(rank);
+    params.dtype = input.scalar_type() == torch::kBFloat16 ? tensorrt_llm::DataType::kBF16 : tensorrt_llm::DataType::kHALF;
+    params.size = static_cast<int>(input.numel());
+    params.hidden_dim = static_cast<int>(hidden);
+    params.workspace = reinterpret_cast<void**>(workspace.mutable_data_ptr());
+    params.allreduce_in = input.data_ptr();
+    params.residual_in = residual.data_ptr();
+    params.rms_gamma = normWeight.data_ptr();
+    params.scale_factor = scale.data_ptr<float>();
+    params.norm_out = normOut.mutable_data_ptr();
+    params.residual_out = residualOut.mutable_data_ptr();
+    params.quant_out = quantOut.mutable_data_ptr();
+    params.scale_out = scaleOut.mutable_data_ptr();
+    params.rms_eps = static_cast<float>(eps);
+    params.use_oneshot = oneshot;
+    params.layout = tensorrt_llm::QuantizationSFLayout::LINEAR;
+    params.pattern = tensorrt_llm::kernels::ar_fusion::AllReduceFusionPattern::kARResidualRMSNormOutFP4Quant;
+    params.trigger_completion_at_end = false;
+    params.stream = at::cuda::getCurrentCUDAStream(input.get_device());
+    tensorrt_llm::kernels::ar_fusion::allreduce_fusion_op(params);
+    return {normOut, residualOut, quantOut, scaleOut};
+}
+
 std::vector<torch::Tensor> minimax_allreduce_rms_qk(torch::Tensor const& q, torch::Tensor const& k,
     torch::Tensor const& norm_weight_q, torch::Tensor const& norm_weight_k, torch::Tensor workspace, int64_t const rank,
     int64_t const nranks, double const eps, bool const trigger_completion_at_end_)
@@ -2311,6 +2406,8 @@ TRTLLM_NAMESPACE_END
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
+    m.def("pre_moe_allreduce_rmsnorm_fp4_linear(Tensor input, Tensor residual, Tensor norm_weight, "
+          "Tensor scale, Tensor(a!) workspace, int rank, float eps) -> Tensor[]");
     m.def(
         "mnnvl_fusion_allreduce(Tensor input, Tensor? gamma, Tensor? residual, "
         "float? epsilon, Tensor(a!) comm_buffer, Tensor buffer_flags, bool rmsnorm_fusion, "
@@ -2413,6 +2510,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
+    m.impl("pre_moe_allreduce_rmsnorm_fp4_linear", &tensorrt_llm::torch_ext::preMoeAllreduceRmsnormFp4Linear);
     m.impl("mnnvl_fusion_allreduce", &tensorrt_llm::torch_ext::mnnvlFusionAllReduce);
     m.impl("allreduce", &tensorrt_llm::torch_ext::allreduce_raw);
     m.impl("autotuned_allreduce", &tensorrt_llm::torch_ext::autotunedAllreduce);
