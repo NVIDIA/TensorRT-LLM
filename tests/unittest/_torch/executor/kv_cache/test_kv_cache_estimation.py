@@ -1610,7 +1610,7 @@ def test_estimation_temporarily_uses_inferred_pool_sizing(
     assert creator._fp8_ctx_mla_kv_len_cap == expected_cap
     py_executor.warmup_scope.assert_called_once_with()
     py_executor.start_worker.assert_called_once()
-    py_executor.shutdown_for_kv_cache_estimation.assert_called_once()
+    py_executor.release_resources.assert_called_once()
     py_executor.shutdown.assert_not_called()
     assert kv_cache_config.max_tokens == user_max_tokens
     assert kv_cache_config.pool_ratio == pool_ratio
@@ -2059,3 +2059,35 @@ def test_create_kv_cache_manager_layer_specs_preserve_window_guards(guard: str) 
 
     assert manager_config is kv_cache_config
     assert manager_config.max_attention_window == ([1024] if guard == "explicit_window" else None)
+
+
+def test_profiling_failure_releases_resources_and_restores_response_state():
+    creator = object.__new__(KvCacheCreator)
+    creator._mapping = SimpleNamespace(cp_config={})
+    creator._kv_cache_config = SimpleNamespace(free_gpu_memory_fraction=0.9)
+    creator._skip_est = False
+    creator._dummy_reqs = []
+    creator._encode_dummy_inputs = Mock(return_value=None)
+    executor = Mock()
+    executor.dist.mapping.rank = 0
+    executor.dist.broadcast.side_effect = lambda value, root: value
+    executor.enable_iter_perf_stats = True
+    executor.await_responses.side_effect = RuntimeError("profiling request failed")
+    kv_manager = Mock()
+    kv_manager.get_kv_cache_stats.return_value = SimpleNamespace(allocated_bytes=0)
+    executor.resource_manager.resource_managers.get.side_effect = [kv_manager, None]
+
+    with (
+        patch.object(torch.cuda, "empty_cache"),
+        patch.object(torch.cuda, "reset_peak_memory_stats"),
+        patch.object(torch.cuda, "mem_get_info", return_value=(768, 1024)),
+        patch.object(torch.cuda, "memory_stats", return_value={"allocated_bytes.all.current": 128}),
+        pytest.raises(RuntimeError, match="profiling request failed"),
+    ):
+        creator.configure_kv_cache_capacity(executor)
+
+    executor.release_resources.assert_called_once_with()
+    executor.shutdown.assert_not_called()
+    assert executor.is_warmup is False
+    assert executor.enable_iter_perf_stats is True
+    assert executor.set_gather_responses.call_args.args == (False,)
