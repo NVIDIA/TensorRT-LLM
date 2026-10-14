@@ -43,6 +43,7 @@ class DecoderRunnerConfig(RunnerConfig):
     torch_compile_enabled: bool
     torch_compile_piecewise_cuda_graph: bool
     torch_compile_prefill_only: bool
+    compile_only_piecewise_graphs: bool
     use_mrope: bool
     is_multimodal: bool
     mm_encoder_cache_enabled: bool

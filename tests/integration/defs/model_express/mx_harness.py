@@ -82,6 +82,10 @@ print(f"MODELEXPRESS_VERSION={metadata.version('modelexpress')}")
 """
 
 ROLES = ("baseline", "donor", "receiver")
+# Exit status `mx_e2e_worker.py` uses when a receiver's own transfer
+# self-check fails before any accuracy evaluation runs. The worker defines the
+# same constant; `test_mx_accuracy_cases_have_references` pins the two together.
+SELF_CHECK_FAILED_EXIT_CODE = 3
 MX_ROLES = ("donor", "receiver")
 # NIXL binds `MX_METADATA_PORT + device_id` in every rank. The donor and the
 # receiver share one network namespace in CI, so each side gets its own range.
@@ -433,6 +437,11 @@ def run_worker(
             returncode = process.wait(timeout=timeout_s)
     except subprocess.TimeoutExpired:
         pytest.fail(f"MX E2E worker timed out: {' '.join(command)}\n{log_tail(log_path)}")
+    if returncode == SELF_CHECK_FAILED_EXIT_CODE:
+        pytest.fail(
+            "MX receiver transfer self-check failed before eval (weights did not arrive "
+            f"through MX P2P): {' '.join(command)}\n{log_tail(log_path)}"
+        )
     if returncode != 0:
         pytest.fail(
             f"MX E2E worker exited with status {returncode}: "
@@ -599,10 +608,28 @@ def assert_transfer_evidence(case: MxE2ECase, receiver_log_path: Path) -> None:
 # --------------------------------------------------------------------------- #
 
 
+def _validated_roles(roles: Sequence[str]) -> tuple[str, ...]:
+    """Return `roles` in `ROLES` order; both MX roles are always required."""
+    unknown = sorted(set(roles) - set(ROLES))
+    missing_mx = sorted(set(MX_ROLES) - set(roles))
+    if unknown or missing_mx or len(set(roles)) != len(roles):
+        raise ValueError(
+            f"Manifest roles must be distinct, drawn from {ROLES}, and include {MX_ROLES}; "
+            f"got {tuple(roles)}"
+        )
+    return tuple(role for role in ROLES if role in roles)
+
+
 def collect_weight_manifests(
-    manifest_dir: Path, case: MxE2ECase
+    manifest_dir: Path, case: MxE2ECase, roles: Sequence[str] = ROLES
 ) -> dict[ManifestKey, WeightManifest]:
-    """Load every manifest of a run and require the exact expected (family, role, rank) set."""
+    """Load every manifest of a run and require the exact expected (family, role, rank) set.
+
+    `roles` names the worker roles the run launched. Tests without an HF
+    baseline, such as the accuracy canaries, pass `MX_ROLES`; a manifest from
+    any other role then fails as unexpected.
+    """
+    roles = _validated_roles(roles)
     if not manifest_dir.is_dir():
         pytest.fail(f"No weight manifests were written: {manifest_dir} does not exist")
     manifests: dict[ManifestKey, WeightManifest] = {}
@@ -623,7 +650,7 @@ def collect_weight_manifests(
             )
         manifests[key] = manifest
 
-    expected_keys = {("final", role, rank) for role in ROLES for rank in range(case.tp_size)}
+    expected_keys = {("final", role, rank) for role in roles for rank in range(case.tp_size)}
     expected_keys |= {("transfer", role, rank) for role in MX_ROLES for rank in range(case.tp_size)}
     missing = sorted(expected_keys - manifests.keys())
     unexpected = sorted(manifests.keys() - expected_keys)
@@ -683,21 +710,32 @@ def _assert_manifests_equal(
 
 
 def assert_weight_manifests(
-    case: MxE2ECase, manifests: Mapping[ManifestKey, WeightManifest]
+    case: MxE2ECase,
+    manifests: Mapping[ManifestKey, WeightManifest],
+    roles: Sequence[str] = ROLES,
 ) -> None:
     """Enforce the transfer and final manifest tiers of one run.
 
     Transfer tier: donor-at-publish and receiver-at-receive parameters are
-    byte-identical, never exempted. Final tier: baseline, donor, and receiver
-    are pairwise byte-identical after finalization, honoring only the row's
-    `final_manifest_exempt_patterns`.
+    byte-identical, never exempted. Final tier: every launched role is
+    pairwise byte-identical after finalization, honoring only the row's
+    `final_manifest_exempt_patterns`. The per-role context checks (load path,
+    preloaded flag, transfer boundary) apply to every launched role; `roles`
+    must match the value given to `collect_weight_manifests`.
     """
+    roles = _validated_roles(roles)
 
     def context(family: str, role: str, rank: int) -> Mapping[str, object]:
         return manifests[(family, role, rank)].context
 
+    final_pairs = tuple(
+        (expected, actual)
+        for expected, actual in FINAL_TIER_PAIRS
+        if expected in roles and actual in roles
+    )
     for rank in range(case.tp_size):
-        assert context("final", "baseline", rank).get("checkpoint_format") == "HF"
+        if "baseline" in roles:
+            assert context("final", "baseline", rank).get("checkpoint_format") == "HF"
         for role in MX_ROLES:
             assert context("final", role, rank).get("checkpoint_format") == "MX"
         assert context("final", "donor", rank).get("weights_preloaded") is False, (
@@ -716,7 +754,7 @@ def assert_weight_manifests(
             f"receiver@receive rank{rank}",
             kinds=TRANSFER_TIER_KINDS,
         )
-        for expected_role, actual_role in FINAL_TIER_PAIRS:
+        for expected_role, actual_role in final_pairs:
             _assert_manifests_equal(
                 manifests[("final", expected_role, rank)],
                 manifests[("final", actual_role, rank)],
@@ -804,6 +842,7 @@ __all__ = [
     "MX_PREFLIGHT_SCRIPT",
     "MX_ROLES",
     "ROLES",
+    "SELF_CHECK_FAILED_EXIT_CODE",
     "TRANSFER_TIER_KINDS",
     "WEIGHT_SUFFIXES",
     "WORKER_PATH",
