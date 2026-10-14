@@ -845,3 +845,27 @@ def test_the_roadmap_request_names_its_sources(tmp_path):
     req = (spec.workdir / "roadmap-request.md").read_text()
     assert "surface.md" in req and "kernel_choices.json" in req and "--grep='perf'" in req and "/engines/sglang" in req
     assert "sources}" in req and "repo-prior-art" in req
+
+
+def test_without_a_ladder_the_ground_baseline_is_the_first_control(tmp_path):
+    """A follow-up campaign on an already tuned config skips the ladder; the ground baseline measured
+    the best tree at the same configs, so the campaign adopts it instead of queueing a control run."""
+    repo = _repo(tmp_path)
+    identity = tmp_path / "identity.yaml"
+    identity.write_text(yaml.safe_dump({"modeling_v2": "require"}))
+    task = {"trtllm_repo_path": str(repo), "checkpoint_path": "/ckpt",
+            "perf": {"identity_configs": [str(identity)], "workload": {"isl": 8192, "osl": 1024, "concurrency": [1, 128]},
+                     "spools": ["s1"], "env_script": "/env.sh", "reference": "none", "ladder": {"enabled": False},
+                     "campaign": {"accuracy": {"task": "gsm8k", "anchor": 96.36}}}}
+    spec = TuneSpec.from_task(task, tmp_path / "ws", target="t/")
+
+    def dispatch(role, what, prompt):
+        (spec.workdir / f"{what}.yaml").write_text("[]")
+        return ""
+
+    state: dict = {}
+    stage = TuneStage(spec, state, dispatch=dispatch, checkpoint=lambda: None,
+                      runner_factory=lambda spools, prefix: FakeRunner(spools, prefix, _effect), poll_s=0, log=lambda m: None)
+    assert stage.run() == "tuned"
+    camp = json.loads((spec.workdir / "campaign_state.json").read_text())
+    assert camp["control_label"] == "t-baseline" and "t-baseline" in camp["controls"].values()

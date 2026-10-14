@@ -359,6 +359,12 @@ class TuneStage:
             for label in labels:
                 if (lad / "data" / label / "meta.json").exists():
                     camp.set_control(lad / "data" / label)
+            if not labels and not camp.state.config_overlays:
+                # No ladder overlay: the ground baseline (and its repeats) measured this tree at
+                # these configs, so they are the first controls.
+                for label in ["t-baseline", *[f"t-baseline-r{i}" for i in range(1, s.noise_repeats + 1)]]:
+                    if (self.data / label / "meta.json").exists():
+                        camp.set_control(self.data / label)
         n_road = int(self.t.get("roadmaps", 1))
         roadmap = [r for r in self._roadmap(n_road, tried=list(camp.state.candidates) if n_road > 1 else ())
                    if r.get("slug") not in camp.state.candidates]
