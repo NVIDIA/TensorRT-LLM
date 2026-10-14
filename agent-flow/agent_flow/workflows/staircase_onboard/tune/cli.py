@@ -91,7 +91,8 @@ def build_campaign(perf: dict, log=print) -> Campaign:
     workdir = Path(c.get("workdir") or Path(perf["workdir"]).parent / "campaign")
     workdir.mkdir(parents=True, exist_ok=True)
     repo = Path(perf["tree"])
-    best = open_candidate(repo, Path(c.get("worktrees", workdir / "worktrees")), "best", c.get("base", "HEAD"))
+    prefix = str(c.get("branch_prefix", "tune"))  # a second campaign in one repository needs its own
+    best = open_candidate(repo, Path(c.get("worktrees", workdir / "worktrees")), "best", c.get("base", "HEAD"), prefix=prefix)
     noise_spread = c.get("noise_spread") or {}
     camp = Campaign(
         workdir=workdir,
@@ -105,6 +106,7 @@ def build_campaign(perf: dict, log=print) -> Campaign:
         noise=NoiseFloor(spread=noise_spread, samples=int(c.get("noise_samples", 0))),
         min_gain=float(c.get("min_gain", 0.01)),
         noise_factor=float(c.get("noise_factor", 3.0)),
+        branch_prefix=prefix,
         log=log,
     )
     if not camp.state.best_tree:
