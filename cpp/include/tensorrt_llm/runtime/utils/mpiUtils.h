@@ -30,6 +30,7 @@
 #endif
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
@@ -534,6 +535,56 @@ private:
     std::condition_variable mCondVar;
     bool mRunning{true};
     std::atomic<bool> mShouldExit{false};
+};
+
+//! \brief A native thread that keeps the MPI progress engine running.
+//!
+//! Some sends complete only when the sending process enters MPI again, for example a
+//! rendezvous-protocol send that the receiver has matched. If no thread of the sender enters
+//! MPI -- e.g. the only thread that does is blocked in a native call while holding the Python
+//! GIL -- such a send never completes and its receiver waits forever.
+//!
+//! Every `interval` this thread issues one MPI_Iprobe on `probeTag`, a tag that must never be
+//! sent, so the probe always misses and only drives the progress engine. The thread never runs
+//! Python code and never takes the GIL. It must stay a plain MPI_Iprobe: MPI_Improbe and
+//! MPI_Mprobe remove the matched message and would race the application's own
+//! probe-then-receive sequences on the same communicator.
+//!
+//! Requires MPI_THREAD_MULTIPLE (the constructor throws otherwise). Stop the thread before MPI
+//! is finalized.
+class MpiProgressThread
+{
+public:
+    MpiProgressThread(MPI_Comm comm, std::chrono::microseconds interval, int probeTag);
+    ~MpiProgressThread();
+
+    MpiProgressThread(MpiProgressThread const&) = delete;
+    MpiProgressThread& operator=(MpiProgressThread const&) = delete;
+    MpiProgressThread(MpiProgressThread&&) = delete;
+    MpiProgressThread& operator=(MpiProgressThread&&) = delete;
+
+    //! Converts a Fortran communicator handle (mpi4py: `comm.py2f()`) into an MPI_Comm.
+    [[nodiscard]] static MPI_Comm commFromFortranHandle(int64_t fortranHandle);
+
+    //! Stops and joins the thread. Idempotent.
+    void stop();
+
+    [[nodiscard]] bool isRunning() const;
+
+    [[nodiscard]] std::uint64_t getNumProbes() const;
+
+private:
+    void run();
+
+    MPI_Comm mComm;
+    std::chrono::microseconds mInterval;
+    int mProbeTag;
+    std::atomic<std::uint64_t> mNumProbes{0};
+    std::atomic<bool> mRunning{false};
+    std::mutex mMutex;
+    std::condition_variable mCondVar;
+    bool mShouldStop{false};
+    std::thread mThread;
 };
 
 } // namespace tensorrt_llm::mpi
