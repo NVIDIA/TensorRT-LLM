@@ -139,7 +139,6 @@ class CUDAGraphRunnerConfig:
     spec_config: Optional[DecodingBaseConfig]
     cuda_graph_mem_pool: Any
     use_mrope: bool
-    original_max_draft_len: int
     original_max_total_draft_tokens: int
     enable_attention_dp: bool
     is_encoder_decoder: bool
@@ -690,9 +689,6 @@ class CUDAGraphRunner:
                 enable_spec_decode: bool = False,
                 postprocess_fn: Optional[Callable] = None) -> Any:
         """Warm up and/or capture the forward pass for a graph key."""
-        # Preserve compatibility with direct callers that still pass the
-        # original three-field generation-only tuple.
-        key = KeyType(*key)
         batch_size = key.batch_size
         # [CUDA graph spec decode padding]
         # We pad input IDs/position IDs to the maximum draft length (token per request).
@@ -798,7 +794,6 @@ class CUDAGraphRunner:
         ``position_id_offsets`` is a one-dimensional device tensor containing the
         position corrections applied inside the captured speculative preprocessing.
         """
-        key = KeyType(*key)
         stored_meta = self.graph_metadata[key]
         assert current_inputs["attn_metadata"] is stored_meta["attn_metadata"]
         if stored_meta["spec_metadata"] is not None:

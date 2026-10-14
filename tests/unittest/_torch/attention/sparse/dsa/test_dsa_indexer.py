@@ -383,7 +383,6 @@ def test_gvr_prior_writeback_uses_aux_stream():
             request_ids,
             kv_lens.tolist(),
             is_gen=False,
-            prepare_resource=True,
         )
         metadata = _create_mock_metadata(
             request_ids,
@@ -2076,9 +2075,7 @@ def test_recompute_slot_mappings_matches_prepare_with_cached_tokens():
         max_seq_len=256,
         num_layers=1,
     )
-    cache_manager.add_dummy_requests(
-        request_ids, kv_lens.tolist(), is_gen=False, prepare_resource=True
-    )
+    cache_manager.add_dummy_requests(request_ids, kv_lens.tolist(), is_gen=False)
     metadata = _create_mock_metadata(
         request_ids,
         len(request_ids),
@@ -2141,9 +2138,7 @@ def test_indexer_k_cache_scatter_custom_op():
     # Allocate blocks
     request_ids = list(range(batch_size))
     tokens_per_req = [32, 32, 32]
-    cache_manager.add_dummy_requests(
-        request_ids, tokens_per_req, is_gen=False, prepare_resource=True
-    )
+    cache_manager.add_dummy_requests(request_ids, tokens_per_req, is_gen=False)
 
     # Create metadata
     metadata = _create_mock_metadata(
@@ -2304,9 +2299,7 @@ def test_fp8_k_cache_roundtrip():
 
     # Allocate blocks for both requests
     request_ids = [0, 1]
-    cache_manager.add_dummy_requests(
-        request_ids, num_tokens_per_req, is_gen=False, prepare_resource=True
-    )
+    cache_manager.add_dummy_requests(request_ids, num_tokens_per_req, is_gen=False)
 
     # Prepare and write data for each request
     total_tokens = sum(num_tokens_per_req)
@@ -2454,7 +2447,6 @@ def test_indexer_decode_with_paged_kv_cache(batch_size, next_n, backend, compres
         request_ids=request_ids,
         token_nums=final_kv_lens.tolist(),
         is_gen=False,
-        prepare_resource=True,
     )
 
     # Generate test data with variable lengths
@@ -2745,7 +2737,7 @@ def test_indexer_decode_with_paged_kv_cache_fp4(batch_size, next_n, backend):
 
     request_ids = list(range(batch_size))
     cache_manager.add_dummy_requests(
-        request_ids=request_ids, token_nums=final_lens.tolist(), is_gen=False, prepare_resource=True
+        request_ids=request_ids, token_nums=final_lens.tolist(), is_gen=False
     )
 
     total_context_tokens = context_lens_context.sum().item()
@@ -3533,7 +3525,7 @@ def test_indexer_chunked_prefill(chunk_size, seq_lens_list, chunking_type, compr
     # Allocate blocks for all sequences
     request_ids = list(range(batch_size))
     cache_manager.add_dummy_requests(
-        request_ids=request_ids, token_nums=seq_lens_list, is_gen=False, prepare_resource=True
+        request_ids=request_ids, token_nums=seq_lens_list, is_gen=False
     )
 
     # Generate test data
@@ -3794,7 +3786,7 @@ def test_indexer_decode_custom_vs_fallback(batch_size, next_n, index_topk, seq_l
     request_ids = list(range(batch_size))
     final_lens = kv_lens + next_n  # Historical + new decode tokens
     cache_manager.add_dummy_requests(
-        request_ids=request_ids, token_nums=final_lens.tolist(), is_gen=False, prepare_resource=True
+        request_ids=request_ids, token_nums=final_lens.tolist(), is_gen=False
     )
 
     # Populate KV cache with historical context
@@ -3989,7 +3981,6 @@ def test_indexer_decode_mtp_topk_reuse(step0_mode, batch_size):
         request_ids=request_ids,
         token_nums=reserve,
         is_gen=False,
-        prepare_resource=True,
     )
 
     def make_inputs(n_tokens):
@@ -4154,7 +4145,7 @@ def test_indexer_prefill_chunked_custom_vs_fallback(batch_size, index_topk, chun
     # Allocate cache blocks
     request_ids = list(range(batch_size))
     cache_manager.add_dummy_requests(
-        request_ids=request_ids, token_nums=seq_lens.tolist(), is_gen=False, prepare_resource=True
+        request_ids=request_ids, token_nums=seq_lens.tolist(), is_gen=False
     )
 
     # Generate test data
@@ -4263,7 +4254,7 @@ def test_indexer_prefill_single_pass_custom_vs_fallback(batch_size, index_topk, 
 
     request_ids = list(range(batch_size))
     cache_manager.add_dummy_requests(
-        request_ids=request_ids, token_nums=seq_lens.tolist(), is_gen=False, prepare_resource=True
+        request_ids=request_ids, token_nums=seq_lens.tolist(), is_gen=False
     )
 
     # Generate test data
@@ -4435,9 +4426,7 @@ def test_indexer_topk_multi_request_with_different_cache(enable_indexer_skip):
 
     # Allocate blocks
     request_ids = [0, 1]
-    cache_manager.add_dummy_requests(
-        request_ids, total_kv_lens, is_gen=False, prepare_resource=True
-    )
+    cache_manager.add_dummy_requests(request_ids, total_kv_lens, is_gen=False)
 
     # Generate test data
     q = torch.randn((total_tokens, heads, head_dim), device="cuda", dtype=torch.bfloat16)
@@ -4733,7 +4722,7 @@ def test_cutedsl_mqa_logits_output_buffer_persistent():
     request_ids = list(range(batch_size))
     kv_lens = torch.full((batch_size,), kv_len, dtype=torch.int32)
     cache_manager.add_dummy_requests(
-        request_ids=request_ids, token_nums=kv_lens.tolist(), is_gen=False, prepare_resource=True
+        request_ids=request_ids, token_nums=kv_lens.tolist(), is_gen=False
     )
 
     metadata = _create_mock_metadata(
@@ -4810,7 +4799,6 @@ def test_topk_indices_buffer_cuda_graph():
         request_ids=request_ids,
         token_nums=kv_lens.tolist(),
         is_gen=False,
-        prepare_resource=True,
     )
 
     metadata = _create_mock_metadata(
