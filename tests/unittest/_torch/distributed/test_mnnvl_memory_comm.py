@@ -32,8 +32,12 @@ from collections.abc import Iterator
 import pytest
 import torch
 
-from tensorrt_llm import _mnnvl_utils
-from tensorrt_llm._mnnvl_utils import HelixCpMnnvlMemory, MnnvlMemory, ProcessGroupComm
+from tensorrt_llm._torch.distributed import mnnvl_memory as _mnnvl_utils
+from tensorrt_llm._torch.distributed.mnnvl_memory import (
+    HelixCpMnnvlMemory,
+    MnnvlMemory,
+    ProcessGroupComm,
+)
 from tensorrt_llm._torch.models.modeling_utils import MetaInitException, MetaInitMode
 
 
