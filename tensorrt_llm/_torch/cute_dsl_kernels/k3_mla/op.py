@@ -438,6 +438,7 @@ def _launch_attn(
     import cuda.bindings.driver as cuda_driver
 
     from . import k3_mla_attn_kernel as kernel
+    from ._launch import _attn_no_cluster
 
     if not supports_attn(q, pool, row_stride, page_table, seq_len):
         raise ValueError(
@@ -476,11 +477,9 @@ def _launch_attn(
     # More 16-CTA clusters than co-reside would run a second wave: launch without a cluster instead when every CTA fits
     # on the SMs at once (one per SM; its waits are spins).
     clusters = num_requests * groups
-    no_cluster = (
-        clusters > kernel.CLUSTER_WAVE
-        and clusters * kernel.CLUSTER
-        <= torch.cuda.get_device_properties(q.device).multi_processor_count
-    )
+    with torch.cuda.device(q.device):
+        stream = cuda_driver.CUstream(torch.cuda.current_stream(q.device).cuda_stream)
+        no_cluster = _attn_no_cluster(stream, clusters, kernel.CLUSTER, kernel.CLUSTER_WAVE)
     if out is None:
         out = torch.empty(num_tokens, total_heads * width, dtype=torch.bfloat16, device=q.device)
     elif not (
@@ -496,7 +495,6 @@ def _launch_attn(
     gate_ld = gate.stride(0) if apply_gate else 0
     args = (_arg(q.view(-1)), _arg(_pool_base(pool, row_stride)), _arg(page_rows, 4), _arg(seq_len, 4),
             _arg(workspace), _arg(out.view(-1)), _arg((w_vb if fuse_vb else q).view(-1)), _arg(gate_flat))  # fmt: skip
-    stream = cuda_driver.CUstream(torch.cuda.current_stream(q.device).cuda_stream)
     use_pdl = _use_pdl()
     scale_log2 = float(softmax_scale) * kernel.LOG2E
     key = ("k3_mla_attn", row_stride, total_heads, fuse_vb, apply_gate, use_pdl, no_cluster)
