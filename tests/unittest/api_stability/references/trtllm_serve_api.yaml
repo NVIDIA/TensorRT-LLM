@@ -55,6 +55,12 @@
 models:
   CompletionRequest:
     fields:
+      kv_hints:
+        kind: extension
+        type: Optional[KvHintsEnvelope]
+        default: null
+        status: prototype
+        required: false
       model:
         kind: openai
         type: str
@@ -508,6 +514,12 @@ models:
 
   ChatCompletionRequest:
     fields:
+      kv_hints:
+        kind: extension
+        type: Optional[KvHintsEnvelope]
+        default: null
+        status: prototype
+        required: false
       messages:
         kind: openai
         type: List[ChatCompletionMessageParam]
@@ -1045,6 +1057,12 @@ models:
 
   ResponsesRequest:
     fields:
+      kv_hints:
+        kind: extension
+        type: Optional[KvHintsEnvelope]
+        default: null
+        status: prototype
+        required: false
       background:
         kind: openai
         type: Optional[bool]

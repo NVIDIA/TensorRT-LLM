@@ -528,6 +528,7 @@ class RequestBroadcaster:
                 "py_logprobs_simple_format",
                 "py_return_routed_experts",
                 "py_arrival_time",
+                "py_kv_hints",
             )
         ]
         py_objects.extend(

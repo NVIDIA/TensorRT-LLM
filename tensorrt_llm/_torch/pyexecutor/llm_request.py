@@ -17,6 +17,7 @@ from tensorrt_llm.executor.result import SimpleTokenLogprobs, TokenLogprobs
 from tensorrt_llm.inputs.multimodal import (MultimodalEncoderRequestState,
                                             MultimodalParams,
                                             get_multimodal_item_metadata)
+from tensorrt_llm.kv_hints.protocol import KvHintsSnapshot
 from tensorrt_llm.sampling_params import LogprobMode
 
 SamplingConfig = tllm_executor.SamplingConfig
@@ -865,6 +866,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_original_end_id = self.py_end_id
         self.py_bad_words = None
         self.py_no_repeat_ngram_size = None
+        self.py_kv_hints: Optional[KvHintsSnapshot] = None
 
         self.py_num_connector_matched_tokens = 0
 
@@ -1256,6 +1258,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         child.py_original_end_id = self.py_original_end_id
         child.py_disaggregated_params = deepcopy(self.py_disaggregated_params)
         child.py_conversation_params = deepcopy(self.py_conversation_params)
+        child.py_kv_hints = self.py_kv_hints
         child.py_uncached_prefill_tokens = self.py_uncached_prefill_tokens
         child.py_disable_speculative_decoding = self.py_disable_speculative_decoding
         child.is_attention_dp_dummy = self.is_attention_dp_dummy
@@ -1753,6 +1756,7 @@ def executor_request_to_llm_request(
     # Published by the attention-DP router before this conversion, if at all.
     llm_request.py_uncached_prefill_tokens = getattr(
         executor_request, "py_uncached_prefill_tokens", None)
+    llm_request.py_kv_hints = getattr(executor_request, "py_kv_hints", None)
     if child_req_ids:
         for child_id in child_req_ids:
             llm_request.create_child_request(child_id)
