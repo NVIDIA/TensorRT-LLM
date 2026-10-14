@@ -124,7 +124,9 @@ def compare_logprobs(logprobs_list, ref_new_token_logprobs_list):
 @pytest.mark.gpu4
 @pytest.mark.parametrize("model_dir", ["Qwen3/Qwen3-8B"])
 @pytest.mark.parametrize("allreduce_strategy", ["NCCL", "AUTO"])
-def test_accuracy_with_allreduce_strategy(model_dir, allreduce_strategy):
+def test_accuracy_with_allreduce_strategy(
+    model_dir: str, allreduce_strategy: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Test accuracy with different allreduce strategies.
 
     This test validates that both NCCL and AUTO allreduce strategies produce
@@ -147,6 +149,9 @@ def test_accuracy_with_allreduce_strategy(model_dir, allreduce_strategy):
     llm_logprobs = []
     llm_responses = []
 
+    # Fix attention dispatch for the cross-backend comparison while retaining
+    # the selected all-reduce strategy in each fresh Ray worker.
+    monkeypatch.setenv("FORCE_ATTENTION_KERNEL_DETERMINISTIC", "1")
     kv_cache_config = KvCacheConfig(enable_block_reuse=False, free_gpu_memory_fraction=0.6)
     if allreduce_strategy == "NCCL":
         kv_cache_config.use_kv_cache_manager_v2 = True
