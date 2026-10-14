@@ -46,11 +46,6 @@ skip_not_sm103 = pytest.mark.skipif(
     get_sm_version() != 103, reason="modeling_v2 targets in this batch are certified on sm_103 only"
 )
 
-# Speculative cases need the legacy Gated-DeltaNet verify path: the engine's
-# default (replay) commits through a callable the target's closed op vocabulary
-# has no entry for, and the target asserts the legacy path is selected.
-_GDN_LEGACY = {"TRTLLM_USE_GDN_REPLAY": "0"}
-
 # Check the target's step contract on the first forward, against metadata the
 # engine prepared; the flag has to reach the worker rank.
 _VALIDATE = {MODELING_V2_VALIDATE_ENV: "1"}
@@ -153,8 +148,7 @@ class TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1(LlmapiAccuracyTestHarness):
         A miscomputed draft layer only makes generation slower (every draft is
         rejected, the text stays correct), so acceptance length is the only
         detector. The floor in references/acceptance_length.yaml is a collapse
-        tripwire. The draft layer runs dense attention and the PLE pools have
-        no speculative-state rollback; no gate here sees either.
+        tripwire.
         """
         mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN", self.GSM8K_MAX_OUTPUT_LEN)
 
@@ -163,7 +157,7 @@ class TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1(LlmapiAccuracyTestHarness):
             speculative_config=self.MTP1,
             enable_iter_perf_stats=True,
             **self.ENGINE,
-            **_require_target(monkeypatch, **_GDN_LEGACY, **_VALIDATE),
+            **_require_target(monkeypatch, **_VALIDATE),
         ) as llm:
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm, extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
@@ -197,7 +191,7 @@ class TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1(LlmapiAccuracyTestHarness):
             self.MODEL_PATH,
             speculative_config=self.MTP1,
             **engine,
-            **_require_target(monkeypatch, **_GDN_LEGACY, **_VALIDATE),
+            **_require_target(monkeypatch, **_VALIDATE),
         ) as llm:
             task = MMMU(self.MODEL_NAME)
             task.evaluate(

@@ -144,12 +144,7 @@ ModelingV2Qwen38FlashNextNvfp4Sm103Tp1::mtp1:
   # the variant's whole range: a collapsed or miscomputed draft path scores 1.0,
   # and anything at or above 1.5 is accepting at least half its drafts.
   #
-  # This unit has a disclosed deviation the gate is deliberately sized around:
-  # the draft layer runs dense attention rather than QSA, because
-  # `QSAAttentionMetadata` has no `prepare_for_draft_forward`. That costs
-  # acceptance on long prompts and costs nothing on short ones, so a floor set
-  # tight against a short-prompt reading would fail on the benchmark for a
-  # reason already written down. Replace both numbers with a full-gsm8k STOCK
-  # reading (TRTLLM_POPULATE_ACCEPTANCE_LENGTH=1 on the stock leg) when one is
+  # Replace both numbers with a full-gsm8k STOCK reading
+  # (TRTLLM_POPULATE_ACCEPTANCE_LENGTH=1 on the stock leg) when one is
   # measured, and tighten min_al then.
   min_al: 1.5

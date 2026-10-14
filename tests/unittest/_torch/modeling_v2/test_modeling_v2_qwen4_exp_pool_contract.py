@@ -26,6 +26,7 @@ G = M._PoolGeometry(
     index_head_dim=128,
     conv_dim=8192,
     conv_kernel=4,
+    num_k_heads=16,
     num_v_heads=48,
     head_v_dim=128,
     head_k_dim=128,
@@ -35,6 +36,7 @@ G = M._PoolGeometry(
     dtype=torch.bfloat16,
 )
 SLOTS = 6
+HISTORY = 16
 
 
 def _t(*shape, dtype=torch.bfloat16):
@@ -47,6 +49,15 @@ def _conv(**kw):
 
 def _ssm(**kw):
     return _t(SLOTS, G.num_v_heads, G.head_v_dim, G.head_k_dim, dtype=torch.float32)
+
+
+def _history(slots=SLOTS, history=HISTORY):
+    """One GDN layer's cached-replay history buffers (old_x, old_B, old_dt)."""
+    return (
+        _t(slots, 2, history, G.num_v_heads, G.head_v_dim),
+        _t(slots, 2, history, G.num_k_heads, G.head_k_dim),
+        _t(slots, 2, G.num_v_heads, history, dtype=torch.float32),
+    )
 
 
 def test_valid_pools_pass() -> None:
@@ -62,13 +73,16 @@ def test_valid_pools_pass() -> None:
         _conv(),
     )
     M.check_step_buffers(
-        G,
-        _t(SLOTS, 2, G.conv_dim, G.conv_kernel - 1),
-        _t(SLOTS, 2, G.num_v_heads, G.head_v_dim, G.head_k_dim, dtype=torch.float32),
-        _conv(),
-        _ssm(),
-        _t(SLOTS, dtype=torch.int32),
+        G, _t(SLOTS, 2, G.conv_dim, G.conv_kernel - 1), _conv(), _t(SLOTS, dtype=torch.int32)
     )
+    M.check_legacy_state(
+        G, _t(SLOTS, 2, G.num_v_heads, G.head_v_dim, G.head_k_dim, dtype=torch.float32), _ssm()
+    )
+    M.check_replay_state(
+        HISTORY, 3, _t(SLOTS, dtype=torch.int32), _t(SLOTS, dtype=torch.int32), _ssm()
+    )
+    M.check_replay_history(G, 3, HISTORY, SLOTS, *_history())
+    M.check_shared_selection(_t(2, 8, 512, dtype=torch.int32), {3: 1}, 3, 512)
 
 
 @pytest.mark.parametrize(
@@ -123,19 +137,83 @@ def test_ple_pools_reject_slot_mismatch_and_int32_history() -> None:
         M.check_ple_pools(G, None, ngram, _conv())
 
 
-def test_step_buffers_reject_missing_dtype_drift_and_index() -> None:
+def test_step_buffers_reject_missing_conv_rank_dtype_and_index() -> None:
     int_conv = _t(SLOTS, 2, G.conv_dim, G.conv_kernel - 1)
-    int_ssm = _t(SLOTS, 2, G.num_v_heads, G.head_v_dim, G.head_k_dim, dtype=torch.float32)
     idx = _t(SLOTS, dtype=torch.int32)
-    with pytest.raises(AssertionError, match="no per-step"):
-        M.check_step_buffers(G, None, None, _conv(), _ssm(), idx)
+    with pytest.raises(AssertionError, match="no per-step conv"):
+        M.check_step_buffers(G, None, _conv(), idx)
     # Rank without the steps dim.
     with pytest.raises(AssertionError, match="per-step conv buffer"):
-        M.check_step_buffers(G, _conv(), int_ssm, _conv(), _ssm(), idx)
-    # The promotion kernel copies without converting, so the dtypes must match the pools.
+        M.check_step_buffers(G, _conv(), _conv(), idx)
+    # The promotion kernel copies without converting, so the dtype must match the pool.
+    with pytest.raises(AssertionError, match="per-step conv buffer"):
+        M.check_step_buffers(G, int_conv.to(torch.float32), _conv(), idx)
+    with pytest.raises(AssertionError, match="intermediate_state_indices"):
+        M.check_step_buffers(G, int_conv, _conv(), idx.to(torch.int64))
+    with pytest.raises(AssertionError, match="intermediate_state_indices"):
+        M.check_step_buffers(G, int_conv, _conv(), None)
+
+
+def test_legacy_state_rejects_missing_rank_and_dtype_drift() -> None:
+    int_ssm = _t(SLOTS, 2, G.num_v_heads, G.head_v_dim, G.head_k_dim, dtype=torch.float32)
+    with pytest.raises(AssertionError, match="no per-step recurrent"):
+        M.check_legacy_state(G, None, _ssm())
     with pytest.raises(AssertionError, match="per-step recurrent buffer"):
-        M.check_step_buffers(G, int_conv, int_ssm.to(torch.bfloat16), _conv(), _ssm(), idx)
-    with pytest.raises(AssertionError, match="intermediate_state_indices"):
-        M.check_step_buffers(G, int_conv, int_ssm, _conv(), _ssm(), idx.to(torch.int64))
-    with pytest.raises(AssertionError, match="intermediate_state_indices"):
-        M.check_step_buffers(G, int_conv, int_ssm, _conv(), _ssm(), None)
+        M.check_legacy_state(G, _ssm(), _ssm())
+    with pytest.raises(AssertionError, match="per-step recurrent buffer"):
+        M.check_legacy_state(G, int_ssm.to(torch.bfloat16), _ssm())
+
+
+def test_replay_state_rejects_pool_dtype_geometry_and_bookkeeping() -> None:
+    pnat = _t(SLOTS, dtype=torch.int32)
+    buf = _t(SLOTS, dtype=torch.int32)
+    with pytest.raises(AssertionError, match="fp32 checkpoint"):
+        M.check_replay_state(HISTORY, 3, pnat, buf, _ssm().to(torch.bfloat16))
+    with pytest.raises(AssertionError, match="replay_history_size"):
+        M.check_replay_state(12, 3, pnat, buf, _ssm())
+    for width in (1, 5):
+        with pytest.raises(AssertionError, match="replay_step_width"):
+            M.check_replay_state(HISTORY, width, pnat, buf, _ssm())
+    # The bookkeeping is one int32 per pool slot, so it must cover the whole pool.
+    with pytest.raises(AssertionError, match="prev_num_accepted_tokens"):
+        M.check_replay_state(HISTORY, 3, _t(SLOTS - 1, dtype=torch.int32), buf, _ssm())
+    with pytest.raises(AssertionError, match="cache_buf_idx"):
+        M.check_replay_state(HISTORY, 3, pnat, buf.to(torch.int64), _ssm())
+
+
+def test_replay_history_rejects_missing_short_pool_and_wrong_geometry() -> None:
+    old_x, old_B, old_dt = _history()
+    with pytest.raises(AssertionError, match="no old_x"):
+        M.check_replay_history(G, 3, HISTORY, SLOTS, None, old_B, old_dt)
+    with pytest.raises(AssertionError, match="slots for a"):
+        M.check_replay_history(G, 3, HISTORY, SLOTS, *_history(slots=SLOTS - 1))
+    # The kernel addresses the history by `history_size`, so a buffer of another depth
+    # would be read at the wrong offsets.
+    with pytest.raises(AssertionError, match="old_x"):
+        M.check_replay_history(G, 3, HISTORY, SLOTS, *_history(history=12))
+    with pytest.raises(AssertionError, match="old_B"):
+        M.check_replay_history(G, 3, HISTORY, SLOTS, old_x, old_B.to(torch.float32), old_dt)
+    with pytest.raises(AssertionError, match="old_dt"):
+        M.check_replay_history(G, 3, HISTORY, SLOTS, old_x, old_B, old_dt.to(torch.bfloat16))
+    with pytest.raises(AssertionError, match="double-buffered"):
+        M.check_replay_history(
+            G,
+            3,
+            HISTORY,
+            SLOTS,
+            old_x,
+            old_B,
+            _t(SLOTS, 3, G.num_v_heads, HISTORY, dtype=torch.float32),
+        )
+
+
+def test_shared_selection_rejects_missing_row_and_width() -> None:
+    shared = _t(2, 8, 512, dtype=torch.int32)
+    with pytest.raises(AssertionError, match="no shared buffers"):
+        M.check_shared_selection(None, {3: 0}, 3, 512)
+    with pytest.raises(AssertionError, match="no row"):
+        M.check_shared_selection(shared, {4: 0}, 3, 512)
+    with pytest.raises(AssertionError, match="no row"):
+        M.check_shared_selection(shared, {3: 2}, 3, 512)
+    with pytest.raises(AssertionError, match="blocks per row"):
+        M.check_shared_selection(shared, {3: 1}, 3, 256)

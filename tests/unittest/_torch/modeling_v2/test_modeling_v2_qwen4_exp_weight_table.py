@@ -97,9 +97,16 @@ def test_mtp_rows_appear_only_when_mtp_is_live():
     on = W.MODEL_WEIGHTS.manifest(_core(True))
     added = set(on) - set(off)
     assert set(off) <= set(on)
-    assert added and all(k.startswith(f"l{_TEXT['num_hidden_layers']}_mtp_") for k in added)
-    # The draft layer's own QSA indexer is never loaded; see weights.py.
-    assert not any("indexer" in str(src) for k in added for src, _, _ in on[k])
+    m = f"l{_TEXT['num_hidden_layers']}_mtp_"
+    assert added and all(k.startswith(m) for k in added)
+    # The draft layer runs QSA over its own indexer, read from the module's keys.
+    indexer = {f"{m}idx_w", f"{m}idx_qn", f"{m}idx_kn"}
+    assert indexer <= added
+    assert all(
+        str(src).startswith("mtp.layers.0.self_attn.indexer.")
+        for k in indexer
+        for src, _, _ in on[k]
+    )
 
 
 def _reference_declaration(mtp: bool) -> dict:
@@ -223,6 +230,9 @@ def _reference_declaration(mtp: bool) -> dict:
         hyper_connection(f"{m}ahc")
         hyper_connection(f"{m}mhc")
         gated_attention(m)
+        P(f"{m}idx_w", index_width, hidden)
+        P(f"{m}idx_qn", t.indexer_head_dim)
+        P(f"{m}idx_kn", t.indexer_head_dim)
         P(f"{m}router", experts, hidden)
         P(f"{m}fc1_w", experts, 2 * inter, hidden, dtype=f8)
         P(f"{m}fc1_s", experts, (2 * inter) // 128, hidden // 128, dtype=f32)

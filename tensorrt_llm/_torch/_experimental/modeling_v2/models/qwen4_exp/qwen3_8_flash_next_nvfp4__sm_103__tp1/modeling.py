@@ -11,7 +11,9 @@ The checkpoint is the composite Qwen4-Exp VLM export. The MTP module is built on
 when the engine has a ``speculative_config`` (else ``mtp.*`` stays in
 ``weights.py``'s non-load set). The vision tower is always built; a text-only
 request never reaches it. Every speculation-dependent change is gated on a host
-int that is 1 when speculation is off.
+int that is 1 when speculation is off. The PLE pools and the QSA side caches are
+written for every verify row, so `SpeculativeRollback` (registered with the spec
+worker) rewrites them to the accepted prefix after each verify step.
 
 Differences from other targets:
 
@@ -20,7 +22,8 @@ Differences from other targets:
   ``hyper_connection_mixer`` is the final norm and ``lm_head`` reads its output.
 * **QSA sparse attention.** The index plane is maintained on every step so a
   request can cross ``dense_seq_len_threshold`` later without rebuilding its
-  prefix; sparse selection replaces the dense core only above it.
+  prefix; sparse selection replaces the dense core only above it. The MTP draft
+  layer runs the same branch over its own indexer and its own manager's planes.
 * **PLE.** Decoder layer 1 only (``ple_layer_ids: [2]`` is one-based): an n-gram
   side path over a 320,001,536-row fp8 table (47.68 GiB of a 123.5 GiB checkpoint).
 * **NVFP4 MoE on every layer** (routed experts only); everything else is bf16. The
@@ -81,14 +84,16 @@ from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_utils import DecoderModel, DecoderModelForCausalLM
+from tensorrt_llm._torch.modules.fla.cached_replay import CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE
 from tensorrt_llm._torch.speculative import get_spec_worker, should_use_separate_draft_kv_cache
-from tensorrt_llm._torch.utils import ActivationType, is_gdn_replay_enabled
+from tensorrt_llm._torch.utils import ActivationType
 
 from . import weights as _weights
 from .ops.activation.fused_sigmoid_mul_inplace import fused_sigmoid_mul_inplace
 from .ops.activation.gelu_erf import gelu_erf
 from .ops.activation.gelu_tanh import gelu_tanh
 from .ops.attention.qsa_expand_block_indices import qsa_expand_block_indices
+from .ops.attention.qsa_mtp_reuse_topk import qsa_mtp_reuse_topk
 from .ops.attention.qsa_paged_index_scores import qsa_paged_index_scores
 from .ops.attention.qsa_paged_index_store import qsa_paged_index_store
 from .ops.attention.qsa_paged_kv_store import qsa_paged_kv_store
@@ -124,6 +129,9 @@ from .ops.ssm.dilated_short_conv_paged import dilated_short_conv_paged
 from .ops.ssm.extract_transpose_prefill_slice import extract_transpose_prefill_slice
 from .ops.ssm.fused_gdn_gating import fused_gdn_gating
 from .ops.ssm.fused_gdn_post_conv import fused_gdn_post_conv
+from .ops.ssm.fused_recurrent_gated_delta_rule_cached_replay_update import (
+    fused_recurrent_gated_delta_rule_cached_replay_update,
+)
 from .ops.ssm.fused_recurrent_gated_delta_rule_update import fused_recurrent_gated_delta_rule_update
 from .ops.ssm.fused_sigmoid_gating_delta_rule_update import fused_sigmoid_gating_delta_rule_update
 from .ops.ssm.pack_gdn_decode_qkv import pack_gdn_decode_qkv
@@ -395,6 +403,10 @@ _QSA_INDEX_HEAD_TO_ROTARY_RATIO = 2
 _QSA_MROPE_SECTION = None
 _QSA_INDEX_USE_MROPE = False
 
+#: The key a padding slot (`-1`) sorts under when a row's selected groups are put in
+#: ascending order: past every group id, so padding stays last.
+_SELECTION_PAD_KEY = torch.iinfo(torch.int32).max
+
 # ---------------------------------------------------------------- MTP ------
 
 #: The checkpoint's MTP module count (`mtp_num_hidden_layers`), replayed
@@ -414,6 +426,11 @@ _FP8_BLOCK = _weights.FP8_BLOCK
 #: (UE8M0), a different quantization of the same input.
 _MTP_MOE_USE_UE8M0 = False
 
+#: The history depth of the GDN cached-replay verify path (the manager's
+#: `replay_history_size`). The replay entry is certified at 16 only, and a manager that
+#: reports another depth is refused at bind.
+_GDN_REPLAY_HISTORY = 16
+
 
 # ----------------------------------------------- KV cache manager binding ---
 #
@@ -421,19 +438,23 @@ _MTP_MOE_USE_UE8M0 = False
 # KV cache manager are `TensorWrapper`s over raw device addresses that do not keep
 # memory alive, so a view is only valid for the manager that produced it. `_Bound`
 # is everything derived from one manager; the core replaces it as a unit
-# (`_bind_cache_manager`) and the hot path pays one identity comparison.
+# (`_bind_cache_manager`) and the hot path pays one identity comparison. The MTP
+# draft layer's step can see a second manager (the separate draft KV cache), bound
+# the same way into `_DraftBound` (`_bind_draft_cache_manager`).
 #
 # The `check_*` functions hold the shape/dtype contract. They read only
 # `.shape` / `.dtype`, so unit tests run them on meta tensors with no engine.
 #
 # For a later target with pools that are not in `attn_metadata` (mamba/GDN state,
-# side caches): the reusable parts are (1) one immutable bound object, replaced
-# atomically and keyed on manager identity, (2) pure contract checks, (3) refusing
-# a re-bind during CUDA graph capture. Once a second target needs it, the next
-# step is a declarative `PoolSpec(name, layers, getter, tail_shape, dtype)` list
-# consumed by one shared binder under `modeling_v2/` (not `catalog/`), leaving each
-# target only its specs and shape constants. Pure-attention targets that read the
-# pool pointers from `attn_metadata` on every call (deepseek_v3) do not need this.
+# side caches): the reusable parts are (1) one immutable bound object per manager,
+# replaced atomically and keyed on manager identity, (2) pure contract checks,
+# (3) refusing a bind during CUDA graph capture that no eager step validated first
+# (a re-bind for the trunk's, a first bind for the draft layer's). Once a second
+# target needs it, the next step is a declarative
+# `PoolSpec(name, layers, getter, tail_shape, dtype)` list consumed by one shared
+# binder under `modeling_v2/` (not `catalog/`), leaving each target only its specs
+# and shape constants. Pure-attention targets that read the pool pointers from
+# `attn_metadata` on every call (deepseek_v3) do not need this.
 
 
 class _PoolGeometry(NamedTuple):
@@ -446,6 +467,7 @@ class _PoolGeometry(NamedTuple):
     index_head_dim: int
     conv_dim: int
     conv_kernel: int
+    num_k_heads: int
     num_v_heads: int
     head_v_dim: int
     head_k_dim: int
@@ -453,6 +475,18 @@ class _PoolGeometry(NamedTuple):
     ple_state_len: int
     ngram_context_len: int
     dtype: torch.dtype  # the activation dtype
+
+
+class _Replay(NamedTuple):
+    """The GDN cached-replay verify state of one manager: per slot, the recurrent pool
+    row is a checkpoint and a compact history holds the tokens accepted since it."""
+
+    old: dict  # GDN layer -> (old_x, old_B, old_dt, old_dA_cumsum) history buffers
+    cache_buf_idx: torch.Tensor  # per slot: which history half is pending
+    prev_num_accepted: torch.Tensor  # per slot: pending history entries
+    history: int
+    width: int  # verify rows per generation request
+    all_layer_commit: bool  # the manager commits partitioned steps over every layer
 
 
 class _Bound(NamedTuple):
@@ -466,10 +500,23 @@ class _Bound(NamedTuple):
     conv: dict  # GDN layer -> conv state pool
     ssm: dict  # GDN layer -> recurrent state pool
     ple_state: tuple  # (PLE conv state, PLE n-gram id history)
-    # MTP only: the runtime's per-step rollback buffers.
+    # MTP only: the verify step's per-step conv buffers, and one recurrent mode. Legacy:
+    # per-step recurrent buffers (`int_ssm`). Cached replay: `replay`, no `int_ssm`.
     int_idx: torch.Tensor | None = None
     int_conv: dict | None = None
     int_ssm: dict | None = None
+    replay: _Replay | None = None
+
+
+class _DraftBound(NamedTuple):
+    """The MTP draft layer's views of the manager its draft step sees: the separate
+    draft manager when the engine built one, else the trunk's."""
+
+    cm: object
+    index_cache: torch.Tensor  # the draft layer's QSA index plane
+    position_cache: torch.Tensor  # that manager's QSA position plane
+    kv: tuple  # (K, V) views of the draft layer's paged K/V
+    share_slot: int | None  # its row in the metadata's shared selection buffers (IndexShare)
 
 
 def _require(cm, names, what: str) -> None:
@@ -520,19 +567,81 @@ def check_ple_pools(g: _PoolGeometry, ple_conv, ple_ngram, conv) -> None:
     )
 
 
-def check_step_buffers(g: _PoolGeometry, int_conv, int_ssm, conv, ssm, int_idx) -> None:
-    """MTP verify rollback buffers: `[slots, steps, ...]`, at the pools' dtypes
-    (the promotion kernel copies between them without converting)."""
-    assert int_conv is not None and int_ssm is not None, (
-        "the runtime allocated no per-step conv/recurrent state buffers; a "
-        "partially accepted draft cannot be rolled back"
+def check_step_buffers(g: _PoolGeometry, int_conv, conv, int_idx) -> None:
+    """MTP verify buffers both recurrent modes use: the per-step conv windows
+    `[slots, steps, ...]` at the pool's dtype (the promotion copies between them without
+    converting) and the rows `update_mamba_states` reads its sources from."""
+    assert int_conv is not None, (
+        "the runtime allocated no per-step conv buffer; a partially accepted draft "
+        "cannot be rolled back"
     )
     _check_pool(int_conv, "per-step conv buffer", 2, (g.conv_dim, g.conv_kernel - 1), conv.dtype)
-    ssm_shape = (g.num_v_heads, g.head_v_dim, g.head_k_dim)
-    _check_pool(int_ssm, "per-step recurrent buffer", 2, ssm_shape, ssm.dtype)
-    # `update_mamba_states` reads its source rows from this vector.
     assert int_idx is not None and int_idx.dtype == torch.int32, (
         "the cache manager exposes no int32 intermediate_state_indices"
+    )
+
+
+def check_legacy_state(g: _PoolGeometry, int_ssm, ssm) -> None:
+    """Legacy verify: per-step recurrent buffer `[slots, steps, ...]` at the pool's dtype."""
+    assert int_ssm is not None, (
+        "the cache manager runs the legacy verify path but allocated no per-step recurrent "
+        "buffer; a partially accepted draft cannot be rolled back"
+    )
+    ssm_shape = (g.num_v_heads, g.head_v_dim, g.head_k_dim)
+    _check_pool(int_ssm, "per-step recurrent buffer", 2, ssm_shape, ssm.dtype)
+
+
+def check_replay_state(history, width, prev_accepted, cache_buf_idx, ssm) -> None:
+    """Cached replay, manager-wide: the geometry the replay entry is certified at, and the
+    per-slot bookkeeping, which must cover every pool slot."""
+    assert ssm.dtype == torch.float32, (
+        f"the recurrent pool is {ssm.dtype}; the replay entry is certified at an fp32 checkpoint. "
+        "Set mamba_ssm_cache_dtype to float32 or export TRTLLM_USE_GDN_REPLAY=0"
+    )
+    assert history == _GDN_REPLAY_HISTORY, (
+        f"replay_history_size {history}; the replay entry is certified at {_GDN_REPLAY_HISTORY}"
+    )
+    assert 2 <= width <= 4, (
+        f"replay_step_width {width}; the replay entry is certified at 2..4 verify rows"
+    )
+    for name, t in (("prev_num_accepted_tokens", prev_accepted), ("cache_buf_idx", cache_buf_idx)):
+        assert t.dim() == 1 and t.shape[0] >= ssm.shape[0] and t.dtype == torch.int32, (
+            f"{name} is {tuple(t.shape)} {t.dtype}; the kernel reads one int32 per pool slot "
+            f"({ssm.shape[0]})"
+        )
+
+
+def check_replay_history(
+    g: _PoolGeometry, layer: int, history, pool_slots, old_x, old_B, old_dt
+) -> None:
+    """One GDN layer's replay history: `[slots, 2 halves, ...]`, addressed by `history` and
+    the head geometry, never by the buffer's own shape."""
+    for name, t in (("old_x", old_x), ("old_B", old_B), ("old_dt", old_dt)):
+        assert t is not None, f"layer {layer}: the manager's layer cache carries no {name}"
+    assert old_x.shape[0] >= pool_slots, (
+        f"layer {layer}: the replay history has {old_x.shape[0]} slots for a {pool_slots}-slot pool"
+    )
+    bf16, fp32 = torch.bfloat16, torch.float32
+    x_tail, b_tail = (history, g.num_v_heads, g.head_v_dim), (history, g.num_k_heads, g.head_k_dim)
+    _check_pool(old_x, f"layer {layer}: old_x", 2, x_tail, bf16)
+    _check_pool(old_B, f"layer {layer}: old_B", 2, b_tail, bf16)
+    _check_pool(old_dt, f"layer {layer}: old_dt", 2, (g.num_v_heads, history), fp32)
+    assert old_x.shape[1] == old_B.shape[1] == old_dt.shape[1] == 2, (
+        f"layer {layer}: the replay history is not double-buffered"
+    )
+
+
+def check_shared_selection(shared, slots, layer: int, block_topk: int) -> None:
+    """IndexShare: the metadata's shared selection buffers have a row for `layer` and are
+    `block_topk` wide."""
+    assert shared is not None, "IndexShare is on but the QSA metadata allocated no shared buffers"
+    assert layer in slots and slots[layer] < shared.shape[0], (
+        f"the KV cache manager gives layer {layer} no row of the {shared.shape[0]}-row shared "
+        f"selection buffers (qsa_shared_topk_slots={slots})"
+    )
+    assert shared.shape[2] == block_topk, (
+        f"the shared selection rows are {shared.shape[2]} wide and this target selects "
+        f"{block_topk} blocks per row"
     )
 
 
@@ -788,6 +897,10 @@ class Qwen4ExpTp1ModelingV2(DecoderModel):
             f"seq_len_threshold above token_topk is the way to get here, and "
             f"it is a configuration this target does not implement"
         )
+        # IndexShare for the MTP draft loop (`sparse_attention_config.
+        # index_share_for_mtp_iteration`), as the engine resolved it: the same lowering
+        # sizes the metadata's shared selection buffers.
+        self.mtp_index_share = bool(qsa_params.mtp_index_share)
         self.index_width = (self.index_heads + self.index_kv_heads) * self.index_head_dim
         # Packed [q | k | v] scratch for the fused norm+rope call; the spare KV head
         # is the v slot the op needs but never reads.
@@ -1012,19 +1125,10 @@ class Qwen4ExpTp1ModelingV2(DecoderModel):
                 f"{spec_config.max_total_draft_tokens} against {max_draft}"
             )
 
-            # The engine picks the replay (default) or legacy verify path at
-            # cache-manager construction; this target is closed over the legacy one
-            # (`_gdn_verify` + `update_mamba_states`). Checked again against the
-            # manager at the first forward.
-            assert not is_gdn_replay_enabled(), (
-                "the GDN cached-replay verify path is on and this target does "
-                "not implement it: its commit kernel "
-                "(fused_recurrent_gated_delta_rule_cached_replay_update) has no "
-                "catalog entry, and with replay on the runtime allocates no "
-                "intermediate SSM buffer for the legacy path to write. Export "
-                "TRTLLM_USE_GDN_REPLAY=0 before the ranks start. This is a "
-                "requirement of the MTP path, not a tuning knob"
-            )
+            # The recurrent half of the verify step has two forms, and the cache manager
+            # picks one when it is built (`TRTLLM_USE_GDN_REPLAY`, default on): the cached
+            # replay or the legacy per-step recurrent buffers. Both are implemented;
+            # `_bind_step_buffers` reads which one a manager allocated.
             # The FP8 block-scale runner's own shape rules.
             assert self.hidden % _FP8_BLOCK == 0 and self.moe_inter % _FP8_BLOCK == 0, (
                 f"fp8_block_scale_moe_runner needs hidden ({self.hidden}) and "
@@ -1054,6 +1158,12 @@ class Qwen4ExpTp1ModelingV2(DecoderModel):
         self._cos_sin: torch.Tensor | None = None
         # MTP module operands; None with speculation off.
         self._mtp: _MtpWeights | None = None
+        self._mtp_cos_sin: torch.Tensor | None = None
+        # The verify step's side-cache rollback, registered with the spec worker; None
+        # with speculation off.
+        self.spec_rollback: SpeculativeRollback | None = (
+            SpeculativeRollback() if self.mtp_enabled else None
+        )
         self._prefill: "PrefillTarget | None" = None
         self._decode: "DecodeTarget | None" = None
         self.vision_tower: VisionTower | None = None
@@ -1061,6 +1171,8 @@ class Qwen4ExpTp1ModelingV2(DecoderModel):
         # None until the first forward.
         self._bound: _Bound | None = None
         self._binds = 0
+        # The draft layer's own bind, keyed on the manager its draft step sees.
+        self._draft_bound: _DraftBound | None = None
 
     # ---------------------------------------------------------------- load ---
 
@@ -1152,15 +1264,15 @@ class Qwen4ExpTp1ModelingV2(DecoderModel):
             f"do not concatenate to the padded id space this checkpoint "
             f"declares"
         )
-        # The index branch's rope table in the QSA kernels' layout:
-        # `[max_positions, 2 * rotary_pairs]` fp32, cos block then sin block.
-        pairs = self.rotary_dim // 2
-        exponent = torch.arange(0, self.rotary_dim, 2, dtype=torch.float64, device=device)
-        inv_freq = (1.0 / (self.theta ** (exponent / self.rotary_dim))).to(torch.float32)
-        positions = torch.arange(self.max_positions, dtype=torch.float32, device=device)
-        angles = positions.unsqueeze(1) * inv_freq.unsqueeze(0)
-        self._cos_sin = torch.cat([torch.cos(angles), torch.sin(angles)], dim=1).contiguous()
-        assert self._cos_sin.shape == (self.max_positions, 2 * pairs), self._cos_sin.shape
+        self._cos_sin = self._index_rope_table(self.theta, device)
+        if self.mtp_enabled:
+            # The draft layer's index plane rotates at the module's own rope base, like its
+            # attention rope.
+            self._mtp_cos_sin = (
+                self._cos_sin
+                if self.mtp_theta == self.theta
+                else self._index_rope_table(self.mtp_theta, device)
+            )
         self._report_ple_residency()
         if self.mtp_enabled:
             self._mtp = _mtp_views(self)
@@ -1168,6 +1280,18 @@ class Qwen4ExpTp1ModelingV2(DecoderModel):
         self._prefill = PrefillTarget(self)
         self._decode = DecodeTarget(self)
         self.vision_tower = VisionTower(self)
+
+    def _index_rope_table(self, theta: float, device) -> torch.Tensor:
+        """The index branch's rope table at `theta` in the QSA kernels' layout:
+        `[max_positions, 2 * rotary_pairs]` fp32, cos block then sin block."""
+        pairs = self.rotary_dim // 2
+        exponent = torch.arange(0, self.rotary_dim, 2, dtype=torch.float64, device=device)
+        inv_freq = (1.0 / (theta ** (exponent / self.rotary_dim))).to(torch.float32)
+        positions = torch.arange(self.max_positions, dtype=torch.float32, device=device)
+        angles = positions.unsqueeze(1) * inv_freq.unsqueeze(0)
+        table = torch.cat([torch.cos(angles), torch.sin(angles)], dim=1).contiguous()
+        assert table.shape == (self.max_positions, 2 * pairs), table.shape
+        return table
 
     def _report_ple_residency(self) -> None:
         """Check where the n-gram table ended up, and report it once.
@@ -1217,6 +1341,7 @@ class Qwen4ExpTp1ModelingV2(DecoderModel):
             index_head_dim=self.index_head_dim,
             conv_dim=self.conv_dim,
             conv_kernel=self.conv_kernel,
+            num_k_heads=self.num_k_heads,
             num_v_heads=self.num_v_heads,
             head_v_dim=self.head_v_dim,
             head_k_dim=self.head_k_dim,
@@ -1350,33 +1475,115 @@ class Qwen4ExpTp1ModelingV2(DecoderModel):
             cm, pool_idx, index_cache, position_cache, kv, conv, ssm, (ple_conv, ple_ngram)
         )
         if self.mtp_enabled:
-            bound = bound._replace(**self._bind_step_buffers(cm, g, conv0, ssm0))
+            bound = bound._replace(**self._bind_step_buffers(cm, g, mm, conv0, ssm0))
         self._bound = bound
 
-    def _bind_step_buffers(self, cm, g: _PoolGeometry, conv0, ssm0) -> dict:
+    def _bind_step_buffers(self, cm, g: _PoolGeometry, mm, conv0, ssm0) -> dict:
         """Per-manager fail-fast for the MTP increment: the verify step needs
-        runtime-owned per-step buffers that exist only under the legacy GDN path.
-        Returns the `_Bound` fields it adds."""
+        runtime-owned buffers the base path never touches. Every row's conv window goes
+        to a per-step buffer in both recurrent modes; the recurrent state is either the
+        cached replay (a checkpoint per slot plus a compact history of accepted tokens,
+        no per-step recurrent buffer) or, with `TRTLLM_USE_GDN_REPLAY=0`, per-step
+        recurrent buffers. Returns the `_Bound` fields it adds."""
         assert cm.is_speculative(), (
             f"the KV cache manager {type(cm).__name__} reports is_speculative() False, "
             "so it allocated none of the per-step state buffers the verify path writes"
         )
-        assert not getattr(cm, "use_replay_state_update", False), (
-            "the GDN cached-replay verify path is on. Export TRTLLM_USE_GDN_REPLAY=0 "
-            "before the ranks start; see this target's __init__ for why"
-        )
         _require(
             cm,
             ("get_intermediate_conv_states", "get_intermediate_ssm_states"),
-            "reads both per-step state buffers",
+            "binds its per-step state buffers",
         )
         # `get_intermediate_*` builds a fresh view per call, so bind them here.
         int_conv = {i: cm.get_intermediate_conv_states(i) for i in self.gdn_layers}
-        int_ssm = {i: cm.get_intermediate_ssm_states(i) for i in self.gdn_layers}
         int_idx = getattr(cm, "intermediate_state_indices", None)
         g0 = self.gdn_layers[0]
-        check_step_buffers(g, int_conv[g0], int_ssm[g0], conv0, ssm0, int_idx)
-        return dict(int_idx=int_idx, int_conv=int_conv, int_ssm=int_ssm)
+        check_step_buffers(g, int_conv[g0], conv0, int_idx)
+        int_ssm0 = cm.get_intermediate_ssm_states(g0)
+        if not getattr(cm, "use_replay_state_update", False):
+            check_legacy_state(g, int_ssm0, ssm0)
+            int_ssm = {i: cm.get_intermediate_ssm_states(i) for i in self.gdn_layers}
+            return dict(int_idx=int_idx, int_conv=int_conv, int_ssm=int_ssm)
+        assert int_ssm0 is None, (
+            "the cache manager runs the cached-replay verify path and also allocated a "
+            "per-step recurrent buffer; the runtime allocates one or the other"
+        )
+        return dict(int_idx=int_idx, int_conv=int_conv, replay=self._bind_replay(cm, g, mm, ssm0))
+
+    def _bind_replay(self, cm, g: _PoolGeometry, mm, ssm0) -> _Replay:
+        """The cached-replay history buffers and bookkeeping of one manager."""
+        meta = cm.get_replay_state_update_metadata()
+        assert meta is not None, (
+            "use_replay_state_update is True but the manager returns no replay metadata "
+            "(prev_num_accepted_tokens / cache_buf_idx / widths)"
+        )
+        history, width = meta.replay_history_size, meta.replay_step_width
+        check_replay_state(history, width, meta.prev_num_accepted_tokens, meta.cache_buf_idx, ssm0)
+        old = {}
+        for i in self.gdn_layers:
+            layer_cache = cm.mamba_layer_cache(i)
+            old[i] = (
+                layer_cache.old_x,
+                layer_cache.old_B,
+                layer_cache.old_dt,
+                layer_cache.old_dA_cumsum,
+            )
+            check_replay_history(g, i, history, ssm0.shape[0], *old[i][:3])
+        # The partitioned replay is the manager's to commit: it commits exactly when this
+        # flag holds and a step carries `CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE` or more
+        # generation requests, and the forward hands the kernel the work items under that
+        # same condition.
+        all_layer = bool(getattr(cm, "use_gdn_cached_replay_all_layer_commit", False))
+        if all_layer:
+            missing = [n for n in ("replay_work_items", "replay_n_writes") if not hasattr(mm, n)]
+            assert not missing, (
+                f"the manager's all-layer replay commit is on but the mamba metadata lacks "
+                f"{missing}; the partitioned verify call needs both"
+            )
+        return _Replay(
+            old, meta.cache_buf_idx, meta.prev_num_accepted_tokens, history, width, all_layer
+        )
+
+    def _bind_draft_cache_manager(self, md) -> None:
+        """Bind the draft layer to the manager its draft step sees: its own index plane,
+        that manager's position plane and its paged K/V.
+
+        With a separate draft KV cache that is the draft manager the worker swaps in for
+        the draft loop, whose pools hold the draft layer's pages and none of the trunk's;
+        otherwise the trunk's manager, which maps the draft layer as well. Keyed on the
+        manager like `_bind_cache_manager`. Never first bound under capture: the runner
+        runs every captured batch shape eagerly first, so a bind under capture would bake
+        views no eager step validated into the graph."""
+        cm = md.kv_cache_manager
+        assert not torch.cuda.is_current_stream_capturing(), (
+            f"the draft layer met KV cache manager {type(cm).__name__} for the first time "
+            "under CUDA graph capture; its views must be taken and checked by an eager step first"
+        )
+        _require(
+            cm,
+            ("get_index_k_buffer", "get_qsa_position_buffer", "get_buffers"),
+            "reads the draft layer's QSA index plane, position plane and paged K/V",
+        )
+        g = self._pool_geometry(md.tokens_per_block)
+        layer = self.mtp_layer_idx
+        index_cache = cm.get_index_k_buffer(layer)
+        position_cache = cm.get_qsa_position_buffer()
+        pool = cm.get_buffers(layer, kv_layout="HND")
+        check_position_plane(g, position_cache)
+        check_attention_pools(g, layer, index_cache, pool)
+        share_slot = None
+        if self.mtp_index_share:
+            # The metadata sizes its shared selection buffers from the same resolved knob,
+            # one row per sparse layer of whichever manager is bound.
+            assert md.sparse_metadata_params.mtp_index_share, (
+                "this target resolved IndexShare on but the engine's QSA metadata did not"
+            )
+            slots = cm.qsa_shared_topk_slots
+            check_shared_selection(md.qsa_shared_topk_indices, slots, layer, self.block_topk)
+            share_slot = slots[layer]
+        self._draft_bound = _DraftBound(
+            cm, index_cache, position_cache, (pool[:, 0], pool[:, 1]), share_slot
+        )
 
     # -------------------------------------------------------------- forward ---
 
@@ -1633,6 +1840,9 @@ class _MtpWeights(NamedTuple):
     o: torch.Tensor
     q_norm: torch.Tensor
     k_norm: torch.Tensor
+    idx: torch.Tensor
+    idx_qn: torch.Tensor
+    idx_kn: torch.Tensor
     router: torch.Tensor
     fc1_w: torch.Tensor
     fc1_s: torch.Tensor
@@ -1668,6 +1878,9 @@ def _mtp_views(core: Qwen4ExpTp1ModelingV2) -> _MtpWeights:
         o=w[f"{p}o_w"].t(),
         q_norm=w[f"{p}q_norm"],
         k_norm=w[f"{p}k_norm"],
+        idx=w[f"{p}idx_w"].t(),
+        idx_qn=w[f"{p}idx_qn"],
+        idx_kn=w[f"{p}idx_kn"],
         router=w[f"{p}router"].t(),
         fc1_w=w[f"{p}fc1_w"],
         fc1_s=w[f"{p}fc1_s"],
@@ -1679,6 +1892,87 @@ def _mtp_views(core: Qwen4ExpTp1ModelingV2) -> _MtpWeights:
         fhc_norm=core._norm_slices(f"{p}fhc_norm"),
         fhc_down=w[f"{p}fhc_down"],
         fhc_up=w[f"{p}fhc_up"],
+    )
+
+
+def _sort_selection(topk_indices: torch.Tensor) -> None:
+    """Put each row's selected group ids in ascending order, padding last, in place.
+
+    `qsa_topk_select` compacts a row's picks through a shared-memory atomic, so the set
+    comes back in a launch-dependent order; the expansion keeps that order and the sparse
+    GQA reduces in it, so an unsorted row past the dense threshold is not reproducible
+    run to run. A sorted row is also prefix-packed, which the expansion and the IndexShare
+    reuse require, and the reuse keeps the order: groups completed since the capture are
+    larger than every captured id."""
+    keyed = torch.where(topk_indices < 0, _SELECTION_PAD_KEY, topk_indices)
+    ordered = torch.sort(keyed, dim=1).values
+    topk_indices.copy_(torch.where(ordered == _SELECTION_PAD_KEY, -1, ordered))
+
+
+def _replay_verify(
+    core, mq_out, a_d, b_d, ssm_states, i, L, si_d, n, p, replay, packed_qkv
+) -> torch.Tensor:
+    """One GDN layer's verify recurrence under the cached replay: `n` generation sequences
+    of `p` rows over the conv output `mq_out` (`[n * p, conv_dim]`, token-major) and the
+    raw `a`/`b` projections, with the fp32 gating parameters fused into the kernel.
+
+    `replay` is `(work_items, n_writes, partitioned)`; the work items are given exactly
+    when the manager runs its all-layer commit after the step (without that commit every
+    history wrap goes uncommitted, with it a wrap committed here is committed twice).
+    `packed_qkv` is `mq_out` when it is the contiguous conv rows themselves, else None
+    and q/k/v go in as views the kernel copies. The conv before it does not signal
+    dependents, so the kernel launches without PDL."""
+    work_items, n_writes, partitioned = replay
+    state = core._bound.replay
+    old_x, old_B, old_dt, old_dA = state.old[i]
+    qv, kv, vv = torch.split(mq_out, [core.key_dim, core.key_dim, core.value_dim], 1)
+    out = fused_recurrent_gated_delta_rule_cached_replay_update(
+        q=torch.reshape(qv, [n, p, core.num_k_heads, core.head_k_dim]),
+        k=torch.reshape(kv, [n, p, core.num_k_heads, core.head_k_dim]),
+        v=torch.reshape(vv, [n, p, core.num_v_heads, core.head_v_dim]),
+        g=torch.reshape(a_d, [n, p, core.num_v_heads]),
+        beta=torch.reshape(b_d, [n, p, core.num_v_heads]),
+        ssm_states=ssm_states,
+        state_indices=si_d,
+        old_u=old_x,
+        old_k=old_B,
+        old_G=old_dt,
+        old_beta=old_dA,
+        cache_buf_idx=state.cache_buf_idx,
+        prev_num_accepted_tokens=state.prev_num_accepted,
+        history_size=state.history,
+        scale=None,
+        use_qk_l2norm_in_kernel=True,
+        A_log=L.a_log,
+        dt_bias=L.dt_bias,
+        launch_with_pdl=False,
+        replay_work_items=work_items,
+        n_writes=n_writes,
+        block_v=None,
+        num_warps=None,
+        use_l2_state_cache=None,
+        use_l2_streaming_inputs=None,
+        use_l2_shared_inputs=None,
+        main_num_stages=None,
+        packed_qkv=packed_qkv,
+        use_all_layer_commit=partitioned,
+        output=None,
+    )
+    return torch.reshape(out, [1, n * p, core.num_v_heads, core.head_v_dim])
+
+
+def _replay_work(core, mm, num_decodes: int) -> tuple:
+    """`_replay_verify`'s `replay` argument for a verify step of `num_decodes` generation
+    requests: the partitioned replay exactly when `update_mamba_states` runs the manager's
+    all-layer commit after the step."""
+    partitioned = (
+        core._bound.replay.all_layer_commit
+        and num_decodes >= CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE
+    )
+    return (
+        mm.replay_work_items[:num_decodes] if partitioned else None,
+        mm.replay_n_writes if partitioned else None,
+        partitioned,
     )
 
 
@@ -1880,7 +2174,7 @@ class PrefillTarget:
         gate_logits = cublas_mm(x, L.sh_gate)
         return fused_sigmoid_gate_mul_add(routed, gate_logits, shared)
 
-    def _attention_block(self, x, i, L, qkv, index_scratch, attn_out, qsa, step):
+    def _attention_block(self, x, i, L, qkv, index_scratch, attn_out, qsa, step, stage):
         """One gated GQA layer plus its QSA index branch.
 
         The q projection is twice as wide as q (q and output gate interleave per
@@ -1888,7 +2182,11 @@ class PrefillTarget:
         buffer and the gate half is read later through its own strides. The index
         plane advances on every step, including below the threshold, so a request
         growing past it finds its prefix compressed; above it the main K/V append
-        becomes this layer's own call."""
+        becomes this layer's own call.
+
+        `stage` is True on a verify step: the generation rows' index slots (and, on
+        the first attention layer, their position slots) are snapshotted for
+        `SpeculativeRollback` before the store and compression overwrite them."""
         core = self.core
         (
             req_idx,
@@ -1956,6 +2254,8 @@ class PrefillTarget:
             [core.index_heads, core.index_kv_heads],
             1,
         )[1]
+        if stage:
+            core.spec_rollback.stage_index(index_cache, core._bound.position_cache)
         qsa_paged_index_store(
             token_k,
             coords,
@@ -2035,6 +2335,7 @@ class PrefillTarget:
             qsa_topk_select(
                 scores, topk_row_starts, visible_blocks, topk_indices, index_topk=core.block_topk
             )
+            _sort_selection(topk_indices)
             selected = qsa_expand_block_indices(
                 topk_indices,
                 logical,
@@ -2074,18 +2375,33 @@ class PrefillTarget:
         fused_sigmoid_mul_inplace(out, gate)
         return cublas_mm(out, L.o)
 
-    def _gdn_verify(self, mq_d, a_d, b_d, ssm_states, i, L, si_d, int_idx, n, p) -> torch.Tensor:
+    def _gdn_verify(
+        self, mq_d, a_d, b_d, ssm_states, i, L, si_d, int_idx, n, p, replay
+    ) -> torch.Tensor:
         """The recurrent half of a speculative verify step: `n` generation sequences of
-        `p = runtime_draft_len + 1` tokens, with per-step conv window and recurrent
-        state written to the runtime's rollback buffers, not the pools.
+        `p = runtime_draft_len + 1` tokens, written so that the accepted prefix, unknown
+        until the sampler has run, can be kept and the rest dropped.
 
-        The pools must not move: which prefix is real is unknown until the sampler
-        accepts, and `update_mamba_states` then promotes step `k - 1`. Advancing them
-        would leave rejected tokens' state in every recurrent layer, invisible to the
-        acceptance rate. `causal_conv1d_triton_update` is the only conv with per-step
-        snapshots (its result for a pad-sentinel slot is uninitialized, safe because
-        every row is a real sequence); `pack_gdn_decode_qkv` does no Q/K L2 norm,
-        hence `use_qk_l2norm_in_kernel=True` below."""
+        The conv writes each row's window to the runtime's per-step buffer and leaves the
+        conv pool alone; `update_mamba_states` promotes window `k - 1`.
+        `causal_conv1d_triton_update` is the only conv with per-step snapshots (its result
+        for a pad-sentinel slot is uninitialized, safe because every row is a real
+        sequence). The recurrence has two forms, bound per manager
+        (`_bind_step_buffers`):
+
+        * cached replay (`replay` given): the pool row is a checkpoint; one call rebuilds
+          the current state from it and the slot's pending history, runs the `p` rows and
+          appends them to the history. Rejected rows cost nothing to undo, because the
+          manager advances the pending count by the accepted tokens only. A full history
+          advances the checkpoint inside the kernel below
+          `CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE` requests and in the manager's
+          all-layer commit from there on, hence `replay` carries the work items exactly
+          under the manager's own condition.
+        * legacy (`replay` None): every row's recurrent state goes to the per-step buffer
+          instead of the pool, and the promotion copies step `k - 1` into it. Advancing
+          the pool directly would leave rejected tokens' state in every recurrent layer,
+          invisible to the acceptance rate. `pack_gdn_decode_qkv` does no Q/K L2 norm,
+          hence `use_qk_l2norm_in_kernel=True` below."""
         core = self.core
         # [n*p, C] -> [n, C, p]: the multi-token conv reads channel-major (the
         # transposed view is certified bitwise equal to the contiguous form).
@@ -2106,6 +2422,12 @@ class PrefillTarget:
         )
         # Back to token-major (a view).
         mq_out = torch.reshape(torch.transpose(conv_out, 1, 2), [n * p, core.conv_dim])
+        if replay is not None:
+            # Behind a context prefix: q/k/v go in as views over the conv rows and the
+            # kernel copies them (the entry's mixed-batch form, no `packed_qkv`).
+            return _replay_verify(
+                core, mq_out, a_d, b_d, ssm_states, i, L, si_d, n, p, replay, None
+            )
         q, k, v = pack_gdn_decode_qkv(
             mq_out, core.num_k_heads, core.head_k_dim, core.num_v_heads, core.head_v_dim
         )
@@ -2166,6 +2488,7 @@ class PrefillTarget:
             gen_p,
             int_idx,
             qsl_long_p,
+            replay,
         ) = gdn_state
         num_tokens = x.shape[0]
 
@@ -2233,7 +2556,7 @@ class PrefillTarget:
                     output=None,
                 )
                 out_d = self._gdn_verify(
-                    mq_d, a_d, b_d, ssm_states, i, L, si_d, int_idx, num_decodes, gen_p
+                    mq_d, a_d, b_d, ssm_states, i, L, si_d, int_idx, num_decodes, gen_p, replay
                 )
                 return self._gdn_epilogue(torch.cat([out_p, out_d], 1), z, L, num_tokens)
             causal_conv1d_update(
@@ -2320,7 +2643,7 @@ class PrefillTarget:
         )
         return cublas_mm(torch.reshape(o, [num_tokens, core.value_dim]), L.out)
 
-    def _ple_block(self, hc, input_ids, ple_state) -> torch.Tensor:
+    def _ple_block(self, hc, input_ids, ple_state, stage) -> torch.Tensor:
         """The n-gram side path on one decoder layer; the caller adds the result into
         the hyper-connection stream.
 
@@ -2330,11 +2653,18 @@ class PrefillTarget:
         scale; key/value projections and the gate scale one value into each stream;
         a dilated depthwise short conv over a paged state is added back. A sequence
         carrying nothing is seeded with `eos_token_id`, not 0: id 0 is a real token
-        the hash cannot distinguish."""
+        the hash cannot distinguish.
+
+        The id history and the conv state publish the state after the whole chunk. On
+        a verify step (`stage`) the generation rows' pre-step pool rows, id windows and
+        conv input go to `SpeculativeRollback`, which rewrites both pools to the
+        accepted prefix once the sampler has decided it."""
         core = self.core
         S = self._stack
         conv_states, ngram_pool, si_all, carry_all, qsl = ple_state
 
+        if stage:
+            core.spec_rollback.stage_ple_pools(ngram_pool, conv_states)
         window = ngram_token_history(
             input_ids, ngram_pool, si_all, carry_all, qsl, core.eos_token_id, core.ngram_size
         )
@@ -2360,9 +2690,12 @@ class PrefillTarget:
         gated = gated_ngram_injection(
             key_normed, query_normed, value, core.hc_count, _PLE_CLAMP_MIN
         )
+        conv_in = self._grouped_norm(gated, S.ple_nc)
+        if stage:
+            core.spec_rollback.stage_ple_rows(window, conv_in)
         # The short conv reads channel-major; a bare transpose is the certified form.
         convolved = dilated_short_conv_paged(
-            x=torch.transpose(self._grouped_norm(gated, S.ple_nc), 0, 1),
+            x=torch.transpose(conv_in, 0, 1),
             weight=S.ple_conv_w,
             bias=None,
             conv_states=conv_states,
@@ -2475,6 +2808,17 @@ class PrefillTarget:
                 f"predicted_tokens_per_seq {gen_p} is outside the 1..4 range "
                 f"attention/thop_attention certifies"
             )
+            # Under the cached replay a single-row generation step cannot take the
+            # ordinary recurrence: the pool row is a checkpoint whose pending history only
+            # the replay kernel applies. The manager's step width is the one row count a
+            # generation step may carry.
+            replay_state = core._bound.replay
+            assert replay_state is None or gen_p == replay_state.width, (
+                f"the batch carries {gen_p} query rows per generation sequence and the GDN "
+                f"cached replay runs at step width {replay_state.width}; a runtime_draft_len "
+                f"of {gen_p - 1} (a draft-length schedule, or skipped drafting) cannot run "
+                "under it. Export TRTLLM_USE_GDN_REPLAY=0 for variable draft lengths"
+            )
         is_verify = spec_metadata is not None and num_decodes > 0 and gen_p > 1
         step["predicted_tokens_per_seq"] = gen_p
 
@@ -2488,11 +2832,14 @@ class PrefillTarget:
         qsl_long = mm.query_start_loc_long
         int_idx = None
         qsl_long_p = None
+        replay = None
         if is_verify:
             # The runtime's arange over the slot pool, from the cache manager (what
             # `update_mamba_states` reads).
             assert core._bound.int_idx is not None, "the cache-manager bind has not run"
             int_idx = core._bound.int_idx[:num_decodes]
+            if core._bound.replay is not None:
+                replay = _replay_work(core, mm, num_decodes)
             # Context rows keep an ordinary chunked recurrence over their prefix.
             qsl_long_p = qsl_long[: num_prefills + 1]
         gdn_state = (
@@ -2511,6 +2858,7 @@ class PrefillTarget:
             gen_p,
             int_idx,
             qsl_long_p,
+            replay,
         )
 
         # PLE carry flags must cover the whole batch, but `has_initial_states` is
@@ -2547,6 +2895,29 @@ class PrefillTarget:
             sparse,
         )
 
+        # A verify step's generation rows write the PLE pools and the QSA side caches for
+        # every draft row, accepted or not; `SpeculativeRollback` keeps what its commit
+        # needs to undo the rejected ones. Reopened on every forward, so a step whose
+        # commit never ran (a failed forward) leaves nothing for the next one. Context
+        # rows are never staged.
+        stage = is_verify
+        rollback = core.spec_rollback
+        if rollback is not None:
+            rollback.discard()
+        if stage:
+            rollback.begin(
+                num_contexts=num_prefills,
+                prefix_tokens=num_prefill_tokens,
+                num_gens=num_decodes,
+                rows_per_gen=gen_p,
+                slots=si_d,
+                input_ids=input_ids[num_prefill_tokens:num_tokens],
+                request_indices=md.qsa_req_idx_per_token[num_prefill_tokens:num_tokens],
+                logical_positions=md.qsa_logical_positions[num_prefill_tokens:num_tokens],
+                block_table=md.qsa_block_table,
+                tokens_per_block=md.tokens_per_block,
+            )
+
         # Scratch shared by all attention layers (each fully rewrites them).
         qkv = torch.empty([num_tokens, core.qkv_width], dtype=dt, device=dev)
         index_scratch = torch.empty([num_tokens, core.index_scratch_width], dtype=dt, device=dev)
@@ -2564,13 +2935,13 @@ class PrefillTarget:
         hc = torch.cat([h] * hc_count, -1)
         for i, L in enumerate(self._layers):
             if i == core.ple_layer:
-                hc = torch.add(hc, self._ple_block(hc, input_ids, ple_state))
+                hc = torch.add(hc, self._ple_block(hc, input_ids, ple_state, stage))
             mixed, inject = qwen4_exp_gated_residual(
                 self._grouped_norm(hc, L.ahc_norm), L.ahc_down, L.ahc_up, L.ahc_inject, hc_count
             )
             if core.is_attn[i]:
                 block_out = self._attention_block(
-                    mixed, i, L, qkv, index_scratch, attn_out, qsa, step
+                    mixed, i, L, qkv, index_scratch, attn_out, qsa, step, stage
                 )
             else:
                 block_out = self._gdn_block(mixed, i, L, gdn_state)
@@ -2632,6 +3003,36 @@ class PrefillTarget:
         shared = cublas_mm(flashinfer_silu_and_mul(cublas_mm(x, M.sh_gu)), M.sh_dn)
         gate_logits = cublas_mm(x, M.sh_gate)
         return fused_sigmoid_gate_mul_add(routed, gate_logits, shared)
+
+    def _capture_selection(self, md, topk_indices, visible_blocks) -> None:
+        """IndexShare: stash, per request, the selection of the row the draft loop continues
+        from, with that row's complete-group count, in the draft layer's row of the shared
+        buffers.
+
+        That row is the one the worker gathers for the next draft step: a context
+        request's last row of this chunk, and a generation request's last accepted row
+        (`num_accepted - 1` past its first). Capturing here rather than at the first draft
+        decode step keeps the indexer at one call per draft loop for a batch with context
+        rows too."""
+        batch = md.num_seqs
+        assert md.qsa_mtp_num_accepted is not None, (
+            "IndexShare needs the worker's accepted counts to pick each request's capture "
+            "row; the draft loop did not supply them"
+        )
+        seq_lens = md.seq_lens_cuda[:batch].to(torch.int64)
+        starts = torch.cumsum(seq_lens, 0) - seq_lens
+        accepted = md.qsa_mtp_num_accepted[:batch].to(torch.int64)
+        offsets = torch.minimum(torch.clamp(accepted - 1, min=0), seq_lens - 1)
+        offsets[: md.num_contexts] = seq_lens[: md.num_contexts] - 1
+        rows = starts + offsets
+        slot = self.core._draft_bound.share_slot
+        md.qsa_shared_topk_indices[slot, :batch].copy_(torch.index_select(topk_indices, 0, rows))
+        md.qsa_shared_topk_visible_blocks[slot, :batch].copy_(
+            torch.index_select(visible_blocks, 0, rows)
+        )
+        # Host-side readiness, recorded in program order: under capture this runs while the
+        # graph is recorded, so a graph holds the reuse only after the capture it reads.
+        md.qsa_shared_topk_captured_slots.add(slot)
 
     def mtp_forward(
         self,
@@ -2703,6 +3104,43 @@ class PrefillTarget:
             "window is not implemented here"
         )
 
+        # The draft layer's QSA planes and the page table that addresses them. With a
+        # separate draft manager the engine's QSA metadata swaps `qsa_block_table` for the
+        # table it decodes from the draft manager's offsets (`prepare_for_draft_forward`);
+        # a table still decoding the trunk's offsets would read and write another pool's
+        # pages.
+        draft = core._draft_bound
+        if draft is None or cm is not draft.cm:
+            core._bind_draft_cache_manager(md)
+            draft = core._draft_bound
+        assert cm is core._bound.cm or md.qsa_block_table is getattr(
+            md, "qsa_draft_block_table", None
+        ), (
+            "the draft step is bound to a separate draft KV cache manager but "
+            "qsa_block_table is not that manager's table: the engine's QSA metadata did "
+            "not swap its page table for the draft forward"
+        )
+        # The `qsa_*` row mapping is sized from the metadata's token count, which the
+        # worker rewrites together with it between draft steps.
+        assert rows == md.num_tokens, (
+            f"the draft step carries {rows} rows for a batch its metadata describes as "
+            f"{md.num_tokens} tokens; the QSA row mapping covers the second"
+        )
+        # The trunk's dense/sparse decision from the same host buffer: the worker advances
+        # only the device KV lengths through the draft loop, so every draft step of one
+        # engine forward takes the branch its trunk took, in the CUDA-graph family the
+        # runner chose for that trunk.
+        batch = md.num_seqs
+        sparse = batch > 0 and int(md.kv_lens_runtime[:batch].max()) > core.dense_threshold
+        # IndexShare: the only draft step with context rows is the loop's first, its
+        # draft-extend step. It always runs the indexer and, with sharing on, captures the
+        # selection the draft decode steps reuse.
+        share = core.mtp_index_share and md.qsa_in_mtp_draft_loop
+        assert not (share and md.qsa_indexer_skip_topk), (
+            "the worker asked a draft step with context rows to reuse a selection; only "
+            "the draft decode steps after it reuse"
+        )
+
         # Copy into a fresh contiguous `[3, N]`: a sliced view keeps the source row
         # stride and the op rejects it under `use_mrope`.
         assert position_ids.shape[0] == _QSA_POSITION_AXES, (
@@ -2715,6 +3153,10 @@ class PrefillTarget:
             device=position_ids.device,
         )
         pos3.copy_(torch.reshape(position_ids, [_QSA_POSITION_AXES, -1]))
+        # The trunk's two other views, from the copy: `pos` (coordinate 0 alone, which the
+        # index rope reads) and `coords` (the `[N, 3]` transpose the position plane stores).
+        pos = torch.reshape(torch.split(pos3, [1, _QSA_POSITION_AXES - 1], 0)[0], [-1])
+        coords = torch.transpose(pos3, 0, 1)
 
         # ---- the front end --------------------------------------------------
         e = nn.functional.embedding(input_ids, embed_tokens)
@@ -2773,19 +3215,140 @@ class PrefillTarget:
             mrope_section1=core.mrope_section1,
             mrope_section2=core.mrope_section2,
         )
-        # Dense attention; see `MTPLayer` for why the module's QSA indexer is unused.
-        attn_out = thop_attention(
-            q=qkv,
-            output=attn_out,
-            local_layer_idx=layer_idx,
-            predicted_tokens_per_seq=p,
-            num_heads=core.heads_q,
-            num_kv_heads=core.heads_kv,
-            head_size=core.head_dim,
-            quant_mode=core.quant_mode,
-            **step,
-            **_CALL_CONSTANTS,
+        # The QSA index branch, as in the trunk's `_attention_block`: the raw key stored
+        # before anything normalizes or rotates it, the query's own norm and rotation,
+        # then the compression of every group this step completes. Maintained on every
+        # draft step at both ends of the threshold, so the draft plane is complete when a
+        # request crosses it.
+        req_idx = md.qsa_req_idx_per_token[:rows]
+        logical = md.qsa_logical_positions[:rows]
+        block_table = md.qsa_block_table
+        tokens_per_block = md.tokens_per_block
+        index_cache = draft.index_cache
+        qk_index = cublas_mm(mixed, M.idx)
+        token_k = torch.split(
+            torch.reshape(qk_index, [rows, core.index_heads + core.index_kv_heads, -1]),
+            [core.index_heads, core.index_kv_heads],
+            1,
+        )[1]
+        qsa_paged_index_store(
+            token_k,
+            coords,
+            index_cache,
+            draft.position_cache,
+            req_idx,
+            logical,
+            block_table,
+            tokens_per_block,
         )
+        index_scratch = torch.empty([rows, core.index_scratch_width], dtype=dt, device=dev)
+        index_scratch[:, : core.index_width].copy_(qk_index)
+        fused_qk_norm_rope(
+            index_scratch,
+            num_heads_q=core.index_heads,
+            num_heads_k=core.index_kv_heads,
+            num_heads_v=core.index_kv_heads,
+            head_dim=core.index_head_dim,
+            rotary_dim=core.rotary_dim,
+            eps=core.eps,
+            q_weight=M.idx_qn,
+            k_weight=M.idx_kn,
+            base=core.mtp_theta,
+            is_neox=True,
+            position_ids=pos3 if _QSA_INDEX_USE_MROPE else pos,
+            is_qk_norm=True,
+            use_gemma=True,
+            use_mrope=_QSA_INDEX_USE_MROPE,
+            mrope_section1=(_QSA_MROPE_SECTION or (0, 0, 0))[1],
+            mrope_section2=(_QSA_MROPE_SECTION or (0, 0, 0))[2],
+        )
+        q_index = torch.split(
+            torch.reshape(
+                index_scratch,
+                [rows, core.index_heads + 2 * core.index_kv_heads, core.index_head_dim],
+            ),
+            [core.index_heads, core.index_kv_heads, core.index_kv_heads],
+            1,
+        )[0]
+        qsa_prefill_compress(
+            logical_positions=logical,
+            request_indices=req_idx,
+            block_table=block_table,
+            index_cache=index_cache,
+            position_cache=draft.position_cache,
+            k_norm_weight=M.idx_kn,
+            cos_sin=core._mtp_cos_sin,
+            eps=core.eps,
+            tokens_per_block=tokens_per_block,
+            compress_ratio=core.compress_ratio,
+            mrope_section=_QSA_MROPE_SECTION,
+        )
+
+        if sparse:
+            k_cache, v_cache = draft.kv
+            # The append the dense op would have owned, then selection over the draft
+            # layer's own compressed keys and the sparse GQA over its pool.
+            qsa_paged_kv_store(
+                k_dst, v_dst, k_cache, v_cache, req_idx, logical, block_table, tokens_per_block
+            )
+            scores = qsa_paged_index_scores(
+                q=q_index,
+                index_cache=index_cache,
+                block_table=block_table,
+                query_positions=logical,
+                request_indices=req_idx,
+                tokens_per_block=tokens_per_block,
+                compress_ratio=core.compress_ratio,
+                only_visible_blocks=True,
+                context_rows=True,
+            )
+            topk_indices = md.qsa_topk_indices[:rows]
+            visible_blocks = md.qsa_visible_blocks[:rows]
+            qsa_topk_select(
+                scores,
+                md.qsa_topk_row_starts[:rows],
+                visible_blocks,
+                topk_indices,
+                index_topk=core.block_topk,
+            )
+            _sort_selection(topk_indices)
+            if share:
+                self._capture_selection(md, topk_indices, visible_blocks)
+            selected = qsa_expand_block_indices(
+                topk_indices,
+                logical,
+                md.qsa_sequence_lengths[:rows],
+                compress_ratio=core.compress_ratio,
+                token_topk=core.token_topk,
+            )
+            attn_out = torch.reshape(
+                qsa_paged_sparse_gqa(
+                    q=q_dst,
+                    k_cache=k_cache,
+                    v_cache=v_cache,
+                    block_table=block_table,
+                    selected_tokens=selected,
+                    request_indices=req_idx,
+                    tokens_per_block=tokens_per_block,
+                    softmax_scale=core.softmax_scale,
+                    query_positions=logical,
+                    compress_ratio=core.compress_ratio,
+                ),
+                [rows, core.q_width],
+            )
+        else:
+            attn_out = thop_attention(
+                q=qkv,
+                output=attn_out,
+                local_layer_idx=layer_idx,
+                predicted_tokens_per_seq=p,
+                num_heads=core.heads_q,
+                num_kv_heads=core.heads_kv,
+                head_size=core.head_dim,
+                quant_mode=core.quant_mode,
+                **step,
+                **_CALL_CONSTANTS,
+            )
         fused_sigmoid_mul_inplace(attn_out, gate)
         x = qwen4_exp_post_inject(x, cublas_mm(attn_out, M.o), inject)
 
@@ -2983,7 +3546,7 @@ class DecodeTarget:
         gate_logits = cublas_mm(x, L.sh_gate)
         return fused_sigmoid_gate_mul_add(routed, gate_logits, shared)
 
-    def _attention_block(self, x, i, L, qkv, index_scratch, attn_out, qsa, step):
+    def _attention_block(self, x, i, L, qkv, index_scratch, attn_out, qsa, step, stage):
         """One gated GQA layer plus its QSA index branch for a generation-only batch;
         see `PrefillTarget._attention_block`."""
         core = self.core
@@ -3050,6 +3613,8 @@ class DecodeTarget:
             [core.index_heads, core.index_kv_heads],
             1,
         )[1]
+        if stage:
+            core.spec_rollback.stage_index(index_cache, core._bound.position_cache)
         qsa_paged_index_store(
             token_k,
             coords,
@@ -3126,6 +3691,7 @@ class DecodeTarget:
             qsa_topk_select(
                 scores, topk_row_starts, visible_blocks, topk_indices, index_topk=core.block_topk
             )
+            _sort_selection(topk_indices)
             selected = qsa_expand_block_indices(
                 topk_indices,
                 logical,
@@ -3164,7 +3730,9 @@ class DecodeTarget:
         fused_sigmoid_mul_inplace(out, gate)
         return cublas_mm(out, L.o)
 
-    def _gdn_verify(self, mq_d, a_d, b_d, ssm_states, i, L, si_d, int_idx, n, p) -> torch.Tensor:
+    def _gdn_verify(
+        self, mq_d, a_d, b_d, ssm_states, i, L, si_d, int_idx, n, p, replay
+    ) -> torch.Tensor:
         """Recurrent half of a speculative verify step; see
         `PrefillTarget._gdn_verify`."""
         core = self.core
@@ -3186,6 +3754,11 @@ class DecodeTarget:
         )
         # Back to token-major (a view).
         mq_out = torch.reshape(torch.transpose(conv_out, 1, 2), [n * p, core.conv_dim])
+        if replay is not None:
+            # The conv rows themselves, contiguous: the q/k/v views are never read.
+            return _replay_verify(
+                core, mq_out, a_d, b_d, ssm_states, i, L, si_d, n, p, replay, mq_out
+            )
         q, k, v = pack_gdn_decode_qkv(
             mq_out, core.num_k_heads, core.head_k_dim, core.num_v_heads, core.head_v_dim
         )
@@ -3229,7 +3802,7 @@ class DecodeTarget:
         """One Gated-DeltaNet layer over a generation-only batch: one token per
         sequence, or under speculation the whole draft chain via the verify path."""
         core = self.core
-        si_all, qsl_long, is_verify, num_decodes, gen_p, int_idx = gdn_state
+        si_all, qsl_long, is_verify, num_decodes, gen_p, int_idx, replay = gdn_state
         num_tokens = x.shape[0]
 
         mixed_qkv = cublas_mm(x, L.in_qkv)
@@ -3240,7 +3813,7 @@ class DecodeTarget:
         ssm_states = core._bound.ssm[i]
         if is_verify:
             out = self._gdn_verify(
-                mixed_qkv, a, b, ssm_states, i, L, si_all, int_idx, num_decodes, gen_p
+                mixed_qkv, a, b, ssm_states, i, L, si_all, int_idx, num_decodes, gen_p, replay
             )
         else:
             causal_conv1d_update(
@@ -3288,12 +3861,14 @@ class DecodeTarget:
         )
         return cublas_mm(torch.reshape(o, [num_tokens, core.value_dim]), L.out)
 
-    def _ple_block(self, hc, input_ids, ple_state) -> torch.Tensor:
+    def _ple_block(self, hc, input_ids, ple_state, stage) -> torch.Tensor:
         """The n-gram side path on one decoder layer; see `PrefillTarget._ple_block`."""
         core = self.core
         S = self._stack
         conv_states, ngram_pool, si_all, carry_all, qsl = ple_state
 
+        if stage:
+            core.spec_rollback.stage_ple_pools(ngram_pool, conv_states)
         window = ngram_token_history(
             input_ids, ngram_pool, si_all, carry_all, qsl, core.eos_token_id, core.ngram_size
         )
@@ -3319,9 +3894,12 @@ class DecodeTarget:
         gated = gated_ngram_injection(
             key_normed, query_normed, value, core.hc_count, _PLE_CLAMP_MIN
         )
+        conv_in = self._grouped_norm(gated, S.ple_nc)
+        if stage:
+            core.spec_rollback.stage_ple_rows(window, conv_in)
         # The short conv reads channel-major; a bare transpose is the certified form.
         convolved = dilated_short_conv_paged(
-            x=torch.transpose(self._grouped_norm(gated, S.ple_nc), 0, 1),
+            x=torch.transpose(conv_in, 0, 1),
             weight=S.ple_conv_w,
             bias=None,
             conv_states=conv_states,
@@ -3417,17 +3995,29 @@ class DecodeTarget:
                 f"predicted_tokens_per_seq {gen_p} is outside the 1..4 range "
                 f"attention/thop_attention certifies"
             )
+            # Under the cached replay only the manager's step width is servable (see
+            # PrefillTarget.forward).
+            replay_state = core._bound.replay
+            assert replay_state is None or gen_p == replay_state.width, (
+                f"the batch carries {gen_p} query rows per generation sequence and the GDN "
+                f"cached replay runs at step width {replay_state.width}; a runtime_draft_len "
+                f"of {gen_p - 1} (a draft-length schedule, or skipped drafting) cannot run "
+                "under it. Export TRTLLM_USE_GDN_REPLAY=0 for variable draft lengths"
+            )
         is_verify = spec_metadata is not None and batch > 0 and gen_p > 1
         step["predicted_tokens_per_seq"] = gen_p
 
         si_all = mm.state_indices[:batch]
         qsl_long = mm.query_start_loc_long
         int_idx = None
+        replay = None
         if is_verify:
             # The runtime's arange over the slot pool (what `update_mamba_states` reads).
             assert core._bound.int_idx is not None, "the cache-manager bind has not run"
             int_idx = core._bound.int_idx[:batch]
-        gdn_state = (si_all, qsl_long, is_verify, batch, gen_p, int_idx)
+            if core._bound.replay is not None:
+                replay = _replay_work(core, mm, batch)
+        gdn_state = (si_all, qsl_long, is_verify, batch, gen_p, int_idx, replay)
 
         # Every generation sequence carries its n-gram history; the engine's
         # `has_initial_states` covers the context prefix only (empty here).
@@ -3461,6 +4051,26 @@ class DecodeTarget:
             sparse,
         )
 
+        # Staging for the speculative rollback, as on the prefill target (see
+        # PrefillTarget.forward); every row here is a generation row.
+        stage = is_verify
+        rollback = core.spec_rollback
+        if rollback is not None:
+            rollback.discard()
+        if stage:
+            rollback.begin(
+                num_contexts=0,
+                prefix_tokens=0,
+                num_gens=batch,
+                rows_per_gen=gen_p,
+                slots=si_all,
+                input_ids=input_ids,
+                request_indices=md.qsa_req_idx_per_token[:num_tokens],
+                logical_positions=md.qsa_logical_positions[:num_tokens],
+                block_table=md.qsa_block_table,
+                tokens_per_block=md.tokens_per_block,
+            )
+
         # Scratch shared by all attention layers (each fully rewrites them).
         qkv = torch.empty([num_tokens, core.qkv_width], dtype=dt, device=dev)
         index_scratch = torch.empty([num_tokens, core.index_scratch_width], dtype=dt, device=dev)
@@ -3478,13 +4088,13 @@ class DecodeTarget:
         hc = torch.cat([h] * hc_count, -1)
         for i, L in enumerate(self._layers):
             if i == core.ple_layer:
-                hc = torch.add(hc, self._ple_block(hc, input_ids, ple_state))
+                hc = torch.add(hc, self._ple_block(hc, input_ids, ple_state, stage))
             mixed, inject = qwen4_exp_gated_residual(
                 self._grouped_norm(hc, L.ahc_norm), L.ahc_down, L.ahc_up, L.ahc_inject, hc_count
             )
             if core.is_attn[i]:
                 block_out = self._attention_block(
-                    mixed, i, L, qkv, index_scratch, attn_out, qsa, step
+                    mixed, i, L, qkv, index_scratch, attn_out, qsa, step, stage
                 )
             else:
                 block_out = self._gdn_block(mixed, i, L, gdn_state)
@@ -3540,6 +4150,26 @@ class DecodeTarget:
         shared = cublas_mm(flashinfer_silu_and_mul(cublas_mm(x, M.sh_gu)), M.sh_dn)
         gate_logits = cublas_mm(x, M.sh_gate)
         return fused_sigmoid_gate_mul_add(routed, gate_logits, shared)
+
+    def _capture_selection(self, md, topk_indices, visible_blocks, batch, p) -> None:
+        """IndexShare: stash, per request, the selection of its last accepted draft-extend
+        row with that row's complete-group count, in the draft layer's row of the shared
+        buffers. Every request carries `p` rows here, and the worker continues the draft
+        loop from row `num_accepted - 1` of each (the golden token counts as accepted)."""
+        assert md.qsa_mtp_num_accepted is not None, (
+            "IndexShare needs the worker's accepted counts to pick each request's capture "
+            "row; the draft loop did not supply them"
+        )
+        accepted = md.qsa_mtp_num_accepted[:batch].to(torch.int64)
+        rows = torch.arange(batch, dtype=torch.int64, device=topk_indices.device) * p
+        rows = rows + torch.clamp(accepted - 1, min=0, max=p - 1)
+        slot = self.core._draft_bound.share_slot
+        md.qsa_shared_topk_indices[slot, :batch].copy_(torch.index_select(topk_indices, 0, rows))
+        md.qsa_shared_topk_visible_blocks[slot, :batch].copy_(
+            torch.index_select(visible_blocks, 0, rows)
+        )
+        # Host-side readiness; see PrefillTarget._capture_selection.
+        md.qsa_shared_topk_captured_slots.add(slot)
 
     def mtp_forward(
         self,
@@ -3607,6 +4237,44 @@ class DecodeTarget:
             "window is not implemented here"
         )
 
+        # The draft layer's QSA planes and the page table that addresses them. With a
+        # separate draft manager the engine's QSA metadata swaps `qsa_block_table` for the
+        # table it decodes from the draft manager's offsets (`prepare_for_draft_forward`);
+        # a table still decoding the trunk's offsets would read and write another pool's
+        # pages.
+        draft = core._draft_bound
+        if draft is None or cm is not draft.cm:
+            core._bind_draft_cache_manager(md)
+            draft = core._draft_bound
+        assert cm is core._bound.cm or md.qsa_block_table is getattr(
+            md, "qsa_draft_block_table", None
+        ), (
+            "the draft step is bound to a separate draft KV cache manager but "
+            "qsa_block_table is not that manager's table: the engine's QSA metadata did "
+            "not swap its page table for the draft forward"
+        )
+        # The `qsa_*` row mapping is sized from the metadata's token count, which the
+        # worker rewrites together with it between draft steps.
+        assert rows == md.num_tokens, (
+            f"the draft step carries {rows} rows for a batch its metadata describes as "
+            f"{md.num_tokens} tokens; the QSA row mapping covers the second"
+        )
+        # The trunk's dense/sparse decision from the same host buffer: the worker advances
+        # only the device KV lengths through the draft loop, so every draft step of one
+        # engine forward takes the branch its trunk took, in the CUDA-graph family the
+        # runner chose for that trunk.
+        sparse = gen_seqs > 0 and int(md.kv_lens_runtime[:gen_seqs].max()) > core.dense_threshold
+        # IndexShare: the loop's draft-extend step (`p` rows per request) runs the indexer
+        # and, with sharing on, captures each request's selection; every draft decode step
+        # after it (one row per request) reuses that capture instead of running the indexer.
+        share = core.mtp_index_share and md.qsa_in_mtp_draft_loop
+        reuse = share and md.qsa_indexer_skip_topk
+        assert not share or reuse == (p == 1), (
+            f"the worker's reuse flag ({md.qsa_indexer_skip_topk}) disagrees with the "
+            f"step's shape ({p} rows per request): only the draft decode steps after the "
+            "draft-extend step reuse its selection"
+        )
+
         # Copy into a fresh contiguous `[3, N]`: a sliced view keeps the source row
         # stride and the op rejects it under `use_mrope`.
         assert position_ids.shape[0] == _QSA_POSITION_AXES, (
@@ -3619,6 +4287,10 @@ class DecodeTarget:
             device=position_ids.device,
         )
         pos3.copy_(torch.reshape(position_ids, [_QSA_POSITION_AXES, -1]))
+        # The trunk's two other views, from the copy: `pos` (coordinate 0 alone, which the
+        # index rope reads) and `coords` (the `[N, 3]` transpose the position plane stores).
+        pos = torch.reshape(torch.split(pos3, [1, _QSA_POSITION_AXES - 1], 0)[0], [-1])
+        coords = torch.transpose(pos3, 0, 1)
 
         # ---- the front end --------------------------------------------------
         e = nn.functional.embedding(input_ids, embed_tokens)
@@ -3677,19 +4349,158 @@ class DecodeTarget:
             mrope_section1=core.mrope_section1,
             mrope_section2=core.mrope_section2,
         )
-        # Dense attention; see `MTPLayer` for why the module's QSA indexer is unused.
-        attn_out = thop_attention(
-            q=qkv,
-            output=attn_out,
-            local_layer_idx=layer_idx,
-            predicted_tokens_per_seq=p,
-            num_heads=core.heads_q,
-            num_kv_heads=core.heads_kv,
-            head_size=core.head_dim,
-            quant_mode=core.quant_mode,
-            **step,
-            **_CALL_CONSTANTS,
-        )
+        req_idx = md.qsa_req_idx_per_token[:rows]
+        logical = md.qsa_logical_positions[:rows]
+        block_table = md.qsa_block_table
+        tokens_per_block = md.tokens_per_block
+        index_cache = draft.index_cache
+        # The QSA index branch, as in the trunk's `_attention_block` (see the prefill
+        # target's draft step). Under IndexShare a draft decode step runs none of it: what
+        # it would write (its row's raw key and coordinates, and the anchor of a group that
+        # row completes) sits at or past the newly committed length, and nothing reads it
+        # before the next engine step's draft-extend rewrites those positions, storing
+        # before it compresses and compressing before it scores.
+        if not reuse:
+            qk_index = cublas_mm(mixed, M.idx)
+            token_k = torch.split(
+                torch.reshape(qk_index, [rows, core.index_heads + core.index_kv_heads, -1]),
+                [core.index_heads, core.index_kv_heads],
+                1,
+            )[1]
+            qsa_paged_index_store(
+                token_k,
+                coords,
+                index_cache,
+                draft.position_cache,
+                req_idx,
+                logical,
+                block_table,
+                tokens_per_block,
+            )
+            index_scratch = torch.empty([rows, core.index_scratch_width], dtype=dt, device=dev)
+            index_scratch[:, : core.index_width].copy_(qk_index)
+            fused_qk_norm_rope(
+                index_scratch,
+                num_heads_q=core.index_heads,
+                num_heads_k=core.index_kv_heads,
+                num_heads_v=core.index_kv_heads,
+                head_dim=core.index_head_dim,
+                rotary_dim=core.rotary_dim,
+                eps=core.eps,
+                q_weight=M.idx_qn,
+                k_weight=M.idx_kn,
+                base=core.mtp_theta,
+                is_neox=True,
+                position_ids=pos3 if _QSA_INDEX_USE_MROPE else pos,
+                is_qk_norm=True,
+                use_gemma=True,
+                use_mrope=_QSA_INDEX_USE_MROPE,
+                mrope_section1=(_QSA_MROPE_SECTION or (0, 0, 0))[1],
+                mrope_section2=(_QSA_MROPE_SECTION or (0, 0, 0))[2],
+            )
+            q_index = torch.split(
+                torch.reshape(
+                    index_scratch,
+                    [rows, core.index_heads + 2 * core.index_kv_heads, core.index_head_dim],
+                ),
+                [core.index_heads, core.index_kv_heads, core.index_kv_heads],
+                1,
+            )[0]
+            qsa_prefill_compress(
+                logical_positions=logical,
+                request_indices=req_idx,
+                block_table=block_table,
+                index_cache=index_cache,
+                position_cache=draft.position_cache,
+                k_norm_weight=M.idx_kn,
+                cos_sin=core._mtp_cos_sin,
+                eps=core.eps,
+                tokens_per_block=tokens_per_block,
+                compress_ratio=core.compress_ratio,
+                mrope_section=_QSA_MROPE_SECTION,
+            )
+
+        if sparse:
+            k_cache, v_cache = draft.kv
+            qsa_paged_kv_store(
+                k_dst, v_dst, k_cache, v_cache, req_idx, logical, block_table, tokens_per_block
+            )
+            topk_indices = md.qsa_topk_indices[:rows]
+            visible_blocks = md.qsa_visible_blocks[:rows]
+            if reuse:
+                # The capture this loop's draft-extend step made, with the groups completed
+                # since appended; the expansion then adds the incomplete tail, so the
+                # positions drafted since the capture stay visible.
+                slot = draft.share_slot
+                assert slot in md.qsa_shared_topk_captured_slots, (
+                    "a draft decode step would reuse a selection that no draft-extend step "
+                    "of this loop captured"
+                )
+                qsa_mtp_reuse_topk(
+                    shared_indices=md.qsa_shared_topk_indices[slot],
+                    shared_visible_blocks=md.qsa_shared_topk_visible_blocks[slot],
+                    request_indices=req_idx,
+                    visible_blocks=visible_blocks,
+                    output=topk_indices,
+                )
+            else:
+                scores = qsa_paged_index_scores(
+                    q=q_index,
+                    index_cache=index_cache,
+                    block_table=block_table,
+                    query_positions=logical,
+                    request_indices=req_idx,
+                    tokens_per_block=tokens_per_block,
+                    compress_ratio=core.compress_ratio,
+                    only_visible_blocks=True,
+                    context_rows=False,
+                )
+                qsa_topk_select(
+                    scores,
+                    md.qsa_topk_row_starts[:rows],
+                    visible_blocks,
+                    topk_indices,
+                    index_topk=core.block_topk,
+                )
+                _sort_selection(topk_indices)
+                if share:
+                    self._capture_selection(md, topk_indices, visible_blocks, gen_seqs, p)
+            selected = qsa_expand_block_indices(
+                topk_indices,
+                logical,
+                md.qsa_sequence_lengths[:rows],
+                compress_ratio=core.compress_ratio,
+                token_topk=core.token_topk,
+            )
+            attn_out = torch.reshape(
+                qsa_paged_sparse_gqa(
+                    q=q_dst,
+                    k_cache=k_cache,
+                    v_cache=v_cache,
+                    block_table=block_table,
+                    selected_tokens=selected,
+                    request_indices=req_idx,
+                    tokens_per_block=tokens_per_block,
+                    softmax_scale=core.softmax_scale,
+                    # The prefill pair bounds a context row's scan; none here.
+                    query_positions=None,
+                    compress_ratio=None,
+                ),
+                [rows, core.q_width],
+            )
+        else:
+            attn_out = thop_attention(
+                q=qkv,
+                output=attn_out,
+                local_layer_idx=layer_idx,
+                predicted_tokens_per_seq=p,
+                num_heads=core.heads_q,
+                num_kv_heads=core.heads_kv,
+                head_size=core.head_dim,
+                quant_mode=core.quant_mode,
+                **step,
+                **_CALL_CONSTANTS,
+            )
         fused_sigmoid_mul_inplace(attn_out, gate)
         x = qwen4_exp_post_inject(x, cublas_mm(attn_out, M.o), inject)
 
@@ -3892,12 +4703,25 @@ class MTPLayer:
     The MoE is FP8 128x128 weight blocks (the trunk's is NVFP4); re-quantizing it
     would change the checkpoint's meaning, visible only as lower acceptance.
 
-    Attention is dense, the one deliberate departure from the checkpoint (its QSA
-    indexer stays unloaded): with a separate draft KV manager the worker swaps
-    `attn_metadata.kv_cache_manager`, `QSAAttentionMetadata` implements no
-    `prepare_for_draft_forward`, so `qsa_block_table` would decode the target
-    manager's page offsets against the draft pool. Below `dense_seq_len_threshold`
-    dense is bit-for-bit the trunk's.
+    Attention is the trunk's QSA layer over the module's own indexer. Every draft step
+    maintains the layer's index plane, then runs the dense core while the trunk's host KV
+    lengths stay within `dense_seq_len_threshold`, and selection plus sparse GQA above it.
+    With a separate draft KV manager the layer's K/V, index and position pages live in
+    that manager's pools: the worker swaps `attn_metadata.kv_cache_manager` and the block
+    offsets for the draft loop, `QSAAttentionMetadata.prepare_for_draft_forward` swaps
+    `qsa_block_table` to the table it decodes from the draft manager's offsets, and the
+    core binds the draft manager's planes once per manager (`_DraftBound`). The planes need
+    no rollback: each engine step's first draft call rewrites every position from the
+    newly committed length on.
+
+    IndexShare (`sparse_attention_config.index_share_for_mtp_iteration`) runs the draft
+    indexer once per MTP iteration instead of once per draft step. The draft-extend step,
+    the loop's first, runs it and captures per request the selection of the row the loop
+    continues from, into the metadata's shared buffers; every draft decode step after it
+    skips the index branch and rebuilds its selection from that capture with
+    `qsa_mtp_reuse_topk`, which appends the groups completed since. The expansion adds
+    the incomplete tail, so the tokens drafted since the capture stay visible. Every
+    selection is sorted first (padding last), so the reuse keeps the order.
 
     Not an `nn.Module`: the weights live in the core's `ParameterDict`, and a second
     registration would break the weight load's both-directions coverage assert."""
@@ -3967,6 +4791,163 @@ class DraftModel:
     @property
     def embed_tokens(self) -> torch.Tensor:
         return self.core.w["embed"]
+
+
+class SpeculativeRollback:
+    """The target's auxiliary speculative-state handler: it undoes what a verify step's
+    rejected draft rows wrote into the four side-cache planes the runtime's own state
+    promotion does not cover.
+
+    A verify step runs `p = runtime_draft_len + 1` rows per generation request through the
+    trunk, and four ops write per-request state for every row without knowing how many the
+    sampler keeps: the PLE n-gram id history (`ops/ple/ngram_token_history`), the PLE
+    dilated-conv state (`ops/ssm/dilated_short_conv_paged`), each attention layer's QSA
+    index-K plane (`qsa_paged_index_store`, `qsa_prefill_compress`) and the shared QSA
+    position plane. The Gated-DeltaNet state is not here: the runtime promotes it.
+
+    For a generation request that accepted `a` rows (golden token included, so
+    `1 <= a <= p`) the commit rewrites:
+
+    * the n-gram pool row to the id window of row `a - 1` minus its oldest id;
+    * the conv pool row to columns `[a, a + state_len)` of `[pre-step state | conv input
+      of the request's p rows]`;
+    * every index-K and position slot written by a row of ordinal `>= a` to its
+      pre-verify contents.
+
+    The targets stage during the forward (`begin`, then `stage_ple_pools` /
+    `stage_ple_rows` in the PLE block and `stage_index` before each attention layer's
+    store) and the spec worker calls `commit_speculative_states` after its draft loop,
+    inside the same model forward. Context rows and non-verify steps stage nothing, and a
+    commit with nothing staged returns. Staging and commit use metadata-sized
+    allocations, gathers, `torch.where` and indexed writes only, and everything staged is
+    allocated by the forward and consumed by that forward's commit, so a captured graph
+    holds both ends and replay re-reads the engine's buffers in place."""
+
+    def __init__(self) -> None:
+        self._pending: dict | None = None
+
+    # ------------------------------------------------------------- staging ---
+
+    def discard(self) -> None:
+        """Drop whatever an earlier forward staged."""
+        self._pending = None
+
+    def begin(
+        self,
+        *,
+        num_contexts: int,
+        prefix_tokens: int,
+        num_gens: int,
+        rows_per_gen: int,
+        slots: torch.Tensor,
+        input_ids: torch.Tensor,
+        request_indices: torch.Tensor,
+        logical_positions: torch.Tensor,
+        block_table: torch.Tensor,
+        tokens_per_block: int,
+    ) -> None:
+        """Open a verify step's staging. The generation rows follow the `prefix_tokens`
+        context rows as `num_gens` runs of `rows_per_gen`, so row `s * p + t` is ordinal `t`
+        of generation request `s`. `slots` are those requests' recurrent slots;
+        `input_ids`, `request_indices` and `logical_positions` are the generation rows'
+        own. Each row's QSA slot is resolved here, as `qsa_paged_index_store` resolves it."""
+        n, p = num_gens, rows_per_gen
+        assert n > 0 and p > 1, (
+            f"a verify step stages generation requests carrying drafts; got {n} "
+            f"requests of {p} rows"
+        )
+        assert input_ids.shape[0] == n * p and logical_positions.shape[0] == n * p, (
+            f"{n} generation requests of {p} rows are {n * p} rows; got "
+            f"{input_ids.shape[0]} ids and {logical_positions.shape[0]} positions"
+        )
+        positions = logical_positions.to(torch.long)
+        pages = block_table[request_indices.to(torch.long), positions // tokens_per_block]
+        self._pending = dict(
+            num_contexts=num_contexts,
+            prefix=prefix_tokens,
+            n=n,
+            p=p,
+            slots=slots.to(torch.long),
+            pages=pages.to(torch.long),
+            within=positions % tokens_per_block,
+            index=[],
+            position=None,
+        )
+
+    def stage_ple_pools(self, ngram_pool: torch.Tensor, conv_pool: torch.Tensor) -> None:
+        """Before the PLE block's first write: both pools, and the generation slots'
+        pre-step conv rows."""
+        pending = self._pending
+        slots = pending["slots"]
+        pending["ngram_pool"] = ngram_pool
+        pending["conv_pool"] = conv_pool
+        pending["conv_prev"] = conv_pool[slots]
+
+    def stage_ple_rows(self, window: torch.Tensor, conv_input: torch.Tensor) -> None:
+        """After the id history and before the conv: the generation rows' id windows
+        (`[T, ngram_size]`, newest id last) and conv input (`[T, C]`, token-major). Copied
+        rather than viewed, so a long context prefix in a mixed batch is not kept alive
+        through the draft loop."""
+        pending = self._pending
+        prefix, n, p = pending["prefix"], pending["n"], pending["p"]
+        # Row t of the window without its oldest id is the history after token t.
+        pending["ngram_candidates"] = torch.reshape(window[prefix:, 1:], [n, p, -1]).clone()
+        pending["conv_x"] = torch.reshape(conv_input[prefix:], [n, p, -1]).clone()
+
+    def stage_index(self, index_cache: torch.Tensor, position_cache: torch.Tensor) -> None:
+        """Before an attention layer's index store: the generation rows' slots of its
+        index-K plane, and, on the step's first attention layer (the first to write the
+        shared plane), of the position plane."""
+        pending = self._pending
+        pages, within = pending["pages"], pending["within"]
+        if pending["position"] is None:
+            pending["position"] = (position_cache, position_cache[pages, within])
+        pending["index"].append((index_cache, index_cache[pages, within]))
+
+    # -------------------------------------------------------------- commit ---
+
+    def commit_speculative_states(
+        self,
+        num_accepted_tokens: torch.Tensor,
+        state_indices: torch.Tensor,
+        num_contexts: int,
+    ) -> None:
+        """Rewrite the staged planes to the accepted prefix. Called by the spec worker."""
+        pending, self._pending = self._pending, None
+        if pending is None:
+            return
+        n, p = pending["n"], pending["p"]
+        assert num_contexts == pending["num_contexts"], (
+            f"the worker commits with {num_contexts} context requests and the "
+            f"forward staged {pending['num_contexts']}"
+        )
+        assert state_indices.shape[0] == num_contexts + n, (
+            f"the worker hands {state_indices.shape[0]} slots for a batch the "
+            f"forward staged as {num_contexts} + {n} requests"
+        )
+        assert pending.get("conv_x") is not None and len(pending["index"]) > 0, (
+            "a verify step staged neither its PLE rows nor any attention layer; "
+            "the forward did not run the staging it opened"
+        )
+        accepted = num_accepted_tokens[num_contexts : num_contexts + n].to(torch.long)
+        slots = state_indices[num_contexts:].to(torch.long)
+        rows = torch.arange(n, device=accepted.device)
+        ngram_pool, conv_pool = pending["ngram_pool"], pending["conv_pool"]
+        state_len = conv_pool.shape[-1]
+        ngram_pool[slots] = pending["ngram_candidates"][rows, accepted - 1]
+        # [n, C, state_len + p]; window k of the unfold is the state after k tokens.
+        history = torch.cat([pending["conv_prev"], torch.transpose(pending["conv_x"], 1, 2)], 2)
+        conv_pool[slots] = history.unfold(2, state_len, 1)[rows, :, accepted]
+
+        # [n * p]: True at every ordinal the sampler rejected.
+        rejected = torch.reshape(
+            torch.arange(p, device=accepted.device).unsqueeze(0) >= accepted.unsqueeze(1), [-1]
+        )
+        pages, within = pending["pages"], pending["within"]
+        for cache, old in pending["index"]:
+            cache[pages, within] = torch.where(rejected[:, None, None], old, cache[pages, within])
+        cache, old = pending["position"]
+        cache[pages, within] = torch.where(rejected[:, None], old, cache[pages, within])
 
 
 class ModelingV2Qwen38FlashNextNvfp4Sm103Tp1(
@@ -4055,6 +5036,10 @@ class ModelingV2Qwen38FlashNextNvfp4Sm103Tp1(
             )
             # Caches the draft->target vocab offset map (correctly None here).
             self.spec_worker.set_draft_model(self.draft_model)
+            # The PLE pools and the QSA side caches are written per verify row and nothing
+            # the runtime owns rolls them back; the worker calls this handler after its
+            # draft loop, inside the same forward.
+            self.spec_worker.register_auxiliary_state_handler(self.model.spec_rollback)
 
     # ----------------------------------------------------------- multimodal ---
     # Names the executor reads off a model class by `getattr`; each is silently

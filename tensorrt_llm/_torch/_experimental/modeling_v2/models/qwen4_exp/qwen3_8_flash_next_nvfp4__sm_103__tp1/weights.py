@@ -26,9 +26,9 @@ same either way. Offloading frees ~47.7 GiB, which the KV cache manager turns in
 more slots; several entries certify at most 461 slots, so raising
 `kv_cache_fraction` with the offload on needs those cells re-checked.
 
-Not loaded: `mtp.*` when there is no `speculative_config`, and
-`mtp.layers.0.self_attn.indexer.*` always (the draft layer runs dense attention).
-MTP experts are plain row-major FP8 128x128: `[up ; gate]` concat, bf16
+Not loaded: `mtp.*` when there is no `speculative_config`. With one, the whole MTP module
+is loaded, including the draft layer's own QSA indexer (`_index_branch`). MTP experts are
+plain row-major FP8 128x128: `[up ; gate]` concat, bf16
 `weight_scale_inv` cast to fp32. `lm_head` is the shell's parameter.
 
 `load(model, weights)` fills every declared parameter once and asserts coverage
@@ -178,15 +178,6 @@ _LM = "model.language_model"
 _VISUAL = "model.visual"
 _MTP = "mtp"
 _MTP_LAYER = "mtp.layers.0"
-
-# The three tensors of the draft layer that are never loaded, with their reason
-# in the module docstring: its own QSA index projection and the two per-head
-# norms that go with it. The draft layer runs dense attention.
-_MTP_NOT_LOADED = (
-    f"{_MTP_LAYER}.self_attn.indexer.index_qk_proj.weight",
-    f"{_MTP_LAYER}.self_attn.indexer.q_layernorm.weight",
-    f"{_MTP_LAYER}.self_attn.indexer.k_layernorm.weight",
-)
 
 # NVFP4 block size: one e4m3 scale per 16 contiguous elements along K.
 SF_VEC = 16
@@ -499,6 +490,31 @@ def _gated_attention(tag, src, layers):
     )
 
 
+def _index_branch(tag, src, layers):
+    """The QSA index branch's three weights: one replicated, unquantized projection
+    producing `[index_heads q | 1 k]`, and two per-head gemma norms."""
+    return (
+        W(
+            f"{tag}idx_w",
+            shape=lambda d: (d.index_width, d.hidden),
+            src=src("index_qk_proj.weight"),
+            layers=layers,
+        ),
+        W(
+            f"{tag}idx_qn",
+            shape=lambda d: (d.index_head_dim,),
+            src=src("q_layernorm.weight"),
+            layers=layers,
+        ),
+        W(
+            f"{tag}idx_kn",
+            shape=lambda d: (d.index_head_dim,),
+            src=src("k_layernorm.weight"),
+            layers=layers,
+        ),
+    )
+
+
 def _shared_expert(tag, prefix, layers):
     """The bf16 shared expert beside the routed ones, and its per-token gate."""
     return (
@@ -555,26 +571,7 @@ class Qwen4ExpTp1Weights:
         ),
         # --- the gated GQA layers and their QSA index branch ---
         *_gated_attention("", lambda s: f"{{p}}.self_attn.{s}", _attn_layers),
-        # One replicated, unquantized projection producing [index_heads q | 1 k], and
-        # two per-head gemma norms.
-        W(
-            "idx_w",
-            shape=lambda d: (d.index_width, d.hidden),
-            src="{p}.self_attn.indexer.index_qk_proj.weight",
-            layers=_attn_layers,
-        ),
-        W(
-            "idx_qn",
-            shape=lambda d: (d.index_head_dim,),
-            src="{p}.self_attn.indexer.q_layernorm.weight",
-            layers=_attn_layers,
-        ),
-        W(
-            "idx_kn",
-            shape=lambda d: (d.index_head_dim,),
-            src="{p}.self_attn.indexer.k_layernorm.weight",
-            layers=_attn_layers,
-        ),
+        *_index_branch("", lambda s: f"{{p}}.self_attn.indexer.{s}", _attn_layers),
         # --- the Gated-DeltaNet layers ---
         W(
             "in_qkv_w",
@@ -898,6 +895,9 @@ class Qwen4ExpTp1Weights:
             )
         ),
         *_gated_attention("mtp_", lambda s: _mtp_key(f"{_MTP_LAYER}.self_attn.{s}"), _mtp_only),
+        *_index_branch(
+            "mtp_", lambda s: _mtp_key(f"{_MTP_LAYER}.self_attn.indexer.{s}"), _mtp_only
+        ),
         W(
             "mtp_router",
             shape=lambda d: (d.num_experts, d.hidden),
@@ -999,13 +999,10 @@ class Qwen4ExpTp1Weights:
         )
 
     def expected_unconsumed(self, core, weights) -> set:
-        """With MTP off, the whole `mtp.` subtree; with it on, exactly the three draft
-        indexer tensors. Named explicitly rather than by prefix so that a fourth unloaded
-        `mtp.*` key fails the coverage assert instead of hiding."""
+        """With MTP off, the whole `mtp.` subtree; with it on, nothing, so that any
+        unloaded `mtp.*` key fails the coverage assert instead of hiding."""
         if core.mtp_enabled:
-            for key in _MTP_NOT_LOADED:
-                assert key in weights, f"checkpoint key missing: {key}"
-            return set(_MTP_NOT_LOADED)
+            return set()
         return {k for k in weights if k.startswith(f"{_MTP}.")}
 
     def declare(self, d: SimpleNamespace) -> nn.ParameterDict:
@@ -1108,9 +1105,7 @@ class Qwen4ExpTp1Weights:
         torch.cuda.synchronize()
         leftover = set(weights.keys()) - consumed
         expected = self.expected_unconsumed(core, weights)
-        what = (
-            "the draft layer's three QSA indexer tensors" if core.mtp_enabled else "the MTP module"
-        )
+        what = "empty" if core.mtp_enabled else "the MTP module"
         assert leftover == expected, (
             f"checkpoint coverage: leftover keys are not exactly {what}; "
             f"unexpected {sorted(leftover - expected)[:8]}, "

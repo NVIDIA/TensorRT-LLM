@@ -37,6 +37,11 @@ from tensorrt_llm._torch.attention.backends.sparse.qsa.module import (
     select_qsa_paged_tokens,
     select_qsa_tokens,
 )
+from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
+from tensorrt_llm._torch.speculative.interface import (
+    prepare_attn_metadata_for_draft_replay,
+    restore_attn_metadata_after_draft_replay,
+)
 from tensorrt_llm.runtime.kv_cache_manager_v2 import PageIndexMode
 
 
@@ -1608,3 +1613,187 @@ def test_qsa_multi_token_generation_captures_speculative_cache_snapshot() -> Non
     assert pending["token_ordinals"].tolist() == [0, 1, 2, 3]
     torch.testing.assert_close(pending["index_values"], index_cache[pages, within])
     torch.testing.assert_close(pending["position_values"], position_cache[pages, within])
+
+
+class _QsaPageConverter:
+    def __init__(self, scale: int) -> None:
+        self.scale = scale
+        self.expansion = 1
+
+
+class _QsaPageImpl:
+    def __init__(self, scale: int) -> None:
+        self._scale = scale
+
+    def get_page_index_converter(self, layer_idx, role):
+        del layer_idx, role
+        return _QsaPageConverter(self._scale)
+
+
+def _qsa_layout_manager(
+    *, sparse_layer_ids, pool_id, scale, num_pools, max_blocks_per_seq
+) -> QSAMambaHybridCacheManagerV2:
+    """A V2 QSA manager reduced to the page layout the metadata reads."""
+    manager = object.__new__(QSAMambaHybridCacheManagerV2)
+    manager.qsa_sparse_layer_ids = list(sparse_layer_ids)
+    manager.layer_offsets = {layer: local for local, layer in enumerate(sparse_layer_ids)}
+    manager.qsa_position_layer_id = sparse_layer_ids[0]
+    manager.layer_to_pool_mapping_dict = {local: pool_id for local in range(len(sparse_layer_ids))}
+    manager.num_attention_op_pools = num_pools
+    manager.max_blocks_per_seq = max_blocks_per_seq
+    manager.impl = _QsaPageImpl(scale)
+    manager.host_kv_cache_block_offsets = torch.zeros(
+        (num_pools, 4, 2, max_blocks_per_seq), dtype=torch.int32
+    )
+    return manager
+
+
+# Target: two sparse layers in pool 1 at scale 6. Draft: one MTP layer in pool 0 at
+# scale 4, a narrower table, and slot numbers the target never uses.
+_TARGET_LAYOUT = dict(
+    sparse_layer_ids=[3, 7], pool_id=1, scale=6, num_pools=2, max_blocks_per_seq=8
+)
+_DRAFT_LAYOUT = dict(sparse_layer_ids=[48], pool_id=0, scale=4, num_pools=1, max_blocks_per_seq=4)
+
+
+def _qsa_metadata_with_draft(
+    monkeypatch, *, mtp_index_share: bool = False, draft_layout: dict | None = _DRAFT_LAYOUT
+):
+    """QSA metadata over a target manager and, unless `draft_layout` is None, a separate
+    draft manager."""
+    monkeypatch.setattr(TrtllmAttentionMetadata, "__post_init__", lambda self: None)
+    metadata = object.__new__(QSAAttentionMetadata)
+    metadata.kv_cache_manager = _qsa_layout_manager(**_TARGET_LAYOUT)
+    metadata.draft_kv_cache_manager = (
+        None if draft_layout is None else _qsa_layout_manager(**draft_layout)
+    )
+    metadata.sparse_metadata_params = QSASparseMetadataParams(
+        token_topk=8, compress_ratio=4, mtp_index_share=mtp_index_share
+    )
+    metadata.max_num_sequences = 4
+    metadata.max_num_tokens = 16
+    metadata.draft_replay_swapped_attrs = {}
+    metadata.__post_init__()
+    return metadata
+
+
+def _set_qsa_offsets(metadata, num_seqs: int, generation: int):
+    """Write fresh target and draft attention offsets; return the raw slots each
+    manager's table must decode to."""
+    slots = []
+    for layout, base in ((_TARGET_LAYOUT, 0), (_DRAFT_LAYOUT, 1000)):
+        width = layout["max_blocks_per_seq"]
+        table = torch.arange(num_seqs * width, dtype=torch.int32, device="cuda")
+        table = table.reshape(num_seqs, width) + base + 100 * generation
+        table[:, -1] = -1
+        # V2 offsets: the key role of the layer's pool holds slot * scale, unallocated
+        # entries stay -1, and every other pool and role is noise.
+        offsets = torch.full(
+            (layout["num_pools"], num_seqs, 2, width), 7777, dtype=torch.int32, device="cuda"
+        )
+        offsets[layout["pool_id"], :, 0, :] = torch.where(table < 0, table, table * layout["scale"])
+        slots.append(table)
+        if layout is _TARGET_LAYOUT:
+            metadata.kv_cache_block_offsets = offsets
+        else:
+            metadata.draft_kv_cache_block_offsets = offsets
+    return slots
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_qsa_draft_block_table_exists_only_for_a_separate_draft_manager(monkeypatch) -> None:
+    metadata = _qsa_metadata_with_draft(monkeypatch)
+
+    # Each table is sized, and its pool and page scale taken, from its own manager.
+    assert metadata.qsa_block_table.shape == (4, _TARGET_LAYOUT["max_blocks_per_seq"])
+    assert metadata.qsa_draft_block_table.shape == (4, _DRAFT_LAYOUT["max_blocks_per_seq"])
+    assert metadata.qsa_draft_block_table.data_ptr() != metadata.qsa_block_table.data_ptr()
+    assert (metadata._qsa_attention_pool_id, metadata._qsa_page_index_scale) == (1, 6)
+    assert (metadata._qsa_draft_attention_pool_id, metadata._qsa_draft_page_index_scale) == (0, 4)
+
+    target_only = _qsa_metadata_with_draft(monkeypatch, draft_layout=None)
+    assert target_only.qsa_draft_block_table is None
+    assert target_only.prepare_for_draft_forward() is None
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_qsa_shared_topk_slots_cover_the_draft_manager(monkeypatch) -> None:
+    """The shared selection buffers are addressed by whichever manager is bound."""
+    wide_draft = dict(_DRAFT_LAYOUT, sparse_layer_ids=[48, 49, 50])
+    metadata = _qsa_metadata_with_draft(monkeypatch, mtp_index_share=True, draft_layout=wide_draft)
+
+    assert metadata.qsa_shared_topk_indices.shape[0] == 3
+    assert metadata.qsa_shared_topk_visible_blocks.shape[0] == 3
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_qsa_draft_forward_addresses_the_draft_manager_pages(monkeypatch) -> None:
+    """prepare() decodes both tables; the draft swap makes `qsa_block_table` the draft one
+    and the restore puts the target's table, pool and scale back."""
+    num_seqs = 3
+    metadata = _qsa_metadata_with_draft(monkeypatch)
+    metadata._seq_lens = torch.ones(num_seqs, dtype=torch.int32)
+    target_slots, draft_slots = _set_qsa_offsets(metadata, num_seqs, generation=0)
+    target_table = metadata.qsa_block_table
+
+    metadata._refresh_qsa_block_table()
+    metadata._refresh_qsa_draft_block_table()
+    torch.testing.assert_close(target_table[:num_seqs], target_slots)
+    torch.testing.assert_close(metadata.qsa_draft_block_table[:num_seqs], draft_slots)
+
+    draft_manager = metadata.draft_kv_cache_manager
+    saved = prepare_attn_metadata_for_draft_replay(metadata, draft_manager)
+    assert saved is not None and saved.get("saved_backend_state") is not None
+    assert metadata.kv_cache_manager is draft_manager
+    assert metadata.qsa_block_table is metadata.qsa_draft_block_table
+    # Every operand of the table refresh is the draft manager's while swapped, so a
+    # refresh rebuilds the draft table and leaves the target's alone.
+    metadata._refresh_qsa_block_table()
+    torch.testing.assert_close(metadata.qsa_block_table[:num_seqs], draft_slots)
+    torch.testing.assert_close(target_table[:num_seqs], target_slots)
+
+    restore_attn_metadata_after_draft_replay(metadata, saved)
+    assert metadata.kv_cache_manager is not draft_manager
+    assert metadata.qsa_block_table is target_table
+    assert (metadata._qsa_attention_pool_id, metadata._qsa_page_index_scale) == (1, 6)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_qsa_draft_forward_refuses_an_unswapped_manager(monkeypatch) -> None:
+    metadata = _qsa_metadata_with_draft(monkeypatch)
+
+    with pytest.raises(RuntimeError, match="draft KV cache manager"):
+        metadata.prepare_for_draft_forward()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_qsa_draft_table_replays_the_refreshed_draft_pages(monkeypatch) -> None:
+    """A graph captured across the draft swap reads each table by address: the trunk
+    segment the target table, the draft segment the draft one, and a refresh outside
+    capture (as prepare() does before every replay) is what the replay sees."""
+    num_seqs = 3
+    metadata = _qsa_metadata_with_draft(monkeypatch)
+    metadata._seq_lens = torch.ones(num_seqs, dtype=torch.int32)
+    _set_qsa_offsets(metadata, num_seqs, generation=0)
+    metadata._refresh_qsa_block_table()
+    metadata._refresh_qsa_draft_block_table()
+    draft_manager = metadata.draft_kv_cache_manager
+    target_seen = torch.zeros_like(metadata.qsa_block_table[:num_seqs])
+    draft_seen = torch.zeros_like(metadata.qsa_draft_block_table[:num_seqs])
+
+    graph = torch.cuda.CUDAGraph()
+    torch.cuda.synchronize()
+    with torch.cuda.graph(graph):
+        target_seen.copy_(metadata.qsa_block_table[:num_seqs])
+        saved = prepare_attn_metadata_for_draft_replay(metadata, draft_manager)
+        draft_seen.copy_(metadata.qsa_block_table[:num_seqs])
+        restore_attn_metadata_after_draft_replay(metadata, saved)
+
+    target_slots, draft_slots = _set_qsa_offsets(metadata, num_seqs, generation=1)
+    metadata._refresh_qsa_block_table()
+    metadata._refresh_qsa_draft_block_table()
+    graph.replay()
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(target_seen, target_slots)
+    torch.testing.assert_close(draft_seen, draft_slots)
