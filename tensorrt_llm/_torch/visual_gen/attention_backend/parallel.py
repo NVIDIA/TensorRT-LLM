@@ -30,6 +30,7 @@ import torch.nn.functional as F
 
 if TYPE_CHECKING:
     from ..mapping import VisualGenMapping
+    from .ulysses_peer_write import UlyssesPeerWrite
 
 from tensorrt_llm._torch.distributed import all_to_all_4d, all_to_all_5d
 
@@ -375,6 +376,7 @@ class UlyssesAttention(AttentionBackend):
         async_ulysses: bool = False,
     ):
         self.inner_backend = inner_backend
+        self.peer_write: Optional["UlyssesPeerWrite"] = None
         self.process_group = process_group
         self._preferred_layout = AttentionTensorLayout.NHD
         self._replicated_kv_backend_id = next(_replicated_kv_backend_ids)
@@ -489,6 +491,22 @@ class UlyssesAttention(AttentionBackend):
         v: torch.Tensor,
         **kwargs,
     ) -> torch.Tensor:
+        workspace = self.peer_write
+        if (
+            workspace is not None
+            and not torch.is_grad_enabled()
+            and self.inner_backend.preferred_layout == AttentionTensorLayout.NHD
+            and not any(
+                kwargs.get(key) is not None
+                for key in (*_REPLICATED_KV_KWARGS, "gate_compress", "gate_fine")
+            )
+            and workspace.matches(q, k, v)
+        ):
+            q, k, v = workspace.exchange_qkv(q, k, v)
+            kwargs.update(batch_size=q.shape[0], seq_len=q.shape[1], seq_len_kv=k.shape[1])
+            output = self.inner_backend.forward(q=q, k=k, v=v, **kwargs)
+            return workspace.exchange_output(output.reshape(q.shape))
+
         # gate_compress / gate_fine (VSA) must follow the same all-to-all as
         # Q/K/V so they arrive at the inner backend in the same (full-S, sharded-H) layout.
         gate_compress = kwargs.pop("gate_compress", None)
