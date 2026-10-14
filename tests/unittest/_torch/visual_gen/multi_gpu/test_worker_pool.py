@@ -272,7 +272,7 @@ import signal, threading, time, os
 from multi_gpu._worker_pool import run_distributed
 from multi_gpu.test_worker_pool import _write_pid_then_hang
 t = threading.Thread(target=run_distributed, args=(2, _write_pid_then_hang, {p!r}),
-                     kwargs=dict(backend="gloo", timeout=3600), daemon=True)
+                     kwargs=dict(dist_backend="gloo", timeout=3600), daemon=True)
 t.start()
 while not all(os.path.exists({p!r} + f".{{r}}") for r in range(2)):
     time.sleep(0.2)
