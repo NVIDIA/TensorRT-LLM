@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Compile Triton kernel variants ahead of the forward pass that needs them.
+"""Compile JIT kernel variants ahead of the forward pass that needs them.
 
 Experimental. Enabled by ``TLLM_JIT_PREFETCH=1``.
 
@@ -20,34 +20,28 @@ A kernel variant that warmup never produced compiles synchronously at its
 first launch, on the executor thread, stalling the GPU. This module compiles
 such variants before the forward pass that launches them, in CPU-only helper
 processes, without launching anything on the GPU and without adding work to
-warmup. Two sources tell it which variants to compile:
+warmup.
 
-A. Variant providers (per module; ``modules/mamba/jit_prefetch.py`` for the
-   Mamba2 SSD prefill path). Once a batch is scheduled, a provider replays the
-   module's real Triton launchers on ``meta`` tensors under
-   :func:`shadow_launches`, which records each ``run`` instead of executing
-   it, so the recorded arguments are exactly those of the real launch. On the
-   first plan, a background thread also plans one batch per kernel-signature
-   class the provider can reach within the engine limits. A covers a process
-   that has never run this model before.
+Variant providers, one per module next to its kernels, say which variants to
+compile. Once a batch is scheduled, a provider replays the module's real
+Triton launchers on ``meta`` tensors under :func:`shadow_launches`, which
+records each ``run`` instead of executing it, so the recorded arguments are
+exactly those of the real launch. On the first plan, a background thread also
+plans one batch per kernel-signature class the provider can reach within the
+engine limits, so a process that has never run this model before is covered.
+DeepGEMM and CuTe DSL providers do the same through those libraries'
+compile-only entry points (``jit_prefetch_deep_gemm.py``,
+``jit_prefetch_cute_dsl.py``).
 
-B. Record and replay (any Triton kernel, no per-module code). With
-   ``TLLM_JIT_RECORD_DIR`` set, every variant this process compiles or loads
-   is appended, as Triton's own specialization JSON, to
-   ``jit_record.rank<r>.jsonl`` (via ``jit_post_compile_hook``). The next
-   process hands the whole record to the helpers before its first request.
-   The record header pins the Triton version and GPU target; a mismatching
-   record is discarded.
-
-For every planned or replayed variant, Triton's own binder computes Triton's
-own cache key, which is checked against the kernel's in-memory cache and then
-the on-disk cache (the same lookup ``JITFunction.run`` and ``triton.compile``
-do, minus the launch). Misses go to the helpers, which call ``triton.compile``
+For every planned Triton variant, Triton's own binder computes Triton's own
+cache key, which is checked against the kernel's in-memory cache and then the
+on-disk cache (the same lookup ``JITFunction.run`` and ``triton.compile`` do,
+minus the launch). Misses go to the helpers, which call ``triton.compile``
 into the on-disk cache, so the real launch loads the cubin in about a
 millisecond. A priority queue orders the work: a variant the executor is
-about to wait on, then the scheduled batch, then the replayed record, then
-provider enumeration. If the executor reaches a variant a helper is still
-compiling, it waits for that compile instead of compiling it a second time.
+about to wait on, then the scheduled batch, then provider enumeration. If the
+executor reaches a variant a helper is still compiling, it waits for that
+compile instead of compiling it a second time.
 
 Autotuned kernels: if the autotuner already picked a config for a key, only
 that config is planned; otherwise every candidate config is compiled, so the
@@ -56,7 +50,8 @@ the GPU, unchanged. Which config runs is always the autotuner's own choice.
 
 Measurement hooks (always on when the module is enabled, or alone with
 ``TLLM_JIT_STATS=1``) log every compile and every autotune benchmark that
-still runs on the executor thread after warmup, with its wall time.
+still runs on the executor thread after warmup, with its wall time. A compile
+listed there is a variant no provider covers.
 """
 
 from __future__ import annotations
@@ -74,13 +69,10 @@ from tensorrt_llm.logger import logger
 _ENABLE_ENV = "TLLM_JIT_PREFETCH"
 _STATS_ENV = "TLLM_JIT_STATS"
 _WORKERS_ENV = "TLLM_JIT_PREFETCH_WORKERS"
-_RECORD_ENV = "TLLM_JIT_RECORD_DIR"
-_PROVIDERS_ENV = "TLLM_JIT_PREFETCH_PROVIDERS"
 
 # Queue priorities, lowest first: the executor is blocked on it; the batch
-# being scheduled needs it; a previous process compiled it (record replay);
-# a provider can reach it (background enumeration).
-_PRIO_URGENT, _PRIO_BATCH, _PRIO_REPLAY, _PRIO_ENUM = -1, 0, 1, 2
+# being scheduled needs it; a provider can reach it (background enumeration).
+_PRIO_URGENT, _PRIO_BATCH, _PRIO_ENUM = -1, 0, 1
 
 
 def _local_world() -> int:
@@ -111,25 +103,18 @@ def prefetch_enabled() -> bool:
     return os.environ.get(_ENABLE_ENV, "0") == "1"
 
 
-def providers_enabled() -> bool:
-    """Per-module variant providers (approach A). ``TLLM_JIT_PREFETCH_PROVIDERS=none``
-    leaves only record/replay (approach B)."""
-    return os.environ.get(_PROVIDERS_ENV, "all") != "none"
-
-
 def warmup_jit_coverage_enabled() -> bool:
     """Whether warmup runs the passes that exist only to trigger JIT compilation.
 
-    Each such pass checks this (see the callers). With prefetch and its
-    providers on, the helpers compile those variants instead, so the passes
-    default to off; a pass whose kernels prefetch cannot compile on this
-    device stays on regardless. ``TLLM_WARMUP_JIT_COVERAGE`` overrides the
-    default either way.
+    Each such pass checks this (see the callers). With prefetch on, the
+    helpers compile those variants instead, so the passes default to off; a
+    pass whose kernels prefetch cannot compile on this device stays on
+    regardless. ``TLLM_WARMUP_JIT_COVERAGE`` overrides the default either way.
     """
     v = os.environ.get("TLLM_WARMUP_JIT_COVERAGE")
     if v is not None:
         return v == "1"
-    return not (prefetch_enabled() and providers_enabled())
+    return not prefetch_enabled()
 
 
 def stats_enabled() -> bool:
@@ -363,8 +348,6 @@ class _Stats:
     wait_n: int = 0
     wait_s: float = 0.0
     bg_submitted: int = 0
-    replay_submitted: int = 0
-    recorded: int = 0
     urgent: int = 0
     dg_planned: int = 0
     dg_unplanned: int = 0
@@ -391,8 +374,6 @@ class JitPrefetcher:
         self._spec_prio: Dict[str, int] = {}
         self._bg_started = False
         self._inflight: Dict[int, str] = {}
-        # tag -> (kind, spec) for non-Triton requests, to record what was built
-        self._tag_spec: Dict[int, Tuple[str, str]] = {}
         self._tag_event: Dict[int, threading.Event] = {}
         self._key_event: Dict[str, threading.Event] = {}
         self._key_spec: Dict[str, Tuple[str, str]] = {}
@@ -400,11 +381,6 @@ class JitPrefetcher:
         # those, and compiles a still-queued one itself.
         self._tag_key: Dict[int, str] = {}
         self._key_started: set = set()
-        self._record_fh = None
-        self._recorded: set = set()
-        self._replay: List[Tuple[str, str, str]] = []
-        self._replay_dg: List[str] = []
-        self._replay_cd: List[str] = []
         self._tag = 0
         self._lock = threading.Lock()
         self._procs = []
@@ -422,7 +398,6 @@ class JitPrefetcher:
         self._executor_thread: Optional[int] = None
         self._ready: Dict[int, threading.Event] = {}
         self._install_hooks()
-        self._open_record()
         if self.prefetch:
             self._start_helpers()
             # Hash the Triton install now (cached for the process lifetime),
@@ -430,10 +405,6 @@ class JitPrefetcher:
             from triton.runtime.cache import triton_key
 
             triton_key()
-            for key, spec, label in self._replay:
-                self._submit(key, spec, label, _PRIO_REPLAY)
-            if self._replay:
-                self._event(f"replaying {len(self._replay)} recorded variants")
 
     @classmethod
     def get(cls) -> Optional["JitPrefetcher"]:
@@ -524,12 +495,8 @@ class JitPrefetcher:
                 return
             self.stats.dg_executor_compiles += 1
             self.stats.dg_executor_compile_s += dt
-            if m < 0:  # MoE masked grouped GEMM, m = -num_groups
-                self._record(jdg.KIND, "deep_gemm", jdg.moe_spec_for(-m, 128, n, k, 1))
-                what = f"moe g={-m}"
-            else:
-                self._record(jdg.KIND, "deep_gemm", jdg.spec_for(m, n, k))
-                what = f"m={m}"
+            # The MoE masked grouped GEMM reports m = -num_groups.
+            what = f"moe g={-m}" if m < 0 else f"m={m}"
             self._event(f"DeepGEMM compile on executor {what} n={n} k={k} {dt:.3f}s")
 
         jdg.done_observer = _done
@@ -616,12 +583,10 @@ class JitPrefetcher:
         threading.Thread(
             target=self._enumerate_dg, daemon=True, name="jit_prefetch_dg_enum"
         ).start()
-        for spec in self._replay_dg:
-            self._submit(spec, spec, "deep_gemm", _PRIO_REPLAY, kind=jdg.KIND)
         self._event(
             f"DeepGEMM prefetch: {len(provider.shapes)} FP8 Linear shape(s), "
             f"{len(moe_provider.shapes) if moe_provider else 0} MoE shape(s), {n} helper(s), "
-            f"target sm_{major}{minor} x{sms} SMs, replaying {len(self._replay_dg)}"
+            f"target sm_{major}{minor} x{sms} SMs"
         )
         return True
 
@@ -677,7 +642,6 @@ class JitPrefetcher:
                 ev_busy.set()
             with self._lock:
                 label = self._inflight.pop(tag, "?")
-                kind_spec = self._tag_spec.pop(tag, None)
                 ev = self._tag_event.pop(tag, None)
                 if ev is not None:
                     ev.set()
@@ -689,10 +653,6 @@ class JitPrefetcher:
                 else:
                     self.stats.helper_fail += 1
                     logger.warning(f"[JIT prefetch] helper failed on {label}: {err}")
-            if ok and r.get("built") and kind_spec is not None:
-                # One line per kernel this process produced: most requests
-                # (each M of each shape) resolve to a kernel already on disk.
-                self._record(kind_spec[0], label, kind_spec[1])
             if ok and label == "deep_gemm" and not r.get("built"):
                 continue  # already on disk: most enumerated M share a layout
             self._event(f"helper {'done' if ok else 'FAIL'} {label} {dt * 1e3:.0f} ms")
@@ -796,17 +756,15 @@ class JitPrefetcher:
                 # The compile that follows is counted by the cute.compile wrapper.
                 if threading.get_ident() == self._executor_thread:
                     self._event(f"CuTe DSL variant not prefetched: {spec}")
-                self._record(jcd.KIND, "cute_dsl", spec)
             else:
                 self.stats.cd_loaded += 1
             return fn
 
         kda_ops.k123_loader = _loader
-        for spec in kda_provider.enumerate_specs() + self._replay_cd:
+        for spec in kda_provider.enumerate_specs():
             self._submit(spec, spec, "cute_dsl", _PRIO_BATCH, kind=jcd.KIND)
         self._event(
-            f"CuTe DSL prefetch: {len(kda_provider.cfgs)} KDA config(s), {n} helper(s), "
-            f"{out_dir}, replaying {len(self._replay_cd)}"
+            f"CuTe DSL prefetch: {len(kda_provider.cfgs)} KDA config(s), {n} helper(s), {out_dir}"
         )
         return True
 
@@ -919,8 +877,6 @@ class JitPrefetcher:
             self._tag += 1
             tag = self._tag
             self._inflight[tag] = label
-            if kind != "triton":
-                self._tag_spec[tag] = (kind, spec)
             ev = self._key_event.get(key)
             if ev is None or ev.is_set():
                 ev = threading.Event()
@@ -930,9 +886,7 @@ class JitPrefetcher:
                 self._tag_key[tag] = key
             self._key_spec[key] = (spec, label, kind)
             self.stats.submitted += 1
-            if priority == _PRIO_REPLAY:
-                self.stats.replay_submitted += 1
-            elif priority == _PRIO_ENUM:
+            if priority == _PRIO_ENUM:
                 self.stats.bg_submitted += 1
             elif priority == _PRIO_URGENT:
                 self.stats.urgent += 1
@@ -1098,35 +1052,6 @@ class JitPrefetcher:
 
         knobs.runtime.jit_cache_hook = cache_hook
 
-        prev_post_hook = knobs.runtime.jit_post_compile_hook
-
-        def post_compile_hook(*, key, repr, fn, compile, is_manual_warmup, already_compiled):
-            # JITFunction._do_compile calls this after every in-memory cache
-            # miss in this process: a real compile or a disk-cache load. That
-            # is exactly the set of variants this process launched, which is
-            # what the next process should compile first (approach B).
-            spec = compile.get("specialization_data") if isinstance(compile, dict) else None
-            fh = me._record_fh
-            if fh is not None and not fh.closed and spec and spec not in me._recorded:
-                with me._lock:
-                    if spec not in me._recorded:
-                        me._recorded.add(spec)
-                        fh.write(json.dumps({"name": fn.name, "spec": spec}) + "\n")
-                        fh.flush()
-                        stats.recorded += 1
-            if prev_post_hook is not None:
-                return prev_post_hook(
-                    key=key,
-                    repr=repr,
-                    fn=fn,
-                    compile=compile,
-                    is_manual_warmup=is_manual_warmup,
-                    already_compiled=already_compiled,
-                )
-            return None
-
-        knobs.runtime.jit_post_compile_hook = post_compile_hook
-
         prev_listener = knobs.autotuning.listener
 
         def listener(*, fn, key, best_config, configs_timings, duration, cache_hit):
@@ -1153,79 +1078,6 @@ class JitPrefetcher:
 
         knobs.autotuning.listener = listener
 
-    def _record(self, kind: str, name: str, spec: str) -> None:
-        """Append one non-Triton request to the record (Triton records itself
-        from ``jit_post_compile_hook``)."""
-        fh = self._record_fh
-        if fh is None or fh.closed or spec in self._recorded:
-            return
-        with self._lock:
-            if spec in self._recorded:
-                return
-            self._recorded.add(spec)
-            fh.write(json.dumps({"kind": kind, "name": name, "spec": spec}) + "\n")
-            fh.flush()
-            self.stats.recorded += 1
-
-    def _open_record(self) -> None:
-        """Open this rank's record file and load the variants to replay.
-
-        ``$TLLM_JIT_RECORD_DIR/jit_record.rank<r>.jsonl``: a header line
-        (record format, Triton version, GPU target) followed by one line per
-        variant, holding Triton's own specialization JSON. A record written
-        by another Triton version or for another GPU target is discarded and
-        rewritten. A stale entry can only cost a helper compile: the executor
-        loads a cubin solely when its own cache-key lookup asks for it.
-        """
-        rec_dir = os.environ.get(_RECORD_ENV)
-        if not rec_dir:
-            return
-        import triton
-        from triton.runtime.driver import driver
-
-        header = {
-            "jit_record": 1,
-            "triton": triton.__version__,
-            "target": str(driver.active.get_current_target()),
-        }
-        os.makedirs(rec_dir, exist_ok=True)
-        path = os.path.join(rec_dir, f"jit_record.rank{self.rank}.jsonl")
-        mode = "w"
-        if os.path.exists(path):
-            with open(path) as f:
-                lines = f.read().splitlines()
-            try:
-                valid = bool(lines) and json.loads(lines[0]) == header
-            except json.JSONDecodeError:
-                valid = False
-            if valid:
-                mode = "a"
-                for line in lines[1:]:
-                    try:
-                        rec = json.loads(line)
-                        spec = rec["spec"]
-                        kind = rec.get("kind", "triton")
-                        key = json.loads(spec)["key"] if kind == "triton" else spec
-                    except (json.JSONDecodeError, KeyError, TypeError):
-                        continue
-                    if spec in self._recorded:
-                        continue
-                    self._recorded.add(spec)
-                    if kind == "triton":
-                        self._replay.append((key, spec, str(rec.get("name", "?"))))
-                    elif kind == "deep_gemm":
-                        self._replay_dg.append(spec)
-                    elif kind == "cute_dsl":
-                        self._replay_cd.append(spec)
-        self._record_fh = open(path, mode)
-        if mode == "w":
-            self._record_fh.write(json.dumps(header) + "\n")
-            self._record_fh.flush()
-        self._event(
-            f"record {path}: {len(self._replay)} Triton + {len(self._replay_dg)} DeepGEMM "
-            "variants to replay"
-        )
-
     def _event(self, msg: str):
         line = f"[JIT stats] rank {self.rank} t={time.time():.3f} {msg}"
         self.stats.events.append(line)
@@ -1242,8 +1094,7 @@ class JitPrefetcher:
             f" submitted={s.submitted} helper_ok={s.helper_ok}"
             f" helper_fail={s.helper_fail} helper_s={s.helper_s:.3f}"
             f" plan_s={s.plan_s:.3f} wait_n={s.wait_n} wait_s={s.wait_s:.3f}"
-            f" bg_submitted={s.bg_submitted} replay_submitted={s.replay_submitted}"
-            f" recorded={s.recorded} urgent={s.urgent} workers={len(self._procs)}"
+            f" bg_submitted={s.bg_submitted} urgent={s.urgent} workers={len(self._procs)}"
             f" dg_planned={s.dg_planned} dg_unplanned={s.dg_unplanned} dg_helper_built={s.dg_helper_built}"
             f" dg_executor_compiles={s.dg_executor_compiles}"
             f" dg_executor_compile_s={s.dg_executor_compile_s:.3f}"

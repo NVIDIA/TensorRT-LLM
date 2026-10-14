@@ -1060,16 +1060,12 @@ class PyTorchModelEngine(ModelEngine):
     def _init_jit_prefetch(self) -> None:
         """Start JIT prefetch / JIT stats after warmup (env-gated, see
         ``tensorrt_llm/_torch/jit_prefetch.py``)."""
-        from ..jit_prefetch import (JitPrefetcher, prefetch_enabled,
-                                    providers_enabled)
+        from ..jit_prefetch import JitPrefetcher, prefetch_enabled
         prefetcher = JitPrefetcher.init(rank=self.mapping.rank)
         self._jit_prefetcher = prefetcher
         if prefetcher is not None and get_sm_version() in (100, 103):
             prefetcher.observe_deep_gemm()
         if prefetcher is None or not prefetch_enabled():
-            return
-        if not providers_enabled():
-            prefetcher.wait_ready()
             return
         from .. import jit_prefetch_deep_gemm as jdg
         if jdg.supported():

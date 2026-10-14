@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""DeepGEMM support for ``jit_prefetch.py``: provider, record kind, stats.
+"""DeepGEMM support for ``jit_prefetch.py``: providers and stats.
 
 Covers the SM100 FP8 block-scale ``Linear`` path
 (``trtllm::fp8_swap_ab_gemm`` -> ``deep_gemm.fp8_gemm_nt``), the DeepGEMM call
@@ -28,8 +28,7 @@ a disk-cache hit in the helper).
 
 A provider (``FP8LinearDeepGemmProvider``) knows each FP8 Linear's (N, K) from
 its weight, and the scheduled batch gives M (its token count; with attention
-DP, each rank plans its own M). Record/replay logs every request this process
-made or that its executor compiled, so the next process compiles them first.
+DP, each rank plans its own M).
 """
 
 from __future__ import annotations
