@@ -2542,9 +2542,14 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         bool,
     ]:
         # A forward that sampled greedy tokens in place of the logits (GREEDY_TOKENS_KEY) may return no logits.
-        raw_logits_cuda = model_outputs.get("logits")
-        greedy_tokens = model_outputs.get(GREEDY_TOKENS_KEY)
-        rows_cuda = raw_logits_cuda if greedy_tokens is None else greedy_tokens
+        raw_logits_cuda: Optional[torch.Tensor] = model_outputs.get("logits")
+        greedy_tokens: Optional[torch.Tensor] = model_outputs.get(GREEDY_TOKENS_KEY)
+        if greedy_tokens is not None:
+            rows_cuda = greedy_tokens
+        elif raw_logits_cuda is not None:
+            rows_cuda = raw_logits_cuda
+        else:
+            raise RuntimeError("the forward returned neither logits nor greedy tokens")
 
         generation_requests = scheduled_requests.generation_requests
         request_ids = [request.py_request_id for request in generation_requests]
@@ -2700,6 +2705,8 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                     next_tokens, new_tokens_cuda, seq_slots_cuda, self.max_beam_width
                 )
             else:
+                # Without greedy tokens, rows_cuda is the logits.
+                assert raw_logits_cuda is not None
                 next_tokens = fast_greedy_sample_kernel(
                     raw_logits_cuda[: len(generation_requests)],
                     new_tokens_cuda,
