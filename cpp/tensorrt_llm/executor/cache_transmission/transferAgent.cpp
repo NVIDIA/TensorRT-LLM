@@ -117,7 +117,7 @@ AgentDesc AgentDesc::deserialize(std::string const& data)
     auto backendAgentDesc = su::deserialize<std::string>(is);
     auto numRegions = su::deserialize<size_t>(is);
     std::vector<VramRegionMeta> regions;
-    regions.reserve(numRegions);
+    TLLM_CHECK_WITH_INFO(numRegions <= regions.max_size(), "Invalid serialized VRAM region count");
     for (size_t i = 0; i < numRegions; ++i)
     {
         auto baseAddr = su::deserialize<uintptr_t>(is);
