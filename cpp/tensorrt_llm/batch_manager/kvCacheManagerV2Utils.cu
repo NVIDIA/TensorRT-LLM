@@ -140,10 +140,11 @@ CUresult launchBatchedCopyImpl(
 
 // lowBandwidth gives each task one CTA instead of splitting a task over several CTAs. It is meant for copies that
 // involve host memory, where a small SM footprint matters. The price is throughput per task: a 128-thread CTA with a
-// 4-deep ring of 16 B grains has at most 8 KiB of loads in flight, and bandwidth is bytes in flight divided by
-// latency, so one task cannot exceed a few GB/s however fast the link is. A batch of small pages is still fast
-// because its N tasks run as N concurrent CTAs from one launch. A single 217 MB recurrent-state page is not: it
-// takes tens of milliseconds where the copy engines need well under a millisecond.
+// 4-deep ring of 16 B grains has at most 4 x 128 x 16 B = 8 KiB of loads in flight, and bandwidth is bytes in flight
+// divided by round-trip latency, so one task gets 8,192 B / (1 to 4 us) = 8 to 2 GB/s however fast the link is
+// (measured: 1.8 to 17.5 GB/s per CTA). A batch of small pages is still fast because its N tasks run as N concurrent
+// CTAs from one launch. A single 217 MB recurrent-state page is not: it takes tens of milliseconds where the copy
+// engines need well under a millisecond.
 //
 // copyHostToDevice / copyDeviceToHost therefore send calls with few, large tasks to the copy engines and keep this
 // kernel for everything else; useCopyEngineForHostCopy below holds the rule. The multi-CTA page copier in
