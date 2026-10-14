@@ -2602,11 +2602,15 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
                          multimodal_request.py_multimodal_data)
         kv_cache_manager.shutdown()
 
-    def _setup_mrope_engine(self, max_num_tokens: int = 32):
+    def _setup_mrope_engine(self,
+                            max_num_tokens: int = 32,
+                            spec_config: DecodingBaseConfig | None = None):
         """Build a DummyModelEngine that takes the MRoPE path, plus its KV cache
         manager and attention metadata."""
         llm_args = TorchLlmArgs(model="dummy")
-        model_engine = DummyModelEngine(llm_args, dtype=torch.half)
+        model_engine = DummyModelEngine(llm_args,
+                                        dtype=torch.half,
+                                        spec_config=spec_config)
         model_engine.model.model_config.pretrained_config.rope_scaling = {
             "type": "mrope"
         }
@@ -2715,6 +2719,137 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
                                 dtype=torch.int32,
                                 device='cuda')
         torch.testing.assert_close(position_ids, expected, atol=0, rtol=0)
+        kv_cache_manager.shutdown()
+
+    def _make_mrope_spec_batch(self, previous_batch: bool):
+        """Two multimodal verify groups around a text-only one, plus a CUDA graph
+        padding dummy, each carrying one draft token.
+
+        Returns the scheduled batch and the multimodal requests."""
+        # (num_tokens, req_id, seq_slot, delta); the middle request is text-only.
+        requests = [
+            self._make_mrope_gen_request(4, 1, 0, 10),
+            self._make_mrope_gen_request(5, 2, 1, None),
+            self._make_mrope_gen_request(6, 3, 2, 20),
+        ]
+        for request in requests:
+            request.py_draft_tokens = [7]
+            if previous_batch:
+                # The overlap scheduler's previous step ran these requests at
+                # their current slots, which also seeded the delta cache.
+                request.py_batch_idx = request.py_seq_slot
+                if request.py_multimodal_data:
+                    request.py_mrope_delta_cache_slot = request.py_seq_slot
+        # The padding dummy carries the zero delta that `add_dummy_requests`
+        # attaches on MRoPE models.
+        dummy = self._make_mrope_gen_request(2, 4, 3, 0)
+        dummy.is_cuda_graph_dummy = True
+        dummy.py_draft_tokens = [0]
+
+        scheduled_requests = ScheduledRequests()
+        scheduled_requests.context_requests_last_chunk = []
+        scheduled_requests.generation_requests = requests + [dummy]
+        return scheduled_requests, [requests[0], requests[2]]
+
+    def test_prepare_tp_inputs_spec_decode_adds_mrope_delta(self) -> None:
+        """One-model speculative verify groups get the request's MRoPE delta.
+
+        Every token a generation step feeds is text after the prompt's vision
+        spans, so its three coordinates are `seq_index + delta`, as for an
+        ordinary generation request. Read slots stay dense, one per verify
+        group, and a generation-only request seeds the delta cache.
+        """
+        model_engine, kv_cache_manager, attn_metadata = self._setup_mrope_engine(
+            spec_config=SADecodingConfig(max_draft_len=1))
+        scheduled_requests, multimodal_requests = self._make_mrope_spec_batch(
+            previous_batch=False)
+        spec_metadata = Mock(
+            _force_non_greedy_for_capture=False,
+            context_prompt_lookahead_tokens=None,
+        )
+
+        result, _, _ = model_engine._runner._prepare_tp_inputs(
+            scheduled_requests=scheduled_requests,
+            kv_cache_manager=kv_cache_manager,
+            attn_metadata=attn_metadata,
+            spec_metadata=spec_metadata,
+            enable_spec_decode=True,
+            runtime_draft_len=1,
+            is_dummy=False)
+
+        # Each verify group is [last token, draft token] at past_seen + 0/1;
+        # the text-only request and the zero-delta dummy keep the scalar
+        # positions.
+        position_ids = result["position_ids"]
+        self.assertEqual(tuple(position_ids.shape), (3, 1, 8))
+        expected = torch.tensor([[[13, 14, 4, 5, 25, 26, 1, 2]]] * 3,
+                                dtype=torch.int32,
+                                device='cuda')
+        torch.testing.assert_close(position_ids, expected, atol=0, rtol=0)
+        # Slot 32 is the reserved zero slot (max_num_tokens * pp_size).
+        self.assertEqual(result["mrope_delta_read_seq_slots"].cpu().tolist(),
+                         [0, 32, 2, 32])
+        self.assertEqual(result["mrope_delta_write_seq_slots"].cpu().tolist(),
+                         [0, 2])
+        self.assertEqual([
+            request.py_mrope_delta_cache_slot for request in multimodal_requests
+        ], [0, 2])
+        kv_cache_manager.shutdown()
+
+    def test_prepare_tp_inputs_spec_decode_overlap_keeps_mrope_delta(
+            self) -> None:
+        """Under the overlap scheduler the accepted-token correction applied in
+        `_preprocess_inputs` lands on top of the delta, on all three axes."""
+        model_engine, kv_cache_manager, attn_metadata = self._setup_mrope_engine(
+            spec_config=SADecodingConfig(max_draft_len=1))
+        scheduled_requests, _ = self._make_mrope_spec_batch(previous_batch=True)
+        spec_metadata = Mock(
+            _force_non_greedy_for_capture=False,
+            context_prompt_lookahead_tokens=None,
+        )
+        # The previous step accepted 2, 1 and 2 tokens in slots 0, 1 and 2.
+        overlap_state = SampleStateTensorsSpec(
+            new_tokens=torch.zeros((2, 4, 1), dtype=torch.int32, device="cuda"),
+            new_tokens_lens=torch.tensor([2, 1, 2, 1],
+                                         dtype=torch.int32,
+                                         device="cuda"),
+            next_draft_tokens=torch.zeros((4, 1),
+                                          dtype=torch.int32,
+                                          device="cuda"),
+        )
+
+        inputs, _, _ = model_engine._runner._prepare_tp_inputs(
+            scheduled_requests=scheduled_requests,
+            kv_cache_manager=kv_cache_manager,
+            attn_metadata=attn_metadata,
+            spec_metadata=spec_metadata,
+            new_tensors_device=overlap_state,
+            enable_spec_decode=True,
+            runtime_draft_len=1,
+            is_dummy=False)
+
+        # The host packs positions from the stale base (past_seen + delta).
+        stale = torch.tensor([[[13, 14, 4, 5, 25, 26, 1, 2]]] * 3,
+                             dtype=torch.int32,
+                             device='cuda')
+        torch.testing.assert_close(inputs["position_ids"],
+                                   stale,
+                                   atol=0,
+                                   rtol=0)
+        self.assertEqual(inputs["mrope_delta_read_seq_slots"].cpu().tolist(),
+                         [0, 32, 2, 32])
+        # The delta cache already holds both multimodal requests' deltas.
+        self.assertNotIn("mrope_delta_write_seq_slots", inputs)
+
+        inputs = model_engine._runner._preprocess_inputs(
+            inputs, enable_spec_decode=True, runtime_draft_len=1)
+        corrected = torch.tensor([[[15, 16, 5, 6, 27, 28, 1, 2]]] * 3,
+                                 dtype=torch.int32,
+                                 device='cuda')
+        torch.testing.assert_close(inputs["position_ids"],
+                                   corrected,
+                                   atol=0,
+                                   rtol=0)
         kv_cache_manager.shutdown()
 
     @skip_pre_blackwell_unittest

@@ -3335,6 +3335,30 @@ class DecoderRunner(ScheduledModelRunner):
             return request.py_multimodal_data
         return self._mm_item_scheduler.build_multimodal_data_for_llm(request, runtime)
 
+    @staticmethod
+    def _decode_mrope_position_delta(request: LlmRequest) -> torch.Tensor | None:
+        """The MRoPE position delta of a decode-phase request, or None.
+
+        A request that ran its context phase on this worker already holds the
+        delta in ``py_mrope_position_delta``. Otherwise (for example the first
+        step of a generation-only request) it is read from the request's
+        ``mrope_config``, moved to the device once, and cached on the request.
+        None means the request carries no MRoPE metadata (a text-only prompt),
+        whose delta is zero.
+        """
+        mrope_position_delta = getattr(request, "py_mrope_position_delta", None)
+        if mrope_position_delta is None and request.py_multimodal_data:
+            mrope_config = request.py_multimodal_data.get("mrope_config") or {}
+            mrope_position_delta = mrope_config.get("mrope_position_deltas")
+            if mrope_position_delta is not None:
+                if mrope_position_delta.device.type == "cpu":
+                    mrope_position_delta = maybe_pin_memory(mrope_position_delta).to(
+                        device="cuda", dtype=torch.int32, non_blocking=True
+                    )
+                    mrope_config["mrope_position_deltas"] = mrope_position_delta
+                request.py_mrope_position_delta = mrope_position_delta
+        return mrope_position_delta
+
     def _prepare_tp_inputs(
         self,
         scheduled_requests: ScheduledRequests,
@@ -3691,6 +3715,15 @@ class DecoderRunner(ScheduledModelRunner):
         unwritten_input_id_rows = []
         runtime_tokens_per_gen_step = self.get_runtime_tokens_per_gen_step(runtime_draft_len)
         runtime_draft_token_buffer_width = runtime_tokens_per_gen_step - 1
+        # Under extend_ctx the attention kernel runs extend requests as chunked
+        # context rows: their rotary comes from position_ids alone, and they take
+        # no entry in the generation-indexed MRoPE delta read slots.
+        extend_requests_are_context = (
+            _use_mrope
+            and enable_spec_decode
+            and spec_config.spec_dec_mode.extend_ctx(self._config.attention_backend)
+            and spec_config.is_linear_tree
+        )
         for request in extend_requests:
             is_promoted_context = request.py_request_id in promoted_context_request_ids
             if getattr(request, "py_needs_onehot_draft_probs", False):
@@ -3821,6 +3854,57 @@ class DecoderRunner(ScheduledModelRunner):
                     prompt_lengths.append(runtime_tokens_per_gen_step)
                 else:
                     prompt_lengths.append(request.py_prompt_len)
+
+            if _use_mrope:
+                mrope_position_delta = self._decode_mrope_position_delta(request)
+                if mrope_position_delta is not None:
+                    # Every row of a verify group lies past the prompt, so it is
+                    # text: its three MRoPE coordinates are equal, the scalar
+                    # position plus the request's delta. The overlap scheduler's
+                    # accepted-token correction later adds to all three axes.
+                    num_request_tokens = sequence_lengths[-1]
+                    token_start = len(position_ids) - num_request_tokens
+                    first_position = position_ids[token_start]
+                    extend_mrope_position_ids = (
+                        torch.arange(
+                            first_position,
+                            first_position + num_request_tokens,
+                            dtype=torch.int32,
+                            device=mrope_position_delta.device,
+                        )
+                        + mrope_position_delta.reshape(1, 1, 1)
+                    ).expand(3, 1, num_request_tokens)
+                    mrope_position_ids.append(
+                        (token_start, len(position_ids), extend_mrope_position_ids)
+                    )
+                    if (
+                        request.py_seq_slot is not None
+                        and not request.is_dummy
+                        and getattr(request, "py_mrope_delta_cache_slot", None)
+                        != request.py_seq_slot
+                    ):
+                        multimodal_params_list.append(
+                            MultimodalParams(
+                                multimodal_data={
+                                    "mrope_config": {"mrope_position_deltas": mrope_position_delta}
+                                }
+                            )
+                        )
+                        mrope_delta_write_seq_slots.append(request.py_seq_slot)
+                        request.py_mrope_delta_cache_slot = request.py_seq_slot
+                if not extend_requests_are_context:
+                    # The kernel indexes deltas by generation request, so every
+                    # verify group takes one read slot, in batch order; a dummy,
+                    # unslotted, or text-only request reads the zero slot.
+                    if mrope_position_delta is not None:
+                        has_gen_mrope_delta = True
+                    mrope_delta_read_seq_slots.append(
+                        request.py_seq_slot
+                        if mrope_position_delta is not None
+                        and not request.is_dummy
+                        and request.py_seq_slot is not None
+                        else mrope_dummy_seq_slot
+                    )
 
             extra_inputs.add_generation_request(request)
 
@@ -3982,17 +4066,7 @@ class DecoderRunner(ScheduledModelRunner):
                     gather_ids.append(len(position_ids) - 1)
 
                 if _use_mrope:
-                    mrope_position_delta = getattr(request, "py_mrope_position_delta", None)
-                    if mrope_position_delta is None and request.py_multimodal_data:
-                        mrope_config = request.py_multimodal_data.get("mrope_config") or {}
-                        mrope_position_delta = mrope_config.get("mrope_position_deltas")
-                        if mrope_position_delta is not None:
-                            if mrope_position_delta.device.type == "cpu":
-                                mrope_position_delta = maybe_pin_memory(mrope_position_delta).to(
-                                    device="cuda", dtype=torch.int32, non_blocking=True
-                                )
-                                mrope_config["mrope_position_deltas"] = mrope_position_delta
-                            request.py_mrope_position_delta = mrope_position_delta
+                    mrope_position_delta = self._decode_mrope_position_delta(request)
                     if mrope_position_delta is not None:
                         has_gen_mrope_delta = True
                         # NOTE: Expanding position_ids to 3D tensor who is using mrope
