@@ -29,8 +29,11 @@
 #include "tensorrt_llm/common/assert.h"
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <memory>
 #include <optional>
+#include <set>
+#include <tuple>
 #include <variant>
 #include <vector>
 
@@ -204,6 +207,23 @@ private:
     std::vector<CachedCudaEvent> mReadyEvents;
 };
 
+//! Copied facts about a logical attention page; no storage ownership or GPU-read permission.
+struct CachePageInfo
+{
+    int beamIndex;
+    int blockOrdinal;
+    int layerGroupId;
+    int cacheLevel;
+    int numTokens;
+    int32_t lossyEncodeCount;
+    bool isSparse;
+    std::optional<int> windowSize;
+    bool hasSharedPage;
+};
+
+//! Explicit (beam, logical block, layer group) supplied by a page policy.
+using PageCoordinates = std::tuple<int, int, int>;
+
 // Availability at the claimed prefix, indexed by LayerGroupId. OPTIONAL
 // candidates are held until the first successful resume or close.
 // Describes the initial prefix claim, not subsequent request progress.
@@ -277,6 +297,19 @@ public:
 
     // Suspend: detach from CUDA stream, unlock pages → PageHolder.
     void suspend();
+
+    //! Replace this request's GPU residency protections atomically. Selected pages must already be hot.
+    void setGpuResidentPages(std::vector<PageCoordinates> const& pages);
+
+    //! Copied facts remain available while suspended; they do not authorize asynchronous reads.
+    std::vector<CachePageInfo> getPageInfo() const;
+
+    //! Keep selected working pages when committing against an existing shared block.
+    void setPrivatePages(std::vector<PageCoordinates> const& pages);
+    std::vector<PageCoordinates> getPrivatePages() const;
+
+    //! Restore retained shared pages before releasing private copies. Missing backing is a no-op.
+    std::vector<PageCoordinates> restoreSharedPages(std::vector<PageCoordinates> const& pages);
 
     // Close: release all blocks back to KvCacheManager.
     void close();
@@ -365,6 +398,9 @@ public:
     {
         return mStatus;
     }
+
+    //! Internal ownership census for resize; caller holds the manager's API lock.
+    std::vector<SharedPtr<Page>> retainedPages() const;
 
     CommitState commitState() const noexcept
     {
@@ -497,8 +533,7 @@ public:
 
     CUstream cudaStream() const;
 
-    // Mirrors Python's cuda_stream setter: if already on a stream AND active,
-    // make the new stream wait for the old one before switching (cross-stream sync).
+    // Order stream handoff for active work and GPU-resident pages retained across suspension.
     void setCudaStream(CUstream stream)
     {
         if (mCudaStream.has_value())
@@ -667,6 +702,9 @@ private:
 
     std::vector<ActivePage> _activePages() const;
     SharedPtr<Page> _page(BlockOrdinal ordinal, BeamIndex beamIdx, LifeCycleId lcId) const;
+    void _releaseGpuResidentPage(PageCoordinates const& coordinates);
+    void _retainGpuResidentPage(PageCoordinates const& coordinates, SharedPtr<Page> const& page);
+    void _clearPageProtections();
 
     bool _shortcutSetHistoryLength(int historyLength);
     bool _shouldRecordManagerStats() const;
@@ -706,16 +744,9 @@ private:
     // See https://nvbugs/6625710.
     void _reattachOrphanTreeBlocks(BlockOrdinal lastOrdinal, RootBlock& root);
 
-    struct TakenPage
-    {
-        SharedPtr<UncommittedPage> page;
-        bool locked;
-    };
-
-    // Extract uncommitted pages from a SeqBlock, resetting block page entries.
-    // Returns one TakenPage per lifecycle. Mirrors Python's _take_uncommitted_page().
-    TypedVec<LifeCycleId, TakenPage> _takeUncommittedPage(
-        SeqBlock& sb, BeamIndex beamIdx, std::optional<LifeCycleId> skipLc = std::nullopt);
+    // Transfer a working page's storage and protections without exposing an unowned slot.
+    void _commitWorkingPage(BlockPage& page, PageCoordinates const& coordinates, SharedPtr<Block> const& block,
+        int numTokens, bool publishToTree = true);
 
     // Get and validate the tree block at a committed ordinal.
     // Mirrors Python's _get_tree_block(). Asserts committed pages reference the correct block.
@@ -766,6 +797,9 @@ private:
     BeamIndex mBeamWidth;
     int mCapacity;
     int mHistoryLength;
+    std::map<PageCoordinates, SharedPtr<PageHolder>> mGpuResidentPages;
+    std::set<PageCoordinates> mPrivatePages;
+    std::map<PageCoordinates, SharedPtr<PageHolder>> mSharedHistoryPages;
     bool mIsDecoding = false;
     // Retry by scanning current blocks; deferred work does not retain pages or other requests.
     bool mHasDeferredSparseOffload = false;

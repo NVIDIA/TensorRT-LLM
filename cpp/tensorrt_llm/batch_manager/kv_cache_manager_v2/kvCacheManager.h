@@ -417,7 +417,7 @@ private:
     void _adjustLevel(CacheLevel level, size_t quota);
     bool _needAdjustment(CacheLevel level) const;
     TypedVec<PoolGroupIndex, float> const& _getTargetRatioList(CacheLevel level) const;
-    TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> _gatherLastLevelPersistentPages() const;
+    TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> _gatherPersistentPages(CacheLevel level) const;
 
     PeakBlockStatsByCacheLevel _currentBlockStatsByCacheLevel() const;
     void _resetIterationPeakNumBlocks(std::optional<CacheLevel> cacheLevel = std::nullopt);

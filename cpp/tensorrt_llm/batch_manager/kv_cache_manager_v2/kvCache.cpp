@@ -345,9 +345,280 @@ SharedPtr<Page> KvCache::_page(BlockOrdinal ordinal, BeamIndex beamIdx, LifeCycl
 
 CacheLevel KvCache::_lockLevel(Page const& page, BlockOrdinal ordinal) const
 {
+    if (page.gpuResidencyPinCount() > 0)
+    {
+        return kHotLevel;
+    }
     bool const readOnly = page.isCommitted()
         || (ordinal != kBadBlockOrdinal && ordinal < BlockOrdinal{mHistoryLength / mTokensPerBlock});
     return mIsDecoding && readOnly ? page.queryLockLevel() : kHotLevel;
+}
+
+std::vector<CachePageInfo> KvCache::getPageInfo() const
+{
+    KVCM2_API_GUARD();
+    auto const apiLock = mManager->lockShared();
+    if (mStatus == Status::CLOSED)
+    {
+        throw LogicError("Cannot query pages of a closed cache");
+    }
+    std::vector<CachePageInfo> result;
+    for (BlockOrdinal ordinal{0}; ordinal < mBlocks.size(); ++ordinal)
+    {
+        auto const& block = mBlocks[ordinal];
+        for (BeamIndex beam{0}; beam < block.pages.size(); ++beam)
+        {
+            for (LifeCycleId lc{0}; lc < block.pages[beam].size(); ++lc)
+            {
+                auto const* attention = std::get_if<AttnLifeCycle>(&mManager->lifeCycles().getLifeCycle(lc));
+                auto const* page = blockPageGetPage(block.pages[beam][lc]).get();
+                if (!attention || !page)
+                {
+                    continue;
+                }
+                int validTokens = std::clamp(mHistoryLength - ordinal.value() * mTokensPerBlock, 0, mTokensPerBlock);
+                if (auto const* committed = dynamic_cast<CommittedPage const*>(page))
+                {
+                    validTokens = std::min(validTokens, committed->numTokensInBlock);
+                }
+                PageCoordinates const coordinates{beam.value(), ordinal.value(), lc.value()};
+                result.push_back({beam.value(), ordinal.value(), lc.value(), page->cacheLevel.value(), validTokens,
+                    page->lossyEncodeCount, attention->isSparse, attention->windowSize,
+                    mSharedHistoryPages.contains(coordinates)});
+            }
+        }
+    }
+    return result;
+}
+
+void KvCache::_releaseGpuResidentPage(PageCoordinates const& coordinates)
+{
+    auto const it = mGpuResidentPages.find(coordinates);
+    if (it != mGpuResidentPages.end())
+    {
+        it->second->page->unpinGpuResidency();
+        mGpuResidentPages.erase(it);
+    }
+}
+
+void KvCache::_retainGpuResidentPage(PageCoordinates const& coordinates, SharedPtr<Page> const& page)
+{
+    auto holder = page->hold();
+    auto [it, inserted] = mGpuResidentPages.emplace(coordinates, std::move(holder));
+    TLLM_CHECK_DEBUG(inserted);
+    try
+    {
+        page->pinGpuResidency();
+    }
+    catch (...)
+    {
+        mGpuResidentPages.erase(it);
+        throw;
+    }
+}
+
+void KvCache::setGpuResidentPages(std::vector<PageCoordinates> const& pages)
+{
+    KVCM2_API_GUARD();
+    auto const apiLock = mManager->lockExclusive();
+    if (mStatus == Status::CLOSED)
+    {
+        throw LogicError("Cannot protect pages of a closed cache");
+    }
+    std::map<PageCoordinates, SharedPtr<PageHolder>> selected;
+    for (auto const& coordinates : pages)
+    {
+        auto const& [beam, ordinal, lc] = coordinates;
+        if (beam < 0 || ordinal < 0 || lc < 0)
+        {
+            throw std::invalid_argument("Page coordinates must be nonnegative");
+        }
+        auto const page = _page(BlockOrdinal{ordinal}, BeamIndex{beam}, LifeCycleId{lc});
+        if (!page || page->cacheLevel != kHotLevel)
+        {
+            throw LogicError("GPU residency protection requires an existing GPU page");
+        }
+        selected.emplace(coordinates, page->hold());
+    }
+    std::vector<SharedPtr<Page>> newlyPinned;
+    newlyPinned.reserve(selected.size());
+    auto rollback = FuncGuard(
+        [&]()
+        {
+            for (auto const& page : newlyPinned)
+            {
+                page->unpinGpuResidency();
+            }
+        });
+    for (auto const& [coordinates, holder] : selected)
+    {
+        auto const old = mGpuResidentPages.find(coordinates);
+        if (old == mGpuResidentPages.end() || old->second->page != holder->page)
+        {
+            holder->page->pinGpuResidency();
+            newlyPinned.push_back(holder->page);
+        }
+    }
+    for (auto const& [coordinates, holder] : mGpuResidentPages)
+    {
+        auto const replacement = selected.find(coordinates);
+        if (replacement == selected.end() || replacement->second->page != holder->page)
+        {
+            holder->page->unpinGpuResidency();
+        }
+    }
+    mGpuResidentPages = std::move(selected);
+    rollback.cancel();
+}
+
+void KvCache::setPrivatePages(std::vector<PageCoordinates> const& pages)
+{
+    KVCM2_API_GUARD();
+    auto const apiLock = mManager->lockExclusive();
+    if (mStatus == Status::CLOSED)
+    {
+        throw LogicError("Cannot select private pages of a closed cache");
+    }
+    std::set<PageCoordinates> selected;
+    for (auto const& coordinates : pages)
+    {
+        auto const& [beam, ordinal, lc] = coordinates;
+        if (beam < 0 || ordinal < 0 || lc < 0 || !_page(BlockOrdinal{ordinal}, BeamIndex{beam}, LifeCycleId{lc}))
+        {
+            throw std::invalid_argument("Private page coordinates must name an existing page");
+        }
+        selected.insert(coordinates);
+    }
+    mPrivatePages = std::move(selected);
+}
+
+std::vector<PageCoordinates> KvCache::getPrivatePages() const
+{
+    KVCM2_API_GUARD();
+    auto const apiLock = mManager->lockShared();
+    return {mPrivatePages.begin(), mPrivatePages.end()};
+}
+
+std::vector<PageCoordinates> KvCache::restoreSharedPages(std::vector<PageCoordinates> const& pages)
+{
+    KVCM2_API_GUARD();
+    auto const apiLock = mManager->lockExclusive();
+    if (!isActive())
+    {
+        throw LogicError("Restoring shared pages requires an active cache");
+    }
+    auto scope = recordEventScope();
+    std::vector<PageCoordinates> restored;
+    for (auto const& coordinates : pages)
+    {
+        auto const backing = mSharedHistoryPages.find(coordinates);
+        if (backing == mSharedHistoryPages.end())
+        {
+            continue;
+        }
+        auto const& [beam, ordinal, lc] = coordinates;
+        auto const shared = dynamicPointerCast<CommittedPage>(backing->second->page);
+        int const neededTokens = std::clamp(mHistoryLength - ordinal * mTokensPerBlock, 0, mTokensPerBlock);
+        if (!shared || shared->numTokensInBlock < neededTokens)
+        {
+            continue;
+        }
+        auto& bp = mBlocks.at(BlockOrdinal{ordinal}).pages.at(BeamIndex{beam}).at(LifeCycleId{lc});
+        auto const working = blockPageGetPage(bp);
+        auto const privatePage = dynamicPointerCast<CommittedPage>(working);
+        if (!mBlocks[BlockOrdinal{ordinal}].isCommitted() || !privatePage || privatePage->block != nullptr
+            || working->cacheLevel != kHotLevel)
+        {
+            continue;
+        }
+        bool const isLocked = std::holds_alternative<SharedPageLock>(bp);
+        bool const isResident = mGpuResidentPages.contains(coordinates);
+        auto holder = working->hold();
+        working->pinGpuResidency();
+        auto unpinWorking = FuncGuard([&]() { working->unpinGpuResidency(); });
+        auto restoreWorking = FuncGuard(
+            [&]()
+            {
+                bp = holder;
+                if (isLocked)
+                {
+                    bp = working->lock(*this, BeamIndex{beam}, BlockOrdinal{ordinal}, LifeCycleId{lc});
+                }
+            });
+        // The working holder and GPU protection remain alive until the shared page is ready.
+        bp = std::monostate{};
+        try
+        {
+            if (isLocked)
+            {
+                auto locks = batchedLockPages(
+                    *this, {{shared, BeamIndex{beam}, BlockOrdinal{ordinal}, LifeCycleId{lc}, kHotLevel}});
+                bp = std::move(locks.front());
+            }
+            else
+            {
+                bp = shared->hold();
+            }
+        }
+        catch (OutOfPagesError const&)
+        {
+            // Leave this coordinate private and protected; the caller may retry later.
+            continue;
+        }
+        if (isResident)
+        {
+            auto sharedHolder = shared->hold();
+            shared->pinGpuResidency();
+            mGpuResidentPages.at(coordinates) = std::move(sharedHolder);
+            working->unpinGpuResidency();
+        }
+        restoreWorking.cancel();
+        mSharedHistoryPages.erase(backing);
+        restored.push_back(coordinates);
+    }
+    return restored;
+}
+
+std::vector<SharedPtr<Page>> KvCache::retainedPages() const
+{
+    std::vector<SharedPtr<Page>> result;
+    auto append = [&](auto const& beams)
+    {
+        for (auto const& beam : beams)
+        {
+            for (auto const& bp : beam)
+            {
+                if (auto page = blockPageGetPage(bp))
+                {
+                    result.push_back(std::move(page));
+                }
+            }
+        }
+    };
+    for (auto const& block : mBlocks)
+    {
+        append(block.pages);
+    }
+    append(mSsmBlocks);
+    for (auto const& [coordinates, holder] : mGpuResidentPages)
+    {
+        result.push_back(holder->page);
+    }
+    for (auto const& [coordinates, holder] : mSharedHistoryPages)
+    {
+        result.push_back(holder->page);
+    }
+    return result;
+}
+
+void KvCache::_clearPageProtections()
+{
+    while (!mGpuResidentPages.empty())
+    {
+        _releaseGpuResidentPage(mGpuResidentPages.begin()->first);
+    }
+    mPrivatePages.clear();
+    mSharedHistoryPages.clear();
 }
 
 void KvCache::_offloadSparseHistory(HalfOpenRange<BlockOrdinal> range, int historyLength)
@@ -374,6 +645,11 @@ void KvCache::_offloadSparseHistory(HalfOpenRange<BlockOrdinal> range, int histo
                 TLLM_CHECK_DEBUG(page && page->status() == PageStatus::LOCKED);
                 if (page->cacheLevel == kSparseHistoryLevel)
                     continue;
+                if (page->gpuResidencyPinCount() > 0)
+                {
+                    deferred = true;
+                    continue;
+                }
                 auto const lock = page->holder.lock()->uniqLock.lock();
                 bool needsGpu = false;
                 for (auto const& owner : lock->owners())
@@ -477,6 +753,10 @@ void KvCache::activate()
         {
             bp = &mBlocks[ap.ordinal].pages[ap.beamIdx][ap.lcId];
         }
+        if (std::holds_alternative<SharedPageLock>(*bp))
+        {
+            throw LogicError("Suspended pages must not retain inference locks");
+        }
         auto& holder = std::get<SharedPtr<PageHolder>>(*bp);
         TLLM_CHECK_DEBUG(holder);
         // A reused partial block is only a copy source. resume() replaces it with a private GPU
@@ -535,14 +815,39 @@ bool KvCache::resume(std::optional<CUstream> stream, std::optional<bool> isDecod
     }
 
     // Check utilization against threshold.
-    auto const utilizations = mManager->storage().getUtilization(kHotLevel);
+    auto& storageMgr = mManager->storage();
+    auto utilizations = storageMgr.getUtilization(kHotLevel);
+    if (!mGpuResidentPages.empty())
+    {
+        TypedVec<PoolGroupIndex, SlotCount> residentSlots(storageMgr.numPoolGroups(kHotLevel), 0);
+        std::set<Page*> seen;
+        for (auto const& [coordinates, holder] : mGpuResidentPages)
+        {
+            auto const& page = holder->page;
+            if (page->cacheLevel != kHotLevel || !seen.insert(page.get()).second)
+            {
+                continue;
+            }
+            ++residentSlots[storageMgr.getPoolGroupIndex(kHotLevel, page->lifeCycle)];
+        }
+        for (PoolGroupIndex pool{0}; pool < residentSlots.size(); ++pool)
+        {
+            if (residentSlots[pool] == 0)
+            {
+                continue;
+            }
+            // These slots already belong to this request; allocation still checks actual free capacity.
+            utilizations[pool] = std::max(0.f,
+                utilizations[pool]
+                    - static_cast<float>(residentSlots[pool]) / static_cast<float>(storageMgr.numSlots(pool)));
+        }
+    }
     float const utilization = utilizations.empty() ? 0.f : *std::max_element(utilizations.begin(), utilizations.end());
     if (utilization > mManager->config().maxUtilForResume)
     {
         return false;
     }
 
-    auto& storageMgr = mManager->storage();
     auto ssmLcId = mManager->lifeCycles().ssmLifeCycleId();
     LifeCycleId numLc = storageMgr.numLifeCycles();
 
@@ -772,6 +1077,7 @@ bool KvCache::resume(std::optional<CUstream> stream, std::optional<bool> isDecod
         // Phase 1: Copy locked sources into private GPU slots. A shared sparse
         // prefix may be locked on host by another request and must stay there.
         std::vector<SharedPageLock*> srcLocks;
+        TypedVec<LifeCycleId, std::int32_t> copiedEncodeCounts(numLc, 0);
         for (LifeCycleId lcIdx{0}; lcIdx < numLc; ++lcIdx)
         {
             if (!deferredSlots[lcIdx].has_value())
@@ -797,6 +1103,7 @@ bool KvCache::resume(std::optional<CUstream> stream, std::optional<bool> isDecod
             CacheLevel const sourceLevel = lock->page()->cacheLevel;
             deferredCopiesStarted = true;
             storageMgr.copySlotData(lcIdx, kHotLevel, sourceLevel, newSlot.slotId(), lock->page()->slotId(), cudaStr);
+            copiedEncodeCounts[lcIdx] = lock->page()->lossyEncodeCount;
             if ((!ssmLcId.has_value() || lcIdx != *ssmLcId) && (recordManagerStats || recordRequestStats))
             {
                 bool const changed = mPendingStats.recordAllocationRange(lcIdx, lastOrdinal, lastOrdinal + 1,
@@ -852,8 +1159,19 @@ bool KvCache::resume(std::optional<CUstream> stream, std::optional<bool> isDecod
 
             auto newPage = makeShared<UncommittedPage>(*this, blockOrdinal, lcIdx, kHotLevel, beamIdx);
             newPage->setSlot(newSlot);
+            newPage->lossyEncodeCount = copiedEncodeCounts[lcIdx];
             auto newLock = newPage->lock(*this, beamIdx, blockOrdinal, lcIdx, /*skipWait=*/true);
+            PageCoordinates const coordinates{beamIdx.value(), blockOrdinal.value(), lcIdx.value()};
+            bool const retainResident = mGpuResidentPages.contains(coordinates);
+            if (retainResident)
+            {
+                _releaseGpuResidentPage(coordinates);
+            }
             *targetBp = std::move(newLock);
+            if (retainResident)
+            {
+                _retainGpuResidentPage(coordinates, newPage);
+            }
         }
 
         // Clear treeBlock for partial last block (mirrors Python: partial block is uncommitted).
@@ -915,6 +1233,10 @@ bool KvCache::prefetch(CacheLevel target)
     {
         auto page = _page(activePage.ordinal, activePage.beamIdx, activePage.lcId);
         if (!page)
+        {
+            continue;
+        }
+        if (page->gpuResidencyPinCount() > 0)
         {
             continue;
         }
@@ -1266,6 +1588,7 @@ bool KvCache::_hasReuseSource(BlockPage const& page)
 
 void KvCache::_clearBlocks()
 {
+    _clearPageProtections();
     // Drop last block first (mirrors Python: while self._blocks: self._blocks.pop()).
     while (!mBlocks.empty())
         mBlocks.pop_back();
@@ -1316,6 +1639,11 @@ CommittedPage* KvCache::_copyPageToTreeBlock(
         auto committed = makeShared<CommittedPage>(
             &storageMgr, treeBlock, lcIdx, lvl, numTokensInBlock, getPriority(treeBlock->ordinal(), lcIdx));
         committed->setSlot(newSlot);
+        committed->lossyEncodeCount = srcPage->lossyEncodeCount;
+        if (storageMgr.isLossyEncode(lcIdx, srcPage->cacheLevel, lvl))
+        {
+            committed->recordLossyEncode();
+        }
         // Drops the superseded page, deferred until the copy is issued: an
         // OutOfPagesError above must not destroy a usable shorter snapshot.
         treeBlock->replacePage(lcIdx, committed.get());
@@ -1821,6 +2149,20 @@ bool KvCache::resize(std::optional<int> capacity, std::optional<int> historyLeng
 
     mCapacity = newCap;
     _publishHistoryLength(newHist);
+    // SWA can discard mappings during growth. Retain protections for rollback until growth succeeds.
+    auto hasMapping = [&](PageCoordinates const& coordinates)
+    {
+        auto const& [beam, ordinal, lc] = coordinates;
+        return !blockPageIsNull(mBlocks.at(BlockOrdinal{ordinal}).pages.at(BeamIndex{beam}).at(LifeCycleId{lc}));
+    };
+    for (auto it = mGpuResidentPages.begin(); it != mGpuResidentPages.end();)
+    {
+        auto const current = it++;
+        if (!hasMapping(current->first))
+            _releaseGpuResidentPage(current->first);
+    }
+    std::erase_if(mPrivatePages, [&](auto const& coordinates) { return !hasMapping(coordinates); });
+    std::erase_if(mSharedHistoryPages, [&](auto const& entry) { return !hasMapping(entry.first); });
     _refreshGenerationAllocReady();
     TLLM_CHECK_DEBUG(_checkSanity());
     return true;
@@ -1892,9 +2234,18 @@ void KvCache::_decreaseCapacity(BlockOrdinal newNumBlocks)
     while (mBlocks.size() > newNumBlocks)
     {
         auto& sb = mBlocks.back();
-        for (auto& beamPages : sb.pages)
-            for (auto& bp : beamPages)
-                bp = std::monostate{};
+        BlockOrdinal const ordinal = mBlocks.size() - 1;
+        for (BeamIndex beam{0}; beam < sb.pages.size(); ++beam)
+        {
+            for (LifeCycleId lc{0}; lc < sb.pages[beam].size(); ++lc)
+            {
+                PageCoordinates const coordinates{beam.value(), ordinal.value(), lc.value()};
+                _releaseGpuResidentPage(coordinates);
+                mPrivatePages.erase(coordinates);
+                mSharedHistoryPages.erase(coordinates);
+                sb.pages[beam][lc] = std::monostate{};
+            }
+        }
         sb.treeBlock.reset();
         mBlocks.pop_back();
     }
@@ -1934,9 +2285,18 @@ void KvCache::_truncateBlockBeams(SeqBlock& block, BeamIndex beamWidth)
 {
     if (block.pages.size() <= beamWidth)
         return;
+    BlockOrdinal const ordinal{static_cast<int>(&block - mBlocks.raw().data())};
     BeamBlockPages removed;
     while (block.pages.size() > beamWidth)
     {
+        BeamIndex const beam = block.pages.size() - 1;
+        for (LifeCycleId lc{0}; lc < block.pages[beam].size(); ++lc)
+        {
+            PageCoordinates const coordinates{beam.value(), ordinal.value(), lc.value()};
+            _releaseGpuResidentPage(coordinates);
+            mPrivatePages.erase(coordinates);
+            mSharedHistoryPages.erase(coordinates);
+        }
         removed.push_back(std::move(block.pages.back()));
         block.pages.pop_back();
     }
@@ -2031,6 +2391,7 @@ void KvCache::_appendBeams(BeamIndex oldBeamWidth, BeamIndex newBeamWidth)
 
         auto page = makeShared<UncommittedPage>(*this, ordinal, lc, kHotLevel, beamIdx);
         page->setSlot(slot);
+        page->lossyEncodeCount = sourcePage->lossyEncodeCount;
         return page->lock(*this, beamIdx, ordinal, lc, /*skipWait=*/true);
     };
 
@@ -2159,38 +2520,36 @@ void KvCache::_lockHeldBlocks(std::vector<StaleBackup> const& backup)
 }
 
 // ---------------------------------------------------------------------------
-// _takeUncommittedPage — extract uncommitted pages from a SeqBlock.
-// Mirrors Python's _take_uncommitted_page().
+// Transfer a working page's storage while keeping request-local protection attached to its content.
 // ---------------------------------------------------------------------------
 
-TypedVec<LifeCycleId, KvCache::TakenPage> KvCache::_takeUncommittedPage(
-    SeqBlock& sb, BeamIndex beamIdx, std::optional<LifeCycleId> skipLc)
+void KvCache::_commitWorkingPage(
+    BlockPage& bp, PageCoordinates const& coordinates, SharedPtr<Block> const& block, int numTokens, bool publishToTree)
 {
-    LifeCycleId numLc = mManager->storage().numLifeCycles();
-    TypedVec<LifeCycleId, TakenPage> result(numLc, TakenPage{nullptr, false});
-    for (LifeCycleId lc{0}; lc < numLc; ++lc)
-    {
-        if ((skipLc.has_value() && lc == *skipLc) || isPrivateLifeCycle(mManager->lifeCycles()[lc]))
+    auto up = dynamicPointerCast<UncommittedPage>(blockPageGetPage(bp));
+    TLLM_CHECK_WITH_INFO(up, "Working page must be uncommitted");
+    bool const locked = std::holds_alternative<SharedPageLock>(bp);
+    bool const resident = mGpuResidentPages.contains(coordinates);
+    auto const& [beam, ordinal, lc] = coordinates;
+    SharedPtr<Page> replacement = up;
+    _releaseGpuResidentPage(coordinates);
+    bp = std::monostate{};
+    auto restoreMapping = FuncGuard(
+        [&]()
         {
-            continue;
-        }
-        auto& bp = sb.pages[beamIdx][lc];
-        if (auto* lock = std::get_if<SharedPageLock>(&bp))
-        {
-            auto up = dynamicPointerCast<UncommittedPage>(lock->page());
-            TLLM_CHECK_WITH_INFO(up, "page must be UncommittedPage");
-            result[lc] = {up, true};
-        }
-        else if (auto* holder = std::get_if<SharedPtr<PageHolder>>(&bp))
-        {
-            TLLM_CHECK_DEBUG(*holder);
-            auto up = dynamicPointerCast<UncommittedPage>((*holder)->page);
-            TLLM_CHECK_WITH_INFO(up, "page must be UncommittedPage");
-            result[lc] = {up, false};
-        }
-        bp = std::monostate{};
-    }
-    return result;
+            bp = std::monostate{};
+            bp = locked ? BlockPage{replacement->lock(*this, BeamIndex{beam}, BlockOrdinal{ordinal}, LifeCycleId{lc})}
+                        : BlockPage{replacement->hold()};
+            if (resident)
+                _retainGpuResidentPage(coordinates, replacement);
+        });
+    auto committed = up->convertToCommitted(block, finishEvent(), numTokens, publishToTree);
+    replacement = committed;
+    bp = locked ? BlockPage{committed->lock(*this, BeamIndex{beam}, BlockOrdinal{ordinal}, LifeCycleId{lc})}
+                : BlockPage{committed->hold()};
+    if (resident)
+        _retainGpuResidentPage(coordinates, committed);
+    restoreMapping.cancel();
 }
 
 // ---------------------------------------------------------------------------
@@ -2249,20 +2608,13 @@ void KvCache::_commitBlock(int ord, bool isLast, bool commitSsm, bool moveSsm)
 
     if (blockIsNew)
     {
-        // New block: take uncommitted pages, convert to committed.
-        // Mirrors Python's _take_uncommitted_page + convert path.
-        auto taken = _takeUncommittedPage(sb, kDefaultBeamIndex, ssmLcId);
         for (LifeCycleId lc{0}; lc < numLc; ++lc)
         {
-            auto& [up, locked] = taken[lc];
-            if (!up)
+            if ((ssmLcId.has_value() && lc == *ssmLcId) || isPrivateLifeCycle(mManager->lifeCycles()[lc]))
                 continue;
-            auto committed = up->convertToCommitted(newBlock, finishEvent(), numTokens);
-            if (locked)
-                sb.pages[kDefaultBeamIndex][lc]
-                    = committed->lock(*this, kDefaultBeamIndex, static_cast<BlockOrdinal>(ord), lc);
-            else
-                sb.pages[kDefaultBeamIndex][lc] = committed->hold();
+            auto& bp = sb.pages[kDefaultBeamIndex][lc];
+            if (!blockPageIsNull(bp))
+                _commitWorkingPage(bp, {kDefaultBeamIndex.value(), ord, lc.value()}, newBlock, numTokens);
         }
         sb.treeBlock = newBlock;
         ++mNumCommittedBlocks;
@@ -2278,11 +2630,22 @@ void KvCache::_commitBlock(int ord, bool isLast, bool commitSsm, bool moveSsm)
         // Mirrors Python's `elif tree_block.is_full and allow_seq_rebasing and is_full` path.
         std::vector<BatchedLockTarget> reuseTasks;
         std::vector<LifeCycleId> missingPages;
+        std::vector<LifeCycleId> privatePages;
         std::vector<std::pair<LifeCycleId, BlockPage>> originalPages;
         std::vector<StaleBackup> originalLocks;
+        std::vector<std::pair<PageCoordinates, SharedPtr<Page>>> originalProtections;
+        originalProtections.reserve(numLc.value());
         auto restorePages = FuncGuard(
             [&]()
             {
+                for (auto const& [coordinates, page] : originalProtections)
+                {
+                    auto& current = mGpuResidentPages.at(coordinates);
+                    auto replacement = page->hold();
+                    page->pinGpuResidency();
+                    current->page->unpinGpuResidency();
+                    current = std::move(replacement);
+                }
                 for (auto& [lc, bp] : originalPages)
                     sb.pages[kDefaultBeamIndex][lc] = std::move(bp);
                 _lockHeldBlocks(originalLocks);
@@ -2311,6 +2674,11 @@ void KvCache::_commitBlock(int ord, bool isLast, bool commitSsm, bool moveSsm)
             {
                 missingPages.push_back(lc);
             }
+            else if (mPrivatePages.contains({kDefaultBeamIndex.value(), ord, lc.value()}))
+            {
+                // Keep this request's recomputed content; retain, but do not overwrite, shared history.
+                privatePages.push_back(lc);
+            }
             else
             {
                 // Downgrade lock to holder for our page; reuse the existing page.
@@ -2323,8 +2691,11 @@ void KvCache::_commitBlock(int ord, bool isLast, bool commitSsm, bool moveSsm)
                 }
                 originalPages.emplace_back(lc, std::move(bp));
                 bp = std::monostate{};
-                reuseTasks.push_back({existingPage->sharedFromThis(), kDefaultBeamIndex, static_cast<BlockOrdinal>(ord),
-                    lc, _lockLevel(*existingPage, static_cast<BlockOrdinal>(ord))});
+                PageCoordinates const coordinates{kDefaultBeamIndex.value(), ord, lc.value()};
+                reuseTasks.push_back(
+                    {existingPage->sharedFromThis(), kDefaultBeamIndex, static_cast<BlockOrdinal>(ord), lc,
+                        mGpuResidentPages.contains(coordinates) ? kHotLevel
+                                                                : _lockLevel(*existingPage, BlockOrdinal{ord})});
             }
         }
         if (!reuseTasks.empty())
@@ -2334,6 +2705,16 @@ void KvCache::_commitBlock(int ord, bool isLast, bool commitSsm, bool moveSsm)
             {
                 LifeCycleId lc = reuseTasks[ri].lifeCycle;
                 sb.pages[kDefaultBeamIndex][lc] = std::move(locks[ri]);
+                PageCoordinates const coordinates{kDefaultBeamIndex.value(), ord, lc.value()};
+                if (auto protectedPage = mGpuResidentPages.find(coordinates); protectedPage != mGpuResidentPages.end())
+                {
+                    auto const page = reuseTasks[ri].page;
+                    auto holder = page->hold();
+                    page->pinGpuResidency();
+                    originalProtections.emplace_back(coordinates, protectedPage->second->page);
+                    protectedPage->second->page->unpinGpuResidency();
+                    protectedPage->second = std::move(holder);
+                }
             }
             if (mIsDecoding)
                 _offloadSparseHistory({ord, ord + 1}, mHistoryLength);
@@ -2346,13 +2727,16 @@ void KvCache::_commitBlock(int ord, bool isLast, bool commitSsm, bool moveSsm)
             auto up = dynamicPointerCast<UncommittedPage>(blockPageGetPage(bp));
             if (!up)
                 continue;
-            bool const isLocked = std::holds_alternative<SharedPageLock>(bp);
-            bp = std::monostate{};
-            auto committed = up->convertToCommitted(newBlock, finishEvent(), numTokens);
+            _commitWorkingPage(bp, {kDefaultBeamIndex.value(), ord, lc.value()}, newBlock, numTokens);
             if (newBlock->eventSink)
                 newBlock->eventSink->addStoredLifeCycle(*newBlock, lc);
-            bp = isLocked ? BlockPage{committed->lock(*this, kDefaultBeamIndex, BlockOrdinal{ord}, lc)}
-                          : BlockPage{committed->hold()};
+        }
+        for (LifeCycleId lc : privatePages)
+        {
+            PageCoordinates const coordinates{kDefaultBeamIndex.value(), ord, lc.value()};
+            auto const existing = newBlock->getPage(lc)->sharedFromThis();
+            mSharedHistoryPages.insert_or_assign(coordinates, existing->hold());
+            _commitWorkingPage(sb.pages[kDefaultBeamIndex][lc], coordinates, newBlock, numTokens, false);
         }
         // Don't clear SSM storage on rebase — the existing block may have a valid snapshot.
         sb.treeBlock = newBlock;
@@ -2396,9 +2780,13 @@ void KvCache::_commitBlock(int ord, bool isLast, bool commitSsm, bool moveSsm)
             auto const staleRange = _getStaleRange(mHistoryLength, lc);
             if (staleRange.contains(BlockOrdinal{ord}))
             {
-                for (auto& beamBlock : sb.pages)
+                for (BeamIndex beam{0}; beam < sb.pages.size(); ++beam)
                 {
-                    beamBlock[lcIdx] = std::monostate{};
+                    PageCoordinates const coordinates{beam.value(), ord, lcIdx.value()};
+                    _releaseGpuResidentPage(coordinates);
+                    mPrivatePages.erase(coordinates);
+                    mSharedHistoryPages.erase(coordinates);
+                    sb.pages[beam][lcIdx] = std::monostate{};
                 }
             }
         }
@@ -2693,9 +3081,13 @@ void KvCache::_onStopCommitting()
         {
             auto& sb = mBlocks[ord];
             TLLM_CHECK_DEBUG(!sb.isCommitted());
-            for (auto& beamPages : sb.pages)
+            for (BeamIndex beam{0}; beam < sb.pages.size(); ++beam)
             {
-                auto& bp = beamPages[lcIdx];
+                PageCoordinates const coordinates{beam.value(), ord.value(), lcIdx.value()};
+                _releaseGpuResidentPage(coordinates);
+                mPrivatePages.erase(coordinates);
+                mSharedHistoryPages.erase(coordinates);
+                auto& bp = sb.pages[beam][lcIdx];
                 if (blockPageIsNull(bp))
                 {
                     // Nothing to release: scratch block, commit_min_snapshot early
@@ -3106,10 +3498,9 @@ bool KvCache::_checkSanity() const
                 }
                 else
                 {
-                    // The page must be present, and locked exactly when the cache is
-                    // active; a suspended cache holds it instead.
+                    bool const locked = mStatus == Status::ACTIVE;
                     TLLM_CHECK_DEBUG(!std::holds_alternative<std::monostate>(bp)
-                        && ((mStatus == Status::ACTIVE) == std::holds_alternative<SharedPageLock>(bp)));
+                        && (locked == std::holds_alternative<SharedPageLock>(bp)));
                 }
 
                 if (!blockPageIsNull(bp))

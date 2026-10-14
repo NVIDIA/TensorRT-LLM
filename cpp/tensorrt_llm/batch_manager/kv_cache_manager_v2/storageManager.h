@@ -170,6 +170,9 @@ public:
     // Check if a page is evictable (optionally at a target level).
     bool isEvictable(Page const& page, std::optional<CacheLevel> level = std::nullopt) const noexcept;
 
+    //! Whether a transfer adds one lossy encoding to the destination content.
+    [[nodiscard]] bool isLossyEncode(LifeCycleId lifeCycle, CacheLevel srcLevel, CacheLevel dstLevel) const noexcept;
+
     // Ensure the requested free slots exist at this level (evicting pages as needed).
     void prepareFreeSlots(CacheLevel level, TypedVec<PoolGroupIndex, SlotCount> const& requirements,
         MigrationRecorder const& migrationRecorder = {}, DropRecorder const& dropRecorder = {});

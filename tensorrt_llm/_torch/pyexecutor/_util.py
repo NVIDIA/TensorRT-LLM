@@ -2925,6 +2925,10 @@ class KvCacheCreator:
         resources[
             ResourceManagerType.CROSS_KV_CACHE_MANAGER] = cross_kv_cache_manager
         if (compression_manager is not None
+                and not compression_manager.uses_iteration_lifecycle):
+            compression_manager.bind_kv_cache_managers(kv_cache_manager,
+                                                       draft_kv_cache_manager)
+        if (compression_manager is not None
                 and compression_manager.uses_iteration_lifecycle):
             resources[ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER] = (
                 compression_manager)

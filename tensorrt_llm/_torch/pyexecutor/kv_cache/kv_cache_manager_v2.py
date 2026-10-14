@@ -136,6 +136,8 @@ if TYPE_CHECKING:
     from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
     from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
 
+    from ..resource_manager import KVCacheCompressionManager
+
 KV_CACHE_ITERATION_STATS_DELTA_FIELDS = _KV_CACHE_ITERATION_STATS_DELTA_FIELDS
 KV_CACHE_ITERATION_STATS_REUSE_FIELDS = (
     "iter_reused_blocks",
@@ -1236,6 +1238,7 @@ class KVCacheManagerV2(BaseResourceManager):
     # connector-reservation cap read it on instances tests build without
     # running __init__. Zero disables the spec recompute tail.
     _spec_recompute_tail: int = 0
+    _cold_page_codec_provider: Optional["KVCacheCompressionManager"] = None
     # True on hybrid Mamba/GDN managers; __init__ then coerces a positive
     # recompute tail to a full re-prefill.
     _has_recurrent_state: bool = False
@@ -1287,11 +1290,14 @@ class KVCacheManagerV2(BaseResourceManager):
         disable_overlap_scheduler: bool = False,
         kv_events_config: Optional[KVEventsConfig] = None,
         is_estimating_kv_cache: bool = False,
-        cold_page_codec_provider: Optional[object] = None,
+        cold_page_codec_provider: Optional["KVCacheCompressionManager"] = None,
         joint_kv_cache_reuse: bool = False,
         max_cuda_graph_batch_size: Optional[int] = None,
         **kwargs,
     ) -> None:
+        self._cold_page_codec_provider = cold_page_codec_provider
+        if cold_page_codec_provider is not None:
+            cold_page_codec_provider.validate_gpu_resident_token_bounds(tokens_per_block)
         self.mapping = mapping
         self.dtype = dtype
         self._validate_speculative_config(spec_config)
@@ -3565,6 +3571,7 @@ class KVCacheManagerV2(BaseResourceManager):
         new_capacity = pre_capacity + 1 + draft_slots
         if not kv_cache.resize(new_capacity):
             return False
+        self._update_gpu_page_protection(kv_cache)
         self._fill_fresh_kv_pages(req.py_request_id)
         self._log_window_crossing(req, kv_cache, pre_capacity, new_capacity, "generation")
         if is_helix_req:
@@ -3606,6 +3613,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 f"{req.py_request_id} from {kv_cache.capacity} to "
                 f"{reverted_cap}"
             )
+        self._update_gpu_page_protection(kv_cache)
 
     def revert_allocate_context(self, req: LlmRequest) -> bool:
         """Undo this iteration's context resize. False means the cache was dropped,
@@ -3637,7 +3645,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 f"to {pre_cap}"
             )
         if pre_cap > 0:
-            kv_cache.suspend()
+            self._suspend_cache(kv_cache)
         return True
 
     def _set_page_index_bufs(self, request_id: int, kv_cache: _KVCache) -> None:
@@ -3690,6 +3698,20 @@ class KVCacheManagerV2(BaseResourceManager):
         if self.sparse_metadata_batch is not None:
             index = self.index_mapper.get_index(request_id)
             self.sparse_metadata_batch.add(kv_cache, index)
+
+        self._update_gpu_page_protection(kv_cache)
+
+    def _update_gpu_page_protection(
+        self, kv_cache: _KVCache, confirmed_length: int | None = None
+    ) -> None:
+        if self._cold_page_codec_provider is not None:
+            self._cold_page_codec_provider.update_gpu_page_protection(
+                kv_cache, confirmed_length=confirmed_length
+            )
+
+    def _suspend_cache(self, kv_cache: _KVCache) -> None:
+        self._update_gpu_page_protection(kv_cache)
+        kv_cache.suspend()
 
     def _resume_and_restore(self, req_id: int, kv_cache, optional_reuse_groups=None) -> bool:
         """Resume a suspended KV cache and restore its page index buffers.
@@ -3767,29 +3789,56 @@ class KVCacheManagerV2(BaseResourceManager):
             # matched, which is also the case where no branch point applies.
             num_lookup_tokens = None
             if kv_cache is None:
-                if self.enable_block_reuse:
-                    # Empty (not None) for a zero limit: lookup is off, but
-                    # newly computed blocks may still be committed.
-                    tokens = self._context_reuse_tokens(req, reuse_limit)
-                else:
-                    tokens = None
-                # Taken from the augmented sequence rather than derived as
-                # prompt_len - 1, because augmentation can change the length
-                # for multimodal requests.
-                num_lookup_tokens = len(tokens) if tokens is not None else None
-                kv_cache = self._create_kv_cache(
-                    req.py_request_id,
-                    req.lora_task_id,
-                    tokens,
-                    cache_salt=req.cache_salt,
-                    is_dummy=req.is_dummy,
-                    enable_request_stats=req.return_perf_metrics,
-                    expected_prompt_length=(
-                        req.total_input_len_cp if self._has_cp_helix else req.prompt_len
-                    ),
+                provider = self._cold_page_codec_provider
+                reuse_checker = (
+                    provider.create_precision_reuse_checker()
+                    if provider is not None
+                    and self.enable_block_reuse
+                    and not req.is_disagg_generation_init_state
+                    else None
                 )
-                if kv_cache is None:
-                    return None
+                while True:
+                    if self.enable_block_reuse:
+                        # Empty (not None) for a zero limit: lookup is off, but
+                        # newly computed blocks may still be committed.
+                        tokens = self._context_reuse_tokens(req, reuse_limit)
+                    else:
+                        tokens = None
+                    # Augmentation may change the lookup length for multimodal requests.
+                    num_lookup_tokens = len(tokens) if tokens is not None else None
+                    kv_cache = self._create_kv_cache(
+                        req.py_request_id,
+                        req.lora_task_id,
+                        tokens,
+                        cache_salt=req.cache_salt,
+                        is_dummy=req.is_dummy,
+                        enable_request_stats=req.return_perf_metrics,
+                        expected_prompt_length=(
+                            req.total_input_len_cp if self._has_cp_helix else req.prompt_len
+                        ),
+                    )
+                    if kv_cache is None:
+                        return None
+                    if reuse_checker is None:
+                        break
+                    limit = reuse_checker(kv_cache)
+                    if limit is not None:
+                        self._discard_tentative_context_cache(req.py_request_id, kv_cache)
+                        reuse_limit = limit
+                        continue
+                    kv_cache.cuda_stream = self._stream.cuda_stream
+                    if self._connector_may_serve(req):
+                        kv_cache.enable_swa_scratch_reuse = False
+                    if not self._resume_context_cache(req, kv_cache):
+                        self._discard_tentative_context_cache(req.py_request_id, kv_cache)
+                        return None
+                    # Protection prevents later migration; re-read provenance after
+                    # installing it to catch encoding between the first query and resume.
+                    limit = reuse_checker(kv_cache)
+                    if limit is None:
+                        break
+                    self._discard_tentative_context_cache(req.py_request_id, kv_cache)
+                    reuse_limit = limit
                 kv_cache.cuda_stream = self._stream.cuda_stream
 
             if not self.enable_block_reuse:
@@ -3832,6 +3881,17 @@ class KVCacheManagerV2(BaseResourceManager):
         if not self._resume_context_cache(req, kv_cache):
             return None
         return kv_cache.num_committed_tokens
+
+    def _discard_tentative_context_cache(self, request_id: int, kv_cache: _KVCache) -> None:
+        """Release an unexecuted claim without changing request or connector state."""
+        if self.sparse_metadata_batch is not None:
+            self.sparse_metadata_batch.remove(kv_cache)
+        kv_cache.discard_pending_stats()
+        kv_cache.close()
+        self.kv_cache_map.pop(request_id)
+        self._request_stats_enabled_ids.discard(request_id)
+        self.index_mapper.remove_sequence(request_id)
+        self.impl.clear_stats_excluded(request_id)
 
     def context_replay_tokens(self, req: LlmRequest) -> int | None:
         """Pending recovery rows fixed at resume; None keeps ordinary budgeting."""
@@ -3920,8 +3980,9 @@ class KVCacheManagerV2(BaseResourceManager):
                 self.free_resources(req)
                 rewind_context_after_cache_drop(req, self.tokens_per_block)
             elif req.is_first_context_chunk:
-                kv_cache.suspend()
+                self._suspend_cache(kv_cache)
             return False
+        self._update_gpu_page_protection(kv_cache)
         self._fill_fresh_kv_pages(req.py_request_id)
         self._log_window_crossing(req, kv_cache, pre_cap, capacity, "context")
         req.py_ctx_pre_resize_cap = pre_cap if capacity > pre_cap else None
@@ -3937,7 +3998,10 @@ class KVCacheManagerV2(BaseResourceManager):
             return False
 
         target = req.context_current_position + num_tokens + self.num_extra_kv_tokens
-        return kv_cache.resize(max(kv_cache.capacity, target))
+        success = kv_cache.resize(max(kv_cache.capacity, target))
+        if success:
+            self._update_gpu_page_protection(kv_cache)
+        return success
 
     def prepare_disagg_gen_init(self, req: LlmRequest) -> bool:
         """Prepare KV cache for a disagg generation init request.
@@ -3980,8 +4044,9 @@ class KVCacheManagerV2(BaseResourceManager):
         success = kv_cache.resize(capacity, history_len)
         if not success:
             if req.is_first_context_chunk:
-                kv_cache.suspend()
+                self._suspend_cache(kv_cache)
             return False
+        self._update_gpu_page_protection(kv_cache)
         self._fill_fresh_kv_pages(req.py_request_id)
         self._log_window_crossing(req, kv_cache, pre_cap, capacity, "disagg_gen_init")
         req.py_ctx_pre_resize_cap = pre_cap if capacity > pre_cap else None
@@ -4042,12 +4107,13 @@ class KVCacheManagerV2(BaseResourceManager):
                 f"(target capacity {new_capacity})"
             )
         self._allocated_draft_lens[request.py_request_id] = current_draft_len
+        self._update_gpu_page_protection(kv_cache)
 
     def suspend_request(self, req: LlmRequest) -> None:
         """Suspend a request's KV cache, allowing pages to migrate to a secondary tier."""
         kv_cache = self.kv_cache_map.get(req.py_request_id)
         if kv_cache is not None and kv_cache.is_active:
-            kv_cache.suspend()
+            self._suspend_cache(kv_cache)
 
     def resume_request(self, req: LlmRequest) -> bool:
         """Resume a previously-suspended KV cache for *req*.
@@ -4555,6 +4621,7 @@ class KVCacheManagerV2(BaseResourceManager):
             # grew nothing there is no record, and this growth would then
             # survive a `revert_allocate_context`.
             req.py_ctx_pre_resize_cap = pre_cap
+        self._update_gpu_page_protection(kv_cache)
         return True
 
     def _mark_connector_prefix_populated(
@@ -5619,7 +5686,9 @@ class KVCacheManagerV2(BaseResourceManager):
             )
             # TODO: On a disaggregated prefill server, pass is_end=True for
             # the last context chunk to improve performance.
+            self._update_gpu_page_protection(kv_cache, commit_end)
             kv_cache.commit(tokens)
+            self._update_gpu_page_protection(kv_cache)
         if request.context_remaining_length == 0:
             kv_cache.stop_committing()
 
@@ -5948,6 +6017,10 @@ class KVCacheManagerV2(BaseResourceManager):
         if self.conversation_manager is not None:
             self.conversation_manager.clear()
         self.impl.shutdown()
+        provider = self._cold_page_codec_provider
+        self._cold_page_codec_provider = None
+        if provider is not None and provider.kv_cache_manager is self:
+            provider.shutdown()
         # Shut the streaming event manager down last so removals emitted during
         # cache / impl teardown (via the radix tree's own event-manager
         # reference) are still flushed before the publisher stops. Do not null
@@ -6370,6 +6443,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 "Failed to resize history length of KV cache for request "
                 f"{req.py_request_id} to {history_length} tokens at context update"
             )
+        self._update_gpu_page_protection(kv_cache)
 
     def update_resources(
         self,
@@ -6430,6 +6504,7 @@ class KVCacheManagerV2(BaseResourceManager):
                     f"{history_length} tokens at generation update"
                 )
             self._allocated_draft_lens.pop(req.py_request_id, None)
+            self._update_gpu_page_protection(kv_cache)
 
     def copy_batch_block_offsets(
         self,

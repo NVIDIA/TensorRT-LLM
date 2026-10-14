@@ -1773,6 +1773,17 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
     nb::class_<kv::PlannedDropHandle>(m, "PlannedDropHandle")
         .def("drop", &kv::PlannedDropHandle::drop, nb::call_guard<nb::gil_scoped_release>());
 
+    nb::class_<kv::CachePageInfo>(m, "CachePageInfo")
+        .def_ro("beam_index", &kv::CachePageInfo::beamIndex)
+        .def_ro("block_ordinal", &kv::CachePageInfo::blockOrdinal)
+        .def_ro("layer_group_id", &kv::CachePageInfo::layerGroupId)
+        .def_ro("cache_level", &kv::CachePageInfo::cacheLevel)
+        .def_ro("num_tokens", &kv::CachePageInfo::numTokens)
+        .def_ro("lossy_encode_count", &kv::CachePageInfo::lossyEncodeCount)
+        .def_ro("is_sparse", &kv::CachePageInfo::isSparse)
+        .def_ro("window_size", &kv::CachePageInfo::windowSize)
+        .def_ro("has_shared_page", &kv::CachePageInfo::hasSharedPage);
+
     nb::class_<kv::PageStorageSnapshot>(m, "PageStorageSnapshot")
         .def_prop_ro("version", &kv::PageStorageSnapshot::version)
         .def_prop_ro("row", &kv::PageStorageSnapshot::row)
@@ -1926,6 +1937,14 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def("record_page_storage_read", &kv::KvCache::recordPageStorageRead, nb::arg("cuda_stream"),
             nb::call_guard<nb::gil_scoped_release>())
         .def("suspend", &kv::KvCache::suspend, nb::call_guard<nb::gil_scoped_release>())
+        .def("get_page_info", &kv::KvCache::getPageInfo, nb::call_guard<nb::gil_scoped_release>())
+        .def("set_gpu_resident_pages", &kv::KvCache::setGpuResidentPages, nb::arg("pages"),
+            nb::call_guard<nb::gil_scoped_release>())
+        .def("get_private_pages", &kv::KvCache::getPrivatePages, nb::call_guard<nb::gil_scoped_release>())
+        .def("set_private_pages", &kv::KvCache::setPrivatePages, nb::arg("pages"),
+            nb::call_guard<nb::gil_scoped_release>())
+        .def("restore_shared_pages", &kv::KvCache::restoreSharedPages, nb::arg("pages"),
+            nb::call_guard<nb::gil_scoped_release>())
         .def(
             "prefetch", [](kv::KvCache& self, int target) { return self.prefetch(kv::CacheLevel{target}); },
             nb::arg("target"), nb::call_guard<nb::gil_scoped_release>())

@@ -194,6 +194,28 @@ defines its compressed format and implements the relevant APIs below.
 | `encode_cold_pages()` | Encode a batch of KV Pages into the cold-page representation |
 | `decode_cold_pages()` | Decode a batch of cold Pages back into the hot KV representation |
 
+`ColdPageQuantizationCompression` provides optional First/Last-N protection
+through `first_n` and `last_n`. Both default to `0`, leaving page protection
+disabled. Counts must be nonnegative KV-block-size multiples and include
+prefill and accepted decode tokens. Format subclasses inherit this policy;
+other compression methods do not need to define these options.
+
+The compression manager selects protected dense, non-sliding-window pages and
+moves the tail window as confirmed tokens advance. KVCM supplies page
+information, GPU residency protection, and private/shared page switching; it
+does not decide the protection policy.
+
+For reuse, the compression manager checks each required protected page's
+`lossy_encode_count`. A nonzero count, including `-1` for unknown history,
+caps reuse at the earliest affected page. Normal prefill recomputes the suffix
+using the restored prefix as input. Protected recomputed pages remain private
+without overwriting existing shared entries. When they leave the window, the
+manager requests a switch back to existing shared pages; if that switch fails,
+the valid private pages remain available for a later retry.
+
+This revision covers local dense Attention. Precision history is not yet
+tracked across disaggregated-serving or connector transfers.
+
 ## Ownership and failure boundaries
 
 | Component | Owns | Does not own |

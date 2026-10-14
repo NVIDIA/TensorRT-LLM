@@ -566,6 +566,11 @@ class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
             runtime_type=runtime_type if runtime_type is not None else 0,
         )
 
+    def is_lifecycle_lossless(
+        self, codec_state: _Nvfp4ColdPageCodecState, metadata: _Nvfp4ColdPageMetadata
+    ) -> bool:
+        return bool(torch.all(metadata.integers[:, 1] == _LOSSLESS_TRANSFORM).item())
+
     def build_lifecycle_metadata(
         self, codec_state: _Nvfp4ColdPageCodecState, lifecycle: object
     ) -> _Nvfp4ColdPageMetadata:

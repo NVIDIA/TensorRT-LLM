@@ -89,6 +89,11 @@ public:
         return findGroup(layerGroupId) == nullptr ? PageIndexLocation::kBadLocation : mCopier.pageIndexLocation();
     }
 
+    [[nodiscard]] bool isLossless(LayerGroupId layerGroupId) const noexcept override
+    {
+        return findGroup(layerGroupId) != nullptr;
+    }
+
     bool encode(LayerGroupId layerGroupId, void* dstBasePtr, PageIndexPair const* pageIndices, size_t numBasePages,
         cudaStream_t stream) noexcept override
     {
@@ -273,6 +278,11 @@ private:
 
 IKvCacheColdPageCodec::IKvCacheColdPageCodec() = default;
 IKvCacheColdPageCodec::~IKvCacheColdPageCodec() = default;
+
+bool IKvCacheColdPageCodec::isLossless(LayerGroupId) const noexcept
+{
+    return false;
+}
 
 LayerGroupId IKvCacheColdPageCodec::getBatchingLayerGroupId(LayerGroupId layerGroupId) const noexcept
 {

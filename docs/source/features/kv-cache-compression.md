@@ -207,6 +207,44 @@ NVFP4. See [Quantization](quantization.md) for active KV-cache quantization.
 For complete single-GPU and disaggregated-serving configurations, see the
 [NVFP4 cold-page compression example](source:examples/kv_cache_compression/nvfp4_cold_page.md).
 
+#### First/Last-N Protection
+
+Set `first_n` and `last_n` in `ColdPageQuantizationCompressionConfig` to keep
+dense, non-sliding-window Attention pages that intersect the first or last N
+confirmed tokens on the GPU while a request is live. Both options default to
+`0` and must be multiples of the KV block size. Counts include prefill and
+decode; the last-token window moves as confirmed tokens are added. A page that
+partly overlaps either window is protected in full. If the confirmed sequence
+length is at most `first_n + last_n`, every dense Attention page is protected.
+Allocated padding and unaccepted speculative tokens do not extend the window.
+
+For example, with a 64-token KV block size:
+
+```yaml
+kv_cache_compression_config:
+  algorithm: quantization_for_cold_page
+  quant: nvfp4
+  first_n: 64
+  last_n: 256
+```
+
+Protection preserves the existing hot-cache precision; it does not upgrade FP8
+to BF16. Protected pages remain charged to GPU capacity, including during
+suspension. Sliding-window Attention and independent recurrent/compressor
+state keep their existing lifecycles. Finishing or cancelling the request
+releases its protection.
+
+Block reuse stays enabled. If a required first or last page was previously
+compressed, or its precision history is unknown, reuse stops before that page
+and normal prefill recomputes the remaining tokens using the restored prefix.
+Recomputed protected pages stay private to the request instead of replacing
+existing shared cache entries. As pages leave the protected window, the request
+can return to those shared entries. After the request finishes, its pages may
+be compressed for later reuse.
+
+This revision covers local dense Attention. Precision history is not yet
+tracked across disaggregated-serving or connector transfers.
+
 #### Skipping RoPE Quantization
 
 In some models, part of each K vector carries positional information (RoPE).

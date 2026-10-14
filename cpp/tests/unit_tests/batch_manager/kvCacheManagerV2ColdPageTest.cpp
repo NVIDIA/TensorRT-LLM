@@ -591,6 +591,11 @@ public:
         return submitted && decodeCalls != rejectDecodeCall;
     }
 
+    bool isLossless(LayerGroupId) const noexcept override
+    {
+        return lossless;
+    }
+
     size_t encodeCalls = 0;
     size_t encodedPages = 0;
     size_t rejectEncodeCall = 0;
@@ -598,6 +603,7 @@ public:
     size_t decodedPages = 0;
     size_t rejectDecodeCall = 0;
     cudaStream_t encodeStream{};
+    bool lossless = false;
 
 private:
     std::unique_ptr<IKvCacheColdPageCodec> mCodec = createDefaultKvCacheColdPageCodec();
@@ -742,6 +748,99 @@ TEST(KvCacheManagerV2ColdPageTest, ColdGpuTierSupportsSingleSlotRoundTrip)
 
     storage.releaseSlot(lifeCycle, coldLevel, std::move(coldSlot));
     storage.releaseSlot(lifeCycle, kHotLevel, std::move(hotSlot));
+}
+
+TEST(KvCacheManagerV2ColdPageTest, LossyEncodeCountSaturatesAndPreservesUnknown)
+{
+    class ContentPage final : public Page
+    {
+    public:
+        ContentPage()
+            : Page(nullptr, LifeCycleId{0}, kHotLevel, kPriorityDefault)
+        {
+        }
+
+        bool isCommitted() const override
+        {
+            return false;
+        }
+    };
+
+    ContentPage page;
+    EXPECT_EQ(page.lossyEncodeCount, 0);
+    page.recordLossyEncode();
+    EXPECT_EQ(page.lossyEncodeCount, 1);
+    page.lossyEncodeCount = std::numeric_limits<std::int32_t>::max();
+    page.recordLossyEncode();
+    EXPECT_EQ(page.lossyEncodeCount, std::numeric_limits<std::int32_t>::max());
+    page.lossyEncodeCount = -1;
+    page.recordLossyEncode();
+    EXPECT_EQ(page.lossyEncodeCount, -1);
+}
+
+TEST(KvCacheManagerV2ColdPageTest, CountsOnlySuccessfullyInstalledLossyEncodings)
+{
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    for (bool const lossless : {false, true})
+    {
+        SCOPED_TRACE(lossless);
+        auto codec = std::make_unique<ObservingColdPageCodec>();
+        codec->lossless = lossless;
+        auto* observer = codec.get();
+        auto manager = std::make_shared<KvCacheManager>(makeTieredConfig(), nullptr, std::move(codec));
+        auto const apiLock = manager->lockExclusive();
+        auto& storage = manager->storage();
+        LifeCycleId const lifeCycle{0};
+        CacheLevel const coldLevel{1};
+        auto slots = storage.newGpuSlots(TypedVec<LifeCycleId, SlotCount>(LifeCycleId{1}, 1));
+        auto page = makeCommittedPage(*manager, storage, kHotLevel, slots[lifeCycle].front());
+        auto holder = page->hold();
+        storage.excludeFromEviction(*page);
+        EXPECT_EQ(page->lossyEncodeCount, 0);
+        EXPECT_EQ(storage.isLossyEncode(lifeCycle, kHotLevel, coldLevel), !lossless);
+        for (int round = 1; round <= 2; ++round)
+        {
+            storage.batchedMigrate(coldLevel, {page}, {});
+            EXPECT_EQ(page->lossyEncodeCount, lossless ? 0 : round);
+            storage.batchedMigrate(kHotLevel, {page}, {});
+            EXPECT_EQ(page->lossyEncodeCount, lossless ? 0 : round);
+        }
+        observer->rejectEncodeCall = observer->encodeCalls + 1;
+        EXPECT_THROW(storage.batchedMigrate(coldLevel, {page}, {}), TllmException);
+        EXPECT_EQ(page->cacheLevel, kHotLevel);
+        EXPECT_EQ(page->lossyEncodeCount, lossless ? 0 : 2);
+    }
+}
+
+TEST(KvCacheManagerV2ColdPageTest, ResidencyProtectionHasIndependentReferences)
+{
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    auto manager = std::make_shared<KvCacheManager>(makeTieredConfig());
+    auto const apiLock = manager->lockExclusive();
+    auto& storage = manager->storage();
+    LifeCycleId const lifeCycle{0};
+    auto slots = storage.newGpuSlots(TypedVec<LifeCycleId, SlotCount>(LifeCycleId{1}, 1));
+    auto page = makeCommittedPage(*manager, storage, kHotLevel, slots[lifeCycle].front());
+    auto holder = page->hold();
+    ASSERT_EQ(page->status(), PageStatus::HELD);
+    ASSERT_TRUE(page->scheduledForEviction());
+    page->pinGpuResidency();
+    page->pinGpuResidency();
+    EXPECT_EQ(page->status(), PageStatus::HELD);
+    EXPECT_EQ(page->gpuResidencyPinCount(), 2);
+    EXPECT_FALSE(storage.isEvictable(*page));
+    EXPECT_FALSE(page->scheduledForEviction());
+    EXPECT_THROW(storage.batchedMigrate(CacheLevel{1}, {page}, {}), LogicError);
+    page->unpinGpuResidency();
+    EXPECT_EQ(page->gpuResidencyPinCount(), 1);
+    EXPECT_FALSE(page->scheduledForEviction());
+    page->unpinGpuResidency();
+    EXPECT_TRUE(page->scheduledForEviction());
+    EXPECT_THROW(page->unpinGpuResidency(), LogicError);
+    storage.excludeFromEviction(*page);
+    storage.batchedMigrate(CacheLevel{1}, {page}, {});
+    EXPECT_EQ(page->lossyEncodeCount, 0);
+    EXPECT_THROW(page->pinGpuResidency(), LogicError);
 }
 
 TEST(KvCacheManagerV2ColdPageTest, AsyncEncodeRejectionFencesRecycledColdSlotAndReschedulesSource)
@@ -1106,6 +1205,26 @@ protected:
 class KvCacheManagerV2SparseOffloadTest : public KvCacheManagerV2PageLockTest
 {
 };
+
+TEST_F(KvCacheManagerV2SparseOffloadTest, ResidencyProtectionAlsoGuardsExplicitSparseOffload)
+{
+    auto manager = std::make_shared<KvCacheManager>(sparseConfig());
+    auto const apiLock = manager->lockExclusive();
+    auto cache = manager->createKvCache();
+    auto closeCache = FuncGuard([&]() { cache->close(); });
+    ASSERT_TRUE(cache->resume(stream()));
+    ASSERT_TRUE(cache->resize(4, 4));
+    auto page = pageAt(*cache);
+    page->pinGpuResidency();
+    auto unpin = FuncGuard([&]() { page->unpinGpuResidency(); });
+    EXPECT_THROW(manager->storage().offloadSparsePages(*cache, {page}, {}, {}), LogicError);
+    EXPECT_EQ(page->cacheLevel, kHotLevel);
+    EXPECT_EQ(page->lossyEncodeCount, 0);
+    unpin.run();
+    manager->storage().offloadSparsePages(*cache, {page}, {}, {});
+    EXPECT_EQ(page->cacheLevel, kSparseHistoryLevel);
+    EXPECT_EQ(page->lossyEncodeCount, 0);
+}
 
 class KvCacheManagerV2PageStorageTest : public KvCacheManagerV2PageLockTest
 {

@@ -24,6 +24,7 @@
 #include "tensorrt_llm/common/assert.h"
 
 #include <algorithm>
+#include <limits>
 #include <unordered_map>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
@@ -52,8 +53,9 @@ Page::~Page()
     KVCM2_POISON_ON_EXCEPT(
         [this]()
         {
-            TLLM_CHECK_DEBUG_WITH_INFO(status() == PageStatus::DROPPABLE && !scheduledForEviction(),
-                "Page destroyed while still held or scheduled for eviction");
+            TLLM_CHECK_DEBUG_WITH_INFO(
+                status() == PageStatus::DROPPABLE && !scheduledForEviction() && mGpuResidencyPinCount == 0,
+                "Page destroyed while still held, scheduled for eviction, or residency-protected");
             if (hasValidSlot())
             {
                 Slot s;
@@ -73,6 +75,44 @@ PageStatus Page::status() const noexcept
     if (h->uniqLock.expired())
         return PageStatus::HELD;
     return PageStatus::LOCKED;
+}
+
+void Page::pinGpuResidency()
+{
+    if (cacheLevel != kHotLevel || !hasValidSlot())
+    {
+        throw LogicError("GPU residency protection requires a valid hot page");
+    }
+    if (mGpuResidencyPinCount == std::numeric_limits<std::int32_t>::max())
+    {
+        throw LogicError("GPU residency protection reference count overflow");
+    }
+    ++mGpuResidencyPinCount;
+    if (scheduledForEviction())
+    {
+        manager->excludeFromEviction(*this);
+    }
+}
+
+void Page::unpinGpuResidency()
+{
+    if (mGpuResidencyPinCount == 0)
+    {
+        throw LogicError("GPU residency protection is not held");
+    }
+    --mGpuResidencyPinCount;
+    if (mGpuResidencyPinCount == 0 && hasValidSlot() && !scheduledForEviction())
+    {
+        manager->scheduleForEviction(*this);
+    }
+}
+
+void Page::recordLossyEncode() noexcept
+{
+    if (lossyEncodeCount >= 0 && lossyEncodeCount < std::numeric_limits<std::int32_t>::max())
+    {
+        ++lossyEncodeCount;
+    }
 }
 
 SharedPtr<PageHolder> Page::hold()
@@ -207,19 +247,21 @@ UncommittedPage::~UncommittedPage()
 }
 
 SharedPtr<CommittedPage> UncommittedPage::convertToCommitted(
-    SharedPtr<Block> blk, CachedCudaEvent readyEv, int numTokensInBlock)
+    SharedPtr<Block> blk, CachedCudaEvent readyEv, int numTokensInBlock, bool publishToTree)
 {
     TLLM_CHECK_DEBUG(!scheduledForEviction());
     // Check before building: replacePage() below drops the superseded page, so a failure
     // in between must not lose a usable snapshot.
-    TLLM_CHECK_DEBUG_WITH_INFO(blk->canReplacePage(lifeCycle, numTokensInBlock),
+    TLLM_CHECK_DEBUG_WITH_INFO(!publishToTree || blk->canReplacePage(lifeCycle, numTokensInBlock),
         "Block slot for this lifecycle already has a page covering more tokens");
     TLLM_CHECK_DEBUG_WITH_INFO(status() == PageStatus::DROPPABLE, "Release holder/lock before converting");
+    TLLM_CHECK_DEBUG_WITH_INFO(gpuResidencyPinCount() == 0, "Release residency protection before converting");
 
     // Set the ready event before transfer (matches Python: self.ready_event = ready_event).
     this->readyEvent = std::move(readyEv);
 
     auto committed = makeShared<CommittedPage>(manager, blk, lifeCycle, cacheLevel, numTokensInBlock, priority);
+    committed->lossyEncodeCount = lossyEncodeCount;
     // Move slot id to the committed page; invalidate our slot.
     committed->setSlotId(slotId()); // asserts valid
     committed->readyEvent = std::move(readyEvent);
@@ -229,8 +271,14 @@ SharedPtr<CommittedPage> UncommittedPage::convertToCommitted(
     TLLM_CHECK_DEBUG(!hasValidSlot() && readyEvent.isClosed());
     TLLM_CHECK_DEBUG_WITH_INFO(committed->hasValidSlot(), "committed page must have a valid slot after transfer");
 
-    // Register in block storage.
-    blk->replacePage(lifeCycle, committed.get());
+    if (publishToTree)
+    {
+        blk->replacePage(lifeCycle, committed.get());
+    }
+    else
+    {
+        committed->block = nullptr;
+    }
 
     return committed;
 }

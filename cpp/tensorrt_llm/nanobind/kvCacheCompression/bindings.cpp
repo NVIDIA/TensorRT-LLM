@@ -157,7 +157,8 @@ void initBindings(nb::module_& module)
     nb::class_<compression::ColdPageLifecycleProperties>(module, "ColdPageLifecycleProperties")
         .def(nb::init<>())
         .def_rw("cold_page_bytes", &compression::ColdPageLifecycleProperties::coldPageBytes)
-        .def_rw("page_index_location", &compression::ColdPageLifecycleProperties::pageIndexLocation);
+        .def_rw("page_index_location", &compression::ColdPageLifecycleProperties::pageIndexLocation)
+        .def_rw("is_lossless", &compression::ColdPageLifecycleProperties::isLossless);
 
     module.def(
         "create_python_cold_page_codec",

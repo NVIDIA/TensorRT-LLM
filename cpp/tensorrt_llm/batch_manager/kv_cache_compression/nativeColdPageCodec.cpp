@@ -101,6 +101,7 @@ bool NativeColdPageCodec::configure(kv::PoolGroupDesc const* gpuDescs, kv::PoolG
                 {
                     state.coldPageBytes = losslessCodec->queryColdPageBytes(variant.lifeCycleId);
                     state.pageIndexLocation = losslessCodec->queryPageIndexLocation(variant.lifeCycleId);
+                    state.isLossless = true;
                 }
                 else
                 {
@@ -167,6 +168,7 @@ bool NativeColdPageCodec::configure(kv::PoolGroupDesc const* gpuDescs, kv::PoolG
             auto& state = pendingGroups.at(providerLifecycles[index].lifeCycleId);
             state.coldPageBytes = lifecycle.coldPageBytes;
             state.pageIndexLocation = lifecycle.pageIndexLocation;
+            state.isLossless = lifecycle.isLossless;
         }
 
         mLayerGroups = std::move(pendingGroups);
@@ -207,6 +209,12 @@ kv::PageIndexLocation NativeColdPageCodec::queryPageIndexLocation(kv::LayerGroup
 {
     auto const* state = findLayerGroup(layerGroupId);
     return state == nullptr ? kv::PageIndexLocation::kBadLocation : state->pageIndexLocation;
+}
+
+bool NativeColdPageCodec::isLossless(kv::LayerGroupId layerGroupId) const noexcept
+{
+    auto const* state = findLayerGroup(layerGroupId);
+    return state != nullptr && state->isLossless;
 }
 
 bool NativeColdPageCodec::encode(kv::LayerGroupId layerGroupId, void* dstBasePtr, kv::PageIndexPair const* pageIndices,

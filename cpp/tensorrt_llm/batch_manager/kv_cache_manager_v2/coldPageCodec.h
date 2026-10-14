@@ -111,6 +111,9 @@ public:
     //! PageIndexLocation::kBadLocation on failure or for an unknown layer group.
     [[nodiscard]] virtual PageIndexLocation queryPageIndexLocation(LayerGroupId layerGroupId) const noexcept = 0;
 
+    //! Whether encode/decode preserves this lifecycle byte-for-byte. Undeclared codecs are conservative.
+    [[nodiscard]] virtual bool isLossless(LayerGroupId layerGroupId) const noexcept;
+
     //! Encodes hot pages into cold pages.
     //!
     //! The cold base pointer is GPU-accessible. The index-array location is selected by queryPageIndexLocation(). Host

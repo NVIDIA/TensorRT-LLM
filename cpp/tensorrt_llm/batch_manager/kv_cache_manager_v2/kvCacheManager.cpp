@@ -30,6 +30,7 @@
 #include <map>
 #include <numeric>
 #include <stdexcept>
+#include <unordered_set>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
@@ -891,56 +892,27 @@ int KvCacheManager::clampMaxSeqLenForMem(int batchSize, int tokenNumUpperBound) 
 void KvCacheManager::_adjustLevel(CacheLevel level, size_t quota)
 {
     auto const& ratioList = _getTargetRatioList(level);
-    TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> const* persistent = nullptr;
-    TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> persistentPages;
-    if (mStorage->isLastLevel(level))
-    {
-        persistentPages = _gatherLastLevelPersistentPages();
-        persistent = &persistentPages;
-    }
-    mStorage->adjustCacheLevel(level, quota, ratioList, persistent);
+    auto const persistentPages = _gatherPersistentPages(level);
+    mStorage->adjustCacheLevel(level, quota, ratioList, &persistentPages);
 }
 
-TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> KvCacheManager::_gatherLastLevelPersistentPages() const
+TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> KvCacheManager::_gatherPersistentPages(CacheLevel level) const
 {
-    CacheLevel lastLevel = mStorage->numCacheLevels() - 1;
-    PoolGroupIndex numPg = mStorage->numPoolGroups(lastLevel);
-    TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> result(numPg);
+    TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> result(mStorage->numPoolGroups(level));
+    std::unordered_set<Page const*> seen;
 
     for (KvCache* kvc : mLivingKvCaches)
     {
         TLLM_CHECK_DEBUG(kvc->status() == KvCache::Status::SUSPENDED);
-        for (auto const& sb : kvc->blocks())
+        for (auto const& page : kvc->retainedPages())
         {
-            for (auto const& beamPages : sb.pages)
+            if (page->cacheLevel != level || page->scheduledForEviction() || !seen.insert(page.get()).second)
             {
-                for (LifeCycleId lc{0}; lc < beamPages.size(); ++lc)
-                {
-                    // Mirrors Python: holder must be _PageHolder type (suspended state).
-                    if (blockPageIsNull(beamPages[lc]))
-                    {
-                        continue;
-                    }
-                    TLLM_CHECK_DEBUG_WITH_INFO(std::holds_alternative<SharedPtr<PageHolder>>(beamPages[lc]),
-                        "Non-null holder must be PageHolder in suspended state");
-                    auto const& pg = blockPageGetPage(beamPages[lc]);
-                    if (!pg)
-                    {
-                        continue;
-                    }
-                    // Mirrors Python assertions for invariant checking.
-                    TLLM_CHECK_DEBUG_WITH_INFO(
-                        pg->status() == PageStatus::HELD, "Page in suspended KvCache must be HELD");
-                    TLLM_CHECK_DEBUG_WITH_INFO((pg->scheduledForEviction() == (pg->cacheLevel != lastLevel)),
-                        "Eviction scheduling invariant violated");
-                    if (pg->scheduledForEviction())
-                    {
-                        continue;
-                    }
-                    PoolGroupIndex pgIdx = mStorage->getPoolGroupIndex(lastLevel, lc);
-                    result[pgIdx].push_back(pg);
-                }
+                continue;
             }
+            TLLM_CHECK_DEBUG_WITH_INFO(
+                page->status() == PageStatus::HELD, "Persistent page in a suspended KvCache must be HELD");
+            result[mStorage->getPoolGroupIndex(level, page->lifeCycle)].push_back(page);
         }
     }
     return result;

@@ -460,6 +460,231 @@ class TestStorageStatistics(TestKVCacheManagerV2):
 
 
 class TestNoBatching(TestKVCacheManagerV2):
+    def _resident_pages(self, cache: _KVCache, first: int, last: int) -> list[tuple[int, int, int]]:
+        """Choose pages in the test; the native API receives no first/last policy."""
+        block_size = self.manager.tokens_per_block
+        tail_begin = max(0, cache.history_length - last)
+        return [
+            (int(page.beam_index), int(page.block_ordinal), int(page.layer_group_id))
+            for page in cache.get_page_info()
+            if page.block_ordinal * block_size < first
+            or (last > 0 and (page.block_ordinal + 1) * block_size > tail_begin)
+        ]
+
+    def _evict_unprotected_gpu_pages(
+        self, cache: _KVCache, protected: Sequence[int], stream: CudaStream
+    ) -> None:
+        # Host prefetch only onboards colder pages. Fill the GPU pool to exercise real offload.
+        pools = self.manager.get_storage_statistics(GPU_LEVEL)
+        self.assertEqual(len(pools), 1)
+        pressure = self.manager.create_kv_cache()
+        try:
+            self.assertTrue(pressure.resume(stream))
+            pressure.stop_committing()
+            self.assertTrue(pressure.resize(pools[0].available * self.manager.tokens_per_block))
+            for page in cache.get_page_info():
+                self.assertEqual(
+                    page.cache_level,
+                    GPU_LEVEL if page.block_ordinal in protected else CacheLevel(1),
+                )
+        finally:
+            pressure.close()
+
+    @parameterized.expand(
+        [
+            ("disabled", 0, 0, 10, 12, []),
+            ("head_only", 4, 0, 10, 12, [0]),
+            ("tail_only", 0, 4, 10, 12, [1, 2]),
+            ("short_sequence", 4, 4, 6, 8, [0, 1]),
+            ("aligned", 4, 4, 12, 12, [0, 2]),
+            ("partial_tail", 4, 4, 13, 16, [0, 2, 3]),
+            ("reserved_tail", 0, 4, 8, 12, [1, 2]),
+        ]
+    )
+    def test_gpu_resident_pages(
+        self, _name: str, first: int, last: int, history: int, capacity: int, protected: list[int]
+    ) -> None:
+        self.prepare(8 << 20, 8 << 20, 0, 2, None, 0, tokens_per_block=4, kv_buf_size=1024)
+        group = self.manager.get_layer_group_id(LayerId(0))
+        cache = self.manager.create_kv_cache()
+        with TemporaryCudaStream([]) as stream:
+            try:
+                self.assertTrue(cache.resume(cast(CudaStream, stream.handle)))
+                cache.stop_committing()
+                self.assertTrue(cache.resize(capacity, history))
+                cache.set_gpu_resident_pages(self._resident_pages(cache, first, last))
+                cache.suspend()
+                indices = list(cache.get_base_page_indices(group))
+                self.assertTrue(all(value == BAD_PAGE_INDEX for value in indices))
+                self._evict_unprotected_gpu_pages(cache, protected, cast(CudaStream, stream.handle))
+                self.assertEqual(
+                    sorted(
+                        {
+                            page.block_ordinal
+                            for page in cache.get_page_info()
+                            if page.cache_level == GPU_LEVEL
+                        }
+                    ),
+                    protected,
+                )
+                if protected:
+                    self.manager.adjust()
+                    for level in (0, 1):
+                        quota = self.manager.get_quota(level)
+                        self.assertTrue(self.manager.resize(level, quota))
+                        self.assertEqual(self.manager.get_quota(level), quota)
+                self.assertTrue(cache.resume(cast(CudaStream, stream.handle)))
+                resumed = list(cache.get_base_page_indices(group))
+                self.assertNotIn(BAD_PAGE_INDEX, resumed)
+                self.assertTrue(
+                    all(
+                        page.cache_level == GPU_LEVEL and page.lossy_encode_count == 0
+                        for page in cache.get_page_info()
+                        if page.block_ordinal in protected
+                    )
+                )
+            finally:
+                cache.close()
+        stream.take_finish_event().synchronize()
+        self.assertEqual(sum(pool.unavailable for pool in self.manager.get_storage_statistics()), 0)
+
+    def test_gpu_resident_tail_moves_and_releases(self) -> None:
+        self.prepare(8 << 20, 8 << 20, 0, 2, None, 0, tokens_per_block=4, kv_buf_size=1024)
+        group = self.manager.get_layer_group_id(LayerId(0))
+        cache = self.manager.create_kv_cache()
+        with TemporaryCudaStream([]) as stream:
+            try:
+                self.assertTrue(cache.resume(cast(CudaStream, stream.handle)))
+                cache.stop_committing()
+                for history, capacity, protected in ((10, 12, [0, 1, 2]), (14, 16, [0, 2, 3])):
+                    self.assertTrue(cache.resize(capacity, history))
+                    cache.set_gpu_resident_pages(self._resident_pages(cache, 4, 4))
+                    cache.suspend()
+                    indices = list(cache.get_base_page_indices(group))
+                    self.assertTrue(all(value == BAD_PAGE_INDEX for value in indices))
+                    self._evict_unprotected_gpu_pages(
+                        cache, protected, cast(CudaStream, stream.handle)
+                    )
+                    self.assertEqual(
+                        sorted(
+                            {
+                                page.block_ordinal
+                                for page in cache.get_page_info()
+                                if page.cache_level == GPU_LEVEL
+                            }
+                        ),
+                        protected,
+                    )
+                    self.assertTrue(cache.resume(cast(CudaStream, stream.handle)))
+                cache.set_gpu_resident_pages([])
+                cache.suspend()
+                self.assertTrue(
+                    all(value == BAD_PAGE_INDEX for value in cache.get_base_page_indices(group))
+                )
+                self._evict_unprotected_gpu_pages(cache, [], cast(CudaStream, stream.handle))
+                self.assertTrue(cache.resume(cast(CudaStream, stream.handle)))
+            finally:
+                cache.close()
+        stream.take_finish_event().synchronize()
+        self.assertEqual(sum(pool.unavailable for pool in self.manager.get_storage_statistics()), 0)
+
+    def test_gpu_resident_pages_before_reused_cache_resume(self) -> None:
+        self.prepare(8 << 20, 8 << 20, 0, 2, None, 0, tokens_per_block=4, kv_buf_size=1024)
+        tokens = [TokenId(i) for i in range(12)]
+        source = self.manager.create_kv_cache(None, tokens)
+        with TemporaryCudaStream([]) as stream:
+            try:
+                self.assertTrue(source.resume(cast(CudaStream, stream.handle)))
+                self.assertTrue(source.resize(12, 12))
+                source.commit(tokens)
+                source.stop_committing()
+            finally:
+                source.close()
+            reused = self.manager.create_kv_cache(None, tokens)
+            try:
+                self.assertEqual(reused.num_committed_tokens, 12)
+                self.assertEqual(reused.capacity, 12)
+                reused.set_gpu_resident_pages(self._resident_pages(reused, 4, 4))
+                self.assertTrue(reused.resume(cast(CudaStream, stream.handle)))
+                reused.suspend()
+                self._evict_unprotected_gpu_pages(reused, [0, 2], cast(CudaStream, stream.handle))
+                self.assertEqual(
+                    sorted(
+                        {
+                            page.block_ordinal
+                            for page in reused.get_page_info()
+                            if page.cache_level == GPU_LEVEL
+                        }
+                    ),
+                    [0, 2],
+                )
+            finally:
+                reused.close()
+        stream.take_finish_event().synchronize()
+
+    def test_gpu_resident_pages_validation(self) -> None:
+        self.prepare(8 << 20, 0, 0, 2, None, 0, tokens_per_block=4, kv_buf_size=1024)
+        cache = self.manager.create_kv_cache()
+        try:
+            for coordinates in ((-1, 0, 0), (0, -1, 0), (0, 0, -1)):
+                with self.assertRaisesRegex(ValueError, "nonnegative"):
+                    cache.set_gpu_resident_pages([coordinates])
+            cache.set_gpu_resident_pages([])
+        finally:
+            cache.close()
+        with self.assertRaises(LogicError):
+            cache.set_gpu_resident_pages([])
+
+    def test_private_commit_preserves_shared_history_and_can_restore_it(self) -> None:
+        self.prepare(8 << 20, 8 << 20, 0, 2, None, 0, tokens_per_block=4, kv_buf_size=1024)
+        group = self.manager.get_layer_group_id(LayerId(0))
+        tokens = [TokenId(i) for i in range(4)]
+        private_values = [TokenId(100 + i) for i in range(4)]
+        with TemporaryCudaStream([]) as stream:
+            cuda_stream = cast(CudaStream, stream.handle)
+            source = self.manager.create_kv_cache()
+            try:
+                self.assertTrue(source.resume(cuda_stream))
+                self.assertTrue(source.resize(4, 4))
+                self.engine.execute([Step(source, tokens, [])], cuda_stream)
+                source.commit(tokens)
+                shared_indices = list(source.get_base_page_indices(group))
+            finally:
+                source.close()
+
+            private = self.manager.create_kv_cache()
+            reader = None
+            try:
+                self.assertTrue(private.resume(cuda_stream))
+                self.assertTrue(private.resize(4, 4))
+                # Distinct sentinels distinguish request-local values from shared history.
+                self.engine.execute([Step(private, private_values, [])], cuda_stream)
+                coordinates = self._resident_pages(private, 4, 0)
+                private.set_private_pages(coordinates)
+                private.set_gpu_resident_pages(coordinates)
+                private_indices = list(private.get_base_page_indices(group))
+                self.assertNotEqual(private_indices, shared_indices)
+                private.commit(tokens)
+                self.assertEqual(list(private.get_base_page_indices(group)), private_indices)
+                self.assertTrue(all(page.has_shared_page for page in private.get_page_info()))
+                self.engine.execute([Step(private, [], private_values)], cuda_stream)
+
+                reader = self.manager.create_kv_cache(None, tokens)
+                self.assertTrue(reader.resume(cuda_stream))
+                self.assertEqual(list(reader.get_base_page_indices(group)), shared_indices)
+                self.engine.execute([Step(reader, [], tokens)], cuda_stream)
+
+                private.set_private_pages([])
+                private.set_gpu_resident_pages([])
+                self.assertEqual(private.restore_shared_pages(coordinates), coordinates)
+                self.assertEqual(list(private.get_base_page_indices(group)), shared_indices)
+                self.engine.execute([Step(private, [], tokens)], cuda_stream)
+            finally:
+                if reader is not None:
+                    reader.close()
+                private.close()
+        stream.take_finish_event().synchronize()
+
     def test_batch_publishes_sparse_gpu_metadata(self) -> None:
         import torch
 

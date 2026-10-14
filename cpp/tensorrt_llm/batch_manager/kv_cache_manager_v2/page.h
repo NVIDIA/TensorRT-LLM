@@ -25,6 +25,7 @@
 #include "kv_cache_manager_v2/utils/cudaEvent.h"
 #include "kv_cache_manager_v2/utils/sharedPtr.h"
 
+#include <cstdint>
 #include <functional>
 #include <optional>
 #include <vector>
@@ -55,6 +56,8 @@ public:
     Priority const priority;
     WeakPtr<PageHolder> holder;     // empty → DROPPABLE
     std::optional<NodeRef> nodeRef; // present → scheduled for eviction
+    // Number of lossy cold encodings in this content's ancestry; -1 denotes an unknown source.
+    std::int32_t lossyEncodeCount{0};
 
     Page(StorageManager* mgr, LifeCycleId lc, CacheLevel level, Priority prio);
 
@@ -65,6 +68,17 @@ public:
     bool isPrivate() const;
 
     PageStatus status() const noexcept;
+
+    // Residency protection does not retain a CUDA reader lock. The owner must also hold the page.
+    void pinGpuResidency();
+    void unpinGpuResidency();
+
+    [[nodiscard]] std::int32_t gpuResidencyPinCount() const noexcept
+    {
+        return mGpuResidencyPinCount;
+    }
+
+    void recordLossyEncode() noexcept;
 
     bool scheduledForEviction() const noexcept
     {
@@ -82,6 +96,9 @@ public:
     // skip_wait: caller guarantees the page is ready on kvCache's stream.
     SharedPageLock lock(
         KvCache& kvCache, BeamIndex beamIndex, BlockOrdinal ordinal, LifeCycleId lifeCycle, bool skipWait = false);
+
+private:
+    std::int32_t mGpuResidencyPinCount{0};
 };
 
 // ---------------------------------------------------------------------------
@@ -148,13 +165,13 @@ public:
         return false;
     }
 
-    // Convert this UncommittedPage into a CommittedPage and attach to `block`.
+    // Convert into an immutable CommittedPage; publishToTree=false keeps it request-local.
     // The UncommittedPage becomes invalid (slot transferred to CommittedPage).
     //
     // `numTokensInBlock` records the page's token count. See
     // CommittedPage::numTokensInBlock for its attention and SSM interpretations.
     SharedPtr<CommittedPage> convertToCommitted(
-        SharedPtr<Block> block, CachedCudaEvent readyEvent, int numTokensInBlock);
+        SharedPtr<Block> block, CachedCudaEvent readyEvent, int numTokensInBlock, bool publishToTree = true);
 };
 
 // ---------------------------------------------------------------------------

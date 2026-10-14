@@ -55,6 +55,7 @@ struct ColdPageLifecycleProperties
 {
     std::size_t coldPageBytes = 0;
     kv::PageIndexLocation pageIndexLocation = kv::PageIndexLocation::kBadLocation;
+    bool isLossless = false;
 };
 
 //! Resolves KVCM layouts and routes lifecycles for one native compression method.
@@ -70,6 +71,8 @@ public:
     [[nodiscard]] kv::LayerGroupId getBatchingLayerGroupId(kv::LayerGroupId layerGroupId) const noexcept final;
 
     [[nodiscard]] kv::PageIndexLocation queryPageIndexLocation(kv::LayerGroupId layerGroupId) const noexcept final;
+
+    [[nodiscard]] bool isLossless(kv::LayerGroupId layerGroupId) const noexcept final;
 
     bool encode(kv::LayerGroupId layerGroupId, void* dstBasePtr, kv::PageIndexPair const* pageIndices,
         std::size_t numBasePages, cudaStream_t stream) noexcept final;
@@ -96,6 +99,7 @@ private:
         std::optional<std::size_t> lifecycleIndex;
         std::size_t coldPageBytes = 0;
         kv::PageIndexLocation pageIndexLocation = kv::PageIndexLocation::kBadLocation;
+        bool isLossless = false;
     };
 
     [[nodiscard]] LayerGroupState const* findLayerGroup(kv::LayerGroupId layerGroupId) const noexcept;

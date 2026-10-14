@@ -4417,6 +4417,27 @@ class ColdPageQuantizationCompressionConfig(KvCacheCompressionConfig):
     quant: Literal["nvfp4"] = Field(
         default="nvfp4",
         description="Quantization format stored in the compressed cache tier.")
+    first_n: int = Field(
+        default=0,
+        ge=0,
+        status="prototype",
+        description=
+        "Keep dense Attention pages intersecting the first N confirmed tokens "
+        "GPU-resident while the request is live, preventing cold-page "
+        "quantization. Includes prefill and decode. Must be a multiple of the "
+        "KV block size; 0 disables first-token protection. Block reuse remains "
+        "enabled and previously compressed values are not reconstructed.")
+    last_n: int = Field(
+        default=0,
+        ge=0,
+        status="prototype",
+        description=
+        "Keep dense Attention pages intersecting the last N confirmed tokens "
+        "GPU-resident while the request is live. The window moves across "
+        "prefill and decode. Must be a multiple of the KV block size; 0 "
+        "disables last-token protection. Short sequences whose first/last "
+        "windows overlap are fully protected. Previously compressed reused "
+        "values are not reconstructed.")
     skip_rope_quantization: bool = Field(
         default=False,
         status="prototype",

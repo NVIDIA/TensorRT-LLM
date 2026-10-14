@@ -513,6 +513,75 @@ def test_many_threads_probe_reuse_concurrently() -> None:
         manager.shutdown()
 
 
+def test_many_threads_read_shared_page_info_concurrently() -> None:
+    """Page queries must not mutate non-atomic ownership counts under a shared lock."""
+    manager = KVCacheManager(_make_config())
+    readers = []
+    try:
+        block_count = 32
+        tokens = list(range(manager.tokens_per_block * block_count))
+        seed = manager.create_kv_cache(None, tokens)
+        try:
+            assert seed.resume(CudaStream(torch.cuda.Stream().cuda_stream))
+            assert seed.resize(len(tokens))
+            seed.commit(tokens, is_end=True)
+        finally:
+            seed.close()
+
+        for _ in range(8):
+            cache = manager.create_kv_cache(None, tokens)
+            readers.append(cache)
+            assert cache.num_committed_tokens == len(tokens)
+
+        expected = [
+            (0, ordinal, 0, GPU_LEVEL, manager.tokens_per_block, 0, False, None, False)
+            for ordinal in range(block_count)
+        ]
+        start = threading.Barrier(len(readers))
+
+        def read_pages(reader_index: int) -> None:
+            # Each cache has one owner; only its canonical pages are shared between threads.
+            cache = readers[reader_index]
+            start.wait(TIMEOUT_S)
+            for _ in range(500):
+                facts = [
+                    (
+                        page.beam_index,
+                        page.block_ordinal,
+                        page.layer_group_id,
+                        page.cache_level,
+                        page.num_tokens,
+                        page.lossy_encode_count,
+                        page.is_sparse,
+                        page.window_size,
+                        page.has_shared_page,
+                    )
+                    for page in cache.get_page_info()
+                ]
+                assert facts == expected
+
+        threads = [_worker(lambda index=index: read_pages(index)) for index in range(len(readers))]
+        for thread in threads:
+            thread.start()
+        _join(*threads)
+        for cache in readers:
+            cache.close()
+        assert manager.probe_reuse(None, tokens) == len(tokens)
+
+        # Clearing reuse state must release its pages, not just remove their token matches.
+        manager.clear_reusable_blocks()
+        assert manager.probe_reuse(None, tokens) == 0
+        pools = manager.get_storage_statistics()
+        assert pools
+        for pool in pools:
+            assert pool.free == pool.available == pool.total
+            assert pool.evictable == pool.unavailable == 0
+    finally:
+        for cache in readers:
+            cache.close()
+        manager.shutdown()
+
+
 def test_priority_callback_under_the_lock_does_not_deadlock_stats_queries() -> None:
     """The exact GIL/API-lock inversion.
 

@@ -4186,6 +4186,8 @@ def test_kv_cache_compression_config_dispatches_by_algorithm():
     assert cold_config.model_dump() == {
         "algorithm": "quantization_for_cold_page",
         "quant": "nvfp4",
+        "first_n": 0,
+        "last_n": 0,
         "skip_rope_quantization": False,
         "nvfp4_residual_dim": 64,
         "scale_checkpoint_path": None,
@@ -4193,6 +4195,25 @@ def test_kv_cache_compression_config_dispatches_by_algorithm():
     assert not cold_config.changes_physical_kv_length
     assert cold_config.supports_block_reuse()
     assert cold_config.supports_speculative_decoding()
+
+    protected_config = TorchLlmArgs(
+        model="/tmp/dummy_model",
+        **yaml.safe_load("""
+kv_cache_compression_config:
+  algorithm: quantization_for_cold_page
+  first_n: 64
+  last_n: 256
+"""),
+    ).kv_cache_compression_config
+    assert (protected_config.first_n, protected_config.last_n) == (64, 256)
+    assert protected_config.supports_block_reuse()
+    assert protected_config.supports_speculative_decoding()
+    assert ColdPageQuantizationCompressionConfig.model_validate_json(
+        protected_config.model_dump_json()) == protected_config
+    for option in ("first_n", "last_n"):
+        for invalid in (-1, "maybe"):
+            with pytest.raises(ValidationError):
+                ColdPageQuantizationCompressionConfig(**{option: invalid})
 
     cold_config_with_scales = TorchLlmArgs(
         model="/tmp/dummy_model",

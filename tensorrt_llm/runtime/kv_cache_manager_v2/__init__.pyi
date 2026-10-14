@@ -508,6 +508,20 @@ class Batch:
     def num_blocks(self, layer_group_id: LayerGroupId) -> BatchDeviceArray:
         """Eligible history counts, shape [max_rows, max_beam_width]; zero for inactive/dense rows."""
 
+@dataclass(slots=True, frozen=True)
+class CachePageInfo:
+    """Copied facts about one mapped Attention page; no storage ownership."""
+
+    beam_index: int
+    block_ordinal: int
+    layer_group_id: LayerGroupId
+    cache_level: CacheLevel
+    num_tokens: int
+    lossy_encode_count: int
+    is_sparse: bool
+    window_size: int | None
+    has_shared_page: bool
+
 class PageStorageSnapshot:
     """Copied host metadata for one layer group and beam; indices are raw mixed-tier slot IDs.
 
@@ -630,6 +644,17 @@ class _KVCache:
     def plan_committed_block_drop(self) -> PlannedDropHandle | None: ...
     def stop_committing(self) -> None: ...
     def suspend(self) -> None: ...
+    def get_page_info(self) -> list[CachePageInfo]:
+        """Copy mapped-page facts while active or suspended, including pending writes."""
+    def set_gpu_resident_pages(self, pages: Sequence[tuple[int, int, int]]) -> None:
+        """Replace this request's GPU protection using beam/block/group coordinates."""
+    def get_private_pages(self) -> list[tuple[int, int, int]]: ...
+    def set_private_pages(self, pages: Sequence[tuple[int, int, int]]) -> None:
+        """Keep selected request-local pages when committing matching shared blocks."""
+    def restore_shared_pages(
+        self, pages: Sequence[tuple[int, int, int]]
+    ) -> list[tuple[int, int, int]]:
+        """Adopt complete shared replacements; return the coordinates actually restored."""
     def resume(
         self,
         cuda_stream: CudaStream | None = None,

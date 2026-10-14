@@ -20,8 +20,8 @@ from abc import ABC, abstractmethod
 from collections import OrderedDict, defaultdict, deque
 from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import (TYPE_CHECKING, Dict, Iterable, List, Optional, Sequence,
-                    Set, Tuple, Union)
+from typing import (TYPE_CHECKING, Callable, Dict, Iterable, List, Optional,
+                    Sequence, Set, Tuple, Union)
 
 import torch
 
@@ -71,6 +71,7 @@ if TYPE_CHECKING:
         AttentionMetadata
     from tensorrt_llm.llmapi.llm_args import (DecodingBaseConfig,
                                               KvCacheCompressionConfig)
+    from tensorrt_llm.runtime.kv_cache_manager_v2 import _KVCache
 
     from .kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 
@@ -2918,6 +2919,24 @@ class KVCacheCompressionManager(BaseResourceManager):
     uses_iteration_lifecycle = True
     provides_cold_page_codec = False
 
+    uses_gpu_page_protection = False
+
+    def validate_gpu_resident_token_bounds(self, tokens_per_block: int) -> None:
+        """Validate optional page protection; no policy is enabled by default."""
+
+    def update_gpu_page_protection(
+        self,
+        kv_cache: "_KVCache",
+        *,
+        confirmed_length: int | None = None,
+    ) -> None:
+        """Apply optional page protection; the default leaves pages unchanged."""
+
+    def create_precision_reuse_checker(
+        self, ) -> Callable[["_KVCache"], int | None] | None:
+        """Return an optional admission check, or leave ordinary reuse unchanged."""
+        return None
+
     def __init__(
         self,
         config: "KvCacheCompressionConfig",
@@ -2928,6 +2947,10 @@ class KVCacheCompressionManager(BaseResourceManager):
         self.pretrained_config = pretrained_config
         self.kv_cache_manager: Optional["KVCacheManagerV2"] = None
         self.draft_kv_cache_manager: Optional["KVCacheManagerV2"] = None
+
+    def shutdown(self) -> None:
+        self.kv_cache_manager = None
+        self.draft_kv_cache_manager = None
 
     def bind_kv_cache_managers(
         self,

@@ -385,7 +385,8 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
         LayerGroupId const batchingLayerGroupId = mBatchingLayerGroupIds[lifeCycle];
         TLLM_CHECK_WITH_INFO(mBatchingLayerGroupIds[batchingLayerGroupId] == batchingLayerGroupId
                 && coldPageBytesByLifeCycle[batchingLayerGroupId] == coldPageBytesByLifeCycle[lifeCycle]
-                && mPageIndexLocations[batchingLayerGroupId] == mPageIndexLocations[lifeCycle],
+                && mPageIndexLocations[batchingLayerGroupId] == mPageIndexLocations[lifeCycle]
+                && codec.isLossless(batchingLayerGroupId) == codec.isLossless(lifeCycle),
             "Cold-page codec batching class is inconsistent");
     }
 
@@ -747,6 +748,10 @@ bool StorageManager::isEvictable(Page const& page, std::optional<CacheLevel> lev
 {
     PageStatus s = page.status();
     CacheLevel lvl = level.value_or(page.cacheLevel);
+    if (lvl == kHotLevel && page.gpuResidencyPinCount() != 0)
+    {
+        return false;
+    }
     if (s == PageStatus::DROPPABLE && page.isCommitted())
     {
         // A migration batch can outlive checkpoint invalidation. Do not put
@@ -755,6 +760,11 @@ bool StorageManager::isEvictable(Page const& page, std::optional<CacheLevel> lev
         return committed.block && !committed.block->isOrphan() && committed.block->holdsPage(committed);
     }
     return s == PageStatus::HELD && lvl < numCacheLevels() - 1;
+}
+
+bool StorageManager::isLossyEncode(LifeCycleId lifeCycle, CacheLevel srcLevel, CacheLevel dstLevel) const noexcept
+{
+    return srcLevel == kHotLevel && dstLevel != kHotLevel && !mColdPageCodec->isLossless(lifeCycle);
 }
 
 // ---------------------------------------------------------------------------
@@ -1132,6 +1142,13 @@ std::optional<std::vector<Slot>> StorageManager::_batchedMigrate(CacheLevel dstL
         return updateSrc ? std::nullopt : std::optional<std::vector<Slot>>{std::in_place};
     }
 
+    if (srcLevel == kHotLevel && dstLevel != kHotLevel
+        && std::any_of(
+            srcPages.begin(), srcPages.end(), [](auto const& page) { return page->gpuResidencyPinCount() != 0; }))
+    {
+        throw LogicError("Cannot offload a GPU residency-protected page");
+    }
+
     if (updateSrc && !defrag
         && std::any_of(
             srcPages.begin(), srcPages.end(), [](auto const& page) { return page->status() == PageStatus::LOCKED; }))
@@ -1220,6 +1237,10 @@ std::optional<std::vector<Slot>> StorageManager::_batchedMigrate(CacheLevel dstL
                 Slot srcSlot = srcPages.at(i)->exchangeSlot(std::move(dstSlots.at(i)));
                 srcPoolGroup.release(std::move(srcSlot));
                 srcPages.at(i)->cacheLevel = dstLevel;
+                if (isLossyEncode(srcPages.at(i)->lifeCycle, srcLevel, dstLevel))
+                {
+                    srcPages.at(i)->recordLossyEncode();
+                }
                 if (emitCacheLevelUpdates && srcPages.at(i)->isCommitted())
                 {
                     auto const& page = static_cast<CommittedPage const&>(*srcPages.at(i));
@@ -1314,6 +1335,10 @@ void StorageManager::_migrateLockedSparsePages(CUstream stream, CacheLevel dstLe
         if (!seen.insert(page.get()).second)
         {
             continue;
+        }
+        if (srcLevel == kHotLevel && dstLevel != kHotLevel && page->gpuResidencyPinCount() != 0)
+        {
+            throw LogicError("Cannot offload a GPU residency-protected page");
         }
         auto holder = page->holder.lock();
         auto lock = holder ? holder->uniqLock.lock() : nullptr;
@@ -1439,6 +1464,10 @@ void StorageManager::_migrateLockedSparsePages(CUstream stream, CacheLevel dstLe
         {
             Slot source = batch.srcPageLocks[i]->moveToCacheLevel(dstLevel, std::move(batch.dstSlots[i]));
             releaseSlot(batch.srcPages[i]->lifeCycle, srcLevel, std::move(source));
+            if (isLossyEncode(batch.srcPages[i]->lifeCycle, srcLevel, dstLevel))
+            {
+                batch.srcPages[i]->recordLossyEncode();
+            }
         }
     }
     if (mEventSink)
@@ -1719,8 +1748,10 @@ void StorageManager::shrinkPoolGroup(
     TLLM_CHECK_DEBUG(newNumSlots < pg.numSlots());
 
     // A16: persistent_pages preconditions.
-    TLLM_CHECK_DEBUG_WITH_INFO(
-        persistentPages.size() <= slotCountToSizeT(newNumSlots), "Not enough slots to hold all persistent pages");
+    if (persistentPages.size() > slotCountToSizeT(newNumSlots))
+    {
+        throw OutOfPagesError("Not enough slots to hold all persistent pages");
+    }
     TLLM_CHECK_WITH_INFO(std::all_of(persistentPages.begin(), persistentPages.end(),
                              [this, level, pgIdx](auto const& p)
                              { return p->cacheLevel == level && getPoolGroupIndex(level, p->lifeCycle) == pgIdx; }),
@@ -1840,7 +1871,26 @@ void StorageManager::adjustCacheLevel(CacheLevel level, std::optional<size_t> ne
     }
     auto newNumSlots = lvlStorage.computeSlotCountList(ratioList, minSlots, quota);
 
-    TLLM_CHECK_DEBUG(isLastLevel(level) || persistentPages == nullptr);
+    if (persistentPages)
+    {
+        TLLM_CHECK_WITH_INFO(persistentPages->size() == newNumSlots.size(), "Persistent page pool count mismatch");
+        // Validate every protected pool before the first shrink changes any
+        // storage.
+        for (PoolGroupIndex pgIdx{0}; pgIdx < newNumSlots.size(); ++pgIdx)
+        {
+            auto const& pages = (*persistentPages)[pgIdx];
+            if (pages.size() > slotCountToSizeT(newNumSlots[pgIdx]))
+            {
+                throw OutOfPagesError("Not enough slots to hold all persistent pages");
+            }
+            TLLM_CHECK_WITH_INFO(std::all_of(pages.begin(), pages.end(),
+                                     [this, level, pgIdx](auto const& page) {
+                                         return page && page->cacheLevel == level
+                                             && getPoolGroupIndex(level, page->lifeCycle) == pgIdx;
+                                     }),
+                "Persistent page cache level or pool group mismatch");
+        }
+    }
 
     // Shrink first.
     for (PoolGroupIndex pgIdx{0}; pgIdx < newNumSlots.size(); ++pgIdx)
