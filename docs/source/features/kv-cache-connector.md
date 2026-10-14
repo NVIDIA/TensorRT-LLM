@@ -510,3 +510,7 @@ MTP reuse is supported for EAGLE-style context-only requests with KV cache manag
 The content hash includes the draft prompt lookahead and only completed full blocks are published. Local reuse is aligned to whole blocks after draft backoff. Completion reservations protect admitted context work. The key format is versioned; entries written with the previous format are cold misses. Cache salts, multimodal content identities, LoRA bypass, and the explicit `model_key` requirement continue to apply.
 
 These features use the existing `kv_connector_config.mooncake_store` pool/role interface; no old benchmark configuration fields are required.
+
+### Evicted-prefix recovery
+
+A Mooncake page may disappear between lookup and load. An attention-DP owner or a single-rank worker restarts the affected context request before forward execution, releases its target/draft allocations, and repeats lookup from local reuse. Only successfully loaded staging slots are copied to GPU memory. Saves belonging to the failed request are removed from the bound pass before its pages are released. Other requests in the batch continue. Tensor-parallel load failures remain fatal because shards cannot restart independently.

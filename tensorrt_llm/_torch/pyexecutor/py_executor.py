@@ -4370,6 +4370,45 @@ class PyExecutor:
             self.kv_connector_manager.mark_prefix_loads_dispatched()
             self.kv_connector_manager.worker.start_load_kv(
                 torch.cuda.current_stream())
+            failed = self.kv_connector_manager.take_failed_load_requests()
+            if failed:
+                self._recover_failed_connector_loads(scheduled_batch, failed)
+
+    def _recover_failed_connector_loads(self, scheduled_batch: ScheduledRequests,
+                                        failed_ids) -> None:
+        """Restart context requests whose connector prefix could not be loaded.
+
+        The connector offered a stored prefix, the scheduler skipped the request
+        past it, and the pages were then not there to load (evicted from a full
+        pool, or never completely written). Those positions already count as
+        computed, so the request cannot take part in this forward pass. Drop
+        its allocation and progress and leave it active: the scheduler admits
+        it again next iteration from local reuse, and the connector is asked
+        afresh without the lost pages. Rank-local by construction, so only
+        attention-DP owners and single-rank servers report failures here.
+        """
+        dropped = []
+        for key in ("context_requests_chunking", "context_requests_last_chunk"):
+            kept = []
+            for req in getattr(scheduled_batch, key):
+                (dropped if req.request_id in failed_ids else kept).append(req)
+            setattr(scheduled_batch, key, kept)
+        for req in dropped:
+            self.kv_cache_manager.drop_context_allocation(req)
+            draft_kv_cache_manager = getattr(self, "draft_kv_cache_manager", None)
+            if isinstance(draft_kv_cache_manager, KVCacheManagerV2):
+                draft_kv_cache_manager.free_resources(req)
+            self.kv_connector_manager.forget_request(req)
+        logger.warning(
+            f"kv connector: {len(dropped)} context request(s) restarted after a failed "
+            f"prefix load: {[req.request_id for req in dropped]}")
+        if self.enable_attention_dp and scheduled_batch.batch_size == 0:
+            # Same as the asynchronous-restore case above: keep this owner in
+            # the collective forward while it has nothing of its own to run.
+            self._pad_empty_attention_dp_batch(scheduled_batch)
+            if scheduled_batch.batch_size:
+                self.resource_manager.prepare_resources(
+                    scheduled_batch, publish_connector_output=False)
 
     def _defer_connector_load_cancellations(self) -> None:
         # A cancelled load must drain without becoming schedulable again.

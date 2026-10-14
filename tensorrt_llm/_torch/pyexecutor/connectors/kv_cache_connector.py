@@ -1260,6 +1260,23 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
             "docs/source/features/kv-cache-connector.md, 'Blocks with no page'."
         )
 
+    def take_failed_load_requests(self) -> set:
+        """Requests the worker could not load pages for in this iteration.
+
+        Empty for connectors that raise on a failed load. See
+        `PyExecutor._recover_failed_connector_loads` for what happens to them.
+        """
+        take = getattr(self.worker, "take_failed_load_requests", None)
+        return set(take()) if take is not None else set()
+
+    def forget_request(self, request: LlmRequest) -> None:
+        """Drop everything keyed to a request that is about to restart from scratch."""
+        drop_saves = getattr(self.worker, "drop_bound_saves", None)
+        if drop_saves is not None:
+            drop_saves([request.request_id])
+        # Main's reset hook already notifies the scheduler via request_reset.
+        self.reset_request_state(request)
+
     def reset_request_state(self, request: LlmRequest) -> None:
         """Retire bookkeeping only after the allocation's writes have completed."""
         if self.has_pending_load(request):

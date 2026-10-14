@@ -3739,6 +3739,22 @@ class KVCacheManagerV2(BaseResourceManager):
         self._set_page_index_bufs(req.py_request_id, kv_cache)
         return True
 
+    def drop_context_allocation(self, req: LlmRequest) -> None:
+        """Give up a context request's allocation and progress; it restarts from scratch.
+
+        For a request that was skipped past a connector prefix whose pages then
+        could not be filled: those positions already count as computed, so the
+        request cannot run this iteration and the only correct outcome is to
+        recompute them. Same rewind as the drop branch of
+        ``revert_allocate_context``; the scheduler re-admits the request from
+        whatever the radix tree still holds, and the connector is asked again.
+        """
+        self._release_unconsumed_context_reservation(req)
+        req.py_ctx_pre_resize_cap = None
+        if req.py_request_id in self.kv_cache_map:
+            self.free_resources(req)
+        rewind_context_after_cache_drop(req, self.tokens_per_block)
+
     def _restore_page_index_bufs(self, request_id: int, kv_cache: _KVCache) -> None:
         """Re-connect host page-index buffers after resume().
 
