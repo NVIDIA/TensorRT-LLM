@@ -3256,6 +3256,13 @@ def test_connector_adp_transfer_timeout(
     # Give the fatal consumer its own MPI job; inheriting pytest's MPI identity
     # would make its initialization or abort affect the parent test runner.
     consumer_env, _ = split_mpi_env()
+    # Keep transport policy without restoring the parent MPI job's identity.
+    # Otherwise the isolated consumer may select an unavailable network device.
+    consumer_env.update({
+        key: value
+        for key, value in os.environ.items()
+        if key.startswith("UCX_") or key in ("OMPI_MCA_btl", "OMPI_MCA_pml")
+    })
     with log_path.open("w") as log:
         process = subprocess.Popen(
             [
