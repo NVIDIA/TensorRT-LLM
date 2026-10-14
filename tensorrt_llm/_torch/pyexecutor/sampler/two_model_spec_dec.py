@@ -12,10 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Draft-token verification for two-model speculative decoding.
+"""Draft-token verification for drafter-based speculative decoding.
 
-Only reached when the drafter runs as a separate engine (NGram, two-model
-Eagle3/draft-target). One-model speculation (MTP / Eagle3 one-model / SA)
+Only reached when a ``Drafter`` attaches draft tokens to target requests, which
+today means NGram. One-model speculation (MTP / Eagle3 one-model / SA)
 verifies via ``SpecSampler`` and never enters this path -- see the note in
 ``speculative/drafter.py`` on which drafters use ``TorchSampler``.
 
@@ -36,7 +36,7 @@ __all__ = ["TwoModelSpecDecHandler"]
 
 
 class TwoModelSpecDecHandler:
-    """Verifies draft tokens produced by a separate drafter engine.
+    """Verifies draft tokens produced by a drafter.
 
     Holds a back-reference to the owning ``TorchSampler`` because verification
     is interleaved with its finish-reason bookkeeping (``finish_if_reason``).

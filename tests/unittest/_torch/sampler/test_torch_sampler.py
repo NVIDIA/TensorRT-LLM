@@ -510,6 +510,30 @@ def test_stochastic_requests_share_one_group():
 
 
 @force_ampere
+def test_grouping_rejects_a_request_not_admitted_to_its_slot():
+    """A request whose slot was last admitted for another request fails loudly
+    instead of sampling with that request's params."""
+    sampler = TorchSampler(
+        TorchSampler.Args(
+            max_seq_len=16,
+            max_draft_len=0,
+            max_num_sequences=1,
+            max_beam_width=1,
+            max_total_draft_tokens=0,
+        )
+    )
+    make_request = TestSlotSamplingParams._request
+    admitted = make_request(SamplingParams(temperature=0.8), 0)
+    sampler._slot_params.admit([admitted], torch.tensor([0], dtype=torch.int64, device="cuda"))
+    sampler._group_requests([admitted], [0])
+
+    unadmitted = make_request(SamplingParams(), 0)
+    unadmitted.py_request_id = admitted.py_request_id + 1
+    with pytest.raises(AssertionError, match="last admitted for request"):
+        sampler._group_requests([unadmitted], [0])
+
+
+@force_ampere
 @pytest.mark.parametrize(
     "draft_len, with_ctx_chunking, with_ctx_last_chunk, with_gen",
     [
@@ -3376,7 +3400,9 @@ class TestTopPDecay:
             sampling_config=SamplingConfig(params._get_sampling_config()),
             is_context_init_state=False,
             py_draft_tokens=draft_tokens,
+            py_request_id=0,
             py_seq_slot=slot,
+            is_dummy=False,
             return_log_probs=False,
             # Read by the row_stride query in sampler_common; these tests are
             # single-beam, so the static admission width is 1.

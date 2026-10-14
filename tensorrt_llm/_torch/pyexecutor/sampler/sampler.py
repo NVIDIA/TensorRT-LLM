@@ -93,6 +93,9 @@ else:
 
 T = TypeVar("T")
 
+# Seed of every unseeded request, the same on every rank.
+_GLOBAL_SEED = 42
+
 
 @dataclass(kw_only=True)
 class SampleStateTensors:
@@ -691,7 +694,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         # fixed for multi-GPU consistency.
         self._seed_manager = _SeedManager(
             max_num_sequences=self.max_num_sequences,
-            global_seed=42,
+            global_seed=_GLOBAL_SEED,
         )
 
         # Force number of accepted tokens for speculative decoding testing.
@@ -802,6 +805,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         for req in requests:
             slot = req.py_seq_slot
             assert slot is not None
+            self._slot_params.assert_admitted(req, slot)
             # Greedy is left out on purpose: greedy batches stay on the eager
             # path. Capturing argmax saves about as much launch overhead as
             # staging for it costs (on Qwen2-0.5B the two cancelled out), the
@@ -1756,10 +1760,12 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         must share (``BeamSearchParams.group_key``). Request indices within a
         group are ascending.
         """
-        modes = self._slot_params.modes
-        need_processed_logprobs = self._slot_params.need_processed_logprobs
+        slot_params = self._slot_params
+        modes = slot_params.modes
+        need_processed_logprobs = slot_params.need_processed_logprobs
         groups: dict[Hashable, _SamplingGroup] = {}
         for req_idx, (request, slot) in enumerate(zip(requests, seq_slots)):
+            slot_params.assert_admitted(request, slot)
             mode = modes[slot]
             needs_probs = need_processed_logprobs[slot]
             beam_params = None

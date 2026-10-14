@@ -71,6 +71,9 @@ def resolve_row_params(
     greedy default, is ``SamplingParams.params_imply_greedy_decoding``. A
     ``top_k`` at or above the vocab size needs no special case: the kernel
     treats it as disabled.
+
+    Expects values ``SamplingParams._validate`` has accepted (temperature >= 0,
+    top_k >= 0, top_p and min_p in [0, 1]); the asserts below rely on it.
     """
     if use_beam_search:
         return RowSamplingParams(SamplingMode.BEAM, 1.0, 0, 1.0, 0.0)
@@ -122,6 +125,8 @@ class SlotSamplingParams:
         self.modes: list[SamplingMode] = [SamplingMode.GREEDY] * num_slots
         self.need_processed_logprobs: list[bool] = [False] * num_slots
         self.need_raw_logprobs: list[bool] = [False] * num_slots
+        # The request each slot was last admitted for, checked by assert_admitted.
+        self.request_ids: list[int | None] = [None] * num_slots
         # (temperature, top_p, min_p), so admission and a gather move them together.
         self.floats = torch.tensor(
             [[1.0], [1.0], [0.0]], dtype=torch.float32, device=device
@@ -135,6 +140,7 @@ class SlotSamplingParams:
             slot = request.py_seq_slot
             assert slot is not None
             self.modes[slot] = row.mode
+            self.request_ids[slot] = request.py_request_id
             return_log_probs = request.return_log_probs
             self.need_processed_logprobs[slot] = (
                 return_log_probs and request.py_logprobs_mode == LogprobMode.PROCESSED
@@ -149,6 +155,18 @@ class SlotSamplingParams:
         device = self.floats.device
         self.floats.index_copy_(1, slots_cuda, floats.to(device, non_blocking=True))
         self.top_k.index_copy_(0, slots_cuda, top_k.to(device, non_blocking=True))
+
+    def assert_admitted(self, request: LlmRequest, slot: int) -> None:
+        """Fail if ``request`` reads ``slot`` without having been admitted to it.
+
+        Without admission the slot holds its previous occupant's params, or
+        neutral greedy ones. Dummy requests are exempt: their tokens are
+        discarded.
+        """
+        assert request.is_dummy or self.request_ids[slot] == request.py_request_id, (
+            f"request {request.py_request_id} reads slot {slot}, last admitted for "
+            f"request {self.request_ids[slot]}"
+        )
 
     def gather(
         self, slots_cuda: torch.Tensor
