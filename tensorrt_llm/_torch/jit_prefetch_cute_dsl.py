@@ -409,24 +409,44 @@ def device_props() -> Dict[str, Any]:
     import torch
 
     p = torch.cuda.get_device_properties(torch.cuda.current_device())
-    return {
+    props = {
         "major": p.major,
         "minor": p.minor,
         "multi_processor_count": p.multi_processor_count,
         "shared_memory_per_block_optin": p.shared_memory_per_block_optin,
         "name": p.name,
     }
+    try:  # the radix top-k cluster kernels clamp their cluster size to this
+        from .cute_dsl_kernels.blackwell.top_k import single_pass_multi_cta_radix_topk_cluster as c
+
+        props["max_cluster_size"] = int(c._query_max_cluster_size())
+    except Exception:  # noqa: BLE001 - CuTe DSL missing, or the query failed
+        pass
+    return props
 
 
 def install_device_shim(props: Dict[str, Any]) -> None:
     """In a helper process: answer the device queries of kernel constructors
-    (``torch.cuda.get_device_properties`` and friends) with ``props``."""
+    (``torch.cuda.get_device_properties`` and friends, the radix top-k max
+    cluster size, the top-k runners' SM count) with ``props``."""
     import torch
 
     ns = types.SimpleNamespace(**props)
     torch.cuda.get_device_properties = lambda device=None: ns
     torch.cuda.current_device = lambda: 0
     torch.cuda.get_device_capability = lambda device=None: (props["major"], props["minor"])
+    if "max_cluster_size" in props:
+        try:
+            from .custom_ops import cute_dsl_custom_ops as ops
+            from .cute_dsl_kernels.blackwell.top_k import (
+                single_pass_multi_cta_radix_topk_cluster as cluster_mod,
+            )
+        except ImportError:
+            return
+        size = int(props["max_cluster_size"])
+        cluster_mod._query_max_cluster_size = lambda: size
+        if hasattr(ops, "_query_max_cluster_size"):
+            ops._query_max_cluster_size = lambda: size
 
 
 class KdaPrefillProvider:
