@@ -2002,6 +2002,12 @@ class PyExecutor:
             self._stop_mpi_progress_thread()
             return
         self.worker_thread.join()
+        coordinator = self.__dict__.get("_disagg_coordinator")
+        if coordinator is not None and not coordinator.shared_shutdown_complete(
+        ):
+            raise RuntimeError(
+                "Shared KV cleanup is incomplete; retain resource managers until "
+                "Lifecycle containment or confirmed cleanup")
         if self.kv_connector_manager is not None:
             self.kv_connector_manager.shutdown()
         if self.dist.pp_size > 1:
@@ -2228,13 +2234,21 @@ class PyExecutor:
             len(self.waiting_queue) == 0 and not self._has_pending_connector_transfers()
 
     def _has_pending_connector_transfers(self) -> bool:
+        """Return whether connector or shared work needs another owner-loop round.
+
+        Returns:
+            Whether retained transfers prevent an indefinite idle wait or teardown.
+        """
         connector = getattr(self, "kv_connector_manager", None)
-        if connector is None:
-            return False
-        transfers = getattr(self, "async_transfer_manager", None)
-        return (connector.has_pending_loads()
-                or (transfers is not None
-                    and transfers.has_any_inflight_requests()))
+        if connector is not None:
+            transfers = getattr(self, "async_transfer_manager", None)
+            if (connector.has_pending_loads()
+                    or (transfers is not None
+                        and transfers.has_any_inflight_requests())):
+                return True
+        coordinator = self.__dict__.get("_disagg_coordinator")
+        return (coordinator is not None
+                and coordinator.has_pending_shared_transfers())
 
     @contextmanager
     def _profiler(self):
@@ -3024,6 +3038,13 @@ class PyExecutor:
             self.is_shutdown = True
             self.response_cv.notify_all()
         self.shutdown_event.set()
+        coordinator = self.__dict__.get("_disagg_coordinator")
+        if coordinator is not None:
+            try:
+                coordinator.begin_shared_shutdown()
+            except Exception as error:
+                # Waiters are already awake; retained resources still block manager teardown.
+                logger.error(f"Shared KV shutdown initiation failed: {error}")
 
         # The loop may exit while the benchmark fill gate is still closed.
         keepalive = getattr(self, "_gpu_keepalive", None)
@@ -6815,6 +6836,7 @@ class PyExecutor:
                     req_item.finished_prefix_load_ids)
             elif req_item.is_shutdown_request:
                 self.is_shutdown = True
+                self.disagg.begin_shared_shutdown()
                 break
             elif req_item.is_canceled_request:
                 self.canceled_req_ids.append(req_item.id)
