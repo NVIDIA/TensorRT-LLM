@@ -5109,23 +5109,31 @@ crypto = ["cryptography (>=3.4.0)"]
 
 [[package]]
 name = "pynvvideocodec"
-version = "2.1.0"
+version = "2.2.3"
 description = "pynvvideocodec (PyNvVideoCodec) is NVIDIA's Python library for hardware-accelerated video encode/decode on NVIDIA GPUs."
 optional = false
 python-versions = ">=3.8"
 groups = ["main"]
 files = [
-    {file = "pynvvideocodec-2.1.0-cp310-cp310-manylinux_2_28_aarch64.whl", hash = "sha256:e778af3319a759c1728065e9e4682f591c44dedbbc90c1ca71d025dce65d6a58"},
-    {file = "pynvvideocodec-2.1.0-cp310-cp310-manylinux_2_28_x86_64.whl", hash = "sha256:3e1ecef741e1943978911998aa1a9d683be8b005957646db6c9b0d53f943f9af"},
-    {file = "pynvvideocodec-2.1.0-cp310-cp310-win_amd64.whl", hash = "sha256:7c35887e294613825c9011dc1b6962d0c0374049b1ce8939cee97db5d82b28e8"},
-    {file = "pynvvideocodec-2.1.0-cp311-cp311-manylinux_2_28_aarch64.whl", hash = "sha256:b8d9b47b5c910953d6c24fa60fd7bf6ac57f3d4a20831fcaf35e039349a91d42"},
-    {file = "pynvvideocodec-2.1.0-cp311-cp311-manylinux_2_28_x86_64.whl", hash = "sha256:6d653240ce835e9ab531a4d61350a4af54f7f7859e5392e1323c030ffcfc8ff0"},
-    {file = "pynvvideocodec-2.1.0-cp311-cp311-win_amd64.whl", hash = "sha256:ee5d2dc56ac5ca8d223fa6fe8f57c67faf5ee1c9360216d9194cfbcd3f9d3948"},
-    {file = "pynvvideocodec-2.1.0-cp312-cp312-manylinux_2_28_aarch64.whl", hash = "sha256:af7e44d13cfb524626c72d947f12a3b192cfa1deb4b598a7778bd4aa1e6fd4ac"},
-    {file = "pynvvideocodec-2.1.0-cp312-cp312-manylinux_2_28_x86_64.whl", hash = "sha256:c317fbad725b1b81936b863edcd98920bc4be423b9965719657030359d7afe29"},
-    {file = "pynvvideocodec-2.1.0-cp312-cp312-win_amd64.whl", hash = "sha256:09cdd222c761855cde9b05ddc13d21893473cebae50077eca20b4eac0fed8acb"},
-    {file = "pynvvideocodec-2.1.0-cp38-cp38-manylinux_2_28_aarch64.whl", hash = "sha256:34ddbb22230f4963f5b25b41af0a1579c3731fb95c79993502dd014a4dec7fd6"},
-    {file = "pynvvideocodec-2.1.0-cp38-cp38-manylinux_2_28_x86_64.whl", hash = "sha256:133b47336cd9b3a161707b02d2ceb9e5af387cb9833335d60c16eddf7322b3ea"},
+    {file = "pynvvideocodec-2.2.3-cp310-cp310-manylinux_2_28_aarch64.whl", hash = "sha256:92555b2af82459827f0c9142f79c4fd197a72c2eebf8aef09fa3370c8ba6fbfb"},
+    {file = "pynvvideocodec-2.2.3-cp310-cp310-manylinux_2_28_x86_64.whl", hash = "sha256:6d401816b515e19fd5b3fe39adcaf63e1462fd8d13c0443ed0c52fb40ecacbb0"},
+    {file = "pynvvideocodec-2.2.3-cp310-cp310-win_amd64.whl", hash = "sha256:5e862f2f56294fee116cee438899bdd490d932f575761c6b1632fd5e4f562405"},
+    {file = "pynvvideocodec-2.2.3-cp311-cp311-manylinux_2_28_aarch64.whl", hash = "sha256:0301be2bdf921fb6456a1f6087b7364f65501e895a2cb3bf7d73b8fe4ef5940b"},
+    {file = "pynvvideocodec-2.2.3-cp311-cp311-manylinux_2_28_x86_64.whl", hash = "sha256:eef8954b28f7d43b3c6e65eceac488c28ba3ca511366ad8d260885303cf126d2"},
+    {file = "pynvvideocodec-2.2.3-cp311-cp311-win_amd64.whl", hash = "sha256:cc1a1eaaed591f98a1e96bb5d28caeb5f47157682c3c8981316dc44450529015"},
+    {file = "pynvvideocodec-2.2.3-cp311-cp311-win_arm64.whl", hash = "sha256:2b8a3312f5938be960db4d0447845131d97a09f224405f933d74d588864e2d26"},
+    {file = "pynvvideocodec-2.2.3-cp312-cp312-manylinux_2_28_aarch64.whl", hash = "sha256:b9bb2b4a007965672a9fd02d70c3eba75eed23bd77c6ebef0c8ffbfcf506c0fe"},
+    {file = "pynvvideocodec-2.2.3-cp312-cp312-manylinux_2_28_x86_64.whl", hash = "sha256:126224753a41655c72c1576cb23a835cb853a1a3c3568d78360ff07d24627b42"},
+    {file = "pynvvideocodec-2.2.3-cp312-cp312-win_amd64.whl", hash = "sha256:a535d5acededa18602cfc5898be7e906099e34419e91448e348f18bdf6f11329"},
+    {file = "pynvvideocodec-2.2.3-cp312-cp312-win_arm64.whl", hash = "sha256:871fb41bfe275db3cfa645b1ddb5bf447bea49d0265d487e821f63d240caccca"},
+    {file = "pynvvideocodec-2.2.3-cp313-cp313-manylinux_2_28_x86_64.whl", hash = "sha256:84baf32244ee9e3b047cd19671536587c3e54abab9dddfc7e3ec4d413c1704b1"},
+    {file = "pynvvideocodec-2.2.3-cp313-cp313-manylinux_2_34_aarch64.whl", hash = "sha256:73ef5aa2ee95f795758bf08638626e972a75dd4b70e3aa7e92d128a096565062"},
+    {file = "pynvvideocodec-2.2.3-cp313-cp313-win_amd64.whl", hash = "sha256:48c5dd9f4cd23098079c629c0446702c8b3a148dff6f8f851d66844743a8128b"},
+    {file = "pynvvideocodec-2.2.3-cp313-cp313-win_arm64.whl", hash = "sha256:b962a1ac8dfb4b3c129783f7f46a3585b1f931a36032d4e5525d446f8ecd485e"},
+    {file = "pynvvideocodec-2.2.3-cp314-cp314-manylinux_2_28_x86_64.whl", hash = "sha256:ffa03cedc4128456727fd5d1cf5a91fa747cda6cf6544d1b603b1b9d84d00eae"},
+    {file = "pynvvideocodec-2.2.3-cp314-cp314-manylinux_2_34_aarch64.whl", hash = "sha256:c124c73132b82383347d05c526de1403adea79c217381a20d1a5af9a6cf1b79e"},
+    {file = "pynvvideocodec-2.2.3-cp314-cp314-win_amd64.whl", hash = "sha256:223271328633fa256eb30903008ab7bccf6fccfa51647a5755e0df486fecdd25"},
+    {file = "pynvvideocodec-2.2.3-cp314-cp314-win_arm64.whl", hash = "sha256:3d45624af9cc705fecf3cd678d6dd28b0e750162563d869bccd557cb591ca286"},
 ]
 
 [[package]]
@@ -6123,9 +6131,30 @@ description = "The little ASGI library that shines."
 optional = false
 python-versions = ">=3.10"
 groups = ["main"]
+markers = "python_version == \"3.10\""
 files = [
     {file = "starlette-1.7.0-py3-none-any.whl", hash = "sha256:67f8e99895493dd2911a03f11314af6ceebeae4e704bb9f43dfc6a9db151c93e"},
     {file = "starlette-1.7.0.tar.gz", hash = "sha256:c79f74ea63cff761804fbbfb182f1e0b440c2d07b164d24700c5a1bab5d6ff5d"},
+]
+
+[package.dependencies]
+anyio = ">=4.0.0,<5"
+typing-extensions = {version = ">=4.10.0", markers = "python_version < \"3.13\""}
+
+[package.extras]
+full = ["httpx (>=0.27.0,<0.29.0)", "httpx2 (>=2.0.0)", "itsdangerous", "jinja2", "opentelemetry-api", "python-multipart (>=0.0.18)", "pyyaml"]
+
+[[package]]
+name = "starlette"
+version = "1.8.0"
+description = "The little ASGI library that shines."
+optional = false
+python-versions = ">=3.11"
+groups = ["main"]
+markers = "python_version >= \"3.11\""
+files = [
+    {file = "starlette-1.8.0-py3-none-any.whl", hash = "sha256:dfdd6b29c26483288088d990eee59631dedadd66ce20d203402a7ca8e3c4656f"},
+    {file = "starlette-1.8.0.tar.gz", hash = "sha256:1565dc0b35d5737a271ed1e0e04e949f4e81198799f216d2667b0a0fb9cf9522"},
 ]
 
 [package.dependencies]
@@ -7302,4 +7331,4 @@ type = ["pytest-mypy (>=1.0.1) ; platform_python_implementation != \"PyPy\""]
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.10,<3.13"
-content-hash = "ad48332c853f32487b0fbb74ccb9b2892bc1a6865cfb3aff74d4a193f6af131b"
+content-hash = "fcf4cd9fc83bb2b50af7195a985784aa1dfa3056d5afa416f525f4fe481daa49"
