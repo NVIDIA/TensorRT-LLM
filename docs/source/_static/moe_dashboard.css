@@ -127,6 +127,12 @@ html[data-theme="dark"] .multi-panel {
 }
 #moe-dashboard .banner svg { width: 15px; height: 15px; flex: none; }
 
+/* ----------------------------------------------------- provenance --- */
+/* One line naming the commit behind the numbers; hidden when data.js has no
+   `commit` field. */
+#moe-dashboard .provenance { margin: 0 0 14px; color: var(--muted); font-size: 13px; }
+#moe-dashboard .provenance a { color: inherit; text-decoration: underline; }
+
 /* -------------------------------------------------------- filters --- */
 #moe-dashboard .moe-main { padding: 24px 0 56px; }
 /* Two columns: a standing control rail, then the results. --side is also added

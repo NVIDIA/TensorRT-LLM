@@ -33,6 +33,7 @@ SKELETON = """\
 <div id="moe-dashboard">
   <div class="wrap">
     <div id="moe-banner" class="banner" hidden></div>
+    <p id="moe-provenance" class="provenance" hidden></p>
   </div>
   <div class="moe-main">
     <div class="wrap stage" id="moe-stage">

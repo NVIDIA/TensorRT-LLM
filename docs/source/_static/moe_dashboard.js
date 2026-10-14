@@ -1037,6 +1037,17 @@ function moeDashboardMain() {
            "M7 2.6 1.7 12.2c-.4.7.1 1.6.9 1.6h10.8c.8 0 1.3-.9.9-1.6L9 2.6a1.1 1.1 0 0 0-2 0Z"]),
       el("span", null, "Mock data — placeholder values, not real measurements."));
   }
+  // Data provenance: which TensorRT-LLM commit the payload was measured on.
+  // data.js carries `commit`; a payload without it leaves the line hidden.
+  if (DATA.commit) {
+    const p = $("provenance");
+    p.hidden = false;
+    const a = el("a", null, DATA.commit);
+    a.href = `https://github.com/NVIDIA/TensorRT-LLM/commit/${DATA.commit}`;
+    a.target = "_blank";
+    a.rel = "noopener";
+    p.append("Measured on TensorRT-LLM commit ", a, ".");
+  }
   // Defaults first, then whatever the reader last looked at. Index dims that no
   // longer resolve to a file, and data dims absent from it, are dropped by
   // onIndexChange rather than trusted.
