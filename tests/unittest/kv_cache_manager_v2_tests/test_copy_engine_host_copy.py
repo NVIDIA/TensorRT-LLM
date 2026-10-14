@@ -18,9 +18,11 @@ copy_host_to_device / copy_device_to_host (kvCacheManagerV2Utils.cu) send a call
 least TLLM_KV_CACHE_MANAGER_V2_HOST_COPY_DMA_MIN_BYTES each (default 4 MiB) to the copy engines, as one
 cuMemcpyBatchAsync, and every other call to the batched copy kernel; use_copy_engine_for_host_copy()
 reports the decision for a task size. The knob is read once per process, so the shapes below sit on
-both sides of the default instead of toggling the environment variable. Needs one GPU.
+both sides of the default instead of toggling the environment variable, and every expectation that
+depends on the path asks the predicate first. Needs one GPU.
 """
 
+import os
 from random import randbytes
 
 import pytest
@@ -53,6 +55,19 @@ SHAPES = [
 ]
 
 
+def _expected_threshold() -> int | None:
+    """The threshold the C++ policy read at start-up: None when the path is disabled, 0 for any size."""
+    raw = os.environ.get("TLLM_KV_CACHE_MANAGER_V2_HOST_COPY_DMA_MIN_BYTES", "")
+    if raw == "":
+        return DEFAULT_DMA_MIN_BYTES
+    try:
+        value = int(raw, 10)
+    except ValueError:
+        # The policy logs a warning and keeps the default.
+        return DEFAULT_DMA_MIN_BYTES
+    return None if value < 0 else value
+
+
 def _pinned(num_bytes: int) -> torch.Tensor:
     return torch.empty(num_bytes, dtype=torch.uint8, pin_memory=True)
 
@@ -77,18 +92,8 @@ def _check(result: int) -> None:
     assert result == 0, f"copy helper returned CUresult {result}"
 
 
-def test_policy_follows_the_documented_default() -> None:
-    """Below the size threshold the kernel is used; the predicate says which path a size takes."""
-    selected = copy_helpers.use_copy_engine_for_host_copy
-    assert not selected(884_736)
-    assert not selected(DEFAULT_DMA_MIN_BYTES - 1)
-    # The two state pages of one request take the copy engines unless this host registers pinned
-    # memory in chunks, in which case the predicate is false for every size.
-    assert selected(DEFAULT_DMA_MIN_BYTES) == selected(15_261_696) == selected(217_055_232)
-
-
-@pytest.mark.parametrize(("num_bytes", "num_tasks"), SHAPES)
-def test_round_trip(num_bytes: int, num_tasks: int) -> None:
+def _round_trip(num_bytes: int, num_tasks: int) -> None:
+    """Pinned host -> device -> pinned host through the helpers, byte-exact."""
     total = num_bytes * num_tasks
     stream = torch.cuda.Stream()
     src = _pinned(total)
@@ -100,12 +105,6 @@ def test_round_trip(num_bytes: int, num_tasks: int) -> None:
     host_to_device = _tasks(dev, src, num_bytes, num_tasks)
     device_to_host = _tasks(dst, dev, num_bytes, num_tasks)
 
-    if num_bytes % 16 != 0 and not copy_helpers.use_copy_engine_for_host_copy(num_bytes):
-        # The kernel path requires a multiple of 16 and rejects the call before enqueuing anything.
-        with pytest.raises(Exception, match="multiple of 16"):
-            copy_helpers.copy_host_to_device(host_to_device, num_bytes, stream.cuda_stream)
-        return
-
     _check(copy_helpers.copy_host_to_device(host_to_device, num_bytes, stream.cuda_stream))
     _check(copy_helpers.copy_device_to_host(device_to_host, num_bytes, stream.cuda_stream))
     # The copies are stream-ordered on the stream they were given, so this is the only wait needed.
@@ -113,10 +112,42 @@ def test_round_trip(num_bytes: int, num_tasks: int) -> None:
     assert torch.equal(dst, payload), f"{num_tasks} x {num_bytes} B round trip is not byte-exact"
 
 
-def test_kernel_path_rejects_a_size_that_is_not_a_multiple_of_16() -> None:
-    """A size below the threshold always takes the kernel, whose check throws before any CUDA work."""
+def test_policy_follows_the_environment() -> None:
+    """The predicate mirrors the threshold this process started with.
+
+    A host that registers pinned memory in chunks reports the kernel for every size instead, so that
+    answer is accepted as well.
+    """
+    selected = copy_helpers.use_copy_engine_for_host_copy
+    sizes = [16, 884_736, DEFAULT_DMA_MIN_BYTES - 1, DEFAULT_DMA_MIN_BYTES, 15_261_696, 217_055_232]
+    actual = [selected(n) for n in sizes]
+    threshold = _expected_threshold()
+    if threshold is None:
+        assert not any(actual), actual
+        return
+    expected = [n >= threshold for n in sizes]
+    assert actual == expected or not any(actual), (actual, expected)
+
+
+@pytest.mark.parametrize(("num_bytes", "num_tasks"), SHAPES)
+def test_round_trip(num_bytes: int, num_tasks: int) -> None:
+    if num_bytes % 16 != 0 and not copy_helpers.use_copy_engine_for_host_copy(num_bytes):
+        # The kernel path requires a multiple of 16 and rejects the call before enqueuing anything.
+        tasks = [MemToMemTask(dst=0x1000, src=0x2000)] * num_tasks
+        with pytest.raises(Exception, match="multiple of 16"):
+            copy_helpers.copy_host_to_device(
+                tasks, num_bytes, torch.cuda.current_stream().cuda_stream
+            )
+        return
+    _round_trip(num_bytes, num_tasks)
+
+
+def test_size_that_is_not_a_multiple_of_16() -> None:
+    """24 B: the kernel's check throws before any CUDA work, the copy engines accept the size."""
     num_bytes = 24
-    assert not copy_helpers.use_copy_engine_for_host_copy(num_bytes)
+    if copy_helpers.use_copy_engine_for_host_copy(num_bytes):
+        _round_trip(num_bytes, 3)
+        return
     # Rejected before the addresses are used, so they need not be real.
     tasks = [MemToMemTask(dst=0x1000, src=0x2000)] * 3
     for helper in (copy_helpers.copy_host_to_device, copy_helpers.copy_device_to_host):

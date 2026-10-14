@@ -273,30 +273,27 @@ INSTANTIATE_TEST_SUITE_P(Shapes, HostCopyRoundTripTest,
         std::make_pair(kConvStateBytes, size_t{12})));
 
 // The kernel requires numBytes % 16 == 0 and rejects anything else with TLLM_CHECK before enqueuing work; the
-// copy-engine path has no such constraint. A size below the threshold always takes the kernel, so its rejection is
-// asserted on every host; the copy-engine round trip runs wherever that path is selected.
+// copy-engine path has no such constraint. Which path a size takes depends on the threshold this process started
+// with (24 B is below the default, 4 MiB + 8 B above it), so each size is either round-tripped or asserted to throw
+// according to the policy predicate.
 TEST_F(KvCacheManagerV2HostCopyTest, NonMultipleOf16)
 {
     size_t const numTasks = 3;
-    // Rejected before any CUDA work: the addresses are never dereferenced, so they need not be real.
-    size_t const kernelBytes = 24;
-    ASSERT_FALSE(useCopyEngineForHostCopy(kernelBytes));
-    std::vector<MMTask> const tasks(numTasks, MMTask{MemAddress{0x1000}, MemAddress{0x2000}});
-    EXPECT_THROW(copyHostToDevice(tasks, static_cast<ssize_t>(kernelBytes), reinterpret_cast<CUstream>(mStream)),
-        tensorrt_llm::common::TllmException);
-    EXPECT_THROW(copyDeviceToHost(tasks, static_cast<ssize_t>(kernelBytes), reinterpret_cast<CUstream>(mStream)),
-        tensorrt_llm::common::TllmException);
-
-    size_t const copyEngineBytes = kDefaultThreshold + 8;
-    if (useCopyEngineForHostCopy(copyEngineBytes))
+    for (size_t numBytes : {size_t{24}, kDefaultThreshold + 8})
     {
-        roundTrip(copyEngineBytes, numTasks, mStream);
-    }
-    else
-    {
-        EXPECT_THROW(
-            copyHostToDevice(tasks, static_cast<ssize_t>(copyEngineBytes), reinterpret_cast<CUstream>(mStream)),
-            tensorrt_llm::common::TllmException);
+        if (useCopyEngineForHostCopy(numBytes))
+        {
+            roundTrip(numBytes, numTasks, mStream);
+            continue;
+        }
+        // Rejected before any CUDA work: the addresses are never dereferenced, so they need not be real.
+        std::vector<MMTask> const tasks(numTasks, MMTask{MemAddress{0x1000}, MemAddress{0x2000}});
+        EXPECT_THROW(copyHostToDevice(tasks, static_cast<ssize_t>(numBytes), reinterpret_cast<CUstream>(mStream)),
+            tensorrt_llm::common::TllmException)
+            << "numBytes=" << numBytes;
+        EXPECT_THROW(copyDeviceToHost(tasks, static_cast<ssize_t>(numBytes), reinterpret_cast<CUstream>(mStream)),
+            tensorrt_llm::common::TllmException)
+            << "numBytes=" << numBytes;
     }
 }
 
