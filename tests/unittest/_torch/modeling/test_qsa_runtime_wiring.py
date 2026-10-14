@@ -244,6 +244,10 @@ def test_qsa_hybrid_routes_to_sparse_v2_cache_manager(monkeypatch) -> None:
         pretrained_config=SimpleNamespace(),
         sparse_attention_config=QSASparseAttentionConfig(),
         get_num_mamba_layers=lambda: 1,
+        # Real ModelConfig declares both with defaults; the helix x
+        # speculation manager check reads them.
+        mapping=None,
+        spec_config=None,
     )
     kv_cache_config = KvCacheConfig(use_kv_cache_manager_v2=True)
 
@@ -260,6 +264,10 @@ def test_qsa_hybrid_rejects_kv_cache_manager_v1(monkeypatch) -> None:
         pretrained_config=SimpleNamespace(),
         sparse_attention_config=QSASparseAttentionConfig(),
         get_num_mamba_layers=lambda: 1,
+        # Real ModelConfig declares both with defaults; the helix x
+        # speculation manager check reads them.
+        mapping=None,
+        spec_config=None,
     )
 
     with pytest.raises(ValueError, match="requires use_kv_cache_manager_v2=True"):

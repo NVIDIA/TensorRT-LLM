@@ -81,6 +81,7 @@ WAN22_T2V_MODEL_SUBPATH = "Wan2.2-T2V-A14B-Diffusers"
 WAN22_A14B_NVFP4_MODEL_SUBPATH = "Wan2.2-T2V-A14B-Diffusers-NVFP4"
 FASTWAN_MODEL_SUBPATH = "FastWan2.2-TI2V-5B-FullAttn-Diffusers"
 WAN22_I2V_A14B_NVFP4_MODEL_SUBPATH = "Wan2.2-I2V-A14B-Diffusers-NVFP4"
+WAN22_LPIPS_THRESHOLD = 0.25
 WAN_FEATURE_LPIPS_THRESHOLD = 0.05
 WAN_STANDARD_SUPPORTED_FEATURES = frozenset({"fp8-blockwise", "nvfp4", "cuda-graph"})
 
@@ -299,11 +300,11 @@ def test_wan22_t2v_lpips_against_golden(request, tmp_path, wan22_bf16_video_path
     _preserve_lpips_candidate_on_failure(
         request,
         score,
-        WAN_LPIPS_THRESHOLD,
+        WAN22_LPIPS_THRESHOLD,
         wan22_bf16_video_path,
         "wan22_t2v_lpips_golden_video.mp4",
     )
-    _assert_lpips_below_threshold(score, WAN_LPIPS_THRESHOLD)
+    _assert_lpips_below_threshold(score, WAN22_LPIPS_THRESHOLD)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
@@ -415,13 +416,7 @@ def test_wan_feature_accuracy_against_golden(
 
 def test_visual_gen_quickstart(_visual_gen_deps, llm_root, llm_venv):
     """Run examples/visual_gen/quickstart_example.py end-to-end."""
-    scratch_space = conftest.llm_models_root()
-    model_src = os.path.join(scratch_space, WAN_T2V_MODEL_SUBPATH)
-    if not os.path.isdir(model_src):
-        pytest.skip(
-            f"Model not found: {model_src} "
-            f"(set LLM_MODELS_ROOT or place {WAN_T2V_MODEL_SUBPATH} under scratch)"
-        )
+    model_src = get_checkpoint(WAN_T2V_MODEL_SUBPATH)
 
     model_dst = os.path.join(llm_venv.get_working_directory(), "Wan-AI", WAN_T2V_MODEL_SUBPATH)
     if not os.path.islink(model_dst):
@@ -437,13 +432,7 @@ def test_visual_gen_quickstart(_visual_gen_deps, llm_root, llm_venv):
 
 def test_visual_gen_api_walkthrough(_visual_gen_deps, llm_root, llm_venv):
     """Run examples/visual_gen/api_walkthrough.py end-to-end."""
-    scratch_space = conftest.llm_models_root()
-    model_src = os.path.join(scratch_space, WAN_T2V_MODEL_SUBPATH)
-    if not os.path.isdir(model_src):
-        pytest.skip(
-            f"Model not found: {model_src} "
-            f"(set LLM_MODELS_ROOT or place {WAN_T2V_MODEL_SUBPATH} under scratch)"
-        )
+    model_src = get_checkpoint(WAN_T2V_MODEL_SUBPATH)
 
     model_dst = os.path.join(llm_venv.get_working_directory(), "Wan-AI", WAN_T2V_MODEL_SUBPATH)
     if not os.path.islink(model_dst):
@@ -515,13 +504,7 @@ def test_wan_i2v_example(_visual_gen_deps, llm_root, llm_venv):
     work together as documented. Uses the pre-quantized Wan 2.2 I2V A14B NVFP4
     checkpoint and the default input image (cat_piano.png) bundled with the examples.
     """
-    scratch_space = conftest.llm_models_root()
-    model_path = os.path.join(scratch_space, WAN22_I2V_A14B_NVFP4_MODEL_SUBPATH)
-    if not os.path.isdir(model_path):
-        pytest.skip(
-            f"Model not found: {model_path} "
-            f"(set LLM_MODELS_ROOT or place {WAN22_I2V_A14B_NVFP4_MODEL_SUBPATH} under models root)"
-        )
+    model_path = get_checkpoint(WAN22_I2V_A14B_NVFP4_MODEL_SUBPATH)
 
     out_dir = os.path.join(llm_venv.get_working_directory(), "visual_gen_output", "wan_i2v_example")
     os.makedirs(out_dir, exist_ok=True)

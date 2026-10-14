@@ -843,6 +843,7 @@ def test_hybrid_cache_manager_factory_rejects_mixed_override_with_reuse(
             KvCacheConfig(
                 enable_block_reuse=True,
                 mamba_state_config=MambaStateConfig(periodic_snapshot_interval=256),
+                use_kv_cache_manager_v2=False,
             ),
         )
 
@@ -901,7 +902,10 @@ def test_hybrid_models_prefer_v2_and_python_transceiver(monkeypatch):
     ):
         llm_args = TorchLlmArgs(
             model="/tmp/dummy_model",
-            cache_transceiver_config=CacheTransceiverConfig(backend="DEFAULT"),
+            kv_cache_config=KvCacheConfig(use_kv_cache_manager_v2="auto"),
+            cache_transceiver_config=CacheTransceiverConfig(
+                backend="DEFAULT", transceiver_runtime="auto"
+            ),
         )
         _resolve_transceiver_runtime_auto(llm_args, model_cls)
         _resolve_kv_cache_manager_v2_auto(llm_args, model_cls)
@@ -969,6 +973,7 @@ def test_kimi_without_v2_preference_uses_mixed_manager(
         kv_cache_config=KvCacheConfig(
             enable_block_reuse=False,
             tokens_per_block=64,
+            use_kv_cache_manager_v2="auto",
         ),
     )
     resolved = _resolve_kv_cache_manager_v2_auto(llm_args, KimiLinearForCausalLM)
@@ -995,7 +1000,7 @@ def test_kimi_preferred_transceiver_runtime() -> None:
     "cache_transceiver_config",
     [
         None,
-        CacheTransceiverConfig(backend="NIXL"),  # runtime left at 'auto'
+        CacheTransceiverConfig(backend="NIXL", transceiver_runtime="auto"),
         CacheTransceiverConfig(backend="NIXL", transceiver_runtime="CPP"),
         CacheTransceiverConfig(backend="UCX", transceiver_runtime="CPP"),
         CacheTransceiverConfig(backend="UCX", transceiver_runtime="PYTHON"),
@@ -1008,8 +1013,8 @@ def test_kimi_disagg_rejects_non_python_transceiver_route(
     """Any K3 disagg route that does not reach the Python NIXL transceiver
     must fail loudly instead of returning a manager the C++ transceiver
     would drive without KDA state transfer (silent wrong results). The
-    'auto_unresolved' case covers paths that skip model-default resolution
-    (e.g. AutoDeploy), where 'auto' falls back to the C++ runtime."""
+    'auto_unresolved' case covers paths that skip model-default resolution,
+    where 'auto' falls back to the C++ runtime."""
     monkeypatch.delenv("TRTLLM_USE_PY_MAMBA", raising=False)
     monkeypatch.delenv("TLLM_MAMBA_MANAGER_PREFERENCE", raising=False)
 
@@ -1031,7 +1036,10 @@ def test_kimi_disagg_python_nixl_routes_to_mixed_manager(
     assert (
         get_kv_cache_manager_cls(
             _kimi_model_config(),
-            KvCacheConfig(enable_block_reuse=False),
+            KvCacheConfig(
+                enable_block_reuse=False,
+                use_kv_cache_manager_v2=False,
+            ),
             is_disagg=True,
             cache_transceiver_config=CacheTransceiverConfig(
                 backend="NIXL", transceiver_runtime="PYTHON"
@@ -1129,6 +1137,8 @@ def test_v2_hybrid_incompatibility_fails_without_cpp_fallback(
     creator = object.__new__(KvCacheCreator)
     creator._kv_connector_manager = object() if has_connector else None
     creator._max_beam_width = max_beam_width
+    creator._is_disagg = False
+    creator._llm_args = SimpleNamespace(sleep_config=None)
 
     if expected is None:
         assert (
@@ -1490,7 +1500,7 @@ def test_update_mamba_states_mtp_path():
 
 
 @skip_no_cuda
-def test_update_mamba_states_autodeploy_path():
+def test_update_mamba_states_with_explicit_state_indices():
     mgr = _make_mgr()
     mgr._prepare_mamba_cache_blocks([200, 201, 202])
 

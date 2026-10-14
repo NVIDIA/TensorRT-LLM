@@ -144,15 +144,35 @@ foreach(DEP_IDX RANGE ${DEP_COUNT_MINUS_ONE})
   endif()
 
   if(DEP_PATCH_FILE AND NOT DEP_PATCH_FILE STREQUAL "")
+    set(_patch_command "${Python3_EXECUTABLE}"
+                       "${CMAKE_CURRENT_SOURCE_DIR}/patch_dependency.py")
     set(_patch_file "${CMAKE_CURRENT_SOURCE_DIR}/${DEP_PATCH_FILE}")
+    # Reconfigure, and rerun the patch step, when the patch changes.
+    set_property(
+      DIRECTORY
+      APPEND
+      PROPERTY CMAKE_CONFIGURE_DEPENDS "${_patch_file}")
+    file(SHA256 "${_patch_file}" _patch_sha256)
     list(
       APPEND
       FETCH_ARGS
       PATCH_COMMAND
-      bash
-      -c
-      "patch -p1 --forward --batch --dry-run -i '${_patch_file}' && patch -p1 --forward --batch -i '${_patch_file}' || patch -p1 --reverse --batch --dry-run -i '${_patch_file}' || (echo 'Patch state for ${DEP_NAME} is inconsistent. Remove ${CMAKE_BINARY_DIR}/_deps/${DEP_NAME}-src and reconfigure.' >&2 && false)"
-    )
+      ${_patch_command}
+      apply
+      "${DEP_NAME}"
+      "${_patch_file}"
+      --patch-sha256
+      ${_patch_sha256})
+    if(NOT DEP_USE_URL)
+      list(
+        APPEND
+        FETCH_ARGS
+        UPDATE_COMMAND
+        ${_patch_command}
+        update
+        "${DEP_NAME}"
+        "${DEP_GIT_TAG}")
+    endif()
   endif()
 
   if(_git_submodules_error STREQUAL "NOTFOUND")

@@ -35,12 +35,15 @@ from tensorrt_llm._torch.models.hf_parameter_utils import get_parameter_device
 from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
 from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
+from tensorrt_llm._torch.visual_gen.attention.attention import Attention, QKVMode
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm._torch.visual_gen.models.modeling import BaseDiffusionModel
-from tensorrt_llm._torch.visual_gen.modules.attention import Attention, QKVMode
 from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeightLoader
+from tensorrt_llm._torch.visual_gen.utils import SequenceSharder
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
+
+from .fused_adaln import h3_adaln_supported, h3_gate_res_norm_mod, h3_norm_mod
 
 MINIMAX_H3_MODALITY_NUM = 3
 
@@ -189,6 +192,25 @@ def _norm_2d(norm: RMSNorm, hidden_states: torch.Tensor) -> torch.Tensor:
     return norm(hidden_states.reshape(-1, shape[-1])).view(shape)
 
 
+def _pad_tensor_dim(
+    tensor: torch.Tensor,
+    dim: int,
+    pad: int,
+    value: float | int | bool = 0,
+) -> torch.Tensor:
+    if pad == 0:
+        return tensor
+    pad_shape = list(tensor.shape)
+    pad_shape[dim] = pad
+    return torch.cat([tensor, tensor.new_full(pad_shape, value)], dim=dim)
+
+
+def _padding_to_multiple(seq_len: int, multiple: int) -> int:
+    if multiple <= 1:
+        return 0
+    return (multiple - seq_len % multiple) % multiple
+
+
 class MiniMaxH3AdaLayerNormModulation(nn.Module):
     """Produce six AdaLN vectors for every ``(timestep, modality)`` pair."""
 
@@ -212,9 +234,17 @@ class MiniMaxH3AdaLayerNormModulation(nn.Module):
             reduce_output=False,
         )
 
-    def forward(self, temb: torch.Tensor) -> tuple[torch.Tensor, ...]:
+    def table(self, temb: torch.Tensor) -> torch.Tensor:
+        """Return the modulation table ``[n_t * 3, 6 * hidden_size]``.
+
+        One row per ``(timestep, modality)`` pair; the six column blocks are
+        shift, scale and gate for attention, then shift, scale and gate for the MLP.
+        """
         temb = self.linear(F.silu(temb).to(self.linear.dtype))
-        return temb.view(-1, 6 * self.hidden_size).chunk(6, dim=-1)
+        return temb.view(-1, 6 * self.hidden_size)
+
+    def forward(self, temb: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        return self.table(temb).chunk(6, dim=-1)
 
 
 class MiniMaxH3AdaLayerNormOut(nn.Module):
@@ -295,8 +325,15 @@ class MiniMaxH3TokenRefinerBlock(nn.Module):
             reduce_output=model_config.mapping.tp_size > 1,
         )
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        hidden_states = hidden_states + self.attn(_norm_2d(self.norm1, hidden_states))
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        key_padding_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        hidden_states = hidden_states + self.attn(
+            _norm_2d(self.norm1, hidden_states),
+            key_padding_mask=key_padding_mask,
+        )
         residual = hidden_states
         hidden_states = _norm_2d(self.norm2, hidden_states)
         hidden_states = self.ff(hidden_states.reshape(-1, hidden_states.shape[-1])).reshape_as(
@@ -320,6 +357,14 @@ class MiniMaxH3TokenRefiner(nn.Module):
         model_config: DiffusionModelConfig,
     ) -> None:
         super().__init__()
+        self._supports_key_padding_mask = model_config.attention.backend.upper() in (
+            "VANILLA",
+            "FA4",
+        )
+        self.sharder = SequenceSharder.from_vgm(
+            model_config.visual_gen_mapping,
+            num_attention_heads=num_attention_heads,
+        )
         self.refiner_blocks = nn.ModuleList(
             [
                 MiniMaxH3TokenRefinerBlock(
@@ -343,9 +388,33 @@ class MiniMaxH3TokenRefiner(nn.Module):
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        seq_len = hidden_states.shape[1]
+        pad = _padding_to_multiple(seq_len, self.sharder.size)
+        key_padding_mask = None
+        if pad:
+            if not self._supports_key_padding_mask:
+                raise NotImplementedError(
+                    "Padded token-refiner sequences require key_padding_mask support; use VANILLA or FA4."
+                )
+            valid = hidden_states.new_ones((hidden_states.shape[0], seq_len), dtype=torch.bool)
+            key_padding_mask = _pad_tensor_dim(valid, 1, pad, False)
+            hidden_states = _pad_tensor_dim(hidden_states, 1, pad)
+        hidden_states = self.sharder.shard(hidden_states, dim=1)
         for block in self.refiner_blocks:
-            hidden_states = block(hidden_states)
-        return _norm_2d(self.final_norm, hidden_states)
+            hidden_states = block(hidden_states, key_padding_mask=key_padding_mask)
+        hidden_states = _norm_2d(self.final_norm, hidden_states)
+        return self.sharder.gather(hidden_states, dim=1, unpad_to=seq_len)
+
+
+def _pad_rotary_emb(
+    rotary_emb: tuple[torch.Tensor, torch.Tensor],
+    pad: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    cos, sin = rotary_emb
+    return (
+        _pad_tensor_dim(cos, 0, pad, 1.0),
+        _pad_tensor_dim(sin, 0, pad, 0.0),
+    )
 
 
 class MiniMaxH3TransformerBlock(nn.Module):
@@ -392,6 +461,8 @@ class MiniMaxH3TransformerBlock(nn.Module):
             hidden_size=hidden_size,
             model_config=model_config,
         )
+        # Fused RMSNorm + gathered modulation (and the gated residual before norm2).
+        self._fused_adaln = h3_adaln_supported(hidden_size, model_config.torch_dtype)
 
     def forward(
         self,
@@ -402,6 +473,10 @@ class MiniMaxH3TransformerBlock(nn.Module):
         key_padding_mask: Optional[torch.Tensor] = None,
         timestep: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if self._fused_adaln and hidden_states.dtype == torch.bfloat16:
+            return self._forward_fused_adaln(
+                hidden_states, temb, adaln_indices, rotary_emb, key_padding_mask, timestep
+            )
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaln_proj(temb)
 
         residual = hidden_states
@@ -426,6 +501,38 @@ class MiniMaxH3TransformerBlock(nn.Module):
         ).reshape_as(norm_hidden_states)
         return residual + gate_mlp.index_select(0, adaln_indices) * ff_output
 
+    def _forward_fused_adaln(
+        self,
+        hidden_states: torch.Tensor,
+        temb: torch.Tensor,
+        adaln_indices: torch.Tensor,
+        rotary_emb: tuple[torch.Tensor, torch.Tensor],
+        key_padding_mask: Optional[torch.Tensor],
+        timestep: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        hidden_size = hidden_states.shape[-1]
+        mod = self.adaln_proj.table(temb)
+        norm_hidden_states = h3_norm_mod(
+            hidden_states, self.norm1.weight, mod, adaln_indices, self.norm1.variance_epsilon, 1, 0
+        )
+        attn_output = self.attn(norm_hidden_states, rotary_emb, key_padding_mask, timestep)
+        hidden_states, norm_hidden_states = h3_gate_res_norm_mod(
+            hidden_states,
+            attn_output,
+            self.norm2.weight,
+            mod,
+            adaln_indices,
+            self.norm2.variance_epsilon,
+            2,
+            4,
+            3,
+        )
+        ff_output = self.ff(
+            norm_hidden_states.reshape(-1, norm_hidden_states.shape[-1])
+        ).reshape_as(norm_hidden_states)
+        gate_mlp = mod[:, 5 * hidden_size : 6 * hidden_size]
+        return hidden_states + gate_mlp.index_select(0, adaln_indices) * ff_output
+
 
 class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
     """MiniMax-H3's dense single-stream joint audio-video transformer.
@@ -444,7 +551,7 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
             )
         self._attn_backend = getattr(model_config.attention, "backend", "VANILLA")
         # Only VANILLA supports arbitrary padding between packed modalities.
-        self._supports_key_padding_mask = self._attn_backend == "VANILLA"
+        self._supports_key_padding_mask = self._attn_backend in ("VANILLA", "FA4")
         quant_algo = model_config.quant_config.quant_algo
         # TODO: Support calibrated checkpoints in load_weights before enabling static quantization.
         if quant_algo is not None and not (
@@ -491,6 +598,10 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
         norm_eps = float(cfg.norm_eps)
         qk_norm_eps = float(cfg.qk_norm_eps)
         final_norm_eps = float(cfg.final_norm_eps)
+        self.sharder = SequenceSharder.from_vgm(
+            model_config.visual_gen_mapping,
+            num_attention_heads=num_attention_heads,
+        )
 
         video_patch_dim = in_channels * patch_size[0] * patch_size[1] * patch_size[2]
         # Block-scaled GEMMs require aligned dimensions. Keep the checkpoint's
@@ -652,16 +763,12 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
 
     def _validate_layout(
         self,
-        position_ids: torch.Tensor,
+        sequence_length: int,
         token_tags: torch.Tensor,
         timestep_indices: torch.Tensor,
         timestep: torch.Tensor,
     ) -> None:
-        if position_ids.ndim != 2 or position_ids.shape[-1] != 3:
-            raise ValueError(
-                f"position_ids must have shape [sequence_length, 3], got {list(position_ids.shape)}."
-            )
-        sequence_length = position_ids.shape[0]
+        """Range-check the packed layout; the fused AdaLN kernels gather ``mod[idx]`` without bounds checks."""
         if token_tags.shape != (sequence_length,) or timestep_indices.shape != (sequence_length,):
             raise ValueError(
                 "token_tags and timestep_indices must match the packed sequence length."
@@ -703,10 +810,12 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
                 raise ValueError("position_ids is required when static_context is not provided.")
             sequence_length = static_context.sequence_length
         else:
+            if position_ids.ndim != 2 or position_ids.shape[-1] != 3:
+                raise ValueError(
+                    f"position_ids must have shape [sequence_length, 3], got {list(position_ids.shape)}."
+                )
             sequence_length = position_ids.shape[0]
-            self._validate_layout(
-                position_ids, token_tags, timestep_indices, conditioning_timesteps
-            )
+        self._validate_layout(sequence_length, token_tags, timestep_indices, conditioning_timesteps)
 
         if static_context is None:
             if encoder_hidden_states is None or position_ids is None:
@@ -716,10 +825,6 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
             static_context = self.prepare_static_context(
                 encoder_hidden_states,
                 position_ids,
-            )
-        elif token_tags.shape != (sequence_length,) or timestep_indices.shape != (sequence_length,):
-            raise ValueError(
-                "token_tags and timestep_indices must match the cached packed sequence length."
             )
 
         if static_context.sequence_length != sequence_length:
@@ -745,25 +850,54 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
         temb = self.time_proj(conditioning_timesteps)
         temb = self.time_embedder(temb.to(self.time_embedder.linear_1.weight.dtype))
         adaln_indices = timestep_indices * MINIMAX_H3_MODALITY_NUM + token_tags.clamp(min=0)
+        timestep_indices_for_norm = timestep_indices
+        rotary_emb = static_context.rotary_emb
+        pad = _padding_to_multiple(sequence_length, self.sharder.size)
+        token_tags_for_mask = token_tags
+        if pad:
+            packed_hidden_states = _pad_tensor_dim(packed_hidden_states, 1, pad)
+            adaln_indices = _pad_tensor_dim(adaln_indices, 0, pad)
+            timestep_indices_for_norm = _pad_tensor_dim(timestep_indices, 0, pad)
+            token_tags_for_mask = _pad_tensor_dim(token_tags, 0, pad, -1)
+            rotary_emb = _pad_rotary_emb(rotary_emb, pad)
+
         key_padding_mask = None
-        if bool((token_tags < 0).any()):
+        if bool((token_tags_for_mask < 0).any()):
             if not self._supports_key_padding_mask:
                 raise NotImplementedError(
                     "Padded packed sequences (negative token_tags) need an attention "
                     "backend that honours key_padding_mask; the "
                     f"{self._attn_backend} backend cannot express it. Use "
-                    "VANILLA."
+                    "VANILLA or FA4."
+                )
+            # FA4 expresses padding through seqused_k, which requires valid
+            # tokens to form a prefix. Ulysses appends padding in this layout.
+            if self._attn_backend == "FA4" and bool(
+                ((token_tags_for_mask[:-1] < 0) & (token_tags_for_mask[1:] >= 0)).any()
+            ):
+                raise NotImplementedError(
+                    "FA4 requires trailing packed-row padding; use VANILLA for interior padding."
                 )
             key_padding_mask = (
-                (token_tags >= 0).unsqueeze(0).expand(packed_hidden_states.shape[0], -1)
+                (token_tags_for_mask >= 0).unsqueeze(0).expand(packed_hidden_states.shape[0], -1)
             )
+
+        padded_sequence_length = packed_hidden_states.shape[1]
+        packed_hidden_states = self.sharder.shard(packed_hidden_states, dim=1)
+        adaln_indices = self.sharder.shard(adaln_indices, dim=0)
+        timestep_indices_for_norm = self.sharder.shard(timestep_indices_for_norm, dim=0)
+        rotary_emb = self.sharder.shard_rope(
+            rotary_emb,
+            seq_len=padded_sequence_length,
+            seq_dim=0,
+        )
 
         for block in self.transformer_blocks:
             packed_hidden_states = block(
                 packed_hidden_states,
                 temb,
                 adaln_indices,
-                static_context.rotary_emb,
+                rotary_emb,
                 key_padding_mask,
                 timestep,
             )
@@ -771,7 +905,12 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
         packed_hidden_states = self.norm_out(
             packed_hidden_states,
             temb,
-            timestep_indices,
+            timestep_indices_for_norm,
+        )
+        packed_hidden_states = self.sharder.gather(
+            packed_hidden_states,
+            dim=1,
+            unpad_to=sequence_length,
         )
         video_output = self.proj_out(
             packed_hidden_states.to(self._projection_act_dtype)

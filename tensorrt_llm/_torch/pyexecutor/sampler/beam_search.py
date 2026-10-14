@@ -11,7 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
 """Beam search for ``TorchSampler``.
 
 The candidate-selection, beam-expansion and candidate-beams-array (CBA) logic:
@@ -45,7 +44,7 @@ from ..llm_request import LlmRequest, LlmRequestState
 from .logprobs import LogProbsStore
 from .ops.flashinfer import radix_topk_op
 from .ops.vanilla import StrategyMetadata
-from .sampler_common import _get_beam_width_in, int_tensor
+from .sampler_common import _get_beam_width_out, int_tensor
 from .sampler_features import _SideStreamCopier
 
 BEAM_SEARCH_PAD_TOKEN = -1
@@ -1133,9 +1132,15 @@ def _prepare_beam_history_cba(
     slot = request.py_seq_slot
     assert slot is not None
     row = cba_group.pos[slot]
-    # Active beams currently in the slots: the input width of the current
-    # step (== num_beams except for variable-beam-width requests).
-    active_width = _get_beam_width_in(request)
+    # Beams live in the slots: the width the step being finalized produced,
+    # which is the same _get_beam_width_out the sampler sized that step with.
+    # That is not the width which entered the step whenever the step changed it
+    # -- a variable-beam-width step that widens, or any request's context step,
+    # which enters with one row and leaves beam_width beams -- and slicing the
+    # snapshot with the input width drops the beams the step added, so a run
+    # ending on such a step finalizes fewer paths than it produced and the
+    # remaining output beams stay padded.
+    active_width = _get_beam_width_out(request)
     return_log_probs = request.py_return_log_probs
 
     length_penalty = request.sampling_config.length_penalty or 0.0
@@ -1603,6 +1608,9 @@ class BeamSearchHandler:
             )
             if cba_group is None:
                 return None
+            # The copies above are non-blocking; wait for them to finish before reading
+            # them.
+            torch.cuda.current_stream().synchronize()
             inner = _prepare_beam_history_cba(request, cba_group=cba_group)
             return inner() if inner is not None else None
 

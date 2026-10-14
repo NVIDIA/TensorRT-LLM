@@ -397,3 +397,75 @@ def test_chunked_continuation_matches_fla(
     assert_kda_close("chunked/first_output", first_output, full_output[:, :split])
     assert_kda_close("chunked/second_output", second_output, full_output[:, split:])
     assert_kda_close("chunked/state", second_state, full_state)
+
+
+@pytest.mark.parametrize("use_cuda_graph", [False, True], ids=["eager", "cuda_graph"])
+@torch.no_grad()
+def test_prefill_stage_reuse_is_repeatable(use_cuda_graph: bool) -> None:
+    """TMA must wait for K1's Q/K reads as well as MMA before reusing a stage."""
+    generator = torch.Generator(device="cuda").manual_seed(20260921)
+    length = 1186
+    shape = (1, length, NUM_HEADS, HEAD_DIM)
+
+    def random_tensor(shape: tuple[int, ...]) -> torch.Tensor:
+        return torch.randn(shape, device="cuda", generator=generator)
+
+    q = torch.nn.functional.normalize(random_tensor(shape), dim=-1).bfloat16()
+    k = torch.nn.functional.normalize(random_tensor(shape), dim=-1).bfloat16()
+    v = random_tensor(shape).bfloat16()
+    g = random_tensor(shape).bfloat16()
+    beta = random_tensor(shape[:-1])
+    a_log = torch.zeros(NUM_HEADS, device="cuda")
+    dt_bias = torch.zeros(NUM_HEADS * HEAD_DIM, device="cuda")
+    state = torch.empty(1, NUM_HEADS, HEAD_DIM, HEAD_DIM, device="cuda")
+    indices = torch.zeros(1, dtype=torch.int64, device="cuda")
+    cu_seqlens = _make_cu_seqlens([length])
+    chunk_count = (length + 63) // 64
+    chunk_indices = torch.stack(
+        (
+            torch.zeros(chunk_count, device="cuda", dtype=torch.int64),
+            torch.arange(chunk_count, device="cuda"),
+        ),
+        dim=-1,
+    )
+    dispatch = KDAKernelDispatch(use_optimized_prefill=True, use_optimized_decode=False)
+
+    def run() -> torch.Tensor:
+        state.zero_()
+        output, _ = dispatch.prefill_chunk_kda(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            A_log=a_log,
+            dt_bias=dt_bias,
+            scale=HEAD_DIM**-0.5,
+            initial_state=None,
+            safe_gate=True,
+            lower_bound=-5.0,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+            state_pool=state,
+            state_indices=indices,
+            varlen_is_aligned=False,
+            single_sequence_length=length,
+        )
+        return output
+
+    for _ in range(3):
+        output = run()
+    expected = output.clone()
+    expected_state = state.clone()
+    graph = None
+    if use_cuda_graph:
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            output = run()
+    for _ in range(128):
+        if graph is None:
+            output = run()
+        else:
+            graph.replay()
+        torch.testing.assert_close(output, expected, rtol=0, atol=0)
+        torch.testing.assert_close(state, expected_state, rtol=0, atol=0)

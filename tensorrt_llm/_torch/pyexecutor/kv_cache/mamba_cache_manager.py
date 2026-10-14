@@ -59,6 +59,10 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (LayerId, PageIndexMode,
                                                       SsmLayerConfig,
                                                       TokenIdExt, _KVCache)
 
+# Shared with the KV budget estimator so allocator and budgeting can never
+# diverge on the sharding rule (config_utils is import-cycle-free).
+from ..config_utils import mamba_effective_tp_size
+
 GB = 1 << 30
 
 
@@ -117,7 +121,7 @@ def _get_num_cuda_graph_padding_dummy_slots(
 
     This is computed before ``ModelEngine`` exists and covers draft lengths
     reachable at every batch size, including the zero-length acceptance-rate
-    fallback. ``ModelEngine._compute_dynamic_draft_len_mapping`` is created
+    fallback. ``DecoderRunner._compute_dynamic_draft_len_mapping`` is created
     later and covers only configured CUDA-graph batch sizes, so it cannot size
     this persistent ID set.
     """
@@ -166,19 +170,6 @@ class MambaRole:
     CONV_STATE = DataRole("conv_state")
     PLE_NGRAM_CONTEXT = DataRole("ple_ngram_context")
     PLE_CONV_STATE = DataRole("ple_conv_state")
-
-
-def _mamba_effective_tp_size(mapping: Mapping) -> int:
-    """TP degree for sizing per-rank mamba/KDA state pools.
-
-    Attention-DP replicates the state and takes precedence; helix
-    repurposes CP ranks as plain TP for recurrent-state layers.
-    """
-    if mapping.enable_attention_dp:
-        return 1
-    if mapping.has_cp_helix():
-        return mapping.tp_size * mapping.cp_size
-    return mapping.tp_size
 
 
 def get_tensor_size_bytes(tensor):
@@ -536,7 +527,7 @@ class PythonMambaCacheManager(BaseResourceManager):
         self._seed_request_counter = 0
 
         # get tp size
-        tp_size = _mamba_effective_tp_size(mapping)
+        tp_size = mamba_effective_tp_size(mapping)
 
         # derive mamba parameters for conv and ssm states
         d_inner = head_dim * num_heads
@@ -1645,6 +1636,11 @@ class MixedMambaHybridCacheManager(KVCacheManager, MambaCacheManager,
     Does not support block reuse / prefix caching for mamba states.
     """
 
+    # Recurrent (conv/SSM) state summarizes the whole matched prefix, so the
+    # cache manager __init__ coerces a positive spec recompute tail to a full
+    # re-prefill (see _has_recurrent_state on the attention-only base classes).
+    _has_recurrent_state = True
+
     def __init__(
         self,
         # mamba cache parameters
@@ -2225,6 +2221,11 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
 
     """
 
+    # Recurrent (conv/SSM) state summarizes the whole matched prefix, so the
+    # cache manager __init__ coerces a positive spec recompute tail to a full
+    # re-prefill (see _has_recurrent_state on the attention-only base classes).
+    _has_recurrent_state = True
+
     def __init__(
         self,
         # mamba cache parameters
@@ -2352,7 +2353,7 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
             return
 
         # Derive ssm_state_shape and conv_state_shape from mamba params (same as MambaCacheManager)
-        tp_size = _mamba_effective_tp_size(mapping)
+        tp_size = mamba_effective_tp_size(mapping)
         d_inner = mamba_head_dim * mamba_num_heads
         conv_dim = d_inner + 2 * mamba_n_groups * mamba_d_state
         nheads = mamba_num_heads
@@ -2987,6 +2988,11 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
     # keep main-like reuse endpoints and the existing unpaired draft path.
     _supports_reuse_match_backoff = False
 
+    # Recurrent (conv/SSM) state summarizes the whole matched prefix, so the
+    # cache manager __init__ coerces a positive spec recompute tail to a full
+    # re-prefill (see _has_recurrent_state on the attention-only base classes).
+    _has_recurrent_state = True
+
     # Qwen4-Exp PLE state is opt-in. These class-level defaults keep every other
     # model — and any partially-constructed instance that sets only the fields it
     # needs — out of the PLE branches without carrying PLE geometry.
@@ -3142,7 +3148,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             and self.local_num_mamba_layers > 0)
 
         if self.local_num_mamba_layers > 0:
-            tp_size = _mamba_effective_tp_size(mapping)
+            tp_size = mamba_effective_tp_size(mapping)
             d_inner = mamba_head_dim * mamba_num_heads
             grouped_state_dim = mamba_n_groups * mamba_d_state
             conv_dim = d_inner + 2 * grouped_state_dim

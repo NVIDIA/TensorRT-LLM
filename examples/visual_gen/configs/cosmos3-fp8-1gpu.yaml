@@ -1,0 +1,40 @@
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# 1-GPU static-FP8 Cosmos3 (Nano / Super).
+# Model: nvidia/Cosmos3-Nano or nvidia/Cosmos3-Super
+# Shared by offline examples (--visual_gen_args) and trtllm-serve.
+#
+# Same as cosmos3-nano-1gpu.yaml plus the revision: the FP8 weights live on the
+# 'fp8' branch of those repos rather than under a separate model ID. Drop this
+# line when --model is a local checkout of that branch.
+#
+# Quantization itself needs no declaration here; it is read from the
+# checkpoint's own metadata. FP8 is single-GPU only -- multi-GPU is refused
+# with an explicit error, so use BF16 there (see cosmos3-super-4gpu.yaml).
+#
+# That makes memory the binding constraint, since the weights cannot be split.
+# Weight footprint on the fp8 branch: Nano 21 GB, Super 70 GB. Activations are
+# on top of that and scale with resolution and frame count, so size the card
+# against your request shape rather than against the weights alone.
+#
+# Only Blackwell is exercised in CI (the FP8 tests run on l0_b200); nothing
+# gates other architectures, but they are untested.
+revision: fp8
+attention_config:
+  backend: VANILLA
+parallel_config:
+  cfg_size: 1
+  ulysses_size: 1

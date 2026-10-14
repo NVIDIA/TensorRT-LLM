@@ -29,6 +29,7 @@ l0_rtx_pro_6000:
   - unittest/_torch/thop/parallel/test_weight_only_quant_linear.py
   - unittest/_torch/thop/parallel/test_weight_only_quant_gemm.py
   - unittest/_torch/thop/parallel/test_w4a8_linear.py
+  - unittest/_torch/modules/mamba/test_flashinfer_chunk_gdn.py
   - test_e2e.py::test_ptp_quickstart_bert[VANILLA-BertForSequenceClassification-bert/bert-base-uncased-yelp-polarity]
   - test_e2e.py::test_ptp_quickstart_bert[TRTLLM-BertForSequenceClassification-bert/bert-base-uncased-yelp-polarity]
   - test_e2e.py::test_ptp_quickstart_advanced[Qwen3-30B-A3B-Qwen3/Qwen3-30B-A3B] # 3mins
