@@ -15,6 +15,7 @@ regressions.
 import json
 
 import pytest
+import torch
 from transformers import AutoConfig
 
 import tensorrt_llm  # noqa: F401  triggers AutoConfig registration
@@ -212,6 +213,18 @@ def test_autoconfig_from_pretrained_resolves_to_local_config(
     _verify_autoconfig_from_pretrained(cfg, model_type, config_cls)
     if model_type in ("cosmos3", "cosmos3_edge"):
         assert cfg._name_or_path == str(model_dir)
+
+
+def test_edge_text_config_keeps_legacy_torch_dtype():
+    cfg = Cosmos3EdgeTextConfig(torch_dtype="float16")
+    assert cfg.dtype == torch.float16
+
+
+def test_edge_attn_implementation_reaches_sub_configs():
+    cfg = Cosmos3EdgeConfig(attn_implementation="sdpa")
+    assert cfg.text_config._attn_implementation == "sdpa"
+    assert cfg.vision_config._attn_implementation == "sdpa"
+    assert cfg.projector_config._attn_implementation == "sdpa"
 
 
 def test_legacy_cosmos3_omni_model_type_still_resolves(tmp_path):

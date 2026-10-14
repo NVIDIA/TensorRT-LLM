@@ -83,10 +83,18 @@ def test_edge_mapper_drops_generator_weights_and_renames_reasoner_keys():
         "layers.0.mlp_moe_gen.up_proj.weight",
         "norm_moe_gen.weight",
         "time_embedder.linear_1.weight",
+        "model.layers.0.self_attn.k_norm_und_for_gen.weight",
+        "model.layers.0.self_attn.add_q_proj.weight",
+        "model.layers.0.mlp_moe_gen.up_proj.weight",
+        "model.norm_moe_gen.weight",
+    ]
+    assert all(key not in mapped for key in dropped)
+    renamed_away = [
         "model.visual.encoder.layers.0.mlp.fc1.weight",
         "model.visual.encoder.layers.0.self_attn.out_proj.weight",
     ]
-    assert all(key not in mapped for key in dropped)
+    assert all(key not in mapped for key in renamed_away)
+    assert len(mapped) == 12
 
 
 def test_siglip_position_interpolation_keeps_packed_token_count():

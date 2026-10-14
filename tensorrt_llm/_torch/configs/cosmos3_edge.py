@@ -62,9 +62,12 @@ class Cosmos3EdgeTextConfig(PreTrainedConfig):
         tie_word_embeddings: bool = False,
         **kwargs,
     ):
-        kwargs.pop("torch_dtype", None)
+        # Checkpoints may still say ``torch_dtype`` instead of ``dtype``.
+        legacy_torch_dtype = kwargs.pop("torch_dtype", None)
         kwargs.pop("model_type", None)
-        resolved_dtype = _as_torch_dtype(dtype or kwargs.pop("dtype", None) or "bfloat16")
+        resolved_dtype = _as_torch_dtype(
+            dtype or kwargs.pop("dtype", None) or legacy_torch_dtype or "bfloat16"
+        )
         rope_parameters = dict(rope_parameters or {})
         section = list(rope_parameters.get("mrope_section") or [24, 20, 20])
         theta = float(rope_parameters.get("rope_theta", rope_theta))
@@ -159,6 +162,23 @@ class Cosmos3EdgeProjectorConfig(PreTrainedConfig):
         self.out_hidden_size = out_hidden_size
 
 
+def _build_edge_sub_config(config_cls, value, attn_implementation):
+    """Build one Edge sub-config and keep the parent attention implementation."""
+    if isinstance(value, dict):
+        value = dict(value)
+        if attn_implementation is not None and "attn_implementation" not in value:
+            value["attn_implementation"] = attn_implementation
+        return config_cls(**value)
+    if value is None:
+        extra = {}
+        if attn_implementation is not None:
+            extra["attn_implementation"] = attn_implementation
+        return config_cls(**extra)
+    if attn_implementation is not None:
+        value._attn_implementation = attn_implementation
+    return value
+
+
 class Cosmos3EdgeConfig(PreTrainedConfig):
     """Composite config for ``nvidia/Cosmos3-Edge`` Reasoner checkpoints."""
 
@@ -182,27 +202,23 @@ class Cosmos3EdgeConfig(PreTrainedConfig):
         tie_word_embeddings: bool = False,
         **kwargs,
     ):
+        # Capture before ``PreTrainedConfig`` consumes the kwarg. Sub-configs are
+        # built after that call, so they do not see the propagation that happens
+        # during base initialization.
+        attn_implementation = kwargs.get("attn_implementation")
         kwargs.pop("model_type", None)
         super().__init__(tie_word_embeddings=tie_word_embeddings, **kwargs)
-        self.text_config = (
-            Cosmos3EdgeTextConfig(**text_config) if isinstance(text_config, dict) else text_config
+        if attn_implementation is None:
+            attn_implementation = getattr(self, "_attn_implementation", None)
+        self.text_config = _build_edge_sub_config(
+            Cosmos3EdgeTextConfig, text_config, attn_implementation
         )
-        if self.text_config is None:
-            self.text_config = Cosmos3EdgeTextConfig()
-        self.vision_config = (
-            Cosmos3EdgeVisionConfig(**vision_config)
-            if isinstance(vision_config, dict)
-            else vision_config
+        self.vision_config = _build_edge_sub_config(
+            Cosmos3EdgeVisionConfig, vision_config, attn_implementation
         )
-        if self.vision_config is None:
-            self.vision_config = Cosmos3EdgeVisionConfig()
-        self.projector_config = (
-            Cosmos3EdgeProjectorConfig(**projector_config)
-            if isinstance(projector_config, dict)
-            else projector_config
+        self.projector_config = _build_edge_sub_config(
+            Cosmos3EdgeProjectorConfig, projector_config, attn_implementation
         )
-        if self.projector_config is None:
-            self.projector_config = Cosmos3EdgeProjectorConfig()
 
         # Qwen3-VL processing and the patch merger read these from the vision
         # config. The Edge checkpoint stores the merge width on the projector.
