@@ -22,7 +22,7 @@ TensorRT LLM
 
 <!-- Use github markdown link to link for the latest blog since the doc build has not happened yet. When the doc build is updated, it should be updated to the webpage link. -->
 
-* [09/16] KV Cache Compression in TensorRT LLM
+* [10/14] KV Cache Compression in TensorRT LLM
 ✨ [➡️ link](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog29_KV_Cache_Compression_in_TensorRT-LLM.md)
 
 * [09/02] Accelerating Video Generation with GEMM Quantization, Attention Quantization and Skip Softmax Attention in TensorRT-LLM
