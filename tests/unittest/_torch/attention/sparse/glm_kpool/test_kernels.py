@@ -293,6 +293,8 @@ def test_pool_scores_max_kv_len_without_complete_pools_selects_nothing(
     assert scores.shape == (n, num_pools_max)
 
     num_cand = (kv_lens // KPOOL).to(torch.int32)
+    # Glm5NextSparseAttention selects pools with is_prefill=False and scan_lengths
+    # in every phase, context rows included, so this is the prefill path too.
     for candidate_scores in (scores, torch.full_like(scores, float("inf"))):
         selected = torch.empty(n, indexer.select_k, dtype=torch.int32, device="cuda")
         indexer.pool_top_k(
