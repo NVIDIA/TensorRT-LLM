@@ -383,8 +383,8 @@ class JitPrefetcher:
         self._tag_event: Dict[int, threading.Event] = {}
         self._key_event: Dict[str, threading.Event] = {}
         self._key_spec: Dict[str, Tuple[str, str]] = {}
-        # Triton keys a helper has been sent: the executor waits only for
-        # those, and compiles a still-queued one itself.
+        # Triton and CuTe DSL keys a helper has been sent: the executor waits
+        # only for those, and compiles a still-queued one itself.
         self._tag_key: Dict[int, str] = {}
         self._key_started: set = set()
         self._tag = 0
@@ -789,22 +789,19 @@ class JitPrefetcher:
         return True
 
     def _cute_dsl_load(self, spec: str):
-        """Executor side: the helper-exported kernel for ``spec``, waiting for
-        a helper compile of it already in flight; None to compile in place.
+        """Executor side: the helper-exported kernel for ``spec``; None to
+        compile in place.
 
-        Only the serving thread waits. Before serving starts (the final
-        executor's warmup), a variant not yet exported is resolved as it would
-        be without prefetch: the caller's own cache, which already holds what
-        the first warmup compiled, or an in-place compile.
+        A variant a helper is compiling is waited for: that compile is under
+        way, so it usually finishes before one started here would. A variant
+        still queued is compiled in place, as without prefetch, rather than
+        waited for behind the helpers' other work; the Triton hook does the
+        same.
         """
         from . import jit_prefetch_cute_dsl as jcd
 
-        serving = (
-            self._executor_thread is not None and threading.get_ident() == self._executor_thread
-        )
         ev = self._key_event.get(spec)
-        if serving and ev is not None and not ev.is_set():
-            self._submit(spec, spec, "cute_dsl", _PRIO_URGENT, kind=jcd.KIND)
+        if ev is not None and not ev.is_set() and spec in self._key_started:
             wait_timeout_s = float(os.environ.get("TLLM_JIT_PREFETCH_WAIT_TIMEOUT_S", "300"))
             t0 = time.perf_counter()
             ev.wait(wait_timeout_s)
@@ -826,9 +823,9 @@ class JitPrefetcher:
 
         Helpers compile from fake tensors for this rank's arch and export
         ``<dir>/<key>.o``; at the point the KDA op would call ``cute.compile``
-        the loader loads that file instead. On the serving thread it waits
-        for an in-flight helper compile of the same variant rather than
-        compiling it again (see ``_cute_dsl_load``).
+        the loader loads that file instead, waiting for a helper compile of
+        the same variant already under way rather than compiling it again
+        (see ``_cute_dsl_load``).
         """
         from . import jit_prefetch_cute_dsl as jcd
         from .custom_ops import cute_dsl_kimi_k3_custom_ops as kda_ops
@@ -1015,8 +1012,7 @@ class JitPrefetcher:
                 ev = threading.Event()
                 self._key_event[key] = ev
             self._tag_event[tag] = ev
-            if kind == "triton":
-                self._tag_key[tag] = key
+            self._tag_key[tag] = key
             self._key_spec[key] = (spec, label, kind)
             self.stats.submitted += 1
             if priority == _PRIO_ENUM:

@@ -249,10 +249,10 @@ def test_background_enumeration_reruns_only_warmup_recorded_providers(monkeypatc
 
 
 @pytest.mark.usefixtures("restore_triton_hooks")
-def test_cute_dsl_load_waits_for_a_helper_only_while_serving(tmp_path, monkeypatch):
-    """Warmup never waits for a CuTe DSL helper: a variant not exported yet
-    is compiled as without prefetch. The serving thread waits for an
-    in-flight helper compile instead of compiling it again."""
+def test_cute_dsl_load_waits_only_for_a_compile_under_way(tmp_path, monkeypatch):
+    """A CuTe DSL variant still queued (no helper started it) is compiled in
+    place at once, as without prefetch; only one a helper is compiling is
+    waited for."""
     import queue
     import threading
 
@@ -264,12 +264,13 @@ def test_cute_dsl_load_waits_for_a_helper_only_while_serving(tmp_path, monkeypat
     p = jp.JitPrefetcher(rank=0)
     p._cd_dir = str(tmp_path)
     p._queues[jcd.KIND] = queue.PriorityQueue()
-    assert p._submit("spec", "spec", "cute_dsl", jp._PRIO_ENUM, kind=jcd.KIND)
-    assert p._cute_dsl_load("spec") is None  # warmup: no executor thread yet
+    for spec in ("queued", "started"):
+        assert p._submit(spec, spec, "cute_dsl", jp._PRIO_ENUM, kind=jcd.KIND)
+    p._key_started.add("started")
+    assert p._cute_dsl_load("queued") is None
     assert p.stats.wait_n == 0
-    p.bind_executor_thread()
-    threading.Timer(0.05, p._key_event["spec"].set).start()
-    p._cute_dsl_load("spec")
+    threading.Timer(0.05, p._key_event["started"].set).start()
+    p._cute_dsl_load("started")
     assert p.stats.wait_n == 1
 
 
