@@ -19,6 +19,8 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from test_common.visual_gen_perf_history import VISUAL_GEN_METRIC_CONTRACT
+
 from tensorrt_llm.commands.utils import get_visual_gen_num_gpus as resolve_visual_gen_num_gpus
 
 MAXIMIZE_METRICS = [
@@ -170,6 +172,7 @@ def build_visual_gen_db_entry(
     client_name = str(client_config.get("name", "default"))
     entry = {
         "s_runtime": "visual_gen",
+        "s_visual_gen_metric_contract": VISUAL_GEN_METRIC_CONTRACT,
         "s_gpu_type": gpu_type,
         "s_model_name": str(model_name).lower(),
         "s_server_name": server_name,

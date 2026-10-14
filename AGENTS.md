@@ -131,6 +131,12 @@ Key entry points:
 - Serving CLI: `trtllm-serve <HF id> --visual_gen_args <YAML path>`.
 
 Key files:
+- VisualGen perf sanity uses client latency for regression. Its history policy
+  in `tests/test_common/visual_gen_perf_history.py` preserves existing verified
+  client results without changing match keys, and excludes old/unverified timing
+  windows before baseline and latest-main lookup. Keep this policy active when
+  changing benchmark mapping or perf upload; dates do not identify release/backport
+  timing semantics.
 - `tensorrt_llm/_torch/visual_gen/ENGINEERING_CRITERIA.md`: **Engineering criteria for any change under `tensorrt_llm/visual_gen/` or `tensorrt_llm/_torch/visual_gen/`** — API discipline, feature/test/lossy-vs-lossless requirements, examples & docs rules. Read before modifying anything in those trees.
 - `tensorrt_llm/visual_gen/`: VisualGen public Python API. **User-facing surface — before modifying anything here, pause and confirm with the user that a public API change is actually intended; do not infer it from the surrounding task.**
 - `tensorrt_llm/_torch/visual_gen/`: VisualGen internal implementation. All non-user-facing code belongs here.
