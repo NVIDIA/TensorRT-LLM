@@ -262,3 +262,21 @@ def test_r1_dep4_with_vanilla_mtp_does_not_match():
         modeling_v2_resolve(config, _llm_args("require"))
     with pytest.raises(ValueError, match="MTP"):
         modeling_v2_resolve(config, _llm_args("require"))
+
+
+@pytest.mark.parametrize(
+    "mapping_kwargs, parallel",
+    [
+        (dict(world_size=4, tp_size=4, moe_tp_size=4, moe_ep_size=1), "tp4"),
+        (dict(world_size=8, tp_size=8, moe_tp_size=8, moe_ep_size=1), "tp8"),
+        # experts split by expert rather than by tensor: another weight layout, no target
+        (dict(world_size=8, tp_size=8, moe_tp_size=1, moe_ep_size=8), None),
+        (dict(world_size=8, tp_size=8, moe_tp_size=8, enable_attention_dp=True), None),
+        (dict(world_size=2, tp_size=2, moe_tp_size=2), None),
+    ],
+)
+def test_minimax_m3_parallel_names_the_target_topology(mapping_kwargs, parallel):
+    """MiniMax-M3 has one target per tensor-parallel width: tp4 and tp8 load different per-rank shapes."""
+    from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3 import routing
+
+    assert routing._parallel(Mapping(**mapping_kwargs)) == parallel

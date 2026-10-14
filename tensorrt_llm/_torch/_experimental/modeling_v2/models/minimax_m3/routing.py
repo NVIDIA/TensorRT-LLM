@@ -67,20 +67,21 @@ def _parallel(m) -> Optional[str]:
 
     Attention is head-split and the routed experts are tensor-parallel with
     every expert on every rank: the expert split decides which expert weights
-    each rank loads and into which shapes (per-rank expert width 768 at tp4),
-    so it selects a target rather than a runtime branch.
+    each rank loads and into which shapes (per-rank expert width 768 at tp4,
+    384 at tp8), so it selects a target rather than a runtime branch.
     """
-    if not (
-        m.world_size == 4
-        and m.tp_size == 4
-        and m.pp_size == 1
-        and m.cp_size == 1
-        and m.moe_tp_size == 4
-        and m.moe_ep_size == 1
-        and not m.enable_attention_dp
-    ):
-        return None
-    return "tp4"
+    for tp in (4, 8):
+        if (
+            m.world_size == tp
+            and m.tp_size == tp
+            and m.pp_size == 1
+            and m.cp_size == 1
+            and m.moe_tp_size == tp
+            and m.moe_ep_size == 1
+            and not m.enable_attention_dp
+        ):
+            return f"tp{tp}"
+    return None
 
 
 def _eagle3_one_model_or_none(spec_config: Optional[Any]) -> bool:
@@ -137,13 +138,26 @@ def route(
 
         return ModelingV2MiniMaxM3Nvfp4Sm103Tp4
 
+    # The same checkpoint on 8 GB300s over two trays (sm103), tensor-parallel
+    # attention and experts, one-model Eagle3 or no speculative decoding.
+    if (
+        compute_capability == _SM
+        and shape == _SHAPE
+        and quant_algo == QuantAlgo.MIXED_PRECISION
+        and parallel == "tp8"
+        and speculation
+    ):
+        from .minimax_m3_nvfp4__sm_103__tp8.modeling import ModelingV2MiniMaxM3Nvfp4Sm103Tp8
+
+        return ModelingV2MiniMaxM3Nvfp4Sm103Tp8
+
     raise NoTarget(
         f"compute capability {compute_capability}, text_config shape {shape}, "
         f"quantization {quant_algo.name if quant_algo is not None else 'none'}, parallel "
         f"ws={mapping.world_size} tp={mapping.tp_size} pp={mapping.pp_size} cp={mapping.cp_size} "
         f"moe_tp={mapping.moe_tp_size} moe_ep={mapping.moe_ep_size} "
         f"attention_dp={mapping.enable_attention_dp}, speculative decoding "
-        f"{spec_config.spec_dec_mode.name if spec_config is not None else 'off'}; the one "
-        "minimax_m3 target is the MiniMax-M3 NVFP4 checkpoint on sm103 (GB300), 4 ranks of "
+        f"{spec_config.spec_dec_mode.name if spec_config is not None else 'off'}; the "
+        "minimax_m3 targets are the MiniMax-M3 NVFP4 checkpoint on sm103 (GB300), 4 or 8 ranks of "
         "tensor-parallel attention and experts, with one-model Eagle3 or no speculative decoding"
     )

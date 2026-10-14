@@ -84,6 +84,8 @@ add_th_common_family(
   minimaxM3SparseDecodeLcOp.cpp
   minimaxM3SpecTailOp.cpp
   minimaxM3TargetHeadOp.cpp
+  minimaxM3Tp8FusedScoreSelectOp.cpp
+  minimaxM3Tp8SparseDecodeLc8Op.cpp
   stepInputsScatterOp.cpp
   mlaRopeInplaceOp.cpp
   relativeAttentionBiasOp.cpp
