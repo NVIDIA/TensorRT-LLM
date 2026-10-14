@@ -41,24 +41,33 @@ _EVENT_RE = re.compile(
 )
 
 
-def shrink_checkpoint(src: str, dst: str, layers: int) -> str:
-    """A copy of ``src`` (config and tokenizer files only, no weights) whose
-    config keeps the first ``layers`` decoder layers.
+def shrink_checkpoint(src: str, dst: str, layers: int, link_weights: bool = False) -> str:
+    """A copy of ``src`` whose config keeps the first ``layers`` decoder layers.
 
-    Every per-layer list in the config is cut to the same length, so models
-    that check those lists against ``num_hidden_layers`` still load. Layer
-    index lists (Kimi K3's ``kda_layers`` / ``full_attn_layers``, 1-based) keep
-    only the indices that remain. Pick ``layers`` so every layer kind the
-    model has appears at least once; the run log names the kinds built.
+    Without ``link_weights`` only config and tokenizer files are copied (for
+    dummy weights); with it every other entry, weights included, is a symlink
+    into ``src``, and the model loads the layers it builds from the full
+    checkpoint. Every per-layer list in the config is cut to the same length,
+    so models that check those lists against ``num_hidden_layers`` still
+    load. Layer index lists (Kimi K3's ``kda_layers`` / ``full_attn_layers``,
+    1-based) keep only the indices that remain. Pick ``layers`` so every
+    layer kind the model has appears at least once; the run log names the
+    kinds built.
     """
     import shutil
 
     os.makedirs(dst, exist_ok=True)
     for name in os.listdir(src):
-        p = os.path.join(src, name)
-        if os.path.isfile(p) and not name.endswith((".safetensors", ".bin", ".pt", ".pth")):
+        p, q = os.path.join(src, name), os.path.join(dst, name)
+        if name == "config.json":
+            continue
+        if os.path.lexists(q):
+            os.remove(q)
+        if link_weights:
+            os.symlink(p, q)
+        elif os.path.isfile(p) and not name.endswith((".safetensors", ".bin", ".pt", ".pth")):
             if name not in ("model.safetensors.index.json",):
-                shutil.copy2(p, os.path.join(dst, name))
+                shutil.copy2(p, q)
     with open(os.path.join(src, "config.json")) as f:
         cfg = json.load(f)
 
@@ -66,13 +75,41 @@ def shrink_checkpoint(src: str, dst: str, layers: int) -> str:
         n = c.get("num_hidden_layers")
         if not isinstance(n, int):
             return
+        nextn = c.get("num_nextn_predict_layers") or 0
+
+        def cut_list(v):
+            # A per-layer list that also covers the MTP layers keeps its tail
+            # (DeepSeek-V4 compress_ratios: the MTP layers' own entries).
+            if len(v) == n:
+                return v[:layers]
+            if nextn and len(v) == n + nextn:
+                return v[:layers] + v[n:]
+            return None
+
         for k, v in list(c.items()):
-            if isinstance(v, list) and len(v) == n:
-                c[k] = v[:layers]
+            if isinstance(v, list):
+                r = cut_list(v)
+                if r is not None:
+                    c[k] = r
+            elif isinstance(v, str) and k.endswith("pattern") and len(v) == n:
+                c[k] = v[:layers]  # Nemotron-H hybrid_override_pattern
             elif isinstance(v, dict):
                 for kk, vv in list(v.items()):
-                    if isinstance(vv, list) and len(vv) == n:
-                        v[kk] = vv[:layers]
+                    if isinstance(vv, list):
+                        r = cut_list(vv)
+                        if r is not None:
+                            v[kk] = r
+        # 0-based layer id lists (DeepSeek-V4.1 KV / index sources) drop the
+        # ids past the cut; the layers a draft model captures move to the
+        # last layers kept, so the draft sees as many as it was built for.
+        for k, v in list(c.items()):
+            if k.endswith("_layer_ids") and isinstance(v, list) and v:
+                if "target" in k:
+                    c[k] = list(range(max(0, layers - len(v)), layers))
+                else:
+                    c[k] = [i for i in v if i < layers]
+            elif k.endswith("_layer_id") and isinstance(v, int) and v >= layers:
+                c[k] = None
         lac = c.get("linear_attn_config")
         if isinstance(lac, dict):
             for k in ("kda_layers", "full_attn_layers"):
@@ -87,6 +124,50 @@ def shrink_checkpoint(src: str, dst: str, layers: int) -> str:
     with open(os.path.join(dst, "config.json"), "w") as f:
         json.dump(cfg, f, indent=1)
     return dst
+
+
+def shrink_draft(src: str, dst: str, layers: int) -> str:
+    """A standalone draft checkpoint for a target cut to ``layers`` layers.
+
+    For DSpark / DFlash drafters: the captured target layers become the last
+    ones kept, as many as before (the draft's input projection is sized by
+    that count). Weights are symlinks into ``src``.
+    """
+    os.makedirs(dst, exist_ok=True)
+    for name in os.listdir(src):
+        q = os.path.join(dst, name)
+        if name == "config.json":
+            continue
+        if os.path.lexists(q):
+            os.remove(q)
+        os.symlink(os.path.join(src, name), q)
+    with open(os.path.join(src, "config.json")) as f:
+        cfg = json.load(f)
+    for scope in (cfg, *(cfg.get(k) for k in ("dflash_config", "dspark_config", "text_config"))):
+        if not isinstance(scope, dict):
+            continue
+        for key in ("target_layer_ids", "dspark_target_layer_ids"):
+            ids = scope.get(key)
+            if isinstance(ids, list) and ids:
+                scope[key] = list(range(max(0, layers - len(ids)), layers))
+    if isinstance(cfg.get("num_target_layers"), int):
+        cfg["num_target_layers"] = layers
+    with open(os.path.join(dst, "config.json"), "w") as f:
+        json.dump(cfg, f, indent=1)
+    return dst
+
+
+def _config_vocab(model_dir: str):
+    """``vocab_size`` from the checkpoint config (or its text config)."""
+    try:
+        with open(os.path.join(model_dir, "config.json")) as f:
+            cfg = json.load(f)
+    except (OSError, ValueError):
+        return None
+    for c in (cfg, *(cfg.get(k) for k in ("text_config", "llm_config", "language_config"))):
+        if isinstance(c, dict) and isinstance(c.get("vocab_size"), int):
+            return c["vocab_size"]
+    return None
 
 
 def workload(max_len: int, seed: int = 0):
@@ -134,11 +215,18 @@ def main() -> int:
     kv.setdefault("enable_block_reuse", True)
     model = args.model
     if args.layers:
-        if args.real_weights:
-            raise SystemExit("--layers needs dummy weights")
         model = shrink_checkpoint(
-            args.model, os.path.join(args.workdir, os.path.basename(args.model.rstrip("/"))), args.layers
+            args.model,
+            os.path.join(args.workdir, os.path.basename(args.model.rstrip("/"))),
+            args.layers,
+            link_weights=args.real_weights,
         )
+        spec = extra.get("speculative_config")
+        draft = spec.get("speculative_model") if isinstance(spec, dict) else None
+        if draft and os.path.realpath(draft) != os.path.realpath(args.model):
+            spec["speculative_model"] = shrink_draft(
+                draft, os.path.join(args.workdir, "draft"), args.layers
+            )
     kwargs = dict(
         model=model,
         tensor_parallel_size=args.tp,
@@ -159,27 +247,38 @@ def main() -> int:
     init_s = time.time() - t0
     print(f"COVERAGE init {init_s:.1f} s", flush=True)
 
-    tok = llm.tokenizer
-    vocab = getattr(tok, "vocab_size", None) or 32000
+    # Token ids only need to be valid embedding rows; every model here has a
+    # vocabulary above 32000. No detokenization: the text is never read.
+    hi = min(_config_vocab(model) or 32000, 32000)
     in_lens, out_lens = workload(args.max_seq_len - 64)
     rng = random.Random(1)
-    prompts = [[rng.randint(100, vocab - 1) for _ in range(n)] for n in in_lens]
-    params = [SamplingParams(max_tokens=m, ignore_eos=True) for m in out_lens]
+    prompts = [[rng.randint(100, hi - 1) for _ in range(n)] for n in in_lens]
+    params = [SamplingParams(max_tokens=m, ignore_eos=True, detokenize=False) for m in out_lens]
     t1 = time.time()
     llm.generate(prompts, params)
     # Cached prefixes: the same prompts extended, so prefill starts mid-sequence.
-    ext = [p + [rng.randint(100, vocab - 1) for _ in range(1 + i % 37)] for i, p in enumerate(prompts)]
-    llm.generate(ext, [SamplingParams(max_tokens=4, ignore_eos=True) for _ in ext])
+    ext = [p + [rng.randint(100, hi - 1) for _ in range(1 + i % 37)] for i, p in enumerate(prompts)]
+    llm.generate(
+        ext, [SamplingParams(max_tokens=4, ignore_eos=True, detokenize=False) for _ in ext]
+    )
     print(f"COVERAGE generate {time.time() - t1:.1f} s", flush=True)
     llm.shutdown()
     return 0
 
 
 def summarize(log_path: str, report_path: str = None) -> int:
-    """Group the executor-side JIT events in a run log by kind and kernel."""
+    """Group the executor-side JIT events in a run log by kind and kernel.
+
+    Exits 2 when the run did not finish its workload or never opened the
+    counting window (no ``executor thread bound`` event): such a log has no
+    events because nothing was measured, not because nothing compiled.
+    """
     found = {}
+    finished = bound = False
     with open(log_path, errors="replace") as f:
         for line in f:
+            finished = finished or line.startswith("COVERAGE generate")
+            bound = bound or "executor thread bound" in line
             m = _EVENT_RE.search(line)
             if m:
                 key = (m.group(2), m.group(3))
@@ -189,7 +288,19 @@ def summarize(log_path: str, report_path: str = None) -> int:
         print(f"UNCOVERED {n:5d}  {kind:32s} {name}")
     if report_path:
         with open(report_path, "w") as f:
-            json.dump([{"kind": k, "kernel": n, "count": c} for (k, n), c in rows], f, indent=1)
+            json.dump(
+                {
+                    "finished": finished,
+                    "counted": bound,
+                    "uncovered": [{"kind": k, "kernel": n, "count": c} for (k, n), c in rows],
+                },
+                f,
+                indent=1,
+            )
+    if not (finished and bound):
+        why = "the workload did not finish" if not finished else "no request reached the executor"
+        print(f"COVERAGE INVALID: {why}; {len(rows)} kernel(s) seen before it stopped")
+        return 2
     print(f"COVERAGE {'FAIL' if rows else 'PASS'}: {len(rows)} uncovered kernel(s)")
     return 1 if rows else 0
 
