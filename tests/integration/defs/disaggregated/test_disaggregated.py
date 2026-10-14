@@ -417,7 +417,7 @@ def get_test_config(test_desc, example_dir, test_root):
         "gpt_oss_120b_harmony":
         f"{test_configs_root}/disagg_config_ctxtp2_gentp2_gptoss_tllm.yaml",
         "gpt_oss_20b_kv_cache_aware":
-        f"{test_configs_root}/disagg_config_gptoss_20b_kv_cache_aware.yaml",
+        f"{test_configs_root}/disagg_config_cache_reuse.yaml",
         "cancel_stress_test":
         f"{test_configs_root}/disagg_config_cancel_stress_test.yaml",
         "qwen3_8b":
@@ -770,6 +770,7 @@ def setup_disagg_cluster(
     ctx_env: dict[str, str] | None = None,
     gen_env: dict[str, str] | None = None,
     share_gpu: bool = False,
+    config_overrides: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], list[ProcessWrapper], list[ProcessWrapper],
            ProcessWrapper, int, str]:
     """Load config, launch workers + disagg server, wait for ready.
@@ -783,12 +784,19 @@ def setup_disagg_cluster(
         disagg_cluster_overrides: Entries merged over
             get_default_disagg_cluster_config(), e.g. PRODUCTION_CLUSTER_TIMINGS
             for stress runs (cluster_uri/minimal_instances are still derived below)
+        config_overrides: Entries merged into the config (a dict value is merged into the
+            section), e.g. {"model": "m", "context_servers": {"router": {"type": "kv_cache_aware"}}}
 
     Returns:
         tuple: (config, ctx_workers, gen_workers, disagg_server, server_port, work_dir)
     """
     with open(config_file, 'r') as f:
         config = yaml.safe_load(f)
+    for key, value in (config_overrides or {}).items():
+        if isinstance(value, dict):
+            config.setdefault(key, {}).update(value)
+        else:
+            config[key] = value
 
     if perf_metrics_output_dir is not None:
         config["perf_metrics_output_dir"] = perf_metrics_output_dir
@@ -1070,7 +1078,8 @@ def run_disaggregated_test(example_dir,
                            gen_env=None,
                            share_gpu=False,
                            server_start_timeout=300,
-                           assert_ctx_log_contains=None):
+                           assert_ctx_log_contains=None,
+                           config_overrides=None):
     """Run disaggregated test using service discovery instead of MPI.
 
     If assert_ctx_log_contains or assert_gen_log_contains is set, worker logs are captured and,
@@ -1104,7 +1113,8 @@ def run_disaggregated_test(example_dir,
                              save_log=assert_worker_logs,
                              perf_metrics_output_dir=perf_metrics_output_dir,
                              ctx_env=ctx_run_env, gen_env=gen_run_env,
-                             share_gpu=share_gpu)
+                             share_gpu=share_gpu,
+                             config_overrides=config_overrides)
 
     server_host = config.get("hostname", "localhost")
 
@@ -2955,7 +2965,7 @@ def test_disaggregated_gpt_oss_20b_kv_cache_aware(disaggregated_test_root,
     def chat_and_fingerprints(server_url: str) -> None:
         reply = requests.post(f"{server_url}/v1/chat/completions",
                               json={
-                                  "model": model_dir,
+                                  "model": model_path,
                                   "messages": [{
                                       "role": "user",
                                       "content": "Say hi in three words."
@@ -2977,6 +2987,14 @@ def test_disaggregated_gpt_oss_20b_kv_cache_aware(disaggregated_test_root,
                            model_path=model_dir,
                            cwd=llm_venv.get_working_directory(),
                            post_client_test=chat_and_fingerprints,
+                           config_overrides={
+                               "model": model_path,
+                               "context_servers": {
+                                   "router": {
+                                       "type": "kv_cache_aware"
+                                   }
+                               }
+                           },
                            server_start_timeout=600)
 
 
