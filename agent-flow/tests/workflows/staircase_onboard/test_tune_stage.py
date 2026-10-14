@@ -833,7 +833,7 @@ def test_the_roadmap_request_names_its_sources(tmp_path):
     """The roadmap turn, where hypotheses are formed, sees the same sources as a candidate turn and must
     say per item where the idea came from."""
     repo = _repo(tmp_path)
-    task = {"trtllm_repo_path": str(repo), "checkpoint_path": "/ckpt",
+    task = {"trtllm_repo_path": str(repo), "checkpoint_path": "/ckpt", "source_embargo": ["x/modeling_stock.py"],
             "perf": {"identity_configs": [str(tmp_path / "identity.yaml")], "spools": ["s1"], "env_script": "/env.sh",
                      "sister_engines": ["/engines/sglang"]}}
     spec = TuneSpec.from_task(task, tmp_path / "ws", target="tensorrt_llm/_torch/_experimental/modeling_v2/models/f/t/")
@@ -845,6 +845,7 @@ def test_the_roadmap_request_names_its_sources(tmp_path):
     req = (spec.workdir / "roadmap-request.md").read_text()
     assert "surface.md" in req and "kernel_choices.json" in req and "--grep='perf'" in req and "/engines/sglang" in req
     assert "sources}" in req and "repo-prior-art" in req
+    assert "worktrees/best" in req and "/env.sh" in req and "`x/modeling_stock.py`" in req  # profiles without asking
 
 
 def test_without_a_ladder_the_ground_baseline_is_the_first_control(tmp_path):

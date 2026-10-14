@@ -281,6 +281,24 @@ class TuneStage:
         ]
         return "\n".join(lines)
 
+    def _roadmap_paths(self) -> str:
+        """What a roadmap turn needs to profile the best tree without asking: the same facts a candidate
+        request carries, and the embargo."""
+        s = self.spec
+        configs = [*s.identity_configs, *(Path(p) for p in self.t.get("config_overlays") or [])]
+        rows = [
+            ("best tree to profile", self.spec.workdir / "worktrees" / "best"),
+            ("configs, applied in order", ", ".join(f"`{c}`" for c in configs)),
+            ("model", s.model),
+            ("dev spools (1-GPU jobs: nsys captures)", ", ".join(f"`{p}`" for p in s.dev_spools)),
+            ("env script every job sources", s.env_script),
+            ("package (bench.py --nsys, nsys_summary.py, spoolctl)", PACKAGE),
+        ]
+        lines = ["## Paths", "", "| name | value |", "|---|---|"]
+        lines += [f"| {k} | {v if str(v).startswith('`') else f'`{v}`'} |" for k, v in rows]
+        lines += ["", "## Embargo (do not read, grep or call)", "", *(f"- `{e}`" for e in s.embargo)]
+        return "\n".join(lines)
+
     def _sisters_line(self) -> str:
         if not self.spec.sister_engines:
             return ""
@@ -321,6 +339,7 @@ class TuneStage:
                 "`flashinfer`, `repo-prior-art`, `sister-engine`, `kernel-choices`, each with a reference). Then write the "
                 "decision file `" + str(self.spec.workdir / f"{what}-decision.yaml")
                 + "` with `decision: CANDIDATE` (roadmap ready) or `STOP`." + again
+                + "\n\n" + self._roadmap_paths()
                 + "\n\n## Standings\n\n" + self._standings() + "\n\n" + self._sources_note() + self._sisters_line() + "\n"
             )
             self.dispatch("tuner", what, turn_prompt(PACKAGE, request))
