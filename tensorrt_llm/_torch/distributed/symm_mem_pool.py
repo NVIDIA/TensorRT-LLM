@@ -468,9 +468,18 @@ class SymmMemPool:
             agreed = self._layout.merged(agreed)
             self._free(fence=True)
         self._allocate(agreed)
-        self._require_channels(min_channels)
+        # Both failures below are agreed across ranks (the pad size and the merged request are
+        # the same everywhere), so every rank reaches the fenced free together. Without it the
+        # bad allocation would stay reserved and a retried, covered request would return False
+        # as if the pool were usable.
+        try:
+            self._require_channels(min_channels)
+        except RuntimeError:
+            self._free(fence=True)
+            raise
         ok, reason = self._check_addressing()
         if not ok:
+            self._free(fence=True)
             raise RuntimeError(
                 f"SymmMemPool: peer views do not address the peers' regions: {reason}"
             )
@@ -719,10 +728,17 @@ def probe_symmetric_memory(
             pool._free(fence=False)
         logger.debug(f"probe_symmetric_memory[{group.group_name}]: declined: {reason}")
         return False, reason
-    ok, reason = pool._check_addressing()
-    if ok:
-        shortfall = pool._channel_shortfall(min_channels)
-        ok, reason = _agree(group, not shortfall, shortfall)
+    try:
+        ok, reason = pool._check_addressing()
+        if ok:
+            shortfall = pool._channel_shortfall(min_channels)
+            ok, reason = _agree(group, not shortfall, shortfall)
+    except BaseException:
+        # A CUDA or c10d error here may be local to this rank, so no collective: unmap the probe
+        # allocation without the fence and let the exception propagate.
+        if pool.reserved:
+            pool._free(fence=False)
+        raise
     pool.release()
     if not ok:
         logger.debug(f"probe_symmetric_memory[{group.group_name}]: declined: {reason}")

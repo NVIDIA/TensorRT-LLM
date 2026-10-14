@@ -236,3 +236,88 @@ def test_probe_and_agreement_two_gloo_ranks(tmp_path):
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+# =============================================================================
+# Failure paths after an allocation: the pool must not stay reserved (review of #20308)
+# =============================================================================
+
+
+def _fake_allocate(self, layout):
+    """Stand-in for ``_allocate`` on a CPU gloo group: records the state a real allocation sets."""
+    self._buf, self._handle, self._base_offset, self._layout = object(), object(), 0, layout
+    self._peer_buffers.clear()
+    self.generation += 1
+
+
+@pytest.fixture
+def cpu_allocating_pool(gloo_world, monkeypatch):
+    """A pool whose preconditions, allocation and device syncs are stubbed so the post-allocation
+    failure paths of ``reserve`` / ``probe_symmetric_memory`` run on a one-rank gloo group."""
+    monkeypatch.setattr(symm_mem_pool, "_local_preconditions", lambda group, device: [])
+    monkeypatch.setattr(SymmMemPool, "_allocate", _fake_allocate)
+    monkeypatch.setattr(symm_mem_pool.torch.cuda, "synchronize", lambda device=None: None)
+    return SymmMemPool(gloo_world, "cpu")
+
+
+@pytest.mark.parametrize("failing", ["_check_addressing", "_require_channels"])
+def test_reserve_frees_the_allocation_when_a_post_allocation_check_fails(
+    cpu_allocating_pool, monkeypatch, failing
+):
+    pool = cpu_allocating_pool
+    frees: list[bool] = []
+    real_free = SymmMemPool._free
+
+    def recording_free(self, *, fence):
+        frees.append(fence)
+        real_free(self, fence=fence)
+
+    monkeypatch.setattr(SymmMemPool, "_free", recording_free)
+    if failing == "_check_addressing":
+        monkeypatch.setattr(SymmMemPool, "_require_channels", lambda self, n: None)
+        monkeypatch.setattr(SymmMemPool, "_check_addressing", lambda self: (False, "injected"))
+        match = "injected"
+    else:
+
+        def no_channels(self, n):
+            raise RuntimeError("injected: pad too small")
+
+        monkeypatch.setattr(SymmMemPool, "_require_channels", no_channels)
+        match = "pad too small"
+    with pytest.raises(RuntimeError, match=match):
+        pool.reserve(4096, slots=2, min_channels=4)
+    # The failed allocation is gone (fenced free, all ranks reach it together) ...
+    assert not pool.reserved and pool.layout is None and frees == [True]
+    # ... so a retried request is not mistaken for a covered one: it allocates and fails again
+    # instead of returning False on a pool that was never usable.
+    with pytest.raises(RuntimeError, match=match):
+        pool.reserve(4096, slots=2, min_channels=4)
+    assert not pool.reserved and frees == [True, True]
+
+
+def test_probe_frees_its_allocation_when_the_addressing_check_raises(gloo_world, monkeypatch):
+    monkeypatch.setattr(symm_mem_pool, "_local_preconditions", lambda group, device: [])
+    monkeypatch.setattr(SymmMemPool, "_allocate", _fake_allocate)
+    monkeypatch.setattr(symm_mem_pool.torch.cuda, "synchronize", lambda device=None: None)
+    created: list[SymmMemPool] = []
+    frees: list[bool] = []
+    real_init, real_free = SymmMemPool.__init__, SymmMemPool._free
+
+    def recording_init(self, *args, **kwargs):
+        real_init(self, *args, **kwargs)
+        created.append(self)
+
+    def recording_free(self, *, fence):
+        frees.append(fence)
+        real_free(self, fence=fence)
+
+    def boom(self):
+        raise RuntimeError("injected CUDA error")
+
+    monkeypatch.setattr(SymmMemPool, "__init__", recording_init)
+    monkeypatch.setattr(SymmMemPool, "_free", recording_free)
+    monkeypatch.setattr(SymmMemPool, "_check_addressing", boom)
+    with pytest.raises(RuntimeError, match="injected CUDA error"):
+        probe_symmetric_memory(gloo_world, "cpu")
+    assert len(created) == 1 and not created[0].reserved
+    assert frees == [False]  # unmapped without a collective: the error may be local to one rank
