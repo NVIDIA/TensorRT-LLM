@@ -16,6 +16,7 @@ import asyncio
 import os
 from typing import Callable, Optional
 
+from tensorrt_llm import _disagg_late_receiver_diagnostic as late_receiver_diagnostic
 from tensorrt_llm.llmapi.disagg_utils import ConditionalDisaggConfig, DisaggServerConfig, ServerRole
 from tensorrt_llm.logger import logger
 from tensorrt_llm.serve.anthropic_protocol import (
@@ -53,6 +54,7 @@ class OpenAIDisaggregatedService(OpenAIService):
         client_factory: Callable[[Router, ServerRole], OpenAIClient],
         req_timeout_secs: int = 180,
     ):
+        late_receiver_diagnostic.validate_environment()
         self._config = config
         # The service drives the coordinator's ctx/gen routers uniformly, so serving
         # is identical whether the router is the real one (single-process) or a
@@ -162,6 +164,13 @@ class OpenAIDisaggregatedService(OpenAIService):
         gen_reservation_id = disagg_request_id if gen_server else None
         benchmark_gen_only = await self._check_gen_only_disagg(request)
         need_ctx = need_ctx and not benchmark_gen_only
+        diagnostic_claim = None
+        if late_receiver_diagnostic.is_enabled():
+            diagnostic_claim = late_receiver_diagnostic.claim_request(
+                disagg_request_id,
+                eligible=need_ctx and gen_server is None,
+                clients_no_retry=self._ctx_client._no_retry and self._gen_client._no_retry,
+            )
         ctx_response = None
         gen_req = request
         if need_ctx:
@@ -199,6 +208,11 @@ class OpenAIDisaggregatedService(OpenAIService):
                 gen_req = request.model_copy(update={"disaggregated_params": None})
         self._strip_gen_subagent_affinity(gen_req)
         if ctx_response is None or self._need_gen(ctx_response):
+            if diagnostic_claim is not None:
+                params = ctx_response.choices[0].disaggregated_params
+                await late_receiver_diagnostic.before_generation(
+                    diagnostic_claim, disagg_request_id, params.ctx_request_id, params.ctx_dp_rank
+                )
             if not gen_server:
                 gen_server, _ = await self._gen_router.get_next_server(
                     gen_req, exclude_server=ctx_server, req_id=disagg_request_id
@@ -209,6 +223,11 @@ class OpenAIDisaggregatedService(OpenAIService):
             )
             return gen_response
         else:
+            if diagnostic_claim is not None:
+                late_receiver_diagnostic.observe("router_no_generation", disagg_request_id)
+                raise late_receiver_diagnostic.DiagnosticError(
+                    "Diagnostic request finished in CTX without a GEN transfer"
+                )
             if gen_server:
                 await self._gen_router.finish_request(request, req_id=gen_reservation_id)
             if hooks:

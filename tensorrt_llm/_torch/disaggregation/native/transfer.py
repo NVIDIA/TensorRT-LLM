@@ -37,6 +37,7 @@ except ImportError:
     from cuda import cudart
 
 import tensorrt_llm.bindings
+from tensorrt_llm import _disagg_late_receiver_diagnostic as late_receiver_diagnostic
 from tensorrt_llm import logger
 from tensorrt_llm._torch.disaggregation.base import Chunk
 from tensorrt_llm._torch.disaggregation.base.agent import (
@@ -2067,6 +2068,15 @@ class Sender(SenderBase):
             fenced = (
                 self._enforce_physical_ownership and info.unique_rid in self._pre_cancelled_rids
             )
+            if late_receiver_diagnostic.is_enabled():
+                late_receiver_diagnostic.observe(
+                    "sender_request_data",
+                    info.unique_rid,
+                    rank=self._instance_rank,
+                    peer_rank=info.instance_rank,
+                    session_present=session is not None,
+                    fenced=bool(fenced),
+                )
             if session is None and not fenced:
                 self._save_peer_req_info(info)
                 return
@@ -2103,6 +2113,14 @@ class Sender(SenderBase):
         include_aux: bool = False,
         defer_to_worker: bool = False,
     ):
+        if late_receiver_diagnostic.is_enabled():
+            late_receiver_diagnostic.observe(
+                "sender_terminal_reply_attempt",
+                info.unique_rid,
+                rank=self._instance_rank,
+                peer_rank=info.instance_rank,
+                status="FAILED",
+            )
         try:
             endpoint = self._get_result_receiver_endpoint(info)
             slice_id = info.slice_id if info.slice_id is not None else 0
@@ -2779,6 +2797,10 @@ class TxSession(TxSessionBase):
         # Unregister from Sender; keep fields alive for in-flight worker threads.
         if self._sender is not None:
             self._sender.clear_session(self.disagg_request_id)
+            if late_receiver_diagnostic.is_enabled():
+                late_receiver_diagnostic.observe(
+                    "ctx_native_closed", self.disagg_request_id, rank=self._sender._instance_rank
+                )
         return True
 
     def __enter__(self):
@@ -3543,6 +3565,14 @@ class Receiver(ReceiverBase):
         logger.debug("Sending data request to endpoint '%s'", endpoint)
         messenger = self._get_or_connect_dealer(endpoint)
         messenger.send([MessageType.REQUEST_DATA, receiver_info_bytes])
+        if late_receiver_diagnostic.is_enabled():
+            info = RecvReqInfo.from_bytes(receiver_info_bytes)
+            late_receiver_diagnostic.observe(
+                "gen_request_data_sent",
+                info.unique_rid,
+                rank=self._instance_rank,
+                publication="messenger_send_returned",
+            )
 
     def __del__(self):
         try:
