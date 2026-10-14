@@ -72,6 +72,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     KVCacheManager,
     KVCacheManagerConfig,
     LayerId,
+    PageIndexMode,
     ReuseScope,
     SsmLayerConfig,
     _introspection,
@@ -633,6 +634,113 @@ def test_zero_size_layers_are_removed_before_pool_allocation(
             )
             buffer[0].fill_(global_layer_id)
             assert torch.all(buffer[0] == global_layer_id)
+    finally:
+        manager.shutdown()
+
+
+@pytest.mark.parametrize("kv_first", [False, True], ids=["key-first", "kv-first"])
+@pytest.mark.parametrize("kv_layout", ["NHD", "HND"])
+def test_mixed_role_coalesced_pool_preserves_slot_stride(kv_first: bool, kv_layout: str) -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    torch.cuda.init()
+    key_layer_id, kv_layer_id = 0, 1
+    key_spec = KVCacheLayerSpec(
+        global_layer_id=key_layer_id,
+        owner=KVCacheLayerOwner.TARGET,
+        dtype=DataType.HALF,
+        num_kv_heads=2,
+        head_dim=8,
+        buffer_roles=(Role.KEY,),
+    )
+    kv_spec = replace(key_spec, global_layer_id=kv_layer_id, buffer_roles=(Role.KEY, Role.VALUE))
+    layer_specs = [kv_spec, key_spec] if kv_first else [key_spec, kv_spec]
+    manager = KVCacheManagerV2(
+        KvCacheConfig(
+            max_gpu_total_bytes=16 << 20,
+            host_cache_size=0,
+            enable_block_reuse=False,
+            enable_swa_scratch_reuse=False,
+        ),
+        CacheType.SELF,
+        num_layers=2,
+        num_kv_heads=2,
+        head_dim=8,
+        tokens_per_block=TOKENS_PER_BLOCK,
+        max_seq_len=MAX_SEQ_LEN,
+        max_batch_size=1,
+        mapping=Mapping(world_size=1, rank=0, tp_size=1, pp_size=1),
+        dtype=DataType.HALF,
+        layer_specs=layer_specs,
+    )
+    try:
+        key_local_id = manager.layer_offsets[key_layer_id]
+        kv_local_id = manager.layer_offsets[kv_layer_id]
+        pool_id = manager.layer_to_pool_mapping_dict[key_local_id]
+        assert manager.layer_to_pool_mapping_dict[kv_local_id] == pool_id
+        assert manager.num_pools == 1
+        assert manager.get_layer_page_index_scale(key_layer_id) == 3
+        assert manager.get_layer_page_index_scale(kv_layer_id) == 3
+
+        key_buffer = manager.get_buffers(key_layer_id, kv_layout=kv_layout)
+        kv_buffer = manager.get_buffers(kv_layer_id, kv_layout=kv_layout)
+        page_stride = manager.impl.get_page_stride(kv_local_id, Role.KEY)
+        key_base = manager.impl.get_mem_pool_base_address(
+            kv_local_id, Role.KEY, PageIndexMode.SHARED
+        )
+        value_base = manager.impl.get_mem_pool_base_address(
+            kv_local_id, Role.VALUE, PageIndexMode.SHARED
+        )
+        page_shape = (TOKENS_PER_BLOCK, 2, 8) if kv_layout == "NHD" else (2, TOKENS_PER_BLOCK, 8)
+        assert kv_buffer.shape[1:] == (2, *page_shape)
+        assert kv_buffer.stride(0) * kv_buffer.element_size() == 3 * page_stride
+        # Slot 1 begins three physical pages later, even though this layer
+        # exposes only two roles. Reversing the specs also exercises a base
+        # pointer offset within the coalesced slot.
+        assert kv_buffer[1, 0].data_ptr() == key_base + 3 * page_stride
+        assert kv_buffer[1, 1].data_ptr() == value_base + 3 * page_stride
+        assert key_buffer.stride(0) * key_buffer.element_size() == page_stride
+
+        request_id = 7
+        cache = manager._create_kv_cache(request_id, None, None)
+        assert cache.resume(manager._stream.cuda_stream)
+        assert cache.resize(3 * TOKENS_PER_BLOCK, 0)
+        raw_slots = list(cache.get_base_page_indices(pool_id)[: cache.num_blocks])
+        assert len(raw_slots) == 3
+        assert any(slot % 2 == 1 for slot in raw_slots)
+        for layer_id, buffer, expected in (
+            (key_layer_id, key_buffer, [3 * slot for slot in raw_slots]),
+            (kv_layer_id, kv_buffer, raw_slots),
+        ):
+            batch_indices = manager.get_batch_cache_indices([request_id], layer_idx=layer_id)
+            flat_indices = manager.get_batch_cache_indices_flat(
+                [request_id], [len(raw_slots)], layer_idx=layer_id
+            ).tolist()
+            assert batch_indices == [expected]
+            assert flat_indices == expected
+            local_id = manager.layer_offsets[layer_id]
+            for indices in (batch_indices[0], flat_indices):
+                for slot, index in zip(raw_slots, indices):
+                    for role_index, role in enumerate(manager.get_layer_buffer_roles(layer_id)):
+                        role_base = manager.impl.get_mem_pool_base_address(
+                            local_id, role, PageIndexMode.SHARED
+                        )
+                        assert (
+                            buffer[index, role_index].data_ptr()
+                            == role_base + 3 * slot * page_stride
+                        )
+
+        # Give each role and slot a distinct value. Writing an odd K/V slot
+        # must preserve the K-only page and both neighboring K/V slots.
+        for ordinal, slot in enumerate(raw_slots):
+            key_buffer[3 * slot, 0].fill_(10 + ordinal)
+        for ordinal, slot in enumerate(raw_slots):
+            kv_buffer[slot, 0].fill_(20 + ordinal)
+            kv_buffer[slot, 1].fill_(30 + ordinal)
+        for ordinal, slot in enumerate(raw_slots):
+            assert torch.all(key_buffer[3 * slot, 0] == 10 + ordinal)
+            assert torch.all(kv_buffer[slot, 0] == 20 + ordinal)
+            assert torch.all(kv_buffer[slot, 1] == 30 + ordinal)
     finally:
         manager.shutdown()
 
