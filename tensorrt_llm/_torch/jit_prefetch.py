@@ -354,6 +354,9 @@ class _Stats:
     dg_helper_built: int = 0
     dg_executor_compiles: int = 0
     dg_executor_compile_s: float = 0.0
+    # Every DeepGEMM kernel compiled in this process after warmup, from
+    # DeepJIT's own record of disk-cache misses (all launchers, all ops).
+    dg_process_compiles: int = 0
     cd_loaded: int = 0
     cd_executor_compiles: int = 0
     cd_executor_compile_s: float = 0.0
@@ -677,10 +680,45 @@ class JitPrefetcher:
 
     # -- planning (executor thread) --------------------------------------
     def bind_executor_thread(self) -> None:
-        """Mark the calling thread as the executor loop (idempotent)."""
+        """Mark the calling thread as the executor loop (idempotent).
+
+        Also reports the DeepGEMM kernels this process compiled since the
+        previous call; the first call drops those compiled during warmup.
+        """
         if self._executor_thread is None:
             self._executor_thread = threading.get_ident()
             self._event("executor thread bound; counting JIT from here")
+            self._take_deep_gemm_compiles(report=False)
+            return
+        self._take_deep_gemm_compiles(report=True)
+
+    def _take_deep_gemm_compiles(self, report: bool) -> None:
+        """Count DeepGEMM compiles from DeepJIT's record of disk-cache misses.
+
+        This sees every DeepGEMM kernel any op compiled in this process, also
+        on paths without a launch observer; helpers compile in other
+        processes and never appear here.
+        """
+        take = getattr(self._deep_gemm_module(), "take_compiled_kernel_names", None)
+        if take is None:
+            return
+        names = take()
+        if not report or not names:
+            return
+        self.stats.dg_process_compiles += len(names)
+        counts: Dict[str, int] = {}
+        for name in names:
+            counts[name] = counts.get(name, 0) + 1
+        for name, n in counts.items():
+            self._event(f"DEEP_GEMM compile in process {name} x{n}")
+
+    @staticmethod
+    def _deep_gemm_module():
+        try:
+            from tensorrt_llm import deep_gemm
+        except ImportError:
+            return None
+        return deep_gemm
 
     def plan_deep_gemm(self, num_tokens: int) -> None:
         """Queue the DeepGEMM variants a batch of ``num_tokens`` will run."""
@@ -1098,6 +1136,7 @@ class JitPrefetcher:
             f" dg_planned={s.dg_planned} dg_unplanned={s.dg_unplanned} dg_helper_built={s.dg_helper_built}"
             f" dg_executor_compiles={s.dg_executor_compiles}"
             f" dg_executor_compile_s={s.dg_executor_compile_s:.3f}"
+            f" dg_process_compiles={s.dg_process_compiles}"
             f" cd_loaded={s.cd_loaded} cd_executor_compiles={s.cd_executor_compiles}"
             f" cd_executor_compile_s={s.cd_executor_compile_s:.3f}"
         )
@@ -1110,6 +1149,8 @@ class JitPrefetcher:
         not stopped here; each exits when this process exits and its stdin
         closes.
         """
+        if self._executor_thread is not None:
+            self._take_deep_gemm_compiles(report=True)
         # print(), not only the logger: the summary is the experiment's
         # measurement and must reach the log at any log level.
         print(self.summary(), flush=True)

@@ -907,10 +907,18 @@ index 7ee09da..f167fe8 100644
 +
  }  // namespace deep_gemm
 diff --git a/deep_gemm/__init__.py b/deep_gemm/__init__.py
-index 1c18563..b7107fe 100644
+index 1c18563..0b664ff 100644
 --- a/deep_gemm/__init__.py
 +++ b/deep_gemm/__init__.py
-@@ -36,6 +36,8 @@ from ._C import (
+@@ -23,6 +23,7 @@ from ._C import (
+     set_pdl,
+     get_pdl,
+     use_deterministic_algorithms,
++    take_compiled_kernel_names,
+ )
+ 
+ # cuBLASLt Kernels
+@@ -36,6 +37,8 @@ from ._C import (
  # DeepGEMM Kernels
  from ._C import (
      # FP8-FP4 GEMMs (accept any FP8/FP4 operand combination)
@@ -919,7 +927,7 @@ index 1c18563..b7107fe 100644
      fp8_fp4_gemm_nt, fp8_fp4_gemm_nn,
      fp8_fp4_gemm_tn, fp8_fp4_gemm_tt,
      m_grouped_fp8_fp4_gemm_nt_contiguous,
-@@ -67,6 +69,9 @@ from ._C import (
+@@ -67,6 +70,9 @@ from ._C import (
      einsum,
      fp8_einsum,
      # Attention kernels
@@ -929,7 +937,7 @@ index 1c18563..b7107fe 100644
      fp8_fp4_mqa_logits,
      get_mqa_logits_metadata,
      get_paged_mqa_logits_metadata,
-@@ -85,6 +90,7 @@ from ._C import (
+@@ -85,6 +91,7 @@ from ._C import (
      transform_sf_into_required_layout,
      # MegaMoE
      get_block_m_for_mega_moe,
@@ -988,3 +996,76 @@ index 3cfb206..edb40ca 100644
      int get_num_sms() { return get_prop().multiProcessorCount; }
  
      int get_num_l2_cache_bytes() { return get_prop().l2CacheSize; }
+diff --git a/third-party/deep_jit/include/deep_jit/python_api.hpp b/third-party/deep_jit/include/deep_jit/python_api.hpp
+index eb11c7a..041e15a 100644
+--- a/third-party/deep_jit/include/deep_jit/python_api.hpp
++++ b/third-party/deep_jit/include/deep_jit/python_api.hpp
+@@ -1,8 +1,11 @@
+ #pragma once
+ 
+ #include <memory>
++#include <string>
++#include <vector>
+ 
+ #include <pybind11/pybind11.h>
++#include <pybind11/stl.h>
+ 
+ #include <deep_jit/runtime/runtime.hpp>
+ #include <deep_jit/utils/lazy.hpp>
+@@ -17,6 +20,12 @@ inline void register_python_api(pybind11::module_& module, LazyInit<Runtime<Back
+     module.def("get_jit", [&jit]() {
+         return jit.get();
+     });
++
++    // Names of the kernels compiled in this process since the last call
++    // (disk-cache misses only), oldest first.
++    module.def("take_compiled_kernel_names", [&jit]() {
++        return jit->take_compiled_names();
++    });
+ }
+ 
+ }  // namespace deep_jit
+diff --git a/third-party/deep_jit/include/deep_jit/runtime/runtime.hpp b/third-party/deep_jit/include/deep_jit/runtime/runtime.hpp
+index 8ca176c..7ffe1c8 100644
+--- a/third-party/deep_jit/include/deep_jit/runtime/runtime.hpp
++++ b/third-party/deep_jit/include/deep_jit/runtime/runtime.hpp
+@@ -2,8 +2,10 @@
+ 
+ #include <filesystem>
+ #include <memory>
++#include <mutex>
+ #include <string>
+ #include <utility>
++#include <vector>
+ 
+ #include <deep_jit/cache/disk.hpp>
+ #include <deep_jit/cache/memory.hpp>
+@@ -72,6 +74,17 @@ public:
+         kernel->launch(default_launch_options.override_with(override_options), args...);
+     }
+ 
++    // Names of the kernels this process compiled (disk-cache misses), in
++    // order, so a caller can observe every compile without hooking each
++    // launcher. Drained by `take_compiled_names`.
++    mutable std::mutex compiled_names_mutex;
++    mutable std::vector<std::string> compiled_names;
++
++    std::vector<std::string> take_compiled_names() const {
++        std::lock_guard<std::mutex> lock(compiled_names_mutex);
++        return std::exchange(compiled_names, {});
++    }
++
+     std::filesystem::path compile(const std::string& name,
+                                   const std::string& source,
+                                   const std::string& key,
+@@ -83,6 +96,10 @@ public:
+ 
+         // Compile
+         backend.compile(source, entry.path, env, config, options);
++        {
++            std::lock_guard<std::mutex> lock(compiled_names_mutex);
++            compiled_names.push_back(name);
++        }
+ 
+         // Publish
+         GilScopedRelease gil_release;
