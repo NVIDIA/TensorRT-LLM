@@ -9,6 +9,10 @@ tests that create MPI pools), so suites that never create pools pay nothing —
 not even the tensorrt_llm import.
 """
 
+import functools
+import os
+import subprocess
+
 import pytest
 
 from test_common.session_reuse import REUSE
@@ -27,6 +31,37 @@ _PRIVATE_NODEID_PATTERNS = (
 def _is_private_nodeid(nodeid: str) -> bool:
     lowered = nodeid.lower()
     return any(pat.lower() in lowered for pat in _PRIVATE_NODEID_PATTERNS)
+
+
+# A test's child processes cannot use the cached pools but run on the GPUs
+# their idle workers occupy, so starting one during setup or call drains the
+# cache first. nvidia-smi only queries devices, so it is exempt.
+_POPEN_INIT = subprocess.Popen.__init__
+_drain_on_spawn = False
+
+
+def _is_device_query(args) -> bool:
+    if isinstance(args, (str, bytes, os.PathLike)):
+        args = os.fsdecode(args).split()
+    try:
+        program = os.path.basename(os.fsdecode(args[0]))
+    except (IndexError, TypeError):
+        return False
+    return os.path.splitext(program)[0] == "nvidia-smi"
+
+
+@functools.wraps(_POPEN_INIT)
+def _popen_init(self, args, *popenargs, **kwargs):
+    if _drain_on_spawn and not _is_device_query(args):
+        REUSE.drain()
+    _POPEN_INIT(self, args, *popenargs, **kwargs)
+
+
+def _set_drain_on_spawn(enabled: bool) -> None:
+    global _drain_on_spawn
+    if enabled:
+        subprocess.Popen.__init__ = _popen_init
+    _drain_on_spawn = enabled
 
 
 def pytest_configure(config: pytest.Config) -> None:
@@ -49,6 +84,11 @@ def pytest_runtest_setup(item):
         REUSE.drain()
     REUSE.suspend(opt_out)
     REUSE.install_pool_factory_if_loaded()
+    _set_drain_on_spawn(True)
+
+
+def pytest_runtest_teardown(item):
+    _set_drain_on_spawn(False)
 
 
 # Failure fence: a failed test's pool can pass the health probe (workers alive

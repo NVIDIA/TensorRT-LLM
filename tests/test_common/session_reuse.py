@@ -19,6 +19,9 @@ Pool isolation and reuse rules:
                               construction seam. Reused IPC workers have
                               thread-local allreduce state incompatible with
                               RPC's rank-0 engine-setup thread.
+- child processes          -> a test starting one drains the cache first:
+                              the child cannot use cached pools but shares
+                              their GPUs (nvidia-smi is exempt)
 - tests passing their own ``_mpi_session`` (the explicit fixtures) -> never
   reach the patched seam
 - ``@pytest.mark.private_mpi_session`` -> explicit opt-out: the cache is
