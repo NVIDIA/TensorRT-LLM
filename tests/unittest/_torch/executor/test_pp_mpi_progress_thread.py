@@ -102,11 +102,15 @@ def test_concurrent_stop_calls_all_return():
             except RuntimeError as error:
                 errors.append(error)
 
-        callers = [threading.Thread(target=stop) for _ in range(num_callers)]
+        # Daemon callers and a bounded join, so that a deadlock in stop()
+        # fails this test instead of hanging the test process.
+        callers = [threading.Thread(target=stop, daemon=True) for _ in range(num_callers)]
         for caller in callers:
             caller.start()
+        deadline = time.monotonic() + 30.0
         for caller in callers:
-            caller.join()
+            caller.join(timeout=max(0.0, deadline - time.monotonic()))
+        assert not any(caller.is_alive() for caller in callers), "stop() did not return"
         assert not errors
         assert not thread.is_running
 
@@ -121,7 +125,16 @@ def test_thread_leaves_other_messages_to_the_receiver():
     try:
         request = comm.isend("payload", dest=rank, tag=tag)
         assert _wait_for_probes(thread, 3) >= 3
-        assert comm.recv(source=rank, tag=tag) == "payload"
+        # Poll the receive against a deadline, so that a thread that took the
+        # message fails this test instead of hanging it.
+        receive = comm.irecv(source=rank, tag=tag)
+        deadline = time.monotonic() + 10.0
+        received, payload = receive.test()
+        while not received and time.monotonic() < deadline:
+            time.sleep(0.01)
+            received, payload = receive.test()
+        assert received, "the message was not received"
+        assert payload == "payload"
         request.wait()
     finally:
         thread.stop()
@@ -220,6 +233,26 @@ def test_executor_stops_its_progress_thread_on_shutdown(monkeypatch, hang_detect
         if thread is not None:
             thread.stop()
         # The hang-detected path returns without joining these threads.
+        executor.worker_thread.join()
+        executor.broadcast_sample_state_handler.join()
+        executor._broadcast_mpi_comm.Free()
+
+
+@pytest.mark.parametrize("cause", ["disabled", "no_thread_multiple"])
+def test_executor_runs_without_progress_thread_when_unavailable(monkeypatch, cause):
+    executor = _executor(monkeypatch, pp_size=2)
+    if cause == "disabled":
+        monkeypatch.setenv(PP_MPI_PROGRESS_INTERVAL_US_ENV_VAR_NAME, "0")
+    else:
+        monkeypatch.setattr(MPI, "Query_thread", lambda: MPI.THREAD_SERIALIZED)
+    exit_hooks = _record_atexit(monkeypatch)
+    executor.start_worker()
+    try:
+        assert executor._mpi_progress_thread is None
+        assert exit_hooks.registered == []
+        executor.shutdown()
+        assert exit_hooks.unregistered == []
+    finally:
         executor.worker_thread.join()
         executor.broadcast_sample_state_handler.join()
         executor._broadcast_mpi_comm.Free()
