@@ -41,7 +41,7 @@ python3 -c "import tensorrt_llm"
 ## Option 2: Install on Linux via `pip`
 
 > **Note:** The TensorRT LLM wheel on PyPI is built with the [public PyTorch package](https://pypi.org/project/torch/). This version may be incompatible with the NVIDIA NGC PyTorch container, which uses a different PyTorch build.
-> If you are using the NGC PyTorch container, install the wheel built specifically for that container. The pre-built NGC PyTorch container-specific wheel is located at `/app/tensorrt_llm` inside the TensorRT LLM NGC Release container.
+> If you are using the NGC PyTorch container, follow [Install in an NGC PyTorch container](#install-in-an-ngc-pytorch-container) to install a wheel built specifically for that container.
 
 Tested on Ubuntu 24.04.
 
@@ -110,6 +110,82 @@ pip3 install "tensorrt_llm==<version-from-the-list>" \
 
 If needed, browse the [raw nightly wheel index](https://pypi.nvidia.com/trtllm_nightly/tensorrt-llm/) to inspect
 builds for other Python versions or platforms.
+
+### Install in an NGC PyTorch container
+
+Wheels built with NGC PyTorch are published to separate indexes:
+
+| Release type | Package index |
+|--------------|---------------|
+| Regular release (including release candidates) | [`trtllm_ngcpytorch`](https://pypi.nvidia.com/trtllm_ngcpytorch/tensorrt-llm/) |
+| Nightly release | [`trtllm_ngcpytorch_nightly`](https://pypi.nvidia.com/trtllm_ngcpytorch_nightly/tensorrt-llm/) |
+
+Use the NGC PyTorch container tag specified by `BASE_TAG` in
+[`docker/Dockerfile.multi`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docker/Dockerfile.multi)
+at the source revision of the TensorRT LLM version you intend to install. Replace `<BASE_TAG>` with that tag:
+
+```bash
+docker run --rm -it --ipc host --gpus all --ulimit memlock=-1 --ulimit stack=67108864 \
+    "nvcr.io/nvidia/pytorch:<BASE_TAG>"
+```
+
+Run the following commands inside the container. Use its pre-installed CUDA and PyTorch instead of installing
+the public PyTorch package from the prerequisites above. Before installing the wheel, uninstall any previous
+CUTLASS DSL installation as described above. If TensorRT LLM is already installed, uninstall it with
+`pip3 uninstall tensorrt_llm` before switching wheels. Create a constraint to preserve the container's PyTorch build:
+
+```bash
+CURRENT_TORCH_VERSION=$(python3 -c "import torch; from packaging.version import Version; print(Version(torch.__version__).public)")
+echo "torch==$CURRENT_TORCH_VERSION" > /tmp/torch-constraint.txt
+```
+
+Download the wheel from its dedicated index, then install the local file so PyPI remains available for dependencies.
+The download step selects the NGC PyTorch build even when PyPI contains a wheel with the same version.
+The installation commands use `PIP_CONSTRAINT` to replace the container's default pip constraints with the
+PyTorch constraint above.
+
+#### Install a regular release
+
+List the releases compatible with the container's Python version and platform. `--pre` includes release candidates:
+
+```bash
+pip3 index versions tensorrt_llm --pre \
+    --index-url https://pypi.nvidia.com/trtllm_ngcpytorch/
+```
+
+Choose a version from the list and install it explicitly:
+
+```bash
+TRTLLM_WHEEL_DIR=$(mktemp -d)
+pip3 download --no-deps "tensorrt_llm==<version-from-the-list>" \
+    --index-url https://pypi.nvidia.com/trtllm_ngcpytorch/ \
+    --dest "$TRTLLM_WHEEL_DIR"
+PIP_CONSTRAINT=/tmp/torch-constraint.txt \
+    pip3 install "$TRTLLM_WHEEL_DIR"/tensorrt_llm-*.whl
+```
+
+#### Install a nightly release
+
+List the nightly releases compatible with the container's Python version and platform:
+
+```bash
+pip3 index versions tensorrt_llm --pre \
+    --index-url https://pypi.nvidia.com/trtllm_ngcpytorch_nightly/
+```
+
+Choose a `.dev` version from the list and install it explicitly:
+
+```bash
+TRTLLM_WHEEL_DIR=$(mktemp -d)
+pip3 download --no-deps "tensorrt_llm==<version-from-the-list>" \
+    --index-url https://pypi.nvidia.com/trtllm_ngcpytorch_nightly/ \
+    --dest "$TRTLLM_WHEEL_DIR"
+PIP_CONSTRAINT=/tmp/torch-constraint.txt \
+    pip3 install "$TRTLLM_WHEEL_DIR"/tensorrt_llm-*.whl
+```
+
+If a compatible wheel is unavailable, the NGC PyTorch wheel is also located at `/app/tensorrt_llm` inside the
+corresponding [TensorRT LLM release container](https://catalog.ngc.nvidia.com/orgs/nvidia/teams/tensorrt-llm/containers/release).
 
 ### Sanity check
 
