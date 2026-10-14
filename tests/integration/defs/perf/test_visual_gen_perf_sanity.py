@@ -29,6 +29,7 @@ import pytest
 import yaml
 from test_common.error_utils import report_error
 from test_common.http_utils import wait_for_endpoint_ready
+from test_common.visual_gen_perf_history import transform_visual_gen_history
 
 from defs.trt_test_alternative import print_info
 from tensorrt_llm._utils import get_free_port
@@ -819,6 +820,7 @@ class VisualGenPerfSanityTestConfig:
             regression_metrics=REGRESSION_METRICS,
             extra_fields=extra_fields,
             upload_to_db=self.upload_to_db,
+            history_transform=transform_visual_gen_history,
         )
 
 

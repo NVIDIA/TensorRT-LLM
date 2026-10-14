@@ -33,10 +33,30 @@ shared perf regression pipeline. It is responsible for:
 | `REGRESSION_METRICS` | `d_median_generation` |
 
 Latency and generation metrics are read from the VisualGen benchmark JSON in
-seconds. Latency includes media encoding and persistence overhead, while median
-generation tracks the typical engine-side generation time used for regression
-checks. Online benchmarks receive generation timing from the VisualGen serving
-`Server-Timing` response header and store it in the result JSON.
+seconds. Both gated timings are client-side: video uses `gen_latency`, while
+synchronous image and image-edit routes use `e2e_latency` because they cannot
+observe a separate generation-complete boundary. Server timings remain
+diagnostic outputs of a detailed benchmark, rather than the regression metric.
+
+New uploaded results carry `s_visual_gen_metric_contract=v2_client_latency` as
+source metadata, not as a match key. The CI history policy accepts this contract
+and the existing unversioned client results whose exact commits are recorded in
+`tests/test_common/visual_gen_client_timing_commits.json`. This offline snapshot
+was verified against each commit's `visual_gen_perf_utils.py` mapping; dates do
+not identify the timing contract for releases/backports. Unverified unversioned
+results are excluded until their source is verified and the snapshot extended.
+
+The policy applies before selecting the latest main result, extracting threshold
+overrides, and computing the fallback baseline. It drops inherited `d_baseline_*`
+values, including those stored on client results, because CI may have computed
+them from mixed old/new history. Threshold overrides are preserved. Baselines
+are recomputed with the existing daily/rolling-percentile algorithm from
+compatible history and the new measurement. DB records and metric names are
+unchanged, and video cases reuse their already verified client history. With no
+compatible history (currently Flux), the existing pipeline bootstraps from the
+current measurement; a passing first run is not evidence of an established
+regression baseline. Collect repeated current-window results before treating
+the case as a stable gate.
 
 ## Match Keys
 
