@@ -914,6 +914,18 @@ class Sender(SenderBase):
         peer_rank: int,
         request: TransferRequest,
     ) -> tuple[bool, Optional[str]]:
+        try:
+            # This query cannot submit a transfer. Reject before acquiring backend ownership.
+            if request.op == TransferOp.WRITE and not self._agent.check_remote_descs(
+                request.remote_name, request.dst_descs
+            ):
+                raise RuntimeError("NIXL WRITE remote descriptors unavailable")
+        except Exception as error:
+            if self._enforce_physical_ownership:
+                task.retire_unsubmitted_physical_operation(peer_rank)
+            raise _TransferNotSubmittedError(
+                "NIXL sender rejected transfer before backend submission"
+            ) from error
         if not self._enforce_physical_ownership:
             status = self._agent.submit_transfer_requests(request)
             completed = status.wait()
