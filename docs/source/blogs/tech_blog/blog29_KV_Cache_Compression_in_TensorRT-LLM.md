@@ -266,7 +266,7 @@ Put together, compression and the cold-page mechanism **move the serving frontie
   <img src="../media/tech_blog29_pareto_frontier.svg" width="1000">
 </figure>
 </div>
-<p align="center"><sub><em>Figure 11: GLM-5.2 Pareto frontier · GB300 · 128 GiB of host cache per rank · the ten highest-throughput NVFP4 points and the FP8 host-cache run of each. Top: each green numbered point is a serving point with NVFP4 cold pages, the hollow point is its run with an uncompressed FP8 host cache, and the arrow shows the change. Bottom: the gain of each numbered configuration in tok/s/GPU (green) and in P90 interactivity (blue). Two repeats per setting; AgentX replay.</em></sub></p>
+<p align="center"><sub><em>Figure 11: GLM-5.2 Pareto frontier · GB300 · 128 GiB of host cache per prefill rank · the ten highest-throughput NVFP4 points and the FP8 host-cache run of each. Top: each green numbered point is a serving point with NVFP4 cold pages, the hollow point is its run with an uncompressed FP8 host cache, and the arrow shows the change. Bottom: the gain of each numbered configuration in tok/s/GPU (green) and in P90 interactivity (blue). Two repeats per setting; AgentX replay.</em></sub></p>
 
 The gain is not tied to one setup. Figure 12 details the four configurations with the largest gains, across two models (GLM-5.2 and Qwen3.5-397B-A17B), from 8 to 40 GPUs, and from concurrency 128 to 1536: in every one **both the hit rate and the TTFT improve**. The improvement comes from two sources, not one: the smaller cold page lets the tiers **hold more prefixes, so the hit rate rises**, and it also means **fewer bytes to move, so offloading and onboarding themselves get faster**.
 
