@@ -29,7 +29,8 @@ from tensorrt_llm._torch.modules.mamba import jit_prefetch_decode as jpd
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 
-HEADS, HEAD_DIM, DSTATE, NGROUPS, CONV_DIM, WIDTH = 8, 80, 128, 1, 2304, 4
+HEADS, HEAD_DIM, DSTATE, NGROUPS, WIDTH = 8, 80, 128, 1, 4
+CONV_DIM = HEADS * HEAD_DIM + 2 * NGROUPS * DSTATE  # [x | B | C], as in Mamba2Mixer
 CACHE, MAX_ROWS = 64, 64
 
 
