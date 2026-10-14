@@ -369,7 +369,6 @@ class GenerationResultBase:
     def _handle_sequence(self,
                          finish_reasons,
                          response_tensors,
-                         output_token_ids,
                          sequence_index,
                          logprobs_result=None,
                          req_perf_metrics_dict: Optional[dict[str,
@@ -400,12 +399,12 @@ class GenerationResultBase:
             # Beam search enforces returning all generated tokens
             output.token_ids = [
                 *decoder_output_prefix,
-                *output_token_ids[src_idx],
+                *response_tensors.output_token_ids[src_idx],
             ]
         else:
             if decoder_output_prefix and not output.token_ids:
                 output.token_ids.extend(decoder_output_prefix)
-            output.token_ids.extend(output_token_ids[src_idx])
+            output.token_ids.extend(response_tensors.output_token_ids[src_idx])
 
         if (cum_log_probs := response_tensors.cum_log_probs) is not None:
             output.cumulative_logprob = cum_log_probs[src_idx]
@@ -694,16 +693,13 @@ class GenerationResultBase:
 
             finish_reasons = response_result.finish_reasons
             # output_token_ids = (beams, tokens)
-            output_token_ids = response_result.output_token_ids
             if self.sampling_params.use_beam_search:
-                for beam_idx, _ in enumerate(output_token_ids):
+                for beam_idx, _ in enumerate(response_result.output_token_ids):
                     self._handle_sequence(finish_reasons, response_result,
-                                          output_token_ids, beam_idx,
-                                          logprobs_result,
+                                          beam_idx, logprobs_result,
                                           req_perf_metrics_dict)
             else:
                 self._handle_sequence(finish_reasons, response_result,
-                                      output_token_ids,
                                       response_result.sequence_index,
                                       logprobs_result, req_perf_metrics_dict)
 

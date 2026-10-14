@@ -958,8 +958,10 @@ def nvtx_range_debug(msg: str,
         category (str, optional): The category for the range. Defaults to None.
 
     Returns:
-        contextmanager: A context manager that either marks the NVTX range if enabled,
-                        or a null context manager that does nothing if disabled.
+        contextmanager: A context manager that marks the NVTX range if enabled.
+                        If disabled, a shared, stateless no-op (``_NULL_RANGE``)
+                        that is both a context manager and an identity
+                        decorator; it is safe for concurrent and nested use.
     """
     if os.getenv("TLLM_LLMAPI_ENABLE_NVTX", "0") == "1" or \
             os.getenv("TLLM_NVTX_DEBUG", "0") == "1":
