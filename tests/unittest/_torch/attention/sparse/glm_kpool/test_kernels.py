@@ -152,7 +152,8 @@ def test_pool_scores_generation_rows(precision):
     torch.testing.assert_close(got[visible], want[visible], atol=2e-3, rtol=2e-3)
     if precision == "bf16":
         # FP32 queries are not exact in bf16, so they keep the tf32 dot.
-        args = (q.float(), w, pool, tables, kv_lens, TPB)
+        q32 = torch.randn(n, heads, HD, generator=gen, device="cuda")
+        args = (q32, w, pool, tables, kv_lens, TPB)
         assert torch.equal(
             kpool_score(*args, head_dim=HD, kpool=KPOOL, precision="bf16", **kwargs),
             kpool_score(*args, head_dim=HD, kpool=KPOOL, precision="tf32", **kwargs),
@@ -273,7 +274,9 @@ def test_pool_scores_packed_context_rows_share_tables(bounded, monkeypatch):
         )
         return out.sort(dim=-1).values
 
-    assert torch.equal(select(got.masked_fill(~visible, float("inf"))), select(want))
+    selected = select(got.masked_fill(~visible, float("inf")))
+    assert torch.equal(selected, select(want))
+    assert (selected[num_cand == 0] == -1).all()
     # The first rows of request 1 complete no pool, so nothing is launched.
     monkeypatch.setattr(kernels, "_kpool_score_kernel", None)
     score(slice(lens[0], lens[0] + KPOOL - 1), KPOOL - 1)
