@@ -1714,6 +1714,45 @@ class TestQwen3CoderToolParser(BaseToolParserTestClass):
             "items": [1, 2],
         }
 
+    def test_missing_parameter_end_tag_ends_at_next_parameter(self, parser):
+        """A parameter left without its closing tag ends where the next begins.
+
+        Otherwise the next parameter would be swallowed into its value.
+        """
+        tool = ChatCompletionToolsParam(
+            type="function",
+            function=FunctionDefinition(
+                name="f",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "a": {
+                            "type": "integer"
+                        },
+                        "b": {
+                            "type": "string"
+                        },
+                    },
+                },
+            ),
+        )
+        body = ("\n<function=f>\n"
+                "<parameter=a>\n1\n"
+                "<parameter=b>\nx\n</parameter>\n"
+                "</function>\n")
+
+        whole = parser.detect_and_parse("<tool_call>" + body + "</tool_call>",
+                                        [tool])
+        streamed = ""
+        streaming_parser = Qwen3CoderToolParser()
+        for delta in ("<tool_call>", body, "</tool_call>"):
+            for call in streaming_parser.parse_streaming_increment(
+                    delta, [tool]).calls:
+                streamed += call.parameters or ""
+
+        assert json.loads(whole.calls[0].parameters) == {"a": 1, "b": "x"}
+        assert streamed == whole.calls[0].parameters
+
 
 # ============================================================================
 # DeepSeek Parser Tests

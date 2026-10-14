@@ -188,8 +188,11 @@ class Qwen3CoderToolParser(BaseToolParser):
         self.tool_call_function_regex = re.compile(
             r"<function=(.*?)</function>|<function=(.*)$", re.DOTALL
         )
+        # A parameter ends at its closing tag or, when the model leaves that
+        # out, at the next parameter tag.
         self.tool_call_parameter_regex = re.compile(
-            r"<parameter=(.*?)</parameter>|<parameter=(.*?)$", re.DOTALL
+            r"<\s*parameter\s*=\s*([^>]*)>(.*?)(?:<\s*/\s*parameter\s*>|(?=<\s*parameter\s*=))",
+            re.DOTALL,
         )
         self._buf: str = ""
 
@@ -350,14 +353,12 @@ class Qwen3CoderToolParser(BaseToolParser):
         calls: List[ToolCallItem] = []
 
         # Find all complete parameter patterns
-        param_matches = list(
-            re.finditer(r"<parameter=([^>]+)>(.*?)</parameter>", text_to_parse, re.DOTALL)
-        )
+        param_matches = list(self.tool_call_parameter_regex.finditer(text_to_parse))
 
         # Build new parameters dictionary
         new_params = {}
         for match in param_matches:
-            param_name = match.group(1).strip()
+            param_name = match.group(1)
             param_value = _trim_wrapping_newlines(match.group(2))
             new_params[param_name] = self._convert_param_value(
                 param_value, param_name, param_config, self._current_function_name
@@ -457,13 +458,9 @@ class Qwen3CoderToolParser(BaseToolParser):
             body = txt[idx + 1 :]
             params: Dict[str, Any] = {}
             param_config = self._get_arguments_config(fname, tools)
-            for pm in self.tool_call_parameter_regex.findall(body):
-                ptxt = pm[0] if pm[0] else pm[1]
-                if ">" not in ptxt:
-                    continue
-                pidx = ptxt.index(">")
-                pname = ptxt[:pidx].strip()
-                pval = _trim_wrapping_newlines(ptxt[pidx + 1 :])
+            for pm in self.tool_call_parameter_regex.finditer(body):
+                pname = pm.group(1)
+                pval = _trim_wrapping_newlines(pm.group(2))
                 params[pname] = self._convert_param_value(pval, pname, param_config, fname)
             res.append(
                 ToolCallItem(
