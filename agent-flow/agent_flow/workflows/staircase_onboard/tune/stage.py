@@ -331,7 +331,7 @@ class TuneStage:
             workdir=s.workdir, repo=s.repo, bench=s.bench(), base_configs=s.identity_configs,
             perf_runner=self.runners(s.spools, "tunec"), gate_runner=self.runners(s.dev_spools, "tuneg"),
             gate_cmd=gate_command(PACKAGE, s.env_script, s.model, float(acc.get("anchor", 0.0)), acc.get("task", "gsm8k"),
-                                  tests=self._gate_tests()),
+                                  tests=self._gate_tests(), eval_args=str(acc.get("eval_args", ""))),
             noise=NoiseFloor(spread=dict(self.t.get("noise_spread") or {}), samples=int(self.t.get("noise_samples", 0))),
             min_gain=float(cfg.get("min_gain", 0.01)), noise_factor=float(cfg.get("noise_factor", 3.0)),
             branch_prefix=self.branch_prefix, log=self.log,

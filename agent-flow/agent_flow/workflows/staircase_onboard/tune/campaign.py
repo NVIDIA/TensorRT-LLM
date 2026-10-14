@@ -815,12 +815,14 @@ class Campaign:
 
 
 def gate_command(package: Path, env_script: Path, model: str, anchor: float, task: str = "gsm8k",
-                 tests: Sequence[str] = ()):
+                 tests: Sequence[str] = (), eval_args: str = ""):
     def build(tree: Path, configs: Sequence[Path], out: Path) -> str:
         argv = ["python", str(package / "tune" / "gate_accuracy.py"), "--model", model, "--out", str(out),
                 "--task", task, "--anchor", str(anchor)]
         for t in tests:
             argv += ["--tests", str(t)]
+        if eval_args:  # the model's own eval settings (a reasoning model needs a longer output, its own template kwargs)
+            argv += ["--eval-args", eval_args]
         for c in configs:
             argv += ["--config", str(c)]
         return f"source {shlex.quote(str(env_script))}\ncd {shlex.quote(str(tree))}\n" + " ".join(shlex.quote(a) for a in argv)

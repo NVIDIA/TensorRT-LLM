@@ -509,7 +509,10 @@ def test_the_gate_runs_the_target_suite_first_and_fails_without_the_eval(tmp_pat
     assert rc == 1 and result["verdict"] == "FAIL" and result["score"] is None
     assert "1 failed" in result["reason"] and not (out / "eval.log").exists()
     cmd = campaign_mod.gate_command(Path("/pkg"), Path("/env.sh"), "m", 96.0, tests=["tests/unittest/t"])(tree, [], out)
-    assert "--tests tests/unittest/t" in cmd
+    assert "--tests tests/unittest/t" in cmd and "--eval-args" not in cmd
+    # a reasoning model's own eval settings travel to trtllm-eval
+    cmd = campaign_mod.gate_command(Path("/pkg"), Path("/env.sh"), "m", 96.0, eval_args="--max_output_length=2048")(tree, [], out)
+    assert "--eval-args --max_output_length=2048" in cmd
 
 
 def test_a_measurement_lost_with_its_session_is_re_queued_not_reverted(tmp_path):
