@@ -458,6 +458,11 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
                     dtype=torch_dtype,
                     device=device,
                 )
+        # Resolve the K/V and NVFP4 scale views once too: the forward fetches them every step.
+        for layer_idx in self.layer_offsets:
+            self.get_buffers(layer_idx, kv_layout)
+            if self.is_nvfp4_layer(layer_idx):
+                self.get_block_scale_buffers(layer_idx, kv_layout)
 
     def _validate_speculative_config(self, spec_config: DecodingBaseConfig | None) -> None:
         # Dynamic-tree relocation moves packed K/V bytes without their NVFP4
@@ -600,6 +605,11 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         pool's slot ids; :meth:`copy_batch_block_offsets` scales them.
         """
         super()._prepare_page_table_tensor(index_mapper_capacity)
+        if self.dtype == DataType.NVFP4:
+            # Nothing reads a hybrid cache's own block offsets: MSA layers address pages
+            # by slot id and the shared draft layer reads MiniMaxM3DraftKVCacheView's
+            # table. Without pools, a new reader fails instead of reading unfilled offsets.
+            self.num_attention_op_pools = 0
         draft_layers = [
             layer_idx
             for layer_idx in self._shared_draft_layer_ids
@@ -645,6 +655,11 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
             f"attention-op pools {[pool for pool, _ in op_pools]} address their pages."
         )
 
+    def _prepare_swa_scratch_copy_tensors(self, index_mapper_capacity: int) -> None:
+        # Staging for the per-layer block-offset copy, which a hybrid NVFP4 cache never runs.
+        if self.dtype != DataType.NVFP4:
+            super()._prepare_swa_scratch_copy_tensors(index_mapper_capacity)
+
     def copy_batch_block_offsets(
         self,
         dst_tensor: torch.Tensor,
@@ -654,6 +669,8 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         num_seqs: int,
         max_blocks: Optional[int] = None,
     ) -> None:
+        if self.num_attention_op_pools == 0:
+            return
         if self.skip_unchanged_block_offsets:
             guard = self._unchanged_copies.setdefault(dst_tensor.data_ptr(), _UnchangedCopy())
             args = (

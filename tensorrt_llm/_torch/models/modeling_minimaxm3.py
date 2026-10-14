@@ -967,27 +967,28 @@ def _minimax_m3_qkv_index_proj_fake(
 # the fused kernels; explicit mutable cache inputs keep their writes visible.
 @torch.library.custom_op(
     "trtllm::minimax_m3_fused_sparse_qkv_producer",
-    mutates_args=("kv_cache", "index_k_cache"),
+    mutates_args=("kv_cache", "index_k_cache", "kv_scale_cache"),
 )
 def minimax_m3_fused_sparse_qkv_producer(
     hidden_states: torch.Tensor,
     position_ids: Optional[torch.Tensor],
     kv_cache: torch.Tensor,
     index_k_cache: torch.Tensor,
+    kv_scale_cache: Optional[torch.Tensor],
     out_cache_loc: torch.Tensor,
     layer_idx: str,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Capture projection, norm, RoPE and FP8 cache insertion together."""
+    """Capture projection, norm, RoPE and FP8/NVFP4 cache insertion together."""
     attn_metadata, attn_layer = _extract_minimax_m3_attention_extra_attrs(layer_idx)
     packed = attn_layer.qkv_proj(hidden_states)
     result = attn_layer._fused_fp8_qkv_indexer_norm_rope_kv_insert(
         packed,
         position_ids,
         attn_metadata,
-        cache_tensors=(kv_cache, index_k_cache, out_cache_loc),
+        cache_tensors=(kv_cache, index_k_cache, kv_scale_cache, out_cache_loc),
     )
     if result is None:
-        raise RuntimeError("MiniMax-M3 piecewise graph requires the fused FP8 sparse QKV producer.")
+        raise RuntimeError("MiniMax-M3 piecewise graph requires the fused sparse QKV producer.")
     return result
 
 
@@ -997,6 +998,7 @@ def _minimax_m3_fused_sparse_qkv_producer_fake(
     position_ids: Optional[torch.Tensor],
     kv_cache: torch.Tensor,
     index_k_cache: torch.Tensor,
+    kv_scale_cache: Optional[torch.Tensor],
     out_cache_loc: torch.Tensor,
     layer_idx: str,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -1499,7 +1501,9 @@ class MiniMaxM3Attention(Attention):
         position_ids: Optional[torch.Tensor],
         attn_metadata: AttentionMetadata,
         *,
-        cache_tensors: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
+        cache_tensors: Optional[
+            Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], torch.Tensor]
+        ] = None,
     ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
         """Run the vLLM-style horizontal producer for every sparse batch.
 
@@ -1524,12 +1528,15 @@ class MiniMaxM3Attention(Attention):
                 return None
             buffers = kv_cache_manager.get_buffers(self.layer_idx, kv_layout="HND")
             index_k_cache = attn_metadata.msa_idx_k_cache(self.layer_idx)
+            scale_buffers = None
             out_cache_loc = getattr(attn_metadata, "msa_out_cache_loc", None)
         else:
-            buffers, index_k_cache, out_cache_loc = cache_tensors
+            buffers, index_k_cache, scale_buffers, out_cache_loc = cache_tensors
         if out_cache_loc is None:
             return None
-        plan = self._fused_producer_plan(kv_cache_manager, buffers, index_k_cache, out_cache_loc)
+        plan = self._fused_producer_plan(
+            kv_cache_manager, buffers, index_k_cache, scale_buffers, out_cache_loc
+        )
         if plan is None:
             return None
         num_tokens = int(packed.shape[0])
@@ -1564,6 +1571,7 @@ class MiniMaxM3Attention(Attention):
         kv_cache_manager,
         buffers: Optional[torch.Tensor],
         index_k_cache: torch.Tensor,
+        scale_buffers: Optional[torch.Tensor],
         out_cache_loc: torch.Tensor,
     ) -> Optional[tuple]:
         """Resolve the horizontal producer's per-layer-invariant inputs once.
@@ -1581,6 +1589,7 @@ class MiniMaxM3Attention(Attention):
             id(kv_cache_manager),
             None if buffers is None else buffers.data_ptr(),
             index_k_cache.data_ptr(),
+            None if scale_buffers is None else scale_buffers.data_ptr(),
             out_cache_loc.data_ptr(),
             out_cache_loc.dtype,
             None if rotary_cos_sin is None else rotary_cos_sin.data_ptr(),
@@ -1595,7 +1604,7 @@ class MiniMaxM3Attention(Attention):
         if key in cache:
             return cache[key]
         plan = self._resolve_fused_producer_plan(
-            kv_cache_manager, buffers, index_k_cache, out_cache_loc, rotary_cos_sin
+            kv_cache_manager, buffers, index_k_cache, scale_buffers, out_cache_loc, rotary_cos_sin
         )
         cache[key] = plan
         return plan
@@ -1605,6 +1614,7 @@ class MiniMaxM3Attention(Attention):
         kv_cache_manager,
         buffers: Optional[torch.Tensor],
         index_k_cache: torch.Tensor,
+        scale_buffers: Optional[torch.Tensor],
         out_cache_loc: torch.Tensor,
         rotary_cos_sin: Optional[torch.Tensor],
     ) -> Optional[tuple]:
@@ -1637,22 +1647,15 @@ class MiniMaxM3Attention(Attention):
         if any(weight.dtype != torch.bfloat16 or not weight.is_cuda for weight in norm_weights):
             return None
 
-        layer_uses_nvfp4 = bool(
-            getattr(kv_cache_manager, "is_nvfp4_layer", lambda _layer_idx: False)(self.layer_idx)
-        )
-        scale_buffers = (
-            kv_cache_manager.get_block_scale_buffers(self.layer_idx, kv_layout="HND")
-            if layer_uses_nvfp4
-            else None
-        )
+        if scale_buffers is None and kv_cache_manager.is_nvfp4_layer(self.layer_idx):
+            scale_buffers = kv_cache_manager.get_block_scale_buffers(
+                self.layer_idx, kv_layout="HND"
+            )
+        layer_uses_nvfp4 = scale_buffers is not None
         kv_quant_scale = getattr(self.qkv_proj, "inv_kv_scales", None) if layer_uses_nvfp4 else None
         if layer_uses_nvfp4:
-            supports_fused_layout = (
-                buffers is not None
-                and scale_buffers is not None
-                and _nvfp4_cache_supports_fused_write(
-                    buffers, scale_buffers, self.num_key_value_heads
-                )
+            supports_fused_layout = buffers is not None and _nvfp4_cache_supports_fused_write(
+                buffers, scale_buffers, self.num_key_value_heads
             )
             supported_main_cache = (
                 supports_fused_layout
@@ -2266,17 +2269,20 @@ class MiniMaxM3Attention(Attention):
                 self.register_to_config
                 and is_torch_compiling()
                 and isinstance(self.attn, MiniMaxM3MsaSparseAttention)
-                and self._emit_fp8_main_qkv()
+                and (self.main_kv_is_fp8 or self.main_kv_is_nvfp4)
                 and self.attn.indexer_kv_dtype == "fp8"
             ):
                 # Metadata stages these zero-copy views before compilation;
                 # tracing the cache manager's native pointer access is unsafe.
-                kv_cache, index_k_cache = attn_metadata.msa_layer_cache_tensors[self.layer_idx]
+                kv_cache, index_k_cache, kv_scale_cache = attn_metadata.msa_layer_cache_tensors[
+                    self.layer_idx
+                ]
                 q, idx_q = torch.ops.trtllm.minimax_m3_fused_sparse_qkv_producer(
                     hidden_states,
                     position_ids,
                     kv_cache,
                     index_k_cache,
+                    kv_scale_cache,
                     attn_metadata.msa_out_cache_loc,
                     self.layer_idx_str,
                 )
