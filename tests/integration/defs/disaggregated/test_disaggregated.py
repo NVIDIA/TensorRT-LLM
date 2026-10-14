@@ -2987,13 +2987,18 @@ def test_disaggregated_gpt_oss_20b_kv_cache_aware(disaggregated_test_root,
     def chat_and_fingerprints(server_url: str) -> None:
         reply = requests.post(f"{server_url}/v1/chat/completions",
                               json={
-                                  "model": model_path,
+                                  "model":
+                                  model_path,
                                   "messages": [{
-                                      "role": "user",
-                                      "content": "Say hi in three words."
+                                      "role":
+                                      "user",
+                                      "content":
+                                      "Say hi in three words."
                                   }],
-                                  "max_tokens": 32,
-                                  "temperature": 0
+                                  "max_tokens":
+                                  32,
+                                  "temperature":
+                                  0
                               },
                               timeout=120)
         assert reply.status_code == 200, reply.text

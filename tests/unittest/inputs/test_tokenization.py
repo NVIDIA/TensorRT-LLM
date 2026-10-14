@@ -20,8 +20,8 @@ import threading
 from typing import Any, Optional
 
 import pytest
-
 from llmapi.apps.render_helpers import LLAMA, real_tokenizer
+
 from tensorrt_llm.inputs.registry import DefaultInputProcessor
 from tensorrt_llm.inputs.tokenization import TIKTOKEN_ALLOWED_SPECIAL_TOKENS, tokenize_prompt
 from tensorrt_llm.sampling_params import SamplingParams
