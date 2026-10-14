@@ -288,11 +288,12 @@ def get_kv_cache_manager_cls(
                 "hybrid managers do not implement per-token verify-group "
                 "bookkeeping.")
 
-        # Kimi defaults to MambaHybridCacheManagerV2 with or without reuse.
-        # Explicit V1 aggregated serving uses Mixed without reuse and the
-        # C++ hybrid manager with reuse. Disaggregated serving requires
-        # Python NIXL below, using V2 by default or Mixed for explicit V1
-        # without reuse.
+        # Kimi uses MambaHybridCacheManagerV2 with or without reuse when
+        # use_kv_cache_manager_v2=True, the KvCacheConfig default. V1 can
+        # be selected explicitly or resolved from "auto". Aggregated V1
+        # uses Mixed without reuse and the C++ hybrid manager with reuse.
+        # Disaggregated serving requires Python NIXL below, using V2 for
+        # the configured default or Mixed for V1 without reuse.
         if is_kimi_linear(config) and not use_v2 and not is_disagg:
             if kv_cache_config.enable_block_reuse:
                 logger.info(
