@@ -1254,6 +1254,24 @@ def getCbtsResult(pipeline, testFilter, globalVars)
         if (coverageShadow) {
             pipeline.echo("CBTS: shadow coverage decision — scope=${result.scope}, " +
                           "stages=${result.affected_stages.size()}; baseline remains active")
+            try {
+                writeFile file: "${LLM_ROOT}/cbts_shadow_decision.json", text: output
+                def selectionFiles = ["cbts_shadow_decision.json"]
+                if (result.test_db_dir_override) {
+                    selectionFiles.add(result.test_db_dir_override)
+                }
+                sh "tar czf ${LLM_ROOT}/cbts_shadow_selection.tar.gz -C ${LLM_ROOT} ${selectionFiles.join(' ')}"
+                trtllm_utils.uploadArtifacts("${LLM_ROOT}/cbts_shadow_selection.tar.gz", "${UPLOAD_PATH}/cbts/")
+                def artifactPath = "${UPLOAD_PATH}/cbts/cbts_shadow_selection.tar.gz"
+                def reportedDecision = new groovy.json.JsonSlurper().parseText(output)
+                reportedDecision.shadow_selection_artifact_path = artifactPath
+                output = groovy.json.JsonOutput.toJson(reportedDecision)
+                pipeline.echo("CBTS: uploaded shadow selection to ${artifactPath}")
+            } catch (InterruptedException e) {
+                throw e
+            } catch (Exception e) {
+                pipeline.echo("CBTS: shadow selection upload failed (non-fatal): ${e.message}")
+            }
             _cbtsReportDecision(pipeline, globalVars, runStatus, "", output,
                                 multiGpuRequired, multiGpuLabelGateOpen, false,
                                 coveragePilotEligible)
