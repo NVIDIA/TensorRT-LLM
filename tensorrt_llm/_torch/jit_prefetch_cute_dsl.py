@@ -449,6 +449,12 @@ class FlashInferNormProvider:
         for mod in model.modules():
             if not isinstance(mod, RMSNorm) or getattr(mod, "use_cuda_tile", False):
                 continue
+            if (
+                getattr(mod, "is_nvfp4", False)
+                and getattr(mod, "nvfp4_scale", None) is not None
+                and not getattr(mod, "use_gemma", False)
+            ):
+                continue  # the fused RMSNorm + NVFP4 quantize kernel, not FlashInfer
             weight = getattr(mod, "weight", None)
             if weight is None or weight.dtype not in (torch.bfloat16, torch.float16):
                 continue
@@ -486,11 +492,15 @@ def install_flashinfer_norm_loader(
 ) -> List[str]:
     """Route FlashInfer's compiled-norm getters through ``loader``.
 
-    ``loader(spec)`` returns a helper-exported kernel, or None to let
-    FlashInfer compile it as usual. Each getter keeps FlashInfer's own cache
-    (``functools.cache``), so a variant is resolved once per process either
-    way. Returns the names of the getters that were wrapped.
+    ``loader(spec)`` returns a helper-exported kernel, or None. On None the
+    original getter runs, called the way FlashInfer calls it, so a variant
+    warmup already compiled comes from FlashInfer's own cache and any other
+    compiles in place as before. Each wrapped getter caches its result
+    (``functools.cache``), so a variant is resolved once per process. Returns
+    the names of the getters that were wrapped.
     """
+    import functools
+
     wrapped = []
     targets: List[Tuple[Any, str, str]] = []
     try:
@@ -504,11 +514,8 @@ def install_flashinfer_norm_loader(
         orig = getattr(module, name, None)
         if orig is None or getattr(orig, "_jitp_wrapped", False):
             continue
-        inner = getattr(orig, "__wrapped__", orig)
 
-        def make(inner=inner, op=op):
-            import functools
-
+        def make(orig=orig, op=op):
             @functools.cache
             def getter(dtype_str, H, weight_bias, enable_pdl, sm_version, contiguous=True):
                 spec = fi_norm_spec(
@@ -517,9 +524,14 @@ def install_flashinfer_norm_loader(
                 fn = loader(spec)
                 if fn is not None:
                     return fn
-                return inner(dtype_str, H, weight_bias, enable_pdl, sm_version, contiguous)
+                # FlashInfer passes ``contiguous`` by keyword; the same call
+                # form finds the entries its cache already holds.
+                return orig(
+                    dtype_str, H, weight_bias, enable_pdl, sm_version, contiguous=contiguous
+                )
 
             getter._jitp_wrapped = True
+            getter._jitp_original = orig
             return getter
 
         setattr(module, name, make())
