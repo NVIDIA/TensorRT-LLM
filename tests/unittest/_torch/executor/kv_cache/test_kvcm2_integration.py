@@ -3376,6 +3376,39 @@ def test_window_crossing_is_silent_without_a_crossing(
 
 
 @pytest.mark.parametrize(
+    "pre_capacity,new_capacity,expected_queries",
+    [
+        (100, 101, 0),  # ordinary decode growth below the window
+        (2049, 2050, 0),  # ordinary decode growth past the window
+        (2048, 2048, 0),  # no growth
+        (2047, 2049, 1),  # the one call that crosses the window
+    ],
+)
+def test_window_crossing_queries_log_level_only_on_a_crossing(
+    monkeypatch, pre_capacity: int, new_capacity: int, expected_queries: int
+) -> None:
+    """The log-level query walks the caller's frames, and this hook runs for
+    every generation request on every iteration. Calls that cross no window
+    must return before asking the logger anything."""
+    fake_logger = _FakeLogger(level="info")
+    is_debug_enabled = Mock(wraps=fake_logger.is_debug_enabled)
+    monkeypatch.setattr(fake_logger, "is_debug_enabled", is_debug_enabled)
+    monkeypatch.setattr(kv_cache_v2_module, "logger", fake_logger)
+
+    manager = _make_window_crossing_manager()
+    manager._log_window_crossing(
+        SimpleNamespace(py_request_id=1),
+        _FakeWindowedKVCache({0: [1]}),
+        pre_capacity,
+        new_capacity,
+        "generation",
+    )
+
+    assert is_debug_enabled.call_count == expected_queries
+    assert fake_logger.messages == []
+
+
+@pytest.mark.parametrize(
     "level,expected",
     [("trace", 1), ("debug", 1), ("verbose", 1), ("info", 0), ("warning", 0), ("error", 0)],
 )

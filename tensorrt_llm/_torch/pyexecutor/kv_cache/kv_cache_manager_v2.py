@@ -671,12 +671,13 @@ def _gpu_alloc_granularity(quota: int) -> int:
     """GPU pool allocation granularity for a given quota.
 
     Mirrors ``CacheLevelManager::cacheTierGranularity`` (storageManager.cpp):
-    2 MiB physical chunks, doubled up to 32 MiB as the quota grows past
-    multiples of 1 GiB.
+    2 MiB physical chunks, doubled per power of two of the quota above 1 GiB,
+    up to 256 MiB.
     """
     page = 2 << 20
+    max_exponent = 7
     ratio = quota // (page * 512)
-    exponent = 0 if ratio == 0 else min(4, int(math.log2(ratio)))
+    exponent = 0 if ratio == 0 else min(max_exponent, int(math.log2(ratio)))
     return page << exponent
 
 
@@ -2639,14 +2640,22 @@ class KVCacheManagerV2(BaseResourceManager):
         Capacity grows monotonically within a request, so the condition below
         fires at most once per request per pool without extra bookkeeping.
 
-        Debug level only, and the guard runs before any of the strings or the
-        page-index scan are built, so a default run does no additional work.
+        Debug level only. This runs for every generation request on every
+        iteration, so the window comparison comes first: the log-level query
+        walks the caller's frames and is only made for the rare call that
+        actually crosses a window, before any message string or page-index
+        scan is built.
         """
-        if new_capacity <= pre_capacity or not logger.is_debug_enabled():
+        if new_capacity <= pre_capacity:
             return
+        debug_enabled = None
         for layer_group_id, window_size in self._get_windowed_layer_group_sizes().items():
             if not (pre_capacity <= window_size < new_capacity):
                 continue
+            if debug_enabled is None:
+                debug_enabled = logger.is_debug_enabled()
+            if not debug_enabled:
+                return
             logger.debug(
                 f"[KVCacheManagerV2] request {req.py_request_id} crossed the sliding window "
                 f"during {phase}: layer_group_id={layer_group_id}, window={window_size}, "

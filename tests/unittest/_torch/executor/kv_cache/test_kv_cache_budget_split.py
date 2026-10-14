@@ -1503,6 +1503,26 @@ class TestCacheQuotaPerRequest:
     def test_unknown_max_seq_len_declines(self):
         assert self._call(_v2_model_config(num_layers=1), max_seq_len=None) is None
 
+    @pytest.mark.parametrize(
+        "quota_mib,expected_mib",
+        [
+            (0, 2),
+            (1024, 2),
+            (2 * 1024, 4),
+            (16 * 1024, 32),
+            (128 * 1024, 256),
+            (151 * 1024, 256),
+            (1024 * 1024, 256),
+        ],
+    )
+    def test_gpu_alloc_granularity_matches_the_allocator_schedule(self, quota_mib, expected_mib):
+        """The estimate's granularity must follow ``cacheTierGranularity``:
+        2 MiB, doubled per power of two of the quota above 1 GiB, capped at
+        256 MiB. A smaller cap here would under-reserve large pools."""
+        from tensorrt_llm._torch.pyexecutor.kv_cache import kv_cache_manager_v2 as kvcm2
+
+        assert kvcm2._gpu_alloc_granularity(quota_mib << 20) == expected_mib << 20
+
 
 class TestPerRequestWeightedSplit:
     """The GPU budget split weighs managers by per-request spend when known."""
