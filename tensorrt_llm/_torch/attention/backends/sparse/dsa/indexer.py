@@ -19,6 +19,7 @@ from tensorrt_llm._torch.attention.backends.interface import MLAParams, Position
 from tensorrt_llm._torch.attention.rotary_embedding import RotaryEmbedding
 from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from tensorrt_llm._torch.distributed.ops import allgather
+from tensorrt_llm._torch.flashinfer_utils import IS_FLASHINFER_AVAILABLE
 from tensorrt_llm._torch.modules.layer_norm import LayerNorm
 from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.modules.multi_stream_utils import (
@@ -26,7 +27,7 @@ from tensorrt_llm._torch.modules.multi_stream_utils import (
     maybe_execute_in_parallel,
 )
 from tensorrt_llm._torch.modules.top_k import TopK, TopKImplementation
-from tensorrt_llm._torch.utils import Fp4QuantizedTensor, maybe_compile
+from tensorrt_llm._torch.utils import Fp4QuantizedTensor, is_piecewise_running, maybe_compile
 from tensorrt_llm._utils import get_sm_version, maybe_pin_memory, prefer_pinned
 from tensorrt_llm.deep_gemm import (
     fp8_fp4_mqa_logits,
@@ -39,6 +40,7 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from ..params import use_self_sampling_gvr
+from . import kernels as _prologue
 from .params import DSAParams
 
 ModelConfig = tensorrt_llm.bindings.ModelConfig
@@ -822,6 +824,10 @@ class Indexer(nn.Module):
         # Fused wk + weights_proj weight for single FP32 cuBLAS GEMM
         # (populated in cache_derived_state; maps to TF32 tensor cores on Ampere+)
         self._fused_wk_wp_weight: Optional[torch.Tensor] = None
+        # k_fp8 tensor whose rows the fused prologue already wrote into the
+        # indexer K cache (TRTLLM_DSA_INDEXER_FUSED_PROLOGUE); consumed by
+        # update_k_cache_unless_prewritten so the scatter is not repeated.
+        self._k_cache_prewritten_for: Optional[torch.Tensor] = None
 
     def cache_derived_state(self) -> None:
         """Fuse wk and weights_proj for F.linear with TF32 tensor cores on Ampere+."""
@@ -1342,6 +1348,25 @@ class Indexer(nn.Module):
             metadata.slot_mapping_scale,
             num_tokens,
         )
+
+    def update_k_cache_unless_prewritten(
+        self,
+        k_fp8_full: torch.Tensor,
+        k_fp8: torch.Tensor,
+        k_scale: torch.Tensor,
+        metadata: DSAtrtllmAttentionMetadata,
+    ) -> None:
+        """_update_k_cache, skipped when the fused prologue already wrote these rows.
+
+        ``k_fp8_full`` is the (unsliced) k_fp8 returned by pre_indexer_proj; the
+        fused prologue records it when it scattered the first ``num_tokens`` rows
+        into the cache itself.
+        """
+        prewritten = self._k_cache_prewritten_for
+        self._k_cache_prewritten_for = None
+        if prewritten is not None and prewritten is k_fp8_full:
+            return
+        self._update_k_cache(k_fp8, k_scale, metadata)
 
     def _gather_k_cache_for_chunk(
         self,
@@ -2087,10 +2112,18 @@ class Indexer(nn.Module):
         return weights
 
     def _qk_projection_and_rope(
-        self, qr: torch.Tensor, indexer_k: torch.Tensor, position_ids: torch.Tensor
+        self,
+        qr: Optional[torch.Tensor],
+        indexer_k: torch.Tensor,
+        position_ids: torch.Tensor,
+        wq_b_out: Optional[torch.Tensor] = None,
     ):
-        """Project Q/K and apply RoPE"""
-        q = self.wq_b(qr)
+        """Project Q/K and apply RoPE.
+
+        ``wq_b_out``: the already computed ``wq_b(qr)`` (``pre_indexer_proj``
+        runs that GEMM once, before choosing the fused / chain prologue).
+        """
+        q = wq_b_out if wq_b_out is not None else self.wq_b(qr)
         k = self.k_norm(indexer_k)
         q = q.view(-1, self.n_heads, self.head_dim)
         q_pe, q_nope = q.split([self.rope_dim, self.head_dim - self.rope_dim], dim=-1)
@@ -2113,13 +2146,22 @@ class Indexer(nn.Module):
         return fp8_out, scale
 
     def pre_indexer_proj(
-        self, qr: torch.Tensor, hidden_states: torch.Tensor, position_ids: torch.Tensor
+        self,
+        qr: torch.Tensor,
+        hidden_states: torch.Tensor,
+        position_ids: torch.Tensor,
+        k_cache_metadata: Optional[DSAtrtllmAttentionMetadata] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Pure token-wise projections (CUDA-graph-capturable).
+        """Token-wise projections with optional eager or whole-graph K-cache writes.
+
+        ``k_cache_metadata`` (eager / whole-graph callers only, never inside a
+        piecewise-captured op): lets the fused prologue write the K rows into the
+        indexer K cache directly; the caller must then use
+        ``update_k_cache_unless_prewritten`` instead of ``_update_k_cache``.
 
         Runs cublas_mm, qk_projection_and_rope, FP8/FP4 quantize, and weight
-        scaling.  Does NOT touch the k cache or any batch-specific metadata,
-        so this can safely run inside a captured CUDA graph partition.
+        scaling. Without ``k_cache_metadata``, this does not access the K cache
+        or batch-specific metadata and can run inside a captured graph partition.
 
         Returns (q_fp_bytes, k_fp_bytes, k_scale, weights, q_scale). The last
         tensor is only consumed by the FP4 kernel dispatch; the FP8 path
@@ -2156,11 +2198,110 @@ class Indexer(nn.Module):
                 # which uses its own handle and always falls back to CUDA-core SGEMM.
                 fused_out = F.linear(_to_float(hidden_states_bf), self._fused_wk_wp_weight)
         indexer_k, weights = fused_out.split([self.head_dim, self.n_heads], dim=-1)
+        q_in = self.wq_b(qr)
+        if self._fused_prologue_eligible(q_in, indexer_k, weights, hidden_states_bf.dtype):
+            return self._prologue_fused(indexer_k, weights, q_in, position_ids, k_cache_metadata)
+        return self._prologue_chain(indexer_k, weights, q_in, position_ids, hidden_states_bf.dtype)
+
+    def _fused_prologue_eligible(
+        self,
+        q_in: torch.Tensor,
+        indexer_k: torch.Tensor,
+        weights: torch.Tensor,
+        model_dtype: torch.dtype,
+    ) -> bool:
+        """FP8 indexer with the flashinfer RoPE path: the shapes/dtypes the fused kernel mirrors."""
+        if not _prologue.FUSED_PROLOGUE_ENABLED or self.use_fp4 or self.head_dim != 128:
+            return False
+        # Subclasses that restructure the Q/K projection keep their own path.
+        cls = type(self)
+        if (
+            cls._qk_projection_and_rope is not Indexer._qk_projection_and_rope
+            or cls._prep_q_or_k is not Indexer._prep_q_or_k
+        ):
+            return False
+        cos_sin = getattr(self.rotary_emb, "rotary_cos_sin", None)
+        return (
+            IS_FLASHINFER_AVAILABLE
+            and not getattr(self.rotary_emb, "inverse", False)
+            and isinstance(cos_sin, torch.Tensor)
+            and cos_sin.is_cuda
+            and cos_sin.dtype == torch.float32
+            and self.rope_dim % 2 == 0
+            and 0 < self.rope_dim <= self.head_dim
+            and model_dtype == torch.bfloat16
+            and q_in.dtype == torch.bfloat16
+            and q_in.dim() == 2
+            and q_in.stride(-1) == 1
+            and indexer_k.dtype in (torch.bfloat16, torch.float32)
+            and indexer_k.stride(-1) == 1
+            and weights.stride(-1) == 1
+        )
+
+    def _prologue_fused(
+        self,
+        indexer_k: torch.Tensor,
+        weights: torch.Tensor,
+        q_in: torch.Tensor,
+        position_ids: torch.Tensor,
+        k_cache_metadata: Optional[DSAtrtllmAttentionMetadata],
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """k_norm + RoPE + FP8 quant (Q, K) + weight scaling [+ K-cache write] in one launch."""
+        n_rows = indexer_k.shape[0]
+        k_cache = slot_fp8 = slot_scale = None
+        n_write = 0
+        md = k_cache_metadata
+        if (
+            md is not None
+            and not is_piecewise_running()
+            and not torch.compiler.is_compiling()
+            and md.kv_cache_manager is not None
+            and md.slot_mapping_fp8 is not None
+            and md.slot_mapping_scale is not None
+            and 0 < md.num_tokens <= n_rows
+        ):
+            k_cache = md.kv_cache_manager.get_indexer_k_cache_buffers(self.layer_idx)
+            slot_fp8 = md.slot_mapping_fp8
+            slot_scale = md.slot_mapping_scale
+            n_write = md.num_tokens
+        cos_sin = self.rotary_emb.rotary_cos_sin
+        q_fp8, k_fp8, k_scale, weights_out, q_scale = _prologue.dsa_indexer_prologue_fused(
+            indexer_k,
+            weights,
+            q_in.view(n_rows, self.n_heads, self.head_dim),
+            position_ids.view(-1),
+            cos_sin.view(cos_sin.shape[0], -1),
+            self.k_norm.weight,
+            self.k_norm.bias,
+            self.k_norm.variance_epsilon,
+            self.weight_scale_factor,
+            self.rope_dim,
+            interleave=not self.rotary_emb.is_neox,
+            use_ue8m0=self.scale_fmt == "ue8m0",
+            k_cache=k_cache,
+            slot_mapping_fp8=slot_fp8,
+            slot_mapping_scale=slot_scale,
+            num_cache_tokens=n_write,
+        )
+        self._k_cache_prewritten_for = k_fp8 if n_write > 0 else None
+        return q_fp8, k_fp8, k_scale, weights_out, q_scale
+
+    def _prologue_chain(
+        self,
+        indexer_k: torch.Tensor,
+        weights: torch.Tensor,
+        q_in: torch.Tensor,
+        position_ids: torch.Tensor,
+        model_dtype: torch.dtype,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Original per-kernel chain (TRTLLM_DSA_INDEXER_FUSED_PROLOGUE=0 / ineligible shapes)."""
         # Cast indexer_k back to model dtype for downstream ops (k_norm, RoPE,
         # FP8 quantize); a no-op when the projection already ran in the model dtype.
-        indexer_k = indexer_k.to(hidden_states_bf.dtype)
+        indexer_k = indexer_k.to(model_dtype)
 
-        q_pe, q_nope, k_pe, k_nope = self._qk_projection_and_rope(qr, indexer_k, position_ids)
+        q_pe, q_nope, k_pe, k_nope = self._qk_projection_and_rope(
+            None, indexer_k, position_ids, wq_b_out=q_in
+        )
         q, k = maybe_execute_in_parallel(
             lambda: self._prep_q_or_k(q_pe, q_nope),
             lambda: self._prep_q_or_k(k_pe, k_nope),
@@ -2242,10 +2383,10 @@ class Indexer(nn.Module):
         position_ids: torch.Tensor,
     ):
         q_fp8, k_fp8, k_scale, weights, q_scale = self.pre_indexer_proj(
-            qr, hidden_states, position_ids
+            qr, hidden_states, position_ids, k_cache_metadata=metadata
         )
         indexer_intermediates = [q_fp8, k_fp8, k_scale, weights, q_scale]
-        self._update_k_cache(k_fp8, k_scale, metadata)
+        self.update_k_cache_unless_prewritten(k_fp8, k_fp8, k_scale, metadata)
 
         # Return topk indices buffer for sparse attention [num_tokens, index_topk]
         return self.forward_from_projected(metadata, hidden_states, indexer_intermediates)

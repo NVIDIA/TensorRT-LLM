@@ -177,7 +177,11 @@ def forward_sparse_attn(
             standard output at index zero.
     """
     output = attn_output[0]
-    proj_outputs = forward_dsa_proj(self, position_ids, hidden_states, attn_metadata)
+    # Eager / whole-graph path: Op 1 and Op 2 run back to back in this frame,
+    # so the fused indexer prologue may write the K cache in Op 1.
+    proj_outputs = forward_dsa_proj(
+        self, position_ids, hidden_states, attn_metadata, allow_k_cache_write=True
+    )
     q, compressed_kv, k_pe, latent_cache = proj_outputs[:4]
     indexer_intermediates = proj_outputs[4:]
     _forward_dsa_attn(
@@ -235,8 +239,13 @@ def forward_dsa_proj(
     position_ids: Optional[torch.Tensor],
     hidden_states: torch.Tensor,
     attn_metadata: AttentionMetadata,
+    allow_k_cache_write: bool = False,
 ) -> List[torch.Tensor]:
     """Token-wise projections for DSA MLA (CUDA-graph-capturable Op 1).
+
+    ``allow_k_cache_write`` (only the non-custom-op forward_sparse_attn path):
+    the fused indexer prologue (TRTLLM_DSA_INDEXER_FUSED_PROLOGUE) may scatter
+    the new K rows into the indexer K cache here instead of in Op 2.
 
     Runs kv_a_proj, layernorms, q_b_proj, and conditionally
     indexer.pre_indexer_proj().
@@ -289,7 +298,10 @@ def forward_dsa_proj(
     # as a 5th element so the FP4 dispatch can forward it to the kernel;
     # the FP8 path ignores it in _forward_dsa_attn.
     q_fp8, k_fp8, k_scale, weights, q_scale = self.mqa.indexer.pre_indexer_proj(
-        qr, hidden_states, position_ids
+        qr,
+        hidden_states,
+        position_ids,
+        k_cache_metadata=attn_metadata if allow_k_cache_write else None,
     )
 
     return [
@@ -344,18 +356,19 @@ def _forward_dsa_attn(
     )
 
     if not (use_short_mha_for_ctx and num_generations == 0) and self.mqa.indexer is not None:
-        q_fp8, k_fp8, k_scale, weights, q_scale = indexer_intermediates
+        q_fp8, k_fp8_full, k_scale, weights, q_scale = indexer_intermediates
         # Slice indexer intermediates to actual num_tokens (they were
         # computed on the full padded tensor in Op 1).
         q_fp8 = q_fp8[:num_tokens, ...]
-        k_fp8 = k_fp8[:num_tokens, ...]
+        k_fp8 = k_fp8_full[:num_tokens, ...]
         k_scale = k_scale[:num_tokens, ...]
         weights = weights[:num_tokens, ...]
         q_scale = q_scale[:num_tokens, ...]
         indexer_intermediates = [q_fp8, k_fp8, k_scale, weights, q_scale]
         # Update the full mixed batch once before context/generation prediction
         # splits. Context chunk gathers must observe the newly appended keys.
-        self.mqa.indexer._update_k_cache(k_fp8, k_scale, attn_metadata)
+        # (skipped when the fused prologue already wrote these rows in Op 1)
+        self.mqa.indexer.update_k_cache_unless_prewritten(k_fp8_full, k_fp8, k_scale, attn_metadata)
     else:
         indexer_intermediates = None
 
