@@ -466,7 +466,7 @@ class CuteDslMlaFmha(PhasedFmha):
         local_layer_idx = attn.get_local_layer_idx(meta)
         pool_idx = int(pool_mapping[local_layer_idx, 0])
         page_table_layer = block_offsets[pool_idx, :, 0, :]
-        cache_seqs_base = params.sequence_lengths.to(torch.int32)
+        cache_seqs_base = params.sequence_lengths[:batch_size].to(torch.int32)
         # The page-table batch dimension determines the kernel launch batch.
         page_table = (
             page_table_layer[meta.num_contexts : meta.num_contexts + batch_size]

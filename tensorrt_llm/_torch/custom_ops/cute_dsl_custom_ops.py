@@ -12366,6 +12366,17 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
             # workspace = lse + split_kv_workspace
             batch_size = cache_seqs.shape[0]
+            # The kernel launches one request per page-table column, so a
+            # wider table would read q, o and cache_seqs past their ends.
+            if (page_table.shape[1] != batch_size
+                    or q_latent.shape[3] != batch_size
+                    or o.shape[3] != batch_size):
+                raise RuntimeError(
+                    "CuteDSLNVMlaDecodeBlackwellRunner requires page_table "
+                    "(max_blocks, B), q_latent and o (..., B) to agree with "
+                    f"cache_seqs (B,), got B={batch_size}, page_table="
+                    f"{tuple(page_table.shape)}, q_latent="
+                    f"{tuple(q_latent.shape)}, o={tuple(o.shape)}.")
             d_latent = q_latent.shape[1]
             softmax_stats_kernel = None
             if softmax_stats is not None:
