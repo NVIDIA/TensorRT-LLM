@@ -14131,7 +14131,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                             raise ValueError(
                                 f"bias must be a 1-D tensor of shape [N]={c_tensor.shape[-1]}, "
                                 f"got shape {tuple(bias.shape)}")
-                        c_tensor = c_tensor + bias
+                        c_tensor.add_(bias)
                     return c_tensor
                 elif locality_domain_half_gemm:
                     # c already written via stride — no copy needed
