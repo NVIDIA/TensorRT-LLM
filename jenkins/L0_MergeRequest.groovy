@@ -216,7 +216,7 @@ def BOLT_CONSUME = "bolt_consume"
 // `"bolt_consume": true` opts in a single run without one. Either way
 // resolveBoltConsume() still applies the post-merge and branch restrictions.
 @Field
-def ENABLE_BOLT_PREMERGE_CONSUME = false
+def ENABLE_BOLT_PREMERGE_CONSUME = true
 // Version-controlled rollout switch for post-merge BOLT, same idiom as above.
 //
 // Post-merge cannot use the pre-merge shape, where the BOLTed build REPLACES the
@@ -1651,9 +1651,9 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         "tensorrt_llm/_torch/pyexecutor/model_engine.py",
         "tensorrt_llm/_torch/pyexecutor/py_executor.py",
         "tensorrt_llm/_torch/weight_sharing/",
-        "tensorrt_llm/_torch/visual_gen/attention_backend/parallel.py",
+        "tensorrt_llm/_torch/visual_gen/attention/backends/parallel.py",
         "tensorrt_llm/_torch/visual_gen/modules/vae/",
-        "tensorrt_llm/_torch/visual_gen/modules/attention.py",
+        "tensorrt_llm/_torch/visual_gen/attention/attention.py",
         "tensorrt_llm/_torch/visual_gen/executor.py",
         "tensorrt_llm/_torch/visual_gen/mapping.py",
         "tensorrt_llm/_torch/visual_gen/pipeline.py",

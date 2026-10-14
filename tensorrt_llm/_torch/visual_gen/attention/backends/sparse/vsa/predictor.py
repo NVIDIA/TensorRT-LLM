@@ -21,8 +21,8 @@ from typing import Optional
 
 import torch
 
-from .....attention.backends.interface import PredefinedAttentionMask
-from .....attention.backends.sparse.params import BlockSparseForwardInputs
+from ......attention.backends.interface import PredefinedAttentionMask
+from ......attention.backends.sparse.params import BlockSparseForwardInputs
 from .kernels import blend_coarse_fine, sort_last_dim, tile_and_pool_cubes
 from .metadata import VSA_BLOCK_SIZE, VSAMetadata, get_vsa_forward_context
 

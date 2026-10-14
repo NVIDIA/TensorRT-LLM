@@ -149,6 +149,15 @@ commands:
         is_flag: true
         flags:
         - "--enable_locality_domains"
+      enable_sleep_mode:
+        type: bool
+        default: false
+        status: prototype
+        required: false
+        multiple: false
+        is_flag: true
+        flags:
+        - "--enable_sleep_mode"
       enable_visual_gen:
         type: bool
         default: false
@@ -360,6 +369,15 @@ commands:
         is_flag: false
         flags:
         - "--num_media_load_workers"
+      openengine_enable_load_metrics:
+        type: bool
+        default: false
+        status: prototype
+        required: false
+        multiple: false
+        is_flag: true
+        flags:
+        - "--openengine-enable-load-metrics"
       otlp_traces_endpoint:
         type: str
         default: null

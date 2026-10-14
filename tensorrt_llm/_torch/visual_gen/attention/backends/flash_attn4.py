@@ -25,7 +25,7 @@ from typing import Optional, Tuple
 
 import torch
 
-from ...attention.backends.interface import PredefinedAttentionMask
+from ....attention.backends.interface import PredefinedAttentionMask
 from .interface import AttentionBackend, AttentionTensorLayout
 
 # 2CTA regresses long sequences; must precede the import below.
