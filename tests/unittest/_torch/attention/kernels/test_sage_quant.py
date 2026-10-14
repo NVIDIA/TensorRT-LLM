@@ -356,6 +356,41 @@ def test_sage_quantize_v_extrema_order_negative_zero() -> None:
     torch.testing.assert_close(actual.v_scale[0], expected, rtol=1e-6, atol=0)
 
 
+@pytest.mark.parametrize("quant_dtype", [torch.int8, torch.float8_e4m3fn])
+def test_sage_quantize_smoothing_is_bitwise_reproducible(quant_dtype: torch.dtype) -> None:
+    # Long sequences spread every mean over the most warps; summed with float atomics, the means
+    # and with them the quantized K and V would change from call to call.
+    generator = torch.Generator(device="cuda").manual_seed(5)
+    lengths = [9000, 4097, 7001]
+    q = _ragged(lengths, 4, 128, generator)
+    k = _ragged(lengths, 4, 128, generator)
+    v = _ragged(lengths, 4, 128, generator)
+    cu_seqlens = _cu_seqlens(lengths)
+
+    def quantize():
+        return sage_quantize(
+            q,
+            k,
+            v,
+            cu_seqlens,
+            cu_seqlens,
+            q_block_size=1,
+            k_block_size=16,
+            qk_quant_dtype=quant_dtype,
+            smooth_k=True,
+            smooth_v=True,
+        )
+
+    # Q does not use the means; the K scales are checked through K, as their buffer also holds
+    # slots that are never written.
+    first = quantize()
+    for _ in range(4):
+        again = quantize()
+        for name in ("k", "v", "v_scale", "k_mean", "v_mean"):
+            expected, actual = getattr(first, name), getattr(again, name)
+            assert torch.equal(expected.view(torch.uint8), actual.view(torch.uint8)), name
+
+
 @pytest.mark.parametrize("block_size", [2, 3, 64])
 def test_sage_quantize_rejects_unsupported_block_sizes(block_size: int) -> None:
     x = torch.zeros(16, 2, 128, device="cuda", dtype=torch.bfloat16)
