@@ -7,7 +7,7 @@ import threading
 from collections import deque
 from concurrent.futures import CancelledError, Future
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, call
 
 import pytest
 import zmq
@@ -222,12 +222,13 @@ def test_sync_multiple_failures_send_one_response():
     assert queue.sent == [first_error]
 
 
-def test_next_batch_waits_for_every_previous_future():
+def test_next_batch_waits_for_every_previous_future() -> None:
     pending = Future()
-    queue = _Queue([mpi.RemoteTask(_task, (0,), {}), mpi.RemoteTask(_task, (1,), {}, True)])
+    messages = [mpi.RemoteTask(_task, (0,), {}), mpi.RemoteTask(_task, (1,), {}, True)]
+    queue = _Queue(messages)
     server = _server(queue, [[_future(0), pending], [_future(1), _future(1)]])
 
-    def advance(queue):
+    def advance(queue: _Queue) -> None:
         if queue.polls == 3:
             assert server.session.submit.call_count == 1
             pending.set_result(0)
@@ -236,7 +237,10 @@ def test_next_batch_waits_for_every_previous_future():
 
     queue.on_poll = advance
     server.serve()
-    assert [call.args[2] for call in server.session.submit.call_args_list] == [0, 1]
+    assert server.session.submit.call_args_list == [
+        call(server.task_wrapper, message.sys_path, message.task, *message.args, **message.kwargs)
+        for message in messages
+    ]
     assert queue.sent == [[1, 1]]
 
 
@@ -252,20 +256,24 @@ def test_sync_error_bounds_peer_drain(monkeypatch):
     server._shutdown_session.assert_called_once()
 
 
-def test_stop_drains_preceding_async_batches():
+def test_stop_drains_preceding_async_batches() -> None:
     pending = Future()
 
-    def release_first_batch_at_stop(queue):
+    def release_first_batch_at_stop(queue: _Queue) -> None:
         if queue.polls == 4:
             pending.set_result(0)
 
+    messages = [mpi.RemoteTask(_task, (i,), {}) for i in range(3)]
     queue = _Queue(
-        [mpi.RemoteTask(_task, (i,), {}) for i in range(3)] + [None],
+        messages + [None],
         on_poll=release_first_batch_at_stop,
     )
     server = _server(queue, [[_future(0), pending], [_future(1)] * 2, [_future(2)] * 2])
     server.serve()
-    assert [call.args[2] for call in server.session.submit.call_args_list] == [0, 1, 2]
+    assert server.session.submit.call_args_list == [
+        call(server.task_wrapper, message.sys_path, message.task, *message.args, **message.kwargs)
+        for message in messages
+    ]
     server._shutdown_session.assert_called_once()
     assert queue.closed
 

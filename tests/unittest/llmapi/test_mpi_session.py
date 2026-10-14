@@ -25,7 +25,11 @@ from tensorrt_llm.llmapi.mpi_session import (_DEFAULT_IDENTITY_TIMEOUT,
                                              split_mpi_env)
 
 
-def task0():
+def task0() -> int:
+    from mpi4py import MPI
+
+    # Keep each worker occupied until every worker has received its task.
+    MPI.COMM_WORLD.barrier()
     if MPINodeState.state is None:
         MPINodeState.state = 0
     MPINodeState.state += 1
@@ -39,16 +43,19 @@ def _enable_mpi(monkeypatch):
 
 @pytest.mark.cpu_only
 @pytest.mark.skipif(not ENABLE_MULTI_DEVICE, reason="multi-device required")
-def test_mpi_session_basic():
+def test_mpi_session_basic() -> None:
     from tensorrt_llm.llmapi.mpi_session import MpiPoolSession
 
     n_workers = 4
-    executor = MpiPoolSession(n_workers)
-    results = executor.submit_sync(task0)
-    assert results == [1, 1, 1, 1], results
+    executor = MpiPoolSession(n_workers, wait_shutdown=True)
+    try:
+        results = executor.submit_sync(task0)
+        assert results == [1, 1, 1, 1], results
 
-    results = executor.submit_sync(task0)
-    assert results == [2, 2, 2, 2], results
+        results = executor.submit_sync(task0)
+        assert results == [2, 2, 2, 2], results
+    finally:
+        executor.shutdown()
 
 
 def rendezvous_environment_probe():
