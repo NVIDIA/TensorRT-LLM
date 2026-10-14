@@ -55,6 +55,9 @@ def _compare(out: torch.Tensor, ref: torch.Tensor) -> None:
 
 DEV = "cuda"
 ENGINE_MAX_SEQ_LEN = 8192
+FP8 = torch.float8_e4m3fn
+#: The e4m3fn NaN bit pattern (and, with the sign bit, 0xFF).
+E4M3_NAN = 0x7F
 
 _KERNELS = {
     "_qsa_paged_sparse_gqa_kernel": "prefill",
@@ -488,3 +491,84 @@ def test_selection_width_is_checked_on_the_prefill_kernel_only() -> None:
     args, _ = _build(_with(segments=((200, 100),), prefill_pair=True), seed=9400)
     args["selected_tokens"] = args["selected_tokens"][:, :64].contiguous()
     _compare(op(**args), op.reference(**args))
+
+
+# --------------------------------------------------------------------------
+# an fp8 pool is read at face value
+# --------------------------------------------------------------------------
+
+
+def _every_finite_e4m3_code():
+    """The 256 e4m3fn codes as bytes, the two NaN codes replaced by +0."""
+    codes = torch.arange(256, dtype=torch.int32, device=DEV).to(torch.uint8)
+    return torch.where((codes & 0x7F) == E4M3_NAN, torch.zeros_like(codes), codes)
+
+
+def _two_token_rows(kernel, seed):
+    """Rows at position 1 of a request each, on an fp8 pool: every row's
+    selection is tokens 0 and 1, both on the request's first page."""
+    rows = 300 if kernel == "prefill" else 12
+    spec = _with(
+        segments=((1, 1),) * rows,
+        slots=rows + 8,
+        prefill_pair=kernel == "prefill",
+        cache_dtype=FP8,
+    )
+    args, _ = _build(spec, seed)
+    pages = args["block_table"][args["request_indices"].long(), 0].long()
+    return args, pages
+
+
+@pytest.mark.parametrize("kernel", ["prefill", "splitk"])
+def test_fp8_values_are_read_at_face_value(kernel, launches) -> None:
+    """Token 0's V row holds every finite code, token 1's is zero, and q is
+    zero, so each output row is exactly half of token 0's row: no scale, and
+    the widening to bf16 is exact for every code, subnormals included."""
+    args, pages = _two_token_rows(kernel, seed=12000)
+    codes = _every_finite_e4m3_code()
+    values = args["v_cache"].view(torch.uint8)
+    values[pages, :, 0, :] = codes
+    values[pages, :, 1, :] = 0
+    args["q"].zero_()
+    out = op(**args)
+    assert launches[0][0] == kernel
+    expected = codes.view(FP8).to(torch.bfloat16) / 2
+    assert torch.equal(out, expected.expand_as(out))
+    _compare(out, op.reference(**args))
+
+
+@pytest.mark.parametrize("kernel", ["prefill", "splitk"])
+def test_fp8_keys_are_read_at_face_value(kernel, launches) -> None:
+    """Token 0's K row holds every finite code, token 1's is zero, and each
+    (row, head) queries one element of token 0's row with a one-hot power of
+    two sized so the logit lands near +-8. Every product is exact, and each
+    output row is token 0's softmax weight for one code. A reference that
+    flushed K's 14 subnormal codes to zero moves their weights to 0.5 and is
+    rejected, so the gate sees a misread of a single code."""
+    args, pages = _two_token_rows(kernel, seed=12100)
+    codes = _every_finite_e4m3_code()
+    keys, values = args["k_cache"].view(torch.uint8), args["v_cache"].view(torch.uint8)
+    keys[pages, :, 0, :] = codes
+    keys[pages, :, 1, :] = 0
+    values[pages, :, 0, :] = torch.tensor(1.0, device=DEV).to(FP8).view(torch.uint8)
+    values[pages, :, 1, :] = 0
+    q = args["q"]
+    rows, heads, dim = q.shape
+    assert rows * heads >= dim, "every code must be read by some (row, head)"
+    magnitude = codes.view(FP8).float().abs()
+    # |q . k| * softmax_scale = 128 / 16 = 8 up to the power-of-two rounding.
+    scale = torch.where(magnitude > 0, torch.exp2(torch.round(torch.log2(128.0 / magnitude))), 1.0)
+    column = (torch.arange(rows * heads, device=DEV) % dim).reshape(rows, heads, 1)
+    q.zero_()
+    q.scatter_(2, column, scale[column].to(q.dtype))
+    out = op(**args)
+    assert launches[0][0] == kernel
+    _compare(out, op.reference(**args))
+
+    subnormal = ((codes & 0x78) == 0) & ((codes & 0x07) != 0)
+    assert int(subnormal.sum()) == 14
+    flushed = args["k_cache"].clone()
+    flushed.view(torch.uint8)[pages, :, 0, :] = torch.where(subnormal, codes & 0x80, codes)
+    wrong = op.reference(**{**args, "k_cache": flushed})
+    with pytest.raises(AssertionError):
+        _compare(out, wrong)

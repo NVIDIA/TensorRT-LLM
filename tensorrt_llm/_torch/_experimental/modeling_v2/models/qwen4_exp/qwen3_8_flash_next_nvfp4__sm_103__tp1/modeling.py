@@ -47,6 +47,11 @@ Integration facts this file depends on:
    ``Qwen3VLInputProcessorBase``. This target asserts every ``multimodal_data`` key
    where it is read.
 
+**KV storage.** The paged K/V pool holds the checkpoint's bf16, or fp8-e4m3 when the engine
+resolves ``kv_cache_quant_algo: FP8`` (``kv_cache_config.dtype: fp8``): a lossy substitution, since
+the checkpoint's KV is bf16 and the fp8 attention kernels run q, K, V and the softmax
+probabilities through e4m3. The QSA index and position planes keep their own types under both.
+
 **Host offload.** By default the PLE table lives in host memory the device
 addresses (`weights._host_resident_empty`), and the gather reads it unchanged;
 ``TRTLLM_MODELING_V2_PLE_HOST_OFFLOAD=0`` restores the resident declaration. Output
@@ -71,6 +76,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.fused_qk_no
     fused_qk_norm_rope,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.thop_attention import (
+    QM_FP8_KV_CACHE,
     thop_attention,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.cublas_mm import cublas_mm
@@ -87,6 +93,7 @@ from tensorrt_llm._torch.models.modeling_utils import DecoderModel, DecoderModel
 from tensorrt_llm._torch.modules.fla.cached_replay import CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE
 from tensorrt_llm._torch.speculative import get_spec_worker, should_use_separate_draft_kv_cache
 from tensorrt_llm._torch.utils import ActivationType
+from tensorrt_llm.quantization.mode import QuantAlgo
 
 from . import weights as _weights
 from .ops.activation.fused_sigmoid_mul_inplace import fused_sigmoid_mul_inplace
@@ -166,10 +173,10 @@ _MAMBA_FIELDS = (
 
 
 # Per-call constants of the dense attention call shape: packed-QKV causal GQA, RoPE
-# applied outside (fused_qk_norm_rope), bf16 pool. The sparse / skip-softmax group
-# stays None/0: QSA calls selection and sparse attention as separate kernels and
-# `num_sparse_topk` is 0. `quant_mode` and `predicted_tokens_per_seq` are passed
-# beside these.
+# applied outside (fused_qk_norm_rope), bf16 or fp8-e4m3 pool. The sparse / skip-softmax
+# group stays None/0: QSA calls selection and sparse attention as separate kernels and
+# `num_sparse_topk` is 0. `quant_mode`, the two KV scales (all three follow the pool's
+# storage) and `predicted_tokens_per_seq` are passed beside these.
 _CALL_CONSTANTS = dict(
     output_sf=None,
     k=None,
@@ -181,9 +188,6 @@ _CALL_CONSTANTS = dict(
     mask_type=1,
     q_scaling=1.0,
     attention_sinks=None,
-    # bf16 pool: no KV scale.
-    kv_scale_orig_quant=None,
-    kv_scale_quant_orig=None,
     # In-kernel RoPE disabled; rope_* values are inert placeholders.
     position_embedding_type=0,
     rotary_inv_freq=None,
@@ -481,6 +485,7 @@ class _PoolGeometry(NamedTuple):
     ple_state_len: int
     ngram_context_len: int
     dtype: torch.dtype  # the activation dtype
+    kv_dtype: torch.dtype  # the paged K/V pool's dtype: bf16, or e4m3 under an fp8 KV cache
 
 
 class _Replay(NamedTuple):
@@ -553,7 +558,7 @@ def check_attention_pools(g: _PoolGeometry, layer: int, index_cache, pool) -> No
     _check_pool(index_cache, f"layer {layer}: QSA index plane", 1, index_shape, g.dtype)
     # The sparse path needs adjacent HND K/V role planes: [pages, 2, H, block, D].
     kv_shape = (g.heads_kv, g.tokens_per_block, g.head_dim)
-    _check_pool(pool, f"layer {layer}: paged K/V", 2, kv_shape)
+    _check_pool(pool, f"layer {layer}: paged K/V", 2, kv_shape, g.kv_dtype)
     assert pool.shape[1] == 2, f"layer {layer}: paged K/V has {pool.shape[1]} role planes, not 2"
 
 
@@ -1079,16 +1084,22 @@ class Qwen4ExpTp1ModelingV2(DecoderModel):
             "must publish them as `multimodal_token_ids`"
         )
 
-        # ---- KV pool dtype --------------------------------------------------
-        # An unsupported KV dtype makes the QSA backend silently fall back to dense
-        # (`QSA_SPARSE_KV_CACHE_DTYPES`).
+        # ---- KV pool storage ------------------------------------------------
+        # `None` keeps the checkpoint's bf16 K/V (`quant_mode` 0); `FP8`, what
+        # `kv_cache_config.dtype: fp8` resolves to, stores them as e4m3 under
+        # QM_FP8_KV_CACHE. Anything else is refused: the QSA backend serves its sparse path
+        # only over half, bf16 and fp8 pools (`QSA_SPARSE_KV_CACHE_DTYPES`) and silently
+        # falls back to dense otherwise. The index and position planes are kernel contracts,
+        # not KV storage, and keep their types under both.
         kv_algo = model_config.quant_config.kv_cache_quant_algo
-        assert kv_algo is None, (
-            f"this target runs the checkpoint's own bf16 KV pool, which is what "
-            f"the accuracy reference was measured at and what the QSA sparse "
-            f"path requires; the engine resolved kv_cache_quant_algo {kv_algo!r}"
+        assert kv_algo is None or kv_algo == QuantAlgo.FP8, (
+            f"this target stores K/V as the checkpoint's bf16 (kv_cache_quant_algo None) "
+            f"or as fp8-e4m3 (FP8); the engine resolved kv_cache_quant_algo {kv_algo!r}"
         )
-        self.quant_mode = 0
+        self.quant_mode = 0 if kv_algo is None else QM_FP8_KV_CACHE
+        # What `check_attention_pools` holds every manager's K/V pool to, the draft layer's
+        # included.
+        self.kv_pool_dtype = dt if kv_algo is None else torch.float8_e4m3fn
         # The weight table reads the tower's geometry off this.
         self.vision_config = vcfg
 
@@ -1162,6 +1173,12 @@ class Qwen4ExpTp1ModelingV2(DecoderModel):
         self._moe_scalars: list | None = None
         self._gdn_gating: dict | None = None
         self._cos_sin: torch.Tensor | None = None
+        # The attention op's KV scales: fp32 [1] ones over an fp8 pool (never None there: the
+        # generation kernels read `kvCacheScale[0]`), None over bf16. Unit, because the QSA
+        # store and sparse GQA take no scale while a request's history is written by the dense
+        # and the sparse path alike, so the two agree on what a slot holds only at 1.0.
+        self.kv_scale_orig_quant: torch.Tensor | None = None
+        self.kv_scale_quant_orig: torch.Tensor | None = None
         # MTP module operands; None with speculation off.
         self._mtp: _MtpWeights | None = None
         self._mtp_cos_sin: torch.Tensor | None = None
@@ -1279,6 +1296,10 @@ class Qwen4ExpTp1ModelingV2(DecoderModel):
                 if self.mtp_theta == self.theta
                 else self._index_rope_table(self.mtp_theta, device)
             )
+        if self.quant_mode == QM_FP8_KV_CACHE:
+            # Built here, not at construction: that runs under meta init.
+            self.kv_scale_quant_orig = torch.ones(1, dtype=torch.float32, device=device)
+            self.kv_scale_orig_quant = 1.0 / self.kv_scale_quant_orig
         self._report_ple_residency()
         if self.mtp_enabled:
             self._mtp = _mtp_views(self)
@@ -1355,6 +1376,7 @@ class Qwen4ExpTp1ModelingV2(DecoderModel):
             ple_state_len=self.ple_state_len,
             ngram_context_len=self.ngram_context_len,
             dtype=self.w["embed"].dtype,
+            kv_dtype=self.kv_pool_dtype,
         )
 
     def _bind_cache_manager(self, md, position_ids) -> None:
@@ -2321,7 +2343,9 @@ class PrefillTarget:
         if sparse:
             k_cache, v_cache = core._bound.kv[i]
             # Append the fused-norm+rope'd K/V here: nothing else writes the pool on
-            # this path, and selection reads the current token from it.
+            # this path, and selection reads the current token from it. Over an fp8 pool the
+            # store and the sparse GQA below take e4m3 unscaled, as the dense op does at the
+            # unit KV scales.
             qsa_paged_kv_store(
                 k_dst, v_dst, k_cache, v_cache, req_idx, logical, block_table, tokens_per_block
             )
@@ -2375,6 +2399,8 @@ class PrefillTarget:
                 num_kv_heads=core.heads_kv,
                 head_size=core.head_dim,
                 quant_mode=core.quant_mode,
+                kv_scale_orig_quant=core.kv_scale_orig_quant,
+                kv_scale_quant_orig=core.kv_scale_quant_orig,
                 **step,
                 **_CALL_CONSTANTS,
             )
@@ -3352,6 +3378,8 @@ class PrefillTarget:
                 num_kv_heads=core.heads_kv,
                 head_size=core.head_dim,
                 quant_mode=core.quant_mode,
+                kv_scale_orig_quant=core.kv_scale_orig_quant,
+                kv_scale_quant_orig=core.kv_scale_quant_orig,
                 **step,
                 **_CALL_CONSTANTS,
             )
@@ -3678,7 +3706,7 @@ class DecodeTarget:
         if sparse:
             k_cache, v_cache = core._bound.kv[i]
             # Append the fused-norm+rope'd K/V; the selection reads the current
-            # token from the pool.
+            # token from the pool. Unscaled over an fp8 pool, as in the prefill target.
             qsa_paged_kv_store(
                 k_dst, v_dst, k_cache, v_cache, req_idx, logical, block_table, tokens_per_block
             )
@@ -3730,6 +3758,8 @@ class DecodeTarget:
                 num_kv_heads=core.heads_kv,
                 head_size=core.head_dim,
                 quant_mode=core.quant_mode,
+                kv_scale_orig_quant=core.kv_scale_orig_quant,
+                kv_scale_quant_orig=core.kv_scale_quant_orig,
                 **step,
                 **_CALL_CONSTANTS,
             )
@@ -4504,6 +4534,8 @@ class DecodeTarget:
                 num_kv_heads=core.heads_kv,
                 head_size=core.head_dim,
                 quant_mode=core.quant_mode,
+                kv_scale_orig_quant=core.kv_scale_orig_quant,
+                kv_scale_quant_orig=core.kv_scale_quant_orig,
                 **step,
                 **_CALL_CONSTANTS,
             )

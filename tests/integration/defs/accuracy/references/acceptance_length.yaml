@@ -123,8 +123,9 @@ TestGLM53FlashFP8::test_mtp:
   ref_al: 3.384
   min_al: 3.215
 # Read by TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1::
-# test_mtp1_gsm8k_and_acceptance. Keyed by target and variant for the same
-# reason as the ModelingV2DeepseekR10528Nvfp4Sm103Dep4::mtp3 entry above.
+# test_mtp1_gsm8k_and_acceptance and test_mtp1_fp8_kv_gsm8k_and_acceptance.
+# Keyed by target and variant for the same reason as the
+# ModelingV2DeepseekR10528Nvfp4Sm103Dep4::mtp3 entry above.
 #
 # max_draft_len is 1 on this checkpoint (`mtp_num_hidden_layers: 1`, one module
 # replayed once per step), so acceptance length lives in [1.0, 2.0]: 1.0 is a

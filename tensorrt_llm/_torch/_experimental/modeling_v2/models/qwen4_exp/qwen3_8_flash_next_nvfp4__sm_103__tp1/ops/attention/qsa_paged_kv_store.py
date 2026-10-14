@@ -17,7 +17,9 @@ from tensorrt_llm._torch.attention.backends.sparse.qsa import kernels as _qsa_ke
 #: This checkpoint's main K/V geometry and the engine's QSA metadata. `heads_q`
 #: places k and v as head slices of the packed `[T, 24 + 2 + 2, 256]` QKV
 #: buffer; `slots` x `width` is `qsa_block_table` (max_num_sequences x
-#: max_blocks_per_seq). `pages` is the pool, independent of the batch.
+#: max_blocks_per_seq). `pages` is the pool, independent of the batch. `values`
+#: fills the rows: `every_bf16` is all 65536 bf16 bit patterns (needs 128 rows
+#: of 2 x 256).
 _CKPT = dict(
     hkv=2,
     head_dim=256,
@@ -32,7 +34,10 @@ _CKPT = dict(
     k_layout="qkv_slice",
     table_layout="dense",
     hole=None,
+    values="randn",
 )
+
+_F8 = torch.float8_e4m3fn
 
 _DECODE = ((0, 1), (31, 1), (32, 1), (33, 1), (100, 1), (255, 1), (7, 1), (64, 1))
 
@@ -61,10 +66,11 @@ class QsaPagedKvStore(OpWrapper):
     `logical_positions` is absolute, so prefill, decode and MTP rows are the
     same call. The store is a move, converted once to the pool's dtype
     (bitwise `Tensor.to`; an fp8-e4m3 pool saturates at 448 and takes no
-    scale). A row that resolves to no slot -- negative request, request past
-    the table, negative position, page column past the table, or a table
-    entry that is negative (`-1`, unallocated) or past the pool -- is skipped
-    without error. Returns `(k_cache, v_cache)`, both written in place.
+    scale, so a reader treats it as kv scale 1.0). A row that resolves to no
+    slot -- negative request, request past the table, negative position, page
+    column past the table, or a table entry that is negative (`-1`,
+    unallocated) or past the pool -- is skipped without error. Returns
+    `(k_cache, v_cache)`, both written in place.
 
     Fusion boundary: the scatter only. The K/V projection, norm and RoPE of
     K, the QSA index plane, selection and attention are the caller's; the
@@ -92,7 +98,24 @@ class QsaPagedKvStore(OpWrapper):
         ),
         Cell(
             why="fp8-e4m3 pool: the row rounded once",
-            spec=_spec(_DECODE, pages=64, cache_dtype=torch.float8_e4m3fn),
+            spec=_spec(_DECODE, pages=64, cache_dtype=_F8),
+        ),
+        # The prefill target's call over an fp8 pool (kv_cache_dtype=fp8, unit scale).
+        Cell(
+            why="fp8 prefill: 1024 rows, 4 requests x 256 walking 8 pages each",
+            spec=_spec(((0, 256),) * 4, pages=160, cache_dtype=_F8),
+        ),
+        Cell(
+            why="fp8 mixed: two context chunks and two decode rows, 66 rows",
+            spec=_spec(((0, 40), (0, 24), (200, 1), (7, 1)), pages=64, cache_dtype=_F8),
+        ),
+        Cell(
+            why="fp8 decode MTP: 4 requests x 2 rows, a pair straddling a page",
+            spec=_spec(((0, 2), (31, 2), (63, 2), (95, 2)), pages=32, cache_dtype=_F8),
+        ),
+        Cell(
+            why="fp8 conversion: all 65536 bf16 bit patterns, as torch casts them",
+            spec=_spec(((0, 128),), pages=8, cache_dtype=_F8, values="every_bf16"),
         ),
         Cell(
             why="fp16 rows into a bf16 pool: one conversion",

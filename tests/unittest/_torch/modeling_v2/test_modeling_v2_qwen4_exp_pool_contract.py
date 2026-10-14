@@ -34,7 +34,10 @@ G = M._PoolGeometry(
     ple_state_len=9,
     ngram_context_len=3,
     dtype=torch.bfloat16,
+    kv_dtype=torch.bfloat16,
 )
+# The same pools under an fp8 KV cache: K/V are e4m3, every other plane keeps its type.
+G_FP8 = G._replace(kv_dtype=torch.float8_e4m3fn)
 SLOTS = 6
 HISTORY = 16
 
@@ -64,6 +67,12 @@ def test_valid_pools_pass() -> None:
     M.check_position_plane(G, _t(9, 32, 3, dtype=torch.int32))
     M.check_attention_pools(
         G, 3, _t(9, 32, 1, 128), _t(9, 2, G.heads_kv, G.tokens_per_block, G.head_dim)
+    )
+    M.check_attention_pools(
+        G_FP8,
+        3,
+        _t(9, 32, 1, 128),
+        _t(9, 2, G.heads_kv, G.tokens_per_block, G.head_dim, dtype=torch.float8_e4m3fn),
     )
     M.check_recurrent_pools(G, _conv(), _ssm())
     M.check_ple_pools(
@@ -113,6 +122,23 @@ def test_attention_pools_reject_wrong_index_plane_and_kv_layout() -> None:
     # K and V not adjacent role planes.
     with pytest.raises(AssertionError, match="role planes"):
         M.check_attention_pools(G, 3, _t(9, 32, 1, 128), _t(9, 3, 2, 32, 256))
+
+
+def test_attention_pools_reject_the_other_storage_dtype() -> None:
+    """The attention op reads the pool through one `quant_mode`, so a pool of the other
+    storage would be read through the wrong format. The draft layer's bind runs the same check."""
+    index = _t(9, 32, 1, 128)
+    bf16_kv = _t(9, 2, G.heads_kv, G.tokens_per_block, G.head_dim)
+    fp8_kv = bf16_kv.to(torch.float8_e4m3fn)
+    with pytest.raises(AssertionError, match="paged K/V"):
+        M.check_attention_pools(G, 3, index, fp8_kv)
+    with pytest.raises(AssertionError, match="paged K/V"):
+        M.check_attention_pools(G, 3, index, bf16_kv.to(torch.float16))
+    with pytest.raises(AssertionError, match="paged K/V"):
+        M.check_attention_pools(G_FP8, 3, index, bf16_kv)
+    # The index plane is a kernel contract, not KV storage: bf16 under either algorithm.
+    with pytest.raises(AssertionError, match="QSA index plane"):
+        M.check_attention_pools(G_FP8, 3, index.to(torch.float8_e4m3fn), fp8_kv)
 
 
 def test_recurrent_pools_reject_wrong_key_dim_order_and_dtype() -> None:

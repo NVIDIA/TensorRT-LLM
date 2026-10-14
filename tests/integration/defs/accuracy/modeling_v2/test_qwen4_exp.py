@@ -84,7 +84,8 @@ class TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1(LlmapiAccuracyTestHarness):
 
     # `mamba_ssm_cache_dtype` is float32 because the checkpoint declares
     # `mamba_ssm_dtype: float32` (the engine default is bfloat16). `dtype` is
-    # left at the checkpoint's bf16 KV, which is what the anchors were measured at.
+    # left at the checkpoint's bf16 KV, which is what the anchors were measured at;
+    # only the fp8 KV case sets it.
     KV_CACHE = KvCacheConfig(
         free_gpu_memory_fraction=0.6,
         enable_block_reuse=True,
@@ -163,6 +164,38 @@ class TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1(LlmapiAccuracyTestHarness):
             task.evaluate(llm, extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
             acceptance_length = compute_acceptance_length(llm)
             print(f"[AL] mtp1 acceptance_length = {acceptance_length:.3f}")
+            assert_acceptance_length(self.ACCEPTANCE_KEY, acceptance_length)
+
+    @skip_not_sm103
+    def test_mtp1_fp8_kv_gsm8k_and_acceptance(self, mocker, monkeypatch):
+        """MTP with one draft over an fp8 KV cache: the FP8 KV row of references/gsm8k.yaml.
+
+        ``kv_cache_config.dtype="fp8"`` makes the engine resolve ``kv_cache_quant_algo`` FP8,
+        which the reference lookup keys on: this case reads the FP8 row where
+        ``test_mtp1_gsm8k_and_acceptance`` (no KV quantization) reads the bf16 MTP row. The
+        draft layer runs over the same fp8 pool, so the bf16 case's acceptance-length floor
+        applies unchanged.
+        """
+        mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN", self.GSM8K_MAX_OUTPUT_LEN)
+        engine = dict(self.ENGINE)
+        engine["kv_cache_config"] = KvCacheConfig(
+            dtype="fp8",
+            free_gpu_memory_fraction=0.6,
+            enable_block_reuse=True,
+            mamba_ssm_cache_dtype="float32",
+        )
+
+        with LLM(
+            self.MODEL_PATH,
+            speculative_config=self.MTP1,
+            enable_iter_perf_stats=True,
+            **engine,
+            **_require_target(monkeypatch, **_VALIDATE),
+        ) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm, extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+            acceptance_length = compute_acceptance_length(llm)
+            print(f"[AL] mtp1 fp8 kv acceptance_length = {acceptance_length:.3f}")
             assert_acceptance_length(self.ACCEPTANCE_KEY, acceptance_length)
 
     @skip_not_sm103

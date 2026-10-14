@@ -101,6 +101,13 @@ def _build(spec, seed: int):
     ).to(device=DEV, dtype=spec["row_dtype"])
     k = qkv[:, spec["heads_q"] : spec["heads_q"] + hkv]
     v = qkv[:, spec["heads_q"] + hkv :]
+    if spec["values"] == "every_bf16":
+        patterns = torch.arange(-(2**15), 2**15, dtype=torch.int32).to(torch.int16)
+        patterns = patterns.view(torch.bfloat16).reshape(rows, hkv, head_dim).to(DEV)
+        k.copy_(patterns)
+        v.copy_(patterns.flip(0))
+    else:
+        assert spec["values"] == "randn"
     if spec["k_layout"] == "head_major":
         k = k.transpose(1, 2).contiguous().transpose(1, 2)
         v = v.transpose(1, 2).contiguous().transpose(1, 2)

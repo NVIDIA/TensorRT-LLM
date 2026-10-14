@@ -5907,6 +5907,7 @@ _DRAFT_POOLS = [
     ("bf16 24/2/256", 2, torch.bfloat16, 0, None, SWA_WEIGHT_RTOL),
     ("bf16 24/4/256", 4, torch.bfloat16, 0, None, SWA_WEIGHT_RTOL),
     ("fp8 24/4/256", 4, torch.float8_e4m3fn, QUANT_MODE_FP8_KV_CACHE, 1.0, 2**-4),
+    ("fp8 24/2/256", 2, torch.float8_e4m3fn, QUANT_MODE_FP8_KV_CACHE, 1.0, 2**-4),
 ]
 
 
@@ -6226,7 +6227,11 @@ QWEN_ATTN_LAYERS = list(range(3, QWEN_NUM_LAYERS, 4))
 
 
 def _qwen_layer_pools(
-    attn_blocks: int = 48, other_blocks: int = 32, max_seq_len: int = 256, max_batch: int = 4
+    attn_blocks: int = 48,
+    other_blocks: int = 32,
+    max_seq_len: int = 256,
+    max_batch: int = 4,
+    **pool_kw,
 ) -> Tuple[_MultiLayerPagedAttnEnv, _MultiLayerPagedAttnEnv]:
     """The two pools of the hybrid mapping, at the full-attention cell.
 
@@ -6234,7 +6239,8 @@ def _qwen_layer_pools(
     rows name a real, distinct pool base and the untouched assertion has
     somewhere to look. Both managers take the same max_seq_len and max_batch,
     which makes their block-offset tables concatenable into the per-pool table
-    the op indexes by the mapping's pool column.
+    the op indexes by the mapping's pool column. `pool_kw` (dtype, quant_mode,
+    kv_scaling_factor) goes to both.
     """
     kw = dict(
         num_heads=QWEN_HQ,
@@ -6243,6 +6249,7 @@ def _qwen_layer_pools(
         tokens_per_block=QWEN_TPB,
         max_seq_len=max_seq_len,
         max_batch=max_batch,
+        **pool_kw,
     )
     attn = _MultiLayerPagedAttnEnv(num_layers=len(QWEN_ATTN_LAYERS), num_blocks=attn_blocks, **kw)
     other = _MultiLayerPagedAttnEnv(
@@ -7006,8 +7013,14 @@ def _cell_layered(cell, arm) -> None:
     row, p = spec["local_layer_idx"], spec["predicted_tokens_per_seq"]
     cached, new, nc = spec["cached"], spec["new"], spec["num_contexts"]
     assert all(cached), "the history call drives every sequence of the cell"
+    fp8 = bool(spec["quant_mode"] & QUANT_MODE_FP8_KV_CACHE)
+    pool_kw = (
+        dict(dtype=DataType.FP8, quant_mode=spec["quant_mode"], kv_scaling_factor=spec["kv_scale"])
+        if fp8
+        else {}
+    )
     if spec["pool_layout"] == "hybrid48":
-        env, other = _qwen_layer_pools(max_batch=spec["max_num_requests"])
+        env, other = _qwen_layer_pools(max_batch=spec["max_num_requests"], **pool_kw)
         layer = QWEN_ATTN_LAYERS.index(row)
     else:
         env = _MultiLayerPagedAttnEnv(
@@ -7019,6 +7032,7 @@ def _cell_layered(cell, arm) -> None:
             num_blocks=24,
             max_batch=spec["max_num_requests"],
             max_seq_len=128,
+            **pool_kw,
         )
         other, layer = None, row
 
@@ -7064,7 +7078,7 @@ def _cell_layered(cell, arm) -> None:
         predicted_tokens_per_seq=p,
         **tables(),
     )
-    _compare(out, _op_reference(env, qkv, list(new), rids, layer=layer))
+    _compare(out, _op_reference(env, qkv, list(new), rids, layer=layer, e4m3=fp8))
     env.check_caches(rids, layers=[layer])
     _assert_only_this_layer_moved(env, snapshot, layer, cell.why)
     for before, after in zip(other_before, [] if other is None else other.layer_views):

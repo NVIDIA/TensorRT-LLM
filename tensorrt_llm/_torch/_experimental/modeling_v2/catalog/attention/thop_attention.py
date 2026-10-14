@@ -63,6 +63,12 @@ _QWEN4_VISION = dict(
     mask_type=0,
 )
 
+#: The qwen4_exp full-attention call over an fp8-e4m3 pool at the production kv
+#: scale 1.0 (fp32 [1] scale tensors, quant_mode 128): what the trunk layers and
+#: the MTP draft layer pass when the engine serves an fp8 KV cache. Same chosen
+#: pool sizes as `_QWEN4_DENSE`.
+_QWEN4_FP8 = dict(_QWEN4_DENSE, quant_mode=QM_FP8_KV_CACHE, kv_scale=1.0)
+
 #: A GQA 24/4/256 full-attention layer (Qwen3.8-27B) over an fp8-e4m3 pool at
 #: the production kv scale 1.0. Same chosen pool sizes as `_QWEN4_DENSE`.
 _FP8_24_4_256 = dict(
@@ -90,8 +96,9 @@ class ThopAttention(OpWrapper):
     it, by different paths: gpt-oss on the standard path with attention sinks
     and an alternating sliding window, deepseek on MLA's two phases, and
     qwen4_exp on the standard path twice over -- its full-attention layers and
-    MTP module (GQA 24/2/256, a P-token draft block per generation sequence,
-    a two-pool hybrid mapping), and its vision tower with no KV cache at all.
+    MTP module (GQA 24/2/256 over a bf16 or an fp8-e4m3 pool, a P-token draft
+    block per generation sequence, a two-pool hybrid mapping), and its vision
+    tower with no KV cache at all.
 
     Writes rows `[:num_tokens]` of `output` and returns `output` -- the same
     buffer, mutated and handed back so a call site can show what it touched
@@ -422,6 +429,67 @@ class ThopAttention(OpWrapper):
                 predicted_tokens_per_seq=3,
             ),
         ),
+        # qwen4_exp's own geometry over an fp8 pool: the kv head count changes the compiled
+        # decode kernel, so the 24/4/256 cells above do not cover it.
+        Cell(
+            why="qwen4_exp fp8 pool paged-context prefill, 24/2/256: a fresh 48-row "
+            "sequence beside 33 rows over a 48-token e4m3 prefix",
+            spec=dict(
+                _QWEN4_FP8,
+                cached=(0, 48),
+                new=(48, 33),
+                num_contexts=2,
+                predicted_tokens_per_seq=1,
+            ),
+        ),
+        Cell(
+            why="qwen4_exp fp8 pool decode P=1, 24/2/256: histories 200 and 48 span "
+            "pages and KV tiles",
+            spec=dict(
+                _QWEN4_FP8,
+                cached=(200, 48),
+                new=(1, 1),
+                num_contexts=0,
+                predicted_tokens_per_seq=1,
+            ),
+        ),
+        *(
+            Cell(
+                why=f"qwen4_exp fp8 pool MTP verify P={p}, 24/2/256 (max_draft_len {p - 1})",
+                spec=dict(
+                    _QWEN4_FP8,
+                    cached=(70, 35),
+                    new=(p, p),
+                    num_contexts=0,
+                    predicted_tokens_per_seq=p,
+                ),
+            )
+            for p in (2, 4)
+        ),
+        Cell(
+            why="qwen4_exp fp8 pool mixed step P=3, 24/2/256: a 20-row context ahead "
+            "of two P=3 blocks over histories 31 and 64",
+            spec=dict(
+                _QWEN4_FP8,
+                cached=(0, 31, 64),
+                new=(20, 3, 3),
+                num_contexts=1,
+                predicted_tokens_per_seq=3,
+            ),
+        ),
+        Cell(
+            why="qwen4_exp fp8 hybrid pool P=2: row 47 of the 48-row two-pool mapping "
+            "(pool 0, layer-in-pool 11) over e4m3 slabs",
+            spec=dict(
+                _QWEN4_FP8,
+                pool_layout="hybrid48",
+                local_layer_idx=47,
+                cached=(64, 25),
+                new=(2, 2),
+                num_contexts=0,
+                predicted_tokens_per_seq=2,
+            ),
+        ),
     )
 
     note = """
@@ -472,10 +540,13 @@ class ThopAttention(OpWrapper):
     Over an fp8-e4m3 pool the packed context path reads the bf16 q rows and
     never the pool, while `use_paged_context_fmha=True` reads the pool, so its
     operands are e4m3: the flag is output-inert over a bf16 pool only. Every
-    fp8 cell runs kv scale 1.0; at 1.5 `reference` does not reproduce the
-    kernel's probability rounding.
+    fp8 cell runs kv scale 1.0 through fp32 [1] scale tensors; at 1.5 `reference`
+    does not reproduce the kernel's probability rounding.
     quant_mode 384, 1152, 4224 and 4480 are bit-identical to 128 at 24/4/256;
-    4352 (the same bits without FP8_KV_CACHE) reads e4m3 slabs as bf16.
+    4352 (the same bits without FP8_KV_CACHE) reads e4m3 slabs as bf16. At
+    24/2/256 only 128 was driven, with KV up to 200 keys: the fp8 kernels round
+    the softmax probabilities against a per-tile max, which the row-max model of
+    `reference(e4m3_probabilities=True)` approximates only that far.
 
     The sparse / skip-softmax arguments are bitwise inert in the standard
     configuration (nine off-default settings at 24/2/256): passing them does
