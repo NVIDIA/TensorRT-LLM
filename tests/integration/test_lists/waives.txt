@@ -164,7 +164,6 @@ unittest/_torch/kernels/parallel/test_fp4_linear.py::test_fp4_gemm_bias_per_back
 unittest/_torch/kernels/parallel/test_fp4_linear.py::test_fp4_gemm_bias_per_backend[mnk2-cutlass] SKIP (https://nvbugs/6581067)
 unittest/_torch/kernels/parallel/test_fp4_linear.py::test_fp4_gemm_bias_per_backend[mnk3-cublaslt] SKIP (https://nvbugs/6581067)
 unittest/_torch/kernels/parallel/test_fp4_linear.py::test_fp4_gemm_bias_per_backend[mnk3-cutlass] SKIP (https://nvbugs/6581067)
-unittest/_torch/modeling/test_modeling_nemotron_h_multimodal.py::test_nemotron_nano_v2_vl_image_batch_equivalence SKIP (https://nvbugs/6758946)
 unittest/_torch/modeling_v2 --ignore=unittest/_torch/modeling_v2/comm SKIP (https://nvbugs/7011673)
 unittest/_torch/modeling_v2/comm/test_modeling_v2_allgather_op_matrix.py::test_allgather_op_matrix SKIP (https://nvbugs/6843474)
 unittest/_torch/modeling_v2/comm/test_modeling_v2_reducescatter_op_matrix.py::test_reducescatter_op_matrix SKIP (https://nvbugs/6843474)
