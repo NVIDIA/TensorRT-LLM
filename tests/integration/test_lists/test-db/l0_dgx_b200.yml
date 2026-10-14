@@ -56,6 +56,8 @@ l0_dgx_b200:
   tests:
   - unittest/disaggregated/test_transfer_lifecycle_gpu.py
   - unittest/_torch/visual_gen/multi_gpu/test_minimax_h3_parallel.py::test_h3_partial_vae_groups
+  - unittest/_torch/visual_gen/multi_gpu/test_ulysses_peer_write.py::test_ulysses_peer_write TIMEOUT (15)
+  - examples/visual_gen/test_visual_gen_multi_gpu.py::test_minimax_h3_ulysses_parallel_vae_lpips[4-4-FA4] TIMEOUT (30)
   - examples/visual_gen/test_visual_gen_multi_gpu.py::test_minimax_h3_ulysses_parallel_vae_lpips[4-3-VANILLA] TIMEOUT (30)
   # Synthetic weights cover Engram head/row shards and TP/EP shared-expert collectives.
   - unittest/_torch/multi_gpu/test_engram_sharding.py::test_engram_shard_roundtrip -k "world:4"
