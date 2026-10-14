@@ -1753,6 +1753,79 @@ class TestQwen3CoderToolParser(BaseToolParserTestClass):
         assert json.loads(whole.calls[0].parameters) == {"a": 1, "b": "x"}
         assert streamed == whole.calls[0].parameters
 
+    @pytest.mark.parametrize(
+        "schema,raw,expected",
+        [
+            # One newline on each side is the template's; the rest is the value.
+            ({
+                "type": "string"
+            }, "\n\nhello\n\n", "\nhello\n"),
+            (None, "\n\nhello\n\n", "\nhello\n"),
+            # A carriage return is part of the value; only the newline is
+            # trimmed.
+            ({
+                "type": "string"
+            }, "\r\nhello\r\n", "\r\nhello\r"),
+            ({
+                "type": "string"
+            }, "\n\r\nhello\r\n\n", "\r\nhello\r\n"),
+            # Escape sequences written as text are not decoded.
+            ({
+                "type": "string"
+            }, "\\r\\nhello\\r\\n", "\\r\\nhello\\r\\n"),
+            ({
+                "type": "boolean"
+            }, "\\r\\nhello\\r\\n", "\\r\\nhello\\r\\n"),
+            # true is text unless the schema allows a boolean.
+            ({
+                "type": "string"
+            }, "true", "true"),
+            (None, "true", "true"),
+            ({
+                "type": ["string", "boolean"]
+            }, "true", True),
+            ({
+                "type": "boolean"
+            }, "\ntrue\n", True),
+        ],
+    )
+    def test_raw_values_are_typed_as_written(self, parser, schema, raw,
+                                             expected):
+        """The text between the parameter tags is the value, as in vLLM.
+
+        The value is placed between the tags exactly as given, with no newline
+        added by the test, and must come out the same whole and streamed.
+        """
+        properties = {} if schema is None else {"p": schema}
+        tool = ChatCompletionToolsParam(
+            type="function",
+            function=FunctionDefinition(
+                name="f",
+                parameters={
+                    "type": "object",
+                    "properties": properties
+                },
+            ),
+        )
+        body = f"\n<function=f>\n<parameter=p>{raw}</parameter>\n</function>\n"
+
+        whole = parser.detect_and_parse("<tool_call>" + body + "</tool_call>",
+                                        [tool])
+        streamed = ""
+        streaming_parser = Qwen3CoderToolParser()
+        deltas = ["<tool_call>"]
+        deltas += [body[i:i + 3] for i in range(0, len(body), 3)]
+        deltas.append("</tool_call>")
+        for delta in deltas:
+            for call in streaming_parser.parse_streaming_increment(
+                    delta, [tool]).calls:
+                streamed += call.parameters or ""
+
+        value = json.loads(whole.calls[0].parameters)["p"]
+        assert value == expected
+        assert type(value) is type(expected)
+        assert streamed == whole.calls[0].parameters
+
 
 # ============================================================================
 # DeepSeek Parser Tests
