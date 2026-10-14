@@ -96,7 +96,6 @@ add_library(
   common_src OBJECT
   cudaArchitectures.cpp
   cudaFp8Utils.cu
-  mcastDevMemUtils.cpp
   ncclUtils.cpp
   opUtils.cpp
   safetensors.cpp
