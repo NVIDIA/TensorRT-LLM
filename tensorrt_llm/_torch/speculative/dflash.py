@@ -21,8 +21,9 @@ from typing import TYPE_CHECKING, Callable, List, Optional
 import torch
 from torch import nn
 
+from tensorrt_llm._device_copy import DeviceCopyBuffer
 from tensorrt_llm._torch.custom_ops import inplace_slice_copy
-from tensorrt_llm._utils import copy_to_device_if_changed, prefer_pinned
+from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
@@ -518,13 +519,11 @@ class DFlashSpecMetadata(SpecMetadata):
     captured_hidden_states: Optional[torch.Tensor] = None
 
     def __post_init__(self):
-        # Only copy_to_device_if_changed writes this buffer: it skips values it already copied here, so another write
-        # would leave stale values.
-        self.batch_indices_cuda = torch.empty(
-            [self.max_num_requests],
-            dtype=torch.int,
-            device="cuda",
+        self._batch_indices_buffer = DeviceCopyBuffer(
+            torch.empty([self.max_num_requests], dtype=torch.int, device="cuda"),
+            pin_memory=prefer_pinned(),
         )
+        self.batch_indices_cuda = self._batch_indices_buffer.tensor
 
         self.is_spec_dec_tree = False
         self.is_spec_dec_dynamic_tree = False
@@ -565,7 +564,7 @@ class DFlashSpecMetadata(SpecMetadata):
         assert self.request_ids is not None
 
         num_seqs = len(self.request_ids)
-        copy_to_device_if_changed(self.batch_indices_cuda, torch.arange(num_seqs, dtype=torch.int))
+        self._batch_indices_buffer.update(torch.arange(num_seqs, dtype=torch.int))
 
         # Update slot mapping for DFlash context buffers
         worker = getattr(self, "_dflash_worker", None)
@@ -604,7 +603,7 @@ class DFlashSpecMetadata(SpecMetadata):
                 [worker._req_to_slot.get(rid, worker._dummy_slot) for rid in self.request_ids],
                 dtype=torch.long,
             )
-            copy_to_device_if_changed(worker._batch_to_slot, mapping)
+            worker._batch_to_slot_buffer.update(mapping)
 
     def is_layer_capture(self, layer_id: int) -> bool:
         return layer_id in self._capture_layer_set
@@ -706,7 +705,7 @@ class DFlashWorker(SpecWorkerBase):
         self._kv_rewind_amount = None
         self._kv_rewind_nc = None
         self._kv_rewind_bs = None
-        self._batch_to_slot = None
+        self._batch_to_slot_buffer = None
         self._max_ctx = 0
         self._ctx_k_buf = None  # [max_batch+1, L, max_ctx+block, nkv, hd]
         self._ctx_v_buf = None
@@ -1076,9 +1075,10 @@ class DFlashWorker(SpecWorkerBase):
 
         self._ctx_len = torch.zeros(num_slots, dtype=torch.long, device="cuda")
         self._ctx_len_host = [0] * num_slots
-        # Only copy_to_device_if_changed writes this buffer: it skips values it already copied here, so another write
-        # would leave stale values.
-        self._batch_to_slot = torch.zeros(max_batch, dtype=torch.long, device="cuda")
+        self._batch_to_slot_buffer = DeviceCopyBuffer(
+            torch.zeros(max_batch, dtype=torch.long, device="cuda"),
+            pin_memory=prefer_pinned(),
+        )
 
         self._free_slots = deque(range(max_batch))
         self._req_to_slot = {}
@@ -1382,14 +1382,8 @@ class DFlashWorker(SpecWorkerBase):
         self._ctx_len[self._dummy_slot].zero_()
 
     def _rebuild_batch_to_slot(self, request_ids: List[int]) -> None:
-        """Point _batch_to_slot at each request's slot after prefill assigned new ones.
-
-        Like DFlashSpecMetadata.prepare, this writes through copy_to_device_if_changed,
-        which keeps the values it last copied on the buffer: every write of the buffer
-        must go through it, or a later unchanged batch skips its copy over other values.
-        """
         mapping = [self._req_to_slot.get(rid, self._dummy_slot) for rid in request_ids]
-        copy_to_device_if_changed(self._batch_to_slot, torch.tensor(mapping, dtype=torch.long))
+        self._batch_to_slot_buffer.update(torch.tensor(mapping, dtype=torch.long))
 
     def _write_ctx_len(self, updates: dict[int, int]) -> None:
         """Apply a slot-to-length mapping to _ctx_len in one async scatter."""
@@ -2012,7 +2006,7 @@ class DFlashWorker(SpecWorkerBase):
             query_tokens_per_req = block_size
 
             # Get slots for gen requests from pre-computed mapping
-            slots = self._batch_to_slot[num_contexts : num_contexts + num_gens]
+            slots = self._batch_to_slot_buffer.tensor[num_contexts : num_contexts + num_gens]
             gen_rows_out = torch.arange(
                 num_contexts, num_contexts + num_gens, dtype=torch.long, device="cuda"
             )

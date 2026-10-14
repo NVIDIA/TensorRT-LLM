@@ -19,6 +19,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from tensorrt_llm._device_copy import DeviceCopyBuffer
 from tensorrt_llm._torch.modules.mamba import mamba2_metadata
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import (
     REPLAY_WORK_CACHE_BUF_IDX,
@@ -166,7 +167,7 @@ class TestMamba2Metadata:
         """A decode step whose state indices (a list from the cache manager) did not change enqueues no upload: the
         device buffer keeps values the host never sent. A changed step uploads again."""
         # The test writes the buffer behind prepare() to see the skip, which the check of skipped copies reports.
-        monkeypatch.setattr("tensorrt_llm._utils._verify_skipped_device_copies", False)
+        monkeypatch.setattr("tensorrt_llm._device_copy._verify_skipped_device_copies", False)
         manager = _StateIndexCacheManager([3, 1])
         metadata = Mamba2Metadata(max_batch_size=2, chunk_size=8)
         attn_metadata = _decode_attn_metadata(manager)
@@ -206,7 +207,7 @@ class TestMamba2Metadata:
     def test_check_of_skipped_copies_reports_a_write_behind_prepare(self, monkeypatch):
         """With the check of skipped copies on (TLLM_DEBUG_MODE=1, or the unit-test fixture), a state index buffer
         that something other than prepare() wrote fails the next prepare() whose indices did not change."""
-        monkeypatch.setattr("tensorrt_llm._utils._verify_skipped_device_copies", True)
+        monkeypatch.setattr("tensorrt_llm._device_copy._verify_skipped_device_copies", True)
         manager = _StateIndexCacheManager([3, 1])
         metadata = Mamba2Metadata(max_batch_size=2, chunk_size=8)
         attn_metadata = _decode_attn_metadata(manager)
@@ -216,6 +217,52 @@ class TestMamba2Metadata:
         metadata.state_indices[:2].copy_(torch.tensor([5, 6], dtype=torch.int32))
         with pytest.raises(AssertionError, match="holds \\[5, 6\\] instead of \\[3, 1\\]"):
             metadata.prepare(attn_metadata)
+
+    def test_prepare_alias_keeps_one_owner_across_manager_and_metadata_writes(self, monkeypatch):
+        class CacheManager:
+            def __init__(self):
+                self._state_indices_buffer = DeviceCopyBuffer(
+                    torch.zeros(2, dtype=torch.int32, device="cuda")
+                )
+                self.alias = True
+                self.values = [9, 2]
+
+            def get_state_indices(self, request_ids, is_padding):
+                if self.alias:
+                    return self._state_indices_buffer.tensor
+                return self.values
+
+        manager = CacheManager()
+        metadata = Mamba2Metadata(max_batch_size=2, chunk_size=8)
+        attn_metadata = _decode_attn_metadata(manager)
+        address = manager._state_indices_buffer.tensor.data_ptr()
+        writes = []
+        original = torch.Tensor.copy_
+
+        def counted(dst, src, *args, **kwargs):
+            if dst.is_cuda and dst.data_ptr() == address:
+                writes.append(src.tolist())
+            return original(dst, src, *args, **kwargs)
+
+        monkeypatch.setattr(torch.Tensor, "copy_", counted)
+        manager._state_indices_buffer.update(torch.tensor([1, 2], dtype=torch.int32))
+        metadata.prepare(attn_metadata)
+        torch.cuda.synchronize()
+        assert metadata.state_indices.tolist() == [1, 2]
+        manager.alias = False
+        metadata.prepare(attn_metadata)
+        torch.cuda.synchronize()
+        assert manager._state_indices_buffer.tensor.tolist() == [9, 2]
+        manager._state_indices_buffer.update(torch.tensor([1, 2], dtype=torch.int32))
+        manager.alias = True
+        metadata.prepare(attn_metadata)
+        manager._state_indices_buffer.update(torch.tensor([1, 2], dtype=torch.int32))
+        metadata.prepare(attn_metadata)
+        torch.cuda.synchronize()
+        assert metadata.state_indices.tolist() == [1, 2]
+        assert manager._state_indices_buffer.tensor.tolist() == [1, 2]
+        assert metadata.state_indices.data_ptr() == address
+        assert writes == [[1, 2], [9, 2], [1, 2]]
 
     def test_prepare_replay_work_items_write_first(self):
         class ReplayCacheManager:

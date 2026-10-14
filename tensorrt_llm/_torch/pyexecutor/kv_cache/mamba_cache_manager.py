@@ -32,6 +32,7 @@ if TYPE_CHECKING:
     from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
     from tensorrt_llm.sampling_params import SamplingParams
 
+from tensorrt_llm._device_copy import DeviceCopyBuffer
 from tensorrt_llm._torch.disaggregation.resource.page import (MapperKind,
                                                               RoleLayout)
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
@@ -45,8 +46,8 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import (
     PoolConfiguration, get_pp_layers)
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._utils import (TensorWrapper, convert_to_torch_tensor,
-                                 copy_to_device_if_changed, nvtx_range,
-                                 prefer_pinned, torch_dtype_to_binding)
+                                 nvtx_range, prefer_pinned,
+                                 torch_dtype_to_binding)
 from tensorrt_llm.bindings.internal.batch_manager import (
     LinearAttentionMetadata, LinearCacheType)
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
@@ -1396,6 +1397,16 @@ class MambaHybridCacheManager(BaseResourceManager, BaseMambaCacheManager):
 
     _supports_additional_snapshot_offsets = False
 
+    @property
+    def cuda_state_indices(self) -> torch.Tensor:
+        return self._state_indices_buffer.tensor
+
+    @property
+    def _dummy_request_mask(self) -> Optional[torch.Tensor]:
+        if self._dummy_request_mask_buffer is None:
+            return None
+        return self._dummy_request_mask_buffer.tensor
+
     def _setup_mtp_intermediate_states(self, spec_config,
                                        max_batch_size: int) -> None:
         self.spec_config = spec_config
@@ -1436,7 +1447,7 @@ class MambaHybridCacheManager(BaseResourceManager, BaseMambaCacheManager):
         self.prev_num_accepted_tokens = None
         self.cache_buf_idx = None
         self.mamba_ssm_rand_seed = None
-        self._dummy_request_mask = None
+        self._dummy_request_mask_buffer = None
         self._dummy_request_mask_host = None
         self.old_x = None
         self.old_B = None
@@ -1497,8 +1508,7 @@ class MambaHybridCacheManager(BaseResourceManager, BaseMambaCacheManager):
         if n > 0:
             self._dummy_request_mask_host[:n].copy_(
                 torch.tensor(is_dummy, dtype=torch.bool))
-        copy_to_device_if_changed(self._dummy_request_mask,
-                                  self._dummy_request_mask_host)
+        self._dummy_request_mask_buffer.update(self._dummy_request_mask_host)
 
     def _reset_context_mamba_slots(self, num_contexts: int) -> None:
         if num_contexts == 0:
@@ -2528,9 +2538,10 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         self.recurrent_states_pool_index = self.kv_cache_pool_mapping[
             self.layer_offsets[self.mamba_pp_layers[0]]][0]
 
-        self.cuda_state_indices = torch.zeros([self.max_batch_size],
-                                              dtype=torch.int32,
-                                              device="cuda")
+        self._state_indices_buffer = DeviceCopyBuffer(
+            torch.zeros([self.max_batch_size], dtype=torch.int32,
+                        device="cuda"),
+            pin_memory=prefer_pinned())
         self._host_state_indices = torch.zeros([self.max_batch_size],
                                                dtype=torch.int32,
                                                pin_memory=prefer_pinned())
@@ -2639,7 +2650,7 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         self.prev_num_accepted_tokens = None
         self.cache_buf_idx = None
         self.mamba_ssm_rand_seed = None
-        self._dummy_request_mask = None
+        self._dummy_request_mask_buffer = None
         self._dummy_request_mask_host = None
         self.old_x = None
         self.old_B = None
@@ -2921,10 +2932,7 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
                 )
             self._host_state_indices[:n] = values
 
-        idx_staging = torch.empty_like(self._host_state_indices,
-                                       pin_memory=prefer_pinned())
-        idx_staging.copy_(self._host_state_indices)
-        self.cuda_state_indices.copy_(idx_staging, non_blocking=True)
+        self._state_indices_buffer.update(self._host_state_indices, force=True)
         is_dummy = [req.is_dummy for req in requests]
         self._refresh_dummy_request_mask(is_dummy)
 
@@ -2989,11 +2997,9 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
                                                   device):
             return
 
-        # Only copy_to_device_if_changed writes this buffer: it skips values
-        # it already copied here, so another write would leave stale values.
-        self._dummy_request_mask = torch.zeros(self.max_batch_size,
-                                               dtype=torch.bool,
-                                               device=device)
+        self._dummy_request_mask_buffer = DeviceCopyBuffer(
+            torch.zeros(self.max_batch_size, dtype=torch.bool, device=device),
+            pin_memory=prefer_pinned())
         self._dummy_request_mask_host = torch.zeros(
             self.max_batch_size,
             dtype=torch.bool,
@@ -3291,11 +3297,11 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
 
         state_index_capacity = (self.max_batch_size +
                                 self._num_reserved_dummy_slots)
-        # Only copy_to_device_if_changed writes this buffer: it skips values
-        # it already copied here, so another write would leave stale values.
-        self.cuda_state_indices = torch.zeros([state_index_capacity],
-                                              dtype=torch.int32,
-                                              device="cuda")
+        self._state_indices_buffer = DeviceCopyBuffer(
+            torch.zeros([state_index_capacity],
+                        dtype=torch.int32,
+                        device="cuda"),
+            pin_memory=prefer_pinned())
         self._host_state_indices = torch.zeros([state_index_capacity],
                                                dtype=torch.int32,
                                                pin_memory=prefer_pinned())
@@ -4359,11 +4365,9 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             return
 
         mask_capacity = self._host_state_indices.shape[0]
-        # Only copy_to_device_if_changed writes this buffer: it skips values
-        # it already copied here, so another write would leave stale values.
-        self._dummy_request_mask = torch.zeros(mask_capacity,
-                                               dtype=torch.bool,
-                                               device=device)
+        self._dummy_request_mask_buffer = DeviceCopyBuffer(
+            torch.zeros(mask_capacity, dtype=torch.bool, device=device),
+            pin_memory=prefer_pinned())
         self._dummy_request_mask_host = torch.zeros(
             mask_capacity,
             dtype=torch.bool,
@@ -4705,8 +4709,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                         f"request {req.py_request_id}")
                 self._host_state_indices[i] = base_index
 
-        copy_to_device_if_changed(self.cuda_state_indices,
-                                  self._host_state_indices)
+        self._state_indices_buffer.update(self._host_state_indices)
         is_dummy = [req.is_dummy for req in requests]
         self._refresh_dummy_request_mask(is_dummy)
         state_values = self._host_state_indices[:n].tolist()
@@ -5117,7 +5120,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         self.prev_num_accepted_tokens = None
         self.cache_buf_idx = None
         self.mamba_ssm_rand_seed = None
-        self._dummy_request_mask = None
+        self._dummy_request_mask_buffer = None
         self._dummy_request_mask_host = None
         self.old_x = None
         self.old_B = None
