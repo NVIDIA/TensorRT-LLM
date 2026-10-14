@@ -532,6 +532,10 @@ def _create_py_executor(
     """Create and initialize a PyExecutor while recording scoped metrics."""
     initial_model_engine_metrics: dict[str, float | dict[str, float]] = {}
 
+    scheduler_policy_explicit = (
+        llm_args.scheduler_config is not None
+        and "capacity_scheduler_policy"
+        in llm_args.scheduler_config.model_fields_set)
     skip_est = os.environ.get("TRTLLM_SKIP_KV_CACHE_ESTIMATION", '0') == '1'
     with timing_metric("config_and_checkpoint_loader_initialization_seconds",
                        creation_metrics):
@@ -1217,6 +1221,7 @@ def _create_py_executor(
             max_num_tokens=max_num_tokens,
             peft_cache_config=peft_cache_config,
             scheduler_config=scheduler_config,
+            scheduler_policy_explicit=scheduler_policy_explicit,
             cache_transceiver_config=cache_transceiver_config,
             virtual_memory_pools=vm_pools if not estimating_kv_cache else None,
             execution_stream=execution_stream,
@@ -1298,6 +1303,7 @@ def _create_py_executor(
                 max_num_tokens=max_num_tokens,
                 peft_cache_config=peft_cache_config,
                 scheduler_config=scheduler_config,
+                scheduler_policy_explicit=scheduler_policy_explicit,
                 cache_transceiver_config=cache_transceiver_config,
                 virtual_memory_pools=vm_pools,
                 execution_stream=execution_stream,

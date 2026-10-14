@@ -204,13 +204,31 @@ class KVCacheV2Scheduler(RequestScheduler):
             and kv_cache_manager.enable_block_reuse
             and self._skip_pays_off_under_reuse_policy()
         )
-        if scheduler_policy != CapacitySchedulerPolicy.MAX_UTILIZATION:
+        self._no_evict_managers = [kv_cache_manager]
+        if draft_kv_cache_manager is not None:
+            self._no_evict_managers.append(draft_kv_cache_manager)
+        if scheduler_policy == CapacitySchedulerPolicy.GUARANTEED_NO_EVICT and (
+            cross_kv_cache_manager is not None
+            or not all(m.supports_no_evict_reservation() for m in self._no_evict_managers)
+        ):
             logger.warning(
-                "KVCacheV2Scheduler only supports MAX_UTILIZATION for now, "
+                "KVCacheV2Scheduler: GUARANTEED_NO_EVICT requires single-pool "
+                "full-history target/draft caches, beam width 1, and no helix "
+                "or cross-attention cache; using MAX_UTILIZATION"
+            )
+            scheduler_policy = CapacitySchedulerPolicy.MAX_UTILIZATION
+        if scheduler_policy not in (
+            CapacitySchedulerPolicy.MAX_UTILIZATION,
+            CapacitySchedulerPolicy.GUARANTEED_NO_EVICT,
+        ):
+            logger.warning(
+                "KVCacheV2Scheduler supports MAX_UTILIZATION and GUARANTEED_NO_EVICT, "
                 f"got {scheduler_policy.name}, setting to MAX_UTILIZATION"
             )
             scheduler_policy = CapacitySchedulerPolicy.MAX_UTILIZATION
         self.policy = scheduler_policy
+        self._no_evict = scheduler_policy == CapacitySchedulerPolicy.GUARANTEED_NO_EVICT
+        self.enable_recompute_pause = enable_recompute_pause and not self._no_evict
         self.peft_cache_manager = peft_cache_manager
 
         # Chunking config.
@@ -227,12 +245,13 @@ class KVCacheV2Scheduler(RequestScheduler):
             type(cross_kv_cache_manager).__name__ if cross_kv_cache_manager is not None else "None"
         )
         logger.info(
-            f"KVCacheV2Scheduler: tokens_per_block={self.tokens_per_block}, "
+            f"KVCacheV2Scheduler: policy={self.policy.name}, "
+            f"tokens_per_block={self.tokens_per_block}, "
             f"max_num_tokens={max_num_tokens}, max_batch_size={max_batch_size}, "
             f"draft_mgr={draft_mgr_name}, cross_mgr={cross_mgr_name}, "
             f"enable_prefix_aware_scheduling={enable_prefix_aware_scheduling}, "
             f"prefix_skip_enabled={self._prefix_skip_enabled}, "
-            f"enable_recompute_pause={enable_recompute_pause}"
+            f"enable_recompute_pause={self.enable_recompute_pause}"
         )
         if ctx_chunk_config is not None:
             self.chunking_enabled = True
@@ -404,6 +423,11 @@ class KVCacheV2Scheduler(RequestScheduler):
         recompute_pause_state = _RecomputePauseState(req_it_end)
         req_it = 0
 
+        # Include residents excluded from a remote-tail phase in the reservation.
+        headroom = self._no_evict_headroom(active_requests) if self._no_evict else []
+        no_evict_gen_admission_closed = False
+        no_evict_ctx_admission_closed = False
+
         # Context requests are always deferred to a second phase so that
         # generation requests are fully accounted for in the budget before
         # any context request competes for resources.  This mirrors the
@@ -455,6 +479,17 @@ class KVCacheV2Scheduler(RequestScheduler):
                 if peft_pages is None:
                     break
 
+                needed_blocks = []
+                if self._no_evict:
+                    if no_evict_gen_admission_closed:
+                        req_it += 1
+                        continue
+                    needed_blocks = self._no_evict_blocks_needed(req)
+                    if any(needed > free for needed, free in zip(needed_blocks, headroom)):
+                        no_evict_gen_admission_closed = True
+                        req_it += 1
+                        continue
+
                 action, tokens = self._try_schedule_disagg_gen_init(req, budget)
                 if action is ScheduleAction.STOP:
                     break
@@ -462,6 +497,8 @@ class KVCacheV2Scheduler(RequestScheduler):
                     req_it += 1
                     continue
                 disagg_candidates.append(req)
+                if self._no_evict:
+                    headroom = [free - needed for free, needed in zip(headroom, needed_blocks)]
                 # Disagg requests only commit PEFT (not num_requests/num_tokens)
                 # because they don't participate in the forward pass. Counting
                 # them toward num_requests would steal batch slots from gen/ctx
@@ -623,6 +660,16 @@ class KVCacheV2Scheduler(RequestScheduler):
                 scheduled_encoder.append(req)
                 budget.commit(req, tokens, peft_pages)
             else:
+                needed_blocks = []
+                if self._no_evict and req.is_first_context_chunk:
+                    # A misfit closes new FIFO admissions, but existing context
+                    # chunks retain their reservation and continue to run.
+                    if no_evict_ctx_admission_closed:
+                        continue
+                    needed_blocks = self._no_evict_blocks_needed(req)
+                    if any(needed > free for needed, free in zip(needed_blocks, headroom)):
+                        no_evict_ctx_admission_closed = True
+                        continue
                 action, tokens, chunking_flag = self._try_schedule_context(
                     req, budget, preempt_for_pages
                 )
@@ -630,6 +677,8 @@ class KVCacheV2Scheduler(RequestScheduler):
                     break
                 if action is ScheduleAction.SKIP:
                     continue
+                if needed_blocks:
+                    headroom = [free - needed for free, needed in zip(headroom, needed_blocks)]
                 has_chunking = has_chunking or chunking_flag
                 scheduled_ctx.append(req)
                 if len(scheduled_ctx) == 1:
@@ -1480,6 +1529,10 @@ class KVCacheV2Scheduler(RequestScheduler):
             return ScheduleAction.SKIP, 0, scheduled_beam_width, req_it_end
 
         success = self._try_allocate_generation(req)
+        if not success and self._no_evict:
+            # Retry without releasing this request's or a peer's reserved KV.
+            # The executor clears batch indices after consuming their batch.
+            return ScheduleAction.SKIP, 0, scheduled_beam_width, req_it_end
 
         if not success:
             if self.has_cp_helix:
@@ -1538,6 +1591,26 @@ class KVCacheV2Scheduler(RequestScheduler):
         # The executor clears its batch index only after consuming that batch.
         return ScheduleAction.SKIP, 0, scheduled_beam_width, req_it_end
 
+    def _no_evict_headroom(self, requests: RequestList) -> list[int]:
+        """Free blocks after reserving each resident's remaining completion budget."""
+        headroom = []
+        for manager in self._no_evict_managers:
+            free = manager.get_num_free_primary_blocks()
+            for req in requests:
+                state = req.state_value
+                if not (
+                    self._disagg_gen_init_state_value < state < self._gen_to_complete_state_value
+                ):
+                    continue
+                if state == self._context_init_state_value and req.is_first_context_chunk:
+                    continue
+                free -= manager.get_needed_resource_to_completion(req)
+            headroom.append(free)
+        return headroom
+
+    def _no_evict_blocks_needed(self, req: LlmRequest) -> list[int]:
+        return [m.get_needed_resource_to_completion(req) for m in self._no_evict_managers]
+
     def _try_allocate_generation(self, req: LlmRequest) -> bool:
         """Atomically admit one generation step in target and draft pools.
 
@@ -1584,6 +1657,8 @@ class KVCacheV2Scheduler(RequestScheduler):
         remains "active" on device, which could cause ensure_batch to
         fail if it needs to load a different adapter into a full cache.
         """
+        if self._no_evict:
+            return
         self._clear_request_runtime_state(req)
         self.kv_cache_manager.suspend_request(req)
         if self.draft_kv_cache_manager is not None:

@@ -6006,14 +6006,41 @@ class KVCacheManagerV2(BaseResourceManager):
         return 1
 
     def get_needed_resource_to_completion(self, request: LlmRequest) -> int:
-        # TODO: implement this
-        # context_token_count = request.orig_prompt_len
-        # num_context_blocks = context_token_count // self.tokens_per_block
-        # remaining_tokens = context_token_count + request.max_new_tokens - num_context_blocks * self.tokens_per_block
-        # need_blocks = num_context_blocks + math.ceil(
-        #     remaining_tokens / self.tokens_per_block)
-        # return need_blocks
-        return 0
+        """Additional primary blocks needed through the request's token limit."""
+        # Include the manager's physical generation reserve, including wider
+        # dynamic-tree draft slots. Reuse is not credited before admission.
+        total_tokens = (
+            int(request.prompt_len)
+            + int(request.py_max_new_tokens)
+            + self._generation_kv_capacity_headroom
+        )
+        total_blocks = math.ceil(total_tokens / self.tokens_per_block)
+        kv_cache = self.kv_cache_map.get(request.py_request_id)
+        allocated_blocks = (
+            math.ceil(kv_cache.capacity / self.tokens_per_block) if kv_cache is not None else 0
+        )
+        return max(total_blocks - allocated_blocks, 0)
+
+    def supports_no_evict_reservation(self) -> bool:
+        """Whether token-block accounting represents the complete primary pool."""
+        return (
+            not self._has_cp_helix
+            and not self._has_recurrent_state
+            and self.max_beam_width == 1
+            and all(window is None for window in self.max_attention_window_vec)
+            and len(list(self.impl.pool_group_descs)) == 1
+            and all(
+                isinstance(layer, AttentionLayerConfig)
+                for layer in self.kv_cache_manager_py_config.layers
+            )
+        )
+
+    def get_num_free_primary_blocks(self) -> int:
+        """Primary-tier slots available to additional request blocks."""
+        return min(
+            (int(stat.available) for stat in self._get_storage_statistics(GPU_LEVEL)),
+            default=0,
+        )
 
     # TODO: refactor get_cache_size_per_token and get_cache_bytes_per_token to use the same logic
     @classmethod
