@@ -1561,10 +1561,12 @@ class DecoderForwardTestCase(unittest.TestCase):
                                     resource_manager,
                                     request: LlmRequest) -> None:
         """Leave `request` with a final one-token context chunk."""
-        request.context_chunk_size = request.py_prompt_len - 1
         batch = ScheduledRequests()
         batch.context_requests_chunking = [request]
-        self._forward(engine, kv_cache_manager, resource_manager, batch)
+        _prepare_kv_cache_resources(kv_cache_manager, batch)
+        # Like the scheduler, narrow the chunk after V2 spans it to the prompt end.
+        request.context_chunk_size = request.py_prompt_len - 1
+        engine.forward(batch, resource_manager)
         request.move_to_next_context_chunk()
         request.context_chunk_size = 1
 
