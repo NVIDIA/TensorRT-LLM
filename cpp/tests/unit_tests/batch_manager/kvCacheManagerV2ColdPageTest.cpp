@@ -1078,6 +1078,37 @@ TEST(KvCacheManagerV2ColdPageTest, ResizeToUnalignedMaxQuotaIsAllowed)
     EXPECT_GE(manager->getQuota(coldLevel), kMaxQuota) << "the resize must have taken effect";
 }
 
+//! Each pool group needs an allocation unit of its own, so a level with two of
+//! them cannot be built below two units however small the quota is. A maximum
+//! under that total is unsatisfiable: the quota is raised to the minimum at
+//! construction and would then sit above the maximum, so the level comes up
+//! already unable to resize to the size it reports.
+TEST(KvCacheManagerV2ColdPageTest, MaxQuotaBelowTheStructuralMinimumIsRejected)
+{
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    // Two cold pool groups, from the two distinct sliding windows.
+    constexpr size_t kOneUnit = HostMem::kAlignment;
+
+    auto makeConfig = [](std::optional<size_t> maxQuota)
+    {
+        auto config = makeSplitColdGroupingConfig();
+        config.cacheTiers[1] = HostCacheTierConfig{kOneUnit, maxQuota};
+        return config;
+    };
+    // Cold pool groups are keyed by (reuse policy, cold page bytes), so the split
+    // comes from the codec reporting different page sizes, not from the config
+    // alone. Without it both lifecycles share one group and one unit suffices.
+    auto build = [&makeConfig](std::optional<size_t> maxQuota) {
+        return KvCacheManager{makeConfig(maxQuota), nullptr, std::make_unique<SplitColdPageCodec>()};
+    };
+
+    EXPECT_THROW(build(kOneUnit), std::invalid_argument) << "a maximum of one unit cannot cover two pool groups";
+
+    // Controls: enough for both groups, and no maximum at all.
+    EXPECT_NO_THROW(build(2 * kOneUnit));
+    EXPECT_NO_THROW(build(std::nullopt));
+}
+
 TEST(KvCacheManagerV2ColdPageTest, FallenPagesRetainHighestPriorityAcrossLifecycleQueues)
 {
     ASSERT_EQ(cudaSetDevice(0), cudaSuccess);

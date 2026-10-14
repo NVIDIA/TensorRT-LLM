@@ -121,6 +121,15 @@ inline size_t cacheTierQuota(CacheTierConfig const& cfg)
     return std::visit([](auto const& c) { return c.quota; }, cfg);
 }
 
+//! The configured ceiling on this tier's quota, where it has one. Only the host
+//! tier reserves address space up front and so carries a maximum; the others are
+//! bounded by the device or the filesystem.
+inline std::optional<size_t> cacheTierMaxQuota(CacheTierConfig const& cfg)
+{
+    auto const* host = std::get_if<HostCacheTierConfig>(&cfg);
+    return host != nullptr ? host->maxQuota : std::nullopt;
+}
+
 // ---------------------------------------------------------------------------
 // Buffer configuration (one KV buffer inside an attention layer).
 // ---------------------------------------------------------------------------

@@ -417,6 +417,28 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
 
     mColdPoolGroupMapping = LifeCyclePoolGroupMapping(std::move(coldGrouping));
 
+    // Every pool group needs an allocation unit of its own, so a level whose configured maximum is
+    // below that total cannot be built at any size: the quota is raised to the same minimum below,
+    // and would then sit above the maximum from the outset. Checked for all cold levels before any
+    // of them is built, so a rejection does not leave earlier levels already allocated.
+    for (CacheLevel level{1}; level < config.cacheTiers.size(); ++level)
+    {
+        auto const& tierConfig = config.cacheTiers[level];
+        auto const maxQuota = cacheTierMaxQuota(tierConfig);
+        if (!maxQuota.has_value())
+        {
+            continue;
+        }
+        size_t const granularity = tierCommitUnit(tierConfig);
+        if (size_t const minQuota = minQuotaForLevel(coldSlotSizeLists, granularity, coldMinSlots);
+            *maxQuota < minQuota)
+        {
+            throw std::invalid_argument("max_quota " + std::to_string(*maxQuota) + " for cache level "
+                + std::to_string(level.value()) + " is below the " + std::to_string(minQuota)
+                + " bytes it needs at minimum, one allocation unit of " + std::to_string(granularity) + " per pool");
+        }
+    }
+
     for (CacheLevel level{1}; level < config.cacheTiers.size(); ++level)
     {
         TLLM_CHECK(appendLevelSlotDescList(coldSlotDescList) == level);
