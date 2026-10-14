@@ -38,6 +38,8 @@ lever can be A/B'd on one image; see the ``_*_enabled`` helpers for rationale):
   TP8 pool/unpool projections for batches of at most eight tokens.
 - ``MUSESPARK_OPEN_FUSED_PRE_EXPERT_QUANT`` (default on): fused pre-expert
   RMSNorm + NVFP4 quantization.
+- ``MUSESPARK_OPEN_LL_QKV_WEIGHT_LAYOUT`` (default off): BF16 TP4/TP8 QKV
+  weight layout for single-row decode with separate native normalization.
 - ``MUSESPARK_OPEN_FUSED_PREATTN`` (default OFF, opt-in): fused pre-attention.
 - ``MUSESPARK_OPEN_ALLREDUCE`` (default NCCL): all-reduce strategy name.
 - ``MUSESPARK_OPEN_PREFILL_SEQUENCE_PARALLEL`` (default off): shard replicated
@@ -1484,6 +1486,8 @@ class MuseSparkOpenAttention(QKNormRoPEAttention):
         # the fused arm. `apply_output_gate` picks up the fused sigmoid-mul
         # from the same switch.
         self._fuse_qk_norm_rope_gate = _fused_preattention_enabled()
+        self._qkv_weight_layout = os.getenv("MUSESPARK_OPEN_LL_QKV_WEIGHT_LAYOUT", "0") == "1"
+        self.register_buffer("_qkv_layout_inverse", None, persistent=False)
         self._large_norm_gate_enabled = os.getenv("MUSESPARK_OPEN_LARGE_NORM_GATE", "0") == "1"
         self._sp_projection_stream: Optional[torch.cuda.Stream] = None
         self.fused_prep_q_scale = self.scale_query_by
@@ -1523,6 +1527,31 @@ class MuseSparkOpenAttention(QKNormRoPEAttention):
                 strategy=_attention_allreduce_strategy(),
                 dtype=self.o_proj.dtype,
             )
+
+    def prepare_qkv_weight_layout(self):
+        if getattr(self, "_qkv_weight_layout", False):
+            from .musespark_open_qkv_layout import prepare_weight_layout
+
+            self._qkv_layout_inverse = prepare_weight_layout(self)
+
+    def preprocess_qkv(self, qkv, position_ids):
+        inverse = getattr(self, "_qkv_layout_inverse", None)
+        if inverse is not None:
+            if (
+                not torch.compiler.is_compiling()
+                and qkv.is_cuda
+                and qkv.dtype == torch.bfloat16
+                and qkv.shape == (1, 2 * (self.q_size + self.kv_size))
+                and qkv.stride(-1) == 1
+                and self.support_fused_qkv
+            ):
+                from .musespark_open_qkv_layout import preprocess_one_row
+
+                return preprocess_one_row(self, qkv, position_ids)
+            # Larger batches/prefill retain native arithmetic and dispatch.
+            # Weights stay permuted, so reconstruct the original projection.
+            qkv = qkv.index_select(-1, inverse)
+        return super().preprocess_qkv(qkv, position_ids)
 
     def apply_qk_norm(self, q, k):
         q, k = super().apply_qk_norm(q, k)

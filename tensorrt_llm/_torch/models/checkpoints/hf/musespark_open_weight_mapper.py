@@ -449,6 +449,7 @@ def load_layer(
             {"weight": v_weight},
         ]
     )
+    layer.self_attn.prepare_qkv_weight_layout()
     del q_weight, gate_weight, q_gate
 
     _load_linear(
