@@ -880,6 +880,7 @@ class BaseWorker(GenerationExecutor):
                             None) if has_mnnvl_resources else None)
                         if run_mnnvl is not None:
                             run_mnnvl(target_action, tags)
+                        self._invalidate_v1_prefix_cache_for_sleep(tags)
                         release_with_tag(*tags, resource=self.engine)
                         torch.cuda.synchronize()
                         gc.collect()
@@ -1044,6 +1045,7 @@ class BaseWorker(GenerationExecutor):
                 ):
                     torch.cuda.synchronize()
                     local_mutation_started = True
+                    self._invalidate_v1_prefix_cache_for_sleep(tags)
                     release_with_tag(*tags, resource=self.engine)
                     torch.cuda.synchronize()
                     gc.collect()

@@ -25,6 +25,7 @@ from tensorrt_llm._torch.pyexecutor.executor_request_queue import (
     RequestAdmissionState,
 )
 from tensorrt_llm.executor.ray.gpu_worker import RayGPUWorker
+from tensorrt_llm.llmapi.llm_args import ExecutorMemoryType
 
 
 class _Args:
@@ -65,7 +66,7 @@ def test_ray_worker_publishes_persistent_admission_transition(method, operation)
     with (
         patch("tensorrt_llm.executor.ray.gpu_worker.TorchLlmArgs", _Args),
         patch("tensorrt_llm.executor.ray.gpu_worker.logger", MagicMock(), create=True),
-        patch(f"tensorrt_llm.executor.ray.gpu_worker.{operation}"),
+        patch(f"tensorrt_llm.executor.ray.gpu_worker.{operation}") as memory_operation,
         patch("tensorrt_llm.executor.ray.gpu_worker.torch.cuda.synchronize"),
         patch("tensorrt_llm.executor.ray.gpu_worker.gc.collect"),
         patch("tensorrt_llm.executor.ray.gpu_worker.torch.cuda.empty_cache"),
@@ -74,6 +75,9 @@ def test_ray_worker_publishes_persistent_admission_transition(method, operation)
 
     getattr(worker.engine, f"begin_{method}_transition").assert_called_once()
     getattr(worker.engine, f"complete_{method}_transition").assert_called_once_with()
+    memory_operation.assert_called_once_with(
+        ExecutorMemoryType.MODEL_ENGINE_MAIN, resource=worker.engine
+    )
     if method == "sleep":
         worker.engine.validate_sleep_tags.assert_called_once()
         worker.engine.invalidate_v1_prefix_cache_for_sleep.assert_called_once()

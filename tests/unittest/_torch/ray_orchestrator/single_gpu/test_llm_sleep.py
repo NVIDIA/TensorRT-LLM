@@ -1,7 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-from unittest.mock import Mock
+from contextlib import nullcontext
+from unittest.mock import Mock, patch
 
 import pytest
 from utils.llm_data import llm_models_root
@@ -20,7 +21,7 @@ from tensorrt_llm.llmapi.llm_args import CudaGraphConfig, ExecutorMemoryType, Sl
         ([ExecutorMemoryType.KV_CACHE], "MEMSET", True),
         ([ExecutorMemoryType.KV_CACHE], "CPU", True),
         ([ExecutorMemoryType.KV_CACHE], "PINNED", True),
-        (list(ExecutorMemoryType), "NONE", True),
+        (None, "NONE", True),
         (
             [ExecutorMemoryType.MODEL_ENGINE_MAIN, ExecutorMemoryType.MODEL_WEIGHTS_MAIN],
             "NONE",
@@ -70,19 +71,15 @@ def test_llm_sleep(process_gpu_memory_info_available, sleep_tags, restore_mode, 
 
         memory_usage_active = get_current_process_gpu_memory(True)
 
-        llm._collective_rpc(
-            "sleep",
-            (sleep_tags,),
-        )
+        llm.release(sleep_tags)
+        assert llm.get_memory_status().state == "parked"
 
         memory_usage_sleep = get_current_process_gpu_memory(True)
         if process_gpu_memory_info_available:
             assert memory_usage_sleep < memory_usage_active
 
-        llm._collective_rpc(
-            "wakeup",
-            (sleep_tags,),
-        )
+        llm.resume(sleep_tags)
+        assert llm.get_memory_status().state == "running"
 
         memory_usage_wakeup = get_current_process_gpu_memory(True)
         if process_gpu_memory_info_available:
@@ -232,6 +229,9 @@ def test_sleep_validates_registrations_before_closing_admission(
     stub._is_kv_manager_v2 = use_v2
     stub.kv_cache_transceiver = Mock() if has_transceiver else None
     stub.executor_request_queue = Mock()
+    stub.get_memory_status = Mock(return_value={"state": "running", "parked_tags": []})
+    stub.control_action = Mock(return_value=nullcontext())
+    stub.invalidate_v1_prefix_cache_for_sleep = Mock()
     tags = [ExecutorMemoryType(tag)]
     if entrypoint == "mpi":
         run = stub.begin_sleep_transition
@@ -241,14 +241,19 @@ def test_sleep_validates_registrations_before_closing_admission(
         worker.doing_shutdown = True
         worker.engine = stub
         worker.llm_args = Mock(spec=TorchLlmArgs, sleep_config=SleepConfig())
-        worker._sleep = Mock()
         run = worker.sleep
-        mutation = worker._sleep
+        mutation = stub.executor_request_queue.begin_sleep_transition
 
     if rejected:
         with pytest.raises(NotImplementedError, match="remote memory re-registration"):
             run(tags)
         mutation.assert_not_called()
     else:
-        run(tags)
+        with (
+            patch("tensorrt_llm.executor.ray.gpu_worker.release_with_tag"),
+            patch("torch.cuda.synchronize"),
+            patch("torch.cuda.empty_cache"),
+            patch("gc.collect"),
+        ):
+            run(tags)
         mutation.assert_called_once()

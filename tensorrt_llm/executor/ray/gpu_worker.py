@@ -15,7 +15,6 @@
 import gc
 import importlib
 import os
-import tempfile
 from functools import wraps
 from pathlib import Path
 from queue import Queue
@@ -27,7 +26,8 @@ import torch
 from tensorrt_llm._torch.utils import get_device_uuid
 from tensorrt_llm._torch.virtual_memory import (materialize_with_tag,
                                                 release_with_tag)
-from tensorrt_llm.executor.ray.utils import control_action_decorator
+from tensorrt_llm.executor.ray.utils import (_configure_deep_gemm_cache,
+                                             control_action_decorator)
 
 from ... import TorchLlmArgs
 from ...llmapi.llm_args import BaseLlmArgs, ExecutorMemoryType
@@ -304,7 +304,7 @@ class RayGPUWorker(RpcWorkerMixin, BaseWorker):
                         result_wait_queue: Queue | None = None) -> int:
         return self._enqueue_request(request, result_wait_queue)
 
-    def sleep(self, sleep_tags: List[str]):
+    def sleep(self, sleep_tags: List[str]) -> None:
         assert isinstance(self.llm_args,
                           TorchLlmArgs), "sleep() only available for TorchLLM"
 
@@ -313,21 +313,34 @@ class RayGPUWorker(RpcWorkerMixin, BaseWorker):
                 "Sleep feature is not enabled, please set sleep_config in the LLM arguments."
             )
         tags = [ExecutorMemoryType(tag) for tag in sleep_tags]
-        self.engine.validate_sleep(tags)
-        self._sleep(tags)
+        tags = self._prepare_sleep_tags(tags)
+        if not tags:
+            return
+        self._validate_sleep_tags(tags)
 
-    @control_action_decorator
-    def _sleep(self, tags: List[ExecutorMemoryType]):
+        logger.info(f"Sleep: {tags}")
+        self.engine.begin_sleep_transition(tags)
+        mutation_started = False
         try:
-            logger.info(f"Sleep: {tags}")
-            torch.cuda.synchronize()
-            release_with_tag(*tags, resource=self.engine)
-            torch.cuda.synchronize()
-            gc.collect()
-            torch.cuda.empty_cache()
-        except Exception as e:
-            logger.error(f"Encountered an error in sleep: {e}")
-            raise e
+            with self.engine.control_action():
+                torch.cuda.synchronize()
+                mutation_started = True
+                self._invalidate_v1_prefix_cache_for_sleep(tags)
+                release_with_tag(*tags, resource=self.engine)
+                torch.cuda.synchronize()
+                gc.collect()
+                torch.cuda.empty_cache()
+        except Exception:
+            if mutation_started:
+                self.engine.fail_sleep_wakeup_transition()
+            self.engine.abort_sleep_transition()
+            logger.exception("Encountered an error in sleep")
+            raise
+        try:
+            self.engine.complete_sleep_transition()
+        except Exception:
+            self.engine.fail_sleep_wakeup_transition()
+            raise
 
     @control_action_decorator
     def wakeup(self, wakeup_tags: List[str]):
@@ -338,15 +351,30 @@ class RayGPUWorker(RpcWorkerMixin, BaseWorker):
             raise ValueError(
                 "Sleep feature is not enabled, please set sleep_config in the LLM arguments."
             )
+        tags = [ExecutorMemoryType(tag) for tag in wakeup_tags]
+        tags = self._prepare_wakeup_tags(tags)
+        if not tags:
+            return
+
+        logger.info(f"Wakeup: {tags}")
+        self.engine.begin_wakeup_transition(tags)
+        mutation_started = False
         try:
-            tags = [ExecutorMemoryType(tag) for tag in wakeup_tags]
-            logger.info(f"Wakeup: {tags}")
             torch.cuda.synchronize()
+            mutation_started = True
             materialize_with_tag(*tags, resource=self.engine)
             torch.cuda.synchronize()
-        except Exception as e:
-            logger.error(f"Encountered an error in wakeup")
-            raise e
+        except Exception:
+            if mutation_started:
+                self.engine.fail_sleep_wakeup_transition()
+            self.engine.abort_wakeup_transition()
+            logger.exception("Encountered an error in wakeup")
+            raise
+        try:
+            self.engine.complete_wakeup_transition()
+        except Exception:
+            self.engine.fail_sleep_wakeup_transition()
+            raise
 
     def start(self):
         pass

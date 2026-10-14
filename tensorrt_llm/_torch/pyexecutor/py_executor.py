@@ -2060,11 +2060,11 @@ class PyExecutor:
         return self.executor_request_queue.can_enqueue_request()
 
     def begin_sleep_transition(self, tags: list[ExecutorMemoryType]) -> None:
-        self.validate_sleep(tags)
+        self.validate_sleep_tags(tags)
         self.executor_request_queue.begin_sleep_transition(tag.value
                                                            for tag in tags)
 
-    def validate_sleep(self, tags: list[ExecutorMemoryType]) -> None:
+    def validate_sleep_tags(self, tags: list[ExecutorMemoryType]) -> None:
         if (self._is_kv_manager_v2 and self.kv_cache_transceiver is not None
                 and ExecutorMemoryType.KV_CACHE in tags):
             raise NotImplementedError(
@@ -3729,6 +3729,7 @@ class PyExecutor:
                             elif target_action == _SleepWakeupAction.SLEEP:
                                 self._run_mnnvl_checkpoint_resources(
                                     target_action, tags)
+                                self.invalidate_v1_prefix_cache_for_sleep(tags)
                                 release_with_tag(*tags, resource=self)
                                 torch.cuda.synchronize()
                                 gc.collect()
@@ -9530,13 +9531,6 @@ class PyExecutor:
                                 "route_capture", None)
         if route_capture is not None:
             route_capture.clear_shared()
-
-    def validate_sleep_tags(self, tags: List[ExecutorMemoryType]) -> None:
-        """Reject runtime-memory tags unsupported by the active KV manager."""
-        if (self._is_kv_manager_v2 and ExecutorMemoryType.KV_CACHE in tags):
-            raise ValueError(
-                "KV_CACHE sleep is not supported with KVCacheManagerV2 because "
-                "its main pools are not managed by tagged virtual memory.")
 
     def invalidate_v1_prefix_cache_for_sleep(
             self, tags: List[ExecutorMemoryType]) -> None:

@@ -276,8 +276,8 @@ The `kv_cache` entry in `sleep_config.restore_modes` controls the KV data policy
 | Mode | Sleep | Wakeup |
 | --- | --- | --- |
 | `CPU`, `PINNED` | Suspend internal requests and evict GPU pages through the configured host and optional disk tiers. Reusable pages may be dropped under capacity pressure. | Restore GPU pool capacity and resume internal requests. Reusable pages return to GPU on demand. |
-| `NONE` | Discard KV contents and reusable prefixes, retaining the information needed to recreate internal request caches. | Recreate internal request caches with uninitialized KV storage. |
-| `MEMSET` | Discard KV contents and reusable prefixes as for `NONE`. | Zero the restored GPU pools, then recreate internal request caches. |
+| `NONE` | Discard KV contents and reusable prefixes while retaining native cache objects and their logical state. | Materialize the retained caches' pages with uninitialized KV storage. |
+| `MEMSET` | Discard KV contents and reusable prefixes as for `NONE`. | Zero the restored GPU pools and materialized host pages, then resume the retained caches. |
 
 V2 uses its existing pinned host tier for both `CPU` and `PINNED`; these modes
 provide the same KV-cache policy and do not promise to retain every reusable
@@ -286,7 +286,7 @@ held by suspended internal requests cannot be dropped; an inability to place
 those pages in the configured tiers fails the sleep operation.
 
 Sleep drains user requests before changing memory. Internal padding requests
-retain their request identities and metadata buffers, while their page indices
+retain their native cache identities, logical state, and metadata buffers, while their page indices
 are refreshed on wakeup. GPU pool virtual addresses remain reserved throughout
 sleep. Both hot and cold GPU pools release their physical backing and recover
 their capacities on wakeup. Encoded cold pages retain their representation when

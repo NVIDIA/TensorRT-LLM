@@ -163,7 +163,10 @@ def test_mpi_sleep_wakeup_tp2(process_gpu_memory_info_available):
         llm.resume([ExecutorMemoryType.MODEL_WEIGHTS_MAIN])
         status = llm.get_memory_status()
         assert status.state == "parked"
-        assert status.parked_tags == [ExecutorMemoryType.MODEL_ENGINE_MAIN]
+        assert status.parked_tags == [
+            ExecutorMemoryType.KV_CACHE,
+            ExecutorMemoryType.MODEL_ENGINE_MAIN,
+        ]
 
         llm.resume()
         assert llm.get_memory_status().state == "running"
@@ -231,9 +234,11 @@ def test_mpi_sleep_wakeup_kv_cache_only_tp2(process_gpu_memory_info_available):
             active_devices = {dev for dev, size in mem_active.items() if size > 0}
             if process_gpu_memory_info_available:
                 assert len(active_devices) == 2
-            llm._collective_rpc("sleep", (sleep_tags,))
+            llm.release(sleep_tags)
+            assert llm.get_memory_status().state == "parked"
             mem_sleep = _per_device_gpu_memory()
-            llm._collective_rpc("wakeup", (sleep_tags,))
+            llm.resume(sleep_tags)
+            assert llm.get_memory_status().state == "running"
             mem_wakeup = _per_device_gpu_memory()
             print(f"cycle={cycle} active={mem_active} asleep={mem_sleep} awake={mem_wakeup}")
             if process_gpu_memory_info_available:

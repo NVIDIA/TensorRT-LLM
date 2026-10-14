@@ -70,28 +70,30 @@ def _make_worker(backend="pytorch", world_size=1, sleep_config=_SLEEP_CONFIG_DEF
     return w
 
 
-class TestV2KvCacheSleepRejection:
+class TestRegisteredV2KvCacheSleepRejection:
     @pytest.mark.parametrize(
-        "use_v2,tags,should_raise",
+        "use_v2,has_transceiver,tags,should_raise",
         [
-            (True, ["kv_cache"], True),
-            (True, ["model", "kv_cache"], True),
-            (True, ["model"], False),
-            (False, ["kv_cache"], False),
+            (True, True, ["kv_cache"], True),
+            (True, True, ["model", "kv_cache"], True),
+            (True, True, ["model"], False),
+            (True, False, ["kv_cache"], False),
+            (False, True, ["kv_cache"], False),
         ],
     )
-    def test_validation_conditions(self, use_v2, tags, should_raise):
+    def test_validation_conditions(self, use_v2, has_transceiver, tags, should_raise):
         from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
         from tensorrt_llm.llmapi.llm_args import ExecutorMemoryType
 
         executor = object.__new__(PyExecutor)
         executor._is_kv_manager_v2 = use_v2
+        executor.kv_cache_transceiver = MagicMock() if has_transceiver else None
         parsed_tags = [ExecutorMemoryType(tag) for tag in tags]
 
         if should_raise:
             with pytest.raises(
-                ValueError,
-                match="KV_CACHE sleep is not supported with KVCacheManagerV2",
+                NotImplementedError,
+                match="remote memory re-registration",
             ):
                 executor.validate_sleep_tags(parsed_tags)
         else:
@@ -99,13 +101,13 @@ class TestV2KvCacheSleepRejection:
 
     def test_rejected_before_transition_or_mpi_dispatch(self):
         worker = _make_worker(world_size=2)
-        worker.engine.validate_sleep_tags.side_effect = ValueError(
-            "KV_CACHE sleep is not supported with KVCacheManagerV2"
+        worker.engine.validate_sleep_tags.side_effect = NotImplementedError(
+            "remote memory re-registration"
         )
 
         with pytest.raises(
-            ValueError,
-            match="KV_CACHE sleep is not supported with KVCacheManagerV2",
+            NotImplementedError,
+            match="remote memory re-registration",
         ):
             worker.sleep(["kv_cache"])
 
@@ -299,7 +301,7 @@ class TestBaseWorkerRetrySemantics:
 
         expected = [ExecutorMemoryType.MODEL_ENGINE_MAIN]
         w.engine.begin_wakeup_transition.assert_called_once_with(expected)
-        materialize.assert_called_once_with(*expected)
+        materialize.assert_called_once_with(*expected, resource=w.engine)
         w.engine.complete_wakeup_transition.assert_called_once_with()
 
     def test_transitional_state_rejects_operations(self):
