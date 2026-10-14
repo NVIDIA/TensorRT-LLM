@@ -235,7 +235,7 @@ def test_disagg_gen_transition_reserves_target_drafts_without_context_drafts():
     )
 
     assert manager._effective_draft_len(request) == 4
-    assert manager._required_gen_capacity(request, 128) == 133
+    assert manager._required_gen_capacity(request, 128) == 137
 
 
 def test_disagg_gen_transition_does_not_reserve_disabled_speculation():

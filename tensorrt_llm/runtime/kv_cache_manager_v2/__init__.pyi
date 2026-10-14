@@ -293,6 +293,7 @@ class KVCacheManagerConfig:
     enable_stats: bool = True
     text_only: bool = False
     enable_partial_commit: bool = True
+    reuse_match_alignment: int = 1
     @property
     def enable_swa_scratch_reuse(self) -> bool: ...
 

@@ -121,6 +121,7 @@ class _KVCacheManagerConfigFieldSpec:
     max_util_for_resume: float = 0.97
     enable_partial_reuse: bool = True
     reuse_match_backoff: int = 0
+    reuse_match_alignment: int = 1
     constraints: object = None
     typical_step: object = None
     initial_pool_ratio: object = None

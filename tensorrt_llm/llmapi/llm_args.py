@@ -2589,6 +2589,21 @@ class MooncakeStoreConfig(StrictBaseModel):
         "hold.")
     transfer_batch_size: PositiveInt = Field(
         64, telemetry=False, description="Page keys per store call.")
+    async_load: bool = Field(
+        False,
+        telemetry=False,
+        description="Load stored prefixes on background workers while requests "
+        "are parked outside the compute batch. Requires attention DP or a single rank.")
+    async_load_workers: PositiveInt = Field(
+        1,
+        telemetry=False,
+        description="Background prefix-load workers per rank, each with its own CUDA stream.")
+    staging_buffer_bytes: Union[PositiveInt, str] = Field(
+        "1GiB",
+        telemetry=False,
+        description="Pinned-memory ceiling per synchronous transfer direction and "
+        "for the async workers together. Async workers split one additional load "
+        "budget; every worker must fit at least the largest KV page.")
     namespace: Optional[str] = Field(
         None,
         description="Key namespace, isolating this deployment's cache from "
@@ -2641,6 +2656,15 @@ class MooncakeStoreConfig(StrictBaseModel):
                 "through pinned host memory, which is the only transfer path "
                 "this connector supports today.")
         return True
+
+    @field_validator("staging_buffer_bytes", mode="after")
+    @classmethod
+    def _check_staging_buffer_bytes(cls, value):
+        from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.config import \
+            parse_size
+        if parse_size(value, strict_units=True) <= 0:
+            raise ValueError("mooncake_store.staging_buffer_bytes must be > 0")
+        return value
 
     @field_validator("segment_size", mode="after")
     @classmethod

@@ -39,6 +39,11 @@ void DiskCacheTierConfig::assertValid() const
 
 void KVCacheManagerConfig::validate() const
 {
+    if (reuseMatchAlignment <= 0 || tokensPerBlock % reuseMatchAlignment != 0)
+    {
+        throw AssertionError(
+            "KVCacheManagerConfig: reuse_match_alignment must be a positive divisor of tokens_per_block");
+    }
     if (swaScratchReuse.has_value())
     {
         swaScratchReuse->validate();
