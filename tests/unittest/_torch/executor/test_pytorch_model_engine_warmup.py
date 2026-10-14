@@ -821,22 +821,60 @@ def test_cuda_graph_warmup_request_passes_beam_width_to_kv_cache_managers() -> N
         draft.shutdown()
 
 
+def _create_vswa_beam_search_kv_cache_manager(
+    engine: PyTorchModelEngine, blocks_per_window: int
+) -> KVCacheManager:
+    # One sliding-window layer and one full-attention layer. VSWA pools are
+    # sized from max_gpu_total_bytes, split evenly between the windows.
+    config = engine.model.config
+    bytes_per_block = 2 * config.num_key_value_heads * config.head_dim * 2 * _BEAM_TOKENS_PER_BLOCK
+    return KVCacheManager(
+        KvCacheConfig(
+            enable_block_reuse=False,
+            max_attention_window=[_BEAM_MAX_SEQ_LEN // 2, _BEAM_MAX_SEQ_LEN],
+            max_gpu_total_bytes=2 * blocks_per_window * bytes_per_block,
+        ),
+        tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
+        num_layers=2,
+        num_kv_heads=config.num_key_value_heads,
+        head_dim=config.head_dim,
+        tokens_per_block=_BEAM_TOKENS_PER_BLOCK,
+        max_seq_len=_BEAM_MAX_SEQ_LEN,
+        max_batch_size=_BEAM_BATCH_SIZE,
+        max_beam_width=_BEAM_WIDTH,
+        mapping=Mapping(world_size=1, tp_size=1, rank=0),
+        dtype=tensorrt_llm.bindings.DataType.HALF,
+    )
+
+
 def test_cuda_graph_warmup_request_skips_beam_search_batch_below_one_token() -> None:
-    """When the capacity reported for beam search is below one token, the
-    batch size is skipped and the warmup requests already added are freed."""
-    # Stands in for a manager whose pool cannot hold one more token per beam
-    # but whose add_dummy_requests cannot detect it (VSWA pools).
+    """add_dummy_requests does not check beam-search capacity for VSWA pools,
+    so a batch size whose capacity is below one token must be skipped and the
+    warmup requests already added must be freed."""
+    # Each request reserves one block of draft tokens, so it needs two blocks
+    # per beam in each window. The three filler requests take 24 of the 28
+    # blocks per window; the 4 left are less than one token for 4 beams.
+    blocks_per_window = 28
     engine = _build_beam_search_engine(max_tokens=1024)
     runner = engine._runner
-    kv_cache_manager = _create_beam_search_kv_cache_manager(engine, max_tokens=1024)
-    kv_cache_manager.get_num_available_tokens = Mock(return_value=0)
+    runner._config = replace(runner._config, max_draft_loop_tokens=_BEAM_TOKENS_PER_BLOCK)
+    kv_cache_manager = _create_vswa_beam_search_kv_cache_manager(engine, blocks_per_window)
+    kv_cache_manager.add_dummy_requests = Mock(wraps=kv_cache_manager.add_dummy_requests)
     resource_manager = ResourceManager({ResourceManagerType.KV_CACHE_MANAGER: kv_cache_manager})
+
+    def free_blocks_per_window() -> dict[int, int]:
+        return dict(kv_cache_manager.impl.get_kv_cache_stats().num_free_blocks_per_window_size)
+
     try:
-        total_free = kv_cache_manager.get_num_free_blocks()
+        assert kv_cache_manager.is_vswa
+        total_free = free_blocks_per_window()
+        assert sorted(total_free.values()) == [blocks_per_window] * 2
         assert (
             runner._create_cuda_graph_warmup_request(resource_manager, _BEAM_BATCH_SIZE, 0) is None
         )
-        assert kv_cache_manager.get_num_free_blocks() == total_free
+        # Only the filler requests were added; the longest one was skipped.
+        kv_cache_manager.add_dummy_requests.assert_called_once()
+        assert free_blocks_per_window() == total_free
     finally:
         kv_cache_manager.shutdown()
 
