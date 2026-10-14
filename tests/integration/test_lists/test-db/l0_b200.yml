@@ -128,6 +128,7 @@ l0_b200:
   - unittest/llmapi/test_deepseek_v4_tokenizer.py
   - unittest/_torch/modules/test_mhc.py
   - unittest/_torch/modules/test_engram.py
+  - unittest/_torch/modules/test_multi_stream_utils.py
   # ------------- DeepSeek-V4.1 model, Engram and DSpark ---------------
   - unittest/_torch/modeling/test_modeling_deepseekv41.py
   - unittest/_torch/modules/test_engram_decode_hash.py
@@ -155,6 +156,7 @@ l0_b200:
   # round-trip. Both are single-device cases that use GPU 0 only.
   - unittest/_torch/modules/kimi_kda/test_kda_host_metadata.py
   - unittest/_torch/modules/kimi_kda/test_kimi_kda_bf16_state_pool.py
+  - unittest/_torch/modules/kimi_kda/test_kda_mixed_batch_core_layout.py
   # GPU KDA disagg transfer + peer-validation (cpu_only cases skipped by the
   # stage's "not cpu_only" markexpr and run on the CPU-Generic stage instead).
   - unittest/disaggregated/test_kda_mamba_transfer.py
