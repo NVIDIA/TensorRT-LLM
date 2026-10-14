@@ -115,8 +115,8 @@ def _make_model_config_with_kv_quant(kv_cache_quant_algo):
 
 
 def _make_kv_cache_config(
-    *, use_kv_cache_manager_v2: bool = False, cross_kv_cache_fraction: float | None = None
-):
+    *, use_kv_cache_manager_v2: bool, cross_kv_cache_fraction: float | None = None
+) -> types.SimpleNamespace:
     return types.SimpleNamespace(
         use_kv_cache_manager_v2=use_kv_cache_manager_v2,
         cross_kv_cache_fraction=cross_kv_cache_fraction,
@@ -342,10 +342,7 @@ def test_model_config_sets_is_encoder_decoder_from_pretrained_config():
 
 
 def test_validate_encoder_decoder_kv_cache_config_accepts_v1_enc_dec():
-    """V1 KVCacheManager is the default and production target for enc-dec models.
-
-    Both V1 and V2 are supported as long as ``cross_kv_cache_fraction`` is set.
-    """
+    """Both V1 and V2 are supported as long as ``cross_kv_cache_fraction`` is set."""
     model_config = ModelConfig(
         pretrained_config=make_pretrained_config(
             head_dim=4,
@@ -359,7 +356,10 @@ def test_validate_encoder_decoder_kv_cache_config_accepts_v1_enc_dec():
     )
 
 
-def test_validate_encoder_decoder_kv_cache_config_requires_cross_fraction():
+@pytest.mark.parametrize("use_kv_cache_manager_v2", [False, True])
+def test_validate_encoder_decoder_kv_cache_config_requires_cross_fraction(
+    use_kv_cache_manager_v2: bool,
+) -> None:
     model_config = ModelConfig(
         pretrained_config=make_pretrained_config(
             head_dim=4,
@@ -370,11 +370,14 @@ def test_validate_encoder_decoder_kv_cache_config_requires_cross_fraction():
     with pytest.raises(ValueError, match="cross_kv_cache_fraction to be set"):
         validate_encoder_decoder_kv_cache_config(
             model_config,
-            _make_kv_cache_config(use_kv_cache_manager_v2=True),
+            _make_kv_cache_config(use_kv_cache_manager_v2=use_kv_cache_manager_v2),
         )
 
 
-def test_validate_encoder_decoder_kv_cache_config_rejects_cross_fraction_for_decoder_only():
+@pytest.mark.parametrize("use_kv_cache_manager_v2", [False, True])
+def test_validate_encoder_decoder_kv_cache_config_rejects_cross_fraction_for_decoder_only(
+    use_kv_cache_manager_v2: bool,
+) -> None:
     model_config = ModelConfig(
         pretrained_config=make_pretrained_config(
             head_dim=4,
@@ -385,7 +388,9 @@ def test_validate_encoder_decoder_kv_cache_config_rejects_cross_fraction_for_dec
     with pytest.raises(ValueError, match="should only be set for encoder-decoder models"):
         validate_encoder_decoder_kv_cache_config(
             model_config,
-            _make_kv_cache_config(cross_kv_cache_fraction=0.5),
+            _make_kv_cache_config(
+                use_kv_cache_manager_v2=use_kv_cache_manager_v2, cross_kv_cache_fraction=0.5
+            ),
         )
 
 
