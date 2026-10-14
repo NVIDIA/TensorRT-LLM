@@ -443,6 +443,18 @@ if(ENABLE_BOLT_COMPATIBLE AND NOT WIN32)
   add_compile_options(-fno-plt)
   # Linker flags - applies to shared, module, and executable targets
   add_link_options(-Wl,--emit-relocs)
+  # Ubuntu's aarch64 GCC turns on -mfix-cortex-a53-843419 by default, which
+  # makes the linker rewrite some loads as a branch to a veneer that performs
+  # the load and jumps back. BOLT reads that branch as a tail call, so when it
+  # relocates the function it patches the veneer's return site with an x16
+  # trampoline and destroys a live x16. Grace is not a Cortex-A53, so the
+  # workaround only costs us correctness here. Note there is no
+  # -Wl,--no-fix-cortex-a53-843419: GNU ld rejects it, the driver flag is the
+  # only way to stop the option being passed.
+  if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64" AND CMAKE_CXX_COMPILER_ID
+                                                        STREQUAL "GNU")
+    add_link_options(-mno-fix-cortex-a53-843419)
+  endif()
   # Disable stripping - required for BOLT (affects pybind11 POST_BUILD strip)
   set(CMAKE_STRIP
       ""
