@@ -1054,7 +1054,17 @@ class PyTorchModelEngine(ModelEngine):
         assert resource_manager is not None, (
             "scheduled warmup requires a resource manager")
         assert isinstance(self._runner, ScheduledModelRunner)
-        self._runner.warmup(resource_manager)
+        from ..jit_prefetch import prefetch_enabled
+        record_decode = prefetch_enabled()
+        if record_decode:
+            # The Mamba decode provider plans from the launches warmup makes.
+            from ..modules.mamba import jit_prefetch_decode
+            jit_prefetch_decode.start_recording(self.model)
+        try:
+            self._runner.warmup(resource_manager)
+        finally:
+            if record_decode:
+                jit_prefetch_decode.stop_recording()
         self._init_jit_prefetch()
 
     def _init_jit_prefetch(self) -> None:
@@ -1138,6 +1148,10 @@ class PyTorchModelEngine(ModelEngine):
         if provider and prefetcher.register("mamba_ssd", provider):
             logger.info(f"[JIT prefetch] Mamba SSD provider: "
                         f"{len(provider.shapes)} distinct layer shape(s)")
+        from ..modules.mamba.jit_prefetch_decode import MambaDecodeProvider
+        decode_provider = MambaDecodeProvider(self.batch_size)
+        if decode_provider:
+            prefetcher.register("mamba_decode", decode_provider)
         # Helpers were started when the prefetcher was created; make sure
         # their start-up is paid here, inside warmup, not by a request.
         prefetcher.wait_ready()
