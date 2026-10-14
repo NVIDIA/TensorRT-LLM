@@ -5642,13 +5642,17 @@ class KVCacheManagerV2(BaseResourceManager):
         # The newest sampled token has no KV until the next forward pass.
         stable_token_count = request.max_beam_num_tokens - 1
         is_end = request.state == LlmRequestState.GENERATION_COMPLETE
-        if stable_token_count > kv_cache.num_committed_tokens:
-            tokens = self._augment_tokens_for_block_reuse(
-                self._reuse_token_source(request),
-                request,
-                start=kv_cache.num_committed_tokens,
-                end=stable_token_count,
-            )
+        start = kv_cache.num_committed_tokens
+        if stable_token_count > start:
+            tokens = self._reuse_token_source(request)
+            if start >= request.prompt_len:
+                # Multimodal items live in the prompt, so generated text needs no digests.
+                tokens = tokens[start:stable_token_count]
+            else:
+                # A generation-only request may still have an uncommitted prompt suffix.
+                tokens = self._augment_tokens_for_block_reuse(
+                    tokens, request, start=start, end=stable_token_count
+                )
             kv_cache.commit(tokens, is_end=is_end)
         elif is_end:
             kv_cache.commit([], is_end=True)

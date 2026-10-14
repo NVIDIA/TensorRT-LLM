@@ -132,9 +132,7 @@ def test_generation_commits_stable_tokens_after_relocation_and_resize(
     request.py_rewind_draft_token_separate_adjustment = 0
     request.is_dummy_request = False
     request.is_context_only_request = False
-    request.multimodal_hashes = None
-    request.multimodal_positions = None
-    request.multimodal_lengths = None
+    request.prompt_len = 100
     request.get_tokens_view = lambda beam_id: list(range(201))
     batch = SimpleNamespace(generation_requests=[request])
     attn_metadata = object()

@@ -3432,11 +3432,16 @@ def test_generation_token_slice_shares_token_view() -> None:
     request.get_tokens_view.assert_called_once_with(DEFAULT_BEAM_INDEX)
 
 
-def test_try_commit_generation_blocks_commits_only_materialized_prefix() -> None:
+# Only a range that still overlaps the prompt can hold multimodal items to augment.
+@pytest.mark.parametrize(("prompt_len", "augments"), [(10, False), (12, True)])
+def test_try_commit_generation_blocks_commits_only_materialized_prefix(
+    prompt_len: int, augments: bool
+) -> None:
     request = SimpleNamespace(
         py_request_id=1,
         is_dummy_request=False,
         is_context_only_request=False,
+        prompt_len=prompt_len,
         max_beam_num_tokens=15,
         state=LlmRequestState.GENERATION_IN_PROGRESS,
         get_tokens_view=lambda beam_id: np.arange(15, dtype=np.int32),
@@ -3444,10 +3449,13 @@ def test_try_commit_generation_blocks_commits_only_materialized_prefix() -> None
     kv_cache = _FakeKVCache(num_committed_tokens=10)
     manager = _make_publishing_manager(BlockReusePolicy.ALL_REUSABLE)
     manager.kv_cache_map = {request.py_request_id: kv_cache}
-    manager._augment_tokens_for_block_reuse = lambda tokens, request, start, end: tokens[start:end]
+    manager._augment_tokens_for_block_reuse = Mock(
+        side_effect=lambda tokens, request, start, end: tokens[start:end]
+    )
 
     manager.try_commit_generation_blocks(request)
 
+    assert manager._augment_tokens_for_block_reuse.called is augments
     assert list(kv_cache.committed_tokens) == [10, 11, 12, 13]
     assert kv_cache.num_committed_tokens == 14
     assert not kv_cache.commit_is_end
