@@ -327,14 +327,17 @@ void McastDeviceMemory::initializePointerTables()
     TLLM_CUDA_CHECK(cudaMemcpy(mUcPtrsDev, mUcPtrs.data(), mGroupSize * sizeof(CUdeviceptr), cudaMemcpyHostToDevice));
 }
 
+void deleteMcastDevMemOwner(void* context)
+{
+    delete static_cast<DeviceMemoryOwner*>(context);
+}
+
 McastDeviceMemory::~McastDeviceMemory() noexcept
 {
     int previousDevice{-1};
     bool const restoreDevice = cudaGetDevice(&previousDevice) == cudaSuccess;
     cleanupNoThrow("device selection", [this]() { TLLM_CUDA_CHECK_FREE_RESOURCE(cudaSetDevice(mDeviceIdx)); });
     cleanupNoThrow("device synchronization", []() { TLLM_CUDA_CHECK_FREE_RESOURCE(cudaDeviceSynchronize()); });
-    cleanupNoThrow(
-        "multicast buffer registration", [this]() { tensorrt_llm::common::unregisterMcastDevMemBuffer(this); });
     if (mIsMNNvlink)
     {
         if (mState != State::kUnmapped)

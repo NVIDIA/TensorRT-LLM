@@ -15,7 +15,6 @@
  */
 #pragma once
 
-#include "tensorrt_llm/common/mcastDevMemUtils.h"
 #include "tensorrt_llm/runtime/ipcNvlsMemory.h"
 #include "tensorrt_llm/runtime/mcastGroupComm.h"
 #include <cstddef>
@@ -27,6 +26,12 @@
 
 namespace tensorrt_llm::runtime
 {
+
+class McastDeviceMemory;
+using DeviceMemoryOwner = std::shared_ptr<McastDeviceMemory>;
+
+//! Delete the shared allocation owner retained by a multicast tensor storage.
+void deleteMcastDevMemOwner(void* context);
 
 //! \brief A class that manages multicast device memory for efficient communication between GPUs.
 //!
