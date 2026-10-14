@@ -20,6 +20,8 @@
 #include "tensorrt_llm/runtime/torchUtils.h"
 #include "tensorrt_llm/thop/cublasScaledMM.h"
 
+#include <cstdint>
+
 namespace th = torch;
 namespace tl = tensorrt_llm;
 namespace tk = tensorrt_llm::kernels;
@@ -79,34 +81,46 @@ th::Tensor dsv3_router_gemm_op(th::Tensor const& mat_a, th::Tensor const& mat_b,
     constexpr int kNumExperts = 256;
     constexpr int kHiddenDim7168 = 7168; // DeepSeek-V3 / DeepSeek-V3.2
     constexpr int kHiddenDim6144 = 6144; // GLM-5
-    constexpr int kHiddenDim4096 = 4096; // DeepSeek-V4
+    constexpr int kHiddenDim4096 = 4096; // DeepSeek-V4, GLM-5.3-Flash
+    constexpr int kNumExperts288 = 288;  // GLM-5.3-Flash
     std::vector<int64_t> output_size = {mat_a.sizes()[0], mat_b.sizes()[1]};
     th::Tensor out = th::empty(output_size, mat_a.options().dtype(out_dtype_));
     TORCH_CHECK(mat_a.dim() == 2 && mat_b.dim() == 2);
     TORCH_CHECK(mat_a.strides()[1] == 1 && out.strides()[1] == 1); // Row-major
     TORCH_CHECK(mat_b.strides()[0] == 1);                          // Column-major
     auto stream = at::cuda::getCurrentCUDAStream(mat_a.get_device());
-    bool const shape_ok
-        = (num_tokens >= 1 && num_tokens <= 16 && num_experts == kNumExperts && mat_b.sizes()[0] == hidden_dim
-            && data_type == torch::kBFloat16 && out_dtype_ == torch::kFloat32 && !bias.has_value());
+    bool const shape_ok = (num_tokens >= 1 && num_tokens <= 16 && mat_b.sizes()[0] == hidden_dim
+        && data_type == torch::kBFloat16 && out_dtype_ == torch::kFloat32 && !bias.has_value());
+    // The low-latency kernels load both operands in 16-byte chunks, so an operand that does not start on a
+    // 16-byte boundary is copied (clone keeps its layout).
+    auto const aligned16
+        = [](th::Tensor const& t) { return reinterpret_cast<uintptr_t>(t.data_ptr()) % 16 == 0 ? t : t.clone(); };
+    th::Tensor const input = shape_ok ? aligned16(mat_a) : mat_a;
+    th::Tensor const weights = shape_ok ? aligned16(mat_b) : mat_b;
 
-    if (shape_ok && hidden_dim == kHiddenDim7168)
+    if (shape_ok && num_experts == kNumExperts && hidden_dim == kHiddenDim7168)
     {
         LoopUnroller<1, 16, kNumExperts, kHiddenDim7168>::unroll(num_tokens,
-            reinterpret_cast<float*>(out.mutable_data_ptr()), reinterpret_cast<__nv_bfloat16 const*>(mat_a.data_ptr()),
-            reinterpret_cast<__nv_bfloat16 const*>(mat_b.data_ptr()), stream);
+            reinterpret_cast<float*>(out.mutable_data_ptr()), reinterpret_cast<__nv_bfloat16 const*>(input.data_ptr()),
+            reinterpret_cast<__nv_bfloat16 const*>(weights.data_ptr()), stream);
     }
-    else if (shape_ok && hidden_dim == kHiddenDim6144)
+    else if (shape_ok && num_experts == kNumExperts && hidden_dim == kHiddenDim6144)
     {
         LoopUnroller<1, 16, kNumExperts, kHiddenDim6144>::unroll(num_tokens,
-            reinterpret_cast<float*>(out.mutable_data_ptr()), reinterpret_cast<__nv_bfloat16 const*>(mat_a.data_ptr()),
-            reinterpret_cast<__nv_bfloat16 const*>(mat_b.data_ptr()), stream);
+            reinterpret_cast<float*>(out.mutable_data_ptr()), reinterpret_cast<__nv_bfloat16 const*>(input.data_ptr()),
+            reinterpret_cast<__nv_bfloat16 const*>(weights.data_ptr()), stream);
     }
-    else if (shape_ok && hidden_dim == kHiddenDim4096)
+    else if (shape_ok && num_experts == kNumExperts && hidden_dim == kHiddenDim4096)
     {
         LoopUnroller<1, 16, kNumExperts, kHiddenDim4096>::unroll(num_tokens,
-            reinterpret_cast<float*>(out.mutable_data_ptr()), reinterpret_cast<__nv_bfloat16 const*>(mat_a.data_ptr()),
-            reinterpret_cast<__nv_bfloat16 const*>(mat_b.data_ptr()), stream);
+            reinterpret_cast<float*>(out.mutable_data_ptr()), reinterpret_cast<__nv_bfloat16 const*>(input.data_ptr()),
+            reinterpret_cast<__nv_bfloat16 const*>(weights.data_ptr()), stream);
+    }
+    else if (shape_ok && num_experts == kNumExperts288 && hidden_dim == kHiddenDim4096)
+    {
+        LoopUnroller<1, 16, kNumExperts288, kHiddenDim4096>::unroll(num_tokens,
+            reinterpret_cast<float*>(out.mutable_data_ptr()), reinterpret_cast<__nv_bfloat16 const*>(input.data_ptr()),
+            reinterpret_cast<__nv_bfloat16 const*>(weights.data_ptr()), stream);
     }
     else // fallback to cublas, can be slow
     {

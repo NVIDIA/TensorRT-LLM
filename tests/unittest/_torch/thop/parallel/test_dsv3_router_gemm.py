@@ -24,15 +24,21 @@ def router_gemm_ref(input, weight, bias, dtype):
 
 @pytest.mark.parametrize(
     "num_tokens", [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16])
-@pytest.mark.parametrize("num_experts", [256])
-@pytest.mark.parametrize("hidden_size", [7168, 6144, 4096])
+@pytest.mark.parametrize("num_experts,hidden_size", [(256, 7168), (256, 6144),
+                                                     (256, 4096), (288, 4096)])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
-def test_router_gemm_run(num_tokens, num_experts, hidden_size, dtype):
+# An input 8 bytes past a 16-byte boundary must still be read correctly.
+@pytest.mark.parametrize("storage_offset", [0, 4])
+def test_router_gemm_run(num_tokens, num_experts, hidden_size, dtype,
+                         storage_offset):
     torch.manual_seed(24)
     torch.cuda.manual_seed(24)
 
     device = torch.device("cuda")
-    input = torch.randn(num_tokens, hidden_size, dtype=dtype, device=device)
+    input = torch.randn(num_tokens * hidden_size + storage_offset,
+                        dtype=dtype,
+                        device=device)[storage_offset:].view(
+                            num_tokens, hidden_size)
     weight = torch.randn((num_experts, hidden_size), dtype=dtype, device=device)
     bias = None
     logits = torch.ops.trtllm.dsv3_router_gemm_op(input, weight.t(), bias,
