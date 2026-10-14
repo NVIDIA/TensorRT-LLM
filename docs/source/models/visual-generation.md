@@ -183,6 +183,13 @@ are not supported. See the
   role `reference`. Audio requires an image or video reference. See the
   [Ref2VA example](../../../examples/visual_gen/README.md#minimax-h3-reference-to-video-and-audio)
   for input limits, ordering, and media dependencies.
+- MiniMax-H3 supports tensor parallelism for the Qwen3-VL text encoder through
+  `parallel_config.text_encoder_tp_size`. Ranks `[0, text_encoder_tp_size)`
+  shard the text encoder and rank 0 broadcasts prompt embeddings to the rest of
+  the VisualGen ranks. This is separate from DiT tensor parallelism (`tp_size`),
+  which is still unsupported for MiniMax-H3. Text encoder TP currently supports
+  text-only prompts; FL2VA keyframes and Ref2VA image or video references must
+  use `text_encoder_tp_size: 1`.
 - MiniMax-H3 currently restricts TRTLLM attention to SM100 or SM103. This is a
   model-specific restriction, not a general VisualGen backend requirement.
 - The published [MiniMax-H3 checkpoint license](https://huggingface.co/MiniMaxAI/MiniMax-H3/blob/main/LICENSE)
@@ -406,6 +413,10 @@ Configured under `VisualGenArgs.parallel_config`. Modes can be combined:
     - **Ring Attention** (`ring_size: N`): Shards the sequence axis across a 1D ring of `N` ranks, streaming K/V blocks (CP degree = `N`; total SP degree = `N · ulysses_size`; mutually exclusive with Attention2D).
 - **Tensor Parallelism** (`tp_size: N`): Splits attention heads and transformer MLPs across GPUs for faster compute and reduced memory usage.
     - **Token-sharded TP** (`tp_layout: token_sharded` in `parallel_config`, prototype): Keeps the residual stream sharded by tokens across the TP group, so each all-reduce becomes a reduce-scatter plus an all-gather and the norms, modulation and quantization between projections run on `1/tp_size` of the tokens. Requires `tp_size > 1`; composes with CFG parallelism, not with Ulysses, Ring Attention, Attention2D or VSA. Supported for Wan 2.1 and Wan 2.2.
+- **Text encoder tensor parallelism** (`text_encoder_tp_size: N`): MiniMax-H3
+  only. Shards the Qwen3-VL text encoder over the first N ranks for text-only
+  prompt encoding, then broadcasts prompt embeddings to the remaining VisualGen
+  ranks. This does not enable DiT tensor parallelism for MiniMax-H3.
 
 For multi-node execution, VisualGen relies on the external launcher to terminate
 the remaining ranks when any rank exits. `torchrun` provides this behavior. With
