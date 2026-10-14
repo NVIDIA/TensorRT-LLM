@@ -2,15 +2,15 @@ schema_version: 1
 vendors:
   flashinfer-prims-ts:
     url: https://github.com/yuxianq/flashinfer.git
-    branch: trtllm-prims-ts-dev-20261012
-    commit: ae312f7cc1723b06fda5168105ade0f328ee47d8
+    branch: bug-6791733-prims-ts-cuda-graph--source-q-tma-release13
+    commit: 6b00497398f491136be91fb0e60ac3f314da53ba
     source: flashinfer/attention/prims_ts
     destination: tensorrt_llm/_torch/attention/backends/prims_ts
     include:
     - '**/*.py'
     patch: 3rdparty/vendor_patches/flashinfer-prims-ts.patch
     patch_digest: sha256:65cc08e20a9cc7bdc190eb6f3e79124986dced74394c1f3250ae2d100a8ee340
-    digest: sha256-tree-v1:e411b6c6679474d362b166e586df4276f52322d75a35c59c782d6266143e560e
+    digest: sha256-tree-v1:27b127506e2637f9e7f2a0cce0e3a3812597c0fdc688495542fdf4a40040e459
   sana-sol-attn:
     url: https://github.com/NVlabs/Sana.git
     branch: sol-engine

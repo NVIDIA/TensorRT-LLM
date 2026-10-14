@@ -1,4 +1,5 @@
 # Copyright (c) 2026 by FlashInfer team.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -1533,9 +1534,6 @@ class SmemQResource(MemoryResource):
         q_seq_offset = (
             seq_coord_q + inst_idx * self.cfg.peer_q_seq_tile_stride * self.cfg.q_tile_m
         )
-        q_seq_extent = Int32(0)
-        if cutlass.const_expr(self.cfg.has_varlen):
-            q_seq_extent = cuseqlen_q + seqlen_q - q_seq_offset
         smem_stage_elements = self.cfg.tma_copy_q_elements
         d_granu_inner = self.cfg.tma_copy_q_granu_inner
 
@@ -1546,12 +1544,6 @@ class SmemQResource(MemoryResource):
                 q_coords = (d_offset, q_head_coord, q_seq_offset, batch_coord)
                 if cutlass.const_expr(self.cfg.has_varlen):
                     q_coords = (d_offset, q_head_coord, q_seq_offset)
-                    q_coords = transform_ragged_coords(
-                        q_coords,
-                        ragged_dim_idx=2,
-                        ragged_box_size=self.cfg.qk_mma_tiler[0],
-                        ragged_extent=q_seq_extent,
-                    )
                 if cutlass.const_expr(self.cfg.two_cta_umma):
                     # Each CTA loads only its own 128 Q rows (multicast mask = own
                     # rank), but as a cta_group::2 copy, so the byte completion

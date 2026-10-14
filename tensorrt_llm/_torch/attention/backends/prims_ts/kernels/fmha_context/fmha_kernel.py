@@ -1,4 +1,5 @@
 # Copyright (c) 2026 by FlashInfer team.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -3145,31 +3146,16 @@ class FmhaTs:
                     cfg.pv_mma_tiler[1] // cfg.tma_copy_v_iters,
                 )
                 kv_stride_order = stride_order
-        if cutlass.const_expr(cum_seqlen_q is not None):
-            # Q/O use the packed sequence axis as a ragged TMA dimension.
-            # Dense TMA bounds only see the full sum_seqlen tensor and cannot
-            # prevent a partial final tile from crossing into the next packed
-            # sequence. Paged K/V keep native page-pool descriptors. Invalid K
-            # scores are masked before softmax; invalid V rows are overwritten
-            # in SMEM after their TMA stage completes and before PV MMA.
-            tma_q_desc = create_tensor_map_ragged_from_tensor(
-                q_cute,
-                box_dims=q_box_dims,
-                ragged_dim=0,
-                stride_order=stride_order,
-                swizzle=tma_qkv_swizzle,
-                l2_promotion=cuda.TensorMapL2Promotion.none,
-                # Zero-fill partial Q rows and head-dimension fragments.
-                oob_fill=cuda.TensorMapFloatOOBFill.none,
-            )
-        else:
-            tma_q_desc = cuda.create_tensor_map_tiled_from_view(
-                q_cute,
-                box_dims=q_box_dims,
-                stride_order=stride_order,
-                swizzle=tma_qkv_swizzle,
-                l2_promotion=cuda.TensorMapL2Promotion.none,
-            )
+        # Q reductions are independent per row, so a packed tail tile may
+        # read the next request's Q rows. Ragged O stores discard those rows;
+        # the native Q descriptor bounds reads at the end of the allocation.
+        tma_q_desc = cuda.create_tensor_map_tiled_from_view(
+            q_cute,
+            box_dims=q_box_dims,
+            stride_order=stride_order,
+            swizzle=tma_qkv_swizzle,
+            l2_promotion=cuda.TensorMapL2Promotion.none,
+        )
 
         if cutlass.const_expr(cfg.use_paged_kv):
             # Paged-KV path: K/V are compact pool tensors with shape

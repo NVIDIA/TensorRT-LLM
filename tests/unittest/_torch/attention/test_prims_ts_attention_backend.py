@@ -1310,3 +1310,99 @@ def test_prims_ts_unsupported_context_falls_back(monkeypatch: pytest.MonkeyPatch
 
     assert calls["fallback"] > 0
     assert calls["prims_context"] == 0
+
+
+@pytest.mark.parametrize("paged", [False, True], ids=["contiguous", "paged"])
+@pytest.mark.parametrize("window_left", [-1, 31], ids=["causal", "sliding-window"])
+def test_prims_ts_context_packed_query_tails(paged: bool, window_left: int) -> None:
+    from tensorrt_llm._torch.attention.backends.prims_ts import (
+        BatchPrefillPagedTSWrapper,
+        BatchPrefillTSWrapper,
+    )
+
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    num_qo_heads, num_kv_heads, head_dim = 8, 2, 128
+    page_size = 32
+    # Cover a tile crossing into another request, a partial second Q tile,
+    # and a final tile that extends beyond the packed allocation.
+    q_lengths = [3, 130, 1]
+    kv_lengths = [33, 160, 17]
+    q_offsets = [0, 3, 133, 134]
+    kv_offsets = [0, 33, 193, 210]
+    batch_size = len(q_lengths)
+    max_pages = math.ceil(max(kv_lengths) / page_size)
+    query = torch.randn(sum(q_lengths), num_qo_heads, head_dim, device=device, dtype=dtype)
+    k_cache = torch.randn(
+        batch_size * max_pages, num_kv_heads, page_size, head_dim, device=device, dtype=dtype
+    )
+    v_cache = torch.randn_like(k_cache)
+    block_tables = torch.arange(batch_size * max_pages, device=device, dtype=torch.int32).view(
+        batch_size, max_pages
+    )
+    qo_indptr = torch.tensor(q_offsets, device=device, dtype=torch.int32)
+    kv_indptr = torch.tensor(kv_offsets, device=device, dtype=torch.int32)
+    seq_lens = torch.tensor(kv_lengths, device=device, dtype=torch.int32)
+    keys, values = [], []
+    for batch_idx, kv_length in enumerate(kv_lengths):
+        pages = block_tables[batch_idx].long()
+        keys.append(k_cache[pages].transpose(1, 2).reshape(-1, num_kv_heads, head_dim)[:kv_length])
+        values.append(
+            v_cache[pages].transpose(1, 2).reshape(-1, num_kv_heads, head_dim)[:kv_length]
+        )
+    output = torch.empty_like(query)
+    plan_args = {
+        "device": device,
+        "batch_size": batch_size,
+        "max_seq_len_q": max(q_lengths),
+        "max_kv_len": max(kv_lengths),
+        "num_qo_heads": num_qo_heads,
+        "num_kv_heads": num_kv_heads,
+        "head_dim": head_dim,
+        "q_dtype": dtype,
+        "k_dtype": dtype,
+        "v_dtype": dtype,
+        "out_dtype": dtype,
+        "mask_type": "causal",
+        "window_left": window_left,
+    }
+    if paged:
+        wrapper = BatchPrefillPagedTSWrapper(kv_layout="HND")
+        wrapper.plan(**plan_args, page_size=page_size)
+        run = functools.partial(
+            wrapper.run, query, k_cache, v_cache, qo_indptr, block_tables, seq_lens, out=output
+        )
+    else:
+        wrapper = BatchPrefillTSWrapper()
+        wrapper.plan(**plan_args, packed=True)
+        run = functools.partial(
+            wrapper.run, query, torch.cat(keys), torch.cat(values), qo_indptr, kv_indptr, out=output
+        )
+
+    def reference() -> torch.Tensor:
+        outputs = []
+        for batch_idx, (q_length, kv_length) in enumerate(zip(q_lengths, kv_lengths)):
+            q = query[q_offsets[batch_idx] : q_offsets[batch_idx + 1]].float()
+            k = keys[batch_idx].float().repeat_interleave(num_qo_heads // num_kv_heads, dim=1)
+            v = values[batch_idx].float().repeat_interleave(num_qo_heads // num_kv_heads, dim=1)
+            scores = torch.einsum("qhd,khd->hqk", q, k) / math.sqrt(head_dim)
+            q_positions = torch.arange(q_length, device=device) + kv_length - q_length
+            k_positions = torch.arange(kv_length, device=device)
+            allowed = k_positions[None, :] <= q_positions[:, None]
+            if window_left > 0:
+                allowed &= k_positions[None, :] >= q_positions[:, None] - window_left
+            scores.masked_fill_(~allowed, float("-inf"))
+            outputs.append(torch.einsum("hqk,khd->qhd", scores.softmax(-1), v))
+        return torch.cat(outputs).to(dtype)
+
+    run()
+    torch.testing.assert_close(output, reference(), atol=3e-2, rtol=3e-3)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run(validate=False)
+    query.neg_()
+    output.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(output, reference(), atol=3e-2, rtol=3e-3)
