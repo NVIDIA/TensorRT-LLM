@@ -96,6 +96,8 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
     use_fp8_ds_mla: bool = field(default=False, init=False)
     # Store reference to indexer for preparation stage
     indexer: Optional["Indexer"] = None
+    # The owning runner guarantees a complete device refresh before forward.
+    defer_indexer_decode_prepare: bool = False
     # Chunked prefill metadata for indexer (prefill-only, no CUDA graph needed)
     indexer_prefill_chunks: Optional[List[IndexerPrefillChunkMetadata]] = None
     # Max chunk size for two-level chunking:
@@ -396,8 +398,19 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         # For spec decode
         self.prepare_for_spec_decode(kv_lens)
 
-        # Prepare metadata for indexer
-        Indexer.prepare(metadata=self)
+        # Pure decode can defer slot mappings and MQA schedules when the
+        # owning runner refreshes both before any layer consumes them.
+        if (
+            self.defer_indexer_decode_prepare
+            and self.num_contexts == 0
+            and self.num_generations > 0
+            and self.num_tokens > 0
+            and self.kv_cache_manager is not None
+        ):
+            if Indexer.build_indexer_params(self) is not None:
+                self.num_ctx_kv_tokens = 0
+        else:
+            Indexer.prepare(metadata=self)
 
     def _prepare_device_window_kv_lens(self, kv_lens: torch.Tensor) -> torch.Tensor:
         """Bound host-side KV extents until device-selected windows are installed."""
