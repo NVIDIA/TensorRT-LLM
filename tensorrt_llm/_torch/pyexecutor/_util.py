@@ -781,62 +781,44 @@ def _derive_v2_layer_type_attention_windows(
 def _get_num_pool_groups_for_estimation(
     model_config: ModelConfig,
     max_seq_len: int,
-    fallback_attention_windows: Optional[List[Optional[int]]],
+    kv_cache_config: KvCacheConfig,
 ) -> int:
-    """Estimate V2 pool groups from KV storage windows and layer metadata.
+    """Estimate pool groups for the temporary V2 profiling manager.
 
-    Model sliding attention alone does not imply separate storage pools.
-    Preserve distinctions required by hybrid layer types and page sizes.
+    Hybrid recurrent/attention models also retain their distinct layer types
+    when automatic window derivation does not apply.
     """
     config = model_config.pretrained_config
-    variable_geometry = _has_variable_kv_cache_geometry(model_config)
-    if (fallback_attention_windows is not None
-            and not is_hybrid_linear(config)):
+    attention_windows = kv_cache_config.max_attention_window
+    if attention_windows is None and _has_variable_kv_cache_geometry(
+            model_config):
+        attention_windows = _derive_v2_layer_type_attention_windows(
+            kv_cache_config, KVCacheManagerV2, model_config, max_seq_len)
+    if attention_windows is not None and not is_hybrid_linear(config):
         normalized_windows = _normalize_attention_windows(
-            fallback_attention_windows, max_seq_len)
+            attention_windows, max_seq_len)
         return 1 if normalized_windows is None else len(set(normalized_windows))
 
     layer_types = getattr(config, "layer_types", None)
-    attention_windows = None
-    if (fallback_attention_windows is None and variable_geometry):
-        attention_windows = _derive_layer_type_attention_windows(
-            config, max_seq_len)
-    # Check whether KV storage uses configured or inferred attention windows,
-    # which can be independently configured from the model's use of sliding-window
-    # attention for computation.
-    kv_cache_uses_attention_windows = (fallback_attention_windows is not None
-                                       or attention_windows is not None)
-
-    if attention_windows is not None:
-        normalized_windows = _normalize_attention_windows(
-            attention_windows, max_seq_len)
-        if normalized_windows is None:
-            return 1
-        return len(set(normalized_windows))
-
     if isinstance(layer_types, (list, tuple)):
-        # These tags come from HF pretrained_config.layer_types.
-        # As above, sliding-window attention in the model does not imply windowed
-        # KV storage. Without windowed storage, sliding/full attention share a pool
-        # type unless their page sizes differ (Gemma4).
+        # Without distinct storage windows, sliding/full computation and
+        # different page geometries do not create separate window groups.
         pool_types = set()
         for layer_type in layer_types:
-            if (not kv_cache_uses_attention_windows and not variable_geometry
-                    and
-                (_is_sliding_attention_layer(layer_type)
-                 or getattr(layer_type, "name",
-                            str(layer_type)).lower() == "full_attention")):
+            if attention_windows is None and (
+                    _is_sliding_attention_layer(layer_type)
+                    or getattr(layer_type, "name",
+                               str(layer_type)).lower() == "full_attention"):
                 layer_type = "full_attention"
             pool_types.add(layer_type)
         if len(pool_types) > 1:
             return len(pool_types)
 
-    if fallback_attention_windows is not None:
+    if attention_windows is not None:
         normalized_windows = _normalize_attention_windows(
-            fallback_attention_windows, max_seq_len)
+            attention_windows, max_seq_len)
         if normalized_windows is not None:
             return len(set(normalized_windows))
-
     return 1
 
 
@@ -1631,7 +1613,7 @@ class KvCacheCreator:
             num_pool_groups = _get_num_pool_groups_for_estimation(
                 model_cfg,
                 self._model_engine.max_seq_len,
-                self._kv_cache_config.max_attention_window,
+                self._kv_cache_config,
             )
         num_cache_blocks *= num_pool_groups
 
@@ -1703,14 +1685,14 @@ class KvCacheCreator:
                 "models, disable it.")
 
         if estimating_kv_cache:
+            # User-provided pool sizing can underprovision the temporary
+            # estimation cache and cause warmup to hang or fail. Override it
+            # before budgeting, then restore it in configure_kv_cache_capacity().
+            self._kv_cache_config.pool_ratio = None
             estimate_max_tokens = self._get_token_num_for_estimation()
             max_tokens = min(
                 estimate_max_tokens, self._kv_cache_config.max_tokens
             ) if self._kv_cache_config.max_tokens is not None else estimate_max_tokens
-            # User-provided pool sizing can underprovision the temporary
-            # estimation cache and cause warmup to hang or fail. Override it
-            # for estimation, then restore it in configure_kv_cache_capacity().
-            self._kv_cache_config.pool_ratio = None
             self._kv_cache_config.avg_seq_len = self._max_seq_len
             if self._is_kv_cache_manager_v2:
                 free_mem, _ = torch.cuda.mem_get_info()

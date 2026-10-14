@@ -409,7 +409,7 @@ def _make_creator(
     c._model_engine.model = Mock(model_config=model_config)
 
     c._kv_cache_config = Mock(
-        free_gpu_memory_fraction=0.9, max_attention_window=max_attention_window
+        free_gpu_memory_fraction=0.9, max_attention_window=max_attention_window, pool_ratio=None
     )
 
     # _get_token_num_for_estimation gates pool-group scaling on V2 (the
@@ -774,9 +774,129 @@ def test_uniform_window_overrides_mixed_attention_metadata() -> None:
     )
 
     assert (
-        _get_num_pool_groups_for_estimation(SimpleNamespace(pretrained_config=config), 4096, [512])
+        _get_num_pool_groups_for_estimation(
+            SimpleNamespace(pretrained_config=config),
+            4096,
+            KvCacheConfig(max_attention_window=[512]),
+        )
         == 1
     )
+
+
+@pytest.mark.parametrize(
+    ("layer_types", "max_seq_len", "config_kwargs", "expected_windows", "expected_groups"),
+    [
+        (None, 4096, {}, [128, 256, 4096], 3),
+        (["sliding_attention", "full_attention", "full_attention"], 4096, {}, [128, 256, 4096], 3),
+        (None, 256, {}, [128, 256, 256], 2),
+        (None, 4096, {"max_attention_window": [64]}, None, 1),
+        (
+            ["sliding_attention", "full_attention", "full_attention"],
+            4096,
+            {"pool_ratio": [1.0]},
+            None,
+            1,
+        ),
+        (None, 4096, {"pool_ratio": [0.25, 0.25, 0.5]}, [128, 256, 4096], 3),
+    ],
+    ids=[
+        "missing_layer_types",
+        "conflicting_layer_types",
+        "clamped",
+        "explicit_window",
+        "pool_ratio_mismatch",
+        "pool_ratio_matches",
+    ],
+)
+def test_pool_group_estimation_uses_resolved_spec_windows(
+    layer_types: list[str] | None,
+    max_seq_len: int,
+    config_kwargs: dict[str, list[int] | list[float]],
+    expected_windows: list[int] | None,
+    expected_groups: int,
+) -> None:
+    model_config = SimpleNamespace(
+        pretrained_config=SimpleNamespace(
+            num_hidden_layers=3,
+            layer_types=layer_types,
+            sliding_window=512,
+        ),
+        kv_cache_layer_specs=tuple(
+            KVCacheLayerSpec(
+                head_dim=head_dim, num_q_heads=8, num_kv_heads=2, attention_window=window
+            )
+            for head_dim, window in [(128, 128), (256, 256), (128, None)]
+        ),
+    )
+    kv_cache_config = KvCacheConfig(**config_kwargs)
+    assert (
+        _derive_v2_layer_type_attention_windows(
+            kv_cache_config, KVCacheManagerV2, model_config, max_seq_len
+        )
+        == expected_windows
+    )
+    assert (
+        _get_num_pool_groups_for_estimation(model_config, max_seq_len, kv_cache_config)
+        == expected_groups
+    )
+
+
+def test_pool_group_estimation_keeps_uniform_geometry_profiling_full_context() -> None:
+    pretrained = _mixed_schedule_pretrained(
+        ["sliding_attention", "full_attention"],
+        sliding_window=128,
+    )
+    model_config = SimpleNamespace(pretrained_config=pretrained)
+    kv_cache_config = KvCacheConfig()
+    manager_config = _create_manager_and_capture_config(
+        pretrained,
+        kv_cache_config,
+        max_seq_len=4096,
+        estimating_kv_cache=True,
+    )
+    assert manager_config.max_attention_window is None
+    assert _get_num_pool_groups_for_estimation(model_config, 4096, kv_cache_config) == 1
+    assert _derive_v2_layer_type_attention_windows(
+        kv_cache_config, KVCacheManagerV2, model_config, 4096
+    ) == [128, 4096]
+
+
+def test_estimation_budget_uses_temporary_pool_ratio() -> None:
+    max_seq_len = 4096
+    creator = _make_creator(
+        32,
+        [_make_mock_request(max_seq_len - 1)],
+        enable_attention_dp=False,
+        tp_size=1,
+        model_max_seq_len=max_seq_len,
+    )
+    model_config = creator._model_engine.model.model_config
+    model_config.attn_backend = "FLASHINFER"
+    model_config.is_encoder_decoder = False
+    model_config.kv_cache_layer_specs = tuple(
+        KVCacheLayerSpec(
+            head_dim=head_dim,
+            num_q_heads=8,
+            num_kv_heads=2,
+            attention_window=window,
+        )
+        for head_dim, window in [(128, 128), (256, 256), (128, None)]
+    )
+    creator._kv_cache_config = KvCacheConfig(pool_ratio=[1.0])
+    creator._skip_est = False
+    creator._max_seq_len = max_seq_len
+    creator._max_gpu_total_bytes_in = None
+    single_pool_tokens = creator._get_token_num_for_estimation()
+
+    assert creator.try_prepare_estimation()
+    assert creator._kv_cache_config.pool_ratio is None
+    assert creator._kv_cache_config.max_tokens == 3 * single_pool_tokens
+    assert _derive_v2_layer_type_attention_windows(
+        creator._kv_cache_config,
+        KVCacheManagerV2,
+        model_config,
+        max_seq_len,
+    ) == [128, 256, max_seq_len]
 
 
 def test_vswa_max_attention_window_fallback_scales():

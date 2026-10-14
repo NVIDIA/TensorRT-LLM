@@ -1144,9 +1144,6 @@ class Gemma4DecoderLayer(DecoderLayer):
 # ---------------------------------------------------------------------------
 class Gemma4TextModel(DecoderModel):
     def __init__(self, model_config: ModelConfig[Gemma4TextConfig]):
-        model_config.set_kv_cache_layer_specs(
-            _get_gemma4_kv_cache_layer_specs(model_config.pretrained_config)
-        )
         super().__init__(model_config)
         config = self.model_config
         pretrained = config.pretrained_config
@@ -1368,6 +1365,9 @@ class Gemma4ForCausalLM(SpecDecOneEngineForCausalLM[Gemma4TextModel, Gemma4TextC
                 "moe_ep_size>1 requires a Gemma4 MoE variant (only 26B-A4B-it today)."
             )
 
+        model_config.set_kv_cache_layer_specs(
+            _get_gemma4_kv_cache_layer_specs(model_config.pretrained_config)
+        )
         super().__init__(Gemma4TextModel(model_config), model_config)
 
     @classmethod
