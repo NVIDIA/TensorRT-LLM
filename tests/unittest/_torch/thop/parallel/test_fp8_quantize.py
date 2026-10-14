@@ -202,6 +202,31 @@ def test_mxfp8_quantize_alignment_torch_device(m, k, dtype,
                                   a.cpu().to(torch.float32), 8, 0, 0.999)
 
 
+@pytest.mark.parametrize("is_sf_swizzled_layout, alignment", [(False, 512),
+                                                              (True, 32)])
+@skip_pre_blackwell_unittest
+def test_mxfp8_quantize_zero_rows(is_sf_swizzled_layout, alignment):
+    """No rows: empty outputs, and no launch error left for the next call."""
+    k = 2880
+    torch.random.manual_seed(0)
+    a = torch.randn([4, k], dtype=torch.bfloat16, device="cuda")
+    ref_fp8, ref_sf = torch.ops.trtllm.mxfp8_quantize(a, is_sf_swizzled_layout,
+                                                      alignment)
+
+    empty = torch.empty([0, k], dtype=torch.bfloat16, device="cuda")
+    empty_fp8, empty_sf = torch.ops.trtllm.mxfp8_quantize(
+        empty, is_sf_swizzled_layout, alignment)
+    assert empty_fp8.shape == (0, ref_fp8.shape[1])
+    assert empty_sf.numel() == 0
+
+    # A launch error left pending by the empty call is raised by the next
+    # kernel launch, here torch.equal's.
+    a_fp8, a_sf = torch.ops.trtllm.mxfp8_quantize(a, is_sf_swizzled_layout,
+                                                  alignment)
+    assert torch.equal(a_fp8.view(torch.uint8), ref_fp8.view(torch.uint8))
+    assert torch.equal(a_sf, ref_sf)
+
+
 def _run_megamoe_prepare(hidden_states, token_selected_experts,
                          token_final_scales):
     m, k = hidden_states.shape

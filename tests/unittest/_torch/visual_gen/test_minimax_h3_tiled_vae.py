@@ -30,8 +30,11 @@ pytestmark = pytest.mark.cpu_only
 
 class _TileDecoder(torch.nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Tile-dependent values expose wrong ordering and overlap blending.
-        return (x + x.mean()).repeat_interleave(2, -2).repeat_interleave(2, -1)
+        # Tile-dependent values expose wrong ordering and overlap blending. The mean is taken
+        # per batch entry because, like the ViT decoder, the stub must not mix the tiles that
+        # the single-rank path decodes in one batched call.
+        mean = x.mean(dim=tuple(range(1, x.ndim)), keepdim=True)
+        return (x + mean).repeat_interleave(2, -2).repeat_interleave(2, -1)
 
 
 def _vae() -> TiledAutoencoderKLMiniMaxH3:
@@ -61,32 +64,47 @@ def test_parallel_tiles_match_reference(shape: tuple[int, int], world_size: int)
     ]
     group = object()
     vae.tile_parallel_group = group
+    batch = z.shape[0]
     for rank in range(world_size):
         wave = 0
 
         def all_gather(outputs: list[torch.Tensor], local: torch.Tensor, *, group: object) -> None:
+            # Each rank sends the tiles of several waves in one batch; waves it has run out of
+            # are zero padding.
             nonlocal wave
-            index = wave * world_size + rank
-            if index < len(tiles):
-                torch.testing.assert_close(local, tiles[index], rtol=0, atol=0)
-            else:
-                assert torch.count_nonzero(local) == 0
+            for step, sent in enumerate(local.split(batch, dim=0)):
+                index = (wave + step) * world_size + rank
+                if index < len(tiles):
+                    torch.testing.assert_close(sent, tiles[index], rtol=0, atol=0)
+                else:
+                    assert torch.count_nonzero(sent) == 0
+            steps = local.shape[0] // batch
             for offset, output in enumerate(outputs):
-                index = wave * world_size + offset
-                output.copy_(tiles[index] if index < len(tiles) else torch.zeros_like(output))
-            wave += 1
+                received = []
+                for step in range(steps):
+                    index = (wave + step) * world_size + offset
+                    received.append(
+                        tiles[index] if index < len(tiles) else torch.zeros_like(tiles[0])
+                    )
+                output.copy_(torch.cat(received, dim=0))
+            wave += steps
 
         with (
             patch("torch.distributed.get_world_size", return_value=world_size),
             patch("torch.distributed.get_rank", return_value=rank),
+            patch("torch.distributed.all_reduce") as reduce,
             patch("torch.distributed.all_gather", side_effect=all_gather) as gather,
         ):
             actual = vae._decode_clip(z)
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
         if len(tiles) < world_size or world_size == 1:
             gather.assert_not_called()
+            reduce.assert_not_called()
         else:
+            # Uncalibrated, the whole per-rank share fits one batch: one gather per clip.
             assert wave == (len(tiles) + world_size - 1) // world_size
+            assert gather.call_count == 1
+            assert reduce.call_count == 1
 
 
 def test_no_tile_group_and_disabled_tiling_do_not_use_collectives() -> None:

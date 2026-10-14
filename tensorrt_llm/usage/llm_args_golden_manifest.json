@@ -1389,6 +1389,11 @@
       "path": "sparse_attention_config.fuse_qkv_index_projection"
     },
     {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "sparse_attention_config.gvr_deterministic_topk"
+    },
+    {
       "allowed_values": [
         "triton",
         "msa"
@@ -1888,6 +1893,11 @@
       "capture_policy": "list[int]|none",
       "kind": "value",
       "path": "torch_compile_config.capture_num_tokens"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "torch_compile_config.compile_only_piecewise_graphs"
     },
     {
       "capture_policy": "bool",

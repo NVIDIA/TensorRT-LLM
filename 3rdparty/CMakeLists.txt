@@ -144,21 +144,35 @@ foreach(DEP_IDX RANGE ${DEP_COUNT_MINUS_ONE})
   endif()
 
   if(DEP_PATCH_FILE AND NOT DEP_PATCH_FILE STREQUAL "")
+    set(_patch_command "${Python3_EXECUTABLE}"
+                       "${CMAKE_CURRENT_SOURCE_DIR}/patch_dependency.py")
     set(_patch_file "${CMAKE_CURRENT_SOURCE_DIR}/${DEP_PATCH_FILE}")
-    # Try applying the patch; --forward skips patches already applied and -r -
-    # discards rejects. The forward exit status alone cannot distinguish an
-    # already-patched tree from a failure. Require a reverse dry-run to succeed.
-    # --force keeps this check in reverse mode instead of automatically
-    # switching direction for an unapplied patch. The script must not contain
-    # ';': CMake would split it into separate arguments of the list.
+    # Reconfigure, and rerun the patch step, when the patch changes.
+    set_property(
+      DIRECTORY
+      APPEND
+      PROPERTY CMAKE_CONFIGURE_DEPENDS "${_patch_file}")
+    file(SHA256 "${_patch_file}" _patch_sha256)
     list(
       APPEND
       FETCH_ARGS
       PATCH_COMMAND
-      bash
-      -c
-      "(patch -p1 --forward --batch -r - -i '${_patch_file}' >/dev/null 2>&1 || true) && patch -p1 --reverse --force --dry-run -i '${_patch_file}' >/dev/null 2>&1 || (echo 'Patch state for ${DEP_NAME} is inconsistent. Remove ${CMAKE_BINARY_DIR}/_deps/${DEP_NAME}-src and reconfigure.' >&2 && false)"
-    )
+      ${_patch_command}
+      apply
+      "${DEP_NAME}"
+      "${_patch_file}"
+      --patch-sha256
+      ${_patch_sha256})
+    if(NOT DEP_USE_URL)
+      list(
+        APPEND
+        FETCH_ARGS
+        UPDATE_COMMAND
+        ${_patch_command}
+        update
+        "${DEP_NAME}"
+        "${DEP_GIT_TAG}")
+    endif()
   endif()
 
   if(_git_submodules_error STREQUAL "NOTFOUND")

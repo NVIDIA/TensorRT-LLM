@@ -21,21 +21,14 @@ def _matmul_with_output_dtype(input: torch.Tensor, weight: torch.Tensor,
                               output_dtype: torch.dtype) -> torch.Tensor:
     """Compute ``input @ weight.T`` and write the result in ``output_dtype``.
 
-    ``input`` and ``weight`` stay in the model dtype; cuBLAS accumulates in
+    ``input`` and ``weight`` stay in the model dtype; the GEMM accumulates in
     float32 and stores the result directly in ``output_dtype``, so the output
     is not rounded to the model dtype first.
     """
     out_features = weight.shape[0]
     output_shape = (*input.shape[:-1], out_features)
     input_2d = input.reshape(-1, input.shape[-1])
-    if input_2d.shape[0] == 0:
-        return input.new_empty(output_shape, dtype=output_dtype)
-    # cublas_mm reads mat_b as column-major with leading dimension K.
-    assert weight.is_contiguous(), "LM head weight must be contiguous"
-    output = torch.ops.trtllm.cublas_mm(input_2d.contiguous(),
-                                        weight.t(),
-                                        None,
-                                        out_dtype=output_dtype)
+    output = torch.mm(input_2d, weight.t(), out_dtype=output_dtype)
     return output.view(output_shape)
 
 

@@ -20,13 +20,19 @@ float32 path should match it up to accumulation order, while the default path is
 by the bf16 rounding of each logit.
 """
 
+from contextlib import nullcontext
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 import torch
+from transformers import LlamaConfig
 
-from tensorrt_llm._torch.modules.embedding import LMHead
+from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.modules.embedding import Embedding, LMHead
 from tensorrt_llm._torch.modules.linear import TensorParallelMode
+from tensorrt_llm._torch.pyexecutor import model_loader as model_loader_module
+from tensorrt_llm._torch.pyexecutor.model_loader import ModelLoader, validate_lm_head_output_dtype
 from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
@@ -157,3 +163,130 @@ def test_llm_args_lm_head_output_dtype(tmp_path: Path) -> None:
     )
     with pytest.raises(ValueError):
         TorchLlmArgs(model=str(tmp_path), lm_head_output_dtype="float16")
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
+@torch.inference_mode()
+def test_float32_output_strided_batched_input(dtype: torch.dtype) -> None:
+    """Preserve leading dimensions and FP32 precision for strided hidden states."""
+    generator = torch.Generator(device="cuda").manual_seed(42)
+    hidden = torch.randn(2, 3, 128, device="cuda", dtype=dtype, generator=generator)[..., ::2]
+    head = LMHead(127, 64, dtype=dtype, output_dtype=torch.float32).cuda()
+    head.weight.copy_(torch.randn(127, 64, device="cuda", dtype=dtype, generator=generator))
+    assert not hidden.is_contiguous()
+
+    logits = head(hidden)
+    reference = hidden.double() @ head.weight.double().t()
+    assert logits.shape == (2, 3, 127)
+    assert logits.dtype == torch.float32
+    torch.testing.assert_close(logits.double(), reference, rtol=1e-4, atol=1e-4)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
+@torch.inference_mode()
+def test_float32_output_cuda_graph(dtype: torch.dtype) -> None:
+    """Replay the native FP32-output GEMM with updated hidden states."""
+    generator = torch.Generator(device="cuda").manual_seed(42)
+    hidden = torch.randn(7, 64, device="cuda", dtype=dtype, generator=generator)
+    head = LMHead(127, 64, dtype=dtype, output_dtype=torch.float32).cuda()
+    head.weight.copy_(torch.randn(127, 64, device="cuda", dtype=dtype, generator=generator))
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(3):
+            head(hidden)
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        logits = head(hidden)
+
+    for _ in range(2):
+        hidden.copy_(torch.randn(hidden.shape, device="cuda", dtype=dtype, generator=generator))
+        graph.replay()
+        reference = hidden.double() @ head.weight.double().t()
+        assert logits.dtype == torch.float32
+        torch.testing.assert_close(logits.double(), reference, rtol=1e-4, atol=1e-4)
+
+
+@pytest.mark.parametrize("nested", [False, True], ids=["direct", "nested"])
+@pytest.mark.parametrize("output_dtype", [None, torch.bfloat16, torch.float32])
+def test_built_model_lm_head_output_dtype(nested: bool, output_dtype: torch.dtype | None) -> None:
+    """Validate real LM heads, including nested ones, without mistaking embeddings for heads."""
+    model = torch.nn.Module()
+    model.embed_tokens = Embedding(16, 8, dtype=DTYPE)
+    owner = model
+    if nested:
+        model.language_model = torch.nn.Module()
+        owner = model.language_model
+    owner.lm_head = LMHead(16, 8, dtype=DTYPE, output_dtype=output_dtype)
+
+    validate_lm_head_output_dtype(model, "auto")
+    if output_dtype == torch.float32:
+        validate_lm_head_output_dtype(model, "float32")
+    else:
+        with pytest.raises(ValueError, match=r"lm_head_output_dtype=.*lm_head.output_dtype"):
+            validate_lm_head_output_dtype(model, "float32")
+
+
+def test_built_model_lm_head_output_dtype_checks_all_heads() -> None:
+    """Reject an ignored option in a nested head even if another head honours it."""
+    model = torch.nn.Module()
+    model.lm_head = LMHead(16, 8, dtype=DTYPE, output_dtype=torch.float32)
+    model.draft = torch.nn.Module()
+    model.draft.lm_head = LMHead(16, 8, dtype=DTYPE)
+    with pytest.raises(ValueError, match=r"draft.lm_head.output_dtype"):
+        validate_lm_head_output_dtype(model, "float32")
+
+
+def test_built_model_lm_head_output_dtype_requires_a_head() -> None:
+    """Reject an explicit output dtype when only input embeddings were constructed."""
+    model = torch.nn.Module()
+    model.embed_tokens = Embedding(16, 8, dtype=DTYPE)
+    validate_lm_head_output_dtype(model, "auto")
+    with pytest.raises(ValueError, match="no LMHead was constructed"):
+        validate_lm_head_output_dtype(model, "float32")
+
+
+@pytest.mark.parametrize("nested", [False, True], ids=["direct", "nested"])
+@pytest.mark.parametrize("fallback", [False, True], ids=["meta_init", "regular_init"])
+def test_model_loader_rejects_ignored_lm_head_output_dtype(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, nested: bool, fallback: bool
+) -> None:
+    """Reject unsupported constructed heads before any checkpoint weights are loaded."""
+    model = torch.nn.Module()
+    owner = model
+    if nested:
+        model.language_model = torch.nn.Module()
+        owner = model.language_model
+    owner.lm_head = LMHead(16, 8, dtype=DTYPE)
+    config = ModelConfig(
+        pretrained_config=LlamaConfig(architectures=["LlamaForCausalLM"], dtype=DTYPE),
+        lm_head_output_dtype=torch.float32,
+    )
+    loader = ModelLoader(
+        llm_args=TorchLlmArgs(model=str(tmp_path), lm_head_output_dtype="float32"),
+        mapping=Mapping(),
+        spec_config=None,
+        sparse_attention_config=None,
+        max_num_tokens=8,
+        max_seq_len=8,
+    )
+    monkeypatch.setattr(loader, "_load_and_validate_config", lambda *_args: config)
+    monkeypatch.setattr(model_loader_module, "MetaInitMode", nullcontext)
+    monkeypatch.setattr(
+        model_loader_module, "maybe_create_moe_load_balancer", lambda *_args: nullcontext()
+    )
+    monkeypatch.setattr(model_loader_module, "_checkpoint_startup_metadata", lambda *_args: {})
+    factory = MagicMock(
+        side_effect=[RuntimeError("meta initialization unavailable"), model]
+        if fallback
+        else [model]
+    )
+    monkeypatch.setattr(model_loader_module.AutoModelForCausalLM, "from_config", factory)
+    checkpoint_loader = MagicMock()
+
+    with pytest.raises(ValueError, match=r"lm_head_output_dtype=.*lm_head.output_dtype"):
+        loader.load(str(tmp_path), checkpoint_loader)
+
+    assert factory.call_count == (2 if fallback else 1)
+    checkpoint_loader.load_weights.assert_not_called()
