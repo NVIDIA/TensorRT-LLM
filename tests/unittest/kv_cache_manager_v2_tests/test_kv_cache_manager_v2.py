@@ -1164,7 +1164,10 @@ class TestNoBatching(TestKVCacheManagerV2):
         self.assertEqual(kv2.num_committed_tokens, len(prompt))
         kv2.close()
 
-    def test_reuse_match_backoff_trims_the_tail_of_every_match(self) -> None:
+    @parameterized.expand([("tokens", 1, True), ("blocks", 8, False)])
+    def test_reuse_match_backoff_trims_the_tail_of_every_match(
+        self, _case: str, alignment: int, partial_reuse: bool
+    ) -> None:
         """A pool holding state that reads D tokens ahead cannot use the last D.
 
         Set for a one-model speculative decoding draft pool, whose KV at position
@@ -1190,6 +1193,8 @@ class TestNoBatching(TestKVCacheManagerV2):
                     )
                 ],
                 reuse_match_backoff=backoff,
+                reuse_match_alignment=alignment,
+                enable_partial_reuse=partial_reuse,
             )
         )
 
@@ -1203,17 +1208,16 @@ class TestNoBatching(TestKVCacheManagerV2):
             kv.close()
         stream_holder.take_finish_event().synchronize()
 
-        # Every other test in this file runs with the default backoff of 0 and
-        # matches the full prompt, so the delta here is the backoff alone. The
-        # trim crosses a block boundary rather than stopping at one.
-        self.assertEqual(self.manager.probe_reuse(None, prompt), len(prompt) - backoff)
+        # Alignment is applied after lookahead backoff, never in its place.
+        expected = (len(prompt) - backoff) // alignment * alignment
+        self.assertEqual(self.manager.probe_reuse(None, prompt), expected)
 
         # A match shorter than the backoff collapses to nothing, not negative.
         self.assertEqual(self.manager.probe_reuse(None, prompt[: backoff - 1]), 0)
 
         # The claim agrees with the probe: same trim, no second tree walk.
         kv2 = self.manager.create_kv_cache(input_tokens=prompt)
-        self.assertEqual(kv2.num_committed_tokens, len(prompt) - backoff)
+        self.assertEqual(kv2.num_committed_tokens, expected)
         kv2.close()
 
     @parameterized.expand([("backoff_0", 0), ("backoff_1", 1)])
@@ -4811,6 +4815,7 @@ class TestPartialCoverageReuse(TestKVCacheManagerV2):
         gpu_quota: int = 64 << 20,
         window_size: int | None = None,
         reuse_match_backoff: int = 0,
+        reuse_match_alignment: int = 1,
     ) -> None:
         kv_buf_size = 8192
         window_size = self.WINDOW_SIZE if window_size is None else window_size
@@ -4837,6 +4842,7 @@ class TestPartialCoverageReuse(TestKVCacheManagerV2):
             enable_partial_reuse=True,
             commit_min_snapshot=True,
             reuse_match_backoff=reuse_match_backoff,
+            reuse_match_alignment=reuse_match_alignment,
         )
         self.engine = FakeEngine(self.cfg)
         self.manager = KVCacheManager(self.cfg)
@@ -5044,8 +5050,11 @@ class TestPartialCoverageReuse(TestKVCacheManagerV2):
         # attention lifecycle's reusable prefix.
         self.assertEqual(self.manager.probe_reuse(input_tokens=boundary), len(boundary))
 
-    def test_reuse_backoff_rechecks_swa_coverage_at_final_endpoint(self) -> None:
-        self.prepare_partial(window_size=33, reuse_match_backoff=1)
+    @parameterized.expand([("tokens", 1, 48), ("blocks", 32, 32)])
+    def test_reuse_backoff_rechecks_swa_coverage_at_final_endpoint(
+        self, _case: str, alignment: int, expected: int
+    ) -> None:
+        self.prepare_partial(window_size=33, reuse_match_backoff=1, reuse_match_alignment=alignment)
         base = [TokenId(i) for i in range(48)]
         boundary = base + [TokenId(i) for i in range(1000, 1048)]
 
@@ -5055,9 +5064,10 @@ class TestPartialCoverageReuse(TestKVCacheManagerV2):
 
         # Backing off from 96 to 95 makes block 1's partial SWA page active, but
         # it only covers 16 of the required 32 tokens. The maximal safe endpoint
-        # is the previously committed 48-token prefix.
-        self.assertEqual(self.manager.probe_reuse(input_tokens=boundary), len(base))
-        self.assertEqual(self.run_turn(boundary, refcheck=True), len(base))
+        # is the previously committed 48-token prefix, or 32 when alignment is
+        # required. Coverage must be checked again at that earlier endpoint.
+        self.assertEqual(self.manager.probe_reuse(input_tokens=boundary), expected)
+        self.assertEqual(self.run_turn(boundary, refcheck=True), expected)
 
     def test_page_coverage_only_grows(self) -> None:
         self.prepare_partial()

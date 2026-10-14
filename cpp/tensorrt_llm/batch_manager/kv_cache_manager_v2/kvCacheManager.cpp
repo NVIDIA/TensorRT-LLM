@@ -216,7 +216,8 @@ BlockRadixTree::ReuseMatch KvCacheManager::matchReuse(
     ReuseScope const& reuseScope, TokenSpan inputTokens, bool knownNoDigest) const
 {
     KVCM2_REJECT_IF_POISONED();
-    return mRadixTree->match(reuseScope, inputTokens, knownNoDigest, enablePartialMatch(), mConfig.reuseMatchBackoff);
+    return mRadixTree->match(reuseScope, inputTokens, knownNoDigest, enablePartialMatch(), mConfig.reuseMatchBackoff,
+        mConfig.reuseMatchAlignment);
 }
 
 int KvCacheManager::probeReuse(ReuseScope reuseScope, TokenSpan inputTokens, bool knownNoDigest) const

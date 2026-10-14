@@ -26,6 +26,7 @@ do the moving. That needs two pieces of per-request bookkeeping:
 
 from typing import Dict, List, Optional, Tuple
 
+from tensorrt_llm._torch.speculative.interface import draft_prompt_lookahead
 from tensorrt_llm.bindings.internal.batch_manager import LlmRequest
 from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 from tensorrt_llm.logger import logger
@@ -124,12 +125,15 @@ class _RequestState:
 class MooncakeStoreConnectorScheduler(KvCacheConnectorScheduler):
     """Chooses which pages the Mooncake pool serves and which it receives."""
 
+    supports_attention_dp = True
+
     def __init__(self, llm_args: TorchLlmArgs):
         super().__init__(llm_args)
 
         validate_llm_args(llm_args)
         self._config = MooncakeStoreConnectorConfig.resolve(llm_args)
         self._tokens_per_block = int(llm_args.kv_cache_config.tokens_per_block)
+        self._prompt_lookahead = draft_prompt_lookahead(getattr(llm_args, "speculative_config", None)) or 0
         self._requests: Dict[int, _RequestState] = {}
         self._worker: Optional[MooncakeStoreConnectorWorker] = None
 
@@ -204,13 +208,46 @@ class MooncakeStoreConnectorScheduler(KvCacheConnectorScheduler):
         )
         return hit_blocks * self._tokens_per_block, False
 
+    def cancel_load(self, request: LlmRequest, start: int, end: int) -> None:
+        """Trim a leading or trailing range from an unconsumed load offer.
+
+        The local cache can overtake the beginning of an offer while scheduling
+        waits. Preserve the remaining suffix in that case: the runtime still
+        counts it as externally loaded. Tail cancellation instead releases
+        blocks for which the runtime could not reserve pages.
+        """
+        state = self._requests.get(request.request_id)
+        if state is None or state.load_blocks == 0 or end <= start:
+            return
+        first = state.load_first_block
+        last = first + state.load_blocks
+        cancel_first = max(first, start // self._tokens_per_block)
+        cancel_last = min(last, (end + self._tokens_per_block - 1) // self._tokens_per_block)
+        if cancel_first >= cancel_last:
+            return
+        if cancel_first == first:
+            state.load_first_block = cancel_last
+            state.load_blocks = last - cancel_last
+        elif cancel_last == last:
+            state.load_blocks = cancel_first - first
+        else:
+            raise ValueError(
+                "Mooncake load cancellation must trim the beginning or end of an offer"
+            )
+
     def update_state_after_alloc(self, request: LlmRequest, block_ids: List[int]):
         """No-op: page indices are read from the scheduler output instead.
 
         The flat `block_ids` here are a single space, but a V2 page index is
-        scoped to a layer group, so this connector reads only
-        `RequestData.new_block_ids_by_layer_group`.
+        scoped to a layer group. `RequestData.new_block_ids_by_layer_group` is
+        the form that stays correct for every model, so that is the only source
+        this connector uses.
         """
+
+    def update_state_after_alloc_by_layer_group(
+        self, request: LlmRequest, block_ids_by_layer_group: List[List[int]]
+    ) -> None:
+        """No-op counterpart for target-plus-draft or multi-group layouts."""
 
     # ---- work lists ----
 
@@ -220,8 +257,9 @@ class MooncakeStoreConnectorScheduler(KvCacheConnectorScheduler):
         for request_data in (*scheduler_output.new_requests, *scheduler_output.cached_requests):
             state = self._requests.get(request_data.request_id)
             if state is None:
-                # Only requests that went through get_num_new_matched_tokens
-                # have a hash chain.
+                # Only requests that went through get_num_new_matched_tokens have
+                # a hash chain. Generation-only requests never do, and the
+                # connector manager refuses them outright.
                 continue
 
             state.tokens.extend(request_data.new_tokens)
@@ -231,6 +269,7 @@ class MooncakeStoreConnectorScheduler(KvCacheConnectorScheduler):
             loads = self._loads_for(state, request_data)
             if loads.pages:
                 metadata.loads.append(loads)
+            num_loaded_tokens = state.load_blocks * self._tokens_per_block
 
             # Whatever the store just supplied, and whatever the local cache
             # matched, is not ours to write back: the store already has the
@@ -241,7 +280,7 @@ class MooncakeStoreConnectorScheduler(KvCacheConnectorScheduler):
             state.load_blocks = 0
 
             if self._config.role.saves:
-                saves = self._saves_for(state, request_data)
+                saves = self._saves_for(state, request_data, num_loaded_tokens)
                 if saves.pages:
                     state.emitted_saves = True
                     metadata.saves.append(saves)
@@ -264,6 +303,12 @@ class MooncakeStoreConnectorScheduler(KvCacheConnectorScheduler):
         state = self._requests.pop(request.request_id, None)
         return bool(state is not None and state.emitted_saves)
 
+    def request_finished_by_layer_group(
+        self, request: LlmRequest, block_ids_by_layer_group: List[List[int]]
+    ) -> bool:
+        """Finish a request whose pages span more than one layer group."""
+        return self.request_finished(request, [])
+
     def request_reset(self, request: LlmRequest) -> None:
         """Forget a request whose pages were released for it to run again.
 
@@ -284,7 +329,11 @@ class MooncakeStoreConnectorScheduler(KvCacheConnectorScheduler):
     ) -> _RequestState:
         state = self._requests.get(request.request_id)
         if state is None:
-            state = _RequestState(BlockHashChain(self._tokens_per_block, scope=scope))
+            state = _RequestState(
+                BlockHashChain(
+                    self._tokens_per_block, scope=scope, prompt_lookahead=self._prompt_lookahead
+                )
+            )
             self._requests[request.request_id] = state
         # The lookup runs before the request is scheduled, so the chain has to
         # be ready before any scheduler output exists.
@@ -313,16 +362,26 @@ class MooncakeStoreConnectorScheduler(KvCacheConnectorScheduler):
         for offset in range(state.load_blocks):
             block = state.load_first_block + offset
             if block >= limit:
-                # The runtime allocated fewer pages than it accepted tokens
-                # for, so the tail of the offer has nowhere to land. Dropping
-                # it here leaves the runtime to recompute it.
+                # The runtime allocated fewer pages than it accepted tokens for.
+                # It reports the shortfall through cancel_load; until then the
+                # unaddressable tail is simply not loaded.
                 break
             self._append_pages(state, transfers, block)
         return transfers
 
-    def _saves_for(self, state: _RequestState, request_data: RequestData) -> RequestTransfers:
+    def _saves_for(
+        self, state: _RequestState, request_data: RequestData, num_loaded_tokens: int
+    ) -> RequestTransfers:
         transfers = RequestTransfers(request_data.request_id)
-        limit = self._addressable_blocks(state)
+        # Prompt hashes are known before prefill. Capacity and scratch pages
+        # can also run ahead of computation. The worker waits for this forward
+        # pass before saving, so only its completed full blocks are publishable.
+        # The initial scheduler position excludes this iteration's connector
+        # restore. Add it back before locating the newly computed tail.
+        computed_end = (
+            request_data.computed_position + num_loaded_tokens + request_data.num_scheduled_tokens
+        )
+        limit = min(self._addressable_blocks(state), computed_end // self._tokens_per_block)
         for block in range(state.saved_upto, limit):
             self._append_pages(state, transfers, block)
         state.saved_upto = max(state.saved_upto, limit)
@@ -335,8 +394,9 @@ class MooncakeStoreConnectorScheduler(KvCacheConnectorScheduler):
         for layer_group_id, indices in state.pages.items():
             page_index = indices[block]
             if page_index == BAD_PAGE_INDEX:
-                # A sliding window dropped the block in this group, and a
-                # partial block is not a usable cache entry.
+                # The block has no page in this group, because a sliding window
+                # dropped it. A partial page is not a usable cache entry,
+                # so the whole block is skipped.
                 return
             pages.append(PageTransfer(block_hash, layer_group_id, page_index))
         transfers.pages.extend(pages)
