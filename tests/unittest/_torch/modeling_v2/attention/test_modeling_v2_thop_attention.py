@@ -312,6 +312,32 @@ def _compare(out: torch.Tensor, ref: torch.Tensor) -> None:
     assert_within_ulp(out, ref, element_ulp=8.0, rms_ulp=4.0, ulp=ULP[torch.bfloat16])
 
 
+def _compare_fp8_mla(out: torch.Tensor, ref: torch.Tensor) -> None:
+    """The MLA context cells' band: the fp8 MLA band per element, and
+    `_compare`'s 4 ulp of relative RMS in aggregate.
+
+    `_compare`'s 8-ulp element gate states an accumulation-order difference
+    and nothing else. Over the fp8 pool the kernel also rounds the softmax
+    probabilities to e4m3 before the value product -- an MMA operand that
+    `reference(e4m3_inputs=True)` does not round -- and that error does not
+    shrink with the output's own scale (see FP8_MLA_ATOL above). Gated
+    against the row maximum it also depends on the head count: a row holds
+    `num_heads * v_head_dim` outputs, so at 16 heads the yardstick is the
+    largest of 2048 values instead of 16384, smaller and noisier, while the
+    per-element error is unchanged. The 16-head cell crossed the 8-ulp gate
+    by 1%, on one element of 135168 (0.0316 of the row scale against
+    0.03125); the 128-head cell passing it is one input that happened to,
+    not a derivation. So the element gate is the one this file derives for
+    the fp8 MLA FMHA and applies to every other fp8 context case, and the
+    aggregate keeps `_compare`'s RMS bound, which a row's width does not
+    move.
+    """
+    torch.testing.assert_close(out, ref, rtol=FP8_MLA_RTOL, atol=FP8_MLA_ATOL)
+    err = (out.float() - ref.float()).pow(2).mean().sqrt()
+    rel_rms = (err / ref.float().pow(2).mean().sqrt().clamp_min(1e-9)).item()
+    assert rel_rms <= 4.0 * ULP[torch.bfloat16], f"relative RMS {rel_rms:.3e} exceeds 4 bf16 ulp"
+
+
 class _PagedAttnEnv:
     """Real op state: caller-owned paged KV pool + explicit metadata tensors.
 
@@ -1276,16 +1302,16 @@ def test_bf16_two_pool_layer_routing_gqa_d64() -> None:
 SINK_HQ, SINK_HKV, SINK_D = 64, 8, 64
 
 
-def _sink_env(**kwargs) -> _PagedAttnEnv:
-    return _PagedAttnEnv(num_heads=SINK_HQ, num_kv_heads=SINK_HKV, head_dim=SINK_D, **kwargs)
+def _sink_env(num_heads: int = SINK_HQ, num_kv_heads: int = SINK_HKV, **kwargs) -> _PagedAttnEnv:
+    return _PagedAttnEnv(num_heads=num_heads, num_kv_heads=num_kv_heads, head_dim=SINK_D, **kwargs)
 
 
-def _sinks(low: float, high: float, seed: int) -> torch.Tensor:
+def _sinks(low: float, high: float, seed: int, num_heads: int = SINK_HQ) -> torch.Tensor:
     """One fp32 sink logit per q head, spread over [low, high] so every head
     carries a different value (a kernel indexing sinks by kv head, or by a
     shifted head index, cannot match the reference)."""
     gen = torch.Generator(device="cuda").manual_seed(seed)
-    return torch.empty(SINK_HQ, dtype=torch.float32, device="cuda").uniform_(
+    return torch.empty(num_heads, dtype=torch.float32, device="cuda").uniform_(
         low, high, generator=gen
     )
 
@@ -4273,8 +4299,11 @@ def test_fp8_mla_r1_cell_context_prefill_h128() -> None:
     _assert_table_pins_the_append(env, rival, 0, pre[3], lens[0])
 
 
-def test_fp8_mla_r1_cell_generation_decode_h128() -> None:
-    """Latent-MQA decode at the complete R1 cell over the fp8-e4m3 pool.
+def _fp8_mla_r1_generation_decode(num_heads: int, p: int = 1) -> None:
+    """Latent-MQA decode at the complete R1 cell over the fp8-e4m3 pool, at
+    `num_heads` (128 at attention DP; the deepseek default target splits them
+    over attention TP) and `p` query rows per sequence (`max_draft_len + 1`
+    under MTP). Every MLA generation cell runs it from `test_certified_cells`.
 
     Nothing is rotated in this phase, so of the cell's three axes only
     q_scaling has an effect here — it reaches the kernel through the caller's
@@ -4282,33 +4311,40 @@ def test_fp8_mla_r1_cell_generation_decode_h128() -> None:
     scale. Histories of 64 (two exact pages, first decode token opens page 2)
     and 31 (first decode token takes page 0's last slot, second opens page 1),
     two steps. Gated against a reference at q_scaling = 1.0 (observed 4.2x the
-    fp8 band, where the matching reference uses 0.20).
+    fp8 band at P = 1, where the matching reference uses 0.20).
     """
-    env = _fp8_r1_env()
+    env = _fp8_r1_env(num_heads=num_heads)
     prefill = [64, 31]
     _fp8_mla_prefill(env, prefill, 951)
     for rid in (0, 1):
         env.check_cache(rid)
     for _ in range(2):
         for rid in (0, 1):
-            env.append_decode_latent(
-                rid,
-                torch.randn(LATENT_DIM, dtype=torch.bfloat16, device="cuda") * 0.5,
-            )
+            for _ in range(p):
+                env.append_decode_latent(
+                    rid,
+                    torch.randn(LATENT_DIM, dtype=torch.bfloat16, device="cuda") * 0.5,
+                )
         pool_before = env.pool.clone()
         fused_q = (
-            torch.randn(2, env.num_heads * LATENT_DIM, dtype=torch.bfloat16, device="cuda") * 0.3
+            torch.randn(2 * p, env.num_heads * LATENT_DIM, dtype=torch.bfloat16, device="cuda")
+            * 0.3
         )
-        out = env.call_generation([0, 1], fused_q)
+        out = env.call_generation([0, 1], fused_q, predicted_tokens_per_seq=p)
         torch.testing.assert_close(
             out,
-            env.generation_reference([0, 1], fused_q),
+            env.generation_reference([0, 1], fused_q, predicted_tokens_per_seq=p),
             rtol=FP8_MLA_RTOL,
             atol=FP8_MLA_ATOL,
         )
         _assert_far_outside_band(
             out,
-            env.generation_reference([0, 1], fused_q, softmax_scale=1.0 / math.sqrt(QK_HEAD_DIM)),
+            env.generation_reference(
+                [0, 1],
+                fused_q,
+                softmax_scale=1.0 / math.sqrt(QK_HEAD_DIM),
+                predicted_tokens_per_seq=p,
+            ),
             2.0,
             "fp8 R1-cell MLA decode against a q_scaling = 1.0 reference",
             FP8_MLA_ATOL,
@@ -6829,13 +6865,15 @@ def _cell_standard(cell) -> None:
     spec = cell.spec
     torch.manual_seed(zlib.crc32(cell.why.encode()) % 2**31)
     window = spec["window"]
+    heads = dict(num_heads=spec["num_heads"], num_kv_heads=spec["num_kv_heads"])
+    assert spec["head_size"] == SINK_D, spec["head_size"]
     env = (
-        _sink_env(attention_window_size=window, num_blocks=96, max_blocks_per_seq=16)
+        _sink_env(**heads, attention_window_size=window, num_blocks=96, max_blocks_per_seq=16)
         if window
-        else _sink_env()
+        else _sink_env(**heads)
     )
     n_tokens = 200 if window else 48
-    sink = _sinks(-2.0, 4.0, seed=zlib.crc32(cell.why.encode()) % 1000)
+    sink = _sinks(-2.0, 4.0, seed=zlib.crc32(cell.why.encode()) % 1000, num_heads=spec["num_heads"])
     env.add_request(0, n_tokens)
     qkv = env.random_qkv(n_tokens)
     out = _paged_ctx_call(env, qkv, [n_tokens], 1, [0], attention_sinks=sink)
@@ -6882,8 +6920,11 @@ def _cell_mla_context(cell) -> None:
     The two scale factors under quant_mode 128 -- `s**2` inside the softmax
     scale and `s` on the output -- default to 1.0 on this flavour, which is why
     only `e4m3_inputs` is set here.
+
+    Gated by `_compare_fp8_mla`, not `_compare`: see its docstring for why
+    the fp8 pool needs the fp8 MLA element band.
     """
-    env = _fp8_r1_env()
+    env = _fp8_r1_env(num_heads=cell.spec["num_heads"])
     cached_lens, new_lens = [96, 31, 0], [32, 9, 25]
     kv_lens = [c + n for c, n in zip(cached_lens, new_lens)]
     torch.manual_seed(zlib.crc32(cell.why.encode()) % 2**31)
@@ -6916,7 +6957,7 @@ def _cell_mla_context(cell) -> None:
         atol=FP8_MLA_ATOL,
         msg=lambda m: f"op.reference disagrees with _fp8_no_append_reference\n{m}",
     )
-    _compare(out, ref)
+    _compare_fp8_mla(out, ref)
 
 
 def _seed(cell) -> None:
@@ -7091,12 +7132,11 @@ def _cell_encoder(cell, arm) -> None:
 def test_certified_cells(cell, certifying) -> None:  # noqa: F811
     """Drive every configuration the entry claims.
 
-    The MLA generation cell is driven by the tests above rather than here: its
-    output lives in latent space, reconstructed from the paged cache, and the
-    entry's `reference` takes explicit K/V. The cell stays in the list because
-    it is a configuration a shipped target runs and `is_valid` is checked
-    against it; what this file does not do is compare it to `reference`, and
-    saying so is better than a cell that quietly proves less than its siblings.
+    An MLA generation cell is not compared to `reference`: its output lives in
+    latent space, reconstructed from the paged cache, and the entry's
+    `reference` takes explicit K/V. It runs the latent-space decode check
+    `_fp8_mla_r1_generation_decode` at the cell's head count instead, after
+    `is_valid`.
 
     The cells that state their batch as `cached`/`new` (or `seg_lens`, with no
     KV cache) arm `certifying`, so their run is also proof that the entry's
@@ -7117,4 +7157,6 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811
     else:
         with validating(op):
             op.is_valid(num_heads=cell.spec["num_heads"], num_kv_heads=cell.spec["num_kv_heads"])
-        pytest.skip("MLA generation is covered by test_fp8_mla_r1_cell_generation_decode_h128")
+        _fp8_mla_r1_generation_decode(
+            cell.spec["num_heads"], cell.spec.get("predicted_tokens_per_seq", 1)
+        )
