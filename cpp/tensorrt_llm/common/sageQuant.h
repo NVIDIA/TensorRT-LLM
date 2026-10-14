@@ -19,6 +19,7 @@
 
 #include "tensorrt_llm/common/cudaBf16Wrapper.h"
 #include "tensorrt_llm/kernels/multiHeadAttentionCommon.h"
+#include <cstdint>
 #include <cuda.h>
 #include <cuda_runtime.h>
 #ifdef ENABLE_FP8
@@ -57,12 +58,14 @@ struct SageQuantParams
     kernels::Data_type inputType{kernels::DATA_TYPE_FP16};
     kernels::Data_type quantType{kernels::DATA_TYPE_E4M3};
     float* ptrQkScale{nullptr};
-    // Optional source and scratch mean used to perform K-smoothing.
-    // (See below) collected at vStage==1, applied at vStage==2.
+    // Optional K-smoothing. The vStage==1 launch sums the mean of ptrKForMean into the int64 buffer
+    // ptrKMeanSum and converts it into ptrKMean, which the vStage==2 launch subtracts from K.
     void const* ptrKForMean{nullptr};
+    int64_t* ptrKMeanSum{nullptr};
     float* ptrKMean{nullptr};
     // Optional arguments for SageQuantV:
-    // vStage: 0: disabled, 1: collect scales, 2: quantize
+    // vStage: 0: disabled, 1: collect scales, 2: quantize. The vStage==1 launch initializes the
+    // buffers it reduces into, ptrVScale and the sums and minima of the smoothing means, itself.
     int vStage{};
     int sumSeqLensV{};
     int numHeadsV{};
@@ -74,13 +77,13 @@ struct SageQuantParams
     // PrimTS block-sparse kernel expect; otherwise one [numHeadsV, headDim] row set covers the
     // whole batch, as the trtllm-gen kernels expect.
     int const* ptrCuSeqLensV{nullptr};
-    // Optional V smoothing, with the layout of the V scales. ptrVMean is collected at vStage==1 and
-    // subtracted from V at vStage==2. A smoothed V's scales cover V minus its mean, which is final
-    // only after the whole vStage==1 launch, so that launch collects the signed per-channel extrema
-    // into ptrVMax/ptrVMin (filled with -inf/+inf beforehand) instead of writing ptrVScale, and the
-    // vStage==2 launch derives ptrVScale from them. Without ptrVMax, vStage==2 reads ptrVScale.
+    // Optional V smoothing, with the layout of the V scales. The vStage==1 launch sums the V mean
+    // into the int64 buffer ptrVMeanSum and converts it into ptrVMean, which the vStage==2 launch
+    // subtracts from V. A smoothed V's scales cover V minus its mean, which is final only after the
+    // whole vStage==1 launch, so that launch collects the signed per-channel maximum into ptrVScale
+    // and the minimum into ptrVMin, and turns them into the scales once the mean is known.
+    int64_t* ptrVMeanSum{nullptr};
     float* ptrVMean{nullptr};
-    float* ptrVMax{nullptr};
     float* ptrVMin{nullptr};
     // Hardware info. Required.
     int smCount{};

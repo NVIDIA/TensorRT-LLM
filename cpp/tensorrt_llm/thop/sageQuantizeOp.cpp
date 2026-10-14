@@ -23,7 +23,6 @@
 #include <torch/extension.h>
 
 #include <cstdint>
-#include <limits>
 #include <optional>
 
 TRTLLM_NAMESPACE_BEGIN
@@ -135,6 +134,7 @@ void launch(SageQuantParams params, torch::Tensor const& input, torch::Tensor co
 // quantized to FP8 E4M3 with one scale per channel of each sequence. The V scales and the means
 // are [batch, heads_kv, head_dim]; k_mean and v_mean are the K- and V-smoothing means, subtracted
 // before quantization and filled exactly when given; a smoothed V's scales cover V minus its mean.
+// Repeated calls on the same GPU write bitwise identical values, the means included.
 //
 // With reuse_stats, only K and V are quantized, with the V scales and the means of an earlier call
 // as inputs, for tensors that must dequantize like that call's K and V, such as the K/V block means
@@ -184,29 +184,22 @@ void sage_quantize(std::optional<torch::Tensor> const& query, torch::Tensor cons
     TORCH_CHECK(q_quant->scalar_type() == k_quant.scalar_type(), "q_quant and k_quant must share a dtype");
     checkBlockScales(*query, *q_scale, q_block_size, batchSize, "q_scale");
 
-    // The V scales and the means are reduced with atomics into zeroed buffers. A smoothed V's scales
-    // are derived from the extrema instead.
-    if (!v_mean.has_value())
+    // The launch initializes the buffers it reduces into: the V scales, and the sums and minima of
+    // the smoothing means below.
+    std::optional<torch::Tensor> k_mean_sum;
+    if (params.kSmooth)
     {
-        v_scale.zero_();
+        k_mean_sum = torch::empty_like(*k_mean, torch::kInt64);
+        params.ptrKForMean = key.data_ptr();
+        params.ptrKMeanSum = k_mean_sum->data_ptr<int64_t>();
     }
-    if (k_mean.has_value())
-    {
-        k_mean->zero_();
-    }
-    if (v_mean.has_value())
-    {
-        v_mean->zero_();
-    }
-
-    params.ptrKForMean = params.kSmooth ? key.data_ptr() : nullptr;
-    std::optional<torch::Tensor> v_max;
+    std::optional<torch::Tensor> v_mean_sum;
     std::optional<torch::Tensor> v_min;
     if (v_mean.has_value())
     {
-        v_max = torch::full_like(v_scale, -std::numeric_limits<float>::infinity());
-        v_min = torch::full_like(v_scale, std::numeric_limits<float>::infinity());
-        params.ptrVMax = v_max->data_ptr<float>();
+        v_mean_sum = torch::empty_like(*v_mean, torch::kInt64);
+        v_min = torch::empty_like(v_scale);
+        params.ptrVMeanSum = v_mean_sum->data_ptr<int64_t>();
         params.ptrVMin = v_min->data_ptr<float>();
     }
     // Q, while collecting the V statistics and the K mean; then K (smoothed by the K mean) and V.
