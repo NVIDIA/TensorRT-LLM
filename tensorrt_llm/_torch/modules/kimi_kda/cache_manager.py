@@ -19,6 +19,8 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.common import (
     MambaAcceptanceBatch,
     MambaLayerCache,
     MambaStateLayout,
+    _get_local_mamba_cache_layout,
+    _mamba_effective_tp_size,
     _promote_intermediate_states,
     _stack_state_views,
 )
@@ -26,6 +28,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.mamba_cache_man
     MambaHybridCacheManagerV2,
 )
 from tensorrt_llm.logger import logger
+from tensorrt_llm.mapping import Mapping
 
 _MAMBA_SSM_SEED_MASK = (1 << 62) - 1
 _MAMBA_SSM_UINT64_MASK = (1 << 64) - 1
@@ -327,25 +330,65 @@ class KDAReplayState:
                 "KDA replay caches require equal [Q | K | V] convolution-state sections"
             )
 
-    def bytes_per_slot(self, context: MambaStateLayout, layer_id: int) -> int:
-        if not context.mamba_pp_layers:
-            return 0
-        section_dim = context.conv_section_dims[0]
-        committed_window = context.conv_state_shape[1]
+    def _layer_bytes_per_slot(self, section_dim: int, committed_window: int, num_heads: int) -> int:
         extended_window = committed_window + self.num_speculative_tokens
-        num_heads = context.ssm_state_shape[0]
         float_elements = (
             3 * section_dim * extended_window
             + self.num_speculative_tokens * 3 * section_dim
             + self.num_speculative_tokens * section_dim
             + self.num_speculative_tokens * _kda_beta_cache_padded_heads(num_heads)
         )
+        return float_elements * 4
+
+    def bytes_per_slot(self, context: MambaStateLayout, layer_id: int) -> int:
+        if not context.mamba_pp_layers:
+            return 0
         shared_bytes = 0
         if layer_id == context.mamba_pp_layers[0]:
             shared_bytes = 4
             if self._stochastic_rounding:
                 shared_bytes += 8
-        return float_elements * 4 + shared_bytes
+        return (
+            self._layer_bytes_per_slot(
+                context.conv_section_dims[0],
+                context.conv_state_shape[1],
+                context.ssm_state_shape[0],
+            )
+            + shared_bytes
+        )
+
+    @classmethod
+    def estimate_bytes_per_slot(cls, model_config, mapping: Mapping, **kwargs) -> int:
+        """Estimate rank-local replay storage using the runtime replay gate and geometry."""
+        spec_config = kwargs.get("spec_config")
+        num_spec = kwargs.get("kda_replay_num_spec")
+        if num_spec is None:
+            num_spec = get_kda_replay_num_spec(spec_config, manager_supports_replay=True)
+        if num_spec is None:
+            return 0
+        params, local_layers, _ = _get_local_mamba_cache_layout(
+            model_config,
+            mapping,
+            spec_config=spec_config,
+            is_draft=kwargs.get("is_draft", False),
+            use_separate_draft_kv_cache=kwargs.get("use_separate_draft_kv_cache", False),
+        )
+        if not local_layers:
+            return 0
+        tp_size = _mamba_effective_tp_size(mapping)
+        quant_config = model_config.quant_config
+        stochastic_rounding = kwargs.get(
+            "mamba_ssm_stochastic_rounding",
+            getattr(quant_config, "mamba_ssm_stochastic_rounding", False)
+            and params.mamba_ssm_cache_dtype == torch.float16,
+        )
+        state = cls(num_spec)
+        layer_bytes = state._layer_bytes_per_slot(
+            params.n_groups * params.state_size // tp_size,
+            params.conv_kernel - 1,
+            params.num_heads // tp_size,
+        )
+        return local_layers * layer_bytes + 4 + (8 if stochastic_rounding else 0)
 
     def bind(
         self,
@@ -640,6 +683,11 @@ class KimiK3HybridCacheManager(MambaHybridCacheManagerV2):
             self._kda_replay.bytes_per_slot(self._state_layout, layer_id)
             for layer_id in self.mamba_pp_layers
         )
+
+    @classmethod
+    @override
+    def _extra_state_bytes_per_rank(cls, model_config, mapping: Mapping, **kwargs) -> int:
+        return KDAReplayState.estimate_bytes_per_slot(model_config, mapping, **kwargs)
 
     @override
     def _on_state_slots_relocated(self, old_slots: list[int], new_slots: list[int]) -> None:

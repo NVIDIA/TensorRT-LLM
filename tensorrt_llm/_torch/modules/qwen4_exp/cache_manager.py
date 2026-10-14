@@ -201,7 +201,9 @@ class Qwen4ExpHybridCacheManager(MambaHybridCacheManagerV2):
         self.qsa_index_dim = self.qsa_index_kv_heads = 0
         self.qsa_sparse_layer_ids = []
         self.qsa_position_layer_id = None
-        self._qsa_enabled = sparse_attention_config is not None
+        self._qsa_enabled = (
+            sparse_attention_config is not None and sparse_attention_config.algorithm == "qsa"
+        )
         if self._qsa_enabled:
             if layer_mask is None:
                 raise ValueError("QSA cache allocation requires the full-attention layer mask")

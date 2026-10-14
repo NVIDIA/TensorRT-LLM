@@ -21,7 +21,11 @@ from tensorrt_llm._torch.pyexecutor._util import _create_kv_cache_manager, get_k
 from tensorrt_llm._torch.pyexecutor.config_utils import MambaKVCacheParams
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManagerV2
 from tensorrt_llm.bindings import DataType
-from tensorrt_llm.llmapi.llm_args import KvCacheConfig, QSASparseAttentionConfig
+from tensorrt_llm.llmapi.llm_args import (
+    KvCacheConfig,
+    QSASparseAttentionConfig,
+    SkipSoftmaxAttentionConfig,
+)
 
 
 def _sparse_params() -> QSASparseParams:
@@ -293,8 +297,13 @@ def test_qsa_rejects_non_hybrid_models(monkeypatch) -> None:
         )
 
 
-def test_qsa_cache_manager_uses_resolved_index_geometry(
+@pytest.mark.parametrize(
+    "sparse_config",
+    [None, QSASparseAttentionConfig(), SkipSoftmaxAttentionConfig(threshold_scale_factor=1.0)],
+)
+def test_qwen4_cache_manager_uses_only_qsa_index_geometry(
     monkeypatch,
+    sparse_config,
 ) -> None:
     from tensorrt_llm._torch.pyexecutor import _util
 
@@ -344,7 +353,7 @@ def test_qsa_cache_manager_uses_resolved_index_geometry(
         max_seq_len=4096,
         max_batch_size=8,
         spec_config=None,
-        sparse_attention_config=QSASparseAttentionConfig(),
+        sparse_attention_config=sparse_config,
         max_num_tokens=1024,
         max_beam_width=1,
         kv_connector_manager=None,
@@ -356,8 +365,12 @@ def test_qsa_cache_manager_uses_resolved_index_geometry(
         is_draft=False,
     )
 
-    assert manager.qsa_index_dim == 96
-    assert manager.qsa_index_kv_heads == 1
+    qsa_enabled = isinstance(sparse_config, QSASparseAttentionConfig)
+    assert manager._qsa_enabled == qsa_enabled
+    assert manager.qsa_index_dim == (96 if qsa_enabled else 0)
+    assert manager.qsa_index_kv_heads == (1 if qsa_enabled else 0)
+    if not qsa_enabled:
+        assert manager._extra_buffers_per_layer(tokens_per_block=128) == {}
 
 
 def test_qwen4_manager_also_supports_dense_attention(monkeypatch) -> None:

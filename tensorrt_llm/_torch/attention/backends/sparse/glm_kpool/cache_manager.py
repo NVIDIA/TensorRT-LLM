@@ -126,6 +126,11 @@ class Glm5NextCacheManager(MambaHybridCacheManagerV2):
             for layer_id in self.mamba_pp_layers
         )
 
+    @classmethod
+    @override
+    def _extra_state_bytes_per_rank(cls, model_config, mapping: Mapping, **kwargs) -> int:
+        return KDAReplayState.estimate_bytes_per_slot(model_config, mapping, **kwargs)
+
     @override
     def _on_state_slots_relocated(self, old_slots: list[int], new_slots: list[int]) -> None:
         if self._kda_replay is None:
@@ -249,9 +254,10 @@ class Glm5NextCacheManager(MambaHybridCacheManagerV2):
             for local_layer_idx in range(self.num_local_layers)
         )
 
-    @staticmethod
+    @classmethod
     @override
     def get_cache_size_per_token(
+        cls,
         model_config: ModelConfig,
         mapping: Mapping,
         *,
@@ -261,7 +267,7 @@ class Glm5NextCacheManager(MambaHybridCacheManagerV2):
         max_seq_len: int | None = None,
         **kwargs,
     ) -> tuple[int, int]:
-        slope, fixed_cost = MambaHybridCacheManagerV2.get_cache_size_per_token(
+        slope, fixed_cost = super().get_cache_size_per_token(
             model_config,
             mapping,
             max_batch_size=max_batch_size,

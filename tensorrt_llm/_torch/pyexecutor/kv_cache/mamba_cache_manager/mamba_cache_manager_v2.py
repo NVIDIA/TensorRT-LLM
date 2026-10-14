@@ -70,6 +70,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     TokenIdExt,
     _KVCache,
 )
+from tensorrt_llm.runtime.kv_cache_manager_v2 import KVCacheManager as KVCacheManagerPy
 from tensorrt_llm.runtime.kv_cache_manager_v2 import KVCacheManagerConfig as KVCacheManagerConfigPy
 
 from .common import (
@@ -399,6 +400,16 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
 
     def _extra_scratch_bytes_per_slot(self) -> int:
         return 0
+
+    @override
+    def _get_external_cache_bytes(self, cache: KVCacheManagerPy) -> int:
+        bytes_per_slot = self._extra_scratch_bytes_per_slot()
+        if not bytes_per_slot or not self.mamba_pp_layers:
+            return 0
+        layer_id = LayerId(self.layer_offsets[self.mamba_pp_layers[0]])
+        scale = cache.get_page_index_scale(layer_id, MambaRole.SSM_STATE)
+        pages = cache.get_page_index_upper_bound(layer_id, MambaRole.SSM_STATE)
+        return ((pages + scale - 1) // scale) * bytes_per_slot
 
     def _get_recurrent_buffer_configs(self, global_layer_id: int) -> list[BufferConfig]:
         """Declare all buffers sharing one recurrent layer's slot lifecycle."""

@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Regression tests for Python, Cpp, and V2 Mamba cache managers."""
 
+import math
 import os
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -88,6 +89,7 @@ from tensorrt_llm.llmapi.llm_utils import (
 )
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
+    GPU_LEVEL,
     AttentionLayerConfig,
     BatchDesc,
     BufferConfig,
@@ -3681,6 +3683,18 @@ def test_v2_kda_replay_policy_allocates_logical_slot_caches():
         assert mgr._kda_replay is policy
         assert policy.intermediate_indices.shape == (4,)
         assert not hasattr(mgr, "get_replay_state_update_metadata")
+
+        total_quota = math.ceil(
+            mgr._get_quota_from_max_tokens(mgr.kv_cache_config.max_tokens)
+            / mgr.kv_cache_config.max_util_for_resume
+        )
+        replay_bytes = sum(
+            buffer.untyped_storage().nbytes()
+            for buffer in (*policy._layer_replay_buffers(), policy.prev_num_accepted_tokens)
+        )
+        native_bytes = mgr.impl.get_quota(GPU_LEVEL)
+        assert native_bytes + replay_bytes <= total_quota
+        assert mgr.kv_cache_manager_py_config.cache_tiers[0].quota == native_bytes
 
         layer_cache = mgr.mamba_layer_cache(0)
         assert not hasattr(layer_cache, "intermediate_ssm")
