@@ -250,13 +250,15 @@ available to downstream `L0_Test-*` pods. To deliver it per stage:
 
 If the upload or the download/extraction fails, the override directory is
 absent and `renderTestDB` falls back to the source test-db. Layer 2 still
-applies. The tarball carries only the narrowed YAMLs, so no PR diff text
-travels between jobs.
+applies. For applied decisions, the tarball carries only the narrowed YAMLs,
+so no PR diff text travels between jobs.
 
-Shadow coverage decisions return to the baseline before this upload step, so
-neither Layer 2 stage filtering nor Layer 3 test-db narrowing can affect the
-run. They upload `cbts/cbts_shadow_selection.tar.gz`, containing the final
+Shadow coverage decisions use the same `cbts/cbts_test_db.tar.gz` upload path,
+then return `null` to the baseline filter chain. The archive contains the final
 `cbts_shadow_decision.json` and, when present, the narrowed `cbts_test_db/`.
+Downstream stages use the archive only when the CBTS result is applied, so
+neither Layer 2 stage filtering nor Layer 3 test-db narrowing affects a shadow
+run.
 OpenSearch records the artifact path in `s_shadow_selection_artifact_path` after
 a successful upload. `s_scope=coverage` with `b_cbts_applied=false` identifies
 a successful shadow candidate.

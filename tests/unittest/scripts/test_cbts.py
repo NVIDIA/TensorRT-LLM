@@ -3354,7 +3354,7 @@ def test_main_posts_case_skip_rate_to_opensearch(
     decision_path = tmp_path / "decision.json"
     decision_path.write_text(
         '{"scope": "testsonly", "affected_stages": [], '
-        '"shadow_selection_artifact_path": "repo/build/cbts/cbts_shadow_selection.tar.gz"}'
+        '"shadow_selection_artifact_path": "repo/build/cbts/cbts_test_db.tar.gz"}'
     )
 
     assert (
@@ -3381,7 +3381,7 @@ def test_main_posts_case_skip_rate_to_opensearch(
     assert posted_documents[0]["b_cbts_applied"] is expected_cbts_applied
     assert posted_documents[0]["b_coverage_pilot_eligible"] is expected_coverage_pilot_eligible
     assert posted_documents[0]["s_shadow_selection_artifact_path"] == (
-        "repo/build/cbts/cbts_shadow_selection.tar.gz"
+        "repo/build/cbts/cbts_test_db.tar.gz"
     )
 
 
