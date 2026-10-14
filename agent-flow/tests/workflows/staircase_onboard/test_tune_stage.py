@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -957,3 +958,36 @@ def test_an_incomplete_kernel_ledger_gets_one_fix_turn_with_perf_optimizes_findi
     assert "'ghost-item'" in asks["fix"] and "does not match any roadmap item id" in asks["fix"]
     records = [json.loads(line) for line in (spec.workdir / "perf_ledger.jsonl").read_text().splitlines()]
     assert [r["rows"] for r in records if r["kind"] == "kernel_ledger"] == [2]
+
+
+def test_a_finished_job_without_its_result_is_measured_again(tmp_path):
+    """An adopted receipt can say rc 0 while the result directory is gone (moved aside, quota): the label
+    is re-queued instead of failing the stage."""
+    repo = _repo(tmp_path)
+    identity = tmp_path / "identity.yaml"
+    identity.write_text(yaml.safe_dump({"modeling_v2": "require"}))
+    task = {"trtllm_repo_path": str(repo), "checkpoint_path": "/ckpt",
+            "perf": {"identity_configs": [str(identity)], "workload": {"isl": 8192, "osl": 1024, "concurrency": [1, 128]},
+                     "spools": ["s1"], "env_script": "/env.sh", "reference": "none", "noise_repeats": 0}}
+    spec = TuneSpec.from_task(task, tmp_path / "ws", target="t/")
+
+    class LosesTheFirstResult(FakeRunner):
+        lost = False
+
+        def poll(self):
+            done = super().poll()
+            if not self.lost and done:
+                self.lost = True
+                for label, _, _ in done:
+                    shutil.rmtree(spec.workdir / "data" / label)
+            return done
+
+    runners = []
+
+    def factory(spools, prefix):
+        runners.append(LosesTheFirstResult(spools, prefix, _effect))
+        return runners[-1]
+
+    stage = TuneStage(spec, {}, dispatch=lambda *a: "", checkpoint=lambda: None, runner_factory=factory, poll_s=0, log=lambda m: None)
+    assert stage.ground()
+    assert (spec.workdir / "data" / "t-baseline" / "meta.json").exists()

@@ -195,8 +195,9 @@ class TuneStage:
                 queued.add(label)
                 self.log(f"[tune] measuring {label} on {free[0]}")
             for label, _, rc in self.perf.poll():
-                if rc != 0 and not (self.data / label / "meta.json").exists():
-                    # A session that died, a full filesystem: measure again before giving up.
+                if not (self.data / label / "meta.json").exists():
+                    # A session that died, a full filesystem -- or an adopted receipt whose result
+                    # directory is gone (rc 0, nothing on disk): measure again before giving up.
                     retries[label] = retries.get(label, 0) + 1
                     if retries[label] <= (2 if rc in INFRA_RCS else 1):
                         self.log(f"[tune] {label} failed rc={rc}; re-queued")
