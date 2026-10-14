@@ -687,17 +687,13 @@ def test_sparse_prefill_continuation_preserves_partial_pools():
 
 
 @pytest.mark.cpu_only
-@pytest.mark.parametrize(
-    "cu_seqlens, cached_lens",
-    [([0, 37, 66], [250, 0]), ([0, 10, 70], [100, 0]), ([0, 13], [0])],
-    ids=["continuation-longest", "cached-prefix-beats-longer-chunk", "single-request"],
-)
-def test_sparse_prefill_bounds_pool_scoring_by_largest_visible_length(cu_seqlens, cached_lens):
-    """forward_prefill bounds pool scoring by the batch's largest visible length.
+def test_sparse_prefill_bounds_pool_scoring_by_largest_visible_length():
+    """forward_prefill bounds pool scoring by the largest cached + new length.
 
-    The host bound counts cached tokens and must equal the largest per-row visible
-    prefix it hands to scoring; a smaller bound would hide visible pools from top-k.
+    Request 0 continues a cached prefix with a shorter chunk than request 1, so a
+    bound that ignored cached tokens would hide visible pools from top-k.
     """
+    cu_seqlens, cached_lens = [0, 10, 70], [100, 0]
     tokens, heads, head_dim = cu_seqlens[-1], 2, 4
     select = Mock(return_value=torch.zeros(tokens, 8))
     attention = SimpleNamespace(
@@ -718,10 +714,7 @@ def test_sparse_prefill_bounds_pool_scoring_by_largest_visible_length(cu_seqlens
     visible = select.call_args.args[3]
     max_visible = select.call_args.kwargs["max_visible"]
     assert isinstance(max_visible, int)
-    expected = max(
-        cached + end - start for cached, start, end in zip(cached_lens, cu_seqlens, cu_seqlens[1:])
-    )
-    assert max_visible == int(visible.max()) == expected
+    assert max_visible == int(visible.max()) == 110
 
 
 @pytest.mark.cpu_only

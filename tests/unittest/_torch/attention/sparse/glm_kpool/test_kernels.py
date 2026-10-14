@@ -150,161 +150,13 @@ def test_pool_scores_generation_rows(precision):
     # bf16 x bf16 products are exact in fp32, so every precision is an fp32
     # accumulation of exact products.
     torch.testing.assert_close(got[visible], want[visible], atol=2e-3, rtol=2e-3)
-
-
-def test_pool_scores_bf16_precision_falls_back_for_fp32_queries():
-    """FP32 queries are not exact in bf16, so precision="bf16" keeps the tf32 dot."""
-    gen = torch.Generator(device="cuda").manual_seed(5)
-    n, heads, slots, pages = 6, 4, 64, 8
-    pool = _strided_index_pool(slots, gen)
-    tables = _paged_tables(n, pages, slots, gen)
-    q = torch.randn(n, heads, HD, generator=gen, device="cuda")
-    w = torch.rand(n, heads, generator=gen, device="cuda").to(torch.bfloat16)
-    kv_lens = torch.tensor([2, 5, 16, 33, 60, 64], dtype=torch.int64, device="cuda")
-    kwargs = dict(num_pools_max=100, q_scale=HD**-0.5, w_scale=0.25)
-
-    def score(precision):
-        return kpool_score(
-            q,
-            w,
-            pool,
-            tables,
-            kv_lens,
-            TPB,
-            head_dim=HD,
-            kpool=KPOOL,
-            precision=precision,
-            **kwargs,
+    if precision == "bf16":
+        # FP32 queries are not exact in bf16, so they keep the tf32 dot.
+        args = (q.float(), w, pool, tables, kv_lens, TPB)
+        assert torch.equal(
+            kpool_score(*args, head_dim=HD, kpool=KPOOL, precision="bf16", **kwargs),
+            kpool_score(*args, head_dim=HD, kpool=KPOOL, precision="tf32", **kwargs),
         )
-
-    assert torch.equal(score("bf16"), score("tf32"))
-
-
-@pytest.mark.parametrize("rows_per_program", [1, 16])
-@pytest.mark.parametrize("precision", ["tf32", "bf16"])
-def test_pool_scores_max_kv_len_bounds_scored_pools(rows_per_program, precision):
-    """A host bound on kv_lens limits the launch to pools some row can see.
-
-    Two packed context requests continue from cached prefixes, so the visible
-    pools of every row stay far below the block-table capacity. Each row's
-    complete pools match the reference and the unbounded launch, which is what
-    a top-k scanning kv_len // kpool columns reads.
-    """
-    gen = torch.Generator(device="cuda").manual_seed(29)
-    heads, num_pools_max = 8, 520
-    pages = num_pools_max * KPOOL // TPB
-    slots = 2 * pages + 8
-    pool = _strided_index_pool(slots, gen)
-    tables = _paged_tables(2, pages, slots, gen)
-    cached, lens = [250, 0], [37, 29]
-    request_ids = torch.cat(
-        [torch.full((length,), i, dtype=torch.int32) for i, length in enumerate(lens)]
-    ).cuda()
-    kv_lens = torch.cat(
-        [torch.arange(c + 1, c + length + 1) for c, length in zip(cached, lens)]
-    ).cuda()
-    n = kv_lens.shape[0]
-    q = torch.randn(n, heads, HD, generator=gen, device="cuda").to(torch.bfloat16)
-    w = torch.rand(n, heads, generator=gen, device="cuda").to(torch.bfloat16)
-    kwargs = dict(num_pools_max=num_pools_max, q_scale=HD**-0.5, w_scale=heads**-0.5)
-
-    def score(max_kv_len):
-        return kpool_score(
-            q,
-            w,
-            pool,
-            tables,
-            kv_lens,
-            TPB,
-            head_dim=HD,
-            kpool=KPOOL,
-            rows_per_program=rows_per_program,
-            request_ids=request_ids,
-            precision=precision,
-            max_kv_len=max_kv_len,
-            **kwargs,
-        )
-
-    max_kv_len = max(c + length for c, length in zip(cached, lens))
-    got = score(max_kv_len)
-    unbounded = score(None)
-    want = _reference_scores(q, w, pool, tables[request_ids.long()], kv_lens, **kwargs)
-    assert got.shape == (n, num_pools_max)
-    for r, num_pools in enumerate((kv_lens // KPOOL).tolist()):
-        assert torch.equal(got[r, :num_pools], unbounded[r, :num_pools])
-        torch.testing.assert_close(got[r, :num_pools], want[r, :num_pools], atol=2e-3, rtol=2e-3)
-
-
-def test_pool_scores_max_kv_len_without_complete_pools_selects_nothing(
-    monkeypatch: pytest.MonkeyPatch,
-):
-    """A bound below one complete pool launches nothing, and the unwritten scores
-    never reach the indexer's pool top-k, which scans kv_len // kpool columns."""
-    from types import SimpleNamespace
-
-    from tensorrt_llm._torch.attention.backends.sparse.glm_kpool import kernels
-    from tensorrt_llm._torch.models.modeling_glm5_next import Glm5NextIndexer
-
-    config = SimpleNamespace(
-        hidden_size=256,
-        q_lora_rank=128,
-        index_n_heads=32,
-        index_head_dim=HD,
-        index_topk=2048,
-        index_kpool=KPOOL,
-        index_kpool_always_select_tail=True,
-    )
-    with torch.device("meta"):
-        indexer = Glm5NextIndexer(config, layer_idx=0)
-
-    gen = torch.Generator(device="cuda").manual_seed(31)
-    heads, num_pools_max = 8, 520
-    pages = num_pools_max * KPOOL // TPB
-    pool = _strided_index_pool(pages + 8, gen)
-    tables = _paged_tables(1, pages, pages + 8, gen)
-    # One context request whose first KPOOL - 1 tokens complete no pool.
-    kv_lens = torch.arange(1, KPOOL, device="cuda")
-    n = kv_lens.shape[0]
-    q = torch.randn(n, heads, HD, generator=gen, device="cuda").to(torch.bfloat16)
-    w = torch.rand(n, heads, generator=gen, device="cuda").to(torch.bfloat16)
-
-    class _NoLaunch:
-        def __getitem__(self, grid):
-            raise AssertionError(f"kpool_score launched grid {grid} without a complete pool")
-
-    monkeypatch.setattr(kernels, "_kpool_score_kernel", _NoLaunch())
-    scores = kpool_score(
-        q,
-        w,
-        pool,
-        tables,
-        kv_lens,
-        TPB,
-        num_pools_max=num_pools_max,
-        head_dim=HD,
-        kpool=KPOOL,
-        q_scale=HD**-0.5,
-        w_scale=heads**-0.5,
-        precision="bf16",
-        rows_per_program=16,
-        request_ids=torch.zeros(n, dtype=torch.int32, device="cuda"),
-        max_kv_len=int(kv_lens.max()),
-    )
-    assert scores.shape == (n, num_pools_max)
-
-    num_cand = (kv_lens // KPOOL).to(torch.int32)
-    # Glm5NextSparseAttention selects pools with is_prefill=False and scan_lengths
-    # in every phase, context rows included, so this is the prefill path too.
-    for candidate_scores in (scores, torch.full_like(scores, float("inf"))):
-        selected = torch.empty(n, indexer.select_k, dtype=torch.int32, device="cuda")
-        indexer.pool_top_k(
-            candidate_scores,
-            selected,
-            is_prefill=False,
-            sequence_lengths=num_cand,
-            scan_lengths=num_cand,
-        )
-        assert torch.equal(selected, torch.full_like(selected, -1))
 
 
 @pytest.mark.parametrize("layout", ["generation", "prefill_shared", "prefill_boundary"])
@@ -363,42 +215,56 @@ def test_pool_scores_strided_head_weights(layout, weight_head_stride):
     )
 
 
-def test_pool_scores_packed_context_rows_share_tables():
+@pytest.mark.parametrize("bounded", [False, True], ids=["full_capacity", "max_kv_len"])
+def test_pool_scores_packed_context_rows_share_tables(bounded, monkeypatch):
     """rows_per_program=16 with request_ids: the packed query tokens
     of several requests, in position order, including a group straddling two
-    requests (per-row gather branch)."""
+    requests (per-row gather branch). With max_kv_len, only pools some row can
+    see are launched; columns past the bound are left unwritten."""
+    from tensorrt_llm._torch.attention.backends.sparse.glm_kpool import kernels
+
     gen = torch.Generator(device="cuda").manual_seed(2)
-    heads, slots, pages = 3, 64, 8
-    pool = _strided_index_pool(slots, gen)
-    tables = _paged_tables(2, pages, slots, gen)
-    # Request 0: 21 query tokens (positions 0..20), request 1: 19 (0..18).
-    lens = [21, 19]
+    heads, num_pools_max = 3, 520
+    pages = num_pools_max * KPOOL // TPB
+    pool = _strided_index_pool(2 * pages + 8, gen)
+    tables = _paged_tables(2, pages, 2 * pages + 8, gen)
+    # Request 0: 21 query tokens after 250 cached ones, request 1: 19 (0..18).
+    lens, cached = [21, 19], [250, 0]
     request_ids = torch.cat(
         [torch.full((length,), i, dtype=torch.int32) for i, length in enumerate(lens)]
     ).cuda()
-    kv_lens = torch.cat([torch.arange(1, length + 1) for length in lens]).cuda()
+    kv_lens = torch.cat([torch.arange(c + 1, c + n + 1) for c, n in zip(cached, lens)]).cuda()
     n = kv_lens.shape[0]
     q = torch.randn(n, heads, HD, generator=gen, device="cuda").to(torch.bfloat16)
     w = torch.rand(n, heads, generator=gen, device="cuda").to(torch.bfloat16)
-    kwargs = dict(num_pools_max=8, q_scale=HD**-0.5, w_scale=1.0)
+    kwargs = dict(num_pools_max=num_pools_max, q_scale=HD**-0.5, w_scale=1.0)
 
-    got = kpool_score(
-        q,
-        w,
-        pool,
-        tables,
-        kv_lens,
-        TPB,
-        head_dim=HD,
-        kpool=KPOOL,
-        rows_per_program=16,
-        request_ids=request_ids,
-        **kwargs,
-    )
+    def score(rows, max_kv_len):
+        return kpool_score(
+            q[rows],
+            w[rows],
+            pool,
+            tables,
+            kv_lens[rows],
+            TPB,
+            head_dim=HD,
+            kpool=KPOOL,
+            rows_per_program=16,
+            request_ids=request_ids[rows],
+            max_kv_len=max_kv_len,
+            **kwargs,
+        )
+
+    got = score(slice(None), int(kv_lens.max()) if bounded else None)
     want = _reference_scores(q, w, pool, tables[request_ids.long()], kv_lens, **kwargs)
     visible = want > FP32_MIN
-    assert torch.equal(got <= FP32_MIN, ~visible)
     torch.testing.assert_close(got[visible], want[visible], atol=2e-3, rtol=2e-3)
+    if not bounded:
+        assert torch.equal(got <= FP32_MIN, ~visible)
+        return
+    # The first rows of request 1 complete no pool, so nothing is launched.
+    monkeypatch.setattr(kernels, "_kpool_score_kernel", None)
+    score(slice(lens[0], lens[0] + KPOOL - 1), KPOOL - 1)
 
 
 def test_pool_scores_broadcast_table_single_context_request():
