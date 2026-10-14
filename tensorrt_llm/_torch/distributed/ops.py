@@ -1310,16 +1310,9 @@ class AllReduce(nn.Module):
         if all_reduce_params is None:
             all_reduce_params = AllReduceParams()
 
-        use_torch_distributed_allreduce = self._disable_mpi and getattr(
-            self.mapping, "_use_torch_distributed_allreduce", False)
-        if self._disable_mpi and torch.distributed.is_initialized():
-            # MiniMax-H3 can host its Qwen text encoder on a TP subgroup
-            # smaller than the visual-gen world. Some Qwen layers materialize
-            # fresh mappings that preserve the subgroup but not MiniMax's
-            # private marker, so recognize the subgroup directly here.
-            use_torch_distributed_allreduce = (
-                use_torch_distributed_allreduce
-                or self.mapping.world_size < torch.distributed.get_world_size())
+        use_torch_distributed_allreduce = self._disable_mpi and (
+            getattr(self.mapping, "_use_torch_distributed_allreduce", False)
+            or getattr(self.mapping, "_tp_group_pg", None) is not None)
 
         if use_torch_distributed_allreduce:
             if all_reduce_params.fusion_op != AllReduceFusionOp.NONE or any(

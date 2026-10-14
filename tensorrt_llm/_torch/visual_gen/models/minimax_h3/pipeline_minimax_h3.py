@@ -844,10 +844,40 @@ class MiniMaxH3Pipeline(BasePipeline):
             token_tags, dtype=torch.long
         )
 
+    def _encode_reference_text_tokens(
+        self,
+        token_ids: list[int],
+        vision_inputs: dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        """Encode Ref2VA presentation tokens on owner ranks and broadcast."""
+        if self._uses_tensor_parallel_text_encoder and vision_inputs:
+            raise NotImplementedError(
+                "MiniMax-H3 tensor-parallel text encoder currently supports "
+                "text-only prompts; set text_encoder_tp_size=1 for Ref2VA "
+                "requests with image or video references."
+            )
+        if self.world_size == 1:
+            return self._encode_text_tokens(token_ids, vision_inputs)
+
+        prompt_embeds: torch.Tensor | None = None
+        if self._loads_text_encoder_on_this_rank:
+            prompt_embeds = self._encode_text_tokens(token_ids, vision_inputs)
+        return self._broadcast_tensor_from_rank0(prompt_embeds, dtype=self.dtype)
+
     def _encode_text_tokens(
         self, token_ids: list[int], vision_inputs: dict[str, torch.Tensor]
     ) -> torch.Tensor:
         """Encode one H3 presentation, shared by keyframes and mixed references."""
+        input_ids = torch.tensor([token_ids], dtype=torch.long, device=self.device)
+        if self._uses_tensor_parallel_text_encoder:
+            if vision_inputs:
+                raise NotImplementedError(
+                    "MiniMax-H3 tensor-parallel text encoder currently supports "
+                    "text-only prompts; set text_encoder_tp_size=1 for requests "
+                    "with Qwen3-VL vision inputs."
+                )
+            return self.text_encoder.encode(input_ids).to(device=self.device, dtype=self.dtype)
+
         num_layers = self.text_encoder.config.text_config.num_hidden_layers
         if num_layers <= MINIMAX_H3_TEXT_ENCODER_LAYER:
             raise ValueError(
@@ -855,10 +885,6 @@ class MiniMaxH3Pipeline(BasePipeline):
                 f"layer {MINIMAX_H3_TEXT_ENCODER_LAYER}, but the encoder has "
                 f"{num_layers} layers."
             )
-
-        input_ids = torch.tensor([token_ids], dtype=torch.long, device=self.device)
-        if self._uses_tensor_parallel_text_encoder:
-            return self.text_encoder.encode(input_ids).to(device=self.device, dtype=self.dtype)
 
         mm_token_type_ids = torch.tensor(
             self.processor.create_mm_token_type_ids([token_ids]),
