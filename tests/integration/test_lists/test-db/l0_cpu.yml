@@ -48,6 +48,7 @@ l0_cpu:
   - unittest/_torch/compilation/test_remove_copy_pass.py::test_remove_copy_preserves_minimax_producer_outputs
   - unittest/_torch/distributed
   - unittest/_torch/executor
+  - unittest/_torch/flashinfer/test_flashinfer_artifacts.py
   - unittest/test_startup.py
   - unittest/test_unified_cache.py
   - unittest/_torch/disaggregation

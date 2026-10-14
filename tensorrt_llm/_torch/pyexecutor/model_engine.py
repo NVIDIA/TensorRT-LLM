@@ -35,6 +35,7 @@ from ..attention.backends.utils import get_attention_backend
 from ..compilation.backend import Backend
 from ..distributed import Distributed
 from ..distributed.communicator import init_pp_comm
+from ..flashinfer_artifacts import raise_on_flashinfer_artifact_failure
 from ..models.checkpoints.base_checkpoint_loader import BaseCheckpointLoader
 from ..models.modeling_multimodal_mixin import MultimodalModelMixin
 from ..models.modeling_utils import DecoderModelForCausalLM, timing_metric
@@ -1011,8 +1012,15 @@ class PyTorchModelEngine(ModelEngine):
     @warmup_with_kv_cache_cleanup
     def warmup(self,
                resource_manager: Optional[ResourceManager] = None) -> None:
-        """Run model warmup and record its total wall-clock duration."""
-        self._warmup_impl(resource_manager)
+        """Run model warmup and record its total wall-clock duration.
+
+        Raises:
+            FlashInferArtifactUnavailableError: FlashInfer could not fetch a
+                kernel artifact during warmup.
+        """
+        # Warmup drives the runner directly rather than through forward().
+        with raise_on_flashinfer_artifact_failure():
+            self._warmup_impl(resource_manager)
 
     def _warmup_impl(self,
                      resource_manager: Optional[ResourceManager] = None
@@ -1275,6 +1283,21 @@ class PyTorchModelEngine(ModelEngine):
                 resource_manager: Optional[ResourceManager] = None,
                 new_tensors_device: Optional[SampleStateTensors] = None,
                 cache_indirection_buffer: Optional[torch.Tensor] = None):
+        """Run one forward step.
+
+        Raises:
+            FlashInferArtifactUnavailableError: FlashInfer could not fetch a
+                kernel artifact during the step.
+        """
+        with raise_on_flashinfer_artifact_failure():
+            return self._forward_impl(batch, resource_manager,
+                                      new_tensors_device,
+                                      cache_indirection_buffer)
+
+    def _forward_impl(self, batch: Union[ScheduledRequests, PackedInputs],
+                      resource_manager: Optional[ResourceManager],
+                      new_tensors_device: Optional[SampleStateTensors],
+                      cache_indirection_buffer: Optional[torch.Tensor]):
         if isinstance(batch, PackedInputs):
             assert isinstance(self._runner, PackedModelRunner), (
                 "a packed batch requires a packed-batch runner")

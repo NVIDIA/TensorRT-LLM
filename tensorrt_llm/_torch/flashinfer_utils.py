@@ -1,8 +1,12 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import os
 import platform
 import traceback
 
 from ..logger import logger
+from .flashinfer_artifacts import install_flashinfer_artifact_monitor
 
 IS_FLASHINFER_AVAILABLE = False
 
@@ -25,3 +29,5 @@ if platform.system() != "Windows":
         print(
             "flashinfer is not installed properly, please try pip install or building from source codes"
         )
+    else:
+        install_flashinfer_artifact_monitor()
