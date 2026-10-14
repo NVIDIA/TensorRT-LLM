@@ -805,9 +805,9 @@ class RemoteMpiCommSessionClient(MpiSession):
         """Submit a task to the remote MPI pool and wait for task completion."""
         self.submit(task, *args, sync=True, **kwargs)
 
-        while not ((res := self.poll()) or self._is_shutdown):
+        while not ((res := self.poll(self.SYNC_IDLE_INTERVAL))
+                   or self._is_shutdown):
             logger_debug(f"Waiting for task completion... {res}\n", "grey")
-            time.sleep(self.SYNC_IDLE_INTERVAL)
 
         logger_debug(
             f"rank{global_mpi_rank()} RemoteMpiCommSessionClient.send_sync received results: {res}\n",
@@ -818,8 +818,12 @@ class RemoteMpiCommSessionClient(MpiSession):
                 "RemoteMpiCommSessionClient received unexpected response")
         return res
 
-    def poll(self) -> bool:
+    def poll(self, timeout: float = 0.1) -> bool:
         """Poll the queue for a response.
+
+        Args:
+            timeout: Seconds to wait for a response; returns as soon as one
+                arrives.
 
         Returns:
             True if a response is received, False otherwise.
@@ -828,7 +832,7 @@ class RemoteMpiCommSessionClient(MpiSession):
             return False
         if self._pending_responses:
             return self._pending_responses.pop(0)
-        response = self.queue.poll(0.1)
+        response = self.queue.poll(timeout)
         if response:
             return self.queue.get()  # should get a True if success
         return False

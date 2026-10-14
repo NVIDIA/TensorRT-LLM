@@ -202,6 +202,52 @@ def test_remote_mpi_session(
         assert not list(tmp_path.glob("trtllm-flashinfer-rank-*"))
 
 
+class _DelayedResponseQueue:
+    """Client queue stand-in whose response becomes ready after ``delay`` s."""
+
+    def __init__(self, response, delay: float):
+        self.response = response
+        self.ready = threading.Event()
+        self.sent = []
+        self.poll_timeouts = []
+        self._timer = threading.Timer(delay, self.ready.set)
+
+    def put(self, obj):
+        self.sent.append(obj)
+        self._timer.start()
+
+    def poll(self, timeout):
+        self.poll_timeouts.append(timeout)
+        return self.ready.wait(timeout)
+
+    def get(self):
+        return self.response
+
+
+@pytest.mark.cpu_only
+def test_remote_client_submit_sync_returns_when_response_arrives():
+    import time
+
+    client = object.__new__(RemoteMpiCommSessionClient)  # bypass singleton
+    client.addr = "ipc://unused"
+    client._is_shutdown = False
+    client._pending_responses = []
+    client.queue = _DelayedResponseQueue([{"k": 1}, {"k": 1}], delay=0.3)
+
+    start = time.monotonic()
+    result = client.submit_sync(dict, k=1)
+    elapsed = time.monotonic() - start
+
+    assert result == [{"k": 1}, {"k": 1}]
+    assert client.queue.sent[0].sync is True
+    # The client waits on the response socket instead of sleeping between
+    # polls, so it returns as soon as the response is ready, not after the
+    # idle interval.
+    assert client.SYNC_IDLE_INTERVAL > 2
+    assert elapsed < 2
+    assert set(client.queue.poll_timeouts) == {client.SYNC_IDLE_INTERVAL}
+
+
 @pytest.mark.cpu_only
 def test_remote_task_wrapper_preserves_paths_and_kwargs(
         monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
