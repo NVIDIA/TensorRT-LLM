@@ -668,6 +668,124 @@ class TestNoBatching(TestKVCacheManagerV2):
         stream_holder.take_finish_event().synchronize()
         self.assertEqual(cache.get_page_storage_snapshot(sparse_group).base_page_indices, [])
 
+    @parameterized.expand([("none", False), ("memset", True)])
+    def test_discard_sleep_preserves_native_cache_state(self, _name: str, zero: bool) -> None:
+        import torch
+
+        self.manager = KVCacheManager(
+            KVCacheManagerConfig(
+                tokens_per_block=4,
+                cache_tiers=[GpuCacheTierConfig(4 << 20), HostCacheTierConfig(8 << 20)],
+                layers=[
+                    AttentionLayerConfig(0, [BufferConfig("key", 4096, is_sparse=True)]),
+                    AttentionLayerConfig(1, [BufferConfig("key", 4096)], sliding_window_size=4),
+                    SsmLayerConfig(2, [BufferConfig("ssm_state", 4096)]),
+                ],
+                swa_scratch_reuse=SwaScratchReuseConfig(),
+                commit_min_snapshot=True,
+            )
+        )
+        remaining = None
+
+        def priority(ordinal: int, life_cycle: int) -> int:
+            nonlocal remaining
+            if remaining is not None:
+                if remaining == 0:
+                    raise RuntimeError("injected page materialization failure")
+                remaining -= 1
+            return 17
+
+        cache = self.manager.create_kv_cache(id=1, custom_priority_callback=priority)
+        never_resumed = self.manager.create_kv_cache(id=2)
+        self.manager.mark_stats_excluded(1)
+        self.manager.mark_stats_excluded(2)
+        sparse = self.manager.get_layer_group_id(0)
+        swa = self.manager.get_layer_group_id(1)
+        ssm = self.manager.get_layer_group_id(2)
+        batch = Batch(self.manager, max_rows=1, max_blocks=4)
+        stream = torch.cuda.Stream()
+        with torch.cuda.stream(stream):
+            try:
+                self.assertTrue(cache.resume(stream.cuda_stream))
+                cache.stop_committing()
+                self.assertTrue(cache.resize(8, 0))
+                self.assertTrue(cache.resize(16, 8))
+                self.assertTrue(cache.enter_decode())
+                self.assertIsNotNone(cache.get_scratch_desc(swa))
+                self.assertTrue(cache.has_scratch_slots)
+                batch.add(cache)
+                batch.publish(stream.cuda_stream)
+                table = torch.from_dlpack(batch.page_table(sparse))
+                table_address = table.data_ptr()
+                swa_valid = [i != BAD_PAGE_INDEX for i in cache.get_base_page_indices(swa)]
+
+                for cycle in range(2):
+                    batch.record_read(stream.cuda_stream)
+                    stream.synchronize()
+                    cache.suspend()
+                    self.manager.release_gpu_memory(discard=True)
+                    self.assertEqual(cache.status, _KVCache.Status.UNMATERIALIZED)
+                    self.assertEqual((cache.capacity, cache.history_length), (16, 8))
+                    with self.assertRaisesRegex(LogicError, "Cannot prefetch"):
+                        cache.prefetch(GPU_LEVEL)
+                    self.assertEqual(cache.page_storage_row, 0)
+                    self.assertTrue(cache.is_decoding)
+                    self.assertTrue(cache.enable_swa_scratch_reuse)
+                    self.assertEqual(
+                        list(cache.get_base_page_indices(sparse)), [BAD_PAGE_INDEX] * 4
+                    )
+                    self.assertTrue(
+                        all(stat.total == 0 for stat in self.manager.get_storage_statistics())
+                    )
+
+                    if cycle == 0:
+                        remaining = 1
+                        with self.assertRaisesRegex(
+                            RuntimeError, "injected page materialization failure"
+                        ):
+                            self.manager.materialize_gpu_memory(zero=zero)
+                        self.assertEqual(cache.status, _KVCache.Status.UNMATERIALIZED)
+                        self.assertTrue(
+                            all(
+                                stat.total == stat.free
+                                for level in range(2)
+                                for stat in self.manager.get_storage_statistics(CacheLevel(level))
+                            )
+                        )
+                        remaining = None
+                    self.manager.materialize_gpu_memory(zero=zero)
+                    self.assertEqual(never_resumed.status, _KVCache.Status.SUSPENDED)
+                    self.assertFalse(cache.is_active)
+                    self.assertTrue(cache.resume())
+                    self.assertEqual(
+                        cache.get_page_storage_snapshot(sparse).cache_levels, [1, 1, 0, 0]
+                    )
+                    self.assertIsNotNone(cache.get_scratch_desc(swa))
+                    self.assertTrue(cache.has_scratch_slots)
+                    self.assertEqual(
+                        [i != BAD_PAGE_INDEX for i in cache.get_base_page_indices(swa)], swa_valid
+                    )
+                    self.assertNotEqual(cache.get_ssm_block_base_index(ssm), BAD_PAGE_INDEX)
+                    batch.publish(stream.cuda_stream)
+                    batch.wait_ready(stream.cuda_stream)
+                    self.assertEqual(table.data_ptr(), table_address)
+                    self.assertEqual(
+                        table.cpu().tolist(), [[list(cache.get_base_page_indices(sparse))]]
+                    )
+
+                batch.record_read(stream.cuda_stream)
+                stream.synchronize()
+                cache.suspend()
+                self.manager.release_gpu_memory(discard=True)
+                cache.close()
+                never_resumed.close()
+            finally:
+                remaining = None
+                stream.synchronize()
+                batch.close()
+                cache.close()
+                never_resumed.close()
+
     class Request(NamedTuple):
         id: int
         kv_cache: _KVCache

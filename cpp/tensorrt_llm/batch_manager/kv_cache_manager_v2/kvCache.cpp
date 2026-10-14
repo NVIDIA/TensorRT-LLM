@@ -903,6 +903,8 @@ bool KvCache::prefetch(CacheLevel target)
 {
     KVCM2_API_GUARD();
     auto const apiLock = mManager->lockExclusive();
+    if (mStatus == Status::UNMATERIALIZED)
+        throw LogicError("Cannot prefetch while cache memory is released");
     TLLM_CHECK_DEBUG(mStatus == Status::SUSPENDED);
     auto& storageMgr = mManager->storage();
     CacheLevel const numTiers = storageMgr.numCacheLevels();
@@ -999,6 +1001,106 @@ void KvCache::_deactivate()
     mStatus = Status::SUSPENDED;
     mHasDeferredSparseOffload = false;
     onPageStorageChanged();
+}
+
+void KvCache::releaseMemory()
+{
+    KVCM2_API_GUARD();
+    auto const apiLock = mManager->lockExclusive();
+    TLLM_CHECK_WITH_INFO(mStatus == Status::SUSPENDED && numCommittedTokens() == 0,
+        "Releasing cache pages requires a suspended cache with no committed tokens");
+    stopCommitting();
+    mOptionalCandidates.clear();
+    for (auto const& ap : _activePages())
+    {
+        auto& bp = ap.ordinal == kBadBlockOrdinal ? mSsmBlocks[ap.beamIdx][ap.lcId]
+                                                  : mBlocks[ap.ordinal].pages[ap.beamIdx][ap.lcId];
+        auto const page = blockPageGetPage(bp);
+        TLLM_CHECK_DEBUG(page && !page->isCommitted());
+        // Restore at the level required by resume, without retaining old KV data or its slot.
+        bp = UnmaterializedPage{_lockLevel(*page, ap.ordinal)};
+    }
+    mStatus = Status::UNMATERIALIZED;
+    onPageStorageChanged();
+    TLLM_CHECK_DEBUG(_checkSanity());
+}
+
+void KvCache::materializeMemory(bool zero)
+{
+    KVCM2_API_GUARD();
+    auto const apiLock = mManager->lockExclusive();
+    TLLM_CHECK_WITH_INFO(mStatus == Status::UNMATERIALIZED, "Cache pages have not been released");
+    auto& storage = mManager->storage();
+    auto const activePages = _activePages();
+    auto blockPage = [this](ActivePage const& ap) -> BlockPage&
+    {
+        return ap.ordinal == kBadBlockOrdinal ? mSsmBlocks[ap.beamIdx][ap.lcId]
+                                              : mBlocks[ap.ordinal].pages[ap.beamIdx][ap.lcId];
+    };
+    TypedVec<CacheLevel, TypedVec<LifeCycleId, SlotCount>> counts(
+        storage.numCacheLevels(), TypedVec<LifeCycleId, SlotCount>(storage.numLifeCycles(), 0));
+    for (auto const& ap : activePages)
+    {
+        ++counts[std::get<UnmaterializedPage>(blockPage(ap)).level][ap.lcId];
+    }
+
+    struct PendingPage
+    {
+        BlockPage* target;
+        SharedPtr<PageHolder> holder;
+    };
+
+    std::vector<PendingPage> pending;
+    pending.reserve(activePages.size());
+    for (CacheLevel level{0}; level < counts.size(); ++level)
+    {
+        auto slots = storage.newSlots(level, counts[level]);
+        auto releaseSlots = FuncGuard(
+            [&]()
+            {
+                for (LifeCycleId lc{0}; lc < slots.size(); ++lc)
+                {
+                    for (auto& slot : slots[lc])
+                    {
+                        if (slot.hasValidSlot())
+                        {
+                            storage.releaseSlot(lc, level, std::move(slot));
+                        }
+                    }
+                }
+            });
+        for (auto const& ap : activePages)
+        {
+            auto& bp = blockPage(ap);
+            if (std::get<UnmaterializedPage>(bp).level != level)
+            {
+                continue;
+            }
+            auto& slot = slots[ap.lcId].back();
+            // GPU pools were zeroed at materialization; sparse history may be allocated directly on host.
+            if (zero && storage.cacheTier(level) == CacheTier::HOST_MEM)
+            {
+                storage.zeroHostSlotData(ap.lcId, level, slot);
+            }
+            auto page = makeShared<UncommittedPage>(*this, ap.ordinal, ap.lcId, level, ap.beamIdx);
+            page->setSlot(slot);
+            pending.push_back({&bp, page->hold()});
+            slots[ap.lcId].pop_back();
+        }
+    }
+    // Publish only after allocation and eviction registration succeed. Temporary holders remove
+    // their eviction entries and release their slots on failure, leaving every placeholder intact.
+    for (auto const& entry : pending)
+    {
+        storage.scheduleForEviction(*entry.holder->page);
+    }
+    for (auto& entry : pending)
+    {
+        *entry.target = std::move(entry.holder);
+    }
+    mStatus = Status::SUSPENDED;
+    onPageStorageChanged();
+    TLLM_CHECK_DEBUG(_checkSanity());
 }
 
 void KvCache::close()
@@ -1910,6 +2012,8 @@ void KvCache::setBeamWidth(BeamIndex beamWidth)
         return;
     if (mStatus == Status::CLOSED)
         throw LogicError("Cannot change beam_width after close()");
+    if (mStatus == Status::UNMATERIALIZED)
+        throw LogicError("Cannot change beam_width while cache memory is released");
     auto const apiLock = mManager->lockExclusive();
     if (mManager->enablePartialCommit())
         throw AssertionError("beam_width changes are not supported with partial commit");
@@ -3104,6 +3208,10 @@ bool KvCache::_checkSanity() const
                             || (blockPageIsNull(bp) && (mCommittedTokens.empty() || mManager->commitMinSnapshot())));
                     }
                 }
+                else if (mStatus == Status::UNMATERIALIZED)
+                {
+                    TLLM_CHECK_DEBUG(std::holds_alternative<UnmaterializedPage>(bp));
+                }
                 else
                 {
                     // The page must be present, and locked exactly when the cache is
@@ -3112,7 +3220,7 @@ bool KvCache::_checkSanity() const
                         && ((mStatus == Status::ACTIVE) == std::holds_alternative<SharedPageLock>(bp)));
                 }
 
-                if (!blockPageIsNull(bp))
+                if (!blockPageIsNull(bp) && mStatus != Status::UNMATERIALIZED)
                 {
                     auto page = blockPageGetPage(bp);
                     auto const* attention = std::get_if<AttnLifeCycle>(&lcs[lc]);
@@ -3137,6 +3245,11 @@ bool KvCache::_checkSanity() const
         for (BeamIndex bi{0}; bi < mBeamWidth; ++bi)
         {
             auto const& bp = mSsmBlocks[bi][*ssmLcId];
+            if (mStatus == Status::UNMATERIALIZED)
+            {
+                TLLM_CHECK_DEBUG(mNeverResumed ? blockPageIsNull(bp) : std::holds_alternative<UnmaterializedPage>(bp));
+                continue;
+            }
             if (!blockPageIsNull(bp))
             {
                 if (mNeverResumed)

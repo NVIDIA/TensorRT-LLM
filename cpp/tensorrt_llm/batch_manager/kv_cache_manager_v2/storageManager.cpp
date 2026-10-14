@@ -739,6 +739,19 @@ void StorageManager::releaseSlot(LifeCycleId lc, CacheLevel level, Slot slot)
     mLevels.at(level).storage->release(pg, std::move(slot));
 }
 
+void StorageManager::zeroHostSlotData(LifeCycleId lc, CacheLevel level, Slot const& slot)
+{
+    TLLM_CHECK_WITH_INFO(cacheTier(level) == CacheTier::HOST_MEM, "Zeroing a host slot requires host storage");
+    slot.readyEvent.synchronize();
+    PoolGroupIndex const pg = getPoolGroupIndex(level, lc);
+    auto const sizes = slotSize(level, pg);
+    for (PoolIndex pool{0}; pool < sizes.size(); ++pool)
+    {
+        auto const address = std::get<MemAddress>(slotAddress(level, pg, slot.slotId(), pool));
+        std::fill_n(reinterpret_cast<std::byte*>(address), sizes[pool], std::byte{0});
+    }
+}
+
 // ---------------------------------------------------------------------------
 // isEvictable
 // ---------------------------------------------------------------------------

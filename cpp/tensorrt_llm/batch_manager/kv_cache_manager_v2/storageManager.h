@@ -159,6 +159,9 @@ public:
     // Release a slot back to its pool.
     void releaseSlot(LifeCycleId lc, CacheLevel level, Slot slot);
 
+    //! Zero a host slot after its prior users have completed.
+    void zeroHostSlotData(LifeCycleId lc, CacheLevel level, Slot const& slot);
+
     // ---- Eviction ----------------------------------------------------------
 
     // Schedule a page for eviction (if evictable).

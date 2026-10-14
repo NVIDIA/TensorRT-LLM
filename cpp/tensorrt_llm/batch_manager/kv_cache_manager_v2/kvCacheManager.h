@@ -126,9 +126,10 @@ public:
     void clearReusableBlocks();
 
     //! Release GPU backing after all living caches have been suspended or closed.
-    void releaseGpuMemory();
+    //! Discard also invalidates reusable blocks and releases stats-excluded, uncommitted cache pages in place.
+    void releaseGpuMemory(bool discard = false);
 
-    //! Restore GPU backing before resuming living caches or creating replacement caches.
+    //! Restore GPU backing and materialize discarded cache pages before resuming living caches.
     void materializeGpuMemory(bool zero = false);
 
     // ---- KvCache creation -------------------------------------------------
@@ -441,6 +442,8 @@ private:
 
     // Weak references to all living KvCaches.
     std::set<KvCache*> mLivingKvCaches;
+    //! Engaged after GPU backing is restored, until all released request pages are materialized.
+    std::optional<bool> mMaterializingGpuMemory;
 
     // Moving averages used for ratio rebalancing.
     MovingAverage mAvgReusedLength;

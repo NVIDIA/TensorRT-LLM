@@ -156,19 +156,6 @@ KV_CACHE_ITERATION_STATS_POOL_GROUP_FIELDS = tuple(
 BASE_GENERATION_TOKEN_COUNT = 1
 
 
-@dataclass(frozen=True)
-class _SleepingCacheState:
-    reuse_scope: ReuseScope
-    capacity: int
-    history_length: int
-    beam_width: int
-    expected_prompt_length: int | None
-    is_active: bool
-    is_decoding: bool
-    enable_swa_scratch_reuse: bool
-    text_only: bool
-
-
 # Readable name per CacheTier, used only to label level-indexed counters. The levels themselves
 # come from the configured tier list, so several levels may share a name. Keyed by the enum
 # member because the C++ backend binds CacheTier as a plain nanobind enum, not an IntEnum.
@@ -1894,7 +1881,6 @@ class KVCacheManagerV2(BaseResourceManager):
 
         self.kv_cache_map: dict[int, _KVCache] = {}
         self._sleep_restore_mode: RestoreMode | None = None
-        self._sleeping_caches: dict[int, _SleepingCacheState] = {}
         self._sleeping_active_caches: set[int] = set()
         self._disagg_receive_ready: dict[int, torch.cuda.Event] = {}
         self._request_stats_enabled_ids: set[int] = set()
@@ -6836,27 +6822,14 @@ class KVCacheManagerV2(BaseResourceManager):
             )
         self._sleep_restore_mode = mode
         for req_id, cache in self.kv_cache_map.items():
-            if discard:
-                self._sleeping_caches[req_id] = _SleepingCacheState(
-                    reuse_scope=cache.reuse_scope,
-                    capacity=cache.capacity,
-                    history_length=cache.history_length,
-                    beam_width=cache.beam_width,
-                    expected_prompt_length=cache.expected_prompt_length,
-                    is_active=cache.is_active,
-                    is_decoding=cache.is_decoding,
-                    enable_swa_scratch_reuse=cache.enable_swa_scratch_reuse,
-                    text_only=cache.text_only,
-                )
-                cache.close()
-            elif cache.is_active:
+            if cache.is_active:
                 self._sleeping_active_caches.add(req_id)
                 cache.suspend()
+        self.impl.release_gpu_memory(discard=discard)
         if discard:
-            self.kv_cache_map.clear()
             self._fresh_pages_filled.clear()
-            self.reset_reuse_state()
-        self.impl.release_gpu_memory()
+            if self.conversation_manager is not None:
+                self.conversation_manager.clear()
 
     def materialize_memory(self) -> None:
         """Restore GPU backing and reconnect surviving requests to their cache pages."""
@@ -6864,24 +6837,6 @@ class KVCacheManagerV2(BaseResourceManager):
         if mode is None:
             return
         self.impl.materialize_gpu_memory(zero=mode == RestoreMode.MEMSET)
-        for req_id, state in self._sleeping_caches.items():
-            cache = self.impl.create_kv_cache(
-                state.reuse_scope,
-                id=req_id,
-                expected_prompt_length=state.expected_prompt_length,
-                text_only=state.text_only,
-            )
-            self.kv_cache_map[req_id] = cache
-            cache.enable_swa_scratch_reuse = state.enable_swa_scratch_reuse
-            if not cache.resume(self._stream.cuda_stream, is_decoding=state.is_decoding):
-                raise RuntimeError(f"Could not recreate KV cache for request {req_id}")
-            cache.stop_committing()
-            if not cache.resize(state.capacity, history_length=state.history_length):
-                raise RuntimeError(f"Could not restore KV cache capacity for request {req_id}")
-            cache.beam_width = state.beam_width
-            if not state.is_active:
-                cache.suspend()
-            self._restore_page_index_bufs(req_id, cache)
         for req_id in self._sleeping_active_caches:
             cache = self.kv_cache_map[req_id]
             if not cache.resume(self._stream.cuda_stream):
@@ -6901,7 +6856,6 @@ class KVCacheManagerV2(BaseResourceManager):
         if self.sparse_metadata_batch is not None:
             self.sparse_metadata_batch.publish(self._stream.cuda_stream)
         self._stream.synchronize()
-        self._sleeping_caches.clear()
         self._sleeping_active_caches.clear()
         self._sleep_restore_mode = None
 

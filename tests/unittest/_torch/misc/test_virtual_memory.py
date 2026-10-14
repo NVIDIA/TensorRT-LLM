@@ -15,9 +15,11 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.bindings.internal.batch_manager import CacheType
 from tensorrt_llm.llmapi import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
-from tensorrt_llm.runtime.kv_cache_manager_v2 import (CacheLevel,
+from tensorrt_llm.runtime.kv_cache_manager_v2 import (BAD_PAGE_INDEX,
+                                                      CacheLevel,
                                                       GpuCacheTierConfig,
-                                                      KVCacheManagerConfig)
+                                                      KVCacheManagerConfig,
+                                                      _KVCache)
 
 
 @pytest.fixture(scope="function", autouse=True)
@@ -218,6 +220,7 @@ def test_kv_cache_manager(process_gpu_memory_info_available, manager_cls,
         # Exercise the static device-side page-index conversion tables too.
         kv_cache_params["head_dim"] = [64, 32] * 4
         kv_cache_params["enable_sleep"] = True
+        kv_cache_params["max_beam_width"] = 2
 
     mgr = manager_cls(**kv_cache_params)
     if is_v2:
@@ -282,7 +285,10 @@ def test_kv_cache_manager(process_gpu_memory_info_available, manager_cls,
             materialize_memory=lambda tags, manager=mgr: manager.
             materialize_memory(),
         )
-        dummy = mgr.add_dummy_requests([123], token_nums=[128], is_gen=True)[0]
+        dummy = mgr.add_dummy_requests([123],
+                                       token_nums=[128],
+                                       is_gen=True,
+                                       max_beam_width=2)[0]
         index = mgr.index_mapper.get_index(dummy.py_request_id)
     for cycle in range(2):
         for buffer in buffers:
@@ -290,9 +296,14 @@ def test_kv_cache_manager(process_gpu_memory_info_available, manager_cls,
         torch.cuda.synchronize()
         if is_v2:
             old_cache = mgr.kv_cache_map[dummy.py_request_id]
+            old_shape = (old_cache.capacity, old_cache.history_length,
+                         old_cache.beam_width, old_cache.is_decoding)
         assert virtual_memory.release_with_tag(tag, resource=resource) > 0
         if is_v2:
             assert mgr.index_mapper.get_index(dummy.py_request_id) == index
+            assert mgr.kv_cache_map[dummy.py_request_id] is old_cache
+            assert old_cache.status != _KVCache.Status.CLOSED
+            assert not old_cache.is_active
             assert all(stat.total == 0 for level in gpu_levels
                        for stat in mgr.impl.get_storage_statistics(level))
         memory_usage_released = get_current_process_gpu_memory()
@@ -312,10 +323,16 @@ def test_kv_cache_manager(process_gpu_memory_info_available, manager_cls,
             assert mgr.index_mapper.get_index(dummy.py_request_id) == index
             cache = mgr.kv_cache_map[dummy.py_request_id]
             assert cache.is_active
-            assert (cache
-                    is old_cache) == (restore_mode
-                                      in (virtual_memory.RestoreMode.CPU,
-                                          virtual_memory.RestoreMode.PINNED))
+            assert cache is old_cache
+            assert (cache.capacity, cache.history_length, cache.beam_width,
+                    cache.is_decoding) == old_shape
+            # Shared prompt blocks use beam 0 via cache indirection; the writable tail has both beams.
+            first = cache.get_base_page_indices(0, 0)
+            second = cache.get_base_page_indices(0, 1)
+            assert first[0] != BAD_PAGE_INDEX
+            assert second[0] == BAD_PAGE_INDEX
+            assert first[1] != BAD_PAGE_INDEX and second[1] != BAD_PAGE_INDEX
+            assert first[1] != second[1]
         if restore_mode != virtual_memory.RestoreMode.NONE:
             expected = 0 if restore_mode == virtual_memory.RestoreMode.MEMSET else cycle + 1
             if is_v2 and restore_mode != virtual_memory.RestoreMode.MEMSET:

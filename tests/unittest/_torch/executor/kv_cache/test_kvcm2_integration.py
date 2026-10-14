@@ -3235,7 +3235,6 @@ class _GuardKVCache:
         self.capacity = 1
         self.history_length = 0
         self.beam_width = 1
-        self.expected_prompt_length = 1
         self.is_active = True
         self.is_decoding = False
         self.enable_swa_scratch_reuse = False
@@ -3245,6 +3244,7 @@ class _GuardKVCache:
 
     def resume(self, stream: object, is_decoding: bool = False) -> bool:
         del stream
+        self.is_active = self.resume_ok
         return self.resume_ok
 
     def stop_committing(self) -> None:
@@ -3256,6 +3256,9 @@ class _GuardKVCache:
 
     def close(self) -> None:
         self.closed = True
+
+    def suspend(self) -> None:
+        self.is_active = False
 
 
 def _make_guard_manager(
@@ -3270,7 +3273,6 @@ def _make_guard_manager(
     manager._guard_page_value = float("nan")
     manager._guard_page_by_layer = {}
     manager._sleep_restore_mode = None
-    manager._sleeping_caches = {}
     manager._sleeping_active_caches = set()
     manager._fresh_pages_filled = {}
     manager.conversation_manager = None
@@ -3316,19 +3318,17 @@ def test_reserve_guard_page_fills_and_publishes_the_page(
     from tensorrt_llm._torch.virtual_memory import RestoreMode
 
     manager.release_memory(RestoreMode.NONE)
-    assert kv_cache.closed
-    assert not manager.kv_cache_map
+    assert not kv_cache.closed
+    assert manager.kv_cache_map[kv_cache_v2_module._GUARD_PAGE_REQUEST_ID] is kv_cache
+    manager.impl.release_gpu_memory.assert_called_once_with(discard=True)
     manager.index_mapper.remove_sequence.assert_not_called()
-
-    restored_cache = _GuardKVCache()
-
-    manager.impl.create_kv_cache.return_value = restored_cache
     buffer.fill_(1)
     manager.materialize_memory()
     assert torch.isnan(buffer[3]).all()
     assert torch.equal(buffer[2], torch.ones(2))
     assert manager.guard_page_indices() == frozenset({3})
-    assert not restored_cache.closed
+    assert not kv_cache.closed
+    manager.impl.create_kv_cache.assert_not_called()
 
 
 @pytest.mark.parametrize("failure", ["create", "resume", "resize", "no_layer"])

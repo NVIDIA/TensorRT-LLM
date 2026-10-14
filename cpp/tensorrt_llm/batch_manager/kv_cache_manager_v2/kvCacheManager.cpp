@@ -185,14 +185,26 @@ void KvCacheManager::clearReusableBlocks()
     mRadixTree->clear();
 }
 
-void KvCacheManager::releaseGpuMemory()
+void KvCacheManager::releaseGpuMemory(bool discard)
 {
     KVCM2_API_GUARD();
     auto const apiLock = lockExclusive();
+    TLLM_CHECK_WITH_INFO(!mMaterializingGpuMemory.has_value(), "GPU memory restoration is incomplete");
     for (KvCache const* cache : mLivingKvCaches)
     {
         TLLM_CHECK_WITH_INFO(
             cache->status() == KvCache::Status::SUSPENDED, "GPU memory release requires every KvCache to be suspended");
+        TLLM_CHECK_WITH_INFO(!discard || (isStatsExcluded(cache->id) && cache->numCommittedTokens() == 0),
+            "Discarding KV cache memory requires all user requests to be drained");
+    }
+    if (discard)
+    {
+        for (KvCache* cache : mLivingKvCaches)
+        {
+            cache->releaseMemory();
+        }
+        // Released caches retain only their private page layout, with no references into the tree.
+        mRadixTree->clear();
     }
     mStorage->releaseGpuMemory();
 }
@@ -201,7 +213,21 @@ void KvCacheManager::materializeGpuMemory(bool zero)
 {
     KVCM2_API_GUARD();
     auto const apiLock = lockExclusive();
-    mStorage->materializeGpuMemory(zero);
+    if (!mMaterializingGpuMemory.has_value())
+    {
+        mStorage->materializeGpuMemory(zero);
+        mMaterializingGpuMemory = zero;
+    }
+    TLLM_CHECK_WITH_INFO(
+        *mMaterializingGpuMemory == zero, "Cannot change zero mode while retrying GPU memory restoration");
+    for (KvCache* cache : mLivingKvCaches)
+    {
+        if (cache->status() == KvCache::Status::UNMATERIALIZED)
+        {
+            cache->materializeMemory(zero);
+        }
+    }
+    mMaterializingGpuMemory.reset();
 }
 
 std::shared_ptr<KvCache> KvCacheManager::createKvCache(ReuseScope reuseScope, TokenSpan inputTokens,
