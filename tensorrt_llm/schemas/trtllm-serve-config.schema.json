@@ -930,7 +930,7 @@
     },
     "DSparkDecodingConfig": {
       "additionalProperties": false,
-      "description": "Configuration for DSpark speculative decoding.\n\nDSpark (DeepSeek) is a target-dependent, \"semi-parallel\" speculative\ndecoding method. Like DFlash it captures hidden states from several target\nlayers as cross-attention context and drafts a whole block in a single\nbackbone forward, but it additionally refines the per-position draft logits\nwith a lightweight sequential head (a low-rank Markov head, optionally an RNN\nhead) and predicts an acceptance-confidence per position to truncate the\nproposed prefix.\n\nKey features:\n- Target-dependent: captures hidden states from ``target_layer_ids``.\n- Semi-parallel: one block backbone forward + cheap sequential head refine.\n- Confidence head: truncates the proposed draft length (NOT the accept rule;\n  acceptance stays standard target verification, preserving greedy parity).\n\nReference: DeepSeek DeepSpec (https://github.com/deepseek-ai/DeepSpec).",
+      "description": "Configuration for DSpark speculative decoding.\n\nDSpark (DeepSeek) is a target-dependent, \"semi-parallel\" speculative\ndecoding method. Like DFlash it captures hidden states from several target\nlayers as cross-attention context and drafts a whole block in a single\nbackbone forward, but it additionally refines the per-position draft logits\nwith a lightweight sequential head (a low-rank Markov head, optionally an RNN\nhead). A confidence head can score each draft position for verification\nscheduling without truncating the proposed block. This configuration selects\nnative full-block drafting and does not expose confidence-scheduling or\ncalibration controls.\n\nKey features:\n- Target-dependent: captures hidden states from ``target_layer_ids``.\n- Semi-parallel: one block backbone forward + cheap sequential head refine.\n- Full-block proposals: confidence scoring does not change the draft tokens\n  or the standard target-verification acceptance rule.\n\nReference: DeepSeek DeepSpec (https://github.com/deepseek-ai/DeepSpec).",
       "properties": {
         "acceptance_rate_threshold": {
           "anyOf": [
@@ -5785,6 +5785,13 @@
           "default": null,
           "description": "Deprecated. Use prefill_capture_num_tokens instead.",
           "title": "Capture Num Tokens"
+        },
+        "compile_only_piecewise_graphs": {
+          "default": false,
+          "description": "Compile only forwards eligible for piecewise prefill CUDA graphs, while generation-only forwards, prefill graph misses, and auxiliary kernel warmup forwards remain eager. Enabling this will speed up startup, but might lead to degraded performance or inconsistent output in specific configurations.",
+          "status": "prototype",
+          "title": "Compile Only Piecewise Graphs",
+          "type": "boolean"
         },
         "enable_fullgraph": {
           "default": true,

@@ -42,6 +42,12 @@ set -eo pipefail
 
 BOLT_WORK_DIR="${BOLT_WORK_DIR:-/opt/trtllm_bolt}"
 
+# Resolved once, at source time, the same way run_local.sh does it. The stages
+# below run long after sourcing and are not guaranteed to share a working
+# directory, so a relative dirname of BASH_SOURCE would be evaluated too late
+# to be trustworthy.
+BOLT_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 # ---------------------------------------------------------------------------
 # Logging helpers
 # ---------------------------------------------------------------------------
@@ -380,6 +386,14 @@ optimize_libraries() {
 
         if [[ -z "$profile" ]]; then
             log_warning "No profile for $base; copying original unmodified"
+            cp "$lib" "$BOLT_WORK_DIR/bolted/$base"
+            continue
+        fi
+
+        # BOLT turns cortex-a53-843419 veneers into a mid-function x16
+        # trampoline and still exits 0, so this has to be caught up front.
+        if ! python3 "$BOLT_LIB_DIR/internal/check_a53_veneers.py" "$lib"; then
+            log_error "Refusing to BOLT $base (see above); copying original"
             cp "$lib" "$BOLT_WORK_DIR/bolted/$base"
             continue
         fi

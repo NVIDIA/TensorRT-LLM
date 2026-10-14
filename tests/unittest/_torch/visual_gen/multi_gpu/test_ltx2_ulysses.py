@@ -439,7 +439,7 @@ def _logic_ltx2_dual_topology(rank, world_size, backend, audio_seq_len):
         expect = blk.attn1._attn_stage2 if is_stage2 else blk.attn1._attn_default
         assert blk.attn1.attn is expect, f"Rank {rank}: attn stack not switched"
         # is_ulysses must track the ACTIVE stack (the pair can differ in type).
-        from tensorrt_llm._torch.visual_gen.attention_backend.parallel import UlyssesAttention
+        from tensorrt_llm._torch.visual_gen.attention.backends.parallel import UlyssesAttention
 
         for name in ("attn1", "video_to_audio_attn", "audio_attn1"):
             mod = getattr(blk, name, None)

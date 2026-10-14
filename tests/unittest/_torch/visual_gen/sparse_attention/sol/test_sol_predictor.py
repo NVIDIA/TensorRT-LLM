@@ -10,11 +10,11 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from tensorrt_llm._torch.visual_gen.attention_backend.sparse.sol.kernels import (
+from tensorrt_llm._torch.visual_gen.attention.backends.sparse.sol.kernels import (
     block_pool,
     block_thresholds,
 )
-from tensorrt_llm._torch.visual_gen.attention_backend.sparse.sol.predictor import (
+from tensorrt_llm._torch.visual_gen.attention.backends.sparse.sol.predictor import (
     BLOCK_SIZE,
     SolPredictorOutputs,
     predict,
