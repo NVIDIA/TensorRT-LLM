@@ -45,7 +45,9 @@ def resolve_cache_transceiver_config(
             "enable_pipelined_transfer is set; auto-selecting the Python "
             "transceiver instead of the C++ transceiver to enable "
             "pipelined KV cache transfer. "
-            "Set transceiver_runtime='CPP' to disable this auto-selection.")
+            "Set transceiver_runtime='CPP' and "
+            "kv_cache_config.use_kv_cache_manager_v2=False to select C++ "
+            "with a model that supports V1; disable pipelined transfer too.")
         cache_transceiver_config.transceiver_runtime = "PYTHON"
     elif runtime == "CPP" and enable_pipelined_transfer:
         raise ValueError(
@@ -58,8 +60,9 @@ def resolve_cache_transceiver_config(
         raise ValueError(
             f"Python transceiver currently only supports NIXL backend, "
             f"got {effective_backend}. "
-            f"Please use transceiver_runtime='CPP' for MPI, UCX, or MOONCAKE backends."
-        )
+            "Please use transceiver_runtime='CPP' with "
+            "kv_cache_config.use_kv_cache_manager_v2=False for MPI, UCX, "
+            "or MOONCAKE backends, with a model that supports V1.")
 
 
 def uses_vswa_kv_cache_layout(

@@ -2014,10 +2014,11 @@ def test_vbws_rejects_decreasing_beam_width_array(beam_width_array: list[int],
     # and py_beam_width is the array maximum either way.
     assert request.py_beam_width == max(beam_width_array)
 
-    # Exercise the real beam admission checks while stubbing validation steps
-    # that need a live engine, sampler, or KV cache manager.
+    # Exercise the real beam admission checks with unrelated cache, transport,
+    # token-range, sampler, and budget validation disabled in the executor stub.
     executor = types.SimpleNamespace(
         max_beam_width=request.py_beam_width,
+        kv_cache_manager=None,
         kv_cache_transceiver=None,
         _configure_csa2_remote_tail=lambda _request: None,
         _validate_token_id_range=lambda _request: None,
@@ -2026,7 +2027,7 @@ def test_vbws_rejects_decreasing_beam_width_array(beam_width_array: list[int],
     )
     validate = functools.partial(
         PyExecutor._validate_request,
-        executor,  # type: ignore[arg-type]  # stub for unrelated admission checks
+        executor,  # type: ignore[arg-type]  # minimal executor stub
     )
 
     if accepted:

@@ -573,8 +573,14 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         msl_c = int(self.get_indexer_max_seq_len())
         # Prefill leg first: the decode-stride guard below may return early for
         # an odd msl_c, but the DeepGEMM prefill stride is always 256-aligned.
+        # forwarded only when enabled (keeps the default warmup calls unchanged)
+        det_kw = (
+            {"deterministic": True}
+            if getattr(self.sparse_metadata_params, "gvr_deterministic_topk", False)
+            else {}
+        )
         try:
-            _ss_host.warmup_prefill(int(top_k), max(msl_c, 32768))
+            _ss_host.warmup_prefill(int(top_k), max(msl_c, 32768), **det_kw)
         except torch.cuda.OutOfMemoryError:
             logger.warning(
                 "self-sampling GVR prefill warmup ran out of memory; prefill "
@@ -602,6 +608,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                 next_n=int(next_n),
                 num_rows_list=tuple(sorted(rows)),
                 row_stride=row_stride,
+                **det_kw,
             )
         except torch.cuda.OutOfMemoryError:
             # warmup is best-effort: the dispatch works without it (engines

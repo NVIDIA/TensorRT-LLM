@@ -351,6 +351,7 @@ class PostTransformFeature(str, Enum):
     """Optional lifecycle features that require explicit qualification."""
 
     SEPARATE_DRAFT_MODEL = "separate_draft_model"
+    LOCALITY_DOMAIN_LOCALIZED_WEIGHTS = "localized_weights"
 
 
 class PostTransformQualificationReason(str, Enum):
