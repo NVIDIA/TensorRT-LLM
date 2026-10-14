@@ -243,6 +243,38 @@ class BaseWorker(GenerationExecutor):
 
         return {}
 
+    def get_kv_cache_capacity(self) -> dict:
+        """Read KV capacity directly when this worker serves as the executor."""
+        return self.fetch_kv_cache_capacity()
+
+    def fetch_openengine_discovery(self) -> dict:
+        if self.engine is None:
+            return {}
+
+        from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+        if isinstance(self.engine, PyExecutor):
+            return self.engine.get_openengine_discovery()
+
+        return {}
+
+    def get_openengine_discovery(self) -> dict:
+        """Read OpenEngine discovery directly when this worker serves as the executor."""
+        return self.fetch_openengine_discovery()
+
+    def fetch_kv_cache_load(self) -> dict:
+        if self.engine is None:
+            return {}
+
+        from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+        if isinstance(self.engine, PyExecutor):
+            return self.engine.get_kv_cache_load()
+
+        return {}
+
+    def get_kv_cache_load(self) -> dict:
+        """Read KV load directly when this worker serves as the executor."""
+        return self.fetch_kv_cache_load()
+
     def fetch_kv_cache_events(self) -> list:
         return self.engine.get_latest_kv_cache_events()
 
@@ -1184,6 +1216,10 @@ class BaseWorker(GenerationExecutor):
     @staticmethod
     def _kv_cache_capacity_serializer(capacity) -> str:
         return json.dumps(capacity)
+
+    @staticmethod
+    def _kv_cache_load_serializer(load) -> str:
+        return json.dumps(load)
 
     # Define a Callable to serialize KV cache events
     @staticmethod

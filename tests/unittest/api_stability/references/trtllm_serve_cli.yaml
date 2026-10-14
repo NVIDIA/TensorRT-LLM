@@ -360,6 +360,15 @@ commands:
         is_flag: false
         flags:
         - "--num_media_load_workers"
+      openengine_enable_load_metrics:
+        type: bool
+        default: false
+        status: prototype
+        required: false
+        multiple: false
+        is_flag: true
+        flags:
+        - "--openengine-enable-load-metrics"
       otlp_traces_endpoint:
         type: str
         default: null
