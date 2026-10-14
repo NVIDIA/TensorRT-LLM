@@ -119,14 +119,25 @@ void KVCacheManagerV2UtilsBindings::initBindings(nb::module_& module)
         [](std::vector<Task<MemAddress, MemAddress>> const& tasks, ssize_t numBytes, uintptr_t stream) -> int
         { return copyHostToDevice(tasks, numBytes, reinterpret_cast<CUstream>(stream)); },
         nb::arg("tasks"), nb::arg("num_bytes"), nb::arg("stream"), nb::call_guard<nb::gil_scoped_release>(),
-        "Copy data from host to device using CUDA kernels");
+        "Copy data from host to device: the copy engines for a call of few, large tasks, otherwise CUDA kernels (see "
+        "use_copy_engine_for_host_copy)");
 
     module.def(
         "copy_device_to_host",
         [](std::vector<Task<MemAddress, MemAddress>> const& tasks, ssize_t numBytes, uintptr_t stream) -> int
         { return copyDeviceToHost(tasks, numBytes, reinterpret_cast<CUstream>(stream)); },
         nb::arg("tasks"), nb::arg("num_bytes"), nb::arg("stream"), nb::call_guard<nb::gil_scoped_release>(),
-        "Copy data from device to host using CUDA kernels");
+        "Copy data from device to host: the copy engines for a call of few, large tasks, otherwise CUDA kernels (see "
+        "use_copy_engine_for_host_copy)");
+
+    module.def(
+        "use_copy_engine_for_host_copy",
+        [](size_t numBytes, size_t numTasks) -> bool { return useCopyEngineForHostCopy(numBytes, numTasks); },
+        nb::arg("num_bytes"), nb::arg("num_tasks"),
+        "Whether copy_host_to_device / copy_device_to_host send a call of num_tasks tasks of num_bytes each to the "
+        "copy "
+        "engines (True) or to the batched copy kernel (False) in this process; the kernel requires num_bytes to be a "
+        "multiple of 16");
 
     module.def(
         "copy_device_to_device",

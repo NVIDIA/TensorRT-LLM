@@ -16,14 +16,20 @@
  */
 
 #include "kvCacheManagerV2Utils.h"
+#include "kv_cache_manager_v2/utils/hostMem.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/envUtils.h"
+#include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/memoryUtils.h"
 #include <algorithm>
 #include <array>
 #include <cassert>
+#include <cerrno>
+#include <cstdlib>
 #include <cuda_runtime.h>
+#include <limits>
+#include <optional>
 #include <vector>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
@@ -132,8 +138,15 @@ CUresult launchBatchedCopyImpl(
         stream, args, nullptr);
 }
 
-// When bandwidth is low, e.g. when host memory is involved, we avoid splitting as fewer CTAs should be enough to
-// saturate the bandwidth.
+// lowBandwidth selects one CTA per task (no splitting). With host memory involved this keeps the SM footprint small,
+// but one 128-thread CTA with a 4-deep ring of 16 B grains has only 8 KiB in flight, so each task is latency-bound to
+// a few GB/s whatever the link: a 217 MB recurrent-state page takes tens of milliseconds where the copy engines need
+// well under a millisecond. Host<->device calls with few, large tasks therefore bypass this kernel and go to the copy
+// engines (see useCopyEngineForHostCopy below). Calls with many tasks keep it: N tasks run as N concurrent CTAs, so
+// a large batch already approaches link bandwidth from one launch. The multi-CTA page copier in
+// kv_cache_manager_v2/batchedPageCopy.cu is not reused here: it is driven by pool base/stride/index-pair descriptions
+// and sizes a grid per platform for bulk copies, while this path moves one or two pages through an arbitrary task
+// vector, where a copy-engine enqueue needs no SMs and no tuning.
 CUresult launchBatchedCopy(bool lowBandwidth, std::vector<MMTask> const& tasks, uint32_t nbBytes, cudaStream_t stream)
 {
     constexpr uint32_t maxN = 256;
@@ -169,13 +182,127 @@ CUresult launchBatchedCopy(bool lowBandwidth, std::vector<MMTask> const& tasks, 
     }
 }
 
+namespace
+{
+
+constexpr size_t kDefaultHostCopyDmaMinBytes = size_t{4} << 20;
+constexpr size_t kDefaultHostCopyDmaMaxTasks = 8;
+
+// Integer value of an environment variable, or nullopt when it is unset or not an integer. A value that does not
+// parse is reported and ignored rather than silently read as 0, which would flip the policy below.
+std::optional<long long> integerEnv(char const* name) noexcept
+{
+    char const* const env = std::getenv(name);
+    if (env == nullptr || *env == '\0')
+    {
+        return std::nullopt;
+    }
+    char* end = nullptr;
+    errno = 0;
+    long long const value = std::strtoll(env, &end, 10);
+    if (errno != 0 || end == env || *end != '\0')
+    {
+        TLLM_LOG_WARNING("Ignoring %s=\"%s\": not an integer, using the default", name, env);
+        return std::nullopt;
+    }
+    return value;
+}
+
+// One cuMemcpy{HtoD,DtoH}Async per task on the caller's stream. The tasks of one call target distinct slots, so
+// queuing them back to back on one stream is equivalent to the single kernel launch they replace.
+template <bool HostToDevice>
+CUresult copyWithCopyEngine(std::vector<MMTask> const& tasks, size_t numBytes, CUstream stream) noexcept
+{
+    for (auto const& task : tasks)
+    {
+        CUresult const err = HostToDevice ? cuMemcpyHtoDAsync(static_cast<CUdeviceptr>(task.dst),
+                                 reinterpret_cast<void const*>(task.src), numBytes, stream)
+                                          : cuMemcpyDtoHAsync(reinterpret_cast<void*>(task.dst),
+                                              static_cast<CUdeviceptr>(task.src), numBytes, stream);
+        if (err != CUDA_SUCCESS)
+        {
+            return err;
+        }
+    }
+    return CUDA_SUCCESS;
+}
+
+} // namespace
+
+// Policy for host<->device copies: a call whose tasks are few and large goes to the copy engines through
+// cuMemcpy{HtoD,DtoH}Async on the caller's stream, everything else takes the batched copy kernel above.
+//  - TLLM_KV_CACHE_MANAGER_V2_HOST_COPY_DMA_MIN_BYTES: per-task size at or above which the copy engines may be used.
+//    Default 4 MiB, so an 884,736 B attention page stays on the kernel while a 15 MB conv-state or 217 MB SSM-state
+//    page does not; 0 = any size; negative = never (the previous behaviour).
+//  - TLLM_KV_CACHE_MANAGER_V2_HOST_COPY_DMA_MAX_TASKS: largest task count per call that still takes the copy engines.
+//    Default 8; 0 or negative = no limit. The copy-engine path issues one driver call per task and queues the tasks
+//    back to back, while the kernel copies all tasks of a call concurrently from one launch, so a call with many
+//    tasks keeps the kernel even when each task is large, until the per-call issue cost of a batched memcpy
+//    (cuMemcpyBatchAsync, as batchedPageCopy.cu uses) has been measured. Per-request recurrent-state migrations
+//    carry one task per pool; large eviction or prefetch batches stay on the kernel and are reported at debug level.
+// The memcpys are enqueued on the stream the caller passes, after its prior-event waits and before its finish event,
+// so the events the storage manager records still cover them. Both values are read once per process.
+size_t hostCopyDmaMinBytes() noexcept
+{
+    static size_t const value = []() -> size_t
+    {
+        auto const parsed = integerEnv("TLLM_KV_CACHE_MANAGER_V2_HOST_COPY_DMA_MIN_BYTES");
+        if (!parsed.has_value())
+        {
+            return kDefaultHostCopyDmaMinBytes;
+        }
+        return *parsed < 0 ? std::numeric_limits<size_t>::max() : static_cast<size_t>(*parsed);
+    }();
+    return value;
+}
+
+size_t hostCopyDmaMaxTasks() noexcept
+{
+    static size_t const value = []() -> size_t
+    {
+        auto const parsed = integerEnv("TLLM_KV_CACHE_MANAGER_V2_HOST_COPY_DMA_MAX_TASKS");
+        if (!parsed.has_value())
+        {
+            return kDefaultHostCopyDmaMaxTasks;
+        }
+        return *parsed <= 0 ? std::numeric_limits<size_t>::max() : static_cast<size_t>(*parsed);
+    }();
+    return value;
+}
+
+bool useCopyEngineForHostCopy(size_t numBytes, size_t numTasks) noexcept
+{
+    // A memcpy may not span two cuMemHostRegister ranges, so hosts that register the host tier in 2 GiB chunks (see
+    // HostMem) keep the kernel, which reaches pinned memory through ordinary loads and stores.
+    static bool const chunked = HostMem::shouldUseChunkedRegistration();
+    if (chunked || numBytes < hostCopyDmaMinBytes())
+    {
+        return false;
+    }
+    if (numTasks > hostCopyDmaMaxTasks())
+    {
+        TLLM_LOG_DEBUG("Host copy of %zu tasks x %zu B stays on the copy kernel: more than %zu tasks per call",
+            numTasks, numBytes, hostCopyDmaMaxTasks());
+        return false;
+    }
+    return true;
+}
+
 CUresult copyHostToDevice(std::vector<MMTask> const& tasks, ssize_t numBytes, CUstream stream)
 {
+    if (numBytes > 0 && useCopyEngineForHostCopy(static_cast<size_t>(numBytes), tasks.size()))
+    {
+        return copyWithCopyEngine<true>(tasks, static_cast<size_t>(numBytes), stream);
+    }
     return launchBatchedCopy(true, tasks, numBytes, stream);
 }
 
 CUresult copyDeviceToHost(std::vector<MMTask> const& tasks, ssize_t numBytes, CUstream stream)
 {
+    if (numBytes > 0 && useCopyEngineForHostCopy(static_cast<size_t>(numBytes), tasks.size()))
+    {
+        return copyWithCopyEngine<false>(tasks, static_cast<size_t>(numBytes), stream);
+    }
     return launchBatchedCopy(true, tasks, numBytes, stream);
 }
 
