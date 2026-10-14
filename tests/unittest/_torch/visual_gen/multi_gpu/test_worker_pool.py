@@ -31,7 +31,13 @@ _TIMEOUT = 20.0
 
 
 @pytest.fixture(autouse=True)
-def _fresh_pool_cache():
+def _fresh_pool_cache(monkeypatch):
+    # These tests assert reuse semantics; pin the lifetime they assume rather
+    # than inheriting whatever the environment set (under lifetime "test" the
+    # reset tests would pass without the reset ever running).
+    if os.environ.get("PYTEST_XDIST_WORKER"):
+        pytest.skip("pool reuse is forced off under pytest-xdist")
+    monkeypatch.setenv("TRTLLM_TEST_VISUALGEN_POOL_LIFETIME", "session")
     pool_mod.shutdown_all()
     yield
     pool_mod.shutdown_all()
@@ -128,8 +134,7 @@ def _assert_only_default_group(rank, world_size):
 # ---- tests ----
 
 
-def test_reuses_ranks_across_runs(tmp_path, monkeypatch):
-    monkeypatch.setenv("TRTLLM_TEST_VISUALGEN_POOL_LIFETIME", "session")  # what this test asserts
+def test_reuses_ranks_across_runs(tmp_path):
     p = str(tmp_path / "pid")
     run_distributed(2, _write_pid, p, dist_backend="gloo", timeout=_TIMEOUT)
     first = _read_pids(p, 2)
@@ -159,6 +164,9 @@ def test_rank_failure_kills_pool_and_reports_peer(tmp_path):
 
 
 def test_dead_rank_is_detected():
+    run_distributed(
+        2, _allreduce_ok, 1, dist_backend="gloo", timeout=_TIMEOUT
+    )  # spawn outside the timed window
     t0 = time.monotonic()
     with pytest.raises(WorkerPoolError) as exc_info:
         run_distributed(2, _rank1_dies, dist_backend="gloo", timeout=_TIMEOUT)
