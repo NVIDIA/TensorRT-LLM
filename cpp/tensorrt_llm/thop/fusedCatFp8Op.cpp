@@ -50,11 +50,12 @@ std::tuple<at::Tensor, at::Tensor> fused_cat_fp8(at::Tensor const& pe, at::Tenso
     TORCH_CHECK(pe_M == nope_M, "pe and nope must have same number of rows. pe: ", pe_M, ", nope: ", nope_M);
     auto const M = static_cast<int32_t>(pe_M);
 
-    // Extract row strides — stride of the second-to-last dimension.
-    // For contiguous [M, pe_dim], stride(-2) == pe_dim (same as before).
-    // For non-contiguous views from split(), stride(-2) may be larger (e.g. head_dim).
-    auto const pe_row_stride = static_cast<int32_t>(pe.stride(-2));
-    auto const nope_row_stride = static_cast<int32_t>(nope.stride(-2));
+    // The kernel addresses one flattened row at a time. Reshape preserves a
+    // view when the leading dimensions can be collapsed and copies otherwise.
+    auto const peRows = pe.reshape({pe_M, pe_dim});
+    auto const nopeRows = nope.reshape({nope_M, nope_dim});
+    auto const pe_row_stride = static_cast<int32_t>(peRows.stride(0));
+    auto const nope_row_stride = static_cast<int32_t>(nopeRows.stride(0));
 
     // Allocate output tensors
     at::Tensor fp8_out
@@ -65,8 +66,8 @@ std::tuple<at::Tensor, at::Tensor> fused_cat_fp8(at::Tensor const& pe, at::Tenso
     auto stream = at::cuda::getCurrentCUDAStream(pe.get_device());
 
     tensorrt_llm::kernels::invokeFusedCatFp8(reinterpret_cast<__nv_fp8_e4m3*>(fp8_out.data_ptr()),
-        reinterpret_cast<float*>(scale_out.data_ptr()), reinterpret_cast<__nv_bfloat16 const*>(pe.data_ptr()),
-        reinterpret_cast<__nv_bfloat16 const*>(nope.data_ptr()), M, pe_dim, nope_dim, head_dim, pe_row_stride,
+        reinterpret_cast<float*>(scale_out.data_ptr()), reinterpret_cast<__nv_bfloat16 const*>(peRows.data_ptr()),
+        reinterpret_cast<__nv_bfloat16 const*>(nopeRows.data_ptr()), M, pe_dim, nope_dim, head_dim, pe_row_stride,
         nope_row_stride, use_ue8m0, stream);
 
     return {fp8_out, scale_out};
