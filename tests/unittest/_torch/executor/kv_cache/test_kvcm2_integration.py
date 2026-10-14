@@ -706,7 +706,7 @@ def test_mixed_role_coalesced_pool_preserves_slot_stride(kv_first: bool, kv_layo
         cache = manager._create_kv_cache(request_id, None, None)
         assert cache.resume(manager._stream.cuda_stream)
         assert cache.resize(3 * TOKENS_PER_BLOCK, 0)
-        raw_slots = list(cache.get_base_page_indices(pool_id)[: cache.num_blocks])
+        raw_slots = [int(slot) for slot in cache.get_base_page_indices(pool_id)[: cache.num_blocks]]
         assert len(raw_slots) == 3
         assert any(slot % 2 == 1 for slot in raw_slots)
         for layer_id, buffer, expected in (
