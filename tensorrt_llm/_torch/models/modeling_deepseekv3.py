@@ -1364,11 +1364,11 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         quant_config = self._get_decoder_layer_quant_config(
             model_config, layer_idx)
         # For MIXED_PRECISION, the global quant_algo doesn't map to a single
-        # QuantMode.  Per-module configs (e.g. expert W4A8_AWQ vs attention
-        # FP8_BLOCK_SCALES) are resolved individually where needed, so we
-        # conservatively set layer-level flags here.
-        self.is_nvfp4 = (quant_config.quant_algo != QuantAlgo.MIXED_PRECISION
-                         and quant_config.layer_quant_mode.has_nvfp4())
+        # QuantMode. Per-module configs are resolved individually where needed;
+        # the layer-level NVFP4 flag (NVFP4 norm fusions, pre-MLP fusion) follows
+        # the experts' resolved config, the module those fusions feed.
+        self.is_nvfp4 = self._layer_has_nvfp4(model_config, layer_idx,
+                                              quant_config)
 
         self.allreduce = None
         self.moe_allreduce = None
@@ -1454,6 +1454,25 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                                                 dtype=config.torch_dtype,
                                                 quantize_type=nvfp4_norm)
         self.next_layer_layernorm: RMSNorm = None
+
+    @staticmethod
+    def _layer_has_nvfp4(model_config, layer_idx: int,
+                         quant_config: QuantConfig) -> bool:
+        """Whether this layer's MoE input path is NVFP4.
+
+        Homogeneous checkpoints answer from the layer's own config. For
+        MIXED_PRECISION the global config carries no mode, so the answer comes
+        from the experts' per-module entry: NVFP4 experts enable the fused
+        norm + FP4 quant that feeds them; a dense layer without an experts
+        entry (e.g. FP8 MLP) or an unquantized MTP layer does not.
+        """
+        if quant_config.quant_algo != QuantAlgo.MIXED_PRECISION:
+            return quant_config.layer_quant_mode.has_nvfp4()
+        experts = Deepseekv3MoE._get_experts_quant_config(
+            model_config, layer_idx)
+        return (experts is not None
+                and experts.quant_algo != QuantAlgo.MIXED_PRECISION
+                and experts.layer_quant_mode.has_nvfp4())
 
     def _get_decoder_layer_quant_config(
             self, model_config: ModelConfig[PretrainedConfig], layer_idx: int):

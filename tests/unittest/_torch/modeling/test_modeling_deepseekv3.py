@@ -29,7 +29,7 @@ import torch
 from tensorrt_llm._torch.locality_domain import policy
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models import modeling_deepseekv3, modeling_utils
-from tensorrt_llm._torch.models.modeling_deepseekv3 import Deepseekv3MoE
+from tensorrt_llm._torch.models.modeling_deepseekv3 import DeepseekV3DecoderLayer, Deepseekv3MoE
 from tensorrt_llm._torch.modules import linear
 from tensorrt_llm._torch.moe.fused_moe import MoEWeightLoadingMode
 from tensorrt_llm._torch.moe.fused_moe.configurable_moe import ConfigurableMoE
@@ -366,3 +366,51 @@ def test_quant_config_dict_is_none_when_unquantized():
     model_config = SimpleNamespace(quant_config=None)
 
     assert ConfigurableMoE._get_quant_config_dict(moe, model_config) is None
+
+
+@pytest.fixture
+def nvfp4_config():
+    return QuantConfig(quant_algo=QuantAlgo.NVFP4, group_size=16)
+
+
+@pytest.fixture
+def glm53_model_config(mixed_precision_config, nvfp4_config):
+    fp8 = QuantConfig(quant_algo=QuantAlgo.FP8)
+    quant_config_dict = {
+        "model.layers.0.mlp.gate_up_proj": fp8,
+        "model.layers.0.mlp.down_proj": fp8,
+    }
+    quant_config_dict.update(
+        {EXPERTS_KEY.format(i): nvfp4_config
+         for i in range(3, 78)})
+    return SimpleNamespace(quant_config=mixed_precision_config,
+                           quant_config_dict=quant_config_dict)
+
+
+def test_layer_has_nvfp4_homogeneous_checkpoint(nvfp4_config):
+    assert DeepseekV3DecoderLayer._layer_has_nvfp4(SimpleNamespace(), 5,
+                                                   nvfp4_config)
+    assert not DeepseekV3DecoderLayer._layer_has_nvfp4(
+        SimpleNamespace(), 5, QuantConfig(quant_algo=QuantAlgo.FP8))
+    # An excluded layer (MTP) carries an unquantized config.
+    assert not DeepseekV3DecoderLayer._layer_has_nvfp4(
+        SimpleNamespace(), 78, QuantConfig(quant_algo=None))
+
+
+def test_layer_has_nvfp4_mixed_precision_follows_experts(
+        glm53_model_config, mixed_precision_config):
+    # MoE layer with NVFP4 experts: the fused norm + FP4 quant feeding them stays on.
+    assert DeepseekV3DecoderLayer._layer_has_nvfp4(glm53_model_config, 10,
+                                                   mixed_precision_config)
+    # Dense FP8 layer: no experts entry, falls back to the global MIXED_PRECISION -> off.
+    assert not DeepseekV3DecoderLayer._layer_has_nvfp4(
+        glm53_model_config, 0, mixed_precision_config)
+
+
+def test_layer_has_nvfp4_mixed_precision_w4a8_experts_off(
+        mixed_precision_config, w4a8_awq_config):
+    model_config = SimpleNamespace(
+        quant_config=mixed_precision_config,
+        quant_config_dict={EXPERTS_KEY.format(0): w4a8_awq_config})
+    assert not DeepseekV3DecoderLayer._layer_has_nvfp4(
+        model_config, 0, mixed_precision_config)
