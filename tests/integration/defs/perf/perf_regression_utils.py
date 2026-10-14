@@ -185,8 +185,25 @@ def _percentile(values, p):
     return s[lo] + frac * (s[hi] - s[lo])
 
 
-def _daily_aggregate_values(data_list, metric):
+def _created_ms(data):
+    """``ts_created`` of a history record in epoch milliseconds, or None.
+
+    OpenSearch returns ``ts_created`` as epoch milliseconds; an epoch in seconds
+    is accepted as well. Anything else (absent, ISO string, malformed) is None.
+    """
+    ts = data.get("ts_created")
+    if isinstance(ts, bool) or not isinstance(ts, (int, float)):
+        return None
+    return ts if ts > 1e12 else ts * 1000
+
+
+def _daily_aggregate_values(data_list, metric, min_created_ms=None):
     """Aggregate multiple data points on the same day to a single mean value.
+
+    When min_created_ms is given, records created before it are skipped, and so
+    are records whose creation time is unknown (see _created_ms). The record
+    being checked never reaches here with a ts_created, so it is unaffected by
+    construction.
 
     Returns a list of daily-aggregated metric values sorted by date.
     """
@@ -197,6 +214,10 @@ def _daily_aggregate_values(data_list, metric):
         val = data.get(metric)
         if val is None:
             continue
+        if min_created_ms is not None:
+            created_ms = _created_ms(data)
+            if created_ms is None or created_ms < min_created_ms:
+                continue
         ts = data.get("ts_created") or data.get("@timestamp")
         if ts is None:
             continue
@@ -216,14 +237,28 @@ def _daily_aggregate_values(data_list, metric):
     return result
 
 
-def calculate_baseline_metrics(history_data_list, new_data, maximize_metrics, minimize_metrics):
+def calculate_baseline_metrics(
+    history_data_list,
+    new_data,
+    maximize_metrics,
+    minimize_metrics,
+    metric_history_floors_ms=None,
+):
     """Calculate baseline metrics using rolling smooth + percentile algorithm.
 
     For each metric, aggregates data to daily values, applies a trailing
     rolling mean (window=3), then takes:
       - P95 for maximize_metrics (larger is better, e.g. throughput)
       - P5  for minimize_metrics (smaller is better, e.g. latency)
+
+    metric_history_floors_ms optionally maps a metric to an epoch-millisecond
+    ts_created floor: that metric's baseline is computed only from history
+    records created at or after the floor, so values recorded under an older
+    definition of the metric cannot set it. A metric with no history left
+    above its floor gets no baseline, which the caller treats as "nothing to
+    compare against yet".
     """
+    floors = metric_history_floors_ms or {}
     all_data = []
     if history_data_list:
         all_data.extend(history_data_list)
@@ -237,7 +272,7 @@ def calculate_baseline_metrics(history_data_list, new_data, maximize_metrics, mi
 
     baseline_metrics = {}
     for metric in maximize_metrics + minimize_metrics:
-        daily_vals = _daily_aggregate_values(all_data, metric)
+        daily_vals = _daily_aggregate_values(all_data, metric, floors.get(metric))
         if not daily_vals:
             continue
         smoothed = _rolling_smooth(daily_vals, window=3)
@@ -284,11 +319,13 @@ def prepare_regressive_test_cases(
     maximize_metrics,
     minimize_metrics,
     regression_metrics,
+    metric_history_floors_ms=None,
 ):
     """Update regression info for all data in new_data_dict.
 
     Uses baseline/threshold fields from latest_baseline_threshold_dict when
     available, otherwise falls back to calculating baseline from history data.
+    metric_history_floors_ms is forwarded to calculate_baseline_metrics.
 
     Returns the set of pre-merge cmd_idx whose regression must not fail the
     stage because the latest post-merge record for the same case is itself
@@ -346,7 +383,11 @@ def prepare_regressive_test_cases(
                 if fallback_baseline is None:
                     history_list = history_data_dict.get(cmd_idx, [])
                     fallback_baseline = calculate_baseline_metrics(
-                        history_list, new_data, maximize_metrics, minimize_metrics
+                        history_list,
+                        new_data,
+                        maximize_metrics,
+                        minimize_metrics,
+                        metric_history_floors_ms=metric_history_floors_ms,
                     )
                 baseline_value = fallback_baseline.get(metric)
                 if baseline_value is None or baseline_value <= 0:
@@ -526,6 +567,7 @@ def process_and_upload_test_results(
     extra_fields: Optional[dict] = None,
     upload_to_db: bool = True,
     fail_on_regression: Optional[bool] = None,
+    metric_history_floors_ms: Optional[Dict[str, int]] = None,
 ):
     """Generic regression pipeline: enrich data, query history, detect regression, upload.
 
@@ -540,6 +582,9 @@ def process_and_upload_test_results(
         upload_to_db: Whether to post results to the database.
         fail_on_regression: Whether to raise on pre-merge regression.
             None = auto (fail for pre-merge only).
+        metric_history_floors_ms: Optional metric -> epoch-ms ts_created floor.
+            History created before a metric's floor is ignored when computing
+            that metric's baseline (see calculate_baseline_metrics).
     """
     if not new_data_dict:
         print_info("No data to upload to database.")
@@ -593,6 +638,7 @@ def process_and_upload_test_results(
         maximize_metrics,
         minimize_metrics,
         regression_metrics,
+        metric_history_floors_ms=metric_history_floors_ms,
     )
 
     # Step 7: For post-merge, embed baseline fields
