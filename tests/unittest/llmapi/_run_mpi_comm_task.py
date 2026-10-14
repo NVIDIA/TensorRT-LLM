@@ -30,7 +30,10 @@ from tensorrt_llm.llmapi.utils import print_colored
 from tensorrt_llm.sampling_params import SamplingParams
 
 
-def _check_client_sys_path(client: RemoteMpiCommSessionClient) -> None:
+def _check_client_sys_path(
+        client: RemoteMpiCommSessionClient,
+        path_type: Literal["absolute", "relative",
+                           "empty"] = "absolute") -> None:
     from _mpi_session_test_tasks import receive_logits_processor
 
     worker_pids = client.submit_sync(os.getpid)
@@ -38,7 +41,9 @@ def _check_client_sys_path(client: RemoteMpiCommSessionClient) -> None:
     with tempfile.TemporaryDirectory(
             prefix="trtllm-client-module-") as directory:
         module_name = "client_only_logits_processor"
-        Path(directory, f"{module_name}.py").write_text(
+        module_dir = Path(directory, "modules")
+        module_dir.mkdir()
+        (module_dir / f"{module_name}.py").write_text(
             "from tensorrt_llm.sampling_params import LogitsProcessor\n"
             "class ForceTokenLogitsProcessor(LogitsProcessor):\n"
             "    def __init__(self, token_id):\n"
@@ -51,9 +56,17 @@ def _check_client_sys_path(client: RemoteMpiCommSessionClient) -> None:
         assert worker_specs == [None, None], worker_specs
         queues = [ZeroMqQueue(is_server=True) for _ in range(2)]
         original_path = sys.path.copy()
+        original_cwd = os.getcwd()
         try:
             # Only the client learns this path, after MPI workers have started.
-            sys.path.append(directory)
+            if path_type == "relative":
+                os.chdir(directory)
+                sys.path.append("modules")
+            elif path_type == "empty":
+                os.chdir(module_dir)
+                sys.path.append("")
+            else:
+                sys.path.append(str(module_dir))
             module = importlib.import_module(module_name)
             params = SamplingParams(
                 max_tokens=1,
@@ -67,6 +80,7 @@ def _check_client_sys_path(client: RemoteMpiCommSessionClient) -> None:
             assert results == [(0, 22), (1, 22)], results
             assert len(client.submit_sync(os.getpid)) == 2
         finally:
+            os.chdir(original_cwd)
             sys.path[:] = original_path
             sys.modules.pop(module_name, None)
             for queue in queues:
@@ -78,13 +92,15 @@ def _check_client_sys_path(client: RemoteMpiCommSessionClient) -> None:
               type=click.Choice([
                   "submit", "submit_sync", "flashinfer_workspace",
                   "flashinfer_temporary_cleanup", "task_kwargs",
-                  "client_sys_path"
+                  "client_sys_path", "client_relative_sys_path",
+                  "client_empty_sys_path"
               ]),
               default="submit")
 def main(
     task_type: Literal["submit", "submit_sync", "flashinfer_workspace",
                        "flashinfer_temporary_cleanup", "task_kwargs",
-                       "client_sys_path"]
+                       "client_sys_path", "client_relative_sys_path",
+                       "client_empty_sys_path"]
 ) -> None:
     """Run the requested remote MPI session test task."""
     tasks = [0]
@@ -104,6 +120,10 @@ def main(
             assert client.submit_sync(dict, **expected) == [expected, expected]
         elif task_type == "client_sys_path":
             _check_client_sys_path(client)
+        elif task_type == "client_relative_sys_path":
+            _check_client_sys_path(client, "relative")
+        elif task_type == "client_empty_sys_path":
+            _check_client_sys_path(client, "empty")
         elif task_type == "flashinfer_workspace":
             workspaces = set(
                 client.submit_sync(os.getenv, "FLASHINFER_WORKSPACE_BASE"))

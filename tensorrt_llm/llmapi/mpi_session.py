@@ -803,8 +803,11 @@ class RemoteMpiCommSessionClient(MpiSession):
         logger_debug(
             f"RemoteMpiCommSessionClient [rank{global_mpi_rank()}] sending task {task} to {self.addr}\n",
             "yellow")
+        client_sys_path = tuple(
+            path if os.path.isabs(path) else os.path.abspath(path)
+            for path in sys.path)
         self.queue.put(
-            RemoteTask(task, args, kwargs, sync=sync, sys_path=tuple(sys.path)))
+            RemoteTask(task, args, kwargs, sync=sync, sys_path=client_sys_path))
         return []
 
     def submit_sync(self, task, *args, **kwargs) -> List[T]:

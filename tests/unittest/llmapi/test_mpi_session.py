@@ -10,6 +10,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from subprocess import PIPE, Popen
 from typing import Literal
+from unittest.mock import Mock
 
 import pytest
 import zmq
@@ -208,12 +209,14 @@ def test_remote_mpi_submit_sync_response_after_empty_poll(
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("task_type", [
     "submit", "submit_sync", "flashinfer_workspace",
-    "flashinfer_temporary_cleanup", "task_kwargs", "client_sys_path"
+    "flashinfer_temporary_cleanup", "task_kwargs", "client_sys_path",
+    "client_relative_sys_path", "client_empty_sys_path"
 ])
 def test_remote_mpi_session(
     task_type: Literal["submit", "submit_sync", "flashinfer_workspace",
                        "flashinfer_temporary_cleanup", "task_kwargs",
-                       "client_sys_path"],
+                       "client_sys_path", "client_relative_sys_path",
+                       "client_empty_sys_path"],
     tmp_path: Path,
 ) -> None:
     """Test RemoteMpiPoolSessionClient and RemoteMpiPoolSessionServer interaction"""
@@ -223,7 +226,8 @@ def test_remote_mpi_session(
     command = ["bash", test_file, task_type]
     print(' '.join(command))
     env = os.environ.copy()
-    if task_type == "client_sys_path":
+    if task_type in ("client_sys_path", "client_relative_sys_path",
+                     "client_empty_sys_path"):
         env.pop("PYTHONPATH", None)
     if task_type == "flashinfer_workspace":
         env["HOME"] = str(tmp_path)
@@ -273,6 +277,26 @@ def test_remote_mpi_session(
 
     if task_type == "flashinfer_temporary_cleanup":
         assert not list(tmp_path.glob("trtllm-flashinfer-rank-*"))
+
+
+@pytest.mark.cpu_only
+def test_remote_mpi_submit_resolves_client_sys_path(
+        monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    absolute = str(tmp_path / "existing" / ".." / "absolute")
+    paths = [absolute, "plugins", "", "./plugins"]
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(sys, "path", paths.copy())
+    client = object.__new__(RemoteMpiCommSessionClient)
+    client._is_shutdown = False
+    client.addr = "unused"
+    client.queue = Mock()
+
+    client.submit(dict)
+
+    request = client.queue.put.call_args.args[0]
+    assert request.sys_path == (absolute, str(tmp_path / "plugins"),
+                                str(tmp_path), str(tmp_path / "plugins"))
+    assert sys.path == paths
 
 
 @pytest.mark.cpu_only
