@@ -17,7 +17,6 @@ from tensorrt_llm.llmapi import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (CacheLevel,
                                                       GpuCacheTierConfig,
-                                                      HostCacheTierConfig,
                                                       KVCacheManagerConfig)
 
 
@@ -187,7 +186,7 @@ class _KVCacheManagerV2WithColdGpu(KVCacheManagerV2):
         config.cache_tiers = [
             config.cache_tiers[0],
             GpuCacheTierConfig(quota=gpu_quota),
-            HostCacheTierConfig(quota=2 * gpu_quota),
+            *config.cache_tiers[1:],
         ]
         return config
 
@@ -218,6 +217,7 @@ def test_kv_cache_manager(process_gpu_memory_info_available, manager_cls,
     if is_v2:
         # Exercise the static device-side page-index conversion tables too.
         kv_cache_params["head_dim"] = [64, 32] * 4
+        kv_cache_params["enable_sleep"] = True
 
     mgr = manager_cls(**kv_cache_params)
     if is_v2:

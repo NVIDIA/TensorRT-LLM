@@ -358,6 +358,7 @@ def _make_manager_for_cache_tier_test(
     joint_reuse: bool = False,
     mapping: Mapping | None = None,
     vocab_size: int | None = 16,
+    enable_sleep: bool = False,
 ) -> tuple[KVCacheManagerV2, Mock]:
     impl_constructor = Mock(side_effect=impl_side_effect)
     if mapping is None:
@@ -429,6 +430,7 @@ def _make_manager_for_cache_tier_test(
             vocab_size=vocab_size,
             execution_stream=Mock(),
             cold_page_codec_provider=cold_page_codec_provider,
+            enable_sleep=enable_sleep,
         )
     return manager, impl_constructor
 
@@ -3128,6 +3130,58 @@ def test_fresh_fill_preserves_kv_across_block_onboard(
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "enable_sleep,host_cache_size,mem_available,memlock_limit,integrated,expected_host_quota",
+    [
+        (False, None, 128 << 20, float("inf"), False, 16 << 20),
+        (True, None, 128 << 20, float("inf"), False, 17 << 20),
+        (True, -1, 128 << 20, float("inf"), False, 17 << 20),
+        (True, 8 << 20, 128 << 20, float("inf"), False, 8 << 20),
+        (True, 0, 128 << 20, float("inf"), False, 0),
+        (True, None, 32 << 20, float("inf"), False, 16 << 20),
+        (True, None, 128 << 20, 20 << 20, False, 16 << 20),
+        (True, None, 33 << 20, float("inf"), True, 8 << 20),
+        (True, None, 17 << 20, float("inf"), True, 0),
+    ],
+)
+def test_sleep_auto_host_capacity_includes_cold_gpu(
+    enable_sleep: bool,
+    host_cache_size: int | None,
+    mem_available: int,
+    memlock_limit: float,
+    integrated: bool,
+    expected_host_quota: int,
+) -> None:
+    with (
+        patch.object(kv_cache_v2_module.os, "sysconf", side_effect=[1, mem_available]),
+        patch("resource.getrlimit", return_value=(memlock_limit, memlock_limit)),
+        patch.object(kv_cache_v2_module, "is_device_integrated", return_value=integrated),
+        patch.object(Distributed, "get", return_value=Mock(local_world_size=1)),
+    ):
+        manager, impl_constructor = _make_manager_for_cache_tier_test(
+            KvCacheConfig(max_gpu_total_bytes=16 << 20, host_cache_size=host_cache_size),
+            [Mock()],
+            add_secondary_gpu_tier=True,
+            enable_sleep=enable_sleep,
+        )
+
+    tiers = impl_constructor.call_args.args[0].cache_tiers
+    assert [tier.quota for tier in tiers if isinstance(tier, GpuCacheTierConfig)] == [
+        16 << 20,
+        1 << 20,
+    ]
+    assert [tier.quota for tier in tiers if isinstance(tier, HostCacheTierConfig)] == (
+        [expected_host_quota] if expected_host_quota else []
+    )
+    manager.impl.init_config = SimpleNamespace(cache_tiers=tiers)
+    if expected_host_quota < 17 << 20:
+        with pytest.raises(ValueError, match="shortfall:"):
+            manager.validate_sleep_config()
+    else:
+        manager.validate_sleep_config()
+
+
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("host_quota", [None, 8 << 20, 16 << 20, 32 << 20])
 @pytest.mark.parametrize("cold_gpu", [False, True])
 def test_sleep_requires_host_capacity_covering_gpu(host_quota: int | None, cold_gpu: bool) -> None:
@@ -3140,8 +3194,13 @@ def test_sleep_requires_host_capacity_covering_gpu(host_quota: int | None, cold_
         tiers.append(HostCacheTierConfig(quota=host_quota))
     manager.impl = Mock(init_config=SimpleNamespace(cache_tiers=tiers))
     if host_quota is None or host_quota < gpu_quota:
-        with pytest.raises(ValueError, match="host_cache_size"):
+        with pytest.raises(ValueError, match="host_cache_size") as exc_info:
             manager.validate_sleep_config()
+        available = host_quota or 0
+        assert f"Required: {gpu_quota} bytes" in str(exc_info.value)
+        assert f"largest eligible host tier: {available} bytes" in str(exc_info.value)
+        assert f"shortfall: {gpu_quota - available} bytes" in str(exc_info.value)
+        assert f"host_cache_size to at least {gpu_quota} bytes" in str(exc_info.value)
     else:
         manager.validate_sleep_config()
 
@@ -3155,7 +3214,11 @@ def test_sleep_requires_host_below_last_gpu() -> None:
         GpuCacheTierConfig(quota=16 << 20),
     ]
     manager.impl = Mock(init_config=SimpleNamespace(cache_tiers=tiers))
-    with pytest.raises(ValueError, match="below all GPU levels"):
+    with pytest.raises(ValueError, match="below all GPU levels") as exc_info:
+        manager.validate_sleep_config()
+    assert "largest eligible host tier: 0 bytes" in str(exc_info.value)
+    tiers.extend([HostCacheTierConfig(quota=16 << 20), HostCacheTierConfig(quota=16 << 20)])
+    with pytest.raises(ValueError, match="shortfall: 16777216 bytes"):
         manager.validate_sleep_config()
     tiers.append(HostCacheTierConfig(quota=32 << 20))
     manager.validate_sleep_config()
