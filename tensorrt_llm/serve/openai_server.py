@@ -2484,11 +2484,18 @@ class OpenAIServer(_VideoRoutesMixin):
                     return _count_estimate()
                 # The count is over the prompt tokens the chat route would
                 # execute: same pipeline, same template, same tokenization.
+                resources = RenderResources.from_server(self)
                 try:
                     rendered = render_chat(chat_request,
-                                           RenderResources.from_server(self),
+                                           resources,
                                            tokenize=True)
                 except UnsupportedRenderError:
+                    return _count_estimate()
+                except RuntimeError:
+                    # Harmony cannot convert some messages (a tool without a
+                    # description); the count used to come from the template.
+                    if not resources.use_harmony:
+                        raise
                     return _count_estimate()
                 return len(rendered.token_ids)
 

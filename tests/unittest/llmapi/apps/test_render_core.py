@@ -37,11 +37,7 @@ from tensorrt_llm.serve.render import (
     render_chat,
     render_conversation,
 )
-from tensorrt_llm.serve.serving_extensions import (
-    OutputMode,
-    ServingExtension,
-    register_serving_extension,
-)
+from tensorrt_llm.serve.serving_extensions import ServingExtension, register_serving_extension
 
 from .render_helpers import (
     KIMI_K3,
@@ -50,12 +46,13 @@ from .render_helpers import (
     REQUEST_TEMPLATE,
     SERVER_TEMPLATE,
     WEATHER_TOOL,
-    checkpoint_dir,
     chat_request,
+    checkpoint_dir,
     copy_of,
+    fallback_processor,
+    harmony_resources,
     make_tokenizer,
     model_dir,
-    fallback_processor,
     real_processor,
     resources,
 )
@@ -280,19 +277,15 @@ class TestExtensions:
             render_chat(chat_request(), resources(tokenizer, model_type="mistral_common"))
 
     def test_a_named_tool_choice_is_refused_for_harmony_like_the_chat_route(
-        self, tokenizer
+        self, harmony_vocab
     ) -> None:
-        class NeverRendered(ServingExtension):
-            def render_prompt(self, request, res=None):
-                raise AssertionError("the request must be refused before Harmony renders it")
-
         request = chat_request(
             tools=[WEATHER_TOOL],
             tool_choice={"type": "function", "function": {"name": "get_weather"}},
         )
 
         with pytest.raises(UnsupportedRenderError, match="named function is not yet supported"):
-            render_chat(request, resources(tokenizer, use_harmony=True, extension=NeverRendered()))
+            render_chat(request, harmony_resources())
 
     def test_the_extension_preprocesses_and_serializes_tools(
         self, tokenizer, extension_model
@@ -316,19 +309,44 @@ class TestExtensions:
         assert result.text.startswith("[ran:1]")
         assert "[tool:renamed_get_weather]" in result.text
 
-    def test_harmony_models_render_through_the_extension(self, tokenizer) -> None:
-        class HarmonyLike(ServingExtension):
-            def render_prompt(self, request, res=None):
-                return [9, 8, 7]
+    @pytest.mark.parametrize(
+        "overrides",
+        [
+            {},
+            {"tools": [WEATHER_TOOL], "tool_choice": "auto"},
+            {"reasoning_effort": "high"},
+            {
+                "messages": [
+                    {"role": "developer", "content": "Be brief."},
+                    {"role": "user", "content": "hello world"},
+                ]
+            },
+        ],
+        ids=["plain", "tools", "reasoning_effort", "developer_message"],
+    )
+    def test_harmony_renders_the_adapters_ids(self, harmony_vocab, overrides) -> None:
+        from tensorrt_llm.serve.chat_tokenization import tokenize_harmony_chat_request
 
-            def output_mode(self):
-                return OutputMode.HARMONY_TOKENS
+        result = render_chat(chat_request(**overrides), harmony_resources(), tokenize=True)
 
-        res = resources(tokenizer, extension=HarmonyLike(), use_harmony=True)
-        assert render_chat(chat_request(), res).token_ids == [9, 8, 7]
-        # Without the Harmony switch the extension's renderer is not consulted.
-        res = resources(tokenizer, extension=HarmonyLike(), use_harmony=False)
-        assert render_chat(chat_request(), res).token_ids != [9, 8, 7]
+        assert result.token_ids == tokenize_harmony_chat_request(chat_request(**overrides))
+        assert result.text is None
+
+    def test_the_harmony_reasoning_effort_reaches_the_ids(self, harmony_vocab) -> None:
+        low = render_chat(chat_request(reasoning_effort="low"), harmony_resources())
+        high = render_chat(chat_request(reasoning_effort="high"), harmony_resources())
+
+        assert low.token_ids != high.token_ids
+
+    def test_a_gpt_oss_model_without_the_harmony_switch_uses_the_template(
+        self, harmony_vocab, tokenizer
+    ) -> None:
+        res = resources(tokenizer, model_type="gpt_oss", use_harmony=False)
+
+        assert (
+            render_chat(chat_request(), res).token_ids
+            != render_chat(chat_request(), harmony_resources()).token_ids
+        )
 
 
 class TestRenderConversation:
@@ -433,6 +451,14 @@ class TestFingerprint:
         other = make_tokenizer(name=LLAMA)
         assert not fingerprints_match(
             compute_fingerprint(resources(tokenizer)), compute_fingerprint(resources(other))
+        )
+
+    def test_the_harmony_digest_does_not_depend_on_the_model_type(self, harmony_vocab) -> None:
+        # A router told to use Harmony that cannot resolve the model type still matches a
+        # worker that knows it.
+        assert fingerprints_match(
+            compute_fingerprint(harmony_resources(model_type=None)),
+            compute_fingerprint(harmony_resources()),
         )
 
     def test_the_extension_and_harmony_switch_change_the_digest(self, tokenizer) -> None:

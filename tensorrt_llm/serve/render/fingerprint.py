@@ -200,7 +200,9 @@ def compute_fingerprint(res: "RenderResources") -> Dict[str, Any]:
         else type(input_processor).__qualname__
     )
     compared: Dict[str, Any] = {
-        "model_type": res.model_type,
+        # Harmony renders the same for any model type, so a router that was told to use
+        # Harmony without being able to resolve the type still matches its workers.
+        "model_type": None if res.use_harmony else res.model_type,
         "extension": type(res.extension).__qualname__,
         # Bumped by an extension whose rendering output changes between revisions.
         "extension_render_version": getattr(res.extension, "render_version", 1),

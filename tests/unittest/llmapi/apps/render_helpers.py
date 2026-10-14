@@ -28,7 +28,7 @@ import functools
 from pathlib import Path
 
 import pytest
-from utils.llm_data import llm_models_root
+from utils.llm_data import llm_datasets_root, llm_models_root
 
 from tensorrt_llm.serve.render import RenderResources
 
@@ -111,6 +111,20 @@ def checkpoint_dir(tmp_path: Path, name: str = QWEN3, *, config: bool = True) ->
             continue
         (target / path.name).symlink_to(path)
     return target
+
+
+def use_harmony_vocab(monkeypatch) -> None:
+    """Point Harmony at the local copy of its vocabulary; skip when it is not there."""
+    vocab = Path(llm_datasets_root()) / "tiktoken_vocab"
+    if not vocab.is_dir():
+        pytest.skip("the Harmony vocabulary is not available")
+    monkeypatch.setenv("TIKTOKEN_RS_CACHE_DIR", str(vocab))
+    monkeypatch.setenv("TIKTOKEN_ENCODINGS_BASE", str(vocab))
+
+
+def harmony_resources(model_type: str | None = "gpt_oss") -> RenderResources:
+    """Resources of a router that renders for gpt-oss: Harmony, no tokenizer."""
+    return RenderResources.from_tokenizer(None, model_type=model_type, use_harmony=True)
 
 
 def chat_request(**overrides):

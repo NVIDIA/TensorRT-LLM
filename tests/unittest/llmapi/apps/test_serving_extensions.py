@@ -524,23 +524,3 @@ class TestExtensionHooks:
     def test_gpt_oss_declares_harmony_output(self) -> None:
         extension = serving_extensions.get_serving_extension("gpt_oss")
         assert extension.output_mode() is serving_extensions.OutputMode.HARMONY_TOKENS
-
-    def test_gpt_oss_renders_through_the_harmony_tokenizer(self, monkeypatch) -> None:
-        from tensorrt_llm.serve import chat_tokenization
-
-        calls: list = []
-
-        def fake_tokenize_harmony(request, harmony_adapter=None, set_prompt_token_ids=False):
-            calls.append((request, harmony_adapter))
-            return [7, 8, 9]
-
-        monkeypatch.setattr(
-            chat_tokenization, "tokenize_harmony_chat_request", fake_tokenize_harmony
-        )
-        extension = serving_extensions.get_serving_extension("gpt_oss")
-        request = _chat_request()
-        adapter = object()
-
-        assert extension.render_prompt(request, SimpleNamespace(harmony=adapter)) == [7, 8, 9]
-        assert extension.render_prompt(request) == [7, 8, 9]
-        assert calls == [(request, adapter), (request, None)]
