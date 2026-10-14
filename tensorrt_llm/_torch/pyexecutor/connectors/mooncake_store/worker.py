@@ -163,6 +163,8 @@ def _stream_handle(stream: Optional[torch.cuda.Stream]) -> int:
 class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
     """Moves KV pages between this rank's GPU cache and the Mooncake pool."""
 
+    supports_attention_dp = True
+
     def __init__(self, llm_args: TorchLlmArgs):
         super().__init__(llm_args)
 
@@ -175,6 +177,9 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
         self._run_dir = pool.run_dir if pool is not None else None
         self._rank = mpi_rank()
         self._world_size = mpi_world_size()
+        enable_attention_dp = getattr(llm_args, "enable_attention_dp", False)
+        self._attention_rank = 0 if enable_attention_dp else self._rank
+        self._attention_world_size = 1 if enable_attention_dp else self._world_size
         self._model_key = self._config.resolve_model_key(llm_args.model)
 
         self._addressing: Optional[PageAddressing] = None
@@ -300,11 +305,11 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
         for layer_group_id in addressing.layer_group_ids:
             bytes_per_page = addressing.bytes_per_page(layer_group_id)
             self._namespaces[layer_group_id] = self._namespace(
-                self._rank, layer_group_id, bytes_per_page
+                self._attention_rank, layer_group_id, bytes_per_page
             )
             self._peer_namespaces[layer_group_id] = tuple(
                 self._namespace(rank, layer_group_id, bytes_per_page)
-                for rank in range(self._world_size)
+                for rank in range(self._attention_world_size)
             )
 
         if self._config.role.saves:
@@ -374,7 +379,7 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
             namespace=self._config.namespace,
             model_key=self._model_key,
             rank=rank,
-            world_size=self._world_size,
+            world_size=self._attention_world_size,
             layer_group_id=layer_group_id,
             tokens_per_block=self._addressing.tokens_per_block,
             bytes_per_page=bytes_per_page,

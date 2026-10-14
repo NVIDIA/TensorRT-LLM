@@ -89,11 +89,20 @@ class BlockHashChain:
     digest per newly completed block rather than a rehash of the prompt.
     """
 
-    def __init__(self, tokens_per_block: int, scope: Optional[ReuseScope] = None):
+    def __init__(
+        self, tokens_per_block: int, scope: Optional[ReuseScope] = None, prompt_lookahead: int = 0
+    ) -> None:
         if tokens_per_block <= 0:
             raise ValueError(f"tokens_per_block must be > 0, got {tokens_per_block}")
+        if prompt_lookahead < 0:
+            raise ValueError(f"prompt_lookahead must be >= 0, got {prompt_lookahead}")
         self._tokens_per_block = int(tokens_per_block)
-        self._seed = (scope or ReuseScope()).seed()
+        self._prompt_lookahead = int(prompt_lookahead)
+        self._seed = _digest(b"mooncake-kv-v2", (scope or ReuseScope()).seed())
+        if self._prompt_lookahead:
+            self._seed = _digest(
+                self._seed, b"prompt-lookahead", self._prompt_lookahead.to_bytes(8, "little")
+            )
         self._hashes: List[bytes] = []
 
     @property
@@ -117,7 +126,7 @@ class BlockHashChain:
         Returns:
             The full chain, indexed by block ordinal.
         """
-        num_full_blocks = len(tokens) // self._tokens_per_block
+        num_full_blocks = max(0, len(tokens) - self._prompt_lookahead) // self._tokens_per_block
         if num_full_blocks < len(self._hashes):
             raise ValueError(
                 f"token list shrank from {len(self._hashes)} to {num_full_blocks} "
@@ -125,7 +134,7 @@ class BlockHashChain:
             )
         for ordinal in range(len(self._hashes), num_full_blocks):
             start = ordinal * self._tokens_per_block
-            block = tokens[start : start + self._tokens_per_block]
+            block = tokens[start : start + self._tokens_per_block + self._prompt_lookahead]
             parent = self._hashes[-1] if self._hashes else self._seed
             # Fixed-width little-endian token ids: a delimiter-free encoding
             # would let two different token sequences serialize identically.

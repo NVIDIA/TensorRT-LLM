@@ -78,8 +78,9 @@ from ..speculative.speculation_gate import SpeculationGate
 from ..speculative.utils import update_draft_len
 from .adp_iter_stats import ADPIterStatsBuffer
 from .connectors.kv_cache_connector import KvCacheConnectorManager
-from .connectors.kv_cache_layout import build_kv_cache_layout_v2
 from .disagg_adapter import PyExecutorEffects, PyExecutorRequestRegistry
+from .connectors.kv_cache_layout import (build_kv_cache_layout_v2,
+                                         combine_kv_cache_layouts)
 from .dwdp import DwdpManager
 from .error_classification import ErrorBudget
 from .executor_request_queue import (PREFIX_LOAD_COMPLETION_REQUEST_ID,
@@ -1170,13 +1171,9 @@ class PyExecutor:
                     "list has no notion of beams, so non-leading beams would "
                     "save and restore the wrong KV state.")
 
-            if self.enable_attention_dp:
-                raise NotImplementedError(
-                    "KV Cache Connector is not supported with attention data "
-                    "parallelism (enable_attention_dp). Dummy requests "
-                    "inserted for cross-DP balancing flow through the "
-                    "connector scheduler / worker hooks and are not "
-                    "distinguished from real requests.")
+            if self.enable_attention_dp != self.kv_connector_manager.enable_attention_dp:
+                raise ValueError(
+                    "KV connector and executor attention-DP modes must agree.")
 
             if self.kv_cache_manager is None:
                 raise ValueError(
@@ -1185,7 +1182,8 @@ class PyExecutor:
             is_kv_cache_manager_v2 = isinstance(self.kv_cache_manager,
                                                 KVCacheManagerV2)
 
-            if is_kv_cache_manager_v2 and self.max_draft_len > 0:
+            if (is_kv_cache_manager_v2 and self.max_draft_len > 0
+                    and not self.kv_connector_manager.speculative_prefill_only):
                 raise NotImplementedError(
                     "KV Cache Connector is not supported with speculative "
                     "decoding. Rejected draft tokens "
@@ -1263,7 +1261,20 @@ class PyExecutor:
                     self._reject_non_gpu_cache_tiers(self.kv_cache_manager)
                     self._reject_connector_prefix_without_block_reuse(
                         self.kv_cache_manager)
-                layout = build_kv_cache_layout_v2(self.kv_cache_manager)
+                layouts = [build_kv_cache_layout_v2(self.kv_cache_manager)]
+                if self.draft_kv_cache_manager is not None:
+                    if not isinstance(self.draft_kv_cache_manager,
+                                      KVCacheManagerV2):
+                        raise NotImplementedError(
+                            "KV Cache Connector requires a V2 draft cache manager "
+                            "when one-model speculative decoding uses a separate "
+                            "draft cache.")
+                    if not capacity_only:
+                        self._reject_non_gpu_cache_tiers(
+                            self.draft_kv_cache_manager)
+                    layouts.append(
+                        build_kv_cache_layout_v2(self.draft_kv_cache_manager))
+                layout = combine_kv_cache_layouts(layouts)
                 self.kv_connector_manager.reject_flat_only_scheduler(
                     len(layout.groups))
                 window = (layout.groups[0].window_size
@@ -4339,6 +4350,14 @@ class PyExecutor:
         if self._kv_connector_moves_kv:
             self.kv_connector_manager.take_scheduled_requests_pending_load(
                 scheduled_batch)
+            if self.enable_attention_dp and scheduled_batch.batch_size == 0:
+                # Async restores can empty a batch after the usual ADP padding
+                # and resource preparation. Keep ready owners computing while
+                # this owner's worker makes progress on the restore.
+                self._pad_empty_attention_dp_batch(scheduled_batch)
+                if scheduled_batch.batch_size:
+                    self.resource_manager.prepare_resources(
+                        scheduled_batch, publish_connector_output=False)
             self.kv_connector_manager.handle_metadata()
             self.kv_connector_manager.mark_prefix_loads_dispatched()
             self.kv_connector_manager.worker.start_load_kv(
@@ -8168,7 +8187,7 @@ class PyExecutor:
             # swallows that, leaving `request_finished` uncalled and the
             # connector never told to save anything.
             if isinstance(self.kv_cache_manager, KVCacheManagerV2):
-                by_layer_group = self.kv_cache_manager.get_page_indices_by_layer_group(
+                by_layer_group = self._connector_page_indices_by_layer_group(
                     req)
                 cache_block_ids = by_layer_group[0] if len(
                     by_layer_group) == 1 else []
@@ -8200,6 +8219,17 @@ class PyExecutor:
         for req in requests:
             if req.is_finished:
                 self._start_connector_async_save(req)
+
+    def _connector_page_indices_by_layer_group(
+            self, request: LlmRequest) -> List[List[int]]:
+        """Return the connector's dense target-plus-draft group index space."""
+        by_layer_group = self.kv_cache_manager.get_page_indices_by_layer_group(
+            request)
+        if isinstance(self.draft_kv_cache_manager, KVCacheManagerV2):
+            by_layer_group.extend(
+                self.draft_kv_cache_manager.get_page_indices_by_layer_group(
+                    request))
+        return by_layer_group
 
     def _maybe_prefetch_next_iter_mm_encoders(
             self, scheduled_batch: ScheduledRequests) -> None:
@@ -8823,7 +8853,7 @@ class PyExecutor:
         return (self.kv_cache_transceiver is not None
                 and self.kv_cache_transceiver.has_inflight_transfer(request))
 
-    def _try_cancel_request(self, request) -> bool:
+    def _try_cancel_request(self, request: LlmRequest) -> bool:
         """Check if a request can be canceled and attempt cancellation if needed.
 
         Returns:
@@ -8840,6 +8870,10 @@ class PyExecutor:
                 # then puts it back in context state to be re-prefilled. Held
                 # here, the cancellation outlives that and is applied to the
                 # request the completion hands back.
+                return False
+            if connector.has_pending_transfers(request.request_id):
+                # The generic worker API cannot cancel DMA. Defer cancellation
+                # until get_finished confirms that the blocks are no longer used.
                 return False
         if self.kv_cache_transceiver is None:
             return True

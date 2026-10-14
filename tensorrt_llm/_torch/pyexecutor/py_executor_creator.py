@@ -24,6 +24,7 @@ from tensorrt_llm.llmapi.llm_args import (CapacitySchedulerPolicy,
                                           ContextChunkingPolicy,
                                           ExecutorMemoryType,
                                           GuidedDecodingConfig, KvCacheConfig,
+                                          MTPDecodingConfig,
                                           SpeculativeConfig, TorchLlmArgs)
 from tensorrt_llm.llmapi.tokenizer import (TokenizerBase,
                                            _llguidance_tokenizer_info,
@@ -555,6 +556,18 @@ def _create_py_executor(
         kv_cache_config.enable_block_reuse = False
         kv_cache_config.enable_partial_reuse = False
 
+    # Must happen before the KV cache manager is built, since the manager reads
+    # enable_partial_reuse to construct its block pools.
+    if (kv_cache_config.enable_partial_reuse
+            and uses_connector(kv_connector_config, "mooncake-store")):
+        logger.warning(
+            "Disabling partial reuse: it is not usable with the mooncake-store "
+            "connector. The store is addressed by whole blocks, so a partial "
+            "device match leaves the matched length off a block boundary and "
+            "the connector declines the lookup rather than resume a block from "
+            "the middle. Partial reuse therefore trades part of one block for "
+            "every stored block of the remaining prefix.")
+        kv_cache_config.enable_partial_reuse = False
     # The tokenizer is stripped from MPI kwargs in proxy.py to avoid pickle
     # failures with trust_remote_code models.  Reload it from the checkpoint
     # when guided decoding needs it.
@@ -1010,12 +1023,21 @@ def _create_py_executor(
         # manager that was actually built.
         v2_selection = kv_cache_config.use_kv_cache_manager_v2
 
+        # Context-only requests do not reject draft tokens. Keep Mooncake's
+        # target-plus-MTP prefill layout available, and reject generation work
+        # at the connector boundary before it can use append-only page deltas.
+        speculative_prefill_only = (
+            isinstance(spec_config, MTPDecodingConfig)
+            and uses_connector(kv_connector_config, "mooncake-store")
+            and cache_transceiver_config is not None
+            and cache_transceiver_config.backend is not None)
+
         # Rejected draft tokens shrink a request's page list, and the freed slot
         # goes to whichever request allocates next. The connector is only told
         # about pages appended since the last report, so it would keep
         # addressing a slot another request now owns.
         if (spec_config is not None and spec_config.max_draft_len > 0
-                and v2_selection is True):
+                and v2_selection is True and not speculative_prefill_only):
             raise NotImplementedError(
                 "KV connector is not supported with speculative decoding. "
                 "Disable speculative decoding to run a connector.")
@@ -1030,11 +1052,6 @@ def _create_py_executor(
                 "in this configuration. Set kv_cache_config.use_kv_cache_manager_v2=True."
             )
 
-        if mapping.enable_attention_dp:
-            raise NotImplementedError(
-                "KV connector is not supported with attention data parallelism (enable_attention_dp=True)."
-            )
-
         try:
             module = importlib.import_module(
                 kv_connector_config.connector_module)
@@ -1043,6 +1060,13 @@ def _create_py_executor(
             scheduler_cls = getattr(
                 module, kv_connector_config.connector_scheduler_class)
 
+            if mapping.enable_attention_dp:
+                if mapping.pp_size != 1 or mapping.cp_size != 1:
+                    raise NotImplementedError(
+                        "Attention-DP KV connector requires PP=1 and CP=1.")
+                KvCacheConnectorManager.validate_attention_dp(
+                    worker_cls, scheduler_cls)
+
             rank = tensorrt_llm.mpi_rank()
             # Some connector API implementations may need to establish out-of-band communication between the scheduler and workers.
             # In this case, the worker may be dependent on the scheduler, or vice-versa.
@@ -1050,7 +1074,8 @@ def _create_py_executor(
             with ThreadPoolExecutor(max_workers=2) as executor:
                 connector_worker_task = executor.submit(worker_cls, llm_args)
 
-                if scheduler_cls is not None and rank == 0:
+                if scheduler_cls is not None and (rank == 0 or
+                                                  mapping.enable_attention_dp):
                     connector_scheduler_task = executor.submit(
                         scheduler_cls, llm_args)
                     connector_scheduler = connector_scheduler_task.result()
@@ -1066,7 +1091,10 @@ def _create_py_executor(
                     forward_pass_callable)
 
             kv_connector_manager = KvCacheConnectorManager(
-                connector_worker, connector_scheduler)
+                connector_worker,
+                connector_scheduler,
+                enable_attention_dp=mapping.enable_attention_dp,
+                speculative_prefill_only=speculative_prefill_only)
 
         except Exception as e:
             logger.error(f"Error instantiating connector: {e}")

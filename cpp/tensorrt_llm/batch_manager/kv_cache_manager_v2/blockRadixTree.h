@@ -394,7 +394,7 @@ public:
     // allocating/copying (the hot path). Callers holding a std::vector pass toSpan(vec).
     // backoff: tokens trimmed off the tail of the match (see KVCacheManagerConfig::reuseMatchBackoff).
     ReuseMatch match(ReuseScope const& reuseScope, TokenSpan tokens, bool knownNoDigest = false,
-        bool enablePartialMatch = false, int backoff = 0) const;
+        bool enablePartialMatch = false, int backoff = 0, int alignment = 1) const;
 
     // Detach all cached blocks. ~Block() releases pages when the last owner drops a block.
     void clear();
@@ -436,7 +436,8 @@ private:
     // Shorten `matched` to the prefix that is actually reusable. Passing
     // std::nullopt for `ssmLcId` skips the recurrent-snapshot constraint and
     // yields the attention-only prefix (used for numReusableTokensBeforeHybridPruning).
-    std::vector<MatchResult> pruneMatch(std::vector<MatchResult> matched, std::optional<LifeCycleId> ssmLcId) const;
+    std::vector<MatchResult> pruneMatch(
+        std::vector<MatchResult> matched, std::optional<LifeCycleId> ssmLcId, int alignment = 1) const;
 
     // Erase any pending empty root blocks from mRoots.
     // Const-qualified: deferred cleanup is not a logical mutation.

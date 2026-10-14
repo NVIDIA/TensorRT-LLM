@@ -28,7 +28,8 @@ import contextlib
 import json
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -58,6 +59,7 @@ from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.scheduler import (
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.worker import (
     MooncakeStoreConnectorWorker,
 )
+from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig
 from tensorrt_llm.runtime.kv_cache_manager_v2 import BAD_PAGE_INDEX
 
 pytestmark = pytest.mark.cpu_only
@@ -164,9 +166,12 @@ def set_pool_setting(store_config, **settings):
     store_config.write_text(json.dumps(raw))
 
 
-def make_llm_args(*, run_dir: str | None = None) -> SimpleNamespace:
+def make_llm_args(*, run_dir: str | None = None, enable_attention_dp: bool = False,
+                  speculative_config: MTPDecodingConfig | None = None) -> SimpleNamespace:
     return SimpleNamespace(
         model="/models/test-model",
+        enable_attention_dp=enable_attention_dp,
+        speculative_config=speculative_config,
         kv_cache_config=SimpleNamespace(tokens_per_block=TOKENS_PER_BLOCK),
         tensor_parallel_size=1,
         pipeline_parallel_size=1,
@@ -202,6 +207,7 @@ def make_worker(
     *,
     layout: KvCacheLayout | None = None,
     run_dir: str | None = None,
+    enable_attention_dp: bool = False,
 ) -> Iterator[MooncakeStoreConnectorWorker]:
     """Build a worker and shut it down before the test call phase ends.
 
@@ -209,7 +215,7 @@ def make_worker(
     pytest-threadleak snapshots threads around the call phase only, so
     fixture teardown would run too late to keep it quiet.
     """
-    worker = MooncakeStoreConnectorWorker(make_llm_args(run_dir=run_dir))
+    worker = MooncakeStoreConnectorWorker(make_llm_args(run_dir=run_dir, enable_attention_dp=enable_attention_dp))
     fake_store.workers.append(worker)
     if layout is not None:
         worker.register_kv_cache_layout(layout)
@@ -645,21 +651,38 @@ class FakeWorker:
         return min(self.hit_blocks, len(block_hashes))
 
 
-def make_scheduler(store_config, hit_blocks=0):
-    scheduler = MooncakeStoreConnectorScheduler(make_llm_args())
+def make_scheduler(
+    store_config: Path,
+    hit_blocks: int = 0,
+    speculative_config: MTPDecodingConfig | None = None,
+) -> MooncakeStoreConnectorScheduler:
+    scheduler = MooncakeStoreConnectorScheduler(
+        make_llm_args(speculative_config=speculative_config)
+    )
     scheduler._worker = FakeWorker(hit_blocks)
     return scheduler
 
 
-def request_data(request_id, new_tokens, page_indices):
+def request_data(
+    request_id: int,
+    new_tokens: Sequence[int],
+    page_indices: Sequence[int],
+    layer_group_id: int = 0,
+    *,
+    computed_position: int = 0,
+    num_scheduled_tokens: int | None = None,
+) -> RequestData:
+    by_layer_group = [[] for _ in range(layer_group_id + 1)]
+    by_layer_group[layer_group_id] = list(page_indices)
     return RequestData(
         request_id=request_id,
         new_tokens=list(new_tokens),
         new_block_ids=list(page_indices),
-        computed_position=0,
-        num_scheduled_tokens=len(new_tokens),
-        # One entry per layer group, indexed by layer group id.
-        new_block_ids_by_layer_group=[list(page_indices)],
+        computed_position=computed_position,
+        num_scheduled_tokens=(
+            len(new_tokens) if num_scheduled_tokens is None else num_scheduled_tokens
+        ),
+        new_block_ids_by_layer_group=by_layer_group,
     )
 
 
@@ -717,7 +740,7 @@ def test_scheduler_does_not_resave_blocks_across_iterations(store_config):
     # A generation step completes one more block; only that block is saved.
     more_tokens = list(range(2 * TOKENS_PER_BLOCK, 3 * TOKENS_PER_BLOCK))
     second = scheduler.build_connector_meta(
-        SchedulerOutput(cached_requests=[request_data(1, more_tokens, [6])])
+        SchedulerOutput(cached_requests=[request_data(1, more_tokens, [6], computed_position=2 * TOKENS_PER_BLOCK)])
     )
     assert [page.page_index for page in second.saves[0].pages] == [6]
 
@@ -899,3 +922,173 @@ def test_scheduler_bypasses_multimodal_requests_it_cannot_identify(store_config)
     assert metadata.saves == []
     # Nothing was handed to a save thread, so nothing pins its pages either.
     assert scheduler.request_finished(request, [7, 8, 9]) is False
+
+
+@pytest.mark.parametrize("lookahead", [1, TOKENS_PER_BLOCK + 1])
+def test_hash_chain_requires_lookahead_and_matches_incremental_extension(lookahead: int) -> None:
+    tokens = list(range(4 * TOKENS_PER_BLOCK + lookahead))
+    chain = BlockHashChain(TOKENS_PER_BLOCK, prompt_lookahead=lookahead)
+    assert chain.extend(tokens[: TOKENS_PER_BLOCK + lookahead - 1]) == []
+    assert len(chain.extend(tokens[: TOKENS_PER_BLOCK + lookahead])) == 1
+    for end in range(TOKENS_PER_BLOCK + lookahead + 1, len(tokens) + 1):
+        chain.extend(tokens[:end])
+    assert len(chain.hashes) == 4
+    assert chain.hashes == BlockHashChain(TOKENS_PER_BLOCK, prompt_lookahead=lookahead).extend(
+        tokens
+    )
+
+    divergent = list(tokens)
+    divergent[TOKENS_PER_BLOCK + lookahead - 1] += 1000
+    assert (
+        chain.hashes[0]
+        != BlockHashChain(TOKENS_PER_BLOCK, prompt_lookahead=lookahead).extend(divergent)[0]
+    )
+
+
+def test_hash_chain_rejects_negative_lookahead() -> None:
+    with pytest.raises(ValueError, match="prompt_lookahead"):
+        BlockHashChain(TOKENS_PER_BLOCK, prompt_lookahead=-1)
+
+
+def test_scheduler_publishes_only_computed_full_blocks(store_config: Path) -> None:
+    scheduler = make_scheduler(store_config)
+    tokens = list(range(3 * TOKENS_PER_BLOCK + 1))
+    scheduler.get_num_new_matched_tokens(make_request(1, tokens), 0)
+    data = request_data(1, tokens, [4, 5, 6, 7], num_scheduled_tokens=TOKENS_PER_BLOCK - 1)
+    first = scheduler.build_connector_meta(SchedulerOutput(new_requests=[data]))
+    assert first.saves == []
+
+    # Full prompt hashes and every capacity page were reported up front, but
+    # no page may be published until its final token has actually been computed.
+    for ordinal in range(3):
+        computed = TOKENS_PER_BLOCK - 1 if ordinal == 0 else ordinal * TOKENS_PER_BLOCK
+        scheduled = 1 if ordinal == 0 else TOKENS_PER_BLOCK
+        data = request_data(1, [], [], computed_position=computed, num_scheduled_tokens=scheduled)
+        metadata = scheduler.build_connector_meta(SchedulerOutput(cached_requests=[data]))
+        assert [page.page_index for page in metadata.saves[0].pages] == [4 + ordinal]
+
+
+@pytest.mark.parametrize("local_blocks", [0, 1])
+@pytest.mark.parametrize("use_mtp", [False, True])
+def test_scheduler_saves_computed_tail_after_restore(
+    store_config: Path, local_blocks: int, use_mtp: bool
+) -> None:
+    config = MTPDecodingConfig(max_draft_len=1) if use_mtp else None
+    scheduler = make_scheduler(store_config, hit_blocks=2, speculative_config=config)
+    tokens = list(range(6 * TOKENS_PER_BLOCK + 1))
+    scheduler.get_num_new_matched_tokens(make_request(1, tokens), local_blocks * TOKENS_PER_BLOCK)
+    # The scheduler subtracts connector restores from computed_position.
+    # Full prompt hashes and capacity pages are available ahead of computation.
+    data = request_data(
+        1,
+        tokens,
+        list(range(10, 17)),
+        computed_position=local_blocks * TOKENS_PER_BLOCK,
+        num_scheduled_tokens=TOKENS_PER_BLOCK + 1,
+    )
+    metadata = scheduler.build_connector_meta(SchedulerOutput(new_requests=[data]))
+    tail_block = local_blocks + 2
+    assert [page.page_index for page in metadata.loads[0].pages] == [
+        10 + local_blocks,
+        11 + local_blocks,
+    ]
+    assert [page.page_index for page in metadata.saves[0].pages] == [10 + tail_block]
+
+    # A later chunk includes the restored prefix in its position. Count the
+    # restore only once, and wait for this partial page to become complete.
+    data = request_data(
+        1,
+        [],
+        [],
+        computed_position=(tail_block + 1) * TOKENS_PER_BLOCK + 1,
+        num_scheduled_tokens=TOKENS_PER_BLOCK - 1,
+    )
+    metadata = scheduler.build_connector_meta(SchedulerOutput(cached_requests=[data]))
+    assert metadata.loads == []
+    assert [page.page_index for page in metadata.saves[0].pages] == [11 + tail_block]
+
+
+def test_scheduler_mtp_keys_require_matching_lookahead(store_config: Path) -> None:
+    tokens = list(range(3 * TOKENS_PER_BLOCK))
+    other_tokens = list(tokens)
+    other_tokens[TOKENS_PER_BLOCK] += 1000
+    config = MTPDecodingConfig(max_draft_len=1)
+    scheduler = make_scheduler(store_config, hit_blocks=99, speculative_config=config)
+    scheduler.get_num_new_matched_tokens(make_request(1, tokens), 0)
+    scheduler.get_num_new_matched_tokens(make_request(2, other_tokens), 0)
+    first, other = scheduler._worker.queries
+    assert first == list(BlockHashChain(TOKENS_PER_BLOCK, prompt_lookahead=1).extend(tokens))
+    assert first[0] != other[0]
+    assert first[0] != BlockHashChain(TOKENS_PER_BLOCK).extend(tokens)[0]
+
+    metadata = scheduler.build_connector_meta(
+        SchedulerOutput(new_requests=[request_data(2, other_tokens, [4, 5, 6])])
+    )
+    assert len(metadata.loads[0].pages) == 2
+    assert metadata.saves == []  # The final block lacks the draft's following token.
+
+
+def test_scheduler_cancel_load_truncates_the_offer(store_config):
+    scheduler = make_scheduler(store_config, hit_blocks=3)
+    tokens = list(range(6 * TOKENS_PER_BLOCK))
+    request = make_request(1, tokens)
+    scheduler.get_num_new_matched_tokens(request, 0)
+
+    # The runtime will not consume anything from block 1 onwards.
+    scheduler.cancel_load(request, TOKENS_PER_BLOCK, 6 * TOKENS_PER_BLOCK)
+    metadata = scheduler.build_connector_meta(
+        SchedulerOutput(new_requests=[request_data(1, tokens, list(range(10, 16)))])
+    )
+    assert [page.page_index for page in metadata.loads[0].pages] == [10]
+
+
+@pytest.mark.parametrize(
+    "cancel_ranges,expected_pages",
+    [
+        ([(4, 8)], [12, 13, 14]),
+        ([(4, 12)], [13, 14]),
+        ([(4, 8), (16, 20)], [12, 13]),
+        ([(16, 20), (4, 8)], [12, 13]),
+        ([(4, 20)], []),
+        ([(0, 24)], []),
+        ([(0, 4), (20, 24)], [11, 12, 13, 14]),
+        ([(8, 8)], [11, 12, 13, 14]),
+        ([(4, 5)], [12, 13, 14]),
+        ([(19, 24)], [11, 12, 13]),
+    ],
+)
+def test_scheduler_cancel_load_preserves_uncanceled_range(
+    store_config: Path,
+    cancel_ranges: list[tuple[int, int]],
+    expected_pages: list[int],
+) -> None:
+    """Cancel from either end of a nonzero-offset offer without losing its remainder."""
+    scheduler = make_scheduler(store_config, hit_blocks=4)
+    tokens = list(range(6 * TOKENS_PER_BLOCK))
+    request = make_request(1, tokens)
+    assert scheduler.get_num_new_matched_tokens(request, TOKENS_PER_BLOCK) == (16, False)
+    for start, end in cancel_ranges:
+        scheduler.cancel_load(request, start, end)
+    metadata = scheduler.build_connector_meta(
+        SchedulerOutput(new_requests=[request_data(1, tokens, list(range(10, 16)))])
+    )
+    assert [page.page_index for load in metadata.loads for page in load.pages] == expected_pages
+    # A consumed offer must not be issued again on the next iteration.
+    next_metadata = scheduler.build_connector_meta(
+        SchedulerOutput(cached_requests=[request_data(1, [], [])])
+    )
+    assert next_metadata.loads == []
+
+
+def test_scheduler_rejects_cancellation_that_splits_an_offer(store_config: Path) -> None:
+    scheduler = make_scheduler(store_config, hit_blocks=4)
+    tokens = list(range(6 * TOKENS_PER_BLOCK))
+    request = make_request(1, tokens)
+    scheduler.get_num_new_matched_tokens(request, 0)
+    with pytest.raises(ValueError, match="beginning or end"):
+        scheduler.cancel_load(request, TOKENS_PER_BLOCK, 2 * TOKENS_PER_BLOCK)
+
+
+def test_mooncake_declares_adp_support() -> None:
+    assert MooncakeStoreConnectorScheduler.supports_attention_dp
+    assert MooncakeStoreConnectorWorker.supports_attention_dp

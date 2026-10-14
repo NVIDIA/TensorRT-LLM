@@ -34,7 +34,7 @@ per window size) without any of them being special cases.
 """
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Dict, Iterable, Iterator, List, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
 import torch
 
@@ -49,6 +49,7 @@ __all__ = [
     "KvCacheLayout",
     "KvCacheRegion",
     "build_kv_cache_layout_v2",
+    "combine_kv_cache_layouts",
     "valid_page_slots",
 ]
 
@@ -226,6 +227,56 @@ class KvCacheLayout:
             return None
         block_size = region.size // itemsize // len(region.buffers)
         return region.as_tensor(self.dtype).unflatten(1, (num_layers, kv_factor, block_size))
+
+
+def combine_kv_cache_layouts(layouts: Sequence[KvCacheLayout]) -> KvCacheLayout:
+    """Combine target and one-model draft layouts into one connector layout.
+
+    A separate MTP/draft cache manager has its own layer-group index space,
+    starting at zero just like the target manager. Connector metadata carries
+    one dense list of groups, so each input group is remapped to its position in
+    the concatenated layout. Regions keep their native addresses and slot
+    spaces; only the metadata identifier changes.
+
+    The managers belong to the same model execution and must therefore agree
+    on page width and element type. Global layer ids must be disjoint so a
+    per-layer connector hook can never resolve one model layer to two pools.
+    """
+    if not layouts:
+        raise ValueError("at least one KV cache layout is required")
+
+    tokens_per_block = layouts[0].tokens_per_block
+    dtype = layouts[0].dtype
+    groups: List[KvCacheLayerGroupLayout] = []
+    seen_layers: set[int] = set()
+    for layout in layouts:
+        if layout.tokens_per_block != tokens_per_block:
+            raise ValueError(
+                "cannot combine KV cache layouts with different tokens_per_block: "
+                f"{tokens_per_block} and {layout.tokens_per_block}"
+            )
+        if layout.dtype != dtype:
+            raise ValueError(
+                f"cannot combine KV cache layouts with different dtypes: {dtype} and {layout.dtype}"
+            )
+        for group in layout.groups:
+            overlap = seen_layers.intersection(group.layer_ids)
+            if overlap:
+                raise ValueError(
+                    "cannot combine KV cache layouts that cover the same global "
+                    f"layer ids: {sorted(overlap)}"
+                )
+            seen_layers.update(group.layer_ids)
+            groups.append(
+                KvCacheLayerGroupLayout(
+                    layer_group_id=len(groups),
+                    layer_ids=group.layer_ids,
+                    window_size=group.window_size,
+                    regions=group.regions,
+                )
+            )
+
+    return KvCacheLayout(tokens_per_block=tokens_per_block, groups=tuple(groups), dtype=dtype)
 
 
 def _global_layer_ids(manager: "KVCacheManagerV2", local_layer_ids) -> List[int]:
