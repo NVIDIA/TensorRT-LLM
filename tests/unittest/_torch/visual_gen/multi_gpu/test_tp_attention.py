@@ -61,7 +61,7 @@ def _cleanup_mpi_env():
 def _run(world_size: int, test_fn: Callable, *args):
     if torch.cuda.device_count() < world_size:
         pytest.skip(f"Need {world_size} GPUs, have {torch.cuda.device_count()}")
-    run_distributed(world_size, test_fn, *args, backend="nccl", preload=("tensorrt_llm",))
+    run_distributed(world_size, test_fn, *args, dist_backend="nccl", preload=("tensorrt_llm",))
 
 
 # =============================================================================

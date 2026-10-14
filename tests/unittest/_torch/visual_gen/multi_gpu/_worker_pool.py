@@ -51,13 +51,14 @@ Reset between tests
 Ranks are seeded to ``_RNG_SEED`` before their first task. After a passing test
 body each rank restores ``os.environ`` to its post-spawn contents, re-seeds
 ``random``/``numpy``/``torch``/CUDA, clears the logger's log-once memory and
-Dynamo caches, resets the visual_gen mesh singletons, destroys every process
-group except the world group, clears torch's current-mesh context stack and
-empties the CUDA allocator cache. Ranks do not wait for each other in the
-reset: a test may let some ranks return early while others keep computing, and
-the parent's wait for every rank's report is the fence (a rank stuck in a
-collective a test leaked never reports, and that test fails at its deadline).
-Not covered:
+Dynamo caches, resets the visual_gen mesh singletons and empties the CUDA
+allocator cache. Nothing in the reset is collective: a test may let some ranks
+return early while others keep computing, and the parent's wait for every
+rank's report is the fence (a rank stuck in a collective a test leaked never
+reports, and that test fails at its deadline). The process groups a test
+created on top of the world group, and torch's current-mesh context stack, are
+destroyed at the start of the next task instead, when every rank is known to
+be idle: destroying a NCCL sub-group waits for the group's peers. Not covered:
 torch's default dtype, grad mode and backend flags, and any other module
 global a test mutates. A test that changes such state runs with
 ``reuse=False``.
@@ -253,12 +254,12 @@ def _reset_rank_state(env_snapshot: dict[str, str]) -> None:
 
     if torch.cuda.is_available():
         torch.cuda.synchronize()
-    _destroy_extra_process_groups()
-    if torch.cuda.is_available():
         torch.cuda.empty_cache()
-    # No barrier here: ranks may finish a test at different times (a test can
-    # let non-VAE ranks return while rank 0 runs a single-GPU reference), and
-    # the parent's wait for every rank's report is the fence already.
+    # Nothing collective here: ranks may finish a test at different times (a
+    # test can let other ranks return while rank 0 runs a single-GPU reference
+    # for minutes). Destroying a NCCL sub-group is a finalize that waits for its
+    # peers, so the previous test's sub-groups are destroyed at the start of the
+    # next task, once the parent has seen every rank finish.
 
 
 def _rank_main(
@@ -305,6 +306,7 @@ def _rank_main(
         if not payload:  # shutdown sentinel
             break
         try:
+            _destroy_extra_process_groups()  # the previous test's; all ranks are idle now
             fn, args, kwargs = pickle.loads(payload)
             fn(rank, world_size, *args, **kwargs)
             _reset_rank_state(env_snapshot)
@@ -639,13 +641,17 @@ def run_distributed(
     world_size: int,
     fn: Callable,
     *args: Any,
-    backend: str = "nccl",
+    dist_backend: str = "nccl",
     timeout: float | None = None,
     reuse: bool = True,
     preload: tuple[str, ...] = (),
     **kwargs: Any,
 ) -> None:
     """Run ``fn(rank, world_size, *args, **kwargs)`` on every rank of a pool.
+
+    ``dist_backend`` is the torch.distributed backend of the pool (``nccl`` or
+    ``gloo``); it is not called ``backend`` because the test functions here take
+    an attention ``backend`` kwarg that travels through ``**kwargs``.
 
     Raises :class:`WorkerPoolError` carrying every rank's traceback if any rank
     fails, dies, or the run (spawn included) reaches its deadline (module
@@ -667,11 +673,11 @@ def run_distributed(
 
     if not reuse:
         shutdown_all()
-    pool = _acquire(world_size, backend, preload, deadline_at)  # kills its ranks on failure
+    pool = _acquire(world_size, dist_backend, preload, deadline_at)  # kills its ranks on failure
     pool.run(payload, what, deadline_at)  # likewise
     if not reuse:
         _retire(pool, "test asked for fresh ranks")
     elif mode == "test":
         _retire(pool, "pool lifetime is one call")
     else:
-        _POOLS[(world_size, backend, preload)] = pool
+        _POOLS[(world_size, dist_backend, preload)] = pool

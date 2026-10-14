@@ -60,7 +60,7 @@ def _cleanup_mpi_env():
 def _run_test_in_distributed(world_size: int, test_fn: Callable, **kwargs) -> None:
     if torch.cuda.device_count() < world_size:
         pytest.skip(f"Test requires {world_size} GPUs, only {torch.cuda.device_count()} available")
-    run_distributed(world_size, test_fn, backend="nccl", preload=("tensorrt_llm",), **kwargs)
+    run_distributed(world_size, test_fn, dist_backend="nccl", preload=("tensorrt_llm",), **kwargs)
 
 
 def _test_qwen_image_attention_parallel_topology(

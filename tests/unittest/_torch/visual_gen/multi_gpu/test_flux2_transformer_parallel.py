@@ -69,7 +69,7 @@ def run_test_in_distributed(world_size: int, test_fn: Callable, use_cuda: bool =
     run_distributed(
         world_size,
         test_fn,
-        backend="nccl" if use_cuda else "gloo",
+        dist_backend="nccl" if use_cuda else "gloo",
         preload=("tensorrt_llm",),
         **kwargs,
     )

@@ -62,7 +62,7 @@ def run_test_in_distributed(world_size: int, test_fn: Callable, use_cuda: bool =
     if use_cuda and torch.cuda.device_count() < world_size:
         pytest.skip(f"Test requires {world_size} GPUs, only {torch.cuda.device_count()} available")
     run_distributed(
-        world_size, test_fn, backend="nccl" if use_cuda else "gloo", preload=("tensorrt_llm",)
+        world_size, test_fn, dist_backend="nccl" if use_cuda else "gloo", preload=("tensorrt_llm",)
     )
 
 

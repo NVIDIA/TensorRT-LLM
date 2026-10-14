@@ -129,21 +129,21 @@ def _assert_only_default_group(rank, world_size):
 
 def test_reuses_ranks_across_runs(tmp_path):
     p = str(tmp_path / "pid")
-    run_distributed(2, _write_pid, p, backend="gloo", timeout=_TIMEOUT)
+    run_distributed(2, _write_pid, p, dist_backend="gloo", timeout=_TIMEOUT)
     first = _read_pids(p, 2)
-    run_distributed(2, _allreduce_ok, 3, backend="gloo", timeout=_TIMEOUT)
-    run_distributed(2, _write_pid, p, backend="gloo", timeout=_TIMEOUT)
+    run_distributed(2, _allreduce_ok, 3, dist_backend="gloo", timeout=_TIMEOUT)
+    run_distributed(2, _write_pid, p, dist_backend="gloo", timeout=_TIMEOUT)
     assert _read_pids(p, 2) == first
 
 
 def test_rank_failure_kills_pool_and_reports_peer(tmp_path):
     p = str(tmp_path / "pid")
-    run_distributed(2, _write_pid, p, backend="gloo", timeout=_TIMEOUT)
+    run_distributed(2, _write_pid, p, dist_backend="gloo", timeout=_TIMEOUT)
     before = _read_pids(p, 2)
 
     t0 = time.monotonic()
     with pytest.raises(WorkerPoolError) as exc_info:
-        run_distributed(2, _rank1_raises_rank0_waits, backend="gloo", timeout=120)
+        run_distributed(2, _rank1_raises_rank0_waits, dist_backend="gloo", timeout=120)
     elapsed = time.monotonic() - t0
     msg = str(exc_info.value)
     assert "boom on rank 1" in msg
@@ -152,14 +152,14 @@ def test_rank_failure_kills_pool_and_reports_peer(tmp_path):
     # only the grace period for its report.
     assert elapsed < 2 * pool_mod._GRACE_SECONDS
 
-    run_distributed(2, _write_pid, p, backend="gloo", timeout=_TIMEOUT)
+    run_distributed(2, _write_pid, p, dist_backend="gloo", timeout=_TIMEOUT)
     assert set(_read_pids(p, 2)).isdisjoint(before)
 
 
 def test_dead_rank_is_detected():
     t0 = time.monotonic()
     with pytest.raises(WorkerPoolError) as exc_info:
-        run_distributed(2, _rank1_dies, backend="gloo", timeout=_TIMEOUT)
+        run_distributed(2, _rank1_dies, dist_backend="gloo", timeout=_TIMEOUT)
     assert time.monotonic() - t0 < _TIMEOUT
     assert "rank 1: exited with code 7 without reporting" in str(exc_info.value)
 
@@ -167,7 +167,7 @@ def test_dead_rank_is_detected():
 def test_hung_test_hits_deadline():
     t0 = time.monotonic()
     with pytest.raises(WorkerPoolError, match="deadline reached"):
-        run_distributed(2, _hang_forever, backend="gloo", timeout=15)
+        run_distributed(2, _hang_forever, dist_backend="gloo", timeout=15)
     assert time.monotonic() - t0 < 15 + pool_mod._GRACE_SECONDS
 
 
@@ -178,17 +178,17 @@ def test_default_deadline_follows_pytest_timeout():
     pytest-timeout killing the whole process."""
     t0 = time.monotonic()
     with pytest.raises(WorkerPoolError, match="deadline reached"):
-        run_distributed(2, _hang_forever, backend="gloo")
+        run_distributed(2, _hang_forever, dist_backend="gloo")
     assert time.monotonic() - t0 < 60 - pool_mod._GRACE_SECONDS
 
 
 def test_lifetime_test_gives_fresh_ranks(tmp_path, monkeypatch):
     monkeypatch.setenv("TRTLLM_TEST_VISUALGEN_POOL_LIFETIME", "test")
     p = str(tmp_path / "pid")
-    run_distributed(2, _write_pid, p, backend="gloo", timeout=_TIMEOUT)
+    run_distributed(2, _write_pid, p, dist_backend="gloo", timeout=_TIMEOUT)
     first = _read_pids(p, 2)
     assert not pool_mod._POOLS
-    run_distributed(2, _write_pid, p, backend="gloo", timeout=_TIMEOUT)
+    run_distributed(2, _write_pid, p, dist_backend="gloo", timeout=_TIMEOUT)
     assert set(_read_pids(p, 2)).isdisjoint(first)
 
 
@@ -197,9 +197,9 @@ def test_lifetime_module_reuses_within_a_module_and_drains_at_its_end(tmp_path, 
 
     monkeypatch.setenv("TRTLLM_TEST_VISUALGEN_POOL_LIFETIME", "module")
     p = str(tmp_path / "pid")
-    run_distributed(2, _write_pid, p, backend="gloo", timeout=_TIMEOUT)
+    run_distributed(2, _write_pid, p, dist_backend="gloo", timeout=_TIMEOUT)
     first = _read_pids(p, 2)
-    run_distributed(2, _write_pid, p, backend="gloo", timeout=_TIMEOUT)
+    run_distributed(2, _write_pid, p, dist_backend="gloo", timeout=_TIMEOUT)
     assert _read_pids(p, 2) == first
     assert pool_mod._POOLS
     conftest.end_of_module()  # what the module-scoped fixture runs at teardown
@@ -207,7 +207,7 @@ def test_lifetime_module_reuses_within_a_module_and_drains_at_its_end(tmp_path, 
     for pid in first:
         assert _pid_gone(pid)
     monkeypatch.setenv("TRTLLM_TEST_VISUALGEN_POOL_LIFETIME", "session")
-    run_distributed(2, _write_pid, p, backend="gloo", timeout=_TIMEOUT)
+    run_distributed(2, _write_pid, p, dist_backend="gloo", timeout=_TIMEOUT)
     assert pool_mod._POOLS
     conftest.end_of_module()
     assert pool_mod._POOLS  # session lifetime: untouched at module end
@@ -221,16 +221,16 @@ def test_lifetime_value_is_validated(monkeypatch):
 
 def test_env_change_retires_pool(tmp_path, monkeypatch):
     p = str(tmp_path / "pid")
-    run_distributed(2, _write_pid, p, backend="gloo", timeout=_TIMEOUT)
+    run_distributed(2, _write_pid, p, dist_backend="gloo", timeout=_TIMEOUT)
     first = _read_pids(p, 2)
     monkeypatch.setenv("TRTLLM_TEST_POOL_PROBE", "changed")
-    run_distributed(2, _write_pid, p, backend="gloo", timeout=_TIMEOUT)
+    run_distributed(2, _write_pid, p, dist_backend="gloo", timeout=_TIMEOUT)
     assert set(_read_pids(p, 2)).isdisjoint(first)
 
 
 def test_env_is_restored_between_runs():
-    run_distributed(2, _set_env, backend="gloo", timeout=_TIMEOUT)
-    run_distributed(2, _assert_env_clean, backend="gloo", timeout=_TIMEOUT)
+    run_distributed(2, _set_env, dist_backend="gloo", timeout=_TIMEOUT)
+    run_distributed(2, _assert_env_clean, dist_backend="gloo", timeout=_TIMEOUT)
 
 
 def test_rng_is_seeded_before_every_run(tmp_path):
@@ -238,22 +238,22 @@ def test_rng_is_seeded_before_every_run(tmp_path):
     p = str(tmp_path / "rand")
     draws = []
     for _ in range(3):
-        run_distributed(2, _write_random, p, backend="gloo", timeout=_TIMEOUT)
+        run_distributed(2, _write_random, p, dist_backend="gloo", timeout=_TIMEOUT)
         draws.append(_read_values(p, 2))
     assert draws[0] == draws[1] == draws[2]
     assert len(set(draws[0])) == 1
 
 
 def test_extra_process_groups_are_destroyed():
-    run_distributed(2, _make_extra_group, backend="gloo", timeout=_TIMEOUT)
-    run_distributed(2, _assert_only_default_group, backend="gloo", timeout=_TIMEOUT)
+    run_distributed(2, _make_extra_group, dist_backend="gloo", timeout=_TIMEOUT)
+    run_distributed(2, _assert_only_default_group, dist_backend="gloo", timeout=_TIMEOUT)
 
 
 def test_reuse_false_gives_fresh_ranks_and_drains(tmp_path):
     p = str(tmp_path / "pid")
-    run_distributed(2, _write_pid, p, backend="gloo", timeout=_TIMEOUT)
+    run_distributed(2, _write_pid, p, dist_backend="gloo", timeout=_TIMEOUT)
     cached = _read_pids(p, 2)
-    run_distributed(2, _write_pid, p, backend="gloo", timeout=_TIMEOUT, reuse=False)
+    run_distributed(2, _write_pid, p, dist_backend="gloo", timeout=_TIMEOUT, reuse=False)
     private = _read_pids(p, 2)
     assert set(private).isdisjoint(cached)
     assert not pool_mod._POOLS
@@ -316,7 +316,7 @@ signal.pause()
 def test_unpicklable_fn_touches_no_ranks():
     before = len(multiprocessing.active_children())
     with pytest.raises((pickle.PicklingError, AttributeError)):
-        run_distributed(2, lambda rank, world_size: None, backend="gloo", timeout=_TIMEOUT)
+        run_distributed(2, lambda rank, world_size: None, dist_backend="gloo", timeout=_TIMEOUT)
     assert not pool_mod._POOLS
     assert len(multiprocessing.active_children()) == before
 
