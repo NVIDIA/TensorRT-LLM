@@ -27,7 +27,8 @@ from typing import Optional
 
 import torch
 
-from ..._utils import copy_to_device_if_changed
+from ..._device_copy import DeviceCopyBuffer
+from ..._utils import prefer_pinned
 from ...sampling_params import SamplingParams
 from ..cute_dsl_kernels.spec_step_copies import op as spec_step_copies
 from ..pyexecutor.llm_request import LlmRequest, LlmRequestState, get_draft_token_length
@@ -306,15 +307,14 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         # tree (K=6, T=60), MTP dynamic tree, PARD (T=2K-1) and the linear
         # modes -- none exceed it.
         self.max_accepted_path_len = args.max_draft_len + 1
-        # Where the step-copy kernels run, one kernel moves a step's outputs
-        # into the stores below, reading each row's slot from _slot_table.
         self._store_scatter: Optional[spec_step_copies.SlotScatter] = None
-        self._slot_table: Optional[torch.Tensor] = None
+        self._slot_table_buffer: Optional[DeviceCopyBuffer] = None
         if spec_step_copies.is_supported():
             self._store_scatter = spec_step_copies.SlotScatter()
-            # Only copy_to_device_if_changed writes this buffer: it skips values it already copied here, so another
-            # write would leave stale values.
-            self._slot_table = torch.zeros((seq_slots,), dtype=torch.int32, device="cuda")
+            self._slot_table_buffer = DeviceCopyBuffer(
+                torch.zeros((seq_slots,), dtype=torch.int32, device="cuda"),
+                pin_memory=prefer_pinned(),
+            )
         # Recorded after the last step's host copies of the stores, which read
         # them on the D2H side stream.
         self._store_copies_done: Optional[torch.cuda.Event] = None
@@ -546,12 +546,12 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         scattered = False
         if self._store_scatter is not None:
             # A step whose batch is unchanged leaves the slot table as it is.
-            copy_to_device_if_changed(self._slot_table, torch.tensor(slots, dtype=torch.int32))
+            self._slot_table_buffer.update(torch.tensor(slots, dtype=torch.int32))
             scattered = self._store_scatter.scatter(
                 outputs,
                 num_skip,
                 len(slots),
-                self._slot_table,
+                self._slot_table_buffer.tensor,
                 self.store.new_tokens,
                 self.store.next_new_tokens,
                 self.store.new_tokens_lens,
