@@ -60,6 +60,7 @@ def _make_pynvml(cc_feature: int, multi_gpu_mode: int) -> types.ModuleType:
         (0, 1, True),  # PROTECTED_PCIE
         (0, 2, True),  # NVLE
         (1, 2, True),  # ccFeature enabled and NVLE
+        (0, 0, False),  # neither enabled
     ],
 )
 def test_confidential_compute_enabled(monkeypatch, cc_feature, multi_gpu_mode, expected):
