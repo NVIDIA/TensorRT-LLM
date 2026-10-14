@@ -185,7 +185,7 @@ def merge_spatial_patches(
     hidden_size = image_embeds.shape[-1]
     grids = _cpu_int_rows(grid_thw).tolist()
     for grid in grids:
-        frames, height, width = (int(v) for v in grid.tolist())
+        frames, height, width = (int(v) for v in grid)
         if height % merge_size != 0 or width % merge_size != 0:
             raise ValueError(
                 "Grid height and width must be divisible by merge_size: "
