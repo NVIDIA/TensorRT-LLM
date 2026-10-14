@@ -34,6 +34,10 @@ The launchers are wrapped while warmup runs (``start_recording`` /
 ``stop_recording``): each real call is recorded once per launch class, with
 every per-request tensor (``_BATCH_ARGS``) described independently of the
 batch size. Recording stops at the end of warmup, so serving pays nothing.
+A launch class also fixes the cache pool (its size is a constexpr of the conv
+update and sets the promote kernel's strides), so the classes the final
+executor's warmup records are planned after it, in addition to those of the
+KV-cache estimation pass.
 The provider then replays each recorded call on ``meta`` tensors under
 ``shadow_launches`` for every batch size up to the engine's, with the
 per-request tensors at each alignment a row offset can give them: the
@@ -227,8 +231,14 @@ class MambaDecodeProvider:
         "tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager",
     )
 
+    # Enumerated again after every warmup (JitPrefetcher.start_background):
+    # the KV-cache estimation pass and the final executor warm up on
+    # different cache pools, so each records launch classes of its own.
+    plans_from_warmup = True
+
     def __init__(self, max_batch_size: int):
         self.max_batch_size = max(1, int(max_batch_size))
+        self._planned: set = set()
 
     def __bool__(self):
         return bool(_RECORDS)
@@ -266,11 +276,19 @@ class MambaDecodeProvider:
         return offsets
 
     def plan_all(self) -> List[KernelCall]:
+        """Plan every recorded launch class this provider has not planned
+        before."""
         from tensorrt_llm.logger import logger
 
         _shim_meta_device_properties()
         with _LOCK:
-            records = [(n, r) for n, per_name in _RECORDS.items() for r in per_name.values()]
+            records = [
+                (n, r)
+                for n, per_name in _RECORDS.items()
+                for key, r in per_name.items()
+                if (n, key) not in self._planned
+            ]
+            self._planned.update((n, key) for n, per_name in _RECORDS.items() for key in per_name)
         calls: List[KernelCall] = []
         summary = {}
         for name, (launcher, sig, specs) in records:

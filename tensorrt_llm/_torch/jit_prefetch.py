@@ -376,6 +376,9 @@ class JitPrefetcher:
         self._provider_names: set = set()
         self._spec_prio: Dict[str, int] = {}
         self._bg_started = False
+        # ids of the providers a background enumeration has covered.
+        self._enumerated: set = set()
+        self._enum_lock = threading.Lock()
         self._inflight: Dict[int, str] = {}
         self._tag_event: Dict[int, threading.Event] = {}
         self._key_event: Dict[str, threading.Event] = {}
@@ -770,11 +773,8 @@ class JitPrefetcher:
             for k, v in os.environ.items()
             if not k.startswith(("OMPI_", "PMIX_", "PMI_", "SLURM_", "UCX_", "MPI_"))
         }
-        # CUTE_DSL_ARCH: without it CuTe DSL detects the arch by querying the
-        # driver, which serializes across the node's helpers (about 27 s
-        # each with no GPU visible); compiling for the given arch needs no
-        # driver call.
-        env.update(CUDA_VISIBLE_DEVICES="", PYTHONNOUSERSITE="1", CUTE_DSL_ARCH=jcd.gpu_arch())
+        # The helper targets the arch it is given (it sets CUTE_DSL_ARCH).
+        env.update(CUDA_VISIBLE_DEVICES="", PYTHONNOUSERSITE="1")
         helper = os.path.join(
             os.path.dirname(os.path.abspath(__file__)), "jit_prefetch_cute_dsl_helper.py"
         )
@@ -899,24 +899,41 @@ class JitPrefetcher:
         self._event(f"DeepGEMM enumeration: {n} requests queued")
 
     def start_background(self) -> None:
-        """Queue every enumerable variant, once, on a background thread.
+        """Queue every enumerable variant on a background thread.
 
-        Called when the providers are registered (end of warmup), so the
-        helpers start on the background set while the rest of warmup runs.
+        Called at the end of each warmup, once the providers are registered,
+        so the helpers start on the background set before serving. Each
+        provider is enumerated once, except those that plan from what warmup
+        recorded (``plans_from_warmup``): they are enumerated again after
+        every warmup and plan only the launch classes not planned before. The
+        KV-cache estimation pass and the final executor warm up on different
+        cache pools, and only the final executor's launches reach serving.
         """
-        if not self.prefetch or not self._providers or self._bg_started:
+        if not self.prefetch or not self._providers:
             return
         self._bg_started = True
-        threading.Thread(
-            target=self._enumerate_all, daemon=True, name="jit_prefetch_enumerate"
-        ).start()
+        with self._lock:
+            providers = [
+                p
+                for p in self._providers
+                if id(p) not in self._enumerated or getattr(p, "plans_from_warmup", False)
+            ]
+            self._enumerated.update(id(p) for p in providers)
+        if providers:
+            threading.Thread(
+                target=self._enumerate_all,
+                args=(providers,),
+                daemon=True,
+                name="jit_prefetch_enumerate",
+            ).start()
 
     def plan(self, batch_ctx: Any) -> None:
         """Called once a batch is scheduled, before its inputs are prepared."""
         self.bind_executor_thread()
         if not self.prefetch or not self._providers:
             return
-        self.start_background()
+        if not self._bg_started:
+            self.start_background()
         t0 = time.perf_counter()
         for provider in self._providers:
             try:
@@ -930,9 +947,10 @@ class JitPrefetcher:
                 self._plan_call(call)
         self.stats.plan_s += time.perf_counter() - t0
 
-    def _plan_call(self, call: KernelCall, priority: int = 0):
-        """Plan one call. ``priority`` 0 = the batch being scheduled now,
-        1 = background enumeration; lower is compiled first."""
+    def _plan_call(self, call: KernelCall, priority: int = 0) -> int:
+        """Plan one call; return how many variants it queued. ``priority`` 0
+        = the batch being scheduled now, 1 = background enumeration; lower is
+        compiled first."""
         jit_fn, _, _ = _unwrap_jit(call.fn)
         try:
             variants, tuned = _expand(call)
@@ -940,7 +958,8 @@ class JitPrefetcher:
             logger.warning_once(
                 f"[JIT prefetch] cannot expand {call.label}: {e}", key=f"jitp_expand_{call.label}"
             )
-            return
+            return 0
+        queued = 0
         for kw in variants:
             self.stats.planned += 1
             try:
@@ -957,10 +976,12 @@ class JitPrefetcher:
             key, spec = found
             if not self._submit(key, spec, call.label, priority):
                 continue
+            queued += 1
             if os.environ.get("TLLM_JIT_PREFETCH_DEBUG_KEYS") == "1":
                 print(f"[JIT keys] PLANNED {jit_fn.fn.__name__} key={key}", flush=True)
             if priority == _PRIO_BATCH:
                 self._event(f"submit {call.label}{'' if tuned else ' (untuned: all configs)'}")
+        return queued
 
     def _submit(self, key: str, spec: str, label: str, priority: int, kind: str = "triton") -> bool:
         """Queue one variant; False if it is already queued at this priority
@@ -995,38 +1016,39 @@ class JitPrefetcher:
         self._queues[kind].put((priority, tag, spec))
         return True
 
-    def _enumerate_all(self) -> None:
-        """Queue every variant each provider can reach, at background priority.
+    def _enumerate_all(self, providers: List[Any]) -> None:
+        """Queue every variant ``providers`` can reach, at background priority.
 
         Runs on its own thread so the executor never waits for it. It plans
         with the same meta-tensor replay as ``plan``, only over the batch
         compositions a provider enumerates (``enumerate_batches``) instead of
         the one batch being scheduled. Variants the current batch needs are
-        always queued ahead of these.
+        always queued ahead of these. Enumerations run one at a time.
         """
-        t0 = time.perf_counter()
-        n_batches = 0
-        for provider in self._providers:
-            enum = getattr(provider, "enumerate_batches", None)
-            if enum is None:
-                continue
-            seen: set = set()
-            for batch_ctx in enum():
-                n_batches += 1
-                try:
-                    calls = provider(batch_ctx, seen=seen)
-                except Exception as e:  # noqa: BLE001
-                    logger.warning_once(
-                        f"[JIT prefetch] enumeration failed: {e}", key=f"jitp_enum_{id(provider)}"
-                    )
-                    break
-                for call in calls:
-                    self._plan_call(call, priority=_PRIO_ENUM)
-        self._event(
-            f"background enumeration: {n_batches} batch classes, "
-            f"{self.stats.bg_submitted} variants queued in "
-            f"{(time.perf_counter() - t0) * 1e3:.0f} ms"
-        )
+        with self._enum_lock:
+            t0 = time.perf_counter()
+            n_batches = queued = 0
+            for provider in providers:
+                enum = getattr(provider, "enumerate_batches", None)
+                if enum is None:
+                    continue
+                seen: set = set()
+                for batch_ctx in enum():
+                    n_batches += 1
+                    try:
+                        calls = provider(batch_ctx, seen=seen)
+                    except Exception as e:  # noqa: BLE001
+                        logger.warning_once(
+                            f"[JIT prefetch] enumeration failed: {e}",
+                            key=f"jitp_enum_{id(provider)}",
+                        )
+                        break
+                    for call in calls:
+                        queued += self._plan_call(call, priority=_PRIO_ENUM)
+            self._event(
+                f"background enumeration: {n_batches} batch classes, "
+                f"{queued} variants queued in {(time.perf_counter() - t0) * 1e3:.0f} ms"
+            )
 
     # -- measurement hooks ------------------------------------------------
     def _install_cute_dsl_counter(self) -> None:

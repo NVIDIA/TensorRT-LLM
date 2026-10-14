@@ -22,10 +22,11 @@ two up to ``max_batch_size``. Decode batches at a captured CUDA-graph size
 compile theirs during warmup; eager decode batches (above the largest graph,
 or with graphs off) would compile the rest on the executor.
 
-The fixed launch parameters are taken from the first real call (warmup
+The fixed launch parameters are taken from the latest real call (warmup
 always issues one when the fused path is enabled), so nothing here
 duplicates the metadata object's buffer layout. Every BLOCK_S variant is
-then planned once, in the background.
+then planned in the background, once per warmup that recorded parameters
+not planned before.
 """
 
 from types import SimpleNamespace
@@ -41,10 +42,14 @@ class DsaDecodeMetadataProvider:
     # The module defining the kernel this provider plans; helpers import it
     # during warmup (JitPrefetcher.register).
     kernel_modules = ("tensorrt_llm._torch.attention.backends.sparse.dsa.kernels",)
+    # Enumerated again after every warmup (JitPrefetcher.start_background):
+    # the final executor's warmup may record other launch parameters than
+    # the KV-cache estimation pass.
+    plans_from_warmup = True
 
     def __init__(self, max_batch_size: int):
         self.max_batch_size = int(max_batch_size)
-        self._done = False
+        self._planned: set = set()
 
     def __bool__(self):
         # Known only after warmup ran the fused kernel once.
@@ -71,9 +76,13 @@ class DsaDecodeMetadataProvider:
         return out
 
     def plan_all(self) -> List[KernelCall]:
+        """Plan every BLOCK_S variant of the recorded launch parameters, once
+        per distinct set of them."""
         t = dict(kernels.FUSED_DSA_DECODE_TEMPLATE)
-        if not t:
+        key = tuple(sorted(t.items()))
+        if not t or key in self._planned:
             return []
+        self._planned.add(key)
         meta = torch.device("meta")
         calls: List[KernelCall] = []
         q = t["max_query_len"]

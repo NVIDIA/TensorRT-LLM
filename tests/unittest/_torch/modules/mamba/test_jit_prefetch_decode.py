@@ -142,6 +142,32 @@ def test_planned_keys_cover_other_batches_and_row_offsets():
             assert not missing, f"{name} nctx={nctx} ngen={ngen}: unplanned {sorted(missing)}"
 
 
+def test_a_second_warmup_on_another_pool_is_planned_too():
+    """The KV-cache estimation pass and the final executor warm up on pools
+    of different sizes (the conv update specializes on the pool's size). A
+    provider enumerated after each warmup plans the second pool's launches,
+    and does not plan the first pool's again."""
+    estimation, final = _Buffers(), _Buffers()
+    final.conv_state = torch.zeros(
+        2 * CACHE, WIDTH - 1, CONV_DIM, dtype=torch.bfloat16, device="cuda"
+    ).transpose(1, 2)  # the same layout as _Buffers, twice the cache lines
+    jpd._RECORDS.clear()
+    provider = jpd.MambaDecodeProvider(max_batch_size=MAX_ROWS)
+    for warmup in (estimation, final):
+        jpd.start_recording()
+        try:
+            warmup.conv(0, 4)
+            torch.cuda.synchronize()
+        finally:
+            jpd.stop_recording()
+        planned = _keys(provider.plan_all())
+        assert planned, "a warmup with new launch classes planned nothing"
+    for nctx, ngen in [(0, 1), (3, 16), (5, 33)]:
+        missing = _real(final.conv, nctx, ngen) - planned
+        assert not missing, f"final pool nctx={nctx} ngen={ngen}: unplanned {sorted(missing)}"
+    assert not provider.plan_all(), "launch classes planned twice"
+
+
 def test_recording_stops_and_restores_launchers():
     from tensorrt_llm._torch.modules.mamba import selective_state_update as ssu
 

@@ -71,9 +71,14 @@ class GlmKpoolProvider:
     """Plans every batch-dependent variant of the glm_kpool indexer kernels."""
 
     kernel_modules = ("tensorrt_llm._torch.attention.backends.sparse.glm_kpool.kernels",)
+    # Enumerated again after every warmup (JitPrefetcher.start_background):
+    # the KV-cache estimation pass and the final executor warm up on
+    # different pools, so each records launch classes of its own.
+    plans_from_warmup = True
 
     def __init__(self, max_num_tokens: int):
         self.max_num_tokens = max(1, int(max_num_tokens))
+        self._planned: set = set()
 
     def __bool__(self):
         return bool(kernels.KPOOL_LAUNCH_TEMPLATE)
@@ -89,14 +94,16 @@ class GlmKpoolProvider:
             yield SimpleNamespace(glm_kpool_all=True, ctx_chunk_lens=[])
 
     def plan_all(self) -> List[KernelCall]:
-        template = kernels.KPOOL_LAUNCH_TEMPLATE
+        """Plan every recorded launch class not planned before."""
+        planners = {"score": self._plan_score, "update": self._plan_update,
+                    "expand": self._plan_expand}  # fmt: skip
         with shadow_launches() as rec:
-            for t in list(template.get("score", {}).values()):
-                self._plan_score(t)
-            for t in list(template.get("update", {}).values()):
-                self._plan_update(t)
-            for t in list(template.get("expand", {}).values()):
-                self._plan_expand(t)
+            for name, plan in planners.items():
+                for key, t in list(kernels.KPOOL_LAUNCH_TEMPLATE.get(name, {}).items()):
+                    if (name, key) in self._planned:
+                        continue
+                    self._planned.add((name, key))
+                    plan(t)
         return list(rec)
 
     @staticmethod

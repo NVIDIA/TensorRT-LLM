@@ -56,6 +56,12 @@ def _preload_runtime():
 def main():
     gpu_arch, out_dir = sys.argv[1:3]
     props = json.loads(sys.argv[3]) if len(sys.argv) > 3 else None
+    # The arch every compile here targets, set before CuTe DSL is imported:
+    # kernels compiled through their own compile path (no ``--gpu-arch``
+    # option) take it from here. Without it CuTe DSL queries the driver,
+    # which has no GPU to report here and serializes across the node's
+    # helpers (about 27 s each).
+    os.environ["CUTE_DSL_ARCH"] = gpu_arch
     os.makedirs(out_dir, exist_ok=True)
     # Libraries loaded below (UCX via tensorrt_llm, CuTe DSL) print to fd 1.
     # Keep the protocol on a private copy of stdout; send fd 1 to stderr.

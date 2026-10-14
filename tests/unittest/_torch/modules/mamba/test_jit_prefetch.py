@@ -213,6 +213,41 @@ def test_executor_compiles_triton_variant_no_helper_started(monkeypatch):
     assert p.stats.wait_n == 1
 
 
+@pytest.mark.usefixtures("restore_triton_hooks")
+def test_background_enumeration_reruns_only_warmup_recorded_providers(monkeypatch):
+    """After a second warmup, only providers that plan from warmup records
+    are enumerated again; the others are enumerated once per process."""
+    import threading
+
+    monkeypatch.setenv("TLLM_JIT_PREFETCH", "1")
+    monkeypatch.setattr(jp.JitPrefetcher, "_start_helpers", lambda self: None)
+    p = jp.JitPrefetcher(rank=0)
+    runs = []
+    done = threading.Semaphore(0)
+
+    class Provider:
+        def __init__(self, name, plans_from_warmup):
+            self.name, self.plans_from_warmup = name, plans_from_warmup
+
+        def __call__(self, batch_ctx, seen=None):
+            return []
+
+        def enumerate_batches(self):
+            runs.append(self.name)
+            done.release()
+            return iter(())
+
+    p.register("static", Provider("static", False))
+    p.register("recorded", Provider("recorded", True))
+    p.start_background()  # end of the KV-cache estimation warmup
+    for _ in range(2):
+        assert done.acquire(timeout=10)
+    p.start_background()  # end of the final executor's warmup
+    assert done.acquire(timeout=10)
+    assert not done.acquire(timeout=0.2)
+    assert sorted(runs) == ["recorded", "recorded", "static"]
+
+
 def test_helper_preload_then_compile(tmp_path):
     """A helper given a preload request imports the module then still
     compiles that module's kernels (preload sends no reply)."""
