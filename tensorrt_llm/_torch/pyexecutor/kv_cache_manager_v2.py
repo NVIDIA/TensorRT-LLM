@@ -2245,6 +2245,25 @@ class KVCacheManagerV2(BaseResourceManager):
         if pre_cap > 0:
             kv_cache.suspend()
 
+    def drop_context_allocation(self, req: LlmRequest) -> None:
+        """Give up a context request's allocation and progress so it restarts from scratch.
+
+        For a request skipped past a connector prefix whose pages then could not
+        be filled: those positions already count as computed, so the only
+        correct outcome is to recompute them. The scheduler re-admits the
+        request from whatever the radix tree still holds. The connector is
+        still queried, so it keeps tracking the request for saves, but its
+        offer is handed back: a store that reports pages present and then
+        fails to read them would otherwise restart the request every time.
+        """
+        req.py_ctx_pre_resize_cap = None
+        self._release_preempted(req)
+        req.py_connector_load_failed = True
+        req.set_prepopulated_prompt_len(0, self.tokens_per_block)
+        req.context_current_position = 0
+        req.context_chunk_size = req.prompt_len
+        req.estimated_reusable_tokens = 0
+
     def _restore_page_index_bufs(self, request_id: int, kv_cache) -> None:
         """Re-connect host page-index buffers after resume().
 
@@ -2397,6 +2416,14 @@ class KVCacheManagerV2(BaseResourceManager):
             # loses at most one token, which the forward recomputes.
             req.py_connector_prefix_start = local_end
             offered_end = local_end + num_tokens
+            if req.py_connector_load_failed:
+                # This request already lost a load from this connector; trust
+                # only the local match from now on and hand the offer back.
+                if offered_end > local_end:
+                    self.kv_connector_manager.cancel_load(req, local_end, offered_end)
+                req.py_connector_prefix_end = local_end
+                req.py_connector_load_async = False
+                return kv_cache.num_committed_tokens
             req.py_connector_prefix_end = min(offered_end, req.prompt_len - 1)
             # Hand back what that clamp just dropped, because nothing
             # downstream can: `_deliver_connector_prefix` and
@@ -2786,12 +2813,14 @@ class KVCacheManagerV2(BaseResourceManager):
                 continue
             self._deliver_connector_prefix(request)
             request.py_connector_delivered = True
-            # Connectors that do not reason about layer groups see the single
-            # group's indices; with several groups there is no correct flat
-            # list, so report none and leave them to the layer-group-aware
-            # metadata carried on RequestData.
+            # Both forms are reported, as `RequestData` reports both: the flat
+            # list is empty unless the model has a single layer group. A
+            # request parked for an asynchronous load never reaches
+            # `build_scheduler_output`, so this is its only route to either.
             self.kv_connector_manager.update_state_after_alloc(
-                request, self.get_connector_page_indices(request)
+                request,
+                self.get_connector_page_indices(request),
+                self.get_page_indices_by_layer_group(request),
             )
 
         self.kv_connector_manager.build_scheduler_output(scheduled_batch, self)

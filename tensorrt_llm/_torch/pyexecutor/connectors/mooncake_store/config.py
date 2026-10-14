@@ -230,6 +230,11 @@ class MooncakeStoreConnectorConfig:
     #: pools with Mooncake. Costs a copy each way, but works without GPUDirect
     #: RDMA, which registering device memory requires.
     stage_through_host: bool = False
+    #: Load a served prefix on a background thread while the runtime parks the
+    #: request, instead of inside the executor iteration. See the worker.
+    async_load: bool = False
+    #: Load worker threads, each with its own stream and staging slots.
+    async_load_workers: int = 1
 
     def __post_init__(self) -> None:
         """Reject settings that would fail later, inside a transfer."""
@@ -241,6 +246,8 @@ class MooncakeStoreConnectorConfig:
             raise ValueError("global_segment_size must be >= 0")
         if self.transfer_batch_size <= 0:
             raise ValueError("transfer_batch_size must be > 0")
+        if self.async_load_workers < 1:
+            raise ValueError("async_load_workers must be >= 1")
 
     @property
     def capacity_only(self) -> bool:
@@ -276,6 +283,8 @@ class MooncakeStoreConnectorConfig:
             model_key=raw.get("model_key") or None,
             transfer_batch_size=int(raw.get("transfer_batch_size", 64)),
             stage_through_host=bool(raw.get("stage_through_host", False)),
+            async_load=bool(raw.get("async_load", False)),
+            async_load_workers=int(raw.get("async_load_workers", 1)),
         )
 
     @staticmethod
