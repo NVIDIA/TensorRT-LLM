@@ -298,6 +298,7 @@ class DSv41DSparkForCausalLM(DSv4DSparkForCausalLM):
         confidence_prefix = f"mtp_layers.{self.num_stages - 1}.confidence_head."
         if not any(name.startswith(confidence_prefix) for name in remapped):
             last.confidence_head = None
+        self._prepare_confidence_head_for_load(remapped)
         DeepseekV41WeightLoader(self.dspark_model).load_weights(remapped)
         unexpected, unfed = _v41_load_coverage(self.dspark_model, remapped)
         if unexpected or unfed:

@@ -1710,9 +1710,23 @@ description = "More routines for operating on iterables, beyond itertools"
 optional = false
 python-versions = ">=3.10"
 groups = ["main"]
+markers = "python_version == \"3.10\""
 files = [
     {file = "more_itertools-11.1.0-py3-none-any.whl", hash = "sha256:4b65538ae22f6fed0ce4874efd317463a7489796a0939fa66824dd542125a192"},
     {file = "more_itertools-11.1.0.tar.gz", hash = "sha256:48e8f4d9e7e5878571ecf6f2b4e57634f93cd474cc8cfbd2376f2d11b396e30d"},
+]
+
+[[package]]
+name = "more-itertools"
+version = "11.2.0"
+description = "More routines for operating on iterables, beyond itertools"
+optional = false
+python-versions = ">=3.11"
+groups = ["main"]
+markers = "python_version >= \"3.11\""
+files = [
+    {file = "more_itertools-11.2.0-py3-none-any.whl", hash = "sha256:e4c522352a24664c974d0be8382944107ae638281a06391a5a538366b5707fe5"},
+    {file = "more_itertools-11.2.0.tar.gz", hash = "sha256:59960f488835254863a857eb501f69e4ec92fdc8822f098c0f48dba530afd487"},
 ]
 
 [[package]]
