@@ -1027,8 +1027,7 @@ function moeDashboardMain() {
   });
 
   // --- boot ---------------------------------------------------------------
-  // No masthead in the page; the title survives only as the browser tab name.
-  document.title = CONFIG.title;
+  // PORTED: the documentation page owns <title>; the widget does not set it.
   if (DATA.mock) {
     const b = $("banner");
     b.hidden = false;
