@@ -82,7 +82,7 @@ The two tables below summarize the current coverage.
 
 **Note**: Currently, this design targets and is optimized for NVIDIA Blackwell GPUs and newer architectures.
 
-The rest of the blog covers the framework design shared by all methods, with cold-page compression as the worked example. The framework landed in [#15106](https://github.com/NVIDIA/TensorRT-LLM/pull/15106) and its runtime integration in [#15697](https://github.com/NVIDIA/TensorRT-LLM/pull/15697). The interface between the cache manager and a page encoder is in the [cold-page codec design guide](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/developer-guide/kv-cache-cold-page-codec.md), and the APIs for adding a method are in the [KV Cache Compression Development Guide](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/developer-guide/kv-cache-compression-development.md) ([#18587](https://github.com/NVIDIA/TensorRT-LLM/pull/18587)).
+The rest of the blog covers the framework design shared by all methods, with cold-page compression as the worked example. The framework landed in [#15106](https://github.com/NVIDIA/TensorRT-LLM/pull/15106) and its runtime integration in [#15697](https://github.com/NVIDIA/TensorRT-LLM/pull/15697). The interface between the cache manager and a page encoder is in the [cold-page codec design guide](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/developer-guide/kv-cache-cold-page-codec.md), and the APIs for adding a method are in the [KV Cache Compression Development Guide](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/developer-guide/kv-cache-compression-development.md).
 
 ## KV Cache Compression Framework Design
 
