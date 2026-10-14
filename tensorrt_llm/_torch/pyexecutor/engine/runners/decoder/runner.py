@@ -397,6 +397,7 @@ class DecoderRunner(ScheduledModelRunner):
         self._init_decoder_state()
         self.cuda_graph_runner = self._initialize_cuda_graph_runner()
         self.breakable_cuda_graph_runner = self._initialize_breakable_cuda_graph_runner()
+        self._initialize_moe_workspace_reclaimer()
 
     @property
     def max_beam_width(self) -> int:
@@ -416,13 +417,8 @@ class DecoderRunner(ScheduledModelRunner):
     def warmup(self, resource_manager: ResourceManager) -> None:
         kv_cache_manager = resource_manager.get_resource_manager(self.kv_cache_manager_key)
         # Retain a partial summary when a phase raises.
-        was_warmup = self._is_warmup
-        self._is_warmup = True
-        try:
-            with self._warmup_timer:
-                self._warmup_scheduled(resource_manager, kv_cache_manager)
-        finally:
-            self._is_warmup = was_warmup
+        with self._warmup_timer:
+            self._warmup_scheduled(resource_manager, kv_cache_manager)
 
     def release_graphs(self) -> None:
         self._release_decoder_graphs()
@@ -518,7 +514,6 @@ class DecoderRunner(ScheduledModelRunner):
 
     def _init_decoder_state(self) -> None:
         """Initialize the mutable state read only by engine decoder execution."""
-        self._is_warmup = False
         self._moe_workspace_reclaimer: CutlassWorkspaceReclaimer | None = None
         self._eager_workspace_reclaimer: EagerWorkspaceReclaimer | None = None
         # Token shape of the last autotuner warmup that ran a forward pass.
@@ -768,7 +763,6 @@ class DecoderRunner(ScheduledModelRunner):
         # cuda_graph_config=None flashinfer's sampling kernels would be
         # JIT-built mid-serving.
         self._eager_workspace_reclaimer = None
-        self._initialize_moe_workspace_reclaimer()
         with self._warmup_timer.phase(
             "sampling_module_prewarm", metrics=self._metrics, metric_name="sampling_warmup_seconds"
         ):
@@ -931,6 +925,7 @@ class DecoderRunner(ScheduledModelRunner):
         self._freeze_eager_workspace_floor()
 
     def _initialize_moe_workspace_reclaimer(self) -> None:
+        """Create the native workspace owner for this runner's lifetime."""
         self._moe_workspace_reclaimer = None
         if (
             os.environ.get("TRTLLM_RECLAIM_WORKSPACE", "1") != "0"
@@ -5040,10 +5035,8 @@ class DecoderRunner(ScheduledModelRunner):
         )
         moe_reclaimer = self._moe_workspace_reclaimer
         moe_scope = contextlib.nullcontext()
-        if moe_reclaimer is not None and (not is_dummy or self._is_warmup):
-            moe_scope = moe_reclaimer.forward(
-                warmup=self._is_warmup, num_tokens=metadata.num_tokens
-            )
+        if moe_reclaimer is not None:
+            moe_scope = moe_reclaimer.forward(warmup=is_dummy, num_tokens=metadata.num_tokens)
         with reclaim_scope, moe_scope:
             return self._model_caller(**kwargs)
 

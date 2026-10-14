@@ -793,7 +793,10 @@ The `XXFusedMoE` names remain supported as module-level aliases — `DeepGemmFus
 ### CUTLASS eager scratch reclamation
 
 The scheduled decoder engine supplies a `CutlassWorkspaceReclaimer` scope around
-one complete model forward, including warmup. The Python scope enters and exits
+one complete model forward, including warmup. Each decoder runner keeps one
+reclaimer for its lifetime, including repeated warmups. Dummy forwards, including
+KV-capacity profiling, enter the scope as warmup and contribute to its capacity floor.
+The Python scope enters and exits
 a native `EagerMoeWorkspaceScope`; inference calls discover runners directly in
 C++, after autotuning, without per-layer Python registration or stream queries.
 The native scope retains each runner and groups calls by runner/device/stream.
