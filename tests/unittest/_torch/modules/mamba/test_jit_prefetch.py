@@ -248,6 +248,31 @@ def test_background_enumeration_reruns_only_warmup_recorded_providers(monkeypatc
     assert sorted(runs) == ["recorded", "recorded", "static"]
 
 
+@pytest.mark.usefixtures("restore_triton_hooks")
+def test_cute_dsl_load_waits_for_a_helper_only_while_serving(tmp_path, monkeypatch):
+    """Warmup never waits for a CuTe DSL helper: a variant not exported yet
+    is compiled as without prefetch. The serving thread waits for an
+    in-flight helper compile instead of compiling it again."""
+    import queue
+    import threading
+
+    from tensorrt_llm._torch import jit_prefetch_cute_dsl as jcd
+
+    monkeypatch.setenv("TLLM_JIT_PREFETCH", "1")
+    monkeypatch.setattr(jp.JitPrefetcher, "_start_helpers", lambda self: None)
+    monkeypatch.setattr(jcd, "load", lambda spec, out_dir: None)
+    p = jp.JitPrefetcher(rank=0)
+    p._cd_dir = str(tmp_path)
+    p._queues[jcd.KIND] = queue.PriorityQueue()
+    assert p._submit("spec", "spec", "cute_dsl", jp._PRIO_ENUM, kind=jcd.KIND)
+    assert p._cute_dsl_load("spec") is None  # warmup: no executor thread yet
+    assert p.stats.wait_n == 0
+    p.bind_executor_thread()
+    threading.Timer(0.05, p._key_event["spec"].set).start()
+    p._cute_dsl_load("spec")
+    assert p.stats.wait_n == 1
+
+
 def test_helper_preload_then_compile(tmp_path):
     """A helper given a preload request imports the module then still
     compiles that module's kernels (preload sends no reply)."""

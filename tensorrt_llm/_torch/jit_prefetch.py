@@ -790,11 +790,20 @@ class JitPrefetcher:
 
     def _cute_dsl_load(self, spec: str):
         """Executor side: the helper-exported kernel for ``spec``, waiting for
-        a helper compile of it already in flight; None to compile in place."""
+        a helper compile of it already in flight; None to compile in place.
+
+        Only the serving thread waits. Before serving starts (the final
+        executor's warmup), a variant not yet exported is resolved as it would
+        be without prefetch: the caller's own cache, which already holds what
+        the first warmup compiled, or an in-place compile.
+        """
         from . import jit_prefetch_cute_dsl as jcd
 
+        serving = (
+            self._executor_thread is not None and threading.get_ident() == self._executor_thread
+        )
         ev = self._key_event.get(spec)
-        if ev is not None and not ev.is_set():
+        if serving and ev is not None and not ev.is_set():
             self._submit(spec, spec, "cute_dsl", _PRIO_URGENT, kind=jcd.KIND)
             wait_timeout_s = float(os.environ.get("TLLM_JIT_PREFETCH_WAIT_TIMEOUT_S", "300"))
             t0 = time.perf_counter()
@@ -817,8 +826,9 @@ class JitPrefetcher:
 
         Helpers compile from fake tensors for this rank's arch and export
         ``<dir>/<key>.o``; at the point the KDA op would call ``cute.compile``
-        the loader loads that file instead, waiting for an in-flight helper
-        compile of the same variant rather than compiling it again.
+        the loader loads that file instead. On the serving thread it waits
+        for an in-flight helper compile of the same variant rather than
+        compiling it again (see ``_cute_dsl_load``).
         """
         from . import jit_prefetch_cute_dsl as jcd
         from .custom_ops import cute_dsl_kimi_k3_custom_ops as kda_ops
