@@ -80,3 +80,30 @@ def test_noaux_tc_run(seq_len, num_experts, n_group, topk_group, top_k, dtype):
     torch.testing.assert_close(
         sorted_selected_values, ref_sorted_selected_values, rtol=0.01, atol=0.01
     )
+
+
+@pytest.mark.parametrize(
+    "num_experts, n_group, topk_group, top_k",
+    [
+        (72, 1, 1, 6),
+        (256, 8, 4, 8),
+    ],
+)
+def test_noaux_tc_zero_tokens(num_experts, n_group, topk_group, top_k):
+    """No tokens: empty outputs, and no launch error left for the next call."""
+    torch.manual_seed(24)
+    scores = torch.randn((8, num_experts), dtype=torch.bfloat16, device="cuda")
+    bias = torch.randn((num_experts,), dtype=torch.float32, device="cuda")
+    args = (n_group, topk_group, top_k, 2.5)
+    ref_values, ref_indices = torch.ops.trtllm.noaux_tc_op(scores, bias, *args)
+
+    empty = torch.empty((0, num_experts), dtype=torch.bfloat16, device="cuda")
+    values, indices = torch.ops.trtllm.noaux_tc_op(empty, bias, *args)
+    assert values.shape == (0, top_k)
+    assert indices.shape == (0, top_k)
+
+    # A launch error left pending by the empty call is raised by the next kernel launch, here
+    # torch.equal's.
+    values, indices = torch.ops.trtllm.noaux_tc_op(scores, bias, *args)
+    assert torch.equal(values, ref_values)
+    assert torch.equal(indices, ref_indices)
