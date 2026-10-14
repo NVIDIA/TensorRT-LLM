@@ -149,8 +149,9 @@ modes.
   * Top-P decay is not supported in combination with beam search or with speculative decoding
     modes that route draft tokens through the Torch Sampler; such requests are rejected.
 
-* Positive Min-P is not supported in combination with one-model speculative decoding. Such
-  requests are rejected at admission.
+* Positive Min-P is supported with one-model speculative decoding under the default
+  `advanced_sampling_mode: full`; the `no_*` specializations reject such requests at
+  admission (see [Advanced sampling mode](#advanced-sampling-mode-speculative-decoding)).
 
 * Occurrence penalties are supported: `repetition_penalty`, `presence_penalty` and
   `frequency_penalty` discourage (or encourage) the model from reusing tokens it has
@@ -185,7 +186,7 @@ modes.
     with `enable_penalty: true` in the speculative decoding config, because they need
     an occurrence workspace that is allocated up front. While the flag is off, a
     request that sets any of the three is rejected at admission rather than decoded
-    without them. Tree speculation (`eagle_choices` or a dynamic tree) is not
+    without them. Tree speculation (a dynamic tree) is not
     supported and such requests are rejected even when the flag is on. Only the
     target distribution is penalized; the draft model proposes from its unpenalized
     distribution, which leaves the sampled result unchanged but can lower the
@@ -197,13 +198,14 @@ modes.
 
 ### Performance
 
-The Torch Sampler leverages the optimized sampling kernels provided by
-[FlashInfer](https://docs.flashinfer.ai/api/sampling.html), which is a required
-dependency for the Torch Sampler. The sampler also uses the
-[sorting-free implementations](https://flashinfer.ai/2025/03/10/sampling.html)
-whenever possible. This optimization does not compute the complete set of token sampling probabilities
-(after top-k / top-p masking etc.), which typically can be omitted unless requested by the user or
-required for speculative decoding (rejection sampling).
+The Torch Sampler samples every non-greedy strategy (temperature, top-k, top-p, min-p and their
+combinations) with one fused kernel, which applies all the filters in a single launch and takes
+the sampling parameters and the random seed and offset per row. A seeded request's random stream
+therefore depends only on its own seed and how far it has decoded, not on where it sits in the
+batch. The sampled tokens can still differ across batch sizes, because the kernel picks its
+algorithm by the number of rows. The kernel computes the complete set of token sampling
+probabilities (after top-k / top-p masking etc.) only when the user requests them or speculative
+decoding (rejection sampling) requires them.
 
 Moreover, Torch Sampler internally batches requests with compatible sampling parameters. This
 can greatly reduce the overall latency of the sampling step when request batches are comprised
@@ -222,12 +224,18 @@ speculative config) lets you skip those redundant kernels for a fixed deploy
 config. The output is identical to `FULL` whenever the skipped filter is already
 disabled, so this is a lossless throughput optimization for advanced use cases:
 
-| Mode | `top_k` kernel | `top_p` kernel |
-|---|---|---|
-| `full` (default) | applied | applied |
-| `no_topk` | **skipped** | applied |
-| `no_topp` | applied | **skipped** |
-| `no_topk_no_topp` | **skipped** | **skipped** |
+| Mode | `top_k` kernel | `top_p` kernel | `min_p` kernel |
+|---|---|---|---|
+| `full` (default) | applied | applied | applied |
+| `no_topk` | **skipped** | applied | **rejected** |
+| `no_topp` | applied | **skipped** | **rejected** |
+| `no_topk_no_topp` | **skipped** | **skipped** | **rejected** |
+
+`full` applies all three in one fused kernel, which is why it is the only mode that takes
+`min_p`; the others have no `min_p` input, so such a request is **rejected at admission**
+rather than skipped like a disabled `top_k` or `top_p`. That kernel also skips a filter a
+request left at its neutral value, so the `no_*` modes save work only for requests that
+wanted the filter anyway.
 
 Notes:
 

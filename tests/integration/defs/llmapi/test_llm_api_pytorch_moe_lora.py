@@ -44,7 +44,10 @@ from ..conftest import llm_models_root
 # thread-leak check is disabled as for the other LLM-API integration tests.
 pytestmark = [pytest.mark.threadleak(enabled=False)]
 
-_KV_CACHE_CONFIG = KvCacheConfig(free_gpu_memory_fraction=0.4)
+# Block reuse off: with it on, the first call prefills the whole prompt and
+# later ones prefill a single token, which is a different forward with a
+# different result. Off, every call measures the same thing.
+_KV_CACHE_CONFIG = KvCacheConfig(free_gpu_memory_fraction=0.4, enable_block_reuse=False)
 
 # Adapters of varying rank; max_lora_rank must cover the largest.
 _RANKS = [8, 16, 32, 16, 64]
@@ -108,26 +111,38 @@ def _write_routed_expert_lora_adapter(
 
 def _run_routed_expert_multi_lora(
     model_dir: str,
-    lora_paths: list,
+    lora_paths: list[str],
     *,
     max_rank: int,
-    target_modules: list,
-    trtllm_modules_to_hf_modules: dict,
-    cuda_graph_config,
+    target_modules: list[str],
+    trtllm_modules_to_hf_modules: dict[str, str],
+    cuda_graph_config: CudaGraphConfig | None,
     preallocate_all_adapters: bool = True,
-    peft_cache_config=None,
+    peft_cache_config: PeftCacheConfig | None = None,
 ) -> None:
     """Serve a MoE checkpoint with routed-expert LoRA and assert it applies.
 
-    The batch mixes two no-LoRA (rank-0) requests with every adapter, asserting
-    each adapter moves the logits away from the no-LoRA rows of that same batch
-    and that no two adapters land on the same value. Comparisons stay within one
-    batch because batch width and first-call effects each shift the logits on
-    their own; the second no-LoRA row measures that batch's own noise floor, so
-    the thresholds are checked against the run rather than trusted from a past
-    calibration. With a CUDA graph the decode takes the slot-indexed input
-    schema; without one it takes the per-request schema. Both feed the same
-    grouped-GEMM LoRA core.
+    Each measured request runs in its own call, asserting that every adapter
+    moves its logprob sequence away from the no-LoRA sequence and that no two
+    adapters produce the same sequence. One request per call because the
+    routed-expert GEMM selects its tactic from the token count of the forward
+    pass: rows sharing a batch with different neighbours get different -- by
+    design -- results, which no threshold can be set below. With a CUDA graph the
+    decode takes the slot-indexed input schema; without one it takes the
+    per-request schema. Both feed the same grouped-GEMM LoRA core.
+
+    Args:
+        model_dir: Path to the base model checkpoint.
+        lora_paths: Paths to routed-expert LoRA adapters.
+        max_rank: Maximum adapter rank accepted by the cache.
+        target_modules: TensorRT-LLM LoRA module names to enable.
+        trtllm_modules_to_hf_modules: TensorRT-LLM to Hugging Face module mapping.
+        cuda_graph_config: CUDA graph configuration, or None for eager execution.
+        preallocate_all_adapters: Whether to reserve every adapter slot up front.
+        peft_cache_config: Optional explicit PEFT cache configuration.
+
+    Returns:
+        None.
     """
     cache_config = {}
     if preallocate_all_adapters:
@@ -151,11 +166,6 @@ def _run_routed_expert_multi_lora(
         peft_cache_config=peft_cache_config,
     )
     try:
-        # Logprobs, not just greedy tokens: a randomly fabricated adapter can
-        # shift every logit without crossing an argmax boundary, so an adapter
-        # that demonstrably ran would look "not applied" under token equality.
-        # logprobs=0 in simple format yields one float per token -- the sampled
-        # token's logprob.
         sampling_params = SamplingParams(
             max_tokens=20,
             temperature=0.0,
@@ -164,68 +174,67 @@ def _run_routed_expert_multi_lora(
         )
         prompt = "What is your name?"
 
-        # Batch width, and whether a call is the engine's first, both shift the
-        # logits by ~7e-2 on this model, so no run outside this batch is a valid
-        # baseline. Compare rows *within* one mixed batch instead: the no-LoRA
-        # row is the base-model reference, and every row's first decode step runs
-        # at the same position on the same prompt, so their logprobs are directly
-        # comparable. The threshold sits between the two measured scales -- the
-        # weakest of these adapters moves the logprob by ~2e-2, while equivalent
-        # rows agree to <=1e-3 -- so it is ~4x below real signal and ~5x above
-        # noise. Adapters are fabricated with a fixed seed, so those margins are
+        def logprobs_for(lora_request: LoRARequest | None) -> tuple[float, ...]:
+            """Run one request on its own and return its per-step logprobs.
+
+            One request per call, so every prefill has the same token count.
+            The routed-expert GEMM selects its tactic from that count, so a
+            batch holding different rows would give a different -- by design --
+            answer; alone, the numbers are reproducible and comparable.
+            """
+            request_output = llm.generate([prompt], sampling_params, lora_request=lora_request)[0]
+            output = request_output.outputs[0]
+            assert output.token_ids, "Request produced no tokens."
+            return tuple(output.logprobs)
+
+        def max_divergence(a: tuple[float, ...], b: tuple[float, ...]) -> float:
+            """Largest per-step gap between two runs.
+
+            Every step, not just the first: one logprob is a single scalar,
+            and two unrelated adapters land near the same value often enough
+            for that alone to be a coin flip.
+            """
+            if len(a) != len(b):
+                return float("inf")
+            return max(abs(x - y) for x, y in zip(a, b))
+
+        base_logprobs = logprobs_for(None)
+
+        # Adapters are fabricated with a fixed seed, so these margins are
         # reproducible rather than incidental.
         min_adapter_delta = 5e-3
 
-        # Rows 0 and 1 are both no-LoRA; rows 2.. are one per adapter. Two
-        # baseline rows, not one, so the batch measures its own noise floor: every
-        # other assertion here is relative to the no-LoRA logprob, which makes that
-        # row the one thing nothing else can check. Two of them turn both failure
-        # modes into explicit, self-diagnosing errors -- a threshold that drifted
-        # after a kernel or sampler change, and an adapter leaking into a no-LoRA
-        # slot (which would move the baseline and quietly rescale every delta
-        # below).
-        requests = [None, None] + [
-            LoRARequest(f"moe-lora-{i}", i, path) for i, path in enumerate(lora_paths)
-        ]
-        outputs = [
-            o.outputs[0]
-            for o in llm.generate([prompt] * len(requests), sampling_params, lora_request=requests)
-        ]
-        for i, output in enumerate(outputs):
-            assert output.token_ids, f"Row {i} produced no tokens."
-
-        base_first_logprob = outputs[0].logprobs[0]
-        base_spread = abs(outputs[1].logprobs[0] - base_first_logprob)
+        base_spread = max_divergence(logprobs_for(None), base_logprobs)
         assert base_spread < min_adapter_delta / 4, (
-            f"The two no-LoRA rows disagree by {base_spread:.3e}, which is not far "
-            f"enough below min_adapter_delta={min_adapter_delta:.0e} for the "
-            "adapter checks to mean anything. Either the batch noise floor has "
-            "risen (retune min_adapter_delta against it) or an adapter is leaking "
-            "into a no-LoRA slot."
+            f"Two identical no-LoRA requests disagree by {base_spread:.3e}, which "
+            f"is not far enough below min_adapter_delta={min_adapter_delta:.0e} "
+            "for the adapter checks to mean anything. Either the batch noise "
+            "floor has risen (retune min_adapter_delta against it) or an adapter "
+            "is leaking into a no-LoRA slot."
         )
 
-        adapter_logprobs = [o.logprobs[0] for o in outputs[2:]]
+        adapter_logprobs = [
+            logprobs_for(LoRARequest(f"moe-lora-{i}", i, path)) for i, path in enumerate(lora_paths)
+        ]
+
         for i, adapter_logprob in enumerate(adapter_logprobs):
-            adapter_delta = abs(adapter_logprob - base_first_logprob)
+            adapter_delta = max_divergence(adapter_logprob, base_logprobs)
             assert adapter_delta > min_adapter_delta, (
                 f"Routed-expert MoE LoRA adapter {i} shifted the logits by only "
-                f"{adapter_delta:.3e} versus the no-LoRA row in the same batch "
+                f"{adapter_delta:.3e} versus the no-LoRA request "
                 f"(need > {min_adapter_delta:.0e}); it was not applied."
             )
 
         # Distinct adapters must not collapse onto one another: a slot-table bug
         # that pointed every token at one adapter's weights would still clear the
-        # per-adapter check above. Compare against a threshold rather than for
-        # exact inequality -- a confident greedy first token drives the sampled
-        # logprob toward 0.0, where two genuinely-applied adapters can round to the
-        # same representable value and fail this for no reason.
+        # per-adapter check above.
         for a in range(len(adapter_logprobs)):
             for b in range(a + 1, len(adapter_logprobs)):
-                separation = abs(adapter_logprobs[a] - adapter_logprobs[b])
+                separation = max_divergence(adapter_logprobs[a], adapter_logprobs[b])
                 assert separation > min_adapter_delta / 4, (
-                    f"Adapters {a} and {b} produced first-token logprobs "
-                    f"{adapter_logprobs[a]} vs {adapter_logprobs[b]} (apart by "
-                    f"{separation:.3e}); the slot tables likely collapsed onto one adapter."
+                    f"Adapters {a} and {b} never diverged by more than "
+                    f"{separation:.3e} at any step; the slot tables likely "
+                    "collapsed onto one adapter."
                 )
     finally:
         llm.shutdown()

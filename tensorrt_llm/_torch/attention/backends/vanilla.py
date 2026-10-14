@@ -8,7 +8,7 @@ import torch
 import torch.nn.functional as F
 
 from tensorrt_llm.models.modeling_utils import QuantConfig
-from tensorrt_llm.runtime.kv_cache_manager_v2._common import BAD_PAGE_INDEX
+from tensorrt_llm.runtime.kv_cache_manager_v2 import BAD_PAGE_INDEX
 
 try:
     from transformers.modeling_attn_mask_utils import AttentionMaskConverter

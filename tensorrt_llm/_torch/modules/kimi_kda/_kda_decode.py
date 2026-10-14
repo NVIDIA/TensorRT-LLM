@@ -85,7 +85,6 @@ def run_kda_decode_fusion_cuda(
     onorm_weight: torch.Tensor | None = None,
     out: torch.Tensor | None = None,
     ssm_state_indices: torch.Tensor | None = None,
-    cu_seqlens: torch.Tensor | None = None,
     scale: float = 128**-0.5,
     onorm_eps: float = 1e-5,
     lower_bound: float | None = None,
@@ -127,9 +126,9 @@ def run_kda_decode_fusion_cuda(
     HV = x_v.shape[2]
     if x_k.shape[1:3] != (B, H) or x_v.shape[1] != B:
         raise ValueError("x_q, x_k, and x_v batch/head dimensions are inconsistent")
-    if H != HV or H not in (1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 96):
+    if H != HV or H not in (1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96):
         raise ValueError(
-            "CUDA KDA decode fusion supports H == HV in {1,2,3,4,6,8,12,16,24,32,48,96}"
+            "CUDA KDA decode fusion supports H == HV in {1,2,3,4,6,8,12,16,24,32,48,64,96}"
         )
     if ssm_state_indices is None and not state.is_contiguous():
         raise ValueError("state must be contiguous because it is updated in place")
@@ -186,15 +185,6 @@ def run_kda_decode_fusion_cuda(
                 "[slots, 3 * dim, width] conv states"
             )
 
-    if cu_seqlens is None:
-        cu_seqlens = torch.arange(B + 1, dtype=torch.int32, device=device)
-    else:
-        if not cu_seqlens.is_cuda or cu_seqlens.dtype is not torch.int32:
-            raise TypeError("cu_seqlens must be a CUDA int32 tensor")
-        if tuple(cu_seqlens.shape) != (B + 1,):
-            raise ValueError("cu_seqlens must have shape [B + 1]")
-        cu_seqlens = cu_seqlens.contiguous()
-
     args = (
         _as_token_rows(x_q),
         _as_token_rows(x_k),
@@ -215,7 +205,6 @@ def run_kda_decode_fusion_cuda(
         _as_token_rows(onorm_g),
         onorm_weight.contiguous(),
         ssm_state_indices,
-        cu_seqlens,
         state,
     )
 

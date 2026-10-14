@@ -83,7 +83,7 @@ The calculations for metrics reported by trtllm-bench can be found in the datacl
 
 ---
 
-<a id="deepseek-r1-0528"></a>
+(deepseek-r1-0528)=
 
 # Deepseek R1 0528
 
@@ -99,7 +99,7 @@ unit: `output tokens per second per GPU`
 
 ---
 
-<a id="gpt-oss-120b"></a>
+(gpt-oss-120b)=
 
 # GPT-OSS 120B
 
@@ -116,7 +116,7 @@ unit: `output tokens per second per GPU`
 
 ---
 
-<a id="gpt-oss-20b"></a>
+(gpt-oss-20b)=
 
 # GPT-OSS 20B
 
@@ -133,7 +133,7 @@ unit: `output tokens per second per GPU`
 
 ---
 
-<a id="llama-v33-70b"></a>
+(llama-v33-70b)=
 
 # LLaMA v3.3 70B
 
@@ -149,7 +149,7 @@ unit: `output tokens per second per GPU`
 
 ---
 
-<a id="llama-v33-70b-rtx-configurations"></a>
+(llama-v33-70b-rtx-configurations)=
 
 # LLaMA v3.3 70B - RTX 6000 Pro Blackwell Server Edition
 
@@ -166,7 +166,7 @@ unit: `output tokens per second per GPU`
 
 ---
 
-<a id="llama-v4-maverick"></a>
+(llama-v4-maverick)=
 
 # LLaMA v4 Maverick
 
@@ -183,7 +183,7 @@ unit: `output tokens per second per GPU`
 
 ---
 
-<a id="qwen3-235b-a22b"></a>
+(qwen3-235b-a22b)=
 
 # Qwen3 235B A22B
 
@@ -200,7 +200,7 @@ unit: `output tokens per second per GPU`
 
 ---
 
-<a id="qwen3-235b-a22b-rtx-configurations"></a>
+(qwen3-235b-a22b-rtx-configurations)=
 
 # Qwen3 235B A22B - RTX 6000 Pro Blackwell Server Edition
 
@@ -217,7 +217,7 @@ unit: `output tokens per second per GPU`
 
 ---
 
-<a id="qwen3-30b-a3b"></a>
+(qwen3-30b-a3b)=
 
 # Qwen3 30B A3B
 
@@ -234,7 +234,7 @@ unit: `output tokens per second per GPU`
 
 ---
 
-<a id="qwen3-30b-a3b-rtx-configurations"></a>
+(qwen3-30b-a3b-rtx-configurations)=
 
 # Qwen3 30B A3B - RTX 6000 Pro Blackwell Server Edition
 

@@ -75,8 +75,6 @@ should make) when:
 - Implementation touches `cpp/` (C++/CUDA/header) without rebuild
   evidence, or CMake without clean rebuild evidence, or rebuild evidence
   but validation used a stale wheel.
-- Implementation touches `auto_deploy/` or `tests/.../auto_deploy/`.
-  These paths are out of scope for modeling bring-up.
 - Reference tests use local `transformers` shims, monkeypatches, or
   environment-installed `transformers` imports as pass evidence instead
   of copying the minimal HF/vLLM semantics into local helpers.
@@ -124,7 +122,7 @@ state machine; you are the authoritative writer.
 
 Every turn:
 
-1. Call `read_status` and parse the `## Stages & Goals` block.
+1. Read `status.md` and parse the `## Stages & Goals` block.
    Identify the single `[Doing]` Goal in the active `— IN_PROGRESS`
    Stage. There is at most one `[Doing]` Goal at any time. You may
    also see `— INTERRUPTED` Stages and `[Skipped]` Goals: those are
@@ -140,8 +138,8 @@ Every turn:
    themselves gate Stage closure; the gate is your endorsement of
    the Coder's terminal conclusion (Done or Failed) for the last
    Goal — see the decision table and APPROVE gate below.
-3. Call `read_latest_progress` (`agent: "coder"`) to see what the
-   Coder claims for this turn.
+3. Take in the Coder's latest progress entry to see what they
+   claim for this turn.
 4. Build / run / inspect the change as the base prompt describes,
    then make the state-machine decision below.
 
@@ -158,8 +156,8 @@ Every turn:
 ### `(iterations=N)` counter
 
 - You own the counter. On a Goal that stays `[Doing]` across your
-  REJECT, increment N by 1 in the table you write back via
-  `update_status`. The Coder is told **not** to bump it; you are the
+  REJECT, increment N by 1 in the table you write back into
+  `status.md`. The Coder is told **not** to bump it; you are the
   only writer of the count.
 - On Goal promotion (Done → next Goal, Failed → next Goal), the new
   `[Doing]` Goal starts with `(iterations=0)`.
@@ -170,7 +168,7 @@ Every turn:
 
 Mark a Goal `[Failed]` only when **both** conditions hold:
 
-1. The Coder's most recent `append_coder_progress` summary contains
+1. The Coder's most recent progress-entry summary contains
    a line starting `BLOCKER:` plus a rationale paragraph that names
    the specific acceptance item(s) under the active Goal that are
    unreachable and lists every approach the Coder tried for those
@@ -226,7 +224,7 @@ inserts a gap-fix Stage right after the failing CLOSED Stage (see
 
 ### The mandatory `Stage closed: Stage <N>` summary line
 
-When (and only when) you APPROVE, your `append_reviewer_progress`
+When (and only when) you APPROVE, your progress-entry
 `summary` must contain a single line of the exact form:
 
 ```

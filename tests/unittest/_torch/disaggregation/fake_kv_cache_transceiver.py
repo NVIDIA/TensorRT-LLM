@@ -49,9 +49,13 @@ class FakeKvCacheTransceiver(KvCacheTransceiver):
         self,
         kv_transfer_timeout_ms: Optional[int] = None,
         supports_inflight_cancellation: bool = False,
+        consumes_transfer_buffer: bool = True,
     ) -> None:
         self.kv_transfer_timeout_ms = kv_transfer_timeout_ms
         self._supports_inflight_cancellation = supports_inflight_cancellation
+        # C++-style transceivers consume the CacheTransBuffer budget; the
+        # asynchronous Python transceiver does not.
+        self._consumes_transfer_buffer = consumes_transfer_buffer
         self._pending_sends: Dict[int, LlmRequest] = {}
         self._pending_recvs: Dict[int, LlmRequest] = {}
         # rid -> outcome, consumed by the next check_*_transfer_status call.
@@ -100,6 +104,10 @@ class FakeKvCacheTransceiver(KvCacheTransceiver):
         self._sync_recv_outcomes[req.py_request_id] = outcome
 
     # -- KvCacheTransceiver contract -----------------------------------------
+
+    @property
+    def consumes_transfer_buffer(self) -> bool:
+        return self._consumes_transfer_buffer
 
     def respond_and_send_async(self, req: LlmRequest) -> None:
         self._assert_alive("respond_and_send_async")
@@ -196,8 +204,19 @@ class FakeKvCacheTransceiver(KvCacheTransceiver):
 
     def prepare_context_requests(self, requests: List[LlmRequest]) -> None:
         # Mirror BindKvCacheTransceiver: a no-op placeholder so the executor
-        # can invoke it unconditionally.
-        ...
+        # can invoke it unconditionally. Logged so tests can pin that it is
+        # entered every iteration, with or without requests.
+        self.call_log.append(f"prepare_context_requests:{[req.py_request_id for req in requests]}")
+
+    def commit_blocks_for_reuse(self, req: LlmRequest) -> None:
+        self._assert_alive("commit_blocks_for_reuse")
+        # The reuse adapter behind the real transceivers requires the position
+        # to be at the prompt end when the blocks are committed.
+        assert req.context_current_position == req.prompt_len, (
+            f"commit_blocks_for_reuse for request {req.py_request_id} before "
+            "context_current_position was set to prompt_len"
+        )
+        self.call_log.append(f"commit_blocks_for_reuse:{req.py_request_id}")
 
     def get_disaggregated_params(self) -> Dict[str, object]:
         return {}

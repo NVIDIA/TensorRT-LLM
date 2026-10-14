@@ -134,6 +134,7 @@ class _FmhaCacheKey(NamedTuple):
     generation_seq_len_q: int
     attention_mask_type: AttentionMaskType
     use_spec_decoding: bool
+    has_block_sparse_inputs: bool
     # LoRA can change the effective output from packed NVFP4 to unpacked BF16
     # without changing the request shape. Keep those selection regimes apart.
     output_dtype: torch.dtype | None
@@ -366,12 +367,14 @@ class FmhaManager:
                 generation_seq_len_q, _FMHA_CACHE_SEQ_LEN_Q_GRID
             )
 
+        block_sparse_inputs = forward_args.sparse_runtime_params.block_sparse_inputs
         return _FmhaCacheKey(
             context_batch_size=context_batch_size,
             generation_batch_size=generation_batch_size,
             generation_seq_len_q=generation_seq_len_q,
             attention_mask_type=attention_mask_type,
             use_spec_decoding=metadata.use_spec_decoding,
+            has_block_sparse_inputs=block_sparse_inputs is not None,
             output_dtype=output_dtype,
             output_sf_dtype=output_sf_dtype,
         )

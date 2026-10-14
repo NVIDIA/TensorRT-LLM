@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import gc
 import os
 import sys
@@ -23,7 +38,8 @@ from .base_worker import BaseWorker, _init_hf_modules
 from .ipc import FusedIpcQueue, IpcQueue
 from .postproc_worker import (PostprocWorker, PostprocWorkerConfig,
                               postproc_worker_main)
-from .request import CancellingRequest, GenerationRequest
+from .request import (CancellingRequest, GenerationRequest, StartProfileRequest,
+                      StopProfileRequest)
 from .rpc_worker_mixin import RpcWorkerMixin
 from .utils import (ErrorResponse, IntraProcessQueue, RequestError,
                     WorkerCommIpcAddrs)
@@ -67,6 +83,7 @@ class GenerationExecutorWorker(RpcWorkerMixin, BaseWorker):
             tokenizer=tokenizer,
             llm_args=llm_args,
         )
+        self.rpc_server = None
 
         if (self.llm_args is not None
                 and getattr(self.llm_args, "enable_resource_governor", False)):
@@ -86,6 +103,33 @@ class GenerationExecutorWorker(RpcWorkerMixin, BaseWorker):
             self.await_response_task,
             error_queue=self._error_queue,
             name="await_response_thread")
+
+    def collective_rpc(
+        self,
+        method: str,
+        args: tuple = (),
+        kwargs: Optional[dict] = None,
+        non_block: bool = False,
+        unique_reply_rank: Optional[int] = None,
+        target_ranks: int | list[int] | None = None,
+    ) -> list:
+        """Call a worker method directly and return its result in a list.
+
+        Only blocking calls without rank selection are supported. Runtime-memory
+        methods coordinate multi-rank execution internally; other methods require
+        a single-rank deployment, as with the MPI proxy dispatchers.
+        """
+        from .proxy import _check_collective_rpc_guard
+
+        _check_collective_rpc_guard(self.llm_args.parallel_config.world_size,
+                                    unique_reply_rank,
+                                    target_ranks,
+                                    method=method)
+        if non_block:
+            raise NotImplementedError(
+                "GenerationExecutorWorker collective_rpc only supports blocking calls."
+            )
+        return [getattr(self, method)(*args, **(kwargs or {}))]
 
     def start_thread(self, thread: ManagedThread):
         if not self.engine.can_enqueue_requests():
@@ -118,6 +162,12 @@ class GenerationExecutorWorker(RpcWorkerMixin, BaseWorker):
             self.doing_shutdown = True
 
         logger_debug(f'Worker {mpi_rank()} shutdown...\n', "yellow")
+
+        # The server references this worker; a long-lived worker process would
+        # otherwise keep one server, its threads and sockets per LLM it hosted.
+        if self.rpc_server is not None:
+            self.rpc_server.shutdown()
+            self.rpc_server = None
 
         if self.engine is not None:
             if self.engine.can_enqueue_requests():
@@ -284,6 +334,23 @@ def worker_main(
             is_server=False,
             name="worker_resource_governor_queue"
         ) if worker_queues.resource_governor_queue_addr else None
+        # Synchronous ack channel back to the proxy for control requests
+        # (start_profile / stop_profile). Connected on first use rather
+        # than at startup: the proxy only binds its end when profiling is
+        # actually requested, and it passes the address on the request,
+        # so a deployment that never profiles never creates this socket.
+        profile_ack_queue = None
+
+        def send_profile_ack(kind: str, err, req) -> None:
+            nonlocal profile_ack_queue
+            addr = getattr(req, "ack_addr", None)
+            if addr is None:
+                return
+            if profile_ack_queue is None:
+                profile_ack_queue = IpcQueue(addr,
+                                             is_server=False,
+                                             name="worker_profile_ack_queue")
+            profile_ack_queue.put((kind, err))
 
         if postproc_worker_config.enabled:
             # IPC queues for sending inputs to the postprocess parallel
@@ -404,6 +471,11 @@ def worker_main(
     # Optionally disable GC (default: not disabled)
     if os.getenv("TRTLLM_WORKER_DISABLE_GC", "0") == "1":
         gc.disable()
+        # With automatic GC off, dynamo's post-compile gc.collect(1) walks every
+        # object allocated since the previous compile (seconds per recompile).
+        if "TORCH_DYNAMO_RUN_GC_AFTER_COMPILE" not in os.environ:
+            import torch._dynamo.config
+            torch._dynamo.config.run_gc_after_compile = False
 
     with worker:
         try:
@@ -433,6 +505,37 @@ def worker_main(
                 while (req := request_queue.get()) is not None:
                     if isinstance(req, CancellingRequest):
                         worker.abort_request(req.id)
+                    elif isinstance(req, StartProfileRequest):
+                        # ``PyExecutor.start_profile`` raises
+                        # ``RequestError`` on the double-start path.
+                        # Capture it and propagate back to the proxy via
+                        # ``profile_ack_queue`` so the HTTP /start_profile
+                        # handler can return 409 in the IPC-proxy
+                        # deployment too.
+                        ack_err: Optional[str] = None
+                        try:
+                            worker.start_profile(output_dir=req.output_dir,
+                                                 num_steps=req.num_steps,
+                                                 start_step=req.start_step,
+                                                 activities=req.activities)
+                        except RequestError as e:
+                            logger.warning(f"start_profile rejected: {e}")
+                            ack_err = str(e)
+                        send_profile_ack("start", ack_err, req)
+                    elif isinstance(req, StopProfileRequest):
+                        # ``worker.stop_profile`` blocks until
+                        # ``PyExecutor.stop_profile`` has actually fired
+                        # the in-loop stop and exported the chrome trace
+                        # (or its 30s timeout elapsed). Acking only after
+                        # that return is what gives the proxy its
+                        # synchronous "trace is on disk" guarantee.
+                        ack_err = None
+                        try:
+                            worker.stop_profile()
+                        except RequestError as e:
+                            logger.warning(f"stop_profile rejected: {e}")
+                            ack_err = str(e)
+                        send_profile_ack("stop", ack_err, req)
                     elif isinstance(req, GenerationRequest):
                         try:
                             worker.submit(req)

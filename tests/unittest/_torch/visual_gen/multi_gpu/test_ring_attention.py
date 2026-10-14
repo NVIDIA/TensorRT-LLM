@@ -41,19 +41,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributed.device_mesh import init_device_mesh
 
-try:
-    from tensorrt_llm._torch.attention.backends.interface import PredefinedAttentionMask
-    from tensorrt_llm._torch.visual_gen.attention_backend import RingAttention, UlyssesAttention
-    from tensorrt_llm._torch.visual_gen.attention_backend.flash_attn4 import FlashAttn4Attention
-    from tensorrt_llm._torch.visual_gen.attention_backend.flash_attn4 import (
-        _flash_attn_fwd as _fa4_fwd,
-    )
-    from tensorrt_llm._torch.visual_gen.attention_backend.interface import AttentionTensorLayout
-
-    MODULES_AVAILABLE = True
-except ImportError:
-    MODULES_AVAILABLE = False
-    _fa4_fwd = None
+from tensorrt_llm._torch.attention.backends.interface import PredefinedAttentionMask
+from tensorrt_llm._torch.visual_gen.attention.backends import RingAttention, UlyssesAttention
+from tensorrt_llm._torch.visual_gen.attention.backends.flash_attn4 import FlashAttn4Attention
+from tensorrt_llm._torch.visual_gen.attention.backends.flash_attn4 import (
+    _flash_attn_fwd as _fa4_fwd,
+)
+from tensorrt_llm._torch.visual_gen.attention.backends.interface import AttentionTensorLayout
 
 _flash_attn4_available = _fa4_fwd is not None
 
@@ -115,7 +109,7 @@ class _LSEVanillaAttention(nn.Module):
 
 
 def _init_worker(rank: int, world_size: int, backend: str, port: int):
-    os.environ["MASTER_ADDR"] = "localhost"
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = str(port)
     if backend == "nccl" and torch.cuda.is_available():
         torch.cuda.set_device(rank % torch.cuda.device_count())
@@ -141,8 +135,6 @@ def _distributed_worker(rank, world_size, backend, test_fn, port):
 
 
 def run_test_in_distributed(world_size: int, test_fn: Callable, use_cuda: bool = True):
-    if not MODULES_AVAILABLE:
-        pytest.skip("Required modules not available")
     if use_cuda and torch.cuda.device_count() < world_size:
         pytest.skip(f"Test requires {world_size} GPUs, only {torch.cuda.device_count()} available")
 

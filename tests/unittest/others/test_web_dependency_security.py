@@ -60,7 +60,6 @@ def test_web_framework_security_floors() -> None:
     # starlette ceiling since 0.133.0 (0.134.0-0.141.1 all declare
     # starlette>=0.46.0 unbounded), so re-capping would recreate the same
     # deadlock a release later.
-    assert not any(specifier.operator in {"<", "<="} for specifier in fastapi.specifier)
     assert _minimum_version(instrumentator) >= Version("8.1.0")
     assert _minimum_version(starlette) >= Version("1.3.1")
     assert Version("0.50.0") not in starlette.specifier

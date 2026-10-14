@@ -38,17 +38,12 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch.nn.functional as F
 
-try:
-    from tensorrt_llm._torch.device_mesh import DeviceMeshTopologyImpl
-    from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
-    from tensorrt_llm._torch.visual_gen.mapping import VisualGenMapping
-    from tensorrt_llm._torch.visual_gen.modules.attention import Attention, QKVMode
-    from tensorrt_llm.mapping import Mapping
-    from tensorrt_llm.visual_gen.args import AttentionConfig
-
-    MODULES_AVAILABLE = True
-except ImportError:
-    MODULES_AVAILABLE = False
+from tensorrt_llm._torch.device_mesh import DeviceMeshTopologyImpl
+from tensorrt_llm._torch.visual_gen.attention.attention import Attention, QKVMode
+from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
+from tensorrt_llm._torch.visual_gen.mapping import VisualGenMapping
+from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.visual_gen.args import AttentionConfig
 
 
 @pytest.fixture(autouse=True, scope="module")
@@ -63,7 +58,7 @@ def _cleanup_mpi_env():
 
 
 def _init_worker(rank: int, world_size: int, port: int):
-    os.environ["MASTER_ADDR"] = "localhost"
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = str(port)
     os.environ["RANK"] = str(rank)
     os.environ["WORLD_SIZE"] = str(world_size)
@@ -88,8 +83,6 @@ def _distributed_worker(rank, world_size, test_fn, port, *args):
 
 
 def _run(world_size: int, test_fn: Callable, *args):
-    if not MODULES_AVAILABLE:
-        pytest.skip("Required modules not available")
     if torch.cuda.device_count() < world_size:
         pytest.skip(f"Need {world_size} GPUs, have {torch.cuda.device_count()}")
     # Spawn distributed workers via a helper that retries with a fresh master

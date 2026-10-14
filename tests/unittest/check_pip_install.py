@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import argparse
 import os
 import subprocess
@@ -57,7 +72,8 @@ def verify_license_files():
         'import json; print(json.dumps(files))"',
         shell=True,
         capture_output=True,
-        text=True)
+        text=True,
+        timeout=60)
 
     if result.returncode != 0:
         print(f"ERROR: License files check failed!")
@@ -98,6 +114,73 @@ def verify_license_files():
 
     verified_files = required_files + found_attributions
     print(f"✓ License files verified: {', '.join(verified_files)}")
+
+
+def verify_openengine_distribution() -> None:
+    """Verify the installed wheel's OpenEngine metadata and static payload."""
+    from importlib.metadata import distribution
+
+    from packaging.requirements import Requirement
+    from packaging.utils import canonicalize_name
+
+    dist = distribution("tensorrt_llm")
+    provided_extras = set(dist.metadata.get_all("Provides-Extra") or ())
+    expected_requirements = {"grpc-smg": Requirement("smg-grpc-proto>=0.4.2")}
+    missing_extras = {"grpc-smg", "openengine"} - provided_extras
+    if missing_extras:
+        raise RuntimeError("Missing TensorRT-LLM wheel extras: " +
+                           ", ".join(sorted(missing_extras)))
+
+    requirements = [Requirement(raw) for raw in (dist.requires or ())]
+    for extra, expected in expected_requirements.items():
+        declared = any(
+            canonicalize_name(requirement.name) == canonicalize_name(
+                expected.name) and requirement.specifier == expected.specifier
+            and requirement.marker is not None
+            and requirement.marker.evaluate({"extra": extra})
+            for requirement in requirements)
+        if not declared:
+            raise RuntimeError(
+                f"Wheel extra {extra!r} does not declare {expected}")
+
+    expected_grpc = Requirement("grpcio>=1.67.1,<2")
+    grpc_declared = any(
+        canonicalize_name(requirement.name) == canonicalize_name(
+            expected_grpc.name) and requirement.specifier ==
+        expected_grpc.specifier and requirement.marker is None
+        for requirement in requirements)
+    if not grpc_declared:
+        raise RuntimeError(
+            f"TensorRT-LLM does not declare base requirement {expected_grpc}")
+
+    proto_names = (
+        "error",
+        "generation",
+        "kv",
+        "lifecycle",
+        "lora",
+        "model",
+        "openengine",
+        "server",
+    )
+    expected_files = {
+        "tensorrt_llm/grpc/openengine/_generated/__init__.py",
+        *(f"tensorrt_llm/grpc/openengine/_generated/{name}_pb2.py"
+          for name in proto_names),
+        *(f"tensorrt_llm/grpc/openengine/_generated/{name}_pb2.pyi"
+          for name in proto_names),
+        "tensorrt_llm/grpc/openengine/_generated/openengine_pb2_grpc.py",
+        "tensorrt_llm/grpc/openengine/proto/manifest.json",
+        *(f"tensorrt_llm/grpc/openengine/proto/openengine/v1/{name}.proto"
+          for name in proto_names),
+    }
+    installed_files = {str(path) for path in (dist.files or ())}
+    missing_files = expected_files - installed_files
+    if missing_files:
+        raise RuntimeError("Missing OpenEngine wheel files: " +
+                           ", ".join(sorted(missing_files)))
+
+    print("✓ OpenEngine wheel metadata and static payload verified")
 
 
 def get_cpython_version():
@@ -180,7 +263,8 @@ def get_torch_constraint_file(constraint_dir="."):
             ['python3', '-c', 'import torch; print(torch.__version__)'],
             capture_output=True,
             text=True,
-            check=True)
+            check=True,
+            timeout=60)
         torch_version = torch_version_result.stdout.strip()
         if torch_version:
             print(f"Found installed torch version: {torch_version}")
@@ -221,9 +305,8 @@ def create_link_for_models():
         print(f"ERROR: Models root {models_root} does not exist")
         exit(1)
     src_dst_dict = {
-        # TinyLlama-1.1B-Chat-v1.0
-        f"{models_root}/llama-models-v2/TinyLlama-1.1B-Chat-v1.0":
-        f"{os.getcwd()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+        # Qwen3-0.6B
+        f"{models_root}/Qwen3/Qwen3-0.6B": f"{os.getcwd()}/Qwen3/Qwen3-0.6B",
     }
 
     for src, dst in src_dst_dict.items():
@@ -271,6 +354,7 @@ def test_pip_install(args):
     download_wheel(args)
     install_tensorrt_llm()
 
+    verify_openengine_distribution()
     run_sanity_check()
 
 
@@ -298,7 +382,10 @@ def test_python_builds(args):
     print(f"Repository root: {repo_root}")
 
     # Uninstall existing tensorrt_llm to test fresh editable install
-    subprocess.run("pip3 uninstall -y tensorrt_llm", shell=True, check=False)
+    subprocess.run("pip3 uninstall -y tensorrt_llm",
+                   shell=True,
+                   check=False,
+                   timeout=300)
 
     print("##########  Install with TRTLLM_PRECOMPILED_LOCATION  ##########")
     env = os.environ.copy()
@@ -314,7 +401,10 @@ def test_python_builds(args):
 
     # Clean up: uninstall editable install to leave env in clean state
     print("##########  Clean up editable install  ##########")
-    subprocess.run("pip3 uninstall -y tensorrt_llm", shell=True, check=False)
+    subprocess.run("pip3 uninstall -y tensorrt_llm",
+                   shell=True,
+                   check=False,
+                   timeout=300)
 
 
 if __name__ == "__main__":

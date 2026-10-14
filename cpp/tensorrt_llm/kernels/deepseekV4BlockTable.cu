@@ -249,7 +249,8 @@ __global__ void computeSlidingBlockTablesWithScratchRowsKernel(int32_t const* __
     int32_t const attnTypeId = layerAttnIdx % numAttnTypes;
     int32_t const layerId = layerAttnIdx / numAttnTypes;
     int32_t const layerAttnOffset = layerId * numAttnTypes + attnTypeId;
-    int32_t const outputOffset = rowIdx * maxBlocksPerSeq;
+    // The full layer/role/table layout can exceed INT32_MAX elements even for a single active request.
+    int64_t const outputOffset = static_cast<int64_t>(rowIdx) * maxBlocksPerSeq;
 
     int64_t const poolId64 = poolIds[layerAttnOffset];
     bool const isValidPool = validPool[layerAttnOffset] && poolId64 >= 0 && poolId64 < numPools;

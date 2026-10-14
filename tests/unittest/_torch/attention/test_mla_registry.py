@@ -29,6 +29,7 @@ from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.module import (
 )
 from tensorrt_llm._torch.attention.mla import MLA
 from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.functional import PositionEmbeddingType
 
 
@@ -317,9 +318,10 @@ def test_dsv4_epilogue_bmm_writes_only_phase_ranges(
     def fake_bmm(_attn_fp8, _weight, attn_scale, _weight_scale, phase_output):
         phase_output.fill_(attn_scale.item())
 
+    bmm_op = "cute_dsl_fp8_bmm_rubin" if get_sm_version() == 107 else "cute_dsl_fp8_bmm_blackwell"
     with patch.object(
         torch.ops.trtllm,
-        "cute_dsl_fp8_bmm_blackwell",
+        bmm_op,
         side_effect=fake_bmm,
     ) as bmm:
         context_epilogue = None

@@ -88,10 +88,26 @@ def _make_manager(max_num_tokens, tokens_per_block, enable_chunked_prefill=True)
     # covered explicitly below.
     mgr.enable_chunked_prefill = enable_chunked_prefill
     mgr.is_draft = False
-    # Read by publish_connector_scheduler_output; most tests run without a
+    # Read by report_batch_to_connector; most tests run without a
     # connector attached.
     mgr.kv_connector_manager = None
     return mgr
+
+
+def test_replay_prefix_is_included_in_post_allocation_budget():
+    from tensorrt_llm._torch.pyexecutor.ced_replay import EncoderReplay
+
+    req = _FakeRequest(context_current_position=4096, context_chunk_size=904, prompt_len=5000)
+    req.py_ced_replay = EncoderReplay(req.py_request_id, 123, 4096, 3968)
+    manager = _make_manager(1024, 128)
+    assert manager._request_forward_tokens(req, is_context=True) == 1032
+    batch = _make_batch(context_requests=[req])
+    manager.fit_token_budget(batch)
+    assert req.context_chunk_size == 896
+    assert manager._request_forward_tokens(req, is_context=True) == 1024
+    assert req.context_current_position == 4096
+    assert not req.py_ced_replay.consumed
+    assert batch.context_requests_chunking == [req]
 
 
 def _make_batch(context_requests=(), generation_requests=()):
@@ -535,7 +551,7 @@ class TestConnectorSeesTheTrimmedBatch(unittest.TestCase):
                 req.context_chunk_size = self._shrink_to
             self._log.append(("trim", self._chunks()))
 
-        def publish_connector_scheduler_output(self, scheduled_batch):
+        def report_batch_to_connector(self, scheduled_batch):
             self._log.append(("publish", self._chunks()))
 
         def _chunks(self):
@@ -571,7 +587,7 @@ class TestConnectorSeesTheTrimmedBatch(unittest.TestCase):
     def test_publishing_is_a_no_op_without_a_connector(self):
         mgr = _make_manager(max_num_tokens=128, tokens_per_block=16)
         mgr.kv_connector_manager = None
-        mgr.publish_connector_scheduler_output(_make_batch())  # must not raise
+        mgr.report_batch_to_connector(_make_batch())  # must not raise
 
     def test_publishing_forwards_the_batch_to_the_connector(self):
         class _FakeConnector:
@@ -585,7 +601,7 @@ class TestConnectorSeesTheTrimmedBatch(unittest.TestCase):
         mgr.kv_connector_manager = _FakeConnector()
         batch = _make_batch([_FakeRequest(context_chunk_size=16, prompt_len=16)])
 
-        mgr.publish_connector_scheduler_output(batch)
+        mgr.report_batch_to_connector(batch)
 
         self.assertEqual(mgr.kv_connector_manager.calls, [(batch, mgr)])
 

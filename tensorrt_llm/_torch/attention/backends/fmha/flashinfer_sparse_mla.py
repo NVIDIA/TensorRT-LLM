@@ -9,7 +9,6 @@ import torch
 
 from tensorrt_llm._torch.attention.backends.interface import AttentionForwardArgs
 from tensorrt_llm._torch.attention.backends.sparse.flashinfer_utils import get_sparse_mla_op
-from tensorrt_llm._torch.attention.rotary_embedding import RotaryEmbedding
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.logger import logger
 
@@ -48,6 +47,12 @@ class FlashInferSparseMlaFmha(Fmha):
 
     def __init__(self, attn: "TrtllmAttention"):
         super().__init__(attn)
+        # Imported here, not at module level: rotary_embedding imports
+        # backends.interface, and loading the backends package imports this
+        # module, so a module-level import closes a cycle whenever
+        # rotary_embedding is the first of them to be imported.
+        from tensorrt_llm._torch.attention.rotary_embedding import RotaryEmbedding
+
         self.rotary_emb: RotaryEmbedding = RotaryEmbedding(
             attn.rope_params,
             head_dim=attn.qk_rope_head_dim,
@@ -55,17 +60,7 @@ class FlashInferSparseMlaFmha(Fmha):
         )
 
     @classmethod
-    def is_available(cls, attn: "TrtllmAttention") -> bool:
-        if (
-            getattr(attn, "skip_correction_threshold", 0.0) > 0.0
-            and not cls.supports_skip_correction
-        ):
-            logger.debug(
-                "FlashInfer sparse-MLA FMHA is unavailable: skip-correction is "
-                "enabled and unsupported."
-            )
-            return False
-
+    def _is_available(cls, attn: "TrtllmAttention") -> bool:
         if not attn.is_mla_enable or getattr(attn, "kv_cache_dtype", None) != "fp8_ds_mla":
             return False
         return is_flashinfer_sparse_mla_enabled(getattr(attn.sparse_params, "algorithm", None))

@@ -24,7 +24,7 @@ from tensorrt_llm._torch.modules.layer_norm import LayerNorm
 from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.utils import Fp4QuantizedTensor
 from tensorrt_llm.models.modeling_utils import QuantConfig
-from tensorrt_llm.runtime.kv_cache_manager_v2._common import BAD_PAGE_INDEX
+from tensorrt_llm.runtime.kv_cache_manager_v2 import BAD_PAGE_INDEX
 
 from ..inline_scale_kv import DIM_NOPE as _INLINE_SCALE_NOPE_DIM
 from ..inline_scale_kv import DIM_ROPE as _INLINE_SCALE_ROPE_DIM

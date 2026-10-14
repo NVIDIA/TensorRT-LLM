@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 from abc import ABC, abstractmethod
 from collections import deque, namedtuple
 from dataclasses import dataclass, field
@@ -271,8 +274,9 @@ class AuxBuffer(AuxBufferBase):
                 f"Cannot fill slot {slot}: slot is not currently allocated. "
                 "Call `alloc_slot` first."
             )
-        first_gen_tokens = request.get_last_tokens()
-        draft_tokens = request.py_draft_tokens
+        remote_tail = getattr(request, "py_csa2_remote_tail_mode", None) == "source"
+        first_gen_tokens = [] if remote_tail else request.get_last_tokens()
+        draft_tokens = [] if remote_tail else request.py_draft_tokens
 
         if len(first_gen_tokens) > self._beam_width:
             raise ValueError(

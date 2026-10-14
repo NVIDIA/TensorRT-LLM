@@ -144,104 +144,47 @@ struct Kernel_traits_skip_softmax_sm120
 
     using Gmem_tile_o = typename Base::Gmem_tile_o;
 
-    enum
-    {
-        VALID_D = Base::VALID_D
-    };
+    static constexpr int VALID_D = Base::VALID_D;
 
-    enum
-    {
-        D = Base::D
-    };
+    static constexpr int D = Base::D;
 
-    enum
-    {
-        VALID_DV = Base::VALID_DV
-    };
+    static constexpr int VALID_DV = Base::VALID_DV;
 
-    enum
-    {
-        DV = Base::DV
-    };
+    static constexpr int DV = Base::DV;
 
-    enum
-    {
-        STEP_Q = STEP_Q_
-    };
+    static constexpr int STEP_Q = STEP_Q_;
 
-    enum
-    {
-        STEP_KV = Cta_tile_p::N
-    };
+    static constexpr int STEP_KV = Cta_tile_p::N;
 
-    enum
-    {
-        VERSION = VERSION_
-    };
+    static constexpr int VERSION = VERSION_;
 
-    enum
-    {
-        MASK_VERSION = MASK_VERSION_
-    };
+    static constexpr int MASK_VERSION = MASK_VERSION_;
 
-    enum
-    {
-        CAUSAL_MASK = Base::CAUSAL_MASK
-    };
+    static constexpr int CAUSAL_MASK = Base::CAUSAL_MASK;
 
-    enum
-    {
-        SLIDING_WINDOW_ATTENTION = Base::SLIDING_WINDOW_ATTENTION
-    };
+    static constexpr int SLIDING_WINDOW_ATTENTION = Base::SLIDING_WINDOW_ATTENTION;
 
-    enum
-    {
-        BIDIRECTIONAL_SLIDING_WINDOW_ATTENTION = Base::BIDIRECTIONAL_SLIDING_WINDOW_ATTENTION
-    };
+    static constexpr int BIDIRECTIONAL_SLIDING_WINDOW_ATTENTION = Base::BIDIRECTIONAL_SLIDING_WINDOW_ATTENTION;
 
-    enum
-    {
-        CUSTOM_MASK = Base::CUSTOM_MASK
-    };
+    static constexpr int CUSTOM_MASK = Base::CUSTOM_MASK;
 
-    enum
-    {
-        ELEMENT_BYTES = sizeof(typename Traits_p::A_type)
-    };
+    static constexpr int ELEMENT_BYTES = sizeof(typename Traits_p::A_type);
 
-    enum
-    {
-        TOTAL_BMM2_MMAS_K = Base::TOTAL_BMM2_MMAS_K
-    };
+    static constexpr int TOTAL_BMM2_MMAS_K = Base::TOTAL_BMM2_MMAS_K;
 
-    enum
-    {
-        ENABLE_BMM1_SOFTCAPPING_SCALE = Base::ENABLE_BMM1_SOFTCAPPING_SCALE
-    };
+    static constexpr int ENABLE_BMM1_SOFTCAPPING_SCALE = Base::ENABLE_BMM1_SOFTCAPPING_SCALE;
 
-    enum
-    {
-        IS_MTP = Base::IS_MTP
-    };
+    static constexpr int IS_MTP = Base::IS_MTP;
 
     // Skip-softmax knob.
     static constexpr bool ENABLE_SKIP_SOFTMAX = ENABLE_SKIP_SOFTMAX_;
 
     // Producer + consumer warp layout.
-    enum
-    {
-        NUM_PRODUCER_WARPS = NUM_PRODUCER_WARPS_
-    };
+    static constexpr int NUM_PRODUCER_WARPS = NUM_PRODUCER_WARPS_;
 
-    enum
-    {
-        NUM_CONSUMER_WARPS = WARPS_M_ * WARPS_N_
-    };
+    static constexpr int NUM_CONSUMER_WARPS = WARPS_M_ * WARPS_N_;
 
-    enum
-    {
-        THREADS = (NUM_PRODUCER_WARPS + NUM_CONSUMER_WARPS) * 32
-    };
+    static constexpr int THREADS = (NUM_PRODUCER_WARPS + NUM_CONSUMER_WARPS) * 32;
 
     // Named-barrier ids. Collision-safe with the existing skip-softmax
     // barriers (0x3, 0x4 on the non-warpspec path) since we don't run both
@@ -257,10 +200,7 @@ struct Kernel_traits_skip_softmax_sm120
     // Single CTA cluster (no DSMEM on consumer Blackwell -- CTAS_PER_CGA=1).
     static constexpr int CTAS_PER_CGA = 1;
 
-    enum
-    {
-        CONSUMER_THREADS = NUM_CONSUMER_WARPS * 32
-    };
+    static constexpr int CONSUMER_THREADS = NUM_CONSUMER_WARPS * 32;
 
     // ----- Granular head-dim / kv-position chunking ---------------------------
     //
@@ -354,10 +294,7 @@ struct Kernel_traits_skip_softmax_sm120
 
     // Pad to align. The non-Hopper kernel allocates BYTES_PER_SMEM in the
     // extern __shared__ block; the skip_softmax version uses sizeof(Shared).
-    enum
-    {
-        BYTES_PER_SMEM = sizeof(Shared)
-    };
+    static constexpr int BYTES_PER_SMEM = sizeof(Shared);
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

@@ -64,11 +64,6 @@ def launch_smg_server(
         if backend == "pytorch":
             llm_args.pop("build_config", None)
             llm = PyTorchLLM(**llm_args)
-        elif backend == "_autodeploy":
-            from tensorrt_llm._torch.auto_deploy import LLM as AutoDeployLLM
-
-            llm_args.pop("build_config", None)
-            llm = AutoDeployLLM(**llm_args)
         else:
             raise click.BadParameter(
                 f"{backend} is not a known backend, check help for available options.",
@@ -131,7 +126,13 @@ def launch_smg_server(
                 logger.info("LLM engine stopped")
                 logger.info("Shutdown complete")
 
-    uvloop.run(serve_grpc_async())
+    # Imported here rather than at module scope, since
+    # tensorrt_llm.commands.serve reaches into this module to launch the
+    # server.
+    from tensorrt_llm.commands.serve import _provision_kv_cache_pool
+
+    with _provision_kv_cache_pool(llm_args):
+        uvloop.run(serve_grpc_async())
 
 
 __all__ = ["launch_smg_server"]

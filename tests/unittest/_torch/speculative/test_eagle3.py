@@ -57,6 +57,7 @@ from tensorrt_llm.llmapi import (CudaGraphConfig, Eagle3DecodingConfig,
 def test_mtp_eagle_refreshes_dsa_metadata_before_draft_forward() -> None:
     """Refresh DSA mappings after switching to the draft cache."""
     events = []
+    state = {}
     draft_manager = object.__new__(DSACacheManagerV2)
 
     class _Metadata(DSAtrtllmAttentionMetadata):
@@ -66,13 +67,13 @@ def test_mtp_eagle_refreshes_dsa_metadata_before_draft_forward() -> None:
             self._num_ctx_tokens = 0
 
         def set_in_mtp_draft_loop(self, active):
-            pass
+            state["in_mtp_draft_loop"] = active
 
         def set_mtp_num_accepted(self, value):
-            pass
+            state["mtp_num_accepted"] = value
 
         def set_skip_topk(self, value):
-            pass
+            state["skip_topk"] = value
 
         def on_update_kv_lens(self):
             events.append("refresh")
@@ -116,6 +117,13 @@ def test_mtp_eagle_refreshes_dsa_metadata_before_draft_forward() -> None:
         )
 
     assert events == ["switch", "refresh", "forward"]
+    # The draft forward raised, so only the ExitStack callback can have cleared
+    # this; a leaked flag would let the next target forward reuse the selections.
+    assert state == {
+        "in_mtp_draft_loop": False,
+        "mtp_num_accepted": None,
+        "skip_topk": False,
+    }
 
 
 def test_dynamic_tree_metadata_forces_target_mask_prepare_each_step() -> None:
@@ -375,7 +383,7 @@ def test_eagle3_one_model_capture_uses_real_token_count() -> None:
 @skip_num_gpus_less_than(1)
 def test_mtp_eagle_context_input_uses_prompt_lookahead() -> None:
     invalid = INVALID_PROMPT_LOOKAHEAD_TOKEN
-    spec_config = MTPDecodingConfig(max_draft_len=3, mtp_eagle_one_model=True)
+    spec_config = MTPDecodingConfig(max_draft_len=3)
     spec_metadata = Eagle3OneModelSpecMetadata(
         max_num_requests=2,
         max_draft_len=3,
@@ -466,39 +474,6 @@ def test_mtp_eagle_dynamic_tree_context_input_uses_prompt_lookahead() -> None:
     )
 
 
-def test_eagle3_resource_manager_shares_padding_dummy_slot() -> None:
-    """The target and draft engines of two-model EAGLE3 share one
-    Eagle3ResourceManager, and each registers its own CUDA graph padding dummy
-    under the same draft-length-derived request ID
-    (CUDA_GRAPH_DUMMY_REQUEST_ID - draft_len). The second registration must
-    reuse the already-reserved slot instead of tripping the strict re-add
-    assert in SlotManager.add_slot."""
-    from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import \
-        CUDA_GRAPH_DUMMY_REQUEST_ID
-    from tensorrt_llm._torch.speculative.eagle3 import Eagle3ResourceManager
-
-    config = Eagle3DecodingConfig(max_draft_len=4,
-                                  speculative_model="/dummy/eagle3")
-    manager = Eagle3ResourceManager(config,
-                                    torch.half,
-                                    hidden_size=8,
-                                    max_num_requests=4,
-                                    max_seq_len=32,
-                                    max_num_tokens=64)
-
-    dummy_request_id = CUDA_GRAPH_DUMMY_REQUEST_ID - config.max_draft_len
-    # The target engine registers the padding dummy first (e.g. during warmup
-    # preallocation), then the draft engine registers the same ID.
-    manager.add_dummy_requests([dummy_request_id])
-    dummy_slot = manager.slot_manager.get_slot(dummy_request_id)
-    manager.add_dummy_requests([dummy_request_id])
-    assert manager.slot_manager.get_slot(dummy_request_id) == dummy_slot
-
-    # Real request IDs still get their own slots.
-    real_slot = manager.slot_manager.add_slot(7)
-    assert real_slot != dummy_slot
-
-
 @pytest.fixture(scope="function")
 def enforce_single_worker(monkeypatch):
     monkeypatch.setenv("TLLM_WORKER_USE_SINGLE_PROCESS", "1")
@@ -528,15 +503,7 @@ def test_kv_lens_runtime_with_eagle3_one_model():
         prompt_lens[i] - seq_lens_q[i] for i in range(num_seqs)
     ]
 
-    # Create a mock KV cache manager
-    mock_kv_cache_manager = MagicMock()
-    mock_kv_cache_manager.tokens_per_block = 32
-    mock_kv_cache_manager.num_pools = 1
-    mock_kv_cache_manager.num_attention_op_pools = mock_kv_cache_manager.num_pools
-    mock_kv_cache_manager.max_blocks_per_seq = 16
-    mock_kv_cache_manager.max_batch_size = num_seqs
-    mock_kv_cache_manager.max_seq_len = 512  # Large enough to hold our test sequences
-    mock_kv_cache_manager.copy_batch_block_offsets = MagicMock()
+    mock_kv_cache_manager = _make_mock_kv_cache_manager(num_seqs)
 
     attn_metadata = TrtllmAttentionMetadata(
         max_num_requests=num_seqs,
@@ -581,6 +548,9 @@ def _make_mock_kv_cache_manager(num_seqs: int) -> MagicMock:
     mock_kv_cache_manager.max_batch_size = num_seqs
     mock_kv_cache_manager.max_seq_len = 512
     mock_kv_cache_manager.copy_batch_block_offsets = MagicMock()
+    # MagicMock fabricates every attribute; metadata detects an FP4 MLA cache
+    # layout from this hook, so a plain (non-FP4) manager must not expose it.
+    mock_kv_cache_manager.get_fp4_mla_page_table_spec = None
     return mock_kv_cache_manager
 
 
@@ -726,7 +696,6 @@ def test_llama_eagle3(use_cuda_graph: bool, attn_backend: str,
         max_draft_len=max_draft_len,
         speculative_model=eagle_model,
         # Llama 3 does not support one model eagle.
-        eagle3_one_model=use_one_model,
     )
 
     # Create the LLM instance
@@ -786,7 +755,7 @@ def test_llama_eagle3(use_cuda_graph: bool, attn_backend: str,
         assert text_spec == text_ref
 
 
-@pytest.mark.parametrize("eagle3_one_model", [True, False])
+@pytest.mark.parametrize("eagle3_one_model", [True])
 def test_eagle3_spec_decoding_stats(eagle3_one_model):
     """Test that specDecodingStats are correctly populated in metrics endpoint"""
     models_path = llm_models_root()
@@ -799,18 +768,18 @@ def test_eagle3_spec_decoding_stats(eagle3_one_model):
         pytest.skip(f"Required models not found")
 
     kv_cache_config = KvCacheConfig(enable_block_reuse=False,
-                                    free_gpu_memory_fraction=0.6)
+                                    free_gpu_memory_fraction=0.6,
+                                    use_kv_cache_manager_v2=eagle3_one_model)
     spec_config = Eagle3DecodingConfig(
         max_draft_len=3,
         speculative_model=eagle_model_dir,
-        eagle3_one_model=eagle3_one_model,
     )
 
     with LLM(
             model=target_model_dir,
             speculative_config=spec_config,
             kv_cache_config=kv_cache_config,
-            disable_overlap_scheduler=not eagle3_one_model,
+            disable_overlap_scheduler=False,
             enable_iter_perf_stats=True,
             max_batch_size=4,
     ) as llm:
@@ -883,7 +852,6 @@ def test_llama_eagle3_long_prompt(use_cuda_graph):
     spec_config = Eagle3DecodingConfig(
         max_draft_len=3,
         speculative_model=eagle_model_dir,
-        eagle3_one_model=False,
     )
 
     if use_cuda_graph:
@@ -915,9 +883,7 @@ def test_llama_eagle3_long_prompt(use_cuda_graph):
     generated_text_ref = [result.outputs[0].text for result in results_ref]
     llm_ref.shutdown()
 
-    # The LLM with speculation on should dynamically turn it off in this
-    # test since it goes beyond the max seqlen. Thus, the text should be
-    # _exactly_ the same, no need to use similarity scoring.
+    # Greedy decoding must match the non-speculative reference for a long prompt.
     assert generated_text_spec[0] == generated_text_ref[0]
 
 
@@ -926,7 +892,6 @@ def test_deepseek_mla_eagle3():
     attn_backend = "TRTLLM"
     disable_overlap_scheduler = False
     enable_block_reuse = False
-    use_one_model = True
     enable_chunked_prefill = False
 
     # Eagle3 one model works with overlap scheduler and block reuse.
@@ -1015,7 +980,6 @@ def test_deepseek_mla_eagle3():
 
         spec_config = Eagle3DecodingConfig(max_draft_len=max_draft_len,
                                            speculative_model=eagle_model_dir,
-                                           eagle3_one_model=use_one_model,
                                            load_format="dummy")
 
         llm_spec = LLM(**llm_common_config, speculative_config=spec_config)
@@ -1029,7 +993,7 @@ def test_deepseek_mla_eagle3():
             pass
 
 
-@pytest.mark.parametrize("use_one_model", [True, False])
+@pytest.mark.parametrize("use_one_model", [True])
 def test_multi_eagle3(use_one_model: bool):
     use_cuda_graph = True
     attn_backend = "TRTLLM"
@@ -1096,7 +1060,8 @@ def test_multi_eagle3(use_one_model: bool):
         max_batch_size = 16
         max_draft_len = 3
         kv_cache_config = KvCacheConfig(enable_block_reuse=enable_block_reuse,
-                                        free_gpu_memory_fraction=0.5)
+                                        free_gpu_memory_fraction=0.5,
+                                        use_kv_cache_manager_v2=use_one_model)
         cuda_graph_config = CudaGraphConfig(
             batch_sizes=[1]) if use_cuda_graph else None
 
@@ -1113,7 +1078,6 @@ def test_multi_eagle3(use_one_model: bool):
 
         spec_config = Eagle3DecodingConfig(max_draft_len=max_draft_len,
                                            speculative_model=eagle_model_dir,
-                                           eagle3_one_model=use_one_model,
                                            load_format="dummy")
 
         llm_spec = LLM(**llm_common_config, speculative_config=spec_config)
@@ -1171,7 +1135,6 @@ def test_llama_eagle3_rejection_sampling_modes(use_dynamic_tree: bool,
     spec_config_kwargs = dict(
         max_draft_len=max_draft_len,
         speculative_model=eagle_model,
-        eagle3_one_model=True,
         use_rejection_sampling=True,
     )
     if use_dynamic_tree:
@@ -1228,7 +1191,6 @@ def test_nemotron_super_mtp_dynamic_tree_dl6_k10_dt31(
         max_seq_len=8192,
     )
     spec_config = MTPDecodingConfig(max_draft_len=max_draft_len,
-                                    mtp_eagle_one_model=True,
                                     use_dynamic_tree=True,
                                     dynamic_tree_max_topK=10,
                                     max_total_draft_tokens=31)
@@ -1282,7 +1244,6 @@ def test_eagle3_lora(use_cuda_graph: bool):
     """
     attn_backend = "TRTLLM"
     enable_block_reuse = False
-    use_one_model = True
     enable_chunked_prefill = False
 
     total_mem_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
@@ -1318,7 +1279,6 @@ def test_eagle3_lora(use_cuda_graph: bool):
     spec_config = Eagle3DecodingConfig(
         max_draft_len=max_draft_len,
         speculative_model=eagle_model_dir,
-        eagle3_one_model=use_one_model,
     )
 
     # Create the LLM instance
@@ -1375,7 +1335,6 @@ def test_llama_eagle3_dynamic_tree(use_cuda_graph: bool,
     spec_config = Eagle3DecodingConfig(
         max_draft_len=max_draft_len,
         speculative_model=eagle_model,
-        eagle3_one_model=True,
         use_dynamic_tree=True,
         dynamic_tree_max_topK=dynamic_tree_max_topK,
         max_total_draft_tokens=max_total_draft_tokens,

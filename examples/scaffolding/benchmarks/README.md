@@ -30,7 +30,7 @@ Multiple benchmarks can run concurrently by combining flags.
 
 ### Agent Benchmarks
 
-Uses `create_open_deep_research_scaffolding_llm` with MCP server at `http://0.0.0.0:8082/sse`.
+Uses `create_open_deep_research_scaffolding_llm` with MCP server at `http://127.0.0.1:8082/mcp`.
 
 Prompts loaded from `examples/scaffolding/contrib/open_deep_research/data/open_deep_research_bench.json` (falls back to default prompt if unavailable).
 

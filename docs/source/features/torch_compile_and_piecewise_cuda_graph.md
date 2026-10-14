@@ -6,13 +6,14 @@ Piecewise CUDA Graph is a technique that runs cudagraph-unsupported components (
 
 ## Table of Contents
 
-- [Torch Compile & Piecewise CUDA Graph](#torch-compile--piecewise-cuda-graph)
+- [Torch Compile & Prefill CUDA Graph](#torch-compile--prefill-cuda-graph)
   - [Table of Contents](#table-of-contents)
   - [Usage](#usage)
   - [Tips for Piecewise CUDA Graph](#tips-for-piecewise-cuda-graph)
     - [Piecewise CUDA Graph & Generation Only CUDA Graph](#piecewise-cuda-graph--generation-only-cuda-graph)
     - [Piecewise CUDA Graph Padding](#piecewise-cuda-graph-padding)
     - [Performance Tuning](#performance-tuning)
+    - [Torch Compile Optimizations](#torch-compile-optimizations)
   - [Known Issue](#known-issue)
   - [Development Guide](#development-guide)
     - [Background Knowledge](#background-knowledge)
@@ -113,23 +114,28 @@ Guidelines for `capture_num_tokens`:
 
 Even with Piecewise CUDA Graph enabled, you may still observe bubbles in the context (prefill) phase, primarily due to the attention operator’s substantial host-side overhead.
 
-## Known Issue
+### Torch Compile Optimizations
 
-Torch compile cannot work with multi-ModelEngine config.
+Enabling `prefill_cuda_graph_backend: piecewise` also enables `torch.compile`. By default, decoder forwards are routed through the compiled callable, including autotuning and auxiliary warmups as well as context, mixed, and generation-only batches. For some models, running these forwards through the compiled callable can improve performance through optimizations such as kernel fusion. In other cases, most of the benefit comes from applying piecewise CUDA graphs to context and mixed batches only.
 
-1. Speculative Decoding in Two-Model Style
+The `compile_only_piecewise_graphs` option restricts compilation to forwards that are eligible for piecewise CUDA graphs, including the corresponding specialization warmup and capture forwards:
 
-``` yaml
-speculative_config:
-  decoding_type: "MTP"
-  mtp_eagle_one_model: False # Not supported
-
-speculative_config:
-  decoding_type: "Eagle3"
-  eagle3_one_model: False # Not supported
+```yaml
+prefill_cuda_graph_backend: piecewise
+torch_compile_config:
+  compile_only_piecewise_graphs: true
 ```
 
-2. Multimodal Model Family
+With this option enabled, ineligible context and mixed forwards use the eager decoder. Ordinary CUDA graphs are also captured from the eager decoder and subsequently replayed as CUDA graphs. Auxiliary kernel and memory-pool warmups bypass `torch.compile`. Avoiding unnecessary tracing and compilation can significantly reduce startup time.
+
+The `compile_only_piecewise_graphs` option was validated with a Qwen3 8B FP8 model, where no performance impact was measured in the tested TP1 and TP2 configurations. However, performance and numerical behavior can be model- and configuration-dependent, so these should be evaluated on a case-by-case basis before deployment.
+This option requires `prefill_cuda_graph_backend: piecewise` and currently supports only models derived from `DecoderModelForCausalLM`. With attention DP, the compiled path follows the group-wide prefill graph eligibility decision.
+
+
+## Known Issue
+
+Torch compile cannot work with multi-ModelEngine config, which currently means
+the Multimodal Model Family.
 
 ## Development Guide
 

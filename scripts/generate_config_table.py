@@ -78,6 +78,10 @@ MODEL_INFO = {
         "display_name": "Qwen3.8-2.4T-A95B (FP8)",
         "url": "https://huggingface.co/Qwen/Qwen3.8-2.4T-A95B-FP8",
     },
+    "Qwen/Qwen3.8-Flash-Next-FP8": {
+        "display_name": "Qwen3.8-Flash-Next (FP8)",
+        "url": "https://huggingface.co/Qwen/Qwen3.8-Flash-Next-FP8",
+    },
     "nvidia/Qwen3.5-397B-A17B-NVFP4": {
         "display_name": "Qwen3.5-397B-A17B (NVFP4)",
         "url": "https://huggingface.co/nvidia/Qwen3.5-397B-A17B-NVFP4",

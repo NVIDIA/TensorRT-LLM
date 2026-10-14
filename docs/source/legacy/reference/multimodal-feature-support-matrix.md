@@ -1,3 +1,7 @@
+---
+orphan: true
+---
+
 # Multimodal Feature Support Matrix (PyTorch Backend)
 
 | Model              | CUDA Graph | Encoder IFB         | KV Cache Reuse | Chunked Prefill |

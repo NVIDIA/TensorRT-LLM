@@ -25,6 +25,7 @@ from collections.abc import Callable
 
 import torch
 
+from .common import _num_sparse_pattern_heads
 from .config import _BlockSparseStaticProfile
 
 
@@ -64,12 +65,7 @@ def _raise_for_invalid_paged_metadata(
         return
     reason = {
         4: (f"seq_lens_kv values must lie in [{minimum_seq_len_kv}, {max_seq_len_kv}]"),
-        5: (
-            "paged_kv_indptr must start at zero and each row must be "
-            "bounded and monotone"
-        ),
-        6: "paged_kv_indptr rows must contain enough pages for seq_lens_kv",
-        7: "paged_kv_indices must contain an in-range physical page ID",
+        5: "block_tables must contain an in-range physical page ID for every live page",
     }.get(error_code)
     if reason is None:
         reason = (
@@ -131,7 +127,9 @@ def _inspect_block_sparse_bsr(
         inspect_bsr = compile_block_sparse_inspection(
             device_index=device_index,
             batch_size=static.batch_size,
-            num_kv_heads=static.num_kv_heads,
+            num_kv_heads=_num_sparse_pattern_heads(
+                static.num_kv_heads, static.share_pattern_across_kv_heads
+            ),
             seq_len_q=static.seq_len_q,
             seq_len_kv=static.seq_len_kv,
             q_block_size=static.q_block_size,
@@ -152,8 +150,7 @@ def _inspect_block_sparse_bsr(
 def _inspect_paged_block_sparse_metadata(
     block_indptr: torch.Tensor,
     block_indices: torch.Tensor,
-    paged_kv_indptr: torch.Tensor,
-    paged_kv_indices: torch.Tensor,
+    block_tables: torch.Tensor,
     seq_lens_kv: torch.Tensor,
     *,
     static: _BlockSparseStaticProfile,
@@ -175,7 +172,9 @@ def _inspect_paged_block_sparse_metadata(
         inspect_metadata = compile_paged_block_sparse_metadata_inspection(
             device_index=device_index,
             batch_size=static.batch_size,
-            num_kv_heads=static.num_kv_heads,
+            num_kv_heads=_num_sparse_pattern_heads(
+                static.num_kv_heads, static.share_pattern_across_kv_heads
+            ),
             seq_len_q=static.seq_len_q,
             minimum_seq_len_kv=minimum_seq_len_kv,
             max_seq_len_kv=static.seq_len_kv,
@@ -186,8 +185,8 @@ def _inspect_paged_block_sparse_metadata(
         inspect_metadata(
             block_indptr,
             block_indices,
-            paged_kv_indptr,
-            paged_kv_indices,
+            block_tables,
+            block_tables.stride(0),
             seq_lens_kv,
             num_physical_kv_pages,
             summary,

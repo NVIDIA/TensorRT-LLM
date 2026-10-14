@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import contextlib
 import functools
 import inspect
@@ -6,7 +9,7 @@ import os
 import weakref
 from dataclasses import replace
 from enum import IntEnum
-from typing import Optional
+from typing import Literal, Optional
 
 import torch
 
@@ -410,7 +413,7 @@ class Runner:
     ) -> None:
         super().__init__()
 
-        checkpoint_loader = _construct_checkpoint_loader("pytorch", None, "HF")
+        checkpoint_loader = _construct_checkpoint_loader(None, "HF")
         # Please refer to `tensorrt_llm/_torch/pyexecutor/model_loader.py` for effective args
         llm_args = TorchLlmArgs(
             model=pretrained_model_name_or_path,
@@ -887,6 +890,7 @@ class Runner:
         enable_swa_scratch_reuse=False,
         spec_config: Optional[DecodingBaseConfig] = None,
         vision_config: Optional[str] = None,
+        use_kv_cache_manager_v2: bool | Literal["auto"] = "auto",
     ) -> KVCacheManager:
         # Please refer to `tensorrt_llm/_torch/pyexecutor/py_executor_creator.py` for `tokens_per_block`
         with Runner.vision_config_ctx(vision_config):
@@ -898,8 +902,7 @@ class Runner:
 
         # Please refer to `tensorrt_llm/_torch/pyexecutor/_util.py` for `kv_cache_manager`
         config = model_config.pretrained_config
-        # max_seq_len + 1 because the is_gen path in add_dummy_requests resizes each
-        # request to capacity + 1; without the extra token the last block rounds down.
+        # Reserve one token of headroom before rounding to a block boundary.
         # kv_pool_headroom oversizes max_tokens when the manager splits it across
         # several pools. DeepSeek-V4 needs 3; the default 1 keeps every other model
         # on its previous allocation.
@@ -909,6 +912,9 @@ class Runner:
             * round_up(max_seq_len + 1, tokens_per_block),
             enable_block_reuse=False,
             enable_swa_scratch_reuse=enable_swa_scratch_reuse,
+            # Every dummy request uses max_seq_len tokens, so this is the actual average.
+            avg_seq_len=max_seq_len,
+            use_kv_cache_manager_v2=use_kv_cache_manager_v2,
         )
         kv_cache_manager_cls = get_kv_cache_manager_cls(model_config, kv_cache_config)
         kv_cache_dtype = {

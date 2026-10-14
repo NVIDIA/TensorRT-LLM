@@ -30,7 +30,6 @@ import torch
 import triton
 import triton.language as tl
 
-from ..fla.index import prepare_chunk_indices
 from . import _kda_decode
 
 try:
@@ -69,20 +68,31 @@ def is_kda_optimized_supported() -> bool:
     return get_kda_sm_version() in (100, 103)
 
 
-@triton.jit(do_not_specialize=["num_tokens"])
+@triton.jit(do_not_specialize=["num_tokens", "feature_stride"])
 def _fused_kda_post_conv_kernel(
     packed_ptr,
     q_out_ptr,
     k_out_ptr,
     v_out_ptr,
     num_tokens,
+    token_stride,
+    feature_stride,
     l2_norm_eps,
     NUM_HEADS: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     BLOCK_TOKENS: tl.constexpr,
     BLOCK_DIM: tl.constexpr,
+    TOKEN_MAJOR: tl.constexpr,
 ):
-    """Normalize and transpose channel-major packed Q/K/V in one launch."""
+    """Normalize and transpose packed Q/K/V in one launch.
+
+    ``packed`` is ``[3 * NUM_HEADS * HEAD_DIM, num_tokens]`` with one unit
+    stride: along tokens (channel-major) or, with ``TOKEN_MAJOR``, along
+    features. ``token_stride`` stays specialized so Triton sees when
+    token-major rows start 16-byte aligned and vectorizes their loads.
+    ``feature_stride`` is the token count in channel-major mode, where
+    specializing it selects a slower layout.
+    """
     token_offsets = tl.program_id(0) * BLOCK_TOKENS + tl.arange(0, BLOCK_TOKENS)
     head_idx = tl.program_id(1)
     dim_offsets = tl.arange(0, BLOCK_DIM)
@@ -92,11 +102,18 @@ def _fused_kda_post_conv_kernel(
 
     feature_offsets = head_idx * HEAD_DIM + dim_offsets
     projection_size = NUM_HEADS * HEAD_DIM
-    num_tokens_i64 = num_tokens.to(tl.int64)
-    source_offsets = feature_offsets[None, :].to(tl.int64) * num_tokens_i64 + token_offsets[
-        :, None
-    ].to(tl.int64)
-    section_stride = projection_size * num_tokens_i64
+    if TOKEN_MAJOR:
+        outer_stride_i64 = token_stride.to(tl.int64)
+        source_offsets = token_offsets[:, None].to(tl.int64) * outer_stride_i64 + feature_offsets[
+            None, :
+        ].to(tl.int64)
+        section_stride = projection_size
+    else:
+        outer_stride_i64 = feature_stride.to(tl.int64)
+        source_offsets = feature_offsets[None, :].to(tl.int64) * outer_stride_i64 + token_offsets[
+            :, None
+        ].to(tl.int64)
+        section_stride = projection_size * outer_stride_i64
     output_offsets = (
         token_offsets[:, None].to(tl.int64) * projection_size + feature_offsets[None, :]
     )
@@ -127,11 +144,13 @@ def fused_kda_post_conv(
     head_dim: int,
     l2_norm_eps: float = 1e-6,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Convert packed channel-major convolution output to KDA Q/K/V.
+    """Convert packed convolution output to KDA Q/K/V.
 
-    ``packed`` has shape ``[3 * num_heads * head_dim, tokens]``. The
-    returned tensors are contiguous ``[1, tokens, num_heads, head_dim]``;
-    Q and K are L2-normalized along the head dimension.
+    ``packed`` has shape ``[3 * num_heads * head_dim, tokens]`` and is either
+    channel-major (unit token stride) or a transposed view of token-major
+    rows (unit feature stride). The returned tensors are contiguous
+    ``[1, tokens, num_heads, head_dim]``; Q and K are L2-normalized along the
+    head dimension.
     """
     projection_size = num_heads * head_dim
     if packed.ndim != 2 or packed.shape[0] != 3 * projection_size:
@@ -139,10 +158,15 @@ def fused_kda_post_conv(
             "Packed KDA post-conv expected shape "
             f"[{3 * projection_size}, tokens], got {tuple(packed.shape)}"
         )
-    if not packed.is_contiguous():
-        raise ValueError("Packed KDA post-conv requires a contiguous tensor")
-
     num_tokens = packed.shape[1]
+    feature_stride, token_stride = packed.stride()
+    token_major = feature_stride == 1 and num_tokens > 1
+    if not token_major and token_stride != 1 and num_tokens > 1:
+        raise ValueError(
+            "Packed KDA post-conv requires a unit stride along tokens or features, "
+            f"got strides {packed.stride()}"
+        )
+
     output_shape = (1, num_tokens, num_heads, head_dim)
     q_out = torch.empty(output_shape, dtype=packed.dtype, device=packed.device)
     k_out = torch.empty_like(q_out)
@@ -159,11 +183,14 @@ def fused_kda_post_conv(
         k_out,
         v_out,
         num_tokens,
+        token_stride,
+        feature_stride,
         l2_norm_eps,
         num_heads,
         head_dim,
         block_tokens,
         block_dim,
+        token_major,
         num_warps=8,
         num_stages=3,
     )
@@ -430,19 +457,11 @@ class KDAKernelDispatch:
         cu_seqlens: Optional[torch.Tensor],
         num_sequences: int,
         num_tokens: int,
-        chunk_indices: Optional[torch.Tensor] = None,
-        chunk_size: int = 64,
     ) -> bool:
         """Return whether prefill can update this V-first pool directly."""
         if self.prefill_kernel_path != "optimized" or num_tokens == 0:
             return False
         if cu_seqlens is not None:
-            if chunk_indices is None:
-                from fla.ops.utils.index import prepare_chunk_indices
-
-                chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size)
-            if chunk_indices.shape[0] < 4:
-                return False
             if cu_seqlens.shape[0] - 1 != num_sequences:
                 return False
         if state_pool.dtype != torch.float32 or state_pool.ndim != 4:
@@ -523,20 +542,6 @@ class KDAKernelDispatch:
                 "Indexed KDA prefill requires state_indices and does not accept initial_state."
             )
         use_optimized = self.prefill_kernel_path == "optimized" and use_indexed_state
-        if use_optimized and cu_seqlens is not None:
-            if chunk_indices is None:
-                chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size)
-            # The persistent K123 scheduler needs at least 4 total chunks
-            # (cgs_per_head = NT // 4 cooperative groups per head). The
-            # eqlen path guarantees this by padding to a 256-token multiple
-            # inside the op; varlen has no such pad, so small varlen
-            # batches (short-prompt contexts, NT < 4) launch with a
-            # zero-size grid -> DSLCudaRuntimeError. Route them to the FLA
-            # reference path (negligible perf impact at these sizes). The
-            # check must happen before dispatch: the FLA fallback applies
-            # Q/K normalization and beta sigmoid in its own kernels.
-            if chunk_indices.shape[0] < 4:
-                use_optimized = False
 
         if use_indexed_state and not use_optimized:
             raise RuntimeError(

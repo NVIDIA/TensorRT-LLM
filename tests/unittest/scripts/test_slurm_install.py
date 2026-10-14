@@ -67,7 +67,9 @@ fi
 [[ "$rc" -eq 23 ]]
 [[ "$attempt" -eq 3 ]]
 """
-    result = subprocess.run(["bash", "-c", command], env=env, capture_output=True, text=True)
+    result = subprocess.run(
+        ["bash", "-c", command], env=env, capture_output=True, text=True, timeout=60
+    )
 
     assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
 
@@ -93,6 +95,7 @@ def test_slurm_install_requires_artifact_inputs(missing: str) -> None:
         env=env,
         capture_output=True,
         text=True,
+        timeout=60,
     )
 
     assert result.returncode != 0

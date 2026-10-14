@@ -165,6 +165,14 @@ class AttentionMetadata:
     # The number of tokens in each rank.
     all_rank_num_tokens: Optional[List[int]] = None
 
+    def get_adp_token_counts(self) -> List[int]:
+        """Local execution-stage counts carried by the input count exchange."""
+        return [self.num_tokens]
+
+    def set_adp_token_counts(self, counts: List[List[int]]) -> List[int]:
+        """Save stage counts and return the input-stage counts for padding."""
+        return counts[0]
+
     # These fields are set when changing seq_lens and _num_contexts to avoid computation
     # during execution. If the calculation happens during execution, torch compile treats it
     # as DDS and fails to compile.
@@ -468,6 +476,7 @@ class AttentionMetadata:
         self,
         helix_position_offsets: List[int],
         helix_is_inactive_rank: List[bool],
+        helix_owned_new_tokens: Optional[List[int]] = None,
     ) -> None:
         """
         Hook to be called when using helix parallelism.
@@ -958,11 +967,17 @@ class AttentionForwardArgs:
     sage_attn_num_elts_per_blk_k: int = 0
     sage_attn_num_elts_per_blk_v: int = 0
     sage_attn_qk_int8: bool = False
+    sage_attn_smooth_k: bool = False
 
+    # Packed QKV for non-MLA attention. MLA always passes a separate query.
     is_fused_qkv: bool = False
     update_kv_cache: bool = True
     # Optional normalized diffusion timestep for timestep-varying sparse attention.
     timestep: Optional[torch.Tensor] = None
+    # Dense-prefix (0) or sparse (1) phase of a timestep-scheduled sparse
+    # algorithm, resolved on the host by the caller. When set, backends use it
+    # instead of reading ``timestep``, which CUDA Graph capture cannot do.
+    sparse_attn_phase: Optional[int] = None
 
     sparse_backend_args: Optional[SparseBackendForwardArgs] = None
     sparse_runtime_params: SparseRuntimeParams = field(
@@ -1080,6 +1095,11 @@ class AttentionBackend(Generic[TMetadata]):
         return False
 
     @classmethod
+    def support_fp4_kv_cache(cls) -> bool:
+        """Whether the backend can execute attention with an FP4 KV cache."""
+        return False
+
+    @classmethod
     def support_multi_item_scoring(cls) -> bool:
         return False
 
@@ -1109,6 +1129,24 @@ class AttentionBackend(Generic[TMetadata]):
         that prefix.
         """
         return True
+
+    @classmethod
+    def runtime_workspace_fixed_bytes(
+        cls,
+        model_config: "ModelConfig",
+        mapping: Mapping,
+        *,
+        max_batch_size: int,
+        max_num_tokens: int,
+        max_seq_len: int,
+        enable_cuda_graph: bool,
+    ) -> int:
+        """Capacity-sized workspace not bounded by summed attended KV length.
+
+        The estimator reserves the full capacity alongside the profiled peak,
+        covering arenas first allocated after the peak prefill step.
+        """
+        return 0
 
     def create_output(self, q: torch.Tensor, **kwargs) -> List[torch.Tensor]:
         """

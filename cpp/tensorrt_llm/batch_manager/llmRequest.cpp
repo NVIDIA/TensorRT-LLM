@@ -31,8 +31,8 @@ std::optional<std::chrono::steady_clock::duration>& globalSteadyClockOffset()
     return offset;
 }
 
-template <typename TTensor, typename TStream>
-runtime::SizeType32 GenericLlmRequest<TTensor, TStream>::getBeamWidthByIter(bool const forNextIteration)
+template <typename TTensor>
+runtime::SizeType32 GenericLlmRequest<TTensor>::getBeamWidthByIter(bool const forNextIteration)
 {
     runtime::SizeType32 beamWidth = mSamplingConfig.getBeamWidth(); // For non-Variable-Beam-Width-Search
     auto const beamWidthArray = mSamplingConfig.getBeamWidthArray();
@@ -51,17 +51,6 @@ runtime::SizeType32 GenericLlmRequest<TTensor, TStream>::getBeamWidthByIter(bool
 }
 
 template class GenericLlmRequest<runtime::ITensor::SharedPtr>;
-
-std::optional<executor::Response> LlmRequest::createResponse(bool useFastLogits, int32_t mpiWorldRank)
-{
-    auto requestId = isChild() ? mParentRequestId : mRequestId;
-    auto result = createResult(useFastLogits, mpiWorldRank);
-    if (result.has_value())
-    {
-        return executor::Response(requestId, result.value(), mClientId);
-    }
-    return std::nullopt;
-}
 
 void LlmRequest::createSerializedResult(
     std::vector<char>& serializedResult, bool& isFinal, bool useFastLogits, int32_t mpiWorldRank)
@@ -254,13 +243,8 @@ bool LlmRequest::checkTokenIdRange(SizeType32 vocabSize)
 }
 
 void LlmRequest::validate(SizeType32 maxInputLen, SizeType32 maxSequenceLen, SizeType32 maxDraftLen,
-    SizeType32 vocabSizePadded, std::optional<SizeType32> maxEncoderInputLen, bool enableKVCacheReuse)
+    std::optional<SizeType32> maxEncoderInputLen, bool enableKVCacheReuse)
 {
-    if (mEndId.has_value())
-    {
-        TLLM_CHECK_WITH_INFO(*mEndId >= -1 && *mEndId < vocabSizePadded,
-            "EndId (%d) is not within acceptable range [-1, %d).", *mEndId, vocabSizePadded);
-    }
     if (getEncoderInputFeatures()
         && getEncoderInputFeatures()->getShape().nbDims < 4) // skip encoder shape validation for image inputs
     {
@@ -353,29 +337,6 @@ std::shared_ptr<LlmRequest> LlmRequest::createChildRequest(RequestIdType request
 
     mChildRequests.push_back(childReq);
     return childReq;
-}
-
-void LlmRequest::movePromptEmbeddingTableToGpu(runtime::BufferManager const& manager)
-{
-    if (!mPromptEmbeddingTable.has_value()
-        || mPromptEmbeddingTable.value()->getMemoryType() == runtime::MemoryType::kGPU)
-    {
-        return;
-    }
-
-    TensorPtr gpuPromptEmbeddingTable = manager.copyFrom(*mPromptEmbeddingTable.value(), runtime::MemoryType::kGPU);
-    mPromptEmbeddingTable = gpuPromptEmbeddingTable;
-}
-
-void LlmRequest::moveLoraWeightsToGpu(runtime::BufferManager const& manager)
-{
-    if (!mLoraWeights.has_value() || mLoraWeights.value()->getMemoryType() == runtime::MemoryType::kGPU)
-    {
-        return;
-    }
-    // TODO for tp / pp models we only need to move the bit that belong on the local device
-    TensorPtr gpuLoraWeights = manager.copyFrom(*mLoraWeights.value(), runtime::MemoryType::kGPU);
-    mLoraWeights = gpuLoraWeights;
 }
 
 void LlmRequest::removeLoraTensors()

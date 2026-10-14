@@ -23,6 +23,7 @@ from utils.util import (skip_blackwell_geforce, skip_pre_blackwell_unittest,
 
 import tensorrt_llm
 import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
+from tensorrt_llm._utils import get_sm_version
 
 
 # Used by the (fp16 -> int4) quant layer + int4 gemm network.
@@ -136,6 +137,10 @@ class TestFunctional(unittest.TestCase):
     )
     @skip_pre_blackwell_unittest
     @skip_blackwell_geforce
+    @unittest.skipIf(
+        get_sm_version() == 107,
+        reason=
+        "No sm107a/sm100f cubins for the dense W4A8 NVFP4xFP8 trtllm-gen GEMM")
     def test_fp4_fp8_gemm_trtllmgen(self, m, n, k):
         a = torch.randn([m, k], dtype=torch.float32)
         b = torch.randn([n, k], dtype=torch.float32)
