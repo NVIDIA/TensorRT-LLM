@@ -531,8 +531,15 @@ class SymmMemPool:
         self._handle.get_signal_pad(self.rank, (pad_nbytes,), torch.uint8).zero_()
 
     def _require_channels(self, min_channels: int) -> None:
-        reason = self._channel_shortfall(min_channels)
-        if reason:
+        """Collective: raise on every rank when any rank's pad is too small.
+
+        ``set_signal_pad_size`` is process-local, so ranks can derive different channel counts;
+        agreeing first keeps every rank on the same side of the raise (a rank raising alone would
+        leave its peers waiting at the next collective).
+        """
+        shortfall = self._channel_shortfall(min_channels)
+        ok, reason = _agree(self.group, not shortfall, shortfall)
+        if not ok:
             raise RuntimeError(f"SymmMemPool: {reason}")
 
     def _channel_shortfall(self, min_channels: int) -> str:
@@ -551,37 +558,60 @@ class SymmMemPool:
         Each rank pushes a rank- and generation-specific int64 marker into its own region of
         slot 0 on every rank (the production push path), the group fences (which also orders
         :meth:`_zero_signal_pad` before any peer's first signal), every rank reads all markers
-        back from its local slot 0 and the verdict is agreed. Three host syncs at allocation
-        time, never on the hot path; the markers are zeroed afterwards.
+        back from its local slot 0 and the verdict is agreed. Phase-aligned: every local phase is
+        caught and agreed on before the next collective, so a rank that fails locally never
+        leaves its peers waiting at a barrier; a failed phase ends the check with the agreed
+        reason and no further collective. Host syncs at allocation time only, never on the hot
+        path; the markers are zeroed afterwards (best effort, the verdict is already agreed).
         """
 
         def marker_of(rank: int) -> int:
             return (rank + 1) * 1_000_003 + self.generation
 
-        for peer in range(self.world_size):
-            view = self.peer_region(peer, 0, 0, _MARKER_BYTES).view(torch.int64)
-            view.fill_(marker_of(self.rank))
-        torch.cuda.synchronize(self.device)
+        def local(phase: str, fn) -> str:
+            try:
+                fn()
+                return ""
+            except Exception as e:  # noqa: BLE001 - every local failure becomes an agreed verdict
+                return f"{phase} failed: {type(e).__name__}: {e}"
+
+        def push_markers() -> None:
+            for peer in range(self.world_size):
+                view = self.peer_region(peer, 0, 0, _MARKER_BYTES).view(torch.int64)
+                view.fill_(marker_of(self.rank))
+            torch.cuda.synchronize(self.device)
+
+        ok, reason = _agree(self.group, not (d := local("marker push", push_markers)), d)
+        if not ok:
+            return False, reason
         dist.barrier(group=self.group)
-        seen = {
-            src: int(self.region(0, src, 0, _MARKER_BYTES).view(torch.int64).item())
-            for src in range(self.world_size)
-        }
-        expected = {src: marker_of(src) for src in range(self.world_size)}
-        detail = (
-            ""
-            if seen == expected
-            else (
-                f"read markers {seen}, expected {expected} (block offset {self._base_offset}, "
-                f"block size {int(self._handle.buffer_size)}): get_buffer's frame of reference "
-                "differs from the one this pool assumes"
-            )
-        )
+
+        seen: dict[int, int] = {}
+
+        def read_markers() -> None:
+            for src in range(self.world_size):
+                seen[src] = int(self.region(0, src, 0, _MARKER_BYTES).view(torch.int64).item())
+
+        detail = local("marker read", read_markers)
+        if not detail:
+            expected = {src: marker_of(src) for src in range(self.world_size)}
+            if seen != expected:
+                detail = (
+                    f"read markers {seen}, expected {expected} (block offset {self._base_offset}, "
+                    f"block size {int(self._handle.buffer_size)}): get_buffer's frame of "
+                    "reference differs from the one this pool assumes"
+                )
         ok, reason = _agree(self.group, not detail, detail)
         dist.barrier(group=self.group)  # every peer has read our markers before anyone clears
-        for src in range(self.world_size):
-            self.region(0, src, 0, _MARKER_BYTES).zero_()
-        torch.cuda.synchronize(self.device)
+
+        def clear_markers() -> None:
+            for src in range(self.world_size):
+                self.region(0, src, 0, _MARKER_BYTES).zero_()
+            torch.cuda.synchronize(self.device)
+
+        leftover = local("marker clear", clear_markers)
+        if leftover:  # no collective follows; the agreed verdict stands, the bytes are overwritten by the first push
+            logger.warning(f"SymmMemPool[{self.group_name}]: {leftover}")
         return ok, reason
 
     def _require_reserved(self, op: str) -> None:

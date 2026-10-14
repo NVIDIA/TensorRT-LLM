@@ -321,3 +321,66 @@ def test_probe_frees_its_allocation_when_the_addressing_check_raises(gloo_world,
         probe_symmetric_memory(gloo_world, "cpu")
     assert len(created) == 1 and not created[0].reserved
     assert frees == [False]  # unmapped without a collective: the error may be local to one rank
+
+
+def test_check_addressing_returns_an_agreed_failure_instead_of_raising(cpu_allocating_pool):
+    """A local failure in the marker push (here: the stubbed allocation has no peer buffers) ends the
+    check with the agreed reason and no further collective, instead of raising on one rank while
+    the others wait at the barrier."""
+    pool = cpu_allocating_pool
+    pool._allocate(PoolLayout(pool.world_size, 1, pool.align, pool.align))
+    ok, reason = pool._check_addressing()
+    assert ok is False and reason.startswith("rank 0: marker push failed: ")
+
+
+def test_reserve_turns_a_local_check_failure_into_a_freed_pool(cpu_allocating_pool, monkeypatch):
+    pool = cpu_allocating_pool
+    frees: list[bool] = []
+    real_free = SymmMemPool._free
+
+    def recording_free(self, *, fence):
+        frees.append(fence)
+        real_free(self, fence=fence)
+
+    monkeypatch.setattr(SymmMemPool, "_free", recording_free)
+    monkeypatch.setattr(SymmMemPool, "_channel_shortfall", lambda self, n: "")
+    with pytest.raises(RuntimeError, match="peer views do not address.*marker push failed"):
+        pool.reserve(4096)
+    assert not pool.reserved and frees == [True]
+
+
+def test_require_channels_is_agreed_before_raising(cpu_allocating_pool, monkeypatch):
+    pool = cpu_allocating_pool
+    calls: list[tuple[bool, str]] = []
+    real_agree = symm_mem_pool._agree
+
+    def recording_agree(group, ok, reason):
+        calls.append((bool(ok), reason))
+        return real_agree(group, ok, reason)
+
+    monkeypatch.setattr(symm_mem_pool, "_agree", recording_agree)
+    monkeypatch.setattr(
+        SymmMemPool, "_channel_shortfall", lambda self, n: "injected: 2 channels for 4"
+    )
+    with pytest.raises(RuntimeError, match="rank 0: injected: 2 channels for 4"):
+        pool._require_channels(4)
+    assert calls == [
+        (False, "injected: 2 channels for 4")
+    ]  # the verdict went through the group first
+
+
+def test_probe_declines_with_the_agreed_reason_and_releases(gloo_world, monkeypatch):
+    monkeypatch.setattr(symm_mem_pool, "_local_preconditions", lambda group, device: [])
+    monkeypatch.setattr(SymmMemPool, "_allocate", _fake_allocate)
+    monkeypatch.setattr(symm_mem_pool.torch.cuda, "synchronize", lambda device=None: None)
+    frees: list[bool] = []
+    real_free = SymmMemPool._free
+
+    def recording_free(self, *, fence):
+        frees.append(fence)
+        real_free(self, fence=fence)
+
+    monkeypatch.setattr(SymmMemPool, "_free", recording_free)
+    ok, reason = probe_symmetric_memory(gloo_world, "cpu")
+    assert ok is False and "marker push failed" in reason
+    assert frees == [True]  # the normal path releases with the fence: every rank agreed and is here
