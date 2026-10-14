@@ -1476,9 +1476,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         if not budget.can_fit_tokens(req_tokens):
             return ScheduleAction.STOP, 0, scheduled_beam_width, req_it_end
 
-        if scheduled_beam_width == 0:
-            scheduled_beam_width = beam_width
-        elif scheduled_beam_width != beam_width:
+        if scheduled_beam_width != 0 and scheduled_beam_width != beam_width:
             return ScheduleAction.SKIP, 0, scheduled_beam_width, req_it_end
 
         success = self._try_allocate_generation(req)
@@ -1514,7 +1512,9 @@ class KVCacheV2Scheduler(RequestScheduler):
             )
 
         if success:
-            return ScheduleAction.SCHEDULED, req_tokens, scheduled_beam_width, req_it_end
+            # Only admitted requests constrain the batch's beam width. A
+            # skipped request must not prevent a runnable peer from progressing.
+            return ScheduleAction.SCHEDULED, req_tokens, beam_width, req_it_end
 
         # Self-eviction: suspend this gen request to free its
         # GPU pages so other requests can resume().
