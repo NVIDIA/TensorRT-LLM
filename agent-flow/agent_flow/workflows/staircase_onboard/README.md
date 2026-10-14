@@ -457,6 +457,7 @@ retry fails too, the run closes `smith-blocked:<unit>`.
 | `--max-parallel-smiths` | `10` (`8` with `--agent-transport external`) | where extra compute buys wall-clock. Each dispatch is a full agent session and the upstream rate limit is reported without backoff, so this is bounded by default; `0` opens the whole batch and on a typical queue that is every entry at once |
 | `--reviewer` | `light` | `light` reads the evidence and runs nothing; `full` re-runs the boot gate; `off` skips the turn |
 | `--plan` / `--vocabulary` | — | skip the plan phase with pre-written artifacts |
+| `--wait-for-spool` MINUTES | 0 | with a `session_spool` environment, wait up to MINUTES for the spool to appear (its session is still importing the image) before validating the task |
 | `--skip-substrate-gate` | off | skip the stock-path cold start in preflight. An escape hatch, not a speed-up — see the flag's own help |
 | `--agent-transport` | `inprocess` | how a role turn is delivered. `external` writes it to `<workspace>/dispatch/` and waits — see below |
 | `--agent-turn-timeout` | per role | seconds one externally-dispatched turn may take, for every role. Without it each role has its own bound: assembler 16 h, smith and auditor 6 h, plan drafter and reviewer 4 h, plan reviewer and runner 3 h |
